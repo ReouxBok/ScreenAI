@@ -1,42 +1,60 @@
 {
   "manifest_version": 3,
-  "name": "ScreenAI",
-  "version": "2.7",
-  "description": "AI assistance (Ctrl+Shift+X) with image and clipboard OCR.",
+  "name": "Limova AI - Assistant Onboarding",
+  "version": "2.0.0",
+  "description": "Charly, ton assistante IA d'onboarding Limova — guidance visuelle pas-à-pas, capture automatique, et conversation vocale.",
 
   "icons": {
     "128": "icon.png"
   },
-  
+
   "permissions": [
-    "contextMenus",
-    "scripting",
+    "sidePanel",
     "activeTab",
-    "storage"
+    "tabs",
+    "storage",
+    "scripting",
+    "webNavigation"
   ],
+
   "host_permissions": [
-    "https://generativelanguage.googleapis.com/",
-    "https://images1-focus-opensocial.googleusercontent.com/",
-    "https://api.ocr.space/"
+    "<all_urls>",
+    "https://new.limova.ai/*",
+    "https://limova-proxy-479c7fb78ccf.herokuapp.com/*"
   ],
-  
+
   "background": {
-    "service_worker": "background.js"
+    "service_worker": "background.js",
+    "type": "module"
   },
-  
-  "options_page": "options.html",
-  
+
+  "side_panel": {
+    "default_path": "sidebar/sidebar.html"
+  },
+
   "action": {
     "default_icon": "icon.png",
-    "default_title": "ScreenAI Settings"
+    "default_title": "Limova AI - Assistant Onboarding"
   },
-  
-  "commands": {
-    "activate-ai": {
-      "suggested_key": {
-        "default": "Ctrl+Shift+X"
-      },
-      "description": "Activate AI Assistant"
+
+  "content_scripts": [
+    {
+      "matches": ["https://new.limova.ai/*"],
+      "js": ["console-interceptor.js"],
+      "run_at": "document_start",
+      "world": "MAIN"
+    },
+    {
+      "matches": ["https://new.limova.ai/*"],
+      "js": ["content.js"],
+      "run_at": "document_idle"
     }
-  }
+  ],
+
+  "web_accessible_resources": [
+    {
+      "resources": ["charly.png", "logo-light.png", "logo-dark.png"],
+      "matches": ["https://new.limova.ai/*"]
+    }
+  ]
 }

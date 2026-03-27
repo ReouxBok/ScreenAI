@@ -1,470 +1,979 @@
-// background.js (Updated for Snipping Tool)
+// background.js — Central hub for Limova AI Onboarding Assistant
+// Handles: Gemini API, auto-screenshots, URL change detection, tab locking,
+//          modal detection, and sidebar communication.
+// SECURITY: API keys are stored on the proxy server, never in the extension.
 
-// --- Track active API calls to prevent duplicates ---
-const activeApiCalls = new Map();
+import Logger from './utils/logger.js';
+import { buildSystemPrompt } from './prompts/system-prompt.js';
+import { searchKB } from './knowledge-base/kb-search.js';
+import { createOnboardingPlan, advanceStep } from './prompts/onboarding-plan.js';
 
-// --- Helper: Convert chat history from OpenAI format to Google format ---
-function messagesToContents(messages) {
-  return messages.map(msg => ({
-    // Google uses "model" for the assistant role
-    role: (msg.role === 'assistant') ? 'model' : 'user',
-    parts: [{ text: msg.content }]
-  }));
+// ============================================================================
+// Config
+// ============================================================================
+
+const LIMOVA_DOMAIN = 'https://new.limova.ai';
+const PROXY_URL = 'https://limova-proxy-479c7fb78ccf.herokuapp.com'; // TODO: Replace with your Heroku app URL
+const ELEVENLABS_VOICE_ID = 'YxrwjAKoUKULGd0g8K9Y';
+const GEMINI_MODEL = 'gemini-2.5-flash';
+const MIN_API_INTERVAL = 2000;
+const URL_CHANGE_DEBOUNCE = 500;
+const BROWSER_LANG = (chrome.i18n.getUILanguage() || 'en').split('-')[0].toLowerCase();
+
+// ============================================================================
+// Session State
+// ============================================================================
+
+let sessionState = {
+  conversationHistory: [],
+  onboardingDocs: null,
+  onboardingPlan: null,
+  isActive: false,
+  lastUrl: null,
+  lastAnalysisTime: 0,
+  lockedTabId: null,
+  voiceMode: false
+};
+
+let urlChangeTimeout = null;
+let activeAbortController = null;
+
+// ============================================================================
+// Initialization
+// ============================================================================
+
+chrome.sidePanel.setPanelBehavior({ openPanelOnActionClick: true });
+
+chrome.runtime.onInstalled.addListener(() => {
+  Logger.log('background', 'Extension installed/updated');
+});
+
+// ============================================================================
+// URL Change Detection (Auto-screenshots)
+// ============================================================================
+
+// Detect full page loads
+chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
+  if (!sessionState.isActive) return;
+  if (sessionState.lockedTabId && tabId !== sessionState.lockedTabId) return;
+  if (changeInfo.status !== 'complete') return;
+  if (!tab.url || !tab.url.startsWith(LIMOVA_DOMAIN)) return;
+
+  if (urlChangeTimeout) clearTimeout(urlChangeTimeout);
+  urlChangeTimeout = setTimeout(() => handleUrlChange(tabId, tab.url), URL_CHANGE_DEBOUNCE);
+});
+
+// Detect SPA navigation (pushState / replaceState) — critical for Limova which is a SPA
+chrome.webNavigation.onHistoryStateUpdated.addListener((details) => {
+  if (!sessionState.isActive) return;
+  if (details.frameId !== 0) return; // main frame only
+  if (sessionState.lockedTabId && details.tabId !== sessionState.lockedTabId) return;
+  if (!details.url.startsWith(LIMOVA_DOMAIN)) return;
+
+  if (urlChangeTimeout) clearTimeout(urlChangeTimeout);
+  urlChangeTimeout = setTimeout(() => handleUrlChange(details.tabId, details.url), URL_CHANGE_DEBOUNCE);
+});
+
+async function handleUrlChange(tabId, url) {
+  if (url === sessionState.lastUrl) return;
+  sessionState.lastUrl = url;
+
+  Logger.logTurnStart('url_change', {
+    url,
+    hasScreenshot: true,
+    historyLength: sessionState.conversationHistory.length
+  });
+
+  if (activeAbortController) activeAbortController.abort();
+
+  broadcastToSidebar({ type: 'STATUS_UPDATE', status: 'analyzing', text: 'Nouvelle page détectée...', ponderingText: 'ponderingNewPage' });
+
+  try {
+    const screenshot = await captureScreenshot(tabId);
+    const pageContext = await getPageContext(tabId);
+    const consoleLogs = await getConsoleLogs(tabId);
+
+    await sendToGemini({
+      screenshot,
+      url,
+      pageContext,
+      consoleLogs,
+      trigger: 'url_change'
+    });
+  } catch (error) {
+    Logger.error('background', 'URL change handling failed', error);
+    broadcastToSidebar({ type: 'ERROR', content: `Erreur d'analyse : ${error.message}` });
+  }
 }
 
-// --- Helper: Fetch an image from a URL and convert it to Base64 ---
-async function blobToBase64(blob) {
+// ============================================================================
+// Tab Locking
+// ============================================================================
+
+chrome.tabs.onActivated.addListener(({ tabId }) => {
+  if (!sessionState.lockedTabId) return;
+  if (tabId === sessionState.lockedTabId) {
+    broadcastToSidebar({ type: 'CORRECT_TAB' });
+  } else {
+    broadcastToSidebar({ type: 'WRONG_TAB' });
+  }
+});
+
+chrome.tabs.onRemoved.addListener((tabId) => {
+  if (tabId === sessionState.lockedTabId) {
+    sessionState.lockedTabId = null;
+    broadcastToSidebar({ type: 'LOCKED_TAB_CLOSED' });
+  }
+});
+
+function lockTab(tabId) {
+  sessionState.lockedTabId = tabId;
+  sessionState.isActive = true;
+  chrome.tabs.sendMessage(tabId, { type: 'SESSION_STATE', active: true }).catch(() => {});
+  Logger.log('background', `Tab locked: ${tabId}`);
+}
+
+// ============================================================================
+// Message Handler
+// ============================================================================
+
+chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
+  handleMessage(request, sender).then(sendResponse).catch(err => {
+    Logger.error('background', 'Message handler error', err);
+    sendResponse({ error: err.message });
+  });
+  return true;
+});
+
+async function handleMessage(request, sender) {
+  switch (request.type) {
+    case 'USER_MESSAGE':
+      return handleUserMessage(request.text);
+
+    case 'TAKE_SCREENSHOT':
+      return handleTakeScreenshot();
+
+    case 'NEXT_STEP':
+      return handleNextStep();
+
+    case 'MODAL_DETECTED':
+      return handleModalDetected(sender);
+
+    case 'GET_STATE':
+      return {
+        conversationHistory: sessionState.conversationHistory,
+        isActive: sessionState.isActive,
+        onboardingPlan: sessionState.onboardingPlan
+      };
+
+    case 'GET_SESSION_STATE':
+      return { active: sessionState.isActive };
+
+    case 'GET_SETTINGS':
+      return { hasApiKey: true }; // Keys are on the proxy server
+
+    case 'SAVE_SETTINGS':
+      return { ok: true }; // Keys are managed server-side now
+
+    case 'GET_LOGS':
+      return { logs: Logger.getLogsAsText() };
+
+    case 'RESET_SESSION':
+      return handleResetSession();
+
+    case 'SWITCH_TO_LOCKED_TAB':
+      if (sessionState.lockedTabId) {
+        await chrome.tabs.update(sessionState.lockedTabId, { active: true });
+      }
+      return { ok: true };
+
+    // Voice recognition — relay between sidebar and content script
+    case 'VOICE_START':
+      return handleVoiceStart(request);
+
+    case 'VOICE_STOP':
+      return handleVoiceStop();
+
+    // Relay from content script → sidebar
+    case 'VOICE_TRANSCRIPT':
+    case 'VOICE_ENDED':
+    case 'VOICE_ERROR':
+      broadcastToSidebar(request);
+      return { ok: true };
+
+    case 'TOGGLE_VOICE_MODE':
+      sessionState.voiceMode = !sessionState.voiceMode;
+      Logger.log('background', `Voice mode: ${sessionState.voiceMode ? 'ON' : 'OFF'}`);
+      return { voiceMode: sessionState.voiceMode };
+
+    default:
+      return { error: 'Unknown message type' };
+  }
+}
+
+// ============================================================================
+// Voice Recognition (via content script in active tab)
+// ============================================================================
+
+async function handleVoiceStart(request) {
+  // User started speaking — interrupt any ongoing TTS
+  abortTTS();
+  broadcastToSidebar({ type: 'TTS_STOP' });
+
+  const tab = await getActiveLimovaTab();
+  if (!tab) {
+    broadcastToSidebar({ type: 'VOICE_ERROR', error: 'no-tab' });
+    return { ok: false };
+  }
+  const lang = request.lang || 'fr-FR';
+  const voiceMsg = { type: 'VOICE_START', lang, voiceMode: !!request.voiceMode };
+  try {
+    await chrome.tabs.sendMessage(tab.id, voiceMsg);
+  } catch (_) {
+    // Content script not loaded — inject it and retry
+    try {
+      await chrome.scripting.executeScript({ target: { tabId: tab.id }, files: ['content.js'] });
+      await chrome.tabs.sendMessage(tab.id, voiceMsg);
+    } catch (e) {
+      broadcastToSidebar({ type: 'VOICE_ERROR', error: 'content-script-unavailable' });
+    }
+  }
+  return { ok: true };
+}
+
+async function handleVoiceStop() {
+  const tab = await getActiveLimovaTab();
+  if (tab) {
+    chrome.tabs.sendMessage(tab.id, { type: 'VOICE_STOP' }).catch(() => {});
+  }
+  return { ok: true };
+}
+
+// ============================================================================
+// User Message Handler
+// ============================================================================
+
+async function handleUserMessage(text) {
+  // Interrupt any ongoing TTS when user speaks
+  abortTTS();
+  broadcastToSidebar({ type: 'TTS_STOP' });
+
+  const tab = await getActiveLimovaTab();
+  if (tab && !sessionState.lockedTabId) lockTab(tab.id);
+
+  Logger.logTurnStart('user_message', {
+    url: tab?.url || 'unknown',
+    hasScreenshot: !!tab,
+    historyLength: sessionState.conversationHistory.length
+  });
+  Logger.logUserMessage(text, tab?.url);
+
+  // Initialize onboarding plan on first interaction
+  if (!sessionState.onboardingPlan && sessionState.conversationHistory.length === 0) {
+    sessionState.onboardingPlan = createOnboardingPlan();
+    const current = sessionState.onboardingPlan.steps[0];
+    broadcastToSidebar({ type: 'STEP_UPDATE', step: current.name, progress: `1 / ${sessionState.onboardingPlan.steps.length}` });
+    Logger.log('background', 'Onboarding plan initialized');
+  }
+
+  broadcastToSidebar({ type: 'STATUS_UPDATE', status: 'analyzing', text: 'Analyse...' });
+
+  try {
+    let screenshot = null;
+    let pageContext = '';
+    let consoleLogs = '';
+
+    if (tab) {
+      screenshot = await captureScreenshot(tab.id);
+      pageContext = await getPageContext(tab.id);
+      consoleLogs = await getConsoleLogs(tab.id);
+    }
+
+    await sendToGemini({
+      screenshot,
+      url: tab?.url || '',
+      userMessage: text,
+      pageContext,
+      consoleLogs,
+      trigger: sessionState.conversationHistory.length === 0 ? 'doc_load' : 'user_message'
+    });
+  } catch (error) {
+    Logger.error('background', 'User message handling failed', error);
+    broadcastToSidebar({ type: 'ERROR', content: `Erreur : ${error.message}` });
+  }
+
+  return { ok: true };
+}
+
+// ============================================================================
+// Screenshot Handlers
+// ============================================================================
+
+async function handleTakeScreenshot() {
+  const tab = await getActiveLimovaTab();
+  if (!tab) {
+    broadcastToSidebar({ type: 'ERROR', content: 'Ouvre new.limova.ai pour capturer une page.' });
+    return { ok: false };
+  }
+
+  if (!sessionState.lockedTabId) lockTab(tab.id);
+
+  Logger.logTurnStart('screenshot_button', { url: tab.url, hasScreenshot: true });
+  broadcastToSidebar({ type: 'STATUS_UPDATE', status: 'analyzing', text: 'Capture...', ponderingText: 'ponderingCapture' });
+
+  try {
+    const screenshot = await captureScreenshot(tab.id);
+    const pageContext = await getPageContext(tab.id);
+    const consoleLogs = await getConsoleLogs(tab.id);
+
+    await sendToGemini({
+      screenshot,
+      url: tab.url,
+      pageContext,
+      consoleLogs,
+      trigger: 'screenshot_button'
+    });
+  } catch (error) {
+    Logger.error('background', 'Screenshot handling failed', error);
+    broadcastToSidebar({ type: 'ERROR', content: `Erreur de capture : ${error.message}` });
+  }
+
+  return { ok: true };
+}
+
+async function handleNextStep() {
+  const tab = await getActiveLimovaTab();
+  if (!tab) return { ok: false };
+
+  Logger.logTurnStart('next_step', { url: tab.url, hasScreenshot: true });
+  broadcastToSidebar({ type: 'STATUS_UPDATE', status: 'analyzing', text: 'Étape suivante...' });
+
+  try {
+    const screenshot = await captureScreenshot(tab.id);
+    const pageContext = await getPageContext(tab.id);
+    const consoleLogs = await getConsoleLogs(tab.id);
+
+    await sendToGemini({
+      screenshot,
+      url: tab.url,
+      userMessage: "Continue avec la prochaine étape.",
+      pageContext,
+      consoleLogs,
+      trigger: 'user_message'
+    });
+  } catch (error) {
+    broadcastToSidebar({ type: 'ERROR', content: error.message });
+  }
+  return { ok: true };
+}
+
+// ============================================================================
+// Modal Detection
+// ============================================================================
+
+async function handleModalDetected(sender) {
+  if (!sessionState.isActive) return { ok: false };
+  const tabId = sender?.tab?.id || sessionState.lockedTabId;
+  if (!tabId) return { ok: false };
+
+  const now = Date.now();
+  if (now - sessionState.lastAnalysisTime < MIN_API_INTERVAL) return { ok: false };
+
+  Logger.logTurnStart('modal_detected', { url: sessionState.lastUrl, hasScreenshot: true });
+  broadcastToSidebar({ type: 'STATUS_UPDATE', status: 'analyzing', text: 'Popup détecté...', ponderingText: 'ponderingPopup' });
+
+  try {
+    const screenshot = await captureScreenshot(tabId);
+    const pageContext = await getPageContext(tabId);
+
+    await sendToGemini({
+      screenshot,
+      url: sessionState.lastUrl || '',
+      pageContext,
+      trigger: 'modal_detected'
+    });
+  } catch (error) {
+    Logger.error('background', 'Modal detection handling failed', error);
+  }
+
+  return { ok: true };
+}
+
+// ============================================================================
+// ElevenLabs TTS (Streaming)
+// ============================================================================
+
+let ttsAbortController = null;
+
+function abortTTS() {
+  if (ttsAbortController) {
+    ttsAbortController.abort();
+    ttsAbortController = null;
+    Logger.log('background', 'TTS aborted (user interrupted)');
+  }
+}
+
+function cleanTextForTTS(text) {
+  return text
+    .replace(/\*\*/g, '')
+    .replace(/`[^`]*`/g, '')
+    .replace(/\[([^\]]+)\]\([^)]+\)/g, '$1')
+    .replace(/#{1,3}\s/g, '')
+    .replace(/\n{2,}/g, '\n')
+    .trim();
+}
+
+async function synthesizeVoiceStream(text) {
+  const cleanText = cleanTextForTTS(text);
+  if (!cleanText) {
+    Logger.warn('background', 'TTS skipped: empty text after cleanup');
+    broadcastToSidebar({ type: 'TTS_AUDIO', audioData: null });
+    return;
+  }
+
+  // Abort any previous TTS stream
+  abortTTS();
+  ttsAbortController = new AbortController();
+
+  Logger.log('background', `TTS stream request: voice=${ELEVENLABS_VOICE_ID}, text=${cleanText.substring(0, 80)}...`);
+
+  try {
+    const response = await fetch(`${PROXY_URL}/api/tts`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        text: cleanText,
+        voiceId: ELEVENLABS_VOICE_ID,
+        model_id: 'eleven_flash_v2_5',
+        voice_settings: { stability: 0.5, similarity_boost: 0.75 }
+      }),
+      signal: ttsAbortController.signal
+    });
+
+    if (!response.ok) {
+      const errorBody = await response.text().catch(() => '(no body)');
+      Logger.error('background', `ElevenLabs TTS HTTP ${response.status}: ${errorBody.substring(0, 300)}`);
+      broadcastToSidebar({ type: 'TTS_AUDIO', audioData: null });
+      return;
+    }
+
+    // Signal sidebar to prepare for streaming audio
+    broadcastToSidebar({ type: 'TTS_STREAM_START' });
+
+    const reader = response.body.getReader();
+    let totalBytes = 0;
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+
+      // Convert Uint8Array chunk to base64 and send to sidebar
+      let binary = '';
+      for (let i = 0; i < value.length; i++) {
+        binary += String.fromCharCode(value[i]);
+      }
+      const chunkBase64 = btoa(binary);
+      totalBytes += value.length;
+
+      broadcastToSidebar({ type: 'TTS_STREAM_CHUNK', chunk: chunkBase64 });
+    }
+
+    Logger.log('background', `TTS stream complete: ${totalBytes} bytes`);
+    broadcastToSidebar({ type: 'TTS_STREAM_END' });
+
+  } catch (error) {
+    if (error.name === 'AbortError') {
+      Logger.log('background', 'TTS stream aborted');
+      broadcastToSidebar({ type: 'TTS_STREAM_END', aborted: true });
+      return;
+    }
+    Logger.error('background', `TTS stream failed: ${error.message}`);
+    broadcastToSidebar({ type: 'TTS_AUDIO', audioData: null });
+  } finally {
+    ttsAbortController = null;
+  }
+}
+
+// ============================================================================
+// Gemini API
+// ============================================================================
+
+async function sendToGemini({ screenshot, url, userMessage, pageContext, consoleLogs, trigger }) {
+  const now = Date.now();
+  if (now - sessionState.lastAnalysisTime < MIN_API_INTERVAL) {
+    Logger.warn('background', 'API call rate limited');
+    broadcastToSidebar({ type: 'STATUS_UPDATE', status: 'ready' });
+    return;
+  }
+  sessionState.lastAnalysisTime = now;
+
+  if (activeAbortController) activeAbortController.abort();
+  activeAbortController = new AbortController();
+
+  // API keys are stored on the proxy server, not in the extension
+
+  // Search KB for relevant articles based on user message, page URL and context
+  // Enrich with step-specific queries if onboarding plan is active
+  let kbContext = sessionState.onboardingDocs || '';
+  let searchQuery = userMessage || pageContext || '';
+  if (sessionState.onboardingPlan) {
+    const currentStep = sessionState.onboardingPlan.steps[sessionState.onboardingPlan.activeIndex];
+    if (currentStep?.kbQueries?.length) {
+      searchQuery = currentStep.kbQueries.join(' ') + ' ' + searchQuery;
+    }
+  }
+  if (searchQuery || url) {
+    const kbResults = searchKB(searchQuery, {
+      url: url || '',
+      consoleLogs: consoleLogs || '',
+      maxResults: 5,
+      maxChars: 8000,
+    });
+    if (kbResults) {
+      kbContext = (kbContext ? kbContext + '\n\n' : '') +
+        '## Articles de la base de connaissances Limova\n\n' + kbResults;
+    }
+  }
+
+  const systemPrompt = buildSystemPrompt({
+    onboardingDocs: kbContext || null,
+    pageContext: pageContext || `URL: ${url}`,
+    consoleLogs: consoleLogs || '',
+    trigger,
+    onboardingPlan: sessionState.onboardingPlan,
+    voiceMode: sessionState.voiceMode,
+    lang: BROWSER_LANG
+  });
+
+  const userParts = [];
+  if (userMessage) {
+    userParts.push({ text: `[URL: ${url}]\n\n${userMessage}` });
+  } else {
+    userParts.push({ text: `[URL: ${url}]\n\nThe user navigated to this page. Analyze what you see and guide them.` });
+  }
+  if (screenshot) {
+    userParts.push({ inlineData: { mimeType: 'image/jpeg', data: screenshot } });
+  }
+
+  const contents = [];
+  for (const msg of sessionState.conversationHistory) {
+    contents.push({
+      role: msg.role === 'assistant' ? 'model' : 'user',
+      parts: [{ text: msg.content }]
+    });
+  }
+  contents.push({ role: 'user', parts: userParts });
+
+  Logger.logApiRequest({
+    model: GEMINI_MODEL,
+    messageCount: contents.length,
+    hasScreenshot: !!screenshot,
+    systemPromptLength: systemPrompt.length
+  });
+
+  const startTime = Date.now();
+
+  try {
+    const response = await fetch(`${PROXY_URL}/api/gemini`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Model': GEMINI_MODEL
+      },
+      body: JSON.stringify({
+        systemInstruction: { parts: [{ text: systemPrompt }] },
+        contents
+      }),
+      signal: activeAbortController.signal
+    });
+
+    if (!response.ok) {
+      let errorMessage = response.status === 429
+        ? 'Trop de requêtes, veuillez patienter un moment.'
+        : `Gemini Error: ${response.statusText}`;
+      try {
+        const errorData = await response.json();
+        if (errorData?.error?.message) errorMessage = errorData.error.message;
+        else if (errorData?.error) errorMessage = errorData.error;
+      } catch (_) {}
+      throw new Error(errorMessage);
+    }
+
+    const json = await response.json();
+
+    if (!json.candidates?.length) {
+      if (json.promptFeedback?.blockReason) {
+        throw new Error(`Requête bloquée : ${json.promptFeedback.blockReason}`);
+      }
+      throw new Error('Pas de réponse de Gemini.');
+    }
+
+    const responseText = json.candidates[0]?.content?.parts?.[0]?.text || '';
+    if (!responseText) throw new Error('Réponse vide de Gemini.');
+
+    Logger.logApiResponse({ success: true, responseTime: Date.now() - startTime });
+
+    // Loading screen retry
+    if (responseText.trim() === '[LOADING]') {
+      Logger.log('background', 'Loading screen detected, retrying in 2s');
+      setTimeout(() => {
+        if (sessionState.lockedTabId) handleUrlChange(sessionState.lockedTabId, url);
+      }, 2000);
+      return;
+    }
+
+    // Onboarding step/complete markers
+    let cleanResponse = responseText;
+
+    // Step completion — advance to next step
+    if (cleanResponse.includes('{{STEP_COMPLETE}}')) {
+      cleanResponse = cleanResponse.replace(/\{\{STEP_COMPLETE\}\}/g, '').trim();
+      if (sessionState.onboardingPlan) {
+        const result = advanceStep(sessionState.onboardingPlan);
+        if (result) {
+          sessionState.onboardingPlan = result;
+          const current = result.steps[result.activeIndex];
+          Logger.log('background', `Onboarding: advanced to step ${result.activeIndex + 1} — ${current.name}`);
+          broadcastToSidebar({ type: 'STEP_UPDATE', step: current.name, progress: `${result.activeIndex + 1} / ${result.steps.length}` });
+        } else {
+          Logger.log('background', 'Onboarding: all steps completed');
+          sessionState.onboardingPlan = null;
+          broadcastToSidebar({ type: 'ONBOARDING_COMPLETE' });
+        }
+      }
+    }
+
+    // Full onboarding complete (fallback if Gemini emits this directly)
+    if (cleanResponse.includes('{{ONBOARDING_COMPLETE}}')) {
+      cleanResponse = cleanResponse.replace('{{ONBOARDING_COMPLETE}}', '').trim();
+      sessionState.onboardingPlan = null;
+      broadcastToSidebar({ type: 'ONBOARDING_COMPLETE' });
+    }
+
+    // Extract highlight commands (ID-based)
+    const highlightCommands = [];
+    cleanResponse = cleanResponse.replace(/\{\{HIGHLIGHT:(\d+)\}\}/g, (_, id) => {
+      highlightCommands.push(parseInt(id));
+      return '';
+    });
+
+    cleanResponse = cleanResponse.replace(/\n{3,}/g, '\n\n').trim();
+
+    // Update conversation history
+    if (userMessage) {
+      sessionState.conversationHistory.push({ role: 'user', content: userMessage });
+    }
+    sessionState.conversationHistory.push({ role: 'assistant', content: cleanResponse });
+
+    if (sessionState.conversationHistory.length > 200) {
+      sessionState.conversationHistory = sessionState.conversationHistory.slice(-200);
+    }
+
+    Logger.logGeminiResponse(cleanResponse);
+
+    // Send text response immediately
+    broadcastToSidebar({ type: 'GEMINI_RESPONSE', content: cleanResponse, screenshot: screenshot || null });
+
+    // Execute highlight commands
+    if (highlightCommands.length > 0 && sessionState.lockedTabId) {
+      Logger.log('background', `Highlight: ${highlightCommands.join(', ')}`);
+      // Only highlight the first element (one at a time)
+      setTimeout(() => {
+        chrome.tabs.sendMessage(sessionState.lockedTabId, {
+          type: 'HIGHLIGHT_ELEMENT', id: highlightCommands[0]
+        }).catch(() => {});
+      }, 500);
+    }
+
+    // Synthesize TTS audio (streaming) if voice mode is active
+    // IMPORTANT: must be awaited to keep the service worker alive in MV3
+    if (sessionState.voiceMode) {
+      Logger.log('background', 'Starting TTS stream...');
+      await synthesizeVoiceStream(cleanResponse);
+    }
+
+  } catch (error) {
+    if (error.name === 'AbortError') {
+      Logger.log('background', 'API call aborted (superseded)');
+      broadcastToSidebar({ type: 'STATUS_UPDATE', status: 'ready' });
+      return;
+    }
+    Logger.logApiResponse({ success: false, error: error.message, responseTime: Date.now() - startTime });
+    throw error;
+  }
+}
+
+// ============================================================================
+// Screenshot Capture
+// ============================================================================
+
+async function captureScreenshot(tabId) {
+  try {
+    const dataUrl = await chrome.tabs.captureVisibleTab(null, { format: 'jpeg', quality: 70 });
+    if (!dataUrl) return null;
+    return await resizeScreenshot(dataUrl);
+  } catch (error) {
+    Logger.warn('background', 'Screenshot capture failed', error);
+    return null;
+  }
+}
+
+async function resizeScreenshot(dataUrl) {
+  const MAX_WIDTH = 1024;
+  try {
+    const response = await fetch(dataUrl);
+    const blob = await response.blob();
+    const imageBitmap = await createImageBitmap(blob);
+
+    if (imageBitmap.width <= MAX_WIDTH) return dataUrl.split(',')[1];
+
+    const scale = MAX_WIDTH / imageBitmap.width;
+    const canvas = new OffscreenCanvas(MAX_WIDTH, Math.round(imageBitmap.height * scale));
+    const ctx = canvas.getContext('2d');
+    ctx.drawImage(imageBitmap, 0, 0, canvas.width, canvas.height);
+
+    const resizedBlob = await canvas.convertToBlob({ type: 'image/jpeg', quality: 0.7 });
+    return await blobToBase64(resizedBlob);
+  } catch (error) {
+    return dataUrl.split(',')[1];
+  }
+}
+
+function blobToBase64(blob) {
   return new Promise((resolve, reject) => {
     const reader = new FileReader();
-    reader.onloadend = () => {
-      // result is "data:mime/type;base64,ENCODED_STRING"
-      // We just want the "ENCODED_STRING" part
-      const base64Data = reader.result.split(',')[1];
-      resolve(base64Data);
-    };
+    reader.onloadend = () => resolve(reader.result.split(',')[1]);
     reader.onerror = reject;
     reader.readAsDataURL(blob);
   });
 }
 
-async function fetchImageAsBase64(imageUrl) {
-  // Use Google's proxy to bypass CORS issues
-  const proxiedUrl = `https://images1-focus-opensocial.googleusercontent.com/gadgets/proxy?container=none&url=${encodeURIComponent(imageUrl)}`;
-  
-  const response = await fetch(proxiedUrl);
-  if (!response.ok) throw new Error(`Failed to fetch image (Status: ${response.status})`);
-  
-  const blob = await response.blob();
-  const base64Data = await blobToBase64(blob);
-  
-  return {
-    mimeType: blob.type,
-    data: base64Data
-  };
-}
-// --- End of Helpers ---
+// ============================================================================
+// Page Context Extraction
+// ============================================================================
 
-
-// --- Setup ---
-chrome.runtime.onInstalled.addListener(() => {
-  // 1. Context Menu for Typing Simulator
-  chrome.contextMenus.create({
-    id: "writeClipboardText",
-    title: "Simulate Typing from Clipboard",
-    contexts: ["editable"]
-  });
-  // 2. Context Menu for AI (Text)
-  chrome.contextMenus.create({
-    id: "sendTextToAI",
-    title: "Send selected text to AI",
-    contexts: ["selection"]
-  });
-  // 3. Context Menu for AI (Image)
-  chrome.contextMenus.create({
-    id: "sendImageToAI",
-    title: "Analyze image with AI",
-    contexts: ["image"]
-  });
-});
-
-// --- Listen for Context Menu Clicks ---
-chrome.contextMenus.onClicked.addListener(async (info, tab) => {
-  if (info.menuItemId === "writeClipboardText") {
-    // Note: This file "writer.js" was not provided, but the listener is kept.
-    // Make sure you have this file if you use this feature.
-    try {
-      await chrome.scripting.executeScript({
-        target: { tabId: tab.id },
-        files: ["writer.js"]
-      });
-    } catch(e) {
-      console.warn("ScreenAI: Could not execute writer.js. Make sure the file exists.");
-    }
-    
-  } else if (info.menuItemId === "sendTextToAI" || info.menuItemId === "sendImageToAI") {
-    await injectContentScript(tab.id);
-    safeSendMessage(tab.id, { type: 'showLoading' });
-
-    if (info.menuItemId === "sendTextToAI") {
-      callGoogleAI(info.selectionText, 'text', tab.id);
-    } else {
-      callGoogleAI(info.srcUrl, 'image', tab.id);
-    }
-  }
-});
-
-// --- Listen for Keyboard Shortcuts ---
-chrome.commands.onCommand.addListener(async (command, tab) => {
-  if (command === "activate-writer") {
-    // Note: This file "writer.js" was not provided, but the listener is kept.
-    try {
-      await chrome.scripting.executeScript({
-        target: { tabId: tab.id },
-        files: ["writer.js"]
-      });
-    } catch(e) {
-      console.warn("ScreenAI: Could not execute writer.js. Make sure the file exists.");
-    }
-    
-  } else if (command === "activate-ai") {
+async function getPageContext(tabId) {
+  try {
     const results = await chrome.scripting.executeScript({
-      target: { tabId: tab.id },
+      target: { tabId },
       func: () => {
-        const selection = window.getSelection().toString().trim();
-        if (selection) {
-          return { type: 'text', data: selection };
+        // Clean up previous IDs
+        document.querySelectorAll('[data-lid]').forEach(el => el.removeAttribute('data-lid'));
+
+        let idCounter = 1;
+        const elementMap = [];
+
+        // Helper: get concise zone name from DOM position
+        function getZone(el) {
+          const nav = el.closest('nav, [role="navigation"], [class*="sidebar"], [class*="nav"]');
+          if (nav) return 'nav';
+          const header = el.closest('header, [class*="header"], [class*="topbar"]');
+          if (header) return 'header';
+          const modal = el.closest('[role="dialog"], [aria-modal="true"], dialog, [class*="modal"]');
+          if (modal) return 'modal';
+          const form = el.closest('form, [class*="form"]');
+          if (form) return 'form';
+          const footer = el.closest('footer');
+          if (footer) return 'footer';
+          return 'main';
         }
-        
-        const activeEl = document.activeElement;
-        if (activeEl && activeEl.tagName === 'IMG' && activeEl.src) {
-          return { type: 'image', data: activeEl.src };
+
+        // Helper: check if element is visible
+        function isVisible(el) {
+          if (!el.offsetParent && el.tagName !== 'BODY' && window.getComputedStyle(el).position !== 'fixed') return false;
+          const rect = el.getBoundingClientRect();
+          if (rect.width === 0 || rect.height === 0) return false;
+          const style = window.getComputedStyle(el);
+          if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') return false;
+          return true;
         }
-        
-        return null; // Nothing found
-      }
-    });
-    
-    const selectionData = results[0].result;
-    
-    await injectContentScript(tab.id);
-    
-    if (selectionData) {
-      safeSendMessage(tab.id, { type: 'showLoading' });
-      if (selectionData.type === 'text') {
-        callGoogleAI(selectionData.data, 'text', tab.id);
-      } else if (selectionData.type === 'image') {
-        callGoogleAI(selectionData.data, 'image', tab.id);
-      }
-    } else {
-      safeSendMessage(tab.id, { type: 'showEmptyModal' });
-    }
-  }
-});
 
-// --- Listen for click on extension icon ---
-chrome.action.onClicked.addListener(() => {
-  chrome.runtime.openOptionsPage();
-});
+        // 1. Clickable elements: buttons, links, tabs, menu items
+        const clickables = document.querySelectorAll(
+          'button, a[href], [role="button"], [role="tab"], [role="menuitem"], [role="link"], ' +
+          'input[type="submit"], input[type="button"], [class*="btn"], [tabindex="0"]'
+        );
+        clickables.forEach(el => {
+          if (!isVisible(el)) return;
+          const text = (el.textContent || '').trim().replace(/\s+/g, ' ');
+          const ariaLabel = el.getAttribute('aria-label') || '';
+          const label = text.length > 0 && text.length < 80 ? text : ariaLabel;
+          if (!label || label.length < 1) return;
+          // Skip duplicates
+          if (elementMap.some(e => e.type === 'clickable' && e.text === label && e.zone === getZone(el))) return;
 
-// --- Helper function to safely send messages to tabs ---
-function safeSendMessage(tabId, message, callback) {
-  if (!tabId) {
-    console.warn('ScreenAI: Cannot send message - tabId is undefined');
-    return;
-  }
-  chrome.tabs.sendMessage(tabId, message, (response) => {
-    if (chrome.runtime.lastError) {
-      // Tab might be closed or doesn't exist - this is expected in some cases
-      console.warn('ScreenAI: Failed to send message to tab', tabId, chrome.runtime.lastError.message);
-    }
-    if (callback) callback(response);
-  });
-}
-
-// --- Listen for messages from content.js / snipper.js ---
-chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
-  // Validate sender.tab exists
-  if (!sender.tab || !sender.tab.id) {
-    console.warn('ScreenAI: Message received without valid tab ID');
-    return false;
-  }
-  
-  const tabId = sender.tab.id;
-  
-  if (message.type === 'askFollowUp') {
-    callGoogleAI(message.history, 'followUp', tabId);
-    return true; // Indicates async response
-  }
-  else if (message.type === 'doOcr') {
-    callOcrSpace(message.imageData, tabId);
-    return true; // Indicates async response
-  }
-  // --- NEW: Snipping Tool Listeners ---
-  else if (message.type === 'initiateScreenshot') {
-    // Inject the snipping script
-    chrome.scripting.executeScript({
-      target: { tabId: tabId },
-      files: ['snipper.js']
-    }).catch((error) => {
-      console.error('ScreenAI: Failed to inject snipper.js', error);
-      safeSendMessage(tabId, { type: 'showError', data: 'Failed to initialize screenshot tool.' });
-    });
-    return true;
-  }
-  else if (message.type === 'cancelScreenshot') {
-    // Tell content.js to show the modal again
-    safeSendMessage(tabId, { type: 'showModal' });
-    return true;
-  }
-  else if (message.type === 'captureRegion') {
-    // Validate coordinates
-    if (typeof message.x !== 'number' || typeof message.y !== 'number' || 
-        typeof message.width !== 'number' || typeof message.height !== 'number' ||
-        typeof message.dpr !== 'number' || message.width <= 0 || message.height <= 0) {
-      console.error('ScreenAI: Invalid capture region coordinates', message);
-      safeSendMessage(tabId, { type: 'showError', data: 'Invalid screenshot region.' });
-      return true;
-    }
-    
-    // 1. Capture the visible tab
-    chrome.tabs.captureVisibleTab(async (dataUrl) => {
-      if (chrome.runtime.lastError || !dataUrl) {
-          console.error("Failed to capture tab:", chrome.runtime.lastError || "No data URL returned");
-          safeSendMessage(tabId, { type: 'showError', data: 'Failed to capture screen. Please try again.' });
-          return;
-      }
-      
-      try {
-        // 2. Crop the image
-        const croppedBase64 = await cropImage(dataUrl, message.x, message.y, message.width, message.height, message.dpr);
-        
-        // 3. Send cropped image to content.js for OCR
-        safeSendMessage(tabId, {
-          type: 'screenshotReady',
-          base64Data: croppedBase64
+          const id = idCounter++;
+          el.setAttribute('data-lid', id);
+          const isActive = el.classList.contains('active') || el.getAttribute('aria-selected') === 'true' || el.getAttribute('aria-current') === 'page';
+          elementMap.push({
+            id, type: 'clickable', tag: el.tagName.toLowerCase(), text: label,
+            zone: getZone(el), active: isActive || false
+          });
         });
-      } catch (error) {
-        console.error('ScreenAI Crop Error:', error);
-        safeSendMessage(tabId, { type: 'showError', data: 'Failed to crop screenshot.' });
+
+        // 2. Input fields: text inputs, textareas, selects
+        const inputs = document.querySelectorAll(
+          'input:not([type="hidden"]):not([type="submit"]):not([type="button"]):not([type="checkbox"]):not([type="radio"]), ' +
+          'textarea, select, [contenteditable="true"]'
+        );
+        inputs.forEach(el => {
+          if (!isVisible(el)) return;
+          // Find the label for this input
+          let label = '';
+          // 1) <label for="...">
+          if (el.id) {
+            const lbl = document.querySelector(`label[for="${el.id}"]`);
+            if (lbl) label = lbl.textContent.trim();
+          }
+          // 2) Wrapping <label>
+          if (!label) {
+            const parentLabel = el.closest('label');
+            if (parentLabel) label = parentLabel.textContent.trim().replace(el.value || '', '').trim();
+          }
+          // 3) aria-label or placeholder
+          if (!label) label = el.getAttribute('aria-label') || el.placeholder || el.name || '';
+          label = label.replace(/\s+/g, ' ').substring(0, 80);
+          if (!label) return;
+
+          const id = idCounter++;
+          el.setAttribute('data-lid', id);
+          const inputType = el.tagName === 'SELECT' ? 'select' : (el.type || 'text');
+          const currentVal = el.value ? el.value.substring(0, 50) : '';
+          elementMap.push({
+            id, type: 'input', inputType, text: label,
+            zone: getZone(el), value: currentVal || undefined
+          });
+        });
+
+        // 3. Checkboxes & radios
+        const checks = document.querySelectorAll('input[type="checkbox"], input[type="radio"]');
+        checks.forEach(el => {
+          if (!isVisible(el)) return;
+          let label = '';
+          if (el.id) {
+            const lbl = document.querySelector(`label[for="${el.id}"]`);
+            if (lbl) label = lbl.textContent.trim();
+          }
+          if (!label) {
+            const parentLabel = el.closest('label');
+            if (parentLabel) label = parentLabel.textContent.trim();
+          }
+          if (!label) label = el.getAttribute('aria-label') || el.name || '';
+          if (!label) return;
+
+          const id = idCounter++;
+          el.setAttribute('data-lid', id);
+          elementMap.push({
+            id, type: el.type, text: label.substring(0, 80),
+            zone: getZone(el), checked: el.checked
+          });
+        });
+
+        // 4. Headings (for context, not interactive)
+        const headings = document.querySelectorAll('h1, h2, h3');
+        headings.forEach(el => {
+          if (!isVisible(el)) return;
+          const text = el.textContent.trim().replace(/\s+/g, ' ');
+          if (text.length < 2 || text.length > 120) return;
+          elementMap.push({ type: 'heading', tag: el.tagName.toLowerCase(), text });
+        });
+
+        return {
+          title: document.title || '',
+          url: window.location.href,
+          elements: elementMap.slice(0, 120)
+        };
       }
     });
-    return true; // Indicates async response
-  }
-});
 
-// --- NEW: Cropping function using OffscreenCanvas ---
-async function cropImage(dataUrl, x, y, width, height, dpr) {
-  // 1. Fetch data URL as a blob
-  const response = await fetch(dataUrl);
-  const blob = await response.blob();
+    if (results?.[0]?.result) {
+      const pc = results[0].result;
+      const parts = [];
+      if (pc.title) parts.push(`Page: ${pc.title}`);
 
-  // 2. Create an ImageBitmap
-  const imageBitmap = await createImageBitmap(blob);
-
-  // 3. Create an OffscreenCanvas
-  const canvas = new OffscreenCanvas(width * dpr, height * dpr);
-  const ctx = canvas.getContext('2d');
-
-  // 4. Draw the cropped region
-  // sX, sY, sWidth, sHeight, dX, dY, dWidth, dHeight
-  ctx.drawImage(
-    imageBitmap,
-    x * dpr,
-    y * dpr,
-    width * dpr,
-    height * dpr,
-    0, 0,
-    width * dpr,
-    height * dpr
-  );
-
-  // 5. Convert canvas to blob
-  const croppedBlob = await canvas.convertToBlob({ type: 'image/jpeg' });
-
-  // 6. Convert blob to Base64
-  const base64Data = await blobToBase64(croppedBlob);
-  return base64Data;
-}
-
-
-// --- OCR.space Core Function ---
-async function callOcrSpace(base64Data, tabId) {
-  // Prevent duplicate OCR calls for the same tab
-  const ocrCallKey = `ocr-${tabId}`;
-  if (activeApiCalls.has(ocrCallKey)) {
-    console.warn('ScreenAI: Duplicate OCR call prevented for tab', tabId);
-    return;
-  }
-  
-  activeApiCalls.set(ocrCallKey, true);
-  
-  try {
-    // 1. Get the OCR API Key
-    const { ocrApiKey } = await chrome.storage.local.get('ocrApiKey');
-    if (!ocrApiKey) {
-      throw new Error('OCR.space API key not set. Right-click the extension icon and go to Options.');
-    }
-
-    // 2. Prepare FormData
-    const formData = new FormData();
-    formData.append('apikey', ocrApiKey);
-    // Send as full Data URL. OCR.space handles this.
-    formData.append('base64Image', `data:image/jpeg;base64,${base64Data}`);
-    formData.append('isOverlayRequired', 'false');
-    formData.append('detectOrientation', 'true'); // Auto-rotate
-    formData.append('scale', 'true'); // Auto-scale
-
-    // 3. Make the API call
-    const response = await fetch('https://api.ocr.space/parse/image', {
-      method: 'POST',
-      body: formData
-    });
-
-    if (!response.ok) {
-      throw new Error(`OCR.space API Error: ${response.statusText}`);
-    }
-
-    const json = await response.json();
-
-    // 4. Handle API-side errors
-    if (json.IsErroredOnProcessing) {
-      const errorMsg = (json.ErrorMessage && Array.isArray(json.ErrorMessage) && json.ErrorMessage[0]) 
-        ? json.ErrorMessage[0] 
-        : (json.ErrorMessage || 'Unknown OCR error');
-      throw new Error(`OCR.space Error: ${errorMsg}`);
-    }
-
-    if (!json.ParsedResults || json.ParsedResults.length === 0) {
-      throw new Error('No text could be extracted from the image.');
-    }
-
-    // 5. Success: Send extracted text back to content script
-    const extractedText = json.ParsedResults[0].ParsedText || '';
-    safeSendMessage(tabId, { 
-      type: 'showOcrResult', 
-      text: extractedText 
-    });
-
-  } catch (error) {
-    console.error('ScreenAI OCR Error:', error);
-    // Use 'showOcrError' to be handled by the same logic as 'showError'
-    safeSendMessage(tabId, { type: 'showOcrError', data: error.message });
-  } finally {
-    // Clear the active call flag
-    activeApiCalls.delete(ocrCallKey);
-  }
-}
-
-// --- Google AI Core Function ---
-async function callGoogleAI(data, type, tabId) {
-  // Prevent duplicate calls for the same tab
-  const callKey = `${tabId}-${type}`;
-  if (activeApiCalls.has(callKey)) {
-    console.warn('ScreenAI: Duplicate API call prevented for', callKey);
-    return;
-  }
-  
-  activeApiCalls.set(callKey, true);
-  
-  try {
-    // 1. Get the new Google API Key from storage
-    const { googleApiKey } = await chrome.storage.local.get('googleApiKey');
-    if (!googleApiKey) {
-      throw new Error('Google AI API key not set. Right-click the extension icon and go to Options.');
-    }
-
-    let model = 'gemini-2.5-flash'; // --- Default to gemini-2.5-flash for text
-    let contents;
-    let promptForHistory = data; // The prompt text we send back to content.js
-
-    if (type === 'text') {
-      contents = [{ role: 'user', parts: [{ text: data }] }];
-      
-    } else if (type === 'image') {
-      model = 'gemini-2.5-pro'; // --- Use gemini-2.5-pro for vision
-      const promptText = "Describe this image in detail.";
-      promptForHistory = `Analyze image: ${data}`; // For chat history
-      
-      // Fetch and convert the image
-      const imageData = await fetchImageAsBase64(data);
-      
-      contents = [{
-        role: 'user',
-        parts: [
-          { text: promptText },
-          { inlineData: { mimeType: imageData.mimeType, data: imageData.data } }
-        ]
-      }];
-      
-    } else if (type === 'followUp') {
-      // Follow-ups will use the default 'gemini-2.5-flash' model
-      contents = messagesToContents(data); // 'data' is the full chat history
-    }
-    
-    // 2. Construct the Google AI API URL and Request
-    const API_URL = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${googleApiKey}`;
-
-    const response = await fetch(API_URL, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json'
-      },
-      body: JSON.stringify({ contents: contents })
-    });
-
-    if (!response.ok) {
-      let errorMessage = `Google AI Error: ${response.statusText}`;
-      try {
-        const errorData = await response.json();
-        if (errorData && errorData.error && errorData.error.message) {
-          errorMessage = `Google AI Error: ${errorData.error.message}`;
-        }
-      } catch (e) {
-        // If JSON parsing fails, use the default error message
+      // Group elements by zone for readability
+      const byZone = {};
+      for (const el of pc.elements) {
+        const zone = el.zone || 'page';
+        if (!byZone[zone]) byZone[zone] = [];
+        byZone[zone].push(el);
       }
-      throw new Error(errorMessage);
-    }
 
-    let json;
-    try {
-      json = await response.json();
-    } catch (e) {
-      throw new Error('Invalid response from Google AI API');
-    }
-    
-    // 3. Handle Google's safety blocking
-    if (!json.candidates || json.candidates.length === 0) {
-      if (json.promptFeedback && json.promptFeedback.blockReason) {
-         throw new Error(`Request blocked by Google for safety reasons: ${json.promptFeedback.blockReason}`);
+      for (const [zone, elements] of Object.entries(byZone)) {
+        const lines = elements.map(el => {
+          if (el.type === 'heading') return `  ${el.tag}: "${el.text}"`;
+          const id = `[${el.id}]`;
+          const active = el.active ? ' ✓' : '';
+          const checked = el.checked ? ' ☑' : el.checked === false ? ' ☐' : '';
+          const val = el.value ? ` = "${el.value}"` : '';
+          return `  ${id} ${el.type}(${el.tag || el.inputType || ''}) "${el.text}"${active}${checked}${val}`;
+        });
+        parts.push(`\n[${zone}]\n${lines.join('\n')}`);
       }
-      throw new Error('No response from Google AI. The prompt might have been blocked.');
-    }
 
-    // 4. Parse the response and format it for content.js
-    const candidate = json.candidates[0];
-    if (!candidate || !candidate.content || !candidate.content.parts || !candidate.content.parts[0]) {
-      throw new Error('Invalid response structure from Google AI');
+      return parts.join('\n');
     }
-    
-    const assistantResponseContent = candidate.content.parts[0].text || '';
-    if (!assistantResponseContent) {
-      throw new Error('Empty response from Google AI');
-    }
-    
-    // We *must* send role: "assistant" back to content.js for the chat bubbles to work
-    const assistantResponseObject = { role: 'assistant', content: assistantResponseContent };
-
-    // 5. Send data back to the content script
-    if (type === 'text' || type === 'image') {
-      safeSendMessage(tabId, { 
-        type: 'showResponse', 
-        response: assistantResponseObject.content, // Just the text
-        prompt: promptForHistory // The original prompt
-      });
-    } else if (type === 'followUp') {
-      safeSendMessage(tabId, { 
-        type: 'showFollowUpResponse', 
-        response: assistantResponseObject // The full {role, content} object
-      });
-    }
-
-  } catch (error) {
-    console.error('ScreenAI Google AI Error:', error);
-    safeSendMessage(tabId, { type: 'showError', data: error.message || 'An unknown error occurred' });
-  } finally {
-    // Clear the active call flag
-    activeApiCalls.delete(callKey);
-  }
-}
-
-// --- Helper to inject AI Modal script ---
-async function injectContentScript(tabId) {
-  try {
-    await chrome.scripting.executeScript({
-      target: { tabId: tabId },
-      files: ['content.js']
-    });
   } catch (e) {
-    // This warning is normal if the script is already injected
+    Logger.warn('background', 'Page context extraction failed', e);
   }
+  return '';
+}
+
+async function getConsoleLogs(tabId) {
+  try {
+    const results = await chrome.scripting.executeScript({
+      target: { tabId },
+      func: () => window.__limova_console_logs || []
+    });
+    if (results?.[0]?.result?.length > 0) {
+      return results[0].result.slice(-20).map(l => `[${l.level}] ${l.message}`).join('\n');
+    }
+  } catch (e) {}
+  return '';
+}
+
+// ============================================================================
+// Settings & Session
+// ============================================================================
+
+// API keys are managed server-side on the proxy — no local key storage needed
+
+function handleResetSession() {
+  sessionState.conversationHistory = [];
+  sessionState.onboardingDocs = null;
+  sessionState.onboardingPlan = null;
+  sessionState.isActive = false;
+  sessionState.lastUrl = null;
+  sessionState.lastAnalysisTime = 0;
+  sessionState.voiceMode = false;
+
+  if (sessionState.lockedTabId) {
+    chrome.tabs.sendMessage(sessionState.lockedTabId, { type: 'SESSION_STATE', active: false }).catch(() => {});
+  }
+  sessionState.lockedTabId = null;
+
+  Logger.clearLogs();
+  Logger.log('background', 'Session reset');
+  return { ok: true };
+}
+
+// ============================================================================
+// Helpers
+// ============================================================================
+
+function broadcastToSidebar(message) {
+  chrome.runtime.sendMessage(message).catch(() => {});
+}
+
+async function getActiveLimovaTab() {
+  if (sessionState.lockedTabId) {
+    try {
+      const tab = await chrome.tabs.get(sessionState.lockedTabId);
+      if (tab.url?.startsWith(LIMOVA_DOMAIN)) return tab;
+    } catch (_) {
+      sessionState.lockedTabId = null;
+    }
+  }
+  const tabs = await chrome.tabs.query({ active: true, currentWindow: true });
+  return tabs.find(t => t.url?.startsWith(LIMOVA_DOMAIN)) || null;
 }

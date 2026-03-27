@@ -1,0 +1,173 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Charly - Assistant Onboarding Limova</title>
+  <link rel="stylesheet" href="sidebar.css">
+</head>
+<body>
+  <div class="container">
+    <!-- Header -->
+    <header class="header">
+      <div class="header-left">
+        <img src="../charly.png" alt="Charly" class="header-avatar">
+        <span class="title" data-i18n="title">Charly</span>
+      </div>
+      <div class="header-right">
+        <span class="status-badge" id="statusBadge" data-i18n="statusReady">Prêt</span>
+        <button class="icon-btn" id="callBtn" data-i18n-title="callTitle" title="Mode conversation vocale">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <path d="M22 16.92v3a2 2 0 0 1-2.18 2 19.79 19.79 0 0 1-8.63-3.07 19.5 19.5 0 0 1-6-6 19.79 19.79 0 0 1-3.07-8.67A2 2 0 0 1 4.11 2h3a2 2 0 0 1 2 1.72 12.84 12.84 0 0 0 .7 2.81 2 2 0 0 1-.45 2.11L8.09 9.91a16 16 0 0 0 6 6l1.27-1.27a2 2 0 0 1 2.11-.45 12.84 12.84 0 0 0 2.81.7A2 2 0 0 1 22 16.92z"></path>
+          </svg>
+        </button>
+        <div class="menu-wrapper">
+          <button class="icon-btn" id="menuBtn" title="Menu">
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <circle cx="12" cy="5" r="1.5"/><circle cx="12" cy="12" r="1.5"/><circle cx="12" cy="19" r="1.5"/>
+            </svg>
+          </button>
+          <div class="header-menu" id="headerMenu" hidden>
+            <button class="menu-item" id="newsBtn">
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 8v4m0 4h.01M21 12a9 9 0 1 1-18 0 9 9 0 0 1 18 0z"/></svg>
+              Nouveautés
+            </button>
+            <button class="menu-item" id="linksBtn">
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/></svg>
+              Liens rapides
+            </button>
+            <div class="menu-divider"></div>
+            <button class="menu-item" id="resetBtn" data-i18n-title="resetTitle">
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"/><path d="M3 3v5h5"/></svg>
+              Réinitialiser
+            </button>
+          </div>
+        </div>
+      </div>
+    </header>
+
+    <!-- Tab Warning Banner -->
+    <div class="tab-warning" id="tabWarning" hidden>
+      <span class="tab-warning-text" id="tabWarningText"></span>
+    </div>
+
+    <!-- Welcome Screen -->
+    <div class="welcome-screen" id="welcomeScreen">
+      <div class="charly-animation">
+        <img src="../charly.png" alt="Charly" class="charly-welcome-image">
+        <div class="charly-online-dot"></div>
+      </div>
+
+      <h1 class="charly-greeting" data-i18n="greeting">Bonjour ! Je suis Charly, ton assistante onboarding Limova</h1>
+
+      <div class="how-it-works">
+        <h2 class="how-it-works-headline" data-i18n="howItWorksTitle">Voici comment ça va fonctionner</h2>
+        <ul class="how-it-works-list">
+          <li data-i18n="howItWorks1">Navigue sur Limova, je vois chaque page automatiquement</li>
+          <li data-i18n="howItWorks2">Je te guide étape par étape</li>
+          <li data-i18n="howItWorks3">Si tu es bloqué, clique sur <svg class="inline-icon" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M23 19a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4l2-3h6l2 3h4a2 2 0 0 1 2 2z"></path><circle cx="12" cy="13" r="4"></circle></svg></li>
+          <li data-i18n="howItWorks4">Pose-moi n'importe quelle question en chemin</li>
+        </ul>
+      </div>
+
+      <a class="go-to-limova" id="goToLimova" href="https://new.limova.ai" target="_blank" hidden>
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/><polyline points="15 3 21 3 21 9"/><line x1="10" y1="14" x2="21" y2="3"/></svg>
+        <span data-i18n="goToLimova">Ouvrir Limova</span>
+      </a>
+
+      <div class="welcome-extras">
+        <div class="quick-links" id="quickLinks"></div>
+      </div>
+
+    </div>
+
+    <!-- Modal (shared for News & Links) -->
+    <div class="news-modal-backdrop" id="newsModalBackdrop" hidden>
+      <div class="news-modal">
+        <div class="news-modal-header">
+          <h3>Nouveautés</h3>
+          <button class="news-modal-close" id="newsModalClose">&times;</button>
+        </div>
+        <div class="news-modal-body" id="newsModalBody"></div>
+      </div>
+    </div>
+
+    <!-- Onboarding Step Info -->
+    <div class="step-info" id="stepInfo" hidden>
+      <span class="step-label" data-i18n="stepLabel">Étape :</span>
+      <span class="step-name" id="stepName">-</span>
+      <span class="step-progress" id="stepProgress"></span>
+    </div>
+
+    <!-- Call Overlay (Voice Conversation Mode) -->
+    <div class="call-overlay" id="callOverlay" hidden>
+      <div class="call-content">
+        <img src="../charly.png" alt="Charly" class="call-avatar">
+        <span class="call-name">Charly</span>
+        <span class="call-status" id="callStatus" data-i18n="callListening">Écoute...</span>
+        <div class="call-visualizer" id="callVisualizer">
+          <span></span><span></span><span></span><span></span><span></span>
+        </div>
+      </div>
+      <div class="call-actions">
+        <button class="call-action-btn" id="callMuteBtn" data-i18n-title="callMute" title="Couper le micro">
+          <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <rect x="9" y="1" width="6" height="12" rx="3"></rect>
+            <path d="M19 10v2a7 7 0 0 1-14 0v-2"></path>
+            <line x1="12" y1="19" x2="12" y2="23"></line>
+            <line x1="8" y1="23" x2="16" y2="23"></line>
+          </svg>
+        </button>
+        <button class="call-hangup" id="callHangup" data-i18n-title="callHangup" title="Raccrocher">
+          <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <path d="M22 16.92v3a2 2 0 0 1-2.18 2 19.79 19.79 0 0 1-8.63-3.07 19.5 19.5 0 0 1-6-6 19.79 19.79 0 0 1-3.07-8.67A2 2 0 0 1 4.11 2h3a2 2 0 0 1 2 1.72 12.84 12.84 0 0 0 .7 2.81 2 2 0 0 1-.45 2.11L8.09 9.91a16 16 0 0 0 6 6l1.27-1.27a2 2 0 0 1 2.11-.45 12.84 12.84 0 0 0 2.81.7A2 2 0 0 1 22 16.92z"></path>
+          </svg>
+        </button>
+      </div>
+    </div>
+
+    <!-- Chat Container -->
+    <div class="chat-container" id="chatContainer"></div>
+
+    <!-- Input Area -->
+    <div class="input-area">
+      <button class="screenshot-btn" id="screenshotBtn" data-i18n-title="screenshotTitle" title="Capturer l'écran actuel">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M23 19a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4l2-3h6l2 3h4a2 2 0 0 1 2 2z"></path>
+          <circle cx="12" cy="13" r="4"></circle>
+        </svg>
+      </button>
+      <textarea
+        id="userInput"
+        data-i18n-placeholder="inputPlaceholder"
+        placeholder="Écris à Charly..."
+        rows="1"
+      ></textarea>
+      <button class="mic-btn" id="micBtn" data-i18n-title="micTitle" title="Dicter un message">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <rect x="9" y="1" width="6" height="12" rx="3"></rect>
+          <path d="M19 10v2a7 7 0 0 1-14 0v-2"></path>
+          <line x1="12" y1="19" x2="12" y2="23"></line>
+          <line x1="8" y1="23" x2="16" y2="23"></line>
+        </svg>
+      </button>
+      <button class="send-btn" id="sendBtn" hidden>
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <line x1="22" y1="2" x2="11" y2="13"></line>
+          <polygon points="22,2 15,22 11,13 2,9 22,2"></polygon>
+        </svg>
+      </button>
+    </div>
+
+    <!-- Footer -->
+    <footer class="footer">
+      <button class="link-btn" id="downloadLogsBtn" data-i18n="downloadLogs">Télécharger les logs</button>
+      <span class="footer-brand" data-i18n="footerBrand">propulsé par Limova AI</span>
+    </footer>
+  </div>
+
+  <script src="i18n.js"></script>
+  <script src="announcements.js"></script>
+  <script src="sidebar.js"></script>
+</body>
+</html>
