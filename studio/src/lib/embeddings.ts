@@ -10,7 +10,7 @@ type EmbeddingEnvironment = Record<string, string | undefined>;
 
 export function embeddingApiKey(scope: EmbeddingScope, env: EmbeddingEnvironment = process.env) {
   if (scope === "sav") return env.SAV_GEMINI_API_KEY || "";
-  return env.KNOWLEDGE_GEMINI_API_KEY || env.EXTENSION_GEMINI_API_KEY || env.GEMINI_API_KEY || "";
+  return env.EXTENSION_GEMINI_API_KEY || env.GEMINI_API_KEY || env.KNOWLEDGE_GEMINI_API_KEY || "";
 }
 
 export function deterministicEmbedding(text: string) {

@@ -19,8 +19,12 @@ describe("embedding credential isolation", () => {
     })).toBe("");
   });
 
-  it("keeps the legacy fallback only for extension knowledge during migration", () => {
+  it("keeps the shared extension key for extension knowledge during migration", () => {
     expect(embeddingApiKey("extension", { GEMINI_API_KEY: "legacy-key" })).toBe("legacy-key");
+    expect(embeddingApiKey("extension", {
+      KNOWLEDGE_GEMINI_API_KEY: "invalid-dedicated-key",
+      GEMINI_API_KEY: "shared-extension-key",
+    })).toBe("shared-extension-key");
   });
 
   it("produit un diagnostic fournisseur sans contenu ni clé", () => {
