@@ -1,0 +1,84 @@
+{
+  "name": "studio",
+  "version": "0.1.0",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "dev": "next dev",
+    "build": "next build",
+    "start": "next start",
+    "lint": "eslint",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:e2e": "playwright test",
+    "db:generate": "drizzle-kit generate",
+    "db:migrate": "tsx scripts/migrate.ts",
+    "memory:generate": "drizzle-kit generate --config drizzle.memory.config.ts",
+    "memory:migrate": "tsx scripts/migrate-memory.ts",
+    "kb:import": "tsx scripts/import-markdown.ts",
+    "kb:export": "tsx scripts/export-markdown.ts",
+    "kb:backup": "tsx scripts/backup-knowledge.ts",
+    "kb:reset": "tsx scripts/reset-knowledge.ts",
+    "kb:compare": "tsx scripts/compare-indexes.ts",
+    "kb:validate-existing": "NODE_OPTIONS=--conditions=react-server tsx scripts/validate-existing-content.ts",
+    "kb:test": "NODE_OPTIONS=--conditions=react-server tsx scripts/run-quality-tests.ts",
+    "kb:probe": "NODE_OPTIONS=--conditions=react-server tsx scripts/probe-embedding.ts",
+    "staff:provision": "tsx scripts/provision-staff.ts",
+    "training:reconcile": "NODE_OPTIONS=--conditions=react-server tsx scripts/reconcile-trainings.ts --dry-run",
+    "training:reconcile:apply": "NODE_OPTIONS=--conditions=react-server tsx scripts/reconcile-trainings.ts --apply",
+    "gmail:replay": "NODE_OPTIONS=--conditions=react-server tsx scripts/replay-gmail-receipts.ts --dry-run",
+    "gmail:replay:apply": "NODE_OPTIONS=--conditions=react-server tsx scripts/replay-gmail-receipts.ts --apply",
+    "ops:status": "NODE_OPTIONS=--conditions=react-server tsx scripts/operational-status.ts"
+  },
+  "dependencies": {
+    "@clerk/backend": "^2.33.6",
+    "@clerk/nextjs": "^7.8.2",
+    "@google/adk": "^1.5.0",
+    "@google/genai": "^2.15.0",
+    "@tiptap/markdown": "^3.31.0",
+    "@tiptap/react": "^3.31.0",
+    "@tiptap/starter-kit": "^3.31.0",
+    "@vercel/blob": "^2.7.0",
+    "drizzle-orm": "^0.45.2",
+    "gray-matter": "^4.0.3",
+    "lucide-react": "^1.28.0",
+    "next": "16.3.0",
+    "postgres": "^3.4.9",
+    "react": "19.2.8",
+    "react-dom": "19.2.8",
+    "server-only": "^0.0.1",
+    "workflow": "^4.8.5",
+    "zod": "^4.4.3"
+  },
+  "devDependencies": {
+    "@electric-sql/pglite": "^0.5.4",
+    "@electric-sql/pglite-pgvector": "^0.0.5",
+    "@playwright/test": "^1.62.1",
+    "@types/node": "^20",
+    "@types/react": "^19",
+    "@types/react-dom": "^19",
+    "dotenv-cli": "^11.0.0",
+    "drizzle-kit": "^0.31.10",
+    "eslint": "^9",
+    "eslint-config-next": "16.3.0",
+    "tsx": "^4.23.5",
+    "typescript": "^5",
+    "vitest": "^4.1.10"
+  },
+  "overrides": {
+    "@workflow/core": {
+      "nanoid": "5.1.16"
+    },
+    "@workflow/world-local": {
+      "undici": "7.29.0"
+    },
+    "@workflow/world-vercel": {
+      "undici": "7.29.0"
+    },
+    "adm-zip": "0.6.0",
+    "mariadb": "3.5.3",
+    "mysql2": "3.24.3",
+    "tar": "7.5.22"
+  }
+}

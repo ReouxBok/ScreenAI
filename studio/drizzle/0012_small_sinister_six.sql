@@ -1,0 +1,1 @@
+ALTER TABLE "sav"."webhook_receipts" ADD COLUMN "last_attempt_at" timestamp with time zone;

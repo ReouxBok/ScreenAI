@@ -1,0 +1,7 @@
+.env*
+.e2e-db/
+test-results/
+playwright-report/
+/tests/
+playwright.config.ts
+scripts/prepare-e2e.ts

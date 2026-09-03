@@ -1,0 +1,8 @@
+{
+  "version": "2.2.44",
+  "artifact": "dist/limova-ai-extension-2.2.44.zip",
+  "sha256": "ce41a0e5df13146149d97fff2a29cc0e8ae5340b2ea91dfca0166a141bfc506c",
+  "sizeBytes": 207413,
+  "builtAt": "2026-09-03T10:55:53+02:00",
+  "sourceBranch": "fix/studio-reliability-2.2.44"
+}

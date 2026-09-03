@@ -1,0 +1,1 @@
+ALTER TYPE "sav"."action_kind" ADD VALUE 'log_email' BEFORE 'draft_reply';

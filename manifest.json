@@ -1,60 +1,60 @@
 {
   "manifest_version": 3,
   "name": "Limova AI - Assistant Onboarding",
-  "version": "2.0.0",
-  "description": "Charly, ton assistante IA d'onboarding Limova — guidance visuelle pas-à-pas, capture automatique, et conversation vocale.",
+  "version": "2.2.44",
+  "minimum_chrome_version": "114",
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA1W77Qq9OawSMsnZGUC/m75Vk2t9+3sqc86WeJPA0AndBaECoWQ1dtgv0vQpDyz+URzAC8ObWmsB9ioU2i7oYIxWovKapTlpH/0ANy6zOAbVf9emlyY7ub3W3IPtazyjidgsyYthNPEV6Ybk+dYyg5EEbHN4Czc8wZ6A0u2qQ2la4uwvIlpHu/8JTu8bkARsy6tZ++r0OMK/h/frDUPKRQ7YIHVw3siZzzHJNQC1Dx1DO3066ZIaL6H+MnQ0AEc0WGuc1MLzpr7Qe1NKKWTsd99v/xqu91s2L9hJgMQ49QuSIxzQ3AKLDR5YdoARslYBlcjRYnc1ulb9g1ZSckywgowIDAQAB",
+  "description": "Charly analyse Limova, guide chaque étape et converse à la voix en temps réel.",
 
   "icons": {
-    "128": "icon.png"
+    "128": "assets/icons/icon.png"
   },
 
   "permissions": [
-    "sidePanel",
     "activeTab",
-    "tabs",
+    "sidePanel",
     "storage",
     "scripting",
     "webNavigation"
   ],
 
   "host_permissions": [
-    "<all_urls>",
     "https://new.limova.ai/*",
+    "https://studio.limova.ai/*",
+    "https://vercel.com/*",
+    "https://pihloilpc5svuzjv.private.blob.vercel-storage.com/*",
     "https://limova-proxy-479c7fb78ccf.herokuapp.com/*"
   ],
 
+  "content_security_policy": {
+    "extension_pages": "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data: blob:; connect-src https://limova-proxy-479c7fb78ccf.herokuapp.com https://studio.limova.ai https://vercel.com https://pihloilpc5svuzjv.private.blob.vercel-storage.com https://generativelanguage.googleapis.com wss://generativelanguage.googleapis.com; media-src 'self' blob:; object-src 'none';"
+  },
+
   "background": {
-    "service_worker": "background.js",
+    "service_worker": "src/background.js",
     "type": "module"
   },
 
   "side_panel": {
-    "default_path": "sidebar/sidebar.html"
+    "default_path": "src/sidebar/sidebar.html"
   },
 
   "action": {
-    "default_icon": "icon.png",
+    "default_icon": "assets/icons/icon.png",
     "default_title": "Limova AI - Assistant Onboarding"
   },
 
   "content_scripts": [
     {
       "matches": ["https://new.limova.ai/*"],
-      "js": ["console-interceptor.js"],
+      "js": ["src/content/console-interceptor.js"],
       "run_at": "document_start",
       "world": "MAIN"
     },
     {
       "matches": ["https://new.limova.ai/*"],
-      "js": ["content.js"],
+      "js": ["src/content/content.js"],
       "run_at": "document_idle"
-    }
-  ],
-
-  "web_accessible_resources": [
-    {
-      "resources": ["charly.png", "logo-light.png", "logo-dark.png"],
-      "matches": ["https://new.limova.ai/*"]
     }
   ]
 }

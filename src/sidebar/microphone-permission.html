@@ -1,0 +1,22 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Autoriser le microphone — Charly</title>
+  <link rel="stylesheet" href="microphone-permission.css">
+</head>
+<body>
+  <main class="permission-card" aria-labelledby="permissionTitle">
+    <img src="../../assets/branding/charly.png" alt="Charly" class="charly-avatar">
+    <p class="eyebrow">Limova AI</p>
+    <h1 id="permissionTitle">Autoriser le microphone</h1>
+    <p id="permissionDescription">Chrome doit recevoir cette autorisation dans un onglet complet avant que Charly puisse écouter depuis le panneau latéral.</p>
+    <p class="privacy-note" id="privacyNote">Le micro s’active uniquement quand tu démarres une conversation vocale et s’arrête quand tu la quittes.</p>
+    <div class="status" id="permissionStatus" role="status" aria-live="polite"></div>
+    <button class="primary-button" id="allowMicrophone">Autoriser le microphone</button>
+    <button class="secondary-button" id="closePermission" hidden>Retourner sur Limova</button>
+  </main>
+  <script src="microphone-permission.js"></script>
+</body>
+</html>

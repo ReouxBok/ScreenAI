@@ -1,0 +1,1 @@
+ALTER TYPE "sav"."decision_kind" ADD VALUE 'ticket_pending' BEFORE 'ticket_created';

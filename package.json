@@ -1,0 +1,40 @@
+{
+  "name": "limova-ai-extension",
+  "version": "2.2.44",
+  "private": true,
+  "description": "Limova AI — Charly, onboarding assistant Chrome extension (MV3)",
+  "type": "module",
+  "scripts": {
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:unit": "vitest run tests/unit",
+    "test:proxy": "vitest run tests/proxy",
+    "test:e2e": "npm run build && playwright test",
+    "test:all": "npm run test && npm run test:e2e",
+    "coverage": "vitest run --coverage",
+    "build": "bash scripts/build-extension.sh",
+    "validate:package": "node scripts/validate-package.mjs build",
+    "ci": "npm test && npm run build && npm run validate:package",
+    "release:package": "npm run test:all && npm run build",
+    "kb:refresh": "node scripts/scrape-help.mjs"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.62.1",
+    "@vitest/coverage-v8": "^4.1.0",
+    "cors": "^2.8.5",
+    "esbuild": "^0.28.1",
+    "express": "^5.2.1",
+    "express-rate-limit": "^8.2.1",
+    "jsdom": "^25.0.1",
+    "node-html-parser": "^7.1.0",
+    "sinon-chrome": "^3.0.1",
+    "supertest": "^7.0.0",
+    "vitest": "^4.1.0"
+  },
+  "dependencies": {
+    "@vercel/blob": "^2.7.0"
+  }
+}

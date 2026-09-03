@@ -1,0 +1,47 @@
+name: Limova CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: |
+            package-lock.json
+            proxy/package-lock.json
+            studio/package-lock.json
+      - run: npm ci
+      - run: npm ci --prefix proxy
+      - run: npm ci --prefix studio
+      - run: npm audit --audit-level=high
+      - run: npm audit --prefix proxy --audit-level=high
+      - run: npm audit --prefix studio --audit-level=high
+      - run: npm test
+      - run: npm run typecheck --prefix studio
+      - run: npm run lint --prefix studio
+      - run: npm test --prefix studio
+      - run: npm test --prefix proxy
+      - run: npm run build --prefix studio
+      - run: npx playwright install --with-deps chromium
+      - run: npm run test:e2e --prefix studio
+      - run: npm run test:e2e
+      - run: npm run validate:package
+      - uses: actions/upload-artifact@v4
+        with:
+          name: limova-ai-extension-2.2.44
+          path: |
+            dist/limova-ai-extension-2.2.44.zip
+            dist/limova-ai-extension-2.2.44.zip.sha256
+          if-no-files-found: error

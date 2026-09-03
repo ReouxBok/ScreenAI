@@ -1,5 +1,54 @@
-config.local.js
-proxy/.env
-proxy/node_modules/
-node_modules/
 .DS_Store
+config.local.js
+
+# Dependencies
+node_modules/
+**/node_modules/
+
+# Env / secrets
+.env
+.env.*
+**/.env
+**/.env.*
+!.env.example
+!**/.env.example
+
+# Build artefacts
+build/
+build.zip
+dist/
+**/.next/
+**/.vercel/
+**/.e2e-db/
+backups/
+*.db
+*.db-*
+*.sqlite
+*.sqlite3
+*.zip
+*.tar
+*.tar.gz
+
+# Tooling / caches
+.code-review-graph/
+coverage/
+playwright-report/
+test-results/
+**/playwright-report/
+**/test-results/
+.vitest-cache/
+*.tsbuildinfo
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.code-workspace
+
+# Local agent/editor configuration (not application source)
+.agents/
+**/.agents/
+.claude/
+.mcp.json
+.cursorrules
+.windsurfrules

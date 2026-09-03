@@ -1,0 +1,17 @@
+{
+  "$schema": "https://openapi.vercel.sh/vercel.json",
+  "crons": [
+    {
+      "path": "/api/cron/memory-retention",
+      "schedule": "17 3 * * *"
+    },
+    {
+      "path": "/api/cron/gmail-watch-renew",
+      "schedule": "11 4 * * *"
+    },
+    {
+      "path": "/api/cron/sav-reconcile",
+      "schedule": "*/5 * * * *"
+    }
+  ]
+}
