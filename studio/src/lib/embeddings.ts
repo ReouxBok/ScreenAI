@@ -31,7 +31,16 @@ export function deterministicEmbedding(text: string) {
 export function embeddingFailureDiagnostic(error: unknown, durationMs: number, model = GEMINI_EMBEDDING_MODEL) {
   const source = error && typeof error === "object" ? error as Record<string, unknown> : {};
   const status = Number(source.status ?? source.statusCode);
-  const rawCode = String(source.code ?? source.name ?? "EMBEDDING_PROVIDER_ERROR");
+  let providerCode: unknown;
+  if (typeof source.message === "string") {
+    try {
+      const parsed = JSON.parse(source.message) as { error?: { status?: unknown; code?: unknown } };
+      providerCode = parsed.error?.status ?? parsed.error?.code;
+    } catch {
+      providerCode = undefined;
+    }
+  }
+  const rawCode = String(source.code ?? providerCode ?? source.name ?? "EMBEDDING_PROVIDER_ERROR");
   return {
     model,
     status: Number.isInteger(status) && status >= 100 && status <= 599 ? status : null,

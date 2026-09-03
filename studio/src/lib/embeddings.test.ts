@@ -28,4 +28,14 @@ describe("embedding credential isolation", () => {
     expect(diagnostic).toEqual({ model: "gemini-embedding-001", status: 403, errorCode: "API_KEY_INVALID", latencyMs: 42 });
     expect(JSON.stringify(diagnostic)).not.toContain("never-log");
   });
+
+  it("extrait le code Google sans retourner le message fournisseur", () => {
+    const diagnostic = embeddingFailureDiagnostic({
+      name: "ApiError",
+      status: 400,
+      message: JSON.stringify({ error: { code: 400, status: "API_KEY_SERVICE_BLOCKED", message: "sensitive provider detail" } }),
+    }, 12.4);
+    expect(diagnostic).toEqual({ model: "gemini-embedding-001", status: 400, errorCode: "API_KEY_SERVICE_BLOCKED", latencyMs: 12 });
+    expect(JSON.stringify(diagnostic)).not.toContain("sensitive provider detail");
+  });
 });

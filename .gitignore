@@ -52,3 +52,5 @@ test-results/
 .mcp.json
 .cursorrules
 .windsurfrules
+.vercel
+.env*
