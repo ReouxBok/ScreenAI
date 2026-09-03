@@ -33,7 +33,14 @@ describe("embedding credential isolation", () => {
     const diagnostic = embeddingFailureDiagnostic({
       name: "ApiError",
       status: 400,
-      message: JSON.stringify({ error: { code: 400, status: "API_KEY_SERVICE_BLOCKED", message: "sensitive provider detail" } }),
+      message: JSON.stringify({
+        error: {
+          code: 400,
+          status: "INVALID_ARGUMENT",
+          message: "sensitive provider detail",
+          details: [{ reason: "API_KEY_SERVICE_BLOCKED" }],
+        },
+      }),
     }, 12.4);
     expect(diagnostic).toEqual({ model: "gemini-embedding-001", status: 400, errorCode: "API_KEY_SERVICE_BLOCKED", latencyMs: 12 });
     expect(JSON.stringify(diagnostic)).not.toContain("sensitive provider detail");

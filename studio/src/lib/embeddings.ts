@@ -34,8 +34,12 @@ export function embeddingFailureDiagnostic(error: unknown, durationMs: number, m
   let providerCode: unknown;
   if (typeof source.message === "string") {
     try {
-      const parsed = JSON.parse(source.message) as { error?: { status?: unknown; code?: unknown } };
-      providerCode = parsed.error?.status ?? parsed.error?.code;
+      const parsed = JSON.parse(source.message) as {
+        error?: { status?: unknown; code?: unknown; details?: Array<{ reason?: unknown }> };
+      };
+      providerCode = parsed.error?.details?.find((detail) => typeof detail.reason === "string")?.reason
+        ?? parsed.error?.status
+        ?? parsed.error?.code;
     } catch {
       providerCode = undefined;
     }
