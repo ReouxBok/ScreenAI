@@ -14,5 +14,12 @@ export const metadata: Metadata = {
 };
 
 export default function RootLayout({ children }: LayoutProps<"/">) {
-  return <html lang="fr" className={`${body.variable} ${display.variable} ${mono.variable}`}><body><ClerkProvider afterSignOutUrl="/connexion">{children}</ClerkProvider></body></html>;
+  const isDevelopmentAuthBypass =
+    process.env.NODE_ENV !== "production" && process.env.DEV_AUTH_BYPASS === "true";
+
+  return <html lang="fr" className={`${body.variable} ${display.variable} ${mono.variable}`}><body>
+    {isDevelopmentAuthBypass
+      ? children
+      : <ClerkProvider afterSignOutUrl="/connexion">{children}</ClerkProvider>}
+  </body></html>;
 }

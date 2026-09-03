@@ -1,6 +1,14 @@
 import { clerkMiddleware } from "@clerk/nextjs/server";
+import { NextResponse } from "next/server";
 
-export default clerkMiddleware();
+const isDevelopmentAuthBypass =
+  process.env.NODE_ENV !== "production" && process.env.DEV_AUTH_BYPASS === "true";
+
+// The isolated E2E server deliberately has no Clerk tenant. Keep the bypass
+// development-only so a production build can never disable Clerk by accident.
+export default isDevelopmentAuthBypass
+  ? () => NextResponse.next()
+  : clerkMiddleware();
 
 export const config = {
   matcher: [
