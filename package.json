@@ -1,6 +1,6 @@
 {
   "name": "limova-ai-extension",
-  "version": "2.2.44",
+  "version": "2.2.45",
   "private": true,
   "description": "Limova AI — Charly, onboarding assistant Chrome extension (MV3)",
   "type": "module",

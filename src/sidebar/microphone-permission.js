@@ -1,11 +1,12 @@
 const permissionCopy = {
   fr: {
     title: 'Autoriser le microphone',
-    description: 'Chrome doit recevoir cette autorisation dans un onglet complet avant que Charly puisse écouter depuis le panneau latéral.',
-    privacy: 'Le micro s’active uniquement quand tu démarres une conversation vocale et s’arrête quand tu la quittes.',
+    description: 'Chrome doit recevoir cette autorisation dans un onglet complet avant que Charly puisse écouter depuis le panneau latéral ou enregistrer un tutoriel.',
+    privacy: 'Le micro s’active uniquement pendant une conversation vocale ou un enregistrement que tu démarres, puis s’arrête à la fin.',
     allow: 'Autoriser le microphone',
     retry: 'Réessayer',
     close: 'Retourner sur Limova',
+    settings: 'Ouvrir les paramètres Chrome',
     requesting: 'Choisis « Autoriser » dans la demande affichée par Chrome.',
     success: 'Microphone autorisé. Tu peux retourner sur Limova.',
     dismissed: 'La demande a été fermée. Clique sur « Réessayer », puis choisis « Autoriser » dans Chrome.',
@@ -14,11 +15,12 @@ const permissionCopy = {
   },
   en: {
     title: 'Allow microphone access',
-    description: 'Chrome needs this authorization in a full tab before Charly can listen from the side panel.',
-    privacy: 'The microphone is active only when you start a voice conversation and stops when you leave it.',
+    description: 'Chrome needs this authorization in a full tab before Charly can listen from the side panel or record a tutorial.',
+    privacy: 'The microphone is active only during a voice conversation or recording that you start, then stops when it ends.',
     allow: 'Allow microphone',
     retry: 'Try again',
     close: 'Return to Limova',
+    settings: 'Open Chrome settings',
     requesting: 'Choose “Allow” in the request displayed by Chrome.',
     success: 'Microphone allowed. You can return to Limova.',
     dismissed: 'The request was closed. Click “Try again”, then choose “Allow” in Chrome.',
@@ -27,11 +29,12 @@ const permissionCopy = {
   },
   es: {
     title: 'Permitir el acceso al micrófono',
-    description: 'Chrome necesita esta autorización en una pestaña completa antes de que Charly pueda escuchar desde el panel lateral.',
-    privacy: 'El micrófono solo está activo cuando inicias una conversación de voz y se detiene cuando sales de ella.',
+    description: 'Chrome necesita esta autorización en una pestaña completa antes de que Charly pueda escuchar desde el panel lateral o grabar un tutorial.',
+    privacy: 'El micrófono solo está activo durante una conversación de voz o una grabación que inicias, y se detiene al terminar.',
     allow: 'Permitir el micrófono',
     retry: 'Volver a intentar',
     close: 'Volver a Limova',
+    settings: 'Abrir la configuración de Chrome',
     requesting: 'Elige «Permitir» en la solicitud que muestra Chrome.',
     success: 'Micrófono permitido. Puedes volver a Limova.',
     dismissed: 'Se cerró la solicitud. Haz clic en «Volver a intentar» y elige «Permitir» en Chrome.',
@@ -48,6 +51,7 @@ const elements = {
   privacy: document.getElementById('privacyNote'),
   status: document.getElementById('permissionStatus'),
   allow: document.getElementById('allowMicrophone'),
+  settings: document.getElementById('openMicrophoneSettings'),
   close: document.getElementById('closePermission')
 };
 
@@ -57,12 +61,14 @@ elements.title.textContent = copy.title;
 elements.description.textContent = copy.description;
 elements.privacy.textContent = copy.privacy;
 elements.allow.textContent = copy.allow;
+elements.settings.textContent = copy.settings;
 elements.close.textContent = copy.close;
 
 function showSuccess() {
   elements.status.textContent = copy.success;
   elements.status.classList.add('success');
   elements.allow.hidden = true;
+  elements.settings.hidden = true;
   elements.close.hidden = false;
   chrome.runtime.sendMessage({ type: 'MICROPHONE_PERMISSION_RESULT', granted: true }).catch(() => {});
   chrome.runtime.sendMessage({
@@ -83,9 +89,11 @@ async function requestMicrophonePermission() {
     showSuccess();
   } catch (error) {
     const dismissed = /dismiss|cancel|clos/i.test(error?.message || '');
+    const denied = error?.name === 'NotAllowedError' && !dismissed;
     elements.status.textContent = error?.name === 'NotAllowedError'
       ? (dismissed ? copy.dismissed : copy.denied)
       : copy.unavailable;
+    elements.settings.hidden = !denied;
     elements.allow.textContent = copy.retry;
     elements.allow.disabled = false;
     chrome.runtime.sendMessage({
@@ -98,6 +106,13 @@ async function requestMicrophonePermission() {
 }
 
 elements.allow.addEventListener('click', requestMicrophonePermission);
+elements.settings.addEventListener('click', async () => {
+  try {
+    await chrome.tabs.create({ url: 'chrome://settings/content/microphone', active: true });
+  } catch (_) {
+    elements.status.textContent = `${copy.denied} chrome://settings/content/microphone`;
+  }
+});
 elements.close.addEventListener('click', () => window.close());
 
 navigator.permissions?.query({ name: 'microphone' }).then(permission => {

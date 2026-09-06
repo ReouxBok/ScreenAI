@@ -531,6 +531,36 @@ test.describe('Packaged extension — complete user flows', () => {
     }));
   });
 
+  test('training mode recovers a microphone authorization refused by the side panel', async ({ context, extensionId }) => {
+    const { calls, sidebar } = await openExtensionHarness(context, extensionId);
+    await sidebar.locator('#menuBtn').click();
+    await sidebar.locator('#trainingBtn').click();
+    await sidebar.locator('#trainingToken').fill('training-token-e2e-that-is-long-enough');
+    await sidebar.evaluate(() => {
+      window.__trainingPermissionRequests = 0;
+      window.LimovaTrainingScreenRecorder = class {
+        async start() {
+          const error = new Error('Autorise le microphone.');
+          error.code = 'TRAINING_MIC_REQUIRED';
+          throw error;
+        }
+        abort() {}
+      };
+      window.LimovaVoiceSession = class {
+        async requestMicrophonePermissionInTab() {
+          window.__trainingPermissionRequests += 1;
+        }
+      };
+    });
+
+    await sidebar.locator('#trainingStart').click();
+
+    await expect(sidebar.locator('#trainingFeedback')).toContainText('Microphone autorisé');
+    await expect(sidebar.locator('#trainingStart')).toBeEnabled();
+    await expect.poll(() => sidebar.evaluate(() => window.__trainingPermissionRequests)).toBe(1);
+    expect(calls.training).toHaveLength(0);
+  });
+
   test('trainer microphone stays passive: it transcribes but never chats or clicks', async ({ mediaContext, mediaExtensionId }) => {
     const socketMessages = [];
     let liveSocket;

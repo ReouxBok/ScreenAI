@@ -443,8 +443,12 @@ async function startTrainingCapture() {
   } catch (error) {
     trainingScreenRecorder?.abort();
     trainingScreenRecorder = null;
+    if (error?.code === 'TRAINING_MIC_REQUIRED') {
+      await recoverTrainingMicrophonePermission();
+    } else {
+      elements.trainingFeedback.textContent = error?.message || 'Le partage de l’écran entier a été annulé.';
+    }
     elements.trainingStart.disabled = false;
-    elements.trainingFeedback.textContent = error?.message || 'Le partage de l’écran entier a été annulé.';
     return;
   }
   elements.trainingFeedback.textContent = 'Connexion au Studio…';
@@ -481,6 +485,21 @@ async function startTrainingCapture() {
     return;
   }
   showTrainingActive(response.session);
+}
+
+async function recoverTrainingMicrophonePermission() {
+  if (!window.LimovaVoiceSession) {
+    elements.trainingFeedback.textContent = 'Le microphone est bloqué. Recharge Limova AI depuis chrome://extensions, puis réessaie.';
+    return;
+  }
+  elements.trainingFeedback.textContent = 'Autorise le microphone dans le nouvel onglet Chrome, puis reviens ici.';
+  try {
+    const permissionSession = new window.LimovaVoiceSession({ trainingMode: true });
+    await permissionSession.requestMicrophonePermissionInTab();
+    elements.trainingFeedback.textContent = 'Microphone autorisé. Clique à nouveau sur « Choisir l’écran entier et commencer ».';
+  } catch (_) {
+    elements.trainingFeedback.textContent = 'Le microphone reste bloqué. Dans l’onglet d’autorisation, ouvre les paramètres Chrome, autorise Limova AI, puis réessaie.';
+  }
 }
 
 async function startEvaluation() {

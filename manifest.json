@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Limova AI - Assistant Onboarding",
-  "version": "2.2.44",
+  "version": "2.2.45",
   "minimum_chrome_version": "114",
   "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA1W77Qq9OawSMsnZGUC/m75Vk2t9+3sqc86WeJPA0AndBaECoWQ1dtgv0vQpDyz+URzAC8ObWmsB9ioU2i7oYIxWovKapTlpH/0ANy6zOAbVf9emlyY7ub3W3IPtazyjidgsyYthNPEV6Ybk+dYyg5EEbHN4Czc8wZ6A0u2qQ2la4uwvIlpHu/8JTu8bkARsy6tZ++r0OMK/h/frDUPKRQ7YIHVw3siZzzHJNQC1Dx1DO3066ZIaL6H+MnQ0AEc0WGuc1MLzpr7Qe1NKKWTsd99v/xqu91s2L9hJgMQ49QuSIxzQ3AKLDR5YdoARslYBlcjRYnc1ulb9g1ZSckywgowIDAQAB",
   "description": "Charly analyse Limova, guide chaque étape et converse à la voix en temps réel.",

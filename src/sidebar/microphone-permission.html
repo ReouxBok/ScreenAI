@@ -11,10 +11,11 @@
     <img src="../../assets/branding/charly.png" alt="Charly" class="charly-avatar">
     <p class="eyebrow">Limova AI</p>
     <h1 id="permissionTitle">Autoriser le microphone</h1>
-    <p id="permissionDescription">Chrome doit recevoir cette autorisation dans un onglet complet avant que Charly puisse écouter depuis le panneau latéral.</p>
-    <p class="privacy-note" id="privacyNote">Le micro s’active uniquement quand tu démarres une conversation vocale et s’arrête quand tu la quittes.</p>
+    <p id="permissionDescription">Chrome doit recevoir cette autorisation dans un onglet complet avant que Charly puisse écouter depuis le panneau latéral ou enregistrer un tutoriel.</p>
+    <p class="privacy-note" id="privacyNote">Le micro s’active uniquement pendant une conversation vocale ou un enregistrement que tu démarres, puis s’arrête à la fin.</p>
     <div class="status" id="permissionStatus" role="status" aria-live="polite"></div>
     <button class="primary-button" id="allowMicrophone">Autoriser le microphone</button>
+    <button class="secondary-button" id="openMicrophoneSettings" hidden>Ouvrir les paramètres Chrome</button>
     <button class="secondary-button" id="closePermission" hidden>Retourner sur Limova</button>
   </main>
   <script src="microphone-permission.js"></script>
