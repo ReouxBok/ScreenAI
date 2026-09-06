@@ -16,7 +16,6 @@ import {
   testCases,
 } from "@/db/schema";
 import { chunkMarkdown } from "./chunking";
-import { hasPassingEvaluation } from "./evaluations";
 import { parseContentInput } from "./content";
 import { embedTexts } from "./embeddings";
 
@@ -79,9 +78,6 @@ export async function submitForReview(itemId: string, actorEmail: string, commen
   const db = requireDb();
   const [item] = await db.select().from(contentItems).where(eq(contentItems.id, itemId)).limit(1);
   if (!item?.currentDraftVersionId) throw new Error("DRAFT_NOT_FOUND");
-  if (item.type === "onboarding" && !await hasPassingEvaluation(item.id, item.currentDraftVersionId)) {
-    throw new Error("REAL_EVALUATION_REQUIRED");
-  }
   await db.transaction(async (tx) => {
     await tx.update(contentItems).set({ status: "in_review", updatedAt: new Date() }).where(eq(contentItems.id, itemId));
     await tx.insert(reviewEvents).values({ itemId, versionId: item.currentDraftVersionId, action: "submitted", actorEmail, comment });

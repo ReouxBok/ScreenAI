@@ -16,11 +16,11 @@ const steps = ["draft", "in_review", "published", "archived"] as const;
 
 export default async function DetailPage({ params, searchParams }: {
   params: Promise<{ id: string }>;
-  searchParams: Promise<{ delete?: string; evaluation?: string; testCode?: string; testCase?: string }>;
+  searchParams: Promise<{ delete?: string; testCode?: string; testCase?: string }>;
 }) {
   const { id } = await params;
   const staff = await requireStaff();
-  const { delete: deleteState, evaluation, testCode, testCase } = await searchParams;
+  const { delete: deleteState, testCode, testCase } = await searchParams;
   const detail = await getContentDetail(id);
   if (!detail) notFound();
   const current = detail.versions.find((version) => version.id === detail.item.currentDraftVersionId) ?? detail.versions[0];
@@ -73,7 +73,7 @@ export default async function DetailPage({ params, searchParams }: {
         }}/> : <div className="locked-content"><strong>Contenu verrouillé pour les membres</strong><p>Vous pouvez consulter son historique, mais sa version en production ne peut être modifiée que par Ugo ou Reouven.</p></div>}
         {current && <VersionComparison current={current.bodyMarkdown} previous={previous?.bodyMarkdown}/>}
         {sourceTraining && <TrainingRecordingReview session={sourceTraining} context="validation"/>}
-        {detail.item.type === "onboarding" && <ContentEvaluationPanel itemId={id} data={evaluationData} testCode={testCode} testCaseId={testCase} required={evaluation === "required"}/>}
+        {detail.item.type === "onboarding" && <ContentEvaluationPanel itemId={id} data={evaluationData} testCode={testCode} testCaseId={testCase}/>}
         <section className="decision-section">
           <div><span className="eyebrow">Prochaine étape</span><h2>{detail.item.status === "draft" ? "Envoyer à la validation" : detail.item.status === "in_review" ? "Décider de cette version" : detail.item.status === "published" ? "Cette version est active" : "Contenu archivé"}</h2></div>
           {detail.item.status === "draft" && canEdit && <form action={submitAction}><input type="hidden" name="itemId" value={id}/><input type="hidden" name="comment" value="Soumis pour validation"/><button className="primary">Demander la validation</button></form>}

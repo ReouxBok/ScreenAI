@@ -30,7 +30,7 @@ async function enableAiForTitle(page: import("@playwright/test").Page, title: st
 
 async function passRealEvaluation(page: import("@playwright/test").Page, request: import("@playwright/test").APIRequestContext) {
   const prepare = page.getByRole("button", { name: "Préparer le test complet" });
-  const critical = page.locator(".evaluation-case").filter({ hasText: "Obligatoire" }).first();
+  const critical = page.locator(".evaluation-case").filter({ hasText: "Optionnel" }).first();
   if (await critical.count() === 0) {
     await expect(prepare).toBeVisible();
     await prepare.click();
@@ -51,7 +51,7 @@ async function passRealEvaluation(page: import("@playwright/test").Page, request
   expect(completed.ok()).toBe(true);
   expect((await completed.json()).run).toMatchObject({ status: "passed", score: 100 });
   await page.reload();
-  await expect(page.getByText("Prêt pour la review")).toBeVisible();
+  await expect(page.getByText("Flow vérifié")).toBeVisible();
 }
 
 async function createPublishedOnboarding(page: import("@playwright/test").Page, request: import("@playwright/test").APIRequestContext, suffix: string, title: string) {
@@ -115,7 +115,7 @@ test("workflow complet, recherche Charly, rollback et archivage",async({page,req
   await expect(page.getByText("Archivé",{exact:true}).first()).toBeVisible();
 });
 
-test("un reviewer peut refuser un parcours et le renvoyer en brouillon",async({page,request})=>{
+test("un parcours peut être envoyé en validation sans exécuter le test facultatif",async({page})=>{
   await login(page);
   await page.goto("/studio/contenus/nouveau?type=onboarding");
   await page.getByRole("textbox",{name:"Titre",exact:true}).fill("Démarrer sa prospection LinkedIn");
@@ -128,10 +128,9 @@ test("un reviewer peut refuser un parcours et le renvoyer en brouillon",async({p
   await page.locator(".tiptap").fill("## Qualification\n\nDemander le métier puis proposer le super-pouvoir LinkedIn.");
   await page.getByLabel("Commentaire de modification").fill("Création du parcours E2E");
   await page.getByRole("button",{name:"Enregistrer le brouillon"}).click();
+  await expect(page.getByText("Test facultatif · tout le flow")).toBeVisible();
   await page.getByRole("button",{name:"Demander la validation"}).click();
-  await expect(page.getByText("Le flow complet doit réussir avant l’envoi à l’administrateur.")).toBeVisible();
-  await passRealEvaluation(page, request);
-  await page.getByRole("button",{name:"Demander la validation"}).click();
+  await expect(page.getByRole("button",{name:"Valider et publier"})).toBeVisible();
   await page.getByLabel("Commentaire uniquement si vous demandez une correction").fill("Préciser la branche de repli");
   await page.getByRole("button",{name:"Demander une correction"}).click();
   await expect(page.getByText("Brouillon",{exact:true}).first()).toBeVisible();

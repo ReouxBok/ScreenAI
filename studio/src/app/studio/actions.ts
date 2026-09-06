@@ -98,12 +98,7 @@ export async function submitAction(form: FormData) {
   const staff = await requireApiStaff();
   const id = String(form.get("itemId"));
   await assertContentEditable(staff, id);
-  try {
-    await submitForReview(id, staff.email, String(form.get("comment") || "Prêt à valider"));
-  } catch (error) {
-    if (error instanceof Error && error.message === "REAL_EVALUATION_REQUIRED") redirect(`/studio/contenus/${id}?evaluation=required#content-evaluation`);
-    throw error;
-  }
+  await submitForReview(id, staff.email, String(form.get("comment") || "Prêt à valider"));
   revalidatePath(`/studio/contenus/${id}`);
 }
 
