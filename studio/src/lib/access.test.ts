@@ -1,8 +1,15 @@
 import { describe, expect, it } from "vitest";
-import { canCreateTraining, canEditContent, canManageTraining, hasRole, isAllowedStaffEmail, normalizeStaffEmail } from "./access";
+import { canCreateTraining, canEditContent, canManageTraining, getStaffDirectoryEntry, hasRole, isAllowedStaffEmail, normalizeStaffEmail } from "./access";
 describe("staff access",()=>{
   it.each([["member","member",true],["member","admin",false],["admin","member",true],["admin","owner",false],["owner","admin",true]] as const)("role %s for %s",(actual,required,allowed)=>expect(hasRole(actual,required)).toBe(allowed));
-  it("applique la liste blanche exacte",()=>{expect(isAllowedStaffEmail("ugo@limova.ai")).toBe(true);expect(isAllowedStaffEmail("alice@limova.ai")).toBe(false);expect(isAllowedStaffEmail("ugo@gmail.com")).toBe(false);});
+  it("autorise tout le domaine Limova et refuse les domaines externes",()=>{
+    expect(isAllowedStaffEmail("ugo@limova.ai")).toBe(true);
+    expect(isAllowedStaffEmail("mehdi.t@limova.ai")).toBe(true);
+    expect(isAllowedStaffEmail("nouveau.collaborateur@limova.ai")).toBe(true);
+    expect(isAllowedStaffEmail("ugo@gmail.com")).toBe(false);
+    expect(isAllowedStaffEmail("ugo@limova.ai.example.com")).toBe(false);
+    expect(getStaffDirectoryEntry("nouveau.collaborateur@limova.ai")).toEqual({ name: "Nouveau Collaborateur", role: "member" });
+  });
   it("normalise les emails",()=>{
     expect(normalizeStaffEmail("identite-invalide")).toBe("reouven@limova.ai");
     expect(normalizeStaffEmail(" UGO@LIMOVA.AI ")).toBe("ugo@limova.ai");

@@ -12,6 +12,7 @@ export const STAFF_DIRECTORY = {
   "lea@limova.ai": { name: "Léa", role: "member" },
   "novalie@limova.ai": { name: "Novalie", role: "member" },
   "mehdi@limova.ai": { name: "Mehdi", role: "member" },
+  "mehdi.t@limova.ai": { name: "Mehdi T", role: "member" },
   "yannis@limova.ai": { name: "Yannis", role: "member" },
 } as const satisfies Record<string, StaffDirectoryEntry>;
 
@@ -28,7 +29,18 @@ export function normalizeStaffEmail(email: string | undefined, fallback = "reouv
 
 export function getStaffDirectoryEntry(email: string | undefined): StaffDirectoryEntry | null {
   const normalized = normalizeStaffEmail(email, "");
-  return STAFF_DIRECTORY[normalized as keyof typeof STAFF_DIRECTORY] ?? null;
+  const explicitEntry = STAFF_DIRECTORY[normalized as keyof typeof STAFF_DIRECTORY];
+  if (explicitEntry) return explicitEntry;
+  if (!normalized.endsWith("@limova.ai")) return null;
+
+  const localPart = normalized.slice(0, -"@limova.ai".length);
+  if (!localPart) return null;
+  const name = localPart
+    .split(/[._-]+/)
+    .filter(Boolean)
+    .map((part) => `${part.charAt(0).toUpperCase()}${part.slice(1)}`)
+    .join(" ");
+  return { name: name || normalized, role: "member" };
 }
 
 export function isAllowedStaffEmail(email: string) {

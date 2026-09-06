@@ -16,7 +16,7 @@ export default async function ConnexionPage() {
       <SignOutButton><button className="secondary" type="button">Utiliser un autre compte</button></SignOutButton>
     </> : <>
       <p className="muted">Connectez-vous avec votre adresse email Limova et votre mot de passe personnel.</p>
-      <SignIn routing="hash" withSignUp={false} forceRedirectUrl="/studio"/>
+      <SignIn routing="hash" withSignUp forceRedirectUrl="/studio"/>
     </>}
   </section></main>;
 }

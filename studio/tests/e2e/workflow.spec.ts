@@ -363,7 +363,7 @@ test("la trame publiée hiérarchise les contenus et devient le template de Char
 test("un membre crée, finalise et transforme son tutoriel sans accéder à celui d’un collègue",async({browser})=>{
   test.setTimeout(60_000);
   const baseURL = "http://127.0.0.1:3100";
-  const memberContext = await browser.newContext({ baseURL, extraHTTPHeaders: { "x-studio-test-user": "matheo@limova.ai" } });
+  const memberContext = await browser.newContext({ baseURL, extraHTTPHeaders: { "x-studio-test-user": "mehdi.t@limova.ai" } });
   const otherMemberContext = await browser.newContext({ baseURL, extraHTTPHeaders: { "x-studio-test-user": "arnaud@limova.ai" } });
   const adminContext = await browser.newContext({ baseURL, extraHTTPHeaders: { "x-studio-test-user": "ugo@limova.ai" } });
   const memberPage = await memberContext.newPage();
