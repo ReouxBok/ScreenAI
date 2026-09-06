@@ -416,3 +416,57 @@ test("un membre crée, finalise et transforme son tutoriel sans accéder à celu
     await Promise.all([memberContext.close(), otherMemberContext.close(), adminContext.close()]);
   }
 });
+
+test("dix membres créent et enregistrent leurs tutoriels en parallèle", async ({ browser }) => {
+  test.setTimeout(120_000);
+  const baseURL = "http://127.0.0.1:3100";
+  const emails = [
+    "reouven@limova.ai",
+    "ugo@limova.ai",
+    "contact@limova.ai",
+    "arnaud@limova.ai",
+    "matheo@limova.ai",
+    "cyril@limova.ai",
+    "lea@limova.ai",
+    "novalie@limova.ai",
+    "mehdi.t@limova.ai",
+    "yannis@limova.ai",
+  ];
+  const contexts = await Promise.all(emails.map((email) => browser.newContext({
+    baseURL,
+    extraHTTPHeaders: { "x-studio-test-user": email },
+  })));
+
+  try {
+    const pages = await Promise.all(contexts.map((context) => context.newPage()));
+    await Promise.all(pages.map((page) => page.goto("/studio/entrainements")));
+    await Promise.all(pages.map(async (page, index) => {
+      await page.getByLabel("Nom du parcours").fill(`Tutoriel parallèle ${index + 1}`);
+      await page.getByLabel("Ce que Charly doit apprendre").fill(`Valider le parcours simultané ${index + 1}.`);
+      await page.getByLabel("Agent").selectOption("charly");
+      await page.getByLabel("Page de départ").fill(`/parallel-${index + 1}`);
+    }));
+    await Promise.all(pages.map((page) => page.getByRole("button", { name: "Créer la démonstration" }).click()));
+
+    const sessions = await Promise.all(pages.map(async (page, index) => {
+      await expect(page).toHaveURL(/\/studio\/entrainements\/[0-9a-f-]+\?token=/);
+      const token = (await page.locator(".training-code code").textContent())?.trim();
+      expect(token).toBeTruthy();
+      return { token: token!, context: contexts[index], path: `/parallel-${index + 1}` };
+    }));
+
+    const results = await Promise.all(sessions.map(async ({ token, context, path }) => {
+      const headers = { Authorization: `Bearer ${token}` };
+      const connected = await context.request.post("/api/training/sessions/connect", { data: { token } });
+      const events = await Promise.all([
+        context.request.post("/api/training/sessions/events", { headers, data: { kind: "navigation", path, label: "Départ parallèle" } }),
+        context.request.post("/api/training/sessions/events", { headers, data: { kind: "voice_note", path, label: "Explication parallèle" } }),
+      ]);
+      const completed = await context.request.post("/api/training/sessions/complete", { headers });
+      return [connected, ...events, completed].map((response) => response.status());
+    }));
+    expect(results.flat()).toEqual(Array(40).fill(200));
+  } finally {
+    await Promise.all(contexts.map((context) => context.close()));
+  }
+});

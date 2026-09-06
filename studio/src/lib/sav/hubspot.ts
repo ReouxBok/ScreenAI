@@ -55,6 +55,9 @@ type TicketEmailSnapshot = {
 const globalForHubspot = globalThis as typeof globalThis & { __savClosedHubspotStages?: { values: Set<string>; expiresAt: number } };
 export const HUBSPOT_EMAIL_READ_SCOPE = "crm.objects.emails.read";
 const HUBSPOT_BACKFILL_RETRY_MS = 30 * 60 * 1_000;
+const HUBSPOT_BACKFILL_LEASE_MS = 10 * 60 * 1_000;
+export const HUBSPOT_TICKET_TRANSCRIPT_MAX_BYTES = 48 * 1024;
+const HUBSPOT_TICKET_EMAIL_BODY_MAX_CHARS = 8_000;
 
 function requiredEnv(name: string) {
   const value = process.env[name];
@@ -181,8 +184,11 @@ export function shouldAttemptHubspotBackfill(
   state: { status: string; lastError: string | null; updatedAt: Date } | null,
   now = Date.now(),
 ) {
-  if (!state || state.status !== "blocked" || !isHubspotEmailReadScopeError(state.lastError)) return true;
-  return now - state.updatedAt.getTime() >= HUBSPOT_BACKFILL_RETRY_MS;
+  if (!state) return true;
+  const age = now - state.updatedAt.getTime();
+  if (state.status === "running" && age < HUBSPOT_BACKFILL_LEASE_MS) return false;
+  if (state.status !== "blocked" || !isHubspotEmailReadScopeError(state.lastError)) return true;
+  return age >= HUBSPOT_BACKFILL_RETRY_MS;
 }
 
 function isHubspotValidationError(error: unknown) {
@@ -561,15 +567,65 @@ export async function processPendingPilotHubspotActionsAcrossBatches(limit = 100
 async function loadTicketEmails(ticket: HubspotRecord) {
   const ids = ticket.associations?.emails?.results?.map((association) => association.id) ?? [];
   const emails: HubspotRecord[] = [];
-  for (const id of ids.slice(0, 200)) {
+  for (const id of ids.slice(-200)) {
     emails.push(await hubspotFetch<HubspotRecord>(`/crm/v3/objects/emails/${encodeURIComponent(id)}?properties=hs_email_text,hs_email_html,hs_email_subject,hs_email_from_email,hs_email_to_email,hs_timestamp,hs_email_direction`));
   }
   return emails;
 }
 
+function hubspotEmailPlainText(value: string) {
+  return String(value || "")
+    .replace(/<script\b[^>]*>[\s\S]*?<\/script>/gi, " ")
+    .replace(/<style\b[^>]*>[\s\S]*?<\/style>/gi, " ")
+    .replace(/<br\s*\/?>/gi, "\n")
+    .replace(/<\/p>/gi, "\n")
+    .replace(/<[^>]+>/g, " ")
+    .replace(/&nbsp;/gi, " ")
+    .replace(/&amp;/gi, "&")
+    .replace(/&lt;/gi, "<")
+    .replace(/&gt;/gi, ">")
+    .replace(/\r/g, "")
+    .replace(/[ \t]+/g, " ")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+}
+
+function compactHubspotEmail(email: TicketEmailSnapshot): TicketEmailSnapshot {
+  return {
+    id: String(email.id || "").slice(0, 200),
+    // HubSpot commonly returns the same message as both text and HTML. Keeping
+    // one normalized representation avoids duplicating entire quoted threads.
+    hs_email_text: hubspotEmailPlainText(email.hs_email_text || email.hs_email_html)
+      .slice(0, HUBSPOT_TICKET_EMAIL_BODY_MAX_CHARS),
+    hs_email_html: "",
+    hs_email_subject: hubspotEmailPlainText(email.hs_email_subject).slice(0, 500),
+    hs_email_from_email: String(email.hs_email_from_email || "").slice(0, 320),
+    hs_email_to_email: String(email.hs_email_to_email || "").slice(0, 1_000),
+    hs_timestamp: String(email.hs_timestamp || "").slice(0, 80),
+    hs_email_direction: String(email.hs_email_direction || "").slice(0, 80),
+  };
+}
+
+export function compactHubspotTicketTranscript(rawTranscript: TicketEmailSnapshot[]) {
+  const normalized = rawTranscript.map(compactHubspotEmail)
+    .sort((left, right) => `${left.hs_timestamp}:${left.id}`.localeCompare(`${right.hs_timestamp}:${right.id}`));
+  const selected: TicketEmailSnapshot[] = [];
+  for (let index = normalized.length - 1; index >= 0; index -= 1) {
+    const candidate = [normalized[index], ...selected];
+    if (Buffer.byteLength(JSON.stringify({ transcript: candidate }), "utf8") > HUBSPOT_TICKET_TRANSCRIPT_MAX_BYTES) {
+      if (selected.length) break;
+      const fallback = { ...normalized[index], hs_email_text: normalized[index].hs_email_text.slice(0, 4_000) };
+      selected.push(fallback);
+      break;
+    }
+    selected.unshift(normalized[index]);
+  }
+  return selected;
+}
+
 async function snapshotTicket(ticket: HubspotRecord) {
   const emails = await loadTicketEmails(ticket);
-  const transcript: TicketEmailSnapshot[] = emails.map((email) => ({
+  const transcript = compactHubspotTicketTranscript(emails.map((email) => ({
     id: email.id,
     hs_email_text: String(email.properties.hs_email_text || ""),
     hs_email_html: String(email.properties.hs_email_html || ""),
@@ -578,12 +634,13 @@ async function snapshotTicket(ticket: HubspotRecord) {
     hs_email_to_email: String(email.properties.hs_email_to_email || ""),
     hs_timestamp: String(email.properties.hs_timestamp || ""),
     hs_email_direction: String(email.properties.hs_email_direction || ""),
-  })).sort((left, right) => `${left.hs_timestamp}:${left.id}`.localeCompare(`${right.hs_timestamp}:${right.id}`));
+  })));
   const outbound = transcript.filter((email) => /EMAIL|OUTGOING/i.test(String(email.hs_email_direction || "")));
   const humanIntervened = outbound.some((email) => !String(email.hs_email_text || email.hs_email_html || "").includes(AI_DISCLOSURE));
   const closed = (await closedTicketStages()).has(String(ticket.properties.hs_pipeline_stage || ""));
   const updatedAt = new Date(ticket.updatedAt || ticket.properties.hs_lastmodifieddate || Date.now());
-  const contentHash = savContentHash({ transcript, ticketContent: ticket.properties.content || "" });
+  const ticketContent = hubspotEmailPlainText(ticket.properties.content || "").slice(0, 10_000);
+  const contentHash = savContentHash({ transcript, ticketContent });
   const db = requireDb();
   const [snapshot] = await db.insert(savTicketSnapshots).values({
     hubspotTicketId: ticket.id,
@@ -617,7 +674,7 @@ async function snapshotTicket(ticket: HubspotRecord) {
   if (closed) {
     const lastHuman = [...outbound].reverse().find((email) => !String(email.hs_email_text || email.hs_email_html || "").includes(AI_DISCLOSURE));
     const lastResolution = lastHuman ?? [...outbound].reverse().find((email) => String(email.hs_email_text || email.hs_email_html || "").trim());
-    const finalResolution = String(lastResolution?.hs_email_text || lastResolution?.hs_email_html || ticket.properties.content || "").trim().slice(0, 10_000);
+    const finalResolution = String(lastResolution?.hs_email_text || ticketContent).trim().slice(0, 10_000);
     if (finalResolution.length >= 20) await db.insert(savLearningCandidates).values({
       hubspotTicketId: ticket.id,
       sourceContentHash: contentHash,
@@ -673,17 +730,32 @@ export async function continueHubspotBackfill(maxPages = 1, pageSize = 25) {
   const existing = await getHubspotBackfillState();
   if (existing?.status === "complete") return { processed: 0, pages: 0, nextAfter: null, complete: true };
   const now = new Date();
-  await db.insert(savSyncState).values({
-    key: "hubspot:tickets:backfill",
-    cursor: existing?.cursor,
-    status: "running",
-    processedCount: existing?.processedCount ?? 0,
-    startedAt: existing?.startedAt ?? now,
-    updatedAt: now,
-  }).onConflictDoUpdate({
-    target: savSyncState.key,
-    set: { status: "running", lastError: null, updatedAt: now, startedAt: existing?.startedAt ?? now },
-  });
+  const claimed = existing
+    ? await db.update(savSyncState).set({
+      status: "running",
+      lastError: null,
+      updatedAt: now,
+      startedAt: existing.startedAt ?? now,
+    }).where(and(
+      eq(savSyncState.key, "hubspot:tickets:backfill"),
+      eq(savSyncState.updatedAt, existing.updatedAt),
+    )).returning({ key: savSyncState.key })
+    : await db.insert(savSyncState).values({
+      key: "hubspot:tickets:backfill",
+      status: "running",
+      processedCount: 0,
+      startedAt: now,
+      updatedAt: now,
+    }).onConflictDoNothing().returning({ key: savSyncState.key });
+  // Optimistic compare-and-set gives the backfill a single database-backed
+  // lease across concurrent Vercel instances. A second cron exits immediately.
+  if (!claimed.length) return {
+    processed: 0,
+    pages: 0,
+    nextAfter: existing?.cursor ?? null,
+    complete: false,
+    skipped: "already_running" as const,
+  };
   try {
     const result = await backfillHubspotTickets({ after: existing?.cursor ?? undefined, maxPages, pageSize });
     await db.update(savSyncState).set({

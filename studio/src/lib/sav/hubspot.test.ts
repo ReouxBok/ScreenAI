@@ -1,6 +1,6 @@
 import { createHmac } from "node:crypto";
 import { describe, expect, it } from "vitest";
-import { isHubspotEmailReadScopeError, processPendingPilotHubspotActions, processPendingPilotHubspotActionsAcrossBatches, shouldAttemptHubspotBackfill, summarizeHubspotError, verifyHubspotSignature } from "./hubspot";
+import { compactHubspotTicketTranscript, HUBSPOT_TICKET_TRANSCRIPT_MAX_BYTES, isHubspotEmailReadScopeError, processPendingPilotHubspotActions, processPendingPilotHubspotActionsAcrossBatches, shouldAttemptHubspotBackfill, summarizeHubspotError, verifyHubspotSignature } from "./hubspot";
 
 describe("HubSpot webhook verification", () => {
   it("never executes HubSpot work for a pilot batch", async () => {
@@ -69,5 +69,26 @@ describe("HubSpot webhook verification", () => {
     expect(shouldAttemptHubspotBackfill({ status: "blocked", lastError: error, updatedAt: new Date(now - 5 * 60_000) }, now)).toBe(false);
     expect(shouldAttemptHubspotBackfill({ status: "blocked", lastError: error, updatedAt: new Date(now - 31 * 60_000) }, now)).toBe(true);
     expect(shouldAttemptHubspotBackfill({ status: "failed", lastError: "HUBSPOT_HTTP_500", updatedAt: new Date(now) }, now)).toBe(true);
+    expect(shouldAttemptHubspotBackfill({ status: "running", lastError: null, updatedAt: new Date(now - 5 * 60_000) }, now)).toBe(false);
+    expect(shouldAttemptHubspotBackfill({ status: "running", lastError: null, updatedAt: new Date(now - 11 * 60_000) }, now)).toBe(true);
+  });
+
+  it("keeps HubSpot ticket transcripts useful without exhausting database storage", () => {
+    const transcript = Array.from({ length: 200 }, (_, index) => ({
+      id: `email-${index}`,
+      hs_email_text: `Texte ${index} `.repeat(2_000),
+      hs_email_html: `<p>${`HTML ${index} `.repeat(2_000)}</p>`,
+      hs_email_subject: `Sujet ${index}`,
+      hs_email_from_email: "client@example.com",
+      hs_email_to_email: "contact@limova.ai",
+      hs_timestamp: new Date(Date.UTC(2026, 0, 1, 0, index)).toISOString(),
+      hs_email_direction: index % 2 ? "OUTGOING_EMAIL" : "INCOMING_EMAIL",
+    }));
+    const compacted = compactHubspotTicketTranscript(transcript);
+    expect(compacted.length).toBeGreaterThan(0);
+    expect(compacted.at(-1)?.id).toBe("email-199");
+    expect(compacted.every((email) => email.hs_email_html === "")).toBe(true);
+    expect(Buffer.byteLength(JSON.stringify({ transcript: compacted }), "utf8"))
+      .toBeLessThanOrEqual(HUBSPOT_TICKET_TRANSCRIPT_MAX_BYTES);
   });
 });
