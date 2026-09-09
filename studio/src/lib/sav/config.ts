@@ -7,7 +7,8 @@ export type SavHarnessMode = z.infer<typeof savHarnessModeSchema>;
 
 export const SAV_AGENT_ID = "sav-ticket-analyst";
 export const SAV_AGENT_SCOPE = "sav_ticket_analysis";
-export const SAV_PROMPT_REVISION = "sav-adk-2026-09-01.1";
+export const SAV_PROMPT_REVISION = "sav-adk-2026-09-09.1";
+export const SAV_LEGACY_PROMPT_REVISION = "sav-legacy-2026-09-09.1";
 
 export function savAutomationMode(): SavAutomationMode {
   return savAutomationModeSchema.catch("shadow").parse(process.env.SAV_AUTOMATION_MODE);

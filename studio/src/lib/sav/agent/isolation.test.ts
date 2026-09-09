@@ -10,5 +10,7 @@ describe("SAV agent isolation", () => {
   it("rejects extension and browser tools", () => {
     expect(() => assertSavAgentIsolation([...SAV_AGENT_TOOL_NAMES, "click_element"])).toThrow("SAV_AGENT_TOOL_SCOPE_VIOLATION");
     expect(() => assertSavAgentIsolation(["inspect_current_page"])).toThrow("SAV_AGENT_TOOL_SCOPE_VIOLATION");
+    expect(() => assertSavAgentIsolation(["send_email"])).toThrow("SAV_AGENT_TOOL_SCOPE_VIOLATION");
+    expect(() => assertSavAgentIsolation(["delete_ticket"])).toThrow("SAV_AGENT_TOOL_SCOPE_VIOLATION");
   });
 });

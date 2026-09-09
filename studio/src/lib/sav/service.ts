@@ -8,7 +8,6 @@ import {
   savActions,
   savAgentRuns,
   savDecisions,
-  savFollowups,
   savGmailQuarantine,
   savLearningCandidates,
   savMailboxes,
@@ -21,9 +20,11 @@ import {
 } from "@/db/schema";
 import { decryptSavPayload, encryptSavPayload, savContentHash } from "./crypto";
 import { analyzeSavMessage } from "./intelligence";
+import { invalidateSavReplies } from "./invalidation";
 import { isSavPilotMode } from "./config";
 import {
   decisionKindSchema,
+  requestsHuman,
   humanDueAt,
   assertSavPilotReplyApprovalAllowed,
   normalizeEmailAddress,
@@ -183,6 +184,7 @@ async function createDecision(
       }).onConflictDoNothing();
     } else if (proposal.kind === "human_review_required") {
       if (!pilotBatchId) {
+        await invalidateSavReplies(tx, message.threadId, "SAV_THREAD_PAUSED", now);
         await tx.update(savThreads).set({
           status: "human_requested",
           aiPaused: true,
@@ -257,13 +259,21 @@ export async function ingestInboundMessage(rawInput: unknown) {
       .where(and(eq(savMessages.mailboxId, mailbox.id), eq(savMessages.gmailMessageId, input.gmailMessageId))).limit(1);
     if (!message) throw new Error("SAV_MESSAGE_NOT_FOUND");
     await tx.update(savThreads).set({
-      subject: input.subject || thread.subject,
-      customerEmail: normalizedFrom,
-      lastMessageAt: input.receivedAt,
+      subject: input.receivedAt >= thread.lastMessageAt ? input.subject || thread.subject : thread.subject,
+      // A forwarded/multi-party reply must not silently replace the ticket owner.
+      lastMessageAt: input.receivedAt > thread.lastMessageAt ? input.receivedAt : thread.lastMessageAt,
       updatedAt: new Date(),
     }).where(eq(savThreads.id, thread.id));
-    if (created) await tx.update(savFollowups).set({ status: "cancelled", cancelledAt: new Date() })
-      .where(and(eq(savFollowups.threadId, thread.id), inArray(savFollowups.status, ["scheduled", "queued"])));
+    if (created) {
+      const now = new Date();
+      await invalidateSavReplies(tx, thread.id, "SAV_REPLY_OBSOLETE", now);
+      // A human request takes effect before a potentially slow model call.
+      if (!isSavPilotMode() && requestsHuman(`${input.subject}\n${bodyText}`)) {
+        await tx.update(savThreads).set({ aiPaused: true, status: "human_requested",
+          humanRequestedAt: now, humanDueAt: humanDueAt(now), updatedAt: now,
+        }).where(eq(savThreads.id, thread.id));
+      }
+    }
     return { mailbox, thread, message, duplicate: !created };
   });
 
@@ -914,14 +924,14 @@ export async function requestHumanIntervention(threadId: string, actorEmail: str
   const db = requireDb();
   const [thread] = await db.select().from(savThreads).where(eq(savThreads.id, threadId)).limit(1);
   if (!thread) throw new Error("SAV_THREAD_NOT_FOUND");
-  if (thread.aiPaused && thread.humanRequestedAt) return thread;
   const now = new Date();
-  const dueAt = humanDueAt(now);
+  const dueAt = thread.humanDueAt ?? humanDueAt(now);
   return db.transaction(async (tx) => {
+    await invalidateSavReplies(tx, threadId, "SAV_THREAD_PAUSED", now);
     const [updated] = await tx.update(savThreads).set({
       status: "human_requested",
       aiPaused: true,
-      humanRequestedAt: now,
+      humanRequestedAt: thread.humanRequestedAt ?? now,
       humanDueAt: dueAt,
       updatedAt: now,
     }).where(eq(savThreads.id, threadId)).returning();
@@ -951,6 +961,14 @@ export async function correctSavDecision(decisionId: string, rawInput: unknown, 
   const [current] = await db.select().from(savDecisions).where(eq(savDecisions.id, decisionId)).limit(1);
   if (!current || !current.isCurrent) throw new Error("SAV_DECISION_NOT_CURRENT");
   return db.transaction(async (tx) => {
+    const [message] = await tx.select().from(savMessages).where(eq(savMessages.id, current.messageId)).limit(1);
+    if (!message) throw new Error("SAV_MESSAGE_NOT_FOUND");
+    await invalidateSavReplies(tx, message.threadId, "SAV_REPLY_OBSOLETE");
+    if (input.kind === "human_review_required") {
+      const now = new Date();
+      await tx.update(savThreads).set({ aiPaused: true, status: "human_requested", humanRequestedAt: now, humanDueAt: humanDueAt(now), updatedAt: now })
+        .where(eq(savThreads.id, message.threadId));
+    }
     await tx.update(savDecisions).set({ isCurrent: false }).where(eq(savDecisions.id, current.id));
     const [replacement] = await tx.insert(savDecisions).values({
       messageId: current.messageId,
@@ -981,6 +999,12 @@ export async function approveSavDraft(draftActionId: string, actorEmail: string)
     .where(and(eq(savActions.id, draftActionId), eq(savActions.kind, "draft_reply"), eq(savActions.status, "succeeded"))).limit(1);
   if (!draft || !draft.payload.bodyCiphertext) throw new Error("SAV_DRAFT_NOT_FOUND");
   assertSavPilotReplyApprovalAllowed(draft.pilotBatchId);
+  const [thread] = await db.select().from(savThreads).where(eq(savThreads.id, draft.threadId)).limit(1);
+  if (!thread || thread.aiPaused) throw new Error("SAV_THREAD_PAUSED");
+  const [latest] = await db.select({ id: savMessages.id }).from(savMessages)
+    .where(and(eq(savMessages.threadId, draft.threadId), eq(savMessages.direction, "inbound")))
+    .orderBy(desc(savMessages.receivedAt), desc(savMessages.createdAt), desc(savMessages.id)).limit(1);
+  if (!draft.messageId || draft.messageId !== latest?.id) throw new Error("SAV_REPLY_OBSOLETE");
   const [action] = await db.insert(savActions).values({
     threadId: draft.threadId,
     messageId: draft.messageId,

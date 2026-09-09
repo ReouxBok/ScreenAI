@@ -62,6 +62,8 @@ export default async function SavDashboardPage({ searchParams }: { searchParams:
   const mode = savAutomationMode();
   const harnessMode = savHarnessMode();
   const harnessReady = Boolean(savGeminiApiKey());
+  const writesDisabled = process.env.SAV_WRITES_DISABLED === "true";
+  const aiDisabled = process.env.SAV_AI_ANALYSIS === "false";
   const activePilotBatch = pilotBatches.find((item) => item.status === "processing" || item.status === "reviewing");
   const selectedPilotBatch = batch ? pilotBatches.find((item) => item.id === batch) : null;
   const selectedPilotBatchIndex = selectedPilotBatch ? pilotBatches.findIndex((item) => item.id === selectedPilotBatch.id) : -1;
@@ -73,6 +75,9 @@ export default async function SavDashboardPage({ searchParams }: { searchParams:
       <div className="sav-hero-copy"><span className="eyebrow">Registre SAV</span><h1>Chaque mail laisse une trace.</h1><p>Charly qualifie, justifie et simule les actions. Pendant le pilote, aucune donnée n’est écrite dans Gmail ou HubSpot.</p></div>
       <div className="sav-mode-panel"><span>Mode actuel</span><strong>{modeLabels[mode]}</strong><small>{mode === "shadow" ? "Aucun envoi ni ticket automatique" : mode === "assist" ? "Les actions attendent une validation" : "Automatisation surveillée"}</small><small>Harness ADK : {harnessMode} · {harnessReady ? "clé Gemini SAV connectée" : "clé Gemini requise"}</small><i className={`sav-mode-light ${mode}`}/></div>
     </section>
+
+    {writesDisabled && <p className="login-notice" role="status">Les écritures Gmail et HubSpot sont suspendues. Les mails entrants continuent d’être enregistrés.</p>}
+    {aiDisabled && <p className="login-notice" role="status">L’analyse IA est désactivée. Seules les règles de tri locales sont utilisées.</p>}
 
     {!configured && <div className="setup card"><strong>Base SAV non configurée.</strong> Ajoutez les variables SAV, puis appliquez les migrations avant de connecter Gmail.</div>}
     {batchCancelled && <p className="login-notice" role="status">Le batch invalide a été conservé dans l’audit puis annulé. Les dix prochains mails peuvent maintenant être analysés.</p>}

@@ -5,6 +5,8 @@ import { and, asc, desc, eq, inArray, isNull, lt, or, sql } from "drizzle-orm";
 import { z } from "zod";
 import { requireDb } from "@/db";
 import { savActions, savFollowups, savGmailQuarantine, savMailboxes, savMessages, savThreads, savWebhookReceipts } from "@/db/schema";
+import { assertSavWriteAllowed } from "./write-guard";
+import { isSavWriteCancellation, savModeAllowsWrite } from "./action-policy";
 import { savAutomationMode } from "./config";
 import { decryptSavPayload, encryptSavPayload } from "./crypto";
 import {
@@ -516,6 +518,7 @@ async function sendReplyAction(action: typeof savActions.$inferSelect, text: str
   ].join("\r\n");
 
   const existing = await findSentMessage(mailbox.email, rfcMessageId);
+  await assertSavWriteAllowed(action.id);
   const sent = existing ?? await gmailFetch<{ id: string; threadId: string }>(mailbox.email, "messages/send", {
     method: "POST",
     body: JSON.stringify({ raw: Buffer.from(raw, "utf8").toString("base64url"), threadId: thread.gmailThreadId }),
@@ -559,6 +562,7 @@ async function sendReplyAction(action: typeof savActions.$inferSelect, text: str
       await tx.insert(savActions).values({
         threadId: thread.id,
         kind: "update_ticket_status",
+        messageId: inbound.id,
         idempotencyKey: `hubspot:status:${action.kind}:${action.id}`,
         payload: {
           hubspotTicketId: thread.hubspotTicketId,
@@ -573,7 +577,7 @@ async function sendReplyAction(action: typeof savActions.$inferSelect, text: str
 
 export async function processPendingGmailSendActions(limit = 20) {
   const mode = savAutomationMode();
-  if (mode === "shadow") return { skipped: "shadow_mode", processed: [] as Array<Record<string, unknown>> };
+  if (mode === "shadow" || process.env.SAV_WRITES_DISABLED === "true") return { skipped: "shadow_mode", processed: [] as Array<Record<string, unknown>> };
   const db = requireDb();
   const staleBefore = new Date(Date.now() - 15 * 60 * 1_000);
   const allowedKinds = ["send_reply", "request_human"] as const;
@@ -584,7 +588,7 @@ export async function processPendingGmailSendActions(limit = 20) {
       or(eq(savActions.status, "pending"), and(eq(savActions.status, "running"), lt(savActions.updatedAt, staleBefore))),
     ))
     .orderBy(asc(savActions.createdAt)).limit(Math.min(100, Math.max(1, limit)));
-  const actions = mode === "assist" ? candidates.filter((action) => action.actorType === "human") : candidates;
+  const actions = candidates.filter((action) => savModeAllowsWrite(mode, action.kind, action.actorType, Boolean(action.payload.followupSequence)));
   const processed = [];
   for (const action of actions) {
     const [claimed] = await db.update(savActions).set({ status: "running", updatedAt: new Date() }).where(and(
@@ -600,7 +604,7 @@ export async function processPendingGmailSendActions(limit = 20) {
       processed.push({ actionId: claimed.id, status: "succeeded", gmailMessageId: sent.id });
     } catch (error) {
       const errorCode = (error instanceof Error ? error.message : "UNKNOWN_ERROR").slice(0, 160);
-      await db.update(savActions).set({ status: "failed", errorCode, updatedAt: new Date() }).where(eq(savActions.id, claimed.id));
+      await db.update(savActions).set({ status: isSavWriteCancellation(errorCode) ? "cancelled" : "failed", errorCode, updatedAt: new Date() }).where(eq(savActions.id, claimed.id));
       processed.push({ actionId: claimed.id, status: "failed", errorCode });
     }
   }

@@ -23,6 +23,7 @@ Les tables sont créées dans le schéma PostgreSQL `sav`. Utiliser une clé dé
 ```dotenv
 SAV_ENCRYPTION_KEY_V1=<secret dédié>
 SAV_AUTOMATION_MODE=shadow
+SAV_WRITES_DISABLED=false
 SAV_PILOT_MODE=false
 SAV_AI_ANALYSIS=true
 SAV_ADK_MODE=shadow
@@ -42,13 +43,13 @@ En environnement de recette, définir impérativement `SAV_TEST_MODE=true` et un
 
 ## Pilote supervisé sur de vrais mails
 
-Définir `SAV_PILOT_MODE=true` pour mettre les nouveaux mails en attente et les traiter par batches stricts de 10 depuis le registre SAV. Un seul batch peut être ouvert à la fois. Le pilote peut qualifier les messages, créer ou rattacher un ticket HubSpot, journaliser le mail, préparer un brouillon et publier une note interne marquée « Analyse pilote IA — à valider ».
+Définir `SAV_PILOT_MODE=true` pour mettre les nouveaux mails en attente et les traiter par lots de 10 depuis le laboratoire SAV. Un seul lot peut être ouvert à la fois.
 
-Les actions Gmail du pilote sont exclues du worker d’envoi et les mises à jour de statut HubSpot sont exclues de son worker dédié. Une vérification supplémentaire refuse toute étape HubSpot reconnue comme fermée. Chaque mail doit recevoir un verdict humain (`correct`, `partial`, `incorrect` ou `critical`) avant que le batch soit clôturé et que le suivant puisse démarrer.
+Le pilote est une **simulation stricte** : il lit les messages, consulte les fiches et les tickets, puis enregistre localement ses décisions, brouillons et actions proposées. Aucun email n’est envoyé et aucun ticket, contact, statut ou note n’est écrit dans HubSpot. Les workers excluent les actions portant un identifiant de lot pilote ; le contrôle commun d’écriture les refuse également.
 
-Le clic « Analyser les 10 prochains mails » démarre immédiatement un workflow durable Vercel. Les analyses sont exécutées par groupes de trois pour réduire la latence sans saturer le modèle, puis les actions HubSpot réversibles sont synchronisées. La page s’actualise automatiquement pendant l’exécution. Le cron `/api/cron/sav-reconcile` reste un filet de sécurité idempotent : il reprend les éléments encore en attente si le lancement immédiat n’a pas pu être créé.
+Le clic « Analyser les 10 prochains mails » lance un workflow durable, avec trois analyses simultanées. Le cron `/api/cron/sav-reconcile` reprend les éléments en attente si nécessaire. Chaque mail doit recevoir un verdict humain (`correct`, `partial`, `incorrect` ou `critical`) avant de clôturer le lot. Un lot peut être annulé sans supprimer ses preuves.
 
-Un batch en cours peut être annulé depuis le Studio sans supprimer ses preuves. Une correction humaine associée à un ticket crée une proposition d’apprentissage séparée ; elle doit être relue par un admin, puis suivre le workflow normal de validation/publication avant d’être utilisable par l’agent.
+Les corrections restent des propositions : elles ne deviennent pas des connaissances actives sans validation et publication. La prise en charge des corrections sans ticket est suivie dans `SAV_IMPLEMENTATION.md`.
 
 ## 2. Gmail et Pub/Sub
 
@@ -141,6 +142,10 @@ Pour chaque ticket :
 | `assist` | oui | seulement après action admin | seulement après validation admin | exploitation supervisée |
 | `semi` | oui | cas éligibles | confirmations humaines et réponses approuvées | montée en charge |
 | `on` | oui | cas éligibles | réponses fondées et confiance suffisante | autonomie contrôlée |
+
+`SAV_WRITES_DISABLED=true` bloque les écritures, indépendamment du mode. Les lectures et la conservation des événements continuent. `SAV_AI_ANALYSIS=false` désactive l’analyse par modèle et la recherche par embeddings dans les deux parcours d’analyse ; les règles locales continuent de qualifier les messages.
+
+Les workers revérifient l’état courant avant les mutations. Une réponse liée à un ancien message ou à un fil suspendu est refusée, y compris si elle avait été approuvée avant le changement. Les brouillons et envois en attente sont invalidés à l’arrivée d’un mail ou lors d’une reprise humaine. Un accusé de transfert est distinct d’une réponse de résolution.
 
 Changer de mode uniquement après avoir vérifié les indicateurs du dashboard. Le retour à `shadow` est le kill switch global.
 

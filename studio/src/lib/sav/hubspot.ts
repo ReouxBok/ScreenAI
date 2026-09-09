@@ -15,6 +15,8 @@ import {
   savWebhookReceipts,
 } from "@/db/schema";
 import { decryptSavPayload, encryptSavPayload, savContentHash } from "./crypto";
+import { assertSavWriteAllowed } from "./write-guard";
+import { isSavWriteCancellation, savModeAllowsWrite } from "./action-policy";
 import { autoReplyMinConfidence, canSendRepliesAutomatically, savAutomationMode } from "./config";
 import { AI_DISCLOSURE, assertSavTicketStageNotClosed, normalizeEmailAddress } from "./policy";
 import { claimWebhookReceipt, markWebhookReceipt, recordWebhookReceipt, type SavMessageBody } from "./service";
@@ -229,10 +231,15 @@ async function findContactByEmail(email: string) {
   return response.results?.[0] ?? null;
 }
 
-async function ensureContactByEmail(email: string) {
+async function guardedHubspotWrite<T>(actionId: string, path: string, init: RequestInit): Promise<T> {
+  await assertSavWriteAllowed(actionId);
+  return hubspotFetch<T>(path, init);
+}
+
+async function ensureContactByEmail(email: string, actionId: string) {
   const existing = await findContactByEmail(email);
   if (existing) return existing;
-  return hubspotFetch<HubspotRecord>("/crm/v3/objects/contacts", {
+  return guardedHubspotWrite<HubspotRecord>(actionId, "/crm/v3/objects/contacts", {
     method: "POST",
     body: JSON.stringify({ properties: { email: normalizeEmailAddress(email) } }),
   });
@@ -288,7 +295,7 @@ export async function readSavHubspotContext(input: { email: string; subject: str
   };
 }
 
-async function createHubspotTicket(message: typeof savMessages.$inferSelect, body: SavMessageBody, contactId: string | null) {
+async function createHubspotTicket(message: typeof savMessages.$inferSelect, body: SavMessageBody, contactId: string | null, actionId: string) {
   const properties: Record<string, string> = {
     subject: message.subject,
     content: body.text.slice(0, 20_000),
@@ -299,7 +306,8 @@ async function createHubspotTicket(message: typeof savMessages.$inferSelect, bod
     to: { id: contactId },
     types: [{ associationCategory: "HUBSPOT_DEFINED", associationTypeId: 16 }],
   }] : [];
-  return hubspotFetch<HubspotRecord>("/crm/v3/objects/tickets", {
+  await assertSavTicketStageNotClosed(properties.hs_pipeline_stage, await closedTicketStages());
+  return guardedHubspotWrite<HubspotRecord>(actionId, "/crm/v3/objects/tickets", {
     method: "POST",
     body: JSON.stringify({ properties, associations }),
   });
@@ -314,9 +322,9 @@ async function finalizeTicketAction(action: typeof savActions.$inferSelect) {
   const [thread] = await db.select().from(savThreads).where(eq(savThreads.id, action.threadId)).limit(1);
   if (!thread) throw new Error("SAV_ACTION_THREAD_NOT_FOUND");
   const body = decryptSavPayload<SavMessageBody>(message.bodyCiphertext);
-  const contact = await ensureContactByEmail(thread.customerEmail);
+  const contact = await ensureContactByEmail(thread.customerEmail, action.id);
   const existing = await findExistingTicket(contact?.id ?? null, thread.subject);
-  const ticket = existing ?? await createHubspotTicket(message, body, contact?.id ?? null);
+  const ticket = existing ?? await createHubspotTicket(message, body, contact?.id ?? null, action.id);
   const [sourceDecision] = action.decisionId
     ? await db.select({ confidence: savDecisions.confidence }).from(savDecisions).where(eq(savDecisions.id, action.decisionId)).limit(1)
     : [];
@@ -388,11 +396,11 @@ async function createHubspotNote(action: typeof savActions.$inferSelect) {
   if (!bodyCiphertext) throw new Error("SAV_NOTE_BODY_MISSING");
   const noteText = decryptSavPayload<{ text: string }>(bodyCiphertext).text.trim();
   if (!noteText) throw new Error("SAV_NOTE_BODY_EMPTY");
-  const note = await hubspotFetch<HubspotRecord>("/crm/v3/objects/notes", {
+  const note = await guardedHubspotWrite<HubspotRecord>(action.id, "/crm/v3/objects/notes", {
     method: "POST",
     body: JSON.stringify({ properties: { hs_timestamp: new Date().toISOString(), hs_note_body: noteText.slice(0, 50_000) } }),
   });
-  await hubspotFetch(`/crm/v4/objects/notes/${encodeURIComponent(note.id)}/associations/default/tickets/${encodeURIComponent(ticketId)}`, { method: "PUT" });
+  await guardedHubspotWrite(action.id, `/crm/v4/objects/notes/${encodeURIComponent(note.id)}/associations/default/tickets/${encodeURIComponent(ticketId)}`, { method: "PUT" });
   await db.update(savActions).set({
     status: "succeeded",
     executedAt: new Date(),
@@ -456,11 +464,11 @@ async function logHubspotEmail(action: typeof savActions.$inferSelect) {
   };
   let email: HubspotRecord;
   try {
-    email = await withoutRejectedOwner(properties, (safeProperties) => hubspotFetch<HubspotRecord>("/crm/v3/objects/emails", {
+    email = await withoutRejectedOwner(properties, (safeProperties) => guardedHubspotWrite<HubspotRecord>(action.id, "/crm/v3/objects/emails", {
       method: "POST",
       body: JSON.stringify({ properties: safeProperties }),
     }));
-    await hubspotFetch(`/crm/v4/objects/emails/${encodeURIComponent(email.id)}/associations/default/tickets/${encodeURIComponent(ticketId)}`, { method: "PUT" });
+    await guardedHubspotWrite(action.id, `/crm/v4/objects/emails/${encodeURIComponent(email.id)}/associations/default/tickets/${encodeURIComponent(ticketId)}`, { method: "PUT" });
   } catch (error) {
     if (!isHubspotValidationError(error)) throw error;
     return fallbackAsNote(error);
@@ -468,7 +476,7 @@ async function logHubspotEmail(action: typeof savActions.$inferSelect) {
   const contactId = String(action.payload.contactId || "");
   if (contactId) {
     try {
-      await hubspotFetch(`/crm/v4/objects/emails/${encodeURIComponent(email.id)}/associations/default/contacts/${encodeURIComponent(contactId)}`, { method: "PUT" });
+      await guardedHubspotWrite(action.id, `/crm/v4/objects/emails/${encodeURIComponent(email.id)}/associations/default/contacts/${encodeURIComponent(contactId)}`, { method: "PUT" });
     } catch (error) {
       // The ticket association is the source of truth. A missing optional
       // contact association must not duplicate the email on every retry.
@@ -500,7 +508,7 @@ async function updateHubspotTicketStatus(action: typeof savActions.$inferSelect)
   const properties: Record<string, string> = { hs_pipeline_stage: stageId };
   assertSavTicketStageNotClosed(stageId, await closedTicketStages());
   if (target === "human" && process.env.HUBSPOT_SAV_OWNER_ID) properties.hubspot_owner_id = process.env.HUBSPOT_SAV_OWNER_ID;
-  await withoutRejectedOwner(properties, (safeProperties) => hubspotFetch(`/crm/v3/objects/tickets/${encodeURIComponent(ticketId)}`, {
+  await withoutRejectedOwner(properties, (safeProperties) => guardedHubspotWrite(action.id, `/crm/v3/objects/tickets/${encodeURIComponent(ticketId)}`, {
     method: "PATCH",
     body: JSON.stringify({ properties: safeProperties }),
   }));
@@ -511,7 +519,7 @@ async function updateHubspotTicketStatus(action: typeof savActions.$inferSelect)
 
 export async function processPendingHubspotActions(limit = 20) {
   const mode = savAutomationMode();
-  if (mode === "shadow") return { skipped: "shadow_mode", processed: [] as Array<Record<string, unknown>> };
+  if (mode === "shadow" || process.env.SAV_WRITES_DISABLED === "true") return { skipped: "shadow_mode", processed: [] as Array<Record<string, unknown>> };
   const db = requireDb();
   const staleBefore = new Date(Date.now() - 15 * 60 * 1_000);
   const candidates = await db.select().from(savActions)
@@ -521,9 +529,7 @@ export async function processPendingHubspotActions(limit = 20) {
       or(eq(savActions.status, "pending"), and(eq(savActions.status, "running"), lt(savActions.updatedAt, staleBefore))),
     ))
     .orderBy(asc(savActions.createdAt)).limit(Math.min(100, Math.max(1, limit)));
-  const actions = mode === "assist"
-    ? candidates.filter((action) => action.actorType === "human" || action.kind === "log_email" || action.kind === "update_ticket_status")
-    : candidates;
+  const actions = candidates.filter((action) => savModeAllowsWrite(mode, action.kind, action.actorType));
   const processed = [];
   for (const action of actions) {
     const [claimed] = await db.update(savActions).set({ status: "running", updatedAt: new Date() }).where(and(
@@ -544,7 +550,7 @@ export async function processPendingHubspotActions(limit = 20) {
       }
     } catch (error) {
       const errorCode = (error instanceof Error ? error.message : "UNKNOWN_ERROR").slice(0, 160);
-      await db.update(savActions).set({ status: "failed", errorCode, updatedAt: new Date() }).where(eq(savActions.id, claimed.id));
+      await db.update(savActions).set({ status: isSavWriteCancellation(errorCode) ? "cancelled" : "failed", errorCode, updatedAt: new Date() }).where(eq(savActions.id, claimed.id));
       processed.push({ actionId: claimed.id, status: "failed", errorCode });
     }
   }

@@ -17,11 +17,14 @@ import { readSavHubspotContext } from "../hubspot";
 import { SAV_AGENT_ID, SAV_AGENT_SCOPE, SAV_PROMPT_REVISION, savAdkTimeoutMs } from "../config";
 import { assertSavAgentIsolation } from "./isolation";
 import { SAV_AGENT_TOOL_NAMES, savAgentOutputSchema, type SavAgentOutput } from "./contracts";
+import type { SavConversation } from "../conversation";
+import { assertSavAnalysisComplete } from "./validation";
 
 export type SavAgentInput = {
   from: string;
   subject: string;
   body: string;
+  conversation?: SavConversation;
 };
 
 export type SavAgentRunResult = {
@@ -42,9 +45,10 @@ RÈGLES ABSOLUES
 - Tu n’as aucun accès à l’extension Charly, au DOM, à la navigation ou aux mémoires de l’agent d’onboarding.
 - Tes outils sont exclusivement en lecture. Tu proposes un plan typé ; tu n’envoies aucun email, tu ne fermes aucun ticket et tu ne modifies aucun statut.
 - Consulte le message, les fiches SAV pertinentes et les tickets HubSpot liés avant de conclure.
+- Tiens compte des échanges précédents : ne répète pas une question déjà répondue ni une procédure déjà essayée. Les extraits tronqués et pièces jointes non analysées restent des informations manquantes, jamais des preuves.
 - Toute facturation, remboursement, sécurité, confidentialité, suppression de données, engagement commercial, urgence critique, doute factuel ou demande explicite d’un humain impose requiresHuman=true.
 - N’invente aucune procédure. Une réponse apportant une solution doit être étayée par au moins une fiche SAV validée. Sans fiche, tu peux uniquement accuser réception, poser une question de clarification ou préparer un transfert humain.
-- Appelle chaque outil au maximum une fois. Une seconde requête au même outil ne fournit aucune information supplémentaire.
+- Consulte le message et les tickets une fois. Tu peux rechercher des fiches deux fois avec des requêtes différentes si la première recherche est insuffisante.
 - Le brouillon doit annoncer clairement qu’il est préparé par une IA et proposer à tout moment un transfert humain sous 3 jours, en rappelant que l’assistance IA est immédiate.
 - evidenceIds contient uniquement les identifiants réellement retournés par les outils.
 - Retourne le résultat final avec le schéma imposé.`;
@@ -76,6 +80,7 @@ export async function runSavAdkAgent(input: SavAgentInput, options: { apiKey: st
   const toolTrace: SavAgentToolTrace[] = [];
   const evidenceById = new Map<string, SavDecisionEvidence>();
   const resultByTool = new Map<string, unknown>();
+  const executionsByTool = new Map<string, number>();
   let sequence = 0;
 
   function tracedTool<T extends z.ZodObject<z.ZodRawShape>>(definition: {
@@ -98,20 +103,24 @@ export async function runSavAdkAgent(input: SavAgentInput, options: { apiKey: st
           durationMs: 0,
         };
         try {
-          if (resultByTool.has(definition.name)) {
-            const reused = resultByTool.get(definition.name);
+          const cacheKey = `${definition.name}:${savContentHash(args)}`;
+          if (resultByTool.has(cacheKey)) {
+            const reused = resultByTool.get(cacheKey);
             trace.resultSummary = { ...summarizeResult(definition.name, reused), reused: true };
             return reused;
           }
+          const count = executionsByTool.get(definition.name) ?? 0;
+          if (count >= (definition.name === "search_resolution_cards" ? 2 : 1)) throw new Error("SAV_TOOL_BUDGET_EXCEEDED");
+          executionsByTool.set(definition.name, count + 1);
           const result = await definition.execute(args as z.infer<T>);
-          resultByTool.set(definition.name, result);
+          resultByTool.set(cacheKey, result);
           trace.resultSummary = summarizeResult(definition.name, result);
           return result;
         } catch (error) {
           trace.status = "failed";
           trace.errorCode = safeErrorCode(error);
           const unavailable = { unavailable: true, errorCode: trace.errorCode };
-          resultByTool.set(definition.name, unavailable);
+          trace.resultSummary = { unavailable: true };
           return unavailable;
         } finally {
           trace.durationMs = Date.now() - callStartedAt;
@@ -130,6 +139,7 @@ export async function runSavAdkAgent(input: SavAgentInput, options: { apiKey: st
         from: input.from.slice(0, 500),
         subject: input.subject.slice(0, 1_000),
         body: input.body.slice(0, 12_000),
+        conversation: input.conversation ?? null,
       }),
     }),
     tracedTool({
@@ -199,6 +209,7 @@ export async function runSavAdkAgent(input: SavAgentInput, options: { apiKey: st
       for (const call of getFunctionCalls(event)) {
         if (call.name === "set_model_response") rawOutput = call.args;
       }
+      if (sequence > 10) throw new Error("SAV_TOOL_BUDGET_EXCEEDED");
       if (isFinalResponse(event)) finalText = stringifyContent(event).trim();
     }
   };
@@ -214,9 +225,7 @@ export async function runSavAdkAgent(input: SavAgentInput, options: { apiKey: st
     // runEphemeral does not expose an AbortSignal. Closing its async generator
     // prevents a timed-out, read-only agent from continuing to consume model
     // quota after the guarded fallback has already taken over.
-    if (error instanceof Error && error.message === "SAV_ADK_TIMEOUT") {
-      void eventStream.return(undefined).catch(() => undefined);
-    }
+    void eventStream.return(undefined).catch(() => undefined);
     throw error;
   } finally {
     if (timeout) clearTimeout(timeout);
@@ -226,6 +235,7 @@ export async function runSavAdkAgent(input: SavAgentInput, options: { apiKey: st
   if (!rawOutput && finalText) rawOutput = JSON.parse(finalText);
   if (!rawOutput) throw new Error("SAV_ADK_EMPTY_OUTPUT");
   const output = savAgentOutputSchema.parse(rawOutput);
+  assertSavAnalysisComplete(output, toolTrace, [...evidenceById.values()]);
   const requestedEvidence = new Set(output.evidenceIds);
   const evidence = [...evidenceById.values()].filter((item) => requestedEvidence.has(item.sourceId));
   return {
@@ -234,7 +244,7 @@ export async function runSavAdkAgent(input: SavAgentInput, options: { apiKey: st
     toolTrace,
     model: options.model,
     promptRevision: SAV_PROMPT_REVISION,
-    inputHash: savContentHash({ scope: SAV_AGENT_SCOPE, from: input.from, subject: input.subject, body: input.body }),
+    inputHash: savContentHash({ scope: SAV_AGENT_SCOPE, ...input }),
     outputHash: savContentHash(output),
     durationMs: Date.now() - startedAt,
   };
