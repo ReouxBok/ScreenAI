@@ -23,7 +23,7 @@ const savResolutionIsCurrent = sql`
   version.metadata ? 'resolution'
   AND CASE
     WHEN NULLIF(version.metadata -> 'resolution' ->> 'validUntil', '') IS NULL THEN TRUE
-    WHEN version.metadata -> 'resolution' ->> 'validUntil' ~ '^[0-9]{4}-(0[1-9]|1[0-2])-([0-2][0-9]|3[01])$'
+    WHEN version.metadata -> 'resolution' ->> 'validUntil' ~ '^[0-9]{4}-((01|03|05|07|08|10|12)-(0[1-9]|[12][0-9]|3[01])|(04|06|09|11)-(0[1-9]|[12][0-9]|30)|02-(0[1-9]|1[0-9]|2[0-9]))$'
       THEN version.metadata -> 'resolution' ->> 'validUntil' >= to_char(CURRENT_DATE, 'YYYY-MM-DD')
     ELSE FALSE
   END

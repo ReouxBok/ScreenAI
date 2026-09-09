@@ -22,7 +22,7 @@ describe("SAV knowledge freshness", () => {
         '30000000-0000-4000-8000-000000000001',
         1,
         'Procédure ancienne',
-        '{"resolution":{"validUntil":"2026-99-99"}}',
+        '{"resolution":{"validUntil":"2027-02-31"}}',
         'Import historique',
         'ops@example.com'
       );
