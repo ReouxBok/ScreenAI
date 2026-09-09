@@ -29,7 +29,10 @@
     "training:reconcile:apply": "NODE_OPTIONS=--conditions=react-server tsx scripts/reconcile-trainings.ts --apply",
     "gmail:replay": "NODE_OPTIONS=--conditions=react-server tsx scripts/replay-gmail-receipts.ts --dry-run",
     "gmail:replay:apply": "NODE_OPTIONS=--conditions=react-server tsx scripts/replay-gmail-receipts.ts --apply",
-    "ops:status": "NODE_OPTIONS=--conditions=react-server tsx scripts/operational-status.ts"
+    "ops:status": "NODE_OPTIONS=--conditions=react-server tsx scripts/operational-status.ts",
+    "ops:status:strict": "NODE_OPTIONS=--conditions=react-server tsx scripts/operational-status.ts --strict",
+    "sav:replay": "tsx scripts/run-sav-replay.ts",
+    "sav:replay:agent": "NODE_OPTIONS=--conditions=react-server tsx scripts/run-sav-agent-replay.ts"
   },
   "dependencies": {
     "@clerk/backend": "^2.33.6",

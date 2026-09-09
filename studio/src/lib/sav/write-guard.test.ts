@@ -1,12 +1,13 @@
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { eq } from "drizzle-orm";
 import { createSavTestDb } from "../../../test/sav-db";
-import { savActions, savMailboxes, savMessages, savThreads } from "@/db/schema";
+import { savActions, savAgentRuns, savDecisions, savLearningCandidates, savMailboxes, savMessages, savPilotBatches, savPilotItems, savThreads } from "@/db/schema";
 import { assertSavWriteAllowed } from "./write-guard";
 import { invalidateSavReplies } from "./invalidation";
 import { processPendingGmailSendActions } from "./gmail";
 import { encryptSavPayload } from "./crypto";
 import { currentMessageText, loadSavConversation } from "./conversation";
+import { processPendingSavMessages, processSavPilotItem, reviewSavPilotItem } from "./service";
 
 const state = vi.hoisted(() => ({ db: null as unknown }));
 vi.mock("@/db", () => ({ requireDb: () => state.db }));
@@ -103,6 +104,25 @@ describe("write guard with migrated database", () => {
     const [row] = await fixture.db.select().from(savActions).where(eq(savActions.id, queued.id));
     expect(row.status).toBe("succeeded");
   });
+  it("backs off a transient Gmail failure instead of retrying in a tight loop", async () => {
+    const queued = await action();
+    await fixture.db.update(savActions).set({ status: "pending", payload: { bodyCiphertext: encryptSavPayload({ text: "Proposed response" }) } }).where(eq(savActions.id, queued.id));
+    let sends = 0;
+    vi.stubGlobal("fetch", vi.fn(async (url: string | URL | Request) => {
+      const path = String(url);
+      if (path.includes("oauth2")) return Response.json({ access_token: "fixture", expires_in: 3600 });
+      if (path.includes("messages?")) return Response.json({ messages: [] });
+      if (path.endsWith("messages/send")) { sends++; return new Response("unavailable", { status: 503 }); }
+      throw new Error("Unexpected network call");
+    }));
+    await processPendingGmailSendActions();
+    await processPendingGmailSendActions();
+    const [row] = await fixture.db.select().from(savActions).where(eq(savActions.id, queued.id));
+    expect(sends).toBe(1);
+    expect(row.status).toBe("pending");
+    expect(row.attemptCount).toBe(1);
+    expect(row.scheduledAt!.getTime()).toBeGreaterThan(Date.now());
+  });
   it("conversation context includes prior answers but excludes other customers and future mail", async () => {
     const [original] = await fixture.db.select().from(savMessages).where(eq(savMessages.id, messageId));
     await fixture.db.insert(savMessages).values({ ...original, id: crypto.randomUUID(), direction: "outbound",
@@ -123,5 +143,59 @@ describe("write guard with migrated database", () => {
   it("removes obvious quoted text while retaining the customer's latest answer", () => {
     expect(currentMessageText("Cela ne fonctionne toujours pas.\n\nLe mardi, Charly a écrit :\nAncienne procédure")).toBe("Cela ne fonctionne toujours pas.");
     expect(currentMessageText("Merci\n> procédure précédente")).toBe("Merci");
+  });
+  it("summarizes older conversation turns with message references inside the fixed budget", async () => {
+    const [original] = await fixture.db.select().from(savMessages).where(eq(savMessages.id, messageId));
+    for (let index = 1; index <= 14; index++) await fixture.db.insert(savMessages).values({
+      ...original, id: crypto.randomUUID(), direction: index % 2 ? "outbound" : "inbound",
+      gmailMessageId: `older-${index}`, receivedAt: new Date(original.receivedAt.getTime() - index * 60_000),
+      createdAt: new Date(original.createdAt.getTime() - index * 60_000),
+      bodyCiphertext: encryptSavPayload({ text: `Échange antérieur ${index} avec une information utile.` }),
+    });
+    const context = await loadSavConversation(messageId);
+    expect(context.messages).toHaveLength(12);
+    expect(context.olderSummary.length).toBeGreaterThan(0);
+    expect(context.olderSummary.every((item) => item.messageId && item.excerpt)).toBe(true);
+    expect(context.messages.reduce((sum, item) => sum + item.text.length, 0) + context.olderSummary.reduce((sum, item) => sum + item.excerpt.length, 0)).toBeLessThanOrEqual(18_000);
+  });
+  it("turns a corrected pilot response into a reviewable learning candidate without HubSpot", async () => {
+    const [batch] = await fixture.db.insert(savPilotBatches).values({ targetSize: 1, createdBy: "reviewer@example.com", status: "reviewing" }).returning();
+    const [item] = await fixture.db.insert(savPilotItems).values({ batchId: batch.id, messageId, status: "ready" }).returning();
+    await reviewSavPilotItem(item.id, {
+      verdict: "incorrect",
+      dimensions: { classification: "correct", routing: "incorrect", grounding: "incorrect", tone: "partial", escalation: "correct" },
+      feedbackCodes: ["unsupported_claim"], comment: "La procédure n'était pas prouvée.",
+      correctedDraft: "La bonne réponse consiste à transmettre le dossier pour vérification humaine.",
+    }, "reviewer@example.com");
+    const [candidate] = await fixture.db.select().from(savLearningCandidates);
+    expect(candidate).toMatchObject({ threadId, hubspotTicketId: null, sourceRef: `thread:${threadId}`, evidenceTicketIds: [], createdBy: "human" });
+    const [reviewed] = await fixture.db.select().from(savPilotItems).where(eq(savPilotItems.id, item.id));
+    expect(reviewed).toMatchObject({ classificationVerdict: "correct", routingVerdict: "incorrect", groundingVerdict: "incorrect", toneVerdict: "partial", escalationVerdict: "correct" });
+  });
+  it("links a pilot review to the exact agent run that produced its decision", async () => {
+    vi.stubEnv("SAV_PILOT_MODE", "true");
+    vi.stubEnv("SAV_ADK_MODE", "pilot");
+    vi.stubEnv("SAV_AI_ANALYSIS", "false");
+    const [batch] = await fixture.db.insert(savPilotBatches).values({ targetSize: 1, createdBy: "reviewer@example.com", status: "processing" }).returning();
+    const [item] = await fixture.db.insert(savPilotItems).values({ batchId: batch.id, messageId }).returning();
+    await expect(processSavPilotItem(item.id)).resolves.toMatchObject({ status: "ready" });
+    const [processed] = await fixture.db.select().from(savPilotItems).where(eq(savPilotItems.id, item.id));
+    const [run] = await fixture.db.select().from(savAgentRuns).where(eq(savAgentRuns.id, processed.agentRunId!));
+    expect(processed.agentRunId).toBeTruthy();
+    expect(run).toMatchObject({ messageId, pilotBatchId: batch.id, promptRevision: "rules-v1" });
+  });
+  it("reclaims an interrupted non-pilot analysis and finishes it once", async () => {
+    vi.stubEnv("SAV_PILOT_MODE", "false");
+    vi.stubEnv("SAV_AI_ANALYSIS", "false");
+    await fixture.db.update(savMessages).set({ analysisStatus: "processing", analysisAttempts: 1, analysisStartedAt: new Date(Date.now() - 20 * 60_000) }).where(eq(savMessages.id, messageId));
+    const first = await processPendingSavMessages(4);
+    const second = await processPendingSavMessages(4);
+    const [message] = await fixture.db.select().from(savMessages).where(eq(savMessages.id, messageId));
+    const decisions = await fixture.db.select().from(savDecisions).where(eq(savDecisions.messageId, messageId));
+    expect(first.processed).toEqual([{ messageId, status: "processed" }]);
+    expect(second.processed).toEqual([]);
+    expect(message).toMatchObject({ analysisStatus: "done", analysisAttempts: 2 });
+    expect(message.processedAt).not.toBeNull();
+    expect(decisions).toHaveLength(1);
   });
 });

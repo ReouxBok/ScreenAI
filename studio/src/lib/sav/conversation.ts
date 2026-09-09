@@ -12,6 +12,7 @@ export type SavConversation = {
   aiPaused: boolean;
   senderMatchesCustomer: boolean;
   messages: Array<{ id: string; direction: string; from: string; receivedAt: string; text: string; truncated: boolean }>;
+  olderSummary: Array<{ messageId: string; direction: string; receivedAt: string; excerpt: string }>;
   historyTruncated: boolean;
   attachmentNotice: string;
 };
@@ -31,8 +32,8 @@ export async function loadSavConversation(messageId: string): Promise<SavConvers
   const rows = await db.select().from(savMessages).where(and(
     eq(savMessages.threadId, thread.id), eq(savMessages.mailboxId, current.mailboxId),
     lte(savMessages.receivedAt, current.receivedAt), lte(savMessages.createdAt, current.createdAt),
-  )).orderBy(desc(savMessages.receivedAt), desc(savMessages.createdAt), desc(savMessages.id)).limit(13);
-  let remaining = 18_000;
+  )).orderBy(desc(savMessages.receivedAt), desc(savMessages.createdAt), desc(savMessages.id)).limit(33);
+  let remaining = 15_000;
   const messages = rows.slice(0, 12).map((row) => {
     const body = decryptSavPayload<{ text: string }>(row.bodyCiphertext);
     const clean = currentMessageText(body.text);
@@ -40,11 +41,18 @@ export async function loadSavConversation(messageId: string): Promise<SavConvers
     remaining -= text.length;
     return { id: row.id, direction: row.direction, from: row.fromEmail, receivedAt: row.receivedAt.toISOString(), text, truncated: text.length < clean.length };
   }).reverse();
+  let summaryRemaining = 3_000;
+  const olderSummary = rows.slice(12, 32).map((row) => {
+    const body = decryptSavPayload<{ text: string }>(row.bodyCiphertext);
+    const excerpt = currentMessageText(body.text).replace(/\s+/g, " ").slice(0, Math.min(300, summaryRemaining));
+    summaryRemaining -= excerpt.length;
+    return { messageId: row.id, direction: row.direction, receivedAt: row.receivedAt.toISOString(), excerpt };
+  }).filter((item) => item.excerpt).reverse();
   return {
     threadId: thread.id, currentMessageId: current.id, hubspotTicketId: thread.hubspotTicketId,
     status: thread.status, aiPaused: thread.aiPaused,
     senderMatchesCustomer: current.fromEmail.toLowerCase() === thread.customerEmail.toLowerCase(),
-    messages, historyTruncated: rows.length > 12 || messages.some((message) => message.truncated),
+    messages, olderSummary, historyTruncated: rows.length > 32 || olderSummary.length > 0 || messages.some((message) => message.truncated),
     attachmentNotice: "Les pièces jointes ne sont pas analysées. Ne prétends pas avoir consulté une capture ou un document joint ; demande les détails nécessaires si leur contenu est indispensable.",
   };
 }

@@ -14,6 +14,7 @@ export type KnowledgeSearchResult = {
   source: string;
   verifiedAt: string | null;
   actionHints?: LearnedActionStep[];
+  resolution?: Record<string, unknown>;
 };
 
 export async function searchKnowledge(rawInput: unknown) {
@@ -27,10 +28,12 @@ export async function searchKnowledge(rawInput: unknown) {
       SELECT 1
       FROM content_items item
       JOIN content_chunks chunk ON chunk.item_id = item.id AND chunk.version_id = item.published_version_id
+      JOIN content_versions version ON version.id = item.published_version_id
       WHERE item.published_version_id IS NOT NULL
         AND item.status <> 'archived'
         AND item.ai_enabled = true
         AND ${input.scope === "sav" ? sql`item.agent_key = 'sav'` : sql`item.agent_key <> 'sav'`}
+        AND ${input.scope === "sav" ? sql`version.metadata ? 'resolution' AND COALESCE(NULLIF(version.metadata -> 'resolution' ->> 'validUntil', '')::date, CURRENT_DATE) >= CURRENT_DATE` : sql`TRUE`}
         AND item.locale = ${input.locale}
         AND ${typeFilter}
     ) AS "hasCandidates"
@@ -53,6 +56,7 @@ export async function searchKnowledge(rawInput: unknown) {
       item.slug AS source,
       item.verified_at AS "verifiedAt",
       version.metadata -> 'actionSteps' AS "actionSteps",
+      version.metadata -> 'resolution' AS "resolution",
       (
         (1 - (chunk.embedding <=> ${vectorLiteral}::vector)) * 0.58
         + ts_rank_cd(to_tsvector('french', item.title || ' ' || chunk.heading || ' ' || chunk.content), plainto_tsquery('french', ${input.query})) * 0.30
@@ -89,13 +93,14 @@ export async function searchKnowledge(rawInput: unknown) {
       AND item.ai_enabled = true
       AND item.locale = ${input.locale}
       AND ${input.scope === "sav" ? sql`item.agent_key = 'sav'` : sql`item.agent_key <> 'sav'`}
+      AND ${input.scope === "sav" ? sql`version.metadata ? 'resolution' AND COALESCE(NULLIF(version.metadata -> 'resolution' ->> 'validUntil', '')::date, CURRENT_DATE) >= CURRENT_DATE` : sql`TRUE`}
       AND ${typeFilter}
     ), best_per_content AS (
-      SELECT DISTINCT ON (id) id, title, content, source, "verifiedAt", "actionSteps", score
+      SELECT DISTINCT ON (id) id, title, content, source, "verifiedAt", "actionSteps", "resolution", score
       FROM candidates
       ORDER BY id, score DESC
     )
-    SELECT id, title, content, source, "verifiedAt", "actionSteps", score
+    SELECT id, title, content, source, "verifiedAt", "actionSteps", "resolution", score
     FROM best_per_content
     ORDER BY score DESC
     LIMIT ${input.limit}
@@ -112,6 +117,7 @@ export async function searchKnowledge(rawInput: unknown) {
       source: String(row.source),
       verifiedAt: row.verifiedAt ? new Date(String(row.verifiedAt)).toISOString().slice(0, 10) : null,
       ...(parsedHints.success && parsedHints.data.length ? { actionHints: parsedHints.data as LearnedActionStep[] } : {}),
+      ...(row.resolution && typeof row.resolution === "object" ? { resolution: row.resolution as Record<string, unknown> } : {}),
     };
   });
 

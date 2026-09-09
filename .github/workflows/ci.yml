@@ -32,6 +32,7 @@ jobs:
       - run: npm run typecheck --prefix studio
       - run: npm run lint --prefix studio
       - run: npm test --prefix studio
+      - run: npm run sav:replay --prefix studio
       - run: npm test --prefix proxy
       - run: npm run build --prefix studio
       - run: npx playwright install --with-deps chromium

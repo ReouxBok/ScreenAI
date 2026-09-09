@@ -1,7 +1,7 @@
 import "server-only";
 
 import { createHmac, timingSafeEqual } from "node:crypto";
-import { and, asc, eq, inArray, isNull, lt, or } from "drizzle-orm";
+import { and, asc, desc, eq, inArray, isNull, lt, lte, or, sql } from "drizzle-orm";
 import { z } from "zod";
 import { requireDb } from "@/db";
 import {
@@ -16,9 +16,13 @@ import {
 } from "@/db/schema";
 import { decryptSavPayload, encryptSavPayload, savContentHash } from "./crypto";
 import { assertSavWriteAllowed } from "./write-guard";
-import { isSavWriteCancellation, savModeAllowsWrite } from "./action-policy";
-import { autoReplyMinConfidence, canSendRepliesAutomatically, savAutomationMode } from "./config";
+import { savModeAllowsWrite } from "./action-policy";
+import { autoReplyMinConfidence, canSendRepliesAutomatically, savAutoReplyCategories, savAutoReplyDailyLimit, savAutomationMode, savThreadInAutoReplyRollout } from "./config";
 import { AI_DISCLOSURE, assertSavTicketStageNotClosed, normalizeEmailAddress } from "./policy";
+import { getSavAutonomyGate } from "./promotion";
+import { selectSavTicketMatch } from "./ticket-routing";
+import { extractSavLearningResolution, isHubspotOutboundDirection } from "./learning-extraction";
+import { savActionFailurePlan } from "./retry-policy";
 import { claimWebhookReceipt, markWebhookReceipt, recordWebhookReceipt, type SavMessageBody } from "./service";
 
 const hubspotEventSchema = z.object({
@@ -245,7 +249,16 @@ async function ensureContactByEmail(email: string, actionId: string) {
   });
 }
 
-async function findExistingTicket(contactId: string | null, subject: string) {
+async function findExistingTicket(contactId: string | null, subject: string, currentTicketId?: string | null) {
+  if (currentTicketId) {
+    try {
+      const linked = await hubspotFetch<HubspotRecord>(`/crm/v3/objects/tickets/${encodeURIComponent(currentTicketId)}?properties=subject,hs_pipeline,hs_pipeline_stage,hs_lastmodifieddate`);
+      if (!(await closedTicketStages()).has(String(linked.properties.hs_pipeline_stage || ""))) return linked;
+    } catch (error) {
+      if (!/HUBSPOT_HTTP_404/.test(error instanceof Error ? error.message : "")) throw error;
+    }
+  }
+  if (!contactId) return null;
   const filters = contactId
     ? [{ propertyName: "associations.contact", operator: "EQ", value: contactId }]
     : [{ propertyName: "subject", operator: "EQ", value: subject }];
@@ -260,38 +273,54 @@ async function findExistingTicket(contactId: string | null, subject: string) {
     }),
   });
   const closed = await closedTicketStages();
-  const normalizedSubject = subject.toLocaleLowerCase("fr").replace(/^(?:re|fwd?)\s*:\s*/i, "").trim();
-  return response.results?.find((ticket) => {
-    const candidateSubject = String(ticket.properties.subject || "").toLocaleLowerCase("fr").replace(/^(?:re|fwd?)\s*:\s*/i, "").trim();
-    return candidateSubject === normalizedSubject && !closed.has(String(ticket.properties.hs_pipeline_stage || ""));
-  }) ?? null;
+  const records = response.results ?? [];
+  const selection = selectSavTicketMatch({ subject, currentTicketId, candidates: records.map((ticket) => ({
+    id: ticket.id, subject: String(ticket.properties.subject || ""),
+    status: closed.has(String(ticket.properties.hs_pipeline_stage || "")) ? "closed" : "open",
+    updatedAt: ticket.properties.hs_lastmodifieddate || ticket.updatedAt || null,
+  })) });
+  if (selection.kind === "ambiguous") throw new Error(`SAV_TICKET_MATCH_AMBIGUOUS:${selection.candidates.map((ticket) => ticket.id).join(",")}`);
+  return selection.kind === "matched" ? records.find((ticket) => ticket.id === selection.ticket.id) ?? null : null;
 }
 
-export async function readSavHubspotContext(input: { email: string; subject: string }) {
+export async function readSavHubspotContext(input: { email: string; subject: string; currentTicketId?: string | null }) {
+  let linkedTicket: HubspotRecord | null = null;
+  if (input.currentTicketId) {
+    try {
+      linkedTicket = await hubspotFetch<HubspotRecord>(`/crm/v3/objects/tickets/${encodeURIComponent(input.currentTicketId)}?properties=subject,hs_pipeline,hs_pipeline_stage,hs_lastmodifieddate`);
+    } catch (error) {
+      if (!/HUBSPOT_HTTP_404/.test(error instanceof Error ? error.message : "")) throw error;
+    }
+  }
   const contact = await findContactByEmail(input.email);
-  if (!contact) return { contactFound: false, tickets: [] as Array<Record<string, unknown>> };
-  const response = await hubspotFetch<{ results?: HubspotRecord[] }>("/crm/v3/objects/tickets/search", {
-    method: "POST",
-    body: JSON.stringify({
-      filterGroups: [{ filters: [{ propertyName: "associations.contact", operator: "EQ", value: contact.id }] }],
-      query: input.subject.slice(0, 120),
-      properties: ["subject", "hs_pipeline", "hs_pipeline_stage", "hs_lastmodifieddate"],
-      sorts: ["-hs_lastmodifieddate"],
-      limit: 10,
-    }),
-  });
+  const response = contact ? await hubspotFetch<{ results?: HubspotRecord[] }>("/crm/v3/objects/tickets/search", {
+      method: "POST",
+      body: JSON.stringify({
+        filterGroups: [{ filters: [{ propertyName: "associations.contact", operator: "EQ", value: contact.id }] }],
+        query: input.subject.slice(0, 120),
+        properties: ["subject", "hs_pipeline", "hs_pipeline_stage", "hs_lastmodifieddate"],
+        sorts: ["-hs_lastmodifieddate"],
+        limit: 10,
+      }),
+    }) : { results: [] };
   const closed = await closedTicketStages();
+  const records = [...(linkedTicket ? [linkedTicket] : []), ...(response.results ?? []).filter((ticket) => ticket.id !== linkedTicket?.id)];
+  const tickets = records.slice(0, 10).map((ticket) => ({
+    id: ticket.id,
+    subject: String(ticket.properties.subject || "Sans objet").slice(0, 500),
+    pipelineId: ticket.properties.hs_pipeline,
+    stageId: ticket.properties.hs_pipeline_stage,
+    status: closed.has(String(ticket.properties.hs_pipeline_stage || "")) ? "closed" as const : "open" as const,
+    updatedAt: ticket.properties.hs_lastmodifieddate || ticket.updatedAt || null,
+  }));
+  const routing = selectSavTicketMatch({ subject: input.subject, candidates: tickets, currentTicketId: input.currentTicketId });
   return {
-    contactFound: true,
-    contactId: contact.id,
-    tickets: (response.results ?? []).slice(0, 10).map((ticket) => ({
-      id: ticket.id,
-      subject: String(ticket.properties.subject || "Sans objet").slice(0, 500),
-      pipelineId: ticket.properties.hs_pipeline,
-      stageId: ticket.properties.hs_pipeline_stage,
-      status: closed.has(String(ticket.properties.hs_pipeline_stage || "")) ? "closed" : "open",
-      updatedAt: ticket.properties.hs_lastmodifieddate || ticket.updatedAt || null,
-    })),
+    contactFound: Boolean(contact),
+    contactId: contact?.id,
+    tickets,
+    routing: routing.kind === "matched"
+      ? { kind: routing.kind, ticketId: routing.ticket.id, reason: routing.reason }
+      : { kind: routing.kind, reason: routing.reason, candidateIds: routing.kind === "ambiguous" ? routing.candidates.map((ticket) => ticket.id) : [] },
   };
 }
 
@@ -322,9 +351,12 @@ async function finalizeTicketAction(action: typeof savActions.$inferSelect) {
   const [thread] = await db.select().from(savThreads).where(eq(savThreads.id, action.threadId)).limit(1);
   if (!thread) throw new Error("SAV_ACTION_THREAD_NOT_FOUND");
   const body = decryptSavPayload<SavMessageBody>(message.bodyCiphertext);
-  const contact = await ensureContactByEmail(thread.customerEmail, action.id);
-  const existing = await findExistingTicket(contact?.id ?? null, thread.subject);
+  const existingContact = await findContactByEmail(thread.customerEmail);
+  const persistedTicketId = typeof action.payload.hubspotTicketId === "string" ? action.payload.hubspotTicketId : null;
+  const existing = await findExistingTicket(existingContact?.id ?? null, thread.subject, persistedTicketId || thread.hubspotTicketId);
+  const contact = existingContact ?? await ensureContactByEmail(thread.customerEmail, action.id);
   const ticket = existing ?? await createHubspotTicket(message, body, contact?.id ?? null, action.id);
+  if (!existing) await db.update(savActions).set({ payload: { ...action.payload, hubspotTicketId: ticket.id }, updatedAt: new Date() }).where(eq(savActions.id, action.id));
   const [sourceDecision] = action.decisionId
     ? await db.select({ confidence: savDecisions.confidence }).from(savDecisions).where(eq(savDecisions.id, action.decisionId)).limit(1)
     : [];
@@ -332,6 +364,9 @@ async function finalizeTicketAction(action: typeof savActions.$inferSelect) {
   const explanation = existing
     ? `Le message a été rattaché au ticket HubSpot ${ticket.id}, déjà ouvert pour le même client et le même sujet.`
     : `Un ticket HubSpot ${ticket.id} a été créé car le message contient une demande SAV exploitable.`;
+  const autonomy = canSendRepliesAutomatically() ? await getSavAutonomyGate() : null;
+  const categoryEligible = savAutoReplyCategories().has(String(action.payload.category ?? "other"));
+  const rolloutEligible = savThreadInAutoReplyRollout(thread.id);
   await db.transaction(async (tx) => {
     if (action.decisionId) await tx.update(savDecisions).set({ isCurrent: false }).where(eq(savDecisions.id, action.decisionId));
     await tx.insert(savDecisions).values({
@@ -370,7 +405,15 @@ async function finalizeTicketAction(action: typeof savActions.$inferSelect) {
       errorCode: action.pilotBatchId ? "SAV_PILOT_STATUS_UPDATE_BLOCKED" : null,
       executedAt: action.pilotBatchId ? new Date() : null,
     }).onConflictDoNothing();
-    if (!action.pilotBatchId && canSendRepliesAutomatically() && !thread.aiPaused && (sourceDecision?.confidence ?? 0) >= autoReplyMinConfidence()) {
+    if (!action.pilotBatchId && autonomy?.eligible && categoryEligible && rolloutEligible
+      && !thread.aiPaused && (sourceDecision?.confidence ?? 0) >= autoReplyMinConfidence()) {
+      // Serialize the daily-cap check across concurrent cron instances.
+      await tx.execute(sql`SELECT pg_advisory_xact_lock(1471638451)`);
+      const [dailyAutonomous] = await tx.select({ count: sql<number>`count(*)::int` }).from(savActions).where(and(
+        eq(savActions.kind, "send_reply"), eq(savActions.status, "succeeded"), eq(savActions.actorType, "ai"),
+        sql`${savActions.executedAt} >= ${new Date(Date.now() - 86_400_000)}`,
+      ));
+      if ((dailyAutonomous?.count ?? 0) >= savAutoReplyDailyLimit()) return;
       const [draft] = await tx.select().from(savActions)
         .where(and(eq(savActions.messageId, message.id), eq(savActions.kind, "draft_reply"), eq(savActions.status, "succeeded"))).limit(1);
       if (draft?.payload.bodyCiphertext) await tx.insert(savActions).values({
@@ -396,10 +439,12 @@ async function createHubspotNote(action: typeof savActions.$inferSelect) {
   if (!bodyCiphertext) throw new Error("SAV_NOTE_BODY_MISSING");
   const noteText = decryptSavPayload<{ text: string }>(bodyCiphertext).text.trim();
   if (!noteText) throw new Error("SAV_NOTE_BODY_EMPTY");
-  const note = await guardedHubspotWrite<HubspotRecord>(action.id, "/crm/v3/objects/notes", {
-    method: "POST",
-    body: JSON.stringify({ properties: { hs_timestamp: new Date().toISOString(), hs_note_body: noteText.slice(0, 50_000) } }),
-  });
+  const persistedNoteId = typeof action.payload.hubspotNoteId === "string" ? action.payload.hubspotNoteId : null;
+  const note = persistedNoteId ? { id: persistedNoteId, properties: {} } : await guardedHubspotWrite<HubspotRecord>(action.id, "/crm/v3/objects/notes", {
+      method: "POST",
+      body: JSON.stringify({ properties: { hs_timestamp: new Date().toISOString(), hs_note_body: noteText.slice(0, 50_000) } }),
+    });
+  if (!persistedNoteId) await db.update(savActions).set({ payload: { ...action.payload, hubspotTicketId: ticketId, hubspotNoteId: note.id }, updatedAt: new Date() }).where(eq(savActions.id, action.id));
   await guardedHubspotWrite(action.id, `/crm/v4/objects/notes/${encodeURIComponent(note.id)}/associations/default/tickets/${encodeURIComponent(ticketId)}`, { method: "PUT" });
   await db.update(savActions).set({
     status: "succeeded",
@@ -464,10 +509,14 @@ async function logHubspotEmail(action: typeof savActions.$inferSelect) {
   };
   let email: HubspotRecord;
   try {
-    email = await withoutRejectedOwner(properties, (safeProperties) => guardedHubspotWrite<HubspotRecord>(action.id, "/crm/v3/objects/emails", {
-      method: "POST",
-      body: JSON.stringify({ properties: safeProperties }),
-    }));
+    const persistedEmailId = typeof action.payload.hubspotEmailId === "string" ? action.payload.hubspotEmailId : null;
+    email = persistedEmailId
+      ? { id: persistedEmailId, properties: {} }
+      : await withoutRejectedOwner(properties, (safeProperties) => guardedHubspotWrite<HubspotRecord>(action.id, "/crm/v3/objects/emails", {
+        method: "POST",
+        body: JSON.stringify({ properties: safeProperties }),
+      }));
+    if (!persistedEmailId) await db.update(savActions).set({ payload: { ...action.payload, hubspotEmailId: email.id }, updatedAt: new Date() }).where(eq(savActions.id, action.id));
     await guardedHubspotWrite(action.id, `/crm/v4/objects/emails/${encodeURIComponent(email.id)}/associations/default/tickets/${encodeURIComponent(ticketId)}`, { method: "PUT" });
   } catch (error) {
     if (!isHubspotValidationError(error)) throw error;
@@ -527,12 +576,13 @@ export async function processPendingHubspotActions(limit = 20) {
       inArray(savActions.kind, ["create_ticket", "link_ticket", "log_email", "update_ticket_status"]),
       isNull(savActions.pilotBatchId),
       or(eq(savActions.status, "pending"), and(eq(savActions.status, "running"), lt(savActions.updatedAt, staleBefore))),
+      or(isNull(savActions.scheduledAt), lte(savActions.scheduledAt, new Date())),
     ))
-    .orderBy(asc(savActions.createdAt)).limit(Math.min(100, Math.max(1, limit)));
+    .orderBy(desc(savActions.priority), asc(savActions.createdAt)).limit(Math.min(100, Math.max(1, limit)));
   const actions = candidates.filter((action) => savModeAllowsWrite(mode, action.kind, action.actorType));
   const processed = [];
   for (const action of actions) {
-    const [claimed] = await db.update(savActions).set({ status: "running", updatedAt: new Date() }).where(and(
+    const [claimed] = await db.update(savActions).set({ status: "running", scheduledAt: null, attemptCount: sql`${savActions.attemptCount} + 1`, updatedAt: new Date() }).where(and(
       eq(savActions.id, action.id),
       isNull(savActions.pilotBatchId),
       or(eq(savActions.status, "pending"), and(eq(savActions.status, "running"), lt(savActions.updatedAt, staleBefore))),
@@ -550,8 +600,9 @@ export async function processPendingHubspotActions(limit = 20) {
       }
     } catch (error) {
       const errorCode = (error instanceof Error ? error.message : "UNKNOWN_ERROR").slice(0, 160);
-      await db.update(savActions).set({ status: isSavWriteCancellation(errorCode) ? "cancelled" : "failed", errorCode, updatedAt: new Date() }).where(eq(savActions.id, claimed.id));
-      processed.push({ actionId: claimed.id, status: "failed", errorCode });
+      const failure = savActionFailurePlan(errorCode, claimed.attemptCount);
+      await db.update(savActions).set({ status: failure.status, scheduledAt: failure.scheduledAt, errorCode, updatedAt: new Date() }).where(eq(savActions.id, claimed.id));
+      processed.push({ actionId: claimed.id, status: failure.status, retryScheduledAt: failure.scheduledAt, errorCode });
     }
   }
   return { processed };
@@ -641,7 +692,7 @@ async function snapshotTicket(ticket: HubspotRecord) {
     hs_timestamp: String(email.properties.hs_timestamp || ""),
     hs_email_direction: String(email.properties.hs_email_direction || ""),
   })));
-  const outbound = transcript.filter((email) => /EMAIL|OUTGOING/i.test(String(email.hs_email_direction || "")));
+  const outbound = transcript.filter((email) => isHubspotOutboundDirection(String(email.hs_email_direction || "")));
   const humanIntervened = outbound.some((email) => !String(email.hs_email_text || email.hs_email_html || "").includes(AI_DISCLOSURE));
   const closed = (await closedTicketStages()).has(String(ticket.properties.hs_pipeline_stage || ""));
   const updatedAt = new Date(ticket.updatedAt || ticket.properties.hs_lastmodifieddate || Date.now());
@@ -678,22 +729,27 @@ async function snapshotTicket(ticket: HubspotRecord) {
     },
   }).returning();
   if (closed) {
-    const lastHuman = [...outbound].reverse().find((email) => !String(email.hs_email_text || email.hs_email_html || "").includes(AI_DISCLOSURE));
-    const lastResolution = lastHuman ?? [...outbound].reverse().find((email) => String(email.hs_email_text || email.hs_email_html || "").trim());
-    const finalResolution = String(lastResolution?.hs_email_text || ticketContent).trim().slice(0, 10_000);
+    const extracted = extractSavLearningResolution(ticketContent, transcript.map((email) => ({
+      id: email.id, direction: String(email.hs_email_direction || ""),
+      text: hubspotEmailPlainText(email.hs_email_text || email.hs_email_html || ""),
+      timestamp: email.hs_timestamp, aiAuthored: String(email.hs_email_text || email.hs_email_html || "").includes(AI_DISCLOSURE),
+    })));
+    const finalResolution = extracted.resolution;
     if (finalResolution.length >= 20) await db.insert(savLearningCandidates).values({
       hubspotTicketId: ticket.id,
+      sourceRef: `hubspot:${ticket.id}`,
       sourceContentHash: contentHash,
       proposedPatch: {
         ciphertext: encryptSavPayload({
           subject: snapshot.subject,
           finalHumanResolution: finalResolution,
           sourceSnapshotId: snapshot.id,
+          provenance: extracted.provenance,
+          customerConfirmed: extracted.customerConfirmed,
+          sourceMessageId: extracted.sourceMessageId,
         }),
       },
-      explanation: humanIntervened
-        ? "Le ticket a été clôturé après une intervention humaine. Cette résolution doit être relue avant de corriger une fiche existante ou d’en créer une nouvelle."
-        : "Le ticket clôturé contient une résolution exploitable. Elle doit être relue avant de devenir une fiche de connaissance.",
+      explanation: `${extracted.provenance === "human_resolution" ? "Résolution humaine" : extracted.provenance === "ai_resolution" ? "Réponse IA" : "Contenu du ticket"}${extracted.customerConfirmed ? " confirmée par un message client ultérieur" : " sans confirmation client explicite"}. Cette proposition doit être relue avant de devenir une fiche de connaissance.`,
       evidenceTicketIds: [ticket.id],
       createdBy: "system",
     }).onConflictDoNothing();

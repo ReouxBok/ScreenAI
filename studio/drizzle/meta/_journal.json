@@ -120,6 +120,62 @@
       "when": 1788424334187,
       "tag": "0016_burly_thena",
       "breakpoints": true
+    },
+    {
+      "idx": 17,
+      "version": "7",
+      "when": 1788955200000,
+      "tag": "0017_sav_review_dimensions",
+      "breakpoints": true
+    },
+    {
+      "idx": 18,
+      "version": "7",
+      "when": 1788955201000,
+      "tag": "0018_sav_learning_source_ref",
+      "breakpoints": true
+    },
+    {
+      "idx": 19,
+      "version": "7",
+      "when": 1788955202000,
+      "tag": "0019_sav_action_retries",
+      "breakpoints": true
+    },
+    {
+      "idx": 20,
+      "version": "7",
+      "when": 1788955203000,
+      "tag": "0020_sav_message_analysis_recovery",
+      "breakpoints": true
+    },
+    {
+      "idx": 21,
+      "version": "7",
+      "when": 1788955204000,
+      "tag": "0021_sav_preview_redaction",
+      "breakpoints": true
+    },
+    {
+      "idx": 22,
+      "version": "7",
+      "when": 1788955205000,
+      "tag": "0022_sav_pilot_agent_run",
+      "breakpoints": true
+    },
+    {
+      "idx": 23,
+      "version": "7",
+      "when": 1788955206000,
+      "tag": "0023_sav_action_priority",
+      "breakpoints": true
+    },
+    {
+      "idx": 24,
+      "version": "7",
+      "when": 1788955207000,
+      "tag": "0024_sav_agent_token_usage",
+      "breakpoints": true
     }
   ]
 }

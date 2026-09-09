@@ -19,7 +19,8 @@ import {
   type SavDecisionEvidence,
 } from "@/db/schema";
 import { decryptSavPayload, encryptSavPayload, savContentHash } from "./crypto";
-import { analyzeSavMessage } from "./intelligence";
+import { analyzeSavMessage, type SavAnalysis } from "./intelligence";
+import { redactSavLearningText } from "./learning-extraction";
 import { invalidateSavReplies } from "./invalidation";
 import { isSavPilotMode } from "./config";
 import {
@@ -57,6 +58,13 @@ const correctedDecisionSchema = z.object({
 
 const pilotReviewSchema = z.object({
   verdict: z.enum(["correct", "partial", "incorrect", "critical"]),
+  dimensions: z.object({
+    classification: z.enum(["correct", "partial", "incorrect", "critical"]),
+    routing: z.enum(["correct", "partial", "incorrect", "critical"]),
+    grounding: z.enum(["correct", "partial", "incorrect", "critical"]),
+    tone: z.enum(["correct", "partial", "incorrect", "critical"]),
+    escalation: z.enum(["correct", "partial", "incorrect", "critical"]),
+  }),
   feedbackCodes: z.array(z.enum([
     "wrong_classification",
     "wrong_ticket_decision",
@@ -151,6 +159,8 @@ async function createDecision(
   evidence: SavDecisionEvidence[] = [],
   model = "rules-v1",
   pilotBatchId?: string,
+  category = "other",
+  urgency: SavAnalysis["urgency"] = "normal",
 ) {
   const db = requireDb();
   const [existing] = await db.select().from(savDecisions)
@@ -178,8 +188,9 @@ async function createDecision(
         decisionId: decision.id,
         pilotBatchId,
         kind: "create_ticket",
+        priority: urgency === "critical" ? 100 : urgency === "high" ? 80 : urgency === "low" ? 20 : 50,
         idempotencyKey: `hubspot:create-ticket:${message.id}`,
-        payload: { reasonCode: proposal.reasonCode },
+        payload: { reasonCode: proposal.reasonCode, category },
         actorType: "ai",
       }).onConflictDoNothing();
     } else if (proposal.kind === "human_review_required") {
@@ -199,8 +210,9 @@ async function createDecision(
         decisionId: decision.id,
         pilotBatchId,
         kind: "create_ticket",
+        priority: urgency === "critical" ? 100 : urgency === "high" ? 80 : 50,
         idempotencyKey: `hubspot:create-ticket:${message.id}`,
-        payload: { reasonCode: proposal.reasonCode, humanRequired: true },
+        payload: { reasonCode: proposal.reasonCode, humanRequired: true, category },
         actorType: "ai",
       }).onConflictDoNothing();
       await tx.insert(savActions).values({
@@ -209,6 +221,7 @@ async function createDecision(
         decisionId: decision.id,
         pilotBatchId,
         kind: "request_human",
+        priority: 100,
         status: "pending",
         idempotencyKey: `human:request:${message.id}`,
         payload: { reasonCode: proposal.reasonCode, dueAt: humanDueAt(now).toISOString() },
@@ -251,7 +264,7 @@ export async function ingestInboundMessage(rawInput: unknown) {
       fromEmail: normalizedFrom,
       toEmails: input.to.map(normalizeEmailAddress),
       subject: input.subject || "Sans objet",
-      preview: bodyText.replace(/\s+/g, " ").slice(0, 280),
+      preview: redactSavLearningText(bodyText.replace(/\s+/g, " ")).slice(0, 280),
       bodyCiphertext: encryptSavPayload({ text: bodyText, ...(input.bodyHtml ? { html: input.bodyHtml } : {}), ...(input.headers ? { headers: input.headers } : {}) }),
       receivedAt: input.receivedAt,
     }).onConflictDoNothing().returning();
@@ -279,33 +292,74 @@ export async function ingestInboundMessage(rawInput: unknown) {
 
   if (result.duplicate) return result;
   if (isSavPilotMode()) return { ...result, queuedForPilot: true as const };
+  const decision = await processStoredSavMessage(result.message.id);
+  return { ...result, decision };
+}
+
+export async function processStoredSavMessage(messageId: string) {
+  if (isSavPilotMode()) return null;
+  const db = requireDb();
+  const staleBefore = new Date(Date.now() - 10 * 60 * 1_000);
+  const [message] = await db.update(savMessages).set({
+    analysisStatus: "processing", analysisStartedAt: new Date(), analysisErrorCode: null,
+    analysisAttempts: sql`${savMessages.analysisAttempts} + 1`,
+  }).where(and(
+    eq(savMessages.id, messageId), eq(savMessages.direction, "inbound"), isNull(savMessages.processedAt),
+    lt(savMessages.analysisAttempts, 3),
+    or(eq(savMessages.analysisStatus, "pending"), and(eq(savMessages.analysisStatus, "processing"), or(isNull(savMessages.analysisStartedAt), lt(savMessages.analysisStartedAt, staleBefore)))),
+  )).returning();
+  if (!message) return null;
+  try {
+    const body = decryptSavPayload<SavMessageBody>(message.bodyCiphertext);
   const analysis = await analyzeSavMessage({
-    from: input.from,
-    subject: input.subject,
-    body: bodyText,
-    autoSubmitted: input.autoSubmitted,
-  }, { messageId: result.message.id });
-  const decision = await createDecision(result.message, analysis.proposal, analysis.evidence, analysis.model);
-  if (analysis.replyDraft) {
+      from: message.fromEmail, subject: message.subject, body: body.text,
+      autoSubmitted: body.headers?.["auto-submitted"],
+    }, { messageId: message.id });
+    const decision = await createDecision(message, analysis.proposal, analysis.evidence, analysis.model, undefined, analysis.category, analysis.urgency);
+    if (analysis.replyDraft) {
     await db.insert(savActions).values({
-      threadId: result.thread.id,
-      messageId: result.message.id,
+      threadId: message.threadId,
+      messageId: message.id,
       decisionId: decision.id,
       kind: "draft_reply",
       status: "succeeded",
-      idempotencyKey: `reply:draft:${result.message.id}`,
+      idempotencyKey: `reply:draft:${message.id}`,
       payload: { bodyCiphertext: encryptSavPayload({ text: analysis.replyDraft }), model: analysis.model },
       actorType: "ai",
       executedAt: new Date(),
     }).onConflictDoNothing();
+    }
+    await db.update(savMessages).set({ analysisStatus: "done", analysisErrorCode: null }).where(eq(savMessages.id, message.id));
+    return decision;
+  } catch (error) {
+    const errorCode = safeErrorCode(error);
+    await db.update(savMessages).set({ analysisStatus: message.analysisAttempts >= 3 ? "failed" : "pending", analysisErrorCode: errorCode })
+      .where(eq(savMessages.id, message.id));
+    throw error;
   }
-  return { ...result, decision };
+}
+
+export async function processPendingSavMessages(limit = 4) {
+  if (isSavPilotMode()) return { skipped: "pilot_mode", processed: [] as Array<Record<string, unknown>> };
+  const db = requireDb();
+  const staleBefore = new Date(Date.now() - 10 * 60 * 1_000);
+  const candidates = await db.select({ id: savMessages.id }).from(savMessages).leftJoin(savPilotItems, eq(savPilotItems.messageId, savMessages.id)).where(and(
+    eq(savMessages.direction, "inbound"), isNull(savMessages.processedAt), isNull(savPilotItems.id), lt(savMessages.analysisAttempts, 3),
+    or(eq(savMessages.analysisStatus, "pending"), and(eq(savMessages.analysisStatus, "processing"), or(isNull(savMessages.analysisStartedAt), lt(savMessages.analysisStartedAt, staleBefore)))),
+  )).orderBy(asc(savMessages.receivedAt)).limit(Math.min(20, Math.max(1, limit)));
+  const processed = [];
+  for (const candidate of candidates) {
+    try { processed.push({ messageId: candidate.id, status: (await processStoredSavMessage(candidate.id)) ? "processed" : "skipped" }); }
+    catch (error) { processed.push({ messageId: candidate.id, status: "failed", errorCode: safeErrorCode(error) }); }
+  }
+  return { processed };
 }
 
 export async function processSavPilotItem(itemId: string) {
   const db = requireDb();
   const [claimed] = await db.update(savPilotItems).set({
     status: "processing",
+    attemptCount: sql`${savPilotItems.attemptCount} + 1`,
     errorCode: null,
     updatedAt: new Date(),
   }).where(and(eq(savPilotItems.id, itemId), eq(savPilotItems.status, "pending"))).returning();
@@ -321,7 +375,7 @@ export async function processSavPilotItem(itemId: string) {
     const [activeBatch] = await db.select({ id: savPilotBatches.id }).from(savPilotBatches)
       .where(and(eq(savPilotBatches.id, claimed.batchId), eq(savPilotBatches.status, "processing"))).limit(1);
     if (!activeBatch) throw new Error("SAV_PILOT_BATCH_CANCELLED");
-    const decision = await createDecision(message, analysis.proposal, analysis.evidence, analysis.model, claimed.batchId);
+    const decision = await createDecision(message, analysis.proposal, analysis.evidence, analysis.model, claimed.batchId, analysis.category, analysis.urgency);
     if (analysis.replyDraft) await db.insert(savActions).values({
       threadId: message.threadId,
       messageId: message.id,
@@ -346,13 +400,15 @@ export async function processSavPilotItem(itemId: string) {
         actorType: "ai",
       }).onConflictDoNothing();
     }
-    await db.update(savPilotItems).set({ status: "ready", decisionId: decision.id, updatedAt: new Date() })
+    await db.update(savPilotItems).set({ status: "ready", decisionId: decision.id, agentRunId: analysis.agentRunId, updatedAt: new Date() })
       .where(eq(savPilotItems.id, claimed.id));
+    await db.update(savMessages).set({ analysisStatus: "done", analysisErrorCode: null }).where(eq(savMessages.id, message.id));
     return { itemId: claimed.id, status: "ready" as const };
   } catch (error) {
     const errorCode = safeErrorCode(error);
     await db.update(savPilotItems).set({ status: "error", errorCode, updatedAt: new Date() })
       .where(eq(savPilotItems.id, claimed.id));
+    await db.update(savMessages).set({ analysisStatus: "failed", analysisErrorCode: errorCode }).where(eq(savMessages.id, claimed.messageId));
     return { itemId: claimed.id, status: "error" as const, errorCode };
   }
 }
@@ -419,6 +475,11 @@ export async function listSavPilotBatchItems(batchId: string) {
     batchId: savPilotItems.batchId,
     status: savPilotItems.status,
     verdict: savPilotItems.verdict,
+    classificationVerdict: savPilotItems.classificationVerdict,
+    routingVerdict: savPilotItems.routingVerdict,
+    groundingVerdict: savPilotItems.groundingVerdict,
+    toneVerdict: savPilotItems.toneVerdict,
+    escalationVerdict: savPilotItems.escalationVerdict,
     feedbackCodes: savPilotItems.feedbackCodes,
     errorCode: savPilotItems.errorCode,
     messageId: savMessages.id,
@@ -515,6 +576,11 @@ export async function cancelSavPilotBatch(batchId: string, actorEmail: string, r
 export async function processPendingSavPilotItems(limit = 10) {
   if (!isSavPilotMode()) return { skipped: "pilot_disabled", processed: [] as Array<Record<string, unknown>> };
   const db = requireDb();
+  const staleBefore = new Date(Date.now() - 10 * 60 * 1_000);
+  await db.update(savPilotItems).set({ status: "pending", errorCode: "SAV_PILOT_STALE_REQUEUED", updatedAt: new Date() })
+    .where(and(eq(savPilotItems.status, "processing"), lt(savPilotItems.updatedAt, staleBefore), lt(savPilotItems.attemptCount, 3)));
+  await db.update(savPilotItems).set({ status: "error", errorCode: "SAV_PILOT_RETRY_EXHAUSTED", updatedAt: new Date() })
+    .where(and(eq(savPilotItems.status, "processing"), lt(savPilotItems.updatedAt, staleBefore), sql`${savPilotItems.attemptCount} >= 3`));
   const items = await db.select({ id: savPilotItems.id, batchId: savPilotItems.batchId }).from(savPilotItems)
     .innerJoin(savPilotBatches, eq(savPilotBatches.id, savPilotItems.batchId))
     .where(and(eq(savPilotBatches.status, "processing"), eq(savPilotItems.status, "pending")))
@@ -569,6 +635,11 @@ export async function listSavPilotBatches(limit = 20) {
     batchId: savPilotItems.batchId,
     status: savPilotItems.status,
     verdict: savPilotItems.verdict,
+    classificationVerdict: savPilotItems.classificationVerdict,
+    routingVerdict: savPilotItems.routingVerdict,
+    groundingVerdict: savPilotItems.groundingVerdict,
+    toneVerdict: savPilotItems.toneVerdict,
+    escalationVerdict: savPilotItems.escalationVerdict,
   }).from(savPilotItems).where(inArray(savPilotItems.batchId, batches.map((batch) => batch.id)));
   const actionRows = await db.select({
     batchId: savActions.pilotBatchId,
@@ -620,6 +691,10 @@ export async function getSavDashboard() {
     .where(eq(savLearningCandidates.status, "pending"));
   const [failedActions] = await db.select({ count: sql<number>`count(*)::int` }).from(savActions)
     .where(eq(savActions.status, "failed"));
+  const [scheduledRetries] = await db.select({ count: sql<number>`count(*)::int` }).from(savActions)
+    .where(and(eq(savActions.status, "pending"), isNotNull(savActions.scheduledAt)));
+  const [analysisFailures] = await db.select({ count: sql<number>`count(*)::int` }).from(savMessages)
+    .where(eq(savMessages.analysisStatus, "failed"));
   const [degradedRuns] = await db.select({ count: sql<number>`count(*)::int` }).from(savAgentRuns)
     .where(inArray(savAgentRuns.status, ["failed", "fallback"]));
   const [gmailReceiptCounts] = await db.select({
@@ -632,6 +707,8 @@ export async function getSavDashboard() {
     ...(totals ?? { total: 0, withoutDecision: 0, tickets: 0, human: 0, closedNoAction: 0, pilotQueued: 0 }),
     pendingLearning: pendingLearning?.count ?? 0,
     failedActions: failedActions?.count ?? 0,
+    scheduledRetries: scheduledRetries?.count ?? 0,
+    analysisFailures: analysisFailures?.count ?? 0,
     degradedRuns: degradedRuns?.count ?? 0,
     gmailPending: gmailReceiptCounts?.pending ?? 0,
     gmailFailed: gmailReceiptCounts?.failed ?? 0,
@@ -647,11 +724,17 @@ export async function listSavAgentPerformance(limit = 2_000) {
     model: savAgentRuns.model,
     promptRevision: savAgentRuns.promptRevision,
     durationMs: savAgentRuns.durationMs,
+    totalTokens: savAgentRuns.totalTokens,
     verdict: savPilotItems.verdict,
     reviewedAt: savPilotItems.reviewedAt,
+    classificationVerdict: savPilotItems.classificationVerdict,
+    routingVerdict: savPilotItems.routingVerdict,
+    groundingVerdict: savPilotItems.groundingVerdict,
+    toneVerdict: savPilotItems.toneVerdict,
+    escalationVerdict: savPilotItems.escalationVerdict,
     createdAt: savAgentRuns.createdAt,
   }).from(savAgentRuns)
-    .leftJoin(savPilotItems, eq(savPilotItems.messageId, savAgentRuns.messageId))
+    .leftJoin(savPilotItems, eq(savPilotItems.agentRunId, savAgentRuns.id))
     .orderBy(desc(savAgentRuns.createdAt))
     .limit(Math.min(5_000, Math.max(1, limit)));
 
@@ -668,7 +751,10 @@ export async function listSavAgentPerformance(limit = 2_000) {
     critical: number;
     degraded: number;
     durationTotalMs: number;
+    tokenTotal: number;
     latestAt: Date;
+    dimensionPoints: Record<string, number>;
+    dimensionCounts: Record<string, number>;
   }>();
   for (const row of rows) {
     const key = `${row.runtime}\u0000${row.mode}\u0000${row.model}\u0000${row.promptRevision}`;
@@ -685,31 +771,47 @@ export async function listSavAgentPerformance(limit = 2_000) {
       critical: 0,
       degraded: 0,
       durationTotalMs: 0,
+      tokenTotal: 0,
       latestAt: row.createdAt,
+      dimensionPoints: {},
+      dimensionCounts: {},
     };
     group.runs += 1;
     group.durationTotalMs += row.durationMs;
+    group.tokenTotal += row.totalTokens;
     if (["failed", "fallback"].includes(row.status)) group.degraded += 1;
     if (row.reviewedAt && row.verdict) {
       group.reviewed += 1;
       group[row.verdict] += 1;
     }
+    for (const [dimension, verdict] of Object.entries({ classification: row.classificationVerdict, routing: row.routingVerdict, grounding: row.groundingVerdict, tone: row.toneVerdict, escalation: row.escalationVerdict })) {
+      if (!verdict) continue;
+      group.dimensionCounts[dimension] = (group.dimensionCounts[dimension] ?? 0) + 1;
+      group.dimensionPoints[dimension] = (group.dimensionPoints[dimension] ?? 0) + (verdict === "correct" ? 1 : verdict === "partial" ? 0.5 : 0);
+    }
     groups.set(key, group);
   }
 
-  return [...groups.values()].map(({ durationTotalMs, ...group }) => ({
+  return [...groups.values()].map(({ durationTotalMs, tokenTotal, dimensionPoints, dimensionCounts, ...group }) => ({
     ...group,
     acceptanceRate: group.reviewed
       ? Math.round(((group.correct + group.partial * 0.5) / group.reviewed) * 100)
       : null,
     degradedRate: group.runs ? Math.round((group.degraded / group.runs) * 100) : 0,
     averageDurationMs: group.runs ? Math.round(durationTotalMs / group.runs) : 0,
+    averageTokens: group.runs ? Math.round(tokenTotal / group.runs) : 0,
+    dimensions: Object.fromEntries(Object.keys(dimensionCounts).map((dimension) => [dimension, Math.round((dimensionPoints[dimension] / dimensionCounts[dimension]) * 100)])),
   })).sort((left, right) => right.latestAt.getTime() - left.latestAt.getTime());
 }
 
 export async function getSavImprovementSignals(limit = 5_000) {
   const rows = await requireDb().select({
     verdict: savPilotItems.verdict,
+    classificationVerdict: savPilotItems.classificationVerdict,
+    routingVerdict: savPilotItems.routingVerdict,
+    groundingVerdict: savPilotItems.groundingVerdict,
+    toneVerdict: savPilotItems.toneVerdict,
+    escalationVerdict: savPilotItems.escalationVerdict,
     feedbackCodes: savPilotItems.feedbackCodes,
     correctedDraftCiphertext: savPilotItems.correctedDraftCiphertext,
   }).from(savPilotItems)
@@ -732,6 +834,11 @@ export async function getSavImprovementSignals(limit = 5_000) {
     incorrect: rows.filter((row) => row.verdict === "incorrect").length,
     critical: rows.filter((row) => row.verdict === "critical").length,
     correctedDrafts: rows.filter((row) => Boolean(row.correctedDraftCiphertext)).length,
+    dimensions: Object.fromEntries(["classification", "routing", "grounding", "tone", "escalation"].map((dimension) => {
+      const verdicts = rows.map((row) => row[`${dimension}Verdict` as keyof typeof row]).filter((value): value is "correct" | "partial" | "incorrect" | "critical" => typeof value === "string");
+      const score = verdicts.length ? Math.round((verdicts.reduce((sum, verdict) => sum + (verdict === "correct" ? 1 : verdict === "partial" ? 0.5 : 0), 0) / verdicts.length) * 100) : null;
+      return [dimension, { reviewed: verdicts.length, score }];
+    })),
     feedback: [...feedback.values()].sort((left, right) => right.critical - left.critical || right.count - left.count || left.code.localeCompare(right.code)),
   };
 }
@@ -815,6 +922,11 @@ export async function getSavThreadDetail(threadId: string) {
     batchId: savPilotItems.batchId,
     status: savPilotItems.status,
     verdict: savPilotItems.verdict,
+    classificationVerdict: savPilotItems.classificationVerdict,
+    routingVerdict: savPilotItems.routingVerdict,
+    groundingVerdict: savPilotItems.groundingVerdict,
+    toneVerdict: savPilotItems.toneVerdict,
+    escalationVerdict: savPilotItems.escalationVerdict,
     feedbackCodes: savPilotItems.feedbackCodes,
     reviewerComment: savPilotItems.reviewerComment,
     correctedDraftCiphertext: savPilotItems.correctedDraftCiphertext,
@@ -865,6 +977,11 @@ export async function reviewSavPilotItem(itemId: string, rawInput: unknown, acto
   const [updated] = await db.update(savPilotItems).set({
     status: "reviewed",
     verdict: input.verdict,
+    classificationVerdict: input.dimensions.classification,
+    routingVerdict: input.dimensions.routing,
+    groundingVerdict: input.dimensions.grounding,
+    toneVerdict: input.dimensions.tone,
+    escalationVerdict: input.dimensions.escalation,
     feedbackCodes: input.feedbackCodes,
     reviewerComment: input.comment,
     correctedDraftCiphertext,
@@ -877,7 +994,12 @@ export async function reviewSavPilotItem(itemId: string, rawInput: unknown, acto
     action: "sav_pilot_item_reviewed",
     entityType: "sav_pilot_item",
     entityId: item.id,
-    technicalMetadata: { verdict: input.verdict, batchId: item.batchId, feedbackCount: input.feedbackCodes.length },
+    technicalMetadata: {
+      verdict: input.verdict, classificationVerdict: input.dimensions.classification,
+      routingVerdict: input.dimensions.routing, groundingVerdict: input.dimensions.grounding,
+      toneVerdict: input.dimensions.tone, escalationVerdict: input.dimensions.escalation,
+      batchId: item.batchId, feedbackCount: input.feedbackCodes.length,
+    },
   });
   if (input.verdict !== "correct" && input.correctedDraft.length >= 20) {
     const [context] = await db.select({
@@ -888,7 +1010,7 @@ export async function reviewSavPilotItem(itemId: string, rawInput: unknown, acto
       .innerJoin(savThreads, eq(savThreads.id, savMessages.threadId))
       .where(eq(savMessages.id, item.messageId))
       .limit(1);
-    if (context?.hubspotTicketId) {
+    if (context) {
       const sourceContentHash = savContentHash({
         source: "pilot_human_review",
         pilotItemId: item.id,
@@ -897,16 +1019,19 @@ export async function reviewSavPilotItem(itemId: string, rawInput: unknown, acto
       await db.insert(savLearningCandidates).values({
         threadId: context.threadId,
         hubspotTicketId: context.hubspotTicketId,
+        sourceRef: context.hubspotTicketId ? `hubspot:${context.hubspotTicketId}` : `thread:${context.threadId}`,
         sourceContentHash,
         proposedPatch: {
           ciphertext: encryptSavPayload({
             subject: context.subject,
             finalHumanResolution: input.correctedDraft,
             sourceSnapshotId: `pilot:${item.id}`,
+            provenance: "pilot_human_review",
+            customerConfirmed: false,
           }),
         },
         explanation: "Un humain a corrigé la réponse proposée pendant le pilote. Cette correction doit encore être relue et approuvée avant de devenir une fiche de résolution.",
-        evidenceTicketIds: [context.hubspotTicketId],
+        evidenceTicketIds: context.hubspotTicketId ? [context.hubspotTicketId] : [],
         createdBy: "human",
       }).onConflictDoNothing();
     }
@@ -1048,7 +1173,7 @@ export async function queueSavTicketCreation(threadId: string, actorEmail: strin
 
 export async function retrySavAction(actionId: string, actorEmail: string) {
   const db = requireDb();
-  const [action] = await db.update(savActions).set({ status: "pending", errorCode: null, updatedAt: new Date() })
+  const [action] = await db.update(savActions).set({ status: "pending", attemptCount: 0, scheduledAt: null, errorCode: null, updatedAt: new Date() })
     .where(and(eq(savActions.id, actionId), eq(savActions.status, "failed"))).returning();
   if (!action) throw new Error("SAV_FAILED_ACTION_NOT_FOUND");
   await db.insert(auditLogs).values({

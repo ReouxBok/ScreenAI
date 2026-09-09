@@ -9,19 +9,19 @@ Branche : `feat/sav-reliability-harness`.
 
 | Lot | Exigences | Preuve attendue | État |
 |---|---|---|---|
-| A1 | Référence : modes, moteurs, corpus anonymisé, tests et mesures initiales | Tests exécutés, référence versionnée, mesures réelles distinguées des simulations | En cours |
-| A2 | Contrôle central des écritures, invalidation, suspension, destinataire, doublons et arrêt | Tests de workers et scénarios concurrents | En cours |
-| A3 | Matrice des modes, drapeau IA global, interface et documentation cohérentes | Tests exhaustifs des permissions et inspection UI | En cours |
-| B1 | Historique borné, auteurs, pièces jointes, citations, résumés et isolation client | Scénarios de conversation | En cours |
-| B2 | Rattachement explicite, ambiguïtés, nouveaux sujets et tickets fermés | Scénarios CRM simulés | À faire |
-| B3 | Étapes contrôlées, recherche répétable bornée, cache par arguments, sorties cohérentes | Tests harness et replis | En cours |
-| B4 | Fiches structurées, validité, preuves précises, contradiction et clarification | Tests de recherche et de justification | À faire |
-| B5 | Éligibilité par catégorie, confiance calibrée, promotion bloquante | Gate lié aux évaluations de la version exacte | À faire |
-| C1 | Pilote détaillé, dimensions de verdict, corrections sans ticket et origine des moteurs | Tests service et interface | À faire |
-| C2 | Replay versionné, corpus de contrôle séparé, régressions et événements successifs | Rapport reproductible et CI bloquante | À faire |
-| D1 | Apprentissage du dossier, provenance, anonymisation, déduplication et validation | Tests candidats et publication | À faire |
-| D2 | Reprise ingestion, retry borné, alertes, priorités, coût et conservation | Tests incidents et métriques opérables | À faire |
-| E | Autonomie graduelle, qualité observée et retour arrière | Données pilotes réelles et recette avant activation | À faire |
+| A1 | Référence : modes, moteurs, corpus anonymisé, tests et mesures initiales | Tests exécutés, référence versionnée, mesures réelles distinguées des simulations | Implémenté localement |
+| A2 | Contrôle central des écritures, invalidation, suspension, destinataire, doublons et arrêt | Tests de workers et scénarios concurrents | Implémenté localement |
+| A3 | Matrice des modes, drapeau IA global, interface et documentation cohérentes | Tests exhaustifs des permissions et inspection UI | Implémenté localement |
+| B1 | Historique borné, auteurs, pièces jointes, citations, résumés et isolation client | Scénarios de conversation | Implémenté localement |
+| B2 | Rattachement explicite, ambiguïtés, nouveaux sujets et tickets fermés | Scénarios CRM simulés | Implémenté localement |
+| B3 | Étapes contrôlées, recherche répétable bornée, cache par arguments, sorties cohérentes | Tests harness et replis | Implémenté localement |
+| B4 | Fiches structurées, validité, preuves précises, contradiction et clarification | Tests de recherche et de justification | Implémenté localement |
+| B5 | Éligibilité par catégorie, confiance calibrée, promotion bloquante | Gate lié aux évaluations de la version exacte | Gate implémenté ; calibration réelle attendue |
+| C1 | Pilote détaillé, dimensions de verdict, corrections sans ticket et origine des moteurs | Tests service et interface | Implémenté localement |
+| C2 | Replay versionné, corpus de contrôle séparé, régressions et événements successifs | Rapport reproductible et CI bloquante | Règles en CI ; runner ADK prêt, campagne réelle attendue |
+| D1 | Apprentissage du dossier, provenance, anonymisation, déduplication et validation | Tests candidats et publication | Implémenté localement |
+| D2 | Reprise ingestion, retry borné, alertes, priorités, coût et conservation | Tests incidents et métriques opérables | Implémenté localement |
+| E | Autonomie graduelle, qualité observée et retour arrière | Données pilotes réelles et recette avant activation | Code fermé par défaut ; données réelles attendues |
 
 ## État initial
 
@@ -52,21 +52,65 @@ Branche : `feat/sav-reliability-harness`.
   reprise humaine pendant une lecture Gmail et absence de second envoi après succès.
 - Dernière suite globale : 115 tests réussis, TypeScript et ESLint réussis.
 
-## Limites restantes à ne pas confondre avec une livraison complète
+## Deuxième implémentation — 9 septembre 2026
 
-- La fenêtre entre le dernier contrôle local et l’acceptation d’une requête externe
-  n’est pas éliminée par ces contrôles. Les scénarios de concurrence et de réponse
-  réseau incertaine demandent un protocole de reprise supplémentaire.
-- Les créations HubSpot après un timeout et les associations partiellement réussies
-  nécessitent une réconciliation persistante avant nouvelle tentative.
-- L’historique est borné, pas encore résumé avec références. Le contenu détaillé du
-  ticket HubSpot, les ambiguïtés de routage et les pièces jointes restent à traiter.
-- Vérifier une source connue ne prouve pas que chaque affirmation est étayée.
-  La justification par passages, la vérification des réponses et les fiches structurées restent à faire.
-- Corpus de replay, critères de promotion, corrections sans ticket, apprentissage,
-  observabilité et reprise des analyses interrompues restent à implémenter.
-- Aucun résultat pilote réel collecté, aucune configuration de production auditée,
-  aucune autonomie activée. L’interface modifiée n’a pas encore été inspectée visuellement.
+- Les solutions utilisent des citations exactes. L’identifiant, l’affirmation et
+  l’extrait sont contrôlés contre une fiche structurée, récente et suffisamment
+  pertinente. Les conflits déclarés entre fiches imposent une revue humaine.
+- Les fiches SAV expirées ou sans structure de résolution sont exclues de la
+  recherche autonome. Les types de réponse distinguent solution, clarification,
+  accusé de réception, transfert et absence de réponse.
+- Le routage HubSpot privilégie le ticket déjà lié au fil Gmail, puis une référence
+  explicite, un sujet exact et enfin une similarité avec seuil et marge. Une
+  ambiguïté suspend l’écriture ; un ticket fermé n’est pas rouvert.
+- Les identifiants HubSpot créés sont persistés avant les associations suivantes,
+  afin qu’une reprise n’engendre pas un second objet après un échec partiel connu.
+- Chaque élément pilote référence directement l’exécution qui l’a produit. Les
+  scores de promotion ne peuvent plus être hérités par une autre version du prompt.
+- Le formulaire pilote mesure classification, routage, ancrage, ton et escalade.
+  Une correction sans ticket HubSpot crée aussi un candidat d’apprentissage.
+- Les résolutions apprises enregistrent auteur humain ou IA, confirmation client,
+  message source et référence du dossier. Les aperçus et contenus d’apprentissage
+  masquent emails, téléphones, cartes et secrets probables.
+- Les analyses interrompues et actions externes ont une reprise bornée, un délai
+  exponentiel et un état terminal. Les actions urgentes passent avant la file
+  normale. Le cron renvoie désormais une erreur exploitable si une étape échoue.
+- Les exécutions ADK enregistrent latence et jetons. Le tableau de bord expose les
+  incidents, reprises, dimensions de qualité, version exacte et coût en jetons.
+- La conservation est volontairement inactive par défaut et ne supprime que les
+  dossiers clos au-delà du délai configuré, plus les reçus techniques anciens.
+- L’autonomie exige 30 revues de la version exacte, 100 revues globales, 90 % de
+  score pondéré, aucun verdict critique, aucun repli et aucune action en échec.
+  Elle reste ensuite limitée aux catégories autorisées, à un seuil de confiance,
+  à un pourcentage stable de dossiers et à un plafond quotidien. Le pourcentage
+  vaut 0 par défaut.
+- Le replay synthétique versionné sépare développement et contrôle et bloque la CI.
+  Résultat local : 12/12. La suite Studio compte 147 tests réussis.
+- Un second replay exécute le vrai harness ADK avec des fiches et tickets synthétiques
+  injectés, sans accès aux systèmes externes. Son exécution exige une clé Gemini et
+  reste distincte du replay déterministe bloquant de la CI.
+- Validation supplémentaire : typage, lint, build Next.js, migration Drizzle réelle
+  sur PostgreSQL local isolé et test navigateur du registre SAV réussis.
+- Audit Vercel en lecture seule : le projet `studio` est en mode `shadow`, le harness
+  ADK est en mode `pilot`, l’analyse IA est active et les webhooks non signés sont
+  refusés. Les nouveaux réglages d’autonomie sont absents et prennent donc leurs
+  valeurs fermées par défaut.
+
+## Limites externes restantes
+
+- Un timeout sur la requête de création elle-même peut rester ambigu si HubSpot a
+  créé l’objet sans renvoyer son identifiant. Les reprises couvrent les échecs après
+  réception de l’identifiant ; une garantie absolue demanderait une clé
+  d’idempotence acceptée par l’API distante.
+- Les pièces jointes sont déclarées non analysées et déclenchent une clarification
+  si elles sont nécessaires. Leur extraction sûre n’est pas incluse dans ce lot.
+- Le replay CI couvre les règles déterministes et les invariants du harness. Une
+  campagne récurrente du modèle ADK sur un corpus pilote anonymisé exige une clé,
+  une base de fiches représentative et un budget modèle ; elle ne doit pas être
+  simulée dans les chiffres de production.
+- Aucun déploiement, migration distante ou changement de variable Vercel n’a été
+  effectué dans ce lot. Les métriques de promotion restent donc à zéro tant que les
+  revues pilotes réelles n’ont pas été menées sur la version déployée.
 
 ## Audit de clôture
 

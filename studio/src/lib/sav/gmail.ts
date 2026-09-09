@@ -1,12 +1,12 @@
 import "server-only";
 
 import { timingSafeEqual } from "node:crypto";
-import { and, asc, desc, eq, inArray, isNull, lt, or, sql } from "drizzle-orm";
+import { and, asc, desc, eq, inArray, isNull, lt, lte, or, sql } from "drizzle-orm";
 import { z } from "zod";
 import { requireDb } from "@/db";
 import { savActions, savFollowups, savGmailQuarantine, savMailboxes, savMessages, savThreads, savWebhookReceipts } from "@/db/schema";
 import { assertSavWriteAllowed } from "./write-guard";
-import { isSavWriteCancellation, savModeAllowsWrite } from "./action-policy";
+import { savModeAllowsWrite } from "./action-policy";
 import { savAutomationMode } from "./config";
 import { decryptSavPayload, encryptSavPayload } from "./crypto";
 import {
@@ -19,6 +19,8 @@ import {
   updateMailboxWatch,
 } from "./service";
 import { assertSavOutboundRecipientAllowed, ensureAiTransparency, followupDates, normalizeEmailAddress, sanitizeInboundText } from "./policy";
+import { savActionFailurePlan } from "./retry-policy";
+import { redactSavLearningText } from "./learning-extraction";
 
 const pubSubEnvelopeSchema = z.object({
   message: z.object({
@@ -533,10 +535,11 @@ async function sendReplyAction(action: typeof savActions.$inferSelect, text: str
       fromEmail: replyFrom,
       toEmails: [thread.customerEmail],
       subject: /^re\s*:/i.test(thread.subject) ? thread.subject : `Re: ${thread.subject}`,
-      preview: transparentText.replace(/\s+/g, " ").slice(0, 280),
+      preview: redactSavLearningText(transparentText.replace(/\s+/g, " ")).slice(0, 280),
       bodyCiphertext: encryptSavPayload({ text: transparentText, headers: { "message-id": rfcMessageId } }),
       receivedAt: now,
       processedAt: now,
+      analysisStatus: "done",
     }).onConflictDoNothing().returning();
     const [outbound] = createdOutbound ? [createdOutbound] : await tx.select().from(savMessages)
       .where(and(eq(savMessages.mailboxId, mailbox.id), eq(savMessages.gmailMessageId, sent.id))).limit(1);
@@ -586,12 +589,13 @@ export async function processPendingGmailSendActions(limit = 20) {
       inArray(savActions.kind, [...allowedKinds]),
       isNull(savActions.pilotBatchId),
       or(eq(savActions.status, "pending"), and(eq(savActions.status, "running"), lt(savActions.updatedAt, staleBefore))),
+      or(isNull(savActions.scheduledAt), lte(savActions.scheduledAt, new Date())),
     ))
-    .orderBy(asc(savActions.createdAt)).limit(Math.min(100, Math.max(1, limit)));
+    .orderBy(desc(savActions.priority), asc(savActions.createdAt)).limit(Math.min(100, Math.max(1, limit)));
   const actions = candidates.filter((action) => savModeAllowsWrite(mode, action.kind, action.actorType, Boolean(action.payload.followupSequence)));
   const processed = [];
   for (const action of actions) {
-    const [claimed] = await db.update(savActions).set({ status: "running", updatedAt: new Date() }).where(and(
+    const [claimed] = await db.update(savActions).set({ status: "running", scheduledAt: null, attemptCount: sql`${savActions.attemptCount} + 1`, updatedAt: new Date() }).where(and(
       eq(savActions.id, action.id),
       or(eq(savActions.status, "pending"), and(eq(savActions.status, "running"), lt(savActions.updatedAt, staleBefore))),
     )).returning();
@@ -604,8 +608,9 @@ export async function processPendingGmailSendActions(limit = 20) {
       processed.push({ actionId: claimed.id, status: "succeeded", gmailMessageId: sent.id });
     } catch (error) {
       const errorCode = (error instanceof Error ? error.message : "UNKNOWN_ERROR").slice(0, 160);
-      await db.update(savActions).set({ status: isSavWriteCancellation(errorCode) ? "cancelled" : "failed", errorCode, updatedAt: new Date() }).where(eq(savActions.id, claimed.id));
-      processed.push({ actionId: claimed.id, status: "failed", errorCode });
+      const failure = savActionFailurePlan(errorCode, claimed.attemptCount);
+      await db.update(savActions).set({ status: failure.status, scheduledAt: failure.scheduledAt, errorCode, updatedAt: new Date() }).where(eq(savActions.id, claimed.id));
+      processed.push({ actionId: claimed.id, status: failure.status, retryScheduledAt: failure.scheduledAt, errorCode });
     }
   }
   return { processed };

@@ -23,6 +23,16 @@ export const articleMetadataSchema = z.object({
   expectedResult: z.string().trim().max(5000).default(""),
   troubleshooting: z.string().trim().max(10000).default(""),
   sourceMetadata: z.record(z.string(), z.unknown()).optional(),
+  resolution: z.object({
+    symptoms: stringList,
+    steps: stringList,
+    exceptions: stringList,
+    escalation: z.string().trim().min(3).max(5_000),
+    productVersion: z.string().trim().max(100).default(""),
+    validUntil: z.iso.date().optional(),
+    supersedes: stringList,
+    conflictsWith: stringList,
+  }).optional(),
 });
 
 export const learnedActionStepSchema = z.object({

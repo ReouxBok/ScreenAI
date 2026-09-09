@@ -31,8 +31,13 @@ SAV_GEMINI_API_KEY=<clé Gemini utilisée par le SAV>
 SAV_AI_MODEL=gemini-3.6-flash
 SAV_HUBSPOT_BACKFILL_ENABLED=true
 SAV_AUTO_REPLY_MIN_CONFIDENCE=920
+SAV_AUTO_REPLY_CATEGORIES=technical,how_to
+SAV_AUTO_REPLY_ROLLOUT_PERCENT=0
+SAV_AUTO_REPLY_DAILY_LIMIT=10
 SAV_TEST_MODE=false
 SAV_TEST_OUTBOUND_ALLOWLIST=
+SAV_RETENTION_ENABLED=false
+SAV_RETENTION_DAYS=365
 ```
 
 Ne jamais réutiliser `MEMORY_ENCRYPTION_KEY_V1`.
@@ -145,7 +150,11 @@ Pour chaque ticket :
 
 `SAV_WRITES_DISABLED=true` bloque les écritures, indépendamment du mode. Les lectures et la conservation des événements continuent. `SAV_AI_ANALYSIS=false` désactive l’analyse par modèle et la recherche par embeddings dans les deux parcours d’analyse ; les règles locales continuent de qualifier les messages.
 
+La purge de rétention est désactivée par défaut. Avec `SAV_RETENTION_ENABLED=true`, le worker supprime les dossiers terminés (`resolved` ou `closed_no_action`) au-delà de `SAV_RETENTION_DAYS` et les reçus de webhook déjà traités après 90 jours. Les dossiers ouverts ou confiés à un humain ne sont jamais sélectionnés. Le minimum configurable est 30 jours.
+
 Les workers revérifient l’état courant avant les mutations. Une réponse liée à un ancien message ou à un fil suspendu est refusée, y compris si elle avait été approuvée avant le changement. Les brouillons et envois en attente sont invalidés à l’arrivée d’un mail ou lors d’une reprise humaine. Un accusé de transfert est distinct d’une réponse de résolution.
+
+Le replay déterministe versionné s’exécute avec `npm run sav:replay`. Il sépare développement et contrôle et renvoie un code non nul en cas de régression. `npm run sav:replay:agent` exécute le harness ADK complet avec une clé Gemini SAV et des fiches synthétiques injectées. Ce second replay utilise les vrais budgets, schémas et validateurs sans lire ni écrire Gmail ou HubSpot.
 
 Changer de mode uniquement après avoir vérifié les indicateurs du dashboard. Le retour à `shadow` est le kill switch global.
 
@@ -168,7 +177,7 @@ Changer de mode uniquement après avoir vérifié les indicateurs du dashboard. 
 2. Vérifier 100 % de couverture, aucune décision sans justification et aucun doublon.
 3. Passer à `assist` et contrôler les brouillons et associations HubSpot.
 4. Passer à `semi` uniquement pour les transferts et cas explicitement approuvés.
-5. Passer à `on` avec un seuil initial de 920/1000.
+5. Passer à `on` avec un seuil initial de 920/1000 et augmenter progressivement `SAV_AUTO_REPLY_ROLLOUT_PERCENT` depuis 0, sous le plafond `SAV_AUTO_REPLY_DAILY_LIMIT`.
 6. Revenir immédiatement à `shadow` en cas de mauvaise action sensible, doublon ou baisse anormale de qualité.
 
 ## 8. Boucle d’amélioration continue
@@ -185,8 +194,7 @@ Le système ne modifie jamais seul son prompt à partir d’un retour isolé. L�
 Optimisations suivantes, dans l’ordre :
 
 - transformer les 100 revues du pilote en jeu de replay chiffré et anonymisé ;
-- exécuter automatiquement ce jeu contre chaque nouveau prompt ou modèle et bloquer toute régression ;
+- exécuter le replay ADK contre chaque nouveau prompt ou modèle avec un budget contrôlé et bloquer toute régression ;
 - tester un challenger en `shadow` sur les mêmes mails avant promotion ;
-- suivre séparément précision de tri, décision de ticket, rattachement, grounding, ton et calibration de confiance ;
 - mesurer la dérive par catégorie et par semaine, avec retour automatique en `shadow` au-delà d’un seuil ;
 - échantillonner continuellement des réponses « faciles » pour détecter les faux positifs invisibles.

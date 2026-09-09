@@ -8,9 +8,15 @@ export const savAgentOutputSchema = z.object({
   explanation: z.string().trim().min(10).max(2_000),
   confidence: z.number().min(0).max(1),
   requiresHuman: z.boolean(),
+  responseKind: z.enum(["none", "acknowledgement", "clarification", "solution", "handoff"]),
   replyDraft: z.string().max(8_000),
   internalNote: z.string().max(8_000),
   evidenceIds: z.array(z.string().trim().min(1).max(200)).max(20),
+  citations: z.array(z.object({
+    sourceId: z.string().trim().min(1).max(200),
+    claim: z.string().trim().min(3).max(500),
+    quote: z.string().trim().min(8).max(1_000),
+  }).strict()).max(20),
 }).strict();
 
 export type SavAgentOutput = z.infer<typeof savAgentOutputSchema>;

@@ -36,6 +36,9 @@ export type SavAgentRunResult = {
   inputHash: string;
   outputHash: string;
   durationMs: number;
+  inputTokens: number;
+  outputTokens: number;
+  totalTokens: number;
 };
 
 const instruction = `Tu es l’agent de qualification SAV Limova. Ton périmètre est strictement limité aux emails Gmail de contact@limova.ai, aux tickets HubSpot SAV et aux fiches de résolution SAV validées.
@@ -48,9 +51,11 @@ RÈGLES ABSOLUES
 - Tiens compte des échanges précédents : ne répète pas une question déjà répondue ni une procédure déjà essayée. Les extraits tronqués et pièces jointes non analysées restent des informations manquantes, jamais des preuves.
 - Toute facturation, remboursement, sécurité, confidentialité, suppression de données, engagement commercial, urgence critique, doute factuel ou demande explicite d’un humain impose requiresHuman=true.
 - N’invente aucune procédure. Une réponse apportant une solution doit être étayée par au moins une fiche SAV validée. Sans fiche, tu peux uniquement accuser réception, poser une question de clarification ou préparer un transfert humain.
+- Classe le brouillon dans responseKind. Utilise solution pour toute procédure ou conseil factuel, clarification uniquement pour une question sans conseil, acknowledgement pour un accusé de réception sans fait nouveau, handoff pour un transfert, et none quand replyDraft est vide.
 - Consulte le message et les tickets une fois. Tu peux rechercher des fiches deux fois avec des requêtes différentes si la première recherche est insuffisante.
 - Le brouillon doit annoncer clairement qu’il est préparé par une IA et proposer à tout moment un transfert humain sous 3 jours, en rappelant que l’assistance IA est immédiate.
 - evidenceIds contient uniquement les identifiants réellement retournés par les outils.
+- Toute réponse qui affirme une procédure ou un fait doit fournir citations avec l’identifiant de la fiche, l’affirmation soutenue et un court extrait textuel exact. Un ticket HubSpot ne prouve pas une procédure générale.
 - Retourne le résultat final avec le schéma imposé.`;
 
 function safeErrorCode(error: unknown) {
@@ -74,11 +79,17 @@ function summarizeResult(name: string, result: unknown): Record<string, unknown>
   };
 }
 
-export async function runSavAdkAgent(input: SavAgentInput, options: { apiKey: string; model: string }): Promise<SavAgentRunResult> {
+export async function runSavAdkAgent(input: SavAgentInput, options: {
+  apiKey: string;
+  model: string;
+  searchKnowledge?: typeof searchKnowledge;
+  readHubspotContext?: typeof readSavHubspotContext;
+}): Promise<SavAgentRunResult> {
   assertSavAgentIsolation();
   const startedAt = Date.now();
   const toolTrace: SavAgentToolTrace[] = [];
   const evidenceById = new Map<string, SavDecisionEvidence>();
+  const knowledgeById = new Map<string, { content: string; verifiedAt: string | null; score: number; resolution?: Record<string, unknown> }>();
   const resultByTool = new Map<string, unknown>();
   const executionsByTool = new Map<string, number>();
   let sequence = 0;
@@ -147,7 +158,7 @@ export async function runSavAdkAgent(input: SavAgentInput, options: { apiKey: st
       description: "Recherche uniquement les fiches de résolution SAV publiées, validées et activées pour l’IA.",
       parameters: z.object({ query: z.string().trim().min(2).max(2_000) }).strict(),
       execute: async ({ query }) => {
-        const result = await searchKnowledge({
+        const result = await (options.searchKnowledge ?? searchKnowledge)({
           query,
           path: "",
           locale: "fr-FR",
@@ -160,7 +171,9 @@ export async function runSavAdkAgent(input: SavAgentInput, options: { apiKey: st
           sourceId: item.id,
           title: item.title,
           score: item.score,
+          verifiedAt: item.verifiedAt,
         });
+        for (const item of result.results) knowledgeById.set(item.id, { content: item.content, verifiedAt: item.verifiedAt, score: item.score, resolution: item.resolution });
         return result;
       },
     }),
@@ -169,7 +182,7 @@ export async function runSavAdkAgent(input: SavAgentInput, options: { apiKey: st
       description: "Recherche en lecture seule les tickets HubSpot liés à l’adresse du client et au sujet courant.",
       parameters: z.object({}).strict(),
       execute: async () => {
-        const result = await readSavHubspotContext({ email: input.from, subject: input.subject });
+        const result = await (options.readHubspotContext ?? readSavHubspotContext)({ email: input.from, subject: input.subject, currentTicketId: input.conversation?.hubspotTicketId });
         for (const ticket of result.tickets) evidenceById.set(String(ticket.id), {
           sourceType: "hubspot_ticket",
           sourceId: String(ticket.id),
@@ -197,6 +210,9 @@ export async function runSavAdkAgent(input: SavAgentInput, options: { apiKey: st
   let rawOutput: unknown = null;
   let finalText = "";
   let modelError: string | null = null;
+  let inputTokens = 0;
+  let outputTokens = 0;
+  let totalTokens = 0;
 
   const eventStream = runner.runEphemeral({
     userId: savContentHash({ scope: SAV_AGENT_SCOPE, from: input.from }).slice(0, 32),
@@ -205,6 +221,9 @@ export async function runSavAdkAgent(input: SavAgentInput, options: { apiKey: st
   });
   const consume = async () => {
     for await (const event of eventStream) {
+      inputTokens += event.usageMetadata?.promptTokenCount ?? 0;
+      outputTokens += event.usageMetadata?.candidatesTokenCount ?? 0;
+      totalTokens += event.usageMetadata?.totalTokenCount ?? 0;
       if (event.errorCode || event.errorMessage) modelError = `${event.errorCode || "SAV_ADK_MODEL_ERROR"}:${event.errorMessage || ""}`;
       for (const call of getFunctionCalls(event)) {
         if (call.name === "set_model_response") rawOutput = call.args;
@@ -235,9 +254,13 @@ export async function runSavAdkAgent(input: SavAgentInput, options: { apiKey: st
   if (!rawOutput && finalText) rawOutput = JSON.parse(finalText);
   if (!rawOutput) throw new Error("SAV_ADK_EMPTY_OUTPUT");
   const output = savAgentOutputSchema.parse(rawOutput);
-  assertSavAnalysisComplete(output, toolTrace, [...evidenceById.values()]);
+  assertSavAnalysisComplete(output, toolTrace, [...evidenceById.values()], knowledgeById);
   const requestedEvidence = new Set(output.evidenceIds);
-  const evidence = [...evidenceById.values()].filter((item) => requestedEvidence.has(item.sourceId));
+  const citations = new Map(output.citations.map((citation) => [citation.sourceId, citation]));
+  const evidence = [...evidenceById.values()].filter((item) => requestedEvidence.has(item.sourceId)).map((item) => {
+    const citation = citations.get(item.sourceId);
+    return citation ? { ...item, claim: citation.claim, excerpt: citation.quote } : item;
+  });
   return {
     output,
     evidence,
@@ -247,5 +270,8 @@ export async function runSavAdkAgent(input: SavAgentInput, options: { apiKey: st
     inputHash: savContentHash({ scope: SAV_AGENT_SCOPE, ...input }),
     outputHash: savContentHash(output),
     durationMs: Date.now() - startedAt,
+    inputTokens,
+    outputTokens,
+    totalTokens,
   };
 }

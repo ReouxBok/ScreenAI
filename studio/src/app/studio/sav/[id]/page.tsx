@@ -24,6 +24,8 @@ export default async function SavThreadPage({ params, searchParams }: { params: 
     <Link className="back-link" href={from === "pilot" ? `/studio/sav/pilote?batch=${encodeURIComponent(batch || detail.pilotItem?.batchId || "")}#batch-review` : "/studio/sav"}><ArrowLeft size={14}/> {from === "pilot" ? "Retour au lot de test" : "Retour à tous les mails"}</Link>
     <div className="sav-thread-heading"><div><span className="eyebrow">Dossier SAV</span><h1>{detail.thread.subject}</h1><p>{detail.thread.customerEmail} · {detail.thread.hubspotTicketId ? `Ticket HubSpot #${detail.thread.hubspotTicketId}` : "Aucun ticket associé"}</p></div><span className={`sav-thread-status ${detail.thread.status}`}>{detail.thread.aiPaused ? <UserRound size={15}/> : <Bot size={15}/>} {detail.thread.status.replaceAll("_", " ")}</span></div>
 
+    {currentDecision?.evidence.some((source) => source.claim || source.excerpt) && <section className="card sav-note"><span className="eyebrow">Preuves de la réponse</span><h2>Affirmations reliées aux fiches validées</h2><ul>{currentDecision.evidence.map((source) => <li key={`${source.sourceType}:${source.sourceId}`}><strong>{source.title}</strong>{source.claim && <p>{source.claim}</p>}{source.excerpt && <blockquote>{source.excerpt}</blockquote>}{source.verifiedAt && <small>Fiche vérifiée le {source.verifiedAt}</small>}</li>)}</ul></section>}
+
     <section className="sav-thread-grid">
       <div className="sav-conversation">
         <div className="section-heading"><div><span className="eyebrow">Conversation</span><h2>Messages échangés</h2></div></div>
@@ -44,6 +46,15 @@ export default async function SavThreadPage({ params, searchParams }: { params: 
             {from === "pilot" && <><input type="hidden" name="returnTo" value="pilot"/><input type="hidden" name="pilotBatchId" value={batch || detail.pilotItem.batchId}/></>}
             <fieldset><legend>Verdict</legend><div className="pilot-verdicts">
               {[["correct", "Correct"], ["partial", "Partiel"], ["incorrect", "Incorrect"], ["critical", "Erreur critique"]].map(([value, label]) => <label key={value}><input type="radio" name="verdict" value={value} defaultChecked={detail.pilotItem?.verdict === value || (!detail.pilotItem?.verdict && value === "correct")}/><span>{label}</span></label>)}
+            </div></fieldset>
+            <fieldset><legend>Qualité par dimension</legend><div className="pilot-dimensions">
+              {([
+                ["Classification", "dimensionClassification", detail.pilotItem.classificationVerdict],
+                ["Ticket et rattachement", "dimensionRouting", detail.pilotItem.routingVerdict],
+                ["Preuves et factualité", "dimensionGrounding", detail.pilotItem.groundingVerdict],
+                ["Ton de la réponse", "dimensionTone", detail.pilotItem.toneVerdict],
+                ["Escalade humaine", "dimensionEscalation", detail.pilotItem.escalationVerdict],
+              ] as const).map(([label, name, current]) => <label key={name}>{label}<select name={name} defaultValue={current ?? detail.pilotItem?.verdict ?? "correct"}><option value="correct">Correct</option><option value="partial">Partiel</option><option value="incorrect">Incorrect</option><option value="critical">Critique</option></select></label>)}
             </div></fieldset>
             <fieldset><legend>Points à corriger</legend><div className="pilot-feedback-codes">
               {[["wrong_classification", "Mauvais tri"], ["wrong_ticket_decision", "Mauvaise décision de ticket"], ["wrong_ticket_link", "Mauvais rattachement"], ["wrong_priority", "Mauvaise priorité"], ["unsupported_claim", "Information non prouvée"], ["wrong_tone", "Ton inadapté"], ["missing_information", "Information manquante"], ["unsafe_action", "Action risquée"], ["good_without_change", "Validé sans changement"]].map(([value, label]) => <label key={value}><input type="checkbox" name="feedbackCodes" value={value} defaultChecked={detail.pilotItem?.feedbackCodes.includes(value)}/><span>{label}</span></label>)}
