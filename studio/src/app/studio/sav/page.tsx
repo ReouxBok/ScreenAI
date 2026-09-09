@@ -48,7 +48,7 @@ export default async function SavDashboardPage({ searchParams }: { searchParams:
     configured ? listSavPilotBatches() : Promise.resolve([]),
     configured ? listSavAgentPerformance() : Promise.resolve([]),
     configured ? getSavImprovementSignals() : Promise.resolve({ reviewed: 0, correct: 0, partial: 0, incorrect: 0, critical: 0, correctedDrafts: 0, dimensions: {}, feedback: [] }),
-    configured ? getSavAutonomyGate() : Promise.resolve({ eligible: false, acceptanceRate: 0, reasons: ["DATABASE_NOT_CONFIGURED"], metrics: { versionReviewed: 0, versionCorrect: 0, versionPartial: 0, versionCritical: 0, versionDegraded: 0, globalReviewed: 0, failedActions: 0 } }),
+    configured ? getSavAutonomyGate() : Promise.resolve({ eligible: false, acceptanceRate: 0, reasons: ["DATABASE_NOT_CONFIGURED"], metrics: { versionReviewed: 0, versionCorrect: 0, versionPartial: 0, versionCritical: 0, versionDegraded: 0, versionCalibrationError: 100, globalReviewed: 0, failedActions: 0 } }),
     configured ? getHubspotBackfillState() : Promise.resolve(null),
   ]);
   const normalizedQuery = q.trim().toLocaleLowerCase("fr");
@@ -81,7 +81,7 @@ export default async function SavDashboardPage({ searchParams }: { searchParams:
 
     {writesDisabled && <p className="login-notice" role="status">Les écritures Gmail et HubSpot sont suspendues. Les mails entrants continuent d’être enregistrés.</p>}
     {aiDisabled && <p className="login-notice" role="status">L’analyse IA est désactivée. Seules les règles de tri locales sont utilisées.</p>}
-    {mode === "on" && !autonomyGate.eligible && <p className="login-notice error" role="alert">Le mode autonome est configuré, mais les réponses automatiques restent bloquées par le contrôle qualité : {autonomyGate.metrics.versionReviewed}/30 revues sur cette version, {autonomyGate.metrics.globalReviewed}/100 revues globales, {autonomyGate.acceptanceRate}% de conformité.</p>}
+    {mode === "on" && !autonomyGate.eligible && <p className="login-notice error" role="alert">Le mode autonome est configuré, mais les réponses automatiques restent bloquées par le contrôle qualité : {autonomyGate.metrics.versionReviewed}/30 revues sur cette version, {autonomyGate.metrics.globalReviewed}/100 revues globales, {autonomyGate.acceptanceRate}% de conformité, {autonomyGate.metrics.versionCalibrationError}% d’écart de confiance.</p>}
     {mode === "on" && autonomyGate.eligible && <p className="login-notice" role="status">Réponses autonomes déployées sur {autoReplyRollout}% des dossiers éligibles, avec un plafond de {savAutoReplyDailyLimit()} envois IA par jour.</p>}
 
     {!configured && <div className="setup card"><strong>Base SAV non configurée.</strong> Ajoutez les variables SAV, puis appliquez les migrations avant de connecter Gmail.</div>}

@@ -10,6 +10,7 @@ export type SavPromotionMetrics = {
   versionPartial: number;
   versionCritical: number;
   versionDegraded: number;
+  versionCalibrationError: number;
   globalReviewed: number;
   failedActions: number;
 };
@@ -23,10 +24,30 @@ export function evaluateSavPromotion(metrics: SavPromotionMetrics) {
     ...(acceptanceRate < 90 ? ["SAV_PROMOTION_ACCEPTANCE_BELOW_90"] : []),
     ...(metrics.versionCritical > 0 ? ["SAV_PROMOTION_HAS_CRITICAL_REVIEW"] : []),
     ...(metrics.versionDegraded > 0 ? ["SAV_PROMOTION_HAS_DEGRADED_RUN"] : []),
+    ...(metrics.versionCalibrationError > 15 ? ["SAV_PROMOTION_CONFIDENCE_NOT_CALIBRATED"] : []),
     ...(metrics.globalReviewed < 100 ? ["SAV_PROMOTION_NEEDS_100_GLOBAL_REVIEWS"] : []),
     ...(metrics.failedActions > 0 ? ["SAV_PROMOTION_HAS_FAILED_ACTION"] : []),
   ];
   return { eligible: reasons.length === 0, acceptanceRate: Math.round(acceptanceRate * 10) / 10, reasons, metrics };
+}
+
+export function savConfidenceCalibrationError(rows: Array<{ confidence: number | null; verdict: string | null }>) {
+  const reviewed = rows.filter((row) => row.confidence !== null && row.verdict);
+  if (!reviewed.length) return 100;
+  const bins = new Map<number, { confidence: number; observed: number; count: number }>();
+  for (const row of reviewed) {
+    const confidence = Math.min(1, Math.max(0, (row.confidence ?? 0) / 1_000));
+    const observed = row.verdict === "correct" ? 1 : row.verdict === "partial" ? 0.5 : 0;
+    const key = Math.min(9, Math.floor(confidence * 10));
+    const bin = bins.get(key) ?? { confidence: 0, observed: 0, count: 0 };
+    bin.confidence += confidence;
+    bin.observed += observed;
+    bin.count += 1;
+    bins.set(key, bin);
+  }
+  const error = [...bins.values()].reduce((sum, bin) => sum
+    + Math.abs(bin.confidence / bin.count - bin.observed / bin.count) * bin.count / reviewed.length, 0);
+  return Math.round(error * 1_000) / 10;
 }
 
 /** Reviews are counted only on the primary successful ADK run for this exact prompt revision. */
@@ -43,10 +64,15 @@ export async function getSavAutonomyGate(promptRevision = SAV_PROMPT_REVISION) {
     inArray(savAgentRuns.status, ["succeeded", "failed", "fallback"]),
   ));
   const [global] = await db.select({ count: sql<number>`count(*)::int` }).from(savPilotItems).where(isNotNull(savPilotItems.reviewedAt));
+  const calibrationRows = await db.select({ confidence: savAgentRuns.confidence, verdict: savPilotItems.verdict })
+    .from(savAgentRuns).innerJoin(savPilotItems, eq(savPilotItems.agentRunId, savAgentRuns.id)).where(and(
+      eq(savAgentRuns.promptRevision, promptRevision), isNotNull(savPilotItems.reviewedAt), eq(savAgentRuns.status, "succeeded"),
+    ));
   const [failed] = await db.select({ count: sql<number>`count(*)::int` }).from(savActions).where(eq(savActions.status, "failed"));
   return evaluateSavPromotion({
     versionReviewed: version?.reviewed ?? 0, versionCorrect: version?.correct ?? 0,
     versionPartial: version?.partial ?? 0, versionCritical: version?.critical ?? 0,
     versionDegraded: version?.degraded ?? 0, globalReviewed: global?.count ?? 0, failedActions: failed?.count ?? 0,
+    versionCalibrationError: savConfidenceCalibrationError(calibrationRows),
   });
 }

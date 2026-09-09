@@ -80,12 +80,13 @@ Branche : `feat/sav-reliability-harness`.
 - La conservation est volontairement inactive par défaut et ne supprime que les
   dossiers clos au-delà du délai configuré, plus les reçus techniques anciens.
 - L’autonomie exige 30 revues de la version exacte, 100 revues globales, 90 % de
-  score pondéré, aucun verdict critique, aucun repli et aucune action en échec.
+  score pondéré, au plus 15 % d’écart de calibration, aucun verdict critique,
+  aucun repli et aucune action en échec.
   Elle reste ensuite limitée aux catégories autorisées, à un seuil de confiance,
   à un pourcentage stable de dossiers et à un plafond quotidien. Le pourcentage
   vaut 0 par défaut.
 - Le replay synthétique versionné sépare développement et contrôle et bloque la CI.
-  Résultat local : 12/12. La suite Studio compte 147 tests réussis.
+  Résultat local : 12/12. La suite Studio compte 149 tests réussis.
 - Un second replay exécute le vrai harness ADK avec des fiches et tickets synthétiques
   injectés, sans accès aux systèmes externes. Son exécution exige une clé Gemini et
   reste distincte du replay déterministe bloquant de la CI.
