@@ -92,7 +92,9 @@ Branche : `feat/sav-reliability-harness`.
   injectés, sans accès aux systèmes externes. Son exécution exige une clé Gemini et
   reste distincte du replay déterministe bloquant de la CI.
 - Validation supplémentaire : typage, lint, build Next.js, migration Drizzle réelle
-  sur PostgreSQL local isolé et test navigateur du registre SAV réussis.
+  sur PostgreSQL local isolé et test navigateur du registre SAV réussis. Le snapshot
+  Drizzle 0024 est consolidé et la CI refuse désormais tout écart entre le schéma et
+  l'historique de migrations.
 - Audit Vercel en lecture seule : le projet `studio` est en mode `shadow`, le harness
   ADK est en mode `pilot`, l’analyse IA est active et les webhooks non signés sont
   refusés. Les nouveaux réglages d’autonomie sont absents et prennent donc leurs
