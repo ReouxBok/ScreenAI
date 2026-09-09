@@ -8,5 +8,7 @@ export function assertSavAgentIsolation(toolNames: readonly string[] = SAV_AGENT
   if (overlap.length) throw new Error(`SAV_AGENT_TOOL_SCOPE_VIOLATION:${overlap.join(",")}`);
   const suspicious = normalized.filter((name) => forbiddenSavFragments.some((fragment) => name.includes(fragment)));
   if (suspicious.length) throw new Error(`SAV_AGENT_TOOL_SCOPE_VIOLATION:${suspicious.join(",")}`);
+  const unknown = normalized.filter((name) => !(SAV_AGENT_TOOL_NAMES as readonly string[]).includes(name));
+  if (unknown.length) throw new Error(`SAV_AGENT_TOOL_SCOPE_VIOLATION:${unknown.join(",")}`);
   return true;
 }

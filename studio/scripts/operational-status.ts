@@ -7,16 +7,18 @@ import {
   savActions,
   savGmailQuarantine,
   savMessages,
+  savPilotItems,
   savWebhookReceipts,
 } from "../src/db/schema";
 import { savAutomationMode } from "../src/lib/sav/config";
+import { getSavAutonomyGate } from "../src/lib/sav/promotion";
 import { getTrainingReconciliationCandidates } from "../src/lib/training";
 
 const db = requireDb();
 
 try {
   const now = new Date();
-  const [receiptCounts, quarantineCount, expiredEvaluations, messageDuplicates, actionDuplicates, trainingCandidates] = await Promise.all([
+  const [receiptCounts, quarantineCount, expiredEvaluations, messageDuplicates, actionDuplicates, analysisCounts, actionCounts, stalePilotItems, autonomyGate, trainingCandidates] = await Promise.all([
     db.select({
       pending: sql<number>`count(*) filter (where ${savWebhookReceipts.status} in ('pending', 'processing'))::int`,
       failed: sql<number>`count(*) filter (where ${savWebhookReceipts.status} = 'failed')::int`,
@@ -48,10 +50,22 @@ try {
         ) duplicate_actions
       )`,
     }).from(savActions).limit(1),
+    db.select({
+      pending: sql<number>`count(*) filter (where ${savMessages.analysisStatus} in ('pending', 'processing'))::int`,
+      failed: sql<number>`count(*) filter (where ${savMessages.analysisStatus} = 'failed')::int`,
+    }).from(savMessages),
+    db.select({
+      retryScheduled: sql<number>`count(*) filter (where ${savActions.status} = 'pending' and ${savActions.scheduledAt} is not null)::int`,
+      failed: sql<number>`count(*) filter (where ${savActions.status} = 'failed')::int`,
+    }).from(savActions),
+    db.select({ count: sql<number>`count(*)::int` }).from(savPilotItems).where(and(
+      eq(savPilotItems.status, "processing"), lt(savPilotItems.updatedAt, new Date(now.getTime() - 10 * 60_000)),
+    )),
+    getSavAutonomyGate(),
     getTrainingReconciliationCandidates(now),
   ]);
 
-  console.log(JSON.stringify({
+  const report = {
     checkedAt: now.toISOString(),
     savModeIsShadow: savAutomationMode() === "shadow",
     gmail: {
@@ -62,6 +76,10 @@ try {
       duplicateMessages: messageDuplicates[0]?.count ?? 0,
       duplicateActions: actionDuplicates[0]?.count ?? 0,
     },
+    analysis: analysisCounts[0] ?? { pending: 0, failed: 0 },
+    actions: actionCounts[0] ?? { retryScheduled: 0, failed: 0 },
+    pilot: { staleProcessing: stalePilotItems[0]?.count ?? 0 },
+    autonomy: autonomyGate,
     trainings: {
       recoverable: trainingCandidates.recoverable.length,
       incomplete: trainingCandidates.incomplete.length,
@@ -69,7 +87,17 @@ try {
     evaluations: {
       expiredRunning: expiredEvaluations[0]?.count ?? 0,
     },
-  }, null, 2));
+  };
+  console.log(JSON.stringify(report, null, 2));
+  if (process.argv.includes("--strict") && (
+    (receiptCounts[0]?.failed ?? 0) > 0
+    || (quarantineCount[0]?.count ?? 0) > 0
+    || (analysisCounts[0]?.failed ?? 0) > 0
+    || (actionCounts[0]?.failed ?? 0) > 0
+    || (stalePilotItems[0]?.count ?? 0) > 0
+    || (messageDuplicates[0]?.count ?? 0) > 0
+    || (actionDuplicates[0]?.count ?? 0) > 0
+  )) process.exitCode = 1;
 } finally {
   await closeDb();
 }

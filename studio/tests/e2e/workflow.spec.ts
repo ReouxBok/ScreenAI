@@ -166,6 +166,16 @@ test("le banc E2E utilise l’identité owner et expose les espaces administrate
   await expect(page).toHaveURL(/\/studio\/validations$/);
 });
 
+test("le registre SAV expose clairement le pilote, les verrous et les incidents", async ({ page }) => {
+  await login(page);
+  await page.goto("/studio/sav");
+  await expect(page.getByRole("heading", { name: "Chaque mail laisse une trace." })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "Tester Charly sur 10 mails isolés" })).toBeVisible();
+  await expect(page.getByText("Simulation stricte")).toBeVisible();
+  await expect(page.getByRole("navigation", { name: "Vues SAV" })).toBeVisible();
+  await expect(page.getByText("Incidents techniques")).toBeVisible();
+});
+
 test("une démonstration extension devient un parcours Charly éditable",async({page,request})=>{
   await login(page);
   await page.goto("/studio/entrainements");

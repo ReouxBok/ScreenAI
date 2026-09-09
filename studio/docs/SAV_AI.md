@@ -23,6 +23,7 @@ Les tables sont créées dans le schéma PostgreSQL `sav`. Utiliser une clé dé
 ```dotenv
 SAV_ENCRYPTION_KEY_V1=<secret dédié>
 SAV_AUTOMATION_MODE=shadow
+SAV_WRITES_DISABLED=false
 SAV_PILOT_MODE=false
 SAV_AI_ANALYSIS=true
 SAV_ADK_MODE=shadow
@@ -30,8 +31,13 @@ SAV_GEMINI_API_KEY=<clé Gemini utilisée par le SAV>
 SAV_AI_MODEL=gemini-3.6-flash
 SAV_HUBSPOT_BACKFILL_ENABLED=true
 SAV_AUTO_REPLY_MIN_CONFIDENCE=920
+SAV_AUTO_REPLY_CATEGORIES=technical,how_to
+SAV_AUTO_REPLY_ROLLOUT_PERCENT=0
+SAV_AUTO_REPLY_DAILY_LIMIT=10
 SAV_TEST_MODE=false
 SAV_TEST_OUTBOUND_ALLOWLIST=
+SAV_RETENTION_ENABLED=false
+SAV_RETENTION_DAYS=365
 ```
 
 Ne jamais réutiliser `MEMORY_ENCRYPTION_KEY_V1`.
@@ -42,13 +48,13 @@ En environnement de recette, définir impérativement `SAV_TEST_MODE=true` et un
 
 ## Pilote supervisé sur de vrais mails
 
-Définir `SAV_PILOT_MODE=true` pour mettre les nouveaux mails en attente et les traiter par batches stricts de 10 depuis le registre SAV. Un seul batch peut être ouvert à la fois. Le pilote peut qualifier les messages, créer ou rattacher un ticket HubSpot, journaliser le mail, préparer un brouillon et publier une note interne marquée « Analyse pilote IA — à valider ».
+Définir `SAV_PILOT_MODE=true` pour mettre les nouveaux mails en attente et les traiter par lots de 10 depuis le laboratoire SAV. Un seul lot peut être ouvert à la fois.
 
-Les actions Gmail du pilote sont exclues du worker d’envoi et les mises à jour de statut HubSpot sont exclues de son worker dédié. Une vérification supplémentaire refuse toute étape HubSpot reconnue comme fermée. Chaque mail doit recevoir un verdict humain (`correct`, `partial`, `incorrect` ou `critical`) avant que le batch soit clôturé et que le suivant puisse démarrer.
+Le pilote est une **simulation stricte** : il lit les messages, consulte les fiches et les tickets, puis enregistre localement ses décisions, brouillons et actions proposées. Aucun email n’est envoyé et aucun ticket, contact, statut ou note n’est écrit dans HubSpot. Les workers excluent les actions portant un identifiant de lot pilote ; le contrôle commun d’écriture les refuse également.
 
-Le clic « Analyser les 10 prochains mails » démarre immédiatement un workflow durable Vercel. Les analyses sont exécutées par groupes de trois pour réduire la latence sans saturer le modèle, puis les actions HubSpot réversibles sont synchronisées. La page s’actualise automatiquement pendant l’exécution. Le cron `/api/cron/sav-reconcile` reste un filet de sécurité idempotent : il reprend les éléments encore en attente si le lancement immédiat n’a pas pu être créé.
+Le clic « Analyser les 10 prochains mails » lance un workflow durable, avec trois analyses simultanées. Le cron `/api/cron/sav-reconcile` reprend les éléments en attente si nécessaire. Chaque mail doit recevoir un verdict humain (`correct`, `partial`, `incorrect` ou `critical`) avant de clôturer le lot. Un lot peut être annulé sans supprimer ses preuves.
 
-Un batch en cours peut être annulé depuis le Studio sans supprimer ses preuves. Une correction humaine associée à un ticket crée une proposition d’apprentissage séparée ; elle doit être relue par un admin, puis suivre le workflow normal de validation/publication avant d’être utilisable par l’agent.
+Les corrections restent des propositions : elles ne deviennent pas des connaissances actives sans validation et publication. La prise en charge des corrections sans ticket est suivie dans `SAV_IMPLEMENTATION.md`.
 
 ## 2. Gmail et Pub/Sub
 
@@ -142,6 +148,14 @@ Pour chaque ticket :
 | `semi` | oui | cas éligibles | confirmations humaines et réponses approuvées | montée en charge |
 | `on` | oui | cas éligibles | réponses fondées et confiance suffisante | autonomie contrôlée |
 
+`SAV_WRITES_DISABLED=true` bloque les écritures, indépendamment du mode. Les lectures et la conservation des événements continuent. `SAV_AI_ANALYSIS=false` désactive l’analyse par modèle et la recherche par embeddings dans les deux parcours d’analyse ; les règles locales continuent de qualifier les messages.
+
+La purge de rétention est désactivée par défaut. Avec `SAV_RETENTION_ENABLED=true`, le worker supprime les dossiers terminés (`resolved` ou `closed_no_action`) au-delà de `SAV_RETENTION_DAYS` et les reçus de webhook déjà traités après 90 jours. Les dossiers ouverts ou confiés à un humain ne sont jamais sélectionnés. Le minimum configurable est 30 jours.
+
+Les workers revérifient l’état courant avant les mutations. Une réponse liée à un ancien message ou à un fil suspendu est refusée, y compris si elle avait été approuvée avant le changement. Les brouillons et envois en attente sont invalidés à l’arrivée d’un mail ou lors d’une reprise humaine. Un accusé de transfert est distinct d’une réponse de résolution.
+
+Le replay déterministe versionné s’exécute avec `npm run sav:replay`. Il sépare développement et contrôle et renvoie un code non nul en cas de régression. `npm run sav:replay:agent` exécute le harness ADK complet avec une clé Gemini SAV et des fiches synthétiques injectées. Ce second replay utilise les vrais budgets, schémas et validateurs sans lire ni écrire Gmail ou HubSpot.
+
 Changer de mode uniquement après avoir vérifié les indicateurs du dashboard. Le retour à `shadow` est le kill switch global.
 
 ## 6. Recette avant activation
@@ -163,7 +177,7 @@ Changer de mode uniquement après avoir vérifié les indicateurs du dashboard. 
 2. Vérifier 100 % de couverture, aucune décision sans justification et aucun doublon.
 3. Passer à `assist` et contrôler les brouillons et associations HubSpot.
 4. Passer à `semi` uniquement pour les transferts et cas explicitement approuvés.
-5. Passer à `on` avec un seuil initial de 920/1000.
+5. Passer à `on` avec un seuil initial de 920/1000 et augmenter progressivement `SAV_AUTO_REPLY_ROLLOUT_PERCENT` depuis 0, sous le plafond `SAV_AUTO_REPLY_DAILY_LIMIT`.
 6. Revenir immédiatement à `shadow` en cas de mauvaise action sensible, doublon ou baisse anormale de qualité.
 
 ## 8. Boucle d’amélioration continue
@@ -175,13 +189,12 @@ Le système ne modifie jamais seul son prompt à partir d’un retour isolé. L�
 3. le dashboard agrège les défauts et la conformité par version ;
 4. une correction exploitable devient un candidat de résolution, jamais une connaissance active directement ;
 5. après double contrôle éditorial, publication et activation IA, la fiche peut étayer les réponses suivantes ;
-6. toute nouvelle version doit obtenir au moins 30 revues propres à ≥ 90 %, sans critique ni repli, et le pilote global doit atteindre 100 revues sans action en échec avant toute autonomie.
+6. chaque paire exacte version de prompt/modèle doit obtenir au moins 30 revues propres à ≥ 90 %, sans critique ni repli, et le pilote global doit atteindre 100 revues sans action en échec avant toute autonomie.
 
 Optimisations suivantes, dans l’ordre :
 
 - transformer les 100 revues du pilote en jeu de replay chiffré et anonymisé ;
-- exécuter automatiquement ce jeu contre chaque nouveau prompt ou modèle et bloquer toute régression ;
+- exécuter le replay ADK contre chaque nouveau prompt ou modèle avec un budget contrôlé et bloquer toute régression ;
 - tester un challenger en `shadow` sur les mêmes mails avant promotion ;
-- suivre séparément précision de tri, décision de ticket, rattachement, grounding, ton et calibration de confiance ;
 - mesurer la dérive par catégorie et par semaine, avec retour automatique en `shadow` au-delà d’un seuil ;
 - échantillonner continuellement des réponses « faciles » pour détecter les faux positifs invisibles.

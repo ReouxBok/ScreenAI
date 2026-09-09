@@ -2,9 +2,10 @@ import Link from "next/link";
 import { AlertTriangle, ArrowUpRight, Bot, CheckCircle2, Clock3, FlaskConical, Inbox, TicketCheck, UserRoundCheck } from "lucide-react";
 import { isDatabaseConfigured } from "@/db";
 import { requireStaff } from "@/lib/auth";
-import { savAutomationMode, savGeminiApiKey, savHarnessMode } from "@/lib/sav/config";
+import { savAutomationMode, savAutoReplyDailyLimit, savAutoReplyRolloutPercent, savGeminiApiKey, savHarnessMode } from "@/lib/sav/config";
 import { getHubspotBackfillState, HUBSPOT_EMAIL_READ_SCOPE, isHubspotEmailReadScopeError } from "@/lib/sav/hubspot";
 import { getSavDashboard, getSavImprovementSignals, listSavActionIncidents, listSavAgentPerformance, listSavInbox, listSavPilotBatches, listSavWebhookIncidents } from "@/lib/sav/service";
+import { getSavAutonomyGate } from "@/lib/sav/promotion";
 import { retryAction, retryWebhookAction } from "./actions";
 
 export const dynamic = "force-dynamic";
@@ -38,15 +39,16 @@ const feedbackLabels: Record<string, string> = {
 export default async function SavDashboardPage({ searchParams }: { searchParams: Promise<{ view?: string; q?: string; batch?: string; batchCancelled?: string; launch?: string }> }) {
   await requireStaff("admin");
   const configured = isDatabaseConfigured();
-  const [{ view = "all", q = "", batch = "", batchCancelled = "", launch = "" }, dashboard, inbox, incidents, actionIncidents, pilotBatches, agentPerformance, improvementSignals, hubspotBackfill] = await Promise.all([
+  const [{ view = "all", q = "", batch = "", batchCancelled = "", launch = "" }, dashboard, inbox, incidents, actionIncidents, pilotBatches, agentPerformance, improvementSignals, autonomyGate, hubspotBackfill] = await Promise.all([
     searchParams,
-    configured ? getSavDashboard() : Promise.resolve({ total: 0, withoutDecision: 0, tickets: 0, human: 0, closedNoAction: 0, pilotQueued: 0, pendingLearning: 0, failedActions: 0, degradedRuns: 0, gmailPending: 0, gmailFailed: 0, gmailQuarantined: 0 }),
+    configured ? getSavDashboard() : Promise.resolve({ total: 0, withoutDecision: 0, tickets: 0, human: 0, closedNoAction: 0, pilotQueued: 0, pendingLearning: 0, failedActions: 0, scheduledRetries: 0, analysisFailures: 0, degradedRuns: 0, gmailPending: 0, gmailFailed: 0, gmailQuarantined: 0 }),
     configured ? listSavInbox(250) : Promise.resolve([]),
     configured ? listSavWebhookIncidents() : Promise.resolve([]),
     configured ? listSavActionIncidents() : Promise.resolve([]),
     configured ? listSavPilotBatches() : Promise.resolve([]),
     configured ? listSavAgentPerformance() : Promise.resolve([]),
-    configured ? getSavImprovementSignals() : Promise.resolve({ reviewed: 0, correct: 0, partial: 0, incorrect: 0, critical: 0, correctedDrafts: 0, feedback: [] }),
+    configured ? getSavImprovementSignals() : Promise.resolve({ reviewed: 0, correct: 0, partial: 0, incorrect: 0, critical: 0, correctedDrafts: 0, dimensions: {}, feedback: [] }),
+    configured ? getSavAutonomyGate() : Promise.resolve({ eligible: false, acceptanceRate: 0, reasons: ["DATABASE_NOT_CONFIGURED"], metrics: { versionReviewed: 0, versionCorrect: 0, versionPartial: 0, versionCritical: 0, versionDegraded: 0, versionCalibrationError: 100, globalReviewed: 0, failedActions: 0 } }),
     configured ? getHubspotBackfillState() : Promise.resolve(null),
   ]);
   const normalizedQuery = q.trim().toLocaleLowerCase("fr");
@@ -62,6 +64,9 @@ export default async function SavDashboardPage({ searchParams }: { searchParams:
   const mode = savAutomationMode();
   const harnessMode = savHarnessMode();
   const harnessReady = Boolean(savGeminiApiKey());
+  const autoReplyRollout = savAutoReplyRolloutPercent();
+  const writesDisabled = process.env.SAV_WRITES_DISABLED === "true";
+  const aiDisabled = process.env.SAV_AI_ANALYSIS === "false";
   const activePilotBatch = pilotBatches.find((item) => item.status === "processing" || item.status === "reviewing");
   const selectedPilotBatch = batch ? pilotBatches.find((item) => item.id === batch) : null;
   const selectedPilotBatchIndex = selectedPilotBatch ? pilotBatches.findIndex((item) => item.id === selectedPilotBatch.id) : -1;
@@ -73,6 +78,11 @@ export default async function SavDashboardPage({ searchParams }: { searchParams:
       <div className="sav-hero-copy"><span className="eyebrow">Registre SAV</span><h1>Chaque mail laisse une trace.</h1><p>Charly qualifie, justifie et simule les actions. Pendant le pilote, aucune donnée n’est écrite dans Gmail ou HubSpot.</p></div>
       <div className="sav-mode-panel"><span>Mode actuel</span><strong>{modeLabels[mode]}</strong><small>{mode === "shadow" ? "Aucun envoi ni ticket automatique" : mode === "assist" ? "Les actions attendent une validation" : "Automatisation surveillée"}</small><small>Harness ADK : {harnessMode} · {harnessReady ? "clé Gemini SAV connectée" : "clé Gemini requise"}</small><i className={`sav-mode-light ${mode}`}/></div>
     </section>
+
+    {writesDisabled && <p className="login-notice" role="status">Les écritures Gmail et HubSpot sont suspendues. Les mails entrants continuent d’être enregistrés.</p>}
+    {aiDisabled && <p className="login-notice" role="status">L’analyse IA est désactivée. Seules les règles de tri locales sont utilisées.</p>}
+    {mode === "on" && !autonomyGate.eligible && <p className="login-notice error" role="alert">Le mode autonome est configuré, mais les réponses automatiques restent bloquées par le contrôle qualité : {autonomyGate.metrics.versionReviewed}/30 revues sur cette version, {autonomyGate.metrics.globalReviewed}/100 revues globales, {autonomyGate.acceptanceRate}% de conformité, {autonomyGate.metrics.versionCalibrationError}% d’écart de confiance.</p>}
+    {mode === "on" && autonomyGate.eligible && <p className="login-notice" role="status">Réponses autonomes déployées sur {autoReplyRollout}% des dossiers éligibles, avec un plafond de {savAutoReplyDailyLimit()} envois IA par jour.</p>}
 
     {!configured && <div className="setup card"><strong>Base SAV non configurée.</strong> Ajoutez les variables SAV, puis appliquez les migrations avant de connecter Gmail.</div>}
     {batchCancelled && <p className="login-notice" role="status">Le batch invalide a été conservé dans l’audit puis annulé. Les dix prochains mails peuvent maintenant être analysés.</p>}
@@ -87,7 +97,7 @@ export default async function SavDashboardPage({ searchParams }: { searchParams:
       <article><TicketCheck size={18}/><span>Avec ticket</span><strong>{dashboard.tickets}</strong></article>
       <article><UserRoundCheck size={18}/><span>Reprise humaine</span><strong>{dashboard.human}</strong></article>
       <article className={dashboard.withoutDecision ? "needs-attention" : ""}><AlertTriangle size={18}/><span>Sans justification</span><strong>{dashboard.withoutDecision}</strong></article>
-      <article className={incidents.length || dashboard.failedActions || dashboard.degradedRuns ? "needs-attention" : ""}><AlertTriangle size={18}/><span>Incidents techniques</span><strong>{incidents.length + dashboard.failedActions + dashboard.degradedRuns}</strong></article>
+      <article className={incidents.length || dashboard.failedActions || dashboard.analysisFailures || dashboard.degradedRuns ? "needs-attention" : ""}><AlertTriangle size={18}/><span>Incidents techniques</span><strong>{incidents.length + dashboard.failedActions + dashboard.analysisFailures + dashboard.degradedRuns}</strong><small>{dashboard.scheduledRetries} reprise{dashboard.scheduledRetries > 1 ? "s" : ""} planifiée{dashboard.scheduledRetries > 1 ? "s" : ""}</small></article>
       <article className={dashboard.gmailPending ? "needs-attention" : ""}><Clock3 size={18}/><span>Gmail en attente</span><strong>{dashboard.gmailPending}</strong></article>
       <article className={dashboard.gmailFailed ? "needs-attention" : ""}><AlertTriangle size={18}/><span>Gmail en échec</span><strong>{dashboard.gmailFailed}</strong></article>
       <article className={dashboard.gmailQuarantined ? "needs-attention" : ""}><AlertTriangle size={18}/><span>Gmail en quarantaine</span><strong>{dashboard.gmailQuarantined}</strong></article>
@@ -102,11 +112,11 @@ export default async function SavDashboardPage({ searchParams }: { searchParams:
     {agentPerformance.length > 0 && <section className="sav-performance card" aria-labelledby="sav-performance-title">
       <div><span className="eyebrow">Amélioration continue</span><h2 id="sav-performance-title">Qualité par version du harness</h2><p>Les corrections humaines restent rattachées au modèle et au prompt exacts qui ont produit la proposition. Une nouvelle version ne peut pas hériter du score d’une ancienne.</p></div>
       <div className="sav-performance-table" role="table" aria-label="Performance des versions SAV">
-        <div role="row" className="sav-performance-head"><span>Version</span><span>Exécutions</span><span>Revues</span><span>Conformité</span><span>Dégradé</span><span>Latence</span></div>
+        <div role="row" className="sav-performance-head"><span>Version</span><span>Exécutions</span><span>Revues</span><span>Conformité</span><span>Dégradé</span><span>Latence / coût</span></div>
         {agentPerformance.slice(0, 12).map((item) => <div role="row" key={`${item.runtime}:${item.mode}:${item.model}:${item.promptRevision}`}>
           <span><strong>{item.promptRevision}</strong><small>{item.runtime.replaceAll("_", " ")} · {item.model} · {item.mode}</small></span>
           <span>{item.runs}</span><span>{item.reviewed}</span><span>{item.acceptanceRate === null ? "—" : `${item.acceptanceRate}%`}</span>
-          <span className={item.degraded ? "needs-attention" : ""}>{item.degraded} ({item.degradedRate}%)</span><span>{(item.averageDurationMs / 1_000).toFixed(1)} s</span>
+          <span className={item.degraded ? "needs-attention" : ""}>{item.degraded} ({item.degradedRate}%)</span><span>{(item.averageDurationMs / 1_000).toFixed(1)} s · {item.averageTokens} jetons</span>
         </div>)}
       </div>
     </section>}
@@ -114,6 +124,7 @@ export default async function SavDashboardPage({ searchParams }: { searchParams:
     <section className="sav-improvement card" aria-labelledby="sav-improvement-title">
       <div><span className="eyebrow">Boucle d’amélioration</span><h2 id="sav-improvement-title">Les corrections humaines deviennent des signaux mesurables.</h2><p>Chaque verdict alimente la qualité par version. Une réponse corrigée peut ensuite devenir une fiche SAV, mais seulement après relecture, validation, publication et activation pour l’IA.</p></div>
       <div className="sav-improvement-stats"><span><strong>{improvementSignals.reviewed}</strong> revues</span><span><strong>{improvementSignals.correctedDrafts}</strong> corrections rédigées</span><span className={improvementSignals.critical ? "needs-attention" : ""}><strong>{improvementSignals.critical}</strong> critiques</span></div>
+      {Object.keys(improvementSignals.dimensions).length > 0 && <div className="sav-improvement-stats">{Object.entries(improvementSignals.dimensions).map(([dimension, metric]) => <span key={dimension}><strong>{metric.score ?? "—"}%</strong> {dimension} · {metric.reviewed} revues</span>)}</div>}
       <ol>{improvementSignals.feedback.slice(0, 6).map((signal) => <li key={signal.code}><span>{feedbackLabels[signal.code] ?? signal.code.replaceAll("_", " ")}</span><strong>{signal.count}</strong>{signal.critical > 0 && <em>{signal.critical} critique{signal.critical > 1 ? "s" : ""}</em>}</li>)}</ol>
       {!improvementSignals.reviewed && <small>Commencez par relire les 10 éléments du batch actif : aucune montée en autonomie n’est possible sans ces verdicts.</small>}
     </section>

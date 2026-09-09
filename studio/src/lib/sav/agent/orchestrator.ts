@@ -17,11 +17,14 @@ import { readSavHubspotContext } from "../hubspot";
 import { SAV_AGENT_ID, SAV_AGENT_SCOPE, SAV_PROMPT_REVISION, savAdkTimeoutMs } from "../config";
 import { assertSavAgentIsolation } from "./isolation";
 import { SAV_AGENT_TOOL_NAMES, savAgentOutputSchema, type SavAgentOutput } from "./contracts";
+import type { SavConversation } from "../conversation";
+import { assertSavAnalysisComplete } from "./validation";
 
 export type SavAgentInput = {
   from: string;
   subject: string;
   body: string;
+  conversation?: SavConversation;
 };
 
 export type SavAgentRunResult = {
@@ -33,6 +36,9 @@ export type SavAgentRunResult = {
   inputHash: string;
   outputHash: string;
   durationMs: number;
+  inputTokens: number;
+  outputTokens: number;
+  totalTokens: number;
 };
 
 const instruction = `Tu es l’agent de qualification SAV Limova. Ton périmètre est strictement limité aux emails Gmail de contact@limova.ai, aux tickets HubSpot SAV et aux fiches de résolution SAV validées.
@@ -42,11 +48,14 @@ RÈGLES ABSOLUES
 - Tu n’as aucun accès à l’extension Charly, au DOM, à la navigation ou aux mémoires de l’agent d’onboarding.
 - Tes outils sont exclusivement en lecture. Tu proposes un plan typé ; tu n’envoies aucun email, tu ne fermes aucun ticket et tu ne modifies aucun statut.
 - Consulte le message, les fiches SAV pertinentes et les tickets HubSpot liés avant de conclure.
+- Tiens compte des échanges précédents : ne répète pas une question déjà répondue ni une procédure déjà essayée. Les extraits tronqués et pièces jointes non analysées restent des informations manquantes, jamais des preuves.
 - Toute facturation, remboursement, sécurité, confidentialité, suppression de données, engagement commercial, urgence critique, doute factuel ou demande explicite d’un humain impose requiresHuman=true.
 - N’invente aucune procédure. Une réponse apportant une solution doit être étayée par au moins une fiche SAV validée. Sans fiche, tu peux uniquement accuser réception, poser une question de clarification ou préparer un transfert humain.
-- Appelle chaque outil au maximum une fois. Une seconde requête au même outil ne fournit aucune information supplémentaire.
+- Classe le brouillon dans responseKind. Utilise solution pour toute procédure ou conseil factuel, clarification uniquement pour une question sans conseil, acknowledgement pour un accusé de réception sans fait nouveau, handoff pour un transfert, et none quand replyDraft est vide.
+- Consulte le message et les tickets une fois. Tu peux rechercher des fiches deux fois avec des requêtes différentes si la première recherche est insuffisante.
 - Le brouillon doit annoncer clairement qu’il est préparé par une IA et proposer à tout moment un transfert humain sous 3 jours, en rappelant que l’assistance IA est immédiate.
 - evidenceIds contient uniquement les identifiants réellement retournés par les outils.
+- Toute réponse qui affirme une procédure ou un fait doit fournir citations avec l’identifiant de la fiche, l’affirmation soutenue et un court extrait textuel exact. Un ticket HubSpot ne prouve pas une procédure générale.
 - Retourne le résultat final avec le schéma imposé.`;
 
 function safeErrorCode(error: unknown) {
@@ -70,12 +79,19 @@ function summarizeResult(name: string, result: unknown): Record<string, unknown>
   };
 }
 
-export async function runSavAdkAgent(input: SavAgentInput, options: { apiKey: string; model: string }): Promise<SavAgentRunResult> {
+export async function runSavAdkAgent(input: SavAgentInput, options: {
+  apiKey: string;
+  model: string;
+  searchKnowledge?: typeof searchKnowledge;
+  readHubspotContext?: typeof readSavHubspotContext;
+}): Promise<SavAgentRunResult> {
   assertSavAgentIsolation();
   const startedAt = Date.now();
   const toolTrace: SavAgentToolTrace[] = [];
   const evidenceById = new Map<string, SavDecisionEvidence>();
+  const knowledgeById = new Map<string, { content: string; verifiedAt: string | null; score: number; resolution?: Record<string, unknown> }>();
   const resultByTool = new Map<string, unknown>();
+  const executionsByTool = new Map<string, number>();
   let sequence = 0;
 
   function tracedTool<T extends z.ZodObject<z.ZodRawShape>>(definition: {
@@ -98,20 +114,24 @@ export async function runSavAdkAgent(input: SavAgentInput, options: { apiKey: st
           durationMs: 0,
         };
         try {
-          if (resultByTool.has(definition.name)) {
-            const reused = resultByTool.get(definition.name);
+          const cacheKey = `${definition.name}:${savContentHash(args)}`;
+          if (resultByTool.has(cacheKey)) {
+            const reused = resultByTool.get(cacheKey);
             trace.resultSummary = { ...summarizeResult(definition.name, reused), reused: true };
             return reused;
           }
+          const count = executionsByTool.get(definition.name) ?? 0;
+          if (count >= (definition.name === "search_resolution_cards" ? 2 : 1)) throw new Error("SAV_TOOL_BUDGET_EXCEEDED");
+          executionsByTool.set(definition.name, count + 1);
           const result = await definition.execute(args as z.infer<T>);
-          resultByTool.set(definition.name, result);
+          resultByTool.set(cacheKey, result);
           trace.resultSummary = summarizeResult(definition.name, result);
           return result;
         } catch (error) {
           trace.status = "failed";
           trace.errorCode = safeErrorCode(error);
           const unavailable = { unavailable: true, errorCode: trace.errorCode };
-          resultByTool.set(definition.name, unavailable);
+          trace.resultSummary = { unavailable: true };
           return unavailable;
         } finally {
           trace.durationMs = Date.now() - callStartedAt;
@@ -130,6 +150,7 @@ export async function runSavAdkAgent(input: SavAgentInput, options: { apiKey: st
         from: input.from.slice(0, 500),
         subject: input.subject.slice(0, 1_000),
         body: input.body.slice(0, 12_000),
+        conversation: input.conversation ?? null,
       }),
     }),
     tracedTool({
@@ -137,7 +158,7 @@ export async function runSavAdkAgent(input: SavAgentInput, options: { apiKey: st
       description: "Recherche uniquement les fiches de résolution SAV publiées, validées et activées pour l’IA.",
       parameters: z.object({ query: z.string().trim().min(2).max(2_000) }).strict(),
       execute: async ({ query }) => {
-        const result = await searchKnowledge({
+        const result = await (options.searchKnowledge ?? searchKnowledge)({
           query,
           path: "",
           locale: "fr-FR",
@@ -150,7 +171,9 @@ export async function runSavAdkAgent(input: SavAgentInput, options: { apiKey: st
           sourceId: item.id,
           title: item.title,
           score: item.score,
+          verifiedAt: item.verifiedAt,
         });
+        for (const item of result.results) knowledgeById.set(item.id, { content: item.content, verifiedAt: item.verifiedAt, score: item.score, resolution: item.resolution });
         return result;
       },
     }),
@@ -159,7 +182,7 @@ export async function runSavAdkAgent(input: SavAgentInput, options: { apiKey: st
       description: "Recherche en lecture seule les tickets HubSpot liés à l’adresse du client et au sujet courant.",
       parameters: z.object({}).strict(),
       execute: async () => {
-        const result = await readSavHubspotContext({ email: input.from, subject: input.subject });
+        const result = await (options.readHubspotContext ?? readSavHubspotContext)({ email: input.from, subject: input.subject, currentTicketId: input.conversation?.hubspotTicketId });
         for (const ticket of result.tickets) evidenceById.set(String(ticket.id), {
           sourceType: "hubspot_ticket",
           sourceId: String(ticket.id),
@@ -187,6 +210,9 @@ export async function runSavAdkAgent(input: SavAgentInput, options: { apiKey: st
   let rawOutput: unknown = null;
   let finalText = "";
   let modelError: string | null = null;
+  let inputTokens = 0;
+  let outputTokens = 0;
+  let totalTokens = 0;
 
   const eventStream = runner.runEphemeral({
     userId: savContentHash({ scope: SAV_AGENT_SCOPE, from: input.from }).slice(0, 32),
@@ -195,10 +221,14 @@ export async function runSavAdkAgent(input: SavAgentInput, options: { apiKey: st
   });
   const consume = async () => {
     for await (const event of eventStream) {
+      inputTokens += event.usageMetadata?.promptTokenCount ?? 0;
+      outputTokens += event.usageMetadata?.candidatesTokenCount ?? 0;
+      totalTokens += event.usageMetadata?.totalTokenCount ?? 0;
       if (event.errorCode || event.errorMessage) modelError = `${event.errorCode || "SAV_ADK_MODEL_ERROR"}:${event.errorMessage || ""}`;
       for (const call of getFunctionCalls(event)) {
         if (call.name === "set_model_response") rawOutput = call.args;
       }
+      if (sequence > 10) throw new Error("SAV_TOOL_BUDGET_EXCEEDED");
       if (isFinalResponse(event)) finalText = stringifyContent(event).trim();
     }
   };
@@ -214,9 +244,7 @@ export async function runSavAdkAgent(input: SavAgentInput, options: { apiKey: st
     // runEphemeral does not expose an AbortSignal. Closing its async generator
     // prevents a timed-out, read-only agent from continuing to consume model
     // quota after the guarded fallback has already taken over.
-    if (error instanceof Error && error.message === "SAV_ADK_TIMEOUT") {
-      void eventStream.return(undefined).catch(() => undefined);
-    }
+    void eventStream.return(undefined).catch(() => undefined);
     throw error;
   } finally {
     if (timeout) clearTimeout(timeout);
@@ -226,16 +254,24 @@ export async function runSavAdkAgent(input: SavAgentInput, options: { apiKey: st
   if (!rawOutput && finalText) rawOutput = JSON.parse(finalText);
   if (!rawOutput) throw new Error("SAV_ADK_EMPTY_OUTPUT");
   const output = savAgentOutputSchema.parse(rawOutput);
+  assertSavAnalysisComplete(output, toolTrace, [...evidenceById.values()], knowledgeById);
   const requestedEvidence = new Set(output.evidenceIds);
-  const evidence = [...evidenceById.values()].filter((item) => requestedEvidence.has(item.sourceId));
+  const citations = new Map(output.citations.map((citation) => [citation.sourceId, citation]));
+  const evidence = [...evidenceById.values()].filter((item) => requestedEvidence.has(item.sourceId)).map((item) => {
+    const citation = citations.get(item.sourceId);
+    return citation ? { ...item, claim: citation.claim, excerpt: citation.quote } : item;
+  });
   return {
     output,
     evidence,
     toolTrace,
     model: options.model,
     promptRevision: SAV_PROMPT_REVISION,
-    inputHash: savContentHash({ scope: SAV_AGENT_SCOPE, from: input.from, subject: input.subject, body: input.body }),
+    inputHash: savContentHash({ scope: SAV_AGENT_SCOPE, ...input }),
     outputHash: savContentHash(output),
     durationMs: Date.now() - startedAt,
+    inputTokens,
+    outputTokens,
+    totalTokens,
   };
 }

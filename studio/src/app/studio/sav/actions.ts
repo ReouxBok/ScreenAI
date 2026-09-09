@@ -143,6 +143,13 @@ export async function reviewPilotItemAction(form: FormData) {
   const threadId = id(form, "threadId");
   await reviewSavPilotItem(id(form, "pilotItemId"), {
     verdict: String(form.get("verdict")),
+    dimensions: {
+      classification: String(form.get("dimensionClassification")),
+      routing: String(form.get("dimensionRouting")),
+      grounding: String(form.get("dimensionGrounding")),
+      tone: String(form.get("dimensionTone")),
+      escalation: String(form.get("dimensionEscalation")),
+    },
     feedbackCodes: form.getAll("feedbackCodes").map(String),
     comment: String(form.get("comment") || ""),
     correctedDraft: String(form.get("correctedDraft") || ""),

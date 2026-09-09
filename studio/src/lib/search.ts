@@ -14,7 +14,20 @@ export type KnowledgeSearchResult = {
   source: string;
   verifiedAt: string | null;
   actionHints?: LearnedActionStep[];
+  resolution?: Record<string, unknown>;
 };
+
+// Historical articles predate the structured resolution schema. Keep their
+// metadata from turning one malformed date into a failed support search.
+const savResolutionIsCurrent = sql`
+  version.metadata ? 'resolution'
+  AND CASE
+    WHEN NULLIF(version.metadata -> 'resolution' ->> 'validUntil', '') IS NULL THEN TRUE
+    WHEN version.metadata -> 'resolution' ->> 'validUntil' ~ '^[0-9]{4}-((01|03|05|07|08|10|12)-(0[1-9]|[12][0-9]|3[01])|(04|06|09|11)-(0[1-9]|[12][0-9]|30)|02-(0[1-9]|1[0-9]|2[0-9]))$'
+      THEN version.metadata -> 'resolution' ->> 'validUntil' >= to_char(CURRENT_DATE, 'YYYY-MM-DD')
+    ELSE FALSE
+  END
+`;
 
 export async function searchKnowledge(rawInput: unknown) {
   const input = knowledgeSearchSchema.parse(rawInput);
@@ -27,10 +40,12 @@ export async function searchKnowledge(rawInput: unknown) {
       SELECT 1
       FROM content_items item
       JOIN content_chunks chunk ON chunk.item_id = item.id AND chunk.version_id = item.published_version_id
+      JOIN content_versions version ON version.id = item.published_version_id
       WHERE item.published_version_id IS NOT NULL
         AND item.status <> 'archived'
         AND item.ai_enabled = true
         AND ${input.scope === "sav" ? sql`item.agent_key = 'sav'` : sql`item.agent_key <> 'sav'`}
+        AND ${input.scope === "sav" ? savResolutionIsCurrent : sql`TRUE`}
         AND item.locale = ${input.locale}
         AND ${typeFilter}
     ) AS "hasCandidates"
@@ -53,6 +68,7 @@ export async function searchKnowledge(rawInput: unknown) {
       item.slug AS source,
       item.verified_at AS "verifiedAt",
       version.metadata -> 'actionSteps' AS "actionSteps",
+      version.metadata -> 'resolution' AS "resolution",
       (
         (1 - (chunk.embedding <=> ${vectorLiteral}::vector)) * 0.58
         + ts_rank_cd(to_tsvector('french', item.title || ' ' || chunk.heading || ' ' || chunk.content), plainto_tsquery('french', ${input.query})) * 0.30
@@ -89,13 +105,14 @@ export async function searchKnowledge(rawInput: unknown) {
       AND item.ai_enabled = true
       AND item.locale = ${input.locale}
       AND ${input.scope === "sav" ? sql`item.agent_key = 'sav'` : sql`item.agent_key <> 'sav'`}
+      AND ${input.scope === "sav" ? savResolutionIsCurrent : sql`TRUE`}
       AND ${typeFilter}
     ), best_per_content AS (
-      SELECT DISTINCT ON (id) id, title, content, source, "verifiedAt", "actionSteps", score
+      SELECT DISTINCT ON (id) id, title, content, source, "verifiedAt", "actionSteps", "resolution", score
       FROM candidates
       ORDER BY id, score DESC
     )
-    SELECT id, title, content, source, "verifiedAt", "actionSteps", score
+    SELECT id, title, content, source, "verifiedAt", "actionSteps", "resolution", score
     FROM best_per_content
     ORDER BY score DESC
     LIMIT ${input.limit}
@@ -112,6 +129,7 @@ export async function searchKnowledge(rawInput: unknown) {
       source: String(row.source),
       verifiedAt: row.verifiedAt ? new Date(String(row.verifiedAt)).toISOString().slice(0, 10) : null,
       ...(parsedHints.success && parsedHints.data.length ? { actionHints: parsedHints.data as LearnedActionStep[] } : {}),
+      ...(row.resolution && typeof row.resolution === "object" ? { resolution: row.resolution as Record<string, unknown> } : {}),
     };
   });
 

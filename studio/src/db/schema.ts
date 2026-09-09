@@ -72,6 +72,16 @@ export type ArticleMetadata = {
   expectedResult: string;
   troubleshooting: string;
   sourceMetadata?: Record<string, unknown>;
+  resolution?: {
+    symptoms: string[];
+    steps: string[];
+    exceptions: string[];
+    escalation: string;
+    productVersion: string;
+    validUntil?: string;
+    supersedes: string[];
+    conflictsWith: string[];
+  };
 };
 
 export type OnboardingMetadata = {
@@ -362,6 +372,9 @@ export type SavDecisionEvidence = {
   sourceId: string;
   title: string;
   score?: number;
+  verifiedAt?: string | null;
+  claim?: string;
+  excerpt?: string;
 };
 
 export type SavAgentToolTrace = {
@@ -464,10 +477,15 @@ export const savMessages = sav.table("messages", {
   bodyCiphertext: text("body_ciphertext").notNull(),
   receivedAt: timestamp("received_at", { withTimezone: true }).notNull(),
   processedAt: timestamp("processed_at", { withTimezone: true }),
+  analysisStatus: text("analysis_status").notNull().default("pending"),
+  analysisAttempts: integer("analysis_attempts").notNull().default(0),
+  analysisStartedAt: timestamp("analysis_started_at", { withTimezone: true }),
+  analysisErrorCode: text("analysis_error_code"),
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
 }, (table) => [
   uniqueIndex("sav_messages_mailbox_gmail_idx").on(table.mailboxId, table.gmailMessageId),
   index("sav_messages_thread_received_idx").on(table.threadId, table.receivedAt),
+  index("sav_messages_analysis_recovery_idx").on(table.analysisStatus, table.analysisStartedAt, table.analysisAttempts),
 ]);
 
 export const savPilotBatches = sav.table("pilot_batches", {
@@ -520,6 +538,9 @@ export const savAgentRuns = sav.table("agent_runs", {
   fallbackRuntime: text("fallback_runtime"),
   errorCode: text("error_code"),
   durationMs: integer("duration_ms").notNull().default(0),
+  inputTokens: integer("input_tokens").notNull().default(0),
+  outputTokens: integer("output_tokens").notNull().default(0),
+  totalTokens: integer("total_tokens").notNull().default(0),
   startedAt: timestamp("started_at", { withTimezone: true }).notNull().defaultNow(),
   completedAt: timestamp("completed_at", { withTimezone: true }),
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
@@ -533,20 +554,29 @@ export const savPilotItems = sav.table("pilot_items", {
   id: uuid("id").defaultRandom().primaryKey(),
   batchId: uuid("batch_id").notNull().references(() => savPilotBatches.id, { onDelete: "cascade" }),
   messageId: uuid("message_id").notNull().references(() => savMessages.id, { onDelete: "cascade" }),
+  agentRunId: uuid("agent_run_id").references(() => savAgentRuns.id, { onDelete: "set null" }),
   decisionId: uuid("decision_id").references(() => savDecisions.id, { onDelete: "set null" }),
   status: savPilotItemStatus("status").notNull().default("pending"),
   verdict: savPilotVerdict("verdict"),
+  classificationVerdict: savPilotVerdict("classification_verdict"),
+  routingVerdict: savPilotVerdict("routing_verdict"),
+  groundingVerdict: savPilotVerdict("grounding_verdict"),
+  toneVerdict: savPilotVerdict("tone_verdict"),
+  escalationVerdict: savPilotVerdict("escalation_verdict"),
   feedbackCodes: text("feedback_codes").array().notNull().default([]),
   reviewerComment: text("reviewer_comment").notNull().default(""),
   correctedDraftCiphertext: text("corrected_draft_ciphertext"),
   reviewedBy: text("reviewed_by"),
   reviewedAt: timestamp("reviewed_at", { withTimezone: true }),
   errorCode: text("error_code"),
+  attemptCount: integer("attempt_count").notNull().default(0),
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
   updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
 }, (table) => [
   uniqueIndex("sav_pilot_items_message_idx").on(table.messageId),
   index("sav_pilot_items_batch_status_idx").on(table.batchId, table.status),
+  index("sav_pilot_items_agent_run_idx").on(table.agentRunId),
+  index("sav_pilot_items_recovery_idx").on(table.status, table.updatedAt, table.attemptCount),
 ]);
 
 export const savActions = sav.table("actions", {
@@ -562,6 +592,8 @@ export const savActions = sav.table("actions", {
   actorType: savActorType("actor_type").notNull().default("system"),
   actorEmail: text("actor_email"),
   errorCode: text("error_code"),
+  priority: integer("priority").notNull().default(50),
+  attemptCount: integer("attempt_count").notNull().default(0),
   scheduledAt: timestamp("scheduled_at", { withTimezone: true }),
   executedAt: timestamp("executed_at", { withTimezone: true }),
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
@@ -570,6 +602,8 @@ export const savActions = sav.table("actions", {
   index("sav_actions_status_scheduled_idx").on(table.status, table.scheduledAt),
   index("sav_actions_thread_created_idx").on(table.threadId, table.createdAt),
   index("sav_actions_pilot_batch_idx").on(table.pilotBatchId, table.status),
+  index("sav_actions_retry_schedule_idx").on(table.status, table.scheduledAt, table.attemptCount),
+  index("sav_actions_queue_priority_idx").on(table.status, table.priority, table.createdAt),
 ]);
 
 export const savFollowups = sav.table("followups", {
@@ -607,20 +641,22 @@ export const savResolutionEvidence = sav.table("resolution_evidence", {
   id: uuid("id").defaultRandom().primaryKey(),
   itemId: uuid("item_id").notNull().references(() => contentItems.id, { onDelete: "cascade" }),
   versionId: uuid("version_id").notNull().references(() => contentVersions.id, { onDelete: "cascade" }),
-  hubspotTicketId: text("hubspot_ticket_id").notNull(),
+  hubspotTicketId: text("hubspot_ticket_id"),
+  sourceRef: text("source_ref").notNull(),
   weight: integer("weight").notNull().default(500),
   outcome: text("outcome").notNull(),
   summary: text("summary").notNull().default(""),
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
 }, (table) => [
-  uniqueIndex("sav_resolution_evidence_version_ticket_idx").on(table.versionId, table.hubspotTicketId),
+  uniqueIndex("sav_resolution_evidence_version_source_idx").on(table.versionId, table.sourceRef),
   index("sav_resolution_evidence_item_idx").on(table.itemId),
 ]);
 
 export const savLearningCandidates = sav.table("learning_candidates", {
   id: uuid("id").defaultRandom().primaryKey(),
   threadId: uuid("thread_id").references(() => savThreads.id, { onDelete: "set null" }),
-  hubspotTicketId: text("hubspot_ticket_id").notNull(),
+  hubspotTicketId: text("hubspot_ticket_id"),
+  sourceRef: text("source_ref").notNull(),
   contentItemId: uuid("content_item_id").references(() => contentItems.id, { onDelete: "set null" }),
   status: savLearningStatus("status").notNull().default("pending"),
   proposedPatch: jsonb("proposed_patch").$type<Record<string, unknown>>().notNull(),
@@ -632,7 +668,7 @@ export const savLearningCandidates = sav.table("learning_candidates", {
   reviewedAt: timestamp("reviewed_at", { withTimezone: true }),
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
 }, (table) => [
-  uniqueIndex("sav_learning_ticket_content_idx").on(table.hubspotTicketId, table.sourceContentHash),
+  uniqueIndex("sav_learning_source_content_idx").on(table.sourceRef, table.sourceContentHash),
   index("sav_learning_status_created_idx").on(table.status, table.createdAt),
   index("sav_learning_ticket_idx").on(table.hubspotTicketId),
 ]);

@@ -17,6 +17,9 @@ type LearningPatch = {
   subject: string;
   finalHumanResolution: string;
   sourceSnapshotId: string;
+  provenance?: "human_resolution" | "ai_resolution" | "ticket_content" | "pilot_human_review";
+  customerConfirmed?: boolean;
+  sourceMessageId?: string | null;
 };
 
 function plainText(value: string) {
@@ -82,7 +85,8 @@ export async function approveLearningCandidate(candidateId: string, actorEmail: 
     .where(and(eq(savLearningCandidates.id, candidateId), eq(savLearningCandidates.status, "pending"))).limit(1);
   if (!candidate) throw new Error("SAV_LEARNING_CANDIDATE_NOT_PENDING");
   const patch = candidatePatch(candidate);
-  const subject = plainText(patch.subject) || `Résolution du ticket ${candidate.hubspotTicketId}`;
+  const sourceLabel = candidate.hubspotTicketId ? `ticket HubSpot ${candidate.hubspotTicketId}` : `dossier SAV ${candidate.threadId ?? candidate.sourceRef}`;
+  const subject = plainText(patch.subject) || `Résolution du ${sourceLabel}`;
   const resolution = plainText(patch.finalHumanResolution);
   if (resolution.length < 20) throw new Error("SAV_LEARNING_RESOLUTION_TOO_SHORT");
 
@@ -105,38 +109,51 @@ export async function approveLearningCandidate(candidateId: string, actorEmail: 
       visibility: current.item.visibility,
       agentKey: "sav",
       ownerEmail: current.item.ownerEmail,
-      bodyMarkdown: `${current.version.bodyMarkdown.trim()}\n\n## Correction issue du ticket ${candidate.hubspotTicketId}\n\n${resolution}`,
-      changeNote: `Apprentissage après intervention humaine sur le ticket ${candidate.hubspotTicketId}`,
+      bodyMarkdown: `${current.version.bodyMarkdown.trim()}\n\n## Correction issue du ${sourceLabel}\n\n${resolution}`,
+      changeNote: `Apprentissage après intervention humaine sur le ${sourceLabel}`,
       metadata: {
         ...metadata,
         sourceMetadata: {
           ...(metadata.sourceMetadata ?? {}),
           supportResolution: true,
-          evidenceTicketIds: [...new Set([...(Array.isArray(metadata.sourceMetadata?.evidenceTicketIds) ? metadata.sourceMetadata.evidenceTicketIds.map(String) : []), candidate.hubspotTicketId])],
+          evidenceTicketIds: [...new Set([...(Array.isArray(metadata.sourceMetadata?.evidenceTicketIds) ? metadata.sourceMetadata.evidenceTicketIds.map(String) : []), ...(candidate.hubspotTicketId ? [candidate.hubspotTicketId] : [])])],
+          evidenceSourceRefs: [...new Set([...(Array.isArray(metadata.sourceMetadata?.evidenceSourceRefs) ? metadata.sourceMetadata.evidenceSourceRefs.map(String) : []), candidate.sourceRef])],
+          resolutionProvenance: patch.provenance ?? "unknown",
+          customerConfirmed: patch.customerConfirmed === true,
+        },
+        resolution: metadata.resolution ?? {
+          symptoms: [subject.slice(0, 500)], steps: [resolution], exceptions: [],
+          escalation: "Transférer à un humain si la situation diffère de ce cas ou si la procédure échoue.",
+          productVersion: "",
         },
       },
     }, actorEmail, current.item.id);
   } else {
-    const slugId = candidate.hubspotTicketId.toLocaleLowerCase("en").replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "").slice(0, 80) || candidate.id.slice(0, 8);
+    const slugId = candidate.sourceRef.toLocaleLowerCase("en").replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "").slice(0, 80) || candidate.id.slice(0, 8);
     result = await saveDraft({
       type: "article",
       slug: `resolution-sav-${slugId}`,
       locale: "fr-FR",
       title: subject.slice(0, 500),
-      summary: `Solution confirmée par l’équipe SAV à partir du ticket HubSpot ${candidate.hubspotTicketId}.`,
+      summary: `Solution confirmée par l’équipe SAV à partir du ${sourceLabel}.`,
       categorySlug: "depannage",
       visibility: "charly_only",
       agentKey: "sav",
       ownerEmail: actorEmail,
       bodyMarkdown: `## Problème observé\n\n${subject}\n\n## Solution confirmée par l’équipe\n\n${resolution}\n\n## Escalade\n\nTransférer à un humain si la situation diffère de ce cas ou si la procédure ne produit pas le résultat attendu.`,
-      changeNote: `Fiche créée après intervention humaine sur le ticket ${candidate.hubspotTicketId}`,
+      changeNote: `Fiche créée après intervention humaine sur le ${sourceLabel}`,
       metadata: {
         intents: [subject.slice(0, 500)],
         limovaPaths: [],
         prerequisites: [],
         expectedResult: "Le problème décrit est résolu et le client confirme le résultat.",
         troubleshooting: "Transférer à un humain si la procédure validée ne fonctionne pas.",
-        sourceMetadata: { supportResolution: true, evidenceTicketIds: [candidate.hubspotTicketId], sourceSnapshotId: patch.sourceSnapshotId },
+        sourceMetadata: { supportResolution: true, evidenceTicketIds: candidate.hubspotTicketId ? [candidate.hubspotTicketId] : [], evidenceSourceRefs: [candidate.sourceRef], sourceSnapshotId: patch.sourceSnapshotId, resolutionProvenance: patch.provenance ?? "unknown", customerConfirmed: patch.customerConfirmed === true },
+        resolution: {
+          symptoms: [subject.slice(0, 500)], steps: [resolution], exceptions: [],
+          escalation: "Transférer à un humain si la situation diffère de ce cas ou si la procédure ne produit pas le résultat attendu.",
+          productVersion: "",
+        },
       },
     }, actorEmail);
   }
@@ -146,6 +163,7 @@ export async function approveLearningCandidate(candidateId: string, actorEmail: 
       itemId: result.item.id,
       versionId: result.version.id,
       hubspotTicketId: candidate.hubspotTicketId,
+      sourceRef: candidate.sourceRef,
       weight: 900,
       outcome: "human_resolution",
       summary: subject.slice(0, 1_000),

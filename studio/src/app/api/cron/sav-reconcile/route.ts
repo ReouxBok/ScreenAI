@@ -1,8 +1,9 @@
 import { processPendingGmailReceipts, processPendingGmailSendActions } from "@/lib/sav/gmail";
 import { continueHubspotBackfill, getHubspotBackfillState, processPendingHubspotActions, processPendingHubspotReceipts, processPendingPilotHubspotActionsAcrossBatches, shouldAttemptHubspotBackfill } from "@/lib/sav/hubspot";
 import { processDueFollowups } from "@/lib/sav/followups";
-import { processPendingSavPilotItems } from "@/lib/sav/service";
+import { processPendingSavMessages, processPendingSavPilotItems } from "@/lib/sav/service";
 import { expireStaleEvaluationRuns } from "@/lib/evaluations";
+import { enforceSavRetention } from "@/lib/sav/retention";
 import { reconcileStaleTrainings } from "@/lib/training";
 
 export const runtime = "nodejs";
@@ -45,6 +46,7 @@ export async function GET(request: Request) {
   // a guarded legacy fallback and the remaining integrations inside the 300 s
   // function deadline. A 10-mail batch advances over at most three passages.
   const pilotItems = await runStep("pilot_items", () => processPendingSavPilotItems(4));
+  const pendingMessages = await runStep("pending_messages", () => processPendingSavMessages(4));
   const pilotActions = await runStep("pilot_hubspot_actions", () => processPendingPilotHubspotActionsAcrossBatches(100));
   const followups = await runStep("followups", () => processDueFollowups(50));
   const replies = await runStep("gmail_replies", () => processPendingGmailSendActions(50));
@@ -54,6 +56,9 @@ export async function GET(request: Request) {
     ? { status: "skipped" as const, durationMs: 0, data: { reason: "disabled" } }
     : !shouldAttemptHubspotBackfill(backfillState)
       ? { status: "skipped" as const, durationMs: 0, data: { reason: "configuration_required", retry: "automatic_within_30_minutes_or_manual" } }
-    : await runStep("hubspot_learning_backfill", () => continueHubspotBackfill(1, 10));
-  return Response.json({ gmail, hubspot, trainings, evaluations, ticketActions, pilotItems, pilotActions, followups, replies, statusActions, learningBackfill });
+      : await runStep("hubspot_learning_backfill", () => continueHubspotBackfill(1, 10));
+  const retention = await runStep("retention", () => enforceSavRetention());
+  const payload = { gmail, hubspot, trainings, evaluations, ticketActions, pilotItems, pendingMessages, pilotActions, followups, replies, statusActions, learningBackfill, retention };
+  const hasStepFailure = Object.values(payload).some((step) => step.status === "error");
+  return Response.json(payload, { status: hasStepFailure ? 500 : 200 });
 }

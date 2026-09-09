@@ -31,7 +31,10 @@ jobs:
       - run: npm test
       - run: npm run typecheck --prefix studio
       - run: npm run lint --prefix studio
+      - run: npm run db:generate --prefix studio -- --name ci_schema_check
+      - run: git diff --exit-code -- studio/drizzle
       - run: npm test --prefix studio
+      - run: npm run sav:replay --prefix studio
       - run: npm test --prefix proxy
       - run: npm run build --prefix studio
       - run: npx playwright install --with-deps chromium
