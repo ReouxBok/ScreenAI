@@ -173,7 +173,7 @@ describe("write guard with migrated database", () => {
     const [reviewed] = await fixture.db.select().from(savPilotItems).where(eq(savPilotItems.id, item.id));
     expect(reviewed).toMatchObject({ classificationVerdict: "correct", routingVerdict: "incorrect", groundingVerdict: "incorrect", toneVerdict: "partial", escalationVerdict: "correct" });
   });
-  it("links a pilot review to the exact agent run that produced its decision", async () => {
+  it("links a pilot review to the exact prompt and model that produced its decision", async () => {
     vi.stubEnv("SAV_PILOT_MODE", "true");
     vi.stubEnv("SAV_ADK_MODE", "pilot");
     vi.stubEnv("SAV_AI_ANALYSIS", "false");
@@ -189,8 +189,9 @@ describe("write guard with migrated database", () => {
       status: "succeeded", model: "fixture", promptRevision: "other-version", inputHash: "fixture",
     });
     await fixture.db.update(savPilotItems).set({ status: "reviewed", verdict: "correct", reviewedAt: new Date() }).where(eq(savPilotItems.id, item.id));
-    await expect(getSavAutonomyGate("rules-v1")).resolves.toMatchObject({ metrics: { versionReviewed: 1, versionCorrect: 1 } });
-    await expect(getSavAutonomyGate("other-version")).resolves.toMatchObject({ metrics: { versionReviewed: 0, versionCorrect: 0 } });
+    await expect(getSavAutonomyGate("rules-v1", "rules-v1")).resolves.toMatchObject({ metrics: { versionReviewed: 1, versionCorrect: 1 } });
+    await expect(getSavAutonomyGate("other-version", "fixture")).resolves.toMatchObject({ metrics: { versionReviewed: 0, versionCorrect: 0 } });
+    await expect(getSavAutonomyGate("rules-v1", "different-model")).resolves.toMatchObject({ metrics: { versionReviewed: 0, versionCorrect: 0 } });
   });
   it("reclaims an interrupted non-pilot analysis and finishes it once", async () => {
     vi.stubEnv("SAV_PILOT_MODE", "false");

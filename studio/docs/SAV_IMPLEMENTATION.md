@@ -66,7 +66,8 @@ Branche : `feat/sav-reliability-harness`.
 - Les identifiants HubSpot créés sont persistés avant les associations suivantes,
   afin qu’une reprise n’engendre pas un second objet après un échec partiel connu.
 - Chaque élément pilote référence directement l’exécution qui l’a produit. Les
-  scores de promotion ne peuvent plus être hérités par une autre version du prompt.
+  scores de promotion ne peuvent plus être hérités par une autre version du prompt
+  ni par un autre modèle utilisant la même version de prompt.
 - Le formulaire pilote mesure classification, routage, ancrage, ton et escalade.
   Une correction sans ticket HubSpot crée aussi un candidat d’apprentissage.
 - Les résolutions apprises enregistrent auteur humain ou IA, confirmation client,

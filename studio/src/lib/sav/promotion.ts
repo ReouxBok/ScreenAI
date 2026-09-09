@@ -50,8 +50,11 @@ export function savConfidenceCalibrationError(rows: Array<{ confidence: number |
   return Math.round(error * 1_000) / 10;
 }
 
-/** Reviews are counted only on the primary successful ADK run for this exact prompt revision. */
-export async function getSavAutonomyGate(promptRevision = SAV_PROMPT_REVISION) {
+/** Reviews are counted only on the producing run for this exact prompt and model pair. */
+export async function getSavAutonomyGate(
+  promptRevision = SAV_PROMPT_REVISION,
+  model = process.env.SAV_AI_MODEL ?? "gemini-3.6-flash",
+) {
   const db = requireDb();
   const [version] = await db.select({
     reviewed: sql<number>`count(distinct ${savPilotItems.id}) filter (where ${savPilotItems.reviewedAt} is not null)::int`,
@@ -61,12 +64,14 @@ export async function getSavAutonomyGate(promptRevision = SAV_PROMPT_REVISION) {
     degraded: sql<number>`count(distinct ${savAgentRuns.id}) filter (where ${savAgentRuns.status} in ('failed', 'fallback'))::int`,
   }).from(savAgentRuns).leftJoin(savPilotItems, eq(savPilotItems.agentRunId, savAgentRuns.id)).where(and(
     eq(savAgentRuns.promptRevision, promptRevision),
+    eq(savAgentRuns.model, model),
     inArray(savAgentRuns.status, ["succeeded", "failed", "fallback"]),
   ));
   const [global] = await db.select({ count: sql<number>`count(*)::int` }).from(savPilotItems).where(isNotNull(savPilotItems.reviewedAt));
   const calibrationRows = await db.select({ confidence: savAgentRuns.confidence, verdict: savPilotItems.verdict })
     .from(savAgentRuns).innerJoin(savPilotItems, eq(savPilotItems.agentRunId, savAgentRuns.id)).where(and(
-      eq(savAgentRuns.promptRevision, promptRevision), isNotNull(savPilotItems.reviewedAt), eq(savAgentRuns.status, "succeeded"),
+      eq(savAgentRuns.promptRevision, promptRevision), eq(savAgentRuns.model, model),
+      isNotNull(savPilotItems.reviewedAt), eq(savAgentRuns.status, "succeeded"),
     ));
   const [failed] = await db.select({ count: sql<number>`count(*)::int` }).from(savActions).where(eq(savActions.status, "failed"));
   return evaluateSavPromotion({

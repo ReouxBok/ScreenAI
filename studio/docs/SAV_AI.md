@@ -189,7 +189,7 @@ Le système ne modifie jamais seul son prompt à partir d’un retour isolé. L�
 3. le dashboard agrège les défauts et la conformité par version ;
 4. une correction exploitable devient un candidat de résolution, jamais une connaissance active directement ;
 5. après double contrôle éditorial, publication et activation IA, la fiche peut étayer les réponses suivantes ;
-6. toute nouvelle version doit obtenir au moins 30 revues propres à ≥ 90 %, sans critique ni repli, et le pilote global doit atteindre 100 revues sans action en échec avant toute autonomie.
+6. chaque paire exacte version de prompt/modèle doit obtenir au moins 30 revues propres à ≥ 90 %, sans critique ni repli, et le pilote global doit atteindre 100 revues sans action en échec avant toute autonomie.
 
 Optimisations suivantes, dans l’ordre :
 
