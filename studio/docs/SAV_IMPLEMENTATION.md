@@ -86,7 +86,7 @@ Branche : `feat/sav-reliability-harness`.
   à un pourcentage stable de dossiers et à un plafond quotidien. Le pourcentage
   vaut 0 par défaut.
 - Le replay synthétique versionné sépare développement et contrôle et bloque la CI.
-  Résultat local : 12/12. La suite Studio compte 149 tests réussis.
+  Résultat local : 12/12. La suite Studio compte 152 tests réussis, dont un upgrade des migrations 0017–0024 sur des lignes historiques et l'exclusion sans erreur d'une date de validité SAV ancienne mal formée.
 - Un second replay exécute le vrai harness ADK avec des fiches et tickets synthétiques
   injectés, sans accès aux systèmes externes. Son exécution exige une clé Gemini et
   reste distincte du replay déterministe bloquant de la CI.

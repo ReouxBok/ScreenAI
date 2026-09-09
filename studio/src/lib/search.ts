@@ -17,6 +17,18 @@ export type KnowledgeSearchResult = {
   resolution?: Record<string, unknown>;
 };
 
+// Historical articles predate the structured resolution schema. Keep their
+// metadata from turning one malformed date into a failed support search.
+const savResolutionIsCurrent = sql`
+  version.metadata ? 'resolution'
+  AND CASE
+    WHEN NULLIF(version.metadata -> 'resolution' ->> 'validUntil', '') IS NULL THEN TRUE
+    WHEN version.metadata -> 'resolution' ->> 'validUntil' ~ '^[0-9]{4}-(0[1-9]|1[0-2])-([0-2][0-9]|3[01])$'
+      THEN version.metadata -> 'resolution' ->> 'validUntil' >= to_char(CURRENT_DATE, 'YYYY-MM-DD')
+    ELSE FALSE
+  END
+`;
+
 export async function searchKnowledge(rawInput: unknown) {
   const input = knowledgeSearchSchema.parse(rawInput);
   const db = requireDb();
@@ -33,7 +45,7 @@ export async function searchKnowledge(rawInput: unknown) {
         AND item.status <> 'archived'
         AND item.ai_enabled = true
         AND ${input.scope === "sav" ? sql`item.agent_key = 'sav'` : sql`item.agent_key <> 'sav'`}
-        AND ${input.scope === "sav" ? sql`version.metadata ? 'resolution' AND COALESCE(NULLIF(version.metadata -> 'resolution' ->> 'validUntil', '')::date, CURRENT_DATE) >= CURRENT_DATE` : sql`TRUE`}
+        AND ${input.scope === "sav" ? savResolutionIsCurrent : sql`TRUE`}
         AND item.locale = ${input.locale}
         AND ${typeFilter}
     ) AS "hasCandidates"
@@ -93,7 +105,7 @@ export async function searchKnowledge(rawInput: unknown) {
       AND item.ai_enabled = true
       AND item.locale = ${input.locale}
       AND ${input.scope === "sav" ? sql`item.agent_key = 'sav'` : sql`item.agent_key <> 'sav'`}
-      AND ${input.scope === "sav" ? sql`version.metadata ? 'resolution' AND COALESCE(NULLIF(version.metadata -> 'resolution' ->> 'validUntil', '')::date, CURRENT_DATE) >= CURRENT_DATE` : sql`TRUE`}
+      AND ${input.scope === "sav" ? savResolutionIsCurrent : sql`TRUE`}
       AND ${typeFilter}
     ), best_per_content AS (
       SELECT DISTINCT ON (id) id, title, content, source, "verifiedAt", "actionSteps", "resolution", score
