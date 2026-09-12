@@ -5,6 +5,7 @@ import { requireDb } from "@/db";
 import { embedTexts } from "./embeddings";
 import { knowledgeSearchSchema, learnedActionStepSchema } from "./content";
 import type { LearnedActionStep } from "./action-trace";
+import { searchOperationalCurriculum } from "./operational-curriculum-search";
 
 export type KnowledgeSearchResult = {
   id: string;
@@ -31,6 +32,11 @@ const savResolutionIsCurrent = sql`
 
 export async function searchKnowledge(rawInput: unknown) {
   const input = knowledgeSearchSchema.parse(rawInput);
+  const curriculumResults: KnowledgeSearchResult[] = input.scope === "extension"
+    && input.locale === "fr-FR"
+    && input.contentTypes.includes("onboarding")
+    ? searchOperationalCurriculum(input.query, input.path, input.limit)
+    : [];
   const db = requireDb();
   const typeFilter = input.contentTypes.length === 2
     ? sql`item.type IN ('article', 'onboarding')`
@@ -54,7 +60,10 @@ export async function searchKnowledge(rawInput: unknown) {
     ? availability
     : (availability as unknown as { rows: Record<string, unknown>[] }).rows;
   if (availabilityRows[0]?.hasCandidates !== true) {
-    return { revision: "kb_empty", results: [] as KnowledgeSearchResult[] };
+    return {
+      revision: curriculumResults.length ? "curriculum_operational_v2" : "kb_empty",
+      results: curriculumResults,
+    };
   }
   const [embedding] = await embedTexts([input.query], "RETRIEVAL_QUERY", { scope: input.scope });
   const vectorLiteral = `[${embedding.join(",")}]`;
@@ -136,5 +145,25 @@ export async function searchKnowledge(rawInput: unknown) {
   const revisionResponse = await db.execute(sql`SELECT revision_id FROM active_knowledge WHERE singleton = true LIMIT 1`);
   const revisionRows = Array.isArray(revisionResponse) ? revisionResponse : (revisionResponse as unknown as { rows: Record<string, unknown>[] }).rows;
   const revision = String(revisionRows[0]?.revision_id ?? "kb_empty");
-  return { revision, results };
+  const byTitle = new Map<string, KnowledgeSearchResult>();
+  for (const result of [...results, ...curriculumResults]) {
+    const key = result.title.normalize("NFD").replace(/[\u0300-\u036f]/g, "").toLocaleLowerCase("fr");
+    const existing = byTitle.get(key);
+    if (!existing) {
+      byTitle.set(key, result);
+      continue;
+    }
+    // The published Studio version wins because it can contain staff-recorded
+    // action hints; keep the strongest retrieval score across both sources.
+    if (existing.source.startsWith("curriculum/") && !result.source.startsWith("curriculum/")) {
+      byTitle.set(key, { ...result, score: Math.max(existing.score, result.score) });
+    } else {
+      existing.score = Math.max(existing.score, result.score);
+    }
+  }
+  const mergedResults = [...byTitle.values()].sort((left, right) => right.score - left.score).slice(0, input.limit);
+  return {
+    revision: curriculumResults.length ? `${revision}:curriculum_operational_v2` : revision,
+    results: mergedResults,
+  };
 }
