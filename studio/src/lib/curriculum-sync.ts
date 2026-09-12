@@ -12,6 +12,17 @@ const normalized = (value: string) => value.normalize("NFD").replace(/[\u0300-\u
 const unique = (values: unknown[], max = 50) => [...new Set(values.map(String).map((value) => value.trim()).filter(Boolean))].slice(0, max);
 const objects = (value: unknown) => Array.isArray(value) ? value.filter((item): item is { condition: string; next: string } => Boolean(item && typeof item === "object" && "condition" in item && "next" in item)) : [];
 
+function databaseDiagnostic(error: unknown) {
+  const cause = error && typeof error === "object" && "cause" in error ? (error as { cause?: unknown }).cause : null;
+  const source = cause && typeof cause === "object" ? cause as Record<string, unknown> : {};
+  return {
+    message: error instanceof Error ? error.message.slice(0, 300) : "unknown",
+    code: typeof source.code === "string" ? source.code : undefined,
+    constraint: typeof source.constraint === "string" ? source.constraint : undefined,
+    detail: typeof source.detail === "string" ? source.detail.slice(0, 300) : undefined,
+  };
+}
+
 function mergeMetadata(generated: OnboardingMetadata, existing?: OnboardingMetadata): OnboardingMetadata {
   if (!existing) return generated;
   const existingSuccess = existing.successCriteria?.filter((value) => !/^le parcours démontré est terminé$/i.test(value)) ?? [];
@@ -66,7 +77,9 @@ export async function syncCurriculumBatch(input: { offset: number; limit: number
       if (!existingItem) allItems.push(saved.item);
       results.push({ title: entry.title, id: saved.item.id, status: input.publishNow ? "published" : "draft" });
     } catch (error) {
-      results.push({ title: entry.title, status: "failed", error: error instanceof Error ? error.message.slice(0, 300) : "unknown" });
+      const diagnostic = databaseDiagnostic(error);
+      console.error("curriculum_sync_item_failed", { title: entry.title, ...diagnostic });
+      results.push({ title: entry.title, status: "failed", error: JSON.stringify(diagnostic) });
     }
   }
   return { offset: input.offset, processed: entries.length, total: LIMOVA_CURRICULUM.length, nextOffset: input.offset + entries.length, done: input.offset + entries.length >= LIMOVA_CURRICULUM.length, results };
