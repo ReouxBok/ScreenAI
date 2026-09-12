@@ -156,7 +156,17 @@ export async function searchKnowledge(rawInput: unknown) {
     // The published Studio version wins because it can contain staff-recorded
     // action hints; keep the strongest retrieval score across both sources.
     if (existing.source.startsWith("curriculum/") && !result.source.startsWith("curriculum/")) {
-      byTitle.set(key, { ...result, score: Math.max(existing.score, result.score) });
+      byTitle.set(key, {
+        ...result,
+        content: `${result.content.trim()}\n\n---\n\n${existing.content}`,
+        score: Math.max(existing.score, result.score),
+      });
+    } else if (!existing.source.startsWith("curriculum/") && result.source.startsWith("curriculum/")) {
+      byTitle.set(key, {
+        ...existing,
+        content: `${existing.content.trim()}\n\n---\n\n${result.content}`,
+        score: Math.max(existing.score, result.score),
+      });
     } else {
       existing.score = Math.max(existing.score, result.score);
     }
