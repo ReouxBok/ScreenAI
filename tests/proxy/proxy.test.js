@@ -124,6 +124,18 @@ describe('GET /', () => {
   });
 });
 
+describe('GET /healthz', () => {
+  it('reports non-secret Studio and memory connection flags', async () => {
+    const res = await req().get('/healthz');
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual(expect.objectContaining({
+      status: 'ok',
+      knowledgeConfigured: true,
+      memoryConfigured: false,
+    }));
+  });
+});
+
 describe('Copilot memory fallback', () => {
   it('keeps the extension usable when the private memory service is not configured', async () => {
     const res = await req().get('/api/copilot/bootstrap');

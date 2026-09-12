@@ -261,7 +261,15 @@ export async function setContentAiEnabled(itemId: string, enabled: boolean, acto
 
 export async function listContent() {
   const db = requireDb();
-  return db.select({ item: contentItems, category: categories, stale: sql<boolean>`${contentItems.verifiedAt} IS NULL OR ${contentItems.verifiedAt} < now() - interval '90 days'` }).from(contentItems).leftJoin(categories, eq(contentItems.categoryId, categories.id)).orderBy(desc(contentItems.updatedAt));
+  return db.select({
+    item: contentItems,
+    category: categories,
+    metadata: contentVersions.metadata,
+    stale: sql<boolean>`${contentItems.verifiedAt} IS NULL OR ${contentItems.verifiedAt} < now() - interval '90 days'`,
+  }).from(contentItems)
+    .leftJoin(categories, eq(contentItems.categoryId, categories.id))
+    .leftJoin(contentVersions, eq(contentItems.currentDraftVersionId, contentVersions.id))
+    .orderBy(desc(contentItems.updatedAt));
 }
 
 export async function getContentDetail(itemId: string) {

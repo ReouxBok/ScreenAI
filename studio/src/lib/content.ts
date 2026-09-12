@@ -72,6 +72,7 @@ export const onboardingMetadataSchema = z.object({
   successCriteria: stringList,
   branches: z.array(z.object({ condition: nonEmptyString, next: nonEmptyString })).max(30).default([]),
   fallbacks: stringList,
+  sourceMetadata: z.record(z.string(), z.unknown()).optional(),
   actionSteps: z.array(learnedActionStepSchema).max(50).default([]),
 });
 

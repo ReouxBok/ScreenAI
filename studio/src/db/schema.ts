@@ -92,6 +92,7 @@ export type OnboardingMetadata = {
   successCriteria: string[];
   branches: Array<{ condition: string; next: string }>;
   fallbacks: string[];
+  sourceMetadata?: Record<string, unknown>;
   actionSteps?: Array<{
     order: number;
     action: "click" | "input" | "external_popup";

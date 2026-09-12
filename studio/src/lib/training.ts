@@ -475,6 +475,10 @@ export async function convertTrainingToContent(id: string, actorEmail: string) {
       successCriteria: ["Le parcours démontré est terminé"],
       branches: [],
       fallbacks: ["Demander une précision au membre Limova"],
+      sourceMetadata: {
+        origin: "staff_demonstration",
+        trainingSessionId: detail.session.id,
+      },
       actionSteps,
     },
   }, normalizedActorEmail);

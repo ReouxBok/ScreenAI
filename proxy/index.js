@@ -6,6 +6,7 @@ const rateLimit = require('express-rate-limit');
 const { sessionSchema, turnSchema, toolResultSchema } = require('./copilot/contracts');
 const { CharlyAdkOrchestrator } = require('./copilot/orchestrator');
 const { loadPromptBundle } = require('./copilot/prompt');
+const { sanitizeKnowledgeResponse } = require('./copilot/knowledge');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -61,6 +62,8 @@ app.get('/healthz', (_req, res) => res.json({
   agentScope: 'extension_onboarding',
   adkTextMode: ADK_TEXT_MODE,
   adkCanaryPercent: ADK_CANARY_PERCENT,
+  knowledgeConfigured: Boolean(KNOWLEDGE_API_URL && KNOWLEDGE_SERVICE_TOKEN),
+  memoryConfigured: memoryAvailable(),
   promptRevision: PROMPT_BUNDLE.revision
 }));
 
@@ -447,16 +450,7 @@ async function searchKnowledgeForAdk(input) {
   });
   const data = await response.json().catch(() => ({ revision: null, results: [] }));
   if (!response.ok) return { revision: null, results: [], unavailable: true };
-  return {
-    revision: data.revision || null,
-    results: Array.isArray(data.results) ? data.results.slice(0, 5).map(result => ({
-      id: result.id,
-      title: String(result.title || '').slice(0, 300),
-      content: String(result.content || '').slice(0, 5_000),
-      score: Number(result.score) || 0,
-      source: String(result.source || '').slice(0, 500)
-    })) : []
-  };
+  return sanitizeKnowledgeResponse(data);
 }
 
 async function evaluationContextFor(code) {

@@ -76,6 +76,7 @@ export async function saveContentAction(form: FormData) {
     successCriteria: strings(form.get("successCriteria")),
     branches: jsonArray(form.get("branches")),
     fallbacks: strings(form.get("fallbacks")),
+    sourceMetadata,
     actionSteps: jsonArray(form.get("actionSteps")),
   };
   const result = await saveDraft({ ...common, metadata }, staff.email, itemId);

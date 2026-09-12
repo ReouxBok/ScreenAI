@@ -76,7 +76,7 @@ function createCharlyTools({ searchKnowledge }) {
     ),
     new FunctionTool({
       name: 'search_knowledge_base',
-      description: 'Recherche les articles et parcours publiés du Studio Charly correspondant à la question et à la page Limova.',
+      description: 'Recherche les articles et parcours publiés du Studio Charly correspondant à la question et à la page Limova. Les actionHints éventuels décrivent des étapes démontrées, leurs cibles structurelles et leurs résultats attendus.',
       parameters: z.object({
         query: z.string().min(2).max(2_000),
         path: z.string().max(1_000).default('/'),

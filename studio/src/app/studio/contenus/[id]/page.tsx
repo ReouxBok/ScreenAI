@@ -3,10 +3,12 @@ import { notFound } from "next/navigation";
 import { archiveAction, deleteContentAction, reviewDecisionAction, rollbackAction, submitAction } from "@/app/studio/actions";
 import { ContentEvaluationPanel } from "@/components/content-evaluation-panel";
 import { ContentForm } from "@/components/content-form";
+import { ContentReadinessPanel } from "@/components/content-readiness-panel";
 import { TrainingRecordingReview } from "@/components/training-recording-review";
 import { VersionComparison } from "@/components/version-comparison";
 import { canEditContent, canManageProduction } from "@/lib/access";
 import { requireStaff } from "@/lib/auth";
+import { assessContentReadiness } from "@/lib/content-readiness";
 import { getEvaluationForContent } from "@/lib/evaluations";
 import { getTrainingByContentItemId } from "@/lib/training";
 import { getContentDetail } from "@/lib/workflow";
@@ -29,6 +31,13 @@ export default async function DetailPage({ params, searchParams }: {
   const evaluationData = detail.item.type === "onboarding" ? await getEvaluationForContent(id) : null;
   const isAdmin = canManageProduction(staff.role);
   const canEdit = canEditContent(staff.role, detail.item.publishedVersionId);
+  const readiness = assessContentReadiness({
+    type: detail.item.type,
+    metadata: (current?.metadata ?? {}) as Record<string, unknown>,
+    itemSourcePath: detail.item.sourcePath,
+    hasTraining: Boolean(sourceTraining),
+    evaluationPassed: evaluationData?.suite.status === "passed",
+  });
 
   return <>
     <span className="eyebrow">{detail.item.type === "article" ? "Article" : "Parcours"} · version {current?.version ?? 0}</span>
@@ -56,6 +65,7 @@ export default async function DetailPage({ params, searchParams }: {
         </details>
       </div>}
     </section>
+    <ContentReadinessPanel readiness={readiness}/>
     <div className="editor-layout">
       <section className="editor-card card">
         {canEdit ? <ContentForm key={current?.id ?? detail.item.id} defaults={{
