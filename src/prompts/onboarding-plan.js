@@ -20,15 +20,15 @@ Règle de première interaction :
 - Sinon, pose UNE seule question : « Est-ce qu'il y a un sujet en particulier que tu veux traiter aujourd'hui ? »
 - Attends sa réponse. Ne présente pas encore le catalogue Limova.
 
-S'il répond qu'il n'a pas de sujet précis, qu'il ne sait pas ou qu'il veut découvrir, propose seulement ces deux points de départ dans l'onglet **Conversation** :
-1. Développer sa prospection LinkedIn dans **Conversation**, avec le cas d'usage **Créer une campagne de prospection LinkedIn**.
-2. Automatiser ses réseaux sociaux dans **Conversation**, avec le cas d'usage **Créer une campagne de posts pour réseaux sociaux**.
+S'il répond qu'il n'a pas de sujet précis, qu'il ne sait pas ou qu'il veut découvrir, propose seulement ces deux points de départ :
+1. Développer sa prospection LinkedIn avec le super-pouvoir **Créer une campagne de prospection LinkedIn**.
+2. Automatiser ses réseaux sociaux avec le super-pouvoir **Créer une campagne de posts pour réseaux sociaux**.
 Demande lequel l'intéresse le plus. Une seule question dans le message.
 
 Si aucun des deux ne lui parle, si ses réponses restent trop vagues ou si tu n'arrives pas à recommander quelque chose de pertinent, demande : « Qu'est-ce que tu fais dans la vie ? »
 À partir de sa réponse, propose au maximum deux cas d'usage concrets adaptés à son métier, en expliquant le bénéfice attendu. Pour une activité B2B qui doit trouver des clients, privilégie la prospection LinkedIn. Pour une marque, un commerce, un créateur ou une activité qui doit publier régulièrement, privilégie la campagne de posts. Pour les autres métiers, utilise la base de connaissances avant de recommander et n'invente jamais une capacité. Ne récite pas toute la liste des fonctionnalités.
 
-Après son choix, accompagne-le dans l'onglet **Conversation** pour lancer le cas d'usage correspondant et aide-le à obtenir son premier résultat. Si la cible visible est ambiguë, demande une clarification ; sinon utilise les outils de navigation et de clic autorisés.`,
+Après son choix, accompagne-le jusqu'au super-pouvoir correspondant dans l'interface et aide-le à lancer son premier cas d'usage. Si la cible visible est ambiguë, demande une clarification ; sinon utilise les outils de navigation et de clic autorisés.`,
     completionHint: `Émets {{STEP_COMPLETE}} seulement quand le premier cas d'usage choisi a été lancé, quand le besoin précis de l'utilisateur est résolu et qu'il le confirme, ou quand il demande explicitement une visite générale de Limova.`,
     status: 'active'
   },
@@ -55,7 +55,7 @@ Sois concis : présente 2-3 sections à la fois, pas tout d'un coup.`,
     type: 'navigation',
     expectedUrls: ['/integrations'],
     kbQueries: ['connecter outils gmail outlook calendar', 'integration applications'],
-    description: `Guide l'utilisateur vers la page Intégrations pour connecter son email et son agenda. Si ce parcours est lancé depuis Conversation, privilégie la version BETA de l'intégration concernée. Si l'utilisateur utilise Super-pouvoirs, utilise la version standard.
+    description: `Guide l'utilisateur vers la page Intégrations pour connecter son email et son agenda.
 
 Étapes :
 1. Demande quel email il utilise (Gmail ou Outlook)
@@ -138,12 +138,12 @@ Dis à l'utilisateur de le copier et de le sauver dans ses Documents comme conte
     type: 'conversational',
     expectedUrls: ['/power-ups', '/campaigns', '/agents'],
     kbQueries: ['decouvrez super pouvoirs'],
-    description: `Présente les Super Pouvoirs disponibles pour les fonctionnalités hors marketing (onglet dédié), en partant du besoin déjà exprimé pendant l'orientation. Pour les usages marketing, Conversation reste le point d'entrée recommandé :
+    description: `Présente les Super Pouvoirs disponibles (onglet dédié, pas dans le chat) en partant du besoin déjà exprimé pendant l'orientation :
 
 - Pour la prospection LinkedIn, utilise le nom exact **Créer une campagne de prospection LinkedIn**.
 - Pour les réseaux sociaux, utilise le nom exact **Créer une campagne de posts pour réseaux sociaux**.
 
-- **John** (Marketing & Contenu) : fonctionnalités marketing accessibles historiquement ; pour ces usages, recommande Conversation par défaut
+- **John** (Marketing & Contenu) : posts réseaux sociaux, présentations pro, suppression fond image, transcription audio, génération vidéo
 - **Lou** (SEO & Content Marketing) : audits SEO avec rapport PDF, articles de blog optimisés avec images IA
 - **Elio** (Prospection LinkedIn) : campagnes LinkedIn automatisées, campagnes d'appels sortants
 - **Tom** (Agent Téléphonique IA) : standard téléphonique, chatbot support client (site web/WhatsApp)
@@ -184,7 +184,7 @@ export function createOnboardingPlan(template = null) {
     revision: String(template?.revision || 'embedded_fallback'),
     name: String(template?.name || 'Onboarding Limova'),
     openingPrompt: String(template?.openingPrompt || "Si l'utilisateur n'a pas encore formulé de besoin précis, demande-lui s'il souhaite traiter un sujet particulier aujourd'hui, puis attends sa réponse."),
-    fallbackPrompt: String(template?.fallbackPrompt || "S'il n'a pas d'idée, propose la prospection LinkedIn ou la création de posts pour les réseaux sociaux dans l'onglet Conversation, puis demande ce qui l'intéresse le plus."),
+    fallbackPrompt: String(template?.fallbackPrompt || "S'il n'a pas d'idée, propose la prospection LinkedIn ou la création de posts pour les réseaux sociaux, puis demande ce qui l'intéresse le plus."),
     steps: remoteSteps || ONBOARDING_STEPS.map((step, index) => ({ ...step, depth: 0, optional: false, successCriteria: [], status: index === 0 ? 'active' : 'pending' })),
     activeIndex: 0,
     startedAt: Date.now()
