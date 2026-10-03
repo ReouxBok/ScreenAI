@@ -610,6 +610,33 @@ async function handleMessage(request, sender) {
     case 'GET_LIVE_TOKEN':
       return getLiveToken(request.context || {});
 
+    case 'OPEN_TAVUS_VIDEO': {
+      if (!(await hasAIProcessingConsent())) return { ok: false, consentRequired: true };
+      await chrome.windows.create({
+        url: chrome.runtime.getURL('src/video/video.html'),
+        type: 'popup', width: 520, height: 760, focused: true
+      });
+      return { ok: true };
+    }
+
+    case 'START_TAVUS_CONVERSATION': {
+      if (!(await hasAIProcessingConsent())) return { ok: false, consentRequired: true };
+      const context = await getFreshVoiceContext();
+      const response = await authorizedProxyFetch('/api/tavus/conversations', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ pageContext: context.pageContext, testMode: request.testMode === true })
+      });
+      const data = await response.json().catch(() => ({}));
+      if (!response.ok) throw codedError('TAVUS_START_FAILED', data.error || 'La vidéo Charly est indisponible.');
+      return { ok: true, ...data };
+    }
+
+    case 'END_TAVUS_CONVERSATION': {
+      const conversationId = String(request.conversationId || '');
+      const response = await authorizedProxyFetch(`/api/tavus/conversations/${encodeURIComponent(conversationId)}/end`, { method: 'POST' });
+      return { ok: response.ok };
+    }
+
     case 'VOICE_CONTEXT_REQUEST':
       return runEvaluatedVoiceTool(
         ['inspect_current_page', 'verify_expected_result', 'capture_current_view'].includes(request.toolName)

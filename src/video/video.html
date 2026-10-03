@@ -1,0 +1,18 @@
+<!doctype html>
+<html lang="fr">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Appel vidéo avec Charly</title>
+  <link rel="stylesheet" href="video.css">
+</head>
+<body>
+  <main>
+    <header><img src="../../assets/branding/charly.png" alt=""><div><strong>Charly</strong><span id="status">Préparation de l’appel…</span></div></header>
+    <section id="intro"><h1>Votre onboarding en vidéo</h1><p>Charly utilisera le microphone, la caméra si vous l’activez, et la structure filtrée de votre page Limova.</p><button id="start">Démarrer l’appel</button><p class="error" id="error" hidden></p></section>
+    <iframe id="conversation" title="Conversation vidéo avec Charly" allow="camera; microphone; fullscreen; display-capture; autoplay" hidden></iframe>
+    <footer><button id="end" hidden>Terminer l’appel</button></footer>
+  </main>
+  <script src="video.js"></script>
+</body>
+</html>

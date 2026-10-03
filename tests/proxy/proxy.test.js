@@ -34,6 +34,8 @@ beforeAll(async () => {
   process.env.KNOWLEDGE_API_URL = 'https://studio.example';
   process.env.KNOWLEDGE_SERVICE_TOKEN = 'x'.repeat(40);
   process.env.MEMORY_IDENTITY_SECRET_V1 = 'memory-identity-test-secret-that-is-long-enough';
+  process.env.TAVUS_API_KEY = 'test_tavus_key';
+  process.env.TAVUS_PAL_ID = 'p-test-charly';
 
   app = requireFromProxy('./index.js');
   supertest = (await import('supertest')).default;
@@ -121,6 +123,38 @@ describe('GET /', () => {
     const res = await req().get('/');
     expect(res.status).toBe(200);
     expect(res.body).toEqual({ status: 'ok', service: 'limova-proxy' });
+  });
+});
+
+describe('Tavus video conversations', () => {
+  it('creates and ends an authenticated conversation without exposing the API key', async () => {
+    fetch.mockResolvedValueOnce({
+      ok: true,
+      status: 200,
+      json: async () => ({
+        conversation_id: 'ctest1234',
+        conversation_url: 'https://tavus.daily.co/ctest1234',
+        status: 'active'
+      })
+    });
+
+    const created = await req().post('/api/tavus/conversations').send({
+      pageContext: 'Page: Accueil',
+      testMode: false
+    });
+    expect(created.status).toBe(200);
+    expect(created.body).toEqual({
+      conversationId: 'ctest1234',
+      conversationUrl: 'https://tavus.daily.co/ctest1234',
+      status: 'active'
+    });
+    expect(fetch.mock.calls[0][0]).toBe('https://tavusapi.com/v2/conversations');
+    expect(fetch.mock.calls[0][1].headers['x-api-key']).toBe('test_tavus_key');
+
+    fetch.mockResolvedValueOnce({ ok: true, status: 204, json: async () => ({}) });
+    const ended = await req().post('/api/tavus/conversations/ctest1234/end').send({});
+    expect(ended.status).toBe(200);
+    expect(ended.body).toEqual({ ok: true });
   });
 });
 

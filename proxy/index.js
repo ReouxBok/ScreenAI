@@ -35,12 +35,16 @@ const LIMOVA_API_URL = String(process.env.LIMOVA_API_URL || 'https://api.new.lim
 const RESEND_API_KEY = process.env.RESEND_API_KEY;
 const RESEND_FROM_EMAIL = process.env.RESEND_FROM_EMAIL;
 const CHARLY_SESSION_SECRET = process.env.CHARLY_SESSION_SECRET;
+const TAVUS_API_KEY = process.env.TAVUS_API_KEY;
+const TAVUS_PAL_ID = process.env.TAVUS_PAL_ID;
+const TAVUS_API_URL = 'https://tavusapi.com/v2';
 const OTP_TTL_MS = 10 * 60_000;
 const SESSION_TTL_MS = 30 * 24 * 60 * 60_000;
 const ACTIVE_USER_CACHE_MS = 5 * 60_000;
 let onboardingTemplateCache = null;
 let onboardingTemplateCacheExpiresAt = 0;
 const memoryContextCache = new Map();
+const tavusConversationOwners = new Map();
 const PROMPT_BUNDLE = loadPromptBundle(path.join(__dirname, 'prompts'));
 const SERVER_PROMPT = PROMPT_BUNDLE.content;
 
@@ -403,6 +407,79 @@ app.post('/api/auth/verify-otp', otpVerifyLimiter, async (req, res) => {
 app.get('/api/auth/session', verifyAssistantAuth, (req, res) => {
   res.set('Cache-Control', 'no-store');
   return res.json({ authenticated: true, userId: req.auth.sub, provider: req.auth.provider });
+});
+
+function tavusAvailable() {
+  return Boolean(TAVUS_API_KEY && TAVUS_PAL_ID);
+}
+
+async function tavusRequest(pathname, options = {}) {
+  const response = await fetch(`${TAVUS_API_URL}${pathname}`, {
+    ...options,
+    headers: {
+      'Content-Type': 'application/json',
+      'x-api-key': TAVUS_API_KEY,
+      ...(options.headers || {})
+    },
+    signal: AbortSignal.timeout(20_000)
+  });
+  const data = response.status === 204 ? {} : await response.json().catch(() => ({}));
+  if (!response.ok) {
+    const error = new Error('TAVUS_REQUEST_FAILED');
+    error.status = response.status;
+    error.details = data;
+    throw error;
+  }
+  return data;
+}
+
+app.post('/api/tavus/conversations', verifyAssistantAuth, assistantLimiter, async (req, res) => {
+  res.set('Cache-Control', 'no-store');
+  if (!tavusAvailable()) return res.status(503).json({ error: 'Tavus video is not configured' });
+  const requestId = crypto.randomUUID();
+  const pageContext = typeof req.body?.pageContext === 'string'
+    ? req.body.pageContext.replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f]/g, '').slice(0, 12_000)
+    : '';
+  try {
+    const data = await tavusRequest('/conversations', {
+      method: 'POST',
+      body: JSON.stringify({
+        pal_id: TAVUS_PAL_ID,
+        conversation_name: 'Onboarding Limova avec Charly',
+        conversational_context: pageContext
+          ? `L'utilisateur est actuellement sur Limova. Voici une carte DOM filtrée de la page au début de l'appel. N'invente aucun élément absent de cette carte.\n\n${pageContext}`
+          : "L'utilisateur souhaite être accompagné dans son onboarding Limova.",
+        custom_greeting: "Bonjour, je suis Charly, l'assistant IA de Limova. Dites-moi ce que vous souhaitez faire et nous avancerons ensemble.",
+        properties: { languages: ['fr'] },
+        test_mode: req.body?.testMode === true
+      })
+    });
+    if (typeof data.conversation_id !== 'string') throw new Error('TAVUS_INVALID_RESPONSE');
+    if (data.status === 'active') tavusConversationOwners.set(data.conversation_id, req.auth.sub);
+    console.info(JSON.stringify({ type: 'tavus_conversation_created', requestId, conversationId: data.conversation_id, testMode: req.body?.testMode === true }));
+    return res.json({
+      conversationId: data.conversation_id,
+      conversationUrl: data.conversation_url,
+      status: data.status
+    });
+  } catch (error) {
+    console.error(JSON.stringify({ type: 'tavus_conversation_error', requestId, code: technicalErrorCode(error) }));
+    return res.status(error.status >= 400 && error.status < 500 ? error.status : 502).json({ error: 'Tavus video is unavailable', requestId });
+  }
+});
+
+app.post('/api/tavus/conversations/:conversationId/end', verifyAssistantAuth, assistantLimiter, async (req, res) => {
+  res.set('Cache-Control', 'no-store');
+  const conversationId = String(req.params.conversationId || '');
+  if (!/^c[a-zA-Z0-9_-]{4,100}$/.test(conversationId)) return res.status(400).json({ error: 'Invalid conversation' });
+  if (tavusConversationOwners.get(conversationId) !== req.auth.sub) return res.status(404).json({ error: 'Conversation not found' });
+  try {
+    await tavusRequest(`/conversations/${conversationId}/end`, { method: 'POST' });
+    tavusConversationOwners.delete(conversationId);
+    return res.json({ ok: true });
+  } catch (error) {
+    return res.status(error.status === 404 ? 404 : 502).json({ error: 'Unable to end Tavus conversation' });
+  }
 });
 
 function memoryAvailable() {
