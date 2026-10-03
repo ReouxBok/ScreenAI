@@ -29,13 +29,12 @@ const req = () => {
 
 beforeAll(async () => {
   process.env.EXTENSION_GEMINI_API_KEY = 'test_gemini_key';
+  process.env.OPENAI_API_KEY = 'test_openai_key';
   process.env.ALLOWED_EXTENSION_ID = EXT_ID;
   process.env.PORT = '0';
   process.env.KNOWLEDGE_API_URL = 'https://studio.example';
   process.env.KNOWLEDGE_SERVICE_TOKEN = 'x'.repeat(40);
   process.env.MEMORY_IDENTITY_SECRET_V1 = 'memory-identity-test-secret-that-is-long-enough';
-  process.env.TAVUS_API_KEY = 'test_tavus_key';
-  process.env.TAVUS_PAL_ID = 'p-test-charly';
 
   app = requireFromProxy('./index.js');
   supertest = (await import('supertest')).default;
@@ -123,38 +122,6 @@ describe('GET /', () => {
     const res = await req().get('/');
     expect(res.status).toBe(200);
     expect(res.body).toEqual({ status: 'ok', service: 'limova-proxy' });
-  });
-});
-
-describe('Tavus video conversations', () => {
-  it('creates and ends an authenticated conversation without exposing the API key', async () => {
-    fetch.mockResolvedValueOnce({
-      ok: true,
-      status: 200,
-      json: async () => ({
-        conversation_id: 'ctest1234',
-        conversation_url: 'https://tavus.daily.co/ctest1234',
-        status: 'active'
-      })
-    });
-
-    const created = await req().post('/api/tavus/conversations').send({
-      pageContext: 'Page: Accueil',
-      testMode: false
-    });
-    expect(created.status).toBe(200);
-    expect(created.body).toEqual({
-      conversationId: 'ctest1234',
-      conversationUrl: 'https://tavus.daily.co/ctest1234',
-      status: 'active'
-    });
-    expect(fetch.mock.calls[0][0]).toBe('https://tavusapi.com/v2/conversations');
-    expect(fetch.mock.calls[0][1].headers['x-api-key']).toBe('test_tavus_key');
-
-    fetch.mockResolvedValueOnce({ ok: true, status: 204, json: async () => ({}) });
-    const ended = await req().post('/api/tavus/conversations/ctest1234/end').send({});
-    expect(ended.status).toBe(200);
-    expect(ended.body).toEqual({ ok: true });
   });
 });
 
@@ -308,54 +275,10 @@ describe('POST /api/tts (removed)', () => {
   });
 });
 
-describe('POST /api/live-token', () => {
-  it('isolates a real-flow voice evaluation from onboarding, history, and personal memory', async () => {
-    fetch.mockResolvedValueOnce({
-      ok: true,
-      status: 200,
-      json: async () => ({
-        run: { id: 'run-evaluation-voice' },
-        case: {
-          kind: 'live_action',
-          title: 'Tester le flow complet dans Limova',
-          prompt: 'Aide-moi à connecter HubSpot.',
-          expectation: { objective: 'Connecter HubSpot', expectedPages: ['/integrations'] }
-        },
-        content: {
-          versionId: 'version-draft-1',
-          title: 'Connecter HubSpot',
-          summary: 'Flow de connexion complet',
-          bodyMarkdown: '## Étapes\n\nOuvrir Intégrations puis connecter HubSpot.',
-          metadata: { expectedPages: ['/integrations'] }
-        }
-      })
-    }).mockResolvedValueOnce({
-      ok: true,
-      status: 200,
-      json: async () => ({ name: 'authTokens/evaluation-voice' })
-    });
+describe('POST /api/live-session', () => {
+  const sdp = 'v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\n';
 
-    const res = await req().post('/api/live-token').send({
-      lang: 'fr',
-      evaluationCode: 'evaluation-code-that-is-long-enough',
-      pageContext: 'Page: Accueil',
-      history: [{ role: 'user', content: 'Secret personnel historique' }]
-    });
-
-    expect(res.status).toBe(200);
-    expect(fetch.mock.calls[0][0]).toContain('/api/evaluations/runs/connect');
-    const body = JSON.parse(fetch.mock.calls[1][1].body);
-    const systemText = body.bidiGenerateContentSetup.systemInstruction.parts[0].text;
-    expect(systemText).toContain('MODE TEST DE FLOW ISOLÉ');
-    expect(systemText).toContain('Connecter HubSpot');
-    expect(systemText).toContain('verify_expected_result');
-    expect(systemText).not.toContain('Secret personnel historique');
-    expect(systemText).not.toContain('Trame de secours');
-    expect(body.bidiGenerateContentSetup.tools[0].functionDeclarations.map(tool => tool.name))
-      .not.toContain('search_knowledge_base');
-  });
-
-  it('creates a one-use constrained Gemini Live token', async () => {
+  it('creates an authenticated GPT Live WebRTC session with DOM tools', async () => {
     fetch.mockResolvedValueOnce({
       ok: true,
       status: 200,
@@ -363,160 +286,93 @@ describe('POST /api/live-token', () => {
         revision: 'onboarding_v7',
         version: 7,
         name: 'Trame E2E',
-        openingPrompt: 'Est-ce qu’il y a un sujet en particulier que tu veux traiter aujourd’hui ?',
-        fallbackPrompt: 'Propose Créer une campagne de prospection LinkedIn ou Créer une campagne de posts pour réseaux sociaux, puis demande ce que l’utilisateur fait dans la vie.',
-        steps: [{ id: 'linkedin', contentItemId: 'content-1', name: 'Prospection LinkedIn', depth: 0, trigger: 'si le membre cherche des clients', optional: false, description: 'Lancer le super-pouvoir LinkedIn.' }]
+        openingPrompt: 'Quel objectif veux-tu atteindre ?',
+        fallbackPrompt: 'Comprends le métier avant de proposer un parcours.',
+        steps: []
       })
     }).mockResolvedValueOnce({
       ok: true,
-      status: 200,
-      json: async () => ({ name: 'authTokens/ephemeral-test' })
+      status: 201,
+      json: async () => ({
+        session: { id: 'live_test' },
+        transport: { type: 'webrtc', sdp: 'v=0\r\na=answer\r\n' }
+      })
     });
-    const res = await req().post('/api/live-token').send({ lang: 'fr', pageContext: 'Page: Accueil' });
-    expect(res.status).toBe(200);
-    expect(res.body.token).toBe('authTokens/ephemeral-test');
-    expect(res.body.model).toBe('gemini-3.1-flash-live-preview');
-    const [url, options] = fetch.mock.calls[1];
-    expect(url).toContain('/v1beta/auth_tokens');
-    const body = JSON.parse(options.body);
-    expect(body.uses).toBe(1);
-    expect(body).not.toHaveProperty('liveConnectConstraints');
-    expect(body.bidiGenerateContentSetup.model).toBe('models/gemini-3.1-flash-live-preview');
-    expect(body.bidiGenerateContentSetup.generationConfig.responseModalities).toEqual(['AUDIO']);
-    expect(body.bidiGenerateContentSetup.generationConfig.speechConfig.voiceConfig.prebuiltVoiceConfig.voiceName).toBe('Kore');
-    expect(body.bidiGenerateContentSetup.systemInstruction.parts[0].text).toContain('accent français métropolitain neutre');
-    expect(body.bidiGenerateContentSetup.systemInstruction.parts[0].text).toContain('ne demande aucune confirmation');
-    expect(body.bidiGenerateContentSetup.systemInstruction.parts[0].text).toContain('carte DOM structurée');
-    expect(body.bidiGenerateContentSetup.systemInstruction.parts[0].text).toContain('Empreintes d’action démontrées');
-    expect(body.bidiGenerateContentSetup.systemInstruction.parts[0].text).toContain('vérifie la route, la modale');
-    expect(body.bidiGenerateContentSetup.systemInstruction.parts[0].text).toContain('ne dis jamais que tu ne vois pas l’écran');
-    expect(body.bidiGenerateContentSetup.systemInstruction.parts[0].text).toContain('pose une seule question de clarification concise');
-    expect(body.bidiGenerateContentSetup.systemInstruction.parts[0].text).toContain('La saisie ne valide et n’envoie jamais le formulaire');
-    expect(body.bidiGenerateContentSetup.systemInstruction.parts[0].text).toContain('Est-ce qu’il y a un sujet en particulier que tu veux traiter aujourd’hui ?');
-    expect(body.bidiGenerateContentSetup.systemInstruction.parts[0].text).toContain('Créer une campagne de prospection LinkedIn');
-    expect(body.bidiGenerateContentSetup.systemInstruction.parts[0].text).toContain('Créer une campagne de posts pour réseaux sociaux');
-    expect(body.bidiGenerateContentSetup.systemInstruction.parts[0].text).toContain('demande ce que l’utilisateur fait dans la vie');
-    expect(body.bidiGenerateContentSetup.systemInstruction.parts[0].text).toContain('TRAME D’ONBOARDING PUBLIÉE');
-    expect(body.bidiGenerateContentSetup.systemInstruction.parts[0].text).toContain('onboarding_v7');
-    expect(body.bidiGenerateContentSetup.systemInstruction.parts[0].text).toContain('Envoyer le message');
-    expect(body.bidiGenerateContentSetup.systemInstruction.parts[0].text).toContain('Ne remplace jamais cette cible par le micro');
-    expect(body.bidiGenerateContentSetup).not.toHaveProperty('sessionResumption');
-    expect(body.bidiGenerateContentSetup.contextWindowCompression).toEqual({ slidingWindow: {} });
-    expect(body.bidiGenerateContentSetup.realtimeInputConfig).toEqual({
-      automaticActivityDetection: {
-        disabled: false,
-        startOfSpeechSensitivity: 'START_SENSITIVITY_LOW',
-        endOfSpeechSensitivity: 'END_SENSITIVITY_LOW',
-        prefixPaddingMs: 160,
-        silenceDurationMs: 1100
-      },
-      activityHandling: 'START_OF_ACTIVITY_INTERRUPTS',
-      turnCoverage: 'TURN_INCLUDES_ONLY_ACTIVITY'
-    });
-    expect(body.bidiGenerateContentSetup.tools[0].functionDeclarations[0].name).toBe('click_element');
-    expect(body.bidiGenerateContentSetup.tools[0].functionDeclarations[0].parameters.required).toEqual([
-      'elementId',
-      'contextVersion',
-      'targetLabel',
-      'explicitRequest'
-    ]);
-    expect(body.bidiGenerateContentSetup.tools[0].functionDeclarations[1].name).toBe('inspect_current_page');
-    expect(body.bidiGenerateContentSetup.tools[0].functionDeclarations[1].description).toContain('métadonnées réseau filtrées');
-    expect(body.bidiGenerateContentSetup.tools[0].functionDeclarations[2].name).toBe('capture_current_view');
-    expect(body.bidiGenerateContentSetup.tools[0].functionDeclarations[3].name).toBe('search_knowledge_base');
-    expect(body.bidiGenerateContentSetup.tools[0].functionDeclarations[3].parameters.required).toEqual(['query']);
-    expect(body.bidiGenerateContentSetup.tools[0].functionDeclarations[4].name).toBe('scroll_page');
-    expect(body.bidiGenerateContentSetup.tools[0].functionDeclarations[4].parameters.required).toEqual(['direction', 'amount', 'contextVersion']);
-    expect(body.bidiGenerateContentSetup.tools[0].functionDeclarations[5].name).toBe('fill_field');
-    expect(body.bidiGenerateContentSetup.tools[0].functionDeclarations[5].parameters.required).toEqual(['elementId', 'contextVersion', 'targetLabel', 'text']);
-    expect(body.bidiGenerateContentSetup.tools[0].functionDeclarations[5].description).toContain('Ne soumet jamais');
-    expect(body.bidiGenerateContentSetup.tools[0].functionDeclarations[6].name).toBe('navigate_internal');
-    expect(body.bidiGenerateContentSetup.tools[0].functionDeclarations[7].name).toBe('verify_expected_result');
-    expect(body.fieldMask.split(',')).toEqual(expect.arrayContaining([
-      'model',
-      'generationConfig.responseModalities',
-      'generationConfig.speechConfig',
-      'realtimeInputConfig',
-      'systemInstruction',
-      'tools'
-    ]));
-  });
 
-  it('creates a tool-free passive token for a trainer demonstration', async () => {
-    fetch.mockResolvedValueOnce({
-      ok: true,
-      status: 200,
-      json: async () => ({ name: 'authTokens/passive-training' })
-    });
-    const res = await req().post('/api/live-token').send({
+    const res = await req().post('/api/live-session').send({
       lang: 'fr',
+      sdp,
+      pageContext: 'Page: Accueil'
+    });
+
+    expect(res.status).toBe(201);
+    expect(res.body).toEqual(expect.objectContaining({
+      id: 'live_test',
+      sdp: 'v=0\r\na=answer\r\n',
+      model: 'gpt-live-1'
+    }));
+    const [url, options] = fetch.mock.calls[1];
+    expect(url).toBe('https://api.openai.com/v1/live/sessions');
+    expect(options.headers.Authorization).toBe('Bearer test_openai_key');
+    expect(options.headers['OpenAI-Safety-Identifier']).toMatch(/^[a-f0-9]{64}$/);
+    const body = JSON.parse(options.body);
+    expect(body.transport).toEqual({ type: 'webrtc', sdp: sdp.trim() });
+    expect(body.session.model).toBe('gpt-live-1');
+    expect(body.session.audio).toEqual({ output: { voice: 'marin' } });
+    expect(body.session.instructions).toContain('pose une seule question courte à la fois');
+    expect(body.session.instructions).toContain('Après un clic');
+    expect(body.session.instructions).toContain('Page: Accueil');
+    expect(body.session.delegation).toMatchObject({
+      type: 'responses',
+      responses: { model: 'gpt-6-luna', tool_choice: 'auto', parallel_tool_calls: false }
+    });
+    expect(body.session.delegation.responses.tools.map(tool => tool.name)).toEqual([
+      'click_element', 'inspect_current_page', 'capture_current_view',
+      'search_knowledge_base', 'scroll_page', 'fill_field',
+      'navigate_internal', 'verify_expected_result'
+    ]);
+  });
+
+  it('keeps trainer transcription passive and tool-free', async () => {
+    fetch.mockResolvedValueOnce({
+      ok: true,
+      status: 201,
+      json: async () => ({
+        session: { id: 'live_training' },
+        transport: { type: 'webrtc', sdp: 'v=0\r\na=answer\r\n' }
+      })
+    });
+    const res = await req().post('/api/live-session').send({
+      lang: 'fr',
+      sdp,
       trainingMode: true,
-      pageContext: 'Page privée à ne pas inclure',
-      history: [{ role: 'user', content: 'Conversation à ne pas inclure' }]
+      pageContext: 'Page privée',
+      history: [{ role: 'user', content: 'Historique privé' }]
     });
-    expect(res.status).toBe(200);
+    expect(res.status).toBe(201);
     const body = JSON.parse(fetch.mock.calls[0][1].body);
-    expect(body.fieldMask.split(',')).not.toContain('tools');
-    expect(body.bidiGenerateContentSetup).not.toHaveProperty('tools');
-    expect(body.bidiGenerateContentSetup.systemInstruction.parts[0].text).toContain('strictement passive');
-    expect(body.bidiGenerateContentSetup.systemInstruction.parts[0].text).not.toContain('Page privée');
-    expect(body.bidiGenerateContentSetup.systemInstruction.parts[0].text).not.toContain('Conversation à ne pas inclure');
+    expect(body.session.delegation).toEqual({ type: 'client' });
+    expect(body.session.instructions).toContain('Reste silencieuse');
+    expect(body.session.instructions).not.toContain('Page privée');
+    expect(body.session.instructions).not.toContain('Historique privé');
   });
 
-  it('forwards up to the 200 most recent messages to a new voice session', async () => {
-    fetch.mockResolvedValueOnce({
-      ok: true,
-      status: 200,
-      json: async () => ({ name: 'authTokens/history-test' })
-    });
-    const history = Array.from({ length: 205 }, (_, index) => ({
-      role: index % 2 === 0 ? 'user' : 'assistant',
-      content: `voice-message-${index}`
-    }));
-
-    const res = await req().post('/api/live-token').send({ lang: 'fr', history });
-
-    expect(res.status).toBe(200);
-    const body = JSON.parse(fetch.mock.calls[0][1].body);
-    const systemText = body.bidiGenerateContentSetup.systemInstruction.parts[0].text;
-    const forwardedMessages = systemText.match(/(?:Utilisateur|Charly): voice-message-\d+/g) || [];
-    expect(forwardedMessages).toHaveLength(200);
-    expect(systemText).not.toContain('voice-message-4\n');
-    expect(systemText).toContain('voice-message-5');
-    expect(systemText).toContain('voice-message-204');
+  it('rejects a missing or invalid SDP offer before calling OpenAI', async () => {
+    const res = await req().post('/api/live-session').send({ lang: 'fr', sdp: 'invalid' });
+    expect(res.status).toBe(400);
+    expect(fetch).not.toHaveBeenCalled();
   });
 
-  it('bounds long voice history while preserving the newest message', async () => {
-    fetch.mockResolvedValueOnce({
-      ok: true,
-      status: 200,
-      json: async () => ({ name: 'authTokens/long-history-test' })
-    });
-    const history = Array.from({ length: 200 }, (_, index) => ({
-      role: 'user',
-      content: `long-message-${index}-${'x'.repeat(1_000)}`
-    }));
-
-    const res = await req().post('/api/live-token').send({ lang: 'fr', history });
-
-    expect(res.status).toBe(200);
-    const body = JSON.parse(fetch.mock.calls[0][1].body);
-    const systemText = body.bidiGenerateContentSetup.systemInstruction.parts[0].text;
-    const recentConversation = systemText.split('Conversation récente:\n')[1];
-    expect(recentConversation.length).toBeLessThanOrEqual(60_000);
-    expect(recentConversation).toContain('long-message-199-');
-    expect(recentConversation).not.toContain('long-message-0-');
-  });
-
-  it('forwards a Gemini token provisioning error without hiding its status', async () => {
+  it('forwards an OpenAI session error without exposing the API key', async () => {
     fetch.mockResolvedValueOnce({
       ok: false,
-      status: 400,
-      json: async () => ({ error: { message: 'Invalid auth token configuration' } })
+      status: 403,
+      json: async () => ({ error: { message: 'Model access denied' } })
     });
-    const res = await req().post('/api/live-token').send({ lang: 'fr' });
-    expect(res.status).toBe(400);
-    expect(res.body.error.message).toBe('Invalid auth token configuration');
+    const res = await req().post('/api/live-session').send({ lang: 'fr', sdp, trainingMode: true });
+    expect(res.status).toBe(403);
+    expect(res.body.error).toBe('Model access denied');
+    expect(JSON.stringify(res.body)).not.toContain('test_openai_key');
   });
 });
 

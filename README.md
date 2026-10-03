@@ -22,7 +22,7 @@ Charly est une extension Chrome (Manifest V3) qui guide les nouveaux utilisateur
 - **Orchestration Google ADK** — sessions texte explicites, outils typés et compacting à 32 000 tokens, avec Gemini exclusivement.
 - **Highlighting** — overlay visuel sur les éléments de la page pour guider l'utilisateur.
 - **Actions contrôlées** — navigation interne sur demande et confirmation obligatoire pour les actions sensibles.
-- **Voix temps réel** — conversation Gemini Live explicitement démarrée, avec interruption naturelle.
+- **Voix temps réel** — conversation GPT Live explicitement démarrée en WebRTC, avec interruption naturelle.
 - **Base de connaissances** — recherche locale TF-IDF dans 106 articles Limova (refresh via `npm run kb:refresh`).
 - **Plan d'onboarding** — 6 étapes structurées pour les nouveaux utilisateurs.
 - **Multilingue** — FR / EN / ES, détection auto + override persisté.
@@ -37,7 +37,7 @@ Charly est une extension Chrome (Manifest V3) qui guide les nouveaux utilisateur
 └─────────────────────┘     └──────────────────┘     └────────────────────┘
 ```
 
-L'extension ne contient **aucune clé API**. Le texte passe par le proxy Express (`proxy/index.js`). Pour réduire la latence vocale, le proxy délivre un jeton Gemini Live à usage unique et la sidebar ouvre ensuite une connexion directe, limitée et éphémère.
+L'extension ne contient **aucune clé API**. Le texte passe par le proxy Express (`proxy/index.js`). Pour la voix, le proxy authentifié négocie une session GPT Live WebRTC sans exposer la clé OpenAI au navigateur ; l’audio et les événements transitent ensuite sur la connexion éphémère.
 
 Voir [`ARCHITECTURE.md`](./ARCHITECTURE.md) pour le détail des flux de messages entre service worker, content script, sidebar, proxy.
 

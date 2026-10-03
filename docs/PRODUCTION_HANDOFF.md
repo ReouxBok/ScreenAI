@@ -4,7 +4,7 @@
 
 - Le backend de production publie `POST /extension/token` et `GET /.well-known/jwks.json` depuis le merge `fcece8a` de la PR `Limova-2-0/api#1639`.
 - Le JWKS répond `200` avec une seule clé RSA `RS256` publique (`kid: limova-extension-2026-07`) et aucune composante privée.
-- Le proxy Heroku `limova-proxy` exécute la release `v16`. `/api/gemini` et `/api/live-token` répondent `401` sans JWT, une origine non autorisée reçoit `403` et `/healthz` répond `200`.
+- Le proxy Heroku `limova-proxy` expose `/api/gemini` pour le texte et `/api/live-session` pour négocier GPT Live en WebRTC. Ces routes répondent `401` sans session Charly, une origine non autorisée reçoit `403` et `/healthz` répond `200`.
 - La chaîne de confiance production a été testée avec un JWT `RS256` éphémère signé par la clé Render : le proxy charge le JWKS enveloppé par l’API, accepte la signature/issuer/audience et poursuit jusqu’à la validation du payload.
 - L’extension utilise `https://api.new.limova.ai/extension/token` dans le contexte de la page connectée et accepte l’enveloppe standard de l’API.
 - Le ZIP final est produit par le build validant explicitement `src/sidebar/sidebar.html`; le test d’installation visuel dans Chrome reste le dernier contrôle manuel avant téléversement CWS.

@@ -20,7 +20,6 @@ const elements = {
   sendBtn: document.getElementById('sendBtn'),
   screenshotBtn: document.getElementById('screenshotBtn'),
   voiceBtn: document.getElementById('voiceBtn'),
-  videoBtn: document.getElementById('videoBtn'),
   downloadLogsBtn: document.getElementById('downloadLogsBtn'),
   diagnoseBtn: document.getElementById('diagnoseBtn'),
   diagnosticResult: document.getElementById('diagnosticResult'),
@@ -99,7 +98,6 @@ function initEventListeners() {
   elements.sendBtn.addEventListener('click', sendMessage);
   elements.screenshotBtn.addEventListener('click', analyzePage);
   elements.voiceBtn.addEventListener('click', toggleVoice);
-  elements.videoBtn?.addEventListener('click', startVideoCall);
   elements.authEmailForm?.addEventListener('submit', requestAuthenticationCode);
   elements.authCodeForm?.addEventListener('submit', verifyAuthenticationCode);
   elements.authBack?.addEventListener('click', resetAuthenticationForm);
@@ -1091,12 +1089,6 @@ async function toggleVoice() {
   try {
     await voiceSession.start();
   } catch (_) {}
-}
-
-async function startVideoCall() {
-  if (!(await ensureAIConsent())) return;
-  const result = await chrome.runtime.sendMessage({ type: 'OPEN_TAVUS_VIDEO' }).catch(() => null);
-  if (!result?.ok) addMessage('error', result?.error || t('videoError'));
 }
 
 function updateVoiceStatus({ status, error, errorKey }) {

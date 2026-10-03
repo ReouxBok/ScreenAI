@@ -607,35 +607,8 @@ async function handleMessage(request, sender) {
     case 'CANCEL_ACTION':
       return cancelPendingAction(request.actionId);
 
-    case 'GET_LIVE_TOKEN':
-      return getLiveToken(request.context || {});
-
-    case 'OPEN_TAVUS_VIDEO': {
-      if (!(await hasAIProcessingConsent())) return { ok: false, consentRequired: true };
-      await chrome.windows.create({
-        url: chrome.runtime.getURL('src/video/video.html'),
-        type: 'popup', width: 520, height: 760, focused: true
-      });
-      return { ok: true };
-    }
-
-    case 'START_TAVUS_CONVERSATION': {
-      if (!(await hasAIProcessingConsent())) return { ok: false, consentRequired: true };
-      const context = await getFreshVoiceContext();
-      const response = await authorizedProxyFetch('/api/tavus/conversations', {
-        method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ pageContext: context.pageContext, testMode: request.testMode === true })
-      });
-      const data = await response.json().catch(() => ({}));
-      if (!response.ok) throw codedError('TAVUS_START_FAILED', data.error || 'La vidéo Charly est indisponible.');
-      return { ok: true, ...data };
-    }
-
-    case 'END_TAVUS_CONVERSATION': {
-      const conversationId = String(request.conversationId || '');
-      const response = await authorizedProxyFetch(`/api/tavus/conversations/${encodeURIComponent(conversationId)}/end`, { method: 'POST' });
-      return { ok: response.ok };
-    }
+    case 'GET_LIVE_SESSION':
+      return getLiveSession(request.context || {});
 
     case 'VOICE_CONTEXT_REQUEST':
       return runEvaluatedVoiceTool(
@@ -1313,7 +1286,7 @@ async function handleTakeScreenshot() {
   const operationId = Logger.createOperationId('analysis');
 
   // The camera button is also useful during a Live conversation, but it must
-  // never start the legacy text orchestrator in parallel with Gemini Live.
+  // Never start the text orchestrator in parallel with an active GPT Live session.
   // In voice mode it only refreshes the current DOM + ephemeral screenshot.
   if (voiceSessionActive) {
     try {
@@ -3031,7 +3004,7 @@ async function authorizedProxyFetch(path, options = {}, retry = true) {
   let response;
   const controller = new AbortController();
   let timedOut = false;
-  const timeoutMs = path === '/api/live-token' ? 15_000 : 35_000;
+  const timeoutMs = path === '/api/live-session' ? 25_000 : 35_000;
   const timeout = setTimeout(() => {
     timedOut = true;
     controller.abort();
@@ -3157,21 +3130,24 @@ async function persistVoiceTranscript(role, content) {
   }
 }
 
-async function getLiveToken(context) {
+async function getLiveSession(context) {
   if (!(await hasAIProcessingConsent())) return { ok: false, consentRequired: true };
   const operationId = Logger.createOperationId('voice-token');
-  Logger.event('voice', 'LIVE_TOKEN_REQUEST_STARTED', null, operationId);
+  Logger.event('voice', 'LIVE_SESSION_REQUEST_STARTED', null, operationId);
   const trainingMode = context?.trainingMode === true && trainingState.active;
   const evaluationMode = evaluationState.active && Boolean(evaluationState.token);
   const sessionId = trainingMode || evaluationMode ? null : await ensureRemoteCopilotSession();
   const freshContext = trainingMode
     ? { pageContext: '', contextVersion: pageContextVersion }
     : await getFreshVoiceContext(operationId);
-  const response = await authorizedProxyFetch('/api/live-token', {
+  const sdp = typeof context?.sdp === 'string' ? context.sdp : '';
+  if (!sdp.startsWith('v=0')) throw codedError('LIVE_SESSION_SDP_INVALID', 'La connexion vocale WebRTC est invalide.');
+  const response = await authorizedProxyFetch('/api/live-session', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
       lang: currentLang,
+      sdp,
       trainingMode,
       ...(evaluationMode ? { evaluationCode: evaluationState.token } : {}),
       ...(sessionId ? { sessionId } : {}),
@@ -3185,12 +3161,12 @@ async function getLiveToken(context) {
   });
   const data = await response.json().catch(() => ({}));
   if (!response.ok) {
-    const code = response.status === 429 ? 'LIVE_TOKEN_RATE_LIMITED' : response.status >= 500 ? 'LIVE_TOKEN_SERVICE_FAILED' : `LIVE_TOKEN_HTTP_${response.status}`;
+    const code = response.status === 429 ? 'LIVE_SESSION_RATE_LIMITED' : response.status >= 500 ? 'LIVE_SESSION_SERVICE_FAILED' : `LIVE_SESSION_HTTP_${response.status}`;
     const error = codedError(code, data.error?.message || data.error || 'Session vocale indisponible.');
     Logger.error('voice', 'Live token request failed', error, code, operationId);
     throw error;
   }
-  Logger.event('voice', 'LIVE_TOKEN_REQUEST_SUCCEEDED', { model: data.model || 'unknown' }, operationId);
+  Logger.event('voice', 'LIVE_SESSION_REQUEST_SUCCEEDED', { model: data.model || 'unknown' }, operationId);
   return {
     ok: true,
     ...data,

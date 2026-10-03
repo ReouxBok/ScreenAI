@@ -7,9 +7,9 @@ Page Limova ── DOM filtré / action ID ──► service worker ── sessi
      ▲                                      │                               │
      └──── observation / clic validé ───────┘                               ├─ Google ADK / Gemini 3.6 Flash
                                                                             ├─ mémoire chiffrée Neon
-                                                                            └─ jeton Gemini Live éphémère
+                                                                            └─ session GPT Live WebRTC
 Sidebar ── consentement / chat / micro ──► service worker
-Sidebar ── audio WebSocket avec jeton contraint ───────────────────────────► Gemini Live
+Sidebar ── audio WebRTC + canal d’outils ──────────────────────────────────► GPT Live
 ```
 
 ## Analyse de page
@@ -24,7 +24,7 @@ Le membre s’authentifie auprès de Charly par OTP Resend. Le proxy vérifie qu
 
 Le texte utilise un `Runner` Google ADK avec `CharlySessionService`, `CharlyMemoryService`, sept outils typés et un `TokenBasedContextCompactor` à 32 000 tokens conservant 24 événements récents. L’extension ne fournit plus de prompt système au protocole v2. Le déploiement est commandé par `ADK_TEXT_MODE=off|shadow|canary|on` et `ADK_CANARY_PERCENT`; `/api/gemini` reste le fallback pendant la transition.
 
-Pour la voix, le proxy crée un jeton Gemini Live à usage unique, contraint au modèle `gemini-3.1-flash-live-preview`, à l’audio et à une expiration courte. La sidebar ouvre ensuite un WebSocket direct. Le texte et la voix utilisent le même `sessionId` et la même mémoire, mais le runtime Live reste direct tant que le runtime JavaScript ADK Live n’est pas retenu.
+Pour la voix, la sidebar ouvre une connexion WebRTC et transmet son offre SDP au proxy authentifié. Le proxy crée une session `gpt-live-1` auprès d’OpenAI sans exposer la clé API au navigateur, puis renvoie uniquement la réponse SDP. L’audio circule sur les pistes WebRTC et les événements, transcriptions et appels d’outils DOM passent par le canal de données `oai-events`. Le texte et la voix utilisent le même `sessionId` et la même mémoire.
 
 ## Actions contrôlées
 

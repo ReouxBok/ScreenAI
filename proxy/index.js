@@ -10,9 +10,11 @@ const { loadPromptBundle } = require('./copilot/prompt');
 const app = express();
 const PORT = process.env.PORT || 3000;
 const GEMINI_API_KEY = process.env.EXTENSION_GEMINI_API_KEY;
+const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 const ALLOWED_EXTENSION_ID = process.env.ALLOWED_EXTENSION_ID;
 const GEMINI_MODEL = 'gemini-3.6-flash';
-const LIVE_MODEL = 'gemini-3.1-flash-live-preview';
+const LIVE_MODEL = 'gpt-live-1';
+const LIVE_BACKEND_MODEL = process.env.OPENAI_LIVE_BACKEND_MODEL || 'gpt-6-luna';
 const CONVERSATION_HISTORY_MAX_MESSAGES = 200;
 const CONVERSATION_CONTEXT_MAX_CHARACTERS = 60_000;
 const CONVERSATION_MESSAGE_MAX_CHARACTERS = 8_000;
@@ -35,16 +37,12 @@ const LIMOVA_API_URL = String(process.env.LIMOVA_API_URL || 'https://api.new.lim
 const RESEND_API_KEY = process.env.RESEND_API_KEY;
 const RESEND_FROM_EMAIL = process.env.RESEND_FROM_EMAIL;
 const CHARLY_SESSION_SECRET = process.env.CHARLY_SESSION_SECRET;
-const TAVUS_API_KEY = process.env.TAVUS_API_KEY;
-const TAVUS_PAL_ID = process.env.TAVUS_PAL_ID;
-const TAVUS_API_URL = 'https://tavusapi.com/v2';
 const OTP_TTL_MS = 10 * 60_000;
 const SESSION_TTL_MS = 30 * 24 * 60 * 60_000;
 const ACTIVE_USER_CACHE_MS = 5 * 60_000;
 let onboardingTemplateCache = null;
 let onboardingTemplateCacheExpiresAt = 0;
 const memoryContextCache = new Map();
-const tavusConversationOwners = new Map();
 const PROMPT_BUNDLE = loadPromptBundle(path.join(__dirname, 'prompts'));
 const SERVER_PROMPT = PROMPT_BUNDLE.content;
 
@@ -407,79 +405,6 @@ app.post('/api/auth/verify-otp', otpVerifyLimiter, async (req, res) => {
 app.get('/api/auth/session', verifyAssistantAuth, (req, res) => {
   res.set('Cache-Control', 'no-store');
   return res.json({ authenticated: true, userId: req.auth.sub, provider: req.auth.provider });
-});
-
-function tavusAvailable() {
-  return Boolean(TAVUS_API_KEY && TAVUS_PAL_ID);
-}
-
-async function tavusRequest(pathname, options = {}) {
-  const response = await fetch(`${TAVUS_API_URL}${pathname}`, {
-    ...options,
-    headers: {
-      'Content-Type': 'application/json',
-      'x-api-key': TAVUS_API_KEY,
-      ...(options.headers || {})
-    },
-    signal: AbortSignal.timeout(20_000)
-  });
-  const data = response.status === 204 ? {} : await response.json().catch(() => ({}));
-  if (!response.ok) {
-    const error = new Error('TAVUS_REQUEST_FAILED');
-    error.status = response.status;
-    error.details = data;
-    throw error;
-  }
-  return data;
-}
-
-app.post('/api/tavus/conversations', verifyAssistantAuth, assistantLimiter, async (req, res) => {
-  res.set('Cache-Control', 'no-store');
-  if (!tavusAvailable()) return res.status(503).json({ error: 'Tavus video is not configured' });
-  const requestId = crypto.randomUUID();
-  const pageContext = typeof req.body?.pageContext === 'string'
-    ? req.body.pageContext.replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f]/g, '').slice(0, 12_000)
-    : '';
-  try {
-    const data = await tavusRequest('/conversations', {
-      method: 'POST',
-      body: JSON.stringify({
-        pal_id: TAVUS_PAL_ID,
-        conversation_name: 'Onboarding Limova avec Charly',
-        conversational_context: pageContext
-          ? `L'utilisateur est actuellement sur Limova. Voici une carte DOM filtrée de la page au début de l'appel. N'invente aucun élément absent de cette carte.\n\n${pageContext}`
-          : "L'utilisateur souhaite être accompagné dans son onboarding Limova.",
-        custom_greeting: "Bonjour, je suis Charly, l'assistant IA de Limova. Dites-moi ce que vous souhaitez faire et nous avancerons ensemble.",
-        properties: { languages: ['fr'] },
-        test_mode: req.body?.testMode === true
-      })
-    });
-    if (typeof data.conversation_id !== 'string') throw new Error('TAVUS_INVALID_RESPONSE');
-    if (data.status === 'active') tavusConversationOwners.set(data.conversation_id, req.auth.sub);
-    console.info(JSON.stringify({ type: 'tavus_conversation_created', requestId, conversationId: data.conversation_id, testMode: req.body?.testMode === true }));
-    return res.json({
-      conversationId: data.conversation_id,
-      conversationUrl: data.conversation_url,
-      status: data.status
-    });
-  } catch (error) {
-    console.error(JSON.stringify({ type: 'tavus_conversation_error', requestId, code: technicalErrorCode(error) }));
-    return res.status(error.status >= 400 && error.status < 500 ? error.status : 502).json({ error: 'Tavus video is unavailable', requestId });
-  }
-});
-
-app.post('/api/tavus/conversations/:conversationId/end', verifyAssistantAuth, assistantLimiter, async (req, res) => {
-  res.set('Cache-Control', 'no-store');
-  const conversationId = String(req.params.conversationId || '');
-  if (!/^c[a-zA-Z0-9_-]{4,100}$/.test(conversationId)) return res.status(400).json({ error: 'Invalid conversation' });
-  if (tavusConversationOwners.get(conversationId) !== req.auth.sub) return res.status(404).json({ error: 'Conversation not found' });
-  try {
-    await tavusRequest(`/conversations/${conversationId}/end`, { method: 'POST' });
-    tavusConversationOwners.delete(conversationId);
-    return res.json({ ok: true });
-  } catch (error) {
-    return res.status(error.status === 404 ? 404 : 502).json({ error: 'Unable to end Tavus conversation' });
-  }
 });
 
 function memoryAvailable() {
@@ -974,8 +899,62 @@ async function handleCopilotTurn(req, res) {
 app.post('/api/gemini', verifyAssistantAuth, assistantLimiter, handleCopilotTurn);
 app.post('/api/copilot/turn', verifyAssistantAuth, assistantLimiter, handleCopilotTurn);
 
-app.post('/api/live-token', verifyAssistantAuth, assistantLimiter, async (req, res) => {
+function openAiLiveTools(evaluationMode) {
+  const tool = (name, description, properties = {}, required = []) => ({
+    type: 'function',
+    name,
+    description,
+    parameters: {
+      type: 'object',
+      properties,
+      ...(required.length ? { required } : {}),
+      additionalProperties: false
+    }
+  });
+  const elementId = { type: 'integer', description: 'Identifiant numérique visible dans la carte DOM courante.' };
+  const contextVersion = { type: 'integer', description: 'Version exacte de la carte DOM courante.' };
+  const targetLabel = { type: 'string', description: 'Libellé accessible exact de la cible.' };
+  return [
+    tool('click_element', 'Clique un élément sûr et visible de la carte DOM courante. N’annonce jamais la réussite avant le résultat vérifié.', {
+      elementId, contextVersion, targetLabel,
+      explicitRequest: { type: 'boolean', description: 'Vrai uniquement si le tour utilisateur demande explicitement cette action.' }
+    }, ['elementId', 'contextVersion', 'targetLabel', 'explicitRequest']),
+    tool('inspect_current_page', 'Relit immédiatement la page Limova et renvoie son état DOM actuel. À utiliser avant une action et après tout changement possible.'),
+    tool('capture_current_view', 'Prend une capture temporaire masquée pour lever une ambiguïté visuelle.', {
+      reason: { type: 'string' }
+    }, ['reason']),
+    ...(!evaluationMode ? [tool('search_knowledge_base', 'Recherche la documentation Limova pertinente.', {
+      query: { type: 'string' }
+    }, ['query'])] : []),
+    tool('scroll_page', 'Fait défiler la page, puis impose une nouvelle inspection avant toute action.', {
+      direction: { type: 'string', enum: ['up', 'down', 'top', 'bottom'] },
+      amount: { type: 'string', enum: ['small', 'medium', 'large'] },
+      contextVersion,
+      elementId
+    }, ['direction', 'amount', 'contextVersion']),
+    tool('fill_field', 'Saisit le texte exact dans un champ non sensible sans soumettre le formulaire.', {
+      elementId, contextVersion, targetLabel,
+      text: { type: 'string', maxLength: 4000 }
+    }, ['elementId', 'contextVersion', 'targetLabel', 'text']),
+    tool('navigate_internal', 'Navigue dans Limova en activant un élément DOM courant, jamais une URL arbitraire.', {
+      elementId, contextVersion, targetLabel
+    }, ['elementId', 'contextVersion', 'targetLabel']),
+    tool('verify_expected_result', 'Relit la page après une action et vérifie le résultat attendu avant toute confirmation orale.', {
+      expectation: { type: 'string' },
+      contextVersion
+    }, ['expectation', 'contextVersion'])
+  ];
+}
+
+app.post('/api/live-session', verifyAssistantAuth, assistantLimiter, async (req, res) => {
+  res.set('Cache-Control', 'no-store');
   const requestId = crypto.randomUUID();
+  if (!OPENAI_API_KEY) return res.status(503).json({ error: 'OpenAI voice is not configured', requestId });
+  const sdp = typeof req.body?.sdp === 'string' ? req.body.sdp.trim() : '';
+  if (!sdp || sdp.length > 100_000 || !sdp.startsWith('v=0')) {
+    return res.status(400).json({ error: 'A valid SDP offer is required', requestId });
+  }
+
   const lang = ['fr', 'en', 'es'].includes(req.body?.lang) ? req.body.lang : 'fr';
   const trainingMode = req.body?.trainingMode === true;
   const evaluationCode = typeof req.body?.evaluationCode === 'string' ? req.body.evaluationCode.trim() : '';
@@ -986,184 +965,95 @@ app.post('/api/live-token', verifyAssistantAuth, assistantLimiter, async (req, r
   const history = trainingMode || evaluationMode ? '' : formatConversationHistory(req.body?.history);
   const onboardingTemplate = trainingMode || evaluationMode ? null : await fetchPublishedOnboardingTemplate(requestId);
   const onboardingTemplateText = formatOnboardingTemplate(onboardingTemplate);
-  const lastUserMessage = trainingMode || evaluationMode ? '' : [...(Array.isArray(req.body?.history) ? req.body.history : [])].reverse().find(item => item?.role === 'user')?.content || '';
-  const liveSessionId = typeof req.body?.sessionId === 'string' && /^[0-9a-f-]{36}$/i.test(req.body.sessionId) ? req.body.sessionId : undefined;
-  const personalContext = trainingMode || evaluationMode ? null : await getMemoryContext(req.auth.memoryUserKey, lastUserMessage, requestId, liveSessionId);
-  const now = Date.now();
-  const expireTime = new Date(now + 30 * 60_000).toISOString();
-  const newSessionExpireTime = new Date(now + 2 * 60_000).toISOString();
+  const lastUserMessage = trainingMode || evaluationMode ? '' : [...(Array.isArray(req.body?.history) ? req.body.history : [])]
+    .reverse().find(item => item?.role === 'user')?.content || '';
+  const liveSessionId = typeof req.body?.sessionId === 'string' && /^[0-9a-f-]{36}$/i.test(req.body.sessionId)
+    ? req.body.sessionId
+    : undefined;
+  const personalContext = trainingMode || evaluationMode
+    ? null
+    : await getMemoryContext(req.auth.memoryUserKey, lastUserMessage, requestId, liveSessionId);
+
   const languageInstruction = lang === 'fr'
-    ? 'Parle exclusivement en français de France, avec un accent français métropolitain neutre. N’utilise jamais d’accent québécois ou canadien et ne change jamais de langue, même si la reconnaissance audio hésite. Si un passage est incompréhensible, demande simplement à l’utilisateur de répéter.'
+    ? 'Parle exclusivement en français de France, avec un accent français métropolitain neutre.'
     : lang === 'es'
-      ? 'Habla exclusivamente en español neutro. No cambies nunca de idioma. Si un fragmento no se entiende, pide al usuario que lo repita.'
-      : 'Speak exclusively in neutral English. Never switch languages. If speech is unclear, ask the user to repeat it.';
+      ? 'Habla exclusivamente en español neutro.'
+      : 'Speak exclusively in neutral English.';
+  const discoveryInstruction = [
+    'Avant de conseiller ou d’agir, comprends ce que l’utilisateur cherche réellement à accomplir.',
+    'S’il manque du contexte utile, pose une seule question courte à la fois. Priorise dans cet ordre : objectif concret, rôle ou activité, méthode actuelle, résultat attendu, contrainte principale.',
+    'Ne redemande jamais une information déjà donnée ou visible. Dès que le but et les contraintes sont suffisants, arrête les questions et guide l’utilisateur.',
+    'Reformule brièvement l’objectif avant la première action pour vérifier que tu as bien compris.'
+  ].join(' ');
+  const actionInstruction = [
+    'Pour toute action DOM : inspecte la page juste avant, utilise uniquement un identifiant de la version courante, puis attends le résultat de l’outil.',
+    'Après un clic, relis la page jusqu’à obtenir un état stable et appelle verify_expected_result avant d’annoncer la réussite.',
+    'Si la route, une modale ou le DOM ne change pas comme prévu, dis que le résultat n’est pas confirmé et tente au maximum une récupération avec un contexte frais.',
+    'Ne meuble pas le temps d’exécution avec une fausse confirmation : dis simplement que tu vérifies.'
+  ].join(' ');
+
   const assistantSystemText = [
     SERVER_PROMPT,
-    `Tu es Charly, l'assistante dédiée à l'onboarding Limova. Tu accompagnes l'utilisateur sur toute la plateforme, réponds à ses questions produit, l'aides à trouver la bonne page et peux y agir avec les outils autorisés. Réponds avec précision et concision. ${languageInstruction}`,
+    `Tu es Charly, l'assistante dédiée à l'onboarding Limova. Tu peux comprendre, expliquer et piloter la page avec les outils autorisés. Réponds avec précision et concision. ${languageInstruction}`,
+    discoveryInstruction,
+    actionInstruction,
+    evaluationMode ? '' : onboardingTemplateText || 'Si aucun objectif précis n’a été exprimé, commence par demander ce que l’utilisateur veut accomplir aujourd’hui. Pose une seule question par tour.',
+    'La carte DOM la plus récente est la seule source fiable pour les éléments visibles. N’invente jamais un contrôle, un état, un identifiant ou le succès d’une action.',
+    'Appelle inspect_current_page avant toute observation de l’écran et après une navigation. Une source user_click, user_input ou user_scroll signifie que l’utilisateur a déjà agi : ne répète pas son geste.',
     evaluationMode
-      ? ''
-      : onboardingTemplateText || 'Trame de secours : pour démarrer, vérifie si l’utilisateur a déjà exprimé un objectif précis. Si oui, aide-le directement. Sinon, demande uniquement : « Est-ce qu’il y a un sujet en particulier que tu veux traiter aujourd’hui ? ». S’il n’a pas d’idée, propose la prospection LinkedIn ou la création de posts pour réseaux sociaux, puis adapte la suite à son métier. Pose une seule question par tour.',
-    'Tu peux inspecter et piloter la page Limova grâce à une carte DOM structurée : URL, titres, éléments visibles et cliquables avec identifiants, états, modales, erreurs et métadonnées réseau récentes filtrées. Tu peux aussi recevoir une capture visuelle temporaire de la zone visible : les pastilles #N correspondent aux identifiants DOM et les valeurs de formulaires sont masquées. Utilise l’image pour comprendre la disposition et les contrôles graphiques, jamais pour deviner une valeur ou cliquer par coordonnées. Toute action doit utiliser un identifiant de la carte DOM actuelle ; ne dis jamais que tu ne vois pas l’écran ou que tu ne peux pas naviguer.',
-    'Appelle inspect_current_page avant de répondre à toute question sur ce qui est affiché, après une navigation ou dès que le contexte peut avoir changé. Utilise exclusivement les identifiants de la carte DOM la plus récente. Une MISE À JOUR TECHNIQUE SILENCIEUSE remplace l’ancien contexte de page : assimile-la sans y répondre seule et considère sa version DOM comme la nouvelle référence. Une source user_click, user_input ou user_scroll signifie que l’utilisateur a déjà agi : ne répète pas son action. Utilise scroll_page pour découvrir les contrôles hors écran, puis inspecte de nouveau la page.',
-    evaluationMode
-      ? 'Pendant ce test, le brouillon isolé est l’unique source produit. N’appelle pas la base de connaissances publiée.'
-      : 'Pour une question sur le fonctionnement de Limova, une procédure, une intégration ou une fonctionnalité qui n’est pas explicitement expliquée dans le DOM, appelle search_knowledge_base. Combine la documentation retournée avec le DOM courant, sans inventer ce qui manque.',
-    'Les parcours peuvent contenir des « Empreintes d’action démontrées » : nom accessible, rôle, section, test-id/id stable, destination et résultat attendu. Utilise plusieurs de ces signaux pour retrouver une cible unique dans la carte DOM ACTUELLE, mais n’utilise jamais un ancien identifiant numérique ni un sélecteur brut. Si plusieurs contrôles restent plausibles, relis la page puis demande une clarification au lieu de deviner. Après chaque clic, appelle inspect_current_page et vérifie la route, la modale, les marqueurs visibles et les effets réseau attendus avant de poursuivre.',
-    'Si une action est rejetée avec retryWithFreshContext, l’extension a automatiquement repris la carte DOM et une capture visuelle. Réévalue la cible avec ces deux sources et réessaie au maximum une fois. Si elle reste ambiguë ou absente, pose une seule question de clarification concise.',
-    'Pour écrire à la place de l’utilisateur, appelle type_text_into_page uniquement si son intention désigne sans ambiguïté un seul champ non sensible et si le texte exact à saisir est connu. Si plusieurs champs conviennent, si la cible est incertaine ou si une valeur manque, n’appelle aucun outil et pose une seule question de clarification concise. N’invente jamais une donnée personnelle. La saisie ne valide et n’envoie jamais le formulaire.',
-    'Si l’utilisateur demande explicitement une action sûre sur la page, appelle request_page_action avec l’ID exact présent dans la carte DOM la plus récente. Un lien de navigation interne visible peut être une étape intermédiaire sûre même si son libellé diffère du but final — par exemple « connecter Gmail » commence par « Intégrations » — à condition de nommer cette étape dans ta réponse ; cette exception ne vaut jamais pour un bouton final, un formulaire ou un lien externe. « Fais-le », « vas-y », « go ahead » ou « hazlo » constituent une demande explicite uniquement si ton tour précédent nommait une cible unique encore présente dans la carte DOM ; sinon demande quel contrôle utiliser. Une carte d’intégration libellée « Connecter [nom] » est une cible préparatoire sûre : sélectionne celle dont le nom correspond exactement à la demande. Pour envoyer un message, n’agis que si la carte DOM contient exactement « Envoyer le message » et que l’utilisateur vient de demander explicitement l’envoi, directement ou par cette reprise non ambiguë. Ne remplace jamais cette cible par le micro, la pièce jointe ou un autre bouton ; si elle manque, relis la page puis demande une clarification. L’extension affichera un curseur et cliquera automatiquement : ne demande aucune confirmation et ne parle jamais de notification à valider. Après le résultat de l’outil, continue à partir de la nouvelle carte DOM et indique clairement si le clic a réussi.',
-    evaluationMode ? `MODE TEST DE FLOW ISOLÉ. Exécute un seul parcours continu de bout en bout à partir du brouillon ci-dessous. Ce brouillon remplace la base publiée pour ce test. Comprends l’objectif, demande une précision uniquement si une donnée réellement nécessaire manque, agis avec les outils sur chaque étape, puis appelle verify_expected_result avant d’annoncer la réussite. N’utilise aucune mémoire personnelle et ne transforme rien de ce test en souvenir.\n${evaluationContext.context}` : '',
-    pageContext ? `Contexte DOM privé de la page:\n${pageContext}` : '',
-    history ? `Conversation récente:\n${history}` : ''
-    ,memoryPrompt(personalContext)
+      ? 'Pendant ce test, le brouillon isolé est l’unique source produit.'
+      : 'Pour les explications produit absentes du DOM, appelle search_knowledge_base.',
+    'Une action finale ou sensible exige une demande explicite. Ne saisis jamais de mot de passe, OTP, paiement ou secret. La saisie de texte ne soumet jamais le formulaire.',
+    evaluationMode ? `MODE TEST DE FLOW ISOLÉ. Exécute le parcours et vérifie son résultat.\n${evaluationContext.context}` : '',
+    pageContext ? `Contexte DOM privé initial :\n${pageContext}` : '',
+    history ? `Conversation récente :\n${history}` : '',
+    memoryPrompt(personalContext)
   ].filter(Boolean).join('\n\n');
-  const systemText = trainingMode
-    ? `Mode transcription de démonstration Limova. Écoute et transcris fidèlement les explications du formateur en ${lang === 'fr' ? 'français' : lang === 'es' ? 'espagnol' : 'anglais'}. Tu es strictement passive : ne réponds jamais, ne produis aucun commentaire, ne suggère rien, ne navigue pas et n’appelle aucun outil.`
+
+  const instructions = trainingMode
+    ? `Mode transcription de démonstration Limova. Transcris fidèlement en ${lang === 'fr' ? 'français' : lang === 'es' ? 'espagnol' : 'anglais'}. Reste silencieuse et n’appelle aucun outil.`
     : assistantSystemText;
 
   try {
-    const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/auth_tokens?key=${GEMINI_API_KEY}`, {
+    const upstream = await fetch('https://api.openai.com/v1/live/sessions', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: {
+        Authorization: `Bearer ${OPENAI_API_KEY}`,
+        'Content-Type': 'application/json',
+        'OpenAI-Safety-Identifier': crypto.createHash('sha256').update(String(req.auth.sub)).digest('hex')
+      },
       body: JSON.stringify({
-        uses: 1,
-        expireTime,
-        newSessionExpireTime,
-        // AuthToken v1beta uses BidiGenerateContentSetup. The former
-        // liveConnectConstraints field is rejected by the provisioning API.
-        // Keep sessionResumption outside the mask so the client can supply a
-        // fresh handle when reconnecting; all other capabilities stay locked.
-        fieldMask: [
-          'model',
-          'generationConfig.responseModalities',
-          'generationConfig.speechConfig',
-          'inputAudioTranscription',
-          'outputAudioTranscription',
-          'realtimeInputConfig',
-          'contextWindowCompression',
-          'systemInstruction',
-          ...(!trainingMode ? ['tools'] : [])
-        ].join(','),
-        bidiGenerateContentSetup: {
-          model: `models/${LIVE_MODEL}`,
-          generationConfig: {
-            responseModalities: ['AUDIO'],
-            speechConfig: { voiceConfig: { prebuiltVoiceConfig: { voiceName: 'Kore' } } }
-          },
-          inputAudioTranscription: {},
-          outputAudioTranscription: {},
-          realtimeInputConfig: {
-            automaticActivityDetection: {
-              disabled: false,
-              startOfSpeechSensitivity: 'START_SENSITIVITY_LOW',
-              endOfSpeechSensitivity: 'END_SENSITIVITY_LOW',
-              prefixPaddingMs: 160,
-              silenceDurationMs: 1_100
-            },
-            activityHandling: 'START_OF_ACTIVITY_INTERRUPTS',
-            turnCoverage: 'TURN_INCLUDES_ONLY_ACTIVITY'
-          },
-          contextWindowCompression: { slidingWindow: {} },
-          systemInstruction: { parts: [{ text: systemText }] },
-          ...(!trainingMode ? { tools: [{
-            functionDeclarations: [{
-              name: 'click_element',
-              description: 'Clique un élément sûr et visible identifié dans la carte DOM courante. Pour envoyer, utiliser uniquement l’élément exactement libellé « Envoyer le message » après une demande explicite. Les cibles incohérentes et actions sensibles sont refusées localement.',
-              parameters: {
-                type: 'OBJECT',
-                properties: {
-                  elementId: { type: 'INTEGER', description: 'Identifiant numérique visible dans le contexte DOM.' },
-                  contextVersion: { type: 'INTEGER', description: 'Version de la carte DOM.' },
-                  targetLabel: { type: 'STRING', description: 'Libellé exact de la cible.' },
-                  explicitRequest: { type: 'BOOLEAN', description: 'Vrai uniquement si le tour utilisateur demande explicitement cette action.' }
-                },
-                required: ['elementId', 'contextVersion', 'targetLabel', 'explicitRequest']
+        session: {
+          model: LIVE_MODEL,
+          instructions,
+          audio: { output: { voice: 'marin' } },
+          ...(!trainingMode ? {
+            delegation: {
+              type: 'responses',
+              responses: {
+                model: LIVE_BACKEND_MODEL,
+                instructions: assistantSystemText,
+                tools: openAiLiveTools(evaluationMode),
+                tool_choice: 'auto',
+                parallel_tool_calls: false
               }
-            }, {
-              name: 'inspect_current_page',
-              description: 'Relit immédiatement la page Limova active et renvoie sa carte DOM, ses éléments actionnables, ses modales, ses erreurs et ses métadonnées réseau filtrées. À appeler avant toute observation ou après navigation.',
-              parameters: {
-                type: 'OBJECT',
-                properties: {}
-              }
-            }, {
-              name: 'capture_current_view',
-              description: 'Prend silencieusement une capture temporaire masquée uniquement pour récupérer après une cible introuvable, ambiguë ou un résultat inattendu.',
-              parameters: {
-                type: 'OBJECT',
-                properties: { reason: { type: 'STRING' } },
-                required: ['reason']
-              }
-            }, ...(!evaluationMode ? [{
-              name: 'search_knowledge_base',
-              description: 'Recherche la documentation Limova pertinente pour répondre à une question produit, expliquer une fonctionnalité ou guider une procédure.',
-              parameters: {
-                type: 'OBJECT',
-                properties: {
-                  query: { type: 'STRING', description: 'Question ou sujet Limova à rechercher dans la documentation.' }
-                },
-                required: ['query']
-              }
-            }] : []), {
-              name: 'scroll_page',
-              description: 'Fait défiler la vue Limova ou la zone contenant un élément. Utilise cet outil pour découvrir les contrôles hors écran, puis appelle inspect_current_page avant de cliquer.',
-              parameters: {
-                type: 'OBJECT',
-                properties: {
-                  direction: { type: 'STRING', enum: ['up', 'down', 'top', 'bottom'] },
-                  amount: { type: 'STRING', enum: ['small', 'medium', 'large'] },
-                  contextVersion: { type: 'INTEGER' },
-                  elementId: { type: 'INTEGER', description: 'Élément situé dans la zone à faire défiler, facultatif.' }
-                },
-                required: ['direction', 'amount', 'contextVersion']
-              }
-            }, {
-              name: 'fill_field',
-              description: 'Écrit le texte exact demandé dans un unique champ non sensible de la carte DOM. Ne soumet jamais le formulaire. Ne pas appeler si la cible ou le texte est ambigu : demander une clarification.',
-              parameters: {
-                type: 'OBJECT',
-                properties: {
-                  elementId: { type: 'INTEGER', description: 'Identifiant numérique du champ non sensible dans la carte DOM la plus récente.' },
-                  contextVersion: { type: 'INTEGER', description: 'Version de la carte DOM.' },
-                  targetLabel: { type: 'STRING', description: 'Libellé exact du champ visé dans la carte DOM.' },
-                  text: { type: 'STRING', description: 'Texte exact explicitement fourni ou validé par l’utilisateur, 4000 caractères maximum.' }
-                },
-                required: ['elementId', 'contextVersion', 'targetLabel', 'text']
-              }
-            }, {
-              name: 'navigate_internal',
-              description: 'Navigue dans Limova en activant un identifiant DOM courant, jamais une URL arbitraire.',
-              parameters: {
-                type: 'OBJECT',
-                properties: {
-                  elementId: { type: 'INTEGER' },
-                  contextVersion: { type: 'INTEGER' },
-                  targetLabel: { type: 'STRING' }
-                },
-                required: ['elementId', 'contextVersion', 'targetLabel']
-              }
-            }, {
-              name: 'verify_expected_result',
-              description: 'Relit la route, la modale et le DOM après une action avant d’annoncer sa réussite.',
-              parameters: {
-                type: 'OBJECT',
-                properties: {
-                  expectation: { type: 'STRING' },
-                  contextVersion: { type: 'INTEGER' }
-                },
-                required: ['expectation', 'contextVersion']
-              }
-            }]
-          }] } : {})
-        }
+            }
+          } : { delegation: { type: 'client' } })
+        },
+        transport: { type: 'webrtc', sdp }
       }),
-      signal: AbortSignal.timeout(15_000)
+      signal: AbortSignal.timeout(20_000)
     });
-    const data = await response.json().catch(() => ({ error: { message: 'Invalid upstream response' } }));
-    if (!response.ok) return res.status(response.status).json(data);
-    return res.json({ token: data.name, model: LIVE_MODEL, expiresAt: expireTime, requestId });
+    const data = await upstream.json().catch(() => ({}));
+    if (!upstream.ok || typeof data?.transport?.sdp !== 'string') {
+      console.error(JSON.stringify({ type: 'openai_live_session_error', requestId, status: upstream.status }));
+      return res.status(upstream.status >= 400 && upstream.status < 500 ? upstream.status : 502)
+        .json({ error: data?.error?.message || 'Voice service unavailable', requestId });
+    }
+    console.info(JSON.stringify({ type: 'openai_live_session_created', requestId, model: LIVE_MODEL, trainingMode }));
+    return res.status(201).json({ id: data.session?.id, sdp: data.transport.sdp, model: LIVE_MODEL, requestId });
   } catch (error) {
-    console.error(JSON.stringify({ type: 'live_token_error', requestId, message: error.message }));
+    console.error(JSON.stringify({ type: 'openai_live_session_error', requestId, code: technicalErrorCode(error) }));
     return res.status(502).json({ error: 'Voice service unavailable', requestId });
   }
 });

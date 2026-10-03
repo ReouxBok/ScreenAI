@@ -6,7 +6,7 @@
 tests/
 ├── unit/
 │   ├── utils/              Logger local et filtrage des secrets
-│   ├── sidebar/            i18n + annonces + protocole Gemini Live (jsdom)
+│   ├── sidebar/            i18n + annonces + protocole GPT Live WebRTC (jsdom)
 │   ├── content/            content.js DOM helpers (jsdom)
 │   ├── prompts/            system-prompt + onboarding-plan + snapshots
 │   ├── knowledge-base/     kb-search (TF-IDF)
@@ -19,7 +19,7 @@ tests/
 
 **Total : 199 tests** (163 unitaires/intégration, proxy inclus, + 36 E2E Chrome).
 
-Les E2E chargent le dossier `build/` comme une vraie extension Manifest V3 dans Chromium. Ils utilisent une vraie page HTTPS Limova de test et les vrais content scripts/service worker. Seules les frontières externes (API d’authentification, proxy et WebSocket Gemini) sont simulées de façon déterministe.
+Les E2E chargent le dossier `build/` comme une vraie extension Manifest V3 dans Chromium. Ils utilisent une vraie page HTTPS Limova de test et les vrais content scripts/service worker. Seules les frontières externes (API d’authentification, proxy et session vocale) sont simulées de façon déterministe.
 
 ## Commandes
 
