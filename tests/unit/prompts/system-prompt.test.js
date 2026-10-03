@@ -61,6 +61,8 @@ describe('buildSystemPrompt', () => {
     expect(out).toContain('deux à quatre activations concrètes');
     expect(out).toContain('agent Limova autonome');
     expect(out).toContain('produis un vrai output');
+    expect(out).toContain('jamais un prérequis ni la première question obligatoire');
+    expect(out).toContain("inspecte uniquement l'existant lié à ce résultat");
     expect(out).toContain('jamais un questionnaire');
     expect(out).toContain('Ask one question per turn');
   });
@@ -70,6 +72,8 @@ describe('buildSystemPrompt', () => {
     expect(out).toContain('never a checklist');
     expect(out).toContain('Select only relevant activation types');
     expect(out).toContain('Never force an example that does not fit the activity');
+    expect(out).toContain('Keep this audit scoped to the current result');
+    expect(out).toContain('never recreate an item unnecessarily');
     expect(out).toContain('test on a real example');
   });
 
