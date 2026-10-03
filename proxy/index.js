@@ -950,10 +950,17 @@ app.post('/api/live-session', verifyAssistantAuth, assistantLimiter, async (req,
   res.set('Cache-Control', 'no-store');
   const requestId = crypto.randomUUID();
   if (!OPENAI_API_KEY) return res.status(503).json({ error: 'OpenAI voice is not configured', requestId });
-  const sdp = typeof req.body?.sdp === 'string' ? req.body.sdp.trim() : '';
-  if (!sdp || sdp.length > 100_000 || !sdp.startsWith('v=0')) {
+  const rawSdp = typeof req.body?.sdp === 'string' ? req.body.sdp : '';
+  const sdp = rawSdp.trimEnd() + '\r\n';
+  if (!rawSdp || sdp.length > 100_000 || !sdp.startsWith('v=0') || !sdp.includes('\nm=audio ') || !sdp.includes('\nm=application ')) {
     return res.status(400).json({ error: 'A valid SDP offer is required', requestId });
   }
+  const sdpShape = {
+    length: sdp.length,
+    lines: sdp.split(/\r?\n/).filter(Boolean).length,
+    hasAudio: sdp.includes('\nm=audio '),
+    hasDataChannel: sdp.includes('\nm=application ')
+  };
 
   const lang = ['fr', 'en', 'es'].includes(req.body?.lang) ? req.body.lang : 'fr';
   const trainingMode = req.body?.trainingMode === true;
@@ -1046,11 +1053,11 @@ app.post('/api/live-session', verifyAssistantAuth, assistantLimiter, async (req,
     });
     const data = await upstream.json().catch(() => ({}));
     if (!upstream.ok || typeof data?.transport?.sdp !== 'string') {
-      console.error(JSON.stringify({ type: 'openai_live_session_error', requestId, status: upstream.status }));
+      console.error(JSON.stringify({ type: 'openai_live_session_error', requestId, status: upstream.status, sdpShape }));
       return res.status(upstream.status >= 400 && upstream.status < 500 ? upstream.status : 502)
         .json({ error: data?.error?.message || 'Voice service unavailable', requestId });
     }
-    console.info(JSON.stringify({ type: 'openai_live_session_created', requestId, model: LIVE_MODEL, trainingMode }));
+    console.info(JSON.stringify({ type: 'openai_live_session_created', requestId, model: LIVE_MODEL, trainingMode, sdpShape }));
     return res.status(201).json({ id: data.session?.id, sdp: data.transport.sdp, model: LIVE_MODEL, requestId });
   } catch (error) {
     console.error(JSON.stringify({ type: 'openai_live_session_error', requestId, code: technicalErrorCode(error) }));

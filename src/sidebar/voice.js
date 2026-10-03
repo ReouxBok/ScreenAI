@@ -89,7 +89,9 @@ class LimovaVoiceSession {
         this.remoteAudio.srcObject = event.streams?.[0] || new MediaStream([event.track]);
         this.remoteAudio.play?.().catch(() => {});
       };
-      this.stream.getTracks().forEach(track => peer.addTrack(track, this.stream));
+      const audioTracks = this.stream.getAudioTracks();
+      if (!audioTracks.length) throw new Error('Aucune piste audio active n’est disponible.');
+      audioTracks.forEach(track => peer.addTransceiver(track, { direction: 'sendrecv', streams: [this.stream] }));
       const channel = peer.createDataChannel('oai-events');
       this.channel = channel;
       channel.addEventListener('message', event => this.handleDataEvent(event));
@@ -102,9 +104,15 @@ class LimovaVoiceSession {
       const offer = await peer.createOffer();
       await peer.setLocalDescription(offer);
       await this.waitForIceGathering(peer);
+      const localSdp = String(peer.localDescription?.sdp || offer.sdp || '').trimEnd() + '\r\n';
+      if (!localSdp.startsWith('v=0') || !localSdp.includes('\nm=audio ') || !localSdp.includes('\nm=application ')) {
+        const error = new Error('Chrome n’a pas produit une offre WebRTC audio complète. Réessaie après avoir vérifié l’autorisation du microphone.');
+        error.voiceDiagnosticCode = 'VOICE_SDP_INCOMPLETE';
+        throw error;
+      }
       const session = await chrome.runtime.sendMessage({
         type: 'GET_LIVE_SESSION',
-        context: { trainingMode: this.trainingMode, sdp: peer.localDescription?.sdp || offer.sdp }
+        context: { trainingMode: this.trainingMode, sdp: localSdp }
       });
       if (!session?.ok || !session.sdp) {
         if (session?.consentRequired) this.emit('limova-voice-consent-required');

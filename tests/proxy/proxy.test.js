@@ -276,7 +276,7 @@ describe('POST /api/tts (removed)', () => {
 });
 
 describe('POST /api/live-session', () => {
-  const sdp = 'v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\n';
+  const sdp = 'v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\nm=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\n';
 
   it('creates an authenticated GPT Live WebRTC session with DOM tools', async () => {
     fetch.mockResolvedValueOnce({
@@ -316,7 +316,7 @@ describe('POST /api/live-session', () => {
     expect(options.headers.Authorization).toBe('Bearer test_openai_key');
     expect(options.headers['OpenAI-Safety-Identifier']).toMatch(/^[a-f0-9]{64}$/);
     const body = JSON.parse(options.body);
-    expect(body.transport).toEqual({ type: 'webrtc', sdp: sdp.trim() });
+    expect(body.transport).toEqual({ type: 'webrtc', sdp: `${sdp.trimEnd()}\r\n` });
     expect(body.session.model).toBe('gpt-live-1');
     expect(body.session.audio).toEqual({ output: { voice: 'marin' } });
     expect(body.session.instructions).toContain('pose une seule question courte à la fois');

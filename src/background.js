@@ -3141,7 +3141,9 @@ async function getLiveSession(context) {
     ? { pageContext: '', contextVersion: pageContextVersion }
     : await getFreshVoiceContext(operationId);
   const sdp = typeof context?.sdp === 'string' ? context.sdp : '';
-  if (!sdp.startsWith('v=0')) throw codedError('LIVE_SESSION_SDP_INVALID', 'La connexion vocale WebRTC est invalide.');
+  if (!sdp.startsWith('v=0') || !sdp.includes('\nm=audio ') || !sdp.includes('\nm=application ')) {
+    throw codedError('LIVE_SESSION_SDP_INVALID', 'La connexion vocale WebRTC audio est incomplète.');
+  }
   const response = await authorizedProxyFetch('/api/live-session', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },

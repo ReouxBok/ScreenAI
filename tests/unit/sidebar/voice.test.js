@@ -39,13 +39,13 @@ class FakePeerConnection {
   constructor() {
     this.iceGatheringState = 'complete';
     this.channel = new FakeDataChannel();
-    this.addTrack = vi.fn();
+    this.addTransceiver = vi.fn();
     this.close = vi.fn();
     this.setLocalDescription = vi.fn(async description => {
-      this.localDescription = { ...description, sdp: 'v=0\r\na=offer\r\n' };
+      this.localDescription = { ...description, sdp: 'v=0\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\nm=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\n' };
     });
     this.setRemoteDescription = vi.fn(async description => { this.remoteDescription = description; });
-    this.createOffer = vi.fn(async () => ({ type: 'offer', sdp: 'v=0\r\na=offer\r\n' }));
+    this.createOffer = vi.fn(async () => ({ type: 'offer', sdp: 'v=0\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\nm=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\n' }));
     FakePeerConnection.instances.push(this);
   }
   createDataChannel(label) {
@@ -127,10 +127,13 @@ describe('OpenAI GPT Live WebRTC voice protocol', () => {
   it('negotiates GPT Live over WebRTC after microphone permission', async () => {
     const { peer } = await startConnected();
     expect(peer.label).toBe('oai-events');
-    expect(peer.addTrack).toHaveBeenCalledWith(mediaTrack, expect.anything());
+    expect(peer.addTransceiver).toHaveBeenCalledWith(mediaTrack, expect.objectContaining({ direction: 'sendrecv' }));
     expect(chromeMock.runtime.sendMessage).toHaveBeenCalledWith({
       type: 'GET_LIVE_SESSION',
-      context: { trainingMode: false, sdp: 'v=0\r\na=offer\r\n' }
+      context: {
+        trainingMode: false,
+        sdp: 'v=0\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\nm=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\n'
+      }
     });
     expect(peer.remoteDescription).toEqual({ type: 'answer', sdp: 'v=0\r\na=answer\r\n' });
   });
