@@ -320,8 +320,10 @@ describe('POST /api/live-session', () => {
     expect(body.session.model).toBe('gpt-live-1');
     expect(body.session.audio).toEqual({ output: { voice: 'marin' } });
     expect(body.session.instructions).toContain('pose une seule question courte à la fois');
-    expect(body.session.instructions).toContain('Après un clic');
-    expect(body.session.instructions).toContain('Page: Accueil');
+    expect(body.session.instructions).toContain('Delegation policy:');
+    expect(body.session.instructions).toContain('cliquer, sélectionner, naviguer');
+    expect(body.session.delegation.responses.instructions).toContain('Après un clic');
+    expect(body.session.delegation.responses.instructions).toContain('Page: Accueil');
     expect(body.session.delegation).toMatchObject({
       type: 'responses',
       responses: { model: 'gpt-6-luna', tool_choice: 'auto', parallel_tool_calls: false }

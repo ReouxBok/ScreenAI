@@ -264,8 +264,15 @@ class LimovaVoiceSession {
     const type = String(message?.type || '');
     if (type === 'session.started') {
       this.sessionStarted = true;
+      this.diagnostic('VOICE_OPENAI_SESSION_STARTED');
       for (const waiter of this.sessionStartedWaiters.splice(0)) waiter.resolve();
       return;
+    }
+    if (type === 'session.delegation.created') {
+      this.diagnostic('VOICE_DELEGATION_CREATED', {
+        target: message.delegation?.target || 'unknown',
+        delegationId: message.delegation?.id || null
+      });
     }
     if (type === 'error') {
       this.diagnostic('VOICE_OPENAI_ERROR', { code: message.error?.code, type: message.error?.type });
@@ -299,6 +306,7 @@ class LimovaVoiceSession {
       : null;
     if (call?.id && !this.completedToolCalls.has(call.id)) {
       this.completedToolCalls.add(call.id);
+      this.diagnostic('VOICE_TOOL_CALL_RECEIVED', { name: call.name, callId: call.id });
       this.handleToolCalls([call]).catch(() => {});
     }
   }
@@ -385,6 +393,7 @@ class LimovaVoiceSession {
         ...(result?.knowledge ? { knowledgeBase: String(result.knowledge).slice(0, 6_000) } : {}),
         ...(result?.error ? { reason: String(result.error).slice(0, 240), retryWithFreshContext: Boolean(result.retryWithFreshContext) } : {})
       };
+      this.diagnostic('VOICE_TOOL_CALL_COMPLETED', { name: call.name, callId: call.id, status: output.status });
       this.send({
         type: 'response.item.create',
         event_id: `tool-result-${call.id}`,

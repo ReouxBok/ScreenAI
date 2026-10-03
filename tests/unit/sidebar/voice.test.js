@@ -188,6 +188,9 @@ describe('OpenAI GPT Live WebRTC voice protocol', () => {
       contextVersion: 8
     }));
     expect(channel.sent.at(-1)).toEqual({ type: 'response.create' });
+    expect(chromeMock.runtime.sendMessage).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'DIAGNOSTIC_EVENT', code: 'VOICE_TOOL_CALL_COMPLETED'
+    }));
   });
 
   it('deduplicates repeated completion events for the same tool call', async () => {

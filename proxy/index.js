@@ -1019,7 +1019,30 @@ app.post('/api/live-session', verifyAssistantAuth, assistantLimiter, async (req,
 
   const instructions = trainingMode
     ? `Mode transcription de démonstration Limova. Transcris fidèlement en ${lang === 'fr' ? 'français' : lang === 'es' ? 'espagnol' : 'anglais'}. Reste silencieuse et n’appelle aucun outil.`
-    : assistantSystemText;
+    : [
+        `Tu es Charly, l’assistante vocale d’onboarding Limova. ${languageInstruction} Parle naturellement, brièvement et guide une étape à la fois.`,
+        discoveryInstruction,
+        'Backchannel policy: Utilise de rares acquiescements très courts sans interrompre l’utilisateur.',
+        'Interruption policy: Arrête de parler dès que l’utilisateur t’interrompt et écoute sa correction.',
+        [
+          'Delegation policy:',
+          'Backend tools:',
+          '- Lire l’état DOM actuel de la page Limova et identifier les contrôles visibles.',
+          '- Cliquer un élément, naviguer, faire défiler la page et écrire dans un champ non sensible.',
+          '- Vérifier le résultat réel d’une action avant de l’annoncer.',
+          '- Rechercher la documentation produit Limova.',
+          'Delegate to the backend when:',
+          '- L’utilisateur demande de regarder, trouver, montrer, ouvrir, cliquer, sélectionner, naviguer, faire défiler, remplir ou écrire quelque chose dans Limova.',
+          '- La réponse dépend de l’état actuel de la page, du DOM ou de la documentation produit.',
+          '- Une correction modifie une action déjà demandée.',
+          '- Tu dois vérifier qu’une action a réellement réussi.',
+          'Do not delegate to the backend when:',
+          '- L’utilisateur te salue, demande de répéter un résultat déjà obtenu ou répond à une question de clarification.',
+          '- La demande est trop ambiguë pour agir : pose alors une seule question courte.',
+          'Délègue avant toute réponse dépendant de la page ou d’une action. N’affirme jamais que tu ne peux pas cliquer ou écrire.',
+          'Pendant la délégation, dis seulement que tu vérifies si un retour oral est utile. Attends le résultat du backend et ne devine jamais le résultat.'
+        ].join('\n')
+      ].join('\n\n');
 
   try {
     const upstream = await fetch('https://api.openai.com/v1/live/sessions', {
