@@ -158,6 +158,20 @@ describe('OpenAI GPT Live WebRTC voice protocol', () => {
       { role: 'user', text: 'Bonjour', final: false },
       { role: 'assistant', text: 'Comment puis-je aider ?', final: false }
     ]));
+    await vi.waitFor(() => expect(events.at(-1)).toEqual({ role: 'assistant', text: '', final: true }), { timeout: 1_500 });
+  });
+
+  it('finalizes the visible assistant transcript when the user starts speaking again', () => {
+    const session = new VoiceSession();
+    const events = [];
+    window.addEventListener('limova-voice-transcript', event => events.push(event.detail));
+    session.handleServerMessage({ type: 'session.output_transcript.delta', delta: 'Voici le résultat.' });
+    session.handleServerMessage({ type: 'session.input_transcript.delta', delta: 'Merci' });
+    expect(events).toEqual([
+      { role: 'assistant', text: 'Voici le résultat.', final: false },
+      { role: 'assistant', text: '', final: true },
+      { role: 'user', text: 'Merci', final: false }
+    ]);
   });
 
   it('executes one current DOM action and returns a verified tool output', async () => {

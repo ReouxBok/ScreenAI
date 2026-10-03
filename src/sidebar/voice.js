@@ -16,6 +16,8 @@ class LimovaVoiceSession {
     this.pendingVisualCapture = null;
     this.completedToolCalls = new Set();
     this.pendingUserTranscript = '';
+    this.pendingAssistantTranscript = '';
+    this.assistantTranscriptTimer = null;
     this.delegationTranscripts = new Map();
     this.sessionStarted = false;
     this.sessionStartedWaiters = [];
@@ -262,6 +264,19 @@ class LimovaVoiceSession {
     try { this.handleServerMessage(JSON.parse(event.data)); }
     catch (_) { this.diagnostic('VOICE_EVENT_INVALID_JSON'); }
   }
+  scheduleAssistantTranscriptFinalization() {
+    clearTimeout(this.assistantTranscriptTimer);
+    this.assistantTranscriptTimer = setTimeout(() => this.finalizeAssistantTranscript(), 900);
+  }
+  finalizeAssistantTranscript() {
+    clearTimeout(this.assistantTranscriptTimer);
+    this.assistantTranscriptTimer = null;
+    if (!this.pendingAssistantTranscript.trim()) return false;
+    this.emit('limova-voice-transcript', { role: 'assistant', text: '', final: true });
+    this.pendingAssistantTranscript = '';
+    this.emit('limova-voice-status', { status: 'listening' });
+    return true;
+  }
   handleServerMessage(message) {
     const type = String(message?.type || '');
     if (type === 'session.started') {
@@ -287,7 +302,10 @@ class LimovaVoiceSession {
       this.diagnostic('VOICE_OPENAI_ERROR', { code: message.error?.code, type: message.error?.type });
       return;
     }
-    if (type === 'session.input_transcript.delta') this.emit('limova-voice-status', { status: 'listening' });
+    if (type === 'session.input_transcript.delta') {
+      this.finalizeAssistantTranscript();
+      this.emit('limova-voice-status', { status: 'listening' });
+    }
     if (type === 'session.output_transcript.delta') this.emit('limova-voice-status', { status: 'speaking' });
 
     const transcript = (
@@ -299,6 +317,10 @@ class LimovaVoiceSession {
     );
     if (transcript && (!this.trainingMode || transcript.role === 'user')) {
       if (transcript.role === 'user' && transcript.text) this.pendingUserTranscript += transcript.text;
+      if (transcript.role === 'assistant' && transcript.text) {
+        this.pendingAssistantTranscript += transcript.text;
+        this.scheduleAssistantTranscriptFinalization();
+      }
       if (transcript.text) this.emitSafeTranscript(transcript.role, transcript.text);
       if (transcript.final) {
         this.emit('limova-voice-transcript', { role: transcript.role, text: '', final: true });
@@ -425,6 +447,7 @@ class LimovaVoiceSession {
     this.remoteAudio = null;
   }
   stop(notify = true) {
+    this.finalizeAssistantTranscript();
     const channel = this.channel;
     const peer = this.peer;
     this.channel = null;
@@ -440,6 +463,7 @@ class LimovaVoiceSession {
     this.pendingPageContext = null;
     this.pendingVisualCapture = null;
     this.pendingUserTranscript = '';
+    this.pendingAssistantTranscript = '';
     this.delegationTranscripts.clear();
     this.diagnostic('VOICE_SESSION_STOPPED', { notified: notify });
     if (notify) this.emit('limova-voice-status', { status: 'stopped' });

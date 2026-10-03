@@ -58,8 +58,9 @@ describe('buildSystemPrompt', () => {
 
   it('discovers the profession before recommending a limited set of use cases', () => {
     const out = buildSystemPrompt({ trigger: 'doc_load', lang: 'fr', onboardingPlan: createOnboardingPlan() });
-    expect(out).toContain("deux à quatre cas d'usage concrets");
-    expect(out).toContain('premier résultat rapide et observable');
+    expect(out).toContain('deux à quatre activations concrètes');
+    expect(out).toContain('agent Limova autonome');
+    expect(out).toContain('produis un vrai output');
     expect(out).toContain('jamais un questionnaire');
     expect(out).toContain('Ask one question per turn');
   });
@@ -67,7 +68,8 @@ describe('buildSystemPrompt', () => {
   it('treats the published template as adaptable guidance', () => {
     const out = buildSystemPrompt({ trigger: 'doc_load', lang: 'fr', onboardingPlan: createOnboardingPlan() });
     expect(out).toContain('never a checklist');
-    expect(out).toContain('Only propose an integration, Skill or routine when it serves an identified need');
+    expect(out).toContain('Select only relevant activation types');
+    expect(out).toContain('Never force an example that does not fit the activity');
     expect(out).toContain('test on a real example');
   });
 

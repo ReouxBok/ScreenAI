@@ -60,9 +60,10 @@ describe('createOnboardingPlan', () => {
     expect(orientation).toContain('outils déjà utilisés');
     expect(orientation).toContain("connecter uniquement ceux qui servent le cas d'usage retenu");
     expect(orientation).toContain('Une question courte à la fois, jamais un questionnaire');
-    expect(orientation).toContain("deux à quatre cas d'usage concrets");
-    expect(orientation).toContain('premier résultat rapide et observable');
-    expect(orientation).toContain('teste-le sur un cas réel');
+    expect(orientation).toContain('deux à quatre activations concrètes');
+    expect(orientation).toContain('déployer un agent Limova autonome');
+    expect(orientation).toContain('propose de la réaliser maintenant');
+    expect(orientation).toContain('produis un vrai output');
   });
 
   it('builds a published Studio hierarchy', () => {

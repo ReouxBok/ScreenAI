@@ -800,13 +800,15 @@ body {
   font-weight: 500;
 }
 
-/* Assistant messages — Limova style: no bubble, direct text */
+/* Assistant messages — clear, readable response card */
 .message.assistant .message-content {
-  background: transparent;
+  background: #ffffff;
   color: var(--color-gray-800);
-  padding-left: 0;
-  padding-right: 0;
+  border: 1px solid var(--color-gray-200);
+  border-left: 3px solid var(--color-primary);
+  box-shadow: 0 2px 10px rgba(15, 23, 42, 0.06);
   font-size: var(--font-size-base);
+  line-height: 1.65;
 }
 
 /* System messages */
