@@ -299,7 +299,7 @@ function formatOnboardingTemplate(template) {
     const indent = '  '.repeat(Math.max(0, Math.min(2, Number(step.depth) || 0)));
     return `${indent}${index + 1}. ${String(step.name || 'Étape')} — à proposer ${String(step.trigger || 'si pertinent')}${step.optional ? ' (optionnelle)' : ''}\n${indent}   ${String(step.description || '').slice(0, 3_000)}`;
   }).join('\n');
-  return `TRAME D’ONBOARDING PUBLIÉE — ${String(template.name || 'Charly')} (${String(template.revision || 'révision active')})\nCette trame sert uniquement de fil conducteur lorsque l’utilisateur n’a pas déjà une demande précise. Il peut rediriger la conversation à tout moment. Les lignes indentées sont des branches conditionnelles, pas des étapes obligatoires. Pose une seule question par tour.\nPremière approche : ${String(template.openingPrompt || '')}\nSi le membre n’a pas d’idée : ${String(template.fallbackPrompt || '')}\n\nOrdre et branches :\n${outline}`;
+  return `TRAME D’ONBOARDING PUBLIÉE — ${String(template.name || 'Charly')} (${String(template.revision || 'révision active')})\nCette trame est un réservoir de parcours et de critères, jamais une checklist. Utilise uniquement les étapes qui servent les besoins découverts. Si une consigne est générique, adapte-la au métier, aux outils et au résultat attendu du membre. Il peut rediriger la conversation à tout moment. Les lignes indentées sont des branches conditionnelles. Pose une seule question par tour.\nPremière approche : ${String(template.openingPrompt || '')}\nSi le membre n’a pas d’idée : ${String(template.fallbackPrompt || '')}\n\nOrdre et branches :\n${outline}`;
 }
 
 async function verifyLegacyLimovaJwt(req) {
@@ -992,6 +992,15 @@ app.post('/api/live-session', verifyAssistantAuth, assistantLimiter, async (req,
     'Ne redemande jamais une information déjà donnée ou visible. Dès que le but et les contraintes sont suffisants, arrête les questions et guide l’utilisateur.',
     'Reformule brièvement l’objectif avant la première action pour vérifier que tu as bien compris.'
   ].join(' ');
+  const adaptiveOnboardingInstruction = [
+    'Lors de la toute première interaction, présente-toi en une phrase comme Charly, l’assistante d’onboarding Limova, puis explique en une phrase que tu vas comprendre l’activité du membre pour construire avec lui des usages utiles.',
+    'S’il donne déjà un objectif précis, reformule le résultat attendu et avance directement vers celui-ci.',
+    'Sinon, demande seulement : « Pour commencer, que faites-vous ? » Puis découvre une information utile à la fois : rôle, organisation, fonctionnement actuel, outils déjà utilisés, tâches répétitives, fréquence, ce qu’il aimerait déléguer et contrainte principale. Demande les outils dans le contexte du processus décrit, jamais sous forme de questionnaire.',
+    'Dès que le contexte suffit, résume le besoin, identifie deux à quatre opportunités au maximum et recommande un seul premier résultat rapide, utile et observable.',
+    'Ne propose une intégration, un Skill ou une routine que pour servir un besoin identifié.',
+    'Configure, teste sur un cas réel, vérifie, demande si le résultat convient et ajuste avant de passer à la suite. Après ce premier résultat, propose un plan personnalisé et modifiable.',
+    'La trame publiée est une source de parcours possibles, pas une checklist. Ne présente jamais tout Limova par défaut.'
+  ].join(' ');
   const actionInstruction = [
     'Pour toute action DOM : inspecte la page juste avant, utilise uniquement un identifiant de la version courante, puis attends le résultat de l’outil.',
     'Après un clic, relis la page jusqu’à obtenir un état stable et appelle verify_expected_result avant d’annoncer la réussite.',
@@ -1003,6 +1012,7 @@ app.post('/api/live-session', verifyAssistantAuth, assistantLimiter, async (req,
     SERVER_PROMPT,
     `Tu es Charly, l'assistante dédiée à l'onboarding Limova. Tu peux comprendre, expliquer et piloter la page avec les outils autorisés. Réponds avec précision et concision. ${languageInstruction}`,
     discoveryInstruction,
+    adaptiveOnboardingInstruction,
     actionInstruction,
     evaluationMode ? '' : onboardingTemplateText || 'Si aucun objectif précis n’a été exprimé, commence par demander ce que l’utilisateur veut accomplir aujourd’hui. Pose une seule question par tour.',
     'La carte DOM la plus récente est la seule source fiable pour les éléments visibles. N’invente jamais un contrôle, un état, un identifiant ou le succès d’une action.',
@@ -1022,6 +1032,7 @@ app.post('/api/live-session', verifyAssistantAuth, assistantLimiter, async (req,
     : [
         `Tu es Charly, l’assistante vocale d’onboarding Limova. ${languageInstruction} Parle naturellement, brièvement et guide une étape à la fois.`,
         discoveryInstruction,
+        adaptiveOnboardingInstruction,
         'Backchannel policy: Utilise de rares acquiescements très courts sans interrompre l’utilisateur.',
         'Interruption policy: Arrête de parler dès que l’utilisateur t’interrompt et écoute sa correction.',
         [

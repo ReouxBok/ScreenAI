@@ -54,14 +54,15 @@ describe('createOnboardingPlan', () => {
     expect(createOnboardingPlan().steps.map(s => s.id)).toEqual(expected);
   });
 
-  it('defines the progressive discovery funnel and exact super-power names', () => {
+  it('defines an adaptive discovery funnel before recommending a first result', () => {
     const orientation = createOnboardingPlan().steps[0].description;
-    expect(orientation).toContain('Est-ce qu\'il y a un sujet en particulier que tu veux traiter aujourd\'hui ?');
-    expect(orientation).toContain('Créer une campagne de prospection LinkedIn');
-    expect(orientation).toContain('Créer une campagne de posts pour réseaux sociaux');
-    expect(orientation.indexOf('Qu\'est-ce que tu fais dans la vie ?'))
-      .toBeGreaterThan(orientation.indexOf('Créer une campagne de posts pour réseaux sociaux'));
-    expect(orientation).toContain('au maximum deux cas d\'usage concrets');
+    expect(orientation).toContain('Pour commencer, que faites-vous ?');
+    expect(orientation).toContain('outils déjà utilisés');
+    expect(orientation).toContain("connecter uniquement ceux qui servent le cas d'usage retenu");
+    expect(orientation).toContain('Une question courte à la fois, jamais un questionnaire');
+    expect(orientation).toContain("deux à quatre cas d'usage concrets");
+    expect(orientation).toContain('premier résultat rapide et observable');
+    expect(orientation).toContain('teste-le sur un cas réel');
   });
 
   it('builds a published Studio hierarchy', () => {

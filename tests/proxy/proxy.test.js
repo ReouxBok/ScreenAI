@@ -320,6 +320,8 @@ describe('POST /api/live-session', () => {
     expect(body.session.model).toBe('gpt-live-1');
     expect(body.session.audio).toEqual({ output: { voice: 'marin' } });
     expect(body.session.instructions).toContain('pose une seule question courte à la fois');
+    expect(body.session.instructions).toContain('premier résultat rapide, utile et observable');
+    expect(body.session.instructions).toContain('pas une checklist');
     expect(body.session.instructions).toContain('Delegation policy:');
     expect(body.session.instructions).toContain('cliquer, sélectionner, naviguer');
     expect(body.session.delegation.responses.instructions).toContain('Après un clic');

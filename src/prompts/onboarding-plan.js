@@ -16,20 +16,17 @@ const ONBOARDING_STEPS = [
     description: `Commence par comprendre ce que l'utilisateur veut obtenir, avant de lui faire visiter la plateforme.
 
 Règle de première interaction :
-- Si l'utilisateur a déjà formulé un besoin précis, reformule-le brièvement et traite-le directement.
-- Sinon, pose UNE seule question : « Est-ce qu'il y a un sujet en particulier que tu veux traiter aujourd'hui ? »
+- Présente-toi en une phrase et explique en une phrase que tu vas comprendre son activité pour construire avec lui des usages utiles.
+- S'il a déjà formulé un besoin précis, reformule le résultat attendu et avance directement vers ce premier résultat.
+- Sinon, pose UNE seule question : « Pour commencer, que faites-vous ? »
 - Attends sa réponse. Ne présente pas encore le catalogue Limova.
 
-S'il répond qu'il n'a pas de sujet précis, qu'il ne sait pas ou qu'il veut découvrir, propose seulement ces deux points de départ :
-1. Développer sa prospection LinkedIn avec le super-pouvoir **Créer une campagne de prospection LinkedIn**.
-2. Automatiser ses réseaux sociaux avec le super-pouvoir **Créer une campagne de posts pour réseaux sociaux**.
-Demande lequel l'intéresse le plus. Une seule question dans le message.
+Approfondis ensuite seulement ce qui aide à choisir : rôle et responsabilités, organisation ou équipe, fonctionnement actuel, outils déjà utilisés, tâche répétitive ou pénible, fréquence, ce qu'il aimerait déléguer, résultat attendu et contrainte principale. Demande les outils dans le contexte du processus qu'il vient de décrire, puis aide-le à connecter uniquement ceux qui servent le cas d'usage retenu. Une question courte à la fois, jamais un questionnaire.
 
-Si aucun des deux ne lui parle, si ses réponses restent trop vagues ou si tu n'arrives pas à recommander quelque chose de pertinent, demande : « Qu'est-ce que tu fais dans la vie ? »
-À partir de sa réponse, propose au maximum deux cas d'usage concrets adaptés à son métier, en expliquant le bénéfice attendu. Pour une activité B2B qui doit trouver des clients, privilégie la prospection LinkedIn. Pour une marque, un commerce, un créateur ou une activité qui doit publier régulièrement, privilégie la campagne de posts. Pour les autres métiers, utilise la base de connaissances avant de recommander et n'invente jamais une capacité. Ne récite pas toute la liste des fonctionnalités.
+Dès que le contexte suffit, résume ce que tu as compris et propose au maximum deux à quatre cas d'usage concrets, classés par impact, fréquence, gain de temps et simplicité. Recommande un seul premier résultat rapide et observable. La prospection LinkedIn ou la campagne de posts ne sont proposées que si elles correspondent réellement à l'activité et au besoin exprimé. Utilise la base de connaissances avant toute recommandation et n'invente jamais une capacité.
 
-Après son choix, accompagne-le jusqu'au super-pouvoir correspondant dans l'interface et aide-le à lancer son premier cas d'usage. Si la cible visible est ambiguë, demande une clarification ; sinon utilise les outils de navigation et de clic autorisés.`,
-    completionHint: `Émets {{STEP_COMPLETE}} seulement quand le premier cas d'usage choisi a été lancé, quand le besoin précis de l'utilisateur est résolu et qu'il le confirme, ou quand il demande explicitement une visite générale de Limova.`,
+Après son accord, accompagne-le jusqu'au premier résultat, teste-le sur un cas réel, vérifie le résultat et demande s'il correspond à son attente. Ajuste si nécessaire. Propose ensuite un plan personnalisé et modifiable pour les prochains usages pertinents.`,
+    completionHint: `Émets {{STEP_COMPLETE}} seulement lorsqu'un premier résultat concret a été vérifié et accepté, lorsque le besoin précis de l'utilisateur est résolu, ou lorsqu'il demande explicitement une visite générale de Limova.`,
     status: 'active'
   },
   {
@@ -183,8 +180,8 @@ export function createOnboardingPlan(template = null) {
   return {
     revision: String(template?.revision || 'embedded_fallback'),
     name: String(template?.name || 'Onboarding Limova'),
-    openingPrompt: String(template?.openingPrompt || "Si l'utilisateur n'a pas encore formulé de besoin précis, demande-lui s'il souhaite traiter un sujet particulier aujourd'hui, puis attends sa réponse."),
-    fallbackPrompt: String(template?.fallbackPrompt || "S'il n'a pas d'idée, propose la prospection LinkedIn ou la création de posts pour les réseaux sociaux, puis demande ce qui l'intéresse le plus."),
+    openingPrompt: String(template?.openingPrompt || "Présente-toi brièvement. Si l'utilisateur n'a pas formulé de besoin précis, demande-lui seulement ce qu'il fait, puis utilise les tours suivants pour comprendre son fonctionnement, ses outils et ce qu'il aimerait déléguer."),
+    fallbackPrompt: String(template?.fallbackPrompt || "S'il n'a pas d'idée, explore une seule dimension utile à la fois, puis propose au maximum deux à quatre cas d'usage adaptés et recommande un premier résultat concret."),
     steps: remoteSteps || ONBOARDING_STEPS.map((step, index) => ({ ...step, depth: 0, optional: false, successCriteria: [], status: index === 0 ? 'active' : 'pending' })),
     activeIndex: 0,
     startedAt: Date.now()

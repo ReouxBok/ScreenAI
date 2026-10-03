@@ -51,15 +51,24 @@ describe('buildSystemPrompt', () => {
     const out = buildSystemPrompt({ trigger: 'doc_load', lang: 'en', onboardingPlan: createOnboardingPlan() });
     expect(out).toContain('Trigger: doc_load');
     expect(out).toContain('Phase 1 - Setup');
-    expect(out).toContain("Est-ce qu'il y a un sujet en particulier que tu veux traiter aujourd'hui ?");
+    expect(out).toContain('Pour commencer, que faites-vous ?');
+    expect(out).toContain('outils déjà utilisés');
+    expect(out).toContain('do not present features, a checklist or several questions');
   });
 
-  it('proposes the two priority use cases before asking about the profession', () => {
+  it('discovers the profession before recommending a limited set of use cases', () => {
     const out = buildSystemPrompt({ trigger: 'doc_load', lang: 'fr', onboardingPlan: createOnboardingPlan() });
-    expect(out).toContain('Créer une campagne de prospection LinkedIn');
-    expect(out).toContain('Créer une campagne de posts pour réseaux sociaux');
-    expect(out).toContain("Qu'est-ce que tu fais dans la vie ?");
+    expect(out).toContain("deux à quatre cas d'usage concrets");
+    expect(out).toContain('premier résultat rapide et observable');
+    expect(out).toContain('jamais un questionnaire');
     expect(out).toContain('Ask one question per turn');
+  });
+
+  it('treats the published template as adaptable guidance', () => {
+    const out = buildSystemPrompt({ trigger: 'doc_load', lang: 'fr', onboardingPlan: createOnboardingPlan() });
+    expect(out).toContain('never a checklist');
+    expect(out).toContain('Only propose an integration, Skill or routine when it serves an identified need');
+    expect(out).toContain('test on a real example');
   });
 
   it('uses a generic trigger block for url_change', () => {
