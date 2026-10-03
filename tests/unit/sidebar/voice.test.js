@@ -162,6 +162,11 @@ describe('OpenAI GPT Live WebRTC voice protocol', () => {
 
   it('executes one current DOM action and returns a verified tool output', async () => {
     const { channel } = await startConnected();
+    channel.receive({ type: 'session.input_transcript.delta', delta: 'Clique sur Intégrations' });
+    channel.receive({
+      type: 'session.delegation.created',
+      delegation: { id: 'delegation-1', target: 'responses' }
+    });
     chromeMock.runtime.sendMessage.mockImplementation(async request => {
       if (request.type === 'VOICE_ACTION_REQUEST') return { ok: true, contextVersion: 7 };
       if (request.type === 'VOICE_CONTEXT_REQUEST') return {
@@ -188,6 +193,9 @@ describe('OpenAI GPT Live WebRTC voice protocol', () => {
       contextVersion: 8
     }));
     expect(channel.sent.at(-1)).toEqual({ type: 'response.create' });
+    expect(chromeMock.runtime.sendMessage).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'VOICE_ACTION_REQUEST', userTranscript: 'Clique sur Intégrations'
+    }));
     expect(chromeMock.runtime.sendMessage).toHaveBeenCalledWith(expect.objectContaining({
       type: 'DIAGNOSTIC_EVENT', code: 'VOICE_TOOL_CALL_COMPLETED'
     }));

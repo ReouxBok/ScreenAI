@@ -629,7 +629,8 @@ async function handleMessage(request, sender) {
         () =>
         proposeVoiceAction(request.elementId, request.contextVersion, {
           explicitRequest: request.explicitRequest === true,
-          targetLabel: request.targetLabel
+          targetLabel: request.targetLabel,
+          userTranscript: request.userTranscript
         })
       );
 
@@ -3440,11 +3441,20 @@ async function proposeVoiceAction(elementId, requestedContextVersion, toolIntent
   }
   const element = lastPageElements.get(elementId);
   if (!element || element.disabled) return { ok: false, error: 'Élément absent ou indisponible.' };
-  const voiceTurn = lastUserTurn
+  let voiceTurn = lastUserTurn
     && lastUserTurn.source === 'voice'
     && Date.now() - lastUserTurn.createdAt <= ACTION_INTENT_MAX_AGE_MS
       ? lastUserTurn
       : null;
+  const delegatedTranscript = String(toolIntent.userTranscript || '').trim().slice(0, 4_000);
+  if (!voiceTurn && delegatedTranscript) {
+    rememberUserTurn(delegatedTranscript, 'voice');
+    voiceTurn = lastUserTurn;
+    Logger.event('voice', 'VOICE_DELEGATION_TRANSCRIPT_BOUND', {
+      characterCount: delegatedTranscript.length,
+      contentExported: false
+    });
+  }
   if (!voiceTurn) {
     return {
       ok: false,

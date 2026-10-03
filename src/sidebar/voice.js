@@ -15,6 +15,8 @@ class LimovaVoiceSession {
     this.pendingPageContext = null;
     this.pendingVisualCapture = null;
     this.completedToolCalls = new Set();
+    this.pendingUserTranscript = '';
+    this.delegationTranscripts = new Map();
     this.sessionStarted = false;
     this.sessionStartedWaiters = [];
   }
@@ -269,9 +271,16 @@ class LimovaVoiceSession {
       return;
     }
     if (type === 'session.delegation.created') {
+      const delegationId = message.delegation?.id || null;
+      const transcript = this.pendingUserTranscript.trim();
+      if (delegationId && transcript) this.delegationTranscripts.set(delegationId, transcript);
+      if (transcript) {
+        this.emit('limova-voice-transcript', { role: 'user', text: '', final: true });
+        this.pendingUserTranscript = '';
+      }
       this.diagnostic('VOICE_DELEGATION_CREATED', {
         target: message.delegation?.target || 'unknown',
-        delegationId: message.delegation?.id || null
+        delegationId
       });
     }
     if (type === 'error') {
@@ -289,6 +298,7 @@ class LimovaVoiceSession {
           : null
     );
     if (transcript && (!this.trainingMode || transcript.role === 'user')) {
+      if (transcript.role === 'user' && transcript.text) this.pendingUserTranscript += transcript.text;
       if (transcript.text) this.emitSafeTranscript(transcript.role, transcript.text);
       if (transcript.final) {
         this.emit('limova-voice-transcript', { role: transcript.role, text: '', final: true });
@@ -301,7 +311,9 @@ class LimovaVoiceSession {
       ? {
           id: responseEvent.item.call_id || responseEvent.item.id,
           name: responseEvent.item.name,
-          args: this.parseArguments(responseEvent.item.arguments)
+          args: this.parseArguments(responseEvent.item.arguments),
+          delegationId: message.delegation_id || null,
+          userTranscript: this.delegationTranscripts.get(message.delegation_id) || ''
         }
       : null;
     if (call?.id && !this.completedToolCalls.has(call.id)) {
@@ -374,7 +386,7 @@ class LimovaVoiceSession {
         result = await chrome.runtime.sendMessage({
           type: 'VOICE_ACTION_REQUEST', toolName: call.name, elementId: args.elementId,
           contextVersion: args.contextVersion, explicitRequest: args.explicitRequest === true,
-          targetLabel: args.targetLabel || ''
+          targetLabel: args.targetLabel || '', userTranscript: call.userTranscript || ''
         }).catch(() => ({ ok: false, error: 'Extension indisponible.' }));
         if (result?.ok) {
           const stable = await this.waitForStablePage(result.contextVersion || args.contextVersion);
@@ -427,6 +439,8 @@ class LimovaVoiceSession {
     this.cleanupMedia();
     this.pendingPageContext = null;
     this.pendingVisualCapture = null;
+    this.pendingUserTranscript = '';
+    this.delegationTranscripts.clear();
     this.diagnostic('VOICE_SESSION_STOPPED', { notified: notify });
     if (notify) this.emit('limova-voice-status', { status: 'stopped' });
   }
