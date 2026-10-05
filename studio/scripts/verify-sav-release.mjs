@@ -7,7 +7,8 @@ import { fileURLToPath } from "node:url";
 // Not a complete secret/PII audit: the diff still needs human review.
 const repo = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
 const git = (args) => execFileSync("git", args, { cwd: repo, encoding: "utf8" }).split("\0").filter(Boolean);
-const files = [...new Set([...git(["diff", "--name-only", "--diff-filter=ACMR", "-z", "HEAD"]), ...git(["ls-files", "--others", "--exclude-standard", "-z"])])];
+const baseline = process.argv[2] ?? "origin/main";
+const files = [...new Set([...git(["diff", "--name-only", "--diff-filter=ACMR", "-z", baseline]), ...git(["ls-files", "--others", "--exclude-standard", "-z"])])];
 const forbidden = /(^|\/)(\.env(?:\..*)?|\.sav-preview|\.e2e-db|node_modules|\.next|\.vercel|backups)(\/|$)|\.(?:pem|key|db|sqlite3?|zip|tar|tar\.gz)$/i;
 const patterns = [
   ["private-key", /-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----/],
