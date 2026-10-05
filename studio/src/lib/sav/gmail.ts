@@ -669,7 +669,9 @@ async function sendReplyAction(action: typeof savActions.$inferSelect, text: str
       actorType: "system",
     }).onConflictDoNothing();
     if (action.kind === "send_reply") {
-      await tx.update(savThreads).set({ status: "awaiting_customer", lastMessageAt: now, updatedAt: now })
+      await tx.update(savThreads).set({ status: manualV0
+        ? sql`case when ${savThreads.aiPaused} then ${savThreads.status} else 'awaiting_customer' end`
+        : "awaiting_customer", lastMessageAt: now, updatedAt: now })
         .where(eq(savThreads.id, thread.id));
       for (const [index, dueAt] of (manualV0 ? [] : followupDates(now)).entries()) {
         await tx.insert(savFollowups).values({ threadId: thread.id, sequence: index + 1, dueAt })

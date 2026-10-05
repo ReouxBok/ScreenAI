@@ -22,7 +22,9 @@ export async function queueSavManualReply(raw: unknown, actorEmail: string) {
   const input = requestSchema.parse(raw);
   return requireDb().transaction(async (tx) => {
     const [thread] = await tx.select().from(savThreads).where(eq(savThreads.id, input.threadId)).for("update");
-    if (!thread || thread.aiPaused) throw new Error("SAV_THREAD_PAUSED");
+    if (!thread) throw new Error("SAV_THREAD_NOT_FOUND");
+    // V0 is human-only: pausing the agent must not prevent its owner replying.
+    // Keep aiPaused unchanged; this confirmation never resumes automation.
     const [draft] = await tx.select().from(savReplyDrafts).where(and(eq(savReplyDrafts.id, input.draftId), eq(savReplyDrafts.threadId, thread.id), eq(savReplyDrafts.isCurrent, true))).limit(1);
     if (!draft || draft.status === "abandoned") throw new Error("SAV_REPLY_MANUAL_DRAFT_REQUIRED");
     const key = `gmail:manual-reply:${draft.messageId}`;

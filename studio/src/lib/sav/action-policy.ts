@@ -45,7 +45,9 @@ export function savWriteDenial(input: SavWriteContext): string | null {
   if (!savModeAllowsWrite(input.mode, input.kind, input.actorType, input.followup, input.releaseStage)) return "SAV_HUMAN_APPROVAL_REQUIRED";
   if (input.kind === "send_reply") {
     // A transfer acknowledgement is deliberately separate from a solution.
-    if (input.aiPaused) return "SAV_THREAD_PAUSED";
+    const confirmedV0HumanReply = (input.releaseStage ?? "v0") === "v0"
+      && input.actorType === "human" && input.manualReplyConfirmed === true && !input.followup;
+    if (input.aiPaused && !confirmedV0HumanReply) return "SAV_THREAD_PAUSED";
     if (input.followup && input.threadStatus !== "awaiting_customer") return "SAV_FOLLOWUP_OBSOLETE";
     if (!input.followup && (!input.messageId || input.messageId !== input.latestInboundId)) return "SAV_REPLY_OBSOLETE";
   }
