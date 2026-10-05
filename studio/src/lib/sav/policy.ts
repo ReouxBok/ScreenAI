@@ -29,6 +29,14 @@ export type DecisionProposal = {
   requiresHumanApproval: boolean;
 };
 
+export type SavClassificationInput = {
+  from: string;
+  subject: string;
+  body: string;
+  autoSubmitted?: string;
+  contentType?: string;
+};
+
 const humanRequestPatterns = [
   /(?:parler|échanger|discuter)\s+(?:à|avec)\s+(?:un|une)\s+(?:humain|personne|conseiller|conseillère|agent)/i,
   /(?:transf(?:ère|erer|érez)|passez-moi)\s+(?:à|vers)\s+(?:un|une)\s+(?:humain|conseiller|personne)/i,
@@ -143,28 +151,26 @@ export function assertSavTicketStageNotClosed(stageId: string, closedStageIds: R
   if (closedStageIds.has(stageId)) throw new Error("SAV_AGENT_CANNOT_RESOLVE_TICKET");
 }
 
-export function deterministicDecision(input: {
-  from: string;
-  subject: string;
-  body: string;
-  autoSubmitted?: string;
-}): DecisionProposal {
+export function deterministicDecision(input: SavClassificationInput): DecisionProposal {
   const from = normalizeEmailAddress(input.from);
   const subject = input.subject.trim();
-  const text = `${subject}\n${sanitizeInboundText(input.body)}`;
-  const autoSubmitted = String(input.autoSubmitted || "").toLocaleLowerCase("en");
+  const body = sanitizeInboundText(input.body);
+  const text = `${subject}\n${body}`;
+  const autoSubmitted = String(input.autoSubmitted || "").split(";")[0].trim().toLocaleLowerCase("en");
+  const deliveryReport = /multipart\/report\s*;[^\n]*report-type\s*=\s*"?delivery-status/i.test(input.contentType ?? "");
 
-  if (/mailer-daemon|postmaster/i.test(from) || /undeliver|delivery status notification|échec de remise|non remis/i.test(text)) {
+  // Never infer a bounce from a phrase quoted in a customer's support request.
+  if (/^(?:mailer-daemon|postmaster)@/i.test(from) || deliveryReport) {
     return { kind: "bounce", reasonCode: "delivery_failure", explanation: "Le message est un avis automatique d’échec de distribution ; aucun ticket client n’est créé.", confidence: 990, requiresHumanApproval: false };
   }
-  if ((autoSubmitted && autoSubmitted !== "no") || /absence du bureau|out of office|réponse automatique|automatic reply/i.test(subject)) {
-    return { kind: "automatic_reply", reasonCode: "automated_sender_reply", explanation: "Gmail identifie une réponse automatique ; elle est conservée dans l’audit sans créer de nouveau ticket.", confidence: 980, requiresHumanApproval: false };
+  if (["auto-replied", "auto-generated"].includes(autoSubmitted)) {
+    return { kind: "automatic_reply", reasonCode: "automated_sender_reply", explanation: "L’en-tête Auto-Submitted indique un message automatique ; il est conservé dans l’audit sans créer de nouveau ticket.", confidence: 980, requiresHumanApproval: false };
+  }
+  if (autoSubmitted && autoSubmitted !== "no") {
+    return { kind: "human_review_required", reasonCode: "unknown_automation_header", explanation: "L’en-tête d’automatisation est inconnu ; la nature du message doit être vérifiée par un humain.", confidence: 300, requiresHumanApproval: true };
   }
   if (/^(?:no-?reply|notifications?)@limova\.ai$/i.test(from)) {
     return { kind: "internal_notification", reasonCode: "limova_system_notification", explanation: "Le message provient d’une adresse technique Limova et ne correspond pas à une demande client.", confidence: 960, requiresHumanApproval: false };
-  }
-  if (/\b(?:buy followers|guest post|casino|crypto giveaway|seo backlinks)\b/i.test(text)) {
-    return { kind: "spam", reasonCode: "unsolicited_bulk_message", explanation: "Le contenu correspond à une sollicitation automatisée sans rapport avec le SAV.", confidence: 960, requiresHumanApproval: false };
   }
   if (requestsHuman(text)) {
     return { kind: "human_review_required", reasonCode: "customer_requested_human", explanation: "Le client demande explicitement l’intervention d’une personne ; l’automatisation doit être suspendue et le ticket transmis au SAV.", confidence: 995, requiresHumanApproval: true };
@@ -175,5 +181,22 @@ export function deterministicDecision(input: {
   if (highRiskPatterns.some((pattern) => pattern.test(text))) {
     return { kind: "human_review_required", reasonCode: "sensitive_or_high_risk_request", explanation: "La demande touche à une opération sensible ou engageante et doit être relue par un humain.", confidence: 940, requiresHumanApproval: true };
   }
-  return { kind: "ticket_pending", reasonCode: "new_customer_support_request", explanation: "Le message contient une demande client exploitable qui doit être recherchée ou créée dans HubSpot.", confidence: 820, requiresHumanApproval: false };
+  if (/\b(?:buy followers|crypto giveaway|seo backlinks)\b/i.test(text)
+    && !/\b(?:limova|support|bug|erreur|problem|problème)\b/i.test(text)) {
+    return { kind: "spam", reasonCode: "unsolicited_bulk_message", explanation: "Le contenu correspond à une sollicitation commerciale sans rapport apparent avec le SAV ; aucun ticket n’est proposé.", confidence: 900, requiresHumanApproval: false };
+  }
+  if (!body || /^(?:bonjour|bonsoir|salut|hello|hi)[\s!.]*$/i.test(body)) {
+    return { kind: "human_review_required", reasonCode: "insufficient_message_content", explanation: "Le message ne contient pas de demande exploitable ; son contenu et ses éventuelles pièces jointes doivent être vérifiés par un humain.", confidence: 300, requiresHumanApproval: true };
+  }
+  // Only classify the whole short message, not a 'merci' preceding a new issue.
+  if (/^(?:(?:bonjour|bonsoir|hello)[\s,!]*)?(?:merci(?:\s+beaucoup)?(?:\s+pour\s+(?:votre|ton|la)\s+(?:aide|réponse|retour))?|thanks(?:\s+a\s+lot)?|thank\s+you|c['’]est\s+(?:bon|résolu)|tout\s+(?:fonctionne|est\s+bon))(?:[\s,!;.]+(?:bonne\s+journée|à\s+bientôt))?[\s!.]*$/i.test(body)) {
+    return { kind: "no_ticket_needed", reasonCode: "simple_acknowledgement", explanation: "Le message est uniquement un remerciement ou une confirmation, sans nouvelle demande ; aucun nouveau ticket n’est proposé.", confidence: 950, requiresHumanApproval: false };
+  }
+  if (/^(?:absence du bureau|out of office|réponse automatique|automatic reply)(?:\s*[:—-]|$)/i.test(subject)) {
+    return { kind: "human_review_required", reasonCode: "unconfirmed_automatic_reply", explanation: "L’objet évoque une réponse automatique, mais aucun en-tête fiable ne le confirme ; une revue humaine est nécessaire.", confidence: 500, requiresHumanApproval: true };
+  }
+  if (!/\?|\b(?:comment|how|aide|help|bug|erreur|error|problème|problem|impossible|bloqu|fonctionne|facture|invoice|abonnement|subscription|connexion|connecter|intégration|integration|paramètre|résilier|cancel)\b|(?:ne|n['’]).{0,40}(?:pas|plus)/i.test(text)) {
+    return { kind: "human_review_required", reasonCode: "ambiguous_inbound_message", explanation: "Aucun signal suffisant ne confirme une demande SAV ; l’humain doit qualifier ce message avant de proposer une action.", confidence: 500, requiresHumanApproval: true };
+  }
+  return { kind: "ticket_pending", reasonCode: "new_customer_support_request", explanation: "Le message présente une demande potentiellement liée au support ; le dossier HubSpot doit être recherché avant toute proposition de création validée par un humain.", confidence: 820, requiresHumanApproval: false };
 }

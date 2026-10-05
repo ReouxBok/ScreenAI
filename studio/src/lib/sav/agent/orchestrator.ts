@@ -19,6 +19,7 @@ import { assertSavAgentIsolation } from "./isolation";
 import { SAV_AGENT_TOOL_NAMES, savAgentOutputSchema, type SavAgentOutput } from "./contracts";
 import type { SavConversation } from "../conversation";
 import { assertSavAnalysisComplete } from "./validation";
+import type { SavProposalRouting } from "../proposal";
 
 export type SavAgentInput = {
   from: string;
@@ -39,6 +40,8 @@ export type SavAgentRunResult = {
   inputTokens: number;
   outputTokens: number;
   totalTokens: number;
+  knowledgeRevision: string;
+  ticketRouting: SavProposalRouting;
 };
 
 const instruction = `Tu es l’agent de qualification SAV Limova. Ton périmètre est strictement limité aux emails Gmail de contact@limova.ai, aux tickets HubSpot SAV et aux fiches de résolution SAV validées.
@@ -93,6 +96,8 @@ export async function runSavAdkAgent(input: SavAgentInput, options: {
   const resultByTool = new Map<string, unknown>();
   const executionsByTool = new Map<string, number>();
   let sequence = 0;
+  let knowledgeRevision = "not_consulted";
+  let ticketRouting: SavProposalRouting = { kind: "review", reason: "hubspot_context_unavailable", candidateIds: [] };
 
   function tracedTool<T extends z.ZodObject<z.ZodRawShape>>(definition: {
     name: typeof SAV_AGENT_TOOL_NAMES[number];
@@ -166,9 +171,12 @@ export async function runSavAdkAgent(input: SavAgentInput, options: {
           scope: "sav",
           limit: 5,
         });
+        if (knowledgeRevision !== "not_consulted" && knowledgeRevision !== result.revision) throw new Error("SAV_KNOWLEDGE_REVISION_CHANGED");
+        knowledgeRevision = result.revision;
         for (const item of result.results) evidenceById.set(item.id, {
           sourceType: "knowledge",
           sourceId: item.id,
+          contentVersionId: item.contentVersionId,
           title: item.title,
           score: item.score,
           verifiedAt: item.verifiedAt,
@@ -183,6 +191,13 @@ export async function runSavAdkAgent(input: SavAgentInput, options: {
       parameters: z.object({}).strict(),
       execute: async () => {
         const result = await (options.readHubspotContext ?? readSavHubspotContext)({ email: input.from, subject: input.subject, currentTicketId: input.conversation?.hubspotTicketId });
+        ticketRouting = !result.contactFound || !result.contactId
+          ? { kind: "review", reason: "customer_identity_unverified", candidateIds: [] }
+          : result.routing.kind === "matched" && result.routing.ticketId
+            ? { kind: "matched", ticketId: result.routing.ticketId, contactId: result.contactId, reason: result.routing.reason }
+            : result.routing.kind === "ambiguous"
+              ? { kind: "review", reason: result.routing.reason, candidateIds: result.routing.candidateIds ?? [] }
+              : { kind: "new", contactId: result.contactId, reason: result.routing.reason };
         for (const ticket of result.tickets) evidenceById.set(String(ticket.id), {
           sourceType: "hubspot_ticket",
           sourceId: String(ticket.id),
@@ -273,5 +288,7 @@ export async function runSavAdkAgent(input: SavAgentInput, options: {
     inputTokens,
     outputTokens,
     totalTokens,
+    knowledgeRevision,
+    ticketRouting,
   };
 }

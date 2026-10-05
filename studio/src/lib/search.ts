@@ -9,6 +9,7 @@ import { searchOperationalCurriculum } from "./operational-curriculum-search";
 
 export type KnowledgeSearchResult = {
   id: string;
+  contentVersionId?: string;
   title: string;
   content: string;
   score: number;
@@ -65,6 +66,14 @@ export async function searchKnowledge(rawInput: unknown) {
       results: curriculumResults,
     };
   }
+  const readRevision = async () => {
+    const value = await db.execute(sql`SELECT revision_id FROM active_knowledge WHERE singleton = true LIMIT 1`);
+    const rows = Array.isArray(value) ? value : (value as unknown as { rows: Record<string, unknown>[] }).rows;
+    return String(rows[0]?.revision_id ?? "kb_empty");
+  };
+  // Only SAV requires a stable revision across grounding. Preserve the
+  // installed extension's historical search behavior during publication.
+  const startingRevision = input.scope === "sav" ? await readRevision() : null;
   const [embedding] = await embedTexts([input.query], "RETRIEVAL_QUERY", { scope: input.scope });
   const vectorLiteral = `[${embedding.join(",")}]`;
 
@@ -72,6 +81,7 @@ export async function searchKnowledge(rawInput: unknown) {
     WITH candidates AS (
     SELECT
       item.id,
+      version.id AS "contentVersionId",
       item.title,
       chunk.content,
       item.slug AS source,
@@ -117,11 +127,11 @@ export async function searchKnowledge(rawInput: unknown) {
       AND ${input.scope === "sav" ? savResolutionIsCurrent : sql`TRUE`}
       AND ${typeFilter}
     ), best_per_content AS (
-      SELECT DISTINCT ON (id) id, title, content, source, "verifiedAt", "actionSteps", "resolution", score
+      SELECT DISTINCT ON (id) id, "contentVersionId", title, content, source, "verifiedAt", "actionSteps", "resolution", score
       FROM candidates
       ORDER BY id, score DESC
     )
-    SELECT id, title, content, source, "verifiedAt", "actionSteps", "resolution", score
+    SELECT id, "contentVersionId", title, content, source, "verifiedAt", "actionSteps", "resolution", score
     FROM best_per_content
     ORDER BY score DESC
     LIMIT ${input.limit}
@@ -132,6 +142,7 @@ export async function searchKnowledge(rawInput: unknown) {
     const parsedHints = learnedActionStepSchema.array().max(50).safeParse(row.actionSteps);
     return {
       id: String(row.id),
+      ...(row.contentVersionId ? { contentVersionId: String(row.contentVersionId) } : {}),
       title: String(row.title),
       content: String(row.content),
       score: Number(Number(row.score).toFixed(4)),
@@ -142,9 +153,11 @@ export async function searchKnowledge(rawInput: unknown) {
     };
   });
 
-  const revisionResponse = await db.execute(sql`SELECT revision_id FROM active_knowledge WHERE singleton = true LIMIT 1`);
-  const revisionRows = Array.isArray(revisionResponse) ? revisionResponse : (revisionResponse as unknown as { rows: Record<string, unknown>[] }).rows;
-  const revision = String(revisionRows[0]?.revision_id ?? "kb_empty");
+  const revision = await readRevision();
+  if (input.scope === "sav" && revision !== startingRevision) throw new Error("KNOWLEDGE_REVISION_CHANGED_DURING_SEARCH");
+  // SAV sources are evidence identities, not titles: two similarly named cards
+  // must remain visible so grounding can detect conflicts between them.
+  if (input.scope === "sav") return { revision, results };
   const byTitle = new Map<string, KnowledgeSearchResult>();
   for (const result of [...results, ...curriculumResults]) {
     const key = result.title.normalize("NFD").replace(/[\u0300-\u036f]/g, "").toLocaleLowerCase("fr");

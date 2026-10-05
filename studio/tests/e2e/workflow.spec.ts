@@ -166,14 +166,16 @@ test("le banc E2E utilise l’identité owner et expose les espaces administrate
   await expect(page).toHaveURL(/\/studio\/validations$/);
 });
 
-test("le registre SAV expose clairement le pilote, les verrous et les incidents", async ({ page }) => {
+test("la V0 SAV expose la frontière, les vues et le laboratoire isolé", async ({ page }) => {
   await login(page);
   await page.goto("/studio/sav");
-  await expect(page.getByRole("heading", { name: "Chaque mail laisse une trace." })).toBeVisible();
-  await expect(page.getByRole("heading", { name: "Tester Charly sur 10 mails isolés" })).toBeVisible();
-  await expect(page.getByText("Simulation stricte")).toBeVisible();
+  await expect(page.getByRole("heading", { name: "Propositions à piloter" })).toBeVisible();
+  await expect(page.getByText("Activation non effectuée : aucun ancien email ne sera proposé rétroactivement.", { exact: false })).toBeVisible();
   await expect(page.getByRole("navigation", { name: "Vues SAV" })).toBeVisible();
-  await expect(page.getByText("Incidents techniques")).toBeVisible();
+  await expect(page.getByRole("region", { name: "Emails synchronisés" })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "Évaluation des propositions" })).toBeVisible();
+  await page.getByRole("link", { name: "Laboratoire", exact: true }).click();
+  await expect(page.getByRole("heading", { name: "Un lot. Dix mails. Zéro action externe." })).toBeVisible();
 });
 
 test("une démonstration extension devient un parcours Charly éditable",async({page,request})=>{

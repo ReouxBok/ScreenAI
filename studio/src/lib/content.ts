@@ -1,5 +1,6 @@
 import { z } from "zod";
 import { AGENTS } from "./agents";
+import { semanticStepSchema } from "./knowledge/contracts";
 
 export const CATEGORIES = [
   ["bien-demarrer", "Bien démarrer"],
@@ -17,6 +18,7 @@ const stringList = z.array(nonEmptyString).max(50).default([]);
 const agentKey = z.enum(AGENTS.map((agent) => agent.key) as ["charly", "elio", "john", "lou", "tom", "sav", "common"]);
 
 export const articleMetadataSchema = z.object({
+  semanticSteps: z.array(semanticStepSchema).max(50).optional(),
   intents: stringList,
   limovaPaths: stringList,
   prerequisites: stringList,
@@ -65,6 +67,7 @@ export const learnedActionStepSchema = z.object({
 });
 
 export const onboardingMetadataSchema = z.object({
+  semanticSteps: z.array(semanticStepSchema).max(50).optional(),
   objective: nonEmptyString,
   proposalSignals: stringList,
   qualificationQuestions: stringList,

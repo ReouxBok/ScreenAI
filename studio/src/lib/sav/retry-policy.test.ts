@@ -12,5 +12,6 @@ describe("SAV external action retry policy", () => {
     expect(savActionFailurePlan("SAV_TICKET_MATCH_AMBIGUOUS:1,2", 1, now).status).toBe("failed");
     expect(savActionFailurePlan("SAV_REPLY_OBSOLETE", 1, now).status).toBe("cancelled");
     expect(savActionFailurePlan("GMAIL_HTTP_400", 1, now).status).toBe("failed");
+    expect(savActionFailurePlan("SAV_DISTINCT_ISSUE_CONFIRMATION_REQUIRED", 1, now)).toEqual({ status: "failed", scheduledAt: null, terminal: true });
   });
 });

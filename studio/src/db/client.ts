@@ -18,7 +18,7 @@ export function getDb(){
   if(!url)return null;
   if(url.startsWith("pglite:")){
     if(process.env.NODE_ENV==="production")throw new Error("PGLITE_FORBIDDEN_IN_PRODUCTION");
-    const client=new PGlite(url.replace(/^pglite:/,"file:"),{extensions:{vector:pgliteVector}});
+    const client=new PGlite(url.replace(/^pglite:/,""),{extensions:{vector:pgliteVector}});
     closeClient=()=>client.close();
     cachedDb=drizzlePglite(client,{schema}) as unknown as StudioDb;
   }else{

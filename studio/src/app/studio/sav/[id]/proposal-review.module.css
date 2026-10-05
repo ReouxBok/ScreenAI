@@ -1,0 +1,65 @@
+.review.review {
+  margin-top: 0;
+}
+
+.review h2 {
+  margin: 8px 0;
+  font-size: 26px;
+}
+
+.sources summary {
+  cursor: pointer;
+  font-size: 13px;
+  font-weight: 650;
+}
+
+.sources.sources {
+  padding: 14px 0;
+  border-top: 1px solid var(--line);
+}
+
+.review fieldset {
+  display: grid;
+  gap: 12px;
+}
+
+.review label {
+  display: grid;
+  gap: 7px;
+  min-width: 0;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.review input:not([type="hidden"]):not([type="checkbox"]),
+.review select {
+  width: 100%;
+  min-width: 0;
+  padding: 10px;
+  border: 1px solid #cad2cc;
+  border-radius: 10px;
+  background: white;
+  color: var(--ink);
+  font-size: 13px;
+}
+
+.review label:has(input[type="checkbox"]) {
+  display: flex;
+  align-items: start;
+}
+
+.review pre {
+  max-height: 380px;
+  overflow: auto;
+  overflow-wrap: anywhere;
+}
+
+.section { padding: 20px 0; border-top: 1px solid var(--line); }
+.section h3 { font-size: 17px; margin: 0 0 14px; }
+.summary { line-height: 1.6; white-space: pre-wrap; }
+.contextList { padding-left: 20px; color: var(--muted); line-height: 1.8; }
+.ticketMetrics { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; padding: 14px; border-radius: 10px; background: #f3f6f3; font-size: 12px; }
+.ticketMetrics strong { display: block; margin-top: 5px; font-size: 14px; }
+.validation { padding-top: 20px; border-top: 1px solid var(--line); }
+.validation p { color: var(--muted); line-height: 1.6; font-size: 12px; }
+.review button:disabled { opacity: .45; cursor: not-allowed; }

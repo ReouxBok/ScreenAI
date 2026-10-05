@@ -1,7 +1,7 @@
 import Link from "next/link";
 import { AlertTriangle, ArrowLeft, ArrowUpRight, Bot, Check, CheckCircle2, Clock3, FileText, LockKeyhole, MessageSquareText, NotebookPen, TicketCheck, UserRoundCheck, XCircle } from "lucide-react";
 import { isDatabaseConfigured } from "@/db";
-import { requireStaff } from "@/lib/auth";
+import { requireSavStaff as requireStaff } from "@/lib/sav/auth";
 import { isSavPilotMode, savGeminiApiKey } from "@/lib/sav/config";
 import { listSavPilotBatchItems, listSavPilotBatches, listSavPilotCandidates } from "@/lib/sav/service";
 import { cancelPilotBatchLabAction } from "../actions";

@@ -128,7 +128,7 @@ export async function rejectAction(form: FormData) {
 export async function publishAction(form: FormData) {
   const staff = await requireApiStaff("admin");
   const id = String(form.get("itemId"));
-  await publish(id, staff.email);
+  await publish(id, staff.email, { expectedVersionId: String(form.get("versionId") || "missing") });
   revalidatePath(`/studio/contenus/${id}`);
   revalidatePath("/aide");
 }
@@ -138,7 +138,7 @@ export async function reviewDecisionAction(form: FormData) {
   const id = String(form.get("itemId"));
   const decision = String(form.get("decision"));
   if (decision === "publish") {
-    await publish(id, staff.email);
+    await publish(id, staff.email, { expectedVersionId: String(form.get("versionId") || "missing") });
     revalidatePath("/studio");
     revalidatePath("/studio/validations");
   } else if (decision === "reject") {
@@ -152,7 +152,7 @@ export async function reviewDecisionAction(form: FormData) {
 export async function emergencyPublishAction(form: FormData) {
   const staff = await requireApiStaff("admin");
   const id = String(form.get("itemId"));
-  await publish(id, staff.email, { emergency: true, reason: String(form.get("reason")) });
+  await publish(id, staff.email, { emergency: true, reason: String(form.get("reason")), expectedVersionId: String(form.get("versionId") || "missing") });
   revalidatePath(`/studio/contenus/${id}`);
 }
 

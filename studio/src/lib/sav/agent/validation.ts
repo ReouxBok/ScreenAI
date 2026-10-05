@@ -13,6 +13,14 @@ export function assertSavAnalysisComplete(
       throw new Error(`SAV_REQUIRED_TOOL_UNAVAILABLE:${name}`);
     }
   }
+  assertSavGrounding(output, evidence, knowledgeById);
+}
+
+export function assertSavGrounding(
+  output: SavAgentOutput,
+  evidence: SavDecisionEvidence[],
+  knowledgeById: ReadonlyMap<string, { content: string; verifiedAt: string | null; score: number; resolution?: Record<string, unknown> }> = new Map(),
+) {
   const known = new Set(evidence.map((item) => item.sourceId));
   if (output.evidenceIds.some((id) => !known.has(id))) throw new Error("SAV_UNKNOWN_EVIDENCE");
   if (output.citations.some((citation) => !output.evidenceIds.includes(citation.sourceId))) throw new Error("SAV_CITATION_NOT_DECLARED");
@@ -23,10 +31,11 @@ export function assertSavAnalysisComplete(
   for (const citation of output.citations) {
     const source = knowledgeById.get(citation.sourceId);
     if (!source) throw new Error("SAV_CITATION_MUST_USE_KNOWLEDGE");
-    if (output.responseKind === "solution" && (!source.resolution || !Array.isArray(source.resolution.steps))) throw new Error("SAV_CITATION_REQUIRES_RESOLUTION_CARD");
+    if (output.responseKind === "solution" && (!source.resolution || !Array.isArray(source.resolution.steps) || !source.resolution.steps.length)) throw new Error("SAV_CITATION_REQUIRES_RESOLUTION_CARD");
     const normalize = (value: string) => value.normalize("NFKC").replace(/\s+/g, " ").trim().toLocaleLowerCase("fr");
     if (!normalize(source.content).includes(normalize(citation.quote))) throw new Error("SAV_CITATION_QUOTE_MISMATCH");
     if (source.score < 0.5) throw new Error("SAV_CITATION_RELEVANCE_TOO_LOW");
+    if (typeof source.resolution?.validUntil === "string" && source.resolution.validUntil < new Date().toISOString().slice(0, 10)) throw new Error("SAV_CITATION_EXPIRED");
     const verifiedAt = source.verifiedAt ? new Date(source.verifiedAt) : null;
     if (!verifiedAt || Number.isNaN(verifiedAt.getTime()) || Date.now() - verifiedAt.getTime() > 90 * 86_400_000) throw new Error("SAV_CITATION_STALE");
   }
@@ -38,5 +47,4 @@ export function assertSavAnalysisComplete(
       if (conflicts.some((id) => typeof id === "string" && selected.has(id))) throw new Error("SAV_CONTRADICTORY_RESOLUTION_CARDS");
     }
   }
-  if (!output.ticketRequired && !output.requiresHuman && output.replyDraft.trim()) throw new Error("SAV_INCONSISTENT_REPLY_WITHOUT_TICKET");
 }

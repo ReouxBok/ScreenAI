@@ -5,6 +5,7 @@
   "private": true,
   "scripts": {
     "dev": "next dev",
+    "sav:preview": "node scripts/sav-preview.mjs",
     "build": "next build",
     "start": "next start",
     "lint": "eslint",
@@ -46,7 +47,7 @@
     "drizzle-orm": "^0.45.2",
     "gray-matter": "^4.0.3",
     "lucide-react": "^1.28.0",
-    "next": "16.3.4",
+    "next": "16.3.8",
     "postgres": "^3.4.9",
     "react": "19.2.8",
     "react-dom": "19.2.8",
@@ -64,22 +65,23 @@
     "dotenv-cli": "^11.0.0",
     "drizzle-kit": "^0.31.10",
     "eslint": "^9",
-    "eslint-config-next": "16.3.0",
+    "eslint-config-next": "16.3.8",
     "tsx": "^4.23.5",
     "typescript": "^5",
     "vitest": "^4.1.10"
   },
   "overrides": {
+    "devalue": "5.9.3",
     "@workflow/core": {
       "nanoid": "5.1.16"
     },
     "@workflow/world-local": {
-      "undici": "7.29.0"
+      "undici": "7.29.1"
     },
     "@workflow/world-vercel": {
-      "undici": "7.29.0"
+      "undici": "7.29.1"
     },
-    "adm-zip": "0.6.0",
+    "adm-zip": "0.6.1",
     "mariadb": "3.5.3",
     "mysql2": "3.24.3",
     "tar": "7.5.22"

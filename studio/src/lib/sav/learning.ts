@@ -12,6 +12,8 @@ import {
 import type { ArticleMetadata } from "@/db/schema";
 import { saveDraft } from "@/lib/workflow";
 import { decryptSavPayload } from "./crypto";
+import { proposeOnboardingFromSav } from "@/lib/knowledge/candidates";
+import { assertKnowledgeUgoApproval } from "@/lib/knowledge/contracts";
 
 type LearningPatch = {
   subject: string;
@@ -80,10 +82,21 @@ export async function listLearningCandidates(limit = 100) {
 }
 
 export async function approveLearningCandidate(candidateId: string, actorEmail: string) {
-  const db = requireDb();
+  assertKnowledgeUgoApproval(actorEmail);
+  const result = await requireDb().transaction(async (tx) => {
+  const db = tx;
   const [candidate] = await db.select().from(savLearningCandidates)
-    .where(and(eq(savLearningCandidates.id, candidateId), eq(savLearningCandidates.status, "pending"))).limit(1);
+    .where(eq(savLearningCandidates.id, candidateId)).for("update");
   if (!candidate) throw new Error("SAV_LEARNING_CANDIDATE_NOT_PENDING");
+  if (candidate.status === "approved" && candidate.contentItemId) {
+    const [evidence] = await db.select().from(savResolutionEvidence).where(and(eq(savResolutionEvidence.itemId, candidate.contentItemId), eq(savResolutionEvidence.sourceRef, candidate.sourceRef), eq(savResolutionEvidence.outcome, "human_resolution"))).orderBy(desc(savResolutionEvidence.createdAt)).limit(1);
+    if (!evidence) throw new Error("KNOWLEDGE_REVIEWED_VERSION_EVIDENCE_REQUIRED");
+    const [item] = await db.select().from(contentItems).where(eq(contentItems.id, candidate.contentItemId)).limit(1);
+    const [version] = await db.select().from(contentVersions).where(eq(contentVersions.id, evidence.versionId)).limit(1);
+    if (!item || !version) throw new Error("SAV_RESOLUTION_CONTENT_INVALID");
+    return { item, version };
+  }
+  if (candidate.status !== "pending") throw new Error("SAV_LEARNING_CANDIDATE_NOT_PENDING");
   const patch = candidatePatch(candidate);
   const sourceLabel = candidate.hubspotTicketId ? `ticket HubSpot ${candidate.hubspotTicketId}` : `dossier SAV ${candidate.threadId ?? candidate.sourceRef}`;
   const subject = plainText(patch.subject) || `Résolution du ${sourceLabel}`;
@@ -113,6 +126,7 @@ export async function approveLearningCandidate(candidateId: string, actorEmail: 
       changeNote: `Apprentissage après intervention humaine sur le ${sourceLabel}`,
       metadata: {
         ...metadata,
+        semanticSteps: undefined,
         sourceMetadata: {
           ...(metadata.sourceMetadata ?? {}),
           supportResolution: true,
@@ -121,13 +135,12 @@ export async function approveLearningCandidate(candidateId: string, actorEmail: 
           resolutionProvenance: patch.provenance ?? "unknown",
           customerConfirmed: patch.customerConfirmed === true,
         },
-        resolution: metadata.resolution ?? {
-          symptoms: [subject.slice(0, 500)], steps: [resolution], exceptions: [],
-          escalation: "Transférer à un humain si la situation diffère de ce cas ou si la procédure échoue.",
-          productVersion: "",
+        resolution: {
+          ...(metadata.resolution ?? { symptoms: [subject.slice(0, 500)], exceptions: [], escalation: "Transférer à un humain si la situation diffère de ce cas ou si la procédure échoue.", productVersion: "" }),
+          steps: [resolution],
         },
       },
-    }, actorEmail, current.item.id);
+    }, actorEmail, current.item.id, tx);
   } else {
     const slugId = candidate.sourceRef.toLocaleLowerCase("en").replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "").slice(0, 80) || candidate.id.slice(0, 8);
     result = await saveDraft({
@@ -146,7 +159,7 @@ export async function approveLearningCandidate(candidateId: string, actorEmail: 
         intents: [subject.slice(0, 500)],
         limovaPaths: [],
         prerequisites: [],
-        expectedResult: "Le problème décrit est résolu et le client confirme le résultat.",
+        expectedResult: "Vérifier que le problème décrit est résolu ; recueillir une confirmation du client si nécessaire.",
         troubleshooting: "Transférer à un humain si la procédure validée ne fonctionne pas.",
         sourceMetadata: { supportResolution: true, evidenceTicketIds: candidate.hubspotTicketId ? [candidate.hubspotTicketId] : [], evidenceSourceRefs: [candidate.sourceRef], sourceSnapshotId: patch.sourceSnapshotId, resolutionProvenance: patch.provenance ?? "unknown", customerConfirmed: patch.customerConfirmed === true },
         resolution: {
@@ -155,10 +168,9 @@ export async function approveLearningCandidate(candidateId: string, actorEmail: 
           productVersion: "",
         },
       },
-    }, actorEmail);
+    }, actorEmail, undefined, tx);
   }
 
-  await db.transaction(async (tx) => {
     await tx.insert(savResolutionEvidence).values({
       itemId: result.item.id,
       versionId: result.version.id,
@@ -174,7 +186,9 @@ export async function approveLearningCandidate(candidateId: string, actorEmail: 
       reviewedBy: actorEmail,
       reviewedAt: new Date(),
     }).where(eq(savLearningCandidates.id, candidate.id));
+  return result;
   });
+  await proposeOnboardingFromSav(candidateId, actorEmail);
   return result;
 }
 

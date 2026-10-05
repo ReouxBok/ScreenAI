@@ -25,9 +25,9 @@ jobs:
       - run: npm ci
       - run: npm ci --prefix proxy
       - run: npm ci --prefix studio
-      - run: npm audit --audit-level=high
-      - run: npm audit --prefix proxy --audit-level=high
-      - run: npm audit --prefix studio --audit-level=high
+      - run: node scripts/audit-dependencies.mjs
+      - run: node scripts/audit-dependencies.mjs proxy
+      - run: node scripts/audit-dependencies.mjs studio
       - run: npm test
       - run: npm run typecheck --prefix studio
       - run: npm run lint --prefix studio

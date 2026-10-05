@@ -64,6 +64,39 @@ describe("SAV policy", () => {
     expect(deterministicDecision({ from: "client@example.com", subject: "Réponse automatique : absence", body: "Je reviens lundi", autoSubmitted: "auto-replied" }).kind).toBe("automatic_reply");
   });
 
+  it.each([
+    ["Merci beaucoup !", "no_ticket_needed", "simple_acknowledgement"],
+    ["Bonjour, merci pour votre aide. Bonne journée !", "no_ticket_needed", "simple_acknowledgement"],
+    ["Tout fonctionne !", "no_ticket_needed", "simple_acknowledgement"],
+    ["Merci, mais comment retrouver mes factures ?", "ticket_pending", "new_customer_support_request"],
+    ["Bonjour", "human_review_required", "insufficient_message_content"],
+    ["", "human_review_required", "insufficient_message_content"],
+    ["Je vous propose un rendez-vous jeudi.", "human_review_required", "ambiguous_inbound_message"],
+    ["Buy followers now!", "spam", "unsolicited_bulk_message"],
+    ["Mon agent Limova bloque le texte SEO backlinks, comment faire ?", "ticket_pending", "new_customer_support_request"],
+    ["Mon agent pour un casino ne fonctionne plus.", "ticket_pending", "new_customer_support_request"],
+    ["Le message est non remis, comment utiliser Limova ?", "ticket_pending", "new_customer_support_request"],
+  ])("qualifies %s conservatively with a traceable reason", (body, kind, reasonCode) => {
+    const result = deterministicDecision({ from: "client@example.com", subject: "Message", body });
+    expect(result).toMatchObject({ kind, reasonCode });
+    expect(result.explanation.length).toBeGreaterThan(10);
+    expect(result.confidence).toBeGreaterThanOrEqual(0);
+    expect(result.confidence).toBeLessThanOrEqual(1_000);
+  });
+
+  it("uses MIME delivery status, not quoted delivery-error text", () => {
+    expect(deterministicDecision({ from: "robot@example.com", subject: "Rapport", body: "failed",
+      contentType: 'multipart/report; report-type="delivery-status"; boundary=x' })).toMatchObject({ kind: "bounce" });
+    expect(deterministicDecision({ from: "client@example.com", subject: "Échec de remise", body: "Comment corriger cette erreur ?" }).kind).toBe("ticket_pending");
+  });
+
+  it("does not trust an automated-looking subject or an unknown header alone", () => {
+    expect(deterministicDecision({ from: "client@example.com", subject: "Réponse automatique : absence", body: "Je reviens lundi" })).toMatchObject({ kind: "human_review_required", reasonCode: "unconfirmed_automatic_reply" });
+    expect(deterministicDecision({ from: "client@example.com", subject: "Aide", body: "Comment faire ?", autoSubmitted: "unknown-extension" })).toMatchObject({ kind: "human_review_required", reasonCode: "unknown_automation_header" });
+    expect(deterministicDecision({ from: "client@example.com", subject: "Aide", body: "Comment faire ?", autoSubmitted: " Auto-Replied; owner-email=x@example.com" }).kind).toBe("automatic_reply");
+    expect(deterministicDecision({ from: "client@example.com", subject: "Aide", body: "Comment faire ?", autoSubmitted: "no" }).kind).toBe("ticket_pending");
+  });
+
   it("blocks every non-allowlisted recipient in test mode", () => {
     expect(isSavOutboundRecipientAllowed("ugo@limova.ai", { testMode: true, allowlist: "reouven@limova.ai,ugo@limova.ai" })).toBe(true);
     expect(isSavOutboundRecipientAllowed("client@example.com", { testMode: true, allowlist: "*@limova.ai" })).toBe(false);
