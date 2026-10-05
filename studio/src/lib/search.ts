@@ -71,7 +71,9 @@ export async function searchKnowledge(rawInput: unknown) {
     const rows = Array.isArray(value) ? value : (value as unknown as { rows: Record<string, unknown>[] }).rows;
     return String(rows[0]?.revision_id ?? "kb_empty");
   };
-  const startingRevision = await readRevision();
+  // Only SAV requires a stable revision across grounding. Preserve the
+  // installed extension's historical search behavior during publication.
+  const startingRevision = input.scope === "sav" ? await readRevision() : null;
   const [embedding] = await embedTexts([input.query], "RETRIEVAL_QUERY", { scope: input.scope });
   const vectorLiteral = `[${embedding.join(",")}]`;
 
@@ -152,7 +154,7 @@ export async function searchKnowledge(rawInput: unknown) {
   });
 
   const revision = await readRevision();
-  if (revision !== startingRevision) throw new Error("KNOWLEDGE_REVISION_CHANGED_DURING_SEARCH");
+  if (input.scope === "sav" && revision !== startingRevision) throw new Error("KNOWLEDGE_REVISION_CHANGED_DURING_SEARCH");
   // SAV sources are evidence identities, not titles: two similarly named cards
   // must remain visible so grounding can detect conflicts between them.
   if (input.scope === "sav") return { revision, results };

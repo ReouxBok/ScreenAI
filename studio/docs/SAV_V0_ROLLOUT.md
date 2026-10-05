@@ -21,10 +21,18 @@ Version de retour arrière vérifiée au début de la préparation : commit `9b2
 
 ## Sécurité et recette
 
-L'audit initial bloque la CI : dépendances vulnérables préexistantes, notamment Next 16.3.4 (alerte critique next/og). Ugo autorise un lot séparé de correctifs compatibles, sans montée majeure ADK ni modification fonctionnelle de l'extension. Aucun contournement de l'audit, aucune montée majeure forcée.
+L'audit initial bloque la CI : dépendances vulnérables préexistantes, notamment Next 16.3.4 (alerte critique next/og). Ugo autorise un lot séparé de correctifs compatibles, sans montée majeure ADK ni modification fonctionnelle de l'extension. Le 5 octobre, il autorise ensuite une exception temporaire ciblée sur GHSA-vfj7-8cjw-p6xm (braces 3.0.3), expirant le 12 octobre à 00:00 UTC, documentée dans `SAV_V0_SECURITY.md`. Toute autre high/critical reste bloquante et la CI fonctionnelle reste inchangée. Aucune montée majeure forcée.
 
 La suite Studio avant ce lot de sécurité : 368/368 tests, lint complet, TypeScript, build et replay 12/12 réussis. Génération Drizzle : aucun écart supplémentaire au schéma des migrations 0025–0028. Ces preuves locales ne remplacent pas la recette Gmail/HubSpot/IA réelle.
 
 ## Retour arrière
 
 D'abord bloquer les écritures, puis restaurer le déploiement connu compatible. Conserver migrations additives, reçus, audits et frontière. Une configuration d'environnement modifiée n'affecte pas magiquement les déploiements existants : vérifier/re-déployer le kill switch si nécessaire. Un email envoyé, un ticket créé ou un classement Gmail déjà réalisé n'est pas annulé par un rollback du code. Pas de replay aveugle des résultats incertains.
+
+## Non-régression extension — contre-vérification du 5 octobre
+
+Le feu vert production d'Ugo est conditionné à la préservation de l'extension déjà livrée. Ne publier aucun paquet Chrome et ne déployer aucun proxy dans ce rollout Studio. Les fichiers de l'extension/DOM et les tutoriels publiés ne sont pas modifiés par cette livraison.
+
+Une régression indirecte a été reproduite localement : le nouveau garde de révision de `searchKnowledge` s'appliquait aussi au scope extension. Une publication concurrente déclenchait une erreur API et pouvait forcer la base embarquée de secours du client Chrome. Le garde est désormais strictement SAV ; la recherche extension garde son comportement historique. Deux tests de course simulent le changement de révision pendant l'embedding : extension sans erreur, SAV refusant toujours une proposition à révisions mélangées.
+
+Preuves locales : 303/303 tests racine extension/proxy et 370/370 tests Studio. Elles ne constituent pas une preuve E2E ou une qualification de qualité sur des requêtes réelles. Le correctif local n'est pas encore publié. L'accord conditionnel ne supprime ni la gate sécurité restante ni les vérifications de sauvegarde/migrations ; aucun merge, déploiement, cutover ou appel externe mutatif n'a été réalisé à cette étape.

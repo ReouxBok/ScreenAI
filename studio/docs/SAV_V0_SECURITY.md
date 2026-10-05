@@ -26,7 +26,19 @@ Ces comptes incluent les dépendances parentes d'une même alerte transitive : c
 
 Ne pas exécuter `npm audit fix --force` : les propositions incluent ADK 2 et un downgrade majeur ESLint Next. Une montée majeure ADK seule ne corrige pas la présence de braces dans les outils de lint.
 
-Pas de modification du seuil CI, pas d'exception silencieuse ni de fake override supprimant l'alerte. Production, migrations et cutover restent en attente d'une remédiation ciblée et validée. La présence de braces dans une dépendance ne prouve pas qu'un client peut atteindre son parseur : cartographier les appels réels avant de proposer une suppression/remplacement ou une mitigation.
+Le seuil reste high/critical. La présence de braces dans une dépendance ne prouve pas qu'un client peut atteindre son parseur ; elle n'est pas non plus une preuve d'absence de risque.
+
+## Exception temporaire explicitement autorisée — 5 octobre 2026
+
+Après la proposition d'une exception documentée limitée à braces, Ugo répond « ok fais la verif vite puis push ». Cette décision remplace l'attente d'une correction upstream pour cette seule alerte ; elle ne supprime aucune autre gate de recette ou de base de données.
+
+- Propriétaire : Ugo Le Bras. Expiration bloquante : **12 octobre 2026 à 00:00 UTC**. Pas de renouvellement automatique.
+- Seulement **GHSA-vfj7-8cjw-p6xm**, dépendance `braces`, version installée **3.0.3**, sévérité high et plage `<=3.0.3`. Aucune exception sur une nouvelle alerte, une critical ou un paquet parent entier.
+- `scripts/audit-dependencies.mjs` conserve les comptes bruts et affiche un avertissement. Il remonte les chaînes transitives et échoue sur toute autre high/critical, une erreur réseau, un rapport incomplet ou une exception expirée. Aucun `continue-on-error`.
+- Cartographie : ESLint Next utilise des motifs de configuration ; MikroORM utilise les chemins d'entités/cache. Aucun flux email → motif braces identifié. Import ADK, construction du runner en mémoire et création de session instrumentés : zéro appel braces. Ce contrôle ne couvre pas un appel réel du modèle et ne prouve pas l'inexploitabilité.
+- Risque résiduel accepté : déni de service par motif profondément imbriqué si un chemin exposé est trouvé. Aucune correction de la faille n'est revendiquée.
+- Livraison limitée au Studio en shadow, écritures Gmail/HubSpot bloquées, aucun déploiement proxy ni publication Chrome. CI complète, sauvegarde/restauration, migrations et rollback restent obligatoires.
+- Retirer l'exception dès qu'une correction compatible ou une remédiation testée est disponible ; avant expiration, revoir l'alerte et les chemins d'exposition. Pas de montée majeure ADK forcée.
 
 ## Vérifications locales
 
