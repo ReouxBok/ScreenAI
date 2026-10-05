@@ -31,6 +31,14 @@ La modification des libellés requiert notamment gmail.modify (ou un scope Gmail
 
 La watch INBOX et le curseur de synchronisation restent inchangés. Le préflight d’envoi lit le thread par ID et ne dépend pas de la présence d’INBOX : l’archivage ne supprime pas le contexte nécessaire pour répondre.
 
+### Diagnostic des droits après activation assist
+
+`GET /api/internal/sav/gmail-permissions`, protégé par `STUDIO_SERVICE_TOKEN` (au moins 32 caractères), inspecte le grant OAuth du runtime et le profil `contact@limova.ai`, sans envoi, classement, lecture de corps email ni écriture DB. Réponse non cachée ; aucun token, credential, corps provider ou donnée client retourné. Ne pas copier le token dans un navigateur ou les logs.
+
+Le rapport distingue `sendScopeGranted` et `modifyScopeGranted`. `gmail.modify` permet les deux ; un droit d’envoi seul ne permet pas le classement. Un champ scope absent reste inconnu et ne doit pas être interprété comme un droit absent ou accordé. Le diagnostic ne prouve pas qu’une mutation réussira : `writesNotTested` reste vrai, même avec les scopes requis. Les politiques Workspace peuvent encore refuser une opération.
+
+Ce diagnostic fonctionne en assist sans retirer les garde-fous du préflight initial, qui reste réservé au rollout shadow verrouillé. Si les droits sont insuffisants, demander une réautorisation humaine du compte de service ; ne pas élargir les scopes ni remplacer le refresh token sans validation.
+
 ## Vérification
 
 Tests isolés PGlite/réseau simulé : message exact, préservation des autres libellés et lu/non lu, dossier manquant/ambigu, permissions, acteur non autorisé, identifiants incohérents, corbeille, cutover, boîte inactive, pilotes, kill switch avant POST, clic répété et résultat incertain. Tests POST/auth et rendu sans effet externe. Aucune mutation Gmail réelle dans la recette locale.

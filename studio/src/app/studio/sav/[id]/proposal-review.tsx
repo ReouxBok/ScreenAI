@@ -7,9 +7,9 @@ import styles from "./proposal-review.module.css";
 const verdicts = [["correct", "Correct"], ["partial", "Partiel"], ["incorrect", "Incorrect"], ["critical", "Critique"]] as const;
 type Props = { data: NonNullable<Awaited<ReturnType<typeof getSavProposalReview>>>; threadId: string; messageId: string;
   drafts?: Awaited<ReturnType<typeof getSavReplyDrafts>>; context?: { subject: string; messageCount: number; relatedCount: number; linkedTicketId: string | null };
-  sendAllowed?: boolean; replyState?: "sent" | "pending" | "uncertain" | null };
+  sendAllowed?: boolean; sendDisabledReason?: string | null; replyState?: "sent" | "pending" | "uncertain" | null };
 
-export function ProposalReview({ data, threadId, messageId, drafts, context, sendAllowed = false, replyState }: Props) {
+export function ProposalReview({ data, threadId, messageId, drafts, context, sendAllowed = false, sendDisabledReason, replyState }: Props) {
   const p = data.proposal;
   const current = drafts?.versions.find((draft) => draft.isCurrent);
   const knowledge = p.sources.filter((source) => source.sourceType === "knowledge" && (source.claim || source.excerpt || p.process.some((step) => step.sourceIds.includes(source.sourceId))));
@@ -44,7 +44,7 @@ export function ProposalReview({ data, threadId, messageId, drafts, context, sen
         {current?.stale && <p role="status">Le brouillon précédent est obsolète. La proposition actuelle est affichée : relisez-la avant de l’enregistrer ou de l’envoyer.</p>}
         <label>Réponse au client<textarea name="replyDraft" rows={9} maxLength={10_000} defaultValue={!current?.stale && current?.status !== "abandoned" ? current?.text ?? p.replyDraft ?? "" : p.replyDraft ?? ""}/></label>
         <div className="decision-buttons"><button className="secondary" formAction={saveReplyDraftAction} formNoValidate>Enregistrer le brouillon</button><button className="primary" formAction={sendStudioReplyAction} formNoValidate disabled={!sendAllowed || Boolean(replyState)}>Envoyer la réponse</button></div>
-        <p>{replyState === "sent" ? "Réponse déjà envoyée pour cet email." : replyState === "pending" ? "Envoi en cours ou en attente. Aucun second envoi ne sera créé." : replyState === "uncertain" ? "Résultat d’envoi à vérifier dans Gmail. Ne pas renvoyer automatiquement." : !sendAllowed ? "Envoi désactivé dans cette prévisualisation. Le brouillon reste dans le Studio." : "Ce bouton envoie uniquement cette réponse dans le fil Gmail d’origine. Il ne valide ni le process ni une connaissance."}</p>
+        <p>{replyState === "sent" ? "Réponse déjà envoyée pour cet email." : replyState === "pending" ? "Envoi en cours ou en attente. Aucun second envoi ne sera créé." : replyState === "uncertain" ? "Résultat d’envoi à vérifier dans Gmail. Ne pas renvoyer automatiquement." : !sendAllowed ? sendDisabledReason ?? "L’envoi n’est pas disponible pour ce dossier. Le brouillon reste dans le Studio." : "Ce bouton envoie uniquement cette réponse dans le fil Gmail d’origine. Il ne valide ni le process ni une connaissance."}</p>
         {drafts && <details className={styles.sources}><summary>Historique des brouillons ({drafts.versions.length}{drafts.versions.length === 50 ? " dernières versions" : ""})</summary>{drafts.versions.map((draft) => <article key={draft.id}><p>Version {draft.revision} · {draft.status === "abandoned" ? "Abandonné" : draft.status === "validated" ? "Validé en interne" : "Brouillon"}{draft.stale ? " · contexte obsolète" : ""} · {draft.createdBy}</p><pre>{draft.text}</pre></article>)}</details>}
       </section>
       <section className={styles.section}><h3>Connaissances utilisées</h3>{knowledge.length ? <ul>{knowledge.map((source, index) => <li key={`${source.sourceId}:${index}`}><strong>{source.title}</strong>{source.claim && <p>{source.claim}</p>}</li>)}</ul> : <p>Aucune connaissance spécifique utilisée dans cette proposition.</p>}</section>

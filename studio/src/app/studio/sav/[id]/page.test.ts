@@ -196,6 +196,21 @@ describe("SAV dossier SSR and human-review guardrails", () => {
     expect(buttonAttributes(html, "Envoyer la réponse")[0]).not.toContain("disabled");
     expect(html).toContain("Il ne valide ni le process ni une connaissance");
   });
+  it("allows manual V0 send on a human-owned dossier, not an automatic resumption", async () => {
+    vi.stubEnv("SAV_WRITES_DISABLED", "false");
+    const detail = detailFixture();
+    detail.thread.aiPaused = true; detail.thread.status = "human_requested";
+    dependencies.detail.mockResolvedValue(detail);
+    const html = await renderPage();
+    expect(buttonAttributes(html, "Envoyer la réponse")[0]).not.toContain("disabled");
+    expect(html).not.toContain("Envoi désactivé dans cette prévisualisation");
+    expect(buttonAttributes(html, "Transférer à un humain")).toHaveLength(0);
+  });
+  it("explains the real environment lock rather than claiming this is a preview", async () => {
+    const html = await renderPage();
+    expect(html).toContain("Les envois sont désactivés dans cet environnement");
+    expect(buttonAttributes(html, "Envoyer la réponse")[0]).toContain("disabled");
+  });
 
   it("lists only knowledge actually supporting the response/process, not every retrieved search result", async () => {
     const review = reviewFixture();
@@ -287,6 +302,19 @@ describe("SAV dossier SSR and human-review guardrails", () => {
     expect(buttonAttributes(aside(html), "Demande HubSpot en attente")).toEqual([expect.stringContaining('disabled=""')]);
     expect(buttonAttributes(html, "Créer un ticket HubSpot")).toEqual([]);
     expect(html).not.toContain("Confirmer le rattachement");
+  });
+  it.each(["create_ticket", "link_ticket"] as const)("does not mistake an AI %s suggestion for a pending human request in V0", async (kind) => {
+    const detail = detailFixture();
+    detail.actions = [actionFixture({ kind, actorType: "ai", actorEmail: null, status: "pending" })];
+    dependencies.detail.mockResolvedValue(detail);
+    dependencies.review.mockResolvedValue(reviewFixture(true));
+    const html = await renderPage();
+    expect(buttonAttributes(html, "Demande HubSpot en attente")).toHaveLength(0);
+    expect(buttonAttributes(html, "Créer un ticket HubSpot")[0]).not.toContain("disabled");
+    dependencies.review.mockResolvedValue(reviewFixture(false));
+    const unreviewed = await renderPage();
+    expect(buttonAttributes(unreviewed, "Créer un ticket HubSpot")[0]).toContain("disabled");
+    expect(unreviewed).toContain("Validez d’abord la proposition courante");
   });
 
   it("keeps historical mail readable without a new proposal-review or send CTA", async () => {

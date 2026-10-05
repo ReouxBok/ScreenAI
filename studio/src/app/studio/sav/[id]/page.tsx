@@ -63,7 +63,8 @@ export default async function SavThreadPage({ params, searchParams }: { params: 
   const currentDecision = [...detail.decisions].reverse().find((decision) => decision.isCurrent);
   const displayedDecision = proposalReview?.proposal.decision ?? currentDecision;
   const needsTicketReconciliation = detail.actions.some((action) => !action.payload.hubspotTicketId && (action.errorCode === "SAV_MANUAL_RECONCILIATION_REQUIRED" || action.kind === "create_ticket" && action.payload.ticketCreateDispatchedAt));
-  const ticketRequestPending = detail.actions.some((action) => ["create_ticket", "link_ticket"].includes(action.kind) && ["pending", "running"].includes(action.status));
+  // V0 AI suggestions cannot execute. Only a queued human request blocks another click.
+  const ticketRequestPending = detail.actions.some((action) => (!v0 || action.actorType === "human") && ["create_ticket", "link_ticket"].includes(action.kind) && ["pending", "running"].includes(action.status));
   const approvedDraftIds = new Set(detail.actions.map((action) => action.payload.approvedDraftId).filter((value): value is string => typeof value === "string"));
   const drafts = detail.actions.filter((action) => action.kind === "draft_reply" && action.status === "succeeded" && !approvedDraftIds.has(action.id));
   const notes = detail.actions.filter((action) => action.kind === "create_note" && action.noteText);
@@ -71,6 +72,10 @@ export default async function SavThreadPage({ params, searchParams }: { params: 
   const hubspotPortalId = process.env.HUBSPOT_PORTAL_ID ?? "143641967";
   const replyAction = detail.actions.find((action) => action.kind === "send_reply" && action.messageId === latestInbound?.id && action.payload.manualReplyConfirmed === true);
   const replyState = replyAction?.status === "succeeded" ? "sent" : replyAction?.payload.replySendDispatchedAt ? "uncertain" : replyAction && ["pending", "running"].includes(replyAction.status) ? "pending" : null;
+  const sendDisabledReason = detail.pilotItem ? "Simulation : aucun email réel ne peut être envoyé depuis ce dossier."
+    : savAutomationMode() === "shadow" || process.env.SAV_WRITES_DISABLED === "true" ? "Les envois sont désactivés dans cet environnement. Le brouillon reste dans le Studio."
+    : !v0 ? "L’envoi manuel depuis ce brouillon est réservé à la V0."
+    : null;
 
   return <>
     {filing && <p className={`login-notice ${["filed", "already_filed", "SAV_GMAIL_FILING_DISABLED", "SAV_GMAIL_FILING_PILOT_BLOCKED"].includes(filing) ? "" : "error"}`} role="status">{filingNotices[filing] ?? filingNotices.SAV_GMAIL_FILING_FAILED}</p>}
@@ -82,7 +87,7 @@ export default async function SavThreadPage({ params, searchParams }: { params: 
     <section className={`sav-thread-grid ${styles.layout}`}>
       <div className={`sav-conversation ${styles.main}`}>
         <MailConversation messages={detail.messages}/>
-        {proposalReview && latestInbound && <ProposalReview data={proposalReview} threadId={detail.thread.id} messageId={latestInbound.id} drafts={replyDrafts} context={{ subject: latestInbound.subject, messageCount: detail.messages.length, relatedCount: relatedThreads.length, linkedTicketId: detail.thread.hubspotTicketId }} sendAllowed={savAutomationMode() !== "shadow" && process.env.SAV_WRITES_DISABLED !== "true" && !detail.pilotItem && !detail.thread.aiPaused} replyState={replyState}/>}
+        {proposalReview && latestInbound && <ProposalReview data={proposalReview} threadId={detail.thread.id} messageId={latestInbound.id} drafts={replyDrafts} context={{ subject: latestInbound.subject, messageCount: detail.messages.length, relatedCount: relatedThreads.length, linkedTicketId: detail.thread.hubspotTicketId }} sendAllowed={!sendDisabledReason} sendDisabledReason={sendDisabledReason} replyState={replyState}/>}
         {!proposalReview && currentDecision?.evidence.some((source) => source.claim || source.excerpt) && <section className="card sav-note"><span className="eyebrow">Preuves de la réponse</span><h2>Affirmations reliées aux fiches validées</h2><ul>{currentDecision.evidence.map((source) => <li key={`${source.sourceType}:${source.sourceId}`}><strong>{source.title}</strong>{source.claim && <p>{source.claim}</p>}{source.excerpt && <blockquote>{source.excerpt}</blockquote>}{source.verifiedAt && <small>Fiche vérifiée le {source.verifiedAt}</small>}</li>)}</ul></section>}
         {v0 && !proposalReview && <section className={`card ${styles.context}`}><span className="eyebrow">Proposition IA</span><h2>{latestInbound?.analysisErrorCode ? "Analyse à relancer" : "Aucune proposition disponible"}</h2><p>{latestInbound?.analysisErrorCode ? "L’email est conservé. Vérifiez l’erreur dans les actions à droite avant de relancer." : "Les anciens emails ne sont pas retraités. Une proposition apparaîtra pour les nouveaux emails éligibles, après leur analyse."}</p></section>}
 

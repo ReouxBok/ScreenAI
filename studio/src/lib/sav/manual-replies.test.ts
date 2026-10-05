@@ -56,6 +56,15 @@ beforeEach(async () => {
 });
 
 describe("V0 human-only reply in the original Gmail thread", () => {
+  it("lets the human owner reply on a paused dossier without resuming the agent or adding automatic actions", async () => {
+    await fixture.db.update(savThreads).set({ aiPaused: true, status: "human_requested" }).where(eq(savThreads.id, threadId));
+    const action = await queueSavManualReply({ threadId, draftId }, "ugo@limova.ai");
+    expect((await processPendingGmailSendActions(1, action.id)).processed[0]).toMatchObject({ status: "succeeded" });
+    expect((await fixture.db.select().from(savThreads).where(eq(savThreads.id, threadId)))[0]).toMatchObject({ aiPaused: true, status: "human_requested" });
+    expect(await fixture.db.select().from(savActions)).toHaveLength(1);
+    expect(await fixture.db.select().from(savFollowups)).toHaveLength(0);
+    expect(network.mock.calls.filter(([url]) => String(url).endsWith("/messages/send"))).toHaveLength(1);
+  });
   it("queues only a distinct human send request, independently of process approval and CRM identity", async () => {
     const first = await queueSavManualReply({ threadId, draftId }, "ugo@limova.ai");
     const duplicate = await queueSavManualReply({ threadId, draftId }, "ugo@limova.ai");

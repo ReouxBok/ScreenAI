@@ -59,6 +59,16 @@ describe("SAV write authorization at execution time", () => {
     expect(savWriteDenial({ ...baseline, releaseStage: "v0", actorType: "human", manualReplyConfirmed: true })).toBeNull();
     expect(savWriteDenial({ ...baseline, releaseStage: "v0", actorType: "human", manualReplyConfirmed: true, followup: true })).toBe("SAV_REPLY_MANUAL_APPROVAL_REQUIRED");
   });
+  it.each(["assist", "semi", "on"] as const)("allows a confirmed V0 human reply in %s while keeping the agent paused", (mode) => {
+    const manual = { ...baseline, mode, releaseStage: "v0" as const, actorType: "human", manualReplyConfirmed: true, aiPaused: true };
+    expect(savWriteDenial(manual)).toBeNull();
+    expect(savWriteDenial({ ...manual, manualReplyConfirmed: false })).toBe("SAV_REPLY_MANUAL_APPROVAL_REQUIRED");
+    expect(savWriteDenial({ ...manual, actorType: "ai" })).toBe("SAV_V0_EMAIL_DISABLED");
+    expect(savWriteDenial({ ...manual, followup: true })).toBe("SAV_REPLY_MANUAL_APPROVAL_REQUIRED");
+    expect(savWriteDenial({ ...manual, latestInboundId: "new" })).toBe("SAV_REPLY_OBSOLETE");
+    expect(savWriteDenial({ ...manual, writesDisabled: true })).toBe("SAV_WRITES_DISABLED");
+    for (const releaseStage of ["v1", "v2", "v3", "v4"] as const) expect(savWriteDenial({ ...manual, releaseStage })).toBe("SAV_THREAD_PAUSED");
+  });
   it("prevents an outdated awaiting-customer status from overwriting a human takeover", () => {
     expect(savWriteDenial({ ...baseline, kind: "update_ticket_status", statusTarget: "awaiting_customer", aiPaused: true })).toBe("SAV_THREAD_PAUSED");
     expect(savWriteDenial({ ...baseline, kind: "update_ticket_status", statusTarget: "awaiting_customer", latestInboundId: "m2" })).toBe("SAV_REPLY_OBSOLETE");
