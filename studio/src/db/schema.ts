@@ -1,3 +1,4 @@
+import { sql } from "drizzle-orm";
 import {
   boolean,
   index,
@@ -13,6 +14,7 @@ import {
   uuid,
   vector,
 } from "drizzle-orm/pg-core";
+import type { CanonicalKnowledge, SemanticStep } from "@/lib/knowledge/contracts";
 
 export const staffRole = pgEnum("staff_role", ["contributor", "reviewer", "admin", "member", "owner"]);
 export const contentType = pgEnum("content_type", ["article", "onboarding"]);
@@ -66,6 +68,7 @@ export const contentItems = pgTable("content_items", {
 ]);
 
 export type ArticleMetadata = {
+  semanticSteps?: SemanticStep[];
   intents: string[];
   limovaPaths: string[];
   prerequisites: string[];
@@ -85,6 +88,7 @@ export type ArticleMetadata = {
 };
 
 export type OnboardingMetadata = {
+  semanticSteps?: SemanticStep[];
   objective: string;
   proposalSignals: string[];
   qualificationQuestions: string[];
@@ -130,6 +134,65 @@ export const contentVersions = pgTable("content_versions", {
   authorEmail: text("author_email").notNull(),
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
 }, (table) => [uniqueIndex("content_versions_item_version_idx").on(table.itemId, table.version)]);
+
+// Additive canonical layer. Existing content and published pointers remain intact.
+export const knowledgeFamilies = pgTable("knowledge_families", {
+  id: uuid("id").defaultRandom().primaryKey(),
+  canonicalKey: text("canonical_key").notNull().unique(),
+  title: text("title").notNull(),
+  approvedRevisionId: uuid("approved_revision_id"),
+  createdBy: text("created_by").notNull(),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+});
+export const knowledgeFamilyRevisions = pgTable("knowledge_family_revisions", {
+  id: uuid("id").defaultRandom().primaryKey(),
+  familyId: uuid("family_id").notNull().references(() => knowledgeFamilies.id, { onDelete: "cascade" }),
+  revision: integer("revision").notNull(),
+  canonicalHash: text("canonical_hash").notNull(),
+  document: jsonb("document").$type<CanonicalKnowledge>().notNull(),
+  reviewState: text("review_state").notNull().default("pending"),
+  reviewedBy: text("reviewed_by"),
+  reviewedAt: timestamp("reviewed_at", { withTimezone: true }),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+}, (table) => [uniqueIndex("knowledge_family_revision_idx").on(table.familyId, table.revision), uniqueIndex("knowledge_family_hash_idx").on(table.familyId, table.canonicalHash)]);
+export const knowledgeFamilySources = pgTable("knowledge_family_sources", {
+  id: uuid("id").defaultRandom().primaryKey(),
+  familyId: uuid("family_id").notNull().references(() => knowledgeFamilies.id, { onDelete: "cascade" }),
+  revisionId: uuid("revision_id").notNull().references(() => knowledgeFamilyRevisions.id, { onDelete: "cascade" }),
+  sourceRef: text("source_ref").notNull(),
+  sourceHash: text("source_hash").notNull(),
+  sourceVersionId: uuid("source_version_id").references(() => contentVersions.id, { onDelete: "restrict" }),
+  evidence: jsonb("evidence").$type<Record<string, unknown>>().notNull().default({}),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+}, (table) => [uniqueIndex("knowledge_source_identity_idx").on(table.familyId, table.sourceRef, table.sourceHash)]);
+export const knowledgeProjections = pgTable("knowledge_projections", {
+  id: uuid("id").defaultRandom().primaryKey(),
+  familyId: uuid("family_id").notNull().references(() => knowledgeFamilies.id, { onDelete: "cascade" }),
+  revisionId: uuid("revision_id").notNull().references(() => knowledgeFamilyRevisions.id, { onDelete: "restrict" }),
+  surface: text("surface").notNull(),
+  itemId: uuid("item_id").notNull().references(() => contentItems.id, { onDelete: "restrict" }),
+  versionId: uuid("version_id").notNull().references(() => contentVersions.id, { onDelete: "restrict" }),
+  technicalBindings: jsonb("technical_bindings").$type<Array<{ semanticStepId: string; actionOrder: number }>>().notNull().default([]),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+}, (table) => [uniqueIndex("knowledge_projection_version_idx").on(table.itemId, table.versionId, table.surface), index("knowledge_projection_family_idx").on(table.familyId)]);
+export const knowledgeProjectionCandidates = pgTable("knowledge_projection_candidates", {
+  id: uuid("id").defaultRandom().primaryKey(),
+  familyId: uuid("family_id").notNull().references(() => knowledgeFamilies.id, { onDelete: "cascade" }),
+  revisionId: uuid("revision_id").notNull().references(() => knowledgeFamilyRevisions.id, { onDelete: "restrict" }),
+  sourceId: uuid("source_id").notNull().references(() => knowledgeFamilySources.id, { onDelete: "restrict" }),
+  targetSurface: text("target_surface").notNull(),
+  targetItemId: uuid("target_item_id").references(() => contentItems.id, { onDelete: "restrict" }),
+  baseVersionId: uuid("base_version_id").references(() => contentVersions.id, { onDelete: "restrict" }),
+  status: text("status").notNull().default("pending"),
+  explanation: text("explanation").notNull(),
+  proposedInput: jsonb("proposed_input").$type<Record<string, unknown>>().notNull(),
+  diff: jsonb("diff").$type<{ before: string; after: string }>().notNull(),
+  reviewedBy: text("reviewed_by"),
+  reviewedAt: timestamp("reviewed_at", { withTimezone: true }),
+  materializedVersionId: uuid("materialized_version_id").references(() => contentVersions.id, { onDelete: "restrict" }),
+  createdBy: text("created_by").notNull(),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+}, (table) => [uniqueIndex("knowledge_candidate_revision_target_idx").on(table.revisionId, table.targetSurface)]);
 
 export const contentChunks = pgTable("content_chunks", {
   id: uuid("id").defaultRandom().primaryKey(),
@@ -371,6 +434,7 @@ export const savPilotVerdict = sav.enum("pilot_verdict", ["correct", "partial", 
 export type SavDecisionEvidence = {
   sourceType: "knowledge" | "hubspot_ticket" | "gmail_thread" | "rule";
   sourceId: string;
+  contentVersionId?: string;
   title: string;
   score?: number;
   verifiedAt?: string | null;
@@ -503,6 +567,7 @@ export const savPilotBatches = sav.table("pilot_batches", {
 
 export const savDecisions = sav.table("decisions", {
   id: uuid("id").defaultRandom().primaryKey(),
+  agentRunId: uuid("agent_run_id").references(() => savAgentRuns.id, { onDelete: "restrict" }),
   messageId: uuid("message_id").notNull().references(() => savMessages.id, { onDelete: "cascade" }),
   kind: savDecisionKind("kind").notNull(),
   reasonCode: text("reason_code").notNull(),
@@ -530,6 +595,10 @@ export const savAgentRuns = sav.table("agent_runs", {
   status: text("status").notNull(),
   model: text("model").notNull(),
   promptRevision: text("prompt_revision").notNull(),
+  knowledgeRevision: text("knowledge_revision"),
+  proposalCiphertext: text("proposal_ciphertext"),
+  codeRevision: text("code_revision").notNull().default("unknown"),
+  dataOrigin: text("data_origin").notNull().default("unknown"),
   inputHash: text("input_hash").notNull(),
   outputHash: text("output_hash"),
   decisionKind: text("decision_kind"),
@@ -579,6 +648,71 @@ export const savPilotItems = sav.table("pilot_items", {
   index("sav_pilot_items_agent_run_idx").on(table.agentRunId),
   index("sav_pilot_items_recovery_idx").on(table.status, table.updatedAt, table.attemptCount),
 ]);
+
+export const savProposalReviews = sav.table("proposal_reviews", {
+  id: uuid("id").defaultRandom().primaryKey(),
+  messageId: uuid("message_id").notNull().references(() => savMessages.id, { onDelete: "cascade" }),
+  decisionId: uuid("decision_id").notNull().references(() => savDecisions.id, { onDelete: "restrict" }),
+  agentRunId: uuid("agent_run_id").notNull().references(() => savAgentRuns.id, { onDelete: "restrict" }),
+  revision: integer("revision").notNull(),
+  status: text("status").notNull(),
+  verdict: savPilotVerdict("verdict").notNull(),
+  dimensions: jsonb("dimensions").$type<Record<string, string>>().notNull(),
+  beforeCiphertext: text("before_ciphertext").notNull(),
+  afterCiphertext: text("after_ciphertext").notNull(),
+  commentCiphertext: text("comment_ciphertext").notNull(),
+  reusability: text("reusability").notNull().default("none"),
+  isCurrent: boolean("is_current").notNull().default(true),
+  reviewedBy: text("reviewed_by").notNull(),
+  reviewedAt: timestamp("reviewed_at", { withTimezone: true }).notNull().defaultNow(),
+}, (table) => [uniqueIndex("sav_review_message_revision_idx").on(table.messageId, table.revision), uniqueIndex("sav_review_message_current_idx").on(table.messageId).where(sql`${table.isCurrent} = true`)]);
+
+export const savReplyDrafts = sav.table("reply_drafts", {
+  id: uuid("id").defaultRandom().primaryKey(),
+  threadId: uuid("thread_id").notNull().references(() => savThreads.id, { onDelete: "cascade" }),
+  messageId: uuid("message_id").notNull().references(() => savMessages.id, { onDelete: "cascade" }),
+  decisionId: uuid("decision_id").notNull().references(() => savDecisions.id, { onDelete: "restrict" }),
+  agentRunId: uuid("agent_run_id").notNull().references(() => savAgentRuns.id, { onDelete: "restrict" }),
+  reviewId: uuid("review_id").references(() => savProposalReviews.id, { onDelete: "restrict" }),
+  knowledgeRevision: text("knowledge_revision"),
+  revision: integer("revision").notNull(),
+  status: text("status").notNull(),
+  bodyCiphertext: text("body_ciphertext").notNull(),
+  isCurrent: boolean("is_current").notNull().default(true),
+  createdBy: text("created_by").notNull(),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+}, (table) => [uniqueIndex("sav_reply_draft_revision_idx").on(table.threadId, table.revision), uniqueIndex("sav_reply_draft_current_idx").on(table.threadId).where(sql`${table.isCurrent} = true`)]);
+
+export const savReviewedReplayCases = sav.table("reviewed_replay_cases", {
+  id: uuid("id").defaultRandom().primaryKey(),
+  reviewId: uuid("review_id").notNull().unique().references(() => savProposalReviews.id, { onDelete: "cascade" }),
+  caseCiphertext: text("case_ciphertext").notNull(),
+  contentHash: text("content_hash").notNull(),
+  approvedBy: text("approved_by").notNull(),
+  approvedAt: timestamp("approved_at", { withTimezone: true }).notNull().defaultNow(),
+});
+
+export const savReviewedReplayRuns = sav.table("reviewed_replay_runs", {
+  id: uuid("id").defaultRandom().primaryKey(),
+  corpusHash: text("corpus_hash").notNull(),
+  runnerRevision: text("runner_revision").notNull(),
+  codeRevision: text("code_revision").notNull(),
+  total: integer("total").notNull(),
+  failed: integer("failed").notNull(),
+  result: jsonb("result").$type<Record<string, unknown>>().notNull(),
+  executedBy: text("executed_by").notNull(),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+});
+
+export const savDeploymentReviews = sav.table("deployment_reviews", {
+  id: uuid("id").defaultRandom().primaryKey(),
+  snapshotHash: text("snapshot_hash").notNull(),
+  decision: text("decision").notNull(),
+  reasonCiphertext: text("reason_ciphertext").notNull(),
+  evidence: jsonb("evidence").$type<Record<string, unknown>>().notNull(),
+  reviewedBy: text("reviewed_by").notNull(),
+  reviewedAt: timestamp("reviewed_at", { withTimezone: true }).notNull().defaultNow(),
+});
 
 export const savActions = sav.table("actions", {
   id: uuid("id").defaultRandom().primaryKey(),

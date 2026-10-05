@@ -9,6 +9,7 @@ import { encryptSavPayload } from "./crypto";
 import { currentMessageText, loadSavConversation } from "./conversation";
 import { processPendingSavMessages, processSavPilotItem, reviewSavPilotItem } from "./service";
 import { getSavAutonomyGate } from "./promotion";
+import { activateSavV0Cutover } from "./cutover";
 
 const state = vi.hoisted(() => ({ db: null as unknown }));
 vi.mock("@/db", () => ({ requireDb: () => state.db }));
@@ -20,6 +21,7 @@ beforeAll(async () => { fixture = await createSavTestDb(); state.db = fixture.db
 afterAll(async () => { await fixture?.client.close(); });
 afterEach(() => { vi.unstubAllEnvs(); vi.unstubAllGlobals(); });
 beforeEach(async () => {
+  vi.stubEnv("SAV_RELEASE_STAGE", "v4");
   vi.stubEnv("SAV_AUTOMATION_MODE", "on");
   vi.stubEnv("SAV_WRITES_DISABLED", "false");
   vi.stubEnv("SAV_TEST_MODE", "false");
@@ -28,7 +30,9 @@ beforeEach(async () => {
   vi.stubEnv("GMAIL_CLIENT_SECRET", "fixture");
   vi.stubEnv("GMAIL_REFRESH_TOKEN", "fixture");
   await fixture.client.exec('TRUNCATE sav.mailboxes CASCADE');
+  await fixture.client.exec('TRUNCATE sav.sync_state');
   const [mailbox] = await fixture.db.insert(savMailboxes).values({ email: "sav@example.com" }).returning();
+  await activateSavV0Cutover({ receivedAfter: new Date(Date.now() - 86_400_000).toISOString(), mailboxEmail: mailbox.email, intakeRecipient: "contact@limova.ai", deploymentSha: "a".repeat(40), activatedBy: "ugo@limova.ai" });
   const [thread] = await fixture.db.insert(savThreads).values({ mailboxId: mailbox.id, gmailThreadId: "g1", customerEmail: "customer@example.com" }).returning();
   threadId = thread.id;
   const [message] = await fixture.db.insert(savMessages).values({ mailboxId: mailbox.id, threadId, direction: "inbound", fromEmail: "customer@example.com", bodyCiphertext: encryptSavPayload({ text: "Question", headers: { "message-id": "<original@example.com>" } }), receivedAt: new Date(), createdAt: new Date(Date.now() - 10_000) }).returning();
@@ -43,6 +47,16 @@ async function action(kind: "send_reply" | "draft_reply" = "send_reply") {
 }
 
 describe("write guard with migrated database", () => {
+  it("V0 blocks old approved email actions before any network request", async () => {
+    vi.stubEnv("SAV_RELEASE_STAGE", "v0");
+    const queued = await action();
+    await fixture.db.update(savActions).set({ status: "pending", actorType: "human" }).where(eq(savActions.id, queued.id));
+    const network = vi.fn(() => { throw new Error("No network allowed"); });
+    vi.stubGlobal("fetch", network);
+    await expect(assertSavWriteAllowed(queued.id)).rejects.toThrow("SAV_REPLY_MANUAL_APPROVAL_REQUIRED");
+    await processPendingGmailSendActions();
+    expect(network).not.toHaveBeenCalled();
+  });
   it("reloads human takeover after a reply was claimed", async () => {
     const queued = await action();
     await expect(assertSavWriteAllowed(queued.id)).resolves.toMatchObject({ thread: { id: threadId } });
@@ -159,7 +173,7 @@ describe("write guard with migrated database", () => {
     expect(context.olderSummary.every((item) => item.messageId && item.excerpt)).toBe(true);
     expect(context.messages.reduce((sum, item) => sum + item.text.length, 0) + context.olderSummary.reduce((sum, item) => sum + item.excerpt.length, 0)).toBeLessThanOrEqual(18_000);
   });
-  it("turns a corrected pilot response into a reviewable learning candidate without HubSpot", async () => {
+  it("keeps an unqualified pilot correction as evaluation, not reusable knowledge", async () => {
     const [batch] = await fixture.db.insert(savPilotBatches).values({ targetSize: 1, createdBy: "reviewer@example.com", status: "reviewing" }).returning();
     const [item] = await fixture.db.insert(savPilotItems).values({ batchId: batch.id, messageId, status: "ready" }).returning();
     await reviewSavPilotItem(item.id, {
@@ -168,8 +182,7 @@ describe("write guard with migrated database", () => {
       feedbackCodes: ["unsupported_claim"], comment: "La procédure n'était pas prouvée.",
       correctedDraft: "La bonne réponse consiste à transmettre le dossier pour vérification humaine.",
     }, "reviewer@example.com");
-    const [candidate] = await fixture.db.select().from(savLearningCandidates);
-    expect(candidate).toMatchObject({ threadId, hubspotTicketId: null, sourceRef: `thread:${threadId}`, evidenceTicketIds: [], createdBy: "human" });
+    expect(await fixture.db.select().from(savLearningCandidates)).toHaveLength(0);
     const [reviewed] = await fixture.db.select().from(savPilotItems).where(eq(savPilotItems.id, item.id));
     expect(reviewed).toMatchObject({ classificationVerdict: "correct", routingVerdict: "incorrect", groundingVerdict: "incorrect", toneVerdict: "partial", escalationVerdict: "correct" });
   });

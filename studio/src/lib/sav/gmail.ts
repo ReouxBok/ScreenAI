@@ -4,10 +4,10 @@ import { timingSafeEqual } from "node:crypto";
 import { and, asc, desc, eq, inArray, isNull, lt, lte, or, sql } from "drizzle-orm";
 import { z } from "zod";
 import { requireDb } from "@/db";
-import { savActions, savFollowups, savGmailQuarantine, savMailboxes, savMessages, savThreads, savWebhookReceipts } from "@/db/schema";
+import { savActions, savFollowups, savGmailQuarantine, savMailboxes, savMessages, savSyncState, savThreads, savWebhookReceipts } from "@/db/schema";
 import { assertSavWriteAllowed } from "./write-guard";
 import { savModeAllowsWrite } from "./action-policy";
-import { savAutomationMode } from "./config";
+import { savAutomationMode, savReleaseStage } from "./config";
 import { decryptSavPayload, encryptSavPayload } from "./crypto";
 import {
   claimWebhookReceipt,
@@ -21,6 +21,7 @@ import {
 import { assertSavOutboundRecipientAllowed, ensureAiTransparency, followupDates, normalizeEmailAddress, sanitizeInboundText } from "./policy";
 import { savActionFailurePlan } from "./retry-policy";
 import { redactSavLearningText } from "./learning-extraction";
+import { getSavV0Cutover } from "./cutover";
 
 const pubSubEnvelopeSchema = z.object({
   message: z.object({
@@ -42,8 +43,9 @@ const gmailNotificationSchema = z.object({
 type GmailHeader = { name?: string; value?: string };
 type GmailPart = {
   mimeType?: string;
+  filename?: string;
   headers?: GmailHeader[];
-  body?: { data?: string; size?: number };
+  body?: { data?: string; size?: number; attachmentId?: string };
   parts?: GmailPart[];
 };
 type GmailMessage = {
@@ -181,6 +183,46 @@ async function gmailFetch<T>(mailboxEmail: string, path: string, init?: RequestI
   return response.json() as Promise<T>;
 }
 
+export const SAV_STUDIO_GMAIL_LABEL_NAME = "MAIL STUDIO SAV";
+
+/** One explicitly opened message only. Never creates labels or changes read/unread. */
+export async function fileOpenedGmailMessage(input: {
+  mailboxEmail: string; gmailMessageId: string; gmailThreadId: string;
+}, beforeModify: () => Promise<void>) {
+  const listing = await gmailFetch<{ labels?: Array<{ id?: string; name?: string; type?: string }> }>(input.mailboxEmail, "labels");
+  const matches = (listing.labels ?? []).filter((label) => label.type === "user"
+    && label.name?.trim().toUpperCase() === SAV_STUDIO_GMAIL_LABEL_NAME);
+  if (!matches.length) throw new Error("SAV_GMAIL_STUDIO_LABEL_NOT_FOUND");
+  if (matches.length !== 1 || !matches[0].id) throw new Error("SAV_GMAIL_STUDIO_LABEL_AMBIGUOUS");
+  const labelId = matches[0].id;
+  const path = `messages/${encodeURIComponent(input.gmailMessageId)}`;
+  const message = await gmailFetch<GmailMessage>(input.mailboxEmail, `${path}?format=metadata&fields=id,threadId,labelIds`);
+  if (message.id !== input.gmailMessageId || message.threadId !== input.gmailThreadId || !Array.isArray(message.labelIds)) {
+    throw new Error("SAV_GMAIL_FILING_MESSAGE_MISMATCH");
+  }
+  if (message.labelIds.includes("TRASH")) throw new Error("SAV_GMAIL_FILING_MESSAGE_TRASHED");
+  const alreadyFiled = message.labelIds.includes(labelId) && !message.labelIds.includes("INBOX");
+  if (alreadyFiled) return { labelId, alreadyFiled: true };
+
+  // Re-check kill switch/eligibility and persist the dispatch trace immediately before POST.
+  await beforeModify();
+  try {
+    const result = await gmailFetch<GmailMessage>(input.mailboxEmail, `${path}/modify`, {
+      method: "POST", body: JSON.stringify({ addLabelIds: [labelId], removeLabelIds: ["INBOX"] }),
+    });
+    if (result.id !== input.gmailMessageId || result.threadId !== input.gmailThreadId
+      || !result.labelIds?.includes(labelId) || result.labelIds.includes("INBOX")) {
+      throw new Error("SAV_GMAIL_FILING_UNCERTAIN");
+    }
+    return { labelId, alreadyFiled: false };
+  } catch (error) {
+    if (error instanceof Error && error.message === "GMAIL_HTTP_403") throw new Error("SAV_GMAIL_FILING_PERMISSION_DENIED");
+    // A timeout or malformed acknowledgement can follow a successful modification.
+    // The operation is idempotent, but never report success without a verified receipt.
+    throw new Error("SAV_GMAIL_FILING_UNCERTAIN");
+  }
+}
+
 export async function renewGmailWatch(mailboxEmail = requiredEnv("GMAIL_SUPPORT_ADDRESS")) {
   const response = await gmailFetch<{ historyId: string; expiration: string }>(mailboxEmail, "watch", {
     method: "POST",
@@ -211,11 +253,19 @@ function headerValue(headers: GmailHeader[] | undefined, name: string) {
 
 function collectMimeBodies(part: GmailPart | undefined, result = { text: [] as string[], html: [] as string[] }) {
   if (!part) return result;
+  if (part.filename || part.body?.attachmentId) return result;
   const data = part.body?.data ? decodeBase64Url(part.body.data) : "";
   if (data && part.mimeType === "text/plain") result.text.push(data);
   if (data && part.mimeType === "text/html") result.html.push(data);
   for (const child of part.parts ?? []) collectMimeBodies(child, result);
   return result;
+}
+
+function collectAttachmentMetadata(part: GmailPart | undefined, result: Array<{ filename: string; mimeType: string; size: number }> = []) {
+  if (!part) return result;
+  if (part.filename || part.body?.attachmentId) result.push({ filename: boundedHeader(part.filename || "Pièce jointe", 500), mimeType: (part.mimeType || "application/octet-stream").slice(0, 200), size: Math.max(0, part.body?.size ?? 0) });
+  for (const child of part.parts ?? []) collectAttachmentMetadata(child, result);
+  return result.slice(0, 100);
 }
 
 function htmlToText(html: string) {
@@ -266,6 +316,8 @@ export function normalizeReferencesHeader(value: string, maxLength = 2_000) {
 
 export function parseGmailMessage(mailboxEmail: string, message: GmailMessage) {
   if (!message.id || !message.threadId) throw new Error("GMAIL_MESSAGE_INVALID");
+  const receivedAt = new Date(Number(message.internalDate));
+  if (!message.internalDate || !Number.isFinite(receivedAt.getTime())) throw new Error("GMAIL_MESSAGE_INVALID_INTERNAL_DATE");
   const headers = message.payload?.headers;
   const from = boundedHeader(headerValue(headers, "From"), 500);
   const intakeRecipients = String(process.env.GMAIL_INTAKE_RECIPIENTS || mailboxEmail).split(",");
@@ -281,17 +333,31 @@ export function parseGmailMessage(mailboxEmail: string, message: GmailMessage) {
     to,
     subject,
     bodyText: bodyText.slice(0, 100_000),
+    attachments: collectAttachmentMetadata(message.payload),
     ...(bodies.html.length ? { bodyHtml: bodies.html.join("\n\n").slice(0, 300_000) } : {}),
     autoSubmitted: boundedHeader(headerValue(headers, "Auto-Submitted"), 200) || undefined,
     headers: {
+      "auto-submitted": boundedHeader(headerValue(headers, "Auto-Submitted"), 200),
+      "from-display-name": boundedHeader(from.includes("<") ? from.split("<")[0].trim().replace(/^"|"$/g, "") : "", 100),
+      "content-type": boundedHeader(headerValue(headers, "Content-Type") || message.payload?.mimeType || "", 2_000),
       "message-id": boundedHeader(headerValue(headers, "Message-ID"), 2_000),
       references: normalizeReferencesHeader(headerValue(headers, "References")),
       "in-reply-to": boundedHeader(headerValue(headers, "In-Reply-To"), 2_000, true),
       "delivered-to": boundedHeader(headerValue(headers, "Delivered-To"), 2_000),
       "x-original-to": boundedHeader(headerValue(headers, "X-Original-To"), 2_000),
     },
-    receivedAt: new Date(Number(message.internalDate || Date.now())),
+    receivedAt,
   };
+}
+
+/** Read-only preflight. Do not run a sync or process historical messages here. */
+export async function assertSavGmailThreadCurrent(mailboxEmail: string, gmailThreadId: string, gmailMessageId: string) {
+  const thread = await gmailFetch<{ messages?: GmailMessage[] }>(mailboxEmail, `threads/${encodeURIComponent(gmailThreadId)}?format=metadata&metadataHeaders=From`);
+  const inbound = (thread.messages ?? []).filter((message) => !(message.labelIds ?? []).includes("SENT")
+    && normalizeEmailAddress(headerValue(message.payload?.headers, "From")) !== mailboxEmail.toLowerCase());
+  if (!inbound.length || inbound.some((message) => !message.internalDate || !Number.isFinite(Number(message.internalDate)))) throw new Error("SAV_GMAIL_PREFLIGHT_INCOMPLETE");
+  inbound.sort((a, b) => Number(b.internalDate) - Number(a.internalDate));
+  if (inbound[0]?.id !== gmailMessageId || inbound.filter((message) => message.internalDate === inbound[0]?.internalDate).length !== 1) throw new Error("SAV_GMAIL_THREAD_CHANGED");
 }
 
 export function matchesGmailIntakeRecipient(message: ReturnType<typeof parseGmailMessage>, configured = process.env.GMAIL_INTAKE_RECIPIENTS) {
@@ -370,17 +436,43 @@ async function processGmailMessageSafely(mailboxEmail: string, mailboxId: string
   }
 }
 
-async function fullInboxSync(mailboxEmail: string, mailboxId: string, receiptId?: string, maxMessages = 500) {
-  let pageToken: string | undefined;
-  const messageIds: string[] = [];
-  do {
-    const params = new URLSearchParams({ labelIds: "INBOX", maxResults: String(Math.min(100, maxMessages - messageIds.length)) });
-    if (pageToken) params.set("pageToken", pageToken);
-    const page = await gmailFetch<{ messages?: Array<{ id: string }>; nextPageToken?: string; resultSizeEstimate?: number }>(mailboxEmail, `messages?${params}`);
-    messageIds.push(...(page.messages ?? []).map((message) => message.id));
-    pageToken = page.nextPageToken;
-  } while (pageToken && messageIds.length < maxMessages);
-  for (const id of messageIds) await processGmailMessageSafely(mailboxEmail, mailboxId, id, receiptId);
+async function fullInboxSync(mailboxEmail: string, mailboxId: string, receiptId?: string) {
+  return recoverSavV0Gmail(mailboxEmail, mailboxId, receiptId);
+}
+
+/** One durable page per pass: no 500-message truncation and no old-mail backfill.
+ * The Gmail history cursor advances only after the complete recovery scan.
+ */
+export async function recoverSavV0Gmail(mailboxEmail: string, mailboxId: string, receiptId?: string) {
+  const boundary = await getSavV0Cutover();
+  if (!boundary || boundary.mailboxEmail !== mailboxEmail) throw new Error("SAV_CUTOVER_NOT_ACTIVE");
+  const db = requireDb();
+  const key = `gmail-v0-recovery:${mailboxId}`;
+  const [existing] = await db.select().from(savSyncState).where(eq(savSyncState.key, key)).limit(1);
+  const recovery = existing?.status === "running" && existing.cursor
+    ? z.object({ pageToken: z.string(), before: z.number().int(), after: z.number().int() }).parse(JSON.parse(existing.cursor))
+    : { pageToken: "", before: Math.ceil(Date.now() / 1_000) + 1, after: Math.floor(Date.parse(boundary.receivedAfter) / 1_000) };
+  const params = new URLSearchParams({ q: `after:${recovery.after} before:${recovery.before}`, includeSpamTrash: "true", maxResults: "100" });
+  if (recovery.pageToken) params.set("pageToken", recovery.pageToken);
+  let page: { messages?: Array<{ id: string }>; nextPageToken?: string };
+  try { page = await gmailFetch(mailboxEmail, `messages?${params}`); }
+  catch (error) {
+    // Gmail page tokens can expire. Restart the same bounded time interval;
+    // message IDs deduplicate writes and receivedAt still excludes old mail.
+    if ((error as { status?: number }).status === 400 && recovery.pageToken) {
+      await db.update(savSyncState).set({ cursor: JSON.stringify({ ...recovery, pageToken: "" }), updatedAt: new Date() }).where(eq(savSyncState.key, key));
+    }
+    throw error;
+  }
+  for (const message of page.messages ?? []) await processGmailMessageSafely(mailboxEmail, mailboxId, message.id, receiptId);
+  await db.insert(savSyncState).values({ key, status: page.nextPageToken ? "running" : "completed", cursor: JSON.stringify({ ...recovery, pageToken: page.nextPageToken ?? "" }) }).onConflictDoUpdate({
+    target: savSyncState.key, set: { status: page.nextPageToken ? "running" : "completed", cursor: JSON.stringify({ ...recovery, pageToken: page.nextPageToken ?? "" }), updatedAt: new Date() },
+  });
+  return !page.nextPageToken;
+}
+
+async function deferGmailRecoveryReceipt(receiptId: string) {
+  await requireDb().update(savWebhookReceipts).set({ status: "pending", errorCode: null }).where(eq(savWebhookReceipts.id, receiptId));
 }
 
 export async function processGmailReceipt(receiptId: string) {
@@ -390,7 +482,10 @@ export async function processGmailReceipt(receiptId: string) {
     const notification = gmailNotificationSchema.parse(receipt.payload);
     const mailbox = await ensureSavMailbox(notification.emailAddress);
     if (!mailbox.historyId) {
-      await fullInboxSync(mailbox.email, mailbox.id, receipt.id);
+      if (!await fullInboxSync(mailbox.email, mailbox.id, receipt.id)) {
+        await deferGmailRecoveryReceipt(receipt.id);
+        return;
+      }
       await updateMailboxCursor(mailbox.id, notification.historyId);
       await markWebhookReceipt(receipt.id, "processed");
       return;
@@ -417,7 +512,10 @@ export async function processGmailReceipt(receiptId: string) {
       } while (pageToken);
     } catch (error) {
       if ((error as Error & { status?: number }).status !== 404) throw error;
-      await fullInboxSync(mailbox.email, mailbox.id, receipt.id);
+      if (!await fullInboxSync(mailbox.email, mailbox.id, receipt.id)) {
+        await deferGmailRecoveryReceipt(receipt.id);
+        return;
+      }
     }
     for (const messageId of addedIds) await processGmailMessageSafely(mailbox.email, mailbox.id, messageId, receipt.id);
     await updateMailboxCursor(mailbox.id, latestHistoryId);
@@ -482,33 +580,40 @@ function encodedSubject(value: string) {
   return `=?UTF-8?B?${Buffer.from(safeMailHeader(value), "utf8").toString("base64")}?=`;
 }
 
-async function findSentMessage(mailboxEmail: string, rfcMessageId: string) {
-  const params = new URLSearchParams({ q: `rfc822msgid:${rfcMessageId}`, maxResults: "1" });
+async function findSentMessage(mailboxEmail: string, rfcMessageId: string, sentOnly = false) {
+  const params = new URLSearchParams({ q: `${sentOnly ? "in:sent " : ""}rfc822msgid:${rfcMessageId}`, maxResults: "1" });
   const response = await gmailFetch<{ messages?: Array<{ id: string; threadId: string }> }>(mailboxEmail, `messages?${params}`);
   return response.messages?.[0] ?? null;
 }
 
 async function sendReplyAction(action: typeof savActions.$inferSelect, text: string) {
   const db = requireDb();
+  const manualV0 = savReleaseStage() === "v0";
+  // Legacy approvals are not a Studio send confirmation. Block before any network call.
+  if (manualV0) await assertSavWriteAllowed(action.id);
   const [thread] = await db.select().from(savThreads).where(eq(savThreads.id, action.threadId)).limit(1);
   if (!thread) throw new Error("SAV_ACTION_THREAD_NOT_FOUND");
   const [mailbox] = await db.select().from(savMailboxes).where(eq(savMailboxes.id, thread.mailboxId)).limit(1);
   if (!mailbox) throw new Error("SAV_ACTION_MAILBOX_NOT_FOUND");
   const [inbound] = await db.select().from(savMessages)
-    .where(and(eq(savMessages.threadId, thread.id), eq(savMessages.direction, "inbound")))
+    .where(and(eq(savMessages.threadId, thread.id), eq(savMessages.direction, "inbound"), manualV0 ? eq(savMessages.id, action.messageId!) : undefined))
     .orderBy(desc(savMessages.receivedAt)).limit(1);
   if (!inbound) throw new Error("SAV_ACTION_INBOUND_NOT_FOUND");
   assertSavOutboundRecipientAllowed(thread.customerEmail);
   const inboundBody = decryptSavPayload<{ text: string; headers?: Record<string, string> }>(inbound.bodyCiphertext);
-  const transparentText = ensureAiTransparency(text);
+  // The human authorizes exactly the displayed body, not an unseen appended footer.
+  const transparentText = manualV0 ? text : ensureAiTransparency(text);
   const replyFrom = normalizeEmailAddress(process.env.GMAIL_REPLY_FROM_ADDRESS || mailbox.email);
   const rfcMessageId = `<sav-${action.id}@studio.limova.ai>`;
-  const priorId = inboundBody.headers?.["message-id"] || inboundBody.headers?.["in-reply-to"] || "";
+  const priorId = inboundBody.headers?.["message-id"] || (manualV0 ? "" : inboundBody.headers?.["in-reply-to"]) || "";
+  if (manualV0 && (!thread.gmailThreadId || !priorId || normalizeEmailAddress(inbound.fromEmail) !== normalizeEmailAddress(thread.customerEmail))) throw new Error("SAV_REPLY_MANUAL_THREAD_HEADERS_MISSING");
+  const subject = manualV0 ? inbound.subject : thread.subject;
+  const replySubject = /^re\s*:/i.test(subject) ? subject : `Re: ${subject}`;
   const references = [inboundBody.headers?.references, priorId].filter(Boolean).join(" ");
   const raw = [
     `From: ${safeMailHeader(replyFrom)}`,
     `To: ${safeMailHeader(thread.customerEmail)}`,
-    `Subject: ${encodedSubject(/^re\s*:/i.test(thread.subject) ? thread.subject : `Re: ${thread.subject}`)}`,
+    `Subject: ${encodedSubject(replySubject)}`,
     `Message-ID: ${rfcMessageId}`,
     ...(priorId ? [`In-Reply-To: ${safeMailHeader(priorId)}`] : []),
     ...(references ? [`References: ${safeMailHeader(references)}`] : []),
@@ -519,12 +624,22 @@ async function sendReplyAction(action: typeof savActions.$inferSelect, text: str
     transparentText,
   ].join("\r\n");
 
-  const existing = await findSentMessage(mailbox.email, rfcMessageId);
+  const existing = await findSentMessage(mailbox.email, rfcMessageId, manualV0);
+  if (manualV0) {
+    if (existing && existing.threadId !== thread.gmailThreadId || !existing && action.payload.replySendDispatchedAt) throw new Error("SAV_REPLY_MANUAL_RECONCILIATION_REQUIRED");
+    if (!existing) await assertSavGmailThreadCurrent(mailbox.email, thread.gmailThreadId, inbound.gmailMessageId!);
+  }
   await assertSavWriteAllowed(action.id);
+  if (manualV0 && !existing) {
+    const [dispatched] = await db.update(savActions).set({ payload: sql`${savActions.payload} || ${JSON.stringify({ replySendDispatchedAt: new Date().toISOString() })}::jsonb`, updatedAt: new Date() }).where(and(eq(savActions.id, action.id), eq(savActions.status, "running"), sql`${savActions.payload}->>'replySendDispatchedAt' is null`)).returning();
+    if (!dispatched) throw new Error("SAV_REPLY_MANUAL_RECONCILIATION_REQUIRED");
+    await assertSavWriteAllowed(action.id);
+  }
   const sent = existing ?? await gmailFetch<{ id: string; threadId: string }>(mailbox.email, "messages/send", {
     method: "POST",
     body: JSON.stringify({ raw: Buffer.from(raw, "utf8").toString("base64url"), threadId: thread.gmailThreadId }),
   });
+  if (manualV0 && (!sent.id || sent.threadId !== thread.gmailThreadId)) throw new Error("SAV_REPLY_MANUAL_RECONCILIATION_REQUIRED");
   const now = new Date();
   await db.transaction(async (tx) => {
     const [createdOutbound] = await tx.insert(savMessages).values({
@@ -534,7 +649,7 @@ async function sendReplyAction(action: typeof savActions.$inferSelect, text: str
       direction: "outbound",
       fromEmail: replyFrom,
       toEmails: [thread.customerEmail],
-      subject: /^re\s*:/i.test(thread.subject) ? thread.subject : `Re: ${thread.subject}`,
+      subject: replySubject,
       preview: redactSavLearningText(transparentText.replace(/\s+/g, " ")).slice(0, 280),
       bodyCiphertext: encryptSavPayload({ text: transparentText, headers: { "message-id": rfcMessageId } }),
       receivedAt: now,
@@ -545,7 +660,7 @@ async function sendReplyAction(action: typeof savActions.$inferSelect, text: str
       .where(and(eq(savMessages.mailboxId, mailbox.id), eq(savMessages.gmailMessageId, sent.id))).limit(1);
     await tx.update(savActions).set({ status: "succeeded", executedAt: now, updatedAt: now, errorCode: null })
       .where(eq(savActions.id, action.id));
-    if (thread.hubspotTicketId && outbound) await tx.insert(savActions).values({
+    if (!manualV0 && thread.hubspotTicketId && outbound) await tx.insert(savActions).values({
       threadId: thread.id,
       messageId: outbound.id,
       kind: "log_email",
@@ -556,12 +671,12 @@ async function sendReplyAction(action: typeof savActions.$inferSelect, text: str
     if (action.kind === "send_reply") {
       await tx.update(savThreads).set({ status: "awaiting_customer", lastMessageAt: now, updatedAt: now })
         .where(eq(savThreads.id, thread.id));
-      for (const [index, dueAt] of followupDates(now).entries()) {
+      for (const [index, dueAt] of (manualV0 ? [] : followupDates(now)).entries()) {
         await tx.insert(savFollowups).values({ threadId: thread.id, sequence: index + 1, dueAt })
           .onConflictDoNothing();
       }
     }
-    if (thread.hubspotTicketId) {
+    if (!manualV0 && thread.hubspotTicketId) {
       await tx.insert(savActions).values({
         threadId: thread.id,
         kind: "update_ticket_status",
@@ -578,7 +693,7 @@ async function sendReplyAction(action: typeof savActions.$inferSelect, text: str
   return sent;
 }
 
-export async function processPendingGmailSendActions(limit = 20) {
+export async function processPendingGmailSendActions(limit = 20, onlyActionId?: string) {
   const mode = savAutomationMode();
   if (mode === "shadow" || process.env.SAV_WRITES_DISABLED === "true") return { skipped: "shadow_mode", processed: [] as Array<Record<string, unknown>> };
   const db = requireDb();
@@ -587,12 +702,13 @@ export async function processPendingGmailSendActions(limit = 20) {
   const candidates = await db.select().from(savActions)
     .where(and(
       inArray(savActions.kind, [...allowedKinds]),
+      onlyActionId ? eq(savActions.id, onlyActionId) : undefined,
       isNull(savActions.pilotBatchId),
       or(eq(savActions.status, "pending"), and(eq(savActions.status, "running"), lt(savActions.updatedAt, staleBefore))),
       or(isNull(savActions.scheduledAt), lte(savActions.scheduledAt, new Date())),
     ))
     .orderBy(desc(savActions.priority), asc(savActions.createdAt)).limit(Math.min(100, Math.max(1, limit)));
-  const actions = candidates.filter((action) => savModeAllowsWrite(mode, action.kind, action.actorType, Boolean(action.payload.followupSequence)));
+  const actions = candidates.filter((action) => savModeAllowsWrite(mode, action.kind, action.actorType, Boolean(action.payload.followupSequence), savReleaseStage()));
   const processed = [];
   for (const action of actions) {
     const [claimed] = await db.update(savActions).set({ status: "running", scheduledAt: null, attemptCount: sql`${savActions.attemptCount} + 1`, updatedAt: new Date() }).where(and(
@@ -607,7 +723,12 @@ export async function processPendingGmailSendActions(limit = 20) {
       const sent = await sendReplyAction(claimed, text);
       processed.push({ actionId: claimed.id, status: "succeeded", gmailMessageId: sent.id });
     } catch (error) {
-      const errorCode = (error instanceof Error ? error.message : "UNKNOWN_ERROR").slice(0, 160);
+      let errorCode = (error instanceof Error ? error.message : "UNKNOWN_ERROR").slice(0, 160);
+      if (savReleaseStage() === "v0") {
+        const [current] = await db.select({ payload: savActions.payload }).from(savActions).where(eq(savActions.id, claimed.id)).limit(1);
+        // A timeout, crash or local commit error after dispatch has an unknown outcome.
+        if (current?.payload.replySendDispatchedAt) errorCode = "SAV_REPLY_MANUAL_RECONCILIATION_REQUIRED";
+      }
       const failure = savActionFailurePlan(errorCode, claimed.attemptCount);
       await db.update(savActions).set({ status: failure.status, scheduledAt: failure.scheduledAt, errorCode, updatedAt: new Date() }).where(eq(savActions.id, claimed.id));
       processed.push({ actionId: claimed.id, status: failure.status, retryScheduledAt: failure.scheduledAt, errorCode });

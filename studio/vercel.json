@@ -1,5 +1,10 @@
 {
   "$schema": "https://openapi.vercel.sh/vercel.json",
+  "git": {
+    "deploymentEnabled": {
+      "codex/sav-v0": false
+    }
+  },
   "crons": [
     {
       "path": "/api/cron/memory-retention",

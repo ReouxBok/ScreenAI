@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 import { savModeAllowsWrite, savWriteDenial, type SavWriteContext } from "./action-policy";
 
 const baseline: SavWriteContext = {
-  mode: "on", writesDisabled: false, kind: "send_reply", actorType: "ai",
+  mode: "on", releaseStage: "v4", writesDisabled: false, kind: "send_reply", actorType: "ai",
   pilotBatchId: null, status: "running", aiPaused: false, messageId: "m1",
   latestInboundId: "m1", followup: false, threadStatus: "ai_processing",
   actionCreatedAt: new Date("2026-09-09T12:01:00Z"), latestInboundCreatedAt: new Date("2026-09-09T12:00:00Z"),
@@ -41,14 +41,34 @@ describe("SAV write authorization at execution time", () => {
     const kinds = ["create_ticket", "link_ticket", "log_email", "create_note", "update_ticket_status", "request_human", "send_reply"];
     for (const kind of kinds) {
       expect(savModeAllowsWrite("shadow", kind, actor)).toBe(false);
-      expect(savModeAllowsWrite("on", kind, actor)).toBe(true);
-      expect(savModeAllowsWrite("assist", kind, actor)).toBe(actor === "human" || ["log_email", "update_ticket_status"].includes(kind));
-      expect(savModeAllowsWrite("semi", kind, actor)).toBe(kind !== "send_reply" || actor === "human");
+      expect(savModeAllowsWrite("on", kind, actor, false, "v4")).toBe(true);
+      expect(savModeAllowsWrite("assist", kind, actor, false, "v4")).toBe(actor === "human");
+      expect(savModeAllowsWrite("semi", kind, actor, false, "v4")).toBe(kind !== "send_reply" || actor === "human");
     }
     expect(savModeAllowsWrite("on", "unknown_operation", actor)).toBe(false);
+  });
+  it("enforces V0 even when automation is on or an old reply was approved by a human", () => {
+    for (const releaseStage of [undefined, "v0"] as const) {
+      for (const actorType of ["ai", "human", "system"]) {
+        expect(savWriteDenial({ ...baseline, releaseStage, actorType })).toBe(actorType === "human" ? "SAV_REPLY_MANUAL_APPROVAL_REQUIRED" : "SAV_V0_EMAIL_DISABLED");
+        expect(savWriteDenial({ ...baseline, releaseStage, actorType, kind: "create_ticket" })).toBe(actorType === "human" ? null : "SAV_HUMAN_APPROVAL_REQUIRED");
+      }
+    }
+  });
+  it("allows only a distinct confirmed human reply in V0, never a followup", () => {
+    expect(savWriteDenial({ ...baseline, releaseStage: "v0", actorType: "human", manualReplyConfirmed: true })).toBeNull();
+    expect(savWriteDenial({ ...baseline, releaseStage: "v0", actorType: "human", manualReplyConfirmed: true, followup: true })).toBe("SAV_REPLY_MANUAL_APPROVAL_REQUIRED");
   });
   it("prevents an outdated awaiting-customer status from overwriting a human takeover", () => {
     expect(savWriteDenial({ ...baseline, kind: "update_ticket_status", statusTarget: "awaiting_customer", aiPaused: true })).toBe("SAV_THREAD_PAUSED");
     expect(savWriteDenial({ ...baseline, kind: "update_ticket_status", statusTarget: "awaiting_customer", latestInboundId: "m2" })).toBe("SAV_REPLY_OBSOLETE");
+  });
+  it("does not enable replies, followups or ticket processing in V1", () => {
+    for (const kind of ["send_reply", "request_human", "create_note", "update_ticket_status"]) {
+      for (const actorType of ["ai", "system"]) {
+        expect(savModeAllowsWrite("on", kind, actorType, true, "v1")).toBe(false);
+      }
+    }
+    expect(savModeAllowsWrite("on", "create_ticket", "ai", false, "v1")).toBe(true);
   });
 });

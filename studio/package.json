@@ -5,6 +5,7 @@
   "private": true,
   "scripts": {
     "dev": "next dev",
+    "sav:preview": "node scripts/sav-preview.mjs",
     "build": "next build",
     "start": "next start",
     "lint": "eslint",

@@ -14,10 +14,13 @@ import {
   onboardingTemplateVersions,
   reviewEvents,
   testCases,
+  knowledgeFamilyRevisions,
+  knowledgeProjections,
 } from "@/db/schema";
 import { chunkMarkdown } from "./chunking";
 import { parseContentInput } from "./content";
 import { embedTexts } from "./embeddings";
+import { assertKnowledgeUgoApproval, requiresKnowledgeUgoApproval } from "./knowledge/contracts";
 
 function revisionId() {
   const now = new Date();
@@ -25,13 +28,14 @@ function revisionId() {
   return `kb_${date}_${now.getTime().toString(36)}`;
 }
 
-export async function saveDraft(rawInput: unknown, actorEmail: string, itemId?: string) {
+export type WorkflowTransaction = Parameters<Parameters<ReturnType<typeof requireDb>["transaction"]>[0]>[0];
+export async function saveDraft(rawInput: unknown, actorEmail: string, itemId?: string, transaction?: WorkflowTransaction) {
   const input = parseContentInput(rawInput);
   const db = requireDb();
-  const [category] = await db.select().from(categories).where(eq(categories.slug, input.categorySlug)).limit(1);
+  const [category] = await (transaction ?? db).select().from(categories).where(eq(categories.slug, input.categorySlug)).limit(1);
   if (!category) throw new Error("CATEGORY_NOT_FOUND");
 
-  return db.transaction(async (tx) => {
+  const save = async (tx: WorkflowTransaction) => {
     let item;
     if (itemId) {
       [item] = await tx.select().from(contentItems).where(eq(contentItems.id, itemId)).limit(1);
@@ -71,7 +75,8 @@ export async function saveDraft(rawInput: unknown, actorEmail: string, itemId?: 
     await tx.update(contentItems).set({ currentDraftVersionId: version.id }).where(eq(contentItems.id, item.id));
     await tx.insert(auditLogs).values({ actorEmail, action: "draft_saved", entityType: "content", entityId: item.id, technicalMetadata: { version: version.version } });
     return { item, version };
-  });
+  };
+  return transaction ? save(transaction) : db.transaction(save);
 }
 
 export async function submitForReview(itemId: string, actorEmail: string, comment: string) {
@@ -95,12 +100,24 @@ export async function rejectReview(itemId: string, actorEmail: string, comment: 
   });
 }
 
-async function prepareVersion(itemId: string) {
+async function prepareVersion(itemId: string, actorEmail: string, expectedVersionId?: string) {
   const db = requireDb();
   const [item] = await db.select().from(contentItems).where(eq(contentItems.id, itemId)).limit(1);
   if (!item?.currentDraftVersionId) throw new Error("DRAFT_NOT_FOUND");
   const [version] = await db.select().from(contentVersions).where(eq(contentVersions.id, item.currentDraftVersionId)).limit(1);
   if (!version) throw new Error("VERSION_NOT_FOUND");
+  if (requiresKnowledgeUgoApproval(item.agentKey, version.metadata)) assertKnowledgeUgoApproval(actorEmail);
+  if (expectedVersionId && version.id !== expectedVersionId) throw new Error("KNOWLEDGE_REVIEW_STALE");
+  if (item.type === "onboarding" && version.metadata.sourceMetadata?.needsRecording === true) throw new Error("KNOWLEDGE_RECORDING_REQUIRED");
+  if (item.agentKey === "sav" && version.metadata.sourceMetadata?.canonicalRevisionId) {
+    const revisionId = String(version.metadata.sourceMetadata.canonicalRevisionId);
+    const [approved] = await db.select({ revision: knowledgeFamilyRevisions }).from(knowledgeProjections)
+      .innerJoin(knowledgeFamilyRevisions, eq(knowledgeFamilyRevisions.id, knowledgeProjections.revisionId))
+      .where(and(eq(knowledgeProjections.itemId, itemId), eq(knowledgeProjections.versionId, version.id), eq(knowledgeProjections.revisionId, revisionId), eq(knowledgeFamilyRevisions.reviewState, "approved"), eq(knowledgeFamilyRevisions.reviewedBy, "ugo@limova.ai"))).limit(1);
+    if (!approved) throw new Error("KNOWLEDGE_CANONICAL_APPROVAL_REQUIRED");
+    if (approved.revision.document.steps.some((step) => step.variants.length)) throw new Error("KNOWLEDGE_VARIANT_CONTEXT_REQUIRED");
+    if (approved.revision.document.validUntil && approved.revision.document.validUntil < new Date().toISOString().slice(0, 10)) throw new Error("KNOWLEDGE_EXPIRED");
+  }
   const chunks = chunkMarkdown(version.bodyMarkdown);
   if (!chunks.length) throw new Error("EMPTY_CHUNKS");
   const intents = "intents" in version.metadata ? version.metadata.intents : version.metadata.proposalSignals;
@@ -121,14 +138,16 @@ async function prepareVersion(itemId: string) {
   return { item, version, chunks, embeddings, intents, limovaPaths };
 }
 
-export async function publish(itemId: string, actorEmail: string, options: { emergency?: boolean; reason?: string } = {}) {
-  const prepared = await prepareVersion(itemId);
+export async function publish(itemId: string, actorEmail: string, options: { emergency?: boolean; reason?: string; expectedVersionId?: string } = {}) {
+  const prepared = await prepareVersion(itemId, actorEmail, options.expectedVersionId);
   if (options.emergency && (!options.reason || options.reason.trim().length < 10)) throw new Error("EMERGENCY_REASON_REQUIRED");
   if (!options.emergency && prepared.item.status !== "in_review") throw new Error("CONTENT_NOT_IN_REVIEW");
   const db = requireDb();
   const revision = revisionId();
 
   await db.transaction(async (tx) => {
+    const [current] = await tx.select().from(contentItems).where(eq(contentItems.id, itemId)).for("update");
+    if (!current || current.currentDraftVersionId !== prepared.version.id || (!options.emergency && current.status !== "in_review")) throw new Error("KNOWLEDGE_REVIEW_STALE");
     await tx.delete(contentChunks).where(eq(contentChunks.versionId, prepared.version.id));
     await tx.insert(contentChunks).values(prepared.chunks.map((chunk, index) => ({
       itemId,
@@ -158,7 +177,7 @@ export async function publish(itemId: string, actorEmail: string, options: { eme
       actorEmail,
       comment: options.reason ?? "Publication validée",
     });
-    await tx.insert(auditLogs).values({ actorEmail, action: "published", entityType: "content", entityId: itemId, technicalMetadata: { revision } });
+    await tx.insert(auditLogs).values({ actorEmail, action: "published", entityType: "content", entityId: itemId, technicalMetadata: { revision, versionId: prepared.version.id, previousPublishedVersionId: current.publishedVersionId, canonicalRevisionId: prepared.version.metadata.sourceMetadata?.canonicalRevisionId ? String(prepared.version.metadata.sourceMetadata.canonicalRevisionId) : null } });
   });
   return { revision };
 }
@@ -166,8 +185,16 @@ export async function publish(itemId: string, actorEmail: string, options: { eme
 export async function rollback(itemId: string, versionId: string, actorEmail: string, reason: string) {
   if (reason.trim().length < 10) throw new Error("ROLLBACK_REASON_REQUIRED");
   const db = requireDb();
+  const [item] = await db.select().from(contentItems).where(eq(contentItems.id, itemId)).limit(1);
+  if (!item) throw new Error("CONTENT_NOT_FOUND");
   const [version] = await db.select().from(contentVersions).where(and(eq(contentVersions.id, versionId), eq(contentVersions.itemId, itemId))).limit(1);
   if (!version) throw new Error("VERSION_NOT_FOUND");
+  if (requiresKnowledgeUgoApproval(item.agentKey, version.metadata)) assertKnowledgeUgoApproval(actorEmail);
+  // Restoring an old version must not bypass approval on a current SAV projection.
+  if (item.currentDraftVersionId) {
+    const [current] = await db.select().from(contentVersions).where(eq(contentVersions.id, item.currentDraftVersionId)).limit(1);
+    if (requiresKnowledgeUgoApproval(item.agentKey, current?.metadata)) assertKnowledgeUgoApproval(actorEmail);
+  }
   const [indexed] = await db.select({ id: contentChunks.id }).from(contentChunks).where(eq(contentChunks.versionId, versionId)).limit(1);
   if (!indexed) throw new Error("VERSION_NOT_INDEXED");
   const revision = revisionId();

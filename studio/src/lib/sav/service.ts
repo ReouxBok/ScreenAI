@@ -1,6 +1,6 @@
 import "server-only";
 
-import { and, asc, desc, eq, inArray, isNotNull, isNull, lt, or, sql } from "drizzle-orm";
+import { and, asc, desc, eq, ilike, inArray, isNotNull, isNull, lt, notInArray, or, sql } from "drizzle-orm";
 import { z } from "zod";
 import { requireDb } from "@/db";
 import {
@@ -14,15 +14,18 @@ import {
   savMessages,
   savPilotBatches,
   savPilotItems,
+  savProposalReviews,
   savThreads,
   savWebhookReceipts,
   type SavDecisionEvidence,
 } from "@/db/schema";
 import { decryptSavPayload, encryptSavPayload, savContentHash } from "./crypto";
 import { analyzeSavMessage, type SavAnalysis } from "./intelligence";
+import type { SavProposalRouting } from "./proposal";
 import { redactSavLearningText } from "./learning-extraction";
 import { invalidateSavReplies } from "./invalidation";
-import { isSavPilotMode } from "./config";
+import { isSavPilotMode, savReleaseStage } from "./config";
+import { getSavV0Cutover, isSavMessageEligible, savV0EligibleMessageFilter } from "./cutover";
 import {
   decisionKindSchema,
   requestsHuman,
@@ -33,7 +36,7 @@ import {
   type DecisionProposal,
 } from "./policy";
 
-export type SavMessageBody = { text: string; html?: string; headers?: Record<string, string> };
+export type SavMessageBody = { text: string; html?: string; headers?: Record<string, string>; attachments?: Array<{ filename: string; mimeType: string; size: number }> };
 
 export const inboundMessageSchema = z.object({
   mailboxEmail: z.email(),
@@ -44,6 +47,7 @@ export const inboundMessageSchema = z.object({
   subject: z.string().trim().max(1_000).default("Sans objet"),
   bodyText: z.string().max(100_000).default(""),
   bodyHtml: z.string().max(300_000).optional(),
+  attachments: z.array(z.object({ filename: z.string().max(500), mimeType: z.string().max(200), size: z.number().int().nonnegative() })).max(100).default([]),
   headers: z.record(z.string(), z.string().max(2_000)).optional(),
   autoSubmitted: z.string().trim().max(200).optional(),
   receivedAt: z.coerce.date(),
@@ -78,6 +82,8 @@ const pilotReviewSchema = z.object({
   ])).max(9).default([]),
   comment: z.string().trim().max(4_000).default(""),
   correctedDraft: z.string().trim().max(10_000).default(""),
+  reusability: z.enum(["none", "tone_only", "customer_specific", "reusable"]).default("none"),
+  justification: z.string().trim().max(2_000).default(""),
 });
 
 function safeErrorCode(error: unknown) {
@@ -161,6 +167,8 @@ async function createDecision(
   pilotBatchId?: string,
   category = "other",
   urgency: SavAnalysis["urgency"] = "normal",
+  routing?: SavProposalRouting,
+  agentRunId?: string,
 ) {
   const db = requireDb();
   const [existing] = await db.select().from(savDecisions)
@@ -168,8 +176,15 @@ async function createDecision(
   if (existing) return existing;
 
   return db.transaction(async (tx) => {
+    // Serialize analysis commits with corrections for this message. A retried
+    // worker must reuse the current decision, never create a second current row.
+    await tx.select({ id: savMessages.id }).from(savMessages).where(eq(savMessages.id, message.id)).for("update");
+    const [current] = await tx.select().from(savDecisions)
+      .where(and(eq(savDecisions.messageId, message.id), eq(savDecisions.isCurrent, true))).limit(1);
+    if (current) return current;
     const [decision] = await tx.insert(savDecisions).values({
       messageId: message.id,
+      agentRunId,
       kind: proposal.kind,
       reasonCode: proposal.reasonCode,
       explanation: proposal.explanation,
@@ -182,15 +197,15 @@ async function createDecision(
     const now = new Date();
     if (proposal.kind === "ticket_pending") {
       if (!pilotBatchId) await tx.update(savThreads).set({ status: "ai_processing", updatedAt: now }).where(eq(savThreads.id, message.threadId));
-      await tx.insert(savActions).values({
+      if (routing && ["new", "matched"].includes(routing.kind)) await tx.insert(savActions).values({
         threadId: message.threadId,
         messageId: message.id,
         decisionId: decision.id,
         pilotBatchId,
-        kind: "create_ticket",
+        kind: routing.kind === "matched" ? "link_ticket" : "create_ticket",
         priority: urgency === "critical" ? 100 : urgency === "high" ? 80 : urgency === "low" ? 20 : 50,
         idempotencyKey: `hubspot:create-ticket:${message.id}`,
-        payload: { reasonCode: proposal.reasonCode, category },
+        payload: { reasonCode: proposal.reasonCode, category, ...(routing.kind === "matched" ? { ticketId: routing.ticketId } : {}) },
         actorType: "ai",
       }).onConflictDoNothing();
     } else if (proposal.kind === "human_review_required") {
@@ -204,15 +219,15 @@ async function createDecision(
           updatedAt: now,
         }).where(eq(savThreads.id, message.threadId));
       }
-      await tx.insert(savActions).values({
+      if (routing && ["new", "matched"].includes(routing.kind)) await tx.insert(savActions).values({
         threadId: message.threadId,
         messageId: message.id,
         decisionId: decision.id,
         pilotBatchId,
-        kind: "create_ticket",
+        kind: routing.kind === "matched" ? "link_ticket" : "create_ticket",
         priority: urgency === "critical" ? 100 : urgency === "high" ? 80 : 50,
         idempotencyKey: `hubspot:create-ticket:${message.id}`,
-        payload: { reasonCode: proposal.reasonCode, humanRequired: true, category },
+        payload: { reasonCode: proposal.reasonCode, humanRequired: true, category, ...(routing.kind === "matched" ? { ticketId: routing.ticketId } : {}) },
         actorType: "ai",
       }).onConflictDoNothing();
       await tx.insert(savActions).values({
@@ -229,7 +244,11 @@ async function createDecision(
         executedAt: null,
       }).onConflictDoNothing();
     } else {
-      if (!pilotBatchId) await tx.update(savThreads).set({ status: "closed_no_action", updatedAt: now }).where(eq(savThreads.id, message.threadId));
+      // This message needs no action; an already-open customer dossier may.
+      if (!pilotBatchId) await tx.update(savThreads).set({ status: "closed_no_action", updatedAt: now }).where(and(
+        eq(savThreads.id, message.threadId), eq(savThreads.aiPaused, false), isNull(savThreads.hubspotTicketId),
+        inArray(savThreads.status, ["new", "closed_no_action"]),
+      ));
     }
     await tx.update(savMessages).set({ processedAt: now }).where(eq(savMessages.id, message.id));
     return decision;
@@ -240,20 +259,27 @@ export async function ingestInboundMessage(rawInput: unknown) {
   const input = inboundMessageSchema.parse(rawInput);
   const db = requireDb();
   const mailbox = await ensureSavMailbox(input.mailboxEmail);
+  const cutover = await getSavV0Cutover();
+  const eligible = Boolean(cutover && mailbox.email === cutover.mailboxEmail && input.receivedAt.getTime() > Date.parse(cutover.receivedAfter));
   const normalizedFrom = normalizeEmailAddress(input.from);
   const bodyText = sanitizeInboundText(input.bodyText);
+  const headers = Object.fromEntries(Object.entries(input.headers ?? {}).map(([key, value]) => [key.toLocaleLowerCase("en"), value]));
+  if (input.autoSubmitted !== undefined) headers["auto-submitted"] = input.autoSubmitted;
 
   const result = await db.transaction(async (tx) => {
     let [thread] = await tx.select().from(savThreads)
       .where(and(eq(savThreads.mailboxId, mailbox.id), eq(savThreads.gmailThreadId, input.gmailThreadId))).limit(1);
     if (!thread) {
-      [thread] = await tx.insert(savThreads).values({
+      const [createdThread] = await tx.insert(savThreads).values({
         mailboxId: mailbox.id,
         gmailThreadId: input.gmailThreadId,
         subject: input.subject || "Sans objet",
         customerEmail: normalizedFrom,
         lastMessageAt: input.receivedAt,
-      }).returning();
+      }).onConflictDoNothing().returning();
+      [thread] = createdThread ? [createdThread] : await tx.select().from(savThreads)
+        .where(and(eq(savThreads.mailboxId, mailbox.id), eq(savThreads.gmailThreadId, input.gmailThreadId))).limit(1);
+      if (!thread) throw new Error("SAV_THREAD_NOT_FOUND");
     }
 
     const [created] = await tx.insert(savMessages).values({
@@ -265,7 +291,7 @@ export async function ingestInboundMessage(rawInput: unknown) {
       toEmails: input.to.map(normalizeEmailAddress),
       subject: input.subject || "Sans objet",
       preview: redactSavLearningText(bodyText.replace(/\s+/g, " ")).slice(0, 280),
-      bodyCiphertext: encryptSavPayload({ text: bodyText, ...(input.bodyHtml ? { html: input.bodyHtml } : {}), ...(input.headers ? { headers: input.headers } : {}) }),
+      bodyCiphertext: encryptSavPayload({ text: bodyText, ...(input.bodyHtml ? { html: input.bodyHtml } : {}), headers, attachments: input.attachments }),
       receivedAt: input.receivedAt,
     }).onConflictDoNothing().returning();
     const [message] = created ? [created] : await tx.select().from(savMessages)
@@ -277,7 +303,7 @@ export async function ingestInboundMessage(rawInput: unknown) {
       lastMessageAt: input.receivedAt > thread.lastMessageAt ? input.receivedAt : thread.lastMessageAt,
       updatedAt: new Date(),
     }).where(eq(savThreads.id, thread.id));
-    if (created) {
+    if (created && eligible) {
       const now = new Date();
       await invalidateSavReplies(tx, thread.id, "SAV_REPLY_OBSOLETE", now);
       // A human request takes effect before a potentially slow model call.
@@ -291,6 +317,7 @@ export async function ingestInboundMessage(rawInput: unknown) {
   });
 
   if (result.duplicate) return result;
+  if (!eligible) return { ...result, excludedFromProposals: true as const, proposalSkipReason: cutover ? "before_cutover" : "cutover_not_active" };
   if (isSavPilotMode()) return { ...result, queuedForPilot: true as const };
   const decision = await processStoredSavMessage(result.message.id);
   return { ...result, decision };
@@ -304,18 +331,20 @@ export async function processStoredSavMessage(messageId: string) {
     analysisStatus: "processing", analysisStartedAt: new Date(), analysisErrorCode: null,
     analysisAttempts: sql`${savMessages.analysisAttempts} + 1`,
   }).where(and(
-    eq(savMessages.id, messageId), eq(savMessages.direction, "inbound"), isNull(savMessages.processedAt),
+    eq(savMessages.id, messageId), eq(savMessages.direction, "inbound"), isNull(savMessages.processedAt), savV0EligibleMessageFilter(),
     lt(savMessages.analysisAttempts, 3),
     or(eq(savMessages.analysisStatus, "pending"), and(eq(savMessages.analysisStatus, "processing"), or(isNull(savMessages.analysisStartedAt), lt(savMessages.analysisStartedAt, staleBefore)))),
   )).returning();
   if (!message) return null;
   try {
     const body = decryptSavPayload<SavMessageBody>(message.bodyCiphertext);
-  const analysis = await analyzeSavMessage({
+    const analysis = await analyzeSavMessage({
       from: message.fromEmail, subject: message.subject, body: body.text,
       autoSubmitted: body.headers?.["auto-submitted"],
+      contentType: body.headers?.["content-type"],
+      displayName: body.headers?.["from-display-name"],
     }, { messageId: message.id });
-    const decision = await createDecision(message, analysis.proposal, analysis.evidence, analysis.model, undefined, analysis.category, analysis.urgency);
+    const decision = await createDecision(message, analysis.proposal, analysis.evidence, analysis.model, undefined, analysis.category, analysis.urgency, analysis.ticketRouting, analysis.agentRunId);
     if (analysis.replyDraft) {
     await db.insert(savActions).values({
       threadId: message.threadId,
@@ -344,7 +373,7 @@ export async function processPendingSavMessages(limit = 4) {
   const db = requireDb();
   const staleBefore = new Date(Date.now() - 10 * 60 * 1_000);
   const candidates = await db.select({ id: savMessages.id }).from(savMessages).leftJoin(savPilotItems, eq(savPilotItems.messageId, savMessages.id)).where(and(
-    eq(savMessages.direction, "inbound"), isNull(savMessages.processedAt), isNull(savPilotItems.id), lt(savMessages.analysisAttempts, 3),
+    eq(savMessages.direction, "inbound"), isNull(savMessages.processedAt), isNull(savPilotItems.id), lt(savMessages.analysisAttempts, 3), savV0EligibleMessageFilter(),
     or(eq(savMessages.analysisStatus, "pending"), and(eq(savMessages.analysisStatus, "processing"), or(isNull(savMessages.analysisStartedAt), lt(savMessages.analysisStartedAt, staleBefore)))),
   )).orderBy(asc(savMessages.receivedAt)).limit(Math.min(20, Math.max(1, limit)));
   const processed = [];
@@ -367,15 +396,17 @@ export async function processSavPilotItem(itemId: string) {
   try {
     const [message] = await db.select().from(savMessages).where(eq(savMessages.id, claimed.messageId)).limit(1);
     if (!message) throw new Error("SAV_PILOT_MESSAGE_NOT_FOUND");
+    if (!await isSavMessageEligible(message.id)) throw new Error("SAV_MESSAGE_BEFORE_CUTOVER");
     const body = decryptSavPayload<SavMessageBody>(message.bodyCiphertext);
     const analysis = await analyzeSavMessage(
-      { from: message.fromEmail, subject: message.subject, body: body.text },
+      { from: message.fromEmail, subject: message.subject, body: body.text,
+        autoSubmitted: body.headers?.["auto-submitted"], contentType: body.headers?.["content-type"], displayName: body.headers?.["from-display-name"] },
       { messageId: message.id, pilotBatchId: claimed.batchId },
     );
     const [activeBatch] = await db.select({ id: savPilotBatches.id }).from(savPilotBatches)
       .where(and(eq(savPilotBatches.id, claimed.batchId), eq(savPilotBatches.status, "processing"))).limit(1);
     if (!activeBatch) throw new Error("SAV_PILOT_BATCH_CANCELLED");
-    const decision = await createDecision(message, analysis.proposal, analysis.evidence, analysis.model, claimed.batchId, analysis.category, analysis.urgency);
+    const decision = await createDecision(message, analysis.proposal, analysis.evidence, analysis.model, claimed.batchId, analysis.category, analysis.urgency, analysis.ticketRouting, analysis.agentRunId);
     if (analysis.replyDraft) await db.insert(savActions).values({
       threadId: message.threadId,
       messageId: message.id,
@@ -427,6 +458,7 @@ export async function listSavPilotCandidates(limit = 80) {
       eq(savMessages.direction, "inbound"),
       isNull(savMessages.processedAt),
       isNull(savPilotItems.id),
+      savV0EligibleMessageFilter(),
     ))
     .orderBy(asc(savMessages.receivedAt))
     .limit(Math.min(100, Math.max(10, limit)));
@@ -450,6 +482,7 @@ export async function startSavPilotBatch(actorEmail: string, selection: number |
         isNull(savMessages.processedAt),
         isNull(savPilotItems.id),
         selectedMessageIds ? inArray(savMessages.id, selectedMessageIds) : undefined,
+        savV0EligibleMessageFilter(),
       ))
       .orderBy(asc(savMessages.receivedAt)).limit(targetSize);
     if (candidates.length < targetSize) throw new Error(selectedMessageIds ? "SAV_PILOT_SELECTION_STALE" : `SAV_PILOT_NEEDS_${targetSize}_MAILS`);
@@ -595,8 +628,15 @@ export async function processPendingSavPilotItems(limit = 10) {
   return { processed };
 }
 
-export async function listSavInbox(limit = 100) {
+export async function listSavInbox(limit = 100, options: { offset?: number; query?: string; view?: string } = {}) {
   const db = requireDb();
+  const technical = ["spam", "automatic_reply", "bounce", "internal_notification", "duplicate"] as const;
+  const query = options.query?.trim().slice(0, 200).replace(/[\\%_]/g, "\\$&");
+  const viewFilter = options.view === "technical" ? inArray(savDecisions.kind, technical)
+    : options.view === "human" ? eq(savThreads.aiPaused, true)
+    : options.view === "reviewed" ? isNotNull(savProposalReviews.id)
+    : options.view === "errors" ? or(isNotNull(savMessages.analysisErrorCode), eq(savMessages.analysisStatus, "failed"))
+    : options.view === "pending" ? and(isNull(savProposalReviews.id), eq(savMessages.analysisStatus, "done")) : undefined;
   return db.select({
     messageId: savMessages.id,
     threadId: savThreads.id,
@@ -604,6 +644,10 @@ export async function listSavInbox(limit = 100) {
     fromEmail: savMessages.fromEmail,
     subject: savMessages.subject,
     preview: savMessages.preview,
+    analysisStatus: savMessages.analysisStatus,
+    analysisErrorCode: savMessages.analysisErrorCode,
+    reviewStatus: savProposalReviews.status,
+    reviewId: savProposalReviews.id,
     threadStatus: savThreads.status,
     hubspotTicketId: savThreads.hubspotTicketId,
     aiPaused: savThreads.aiPaused,
@@ -621,9 +665,20 @@ export async function listSavInbox(limit = 100) {
     .innerJoin(savThreads, eq(savThreads.id, savMessages.threadId))
     .leftJoin(savDecisions, and(eq(savDecisions.messageId, savMessages.id), eq(savDecisions.isCurrent, true)))
     .leftJoin(savPilotItems, eq(savPilotItems.messageId, savMessages.id))
-    .where(eq(savMessages.direction, "inbound"))
-    .orderBy(desc(savMessages.receivedAt))
-    .limit(Math.min(250, Math.max(1, limit)));
+    .leftJoin(savProposalReviews, and(eq(savProposalReviews.messageId, savMessages.id), eq(savProposalReviews.decisionId, savDecisions.id), eq(savProposalReviews.isCurrent, true)))
+    .where(and(eq(savMessages.direction, "inbound"), savV0EligibleMessageFilter(), viewFilter,
+      options.view === "technical" ? undefined : or(isNull(savDecisions.kind), notInArray(savDecisions.kind, [...technical])),
+      query ? or(ilike(savMessages.fromEmail, `%${query}%`), ilike(savMessages.subject, `%${query}%`), ilike(savMessages.preview, `%${query}%`)) : undefined))
+    .orderBy(desc(savMessages.receivedAt), desc(savMessages.id))
+    .limit(Math.min(250, Math.max(1, limit))).offset(Math.max(0, Math.min(100_000, options.offset ?? 0)));
+}
+
+export async function retrySavAnalysis(messageId: string, actorEmail: string) {
+  if (!await isSavMessageEligible(messageId)) throw new Error("SAV_MESSAGE_BEFORE_CUTOVER");
+  const [message] = await requireDb().update(savMessages).set({ analysisStatus: "pending", analysisAttempts: 0, analysisStartedAt: null, analysisErrorCode: null })
+    .where(and(eq(savMessages.id, messageId), eq(savMessages.analysisStatus, "failed"), isNull(savMessages.processedAt))).returning();
+  if (!message) throw new Error("SAV_ANALYSIS_NOT_RETRYABLE");
+  await requireDb().insert(auditLogs).values({ actorEmail, action: "sav_analysis_retried", entityType: "sav_message", entityId: messageId });
 }
 
 export async function listSavPilotBatches(limit = 20) {
@@ -1001,7 +1056,7 @@ export async function reviewSavPilotItem(itemId: string, rawInput: unknown, acto
       batchId: item.batchId, feedbackCount: input.feedbackCodes.length,
     },
   });
-  if (input.verdict !== "correct" && input.correctedDraft.length >= 20) {
+  if (input.reusability === "reusable" && input.justification.length >= 20 && item.agentRunId && input.correctedDraft.length >= 20) {
     const [context] = await db.select({
       threadId: savThreads.id,
       hubspotTicketId: savThreads.hubspotTicketId,
@@ -1014,6 +1069,7 @@ export async function reviewSavPilotItem(itemId: string, rawInput: unknown, acto
       const sourceContentHash = savContentHash({
         source: "pilot_human_review",
         pilotItemId: item.id,
+        agentRunId: item.agentRunId,
         correctedDraft: input.correctedDraft,
       });
       await db.insert(savLearningCandidates).values({
@@ -1023,9 +1079,11 @@ export async function reviewSavPilotItem(itemId: string, rawInput: unknown, acto
         sourceContentHash,
         proposedPatch: {
           ciphertext: encryptSavPayload({
-            subject: context.subject,
-            finalHumanResolution: input.correctedDraft,
+            subject: redactSavLearningText(context.subject),
+            finalHumanResolution: redactSavLearningText(input.correctedDraft),
             sourceSnapshotId: `pilot:${item.id}`,
+            agentRunId: item.agentRunId,
+            reusabilityJustification: redactSavLearningText(input.justification),
             provenance: "pilot_human_review",
             customerConfirmed: false,
           }),
@@ -1085,10 +1143,17 @@ export async function correctSavDecision(decisionId: string, rawInput: unknown, 
   const db = requireDb();
   const [current] = await db.select().from(savDecisions).where(eq(savDecisions.id, decisionId)).limit(1);
   if (!current || !current.isCurrent) throw new Error("SAV_DECISION_NOT_CURRENT");
+  if (!await isSavMessageEligible(current.messageId)) throw new Error("SAV_MESSAGE_BEFORE_CUTOVER");
   return db.transaction(async (tx) => {
-    const [message] = await tx.select().from(savMessages).where(eq(savMessages.id, current.messageId)).limit(1);
+    const [message] = await tx.select().from(savMessages).where(eq(savMessages.id, current.messageId)).for("update");
     if (!message) throw new Error("SAV_MESSAGE_NOT_FOUND");
+    const [stillCurrent] = await tx.select({ id: savDecisions.id }).from(savDecisions)
+      .where(and(eq(savDecisions.id, current.id), eq(savDecisions.isCurrent, true))).limit(1);
+    if (!stillCurrent) throw new Error("SAV_DECISION_NOT_CURRENT");
     await invalidateSavReplies(tx, message.threadId, "SAV_REPLY_OBSOLETE");
+    // Keep the old proposal for audit, but it must no longer be executable.
+    await tx.update(savActions).set({ status: "cancelled", errorCode: "SAV_DECISION_SUPERSEDED", updatedAt: new Date() })
+      .where(and(eq(savActions.decisionId, current.id), eq(savActions.status, "pending")));
     if (input.kind === "human_review_required") {
       const now = new Date();
       await tx.update(savThreads).set({ aiPaused: true, status: "human_requested", humanRequestedAt: now, humanDueAt: humanDueAt(now), updatedAt: now })
@@ -1151,6 +1216,7 @@ export async function approveSavDraft(draftActionId: string, actorEmail: string)
 }
 
 export async function queueSavTicketCreation(threadId: string, actorEmail: string) {
+  if (savReleaseStage() === "v0") throw new Error("SAV_VALIDATED_CURRENT_PROPOSAL_REQUIRED");
   const db = requireDb();
   const [thread] = await db.select().from(savThreads).where(eq(savThreads.id, threadId)).limit(1);
   if (!thread) throw new Error("SAV_THREAD_NOT_FOUND");
@@ -1173,6 +1239,8 @@ export async function queueSavTicketCreation(threadId: string, actorEmail: strin
 
 export async function retrySavAction(actionId: string, actorEmail: string) {
   const db = requireDb();
+  const [current] = await db.select().from(savActions).where(eq(savActions.id, actionId)).limit(1);
+  if ((current?.errorCode === "SAV_MANUAL_RECONCILIATION_REQUIRED" || current?.payload.ticketCreateDispatchedAt) && !current?.payload.hubspotTicketId) throw new Error("SAV_MANUAL_RECONCILIATION_REQUIRED");
   const [action] = await db.update(savActions).set({ status: "pending", attemptCount: 0, scheduledAt: null, errorCode: null, updatedAt: new Date() })
     .where(and(eq(savActions.id, actionId), eq(savActions.status, "failed"))).returning();
   if (!action) throw new Error("SAV_FAILED_ACTION_NOT_FOUND");

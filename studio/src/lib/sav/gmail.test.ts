@@ -65,6 +65,7 @@ describe("Gmail SAV ingestion", () => {
   it("ingests only recipients explicitly assigned to the SAV", () => {
     const supportMessage = parseGmailMessage("reouven@limova.ai", {
       id: "gmail-support",
+      internalDate: "1788170400000",
       threadId: "thread-support",
       payload: { headers: [
         { name: "From", value: "Client <client@example.com>" },
@@ -74,6 +75,7 @@ describe("Gmail SAV ingestion", () => {
     });
     const personalMessage = parseGmailMessage("reouven@limova.ai", {
       id: "gmail-personal",
+      internalDate: "1788170400000",
       threadId: "thread-personal",
       payload: { headers: [
         { name: "From", value: "Partenaire <partner@example.com>" },
@@ -103,6 +105,7 @@ describe("Gmail SAV ingestion", () => {
   it("normalise le HTML et tronque les en-têtes non critiques", () => {
     const parsed = parseGmailMessage("contact@limova.ai", {
       id: "gmail-html",
+      internalDate: "1788170400000",
       threadId: "thread-html",
       payload: {
         headers: [
@@ -117,7 +120,25 @@ describe("Gmail SAV ingestion", () => {
     });
     expect(parsed.from.length).toBeLessThanOrEqual(500);
     expect(parsed.autoSubmitted?.length).toBeLessThanOrEqual(200);
+    expect(parsed.headers["auto-submitted"]).toBe(parsed.autoSubmitted);
+    expect(parsed.headers["content-type"]).toBe("text/html");
     expect(parsed.bodyText).toContain("Bonjour & merci");
     expect(parsed.bodyText).not.toContain("secret()");
+  });
+  it("does not turn an undated historical message into a new arrival", () => {
+    expect(() => parseGmailMessage("contact@limova.ai", { id: "undated", threadId: "thread" })).toThrow("GMAIL_MESSAGE_INVALID_INTERNAL_DATE");
+    expect(() => parseGmailMessage("contact@limova.ai", { id: "invalid-date", threadId: "thread", internalDate: "not-a-date" })).toThrow("GMAIL_MESSAGE_INVALID_INTERNAL_DATE");
+  });
+  it("keeps attachment metadata without reading attachment text as the email body", () => {
+    const parsed = parseGmailMessage("contact@limova.ai", {
+      id: "with-attachment", threadId: "thread", internalDate: "1788170400000",
+      payload: { mimeType: "multipart/mixed", headers: [{ name: "From", value: "Jeanne Martin <client@example.com>" }], parts: [
+        { mimeType: "text/plain", body: { data: base64url("Bonjour, ma demande.") } },
+        { mimeType: "text/plain", filename: "piece.txt", body: { data: base64url("Contenu de pièce jointe non analysé"), size: 42 } },
+      ] },
+    });
+    expect(parsed.bodyText).toBe("Bonjour, ma demande.");
+    expect(parsed.attachments).toEqual([{ filename: "piece.txt", mimeType: "text/plain", size: 42 }]);
+    expect(parsed.headers["from-display-name"]).toBe("Jeanne Martin");
   });
 });

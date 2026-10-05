@@ -3,14 +3,13 @@
 import { revalidatePath } from "next/cache";
 import { redirect } from "next/navigation";
 import { start } from "workflow/api";
-import { requireApiStaff } from "@/lib/auth";
-import { continueHubspotBackfill } from "@/lib/sav/hubspot";
+import { requireSavApiStaff as requireApiStaff } from "@/lib/sav/auth";
+import { continueHubspotBackfill, reconcileSavManualTicket } from "@/lib/sav/hubspot";
 import { approveLearningCandidate, rejectLearningCandidate } from "@/lib/sav/learning";
 import {
   approveSavDraft,
   cancelSavPilotBatch,
   correctSavDecision,
-  queueSavTicketCreation,
   requestHumanIntervention,
   retrySavAction,
   retrySavWebhookReceipt,
@@ -18,6 +17,70 @@ import {
   startSavPilotBatch,
 } from "@/lib/sav/service";
 import { analyzeSavPilotBatchWorkflow } from "@/workflows/sav-pilot";
+import { reviewKnowledgeCandidate } from "@/lib/knowledge/review";
+import { proposeSavFromOnboarding } from "@/lib/knowledge/candidates";
+import { reviewSavProposal } from "@/lib/sav/review";
+import { queueSavManualTicket } from "@/lib/sav/manual-tickets";
+import { retrySavAnalysis } from "@/lib/sav/service";
+import { saveSavReplyDraft } from "@/lib/sav/drafts";
+import { assertSavManualReplyEnabled, queueSavManualReply } from "@/lib/sav/manual-replies";
+import { processPendingGmailSendActions } from "@/lib/sav/gmail";
+import { recordSavDeploymentDecision } from "@/lib/sav/metrics";
+import { createReviewedSavReplay, runReviewedSavRuleReplay } from "@/lib/sav/reviewed-replay";
+
+async function evaluationAction(operation: () => Promise<unknown>, success: string) {
+  let result = success;
+  try { await operation(); } catch (error) { result = error instanceof Error && /^SAV_[A-Z_]+$/.test(error.message) ? error.message : "SAV_EVALUATION_INVALID"; }
+  revalidatePath("/studio/sav/evaluation");
+  redirect(`/studio/sav/evaluation?origin=all&notice=${result}`);
+}
+
+export async function recordDeploymentDecisionAction(form: FormData) {
+  const staff = await requireApiStaff("admin");
+  await evaluationAction(() => recordSavDeploymentDecision({ snapshotHash: String(form.get("snapshotHash")), versionId: String(form.get("versionId")), decision: String(form.get("decision")), reason: String(form.get("reason") || "") }, staff.email), "decision_saved");
+}
+export async function approveReplayAction(form: FormData) {
+  const staff = await requireApiStaff("admin");
+  await evaluationAction(() => createReviewedSavReplay({ reviewId: id(form, "reviewId"), title: String(form.get("title") || ""), scenario: String(form.get("scenario") || ""), expectedKind: String(form.get("expectedKind")), requiresHumanApproval: form.get("requiresHumanApproval") === "on", anonymizationConfirmed: form.get("anonymizationConfirmed") === "on" }, staff.email), "replay_saved");
+}
+export async function runReviewedReplayAction() {
+  const staff = await requireApiStaff("admin");
+  await evaluationAction(() => runReviewedSavRuleReplay(staff.email), "replay_done");
+}
+
+export async function saveReplyDraftAction(form: FormData) {
+  const staff = await requireApiStaff("admin");
+  const threadId = id(form, "threadId");
+  let result = "draft_saved";
+  try { await saveSavReplyDraft({ threadId, messageId: id(form, "messageId"), decisionId: id(form, "decisionId"), agentRunId: id(form, "agentRunId"),
+    reviewId: String(form.get("reviewId") || "") || null, knowledgeRevision: String(form.get("knowledgeRevision") || "") || null,
+    expectedDraftId: String(form.get("draftId") || "") || null, status: String(form.get("status") || "draft"), text: String(form.get("replyDraft") || form.get("text") || "") }, staff.email); }
+  catch (error) { result = error instanceof Error && /^SAV_[A-Z_]+$/.test(error.message) ? error.message : "SAV_DRAFT_INVALID"; }
+  revalidatePath(`/studio/sav/${threadId}`);
+  redirect(`/studio/sav/${encodeURIComponent(threadId)}?review=${result}`);
+}
+
+export async function sendStudioReplyAction(form: FormData) {
+  const staff = await requireApiStaff("admin");
+  const threadId = id(form, "threadId");
+  let result = "reply_queued";
+  try {
+    assertSavManualReplyEnabled();
+    const draft = await saveSavReplyDraft({ threadId, messageId: id(form, "messageId"), decisionId: id(form, "decisionId"), agentRunId: id(form, "agentRunId"),
+      reviewId: String(form.get("reviewId") || "") || null, knowledgeRevision: String(form.get("knowledgeRevision") || "") || null,
+      expectedDraftId: String(form.get("draftId") || "") || null, status: "draft", text: String(form.get("replyDraft") || "") }, staff.email);
+    const action = await queueSavManualReply({ threadId, draftId: draft.id }, staff.email);
+    if (action.status === "succeeded") result = "reply_sent";
+    else {
+      const delivery = await processPendingGmailSendActions(1, action.id);
+      const processed = delivery.processed[0];
+      result = processed?.status === "succeeded" ? "reply_sent" : typeof processed?.errorCode === "string" ? processed.errorCode : "reply_queued";
+    }
+  } catch (error) { result = error instanceof Error && /^SAV_[A-Z_]+$/.test(error.message) ? error.message : "SAV_REPLY_MANUAL_INVALID"; }
+  revalidatePath(`/studio/sav/${threadId}`);
+  revalidatePath("/studio/sav");
+  redirect(`/studio/sav/${encodeURIComponent(threadId)}?review=${result}`);
+}
 
 function id(form: FormData, name: string) {
   const value = String(form.get(name) || "").trim();
@@ -64,9 +127,38 @@ export async function correctDecisionAction(form: FormData) {
 export async function createTicketAction(form: FormData) {
   const staff = await requireApiStaff("admin");
   const threadId = id(form, "threadId");
-  await queueSavTicketCreation(threadId, staff.email);
+  let errorCode = "";
+  try { await queueSavManualTicket({ threadId, reviewId: id(form, "reviewId"), kind: "create_ticket", distinctIssueReason: String(form.get("distinctIssueReason") || "") }, staff.email); }
+  catch (error) { errorCode = error instanceof Error && /^[A-Z][A-Z_]+$/.test(error.message) ? error.message : "SAV_MANUAL_TICKET_INVALID"; }
   revalidatePath("/studio/sav");
   revalidatePath(`/studio/sav/${threadId}`);
+  redirect(`/studio/sav/${encodeURIComponent(threadId)}?review=${errorCode || "ticket_queued"}`);
+}
+
+export async function linkTicketAction(form: FormData) {
+  const staff = await requireApiStaff("admin");
+  const threadId = id(form, "threadId");
+  let errorCode = "";
+  try { await queueSavManualTicket({ threadId, reviewId: id(form, "reviewId"), kind: "link_ticket", ticketId: id(form, "ticketId") }, staff.email); }
+  catch (error) { errorCode = error instanceof Error && /^[A-Z][A-Z_]+$/.test(error.message) ? error.message : "SAV_MANUAL_TICKET_INVALID"; }
+  revalidatePath("/studio/sav"); revalidatePath(`/studio/sav/${threadId}`);
+  redirect(`/studio/sav/${encodeURIComponent(threadId)}?review=${errorCode || "ticket_queued"}`);
+}
+
+export async function retryAnalysisAction(form: FormData) {
+  const staff = await requireApiStaff("admin");
+  await retrySavAnalysis(id(form, "messageId"), staff.email);
+  revalidatePath("/studio/sav"); revalidatePath(`/studio/sav/${id(form, "threadId")}`);
+}
+
+export async function reconcileTicketAction(form: FormData) {
+  const staff = await requireApiStaff("admin");
+  const threadId = id(form, "threadId");
+  let errorCode = "";
+  try { await reconcileSavManualTicket(id(form, "actionId"), id(form, "ticketId"), staff.email, String(form.get("reason") || "")); }
+  catch (error) { errorCode = error instanceof Error && /^[A-Z][A-Z_]+$/.test(error.message) ? error.message : "SAV_RECONCILIATION_FAILED"; }
+  revalidatePath("/studio/sav"); revalidatePath(`/studio/sav/${threadId}`);
+  redirect(`/studio/sav/${encodeURIComponent(threadId)}?review=${errorCode || "ticket_reconciled"}`);
 }
 
 export async function approveDraftAction(form: FormData) {
@@ -178,4 +270,46 @@ export async function reviewLearningAction(form: FormData) {
   revalidatePath("/studio/sav");
   revalidatePath("/studio/sav/resolutions");
   revalidatePath("/studio/contenus");
+}
+
+export async function reviewKnowledgeAction(form: FormData) {
+  const staff = await requireApiStaff("admin");
+  let errorCode = "";
+  try {
+    const decision = String(form.get("decision"));
+    if (decision !== "approve" && decision !== "reject") throw new Error("INVALID_LEARNING_DECISION");
+    await reviewKnowledgeCandidate(id(form, "candidateId"), { expectedRevisionId: id(form, "revisionId"), decision, reason: String(form.get("reason") || ""), ...(decision === "approve" ? { document: JSON.parse(String(form.get("document"))) } : {}) }, staff.email);
+  } catch (error) { errorCode = error instanceof Error && /^[A-Z][A-Z_]+$/.test(error.message) ? error.message : "KNOWLEDGE_REVIEW_INVALID"; }
+  revalidatePath("/studio/sav/connaissances");
+  redirect(`/studio/sav/connaissances?result=${errorCode || "draft_ready"}`);
+}
+
+export async function importOnboardingKnowledgeAction(form: FormData) {
+  const staff = await requireApiStaff("admin");
+  let errorCode = "";
+  try { await proposeSavFromOnboarding(id(form, "itemId"), id(form, "versionId"), staff.email); }
+  catch (error) { errorCode = error instanceof Error && /^[A-Z][A-Z_]+$/.test(error.message) ? error.message : "KNOWLEDGE_IMPORT_FAILED"; }
+  revalidatePath("/studio/sav/connaissances");
+  redirect(`/studio/sav/connaissances?result=${errorCode || "candidate_ready"}`);
+}
+
+export async function reviewProposalAction(form: FormData) {
+  const staff = await requireApiStaff("admin");
+  const threadId = id(form, "threadId");
+  let errorCode = "";
+  try {
+    await reviewSavProposal({ messageId: id(form, "messageId"), decisionId: id(form, "decisionId"), agentRunId: id(form, "agentRunId"), expectedReviewId: String(form.get("reviewId") || "") || null,
+      status: "approved", verdict: String(form.get("verdict")), comment: String(form.get("comment") || "Process corrigé relu et validé manuellement depuis le Studio."),
+      dimensions: Object.fromEntries(["classification", "routing", "grounding", "tone", "escalation"].map((key) => [key, String(form.get(`dimension_${key}`))])),
+      reusability: String(form.get("reusability")), reusableResolution: String(form.get("reusableResolution") || ""), justification: String(form.get("justification") || ""),
+      correction: { category: String(form.get("category")), urgency: String(form.get("urgency")), decisionKind: String(form.get("decisionKind")), reasonCode: String(form.get("reasonCode")), explanation: String(form.get("explanation")), title: String(form.get("title")), description: String(form.get("description")), process: [
+        ...Array.from({ length: Math.max(0, Math.min(30, Number(form.get("processCount")) || 0)) }, (_, index) => ({ kind: String(form.get(`processKind_${index}`)), label: String(form.get(`processLabel_${index}`)), sourceIds: JSON.parse(String(form.get(`processSources_${index}`))) })),
+        ...String(form.get("additionalSteps") || "").split("\n").map((value) => value.trim()).filter(Boolean).map((label) => ({ kind: "product_step", label, sourceIds: [] })),
+      ], internalNote: String(form.get("internalNote") || ""), replyDraft: String(form.get("replyDraft") || ""), registrationEmail: String(form.get("registrationEmail") || "").trim().toLowerCase(), identityVerified: form.get("identityVerified") === "on" },
+    }, staff.email);
+  } catch (error) { errorCode = error instanceof Error && /^[A-Z][A-Z_]+$/.test(error.message) ? error.message : "SAV_REVIEW_INVALID"; }
+  revalidatePath("/studio/sav");
+  revalidatePath(`/studio/sav/${threadId}`);
+  revalidatePath("/studio/sav/resolutions");
+  redirect(`/studio/sav/${encodeURIComponent(threadId)}?review=${errorCode || "saved"}`);
 }

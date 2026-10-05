@@ -1,12 +1,14 @@
 import Link from "next/link";
 import { AlertTriangle, ArrowUpRight, Bot, CheckCircle2, Clock3, FlaskConical, Inbox, TicketCheck, UserRoundCheck } from "lucide-react";
 import { isDatabaseConfigured } from "@/db";
-import { requireStaff } from "@/lib/auth";
+import { requireSavStaff as requireStaff } from "@/lib/sav/auth";
 import { savAutomationMode, savAutoReplyDailyLimit, savAutoReplyRolloutPercent, savGeminiApiKey, savHarnessMode } from "@/lib/sav/config";
 import { getHubspotBackfillState, HUBSPOT_EMAIL_READ_SCOPE, isHubspotEmailReadScopeError } from "@/lib/sav/hubspot";
 import { getSavDashboard, getSavImprovementSignals, listSavActionIncidents, listSavAgentPerformance, listSavInbox, listSavPilotBatches, listSavWebhookIncidents } from "@/lib/sav/service";
 import { getSavAutonomyGate } from "@/lib/sav/promotion";
 import { retryAction, retryWebhookAction } from "./actions";
+import { SavV0Inbox } from "./inbox";
+import { savReleaseStage } from "@/lib/sav/config";
 
 export const dynamic = "force-dynamic";
 
@@ -36,8 +38,9 @@ const feedbackLabels: Record<string, string> = {
   good_without_change: "Bonne réponse sans changement",
 };
 
-export default async function SavDashboardPage({ searchParams }: { searchParams: Promise<{ view?: string; q?: string; batch?: string; batchCancelled?: string; launch?: string }> }) {
+export default async function SavDashboardPage({ searchParams }: { searchParams: Promise<{ view?: string; q?: string; page?: string; batch?: string; batchCancelled?: string; launch?: string }> }) {
   await requireStaff("admin");
+  if (savReleaseStage() === "v0") return <SavV0Inbox searchParams={searchParams}/>;
   const configured = isDatabaseConfigured();
   const [{ view = "all", q = "", batch = "", batchCancelled = "", launch = "" }, dashboard, inbox, incidents, actionIncidents, pilotBatches, agentPerformance, improvementSignals, autonomyGate, hubspotBackfill] = await Promise.all([
     searchParams,

@@ -176,6 +176,34 @@
       "when": 1788955207000,
       "tag": "0024_sav_agent_token_usage",
       "breakpoints": true
+    },
+    {
+      "idx": 25,
+      "version": "7",
+      "when": 1790946524329,
+      "tag": "0025_sav_v0_knowledge",
+      "breakpoints": true
+    },
+    {
+      "idx": 26,
+      "version": "7",
+      "when": 1790951149228,
+      "tag": "0026_sav_supervised_reviews",
+      "breakpoints": true
+    },
+    {
+      "idx": 27,
+      "version": "7",
+      "when": 1791177708943,
+      "tag": "0027_sav_v0_studio_drafts",
+      "breakpoints": true
+    },
+    {
+      "idx": 28,
+      "version": "7",
+      "when": 1791178127359,
+      "tag": "0028_sav_v0_evaluation",
+      "breakpoints": true
     }
   ]
 }

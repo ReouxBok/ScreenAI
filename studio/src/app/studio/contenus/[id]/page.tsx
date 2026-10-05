@@ -8,6 +8,7 @@ import { TrainingRecordingReview } from "@/components/training-recording-review"
 import { VersionComparison } from "@/components/version-comparison";
 import { canEditContent, canManageProduction } from "@/lib/access";
 import { requireStaff } from "@/lib/auth";
+import { requiresKnowledgeUgoApproval } from "@/lib/knowledge/contracts";
 import { assessContentReadiness } from "@/lib/content-readiness";
 import { getEvaluationForContent } from "@/lib/evaluations";
 import { getTrainingByContentItemId } from "@/lib/training";
@@ -30,6 +31,7 @@ export default async function DetailPage({ params, searchParams }: {
   const sourceTraining = await getTrainingByContentItemId(id);
   const evaluationData = detail.item.type === "onboarding" ? await getEvaluationForContent(id) : null;
   const isAdmin = canManageProduction(staff.role);
+  const canPublish = isAdmin && (!requiresKnowledgeUgoApproval(detail.item.agentKey, current?.metadata) || staff.email === "ugo@limova.ai");
   const canEdit = canEditContent(staff.role, detail.item.publishedVersionId);
   const readiness = assessContentReadiness({
     type: detail.item.type,
@@ -89,8 +91,9 @@ export default async function DetailPage({ params, searchParams }: {
           {detail.item.status === "draft" && canEdit && <form action={submitAction}><input type="hidden" name="itemId" value={id}/><input type="hidden" name="comment" value="Soumis pour validation"/><button className="primary">Demander la validation</button></form>}
           {detail.item.status === "in_review" && isAdmin && <form action={reviewDecisionAction} className="decision-form">
             <input type="hidden" name="itemId" value={id}/>
+            <input type="hidden" name="versionId" value={current?.id ?? ""}/>
             <div className="field"><label htmlFor="reviewComment">Commentaire uniquement si vous demandez une correction</label><input id="reviewComment" name="comment" placeholder="Ex. Préciser l’étape de connexion"/></div>
-            <div className="decision-buttons"><button className="primary" name="decision" value="publish">Valider et publier</button><button className="ghost-danger" name="decision" value="reject">Demander une correction</button></div>
+            <div className="decision-buttons">{canPublish ? <button className="primary" name="decision" value="publish">Valider et publier</button> : <span>Publication réservée à Ugo</span>}<button className="ghost-danger" name="decision" value="reject">Demander une correction</button></div>
           </form>}
           {detail.item.status === "in_review" && !isAdmin && <p className="muted">Cette version attend la validation de l’administrateur ou de l’owner.</p>}
           {detail.item.status === "published" && isAdmin && <details className="quiet-actions"><summary>Autres actions</summary><form action={archiveAction} className="admin-action"><input type="hidden" name="itemId" value={id}/><input type="hidden" name="reason" value="Archivage manuel"/><button>Archiver</button></form></details>}

@@ -21,14 +21,15 @@ describe("SAV mandatory analysis stages", () => {
   it("rejects invented sources even when another source is real", () => {
     expect(() => assertSavAnalysisComplete({ ...output, evidenceIds: ["card-1", "invented"] }, traces, evidence, freshKnowledge)).toThrow("SAV_UNKNOWN_EVIDENCE");
   });
-  it("rejects an action plan that both ignores and answers the customer", () => {
-    expect(() => assertSavAnalysisComplete({ ...output, ticketRequired: false }, traces, evidence, freshKnowledge)).toThrow("SAV_INCONSISTENT_REPLY_WITHOUT_TICKET");
+  it("allows a grounded Studio draft without demanding a new ticket", () => {
+    expect(() => assertSavAnalysisComplete({ ...output, ticketRequired: false }, traces, evidence, freshKnowledge)).not.toThrow();
   });
   it("rejects unsupported, weak or stale quotations", () => {
     expect(() => assertSavAnalysisComplete({ ...output, citations: [] }, traces, evidence, freshKnowledge)).toThrow("SAV_UNGROUNDED_REPLY");
     expect(() => assertSavAnalysisComplete({ ...output, citations: [{ ...output.citations[0], quote: "Texte absent de la fiche" }] }, traces, evidence, freshKnowledge)).toThrow("SAV_CITATION_QUOTE_MISMATCH");
     expect(() => assertSavAnalysisComplete(output, traces, evidence, new Map([["card-1", { ...freshKnowledge.get("card-1")!, score: 0.2 }]]))).toThrow("SAV_CITATION_RELEVANCE_TOO_LOW");
     expect(() => assertSavAnalysisComplete(output, traces, evidence, new Map([["card-1", { ...freshKnowledge.get("card-1")!, verifiedAt: "2020-01-01" }]]))).toThrow("SAV_CITATION_STALE");
+    expect(() => assertSavAnalysisComplete(output, traces, evidence, new Map([["card-1", { ...freshKnowledge.get("card-1")!, resolution: { steps: ["A"], validUntil: "2020-01-01" } }]]))).toThrow("SAV_CITATION_EXPIRED");
   });
   it("allows a claim-free acknowledgement without manufacturing a citation", () => {
     expect(() => assertSavAnalysisComplete({ ...output, responseKind: "acknowledgement", replyDraft: "Votre demande est bien reçue.", evidenceIds: [], citations: [] }, traces, [])).not.toThrow();

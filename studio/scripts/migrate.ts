@@ -10,7 +10,7 @@ const url=process.env.DATABASE_URL;
 if(!url) throw new Error("DATABASE_URL is required");
 if(url.startsWith("pglite:")){
   if(process.env.NODE_ENV==="production") throw new Error("PGlite is test-only");
-  const client=new PGlite(url.replace(/^pglite:/,"file:"),{extensions:{vector}});
+  const client=new PGlite(url.replace(/^pglite:/,""),{extensions:{vector}});
   await pgliteMigrate(pgliteDrizzle(client),{migrationsFolder:"drizzle"}); await client.close();
 }else{
   const client=postgres(url,{max:1,prepare:false}); await postgresMigrate(postgresDrizzle(client),{migrationsFolder:"drizzle"}); await client.end();

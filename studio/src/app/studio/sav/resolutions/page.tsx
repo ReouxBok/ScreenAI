@@ -1,6 +1,6 @@
 import Link from "next/link";
 import { ArrowLeft, BookOpenCheck, DatabaseZap } from "lucide-react";
-import { requireStaff } from "@/lib/auth";
+import { requireSavStaff as requireStaff } from "@/lib/sav/auth";
 import { getHubspotBackfillState, HUBSPOT_EMAIL_READ_SCOPE, isHubspotEmailReadScopeError } from "@/lib/sav/hubspot";
 import { listLearningCandidates } from "@/lib/sav/learning";
 import { continueBackfillAction, reviewLearningAction } from "../actions";
@@ -8,7 +8,7 @@ import { continueBackfillAction, reviewLearningAction } from "../actions";
 export const dynamic = "force-dynamic";
 
 export default async function SavResolutionsPage({ searchParams }: { searchParams: Promise<{ backfill?: string }> }) {
-  await requireStaff("admin");
+  const staff = await requireStaff("admin");
   const [candidates, backfill, query] = await Promise.all([
     listLearningCandidates(),
     getHubspotBackfillState(),
@@ -64,7 +64,7 @@ export default async function SavResolutionsPage({ searchParams }: { searchParam
           <small>Ticket HubSpot #{candidate.hubspotTicketId} · détecté le {new Intl.DateTimeFormat("fr-FR", { dateStyle: "medium" }).format(candidate.createdAt)}</small>
           {candidate.contentItemId && <Link className="table-link" href={`/studio/contenus/${candidate.contentItemId}`}>Ouvrir la fiche →</Link>}
         </div>
-        {candidate.status === "pending" && <form action={reviewLearningAction} className="learning-actions">
+        {candidate.status === "pending" && staff.email === "ugo@limova.ai" && <form action={reviewLearningAction} className="learning-actions">
           <input type="hidden" name="candidateId" value={candidate.id}/>
           <button className="primary" name="decision" value="approve" type="submit">Créer le brouillon</button>
           <button className="ghost-danger" name="decision" value="reject" type="submit">Écarter</button>
