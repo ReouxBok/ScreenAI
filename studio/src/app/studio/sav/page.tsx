@@ -5,6 +5,7 @@ import { requireStaff } from "@/lib/auth";
 import { savAutomationMode, savAutoReplyDailyLimit, savAutoReplyRolloutPercent, savGeminiApiKey, savHarnessMode } from "@/lib/sav/config";
 import { getHubspotBackfillState, HUBSPOT_EMAIL_READ_SCOPE, isHubspotEmailReadScopeError } from "@/lib/sav/hubspot";
 import { getSavDashboard, getSavImprovementSignals, listSavActionIncidents, listSavAgentPerformance, listSavInbox, listSavPilotBatches, listSavWebhookIncidents } from "@/lib/sav/service";
+import { archiveAndOpenSavMailAction } from "./actions";
 import { getSavAutonomyGate } from "@/lib/sav/promotion";
 import { retryAction, retryWebhookAction } from "./actions";
 
@@ -147,12 +148,16 @@ export default async function SavDashboardPage({ searchParams }: { searchParams:
 
     <section className="decision-ledger" aria-label={selectedPilotBatch ? `Mails du batch ${selectedPilotBatchNumber}` : "Tous les mails reçus"}>
       <header><span>{rows.length} mail{rows.length > 1 ? "s" : ""}</span><span>Décision et justification</span><span>Action</span></header>
-      {rows.map((row) => <Link className="decision-ledger-row" href={`/studio/sav/${row.threadId}`} key={row.messageId}>
+      {rows.map((row) => <form action={archiveAndOpenSavMailAction} className="decision-ledger-row-form" key={row.messageId}>
+        <input type="hidden" name="threadId" value={row.threadId}/>
+        {selectedPilotBatch && <><input type="hidden" name="returnTo" value="pilot"/><input type="hidden" name="pilotBatchId" value={selectedPilotBatch.id}/></>}
+        <button className="decision-ledger-row" type="submit" aria-label={`Ouvrir et classer ${row.subject} dans Gmail`}>
         <span className="ledger-rail" aria-hidden="true"><i className={row.decisionKind === "human_review_required" ? "human" : row.decisionId ? "decided" : "missing"}/></span>
         <span className="ledger-mail"><small>{new Intl.DateTimeFormat("fr-FR", { dateStyle: "short", timeStyle: "short" }).format(row.receivedAt)}</small><strong>{row.subject}</strong><span>{row.fromEmail}</span><p>{row.preview || "Aucun aperçu disponible"}</p></span>
         <span className="ledger-decision"><em className={`sav-decision ${row.decisionKind ?? "missing"}`}>{row.decisionKind ? decisionLabels[row.decisionKind] : "Non justifié"}</em><strong>{row.explanation ?? "Ce mail attend encore une décision traçable."}</strong>{row.confidence !== null && <small>Confiance {Math.round(row.confidence / 10)} % · {row.actorType === "human" ? "corrigé par un humain" : "décidé par Charly"}</small>}</span>
         <span className="ledger-action">{row.pilotItemStatus === "pending" || row.pilotItemStatus === "processing" ? <><FlaskConical size={16}/><strong>Analyse batch</strong></> : row.pilotVerdict ? <><CheckCircle2 size={16}/><strong>{row.pilotVerdict}</strong></> : row.pilotItemStatus === "ready" ? <><Bot size={16}/><strong>Simulation prête</strong></> : row.hubspotTicketId ? <><TicketCheck size={16}/><strong>#{row.hubspotTicketId}</strong></> : row.aiPaused ? <><Clock3 size={16}/><strong>Équipe SAV</strong></> : <><Bot size={16}/><strong>En attente</strong></>}<ArrowUpRight size={15}/></span>
-      </Link>)}
+        </button>
+      </form>)}
       {!rows.length && <div className="empty sav-empty"><Inbox size={24}/><strong>Aucun mail dans cette vue</strong><span>Les notifications Gmail apparaîtront ici avec leur justification.</span></div>}
     </section>
 

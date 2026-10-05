@@ -5,6 +5,7 @@ import { redirect } from "next/navigation";
 import { start } from "workflow/api";
 import { requireApiStaff } from "@/lib/auth";
 import { continueHubspotBackfill } from "@/lib/sav/hubspot";
+import { archiveSavThreadInGmail } from "@/lib/sav/gmail";
 import { approveLearningCandidate, rejectLearningCandidate } from "@/lib/sav/learning";
 import {
   approveSavDraft,
@@ -23,6 +24,27 @@ function id(form: FormData, name: string) {
   const value = String(form.get(name) || "").trim();
   if (!value) throw new Error(`${name.toUpperCase()}_REQUIRED`);
   return value;
+}
+
+export async function archiveAndOpenSavMailAction(form: FormData) {
+  const staff = await requireApiStaff("admin");
+  const threadId = id(form, "threadId");
+  let gmailArchive = "archived";
+  try {
+    await archiveSavThreadInGmail(threadId, staff.email);
+  } catch (error) {
+    const code = error instanceof Error ? error.message : "UNKNOWN_ERROR";
+    gmailArchive = code === "GMAIL_HTTP_401" || code === "GMAIL_HTTP_403"
+      ? "permission_required"
+      : code === "SAV_WRITES_DISABLED" ? "writes_disabled" : "failed";
+    console.error("sav_gmail_manual_archive_failed", { threadId, actorEmail: staff.email, errorCode: code.slice(0, 160) });
+  }
+  const query = new URLSearchParams({ gmailArchive });
+  const from = String(form.get("returnTo") || "");
+  const batch = String(form.get("pilotBatchId") || "");
+  if (from === "pilot") query.set("from", "pilot");
+  if (batch) query.set("batch", batch);
+  redirect(`/studio/sav/${threadId}?${query}`);
 }
 
 async function enqueuePilotBatch(batchId: string, actorEmail: string) {

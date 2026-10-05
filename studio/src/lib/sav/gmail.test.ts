@@ -1,11 +1,47 @@
-import { describe, expect, it } from "vitest";
-import { decodeGmailPubSubEnvelope, matchesGmailIntakeRecipient, normalizeRecipientHeader, normalizeReferencesHeader, parseGmailMessage } from "./gmail";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { archiveGmailMessage, decodeGmailPubSubEnvelope, matchesGmailIntakeRecipient, normalizeRecipientHeader, normalizeReferencesHeader, parseGmailMessage } from "./gmail";
+
+afterEach(() => {
+  vi.unstubAllGlobals();
+  delete (globalThis as typeof globalThis & { __savGmailToken?: unknown }).__savGmailToken;
+  delete process.env.GMAIL_CLIENT_ID;
+  delete process.env.GMAIL_CLIENT_SECRET;
+  delete process.env.GMAIL_REFRESH_TOKEN;
+});
 
 function base64url(value: string) {
   return Buffer.from(value, "utf8").toString("base64url");
 }
 
 describe("Gmail SAV ingestion", () => {
+  it("classe manuellement un mail dans le libellé Studio et le retire de INBOX", async () => {
+    process.env.GMAIL_CLIENT_ID = "client-id";
+    process.env.GMAIL_CLIENT_SECRET = "client-secret";
+    process.env.GMAIL_REFRESH_TOKEN = "refresh-token";
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(new Response(JSON.stringify({ access_token: "access-token", expires_in: 3600 }), { status: 200 }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ labels: [] }), { status: 200 }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ id: "Label_42", name: "MAIL STUDIO SAV" }), { status: 200 }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ id: "gmail-message-1", threadId: "gmail-thread-1" }), { status: 200 }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(archiveGmailMessage("contact@limova.ai", "gmail-message-1")).resolves.toEqual({
+      messageId: "gmail-message-1",
+      labelId: "Label_42",
+      labelName: "MAIL STUDIO SAV",
+    });
+    expect(fetchMock).toHaveBeenNthCalledWith(3,
+      "https://gmail.googleapis.com/gmail/v1/users/contact%40limova.ai/labels",
+      expect.objectContaining({ method: "POST" }),
+    );
+    expect(fetchMock).toHaveBeenNthCalledWith(4,
+      "https://gmail.googleapis.com/gmail/v1/users/contact%40limova.ai/messages/gmail-message-1/modify",
+      expect.objectContaining({
+        method: "POST",
+        body: JSON.stringify({ addLabelIds: ["Label_42"], removeLabelIds: ["INBOX"] }),
+      }),
+    );
+  });
   it("decodes Pub/Sub envelopes", () => {
     const payload = { emailAddress: "sav@limova.ai", historyId: "12345" };
     expect(decodeGmailPubSubEnvelope({ message: { messageId: "pubsub-1", data: Buffer.from(JSON.stringify(payload)).toString("base64") } })).toMatchObject({

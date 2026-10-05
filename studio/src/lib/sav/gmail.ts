@@ -4,7 +4,7 @@ import { timingSafeEqual } from "node:crypto";
 import { and, asc, desc, eq, inArray, isNull, lt, lte, or, sql } from "drizzle-orm";
 import { z } from "zod";
 import { requireDb } from "@/db";
-import { savActions, savFollowups, savGmailQuarantine, savMailboxes, savMessages, savThreads, savWebhookReceipts } from "@/db/schema";
+import { auditLogs, savActions, savFollowups, savGmailQuarantine, savMailboxes, savMessages, savThreads, savWebhookReceipts } from "@/db/schema";
 import { assertSavWriteAllowed } from "./write-guard";
 import { savModeAllowsWrite } from "./action-policy";
 import { savAutomationMode } from "./config";
@@ -179,6 +179,58 @@ async function gmailFetch<T>(mailboxEmail: string, path: string, init?: RequestI
     throw error;
   }
   return response.json() as Promise<T>;
+}
+
+type GmailLabel = { id: string; name: string };
+
+async function findGmailLabel(mailboxEmail: string, labelName: string) {
+  const response = await gmailFetch<{ labels?: GmailLabel[] }>(mailboxEmail, "labels");
+  return response.labels?.find((label) => label.name.localeCompare(labelName, undefined, { sensitivity: "accent" }) === 0) ?? null;
+}
+
+export async function archiveGmailMessage(mailboxEmail: string, messageId: string, labelName = "MAIL STUDIO SAV") {
+  const cleanLabelName = labelName.trim().slice(0, 225);
+  if (!cleanLabelName) throw new Error("GMAIL_ARCHIVE_LABEL_REQUIRED");
+  let label = await findGmailLabel(mailboxEmail, cleanLabelName);
+  if (!label) {
+    try {
+      label = await gmailFetch<GmailLabel>(mailboxEmail, "labels", {
+        method: "POST",
+        body: JSON.stringify({ name: cleanLabelName, labelListVisibility: "labelShow", messageListVisibility: "show" }),
+      });
+    } catch (error) {
+      if ((error as Error & { status?: number }).status !== 409) throw error;
+      label = await findGmailLabel(mailboxEmail, cleanLabelName);
+    }
+  }
+  if (!label?.id) throw new Error("GMAIL_ARCHIVE_LABEL_UNAVAILABLE");
+  const message = await gmailFetch<GmailMessage>(mailboxEmail, `messages/${encodeURIComponent(messageId)}/modify`, {
+    method: "POST",
+    body: JSON.stringify({ addLabelIds: [label.id], removeLabelIds: ["INBOX"] }),
+  });
+  return { messageId: message.id, labelId: label.id, labelName: cleanLabelName };
+}
+
+export async function archiveSavThreadInGmail(threadId: string, actorEmail: string) {
+  if (process.env.SAV_WRITES_DISABLED === "true") throw new Error("SAV_WRITES_DISABLED");
+  const db = requireDb();
+  const [context] = await db.select({ mailboxEmail: savMailboxes.email, gmailMessageId: savMessages.gmailMessageId })
+    .from(savThreads)
+    .innerJoin(savMailboxes, eq(savMailboxes.id, savThreads.mailboxId))
+    .innerJoin(savMessages, eq(savMessages.threadId, savThreads.id))
+    .where(and(eq(savThreads.id, threadId), eq(savMessages.direction, "inbound")))
+    .orderBy(desc(savMessages.receivedAt), desc(savMessages.createdAt), desc(savMessages.id))
+    .limit(1);
+  if (!context?.gmailMessageId) throw new Error("SAV_GMAIL_MESSAGE_NOT_FOUND");
+  const result = await archiveGmailMessage(context.mailboxEmail, context.gmailMessageId, process.env.GMAIL_STUDIO_SAV_LABEL || "MAIL STUDIO SAV");
+  await db.insert(auditLogs).values({
+    actorEmail,
+    action: "sav_gmail_message_archived_manually",
+    entityType: "sav_thread",
+    entityId: threadId,
+    technicalMetadata: { gmailMessageId: result.messageId, labelId: result.labelId, labelName: result.labelName },
+  });
+  return result;
 }
 
 export async function renewGmailWatch(mailboxEmail = requiredEnv("GMAIL_SUPPORT_ADDRESS")) {

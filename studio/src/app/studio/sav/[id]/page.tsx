@@ -7,10 +7,10 @@ import { approveDraftAction, correctDecisionAction, createTicketAction, requestH
 
 export const dynamic = "force-dynamic";
 
-export default async function SavThreadPage({ params, searchParams }: { params: Promise<{ id: string }>; searchParams: Promise<{ from?: string; batch?: string }> }) {
+export default async function SavThreadPage({ params, searchParams }: { params: Promise<{ id: string }>; searchParams: Promise<{ from?: string; batch?: string; gmailArchive?: string }> }) {
   await requireStaff("admin");
   const { id } = await params;
-  const { from = "", batch = "" } = await searchParams;
+  const { from = "", batch = "", gmailArchive = "" } = await searchParams;
   const detail = await getSavThreadDetail(id);
   if (!detail) notFound();
   const currentDecision = [...detail.decisions].reverse().find((decision) => decision.isCurrent);
@@ -23,6 +23,11 @@ export default async function SavThreadPage({ params, searchParams }: { params: 
   return <>
     <Link className="back-link" href={from === "pilot" ? `/studio/sav/pilote?batch=${encodeURIComponent(batch || detail.pilotItem?.batchId || "")}#batch-review` : "/studio/sav"}><ArrowLeft size={14}/> {from === "pilot" ? "Retour au lot de test" : "Retour à tous les mails"}</Link>
     <div className="sav-thread-heading"><div><span className="eyebrow">Dossier SAV</span><h1>{detail.thread.subject}</h1><p>{detail.thread.customerEmail} · {detail.thread.hubspotTicketId ? `Ticket HubSpot #${detail.thread.hubspotTicketId}` : "Aucun ticket associé"}</p></div><span className={`sav-thread-status ${detail.thread.status}`}>{detail.thread.aiPaused ? <UserRound size={15}/> : <Bot size={15}/>} {detail.thread.status.replaceAll("_", " ")}</span></div>
+
+    {gmailArchive === "archived" && <p className="login-notice" role="status">Mail classé dans « MAIL STUDIO SAV » et retiré de la boîte de réception Gmail.</p>}
+    {gmailArchive === "permission_required" && <p className="login-error" role="alert">Gmail a refusé le classement. Réautorisez la connexion de contact@limova.ai avec le droit gmail.modify.</p>}
+    {gmailArchive === "writes_disabled" && <p className="login-error" role="alert">Le classement Gmail est suspendu par le coupe-circuit SAV.</p>}
+    {gmailArchive === "failed" && <p className="login-error" role="alert">Le mail est ouvert, mais son classement dans Gmail a échoué. L’incident a été journalisé côté serveur.</p>}
 
     {currentDecision?.evidence.some((source) => source.claim || source.excerpt) && <section className="card sav-note"><span className="eyebrow">Preuves de la réponse</span><h2>Affirmations reliées aux fiches validées</h2><ul>{currentDecision.evidence.map((source) => <li key={`${source.sourceType}:${source.sourceId}`}><strong>{source.title}</strong>{source.claim && <p>{source.claim}</p>}{source.excerpt && <blockquote>{source.excerpt}</blockquote>}{source.verifiedAt && <small>Fiche vérifiée le {source.verifiedAt}</small>}</li>)}</ul></section>}
 
