@@ -2,12 +2,13 @@ import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vites
 import { eq } from "drizzle-orm";
 import { createSavTestDb } from "../../../test/sav-db";
 import { categories, contentItems, contentVersions, knowledgeFamilies, knowledgeFamilyRevisions, knowledgeFamilySources, knowledgeProjectionCandidates } from "@/db/schema";
-import { importHubspotKnowledge, hubspotComparison, knowledgeComparisonInventory } from "./hubspot-import";
+import { importHubspotKnowledge, hubspotComparison, knowledgeComparisonInventory, prepareHubspotReview } from "./hubspot-import";
 import { reviewKnowledgeCandidate } from "./review";
 import { compareKnowledge, parseHubspotKnowledgeImport } from "./hubspot-input";
 import { savProjectionBody } from "./conversion";
 import { publish, setContentAiEnabled } from "@/lib/workflow";
 import { searchKnowledge } from "@/lib/search";
+import { savContentHash } from "@/lib/sav/crypto";
 
 const state = vi.hoisted(() => ({ db: null as unknown }));
 vi.mock("@/db", () => ({ requireDb: () => state.db }));
@@ -35,11 +36,78 @@ async function imported() {
   const [candidate] = await fixture.db.select().from(knowledgeProjectionCandidates).where(eq(knowledgeProjectionCandidates.id, result.candidateIds[0]));
   return candidate;
 }
-async function approval(candidate: Awaited<ReturnType<typeof imported>>) {
-  const comparison = hubspotComparison(candidate, await knowledgeComparisonInventory());
+async function approval(candidate: Awaited<ReturnType<typeof imported>>, document?: unknown) {
+  const comparison = await prepareHubspotReview(candidate, document);
   return { expectedRevisionId: candidate.revisionId, decision: "approve" as const, reason: "Sources et différences examinées dans le test isolé.", comparison: { snapshot: comparison.snapshot, acknowledged: true } };
 }
 describe("private HubSpot knowledge import", () => {
+  it("reuses a legacy document-only revision for an identical import", async () => {
+    const candidate = await imported();
+    const document = parseHubspotKnowledgeImport(JSON.stringify(bundle())).entries[0].document;
+    await fixture.db.update(knowledgeFamilyRevisions).set({ canonicalHash: savContentHash(document) }).where(eq(knowledgeFamilyRevisions.id, candidate.revisionId));
+    expect((await importHubspotKnowledge(JSON.stringify(bundle()), "ugo@limova.ai")).candidateIds).toEqual([candidate.id]);
+    expect(await fixture.db.select().from(knowledgeFamilyRevisions)).toHaveLength(1);
+  });
+  it("reviews two previously pending revisions against one current target", async () => {
+    const first = await imported();
+    const changed = bundle(); changed.entries[0].document.supportContext.responseTemplate = "Nouvelle réponse fictive.";
+    const result = await importHubspotKnowledge(JSON.stringify(changed), "ugo@limova.ai");
+    const [second] = await fixture.db.select().from(knowledgeProjectionCandidates).where(eq(knowledgeProjectionCandidates.id, result.candidateIds[0]));
+    const staleApproval = await approval(second);
+    const approvedFirst = await reviewKnowledgeCandidate(first.id, await approval(first), "ugo@limova.ai");
+    await expect(reviewKnowledgeCandidate(second.id, staleApproval, "ugo@limova.ai")).rejects.toThrow("HUBSPOT_COMPARISON_STALE");
+    const approvedSecond = await reviewKnowledgeCandidate(second.id, await approval(second), "ugo@limova.ai");
+    expect(approvedSecond.targetItemId).toBe(approvedFirst.targetItemId);
+    expect(approvedSecond.baseVersionId).toBe(approvedFirst.materializedVersionId);
+    expect(approvedSecond.diff.before).toBe(approvedFirst.diff.after);
+    expect(await fixture.db.select().from(contentItems)).toHaveLength(1);
+    expect(await fixture.db.select().from(contentVersions)).toHaveLength(2);
+  });
+  it.each(["pending", "approved", "rejected"])("versions new evidence without rewriting a %s decision", async (status) => {
+    const first = await imported();
+    if (status === "approved") await reviewKnowledgeCandidate(first.id, await approval(first), "ugo@limova.ai");
+    if (status === "rejected") await reviewKnowledgeCandidate(first.id, { expectedRevisionId: first.revisionId, decision: "reject", reason: "Source fictive à réexaminer." }, "ugo@limova.ai");
+    const [before] = await fixture.db.select().from(knowledgeProjectionCandidates).where(eq(knowledgeProjectionCandidates.id, first.id));
+    const changed = bundle(); changed.entries[0].provenance.validationNotes = ["Preuve fictive corrigée : mode démonstration uniquement."];
+    const result = await importHubspotKnowledge(JSON.stringify(changed), "ugo@limova.ai");
+    expect(result.candidateIds).not.toEqual([first.id]);
+    const [candidate] = await fixture.db.select().from(knowledgeProjectionCandidates).where(eq(knowledgeProjectionCandidates.id, result.candidateIds[0]));
+    const [source] = await fixture.db.select().from(knowledgeFamilySources).where(eq(knowledgeFamilySources.id, candidate.sourceId));
+    expect(candidate.status).toBe("pending");
+    expect(source.evidence.validationNotes).toEqual(changed.entries[0].provenance.validationNotes);
+    expect((await fixture.db.select().from(knowledgeProjectionCandidates).where(eq(knowledgeProjectionCandidates.id, first.id)))[0]).toEqual(before);
+    expect((await importHubspotKnowledge(JSON.stringify(changed), "ugo@limova.ai")).candidateIds).toEqual(result.candidateIds);
+    const oldInput = await approval(first);
+    await expect(reviewKnowledgeCandidate(candidate.id, { ...oldInput, expectedRevisionId: candidate.revisionId }, "ugo@limova.ai")).rejects.toThrow("HUBSPOT_COMPARISON_STALE");
+  });
+  it("requires a fresh comparison for corrected content and records its new findings", async () => {
+    const [item] = await fixture.db.insert(contentItems).values({ slug: "security-fixture", title: "Authentifier connexion sécurisée compte", type: "article", ownerEmail: "ugo@limova.ai", agentKey: "sav" }).returning();
+    const [version] = await fixture.db.insert(contentVersions).values({ itemId: item.id, version: 1, bodyMarkdown: "Authentifier connexion sécurisée compte. Identité obligatoire.", metadata: { intents: [], limovaPaths: [], prerequisites: [], expectedResult: "", troubleshooting: "" }, changeNote: "Fixture", authorEmail: "ugo@limova.ai" }).returning();
+    await fixture.db.update(contentItems).set({ currentDraftVersionId: version.id }).where(eq(contentItems.id, item.id));
+    const candidate = await imported();
+    const oldApproval = await approval(candidate);
+    expect((await prepareHubspotReview(candidate)).findings).toHaveLength(0);
+    const [revision] = await fixture.db.select().from(knowledgeFamilyRevisions).where(eq(knowledgeFamilyRevisions.id, candidate.revisionId));
+    const document = { ...revision.document, objective: item.title, steps: [{ ...revision.document.steps[0], objective: item.title, instruction: "Authentifier connexion sécurisée compte sans identité." }] };
+    await expect(reviewKnowledgeCandidate(candidate.id, { ...oldApproval, document }, "ugo@limova.ai")).rejects.toThrow("HUBSPOT_COMPARISON_STALE");
+    expect((await prepareHubspotReview(candidate, document)).findings.map((finding) => finding.versionId)).toContain(version.id);
+    const approved = await reviewKnowledgeCandidate(candidate.id, { ...await approval(candidate, document), document }, "ugo@limova.ai");
+    const [saved] = await fixture.db.select().from(contentVersions).where(eq(contentVersions.id, approved.materializedVersionId!));
+    expect(saved.metadata.sourceMetadata).toHaveProperty("comparisonReview.relatedVersions", expect.arrayContaining([expect.objectContaining({ versionId: version.id })]));
+  });
+  it("invalidates comparison after an editor changes the current target draft", async () => {
+    const first = await imported();
+    const approved = await reviewKnowledgeCandidate(first.id, await approval(first), "ugo@limova.ai");
+    const changed = bundle(); changed.entries[0].provenance.validationNotes = ["Nouvelle preuve fictive."];
+    const result = await importHubspotKnowledge(JSON.stringify(changed), "ugo@limova.ai");
+    const [candidate] = await fixture.db.select().from(knowledgeProjectionCandidates).where(eq(knowledgeProjectionCandidates.id, result.candidateIds[0]));
+    const input = await approval(candidate);
+    const [newDraft] = await fixture.db.insert(contentVersions).values({ itemId: approved.targetItemId!, version: 2, bodyMarkdown: "Correction humaine fictive à préserver.", metadata: { intents: [], limovaPaths: [], prerequisites: [], expectedResult: "", troubleshooting: "" }, changeNote: "Fixture", authorEmail: "ugo@limova.ai" }).returning();
+    await fixture.db.update(contentItems).set({ currentDraftVersionId: newDraft.id }).where(eq(contentItems.id, approved.targetItemId!));
+    await expect(reviewKnowledgeCandidate(candidate.id, input, "ugo@limova.ai")).rejects.toThrow("HUBSPOT_COMPARISON_STALE");
+    expect((await prepareHubspotReview(candidate)).before).toBe(newDraft.bodyMarkdown);
+    expect((await fixture.db.select().from(contentItems))[0].currentDraftVersionId).toBe(newDraft.id);
+  });
   it("stages provenance and complete knowledge once, without content, publication or activation", async () => {
     const text = JSON.stringify(bundle());
     const first = await importHubspotKnowledge(text, "ugo@limova.ai");
@@ -101,7 +169,7 @@ describe("private HubSpot knowledge import", () => {
     const candidate = await imported();
     const [revision] = await fixture.db.select().from(knowledgeFamilyRevisions).where(eq(knowledgeFamilyRevisions.id, candidate.revisionId));
     const document = { ...revision.document, supportContext: { ...revision.document.supportContext!, responseTemplate: "Réponse fictive corrigée par Ugo." } };
-    const approved = await reviewKnowledgeCandidate(candidate.id, { ...await approval(candidate), document }, "ugo@limova.ai");
+    const approved = await reviewKnowledgeCandidate(candidate.id, { ...await approval(candidate, document), document }, "ugo@limova.ai");
     const [item] = await fixture.db.select().from(contentItems);
     const [version] = await fixture.db.select().from(contentVersions);
     expect(item).toMatchObject({ status: "in_review", agentKey: "sav", aiEnabled: false, publishedVersionId: null });

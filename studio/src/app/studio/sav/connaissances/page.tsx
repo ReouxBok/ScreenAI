@@ -4,6 +4,7 @@ import { listKnowledgeProjectionCandidates } from "@/lib/knowledge/candidates";
 import { importOnboardingKnowledgeAction, importHubspotKnowledgeAction, reviewKnowledgeAction } from "../actions";
 
 import { hubspotComparison, knowledgeComparisonInventory } from "@/lib/knowledge/hubspot-import";
+import { HubspotReviewForm } from "./hubspot-review-form";
 
 export const dynamic = "force-dynamic";
 
@@ -13,7 +14,7 @@ export default async function SavKnowledgeCandidatesPage({ searchParams }: { sea
   const staff = await requireSavStaff();
   const { result } = await searchParams;
   const rows = await listKnowledgeProjectionCandidates();
-  const inventory = rows.some(({ source, candidate }) => source.evidence.importKind === "hubspot" && candidate.status === "pending") ? await knowledgeComparisonInventory() : [];
+  const inventory = staff.email !== "ugo@limova.ai" && rows.some(({ source, candidate }) => source.evidence.importKind === "hubspot" && candidate.status === "pending") ? await knowledgeComparisonInventory() : [];
   return <>
     <Link className="back-link" href="/studio/sav">← Retour au SAV</Link>
     <div className="page-intro compact"><div>
@@ -31,7 +32,7 @@ export default async function SavKnowledgeCandidatesPage({ searchParams }: { sea
     <section className="learning-list">
       {rows.map(({ candidate, family, revision, source }) => {
         const imported = source.evidence.importKind === "hubspot";
-        const comparison = imported && candidate.status === "pending" ? hubspotComparison(candidate, inventory) : null;
+        const comparison = imported && candidate.status === "pending" && staff.email !== "ugo@limova.ai" ? hubspotComparison(candidate, inventory) : null;
         return <article className="card" style={{ padding: 24, minWidth: 0, overflowWrap: "anywhere" }} key={candidate.id}>
         <div>
           <span className="sav-learning-status pending">{statusLabels[candidate.status] ?? candidate.status}</span>
@@ -65,9 +66,9 @@ export default async function SavKnowledgeCandidatesPage({ searchParams }: { sea
           </details>
           {candidate.targetItemId && <Link className="table-link" href={`/studio/contenus/${candidate.targetItemId}`}>Ouvrir la projection existante →</Link>}
           {candidate.reviewedAt && <p>Revu par {candidate.reviewedBy} le {candidate.reviewedAt.toLocaleString("fr-FR")} · Version préparée : {candidate.materializedVersionId ?? "aucune"}</p>}
-          {staff.email === "ugo@limova.ai" && ["pending", "needs_recording", "not_applicable"].includes(candidate.status) && <form action={reviewKnowledgeAction}>
+          {staff.email === "ugo@limova.ai" && imported && candidate.status === "pending" && <HubspotReviewForm candidateId={candidate.id} revisionId={revision.id} initialDocument={JSON.stringify(revision.document, null, 2)}/>}
+          {staff.email === "ugo@limova.ai" && !(imported && candidate.status === "pending") && ["pending", "needs_recording", "not_applicable"].includes(candidate.status) && <form action={reviewKnowledgeAction}>
             <input type="hidden" name="candidateId" value={candidate.id}/><input type="hidden" name="revisionId" value={revision.id}/>
-            {comparison && <><input type="hidden" name="comparisonSnapshot" value={comparison.snapshot}/><label><input type="checkbox" name="comparisonAcknowledged"/>J’ai vérifié les sources, les autres fiches et les éventuels désaccords. Mon motif explique la décision.</label></>}
             {candidate.status === "pending" && candidate.targetSurface === "sav" && <details><summary>Corriger la connaissance avant validation (JSON métier, sans DOM)</summary><label>Connaissance complète<textarea name="document" rows={16} defaultValue={JSON.stringify(revision.document, null, 2)} style={{ width: "100%" }}/></label></details>}
             <label>Motif de la décision<input name="reason" required minLength={10}/></label>
             {candidate.status === "pending" && candidate.targetSurface === "sav" && <button className="primary" name="decision" value="approve">Valider et préparer le brouillon SAV</button>}

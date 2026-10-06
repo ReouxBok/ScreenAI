@@ -32,7 +32,9 @@ Le fichier JSON suit `hubspotImportSchema` :
 Le même namespace et identifiant rattachent les révisions à une famille stable.
 Le réimport est idempotent : un candidat déjà préparé, approuvé ou rejeté n’est
 pas recréé. Une modification de procédure, diagnostic ou réponse type crée une
-révision. Toutes les fiches sont validées avant la première écriture. Les
+révision. Un changement de sources ou de notes de validation crée également
+une nouvelle révision à examiner, sans réécrire une décision antérieure.
+Toutes les fiches sont validées avant la première écriture. Les
 écritures se font ensuite par fiche : un incident DB peut laisser un lot partiel,
 que le renvoi du même fichier permet de reprendre. Aucun contenu publié n’est
 remplacé par rapprochement de titre.
@@ -53,8 +55,14 @@ vérité produit. Ugo vérifie les conditions, produits, versions et sources ; i
 écarte le doublon ou corrige le candidat avant de l’approuver.
 
 Pour un candidat HubSpot, l’approbation exige une confirmation de cette revue
-et un motif. Le serveur recalcule une empreinte des textes et versions comparés ;
-si la base a changé depuis l’affichage, recharger et refaire la comparaison.
+et un motif. Après correction du JSON métier, cliquer sur **Actualiser la
+comparaison**, puis confirmer la revue. Toute modification du texte annule
+la confirmation précédente. Le serveur recalcule une empreinte du document
+corrigé, de sa provenance, des versions comparées et du brouillon cible actuel ;
+si la base a changé depuis l’affichage, refaire la comparaison.
+Deux révisions importées avant leur validation rejoignent la même fiche SAV :
+la deuxième exige une revue de la version actuelle, puis ajoute un brouillon
+versionné, sans créer une seconde fiche ni effacer les versions précédentes.
 L’approbation conserve l’empreinte et les références dans le Studio et produit
 un brouillon `in_review`, non publié et désactivé pour l’IA à sa création.
 L’état d’une projection existante est préservé lorsqu’une nouvelle révision est
@@ -114,7 +122,7 @@ emploient exclusivement des procédures fictives et des embeddings simulés.
 - Le retour arrière du code est le revert du commit de cette livraison sur la
   branche, suivi d’une nouvelle revue ; aucun déploiement automatique autorisé.
 
-## Vérifications exécutées pour cette livraison
+## Vérifications initiales de la livraison HubSpot
 
 En local avec Node 22.22.1, sans configuration de production :
 
@@ -134,3 +142,35 @@ embeddings fictifs : aucune publication réelle, aucun test du modèle externe
 ni validation fonctionnelle du produit. Aucun build ou E2E navigateur n’a été
 exécuté pour ce lot. Les deux alertes de dépendances bloquant la CI existante
 restent hors périmètre, sans changement d’audit, dépendance ou workflow CI.
+
+## Correctifs issus de la revue du 6 octobre 2026
+
+Vérification finale Node 24 : **526 tests réussis, 1 test privé optionnel sauté,
+61 fichiers passants** ; typegen + TypeScript, ESLint global et audit historique
+hors ligne (9/9) passants. Scanner partiel de publication et diff-check passants.
+
+- Deux candidats de la même famille importés avant approbation rejoignent
+  désormais la projection actuelle sous verrou de famille. Une comparaison
+  périmée est refusée ; les versions précédentes restent conservées.
+- Une modification de provenance crée une révision/candidate distincte, même
+  si le document ne change pas. Les décisions et preuves anciennes ne sont
+  pas réécrites. Le réimport identique reste idempotent.
+- La comparaison utilise le document corrigé et son sujet, les preuves et le
+  brouillon cible actuel. Le formulaire demande une nouvelle comparaison après
+  chaque correction ; le serveur vérifie à nouveau l’empreinte à l’approbation.
+- Le lint du script historique a été corrigé sans modifier ses scénarios.
+- Tests ajoutés pour les imports en attente, les preuves modifiées avant/après
+  approbation ou rejet, les corrections de sujet, les éditions concurrentes
+  du brouillon et la compatibilité d’un import antérieur identique.
+
+La checklist React a été utilisée pour les actions authentifiées, les données
+sérialisées et la confirmation invalidée à chaque modification. Le test
+Playwright `tests/e2e/hubspot-review.spec.ts` couvre le parcours du formulaire,
+mais son exécution locale n’est **pas validée** : Chromium requis absent et
+lancement du Chromium local alternatif interdit par la sandbox macOS.
+Le serveur isolé a démarré avec `WATCHPACK_POLLING=true`. Aucun changement de
+configuration navigateur locale n’est livré. Rejouer la recette en CI.
+
+Aucun merge, déploiement, publication de connaissance, appel fournisseur réel
+ou migration n’a été exécuté pour ces correctifs. Les alertes de sécurité CI
+préexistantes (`proxy-addr`, `source-map-js`) restent hors de ce lot.

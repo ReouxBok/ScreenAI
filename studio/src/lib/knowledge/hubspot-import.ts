@@ -1,13 +1,14 @@
 import "server-only";
 import { and, eq, ne, or } from "drizzle-orm";
 import { requireDb } from "@/db";
-import { contentItems, contentVersions, knowledgeProjectionCandidates } from "@/db/schema";
+import { contentItems, contentVersions, knowledgeProjectionCandidates, knowledgeFamilyRevisions, knowledgeFamilySources, knowledgeProjections } from "@/db/schema";
 import { parseContentInput } from "@/lib/content";
 import { savContentHash } from "@/lib/sav/crypto";
 import { assertSavActor } from "@/lib/sav/access";
 import { registerCanonicalKnowledge } from "./families";
 import { storeCandidate } from "./candidates";
 import { savProjectionBody } from "./conversion";
+import { canonicalKnowledgeSchema } from "./contracts";
 import { compareKnowledge, parseHubspotKnowledgeImport, type KnowledgeComparisonEntry } from "./hubspot-input";
 
 type DbReader = Pick<ReturnType<typeof requireDb>, "select">;
@@ -31,6 +32,27 @@ export function hubspotComparison(candidate: { id: string; proposedInput: unknow
   return { snapshot: savContentHash({ candidateId: candidate.id, input, inventory: others }), findings, compared: others.length };
 }
 
+/** Preview and approval share the exact document, provenance and current target base. */
+export async function prepareHubspotReview(candidate: typeof knowledgeProjectionCandidates.$inferSelect, rawDocument?: unknown, db: DbReader = requireDb()) {
+  const [revision] = await db.select().from(knowledgeFamilyRevisions).where(eq(knowledgeFamilyRevisions.id, candidate.revisionId));
+  const [source] = await db.select().from(knowledgeFamilySources).where(eq(knowledgeFamilySources.id, candidate.sourceId));
+  if (!revision || !source || revision.familyId !== candidate.familyId || source.familyId !== candidate.familyId || source.revisionId !== candidate.revisionId || source.evidence.importKind !== "hubspot") throw new Error("KNOWLEDGE_PROVENANCE_REQUIRED");
+  const document = canonicalKnowledgeSchema.parse(rawDocument ?? revision.document);
+  const projections = await db.select({ item: contentItems }).from(knowledgeProjections).innerJoin(contentItems, eq(contentItems.id, knowledgeProjections.itemId)).where(and(eq(knowledgeProjections.familyId, candidate.familyId), eq(knowledgeProjections.surface, "sav")));
+  const targets = new Map(projections.map(({ item }) => [item.id, item]));
+  if (targets.size > 1) throw new Error("KNOWLEDGE_TARGET_PROJECTION_AMBIGUOUS");
+  const target = targets.values().next().value ?? null;
+  if (target && (target.status === "archived" || target.type !== "article" || target.agentKey !== "sav")) throw new Error("KNOWLEDGE_TARGET_STALE");
+  const baseVersionId = target?.currentDraftVersionId ?? target?.publishedVersionId ?? null;
+  const [base] = baseVersionId ? await db.select().from(contentVersions).where(eq(contentVersions.id, baseVersionId)) : [];
+  const original = parseContentInput(candidate.proposedInput);
+  const proposed = parseContentInput({ ...original, title: document.objective, summary: document.objective, bodyMarkdown: savProjectionBody(document) });
+  if (proposed.bodyMarkdown.length > 12_000) throw new Error("HUBSPOT_PROCEDURE_TOO_LONG");
+  const comparison = hubspotComparison({ id: candidate.id, proposedInput: proposed }, await knowledgeComparisonInventory(db));
+  return { ...comparison, snapshot: savContentHash({ comparison: comparison.snapshot, document, sourceId: source.id, sourceHash: source.sourceHash, evidence: source.evidence, targetItemId: target?.id ?? null, baseVersionId }),
+    targetItemId: target?.id ?? null, baseVersionId, before: base?.bodyMarkdown ?? "", after: proposed.bodyMarkdown };
+}
+
 /** Private upload -> pending Studio candidates only. No network/model/publication effects. */
 export async function importHubspotKnowledge(text: string, actorEmail: string) {
   assertSavActor(actorEmail);
@@ -52,7 +74,7 @@ export async function importHubspotKnowledge(text: string, actorEmail: string) {
   const results = [];
   for (const { entry, projection } of prepared) {
     const ref = `hubspot:${input.namespace}:${entry.externalId}`;
-    const registered = await registerCanonicalKnowledge({ canonicalKey: ref, title: entry.title, document: entry.document,
+    const registered = await registerCanonicalKnowledge({ canonicalKey: ref, title: entry.title, document: entry.document, versionBySource: true,
       source: { ref, hash: savContentHash(entry), evidence: { importKind: "hubspot", ...entry.provenance } },
     }, actorEmail);
     const proposedInput = parseContentInput({ ...projection, metadata: { ...projection.metadata, sourceMetadata: {

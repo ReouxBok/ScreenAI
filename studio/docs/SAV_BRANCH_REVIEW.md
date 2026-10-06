@@ -18,8 +18,13 @@ retraitement d'emails ou appel d'écriture Gmail/HubSpot.
   canonique du Studio ; Notion sert uniquement au suivi des tâches.
 - SAV-24 : évaluation isolée et qualité réelle des sorties encore à qualifier.
 
-Aucun changement de l'extension Chrome, DOM, tutoriels, recherche partagée,
-SDK, dépendances, schéma ou rôles globaux du Studio.
+Complément HubSpot et correctifs de revue : import privé vers des candidats
+SAV, provenance versionnée, comparaison sur le document corrigé et le brouillon
+cible actuel. La recherche partagée est modifiée uniquement pour restituer une
+fiche HubSpot complète dans le scope SAV ; le chemin extension est inchangé.
+Voir `SAV_HUBSPOT_KNOWLEDGE_IMPORT.md` pour le détail et les limites de recette.
+Aucun changement du runtime extension Chrome, DOM, tutoriels, SDK, dépendances,
+schéma ou rôles globaux du Studio.
 
 ## Vérification locale
 
@@ -39,7 +44,7 @@ node studio/scripts/verify-sav-release.mjs origin/main
 node studio/scripts/audit-sav-20-offline.mjs
 ```
 
-Dernière régression locale : 505 tests, 59 fichiers, passants. PostgreSQL PGlite
+Régression initiale du lot SAV-20/21/23 : 505 tests, 59 fichiers, passants. PostgreSQL PGlite
 et fournisseurs simulés uniquement. Le scanner est partiel : relire le diff
 pour les données privées, il ne constitue pas un audit PII exhaustif.
 Un test mémoire préexistant et intermittent reste inchangé hors du SAV.

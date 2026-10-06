@@ -19,7 +19,11 @@ import {
 import { analyzeSavPilotBatchWorkflow } from "@/workflows/sav-pilot";
 import { reviewKnowledgeCandidate } from "@/lib/knowledge/review";
 import { HUBSPOT_IMPORT_MAX_BYTES } from "@/lib/knowledge/hubspot-input";
-import { importHubspotKnowledge } from "@/lib/knowledge/hubspot-import";
+import { importHubspotKnowledge, prepareHubspotReview } from "@/lib/knowledge/hubspot-import";
+import { assertKnowledgeUgoApproval } from "@/lib/knowledge/contracts";
+import { requireDb } from "@/db";
+import { knowledgeProjectionCandidates } from "@/db/schema";
+import { eq } from "drizzle-orm";
 import { proposeSavFromOnboarding } from "@/lib/knowledge/candidates";
 import { reviewSavProposal } from "@/lib/sav/review";
 import { queueSavManualTicket } from "@/lib/sav/manual-tickets";
@@ -272,6 +276,18 @@ export async function reviewLearningAction(form: FormData) {
   revalidatePath("/studio/sav");
   revalidatePath("/studio/sav/resolutions");
   revalidatePath("/studio/contenus");
+}
+
+export async function previewHubspotReviewAction(form: FormData) {
+  const staff = await requireApiStaff("admin");
+  assertKnowledgeUgoApproval(staff.email);
+  try {
+    const [candidate] = await requireDb().select().from(knowledgeProjectionCandidates).where(eq(knowledgeProjectionCandidates.id, id(form, "candidateId")));
+    if (!candidate || candidate.status !== "pending" || candidate.targetSurface !== "sav" || candidate.revisionId !== id(form, "revisionId")) throw new Error("KNOWLEDGE_CANDIDATE_STALE");
+    return { comparison: await prepareHubspotReview(candidate, JSON.parse(String(form.get("document")))), error: null };
+  } catch (error) {
+    return { comparison: null, error: error instanceof Error && /^[A-Z][A-Z_]+$/.test(error.message) ? error.message : "KNOWLEDGE_REVIEW_INVALID" };
+  }
 }
 
 export async function reviewKnowledgeAction(form: FormData) {

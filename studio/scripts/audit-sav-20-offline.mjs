@@ -43,11 +43,11 @@ function harness({ key = true, response = "503" } = {}) {
   };
   function load(name) {
     if (modules[name]) return modules[name];
-    const module = { exports: {} };
+    const loadedModule = { exports: {} };
     const compiled = ts.transpileModule(sources[name], { compilerOptions: {
       target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.CommonJS,
     } }).outputText;
-    const context = vm.createContext({ module, exports: module.exports,
+    const context = vm.createContext({ module: loadedModule, exports: loadedModule.exports,
       require: specifier => {
         if (["./config", "./policy"].includes(specifier)) return load(specifier.slice(2));
         if (!(specifier in dependencies)) throw new Error(`Unexpected import: ${specifier}`);
@@ -62,8 +62,8 @@ function harness({ key = true, response = "503" } = {}) {
       },
     });
     vm.runInContext(compiled, context, { filename: `historical-${name}.js`, timeout: 5_000 });
-    modules[name] = module.exports;
-    return module.exports;
+    modules[name] = loadedModule.exports;
+    return loadedModule.exports;
   }
   return { analyze: load("intelligence").analyzeSavMessage, policy: load("policy"), calls, traces };
 }
