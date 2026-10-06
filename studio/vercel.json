@@ -2,7 +2,9 @@
   "$schema": "https://openapi.vercel.sh/vercel.json",
   "git": {
     "deploymentEnabled": {
-      "codex/sav-v0": false
+      "codex/sav-v0": false,
+      "codex/ugo": false,
+      "codex/ugo/**": false
     }
   },
   "crons": [
