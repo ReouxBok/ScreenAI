@@ -67,8 +67,8 @@ export function canonicalFromSav(familyKey: string, metadata: ArticleMetadata, l
 }
 
 export function savProjectionBody(document: CanonicalKnowledge) {
-  return ["## Objectif", document.objective, ...(document.productVersion ? ["Version produit : " + document.productVersion] : []), ...(document.validUntil ? ["Validité : " + document.validUntil] : []), "## Prérequis", ...document.prerequisites, "## Procédure proposée", ...document.steps.flatMap((step, index) => [
+  return ["## Objectif", document.objective, ...(document.supportContext ? ["## Symptômes", ...document.supportContext.symptoms, "## Questions de diagnostic", ...document.supportContext.diagnosticQuestions] : []), ...(document.productVersion ? ["Version produit : " + document.productVersion] : []), ...(document.validUntil ? ["Validité : " + document.validUntil] : []), "## Prérequis", ...document.prerequisites, "## Procédure proposée", ...document.steps.flatMap((step, index) => [
     `${index + 1}. ${step.instruction}`, ...(step.location ? ["Emplacement : " + step.location] : []), ...step.prerequisites.map((value) => "Prérequis de l’étape : " + value), "Résultat de l’étape : " + (step.expectedResult || "À confirmer par Ugo."), ...step.exceptions.map((value) => "Exception : " + value), ...(step.escalation ? ["Escalade de l’étape : " + step.escalation] : []),
     ...step.variants.map((variant) => `Variante à qualifier (${variant.roles.join(", ") || "rôle non précisé"} ; ${variant.productVersion || "version non précisée"}) : ${variant.instruction}`),
-  ]), "## Résultat attendu", document.expectedResult || "À confirmer par Ugo.", "## Exceptions", ...document.exceptions, "## Escalade", document.escalation].join("\n\n");
+  ]), "## Résultat attendu", document.expectedResult || "À confirmer par Ugo.", "## Exceptions", ...document.exceptions, "## Escalade", document.escalation, ...(document.supportContext?.responseTemplate ? ["## Exemple de réponse à adapter", document.supportContext.responseTemplate] : [])].join("\n\n");
 }

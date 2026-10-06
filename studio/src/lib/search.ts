@@ -83,7 +83,10 @@ export async function searchKnowledge(rawInput: unknown) {
       item.id,
       version.id AS "contentVersionId",
       item.title,
-      chunk.content,
+      ${input.scope === "sav" ? sql`CASE
+        WHEN version.metadata -> 'sourceMetadata' ->> 'importKind' = 'hubspot'
+          AND length(version.body_markdown) <= 12000 THEN version.body_markdown
+        ELSE chunk.content END` : sql`chunk.content`} AS content,
       item.slug AS source,
       item.verified_at AS "verifiedAt",
       version.metadata -> 'actionSteps' AS "actionSteps",

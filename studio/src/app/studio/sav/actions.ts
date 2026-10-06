@@ -18,6 +18,8 @@ import {
 } from "@/lib/sav/service";
 import { analyzeSavPilotBatchWorkflow } from "@/workflows/sav-pilot";
 import { reviewKnowledgeCandidate } from "@/lib/knowledge/review";
+import { HUBSPOT_IMPORT_MAX_BYTES } from "@/lib/knowledge/hubspot-input";
+import { importHubspotKnowledge } from "@/lib/knowledge/hubspot-import";
 import { proposeSavFromOnboarding } from "@/lib/knowledge/candidates";
 import { reviewSavProposal } from "@/lib/sav/review";
 import { queueSavManualTicket } from "@/lib/sav/manual-tickets";
@@ -278,7 +280,7 @@ export async function reviewKnowledgeAction(form: FormData) {
   try {
     const decision = String(form.get("decision"));
     if (decision !== "approve" && decision !== "reject") throw new Error("INVALID_LEARNING_DECISION");
-    await reviewKnowledgeCandidate(id(form, "candidateId"), { expectedRevisionId: id(form, "revisionId"), decision, reason: String(form.get("reason") || ""), ...(decision === "approve" ? { document: JSON.parse(String(form.get("document"))) } : {}) }, staff.email);
+    await reviewKnowledgeCandidate(id(form, "candidateId"), { expectedRevisionId: id(form, "revisionId"), decision, reason: String(form.get("reason") || ""), comparison: { snapshot: String(form.get("comparisonSnapshot") || ""), acknowledged: form.get("comparisonAcknowledged") === "on" }, ...(decision === "approve" ? { document: JSON.parse(String(form.get("document"))) } : {}) }, staff.email);
   } catch (error) { errorCode = error instanceof Error && /^[A-Z][A-Z_]+$/.test(error.message) ? error.message : "KNOWLEDGE_REVIEW_INVALID"; }
   revalidatePath("/studio/sav/connaissances");
   redirect(`/studio/sav/connaissances?result=${errorCode || "draft_ready"}`);
@@ -312,4 +314,20 @@ export async function reviewProposalAction(form: FormData) {
   revalidatePath(`/studio/sav/${threadId}`);
   revalidatePath("/studio/sav/resolutions");
   redirect(`/studio/sav/${encodeURIComponent(threadId)}?review=${errorCode || "saved"}`);
+}
+
+export async function importHubspotKnowledgeAction(form: FormData) {
+  const staff = await requireApiStaff("admin");
+  let result = "hubspot_candidates_ready";
+  try {
+    const file = form.get("knowledgeFile");
+    if (!(file instanceof File) || file.size === 0) throw new Error("HUBSPOT_IMPORT_FILE_REQUIRED");
+    if (file.size > HUBSPOT_IMPORT_MAX_BYTES) throw new Error("HUBSPOT_IMPORT_TOO_LARGE");
+    await importHubspotKnowledge(await file.text(), staff.email);
+  } catch (error) {
+    // Never expose a private payload, schema details or DB errors in the URL/logs.
+    result = error instanceof Error && /^[A-Z][A-Z_]+$/.test(error.message) ? error.message : "HUBSPOT_IMPORT_INVALID";
+  }
+  revalidatePath("/studio/sav/connaissances");
+  redirect(`/studio/sav/connaissances?result=${result}`);
 }

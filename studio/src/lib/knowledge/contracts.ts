@@ -28,6 +28,12 @@ export const canonicalKnowledgeSchema = z.object({
   exceptions: list,
   escalation: text,
   steps: z.array(semanticStepSchema).max(50),
+  // Written support evidence stays with the reviewed revision, never in a prompt.
+  supportContext: z.object({
+    symptoms: list,
+    diagnosticQuestions: list,
+    responseTemplate: text,
+  }).strict().optional(),
 }).strict().superRefine((value, ctx) => {
   if (new Set(value.steps.map((step) => step.id)).size !== value.steps.length) ctx.addIssue({ code: "custom", message: "SEMANTIC_STEP_IDS_MUST_BE_UNIQUE", path: ["steps"] });
 });

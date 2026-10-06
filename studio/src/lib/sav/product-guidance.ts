@@ -1,0 +1,2 @@
+/** The only general product direction. All procedures still require reviewed KB evidence. */
+export const SAV_PRODUCT_GUIDANCE = "Oriente vers Limova 3 lorsque cela répond au besoin du client. Explique uniquement les avantages et procédures étayés par les fiches SAV validées ; sans source pertinente, demande une clarification ou une revue humaine. Adapte ce conseil au produit et au contexte du client.";

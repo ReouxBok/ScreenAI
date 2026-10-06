@@ -6,9 +6,10 @@ import { parseContentInput } from "@/lib/content";
 import { savContentHash } from "@/lib/sav/crypto";
 import { assertKnowledgeUgoApproval, canonicalKnowledgeSchema } from "./contracts";
 import { savProjectionBody } from "./conversion";
+import { hubspotComparison, knowledgeComparisonInventory } from "./hubspot-import";
 
 /** Approval creates an in-review SAV draft, never publishes or edits Chrome. */
-export async function reviewKnowledgeCandidate(candidateId: string, input: { expectedRevisionId: string; decision: "approve" | "reject"; reason: string; document?: unknown }, actorEmail: string) {
+export async function reviewKnowledgeCandidate(candidateId: string, input: { expectedRevisionId: string; decision: "approve" | "reject"; reason: string; document?: unknown; comparison?: { snapshot: string; acknowledged: boolean } }, actorEmail: string) {
   assertKnowledgeUgoApproval(actorEmail);
   if (input.reason.trim().length < 10) throw new Error("KNOWLEDGE_REVIEW_REASON_REQUIRED");
   return requireDb().transaction(async (tx) => {
@@ -26,6 +27,15 @@ export async function reviewKnowledgeCandidate(candidateId: string, input: { exp
     const [originalRevision] = await tx.select().from(knowledgeFamilyRevisions).where(and(eq(knowledgeFamilyRevisions.id, candidate.revisionId), eq(knowledgeFamilyRevisions.familyId, candidate.familyId)));
     const [source] = await tx.select().from(knowledgeFamilySources).where(eq(knowledgeFamilySources.id, candidate.sourceId));
     if (!originalRevision || !source) throw new Error("KNOWLEDGE_PROVENANCE_REQUIRED");
+    let comparisonReview;
+    if (source.evidence.importKind === "hubspot") {
+      if (!input.comparison?.acknowledged) throw new Error("HUBSPOT_COMPARISON_REVIEW_REQUIRED");
+      const comparison = hubspotComparison(candidate, await knowledgeComparisonInventory(tx));
+      if (input.comparison.snapshot !== comparison.snapshot) throw new Error("HUBSPOT_COMPARISON_STALE");
+      comparisonReview = { snapshot: comparison.snapshot, compared: comparison.compared,
+        relatedVersions: comparison.findings.map(({ ref, versionId, signal }) => ({ ref, versionId, signal })),
+        reviewedBy: actorEmail, reviewedAt: new Date().toISOString(), reason: input.reason };
+    }
     const document = canonicalKnowledgeSchema.parse(input.document ?? originalRevision.document);
     if (!["shared", "sav_only"].includes(document.applicability) || !document.steps.length) throw new Error("KNOWLEDGE_NOT_APPLICABLE_TO_SAV");
     // Contextual variants are kept for review, not flattened into universal advice.
@@ -43,9 +53,10 @@ export async function reviewKnowledgeCandidate(candidateId: string, input: { exp
     const original = parseContentInput(candidate.proposedInput);
     const proposed = parseContentInput({ ...original, summary: document.objective, bodyMarkdown: savProjectionBody(document), metadata: {
       ...original.metadata, semanticSteps: document.steps, prerequisites: document.prerequisites, expectedResult: document.expectedResult, troubleshooting: document.escalation,
-      sourceMetadata: { ...original.metadata.sourceMetadata, canonicalRevisionId: revision.id, canonicalObjective: document.objective, approvedCandidateId: candidate.id },
-      resolution: { symptoms: [document.objective], steps: document.steps.map((step) => step.instruction), exceptions: document.exceptions, escalation: document.escalation, productVersion: document.productVersion, ...(document.validUntil ? { validUntil: document.validUntil } : {}), supersedes: [], conflictsWith: [] },
+      sourceMetadata: { ...original.metadata.sourceMetadata, canonicalRevisionId: revision.id, canonicalObjective: document.objective, approvedCandidateId: candidate.id, ...(comparisonReview ? { comparisonReview } : {}) },
+      resolution: { symptoms: document.supportContext?.symptoms ?? [document.objective], steps: document.steps.map((step) => step.instruction), exceptions: document.exceptions, escalation: document.escalation, productVersion: document.productVersion, ...(document.validUntil ? { validUntil: document.validUntil } : {}), supersedes: [], conflictsWith: [] },
     } });
+    if (comparisonReview && proposed.bodyMarkdown.length > 12_000) throw new Error("HUBSPOT_PROCEDURE_TOO_LONG");
     const [category] = await tx.select().from(categories).where(eq(categories.slug, proposed.categorySlug));
     if (!category) throw new Error("CATEGORY_NOT_FOUND");
     let item;
