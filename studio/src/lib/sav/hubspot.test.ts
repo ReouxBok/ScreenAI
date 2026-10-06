@@ -1,5 +1,33 @@
 import { createHmac } from "node:crypto";
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { readSavHubspotContext } from "./hubspot";
+
+afterEach(() => { vi.unstubAllGlobals(); vi.unstubAllEnvs(); });
+
+describe("HubSpot dossier context reads", () => {
+  it("does not filter associated tickets by the incoming email subject", async () => {
+    vi.stubEnv("HUBSPOT_ACCESS_TOKEN", "fixture-token");
+    const network = vi.fn(async (url: string, init?: RequestInit) => {
+      if (url.endsWith("contacts/search")) return Response.json({ results: [{ id: "42", properties: { email: "client@example.invalid" } }] });
+      if (url.endsWith("tickets/search")) {
+        expect(JSON.parse(String(init?.body))).not.toHaveProperty("query");
+        return Response.json({ results: [{ id: "99", properties: { subject: "Une autre question", content: "Historique utile", hs_pipeline: "0", hs_pipeline_stage: "1" } }] });
+      }
+      return Response.json({ results: [{ id: "0", stages: [{ id: "1", metadata: { isClosed: false } }] }] });
+    });
+    vi.stubGlobal("fetch", network);
+    const context = await readSavHubspotContext({ email: "client@example.invalid", subject: "Question actuelle" });
+    expect(context.tickets).toMatchObject([{ id: "99", subject: "Une autre question", description: "Historique utile" }]);
+  });
+  it("preserves a contact if ticket lookup fails, while write preflights remain strict", async () => {
+    vi.stubEnv("HUBSPOT_ACCESS_TOKEN", "fixture-token");
+    vi.stubGlobal("fetch", vi.fn(async (url: string) => url.endsWith("contacts/search")
+      ? Response.json({ results: [{ id: "42", properties: { email: "client@example.invalid" } }] })
+      : new Response("private provider error", { status: 403 })));
+    await expect(readSavHubspotContext({ email: "client@example.invalid", subject: "Aide", toleratePartial: true })).resolves.toMatchObject({ contactId: "42", contactFound: true, errorCode: "SAV_HUBSPOT_TICKETS_UNAVAILABLE" });
+    await expect(readSavHubspotContext({ email: "client@example.invalid", subject: "Aide" })).rejects.toThrow("HUBSPOT_HTTP_403");
+  });
+});
 import { compactHubspotTicketTranscript, HUBSPOT_TICKET_TRANSCRIPT_MAX_BYTES, isHubspotEmailReadScopeError, processPendingPilotHubspotActions, processPendingPilotHubspotActionsAcrossBatches, shouldAttemptHubspotBackfill, summarizeHubspotError, verifyHubspotSignature } from "./hubspot";
 
 describe("HubSpot webhook verification", () => {

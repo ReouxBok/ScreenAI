@@ -6,13 +6,15 @@ import type { getSavProposalReview } from "@/lib/sav/review";
 import type { SavStructuredProposal } from "@/lib/sav/proposal";
 
 const dependencies = vi.hoisted(() => ({
-  auth: vi.fn(), detail: vi.fn(), review: vi.fn(), related: vi.fn(), stage: vi.fn(), notFound: vi.fn(), drafts: vi.fn(),
+  eligible: vi.fn().mockResolvedValue(true), auth: vi.fn(), detail: vi.fn(), review: vi.fn(), related: vi.fn(), stage: vi.fn(), notFound: vi.fn(), drafts: vi.fn(),
   actions: {
+    refreshSavContextAction: vi.fn(), repairSavProposalAction: vi.fn(),
     approveDraftAction: vi.fn(), correctDecisionAction: vi.fn(), createTicketAction: vi.fn(),
     linkTicketAction: vi.fn(), reconcileTicketAction: vi.fn(), requestHumanAction: vi.fn(),
     retryAction: vi.fn(), retryAnalysisAction: vi.fn(), reviewPilotItemAction: vi.fn(), reviewProposalAction: vi.fn(), saveReplyDraftAction: vi.fn(), sendStudioReplyAction: vi.fn(),
   },
 }));
+vi.mock("@/lib/sav/cutover", () => ({ isSavMessageEligible: dependencies.eligible }));
 vi.mock("@/lib/sav/auth", () => ({ requireSavStaff: dependencies.auth }));
 vi.mock("@/lib/sav/service", () => ({ getSavThreadDetail: dependencies.detail }));
 vi.mock("@/lib/sav/review", () => ({ getSavProposalReview: dependencies.review }));
@@ -121,6 +123,26 @@ beforeEach(() => {
 afterEach(() => vi.unstubAllEnvs());
 
 describe("SAV dossier SSR and human-review guardrails", () => {
+  it("shows the contact and associated tickets without any proposal", async () => {
+    const detail = detailFixture();
+    detail.messages[0].body.supportContext = { version: 1, messageId, collectedAt: now.toISOString(),
+      crm: { status: "ready", errorCode: null, data: { errorCode: null, contactFound: true, contactId: "42", identityCandidates: [],
+        tickets: [{ id: "99", subject: "Une autre question", description: "", status: "open", pipelineId: "0", stageId: "1", updatedAt: null }], routing: { kind: "new", reason: "distinct_issue", candidateIds: [] } } },
+      conversation: null, conversationError: null, otherConversations: [], otherConversationsError: null };
+    dependencies.detail.mockResolvedValue(detail); dependencies.review.mockResolvedValue(null);
+    const html = await renderPage();
+    expect(html).toContain("Ouvrir la fiche #42"); expect(html).toContain("Une autre question · #99");
+    expect(html).toContain("Reconstituer la proposition manquante");
+    expect(html).not.toContain("Les anciens emails ne sont pas retraités");
+  });
+  it("does not turn a CRM outage into a missing contact", async () => {
+    const detail = detailFixture();
+    detail.messages[0].body.supportContext = { version: 1, messageId, collectedAt: now.toISOString(),
+      crm: { status: "error", errorCode: "SAV_HUBSPOT_CONTACT_UNAVAILABLE", data: null },
+      conversation: null, conversationError: null, otherConversations: [], otherConversationsError: null };
+    dependencies.detail.mockResolvedValue(detail); dependencies.review.mockResolvedValue(null);
+    expect(await renderPage()).toContain("Recherche HubSpot indisponible");
+  });
   it("authorizes the SAV user before reading the dossier or related customer context", async () => {
     await renderPage();
     expect(dependencies.auth).toHaveBeenCalledWith("admin");
@@ -318,6 +340,7 @@ describe("SAV dossier SSR and human-review guardrails", () => {
   });
 
   it("keeps historical mail readable without a new proposal-review or send CTA", async () => {
+    dependencies.eligible.mockResolvedValueOnce(false);
     const detail = detailFixture();
     detail.messages[0].receivedAt = new Date("2026-10-01T12:00:00Z");
     detail.decisions = [];

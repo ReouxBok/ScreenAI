@@ -21,6 +21,8 @@ import {
 } from "@/db/schema";
 import { decryptSavPayload, encryptSavPayload, savContentHash } from "./crypto";
 import { analyzeSavMessage, type SavAnalysis } from "./intelligence";
+import { collectSavDossierContext, type SavDossierContext } from "./dossier-context";
+import { assertSavActor } from "./access";
 import type { SavProposalRouting } from "./proposal";
 import { redactSavLearningText } from "./learning-extraction";
 import { invalidateSavReplies } from "./invalidation";
@@ -37,7 +39,7 @@ import {
   type DecisionProposal,
 } from "./policy";
 
-export type SavMessageBody = { text: string; html?: string; headers?: Record<string, string>; attachments?: Array<{ filename: string; mimeType: string; size: number }> };
+export type SavMessageBody = { text: string; html?: string; headers?: Record<string, string>; attachments?: Array<{ filename: string; mimeType: string; size: number }>; supportContext?: SavDossierContext };
 
 export const inboundMessageSchema = z.object({
   mailboxEmail: z.email(),
@@ -340,6 +342,7 @@ export async function processStoredSavMessage(messageId: string) {
   try {
     const body = decryptSavPayload<SavMessageBody>(message.bodyCiphertext);
     const analysis = await analyzeSavMessage({
+      dossierContext: await collectSavDossierContext(message.id),
       from: message.fromEmail, subject: message.subject, body: body.text,
       autoSubmitted: body.headers?.["auto-submitted"],
       contentType: body.headers?.["content-type"],
@@ -400,7 +403,7 @@ export async function processSavPilotItem(itemId: string) {
     if (!await isSavMessageEligible(message.id)) throw new Error("SAV_MESSAGE_BEFORE_CUTOVER");
     const body = decryptSavPayload<SavMessageBody>(message.bodyCiphertext);
     const analysis = await analyzeSavMessage(
-      { from: message.fromEmail, subject: message.subject, body: body.text,
+      { dossierContext: await collectSavDossierContext(message.id), from: message.fromEmail, subject: message.subject, body: body.text,
         autoSubmitted: body.headers?.["auto-submitted"], contentType: body.headers?.["content-type"], displayName: body.headers?.["from-display-name"] },
       { messageId: message.id, pilotBatchId: claimed.batchId },
     );
@@ -680,6 +683,54 @@ export async function retrySavAnalysis(messageId: string, actorEmail: string) {
     .where(and(eq(savMessages.id, messageId), eq(savMessages.analysisStatus, "failed"), isNull(savMessages.processedAt))).returning();
   if (!message) throw new Error("SAV_ANALYSIS_NOT_RETRYABLE");
   await requireDb().insert(auditLogs).values({ actorEmail, action: "sav_analysis_retried", entityType: "sav_message", entityId: messageId });
+}
+
+/** Explicit repair only: never bulk-reprocess history or overwrite a human review. */
+export async function repairSavProposal(messageId: string, actorEmail: string) {
+  assertSavActor(actorEmail);
+  if (savReleaseStage() !== "v0" || isSavPilotMode()) throw new Error("SAV_REPAIR_V0_ONLY");
+  if (!await isSavMessageEligible(messageId)) throw new Error("SAV_MESSAGE_BEFORE_CUTOVER");
+  const db = requireDb();
+  const [message] = await db.select().from(savMessages).where(eq(savMessages.id, messageId)).limit(1);
+  if (!message || message.direction !== "inbound") throw new Error("SAV_MESSAGE_NOT_FOUND");
+  const [decisions, reviews, humanActions, pilots] = await Promise.all([
+    db.select({ actor: savDecisions.actorType, proposal: savAgentRuns.proposalCiphertext }).from(savDecisions)
+      .leftJoin(savAgentRuns, eq(savAgentRuns.id, savDecisions.agentRunId))
+      .where(and(eq(savDecisions.messageId, messageId), eq(savDecisions.isCurrent, true))).limit(1),
+    db.select({ id: savProposalReviews.id }).from(savProposalReviews).where(eq(savProposalReviews.messageId, messageId)).limit(1),
+    db.select({ id: savActions.id }).from(savActions).where(and(eq(savActions.messageId, messageId), eq(savActions.actorType, "human"))).limit(1),
+    db.select({ id: savPilotItems.id }).from(savPilotItems).where(eq(savPilotItems.messageId, messageId)).limit(1),
+  ]);
+  if (!message.processedAt || message.analysisStatus !== "done" || decisions[0]?.actor === "human" || reviews.length || humanActions.length || pilots.length) throw new Error("SAV_REPAIR_CONTEXT_CHANGED");
+  if (decisions[0]?.proposal) throw new Error("SAV_PROPOSAL_ALREADY_AVAILABLE");
+  // Generate first. The existing decision stays intact if generation fails.
+  const body = decryptSavPayload<SavMessageBody>(message.bodyCiphertext);
+  const dossierContext = await collectSavDossierContext(messageId);
+  const analysis = await analyzeSavMessage({ from: message.fromEmail, subject: message.subject, body: body.text,
+    autoSubmitted: body.headers?.["auto-submitted"], contentType: body.headers?.["content-type"],
+    displayName: body.headers?.["from-display-name"], dossierContext }, { messageId });
+  await db.transaction(async (tx) => {
+    await tx.select().from(savThreads).where(eq(savThreads.id, message.threadId)).for("update");
+    const [locked] = await tx.select().from(savMessages).where(eq(savMessages.id, messageId)).for("update");
+    const [latest] = await tx.select({ id: savMessages.id }).from(savMessages).where(and(eq(savMessages.threadId, message.threadId), eq(savMessages.direction, "inbound"))).orderBy(desc(savMessages.receivedAt), desc(savMessages.createdAt), desc(savMessages.id)).limit(1);
+    const [current] = await tx.select().from(savDecisions).where(and(eq(savDecisions.messageId, messageId), eq(savDecisions.isCurrent, true))).limit(1);
+    const [review] = await tx.select({ id: savProposalReviews.id }).from(savProposalReviews).where(eq(savProposalReviews.messageId, messageId)).limit(1);
+    const [humanAction] = await tx.select({ id: savActions.id }).from(savActions).where(and(eq(savActions.messageId, messageId), eq(savActions.actorType, "human"))).limit(1);
+    const [pilot] = await tx.select({ id: savPilotItems.id }).from(savPilotItems).where(eq(savPilotItems.messageId, messageId)).limit(1);
+    if (latest?.id !== messageId || !locked?.processedAt || locked.analysisStatus !== "done" || current?.actorType === "human" || review || humanAction || pilot) throw new Error("SAV_REPAIR_CONTEXT_CHANGED");
+    if (current?.agentRunId) {
+      const [run] = await tx.select({ proposal: savAgentRuns.proposalCiphertext }).from(savAgentRuns).where(eq(savAgentRuns.id, current.agentRunId)).limit(1);
+      if (run?.proposal) throw new Error("SAV_PROPOSAL_ALREADY_AVAILABLE");
+    }
+    if (current) await tx.update(savDecisions).set({ isCurrent: false }).where(eq(savDecisions.id, current.id));
+    await tx.insert(savDecisions).values({ messageId, agentRunId: analysis.agentRunId, kind: analysis.proposal.kind,
+      reasonCode: analysis.proposal.reasonCode, explanation: analysis.proposal.explanation, confidence: analysis.proposal.confidence,
+      evidence: analysis.evidence, model: analysis.model, actorType: "ai", supersedesDecisionId: current?.id });
+    // Cancel stale machine suggestions, without queueing any external action.
+    await tx.update(savActions).set({ status: "cancelled", errorCode: "SAV_PROPOSAL_REPAIRED" })
+      .where(and(eq(savActions.messageId, messageId), eq(savActions.actorType, "ai"), eq(savActions.status, "pending")));
+    await tx.insert(auditLogs).values({ actorEmail, action: "sav_proposal_repaired", entityType: "sav_message", entityId: messageId });
+  });
 }
 
 export async function listSavPilotBatches(limit = 20) {

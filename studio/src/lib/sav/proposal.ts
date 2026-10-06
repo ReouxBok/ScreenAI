@@ -1,6 +1,7 @@
 import { z } from "zod";
 import type { SavDecisionEvidence } from "@/db/schema";
 import type { SavAnalysis } from "./intelligence";
+import type { SavDossierContext } from "./dossier-context";
 import { savInboundContextSchema, type SavInboundContext } from "./message-context";
 
 export const savRoutingSchema = z.discriminatedUnion("kind", [
@@ -26,11 +27,13 @@ export const savStructuredProposalSchema = z.object({
   identityCandidates: z.array(z.object({ contactId: z.string(), name: z.string(), email: z.string(), phoneHint: z.string(), matchedBy: z.enum(["name", "phone"]), confirmed: z.literal(false) })).max(10).default([]),
   customerIdentity: z.object({ registrationEmail: z.email().nullable(), verifiedByHuman: z.boolean() }).default({ registrationEmail: null, verifiedByHuman: false }),
   messageContext: savInboundContextSchema.optional(),
+  // Server-owned, encrypted snapshot: keeps the evidence available for later audits.
+  dossierContext: z.custom<SavDossierContext>((value) => !!value && typeof value === "object" && "version" in value && value.version === 1).optional(),
 }).strict();
 export type SavStructuredProposal = z.infer<typeof savStructuredProposalSchema>;
 
 /** This is a proposed process for the reviewer, never a queue of executable steps. */
-export function buildSavStructuredProposal(input: { subject: string; body: string; messageContext?: SavInboundContext }, analysis: SavAnalysis) {
+export function buildSavStructuredProposal(input: { subject: string; body: string; messageContext?: SavInboundContext; dossierContext?: SavDossierContext }, analysis: SavAnalysis) {
   const routing = analysis.ticketRouting ?? { kind: "review" as const, reason: "hubspot_context_unavailable", candidateIds: [] };
   const process: SavStructuredProposal["process"] = [];
   const support = ["ticket_pending", "human_review_required"].includes(analysis.proposal.kind);
@@ -52,5 +55,6 @@ export function buildSavStructuredProposal(input: { subject: string; body: strin
     sources: analysis.evidence.map((source: SavDecisionEvidence) => ({ sourceType: source.sourceType, sourceId: source.sourceId, contentVersionId: source.contentVersionId, title: source.title, claim: source.claim, excerpt: source.excerpt })),
     knowledgeRevision: analysis.knowledgeRevision ?? "not_consulted", model: analysis.model, identityCandidates: analysis.identityCandidates ?? [],
     ...(input.messageContext ? { messageContext: input.messageContext } : {}),
+    ...(input.dossierContext ? { dossierContext: input.dossierContext } : {}),
   });
 }
