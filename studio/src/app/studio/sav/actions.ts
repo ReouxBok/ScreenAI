@@ -27,7 +27,8 @@ import { eq } from "drizzle-orm";
 import { proposeSavFromOnboarding } from "@/lib/knowledge/candidates";
 import { reviewSavProposal } from "@/lib/sav/review";
 import { queueSavManualTicket } from "@/lib/sav/manual-tickets";
-import { retrySavAnalysis } from "@/lib/sav/service";
+import { retrySavAnalysis, repairSavProposal } from "@/lib/sav/service";
+import { collectSavDossierContext } from "@/lib/sav/dossier-context";
 import { saveSavReplyDraft } from "@/lib/sav/drafts";
 import { assertSavManualReplyEnabled, queueSavManualReply } from "@/lib/sav/manual-replies";
 import { processPendingGmailSendActions } from "@/lib/sav/gmail";
@@ -155,6 +156,26 @@ export async function retryAnalysisAction(form: FormData) {
   const staff = await requireApiStaff("admin");
   await retrySavAnalysis(id(form, "messageId"), staff.email);
   revalidatePath("/studio/sav"); revalidatePath(`/studio/sav/${id(form, "threadId")}`);
+}
+
+export async function refreshSavContextAction(form: FormData) {
+  await requireApiStaff("admin");
+  const threadId = id(form, "threadId");
+  let notice = "context_refreshed";
+  try { await collectSavDossierContext(id(form, "messageId")); }
+  catch { notice = "SAV_CONTEXT_REFRESH_FAILED"; }
+  revalidatePath(`/studio/sav/${threadId}`);
+  redirect(`/studio/sav/${encodeURIComponent(threadId)}?review=${notice}`);
+}
+
+export async function repairSavProposalAction(form: FormData) {
+  const staff = await requireApiStaff("admin");
+  const threadId = id(form, "threadId");
+  let notice = "proposal_repaired";
+  try { await repairSavProposal(id(form, "messageId"), staff.email); }
+  catch (error) { notice = error instanceof Error && /^SAV_[A-Z_]+$/.test(error.message) ? error.message : "SAV_PROPOSAL_REPAIR_FAILED"; }
+  revalidatePath("/studio/sav"); revalidatePath(`/studio/sav/${threadId}`);
+  redirect(`/studio/sav/${encodeURIComponent(threadId)}?review=${notice}`);
 }
 
 export async function reconcileTicketAction(form: FormData) {

@@ -26,7 +26,7 @@ for (const testCase of corpus) {
     const run = await runSavAdkAgent(testCase.input, {
       apiKey, model,
       searchKnowledge: async () => ({ revision: "sav-agent-replay-v1", results: testCase.knowledge }),
-      readHubspotContext: async () => ({ contactFound: true, contactId: "fixture-contact", identityCandidates: [], tickets: [], routing: { kind: "new", reason: "no_candidates", candidateIds: [] } }),
+      readHubspotContext: async () => ({ errorCode: null, contactFound: true, contactId: "fixture-contact", identityCandidates: [], tickets: [], routing: { kind: "new", reason: "no_candidates", candidateIds: [] } }),
     });
     const passed = run.output.category === testCase.expected.category
       && run.output.requiresHuman === testCase.expected.requiresHuman

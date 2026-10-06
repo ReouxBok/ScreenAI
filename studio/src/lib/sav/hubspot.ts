@@ -226,9 +226,9 @@ async function withoutRejectedOwner<T>(properties: Record<string, string>, opera
 async function closedTicketStages() {
   const cached = globalForHubspot.__savClosedHubspotStages;
   if (cached && cached.expiresAt > Date.now()) return cached.values;
-  const response = await hubspotFetch<{ results?: Array<{ stages?: Array<{ id: string; metadata?: { ticketState?: string } }> }> }>("/crm/v3/pipelines/tickets");
+  const response = await hubspotFetch<{ results?: Array<{ stages?: Array<{ id: string; metadata?: { ticketState?: string; isClosed?: boolean | string } }> }> }>("/crm/v3/pipelines/tickets");
   const values = new Set(response.results?.flatMap((pipeline) => pipeline.stages ?? [])
-    .filter((stage) => stage.metadata?.ticketState === "CLOSED").map((stage) => stage.id) ?? []);
+    .filter((stage) => stage.metadata?.ticketState === "CLOSED" || stage.metadata?.isClosed === true || stage.metadata?.isClosed === "true").map((stage) => stage.id) ?? []);
   globalForHubspot.__savClosedHubspotStages = { values, expiresAt: Date.now() + 15 * 60 * 1_000 };
   return values;
 }
@@ -415,48 +415,59 @@ export async function findSavContactCandidates(hints: SavIdentityHints): Promise
   return [...candidates.values()].slice(0, 10);
 }
 
-export async function readSavHubspotContext(input: { email: string; subject: string; currentTicketId?: string | null; identityHints?: SavIdentityHints }) {
-  let linkedTicket: HubspotRecord | null = null;
-  if (input.currentTicketId) {
-    try {
-      linkedTicket = await hubspotFetch<HubspotRecord>(`/crm/v3/objects/tickets/${encodeURIComponent(input.currentTicketId)}?properties=subject,hs_pipeline,hs_pipeline_stage,hs_lastmodifieddate`);
-    } catch (error) {
-      if (!/HUBSPOT_HTTP_404/.test(error instanceof Error ? error.message : "")) throw error;
-    }
-  }
+export async function readSavHubspotContext(input: { email: string; subject: string; currentTicketId?: string | null; identityHints?: SavIdentityHints; toleratePartial?: boolean }) {
   const contact = await findContactByEmail(input.email);
-  const identityCandidates = !contact && input.identityHints ? await findSavContactCandidates(input.identityHints) : [];
-  const response = contact ? await hubspotFetch<{ results?: HubspotRecord[] }>("/crm/v3/objects/tickets/search", {
-      method: "POST",
-      body: JSON.stringify({
-        filterGroups: [{ filters: [{ propertyName: "associations.contact", operator: "EQ", value: contact.id }] }],
-        query: input.subject.slice(0, 120),
-        properties: ["subject", "hs_pipeline", "hs_pipeline_stage", "hs_lastmodifieddate"],
-        sorts: ["-hs_lastmodifieddate"],
-        limit: 10,
-      }),
-    }) : { results: [] };
-  const closed = await closedTicketStages();
-  const records = [...(linkedTicket ? [linkedTicket] : []), ...(response.results ?? []).filter((ticket) => ticket.id !== linkedTicket?.id)]
-    .filter((ticket) => String(ticket.properties.hs_pipeline) === SAV_HUBSPOT_SUPPORT.pipelineId);
-  const tickets = records.slice(0, 10).map((ticket) => ({
-    id: ticket.id,
-    subject: String(ticket.properties.subject || "Sans objet").slice(0, 500),
-    pipelineId: ticket.properties.hs_pipeline,
-    stageId: ticket.properties.hs_pipeline_stage,
-    status: closed.has(String(ticket.properties.hs_pipeline_stage || "")) ? "closed" as const : "open" as const,
-    updatedAt: ticket.properties.hs_lastmodifieddate || ticket.updatedAt || null,
-  }));
-  const routing = selectSavTicketMatch({ subject: input.subject, candidates: tickets, currentTicketId: input.currentTicketId });
-  return {
-    contactFound: Boolean(contact),
-    contactId: contact?.id,
-    identityCandidates,
-    tickets,
-    routing: routing.kind === "matched"
-      ? { kind: routing.kind, ticketId: routing.ticket.id, reason: routing.reason }
-      : { kind: routing.kind, reason: routing.reason, candidateIds: routing.kind === "ambiguous" ? routing.candidates.map((ticket) => ticket.id) : [] },
-  };
+  let identityCandidates: SavIdentityCandidate[] = [];
+  try {
+    identityCandidates = !contact && input.identityHints ? await findSavContactCandidates(input.identityHints) : [];
+    let linkedTicket: HubspotRecord | null = null;
+    if (input.currentTicketId) {
+      try {
+        linkedTicket = await hubspotFetch<HubspotRecord>(`/crm/v3/objects/tickets/${encodeURIComponent(input.currentTicketId)}?properties=subject,hs_pipeline,hs_pipeline_stage,hs_lastmodifieddate`);
+      } catch (error) {
+        if (!/HUBSPOT_HTTP_404/.test(error instanceof Error ? error.message : "")) throw error;
+      }
+    }
+    const response = contact ? await hubspotFetch<{ results?: HubspotRecord[] }>("/crm/v3/objects/tickets/search", {
+        method: "POST",
+        body: JSON.stringify({
+          filterGroups: [{ filters: [{ propertyName: "associations.contact", operator: "EQ", value: contact.id }] }],
+          properties: ["subject", "content", "hs_pipeline", "hs_pipeline_stage", "hs_lastmodifieddate"],
+          sorts: ["-hs_lastmodifieddate"],
+          limit: 20,
+        }),
+      }) : { results: [] };
+    const closed = await closedTicketStages();
+    const records = [...(linkedTicket ? [linkedTicket] : []), ...(response.results ?? []).filter((ticket) => ticket.id !== linkedTicket?.id)]
+      .filter((ticket) => String(ticket.properties.hs_pipeline) === SAV_HUBSPOT_SUPPORT.pipelineId);
+    const tickets = records.slice(0, 20).map((ticket) => ({
+      id: ticket.id,
+      subject: String(ticket.properties.subject || "Sans objet").slice(0, 500),
+      description: String(ticket.properties.content || "").slice(0, 2_500),
+      pipelineId: ticket.properties.hs_pipeline,
+      stageId: ticket.properties.hs_pipeline_stage,
+      status: closed.has(String(ticket.properties.hs_pipeline_stage || "")) ? "closed" as const : "open" as const,
+      updatedAt: ticket.properties.hs_lastmodifieddate || ticket.updatedAt || null,
+    }));
+    const routing = selectSavTicketMatch({ subject: input.subject, candidates: tickets, currentTicketId: input.currentTicketId });
+    return {
+      errorCode: null as string | null,
+      contactFound: Boolean(contact),
+      contactId: contact?.id,
+      identityCandidates,
+      tickets,
+      routing: routing.kind === "matched"
+        ? { kind: routing.kind, ticketId: routing.ticket.id, reason: routing.reason }
+        : { kind: routing.kind, reason: routing.reason, candidateIds: routing.kind === "ambiguous" ? routing.candidates.map((ticket) => ticket.id) : [] },
+    };
+  } catch (error) {
+    // Reading the ticket pipeline must not erase a contact already found. Write
+    // callers remain strict; only the read-only enrichment allows partial data.
+    if (!input.toleratePartial) throw error;
+    return { contactFound: Boolean(contact), contactId: contact?.id, identityCandidates, tickets: [],
+      errorCode: "SAV_HUBSPOT_TICKETS_UNAVAILABLE",
+      routing: { kind: "ambiguous" as const, reason: "hubspot_context_unavailable", candidateIds: [] as string[] } };
+  }
 }
 
 async function createHubspotTicket(message: typeof savMessages.$inferSelect, body: SavMessageBody, contactId: string | null, actionId: string) {

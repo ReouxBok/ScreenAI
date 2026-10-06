@@ -14,7 +14,7 @@ export function ProposalReview({ data, threadId, messageId, drafts, context, sen
   const p = data.proposal;
   const current = drafts?.versions.find((draft) => draft.isCurrent);
   const knowledge = p.sources.filter((source) => source.sourceType === "knowledge" && (source.claim || source.excerpt || p.process.some((step) => step.sourceIds.includes(source.sourceId))));
-  const contactId = p.routing.kind === "new" || p.routing.kind === "matched" ? p.routing.contactId : null;
+  const contactId = p.dossierContext?.crm.data?.contactId ?? (p.routing.kind === "new" || p.routing.kind === "matched" ? p.routing.contactId : null);
   const ticketId = context?.linkedTicketId || (p.routing.kind === "matched" ? p.routing.ticketId : null);
   return <section className={`pilot-review card ${styles.review}`} aria-labelledby="proposal-review-title">
     <header><span className="eyebrow">À relire et corriger</span><h2 id="proposal-review-title">Proposition de l’IA</h2></header>
@@ -27,6 +27,8 @@ export function ProposalReview({ data, threadId, messageId, drafts, context, sen
         <ul className={styles.contextList}>
           <li>Fiche HubSpot : {contactId ? `retrouvée · contact #${contactId}` : p.routing.reason === "customer_identity_unverified" ? "email non reconnu, identité à confirmer" : "non confirmée dans cette analyse"}.</li>
           <li>Ticket : {ticketId ? `retrouvé · #${ticketId}` : "aucun ticket confirmé pour cette demande"}.</li>
+          {!!p.dossierContext?.crm.data?.tickets.length && <li>Tickets sur la fiche : {p.dossierContext.crm.data.tickets.map(ticket => `${ticket.subject} (#${ticket.id})`).join(" ; ")}. À distinguer d’un rattachement confirmé à cette demande.</li>}
+          {!!p.dossierContext?.otherConversations.length && <li>Autres échanges du même expéditeur : {p.dossierContext.otherConversations.length}, sujets à vérifier.</li>}
           {context && <><li>Conversation : {context.messageCount} message{context.messageCount > 1 ? "s" : ""} dans ce fil.</li><li>Autres fils reliés : {context.relatedCount || "aucun"}.</li></>}
         </ul>
         {p.routing.kind === "review" && p.routing.reason === "customer_identity_unverified" && <div className="login-notice"><p>Aucun contact ne sera créé. Le nom et le téléphone servent uniquement à retrouver des candidats.</p>{p.identityCandidates.length ? <ul>{p.identityCandidates.map((candidate) => <li key={candidate.contactId}>{candidate.name} · {candidate.email} · {candidate.phoneHint} · correspondance par {candidate.matchedBy === "phone" ? "téléphone" : "nom"}, à vérifier humainement (contact #{candidate.contactId}).</li>)}</ul> : <p>Aucune correspondance nom/téléphone confirmée. Demander l’adresse email d’inscription Limova dans la réponse.</p>}</div>}

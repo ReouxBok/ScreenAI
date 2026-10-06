@@ -19,6 +19,7 @@ import { SAV_AGENT_ID, SAV_AGENT_SCOPE, SAV_PROMPT_REVISION, savAdkTimeoutMs } f
 import { assertSavAgentIsolation } from "./isolation";
 import { SAV_AGENT_TOOL_NAMES, savAgentOutputSchema, type SavAgentOutput } from "./contracts";
 import type { SavConversation } from "../conversation";
+import type { SavDossierContext } from "../dossier-context";
 import { assertSavAnalysisComplete } from "./validation";
 import type { SavProposalRouting } from "../proposal";
 import { savAnalysisErrorCode } from "../analysis-errors";
@@ -29,6 +30,7 @@ export type SavAgentInput = {
   subject: string;
   body: string;
   conversation?: SavConversation;
+  dossierContext?: SavDossierContext;
   messageContext?: SavInboundContext;
 };
 
@@ -165,6 +167,7 @@ export async function runSavAdkAgent(input: SavAgentInput, options: {
         body: input.body.slice(0, 12_000),
         messageContext: input.messageContext ?? null,
         conversation: input.conversation ?? null,
+        dossierContext: input.dossierContext ?? null,
       }),
     }),
     tracedTool({
@@ -199,8 +202,11 @@ export async function runSavAdkAgent(input: SavAgentInput, options: {
       description: "Recherche en lecture seule les tickets HubSpot liés à l’adresse du client et au sujet courant.",
       parameters: z.object({}).strict(),
       execute: async () => {
-        const result = await (options.readHubspotContext ?? readSavHubspotContext)({ email: input.from, subject: input.subject, currentTicketId: input.conversation?.hubspotTicketId });
-        ticketRouting = !result.contactFound || !result.contactId
+        const result = input.dossierContext ? input.dossierContext.crm.data
+          : await (options.readHubspotContext ?? readSavHubspotContext)({ email: input.from, subject: input.subject, currentTicketId: input.conversation?.hubspotTicketId });
+        if (!result) throw new Error("SAV_HUBSPOT_CONTEXT_UNAVAILABLE");
+        ticketRouting = result.errorCode ? { kind: "review", reason: "hubspot_context_unavailable", candidateIds: [] }
+          : !result.contactFound || !result.contactId
           ? { kind: "review", reason: "customer_identity_unverified", candidateIds: [] }
           : result.routing.kind === "matched" && result.routing.ticketId
             ? { kind: "matched", ticketId: result.routing.ticketId, contactId: result.contactId, reason: result.routing.reason }

@@ -46,6 +46,23 @@ beforeEach(async () => {
 });
 
 describe("SAV generation diagnostics on isolated PostgreSQL", () => {
+  it("reads CRM before generation and includes its result in the prompt and encrypted snapshot", async () => {
+    network.mockResolvedValue(response(validOutput));
+    await analyzeSavMessage(input, { messageId });
+    expect(state.crm.mock.invocationCallOrder[0]).toBeLessThan(network.mock.invocationCallOrder[0]);
+    expect(JSON.parse(network.mock.calls[0][1].body).contents[0].parts[0].text).toContain('"contactId":"31"');
+    const snapshot = decryptSavPayload<{ dossierContext: { crm: { data: { contactId: string } } } }>((await runs())[0].proposalCiphertext!);
+    expect(snapshot.dossierContext.crm.data.contactId).toBe("31");
+  });
+  it("prepares a contextual proposal in V0 even when the thread is paused, keeping human approval mandatory", async () => {
+    vi.stubEnv("SAV_RELEASE_STAGE", "v0");
+    state.context.mockResolvedValue({ senderMatchesCustomer: false, aiPaused: true });
+    network.mockResolvedValue(response(validOutput));
+    const analysis = await analyzeSavMessage(input, { messageId });
+    expect(network).toHaveBeenCalledOnce();
+    expect(analysis.proposal).toMatchObject({ kind: "human_review_required", requiresHumanApproval: true });
+    expect(analysis.structuredProposal?.dossierContext?.crm.data?.contactId).toBe("31");
+  });
   it("persists separated current declarations and provenance while the original remains untouched", async () => {
     const body = "Hello, how can I invite 3 users?\nI am available Tuesday at 14:00.\nOn Tuesday, Support wrote:\nPlease cancel my subscription.";
     network.mockResolvedValue(response(validOutput));
