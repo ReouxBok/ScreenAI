@@ -3,6 +3,7 @@ import { and, desc, eq, lte } from "drizzle-orm";
 import { requireDb } from "@/db";
 import { savMessages, savThreads } from "@/db/schema";
 import { decryptSavPayload } from "./crypto";
+import { splitSavMessageText } from "./message-context";
 
 export type SavConversation = {
   threadId: string;
@@ -19,8 +20,7 @@ export type SavConversation = {
 
 /** Preserve the original in storage. This only removes obvious quoted history from model context. */
 export function currentMessageText(text: string) {
-  return text.split(/\n(?:On .+ wrote:|Le .+ a écrit\s*:|[- ]*Original Message[- ]*|[- ]*Message d'origine[- ]*)\s*\n/i)[0]
-    .split("\n").filter((line) => !/^\s*>/.test(line)).join("\n").trim();
+  return splitSavMessageText(text).currentText;
 }
 
 export async function loadSavConversation(messageId: string): Promise<SavConversation> {

@@ -26,7 +26,8 @@ export function assertSavGrounding(
   if (output.citations.some((citation) => !output.evidenceIds.includes(citation.sourceId))) throw new Error("SAV_CITATION_NOT_DECLARED");
   const hasReply = Boolean(output.replyDraft.trim());
   if (hasReply === (output.responseKind === "none")) throw new Error("SAV_RESPONSE_KIND_MISMATCH");
-  const solution = output.responseKind === "solution" && !output.requiresHuman;
+  // Human review is not a license to display an unsupported solution.
+  const solution = output.responseKind === "solution";
   if (solution && output.citations.length === 0) throw new Error("SAV_UNGROUNDED_REPLY");
   for (const citation of output.citations) {
     const source = knowledgeById.get(citation.sourceId);
@@ -39,7 +40,7 @@ export function assertSavGrounding(
     const verifiedAt = source.verifiedAt ? new Date(source.verifiedAt) : null;
     if (!verifiedAt || Number.isNaN(verifiedAt.getTime()) || Date.now() - verifiedAt.getTime() > 90 * 86_400_000) throw new Error("SAV_CITATION_STALE");
   }
-  if (!output.requiresHuman) {
+  if (solution || !output.requiresHuman) {
     const selected = new Set(output.evidenceIds);
     for (const [sourceId, source] of knowledgeById) {
       if (!selected.has(sourceId)) continue;

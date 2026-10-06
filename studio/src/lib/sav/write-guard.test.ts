@@ -196,13 +196,13 @@ describe("write guard with migrated database", () => {
     const [processed] = await fixture.db.select().from(savPilotItems).where(eq(savPilotItems.id, item.id));
     const [run] = await fixture.db.select().from(savAgentRuns).where(eq(savAgentRuns.id, processed.agentRunId!));
     expect(processed.agentRunId).toBeTruthy();
-    expect(run).toMatchObject({ messageId, pilotBatchId: batch.id, promptRevision: "rules-v1" });
+    expect(run).toMatchObject({ messageId, pilotBatchId: batch.id, promptRevision: "sav-rules-2026-10-06.v3" });
     await fixture.db.insert(savAgentRuns).values({
       messageId, pilotBatchId: batch.id, scope: "sav_ticket_analysis", runtime: "google_adk", mode: "pilot",
       status: "succeeded", model: "fixture", promptRevision: "other-version", inputHash: "fixture",
     });
     await fixture.db.update(savPilotItems).set({ status: "reviewed", verdict: "correct", reviewedAt: new Date() }).where(eq(savPilotItems.id, item.id));
-    await expect(getSavAutonomyGate("rules-v1", "rules-v1")).resolves.toMatchObject({ metrics: { versionReviewed: 1, versionCorrect: 1 } });
+    await expect(getSavAutonomyGate("sav-rules-2026-10-06.v3", "rules-v1")).resolves.toMatchObject({ metrics: { versionReviewed: 1, versionCorrect: 1 } });
     await expect(getSavAutonomyGate("other-version", "fixture")).resolves.toMatchObject({ metrics: { versionReviewed: 0, versionCorrect: 0 } });
     await expect(getSavAutonomyGate("rules-v1", "different-model")).resolves.toMatchObject({ metrics: { versionReviewed: 0, versionCorrect: 0 } });
   });

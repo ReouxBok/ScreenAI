@@ -1,9 +1,10 @@
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { eq } from "drizzle-orm";
 import { createSavTestDb } from "../../../test/sav-db";
-import { activeKnowledge, knowledgeRevisions, savActions, savAgentRuns, savDecisions, savFollowups, savMailboxes, savMessages, savThreads } from "@/db/schema";
+import { activeKnowledge, knowledgeRevisions, savActions, savAgentRuns, savDecisions, savFollowups, savMailboxes, savMessages, savReplyDrafts, savThreads } from "@/db/schema";
 import { activateSavV0Cutover } from "./cutover";
-import { encryptSavPayload } from "./crypto";
+import { decryptSavPayload, encryptSavPayload, savContentHash } from "./crypto";
+import { renderSavOutboundReply, SAV_REPLY_FORMAT_REVISION, savReplyFooter } from "./reply-format";
 import { saveSavReplyDraft } from "./drafts";
 import { assertSavCurrentManualReply, queueSavManualReply } from "./manual-replies";
 import { processPendingGmailSendActions } from "./gmail";
@@ -11,7 +12,7 @@ import { processPendingGmailSendActions } from "./gmail";
 const state = vi.hoisted(() => ({ db: null as unknown }));
 vi.mock("@/db", () => ({ requireDb: () => state.db }));
 let fixture: Awaited<ReturnType<typeof createSavTestDb>>;
-let input: Parameters<typeof saveSavReplyDraft>[0];
+let input: Record<string, unknown> & { text: string };
 let threadId: string;
 let messageId: string;
 let draftId: string;
@@ -73,7 +74,7 @@ describe("V0 human-only reply in the original Gmail thread", () => {
     expect(first).toMatchObject({ kind: "send_reply", actorType: "human", payload: { manualReplyConfirmed: true, studioDraftId: draftId } });
     expect(network).not.toHaveBeenCalled();
   });
-  it("sends the exact displayed body with Gmail threadId and RFC reply headers, without followups or CRM writes", async () => {
+  it("sends the captured draft plus send-only footer in the original thread, without editing the draft or adding followups/CRM writes", async () => {
     const action = await queueSavManualReply({ threadId, draftId }, "ugo@limova.ai");
     expect((await processPendingGmailSendActions(1, action.id)).processed[0]).toMatchObject({ status: "succeeded" });
     expect(rawReply!.threadId).toBe("original-thread");
@@ -81,12 +82,47 @@ describe("V0 human-only reply in the original Gmail thread", () => {
     expect(email).toContain("In-Reply-To: <original@example.invalid>");
     expect(email).toContain("References: <earlier@example.invalid> <original@example.invalid>");
     expect(email).toContain(`Subject: =?UTF-8?B?${Buffer.from("Re: Mes factures").toString("base64")}?=`);
-    expect(email.split("\r\n\r\n")[1]).toBe("Bonjour, quelle adresse email avez-vous utilisée pour votre inscription Limova ?");
+    expect(email.split("\r\n\r\n")[1]).toBe(renderSavOutboundReply(input.text));
+    expect(decryptSavPayload<{ text: string }>((await fixture.db.select().from(savReplyDrafts))[0].bodyCiphertext).text).toBe(input.text);
+    const sentMessage = (await fixture.db.select().from(savMessages)).find(message => message.direction === "outbound")!;
+    expect(decryptSavPayload<{ text: string }>(sentMessage.bodyCiphertext).text).toBe(renderSavOutboundReply(input.text));
     expect(network.mock.calls.some(([url]) => new URL(String(url)).searchParams.get("q")?.startsWith("in:sent rfc822msgid:"))).toBe(true);
     expect(await fixture.db.select().from(savFollowups)).toHaveLength(0);
     expect(await fixture.db.select().from(savActions)).toHaveLength(1);
     await processPendingGmailSendActions();
     expect(network.mock.calls.filter(([url]) => String(url).endsWith("/messages/send"))).toHaveLength(1);
+  });
+  it("captures the English send rule from the current inbound, not the inherited subject", async () => {
+    await fixture.db.update(savMessages).set({ bodyCiphertext: encryptSavPayload({ text: "Hello, I need help with my account.", headers: { "message-id": "<original@example.invalid>" } }) }).where(eq(savMessages.id, messageId));
+    const action = await queueSavManualReply({ threadId, draftId }, "ugo@limova.ai");
+    expect(decryptSavPayload<{ text: string }>(String(action.payload.outboundBodyCiphertext)).text).toBe(renderSavOutboundReply(input.text, "en"));
+    expect(action.payload.replyFormatRevision).toBe(SAV_REPLY_FORMAT_REVISION);
+    expect(network).not.toHaveBeenCalled();
+  });
+  it("rejects an altered final body even if its hash was replaced too", async () => {
+    const action = await queueSavManualReply({ threadId, draftId }, "ugo@limova.ai");
+    const forged = "An unapproved replacement";
+    await fixture.db.update(savActions).set({ payload: { ...action.payload, outboundBodyCiphertext: encryptSavPayload({ text: forged }), outboundBodyHash: savContentHash(forged) } }).where(eq(savActions.id, action.id));
+    expect((await processPendingGmailSendActions(1, action.id)).processed[0]).toMatchObject({ status: "failed", errorCode: "SAV_REPLY_MANUAL_OUTBOUND_CHANGED" });
+    expect(network).not.toHaveBeenCalled();
+  });
+  it("does not silently upgrade an old queued approval and requires a new human confirmation", async () => {
+    const action = await queueSavManualReply({ threadId, draftId }, "ugo@limova.ai");
+    const oldPayload = { manualReplyConfirmed: true, studioDraftId: draftId, bodyCiphertext: action.payload.bodyCiphertext };
+    await fixture.db.update(savActions).set({ payload: oldPayload }).where(eq(savActions.id, action.id));
+    await expect(assertSavCurrentManualReply({ ...action, payload: oldPayload })).rejects.toThrow("SAV_REPLY_MANUAL_FORMAT_RECONFIRM_REQUIRED");
+    expect(network).not.toHaveBeenCalled();
+    const confirmed = await queueSavManualReply({ threadId, draftId }, "ugo@limova.ai");
+    expect(confirmed.id).toBe(action.id);
+    expect(confirmed.payload.replyFormatRevision).toBe(SAV_REPLY_FORMAT_REVISION);
+    await expect(assertSavCurrentManualReply(confirmed)).resolves.toHaveProperty("outboundText", `${input.text}\n\n${savReplyFooter()}`);
+    expect(network).not.toHaveBeenCalled();
+  });
+  it("blocks old-format queued actions in the worker before network access", async () => {
+    const action = await queueSavManualReply({ threadId, draftId }, "ugo@limova.ai");
+    await fixture.db.update(savActions).set({ payload: { ...action.payload, replyFormatRevision: "old-rule" } }).where(eq(savActions.id, action.id));
+    expect((await processPendingGmailSendActions(1, action.id)).processed[0]).toMatchObject({ status: "failed", errorCode: "SAV_REPLY_MANUAL_FORMAT_RECONFIRM_REQUIRED" });
+    expect(network).not.toHaveBeenCalled();
   });
   it("blocks in preview/kill-switch mode without creating a send action or calling Gmail", async () => {
     vi.stubEnv("SAV_WRITES_DISABLED", "true");

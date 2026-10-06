@@ -26,6 +26,7 @@ import { redactSavLearningText } from "./learning-extraction";
 import { invalidateSavReplies } from "./invalidation";
 import { isSavPilotMode, savReleaseStage } from "./config";
 import { getSavV0Cutover, isSavMessageEligible, savV0EligibleMessageFilter } from "./cutover";
+import { savActiveSubject, splitSavMessageText } from "./message-context";
 import {
   decisionKindSchema,
   requestsHuman,
@@ -307,7 +308,7 @@ export async function ingestInboundMessage(rawInput: unknown) {
       const now = new Date();
       await invalidateSavReplies(tx, thread.id, "SAV_REPLY_OBSOLETE", now);
       // A human request takes effect before a potentially slow model call.
-      if (!isSavPilotMode() && requestsHuman(`${input.subject}\n${bodyText}`)) {
+      if (!isSavPilotMode() && requestsHuman(`${savActiveSubject({ subject: input.subject, body: bodyText })}\n${splitSavMessageText(bodyText).currentText}`)) {
         await tx.update(savThreads).set({ aiPaused: true, status: "human_requested",
           humanRequestedAt: now, humanDueAt: humanDueAt(now), updatedAt: now,
         }).where(eq(savThreads.id, thread.id));

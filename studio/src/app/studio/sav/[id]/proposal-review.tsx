@@ -3,6 +3,7 @@ import type { getSavReplyDrafts } from "@/lib/sav/drafts";
 import { savCategoryLabels, savDecisionLabels, savLabel, savProcessLabels, savRoutingLabels, savRoutingReasonLabels, savUrgencyLabels, savVerdictLabels } from "@/lib/sav/labels";
 import { reviewProposalAction, saveReplyDraftAction, sendStudioReplyAction } from "../actions";
 import styles from "./proposal-review.module.css";
+import { savReplyFooter } from "@/lib/sav/reply-format";
 
 const verdicts = [["correct", "Correct"], ["partial", "Partiel"], ["incorrect", "Incorrect"], ["critical", "Critique"]] as const;
 type Props = { data: NonNullable<Awaited<ReturnType<typeof getSavProposalReview>>>; threadId: string; messageId: string;
@@ -43,6 +44,7 @@ export function ProposalReview({ data, threadId, messageId, drafts, context, sen
       <section className={styles.section}><h3 id="studio-draft-title">Proposition de brouillon de réponse</h3>
         {current?.stale && <p role="status">Le brouillon précédent est obsolète. La proposition actuelle est affichée : relisez-la avant de l’enregistrer ou de l’envoyer.</p>}
         <label>Réponse au client<textarea name="replyDraft" rows={9} maxLength={10_000} defaultValue={!current?.stale && current?.status !== "abandoned" ? current?.text ?? p.replyDraft ?? "" : p.replyDraft ?? ""}/></label>
+        <details className={styles.sources}><summary>Signature ajoutée uniquement à l’envoi</summary><pre>{savReplyFooter(p.messageContext?.language ?? "fr")}</pre>{!p.messageContext && <><p>Pour un message client en anglais, l’avertissement utilisé sera :</p><pre>{savReplyFooter("en")}</pre></>}<p>Elle ne fait pas partie du brouillon. Cliquer sur Envoyer autorise la réponse ci-dessus avec cette signature ; valider le process n’envoie rien.</p></details>
         <div className="decision-buttons"><button className="secondary" formAction={saveReplyDraftAction} formNoValidate>Enregistrer le brouillon</button><button className="primary" formAction={sendStudioReplyAction} formNoValidate disabled={!sendAllowed || Boolean(replyState)}>Envoyer la réponse</button></div>
         <p>{replyState === "sent" ? "Réponse déjà envoyée pour cet email." : replyState === "pending" ? "Envoi en cours ou en attente. Aucun second envoi ne sera créé." : replyState === "uncertain" ? "Résultat d’envoi à vérifier dans Gmail. Ne pas renvoyer automatiquement." : !sendAllowed ? sendDisabledReason ?? "L’envoi n’est pas disponible pour ce dossier. Le brouillon reste dans le Studio." : "Ce bouton envoie uniquement cette réponse dans le fil Gmail d’origine. Il ne valide ni le process ni une connaissance."}</p>
         {drafts && <details className={styles.sources}><summary>Historique des brouillons ({drafts.versions.length}{drafts.versions.length === 50 ? " dernières versions" : ""})</summary>{drafts.versions.map((draft) => <article key={draft.id}><p>Version {draft.revision} · {draft.status === "abandoned" ? "Abandonné" : draft.status === "validated" ? "Validé en interne" : "Brouillon"}{draft.stale ? " · contexte obsolète" : ""} · {draft.createdBy}</p><pre>{draft.text}</pre></article>)}</details>}

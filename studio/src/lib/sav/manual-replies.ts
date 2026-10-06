@@ -5,8 +5,10 @@ import { requireDb } from "@/db";
 import { activeKnowledge, auditLogs, savActions, savAgentRuns, savDecisions, savMessages, savProposalReviews, savReplyDrafts, savThreads } from "@/db/schema";
 import { assertSavActor } from "./access";
 import { savAutomationMode, savReleaseStage } from "./config";
-import { decryptSavPayload, savContentHash } from "./crypto";
+import { decryptSavPayload, encryptSavPayload, savContentHash } from "./crypto";
 import { savV0EligibleMessageFilter } from "./cutover";
+import { buildSavInboundContext } from "./message-context";
+import { renderSavOutboundReply, SAV_REPLY_FORMAT_REVISION } from "./reply-format";
 
 const requestSchema = z.object({ threadId: z.uuid(), draftId: z.uuid() }).strict();
 
@@ -30,16 +32,24 @@ export async function queueSavManualReply(raw: unknown, actorEmail: string) {
     const key = `gmail:manual-reply:${draft.messageId}`;
     const [existing] = await tx.select().from(savActions).where(eq(savActions.idempotencyKey, key)).limit(1);
     // One manual answer per inbound. Unknown delivery must never become another POST.
-    if (existing && !["failed", "cancelled"].includes(existing.status)) return existing;
+    // A pending pre-rule action can only be upgraded by a NEW explicit send
+    // confirmation. Workers never silently add a footer to an old approval.
+    const reconfirmOldPending = existing?.status === "pending" && existing.payload.replyFormatRevision !== SAV_REPLY_FORMAT_REVISION && !existing.payload.replySendDispatchedAt;
+    if (existing && !["failed", "cancelled"].includes(existing.status) && !reconfirmOldPending) return existing;
     if (existing?.payload.replySendDispatchedAt) throw new Error("SAV_REPLY_MANUAL_RECONCILIATION_REQUIRED");
+    const [source] = await tx.select().from(savMessages).where(eq(savMessages.id, draft.messageId)).limit(1);
+    if (!source) throw new Error("SAV_REPLY_MANUAL_CONTEXT_CHANGED");
+    const language = buildSavInboundContext({ subject: source.subject, body: decryptSavPayload<{ text: string }>(source.bodyCiphertext).text }).language;
+    const outboundText = renderSavOutboundReply(decryptSavPayload<{ text: string }>(draft.bodyCiphertext).text, language);
     const values = { threadId: thread.id, messageId: draft.messageId, decisionId: draft.decisionId,
       kind: "send_reply", actorType: "human", actorEmail, status: "pending", errorCode: null, scheduledAt: null,
-      payload: { manualReplyConfirmed: true, studioDraftId: draft.id, bodyCiphertext: draft.bodyCiphertext }, updatedAt: new Date() } as const;
+      payload: { manualReplyConfirmed: true, studioDraftId: draft.id, bodyCiphertext: draft.bodyCiphertext,
+        outboundBodyCiphertext: encryptSavPayload({ text: outboundText }), outboundBodyHash: savContentHash(outboundText), replyFormatRevision: SAV_REPLY_FORMAT_REVISION }, updatedAt: new Date() } as const;
     const [action] = existing ? await tx.update(savActions).set(values).where(eq(savActions.id, existing.id)).returning()
       : await tx.insert(savActions).values({ ...values, idempotencyKey: key }).returning();
     await assertSavCurrentManualReply(action, tx);
     await tx.insert(auditLogs).values({ actorEmail, action: "sav_manual_reply_requested", entityType: "sav_action", entityId: action.id,
-      technicalMetadata: { draftId: draft.id, messageId: draft.messageId, reviewId: draft.reviewId, bodyHash: savContentHash(decryptSavPayload<{ text: string }>(draft.bodyCiphertext).text) } });
+      technicalMetadata: { draftId: draft.id, messageId: draft.messageId, reviewId: draft.reviewId, bodyHash: savContentHash(decryptSavPayload<{ text: string }>(draft.bodyCiphertext).text), outboundBodyHash: savContentHash(outboundText), replyFormatRevision: SAV_REPLY_FORMAT_REVISION } });
     return action;
   });
 }
@@ -60,5 +70,9 @@ export async function assertSavCurrentManualReply(action: typeof savActions.$inf
   if (!["not_consulted", "unavailable"].includes(proposal.knowledgeRevision) && proposal.knowledgeRevision !== knowledge?.revisionId) throw new Error("SAV_KNOWLEDGE_CHANGED_REANALYSIS_REQUIRED");
   const body = decryptSavPayload<{ text: string; headers?: Record<string, string> }>(message.bodyCiphertext);
   if (!/^<[^<>\s]+@[^<>\s]+>$/.test(body.headers?.["message-id"] ?? "")) throw new Error("SAV_REPLY_MANUAL_THREAD_HEADERS_MISSING");
-  return { draft, message };
+  if (action.payload.replyFormatRevision !== SAV_REPLY_FORMAT_REVISION || typeof action.payload.outboundBodyCiphertext !== "string") throw new Error("SAV_REPLY_MANUAL_FORMAT_RECONFIRM_REQUIRED");
+  const outboundText = decryptSavPayload<{ text: string }>(action.payload.outboundBodyCiphertext).text;
+  const language = buildSavInboundContext({ subject: message.subject, body: body.text }).language;
+  if (outboundText !== renderSavOutboundReply(decryptSavPayload<{ text: string }>(draft.bodyCiphertext).text, language) || action.payload.outboundBodyHash !== savContentHash(outboundText)) throw new Error("SAV_REPLY_MANUAL_OUTBOUND_CHANGED");
+  return { draft, message, outboundText };
 }

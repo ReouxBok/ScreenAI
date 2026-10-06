@@ -601,8 +601,9 @@ async function sendReplyAction(action: typeof savActions.$inferSelect, text: str
   if (!inbound) throw new Error("SAV_ACTION_INBOUND_NOT_FOUND");
   assertSavOutboundRecipientAllowed(thread.customerEmail);
   const inboundBody = decryptSavPayload<{ text: string; headers?: Record<string, string> }>(inbound.bodyCiphertext);
-  // The human authorizes exactly the displayed body, not an unseen appended footer.
-  const transparentText = manualV0 ? text : ensureAiTransparency(text);
+  // Explicit send captures draft + displayed send-only rule. Never re-render a
+  // pending action here: its encrypted final body must match that approval.
+  const transparentText = manualV0 ? decryptSavPayload<{ text: string }>(String(action.payload.outboundBodyCiphertext)).text : ensureAiTransparency(text);
   const replyFrom = normalizeEmailAddress(process.env.GMAIL_REPLY_FROM_ADDRESS || mailbox.email);
   const rfcMessageId = `<sav-${action.id}@studio.limova.ai>`;
   const priorId = inboundBody.headers?.["message-id"] || (manualV0 ? "" : inboundBody.headers?.["in-reply-to"]) || "";

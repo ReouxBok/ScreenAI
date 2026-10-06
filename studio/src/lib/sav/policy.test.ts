@@ -13,9 +13,21 @@ import {
   requestsHuman,
   safeSavHumanHandoffDraft,
   safeSavTriageDraft,
+  isSavCancellationRequest,
+  isSavFinancialRequest,
+  safeSavFinanceDraft,
 } from "./policy";
+import { SAV_REPLY_SIGNATURE, SAV_REPLY_NOTICE } from "./reply-format";
 
 describe("SAV policy", () => {
+  it.each(["Demande de résiliation", "Je souhaite résilier mon abonnement", "Résiliez mon abonnement", "Annuler mon abonnement", "Please cancel my subscription", "Subscription cancellation", "Je veux me désabonner"])("routes cancellation to humans: %s", body => {
+    const input = { from: "client@example.com", subject: "Abonnement", body };
+    expect(isSavCancellationRequest(input)).toBe(true);
+    expect(deterministicDecision(input)).toMatchObject({ kind: "human_review_required", reasonCode: "cancellation_human_only", requiresHumanApproval: true });
+  });
+  it.each(["Annuler mon rendez-vous", "Cancel the import", "Comment retrouver mes factures ?"])("does not mistake an unrelated operation for subscription cancellation: %s", body => {
+    expect(isSavCancellationRequest({ subject: "Aide", body })).toBe(false);
+  });
   it("requires a human whenever the customer asks for one", () => {
     expect(requestsHuman("Je souhaite parler à une personne")).toBe(true);
     expect(deterministicDecision({ from: "client@example.com", subject: "Aide", body: "Passez-moi à un conseiller" })).toMatchObject({
@@ -25,19 +37,48 @@ describe("SAV policy", () => {
     });
   });
 
-  it("adds the AI disclosure and both support choices exactly once", () => {
+  it("adds only the send-only signature and notice, once, without SLA promises", () => {
     const first = ensureAiTransparency("Voici la procédure à suivre.");
     const second = ensureAiTransparency(first);
     expect(first).toBe(second);
-    expect(first.startsWith(AI_DISCLOSURE)).toBe(true);
+    expect(first).not.toContain(AI_DISCLOSURE);
+    expect(first).toContain(SAV_REPLY_SIGNATURE);
+    expect(first).toContain(SAV_REPLY_NOTICE);
+    expect(first).not.toMatch(/3 jours|réponse instantanée/);
     expect(isTransparentAiReply(first)).toBe(true);
   });
 
-  it("keeps acknowledgement and handoff drafts transparent without inventing a solution", () => {
-    for (const draft of [safeSavTriageDraft(), safeSavHumanHandoffDraft()]) {
-      expect(isTransparentAiReply(draft)).toBe(true);
+  it("keeps drafts signature-free without inventing a solution or execution", () => {
+    for (const draft of [safeSavTriageDraft(), safeSavHumanHandoffDraft(), safeSavFinanceDraft()]) {
+      expect(isTransparentAiReply(draft)).toBe(false);
+      expect(draft).not.toMatch(/Charly|IA|3 jours|immédiatement|instantanée/);
       expect(draft).not.toMatch(/cliquez|paramètres|procédure|résolu/i);
     }
+  });
+
+  it.each([
+    "Je souhaite un remboursement", "I was charged twice, please refund me", "Mon paiement ne passe pas",
+    "Quel est le montant de ma facture ?", "Je conteste cette facture", "Mon solde est incorrect",
+    "Mon agent téléphonique bug et je veux un remboursement", "Mon agent tel marche pas. Comment recharger mes crédits ?",
+    "Mon agent téléphonique bug, j’ai été facturé deux fois", "Export des données financières",
+    "Can you send me a credit note?", "Mon agent tel bug et double facturation",
+  ])("routes financial data/operations to a human even with a phone bug: %s", body => {
+    const input = { from: "client@example.com", subject: "Support", body };
+    expect(isSavFinancialRequest(input)).toBe(true);
+    expect(deterministicDecision(input)).toMatchObject({ reasonCode: "finance_human_only", requiresHumanApproval: true });
+  });
+  it.each([
+    "Comment retrouver mes factures ?", "Où télécharger mes factures ?", "Where can I download my invoices?",
+    "Mon agent tel marche pas", "Mon agent tel marche pas, vérifier les crédits ?", "Mon agent téléphonique ne fonctionne plus",
+    "My phone agent is not working, how do I check the credits?",
+  ])("permits product navigation and technical phone checks, not financial handling: %s", body => {
+    const input = { from: "client@example.com", subject: "Support", body };
+    expect(isSavFinancialRequest(input)).toBe(false);
+    expect(deterministicDecision(input).kind).toBe("ticket_pending");
+  });
+  it("does not reuse a quoted financial request as the current intent", () => {
+    expect(isSavFinancialRequest({ subject: "Re: Paiement", body: "Comment télécharger mes factures ?\nLe mardi, Support a écrit :\nJe conteste ce prélèvement." })).toBe(false);
+    expect(deterministicDecision({ from: "client@example.com", subject: "Support", body: "Résilier mon abonnement et me rembourser" }).reasonCode).toBe("cancellation_human_only");
   });
 
   it("uses the three-day human SLA and the agreed follow-up cadence", () => {

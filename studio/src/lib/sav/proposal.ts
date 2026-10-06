@@ -1,6 +1,7 @@
 import { z } from "zod";
 import type { SavDecisionEvidence } from "@/db/schema";
 import type { SavAnalysis } from "./intelligence";
+import { savInboundContextSchema, type SavInboundContext } from "./message-context";
 
 export const savRoutingSchema = z.discriminatedUnion("kind", [
   z.object({ kind: z.literal("none"), reason: z.string() }),
@@ -24,18 +25,19 @@ export const savStructuredProposalSchema = z.object({
   model: z.string(),
   identityCandidates: z.array(z.object({ contactId: z.string(), name: z.string(), email: z.string(), phoneHint: z.string(), matchedBy: z.enum(["name", "phone"]), confirmed: z.literal(false) })).max(10).default([]),
   customerIdentity: z.object({ registrationEmail: z.email().nullable(), verifiedByHuman: z.boolean() }).default({ registrationEmail: null, verifiedByHuman: false }),
+  messageContext: savInboundContextSchema.optional(),
 }).strict();
 export type SavStructuredProposal = z.infer<typeof savStructuredProposalSchema>;
 
 /** This is a proposed process for the reviewer, never a queue of executable steps. */
-export function buildSavStructuredProposal(input: { subject: string; body: string }, analysis: SavAnalysis) {
+export function buildSavStructuredProposal(input: { subject: string; body: string; messageContext?: SavInboundContext }, analysis: SavAnalysis) {
   const routing = analysis.ticketRouting ?? { kind: "review" as const, reason: "hubspot_context_unavailable", candidateIds: [] };
   const process: SavStructuredProposal["process"] = [];
   const support = ["ticket_pending", "human_review_required"].includes(analysis.proposal.kind);
   if (analysis.proposal.requiresHumanApproval || routing.kind === "review") process.push({ kind: "human_review", label: analysis.proposal.explanation, sourceIds: [] });
   if (support && routing.kind === "new") process.push({ kind: "create_ticket", label: "Vérifier la proposition, puis créer le ticket HubSpot par un clic humain séparé.", sourceIds: [] });
   if (support && routing.kind === "matched") process.push({ kind: "link_ticket", label: `Vérifier le rattachement au ticket HubSpot ${routing.ticketId} avant toute action.`, sourceIds: [routing.ticketId] });
-  if (!analysis.proposal.requiresHumanApproval) {
+  if (analysis.replyDraft && !analysis.diagnostics?.length && analysis.proposal.reasonCode !== "agent_runtime_degraded") {
     for (const source of analysis.evidence.filter((item) => item.sourceType === "knowledge" && item.excerpt)) {
       process.push({ kind: "product_step", label: source.excerpt!, sourceIds: [source.sourceId] });
     }
@@ -49,5 +51,6 @@ export function buildSavStructuredProposal(input: { subject: string; body: strin
     process, internalNote: analysis.internalNote, replyDraft: analysis.replyDraft,
     sources: analysis.evidence.map((source: SavDecisionEvidence) => ({ sourceType: source.sourceType, sourceId: source.sourceId, contentVersionId: source.contentVersionId, title: source.title, claim: source.claim, excerpt: source.excerpt })),
     knowledgeRevision: analysis.knowledgeRevision ?? "not_consulted", model: analysis.model, identityCandidates: analysis.identityCandidates ?? [],
+    ...(input.messageContext ? { messageContext: input.messageContext } : {}),
   });
 }
