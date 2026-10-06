@@ -13,11 +13,11 @@ describe("HubSpot dossier context reads", () => {
         expect(JSON.parse(String(init?.body))).not.toHaveProperty("query");
         return Response.json({ results: [{ id: "99", properties: { subject: "Une autre question", content: "Historique utile", hs_pipeline: "0", hs_pipeline_stage: "1" } }] });
       }
-      return Response.json({ results: [{ id: "0", stages: [{ id: "1", metadata: { isClosed: false } }] }] });
+      return Response.json({ results: [{ id: "0", stages: [{ id: "1", metadata: { isClosed: "true" } }] }] });
     });
     vi.stubGlobal("fetch", network);
     const context = await readSavHubspotContext({ email: "client@example.invalid", subject: "Question actuelle" });
-    expect(context.tickets).toMatchObject([{ id: "99", subject: "Une autre question", description: "Historique utile" }]);
+    expect(context.tickets).toMatchObject([{ id: "99", subject: "Une autre question", description: "Historique utile", status: "closed" }]);
   });
   it("preserves a contact if ticket lookup fails, while write preflights remain strict", async () => {
     vi.stubEnv("HUBSPOT_ACCESS_TOKEN", "fixture-token");

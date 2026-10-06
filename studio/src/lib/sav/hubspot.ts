@@ -226,9 +226,9 @@ async function withoutRejectedOwner<T>(properties: Record<string, string>, opera
 async function closedTicketStages() {
   const cached = globalForHubspot.__savClosedHubspotStages;
   if (cached && cached.expiresAt > Date.now()) return cached.values;
-  const response = await hubspotFetch<{ results?: Array<{ stages?: Array<{ id: string; metadata?: { ticketState?: string } }> }> }>("/crm/v3/pipelines/tickets");
+  const response = await hubspotFetch<{ results?: Array<{ stages?: Array<{ id: string; metadata?: { ticketState?: string; isClosed?: boolean | string } }> }> }>("/crm/v3/pipelines/tickets");
   const values = new Set(response.results?.flatMap((pipeline) => pipeline.stages ?? [])
-    .filter((stage) => stage.metadata?.ticketState === "CLOSED").map((stage) => stage.id) ?? []);
+    .filter((stage) => stage.metadata?.ticketState === "CLOSED" || stage.metadata?.isClosed === true || stage.metadata?.isClosed === "true").map((stage) => stage.id) ?? []);
   globalForHubspot.__savClosedHubspotStages = { values, expiresAt: Date.now() + 15 * 60 * 1_000 };
   return values;
 }
