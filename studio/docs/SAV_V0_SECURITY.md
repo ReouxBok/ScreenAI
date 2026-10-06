@@ -1,5 +1,47 @@
 # SAV V0 — gate sécurité
 
+## Correctifs compatibles — 6 octobre 2026, PR #4
+
+Mises à jour ciblées des lockfiles uniquement, sans nouvelle exception, montée
+majeure ADK, modification de code fonctionnel ou changement de seuil CI :
+
+| Dépendance | Avant → après | Périmètre |
+| --- | --- | --- |
+| proxy-addr | 2.0.7 → 2.0.8 | Racine, proxy, Studio |
+| source-map-js | 1.2.1 → 1.2.2 | Racine, Studio |
+| prosemirror-view | 1.42.2 → 1.42.6 | Éditeur Studio |
+| prosemirror-model | 1.25.11 → 1.25.12 | Dépendance requise par le patch de l’éditeur |
+
+Avis : [proxy-addr](https://github.com/advisories/GHSA-jqcg-44mw-7w3h),
+[source-map-js](https://github.com/advisories/GHSA-68fv-2mgg-jv7q),
+[prosemirror-view](https://github.com/advisories/GHSA-c8x8-7fp4-3x9w).
+
+| Audit après patch | High brutes | Critical | Gate existante |
+| --- | ---: | ---: | --- |
+| Racine | 0 | 0 | Passe |
+| Proxy | 13 | 0 | Passe avec exception braces existante |
+| Studio | 15 | 0 | Passe avec exception braces existante |
+
+Les nombres high du proxy/Studio correspondent à la chaîne transitive braces,
+pas à autant d’avis indépendants. L’exception reste limitée au même avis et
+expire le **12 octobre 2026 à 00:00 UTC**. Elle n’est ni renouvelée ni élargie.
+Les autres alertes low/moderate restent présentes ; ce lot ne prétend pas à
+une absence totale de vulnérabilités.
+
+Vérifications locales après installations propres, Node 24 : 313 tests racine,
+526 Studio (+ 1 test privé optionnel sauté), 2 proxy ; replay SAV 12/12 ;
+typecheck, lint et build production du Studio passants ; build et validation
+du paquet extension passants, sans publication de celui-ci. Recette métier
+avec modèle/Gmail/HubSpot reportée en production à la demande d’Ugo ; les
+étapes CI existantes, dont les tests navigateur, ne sont pas retirées.
+
+La production n’est pas autorisée par ce correctif. La source du déploiement
+CLI actif reste partiellement réconciliée : le SHA déclaré n’est pas disponible
+dans le dépôt, et l’inventaire du connecteur est tronqué pour les chemins
+profonds. Ne pas présenter une absence de conflit Git comme une preuve que
+les sources réellement servies sont identiques à main. Le déploiement actif
+doit être conservé comme cible de retour arrière avant une livraison autorisée.
+
 ## Lot compatible autorisé — 5 octobre 2026
 
 Les correctifs sont séparés du commit fonctionnel V0. Aucun upgrade majeur ADK, changement de rôle global ou changement fonctionnel des tutoriels/extension.
