@@ -22,7 +22,8 @@ import { assertSavWriteAllowed } from "./write-guard";
 import { savModeAllowsWrite } from "./action-policy";
 import { SAV_HUBSPOT_SUPPORT, assertSavSupportConfiguration, assertSavSupportPipeline, savSupportTicketProperties } from "./hubspot-mapping";
 import { autoReplyMinConfidence, canSendRepliesAutomatically, savAutoReplyCategories, savAutoReplyDailyLimit, savAutomationMode, savThreadInAutoReplyRollout, savReleaseStage } from "./config";
-import { AI_DISCLOSURE, assertSavTicketStageNotClosed, normalizeEmailAddress } from "./policy";
+import { assertSavTicketStageNotClosed, normalizeEmailAddress } from "./policy";
+import { isSavAiAuthoredReply } from "./reply-format";
 import { getSavAutonomyGate } from "./promotion";
 import { selectSavTicketMatch } from "./ticket-routing";
 import { extractSavLearningResolution, isHubspotOutboundDirection } from "./learning-extraction";
@@ -833,7 +834,7 @@ async function snapshotTicket(ticket: HubspotRecord) {
     hs_email_direction: String(email.properties.hs_email_direction || ""),
   })));
   const outbound = transcript.filter((email) => isHubspotOutboundDirection(String(email.hs_email_direction || "")));
-  const humanIntervened = outbound.some((email) => !String(email.hs_email_text || email.hs_email_html || "").includes(AI_DISCLOSURE));
+  const humanIntervened = outbound.some((email) => !isSavAiAuthoredReply(String(email.hs_email_text || email.hs_email_html || "")));
   const closed = (await closedTicketStages()).has(String(ticket.properties.hs_pipeline_stage || ""));
   const updatedAt = new Date(ticket.updatedAt || ticket.properties.hs_lastmodifieddate || Date.now());
   const ticketContent = hubspotEmailPlainText(ticket.properties.content || "").slice(0, 10_000);
@@ -872,7 +873,7 @@ async function snapshotTicket(ticket: HubspotRecord) {
     const extracted = extractSavLearningResolution(ticketContent, transcript.map((email) => ({
       id: email.id, direction: String(email.hs_email_direction || ""),
       text: hubspotEmailPlainText(email.hs_email_text || email.hs_email_html || ""),
-      timestamp: email.hs_timestamp, aiAuthored: String(email.hs_email_text || email.hs_email_html || "").includes(AI_DISCLOSURE),
+      timestamp: email.hs_timestamp, aiAuthored: isSavAiAuthoredReply(String(email.hs_email_text || email.hs_email_html || "")),
     })));
     const finalResolution = extracted.resolution;
     if (finalResolution.length >= 20) await db.insert(savLearningCandidates).values({

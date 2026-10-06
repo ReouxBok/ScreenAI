@@ -14,7 +14,7 @@ async function sourceContent(itemId: string, versionId: string) {
   return row;
 }
 
-async function storeCandidate(input: {
+export async function storeCandidate(input: {
   familyId: string; revisionId: string; sourceId: string; targetSurface: "sav" | "onboarding";
   status: "pending" | "needs_recording" | "not_applicable"; explanation: string; proposedInput: ContentInput | null;
 }, actorEmail: string) {

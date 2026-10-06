@@ -1,11 +1,13 @@
 import { z } from "zod";
+import { savActiveSubject, savNonSupportIntent, splitSavMessageText } from "./message-context";
+import { cleanSavModelDraft, isSavAiAuthoredReply, LEGACY_AI_CHOICES, LEGACY_AI_DISCLOSURE, LEGACY_AI_NOTICE, renderSavOutboundReply } from "./reply-format";
 
 export const HUMAN_SLA_DAYS = 3;
 export const FOLLOWUP_DAY_OFFSETS = [2, 5, 10] as const;
 
-export const AI_DISCLOSURE = "Bonjour, je suis Charly, l’assistant IA du SAV Limova.";
-export const AI_HANDOFF_NOTICE = "Je peux vous aider immédiatement. Vous pouvez à tout moment demander l’intervention d’un humain ; le délai de traitement est alors de 3 jours.";
-export const AI_HANDOFF_CHOICES = "Continuer avec l’IA — réponse instantanée\nTransférer à un humain — délai de 3 jours";
+export const AI_DISCLOSURE = LEGACY_AI_DISCLOSURE;
+export const AI_HANDOFF_NOTICE = LEGACY_AI_NOTICE;
+export const AI_HANDOFF_CHOICES = LEGACY_AI_CHOICES;
 
 export const decisionKindSchema = z.enum([
   "ticket_pending",
@@ -81,6 +83,32 @@ export function requestsHuman(value: string) {
   return humanRequestPatterns.some((pattern) => pattern.test(value));
 }
 
+/** Cancellation is an internal human dossier, not an AI response procedure. */
+export function isSavCancellationRequest(input: Pick<SavClassificationInput, "subject" | "body">) {
+  const text = `${savActiveSubject(input)}\n${splitSavMessageText(input.body).currentText}`.normalize("NFKD").replace(/\p{M}/gu, "").toLowerCase();
+  if (/\b(?:resiliation|resili(?:er|e|ee|ez|ons)|desabonn(?:ement|er|e|ez)|unsubscribe)\b/.test(text)) return true;
+  if (/\b(?:ne (?:veux|souhaite) plus|arreter|mettre fin|stop|end|terminate)\b.{0,80}\b(?:abonnement|subscription|membership|payer|paying)\b/.test(text)) return true;
+  return /\b(?:annul(?:er|ation|e|ez)|cancel(?:lation|ling|ing|led)?|terminate|termination)\b/.test(text)
+    && /\b(?:abonnement|subscription|membership)\b/.test(text);
+}
+
+/** Financial operations/data are human-only. Product navigation is not finance. */
+export function isSavFinancialRequest(input: Pick<SavClassificationInput, "subject" | "body">) {
+  const text = `${savActiveSubject(input)}\n${splitSavMessageText(input.body).currentText}`.normalize("NFKD").replace(/\p{M}/gu, "").toLowerCase();
+  // These signals always win, even in a mixed phone-bug/refund request.
+  if (/\b(?:rembours\w*|refund\w*|prelev\w*|debite\w*|debit|paiement\w*|payment\w*|paye\w*|paying|paid|montant\w*|amount\w*|transaction\w*|bancaire\w*|bank\w*|rib|iban|tva|vat|tax\w*|prix|price\w*|tarif\w*|cout\w*|cost\w*|conteste\w*|contestation\w*|chargeback\w*|charged|overcharg\w*|recharg\w*|top[ -]?up|racheter|acheter des credits|buy credits)\b|\d\s*(?:€|\$|euros?\b|dollars?\b|eur\b|usd\b)/.test(text)) return true;
+  if (/\b(?:financ\w*|chiffre d['’]affaires|revenus?|revenue|double facturation|un avoir|credit note)\b|(?:ete|suis|was|being)\s+factur\w*/.test(text)) return true;
+  const invoice = /\b(?:factures?|invoices?)\b/.test(text);
+  const invoiceNavigation = invoice && /\b(?:retrouver|trouver|telecharger|consulter|acceder|ou|where|find|download|access|view)\b/.test(text);
+  if (invoice && !invoiceNavigation) return true;
+  const phone = /\b(?:telephon\w*|telephone|tel|appels?|calling|calls?|phone)\b/.test(text);
+  const technical = /\b(?:bug\w*|erreur\w*|error\w*|bloqu\w*|fail\w*|broken|not working|doesn['’]?t work|(?:marche|fonctionne) (?:pas|plus))\b|(?:ne|n['’]).{0,40}(?:pas|plus)/.test(text);
+  if (phone && technical) return false;
+  if (/\b(?:credits?|solde|balance)\b/.test(text)) return true;
+  if (invoiceNavigation) return false;
+  return /\b(?:facturation|billing)\b/.test(text);
+}
+
 export function humanDueAt(requestedAt: Date, slaDays = HUMAN_SLA_DAYS) {
   return new Date(requestedAt.getTime() + slaDays * 24 * 60 * 60 * 1_000);
 }
@@ -90,30 +118,26 @@ export function followupDates(from: Date) {
 }
 
 export function ensureAiTransparency(body: string) {
-  const cleanBody = String(body || "").trim();
-  const withoutDuplicateDisclosure = cleanBody
-    .replace(AI_DISCLOSURE, "")
-    .replace(AI_HANDOFF_NOTICE, "")
-    .replace(AI_HANDOFF_CHOICES, "")
-    .trim();
-  return [AI_DISCLOSURE, withoutDuplicateDisclosure, AI_HANDOFF_NOTICE, AI_HANDOFF_CHOICES]
-    .filter(Boolean)
-    .join("\n\n");
+  return renderSavOutboundReply(cleanSavModelDraft(body));
 }
 
-export function safeSavTriageDraft() {
-  return ensureAiTransparency("J’ai bien reçu votre demande. Je commence son analyse et je vous demanderai uniquement les informations nécessaires si le diagnostic doit être précisé.");
+export function safeSavTriageDraft(language: "fr" | "en" | "unknown" = "fr") {
+  return language === "en" ? "Hello, thank you for your message. Could you describe the issue and any error message you see?"
+    : "Bonjour, merci pour votre message. Pouvez-vous préciser le problème rencontré et le message d’erreur éventuel ?";
 }
 
-export function safeSavHumanHandoffDraft() {
-  return ensureAiTransparency("J’ai bien reçu votre demande. Par précaution, je ne vais pas avancer de solution non vérifiée et je prépare le dossier pour l’équipe Limova.");
+export function safeSavHumanHandoffDraft(language: "fr" | "en" | "unknown" = "fr") {
+  return language === "en" ? "Hello, thank you for your message. Your request needs a review by the Limova team before a reliable answer can be provided."
+    : "Bonjour, merci pour votre message. Votre demande nécessite une vérification par l’équipe Limova avant de pouvoir vous apporter une réponse fiable.";
+}
+
+export function safeSavFinanceDraft(language: "fr" | "en" | "unknown" = "fr") {
+  return language === "en" ? "Hello, thank you for your message. Financial matters are handled by the Limova team. A human review is needed to answer your request."
+    : "Bonjour, merci pour votre message. Les questions financières sont traitées par l’équipe Limova. Une vérification humaine est nécessaire pour répondre à votre demande.";
 }
 
 export function isTransparentAiReply(body: string) {
-  return body.includes(AI_DISCLOSURE)
-    && body.includes("réponse instantanée")
-    && body.includes("délai de 3 jours")
-    && body.includes("Transférer à un humain");
+  return isSavAiAuthoredReply(body);
 }
 
 export function isSavOutboundRecipientAllowed(
@@ -153,8 +177,8 @@ export function assertSavTicketStageNotClosed(stageId: string, closedStageIds: R
 
 export function deterministicDecision(input: SavClassificationInput): DecisionProposal {
   const from = normalizeEmailAddress(input.from);
-  const subject = input.subject.trim();
-  const body = sanitizeInboundText(input.body);
+  const subject = savActiveSubject(input).trim();
+  const body = splitSavMessageText(sanitizeInboundText(input.body)).currentText;
   const text = `${subject}\n${body}`;
   const autoSubmitted = String(input.autoSubmitted || "").split(";")[0].trim().toLocaleLowerCase("en");
   const deliveryReport = /multipart\/report\s*;[^\n]*report-type\s*=\s*"?delivery-status/i.test(input.contentType ?? "");
@@ -178,6 +202,18 @@ export function deterministicDecision(input: SavClassificationInput): DecisionPr
   if (containsPromptInjection(text)) {
     return { kind: "human_review_required", reasonCode: "prompt_injection_detected", explanation: "Le message contient des instructions visant le fonctionnement interne de l’IA ; aucune action automatique n’est autorisée.", confidence: 970, requiresHumanApproval: true };
   }
+  const nonSupport = savNonSupportIntent(input);
+  if (nonSupport) {
+    return { kind: "human_review_required", reasonCode: `${nonSupport}_review`,
+      explanation: "Ce message est une sollicitation, une vérification d’expéditeur ou un historique sans nouvelle demande exploitable. Qualifier manuellement sans demander d’identité Limova ni préparer de réponse IA.",
+      confidence: 700, requiresHumanApproval: true };
+  }
+  if (isSavCancellationRequest(input)) {
+    return { kind: "human_review_required", reasonCode: "cancellation_human_only", explanation: "La demande de résiliation est réservée à l’équipe humaine. Préparer le dossier interne sans proposer de réponse IA, même un accusé de réception.", confidence: 995, requiresHumanApproval: true };
+  }
+  if (isSavFinancialRequest(input)) {
+    return { kind: "human_review_required", reasonCode: "finance_human_only", explanation: "Les données et opérations financières sont réservées à l’équipe humaine. Proposer seulement un ticket dans la catégorie facturation et un brouillon standard sans diagnostic ni engagement financier.", confidence: 995, requiresHumanApproval: true };
+  }
   if (highRiskPatterns.some((pattern) => pattern.test(text))) {
     return { kind: "human_review_required", reasonCode: "sensitive_or_high_risk_request", explanation: "La demande touche à une opération sensible ou engageante et doit être relue par un humain.", confidence: 940, requiresHumanApproval: true };
   }
@@ -195,7 +231,7 @@ export function deterministicDecision(input: SavClassificationInput): DecisionPr
   if (/^(?:absence du bureau|out of office|réponse automatique|automatic reply)(?:\s*[:—-]|$)/i.test(subject)) {
     return { kind: "human_review_required", reasonCode: "unconfirmed_automatic_reply", explanation: "L’objet évoque une réponse automatique, mais aucun en-tête fiable ne le confirme ; une revue humaine est nécessaire.", confidence: 500, requiresHumanApproval: true };
   }
-  if (!/\?|\b(?:comment|how|aide|help|bug|erreur|error|problème|problem|impossible|bloqu|fonctionne|facture|invoice|abonnement|subscription|connexion|connecter|intégration|integration|paramètre|résilier|cancel)\b|(?:ne|n['’]).{0,40}(?:pas|plus)/i.test(text)) {
+  if (!/\?|\b(?:comment|how|aide|help|bug|erreur|error|problème|problem|impossible|bloqu|fonctionne|facture|invoice|abonnement|subscription|connexion|connecter|intégration|integration|paramètre|résilier|cancel)\b|(?:ne|n['’]).{0,40}(?:pas|plus)|(?:marche|fonctionne).{0,20}(?:pas|plus)|not working/i.test(text)) {
     return { kind: "human_review_required", reasonCode: "ambiguous_inbound_message", explanation: "Aucun signal suffisant ne confirme une demande SAV ; l’humain doit qualifier ce message avant de proposer une action.", confidence: 500, requiresHumanApproval: true };
   }
   return { kind: "ticket_pending", reasonCode: "new_customer_support_request", explanation: "Le message présente une demande potentiellement liée au support ; le dossier HubSpot doit être recherché avant toute proposition de création validée par un humain.", confidence: 820, requiresHumanApproval: false };

@@ -24,6 +24,16 @@ describe("SAV mandatory analysis stages", () => {
   it("allows a grounded Studio draft without demanding a new ticket", () => {
     expect(() => assertSavAnalysisComplete({ ...output, ticketRequired: false }, traces, evidence, freshKnowledge)).not.toThrow();
   });
+  it("requires the same grounding for a solution under human review", () => {
+    expect(() => assertSavAnalysisComplete({ ...output, requiresHuman: true }, traces, evidence, freshKnowledge)).not.toThrow();
+    expect(() => assertSavAnalysisComplete({ ...output, requiresHuman: true, citations: [] }, traces, evidence, freshKnowledge)).toThrow("SAV_UNGROUNDED_REPLY");
+    const conflicting = new Map([
+      ["card-1", { ...freshKnowledge.get("card-1")!, resolution: { steps: ["A"], conflictsWith: ["card-2"] } }],
+      ["card-2", { ...freshKnowledge.get("card-1")!, resolution: { steps: ["B"], conflictsWith: ["card-1"] } }],
+    ]);
+    expect(() => assertSavAnalysisComplete({ ...output, requiresHuman: true, evidenceIds: ["card-1", "card-2"] }, traces,
+      [...evidence, { sourceType: "knowledge", sourceId: "card-2", title: "Conflicting card" }], conflicting)).toThrow("SAV_CONTRADICTORY_RESOLUTION_CARDS");
+  });
   it("rejects unsupported, weak or stale quotations", () => {
     expect(() => assertSavAnalysisComplete({ ...output, citations: [] }, traces, evidence, freshKnowledge)).toThrow("SAV_UNGROUNDED_REPLY");
     expect(() => assertSavAnalysisComplete({ ...output, citations: [{ ...output.citations[0], quote: "Texte absent de la fiche" }] }, traces, evidence, freshKnowledge)).toThrow("SAV_CITATION_QUOTE_MISMATCH");

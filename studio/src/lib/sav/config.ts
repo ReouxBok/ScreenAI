@@ -14,8 +14,9 @@ export type SavHarnessMode = z.infer<typeof savHarnessModeSchema>;
 
 export const SAV_AGENT_ID = "sav-ticket-analyst";
 export const SAV_AGENT_SCOPE = "sav_ticket_analysis";
-export const SAV_PROMPT_REVISION = "sav-adk-2026-10-02.v0.1";
-export const SAV_LEGACY_PROMPT_REVISION = "sav-legacy-2026-10-02.v0.1";
+export const SAV_PROMPT_REVISION = "sav-adk-2026-10-06.v0.4";
+export const SAV_LEGACY_PROMPT_REVISION = "sav-legacy-2026-10-06.v0.4";
+export const SAV_RULES_REVISION = "sav-rules-2026-10-06.v3";
 
 export function savRunProvenance(simulation = false) {
   const revision = process.env.SAV_CODE_REVISION || process.env.VERCEL_GIT_COMMIT_SHA || "unknown";

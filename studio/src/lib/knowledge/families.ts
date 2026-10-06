@@ -8,13 +8,14 @@ import { canonicalKnowledgeSchema } from "./contracts";
 
 const registrationSchema = z.object({
   canonicalKey: z.string().trim().min(3).max(200), title: z.string().trim().min(1).max(500), document: canonicalKnowledgeSchema,
+  versionBySource: z.boolean().default(false),
   source: z.object({ ref: z.string().trim().min(3).max(500), hash: z.string().regex(/^(?:[A-Za-z0-9_-]{43}|[a-f0-9]{64})$/), versionId: z.uuid().optional(), evidence: z.record(z.string(), z.unknown()).default({}) }),
   projection: z.object({ surface: z.enum(["sav", "onboarding"]), itemId: z.uuid(), versionId: z.uuid(), technicalBindings: z.array(z.object({ semanticStepId: z.string(), actionOrder: z.number().int().min(1).max(100) }).strict()).max(50).default([]) }).optional(),
 });
 
 export async function registerCanonicalKnowledge(rawInput: unknown, actorEmail: string) {
   const input = registrationSchema.parse(rawInput);
-  const canonicalHash = savContentHash(input.document);
+  const canonicalHash = savContentHash(input.versionBySource ? { document: input.document, sourceHash: input.source.hash } : input.document);
   return requireDb().transaction(async (tx) => {
     if (input.projection) {
       const [version] = await tx.select({ version: contentVersions, item: contentItems }).from(contentVersions)
@@ -33,7 +34,10 @@ export async function registerCanonicalKnowledge(rawInput: unknown, actorEmail: 
     }
     await tx.insert(knowledgeFamilies).values({ canonicalKey: input.canonicalKey, title: input.title, createdBy: actorEmail }).onConflictDoNothing();
     const [family] = await tx.select().from(knowledgeFamilies).where(eq(knowledgeFamilies.canonicalKey, input.canonicalKey)).for("update");
-    let [revision] = await tx.select().from(knowledgeFamilyRevisions).where(and(eq(knowledgeFamilyRevisions.familyId, family.id), eq(knowledgeFamilyRevisions.canonicalHash, canonicalHash))).limit(1);
+    // Preserve old imports and their decisions when retrying after evidence versioning was introduced.
+    const [existingSource] = input.versionBySource ? await tx.select().from(knowledgeFamilySources).where(and(eq(knowledgeFamilySources.familyId, family.id), eq(knowledgeFamilySources.sourceRef, input.source.ref), eq(knowledgeFamilySources.sourceHash, input.source.hash))).limit(1) : [];
+    let [revision] = await tx.select().from(knowledgeFamilyRevisions).where(and(eq(knowledgeFamilyRevisions.familyId, family.id), existingSource ? eq(knowledgeFamilyRevisions.id, existingSource.revisionId) : eq(knowledgeFamilyRevisions.canonicalHash, canonicalHash))).limit(1);
+    if (existingSource && (!revision || savContentHash(canonicalKnowledgeSchema.parse(revision.document)) !== savContentHash(input.document))) throw new Error("KNOWLEDGE_SOURCE_MAPPING_CONFLICT");
     if (!revision) {
       const [{ value }] = await tx.select({ value: max(knowledgeFamilyRevisions.revision) }).from(knowledgeFamilyRevisions).where(eq(knowledgeFamilyRevisions.familyId, family.id));
       [revision] = await tx.insert(knowledgeFamilyRevisions).values({ familyId: family.id, revision: (value ?? 0) + 1, canonicalHash, document: input.document }).returning();
