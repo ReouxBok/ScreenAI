@@ -6,7 +6,7 @@ import {
   categories,
   contentItems,
   contentVersions,
-  savLearningCandidates,
+  savObservationCycles, savResolutionObservations, savLearningCandidates,
   savResolutionEvidence,
 } from "@/db/schema";
 import type { ArticleMetadata } from "@/db/schema";
@@ -85,6 +85,11 @@ export async function approveLearningCandidate(candidateId: string, actorEmail: 
   assertKnowledgeUgoApproval(actorEmail);
   const result = await requireDb().transaction(async (tx) => {
   const db = tx;
+  const [source] = await db.select().from(savLearningCandidates).where(eq(savLearningCandidates.id,candidateId));
+  if(source?.sourceRef.startsWith("sav-observation:")) {
+    const [cycle] = await db.select().from(savObservationCycles).where(eq(savObservationCycles.id,source.sourceRef.slice("sav-observation:".length)));
+    if(cycle) await db.select().from(savResolutionObservations).where(eq(savResolutionObservations.id,cycle.observationId)).for("update");
+  }
   const [candidate] = await db.select().from(savLearningCandidates)
     .where(eq(savLearningCandidates.id, candidateId)).for("update");
   if (!candidate) throw new Error("SAV_LEARNING_CANDIDATE_NOT_PENDING");
@@ -98,6 +103,11 @@ export async function approveLearningCandidate(candidateId: string, actorEmail: 
   }
   if (candidate.status !== "pending") throw new Error("SAV_LEARNING_CANDIDATE_NOT_PENDING");
   const patch = candidatePatch(candidate);
+  if(candidate.sourceRef.startsWith("sav-observation:")) {
+    const [cycle]=await db.select().from(savObservationCycles).where(eq(savObservationCycles.id,candidate.sourceRef.slice("sav-observation:".length)));
+    const [observation]=cycle?await db.select().from(savResolutionObservations).where(eq(savResolutionObservations.id,cycle.observationId)).for("update"):[];
+    if(!cycle || !observation?.closed || cycle.cycle!==observation.cycle || cycle.candidateId!==candidate.id || cycle.qualification!=="resolved" || observation.sourceErrors.length || (patch as LearningPatch & {sourceHash?:string}).sourceHash!==cycle.sourceHash)throw new Error("SAV_OBSERVATION_STALE");
+  }
   const sourceLabel = candidate.hubspotTicketId ? `ticket HubSpot ${candidate.hubspotTicketId}` : `dossier SAV ${candidate.threadId ?? candidate.sourceRef}`;
   const subject = plainText(patch.subject) || `Résolution du ${sourceLabel}`;
   const resolution = plainText(patch.finalHumanResolution);

@@ -35,6 +35,7 @@ import { assertSavGmailThreadCurrent } from "./gmail";
 import { savStructuredProposalSchema } from "./proposal";
 import { phoneMatchesHint, type SavIdentityCandidate, type SavIdentityHints } from "./identity";
 import { assertSavActor } from "./access";
+import { hasSavTicketObservation, refreshSavTicketObservations } from "./observations";
 
 const hubspotEventSchema = z.object({
   eventId: z.number().optional(),
@@ -849,6 +850,11 @@ export function compactHubspotTicketTranscript(rawTranscript: TicketEmailSnapsho
 }
 
 async function snapshotTicket(ticket: HubspotRecord) {
+  if (await hasSavTicketObservation(ticket.id)) {
+    await refreshSavTicketObservations(ticket.id);
+    const [snapshot] = await requireDb().select().from(savTicketSnapshots).where(eq(savTicketSnapshots.hubspotTicketId,ticket.id));
+    return snapshot;
+  }
   const emails = await loadTicketEmails(ticket);
   const transcript = compactHubspotTicketTranscript(emails.map((email) => ({
     id: email.id,
@@ -1022,7 +1028,9 @@ async function processHubspotReceipt(receiptId: string) {
   if (!receipt) return;
   try {
     const event = hubspotEventSchema.parse(receipt.payload);
-    if (event.objectId && event.subscriptionType.startsWith("ticket.")) {
+    if (event.objectId && event.subscriptionType.startsWith("ticket.") && await hasSavTicketObservation(String(event.objectId))) {
+      await refreshSavTicketObservations(String(event.objectId));
+    } else if (event.objectId && event.subscriptionType.startsWith("ticket.")) {
       const ticket = await hubspotFetch<HubspotRecord>(`/crm/v3/objects/tickets/${event.objectId}?properties=subject,content,hs_pipeline,hs_pipeline_stage,hs_lastmodifieddate&associations=emails,contacts`);
       await snapshotTicket(ticket);
     }

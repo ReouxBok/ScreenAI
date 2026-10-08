@@ -5,7 +5,9 @@ import { requireDb } from "@/db";
 import { auditLogs, savActions, savDecisions, savMessages, savProposalReviews, savThreads } from "@/db/schema";
 import { assertSavActor } from "./access";
 import { savV0EligibleMessageFilter } from "./cutover";
-import { encryptSavPayload } from "./crypto";
+import { loadSavDraftContext } from "./draft-verdicts";
+import {savStructuredProposalSchema} from "./proposal";
+import { decryptSavPayload, encryptSavPayload } from "./crypto";
 
 const requestSchema = z.object({ threadId: z.uuid(), reviewId: z.uuid(), kind: z.enum(["create_ticket", "link_ticket"]), ticketId: z.string().regex(/^\d{1,30}$/).optional(), distinctIssueReason: z.string().trim().max(2_000).default("") });
 export async function queueSavManualTicket(raw: unknown, actorEmail: string) {
@@ -19,8 +21,11 @@ export async function queueSavManualTicket(raw: unknown, actorEmail: string) {
     const [message] = await tx.select().from(savMessages).where(and(eq(savMessages.threadId, thread.id), eq(savMessages.direction, "inbound"), savV0EligibleMessageFilter())).orderBy(desc(savMessages.receivedAt), desc(savMessages.createdAt), desc(savMessages.id)).limit(1);
     if (!message) throw new Error("SAV_MESSAGE_BEFORE_CUTOVER");
     const [review] = await tx.select().from(savProposalReviews).where(and(eq(savProposalReviews.id, input.reviewId), eq(savProposalReviews.messageId, message.id), eq(savProposalReviews.isCurrent, true), eq(savProposalReviews.status, "approved"))).limit(1);
-    const [decision] = review ? await tx.select().from(savDecisions).where(and(eq(savDecisions.id, review.decisionId), eq(savDecisions.isCurrent, true))).limit(1) : [];
-    if (!review || !decision) throw new Error("SAV_VALIDATED_CURRENT_PROPOSAL_REQUIRED");
+    const c = review?.reviewScope === "dossier" ? await loadSavDraftContext(message.id, tx) : null;
+    const [legacyDecision] = c ? [] : await tx.select().from(savDecisions).where(and(eq(savDecisions.id, review?.decisionId ?? input.reviewId),eq(savDecisions.isCurrent,true))).limit(1);
+    const decision = c?.decision ?? legacyDecision;
+    if (c && (c.review?.id !== review?.id || !["ticket_pending", "human_review_required"].includes(c.proposal.decision.kind))) throw new Error("SAV_VALIDATED_CURRENT_PROPOSAL_REQUIRED");
+    if (!review || !decision || !["ticket_pending","human_review_required"].includes(savStructuredProposalSchema.parse(decryptSavPayload(review.afterCiphertext)).decision.kind)) throw new Error("SAV_VALIDATED_CURRENT_PROPOSAL_REQUIRED");
     const key = `hubspot:manual-ticket:${thread.id}`;
     const [existing] = await tx.select().from(savActions).where(eq(savActions.idempotencyKey, key)).limit(1);
     if (existing) {
@@ -33,7 +38,7 @@ export async function queueSavManualTicket(raw: unknown, actorEmail: string) {
       }
       if (existing.payload.hubspotTicketId) throw new Error("SAV_MANUAL_RECONCILIATION_REQUIRED");
     }
-    const values = { threadId: thread.id, messageId: message.id, decisionId: review.decisionId, kind: input.kind, status: "pending" as const,
+    const values = { threadId: thread.id, messageId: message.id, decisionId: decision.id, kind: input.kind, status: "pending" as const,
       payload: { savReviewId: review.id, ...(input.ticketId ? { ticketId: input.ticketId } : {}), ...(input.distinctIssueReason ? { distinctIssueReasonCiphertext: encryptSavPayload({ text: input.distinctIssueReason }) } : {}) }, actorType: "human" as const, actorEmail, errorCode: null, scheduledAt: null, updatedAt: new Date() };
     const [action] = existing ? await tx.update(savActions).set(values).where(eq(savActions.id, existing.id)).returning()
       : await tx.insert(savActions).values({ ...values, idempotencyKey: key }).returning();
@@ -45,9 +50,11 @@ export async function queueSavManualTicket(raw: unknown, actorEmail: string) {
 export async function assertSavCurrentTicketReview(action: typeof savActions.$inferSelect) {
   if (!action.messageId || !action.decisionId || typeof action.payload.savReviewId !== "string") throw new Error("SAV_VALIDATED_CURRENT_PROPOSAL_REQUIRED");
   const db = requireDb();
-  const [review] = await db.select().from(savProposalReviews).where(and(eq(savProposalReviews.id, action.payload.savReviewId), eq(savProposalReviews.messageId, action.messageId), eq(savProposalReviews.decisionId, action.decisionId), eq(savProposalReviews.isCurrent, true), eq(savProposalReviews.status, "approved"))).limit(1);
+  const [review] = await db.select().from(savProposalReviews).where(and(eq(savProposalReviews.id, action.payload.savReviewId), eq(savProposalReviews.messageId, action.messageId), eq(savProposalReviews.isCurrent, true), eq(savProposalReviews.status, "approved"))).limit(1);
   const [decision] = await db.select().from(savDecisions).where(and(eq(savDecisions.id, action.decisionId), eq(savDecisions.isCurrent, true))).limit(1);
   const [latest] = await db.select({ id: savMessages.id }).from(savMessages).where(and(eq(savMessages.threadId, action.threadId), eq(savMessages.direction, "inbound"))).orderBy(desc(savMessages.receivedAt), desc(savMessages.createdAt), desc(savMessages.id)).limit(1);
-  if (!review || !decision || latest?.id !== action.messageId) throw new Error("SAV_PROPOSAL_STALE");
+  const c = review?.reviewScope === "dossier" ? await loadSavDraftContext(action.messageId) : null;
+  if (!review || !decision || (c ? c.review?.id !== review.id : review.decisionId !== decision.id) || latest?.id !== action.messageId) throw new Error("SAV_PROPOSAL_STALE");
+  if(!["ticket_pending","human_review_required"].includes(savStructuredProposalSchema.parse(decryptSavPayload(review.afterCiphertext)).decision.kind))throw new Error("SAV_VALIDATED_CURRENT_PROPOSAL_REQUIRED");
   return review;
 }

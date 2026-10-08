@@ -5,7 +5,9 @@ import { activeKnowledge, knowledgeRevisions, savActions, savAgentRuns, savDecis
 import { activateSavV0Cutover } from "./cutover";
 import { decryptSavPayload, encryptSavPayload, savContentHash } from "./crypto";
 import { renderSavOutboundReply, SAV_REPLY_FORMAT_REVISION, savReplyFooter } from "./reply-format";
-import { saveSavReplyDraft } from "./drafts";
+import {v0Proposal} from "../../../test/sav-v0-review-fixture";
+import {loadSavDraftContext,reviewSavDraft} from "./draft-verdicts";
+import {savDraftVerdicts} from "@/db/schema";
 import { assertSavCurrentManualReply, queueSavManualReply } from "./manual-replies";
 import { processPendingGmailSendActions } from "./gmail";
 
@@ -49,13 +51,17 @@ beforeEach(async () => {
   const [thread] = await fixture.db.insert(savThreads).values({ mailboxId: mailbox.id, gmailThreadId: "original-thread", subject: "Ancien objet du fil", customerEmail: "fiction@example.invalid", hubspotTicketId: "123" }).returning();
   const [message] = await fixture.db.insert(savMessages).values({ mailboxId: mailbox.id, threadId: thread.id, gmailMessageId: "original-gmail-id", subject: "Mes factures", direction: "inbound", fromEmail: thread.customerEmail,
     bodyCiphertext: encryptSavPayload({ text: "Cas fictif", headers: { "message-id": "<original@example.invalid>", references: "<earlier@example.invalid>" } }), receivedAt: new Date("2026-10-02T12:01:00Z") }).returning();
-  const [run] = await fixture.db.insert(savAgentRuns).values({ messageId: message.id, runtime: "local_fixture", mode: "off", status: "succeeded", model: "fixture", promptRevision: "fixture", inputHash: "fixture", proposalCiphertext: encryptSavPayload({ knowledgeRevision: "not_consulted" }) }).returning();
+  const [run] = await fixture.db.insert(savAgentRuns).values({ messageId: message.id, runtime: "local_fixture", mode: "off", status: "succeeded", model: "fixture", promptRevision: "fixture", inputHash: "fixture", proposalCiphertext: encryptSavPayload(v0Proposal("Bonjour, quelle adresse email avez-vous utilisée pour votre inscription Limova ?")) }).returning();
   const [decision] = await fixture.db.insert(savDecisions).values({ messageId: message.id, agentRunId: run.id, kind: "human_review_required", reasonCode: "identity_unknown", explanation: "Demander le mail d’inscription", confidence: 800 }).returning();
   threadId = thread.id; messageId = message.id;
   input = { threadId, messageId, decisionId: decision.id, agentRunId: run.id, reviewId: null, knowledgeRevision: null, expectedDraftId: null, status: "draft", text: "Bonjour, quelle adresse email avez-vous utilisée pour votre inscription Limova ?" };
-  draftId = (await saveSavReplyDraft(input, "ugo@limova.ai")).id;
+  await acceptCurrent();
 });
 
+async function acceptCurrent() {
+ const c=await loadSavDraftContext(messageId); const [current]=await fixture.db.select().from(savDraftVerdicts).where(eq(savDraftVerdicts.isCurrent,true));
+ const verdict=await reviewSavDraft({threadId,messageId,decisionId:c.decision.id,agentRunId:c.run.id,sourceHash:c.sourceHash,expectedVerdictId:current?.id??null,status:"accepted",reason:""},"ugo@limova.ai");draftId=verdict.draftId!;
+}
 describe("V0 human-only reply in the original Gmail thread", () => {
   it("lets the human owner reply on a paused dossier without resuming the agent or adding automatic actions", async () => {
     await fixture.db.update(savThreads).set({ aiPaused: true, status: "human_requested" }).where(eq(savThreads.id, threadId));
@@ -94,6 +100,7 @@ describe("V0 human-only reply in the original Gmail thread", () => {
   });
   it("captures the English send rule from the current inbound, not the inherited subject", async () => {
     await fixture.db.update(savMessages).set({ bodyCiphertext: encryptSavPayload({ text: "Hello, I need help with my account.", headers: { "message-id": "<original@example.invalid>" } }) }).where(eq(savMessages.id, messageId));
+    await acceptCurrent();
     const action = await queueSavManualReply({ threadId, draftId }, "ugo@limova.ai");
     expect(decryptSavPayload<{ text: string }>(String(action.payload.outboundBodyCiphertext)).text).toBe(renderSavOutboundReply(input.text, "en"));
     expect(action.payload.replyFormatRevision).toBe(SAV_REPLY_FORMAT_REVISION);
@@ -138,6 +145,7 @@ describe("V0 human-only reply in the original Gmail thread", () => {
   });
   it("fails closed when RFC Message-ID is missing", async () => {
     await fixture.db.update(savMessages).set({ bodyCiphertext: encryptSavPayload({ text: "Missing headers" }) }).where(eq(savMessages.id, messageId));
+    await acceptCurrent();
     await expect(queueSavManualReply({ threadId, draftId }, "ugo@limova.ai")).rejects.toThrow("SAV_REPLY_MANUAL_THREAD_HEADERS_MISSING");
     expect(await fixture.db.select().from(savActions)).toHaveLength(0);
     expect(network).not.toHaveBeenCalled();
@@ -146,7 +154,7 @@ describe("V0 human-only reply in the original Gmail thread", () => {
     const action = await queueSavManualReply({ threadId, draftId }, "ugo@limova.ai");
     const [revision] = await fixture.db.insert(knowledgeRevisions).values({ id: crypto.randomUUID(), actorEmail: "ugo@limova.ai" }).returning();
     await fixture.db.insert(activeKnowledge).values({ revisionId: revision.id });
-    expect((await processPendingGmailSendActions(1, action.id)).processed[0]).toMatchObject({ status: "failed", errorCode: "SAV_REPLY_MANUAL_CONTEXT_CHANGED" });
+    expect((await processPendingGmailSendActions(1, action.id)).processed[0]).toMatchObject({ status: "failed", errorCode: "SAV_DRAFT_ACCEPTANCE_REQUIRED" });
     expect(network).not.toHaveBeenCalled();
   });
   it("checks Gmail for a new inbound even if the local database has not synced it", async () => {

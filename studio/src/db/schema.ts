@@ -650,6 +650,8 @@ export const savPilotItems = sav.table("pilot_items", {
 ]);
 
 export const savProposalReviews = sav.table("proposal_reviews", {
+  reviewScope: text("review_scope").notNull().default("legacy_global"),
+  dossierSourceHash: text("dossier_source_hash"),
   id: uuid("id").defaultRandom().primaryKey(),
   messageId: uuid("message_id").notNull().references(() => savMessages.id, { onDelete: "cascade" }),
   decisionId: uuid("decision_id").notNull().references(() => savDecisions.id, { onDelete: "restrict" }),
@@ -668,6 +670,7 @@ export const savProposalReviews = sav.table("proposal_reviews", {
 }, (table) => [uniqueIndex("sav_review_message_revision_idx").on(table.messageId, table.revision), uniqueIndex("sav_review_message_current_idx").on(table.messageId).where(sql`${table.isCurrent} = true`)]);
 
 export const savReplyDrafts = sav.table("reply_drafts", {
+  sourceHash: text("source_hash"),
   id: uuid("id").defaultRandom().primaryKey(),
   threadId: uuid("thread_id").notNull().references(() => savThreads.id, { onDelete: "cascade" }),
   messageId: uuid("message_id").notNull().references(() => savMessages.id, { onDelete: "cascade" }),
@@ -682,6 +685,47 @@ export const savReplyDrafts = sav.table("reply_drafts", {
   createdBy: text("created_by").notNull(),
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
 }, (table) => [uniqueIndex("sav_reply_draft_revision_idx").on(table.threadId, table.revision), uniqueIndex("sav_reply_draft_current_idx").on(table.threadId).where(sql`${table.isCurrent} = true`)]);
+
+export const savDraftVerdicts = sav.table("draft_verdicts", {
+  id:uuid("id").defaultRandom().primaryKey(),
+  threadId:uuid("thread_id").notNull().references(()=>savThreads.id,{onDelete:"cascade"}),
+  messageId:uuid("message_id").notNull().references(()=>savMessages.id,{onDelete:"cascade"}),
+  decisionId:uuid("decision_id").notNull().references(()=>savDecisions.id,{onDelete:"no action"}),
+  agentRunId:uuid("agent_run_id").notNull().references(()=>savAgentRuns.id,{onDelete:"no action"}),
+  draftId:uuid("draft_id").references(()=>savReplyDrafts.id,{onDelete:"set null"}),
+  sourceHash:text("source_hash").notNull(), status:text("status").notNull(),
+  snapshotCiphertext:text("snapshot_ciphertext").notNull(),reasonCiphertext:text("reason_ciphertext").notNull(),
+  isCurrent:boolean("is_current").notNull().default(true),
+  reviewedBy:text("reviewed_by").notNull(),reviewedAt:timestamp("reviewed_at",{withTimezone:true}).notNull().defaultNow(),
+},t=>[uniqueIndex("sav_draft_verdict_current_idx").on(t.messageId).where(sql`${t.isCurrent}=true`)]);
+
+export const savResolutionObservations = sav.table("resolution_observations", {
+  id:uuid("id").defaultRandom().primaryKey(),
+  threadId:uuid("thread_id").notNull().references(()=>savThreads.id,{onDelete:"cascade"}),
+  messageId:uuid("message_id").notNull().references(()=>savMessages.id,{onDelete:"cascade"}),
+  verdictId:uuid("verdict_id").notNull().unique().references(()=>savDraftVerdicts.id,{onDelete:"cascade"}),
+  hubspotTicketId:text("hubspot_ticket_id"),state:text("state").notNull().default("waiting_ticket"),
+  closedCatchupUntil:timestamp("closed_catchup_until",{withTimezone:true}), remoteUpdatedAt:timestamp("remote_updated_at",{withTimezone:true}), closed:boolean("closed").notNull().default(false),
+  cycle:integer("cycle").notNull().default(1),lastSyncAt:timestamp("last_sync_at",{withTimezone:true}),
+  nextSyncAt:timestamp("next_sync_at",{withTimezone:true}).notNull().defaultNow(),
+  leaseUntil:timestamp("lease_until",{withTimezone:true}),leaseToken:uuid("lease_token"),
+  sourceErrors:jsonb("source_errors").$type<string[]>().notNull().default([]),
+  createdAt:timestamp("created_at",{withTimezone:true}).notNull().defaultNow(),updatedAt:timestamp("updated_at",{withTimezone:true}).notNull().defaultNow(),
+},t=>[index("sav_observation_due_idx").on(t.nextSyncAt)]);
+
+export const savObservationCycles = sav.table("observation_cycles", {
+  id:uuid("id").defaultRandom().primaryKey(),observationId:uuid("observation_id").notNull().references(()=>savResolutionObservations.id,{onDelete:"cascade"}),
+  cycle:integer("cycle").notNull(),status:text("status").notNull(),summaryCiphertext:text("summary_ciphertext").notNull(),sourceHash:text("source_hash").notNull(),
+  candidateId:uuid("candidate_id"),qualification:text("qualification"),qualifiedBy:text("qualified_by"),qualifiedAt:timestamp("qualified_at",{withTimezone:true}),
+  closedAt:timestamp("closed_at",{withTimezone:true}),createdAt:timestamp("created_at",{withTimezone:true}).notNull().defaultNow(),updatedAt:timestamp("updated_at",{withTimezone:true}).notNull().defaultNow(),
+},t=>[uniqueIndex("sav_observation_cycle_idx").on(t.observationId,t.cycle)]);
+
+export const savObservationEvents = sav.table("observation_events", {
+ id:uuid("id").defaultRandom().primaryKey(),observationId:uuid("observation_id").notNull().references(()=>savResolutionObservations.id,{onDelete:"cascade"}),
+ sourceRef:text("source_ref").notNull(),contentHash:text("content_hash").notNull(),kind:text("kind").notNull(),
+ occurredAt:timestamp("occurred_at",{withTimezone:true}).notNull(),payloadCiphertext:text("payload_ciphertext").notNull(),
+ createdAt:timestamp("created_at",{withTimezone:true}).notNull().defaultNow(),
+},t=>[uniqueIndex("sav_observation_event_content_idx").on(t.observationId,t.sourceRef,t.contentHash)]);
 
 export const savReviewedReplayCases = sav.table("reviewed_replay_cases", {
   id: uuid("id").defaultRandom().primaryKey(),

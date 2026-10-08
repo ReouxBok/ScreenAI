@@ -29,7 +29,8 @@ import { reviewSavProposal } from "@/lib/sav/review";
 import { queueSavManualTicket } from "@/lib/sav/manual-tickets";
 import { retrySavAnalysis, repairSavProposal } from "@/lib/sav/service";
 import { collectSavDossierContext } from "@/lib/sav/dossier-context";
-import { saveSavReplyDraft } from "@/lib/sav/drafts";
+import { qualifySavObservation } from "@/lib/sav/observations";
+import { reviewSavDraft } from "@/lib/sav/draft-verdicts";
 import { assertSavManualReplyEnabled, queueSavManualReply } from "@/lib/sav/manual-replies";
 import { processPendingGmailSendActions } from "@/lib/sav/gmail";
 import { recordSavDeploymentDecision } from "@/lib/sav/metrics";
@@ -56,13 +57,28 @@ export async function runReviewedReplayAction() {
 }
 
 export async function saveReplyDraftAction(form: FormData) {
+  await requireApiStaff("admin");
+  redirect(`/studio/sav/${encodeURIComponent(id(form, "threadId"))}?review=SAV_DRAFT_READ_ONLY`);
+}
+
+export async function qualifyObservationAction(form:FormData) {
+  const staff=await requireApiStaff("admin");
+  const threadId=id(form,"threadId");let result="observation_qualified";
+  try { const evidence=JSON.parse(String(form.get("evidence")||"{}"));
+    await qualifySavObservation({observationId:id(form,"observationId"),cycleId:id(form,"cycleId"),sourceHash:id(form,"sourceHash"),outcome:String(form.get("outcome")),evidenceRef:evidence.sourceRef||"",evidenceHash:evidence.contentHash||"",resolution:String(form.get("resolution")||""),justification:String(form.get("justification")||""),customerConfirmationRef:String(form.get("customerConfirmationRef")||""),unconfirmedAcknowledged:form.get("unconfirmedAcknowledged")==="on"},staff.email);
+  } catch(error){result=error instanceof Error && /^[A-Z_]+$/.test(error.message)?error.message:"SAV_OBSERVATION_INVALID";}
+  revalidatePath(`/studio/sav/${threadId}`);revalidatePath("/studio/sav/resolutions");
+  redirect(`/studio/sav/${encodeURIComponent(threadId)}?review=${result}`);
+}
+
+export async function reviewDraftAction(form: FormData) {
   const staff = await requireApiStaff("admin");
   const threadId = id(form, "threadId");
-  let result = "draft_saved";
-  try { await saveSavReplyDraft({ threadId, messageId: id(form, "messageId"), decisionId: id(form, "decisionId"), agentRunId: id(form, "agentRunId"),
-    reviewId: String(form.get("reviewId") || "") || null, knowledgeRevision: String(form.get("knowledgeRevision") || "") || null,
-    expectedDraftId: String(form.get("draftId") || "") || null, status: String(form.get("status") || "draft"), text: String(form.get("replyDraft") || form.get("text") || "") }, staff.email); }
-  catch (error) { result = error instanceof Error && /^SAV_[A-Z_]+$/.test(error.message) ? error.message : "SAV_DRAFT_INVALID"; }
+  let result = "draft_reviewed";
+  try {
+    if (form.has("replyDraft") || form.has("text")) throw new Error("SAV_DRAFT_READ_ONLY");
+    await reviewSavDraft({ threadId, messageId: id(form,"messageId"), decisionId: id(form,"decisionId"), agentRunId: id(form,"agentRunId"), sourceHash: id(form,"sourceHash"), expectedVerdictId: String(form.get("verdictId") || "") || null, status: String(form.get("status")), reason: String(form.get("reason") || "") }, staff.email);
+  } catch (error) { result = error instanceof Error && /^SAV_[A-Z_]+$/.test(error.message) ? error.message : "SAV_DRAFT_INVALID"; }
   revalidatePath(`/studio/sav/${threadId}`);
   redirect(`/studio/sav/${encodeURIComponent(threadId)}?review=${result}`);
 }
@@ -73,10 +89,8 @@ export async function sendStudioReplyAction(form: FormData) {
   let result = "reply_queued";
   try {
     assertSavManualReplyEnabled();
-    const draft = await saveSavReplyDraft({ threadId, messageId: id(form, "messageId"), decisionId: id(form, "decisionId"), agentRunId: id(form, "agentRunId"),
-      reviewId: String(form.get("reviewId") || "") || null, knowledgeRevision: String(form.get("knowledgeRevision") || "") || null,
-      expectedDraftId: String(form.get("draftId") || "") || null, status: "draft", text: String(form.get("replyDraft") || "") }, staff.email);
-    const action = await queueSavManualReply({ threadId, draftId: draft.id }, staff.email);
+    if (form.has("replyDraft") || form.has("text")) throw new Error("SAV_DRAFT_READ_ONLY");
+    const action = await queueSavManualReply({ threadId, draftId: id(form,"draftId") }, staff.email);
     if (action.status === "succeeded") result = "reply_sent";
     else {
       const delivery = await processPendingGmailSendActions(1, action.id);
@@ -337,14 +351,15 @@ export async function reviewProposalAction(form: FormData) {
   const threadId = id(form, "threadId");
   let errorCode = "";
   try {
-    await reviewSavProposal({ messageId: id(form, "messageId"), decisionId: id(form, "decisionId"), agentRunId: id(form, "agentRunId"), expectedReviewId: String(form.get("reviewId") || "") || null,
+    if (form.has("replyDraft")) throw new Error("SAV_DRAFT_READ_ONLY");
+    await reviewSavProposal({ reviewScope: "dossier", messageId: id(form, "messageId"), decisionId: id(form, "decisionId"), agentRunId: id(form, "agentRunId"), expectedReviewId: String(form.get("reviewId") || "") || null,
       status: "approved", verdict: String(form.get("verdict")), comment: String(form.get("comment") || "Process corrigé relu et validé manuellement depuis le Studio."),
       dimensions: Object.fromEntries(["classification", "routing", "grounding", "tone", "escalation"].map((key) => [key, String(form.get(`dimension_${key}`))])),
       reusability: String(form.get("reusability")), reusableResolution: String(form.get("reusableResolution") || ""), justification: String(form.get("justification") || ""),
       correction: { category: String(form.get("category")), urgency: String(form.get("urgency")), decisionKind: String(form.get("decisionKind")), reasonCode: String(form.get("reasonCode")), explanation: String(form.get("explanation")), title: String(form.get("title")), description: String(form.get("description")), process: [
         ...Array.from({ length: Math.max(0, Math.min(30, Number(form.get("processCount")) || 0)) }, (_, index) => ({ kind: String(form.get(`processKind_${index}`)), label: String(form.get(`processLabel_${index}`)), sourceIds: JSON.parse(String(form.get(`processSources_${index}`))) })),
         ...String(form.get("additionalSteps") || "").split("\n").map((value) => value.trim()).filter(Boolean).map((label) => ({ kind: "product_step", label, sourceIds: [] })),
-      ], internalNote: String(form.get("internalNote") || ""), replyDraft: String(form.get("replyDraft") || ""), registrationEmail: String(form.get("registrationEmail") || "").trim().toLowerCase(), identityVerified: form.get("identityVerified") === "on" },
+      ], internalNote: String(form.get("internalNote") || ""), replyDraft: "", registrationEmail: String(form.get("registrationEmail") || "").trim().toLowerCase(), identityVerified: form.get("identityVerified") === "on" },
     }, staff.email);
   } catch (error) { errorCode = error instanceof Error && /^[A-Z][A-Z_]+$/.test(error.message) ? error.message : "SAV_REVIEW_INVALID"; }
   revalidatePath("/studio/sav");

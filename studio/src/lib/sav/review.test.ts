@@ -127,7 +127,7 @@ describe("SAV supervised reviews and manual tickets", () => {
     expect(review).toMatchObject({ agentRunId: runId, decisionId, verdict: "partial" });
     expect(review.afterCiphertext).not.toContain("corrigé");
     expect(decryptSavPayload(review.beforeCiphertext)).toEqual(proposal);
-    expect((await getSavProposalReview(messageId))?.proposal.replyDraft).toBe("Brouillon corrigé, à relire");
+    expect((await getSavProposalReview(messageId))?.proposal.replyDraft).toBe(proposal.replyDraft);
     expect(await fixture.db.select().from(savLearningCandidates)).toHaveLength(0);
     expect(await fixture.db.select().from(savActions)).toHaveLength(0);
     expect(await fixture.db.select().from(activeKnowledge)).toHaveLength(0);
