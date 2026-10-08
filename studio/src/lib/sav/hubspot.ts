@@ -7,6 +7,7 @@ import { requireDb } from "@/db";
 import {
   auditLogs,
   savActions,
+  savActorType,
   savDecisions,
   savLearningCandidates,
   savMessages,
@@ -309,7 +310,7 @@ async function finalizeSavV0TicketAction(action: typeof savActions.$inferSelect)
     const [current] = await tx.select().from(savThreads).where(eq(savThreads.id, thread.id));
     if (current?.hubspotTicketId && current.hubspotTicketId !== ticket.id) throw new Error("SAV_MANUAL_RECONCILIATION_REQUIRED");
     await tx.update(savThreads).set({ hubspotTicketId: ticket.id, updatedAt: new Date() }).where(eq(savThreads.id, thread.id));
-    await tx.update(savActions).set({ status: "succeeded", executedAt: new Date(), updatedAt: new Date(), payload: sql`${savActions.payload} || ${JSON.stringify({ hubspotTicketId: ticket.id })}::jsonb` }).where(eq(savActions.id, action.id));
+    await tx.update(savActions).set({ status: "succeeded", errorCode: null, executedAt: new Date(), updatedAt: new Date(), payload: sql`${savActions.payload} || ${JSON.stringify({ hubspotTicketId: ticket.id })}::jsonb` }).where(eq(savActions.id, action.id));
     await tx.insert(auditLogs).values({ actorEmail: action.actorEmail || "system", action: "sav_manual_ticket_completed", entityType: "sav_action", entityId: action.id, technicalMetadata: { ticketId: ticket.id, kind: action.kind, reviewId: review.id, messageId: latest.id } });
     // No reply, note, email log or status change is queued by this V0 action.
   });
@@ -723,15 +724,22 @@ export async function processPendingHubspotActions(limit = 20) {
   if (mode === "shadow" || process.env.SAV_WRITES_DISABLED === "true") return { skipped: "shadow_mode", processed: [] as Array<Record<string, unknown>> };
   const db = requireDb();
   const staleBefore = new Date(Date.now() - 15 * 60 * 1_000);
+  const releaseStage = savReleaseStage();
+  // Filter before LIMIT: forbidden proposals must not consume the worker's
+  // batch and starve explicit human commands. Use the same policy as the guard.
+  const eligibleKinds = (["create_ticket", "link_ticket", "log_email", "update_ticket_status"] as const).flatMap((kind) => {
+    const actors = savActorType.enumValues.filter((actor) => savModeAllowsWrite(mode, kind, actor, false, releaseStage));
+    return actors.length ? [and(eq(savActions.kind, kind), inArray(savActions.actorType, actors))!] : [];
+  });
   const candidates = await db.select().from(savActions)
     .where(and(
-      inArray(savActions.kind, ["create_ticket", "link_ticket", "log_email", "update_ticket_status"]),
+      or(...eligibleKinds) ?? sql`false`,
       isNull(savActions.pilotBatchId),
       or(eq(savActions.status, "pending"), and(eq(savActions.status, "running"), lt(savActions.updatedAt, staleBefore))),
       or(isNull(savActions.scheduledAt), lte(savActions.scheduledAt, new Date())),
     ))
     .orderBy(desc(savActions.priority), asc(savActions.createdAt)).limit(Math.min(100, Math.max(1, limit)));
-  const actions = candidates.filter((action) => savModeAllowsWrite(mode, action.kind, action.actorType, false, savReleaseStage()));
+  const actions = candidates.filter((action) => savModeAllowsWrite(savAutomationMode(), action.kind, action.actorType, false, savReleaseStage()));
   const processed = [];
   for (const action of actions) {
     const [claimed] = await db.update(savActions).set({ status: "running", scheduledAt: null, attemptCount: sql`${savActions.attemptCount} + 1`, updatedAt: new Date() }).where(and(
@@ -756,6 +764,14 @@ export async function processPendingHubspotActions(limit = 20) {
       await db.update(savActions).set({ status: failure.status, scheduledAt: failure.scheduledAt, errorCode, updatedAt: new Date() }).where(eq(savActions.id, claimed.id));
       processed.push({ actionId: claimed.id, status: failure.status, retryScheduledAt: failure.scheduledAt, errorCode });
     }
+    const result = processed.at(-1)!;
+    console.info("sav_hubspot_action_result", {
+      actionId: claimed.id, threadId: claimed.threadId, messageId: claimed.messageId,
+      decisionId: claimed.decisionId,
+      reviewId: typeof claimed.payload.savReviewId === "string" && /^[a-f0-9-]{36}$/i.test(claimed.payload.savReviewId) ? claimed.payload.savReviewId : null,
+      kind: claimed.kind, status: result.status,
+      errorCode: "errorCode" in result && typeof result.errorCode === "string" && /^[A-Z0-9_:.-]{1,160}$/.test(result.errorCode) ? result.errorCode : null,
+    });
   }
   return { processed };
 }
