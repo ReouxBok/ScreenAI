@@ -3,6 +3,8 @@
   "git": {
     "deploymentEnabled": {
       "codex/sav-v0": false,
+      "codex/sav-bug-20-generation": false,
+      "codex/sav-20-sdk-security": false,
       "codex/ugo": false,
       "codex/ugo/**": false
     }

@@ -33,3 +33,48 @@ describe("SAV inbox explicit open forms", () => {
     expect(html).toContain("Aucun email dans cette vue"); expect(dependencies.open).not.toHaveBeenCalled();
   });
 });
+
+async function renderInboxRow(overrides: Record<string, unknown>, view = "all") {
+  const [row] = await dependencies.inbox();
+  dependencies.inbox.mockResolvedValue([{ ...row, ...overrides }]);
+  const element = await SavV0Inbox({ searchParams: Promise.resolve({ view }) });
+  return renderToStaticMarkup(createElement(Fragment, null, element));
+}
+
+describe("SAV inbox human verdict and AI diagnostic", () => {
+  const reviewedCases = (["approved", "rejected"] as const).flatMap((status) =>
+    [false, true].flatMap((aiPaused) => ["all", "reviewed", "errors"].map((view) => ({ status, aiPaused, view }))));
+
+  it.each(reviewedCases)("keeps $status visible with an AI diagnostic in $view (paused=$aiPaused)", async ({ status, aiPaused, view }) => {
+    const html = await renderInboxRow({ reviewId: "review-current", reviewStatus: status,
+      analysisStatus: "done", analysisErrorCode: "SAV_AI_INVALID_JSON", aiPaused }, view);
+    expect(html).toContain(`<strong>${status === "approved" ? "Validée" : "Refusée"}</strong>`);
+    expect(html).toContain("Analyse IA dégradée");
+    expect(html).toContain("SAV_AI_INVALID_JSON");
+    expect(html).not.toContain("Revue humaine nécessaire");
+    expect(html).not.toContain("<strong>Analyse dégradée</strong>");
+    expect(dependencies.open).not.toHaveBeenCalled();
+  });
+
+  it.each([false, true])("requests a review for an unreviewed degradation (paused=%s)", async (aiPaused) => {
+    const html = await renderInboxRow({ analysisStatus: "done", analysisErrorCode: "SAV_AI_OUTPUT_TRUNCATED", aiPaused }, "errors");
+    expect(html).toContain("<strong>Analyse dégradée</strong>");
+    expect(html).toContain("Revue humaine nécessaire");
+    expect(html).toContain("SAV_AI_OUTPUT_TRUNCATED");
+    expect(dependencies.open).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    { reviewStatus: "approved", aiPaused: true, analysisStatus: "done", label: "Validée" },
+    { reviewStatus: "rejected", aiPaused: true, analysisStatus: "done", label: "Refusée" },
+    { reviewStatus: null, aiPaused: true, analysisStatus: "done", label: "Reprise humaine" },
+    { reviewStatus: null, aiPaused: false, analysisStatus: "done", label: "À relire" },
+    { reviewStatus: null, aiPaused: false, analysisStatus: "pending", label: "Analyse en attente" },
+  ])("keeps the normal $label state without an AI diagnostic", async ({ label, ...row }) => {
+    const html = await renderInboxRow({ ...row, reviewId: row.reviewStatus ? "review-current" : null });
+    expect(html).toContain(`<strong>${label}</strong>`);
+    expect(html).not.toContain("Analyse IA dégradée");
+    expect(html).not.toContain("Revue humaine nécessaire");
+    expect(dependencies.open).not.toHaveBeenCalled();
+  });
+});

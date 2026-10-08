@@ -55,6 +55,46 @@ beforeEach(async () => {
   const [decision] = await fixture.db.insert(savDecisions).values({ messageId, agentRunId: runId, kind: "ticket_pending", reasonCode: "fixture", explanation: "Demande fictive", confidence: 800 }).returning(); decisionId = decision.id;
 });
 describe("SAV supervised reviews and manual tickets", () => {
+  it.each(["approved", "rejected"])("keeps the current %s verdict alongside its AI degradation without external actions", async (status) => {
+    const network = vi.fn(() => { throw new Error("Unexpected network operation in isolated review"); });
+    vi.stubGlobal("fetch", network);
+    await fixture.db.update(savAgentRuns).set({ status: "fallback", errorCode: "SAV_AI_INVALID_JSON" }).where(eq(savAgentRuns.id, runId));
+    const review = await reviewSavProposal({ ...reviewInput(), status }, "ugo@limova.ai");
+    for (const view of ["all", "reviewed", "errors"]) {
+      expect(await listSavInbox(100, { view })).toMatchObject([{ messageId, decisionId,
+        reviewId: review.id, reviewStatus: status, analysisErrorCode: "SAV_AI_INVALID_JSON" }]);
+    }
+    expect(await listSavInbox(100, { view: "pending" })).toEqual([]);
+    expect(await fixture.db.select().from(savActions)).toHaveLength(0);
+    expect(network).not.toHaveBeenCalled();
+  });
+
+  it.each(["superseded_decision", "inactive_review"])("does not apply a past verdict to a proposal with %s", async (scenario) => {
+    const network = vi.fn(() => { throw new Error("Unexpected network operation in isolated review"); });
+    vi.stubGlobal("fetch", network);
+    const review = await reviewSavProposal(reviewInput(), "ugo@limova.ai");
+    let currentDecisionId = decisionId;
+    if (scenario === "superseded_decision") {
+      await fixture.db.update(savDecisions).set({ isCurrent: false }).where(eq(savDecisions.id, decisionId));
+      const [run] = await fixture.db.insert(savAgentRuns).values({ messageId, runtime: "legacy_gemini", mode: "off",
+        status: "fallback", errorCode: "SAV_AI_OUTPUT_TRUNCATED", model: "fixture", promptRevision: "fixture-v2",
+        inputHash: "fixture-v2", proposalCiphertext: encryptSavPayload(proposal), completedAt: new Date() }).returning();
+      const [decision] = await fixture.db.insert(savDecisions).values({ messageId, agentRunId: run.id,
+        kind: "human_review_required", reasonCode: "analysis_unverified", explanation: "Nouvelle proposition fictive à relire", confidence: 0 }).returning();
+      currentDecisionId = decision.id;
+    } else {
+      await fixture.db.update(savProposalReviews).set({ isCurrent: false }).where(eq(savProposalReviews.id, review.id));
+      await fixture.db.update(savAgentRuns).set({ status: "fallback", errorCode: "SAV_AI_OUTPUT_TRUNCATED" }).where(eq(savAgentRuns.id, runId));
+    }
+    expect(await listSavInbox(100, { view: "reviewed" })).toEqual([]);
+    for (const view of ["all", "pending", "errors"]) {
+      expect(await listSavInbox(100, { view })).toMatchObject([{ messageId, decisionId: currentDecisionId,
+        reviewId: null, reviewStatus: null, analysisErrorCode: "SAV_AI_OUTPUT_TRUNCATED" }]);
+    }
+    expect(await fixture.db.select().from(savActions)).toHaveLength(0);
+    expect(network).not.toHaveBeenCalled();
+  });
+
   it("allows correcting a critical proposal without upgrading the original verdict", async () => {
     const review = await reviewSavProposal({ ...reviewInput(), verdict: "critical" }, "ugo@limova.ai");
     expect((await getSavProposalReview(messageId))?.review).toMatchObject({ id: review.id, status: "approved", verdict: "critical" });

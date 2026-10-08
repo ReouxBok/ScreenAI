@@ -10,6 +10,8 @@ const validationCodes = new Set([
   "SAV_KNOWLEDGE_REVISION_CHANGED", "SAV_ADK_EMPTY_OUTPUT", "SAV_ADK_TIMEOUT",
   "SAV_TOOL_RATE_LIMITED", "SAV_TOOL_TIMEOUT", "SAV_AI_KEY_MISSING",
   "SAV_AI_INVALID_JSON", "SAV_AI_INVALID_SCHEMA", "SAV_AI_TIMEOUT",
+  "SAV_AI_INVALID_RESPONSE", "SAV_AI_OUTPUT_BLOCKED", "SAV_AI_OUTPUT_TRUNCATED",
+  "SAV_AI_OUTPUT_INCOMPLETE", "SAV_AI_EMPTY_OUTPUT", "SAV_CONTEXT_UNAVAILABLE",
 ]);
 
 export function savAnalysisErrorCode(error: unknown) {
@@ -26,3 +28,7 @@ export type SavAnalysisDiagnostic = {
   phase: "knowledge" | "generation";
   errorCode: string;
 };
+
+export function savPrimaryAnalysisDiagnostic(diagnostics: SavAnalysisDiagnostic[] = []) {
+  return diagnostics.find((item) => item.phase === "generation") ?? diagnostics[0];
+}

@@ -71,6 +71,7 @@
     "vitest": "^4.1.10"
   },
   "overrides": {
+    "@modelcontextprotocol/sdk": "1.31.0",
     "devalue": "5.9.3",
     "@workflow/core": {
       "nanoid": "5.1.16"
