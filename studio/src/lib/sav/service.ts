@@ -21,6 +21,7 @@ import {
 } from "@/db/schema";
 import { decryptSavPayload, encryptSavPayload, savContentHash } from "./crypto";
 import { analyzeSavMessage, type SavAnalysis } from "./intelligence";
+import { savPrimaryAnalysisDiagnostic } from "./analysis-errors";
 import { collectSavDossierContext, type SavDossierContext } from "./dossier-context";
 import { assertSavActor } from "./access";
 import type { SavProposalRouting } from "./proposal";
@@ -362,7 +363,7 @@ export async function processStoredSavMessage(messageId: string) {
       executedAt: new Date(),
     }).onConflictDoNothing();
     }
-    await db.update(savMessages).set({ analysisStatus: "done", analysisErrorCode: null }).where(eq(savMessages.id, message.id));
+    await db.update(savMessages).set({ analysisStatus: "done", analysisErrorCode: savPrimaryAnalysisDiagnostic(analysis.diagnostics)?.errorCode ?? null }).where(eq(savMessages.id, message.id));
     return decision;
   } catch (error) {
     const errorCode = safeErrorCode(error);
@@ -437,7 +438,7 @@ export async function processSavPilotItem(itemId: string) {
     }
     await db.update(savPilotItems).set({ status: "ready", decisionId: decision.id, agentRunId: analysis.agentRunId, updatedAt: new Date() })
       .where(eq(savPilotItems.id, claimed.id));
-    await db.update(savMessages).set({ analysisStatus: "done", analysisErrorCode: null }).where(eq(savMessages.id, message.id));
+    await db.update(savMessages).set({ analysisStatus: "done", analysisErrorCode: savPrimaryAnalysisDiagnostic(analysis.diagnostics)?.errorCode ?? null }).where(eq(savMessages.id, message.id));
     return { itemId: claimed.id, status: "ready" as const };
   } catch (error) {
     const errorCode = safeErrorCode(error);
@@ -634,12 +635,15 @@ export async function processPendingSavPilotItems(limit = 10) {
 
 export async function listSavInbox(limit = 100, options: { offset?: number; query?: string; view?: string } = {}) {
   const db = requireDb();
+  // Existing messages may have had their diagnostic cleared after a fallback.
+  // Read the run of the current decision, never a shadow run or an old attempt.
+  const analysisErrorCode = sql<string | null>`coalesce(${savMessages.analysisErrorCode}, case when ${savAgentRuns.status} in ('fallback', 'failed') then coalesce(${savAgentRuns.errorCode}, 'SAV_AI_GENERATION_FAILED') end)`;
   const technical = ["spam", "automatic_reply", "bounce", "internal_notification", "duplicate"] as const;
   const query = options.query?.trim().slice(0, 200).replace(/[\\%_]/g, "\\$&");
   const viewFilter = options.view === "technical" ? inArray(savDecisions.kind, technical)
     : options.view === "human" ? eq(savThreads.aiPaused, true)
     : options.view === "reviewed" ? isNotNull(savProposalReviews.id)
-    : options.view === "errors" ? or(isNotNull(savMessages.analysisErrorCode), eq(savMessages.analysisStatus, "failed"))
+    : options.view === "errors" ? or(isNotNull(analysisErrorCode), eq(savMessages.analysisStatus, "failed"))
     : options.view === "pending" ? and(isNull(savProposalReviews.id), eq(savMessages.analysisStatus, "done")) : undefined;
   return db.select({
     messageId: savMessages.id,
@@ -649,7 +653,7 @@ export async function listSavInbox(limit = 100, options: { offset?: number; quer
     subject: savMessages.subject,
     preview: savMessages.preview,
     analysisStatus: savMessages.analysisStatus,
-    analysisErrorCode: savMessages.analysisErrorCode,
+    analysisErrorCode,
     reviewStatus: savProposalReviews.status,
     reviewId: savProposalReviews.id,
     threadStatus: savThreads.status,
@@ -668,6 +672,7 @@ export async function listSavInbox(limit = 100, options: { offset?: number; quer
   }).from(savMessages)
     .innerJoin(savThreads, eq(savThreads.id, savMessages.threadId))
     .leftJoin(savDecisions, and(eq(savDecisions.messageId, savMessages.id), eq(savDecisions.isCurrent, true)))
+    .leftJoin(savAgentRuns, eq(savAgentRuns.id, savDecisions.agentRunId))
     .leftJoin(savPilotItems, eq(savPilotItems.messageId, savMessages.id))
     .leftJoin(savProposalReviews, and(eq(savProposalReviews.messageId, savMessages.id), eq(savProposalReviews.decisionId, savDecisions.id), eq(savProposalReviews.isCurrent, true)))
     .where(and(eq(savMessages.direction, "inbound"), savV0EligibleMessageFilter(), viewFilter,
@@ -726,6 +731,8 @@ export async function repairSavProposal(messageId: string, actorEmail: string) {
     await tx.insert(savDecisions).values({ messageId, agentRunId: analysis.agentRunId, kind: analysis.proposal.kind,
       reasonCode: analysis.proposal.reasonCode, explanation: analysis.proposal.explanation, confidence: analysis.proposal.confidence,
       evidence: analysis.evidence, model: analysis.model, actorType: "ai", supersedesDecisionId: current?.id });
+    await tx.update(savMessages).set({ analysisErrorCode: savPrimaryAnalysisDiagnostic(analysis.diagnostics)?.errorCode ?? null })
+      .where(eq(savMessages.id, messageId));
     // Cancel stale machine suggestions, without queueing any external action.
     await tx.update(savActions).set({ status: "cancelled", errorCode: "SAV_PROPOSAL_REPAIRED" })
       .where(and(eq(savActions.messageId, messageId), eq(savActions.actorType, "ai"), eq(savActions.status, "pending")));

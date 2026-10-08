@@ -18,15 +18,27 @@ export async function SavV0Inbox({ searchParams }: { searchParams: Promise<{ vie
     <nav className="sav-tabs" aria-label="Vues SAV">{[["all", "Tous les emails"], ["pending", "À valider"], ["reviewed", "Revues faites"], ["human", "Reprise humaine"], ["errors", "Erreurs"], ["technical", "Exclusions techniques"]].map(([key, label]) => <Link key={key} className={view === key ? "active" : ""} href={`/studio/sav?view=${key}`}>{label}</Link>)}<Link href="/studio/sav/connaissances">Connaissances</Link><Link href="/studio/sav/resolutions">Résolutions</Link><Link href="/studio/sav/pilote">Laboratoire</Link><Link href="/studio/sav/evaluation">Évaluation et décision</Link></nav>
     <form className="sav-search" method="get"><input type="hidden" name="view" value={view}/><label htmlFor="sav-q">Rechercher dans toute la file</label><div><input id="sav-q" name="q" defaultValue={q} maxLength={200} placeholder="Expéditeur, objet ou extrait…"/><button>Rechercher</button></div></form>
     <section className="decision-ledger" aria-label="Emails synchronisés"><header><span>Email</span><span>Qualification</span><span>État de la proposition</span></header>
-      {rows.slice(0, 50).map((row) => <form action={openSavEmailAction} key={row.messageId} className={styles.openForm}>
+      {rows.slice(0, 50).map((row) => {
+        const hasReview = row.reviewStatus === "approved" || row.reviewStatus === "rejected";
+        const proposalState = row.reviewStatus === "approved" ? "Validée"
+          : row.reviewStatus === "rejected" ? "Refusée"
+          : row.analysisErrorCode ? row.analysisStatus === "done" ? "Analyse dégradée" : "Erreur d’analyse"
+          : row.aiPaused ? "Reprise humaine"
+          : row.analysisStatus === "done" ? "À relire" : "Analyse en attente";
+        return <form action={openSavEmailAction} key={row.messageId} className={styles.openForm}>
         <input type="hidden" name="threadId" value={row.threadId}/><input type="hidden" name="messageId" value={row.messageId}/>
         <OpenEmailButton subject={row.subject}>
         <span className="ledger-rail" aria-hidden="true"><i className={row.reviewId ? "decided" : "missing"}/></span>
         <span className="ledger-mail"><small>{row.receivedAt.toLocaleString("fr-FR")}</small><strong>{row.subject}</strong><span>{row.fromEmail}</span><p>{row.preview}</p></span>
         <span className="ledger-decision"><strong>{row.decisionKind ? savLabel(savDecisionLabels, row.decisionKind) : "Analyse en attente"}</strong><p>{row.explanation}</p>{row.confidence !== null && <small>Confiance IA : {Math.round(row.confidence / 10)} %</small>}</span>
-        <span className={`ledger-action ${styles.state}`}><strong>{row.analysisErrorCode ? "Erreur d’analyse" : row.aiPaused ? "Reprise humaine" : row.reviewStatus === "approved" ? "Validée" : row.reviewStatus === "rejected" ? "Refusée" : row.analysisStatus === "done" ? "À relire" : "Analyse en attente"}</strong>{row.analysisErrorCode && <code>{row.analysisErrorCode}</code>}{row.hubspotTicketId && <small>HubSpot #{row.hubspotTicketId}</small>}</span>
+        <span className={`ledger-action ${styles.state}`}>
+          <strong>{proposalState}</strong>
+          {row.analysisErrorCode && <><small>{hasReview ? "Analyse IA dégradée" : "Revue humaine nécessaire"}</small><code>{row.analysisErrorCode}</code></>}
+          {row.hubspotTicketId && <small>HubSpot #{row.hubspotTicketId}</small>}
+        </span>
         </OpenEmailButton>
-      </form>)}
+      </form>;
+      })}
       {!rows.length && <div className="empty card">Aucun email dans cette vue. Les exclusions restent consultables séparément.</div>}
     </section>
     <nav className="sav-tabs" aria-label="Pagination">{currentPage > 1 && <Link href={href(currentPage - 1)}>← Page précédente</Link>}<span>Page {currentPage}</span>{rows.length > 50 && <Link href={href(currentPage + 1)}>Page suivante →</Link>}</nav>
