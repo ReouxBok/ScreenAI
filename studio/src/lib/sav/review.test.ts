@@ -7,7 +7,11 @@ import { decryptSavPayload, encryptSavPayload } from "./crypto";
 import { savStructuredProposalSchema } from "./proposal";
 import { getSavProposalReview, reviewSavProposal } from "./review";
 import { queueSavManualTicket } from "./manual-tickets";
-import { listSavInbox, retrySavAction } from "./service";
+import { getSavThreadDetail, listSavInbox, retrySavAction } from "./service";
+import { savModeAllowsWrite } from "./action-policy";
+import { createElement } from "react";
+import { renderToStaticMarkup } from "react-dom/server";
+import { ManualTicketStatus } from "@/app/studio/sav/[id]/manual-ticket-status";
 import { findSavContactCandidates, processPendingHubspotActions, reconcileSavManualTicket } from "./hubspot";
 import { extractSavIdentityHints, phoneMatchesHint } from "./identity";
 
@@ -43,8 +47,9 @@ function mockIntegrations(mode: "create" | "timeout" | "existing" | "unknown" | 
 }
 beforeAll(async () => { fixture = await createSavTestDb(); state.db = fixture.db; }, 30_000);
 afterAll(async () => { await fixture?.client.close(); });
-afterEach(() => { vi.unstubAllEnvs(); vi.unstubAllGlobals(); });
+afterEach(() => { vi.unstubAllEnvs(); vi.unstubAllGlobals(); vi.restoreAllMocks(); });
 beforeEach(async () => {
+  vi.spyOn(console, "info").mockImplementation(() => {});
   vi.stubEnv("SAV_RELEASE_STAGE", "v0"); vi.stubEnv("SAV_AUTOMATION_MODE", "assist"); vi.stubEnv("SAV_WRITES_DISABLED", "false"); vi.stubEnv("SAV_ENCRYPTION_KEY_V1", "test-only-sav-encryption-key-32-characters"); vi.stubEnv("HUBSPOT_ACCESS_TOKEN", "test-only");
   await fixture.client.exec("TRUNCATE sav.mailboxes CASCADE; TRUNCATE sav.sync_state; TRUNCATE active_knowledge; TRUNCATE audit_logs");
   const [mailbox] = await fixture.db.insert(savMailboxes).values({ email: "contact@limova.ai" }).returning();
@@ -163,6 +168,78 @@ describe("SAV supervised reviews and manual tickets", () => {
     expect(network.mock.calls.some(([url]) => /\/objects\/contacts$|\/send|\/objects\/emails/.test(url))).toBe(false);
     expect(JSON.parse(String(creations[0][1]?.body)).properties).toMatchObject({ content: proposal.ticket.description, hs_pipeline: "0", hs_pipeline_stage: "1" });
   });
+  it.each(["assist", "on"])("processes a human ticket behind a full batch of forbidden V0 proposals (%s)", async (mode) => {
+    const review = await reviewSavProposal(reviewInput(), "ugo@limova.ai");
+    const action = await queueSavManualTicket({ threadId, reviewId: review.id, kind: "create_ticket" }, "ugo@limova.ai");
+    await fixture.db.insert(savActions).values(Array.from({ length: 50 }, (_, index) => ({
+      threadId, messageId, decisionId, kind: "create_ticket" as const, actorType: "ai" as const,
+      priority: 100, idempotencyKey: `fixture:blocked:${index}`,
+    })));
+    vi.stubEnv("SAV_AUTOMATION_MODE", mode);
+    const network = mockIntegrations();
+    expect((await processPendingHubspotActions(50)).processed).toEqual([
+      { actionId: action.id, status: "succeeded", ticketId: "301" },
+    ]);
+    const blocked = (await fixture.db.select().from(savActions)).filter((item) => item.actorType === "ai");
+    expect(blocked.every((item) => item.status === "pending" && item.attemptCount === 0)).toBe(true);
+    expect(network.mock.calls.filter(([url, init]) => url.endsWith("/objects/tickets") && init?.method === "POST")).toHaveLength(1);
+  });
+  it.each((["v0", "v1", "v2", "v3", "v4"] as const).flatMap((stage) =>
+    (["shadow", "assist", "semi", "on"] as const).map((mode) => ({ stage, mode }))))("selects only the existing policy's eligible actions in $stage/$mode", async ({ stage, mode }) => {
+    vi.stubEnv("SAV_RELEASE_STAGE", stage); vi.stubEnv("SAV_AUTOMATION_MODE", mode);
+    const values = (["create_ticket", "link_ticket", "log_email", "update_ticket_status"] as const).flatMap((kind) =>
+      (["ai", "human", "system"] as const).map((actorType) => ({
+        threadId, kind, actorType, idempotencyKey: `fixture:policy:${kind}:${actorType}`,
+      })));
+    const actions = await fixture.db.insert(savActions).values(values).returning();
+    const network = vi.fn(() => { throw new Error("No provider calls allowed in eligibility test"); }); vi.stubGlobal("fetch", network);
+    const result = await processPendingHubspotActions(100);
+    const expected = actions.filter((action) => savModeAllowsWrite(mode, action.kind, action.actorType, false, stage));
+    expect(result.processed.map((action) => action.actionId).sort()).toEqual(expected.map((action) => action.id).sort());
+    const saved = await fixture.db.select().from(savActions);
+    for (const action of saved) expect(action.attemptCount).toBe(expected.some((item) => item.id === action.id) ? 1 : 0);
+    expect(network).not.toHaveBeenCalled();
+  });
+  it.each(["shadow", "disabled"])("keeps a queued human request pending without calls when %s", async (blocker) => {
+    const review = await reviewSavProposal(reviewInput(), "ugo@limova.ai");
+    const action = await queueSavManualTicket({ threadId, reviewId: review.id, kind: "create_ticket" }, "ugo@limova.ai");
+    if (blocker === "shadow") vi.stubEnv("SAV_AUTOMATION_MODE", "shadow");
+    else vi.stubEnv("SAV_WRITES_DISABLED", "true");
+    const network = vi.fn(); vi.stubGlobal("fetch", network);
+    expect((await processPendingHubspotActions()).processed).toEqual([]);
+    const detail = await getSavThreadDetail(threadId);
+    expect(detail?.actions.find((item) => item.id === action.id)).toMatchObject({ status: "pending", attemptCount: 0 });
+    const html = renderToStaticMarkup(createElement(ManualTicketStatus, { action: detail!.actions[0], writesDisabled: true }));
+    expect(html).toContain("Les écritures HubSpot sont désactivées");
+    expect(network).not.toHaveBeenCalled();
+  });
+  it("blocks a queued request after a new inbound and shows a recovery without writes", async () => {
+    const review = await reviewSavProposal(reviewInput(), "ugo@limova.ai");
+    await queueSavManualTicket({ threadId, reviewId: review.id, kind: "create_ticket" }, "ugo@limova.ai");
+    const [message] = await fixture.db.select().from(savMessages).where(eq(savMessages.id, messageId));
+    await fixture.db.insert(savMessages).values({ ...message, id: crypto.randomUUID(), gmailMessageId: "newer", receivedAt: new Date("2026-10-02T12:02:00Z") });
+    const network = vi.fn(); vi.stubGlobal("fetch", network);
+    expect((await processPendingHubspotActions()).processed[0]).toMatchObject({ status: "failed", errorCode: "SAV_PROPOSAL_STALE" });
+    const detail = await getSavThreadDetail(threadId);
+    expect(renderToStaticMarkup(createElement(ManualTicketStatus, { action: detail!.actions[0], writesDisabled: false }))).toContain("La proposition validée a changé");
+    expect(network).not.toHaveBeenCalled();
+  });
+  it("persists a confirmed ticket and logs only identifiers during concurrent worker claims", async () => {
+    const review = await reviewSavProposal(reviewInput(), "ugo@limova.ai");
+    const action = await queueSavManualTicket({ threadId, reviewId: review.id, kind: "create_ticket" }, "ugo@limova.ai");
+    const network = mockIntegrations();
+    const results = await Promise.all([processPendingHubspotActions(), processPendingHubspotActions()]);
+    expect(results.flatMap((item) => item.processed)).toHaveLength(1);
+    const detail = await getSavThreadDetail(threadId);
+    expect(detail?.thread.hubspotTicketId).toBe("301");
+    expect(detail?.actions[0]).toMatchObject({ status: "succeeded", errorCode: null, payload: { hubspotTicketId: "301" } });
+    expect(console.info).toHaveBeenCalledWith("sav_hubspot_action_result", {
+      actionId: action.id, threadId, messageId, decisionId, reviewId: review.id,
+      kind: "create_ticket", status: "succeeded", errorCode: null,
+    });
+    expect(JSON.stringify(vi.mocked(console.info).mock.calls)).not.toContain("client@example.com");
+    expect(network.mock.calls.filter(([url, init]) => url.endsWith("/objects/tickets") && init?.method === "POST")).toHaveLength(1);
+  });
   it("prevents a late duplicate and requires a separate explicit link", async () => {
     const review = await reviewSavProposal(reviewInput(), "ugo@limova.ai");
     await queueSavManualTicket({ threadId, reviewId: review.id, kind: "create_ticket" }, "ugo@limova.ai");
@@ -251,6 +328,7 @@ describe("SAV supervised reviews and manual tickets", () => {
     await processPendingHubspotActions();
     expect((await fixture.db.select().from(savThreads))[0].hubspotTicketId).toBe("301");
     expect((await fixture.db.select().from(savActions))[0].status).toBe("succeeded");
+    expect((await fixture.db.select().from(savActions))[0].errorCode).toBeNull();
     expect(await fixture.db.select().from(savActions)).toHaveLength(1);
   });
   it("separates technical exclusions and searches beyond the first page", async () => {
