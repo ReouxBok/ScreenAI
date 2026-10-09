@@ -1,6 +1,6 @@
 import "server-only";
 import { randomUUID } from "node:crypto";
-import { and, asc, desc, eq, isNull, lte, or } from "drizzle-orm";
+import { and, asc, desc, eq, isNotNull, isNull, lte, or } from "drizzle-orm";
 import { z } from "zod";
 import { requireDb } from "@/db";
 import { auditLogs, knowledgeFamilySources, knowledgeProjectionCandidates, savDraftVerdicts, savLearningCandidates, savResolutionEvidence, savMessages, savObservationCycles, savObservationEvents, savResolutionObservations, savThreads, savTicketSnapshots } from "@/db/schema";
@@ -194,7 +194,7 @@ export async function qualifySavObservation(raw: unknown, actorEmail: string) {
             const justification = publicKnowledgeText(input.justification);
             const contentHash = savContentHash({ sourceHash: cycle.sourceHash, proof, resolution, justification, customerConfirmationRef:input.customerConfirmationRef });
             const values = { threadId: observation.threadId, hubspotTicketId: observation.hubspotTicketId, sourceRef: `sav-observation:${cycle.id}`, sourceContentHash: contentHash, proposedPatch: { ciphertext: encryptSavPayload({ subject: publicKnowledgeText(summary.subject), finalHumanResolution: resolution, sourceSnapshotId: `observation:${cycle.id}`, sourceMessageId: input.evidenceRef, provenance: "human_resolution", customerConfirmed: Boolean(input.customerConfirmationRef), qualificationBy: actorEmail, qualificationJustification: justification, sourceHash: cycle.sourceHash }) }, explanation: justification, evidenceTicketIds: observation.hubspotTicketId ? [observation.hubspotTicketId] : [], createdBy: "human" as const };
-            const [previous] = await tx.select().from(savLearningCandidates).where(eq(savLearningCandidates.sourceRef, values.sourceRef)).orderBy(desc(savLearningCandidates.createdAt), desc(savLearningCandidates.id)).limit(250).then(rows => rows.filter(row => row.contentItemId));
+            const [previous] = await tx.select().from(savLearningCandidates).where(and(eq(savLearningCandidates.sourceRef, values.sourceRef), isNotNull(savLearningCandidates.contentItemId))).orderBy(desc(savLearningCandidates.createdAt), desc(savLearningCandidates.id)).limit(1);
             await tx.insert(savLearningCandidates).values({ ...values, contentItemId: previous?.contentItemId ?? null }).onConflictDoNothing();
             const [candidate] = await tx.select().from(savLearningCandidates).where(and(eq(savLearningCandidates.sourceRef, values.sourceRef), eq(savLearningCandidates.sourceContentHash, contentHash)));
             candidateId = candidate.id;

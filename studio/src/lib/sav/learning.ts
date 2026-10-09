@@ -100,8 +100,8 @@ export async function approveLearningCandidate(candidateId: string, actorEmail: 
   const [candidate] = await db.select().from(savLearningCandidates)
     .where(eq(savLearningCandidates.id, candidateId)).for("update");
   if (!candidate) throw new Error("SAV_LEARNING_CANDIDATE_NOT_PENDING");
-  const patch = candidatePatch(candidate);
   if(candidate.sourceRef.startsWith("sav-observation:")) {
+    const patch = candidatePatch(candidate);
     const [cycle]=await db.select().from(savObservationCycles).where(eq(savObservationCycles.id,candidate.sourceRef.slice("sav-observation:".length)));
     const [observation]=cycle?await db.select().from(savResolutionObservations).where(eq(savResolutionObservations.id,cycle.observationId)).for("update"):[];
     if (observation?.leaseUntil && observation.leaseUntil > new Date()) throw new Error("SAV_OBSERVATION_SYNC_IN_PROGRESS");
@@ -116,6 +116,7 @@ export async function approveLearningCandidate(candidateId: string, actorEmail: 
     return { item, version };
   }
   if (candidate.status !== "pending") throw new Error("SAV_LEARNING_CANDIDATE_NOT_PENDING");
+  const patch = candidatePatch(candidate);
   const sourceLabel = candidate.hubspotTicketId ? `ticket HubSpot ${candidate.hubspotTicketId}` : `dossier SAV ${candidate.threadId ?? candidate.sourceRef}`;
   const subject = plainText(patch.subject) || `Résolution du ${sourceLabel}`;
   const resolution = plainText(patch.finalHumanResolution);
@@ -140,7 +141,7 @@ export async function approveLearningCandidate(candidateId: string, actorEmail: 
       visibility: current.item.visibility,
       agentKey: "sav",
       ownerEmail: current.item.ownerEmail,
-      bodyMarkdown: `${current.version.bodyMarkdown.trim()}\n\n## Correction issue du ${sourceLabel}\n\n${resolution}`,
+      bodyMarkdown: candidate.sourceRef.startsWith("sav-observation:") ? `## Problème observé\n\n${subject}\n\n## Solution confirmée par l’équipe\n\n${resolution}\n\n## Escalade\n\n${metadata.resolution?.escalation ?? "Transférer à un humain si la situation diffère de ce cas."}` : `${current.version.bodyMarkdown.trim()}\n\n## Correction issue du ${sourceLabel}\n\n${resolution}`,
       changeNote: `Apprentissage après intervention humaine sur le ${sourceLabel}`,
       metadata: {
         ...metadata,

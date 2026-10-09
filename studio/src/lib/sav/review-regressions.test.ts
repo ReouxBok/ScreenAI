@@ -73,6 +73,7 @@ it("F2 approves a corrected candidate after an earlier candidate for this cycle 
  const corrected=await approveLearningCandidate(second.candidateId!,"ugo@limova.ai");
  expect(corrected.item.id).toBe(initial.item.id);expect(corrected.version.id).not.toBe(initial.version.id);
  expect(corrected.version.version).toBe(initial.version.version+1);
+ expect(corrected.version.bodyMarkdown).toContain("Ouvrez Paramètres puis corrigez le compte");expect(corrected.version.bodyMarkdown).not.toContain("Ouvrez Facturation puis téléchargez");
  expect((await f.db.select().from(contentVersions).where(eq(contentVersions.id,initial.version.id)))[0].bodyMarkdown).toBe(initial.version.bodyMarkdown);
  expect((await approveLearningCandidate(second.candidateId!,"ugo@limova.ai")).version.id).toBe(corrected.version.id);
 });
