@@ -66,6 +66,7 @@ function isLimovaUrl(value) {
 let sessionState = {
   conversationHistory: [],
   remoteSessionId: null,
+  resetContext: false,
   onboardingDocs: null,
   onboardingPlan: null,
   isActive: false,
@@ -76,6 +77,7 @@ let sessionState = {
 
 let urlChangeTimeout = null;
 let activeAbortController = null;
+let sessionGeneration = 0;
 let proxyAccessToken = null;
 let proxyAccessTokenExpiresAt = 0;
 let pageContextVersion = 0;
@@ -112,7 +114,7 @@ let lastSyncedProfileHash = '';
 const SESSION_STORAGE_KEY = 'limova_session';
 
 // Keys to persist (exclude transient/non-serializable state)
-const PERSISTED_KEYS = ['conversationHistory', 'remoteSessionId', 'onboardingPlan', 'isActive', 'lastUrl', 'lockedTabId'];
+const PERSISTED_KEYS = ['conversationHistory', 'remoteSessionId', 'resetContext', 'onboardingPlan', 'isActive', 'lastUrl', 'lockedTabId'];
 
 async function saveSession() {
   const data = {};
@@ -340,6 +342,7 @@ async function finalizeExternalPopupFlow(flow) {
 }
 
 async function handleUrlChange(tabId, url, { force = false } = {}) {
+  const generation = sessionGeneration;
   if (trainingState.active) {
     await sendContentMessage(tabId, { type: 'TRAINING_STATE', active: true }).catch(() => {});
     const context = await getPageContext(tabId).catch(() => '');
@@ -348,6 +351,7 @@ async function handleUrlChange(tabId, url, { force = false } = {}) {
   }
   if (!sessionState.isActive) return;
   if (!(await hasAIProcessingConsent())) return;
+  if (generation !== sessionGeneration) return;
   url = privacySafeUrl(url);
   if (!force && url === sessionState.lastUrl) return;
   sessionState.lastUrl = url;
@@ -366,7 +370,9 @@ async function handleUrlChange(tabId, url, { force = false } = {}) {
 
   try {
     const pageContext = await getPageContext(tabId);
+    if (generation !== sessionGeneration) return;
     const pageAnalysis = await capturePageAnalysis(tabId);
+    if (generation !== sessionGeneration) return;
     if (voiceSessionActive) {
       broadcastToSidebar({
         type: 'VOICE_PAGE_CONTEXT',
@@ -389,9 +395,11 @@ async function handleUrlChange(tabId, url, { force = false } = {}) {
       url,
       pageContext,
       consoleLogs,
-      trigger: 'url_change'
+      trigger: 'url_change',
+      _sessionGeneration: generation
     });
   } catch (error) {
+    if (generation !== sessionGeneration) return;
     Logger.error('background', 'URL change handling failed', error);
     broadcastToSidebar({ type: 'ERROR', content: `Erreur d'analyse : ${error.message}` });
   }
@@ -1189,14 +1197,17 @@ function rememberUserTurn(text, source = 'text') {
 }
 
 async function handleUserMessage(text) {
+  const generation = sessionGeneration;
   text = String(text || '').trim().slice(0, 8_000);
   if (!text) return { ok: false, error: 'Message vide.' };
   rememberUserTurn(text, 'text');
   if (!(await hasAIProcessingConsent())) {
+    if (generation !== sessionGeneration) return { ok: true };
     broadcastToSidebar({ type: 'CONSENT_REQUIRED' });
     return { ok: false, consentRequired: true };
   }
   const tab = await getActiveLimovaTab();
+  if (generation !== sessionGeneration) return { ok: true };
   if (tab && !sessionState.lockedTabId) lockTab(tab.id);
   const operationId = Logger.createOperationId('chat');
 
@@ -1214,8 +1225,10 @@ async function handleUserMessage(text) {
     // Initialize onboarding inside the guarded request flow so an expired
     // Limova session produces the same actionable error as every AI request.
     const { limova_onboarding_dismissed } = await chrome.storage.local.get('limova_onboarding_dismissed');
+    if (generation !== sessionGeneration) return { ok: true };
     if (!sessionState.onboardingPlan && sessionState.conversationHistory.length === 0 && !limova_onboarding_dismissed) {
       const publishedTemplate = await getPublishedOnboardingTemplate();
+      if (generation !== sessionGeneration) return { ok: true };
       sessionState.onboardingPlan = createOnboardingPlan(publishedTemplate);
       const current = sessionState.onboardingPlan.steps[0];
       broadcastToSidebar({ type: 'STEP_UPDATE', step: current.name, progress: `1 / ${sessionState.onboardingPlan.steps.length}` });
@@ -1223,6 +1236,7 @@ async function handleUserMessage(text) {
       scheduleSave();
     }
     const copilot = await getCopilotBootstrap(false).catch(() => null);
+    if (generation !== sessionGeneration) return { ok: true };
     if (copilot?.sessionId && !sessionState.remoteSessionId) {
       sessionState.remoteSessionId = copilot.sessionId;
       scheduleSave();
@@ -1233,8 +1247,10 @@ async function handleUserMessage(text) {
 
     if (tab) {
       pageContext = await getPageContext(tab.id);
+      if (generation !== sessionGeneration) return { ok: true };
       if (!copilot?.serverOrchestration) {
         pageAnalysis = await capturePageAnalysis(tab.id, operationId);
+        if (generation !== sessionGeneration) return { ok: true };
         consoleLogs = await getConsoleLogs(tab.id);
       }
     }
@@ -1244,7 +1260,8 @@ async function handleUserMessage(text) {
         tab,
         userMessage: text,
         pageContext,
-        operationId
+        operationId,
+        _sessionGeneration: generation
       });
       return { ok: true };
     }
@@ -1256,9 +1273,11 @@ async function handleUserMessage(text) {
       pageContext,
       consoleLogs,
       trigger: sessionState.conversationHistory.length === 0 ? 'doc_load' : 'user_message',
-      operationId
+      operationId,
+      _sessionGeneration: generation
     });
   } catch (error) {
+    if (generation !== sessionGeneration) return { ok: true };
     const code = errorCodeOf(error);
     Logger.error('background', 'User message handling failed', error, code, operationId);
     broadcastToSidebar({ type: 'ERROR', content: `Erreur : ${error.message}`, code });
@@ -1272,11 +1291,13 @@ async function handleUserMessage(text) {
 // ============================================================================
 
 async function handleTakeScreenshot() {
+  const generation = sessionGeneration;
   if (!(await hasAIProcessingConsent())) {
     broadcastToSidebar({ type: 'CONSENT_REQUIRED' });
     return { ok: false, consentRequired: true };
   }
   const tab = await getActiveLimovaTab();
+  if (generation !== sessionGeneration) return { ok: true };
   if (!tab) {
     broadcastToSidebar({ type: 'ERROR', content: 'Ouvre new.limova.ai pour analyser une page.' });
     return { ok: false };
@@ -1291,6 +1312,7 @@ async function handleTakeScreenshot() {
   if (voiceSessionActive) {
     try {
       const fresh = await getFreshVoiceContext(operationId, { capture: true });
+      if (generation !== sessionGeneration) return { ok: true };
       broadcastToSidebar({
         type: 'VOICE_PAGE_CONTEXT',
         pageContext: fresh.pageContext,
@@ -1306,6 +1328,7 @@ async function handleTakeScreenshot() {
       }, operationId);
       return { ok: true, voiceSessionActive: true };
     } catch (error) {
+      if (generation !== sessionGeneration) return { ok: true };
       Logger.warn('voice', 'Manual voice context refresh failed', {
         code: errorCodeOf(error, 'VOICE_CONTEXT_REFRESH_FAILED')
       }, 'VOICE_CONTEXT_REFRESH_FAILED', operationId);
@@ -1318,7 +1341,9 @@ async function handleTakeScreenshot() {
 
   try {
     const pageContext = await getPageContext(tab.id);
+    if (generation !== sessionGeneration) return { ok: true };
     const pageAnalysis = await capturePageAnalysis(tab.id, operationId);
+    if (generation !== sessionGeneration) return { ok: true };
     const consoleLogs = await getConsoleLogs(tab.id);
 
     await sendToGemini({
@@ -1327,9 +1352,11 @@ async function handleTakeScreenshot() {
       pageContext,
       consoleLogs,
       trigger: 'page_analysis_button',
-      operationId
+      operationId,
+      _sessionGeneration: generation
     });
   } catch (error) {
+    if (generation !== sessionGeneration) return { ok: true };
     const code = errorCodeOf(error, 'PAGE_ANALYSIS_FAILED');
     Logger.error('background', 'Page analysis failed', error, code, operationId);
     broadcastToSidebar({ type: 'ERROR', content: `Erreur d’analyse : ${error.message}`, code });
@@ -1339,11 +1366,13 @@ async function handleTakeScreenshot() {
 }
 
 async function handleNextStep() {
+  const generation = sessionGeneration;
   if (!(await hasAIProcessingConsent())) {
     broadcastToSidebar({ type: 'CONSENT_REQUIRED' });
     return { ok: false, consentRequired: true };
   }
   const tab = await getActiveLimovaTab();
+  if (generation !== sessionGeneration) return { ok: true };
   if (!tab) return { ok: false };
 
   const operationId = Logger.createOperationId('next-step');
@@ -1352,7 +1381,9 @@ async function handleNextStep() {
 
   try {
     const pageContext = await getPageContext(tab.id);
+    if (generation !== sessionGeneration) return { ok: true };
     const pageAnalysis = await capturePageAnalysis(tab.id, operationId);
+    if (generation !== sessionGeneration) return { ok: true };
     const consoleLogs = await getConsoleLogs(tab.id);
 
     await sendToGemini({
@@ -1362,9 +1393,11 @@ async function handleNextStep() {
       pageContext,
       consoleLogs,
       trigger: 'user_message',
-      operationId
+      operationId,
+      _sessionGeneration: generation
     });
   } catch (error) {
+    if (generation !== sessionGeneration) return { ok: true };
     const code = errorCodeOf(error, 'NEXT_STEP_FAILED');
     Logger.error('background', 'Next step failed', error, code, operationId);
     broadcastToSidebar({ type: 'ERROR', content: error.message, code });
@@ -1377,6 +1410,7 @@ async function handleNextStep() {
 // ============================================================================
 
 async function handleModalDetected(sender, modal = {}) {
+  const generation = sessionGeneration;
   const tabId = sender?.tab?.id || sessionState.lockedTabId;
   if (!tabId) return { ok: false };
 
@@ -1395,6 +1429,7 @@ async function handleModalDetected(sender, modal = {}) {
   }
   if (!sessionState.isActive) return { ok: true };
   if (!(await hasAIProcessingConsent())) return { ok: false };
+  if (generation !== sessionGeneration) return { ok: true };
 
   const now = Date.now();
   if (now - sessionState.lastAnalysisTime < MIN_API_INTERVAL) return { ok: false };
@@ -1407,7 +1442,9 @@ async function handleModalDetected(sender, modal = {}) {
 
   try {
     const pageContext = await getPageContext(tabId);
+    if (generation !== sessionGeneration) return { ok: true };
     const pageAnalysis = await capturePageAnalysis(tabId, operationId);
+    if (generation !== sessionGeneration) return { ok: true };
 
     if (voiceSessionActive) {
       broadcastToSidebar({
@@ -1430,9 +1467,11 @@ async function handleModalDetected(sender, modal = {}) {
       url: sessionState.lastUrl || '',
       pageContext,
       trigger: 'modal_detected',
-      operationId
+      operationId,
+      _sessionGeneration: generation
     });
   } catch (error) {
+    if (generation !== sessionGeneration) return { ok: true };
     Logger.error('background', 'Modal detection handling failed', error, errorCodeOf(error, 'MODAL_ANALYSIS_FAILED'), operationId);
   }
 
@@ -1447,9 +1486,11 @@ function copilotLocale() {
   return currentLang === 'es' ? 'es-ES' : currentLang === 'en' ? 'en-US' : 'fr-FR';
 }
 
-async function ensureRemoteCopilotSession() {
+async function ensureRemoteCopilotSession(generation = sessionGeneration, signal) {
+  if (generation !== sessionGeneration) return null;
   if (sessionState.remoteSessionId) return sessionState.remoteSessionId;
-  const bootstrap = await getCopilotBootstrap(true);
+  const bootstrap = sessionState.resetContext ? null : await getCopilotBootstrap(true);
+  if (generation !== sessionGeneration) return null;
   if (bootstrap?.sessionId) {
     sessionState.remoteSessionId = bootstrap.sessionId;
     scheduleSave();
@@ -1458,9 +1499,11 @@ async function ensureRemoteCopilotSession() {
   const response = await authorizedProxyFetch('/api/copilot/v2/sessions', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: '{}'
+    body: JSON.stringify(sessionState.resetContext ? { closePrevious: true } : {}),
+    signal
   });
   const data = await response.json().catch(() => ({}));
+  if (generation !== sessionGeneration) return null;
   if (!response.ok || !data.sessionId) throw codedError('COPILOT_SESSION_FAILED', data.error || 'Impossible d’ouvrir la session Charly.');
   sessionState.remoteSessionId = data.sessionId;
   scheduleSave();
@@ -1558,17 +1601,22 @@ async function executeCopilotTool(call, userMessage, operationId) {
   };
 }
 
-async function sendToCopilotV2({ tab, userMessage, pageContext, operationId }) {
+async function sendToCopilotV2({ tab, userMessage, pageContext, operationId, _sessionGeneration: generation = sessionGeneration }) {
+  if (generation !== sessionGeneration) return;
   if (activeAbortController) activeAbortController.abort();
-  activeAbortController = new AbortController();
-  const sessionId = await ensureRemoteCopilotSession();
+  const controller = new AbortController();
+  activeAbortController = controller;
+  const sessionId = await ensureRemoteCopilotSession(generation, controller.signal);
+  if (generation !== sessionGeneration) return;
   const idempotencyKey = `${operationId || 'text'}:${userTurnSequence}`;
   const page = await currentCopilotPage(tab, pageContext);
+  if (generation !== sessionGeneration) return;
   let response = await authorizedProxyFetch('/api/copilot/v2/turn', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
       sessionId,
+      ...(sessionState.resetContext ? { resetContext: true } : {}),
       message: userMessage,
       source: 'text',
       locale: copilotLocale(),
@@ -1586,13 +1634,15 @@ async function sendToCopilotV2({ tab, userMessage, pageContext, operationId }) {
         }
       } : {})
     }),
-    signal: activeAbortController?.signal
+    signal: controller.signal
   });
+  if (generation !== sessionGeneration) return;
   if ([404, 409, 503].includes(response.status)) {
     copilotBootstrapCache = null;
     copilotBootstrapCacheExpiresAt = 0;
     Logger.warn('copilot', 'ADK unavailable; legacy text fallback used', { status: response.status }, 'ADK_FALLBACK', operationId);
     const fallbackCapture = tab?.id ? await capturePageAnalysis(tab.id, operationId) : null;
+    if (generation !== sessionGeneration) return;
     const consoleLogs = tab?.id ? await getConsoleLogs(tab.id) : '';
     return sendToGemini({
       pageAnalysis: fallbackCapture,
@@ -1602,16 +1652,19 @@ async function sendToCopilotV2({ tab, userMessage, pageContext, operationId }) {
       consoleLogs,
       trigger: sessionState.conversationHistory.length === 0 ? 'doc_load' : 'user_message',
       operationId,
-      _suppressMemoryTurn: true
+      _suppressMemoryTurn: true,
+      _sessionGeneration: generation
     });
   }
   let data = await response.json().catch(() => ({}));
+  if (generation !== sessionGeneration) return;
   if (!response.ok) throw codedError('COPILOT_ADK_FAILED', data.error || 'Charly est temporairement indisponible.');
   let actionCount = 0;
   while (data.type === 'tool_call') {
     actionCount += 1;
     if (actionCount > 6) throw codedError('COPILOT_ACTION_LIMIT', 'Charly s’est arrêtée pour éviter une boucle d’actions.');
     const result = await executeCopilotTool(data.call, userMessage, operationId);
+    if (generation !== sessionGeneration) return;
     if (evaluationState.active) await recordEvaluationEvent({
       kind: 'tool_result',
       toolName: data.call?.name,
@@ -1620,18 +1673,21 @@ async function sendToCopilotV2({ tab, userMessage, pageContext, operationId }) {
       targetLabel: data.call?.args?.targetLabel,
       contextVersion: result.contextVersion
     });
+    if (generation !== sessionGeneration) return;
     response = await authorizedProxyFetch(`/api/copilot/v2/runs/${encodeURIComponent(data.runId)}/result`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(result),
-      signal: activeAbortController?.signal
+      signal: controller.signal
     });
     data = await response.json().catch(() => ({}));
+    if (generation !== sessionGeneration) return;
     if (!response.ok) throw codedError(response.status === 410 ? 'COPILOT_RUN_EXPIRED' : 'COPILOT_RUN_FAILED', data.error || 'L’action de Charly a expiré. Réessaie.');
   }
   if (data.type !== 'message' || typeof data.content !== 'string') throw codedError('COPILOT_INVALID_RESPONSE', 'Réponse Charly invalide.');
   const content = data.content.trim();
   if (evaluationState.active) await recordEvaluationEvent({ kind: 'response', status: 'ok', contextVersion: page.contextVersion });
+  if (generation !== sessionGeneration) return;
   sessionState.conversationHistory.push({ role: 'user', content: userMessage });
   sessionState.conversationHistory.push({ role: 'assistant', content });
   if (sessionState.conversationHistory.length > CONVERSATION_HISTORY_MAX_MESSAGES) {
@@ -1657,8 +1713,11 @@ async function sendToGemini({
   _retryCount = 0,
   _contextVersion = pageContextVersion,
   _elementSnapshot = new Map(lastPageElements),
-  _suppressMemoryTurn = false
+  _suppressMemoryTurn = false,
+  _sessionGeneration: generation = sessionGeneration
 }) {
+  // A turn keeps the generation from its entry point, including fallbacks and retries.
+  if (generation !== sessionGeneration) return;
   url = privacySafeUrl(url);
   const now = Date.now();
   if (now - sessionState.lastAnalysisTime < MIN_API_INTERVAL) {
@@ -1669,7 +1728,8 @@ async function sendToGemini({
   sessionState.lastAnalysisTime = now;
 
   if (activeAbortController) activeAbortController.abort();
-  activeAbortController = new AbortController();
+  const controller = new AbortController();
+  activeAbortController = controller;
 
   // API keys are stored on the proxy server, not in the extension
 
@@ -1695,6 +1755,7 @@ async function sendToGemini({
         '## Articles de la base de connaissances Limova\n\n' + kbResults;
     }
   }
+  if (generation !== sessionGeneration) return;
 
   const systemPrompt = buildSystemPrompt({
     onboardingDocs: kbContext || null,
@@ -1761,6 +1822,7 @@ async function sendToGemini({
       body: JSON.stringify({
         systemInstruction: { parts: [{ text: systemPrompt }] },
         contents,
+        ...(sessionState.resetContext ? { resetContext: true } : {}),
         ...(userMessage && !_suppressMemoryTurn ? {
           memoryTurn: {
             user: userMessage,
@@ -1769,8 +1831,9 @@ async function sendToGemini({
           }
         } : {})
       }),
-      signal: activeAbortController.signal
+      signal: controller.signal
     });
+    if (generation !== sessionGeneration) return;
 
     if (!response.ok) {
       // Retry on 429 (rate limit) or 503 (high demand) — up to 2 retries
@@ -1779,6 +1842,7 @@ async function sendToGemini({
         Logger.log('background', `Gemini ${response.status}, retry ${_retryCount + 1}/2 in ${delay}ms`);
         broadcastToSidebar({ type: 'STATUS_UPDATE', status: 'analyzing', text: 'Charly réfléchit...' });
         await new Promise(r => setTimeout(r, delay));
+        if (generation !== sessionGeneration) return;
         return sendToGemini({
           pageAnalysis,
           url,
@@ -1789,7 +1853,9 @@ async function sendToGemini({
           operationId,
           _retryCount: _retryCount + 1,
           _contextVersion,
-          _elementSnapshot
+          _elementSnapshot,
+          _suppressMemoryTurn,
+          _sessionGeneration: generation
         });
       }
       let errorMessage = response.status === 429
@@ -1809,6 +1875,7 @@ async function sendToGemini({
     }
 
     const json = await response.json();
+    if (generation !== sessionGeneration) return;
 
     // A voice session may have started while the legacy request was already
     // returning. Do not let that stale response speak, mutate history or click
@@ -1846,6 +1913,7 @@ async function sendToGemini({
       }
       Logger.log('background', `Loading screen detected, retry ${retryCount}/3 in 2s`);
       setTimeout(() => {
+        if (generation !== sessionGeneration) return;
         if (sessionState.lockedTabId) handleUrlChange(sessionState.lockedTabId, url, { force: true });
       }, 2000);
       return;
@@ -1922,6 +1990,7 @@ async function sendToGemini({
       Logger.log('background', `Highlight: ${resolvedHighlights.map(command => command.id).join(', ') || 'none'}`);
       resolvedHighlights.forEach((command, i) => {
         setTimeout(() => {
+          if (generation !== sessionGeneration) return;
           sendContentMessage(sessionState.lockedTabId, {
             type: 'HIGHLIGHT_ELEMENT',
             id: command.id,
@@ -1932,11 +2001,13 @@ async function sendToGemini({
     }
 
     for (const elementId of actionCommands) {
+      if (generation !== sessionGeneration) return;
       const command = resolveElementCommand(elementId, _contextVersion, _elementSnapshot, 'action');
       if (command) await proposeOrExecuteAction(command.id, userMessage || lastUserMessage);
     }
 
   } catch (error) {
+    if (generation !== sessionGeneration) return;
     if (error.name === 'AbortError') {
       Logger.log('background', 'API call aborted (superseded)');
       broadcastToSidebar({ type: 'STATUS_UPDATE', status: 'ready' });
@@ -2768,9 +2839,15 @@ async function getPageTechnicalDiagnostics(tabId, since = 0) {
 // API keys are managed server-side on the proxy — no local key storage needed
 
 function handleResetSession() {
+  const generation = ++sessionGeneration;
   const previousRemoteSessionId = sessionState.remoteSessionId;
+  activeAbortController?.abort();
+  activeAbortController = null;
   sessionState.conversationHistory = [];
   sessionState.remoteSessionId = null;
+  // Keep a reset conversation isolated from account-wide memory, including
+  // after voice reconnects or a service-worker restart. This does not delete it.
+  sessionState.resetContext = true;
   sessionState.onboardingDocs = null;
   sessionState.onboardingPlan = null;
   sessionState.isActive = false;
@@ -2812,6 +2889,7 @@ function handleResetSession() {
     body: JSON.stringify({ previousSessionId: previousRemoteSessionId, closePrevious: true })
   }).then(async response => {
     const data = await response.json().catch(() => ({}));
+    if (generation !== sessionGeneration) return { ok: true };
     if (response.ok && data.sessionId) {
       sessionState.remoteSessionId = data.sessionId;
       await saveSession();
@@ -2997,10 +3075,12 @@ async function getLimovaTabForAuthentication() {
 }
 
 async function authorizedProxyFetch(path, options = {}, retry = true) {
+  options.signal?.throwIfAborted();
   const operationId = Logger.createOperationId('proxy');
   const startedAt = Date.now();
   Logger.event('proxy', 'PROXY_REQUEST_STARTED', { path, method: options.method || 'GET', retryAllowed: retry }, operationId);
   const token = await getProxyAccessToken();
+  options.signal?.throwIfAborted();
   let response;
   const controller = new AbortController();
   let timedOut = false;
@@ -3044,9 +3124,15 @@ async function getCopilotBootstrap(force = false) {
   const response = await authorizedProxyFetch('/api/copilot/bootstrap', { method: 'GET', cache: 'no-store' });
   const data = await response.json().catch(() => ({}));
   if (!response.ok) throw codedError('COPILOT_MEMORY_UNAVAILABLE', data.error || 'Mémoire temporairement indisponible.');
-  copilotBootstrapCache = data;
+  copilotBootstrapCache = sessionState.resetContext ? {
+    ...data,
+    sessionId: sessionState.remoteSessionId,
+    recentMessages: [],
+    goals: [],
+    greeting: null
+  } : data;
   copilotBootstrapCacheExpiresAt = Date.now() + 30_000;
-  return data;
+  return copilotBootstrapCache;
 }
 
 function sanitizeLimovaProfile(raw) {
@@ -3146,6 +3232,7 @@ async function getLiveToken(context) {
     body: JSON.stringify({
       lang: currentLang,
       trainingMode,
+      ...(sessionState.resetContext ? { resetContext: true } : {}),
       ...(evaluationMode ? { evaluationCode: evaluationState.token } : {}),
       ...(sessionId ? { sessionId } : {}),
       pageContext: trainingMode ? '' : String(freshContext.pageContext || context.pageContext || lastPageContext).slice(0, 12_000),
