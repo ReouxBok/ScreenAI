@@ -66,6 +66,7 @@ function isLimovaUrl(value) {
 let sessionState = {
   conversationHistory: [],
   remoteSessionId: null,
+  resetContext: false,
   onboardingDocs: null,
   onboardingPlan: null,
   isActive: false,
@@ -76,6 +77,7 @@ let sessionState = {
 
 let urlChangeTimeout = null;
 let activeAbortController = null;
+let sessionGeneration = 0;
 let proxyAccessToken = null;
 let proxyAccessTokenExpiresAt = 0;
 let pageContextVersion = 0;
@@ -112,7 +114,7 @@ let lastSyncedProfileHash = '';
 const SESSION_STORAGE_KEY = 'limova_session';
 
 // Keys to persist (exclude transient/non-serializable state)
-const PERSISTED_KEYS = ['conversationHistory', 'remoteSessionId', 'onboardingPlan', 'isActive', 'lastUrl', 'lockedTabId'];
+const PERSISTED_KEYS = ['conversationHistory', 'remoteSessionId', 'resetContext', 'onboardingPlan', 'isActive', 'lastUrl', 'lockedTabId'];
 
 async function saveSession() {
   const data = {};
@@ -1449,7 +1451,7 @@ function copilotLocale() {
 
 async function ensureRemoteCopilotSession() {
   if (sessionState.remoteSessionId) return sessionState.remoteSessionId;
-  const bootstrap = await getCopilotBootstrap(true);
+  const bootstrap = sessionState.resetContext ? null : await getCopilotBootstrap(true);
   if (bootstrap?.sessionId) {
     sessionState.remoteSessionId = bootstrap.sessionId;
     scheduleSave();
@@ -1458,7 +1460,7 @@ async function ensureRemoteCopilotSession() {
   const response = await authorizedProxyFetch('/api/copilot/v2/sessions', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: '{}'
+    body: JSON.stringify(sessionState.resetContext ? { closePrevious: true } : {})
   });
   const data = await response.json().catch(() => ({}));
   if (!response.ok || !data.sessionId) throw codedError('COPILOT_SESSION_FAILED', data.error || 'Impossible d’ouvrir la session Charly.');
@@ -1559,6 +1561,7 @@ async function executeCopilotTool(call, userMessage, operationId) {
 }
 
 async function sendToCopilotV2({ tab, userMessage, pageContext, operationId }) {
+  const generation = sessionGeneration;
   if (activeAbortController) activeAbortController.abort();
   activeAbortController = new AbortController();
   const sessionId = await ensureRemoteCopilotSession();
@@ -1569,6 +1572,7 @@ async function sendToCopilotV2({ tab, userMessage, pageContext, operationId }) {
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
       sessionId,
+      ...(sessionState.resetContext ? { resetContext: true } : {}),
       message: userMessage,
       source: 'text',
       locale: copilotLocale(),
@@ -1588,6 +1592,7 @@ async function sendToCopilotV2({ tab, userMessage, pageContext, operationId }) {
     }),
     signal: activeAbortController?.signal
   });
+  if (generation !== sessionGeneration) return;
   if ([404, 409, 503].includes(response.status)) {
     copilotBootstrapCache = null;
     copilotBootstrapCacheExpiresAt = 0;
@@ -1606,6 +1611,7 @@ async function sendToCopilotV2({ tab, userMessage, pageContext, operationId }) {
     });
   }
   let data = await response.json().catch(() => ({}));
+  if (generation !== sessionGeneration) return;
   if (!response.ok) throw codedError('COPILOT_ADK_FAILED', data.error || 'Charly est temporairement indisponible.');
   let actionCount = 0;
   while (data.type === 'tool_call') {
@@ -1627,6 +1633,7 @@ async function sendToCopilotV2({ tab, userMessage, pageContext, operationId }) {
       signal: activeAbortController?.signal
     });
     data = await response.json().catch(() => ({}));
+    if (generation !== sessionGeneration) return;
     if (!response.ok) throw codedError(response.status === 410 ? 'COPILOT_RUN_EXPIRED' : 'COPILOT_RUN_FAILED', data.error || 'L’action de Charly a expiré. Réessaie.');
   }
   if (data.type !== 'message' || typeof data.content !== 'string') throw codedError('COPILOT_INVALID_RESPONSE', 'Réponse Charly invalide.');
@@ -1659,6 +1666,7 @@ async function sendToGemini({
   _elementSnapshot = new Map(lastPageElements),
   _suppressMemoryTurn = false
 }) {
+  const generation = sessionGeneration;
   url = privacySafeUrl(url);
   const now = Date.now();
   if (now - sessionState.lastAnalysisTime < MIN_API_INTERVAL) {
@@ -1761,6 +1769,7 @@ async function sendToGemini({
       body: JSON.stringify({
         systemInstruction: { parts: [{ text: systemPrompt }] },
         contents,
+        ...(sessionState.resetContext ? { resetContext: true } : {}),
         ...(userMessage && !_suppressMemoryTurn ? {
           memoryTurn: {
             user: userMessage,
@@ -1809,6 +1818,7 @@ async function sendToGemini({
     }
 
     const json = await response.json();
+    if (generation !== sessionGeneration) return;
 
     // A voice session may have started while the legacy request was already
     // returning. Do not let that stale response speak, mutate history or click
@@ -2768,9 +2778,15 @@ async function getPageTechnicalDiagnostics(tabId, since = 0) {
 // API keys are managed server-side on the proxy — no local key storage needed
 
 function handleResetSession() {
+  const generation = ++sessionGeneration;
   const previousRemoteSessionId = sessionState.remoteSessionId;
+  activeAbortController?.abort();
+  activeAbortController = null;
   sessionState.conversationHistory = [];
   sessionState.remoteSessionId = null;
+  // Keep a reset conversation isolated from account-wide memory, including
+  // after voice reconnects or a service-worker restart. This does not delete it.
+  sessionState.resetContext = true;
   sessionState.onboardingDocs = null;
   sessionState.onboardingPlan = null;
   sessionState.isActive = false;
@@ -2812,6 +2828,7 @@ function handleResetSession() {
     body: JSON.stringify({ previousSessionId: previousRemoteSessionId, closePrevious: true })
   }).then(async response => {
     const data = await response.json().catch(() => ({}));
+    if (generation !== sessionGeneration) return { ok: true };
     if (response.ok && data.sessionId) {
       sessionState.remoteSessionId = data.sessionId;
       await saveSession();
@@ -3044,9 +3061,15 @@ async function getCopilotBootstrap(force = false) {
   const response = await authorizedProxyFetch('/api/copilot/bootstrap', { method: 'GET', cache: 'no-store' });
   const data = await response.json().catch(() => ({}));
   if (!response.ok) throw codedError('COPILOT_MEMORY_UNAVAILABLE', data.error || 'Mémoire temporairement indisponible.');
-  copilotBootstrapCache = data;
+  copilotBootstrapCache = sessionState.resetContext ? {
+    ...data,
+    sessionId: sessionState.remoteSessionId,
+    recentMessages: [],
+    goals: [],
+    greeting: null
+  } : data;
   copilotBootstrapCacheExpiresAt = Date.now() + 30_000;
-  return data;
+  return copilotBootstrapCache;
 }
 
 function sanitizeLimovaProfile(raw) {
@@ -3146,6 +3169,7 @@ async function getLiveToken(context) {
     body: JSON.stringify({
       lang: currentLang,
       trainingMode,
+      ...(sessionState.resetContext ? { resetContext: true } : {}),
       ...(evaluationMode ? { evaluationCode: evaluationState.token } : {}),
       ...(sessionId ? { sessionId } : {}),
       pageContext: trainingMode ? '' : String(freshContext.pageContext || context.pageContext || lastPageContext).slice(0, 12_000),
