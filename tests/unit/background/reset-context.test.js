@@ -24,9 +24,109 @@ async function setup(remoteSessionId = OLD_SESSION) {
   await new Promise(resolve => setTimeout(resolve, 0));
 }
 
-afterEach(() => { uninstallFullChromeMock(); delete globalThis.fetch; });
+afterEach(() => { vi.useRealTimers(); uninstallFullChromeMock(); delete globalThis.fetch; });
+
+async function prepareUserTurn(serverOrchestration = false) {
+  await setup();
+  await chromeMock.storage.local.set({ limova_ai_processing_consent_v1: true, limova_onboarding_dismissed: true });
+  fetch.mockImplementation(async url => {
+    const path = String(url);
+    if (path.endsWith('/sessions')) return response({ sessionId: NEW_SESSION });
+    if (path.endsWith('/bootstrap')) return response({ available: true, enabled: true, serverOrchestration, sessionId: OLD_SESSION });
+    if (path.endsWith('/api/gemini')) return response({ candidates: [{ content: { parts: [{ text: 'Reprenons votre audit SEO.' }] } }] });
+    if (path.endsWith('/v2/turn')) return response({ type: 'message', content: 'Reprenons votre audit SEO.' });
+    return response({ revision: 'reset-test', results: [] });
+  });
+}
 
 describe('reset conversation boundaries', () => {
+  it.each([true, false])('drops a user turn whose bootstrap completes after reset (ADK=%s)', async serverOrchestration => {
+    await prepareUserTurn(serverOrchestration);
+    const normalFetch = fetch.getMockImplementation();
+    let finishBootstrap;
+    fetch.mockImplementation((url, options) => String(url).endsWith('/bootstrap') && !finishBootstrap
+      ? new Promise(resolve => { finishBootstrap = resolve; })
+      : normalFetch(url, options));
+    const pending = message({ type: 'USER_MESSAGE', text: 'Fais mon audit SEO' });
+    await vi.waitFor(() => expect(finishBootstrap).toBeTypeOf('function'));
+    await background.handleResetSession();
+    finishBootstrap(response({ available: true, enabled: true, serverOrchestration, sessionId: OLD_SESSION }));
+    await pending;
+    expect(fetch.mock.calls.filter(([url]) => /\/(v2\/turn|api\/gemini)$/.test(String(url)))).toHaveLength(0);
+    expect((await message({ type: 'GET_STATE' })).conversationHistory).toEqual([]);
+    expect(chromeMock._storage.get('limova_session').remoteSessionId).toBe(NEW_SESSION);
+    await message({ type: 'USER_MESSAGE', text: 'Bonjour, nouvelle conversation' });
+    const turns = fetch.mock.calls.filter(([url]) => /\/(v2\/turn|api\/gemini)$/.test(String(url)));
+    expect(turns).toHaveLength(1);
+    const body = JSON.parse(turns[0][1].body);
+    expect(body.resetContext).toBe(true);
+    expect(serverOrchestration ? body.message : body.contents.at(-1).parts[0].text).toContain('Bonjour, nouvelle conversation');
+    expect((await message({ type: 'GET_STATE' })).conversationHistory[0].content).toBe('Bonjour, nouvelle conversation');
+  });
+
+  it.each([503, 429])('cancels a pending retry after reset (HTTP %s)', async status => {
+    await prepareUserTurn();
+    vi.useFakeTimers();
+    const normalFetch = fetch.getMockImplementation();
+    let attempts = 0;
+    fetch.mockImplementation((url, options) => String(url).endsWith('/api/gemini') && ++attempts === 1
+      ? Promise.resolve({ ok: false, status, json: async () => ({}) })
+      : normalFetch(url, options));
+    const pending = message({ type: 'USER_MESSAGE', text: 'Fais mon audit SEO' });
+    await vi.waitFor(() => expect(attempts).toBe(1));
+    await background.handleResetSession();
+    await vi.advanceTimersByTimeAsync(3000);
+    await pending;
+    expect(fetch.mock.calls.filter(([url]) => String(url).endsWith('/api/gemini'))).toHaveLength(1);
+    expect((await message({ type: 'GET_STATE' })).conversationHistory).toEqual([]);
+  });
+
+  it.each([503, 429])('still retries without a reset (HTTP %s)', async status => {
+    await prepareUserTurn();
+    vi.useFakeTimers();
+    const normalFetch = fetch.getMockImplementation();
+    let attempts = 0;
+    fetch.mockImplementation((url, options) => String(url).endsWith('/api/gemini') && ++attempts === 1
+      ? Promise.resolve({ ok: false, status, json: async () => ({}) })
+      : normalFetch(url, options));
+    const pending = message({ type: 'USER_MESSAGE', text: 'Fais mon audit SEO' });
+    await vi.waitFor(() => expect(attempts).toBe(1));
+    await vi.advanceTimersByTimeAsync(3000);
+    await pending;
+    expect(fetch.mock.calls.filter(([url]) => String(url).endsWith('/api/gemini'))).toHaveLength(2);
+    expect((await message({ type: 'GET_STATE' })).conversationHistory.at(-1).content).toBe('Reprenons votre audit SEO.');
+  });
+
+  it('does not send an old user message after a knowledge search spanning the reset', async () => {
+    await prepareUserTurn();
+    const normalFetch = fetch.getMockImplementation();
+    let finishSearch;
+    fetch.mockImplementation((url, options) => String(url).includes('/api/knowledge/search') && !finishSearch
+      ? new Promise(resolve => { finishSearch = resolve; })
+      : normalFetch(url, options));
+    const pending = message({ type: 'USER_MESSAGE', text: 'Fais mon audit SEO' });
+    await vi.waitFor(() => expect(finishSearch).toBeTypeOf('function'));
+    await background.handleResetSession();
+    finishSearch(response({ revision: 'reset-test', results: [] }));
+    await pending;
+    expect(fetch.mock.calls.filter(([url]) => String(url).endsWith('/api/gemini'))).toHaveLength(0);
+    expect((await message({ type: 'GET_STATE' })).conversationHistory).toEqual([]);
+  });
+
+  it('does not replace the new session id with a late session-opening response', async () => {
+    await setup(null);
+    await background.handleResetSession();
+    let finishOpening;
+    fetch.mockImplementation(async () => new Promise(resolve => { finishOpening = resolve; }));
+    const pending = background.sendToCopilotV2({ userMessage: 'Fais mon audit SEO', pageContext: 'Accueil', operationId: 'old-opening' });
+    await vi.waitFor(() => expect(finishOpening).toBeTypeOf('function'));
+    await background.handleResetSession();
+    finishOpening(response({ sessionId: OLD_SESSION }));
+    await pending;
+    expect(fetch.mock.calls.filter(([url]) => String(url).endsWith('/v2/turn'))).toHaveLength(0);
+    expect(chromeMock._storage.get('limova_session').remoteSessionId).toBeNull();
+  });
+
   it('clears visible history and excludes old bootstrap messages, goals and greeting', async () => {
     await setup();
     expect((await message({ type: 'GET_STATE' })).copilot.goals).toHaveLength(1);
