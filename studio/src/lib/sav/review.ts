@@ -8,7 +8,7 @@ import { isSavMessageEligible } from "./cutover";
 import { decryptSavPayload, encryptSavPayload, savContentHash } from "./crypto";
 import { publicKnowledgeText } from "@/lib/knowledge/conversion";
 import { savStructuredProposalSchema, type SavStructuredProposal } from "./proposal";
-import { savDossierSourceHash, savDraftSourceHash } from "./review-contract";
+import { savReviewMatchesProposal, savDossierSourceHash, savDraftSourceHash } from "./review-contract";
 import { decisionKindSchema } from "./policy";
 
 const verdict = z.enum(["correct", "partial", "incorrect", "critical"]);
@@ -42,7 +42,7 @@ export async function getSavProposalReview(messageId: string) {
   const [message] = await db.select().from(savMessages).where(eq(savMessages.id,messageId));
   const before = savStructuredProposalSchema.parse(decryptSavPayload(run.proposalCiphertext));
   const [review] = await db.select().from(savProposalReviews).where(and(eq(savProposalReviews.messageId, messageId), eq(savProposalReviews.isCurrent, true))).limit(1);
-  const matches = review && (review.reviewScope === "dossier" ? review.dossierSourceHash === savDossierSourceHash(before,message) : review.decisionId === decision.id && review.agentRunId === run.id);
+  const matches = savReviewMatchesProposal(review, { decisionId: decision.id, agentRunId: run.id, proposal: before, message });
   const proposal = matches ? { ...savStructuredProposalSchema.parse(decryptSavPayload(review.afterCiphertext)), replyDraft: before.replyDraft } : before;
   const [knowledge] = await db.select().from(activeKnowledge).limit(1);
   const [draftVerdict] = await db.select().from(savDraftVerdicts).where(and(eq(savDraftVerdicts.messageId, messageId), eq(savDraftVerdicts.isCurrent, true))).limit(1);

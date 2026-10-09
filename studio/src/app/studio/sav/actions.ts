@@ -305,9 +305,15 @@ export async function reviewLearningAction(form: FormData) {
   const staff = await requireApiStaff("admin");
   const candidateId = id(form, "candidateId");
   const decision = String(form.get("decision"));
-  if (decision === "approve") await approveLearningCandidate(candidateId, staff.email);
-  else if (decision === "reject") await rejectLearningCandidate(candidateId, staff.email);
-  else throw new Error("INVALID_LEARNING_DECISION");
+  try {
+    if (decision === "approve") await approveLearningCandidate(candidateId, staff.email);
+    else if (decision === "reject") await rejectLearningCandidate(candidateId, staff.email);
+    else throw new Error("INVALID_LEARNING_DECISION");
+  } catch (error) {
+    if (error instanceof Error && ["SAV_OBSERVATION_SYNC_IN_PROGRESS", "SAV_OBSERVATION_STALE"].includes(error.message))
+      redirect(`/studio/sav/resolutions?review=${error.message === "SAV_OBSERVATION_SYNC_IN_PROGRESS" ? "sync_in_progress" : "stale"}`);
+    throw error;
+  }
   revalidatePath("/studio/sav");
   revalidatePath("/studio/sav/resolutions");
   revalidatePath("/studio/contenus");

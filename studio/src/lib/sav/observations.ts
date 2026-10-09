@@ -3,7 +3,7 @@ import { randomUUID } from "node:crypto";
 import { and, asc, desc, eq, isNull, lte, or } from "drizzle-orm";
 import { z } from "zod";
 import { requireDb } from "@/db";
-import { auditLogs, savDraftVerdicts, savLearningCandidates, savMessages, savObservationCycles, savObservationEvents, savResolutionObservations, savThreads, savTicketSnapshots } from "@/db/schema";
+import { auditLogs, knowledgeFamilySources, knowledgeProjectionCandidates, savDraftVerdicts, savLearningCandidates, savResolutionEvidence, savMessages, savObservationCycles, savObservationEvents, savResolutionObservations, savThreads, savTicketSnapshots } from "@/db/schema";
 import { assertKnowledgeUgoApproval } from "@/lib/knowledge/contracts";
 import { publicKnowledgeText } from "@/lib/knowledge/conversion";
 import { decryptSavPayload, encryptSavPayload, savContentHash } from "./crypto";
@@ -14,6 +14,18 @@ const STOPPED = new Date("9999-01-01T00:00:00Z");
 function nextDue(row: {
     closedCatchupUntil: Date | null;
 }, now: Date) { return row.closedCatchupUntil && now >= row.closedCatchupUntil ? STOPPED : new Date(now.getTime() + DAY); }
+/** Invalidate dependent approvals but retain every candidate/version/event as history. */
+async function invalidateObservationCandidates(tx: Parameters<Parameters<ReturnType<typeof requireDb>["transaction"]>[0]>[0], sourceRef: string, exceptId?: string) {
+    const candidates = await tx.select().from(savLearningCandidates).where(eq(savLearningCandidates.sourceRef, sourceRef));
+    for (const candidate of candidates) {
+        if (candidate.id === exceptId || candidate.status === "rejected") continue;
+        await tx.update(savLearningCandidates).set({ status: "rejected", explanation: `${candidate.explanation}\nPreuves actualisées : qualification antérieure devenue obsolète.` }).where(eq(savLearningCandidates.id, candidate.id));
+        if (candidate.contentItemId) await tx.update(savResolutionEvidence).set({ outcome: "superseded", weight: 0 }).where(and(eq(savResolutionEvidence.sourceRef, sourceRef), eq(savResolutionEvidence.itemId, candidate.contentItemId)));
+        const sources = await tx.select().from(knowledgeFamilySources).where(eq(knowledgeFamilySources.sourceRef, `sav-learning:${candidate.id}`));
+        for (const source of sources) await tx.update(knowledgeProjectionCandidates).set({ status: "rejected", explanation: "La preuve SAV source est devenue obsolète. Nouvelle qualification requise." }).where(eq(knowledgeProjectionCandidates.sourceId, source.id));
+        await tx.insert(auditLogs).values({ actorEmail: "system", action: "sav_observation_candidate_invalidated", entityType: "sav_learning_candidate", entityId: candidate.id, technicalMetadata: { previousStatus: candidate.status, sourceRef } });
+    }
+}
 const sourceError = (e: unknown) => e instanceof Error && /^[A-Z0-9_:]+$/.test(e.message) ? e.message : "SOURCE_UNAVAILABLE";
 export async function hasSavTicketObservation(ticketId: string) {
     const [row] = await requireDb().select({ id: savResolutionObservations.id }).from(savResolutionObservations).innerJoin(savThreads, eq(savThreads.id, savResolutionObservations.threadId)).where(or(eq(savResolutionObservations.hubspotTicketId, ticketId), eq(savThreads.hubspotTicketId, ticketId))).limit(1);
@@ -96,7 +108,8 @@ export async function syncSavObservation(id: string, collect: (id: string) => Pr
             const body = decryptSavPayload<{
                 text: string;
             }>(message.bodyCiphertext).text;
-            events.push({ sourceRef: `gmail:${message.gmailMessageId}`, kind: message.direction === "inbound" ? "customer_reply" : isSavAiAuthoredReply(body) ? "ai_reply" : "human_reply", occurredAt: message.receivedAt.toISOString(), text: body.slice(0, 8000), author: message.fromEmail, provenance: "Gmail / fil lié synchronisé", associationTicketId: snapshot.ticketId, remoteUpdatedAt: null });
+            if (body.length > 8000) snapshot.errors.push(`gmail:${message.gmailMessageId}:truncated_8000`);
+            events.push({ fullContentHash: savContentHash(body), truncated: body.length > 8000, sourceRef: `gmail:${message.gmailMessageId}`, kind: message.direction === "inbound" ? "customer_reply" : isSavAiAuthoredReply(body) ? "ai_reply" : "human_reply", occurredAt: message.receivedAt.toISOString(), text: body.slice(0, 8000), author: message.fromEmail, provenance: "Gmail / fil lié synchronisé", associationTicketId: snapshot.ticketId, remoteUpdatedAt: null });
         }
         events.sort((a, b) => `${a.occurredAt}:${a.sourceRef}`.localeCompare(`${b.occurredAt}:${b.sourceRef}`));
         while (Buffer.byteLength(JSON.stringify(events), "utf8") > 64 * 1024) {
@@ -131,6 +144,12 @@ export async function syncSavObservation(id: string, collect: (id: string) => Pr
             events: relevant, humanEvidence: human.map(e => ({ sourceRef: e.sourceRef, contentHash: savContentHash(e), kind: e.kind })), customerConfirmation: customerConfirmation.map(e => e.sourceRef), sourceErrors: snapshot.errors, coverage: "Emails HubSpot associés et fil Gmail synchronisé uniquement. Boîtes externes non enregistrées, appels et opérations hors CRM non observables. Une tâche terminée n’atteste pas une opération exécutée.", outcome: snapshot.errors.length || snapshot.status === "unknown" ? "insufficient_sources" : human.length ? "human_evidence_to_qualify" : "closed_without_human_evidence" };
         const hash = savContentHash(summary);
         const changed = existing?.sourceHash !== hash;
+        if (changed && existing) await invalidateObservationCandidates(tx, `sav-observation:${existing.id}`);
+        // A reopened cycle also invalidates the previous resolution, without erasing its history.
+        if (cycle !== row.cycle) {
+            const previous = await tx.select().from(savObservationCycles).where(and(eq(savObservationCycles.observationId, id), eq(savObservationCycles.cycle, row.cycle)));
+            for (const old of previous) await invalidateObservationCandidates(tx, `sav-observation:${old.id}`);
+        }
         const closed = snapshot.status === "closed";
         const status = snapshot.status === "unknown" ? "unknown" : closed ? "closed" : "open";
         const values = { status, summaryCiphertext: encryptSavPayload(summary), sourceHash: hash, closedAt: closed ? (existing?.closedAt ?? new Date(snapshot.updatedAt)) : null, updatedAt: now, ...(changed ? { qualification: null, qualifiedBy: null, qualifiedAt: null, candidateId: null } : {}) };
@@ -175,12 +194,16 @@ export async function qualifySavObservation(raw: unknown, actorEmail: string) {
             const justification = publicKnowledgeText(input.justification);
             const contentHash = savContentHash({ sourceHash: cycle.sourceHash, proof, resolution, justification, customerConfirmationRef:input.customerConfirmationRef });
             const values = { threadId: observation.threadId, hubspotTicketId: observation.hubspotTicketId, sourceRef: `sav-observation:${cycle.id}`, sourceContentHash: contentHash, proposedPatch: { ciphertext: encryptSavPayload({ subject: publicKnowledgeText(summary.subject), finalHumanResolution: resolution, sourceSnapshotId: `observation:${cycle.id}`, sourceMessageId: input.evidenceRef, provenance: "human_resolution", customerConfirmed: Boolean(input.customerConfirmationRef), qualificationBy: actorEmail, qualificationJustification: justification, sourceHash: cycle.sourceHash }) }, explanation: justification, evidenceTicketIds: observation.hubspotTicketId ? [observation.hubspotTicketId] : [], createdBy: "human" as const };
-            await tx.insert(savLearningCandidates).values(values).onConflictDoNothing();
+            const [previous] = await tx.select().from(savLearningCandidates).where(eq(savLearningCandidates.sourceRef, values.sourceRef)).orderBy(desc(savLearningCandidates.createdAt), desc(savLearningCandidates.id)).limit(250).then(rows => rows.filter(row => row.contentItemId));
+            await tx.insert(savLearningCandidates).values({ ...values, contentItemId: previous?.contentItemId ?? null }).onConflictDoNothing();
             const [candidate] = await tx.select().from(savLearningCandidates).where(and(eq(savLearningCandidates.sourceRef, values.sourceRef), eq(savLearningCandidates.sourceContentHash, contentHash)));
             candidateId = candidate.id;
+            await tx.update(savLearningCandidates).set({ contentItemId: candidate.contentItemId ?? previous?.contentItemId ?? null,
+                ...(candidate.status === "rejected" ? { status: "pending" as const, reviewedBy: null, reviewedAt: null } : {}) }).where(eq(savLearningCandidates.id, candidate.id));
         }
         else
             candidateId = null;
+        if (candidateId !== cycle.candidateId) await invalidateObservationCandidates(tx, `sav-observation:${cycle.id}`, candidateId ?? undefined);
         await tx.update(savObservationCycles).set({ candidateId, qualification: input.outcome, qualifiedBy: actorEmail, qualifiedAt: new Date() }).where(eq(savObservationCycles.id, cycle.id));
         await tx.update(savResolutionObservations).set({ state: candidateId ? "candidate_ready" : "closed_to_analyze" }).where(eq(savResolutionObservations.id, observation.id));
         const qualificationEvent:ObservationEvent={sourceRef:`qualification:${cycle.id}`,kind:"human_qualification",occurredAt:new Date().toISOString(),text:`Résultat : ${input.outcome}\nJustification : ${input.justification}\nPreuve : ${input.evidenceRef || "aucune"}`,author:actorEmail,provenance:"Qualification explicite Studio Ugo",associationTicketId:observation.hubspotTicketId!,remoteUpdatedAt:null};

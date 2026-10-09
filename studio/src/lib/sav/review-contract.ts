@@ -25,6 +25,13 @@ export function savDraftSourceHash(p: SavStructuredProposal, message?: {
 }, activeRevision?: string | null) {
     return savContentHash(stable({ activeRevision: activeRevision ?? null, text: p.replyDraft?.trim(), customerIdentity: p.customerIdentity, message: message ? { subject: message.subject, fromEmail: message.fromEmail, body: decryptSavPayload(message.bodyCiphertext) } : null, knowledgeRevision: p.knowledgeRevision, dossierContext: p.dossierContext, messageContext: p.messageContext }));
 }
+/** One validity contract for the detail, action guards and paginated inbox. */
+export function savReviewMatchesProposal(review: { reviewScope: string; dossierSourceHash: string | null; decisionId: string; agentRunId: string } | null | undefined,
+    source: { decisionId: string; agentRunId: string; proposal: SavStructuredProposal; message: { bodyCiphertext: string; subject: string; fromEmail: string } }) {
+    return Boolean(review && (review.reviewScope === "dossier"
+        ? review.dossierSourceHash === savDossierSourceHash(source.proposal, source.message)
+        : review.decisionId === source.decisionId && review.agentRunId === source.agentRunId));
+}
 export function savDraftNotApplicable(p: SavStructuredProposal) {
     return p.decision.reasonCode === "cancellation_human_only" || !p.replyDraft?.trim();
 }

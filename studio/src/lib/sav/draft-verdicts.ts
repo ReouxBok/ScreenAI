@@ -7,7 +7,7 @@ import { assertSavActor } from "./access";
 import { isSavMessageEligible } from "./cutover";
 import { decryptSavPayload, encryptSavPayload, savContentHash } from "./crypto";
 import { savStructuredProposalSchema } from "./proposal";
-import { savDossierSourceHash, savDraftSourceHash, savDraftNotApplicable } from "./review-contract";
+import { savReviewMatchesProposal, savDossierSourceHash, savDraftSourceHash, savDraftNotApplicable } from "./review-contract";
 import { savReleaseStage } from "./config";
 type Reader = Pick<ReturnType<typeof requireDb>, "select">;
 /** Called under the thread lock for mutations; exact IDs prevent stale forms,
@@ -23,7 +23,7 @@ export async function loadSavDraftContext(messageId: string, db: Reader = requir
         throw new Error("SAV_DRAFT_CONTEXT_CHANGED");
     const original = savStructuredProposalSchema.parse(decryptSavPayload(run.proposalCiphertext));
     const [review] = await db.select().from(savProposalReviews).where(and(eq(savProposalReviews.messageId, messageId), eq(savProposalReviews.isCurrent, true))).limit(1);
-    const matches = review && (review.reviewScope === "dossier" ? review.dossierSourceHash === savDossierSourceHash(original, message) : review.decisionId === decision.id && review.agentRunId === run.id);
+    const matches = savReviewMatchesProposal(review, { decisionId: decision.id, agentRunId: run.id, proposal: original, message });
     const proposal = matches ? { ...savStructuredProposalSchema.parse(decryptSavPayload(review.afterCiphertext)), replyDraft: original.replyDraft } : original;
     const [knowledge] = await db.select().from(activeKnowledge).limit(1);
     if (!["not_consulted", "unavailable"].includes(original.knowledgeRevision) && original.knowledgeRevision !== knowledge?.revisionId)

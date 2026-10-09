@@ -10,6 +10,8 @@ export type ObservationEvent = {
     provenance: string;
     associationTicketId: string;
     remoteUpdatedAt: string | null;
+    fullContentHash?: string;
+    truncated?: boolean;
 };
 export type ObservationSnapshot = {
     ticketId: string;

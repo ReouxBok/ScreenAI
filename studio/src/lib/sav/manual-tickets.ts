@@ -39,7 +39,8 @@ export async function queueSavManualTicket(raw: unknown, actorEmail: string) {
       if (existing.payload.hubspotTicketId) throw new Error("SAV_MANUAL_RECONCILIATION_REQUIRED");
     }
     const values = { threadId: thread.id, messageId: message.id, decisionId: decision.id, kind: input.kind, status: "pending" as const,
-      payload: { savReviewId: review.id, ...(input.ticketId ? { ticketId: input.ticketId } : {}), ...(input.distinctIssueReason ? { distinctIssueReasonCiphertext: encryptSavPayload({ text: input.distinctIssueReason }) } : {}) }, actorType: "human" as const, actorEmail, errorCode: null, scheduledAt: null, updatedAt: new Date() };
+      payload: { savReviewId: review.id, ticketReviewSnapshotCiphertext: encryptSavPayload({ reviewId: review.id, decisionId: decision.id, messageId: message.id, threadId: thread.id,
+        customerEmail: thread.customerEmail, proposal: savStructuredProposalSchema.parse(decryptSavPayload(review.afterCiphertext)) }), ...(input.ticketId ? { ticketId: input.ticketId } : {}), ...(input.distinctIssueReason ? { distinctIssueReasonCiphertext: encryptSavPayload({ text: input.distinctIssueReason }) } : {}) }, actorType: "human" as const, actorEmail, errorCode: null, scheduledAt: null, updatedAt: new Date() };
     const [action] = existing ? await tx.update(savActions).set(values).where(eq(savActions.id, existing.id)).returning()
       : await tx.insert(savActions).values({ ...values, idempotencyKey: key }).returning();
     await tx.insert(auditLogs).values({ actorEmail, action: "sav_manual_ticket_requested", entityType: "sav_action", entityId: action.id, technicalMetadata: { reviewId: review.id, messageId: message.id, kind: input.kind, ticketId: input.ticketId ?? null, distinctIssueConfirmed: input.distinctIssueReason.length >= 20 } });

@@ -1,6 +1,6 @@
 import "server-only";
 
-import { and, desc, eq } from "drizzle-orm";
+import { and, desc, eq, sql } from "drizzle-orm";
 import { requireDb } from "@/db";
 import {
   categories,
@@ -60,13 +60,19 @@ export async function listLearningCandidates(limit = 100) {
     reviewedBy: savLearningCandidates.reviewedBy,
     reviewedAt: savLearningCandidates.reviewedAt,
     proposedPatch: savLearningCandidates.proposedPatch,
-  }).from(savLearningCandidates).orderBy(desc(savLearningCandidates.createdAt)).limit(Math.min(250, Math.max(1, limit)));
-  return candidates.map((candidate) => {
+    syncLeaseUntil: savResolutionObservations.leaseUntil,
+  }).from(savLearningCandidates)
+    .leftJoin(savObservationCycles, eq(savLearningCandidates.sourceRef, sql`'sav-observation:' || ${savObservationCycles.id}::text`))
+    .leftJoin(savResolutionObservations, eq(savResolutionObservations.id, savObservationCycles.observationId)).orderBy(desc(savLearningCandidates.createdAt)).limit(Math.min(250, Math.max(1, limit)));
+  return candidates.map((row) => {
+    const { syncLeaseUntil, ...candidate } = row;
+    const syncInProgress = Boolean(syncLeaseUntil && syncLeaseUntil > new Date());
     try {
       const patch = candidatePatch(candidate as typeof savLearningCandidates.$inferSelect);
       return {
         ...candidate,
         proposedPatch: undefined,
+        syncInProgress,
         proposedSubject: plainText(patch.subject).slice(0, 500),
         proposedResolution: plainText(patch.finalHumanResolution).slice(0, 4_000),
       };
@@ -74,6 +80,7 @@ export async function listLearningCandidates(limit = 100) {
       return {
         ...candidate,
         proposedPatch: undefined,
+        syncInProgress,
         proposedSubject: "Proposition illisible",
         proposedResolution: "Le contenu chiffré de cette proposition n’a pas pu être relu.",
       };
@@ -93,6 +100,13 @@ export async function approveLearningCandidate(candidateId: string, actorEmail: 
   const [candidate] = await db.select().from(savLearningCandidates)
     .where(eq(savLearningCandidates.id, candidateId)).for("update");
   if (!candidate) throw new Error("SAV_LEARNING_CANDIDATE_NOT_PENDING");
+  const patch = candidatePatch(candidate);
+  if(candidate.sourceRef.startsWith("sav-observation:")) {
+    const [cycle]=await db.select().from(savObservationCycles).where(eq(savObservationCycles.id,candidate.sourceRef.slice("sav-observation:".length)));
+    const [observation]=cycle?await db.select().from(savResolutionObservations).where(eq(savResolutionObservations.id,cycle.observationId)).for("update"):[];
+    if (observation?.leaseUntil && observation.leaseUntil > new Date()) throw new Error("SAV_OBSERVATION_SYNC_IN_PROGRESS");
+    if(!cycle || !observation?.closed || cycle.cycle!==observation.cycle || cycle.candidateId!==candidate.id || cycle.qualification!=="resolved" || observation.sourceErrors.length || (patch as LearningPatch & {sourceHash?:string}).sourceHash!==cycle.sourceHash)throw new Error("SAV_OBSERVATION_STALE");
+  }
   if (candidate.status === "approved" && candidate.contentItemId) {
     const [evidence] = await db.select().from(savResolutionEvidence).where(and(eq(savResolutionEvidence.itemId, candidate.contentItemId), eq(savResolutionEvidence.sourceRef, candidate.sourceRef), eq(savResolutionEvidence.outcome, "human_resolution"))).orderBy(desc(savResolutionEvidence.createdAt)).limit(1);
     if (!evidence) throw new Error("KNOWLEDGE_REVIEWED_VERSION_EVIDENCE_REQUIRED");
@@ -102,12 +116,6 @@ export async function approveLearningCandidate(candidateId: string, actorEmail: 
     return { item, version };
   }
   if (candidate.status !== "pending") throw new Error("SAV_LEARNING_CANDIDATE_NOT_PENDING");
-  const patch = candidatePatch(candidate);
-  if(candidate.sourceRef.startsWith("sav-observation:")) {
-    const [cycle]=await db.select().from(savObservationCycles).where(eq(savObservationCycles.id,candidate.sourceRef.slice("sav-observation:".length)));
-    const [observation]=cycle?await db.select().from(savResolutionObservations).where(eq(savResolutionObservations.id,cycle.observationId)).for("update"):[];
-    if(!cycle || !observation?.closed || cycle.cycle!==observation.cycle || cycle.candidateId!==candidate.id || cycle.qualification!=="resolved" || observation.sourceErrors.length || (patch as LearningPatch & {sourceHash?:string}).sourceHash!==cycle.sourceHash)throw new Error("SAV_OBSERVATION_STALE");
-  }
   const sourceLabel = candidate.hubspotTicketId ? `ticket HubSpot ${candidate.hubspotTicketId}` : `dossier SAV ${candidate.threadId ?? candidate.sourceRef}`;
   const subject = plainText(patch.subject) || `Résolution du ${sourceLabel}`;
   const resolution = plainText(patch.finalHumanResolution);

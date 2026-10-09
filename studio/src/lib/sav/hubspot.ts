@@ -8,6 +8,7 @@ import {
   auditLogs,
   savActions,
   savActorType,
+  savAgentRuns,
   savDecisions,
   savLearningCandidates,
   savMessages,
@@ -30,6 +31,7 @@ import { selectSavTicketMatch } from "./ticket-routing";
 import { extractSavLearningResolution, isHubspotOutboundDirection } from "./learning-extraction";
 import { savActionFailurePlan } from "./retry-policy";
 import { claimWebhookReceipt, markWebhookReceipt, recordWebhookReceipt, type SavMessageBody } from "./service";
+import { savReviewMatchesProposal } from "./review-contract";
 import { assertSavCurrentTicketReview } from "./manual-tickets";
 import { assertSavGmailThreadCurrent } from "./gmail";
 import { savStructuredProposalSchema } from "./proposal";
@@ -287,7 +289,10 @@ async function finalizeSavV0TicketAction(action: typeof savActions.$inferSelect)
       const properties = savSupportTicketProperties({ title: proposal.ticket.title, description: proposal.ticket.description });
       const db = requireDb();
       // Durable marker before dispatch. Recovery must fail closed after a crash.
-      const [claimed] = await db.update(savActions).set({ payload: sql`${savActions.payload} || ${JSON.stringify({ ticketCreateDispatchedAt: new Date().toISOString() })}::jsonb`, updatedAt: new Date() })
+      const [claimed] = await db.update(savActions).set({ payload: sql`${savActions.payload} || ${JSON.stringify({ ticketCreateDispatchedAt: new Date().toISOString(), ticketCreateRequestCiphertext: encryptSavPayload({
+          actionId: action.id, reviewId: review.id, decisionId: action.decisionId, messageId: action.messageId, threadId: thread.id,
+          contactId: context.contactId, customerEmail, properties,
+        }) })}::jsonb`, updatedAt: new Date() })
         .where(and(eq(savActions.id, action.id), eq(savActions.status, "running"), sql`${savActions.payload}->>'ticketCreateDispatchedAt' is null`)).returning();
       if (!claimed) throw new Error("SAV_MANUAL_RECONCILIATION_REQUIRED");
       try {
@@ -328,13 +333,33 @@ export async function reconcileSavManualTicket(actionId: string, ticketId: strin
   if (!action || action.kind !== "create_ticket" || !action.payload.ticketCreateDispatchedAt || typeof action.payload.savReviewId !== "string") throw new Error("SAV_ACTION_NOT_RECONCILABLE");
   const [review] = await db.select().from(savProposalReviews).where(eq(savProposalReviews.id, action.payload.savReviewId)).limit(1);
   const [thread] = await db.select().from(savThreads).where(eq(savThreads.id, action.threadId)).limit(1);
-  if (!review || !thread || review.messageId !== action.messageId || review.decisionId !== action.decisionId) throw new Error("SAV_ACTION_NOT_RECONCILABLE");
+  if (!review || !thread || review.messageId !== action.messageId) throw new Error("SAV_ACTION_NOT_RECONCILABLE");
   const proposal = savStructuredProposalSchema.parse(decryptSavPayload(review.afterCiphertext));
-  const email = proposal.customerIdentity.verifiedByHuman && proposal.customerIdentity.registrationEmail ? proposal.customerIdentity.registrationEmail : thread.customerEmail;
+  let email = proposal.customerIdentity.verifiedByHuman && proposal.customerIdentity.registrationEmail ? proposal.customerIdentity.registrationEmail : thread.customerEmail;
+  let expected = savSupportTicketProperties({ title: proposal.ticket.title, description: proposal.ticket.description });
+  let dispatchedContactId: string | null = null;
+  if (typeof action.payload.ticketCreateRequestCiphertext === "string") {
+    const request = decryptSavPayload<{ actionId: string; reviewId: string; decisionId: string; messageId: string; threadId: string; contactId: string; customerEmail: string; properties: typeof expected }>(action.payload.ticketCreateRequestCiphertext);
+    if (request.actionId !== action.id || request.reviewId !== review.id || request.decisionId !== action.decisionId || request.messageId !== action.messageId || request.threadId !== thread.id || !request.contactId || !request.customerEmail)
+      throw new Error("SAV_ACTION_NOT_RECONCILABLE");
+    expected = request.properties; email = request.customerEmail; dispatchedContactId = request.contactId;
+  } else if (typeof action.payload.ticketReviewSnapshotCiphertext === "string") {
+    const request = decryptSavPayload<{ reviewId: string; decisionId: string; messageId: string; threadId: string; customerEmail: string; proposal: unknown }>(action.payload.ticketReviewSnapshotCiphertext);
+    if (request.reviewId !== review.id || request.decisionId !== action.decisionId || request.messageId !== action.messageId || request.threadId !== thread.id || savContentHash(request.proposal) !== savContentHash(proposal))
+      throw new Error("SAV_ACTION_NOT_RECONCILABLE");
+    email = proposal.customerIdentity.verifiedByHuman && proposal.customerIdentity.registrationEmail ? proposal.customerIdentity.registrationEmail : request.customerEmail;
+  } else {
+    // Compatibility for commands queued before immutable request snapshots.
+    // Compare the historical generation actually attached to this action, never the latest one.
+    const [decision] = await db.select().from(savDecisions).where(eq(savDecisions.id, action.decisionId!));
+    const [run] = decision?.agentRunId ? await db.select().from(savAgentRuns).where(eq(savAgentRuns.id, decision.agentRunId)) : [];
+    const [message] = await db.select().from(savMessages).where(eq(savMessages.id, action.messageId!));
+    if (!decision || !message || run?.messageId !== message.id || !run.proposalCiphertext || !savReviewMatchesProposal(review, { decisionId: decision.id, agentRunId: run.id,
+      proposal: savStructuredProposalSchema.parse(decryptSavPayload(run.proposalCiphertext)), message })) throw new Error("SAV_ACTION_NOT_RECONCILABLE");
+  }
   const contact = await findContactByEmail(email);
   const ticket = await hubspotFetch<HubspotRecord>(`/crm/v3/objects/tickets/${encodeURIComponent(ticketId)}?properties=subject,content,hs_pipeline&associations=contacts`);
-  const expected = savSupportTicketProperties({ title: proposal.ticket.title, description: proposal.ticket.description });
-  if (!contact || ticket.properties.hs_pipeline !== SAV_HUBSPOT_SUPPORT.pipelineId || ticket.properties.subject !== expected.subject || ticket.properties.content !== expected.content
+  if (!contact || (dispatchedContactId && contact.id !== dispatchedContactId) || ticket.properties.hs_pipeline !== SAV_HUBSPOT_SUPPORT.pipelineId || ticket.properties.subject !== expected.subject || ticket.properties.content !== expected.content
     || !ticket.associations?.contacts?.results?.some((value) => value.id === contact.id)) throw new Error("SAV_RECONCILIATION_TARGET_INVALID");
   return db.transaction(async (tx) => {
     await tx.select().from(savThreads).where(eq(savThreads.id, thread.id)).for("update");
