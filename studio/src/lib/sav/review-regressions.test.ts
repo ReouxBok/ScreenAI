@@ -2,7 +2,7 @@ import { afterAll, afterEach, beforeAll, beforeEach, expect, it, vi } from "vite
 import { eq } from "drizzle-orm";
 import { createSavTestDb } from "../../../test/sav-db";
 import { v0Proposal } from "../../../test/sav-v0-review-fixture";
-import { savMailboxes, savThreads, savMessages, savAgentRuns, savDecisions, savActions, savDraftVerdicts, savResolutionObservations, savLearningCandidates, savResolutionEvidence, contentVersions, categories } from "@/db/schema";
+import { savMailboxes, savThreads, savMessages, savAgentRuns, savDecisions, savActions, savDraftVerdicts, savResolutionObservations, savLearningCandidates, savResolutionEvidence, contentVersions, categories, knowledgeProjectionCandidates, knowledgeFamilySources, knowledgeFamilyRevisions, contentItems } from "@/db/schema";
 import { activateSavV0Cutover } from "./cutover";
 import {reconcileSavManualTicket} from "./hubspot";
 import { encryptSavPayload, savContentHash } from "./crypto";
@@ -140,4 +140,36 @@ it("F6 paginates after filtering across a full unreviewed batch",async()=>{
  await f.db.insert(savMessages).values(Array.from({length:251},(_,i)=>({...m,id:undefined,gmailMessageId:`other-${i}`,receivedAt:new Date(now.getTime()+i),analysisStatus:"done" as const})));
  expect(await listSavInbox(1,{view:"reviewed"})).toMatchObject([{messageId,reviewId:review.id}]);
  expect(await listSavInbox(1,{view:"reviewed",offset:1})).toEqual([]);
+});
+
+it("F7 creates an idempotent proposal from revalidated evidence without reviving its rejected history", async () => {
+ await f.db.insert(categories).values({slug:"depannage",label:"Dépannage",position:0}).onConflictDoNothing();
+ const o=await linkedObservation(); await syncSavObservation(o.id,async()=>snapshot(),now);
+ const first=await qualifySavObservation(await qualifyInput(o.id),"ugo@limova.ai");
+ await approveLearningCandidate(first.candidateId!,"ugo@limova.ai");
+ const [source]=await f.db.select().from(knowledgeFamilySources).where(eq(knowledgeFamilySources.sourceRef,`sav-learning:${first.candidateId}`));
+ const [original]=await f.db.select().from(knowledgeProjectionCandidates).where(eq(knowledgeProjectionCandidates.sourceId,source.id));
+ expect(original.status).toBe("needs_recording");
+ await syncSavObservation(o.id,async()=>snapshot({events:[event(),{...event("human_reply","Confirmation humaine supplémentaire : la procédure de téléchargement reste valide."),sourceRef:"hubspot:emails:1000"}]}),now);
+ const [historical]=await f.db.select().from(knowledgeProjectionCandidates).where(eq(knowledgeProjectionCandidates.id,original.id));
+ expect(historical.status).toBe("rejected");
+ const second=await qualifySavObservation(await qualifyInput(o.id),"ugo@limova.ai");
+ expect(second.candidateId).not.toBe(first.candidateId);
+ const approved=await approveLearningCandidate(second.candidateId!,"ugo@limova.ai");
+ await approveLearningCandidate(second.candidateId!,"ugo@limova.ai");
+ const rows=await f.db.select().from(knowledgeProjectionCandidates).where(eq(knowledgeProjectionCandidates.familyId,original.familyId));
+ const current=rows.find(row=>row.status==="needs_recording");
+ expect(current).toBeDefined(); expect(rows).toHaveLength(2);
+ expect(rows.find(row=>row.id===historical.id)).toEqual(historical);
+ expect(current!.id).not.toBe(historical.id); expect(current!.revisionId).not.toBe(historical.revisionId);
+ const [newSource]=await f.db.select().from(knowledgeFamilySources).where(eq(knowledgeFamilySources.id,current!.sourceId));
+ expect(newSource.sourceRef).toBe(`sav-learning:${second.candidateId}`);
+ expect(newSource.sourceVersionId).toBe(approved.version.id);
+ expect(newSource.evidence).toMatchObject({learningCandidateId:second.candidateId,sourceVersionId:approved.version.id});
+ expect(current!.proposedInput).toHaveProperty("metadata.sourceMetadata.learningCandidateId",second.candidateId);
+ expect(current!.proposedInput).toHaveProperty("metadata.actionSteps",[]);
+ const revisions=await f.db.select().from(knowledgeFamilyRevisions).where(eq(knowledgeFamilyRevisions.familyId,original.familyId));
+ expect(revisions).toHaveLength(2); expect(revisions[0].document).toEqual(revisions[1].document);
+ expect((await f.db.select().from(contentItems).where(eq(contentItems.id,approved.item.id)))[0].publishedVersionId).toBeNull();
+ expect(denyNetwork).not.toHaveBeenCalled();
 });
