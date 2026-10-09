@@ -4,7 +4,8 @@ import { eq } from "drizzle-orm";
 import { revalidatePath } from "next/cache";
 import { redirect } from "next/navigation";
 import { requireDb } from "@/db";
-import { contentItems } from "@/db/schema";
+import { contentItems, contentVersions } from "@/db/schema";
+import { articleMetadataFromForm } from "@/lib/article-form";
 import { canEditContent } from "@/lib/access";
 import { requireApiStaff, type StaffIdentity } from "@/lib/auth";
 import { createEvaluationRun, ensureEvaluationSuite } from "@/lib/evaluations";
@@ -30,7 +31,7 @@ const jsonArray = (value: FormDataEntryValue | null) => {
 };
 
 async function assertContentEditable(staff: StaffIdentity, itemId: string) {
-  const [item] = await requireDb().select({ publishedVersionId: contentItems.publishedVersionId })
+  const [item] = await requireDb().select({ publishedVersionId: contentItems.publishedVersionId, currentDraftVersionId: contentItems.currentDraftVersionId })
     .from(contentItems).where(eq(contentItems.id, itemId)).limit(1);
   if (!item) throw new Error("CONTENT_NOT_FOUND");
   if (!canEditContent(staff.role, item.publishedVersionId)) throw new Error("CONTENT_LOCKED_IN_PRODUCTION");
@@ -40,7 +41,7 @@ async function assertContentEditable(staff: StaffIdentity, itemId: string) {
 export async function saveContentAction(form: FormData) {
   const staff = await requireApiStaff();
   const itemId = String(form.get("itemId") || "") || undefined;
-  if (itemId) await assertContentEditable(staff, itemId);
+  const currentItem = itemId ? await assertContentEditable(staff, itemId) : null;
   const type = String(form.get("type"));
   const common = {
     type,
@@ -61,14 +62,10 @@ export async function saveContentAction(form: FormData) {
   } catch {
     throw new Error("INVALID_SOURCE_METADATA");
   }
-  const metadata = type === "article" ? {
-    intents: strings(form.get("intents")),
-    limovaPaths: strings(form.get("limovaPaths")),
-    prerequisites: strings(form.get("prerequisites")),
-    expectedResult: String(form.get("expectedResult")),
-    troubleshooting: String(form.get("troubleshooting")),
-    sourceMetadata,
-  } : {
+  const previousVersionId = currentItem?.currentDraftVersionId ?? currentItem?.publishedVersionId;
+  const [previousVersion] = type === "article" && previousVersionId
+    ? await requireDb().select({ metadata: contentVersions.metadata }).from(contentVersions).where(eq(contentVersions.id, previousVersionId)).limit(1) : [];
+  const metadata = type === "article" ? articleMetadataFromForm(form, staff.email, previousVersion?.metadata ?? {}) : {
     objective: String(form.get("objective")),
     proposalSignals: strings(form.get("proposalSignals")),
     qualificationQuestions: strings(form.get("qualificationQuestions")),

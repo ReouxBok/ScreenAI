@@ -76,6 +76,8 @@ export type ArticleMetadata = {
   troubleshooting: string;
   sourceMetadata?: Record<string, unknown>;
   resolution?: {
+    audience?: "support" | "lead";
+    responseTemplate?: string;
     symptoms: string[];
     steps: string[];
     exceptions: string[];

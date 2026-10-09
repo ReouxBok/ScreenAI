@@ -97,6 +97,18 @@ export function buildSavInboundContext(input: { subject: string; body: string })
   });
 }
 
+/** Current customer/operational signals take priority over a simultaneous presales question. */
+export function hasSavCustomerOrOperationalRequest(input: { subject: string; body: string }) {
+  const text = `${savActiveSubject(input)}\n${splitSavMessageText(input.body).currentText}`
+    .normalize("NFKD").replace(/\p{M}/gu, "").toLowerCase();
+  const account = /\b(?:mon|ma|mes|notre|nos|my|our)\s+(?:compte|account|abonnement|subscription|facture|invoice|agent|licence|license|plan)\b|\b(?:deja client|already a customer|registration email|email du compte)\b/;
+  const customer = /\b(?:je suis|nous sommes|i am|i['’]m|we are|we['’]re)\s+(?:(?:deja|already|un|une|a|an|currently)\s+)*(?:abonne\w*|client\w*|utilisateur\w*|subscriber\w*|customer\w*|subscribed)\b|\b(?:j['’]ai|nous avons|i have|we have)\s+(?:deja\s+|already\s+)?(?:un |une |a |an )?(?:abonnement|compte|subscription|account)\b|\b(?:j['’]utilise|nous utilisons|i use|we use)\s+limova\b/;
+  const operations = /\b(?:configur\w*|parametr\w*|install\w*|connect\w*|activ\w*|login|connexion|support|sav|bug\w*|erreur\w*|error\w*|probleme\w*|problem\w*|bloqu\w*|broken|password|mot de passe|api key)\b|\b(?:comment|how to|help.{0,30})\s+(?:utiliser|use|setup|set up)\b/;
+  // Pricing discovery is deliberately absent here; credits, payments and financial data are operations.
+  const finance = /\b(?:credits?|solde|balance|recharg\w*|top[ -]?up|racheter|factur\w*|invoic\w*|rembours\w*|refund\w*|prelev\w*|debit\w*|paiement\w*|payment\w*|paye\w*|paying|paid|montant\w*|amount\w*|transaction\w*|bancaire\w*|bank\w*|rib|iban|tva|vat|tax\w*|conteste\w*|contestation\w*|chargeback\w*|charged|overcharg\w*|financ\w*|revenus?|revenue)\b|chiffre d['’]affaires/;
+  return account.test(text) || customer.test(text) || operations.test(text) || finance.test(text);
+}
+
 /** Conservative non-support identification; an uncertain message stays human-reviewed. */
 export function savNonSupportIntent(input: { from: string; subject: string; body: string }) {
   const body = splitSavMessageText(input.body).currentText;
@@ -108,7 +120,7 @@ export function savNonSupportIntent(input: { from: string; subject: string; body
   if (/\b(?:partenariat|partnership|collaboration)\b/i.test(body)
     && !/\b(?:bug|erreur|error|bloqu|broken|impossible)\b/i.test(body)) return "partnership";
   if (/(?:vos|your)\s+(?:tarifs?|pricing|prices)|(?:demande|request).{0,20}(?:devis|quotation|demo|démonstration)/i.test(body)
-    && !/\b(?:mon|my)\s+(?:compte|account|abonnement|subscription)|\b(?:facture|invoice|bug|erreur|error)\b/i.test(body)) return "presales";
+    && !hasSavCustomerOrOperationalRequest(input)) return "presales";
   if (!body && splitSavMessageText(input.body).quotedText) return "quoted_only";
   return null;
 }

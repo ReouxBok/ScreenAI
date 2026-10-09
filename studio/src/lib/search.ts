@@ -39,6 +39,9 @@ export async function searchKnowledge(rawInput: unknown) {
     ? searchOperationalCurriculum(input.query, input.path, input.limit)
     : [];
   const db = requireDb();
+  const audienceFilter = input.scope === "sav"
+    ? sql`COALESCE(version.metadata -> 'resolution' ->> 'audience', 'support') = ${input.savAudience}`
+    : sql`COALESCE(version.metadata -> 'resolution' ->> 'audience', 'support') <> 'lead'`;
   const typeFilter = input.contentTypes.length === 2
     ? sql`item.type IN ('article', 'onboarding')`
     : sql`item.type = ${input.contentTypes[0]}::content_type`;
@@ -53,6 +56,7 @@ export async function searchKnowledge(rawInput: unknown) {
         AND item.ai_enabled = true
         AND ${input.scope === "sav" ? sql`item.agent_key = 'sav'` : sql`item.agent_key <> 'sav'`}
         AND ${input.scope === "sav" ? savResolutionIsCurrent : sql`TRUE`}
+        AND ${audienceFilter}
         AND item.locale = ${input.locale}
         AND ${typeFilter}
     ) AS "hasCandidates"
@@ -128,6 +132,7 @@ export async function searchKnowledge(rawInput: unknown) {
       AND item.locale = ${input.locale}
       AND ${input.scope === "sav" ? sql`item.agent_key = 'sav'` : sql`item.agent_key <> 'sav'`}
       AND ${input.scope === "sav" ? savResolutionIsCurrent : sql`TRUE`}
+      AND ${audienceFilter}
       AND ${typeFilter}
     ), best_per_content AS (
       SELECT DISTINCT ON (id) id, "contentVersionId", title, content, source, "verifiedAt", "actionSteps", "resolution", score
