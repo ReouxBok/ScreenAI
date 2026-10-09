@@ -108,6 +108,62 @@ test.describe('Sidebar UI', () => {
     await page.close();
   });
 
+  test('exposes an accessible mute toggle during voice chat and hides it when voice stops', async ({ context, extensionId, serviceWorker }) => {
+    await serviceWorker.evaluate(() => chrome.storage.local.set({ limova_lang: 'fr' }));
+    const page = await context.newPage();
+    await page.goto(`chrome-extension://${extensionId}/src/sidebar/sidebar.html`);
+    await page.waitForFunction(() => document.documentElement.dataset.sidebarReady === 'true');
+    await page.evaluate(() => {
+      window.LimovaVoiceSession = class {
+        constructor({ trainingMode = false } = {}) {
+          this.trainingMode = trainingMode;
+          this.active = false;
+          this.microphoneMuted = false;
+        }
+        async start() {
+          this.active = true;
+          window.dispatchEvent(new CustomEvent('limova-voice-status', { detail: { status: 'listening' } }));
+        }
+        setMicrophoneMuted(muted) {
+          if (!this.active || this.trainingMode) return false;
+          this.microphoneMuted = muted;
+          return true;
+        }
+        stop() {
+          this.active = false;
+          this.microphoneMuted = false;
+          window.dispatchEvent(new CustomEvent('limova-voice-status', { detail: { status: 'stopped' } }));
+        }
+      };
+    });
+
+    const muteButton = page.locator('#voiceMuteBtn');
+    await expect(muteButton).toBeHidden();
+    await page.locator('#voiceBtn').click();
+    await expect(page.locator('#aiConsentPanel')).toBeVisible();
+    await page.locator('#aiConsentAccept').click();
+    await page.locator('#voiceBtn').click();
+    await expect(muteButton).toBeVisible();
+    await expect(muteButton).toHaveAttribute('aria-label', 'Couper le micro');
+    await expect(muteButton).toHaveAttribute('aria-pressed', 'false');
+    await expect(page.locator('#voiceMuteStatus')).toBeHidden();
+
+    await muteButton.click();
+    await expect(muteButton).toHaveText('Réactiver le micro');
+    await expect(muteButton).toHaveAttribute('aria-pressed', 'true');
+    await expect(page.locator('#voiceMuteStatus')).toBeVisible();
+    await expect(page.locator('#voiceMuteStatus')).toHaveText('Micro coupé');
+
+    await muteButton.click();
+    await expect(muteButton).toHaveText('Couper le micro');
+    await expect(muteButton).toHaveAttribute('aria-pressed', 'false');
+    await expect(page.locator('#voiceMuteStatus')).toBeHidden();
+
+    await page.locator('#voiceBtn').click();
+    await expect(muteButton).toBeHidden();
+    await page.close();
+  });
+
   test('runs an inline degraded diagnostic without opening a popup', async ({ context, extensionId }) => {
     await context.route('https://limova-proxy-479c7fb78ccf.herokuapp.com/healthz', route => route.fulfill({
       status: 503,

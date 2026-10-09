@@ -10,6 +10,8 @@ class LimovaVoiceSession {
     this.inputContext = null;
     this.outputContext = null;
     this.captureNode = null;
+    this.microphoneMuted = false;
+    this.captureEpoch = 0;
     this.source = null;
     this.playingSources = new Set();
     this.nextPlaybackTime = 0;
@@ -444,9 +446,11 @@ class LimovaVoiceSession {
 
     this.source = this.inputContext.createMediaStreamSource(this.stream);
     this.captureNode.port.onmessage = event => {
-      if (!this.ready || this.socket?.readyState !== WebSocket.OPEN) return;
-      if (Object.prototype.toString.call(event.data) !== '[object ArrayBuffer]') return;
-      const samples = new Float32Array(event.data);
+      const frame = event.data;
+      if (!this.ready || this.microphoneMuted || this.socket?.readyState !== WebSocket.OPEN) return;
+      if (frame?.type !== 'audio' || frame.epoch !== this.captureEpoch) return;
+      if (Object.prototype.toString.call(frame.buffer) !== '[object ArrayBuffer]') return;
+      const samples = new Float32Array(frame.buffer);
       this.detectLocalInterruption(samples);
       const pcm = this.downsample(samples, this.inputContext.sampleRate, 16_000);
       this.socket.send(JSON.stringify({
@@ -455,6 +459,12 @@ class LimovaVoiceSession {
         }
       }));
     };
+    this.stream?.getAudioTracks?.().forEach(track => { track.enabled = !this.microphoneMuted; });
+    this.captureNode.port.postMessage({
+      type: 'set-muted',
+      muted: this.microphoneMuted,
+      epoch: this.captureEpoch
+    });
     this.source.connect(this.captureNode);
     // The processor emits silence on its output, preventing microphone echo
     // while keeping Chrome's rendering graph active.
@@ -900,7 +910,26 @@ class LimovaVoiceSession {
     this.stream = null;
     this.inputContext = null;
     this.outputContext = null;
+    this.microphoneMuted = false;
+    this.captureEpoch += 1;
     this.pendingPageContext = null;
+  }
+
+  setMicrophoneMuted(muted) {
+    if (this.trainingMode || !(this.active || this.starting)) return false;
+    const nextMuted = muted === true;
+    if (nextMuted === this.microphoneMuted) return false;
+
+    this.microphoneMuted = nextMuted;
+    this.captureEpoch += 1;
+    this.stream?.getAudioTracks?.().forEach(track => { track.enabled = !nextMuted; });
+    this.captureNode?.port?.postMessage({
+      type: 'set-muted',
+      muted: nextMuted,
+      epoch: this.captureEpoch
+    });
+    this.diagnostic(nextMuted ? 'VOICE_MICROPHONE_MUTED' : 'VOICE_MICROPHONE_UNMUTED');
+    return true;
   }
 
   async reconnect() {

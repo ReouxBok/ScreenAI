@@ -20,6 +20,9 @@ const elements = {
   sendBtn: document.getElementById('sendBtn'),
   screenshotBtn: document.getElementById('screenshotBtn'),
   voiceBtn: document.getElementById('voiceBtn'),
+  voiceMuteBtn: document.getElementById('voiceMuteBtn'),
+  voiceMuteLabel: document.getElementById('voiceMuteLabel'),
+  voiceMuteStatus: document.getElementById('voiceMuteStatus'),
   downloadLogsBtn: document.getElementById('downloadLogsBtn'),
   diagnoseBtn: document.getElementById('diagnoseBtn'),
   diagnosticResult: document.getElementById('diagnosticResult'),
@@ -98,6 +101,7 @@ function initEventListeners() {
   elements.sendBtn.addEventListener('click', sendMessage);
   elements.screenshotBtn.addEventListener('click', analyzePage);
   elements.voiceBtn.addEventListener('click', toggleVoice);
+  elements.voiceMuteBtn?.addEventListener('click', toggleVoiceMute);
   elements.authEmailForm?.addEventListener('submit', requestAuthenticationCode);
   elements.authCodeForm?.addEventListener('submit', verifyAuthenticationCode);
   elements.authBack?.addEventListener('click', resetAuthenticationForm);
@@ -137,7 +141,7 @@ function initEventListeners() {
   document.getElementById('langSwitcher')?.addEventListener('click', (e) => {
     const btn = e.target.closest('.lang-option');
     if (btn?.dataset.lang) {
-      setLang(btn.dataset.lang);
+      setLang(btn.dataset.lang).then(updateVoiceMuteControl);
     }
   });
 
@@ -1091,11 +1095,35 @@ async function toggleVoice() {
   } catch (_) {}
 }
 
+function toggleVoiceMute() {
+  if (!voiceSession || voiceSession.trainingMode) return;
+  const muted = !voiceSession.microphoneMuted;
+  if (voiceSession.setMicrophoneMuted(muted)) updateVoiceMuteControl();
+}
+
+function updateVoiceMuteControl() {
+  if (!elements.voiceMuteBtn) return;
+  const muted = voiceSession?.microphoneMuted === true;
+  const labelKey = muted ? 'voiceUnmute' : 'voiceMute';
+  elements.voiceMuteBtn.setAttribute('aria-pressed', String(muted));
+  elements.voiceMuteBtn.setAttribute('aria-label', t(labelKey));
+  elements.voiceMuteBtn.title = t(labelKey);
+  if (elements.voiceMuteLabel) elements.voiceMuteLabel.textContent = t(labelKey);
+  if (elements.voiceMuteStatus) {
+    elements.voiceMuteStatus.hidden = !muted;
+    elements.voiceMuteStatus.textContent = t('voiceMuted');
+  }
+}
+
 function updateVoiceStatus({ status, error, errorKey }) {
   const active = ['connecting', 'listening', 'speaking'].includes(status);
   elements.voiceBtn.classList.toggle('active', active);
   elements.voiceBtn.setAttribute('aria-pressed', String(active));
   elements.voiceBtn.title = active ? t('voiceStop') : t('voiceStart');
+  if (elements.voiceMuteBtn) {
+    elements.voiceMuteBtn.hidden = !active || voiceSession?.trainingMode === true;
+    updateVoiceMuteControl();
+  }
   if (elements.trainingMic) {
     elements.trainingMic.classList.toggle('active', active);
     elements.trainingMic.setAttribute('aria-pressed', String(active));
