@@ -8,14 +8,48 @@ vi.mock("./hubspot", () => ({ readSavHubspotContext: dependencies.crm }));
 afterEach(() => { vi.unstubAllEnvs(); vi.unstubAllGlobals(); vi.resetAllMocks(); });
 
 describe("SAV analysis controls", () => {
-  it.each(["off", "shadow", "pilot", "on"])("uses only the reviewed unsigned lead template in %s", async mode => {
+  it.each(["off", "shadow", "pilot", "on"].flatMap(mode => [
+    "Bonjour, je souhaite des informations sur Limova et acheter des crédits.",
+    "Bonjour, je souhaite des informations sur Limova. Comment configurer une intégration ?",
+    "Bonjour, je souhaite des informations sur Limova. Je suis abonné depuis un an.",
+    "Quels sont vos tarifs ? Je souhaite acheter des crédits.",
+    "Quels sont vos tarifs ? Comment configurer une intégration ?",
+    "Quels sont vos tarifs ? Je suis abonné depuis un an.",
+  ].map(body => ({ mode, body }))))("preserves human support routing instead of the lead template in $mode: $body", async ({ mode, body }) => {
+    vi.stubEnv("SAV_ADK_MODE", mode); vi.stubEnv("SAV_AI_ANALYSIS", "true"); vi.stubEnv("SAV_GEMINI_API_KEY", "");
+    vi.stubEnv("GOOGLE_API_KEY", ""); vi.stubEnv("GEMINI_API_KEY", "");
+    const template = "Bonjour, modèle commercial fictif : https://example.invalid/contact.";
+    dependencies.search.mockImplementation(async ({ savAudience }) => ({ revision: "fixture", results: savAudience === "lead" ? [{
+      id: "fixture-lead", contentVersionId: "fixture-v1", title: "Fixture", content: template, score: 0.9,
+      verifiedAt: new Date().toISOString(), resolution: { audience: "lead", responseTemplate: template,
+        symptoms: ["Découverte"], steps: ["Formulaire fictif"], escalation: "Humain" },
+    }] : [] }));
+    dependencies.crm.mockResolvedValue({ contactFound: false, tickets: [], routing: { kind: "new", reason: "no_contact" } });
+    const network = vi.fn(); vi.stubGlobal("fetch", network);
+    const result = await analyzeSavMessage({ from: "fixture@example.invalid", subject: "Informations Limova", body });
+    expect(result.proposal.reasonCode).not.toMatch(/^lead_/);
+    expect(result.replyDraft).not.toBe(template);
+    expect(result.proposal.requiresHumanApproval).toBe(true);
+    expect(result.ticketRouting).toMatchObject({ kind: "review", reason: "customer_identity_unverified" });
+    expect(dependencies.crm).toHaveBeenCalledOnce();
+    expect(dependencies.search).not.toHaveBeenCalledWith(expect.objectContaining({ savAudience: "lead" }));
+    if (/crédits/.test(body)) {
+      expect(result.category).toBe("billing");
+      expect(result.replyDraft).toContain("Les questions financières sont traitées par l’équipe Limova");
+    }
+    expect(network).not.toHaveBeenCalled();
+  });
+  it.each(["off", "shadow", "pilot", "on"].flatMap(mode => [
+    "Bonjour, je souhaite des informations sur un produit Limova avant achat.",
+    "Quels sont vos tarifs ?", "Quel est le prix de Limova Team avant achat ?",
+  ].map(body => ({ mode, body }))))("uses only the reviewed unsigned lead template in $mode: $body", async ({ mode, body }) => {
     vi.stubEnv("SAV_ADK_MODE", mode); vi.stubEnv("SAV_AI_ANALYSIS", "true");
     const template = "Bonjour, voici un formulaire fictif : https://example.invalid/demo.";
     dependencies.search.mockResolvedValue({ revision: "fixture-lead-revision", results: [{ id: "lead-fixture", contentVersionId: "lead-version", title: "Modèle fictif", content: template,
       score: 0.9, verifiedAt: new Date().toISOString().slice(0, 10), resolution: { audience: "lead", responseTemplate: template,
         symptoms: ["Découvrir le produit"], steps: ["Orienter vers le formulaire fictif"], escalation: "Qualifier humainement en cas de doute" } }] });
     const network = vi.fn(); vi.stubGlobal("fetch", network);
-    const result = await analyzeSavMessage({ from: "lead@example.invalid", subject: "Découverte", body: "Bonjour, je souhaite des informations sur un produit Limova avant achat." });
+    const result = await analyzeSavMessage({ from: "lead@example.invalid", subject: "Découverte", body });
     expect(result.replyDraft).toBe(template);
     expect(result.proposal).toMatchObject({ kind: "human_review_required", reasonCode: "lead_product_information", requiresHumanApproval: true });
     expect(result.ticketRouting).toMatchObject({ kind: "none" });
