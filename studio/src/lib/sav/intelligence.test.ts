@@ -8,6 +8,46 @@ vi.mock("./hubspot", () => ({ readSavHubspotContext: dependencies.crm }));
 afterEach(() => { vi.unstubAllEnvs(); vi.unstubAllGlobals(); vi.resetAllMocks(); });
 
 describe("SAV analysis controls", () => {
+  it.each(["off", "shadow", "pilot", "on"])("uses only the reviewed unsigned lead template in %s", async mode => {
+    vi.stubEnv("SAV_ADK_MODE", mode); vi.stubEnv("SAV_AI_ANALYSIS", "true");
+    const template = "Bonjour, voici un formulaire fictif : https://example.invalid/demo.";
+    dependencies.search.mockResolvedValue({ revision: "fixture-lead-revision", results: [{ id: "lead-fixture", contentVersionId: "lead-version", title: "Modèle fictif", content: template,
+      score: 0.9, verifiedAt: new Date().toISOString().slice(0, 10), resolution: { audience: "lead", responseTemplate: template,
+        symptoms: ["Découvrir le produit"], steps: ["Orienter vers le formulaire fictif"], escalation: "Qualifier humainement en cas de doute" } }] });
+    const network = vi.fn(); vi.stubGlobal("fetch", network);
+    const result = await analyzeSavMessage({ from: "lead@example.invalid", subject: "Découverte", body: "Bonjour, je souhaite des informations sur un produit Limova avant achat." });
+    expect(result.replyDraft).toBe(template);
+    expect(result.proposal).toMatchObject({ kind: "human_review_required", reasonCode: "lead_product_information", requiresHumanApproval: true });
+    expect(result.ticketRouting).toMatchObject({ kind: "none" });
+    expect(result.evidence).toContainEqual(expect.objectContaining({ sourceId: "lead-fixture", contentVersionId: "lead-version" }));
+    expect(result.structuredProposal?.sources[0].contentVersionId).toBe("lead-version");
+    expect(result.structuredProposal?.process.map(step => step.kind)).toEqual(["human_review", "review_reply"]);
+    expect(dependencies.search).toHaveBeenCalledWith(expect.objectContaining({ scope: "sav", savAudience: "lead", locale: "fr-FR" }));
+    expect(dependencies.crm).not.toHaveBeenCalled(); expect(dependencies.agent).not.toHaveBeenCalled(); expect(network).not.toHaveBeenCalled();
+    expect(result.replyDraft).not.toMatch(/Charly|IA|compte Limova/);
+  });
+  it.each([false, true])("leaves a lead without a draft when the model is unavailable or analysis disabled: %s", async disabled => {
+    vi.stubEnv("SAV_AI_ANALYSIS", disabled ? "false" : "true");
+    dependencies.search.mockResolvedValue({ revision: "kb_empty", results: [] });
+    const result = await analyzeSavMessage({ from: "lead@example.invalid", subject: "Tarifs", body: "Quels sont vos tarifs ?" });
+    expect(result.replyDraft).toBeNull(); expect(result.ticketRouting?.kind).toBe("none");
+    expect(result.proposal.reasonCode).toBe("lead_template_unavailable");
+    expect(dependencies.crm).not.toHaveBeenCalled(); expect(dependencies.agent).not.toHaveBeenCalled();
+    if (disabled) expect(dependencies.search).not.toHaveBeenCalled();
+  });
+  it("keeps knowledge failure explicit without inventing a lead response", async () => {
+    vi.stubEnv("SAV_AI_ANALYSIS", "true"); dependencies.search.mockRejectedValue(new Error("fixture lookup failure"));
+    const logger = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    const result = await analyzeSavMessage({ from: "lead@example.invalid", subject: "Découverte", body: "Je souhaite une démonstration de Limova." });
+    expect(result.replyDraft).toBeNull(); expect(result.diagnostics).toContainEqual({ phase: "knowledge", errorCode: "SAV_KNOWLEDGE_LOOKUP_FAILED" });
+    expect(result.ticketRouting?.kind).toBe("none"); expect(dependencies.crm).not.toHaveBeenCalled(); logger.mockRestore();
+  });
+  it("requires an analysis trace for a lead too", async () => {
+    vi.stubEnv("SAV_AI_ANALYSIS", "false");
+    const logger = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    await expect(analyzeSavMessage({ from: "lead@example.invalid", subject: "Découverte", body: "Je souhaite une démonstration de Limova." }, { messageId: "unavailable" })).rejects.toThrow("SAV_ANALYSIS_TRACE_REQUIRED");
+    logger.mockRestore();
+  });
   it.each(["off", "shadow", "pilot", "on"])("financial requests use only a standard draft and no model/knowledge search in %s", async mode => {
     vi.stubEnv("SAV_ADK_MODE", mode); vi.stubEnv("SAV_AI_ANALYSIS", "true"); vi.stubEnv("SAV_GEMINI_API_KEY", "fixture");
     dependencies.crm.mockResolvedValue({ contactFound: false, tickets: [], routing: { kind: "new", reason: "no_contact" } });
@@ -85,7 +125,6 @@ describe("SAV analysis controls", () => {
     { from: "robot@mailinblack.com", subject: "Vérification", body: "Veuillez authentifier votre adresse expéditeur." },
     { from: "sales@example.com", subject: "Nos services", body: "Nous vous proposons des services de marketing." },
     { from: "partner@example.com", subject: "Partenariat", body: "Je souhaite un partenariat avec Limova." },
-    { from: "prospect@example.com", subject: "Tarifs", body: "Quels sont vos tarifs ?" },
   ])("does not ask for a registration address or propose a ticket for non-support: %s", async input => {
     vi.stubEnv("SAV_ADK_MODE", "on"); vi.stubEnv("SAV_AI_ANALYSIS", "true"); vi.stubEnv("SAV_GEMINI_API_KEY", "fixture");
     const result = await analyzeSavMessage(input);

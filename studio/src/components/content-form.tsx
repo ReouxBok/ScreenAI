@@ -9,6 +9,8 @@ const join = (value: unknown) => Array.isArray(value) ? value.join("\n") : "";
 export function ContentForm({ defaults }: { defaults: Defaults }) {
   const meta = defaults.metadata ?? {};
   const type = defaults.type ?? "article";
+  const resolution = (meta.resolution ?? {}) as Record<string, unknown>;
+  const source = ((meta.sourceMetadata as Record<string, unknown> | undefined)?.editorialSource ?? {}) as Record<string, unknown>;
   return <form id="content-editor-form" action={saveContentAction}>
     <input type="hidden" name="itemId" value={defaults.id ?? ""}/>
     <input type="hidden" name="type" value={type}/>
@@ -37,6 +39,23 @@ export function ContentForm({ defaults }: { defaults: Defaults }) {
       <div className="field"><label htmlFor="prerequisites">Prérequis</label><textarea id="prerequisites" name="prerequisites" defaultValue={join(meta.prerequisites)}/></div>
       <div className="field"><label htmlFor="expectedResult">Résultat attendu</label><textarea id="expectedResult" name="expectedResult" defaultValue={String(meta.expectedResult ?? "")}/></div>
       <div className="field"><label htmlFor="troubleshooting">Dépannage</label><textarea id="troubleshooting" name="troubleshooting" defaultValue={String(meta.troubleshooting ?? "")}/></div>
+      {defaults.agentKey === "sav" && <fieldset>
+        <legend>Conditions d’utilisation de la connaissance SAV</legend>
+        <p>Précisez les demandes auxquelles cette fiche répond et la conduite à tenir. L’enregistrement prépare une version privée ; l’utilisation par l’agent nécessite une publication et une activation distinctes.</p>
+        <input type="hidden" name="savResolution" value="on"/>
+        <div className="field"><label htmlFor="savAudience">Public concerné</label><select id="savAudience" name="savAudience" defaultValue={String(resolution.audience ?? "support")}><option value="support">Client demandant du support</option><option value="lead">Lead demandant des informations produit avant achat</option></select></div>
+        <div className="field"><label htmlFor="savResponseTemplate">Modèle de réponse pour un lead (sans signature)</label><textarea id="savResponseTemplate" name="savResponseTemplate" maxLength={8000} defaultValue={String(resolution.responseTemplate ?? "")}/><p>Requis pour un lead. La signature Charly et la mention IA sont ajoutées uniquement à l’envoi humain.</p></div>
+        <div className="field"><label htmlFor="savSymptoms">Demandes concernées (une ligne chacune)</label><textarea id="savSymptoms" name="savSymptoms" required defaultValue={join(resolution.symptoms)}/></div>
+        <div className="field"><label htmlFor="savSteps">Conduite à tenir (une ligne par étape)</label><textarea id="savSteps" name="savSteps" required defaultValue={join(resolution.steps)}/></div>
+        <div className="field"><label htmlFor="savExceptions">Exceptions (une ligne chacune)</label><textarea id="savExceptions" name="savExceptions" defaultValue={join(resolution.exceptions)}/></div>
+        <div className="field"><label htmlFor="savEscalation">Quand demander une qualification humaine</label><textarea id="savEscalation" name="savEscalation" required minLength={3} defaultValue={String(resolution.escalation ?? meta.troubleshooting ?? "")}/></div>
+        <div className="form-grid">
+          <div className="field"><label htmlFor="savProductVersion">Version du produit (facultatif)</label><input id="savProductVersion" name="savProductVersion" defaultValue={String(resolution.productVersion ?? "")}/></div>
+          <div className="field"><label htmlFor="savValidUntil">Valable jusqu’au (facultatif)</label><input id="savValidUntil" name="savValidUntil" type="date" defaultValue={String(resolution.validUntil ?? "")}/></div>
+        </div>
+        <div className="field"><label htmlFor="savSourceReference">Source du contenu fourni</label><textarea id="savSourceReference" name="savSourceReference" required minLength={3} maxLength={1000} defaultValue={String(source.reference ?? "")}/></div>
+        <div className="field"><label htmlFor="savSourceDate">Date du contenu fourni</label><input id="savSourceDate" name="savSourceDate" type="date" required defaultValue={String(source.suppliedOn ?? "")}/></div>
+      </fieldset>}
     </>}
     <div className="field"><label>Contenu</label><MarkdownEditor name="bodyMarkdown" initialValue={defaults.bodyMarkdown ?? "## Objectif\n\nDécrivez ici ce que le membre Limova doit accomplir.\n\n## Étapes\n\n1. Première étape\n2. Deuxième étape"}/></div>
     <input type="hidden" name="ownerEmail" value={defaults.ownerEmail}/>
