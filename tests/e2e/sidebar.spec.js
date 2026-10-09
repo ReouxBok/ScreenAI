@@ -129,10 +129,10 @@ test.describe('Sidebar UI', () => {
           this.microphoneMuted = muted;
           return true;
         }
-        stop() {
+        stop(notify = true) {
           this.active = false;
           this.microphoneMuted = false;
-          window.dispatchEvent(new CustomEvent('limova-voice-status', { detail: { status: 'stopped' } }));
+          if (notify) window.dispatchEvent(new CustomEvent('limova-voice-status', { detail: { status: 'stopped', session: this } }));
         }
       };
     });

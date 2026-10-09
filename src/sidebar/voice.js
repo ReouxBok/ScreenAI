@@ -21,6 +21,8 @@ class LimovaVoiceSession {
     this.reconnecting = false;
     this.transcriptFlushTimer = null;
     this.starting = false;
+    this.lifecycleId = 0;
+    this.cancelSocketSetup = null;
     this.operationId = null;
     this.reconnectAttempts = 0;
     this.receivedFrameCount = 0;
@@ -50,7 +52,9 @@ class LimovaVoiceSession {
   }
 
   emit(name, detail = {}) {
-    window.dispatchEvent(new CustomEvent(name, { detail }));
+    const event = new CustomEvent(name, { detail });
+    event.voiceSession = this;
+    window.dispatchEvent(event);
   }
 
   diagnostic(code, data = {}) {
@@ -146,18 +150,22 @@ class LimovaVoiceSession {
 
   async start() {
     if (this.active || this.starting) return;
+    const lifecycleId = ++this.lifecycleId;
     this.starting = true;
     this.reconnectAttempts = 0;
     this.operationId = `voice-${crypto.randomUUID()}`;
     this.diagnostic('VOICE_SESSION_STARTED');
     this.emit('limova-voice-status', { status: 'connecting' });
     try {
-      this.stream = await this.requestMicrophone();
+      const stream = await this.requestMicrophone(lifecycleId);
+      if (lifecycleId !== this.lifecycleId) return;
+      this.stream = stream;
 
       const tokenData = await chrome.runtime.sendMessage({
         type: 'GET_LIVE_TOKEN',
         context: { trainingMode: this.trainingMode }
       });
+      if (lifecycleId !== this.lifecycleId) return;
       if (!tokenData?.ok || !tokenData.token) {
         if (tokenData?.consentRequired) this.emit('limova-voice-consent-required');
         throw new Error(tokenData?.error || 'Jeton vocal indisponible.');
@@ -167,9 +175,12 @@ class LimovaVoiceSession {
       this.queueVisualCapture(tokenData.visualCapture, tokenData.contextVersion, 'session_start');
       this.diagnostic('VOICE_LIVE_TOKEN_RECEIVED', { model: tokenData.model || 'unknown' });
       await this.openSocket(tokenData);
-      await this.startCapture();
+      if (lifecycleId !== this.lifecycleId) return;
+      await this.startCapture(lifecycleId);
+      if (lifecycleId !== this.lifecycleId) return;
       this.markBackgroundVoiceState(true);
     } catch (error) {
+      if (lifecycleId !== this.lifecycleId) return;
       const diagnosticCode = error.voiceDiagnosticCode || (error.voiceErrorKey
         ? String(error.voiceErrorKey).replace(/([a-z])([A-Z])/g, '$1_$2').toUpperCase()
         : 'VOICE_SESSION_FAILED');
@@ -182,11 +193,11 @@ class LimovaVoiceSession {
       });
       throw error;
     } finally {
-      this.starting = false;
+      if (lifecycleId === this.lifecycleId) this.starting = false;
     }
   }
 
-  async requestMicrophone() {
+  async requestMicrophone(lifecycleId = this.lifecycleId) {
     if (!navigator.mediaDevices?.getUserMedia) {
       const error = new Error('Microphone API unavailable.');
       error.voiceErrorKey = 'voiceMicUnsupported';
@@ -195,10 +206,15 @@ class LimovaVoiceSession {
 
     try {
       await this.ensureMicrophonePermission();
+      if (lifecycleId !== this.lifecycleId) return null;
       const stream = await navigator.mediaDevices.getUserMedia({
         audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true, autoGainControl: true },
         video: false
       });
+      if (lifecycleId !== this.lifecycleId) {
+        stream.getTracks().forEach(track => track.stop());
+        return null;
+      }
       this.diagnostic('VOICE_MICROPHONE_ACQUIRED', { trackCount: stream.getAudioTracks?.().length || 0 });
       return stream;
     } catch (cause) {
@@ -281,6 +297,7 @@ class LimovaVoiceSession {
   }
 
   openSocket(tokenData) {
+    const lifecycleId = this.lifecycleId;
     return new Promise((resolve, reject) => {
       const endpoint = 'wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContentConstrained';
       const socket = new WebSocket(`${endpoint}?access_token=${encodeURIComponent(tokenData.token)}`);
@@ -295,10 +312,14 @@ class LimovaVoiceSession {
         if (setupSettled || this.ready) return;
         setupSettled = true;
         clearTimeout(timeout);
+        if (this.cancelSocketSetup === cancelSetup) this.cancelSocketSetup = null;
         error.voiceDiagnosticCode = code;
         this.diagnostic(code, data);
         reject(error);
       };
+      const cancelSetup = () => failSetup(new Error('Session vocale annulée.'), 'LIVE_SETUP_CANCELLED');
+      this.cancelSocketSetup = cancelSetup;
+      const isCurrent = () => lifecycleId === this.lifecycleId && socket === this.socket;
       const timeout = setTimeout(() => failSetup(
         new Error('Connexion vocale expirée.'),
         'LIVE_SETUP_TIMEOUT',
@@ -306,6 +327,7 @@ class LimovaVoiceSession {
       ), 12_000);
 
       socket.addEventListener('open', () => {
+        if (!isCurrent()) return;
         this.diagnostic('LIVE_WS_OPENED');
         socket.send(JSON.stringify({
           setup: {
@@ -330,6 +352,7 @@ class LimovaVoiceSession {
         }));
       });
       socket.addEventListener('message', async event => {
+        if (!isCurrent()) return;
         const frame = this.describeSocketData(event.data);
         this.receivedFrameCount += 1;
         let raw;
@@ -342,6 +365,7 @@ class LimovaVoiceSession {
           });
           return;
         }
+        if (!isCurrent()) return;
         let message;
         try {
           message = JSON.parse(raw);
@@ -368,6 +392,7 @@ class LimovaVoiceSession {
         if (message.setupComplete && !this.ready) {
           clearTimeout(timeout);
           setupSettled = true;
+          if (this.cancelSocketSetup === cancelSetup) this.cancelSocketSetup = null;
           this.ready = true;
           this.diagnostic('LIVE_SETUP_COMPLETED');
           this.emit('limova-voice-status', { status: 'listening' });
@@ -378,12 +403,14 @@ class LimovaVoiceSession {
         this.handleServerMessage(message);
       });
       socket.addEventListener('error', () => {
+        if (!isCurrent()) return;
         failSetup(new Error('Connexion vocale impossible.'), 'LIVE_WS_ERROR');
       });
       socket.addEventListener('close', event => {
         clearTimeout(timeout);
         this.diagnostic('LIVE_WS_CLOSED', { code: event.code, clean: event.wasClean, reasonLength: String(event.reason || '').length });
-        if (socket !== this.socket) return;
+        if (!isCurrent()) return;
+        failSetup(new Error('Connexion vocale fermée.'), 'LIVE_SETUP_CLOSED');
         const wasActive = this.active;
         this.socket = null;
         this.ready = false;
@@ -393,11 +420,12 @@ class LimovaVoiceSession {
           this.reconnectAttempts += 1;
           this.diagnostic('LIVE_WS_AUTOMATIC_RECOVERY_SCHEDULED', { attempt: this.reconnectAttempts, code: event.code });
           this.emit('limova-voice-status', { status: 'connecting' });
-          setTimeout(() => this.reconnect().catch(() => {}), 500);
+          setTimeout(() => {
+            if (lifecycleId === this.lifecycleId) this.reconnect().catch(() => {});
+          }, 500);
           return;
         }
-        this.markBackgroundVoiceState(false);
-        this.cleanupMedia();
+        this.stop(false);
         if (wasActive) this.emit('limova-voice-status', { status: event.wasClean ? 'stopped' : 'error' });
       });
     });
@@ -419,20 +447,23 @@ class LimovaVoiceSession {
     throw new TypeError('Unsupported WebSocket frame type');
   }
 
-  async startCapture() {
-    this.inputContext = new AudioContext();
-    await this.inputContext.resume();
-    if (!this.inputContext.audioWorklet || typeof AudioWorkletNode !== 'function') {
+  async startCapture(lifecycleId = this.lifecycleId) {
+    const context = new AudioContext();
+    this.inputContext = context;
+    await context.resume();
+    if (lifecycleId !== this.lifecycleId) return;
+    if (!context.audioWorklet || typeof AudioWorkletNode !== 'function') {
       const error = new Error('Le moteur audio moderne de Chrome est indisponible.');
       error.voiceDiagnosticCode = 'VOICE_AUDIO_WORKLET_UNAVAILABLE';
       throw error;
     }
 
     try {
-      await this.inputContext.audioWorklet.addModule(
+      await context.audioWorklet.addModule(
         chrome.runtime.getURL('src/sidebar/audio-input-worklet.js')
       );
-      this.captureNode = new AudioWorkletNode(this.inputContext, 'limova-audio-input', {
+      if (lifecycleId !== this.lifecycleId) return;
+      this.captureNode = new AudioWorkletNode(context, 'limova-audio-input', {
         numberOfInputs: 1,
         numberOfOutputs: 1,
         outputChannelCount: [1]
@@ -447,7 +478,7 @@ class LimovaVoiceSession {
     this.source = this.inputContext.createMediaStreamSource(this.stream);
     this.captureNode.port.onmessage = event => {
       const frame = event.data;
-      if (!this.ready || this.microphoneMuted || this.socket?.readyState !== WebSocket.OPEN) return;
+      if (lifecycleId !== this.lifecycleId || !this.ready || this.microphoneMuted || this.socket?.readyState !== WebSocket.OPEN) return;
       if (frame?.type !== 'audio' || frame.epoch !== this.captureEpoch) return;
       if (Object.prototype.toString.call(frame.buffer) !== '[object ArrayBuffer]') return;
       const samples = new Float32Array(frame.buffer);
@@ -806,8 +837,11 @@ class LimovaVoiceSession {
 
   async playPcm(base64, sampleRate) {
     if (this.localInterruptionPending || Date.now() < this.suppressPlaybackUntil) return false;
+    const lifecycleId = this.lifecycleId;
     this.outputContext ||= new AudioContext({ sampleRate });
-    if (this.outputContext.state === 'suspended') await this.outputContext.resume();
+    const context = this.outputContext;
+    if (context.state === 'suspended') await context.resume();
+    if (lifecycleId !== this.lifecycleId) return false;
     const binary = atob(base64);
     const bytes = new Uint8Array(binary.length);
     for (let index = 0; index < binary.length; index += 1) bytes[index] = binary.charCodeAt(index);
@@ -825,7 +859,7 @@ class LimovaVoiceSession {
     this.nextPlaybackTime = startAt + buffer.duration;
     this.playingSources.add(source);
     source.onended = () => {
-      this.playingSources.delete(source);
+      if (lifecycleId !== this.lifecycleId || !this.playingSources.delete(source)) return;
       if (this.playingSources.size === 0) {
         this.emit('limova-voice-status', { status: 'listening' });
         this.flushDeferredObservations();
@@ -876,6 +910,7 @@ class LimovaVoiceSession {
 
   clearPlayback() {
     for (const source of this.playingSources) {
+      source.onended = null;
       try { source.stop(); } catch (_) {}
     }
     this.playingSources.clear();
@@ -934,6 +969,7 @@ class LimovaVoiceSession {
 
   async reconnect() {
     if (this.reconnecting || !this.tokenData || new Date(this.tokenData.expiresAt).getTime() <= Date.now()) return;
+    const lifecycleId = this.lifecycleId;
     this.reconnecting = true;
     this.diagnostic('LIVE_WS_RECONNECT_STARTED');
     this.ready = false;
@@ -943,22 +979,30 @@ class LimovaVoiceSession {
       const connection = this.openSocket(this.tokenData);
       previous?.close(1000, 'session-resumption');
       await connection;
+      if (lifecycleId !== this.lifecycleId) return;
       this.diagnostic('LIVE_WS_RECONNECT_SUCCEEDED');
     } catch (error) {
+      if (lifecycleId !== this.lifecycleId) return;
       this.diagnostic('LIVE_WS_RECONNECT_FAILED', { name: error.name, message: error.message });
       this.stop(false);
       this.emit('limova-voice-status', { status: 'error', error: error.message });
     } finally {
-      this.reconnecting = false;
+      if (lifecycleId === this.lifecycleId) this.reconnecting = false;
     }
   }
 
   stop(notify = true) {
+    this.lifecycleId += 1;
+    this.starting = false;
+    this.cancelSocketSetup?.();
+    this.cancelSocketSetup = null;
     const socket = this.socket;
     this.socket = null;
     this.ready = false;
     this.reconnecting = false;
     this.reconnectAttempts = 0;
+    this.tokenData = null;
+    this.resumptionHandle = null;
     this.markBackgroundVoiceState(false);
     if (socket?.readyState === WebSocket.OPEN) {
       try { socket.send(JSON.stringify({ realtimeInput: { audioStreamEnd: true } })); } catch (_) {}

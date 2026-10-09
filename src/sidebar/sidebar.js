@@ -188,13 +188,22 @@ function initEventListeners() {
     if (actionButton) handleActionDecision(actionButton.dataset.actionId, actionButton.dataset.decision === 'confirm');
   });
 
-  window.addEventListener('limova-voice-status', event => updateVoiceStatus(event.detail));
-  window.addEventListener('limova-voice-transcript', event => handleVoiceTranscript(event.detail));
-  window.addEventListener('limova-voice-consent-required', () => showAIConsent());
+  window.addEventListener('limova-voice-status', event => {
+    if (event.voiceSession && event.voiceSession !== voiceSession) return;
+    updateVoiceStatus(event.detail);
+  });
+  window.addEventListener('limova-voice-transcript', event => {
+    if (event.voiceSession && event.voiceSession !== voiceSession) return;
+    handleVoiceTranscript(event.detail);
+  });
+  window.addEventListener('limova-voice-consent-required', event => {
+    if (event.voiceSession && event.voiceSession !== voiceSession) return;
+    showAIConsent();
+  });
   window.addEventListener('limova-training-screen-ended', handleTrainingScreenEnded);
   window.addEventListener('limova-training-recording-limit', handleTrainingRecordingLimit);
   window.addEventListener('pagehide', () => {
-    voiceSession?.stop(false);
+    stopVoiceSession();
     if (trainingCaptureActive) {
       trainingScreenRecorder?.abort();
       chrome.runtime.sendMessage({ type: 'CANCEL_TRAINING' }).catch(() => {});
@@ -308,8 +317,7 @@ function setAuthenticationVisible(required) {
   elements.authPanel.hidden = !required;
   document.documentElement.dataset.authState = required ? 'required' : 'authenticated';
   if (required) {
-    voiceSession?.stop(false);
-    voiceSession = null;
+    stopVoiceSession();
     setTimeout(() => elements.authEmail?.focus(), 0);
   }
 }
@@ -437,8 +445,7 @@ async function startTrainingCapture() {
   }
   elements.trainingFeedback.textContent = 'Dans Chrome, sélectionne « Écran entier ». La démonstration démarrera ensuite.';
   elements.trainingStart.disabled = true;
-  if (voiceSession?.active) voiceSession.stop(false);
-  voiceSession = null;
+  stopVoiceSession();
   const RecorderClass = window.LimovaTrainingScreenRecorder;
   trainingScreenRecorder = RecorderClass ? new RecorderClass() : null;
   try {
@@ -566,8 +573,7 @@ function showTrainingActive(session) {
 
 async function stopTrainingCapture() {
   elements.trainingStop.disabled = true;
-  if (voiceSession?.active) voiceSession.stop();
-  voiceSession = null;
+  stopVoiceSession();
   if (!trainingScreenRecorder || !activeTrainingSession || !activeTrainingToken) {
     elements.trainingStop.disabled = false;
     elements.trainingFeedback.textContent = 'La vidéo complète est absente. Recommence cette démonstration depuis le Studio.';
@@ -636,8 +642,7 @@ async function handleTrainingScreenEnded() {
   trainingScreenRecorder = null;
   activeTrainingSession = null;
   activeTrainingToken = '';
-  if (voiceSession?.active) voiceSession.stop(false);
-  voiceSession = null;
+  stopVoiceSession();
   await chrome.runtime.sendMessage({ type: 'CANCEL_TRAINING' }).catch(() => {});
   elements.trainingMic.hidden = true;
   elements.trainingStop.hidden = true;
@@ -1028,9 +1033,8 @@ async function sendMessage() {
 
   // Text and Live voice must never own the same user turn. Closing the voice
   // session first prevents a late Live tool call from racing the text runner.
-  if (voiceSession?.active) {
-    voiceSession.stop(false);
-    voiceSession = null;
+  if (voiceSession?.active || voiceSession?.starting) {
+    stopVoiceSession();
     await chrome.runtime.sendMessage({ type: 'VOICE_SESSION_STATE', active: false }).catch(() => {});
   }
 
@@ -1081,9 +1085,16 @@ function sendNextStepRequest() {
   });
 }
 
+function stopVoiceSession() {
+  const session = voiceSession;
+  voiceSession = null;
+  session?.stop(false);
+  updateVoiceStatus({ status: 'stopped' });
+}
+
 async function toggleVoice() {
-  if (voiceSession?.active) {
-    voiceSession.stop();
+  if (voiceSession?.active || voiceSession?.starting) {
+    stopVoiceSession();
     return;
   }
   if (!(await ensureAIConsent())) return;
@@ -1120,8 +1131,10 @@ function updateVoiceStatus({ status, error, errorKey }) {
   elements.voiceBtn.classList.toggle('active', active);
   elements.voiceBtn.setAttribute('aria-pressed', String(active));
   elements.voiceBtn.title = active ? t('voiceStop') : t('voiceStart');
+  const controlsVisible = active && voiceSession?.trainingMode !== true;
+  document.getElementById('voiceControls').hidden = !controlsVisible;
   if (elements.voiceMuteBtn) {
-    elements.voiceMuteBtn.hidden = !active || voiceSession?.trainingMode === true;
+    elements.voiceMuteBtn.hidden = !controlsVisible;
     updateVoiceMuteControl();
   }
   if (elements.trainingMic) {
@@ -1227,8 +1240,7 @@ function handleTabWarningClick() {
 async function resetSession() {
   if (!confirm(t('resetConfirm'))) return;
   try {
-    voiceSession?.stop(false);
-    voiceSession = null;
+    stopVoiceSession();
     voiceTranscriptBuffers.user = '';
     voiceTranscriptBuffers.assistant = '';
     await chrome.runtime.sendMessage({ type: 'RESET_SESSION' });

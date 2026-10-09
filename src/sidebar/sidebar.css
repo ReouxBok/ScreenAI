@@ -1036,6 +1036,16 @@ body {
   box-shadow: var(--shadow-sm);
 }
 
+.voice-controls {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin: 8px 12px 0;
+}
+
+.voice-controls[hidden] { display: none; }
+
 .voice-mute-btn {
   display: inline-flex;
   align-items: center;
@@ -1077,6 +1087,7 @@ body {
 
 #userInput {
   flex: 1;
+  min-width: 0;
   min-height: 32px;
   max-height: 120px;
   padding: var(--spacing-sm) 0;
