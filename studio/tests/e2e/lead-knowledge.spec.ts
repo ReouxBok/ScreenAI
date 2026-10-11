@@ -1,0 +1,40 @@
+import { expect, test } from "@playwright/test";
+
+test("SAV-40 : Ugo prépare et réédite un modèle lead privé sans l’activer", async ({ page, request }) => {
+  test.setTimeout(120_000);
+  await page.setExtraHTTPHeaders({ "x-studio-test-user": "ugo@limova.ai" });
+  const errors: string[] = []; page.on("pageerror", error => errors.push(error.message));
+  await page.goto("/studio/sav/connaissances");
+  await page.getByRole("link", { name: "Préparer une connaissance SAV" }).click();
+  await page.getByRole("textbox", { name: "Titre", exact: true }).fill("Découverte produit fictive SAV40 E2E");
+  await page.getByLabel("Slug stable").fill("lead-knowledge-sav40-e2e");
+  await page.getByLabel("Résumé").fill("Modèle synthétique de découverte avant achat.");
+  await page.getByLabel("Intentions / signaux").fill("Informations produit avant achat");
+  await page.getByLabel("Public concerné").selectOption("lead");
+  const template = "Bonjour, voici un formulaire fictif : https://example.invalid/demo.";
+  await page.getByLabel("Modèle de réponse pour un lead").fill(template);
+  await page.getByLabel("Demandes concernées").fill("Lead demandant des informations avant achat");
+  await page.getByLabel("Conduite à tenir").fill("Orienter vers le formulaire fictif");
+  await page.getByLabel("Quand demander une qualification humaine").fill("Intention incertaine : qualification humaine");
+  await page.getByLabel("Source du contenu fourni").fill("Source de recette entièrement fictive");
+  await page.getByLabel("Date du contenu fourni").fill(new Date().toISOString().slice(0, 10));
+  await page.locator(".tiptap").fill("## Modèle fictif\n\n" + template);
+  await page.getByLabel("Commentaire de modification").fill("Recette isolée SAV40");
+  await page.getByRole("button", { name: "Enregistrer le brouillon" }).click();
+  await expect(page).toHaveURL(/\/studio\/contenus\/[0-9a-f-]+$/);
+  await expect(page.getByText("Brouillon", { exact: true }).first()).toBeVisible();
+  await expect(page.getByLabel("Public concerné")).toHaveValue("lead");
+  await expect(page.getByLabel("Modèle de réponse pour un lead")).toHaveValue(template);
+  await expect(page.getByLabel("Source du contenu fourni")).toHaveValue("Source de recette entièrement fictive");
+  await page.getByLabel("Résumé").fill("Résumé corrigé, modèle inchangé.");
+  await page.getByLabel("Commentaire de modification").fill("Réédition fictive SAV40");
+  await page.getByRole("button", { name: "Enregistrer la mise à jour" }).click();
+  await expect(page.getByLabel("Modèle de réponse pour un lead")).toHaveValue(template);
+  await page.getByRole("button", { name: "Demander la validation" }).click();
+  await expect(page.getByText("À valider", { exact: true }).first()).toBeVisible();
+  const response = await request.post("/api/internal/knowledge/search", { headers: { Authorization: "Bearer e2e-service-token-that-is-at-least-32-characters" },
+    data: { query: "Informations produit avant achat", scope: "sav", savAudience: "lead", contentTypes: ["article"] } });
+  expect(response.ok()).toBe(true); expect((await response.json()).results).toEqual([]);
+  await page.screenshot({ path: "test-results/sav40-lead-private.jpg", fullPage: true });
+  expect(errors).toEqual([]);
+});

@@ -6,18 +6,19 @@ import type { getSavProposalReview } from "@/lib/sav/review";
 import type { SavStructuredProposal } from "@/lib/sav/proposal";
 
 const dependencies = vi.hoisted(() => ({
-  eligible: vi.fn().mockResolvedValue(true), auth: vi.fn(), detail: vi.fn(), review: vi.fn(), related: vi.fn(), stage: vi.fn(), notFound: vi.fn(), drafts: vi.fn(),
+  observations: vi.fn().mockResolvedValue([]), eligible: vi.fn().mockResolvedValue(true), auth: vi.fn(), detail: vi.fn(), review: vi.fn(), related: vi.fn(), stage: vi.fn(), notFound: vi.fn(), drafts: vi.fn(),
   actions: {
     refreshSavContextAction: vi.fn(), repairSavProposalAction: vi.fn(),
     approveDraftAction: vi.fn(), correctDecisionAction: vi.fn(), createTicketAction: vi.fn(),
     linkTicketAction: vi.fn(), reconcileTicketAction: vi.fn(), requestHumanAction: vi.fn(),
-    retryAction: vi.fn(), retryAnalysisAction: vi.fn(), reviewPilotItemAction: vi.fn(), reviewProposalAction: vi.fn(), saveReplyDraftAction: vi.fn(), sendStudioReplyAction: vi.fn(),
+    retryAction: vi.fn(), retryAnalysisAction: vi.fn(), reviewPilotItemAction: vi.fn(), qualifyObservationAction: vi.fn(), reviewDraftAction: vi.fn(), reviewProposalAction: vi.fn(), saveReplyDraftAction: vi.fn(), sendStudioReplyAction: vi.fn(),
   },
 }));
 vi.mock("@/lib/sav/cutover", () => ({ isSavMessageEligible: dependencies.eligible }));
 vi.mock("@/lib/sav/auth", () => ({ requireSavStaff: dependencies.auth }));
 vi.mock("@/lib/sav/service", () => ({ getSavThreadDetail: dependencies.detail }));
 vi.mock("@/lib/sav/review", () => ({ getSavProposalReview: dependencies.review }));
+vi.mock("@/lib/sav/observations", () => ({getSavObservations:dependencies.observations}));
 vi.mock("@/lib/sav/drafts", () => ({ getSavReplyDrafts: dependencies.drafts }));
 vi.mock("@/lib/sav/thread-context", () => ({ getSavRelatedThreads: dependencies.related }));
 vi.mock("@/lib/sav/config", () => ({ savReleaseStage: dependencies.stage, savAutomationMode: () => "assist" }));
@@ -68,7 +69,8 @@ function proposalFixture(): SavStructuredProposal {
 function reviewFixture(approved = false): ProposalReviewData {
   const proposal = proposalFixture();
   return { decisionId, agentRunId: runId, model: "fixture", promptRevision: "fixture-prompt", before: structuredClone(proposal), proposal,
-    review: approved ? { id: reviewId, status: "approved", verdict: "correct",
+    expectedReviewId: approved?reviewId:null, draftHash:"x".repeat(43), draftVerdict:null,historicalReview:null,
+    review: approved ? { scope:"dossier", id: reviewId, status: "approved", verdict: "correct",
       dimensions: { classification: "correct", routing: "correct", grounding: "correct", tone: "correct", escalation: "correct" },
       reviewedBy: "ugo@limova.ai", reviewedAt: now, comment: "Process vérifié par un humain.", reusability: "none" } : null,
   };
@@ -196,17 +198,17 @@ describe("SAV dossier SSR and human-review guardrails", () => {
     expect(html).toContain(`name="decisionId" value="${decisionId}"`);
     expect(html).toContain(`name="agentRunId" value="${runId}"`);
     expect(html).toContain('name="processKind_0" value="product_step"');
-    expect(buttonAttributes(html, "Valider le process corrigé")).toHaveLength(1);
+    expect(buttonAttributes(html, "Valider le dossier / process")).toHaveLength(1);
     expect(buttonAttributes(html, "Refuser le process")).toHaveLength(0);
   });
 
-  it("shows the clean sections, one editable response and a separate disabled preview-send CTA", async () => {
+  it("shows the clean sections, a read-only draft and a separate disabled preview-send CTA", async () => {
     const html = await renderPage();
-    const titles = ["Résumé du sujet", "Action proposée", "Proposition de brouillon de réponse", "Connaissances utilisées", "Valider le process corrigé"];
+    const titles = ["Résumé du sujet", "Action proposée", "Connaissances utilisées", "Valider le dossier / process", "Verdict du brouillon"];
     for (let index = 1; index < titles.length; index++) expect(html.indexOf(titles[index])).toBeGreaterThan(html.indexOf(titles[index - 1]));
-    expect(html.match(/<textarea[^>]*name="replyDraft"/g)).toHaveLength(1);
+    expect(html).not.toMatch(/<textarea[^>]*name="replyDraft"/);
     expect(html).not.toMatch(/<textarea[^>]*name="text"/);
-    expect(buttonAttributes(html, "Envoyer la réponse")).toEqual([expect.stringContaining('disabled=""')]);
+    expect(buttonAttributes(html, "Envoyer la réponse acceptée")).toEqual([expect.stringContaining('disabled=""')]);
     expect(html).toContain("validée séparément par Ugo");
     expect(html).toContain("Non assigné");
     expect(html).not.toContain("Sources et preuves");
@@ -214,24 +216,26 @@ describe("SAV dossier SSR and human-review guardrails", () => {
 
   it("allows sending independently of process approval when the server enables manual writes", async () => {
     vi.stubEnv("SAV_WRITES_DISABLED", "false");
+    dependencies.review.mockResolvedValue({...reviewFixture(),draftVerdict:{id:"verdict",status:"accepted",draftId:"accepted-draft",stale:false,reason:"",reviewedBy:"ugo@limova.ai"}});
     const html = await renderPage();
-    expect(buttonAttributes(html, "Envoyer la réponse")[0]).not.toContain("disabled");
-    expect(html).toContain("Il ne valide ni le process ni une connaissance");
+    expect(buttonAttributes(html, "Envoyer la réponse acceptée")[0]).not.toContain("disabled");
+    expect(html).toContain("Confirme l’envoi dans le fil Gmail d’origine.");
   });
   it("allows manual V0 send on a human-owned dossier, not an automatic resumption", async () => {
     vi.stubEnv("SAV_WRITES_DISABLED", "false");
     const detail = detailFixture();
     detail.thread.aiPaused = true; detail.thread.status = "human_requested";
     dependencies.detail.mockResolvedValue(detail);
+    dependencies.review.mockResolvedValue({...reviewFixture(),draftVerdict:{id:"verdict",status:"accepted",draftId:"accepted-draft",stale:false,reason:"",reviewedBy:"ugo@limova.ai"}});
     const html = await renderPage();
-    expect(buttonAttributes(html, "Envoyer la réponse")[0]).not.toContain("disabled");
+    expect(buttonAttributes(html, "Envoyer la réponse acceptée")[0]).not.toContain("disabled");
     expect(html).not.toContain("Envoi désactivé dans cette prévisualisation");
     expect(buttonAttributes(html, "Transférer à un humain")).toHaveLength(0);
   });
   it("explains the real environment lock rather than claiming this is a preview", async () => {
     const html = await renderPage();
     expect(html).toContain("Les envois sont désactivés dans cet environnement");
-    expect(buttonAttributes(html, "Envoyer la réponse")[0]).toContain("disabled");
+    expect(buttonAttributes(html, "Envoyer la réponse acceptée")[0]).toContain("disabled");
   });
 
   it("lists only knowledge actually supporting the response/process, not every retrieved search result", async () => {
@@ -248,7 +252,7 @@ describe("SAV dossier SSR and human-review guardrails", () => {
     const detail = detailFixture();
     detail.actions = [actionFixture({ kind: "send_reply", messageId, status, payload: { manualReplyConfirmed: true, ...(status === "failed" ? { replySendDispatchedAt: now.toISOString() } : {}) } })];
     dependencies.detail.mockResolvedValue(detail);
-    expect(buttonAttributes(await renderPage(), "Envoyer la réponse")[0]).toContain("disabled");
+    expect(buttonAttributes(await renderPage(), "Envoyer la réponse acceptée")[0]).toContain("disabled");
   });
 
   it("shows the reviewed correction in the decision rail instead of the original AI decision", async () => {
@@ -349,7 +353,7 @@ describe("SAV dossier SSR and human-review guardrails", () => {
     const html = await renderPage();
     expect(html).toContain("EMAIL_CLIENT_TEST");
     expect(html).toContain("Les anciens emails ne sont pas retraités");
-    expect(html).not.toContain("Valider le process corrigé");
+    expect(html).not.toContain("Valider le dossier / process");
     expect(html).not.toContain("Refuser le process");
     expect(html).not.toContain("Approuver et mettre en file d’envoi");
     expect(buttonAttributes(html, "Créer un ticket HubSpot")).toEqual([expect.stringContaining('disabled=""')]);

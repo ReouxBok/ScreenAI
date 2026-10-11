@@ -4,7 +4,10 @@ import { createSavTestDb } from "../../../test/sav-db";
 import { auditLogs, categories, contentItems, contentVersions, knowledgeFamilies, knowledgeFamilyRevisions, knowledgeFamilySources, knowledgeProjectionCandidates, knowledgeProjections, savLearningCandidates, savResolutionEvidence } from "@/db/schema";
 import { saveDraft, publish, rollback, submitForReview } from "@/lib/workflow";
 import { registerCanonicalKnowledge, getCanonicalFamily } from "./families";
-import { proposeSavFromOnboarding, proposeOnboardingFromSav } from "./candidates";
+import { proposeSavFromOnboarding, proposeOnboardingFromSav, storeCandidate } from "./candidates";
+import { articleMetadataSchema } from "@/lib/content";
+import { savContentHash } from "@/lib/sav/crypto";
+import { canonicalFromSav } from "./conversion";
 import { canonicalKnowledgeSchema } from "./contracts";
 import { approveLearningCandidate } from "@/lib/sav/learning";
 import { reviewKnowledgeCandidate } from "./review";
@@ -176,4 +179,48 @@ describe("canonical families and supervised projections", () => {
     for (const key of ["source:one", "source:two"]) await registerCanonicalKnowledge({ canonicalKey: key, title: "Même titre", document, source: { ref: key, hash: "c".repeat(64) } }, "ugo@limova.ai");
     expect(await fixture.db.select().from(knowledgeFamilies)).toHaveLength(2);
   });
+});
+
+it.each(["pending", "needs_recording", "approved", "rejected", "not_applicable"])("preserves a legacy %s projection when retrying the same approved SAV proof", async (status) => {
+ const source=await savCandidate(["Ouvrez Paramètres puis Facturation pour consulter vos factures."]);
+ const document=canonicalFromSav(`content:${source.item.id}`,articleMetadataSchema.parse(source.version.metadata),source.item.locale,source.item.title).document;
+ const registered=await registerCanonicalKnowledge({canonicalKey:`content:${source.item.id}`,title:source.item.title,document,
+  source:{ref:`sav-learning:${source.candidate.id}`,hash:savContentHash({body:source.version.bodyMarkdown,metadata:source.version.metadata}),versionId:source.version.id},
+  projection:{surface:"sav",itemId:source.item.id,versionId:source.version.id}},"ugo@limova.ai");
+ const historical=(await storeCandidate({familyId:registered.family.id,revisionId:registered.revision.id,sourceId:registered.source.id,targetSurface:"onboarding",status:"needs_recording",explanation:"Ancienne proposition relue",proposedInput:null},"ugo@limova.ai")).candidate!;
+ const [saved]=await fixture.db.update(knowledgeProjectionCandidates).set({status,reviewedBy:"ugo@limova.ai",reviewedAt:new Date("2026-10-08T12:00:00Z")}).where(eq(knowledgeProjectionCandidates.id,historical.id)).returning();
+ for(let i=0;i<2;i++)expect((await proposeOnboardingFromSav(source.candidate.id,"ugo@limova.ai")).candidate).toEqual(saved);
+ expect(await fixture.db.select().from(knowledgeFamilyRevisions)).toHaveLength(1);
+ expect(await fixture.db.select().from(knowledgeFamilySources)).toHaveLength(1);
+ expect(await fixture.db.select().from(knowledgeProjectionCandidates)).toEqual([saved]);
+});
+
+it("versions a newly approved proof after an unchanged procedure from the legacy mapping was rejected", async () => {
+ const source=await savCandidate(["Ouvrez Paramètres puis Facturation pour consulter vos factures."]);
+ const document=canonicalFromSav(`content:${source.item.id}`,articleMetadataSchema.parse(source.version.metadata),source.item.locale,source.item.title).document;
+ const registered=await registerCanonicalKnowledge({canonicalKey:`content:${source.item.id}`,title:source.item.title,document,
+  source:{ref:`sav-learning:${source.candidate.id}`,hash:savContentHash({body:source.version.bodyMarkdown,metadata:source.version.metadata}),versionId:source.version.id},
+  projection:{surface:"sav",itemId:source.item.id,versionId:source.version.id}},"ugo@limova.ai");
+ const old=(await storeCandidate({familyId:registered.family.id,revisionId:registered.revision.id,sourceId:registered.source.id,targetSurface:"onboarding",status:"needs_recording",explanation:"Ancienne preuve",proposedInput:null},"ugo@limova.ai")).candidate!;
+ const rejected=await reviewKnowledgeCandidate(old.id,{expectedRevisionId:old.revisionId,decision:"reject",reason:"Ancienne preuve périmée, refaire la qualification"},"ugo@limova.ai");
+ const [version]=await fixture.db.insert(contentVersions).values({itemId:source.item.id,version:2,bodyMarkdown:source.version.bodyMarkdown,metadata:source.version.metadata,changeNote:"Même procédure revalidée sur nouvelle preuve",authorEmail:"ugo@limova.ai"}).returning();
+ const [learning]=await fixture.db.insert(savLearningCandidates).values({contentItemId:source.item.id,status:"approved",reviewedBy:"ugo@limova.ai",reviewedAt:new Date(),sourceRef:"ticket:revalidated",sourceContentHash:"new-evidence",proposedPatch:{},explanation:"Nouvelle preuve qualifiée"}).returning();
+ await fixture.db.insert(savResolutionEvidence).values({itemId:source.item.id,versionId:version.id,sourceRef:learning.sourceRef,outcome:"human_resolution",summary:"Nouvelle version relue"});
+ const current=(await proposeOnboardingFromSav(learning.id,"ugo@limova.ai")).candidate!;
+ expect(current.status).toBe("needs_recording");expect(current.revisionId).not.toBe(old.revisionId);expect(current.sourceId).not.toBe(old.sourceId);
+ const retry=(await proposeOnboardingFromSav(learning.id,"ugo@limova.ai")).candidate!;expect(retry).toEqual(current);
+ expect((await fixture.db.select().from(knowledgeProjectionCandidates).where(eq(knowledgeProjectionCandidates.id,rejected.id)))[0]).toEqual(rejected);
+ expect(await fixture.db.select().from(knowledgeProjectionCandidates)).toHaveLength(2);
+ expect((await fixture.db.select().from(knowledgeFamilyRevisions)).map(r=>r.document)).toEqual([document,document]);
+ const [proof]=await fixture.db.select().from(knowledgeFamilySources).where(eq(knowledgeFamilySources.id,current.sourceId));
+ expect(proof).toMatchObject({sourceRef:`sav-learning:${learning.id}`,sourceVersionId:version.id});
+});
+it("does not revive a human rejection when retrying a newly versioned SAV proof", async () => {
+ const source=await savCandidate(["Ouvrez Paramètres puis Profil pour modifier votre nom."]);
+ const current=(await proposeOnboardingFromSav(source.candidate.id,"ugo@limova.ai")).candidate!;
+ const rejected=await reviewKnowledgeCandidate(current.id,{expectedRevisionId:current.revisionId,decision:"reject",reason:"Cette procédure ne justifie pas de tutoriel"},"ugo@limova.ai");
+ await approveLearningCandidate(source.candidate.id,"ugo@limova.ai");
+ expect((await proposeOnboardingFromSav(source.candidate.id,"ugo@limova.ai")).candidate).toEqual(rejected);
+ expect(await fixture.db.select().from(knowledgeProjectionCandidates)).toEqual([rejected]);
+ expect(await fixture.db.select().from(knowledgeFamilyRevisions)).toHaveLength(1);
 });

@@ -7,7 +7,7 @@ import { continueBackfillAction, reviewLearningAction } from "../actions";
 
 export const dynamic = "force-dynamic";
 
-export default async function SavResolutionsPage({ searchParams }: { searchParams: Promise<{ backfill?: string }> }) {
+export default async function SavResolutionsPage({ searchParams }: { searchParams: Promise<{ backfill?: string; review?: string }> }) {
   const staff = await requireStaff("admin");
   const [candidates, backfill, query] = await Promise.all([
     listLearningCandidates(),
@@ -31,6 +31,8 @@ export default async function SavResolutionsPage({ searchParams }: { searchParam
       {query.backfill === "complete" ? "Tous les tickets HubSpot ont été analysés." : query.backfill === "permission_required" ? `Ajoutez la permission ${HUBSPOT_EMAIL_READ_SCOPE} à la clé de service HubSpot, puis relancez le test.` : "25 tickets supplémentaires ont été analysés."}
     </p>}
 
+    {query.review === "sync_in_progress" && <p className="login-notice" role="alert">Les preuves sont en cours d’actualisation. Attendez la fin de la synchronisation puis relisez le bilan.</p>}
+    {query.review === "stale" && <p className="login-notice" role="alert">Les preuves ou la qualification ont changé. Relisez et qualifiez le bilan actuel avant de créer un brouillon.</p>}
     <section className="resolution-backfill card">
       <div className="resolution-backfill-icon"><DatabaseZap size={24}/></div>
       <div>
@@ -66,7 +68,8 @@ export default async function SavResolutionsPage({ searchParams }: { searchParam
         </div>
         {candidate.status === "pending" && staff.email === "ugo@limova.ai" && <form action={reviewLearningAction} className="learning-actions">
           <input type="hidden" name="candidateId" value={candidate.id}/>
-          <button className="primary" name="decision" value="approve" type="submit">Créer le brouillon</button>
+          {candidate.syncInProgress && <p role="status">Actualisation des preuves en cours. Relisez le bilan une fois la synchronisation terminée.</p>}
+          <button className="primary" name="decision" value="approve" type="submit" disabled={candidate.syncInProgress}>Créer le brouillon</button>
           <button className="ghost-danger" name="decision" value="reject" type="submit">Écarter</button>
         </form>}
       </article>)}

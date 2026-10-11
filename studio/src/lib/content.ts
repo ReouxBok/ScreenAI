@@ -26,6 +26,8 @@ export const articleMetadataSchema = z.object({
   troubleshooting: z.string().trim().max(10000).default(""),
   sourceMetadata: z.record(z.string(), z.unknown()).optional(),
   resolution: z.object({
+    audience: z.enum(["support", "lead"]).optional(),
+    responseTemplate: z.string().trim().min(20).max(8000).optional(),
     symptoms: stringList,
     steps: stringList,
     exceptions: stringList,
@@ -116,6 +118,7 @@ export const knowledgeSearchSchema = z.object({
   locale: z.string().regex(/^[a-z]{2}-[A-Z]{2}$/).default("fr-FR"),
   contentTypes: z.array(z.enum(["article", "onboarding"])).min(1).max(2).default(["article", "onboarding"]),
   scope: z.enum(["extension", "sav"]).default("extension"),
+  savAudience: z.enum(["support", "lead"]).default("support"),
   limit: z.number().int().min(1).max(10).default(5),
 });
 
@@ -145,6 +148,8 @@ export type ContentInput = z.infer<typeof contentInputSchema>;
 
 export function parseContentInput(input: unknown): ContentInput {
   const parsed = contentInputSchema.parse(input);
+  if (parsed.type === "article" && parsed.metadata.resolution?.audience === "lead"
+    && (parsed.agentKey !== "sav" || parsed.visibility !== "charly_only")) throw new Error("SAV_LEAD_KNOWLEDGE_SCOPE_REQUIRED");
   assertSafeMarkdown(parsed.bodyMarkdown);
   return parsed;
 }

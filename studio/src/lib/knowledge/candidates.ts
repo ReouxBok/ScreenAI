@@ -82,8 +82,18 @@ export async function proposeOnboardingFromSav(candidateId: string, actorEmail: 
   const familyKey = existing?.canonicalKey ?? `content:${item.id}`;
   const objective = typeof metadata.sourceMetadata?.canonicalObjective === "string" ? metadata.sourceMetadata.canonicalObjective : item.title;
   const conversion = canonicalFromSav(familyKey, metadata, item.locale, objective);
+  const sourceRef = `sav-learning:${learning.id}`;
+  const contentHash = savContentHash({ body: version.bodyMarkdown, metadata: version.metadata });
+  // Retrying a pre-existing proof preserves its original mapping and decision.
+  const [legacySource] = existing ? await db.select().from(knowledgeFamilySources).where(and(
+    eq(knowledgeFamilySources.familyId, existing.id), eq(knowledgeFamilySources.sourceRef, sourceRef),
+    eq(knowledgeFamilySources.sourceHash, contentHash), eq(knowledgeFamilySources.sourceVersionId, version.id),
+  )).limit(1) : [];
+  // A newly validated proof owns its revision even when its procedure is unchanged.
+  const sourceHash = legacySource?.sourceHash ?? savContentHash({ contentHash, learningCandidateId: learning.id, evidenceHash: learning.sourceContentHash });
   const registered = await registerCanonicalKnowledge({ canonicalKey: familyKey, title: publicKnowledgeText(item.title), document: conversion.document,
-    source: { ref: `sav-learning:${learning.id}`, hash: savContentHash({ body: version.bodyMarkdown, metadata: version.metadata }), versionId: version.id,
+    versionBySource: true,
+    source: { ref: sourceRef, hash: sourceHash, versionId: version.id,
       evidence: { learningCandidateId: learning.id, ticketIds: learning.evidenceTicketIds, sourceRef: learning.sourceRef, reviewedBy: learning.reviewedBy, reviewedAt: learning.reviewedAt.toISOString(), sourceVersionId: version.id } },
     projection: { surface: "sav", itemId: item.id, versionId: version.id },
   }, actorEmail);

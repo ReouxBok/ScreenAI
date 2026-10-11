@@ -1,5 +1,27 @@
 # SAV V0 — gate sécurité
 
+## Décision courante — renouvellement limité autorisé le 11 octobre 2026
+
+Ugo autorise explicitement l'exception braces pour livrer le Studio SAV V0 actif,
+jusqu'au **19 octobre 2026 à 00:00 UTC**, sans renouvellement automatique.
+Cette décision remplace l'échéance du 12 octobre et la restriction shadow de
+l'autorisation historique ci-dessous ; elle ne constitue pas une correction.
+
+- Même avis GHSA-vfj7-8cjw-p6xm, version 3.0.3, sévérité high et plage <=3.0.3 ;
+  aucune autre exception et aucun bypass de CI.
+- Création de tickets et envoi de réponses uniquement après clic humain distinct.
+  Aucun ticket ni email automatique V1/V2 autorisé par cette décision.
+- Déploiement du Studio uniquement : aucun déploiement proxy ou Chrome.
+  Le passage de leurs audits partagés n'autorise pas leur livraison.
+- Risque résiduel accepté : arrêt du processus si une entrée malveillante atteint
+  braces ; aucun flux email vers son parseur démontré, pas de preuve d'inexploitabilité.
+- CI complète, sauvegarde/restauration, migration additive et retour arrière restent
+  obligatoires. L'expiration bloque les prochaines gates, pas le runtime déjà servi.
+- Revoir l'avis et les chemins d'exposition avant expiration ; retirer l'exception
+  dès qu'une remédiation compatible est testée.
+
+Les sections datées suivantes conservent les constats et autorisations historiques.
+
 ## Correctifs compatibles — 6 octobre 2026, PR #4
 
 Mises à jour ciblées des lockfiles uniquement, sans nouvelle exception, montée

@@ -4,6 +4,7 @@ import { processDueFollowups } from "@/lib/sav/followups";
 import { processPendingSavMessages, processPendingSavPilotItems } from "@/lib/sav/service";
 import { expireStaleEvaluationRuns } from "@/lib/evaluations";
 import { enforceSavRetention } from "@/lib/sav/retention";
+import { reconcileSavObservations } from "@/lib/sav/observations";
 import { reconcileStaleTrainings } from "@/lib/training";
 
 export const runtime = "nodejs";
@@ -57,8 +58,9 @@ export async function GET(request: Request) {
     : !shouldAttemptHubspotBackfill(backfillState)
       ? { status: "skipped" as const, durationMs: 0, data: { reason: "configuration_required", retry: "automatic_within_30_minutes_or_manual" } }
       : await runStep("hubspot_learning_backfill", () => continueHubspotBackfill(1, 10));
+  const observations = await runStep("resolution_observations", () => reconcileSavObservations(5));
   const retention = await runStep("retention", () => enforceSavRetention());
-  const payload = { gmail, hubspot, trainings, evaluations, ticketActions, pilotItems, pendingMessages, pilotActions, followups, replies, statusActions, learningBackfill, retention };
+  const payload = { gmail, hubspot, trainings, evaluations, ticketActions, pilotItems, pendingMessages, pilotActions, followups, replies, statusActions, learningBackfill, observations, retention };
   const hasStepFailure = Object.values(payload).some((step) => step.status === "error");
   return Response.json(payload, { status: hasStepFailure ? 500 : 200 });
 }

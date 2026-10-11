@@ -4,6 +4,7 @@ import { z } from "zod";
 import { requireDb } from "@/db";
 import { activeKnowledge, auditLogs, savActions, savAgentRuns, savDecisions, savMessages, savProposalReviews, savReplyDrafts, savThreads } from "@/db/schema";
 import { assertSavActor } from "./access";
+import { assertSavAcceptedDraft } from "./draft-verdicts";
 import { savAutomationMode, savReleaseStage } from "./config";
 import { decryptSavPayload, encryptSavPayload, savContentHash } from "./crypto";
 import { savV0EligibleMessageFilter } from "./cutover";
@@ -37,11 +38,12 @@ export async function queueSavManualReply(raw: unknown, actorEmail: string) {
     const reconfirmOldPending = existing?.status === "pending" && existing.payload.replyFormatRevision !== SAV_REPLY_FORMAT_REVISION && !existing.payload.replySendDispatchedAt;
     if (existing && !["failed", "cancelled"].includes(existing.status) && !reconfirmOldPending) return existing;
     if (existing?.payload.replySendDispatchedAt) throw new Error("SAV_REPLY_MANUAL_RECONCILIATION_REQUIRED");
-    const [source] = await tx.select().from(savMessages).where(eq(savMessages.id, draft.messageId)).limit(1);
+    const context = await assertSavAcceptedDraft(draft, tx);
+    const source = context.message;
     if (!source) throw new Error("SAV_REPLY_MANUAL_CONTEXT_CHANGED");
     const language = buildSavInboundContext({ subject: source.subject, body: decryptSavPayload<{ text: string }>(source.bodyCiphertext).text }).language;
     const outboundText = renderSavOutboundReply(decryptSavPayload<{ text: string }>(draft.bodyCiphertext).text, language);
-    const values = { threadId: thread.id, messageId: draft.messageId, decisionId: draft.decisionId,
+    const values = { threadId: thread.id, messageId: draft.messageId, decisionId: context.decision.id,
       kind: "send_reply", actorType: "human", actorEmail, status: "pending", errorCode: null, scheduledAt: null,
       payload: { manualReplyConfirmed: true, studioDraftId: draft.id, bodyCiphertext: draft.bodyCiphertext,
         outboundBodyCiphertext: encryptSavPayload({ text: outboundText }), outboundBodyHash: savContentHash(outboundText), replyFormatRevision: SAV_REPLY_FORMAT_REVISION }, updatedAt: new Date() } as const;
@@ -59,13 +61,14 @@ export async function assertSavCurrentManualReply(action: typeof savActions.$inf
   if (action.actorType !== "human" || !action.actorEmail || action.payload.manualReplyConfirmed !== true || typeof action.payload.studioDraftId !== "string" || action.payload.followupSequence) throw new Error("SAV_REPLY_MANUAL_APPROVAL_REQUIRED");
   assertSavActor(action.actorEmail);
   const [draft] = await db.select().from(savReplyDrafts).where(and(eq(savReplyDrafts.id, action.payload.studioDraftId), eq(savReplyDrafts.isCurrent, true))).limit(1);
-  if (!draft || draft.status === "abandoned" || draft.threadId !== action.threadId || draft.messageId !== action.messageId || draft.decisionId !== action.decisionId || draft.createdBy !== action.actorEmail || draft.bodyCiphertext !== action.payload.bodyCiphertext) throw new Error("SAV_REPLY_MANUAL_DRAFT_CHANGED");
+  if (!draft || draft.status === "abandoned" || draft.threadId !== action.threadId || draft.messageId !== action.messageId || draft.createdBy !== action.actorEmail || draft.bodyCiphertext !== action.payload.bodyCiphertext) throw new Error("SAV_REPLY_MANUAL_DRAFT_CHANGED");
+  const context = await assertSavAcceptedDraft(draft, db);
   const [message] = await db.select().from(savMessages).where(and(eq(savMessages.threadId, action.threadId), eq(savMessages.direction, "inbound"), savV0EligibleMessageFilter())).orderBy(desc(savMessages.receivedAt), desc(savMessages.createdAt), desc(savMessages.id)).limit(1);
-  const [decision] = await db.select().from(savDecisions).where(and(eq(savDecisions.id, draft.decisionId), eq(savDecisions.isCurrent, true))).limit(1);
-  const [run] = await db.select().from(savAgentRuns).where(eq(savAgentRuns.id, draft.agentRunId)).limit(1);
+  const [decision] = await db.select().from(savDecisions).where(and(eq(savDecisions.id, context.decision.id), eq(savDecisions.isCurrent, true))).limit(1);
+  const [run] = await db.select().from(savAgentRuns).where(eq(savAgentRuns.id, context.run.id)).limit(1);
   const [review] = await db.select().from(savProposalReviews).where(and(eq(savProposalReviews.messageId, draft.messageId), eq(savProposalReviews.isCurrent, true))).limit(1);
   const [knowledge] = await db.select().from(activeKnowledge).limit(1);
-  if (!message || message.id !== draft.messageId || !message.gmailMessageId || decision?.messageId !== message.id || decision.agentRunId !== draft.agentRunId || run?.messageId !== message.id || run.pilotBatchId || !run.proposalCiphertext || (review?.id ?? null) !== draft.reviewId || (knowledge?.revisionId ?? null) !== draft.knowledgeRevision) throw new Error("SAV_REPLY_MANUAL_CONTEXT_CHANGED");
+  if (!message || message.id !== draft.messageId || !message.gmailMessageId || decision?.messageId !== message.id || decision.agentRunId !== context.run.id || decision.id !== action.decisionId || run?.messageId !== message.id || run.pilotBatchId || !run.proposalCiphertext || (!draft.sourceHash && (review?.id ?? null) !== draft.reviewId) || (knowledge?.revisionId ?? null) !== draft.knowledgeRevision) throw new Error("SAV_REPLY_MANUAL_CONTEXT_CHANGED");
   const proposal = decryptSavPayload<{ knowledgeRevision: string }>(run.proposalCiphertext);
   if (!["not_consulted", "unavailable"].includes(proposal.knowledgeRevision) && proposal.knowledgeRevision !== knowledge?.revisionId) throw new Error("SAV_KNOWLEDGE_CHANGED_REANALYSIS_REQUIRED");
   const body = decryptSavPayload<{ text: string; headers?: Record<string, string> }>(message.bodyCiphertext);

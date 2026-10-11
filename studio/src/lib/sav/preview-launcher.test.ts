@@ -126,11 +126,11 @@ describe("isolated SAV preview launcher", () => {
     const directory = "/example/checkout with spaces/studio";
     const bins = { tsx: "/example/node_modules/tsx/dist/loader.mjs", next: "/example/node_modules/next/dist/bin/next" };
     const plan = createPreviewPlan(directory, bins, { initOnly: false, port: 4010 });
-    expect(plan).toHaveLength(4);
-    expect(plan.slice(0, 3).map((step) => path.basename(step.args.at(-1)!))).toEqual(["migrate.ts", "seed-sav-preview.ts", "seed-sav-inbox-preview.ts"]);
-    for (const step of plan.slice(0, 3)) expect(step.args.slice(0, 3)).toEqual(["--conditions=react-server", "--import", "file:///example/node_modules/tsx/dist/loader.mjs"]);
+    expect(plan).toHaveLength(5);
+    expect(plan.slice(0, 4).map((step) => path.basename(step.args.at(-1)!))).toEqual(["migrate.ts", "seed-sav-preview.ts", "seed-sav-inbox-preview.ts", "seed-sav-review-preview.ts"]);
+    for (const step of plan.slice(0, 4)) expect(step.args.slice(0, 3)).toEqual(["--conditions=react-server", "--import", "file:///example/node_modules/tsx/dist/loader.mjs"]);
     expect(plan.at(-1)?.args).toEqual([bins.next, "dev", "--hostname", "127.0.0.1", "--port", "4010"]);
-    expect(createPreviewPlan(directory, bins, { initOnly: true, port: 3010 })).toHaveLength(3);
+    expect(createPreviewPlan(directory, bins, { initOnly: true, port: 3010 })).toHaveLength(4);
     expect(JSON.stringify(plan)).not.toMatch(/vercel|git push|npm install|next build|next start/);
   });
 });

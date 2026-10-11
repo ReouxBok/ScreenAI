@@ -8,8 +8,8 @@ export const bracesException = Object.freeze({
   dependency: 'braces',
   version: '3.0.3',
   severity: 'high',
-  reviewedAt: '2026-10-05T00:00:00Z',
-  expiresAt: '2026-10-12T00:00:00Z',
+  reviewedAt: '2026-10-11T00:00:00Z',
+  expiresAt: '2026-10-19T00:00:00Z',
   owner: 'Ugo Le Bras',
 });
 
