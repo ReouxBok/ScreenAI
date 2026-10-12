@@ -190,7 +190,7 @@ async function analyzeSavMessageLegacy(input: SavEnrichedInput, context: SavAnal
         confidence,
         requiresHumanApproval: true,
       }
-      : analysis.ticketRequired
+      : plan.ticketRequired
         ? { kind: "ticket_pending", reasonCode: analysis.reasonCode, explanation: analysis.explanation, confidence, requiresHumanApproval: false }
         : { kind: "no_ticket_needed", reasonCode: analysis.reasonCode, explanation: analysis.explanation, confidence, requiresHumanApproval: false };
     const replyDraft = cleanSavModelDraft(analysis.replyDraft) || null;
@@ -228,7 +228,7 @@ function analysisFromAgent(output: Awaited<ReturnType<typeof runSavAdkAgent>>, u
       confidence,
       requiresHumanApproval: true,
     }
-    : analysis.ticketRequired
+    : plan.ticketRequired
       ? { kind: "ticket_pending", reasonCode: analysis.reasonCode, explanation: analysis.explanation, confidence, requiresHumanApproval: false }
       : { kind: "no_ticket_needed", reasonCode: analysis.reasonCode, explanation: analysis.explanation, confidence, requiresHumanApproval: false };
   return {

@@ -29,6 +29,7 @@ async function main() {
   const startedAt = new Date().toISOString();
   if (startedAt < input.manifest.frozenAt) throw new Error("SAV_SEMANTIC_MANIFEST_NOT_FROZEN");
   const apiKey = process.env.SAV_EVAL_GEMINI_API_KEY!;
+  process.env.SAV_CODE_REVISION = codeRevision;
   process.env.SAV_WRITES_DISABLED = "true";
   process.env.SAV_RELEASE_STAGE = "v0";
   // Covers SDK fetch calls too. The injected fetch records the direct pipeline calls.

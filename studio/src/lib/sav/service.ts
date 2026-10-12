@@ -215,10 +215,12 @@ async function createDecision(
       if (!pilotBatchId) {
         await invalidateSavReplies(tx, message.threadId, "SAV_THREAD_PAUSED", now);
         await tx.update(savThreads).set({
-          status: "human_requested",
+          // A degraded follow-up still needs review, but must not restart an
+          // existing human handoff or postpone its deadline.
+          status: sql`case when ${savThreads.status} in ('human_requested', 'human_processing') then ${savThreads.status} else 'human_requested' end`,
           aiPaused: true,
-          humanRequestedAt: now,
-          humanDueAt: humanDueAt(now),
+          humanRequestedAt: sql`case when ${savThreads.status} in ('human_requested', 'human_processing') then coalesce(${savThreads.humanRequestedAt}, ${now.toISOString()}::timestamptz) else ${now.toISOString()}::timestamptz end`,
+          humanDueAt: sql`case when ${savThreads.status} in ('human_requested', 'human_processing') then coalesce(${savThreads.humanDueAt}, ${humanDueAt(now).toISOString()}::timestamptz) else ${humanDueAt(now).toISOString()}::timestamptz end`,
           updatedAt: now,
         }).where(eq(savThreads.id, message.threadId));
       }

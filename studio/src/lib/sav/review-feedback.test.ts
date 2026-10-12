@@ -117,3 +117,20 @@ it("stores the original understanding in encrypted before and after snapshots", 
   expect(decryptSavPayload<SavStructuredProposal>(saved.beforeCiphertext).understanding).toEqual(proposal.understanding);
   expect(decryptSavPayload<SavStructuredProposal>(saved.afterCiphertext).understanding).toEqual(proposal.understanding);
 });
+
+it("retains verdicts when model-local IDs and coverage links are consistently renamed", async () => {
+  proposal.understanding!.customerRelationship = { kind: "existing_customer", evidenceIds: ["evidence-1"] };
+  proposal.understanding!.uncertainties = [{ code: "missing_context", requestIds: ["request-1"] }];
+  proposal.replyAssessment = { kind: "contextualized", errorCode: null, coverage: [{ requestId: "request-1", text: proposal.replyDraft!, kind: "clarification", sourceIds: ["persistent-kb-source"], missingInformationIds: ["missing-1"], repeatedAttemptIds: ["attempt-1"], repeatJustification: "Une preuve nouvelle fictive." }] };
+  await f.db.update(savAgentRuns).set({ proposalCiphertext: encryptSavPayload(proposal) }).where(eq(savAgentRuns.id, runId));
+  const approved = await reviewSavProposal(dossier(), "ugo@limova.ai"); await draft([], "accepted");
+  const renamed = JSON.parse(JSON.stringify(proposal).replace(/(?:request|evidence|fact|attempt|missing)-1/g, value => `renamed-${value}`)) as SavStructuredProposal;
+  expect(savDossierSourceHash(renamed)).toBe(savDossierSourceHash(proposal));
+  expect(savDraftSourceHash(renamed)).toBe(savDraftSourceHash(proposal));
+  await f.db.update(savAgentRuns).set({ proposalCiphertext: encryptSavPayload(renamed) }).where(eq(savAgentRuns.id, runId));
+  const detail = await getSavProposalReview(messageId);
+  expect(detail?.review?.id).toBe(approved.id); expect(detail?.draftVerdict?.stale).toBe(false);
+  renamed.understanding!.evidence[0].sourceId = "different-source";
+  expect(savDossierSourceHash(renamed)).not.toBe(savDossierSourceHash(proposal));
+  expect(savDraftSourceHash(renamed)).not.toBe(savDraftSourceHash(proposal));
+});

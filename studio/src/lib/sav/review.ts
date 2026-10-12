@@ -44,7 +44,7 @@ export async function getSavProposalReview(messageId: string) {
   const before = savStructuredProposalSchema.parse(decryptSavPayload(run.proposalCiphertext));
   const [review] = await db.select().from(savProposalReviews).where(and(eq(savProposalReviews.messageId, messageId), eq(savProposalReviews.isCurrent, true))).limit(1);
   const matches = savReviewMatchesProposal(review, { decisionId: decision.id, agentRunId: run.id, proposal: before, message });
-  const proposal = matches ? { ...savStructuredProposalSchema.parse(decryptSavPayload(review.afterCiphertext)), replyDraft: before.replyDraft, replyAssessment: before.replyAssessment } : before;
+  const proposal = matches ? { ...savStructuredProposalSchema.parse(decryptSavPayload(review.afterCiphertext)), replyDraft: before.replyDraft, replyAssessment: before.replyAssessment, understanding: before.understanding } : before;
   const [knowledge] = await db.select().from(activeKnowledge).limit(1);
   const [draftVerdict] = await db.select().from(savDraftVerdicts).where(and(eq(savDraftVerdicts.messageId, messageId), eq(savDraftVerdicts.isCurrent, true))).limit(1);
   return { decisionId: decision.id, agentRunId: run.id, model: run.model, promptRevision: run.promptRevision, before, proposal,

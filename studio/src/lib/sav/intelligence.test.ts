@@ -37,6 +37,14 @@ beforeEach(() => {
 afterEach(() => { vi.unstubAllEnvs(); vi.unstubAllGlobals(); vi.resetAllMocks(); });
 
 describe("SAV shared semantic pipeline with synthetic provider outputs", () => {
+  it.each(["off", "on"] as const)("keeps the server ticket requirement when the %s composer contradicts it", async mode => {
+    const u = understandingFixture(); deps.understand.mockResolvedValue(u);
+    const answer = { ...outputFor(u), ticketRequired: false, requiresHuman: false };
+    deps.agent.mockResolvedValue({ ...adkResult(u), output: answer });
+    const result = await analyzeSavMessage(input, { evaluation: evaluation(mode, vi.fn<typeof fetch>(async () => geminiFixture(answer))) });
+    expect(result.proposal.kind).toBe("ticket_pending");
+    expect(result.ticketRouting?.kind).toBe("new");
+  });
   it.each(modes)("understands once before retrieval and preserves technical meaning in %s", async mode => {
     const u = understandingFixture(); u.requests[0].financialScope = "incidental_price";
     deps.understand.mockResolvedValue(u); deps.agent.mockResolvedValue(adkResult(u));

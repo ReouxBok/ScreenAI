@@ -24,7 +24,7 @@ export async function loadSavDraftContext(messageId: string, db: Reader = requir
     const original = savStructuredProposalSchema.parse(decryptSavPayload(run.proposalCiphertext));
     const [review] = await db.select().from(savProposalReviews).where(and(eq(savProposalReviews.messageId, messageId), eq(savProposalReviews.isCurrent, true))).limit(1);
     const matches = savReviewMatchesProposal(review, { decisionId: decision.id, agentRunId: run.id, proposal: original, message });
-    const proposal = matches ? { ...savStructuredProposalSchema.parse(decryptSavPayload(review.afterCiphertext)), replyDraft: original.replyDraft, replyAssessment: original.replyAssessment } : original;
+    const proposal = matches ? { ...savStructuredProposalSchema.parse(decryptSavPayload(review.afterCiphertext)), replyDraft: original.replyDraft, replyAssessment: original.replyAssessment, understanding: original.understanding } : original;
     const [knowledge] = await db.select().from(activeKnowledge).limit(1);
     if (!["not_consulted", "unavailable"].includes(original.knowledgeRevision) && original.knowledgeRevision !== knowledge?.revisionId)
         throw new Error("SAV_KNOWLEDGE_CHANGED_REANALYSIS_REQUIRED");
