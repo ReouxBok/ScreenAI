@@ -20,6 +20,9 @@ const elements = {
   sendBtn: document.getElementById('sendBtn'),
   screenshotBtn: document.getElementById('screenshotBtn'),
   voiceBtn: document.getElementById('voiceBtn'),
+  voiceMuteBtn: document.getElementById('voiceMuteBtn'),
+  voiceMuteLabel: document.getElementById('voiceMuteLabel'),
+  voiceMuteStatus: document.getElementById('voiceMuteStatus'),
   downloadLogsBtn: document.getElementById('downloadLogsBtn'),
   diagnoseBtn: document.getElementById('diagnoseBtn'),
   diagnosticResult: document.getElementById('diagnosticResult'),
@@ -98,6 +101,7 @@ function initEventListeners() {
   elements.sendBtn.addEventListener('click', sendMessage);
   elements.screenshotBtn.addEventListener('click', analyzePage);
   elements.voiceBtn.addEventListener('click', toggleVoice);
+  elements.voiceMuteBtn?.addEventListener('click', toggleVoiceMute);
   elements.authEmailForm?.addEventListener('submit', requestAuthenticationCode);
   elements.authCodeForm?.addEventListener('submit', verifyAuthenticationCode);
   elements.authBack?.addEventListener('click', resetAuthenticationForm);
@@ -137,7 +141,7 @@ function initEventListeners() {
   document.getElementById('langSwitcher')?.addEventListener('click', (e) => {
     const btn = e.target.closest('.lang-option');
     if (btn?.dataset.lang) {
-      setLang(btn.dataset.lang);
+      setLang(btn.dataset.lang).then(updateVoiceMuteControl);
     }
   });
 
@@ -184,13 +188,22 @@ function initEventListeners() {
     if (actionButton) handleActionDecision(actionButton.dataset.actionId, actionButton.dataset.decision === 'confirm');
   });
 
-  window.addEventListener('limova-voice-status', event => updateVoiceStatus(event.detail));
-  window.addEventListener('limova-voice-transcript', event => handleVoiceTranscript(event.detail));
-  window.addEventListener('limova-voice-consent-required', () => showAIConsent());
+  window.addEventListener('limova-voice-status', event => {
+    if (event.voiceSession && event.voiceSession !== voiceSession) return;
+    updateVoiceStatus(event.detail);
+  });
+  window.addEventListener('limova-voice-transcript', event => {
+    if (event.voiceSession && event.voiceSession !== voiceSession) return;
+    handleVoiceTranscript(event.detail);
+  });
+  window.addEventListener('limova-voice-consent-required', event => {
+    if (event.voiceSession && event.voiceSession !== voiceSession) return;
+    showAIConsent();
+  });
   window.addEventListener('limova-training-screen-ended', handleTrainingScreenEnded);
   window.addEventListener('limova-training-recording-limit', handleTrainingRecordingLimit);
   window.addEventListener('pagehide', () => {
-    voiceSession?.stop(false);
+    stopVoiceSession();
     if (trainingCaptureActive) {
       trainingScreenRecorder?.abort();
       chrome.runtime.sendMessage({ type: 'CANCEL_TRAINING' }).catch(() => {});
@@ -304,8 +317,7 @@ function setAuthenticationVisible(required) {
   elements.authPanel.hidden = !required;
   document.documentElement.dataset.authState = required ? 'required' : 'authenticated';
   if (required) {
-    voiceSession?.stop(false);
-    voiceSession = null;
+    stopVoiceSession();
     setTimeout(() => elements.authEmail?.focus(), 0);
   }
 }
@@ -433,8 +445,7 @@ async function startTrainingCapture() {
   }
   elements.trainingFeedback.textContent = 'Dans Chrome, sélectionne « Écran entier ». La démonstration démarrera ensuite.';
   elements.trainingStart.disabled = true;
-  if (voiceSession?.active) voiceSession.stop(false);
-  voiceSession = null;
+  stopVoiceSession();
   const RecorderClass = window.LimovaTrainingScreenRecorder;
   trainingScreenRecorder = RecorderClass ? new RecorderClass() : null;
   try {
@@ -562,8 +573,7 @@ function showTrainingActive(session) {
 
 async function stopTrainingCapture() {
   elements.trainingStop.disabled = true;
-  if (voiceSession?.active) voiceSession.stop();
-  voiceSession = null;
+  stopVoiceSession();
   if (!trainingScreenRecorder || !activeTrainingSession || !activeTrainingToken) {
     elements.trainingStop.disabled = false;
     elements.trainingFeedback.textContent = 'La vidéo complète est absente. Recommence cette démonstration depuis le Studio.';
@@ -632,8 +642,7 @@ async function handleTrainingScreenEnded() {
   trainingScreenRecorder = null;
   activeTrainingSession = null;
   activeTrainingToken = '';
-  if (voiceSession?.active) voiceSession.stop(false);
-  voiceSession = null;
+  stopVoiceSession();
   await chrome.runtime.sendMessage({ type: 'CANCEL_TRAINING' }).catch(() => {});
   elements.trainingMic.hidden = true;
   elements.trainingStop.hidden = true;
@@ -1024,9 +1033,8 @@ async function sendMessage() {
 
   // Text and Live voice must never own the same user turn. Closing the voice
   // session first prevents a late Live tool call from racing the text runner.
-  if (voiceSession?.active) {
-    voiceSession.stop(false);
-    voiceSession = null;
+  if (voiceSession?.active || voiceSession?.starting) {
+    stopVoiceSession();
     await chrome.runtime.sendMessage({ type: 'VOICE_SESSION_STATE', active: false }).catch(() => {});
   }
 
@@ -1077,9 +1085,16 @@ function sendNextStepRequest() {
   });
 }
 
+function stopVoiceSession() {
+  const session = voiceSession;
+  voiceSession = null;
+  session?.stop(false);
+  updateVoiceStatus({ status: 'stopped' });
+}
+
 async function toggleVoice() {
-  if (voiceSession?.active) {
-    voiceSession.stop();
+  if (voiceSession?.active || voiceSession?.starting) {
+    stopVoiceSession();
     return;
   }
   if (!(await ensureAIConsent())) return;
@@ -1091,11 +1106,37 @@ async function toggleVoice() {
   } catch (_) {}
 }
 
+function toggleVoiceMute() {
+  if (!voiceSession || voiceSession.trainingMode) return;
+  const muted = !voiceSession.microphoneMuted;
+  if (voiceSession.setMicrophoneMuted(muted)) updateVoiceMuteControl();
+}
+
+function updateVoiceMuteControl() {
+  if (!elements.voiceMuteBtn) return;
+  const muted = voiceSession?.microphoneMuted === true;
+  const labelKey = muted ? 'voiceUnmute' : 'voiceMute';
+  elements.voiceMuteBtn.setAttribute('aria-pressed', String(muted));
+  elements.voiceMuteBtn.setAttribute('aria-label', t(labelKey));
+  elements.voiceMuteBtn.title = t(labelKey);
+  if (elements.voiceMuteLabel) elements.voiceMuteLabel.textContent = t(labelKey);
+  if (elements.voiceMuteStatus) {
+    elements.voiceMuteStatus.hidden = !muted;
+    elements.voiceMuteStatus.textContent = t('voiceMuted');
+  }
+}
+
 function updateVoiceStatus({ status, error, errorKey }) {
   const active = ['connecting', 'listening', 'speaking'].includes(status);
   elements.voiceBtn.classList.toggle('active', active);
   elements.voiceBtn.setAttribute('aria-pressed', String(active));
   elements.voiceBtn.title = active ? t('voiceStop') : t('voiceStart');
+  const controlsVisible = active && voiceSession?.trainingMode !== true;
+  document.getElementById('voiceControls').hidden = !controlsVisible;
+  if (elements.voiceMuteBtn) {
+    elements.voiceMuteBtn.hidden = !controlsVisible;
+    updateVoiceMuteControl();
+  }
   if (elements.trainingMic) {
     elements.trainingMic.classList.toggle('active', active);
     elements.trainingMic.setAttribute('aria-pressed', String(active));
@@ -1199,8 +1240,7 @@ function handleTabWarningClick() {
 async function resetSession() {
   if (!confirm(t('resetConfirm'))) return;
   try {
-    voiceSession?.stop(false);
-    voiceSession = null;
+    stopVoiceSession();
     voiceTranscriptBuffers.user = '';
     voiceTranscriptBuffers.assistant = '';
     await chrome.runtime.sendMessage({ type: 'RESET_SESSION' });

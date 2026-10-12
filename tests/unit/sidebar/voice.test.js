@@ -86,7 +86,7 @@ class FakeAudioWorkletNode {
     this.options = options;
     this.connect = vi.fn();
     this.disconnect = vi.fn();
-    this.port = { onmessage: null };
+    this.port = { onmessage: null, postMessage: vi.fn() };
     FakeAudioWorkletNode.instances.push(this);
   }
 
@@ -117,10 +117,13 @@ describe('Gemini Live voice protocol', () => {
       return context;
     });
     window.AudioContext = globalThis.AudioContext;
-    mediaTrack = { stop: vi.fn() };
+    mediaTrack = { enabled: true, stop: vi.fn() };
     Object.defineProperty(navigator, 'mediaDevices', {
       configurable: true,
-      value: { getUserMedia: vi.fn(async () => ({ getTracks: () => [mediaTrack] })) }
+      value: { getUserMedia: vi.fn(async () => ({
+        getTracks: () => [mediaTrack],
+        getAudioTracks: () => [mediaTrack]
+      })) }
     });
     chromeMock = installChromeMock();
     runtimeMessageListeners = new Set();
@@ -176,7 +179,7 @@ describe('Gemini Live voice protocol', () => {
   it('uses the constrained endpoint and sends a current audio-only setup', async () => {
     const statuses = [];
     window.addEventListener('limova-voice-status', event => statuses.push(event.detail.status), { once: false });
-    const { socket } = await startConnectedSession();
+    const { session, socket } = await startConnectedSession();
     expect(socket.url).toContain('BidiGenerateContentConstrained?access_token=auth_tokens%2Ftest%20value');
     expect(socket.sent[0]).toEqual({
       setup: {
@@ -468,18 +471,240 @@ describe('Gemini Live voice protocol', () => {
   });
 
   it('streams 16 kHz PCM through AudioWorklet without the deprecated ScriptProcessorNode', async () => {
-    const { socket } = await startConnectedSession();
+    const { session, socket } = await startConnectedSession();
     expect(audioContexts[0].audioWorklet.addModule).toHaveBeenCalledWith(
       'chrome-extension://test-extension/src/sidebar/audio-input-worklet.js'
     );
     expect(audioContexts[0].createScriptProcessor).not.toHaveBeenCalled();
     const captureNode = FakeAudioWorkletNode.instances[0];
     expect(captureNode.name).toBe('limova-audio-input');
-    captureNode.emit(new Float32Array(2048).fill(0.25).buffer);
+    captureNode.emit({ type: 'audio', epoch: session.captureEpoch, buffer: new Float32Array(2048).fill(0.25).buffer });
     const audioMessage = socket.sent.at(-1);
     expect(audioMessage.realtimeInput.audio.mimeType).toBe('audio/pcm;rate=16000');
     expect(audioMessage.realtimeInput.audio.data.length).toBeGreaterThan(0);
     expect(audioMessage.realtimeInput).not.toHaveProperty('mediaChunks');
+  });
+
+  it('mutes only microphone frames and rejects queued frames when quickly unmuted', async () => {
+    const { session, socket } = await startConnectedSession();
+    const captureNode = FakeAudioWorkletNode.instances[0];
+    const audioFrames = () => socket.sent.filter(message => message.realtimeInput?.audio);
+    const frame = epoch => ({ type: 'audio', epoch, buffer: new Float32Array(2048).fill(0.25).buffer });
+    const initialEpoch = session.captureEpoch;
+
+    captureNode.emit(frame(initialEpoch));
+    expect(audioFrames()).toHaveLength(1);
+
+    expect(session.setMicrophoneMuted(true)).toBe(true);
+    expect(mediaTrack.enabled).toBe(false);
+    expect(captureNode.port.postMessage).toHaveBeenLastCalledWith({
+      type: 'set-muted', muted: true, epoch: initialEpoch + 1
+    });
+    captureNode.emit(frame(initialEpoch));
+    captureNode.emit(frame(initialEpoch + 1));
+    expect(audioFrames()).toHaveLength(1);
+    expect(session.socket).toBe(socket);
+
+    expect(session.setMicrophoneMuted(false)).toBe(true);
+    expect(mediaTrack.enabled).toBe(true);
+    captureNode.emit(frame(initialEpoch));
+    captureNode.emit(frame(initialEpoch + 1));
+    expect(audioFrames()).toHaveLength(1);
+    captureNode.emit(frame(initialEpoch + 2));
+    expect(audioFrames()).toHaveLength(2);
+    expect(chromeMock.runtime.sendMessage.mock.calls.filter(([message]) => message?.type === 'GET_LIVE_TOKEN')).toHaveLength(1);
+  });
+
+  it('honors mute selected while microphone permission is still being acquired', async () => {
+    let resolveStream;
+    navigator.mediaDevices.getUserMedia.mockImplementationOnce(() => new Promise(resolve => { resolveStream = resolve; }));
+    const session = new VoiceSession();
+    const starting = session.start();
+    await vi.waitFor(() => expect(navigator.mediaDevices.getUserMedia).toHaveBeenCalledOnce());
+    expect(session.setMicrophoneMuted(true)).toBe(true);
+
+    resolveStream({
+      getTracks: () => [mediaTrack],
+      getAudioTracks: () => [mediaTrack]
+    });
+    await vi.waitFor(() => expect(FakeWebSocket.instances).toHaveLength(1));
+    const socket = FakeWebSocket.instances[0];
+    socket.open();
+    socket.receive({ setupComplete: {} });
+    await starting;
+
+    expect(mediaTrack.enabled).toBe(false);
+    const captureNode = FakeAudioWorkletNode.instances[0];
+    expect(captureNode.port.postMessage).toHaveBeenLastCalledWith({
+      type: 'set-muted', muted: true, epoch: session.captureEpoch
+    });
+    captureNode.emit({ type: 'audio', epoch: session.captureEpoch, buffer: new Float32Array(2048).fill(0.25).buffer });
+    expect(socket.sent.filter(message => message.realtimeInput?.audio)).toHaveLength(0);
+  });
+
+  it('stops a microphone received after stop without fetching a token or starting audio', async () => {
+    let resolveStream;
+    navigator.mediaDevices.getUserMedia.mockImplementationOnce(() => new Promise(resolve => { resolveStream = resolve; }));
+    const session = new VoiceSession();
+    const starting = session.start();
+    await vi.waitFor(() => expect(resolveStream).toBeTypeOf('function'));
+    session.setMicrophoneMuted(true);
+    session.stop(false);
+    resolveStream({ getTracks: () => [mediaTrack], getAudioTracks: () => [mediaTrack] });
+    await starting;
+    expect(mediaTrack.stop).toHaveBeenCalledOnce();
+    expect(session.active).toBe(false);
+    expect(session.starting).toBe(false);
+    expect(session.microphoneMuted).toBe(false);
+    expect(FakeWebSocket.instances).toHaveLength(0);
+    expect(FakeAudioWorkletNode.instances).toHaveLength(0);
+    expect(chromeMock.runtime.sendMessage).not.toHaveBeenCalledWith(expect.objectContaining({ type: 'GET_LIVE_TOKEN' }));
+  });
+
+  it('keeps a new explicit start independent from an old pending microphone', async () => {
+    let resolveStream;
+    const oldTrack = { stop: vi.fn(), enabled: true };
+    navigator.mediaDevices.getUserMedia.mockImplementationOnce(() => new Promise(resolve => { resolveStream = resolve; }));
+    const session = new VoiceSession();
+    const oldStart = session.start();
+    await vi.waitFor(() => expect(resolveStream).toBeTypeOf('function'));
+    session.stop(false);
+    await startConnectedSession(session);
+    const newStream = session.stream;
+    resolveStream({ getTracks: () => [oldTrack], getAudioTracks: () => [oldTrack] });
+    await oldStart;
+    expect(oldTrack.stop).toHaveBeenCalledOnce();
+    expect(mediaTrack.stop).not.toHaveBeenCalled();
+    expect(session.stream).toBe(newStream);
+    expect(session.active).toBe(true);
+    expect(FakeWebSocket.instances).toHaveLength(1);
+    session.stop(false);
+  });
+
+  it('does not acquire a microphone after permission completes for a stopped start', async () => {
+    let resolvePermission;
+    const session = new VoiceSession();
+    vi.spyOn(session, 'ensureMicrophonePermission').mockImplementation(() => new Promise(resolve => { resolvePermission = resolve; }));
+    const starting = session.start();
+    session.stop(false);
+    resolvePermission();
+    await starting;
+    expect(navigator.mediaDevices.getUserMedia).not.toHaveBeenCalled();
+    expect(session.active).toBe(false);
+  });
+
+  it('ignores a token received after stop', async () => {
+    let resolveToken;
+    chromeMock.runtime.sendMessage.mockImplementation(request => request.type === 'GET_LIVE_TOKEN'
+      ? new Promise(resolve => { resolveToken = resolve; }) : Promise.resolve({ ok: true }));
+    const session = new VoiceSession();
+    const starting = session.start();
+    await vi.waitFor(() => expect(resolveToken).toBeTypeOf('function'));
+    session.stop(false);
+    resolveToken({ ok: true, token: 'synthetic', model: 'test' });
+    await starting;
+    expect(mediaTrack.stop).toHaveBeenCalledOnce();
+    expect(FakeWebSocket.instances).toHaveLength(0);
+    expect(session.tokenData).toBeNull();
+  });
+
+  it('cancels socket setup and ignores late socket frames after stop', async () => {
+    const session = new VoiceSession();
+    const starting = session.start();
+    await vi.waitFor(() => expect(FakeWebSocket.instances).toHaveLength(1));
+    const socket = FakeWebSocket.instances[0];
+    const emit = vi.spyOn(session, 'emit');
+    session.stop(false);
+    await starting;
+    socket.open();
+    socket.receive({ setupComplete: {} });
+    await Promise.resolve();
+    expect(socket.sent).toHaveLength(0);
+    expect(session.ready).toBe(false);
+    expect(session.active).toBe(false);
+    expect(emit).not.toHaveBeenCalled();
+  });
+
+  it('does not reconnect after stop cancels scheduled recovery', async () => {
+    const { session, socket } = await startConnectedSession();
+    vi.useFakeTimers();
+    socket.emit('close', { code: 1006, wasClean: false, reason: '' });
+    session.stop(false);
+    await vi.advanceTimersByTimeAsync(500);
+    expect(FakeWebSocket.instances).toHaveLength(1);
+    expect(session.active).toBe(false);
+  });
+
+  it('does not build capture nodes after a stopped worklet load completes', async () => {
+    const session = new VoiceSession();
+    let resolveModule;
+    globalThis.AudioContext.mockImplementationOnce(function () {
+      const context = makeAudioContext();
+      context.audioWorklet.addModule.mockImplementation(() => new Promise(resolve => { resolveModule = resolve; }));
+      audioContexts.push(context);
+      return context;
+    });
+    const starting = session.start();
+    await vi.waitFor(() => expect(FakeWebSocket.instances).toHaveLength(1));
+    FakeWebSocket.instances[0].open();
+    FakeWebSocket.instances[0].receive({ setupComplete: {} });
+    await vi.waitFor(() => expect(resolveModule).toBeTypeOf('function'));
+    session.stop(false);
+    resolveModule();
+    await starting;
+    expect(audioContexts[0].close).toHaveBeenCalledOnce();
+    expect(FakeAudioWorkletNode.instances).toHaveLength(0);
+    expect(session.active).toBe(false);
+  });
+
+  it('ignores an onended callback already queued when playback is stopped', async () => {
+    const { session } = await startConnectedSession();
+    await session.playPcm(session.pcmToBase64(new Int16Array(100)), 24_000);
+    const source = [...session.playingSources][0];
+    const lateOnEnded = source.onended;
+    const emit = vi.spyOn(session, 'emit');
+    session.stop(false);
+    lateOnEnded();
+    expect(source.onended).toBeNull();
+    expect(emit).not.toHaveBeenCalled();
+    expect(session.active).toBe(false);
+  });
+
+  it('does not resume PCM playback after stop while the output context resumes', async () => {
+    const session = new VoiceSession();
+    let resolveResume;
+    const context = makeAudioContext();
+    context.state = 'suspended';
+    context.resume.mockImplementation(() => new Promise(resolve => { resolveResume = resolve; }));
+    session.outputContext = context;
+    const playing = session.playPcm(session.pcmToBase64(new Int16Array(100)), 24_000);
+    session.stop(false);
+    resolveResume();
+    expect(await playing).toBe(false);
+    expect(context.createBufferSource).not.toHaveBeenCalled();
+    expect(context.close).toHaveBeenCalledOnce();
+  });
+
+  it('keeps the microphone muted across automatic socket recovery', async () => {
+    const { session, socket } = await startConnectedSession();
+    session.setMicrophoneMuted(true);
+    vi.useFakeTimers();
+    socket.emit('close', { code: 1006, wasClean: false, reason: '' });
+    await vi.advanceTimersByTimeAsync(500);
+    const recovered = FakeWebSocket.instances[1];
+    recovered.open();
+    recovered.receive({ setupComplete: {} });
+    await Promise.resolve();
+
+    expect(session.microphoneMuted).toBe(true);
+    expect(mediaTrack.enabled).toBe(false);
+    const captureNode = FakeAudioWorkletNode.instances[0];
+    captureNode.emit({ type: 'audio', epoch: session.captureEpoch, buffer: new Float32Array(2048).fill(0.25).buffer });
+    expect(recovered.sent.filter(message => message.realtimeInput?.audio)).toHaveLength(0);
+
+    session.setMicrophoneMuted(false);
+    captureNode.emit({ type: 'audio', epoch: session.captureEpoch, buffer: new Float32Array(2048).fill(0.25).buffer });
+    expect(recovered.sent.filter(message => message.realtimeInput?.audio)).toHaveLength(1);
   });
 
   it('immediately clears queued playback when the server reports interruption', () => {
@@ -550,6 +775,8 @@ describe('Gemini Live voice protocol', () => {
   it('keeps trainer voice capture passive and ignores assistant tools and output', async () => {
     const session = new VoiceSession({ trainingMode: true });
     const { socket } = await startConnectedSession(session);
+    expect(session.setMicrophoneMuted(true)).toBe(false);
+    expect(mediaTrack.enabled).toBe(true);
     const transcripts = [];
     window.addEventListener('limova-voice-transcript', event => transcripts.push(event.detail));
     vi.useFakeTimers();
@@ -955,8 +1182,10 @@ describe('Gemini Live voice protocol', () => {
 
   it('stops the microphone and signals audioStreamEnd on explicit stop', async () => {
     const { session, socket } = await startConnectedSession();
+    session.setMicrophoneMuted(true);
     session.stop();
     expect(mediaTrack.stop).toHaveBeenCalledOnce();
+    expect(session.microphoneMuted).toBe(false);
     expect(socket.sent.at(-1)).toEqual({ realtimeInput: { audioStreamEnd: true } });
     expect(socket.closeArgs).toEqual({ code: 1000, reason: 'user-stop' });
   });
