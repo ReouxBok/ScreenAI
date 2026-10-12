@@ -29,3 +29,9 @@ export function runSavRuleReplay(rawCases: unknown) {
     results,
   };
 }
+
+/** CI may explicitly check only deterministic intake. That result never attests
+ * semantic quality; the default replay still fails when any case is unevaluated. */
+export function savRuleReplayExitCode(report: { failed: number; notEvaluated: number }, technicalPreflightOnly = false) {
+  return report.failed || (!technicalPreflightOnly && report.notEvaluated) ? 1 : 0;
+}

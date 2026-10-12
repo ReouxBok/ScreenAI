@@ -1,6 +1,6 @@
 import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
-import { runSavRuleReplay } from "./replay";
+import { runSavRuleReplay, savRuleReplayExitCode } from "./replay";
 
 describe("versioned SAV replay corpus", () => {
   it("does not claim a lexical preflight evaluated semantic quality", () => {
@@ -16,4 +16,11 @@ describe("versioned SAV replay corpus", () => {
       expect(result.actual.reasonCode).toBe("semantic_understanding_required");
     }
   });
+});
+
+it("allows an explicit technical-only CI check without passing unevaluated semantics", () => {
+  expect(savRuleReplayExitCode({ failed: 0, notEvaluated: 12 })).toBe(1);
+  expect(savRuleReplayExitCode({ failed: 0, notEvaluated: 12 }, true)).toBe(0);
+  expect(savRuleReplayExitCode({ failed: 1, notEvaluated: 12 }, true)).toBe(1);
+  expect(savRuleReplayExitCode({ failed: 0, notEvaluated: 0 })).toBe(0);
 });

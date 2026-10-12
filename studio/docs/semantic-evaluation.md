@@ -29,7 +29,7 @@ Keep one situation and all its paraphrases within one partition. Split by situat
 
 `savSemanticManifestSchema` fixes case IDs, family, partition, language, situation group, private input hash, expected labels, justification hash and human annotation approval. `protocolApproval` records product approval; timestamps must precede the freeze. The full canonical manifest hash binds each campaign. A live query of current approved reviews is not a frozen corpus: a later review must not silently delete a previous failure.
 
-Reuse approved, anonymized sources from `reviewed-replay.ts` in the private application environment. Export only after an authorized private workflow; this tooling does not read or export the production database. The existing `replay.ts` deterministic suite remains useful for code regressions and does not measure real semantic quality. No V1 qualification code or corpus is imported.
+Reuse approved, anonymized sources from `reviewed-replay.ts` in the private application environment. Export only after an authorized private workflow; this tooling does not read or export the production database. The existing `replay.ts` deterministic suite remains useful for code regressions and does not measure real semantic quality. CI explicitly uses `sav:replay -- --technical-preflight` to check technical intake rules. Its report keeps all semantic cases unevaluated and `semanticQualityVerified: false`; a successful CI job is not the semantic release gate. The default replay exits nonzero if any case is unevaluated. No V1 qualification code or corpus is imported.
 
 ## Measurements and exit conditions
 
