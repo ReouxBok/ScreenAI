@@ -72,5 +72,8 @@ export function savReviewMatchesProposal(review: { reviewScope: string; dossierS
         : review.decisionId === source.decisionId && review.agentRunId === source.agentRunId));
 }
 export function savDraftNotApplicable(p: SavStructuredProposal) {
-    return p.decision.reasonCode === "cancellation_human_only" || !p.replyDraft?.trim();
+    return ["cancellation_human_only", "finance_human_only", "legal_human_only"].includes(p.decision.reasonCode)
+        || p.replyAssessment?.kind === "finance_standard" || p.replyAssessment?.kind === "forbidden"
+        || p.understanding?.requests.some(r => ["financial_operation", "financial_data", "legal", "cancellation"].includes(r.nature))
+        || (!p.understanding && p.category === "billing") || !p.replyDraft?.trim();
 }

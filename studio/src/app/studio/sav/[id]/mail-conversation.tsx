@@ -1,8 +1,9 @@
+import { formatParisDateTime } from "@/lib/paris-date";
 import type { getSavThreadDetail } from "@/lib/sav/service";
 import styles from "./thread.module.css";
 
 type Messages = NonNullable<Awaited<ReturnType<typeof getSavThreadDetail>>>["messages"];
-const dateFormat = new Intl.DateTimeFormat("fr-FR", { dateStyle: "medium", timeStyle: "short" });
+const dateFormat = { format: (value: Date) => formatParisDateTime(value, { dateStyle: "medium", timeStyle: "short" }) };
 
 function EmailMessage({ message }: { message: Messages[number] }) {
   return <article className={`sav-message ${message.direction} ${styles.message}`}>

@@ -1049,7 +1049,7 @@ export async function getSavThreadDetail(threadId: string) {
   const db = requireDb();
   const [thread] = await db.select().from(savThreads).where(eq(savThreads.id, threadId)).limit(1);
   if (!thread) return null;
-  const messages = await db.select().from(savMessages).where(eq(savMessages.threadId, threadId)).orderBy(savMessages.receivedAt);
+  const messages = await db.select().from(savMessages).where(eq(savMessages.threadId, threadId)).orderBy(savMessages.receivedAt, savMessages.createdAt, savMessages.id);
   const messageIds = messages.map((message) => message.id);
   const decisions = messageIds.length
     ? await db.select().from(savDecisions).where(inArray(savDecisions.messageId, messageIds)).orderBy(savDecisions.createdAt)
@@ -1326,6 +1326,7 @@ export async function queueSavTicketCreation(threadId: string, actorEmail: strin
 export async function retrySavAction(actionId: string, actorEmail: string) {
   const db = requireDb();
   const [current] = await db.select().from(savActions).where(eq(savActions.id, actionId)).limit(1);
+  if (current?.payload.ticketReturnDispatchedAt && !current.payload.ticketReturnCompletedAt) throw new Error("SAV_TICKET_RETURN_RECONCILIATION_REQUIRED");
   if ((current?.errorCode === "SAV_MANUAL_RECONCILIATION_REQUIRED" || current?.payload.ticketCreateDispatchedAt) && !current?.payload.hubspotTicketId) throw new Error("SAV_MANUAL_RECONCILIATION_REQUIRED");
   const [action] = await db.update(savActions).set({ status: "pending", attemptCount: 0, scheduledAt: null, errorCode: null, updatedAt: new Date() })
     .where(and(eq(savActions.id, actionId), eq(savActions.status, "failed"))).returning();

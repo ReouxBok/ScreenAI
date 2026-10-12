@@ -1,3 +1,4 @@
+import { formatParisDateTime } from "@/lib/paris-date";
 import Link from "next/link";
 import { AlertTriangle, ArrowUpRight, Bot, CheckCircle2, Clock3, FlaskConical, Inbox, TicketCheck, UserRoundCheck } from "lucide-react";
 import { isDatabaseConfigured } from "@/db";
@@ -152,7 +153,7 @@ export default async function SavDashboardPage({ searchParams }: { searchParams:
       <header><span>{rows.length} mail{rows.length > 1 ? "s" : ""}</span><span>Décision et justification</span><span>Action</span></header>
       {rows.map((row) => <Link className="decision-ledger-row" href={`/studio/sav/${row.threadId}`} key={row.messageId}>
         <span className="ledger-rail" aria-hidden="true"><i className={row.decisionKind === "human_review_required" ? "human" : row.decisionId ? "decided" : "missing"}/></span>
-        <span className="ledger-mail"><small>{new Intl.DateTimeFormat("fr-FR", { dateStyle: "short", timeStyle: "short" }).format(row.receivedAt)}</small><strong>{row.subject}</strong><span>{row.fromEmail}</span><p>{row.preview || "Aucun aperçu disponible"}</p></span>
+        <span className="ledger-mail"><small>{formatParisDateTime(row.receivedAt, { dateStyle: "short", timeStyle: "short" })}</small><strong>{row.subject}</strong><span>{row.fromEmail}</span><p>{row.preview || "Aucun aperçu disponible"}</p></span>
         <span className="ledger-decision"><em className={`sav-decision ${row.decisionKind ?? "missing"}`}>{row.decisionKind ? decisionLabels[row.decisionKind] : "Non justifié"}</em><strong>{row.explanation ?? "Ce mail attend encore une décision traçable."}</strong>{row.confidence !== null && <small>Confiance {Math.round(row.confidence / 10)} % · {row.actorType === "human" ? "corrigé par un humain" : "décidé par Charly"}</small>}</span>
         <span className="ledger-action">{row.pilotItemStatus === "pending" || row.pilotItemStatus === "processing" ? <><FlaskConical size={16}/><strong>Analyse batch</strong></> : row.pilotVerdict ? <><CheckCircle2 size={16}/><strong>{row.pilotVerdict}</strong></> : row.pilotItemStatus === "ready" ? <><Bot size={16}/><strong>Simulation prête</strong></> : row.hubspotTicketId ? <><TicketCheck size={16}/><strong>#{row.hubspotTicketId}</strong></> : row.aiPaused ? <><Clock3 size={16}/><strong>Équipe SAV</strong></> : <><Bot size={16}/><strong>En attente</strong></>}<ArrowUpRight size={15}/></span>
       </Link>)}

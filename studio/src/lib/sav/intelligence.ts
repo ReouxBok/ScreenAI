@@ -17,7 +17,7 @@ import { SAV_AGENT_SCOPE, SAV_PROMPT_REVISION, SAV_LEGACY_PROMPT_REVISION, SAV_R
 import { savAnalysisErrorCode, savPrimaryAnalysisDiagnostic, type SavAnalysisDiagnostic } from "./analysis-errors";
 import { parseSavGeminiJson, readSavGeminiResponse, type SavGeminiMetadata } from "./gemini-response";
 import { buildSavInboundContext, splitSavMessageText, type SavInboundContext } from "./message-context";
-import { deterministicDecision, containsPromptInjection, safeSavFinanceDraft, safeSavHumanHandoffDraft, type DecisionProposal, type SavClassificationInput } from "./policy";
+import { deterministicDecision, containsPromptInjection, safeSavHumanHandoffDraft, type DecisionProposal, type SavClassificationInput } from "./policy";
 import { cleanSavModelDraft } from "./reply-format";
 import type { SavDossierContext } from "./dossier-context";
 import { selectSavLeadTemplate } from "./lead-template";
@@ -398,10 +398,10 @@ async function analyzeSavMessageRaw(
 }
 
 /** A standard handoff names every understood request without giving product advice. */
-function contextualHandoff(understanding: SavUnderstandingV1, finance = false) {
+function contextualHandoff(understanding: SavUnderstandingV1) {
   const heading = understanding.language === "en" ? "Your message concerns:" : "Votre message porte sur :";
   const summary = understanding.requests.map(r => `• ${r.summary}`).join("\n");
-  const standard = finance ? safeSavFinanceDraft(understanding.language) : safeSavHumanHandoffDraft(understanding.language);
+  const standard = safeSavHumanHandoffDraft(understanding.language);
   return [standard, summary ? `${heading}\n${summary}` : null].filter(Boolean).join("\n\n");
 }
 
@@ -419,14 +419,14 @@ function restrictedSemanticAnalysis(understanding: SavUnderstandingV1): SavAnaly
   const reason = understanding.status === "unavailable" ? "La compréhension IA est indisponible. Qualifier manuellement : aucune catégorie métier ni réponse personnalisée n’est vérifiée."
     : understanding.status === "needs_clarification" ? "La demande ne peut pas être qualifiée de façon fiable. Vérifier les ambiguïtés et les informations manquantes avant de préparer une réponse."
       : plan.reasonCode === "cancellation_human_only" ? "La demande actuelle inclut une résiliation : dossier humain uniquement, aucun brouillon IA."
-        : plan.replyPolicy === "finance_standard" ? "Une demande porte sur des données ou opérations financières : revue humaine et réponse standard uniquement. La catégorie conserve l’objectif principal."
+        : ["finance_human_only", "legal_human_only"].includes(plan.reasonCode) ? "La demande financière ou juridique est réservée à l’équipe humaine : proposer un ticket, aucun brouillon de réponse."
           : "Aucune réponse IA ni création automatique de ticket n’est proposée pour ce message.";
   return { category: plan.category, urgency: "normal", model: understanding.trace.model ?? "rules-v1", understanding,
     proposal: { kind: plan.reasonCode === "simple_acknowledgement" ? "no_ticket_needed" : "human_review_required", reasonCode: plan.reasonCode,
       explanation: [reason, ...understanding.requests.map(r => r.summary)].join("\n").slice(0, 2000), confidence: 0, requiresHumanApproval: true },
-    evidence: [], replyDraft: plan.replyPolicy === "finance_standard" ? contextualHandoff(understanding, true) : null, internalNote: null,
+    evidence: [], replyDraft: null, internalNote: null,
     diagnostics: understanding.trace.errorCode ? [{ phase: "generation", errorCode: understanding.trace.errorCode }] : [],
-    replyAssessment: { kind: plan.replyPolicy === "finance_standard" ? "finance_standard" : understanding.status === "unavailable" ? "unavailable" : plan.reasonCode === "cancellation_human_only" ? "forbidden" : "none", coverage: [], errorCode: understanding.trace.errorCode } };
+    replyAssessment: { kind: understanding.status === "unavailable" ? "unavailable" : ["cancellation_human_only", "finance_human_only", "legal_human_only"].includes(plan.reasonCode) ? "forbidden" : "none", coverage: [], errorCode: understanding.trace.errorCode } };
 }
 
 /** Understand once, apply server policy, compose, then freeze the reviewed snapshot. */
@@ -478,7 +478,6 @@ export async function analyzeSavMessage(input: SavEnrichedInput, context: SavAna
     // These restrictions apply equally to direct Gemini, ADK, and any degraded path.
     analysis.category = plan.category;
     if (plan.replyPolicy === "none") analysis.replyDraft = null;
-    if (plan.replyPolicy === "finance_standard") analysis.replyDraft = contextualHandoff(understanding, true);
     if (plan.requiresHuman || containsPromptInjection(messageContext.currentText) || (conversation && (!conversation.senderMatchesCustomer || conversation.aiPaused))) {
       analysis.proposal = { ...analysis.proposal, kind: analysis.proposal.kind === "no_ticket_needed" ? "no_ticket_needed" : "human_review_required", requiresHumanApproval: true };
     }
@@ -487,7 +486,10 @@ export async function analyzeSavMessage(input: SavEnrichedInput, context: SavAna
       analysis.identityCandidates = crm?.identityCandidates ?? [];
       analysis.ticketRouting = !crm || crm.errorCode ? { kind: "review", reason: "hubspot_context_unavailable", candidateIds: [] }
         : !crm.contactFound || !crm.contactId ? { kind: "review", reason: "customer_identity_unverified", candidateIds: [] }
-          : crm.routing.kind === "matched" && crm.routing.ticketId ? { kind: "matched", contactId: crm.contactId, ticketId: crm.routing.ticketId, reason: crm.routing.reason }
+           : crm.routing.kind === "matched" && crm.routing.ticketId ? crm.routing.returnOperation === "create"
+            ? { kind: "new", contactId: crm.contactId, reason: "closed_over_15_days" }
+            : crm.routing.returnOperation === "review" ? { kind: "review", reason: "ticket_closure_or_stage_to_review", candidateIds: [crm.routing.ticketId] }
+            : { kind: "matched", contactId: crm.contactId, ticketId: crm.routing.ticketId, reason: crm.routing.returnOperation === "reactivate" ? "customer_return_reactivate" : crm.routing.reason }
             : crm.routing.kind === "ambiguous" ? { kind: "review", reason: crm.routing.reason, candidateIds: crm.routing.candidateIds ?? [] }
               : { kind: "new", contactId: crm.contactId, reason: crm.routing.reason };
       for (const ticket of crm?.tickets ?? []) if (!analysis.evidence.some(e => e.sourceType === "hubspot_ticket" && e.sourceId === ticket.id)) analysis.evidence.push({ sourceType: "hubspot_ticket", sourceId: ticket.id, title: ticket.subject });
