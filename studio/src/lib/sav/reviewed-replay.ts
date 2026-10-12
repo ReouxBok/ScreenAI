@@ -9,7 +9,7 @@ import { savV0EligibleMessageFilter } from "./cutover";
 import { savRunProvenance } from "./config";
 import { decisionKindSchema } from "./policy";
 import { savStructuredProposalSchema } from "./proposal";
-import { runSavRuleReplay, savReplayCaseSchema } from "./replay";
+import { runSavRuleReplay, savReplayCaseSchema, SAV_RULE_REPLAY_REVISION } from "./replay";
 
 function ugoOnly(actorEmail: string) { if (actorEmail.trim().toLowerCase() !== "ugo@limova.ai") throw new Error("SAV_REPLAY_UGO_REQUIRED"); }
 export async function createReviewedSavReplay(raw: unknown, actorEmail: string) {
@@ -51,11 +51,11 @@ export async function runReviewedSavRuleReplay(actorEmail: string) {
   const cases = corpus.cases;
   const report = runSavRuleReplay(cases);
   const corpusHash = corpus.hash;
-  const [baseline] = await db.select().from(savReviewedReplayRuns).where(eq(savReviewedReplayRuns.corpusHash, corpusHash)).orderBy(desc(savReviewedReplayRuns.createdAt), desc(savReviewedReplayRuns.id)).limit(1);
+  const [baseline] = await db.select().from(savReviewedReplayRuns).where(and(eq(savReviewedReplayRuns.corpusHash, corpusHash), eq(savReviewedReplayRuns.runnerRevision, SAV_RULE_REPLAY_REVISION))).orderBy(desc(savReviewedReplayRuns.createdAt), desc(savReviewedReplayRuns.id)).limit(1);
   const codeRevision = savRunProvenance().codeRevision;
   return db.transaction(async (tx) => {
-    const [run] = await tx.insert(savReviewedReplayRuns).values({ corpusHash, runnerRevision: "sav-rule-replay-v1", codeRevision, total: report.total, failed: report.failed,
-      result: { scope: "deterministic_rules_only", regression: baseline ? report.failed > baseline.failed : null, baselineId: baseline?.id ?? null, results: report.results }, executedBy: actorEmail }).returning();
+    const [run] = await tx.insert(savReviewedReplayRuns).values({ corpusHash, runnerRevision: SAV_RULE_REPLAY_REVISION, codeRevision, total: report.total, failed: report.failed,
+      result: { scope: "technical_preflight_only", notEvaluated: report.notEvaluated, regression: baseline && !report.notEvaluated && !baseline.result.notEvaluated ? report.failed > baseline.failed : null, baselineId: baseline?.id ?? null, results: report.results }, executedBy: actorEmail }).returning();
     await tx.insert(auditLogs).values({ actorEmail, action: "sav_reviewed_rule_replay_executed", entityType: "sav_replay_run", entityId: run.id, technicalMetadata: { total: run.total, failed: run.failed, codeRevision, corpusHash } });
     return { id: run.id };
   });
