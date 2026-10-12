@@ -141,3 +141,42 @@ it("preserves a review on an unchanged refresh but invalidates it when CRM facts
   const [changed] = await fixture.db.select().from(savMessages).where(eq(savMessages.id, message.id));
   expect(savReviewMatchesProposal(review, { decisionId: decision.id, agentRunId: run.id, proposal, message: changed })).toBe(false);
 });
+
+// Independent review probe: UI and refresher must select the same inbound on a receivedAt tie.
+it("independent: refreshes the inbound actually selected for the displayed dossier on tied timestamps", async () => {
+ const { getSavThreadDetail } = await import("./service");
+ const first = await seed();
+ await fixture.db.update(savMessages).set({createdAt: new Date("2026-10-06T14:00:00Z")}).where(eq(savMessages.id, first.id));
+ await fixture.db.insert(savMessages).values({mailboxId, threadId:first.threadId, direction:"inbound", fromEmail: customer, id:"00000000-0000-4000-8000-000000000001", subject:"Same-time second import", receivedAt:at, createdAt:new Date("2026-10-06T14:00:00Z"), bodyCiphertext:encryptSavPayload({text:"Second inserted, same timestamps, lower ID"})}).returning();
+ const context = await collectLatestSavDossierContext(first.threadId);
+ const detail = await getSavThreadDetail(first.threadId);
+ const shown = [...detail!.messages].reverse().find(m=>m.direction==="inbound")!;
+ expect(context.messageId).toBe(shown.id);
+});
+
+it("independent: refresh covers the latest inbound arriving while CRM lookup is in flight", async () => {
+ const {getSavThreadDetail} = await import("./service");
+ const first=await seed(); let arrivedId="";
+ state.crm.mockImplementationOnce(async () => {
+  const [arrived]=await fixture.db.insert(savMessages).values({mailboxId,threadId:first.threadId,direction:"inbound",fromEmail:customer,subject:"New incoming message",receivedAt:new Date(at.getTime()+1_000),bodyCiphertext:encryptSavPayload({text:"A new issue"})}).returning(); arrivedId=arrived.id;
+  return {contactFound:true, contactId:"42",identityCandidates:[],tickets:[],errorCode:null,routing:{kind:"new",reason:"no_candidates"}};
+ });
+ const context=await collectLatestSavDossierContext(first.threadId);
+ const detail=await getSavThreadDetail(first.threadId);
+ const shown=[...detail!.messages].reverse().find(m=>m.direction==="inbound")!;
+ expect(shown.id).toBe(arrivedId);
+ expect(context.messageId).toBe(shown.id);
+});
+
+it("stops with an explicit error if arrivals keep invalidating the refresh", async () => {
+  const first = await seed(); let arrivals = 0;
+  state.crm.mockImplementation(async () => {
+    arrivals++;
+    await fixture.db.insert(savMessages).values({ mailboxId, threadId: first.threadId, direction: "inbound", fromEmail: customer,
+      subject: "Concurrent message", receivedAt: new Date(at.getTime() + arrivals * 1_000), bodyCiphertext: encryptSavPayload({ text: "New inbound" }) });
+    return { contactFound: true, contactId: "42", identityCandidates: [], tickets: [], errorCode: null, routing: { kind: "new", reason: "no_candidates" } };
+  });
+  await expect(collectLatestSavDossierContext(first.threadId)).rejects.toThrow("SAV_CONTEXT_CHANGED_DURING_REFRESH");
+  expect(state.crm).toHaveBeenCalledTimes(3);
+  expect(await fixture.db.select().from(savActions)).toHaveLength(0);
+});
