@@ -38,6 +38,7 @@ import { assertSavGmailThreadCurrent } from "./gmail";
 import { savStructuredProposalSchema } from "./proposal";
 import { phoneMatchesHint, type SavIdentityCandidate, type SavIdentityHints } from "./identity";
 import { assertSavActor } from "./access";
+import { resolveSavCustomerIdentity, resolveSavCustomerMessage } from "./forwarded-identity";
 import { hasSavTicketObservation, refreshSavTicketObservations } from "./observations";
 
 const hubspotEventSchema = z.object({
@@ -261,7 +262,7 @@ function escapeSavNoteHtml(value: string) {
 
 /** Two writes form a supervised operation. Unknown/partial results require human reconciliation;
  * they are never replayed as another note. Every write retains the live V0 authorization guard. */
-async function reactivateSavTicketForReturn(action: typeof savActions.$inferSelect, ticketId: string, contactId: string, expectedStage: string | null | undefined, expectedClosedAt: string | null | undefined, message: typeof savMessages.$inferSelect, mailboxEmail: string, gmailThreadId: string, replacesClosedTicketId?: string) {
+async function reactivateSavTicketForReturn(action: typeof savActions.$inferSelect, ticketId: string, contactId: string, expectedStage: string | null | undefined, expectedClosedAt: string | null | undefined, expectedOwnerId: string, message: typeof savMessages.$inferSelect, mailboxEmail: string, gmailThreadId: string, replacesClosedTicketId?: string) {
   const body = decryptSavPayload<SavMessageBody>(message.bodyCiphertext);
   const note = `Le client est revenu sur le même sujet. Retour reçu le ${message.receivedAt.toISOString()}.\nDe : ${message.fromEmail}\nObjet : ${message.subject}\nEmail source : ${message.gmailMessageId}\n\n${body.text}`;
   const html = `<p>${escapeSavNoteHtml(note).replace(/\n/g, "<br>")}</p>`;
@@ -274,9 +275,10 @@ async function reactivateSavTicketForReturn(action: typeof savActions.$inferSele
         || predecessor.properties.hs_pipeline_stage !== SAV_HUBSPOT_SUPPORT.stages.closed
         || !predecessor.associations?.contacts?.results?.some(contact => contact.id === contactId)) throw new Error("SAV_TICKET_RETURN_CONTEXT_CHANGED");
     }
-    const target = await hubspotFetch<HubspotRecord>(`/crm/v3/objects/tickets/${encodeURIComponent(ticketId)}?properties=hs_pipeline,hs_pipeline_stage,hs_last_closed_date,closed_date&associations=contacts`);
+    const target = await hubspotFetch<HubspotRecord>(`/crm/v3/objects/tickets/${encodeURIComponent(ticketId)}?properties=hs_pipeline,hs_pipeline_stage,hs_last_closed_date,closed_date,hubspot_owner_id&associations=contacts`);
     if (target.properties.hs_pipeline !== SAV_HUBSPOT_SUPPORT.pipelineId || target.properties.hs_pipeline_stage !== expectedStage
       || (target.properties.hs_last_closed_date || target.properties.closed_date || null) !== (expectedClosedAt ?? null)
+      || target.properties.hubspot_owner_id !== expectedOwnerId
       || !target.associations?.contacts?.results?.some(contact => contact.id === contactId)) throw new Error("SAV_TICKET_RETURN_CONTEXT_CHANGED");
   };
   await checkTarget();
@@ -286,7 +288,7 @@ async function reactivateSavTicketForReturn(action: typeof savActions.$inferSele
   await assertSavGmailThreadCurrent(mailboxEmail, gmailThreadId, message.gmailMessageId!);
   await assertSavWriteAllowed(action.id);
   const db = requireDb();
-  const [claimed] = await db.update(savActions).set({ payload: sql`${savActions.payload} || ${JSON.stringify({ ticketReturnDispatchedAt: new Date().toISOString(), ticketReturnRequestCiphertext: encryptSavPayload({ ticketId, contactId, html, replacesClosedTicketId }) })}::jsonb`, updatedAt: new Date() })
+  const [claimed] = await db.update(savActions).set({ payload: sql`${savActions.payload} || ${JSON.stringify({ ticketReturnDispatchedAt: new Date().toISOString(), ticketReturnRequestCiphertext: encryptSavPayload({ ticketId, contactId, html, expectedOwnerId, replacesClosedTicketId }) })}::jsonb`, updatedAt: new Date() })
     .where(and(eq(savActions.id, action.id), eq(savActions.status, "running"), sql`${savActions.payload}->>'ticketReturnDispatchedAt' is null`)).returning();
   if (!claimed) throw new Error("SAV_TICKET_RETURN_RECONCILIATION_REQUIRED");
   let noteAcknowledged = false;
@@ -300,7 +302,7 @@ async function reactivateSavTicketForReturn(action: typeof savActions.$inferSele
     await db.update(savActions).set({ payload: sql`${savActions.payload} || ${JSON.stringify({ ticketReturnNoteId: noteResult.id })}::jsonb` }).where(eq(savActions.id, action.id));
     await assertSavGmailThreadCurrent(mailboxEmail, gmailThreadId, message.gmailMessageId!);
     await checkTarget();
-    await guardedHubspotWrite(action.id, `/crm/v3/objects/tickets/${encodeURIComponent(ticketId)}`, { method: "PATCH", body: JSON.stringify({ properties: { hs_pipeline_stage: SAV_HUBSPOT_SUPPORT.stages.new } }) });
+    await guardedHubspotWrite(action.id, `/crm/v3/objects/tickets/${encodeURIComponent(ticketId)}`, { method: "PATCH", body: JSON.stringify({ properties: { hs_pipeline_stage: SAV_HUBSPOT_SUPPORT.stages.new, hubspot_owner_id: expectedOwnerId } }) });
     await db.update(savActions).set({ payload: sql`${savActions.payload} || ${JSON.stringify({ ticketReturnCompletedAt: new Date().toISOString(), hubspotTicketId: ticketId })}::jsonb`, updatedAt: new Date() }).where(eq(savActions.id, action.id));
   } catch (error) {
     const code = error instanceof Error ? error.message : "UNKNOWN_ERROR";
@@ -319,7 +321,7 @@ async function finalizeSavV0TicketAction(action: typeof savActions.$inferSelect)
   if (!latest?.gmailMessageId) throw new Error("SAV_GMAIL_MESSAGE_ID_REQUIRED");
   const [mailbox] = await requireDb().select().from(savMailboxes).where(eq(savMailboxes.id, latest.mailboxId)).limit(1);
   if (!mailbox) throw new Error("SAV_MAILBOX_NOT_FOUND");
-  const returnRequest = action.payload.ticketReturn ? z.object({ ticketId: z.string(), operation: z.enum(["keep", "reactivate", "create"]), stageId: z.string().nullish(), closedAt: z.string().nullish(), replacesClosedTicketId: z.string().optional() }).parse(action.payload.ticketReturn) : null;
+  const returnRequest = action.payload.ticketReturn ? z.object({ ticketId: z.string(), operation: z.enum(["keep", "reactivate", "create"]), stageId: z.string().nullish(), closedAt: z.string().nullish(), ownerId: z.string().optional(), replacesClosedTicketId: z.string().optional() }).parse(action.payload.ticketReturn) : null;
   if (action.payload.ticketReturnDispatchedAt && !action.payload.ticketReturnCompletedAt) throw new Error("SAV_TICKET_RETURN_RECONCILIATION_REQUIRED");
   if (returnRequest?.replacesClosedTicketId && thread.hubspotTicketId !== returnRequest.replacesClosedTicketId && thread.hubspotTicketId !== action.payload.hubspotTicketId) throw new Error("SAV_TICKET_RETURN_CONTEXT_CHANGED");
   const knownTicketId = typeof action.payload.hubspotTicketId === "string" ? action.payload.hubspotTicketId : null;
@@ -333,12 +335,18 @@ async function finalizeSavV0TicketAction(action: typeof savActions.$inferSelect)
     ticket = await hubspotFetch<HubspotRecord>(`/crm/v3/objects/tickets/${encodeURIComponent(knownTicketId)}?properties=subject,hs_pipeline,hs_pipeline_stage`);
   } else {
     await assertSavGmailThreadCurrent(mailbox.email, thread.gmailThreadId, latest.gmailMessageId);
-    const customerEmail = proposal.customerIdentity.verifiedByHuman && proposal.customerIdentity.registrationEmail ? proposal.customerIdentity.registrationEmail : thread.customerEmail;
-    const context = await readSavHubspotContext({ email: customerEmail, subject: latest.subject, returnedAt: latest.receivedAt, currentTicketId: thread.hubspotTicketId });
+    const customerMessage = resolveSavCustomerMessage({ fromEmail: latest.fromEmail, subject: latest.subject, body: decryptSavPayload<SavMessageBody>(latest.bodyCiphertext).text });
+    const customerIdentity = { kind: customerMessage.kind, email: customerMessage.email };
+    if (!customerIdentity.email) throw new Error("SAV_FORWARDED_CUSTOMER_UNRESOLVED");
+    const customerEmail = customerIdentity.kind === "forwarded" ? customerIdentity.email
+      : proposal.customerIdentity.verifiedByHuman && proposal.customerIdentity.registrationEmail ? proposal.customerIdentity.registrationEmail : customerIdentity.email;
+    const context = await readSavHubspotContext({ email: customerEmail, subject: customerMessage.subject, returnedAt: latest.receivedAt,
+      currentTicketId: customerIdentity.kind === "sender" && thread.customerEmail.toLowerCase() === customerEmail.toLowerCase() ? thread.hubspotTicketId : undefined });
     if (!context.contactId) throw new Error("SAV_HUBSPOT_CONTACT_REQUIRED");
     const returnTarget = returnRequest ? context.tickets.find(value => value.id === returnRequest.ticketId) : null;
     if (returnRequest && (!returnTarget || context.routing.kind !== "matched" || context.routing.ticketId !== returnTarget.id
       || returnTarget.stageId !== returnRequest.stageId || returnTarget.closedAt !== returnRequest.closedAt
+      || (returnRequest.operation === "reactivate" || returnRequest.operation === "create") && (!returnRequest.ownerId || returnTarget.ownerId !== returnRequest.ownerId)
       || savTicketReturnPlan(returnTarget, latest.receivedAt).operation !== returnRequest.operation)) throw new Error("SAV_TICKET_RETURN_CONTEXT_CHANGED");
     if (returnRequest?.replacesClosedTicketId && (thread.hubspotTicketId !== returnRequest.replacesClosedTicketId
       || action.payload.previousTicketId !== returnRequest.replacesClosedTicketId
@@ -350,7 +358,8 @@ async function finalizeSavV0TicketAction(action: typeof savActions.$inferSelect)
       if (!selected) throw new Error("SAV_LINK_TARGET_INVALID");
       ticket = { id: selected.id, properties: { subject: selected.subject, hs_pipeline: selected.pipelineId || SAV_HUBSPOT_SUPPORT.pipelineId } };
       if (returnRequest?.operation === "reactivate") {
-        await reactivateSavTicketForReturn(action, selected.id, context.contactId, returnRequest.stageId, returnRequest.closedAt, latest, mailbox.email, thread.gmailThreadId, returnRequest.replacesClosedTicketId);
+        if (!returnRequest.ownerId) throw new Error("SAV_TICKET_OWNER_REQUIRED");
+        await reactivateSavTicketForReturn(action, selected.id, context.contactId, returnRequest.stageId, returnRequest.closedAt, returnRequest.ownerId, latest, mailbox.email, thread.gmailThreadId, returnRequest.replacesClosedTicketId);
       }
       // A plain link (including a ticket already New) never changes the CRM.
     } else {
@@ -360,11 +369,15 @@ async function finalizeSavV0TicketAction(action: typeof savActions.$inferSelect)
       await assertSavWriteAllowed(action.id);
       await assertSavGmailThreadCurrent(mailbox.email, thread.gmailThreadId, latest.gmailMessageId);
       const properties = savSupportTicketProperties({ title: proposal.ticket.title, description: proposal.ticket.description });
+      if (returnRequest?.operation === "create") {
+        if (!returnTarget?.ownerId || !returnRequest.ownerId || returnTarget.ownerId !== returnRequest.ownerId) throw new Error("SAV_TICKET_OWNER_REQUIRED");
+        properties.hubspot_owner_id = returnTarget.ownerId;
+      }
       const db = requireDb();
       // Durable marker before dispatch. Recovery must fail closed after a crash.
       const [claimed] = await db.update(savActions).set({ payload: sql`${savActions.payload} || ${JSON.stringify({ ticketCreateDispatchedAt: new Date().toISOString(), ticketCreateRequestCiphertext: encryptSavPayload({
           actionId: action.id, reviewId: review.id, decisionId: action.decisionId, messageId: action.messageId, threadId: thread.id,
-          contactId: context.contactId, customerEmail, properties,
+          contactId: context.contactId, customerEmail, customerIdentityKind: customerIdentity.kind, properties,
         }) })}::jsonb`, updatedAt: new Date() })
         .where(and(eq(savActions.id, action.id), eq(savActions.status, "running"), sql`${savActions.payload}->>'ticketCreateDispatchedAt' is null`)).returning();
       if (!claimed) throw new Error("SAV_MANUAL_RECONCILIATION_REQUIRED");
@@ -405,13 +418,15 @@ export async function reconcileSavTicketReturn(actionId: string, noteId: string,
   const db = requireDb();
   const [action] = await db.select().from(savActions).where(eq(savActions.id, actionId));
   if (!action || action.kind !== "link_ticket" || action.status !== "failed" || typeof action.payload.ticketReturnRequestCiphertext !== "string" || !action.payload.ticketReturnDispatchedAt) throw new Error("SAV_ACTION_NOT_RECONCILABLE");
-  const request = decryptSavPayload<{ ticketId: string; contactId: string; html: string; replacesClosedTicketId?: string }>(action.payload.ticketReturnRequestCiphertext);
+  const request = decryptSavPayload<{ ticketId: string; contactId: string; html: string; expectedOwnerId: string; replacesClosedTicketId?: string }>(action.payload.ticketReturnRequestCiphertext);
+  if (!request.expectedOwnerId) throw new Error("SAV_TICKET_RETURN_LEGACY_OWNER_UNVERIFIABLE");
   const [ticket, note] = await Promise.all([
-    hubspotFetch<HubspotRecord>(`/crm/v3/objects/tickets/${encodeURIComponent(request.ticketId)}?properties=hs_pipeline,hs_pipeline_stage&associations=contacts`),
+    hubspotFetch<HubspotRecord>(`/crm/v3/objects/tickets/${encodeURIComponent(request.ticketId)}?properties=hs_pipeline,hs_pipeline_stage,hubspot_owner_id&associations=contacts`),
     hubspotFetch<HubspotRecord>(`/crm/v3/objects/notes/${encodeURIComponent(noteId)}?properties=hs_note_body&associations=tickets`),
   ]);
   const normalizeHtml = (html: string) => html.replace(/<br\s*\/?>/gi, "\n").replace(/<\/?p>/gi, "").replace(/\r\n/g, "\n").trim();
   if (ticket.properties.hs_pipeline !== SAV_HUBSPOT_SUPPORT.pipelineId || ticket.properties.hs_pipeline_stage !== SAV_HUBSPOT_SUPPORT.stages.new
+    || !request.expectedOwnerId || ticket.properties.hubspot_owner_id !== request.expectedOwnerId
     || !ticket.associations?.contacts?.results?.some(value => value.id === request.contactId)
     || !note.associations?.tickets?.results?.some(value => value.id === request.ticketId)
     || normalizeHtml(String(note.properties.hs_note_body ?? "")) !== normalizeHtml(request.html)) throw new Error("SAV_RECONCILIATION_TARGET_INVALID");
@@ -437,20 +452,28 @@ export async function reconcileSavManualTicket(actionId: string, ticketId: strin
   const [review] = await db.select().from(savProposalReviews).where(eq(savProposalReviews.id, action.payload.savReviewId)).limit(1);
   const [thread] = await db.select().from(savThreads).where(eq(savThreads.id, action.threadId)).limit(1);
   if (!review || !thread || review.messageId !== action.messageId) throw new Error("SAV_ACTION_NOT_RECONCILABLE");
+  const [sourceMessage] = await db.select().from(savMessages).where(eq(savMessages.id, review.messageId)).limit(1);
+  if (!sourceMessage) throw new Error("SAV_ACTION_NOT_RECONCILABLE");
+  const sourceIdentity = resolveSavCustomerIdentity({ fromEmail: sourceMessage.fromEmail, body: decryptSavPayload<SavMessageBody>(sourceMessage.bodyCiphertext).text });
+  if (!sourceIdentity.email) throw new Error("SAV_FORWARDED_CUSTOMER_UNRESOLVED");
   const proposal = savStructuredProposalSchema.parse(decryptSavPayload(review.afterCiphertext));
-  let email = proposal.customerIdentity.verifiedByHuman && proposal.customerIdentity.registrationEmail ? proposal.customerIdentity.registrationEmail : thread.customerEmail;
+  let email = sourceIdentity.kind === "forwarded" ? sourceIdentity.email
+    : proposal.customerIdentity.verifiedByHuman && proposal.customerIdentity.registrationEmail ? proposal.customerIdentity.registrationEmail : sourceIdentity.email;
   let expected = savSupportTicketProperties({ title: proposal.ticket.title, description: proposal.ticket.description });
   let dispatchedContactId: string | null = null;
   if (typeof action.payload.ticketCreateRequestCiphertext === "string") {
-    const request = decryptSavPayload<{ actionId: string; reviewId: string; decisionId: string; messageId: string; threadId: string; contactId: string; customerEmail: string; properties: typeof expected }>(action.payload.ticketCreateRequestCiphertext);
-    if (request.actionId !== action.id || request.reviewId !== review.id || request.decisionId !== action.decisionId || request.messageId !== action.messageId || request.threadId !== thread.id || !request.contactId || !request.customerEmail)
+    const request = decryptSavPayload<{ actionId: string; reviewId: string; decisionId: string; messageId: string; threadId: string; contactId: string; customerEmail: string; customerIdentityKind?: "sender" | "forwarded" | "unresolved_forward"; properties: typeof expected }>(action.payload.ticketCreateRequestCiphertext);
+    if (request.actionId !== action.id || request.reviewId !== review.id || request.decisionId !== action.decisionId || request.messageId !== action.messageId || request.threadId !== thread.id || !request.contactId || !request.customerEmail
+      || sourceIdentity.kind === "forwarded" && request.customerEmail !== sourceIdentity.email)
       throw new Error("SAV_ACTION_NOT_RECONCILABLE");
     expected = request.properties; email = request.customerEmail; dispatchedContactId = request.contactId;
   } else if (typeof action.payload.ticketReviewSnapshotCiphertext === "string") {
-    const request = decryptSavPayload<{ reviewId: string; decisionId: string; messageId: string; threadId: string; customerEmail: string; proposal: unknown }>(action.payload.ticketReviewSnapshotCiphertext);
-    if (request.reviewId !== review.id || request.decisionId !== action.decisionId || request.messageId !== action.messageId || request.threadId !== thread.id || savContentHash(request.proposal) !== savContentHash(proposal))
+    const request = decryptSavPayload<{ reviewId: string; decisionId: string; messageId: string; threadId: string; customerEmail: string; customerIdentityKind?: "sender" | "forwarded" | "unresolved_forward"; proposal: unknown }>(action.payload.ticketReviewSnapshotCiphertext);
+    if (request.reviewId !== review.id || request.decisionId !== action.decisionId || request.messageId !== action.messageId || request.threadId !== thread.id || savContentHash(request.proposal) !== savContentHash(proposal)
+      || sourceIdentity.kind === "forwarded" && request.customerEmail !== sourceIdentity.email)
       throw new Error("SAV_ACTION_NOT_RECONCILABLE");
-    email = proposal.customerIdentity.verifiedByHuman && proposal.customerIdentity.registrationEmail ? proposal.customerIdentity.registrationEmail : request.customerEmail;
+    email = request.customerIdentityKind === "forwarded" ? request.customerEmail
+      : proposal.customerIdentity.verifiedByHuman && proposal.customerIdentity.registrationEmail ? proposal.customerIdentity.registrationEmail : request.customerEmail;
   } else {
     // Compatibility for commands queued before immutable request snapshots.
     // Compare the historical generation actually attached to this action, never the latest one.
@@ -461,8 +484,9 @@ export async function reconcileSavManualTicket(actionId: string, ticketId: strin
       proposal: savStructuredProposalSchema.parse(decryptSavPayload(run.proposalCiphertext)), message })) throw new Error("SAV_ACTION_NOT_RECONCILABLE");
   }
   const contact = await findContactByEmail(email);
-  const ticket = await hubspotFetch<HubspotRecord>(`/crm/v3/objects/tickets/${encodeURIComponent(ticketId)}?properties=subject,content,hs_pipeline&associations=contacts`);
+  const ticket = await hubspotFetch<HubspotRecord>(`/crm/v3/objects/tickets/${encodeURIComponent(ticketId)}?properties=subject,content,hs_pipeline,hubspot_owner_id&associations=contacts`);
   if (!contact || (dispatchedContactId && contact.id !== dispatchedContactId) || ticket.properties.hs_pipeline !== SAV_HUBSPOT_SUPPORT.pipelineId || ticket.properties.subject !== expected.subject || ticket.properties.content !== expected.content
+    || (expected.hubspot_owner_id && ticket.properties.hubspot_owner_id !== expected.hubspot_owner_id)
     || !ticket.associations?.contacts?.results?.some((value) => value.id === contact.id)) throw new Error("SAV_RECONCILIATION_TARGET_INVALID");
   return db.transaction(async (tx) => {
     await tx.select().from(savThreads).where(eq(savThreads.id, thread.id)).for("update");
@@ -490,7 +514,7 @@ async function ensureContactByEmail(email: string, actionId: string) {
 async function findExistingTicket(contactId: string | null, subject: string, currentTicketId?: string | null) {
   if (currentTicketId) {
     try {
-      const linked = await hubspotFetch<HubspotRecord>(`/crm/v3/objects/tickets/${encodeURIComponent(currentTicketId)}?properties=subject,hs_pipeline,hs_pipeline_stage,hs_lastmodifieddate`);
+      const linked = await hubspotFetch<HubspotRecord>(`/crm/v3/objects/tickets/${encodeURIComponent(currentTicketId)}?properties=subject,hs_pipeline,hs_pipeline_stage,hs_lastmodifieddate,hubspot_owner_id`);
       if (!(await closedTicketStages()).has(String(linked.properties.hs_pipeline_stage || ""))) return linked;
     } catch (error) {
       if (!/HUBSPOT_HTTP_404/.test(error instanceof Error ? error.message : "")) throw error;
@@ -505,7 +529,7 @@ async function findExistingTicket(contactId: string | null, subject: string, cur
     body: JSON.stringify({
       filterGroups: [{ filters }],
       query: subject.slice(0, 120),
-      properties: ["subject", "hs_pipeline", "hs_pipeline_stage", "hs_lastmodifieddate"],
+      properties: ["subject", "hs_pipeline", "hs_pipeline_stage", "hs_lastmodifieddate", "hubspot_owner_id"],
       sorts: ["-hs_lastmodifieddate"],
       limit: 20,
     }),
@@ -553,7 +577,7 @@ export async function readSavHubspotContext(input: { email: string; subject: str
     let linkedTicket: HubspotRecord | null = null;
     if (input.currentTicketId) {
       try {
-        linkedTicket = await hubspotFetch<HubspotRecord>(`/crm/v3/objects/tickets/${encodeURIComponent(input.currentTicketId)}?properties=subject,hs_pipeline,hs_pipeline_stage,hs_lastmodifieddate,hs_last_closed_date,closed_date&associations=contacts`);
+        linkedTicket = await hubspotFetch<HubspotRecord>(`/crm/v3/objects/tickets/${encodeURIComponent(input.currentTicketId)}?properties=subject,hs_pipeline,hs_pipeline_stage,hs_lastmodifieddate,hs_last_closed_date,closed_date,hubspot_owner_id&associations=contacts`);
       } catch (error) {
         if (!/HUBSPOT_HTTP_404/.test(error instanceof Error ? error.message : "")) throw error;
       }
@@ -562,7 +586,7 @@ export async function readSavHubspotContext(input: { email: string; subject: str
         method: "POST",
         body: JSON.stringify({
           filterGroups: [{ filters: [{ propertyName: "associations.contact", operator: "EQ", value: contact.id }] }],
-          properties: ["subject", "content", "hs_pipeline", "hs_pipeline_stage", "hs_lastmodifieddate", "createdate", "hs_last_closed_date", "closed_date"],
+          properties: ["subject", "content", "hs_pipeline", "hs_pipeline_stage", "hs_lastmodifieddate", "createdate", "hs_last_closed_date", "closed_date", "hubspot_owner_id"],
           sorts: ["-createdate"],
           limit: 100,
         }),
@@ -578,6 +602,7 @@ export async function readSavHubspotContext(input: { email: string; subject: str
       description: String(ticket.properties.content || "").slice(0, 2_500),
       pipelineId: ticket.properties.hs_pipeline,
       stageId: ticket.properties.hs_pipeline_stage,
+      ownerId: ticket.properties.hubspot_owner_id || null,
       status: closed.has(String(ticket.properties.hs_pipeline_stage || "")) ? "closed" as const : "open" as const,
       createdAt: ticket.createdAt ?? ticket.properties.createdate ?? null,
       closedAt: ticket.properties.hs_last_closed_date || ticket.properties.closed_date || null,
