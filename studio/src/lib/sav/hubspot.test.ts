@@ -11,13 +11,13 @@ describe("HubSpot dossier context reads", () => {
       if (url.endsWith("contacts/search")) return Response.json({ results: [{ id: "42", properties: { email: "client@example.invalid" } }] });
       if (url.endsWith("tickets/search")) {
         expect(JSON.parse(String(init?.body))).not.toHaveProperty("query");
-        return Response.json({ results: [{ id: "99", properties: { subject: "Une autre question", content: "Historique utile", hs_pipeline: "0", hs_pipeline_stage: "1" } }] });
+        return Response.json({ results: [{ id: "99", createdAt: "2026-01-02T12:00:00Z", updatedAt: "2026-10-02T12:00:00Z", properties: { subject: "Une autre question", content: "Historique utile", hs_pipeline: "0", hs_pipeline_stage: "1" } }] });
       }
       return Response.json({ results: [{ id: "0", stages: [{ id: "1", metadata: { isClosed: "true" } }] }] });
     });
     vi.stubGlobal("fetch", network);
     const context = await readSavHubspotContext({ email: "client@example.invalid", subject: "Question actuelle" });
-    expect(context.tickets).toMatchObject([{ id: "99", subject: "Une autre question", description: "Historique utile", status: "closed" }]);
+    expect(context.tickets).toMatchObject([{ id: "99", subject: "Une autre question", description: "Historique utile", status: "closed", createdAt: "2026-01-02T12:00:00Z", updatedAt: "2026-10-02T12:00:00Z" }]);
   });
   it("preserves a contact if ticket lookup fails, while write preflights remain strict", async () => {
     vi.stubEnv("HUBSPOT_ACCESS_TOKEN", "fixture-token");
@@ -119,4 +119,14 @@ describe("HubSpot webhook verification", () => {
     expect(Buffer.byteLength(JSON.stringify({ transcript: compacted }), "utf8"))
       .toBeLessThanOrEqual(HUBSPOT_TICKET_TRANSCRIPT_MAX_BYTES);
   });
+});
+
+it("never substitutes updatedAt when HubSpot omits createdAt", async () => {
+  vi.stubEnv("HUBSPOT_ACCESS_TOKEN", "fixture-token");
+  vi.stubGlobal("fetch", vi.fn(async (url: string) => url.endsWith("contacts/search")
+    ? Response.json({ results: [{ id: "42", properties: {} }] })
+    : url.endsWith("tickets/search") ? Response.json({ results: [{ id: "99", updatedAt: "2026-10-02T12:00:00Z", properties: { hs_pipeline: "0" } }] })
+    : Response.json({ results: [] })));
+  const context = await readSavHubspotContext({ email: "client@example.invalid", subject: "Question" });
+  expect(context.tickets[0]).toMatchObject({ createdAt: null, updatedAt: "2026-10-02T12:00:00Z" });
 });

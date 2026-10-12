@@ -1,3 +1,4 @@
+import { formatParisDateTime } from "@/lib/paris-date";
 import type { getSavProposalReview } from "@/lib/sav/review";
 import type { getSavReplyDrafts } from "@/lib/sav/drafts";
 import { savCategoryLabels, savDecisionLabels, savLabel, savProcessLabels, savRoutingLabels, savRoutingReasonLabels, savUrgencyLabels, savVerdictLabels } from "@/lib/sav/labels";
@@ -16,7 +17,7 @@ export function ProposalReview({ data, threadId, messageId, drafts, context }: P
   const ticketId = context?.linkedTicketId || (p.routing.kind === "matched" ? p.routing.ticketId : null);
   return <section className={`pilot-review card ${styles.review}`} aria-labelledby="proposal-review-title">
     <header><span className="eyebrow">Dossier à relire et corriger</span><h2 id="proposal-review-title">Proposition de l’IA</h2></header>
-    {data.review && <p className="login-notice">{data.review.scope==="legacy_global"?"Revue globale historique · ":"Dossier · "}Process {data.review.status === "approved" ? "validé" : "à reprendre"} par {data.review.reviewedBy} · {data.review.reviewedAt.toLocaleString("fr-FR")} · évaluation initiale : {savLabel(savVerdictLabels, data.review.verdict)}</p>}
+    {data.review && <p className="login-notice">{data.review.scope==="legacy_global"?"Revue globale historique · ":"Dossier · "}Process {data.review.status === "approved" ? "validé" : "à reprendre"} par {data.review.reviewedBy} · {formatParisDateTime(data.review.reviewedAt)} · évaluation initiale : {savLabel(savVerdictLabels, data.review.verdict)}</p>}
     {data.historicalReview && <p role="status">Une revue antérieure est conservée dans l’historique. Le dossier actuel doit être relu.</p>}
     <form action={reviewProposalAction} key={data.expectedReviewId ?? "unreviewed"}>
       <input type="hidden" name="threadId" value={threadId}/><input type="hidden" name="messageId" value={messageId}/><input type="hidden" name="decisionId" value={data.decisionId}/><input type="hidden" name="agentRunId" value={data.agentRunId}/><input type="hidden" name="reviewId" value={data.expectedReviewId ?? data.review?.id ?? ""}/><input type="hidden" name="knowledgeRevision" value={drafts?.knowledgeRevision ?? ""}/>

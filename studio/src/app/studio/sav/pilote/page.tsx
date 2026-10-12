@@ -1,3 +1,4 @@
+import { formatParisDateTime } from "@/lib/paris-date";
 import Link from "next/link";
 import { AlertTriangle, ArrowLeft, ArrowUpRight, Bot, Check, CheckCircle2, Clock3, FileText, LockKeyhole, MessageSquareText, NotebookPen, TicketCheck, UserRoundCheck, XCircle } from "lucide-react";
 import { isDatabaseConfigured } from "@/db";
@@ -30,7 +31,7 @@ const errorMessages: Record<string, string> = {
 };
 
 function formatDate(value: Date) {
-  return new Intl.DateTimeFormat("fr-FR", { dateStyle: "short", timeStyle: "short" }).format(value);
+  return formatParisDateTime(value, { dateStyle: "short", timeStyle: "short" });
 }
 
 export default async function SavPilotLabPage({ searchParams }: { searchParams: Promise<{ batch?: string; launch?: string; error?: string; batchCancelled?: string }> }) {

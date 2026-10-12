@@ -3,10 +3,11 @@ import { eq } from "drizzle-orm";
 import { createSavTestDb } from "../../../test/sav-db";
 import { savActions, savAgentRuns, savDecisions, savMailboxes, savMessages, savThreads } from "@/db/schema";
 import { decryptSavPayload, encryptSavPayload } from "./crypto";
-import { collectSavDossierContext, type SavDossierContext } from "./dossier-context";
+import { collectLatestSavDossierContext, collectSavDossierContext, type SavDossierContext } from "./dossier-context";
 import { activateSavV0Cutover } from "./cutover";
 import { processStoredSavMessage, repairSavProposal } from "./service";
-import { buildSavStructuredProposal } from "./proposal";
+import { buildSavStructuredProposal, type SavStructuredProposal } from "./proposal";
+import { savDossierSourceHash, savReviewMatchesProposal } from "./review-contract";
 
 const state = vi.hoisted(() => ({ db: null as unknown, crm: vi.fn(), analyze: vi.fn() }));
 vi.mock("@/db", () => ({ requireDb: () => state.db }));
@@ -108,4 +109,35 @@ describe("targeted missing-proposal repair", () => {
     await expect(repairSavProposal(message.id, "other@limova.ai")).rejects.toThrow();
     expect(state.analyze).not.toHaveBeenCalled();
   });
+});
+
+it("refreshes the latest inbound message instead of an older inbox row or an outbound reply", async () => {
+  const older = await seed();
+  const [latest] = await fixture.db.insert(savMessages).values({ mailboxId, threadId: older.threadId,
+    direction: "inbound", fromEmail: customer, subject: "Dernière demande", receivedAt: new Date(at.getTime() + 1_000),
+    bodyCiphertext: encryptSavPayload({ text: "Latest incoming message" }) }).returning();
+  await fixture.db.insert(savMessages).values({ mailboxId, threadId: older.threadId, direction: "outbound", fromEmail: "contact@limova.ai",
+    subject: "Réponse", receivedAt: new Date(at.getTime() + 2_000), bodyCiphertext: encryptSavPayload({ text: "Outgoing reply" }) });
+  expect((await collectLatestSavDossierContext(older.threadId)).messageId).toBe(latest.id);
+  const [unchanged] = await fixture.db.select().from(savMessages).where(eq(savMessages.id, older.id));
+  expect(decryptSavPayload(unchanged.bodyCiphertext)).not.toHaveProperty("supportContext");
+  expect(await fixture.db.select().from(savActions)).toHaveLength(0);
+});
+
+it("preserves a review on an unchanged refresh but invalidates it when CRM facts change", async () => {
+  const message = await seed(); await processStoredSavMessage(message.id);
+  // Opening the dossier refreshes the thread state produced by analysis before review.
+  await collectLatestSavDossierContext(message.threadId);
+  const [stored] = await fixture.db.select().from(savMessages).where(eq(savMessages.id, message.id));
+  const [run] = await fixture.db.select().from(savAgentRuns).where(eq(savAgentRuns.messageId, message.id));
+  const [decision] = await fixture.db.select().from(savDecisions).where(eq(savDecisions.messageId, message.id));
+  const proposal = decryptSavPayload<SavStructuredProposal>(run.proposalCiphertext!);
+  const review = { reviewScope: "dossier", dossierSourceHash: savDossierSourceHash(proposal, stored), decisionId: decision.id, agentRunId: run.id };
+  await collectLatestSavDossierContext(message.threadId);
+  const [refreshed] = await fixture.db.select().from(savMessages).where(eq(savMessages.id, message.id));
+  expect(savReviewMatchesProposal(review, { decisionId: decision.id, agentRunId: run.id, proposal, message: refreshed })).toBe(true);
+  state.crm.mockResolvedValue({ contactFound: true, contactId: "43", identityCandidates: [], tickets: [], errorCode: null, routing: { kind: "new", reason: "no_candidates" } });
+  await collectLatestSavDossierContext(message.threadId);
+  const [changed] = await fixture.db.select().from(savMessages).where(eq(savMessages.id, message.id));
+  expect(savReviewMatchesProposal(review, { decisionId: decision.id, agentRunId: run.id, proposal, message: changed })).toBe(false);
 });

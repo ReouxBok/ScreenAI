@@ -474,6 +474,7 @@ export async function readSavHubspotContext(input: { email: string; subject: str
       pipelineId: ticket.properties.hs_pipeline,
       stageId: ticket.properties.hs_pipeline_stage,
       status: closed.has(String(ticket.properties.hs_pipeline_stage || "")) ? "closed" as const : "open" as const,
+      createdAt: ticket.createdAt ?? null,
       updatedAt: ticket.properties.hs_lastmodifieddate || ticket.updatedAt || null,
     }));
     const routing = selectSavTicketMatch({ subject: input.subject, candidates: tickets, currentTicketId: input.currentTicketId });

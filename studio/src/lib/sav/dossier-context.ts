@@ -56,6 +56,15 @@ async function otherConversations(message: typeof savMessages.$inferSelect) {
   return candidates;
 }
 
+/** Refresh the message displayed by the dossier, including when an older inbox row was clicked. */
+export async function collectLatestSavDossierContext(threadId: string): Promise<SavDossierContext> {
+  const [latest] = await requireDb().select({ id: savMessages.id }).from(savMessages)
+    .where(and(eq(savMessages.threadId, threadId), eq(savMessages.direction, "inbound")))
+    .orderBy(desc(savMessages.receivedAt), desc(savMessages.createdAt), desc(savMessages.id)).limit(1);
+  if (!latest) throw new Error("SAV_MESSAGE_NOT_FOUND");
+  return collectSavDossierContext(latest.id);
+}
+
 /** Persist enrichment before a rule or model can produce its decision. No CRM/Gmail writes. */
 export async function collectSavDossierContext(messageId: string): Promise<SavDossierContext> {
   const db = requireDb();

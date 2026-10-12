@@ -1,3 +1,4 @@
+import { formatParisDateTime } from "@/lib/paris-date";
 import Link from "next/link";
 import { ArrowLeft, BookOpenCheck, DatabaseZap } from "lucide-react";
 import { requireSavStaff as requireStaff } from "@/lib/sav/auth";
@@ -63,7 +64,7 @@ export default async function SavResolutionsPage({ searchParams }: { searchParam
             <summary>Voir la résolution proposée</summary>
             <pre>{candidate.proposedResolution}</pre>
           </details>
-          <small>Ticket HubSpot #{candidate.hubspotTicketId} · détecté le {new Intl.DateTimeFormat("fr-FR", { dateStyle: "medium" }).format(candidate.createdAt)}</small>
+          <small>Ticket HubSpot #{candidate.hubspotTicketId} · détecté le {formatParisDateTime(candidate.createdAt, { dateStyle: "medium" })}</small>
           {candidate.contentItemId && <Link className="table-link" href={`/studio/contenus/${candidate.contentItemId}`}>Ouvrir la fiche →</Link>}
         </div>
         {candidate.status === "pending" && staff.email === "ugo@limova.ai" && <form action={reviewLearningAction} className="learning-actions">

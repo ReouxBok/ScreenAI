@@ -1,3 +1,4 @@
+import { formatParisDateTime } from "@/lib/paris-date";
 import { savManualTicketError } from "@/lib/sav/manual-ticket-status";
 
 type TicketAction = {
@@ -16,6 +17,6 @@ export function ManualTicketStatus({ action, writesDisabled }: { action: TicketA
   return <div className={`login-notice ${!pending || uncertain ? "error" : ""}`} role="status" aria-label="Suivi de la demande HubSpot">
     <strong>{uncertain ? "Création à vérifier dans HubSpot" : pending ? "Demande HubSpot en attente de confirmation" : "Demande HubSpot non aboutie"}</strong>
     <p>{uncertain ? savManualTicketError("SAV_MANUAL_RECONCILIATION_REQUIRED") : writesDisabled && pending ? savManualTicketError("SAV_WRITES_DISABLED") : action.errorCode || !pending ? savManualTicketError(action.errorCode) : "La demande sera vérifiée lors du prochain traitement périodique. Aucun ticket créé ou rattaché n’est encore confirmé."}</p>
-    {pending && !uncertain && !writesDisabled && <p>{action.scheduledAt ? `Prochaine tentative prévue le ${new Intl.DateTimeFormat("fr-FR", { dateStyle: "short", timeStyle: "short", timeZone: "Europe/Brussels" }).format(action.scheduledAt)}.` : "Le traitement passe toutes les 5 minutes."} Actualisez ce dossier pour consulter le résultat.</p>}
+    {pending && !uncertain && !writesDisabled && <p>{action.scheduledAt ? `Prochaine tentative prévue le ${formatParisDateTime(action.scheduledAt, { dateStyle: "short", timeStyle: "short" })}.` : "Le traitement passe toutes les 5 minutes."} Actualisez ce dossier pour consulter le résultat.</p>}
   </div>;
 }
