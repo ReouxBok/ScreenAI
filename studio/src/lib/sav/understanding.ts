@@ -1,7 +1,7 @@
 import { z } from "zod";
 
 export const SAV_UNDERSTANDING_REVISION = "sav-understanding-2026-10-12.v1";
-export const SAV_UNDERSTANDING_PROMPT_REVISION = "sav-understanding-prompt-2026-10-12.v1";
+export const SAV_UNDERSTANDING_PROMPT_REVISION = "sav-understanding-prompt-2026-10-12.v2";
 const id = z.string().trim().min(1).max(100);
 const ids = z.array(id).max(30);
 export const savRequestNatureSchema = z.enum(["technical", "account", "integration", "how_to", "financial_operation", "financial_data", "cancellation", "commercial", "callback", "human_request", "security", "privacy", "data_deletion", "legal", "acknowledgement", "non_support", "unknown"]);
@@ -71,7 +71,7 @@ export function validateSavUnderstanding(raw: unknown, sources: SavUnderstanding
 
 export type SavSemanticPlan = {
   category: "technical" | "account" | "billing" | "integration" | "how_to" | "acknowledgement" | "other";
-  replyPolicy: "compose" | "finance_standard" | "lead_template" | "none";
+  replyPolicy: "compose" | "lead_template" | "none";
   requiresHuman: boolean; ticketRequired: boolean; reasonCode: string; retrievalQuery: string;
 };
 
@@ -84,7 +84,8 @@ export function savSemanticPlan(u: SavUnderstandingV1): SavSemanticPlan {
   const base = { category, requiresHuman: true, ticketRequired: true, retrievalQuery: u.requests.map(r => [r.product, r.feature, r.summary].filter(Boolean).join(" — ")).join("\n").slice(0, 2000) };
   if (u.status !== "qualified") return { ...base, replyPolicy: "none", reasonCode: u.status === "unavailable" ? "understanding_unavailable" : "understanding_needs_clarification" };
   if (u.requests.some(r => r.nature === "cancellation")) return { ...base, replyPolicy: "none", reasonCode: "cancellation_human_only" };
-  if (u.requests.some(r => ["financial_operation", "financial_data"].includes(r.nature))) return { ...base, replyPolicy: "finance_standard", reasonCode: "finance_human_only" };
+  if (u.requests.some(r => ["financial_operation", "financial_data"].includes(r.nature))) return { ...base, replyPolicy: "none", reasonCode: "finance_human_only" };
+  if (u.requests.some(r => r.nature === "legal")) return { ...base, replyPolicy: "none", reasonCode: "legal_human_only" };
   if (u.requests.every(r => r.nature === "commercial")) return u.customerRelationship?.kind === "prospect"
     ? { ...base, replyPolicy: "lead_template", ticketRequired: false, reasonCode: "lead_product_information" }
     : { ...base, replyPolicy: "none", ticketRequired: false, reasonCode: "commercial_context_to_review" };

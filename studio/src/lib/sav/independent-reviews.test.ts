@@ -139,7 +139,12 @@ describe("SAV-39 readonly sourced observation", () => {
         else
             expect(init?.method).toBe("GET");
     } });
-    it("keeps finance out of reusable candidates", async () => { proposal = { ...proposal, category: "billing" }; await f.db.update(savAgentRuns).set({ proposalCiphertext: encryptSavPayload(proposal) }).where(eq(savAgentRuns.id, runId)); const o = await linkedObservation(); await syncSavObservation(o.id, async () => snapshot(), now); await expect(qualifySavObservation(await qualifyInput(o.id), "ugo@limova.ai")).rejects.toThrow("SAV_OBSERVATION_QUALIFICATION_REQUIRED"); });
+    it("keeps finance out of reusable candidates", async () => { const o = await linkedObservation();
+      // Historical refusal predates the no-financial-draft rule. Seed its archived evidence,
+      // rather than requesting a now-forbidden new financial draft verdict.
+      const [historical] = await f.db.select().from(savDraftVerdicts);
+      const saved = decryptSavPayload<{ proposal: typeof proposal }>(historical.snapshotCiphertext);
+      await f.db.update(savDraftVerdicts).set({ snapshotCiphertext: encryptSavPayload({ ...saved, proposal: { ...saved.proposal, category: "billing" } }) }).where(eq(savDraftVerdicts.id, historical.id)); await syncSavObservation(o.id, async () => snapshot(), now); await expect(qualifySavObservation(await qualifyInput(o.id), "ugo@limova.ai")).rejects.toThrow("SAV_OBSERVATION_QUALIFICATION_REQUIRED"); });
 });
 function providerMock() { return vi.fn(async (url: string | URL | Request, init?: RequestInit) => {
         if(init?.method==="POST" && !String(url).endsWith("/batch/read"))throw new Error("Unexpected fixture mutation"); const u = String(url); if (u.includes('/objects/tickets/123?'))

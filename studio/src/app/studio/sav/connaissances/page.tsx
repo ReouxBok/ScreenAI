@@ -1,3 +1,4 @@
+import { formatParisDateTime } from "@/lib/paris-date";
 import Link from "next/link";
 import { requireSavStaff } from "@/lib/sav/auth";
 import { listKnowledgeProjectionCandidates } from "@/lib/knowledge/candidates";
@@ -66,7 +67,7 @@ export default async function SavKnowledgeCandidatesPage({ searchParams }: { sea
             <p>Escalade : {revision.document.escalation}</p>
           </details>
           {candidate.targetItemId && <Link className="table-link" href={`/studio/contenus/${candidate.targetItemId}`}>Ouvrir la projection existante →</Link>}
-          {candidate.reviewedAt && <p>Revu par {candidate.reviewedBy} le {candidate.reviewedAt.toLocaleString("fr-FR")} · Version préparée : {candidate.materializedVersionId ?? "aucune"}</p>}
+          {candidate.reviewedAt && <p>Revu par {candidate.reviewedBy} le {formatParisDateTime(candidate.reviewedAt)} · Version préparée : {candidate.materializedVersionId ?? "aucune"}</p>}
           {staff.email === "ugo@limova.ai" && imported && candidate.status === "pending" && <HubspotReviewForm candidateId={candidate.id} revisionId={revision.id} initialDocument={JSON.stringify(revision.document, null, 2)}/>}
           {staff.email === "ugo@limova.ai" && !(imported && candidate.status === "pending") && ["pending", "needs_recording", "not_applicable"].includes(candidate.status) && <form action={reviewKnowledgeAction}>
             <input type="hidden" name="candidateId" value={candidate.id}/><input type="hidden" name="revisionId" value={revision.id}/>

@@ -73,13 +73,13 @@ describe("SAV shared semantic pipeline with synthetic provider outputs", () => {
     expect(result.ticketRouting).toMatchObject({ kind: "review", reason: "customer_identity_unverified" });
     expect(result.structuredProposal?.customerIdentity.verifiedByHuman).toBe(false);
   });
-  it.each(modes)("keeps mixed technical and refund requests in a standard financial handoff in %s", async mode => {
+  it.each(modes)("keeps mixed technical and refund requests without a draft in %s", async mode => {
     const u = understandingFixture(); u.requests.push({ ...u.requests[0], id: "refund", summary: "Demander un remboursement.", nature: "financial_operation", financialScope: "support_account" });
     deps.understand.mockResolvedValue(u); const network = vi.fn();
     const result = await analyzeSavMessage(input, { evaluation: evaluation(mode, network) });
     expect(result.category).toBe("technical"); expect(result.proposal.reasonCode).toBe("finance_human_only");
-    expect(result.replyDraft).toContain("Les questions financières");
-    for (const request of u.requests) expect(result.replyDraft).toContain(request.summary);
+    expect(result.replyDraft).toBeNull();
+    for (const request of u.requests) expect(result.proposal.explanation).toContain(request.summary);
     expect(deps.understand).toHaveBeenCalledOnce(); expect(deps.search).not.toHaveBeenCalled(); expect(deps.agent).not.toHaveBeenCalled(); expect(network).not.toHaveBeenCalled(); expect(deps.coherence).not.toHaveBeenCalled();
   });
   it.each(modes)("forbids every cancellation draft including mixed finance and missing identity in %s", async mode => {

@@ -129,7 +129,7 @@ describe("SAV dossier SSR and human-review guardrails", () => {
     const detail = detailFixture();
     detail.messages[0].body.supportContext = { version: 1, messageId, collectedAt: now.toISOString(),
       crm: { status: "ready", errorCode: null, data: { errorCode: null, contactFound: true, contactId: "42", identityCandidates: [],
-        tickets: [{ id: "99", subject: "Une autre question", description: "", status: "open", pipelineId: "0", stageId: "1", updatedAt: null }], routing: { kind: "new", reason: "distinct_issue", candidateIds: [] } } },
+        tickets: [{ id: "99", subject: "Une autre question", description: "", status: "open", pipelineId: "0", stageId: "1", createdAt: null, updatedAt: null }], routing: { kind: "new", reason: "distinct_issue", candidateIds: [] } } },
       conversation: null, conversationError: null, otherConversations: [], otherConversationsError: null };
     dependencies.detail.mockResolvedValue(detail); dependencies.review.mockResolvedValue(null);
     const html = await renderPage();
@@ -358,4 +358,17 @@ describe("SAV dossier SSR and human-review guardrails", () => {
     expect(html).not.toContain("Approuver et mettre en file d’envoi");
     expect(buttonAttributes(html, "Créer un ticket HubSpot")).toEqual([expect.stringContaining('disabled=""')]);
   });
+});
+
+it.each(["2026-01-02T12:00:00Z", null, "invalid"])("shows the real ticket creation date or an explicit missing date (%s)", async (createdAt) => {
+  const detail = detailFixture(); detail.thread.hubspotTicketId = "99";
+  detail.messages[0].body.supportContext = { version: 1, messageId, collectedAt: now.toISOString(),
+    crm: { status: "ready", errorCode: null, data: { errorCode: null, contactFound: true, contactId: "42", identityCandidates: [],
+      tickets: [{ id: "99", subject: "Question", description: "", status: "open", pipelineId: "0", stageId: "1", createdAt, updatedAt: now.toISOString() }],
+      routing: { kind: "new", reason: "distinct_issue", candidateIds: [] } } },
+    conversation: null, conversationError: null, otherConversations: [], otherConversationsError: null };
+  dependencies.detail.mockResolvedValue(detail);
+  const html = sectionWithHeading(await renderPage(), "Ticket lié");
+  expect(html).toContain(createdAt && createdAt !== "invalid" ? "02/01/2026 13:00" : "Date indisponible");
+  expect(html).not.toContain("02/10/2026");
 });

@@ -1,3 +1,4 @@
+import { formatParisDateTime } from "@/lib/paris-date";
 import type { getSavObservations } from "@/lib/sav/observations";
 import { savContentHash } from "@/lib/sav/crypto";
 import styles from "./proposal-review.module.css";
@@ -11,14 +12,14 @@ export function ResolutionObservation({ rows, isUgo }: {
     if (!rows.length)
         return null;
     return <section className={`card ${styles.review} ${styles.observation}`} aria-labelledby="observation-title"><span className="eyebrow">Résolution humaine après refus</span><h2 id="observation-title">Journal du suivi</h2><p>Notifications HubSpot puis rattrapage quotidien par lots. Aucune action CRM ou Gmail déclenchée par ce suivi.</p>{rows.map(row => <article key={row.id}>
-  <h3>{labels[row.state] ?? row.state} · cycle {row.cycle}</h3><p>Refus enregistré le {row.createdAt.toLocaleString("fr-FR")}.</p><p>Ticket : {row.hubspotTicketId ? `#${row.hubspotTicketId}` : "aucun lien fiable"}. Dernière synchronisation réussie : {row.lastSyncAt?.toLocaleString("fr-FR") ?? "jamais"}. Prochain rattrapage : {row.nextSyncAt.getUTCFullYear() === 9999 ? "terminé après clôture · notifications toujours prises en compte" : row.nextSyncAt.toLocaleString("fr-FR")}{row.nextSyncAt < new Date() ? " · en retard" : ""}.</p>
+  <h3>{labels[row.state] ?? row.state} · cycle {row.cycle}</h3><p>Refus enregistré le {formatParisDateTime(row.createdAt)}.</p><p>Ticket : {row.hubspotTicketId ? `#${row.hubspotTicketId}` : "aucun lien fiable"}. Dernière synchronisation réussie : {row.lastSyncAt ? formatParisDateTime(row.lastSyncAt) : "jamais"}. Prochain rattrapage : {row.nextSyncAt.getUTCFullYear() === 9999 ? "terminé après clôture · notifications toujours prises en compte" : formatParisDateTime(row.nextSyncAt)}{row.nextSyncAt < new Date() ? " · en retard" : ""}.</p>
   {row.sourceErrors.length > 0 && <p role="alert">Sources à vérifier : {row.sourceErrors.join(" ; ")}</p>}
-  {row.qualifications.length>0 && <details><summary>Historique des qualifications Ugo</summary>{row.qualifications.map((q,index)=><article key={index}><p>{new Date(q.occurredAt).toLocaleString("fr-FR")} · {q.author}</p><pre>{q.text}</pre></article>)}</details>}
+  {row.qualifications.length>0 && <details><summary>Historique des qualifications Ugo</summary>{row.qualifications.map((q,index)=><article key={index}><p>{formatParisDateTime(q.occurredAt)} · {q.author}</p><pre>{q.text}</pre></article>)}</details>}
             {row.cycles.map(c => <details key={c.id} open={c.cycle === row.cycle}><summary>Cycle {c.cycle} · {c.status} · {c.qualification ?? "non qualifié"}</summary>
    <p>{c.summary.coverage}</p><p>Motif du refus : {c.summary.refusalReason || "Non renseigné"}.</p><details><summary>Brouillon refusé</summary><pre>{c.summary.draftRefused}</pre></details>
    {!!c.summary.refusalReasons?.length && <p>Retours structurés : {c.summary.refusalReasons.map(reason => savReviewReasonLabels[reason]).join(" · ")}. Ces retours évaluent l’IA ; ils ne prouvent pas une résolution produit.</p>}
    <p>Confirmation client explicite repérée : {c.summary.customerConfirmation.length ? "à vérifier dans les sources" : "aucune"}. Fermer le ticket ne prouve pas sa résolution.</p>
-   <ol>{c.summary.events.map((event, index) => <li key={`${event.sourceRef}:${index}`}><p>{new Date(event.occurredAt).toLocaleString("fr-FR")} · {event.kind} · {event.author ?? "auteur non fourni"} · {event.provenance} · {event.sourceRef}</p><pre>{event.text}</pre></li>)}</ol>
+   <ol>{c.summary.events.map((event, index) => <li key={`${event.sourceRef}:${index}`}><p>{formatParisDateTime(event.occurredAt)} · {event.kind} · {event.author ?? "auteur non fourni"} · {event.provenance} · {event.sourceRef}</p><pre>{event.text}</pre></li>)}</ol>
    {c.candidateId && <p>Candidat préparé. Sa validation et sa publication restent distinctes dans les résolutions.</p>}
    {row.closed && c.cycle === row.cycle && isUgo && <form action={qualifyObservationAction}>
     <input type="hidden" name="threadId" value={row.threadId}/><input type="hidden" name="observationId" value={row.id}/><input type="hidden" name="cycleId" value={c.id}/><input type="hidden" name="sourceHash" value={c.sourceHash}/>

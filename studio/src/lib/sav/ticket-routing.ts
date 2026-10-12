@@ -1,4 +1,4 @@
-export type SavTicketCandidate = { id: string; subject: string; status: "open" | "closed"; updatedAt?: string | null };
+export type SavTicketCandidate = { id: string; subject: string; status: "open" | "closed"; updatedAt?: string | null; closedAt?: string | null };
 
 export function normalizeTicketSubject(value: string) {
   return value.toLocaleLowerCase("fr").replace(/^(?:(?:re|fw|fwd|tr)\s*:\s*)+/i, "").replace(/\[#?\d+\]/g, " ").replace(/[^\p{L}\p{N}]+/gu, " ").trim();
@@ -12,11 +12,11 @@ function similarity(left: string, right: string) {
   return overlap / new Set([...a, ...b]).size;
 }
 
-export function selectSavTicketMatch(input: { subject: string; candidates: SavTicketCandidate[]; currentTicketId?: string | null }) {
-  const open = input.candidates.filter((ticket) => ticket.status === "open");
+export function selectSavTicketMatch(input: { subject: string; candidates: SavTicketCandidate[]; currentTicketId?: string | null; includeClosed?: boolean }) {
+  const open = input.candidates.filter((ticket) => input.includeClosed || ticket.status === "open");
   if (input.currentTicketId) {
     const linked = open.find((ticket) => ticket.id === input.currentTicketId);
-    if (linked) return { kind: "matched" as const, ticket: linked, reason: "gmail_thread_link" };
+    if (linked && (!input.includeClosed || linked.status === "open" && normalizeTicketSubject(linked.subject) === normalizeTicketSubject(input.subject))) return { kind: "matched" as const, ticket: linked, reason: "gmail_thread_link" };
   }
   const explicitId = input.subject.match(/(?:ticket|dossier|#)\s*#?(\d{2,})/i)?.[1];
   if (explicitId) {
@@ -26,6 +26,14 @@ export function selectSavTicketMatch(input: { subject: string; candidates: SavTi
   const normalized = normalizeTicketSubject(input.subject);
   const exact = open.filter((ticket) => normalizeTicketSubject(ticket.subject) === normalized);
   if (exact.length === 1) return { kind: "matched" as const, ticket: exact[0], reason: "exact_subject" };
+  if (exact.length > 1 && input.includeClosed) {
+    const active = exact.filter(ticket => ticket.status === "open");
+    if (active.length === 1) return { kind: "matched" as const, ticket: active[0], reason: "exact_subject" };
+    if (!active.length && exact.every(ticket => ticket.closedAt && Number.isFinite(Date.parse(ticket.closedAt)))) {
+      const latest = [...exact].sort((a, b) => Date.parse(b.closedAt!) - Date.parse(a.closedAt!));
+      if (latest[0].closedAt !== latest[1].closedAt) return { kind: "matched" as const, ticket: latest[0], reason: "latest_closed_exact_subject" };
+    }
+  }
   if (exact.length > 1) return { kind: "ambiguous" as const, candidates: exact, reason: "multiple_exact_subjects" };
   const ranked = open.map((ticket) => ({ ticket, score: similarity(input.subject, ticket.subject) }))
     .filter((item) => item.score >= 0.7).sort((a, b) => b.score - a.score);

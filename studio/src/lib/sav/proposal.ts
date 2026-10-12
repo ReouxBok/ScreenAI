@@ -54,7 +54,7 @@ export function buildSavStructuredProposal(input: { subject: string; body: strin
   const support = ["ticket_pending", "human_review_required"].includes(analysis.proposal.kind);
   if (analysis.proposal.requiresHumanApproval || routing.kind === "review") process.push({ kind: "human_review", label: analysis.proposal.explanation, sourceIds: [] });
   if (support && routing.kind === "new") process.push({ kind: "create_ticket", label: "Vérifier la proposition, puis créer le ticket HubSpot par un clic humain séparé.", sourceIds: [] });
-  if (support && routing.kind === "matched") process.push({ kind: "link_ticket", label: `Vérifier le rattachement au ticket HubSpot ${routing.ticketId} avant toute action.`, sourceIds: [routing.ticketId] });
+  if (support && routing.kind === "matched") process.push({ kind: "link_ticket", label: routing.reason === "customer_return_reactivate" ? `Le client revient sur le même sujet : confirmer le retour du ticket ${routing.ticketId} en Nouveau et l’ajout de l’email en note.` : `Vérifier le rattachement au ticket HubSpot ${routing.ticketId} avant toute action.`, sourceIds: [routing.ticketId] });
   if (analysis.replyDraft && (!analysis.replyAssessment || analysis.replyAssessment.kind === "contextualized") && !analysis.diagnostics?.length && analysis.proposal.reasonCode !== "agent_runtime_degraded") {
     for (const source of analysis.evidence.filter((item) => item.sourceType === "knowledge" && item.excerpt)) {
       process.push({ kind: "product_step", label: source.excerpt!, sourceIds: [source.sourceId] });
