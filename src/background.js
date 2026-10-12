@@ -78,6 +78,7 @@ let sessionState = {
 let urlChangeTimeout = null;
 let activeAbortController = null;
 let sessionGeneration = 0;
+const voiceTranscriptControllers = new Set();
 let proxyAccessToken = null;
 let proxyAccessTokenExpiresAt = 0;
 let pageContextVersion = 0;
@@ -2840,6 +2841,8 @@ async function getPageTechnicalDiagnostics(tabId, since = 0) {
 
 function handleResetSession() {
   const generation = ++sessionGeneration;
+  for (const controller of voiceTranscriptControllers) controller.abort();
+  voiceTranscriptControllers.clear();
   const previousRemoteSessionId = sessionState.remoteSessionId;
   activeAbortController?.abort();
   activeAbortController = null;
@@ -3199,20 +3202,27 @@ async function deleteCopilotData() {
   return { ok: true };
 }
 
-async function persistVoiceTranscript(role, content) {
+async function persistVoiceTranscript(role, content, generation = sessionGeneration) {
+  if (generation !== sessionGeneration) return;
+  const controller = new AbortController();
+  voiceTranscriptControllers.add(controller);
   try {
-    const sessionId = await ensureRemoteCopilotSession();
+    const sessionId = await ensureRemoteCopilotSession(generation, controller.signal);
+    if (generation !== sessionGeneration || !sessionId) return;
     const response = await authorizedProxyFetch('/api/copilot/voice-turn', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ role, text: content, sessionId, idempotencyKey: `voice:${crypto.randomUUID()}` })
+      body: JSON.stringify({ role, text: content, sessionId, idempotencyKey: `voice:${crypto.randomUUID()}` }),
+      signal: controller.signal
     });
-    if (response.ok) {
+    if (response.ok && generation === sessionGeneration) {
       copilotBootstrapCache = null;
       copilotBootstrapCacheExpiresAt = 0;
     }
   } catch (error) {
-    Logger.warn('memory', 'Voice transcript memory unavailable', { code: errorCodeOf(error) });
+    if (generation === sessionGeneration) Logger.warn('memory', 'Voice transcript memory unavailable', { code: errorCodeOf(error) });
+  } finally {
+    voiceTranscriptControllers.delete(controller);
   }
 }
 
@@ -3373,7 +3383,9 @@ async function handleUserPageInteraction(rawInteraction, sender) {
 }
 
 async function storeVoiceTranscript(role, text) {
+  const generation = sessionGeneration;
   if (!(await hasAIProcessingConsent()) || !['user', 'assistant'].includes(role)) return { ok: false };
+  if (generation !== sessionGeneration) return { ok: false };
   const content = String(text || '').trim().slice(0, 4_000);
   if (!content) return { ok: false };
   Logger.event('voice', 'VOICE_TRANSCRIPT_FINALIZED', { role, characterCount: content.length, contentExported: false });
@@ -3401,7 +3413,7 @@ async function storeVoiceTranscript(role, text) {
     sessionState.conversationHistory = sessionState.conversationHistory.slice(-CONVERSATION_HISTORY_MAX_MESSAGES);
   }
   scheduleSave();
-  await persistVoiceTranscript(role, content);
+  await persistVoiceTranscript(role, content, generation);
   return { ok: true };
 }
 

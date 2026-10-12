@@ -687,6 +687,7 @@ class LimovaVoiceSession {
   }
 
   async handleToolCalls(functionCalls) {
+    const lifecycleId = this.lifecycleId;
     this.toolCallsInFlight += 1;
     this.lastToolActivityAt = Date.now();
     clearTimeout(this.replyRecoveryTimer);
@@ -694,6 +695,7 @@ class LimovaVoiceSession {
     const functionResponses = [];
     try {
       for (const call of functionCalls) {
+      if (lifecycleId !== this.lifecycleId) return;
       let result = { ok: false, error: 'Fonction non autorisée.' };
       if (call.name === 'inspect_current_page' || call.name === 'verify_expected_result' || call.name === 'capture_current_view') {
         result = await chrome.runtime.sendMessage({
@@ -738,6 +740,7 @@ class LimovaVoiceSession {
           // Limova filters large integration grids with a short React debounce.
           // Wait for the filtered cards to replace the previous 3,237-item map.
           await new Promise(resolve => setTimeout(resolve, 550));
+          if (lifecycleId !== this.lifecycleId) return;
           const refreshed = await chrome.runtime.sendMessage({ type: 'VOICE_CONTEXT_REQUEST' })
             .catch(() => null);
           if (refreshed?.ok) result = { ...result, ...refreshed };
@@ -752,6 +755,7 @@ class LimovaVoiceSession {
         }).catch(() => ({ ok: false, error: 'La page Limova est indisponible.' }));
         if (result?.ok) {
           await new Promise(resolve => setTimeout(resolve, 180));
+          if (lifecycleId !== this.lifecycleId) return;
           const refreshed = await chrome.runtime.sendMessage({ type: 'VOICE_CONTEXT_REQUEST' }).catch(() => null);
           if (refreshed?.ok) result = { ...result, ...refreshed };
         }
@@ -770,11 +774,13 @@ class LimovaVoiceSession {
         // element IDs on its next step.
         if (result?.ok) {
           await new Promise(resolve => setTimeout(resolve, 300));
+          if (lifecycleId !== this.lifecycleId) return;
           const refreshed = await chrome.runtime.sendMessage({ type: 'VOICE_CONTEXT_REQUEST' })
             .catch(() => null);
           if (refreshed?.ok) result = { ...result, ...refreshed };
         }
       }
+      if (lifecycleId !== this.lifecycleId) return;
       const pageContext = String(result?.pageContext || '');
       if (pageContext) this.acknowledgePageContext(result?.contextVersion);
       if (result?.visualCapture) {
@@ -816,13 +822,15 @@ class LimovaVoiceSession {
         response
       });
       }
-      if (this.socket?.readyState === WebSocket.OPEN) {
+      if (lifecycleId === this.lifecycleId && this.socket?.readyState === WebSocket.OPEN) {
         this.socket.send(JSON.stringify({ toolResponse: { functionResponses } }));
       }
     } finally {
-      this.toolCallsInFlight = Math.max(0, this.toolCallsInFlight - 1);
-      this.lastToolActivityAt = Date.now();
-      this.flushDeferredObservations();
+      if (lifecycleId === this.lifecycleId) {
+        this.toolCallsInFlight = Math.max(0, this.toolCallsInFlight - 1);
+        this.lastToolActivityAt = Date.now();
+        this.flushDeferredObservations();
+      }
     }
   }
 
