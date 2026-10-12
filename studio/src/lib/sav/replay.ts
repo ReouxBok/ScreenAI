@@ -15,7 +15,10 @@ export function runSavRuleReplay(rawCases: unknown) {
   const cases = z.array(savReplayCaseSchema).min(1).parse(rawCases);
   const results = cases.map((testCase) => {
     const actual = deterministicDecision(testCase.input);
-    const evaluated = actual.reasonCode !== "semantic_understanding_required";
+    // Expected technical exclusions remain in scope even if a regression stops
+    // recognizing them. They must fail rather than disappear into notEvaluated.
+    const expectedTechnical = ["bounce", "automatic_reply", "internal_notification"].includes(testCase.expected.kind);
+    const evaluated = expectedTechnical || actual.reasonCode !== "semantic_understanding_required";
     const passed = evaluated && actual.kind === testCase.expected.kind && actual.requiresHumanApproval === testCase.expected.requiresHumanApproval;
     return { id: testCase.id, partition: testCase.partition, passed, evaluated, expected: testCase.expected, actual: { kind: actual.kind, requiresHumanApproval: actual.requiresHumanApproval, reasonCode: actual.reasonCode } };
   });
