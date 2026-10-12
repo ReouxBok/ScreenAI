@@ -1,262 +1,162 @@
-import { afterEach, describe, expect, it, vi } from "vitest";
-import { analyzeSavMessage } from "./intelligence";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { analyzeSavMessage, type SavEvaluationResources } from "./intelligence";
+import { savSemanticPlan, type SavUnderstandingV1 } from "./understanding";
+import { coverageFixture, geminiFixture, understandingFixture } from "../../../test/sav-understanding-fixtures";
+import type { SavAgentOutput } from "./agent/contracts";
 
-const dependencies = vi.hoisted(() => ({ search: vi.fn(), agent: vi.fn(), crm: vi.fn() }));
-vi.mock("@/lib/search", () => ({ searchKnowledge: dependencies.search }));
-vi.mock("./agent/orchestrator", () => ({ runSavAdkAgent: dependencies.agent }));
-vi.mock("./hubspot", () => ({ readSavHubspotContext: dependencies.crm }));
+const deps = vi.hoisted(() => ({ search: vi.fn(), agent: vi.fn(), crm: vi.fn(), understand: vi.fn(), coherence: vi.fn() }));
+vi.mock("@/lib/search", () => ({ searchKnowledge: deps.search }));
+vi.mock("./agent/orchestrator", () => ({ runSavAdkAgent: deps.agent }));
+vi.mock("./hubspot", () => ({ readSavHubspotContext: deps.crm }));
+vi.mock("./understanding-model", () => ({ understandSavMessage: deps.understand }));
+vi.mock("./reply-coherence", () => ({ checkSavReplyCoherence: deps.coherence }));
+
+const modes = ["off", "shadow", "pilot", "on"] as const;
+const input = { from: "fixture@example.invalid", subject: "Re: Résiliation", body: "Je ne veux pas résilier. Mon agent coupe après mon achat à 79 euros.\nOn Tuesday, Support wrote:\nJe veux un remboursement." };
+function outputFor(u: SavUnderstandingV1) {
+  const coverage = coverageFixture(u);
+  return { category: savSemanticPlan(u).category, urgency: "normal", ticketRequired: true, reasonCode: "fixture_support", explanation: "Le problème produit doit être vérifié.", confidence: 0.99, requiresHuman: true,
+    responseKind: "handoff", replyDraft: coverage.map(c => c.text).join("\n\n"), internalNote: "Dossier fictif à vérifier.", coverage, citations: [] as SavAgentOutput["citations"], evidenceIds: [] };
+}
+function adkResult(u: SavUnderstandingV1) {
+  return { output: outputFor(u), evidence: [], toolTrace: [], model: "fixture-model", promptRevision: "fixture-prompt", inputHash: "fixture-in", outputHash: "fixture-out", durationMs: 1, inputTokens: 10, outputTokens: 20, totalTokens: 30, knowledgeRevision: "fixture-kb", ticketRouting: { kind: "new", contactId: "fixture-contact", reason: "fixture" } };
+}
+function coherence(status = "passed") {
+  return { status, issues: status === "rejected" ? ["unsupported_advice"] : [], promptRevision: "fixture-coherence", model: "fixture-model", inputHash: "fixture-in", outputHash: status === "unavailable" ? null : "fixture-out", durationMs: 1, inputTokens: 10, outputTokens: 20, totalTokens: 30, errorCode: status === "passed" ? null : status === "rejected" ? "SAV_REPLY_COHERENCE_REJECTED" : "SAV_AI_HTTP_500" };
+}
+function evaluation(mode: typeof modes[number], network: typeof fetch): SavEvaluationResources {
+  return { apiKey: "fixture-key", model: "fixture-model", mode, pilot: mode === "pilot", searchKnowledge: deps.search, readHubspotContext: deps.crm, fetch: network };
+}
+beforeEach(() => {
+  vi.stubEnv("SAV_AI_ANALYSIS", "true"); vi.stubEnv("SAV_GEMINI_API_KEY", "fixture-key");
+  deps.search.mockResolvedValue({ revision: "fixture-kb", results: [] });
+  deps.crm.mockResolvedValue({ contactFound: true, contactId: "fixture-contact", tickets: [], routing: { kind: "new", reason: "fixture" } });
+  deps.coherence.mockResolvedValue(coherence());
+  vi.stubGlobal("fetch", vi.fn(() => { throw new Error("Unexpected external request"); }));
+});
 afterEach(() => { vi.unstubAllEnvs(); vi.unstubAllGlobals(); vi.resetAllMocks(); });
 
-describe("SAV analysis controls", () => {
-  it.each(["off", "shadow", "pilot", "on"].flatMap(mode => [
-    "Bonjour, je souhaite des informations sur Limova et acheter des crédits.",
-    "Bonjour, je souhaite des informations sur Limova. Comment configurer une intégration ?",
-    "Bonjour, je souhaite des informations sur Limova. Je suis abonné depuis un an.",
-    "Quels sont vos tarifs ? Je souhaite acheter des crédits.",
-    "Quels sont vos tarifs ? Comment configurer une intégration ?",
-    "Quels sont vos tarifs ? Je suis abonné depuis un an.",
-  ].map(body => ({ mode, body }))))("preserves human support routing instead of the lead template in $mode: $body", async ({ mode, body }) => {
-    vi.stubEnv("SAV_ADK_MODE", mode); vi.stubEnv("SAV_AI_ANALYSIS", "true"); vi.stubEnv("SAV_GEMINI_API_KEY", "");
-    vi.stubEnv("GOOGLE_API_KEY", ""); vi.stubEnv("GEMINI_API_KEY", "");
-    const template = "Bonjour, modèle commercial fictif : https://example.invalid/contact.";
-    dependencies.search.mockImplementation(async ({ savAudience }) => ({ revision: "fixture", results: savAudience === "lead" ? [{
-      id: "fixture-lead", contentVersionId: "fixture-v1", title: "Fixture", content: template, score: 0.9,
-      verifiedAt: new Date().toISOString(), resolution: { audience: "lead", responseTemplate: template,
-        symptoms: ["Découverte"], steps: ["Formulaire fictif"], escalation: "Humain" },
-    }] : [] }));
-    dependencies.crm.mockResolvedValue({ contactFound: false, tickets: [], routing: { kind: "new", reason: "no_contact" } });
-    const network = vi.fn(); vi.stubGlobal("fetch", network);
-    const result = await analyzeSavMessage({ from: "fixture@example.invalid", subject: "Informations Limova", body });
-    expect(result.proposal.reasonCode).not.toMatch(/^lead_/);
-    expect(result.replyDraft).not.toBe(template);
-    expect(result.proposal.requiresHumanApproval).toBe(true);
+describe("SAV shared semantic pipeline with synthetic provider outputs", () => {
+  it.each(modes)("understands once before retrieval and preserves technical meaning in %s", async mode => {
+    const u = understandingFixture(); u.requests[0].financialScope = "incidental_price";
+    deps.understand.mockResolvedValue(u); deps.agent.mockResolvedValue(adkResult(u));
+    const network = vi.fn<typeof fetch>(async () => geminiFixture(outputFor(u)));
+    const result = await analyzeSavMessage(input, { evaluation: evaluation(mode, network) });
+    expect(deps.understand).toHaveBeenCalledOnce();
+    expect(result.category).toBe("technical"); expect(result.replyDraft).toBe(outputFor(u).replyDraft);
+    expect(result.understanding).toEqual(u); expect(result.structuredProposal?.understanding).toEqual(u);
+    expect(result.replyAssessment?.coherence?.status).toBe("passed"); expect(deps.coherence).toHaveBeenCalledOnce();
+    if (mode === "off" || mode === "shadow") {
+      expect(deps.search).toHaveBeenCalledWith(expect.objectContaining({ query: savSemanticPlan(u).retrievalQuery }));
+      expect(deps.search.mock.invocationCallOrder[0]).toBeGreaterThan(deps.understand.mock.invocationCallOrder[0]);
+      expect(network).toHaveBeenCalledOnce();
+      const sent = JSON.parse(String(network.mock.calls[0]?.[1]?.body));
+      expect(sent.contents[0].parts[0].text).toContain(u.requests[0].summary);
+    }
+    if (mode !== "off") expect(deps.agent).toHaveBeenCalledWith(expect.objectContaining({ understanding: u }), expect.any(Object));
+  });
+  it.each(modes)("keeps supplied facts and questions in the contract with no late identity boilerplate in %s", async mode => {
+    const u = understandingFixture();
+    u.knownFacts = [{ id: "fact-email", key: "registration_email", text: "account@example.invalid", evidenceIds: ["evidence-1"] }];
+    deps.understand.mockResolvedValue(u); deps.agent.mockResolvedValue(adkResult(u));
+    deps.crm.mockResolvedValue({ contactFound: false, tickets: [], routing: { kind: "new", reason: "no_contact" } });
+    const result = await analyzeSavMessage(input, { evaluation: evaluation(mode, vi.fn<typeof fetch>(async () => geminiFixture(outputFor(u)))) });
+    expect(result.replyDraft).toBe(outputFor(u).replyDraft); expect(result.replyDraft).not.toMatch(/Quelle adresse|Which email/);
     expect(result.ticketRouting).toMatchObject({ kind: "review", reason: "customer_identity_unverified" });
-    expect(dependencies.crm).toHaveBeenCalledOnce();
-    expect(dependencies.search).not.toHaveBeenCalledWith(expect.objectContaining({ savAudience: "lead" }));
-    if (/crédits/.test(body)) {
-      expect(result.category).toBe("billing");
-      expect(result.replyDraft).toContain("Les questions financières sont traitées par l’équipe Limova");
-    }
-    expect(network).not.toHaveBeenCalled();
-  });
-  it.each(["off", "shadow", "pilot", "on"].flatMap(mode => [
-    "Bonjour, je souhaite des informations sur un produit Limova avant achat.",
-    "Quels sont vos tarifs ?", "Quel est le prix de Limova Team avant achat ?",
-  ].map(body => ({ mode, body }))))("uses only the reviewed unsigned lead template in $mode: $body", async ({ mode, body }) => {
-    vi.stubEnv("SAV_ADK_MODE", mode); vi.stubEnv("SAV_AI_ANALYSIS", "true");
-    const template = "Bonjour, voici un formulaire fictif : https://example.invalid/demo.";
-    dependencies.search.mockResolvedValue({ revision: "fixture-lead-revision", results: [{ id: "lead-fixture", contentVersionId: "lead-version", title: "Modèle fictif", content: template,
-      score: 0.9, verifiedAt: new Date().toISOString().slice(0, 10), resolution: { audience: "lead", responseTemplate: template,
-        symptoms: ["Découvrir le produit"], steps: ["Orienter vers le formulaire fictif"], escalation: "Qualifier humainement en cas de doute" } }] });
-    const network = vi.fn(); vi.stubGlobal("fetch", network);
-    const result = await analyzeSavMessage({ from: "lead@example.invalid", subject: "Découverte", body });
-    expect(result.replyDraft).toBe(template);
-    expect(result.proposal).toMatchObject({ kind: "human_review_required", reasonCode: "lead_product_information", requiresHumanApproval: true });
-    expect(result.ticketRouting).toMatchObject({ kind: "none" });
-    expect(result.evidence).toContainEqual(expect.objectContaining({ sourceId: "lead-fixture", contentVersionId: "lead-version" }));
-    expect(result.structuredProposal?.sources[0].contentVersionId).toBe("lead-version");
-    expect(result.structuredProposal?.process.map(step => step.kind)).toEqual(["human_review", "review_reply"]);
-    expect(dependencies.search).toHaveBeenCalledWith(expect.objectContaining({ scope: "sav", savAudience: "lead", locale: "fr-FR" }));
-    expect(dependencies.crm).not.toHaveBeenCalled(); expect(dependencies.agent).not.toHaveBeenCalled(); expect(network).not.toHaveBeenCalled();
-    expect(result.replyDraft).not.toMatch(/Charly|IA|compte Limova/);
-  });
-  it.each([false, true])("leaves a lead without a draft when the model is unavailable or analysis disabled: %s", async disabled => {
-    vi.stubEnv("SAV_AI_ANALYSIS", disabled ? "false" : "true");
-    dependencies.search.mockResolvedValue({ revision: "kb_empty", results: [] });
-    const result = await analyzeSavMessage({ from: "lead@example.invalid", subject: "Tarifs", body: "Quels sont vos tarifs ?" });
-    expect(result.replyDraft).toBeNull(); expect(result.ticketRouting?.kind).toBe("none");
-    expect(result.proposal.reasonCode).toBe("lead_template_unavailable");
-    expect(dependencies.crm).not.toHaveBeenCalled(); expect(dependencies.agent).not.toHaveBeenCalled();
-    if (disabled) expect(dependencies.search).not.toHaveBeenCalled();
-  });
-  it("keeps knowledge failure explicit without inventing a lead response", async () => {
-    vi.stubEnv("SAV_AI_ANALYSIS", "true"); dependencies.search.mockRejectedValue(new Error("fixture lookup failure"));
-    const logger = vi.spyOn(console, "warn").mockImplementation(() => undefined);
-    const result = await analyzeSavMessage({ from: "lead@example.invalid", subject: "Découverte", body: "Je souhaite une démonstration de Limova." });
-    expect(result.replyDraft).toBeNull(); expect(result.diagnostics).toContainEqual({ phase: "knowledge", errorCode: "SAV_KNOWLEDGE_LOOKUP_FAILED" });
-    expect(result.ticketRouting?.kind).toBe("none"); expect(dependencies.crm).not.toHaveBeenCalled(); logger.mockRestore();
-  });
-  it("requires an analysis trace for a lead too", async () => {
-    vi.stubEnv("SAV_AI_ANALYSIS", "false");
-    const logger = vi.spyOn(console, "error").mockImplementation(() => undefined);
-    await expect(analyzeSavMessage({ from: "lead@example.invalid", subject: "Découverte", body: "Je souhaite une démonstration de Limova." }, { messageId: "unavailable" })).rejects.toThrow("SAV_ANALYSIS_TRACE_REQUIRED");
-    logger.mockRestore();
-  });
-  it.each(["off", "shadow", "pilot", "on"])("financial requests use only a standard draft and no model/knowledge search in %s", async mode => {
-    vi.stubEnv("SAV_ADK_MODE", mode); vi.stubEnv("SAV_AI_ANALYSIS", "true"); vi.stubEnv("SAV_GEMINI_API_KEY", "fixture");
-    dependencies.crm.mockResolvedValue({ contactFound: false, tickets: [], routing: { kind: "new", reason: "no_contact" } });
-    const network = vi.fn(); vi.stubGlobal("fetch", network);
-    for (const body of ["Quel est le montant de ma facture ?", "Mon agent tel marche pas et je veux un remboursement"]) {
-      const result = await analyzeSavMessage({ from: "client@example.com", subject: "Support", body });
-      expect(result).toMatchObject({ category: "billing", model: "rules-v1", proposal: { reasonCode: "finance_human_only", requiresHumanApproval: true } });
-      expect(result.replyDraft).toContain("Les questions financières sont traitées par l’équipe Limova");
-      expect(result.replyDraft).not.toMatch(/Quelle adresse email|Charly|IA|3 jours|remboursé|vérifié votre/);
-      expect(result.structuredProposal?.process.some(step => step.kind === "product_step")).toBe(false);
-    }
-    expect(dependencies.agent).not.toHaveBeenCalled(); expect(dependencies.search).not.toHaveBeenCalled(); expect(network).not.toHaveBeenCalled();
-  });
-  it.each(["off", "on"])("keeps a contextual sourced draft under human review and ambiguous CRM routing in %s", async mode => {
-    vi.stubEnv("SAV_ADK_MODE", mode); vi.stubEnv("SAV_AI_ANALYSIS", "true"); vi.stubEnv("SAV_GEMINI_API_KEY", "fixture");
-    const quote = "Dans Paramètres, ouvrez Facturation pour accéder aux factures.";
-    const output = { category: "how_to", urgency: "normal", ticketRequired: true, reasonCode: "invoice_navigation",
-      explanation: "Le client veut retrouver ses factures, procédure disponible et dossier à vérifier.", confidence: 0.99,
-      requiresHuman: true, responseKind: "solution", replyDraft: `Bonjour, voici comment retrouver vos factures. ${quote}`, internalNote: "Demande de navigation vers les factures.",
-      evidenceIds: ["card"], citations: [{ sourceId: "card", claim: "Accès aux factures", quote }] };
-    const evidence = [{ sourceType: "knowledge", sourceId: "card", title: "Retrouver les factures", score: 0.9, excerpt: quote, claim: "Accès aux factures" }];
-    dependencies.search.mockResolvedValue({ revision: "fixture", results: [{ id: "card", title: "Retrouver les factures", content: quote, verifiedAt: new Date().toISOString(), score: 0.9, resolution: { steps: [quote] } }] });
-    dependencies.crm.mockResolvedValue({ contactFound: true, contactId: "31", tickets: [], routing: { kind: "ambiguous", reason: "multiple_exact_subjects", candidateIds: ["1", "2"] } });
-    dependencies.agent.mockResolvedValue({ output, evidence, knowledgeRevision: "fixture", model: "fixture", ticketRouting: { kind: "review", reason: "multiple_exact_subjects", candidateIds: ["1", "2"] } });
-    vi.stubGlobal("fetch", vi.fn(async () => Response.json({ candidates: [{ content: { parts: [{ text: JSON.stringify(output) }] } }] })));
-    const result = await analyzeSavMessage({ from: "client@example.com", subject: "Facturation", body: "Où télécharger mes factures ?" });
-    expect(result.replyDraft).toBe(output.replyDraft);
-    expect(result.proposal.requiresHumanApproval).toBe(true);
-    expect(result.ticketRouting?.kind).toBe("review");
-    expect(result.structuredProposal?.process.some(step => step.kind === "product_step" && step.sourceIds.includes("card"))).toBe(true);
-    expect(result.structuredProposal?.process.some(step => ["create_ticket", "link_ticket"].includes(step.kind))).toBe(false);
-    expect(result.replyDraft).not.toMatch(/Charly|IA|3 jours|instantanée/);
-  });
-  it("prepares the financial standard in English without a model or registration question", async () => {
-    vi.stubEnv("SAV_ADK_MODE", "on"); vi.stubEnv("SAV_AI_ANALYSIS", "true"); vi.stubEnv("SAV_GEMINI_API_KEY", "fixture");
-    dependencies.crm.mockResolvedValue({ contactFound: false, tickets: [], routing: { kind: "new", reason: "fixture" } });
-    const result = await analyzeSavMessage({ from: "client@example.com", subject: "Payment", body: "Hello, I was charged twice. Please refund my payment." });
-    expect(result.replyDraft).toContain("Financial matters are handled by the Limova team");
-    expect(result.replyDraft).not.toMatch(/Which email address|Bonjour|Charly|3 days/);
-    expect(dependencies.agent).not.toHaveBeenCalled(); expect(dependencies.search).not.toHaveBeenCalled();
-  });
-  it("keeps an English targeted clarification without requiring a manufactured citation", async () => {
-    vi.stubEnv("SAV_ADK_MODE", "off"); vi.stubEnv("SAV_AI_ANALYSIS", "true"); vi.stubEnv("SAV_GEMINI_API_KEY", "fixture");
-    dependencies.search.mockResolvedValue({ revision: "fixture", results: [] });
-    dependencies.crm.mockResolvedValue({ contactFound: false, tickets: [], routing: { kind: "new", reason: "fixture" } });
-    const draft = "Hello, I noted your request for 3 users and your availability Tuesday at 14:00. Which error do you see when inviting the users?";
-    vi.stubGlobal("fetch", vi.fn(async () => Response.json({ candidates: [{ content: { parts: [{ text: JSON.stringify({ category: "account", urgency: "normal", ticketRequired: true,
-      reasonCode: "invitation_details", explanation: "Invitation error missing, account email already supplied.", confidence: 0.99, requiresHuman: true,
-      responseKind: "clarification", replyDraft: draft, internalNote: "Needs 3 users, available Tuesday at 14:00.", citations: [] }) }] } }] })));
-    const result = await analyzeSavMessage({ from: "client@example.com", subject: "Account", body: "Hello, how can I invite 3 users? I am available Tuesday at 14:00. Account email: account@example.invalid" });
-    expect(result.replyDraft).toBe(draft);
-    expect(result.replyDraft).not.toContain("Which email address");
-    expect(result.proposal.requiresHumanApproval).toBe(true);
-  });
-  it("does not show an ungrounded solution just because the model asked for human review", async () => {
-    vi.stubEnv("SAV_ADK_MODE", "off"); vi.stubEnv("SAV_AI_ANALYSIS", "true"); vi.stubEnv("SAV_GEMINI_API_KEY", "fixture");
-    dependencies.search.mockResolvedValue({ revision: "fixture", results: [] });
-    vi.stubGlobal("fetch", vi.fn(async () => Response.json({ candidates: [{ content: { parts: [{ text: JSON.stringify({ category: "technical", urgency: "normal", ticketRequired: true,
-      reasonCode: "invented_solution", explanation: "Unverified technical advice requiring review.", confidence: 0.99, requiresHuman: true,
-      responseKind: "solution", replyDraft: "Invented fix: click the nonexistent magic button.", internalNote: "", citations: [] }) }] } }] })));
-    const result = await analyzeSavMessage({ from: "client@example.com", subject: "Bug", body: "Mon agent téléphonique ne fonctionne plus, comment vérifier mes crédits ?" });
-    expect(dependencies.search).toHaveBeenCalled();
-    expect(result.replyDraft).not.toContain("magic button");
-    expect(result.diagnostics).toContainEqual({ phase: "generation", errorCode: "SAV_UNGROUNDED_REPLY" });
-  });
-  it.each(["off", "shadow", "pilot", "on"])("a thank-you with an old cancellation does not consult CRM or a model in %s", async mode => {
-    vi.stubEnv("SAV_ADK_MODE", mode); vi.stubEnv("SAV_AI_ANALYSIS", "true"); vi.stubEnv("SAV_GEMINI_API_KEY", "fixture");
-    const result = await analyzeSavMessage({ from: "client@example.com", subject: "Re: Résiliation", body: "Merci !\n\nLe mardi, Charly a écrit :\nJe veux résilier mon abonnement." });
-    expect(result.proposal).toMatchObject({ kind: "no_ticket_needed", reasonCode: "simple_acknowledgement" });
-    expect(result.replyDraft).toBeNull();
-    expect(result.structuredProposal?.messageContext?.quotedText).toContain("résilier");
-    expect(dependencies.crm).not.toHaveBeenCalled(); expect(dependencies.agent).not.toHaveBeenCalled(); expect(dependencies.search).not.toHaveBeenCalled();
-  });
-  it.each([
-    { from: "robot@mailinblack.com", subject: "Vérification", body: "Veuillez authentifier votre adresse expéditeur." },
-    { from: "sales@example.com", subject: "Nos services", body: "Nous vous proposons des services de marketing." },
-    { from: "partner@example.com", subject: "Partenariat", body: "Je souhaite un partenariat avec Limova." },
-  ])("does not ask for a registration address or propose a ticket for non-support: %s", async input => {
-    vi.stubEnv("SAV_ADK_MODE", "on"); vi.stubEnv("SAV_AI_ANALYSIS", "true"); vi.stubEnv("SAV_GEMINI_API_KEY", "fixture");
-    const result = await analyzeSavMessage(input);
-    expect(result.proposal.requiresHumanApproval).toBe(true);
-    expect(result.ticketRouting?.kind).toBe("none"); expect(result.replyDraft).toBeNull();
-    expect(result.structuredProposal?.process.some(step => ["create_ticket", "link_ticket", "review_reply"].includes(step.kind))).toBe(false);
-    expect(dependencies.crm).not.toHaveBeenCalled(); expect(dependencies.agent).not.toHaveBeenCalled(); expect(dependencies.search).not.toHaveBeenCalled();
-  });
-  it("uses current signature identity hints, never a quoted third-party phone", async () => {
-    vi.stubEnv("SAV_AI_ANALYSIS", "false");
-    dependencies.crm.mockResolvedValue({ contactFound: false, tickets: [], routing: { kind: "new", reason: "fixture" } });
-    await analyzeSavMessage({ from: "client@example.com", subject: "Compte", body: "Comment retrouver mon compte ?\n-- \nTéléphone : 0612345678\nOn Tuesday, Someone wrote:\nNom : Personne Tierce\nTéléphone : 0698765432" });
-    expect(dependencies.crm).toHaveBeenCalledWith(expect.objectContaining({ identityHints: { names: [], phones: ["0612345678"] } }));
-  });
-  it("does not re-ask a supplied account email or silently confirm it as a CRM identity", async () => {
-    vi.stubEnv("SAV_AI_ANALYSIS", "false");
-    dependencies.crm.mockResolvedValue({ contactFound: false, tickets: [], routing: { kind: "new", reason: "fixture" } });
-    const result = await analyzeSavMessage({ from: "other@example.com", subject: "Compte", body: "Comment retrouver mes factures ?\nEmail du compte : account@example.invalid" });
-    expect(result.replyDraft).not.toContain("Quelle adresse email");
     expect(result.structuredProposal?.customerIdentity.verifiedByHuman).toBe(false);
-    expect(result.structuredProposal?.routing).toMatchObject({ kind: "review", reason: "customer_identity_unverified" });
-    expect(result.structuredProposal?.messageContext?.facts).toContainEqual({ kind: "registration_email", excerpt: "Email du compte : account@example.invalid", line: 2 });
   });
-  it.each(["off", "shadow", "pilot", "on"])("cancellation never produces an AI draft, including missing CRM identity, in %s", async (mode) => {
-    vi.stubEnv("SAV_ADK_MODE", mode); vi.stubEnv("SAV_AI_ANALYSIS", "true"); vi.stubEnv("SAV_GEMINI_API_KEY", "fixture");
-    dependencies.crm.mockResolvedValue({ contactFound: false, tickets: [], routing: { kind: "new", reason: "no_contact" } });
-    const result = await analyzeSavMessage({ from: "client@example.com", subject: "Résiliation", body: "Je souhaite résilier mon abonnement." });
-    expect(result.proposal).toMatchObject({ reasonCode: "cancellation_human_only", requiresHumanApproval: true });
-    expect(result.replyDraft).toBeNull(); expect(result.structuredProposal?.replyDraft).toBeNull();
-    expect(result.structuredProposal?.process.some(step => step.kind === "review_reply")).toBe(false);
-    expect(dependencies.agent).not.toHaveBeenCalled(); expect(dependencies.search).not.toHaveBeenCalled();
+  it.each(modes)("keeps mixed technical and refund requests in a standard financial handoff in %s", async mode => {
+    const u = understandingFixture(); u.requests.push({ ...u.requests[0], id: "refund", summary: "Demander un remboursement.", nature: "financial_operation", financialScope: "support_account" });
+    deps.understand.mockResolvedValue(u); const network = vi.fn();
+    const result = await analyzeSavMessage(input, { evaluation: evaluation(mode, network) });
+    expect(result.category).toBe("technical"); expect(result.proposal.reasonCode).toBe("finance_human_only");
+    expect(result.replyDraft).toContain("Les questions financières");
+    for (const request of u.requests) expect(result.replyDraft).toContain(request.summary);
+    expect(deps.understand).toHaveBeenCalledOnce(); expect(deps.search).not.toHaveBeenCalled(); expect(deps.agent).not.toHaveBeenCalled(); expect(network).not.toHaveBeenCalled(); expect(deps.coherence).not.toHaveBeenCalled();
   });
-  it.each(["off", "shadow", "pilot", "on"])("non-support mail bypasses models and CRM in %s", async (mode) => {
-    vi.stubEnv("SAV_ADK_MODE", mode);
-    vi.stubEnv("SAV_AI_ANALYSIS", "true");
-    vi.stubEnv("SAV_GEMINI_API_KEY", "fixture");
-    for (const input of [
-      { subject: "Re: aide", body: "Merci beaucoup !" },
-      { subject: "Rapport", body: "Retour lundi", autoSubmitted: "auto-replied" },
-    ]) {
-      const result = await analyzeSavMessage({ from: "client@example.com", ...input });
-      expect(result.proposal.kind).toMatch(/^(?:no_ticket_needed|automatic_reply)$/);
-      expect(result.replyDraft).toBeNull();
-    }
-    expect(dependencies.agent).not.toHaveBeenCalled();
-    expect(dependencies.search).not.toHaveBeenCalled();
-    expect(dependencies.crm).not.toHaveBeenCalled();
+  it.each(modes)("forbids every cancellation draft including mixed finance and missing identity in %s", async mode => {
+    const u = understandingFixture(); u.requests.push({ ...u.requests[0], id: "cancel", nature: "cancellation", summary: "Mettre fin à l’abonnement." });
+    deps.understand.mockResolvedValue(u); deps.crm.mockResolvedValue({ contactFound: false, tickets: [], routing: { kind: "new", reason: "no_contact" } });
+    const network = vi.fn(); const result = await analyzeSavMessage(input, { evaluation: evaluation(mode, network) });
+    expect(result.proposal.reasonCode).toBe("cancellation_human_only"); expect(result.replyDraft).toBeNull(); expect(result.structuredProposal?.replyDraft).toBeNull();
+    expect(deps.search).not.toHaveBeenCalled(); expect(deps.agent).not.toHaveBeenCalled(); expect(network).not.toHaveBeenCalled();
   });
-  it("requires explicit review for an ambiguous HubSpot association", async () => {
-    vi.stubEnv("SAV_AI_ANALYSIS", "false");
-    dependencies.crm.mockResolvedValue({ contactFound: true, contactId: "c1", tickets: [], routing: { kind: "ambiguous", reason: "multiple_exact_subjects", candidateIds: ["1", "2"] } });
-    const result = await analyzeSavMessage({ from: "client@example.com", subject: "Utilisation", body: "Comment changer la couleur ?" });
-    expect(result.structuredProposal?.routing).toEqual({ kind: "review", reason: "multiple_exact_subjects", candidateIds: ["1", "2"] });
-    expect(result.structuredProposal?.process.some((step) => ["create_ticket", "link_ticket"].includes(step.kind))).toBe(false);
-    expect(result.proposal.requiresHumanApproval).toBe(true);
+  it.each(modes)("does not invent a semantic classification after an unavailable understanding in %s", async mode => {
+    const u = understandingFixture({ status: "unavailable", language: "unknown", requests: [], primaryRequestId: null, evidence: [], uncertainties: [{ code: "provider_unavailable", requestIds: [] }] }); u.trace.errorCode = "SAV_AI_HTTP_402";
+    deps.understand.mockResolvedValue(u); const network = vi.fn();
+    const result = await analyzeSavMessage(input, { evaluation: evaluation(mode, network) });
+    expect(result).toMatchObject({ category: "other", replyDraft: null, proposal: { reasonCode: "understanding_unavailable", confidence: 0, requiresHumanApproval: true } });
+    expect(result.diagnostics).toContainEqual({ phase: "generation", errorCode: "SAV_AI_HTTP_402" });
+    expect(deps.search).not.toHaveBeenCalled(); expect(deps.agent).not.toHaveBeenCalled(); expect(network).not.toHaveBeenCalled();
   });
-  it("does not silently accept a missing mandatory analysis trace", async () => {
-    const logger = vi.spyOn(console, "error").mockImplementation(() => undefined);
-    await expect(analyzeSavMessage({ from: "client@example.com", subject: "Re: aide", body: "Merci !" }, { messageId: "unavailable" })).rejects.toThrow("SAV_ANALYSIS_TRACE_REQUIRED");
-    logger.mockRestore();
+  it.each(modes)("uses a lead template only after qualifying a prospect in %s", async mode => {
+    const u = understandingFixture(); u.requests[0].nature = "commercial"; u.customerRelationship = { kind: "prospect", evidenceIds: ["evidence-1"] };
+    deps.understand.mockResolvedValue(u);
+    const template = "Bonjour, voici le formulaire fictif : https://example.invalid/demo.";
+    deps.search.mockResolvedValue({ revision: "fixture-lead", results: [{ id: "lead", contentVersionId: "lead-v1", title: "Fixture", content: template, score: 0.9, verifiedAt: new Date().toISOString(), resolution: { audience: "lead", symptoms: ["Découverte"], steps: ["Consulter le formulaire"], escalation: "Humain", conflictsWith: [], supersedes: [], responseTemplate: template } }] });
+    const network = vi.fn(); const result = await analyzeSavMessage(input, { evaluation: evaluation(mode, network) });
+    expect(result.replyDraft).toBe(template); expect(result.ticketRouting?.kind).toBe("none");
+    expect(deps.search).toHaveBeenCalledWith(expect.objectContaining({ savAudience: "lead" }));
+    expect(deps.search.mock.invocationCallOrder[0]).toBeGreaterThan(deps.understand.mock.invocationCallOrder[0]);
+    expect(network).not.toHaveBeenCalled(); expect(deps.agent).not.toHaveBeenCalled();
   });
-  it.each([false, true])("scans unknown senders and asks for the registration email only without a candidate: %s", async (hasCandidate) => {
-    vi.stubEnv("SAV_AI_ANALYSIS", "false");
-    const identityCandidates = hasCandidate ? [{ contactId: "31", name: "Jeanne Martin", email: "compte@example.com", phoneHint: "…5678", matchedBy: "phone", confirmed: false }] : [];
-    dependencies.crm.mockResolvedValue({ contactFound: false, identityCandidates, tickets: [], routing: { kind: "new", reason: "no_contact" } });
-    const result = await analyzeSavMessage({ from: "autre@example.com", displayName: "Jeanne Martin", subject: "Compte", body: "Comment retrouver mon compte ? Téléphone : 0612345678" });
-    expect(dependencies.crm).toHaveBeenCalledWith(expect.objectContaining({ identityHints: { names: ["Jeanne Martin"], phones: ["0612345678"] } }));
-    expect(result.proposal.requiresHumanApproval).toBe(true);
-    expect(result.structuredProposal?.identityCandidates).toEqual(identityCandidates);
-    expect(result.structuredProposal?.customerIdentity.verifiedByHuman).toBe(false);
-    if (hasCandidate) expect(result.replyDraft).not.toContain("Quelle adresse email");
-    else expect(result.replyDraft).toContain("Quelle adresse email utilisez-vous pour votre compte Limova");
+  it.each(["existing_customer", "unknown"] as const)("does not apply a prospect template to %s", async kind => {
+    const u = understandingFixture(); u.requests[0].nature = "commercial"; u.customerRelationship = { kind, evidenceIds: kind === "unknown" ? [] : ["evidence-1"] }; deps.understand.mockResolvedValue(u);
+    const network = vi.fn(); const result = await analyzeSavMessage(input, { evaluation: evaluation("off", network) });
+    expect(result.replyDraft).toBeNull(); expect(result.proposal.reasonCode).toBe("commercial_context_to_review");
+    expect(deps.search).not.toHaveBeenCalled(); expect(network).not.toHaveBeenCalled();
   });
-  it.each(["off", "shadow", "pilot", "on"])("disabling AI prevents both engines and embeddings in %s", async (mode) => {
-    vi.stubEnv("SAV_ADK_MODE", mode);
-    vi.stubEnv("SAV_AI_ANALYSIS", "false");
-    vi.stubEnv("SAV_GEMINI_API_KEY", "fixture");
-    const network = vi.fn(() => { throw new Error("No network expected"); });
-    vi.stubGlobal("fetch", network);
-    const analysis = await analyzeSavMessage({ from: "client@example.com", subject: "Utilisation", body: "Comment changer la couleur ?" });
-    expect(analysis.model).toBe("rules-v1");
-    expect(dependencies.agent).not.toHaveBeenCalled();
-    expect(dependencies.search).not.toHaveBeenCalled();
-    expect(network).not.toHaveBeenCalled();
+  it.each(modes)("runs no semantic/model/CRM work for reliable technical automation headers in %s", async mode => {
+    const result = await analyzeSavMessage({ ...input, autoSubmitted: "auto-replied" }, { evaluation: evaluation(mode, vi.fn()) });
+    expect(result.proposal.kind).toBe("automatic_reply"); expect(result.replyDraft).toBeNull();
+    expect(deps.understand).not.toHaveBeenCalled(); expect(deps.crm).not.toHaveBeenCalled(); expect(deps.search).not.toHaveBeenCalled(); expect(deps.agent).not.toHaveBeenCalled();
   });
-  it("a successful, confident legacy fallback cannot authorize an autonomous answer", async () => {
-    vi.stubEnv("SAV_ADK_MODE", "on");
-    vi.stubEnv("SAV_AI_ANALYSIS", "true");
-    vi.stubEnv("SAV_GEMINI_API_KEY", "fixture");
-    dependencies.agent.mockRejectedValue(new Error("SAV_REQUIRED_TOOL_UNAVAILABLE"));
-    dependencies.search.mockResolvedValue({ revision: "fixture", results: [{ id: "card", title: "Procédure", content: "Procédure", score: 0.9 }] });
-    vi.stubGlobal("fetch", vi.fn(async () => Response.json({ candidates: [{ content: { parts: [{ text: JSON.stringify({
-      category: "how_to", urgency: "normal", ticketRequired: true, reasonCode: "known_procedure",
-      explanation: "La procédure correspond au problème.", confidence: 0.99, requiresHuman: false,
-      replyDraft: "Voici la procédure.", internalNote: "Procédure connue.",
-    }) }] } }] })));
-    const result = await analyzeSavMessage({ from: "client@example.com", subject: "Utilisation", body: "Comment changer la couleur ?" });
-    expect(result.proposal).toMatchObject({ kind: "human_review_required", requiresHumanApproval: true, reasonCode: "agent_runtime_degraded" });
-    expect(result.replyDraft).not.toContain("Voici la procédure.");
+  it.each(["rejected", "unavailable"])("replaces a %s coherence verdict with a marked contextual human handoff", async status => {
+    const u = understandingFixture(); deps.understand.mockResolvedValue(u); deps.coherence.mockResolvedValue(coherence(status));
+    const answer = outputFor(u); answer.coverage[0].text = "Cette réponse fournisseur doit être supprimée."; answer.replyDraft = answer.coverage[0].text;
+    const network = vi.fn<typeof fetch>(async () => geminiFixture(answer)); const result = await analyzeSavMessage(input, { evaluation: evaluation("off", network) });
+    expect(result.replyDraft).not.toContain("doit être supprimée"); expect(result.replyDraft).toContain(u.requests[0].summary);
+    expect(result.replyAssessment).toMatchObject({ kind: "human_handoff", coherence: { status } });
+    expect(result.proposal.confidence).toBe(0); expect(network).toHaveBeenCalledOnce(); expect(deps.coherence).toHaveBeenCalledOnce();
+  });
+  it.each(["off", "on"] as const)("rejects missing secondary request coverage in %s", async mode => {
+    const u = understandingFixture(); u.requests.push({ ...u.requests[0], id: "second", summary: "Une seconde demande explicite." }); deps.understand.mockResolvedValue(u);
+    const incomplete = outputFor(u); incomplete.coverage = incomplete.coverage.slice(0, 1); incomplete.replyDraft = incomplete.coverage[0].text;
+    deps.agent.mockResolvedValue({ ...adkResult(u), output: incomplete });
+    const result = await analyzeSavMessage(input, { evaluation: evaluation(mode, vi.fn<typeof fetch>(async () => geminiFixture(incomplete))) });
+    expect(result.replyAssessment?.kind).toBe("human_handoff"); expect(result.replyDraft).toContain("seconde demande");
+    expect(result.diagnostics).toContainEqual({ phase: "generation", errorCode: "SAV_REPLY_INCONSISTENT_WITH_UNDERSTANDING" }); expect(deps.coherence).not.toHaveBeenCalled();
+  });
+  it("does not retry another composer after ADK failure", async () => {
+    deps.understand.mockResolvedValue(understandingFixture()); deps.agent.mockRejectedValue(new Error("SAV_ADK_TIMEOUT"));
+    const network = vi.fn(); const result = await analyzeSavMessage(input, { evaluation: evaluation("on", network) });
+    expect(result.proposal.reasonCode).toBe("agent_runtime_degraded"); expect(result.replyAssessment?.kind).toBe("human_handoff");
+    expect(deps.agent).toHaveBeenCalledOnce(); expect(network).not.toHaveBeenCalled(); expect(deps.search).not.toHaveBeenCalled();
+  });
+  it("retains both claims and the exact version when two claims cite the same card", async () => {
+    const u = understandingFixture(); deps.understand.mockResolvedValue(u);
+    const first = "Consultez le panneau de diagnostic fictif."; const second = "Relevez le code d’erreur affiché dans ce panneau.";
+    deps.search.mockResolvedValue({ revision: "fixture-kb", results: [{ id: "card", contentVersionId: "card-version-1", title: "Procédure fictive", content: `${first}\n${second}`, score: 0.9, verifiedAt: new Date().toISOString(), resolution: { steps: [first, second], conflictsWith: [] } }] });
+    const answer = outputFor(u); answer.responseKind = "solution";
+    answer.coverage[0] = { ...answer.coverage[0], kind: "solution", text: `${first} ${second}`, sourceIds: ["card"] }; answer.replyDraft = answer.coverage[0].text;
+    answer.citations = [{ sourceId: "card", claim: "Ouvrir le diagnostic", quote: first }, { sourceId: "card", claim: "Relever le code", quote: second }];
+    const result = await analyzeSavMessage(input, { evaluation: evaluation("off", vi.fn<typeof fetch>(async () => geminiFixture(answer))) });
+    expect(result.replyDraft).toBe(answer.replyDraft);
+    expect(result.evidence.filter(e => e.sourceId === "card")).toEqual(expect.arrayContaining([
+      expect.objectContaining({ contentVersionId: "card-version-1", claim: "Ouvrir le diagnostic", excerpt: first }),
+      expect.objectContaining({ contentVersionId: "card-version-1", claim: "Relever le code", excerpt: second }),
+    ]));
+  });
+  it("does not display an ungrounded solution even under human review", async () => {
+    const u = understandingFixture(); deps.understand.mockResolvedValue(u); const answer = outputFor(u);
+    answer.responseKind = "solution"; answer.coverage[0] = { ...answer.coverage[0], kind: "solution", text: "Cliquez sur un bouton inventé.", sourceIds: ["missing-card"] }; answer.replyDraft = answer.coverage[0].text;
+    answer.citations = [{ sourceId: "missing-card", claim: "Cliquer sur ce bouton", quote: "Une quote qui n’a jamais été fournie." }];
+    const result = await analyzeSavMessage(input, { evaluation: evaluation("off", vi.fn<typeof fetch>(async () => geminiFixture(answer))) });
+    expect(result.replyDraft).not.toContain("bouton inventé"); expect(result.replyAssessment?.kind).toBe("human_handoff");
+    expect(deps.coherence).not.toHaveBeenCalled(); expect(result.diagnostics?.some(d => d.errorCode === "SAV_UNKNOWN_EVIDENCE")).toBe(true);
+  });
+  it.each([{ messageId: "fixture" }, { pilotBatchId: "fixture" }])("forbids any persisted identity on an evaluation run: %j", async persisted => {
+    await expect(analyzeSavMessage(input, { ...persisted, evaluation: evaluation("off", vi.fn()) })).rejects.toThrow("SAV_EVALUATION_PERSISTENCE_FORBIDDEN");
+    expect(deps.understand).not.toHaveBeenCalled(); expect(deps.crm).not.toHaveBeenCalled();
   });
 });
