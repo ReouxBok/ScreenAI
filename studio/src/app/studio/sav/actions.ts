@@ -77,9 +77,10 @@ export async function reviewDraftAction(form: FormData) {
   let result = "draft_reviewed";
   try {
     if (form.has("replyDraft") || form.has("text")) throw new Error("SAV_DRAFT_READ_ONLY");
-    await reviewSavDraft({ threadId, messageId: id(form,"messageId"), decisionId: id(form,"decisionId"), agentRunId: id(form,"agentRunId"), sourceHash: id(form,"sourceHash"), expectedVerdictId: String(form.get("verdictId") || "") || null, status: String(form.get("status")), reason: String(form.get("reason") || "") }, staff.email);
+    await reviewSavDraft({ threadId, messageId: id(form,"messageId"), decisionId: id(form,"decisionId"), agentRunId: id(form,"agentRunId"), sourceHash: id(form,"sourceHash"), expectedVerdictId: String(form.get("verdictId") || "") || null, status: String(form.get("status")), reason: String(form.get("reason") || ""), reasons: form.getAll("reasons").map(String) }, staff.email);
   } catch (error) { result = error instanceof Error && /^SAV_[A-Z_]+$/.test(error.message) ? error.message : "SAV_DRAFT_INVALID"; }
   revalidatePath(`/studio/sav/${threadId}`);
+  revalidatePath("/studio/sav/evaluation");
   redirect(`/studio/sav/${encodeURIComponent(threadId)}?review=${result}`);
 }
 
@@ -359,7 +360,7 @@ export async function reviewProposalAction(form: FormData) {
   try {
     if (form.has("replyDraft")) throw new Error("SAV_DRAFT_READ_ONLY");
     await reviewSavProposal({ reviewScope: "dossier", messageId: id(form, "messageId"), decisionId: id(form, "decisionId"), agentRunId: id(form, "agentRunId"), expectedReviewId: String(form.get("reviewId") || "") || null,
-      status: "approved", verdict: String(form.get("verdict")), comment: String(form.get("comment") || "Process corrigé relu et validé manuellement depuis le Studio."),
+      status: "approved", verdict: String(form.get("verdict")), comment: String(form.get("comment") || "Process corrigé relu et validé manuellement depuis le Studio."), reasons: form.getAll("reasons").map(String),
       dimensions: Object.fromEntries(["classification", "routing", "grounding", "tone", "escalation"].map((key) => [key, String(form.get(`dimension_${key}`))])),
       reusability: String(form.get("reusability")), reusableResolution: String(form.get("reusableResolution") || ""), justification: String(form.get("justification") || ""),
       correction: { category: String(form.get("category")), urgency: String(form.get("urgency")), decisionKind: String(form.get("decisionKind")), reasonCode: String(form.get("reasonCode")), explanation: String(form.get("explanation")), title: String(form.get("title")), description: String(form.get("description")), process: [
@@ -371,6 +372,7 @@ export async function reviewProposalAction(form: FormData) {
   revalidatePath("/studio/sav");
   revalidatePath(`/studio/sav/${threadId}`);
   revalidatePath("/studio/sav/resolutions");
+  revalidatePath("/studio/sav/evaluation");
   redirect(`/studio/sav/${encodeURIComponent(threadId)}?review=${errorCode || "saved"}`);
 }
 

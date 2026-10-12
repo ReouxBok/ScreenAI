@@ -30,10 +30,8 @@ import { redactSavLearningText } from "./learning-extraction";
 import { invalidateSavReplies } from "./invalidation";
 import { isSavPilotMode, savReleaseStage } from "./config";
 import { getSavV0Cutover, isSavMessageEligible, savV0EligibleMessageFilter } from "./cutover";
-import { savActiveSubject, splitSavMessageText } from "./message-context";
 import {
   decisionKindSchema,
-  requestsHuman,
   humanDueAt,
   assertSavPilotReplyApprovalAllowed,
   normalizeEmailAddress,
@@ -217,10 +215,12 @@ async function createDecision(
       if (!pilotBatchId) {
         await invalidateSavReplies(tx, message.threadId, "SAV_THREAD_PAUSED", now);
         await tx.update(savThreads).set({
-          status: "human_requested",
+          // A degraded follow-up still needs review, but must not restart an
+          // existing human handoff or postpone its deadline.
+          status: sql`case when ${savThreads.status} in ('human_requested', 'human_processing') then ${savThreads.status} else 'human_requested' end`,
           aiPaused: true,
-          humanRequestedAt: now,
-          humanDueAt: humanDueAt(now),
+          humanRequestedAt: sql`case when ${savThreads.status} in ('human_requested', 'human_processing') then coalesce(${savThreads.humanRequestedAt}, ${now.toISOString()}::timestamptz) else ${now.toISOString()}::timestamptz end`,
+          humanDueAt: sql`case when ${savThreads.status} in ('human_requested', 'human_processing') then coalesce(${savThreads.humanDueAt}, ${humanDueAt(now).toISOString()}::timestamptz) else ${humanDueAt(now).toISOString()}::timestamptz end`,
           updatedAt: now,
         }).where(eq(savThreads.id, message.threadId));
       }
@@ -311,12 +311,8 @@ export async function ingestInboundMessage(rawInput: unknown) {
     if (created && eligible) {
       const now = new Date();
       await invalidateSavReplies(tx, thread.id, "SAV_REPLY_OBSOLETE", now);
-      // A human request takes effect before a potentially slow model call.
-      if (!isSavPilotMode() && requestsHuman(`${savActiveSubject({ subject: input.subject, body: bodyText })}\n${splitSavMessageText(bodyText).currentText}`)) {
-        await tx.update(savThreads).set({ aiPaused: true, status: "human_requested",
-          humanRequestedAt: now, humanDueAt: humanDueAt(now), updatedAt: now,
-        }).where(eq(savThreads.id, thread.id));
-      }
+      // Any incoming message invalidates approvals immediately. Human handoff
+      // is applied by createDecision after semantic qualification, not keywords.
     }
     return { mailbox, thread, message, duplicate: !created };
   });

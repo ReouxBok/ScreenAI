@@ -7,7 +7,7 @@ import { assertSavActor } from "./access";
 import { isSavMessageEligible } from "./cutover";
 import { decryptSavPayload, encryptSavPayload, savContentHash } from "./crypto";
 import { savStructuredProposalSchema } from "./proposal";
-import { savReviewMatchesProposal, savDossierSourceHash, savDraftSourceHash, savDraftNotApplicable } from "./review-contract";
+import { savReviewMatchesProposal, savDossierSourceHash, savDraftSourceHash, savDraftNotApplicable, savReviewReasonsSchema, savStoredReviewReasons } from "./review-contract";
 import { savReleaseStage } from "./config";
 type Reader = Pick<ReturnType<typeof requireDb>, "select">;
 /** Called under the thread lock for mutations; exact IDs prevent stale forms,
@@ -24,13 +24,13 @@ export async function loadSavDraftContext(messageId: string, db: Reader = requir
     const original = savStructuredProposalSchema.parse(decryptSavPayload(run.proposalCiphertext));
     const [review] = await db.select().from(savProposalReviews).where(and(eq(savProposalReviews.messageId, messageId), eq(savProposalReviews.isCurrent, true))).limit(1);
     const matches = savReviewMatchesProposal(review, { decisionId: decision.id, agentRunId: run.id, proposal: original, message });
-    const proposal = matches ? { ...savStructuredProposalSchema.parse(decryptSavPayload(review.afterCiphertext)), replyDraft: original.replyDraft } : original;
+    const proposal = matches ? { ...savStructuredProposalSchema.parse(decryptSavPayload(review.afterCiphertext)), replyDraft: original.replyDraft, replyAssessment: original.replyAssessment, understanding: original.understanding } : original;
     const [knowledge] = await db.select().from(activeKnowledge).limit(1);
     if (!["not_consulted", "unavailable"].includes(original.knowledgeRevision) && original.knowledgeRevision !== knowledge?.revisionId)
         throw new Error("SAV_KNOWLEDGE_CHANGED_REANALYSIS_REQUIRED");
     return { message, decision, run, proposal, knowledgeRevision: knowledge?.revisionId ?? null, sourceHash: savDraftSourceHash(proposal, message, knowledge?.revisionId), review: matches ? review : null };
 }
-const request = z.object({ threadId: z.uuid(), messageId: z.uuid(), decisionId: z.uuid(), agentRunId: z.uuid(), sourceHash: z.string().length(43), expectedVerdictId: z.uuid().nullable(), status: z.enum(["accepted", "rejected"]), reason: z.string().trim().max(500).default("") }).strict();
+const request = z.object({ threadId: z.uuid(), messageId: z.uuid(), decisionId: z.uuid(), agentRunId: z.uuid(), sourceHash: z.string().length(43), expectedVerdictId: z.uuid().nullable(), status: z.enum(["accepted", "rejected"]), reason: z.string().trim().max(500).default(""), reasons: savReviewReasonsSchema }).strict();
 export async function reviewSavDraft(raw: unknown, actorEmail: string) {
     assertSavActor(actorEmail);
     if (savReleaseStage() !== "v0")
@@ -53,7 +53,7 @@ export async function reviewSavDraft(raw: unknown, actorEmail: string) {
         const [current] = await tx.select().from(savDraftVerdicts).where(and(eq(savDraftVerdicts.messageId, input.messageId), eq(savDraftVerdicts.isCurrent, true))).limit(1);
         const same = current?.sourceHash === input.sourceHash && current.status === input.status && current.reviewedBy === actorEmail && decryptSavPayload<{
             text: string;
-        }>(current.reasonCiphertext).text === input.reason;
+        }>(current.reasonCiphertext).text === input.reason && JSON.stringify(savStoredReviewReasons(decryptSavPayload<{ reasons?: unknown }>(current.reasonCiphertext).reasons)) === JSON.stringify(input.reasons);
         if (same)
             return current; // exact repeated click: no new version or follow-up
         if ((current?.id ?? null) !== input.expectedVerdictId)
@@ -72,10 +72,10 @@ export async function reviewSavDraft(raw: unknown, actorEmail: string) {
             await tx.update(savReplyDrafts).set({ status: "abandoned" }).where(and(eq(savReplyDrafts.messageId, input.messageId), eq(savReplyDrafts.sourceHash, c.sourceHash), eq(savReplyDrafts.isCurrent, true)));
         }
         const [result] = await tx.insert(savDraftVerdicts).values({ threadId: thread.id, messageId: c.message.id, decisionId: c.decision.id, agentRunId: c.run.id, draftId, sourceHash: c.sourceHash, status: input.status,
-            snapshotCiphertext: encryptSavPayload({ proposal: c.proposal, body: c.proposal.replyDraft, dossierReviewId: c.review?.id ?? null, dossierHash: savDossierSourceHash(c.proposal) }), reasonCiphertext: encryptSavPayload({ text: input.reason }), reviewedBy: actorEmail }).returning();
+            snapshotCiphertext: encryptSavPayload({ proposal: c.proposal, body: c.proposal.replyDraft, dossierReviewId: c.review?.id ?? null, dossierHash: savDossierSourceHash(c.proposal) }), reasonCiphertext: encryptSavPayload({ text: input.reason, reasons: input.reasons }), reviewedBy: actorEmail }).returning();
         if (input.status === "rejected")
             await tx.insert(savResolutionObservations).values({ threadId: thread.id, messageId: c.message.id, verdictId: result.id, hubspotTicketId: thread.hubspotTicketId, state: thread.hubspotTicketId ? "active" : "waiting_ticket" }).onConflictDoNothing();
-        await tx.insert(auditLogs).values({ actorEmail, action: "sav_draft_verdict_recorded", entityType: "sav_draft_verdict", entityId: result.id, technicalMetadata: { status: result.status, sourceHash: c.sourceHash, messageId: c.message.id, decisionId: c.decision.id, agentRunId: c.run.id } });
+        await tx.insert(auditLogs).values({ actorEmail, action: "sav_draft_verdict_recorded", entityType: "sav_draft_verdict", entityId: result.id, technicalMetadata: { status: result.status, reasons: input.reasons.join(","), sourceHash: c.sourceHash, messageId: c.message.id, decisionId: c.decision.id, agentRunId: c.run.id } });
         return result;
     });
 }

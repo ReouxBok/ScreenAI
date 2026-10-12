@@ -3,6 +3,19 @@ import type { SavDecisionEvidence } from "@/db/schema";
 import type { SavAnalysis } from "./intelligence";
 import type { SavDossierContext } from "./dossier-context";
 import { savInboundContextSchema, type SavInboundContext } from "./message-context";
+import { savUnderstandingSchema, savReplyCoverageSchema } from "./understanding";
+
+export const savReplyAssessmentSchema = z.object({
+  kind: z.enum(["contextualized", "finance_standard", "lead_template", "human_handoff", "unavailable", "forbidden", "none"]),
+  coverage: savReplyCoverageSchema,
+  errorCode: z.string().nullable(),
+  coherence: z.object({
+    status: z.enum(["passed", "rejected", "unavailable"]), issues: z.array(z.string()),
+    promptRevision: z.string(), model: z.string(), inputHash: z.string(), outputHash: z.string().nullable(),
+    durationMs: z.number().nonnegative(), inputTokens: z.number().nonnegative(), outputTokens: z.number().nonnegative(), totalTokens: z.number().nonnegative(), errorCode: z.string().nullable(),
+  }).strict().optional(),
+}).strict();
+export type SavReplyAssessment = z.infer<typeof savReplyAssessmentSchema>;
 
 export const savRoutingSchema = z.discriminatedUnion("kind", [
   z.object({ kind: z.literal("none"), reason: z.string() }),
@@ -27,6 +40,8 @@ export const savStructuredProposalSchema = z.object({
   identityCandidates: z.array(z.object({ contactId: z.string(), name: z.string(), email: z.string(), phoneHint: z.string(), matchedBy: z.enum(["name", "phone"]), confirmed: z.literal(false) })).max(10).default([]),
   customerIdentity: z.object({ registrationEmail: z.email().nullable(), verifiedByHuman: z.boolean() }).default({ registrationEmail: null, verifiedByHuman: false }),
   messageContext: savInboundContextSchema.optional(),
+  understanding: savUnderstandingSchema.optional(),
+  replyAssessment: savReplyAssessmentSchema.optional(),
   // Server-owned, encrypted snapshot: keeps the evidence available for later audits.
   dossierContext: z.custom<SavDossierContext>((value) => !!value && typeof value === "object" && "version" in value && value.version === 1).optional(),
 }).strict();
@@ -40,7 +55,7 @@ export function buildSavStructuredProposal(input: { subject: string; body: strin
   if (analysis.proposal.requiresHumanApproval || routing.kind === "review") process.push({ kind: "human_review", label: analysis.proposal.explanation, sourceIds: [] });
   if (support && routing.kind === "new") process.push({ kind: "create_ticket", label: "Vérifier la proposition, puis créer le ticket HubSpot par un clic humain séparé.", sourceIds: [] });
   if (support && routing.kind === "matched") process.push({ kind: "link_ticket", label: `Vérifier le rattachement au ticket HubSpot ${routing.ticketId} avant toute action.`, sourceIds: [routing.ticketId] });
-  if (analysis.replyDraft && !analysis.diagnostics?.length && analysis.proposal.reasonCode !== "agent_runtime_degraded") {
+  if (analysis.replyDraft && (!analysis.replyAssessment || analysis.replyAssessment.kind === "contextualized") && !analysis.diagnostics?.length && analysis.proposal.reasonCode !== "agent_runtime_degraded") {
     for (const source of analysis.evidence.filter((item) => item.sourceType === "knowledge" && item.excerpt)) {
       process.push({ kind: "product_step", label: source.excerpt!, sourceIds: [source.sourceId] });
     }
@@ -55,6 +70,8 @@ export function buildSavStructuredProposal(input: { subject: string; body: strin
     sources: analysis.evidence.map((source: SavDecisionEvidence) => ({ sourceType: source.sourceType, sourceId: source.sourceId, contentVersionId: source.contentVersionId, title: source.title, claim: source.claim, excerpt: source.excerpt })),
     knowledgeRevision: analysis.knowledgeRevision ?? "not_consulted", model: analysis.model, identityCandidates: analysis.identityCandidates ?? [],
     ...(input.messageContext ? { messageContext: input.messageContext } : {}),
+    ...(analysis.understanding ? { understanding: analysis.understanding } : {}),
+    ...(analysis.replyAssessment ? { replyAssessment: analysis.replyAssessment } : {}),
     ...(input.dossierContext ? { dossierContext: input.dossierContext } : {}),
   });
 }

@@ -1,30 +1,6 @@
 import { articleMetadataSchema, assertSafeMarkdown } from "../content";
 import type { KnowledgeSearchResult } from "../search";
-import { hasSavCustomerOrOperationalRequest, savActiveSubject, savNonSupportIntent, splitSavMessageText } from "./message-context";
-import { deterministicDecision, isSavCancellationRequest, type SavClassificationInput } from "./policy";
 import { cleanSavModelDraft } from "./reply-format";
-
-/** Applicability is determined from the current request, not a historical quote or a CRM contact label. */
-export function isSavLeadProductInquiry(input: SavClassificationInput) {
-  const current = splitSavMessageText(input.body).currentText;
-  if (!current || current.length > 12_000) return false;
-  const nonSupport = savNonSupportIntent(input);
-  if (nonSupport && nonSupport !== "presales") return false;
-  const decision = deterministicDecision(input);
-  if (!["presales_review", "new_customer_support_request", "ambiguous_inbound_message", "finance_human_only"].includes(decision.reasonCode)) return false;
-  if (isSavCancellationRequest(input)) return false;
-  if (hasSavCustomerOrOperationalRequest(input)) return false;
-  const text = `${savActiveSubject(input)}\n${current}`.normalize("NFKD").replace(/\p{M}/gu, "").toLowerCase();
-  // Existing account usage, financial operations and mixed requests require their own human qualification.
-  if (/\b(?:support|sav|bug\w*|erreur\w*|error\w*|probleme\w*|problem\w*|bloqu\w*|broken|connexion|login|factur\w*|invoic\w*|rembours\w*|refund\w*|prelev\w*|debit\w*|paiement\w*|payment\w*|paid|paye\w*|solde|balance|recharg\w*|chargeback|iban|rib|tva|vat|bancaire|bank|pirat\w*|fraud\w*|rgpd|gdpr|avocat|lawyer|securite|security|password|mot de passe|api key|secret|urgent|urgence|critical)\b|(?:ne|n['’]).{0,40}(?:pas|plus)|not working|doesn['’]?t work/.test(text)) return false;
-  const body = current.normalize("NFKD").replace(/\p{M}/gu, "").toLowerCase();
-  // A financial classification is eligible only for an explicit product price inquiry,
-  // after excluding financial operations above. Generic "information" never overrides it.
-  if (decision.reasonCode === "finance_human_only" && !/\b(?:tarifs?|prix|pricing|prices?|couts?|costs?)\b/.test(body)) return false;
-  const product = /\b(?:limova|produits?|products?|offres?|offering|solution|services?)\b/.test(body);
-  const discovery = /\b(?:informations?|renseignements?|en savoir plus|decouvrir|interesse|interested|learn more|more info|details|demonstration|demo|devis|quotation|quote|tarifs?|prix|pricing|prices?|couts?|costs?)\b/.test(body);
-  return discovery && (product || nonSupport === "presales");
-}
 
 export function assertSavUnsignedTemplate(template: string) {
   const plainLines = template.split(/\r?\n/).map(line => line.replace(/^[\s*_>#-]+|[\s*_]+$/g, "").trim());

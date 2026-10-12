@@ -5,6 +5,7 @@ import { activeKnowledge, knowledgeRevisions, savActions, savAgentRuns, savDecis
 import { activateSavV0Cutover } from "./cutover";
 import { decryptSavPayload, encryptSavPayload, savContentHash } from "./crypto";
 import { renderSavOutboundReply, SAV_REPLY_FORMAT_REVISION, savReplyFooter } from "./reply-format";
+import { understandingFixture } from "../../../test/sav-understanding-fixtures";
 import {v0Proposal} from "../../../test/sav-v0-review-fixture";
 import {loadSavDraftContext,reviewSavDraft} from "./draft-verdicts";
 import {savDraftVerdicts} from "@/db/schema";
@@ -104,6 +105,16 @@ describe("V0 human-only reply in the original Gmail thread", () => {
     const action = await queueSavManualReply({ threadId, draftId }, "ugo@limova.ai");
     expect(decryptSavPayload<{ text: string }>(String(action.payload.outboundBodyCiphertext)).text).toBe(renderSavOutboundReply(input.text, "en"));
     expect(action.payload.replyFormatRevision).toBe(SAV_REPLY_FORMAT_REVISION);
+    expect(network).not.toHaveBeenCalled();
+  });
+  it("uses the reviewed semantic language for the send footer", async () => {
+    const [run] = await fixture.db.select().from(savAgentRuns);
+    const proposal = { ...v0Proposal(input.text), understanding: understandingFixture({ language: "en" }) };
+    await fixture.db.update(savAgentRuns).set({ proposalCiphertext: encryptSavPayload(proposal) }).where(eq(savAgentRuns.id, run.id));
+    await acceptCurrent();
+    const action = await queueSavManualReply({ threadId, draftId }, "ugo@limova.ai");
+    expect(decryptSavPayload<{ text: string }>(String(action.payload.outboundBodyCiphertext)).text).toBe(renderSavOutboundReply(input.text, "en"));
+    await expect(assertSavCurrentManualReply(action)).resolves.toHaveProperty("outboundText", renderSavOutboundReply(input.text, "en"));
     expect(network).not.toHaveBeenCalled();
   });
   it("rejects an altered final body even if its hash was replaced too", async () => {

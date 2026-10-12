@@ -72,7 +72,7 @@ function reviewFixture(approved = false): ProposalReviewData {
     expectedReviewId: approved?reviewId:null, draftHash:"x".repeat(43), draftVerdict:null,historicalReview:null,
     review: approved ? { scope:"dossier", id: reviewId, status: "approved", verdict: "correct",
       dimensions: { classification: "correct", routing: "correct", grounding: "correct", tone: "correct", escalation: "correct" },
-      reviewedBy: "ugo@limova.ai", reviewedAt: now, comment: "Process vérifié par un humain.", reusability: "none" } : null,
+      reviewedBy: "ugo@limova.ai", reviewedAt: now, reasons: [], comment: "Process vérifié par un humain.", reusability: "none" } : null,
   };
 }
 
