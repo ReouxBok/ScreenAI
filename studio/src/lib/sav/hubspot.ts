@@ -27,6 +27,7 @@ import { autoReplyMinConfidence, canSendRepliesAutomatically, savAutoReplyCatego
 import { assertSavTicketStageNotClosed, normalizeEmailAddress } from "./policy";
 import { isSavAiAuthoredReply } from "./reply-format";
 import { getSavAutonomyGate } from "./promotion";
+import { savTicketReturnPlan, sortSavTicketsNewestFirst, type SavLifecycleTicket } from "./ticket-lifecycle";
 import { selectSavTicketMatch } from "./ticket-routing";
 import { extractSavLearningResolution, isHubspotOutboundDirection } from "./learning-extraction";
 import { savActionFailurePlan } from "./retry-policy";
@@ -254,6 +255,56 @@ async function guardedHubspotWrite<T>(actionId: string, path: string, init: Requ
   return hubspotFetch<T>(path, init);
 }
 
+function escapeSavNoteHtml(value: string) {
+  return value.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&#39;");
+}
+
+/** Two writes form a supervised operation. Unknown/partial results require human reconciliation;
+ * they are never replayed as another note. Every write retains the live V0 authorization guard. */
+async function reactivateSavTicketForReturn(action: typeof savActions.$inferSelect, ticketId: string, contactId: string, expectedStage: string | null | undefined, expectedClosedAt: string | null | undefined, message: typeof savMessages.$inferSelect, mailboxEmail: string, gmailThreadId: string) {
+  const body = decryptSavPayload<SavMessageBody>(message.bodyCiphertext);
+  const note = `Le client est revenu sur le même sujet. Retour reçu le ${message.receivedAt.toISOString()}.\nDe : ${message.fromEmail}\nObjet : ${message.subject}\nEmail source : ${message.gmailMessageId}\n\n${body.text}`;
+  const html = `<p>${escapeSavNoteHtml(note).replace(/\n/g, "<br>")}</p>`;
+  if (html.length > 60_000) throw new Error("SAV_TICKET_RETURN_EMAIL_TOO_LARGE");
+  const checkTarget = async () => {
+    const target = await hubspotFetch<HubspotRecord>(`/crm/v3/objects/tickets/${encodeURIComponent(ticketId)}?properties=hs_pipeline,hs_pipeline_stage,hs_last_closed_date,closed_date&associations=contacts`);
+    if (target.properties.hs_pipeline !== SAV_HUBSPOT_SUPPORT.pipelineId || target.properties.hs_pipeline_stage !== expectedStage
+      || (target.properties.hs_last_closed_date || target.properties.closed_date || null) !== (expectedClosedAt ?? null)
+      || !target.associations?.contacts?.results?.some(contact => contact.id === contactId)) throw new Error("SAV_TICKET_RETURN_CONTEXT_CHANGED");
+  };
+  await checkTarget();
+  const associations = await hubspotFetch<{ results: Array<{ category: string; typeId: number; label: string | null }> }>("/crm/v4/associations/notes/tickets/labels");
+  const association = associations.results.find(type => type.category === "HUBSPOT_DEFINED" && type.label === null);
+  if (!association) throw new Error("SAV_TICKET_RETURN_ASSOCIATION_INVALID");
+  await assertSavGmailThreadCurrent(mailboxEmail, gmailThreadId, message.gmailMessageId!);
+  await assertSavWriteAllowed(action.id);
+  const db = requireDb();
+  const [claimed] = await db.update(savActions).set({ payload: sql`${savActions.payload} || ${JSON.stringify({ ticketReturnDispatchedAt: new Date().toISOString(), ticketReturnRequestCiphertext: encryptSavPayload({ ticketId, contactId, html }) })}::jsonb`, updatedAt: new Date() })
+    .where(and(eq(savActions.id, action.id), eq(savActions.status, "running"), sql`${savActions.payload}->>'ticketReturnDispatchedAt' is null`)).returning();
+  if (!claimed) throw new Error("SAV_TICKET_RETURN_RECONCILIATION_REQUIRED");
+  let noteAcknowledged = false;
+  try {
+    const noteResult = await guardedHubspotWrite<HubspotRecord>(action.id, "/crm/v3/objects/notes", { method: "POST", body: JSON.stringify({
+      properties: { hs_timestamp: message.receivedAt.toISOString(), hs_note_body: html },
+      associations: [{ to: { id: ticketId }, types: [{ associationCategory: "HUBSPOT_DEFINED", associationTypeId: association.typeId }] }],
+    }) });
+    if (!noteResult?.id) throw new Error("SAV_TICKET_RETURN_RECONCILIATION_REQUIRED");
+    noteAcknowledged = true;
+    await db.update(savActions).set({ payload: sql`${savActions.payload} || ${JSON.stringify({ ticketReturnNoteId: noteResult.id })}::jsonb` }).where(eq(savActions.id, action.id));
+    await assertSavGmailThreadCurrent(mailboxEmail, gmailThreadId, message.gmailMessageId!);
+    await checkTarget();
+    await guardedHubspotWrite(action.id, `/crm/v3/objects/tickets/${encodeURIComponent(ticketId)}`, { method: "PATCH", body: JSON.stringify({ properties: { hs_pipeline_stage: SAV_HUBSPOT_SUPPORT.stages.new } }) });
+    await db.update(savActions).set({ payload: sql`${savActions.payload} || ${JSON.stringify({ ticketReturnCompletedAt: new Date().toISOString(), hubspotTicketId: ticketId })}::jsonb`, updatedAt: new Date() }).where(eq(savActions.id, action.id));
+  } catch (error) {
+    const code = error instanceof Error ? error.message : "UNKNOWN_ERROR";
+    if (!noteAcknowledged && /^HUBSPOT_HTTP_(?:400|401|403|404|405|409|422|429)(?::|$)/.test(code)) {
+      await db.update(savActions).set({ payload: sql`${savActions.payload} - 'ticketReturnDispatchedAt'` }).where(eq(savActions.id, action.id));
+      throw error;
+    }
+    throw new Error("SAV_TICKET_RETURN_RECONCILIATION_REQUIRED");
+  }
+}
+
 async function finalizeSavV0TicketAction(action: typeof savActions.$inferSelect) {
   const { thread, latest } = await assertSavWriteAllowed(action.id);
   const review = await assertSavCurrentTicketReview(action);
@@ -261,6 +312,8 @@ async function finalizeSavV0TicketAction(action: typeof savActions.$inferSelect)
   if (!latest?.gmailMessageId) throw new Error("SAV_GMAIL_MESSAGE_ID_REQUIRED");
   const [mailbox] = await requireDb().select().from(savMailboxes).where(eq(savMailboxes.id, latest.mailboxId)).limit(1);
   if (!mailbox) throw new Error("SAV_MAILBOX_NOT_FOUND");
+  const returnRequest = action.payload.ticketReturn ? z.object({ ticketId: z.string(), operation: z.enum(["keep", "reactivate", "create"]), stageId: z.string().nullish(), closedAt: z.string().nullish() }).parse(action.payload.ticketReturn) : null;
+  if (action.payload.ticketReturnDispatchedAt && !action.payload.ticketReturnCompletedAt) throw new Error("SAV_TICKET_RETURN_RECONCILIATION_REQUIRED");
   const knownTicketId = typeof action.payload.hubspotTicketId === "string" ? action.payload.hubspotTicketId : null;
   if (!knownTicketId && action.payload.ticketCreateDispatchedAt) throw new Error("SAV_MANUAL_RECONCILIATION_REQUIRED");
   assertSavSupportConfiguration(process.env);
@@ -273,17 +326,25 @@ async function finalizeSavV0TicketAction(action: typeof savActions.$inferSelect)
   } else {
     await assertSavGmailThreadCurrent(mailbox.email, thread.gmailThreadId, latest.gmailMessageId);
     const customerEmail = proposal.customerIdentity.verifiedByHuman && proposal.customerIdentity.registrationEmail ? proposal.customerIdentity.registrationEmail : thread.customerEmail;
-    const context = await readSavHubspotContext({ email: customerEmail, subject: latest.subject, currentTicketId: thread.hubspotTicketId });
+    const context = await readSavHubspotContext({ email: customerEmail, subject: latest.subject, returnedAt: latest.receivedAt, currentTicketId: thread.hubspotTicketId });
     if (!context.contactId) throw new Error("SAV_HUBSPOT_CONTACT_REQUIRED");
+    const returnTarget = returnRequest ? context.tickets.find(value => value.id === returnRequest.ticketId) : null;
+    if (returnRequest && (!returnTarget || context.routing.kind !== "matched" || context.routing.ticketId !== returnTarget.id
+      || returnTarget.stageId !== returnRequest.stageId || returnTarget.closedAt !== returnRequest.closedAt
+      || savTicketReturnPlan(returnTarget, latest.receivedAt).operation !== returnRequest.operation)) throw new Error("SAV_TICKET_RETURN_CONTEXT_CHANGED");
     if (action.kind === "link_ticket") {
-      const selected = context.tickets.find((value) => value.id === action.payload.ticketId && value.status === "open");
+      if (returnRequest?.operation === "create") throw new Error("SAV_LINK_TARGET_INVALID");
+      const selected = context.tickets.find((value) => value.id === action.payload.ticketId && (value.status === "open" || returnRequest?.operation === "reactivate"));
       if (!selected) throw new Error("SAV_LINK_TARGET_INVALID");
       ticket = { id: selected.id, properties: { subject: selected.subject, hs_pipeline: selected.pipelineId || SAV_HUBSPOT_SUPPORT.pipelineId } };
-      // Record the explicit link locally; no remote ticket or email is changed.
+      if (returnRequest?.operation === "reactivate") {
+        await reactivateSavTicketForReturn(action, selected.id, context.contactId, returnRequest.stageId, returnRequest.closedAt, latest, mailbox.email, thread.gmailThreadId);
+      }
+      // A plain link (including a ticket already New) never changes the CRM.
     } else {
-      if (context.routing.kind === "matched" || context.routing.kind === "ambiguous") throw new Error("SAV_EXISTING_TICKET_REQUIRES_LINK");
+      if (context.routing.kind === "ambiguous" || context.routing.kind === "matched" && returnRequest?.operation !== "create") throw new Error("SAV_EXISTING_TICKET_REQUIRES_LINK");
       const distinctIssueReason = typeof action.payload.distinctIssueReasonCiphertext === "string" ? decryptSavPayload<{ text: string }>(action.payload.distinctIssueReasonCiphertext).text : "";
-      if (context.tickets.some((value) => value.status === "open") && distinctIssueReason.trim().length < 20) throw new Error("SAV_DISTINCT_ISSUE_CONFIRMATION_REQUIRED");
+      if (!returnRequest && context.tickets.some((value) => value.status === "open") && distinctIssueReason.trim().length < 20) throw new Error("SAV_DISTINCT_ISSUE_CONFIRMATION_REQUIRED");
       await assertSavWriteAllowed(action.id);
       await assertSavGmailThreadCurrent(mailbox.email, thread.gmailThreadId, latest.gmailMessageId);
       const properties = savSupportTicketProperties({ title: proposal.ticket.title, description: proposal.ticket.description });
@@ -314,13 +375,42 @@ async function finalizeSavV0TicketAction(action: typeof savActions.$inferSelect)
   await requireDb().transaction(async (tx) => {
     await tx.select().from(savThreads).where(eq(savThreads.id, thread.id)).for("update");
     const [current] = await tx.select().from(savThreads).where(eq(savThreads.id, thread.id));
-    if (current?.hubspotTicketId && current.hubspotTicketId !== ticket.id) throw new Error("SAV_MANUAL_RECONCILIATION_REQUIRED");
+    if (current?.hubspotTicketId && current.hubspotTicketId !== ticket.id
+      && !(returnRequest?.operation === "create" && current.hubspotTicketId === action.payload.previousTicketId && current.hubspotTicketId === returnRequest.ticketId)) throw new Error("SAV_MANUAL_RECONCILIATION_REQUIRED");
     await tx.update(savThreads).set({ hubspotTicketId: ticket.id, updatedAt: new Date() }).where(eq(savThreads.id, thread.id));
     await tx.update(savActions).set({ status: "succeeded", errorCode: null, executedAt: new Date(), updatedAt: new Date(), payload: sql`${savActions.payload} || ${JSON.stringify({ hubspotTicketId: ticket.id })}::jsonb` }).where(eq(savActions.id, action.id));
     await tx.insert(auditLogs).values({ actorEmail: action.actorEmail || "system", action: "sav_manual_ticket_completed", entityType: "sav_action", entityId: action.id, technicalMetadata: { ticketId: ticket.id, kind: action.kind, reviewId: review.id, messageId: latest.id } });
-    // No reply, note, email log or status change is queued by this V0 action.
+    // No reply is queued. Only an explicitly confirmed return may add a note and reopen.
   });
   return ticket;
+}
+
+/** Read-only reconciliation: never repeat a note or patch with an unknown outcome. */
+export async function reconcileSavTicketReturn(actionId: string, noteId: string, actorEmail: string) {
+  assertSavActor(actorEmail);
+  if (!/^\d{1,30}$/.test(noteId)) throw new Error("SAV_RECONCILIATION_CONFIRMATION_REQUIRED");
+  const db = requireDb();
+  const [action] = await db.select().from(savActions).where(eq(savActions.id, actionId));
+  if (!action || action.kind !== "link_ticket" || action.status !== "failed" || typeof action.payload.ticketReturnRequestCiphertext !== "string" || !action.payload.ticketReturnDispatchedAt) throw new Error("SAV_ACTION_NOT_RECONCILABLE");
+  const request = decryptSavPayload<{ ticketId: string; contactId: string; html: string }>(action.payload.ticketReturnRequestCiphertext);
+  const [ticket, note] = await Promise.all([
+    hubspotFetch<HubspotRecord>(`/crm/v3/objects/tickets/${encodeURIComponent(request.ticketId)}?properties=hs_pipeline,hs_pipeline_stage&associations=contacts`),
+    hubspotFetch<HubspotRecord>(`/crm/v3/objects/notes/${encodeURIComponent(noteId)}?properties=hs_note_body&associations=tickets`),
+  ]);
+  const normalizeHtml = (html: string) => html.replace(/<br\s*\/?>/gi, "\n").replace(/<\/?p>/gi, "").replace(/\r\n/g, "\n").trim();
+  if (ticket.properties.hs_pipeline !== SAV_HUBSPOT_SUPPORT.pipelineId || ticket.properties.hs_pipeline_stage !== SAV_HUBSPOT_SUPPORT.stages.new
+    || !ticket.associations?.contacts?.results?.some(value => value.id === request.contactId)
+    || !note.associations?.tickets?.results?.some(value => value.id === request.ticketId)
+    || normalizeHtml(String(note.properties.hs_note_body ?? "")) !== normalizeHtml(request.html)) throw new Error("SAV_RECONCILIATION_TARGET_INVALID");
+  return db.transaction(async tx => {
+    const [thread] = await tx.select().from(savThreads).where(eq(savThreads.id, action.threadId)).for("update");
+    const [current] = await tx.select().from(savActions).where(eq(savActions.id, action.id)).for("update");
+    if (!thread || current?.status !== "failed" || (thread.hubspotTicketId && thread.hubspotTicketId !== request.ticketId)) throw new Error("SAV_RECONCILIATION_TARGET_INVALID");
+    await tx.update(savThreads).set({ hubspotTicketId: request.ticketId, updatedAt: new Date() }).where(eq(savThreads.id, thread.id));
+    await tx.update(savActions).set({ status: "succeeded", errorCode: null, executedAt: new Date(), updatedAt: new Date(),
+      payload: sql`${savActions.payload} || ${JSON.stringify({ ticketReturnCompletedAt: new Date().toISOString(), ticketReturnNoteId: noteId, hubspotTicketId: request.ticketId, ticketReturnReconciledBy: actorEmail })}::jsonb` }).where(eq(savActions.id, action.id));
+    await tx.insert(auditLogs).values({ actorEmail, action: "sav_ticket_return_reconciled", entityType: "sav_action", entityId: action.id, technicalMetadata: { ticketId: request.ticketId, noteId } });
+  });
 }
 
 /** Reconcile an uncertain create via reads and an explicit human confirmation.
@@ -365,7 +455,7 @@ export async function reconcileSavManualTicket(actionId: string, ticketId: strin
     await tx.select().from(savThreads).where(eq(savThreads.id, thread.id)).for("update");
     const [current] = await tx.select().from(savActions).where(eq(savActions.id, action.id)).for("update");
     const [currentThread] = await tx.select().from(savThreads).where(eq(savThreads.id, thread.id));
-    if (!current || (current.payload.hubspotTicketId && current.payload.hubspotTicketId !== ticketId) || (currentThread?.hubspotTicketId && currentThread.hubspotTicketId !== ticketId)) throw new Error("SAV_RECONCILIATION_TARGET_INVALID");
+    if (!current || (current.payload.hubspotTicketId && current.payload.hubspotTicketId !== ticketId) || (currentThread?.hubspotTicketId && currentThread.hubspotTicketId !== ticketId && !(action.payload.ticketReturn && currentThread.hubspotTicketId === action.payload.previousTicketId))) throw new Error("SAV_RECONCILIATION_TARGET_INVALID");
     if (current.status === "succeeded") return current;
     const [updated] = await tx.update(savActions).set({ status: "succeeded", executedAt: new Date(), updatedAt: new Date(), errorCode: null,
       payload: { ...current.payload, hubspotTicketId: ticketId, reconciledBy: actorEmail, reconciledAt: new Date().toISOString() } }).where(eq(savActions.id, current.id)).returning();
@@ -442,7 +532,7 @@ export async function findSavContactCandidates(hints: SavIdentityHints): Promise
   return [...candidates.values()].slice(0, 10);
 }
 
-export async function readSavHubspotContext(input: { email: string; subject: string; currentTicketId?: string | null; identityHints?: SavIdentityHints; toleratePartial?: boolean }) {
+export async function readSavHubspotContext(input: { email: string; subject: string; currentTicketId?: string | null; returnedAt?: Date | string; identityHints?: SavIdentityHints; toleratePartial?: boolean }) {
   const contact = await findContactByEmail(input.email);
   let identityCandidates: SavIdentityCandidate[] = [];
   try {
@@ -450,33 +540,37 @@ export async function readSavHubspotContext(input: { email: string; subject: str
     let linkedTicket: HubspotRecord | null = null;
     if (input.currentTicketId) {
       try {
-        linkedTicket = await hubspotFetch<HubspotRecord>(`/crm/v3/objects/tickets/${encodeURIComponent(input.currentTicketId)}?properties=subject,hs_pipeline,hs_pipeline_stage,hs_lastmodifieddate`);
+        linkedTicket = await hubspotFetch<HubspotRecord>(`/crm/v3/objects/tickets/${encodeURIComponent(input.currentTicketId)}?properties=subject,hs_pipeline,hs_pipeline_stage,hs_lastmodifieddate,hs_last_closed_date,closed_date&associations=contacts`);
       } catch (error) {
         if (!/HUBSPOT_HTTP_404/.test(error instanceof Error ? error.message : "")) throw error;
       }
     }
-    const response = contact ? await hubspotFetch<{ results?: HubspotRecord[] }>("/crm/v3/objects/tickets/search", {
+    const response = contact ? await hubspotFetch<{ results?: HubspotRecord[]; paging?: { next?: unknown } }>("/crm/v3/objects/tickets/search", {
         method: "POST",
         body: JSON.stringify({
           filterGroups: [{ filters: [{ propertyName: "associations.contact", operator: "EQ", value: contact.id }] }],
-          properties: ["subject", "content", "hs_pipeline", "hs_pipeline_stage", "hs_lastmodifieddate"],
-          sorts: ["-hs_lastmodifieddate"],
-          limit: 20,
+          properties: ["subject", "content", "hs_pipeline", "hs_pipeline_stage", "hs_lastmodifieddate", "createdate", "hs_last_closed_date", "closed_date"],
+          sorts: ["-createdate"],
+          limit: 100,
         }),
       }) : { results: [] };
+    if ("paging" in response && response.paging?.next) throw new Error("SAV_HUBSPOT_TICKETS_TRUNCATED");
+    if (linkedTicket && !linkedTicket.associations?.contacts?.results?.some(row => row.id === contact?.id)) linkedTicket = null;
     const closed = await closedTicketStages();
     const records = [...(linkedTicket ? [linkedTicket] : []), ...(response.results ?? []).filter((ticket) => ticket.id !== linkedTicket?.id)]
       .filter((ticket) => String(ticket.properties.hs_pipeline) === SAV_HUBSPOT_SUPPORT.pipelineId);
-    const tickets = records.slice(0, 20).map((ticket) => ({
+    const tickets = sortSavTicketsNewestFirst(records.map((ticket): SavLifecycleTicket & { subject: string; description: string; pipelineId: string | null; stageId: string | null; updatedAt: string | null } => ({
       id: ticket.id,
       subject: String(ticket.properties.subject || "Sans objet").slice(0, 500),
       description: String(ticket.properties.content || "").slice(0, 2_500),
       pipelineId: ticket.properties.hs_pipeline,
       stageId: ticket.properties.hs_pipeline_stage,
       status: closed.has(String(ticket.properties.hs_pipeline_stage || "")) ? "closed" as const : "open" as const,
+      createdAt: ticket.createdAt ?? ticket.properties.createdate ?? null,
+      closedAt: ticket.properties.hs_last_closed_date || ticket.properties.closed_date || null,
       updatedAt: ticket.properties.hs_lastmodifieddate || ticket.updatedAt || null,
-    }));
-    const routing = selectSavTicketMatch({ subject: input.subject, candidates: tickets, currentTicketId: input.currentTicketId });
+    })));
+    const routing = selectSavTicketMatch({ subject: input.subject, candidates: tickets, currentTicketId: input.currentTicketId, includeClosed: true });
     return {
       errorCode: null as string | null,
       contactFound: Boolean(contact),
@@ -484,7 +578,7 @@ export async function readSavHubspotContext(input: { email: string; subject: str
       identityCandidates,
       tickets,
       routing: routing.kind === "matched"
-        ? { kind: routing.kind, ticketId: routing.ticket.id, reason: routing.reason }
+        ? { kind: routing.kind, ticketId: routing.ticket.id, reason: routing.reason, returnOperation: savTicketReturnPlan(tickets.find(ticket => ticket.id === routing.ticket.id)!, input.returnedAt ?? new Date()).operation }
         : { kind: routing.kind, reason: routing.reason, candidateIds: routing.kind === "ambiguous" ? routing.candidates.map((ticket) => ticket.id) : [] },
     };
   } catch (error) {

@@ -40,7 +40,7 @@ describe("SAV semantic server policy", () => {
   });
   it("keeps every mixed request while restricting financial content", () => {
     const u = understandingFixture(); u.requests.push({ ...u.requests[0], id: "refund", summary: "Demander le remboursement.", nature: "financial_operation", financialScope: "support_account" });
-    expect(savSemanticPlan(u)).toMatchObject({ category: "technical", replyPolicy: "finance_standard", requiresHuman: true });
+    expect(savSemanticPlan(u)).toMatchObject({ category: "technical", replyPolicy: "none", requiresHuman: true });
     expect(savSemanticPlan(u).retrievalQuery).toContain("remboursement");
     u.requests.push({ ...u.requests[0], id: "cancel", nature: "cancellation" });
     expect(savSemanticPlan(u)).toMatchObject({ replyPolicy: "none", reasonCode: "cancellation_human_only" });
@@ -56,7 +56,7 @@ describe("SAV semantic server policy", () => {
   });
   it.each(["human_request", "callback", "security", "privacy", "data_deletion", "legal"] as const)("retains review for %s without erasing the draft policy", nature => {
     const u = understandingFixture(); u.requests[0].nature = nature;
-    expect(savSemanticPlan(u)).toMatchObject({ replyPolicy: "compose", requiresHuman: true });
+    expect(savSemanticPlan(u)).toMatchObject({ replyPolicy: nature === "legal" ? "none" : "compose", requiresHuman: true });
   });
 });
 

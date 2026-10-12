@@ -22,10 +22,10 @@ export function DraftReview({ data, threadId, messageId, drafts, sendAllowed, se
     return <section className={`card ${styles.review} ${styles.draft}`} aria-labelledby="draft-review-title">
   <header><span className="eyebrow">Brouillon IA · lecture seule</span><h2 id="draft-review-title">Verdict du brouillon</h2></header>
   <p role="status">{notApplicable ? "Non applicable : aucun brouillon à accepter ou envoyer." : verdict?.stale ? "Contexte ou texte modifié : nouvelle lecture nécessaire." : accepted ? "Brouillon accepté · envoi distinct à confirmer." : verdict?.status === "rejected" ? "Brouillon refusé · traitement humain à observer." : "Brouillon à relire."}</p>
-  {origin && <p>{originLabels[origin] ?? "Origine de la réponse à vérifier."}</p>}
+  {origin && !notApplicable && <p>{originLabels[origin] ?? "Origine de la réponse à vérifier."}</p>}
   {data.proposal.replyAssessment?.coherence?.status === "unavailable" && <p role="status">Contrôle de cohérence indisponible : le brouillon contextualisé n’a pas été retenu.</p>}
   {data.proposal.replyAssessment?.coherence?.status === "rejected" && <p role="status">Le contrôle de cohérence a refusé le brouillon contextualisé. La proposition affichée demande une reprise humaine.</p>}
-  <pre>{data.proposal.replyDraft ?? "Aucun brouillon."}</pre>
+  <pre>{notApplicable ? "Aucun brouillon autorisé pour cette demande. Traitement humain via le ticket." : data.proposal.replyDraft}</pre>
   {!notApplicable && <form action={reviewDraftAction} key={verdict?.id ?? "new"}>
    <input type="hidden" name="threadId" value={threadId}/><input type="hidden" name="messageId" value={messageId}/><input type="hidden" name="decisionId" value={data.decisionId}/><input type="hidden" name="agentRunId" value={data.agentRunId}/><input type="hidden" name="sourceHash" value={data.draftHash}/><input type="hidden" name="verdictId" value={verdict?.id ?? ""}/>
    <label>Motif du refus (facultatif)<textarea name="reason" maxLength={500} defaultValue={verdict?.status === "rejected" ? verdict.reason : ""}/></label>

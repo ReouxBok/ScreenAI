@@ -65,7 +65,7 @@ export async function collectSavDossierContext(messageId: string): Promise<SavDo
   const body = decryptSavPayload<{ text: string; headers?: Record<string, string> }>(message.bodyCiphertext);
   const parts = splitSavMessageText(body.text);
   const [crm, conversation, others] = await Promise.allSettled([
-    readSavHubspotContext({ email: message.fromEmail, subject: message.subject,
+    readSavHubspotContext({ email: message.fromEmail, subject: message.subject, returnedAt: message.receivedAt,
       currentTicketId: thread?.customerEmail.toLowerCase() === message.fromEmail.toLowerCase() ? thread.hubspotTicketId : undefined,
       identityHints: extractSavIdentityHints([parts.currentText, parts.signatureText].filter(Boolean).join("\n"), body.headers?.["from-display-name"]), toleratePartial: true }),
     loadSavConversation(messageId), otherConversations(message),

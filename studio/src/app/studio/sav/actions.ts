@@ -1,5 +1,7 @@
 "use server";
 
+import { reconcileSavTicketReturn } from "@/lib/sav/hubspot";
+
 import { revalidatePath } from "next/cache";
 import { redirect } from "next/navigation";
 import { start } from "workflow/api";
@@ -150,7 +152,7 @@ export async function createTicketAction(form: FormData) {
   const staff = await requireApiStaff("admin");
   const threadId = id(form, "threadId");
   let errorCode = "";
-  try { await queueSavManualTicket({ threadId, reviewId: id(form, "reviewId"), kind: "create_ticket", distinctIssueReason: String(form.get("distinctIssueReason") || "") }, staff.email); }
+  try { await queueSavManualTicket({ threadId, reviewId: id(form, "reviewId"), kind: "create_ticket", ticketId: String(form.get("ticketId") || "") || undefined, returnOperation: String(form.get("returnOperation") || "") || undefined, distinctIssueReason: String(form.get("distinctIssueReason") || "") }, staff.email); }
   catch (error) { errorCode = error instanceof Error && /^[A-Z][A-Z_]+$/.test(error.message) ? error.message : "SAV_MANUAL_TICKET_INVALID"; }
   revalidatePath("/studio/sav");
   revalidatePath(`/studio/sav/${threadId}`);
@@ -161,7 +163,7 @@ export async function linkTicketAction(form: FormData) {
   const staff = await requireApiStaff("admin");
   const threadId = id(form, "threadId");
   let errorCode = "";
-  try { await queueSavManualTicket({ threadId, reviewId: id(form, "reviewId"), kind: "link_ticket", ticketId: id(form, "ticketId") }, staff.email); }
+  try { await queueSavManualTicket({ threadId, reviewId: id(form, "reviewId"), kind: "link_ticket", ticketId: id(form, "ticketId"), returnOperation: String(form.get("returnOperation") || "") || undefined }, staff.email); }
   catch (error) { errorCode = error instanceof Error && /^[A-Z][A-Z_]+$/.test(error.message) ? error.message : "SAV_MANUAL_TICKET_INVALID"; }
   revalidatePath("/studio/sav"); revalidatePath(`/studio/sav/${threadId}`);
   redirect(`/studio/sav/${encodeURIComponent(threadId)}?review=${errorCode || "ticket_queued"}`);
@@ -390,4 +392,14 @@ export async function importHubspotKnowledgeAction(form: FormData) {
   }
   revalidatePath("/studio/sav/connaissances");
   redirect(`/studio/sav/connaissances?result=${result}`);
+}
+
+export async function reconcileTicketReturnAction(form: FormData) {
+  const staff = await requireApiStaff("admin");
+  const threadId = id(form, "threadId");
+  let errorCode = "";
+  try { await reconcileSavTicketReturn(id(form, "actionId"), id(form, "noteId"), staff.email); }
+  catch (error) { errorCode = error instanceof Error && /^[A-Z][A-Z_]+$/.test(error.message) ? error.message : "SAV_RECONCILIATION_TARGET_INVALID"; }
+  revalidatePath("/studio/sav"); revalidatePath(`/studio/sav/${threadId}`);
+  redirect(`/studio/sav/${encodeURIComponent(threadId)}?review=${errorCode || "ticket_reconciled"}`);
 }
