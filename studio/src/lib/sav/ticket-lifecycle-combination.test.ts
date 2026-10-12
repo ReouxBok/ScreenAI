@@ -21,6 +21,7 @@ const proposal = savStructuredProposalSchema.parse({ schemaVersion: 1, category:
 function reviewInput(reusability = "none") {
   return { messageId, decisionId, agentRunId: runId, expectedReviewId: null, status: "approved", verdict: "partial", dimensions: { classification: "correct", routing: "correct", grounding: "partial", tone: "correct", escalation: "correct" }, comment: "Revue fictive, corriger la procédure", reusability, reusableResolution: "Ouvrez Paramètres puis Facturation. Cas client@example.com, tél 0612345678.", justification: "Parcours générique vérifié, réutilisable pour retrouver les factures", correction: { category: proposal.category, urgency: proposal.urgency, decisionKind: proposal.decision.kind, reasonCode: proposal.decision.reasonCode, explanation: proposal.decision.explanation, title: proposal.ticket.title, description: proposal.ticket.description, process: proposal.process, internalNote: "Note corrigée", replyDraft: "Brouillon corrigé, à relire" } };
 }
+let predecessorStage: string | null = null;
 let stage = "2", closedAt: string | null = null;
 let remoteNote: { id: string; properties: Record<string, string> } | null = null;
 let failure: "none" | "note_timeout" | "patch_timeout" = "none";
@@ -34,7 +35,9 @@ function mockIntegrations() {
     if (url.endsWith("/pipelines/tickets/0")) return Response.json({ id: "0", stages });
     if (url.endsWith("/pipelines/tickets")) return Response.json({ results: [{ id: "0", stages }] });
     if (url.endsWith("/contacts/search")) return Response.json({ results: [{ id: "21", properties: { email: "client@example.com" } }] });
-    if (url.endsWith("/tickets/search")) return Response.json({ results: [record()] });
+    const predecessor = () => ({ ...record(), id: "400", properties: { ...record().properties, hs_pipeline_stage: predecessorStage, hs_last_closed_date: "2026-09-01T00:00:00Z" } });
+    if (url.endsWith("/tickets/search")) return Response.json({ results: [...(predecessorStage ? [predecessor()] : []), record()] });
+    if (url.includes("/objects/tickets/400?")) return Response.json(predecessor());
     if (url.endsWith("/associations/notes/tickets/labels")) return Response.json({ results: [{ category: "HUBSPOT_DEFINED", label: null, typeId: 228 }] });
     if (url.endsWith("/objects/notes") && init?.method === "POST") {
       remoteNote = { id: "501", properties: JSON.parse(String(init.body)).properties };
@@ -59,7 +62,7 @@ beforeAll(async () => { fixture = await createSavTestDb(); state.db = fixture.db
 afterAll(async () => { await fixture?.client.close(); });
 afterEach(() => { vi.unstubAllEnvs(); vi.unstubAllGlobals(); vi.restoreAllMocks(); });
 beforeEach(async () => {
-  stage = "2"; closedAt = null; remoteNote = null; failure = "none";
+  predecessorStage = null; stage = "2"; closedAt = null; remoteNote = null; failure = "none";
   vi.spyOn(console, "info").mockImplementation(() => {});
   vi.stubEnv("SAV_RELEASE_STAGE", "v0"); vi.stubEnv("SAV_AUTOMATION_MODE", "assist"); vi.stubEnv("SAV_WRITES_DISABLED", "false"); vi.stubEnv("SAV_ENCRYPTION_KEY_V1", "test-only-sav-encryption-key-32-characters"); vi.stubEnv("HUBSPOT_ACCESS_TOKEN", "test-only");
   await fixture.client.exec("TRUNCATE sav.mailboxes CASCADE; TRUNCATE sav.sync_state; TRUNCATE active_knowledge; TRUNCATE audit_logs");
@@ -73,7 +76,7 @@ beforeEach(async () => {
 
 async function prepare(operation: "keep" | "reactivate" | "create", linked = false) {
   const network = mockIntegrations();
-  if (linked) await fixture.db.update(savThreads).set({ hubspotTicketId: "401" }).where(eq(savThreads.id, threadId));
+  if (linked) await fixture.db.update(savThreads).set({ hubspotTicketId: predecessorStage ? "400" : "401" }).where(eq(savThreads.id, threadId));
   const crm = await readSavHubspotContext({ email: "client@example.com", subject: "Connexion impossible", returnedAt: "2026-10-02T12:01:00Z" });
   await fixture.db.update(savMessages).set({ bodyCiphertext: encryptSavPayload({ text: proposal.ticket.description, supportContext: { version: 1, messageId, collectedAt: "2026-10-02T12:02:00Z", crm: { status: "ready", errorCode: null, data: crm } } }) }).where(eq(savMessages.id, messageId));
   const review = await reviewSavProposal({ ...reviewInput(), reviewScope: "dossier" }, "ugo@limova.ai");
@@ -132,4 +135,34 @@ it("refuses a newer inbound after confirmation", async () => {
   await fixture.db.insert(savMessages).values({ mailboxId: original.mailboxId, threadId, gmailMessageId: "new-inbound", direction: "inbound", fromEmail: original.fromEmail, subject: original.subject, bodyCiphertext: encryptSavPayload({ text: "Nouvelle demande" }), receivedAt: new Date("2026-10-02T13:00:00Z") });
   expect((await processPendingHubspotActions(1)).processed).toMatchObject([{ actionId: action.id, status: "failed" }]);
   expect(mutations(network)).toHaveLength(0);
+});
+
+it.each(["1", "2", "3"])("replaces the closed predecessor link with an existing successor at stage %s", async nextStage => {
+  predecessorStage = "4"; stage = nextStage;
+  const { network, action } = await prepare(stage === "1" ? "keep" : "reactivate", true);
+  expect((await processPendingHubspotActions(1)).processed).toMatchObject([{ actionId: action.id, status: "succeeded", ticketId: "401" }]);
+  expect((await fixture.db.select().from(savThreads).where(eq(savThreads.id, threadId)))[0].hubspotTicketId).toBe("401");
+  expect(mutations(network)).toHaveLength(nextStage === "1" ? 0 : 2);
+});
+it("refuses a successor if the predecessor reopens after confirmation", async () => {
+  predecessorStage = "4";
+  const { network, action } = await prepare("reactivate", true); predecessorStage = "1";
+  expect((await processPendingHubspotActions(1)).processed).toMatchObject([{ actionId: action.id, status: "failed", errorCode: "SAV_TICKET_RETURN_CONTEXT_CHANGED" }]);
+  expect(mutations(network)).toHaveLength(0);
+});
+it("does not replace a concurrently changed local link", async () => {
+  predecessorStage = "4";
+  const { network, action } = await prepare("reactivate", true);
+  await fixture.db.update(savThreads).set({ hubspotTicketId: "999" }).where(eq(savThreads.id, threadId));
+  expect((await processPendingHubspotActions(1)).processed).toMatchObject([{ actionId: action.id, status: "failed" }]);
+  expect(mutations(network)).toHaveLength(0);
+});
+it("reconciles a successor return without repeating the remote writes", async () => {
+  predecessorStage = "4";
+  const { network, action } = await prepare("reactivate", true); failure = "patch_timeout";
+  expect((await processPendingHubspotActions(1)).processed).toMatchObject([{ actionId: action.id, status: "failed", errorCode: "SAV_TICKET_RETURN_RECONCILIATION_REQUIRED" }]);
+  const count = mutations(network).length;
+  await reconcileSavTicketReturn(action.id, "501", "ugo@limova.ai");
+  expect(mutations(network)).toHaveLength(count);
+  expect((await fixture.db.select().from(savThreads).where(eq(savThreads.id, threadId)))[0].hubspotTicketId).toBe("401");
 });

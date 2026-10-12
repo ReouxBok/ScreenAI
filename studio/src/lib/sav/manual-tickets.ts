@@ -28,7 +28,7 @@ export async function queueSavManualTicket(raw: unknown, actorEmail: string) {
     const decision = c?.decision ?? legacyDecision;
     if (c && (c.review?.id !== review?.id || !["ticket_pending", "human_review_required"].includes(c.proposal.decision.kind))) throw new Error("SAV_VALIDATED_CURRENT_PROPOSAL_REQUIRED");
     if (!review || !decision || !["ticket_pending","human_review_required"].includes(savStructuredProposalSchema.parse(decryptSavPayload(review.afterCiphertext)).decision.kind)) throw new Error("SAV_VALIDATED_CURRENT_PROPOSAL_REQUIRED");
-    let ticketReturn: { ticketId: string; operation: "keep" | "reactivate" | "create"; stageId: string | null | undefined; closedAt: string | null | undefined } | undefined;
+    let ticketReturn: { ticketId: string; operation: "keep" | "reactivate" | "create"; replacesClosedTicketId?: string; stageId: string | null | undefined; closedAt: string | null | undefined } | undefined;
     if (input.returnOperation) {
       const context = decryptSavPayload<{ supportContext?: SavDossierContext }>(message.bodyCiphertext).supportContext;
       if (context?.messageId !== message.id || context.crm.status !== "ready" || !context.crm.data?.contactId) throw new Error("SAV_TICKET_RETURN_CONTEXT_CHANGED");
@@ -37,9 +37,12 @@ export async function queueSavManualTicket(raw: unknown, actorEmail: string) {
       if (match.kind !== "matched" || !selected || match.ticket.id !== selected.id) throw new Error("SAV_TICKET_RETURN_CONTEXT_CHANGED");
       const plan = savTicketReturnPlan(selected, message.receivedAt);
       if (plan.operation !== input.returnOperation || (plan.operation === "create" ? input.kind !== "create_ticket" : input.kind !== "link_ticket")) throw new Error("SAV_TICKET_RETURN_CONTEXT_CHANGED");
-      ticketReturn = { ticketId: selected.id, operation: input.returnOperation, stageId: selected.stageId, closedAt: selected.closedAt };
+      const predecessor = thread.hubspotTicketId && thread.hubspotTicketId !== selected.id
+        ? context.crm.data.tickets.find(ticket => ticket.id === thread.hubspotTicketId) : null;
+      if (thread.hubspotTicketId && thread.hubspotTicketId !== selected.id && (predecessor?.status !== "closed" || selected.status !== "open")) throw new Error("SAV_TICKET_ALREADY_LINKED");
+      ticketReturn = { ...(predecessor ? { replacesClosedTicketId: predecessor.id } : {}), ticketId: selected.id, operation: input.returnOperation, stageId: selected.stageId, closedAt: selected.closedAt };
     }
-    if (thread.hubspotTicketId && (!ticketReturn || ticketReturn.ticketId !== thread.hubspotTicketId)) throw new Error("SAV_TICKET_ALREADY_LINKED");
+    if (thread.hubspotTicketId && (!ticketReturn || (ticketReturn.ticketId !== thread.hubspotTicketId && ticketReturn.replacesClosedTicketId !== thread.hubspotTicketId))) throw new Error("SAV_TICKET_ALREADY_LINKED");
     const key = `hubspot:manual-ticket:${thread.id}:${message.id}`;
     // Serialize all intake actions for this thread, including older commands.
     const prior = await tx.select().from(savActions).where(eq(savActions.threadId, thread.id));

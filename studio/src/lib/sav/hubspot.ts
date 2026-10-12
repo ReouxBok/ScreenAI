@@ -261,12 +261,19 @@ function escapeSavNoteHtml(value: string) {
 
 /** Two writes form a supervised operation. Unknown/partial results require human reconciliation;
  * they are never replayed as another note. Every write retains the live V0 authorization guard. */
-async function reactivateSavTicketForReturn(action: typeof savActions.$inferSelect, ticketId: string, contactId: string, expectedStage: string | null | undefined, expectedClosedAt: string | null | undefined, message: typeof savMessages.$inferSelect, mailboxEmail: string, gmailThreadId: string) {
+async function reactivateSavTicketForReturn(action: typeof savActions.$inferSelect, ticketId: string, contactId: string, expectedStage: string | null | undefined, expectedClosedAt: string | null | undefined, message: typeof savMessages.$inferSelect, mailboxEmail: string, gmailThreadId: string, replacesClosedTicketId?: string) {
   const body = decryptSavPayload<SavMessageBody>(message.bodyCiphertext);
   const note = `Le client est revenu sur le même sujet. Retour reçu le ${message.receivedAt.toISOString()}.\nDe : ${message.fromEmail}\nObjet : ${message.subject}\nEmail source : ${message.gmailMessageId}\n\n${body.text}`;
   const html = `<p>${escapeSavNoteHtml(note).replace(/\n/g, "<br>")}</p>`;
   if (html.length > 60_000) throw new Error("SAV_TICKET_RETURN_EMAIL_TOO_LARGE");
   const checkTarget = async () => {
+    if (replacesClosedTicketId) {
+      const { thread } = await assertSavWriteAllowed(action.id);
+      const predecessor = await hubspotFetch<HubspotRecord>(`/crm/v3/objects/tickets/${encodeURIComponent(replacesClosedTicketId)}?properties=hs_pipeline,hs_pipeline_stage&associations=contacts`);
+      if (thread.hubspotTicketId !== replacesClosedTicketId || predecessor.properties.hs_pipeline !== SAV_HUBSPOT_SUPPORT.pipelineId
+        || predecessor.properties.hs_pipeline_stage !== SAV_HUBSPOT_SUPPORT.stages.closed
+        || !predecessor.associations?.contacts?.results?.some(contact => contact.id === contactId)) throw new Error("SAV_TICKET_RETURN_CONTEXT_CHANGED");
+    }
     const target = await hubspotFetch<HubspotRecord>(`/crm/v3/objects/tickets/${encodeURIComponent(ticketId)}?properties=hs_pipeline,hs_pipeline_stage,hs_last_closed_date,closed_date&associations=contacts`);
     if (target.properties.hs_pipeline !== SAV_HUBSPOT_SUPPORT.pipelineId || target.properties.hs_pipeline_stage !== expectedStage
       || (target.properties.hs_last_closed_date || target.properties.closed_date || null) !== (expectedClosedAt ?? null)
@@ -279,7 +286,7 @@ async function reactivateSavTicketForReturn(action: typeof savActions.$inferSele
   await assertSavGmailThreadCurrent(mailboxEmail, gmailThreadId, message.gmailMessageId!);
   await assertSavWriteAllowed(action.id);
   const db = requireDb();
-  const [claimed] = await db.update(savActions).set({ payload: sql`${savActions.payload} || ${JSON.stringify({ ticketReturnDispatchedAt: new Date().toISOString(), ticketReturnRequestCiphertext: encryptSavPayload({ ticketId, contactId, html }) })}::jsonb`, updatedAt: new Date() })
+  const [claimed] = await db.update(savActions).set({ payload: sql`${savActions.payload} || ${JSON.stringify({ ticketReturnDispatchedAt: new Date().toISOString(), ticketReturnRequestCiphertext: encryptSavPayload({ ticketId, contactId, html, replacesClosedTicketId }) })}::jsonb`, updatedAt: new Date() })
     .where(and(eq(savActions.id, action.id), eq(savActions.status, "running"), sql`${savActions.payload}->>'ticketReturnDispatchedAt' is null`)).returning();
   if (!claimed) throw new Error("SAV_TICKET_RETURN_RECONCILIATION_REQUIRED");
   let noteAcknowledged = false;
@@ -312,8 +319,9 @@ async function finalizeSavV0TicketAction(action: typeof savActions.$inferSelect)
   if (!latest?.gmailMessageId) throw new Error("SAV_GMAIL_MESSAGE_ID_REQUIRED");
   const [mailbox] = await requireDb().select().from(savMailboxes).where(eq(savMailboxes.id, latest.mailboxId)).limit(1);
   if (!mailbox) throw new Error("SAV_MAILBOX_NOT_FOUND");
-  const returnRequest = action.payload.ticketReturn ? z.object({ ticketId: z.string(), operation: z.enum(["keep", "reactivate", "create"]), stageId: z.string().nullish(), closedAt: z.string().nullish() }).parse(action.payload.ticketReturn) : null;
+  const returnRequest = action.payload.ticketReturn ? z.object({ ticketId: z.string(), operation: z.enum(["keep", "reactivate", "create"]), stageId: z.string().nullish(), closedAt: z.string().nullish(), replacesClosedTicketId: z.string().optional() }).parse(action.payload.ticketReturn) : null;
   if (action.payload.ticketReturnDispatchedAt && !action.payload.ticketReturnCompletedAt) throw new Error("SAV_TICKET_RETURN_RECONCILIATION_REQUIRED");
+  if (returnRequest?.replacesClosedTicketId && thread.hubspotTicketId !== returnRequest.replacesClosedTicketId && thread.hubspotTicketId !== action.payload.hubspotTicketId) throw new Error("SAV_TICKET_RETURN_CONTEXT_CHANGED");
   const knownTicketId = typeof action.payload.hubspotTicketId === "string" ? action.payload.hubspotTicketId : null;
   if (!knownTicketId && action.payload.ticketCreateDispatchedAt) throw new Error("SAV_MANUAL_RECONCILIATION_REQUIRED");
   assertSavSupportConfiguration(process.env);
@@ -332,13 +340,17 @@ async function finalizeSavV0TicketAction(action: typeof savActions.$inferSelect)
     if (returnRequest && (!returnTarget || context.routing.kind !== "matched" || context.routing.ticketId !== returnTarget.id
       || returnTarget.stageId !== returnRequest.stageId || returnTarget.closedAt !== returnRequest.closedAt
       || savTicketReturnPlan(returnTarget, latest.receivedAt).operation !== returnRequest.operation)) throw new Error("SAV_TICKET_RETURN_CONTEXT_CHANGED");
+    if (returnRequest?.replacesClosedTicketId && (thread.hubspotTicketId !== returnRequest.replacesClosedTicketId
+      || action.payload.previousTicketId !== returnRequest.replacesClosedTicketId
+      || context.tickets.find(value => value.id === returnRequest.replacesClosedTicketId)?.status !== "closed"
+      || returnTarget?.status !== "open")) throw new Error("SAV_TICKET_RETURN_CONTEXT_CHANGED");
     if (action.kind === "link_ticket") {
       if (returnRequest?.operation === "create") throw new Error("SAV_LINK_TARGET_INVALID");
       const selected = context.tickets.find((value) => value.id === action.payload.ticketId && (value.status === "open" || returnRequest?.operation === "reactivate"));
       if (!selected) throw new Error("SAV_LINK_TARGET_INVALID");
       ticket = { id: selected.id, properties: { subject: selected.subject, hs_pipeline: selected.pipelineId || SAV_HUBSPOT_SUPPORT.pipelineId } };
       if (returnRequest?.operation === "reactivate") {
-        await reactivateSavTicketForReturn(action, selected.id, context.contactId, returnRequest.stageId, returnRequest.closedAt, latest, mailbox.email, thread.gmailThreadId);
+        await reactivateSavTicketForReturn(action, selected.id, context.contactId, returnRequest.stageId, returnRequest.closedAt, latest, mailbox.email, thread.gmailThreadId, returnRequest.replacesClosedTicketId);
       }
       // A plain link (including a ticket already New) never changes the CRM.
     } else {
@@ -376,7 +388,8 @@ async function finalizeSavV0TicketAction(action: typeof savActions.$inferSelect)
     await tx.select().from(savThreads).where(eq(savThreads.id, thread.id)).for("update");
     const [current] = await tx.select().from(savThreads).where(eq(savThreads.id, thread.id));
     if (current?.hubspotTicketId && current.hubspotTicketId !== ticket.id
-      && !(returnRequest?.operation === "create" && current.hubspotTicketId === action.payload.previousTicketId && current.hubspotTicketId === returnRequest.ticketId)) throw new Error("SAV_MANUAL_RECONCILIATION_REQUIRED");
+      && !(returnRequest?.operation === "create" && current.hubspotTicketId === action.payload.previousTicketId && current.hubspotTicketId === returnRequest.ticketId)
+      && !(returnRequest?.replacesClosedTicketId === current.hubspotTicketId && current.hubspotTicketId === action.payload.previousTicketId && returnRequest.ticketId === ticket.id)) throw new Error("SAV_MANUAL_RECONCILIATION_REQUIRED");
     await tx.update(savThreads).set({ hubspotTicketId: ticket.id, updatedAt: new Date() }).where(eq(savThreads.id, thread.id));
     await tx.update(savActions).set({ status: "succeeded", errorCode: null, executedAt: new Date(), updatedAt: new Date(), payload: sql`${savActions.payload} || ${JSON.stringify({ hubspotTicketId: ticket.id })}::jsonb` }).where(eq(savActions.id, action.id));
     await tx.insert(auditLogs).values({ actorEmail: action.actorEmail || "system", action: "sav_manual_ticket_completed", entityType: "sav_action", entityId: action.id, technicalMetadata: { ticketId: ticket.id, kind: action.kind, reviewId: review.id, messageId: latest.id } });
@@ -392,7 +405,7 @@ export async function reconcileSavTicketReturn(actionId: string, noteId: string,
   const db = requireDb();
   const [action] = await db.select().from(savActions).where(eq(savActions.id, actionId));
   if (!action || action.kind !== "link_ticket" || action.status !== "failed" || typeof action.payload.ticketReturnRequestCiphertext !== "string" || !action.payload.ticketReturnDispatchedAt) throw new Error("SAV_ACTION_NOT_RECONCILABLE");
-  const request = decryptSavPayload<{ ticketId: string; contactId: string; html: string }>(action.payload.ticketReturnRequestCiphertext);
+  const request = decryptSavPayload<{ ticketId: string; contactId: string; html: string; replacesClosedTicketId?: string }>(action.payload.ticketReturnRequestCiphertext);
   const [ticket, note] = await Promise.all([
     hubspotFetch<HubspotRecord>(`/crm/v3/objects/tickets/${encodeURIComponent(request.ticketId)}?properties=hs_pipeline,hs_pipeline_stage&associations=contacts`),
     hubspotFetch<HubspotRecord>(`/crm/v3/objects/notes/${encodeURIComponent(noteId)}?properties=hs_note_body&associations=tickets`),
@@ -405,7 +418,7 @@ export async function reconcileSavTicketReturn(actionId: string, noteId: string,
   return db.transaction(async tx => {
     const [thread] = await tx.select().from(savThreads).where(eq(savThreads.id, action.threadId)).for("update");
     const [current] = await tx.select().from(savActions).where(eq(savActions.id, action.id)).for("update");
-    if (!thread || current?.status !== "failed" || (thread.hubspotTicketId && thread.hubspotTicketId !== request.ticketId)) throw new Error("SAV_RECONCILIATION_TARGET_INVALID");
+    if (!thread || current?.status !== "failed" || (thread.hubspotTicketId && thread.hubspotTicketId !== request.ticketId && !(thread.hubspotTicketId === request.replacesClosedTicketId && thread.hubspotTicketId === action.payload.previousTicketId))) throw new Error("SAV_RECONCILIATION_TARGET_INVALID");
     await tx.update(savThreads).set({ hubspotTicketId: request.ticketId, updatedAt: new Date() }).where(eq(savThreads.id, thread.id));
     await tx.update(savActions).set({ status: "succeeded", errorCode: null, executedAt: new Date(), updatedAt: new Date(),
       payload: sql`${savActions.payload} || ${JSON.stringify({ ticketReturnCompletedAt: new Date().toISOString(), ticketReturnNoteId: noteId, hubspotTicketId: request.ticketId, ticketReturnReconciledBy: actorEmail })}::jsonb` }).where(eq(savActions.id, action.id));
