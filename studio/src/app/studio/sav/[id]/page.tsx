@@ -10,6 +10,7 @@ import { getSavProposalReview } from "@/lib/sav/review";
 import { savAutomationMode, savReleaseStage } from "@/lib/sav/config";
 import { isSavMessageEligible } from "@/lib/sav/cutover";
 import { getSavRelatedThreads } from "@/lib/sav/thread-context";
+import { resolveSavCustomerMessage } from "@/lib/sav/forwarded-identity";
 import { savActionLabels, savToolStatusLabels, savDecisionLabels, savLabel, savRunStatusLabels, savThreadStatusLabels } from "@/lib/sav/labels";
 import { MailConversation } from "./mail-conversation";
 import { ProposalReview } from "./proposal-review";
@@ -62,23 +63,31 @@ export default async function SavThreadPage({ params, searchParams }: { params: 
   if (!detail) notFound();
   const v0 = savReleaseStage() === "v0";
   const latestInbound = [...detail.messages].reverse().find((message) => message.direction === "inbound");
+  const customerMessage = latestInbound ? resolveSavCustomerMessage({ fromEmail: latestInbound.fromEmail, subject: latestInbound.subject, body: latestInbound.body.text }) : null;
+  const isForward = customerMessage && customerMessage.kind !== "sender";
   const eligible = latestInbound ? await isSavMessageEligible(latestInbound.id) : false;
   const [proposalReview, relatedThreads, replyDrafts, observations] = await Promise.all([
     v0 && latestInbound ? getSavProposalReview(latestInbound.id) : null,
-    getSavRelatedThreads(id),
+    isForward ? Promise.resolve([]) : getSavRelatedThreads(id),
     getSavReplyDrafts(id),
     getSavObservations(id),
   ]);
   const routing = proposalReview?.proposal.routing;
-  const dossier = latestInbound?.body.supportContext;
+  const savedDossier = latestInbound?.body.supportContext;
+  // Historical enrichment of the forwarding colleague is not customer context.
+  // A deliberate refresh is required before presenting it as the client's CRM.
+  const dossier = !isForward || customerMessage.kind === "forwarded"
+    && savedDossier?.customerIdentity?.kind === "forwarded" && savedDossier.customerIdentity.email === customerMessage.email
+    ? savedDossier : undefined;
+  const customerContextBlocked = Boolean(isForward && !dossier);
   const crmTickets = sortSavTicketsNewestFirst(dossier?.crm.data?.tickets ?? []);
-  const ticketMatch = selectSavTicketMatch({ subject: latestInbound?.subject ?? "", candidates: crmTickets, currentTicketId: detail.thread.hubspotTicketId, includeClosed: true });
+  const ticketMatch = selectSavTicketMatch({ subject: customerMessage?.subject ?? "", candidates: crmTickets, currentTicketId: detail.thread.hubspotTicketId, includeClosed: true });
   const returnTicket = ticketMatch.kind === "matched" ? crmTickets.find(ticket => ticket.id === ticketMatch.ticket.id) : null;
   const returnPlan = returnTicket && latestInbound ? savTicketReturnPlan(returnTicket, latestInbound.receivedAt) : null;
   const returnUncertain = detail.actions.some(action => action.payload.ticketReturnDispatchedAt && !action.payload.ticketReturnCompletedAt);
   const returnCompleted = detail.actions.some(action => action.messageId === latestInbound?.id && action.status === "succeeded" && ["create_ticket", "link_ticket"].includes(action.kind) && action.actorType === "human");
   const linkedHubspotTicket = detail.thread.hubspotTicketId ? dossier?.crm.data?.tickets.find((ticket) => ticket.id === detail.thread.hubspotTicketId) : undefined;
-  const contactId = dossier ? dossier.crm.data?.contactId : routing?.kind === "new" || routing?.kind === "matched" ? routing.contactId : null;
+  const contactId = customerContextBlocked ? null : dossier ? dossier.crm.data?.contactId : routing?.kind === "new" || routing?.kind === "matched" ? routing.contactId : null;
   const currentDecision = [...detail.decisions].reverse().find((decision) => decision.isCurrent);
   const displayedDecision = proposalReview?.proposal.decision ?? currentDecision;
   const needsTicketReconciliation = detail.actions.some((action) => !action.payload.hubspotTicketId && (action.errorCode === "SAV_MANUAL_RECONCILIATION_REQUIRED" || action.kind === "create_ticket" && action.payload.ticketCreateDispatchedAt));
@@ -94,6 +103,7 @@ export default async function SavThreadPage({ params, searchParams }: { params: 
   const replyAction = detail.actions.find((action) => action.kind === "send_reply" && action.messageId === latestInbound?.id && action.payload.manualReplyConfirmed === true);
   const replyState = replyAction?.status === "succeeded" ? "sent" : replyAction?.payload.replySendDispatchedAt ? "uncertain" : replyAction && ["pending", "running"].includes(replyAction.status) ? "pending" : null;
   const sendDisabledReason = detail.pilotItem ? "Simulation : aucun email réel ne peut être envoyé depuis ce dossier."
+    : customerContextBlocked ? "Identité du client transféré à vérifier : actualisez le contexte avant toute réponse."
     : savAutomationMode() === "shadow" || process.env.SAV_WRITES_DISABLED === "true" ? "Les envois sont désactivés dans cet environnement. Le brouillon reste dans le Studio."
     : !v0 ? "L’envoi manuel depuis ce brouillon est réservé à la V0."
     : null;
@@ -103,13 +113,13 @@ export default async function SavThreadPage({ params, searchParams }: { params: 
     {context && <p className={`login-notice ${context === "refreshed" ? "" : "error"}`} role="status">{context === "refreshed" ? "Contexte client actualisé à l’ouverture du dossier." : "Contexte HubSpot incomplet : vérifiez l’accès puis utilisez « Actualiser le contexte client »."}</p>}
     {review && <p className="login-notice" role="status">{({ observation_qualified: "Bilan qualifié. Aucune connaissance publiée.", draft_reviewed: "Verdict du brouillon enregistré. Aucun email envoyé, aucun ticket créé.", SAV_DRAFT_READ_ONLY: "Le brouillon IA est en lecture seule.", context_refreshed: "Contexte client actualisé. La proposition existante n’a pas été modifiée.", proposal_repaired: "Proposition reconstituée. Aucun email envoyé, aucun ticket créé." } as Record<string, string>)[review] ?? manualReplyNotices[review] ?? reviewNotices[review] ?? (review === "saved" ? "Revue enregistrée. Aucun email envoyé, aucun ticket créé par cette validation." : review === "ticket_queued" ? "Action manuelle enregistrée. Le worker vérifie Gmail et HubSpot avant de l’exécuter ; si les écritures sont bloquées, elle reste en attente." : review === "ticket_reconciled" ? "Ticket existant vérifié et rapproché. Aucun nouveau ticket créé." : review.startsWith("SAV_TICKET_") || review.startsWith("SAV_LINK_") || ["SAV_MANUAL_TICKET_INVALID", "SAV_MANUAL_RECONCILIATION_REQUIRED", "SAV_VALIDATED_CURRENT_PROPOSAL_REQUIRED", "SAV_MESSAGE_BEFORE_CUTOVER"].includes(review) ? savManualTicketError(review) : `Action refusée : ${review.slice(0, 100)}`)}</p>}
     <Link className="back-link" href={from === "pilot" ? `/studio/sav/pilote?batch=${encodeURIComponent(batch || detail.pilotItem?.batchId || "")}#batch-review` : "/studio/sav"}><ArrowLeft size={14}/> {from === "pilot" ? "Retour au lot de test" : "Retour à tous les mails"}</Link>
-    <div className={`sav-thread-heading ${styles.heading}`}><div><span className="eyebrow">Dossier SAV</span><h1>{detail.thread.subject}</h1></div><div className={styles.customer}><small>Client</small><strong>{detail.thread.customerEmail}</strong><span className={`sav-thread-status ${detail.thread.status}`}>{detail.thread.aiPaused ? <UserRound size={15}/> : <Bot size={15}/>} {savLabel(savThreadStatusLabels, detail.thread.status)}</span></div></div>
+    <div className={`sav-thread-heading ${styles.heading}`}><div><span className="eyebrow">Dossier SAV</span><h1>{customerMessage?.subject ?? detail.thread.subject}</h1></div><div className={styles.customer}><small>Client</small><strong>{customerMessage?.email ?? (isForward ? "Identité à vérifier" : detail.thread.customerEmail)}</strong>{isForward && <small>Transféré par {latestInbound?.fromEmail}. Une réponse Gmail restera adressée à ce collègue dans le fil d’origine.</small>}<span className={`sav-thread-status ${detail.thread.status}`}>{detail.thread.aiPaused ? <UserRound size={15}/> : <Bot size={15}/>} {savLabel(savThreadStatusLabels, detail.thread.status)}</span></div></div>
 
     <a className={styles.contextJump} href="#sav-client-context">Voir le contexte client et les actions</a>
     <section className={`sav-thread-grid ${styles.layout}`}>
       <div className={`sav-conversation ${styles.main}`}>
         <MailConversation messages={detail.messages}/>
-        {proposalReview && latestInbound && <ProposalReview data={proposalReview} threadId={detail.thread.id} messageId={latestInbound.id} drafts={replyDrafts} context={{ subject: latestInbound.subject, messageCount: detail.messages.length, relatedCount: relatedThreads.length, linkedTicketId: detail.thread.hubspotTicketId }} sendAllowed={!sendDisabledReason} sendDisabledReason={sendDisabledReason} replyState={replyState}/>}
+        {proposalReview && latestInbound && <ProposalReview data={proposalReview} threadId={detail.thread.id} messageId={latestInbound.id} drafts={replyDrafts} context={{ subject: customerMessage?.subject ?? latestInbound.subject, messageCount: detail.messages.length, relatedCount: relatedThreads.length + (isForward ? dossier?.otherConversations.length ?? 0 : 0), linkedTicketId: detail.thread.hubspotTicketId }} sendAllowed={!sendDisabledReason} sendDisabledReason={sendDisabledReason} replyState={replyState}/>}
         {proposalReview && latestInbound && <DraftReview data={proposalReview} threadId={id} messageId={latestInbound.id} drafts={replyDrafts} sendAllowed={!sendDisabledReason} sendDisabledReason={sendDisabledReason} replyState={replyState}/>}
         <ResolutionObservation rows={observations} isUgo={staff.email.toLowerCase()==="ugo@limova.ai"}/>
         {!proposalReview && currentDecision?.evidence.some((source) => source.claim || source.excerpt) && <section className="card sav-note"><span className="eyebrow">Preuves de la réponse</span><h2>Affirmations reliées aux fiches validées</h2><ul>{currentDecision.evidence.map((source, index) => <li key={`${source.sourceType}:${source.sourceId}:${index}`}><strong>{source.title}</strong>{source.claim && <p>{source.claim}</p>}{source.excerpt && <blockquote>{source.excerpt}</blockquote>}{source.verifiedAt && <small>Fiche vérifiée le {source.verifiedAt}</small>}</li>)}</ul></section>}
@@ -147,7 +157,7 @@ export default async function SavThreadPage({ params, searchParams }: { params: 
       </div>
 
       <aside id="sav-client-context" tabIndex={-1} className={`sav-audit-rail ${styles.rail}`} aria-label="Contexte client et actions">
-        <section className={`card ${styles.context}`}><span className="eyebrow">Contexte client</span><h2>Fiche HubSpot liée</h2>{contactId ? <><a href={`https://app.hubspot.com/contacts/${hubspotPortalId}/contact/${encodeURIComponent(contactId)}`} target="_blank" rel="noreferrer">Ouvrir la fiche #{contactId} <ExternalLink size={14}/></a><p>Fiche reconnue pour l’expéditeur {latestInbound?.fromEmail}. Un email d’inscription confirmé différent sera vérifié avant toute action.</p></> : <p>{dossier?.crm.status === "error" ? "Recherche HubSpot indisponible : impossible de conclure à l’absence de fiche." : dossier?.crm.data ? "Aucune fiche retrouvée pour cet email. Les correspondances nom/téléphone restent à confirmer. Aucun contact ne sera créé." : routing?.kind === "review" && routing.reason === "customer_identity_unverified" ? "Identité à vérifier : les correspondances nom/téléphone ne sont pas encore une fiche liée. Aucun contact ne sera créé." : "Contexte HubSpot non encore collecté pour cet email."}</p>}{dossier?.crm.status === "partial" && <p>Fiche recherchée, mais recherche des tickets incomplète. Réessayez avant de conclure.</p>}{dossier && <small>Contexte collecté le {formatParisDateTime(dossier.collectedAt)}</small>}{latestInbound && <form action={refreshSavContextAction}><input type="hidden" name="threadId" value={id}/><input type="hidden" name="messageId" value={latestInbound.id}/><button className="secondary">Actualiser le contexte client</button></form>}</section>
+        <section className={`card ${styles.context}`}><span className="eyebrow">Contexte client</span><h2>Fiche HubSpot liée</h2>{contactId ? <><a href={`https://app.hubspot.com/contacts/${hubspotPortalId}/contact/${encodeURIComponent(contactId)}`} target="_blank" rel="noreferrer">Ouvrir la fiche #{contactId} <ExternalLink size={14}/></a><p>Fiche reconnue pour {isForward ? "le client transféré" : "l’expéditeur"} {customerMessage?.email}. Un email d’inscription confirmé différent sera vérifié avant toute action.</p></> : <p>{customerContextBlocked ? "Identité du client transféré à vérifier. Actualisez le contexte client ; aucun historique du collègue ne sera utilisé." : dossier?.crm.status === "error" ? "Recherche HubSpot indisponible : impossible de conclure à l’absence de fiche." : dossier?.crm.data ? "Aucune fiche retrouvée pour cet email. Les correspondances nom/téléphone restent à confirmer. Aucun contact ne sera créé." : routing?.kind === "review" && routing.reason === "customer_identity_unverified" ? "Identité à vérifier : les correspondances nom/téléphone ne sont pas encore une fiche liée. Aucun contact ne sera créé." : "Contexte HubSpot non encore collecté pour cet email."}</p>}{dossier?.crm.status === "partial" && <p>Fiche recherchée, mais recherche des tickets incomplète. Réessayez avant de conclure.</p>}{dossier && <small>Contexte collecté le {formatParisDateTime(dossier.collectedAt)}</small>}{latestInbound && <form action={refreshSavContextAction}><input type="hidden" name="threadId" value={id}/><input type="hidden" name="messageId" value={latestInbound.id}/><button className="secondary">Actualiser le contexte client</button></form>}</section>
         <section className={`card ${styles.context}`}>
           <h2>Ticket lié</h2>
           {detail.thread.hubspotTicketId ? <>
@@ -155,7 +165,7 @@ export default async function SavThreadPage({ params, searchParams }: { params: 
             <small>Date de création : {formatParisDateTime(linkedHubspotTicket?.createdAt)}</small>
           </> : <>
             <p>Aucun ticket lié à ce dossier.</p>
-            {routing?.kind === "matched" && <p>Correspondance proposée : <a href={`https://app.hubspot.com/contacts/${hubspotPortalId}/ticket/${encodeURIComponent(routing.ticketId)}`} target="_blank" rel="noreferrer">#{routing.ticketId} <ExternalLink size={12}/></a>. Rattachement manuel à confirmer.</p>}
+            {!customerContextBlocked && routing?.kind === "matched" && <p>Correspondance proposée : <a href={`https://app.hubspot.com/contacts/${hubspotPortalId}/ticket/${encodeURIComponent(routing.ticketId)}`} target="_blank" rel="noreferrer">#{routing.ticketId} <ExternalLink size={12}/></a>. Rattachement manuel à confirmer.</p>}
           </>}
           {!!dossier?.crm.data?.tickets.length && <>
             <h3>Tickets retrouvés sur la fiche</h3>
@@ -189,8 +199,8 @@ export default async function SavThreadPage({ params, searchParams }: { params: 
                   </form> : <p>{returnPlan.operation === "review" ? "Date de clôture ou statut insuffisant : vérification humaine nécessaire." : "Validez d’abord le dossier pour confirmer cette action."}</p>}
               </div>}
               {!returnTicket && !returnUncertain && !detail.thread.hubspotTicketId && (needsTicketReconciliation ? <><button className="primary" disabled>Créer un ticket HubSpot</button><p>Création bloquée : vérifiez et rapprochez le ticket existant ci-dessous.</p></> : ticketRequestPending ? <><button className="primary" disabled>Demande HubSpot en attente</button><p>Une demande de création ou de rattachement est déjà enregistrée. Suivi disponible dans le journal d’actions.</p></> : proposalReview?.review?.status === "approved" && ["ticket_pending", "human_review_required"].includes(proposalReview.proposal.decision.kind) ? <>
-                <form action={createTicketAction}><input type="hidden" name="threadId" value={id}/><input type="hidden" name="reviewId" value={proposalReview.review.id}/><label>Si ce client a déjà un ticket ouvert : pourquoi est-ce un problème distinct ?<textarea name="distinctIssueReason" maxLength={2_000} placeholder="Justification humaine, au moins 20 caractères si nécessaire"/></label><button className="primary">Créer un ticket HubSpot</button></form>
-                <details><summary>Rattacher à un ticket existant</summary><form action={linkTicketAction}><input type="hidden" name="threadId" value={id}/><input type="hidden" name="reviewId" value={proposalReview.review.id}/><label>ID du ticket existant<input name="ticketId" required pattern="[0-9]+" defaultValue={routing?.kind === "matched" ? routing.ticketId : ""}/></label><button className="secondary">Confirmer le rattachement</button></form></details>
+                <form action={createTicketAction}><input type="hidden" name="threadId" value={id}/><input type="hidden" name="reviewId" value={proposalReview.review.id}/><label>Si ce client a déjà un ticket ouvert : pourquoi est-ce un problème distinct ?<textarea name="distinctIssueReason" maxLength={2_000} placeholder="Justification humaine, au moins 20 caractères si nécessaire"/></label><button className="primary" disabled={customerContextBlocked}>Créer un ticket HubSpot</button></form>
+                <details><summary>Rattacher à un ticket existant</summary><form action={linkTicketAction}><input type="hidden" name="threadId" value={id}/><input type="hidden" name="reviewId" value={proposalReview.review.id}/><label>ID du ticket existant<input name="ticketId" required pattern="[0-9]+" defaultValue={!customerContextBlocked && routing?.kind === "matched" ? routing.ticketId : ""}/></label><button className="secondary" disabled={customerContextBlocked}>Confirmer le rattachement</button></form></details>
               </> : <><button className="primary" disabled>Créer un ticket HubSpot</button><p>Validez d’abord la proposition courante ci-dessous.</p></>)}
             </>}
             {!v0 && !detail.thread.hubspotTicketId && <form action={createTicketAction}><input type="hidden" name="threadId" value={id}/><button className="secondary">Créer le ticket HubSpot</button></form>}

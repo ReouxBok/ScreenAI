@@ -37,6 +37,28 @@ beforeEach(() => {
 afterEach(() => { vi.unstubAllEnvs(); vi.unstubAllGlobals(); vi.resetAllMocks(); });
 
 describe("SAV shared semantic pipeline with synthetic provider outputs", () => {
+  it("uses the forwarded original in CRM and model context, not the colleague's stale enrichment", async () => {
+    const u = understandingFixture(); deps.understand.mockResolvedValue(u);
+    const network = vi.fn<typeof fetch>(async () => geminiFixture(outputFor(u)));
+    const forwarded = { from: "colleague@limova.ai", subject: "À traiter", body: "---------- Forwarded message ---------\nFrom: alice@example.com\nSubject: Connexion impossible\n\nLe produit ne fonctionne pas.",
+      dossierContext: { version: 1 as const, messageId: "fixture-message", collectedAt: new Date().toISOString(), customerIdentity: { kind: "sender" as const, email: "colleague@limova.ai" },
+        crm: { status: "error" as const, data: null, errorCode: "fixture" }, conversation: null, conversationError: null,
+        otherConversations: [{ id: "colleague-history", subject: "PRIVATE_COLLEAGUE_HISTORY", relation: "Same sender", messages: [] }], otherConversationsError: null } };
+    await analyzeSavMessage(forwarded, { evaluation: evaluation("off", network) });
+    expect(deps.crm).toHaveBeenCalledWith(expect.objectContaining({ email: "alice@example.com", subject: "Connexion impossible", currentTicketId: undefined, identityHints: undefined }));
+    expect(deps.understand.mock.calls[0][0]).toMatchObject({ from: "alice@example.com", subject: "Connexion impossible", body: "Le produit ne fonctionne pas." });
+    expect(JSON.stringify(deps.understand.mock.calls[0][0])).not.toContain("PRIVATE_COLLEAGUE_HISTORY");
+    expect(forwarded.from).toBe("colleague@limova.ai");
+  });
+  it("does not query CRM or propose a response for an ambiguous forwarded sender", async () => {
+    const u = understandingFixture(); deps.understand.mockResolvedValue(u);
+    const network = vi.fn<typeof fetch>(async () => geminiFixture(outputFor(u)));
+    const result = await analyzeSavMessage({ from: "colleague@limova.ai", subject: "Support", body: "---------- Forwarded message ---------\nFrom: alice@example.com\nFrom: bob@example.com\nSubject: Support\n\nDemande" }, { evaluation: evaluation("off", network) });
+    expect(deps.crm).not.toHaveBeenCalled();
+    expect(result.proposal).toMatchObject({ kind: "human_review_required", reasonCode: "forwarded_customer_unresolved" });
+    expect(result.replyDraft).toBeNull();
+    expect(result.ticketRouting).toMatchObject({ kind: "review", reason: "forwarded_customer_unresolved" });
+  });
   it.each(["off", "on"] as const)("keeps the server ticket requirement when the %s composer contradicts it", async mode => {
     const u = understandingFixture(); deps.understand.mockResolvedValue(u);
     const answer = { ...outputFor(u), ticketRequired: false, requiresHuman: false };

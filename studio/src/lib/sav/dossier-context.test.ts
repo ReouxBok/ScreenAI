@@ -79,6 +79,37 @@ describe("persisted dossier enrichment", () => {
   });
 });
 
+describe("forwarded customer enrichment", () => {
+  it("replaces old colleague enrichment with the original customer without changing the Gmail envelope", async () => {
+    const priorClient = await seed(customer, new Date("2026-10-06T10:00:00Z"));
+    await seed("colleague@limova.ai", new Date("2026-10-06T10:00:00Z"));
+    const message = await seed("colleague@limova.ai");
+    await fixture.db.update(savMessages).set({ subject: "À traiter", bodyCiphertext: encryptSavPayload({
+      text: `---------- Forwarded message ---------\nFrom: ${customer}\nSubject: Connexion impossible\n\nLe produit ne fonctionne pas.`,
+      supportContext: { version: 1, messageId: message.id, crm: { status: "ready", data: { contactId: "old-colleague" } } },
+    }) }).where(eq(savMessages.id, message.id));
+    const context = await collectSavDossierContext(message.id);
+    expect(context.customerIdentity).toEqual({ kind: "forwarded", email: customer });
+    expect(state.crm).toHaveBeenCalledWith(expect.objectContaining({ email: customer, subject: "Connexion impossible", currentTicketId: undefined, identityHints: undefined }));
+    expect(context.otherConversations.map(thread => thread.id)).toEqual([priorClient.threadId]);
+    expect(context.conversation?.messages).toMatchObject([{ from: customer, text: "Le produit ne fonctionne pas." }]);
+    const [stored] = await fixture.db.select().from(savMessages).where(eq(savMessages.id, message.id));
+    expect(stored.fromEmail).toBe("colleague@limova.ai");
+    expect(await fixture.db.select().from(savActions)).toHaveLength(0);
+  });
+  it("blocks ambiguous forwarding without looking up or leaking the colleague's CRM/history", async () => {
+    await seed("colleague@limova.ai", new Date("2026-10-06T10:00:00Z"));
+    const message = await seed("colleague@limova.ai");
+    await fixture.db.update(savMessages).set({ bodyCiphertext: encryptSavPayload({ text: "---------- Forwarded message ---------\nFrom: alice@example.com\nFrom: bob@example.com\nSubject: Support\n\nDemande" }) }).where(eq(savMessages.id, message.id));
+    const context = await collectSavDossierContext(message.id);
+    expect(context.customerIdentity).toEqual({ kind: "unresolved_forward", email: null });
+    expect(context.crm).toEqual({ status: "error", data: null, errorCode: "SAV_FORWARDED_CUSTOMER_UNRESOLVED" });
+    expect(context.conversation?.messages).toEqual([]);
+    expect(context.otherConversations).toEqual([]);
+    expect(state.crm).not.toHaveBeenCalled();
+  });
+});
+
 describe("targeted missing-proposal repair", () => {
   async function incomplete() {
     const message = await seed();

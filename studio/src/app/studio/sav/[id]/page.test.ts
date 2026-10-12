@@ -128,6 +128,7 @@ describe("SAV dossier SSR and human-review guardrails", () => {
   it("shows the contact and associated tickets without any proposal", async () => {
     const detail = detailFixture();
     detail.messages[0].body.supportContext = { version: 1, messageId, collectedAt: now.toISOString(),
+      customerIdentity: { kind: "sender", email: "client@example.invalid" },
       crm: { status: "ready", errorCode: null, data: { errorCode: null, contactFound: true, contactId: "42", identityCandidates: [],
         tickets: [{ id: "99", subject: "Une autre question", description: "", status: "open", pipelineId: "0", stageId: "1", createdAt: null, updatedAt: null }], routing: { kind: "new", reason: "distinct_issue", candidateIds: [] } } },
       conversation: null, conversationError: null, otherConversations: [], otherConversationsError: null };
@@ -140,6 +141,7 @@ describe("SAV dossier SSR and human-review guardrails", () => {
   it("does not turn a CRM outage into a missing contact", async () => {
     const detail = detailFixture();
     detail.messages[0].body.supportContext = { version: 1, messageId, collectedAt: now.toISOString(),
+      customerIdentity: { kind: "sender", email: "client@example.invalid" },
       crm: { status: "error", errorCode: "SAV_HUBSPOT_CONTACT_UNAVAILABLE", data: null },
       conversation: null, conversationError: null, otherConversations: [], otherConversationsError: null };
     dependencies.detail.mockResolvedValue(detail); dependencies.review.mockResolvedValue(null);
@@ -363,6 +365,7 @@ describe("SAV dossier SSR and human-review guardrails", () => {
 it.each(["2026-01-02T12:00:00Z", null, "invalid"])("shows the real ticket creation date or an explicit missing date (%s)", async (createdAt) => {
   const detail = detailFixture(); detail.thread.hubspotTicketId = "99";
   detail.messages[0].body.supportContext = { version: 1, messageId, collectedAt: now.toISOString(),
+    customerIdentity: { kind: "sender", email: "client@example.invalid" },
     crm: { status: "ready", errorCode: null, data: { errorCode: null, contactFound: true, contactId: "42", identityCandidates: [],
       tickets: [{ id: "99", subject: "Question", description: "", status: "open", pipelineId: "0", stageId: "1", createdAt, updatedAt: now.toISOString() }],
       routing: { kind: "new", reason: "distinct_issue", candidateIds: [] } } },
@@ -371,4 +374,46 @@ it.each(["2026-01-02T12:00:00Z", null, "invalid"])("shows the real ticket creati
   const html = sectionWithHeading(await renderPage(), "Ticket lié");
   expect(html).toContain(createdAt && createdAt !== "invalid" ? "02/01/2026 13:00" : "Date indisponible");
   expect(html).not.toContain("02/10/2026");
+});
+
+it("shows the original customer and the same forwarded return CTA as the backend", async () => {
+  const detail = detailFixture();
+  detail.thread.customerEmail = "colleague@limova.ai";
+  detail.thread.subject = "À traiter pour Alice";
+  Object.assign(detail.messages[0], { fromEmail: "colleague@limova.ai", subject: detail.thread.subject });
+  detail.messages[0].body.text = "---------- Forwarded message ---------\nFrom: Alice <alice@example.com>\nSubject: Connexion impossible\n\nConnexion impossible.";
+  detail.messages[0].body.supportContext = { version: 1, messageId, collectedAt: now.toISOString(), customerIdentity: { kind: "forwarded", email: "alice@example.com" },
+    crm: { status: "ready", errorCode: null, data: { errorCode: null, contactFound: true, contactId: "42", identityCandidates: [],
+      tickets: [{ id: "401", subject: "Connexion impossible", description: "", status: "open", pipelineId: "0", stageId: "2", ownerId: "71", createdAt: null, updatedAt: null }],
+      routing: { kind: "matched", ticketId: "401", reason: "exact_subject", returnOperation: "reactivate" } } },
+    conversation: null, conversationError: null, otherConversations: [], otherConversationsError: null };
+  dependencies.detail.mockResolvedValue(detail); dependencies.review.mockResolvedValue(reviewFixture(true));
+  const html = await renderPage();
+  expect(html).toContain("<h1>Connexion impossible</h1>");
+  expect(html).toContain("<strong>alice@example.com</strong>");
+  expect(html).toContain("Transféré par colleague@limova.ai");
+  expect(html).toContain("Une réponse Gmail restera adressée à ce collègue");
+  expect(html).toContain("Fiche reconnue pour le client transféré alice@example.com");
+  expect(html).not.toContain("Fiche reconnue pour l’expéditeur colleague@limova.ai");
+  expect(html).toContain('name="returnOperation" value="reactivate"');
+  expect(dependencies.related).not.toHaveBeenCalled();
+  expect(detail.messages[0].fromEmail).toBe("colleague@limova.ai");
+});
+
+it.each([false, true])("does not expose the colleague's old CRM/history for a forward (ambiguous=%s)", async ambiguous => {
+  const detail = detailFixture();
+  detail.thread.customerEmail = "colleague@limova.ai";
+  detail.messages[0].fromEmail = "colleague@limova.ai";
+  detail.messages[0].body.text = `---------- Forwarded message ---------\nFrom: alice@example.com\n${ambiguous ? "From: bob@example.com\n" : ""}Subject: Connexion impossible\n\nDemande`;
+  detail.messages[0].body.supportContext = { version: 1, messageId, collectedAt: now.toISOString(), customerIdentity: { kind: "sender", email: "colleague@limova.ai" },
+    crm: { status: "ready", errorCode: null, data: { errorCode: null, contactFound: true, contactId: "999", identityCandidates: [], tickets: [], routing: { kind: "new", reason: "no_candidates", candidateIds: [] } } },
+    conversation: null, conversationError: null, otherConversations: [{ id: "private-history", subject: "HISTORIQUE_COLLEGUE", relation: "Même expéditeur", messages: [] }], otherConversationsError: null };
+  dependencies.detail.mockResolvedValue(detail); dependencies.review.mockResolvedValue(reviewFixture(true));
+  const html = await renderPage();
+  expect(html).toContain("Identité du client transféré à vérifier");
+  expect(html).toContain("Actualiser le contexte client");
+  expect(html).not.toContain("Ouvrir la fiche #999");
+  expect(html).not.toContain("HISTORIQUE_COLLEGUE");
+  expect(buttonAttributes(html, "Créer un ticket HubSpot")).toEqual([expect.stringContaining('disabled=""')]);
+  expect(dependencies.related).not.toHaveBeenCalled();
 });
