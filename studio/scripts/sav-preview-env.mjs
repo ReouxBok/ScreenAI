@@ -124,6 +124,7 @@ export function createPreviewPlan(studioDirectory, bins, options) {
     ["Migrations locales", "migrate.ts"],
     ["Connaissances fictives", "seed-sav-preview.ts"],
     ["Inbox fictive", "seed-sav-inbox-preview.ts"],
+    ["Revue et observation fictives", "seed-sav-review-preview.ts"],
   ].map(([label, file]) => ({ label, args: ["--conditions=react-server", "--import", tsxLoader, path.join(studioDirectory, "scripts", file)] }));
   return options.initOnly ? preparation : [...preparation, {
     label: "Studio local",

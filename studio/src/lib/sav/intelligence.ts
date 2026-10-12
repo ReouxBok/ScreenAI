@@ -20,6 +20,7 @@ import { buildSavInboundContext, savActiveSubject, savNonSupportIntent, splitSav
 import { deterministicDecision, isSavCancellationRequest, isSavFinancialRequest, safeSavFinanceDraft, safeSavHumanHandoffDraft, safeSavTriageDraft, type DecisionProposal, type SavClassificationInput } from "./policy";
 import { cleanSavModelDraft } from "./reply-format";
 import type { SavDossierContext } from "./dossier-context";
+import { isSavLeadProductInquiry, selectSavLeadTemplate } from "./lead-template";
 
 type SavEnrichedInput = SavClassificationInput & { conversation?: SavConversation; messageContext?: SavInboundContext; displayName?: string; dossierContext?: SavDossierContext };
 
@@ -421,13 +422,14 @@ async function analyzeSavMessageRaw(
 /** Reason over the collected dossier, then freeze the server-owned proposal. */
 export async function analyzeSavMessage(input: SavEnrichedInput, context: SavAnalysisContext = {}): Promise<SavAnalysis> {
   const messageContext = buildSavInboundContext(input);
+  const leadInquiry = isSavLeadProductInquiry(input);
   const nonSupport = savNonSupportIntent(input);
   const finance = isSavFinancialRequest(input);
   // Production workers persist enrichment before entering this function. Older
   // callers still perform the CRM read before reasoning, never after it.
   let crm = input.dossierContext?.crm.data ?? null;
   let conversation = input.dossierContext?.conversation ?? input.conversation;
-  if (!input.dossierContext && !nonSupport && ["ticket_pending", "human_review_required"].includes(deterministicDecision(input).kind)) {
+  if (!leadInquiry && !input.dossierContext && !nonSupport && ["ticket_pending", "human_review_required"].includes(deterministicDecision(input).kind)) {
     try {
       conversation ??= context.messageId ? await loadSavConversation(context.messageId) : undefined;
       const { extractSavIdentityHints } = await import("./identity");
@@ -438,12 +440,12 @@ export async function analyzeSavMessage(input: SavEnrichedInput, context: SavAna
   const enriched = { ...input, conversation, dossierContext: input.dossierContext ?? { version: 1 as const, messageId: context.messageId ?? "", collectedAt: new Date().toISOString(),
     crm: { status: crm ? crm.errorCode ? "partial" as const : "ready" as const : "error" as const, data: crm, errorCode: crm?.errorCode ?? (crm ? null : "SAV_HUBSPOT_CONTEXT_UNAVAILABLE") },
     conversation: conversation ?? null, conversationError: null, otherConversations: [], otherConversationsError: null } };
-  const analysis = await analyzeSavMessageRaw(enriched, context);
-  if (!nonSupport && ["ticket_pending", "human_review_required"].includes(analysis.proposal.kind) && conversation && (!conversation.senderMatchesCustomer || conversation.aiPaused)) {
+  const analysis = leadInquiry ? await analyzeSavLeadInquiry(enriched, context) : await analyzeSavMessageRaw(enriched, context);
+  if (!leadInquiry && !nonSupport && ["ticket_pending", "human_review_required"].includes(analysis.proposal.kind) && conversation && (!conversation.senderMatchesCustomer || conversation.aiPaused)) {
     analysis.proposal = { ...analysis.proposal, kind: "human_review_required", requiresHumanApproval: true,
       explanation: `${analysis.proposal.explanation}\nDossier suspendu ou expéditeur différent : vérification humaine obligatoire avant toute action.`.slice(0, 2_000) };
   }
-  const support = !nonSupport && ["ticket_pending", "human_review_required"].includes(analysis.proposal.kind);
+  const support = !leadInquiry && !nonSupport && ["ticket_pending", "human_review_required"].includes(analysis.proposal.kind);
   if (!support) analysis.ticketRouting = { kind: "none", reason: analysis.proposal.reasonCode };
   else if (!analysis.ticketRouting || (analysis.ticketRouting.kind === "review" && analysis.ticketRouting.reason === "customer_identity_unverified")) {
     try {
@@ -481,7 +483,7 @@ export async function analyzeSavMessage(input: SavEnrichedInput, context: SavAna
     analysis.replyDraft = safeSavFinanceDraft(messageContext.language);
   }
   // CRM identity fallback must never introduce an AI draft for cancellation.
-  if (nonSupport || (support && isSavCancellationRequest(input))) analysis.replyDraft = null;
+  if ((!leadInquiry && nonSupport) || (support && isSavCancellationRequest(input))) analysis.replyDraft = null;
   analysis.structuredProposal = buildSavStructuredProposal({ ...enriched, messageContext }, analysis);
   if (context.messageId) {
     if (!analysis.agentRunId) throw new Error("SAV_ANALYSIS_TRACE_REQUIRED");
@@ -491,5 +493,32 @@ export async function analyzeSavMessage(input: SavEnrichedInput, context: SavAna
       outputHash: savContentHash(analysis.structuredProposal),
     }).where(eq(savAgentRuns.id, analysis.agentRunId));
   }
+  return analysis;
+}
+
+async function analyzeSavLeadInquiry(input: SavEnrichedInput, context: SavAnalysisContext): Promise<SavAnalysis> {
+  const message = buildSavInboundContext(input);
+  let knowledge: Awaited<ReturnType<typeof searchKnowledge>> = { revision: "not_consulted", results: [] };
+  const diagnostics: SavAnalysisDiagnostic[] = [];
+  if (process.env.SAV_AI_ANALYSIS !== "false") {
+    try {
+      knowledge = await searchKnowledge({ query: message.currentText.slice(0, 2000), scope: "sav", savAudience: "lead",
+        locale: message.language === "en" ? "en-US" : "fr-FR", contentTypes: ["article"], limit: 10 });
+    } catch { diagnostics.push({ phase: "knowledge", errorCode: "SAV_KNOWLEDGE_LOOKUP_FAILED" }); }
+  }
+  const selected = selectSavLeadTemplate(knowledge.results);
+  const analysis: SavAnalysis = {
+    category: "other", urgency: "normal", model: "rules-v1", knowledgeRevision: knowledge.revision, diagnostics,
+    proposal: { kind: "human_review_required", requiresHumanApproval: true, confidence: selected ? 900 : 500,
+      reasonCode: selected ? "lead_product_information" : "lead_template_unavailable",
+      explanation: selected ? "Demande d’informations produit avant achat : relire le modèle validé avant tout envoi humain. Aucun ticket support n’est proposé."
+        : "Demande d’informations produit avant achat : aucun modèle validé unique et à jour n’est disponible ; qualification humaine requise." },
+    replyDraft: selected?.template ?? null, internalNote: null,
+    ticketRouting: { kind: "none", reason: "lead_product_information" },
+    evidence: selected ? [{ sourceType: "knowledge", sourceId: selected.source.id, contentVersionId: selected.source.contentVersionId,
+      title: selected.source.title, score: selected.source.score, claim: "Modèle validé pour une demande d’informations produit d’un lead." }] : [],
+  };
+  analysis.agentRunId = (await recordAgentRun({ context, source: input, analysis, runtime: "rules", mode: savHarnessMode(),
+    status: "succeeded", model: analysis.model, promptRevision: "sav-lead-template-2026-10-09.v1" })) ?? undefined;
   return analysis;
 }

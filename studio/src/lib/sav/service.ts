@@ -24,7 +24,8 @@ import { analyzeSavMessage, type SavAnalysis } from "./intelligence";
 import { savPrimaryAnalysisDiagnostic } from "./analysis-errors";
 import { collectSavDossierContext, type SavDossierContext } from "./dossier-context";
 import { assertSavActor } from "./access";
-import type { SavProposalRouting } from "./proposal";
+import { savStructuredProposalSchema, type SavProposalRouting } from "./proposal";
+import { savReviewMatchesProposal } from "./review-contract";
 import { redactSavLearningText } from "./learning-extraction";
 import { invalidateSavReplies } from "./invalidation";
 import { isSavPilotMode, savReleaseStage } from "./config";
@@ -642,10 +643,11 @@ export async function listSavInbox(limit = 100, options: { offset?: number; quer
   const query = options.query?.trim().slice(0, 200).replace(/[\\%_]/g, "\\$&");
   const viewFilter = options.view === "technical" ? inArray(savDecisions.kind, technical)
     : options.view === "human" ? eq(savThreads.aiPaused, true)
-    : options.view === "reviewed" ? isNotNull(savProposalReviews.id)
+    : options.view === "reviewed" ? undefined
     : options.view === "errors" ? or(isNotNull(analysisErrorCode), eq(savMessages.analysisStatus, "failed"))
-    : options.view === "pending" ? and(isNull(savProposalReviews.id), eq(savMessages.analysisStatus, "done")) : undefined;
-  return db.select({
+    : options.view === "pending" ? eq(savMessages.analysisStatus, "done") : undefined;
+  const readBatch = (offset: number) => db.select({
+    _review: savProposalReviews, _proposal: savAgentRuns.proposalCiphertext, _body: savMessages.bodyCiphertext, _runId: savAgentRuns.id,
     messageId: savMessages.id,
     threadId: savThreads.id,
     receivedAt: savMessages.receivedAt,
@@ -674,12 +676,41 @@ export async function listSavInbox(limit = 100, options: { offset?: number; quer
     .leftJoin(savDecisions, and(eq(savDecisions.messageId, savMessages.id), eq(savDecisions.isCurrent, true)))
     .leftJoin(savAgentRuns, eq(savAgentRuns.id, savDecisions.agentRunId))
     .leftJoin(savPilotItems, eq(savPilotItems.messageId, savMessages.id))
-    .leftJoin(savProposalReviews, and(eq(savProposalReviews.messageId, savMessages.id), eq(savProposalReviews.decisionId, savDecisions.id), eq(savProposalReviews.isCurrent, true)))
+    .leftJoin(savProposalReviews, and(eq(savProposalReviews.messageId, savMessages.id), eq(savProposalReviews.isCurrent, true)))
     .where(and(eq(savMessages.direction, "inbound"), savV0EligibleMessageFilter(), viewFilter,
       options.view === "technical" ? undefined : or(isNull(savDecisions.kind), notInArray(savDecisions.kind, [...technical])),
       query ? or(ilike(savMessages.fromEmail, `%${query}%`), ilike(savMessages.subject, `%${query}%`), ilike(savMessages.preview, `%${query}%`)) : undefined))
     .orderBy(desc(savMessages.receivedAt), desc(savMessages.id))
-    .limit(Math.min(250, Math.max(1, limit))).offset(Math.max(0, Math.min(100_000, options.offset ?? 0)));
+    .limit(250).offset(offset);
+  const normalize = (row: Awaited<ReturnType<typeof readBatch>>[number]) => {
+    const { _review: review, _proposal: ciphertext, _body: bodyCiphertext, _runId: runId, ...entry } = row;
+    let matches = false;
+    try {
+      matches = Boolean(entry.decisionId && runId && ciphertext && savReviewMatchesProposal(review, { decisionId: entry.decisionId, agentRunId: runId,
+        proposal: savStructuredProposalSchema.parse(decryptSavPayload(ciphertext)), message: { bodyCiphertext, subject: entry.subject, fromEmail: entry.fromEmail } }));
+    } catch { /* An unreadable proposal cannot retain a verdict. */ }
+    return { ...entry, reviewId: matches ? entry.reviewId : null, reviewStatus: matches ? entry.reviewStatus : null };
+  };
+  const pageSize = Math.min(250, Math.max(1, limit));
+  const offset = Math.max(0, Math.min(100_000, options.offset ?? 0));
+  const rows: ReturnType<typeof normalize>[] = [];
+  const contentFiltered = options.view === "reviewed" || options.view === "pending";
+  let rawOffset = contentFiltered ? 0 : offset, matched = contentFiltered ? 0 : offset;
+  // Filter by the shared decrypted-content contract before paginating; stale
+  // reviews must not consume page slots or hide later reviewed dossiers.
+  while (rows.length < pageSize) {
+    const batch = await readBatch(rawOffset);
+    for (const row of batch) {
+      const entry = normalize(row);
+      if (options.view === "reviewed" && !entry.reviewId || options.view === "pending" && entry.reviewId) continue;
+      if (matched++ < offset) continue;
+      rows.push(entry);
+      if (rows.length === pageSize) break;
+    }
+    if (batch.length < 250) break;
+    rawOffset += batch.length;
+  }
+  return rows;
 }
 
 export async function retrySavAnalysis(messageId: string, actorEmail: string) {

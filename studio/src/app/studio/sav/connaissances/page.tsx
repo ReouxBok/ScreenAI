@@ -22,6 +22,7 @@ export default async function SavKnowledgeCandidatesPage({ searchParams }: { sea
       <h1>Connaissances SAV à valider</h1>
       <p>Une même connaissance métier, des versions sources traçables et des projections distinctes. Aucun candidat n’est publié ou exécuté depuis cette page.</p>
     </div></div>
+    <p><Link className="button secondary" href="/studio/contenus/nouveau?type=article&agentKey=sav">Préparer une connaissance SAV</Link></p>
     {result && <p className="login-notice" role="status">{result === "hubspot_candidates_ready" ? "Import préparé : les fiches sont des candidats privés, sans publication ni activation. Un nouvel import du même fichier reprend les candidats existants." : result === "draft_ready" ? "Décision enregistrée. Une validation positive prépare un brouillon SAV ; la publication reste une action distincte d’Ugo." : result === "candidate_ready" ? "Candidat préparé, sans modification du tutoriel source." : `Action refusée : ${result.slice(0, 100)}`}</p>}
     <details className="card" style={{ padding: 24 }}><summary>Importer des fiches HubSpot</summary>
       <p>Choisissez le fichier JSON privé au format Studio (800 Ko maximum). Les fiches restent à valider par Ugo. Aucun email brut ne doit être inclus.</p>

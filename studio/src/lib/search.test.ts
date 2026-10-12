@@ -92,4 +92,13 @@ describe("SAV knowledge freshness", () => {
     await preparePublicationRace("sav");
     await expect(searchKnowledge({ query: "factures", scope: "sav", contentTypes: ["article"] })).rejects.toThrow("KNOWLEDGE_REVISION_CHANGED_DURING_SEARCH");
   });
+  it("never returns a legacy lead template to the extension even if its agent was misclassified", async () => {
+    const [item] = await fixture.db.insert(contentItems).values({ slug: "wrong-agent-lead-fixture", type: "article", locale: "fr-FR", title: "Découverte produit fictive", ownerEmail: "staff@example.invalid", status: "published", agentKey: "charly", aiEnabled: true }).returning();
+    const [version] = await fixture.db.insert(contentVersions).values({ itemId: item.id, version: 1, bodyMarkdown: "Modèle fictif sans donnée réelle.", metadata: { intents: [], limovaPaths: [], prerequisites: [], expectedResult: "", troubleshooting: "",
+      resolution: { audience: "lead", symptoms: [], steps: [], exceptions: [], escalation: "Qualification humaine", productVersion: "", supersedes: [], conflictsWith: [] } }, changeNote: "Donnée historique volontairement mal classée", authorEmail: "staff@example.invalid" }).returning();
+    await fixture.db.update(contentItems).set({ publishedVersionId: version.id }).where(eq(contentItems.id, item.id));
+    await fixture.db.insert(contentChunks).values({ itemId: item.id, versionId: version.id, ordinal: 0, content: "Modèle fictif sans donnée réelle.", embedding: new Array(768).fill(1) });
+    const found = await searchKnowledge({ query: "Découverte produit fictive", contentTypes: ["article"] });
+    expect(found.results.some(result => result.id === item.id)).toBe(false);
+  });
 });

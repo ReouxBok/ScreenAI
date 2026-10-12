@@ -12,6 +12,9 @@ import { MailConversation } from "./mail-conversation";
 import { ProposalReview } from "./proposal-review";
 import { ManualTicketStatus } from "./manual-ticket-status";
 import { savManualTicketError } from "@/lib/sav/manual-ticket-status";
+import { ResolutionObservation } from "./resolution-observation";
+import { getSavObservations } from "@/lib/sav/observations";
+import { DraftReview } from "./draft-review";
 import { getSavReplyDrafts } from "@/lib/sav/drafts";
 import styles from "./thread.module.css";
 import { approveDraftAction, correctDecisionAction, createTicketAction, linkTicketAction, reconcileTicketAction, requestHumanAction, retryAction, retryAnalysisAction, reviewPilotItemAction, refreshSavContextAction, repairSavProposalAction } from "../actions";
@@ -49,7 +52,7 @@ const filingNotices: Record<string, string> = {
 };
 
 export default async function SavThreadPage({ params, searchParams }: { params: Promise<{ id: string }>; searchParams: Promise<{ from?: string; batch?: string; review?: string; filing?: string }> }) {
-  await requireStaff("admin");
+  const staff = await requireStaff("admin");
   const { id } = await params;
   const { from = "", batch = "", review = "", filing = "" } = await searchParams;
   const detail = await getSavThreadDetail(id);
@@ -57,10 +60,11 @@ export default async function SavThreadPage({ params, searchParams }: { params: 
   const v0 = savReleaseStage() === "v0";
   const latestInbound = [...detail.messages].reverse().find((message) => message.direction === "inbound");
   const eligible = latestInbound ? await isSavMessageEligible(latestInbound.id) : false;
-  const [proposalReview, relatedThreads, replyDrafts] = await Promise.all([
+  const [proposalReview, relatedThreads, replyDrafts, observations] = await Promise.all([
     v0 && latestInbound ? getSavProposalReview(latestInbound.id) : null,
     getSavRelatedThreads(id),
     getSavReplyDrafts(id),
+    getSavObservations(id),
   ]);
   const routing = proposalReview?.proposal.routing;
   const dossier = latestInbound?.body.supportContext;
@@ -86,7 +90,7 @@ export default async function SavThreadPage({ params, searchParams }: { params: 
 
   return <>
     {filing && <p className={`login-notice ${["filed", "already_filed", "SAV_GMAIL_FILING_DISABLED", "SAV_GMAIL_FILING_PILOT_BLOCKED"].includes(filing) ? "" : "error"}`} role="status">{filingNotices[filing] ?? filingNotices.SAV_GMAIL_FILING_FAILED}</p>}
-    {review && <p className="login-notice" role="status">{({ context_refreshed: "Contexte client actualisé. La proposition existante n’a pas été modifiée.", proposal_repaired: "Proposition reconstituée. Aucun email envoyé, aucun ticket créé." } as Record<string, string>)[review] ?? manualReplyNotices[review] ?? reviewNotices[review] ?? (review === "saved" ? "Revue enregistrée. Aucun email envoyé, aucun ticket créé par cette validation." : review === "ticket_queued" ? "Action manuelle enregistrée. Le worker vérifie Gmail et HubSpot avant de l’exécuter ; si les écritures sont bloquées, elle reste en attente." : review === "ticket_reconciled" ? "Ticket existant vérifié et rapproché. Aucun nouveau ticket créé." : review.startsWith("SAV_TICKET_") || review.startsWith("SAV_LINK_") || ["SAV_MANUAL_TICKET_INVALID", "SAV_MANUAL_RECONCILIATION_REQUIRED", "SAV_VALIDATED_CURRENT_PROPOSAL_REQUIRED", "SAV_MESSAGE_BEFORE_CUTOVER"].includes(review) ? savManualTicketError(review) : `Action refusée : ${review.slice(0, 100)}`)}</p>}
+    {review && <p className="login-notice" role="status">{({ observation_qualified: "Bilan qualifié. Aucune connaissance publiée.", draft_reviewed: "Verdict du brouillon enregistré. Aucun email envoyé, aucun ticket créé.", SAV_DRAFT_READ_ONLY: "Le brouillon IA est en lecture seule.", context_refreshed: "Contexte client actualisé. La proposition existante n’a pas été modifiée.", proposal_repaired: "Proposition reconstituée. Aucun email envoyé, aucun ticket créé." } as Record<string, string>)[review] ?? manualReplyNotices[review] ?? reviewNotices[review] ?? (review === "saved" ? "Revue enregistrée. Aucun email envoyé, aucun ticket créé par cette validation." : review === "ticket_queued" ? "Action manuelle enregistrée. Le worker vérifie Gmail et HubSpot avant de l’exécuter ; si les écritures sont bloquées, elle reste en attente." : review === "ticket_reconciled" ? "Ticket existant vérifié et rapproché. Aucun nouveau ticket créé." : review.startsWith("SAV_TICKET_") || review.startsWith("SAV_LINK_") || ["SAV_MANUAL_TICKET_INVALID", "SAV_MANUAL_RECONCILIATION_REQUIRED", "SAV_VALIDATED_CURRENT_PROPOSAL_REQUIRED", "SAV_MESSAGE_BEFORE_CUTOVER"].includes(review) ? savManualTicketError(review) : `Action refusée : ${review.slice(0, 100)}`)}</p>}
     <Link className="back-link" href={from === "pilot" ? `/studio/sav/pilote?batch=${encodeURIComponent(batch || detail.pilotItem?.batchId || "")}#batch-review` : "/studio/sav"}><ArrowLeft size={14}/> {from === "pilot" ? "Retour au lot de test" : "Retour à tous les mails"}</Link>
     <div className={`sav-thread-heading ${styles.heading}`}><div><span className="eyebrow">Dossier SAV</span><h1>{detail.thread.subject}</h1></div><div className={styles.customer}><small>Client</small><strong>{detail.thread.customerEmail}</strong><span className={`sav-thread-status ${detail.thread.status}`}>{detail.thread.aiPaused ? <UserRound size={15}/> : <Bot size={15}/>} {savLabel(savThreadStatusLabels, detail.thread.status)}</span></div></div>
 
@@ -95,6 +99,8 @@ export default async function SavThreadPage({ params, searchParams }: { params: 
       <div className={`sav-conversation ${styles.main}`}>
         <MailConversation messages={detail.messages}/>
         {proposalReview && latestInbound && <ProposalReview data={proposalReview} threadId={detail.thread.id} messageId={latestInbound.id} drafts={replyDrafts} context={{ subject: latestInbound.subject, messageCount: detail.messages.length, relatedCount: relatedThreads.length, linkedTicketId: detail.thread.hubspotTicketId }} sendAllowed={!sendDisabledReason} sendDisabledReason={sendDisabledReason} replyState={replyState}/>}
+        {proposalReview && latestInbound && <DraftReview data={proposalReview} threadId={id} messageId={latestInbound.id} drafts={replyDrafts} sendAllowed={!sendDisabledReason} sendDisabledReason={sendDisabledReason} replyState={replyState}/>}
+        <ResolutionObservation rows={observations} isUgo={staff.email.toLowerCase()==="ugo@limova.ai"}/>
         {!proposalReview && currentDecision?.evidence.some((source) => source.claim || source.excerpt) && <section className="card sav-note"><span className="eyebrow">Preuves de la réponse</span><h2>Affirmations reliées aux fiches validées</h2><ul>{currentDecision.evidence.map((source) => <li key={`${source.sourceType}:${source.sourceId}`}><strong>{source.title}</strong>{source.claim && <p>{source.claim}</p>}{source.excerpt && <blockquote>{source.excerpt}</blockquote>}{source.verifiedAt && <small>Fiche vérifiée le {source.verifiedAt}</small>}</li>)}</ul></section>}
         {v0 && !proposalReview && <section className={`card ${styles.context}`}><span className="eyebrow">Proposition IA</span><h2>{latestInbound?.analysisErrorCode ? "Analyse à relancer" : "Aucune proposition disponible"}</h2><p>{!eligible ? "Les anciens emails ne sont pas retraités. Cet email est antérieur à l’activation V0." : latestInbound?.analysisErrorCode ? "L’email est conservé. Vérifiez l’erreur dans les actions à droite avant de relancer." : latestInbound?.processedAt ? "L’analyse enregistrée ne contient pas de proposition exploitable. Le contexte client reste consultable indépendamment." : "Analyse en attente, en cours ou email antérieur à l’activation. Les anciens emails ne sont pas retraités automatiquement."}</p>{eligible && latestInbound?.processedAt && !detail.pilotItem && <form action={repairSavProposalAction}><input type="hidden" name="threadId" value={id}/><input type="hidden" name="messageId" value={latestInbound.id}/><button className="secondary">Reconstituer la proposition manquante</button><p>Uniquement pour un email éligible non revu. Aucun email envoyé, aucun ticket créé.</p></form>}</section>}
 
@@ -139,7 +145,7 @@ export default async function SavThreadPage({ params, searchParams }: { params: 
               <p>Valider le process ne crée pas de ticket. La création et le rattachement demandent un clic séparé.</p>
               {ticketWritesDisabled && <p className="login-notice">Écritures HubSpot désactivées : les boutons enregistrent une demande qui restera en attente.</p>}
               {!detail.thread.hubspotTicketId && <ManualTicketStatus action={manualTicketAction} writesDisabled={ticketWritesDisabled}/>}
-              {!detail.thread.hubspotTicketId && (needsTicketReconciliation ? <><button className="primary" disabled>Créer un ticket HubSpot</button><p>Création bloquée : vérifiez et rapprochez le ticket existant ci-dessous.</p></> : ticketRequestPending ? <><button className="primary" disabled>Demande HubSpot en attente</button><p>Une demande de création ou de rattachement est déjà enregistrée. Suivi disponible dans le journal d’actions.</p></> : proposalReview?.review?.status === "approved" ? <>
+              {!detail.thread.hubspotTicketId && (needsTicketReconciliation ? <><button className="primary" disabled>Créer un ticket HubSpot</button><p>Création bloquée : vérifiez et rapprochez le ticket existant ci-dessous.</p></> : ticketRequestPending ? <><button className="primary" disabled>Demande HubSpot en attente</button><p>Une demande de création ou de rattachement est déjà enregistrée. Suivi disponible dans le journal d’actions.</p></> : proposalReview?.review?.status === "approved" && ["ticket_pending", "human_review_required"].includes(proposalReview.proposal.decision.kind) ? <>
                 <form action={createTicketAction}><input type="hidden" name="threadId" value={id}/><input type="hidden" name="reviewId" value={proposalReview.review.id}/><label>Si ce client a déjà un ticket ouvert : pourquoi est-ce un problème distinct ?<textarea name="distinctIssueReason" maxLength={2_000} placeholder="Justification humaine, au moins 20 caractères si nécessaire"/></label><button className="primary">Créer un ticket HubSpot</button></form>
                 <details><summary>Rattacher à un ticket existant</summary><form action={linkTicketAction}><input type="hidden" name="threadId" value={id}/><input type="hidden" name="reviewId" value={proposalReview.review.id}/><label>ID du ticket existant<input name="ticketId" required pattern="[0-9]+" defaultValue={routing?.kind === "matched" ? routing.ticketId : ""}/></label><button className="secondary">Confirmer le rattachement</button></form></details>
               </> : <><button className="primary" disabled>Créer un ticket HubSpot</button><p>Validez d’abord la proposition courante ci-dessous.</p></>)}

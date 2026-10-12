@@ -1,7 +1,14 @@
 import { describe, expect, it } from "vitest";
-import { cleanSavModelDraft, isSavAiAuthoredReply, LEGACY_AI_CHOICES, LEGACY_AI_DISCLOSURE, LEGACY_AI_NOTICE, renderSavOutboundReply, savReplyFooter } from "./reply-format";
+import { cleanSavModelDraft, isSavAiAuthoredReply, LEGACY_AI_CHOICES, LEGACY_AI_DISCLOSURE, LEGACY_AI_NOTICE, renderSavOutboundReply, savReplyFooter, SAV_REPLY_SIGNATURE, SAV_REPLY_NOTICE } from "./reply-format";
 
 describe("SAV send-only formatting", () => {
+  it("uses exactly Charly as the common signature, with a separate AI notice", () => {
+    expect(SAV_REPLY_SIGNATURE).toBe("Charly");
+    expect(savReplyFooter()).toBe(`Charly\n${SAV_REPLY_NOTICE}`);
+    const historical = `Charly, assistant IA SAV\n${SAV_REPLY_NOTICE}`;
+    expect(isSavAiAuthoredReply(`Ancienne réponse\n\n${historical}`)).toBe(true);
+    expect(cleanSavModelDraft(`Bonjour, modèle fictif.\n\n${historical}`)).toBe("Bonjour, modèle fictif.");
+  });
   it.each(["fr", "en"] as const)("renders the %s footer once without changing the draft", language => {
     const draft = language === "en" ? "Hello, which error do you see?" : "Bonjour, quelle erreur voyez-vous ?";
     const sent = renderSavOutboundReply(draft, language);
@@ -14,6 +21,13 @@ describe("SAV send-only formatting", () => {
   it("recognizes historical authorship without rewriting historical storage", () => {
     expect(isSavAiAuthoredReply(`${LEGACY_AI_DISCLOSURE}\nAncienne réponse`)).toBe(true);
     expect(isSavAiAuthoredReply("Une réponse humaine." )).toBe(false);
+  });
+  it("renders a single current footer from a historical or mixed-language trailing footer", () => {
+    const body = "Bonjour, modèle fictif.";
+    const oldDraft = `${body}\n\nCharly, assistant IA SAV\n${SAV_REPLY_NOTICE}`;
+    expect(renderSavOutboundReply(oldDraft)).toBe(`${body}\n\n${savReplyFooter()}`);
+    expect(oldDraft).toContain("Charly, assistant IA SAV");
+    expect(renderSavOutboundReply(`${body}\n\n${savReplyFooter("fr")}\n\n${savReplyFooter("en")}`)).toBe(`${body}\n\n${savReplyFooter("fr")}`);
   });
   it("removes only app-owned boilerplate from new model output", () => {
     const body = "Bonjour, quelle erreur obtenez-vous ?";

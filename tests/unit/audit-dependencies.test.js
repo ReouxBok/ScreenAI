@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { bracesException, evaluateAudit } from '../../scripts/audit-dependencies.mjs';
 
-const now = new Date('2026-10-05T12:00:00Z');
+const now = new Date('2026-10-11T12:00:00Z');
 function fixture() {
   return {
     report: {
@@ -25,9 +25,13 @@ describe('temporary advisory-scoped security gate', () => {
     report.vulnerabilities.braces.via.push({ dependency: 'braces', severity, url: 'https://github.com/advisories/GHSA-other' });
     expect(evaluateAudit(report, lock, now).ok).toBe(false);
   });
-  it.each(['2026-10-04T23:59:59Z', '2026-10-12T00:00:00Z'])('rejects outside the approval period: %s', (date) => {
+  it.each(['2026-10-10T23:59:59Z', '2026-10-19T00:00:00Z'])('rejects outside the approval period: %s', (date) => {
     const { report, lock } = fixture();
     expect(evaluateAudit(report, lock, new Date(date)).ok).toBe(false);
+  });
+  it.each(['2026-10-12T00:00:00Z', '2026-10-18T23:59:59.999Z'])('accepts within the explicit renewed period: %s', (date) => {
+    const { report, lock } = fixture();
+    expect(evaluateAudit(report, lock, new Date(date)).ok).toBe(true);
   });
   it('rejects a different installed version', () => {
     const { report, lock } = fixture();
