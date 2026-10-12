@@ -1,3 +1,4 @@
+import { formatParisDateTime } from "@/lib/paris-date";
 import type { getSavReplyDrafts } from "@/lib/sav/drafts";
 import type { getSavProposalReview } from "@/lib/sav/review";
 import { saveReplyDraftAction } from "../actions";
@@ -13,6 +14,6 @@ export function ReplyDraft({ drafts, proposal, threadId, messageId }: { drafts: 
       <div className="decision-buttons"><button className="secondary" name="status" value="draft">Enregistrer une version</button><button className="primary" name="status" value="validated" disabled={proposal.review?.status !== "approved" || Boolean(current?.stale)}>Valider en interne</button><button className="secondary" name="status" value="abandoned">Abandonner le brouillon</button></div>
       {proposal.review?.status !== "approved" && <p>Validez d’abord le process. Vous pouvez déjà enregistrer le brouillon.</p>}
     </form>
-    <details><summary>Historique des versions ({drafts.versions.length}{drafts.versions.length === 50 ? " dernières" : ""})</summary>{drafts.versions.map((d) => <article key={d.id}><p>Version {d.revision} · {labels[d.status]}{d.stale ? " · contexte obsolète" : ""} · {d.createdBy} · {d.createdAt.toLocaleString("fr-FR")}</p><pre>{d.text}</pre></article>)}</details>
+    <details><summary>Historique des versions ({drafts.versions.length}{drafts.versions.length === 50 ? " dernières" : ""})</summary>{drafts.versions.map((d) => <article key={d.id}><p>Version {d.revision} · {labels[d.status]}{d.stale ? " · contexte obsolète" : ""} · {d.createdBy} · {formatParisDateTime(d.createdAt)}</p><pre>{d.text}</pre></article>)}</details>
   </section>;
 }

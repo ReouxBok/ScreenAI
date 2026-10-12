@@ -30,7 +30,7 @@ import { proposeSavFromOnboarding } from "@/lib/knowledge/candidates";
 import { reviewSavProposal } from "@/lib/sav/review";
 import { queueSavManualTicket } from "@/lib/sav/manual-tickets";
 import { retrySavAnalysis, repairSavProposal } from "@/lib/sav/service";
-import { collectSavDossierContext } from "@/lib/sav/dossier-context";
+import { collectLatestSavDossierContext } from "@/lib/sav/dossier-context";
 import { qualifySavObservation } from "@/lib/sav/observations";
 import { reviewSavDraft } from "@/lib/sav/draft-verdicts";
 import { assertSavManualReplyEnabled, queueSavManualReply } from "@/lib/sav/manual-replies";
@@ -152,7 +152,7 @@ export async function createTicketAction(form: FormData) {
   const staff = await requireApiStaff("admin");
   const threadId = id(form, "threadId");
   let errorCode = "";
-  try { await queueSavManualTicket({ threadId, reviewId: id(form, "reviewId"), kind: "create_ticket", ticketId: String(form.get("ticketId") || "") || undefined, returnOperation: String(form.get("returnOperation") || "") || undefined, distinctIssueReason: String(form.get("distinctIssueReason") || "") }, staff.email); }
+  try { await refreshTicketContext(threadId); await queueSavManualTicket({ threadId, reviewId: id(form, "reviewId"), kind: "create_ticket", ticketId: String(form.get("ticketId") || "") || undefined, returnOperation: String(form.get("returnOperation") || "") || undefined, distinctIssueReason: String(form.get("distinctIssueReason") || "") }, staff.email); }
   catch (error) { errorCode = error instanceof Error && /^[A-Z][A-Z_]+$/.test(error.message) ? error.message : "SAV_MANUAL_TICKET_INVALID"; }
   revalidatePath("/studio/sav");
   revalidatePath(`/studio/sav/${threadId}`);
@@ -163,10 +163,19 @@ export async function linkTicketAction(form: FormData) {
   const staff = await requireApiStaff("admin");
   const threadId = id(form, "threadId");
   let errorCode = "";
-  try { await queueSavManualTicket({ threadId, reviewId: id(form, "reviewId"), kind: "link_ticket", ticketId: id(form, "ticketId"), returnOperation: String(form.get("returnOperation") || "") || undefined }, staff.email); }
+  try { await refreshTicketContext(threadId); await queueSavManualTicket({ threadId, reviewId: id(form, "reviewId"), kind: "link_ticket", ticketId: id(form, "ticketId"), returnOperation: String(form.get("returnOperation") || "") || undefined }, staff.email); }
   catch (error) { errorCode = error instanceof Error && /^[A-Z][A-Z_]+$/.test(error.message) ? error.message : "SAV_MANUAL_TICKET_INVALID"; }
   revalidatePath("/studio/sav"); revalidatePath(`/studio/sav/${threadId}`);
   redirect(`/studio/sav/${encodeURIComponent(threadId)}?review=${errorCode || "ticket_queued"}`);
+}
+
+async function refreshTicketContext(threadId: string) {
+  try {
+    const dossier = await collectLatestSavDossierContext(threadId);
+    if (dossier.crm.status !== "ready") throw new Error("SAV_CONTEXT_REFRESH_FAILED");
+  } catch {
+    throw new Error("SAV_CONTEXT_REFRESH_FAILED");
+  }
 }
 
 export async function retryAnalysisAction(form: FormData) {
@@ -179,7 +188,7 @@ export async function refreshSavContextAction(form: FormData) {
   await requireApiStaff("admin");
   const threadId = id(form, "threadId");
   let notice = "context_refreshed";
-  try { await collectSavDossierContext(id(form, "messageId")); }
+  try { await refreshTicketContext(threadId); }
   catch { notice = "SAV_CONTEXT_REFRESH_FAILED"; }
   revalidatePath(`/studio/sav/${threadId}`);
   redirect(`/studio/sav/${encodeURIComponent(threadId)}?review=${notice}`);

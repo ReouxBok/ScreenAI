@@ -1049,7 +1049,7 @@ export async function getSavThreadDetail(threadId: string) {
   const db = requireDb();
   const [thread] = await db.select().from(savThreads).where(eq(savThreads.id, threadId)).limit(1);
   if (!thread) return null;
-  const messages = await db.select().from(savMessages).where(eq(savMessages.threadId, threadId)).orderBy(savMessages.receivedAt);
+  const messages = await db.select().from(savMessages).where(eq(savMessages.threadId, threadId)).orderBy(savMessages.receivedAt, savMessages.createdAt, savMessages.id);
   const messageIds = messages.map((message) => message.id);
   const decisions = messageIds.length
     ? await db.select().from(savDecisions).where(inArray(savDecisions.messageId, messageIds)).orderBy(savDecisions.createdAt)
