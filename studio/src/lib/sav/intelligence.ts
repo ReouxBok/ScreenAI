@@ -21,6 +21,7 @@ import { deterministicDecision, containsPromptInjection, safeSavHumanHandoffDraf
 import { cleanSavModelDraft } from "./reply-format";
 import type { SavDossierContext } from "./dossier-context";
 import { selectSavLeadTemplate } from "./lead-template";
+import { resolveSavCustomerMessage } from "./forwarded-identity";
 
 import { understandSavMessage } from "./understanding-model";
 import { checkSavReplyCoherence } from "./reply-coherence";
@@ -432,6 +433,16 @@ function restrictedSemanticAnalysis(understanding: SavUnderstandingV1): SavAnaly
 /** Understand once, apply server policy, compose, then freeze the reviewed snapshot. */
 export async function analyzeSavMessage(input: SavEnrichedInput, context: SavAnalysisContext = {}): Promise<SavAnalysis> {
   if (context.evaluation && (context.messageId || context.pilotBatchId)) throw new Error("SAV_EVALUATION_PERSISTENCE_FORBIDDEN");
+  const customerMessage = resolveSavCustomerMessage({ fromEmail: input.from, subject: input.subject, body: input.body });
+  const customerIdentity = { kind: customerMessage.kind, email: customerMessage.email };
+  if (customerMessage.kind !== "sender" && (input.dossierContext?.customerIdentity?.kind !== customerIdentity.kind
+    || input.dossierContext.customerIdentity.email !== customerIdentity.email)) {
+    // Old enrichment belongs to the colleague, not to the forwarded customer.
+    input = { ...input, dossierContext: undefined, conversation: undefined };
+  }
+  if (customerMessage.kind === "forwarded" && customerMessage.email) {
+    input = { ...input, from: customerMessage.email, subject: customerMessage.subject, body: customerMessage.body };
+  }
   const messageContext = buildSavInboundContext(input);
   const preflight = deterministicDecision(input);
   let crm = input.dossierContext?.crm.data ?? null;
@@ -439,14 +450,14 @@ export async function analyzeSavMessage(input: SavEnrichedInput, context: SavAna
   const technical = preflight.reasonCode !== "semantic_understanding_required";
   if (!technical && !input.dossierContext) {
     try {
-      conversation ??= context.messageId ? await loadSavConversation(context.messageId) : undefined;
+      conversation ??= customerMessage.kind === "sender" && context.messageId ? await loadSavConversation(context.messageId) : undefined;
       const { extractSavIdentityHints } = await import("./identity");
-      crm = await (context.evaluation?.readHubspotContext ?? readSavHubspotContext)({ email: input.from, subject: input.subject, currentTicketId: conversation?.senderMatchesCustomer ? conversation.hubspotTicketId : undefined,
-        identityHints: extractSavIdentityHints([messageContext.currentText, messageContext.signatureText].filter(Boolean).join("\n"), input.displayName), toleratePartial: true });
+      if (customerIdentity.email) crm = await (context.evaluation?.readHubspotContext ?? readSavHubspotContext)({ email: customerIdentity.email, subject: input.subject, currentTicketId: customerIdentity.kind === "sender" && conversation?.senderMatchesCustomer ? conversation.hubspotTicketId : undefined,
+        identityHints: customerMessage.kind === "sender" ? extractSavIdentityHints([messageContext.currentText, messageContext.signatureText].filter(Boolean).join("\n"), input.displayName) : undefined, toleratePartial: true });
     } catch { /* An unavailable read is never interpreted as an absent customer. */ }
   }
-  const enriched: SavEnrichedInput = { ...input, messageContext, conversation, dossierContext: input.dossierContext ?? { version: 1, messageId: context.messageId ?? "", collectedAt: new Date().toISOString(),
-    crm: { status: crm ? crm.errorCode ? "partial" : "ready" : "error", data: crm, errorCode: crm?.errorCode ?? (crm ? null : "SAV_HUBSPOT_CONTEXT_UNAVAILABLE") },
+  const enriched: SavEnrichedInput = { ...input, messageContext, conversation, dossierContext: input.dossierContext ?? { version: 1, messageId: context.messageId ?? "", collectedAt: new Date().toISOString(), customerIdentity,
+    crm: { status: crm ? crm.errorCode ? "partial" : "ready" : "error", data: crm, errorCode: crm?.errorCode ?? (crm ? null : customerIdentity.kind === "unresolved_forward" ? "SAV_FORWARDED_CUSTOMER_UNRESOLVED" : "SAV_HUBSPOT_CONTEXT_UNAVAILABLE") },
     conversation: conversation ?? null, conversationError: null, otherConversations: [], otherConversationsError: null } };
   let analysis: SavAnalysis;
   if (technical) {
@@ -500,6 +511,13 @@ export async function analyzeSavMessage(input: SavEnrichedInput, context: SavAna
       // Identity is an internal permission check. No late boilerplate question may
       // overwrite a contextual reply, repeat known information, or revive a forbidden draft.
     }
+  }
+  if (customerMessage.kind === "unresolved_forward") {
+    analysis.proposal = { kind: "human_review_required", reasonCode: "forwarded_customer_unresolved",
+      explanation: "L’adresse du client dans le transfert n’a pas pu être vérifiée sans ambiguïté. Confirmer l’identité du client avant toute réponse ou action HubSpot.",
+      confidence: 0, requiresHumanApproval: true };
+    analysis.replyDraft = null;
+    analysis.ticketRouting = { kind: "review", reason: "forwarded_customer_unresolved", candidateIds: [] };
   }
   analysis.structuredProposal = buildSavStructuredProposal(enriched, analysis);
   if (context.messageId) {

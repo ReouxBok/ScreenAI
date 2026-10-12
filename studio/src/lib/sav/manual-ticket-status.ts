@@ -3,7 +3,10 @@ export function savManualTicketError(code: string | null): string {
   if (code === "SAV_TICKET_RETURN_CONTEXT_CHANGED") return "Le ticket ou sa clôture a changé. Actualisez le contexte et confirmez de nouveau l’action proposée.";
   if (code === "SAV_TICKET_RETURN_EMAIL_TOO_LARGE") return "L’email dépasse la taille autorisée pour une note. Ajoutez-le manuellement dans HubSpot.";
   if (code === "SAV_TICKET_RETURN_RECONCILIATION_REQUIRED") return "La note ou la réouverture a peut-être abouti. Vérifiez le ticket dans HubSpot ; aucune nouvelle tentative automatique.";
+  if (code === "SAV_TICKET_RETURN_LEGACY_OWNER_UNVERIFIABLE") return "Cette ancienne action ne contient pas de preuve du propriétaire attendu. Faites vérifier et terminer l’opération dans HubSpot ; le Studio ne peut pas la rapprocher automatiquement. Ne recréez pas la note ni le ticket.";
   const messages: Record<string, string> = {
+    SAV_FORWARDED_CUSTOMER_UNRESOLVED: "L’adresse du client transféré est ambiguë ou absente. Faites vérifier le message original ; aucun contact ni ticket ne sera créé.",
+    SAV_TICKET_OWNER_REQUIRED: "Le propriétaire du ticket ne peut pas être vérifié. Vérifiez son attribution dans HubSpot puis actualisez le contexte avant de confirmer de nouveau.",
     SAV_VALIDATED_CURRENT_PROPOSAL_REQUIRED: "Validez la proposition courante avant de créer ou rattacher le ticket.",
     SAV_PROPOSAL_STALE: "La proposition validée a changé. Relisez le dernier email et validez la proposition courante avant de reprendre.",
     SAV_HUBSPOT_CONTACT_REQUIRED: "Aucun contact HubSpot confirmé pour ce dossier. Vérifiez l’email d’inscription dans le dossier puis revalidez la proposition. Aucun contact créé.",
