@@ -7,7 +7,10 @@ import { correctSavDecision, ingestInboundMessage, listSavPilotCandidates, proce
 import { decryptSavPayload, encryptSavPayload } from "./crypto";
 import { processGmailReceipt } from "./gmail";
 
-const state = vi.hoisted(() => ({ db: null as unknown, crm: vi.fn() }));
+import { understandingFixture } from "../../../test/sav-understanding-fixtures";
+
+const state = vi.hoisted(() => ({ db: null as unknown, crm: vi.fn(), understand: vi.fn() }));
+vi.mock("./understanding-model", async (original) => ({ ...await original<typeof import("./understanding-model")>(), understandSavMessage: state.understand }));
 vi.mock("@/db", () => ({ requireDb: () => state.db }));
 vi.mock("./hubspot", async (importOriginal) => ({ ...await importOriginal<typeof import("./hubspot")>(), readSavHubspotContext: state.crm }));
 let fixture: Awaited<ReturnType<typeof createSavTestDb>>;
@@ -18,6 +21,7 @@ beforeAll(async () => { fixture = await createSavTestDb(); state.db = fixture.db
 afterAll(async () => { await fixture?.client.close(); });
 afterEach(() => { vi.unstubAllEnvs(); vi.unstubAllGlobals(); });
 beforeEach(async () => {
+  state.understand.mockImplementation(async (...args) => (await vi.importActual<typeof import("./understanding-model")>("./understanding-model")).understandSavMessage(...args as Parameters<typeof import("./understanding-model").understandSavMessage>));
   state.crm.mockResolvedValue({ contactFound: true, contactId: "contact-fixture", tickets: [], routing: { kind: "new", reason: "no_open_ticket", candidateIds: [] } });
   vi.stubEnv("SAV_RELEASE_STAGE", "v0"); vi.stubEnv("SAV_PILOT_MODE", "false"); vi.stubEnv("SAV_AI_ANALYSIS", "false");
   vi.stubEnv("SAV_ENCRYPTION_KEY_V1", "test-only-sav-encryption-key-32-characters");
@@ -110,6 +114,10 @@ describe("immutable post-deployment SAV V0 cutover", () => {
     await expect(correctSavDecision(first!.id, { kind: "spam", reasonCode: "old_correction", explanation: "Tentative de correction d’une décision obsolète." }, "ugo@limova.ai")).rejects.toThrow("SAV_DECISION_NOT_CURRENT");
   });
   it("a non-support message does not close a paused or linked customer dossier", async () => {
+    const understood = understandingFixture();
+    understood.requests[0] = { ...understood.requests[0], nature: "acknowledgement", summary: "Remercier le support." };
+    understood.evidence[0].excerpt = "Merci beaucoup !";
+    state.understand.mockResolvedValueOnce(understood);
     await activateSavV0Cutover(boundary);
     await fixture.db.update(savThreads).set({ aiPaused: true, status: "human_processing", hubspotTicketId: "fixture-ticket" }).where(eq(savThreads.id, threadId));
     await ingestInboundMessage({ mailboxEmail: boundary.mailboxEmail, gmailMessageId: "thanks", gmailThreadId: "fixture-thread", from: "customer@example.com", subject: "Re: aide", bodyText: "Merci beaucoup !", receivedAt: "2026-10-02T12:01:00Z" });
@@ -117,6 +125,17 @@ describe("immutable post-deployment SAV V0 cutover", () => {
     expect(thread).toMatchObject({ aiPaused: true, status: "human_processing", hubspotTicketId: "fixture-ticket" });
     const [decision] = await fixture.db.select().from(savDecisions); expect(decision.kind).toBe("no_ticket_needed");
     expect(await fixture.db.select().from(savActions)).toHaveLength(0);
+  });
+  it.each(["human_requested", "human_processing"] as const)("preserves %s and its deadline when a follow-up cannot be understood", async (status) => {
+    await activateSavV0Cutover(boundary);
+    const requestedAt = new Date("2026-10-02T12:00:00Z"), dueAt = new Date("2026-10-05T12:00:00Z");
+    await fixture.db.update(savThreads).set({ aiPaused: true, status, humanRequestedAt: requestedAt, humanDueAt: dueAt, hubspotTicketId: "fixture-ticket" }).where(eq(savThreads.id, threadId));
+    await ingestInboundMessage({ mailboxEmail: boundary.mailboxEmail, gmailMessageId: "unavailable-follow-up", gmailThreadId: "fixture-thread", from: "customer@example.com", subject: "Re: aide", bodyText: "Merci beaucoup !", receivedAt: "2026-10-02T12:01:00Z" });
+    const [thread] = await fixture.db.select().from(savThreads).where(eq(savThreads.id, threadId));
+    expect(thread).toMatchObject({ aiPaused: true, status, humanRequestedAt: requestedAt, humanDueAt: dueAt, hubspotTicketId: "fixture-ticket" });
+    const [decision] = await fixture.db.select().from(savDecisions);
+    expect(decision).toMatchObject({ kind: "human_review_required", reasonCode: "understanding_unavailable" });
+    expect((await fixture.db.select().from(savActions)).every(action => action.status === "pending")).toBe(true);
   });
   it("persists recovery pagination and only advances history after the complete scan", async () => {
     await activateSavV0Cutover(boundary);

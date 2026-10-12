@@ -30,7 +30,7 @@ export async function SavV0Inbox({ searchParams }: { searchParams: Promise<{ vie
         <OpenEmailButton subject={row.subject}>
         <span className="ledger-rail" aria-hidden="true"><i className={row.reviewId ? "decided" : "missing"}/></span>
         <span className="ledger-mail"><small>{row.receivedAt.toLocaleString("fr-FR")}</small><strong>{row.subject}</strong><span>{row.fromEmail}</span><p>{row.preview}</p></span>
-        <span className="ledger-decision"><strong>{row.decisionKind ? savLabel(savDecisionLabels, row.decisionKind) : "Analyse en attente"}</strong><p>{row.explanation}</p>{row.confidence !== null && <small>Confiance IA : {Math.round(row.confidence / 10)} %</small>}</span>
+        <span className="ledger-decision"><strong>{row.decisionKind ? savLabel(savDecisionLabels, row.decisionKind) : "Analyse en attente"}</strong><p>{row.explanation}</p>{row.confidence !== null && <small>Estimation IA non calibrée · validation humaine requise.</small>}</span>
         <span className={`ledger-action ${styles.state}`}>
           <strong>{proposalState}</strong>
           {row.analysisErrorCode && <><small>{hasReview ? "Analyse IA dégradée" : "Revue humaine nécessaire"}</small><code>{row.analysisErrorCode}</code></>}

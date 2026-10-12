@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { savReplyCoverageSchema } from "../understanding";
 
 export const savAgentOutputSchema = z.object({
   category: z.enum(["technical", "account", "billing", "integration", "how_to", "acknowledgement", "other"]),
@@ -11,6 +12,7 @@ export const savAgentOutputSchema = z.object({
   responseKind: z.enum(["none", "acknowledgement", "clarification", "solution", "handoff"]),
   replyDraft: z.string().max(8_000),
   internalNote: z.string().max(8_000),
+  coverage: savReplyCoverageSchema.optional(),
   evidenceIds: z.array(z.string().trim().min(1).max(200)).max(20),
   citations: z.array(z.object({
     sourceId: z.string().trim().min(1).max(200),

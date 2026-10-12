@@ -8,10 +8,22 @@ import { assertSavAcceptedDraft } from "./draft-verdicts";
 import { savAutomationMode, savReleaseStage } from "./config";
 import { decryptSavPayload, encryptSavPayload, savContentHash } from "./crypto";
 import { savV0EligibleMessageFilter } from "./cutover";
-import { buildSavInboundContext } from "./message-context";
+import { splitSavMessageText } from "./message-context";
+import type { SavStructuredProposal } from "./proposal";
 import { renderSavOutboundReply, SAV_REPLY_FORMAT_REVISION } from "./reply-format";
 
 const requestSchema = z.object({ threadId: z.uuid(), draftId: z.uuid() }).strict();
+
+/** New decisions use the reviewed understanding. Historical drafts retain their
+ * send-only language behavior; this compatibility path never classifies a case. */
+function replyLanguage(proposal: SavStructuredProposal, body: string) {
+  if (proposal.understanding) return proposal.understanding.language;
+  if (proposal.messageContext?.language && proposal.messageContext.language !== "unknown") return proposal.messageContext.language;
+  const current = splitSavMessageText(body).currentText;
+  const english = (current.match(/\b(?:hello|please|thanks|thank|my|need|would|could|cannot|invoice|subscription|account|available)\b/gi) ?? []).length;
+  const french = (current.match(/\b(?:bonjour|merci|mon|mes|je|vous|pour|souhaite|facture|abonnement|compte|disponible)\b/gi) ?? []).length;
+  return english > french ? "en" : french > 0 ? "fr" : "unknown";
+}
 
 export function assertSavManualReplyEnabled() {
   if (savReleaseStage() !== "v0") throw new Error("SAV_REPLY_MANUAL_INVALID_STAGE");
@@ -41,7 +53,7 @@ export async function queueSavManualReply(raw: unknown, actorEmail: string) {
     const context = await assertSavAcceptedDraft(draft, tx);
     const source = context.message;
     if (!source) throw new Error("SAV_REPLY_MANUAL_CONTEXT_CHANGED");
-    const language = buildSavInboundContext({ subject: source.subject, body: decryptSavPayload<{ text: string }>(source.bodyCiphertext).text }).language;
+    const language = replyLanguage(context.proposal, decryptSavPayload<{ text: string }>(source.bodyCiphertext).text);
     const outboundText = renderSavOutboundReply(decryptSavPayload<{ text: string }>(draft.bodyCiphertext).text, language);
     const values = { threadId: thread.id, messageId: draft.messageId, decisionId: context.decision.id,
       kind: "send_reply", actorType: "human", actorEmail, status: "pending", errorCode: null, scheduledAt: null,
@@ -75,7 +87,7 @@ export async function assertSavCurrentManualReply(action: typeof savActions.$inf
   if (!/^<[^<>\s]+@[^<>\s]+>$/.test(body.headers?.["message-id"] ?? "")) throw new Error("SAV_REPLY_MANUAL_THREAD_HEADERS_MISSING");
   if (action.payload.replyFormatRevision !== SAV_REPLY_FORMAT_REVISION || typeof action.payload.outboundBodyCiphertext !== "string") throw new Error("SAV_REPLY_MANUAL_FORMAT_RECONFIRM_REQUIRED");
   const outboundText = decryptSavPayload<{ text: string }>(action.payload.outboundBodyCiphertext).text;
-  const language = buildSavInboundContext({ subject: message.subject, body: body.text }).language;
+  const language = replyLanguage(context.proposal, body.text);
   if (outboundText !== renderSavOutboundReply(decryptSavPayload<{ text: string }>(draft.bodyCiphertext).text, language) || action.payload.outboundBodyHash !== savContentHash(outboundText)) throw new Error("SAV_REPLY_MANUAL_OUTBOUND_CHANGED");
   return { draft, message, outboundText };
 }

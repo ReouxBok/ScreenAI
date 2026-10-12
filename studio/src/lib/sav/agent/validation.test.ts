@@ -8,7 +8,7 @@ const output: SavAgentOutput = { category: "technical", urgency: "normal", ticke
   requiresHuman: false, responseKind: "solution", replyDraft: "Procédure", internalNote: "", evidenceIds: ["card-1"],
   citations: [{ sourceId: "card-1", claim: "Utiliser la procédure", quote: "Cliquez sur Enregistrer" }] };
 const traces: SavAgentToolTrace[] = SAV_AGENT_TOOL_NAMES.map((name, index) => ({ name, sequence: index + 1, status: "succeeded", inputHash: "fixture", durationMs: 1 }));
-const evidence = [{ sourceType: "knowledge" as const, sourceId: "card-1", title: "Procédure" }];
+const evidence = [{ sourceType: "knowledge" as const, sourceId: "card-1", contentVersionId: "card-version-1", title: "Procédure" }];
 const freshKnowledge = new Map([["card-1", { content: "Cliquez sur Enregistrer pour appliquer la modification.", verifiedAt: new Date().toISOString(), score: 0.9, resolution: { steps: ["Cliquez sur Enregistrer"], conflictsWith: [] } }]]);
 describe("SAV mandatory analysis stages", () => {
   it("rejects a confident answer that skipped a required tool", () => {
@@ -40,6 +40,10 @@ describe("SAV mandatory analysis stages", () => {
     expect(() => assertSavAnalysisComplete(output, traces, evidence, new Map([["card-1", { ...freshKnowledge.get("card-1")!, score: 0.2 }]]))).toThrow("SAV_CITATION_RELEVANCE_TOO_LOW");
     expect(() => assertSavAnalysisComplete(output, traces, evidence, new Map([["card-1", { ...freshKnowledge.get("card-1")!, verifiedAt: "2020-01-01" }]]))).toThrow("SAV_CITATION_STALE");
     expect(() => assertSavAnalysisComplete(output, traces, evidence, new Map([["card-1", { ...freshKnowledge.get("card-1")!, resolution: { steps: ["A"], validUntil: "2020-01-01" } }]]))).toThrow("SAV_CITATION_EXPIRED");
+  });
+  it("requires a recorded source version and refuses future verification dates", () => {
+    expect(() => assertSavAnalysisComplete(output, traces, evidence.map(({ contentVersionId, ...source }) => { void contentVersionId; return source; }), freshKnowledge)).toThrow("SAV_CITATION_VERSION_REQUIRED");
+    expect(() => assertSavAnalysisComplete(output, traces, evidence, new Map([["card-1", { ...freshKnowledge.get("card-1")!, verifiedAt: new Date(Date.now() + 86400000).toISOString() }]]))).toThrow("SAV_CITATION_STALE");
   });
   it("allows a claim-free acknowledgement without manufacturing a citation", () => {
     expect(() => assertSavAnalysisComplete({ ...output, responseKind: "acknowledgement", replyDraft: "Votre demande est bien reçue.", evidenceIds: [], citations: [] }, traces, [])).not.toThrow();

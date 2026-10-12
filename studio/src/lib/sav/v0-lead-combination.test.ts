@@ -13,7 +13,10 @@ import { syncSavObservation } from "./observations";
 import type { SavStructuredProposal } from "./proposal";
 import { decisionKindSchema } from "./policy";
 
-const state = vi.hoisted(() => ({ db: null as unknown, search: vi.fn(), crm: vi.fn(), agent: vi.fn() }));
+import { understandingFixture } from "../../../test/sav-understanding-fixtures";
+
+const state = vi.hoisted(() => ({ db: null as unknown, search: vi.fn(), crm: vi.fn(), agent: vi.fn(), understand: vi.fn() }));
+vi.mock("./understanding-model", () => ({ understandSavMessage: state.understand }));
 vi.mock("@/db", () => ({ requireDb: () => state.db }));
 vi.mock("@/lib/search", () => ({ searchKnowledge: state.search }));
 vi.mock("./hubspot", () => ({ readSavHubspotContext: state.crm }));
@@ -41,6 +44,11 @@ beforeEach(async () => {
   state.search.mockResolvedValue({ revision: revision.id, results: [{ id: "fictitious-lead-card", contentVersionId: "fictitious-v1", title: "Modèle fictif",
     content: template, score: 0.9, verifiedAt: new Date().toISOString().slice(0, 10), resolution: { audience: "lead", responseTemplate: template,
       symptoms: ["Découverte avant achat"], steps: ["Formulaire fictif"], escalation: "Qualification humaine" } }] });
+  const understood = understandingFixture({ customerRelationship: { kind: "prospect", evidenceIds: ["evidence-1"] } });
+  understood.requests[0] = { ...understood.requests[0], nature: "commercial", summary: "Découvrir Limova avant achat." };
+  understood.evidence[0].excerpt = inbound.body;
+  state.understand.mockResolvedValue(understood);
+  state.crm.mockResolvedValue({ contactFound: false, tickets: [], routing: { kind: "new", reason: "no_open_ticket", candidateIds: [] } });
   const analysis = await analyzeSavMessage(inbound);
   proposal = analysis.structuredProposal!;
   const [mailbox] = await fixture.db.insert(savMailboxes).values({ email: "contact@limova.ai" }).returning();
@@ -104,7 +112,7 @@ describe("Combined SAV-38/39/40 V0 contracts with a sourced fictitious lead draf
     const [observation] = await fixture.db.select().from(savResolutionObservations);
     expect(observation).toMatchObject({ state: "waiting_ticket", hubspotTicketId: null });
     const collect = vi.fn(); await syncSavObservation(observation.id, collect, new Date());
-    expect(collect).not.toHaveBeenCalled(); expect(state.crm).not.toHaveBeenCalled();
+    expect(collect).not.toHaveBeenCalled(); expect(state.crm).toHaveBeenCalledTimes(1);
     expect(await fixture.db.select().from(savActions)).toHaveLength(0);
     expect(await fixture.db.select().from(savLearningCandidates)).toHaveLength(0);
     expect(denyNetwork).not.toHaveBeenCalled();

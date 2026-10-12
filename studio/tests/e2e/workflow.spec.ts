@@ -460,7 +460,8 @@ test("dix membres créent et enregistrent leurs tutoriels en parallèle", async 
     await Promise.all(pages.map((page) => page.getByRole("button", { name: "Créer la démonstration" }).click()));
 
     const sessions = await Promise.all(pages.map(async (page, index) => {
-      await expect(page).toHaveURL(/\/studio\/entrainements\/[0-9a-f-]+\?token=/);
+      // Ten concurrent redirects include development compilation and rendering.
+      await expect(page).toHaveURL(/\/studio\/entrainements\/[0-9a-f-]+\?token=/, { timeout: 30_000 });
       const token = (await page.locator(".training-code code").textContent())?.trim();
       expect(token).toBeTruthy();
       return { token: token!, context: contexts[index], path: `/parallel-${index + 1}` };

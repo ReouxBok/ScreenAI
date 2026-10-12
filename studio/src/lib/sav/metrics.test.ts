@@ -71,16 +71,18 @@ describe("V0 metrics, reviewed replays and documentary deployment decisions", ()
     const first = await runReviewedSavRuleReplay("ugo@limova.ai");
     const second = await runReviewedSavRuleReplay("ugo@limova.ai");
     const runs = await fixture.db.select().from(savReviewedReplayRuns);
-    expect(runs.find((r) => r.id === first.id)).toMatchObject({ total: 1, failed: 0, result: { regression: null, scope: "deterministic_rules_only" } });
-    expect(runs.find((r) => r.id === second.id)?.result).toMatchObject({ regression: false, baselineId: first.id });
+    expect(runs.find((r) => r.id === first.id)).toMatchObject({ total: 1, failed: 0, result: { regression: null, scope: "technical_preflight_only", notEvaluated: 1 } });
+    expect(runs.find((r) => r.id === second.id)?.result).toMatchObject({ regression: null, baselineId: first.id });
     expect(network).not.toHaveBeenCalled();
   });
-  it("reports failing rules and blocks promotion instead of presenting the replay as agent quality", async () => {
+  it("reports semantic cases as unevaluated and blocks promotion without inventing agent quality", async () => {
     await createReviewedSavReplay({ ...replayInput(), scenario: "Je souhaite parler à un humain pour retrouver mes factures" }, "ugo@limova.ai");
     await runReviewedSavRuleReplay("ugo@limova.ai");
     const data = await getSavV0Dashboard();
-    expect(data.replayHistory[0].failed).toBe(1);
-    expect(data.versions[0].gate.reasons).toContain("SAV_V0_REPLAY_FAILED");
+    expect(data.replayHistory[0].failed).toBe(0);
+    expect(data.replayHistory[0].result.notEvaluated).toBe(1);
+    expect(data.versions[0].gate.reasons).toContain("SAV_V0_REPLAY_REQUIRED");
+    expect(data.replay[0].notEvaluated).toBe(1);
     await expect(recordSavDeploymentDecision({ snapshotHash: data.snapshotHash, versionId: data.versions[0].id, decision: "request_promotion", reason: "Demande fictive qui doit rester bloquée" }, "ugo@limova.ai")).rejects.toThrow("SAV_DEPLOYMENT_GATE_BLOCKED");
   });
   it("records only Ugo's documentary hold decision with exact evidence and detects stale reviews", async () => {
@@ -100,7 +102,7 @@ describe("V0 metrics, reviewed replays and documentary deployment decisions", ()
     await fixture.db.update(savProposalReviews).set({ isCurrent: false }).where(eq(savProposalReviews.id, reviewId));
     await expect(runReviewedSavRuleReplay("ugo@limova.ai")).rejects.toThrow("SAV_REPLAY_CORPUS_EMPTY");
   });
-  it("records a gated promotion request as documentation only and invalidates outdated replays", async () => {
+  it("keeps promotion blocked for unevaluated semantic cases even after sufficient human reviews", async () => {
     const [message] = await fixture.db.select().from(savMessages).where(eq(savMessages.id, messageId));
     const [run] = await fixture.db.select().from(savAgentRuns).where(eq(savAgentRuns.id, runId));
     const [review] = await fixture.db.select().from(savProposalReviews).where(eq(savProposalReviews.id, reviewId));
@@ -113,15 +115,16 @@ describe("V0 metrics, reviewed replays and documentary deployment decisions", ()
     await createReviewedSavReplay(replayInput(), "ugo@limova.ai");
     await runReviewedSavRuleReplay("ugo@limova.ai");
     const data = await getSavV0Dashboard();
-    expect(data.versions[0].gate.eligible).toBe(true);
-    await recordSavDeploymentDecision({ snapshotHash: data.snapshotHash, versionId: data.versions[0].id, decision: "request_promotion", reason: "Preuves fictives suffisantes : décision documentaire uniquement" }, "ugo@limova.ai");
-    expect((await getSavV0Dashboard()).decisions[0].decision).toBe("request_promotion");
+    expect(data.versions[0].gate.eligible).toBe(false);
+    expect(data.versions[0].gate.reasons).toContain("SAV_V0_REPLAY_REQUIRED");
+    await expect(recordSavDeploymentDecision({ snapshotHash: data.snapshotHash, versionId: data.versions[0].id, decision: "request_promotion", reason: "Preuves fictives suffisantes : décision documentaire uniquement" }, "ugo@limova.ai")).rejects.toThrow("SAV_DEPLOYMENT_GATE_BLOCKED");
+    expect((await getSavV0Dashboard()).decisions).toHaveLength(0);
     expect(await fixture.db.select().from(savActions)).toHaveLength(0);
     const [otherReview] = await fixture.db.select().from(savProposalReviews).where(eq(savProposalReviews.messageId, additional[0].messageId));
     await createReviewedSavReplay({ ...replayInput(), reviewId: otherReview.id }, "ugo@limova.ai");
     expect((await getSavV0Dashboard()).versions[0].gate.reasons).toContain("SAV_V0_REPLAY_REQUIRED");
     await runReviewedSavRuleReplay("ugo@limova.ai");
-    expect((await getSavV0Dashboard()).versions[0].gate.eligible).toBe(true);
+    expect((await getSavV0Dashboard()).versions[0].gate.eligible).toBe(false);
     await fixture.db.update(savAgentRuns).set({ dataOrigin: "simulation" });
     expect((await getSavV0Dashboard()).versions[0].gate.reasons).toContain("SAV_V0_REAL_DATA_REQUIRED");
   });

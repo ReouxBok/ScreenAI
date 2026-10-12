@@ -9,6 +9,7 @@ import { publicKnowledgeText } from "@/lib/knowledge/conversion";
 import { decryptSavPayload, encryptSavPayload, savContentHash } from "./crypto";
 import { isSavAiAuthoredReply } from "./reply-format";
 import { collectSavObservationSources, type ObservationEvent, type ObservationSnapshot } from "./observation-source";
+import { savStoredReviewReasons, type SavReviewReason } from "./review-contract";
 const DAY = 24 * 60 * 60 * 1000;
 const STOPPED = new Date("9999-01-01T00:00:00Z");
 function nextDue(row: {
@@ -138,7 +139,8 @@ export async function syncSavObservation(id: string, collect: (id: string) => Pr
         const relevant = events.filter(e => !cycleStart || new Date(e.occurredAt) >= cycleStart);
         const human = relevant.filter(e => e.kind === "human_reply" || e.kind === "note");
         const customerConfirmation = relevant.filter(e => e.kind === "customer_reply" && !/\b(pas|non|not|never|encore|toujours|plus|jamais)\b/i.test(e.text) && human.some(h => h.occurredAt < e.occurredAt) && /(?:^|[^a-zà-ÿ])(?:résolu|réglé|fonctionne|ça marche|resolved|works now)(?:$|[^a-zà-ÿ])/i.test(e.text));
-        const summary = { subject: snapshot.subject, draftRefused: rejected.body, refusalReason: decryptSavPayload<{
+        const refusalReasons = savStoredReviewReasons(decryptSavPayload<{ reasons?: unknown }>(verdict.reasonCiphertext).reasons);
+        const summary = { subject: snapshot.subject, draftRefused: rejected.body, ...(refusalReasons.length ? { refusalReasons } : {}), refusalReason: decryptSavPayload<{
                 text: string;
             }>(verdict.reasonCiphertext).text, category: rejected.proposal.category, reasonCode: rejected.proposal.decision.reasonCode,
             events: relevant, humanEvidence: human.map(e => ({ sourceRef: e.sourceRef, contentHash: savContentHash(e), kind: e.kind })), customerConfirmation: customerConfirmation.map(e => e.sourceRef), sourceErrors: snapshot.errors, coverage: "Emails HubSpot associés et fil Gmail synchronisé uniquement. Boîtes externes non enregistrées, appels et opérations hors CRM non observables. Une tâche terminée n’atteste pas une opération exécutée.", outcome: snapshot.errors.length || snapshot.status === "unknown" ? "insufficient_sources" : human.length ? "human_evidence_to_qualify" : "closed_without_human_evidence" };
@@ -222,6 +224,7 @@ export async function getSavObservations(threadId: string) {
                     subject: string;
                     draftRefused: string;
                     refusalReason: string;
+                    refusalReasons?: SavReviewReason[];
                     events: ObservationEvent[];
                     humanEvidence: Array<{
                         sourceRef: string;

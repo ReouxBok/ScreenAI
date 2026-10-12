@@ -65,62 +65,11 @@ export function savActiveSubject(input: { subject: string; body: string }) {
 export function buildSavInboundContext(input: { subject: string; body: string }): SavInboundContext {
   const split = splitSavMessageText(input.body);
   const body = split.currentText;
-  const active = `${savActiveSubject(input)}\n${body}`;
-  const english = (body.match(/\b(?:hello|please|thanks|thank|my|need|would|could|cannot|invoice|subscription|account|available)\b/gi) ?? []).length;
-  const french = (body.match(/\b(?:bonjour|merci|mon|mes|je|vous|pour|souhaite|facture|abonnement|compte|disponible)\b/gi) ?? []).length;
-  const intents: SavInboundContext["intents"] = [];
-  for (const [intent, pattern] of [
-    ["account", /\b(?:compte|account|accès|access|invitation|invite|connexion|login|utilisateurs?|users?)\b/i],
-    ["billing", /\b(?:factures?|invoice|facturation|billing|abonnement|subscription|remboursement|refund)\b/i],
-    ["technical", /\b(?:bug|erreur|error|impossible|bloqué|broken|cannot|problème|problem)\b/i],
-    ["integration", /\b(?:intégration|integration|connecteur|connector|hubspot|gmail|slack|zapier)\b/i],
-    ["how_to", /\b(?:comment|how|où|where)\b/i],
-    ["callback", /\b(?:rappel|rappelez|rappeler|rendez-vous|callback|call me|available|disponible)\b/i],
-    ["commercial", /\b(?:tarifs?|pricing|devis|quotation|démonstration|demo|commercial|offre|offer)\b/i],
-    ["partnership", /\b(?:partenariat|partenaire|partnership|partner|collaboration)\b/i],
-  ] as const) if (pattern.test(active)) intents.push(intent);
-  const facts: SavInboundContext["facts"] = [];
-  for (const line of split.currentLines) {
-    for (const [kind, pattern] of [
-      ["registration_email", /(?:email|adresse|e-mail|registration|account).{0,60}[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/i],
-      ["access_count", /\b\d{1,4}\s+(?:accès|utilisateurs?|users?|seats?|licences?|licenses?|comptes?|accounts?)\b/i],
-      ["callback_availability", /(?:disponible|joignable|available|call me|rappele[rz]|rappeler).{0,160}(?:\d|lundi|mardi|mercredi|jeudi|vendredi|samedi|dimanche|monday|tuesday|wednesday|thursday|friday|saturday|sunday)/i],
-      ["organization", /(?:^|\b)(?:entreprise|société|company|organisation|organization)\s*[:=]\s*\S/i],
-    ] as const) if (pattern.test(line.text) && facts.length < 20) facts.push({ kind, excerpt: line.text.trim().slice(0, 500), line: line.line });
-  }
   return savInboundContextSchema.parse({
     revision: SAV_MESSAGE_CONTEXT_REVISION,
     currentText: body.slice(0, 12_000), quotedText: split.quotedText.slice(0, 4_000), signatureText: split.signatureText.slice(0, 2_000),
-    parts: split.parts.slice(0, 100), language: english > french ? "en" : french > 0 ? "fr" : "unknown", intents, facts,
+    parts: split.parts.slice(0, 100), language: "unknown", intents: [], facts: [],
     subjectInherited: replyPrefix.test(input.subject),
     truncated: body.length > 12_000 || split.quotedText.length > 4_000 || split.signatureText.length > 2_000 || split.parts.length > 100 || input.body.length > 100_000,
   });
-}
-
-/** Current customer/operational signals take priority over a simultaneous presales question. */
-export function hasSavCustomerOrOperationalRequest(input: { subject: string; body: string }) {
-  const text = `${savActiveSubject(input)}\n${splitSavMessageText(input.body).currentText}`
-    .normalize("NFKD").replace(/\p{M}/gu, "").toLowerCase();
-  const account = /\b(?:mon|ma|mes|notre|nos|my|our)\s+(?:compte|account|abonnement|subscription|facture|invoice|agent|licence|license|plan)\b|\b(?:deja client|already a customer|registration email|email du compte)\b/;
-  const customer = /\b(?:je suis|nous sommes|i am|i['’]m|we are|we['’]re)\s+(?:(?:deja|already|un|une|a|an|currently)\s+)*(?:abonne\w*|client\w*|utilisateur\w*|subscriber\w*|customer\w*|subscribed)\b|\b(?:j['’]ai|nous avons|i have|we have)\s+(?:deja\s+|already\s+)?(?:un |une |a |an )?(?:abonnement|compte|subscription|account)\b|\b(?:j['’]utilise|nous utilisons|i use|we use)\s+limova\b/;
-  const operations = /\b(?:configur\w*|parametr\w*|install\w*|connect\w*|activ\w*|login|connexion|support|sav|bug\w*|erreur\w*|error\w*|probleme\w*|problem\w*|bloqu\w*|broken|password|mot de passe|api key)\b|\b(?:comment|how to|help.{0,30})\s+(?:utiliser|use|setup|set up)\b/;
-  // Pricing discovery is deliberately absent here; credits, payments and financial data are operations.
-  const finance = /\b(?:credits?|solde|balance|recharg\w*|top[ -]?up|racheter|factur\w*|invoic\w*|rembours\w*|refund\w*|prelev\w*|debit\w*|paiement\w*|payment\w*|paye\w*|paying|paid|montant\w*|amount\w*|transaction\w*|bancaire\w*|bank\w*|rib|iban|tva|vat|tax\w*|conteste\w*|contestation\w*|chargeback\w*|charged|overcharg\w*|financ\w*|revenus?|revenue)\b|chiffre d['’]affaires/;
-  return account.test(text) || customer.test(text) || operations.test(text) || finance.test(text);
-}
-
-/** Conservative non-support identification; an uncertain message stays human-reviewed. */
-export function savNonSupportIntent(input: { from: string; subject: string; body: string }) {
-  const body = splitSavMessageText(input.body).currentText;
-  const address = input.from.match(/<([^>]+)>/)?.[1] ?? input.from;
-  if (/@(?:[a-z0-9-]+\.)?mailinblack\.com\s*$/i.test(address)
-    && /(?:authentifi|vérifi|verifi|identifi|expéditeur|sender)/i.test(body)) return "sender_verification";
-  if (/(?:je vous propose|nous vous proposons|we offer|we provide|our services)[\s\S]{0,160}(?:services?|seo|backlinks|marketing|leads|prospects|visibilité|visibility)/i.test(body)
-    && !/\b(?:bug|erreur|error|bloqu[\p{L}]*|broken|impossible)\b/iu.test(body)) return "commercial_solicitation";
-  if (/\b(?:partenariat|partnership|collaboration)\b/i.test(body)
-    && !/\b(?:bug|erreur|error|bloqu|broken|impossible)\b/i.test(body)) return "partnership";
-  if (/(?:vos|your)\s+(?:tarifs?|pricing|prices)|(?:demande|request).{0,20}(?:devis|quotation|demo|démonstration)/i.test(body)
-    && !hasSavCustomerOrOperationalRequest(input)) return "presales";
-  if (!body && splitSavMessageText(input.body).quotedText) return "quoted_only";
-  return null;
 }
