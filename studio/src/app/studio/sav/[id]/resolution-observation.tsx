@@ -2,6 +2,7 @@ import type { getSavObservations } from "@/lib/sav/observations";
 import { savContentHash } from "@/lib/sav/crypto";
 import styles from "./proposal-review.module.css";
 import { qualifyObservationAction } from "../actions";
+import { savReviewReasonLabels } from "@/lib/sav/review-contract";
 const labels: Record<string, string> = { waiting_ticket: "En attente de ticket confirmé", active: "Suivi actif", sources_incomplete: "Sources incomplètes", closed_to_analyze: "Clôturé · bilan à qualifier", candidate_ready: "Candidat prêt · revue séparée requise" };
 export function ResolutionObservation({ rows, isUgo }: {
     rows: Awaited<ReturnType<typeof getSavObservations>>;
@@ -15,6 +16,7 @@ export function ResolutionObservation({ rows, isUgo }: {
   {row.qualifications.length>0 && <details><summary>Historique des qualifications Ugo</summary>{row.qualifications.map((q,index)=><article key={index}><p>{new Date(q.occurredAt).toLocaleString("fr-FR")} · {q.author}</p><pre>{q.text}</pre></article>)}</details>}
             {row.cycles.map(c => <details key={c.id} open={c.cycle === row.cycle}><summary>Cycle {c.cycle} · {c.status} · {c.qualification ?? "non qualifié"}</summary>
    <p>{c.summary.coverage}</p><p>Motif du refus : {c.summary.refusalReason || "Non renseigné"}.</p><details><summary>Brouillon refusé</summary><pre>{c.summary.draftRefused}</pre></details>
+   {!!c.summary.refusalReasons?.length && <p>Retours structurés : {c.summary.refusalReasons.map(reason => savReviewReasonLabels[reason]).join(" · ")}. Ces retours évaluent l’IA ; ils ne prouvent pas une résolution produit.</p>}
    <p>Confirmation client explicite repérée : {c.summary.customerConfirmation.length ? "à vérifier dans les sources" : "aucune"}. Fermer le ticket ne prouve pas sa résolution.</p>
    <ol>{c.summary.events.map((event, index) => <li key={`${event.sourceRef}:${index}`}><p>{new Date(event.occurredAt).toLocaleString("fr-FR")} · {event.kind} · {event.author ?? "auteur non fourni"} · {event.provenance} · {event.sourceRef}</p><pre>{event.text}</pre></li>)}</ol>
    {c.candidateId && <p>Candidat préparé. Sa validation et sa publication restent distinctes dans les résolutions.</p>}

@@ -1,12 +1,53 @@
 import "server-only";
 import { and, desc, eq, gte, sql } from "drizzle-orm";
 import { requireDb } from "@/db";
-import { auditLogs, knowledgeProjectionCandidates, savActions, savAgentRuns, savDecisions, savDeploymentReviews, savLearningCandidates, savMessages, savProposalReviews, savReviewedReplayRuns, savWebhookReceipts } from "@/db/schema";
+import { auditLogs, knowledgeProjectionCandidates, savActions, savAgentRuns, savDecisions, savDeploymentReviews, savDraftVerdicts, savLearningCandidates, savMessages, savProposalReviews, savReviewedReplayRuns, savWebhookReceipts } from "@/db/schema";
 import { decryptSavPayload, encryptSavPayload, savContentHash } from "./crypto";
 import { getSavV0Cutover, savV0EligibleMessageFilter } from "./cutover";
 import { evaluateSavPromotion, savConfidenceCalibrationError } from "./promotion";
 import { z } from "zod";
 import { getReviewedSavReplayCorpus } from "./reviewed-replay";
+import { savStoredReviewReasons } from "./review-contract";
+import { SAV_RULE_REPLAY_REVISION } from "./replay";
+
+/** Feedback is an evaluation case with its original versions, never product knowledge.
+ * Keep both review streams separate; old verdicts remain visible as history. */
+export async function getSavReviewFeedback() {
+  const db = requireDb();
+  const [dossiers, drafts] = await Promise.all([
+    db.select({ id: savProposalReviews.id, messageId: savProposalReviews.messageId, decisionId: savProposalReviews.decisionId,
+      agentRunId: savProposalReviews.agentRunId, threadId: savMessages.threadId, reviewedAt: savProposalReviews.reviewedAt,
+      reviewedBy: savProposalReviews.reviewedBy, isCurrent: savProposalReviews.isCurrent, status: savProposalReviews.status,
+      verdict: savProposalReviews.verdict, payload: savProposalReviews.commentCiphertext, before: savProposalReviews.beforeCiphertext,
+      after: savProposalReviews.afterCiphertext, model: savAgentRuns.model, promptRevision: savAgentRuns.promptRevision,
+      codeRevision: savAgentRuns.codeRevision, knowledgeRevision: savAgentRuns.knowledgeRevision,
+    }).from(savProposalReviews).innerJoin(savMessages, eq(savMessages.id, savProposalReviews.messageId))
+      .innerJoin(savAgentRuns, eq(savAgentRuns.id, savProposalReviews.agentRunId)).where(savV0EligibleMessageFilter())
+      .orderBy(desc(savProposalReviews.reviewedAt), desc(savProposalReviews.id)).limit(101),
+    db.select({ id: savDraftVerdicts.id, messageId: savDraftVerdicts.messageId, decisionId: savDraftVerdicts.decisionId,
+      agentRunId: savDraftVerdicts.agentRunId, threadId: savDraftVerdicts.threadId, reviewedAt: savDraftVerdicts.reviewedAt,
+      reviewedBy: savDraftVerdicts.reviewedBy, isCurrent: savDraftVerdicts.isCurrent, status: savDraftVerdicts.status,
+      payload: savDraftVerdicts.reasonCiphertext, model: savAgentRuns.model, promptRevision: savAgentRuns.promptRevision,
+      codeRevision: savAgentRuns.codeRevision, knowledgeRevision: savAgentRuns.knowledgeRevision,
+    }).from(savDraftVerdicts).innerJoin(savMessages, eq(savMessages.id, savDraftVerdicts.messageId))
+      .innerJoin(savAgentRuns, eq(savAgentRuns.id, savDraftVerdicts.agentRunId)).where(savV0EligibleMessageFilter())
+      .orderBy(desc(savDraftVerdicts.reviewedAt), desc(savDraftVerdicts.id)).limit(101),
+  ]);
+  const entries = [
+    ...dossiers.slice(0, 100).map(({ payload, before, after, ...row }) => {
+      const feedback = decryptSavPayload<{ text: string; reasons?: unknown }>(payload);
+      return { ...row, scope: "dossier" as const, reasons: savStoredReviewReasons(feedback.reasons), text: feedback.text,
+        originalCategory: decryptSavPayload<{ category: string }>(before).category,
+        correctedCategory: decryptSavPayload<{ category: string }>(after).category };
+    }),
+    ...drafts.slice(0, 100).map(({ payload, ...row }) => {
+      const feedback = decryptSavPayload<{ text: string; reasons?: unknown }>(payload);
+      return { ...row, scope: "draft" as const, verdict: null, reasons: savStoredReviewReasons(feedback.reasons), text: feedback.text,
+        originalCategory: null, correctedCategory: null };
+    }),
+  ].sort((a, b) => b.reviewedAt.getTime() - a.reviewedAt.getTime() || b.id.localeCompare(a.id));
+  return { entries, truncated: dossiers.length > 100 || drafts.length > 100 };
+}
 export type MetricRun = { id: string; model: string; promptRevision: string; knowledgeRevision: string | null; codeRevision: string; dataOrigin: string; runtime: string; category: string;
   status: string; confidence: number | null; verdict: string | null; dimensions: Record<string, string> | null; errorCode: string | null };
 export function summarizeSavV0Runs(rows: MetricRun[]) {
@@ -61,16 +102,16 @@ export async function getSavV0Dashboard() {
   const gates = versions.map((v) => {
     const existing = evaluateSavPromotion({ versionReviewed: v.reviewed, versionCorrect: v.verdicts.correct, versionPartial: v.verdicts.partial, versionCritical: Math.max(v.verdicts.critical, ...Object.values(v.dimensions).map((d) => d.critical)), versionDegraded: v.degraded + v.externalErrors,
       versionCalibrationError: v.calibrationError ?? 100, globalReviewed, failedActions: (failedActions?.total ?? 0) + (incidents[0]?.total ?? 0) });
-    const latestReplay = replays.find((r) => r.codeRevision === v.version.code && r.corpusHash === replayCorpus.hash && r.runnerRevision === "sav-rule-replay-v1");
+    const latestReplay = replays.find((r) => r.codeRevision === v.version.code && r.corpusHash === replayCorpus.hash && r.runnerRevision === SAV_RULE_REPLAY_REVISION);
     const reasons = [...existing.reasons, ...(v.version.origin !== "real" ? ["SAV_V0_REAL_DATA_REQUIRED"] : []),
       ...(!/^[a-f0-9]{40}$/.test(v.version.code) ? ["SAV_V0_CODE_VERSION_REQUIRED"] : []),
       ...(["unknown", "not_consulted", "unavailable"].includes(v.version.knowledge) ? ["SAV_V0_KNOWLEDGE_VERSION_REQUIRED"] : []),
       ...(raw.length > 5_000 ? ["SAV_V0_METRICS_TRUNCATED"] : []),
-      ...(replayCorpus.truncated || !latestReplay || !latestReplay.total ? ["SAV_V0_REPLAY_REQUIRED"] : latestReplay.failed ? ["SAV_V0_REPLAY_FAILED"] : [])];
+      ...(replayCorpus.truncated || !latestReplay || !latestReplay.total || Number(latestReplay.result.notEvaluated ?? latestReplay.total) > 0 ? ["SAV_V0_REPLAY_REQUIRED"] : latestReplay.failed ? ["SAV_V0_REPLAY_FAILED"] : [])];
     return { ...v, gate: { eligible: reasons.length === 0, reasons, acceptanceRate: v.reviewed ? existing.acceptanceRate : null } };
   });
   const evidence = { cutover, versions: gates, ingestion, failedSyncs: incidents[0]?.total ?? 0, failedActions: failedActions?.total ?? 0, duplicates: duplicates[0]?.total ?? 0, pendingKnowledge: pendingKnowledge[0]?.total ?? 0, pendingResolutions: pendingResolutions[0]?.total ?? 0,
-    replayCorpus: { hash: replayCorpus.hash, total: replayCorpus.cases.length, truncated: replayCorpus.truncated }, replay: replays.map(({ id, codeRevision, corpusHash, runnerRevision, total, failed }) => ({ id, codeRevision, corpusHash, runnerRevision, total, failed })), truncated: raw.length > 5_000 };
+    replayCorpus: { hash: replayCorpus.hash, total: replayCorpus.cases.length, truncated: replayCorpus.truncated }, replay: replays.map(({ id, codeRevision, corpusHash, runnerRevision, total, failed, result }) => ({ id, codeRevision, corpusHash, runnerRevision, total, failed, notEvaluated: Number(result.notEvaluated ?? total) })), truncated: raw.length > 5_000 };
   return { ...evidence, snapshotHash: savContentHash(evidence), replayHistory: replays, decisions: decisions.map(({ reasonCiphertext, ...d }) => ({ ...d, reason: decryptSavPayload<{ text: string }>(reasonCiphertext).text })) };
 }
 
