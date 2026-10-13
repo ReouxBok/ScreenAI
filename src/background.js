@@ -499,11 +499,11 @@ function isTrustedMessageSource(request, sender) {
 }
 
 async function handleMessage(request, sender) {
+  await initializationPromise;
   if (nativeVoiceSessionActive && ['GET_LIVE_SESSION', 'VOICE_CONTEXT_REQUEST', 'VOICE_ACTION_REQUEST',
     'VOICE_TEXT_INPUT_REQUEST', 'VOICE_SCROLL_REQUEST', 'VOICE_KB_SEARCH', 'VOICE_TRANSCRIPT'].includes(request.type)) {
     return { ok: false, error: 'La session vocale utilise la conversation Deep Agent.' };
   }
-  await initializationPromise;
   if (LIMOVA_MESSAGE_TYPES.has(request.type)) {
     if (['LIMOVA_SEND_MESSAGE', 'LIMOVA_RESUME_BROWSER'].includes(request.type) && !(await hasAIProcessingConsent())) {
       broadcastToSidebar({ type: 'CONSENT_REQUIRED' });

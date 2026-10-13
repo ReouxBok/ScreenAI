@@ -432,6 +432,13 @@ describe('controlled page actions', () => {
     expect(sidebarMessages.some(message => message.type === 'VOICE_PAGE_CONTEXT')).toBe(false);
   });
 
+  it('checks the native engine after initialization even for concurrently queued messages', async () => {
+    const starting = background.handleMessage({ type: 'VOICE_SESSION_STATE', active: true, engine: 'deep_agents' }, {});
+    const late = background.handleMessage({ type: 'VOICE_TRANSCRIPT', role: 'user', text: 'Late legacy transcript' }, {});
+    await starting;
+    expect(await late).toMatchObject({ ok: false });
+  });
+
   it('drops a legacy observation queued before native voice took over', async () => {
     await background.handleMessage({ type: 'VOICE_SESSION_STATE', active: true }, {});
     const pending = background.handleMessage({ type: 'USER_PAGE_INTERACTION', interaction: { kind: 'click' } }, { tab: { id: 17 } });
