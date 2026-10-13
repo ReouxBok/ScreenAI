@@ -1,0 +1,117 @@
+import { test, expect } from './fixtures.js';
+
+async function setup(context, extensionId) {
+  await context.route('https://api.new.limova.ai/**', route => route.abort());
+  await context.route('https://new.limova.ai/driver-fixture', route => route.fulfill({ contentType: 'text/html', body: `<!doctype html><html><body>
+    <h1>Account settings</h1><button id="original">Save</button><button id="decoy">Delete</button>
+    <input id="name" aria-label="Name"><input type="password" value="SECRET_PASSWORD">
+    <div data-private>PRIVATE_CONTENT</div><script>window.saved=0;window.deleted=0;
+    original.onclick=()=>window.saved++;decoy.onclick=()=>window.deleted++;</script></body></html>` }));
+  const site = await context.newPage();
+  await site.goto('https://new.limova.ai/driver-fixture');
+  const controller = await context.newPage();
+  await controller.goto(`chrome-extension://${extensionId}/src/sidebar/sidebar.html`);
+  await controller.evaluate(async () => {
+    const { browserDocumentCommand } = await import('../limova/browser-document.js');
+    const [tab] = await chrome.tabs.query({ url: 'https://new.limova.ai/driver-fixture' });
+    window.invokeDocument = async request => {
+      const [result] = await chrome.scripting.executeScript({ target: { tabId: tab.id }, world: 'ISOLATED', func: browserDocumentCommand, args: [request] });
+      return result.result;
+    };
+    window.binding = (await invokeDocument({ operation: 'bind', origin: 'https://new.limova.ai', contextVersion: 1 })).binding;
+    window.snapshot = await invokeDocument({ ...binding, operation: 'read_page', nextContextVersion: 2 });
+    window.binding = snapshot.binding;
+  });
+  return { site, controller };
+}
+
+test('uses private element references despite page-controlled data attributes', async ({ context, extensionId }) => {
+  const { site, controller } = await setup(context, extensionId);
+  await site.evaluate(() => { original.dataset.lid = '999'; decoy.dataset.lid = '1'; document.documentElement.dataset.limovaContextVersion = '999'; });
+  const result = await controller.evaluate(() => invokeDocument({ ...binding, operation: 'click', elementId: 1, nextContextVersion: 3 }));
+  expect(result.status).toBe('completed');
+  expect(await site.evaluate(() => ({ saved, deleted, exposed: typeof globalThis.__limovaDeepAgentDocumentV1 }))).toEqual({ saved: 1, deleted: 0, exposed: 'undefined' });
+});
+
+test('rejects a detached reference instead of targeting a replacement with the same ID', async ({ context, extensionId }) => {
+  const { site, controller } = await setup(context, extensionId);
+  await site.evaluate(() => { const replacement = original.cloneNode(true); replacement.onclick = () => window.deleted++; original.replaceWith(replacement); });
+  const result = await controller.evaluate(() => invokeDocument({ ...binding, operation: 'click', elementId: 1, nextContextVersion: 3 }));
+  expect(result.status).toBe('rejected');
+  expect(await site.evaluate(() => deleted)).toBe(0);
+});
+
+test('rejects changed target semantics and stale document versions', async ({ context, extensionId }) => {
+  const { site, controller } = await setup(context, extensionId);
+  await site.evaluate(() => { original.textContent = 'Delete account'; });
+  expect((await controller.evaluate(() => invokeDocument({ ...binding, operation: 'click', elementId: 1, nextContextVersion: 3 }))).status).toBe('rejected');
+  expect((await controller.evaluate(() => invokeDocument({ ...binding, contextVersion: 0, operation: 'click', elementId: 2, nextContextVersion: 3 }))).status).toBe('rejected');
+});
+
+test('reads visible text without input values or explicitly private content', async ({ context, extensionId }) => {
+  const { controller } = await setup(context, extensionId);
+  const observation = await controller.evaluate(() => snapshot.observation);
+  expect(observation).toContain('Account settings');
+  expect(observation).not.toContain('SECRET_PASSWORD');
+  expect(observation).not.toContain('PRIVATE_CONTENT');
+});
+
+test('types through a private reference and advances the document version', async ({ context, extensionId }) => {
+  const { site, controller } = await setup(context, extensionId);
+  const result = await controller.evaluate(() => {
+    const field = JSON.parse(snapshot.observation).elements.find(item => item.label === 'Name');
+    return invokeDocument({ ...binding, operation: 'type_text', elementId: field.elementId, text: 'Alice', nextContextVersion: 3 });
+  });
+  expect(result.status).toBe('completed');
+  expect(result.binding.contextVersion).toBe(3);
+  expect(await site.locator('#name').inputValue()).toBe('Alice');
+  expect((await controller.evaluate(() => invokeDocument({ ...binding, operation: 'click', elementId: 1, nextContextVersion: 3 }))).status).toBe('rejected');
+});
+
+test('refuses a field changed into a sensitive input after the snapshot', async ({ context, extensionId }) => {
+  const { site, controller } = await setup(context, extensionId);
+  await site.locator('#name').evaluate(element => { element.type = 'password'; });
+  const result = await controller.evaluate(() => {
+    const field = JSON.parse(snapshot.observation).elements.find(item => item.label === 'Name');
+    return invokeDocument({ ...binding, operation: 'type_text', elementId: field.elementId, text: 'Never write', nextContextVersion: 3 });
+  });
+  expect(result.status).toBe('rejected');
+  expect(await site.locator('#name').inputValue()).toBe('');
+});
+
+test('refuses a target hidden behind a new overlay', async ({ context, extensionId }) => {
+  const { site, controller } = await setup(context, extensionId);
+  await site.evaluate(() => { const overlay = document.createElement('div'); overlay.style.cssText = 'position:fixed;inset:0;z-index:999999;background:white'; document.body.append(overlay); });
+  expect((await controller.evaluate(() => invokeDocument({ ...binding, operation: 'click', elementId: 1, nextContextVersion: 3 }))).status).toBe('rejected');
+  expect(await site.evaluate(() => saved)).toBe(0);
+});
+
+test('keeps a large escaped observation valid JSON within the backend limit', async ({ context, extensionId }) => {
+  const { site, controller } = await setup(context, extensionId);
+  await site.evaluate(() => {
+    const paragraph = document.createElement('p');
+    paragraph.textContent = '\\'.repeat(30000);
+    paragraph.style.cssText = 'overflow-wrap:anywhere;width:100px';
+    document.body.prepend(paragraph);
+  });
+  const result = await controller.evaluate(() => invokeDocument({ ...binding, operation: 'read_page', nextContextVersion: 3 }));
+  expect(result.status).toBe('completed');
+  expect(result.observation.length).toBeLessThanOrEqual(32000);
+  expect(JSON.parse(result.observation).contextVersion).toBe(3);
+});
+
+test('reports actual scroll movement and document version', async ({ context, extensionId }) => {
+  const { site, controller } = await setup(context, extensionId);
+  await site.evaluate(() => { document.body.style.minHeight = '5000px'; });
+  const result = await controller.evaluate(() => invokeDocument({ ...binding, operation: 'scroll', direction: 'down', nextContextVersion: 3 }));
+  expect(JSON.parse(result.observation).moved).toBe(true);
+  expect(result.binding.contextVersion).toBe(3);
+  expect(await site.evaluate(() => scrollY)).toBeGreaterThan(0);
+});
+
+test('highlights a private target without triggering its click handler', async ({ context, extensionId }) => {
+  const { site, controller } = await setup(context, extensionId);
+  const result = await controller.evaluate(() => invokeDocument({ ...binding, operation: 'highlight', elementId: 1, nextContextVersion: 3 }));
+  expect(result.status).toBe('completed');
+  expect(await site.evaluate(() => saved)).toBe(0);
+});

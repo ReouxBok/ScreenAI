@@ -139,3 +139,25 @@ these decisions, including lost-response recovery with exactly one local effect.
 The API and executor in this browser test are fixtures. The runner is not yet
 invoked by the worker: the actual authorized page driver, immediate target checks,
 uncertainty UI and end-to-end backend/browser validation remain required.
+
+## Isolated document driver foundation
+
+`browser-document.js` is a self-contained function for `chrome.scripting` in the
+ISOLATED world. Its document token, context version and element map stay in a
+private closure. DOM `data-lid` attributes do not select targets. Detached nodes,
+changed target fingerprints, stale versions, covered targets and sensitive text
+fields are rejected. A successful document operation advances the context
+version; the driver must allocate versions and bind the Chrome document identity.
+
+It supports bounded visible-page observations, click, text input, scroll and
+highlight. Observations omit input values and explicitly private/sensitive DOM
+regions, and remain valid JSON within 32,000 characters. This is not a guarantee
+that arbitrary page text contains no sensitive data. Reading is viewport-bound
+and limited; frames/shadow roots and richer page extraction remain to validate.
+Clicks report dispatch, not business success, and scroll reports actual movement.
+
+Ten Chromium tests inject the actual function into a routed HTTPS fixture page
+and exercise real DOM effects and isolation. They do not exercise the final worker
+or a live Limova model. Navigation, redacted screenshots, the privileged Chrome
+driver, monotonic versions across navigation/restart and uncertainty handling
+remain to connect before enabling browser actions.
