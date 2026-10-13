@@ -11,7 +11,7 @@
     "node": "24.x"
   },
   "dependencies": {
-    "@google/adk": "1.5.0",
+    "@google/adk": "2.3.0",
     "cors": "^2.8.5",
     "express": "^5.2.1",
     "express-rate-limit": "^8.2.1",
@@ -22,6 +22,9 @@
     "adm-zip": "0.6.1",
     "mariadb": "3.5.4",
     "mysql2": "3.24.3",
-    "tar": "7.5.22"
+    "tar": "7.5.22",
+    "gaxios": {
+      "uuid": "11.1.1"
+    }
   }
 }
