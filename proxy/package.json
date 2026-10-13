@@ -19,8 +19,8 @@
     "zod": "4.4.3"
   },
   "overrides": {
-    "adm-zip": "0.6.0",
-    "mariadb": "3.5.3",
+    "adm-zip": "0.6.1",
+    "mariadb": "3.5.4",
     "mysql2": "3.24.3",
     "tar": "7.5.22"
   }
