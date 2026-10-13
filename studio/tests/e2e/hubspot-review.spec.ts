@@ -17,6 +17,7 @@ test("Ugo recompare le contenu corrigé avant de préparer un brouillon SAV", as
   await page.getByLabel("Base de connaissances privée").setInputFiles({ name: "fixture.json", mimeType: "application/json", buffer: Buffer.from(JSON.stringify(bundle)) });
   await page.getByRole("button", { name: "Préparer les candidats SAV" }).click();
   await expect(page.getByRole("status")).toContainText("Import préparé");
+  await page.getByText("Revoir, corriger ou écarter cette connaissance", { exact: true }).click();
   const approve = page.getByRole("button", { name: "Valider et préparer le brouillon SAV" });
   await expect(approve).toBeDisabled();
   await page.getByRole("button", { name: "Actualiser la comparaison" }).click();
@@ -24,7 +25,7 @@ test("Ugo recompare le contenu corrigé avant de préparer un brouillon SAV", as
   await acknowledgment.check();
   await expect(approve).toBeEnabled();
   await page.getByText("Corriger la connaissance avant validation (JSON métier, sans DOM)", { exact: true }).click();
-  const editor = page.getByLabel("Connaissance complète");
+  const editor = page.getByRole("textbox", { name: "Connaissance complète", exact: true });
   const document = JSON.parse(await editor.inputValue());
   document.steps[0].instruction = "Choisir le nouveau format fictif corrigé.";
   await editor.fill(JSON.stringify(document));
@@ -37,6 +38,7 @@ test("Ugo recompare le contenu corrigé avant de préparer un brouillon SAV", as
   await approve.click();
   await expect(page.getByRole("status")).toContainText("Décision enregistrée");
   await expect(page.locator("article").filter({ hasText: title }).getByText("Validé", { exact: true })).toBeVisible();
+  await page.getByText("Lire la connaissance et ses limites", { exact: true }).click();
   await page.getByRole("link", { name: "Ouvrir la projection existante →" }).click();
   await expect(page.getByText("À valider", { exact: true }).first()).toBeVisible();
   await expect(page.locator(".tiptap")).toContainText(document.steps[0].instruction);

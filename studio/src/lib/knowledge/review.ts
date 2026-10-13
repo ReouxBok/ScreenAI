@@ -7,30 +7,46 @@ import { savContentHash } from "@/lib/sav/crypto";
 import { assertKnowledgeUgoApproval, canonicalKnowledgeSchema } from "./contracts";
 import { savProjectionBody } from "./conversion";
 import { prepareHubspotReview } from "./hubspot-import";
+import { prepareOnboardingReview } from "./onboarding-import";
+import { assertCompleteOnboardingKnowledge, assertSafeOnboardingKnowledge } from "./onboarding-extraction";
 
 /** Approval creates an in-review SAV draft, never publishes or edits Chrome. */
-export async function reviewKnowledgeCandidate(candidateId: string, input: { expectedRevisionId: string; decision: "approve" | "reject"; reason: string; document?: unknown; comparison?: { snapshot: string; acknowledged: boolean } }, actorEmail: string) {
+export async function reviewKnowledgeCandidate(candidateId: string, input: { expectedRevisionId: string; decision: "approve" | "reject"; reason: string; document?: unknown; completionNote?: string; missingAcknowledged?: boolean; comparison?: { snapshot: string; acknowledged: boolean } }, actorEmail: string) {
   assertKnowledgeUgoApproval(actorEmail);
   if (input.reason.trim().length < 10) throw new Error("KNOWLEDGE_REVIEW_REASON_REQUIRED");
   return requireDb().transaction(async (tx) => {
     const [candidate] = await tx.select().from(knowledgeProjectionCandidates).where(eq(knowledgeProjectionCandidates.id, candidateId)).for("update");
     if (!candidate || candidate.revisionId !== input.expectedRevisionId) throw new Error("KNOWLEDGE_CANDIDATE_STALE");
     if (candidate.status === "approved" && input.decision === "approve") return candidate;
-    if (!["pending", "needs_recording", "not_applicable"].includes(candidate.status)) throw new Error("KNOWLEDGE_CANDIDATE_NOT_REVIEWABLE");
+    if (!["pending", "needs_completion", "needs_recording", "not_applicable"].includes(candidate.status)) throw new Error("KNOWLEDGE_CANDIDATE_NOT_REVIEWABLE");
     if (input.decision === "reject") {
       const [updated] = await tx.update(knowledgeProjectionCandidates).set({ status: "rejected", reviewedBy: actorEmail, reviewedAt: new Date() }).where(eq(knowledgeProjectionCandidates.id, candidate.id)).returning();
       await tx.insert(auditLogs).values({ actorEmail, action: "knowledge_candidate_rejected", entityType: "knowledge_candidate", entityId: candidate.id, technicalMetadata: { revisionId: candidate.revisionId, sourceId: candidate.sourceId, reason: input.reason } });
       return updated;
     }
-    if (candidate.targetSurface !== "sav" || candidate.status !== "pending") throw new Error("KNOWLEDGE_RECORDING_REQUIRED");
+    if (candidate.targetSurface !== "sav" || !["pending", "needs_completion"].includes(candidate.status)) throw new Error("KNOWLEDGE_RECORDING_REQUIRED");
     await tx.select().from(knowledgeFamilies).where(eq(knowledgeFamilies.id, candidate.familyId)).for("update");
     const [originalRevision] = await tx.select().from(knowledgeFamilyRevisions).where(and(eq(knowledgeFamilyRevisions.id, candidate.revisionId), eq(knowledgeFamilyRevisions.familyId, candidate.familyId)));
     const [source] = await tx.select().from(knowledgeFamilySources).where(eq(knowledgeFamilySources.id, candidate.sourceId));
     if (!originalRevision || !source) throw new Error("KNOWLEDGE_PROVENANCE_REQUIRED");
+    const catalog = source.evidence.importKind === "onboarding_catalog";
     let comparisonReview;
     let targetItemId = candidate.targetItemId;
     let baseVersionId = candidate.baseVersionId;
     let before = candidate.diff.before;
+    if (catalog) {
+      if (!input.comparison?.acknowledged) throw new Error("ONBOARDING_COMPARISON_REVIEW_REQUIRED");
+      const sourceItemId = source.evidence.sourceItemId;
+      if (typeof sourceItemId === "string") await tx.select({ id: contentItems.id }).from(contentItems).where(eq(contentItems.id, sourceItemId)).for("update");
+      const comparison = await prepareOnboardingReview(candidate, input.document, tx);
+      if (comparison.snapshot !== input.comparison.snapshot) throw new Error("ONBOARDING_COMPARISON_STALE");
+      if (candidate.status === "needs_completion" && (!input.document || !input.missingAcknowledged || (input.completionNote?.trim().length ?? 0) < 20
+        || savContentHash(canonicalKnowledgeSchema.parse(input.document)) === savContentHash(canonicalKnowledgeSchema.parse(originalRevision.document)))) throw new Error("ONBOARDING_COMPLETION_REQUIRED");
+      targetItemId = comparison.targetItemId; baseVersionId = comparison.baseVersionId; before = comparison.before;
+      comparisonReview = { snapshot: comparison.snapshot, compared: comparison.compared,
+        relatedVersions: comparison.findings.map(({ ref, versionId, signal }) => ({ ref, versionId, signal })), reviewedBy: actorEmail, reviewedAt: new Date().toISOString(), reason: input.reason,
+        completionNote: input.completionNote ?? "", missingAcknowledged: Boolean(input.missingAcknowledged) };
+    }
     if (source.evidence.importKind === "hubspot") {
       if (!input.comparison?.acknowledged) throw new Error("HUBSPOT_COMPARISON_REVIEW_REQUIRED");
       const comparison = await prepareHubspotReview(candidate, input.document, tx);
@@ -43,6 +59,7 @@ export async function reviewKnowledgeCandidate(candidateId: string, input: { exp
         reviewedBy: actorEmail, reviewedAt: new Date().toISOString(), reason: input.reason };
     }
     const document = canonicalKnowledgeSchema.parse(input.document ?? originalRevision.document);
+    if (catalog) { assertSafeOnboardingKnowledge(document); assertCompleteOnboardingKnowledge(document); }
     if (!["shared", "sav_only"].includes(document.applicability) || !document.steps.length) throw new Error("KNOWLEDGE_NOT_APPLICABLE_TO_SAV");
     // Contextual variants are kept for review, not flattened into universal advice.
     if (document.steps.some((step) => step.variants.length)) throw new Error("KNOWLEDGE_VARIANT_CONTEXT_REQUIRED");
@@ -57,12 +74,13 @@ export async function reviewKnowledgeCandidate(candidateId: string, input: { exp
       }
     }
     const original = parseContentInput(candidate.proposedInput);
-    const proposed = parseContentInput({ ...original, ...(comparisonReview ? { title: document.objective } : {}), summary: document.objective, bodyMarkdown: savProjectionBody(document), metadata: {
+    const proposed = parseContentInput({ ...original, ...(catalog ? { title: source.evidence.sourceTitle } : comparisonReview ? { title: document.objective } : {}), summary: document.objective, bodyMarkdown: savProjectionBody(document), metadata: {
       ...original.metadata, semanticSteps: document.steps, prerequisites: document.prerequisites, expectedResult: document.expectedResult, troubleshooting: document.escalation,
       sourceMetadata: { ...original.metadata.sourceMetadata, canonicalRevisionId: revision.id, canonicalObjective: document.objective, approvedCandidateId: candidate.id, ...(comparisonReview ? { comparisonReview } : {}) },
       resolution: { symptoms: document.supportContext?.symptoms ?? [document.objective], steps: document.steps.map((step) => step.instruction), exceptions: document.exceptions, escalation: document.escalation, productVersion: document.productVersion, ...(document.validUntil ? { validUntil: document.validUntil } : {}), supersedes: [], conflictsWith: [] },
     } });
-    if (comparisonReview && proposed.bodyMarkdown.length > 12_000) throw new Error("HUBSPOT_PROCEDURE_TOO_LONG");
+    if (catalog && proposed.bodyMarkdown.length > 12_000) throw new Error("ONBOARDING_PROCEDURE_TOO_LONG");
+    if (!catalog && comparisonReview && proposed.bodyMarkdown.length > 12_000) throw new Error("HUBSPOT_PROCEDURE_TOO_LONG");
     const [category] = await tx.select().from(categories).where(eq(categories.slug, proposed.categorySlug));
     if (!category) throw new Error("CATEGORY_NOT_FOUND");
     let item;
@@ -74,7 +92,7 @@ export async function reviewKnowledgeCandidate(candidateId: string, input: { exp
     }
     const [{ latestVersion }] = await tx.select({ latestVersion: max(contentVersions.version) }).from(contentVersions).where(eq(contentVersions.itemId, item.id));
     const [version] = await tx.insert(contentVersions).values({ itemId: item.id, version: (latestVersion ?? 0) + 1, bodyMarkdown: proposed.bodyMarkdown, metadata: proposed.metadata, changeNote: input.reason, authorEmail: actorEmail }).returning();
-    await tx.update(contentItems).set({ currentDraftVersionId: version.id, status: "in_review", updatedAt: new Date() }).where(eq(contentItems.id, item.id));
+    await tx.update(contentItems).set({ currentDraftVersionId: version.id, status: "in_review", ...(catalog && !item.publishedVersionId ? { title: proposed.title } : {}), updatedAt: new Date() }).where(eq(contentItems.id, item.id));
     await tx.update(knowledgeFamilyRevisions).set({ reviewState: "approved", reviewedBy: actorEmail, reviewedAt: new Date() }).where(eq(knowledgeFamilyRevisions.id, revision.id));
     await tx.update(knowledgeFamilies).set({ approvedRevisionId: revision.id }).where(eq(knowledgeFamilies.id, candidate.familyId));
     await tx.insert(knowledgeProjections).values({ familyId: candidate.familyId, revisionId: revision.id, surface: "sav", itemId: item.id, versionId: version.id });

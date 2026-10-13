@@ -21,6 +21,7 @@ import { chunkMarkdown } from "./chunking";
 import { parseContentInput } from "./content";
 import { embedTexts } from "./embeddings";
 import { assertKnowledgeUgoApproval, requiresKnowledgeUgoApproval } from "./knowledge/contracts";
+import { assertOnboardingPublicationSource } from "./knowledge/onboarding-import";
 
 function revisionId() {
   const now = new Date();
@@ -36,12 +37,23 @@ export async function saveDraft(rawInput: unknown, actorEmail: string, itemId?: 
   if (!category) throw new Error("CATEGORY_NOT_FOUND");
 
   const save = async (tx: WorkflowTransaction) => {
-    let item;
+    let item: typeof contentItems.$inferSelect;
     if (itemId) {
-      [item] = await tx.select().from(contentItems).where(eq(contentItems.id, itemId)).limit(1);
+      [item] = await tx.select().from(contentItems).where(eq(contentItems.id, itemId)).for("update");
       if (!item) throw new Error("CONTENT_NOT_FOUND");
+      const versionIds = [item.currentDraftVersionId, item.publishedVersionId].filter((id): id is string => Boolean(id));
+      const versions = versionIds.length ? await tx.select().from(contentVersions).where(inArray(contentVersions.id, versionIds)) : [];
+      const catalogueVersion = versions.find((version) => version.id === item.currentDraftVersionId && version.metadata.sourceMetadata?.importKind === "onboarding_catalog")
+        ?? versions.find((version) => version.metadata.sourceMetadata?.importKind === "onboarding_catalog");
+      if (catalogueVersion) {
+        const source = catalogueVersion.metadata.sourceMetadata!;
+        if (input.title !== source.sourceTitle) throw new Error("ONBOARDING_EXACT_TITLE_REQUIRED");
+        if (input.type !== "article" || input.agentKey !== "sav" || input.visibility !== "charly_only") throw new Error("SAV_KNOWLEDGE_SCOPE_REQUIRED");
+        const provenanceKeys = ["importKind", "canonicalFamilyId", "canonicalRevisionId", "sourceItemId", "sourceVersionId", "sourceTitle", "sourceHash", "approvedCandidateId"];
+        if (provenanceKeys.some((key) => input.metadata.sourceMetadata?.[key] !== source[key])) throw new Error("KNOWLEDGE_PROVENANCE_REQUIRED");
+      }
       [item] = await tx.update(contentItems).set({
-        title: input.title,
+        title: catalogueVersion && item.publishedVersionId ? item.title : input.title,
         summary: input.summary,
         categoryId: category.id,
         visibility: input.visibility,
@@ -118,12 +130,14 @@ async function prepareVersion(itemId: string, actorEmail: string, expectedVersio
     if (approved.revision.document.steps.some((step) => step.variants.length)) throw new Error("KNOWLEDGE_VARIANT_CONTEXT_REQUIRED");
     if (approved.revision.document.validUntil && approved.revision.document.validUntil < new Date().toISOString().slice(0, 10)) throw new Error("KNOWLEDGE_EXPIRED");
   }
+  await assertOnboardingPublicationSource(version.metadata);
+  const publicationTitle = version.metadata.sourceMetadata?.importKind === "onboarding_catalog" ? String(version.metadata.sourceMetadata.sourceTitle) : item.title;
   const chunks = chunkMarkdown(version.bodyMarkdown);
   if (!chunks.length) throw new Error("EMPTY_CHUNKS");
   const intents = "intents" in version.metadata ? version.metadata.intents : version.metadata.proposalSignals;
   const limovaPaths = "limovaPaths" in version.metadata ? version.metadata.limovaPaths : version.metadata.expectedPages;
   const embeddings = await embedTexts(
-    chunks.map((chunk) => `${item.title}\n${chunk.heading}\n${chunk.content}`),
+    chunks.map((chunk) => `${publicationTitle}\n${chunk.heading}\n${chunk.content}`),
     "RETRIEVAL_DOCUMENT",
     { scope: item.agentKey === "sav" ? "sav" : "extension" },
   );
@@ -135,7 +149,7 @@ async function prepareVersion(itemId: string, actorEmail: string, expectedVersio
     return terms.length > 0 && !terms.some((term) => normalized.includes(term));
   });
   if (failed.length) throw new Error(`QUALITY_TESTS_FAILED:${failed.map((test) => test.id).join(",")}`);
-  return { item, version, chunks, embeddings, intents, limovaPaths };
+  return { item, version, chunks, embeddings, intents, limovaPaths, publicationTitle };
 }
 
 export async function publish(itemId: string, actorEmail: string, options: { emergency?: boolean; reason?: string; expectedVersionId?: string } = {}) {
@@ -146,6 +160,7 @@ export async function publish(itemId: string, actorEmail: string, options: { eme
   const revision = revisionId();
 
   await db.transaction(async (tx) => {
+    await assertOnboardingPublicationSource(prepared.version.metadata, tx, true);
     const [current] = await tx.select().from(contentItems).where(eq(contentItems.id, itemId)).for("update");
     if (!current || current.currentDraftVersionId !== prepared.version.id || (!options.emergency && current.status !== "in_review")) throw new Error("KNOWLEDGE_REVIEW_STALE");
     await tx.delete(contentChunks).where(eq(contentChunks.versionId, prepared.version.id));
@@ -160,6 +175,7 @@ export async function publish(itemId: string, actorEmail: string, options: { eme
       embedding: prepared.embeddings[index],
     })));
     await tx.update(contentItems).set({
+      title: prepared.publicationTitle,
       publishedVersionId: prepared.version.id,
       status: "published",
       verifiedAt: new Date(),
@@ -199,7 +215,8 @@ export async function rollback(itemId: string, versionId: string, actorEmail: st
   if (!indexed) throw new Error("VERSION_NOT_INDEXED");
   const revision = revisionId();
   await db.transaction(async (tx) => {
-    await tx.update(contentItems).set({ currentDraftVersionId: version.id, publishedVersionId: version.id, status: "published", updatedAt: new Date() }).where(eq(contentItems.id, itemId));
+    await assertOnboardingPublicationSource(version.metadata, tx, true);
+    await tx.update(contentItems).set({ currentDraftVersionId: version.id, publishedVersionId: version.id, status: "published", ...(version.metadata.sourceMetadata?.importKind === "onboarding_catalog" ? { title: String(version.metadata.sourceMetadata.sourceTitle) } : {}), updatedAt: new Date() }).where(eq(contentItems.id, itemId));
     await tx.insert(knowledgeRevisions).values({ id: revision, actorEmail });
     await tx.insert(activeKnowledge).values({ singleton: true, revisionId: revision }).onConflictDoUpdate({ target: activeKnowledge.singleton, set: { revisionId: revision, updatedAt: new Date() } });
     await tx.insert(reviewEvents).values({ itemId, versionId, action: "rolled_back", actorEmail, comment: reason });
@@ -265,6 +282,18 @@ export async function setContentAiEnabled(itemId: string, enabled: boolean, acto
   const db = requireDb();
   const revision = revisionId();
   return db.transaction(async (tx) => {
+    if (enabled) {
+      const [current] = await tx.select().from(contentItems).where(eq(contentItems.id, itemId));
+      if (!current) throw new Error("CONTENT_NOT_FOUND");
+      const ids = [current.publishedVersionId, current.currentDraftVersionId].filter((id): id is string => Boolean(id));
+      const versions = ids.length ? await tx.select().from(contentVersions).where(inArray(contentVersions.id, ids)) : [];
+      const catalogue = versions.filter((version) => version.metadata.sourceMetadata?.importKind === "onboarding_catalog");
+      if (current.agentKey === "sav" || catalogue.length) assertKnowledgeUgoApproval(actorEmail);
+      if (catalogue.length) {
+        if (!current.publishedVersionId) throw new Error("ONBOARDING_PUBLICATION_REQUIRED");
+        for (const version of catalogue) await assertOnboardingPublicationSource(version.metadata, tx, true);
+      }
+    }
     const [item] = await tx.update(contentItems).set({ aiEnabled: enabled, updatedAt: new Date() })
       .where(eq(contentItems.id, itemId)).returning();
     if (!item) throw new Error("CONTENT_NOT_FOUND");

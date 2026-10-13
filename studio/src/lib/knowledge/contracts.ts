@@ -3,6 +3,15 @@ import { z } from "zod";
 const label = z.string().trim().min(1).max(500);
 const text = z.string().trim().max(5_000);
 const list = z.array(label).max(50).default([]);
+export const onboardingSourceSectionSchema = z.object({
+  id: z.string().regex(/^section\.[a-f0-9]{24}$/),
+  order: z.number().int().nonnegative(),
+  heading: label,
+  content: z.string().max(10_000),
+  classification: z.enum(["pending", "prerequisite", "exception", "escalation", "context", "not_applicable"]),
+  rationale: z.string().trim().max(2_000),
+}).strict();
+export type OnboardingSourceSection = z.infer<typeof onboardingSourceSectionSchema>;
 export const semanticStepSchema = z.object({
   id: z.string().regex(/^[a-z0-9][a-z0-9.-]{2,199}$/),
   userLabel: label,
@@ -33,6 +42,12 @@ export const canonicalKnowledgeSchema = z.object({
     symptoms: list,
     diagnosticQuestions: list,
     responseTemplate: text,
+  }).strict().optional(),
+  onboardingContext: z.object({
+    entryPoint: z.string().max(5_000),
+    sourceNotes: z.array(z.string().max(10_000)).max(50),
+    // Immutable source text plus Ugo's explicit classification, kept with the reviewed revision.
+    sourceSections: z.array(onboardingSourceSectionSchema).max(50).optional(),
   }).strict().optional(),
 }).strict().superRefine((value, ctx) => {
   if (new Set(value.steps.map((step) => step.id)).size !== value.steps.length) ctx.addIssue({ code: "custom", message: "SEMANTIC_STEP_IDS_MUST_BE_UNIQUE", path: ["steps"] });
