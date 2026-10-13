@@ -21,7 +21,7 @@ function setup(overrides = {}) {
 }
 
 beforeEach(() => {
-  document.body.innerHTML = ['authPanel', 'limovaControls', 'authFeedback', 'limovaFeedback'].map(id => `<div id="${id}"></div>`).join('')
+  document.body.innerHTML = '<input id="limovaBrowser" type="checkbox">' + ['authPanel', 'limovaControls', 'authFeedback', 'limovaFeedback'].map(id => `<div id="${id}"></div>`).join('')
     + ['limovaWorkspace', 'limovaConversation'].map(id => `<select id="${id}"></select>`).join('')
     + ['limovaLogin', 'limovaRefresh', 'limovaRefreshSession', 'limovaNew', 'limovaCancel'].map(id => `<button id="${id}"></button>`).join('');
 });
@@ -81,4 +81,16 @@ describe('Limova panel session and turn boundaries', () => {
     expect(element('limovaFeedback').textContent).toBe('Espace désactivé');
     expect(element('limovaCancel').hidden).toBe(true);
   });
+});
+
+
+it('requires a fresh browser opt-in and surfaces uncertainty without automatic replay', async () => {
+  const { panel, request } = setup({ LIMOVA_SEND_MESSAGE: () => ({ ok: true, browserState: 'uncertain' }) });
+  await panel.refresh();
+  element('limovaBrowser').checked = true;
+  await panel.send('Lis cette page');
+  expect(request).toHaveBeenCalledWith({ type: 'LIMOVA_SEND_MESSAGE', text: 'Lis cette page', browser: true });
+  expect(element('limovaBrowser').checked).toBe(false);
+  expect(element('limovaFeedback').textContent).toContain('incertain');
+  expect(request.mock.calls.filter(([request]) => request.type === 'LIMOVA_SEND_MESSAGE')).toHaveLength(1);
 });

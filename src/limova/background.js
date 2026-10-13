@@ -1,3 +1,4 @@
+import { createBrowserTurnRunner } from './browser-turn.js';
 import { createBrowserJournal } from './browser-journal.js';
 import { LimovaDeepAgentClient, LIMOVA_APP_URL } from './client.js';
 
@@ -9,7 +10,7 @@ export const LIMOVA_MESSAGE_TYPES = new Set([
   'LIMOVA_GET_MESSAGES',
 ]);
 
-export function createLimovaBackground({ storage, openTab, notify, client = new LimovaDeepAgentClient(), journal = createBrowserJournal() }) {
+export function createLimovaBackground({ storage, openTab, notify, client = new LimovaDeepAgentClient(), journal = createBrowserJournal(), createDriver }) {
   let context = null;
   let conversationId = null;
   let activeTurn = null;
@@ -116,9 +117,22 @@ export function createLimovaBackground({ storage, openTab, notify, client = new 
         activeTurn = turn;
         notify({ type: 'LIMOVA_TURN_STARTED', turnId: turn.id, conversationId });
         try {
+          const emit = event => {
+            if (activeTurn === turn) notify({ type: 'LIMOVA_STREAM_EVENT', turnId: turn.id, conversationId: turn.conversationId, event });
+          };
+          if (request.browser === true) {
+            if (!createDriver) throw new Error('Le pilote navigateur est indisponible.');
+            const sessionId = await journal.getSession(turn.context);
+            const driver = createDriver({ scope: { ...turn.context, sessionId }, journal, signal: turn.controller.signal });
+            const runner = createBrowserTurnRunner({ client, journal, readPage: driver.readPage,
+              execute: driver.execute, authorize: driver.authorize, notify: emit });
+            const outcome = await runner.send(turn.context, turn.conversationId, request.text, turn.controller.signal);
+            notify({ type: 'LIMOVA_BROWSER_STATE', turnId: turn.id, conversationId: turn.conversationId, state: outcome.state, actionId: outcome.actionId, browserTurnId: outcome.turnId });
+            return { ok: true, turnId: turn.id, browserState: outcome.state };
+          }
           for await (const event of client.sendMessage(turn.context, turn.conversationId, request.text, turn.controller.signal)) {
             if (activeTurn !== turn) break;
-            notify({ type: 'LIMOVA_STREAM_EVENT', turnId: turn.id, conversationId: turn.conversationId, event });
+            emit(event);
           }
           return { ok: true, turnId: turn.id };
         } catch (error) {
