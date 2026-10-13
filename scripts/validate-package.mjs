@@ -13,9 +13,11 @@ try {
   if (fs.readFileSync(path.join(target, 'src/limova/environment.js'), 'utf8') !== environmentModule(environment)) {
     failures.push('runtime environment module does not match the package environment');
   }
-  const bridge = fs.readFileSync(path.join(target, 'src/limova/app-session-bridge.js'), 'utf8');
-  if (!bridge.includes(environment.appOrigin) || !bridge.includes(environment.apiOrigin)) failures.push('app-session bridge environment mismatch');
-  if (environment.name === 'staging' && /https:\/\/(?:api\.)?new\.limova\.ai/.test(bridge)) failures.push('staging bridge contains a production endpoint');
+  for (const name of ['app-session-bridge', 'app-live-bridge']) {
+    const bridge = fs.readFileSync(path.join(target, `src/limova/${name}.js`), 'utf8');
+    if (!bridge.includes(environment.appOrigin) || !bridge.includes(environment.apiOrigin)) failures.push(`${name} environment mismatch`);
+    if (environment.name === 'staging' && /https:\/\/(?:api\.)?new\.limova\.ai/.test(bridge)) failures.push(`${name} staging bridge contains a production endpoint`);
+  }
 } catch (error) { failures.push(`invalid or missing build environment: ${error.message}`); }
 
 function requireFile(relativePath, source) {
