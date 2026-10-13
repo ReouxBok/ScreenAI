@@ -1,3 +1,4 @@
+import { liveBrowserBinding, liveBrowserContinuation, liveUuid } from './live-browser-contract.js';
 import { LIMOVA_API_URL } from './environment.js';
 
 export const LIVE_PORT = 'limova-app-live-v1';
@@ -15,7 +16,8 @@ const binaryFields = { 'assistant.audio.delta': 'audio', 'turn.deep_agent_stream
 export function attachLimovaLiveBridge(runtime, io) {
   runtime.onConnect.addListener(port => {
     if (port.name !== LIVE_PORT || port.sender?.id !== runtime.id) return;
-    let socket, request, ready, timer, ackTimer;
+    let socket, request, ready, timer, ackTimer, browserBinding, voiceTurnId;
+    let browserCommands = 0;
     let closed = false;
     let started = false;
     let connectedOnce = false;
@@ -62,6 +64,13 @@ export function attachLimovaLiveBridge(runtime, io) {
           ready = value;
           clearTimeout(timer);
         } else if (event !== 'error' && (!ready || value.sessionId !== ready.sessionId)) throw new Error();
+        if (event === 'turn.deep_agent_stream.started') {
+          if (!liveUuid(value.turnId) || voiceTurnId) throw new Error();
+          voiceTurnId = value.turnId; browserCommands = 0;
+        }
+        if (['turn.deep_agent_stream.completed', 'turn.deep_agent_stream.interrupted', 'turn.deep_agent_stream.failed', 'turn.interrupted'].includes(event)) {
+          if (value.turnId === voiceTurnId) voiceTurnId = undefined;
+        }
         const payload = { ...value };
         const binary = binaryFields[event];
         if (binary) {
@@ -92,6 +101,7 @@ export function attachLimovaLiveBridge(runtime, io) {
           if (![request.userId, request.workspaceId, request.conversationId].every(value => typeof value === 'string' && uuid.test(value))
             || typeof request.languageCode !== 'string' || request.languageCode.length > 32
             || typeof request.userTimezone !== 'string' || request.userTimezone.length > 100) throw new Error();
+          browserBinding = liveBrowserBinding(request.browserSession, request.browserContext);
           socket = io(`${LIMOVA_API_URL}/conversation/live`, {
             withCredentials: true, transports: ['websocket'], auth: { workspaceId: request.workspaceId },
             reconnection: false, forceNew: true, autoConnect: false, timeout: 10_000,
@@ -103,6 +113,7 @@ export function attachLimovaLiveBridge(runtime, io) {
             socket.emit('session.start', {
               conversationId: request.conversationId, languageCode: request.languageCode,
               userTimezone: request.userTimezone, clientSurface: 'chrome_extension', expectedUserId: request.userId,
+              ...browserBinding,
             });
           });
           socket.on('disconnect', () => close(true));
@@ -121,8 +132,14 @@ export function attachLimovaLiveBridge(runtime, io) {
           if (windowBytes > 64_000) throw new Error();
           if (socket.sendBuffer.length || socket.io.engine.writeBuffer.length > 8) throw new Error();
           socket.emit('audio.append', { audio: Uint8Array.from(bytes), sequence: audioSequence++ });
+        } else if (message?.kind === 'browser_continue') {
+          const continuation = liveBrowserContinuation(message.payload);
+          if (!browserBinding.browserSession || continuation.turnId !== voiceTurnId || ++browserCommands > 100
+            || socket.sendBuffer.length || socket.io.engine.writeBuffer.length > 8) throw new Error();
+          socket.emit('turn.browser_continue', { sessionId: ready.sessionId, ...continuation });
         } else if (message?.kind === 'cancel' && Number.isFinite(message.playedAudioMs)
           && message.playedAudioMs >= 0 && message.playedAudioMs <= 30 * 60 * 1_000) {
+          voiceTurnId = undefined;
           socket.emit('response.cancel', { playedAudioMs: message.playedAudioMs });
         } else throw new Error();
       } catch { close(true); }
