@@ -1,0 +1,84 @@
+// @vitest-environment jsdom
+import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { createLimovaPanel } from '../../../src/limova/panel.js';
+
+const state = { authenticated: true, user: { id: 'u' }, context: { userId: 'u', workspaceId: 'w' },
+  workspaces: [{ id: 'w', name: 'Mon espace', enabled: true }], conversationId: 'c', activeTurnId: null };
+const element = id => document.getElementById(id);
+
+function setup(overrides = {}) {
+  const request = vi.fn(async ({ type }) => {
+    if (overrides[type]) return overrides[type]();
+    if (type === 'LIMOVA_GET_STATE') return state;
+    if (type === 'LIMOVA_LIST_CONVERSATIONS') return { data: [{ id: 'c', title: 'Mon chat' }] };
+    if (type === 'LIMOVA_GET_MESSAGES') return { data: [{ id: 'h', role: 'user', content: 'Bonjour' }] };
+    return { ok: true };
+  });
+  const render = vi.fn();
+  const onBusy = vi.fn();
+  const panel = createLimovaPanel({ document, request, render, onBusy });
+  return { panel, request, render, onBusy };
+}
+
+beforeEach(() => {
+  document.body.innerHTML = ['authPanel', 'limovaControls', 'authFeedback', 'limovaFeedback'].map(id => `<div id="${id}"></div>`).join('')
+    + ['limovaWorkspace', 'limovaConversation'].map(id => `<select id="${id}"></select>`).join('')
+    + ['limovaLogin', 'limovaRefresh', 'limovaRefreshSession', 'limovaNew', 'limovaCancel'].map(id => `<button id="${id}"></button>`).join('');
+});
+
+describe('Limova panel session and turn boundaries', () => {
+  it('restores the authorized workspace and history using Limova only', async () => {
+    const { panel, render, request } = setup();
+    await panel.refresh();
+    expect(element('authPanel').hidden).toBe(true);
+    expect(element('limovaWorkspace').value).toBe('w');
+    expect(render).toHaveBeenLastCalledWith(expect.objectContaining({ messages: [{ id: 'h', role: 'user', content: 'Bonjour' }] }));
+    expect(request.mock.calls.every(([request]) => request.type.startsWith('LIMOVA_'))).toBe(true);
+  });
+
+  it('opens the app for login without requesting an OTP', async () => {
+    const { panel, request } = setup({ LIMOVA_GET_STATE: () => ({ authenticated: false, workspaces: [], context: null }) });
+    await panel.refresh();
+    expect(element('authPanel').hidden).toBe(false);
+    element('limovaLogin').click();
+    await vi.waitFor(() => expect(request).toHaveBeenCalledWith({ type: 'LIMOVA_OPEN_APP' }));
+  });
+
+  it('ignores events for another conversation or an obsolete turn', async () => {
+    const { panel, render } = setup();
+    await panel.refresh();
+    panel.handle({ type: 'LIMOVA_TURN_STARTED', conversationId: 'c', turnId: 't' });
+    render.mockClear();
+    panel.handle({ type: 'LIMOVA_STREAM_EVENT', conversationId: 'other', turnId: 't', event: { event: 'error' } });
+    panel.handle({ type: 'LIMOVA_STREAM_EVENT', conversationId: 'c', turnId: 'old', event: { event: 'error' } });
+    expect(render).not.toHaveBeenCalled();
+    panel.handle({ type: 'LIMOVA_STREAM_EVENT', conversationId: 'c', turnId: 't', event: { event: 'messages', data: [{ id: 'a', type: 'ai', content: 'Salut' }, {}] } });
+    expect(render.mock.lastCall[0].messages.at(-1).content).toBe('Salut');
+  });
+
+  it('does not restore old history when a pending send finishes after logout', async () => {
+    let finish;
+    let loggedOut = false;
+    const { panel, render, request } = setup({
+      LIMOVA_SEND_MESSAGE: () => new Promise(resolve => { finish = resolve; }),
+      LIMOVA_LOGOUT: () => { loggedOut = true; return { authenticated: false }; },
+      LIMOVA_GET_STATE: () => loggedOut ? { authenticated: false, workspaces: [], context: null } : state,
+    });
+    await panel.refresh();
+    const sending = panel.send('Bonjour');
+    await panel.logout();
+    const calls = request.mock.calls.length;
+    finish({ ok: true });
+    expect(await sending).toBe(false);
+    expect(request.mock.calls.length).toBe(calls);
+    expect(render.mock.lastCall[0].messages).toEqual([]);
+  });
+
+  it('surfaces background errors instead of claiming a message was sent', async () => {
+    const { panel } = setup({ LIMOVA_SEND_MESSAGE: () => ({ error: 'Espace désactivé' }) });
+    await panel.refresh();
+    expect(await panel.send('Bonjour')).toBe(false);
+    expect(element('limovaFeedback').textContent).toBe('Espace désactivé');
+    expect(element('limovaCancel').hidden).toBe(true);
+  });
+});

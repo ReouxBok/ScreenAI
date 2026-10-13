@@ -5,6 +5,7 @@ export const LIMOVA_MESSAGE_TYPES = new Set([
   'LIMOVA_GET_STATE', 'LIMOVA_SELECT_WORKSPACE', 'LIMOVA_LIST_CONVERSATIONS',
   'LIMOVA_CREATE_CONVERSATION', 'LIMOVA_OPEN_CONVERSATION', 'LIMOVA_SEND_MESSAGE',
   'LIMOVA_CANCEL', 'LIMOVA_OPEN_APP', 'LIMOVA_LOGOUT',
+  'LIMOVA_GET_MESSAGES',
 ]);
 
 export function createLimovaBackground({ storage, openTab, notify, client = new LimovaDeepAgentClient() }) {
@@ -42,7 +43,7 @@ export function createLimovaBackground({ storage, openTab, notify, client = new 
       context = { userId: current.user.id, workspaceId: workspace.id };
       conversationId = conversationId ?? stored?.conversationId ?? null;
     }
-    return { authenticated: true, ...current, context, conversationId };
+    return { authenticated: true, ...current, context, conversationId, activeTurnId: activeTurn?.id ?? null };
   }
 
   function requireContext() {
@@ -77,6 +78,8 @@ export function createLimovaBackground({ storage, openTab, notify, client = new 
       }
       case 'LIMOVA_LIST_CONVERSATIONS':
         return client.listConversations(requireContext(), request.page ?? 1);
+      case 'LIMOVA_GET_MESSAGES':
+        return client.getMessages(requireContext(), conversationId, request.cursor);
       case 'LIMOVA_CREATE_CONVERSATION': {
         await cancel();
         const conversation = await client.createConversation(requireContext(), request.title);

@@ -25,6 +25,14 @@ function harness({ enabled = true, userId = USER } = {}) {
 }
 
 describe('Limova Deep Agent client', () => {
+  it('uses the existing before query for an older history page', async () => {
+    const { client, fetch } = harness();
+    const original = fetch.getMockImplementation();
+    fetch.mockImplementation((url, options) => url.includes('/messages?')
+      ? json({ data: [], pagination: { hasMore: false } }) : original(url, options));
+    await client.getMessages(CONTEXT, CONVERSATION, USER);
+    expect(fetch.mock.calls.at(-1)[0]).toBe(`${LIMOVA_API_URL}/conversation/${CONVERSATION}/messages?before=${USER}`);
+  });
   it('resolves the existing main agent and creates a Deep Agent conversation', async () => {
     const { client, fetch } = harness();
     expect(await client.createConversation(CONTEXT)).toEqual({ id: CONVERSATION });

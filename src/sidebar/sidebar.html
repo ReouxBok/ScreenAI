@@ -12,22 +12,26 @@
       <div class="auth-card">
         <img src="../../assets/branding/charly.png" alt="" class="auth-avatar">
         <span class="auth-kicker">Accès Limova</span>
-        <h1 id="authTitle">Connecte-toi à Charly</h1>
-        <p id="authIntro">Utilise l’adresse email de ton compte Limova. Tu ne devras le faire qu’une seule fois sur cet appareil.</p>
-        <form id="authEmailForm" novalidate>
-          <label for="authEmail">Adresse email Limova</label>
-          <input id="authEmail" type="email" autocomplete="email" inputmode="email" required placeholder="prenom@entreprise.com">
-          <button type="submit" id="authEmailSubmit">Recevoir mon code</button>
-        </form>
-        <form id="authCodeForm" novalidate hidden>
-          <label for="authCode">Code reçu par email</label>
-          <input id="authCode" type="text" autocomplete="one-time-code" inputmode="numeric" pattern="[0-9]{6}" maxlength="6" required placeholder="000000">
-          <button type="submit" id="authCodeSubmit">Se connecter</button>
-          <button type="button" class="auth-secondary" id="authBack">Changer d’adresse</button>
-        </form>
+        <h1 id="authTitle">Retrouve ton compte Limova</h1>
+        <p id="authIntro">Connecte-toi dans l’application Limova pour retrouver Charly, tes conversations et tes intégrations.</p>
+        <button type="button" id="limovaLogin">Ouvrir Limova</button>
+        <button type="button" class="auth-secondary" id="limovaRefresh">Actualiser ma connexion</button>
         <p class="auth-feedback" id="authFeedback" role="status" aria-live="polite"></p>
         <a href="https://bienvenue.limova.ai/" target="_blank" rel="noopener noreferrer">Je n’ai pas encore de compte Limova</a>
       </div>
+    </section>
+
+    <section id="limovaControls" class="limova-controls" aria-label="Conversations Limova" hidden>
+      <label for="limovaWorkspace">Espace Limova</label>
+      <select id="limovaWorkspace"></select>
+      <label for="limovaConversation">Conversation</label>
+      <select id="limovaConversation"></select>
+      <div class="limova-control-actions">
+        <button id="limovaNew" type="button" disabled>Nouvelle conversation</button>
+        <button id="limovaRefreshSession" type="button">Actualiser</button>
+        <button id="limovaCancel" type="button" hidden>Arrêter</button>
+      </div>
+      <p id="limovaFeedback" role="status" aria-live="polite"></p>
     </section>
 
     <!-- Header -->
@@ -239,6 +243,6 @@
   <script src="voice.js"></script>
   <script src="training-recording-upload.js"></script>
   <script src="training-recorder.js"></script>
-  <script src="sidebar.js"></script>
+  <script type="module" src="sidebar.js"></script>
 </body>
 </html>

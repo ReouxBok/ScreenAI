@@ -123,7 +123,7 @@ export class LimovaDeepAgentClient {
 
   async getMessages(context, conversationId, cursor, signal) {
     await this.getConversation(context, conversationId, signal);
-    const query = cursor ? `?cursor=${encodeURIComponent(cursor)}` : '';
+    const query = cursor ? `?before=${encodeURIComponent(id(cursor))}` : '';
     return this.#request(`/conversation/${id(conversationId)}/messages${query}`, { workspaceId: context.workspaceId, signal });
   }
 

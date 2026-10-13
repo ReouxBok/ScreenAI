@@ -1,20 +1,17 @@
 import { test, expect } from './fixtures.js';
 
 test.describe('Sidebar UI', () => {
-  test.beforeEach(async ({ context, serviceWorker }) => {
-    await serviceWorker.evaluate(async ({ token, expiresAt }) => {
-      await chrome.storage.local.set({
-        charly_auth_session_v1: { token, expiresAt }
-      });
-    }, {
-      token: `e2e-${'x'.repeat(48)}`,
-      expiresAt: Date.now() + 60 * 60 * 1000
+  test.beforeEach(async ({ context }) => {
+    await context.addInitScript(() => {
+      const original = chrome.runtime.sendMessage.bind(chrome.runtime);
+      chrome.runtime.sendMessage = async request => {
+        if (request.type === 'LIMOVA_GET_STATE') {
+          await new Promise(resolve => setTimeout(resolve, 800));
+          return { authenticated: true, user: { id: 'user' }, workspaces: [], context: null, conversationId: null };
+        }
+        return original(request);
+      };
     });
-    await context.route('https://limova-proxy-479c7fb78ccf.herokuapp.com/api/copilot/bootstrap', route => route.fulfill({
-      status: 200,
-      contentType: 'application/json',
-      body: JSON.stringify({ available: true, enabled: true, recentMessages: [], goals: [], memories: [], greeting: null })
-    }));
   });
 
   test('renders the main layout with greeting and CTA', async ({ context, extensionId }) => {
@@ -38,16 +35,6 @@ test.describe('Sidebar UI', () => {
   });
 
   test('never flashes sign-in while a valid persistent session is restoring', async ({ context, extensionId }) => {
-    await context.unroute('https://limova-proxy-479c7fb78ccf.herokuapp.com/api/copilot/bootstrap');
-    await context.route('https://limova-proxy-479c7fb78ccf.herokuapp.com/api/copilot/bootstrap', async route => {
-      await new Promise(resolve => setTimeout(resolve, 800));
-      await route.fulfill({
-        status: 200,
-        contentType: 'application/json',
-        body: JSON.stringify({ available: true, enabled: true, recentMessages: [], greeting: null })
-      });
-    });
-
     const page = await context.newPage();
     await page.goto(`chrome-extension://${extensionId}/src/sidebar/sidebar.html`, { waitUntil: 'domcontentloaded' });
     await expect(page.locator('#authPanel')).toBeHidden();
@@ -137,7 +124,7 @@ test.describe('Sidebar UI', () => {
       if (action.prepare) await action.prepare(page);
       await page.locator(action.target).click();
       await expect(page.locator('#aiConsentPanel')).toBeVisible();
-      await expect(page.locator('#aiConsentPanel')).toContainText('Google Gemini');
+      await expect(page.locator('#aiConsentPanel')).toContainText('Limova');
       await expect(page.locator('#aiConsentPanel a[href*="politique-de-confidentialite"]')).toHaveCount(1);
       await page.close();
     });

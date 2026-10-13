@@ -491,6 +491,10 @@ function isTrustedMessageSource(request, sender) {
 async function handleMessage(request, sender) {
   await initializationPromise;
   if (LIMOVA_MESSAGE_TYPES.has(request.type)) {
+    if (request.type === 'LIMOVA_SEND_MESSAGE' && !(await hasAIProcessingConsent())) {
+      broadcastToSidebar({ type: 'CONSENT_REQUIRED' });
+      return { ok: false, consentRequired: true, error: 'Consentement IA requis.' };
+    }
     if ((trainingState.active || evaluationState.active) && request.type === 'LIMOVA_SEND_MESSAGE') {
       return { ok: false, error: 'Termine le mode formateur ou évaluation avant de reprendre une conversation personnelle.' };
     }
@@ -528,8 +532,8 @@ async function handleMessage(request, sender) {
         training: trainingState.active ? trainingState.session : null,
         evaluation: evaluationState.active ? { run: evaluationState.run, testCase: evaluationState.testCase, content: evaluationState.content } : null,
         extensionVersion: chrome.runtime.getManifest().version,
-        auth: await getCharlyAuthState(false),
-        copilot: await getCopilotBootstrap(false).catch(() => ({ available: false, enabled: false })),
+        auth: request.clientSurface === 'chrome_extension' ? undefined : await getCharlyAuthState(false),
+        copilot: request.clientSurface === 'chrome_extension' ? undefined : await getCopilotBootstrap(false).catch(() => ({ available: false, enabled: false })),
         capabilities: { training: true, realEvaluation: true, longTrainingRecording: true, domPopups: true, externalPopupLifecycle: true, charlyOtp: true }
       };
 

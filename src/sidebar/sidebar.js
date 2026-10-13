@@ -1,3 +1,5 @@
+import { createLimovaPanel } from '../limova/panel.js';
+
 /**
  * Limova AI - Charly Onboarding Assistant - Sidebar Logic
  * Handles chat rendering, user input, and background communication
@@ -44,13 +46,6 @@ const elements = {
   evaluationCorrect: document.getElementById('evaluationCorrect'),
   evaluationProblem: document.getElementById('evaluationProblem'),
   authPanel: document.getElementById('authPanel'),
-  authEmailForm: document.getElementById('authEmailForm'),
-  authEmail: document.getElementById('authEmail'),
-  authEmailSubmit: document.getElementById('authEmailSubmit'),
-  authCodeForm: document.getElementById('authCodeForm'),
-  authCode: document.getElementById('authCode'),
-  authCodeSubmit: document.getElementById('authCodeSubmit'),
-  authBack: document.getElementById('authBack'),
   authFeedback: document.getElementById('authFeedback'),
   memoryToggleBtn: document.getElementById('memoryToggleBtn'),
   exportDataBtn: document.getElementById('exportDataBtn'),
@@ -70,7 +65,7 @@ let trainingCaptureActive = false;
 let trainingScreenRecorder = null;
 let activeTrainingSession = null;
 let activeTrainingToken = '';
-let authChallenge = null;
+let limovaPanel = null;
 let backgroundPort = null;
 let backgroundReconnectTimer = null;
 let backgroundReconnectAttempts = 0;
@@ -87,6 +82,12 @@ document.addEventListener('DOMContentLoaded', async () => {
   applyTranslations();
   updateLangSwitcher();
   renderAnnouncements();
+  limovaPanel = createLimovaPanel({
+    document,
+    request: request => chrome.runtime.sendMessage(request),
+    onBusy: busy => { isLoading = busy; elements.sendBtn.disabled = busy; },
+    render: renderLimovaConversation,
+  });
   initEventListeners();
   await loadInitialState();
   document.documentElement.dataset.sidebarReady = 'true';
@@ -98,9 +99,6 @@ function initEventListeners() {
   elements.sendBtn.addEventListener('click', sendMessage);
   elements.screenshotBtn.addEventListener('click', analyzePage);
   elements.voiceBtn.addEventListener('click', toggleVoice);
-  elements.authEmailForm?.addEventListener('submit', requestAuthenticationCode);
-  elements.authCodeForm?.addEventListener('submit', verifyAuthenticationCode);
-  elements.authBack?.addEventListener('click', resetAuthenticationForm);
 
   elements.resetBtn.addEventListener('click', () => { document.getElementById('headerMenu').hidden = true; resetSession(); });
   document.getElementById('logoutBtn')?.addEventListener('click', logoutCharly);
@@ -240,49 +238,33 @@ function scheduleBackgroundReconnect() {
 }
 
 async function refreshAuthenticationState() {
-  const response = await chrome.runtime.sendMessage({ type: 'AUTH_GET_STATE' }).catch(() => null);
-  applyAuthenticationState(response);
+  await limovaPanel.refresh();
 }
 
-function applyAuthenticationState(auth) {
-  if (auth?.authenticated === true) {
-    setAuthenticationVisible(false);
-  } else if (auth?.authenticated === false && auth?.pending !== true) {
-    setAuthenticationVisible(true);
-  } else {
-    document.documentElement.dataset.authState = 'checking';
-  }
+function renderLimovaConversation(snapshot) {
+  elements.chatContainer.replaceChildren();
+  lastMessageSender = null;
+  hidePondering();
+  if (snapshot.messages.length || snapshot.files.length) hideWelcomeScreen();
+  snapshot.messages.forEach(message => addMessage(message.role, message.content, { skipScroll: true, nextStep: false }));
+  snapshot.files.forEach(file => {
+    const link = document.createElement('a');
+    link.href = file.url;
+    link.textContent = file.name;
+    link.target = '_blank';
+    link.rel = 'noopener noreferrer';
+    link.className = 'message generated-file';
+    elements.chatContainer.append(link);
+  });
+  if (snapshot.error) addMessage('error', snapshot.error);
+  scrollToBottom();
 }
 
 async function loadInitialState() {
   try {
-    const response = await chrome.runtime.sendMessage({ type: 'GET_STATE' });
+    await limovaPanel.refresh();
+    const response = await chrome.runtime.sendMessage({ type: 'GET_STATE', clientSurface: 'chrome_extension' });
     backgroundCapabilities = response?.capabilities || {};
-    applyAuthenticationState(response?.auth);
-    const visibleHistory = response?.conversationHistory?.length > 0
-      ? response.conversationHistory
-      : (response?.copilot?.recentMessages || []).map(message => ({ role: message.role, content: message.content }));
-    if (visibleHistory.length > 0) {
-      hideWelcomeScreen();
-      visibleHistory.forEach(msg => {
-        if (msg.role !== 'screenshot') {
-          addMessage(msg.role, msg.content, { skipScroll: true });
-        }
-      });
-      scrollToBottom();
-    } else if (response?.copilot?.greeting) {
-      hideWelcomeScreen();
-      addMessage('assistant', response.copilot.greeting, { skipScroll: true });
-    }
-    updateMemoryControls(response?.copilot);
-    // Restore onboarding step progress
-    if (response?.onboardingPlan) {
-      const plan = response.onboardingPlan;
-      const current = plan.steps[plan.activeIndex];
-      if (current) {
-        updateStepInfo(current.name, `${plan.activeIndex + 1} / ${plan.steps.length}`);
-      }
-    }
     if (response?.training) {
       const recovery = await chrome.runtime.sendMessage({ type: 'CANCEL_TRAINING' }).catch(() => null);
       elements.trainingPanel.hidden = false;
@@ -300,88 +282,10 @@ async function loadInitialState() {
 
 }
 
-function setAuthenticationVisible(required) {
-  elements.authPanel.hidden = !required;
-  document.documentElement.dataset.authState = required ? 'required' : 'authenticated';
-  if (required) {
-    voiceSession?.stop(false);
-    voiceSession = null;
-    setTimeout(() => elements.authEmail?.focus(), 0);
-  }
-}
-
-function setAuthFeedback(message, error = false) {
-  elements.authFeedback.textContent = message || '';
-  elements.authFeedback.classList.toggle('error', error);
-}
-
-async function requestAuthenticationCode(event) {
-  event.preventDefault();
-  const email = elements.authEmail.value.trim();
-  if (!elements.authEmail.checkValidity()) {
-    setAuthFeedback('Saisis une adresse email valide.', true);
-    elements.authEmail.reportValidity();
-    return;
-  }
-  elements.authEmailSubmit.disabled = true;
-  setAuthFeedback('Vérification du compte Limova…');
-  try {
-    const result = await chrome.runtime.sendMessage({ type: 'AUTH_REQUEST_OTP', email });
-    if (!result?.challenge) throw new Error(result?.error || 'Impossible d’envoyer le code.');
-    authChallenge = result.challenge;
-    elements.authEmailForm.hidden = true;
-    elements.authCodeForm.hidden = false;
-    setAuthFeedback('Si ce compte Limova est actif, un code vient d’être envoyé.');
-    elements.authCode.focus();
-  } catch (error) {
-    setAuthFeedback(error.message || 'Connexion temporairement indisponible.', true);
-  } finally {
-    elements.authEmailSubmit.disabled = false;
-  }
-}
-
-async function verifyAuthenticationCode(event) {
-  event.preventDefault();
-  const code = elements.authCode.value.trim();
-  if (!/^\d{6}$/.test(code) || !authChallenge) {
-    setAuthFeedback('Saisis le code à six chiffres reçu par email.', true);
-    return;
-  }
-  elements.authCodeSubmit.disabled = true;
-  setAuthFeedback('Connexion…');
-  try {
-    const result = await chrome.runtime.sendMessage({ type: 'AUTH_VERIFY_OTP', challenge: authChallenge, code });
-    if (!result?.authenticated) throw new Error(result?.error || 'Code incorrect ou expiré.');
-    setAuthFeedback('Connexion réussie.');
-    setAuthenticationVisible(false);
-    resetAuthenticationForm();
-    const state = await chrome.runtime.sendMessage({ type: 'GET_STATE' }).catch(() => null);
-    updateMemoryControls(state?.copilot);
-    if (state?.copilot?.greeting && elements.chatContainer.childElementCount === 0) {
-      hideWelcomeScreen();
-      addMessage('assistant', state.copilot.greeting);
-    }
-  } catch (error) {
-    setAuthFeedback(error.message || 'Code incorrect ou expiré.', true);
-    elements.authCode.select();
-  } finally {
-    elements.authCodeSubmit.disabled = false;
-  }
-}
-
-function resetAuthenticationForm() {
-  authChallenge = null;
-  elements.authCode.value = '';
-  elements.authCodeForm.hidden = true;
-  elements.authEmailForm.hidden = false;
-  setAuthFeedback('');
-}
-
 async function logoutCharly() {
   document.getElementById('headerMenu').hidden = true;
-  await chrome.runtime.sendMessage({ type: 'AUTH_LOGOUT' }).catch(() => {});
-  elements.chatContainer.textContent = '';
-  setAuthenticationVisible(true);
+  try { await limovaPanel.logout(); }
+  catch (error) { addMessage('error', error.message); }
 }
 
 function updateMemoryControls(copilot) {
@@ -669,6 +573,7 @@ async function checkIfOnLimova() {
 // ============================================================================
 
 function handleBackgroundMessage(message) {
+  if (limovaPanel?.handle(message)) return;
   if (trainingCaptureActive && [
     'GEMINI_RESPONSE', 'STATUS_UPDATE', 'ACTION_PROPOSAL', 'ACTION_RESULT',
     'STEP_UPDATE', 'ONBOARDING_COMPLETE', 'VOICE_PAGE_CONTEXT'
@@ -677,8 +582,7 @@ function handleBackgroundMessage(message) {
     case 'AUTH_REQUIRED':
       hidePondering();
       isLoading = false;
-      setAuthenticationVisible(true);
-      setAuthFeedback('Ta session a expiré. Reconnecte-toi pour continuer.', true);
+      void limovaPanel.refresh();
       break;
 
     case 'GEMINI_RESPONSE':
@@ -849,7 +753,7 @@ function addMessage(role, content, options = {}) {
   msgDiv.appendChild(contentDiv);
   elements.chatContainer.appendChild(msgDiv);
 
-  if (role === 'assistant') {
+  if (role === 'assistant' && options.nextStep !== false) {
     removeNextStepLinks();
     const link = document.createElement('a');
     link.className = 'next-step-link';
@@ -1017,36 +921,19 @@ function autoResizeTextarea() {
 }
 
 async function sendMessage() {
-  if (trainingCaptureActive) return;
+  if (trainingCaptureActive || isLoading) return;
   const text = elements.userInput.value.trim();
-  if (!text || isLoading) return;
-  if (!(await ensureAIConsent())) return;
-
-  // Text and Live voice must never own the same user turn. Closing the voice
-  // session first prevents a late Live tool call from racing the text runner.
+  if (!text || !(await ensureAIConsent())) return;
   if (voiceSession?.active) {
     voiceSession.stop(false);
     voiceSession = null;
     await chrome.runtime.sendMessage({ type: 'VOICE_SESSION_STATE', active: false }).catch(() => {});
   }
-
-  isLoading = true;
-  hideWelcomeScreen();
-  addMessage('user', text);
-  elements.userInput.value = '';
-  autoResizeTextarea();
-  showPondering();
-  updateStatus('analyzing');
-
-  try {
-    await chrome.runtime.sendMessage({ type: 'USER_MESSAGE', text });
-  } catch (e) {
-    hidePondering();
-    addMessage('error', t('errorComm'));
-    updateStatus('error');
+  const sent = await limovaPanel.send(text);
+  if (sent && elements.userInput.value.trim() === text) {
+    elements.userInput.value = '';
+    autoResizeTextarea();
   }
-
-  isLoading = false;
 }
 
 async function analyzePage() {
@@ -1197,21 +1084,7 @@ function handleTabWarningClick() {
 // ============================================================================
 
 async function resetSession() {
-  if (!confirm(t('resetConfirm'))) return;
-  try {
-    voiceSession?.stop(false);
-    voiceSession = null;
-    voiceTranscriptBuffers.user = '';
-    voiceTranscriptBuffers.assistant = '';
-    await chrome.runtime.sendMessage({ type: 'RESET_SESSION' });
-    elements.chatContainer.textContent = '';
-    elements.stepInfo.hidden = true;
-    elements.welcomeScreen.hidden = false;
-    welcomeScreenVisible = true;
-    lastMessageSender = null;
-    hideTabWarning();
-    updateStatus('ready');
-  } catch (e) {}
+  await limovaPanel.create();
 }
 
 // ============================================================================
