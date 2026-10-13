@@ -6,7 +6,8 @@ import { savTicketReturnPlan } from "./ticket-lifecycle";
 const input = { subject: "Re: Re : Suite à votre demande - Urgent", body: "L'agent ne redémarre plus et le test ne se lance pas.\nLe lundi, Support a écrit :\n> Nous suivons le problème de votre agent téléphonique.",
   tickets: [{ id: "401", subject: "Incident du téléphone IA", description: "Le client revient sur la panne de son agent téléphonique.", status: "open" as const, stageId: "2", ownerId: "71" }] };
 const assessment = (ticketId = "401", relation: "same_issue" | "different_issue" | "uncertain" = "same_issue") => ({ ticketId, relation, messageExcerpt: "L'agent ne redémarre plus", historyExcerpt: "problème de votre agent téléphonique", ticketExcerpt: "panne de son agent téléphonique", explanation: "Le problème technique suivi dans le fil est toujours présent." });
-const data = { currentMessage: input.body.split("\n")[0], history: input.body.split("\n").slice(1).join("\n"), tickets: input.tickets.map(t => ({ id: t.id, text: `${t.subject}\n${t.description}` })) };
+const data = { currentMessage: input.body.split("\n")[0], history: input.body.split("\n").slice(1).join("\n"), tickets: input.tickets.map(t => ({ id: t.id, text: `${t.subject}\n${t.description}` })),
+  limitations: { historyTruncated: false, subjectTruncated: false, descriptionTruncatedTicketIds: [], subjectTruncatedTicketIds: [] } };
 afterEach(() => { vi.unstubAllEnvs(); vi.useRealTimers(); });
 
 describe("supervised ticket content matching", () => {
@@ -96,5 +97,21 @@ describe("supervised ticket content matching", () => {
     expect(selectSavAssessedTicket(tickets, [assessment(), assessment("400", "uncertain")]).kind).toBe("ambiguous");
     const closed = tickets.map((t, i) => ({ ...t, status: "closed" as const, closedAt: i ? "2026-10-01T02:00:00+02:00" : "2026-10-01T00:00:00Z" }));
     expect(selectSavAssessedTicket(closed, [assessment(), assessment("400")]).kind).toBe("ambiguous");
+  });
+  it.each(["same_issue", "different_issue"] as const)("never trusts a %s assessment from a truncated CRM description", relation => {
+    const partial = { ...input.tickets[0], descriptionTruncated: true };
+    expect(selectSavAssessedTicket([partial], [assessment("401", relation)]).kind).toBe("ambiguous");
+  });
+  it("does not infer a distinct issue from a truncated subject or a complete match from a partial CRM title", () => {
+    expect(selectSavAssessedTicket(input.tickets, [assessment("401", "different_issue")], { historyTruncated: false, subjectTruncated: true }).kind).toBe("ambiguous");
+    expect(selectSavAssessedTicket([{ ...input.tickets[0], subjectTruncated: true }], [assessment()]).kind).toBe("ambiguous");
+  });
+  it("does not conclude a distinct issue from truncated history, but preserves a supported active match", async () => {
+    const partial = { ...input, body: `${input.body}\n> ${"ancien échange ".repeat(400)}` };
+    const distinct = await matchSavTicketsByContent(partial, { apiKey: "fixture", fetch: async () => geminiFixture({ assessments: [assessment("401", "different_issue")] }) });
+    expect(distinct.matching.limitations.historyTruncated).toBe(true);
+    expect(distinct.selection.kind).toBe("ambiguous");
+    const same = await matchSavTicketsByContent(partial, { apiKey: "fixture", fetch: async () => geminiFixture({ assessments: [assessment()] }) });
+    expect(same.selection.kind).toBe("matched");
   });
 });

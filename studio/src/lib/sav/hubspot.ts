@@ -597,10 +597,12 @@ export async function readSavHubspotContext(input: { email: string; subject: str
     const closed = await closedTicketStages();
     const records = [...(linkedTicket ? [linkedTicket] : []), ...(response.results ?? []).filter((ticket) => ticket.id !== linkedTicket?.id)]
       .filter((ticket) => String(ticket.properties.hs_pipeline) === SAV_HUBSPOT_SUPPORT.pipelineId);
-    const tickets = sortSavTicketsNewestFirst(records.map((ticket): SavLifecycleTicket & { subject: string; description: string; pipelineId: string | null; stageId: string | null; updatedAt: string | null } => ({
+    const tickets = sortSavTicketsNewestFirst(records.map((ticket): SavLifecycleTicket & { subject: string; description: string; descriptionTruncated?: boolean; subjectTruncated?: boolean; pipelineId: string | null; stageId: string | null; updatedAt: string | null } => ({
       id: ticket.id,
       subject: String(ticket.properties.subject || "Sans objet").slice(0, 500),
+      subjectTruncated: String(ticket.properties.subject || "Sans objet").length > 500,
       description: String(ticket.properties.content || "").slice(0, 2_500),
+      descriptionTruncated: String(ticket.properties.content || "").length > 2_500,
       pipelineId: ticket.properties.hs_pipeline,
       stageId: ticket.properties.hs_pipeline_stage,
       ownerId: ticket.properties.hubspot_owner_id || null,

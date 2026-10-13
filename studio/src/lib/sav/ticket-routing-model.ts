@@ -15,7 +15,7 @@ const assessmentSchema = z.object({
   explanation: z.string().min(1).max(700),
 }).strict();
 const verdictSchema = z.object({ assessments: z.array(assessmentSchema).min(1).max(100) }).strict();
-type Ticket = SavTicketCandidate & { description: string };
+type Ticket = SavTicketCandidate & { description: string; descriptionTruncated?: boolean; subjectTruncated?: boolean };
 type Assessment = z.infer<typeof assessmentSchema>;
 type Selection = ReturnType<typeof selectSavTicketMatch>;
 const normalize = (value: string) => value.normalize("NFKC").replace(/\s+/g, " ").trim();
@@ -39,9 +39,16 @@ export function validateSavTicketAssessments(raw: unknown, data: { currentMessag
 }
 
 /** An existing active match takes precedence over old closed records, never another active candidate. */
-export function selectSavAssessedTicket(tickets: Ticket[], assessments: Assessment[]): Selection {
-  const same = tickets.filter(t => assessments.some(a => a.ticketId === t.id && a.relation === "same_issue"));
-  const uncertain = tickets.filter(t => assessments.some(a => a.ticketId === t.id && a.relation === "uncertain"));
+export function selectSavAssessedTicket(tickets: Ticket[], assessments: Assessment[], limitations = { historyTruncated: false, subjectTruncated: false }): Selection {
+  const relation = (ticket: Ticket) => {
+    const assessment = assessments.find(a => a.ticketId === ticket.id);
+    // A partial CRM record cannot establish either equivalence or distinction.
+    // Missing history may still support an evidenced active match, never absence.
+    return ticket.descriptionTruncated || ticket.subjectTruncated || assessment?.relation === "different_issue" && (limitations.historyTruncated || limitations.subjectTruncated)
+      ? "uncertain" : assessment?.relation ?? "uncertain";
+  };
+  const same = tickets.filter(t => relation(t) === "same_issue");
+  const uncertain = tickets.filter(t => relation(t) === "uncertain");
   const active = same.filter(t => t.status === "open");
   if (active.length === 1 && !uncertain.some(t => t.status === "open"))
     return { kind: "matched", ticket: active[0], reason: "semantic_same_issue" };
@@ -58,18 +65,22 @@ export function selectSavAssessedTicket(tickets: Ticket[], assessments: Assessme
 /** Supervised proposal only. One bounded read, no tools, writes or automatic retry. */
 export async function matchSavTicketsByContent(input: { subject: string; body: string; tickets: Ticket[] }, options: { apiKey?: string; model?: string; fetch?: typeof fetch } = {}) {
   const message = buildSavInboundContext(input);
+  const split = splitSavMessageText(input.body);
   const data = { currentMessage: [message.subjectInherited ? "" : input.subject.slice(0, 1000), message.currentText].filter(Boolean).join("\n"),
-    history: message.quotedText, tickets: input.tickets.map(t => ({ id: t.id, text: `${t.subject}\n${t.description}` })) };
+    history: message.quotedText, tickets: input.tickets.map(t => ({ id: t.id, text: `${t.subject}\n${t.description}` })),
+    limitations: { historyTruncated: split.quotedText.length > message.quotedText.length || input.body.length > 100000,
+      subjectTruncated: !message.subjectInherited && input.subject.length > 1000, descriptionTruncatedTicketIds: input.tickets.filter(t => t.descriptionTruncated).map(t => t.id),
+      subjectTruncatedTicketIds: input.tickets.filter(t => t.subjectTruncated).map(t => t.id) } };
   const started = Date.now(), model = options.model ?? process.env.SAV_AI_MODEL ?? "gemini-3.6-flash";
   let metadata: SavGeminiMetadata = {};
   const trace = (errorCode: string | null, assessments: Assessment[] = []) => ({ revision: SAV_TICKET_MATCH_REVISION, model,
     inputHash: savContentHash(data), durationMs: Date.now() - started, inputTokens: metadata.inputTokens ?? 0,
-    outputTokens: metadata.outputTokens ?? 0, totalTokens: metadata.totalTokens ?? 0, errorCode, assessments });
+    outputTokens: metadata.outputTokens ?? 0, totalTokens: metadata.totalTokens ?? 0, errorCode, assessments, limitations: data.limitations });
   if (!input.tickets.length) return { selection: { kind: "new" as const, reason: "no_open_ticket" }, matching: trace(null) };
   const controller = new AbortController(), timeout = setTimeout(() => controller.abort(), 12000);
   try {
     const key = options.apiKey ?? savGeminiApiKey();
-    if (!message.currentText || splitSavMessageText(input.body).currentText.length > 12000 || JSON.stringify(data).length > 30000 || new Set(input.tickets.map(t => t.id)).size !== input.tickets.length)
+    if (!message.currentText || split.currentText.length > 12000 || JSON.stringify(data).length > 30000 || new Set(input.tickets.map(t => t.id)).size !== input.tickets.length)
       throw new Error("SAV_TICKET_MATCH_CONTEXT_INCOMPLETE");
     if (process.env.SAV_AI_ANALYSIS === "false") throw new Error("SAV_AI_ANALYSIS_DISABLED");
     if (!key) throw new Error("SAV_AI_KEY_MISSING");
@@ -88,7 +99,7 @@ export async function matchSavTicketsByContent(input: { subject: string; body: s
     const generated = readSavGeminiResponse(await response.json());
     metadata = generated.metadata;
     const assessments = validateSavTicketAssessments(parseSavGeminiJson(generated), data);
-    return { selection: selectSavAssessedTicket(input.tickets, assessments), matching: trace(null, assessments) };
+    return { selection: selectSavAssessedTicket(input.tickets, assessments, data.limitations), matching: trace(null, assessments) };
   } catch (error) {
     return { selection: { kind: "ambiguous" as const, candidates: input.tickets, reason: "ticket_semantic_match_unavailable" },
       matching: trace(controller.signal.aborted ? "SAV_AI_TIMEOUT" : savAnalysisErrorCode(error)) };
