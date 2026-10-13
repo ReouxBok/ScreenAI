@@ -1,4 +1,5 @@
-import { savTicketReturnPlan, savTicketReturnLabels, sortSavTicketsNewestFirst } from "@/lib/sav/ticket-lifecycle";
+import { savTicketActionPresentation } from "@/lib/sav/ticket-action-presentation";
+import { savTicketReturnPlan, sortSavTicketsNewestFirst } from "@/lib/sav/ticket-lifecycle";
 import { formatParisDateTime } from "@/lib/paris-date";
 import Link from "next/link";
 import { ArrowLeft, Bot, CheckCircle2, CircleAlert, Clock3, ExternalLink, LockKeyhole, UserRound } from "lucide-react";
@@ -83,6 +84,8 @@ export default async function SavThreadPage({ params, searchParams }: { params: 
   const ticketMatch = dossier?.crm.data?.routing;
   const returnTicket = ticketMatch?.kind === "matched" ? crmTickets.find(ticket => ticket.id === ticketMatch.ticketId) : null;
   const returnPlan = returnTicket && latestInbound ? savTicketReturnPlan(returnTicket, latestInbound.receivedAt) : null;
+  const ticketPresentation = returnTicket && returnPlan ? savTicketActionPresentation(returnTicket, returnPlan.operation, proposalReview?.proposal.ticket.title) : null;
+  const newTicketTitle = proposalReview?.proposal.ticket.title || latestInbound?.subject || detail.thread.subject;
   const returnUncertain = detail.actions.some(action => action.payload.ticketReturnDispatchedAt && !action.payload.ticketReturnCompletedAt);
   const returnCompleted = detail.actions.some(action => action.messageId === latestInbound?.id && action.status === "succeeded" && ["create_ticket", "link_ticket"].includes(action.kind) && action.actorType === "human");
   const linkedHubspotTicket = detail.thread.hubspotTicketId ? dossier?.crm.data?.tickets.find((ticket) => ticket.id === detail.thread.hubspotTicketId) : undefined;
@@ -117,7 +120,7 @@ export default async function SavThreadPage({ params, searchParams }: { params: 
     <a className={styles.contextJump} href="#sav-client-context">Voir le contexte client et les actions</a>
     <section className={`sav-thread-grid ${styles.layout}`}>
       <div className={`sav-conversation ${styles.main}`}>
-        <MailConversation messages={detail.messages}/>
+        <MailConversation key={latestInbound?.id ?? id} messages={detail.messages.map(message => ({ id: message.id, receivedAt: message.receivedAt, direction: message.direction, fromEmail: message.fromEmail, body: { text: message.body.text, attachments: message.body.attachments } }))}/>
         {proposalReview && latestInbound && <ProposalReview data={proposalReview} threadId={detail.thread.id} messageId={latestInbound.id} drafts={replyDrafts} context={{ subject: customerMessage?.subject ?? latestInbound.subject, messageCount: detail.messages.length, relatedCount: relatedThreads.length + (isForward ? dossier?.otherConversations.length ?? 0 : 0), linkedTicketId: detail.thread.hubspotTicketId }} sendAllowed={!sendDisabledReason} sendDisabledReason={sendDisabledReason} replyState={replyState}/>}
         {proposalReview && latestInbound && <DraftReview data={proposalReview} threadId={id} messageId={latestInbound.id} drafts={replyDrafts} sendAllowed={!sendDisabledReason} sendDisabledReason={sendDisabledReason} replyState={replyState}/>}
         <ResolutionObservation rows={observations} isUgo={staff.email.toLowerCase()==="ugo@limova.ai"}/>
@@ -188,19 +191,19 @@ export default async function SavThreadPage({ params, searchParams }: { params: 
                   <input type="hidden" name="threadId" value={id}/><input type="hidden" name="actionId" value={action.id}/><label>ID de la note de retour vérifiée dans HubSpot<input name="noteId" required pattern="[0-9]+" defaultValue={typeof action.payload.ticketReturnNoteId === "string" ? action.payload.ticketReturnNoteId : ""}/></label><button className="secondary">Vérifier la note et le statut Nouveau</button><p>Lecture seule : vérifie l’email complet, le ticket et la fiche client sans rien recréer.</p>
                 </form>)}
               </div>}
-              {returnTicket && returnPlan && <div><h3>Retour sur le ticket #{returnTicket.id}</h3><p>{savTicketReturnLabels[returnPlan.operation]}</p>
+              {returnTicket && returnPlan && ticketPresentation && <div><h3>{ticketPresentation.label}</h3><p><strong>{returnTicket.subject}</strong> · #{returnTicket.id}</p><p>{ticketPresentation.explanation}</p>
                 {returnPlan.operation === "reactivate" && <p>La note indiquera que le client est revenu et contiendra le texte de son email affiché dans ce dossier.</p>}
                 {returnCompleted ? <p>Action déjà traitée pour cet email.</p> : returnPlan.operation !== "review" && proposalReview?.review?.status === "approved" ?
                   <form action={returnPlan.operation === "create" ? createTicketAction : linkTicketAction}>
                     <input type="hidden" name="threadId" value={id}/><input type="hidden" name="reviewId" value={proposalReview.review.id}/>
                     <input type="hidden" name="ticketId" value={returnTicket.id}/><input type="hidden" name="returnOperation" value={returnPlan.operation}/>
-                    <button className="primary" disabled={ticketRequestPending || returnUncertain || needsTicketReconciliation || dossier?.crm.status !== "ready"}>{savTicketReturnLabels[returnPlan.operation]}</button>
+                    <button className={`primary ${styles.ticketButton}`} disabled={ticketRequestPending || returnUncertain || needsTicketReconciliation || dossier?.crm.status !== "ready"}><span>{ticketPresentation.label}</span><small>{ticketPresentation.title}</small></button>
                   </form> : <p>{returnPlan.operation === "review" ? "Date de clôture ou statut insuffisant : vérification humaine nécessaire." : "Validez d’abord le dossier pour confirmer cette action."}</p>}
               </div>}
-              {!returnTicket && !returnUncertain && !detail.thread.hubspotTicketId && (needsTicketReconciliation ? <><button className="primary" disabled>Créer un ticket HubSpot</button><p>Création bloquée : vérifiez et rapprochez le ticket existant ci-dessous.</p></> : ticketRequestPending ? <><button className="primary" disabled>Demande HubSpot en attente</button><p>Une demande de création ou de rattachement est déjà enregistrée. Suivi disponible dans le journal d’actions.</p></> : proposalReview?.review?.status === "approved" && ["ticket_pending", "human_review_required"].includes(proposalReview.proposal.decision.kind) ? <>
-                <form action={createTicketAction}><input type="hidden" name="threadId" value={id}/><input type="hidden" name="reviewId" value={proposalReview.review.id}/><label>Si ce client a déjà un ticket ouvert : pourquoi est-ce un problème distinct ?<textarea name="distinctIssueReason" maxLength={2_000} placeholder="Justification humaine, au moins 20 caractères si nécessaire"/></label><button className="primary" disabled={customerContextBlocked}>Créer un ticket HubSpot</button></form>
+              {!returnTicket && !returnUncertain && !detail.thread.hubspotTicketId && (needsTicketReconciliation ? <><button className={`primary ${styles.ticketButton}`} disabled><span>Ouvrir un nouveau ticket</span><small>{newTicketTitle}</small></button><p>Création bloquée : vérifiez et rapprochez le ticket existant ci-dessous.</p></> : ticketRequestPending ? <><button className="primary" disabled>Demande HubSpot en attente</button><p>Une demande de création ou de rattachement est déjà enregistrée. Suivi disponible dans le journal d’actions.</p></> : proposalReview?.review?.status === "approved" && ["ticket_pending", "human_review_required"].includes(proposalReview.proposal.decision.kind) ? <>
+                <form action={createTicketAction}><input type="hidden" name="threadId" value={id}/><input type="hidden" name="reviewId" value={proposalReview.review.id}/><label>Si ce client a déjà un ticket ouvert : pourquoi est-ce un problème distinct ?<textarea name="distinctIssueReason" maxLength={2_000} placeholder="Justification humaine, au moins 20 caractères si nécessaire"/></label><button className={`primary ${styles.ticketButton}`} disabled={customerContextBlocked}><span>Ouvrir un nouveau ticket</span><small>{newTicketTitle}</small></button></form>
                 <details><summary>Rattacher à un ticket existant</summary><form action={linkTicketAction}><input type="hidden" name="threadId" value={id}/><input type="hidden" name="reviewId" value={proposalReview.review.id}/><label>ID du ticket existant<input name="ticketId" required pattern="[0-9]+" defaultValue={!customerContextBlocked && routing?.kind === "matched" ? routing.ticketId : ""}/></label><button className="secondary" disabled={customerContextBlocked}>Confirmer le rattachement</button></form></details>
-              </> : <><button className="primary" disabled>Créer un ticket HubSpot</button><p>Validez d’abord la proposition courante ci-dessous.</p></>)}
+              </> : <><button className={`primary ${styles.ticketButton}`} disabled><span>Ouvrir un nouveau ticket</span><small>{newTicketTitle}</small></button><p>Validez d’abord le dossier / process pour choisir une action.</p></>)}
             </>}
             {!v0 && !detail.thread.hubspotTicketId && <form action={createTicketAction}><input type="hidden" name="threadId" value={id}/><button className="secondary">Créer le ticket HubSpot</button></form>}
             {!detail.thread.aiPaused && <form action={requestHumanAction}><input type="hidden" name="threadId" value={id}/><input type="hidden" name="reason" value="Reprise demandée depuis le registre SAV"/><button className="ghost-danger">Transférer à un humain</button></form>}

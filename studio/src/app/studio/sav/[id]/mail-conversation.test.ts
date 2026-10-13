@@ -17,19 +17,47 @@ const render = (messages: Message[]) => renderToStaticMarkup(createElement(MailC
 describe("Customer mail before SAV proposal", () => {
   it("shows a single inbound mail without a useless conversation toggle", () => {
     const html = render([message("one", "inbound", "Je cherche mes factures")]);
-    expect(html).toContain("Email du client");
+    expect(html).toContain("Dernier email reçu");
     expect(html).toContain("Je cherche mes factures");
-    expect(html).not.toContain("Voir la conversation entière");
+    expect(html).not.toContain("Afficher toute la conversation");
   });
 
-  it("shows the latest customer mail first and keeps the whole exchange behind native details", () => {
-    const html = render([message("one", "inbound", "PREMIER_MAIL"), message("two", "outbound", "REPONSE_SUPPORT"), message("three", "inbound", "DERNIER_MAIL")]);
-    const toggleAt = html.indexOf("Voir la conversation entière");
-    expect(html.indexOf("DERNIER_MAIL")).toBeLessThan(toggleAt);
-    expect(html.indexOf("PREMIER_MAIL")).toBeGreaterThan(toggleAt);
-    expect(html.indexOf("REPONSE_SUPPORT")).toBeGreaterThan(html.indexOf("PREMIER_MAIL"));
-    expect(html).toContain("(3 messages)");
-    expect(html).not.toContain("<details open");
+  it("shows only the latest inbound and hides older messages", () => {
+    const old = message("old", "inbound", "PREMIER_MAIL");
+    const latest = message("latest", "inbound", "DERNIER_MAIL");
+    latest.receivedAt = new Date("2026-10-03T12:00:00Z");
+    const outbound = message("support", "outbound", "REPONSE_SUPPORT");
+    outbound.receivedAt = new Date("2026-10-04T12:00:00Z");
+    const html = render([latest, outbound, old]);
+    expect(html).toContain("DERNIER_MAIL");
+    expect(html).not.toContain("PREMIER_MAIL");
+    expect(html).not.toContain("REPONSE_SUPPORT");
+    expect(html).toContain('aria-expanded="false"');
+    expect(html).toContain("Afficher toute la conversation");
+  });
+
+  it.each([
+    "Le 12 octobre, Support a écrit :\nANCIEN_MESSAGE",
+    "De : Support\nEnvoyé : 12 octobre\nÀ : Client\nObjet : Test\nANCIEN_MESSAGE",
+    "> ANCIEN_MESSAGE",
+  ])("collapses quoted history even with only one synchronized email", quote => {
+    const html = render([message("one", "inbound", `DEMANDE_ACTUELLE\n${quote}`)]);
+    expect(html).toContain("DEMANDE_ACTUELLE");
+    expect(html).not.toContain("ANCIEN_MESSAGE");
+    expect(html).toContain("Afficher toute la conversation");
+  });
+
+  it("does not mistake a quote-only email for a fresh request", () => {
+    const html = render([message("one", "inbound", "> ANCIEN_MESSAGE")]);
+    expect(html).toContain("uniquement un historique cité");
+    expect(html).not.toContain("ANCIEN_MESSAGE");
+    expect(html).toContain("Afficher toute la conversation");
+  });
+
+  it("offers the full source when its size exceeds the display parser limit", () => {
+    const html = render([message("one", "inbound", "x".repeat(100_001) + "FIN_INTEGRALE")]);
+    expect(html).toContain("Afficher toute la conversation");
+    expect(html).not.toContain("FIN_INTEGRALE");
   });
 
   it("escapes customer content and warns about unanalysed attachments", () => {
@@ -38,7 +66,7 @@ describe("Customer mail before SAV proposal", () => {
     const html = render([item]);
     expect(html).not.toContain("<script>");
     expect(html).toContain("&lt;script&gt;");
-    expect(html).toContain("Pièces jointes non analysées");
+    expect(html).toContain("non analysée(s)");
     expect(html).toContain("capture.png");
   });
 
@@ -46,5 +74,6 @@ describe("Customer mail before SAV proposal", () => {
     const html = render([message("one", "outbound", "REPONSE_SUPPORT")]);
     expect(html).toContain("Aucun email entrant");
     expect(html).not.toContain("REPONSE_SUPPORT");
+    expect(html).toContain("Afficher toute la conversation");
   });
 });

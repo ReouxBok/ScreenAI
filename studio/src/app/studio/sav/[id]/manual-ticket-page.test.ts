@@ -27,7 +27,7 @@ beforeEach(() => {
   dependencies.auth.mockResolvedValue({ email: "ugo@limova.ai" });
   dependencies.detail.mockResolvedValue({ thread: { id: threadId, subject: "Fixture", customerEmail: "fixture@example.invalid", status: "human_requested", aiPaused: true, hubspotTicketId: null },
     messages: [{ id: "fixture-message", direction: "inbound", body: {}, subject: "Fixture", fromEmail: "fixture@example.invalid" }], decisions: [], actions: [], agentRuns: [], pilotItem: null });
-  dependencies.review.mockResolvedValue({ review: { id: reviewId, status: "approved" }, proposal: { routing: { kind: "new", contactId: "21" }, decision: { kind: "ticket_pending", explanation: "Fixture", confidence: 800 } } });
+  dependencies.review.mockResolvedValue({ review: { id: reviewId, status: "approved" }, proposal: { ticket: { title: "Demande fictive" }, routing: { kind: "new", contactId: "21" }, decision: { kind: "ticket_pending", explanation: "Fixture", confidence: 800 } } });
 });
 afterEach(() => vi.unstubAllEnvs());
 async function render(overrides = {}, review = "") {
@@ -75,11 +75,11 @@ describe("manual ticket controls in the dossier", () => {
     expect(await render({}, "SAV_VALIDATED_CURRENT_PROPOSAL_REQUIRED")).toContain("Validez la proposition courante");
   });
   it("keeps a validated no-ticket dossier from enabling human creation", async () => {
-    dependencies.review.mockResolvedValue({ review: { id: reviewId, status: "approved" }, proposal: { routing: { kind: "new", contactId: "21" }, decision: { kind: "no_ticket_needed", explanation: "Fixture", confidence: 800 } } });
+    dependencies.review.mockResolvedValue({ review: { id: reviewId, status: "approved" }, proposal: { ticket: { title: "Demande fictive" }, routing: { kind: "new", contactId: "21" }, decision: { kind: "no_ticket_needed", explanation: "Fixture", confidence: 800 } } });
     const html = await render(); expect(html).not.toContain('name="reviewId"'); expect(html).not.toContain("Créer le ticket HubSpot");
   });
   it("requires a current approval before showing the creation form", async () => {
     dependencies.review.mockResolvedValue(null);
-    const html = await render(); expect(html).toContain("Validez d’abord la proposition courante"); expect(html).not.toContain('name="reviewId"');
+    const html = await render(); expect(html).toContain("Validez d’abord le dossier / process"); expect(html).not.toContain('name="reviewId"');
   });
 });

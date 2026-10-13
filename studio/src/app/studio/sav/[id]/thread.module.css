@@ -175,6 +175,34 @@
   margin-top: 18px;
 }
 
+.conversationToggle {
+  margin-top: 4px;
+}
+
+.conversationHint, .attachments {
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--muted);
+}
+
+.attachments summary {
+  cursor: pointer;
+}
+
+.ticketButton {
+  display: grid;
+  gap: 5px;
+  text-align: left;
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+
+.ticketButton small {
+  font-size: 12px;
+  font-weight: 400;
+  color: inherit;
+}
+
 .audit > section {
   padding: 16px 0 0;
   border: 0;

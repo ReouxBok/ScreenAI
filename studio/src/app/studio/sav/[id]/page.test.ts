@@ -107,7 +107,7 @@ function selectOptions(html: string, name: string) {
 }
 
 function buttonAttributes(html: string, label: string) {
-  return [...html.matchAll(/<button\b([^>]*)>([\s\S]*?)<\/button>/g)].filter((match) => match[2] === label).map((match) => match[1]);
+  return [...html.matchAll(/<button\b([^>]*)>([\s\S]*?)<\/button>/g)].filter((match) => match[2] === label || match[2].startsWith(`<span>${label}</span>`)).map((match) => match[1]);
 }
 
 beforeEach(() => {
@@ -170,9 +170,9 @@ describe("SAV dossier SSR and human-review guardrails", () => {
     dependencies.review.mockResolvedValue(reviewFixture(true));
     const html = await renderPage();
     expect(html.indexOf("EMAIL_CLIENT_TEST")).toBeLessThan(html.indexOf('id="proposal-review-title"'));
-    expect(html.indexOf("Email du client")).toBeLessThan(html.indexOf("Proposition de l’IA"));
-    expect(aside(html)).toContain("Créer un ticket HubSpot");
-    expect(html.slice(0, html.indexOf("<aside"))).not.toContain("Créer un ticket HubSpot");
+    expect(html.indexOf("Dernier email reçu")).toBeLessThan(html.indexOf("Proposition de l’IA"));
+    expect(aside(html)).toContain("Ouvrir un nouveau ticket");
+    expect(html.slice(0, html.indexOf("<aside"))).not.toContain("Ouvrir un nouveau ticket");
     expect(html).toContain('href="#sav-client-context"');
     expect(html).toContain('<aside id="sav-client-context" tabindex="-1"');
     expect(html).toContain("Aucun email envoyé, aucun ticket créé, aucune connaissance publiée par ce bouton.");
@@ -289,7 +289,7 @@ describe("SAV dossier SSR and human-review guardrails", () => {
     const ticketCard = sectionWithHeading(aside(html), "Ticket lié");
     expect(ticketCard).toContain("Ticket #987");
     expect(ticketCard).not.toContain("Correspondance proposée");
-    expect(buttonAttributes(html, "Créer un ticket HubSpot")).toEqual([]);
+    expect(buttonAttributes(html, "Ouvrir un nouveau ticket")).toEqual([]);
   });
 
   it("does not present unconfirmed name/phone candidates as a linked HubSpot contact", async () => {
@@ -316,7 +316,7 @@ describe("SAV dossier SSR and human-review guardrails", () => {
     dependencies.detail.mockResolvedValue(detail);
     dependencies.review.mockResolvedValue(reviewFixture(true));
     const html = await renderPage();
-    expect(buttonAttributes(aside(html), "Créer un ticket HubSpot")).toEqual([expect.stringContaining('disabled=""')]);
+    expect(buttonAttributes(aside(html), "Ouvrir un nouveau ticket")).toEqual([expect.stringContaining('disabled=""')]);
     expect(html).toContain("Création bloquée");
     expect(html).not.toContain("Confirmer le rattachement");
   });
@@ -328,7 +328,7 @@ describe("SAV dossier SSR and human-review guardrails", () => {
     dependencies.review.mockResolvedValue(reviewFixture(true));
     const html = await renderPage();
     expect(buttonAttributes(aside(html), "Demande HubSpot en attente")).toEqual([expect.stringContaining('disabled=""')]);
-    expect(buttonAttributes(html, "Créer un ticket HubSpot")).toEqual([]);
+    expect(buttonAttributes(html, "Ouvrir un nouveau ticket")).toEqual([]);
     expect(html).not.toContain("Confirmer le rattachement");
   });
   it.each(["create_ticket", "link_ticket"] as const)("does not mistake an AI %s suggestion for a pending human request in V0", async (kind) => {
@@ -338,11 +338,11 @@ describe("SAV dossier SSR and human-review guardrails", () => {
     dependencies.review.mockResolvedValue(reviewFixture(true));
     const html = await renderPage();
     expect(buttonAttributes(html, "Demande HubSpot en attente")).toHaveLength(0);
-    expect(buttonAttributes(html, "Créer un ticket HubSpot")[0]).not.toContain("disabled");
+    expect(buttonAttributes(html, "Ouvrir un nouveau ticket")[0]).not.toContain("disabled");
     dependencies.review.mockResolvedValue(reviewFixture(false));
     const unreviewed = await renderPage();
-    expect(buttonAttributes(unreviewed, "Créer un ticket HubSpot")[0]).toContain("disabled");
-    expect(unreviewed).toContain("Validez d’abord la proposition courante");
+    expect(buttonAttributes(unreviewed, "Ouvrir un nouveau ticket")[0]).toContain("disabled");
+    expect(unreviewed).toContain("Validez d’abord le dossier / process");
   });
 
   it("keeps historical mail readable without a new proposal-review or send CTA", async () => {
@@ -358,7 +358,7 @@ describe("SAV dossier SSR and human-review guardrails", () => {
     expect(html).not.toContain("Valider le dossier / process");
     expect(html).not.toContain("Refuser le process");
     expect(html).not.toContain("Approuver et mettre en file d’envoi");
-    expect(buttonAttributes(html, "Créer un ticket HubSpot")).toEqual([expect.stringContaining('disabled=""')]);
+    expect(buttonAttributes(html, "Ouvrir un nouveau ticket")).toEqual([expect.stringContaining('disabled=""')]);
   });
 });
 
@@ -429,6 +429,6 @@ it.each([false, true])("does not expose the colleague's old CRM/history for a fo
   expect(html).toContain("Actualiser le contexte client");
   expect(html).not.toContain("Ouvrir la fiche #999");
   expect(html).not.toContain("HISTORIQUE_COLLEGUE");
-  expect(buttonAttributes(html, "Créer un ticket HubSpot")).toEqual([expect.stringContaining('disabled=""')]);
+  expect(buttonAttributes(html, "Ouvrir un nouveau ticket")).toEqual([expect.stringContaining('disabled=""')]);
   expect(dependencies.related).not.toHaveBeenCalled();
 });
