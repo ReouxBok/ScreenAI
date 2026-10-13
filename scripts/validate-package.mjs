@@ -1,9 +1,22 @@
 import fs from 'node:fs';
 import path from 'node:path';
+import { extensionEnvironment, environmentModule, STAGING_EXTENSION_KEY } from './extension-environments.mjs';
 
 const target = path.resolve(process.argv[2] || process.cwd());
 const manifestPath = path.join(target, 'manifest.json');
 const failures = [];
+let environment = extensionEnvironment('production');
+try {
+  const metadata = JSON.parse(fs.readFileSync(path.join(target, 'extension-build.json'), 'utf8'));
+  environment = extensionEnvironment(metadata.name);
+  if (JSON.stringify(metadata) !== JSON.stringify(environment)) failures.push('build environment metadata does not match the allowed origins');
+  if (fs.readFileSync(path.join(target, 'src/limova/environment.js'), 'utf8') !== environmentModule(environment)) {
+    failures.push('runtime environment module does not match the package environment');
+  }
+  const bridge = fs.readFileSync(path.join(target, 'src/limova/app-session-bridge.js'), 'utf8');
+  if (!bridge.includes(environment.appOrigin) || !bridge.includes(environment.apiOrigin)) failures.push('app-session bridge environment mismatch');
+  if (environment.name === 'staging' && /https:\/\/(?:api\.)?new\.limova\.ai/.test(bridge)) failures.push('staging bridge contains a production endpoint');
+} catch (error) { failures.push(`invalid or missing build environment: ${error.message}`); }
 
 function requireFile(relativePath, source) {
   if (!relativePath || typeof relativePath !== 'string') return;
@@ -44,7 +57,7 @@ if (JSON.stringify(actualPermissions) !== JSON.stringify([...expectedPermissions
 if (JSON.stringify(manifest.optional_host_permissions) !== JSON.stringify(['https://*/*'])) {
   failures.push('optional_host_permissions must allow per-site HTTPS requests only');
 }
-const expectedHosts = [
+const expectedHosts = environment.name === 'staging' ? [`${environment.apiOrigin}/*`, `${environment.appOrigin}/*`] : [
   'https://api.new.limova.ai/*',
   'https://new.limova.ai/*',
   'https://studio.limova.ai/*',
@@ -58,10 +71,18 @@ if (JSON.stringify(actualHosts) !== JSON.stringify([...expectedHosts].sort())) {
 }
 const extensionCsp = manifest.content_security_policy?.extension_pages || '';
 if (!extensionCsp.includes("script-src 'self'")) failures.push("CSP must restrict scripts to 'self'");
-if (!extensionCsp.includes('connect-src') || !extensionCsp.includes('https://vercel.com')) {
+if (environment.name === 'production' && (!extensionCsp.includes('connect-src') || !extensionCsp.includes('https://vercel.com'))) {
   failures.push('CSP must allow the Vercel Blob client upload API');
 }
 if (/unsafe-(?:eval|inline)/.test(extensionCsp)) failures.push('CSP must not allow unsafe-eval or unsafe-inline');
+if (environment.name === 'staging') {
+  const connect = extensionCsp.match(/(?:^|;)\s*connect-src\s+([^;]*)/)?.[1].trim();
+  if (connect !== environment.apiOrigin) failures.push('staging CSP must connect only to the staging API');
+  if (manifest.key !== STAGING_EXTENSION_KEY || manifest.name !== 'Limova AI — Staging') failures.push('staging must use its separate extension identity');
+} else if (manifest.key === STAGING_EXTENSION_KEY) failures.push('production must not use the staging identity');
+for (const script of manifest.content_scripts ?? []) {
+  if (JSON.stringify(script.matches) !== JSON.stringify([`${environment.appOrigin}/*`])) failures.push('content script environment mismatch');
+}
 
 Object.values(manifest.icons || {}).forEach(file => requireFile(file, 'icons'));
 requireFile(manifest.action?.default_icon, 'action.default_icon');

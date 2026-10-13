@@ -4,9 +4,12 @@ import { execFileSync } from 'node:child_process';
 import { mkdtemp, readFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
+import { extensionEnvironment } from '../../scripts/extension-environments.mjs';
 
-const APP = 'https://new.limova.ai';
-const API = 'https://api.new.limova.ai';
+const environment = extensionEnvironment(process.env.LIMOVA_E2E_ENV ?? 'production');
+const APP = environment.appOrigin;
+const API = environment.apiOrigin;
+const COOKIE_PREFIX = environment.name === 'staging' ? 'limova_staging' : 'limova_prod';
 const USER = '11111111-1111-4111-8111-111111111111';
 const WORKSPACE = '22222222-2222-4222-8222-222222222222';
 const AGENT = '33333333-3333-4333-8333-333333333333';
@@ -27,15 +30,15 @@ const test = base.extend({
       `${name}=${value}; Path=${cookiePath}; HttpOnly; Secure; SameSite=None${state.partitioned ? '; Partitioned' : ''}${clear ? '; Max-Age=0' : ''}`;
     const server = createServer({ key: await readFile(key), cert: await readFile(cert) }, (request, response) => {
       const url = new URL(request.url, API);
-      if (request.headers.host === 'new.limova.ai') {
+      if (request.headers.host === new URL(APP).host) {
         response.writeHead(200, { 'content-type': 'text/html' });
         if (state.holdApp) { state.appLoading = true; response.write('<!doctype html>'); return; }
         return response.end('<!doctype html><title>Limova cookie fixture</title>');
       }
       const firstAccess = request.headers.cookie?.split(';').map(part => part.trim())
-        .find(part => part.startsWith('limova_prod_access_token='))?.split('=')[1];
+        .find(part => part.startsWith(`${COOKIE_PREFIX}_access_token=`))?.split('=')[1];
       const access = firstAccess === 'fixture-access' || state.userByToken && firstAccess === 'fixture-other';
-      const refresh = request.headers.cookie?.includes('limova_prod_refresh_token=fixture-refresh') ?? false;
+      const refresh = request.headers.cookie?.includes(`${COOKIE_PREFIX}_refresh_token=fixture-refresh`) ?? false;
       observations.push({ path: url.pathname, method: request.method, access, refresh });
       const headers = { 'access-control-allow-origin': APP, 'access-control-allow-credentials': 'true',
         'access-control-allow-methods': 'GET, POST, OPTIONS',
@@ -44,8 +47,8 @@ const test = base.extend({
       if (request.method === 'OPTIONS') { response.writeHead(204, headers); return response.end(); }
       if (url.pathname === '/fixture-login') {
         response.writeHead(200, { ...headers, 'set-cookie': [
-          cookie('limova_prod_access_token', state.expired ? 'fixture-expired' : 'fixture-access'),
-          cookie('limova_prod_refresh_token', 'fixture-refresh', '/auth'),
+          cookie(`${COOKIE_PREFIX}_access_token`, state.expired ? 'fixture-expired' : 'fixture-access'),
+          cookie(`${COOKIE_PREFIX}_refresh_token`, 'fixture-refresh', '/auth'),
         ] });
         return response.end('{}');
       }
@@ -53,15 +56,15 @@ const test = base.extend({
         state.refreshCount += 1;
         if (state.switchUserOnRefresh) state.user = AGENT;
         response.writeHead(refresh ? 200 : 401, { ...headers, ...(refresh ? { 'set-cookie': [
-          cookie('limova_prod_access_token', 'fixture-access'),
-          cookie('limova_prod_refresh_token', 'fixture-refresh', '/auth'),
+          cookie(`${COOKIE_PREFIX}_access_token`, 'fixture-access'),
+          cookie(`${COOKIE_PREFIX}_refresh_token`, 'fixture-refresh', '/auth'),
         ] } : {}) });
         return response.end(JSON.stringify({ accessToken: 'must-not-cross-bridge', refreshToken: 'must-not-cross-bridge' }));
       }
       if (url.pathname === '/auth/logout') {
         response.writeHead(200, { ...headers, 'set-cookie': [
-          cookie('limova_prod_access_token', '', '/', true),
-          cookie('limova_prod_refresh_token', '', '/auth', true),
+          cookie(`${COOKIE_PREFIX}_access_token`, '', '/', true),
+          cookie(`${COOKIE_PREFIX}_refresh_token`, '', '/auth', true),
         ] });
         return response.end('{}');
       }
@@ -95,13 +98,15 @@ const test = base.extend({
     });
     await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
     const port = server.address().port;
+    const productionMappings = environment.name === 'staging'
+      ? `, MAP api.new.limova.ai 127.0.0.1:${port}, MAP studio.limova.ai 127.0.0.1:${port}, MAP limova-proxy-479c7fb78ccf.herokuapp.com 127.0.0.1:${port}` : '';
     const extensionPath = path.resolve(process.env.EXTENSION_PATH ?? 'build');
     const context = await chromium.launchPersistentContext('', {
       channel: 'chromium', headless: true, ignoreHTTPSErrors: true,
       args: [
         `--disable-extensions-except=${extensionPath}`, `--load-extension=${extensionPath}`,
         '--no-proxy-server', '--ignore-certificate-errors',
-        `--host-resolver-rules=MAP api.new.limova.ai 127.0.0.1:${port}, MAP new.limova.ai 127.0.0.1:${port}, MAP * ~NOTFOUND`,
+        `--host-resolver-rules=MAP ${new URL(API).hostname} 127.0.0.1:${port}, MAP ${new URL(APP).hostname} 127.0.0.1:${port}${productionMappings}, MAP * ~NOTFOUND`,
       ],
     });
     try {
@@ -124,7 +129,7 @@ test('measures whether the extension shares the app partitioned authentication c
   await app.goto(APP);
   expect(await app.evaluate(async api => (await fetch(`${api}/fixture-login`, { credentials: 'include' })).status, API)).toBe(200);
   expect((await context.cookies(API)).filter(cookie => cookie.name.endsWith('access_token')).map(({ name, partitionKey }) => ({ name, partitionKey })))
-    .toEqual([{ name: 'limova_prod_access_token', partitionKey: 'https://limova.ai' }]);
+    .toEqual([{ name: `${COOKIE_PREFIX}_access_token`, partitionKey: 'https://limova.ai' }]);
   expect(await app.evaluate(async api => (await fetch(`${api}/users/me`, { credentials: 'include' })).status, API)).toBe(200);
   const direct = await worker.evaluate(async api => (await fetch(`${api}/users/me`, { credentials: 'include' })).status, API);
   expect(direct).toBe(401);
@@ -142,7 +147,7 @@ test('the client authenticates through the app partition without copying cookies
   expect(result.workspaces).toEqual([{ id: WORKSPACE, name: '', enabled: true }]);
   expect(observations.filter(item => item.path === '/users/me').map(item => item.access)).toEqual([true]);
   expect((await context.cookies(API)).filter(cookie => cookie.name.endsWith('access_token')).map(({ name, partitionKey }) => ({ name, partitionKey })))
-    .toEqual([{ name: 'limova_prod_access_token', partitionKey: 'https://limova.ai' }]);
+    .toEqual([{ name: `${COOKIE_PREFIX}_access_token`, partitionKey: 'https://limova.ai' }]);
   expect(await worker.evaluate(() => chrome.permissions.contains({ permissions: ['cookies'] }))).toBe(false);
 });
 
@@ -174,8 +179,8 @@ test('renews the app refresh cookie once for concurrent expired requests', async
   expect(sessionFixture.state.refreshCount).toBe(1);
   const refreshes = sessionFixture.observations.filter(item => item.path === '/auth/refresh-token');
   expect(refreshes).toEqual([{ path: '/auth/refresh-token', method: 'POST', access: false, refresh: true }]);
-  expect(await sessionFixture.page.evaluate(async () => (await sessionFetch('https://api.new.limova.ai/auth/refresh-token',
-    { method: 'POST', credentials: 'include' })).text())).toBe('');
+  expect(await sessionFixture.page.evaluate(async api => (await sessionFetch(`${api}/auth/refresh-token`,
+    { method: 'POST', credentials: 'include' })).text(), API)).toBe('');
 });
 
 test('reuses an ordinary cookie in the same first-party transport without another login', async ({ sessionFixture }) => {
@@ -195,7 +200,7 @@ test('reopens an app tab in the background when the partitioned session tab was 
   await app.close();
   await prepareClient(sessionFixture);
   expect((await sessionFixture.page.evaluate(() => sessionClient.bootstrap())).user.id).toBe(USER);
-  const tabs = await sessionFixture.worker.evaluate(() => chrome.tabs.query({ url: 'https://new.limova.ai/*' }));
+  const tabs = await sessionFixture.worker.evaluate(app => chrome.tabs.query({ url: `${app}/*` }), APP);
   expect(tabs).toHaveLength(1);
   expect(tabs[0].active).toBe(false);
 });
@@ -304,15 +309,15 @@ test('the app bridge rejects arbitrary destinations, cookie headers and non-allo
     { url: `${API}/users/me`, method: 'GET', headers: { Cookie: 'injected' } },
     { url: `${API}/users/me`, method: 'DELETE' },
   ]) {
-    const result = await sessionFixture.page.evaluate(async request => {
-      const [tab] = await chrome.tabs.query({ url: 'https://new.limova.ai/*' });
+    const result = await sessionFixture.page.evaluate(async ({ request, app }) => {
+      const [tab] = await chrome.tabs.query({ url: `${app}/*` });
       const frame = await chrome.webNavigation.getFrame({ tabId: tab.id, frameId: 0 });
       const port = chrome.tabs.connect(tab.id, { documentId: frame.documentId, name: 'limova-app-session-v1' });
       return new Promise(resolve => {
         port.onMessage.addListener(message => { port.disconnect(); resolve(message.kind); });
         port.postMessage({ kind: 'request', request });
       });
-    }, request);
+    }, { request, app: APP });
     expect(result).toBe('error');
   }
   expect(sessionFixture.observations).toHaveLength(count);
@@ -321,8 +326,8 @@ test('the app bridge rejects arbitrary destinations, cookie headers and non-allo
 test('uses the open app identity when an ordinary cookie belongs to another account', async ({ sessionFixture }) => {
   const app = await login(sessionFixture);
   sessionFixture.state.userByToken = true;
-  await sessionFixture.context.addCookies([{ name: 'limova_prod_access_token', value: 'fixture-other',
-    domain: 'api.new.limova.ai', path: '/', httpOnly: true, secure: true, sameSite: 'None' }]);
+  await sessionFixture.context.addCookies([{ name: `${COOKIE_PREFIX}_access_token`, value: 'fixture-other',
+    domain: new URL(API).hostname, path: '/', httpOnly: true, secure: true, sameSite: 'None' }]);
   const appUser = await app.evaluate(async api => (await fetch(`${api}/users/me`, { credentials: 'include' })).json(), API);
   const directUser = await sessionFixture.worker.evaluate(async api => (await fetch(`${api}/users/me`, { credentials: 'include' })).json(), API);
   expect(appUser.id).toBe(USER);
@@ -350,8 +355,8 @@ test('cancels while the app is loading before sending an authenticated request',
 test('keeps the first-party identity after its tab closes even when another ordinary session is valid', async ({ sessionFixture }) => {
   const app = await login(sessionFixture);
   sessionFixture.state.userByToken = true;
-  await sessionFixture.context.addCookies([{ name: 'limova_prod_access_token', value: 'fixture-other',
-    domain: 'api.new.limova.ai', path: '/', httpOnly: true, secure: true, sameSite: 'None' }]);
+  await sessionFixture.context.addCookies([{ name: `${COOKIE_PREFIX}_access_token`, value: 'fixture-other',
+    domain: new URL(API).hostname, path: '/', httpOnly: true, secure: true, sameSite: 'None' }]);
   expect((await app.evaluate(async api => (await fetch(`${api}/users/me`, { credentials: 'include' })).json(), API)).id).toBe(USER);
   await app.close();
   await prepareClient(sessionFixture);
@@ -361,12 +366,24 @@ test('keeps the first-party identity after its tab closes even when another ordi
 test('offers the existing app tab for login without creating a duplicate', async ({ sessionFixture }) => {
   const { page, worker } = sessionFixture;
   expect((await page.evaluate(() => chrome.runtime.sendMessage({ type: 'LIMOVA_GET_STATE' }))).authenticated).toBe(false);
-  const before = await worker.evaluate(() => chrome.tabs.query({ url: 'https://new.limova.ai/*' }));
+  const before = await worker.evaluate(app => chrome.tabs.query({ url: `${app}/*` }), APP);
   expect(before).toHaveLength(1);
   expect(before[0].active).toBe(false);
   await page.evaluate(() => chrome.runtime.sendMessage({ type: 'LIMOVA_OPEN_APP' }));
-  const after = await worker.evaluate(() => chrome.tabs.query({ url: 'https://new.limova.ai/*' }));
+  const after = await worker.evaluate(app => chrome.tabs.query({ url: `${app}/*` }), APP);
   expect(after).toHaveLength(1);
   expect(after[0].id).toBe(before[0].id);
   expect(after[0].active).toBe(true);
+});
+
+test('the staging worker cannot send requests to production API, Studio or proxy', async ({ sessionFixture }) => {
+  test.skip(environment.name !== 'staging', 'Only the staging package excludes production services');
+  const count = sessionFixture.observations.length;
+  for (const url of ['https://api.new.limova.ai/users/me', 'https://studio.limova.ai/api/training/sessions',
+    'https://limova-proxy-479c7fb78ccf.herokuapp.com/healthz']) {
+    expect(await sessionFixture.worker.evaluate(async url => {
+      try { await fetch(url, { credentials: 'include' }); return true; } catch { return false; }
+    }, url)).toBe(false);
+  }
+  expect(sessionFixture.observations).toHaveLength(count);
 });

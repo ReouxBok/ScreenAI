@@ -1,6 +1,8 @@
+import { LIMOVA_APP_URL, LIMOVA_API_URL } from './environment.js';
+
 (() => {
-  const APP = 'https://new.limova.ai';
-  const API = 'https://api.new.limova.ai';
+  const APP = LIMOVA_APP_URL;
+  const API = LIMOVA_API_URL;
   const PORT = 'limova-app-session-v1';
   if (location.origin !== APP || globalThis.__limovaAppSessionBridgeV1) return;
   globalThis.__limovaAppSessionBridgeV1 = true;

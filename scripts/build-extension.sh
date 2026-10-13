@@ -9,10 +9,15 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 ROOT_DIR="$(dirname "$SCRIPT_DIR")"
-BUILD_DIR="$ROOT_DIR/build"
+BUILD_ENV="${LIMOVA_BUILD_ENV:-production}"
+case "$BUILD_ENV" in
+  production) BUILD_DIR="$ROOT_DIR/build"; ZIP_SUFFIX="" ;;
+  staging) BUILD_DIR="$ROOT_DIR/build-staging"; ZIP_SUFFIX="-staging" ;;
+  *) echo "ERROR: LIMOVA_BUILD_ENV must be production or staging" >&2; exit 1 ;;
+esac
 DIST_DIR="$ROOT_DIR/dist"
 VERSION="$(node -p "JSON.parse(require('fs').readFileSync('$ROOT_DIR/manifest.json','utf8')).version")"
-ZIP_NAME="limova-ai-extension-${VERSION}.zip"
+ZIP_NAME="limova-ai-extension-${VERSION}${ZIP_SUFFIX}.zip"
 ZIP_PATH="$DIST_DIR/$ZIP_NAME"
 
 echo "==> Cleaning previous build..."
@@ -54,6 +59,15 @@ for d in "${DIRS[@]}"; do
     echo "  WARNING: $d/ not found, skipping"
   fi
 done
+
+echo "==> Configuring $BUILD_ENV and bundling the app-session bridge..."
+node "$ROOT_DIR/scripts/configure-extension.mjs" "$BUILD_DIR" "$BUILD_ENV"
+cp "$ROOT_DIR/src/limova/app-session-bridge.entry.js" "$BUILD_DIR/src/limova/app-session-bridge.entry.js"
+"$ROOT_DIR/node_modules/.bin/esbuild" \
+  "$BUILD_DIR/src/limova/app-session-bridge.entry.js" \
+  --bundle --format=iife --platform=browser --target=chrome114 \
+  --outfile="$BUILD_DIR/src/limova/app-session-bridge.js" --log-level=warning
+rm "$BUILD_DIR/src/limova/app-session-bridge.entry.js"
 
 echo "==> Bundling the private training-video uploader..."
 "$ROOT_DIR/node_modules/.bin/esbuild" \
