@@ -4,6 +4,7 @@
 // SECURITY: API keys are stored on the proxy server, never in the extension.
 
 import Logger from './utils/logger.js';
+import { createLimovaBackground, LIMOVA_MESSAGE_TYPES } from './limova/background.js';
 import { buildSystemPrompt } from './prompts/system-prompt.js';
 import { searchKB } from './knowledge-base/kb-search.js';
 import { createOnboardingPlan, advanceStep } from './prompts/onboarding-plan.js';
@@ -33,6 +34,11 @@ const VISUAL_CAPTURE_MAX_BASE64_CHARACTERS = 1_500_000;
 const VISUAL_CAPTURE_JPEG_QUALITY = 55;
 const DEFAULT_LANG = (chrome.i18n.getUILanguage() || 'en').split('-')[0].toLowerCase();
 let currentLang = DEFAULT_LANG;
+const limovaBackground = createLimovaBackground({
+  storage: chrome.storage.local,
+  openTab: options => chrome.tabs.create(options),
+  notify: message => broadcastToSidebar(message),
+});
 
 function codedError(code, message, cause = null) {
   const error = new Error(message);
@@ -484,6 +490,12 @@ function isTrustedMessageSource(request, sender) {
 
 async function handleMessage(request, sender) {
   await initializationPromise;
+  if (LIMOVA_MESSAGE_TYPES.has(request.type)) {
+    if ((trainingState.active || evaluationState.active) && request.type === 'LIMOVA_SEND_MESSAGE') {
+      return { ok: false, error: 'Termine le mode formateur ou évaluation avant de reprendre une conversation personnelle.' };
+    }
+    return limovaBackground.handle(request);
+  }
   if (trainingState.active && [
     'USER_MESSAGE', 'ANALYZE_PAGE', 'TAKE_SCREENSHOT', 'NEXT_STEP',
     'VOICE_ACTION_REQUEST', 'VOICE_TEXT_INPUT_REQUEST', 'VOICE_SCROLL_REQUEST', 'VOICE_KB_SEARCH',

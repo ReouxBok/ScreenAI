@@ -42,6 +42,7 @@ if (JSON.stringify(actualPermissions) !== JSON.stringify([...expectedPermissions
   failures.push(`permissions must stay least-privilege: ${expectedPermissions.join(', ')}`);
 }
 const expectedHosts = [
+  'https://api.new.limova.ai/*',
   'https://new.limova.ai/*',
   'https://studio.limova.ai/*',
   'https://vercel.com/*',

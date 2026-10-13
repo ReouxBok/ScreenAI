@@ -126,6 +126,15 @@ describe('background.js — onMessage router', () => {
     expect(typeof result.training).toBe('boolean');
   });
 
+  it('does not allow a Limova content script to access the privileged account client', async () => {
+    const result = await dispatch({ type: 'LIMOVA_GET_STATE' }, {
+      id: chromeMock.runtime.id,
+      url: 'https://new.limova.ai/',
+      tab: { id: 1, url: 'https://new.limova.ai/' },
+    });
+    expect(result).toEqual({ error: 'Unauthorized message source' });
+  });
+
   it('GET_STATE advertises training and popup support', async () => {
     const result = await dispatch({ type: 'GET_STATE' });
     expect(result.extensionVersion).toBeTruthy();
