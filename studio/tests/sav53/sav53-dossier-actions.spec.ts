@@ -1,8 +1,15 @@
-import { expect, test } from "@playwright/test";
+import { expect, test, type Page } from "@playwright/test";
 import { SAV53_BODY, SAV53_CURRENT, SAV53_PARTNERSHIP, SAV53_QUOTED, SAV53_THREADS, SAV53_TICKET_TITLE } from "../../test/sav53-e2e-fixture";
 
+const duplicateKeyWarnings = new WeakMap<Page, string[]>();
 test.beforeEach(async ({ page, baseURL }) => {
+  const warnings: string[] = [];
+  duplicateKeyWarnings.set(page, warnings);
+  page.on("console", message => { if (/same key|unique.*key.*prop/i.test(message.text())) warnings.push(message.text()); });
   await page.route("**/*", route => new URL(route.request().url()).origin === baseURL ? route.continue() : route.abort());
+});
+test.afterEach(async ({ page }) => {
+  expect(duplicateKeyWarnings.get(page)).toEqual([]);
 });
 
 test("le dernier email reçu est seul visible puis la conversation entière remplace le résumé sans doublon", async ({ page }, testInfo) => {
@@ -57,6 +64,8 @@ for (const scenario of [
     await expect(rail).toContainText(scenario.explanation);
     await expect(rail.getByRole("button", { name: new RegExp(`^${scenario.label}`) })).toHaveCount(0);
     await page.getByRole("region", { name: "Proposition de l’IA", exact: true }).getByRole("button", { name: "Valider le dossier / process", exact: true }).click();
+    // The server action redirects only once the local review has committed.
+    await page.waitForURL(/\?review=saved$/, { timeout: 30_000 });
     await expect(page.getByRole("region", { name: "Proposition de l’IA", exact: true })).toContainText("Process validé par ugo@limova.ai");
     const button = rail.getByRole("button", { name: `${scenario.label} ${SAV53_TICKET_TITLE}`, exact: true });
     await expect(button).toBeVisible();
@@ -91,7 +100,12 @@ test("le transfert partenariat exige un aperçu, un destinataire fixe et une con
   const transfer = page.getByRole("region", { name: "Transfert partenariat", exact: true });
   await expect(transfer).toBeVisible();
   await expect(transfer.getByRole("button", { name: "Confirmer l’envoi à Nathan", exact: true })).toHaveCount(0);
-  await transfer.getByRole("button", { name: "Préparer le transfert à Nathan", exact: true }).click();
+  const [prepared] = await Promise.all([
+    page.waitForResponse(response => response.request().method() === "POST" && new URL(response.url()).pathname === `/studio/sav/${SAV53_THREADS.partnership}`),
+    transfer.getByRole("button", { name: "Préparer le transfert à Nathan", exact: true }).click(),
+  ]);
+  await prepared.finished();
+  expect(prepared.status()).toBe(200);
   await expect(transfer.getByRole("heading", { name: "Aperçu de l’email à envoyer", exact: true })).toBeVisible();
   await expect(transfer).toContainText("nathan@limova.ai");
   await expect(transfer).toContainText(SAV53_PARTNERSHIP);
