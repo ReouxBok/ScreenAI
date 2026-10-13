@@ -25,6 +25,86 @@ function harness({ enabled = true, userId = USER } = {}) {
 }
 
 describe('Limova Deep Agent client', () => {
+  it('uploads a temporary screenshot through the existing workspace file route', async () => {
+    const { client, fetch } = harness();
+    const original = fetch.getMockImplementation();
+    fetch.mockImplementation((url, options) => url.includes('/files?')
+      ? json({ id: AGENT, storageUrl: 'https://private.example/image' }) : original(url, options));
+    const image = new Blob(['image fixture'], { type: 'image/png' });
+    expect(await client.uploadBrowserScreenshot(CONTEXT, CONVERSATION, image)).toEqual({ fileId: AGENT });
+    const [url, options] = fetch.mock.calls.at(-1);
+    expect(url).toBe(`${LIMOVA_API_URL}/files?isTemporary=true&useAsDefaultContext=false`);
+    expect(options).toMatchObject({ method: 'POST', credentials: 'include', headers: { 'x-workspace-id': WORKSPACE } });
+    expect(options.headers['Content-Type']).toBeUndefined();
+    expect(options.headers['x-extension-session']).toBeUndefined();
+    expect(options.body).toBeInstanceOf(FormData);
+    expect([...options.body.keys()]).toEqual(['file']);
+    expect(options.body.get('file').name).toBe('browser-screenshot.png');
+    expect(options.body.get('file').type).toBe('image/png');
+    expect(options.body.get('file').size).toBe(image.size);
+  });
+
+  it('validates screenshot size and format before any request', async () => {
+    const { client, fetch } = harness();
+    for (const image of [null, new Blob([], { type: 'image/png' }),
+      new Blob(['svg'], { type: 'image/svg+xml' }),
+      new Blob([new Uint8Array(5 * 1024 * 1024 + 1)], { type: 'image/jpeg' })]) {
+      await expect(client.uploadBrowserScreenshot(CONTEXT, CONVERSATION, image)).rejects.toMatchObject({ code: 'INVALID_SCREENSHOT' });
+    }
+    expect(fetch).not.toHaveBeenCalled();
+  });
+
+  it('does not upload screenshots after account change or flag disablement', async () => {
+    for (const settings of [{ userId: AGENT }, { enabled: false }]) {
+      const { client, fetch } = harness(settings);
+      await expect(client.uploadBrowserScreenshot(CONTEXT, CONVERSATION,
+        new Blob(['fixture'], { type: 'image/png' }))).rejects.toBeInstanceOf(Error);
+      expect(fetch.mock.calls.some(([, options]) => options.method === 'POST')).toBe(false);
+    }
+  });
+
+  it('refreshes an unauthorized upload once with the same multipart body', async () => {
+    const { client, fetch } = harness();
+    const original = fetch.getMockImplementation();
+    let uploads = 0;
+    fetch.mockImplementation(async (url, options) => {
+      if (url.endsWith('/auth/refresh-token')) return new Response(null, { status: 200 });
+      if (url.includes('/files?')) return ++uploads === 1
+        ? new Response(null, { status: 401 }) : json({ id: AGENT });
+      return original(url, options);
+    });
+    await client.uploadBrowserScreenshot(CONTEXT, CONVERSATION, new Blob(['fixture'], { type: 'image/jpeg' }));
+    const requests = fetch.mock.calls.filter(([url]) => url.includes('/files?'));
+    expect(requests).toHaveLength(2);
+    expect(requests[0][1].body).toBe(requests[1][1].body);
+    expect(requests[1][1].body.get('file').name).toBe('browser-screenshot.jpg');
+  });
+
+  it('does not resend an upload if cookie refresh switched the account', async () => {
+    const { client, fetch } = harness();
+    const original = fetch.getMockImplementation();
+    let switched = false;
+    fetch.mockImplementation(async (url, options) => {
+      if (url.endsWith('/auth/refresh-token')) { switched = true; return new Response(null, { status: 200 }); }
+      if (switched && url.endsWith('/users/me')) return json({ id: AGENT });
+      if (url.includes('/files?')) return new Response(null, { status: 401 });
+      return original(url, options);
+    });
+    await expect(client.uploadBrowserScreenshot(CONTEXT, CONVERSATION,
+      new Blob(['fixture'], { type: 'image/png' }))).rejects.toMatchObject({ code: 'LIMOVA_ACCOUNT_CHANGED' });
+    expect(fetch.mock.calls.filter(([url]) => url.includes('/files?'))).toHaveLength(1);
+  });
+
+  it('does not replay an upload after an ambiguous network failure', async () => {
+    const { client, fetch } = harness();
+    const original = fetch.getMockImplementation();
+    fetch.mockImplementation((url, options) => url.includes('/files?')
+      ? Promise.reject(new Error('network failure')) : original(url, options));
+    await expect(client.uploadBrowserScreenshot(CONTEXT, CONVERSATION,
+      new Blob(['fixture'], { type: 'image/png' }))).rejects.toThrow('network failure');
+    expect(fetch.mock.calls.filter(([url]) => url.includes('/files?'))).toHaveLength(1);
+  });
+
   it('uses the existing before query for an older history page', async () => {
     const { client, fetch } = harness();
     const original = fetch.getMockImplementation();
@@ -109,6 +189,25 @@ async function consume(events) {
 }
 
 describe('Limova browser turn transport', () => {
+  it('transmits only the screenshot file identity on the existing result route', async () => {
+    const { client, fetch } = harness();
+    await consume(client.sendBrowserResult(CONTEXT, CONVERSATION, BROWSER,
+      { ...RESULT, imageFileId: AGENT, imageUrl: 'https://untrusted.example/image' }));
+    const body = JSON.parse(fetch.mock.calls.at(-1)[1].body);
+    expect(body.browserResult.imageFileId).toBe(AGENT);
+    expect(body.browserResult).not.toHaveProperty('imageUrl');
+    expect(body).not.toHaveProperty('fileIds');
+  });
+
+  it('rejects malformed image IDs and images on failed results before networking', async () => {
+    const { client, fetch } = harness();
+    for (const result of [{ ...RESULT, imageFileId: 'https://untrusted.example' },
+      { ...RESULT, status: 'failed', imageFileId: AGENT }]) {
+      await expect(consume(client.sendBrowserResult(CONTEXT, CONVERSATION, BROWSER, result))).rejects.toBeInstanceOf(Error);
+    }
+    expect(fetch).not.toHaveBeenCalled();
+  });
+
   it('binds the initial message through a header and validated page context', async () => {
     const { client, fetch } = harness();
     await consume(client.sendMessage(CONTEXT, CONVERSATION, 'Observe', undefined, BROWSER));

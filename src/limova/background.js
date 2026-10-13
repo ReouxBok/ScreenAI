@@ -125,7 +125,8 @@ export function createLimovaBackground({ storage, openTab, notify, client = new 
           if (request.browser === true) {
             if (!createDriver) throw new Error('Le pilote navigateur est indisponible.');
             const sessionId = await journal.getSession(turn.context);
-            const driver = createDriver({ scope: { ...turn.context, sessionId }, journal, signal: turn.controller.signal });
+            const driver = createDriver({ scope: { ...turn.context, sessionId }, journal, signal: turn.controller.signal,
+              uploadScreenshot: (image, signal) => client.uploadBrowserScreenshot(turn.context, turn.conversationId, image, signal) });
             const runner = createBrowserTurnRunner({ client, journal, readPage: driver.readPage,
               execute: driver.execute, authorize: driver.authorize, notify: emit });
             const outcome = request.type === 'LIMOVA_RESUME_BROWSER'

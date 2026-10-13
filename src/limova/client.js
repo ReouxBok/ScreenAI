@@ -35,6 +35,10 @@ function browserContext(browser) {
 
 function browserResult(result) {
   id(result?.turnId);
+  if (result.imageFileId !== undefined) {
+    id(result.imageFileId);
+    if (result.status !== 'completed') throw new LimovaClientError('INVALID_BROWSER_RESULT', 'Résultat navigateur invalide.');
+  }
   if (typeof result.actionId !== 'string' || !result.actionId || result.actionId.length > 256
     || typeof result.toolCallId !== 'string' || !result.toolCallId || result.toolCallId.length > 128
     || !Number.isSafeInteger(result.contextVersion) || result.contextVersion < 0
@@ -43,7 +47,8 @@ function browserResult(result) {
     throw new LimovaClientError('INVALID_BROWSER_RESULT', 'Résultat navigateur invalide.');
   }
   return { turnId: result.turnId, actionId: result.actionId, toolCallId: result.toolCallId,
-    contextVersion: result.contextVersion, status: result.status, observation: result.observation };
+    contextVersion: result.contextVersion, status: result.status, observation: result.observation,
+    ...(result.imageFileId !== undefined ? { imageFileId: result.imageFileId } : {}) };
 }
 
 function unwrap(payload) {
@@ -74,19 +79,21 @@ export class LimovaDeepAgentClient {
     return this.#refreshPromise;
   }
 
-  async #request(path, { method = 'GET', body, workspaceId, signal, stream = false, browserSession } = {}) {
+  async #request(path, { method = 'GET', body, workspaceId, signal, stream = false, browserSession, expectedContext } = {}) {
     if (!signal && !stream) signal = AbortSignal.timeout(30_000);
     const generation = this.#refreshGeneration;
     const headers = { Accept: stream ? 'text/event-stream' : 'application/json' };
-    if (body !== undefined) headers['Content-Type'] = 'application/json';
+    const multipart = body instanceof FormData;
+    if (body !== undefined && !multipart) headers['Content-Type'] = 'application/json';
     if (workspaceId) headers['x-workspace-id'] = id(workspaceId);
     if (browserSession !== undefined) headers['x-extension-session'] = id(browserSession);
     const options = { method, headers, credentials: 'include', cache: 'no-store', signal,
-      ...(body !== undefined ? { body: JSON.stringify(body) } : {}) };
+      ...(body !== undefined ? { body: multipart ? body : JSON.stringify(body) } : {}) };
     let response = await this.#fetch(`${LIMOVA_API_URL}${path}`, options);
     if (response.status === 401) {
       if (generation === this.#refreshGeneration) await this.#refresh();
       signal?.throwIfAborted();
+      if (expectedContext) await this.#assertContext(expectedContext, signal);
       response = await this.#fetch(`${LIMOVA_API_URL}${path}`, options);
     }
     if (!response.ok) {
@@ -153,6 +160,20 @@ export class LimovaDeepAgentClient {
     await this.getConversation(context, conversationId, signal);
     const query = cursor ? `?before=${encodeURIComponent(id(cursor))}` : '';
     return this.#request(`/conversation/${id(conversationId)}/messages${query}`, { workspaceId: context.workspaceId, signal });
+  }
+
+  async uploadBrowserScreenshot(context, conversationId, image, signal) {
+    if (!(image instanceof Blob) || !['image/png', 'image/jpeg'].includes(image.type)
+      || image.size === 0 || image.size > 5 * 1024 * 1024) {
+      throw new LimovaClientError('INVALID_SCREENSHOT', 'Capture invalide ou trop volumineuse.');
+    }
+    await this.getConversation(context, conversationId, signal);
+    const body = new FormData();
+    body.append('file', image, image.type === 'image/png' ? 'browser-screenshot.png' : 'browser-screenshot.jpg');
+    const file = await this.#request('/files?isTemporary=true&useAsDefaultContext=false', {
+      method: 'POST', body, workspaceId: context.workspaceId, signal, expectedContext: { ...context },
+    });
+    return { fileId: id(file?.id) };
   }
 
   async *sendMessage(context, conversationId, content, signal, browser) {

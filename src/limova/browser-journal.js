@@ -164,8 +164,14 @@ export function createBrowserJournal() {
         || typeof observation.observation !== 'string' || observation.observation.length > 32000) {
         throw new Error('Invalid browser observation; execution must be inspected');
       }
+      const expectsImage = action.input.operation === 'screenshot' && observation.status === 'completed';
+      if (expectsImage !== (observation.imageFileId !== undefined)
+        || (expectsImage && !identifier(observation.imageFileId))) {
+        throw new Error('Invalid screenshot receipt; execution must be inspected');
+      }
       const result = { turnId: action.turnId, actionId: action.actionId, toolCallId: action.toolCallId,
-        contextVersion: action.target.contextVersion, status: observation.status, observation: observation.observation };
+        contextVersion: action.target.contextVersion, status: observation.status, observation: observation.observation,
+        ...(expectsImage ? { imageFileId: observation.imageFileId } : {}) };
       return change(db, key, current => {
         if (current?.owner !== owner || current.digest !== digest || current.state !== 'started') throw new Error('Browser receipt was invalidated');
         return { record: { ...current, state: 'completed', result }, answer: { state: 'completed', result } };

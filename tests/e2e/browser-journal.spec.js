@@ -276,3 +276,50 @@ test('revoked sessions cannot allocate context versions or resurrect their count
   });
   expect(result).toEqual({ error: 'Browser session revoked', next: 1, rotated: true });
 });
+
+
+test('a screenshot receipt preserves its file identity across reopen without uploading twice', async ({ context, extensionId }) => {
+  const page = await journalPage(context, extensionId);
+  const result = await page.evaluate(async () => {
+    action.input = { operation: 'screenshot' };
+    const imageFileId = crypto.randomUUID();
+    let uploads = 0;
+    const first = createJournal();
+    const receipt = await first.run(scope, action, async () => {
+      uploads++;
+      return { status: 'completed', observation: 'Masked screenshot', imageFileId };
+    });
+    await first.close();
+    const second = createJournal();
+    const recovered = await second.run(scope, action, async () => { uploads++; throw new Error('Must not upload again'); });
+    await second.close();
+    return { receipt, recovered, uploads, imageFileId };
+  });
+  expect(result.uploads).toBe(1);
+  expect(result.recovered).toEqual(result.receipt);
+  expect(result.receipt.result.imageFileId).toBe(result.imageFileId);
+});
+
+test('an invalid screenshot receipt remains uncertain and is never re-executed', async ({ context, extensionId }) => {
+  const page = await journalPage(context, extensionId);
+  const result = await page.evaluate(async () => {
+    const journal = createJournal();
+    const attempts = [
+      { operation: 'screenshot', status: 'completed' },
+      { operation: 'screenshot', status: 'completed', imageFileId: 'invalid' },
+      { operation: 'screenshot', status: 'failed', imageFileId: crypto.randomUUID() },
+      { operation: 'read_page', status: 'completed', imageFileId: crypto.randomUUID() },
+    ];
+    const outcomes = [];
+    for (const [index, candidate] of attempts.entries()) {
+      const command = { ...action, actionId: `invalid-${index}`, input: { operation: candidate.operation } };
+      try {
+        await journal.run(scope, command, async () => ({ ...candidate, observation: 'Invalid result' }));
+      } catch (error) { outcomes.push(error.message); }
+      outcomes.push((await journal.run(scope, command, async () => { throw new Error('No replay'); })).state);
+    }
+    await journal.close();
+    return outcomes;
+  });
+  expect(result).toEqual(Array.from({ length: 4 }, () => ['Invalid screenshot receipt; execution must be inspected', 'uncertain']).flat());
+});

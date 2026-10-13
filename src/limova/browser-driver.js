@@ -1,10 +1,11 @@
+import { captureBrowserScreenshot } from './browser-screenshot.js';
 import { waitForBrowserReady } from './browser-ready.js';
 import { createBrowserAuthority } from './browser-authority.js';
 import { createBrowserBinding } from './browser-binding.js';
 
 const DOCUMENT_OPERATIONS = new Set(['read_page', 'click', 'type_text', 'scroll', 'highlight', 'navigate']);
 
-export function createBrowserDriver({ chrome, journal, scope, hasConsent }) {
+export function createBrowserDriver({ chrome, journal, scope, hasConsent, uploadScreenshot }) {
   scope = Object.freeze({ ...scope });
   let tabId;
   const hasSiteAccess = origin => chrome.permissions.contains({ origins: [`${origin}/*`] });
@@ -42,6 +43,10 @@ export function createBrowserDriver({ chrome, journal, scope, hasConsent }) {
     },
     async execute(action, signal) {
       if (action.target?.tabId !== tabId) throw new Error('Browser target changed');
+      if (action.input.operation === 'screenshot') {
+        return captureBrowserScreenshot({ chrome, binding, action, signal, upload: uploadScreenshot,
+          authorize: () => authorize(scope, action, signal) });
+      }
       if (!DOCUMENT_OPERATIONS.has(action.input.operation)) {
         return { status: 'rejected', observation: 'This browser operation is not available in the current driver.' };
       }

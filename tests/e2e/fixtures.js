@@ -15,10 +15,12 @@ const extensionPath = process.env.EXTENSION_PATH
  *   - serviceWorker: the extension service worker (already registered)
  */
 export const test = base.extend({
-  context: async ({}, use) => {
+  nativeViewport: [false, { option: true }],
+  context: async ({ nativeViewport }, use) => {
     const context = await chromium.launchPersistentContext('', {
       channel: 'chromium',
       headless: true,
+      ...(nativeViewport ? { viewport: null } : {}),
       args: [
         `--disable-extensions-except=${extensionPath}`,
         `--load-extension=${extensionPath}`,
