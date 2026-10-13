@@ -452,7 +452,7 @@ export async function analyzeSavMessage(input: SavEnrichedInput, context: SavAna
     try {
       conversation ??= customerMessage.kind === "sender" && context.messageId ? await loadSavConversation(context.messageId) : undefined;
       const { extractSavIdentityHints } = await import("./identity");
-      if (customerIdentity.email) crm = await (context.evaluation?.readHubspotContext ?? readSavHubspotContext)({ email: customerIdentity.email, subject: input.subject, currentTicketId: customerIdentity.kind === "sender" && conversation?.senderMatchesCustomer ? conversation.hubspotTicketId : undefined,
+      if (customerIdentity.email) crm = await (context.evaluation?.readHubspotContext ?? readSavHubspotContext)({ email: customerIdentity.email, subject: input.subject, body: input.body, currentTicketId: customerIdentity.kind === "sender" && conversation?.senderMatchesCustomer ? conversation.hubspotTicketId : undefined,
         identityHints: customerMessage.kind === "sender" ? extractSavIdentityHints([messageContext.currentText, messageContext.signatureText].filter(Boolean).join("\n"), input.displayName) : undefined, toleratePartial: true });
     } catch { /* An unavailable read is never interpreted as an absent customer. */ }
   }

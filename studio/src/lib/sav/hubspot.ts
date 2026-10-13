@@ -29,6 +29,7 @@ import { isSavAiAuthoredReply } from "./reply-format";
 import { getSavAutonomyGate } from "./promotion";
 import { savTicketReturnPlan, sortSavTicketsNewestFirst, type SavLifecycleTicket } from "./ticket-lifecycle";
 import { selectSavTicketMatch } from "./ticket-routing";
+import { matchSavTicketsByContent } from "./ticket-routing-model";
 import { extractSavLearningResolution, isHubspotOutboundDirection } from "./learning-extraction";
 import { savActionFailurePlan } from "./retry-policy";
 import { claimWebhookReceipt, markWebhookReceipt, recordWebhookReceipt, type SavMessageBody } from "./service";
@@ -340,7 +341,7 @@ async function finalizeSavV0TicketAction(action: typeof savActions.$inferSelect)
     if (!customerIdentity.email) throw new Error("SAV_FORWARDED_CUSTOMER_UNRESOLVED");
     const customerEmail = customerIdentity.kind === "forwarded" ? customerIdentity.email
       : proposal.customerIdentity.verifiedByHuman && proposal.customerIdentity.registrationEmail ? proposal.customerIdentity.registrationEmail : customerIdentity.email;
-    const context = await readSavHubspotContext({ email: customerEmail, subject: customerMessage.subject, returnedAt: latest.receivedAt,
+    const context = await readSavHubspotContext({ email: customerEmail, subject: customerMessage.subject, body: customerMessage.body, returnedAt: latest.receivedAt,
       currentTicketId: customerIdentity.kind === "sender" && thread.customerEmail.toLowerCase() === customerEmail.toLowerCase() ? thread.hubspotTicketId : undefined });
     if (!context.contactId) throw new Error("SAV_HUBSPOT_CONTACT_REQUIRED");
     const returnTarget = returnRequest ? context.tickets.find(value => value.id === returnRequest.ticketId) : null;
@@ -569,7 +570,7 @@ export async function findSavContactCandidates(hints: SavIdentityHints): Promise
   return [...candidates.values()].slice(0, 10);
 }
 
-export async function readSavHubspotContext(input: { email: string; subject: string; currentTicketId?: string | null; returnedAt?: Date | string; identityHints?: SavIdentityHints; toleratePartial?: boolean }) {
+export async function readSavHubspotContext(input: { email: string; subject: string; body?: string; currentTicketId?: string | null; returnedAt?: Date | string; identityHints?: SavIdentityHints; toleratePartial?: boolean }) {
   const contact = await findContactByEmail(input.email);
   let identityCandidates: SavIdentityCandidate[] = [];
   try {
@@ -577,7 +578,7 @@ export async function readSavHubspotContext(input: { email: string; subject: str
     let linkedTicket: HubspotRecord | null = null;
     if (input.currentTicketId) {
       try {
-        linkedTicket = await hubspotFetch<HubspotRecord>(`/crm/v3/objects/tickets/${encodeURIComponent(input.currentTicketId)}?properties=subject,hs_pipeline,hs_pipeline_stage,hs_lastmodifieddate,hs_last_closed_date,closed_date,hubspot_owner_id&associations=contacts`);
+        linkedTicket = await hubspotFetch<HubspotRecord>(`/crm/v3/objects/tickets/${encodeURIComponent(input.currentTicketId)}?properties=subject,content,createdate,hs_pipeline,hs_pipeline_stage,hs_lastmodifieddate,hs_last_closed_date,closed_date,hubspot_owner_id&associations=contacts`);
       } catch (error) {
         if (!/HUBSPOT_HTTP_404/.test(error instanceof Error ? error.message : "")) throw error;
       }
@@ -596,10 +597,12 @@ export async function readSavHubspotContext(input: { email: string; subject: str
     const closed = await closedTicketStages();
     const records = [...(linkedTicket ? [linkedTicket] : []), ...(response.results ?? []).filter((ticket) => ticket.id !== linkedTicket?.id)]
       .filter((ticket) => String(ticket.properties.hs_pipeline) === SAV_HUBSPOT_SUPPORT.pipelineId);
-    const tickets = sortSavTicketsNewestFirst(records.map((ticket): SavLifecycleTicket & { subject: string; description: string; pipelineId: string | null; stageId: string | null; updatedAt: string | null } => ({
+    const tickets = sortSavTicketsNewestFirst(records.map((ticket): SavLifecycleTicket & { subject: string; description: string; descriptionTruncated?: boolean; subjectTruncated?: boolean; pipelineId: string | null; stageId: string | null; updatedAt: string | null } => ({
       id: ticket.id,
       subject: String(ticket.properties.subject || "Sans objet").slice(0, 500),
+      subjectTruncated: String(ticket.properties.subject || "Sans objet").length > 500,
       description: String(ticket.properties.content || "").slice(0, 2_500),
+      descriptionTruncated: String(ticket.properties.content || "").length > 2_500,
       pipelineId: ticket.properties.hs_pipeline,
       stageId: ticket.properties.hs_pipeline_stage,
       ownerId: ticket.properties.hubspot_owner_id || null,
@@ -608,13 +611,15 @@ export async function readSavHubspotContext(input: { email: string; subject: str
       closedAt: ticket.properties.hs_last_closed_date || ticket.properties.closed_date || null,
       updatedAt: ticket.properties.hs_lastmodifieddate || ticket.updatedAt || null,
     })));
-    const routing = selectSavTicketMatch({ subject: input.subject, candidates: tickets, currentTicketId: input.currentTicketId, includeClosed: true });
+    const assessed = input.body !== undefined ? await matchSavTicketsByContent({ subject: input.subject, body: input.body, tickets }) : null;
+    const routing = assessed?.selection ?? selectSavTicketMatch({ subject: input.subject, candidates: tickets, currentTicketId: input.currentTicketId, includeClosed: true });
     return {
       errorCode: null as string | null,
       contactFound: Boolean(contact),
       contactId: contact?.id,
       identityCandidates,
       tickets,
+      ...(assessed ? { matching: assessed.matching } : {}),
       routing: routing.kind === "matched"
         ? { kind: routing.kind, ticketId: routing.ticket.id, reason: routing.reason, returnOperation: savTicketReturnPlan(tickets.find(ticket => ticket.id === routing.ticket.id)!, input.returnedAt ?? new Date()).operation }
         : { kind: routing.kind, reason: routing.reason, candidateIds: routing.kind === "ambiguous" ? routing.candidates.map((ticket) => ticket.id) : [] },
