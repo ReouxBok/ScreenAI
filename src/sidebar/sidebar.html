@@ -33,6 +33,14 @@
         <button id="limovaCancel" type="button" hidden>Arrêter</button>
       </div>
       <label><input id="limovaBrowser" type="checkbox"> Autoriser Charly à lire et agir sur l’onglet actif pour ce message</label>
+      <details>
+        <summary>Autoriser un autre site</summary>
+        <label for="limovaSiteOrigin">Adresse du site (HTTPS)</label>
+        <input id="limovaSiteOrigin" type="url" placeholder="https://exemple.com">
+        <button id="limovaSiteDetect" type="button">Utiliser le site actif</button>
+        <button id="limovaSiteAllow" type="button">Autoriser ce site</button>
+        <p id="limovaSiteStatus" role="status" aria-live="polite"></p>
+      </details>
       <p id="limovaFeedback" role="status" aria-live="polite"></p>
     </section>
 

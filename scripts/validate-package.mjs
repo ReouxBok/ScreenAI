@@ -41,6 +41,9 @@ const actualPermissions = [...(manifest.permissions || [])].sort();
 if (JSON.stringify(actualPermissions) !== JSON.stringify([...expectedPermissions].sort())) {
   failures.push(`permissions must stay least-privilege: ${expectedPermissions.join(', ')}`);
 }
+if (JSON.stringify(manifest.optional_host_permissions) !== JSON.stringify(['https://*/*'])) {
+  failures.push('optional_host_permissions must allow per-site HTTPS requests only');
+}
 const expectedHosts = [
   'https://api.new.limova.ai/*',
   'https://new.limova.ai/*',
