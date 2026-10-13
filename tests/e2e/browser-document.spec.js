@@ -115,3 +115,37 @@ test('highlights a private target without triggering its click handler', async (
   expect(result.status).toBe('completed');
   expect(await site.evaluate(() => saved)).toBe(0);
 });
+
+test('Chrome document binding refuses an action after page reload and allocates a newer context', async ({ context, extensionId }) => {
+  const { site, controller } = await setup(context, extensionId);
+  await controller.evaluate(async () => {
+    const { createBrowserBinding } = await import('../limova/browser-binding.js');
+    const { createBrowserJournal } = await import('../limova/browser-journal.js');
+    window.driverJournal = createBrowserJournal();
+    const scope = { userId: crypto.randomUUID(), workspaceId: crypto.randomUUID() };
+    scope.sessionId = await driverJournal.getSession(scope);
+    // The fixture has already initialized document versions 1 and 2.
+    await driverJournal.allocateVersion(scope);
+    await driverJournal.allocateVersion(scope);
+    window.driver = createBrowserBinding({ scripting: chrome.scripting,
+      allocateVersion: () => driverJournal.allocateVersion(scope) });
+    const [tab] = await chrome.tabs.query({ url: 'https://new.limova.ai/driver-fixture' });
+    window.driverPage = await driver.bind(tab.id, 'https://new.limova.ai');
+    await driver.execute(driverPage, 'read_page', {});
+    window.driverPage = await driver.inspect(tab.id);
+  });
+  const before = await controller.evaluate(() => driverPage);
+  await site.reload();
+  const result = await controller.evaluate(async () => {
+    let rejected = false;
+    try { await driver.execute(driverPage, 'click', { elementId: 1 }); } catch { rejected = true; }
+    const next = await driver.bind(driverPage.tabId, driverPage.origin);
+    await driverJournal.close();
+    return { rejected, next };
+  });
+  expect(result.rejected).toBe(true);
+  expect(result.next.chromeDocumentId).not.toBe(before.chromeDocumentId);
+  expect(result.next.documentId).not.toBe(before.documentId);
+  expect(result.next.contextVersion).toBeGreaterThan(before.contextVersion);
+  expect(await site.evaluate(() => saved)).toBe(0);
+});

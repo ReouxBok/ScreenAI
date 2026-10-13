@@ -243,3 +243,35 @@ test('the continuation runner recovers a lost result response without repeating 
   expect(result.failure).toBe('Lost response');
   expect(result.resumed.state).toBe('completed');
 });
+
+test('context versions are atomic across connections and survive worker storage reopen', async ({ context, extensionId }) => {
+  const page = await journalPage(context, extensionId);
+  const result = await page.evaluate(async () => {
+    const one = createJournal(), two = createJournal();
+    const versions = await Promise.all(Array.from({ length: 20 }, (_, index) =>
+      (index % 2 ? one : two).allocateVersion(scope)));
+    await Promise.all([one.close(), two.close()]);
+    const reopened = createJournal();
+    const next = await reopened.allocateVersion(scope);
+    await reopened.close();
+    return { versions: versions.sort((a, b) => a - b), next };
+  });
+  expect(result.versions).toEqual(Array.from({ length: 20 }, (_, index) => index + 1));
+  expect(result.next).toBe(21);
+});
+
+test('revoked sessions cannot allocate context versions or resurrect their counter', async ({ context, extensionId }) => {
+  const page = await journalPage(context, extensionId);
+  const result = await page.evaluate(async () => {
+    const journal = createJournal();
+    await journal.allocateVersion(scope);
+    await journal.revokeSession(scope);
+    const sessionId = await journal.getSession(scope);
+    let error;
+    try { await journal.allocateVersion(scope); } catch (failure) { error = failure.message; }
+    const next = await journal.allocateVersion({ ...scope, sessionId });
+    await journal.close();
+    return { error, next, rotated: sessionId !== scope.sessionId };
+  });
+  expect(result).toEqual({ error: 'Browser session revoked', next: 1, rotated: true });
+});

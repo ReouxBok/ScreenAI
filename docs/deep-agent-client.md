@@ -161,3 +161,5 @@ and exercise real DOM effects and isolation. They do not exercise the final work
 or a live Limova model. Navigation, redacted screenshots, the privileged Chrome
 driver, monotonic versions across navigation/restart and uncertainty handling
 remain to connect before enabling browser actions.
+
+The local Chrome binding transport keeps Chrome's `documentId` separate from the isolated registry token. Subsequent commands target `documentIds` explicitly; a missing document is never retried against the tab's replacement document. Context versions are allocated in strict IndexedDB transactions on the current private session record, shared across connections and retained after reopening storage. Revoked sessions cannot allocate versions. Session rotation starts a new counter namespace; backend session validation remains required. This transport is not yet connected to the worker's action dispatch or permission lifecycle.
