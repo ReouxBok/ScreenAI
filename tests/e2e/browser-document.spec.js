@@ -149,3 +149,33 @@ test('Chrome document binding refuses an action after page reload and allocates 
   expect(result.next.contextVersion).toBeGreaterThan(before.contextVersion);
   expect(await site.evaluate(() => saved)).toBe(0);
 });
+
+test('assembled driver reads and clicks the active page with real Chrome permission checks', async ({ context, extensionId }) => {
+  const { site, controller } = await setup(context, extensionId);
+  await controller.evaluate(async () => {
+    const { createBrowserDriver } = await import('../limova/browser-driver.js');
+    const { createBrowserJournal } = await import('../limova/browser-journal.js');
+    window.assembledJournal = createBrowserJournal();
+    const scope = { userId: crypto.randomUUID(), workspaceId: crypto.randomUUID() };
+    scope.sessionId = await assembledJournal.getSession(scope);
+    await assembledJournal.allocateVersion(scope);
+    await assembledJournal.allocateVersion(scope);
+    window.assembled = createBrowserDriver({ chrome, journal: assembledJournal, scope, hasConsent: async () => true });
+  });
+  await site.bringToFront();
+  const result = await controller.evaluate(async () => {
+    const first = await assembled.readPage();
+    const snapshot = await assembled.execute({ target: first, input: { operation: 'read_page' } });
+    const target = await assembled.readPage();
+    const button = JSON.parse(snapshot.observation).elements.find(element => element.label === 'Save');
+    return assembled.execute({ target, input: { operation: 'click', elementId: button.elementId } });
+  });
+  expect(result.status).toBe('completed');
+  expect(await site.evaluate(() => saved)).toBe(1);
+  await controller.bringToFront();
+  const refused = await controller.evaluate(async () => {
+    try { await assembled.readPage(); return false; } catch { return true; }
+    finally { await assembledJournal.close(); }
+  });
+  expect(refused).toBe(true);
+});

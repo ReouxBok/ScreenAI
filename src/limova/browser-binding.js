@@ -34,11 +34,12 @@ export function createBrowserBinding({ scripting, allocateVersion }) {
         || frame.result.binding.contextVersion !== binding.contextVersion) throw new Error('Browser document changed');
       return { ...binding };
     },
-    async execute(target, operation, input, signal) {
+    async execute(target, operation, input, signal, beforeDispatch) {
       const binding = await this.inspect(target.tabId, signal);
       if (binding.origin !== target.origin || binding.contextVersion !== target.contextVersion) throw new Error('Browser page changed');
       const nextContextVersion = await allocateVersion(signal);
       if (!Number.isSafeInteger(nextContextVersion) || nextContextVersion <= binding.contextVersion) throw new Error('Browser version must advance');
+      await beforeDispatch?.(signal);
       const frame = await inject({ tabId: binding.tabId, documentIds: [binding.chromeDocumentId] },
         { ...input, ...binding, operation, nextContextVersion }, signal);
       if (frame.documentId !== binding.chromeDocumentId || frame.result.binding.documentId !== binding.documentId) throw new Error('Browser document changed');
