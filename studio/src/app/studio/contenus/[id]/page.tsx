@@ -9,6 +9,7 @@ import { VersionComparison } from "@/components/version-comparison";
 import { canEditContent, canManageProduction } from "@/lib/access";
 import { requireStaff } from "@/lib/auth";
 import { requiresKnowledgeUgoApproval } from "@/lib/knowledge/contracts";
+import { onboardingSourceStatus } from "@/lib/knowledge/onboarding-import";
 import { assessContentReadiness } from "@/lib/content-readiness";
 import { getEvaluationForContent } from "@/lib/evaluations";
 import { getTrainingByContentItemId } from "@/lib/training";
@@ -28,6 +29,10 @@ export default async function DetailPage({ params, searchParams }: {
   if (!detail) notFound();
   const current = detail.versions.find((version) => version.id === detail.item.currentDraftVersionId) ?? detail.versions[0];
   const previous = detail.versions.find((version) => version.version === (current?.version ?? 1) - 1);
+  const published = detail.versions.find((version) => version.id === detail.item.publishedVersionId);
+  const sourceStates = await Promise.all([current, published].filter((version) => Boolean(version)).map((version) => onboardingSourceStatus(version!.metadata)));
+  const sourceChanged = sourceStates.includes("changed");
+  const sourceUnavailable = sourceStates.includes("unavailable");
   const sourceTraining = await getTrainingByContentItemId(id);
   const evaluationData = detail.item.type === "onboarding" ? await getEvaluationForContent(id) : null;
   const isAdmin = canManageProduction(staff.role);
@@ -44,6 +49,11 @@ export default async function DetailPage({ params, searchParams }: {
   return <>
     <span className="eyebrow">{detail.item.type === "article" ? "Article" : "Parcours"} · version {current?.version ?? 0}</span>
     <h1 className="page-title">{detail.item.title}</h1>
+    {(sourceChanged || sourceUnavailable) && <section className="card" role="status" style={{ padding: 20 }}>
+      <h2>{sourceChanged ? "Le tutoriel source a changé" : "La provenance doit être vérifiée"}</h2>
+      <p>{detail.item.publishedVersionId ? "La dernière connaissance publiée conserve son état d’activation. Sa mise à jour nécessite une nouvelle préparation et une revalidation d’Ugo." : "Vérifiez la source actuelle et préparez une nouvelle proposition avant publication."}</p>
+      <Link href="/studio/sav/connaissances?source=onboarding">Revoir les connaissances issues des tutoriels</Link>
+    </section>}
     <section className="content-management card" aria-label="Gestion du contenu">
       <div>
         <span className={`status ${detail.item.status}`}>{detail.item.status === "published" ? "Validé" : detail.item.status === "in_review" ? "À valider" : detail.item.status === "draft" ? "Brouillon" : "Archivé"}</span>

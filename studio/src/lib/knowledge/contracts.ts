@@ -34,6 +34,10 @@ export const canonicalKnowledgeSchema = z.object({
     diagnosticQuestions: list,
     responseTemplate: text,
   }).strict().optional(),
+  onboardingContext: z.object({
+    entryPoint: z.string().max(5_000),
+    sourceNotes: z.array(z.string().max(10_000)).max(50),
+  }).strict().optional(),
 }).strict().superRefine((value, ctx) => {
   if (new Set(value.steps.map((step) => step.id)).size !== value.steps.length) ctx.addIssue({ code: "custom", message: "SEMANTIC_STEP_IDS_MUST_BE_UNIQUE", path: ["steps"] });
 });

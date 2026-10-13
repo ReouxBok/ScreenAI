@@ -5,6 +5,13 @@ vi.mock("@/app/studio/actions", () => ({ saveContentAction: async () => undefine
 vi.mock("./markdown-editor", () => ({ MarkdownEditor: () => createElement("textarea", { name: "bodyMarkdown" }) }));
 import { ContentForm } from "./content-form";
 describe("SAV knowledge editor", () => {
+  it("locks a tutorial knowledge to its exact source title and SAV scope", () => {
+    const html = renderToStaticMarkup(createElement(ContentForm, { defaults: { agentKey: "sav", title: "Ancien titre fictif", ownerEmail: "staff@example.invalid",
+      metadata: { sourceMetadata: { importKind: "onboarding_catalog", sourceTitle: "Titre du tutoriel fictif — exact" } } } }));
+    expect(html).toMatch(/<input[^>]*id="title"[^>]*readOnly=""[^>]*value="Titre du tutoriel fictif — exact"/);
+    expect(html).toMatch(/<select[^>]*id="agentKey"[^>]*disabled=""/);
+    expect(html).toContain('type="hidden" name="agentKey" value="sav"');
+  });
   it("exposes labelled lead, procedure and staff source fields", () => {
     const html = renderToStaticMarkup(createElement(ContentForm, { defaults: { agentKey: "sav", ownerEmail: "staff@example.invalid",
       metadata: { resolution: { audience: "lead", responseTemplate: "Bonjour, modèle fictif sans signature.", symptoms: ["Lead avant achat"], steps: ["Étape fictive"] },
