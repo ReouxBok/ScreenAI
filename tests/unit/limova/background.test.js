@@ -18,8 +18,13 @@ function harness() {
     logout: vi.fn().mockResolvedValue({}),
     sendMessage: vi.fn(async function* () { yield { event: 'values', data: { messages: [] } }; }),
   };
+  const journal = {
+    getSession: vi.fn().mockResolvedValue('browser-session'),
+    revokeSession: vi.fn().mockResolvedValue(undefined),
+    clearAccount: vi.fn().mockResolvedValue(undefined),
+  };
   const notify = vi.fn();
-  return { state, storage, client, notify, background: createLimovaBackground({ storage, client, notify, openTab: vi.fn() }) };
+  return { state, storage, client, journal, notify, background: createLimovaBackground({ storage, client, journal, notify, openTab: vi.fn() }) };
 }
 async function open(background) {
   await background.handle({ type: 'LIMOVA_SELECT_WORKSPACE', workspaceId: 'workspace-1' });
@@ -84,5 +89,46 @@ describe('Limova background session isolation', () => {
     await expect(background.handle({ type: 'LIMOVA_SEND_MESSAGE', text: 'Bonjour' })).rejects.toThrow('Account changed');
     expect(state[KEY]).toBeUndefined();
     expect(notify).toHaveBeenCalledWith({ type: 'LIMOVA_SESSION_CHANGED' });
+  });
+});
+
+describe('privileged browser session lifecycle', () => {
+  it('creates a private session without exposing its nonce in the panel state', async () => {
+    const { background, journal } = harness();
+    await open(background);
+    const state = await background.handle({ type: 'LIMOVA_GET_STATE' });
+    expect(journal.getSession).toHaveBeenCalledWith({ userId: 'user-1', workspaceId: 'workspace-1' });
+    expect(JSON.stringify(state)).not.toContain('browser-session');
+  });
+
+  it('can cancel a paused backend turn even with no active local stream', async () => {
+    const { background, client } = harness();
+    await open(background);
+    await background.handle({ type: 'LIMOVA_CANCEL' });
+    expect(client.cancel).toHaveBeenCalledWith({ userId: 'user-1', workspaceId: 'workspace-1' }, 'conversation-1');
+  });
+
+  it('revokes the previous workspace binding when selecting an enabled workspace', async () => {
+    const { background, journal } = harness();
+    await open(background);
+    await background.handle({ type: 'LIMOVA_SELECT_WORKSPACE', workspaceId: 'workspace-1' });
+    expect(journal.revokeSession).toHaveBeenCalledWith({ userId: 'user-1', workspaceId: 'workspace-1' });
+  });
+
+  it('clears local session and receipts even when remote cancellation prevents logout', async () => {
+    const { background, client, journal, state } = harness();
+    await open(background);
+    client.cancel.mockRejectedValueOnce(new Error('Network down'));
+    await expect(background.handle({ type: 'LIMOVA_LOGOUT' })).rejects.toThrow('Network down');
+    expect(journal.clearAccount).toHaveBeenCalledWith('user-1');
+    expect(state[KEY]).toBeUndefined();
+  });
+
+  it('revokes the former account when a different Limova account is detected', async () => {
+    const { background, client, journal } = harness();
+    await open(background);
+    client.bootstrap.mockResolvedValueOnce({ user: { id: 'user-2' }, workspaces: [{ id: 'workspace-1', enabled: true }] });
+    await background.handle({ type: 'LIMOVA_GET_STATE' });
+    expect(journal.clearAccount).toHaveBeenCalledWith('user-1');
   });
 });

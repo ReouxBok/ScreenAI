@@ -64,9 +64,9 @@ Limova account/workspace before submitting observations. A network failure does
 not automatically replay a result. Explicit retries must use the same durable
 receipt; a reconnection can inspect the turn before resuming.
 
-This foundation depends on the API browser HTTP branch. The service-worker
-session lifecycle, local action receipts and browser executor are not connected
-to these methods yet. Existing panel calls remain text-only. The generated ZIP
+This foundation depends on the API browser HTTP branch. The service-worker browser session lifecycle and receipt persistence are now
+implemented; the executor and result/resume dispatch are not connected to these
+transport methods yet. Existing panel calls remain text-only. The generated ZIP
 is still an intermediate development artifact, not the final migration release.
 
 ## Durable browser receipts
@@ -86,8 +86,8 @@ Storage failure before a claim prevents execution altogether.
 
 `clearScope` and `clearAccount` erase the corresponding receipts and invalidate
 in-flight result writes. The caller must also revoke/rotate the browser session
-on logout/account change before accepting more actions. These lifecycle hooks
-and the real page executor are not wired yet. Authorization, current tab/origin,
+on logout/account change before accepting more actions. The lifecycle hooks now run on workspace changes, account invalidation and
+logout; the real page executor is not wired yet. Authorization, current tab/origin,
 page version, permissions and cancellation must be checked immediately before
 the executor acts; journal validation does not grant browser permission.
 
@@ -95,4 +95,24 @@ Nine Chromium tests exercise real IndexedDB transactions, reopening, concurrent
 connections, ambiguous interruption, storage failures and account cleanup.
 Nineteen boundary tests reject malformed operations and raw SDK interrupts.
 These tests use fixture executors, not real clicks on user sites or live Limova
-authentication. The journal remains inactive until the service-worker integration.
+authentication. Action execution remains inactive until the executor and stream dispatch are integrated.
+
+
+## Private browser session lifecycle
+
+The journal atomically creates one persistent session UUID per account/workspace.
+Both execution claims and result commits check that UUID in the same IndexedDB
+transaction. Revoking the workspace session or clearing an account invalidates
+old requests; reconnecting creates a new UUID. The nonce is never included in
+panel state or Chrome local-storage context records.
+
+The worker initializes this session after an enabled workspace is selected or
+restored. Workspace switches revoke the prior binding; account changes, loss of
+access and logout erase the prior account's receipts and sessions. Local cleanup
+also runs if remote cancellation fails during logout. An account change aborts
+the old local stream without issuing cancellation as the newly signed-in user.
+The existing cancel command now reaches the backend even when the local stream
+has finished, so paused browser turns can be cancelled.
+
+The live action dispatcher, page executor, permission checks and uncertainty UI
+remain outstanding. Session creation alone does not activate browser tools.

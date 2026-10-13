@@ -58,22 +58,34 @@ function openDatabase() {
   });
 }
 
-function change(database, key, update) {
+function sessionKey(scope) {
+  if (!scope || !identifier(scope.userId) || !identifier(scope.workspaceId)) throw new Error('Invalid browser session context');
+  return JSON.stringify([scope.userId, scope.workspaceId, 'session']);
+}
+
+function change(database, key, update, scope) {
   return new Promise((resolve, reject) => {
     const transaction = database.transaction(STORE, 'readwrite', { durability: 'strict' });
     const store = transaction.objectStore(STORE);
     let answer;
-    const request = store.get(key);
-    request.onsuccess = () => {
-      try {
-        const next = update(request.result);
-        answer = next.answer;
-        if (next.record !== undefined) store.put(next.record, key);
-      } catch (error) {
-        reject(error);
-        transaction.abort();
-      }
+    const fail = error => { reject(error); transaction.abort(); };
+    const load = () => {
+      const request = store.get(key);
+      request.onsuccess = () => {
+        try {
+          const next = update(request.result);
+          answer = next.answer;
+          if (next.record !== undefined) store.put(next.record, key);
+        } catch (error) { fail(error); }
+      };
     };
+    if (scope) {
+      const session = store.get(sessionKey(scope));
+      session.onsuccess = () => {
+        if (session.result?.sessionId !== scope.sessionId) fail(new Error('Browser session revoked'));
+        else load();
+      };
+    } else load();
     transaction.oncomplete = () => resolve(answer);
     transaction.onerror = () => reject(transaction.error);
     transaction.onabort = () => reject(transaction.error ?? new Error('Browser receipt transaction aborted'));
@@ -100,7 +112,21 @@ export function createBrowserJournal() {
   let database;
   const getDatabase = () => database ??= openDatabase();
   return {
+    async getSession(scope) {
+      const key = sessionKey(scope);
+      return change(await getDatabase(), key, current => {
+        if (identifier(current?.sessionId)) return { answer: current.sessionId };
+        const sessionId = crypto.randomUUID();
+        return { record: { sessionId }, answer: sessionId };
+      });
+    },
+    async revokeSession(scope) {
+      sessionKey(scope);
+      const prefix = JSON.stringify([scope.userId, scope.workspaceId]).slice(0, -1) + ',';
+      await clearPrefix(await getDatabase(), prefix);
+    },
     async run(scope, action, execute) {
+      scope = Object.freeze(structuredClone(scope));
       action = structuredClone(action);
       const key = validate(scope, action);
       Object.freeze(action.target);
@@ -119,7 +145,7 @@ export function createBrowserJournal() {
         }
         if (Date.parse(action.expiresAt) <= Date.now()) throw new Error('Browser action expired');
         return { record: { digest, owner, state: 'started' }, answer: { state: 'execute' } };
-      });
+      }, scope);
       if (claim.state !== 'execute') return claim;
       let observation;
       try { observation = await execute(action); } catch { return { state: 'uncertain', result: null }; }
@@ -132,7 +158,7 @@ export function createBrowserJournal() {
       return change(db, key, current => {
         if (current?.owner !== owner || current.digest !== digest || current.state !== 'started') throw new Error('Browser receipt was invalidated');
         return { record: { ...current, state: 'completed', result }, answer: { state: 'completed', result } };
-      });
+      }, scope);
     },
     async clearScope(scope) {
       if (!scope || !['userId', 'workspaceId', 'conversationId', 'sessionId'].every(key => identifier(scope[key]))) throw new Error('Invalid browser scope');

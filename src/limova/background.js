@@ -1,3 +1,4 @@
+import { createBrowserJournal } from './browser-journal.js';
 import { LimovaDeepAgentClient, LIMOVA_APP_URL } from './client.js';
 
 const STORAGE_KEY = 'limova_deep_agent_context_v1';
@@ -8,7 +9,7 @@ export const LIMOVA_MESSAGE_TYPES = new Set([
   'LIMOVA_GET_MESSAGES',
 ]);
 
-export function createLimovaBackground({ storage, openTab, notify, client = new LimovaDeepAgentClient() }) {
+export function createLimovaBackground({ storage, openTab, notify, client = new LimovaDeepAgentClient(), journal = createBrowserJournal() }) {
   let context = null;
   let conversationId = null;
   let activeTurn = null;
@@ -21,7 +22,10 @@ export function createLimovaBackground({ storage, openTab, notify, client = new 
 
   async function cancel() {
     const turn = activeTurn;
-    if (!turn) return { ok: true };
+    if (!turn) {
+      if (context && conversationId) await client.cancel(context, conversationId);
+      return { ok: true };
+    }
     turn.controller.abort();
     activeTurn = null;
     await client.cancel(turn.context, turn.conversationId);
@@ -35,12 +39,18 @@ export function createLimovaBackground({ storage, openTab, notify, client = new 
     const workspace = previous?.userId === current.user.id
       ? current.workspaces.find(item => item.id === previous.workspaceId) : null;
     if (!workspace || !workspace.enabled) {
+      if (previous?.userId === current.user.id) await cancel().catch(() => {});
+      else {
+        activeTurn?.controller.abort();
+        activeTurn = null;
+      }
+      if (previous?.userId) await journal.clearAccount(previous.userId);
       context = null;
       conversationId = null;
       await save();
-      await cancel().catch(() => {});
     } else {
       context = { userId: current.user.id, workspaceId: workspace.id };
+      await journal.getSession(context);
       conversationId = conversationId ?? stored?.conversationId ?? null;
     }
     return { authenticated: true, ...current, context, conversationId, activeTurnId: activeTurn?.id ?? null };
@@ -56,6 +66,8 @@ export function createLimovaBackground({ storage, openTab, notify, client = new 
       case 'LIMOVA_GET_STATE':
         try { return await state(); } catch (error) {
           if (error.code !== 'LIMOVA_LOGIN_REQUIRED') throw error;
+          const previous = context ?? (await storage.get(STORAGE_KEY))[STORAGE_KEY];
+          if (previous?.userId) await journal.clearAccount(previous.userId);
           activeTurn?.controller.abort();
           activeTurn = null;
           context = null;
@@ -71,7 +83,9 @@ export function createLimovaBackground({ storage, openTab, notify, client = new 
         const workspace = current.workspaces.find(item => item.id === request.workspaceId && item.enabled);
         if (!workspace) throw new Error('L’extension n’est pas activée pour cet espace.');
         await cancel();
+        if (context) await journal.revokeSession(context);
         context = { userId: current.user.id, workspaceId: workspace.id };
+        await journal.getSession(context);
         conversationId = null;
         await save();
         return { ok: true, context };
@@ -109,6 +123,7 @@ export function createLimovaBackground({ storage, openTab, notify, client = new 
           return { ok: true, turnId: turn.id };
         } catch (error) {
           if (activeTurn === turn && ['LIMOVA_ACCOUNT_CHANGED', 'LIMOVA_LOGIN_REQUIRED', 'LIMOVA_EXTENSION_DISABLED'].includes(error.code)) {
+            await journal.clearAccount(turn.context.userId);
             context = null;
             conversationId = null;
             await save();
@@ -122,13 +137,17 @@ export function createLimovaBackground({ storage, openTab, notify, client = new 
       }
       case 'LIMOVA_CANCEL':
         return cancel();
-      case 'LIMOVA_LOGOUT':
-        await cancel();
+      case 'LIMOVA_LOGOUT': {
+        const previous = context ?? (await storage.get(STORAGE_KEY))[STORAGE_KEY];
+        try { await cancel(); } finally {
+          if (previous?.userId) await journal.clearAccount(previous.userId);
+          context = null;
+          conversationId = null;
+          await save();
+        }
         await client.logout();
-        context = null;
-        conversationId = null;
-        await save();
         return { authenticated: false };
+      }
       default:
         throw new Error('Opération Limova non reconnue.');
     }

@@ -8,6 +8,9 @@ async function journalPage(context, extensionId) {
     const { createBrowserJournal } = await import('../limova/browser-journal.js');
     window.createJournal = createBrowserJournal;
     window.scope = { userId: crypto.randomUUID(), workspaceId: crypto.randomUUID(), conversationId: crypto.randomUUID(), sessionId: crypto.randomUUID() };
+    const journal = createBrowserJournal();
+    scope.sessionId = await journal.getSession(scope);
+    await journal.close();
     window.action = { type: 'extension.action_requested', protocolVersion: 1, turnId: crypto.randomUUID(), actionId: 'action-1', toolCallId: 'call-1',
       target: { tabId: 17, origin: 'https://example.com', contextVersion: 1 }, input: { operation: 'click', elementId: 1 },
       expiresAt: new Date(Date.now() + 120000).toISOString() };
@@ -157,6 +160,7 @@ test('account cleanup removes only that account and invalidates its in-flight re
   const result = await page.evaluate(async () => {
     const journal = createJournal();
     const other = { ...scope, userId: crypto.randomUUID() };
+    other.sessionId = await journal.getSession(other);
     let executed = 0;
     const execute = async () => { executed++; return { status: 'completed', observation: 'Other account' }; };
     await journal.run(other, action, execute);
@@ -171,7 +175,31 @@ test('account cleanup removes only that account and invalidates its in-flight re
     await journal.close();
     return { invalidated, executed, recovered };
   });
-  expect(result.invalidated).toBe('Browser receipt was invalidated');
+  expect(result.invalidated).toBe('Browser session revoked');
   expect(result.executed).toBe(1);
   expect(result.recovered.result.observation).toBe('Other account');
+});
+
+test('session creation is atomic, persistent and rotated on workspace revocation', async ({ context, extensionId }) => {
+  const page = await journalPage(context, extensionId);
+  const result = await page.evaluate(async () => {
+    const one = createJournal(), two = createJournal();
+    const sessions = await Promise.all([one.getSession(scope), two.getSession(scope)]);
+    const before = scope.sessionId;
+    await one.revokeSession(scope);
+    let executed = 0, error;
+    try { await two.run(scope, action, async () => { executed++; return { status: 'completed', observation: 'Forbidden' }; }); }
+    catch (failure) { error = failure.message; }
+    const after = await two.getSession(scope);
+    await Promise.all([one.close(), two.close()]);
+    const reopened = createJournal();
+    const recovered = await reopened.getSession(scope);
+    await reopened.close();
+    return { sessions, before, after, recovered, executed, error };
+  });
+  expect(result.sessions).toEqual([result.before, result.before]);
+  expect(result.after).not.toBe(result.before);
+  expect(result.recovered).toBe(result.after);
+  expect(result.executed).toBe(0);
+  expect(result.error).toBe('Browser session revoked');
 });
