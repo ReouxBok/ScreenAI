@@ -123,8 +123,8 @@ export default async function SavThreadPage({ params, searchParams }: { params: 
     <a className={styles.contextJump} href="#sav-client-context">Voir le contexte client et les actions</a>
     <section className={`sav-thread-grid ${styles.layout}`}>
       <div className={`sav-conversation ${styles.main}`}>
-        <MailConversation key={latestInbound?.id ?? id} messages={detail.messages.map(message => ({ id: message.id, receivedAt: message.receivedAt, createdAt: message.createdAt, direction: message.direction, fromEmail: message.fromEmail, body: { text: message.body.text, attachments: message.body.attachments } }))}/>
-        {partnershipState && <PartnershipTransfer key={latestInbound?.id ?? id} threadId={id} state={partnershipState}/>}
+        <MailConversation key={`mail:${latestInbound?.id ?? id}`} messages={detail.messages.map(message => ({ id: message.id, receivedAt: message.receivedAt, createdAt: message.createdAt, direction: message.direction, fromEmail: message.fromEmail, body: { text: message.body.text, attachments: message.body.attachments } }))}/>
+        {partnershipState && <PartnershipTransfer key={`partnership:${latestInbound?.id ?? id}`} threadId={id} state={partnershipState}/>}
         {proposalReview && latestInbound && <ProposalReview data={proposalReview} threadId={detail.thread.id} messageId={latestInbound.id} drafts={replyDrafts} context={{ subject: customerMessage?.subject ?? latestInbound.subject, messageCount: detail.messages.length, relatedCount: relatedThreads.length + (isForward ? dossier?.otherConversations.length ?? 0 : 0), linkedTicketId: detail.thread.hubspotTicketId }} sendAllowed={!sendDisabledReason} sendDisabledReason={sendDisabledReason} replyState={replyState}/>}
         {proposalReview && latestInbound && <DraftReview data={proposalReview} threadId={id} messageId={latestInbound.id} drafts={replyDrafts} sendAllowed={!sendDisabledReason} sendDisabledReason={sendDisabledReason} replyState={replyState}/>}
         <ResolutionObservation rows={observations} isUgo={staff.email.toLowerCase()==="ugo@limova.ai"}/>
