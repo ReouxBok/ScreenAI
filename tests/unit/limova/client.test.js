@@ -98,3 +98,87 @@ describe('Limova Deep Agent client', () => {
     expect(fetch.mock.calls.filter(([url]) => url.endsWith(`/message/${CONVERSATION}`))).toHaveLength(1);
   });
 });
+
+const BROWSER_SESSION = '77777777-7777-4777-8777-777777777777';
+const BROWSER = { sessionId: BROWSER_SESSION, page: { tabId: 17, origin: 'https://example.com', contextVersion: 4 } };
+const RESULT = { turnId: USER, actionId: `${USER}:tool-1`, toolCallId: 'tool-1', contextVersion: 3, status: 'completed', observation: 'Page observed' };
+async function consume(events) {
+  const collected = [];
+  for await (const event of events) collected.push(event);
+  return collected;
+}
+
+describe('Limova browser turn transport', () => {
+  it('binds the initial message through a header and validated page context', async () => {
+    const { client, fetch } = harness();
+    await consume(client.sendMessage(CONTEXT, CONVERSATION, 'Observe', undefined, BROWSER));
+    const [, options] = fetch.mock.calls.at(-1);
+    expect(options.headers['x-extension-session']).toBe(BROWSER_SESSION);
+    expect(JSON.parse(options.body)).toMatchObject({ content: 'Observe', browserContext: BROWSER.page, clientSurface: 'chrome_extension' });
+    expect(options.body).not.toContain(BROWSER_SESSION);
+    expect(fetch.mock.calls.slice(0, -1).every(([, call]) => !call.headers['x-extension-session'])).toBe(true);
+  });
+
+  it('submits a result without appending human text, timezone or attachments', async () => {
+    const { client, fetch } = harness();
+    await consume(client.sendBrowserResult(CONTEXT, CONVERSATION, BROWSER, { ...RESULT, ignored: 'not sent' }));
+    const [url, options] = fetch.mock.calls.at(-1);
+    expect(url).toBe(`${LIMOVA_API_URL}/message/${CONVERSATION}`);
+    expect(options.headers['x-extension-session']).toBe(BROWSER_SESSION);
+    expect(JSON.parse(options.body)).toEqual({ kind: 'browser_tool_result', browserContext: BROWSER.page, browserResult: RESULT, clientSurface: 'chrome_extension' });
+  });
+
+  it('recovers a turn on the existing GET route and resumes without a result', async () => {
+    const { client, fetch } = harness();
+    const original = fetch.getMockImplementation();
+    fetch.mockImplementation((url, options) => url.endsWith(`/conversation/${CONVERSATION}`)
+      ? json({ engine: 'deep_agents', mainAgent: { slug: 'charly' }, browserTurn: { turnId: USER, status: 'open' } }) : original(url, options));
+    expect(await client.getBrowserTurn(CONTEXT, CONVERSATION, BROWSER_SESSION)).toEqual({ turnId: USER, status: 'open' });
+    expect(fetch.mock.calls.at(-1)[1].headers['x-extension-session']).toBe(BROWSER_SESSION);
+    await consume(client.resumeBrowserTurn(CONTEXT, CONVERSATION, BROWSER, USER));
+    expect(JSON.parse(fetch.mock.calls.at(-1)[1].body)).toEqual({ kind: 'browser_resume', browserTurnId: USER, browserContext: BROWSER.page, clientSurface: 'chrome_extension' });
+  });
+
+  it('returns no browser turn when the server has none for this session', async () => {
+    const { client } = harness();
+    expect(await client.getBrowserTurn(CONTEXT, CONVERSATION, BROWSER_SESSION)).toBeNull();
+  });
+
+  it.each([
+    { ...BROWSER, sessionId: 'invalid' },
+    { ...BROWSER, page: { ...BROWSER.page, tabId: '17' } },
+    { ...BROWSER, page: { ...BROWSER.page, origin: 'http://example.com' } },
+    { ...BROWSER, page: { ...BROWSER.page, origin: 'https://example.com/path' } },
+    { ...BROWSER, page: { ...BROWSER.page, contextVersion: -1 } },
+  ])('rejects malformed browser contexts before network activity %#', async browser => {
+    const { client, fetch } = harness();
+    await expect(consume(client.resumeBrowserTurn(CONTEXT, CONVERSATION, browser, USER))).rejects.toThrow();
+    expect(fetch).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    { ...RESULT, status: 'unknown' },
+    { ...RESULT, observation: 'x'.repeat(32001) },
+    { ...RESULT, contextVersion: '3' },
+    { ...RESULT, turnId: 'invalid' },
+  ])('rejects malformed results before network activity %#', async result => {
+    const { client, fetch } = harness();
+    await expect(consume(client.sendBrowserResult(CONTEXT, CONVERSATION, BROWSER, result))).rejects.toThrow();
+    expect(fetch).not.toHaveBeenCalled();
+  });
+
+  it('rechecks account ownership before submitting browser observations', async () => {
+    const { client, fetch } = harness({ userId: AGENT });
+    await expect(consume(client.sendBrowserResult(CONTEXT, CONVERSATION, BROWSER, RESULT))).rejects.toMatchObject({ code: 'LIMOVA_ACCOUNT_CHANGED' });
+    expect(fetch.mock.calls.some(([, options]) => options.method === 'POST')).toBe(false);
+  });
+
+  it('does not automatically replay a result after an ambiguous network failure', async () => {
+    const { client, fetch } = harness();
+    const original = fetch.getMockImplementation();
+    fetch.mockImplementation((url, options) => url.endsWith(`/message/${CONVERSATION}`)
+      ? Promise.reject(new Error('Connection lost')) : original(url, options));
+    await expect(consume(client.sendBrowserResult(CONTEXT, CONVERSATION, BROWSER, RESULT))).rejects.toThrow('Connection lost');
+    expect(fetch.mock.calls.filter(([url]) => url.endsWith(`/message/${CONVERSATION}`))).toHaveLength(1);
+  });
+});

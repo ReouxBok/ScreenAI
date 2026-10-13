@@ -47,3 +47,24 @@ browser/voice/training parity. Legacy voice, page analysis and privacy controls
 still need migration; this is not a release-ready package. Browser UI tests use
 a simulated Limova session, not a real-account cookie handoff. No production
 activation or real-account session-sharing proof is claimed.
+
+## Browser transport foundation
+
+The client accepts an optional privileged browser binding on `sendMessage`:
+`{ sessionId, page: { tabId, origin, contextVersion } }`. It sends the session UUID
+only in `x-extension-session` on the relevant message request; it is not a login
+token and is not included in model input. Page origins must be canonical HTTPS
+origins, and tab/version values must be nonnegative safe integers.
+
+`getBrowserTurn` reads the originating session's turn on the existing conversation
+GET route. `sendBrowserResult` and `resumeBrowserTurn` use the existing message
+POST route with `browser_tool_result` or `browser_resume`. They omit human text,
+attachments and timezone, preserve the native SSE stream, and recheck the current
+Limova account/workspace before submitting observations. A network failure does
+not automatically replay a result. Explicit retries must use the same durable
+receipt; a reconnection can inspect the turn before resuming.
+
+This foundation depends on the API browser HTTP branch. The service-worker
+session lifecycle, local action receipts and browser executor are not connected
+to these methods yet. Existing panel calls remain text-only. The generated ZIP
+is still an intermediate development artifact, not the final migration release.

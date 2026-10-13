@@ -19,6 +19,33 @@ function id(value) {
   return value;
 }
 
+function browserContext(browser) {
+  id(browser?.sessionId);
+  const page = browser?.page;
+  let origin;
+  try { origin = new URL(page?.origin); } catch { /* Validated below. */ }
+  if (!page || !Number.isSafeInteger(page.tabId) || page.tabId < 0
+    || !Number.isSafeInteger(page.contextVersion) || page.contextVersion < 0
+    || !origin || origin.protocol !== 'https:' || origin.origin !== page.origin
+    || page.origin.length > 2048) {
+    throw new LimovaClientError('INVALID_BROWSER_CONTEXT', 'Contexte navigateur invalide.');
+  }
+  return { tabId: page.tabId, origin: page.origin, contextVersion: page.contextVersion };
+}
+
+function browserResult(result) {
+  id(result?.turnId);
+  if (typeof result.actionId !== 'string' || !result.actionId || result.actionId.length > 256
+    || typeof result.toolCallId !== 'string' || !result.toolCallId || result.toolCallId.length > 128
+    || !Number.isSafeInteger(result.contextVersion) || result.contextVersion < 0
+    || !['completed', 'rejected', 'failed'].includes(result.status)
+    || typeof result.observation !== 'string' || result.observation.length > 32000) {
+    throw new LimovaClientError('INVALID_BROWSER_RESULT', 'Résultat navigateur invalide.');
+  }
+  return { turnId: result.turnId, actionId: result.actionId, toolCallId: result.toolCallId,
+    contextVersion: result.contextVersion, status: result.status, observation: result.observation };
+}
+
 function unwrap(payload) {
   return payload && Object.hasOwn(payload, 'data') ? payload.data : payload;
 }
@@ -47,12 +74,13 @@ export class LimovaDeepAgentClient {
     return this.#refreshPromise;
   }
 
-  async #request(path, { method = 'GET', body, workspaceId, signal, stream = false } = {}) {
+  async #request(path, { method = 'GET', body, workspaceId, signal, stream = false, browserSession } = {}) {
     if (!signal && !stream) signal = AbortSignal.timeout(30_000);
     const generation = this.#refreshGeneration;
     const headers = { Accept: stream ? 'text/event-stream' : 'application/json' };
     if (body !== undefined) headers['Content-Type'] = 'application/json';
     if (workspaceId) headers['x-workspace-id'] = id(workspaceId);
+    if (browserSession !== undefined) headers['x-extension-session'] = id(browserSession);
     const options = { method, headers, credentials: 'include', cache: 'no-store', signal,
       ...(body !== undefined ? { body: JSON.stringify(body) } : {}) };
     let response = await this.#fetch(`${LIMOVA_API_URL}${path}`, options);
@@ -112,9 +140,9 @@ export class LimovaDeepAgentClient {
     return this.#request(`/conversation?engine=deep_agents&type=general&page=${page}&limit=20`, { workspaceId: context.workspaceId, signal });
   }
 
-  async getConversation(context, conversationId, signal) {
+  async getConversation(context, conversationId, signal, browserSession) {
     await this.#assertContext(context, signal);
-    const conversation = await this.#request(`/conversation/${id(conversationId)}`, { workspaceId: context.workspaceId, signal });
+    const conversation = await this.#request(`/conversation/${id(conversationId)}`, { workspaceId: context.workspaceId, signal, browserSession });
     if (conversation?.engine !== 'deep_agents' || conversation?.mainAgent?.slug !== 'charly') {
       throw new LimovaClientError('INVALID_CONVERSATION', 'Sélectionne une conversation Deep Agent avec Charly.');
     }
@@ -127,14 +155,53 @@ export class LimovaDeepAgentClient {
     return this.#request(`/conversation/${id(conversationId)}/messages${query}`, { workspaceId: context.workspaceId, signal });
   }
 
-  async *sendMessage(context, conversationId, content, signal) {
+  async *sendMessage(context, conversationId, content, signal, browser) {
+    const page = browser === undefined ? undefined : browserContext(browser);
     await this.getConversation(context, conversationId, signal);
     if (typeof content !== 'string' || !content.trim() || content.length > 8000) {
       throw new LimovaClientError('INVALID_MESSAGE', 'Message vide ou trop long.');
     }
     const response = await this.#request(`/message/${id(conversationId)}`, {
       method: 'POST', workspaceId: context.workspaceId, signal, stream: true,
-      body: { content, clientSurface: 'chrome_extension', userTimezone: Intl.DateTimeFormat().resolvedOptions().timeZone },
+      browserSession: browser?.sessionId,
+      body: { content, clientSurface: 'chrome_extension', userTimezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
+        ...(page ? { browserContext: page } : {}) },
+    });
+    yield* readDeepAgentEvents(response.body, signal);
+  }
+
+  async getBrowserTurn(context, conversationId, browserSession, signal) {
+    const session = id(browserSession);
+    const conversation = await this.getConversation(context, conversationId, signal, session);
+    const turn = conversation.browserTurn;
+    if (turn === null || turn === undefined) return null;
+    id(turn.turnId);
+    if (!['open', 'completed', 'cancelled'].includes(turn.status)) {
+      throw new LimovaClientError('INVALID_BROWSER_TURN', 'État du tour navigateur invalide.');
+    }
+    return { turnId: turn.turnId, status: turn.status };
+  }
+
+  async *sendBrowserResult(context, conversationId, browser, result, signal) {
+    const page = browserContext(browser);
+    const receipt = browserResult(result);
+    yield* this.#continueBrowser(context, conversationId, browser.sessionId, {
+      kind: 'browser_tool_result', browserContext: page, browserResult: receipt,
+    }, signal);
+  }
+
+  async *resumeBrowserTurn(context, conversationId, browser, turnId, signal) {
+    const page = browserContext(browser);
+    yield* this.#continueBrowser(context, conversationId, browser.sessionId, {
+      kind: 'browser_resume', browserContext: page, browserTurnId: id(turnId),
+    }, signal);
+  }
+
+  async *#continueBrowser(context, conversationId, browserSession, body, signal) {
+    await this.getConversation(context, conversationId, signal);
+    const response = await this.#request(`/message/${id(conversationId)}`, {
+      method: 'POST', workspaceId: context.workspaceId, signal, stream: true, browserSession,
+      body: { ...body, clientSurface: 'chrome_extension' },
     });
     yield* readDeepAgentEvents(response.body, signal);
   }
