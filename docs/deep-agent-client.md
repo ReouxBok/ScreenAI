@@ -68,3 +68,31 @@ This foundation depends on the API browser HTTP branch. The service-worker
 session lifecycle, local action receipts and browser executor are not connected
 to these methods yet. Existing panel calls remain text-only. The generated ZIP
 is still an intermediate development artifact, not the final migration release.
+
+## Durable browser receipts
+
+`browser-journal.js` uses the extension origin's IndexedDB with strict-durability
+write transactions. The key includes account, workspace, conversation, privileged
+session, turn and action. A canonical action digest rejects changed arguments.
+An atomic claim is committed before invoking the executor; independent database
+connections cannot execute the same action twice. Completed receipts return the
+original result, including after expiration. A fresh expired action is refused.
+
+If execution throws, or a result cannot be persisted after an action, the stored
+claim stays unresolved. Retrying returns `uncertain` and does not execute again.
+The worker/UI must inspect the page and request user intervention as appropriate;
+uncertainty must not be silently converted into success or an automatic retry.
+Storage failure before a claim prevents execution altogether.
+
+`clearScope` and `clearAccount` erase the corresponding receipts and invalidate
+in-flight result writes. The caller must also revoke/rotate the browser session
+on logout/account change before accepting more actions. These lifecycle hooks
+and the real page executor are not wired yet. Authorization, current tab/origin,
+page version, permissions and cancellation must be checked immediately before
+the executor acts; journal validation does not grant browser permission.
+
+Nine Chromium tests exercise real IndexedDB transactions, reopening, concurrent
+connections, ambiguous interruption, storage failures and account cleanup.
+Nineteen boundary tests reject malformed operations and raw SDK interrupts.
+These tests use fixture executors, not real clicks on user sites or live Limova
+authentication. The journal remains inactive until the service-worker integration.
