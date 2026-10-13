@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { liveBrowserBinding, liveBrowserContinuation } from '../../../src/limova/live-browser-contract.js';
+import { liveBrowserBinding, liveBrowserContinuation, liveBrowserContextReply } from '../../../src/limova/live-browser-contract.js';
 
 const turnId = '11111111-1111-4111-8111-111111111111';
 const browserContext = { tabId: 7, origin: 'https://example.com', contextVersion: 2 };
@@ -7,6 +7,20 @@ const result = { turnId, actionId: 'action-1', toolCallId: 'tool-1', contextVers
 const request = { turnId, kind: 'browser_tool_result', browserContext, browserResult: result };
 
 describe('live browser wire contract', () => {
+  it('copies only the correlated page response fields', () => {
+    const reply = liveBrowserContextReply({ turnId, requestId: turnId, browserContext });
+    expect(reply).toEqual({ turnId, requestId: turnId, browserContext });
+    expect(reply.browserContext).not.toBe(browserContext);
+  });
+
+  it.each([
+    { requestId: 'invalid' }, { turnId: 'invalid' }, { agentId: turnId },
+    { browserContext: { ...browserContext, origin: 'http://example.com' } },
+    { browserContext: { ...browserContext, content: 'not a page binding' } },
+  ])('rejects unsafe or unrelated page response fields: %j', changes => {
+    expect(() => liveBrowserContextReply({ turnId, requestId: turnId, browserContext, ...changes })).toThrow(TypeError);
+  });
+
   it('snapshots the binding and continuation without sharing caller mutations', () => {
     const binding = liveBrowserBinding(turnId, browserContext);
     expect(binding).toEqual({ browserSession: turnId, browserContext });

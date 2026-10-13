@@ -34,3 +34,10 @@ export function liveBrowserContinuation(value) {
     || (result.pageContext !== undefined && !validLiveBrowserPage(result.pageContext))) throw new TypeError('Invalid live browser result');
   return { ...payload, browserResult: structuredClone(result) };
 }
+
+export function liveBrowserContextReply(value) {
+  if (!keys(value, ['turnId', 'requestId', 'browserContext']) || !liveUuid(value.turnId)
+    || !liveUuid(value.requestId) || !validLiveBrowserPage(value.browserContext))
+    throw new TypeError('Invalid live browser context response');
+  return { turnId: value.turnId, requestId: value.requestId, browserContext: { ...value.browserContext } };
+}

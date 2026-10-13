@@ -1,10 +1,10 @@
-import { liveBrowserBinding, liveBrowserContinuation, liveUuid } from './live-browser-contract.js';
+import { liveBrowserBinding, liveBrowserContinuation, liveBrowserContextReply, liveUuid } from './live-browser-contract.js';
 import { LIMOVA_API_URL } from './environment.js';
 
 export const LIVE_PORT = 'limova-app-live-v1';
 const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const events = [
-  'session.ready', 'input.transcript.delta', 'input.transcript.final',
+  'turn.browser_context_requested', 'session.ready', 'input.transcript.delta', 'input.transcript.final',
   'assistant.transcript.delta', 'assistant.transcript.final', 'assistant.audio.delta',
   'assistant.status', 'turn.interrupted', 'turn.deep_agent_stream.started',
   'turn.deep_agent_stream.delta', 'turn.deep_agent_stream.completed',
@@ -16,7 +16,7 @@ const binaryFields = { 'assistant.audio.delta': 'audio', 'turn.deep_agent_stream
 export function attachLimovaLiveBridge(runtime, io) {
   runtime.onConnect.addListener(port => {
     if (port.name !== LIVE_PORT || port.sender?.id !== runtime.id) return;
-    let socket, request, ready, timer, ackTimer, browserBinding, voiceTurnId;
+    let socket, request, ready, timer, ackTimer, browserBinding, voiceTurnId, contextRequest;
     let browserCommands = 0;
     let closed = false;
     let started = false;
@@ -64,12 +64,18 @@ export function attachLimovaLiveBridge(runtime, io) {
           ready = value;
           clearTimeout(timer);
         } else if (event !== 'error' && (!ready || value.sessionId !== ready.sessionId)) throw new Error();
+        if (event === 'turn.browser_context_requested') {
+          if (!browserBinding.browserSession || voiceTurnId || contextRequest
+            || !liveUuid(value.turnId) || !liveUuid(value.requestId)) throw new Error();
+          contextRequest = { turnId: value.turnId, requestId: value.requestId };
+        }
         if (event === 'turn.deep_agent_stream.started') {
           if (!liveUuid(value.turnId) || voiceTurnId) throw new Error();
           voiceTurnId = value.turnId; browserCommands = 0;
         }
         if (['turn.deep_agent_stream.completed', 'turn.deep_agent_stream.interrupted', 'turn.deep_agent_stream.failed', 'turn.interrupted'].includes(event)) {
           if (value.turnId === voiceTurnId) voiceTurnId = undefined;
+          if (value.turnId === contextRequest?.turnId) contextRequest = undefined;
         }
         const payload = { ...value };
         const binary = binaryFields[event];
@@ -132,6 +138,13 @@ export function attachLimovaLiveBridge(runtime, io) {
           if (windowBytes > 64_000) throw new Error();
           if (socket.sendBuffer.length || socket.io.engine.writeBuffer.length > 8) throw new Error();
           socket.emit('audio.append', { audio: Uint8Array.from(bytes), sequence: audioSequence++ });
+        } else if (message?.kind === 'browser_context') {
+          const reply = liveBrowserContextReply(message.payload);
+          if (!browserBinding.browserSession || !contextRequest || reply.turnId !== contextRequest.turnId
+            || reply.requestId !== contextRequest.requestId || socket.sendBuffer.length
+            || socket.io.engine.writeBuffer.length > 8) throw new Error();
+          contextRequest = undefined;
+          socket.emit('turn.browser_context', { sessionId: ready.sessionId, ...reply });
         } else if (message?.kind === 'browser_continue') {
           const continuation = liveBrowserContinuation(message.payload);
           if (!browserBinding.browserSession || continuation.turnId !== voiceTurnId || ++browserCommands > 100
@@ -139,7 +152,7 @@ export function attachLimovaLiveBridge(runtime, io) {
           socket.emit('turn.browser_continue', { sessionId: ready.sessionId, ...continuation });
         } else if (message?.kind === 'cancel' && Number.isFinite(message.playedAudioMs)
           && message.playedAudioMs >= 0 && message.playedAudioMs <= 30 * 60 * 1_000) {
-          voiceTurnId = undefined;
+          voiceTurnId = undefined; contextRequest = undefined;
           socket.emit('response.cancel', { playedAudioMs: message.playedAudioMs });
         } else throw new Error();
       } catch { close(true); }
