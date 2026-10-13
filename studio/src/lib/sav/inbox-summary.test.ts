@@ -40,6 +40,29 @@ describe("SAV-53 inbox presentation", () => {
     expect(buildSavInboxSummary(source).nextAction).toContain("prise en charge humaine");
   });
 
+  it.each([
+    ["succeeded", "Déjà transféré à Nathan."],
+    ["uncertain", "Résultat du transfert à Nathan incertain. Vérifier l’envoi dans Gmail avant toute reprise."],
+    ["pending", "Transfert à Nathan en attente. Vérifier son résultat dans le dossier."],
+    ["failed", "Transfert à Nathan non confirmé. Vérifier le dossier avant de préparer un nouvel aperçu."],
+  ] as const)("uses the current transfer journal in state %s", (partnershipTransferStatus, expected) => {
+    const source = input(); source.proposal.understanding.requests[0].nature = "partnership";
+    expect(buildSavInboxSummary({ ...source, partnershipTransferStatus }).nextAction).toBe(expected);
+  });
+
+  it.each(["succeeded", "uncertain", "pending", "failed"] as const)("keeps a secondary financial request after transfer state %s", partnershipTransferStatus => {
+    const source = input(); source.proposal.understanding.requests[0].nature = "partnership";
+    source.proposal.understanding.requests.push({ ...source.proposal.understanding.requests[0], id: "refund", nature: "financial_operation", financialScope: "support_account", summary: "Demande aussi un remboursement." });
+    const summary = buildSavInboxSummary({ ...source, partnershipTransferStatus });
+    expect(summary.problem).toContain("remboursement"); expect(summary.nextAction).toContain("Nathan");
+    expect(summary.nextAction).toContain("prise en charge humaine");
+  });
+
+  it("keeps a secondary support action after a successful transfer", () => {
+    const source = input(); source.proposal.understanding.requests.push({ ...source.proposal.understanding.requests[0], id: "partner", nature: "partnership", summary: "Propose aussi un partenariat." });
+    expect(buildSavInboxSummary({ ...source, partnershipTransferStatus: "succeeded" }).nextAction).toBe("Valider le dossier puis ouvrir le ticket proposé. Déjà transféré à Nathan.");
+  });
+
   it("retains a reliable understanding when composition is degraded", () => {
     const result = buildSavInboxSummary({ ...input(), analysisErrorCode: "SAV_REPLY_COHERENCE_REJECTED" });
     expect(result.problem).toBe("L’agent téléphone cesse de répondre."); expect(result.nextAction).toContain("vérifier la proposition");

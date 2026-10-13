@@ -25,7 +25,7 @@ import { savPrimaryAnalysisDiagnostic } from "./analysis-errors";
 import { collectSavDossierContext, type SavDossierContext } from "./dossier-context";
 import { assertSavActor } from "./access";
 import { savStructuredProposalSchema, type SavProposalRouting, type SavStructuredProposal } from "./proposal";
-import { buildSavInboxSummary } from "./inbox-summary";
+import { buildSavInboxSummary, type SavInboxPartnershipStatus } from "./inbox-summary";
 import { savReviewMatchesProposal } from "./review-contract";
 import { redactSavLearningText } from "./learning-extraction";
 import { invalidateSavReplies } from "./invalidation";
@@ -645,6 +645,18 @@ export async function listSavInbox(limit = 100, options: { offset?: number; quer
     : options.view === "pending" ? eq(savMessages.analysisStatus, "done") : undefined;
   const readBatch = (offset: number) => db.select({
     _review: savProposalReviews, _proposal: savAgentRuns.proposalCiphertext, _body: savMessages.bodyCiphertext, _runId: savAgentRuns.id,
+    // Scalar journal read keeps pagination stable and excludes customer replies
+    // and transfers of another email in the same conversation.
+    _partnershipStatus: sql<SavInboxPartnershipStatus | null>`(select case
+      when ${savActions.status} = 'succeeded' then 'succeeded'
+      when ${savActions.payload}->>'forwardDispatchedAt' is not null then 'uncertain'
+      when ${savActions.status} in ('pending', 'running') then 'pending'
+      else 'failed' end
+      from ${savActions} where ${savActions.messageId} = ${savMessages.id}
+        and ${savActions.threadId} = ${savThreads.id}
+        and ${savActions.kind} = 'send_reply' and ${savActions.actorType} = 'human'
+        and ${savActions.payload}->>'purpose' = 'partnership_forward'
+      order by ${savActions.updatedAt} desc, ${savActions.id} desc limit 1)`,
     messageId: savMessages.id,
     threadId: savThreads.id,
     receivedAt: savMessages.receivedAt,
@@ -680,7 +692,7 @@ export async function listSavInbox(limit = 100, options: { offset?: number; quer
     .orderBy(desc(savMessages.receivedAt), desc(savMessages.id))
     .limit(250).offset(offset);
   const normalize = (row: Awaited<ReturnType<typeof readBatch>>[number]) => {
-    const { _review: review, _proposal: ciphertext, _body: bodyCiphertext, _runId: runId, ...entry } = row;
+    const { _review: review, _proposal: ciphertext, _body: bodyCiphertext, _runId: runId, _partnershipStatus: partnershipTransferStatus, ...entry } = row;
     let matches = false;
     let originalProposal: SavStructuredProposal | null = null;
     let proposal: SavStructuredProposal | null = null;
@@ -697,7 +709,7 @@ export async function listSavInbox(limit = 100, options: { offset?: number; quer
     const reviewStatus = matches ? entry.reviewStatus : null;
     return { ...entry, reviewId: matches ? entry.reviewId : null, reviewStatus,
       summary: buildSavInboxSummary({ subject: entry.subject, analysisStatus: entry.analysisStatus, analysisErrorCode: entry.analysisErrorCode,
-        hubspotTicketId: entry.hubspotTicketId, proposal, originalProposal, reviewStatus }) };
+        hubspotTicketId: entry.hubspotTicketId, proposal, originalProposal, reviewStatus, partnershipTransferStatus }) };
   };
   const pageSize = Math.min(250, Math.max(1, limit));
   const offset = Math.max(0, Math.min(100_000, options.offset ?? 0));

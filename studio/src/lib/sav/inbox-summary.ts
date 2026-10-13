@@ -1,5 +1,7 @@
 import type { SavStructuredProposal } from "./proposal";
 
+export type SavInboxPartnershipStatus = "succeeded" | "uncertain" | "pending" | "failed";
+
 type InboxSummaryInput = {
   subject: string;
   analysisStatus: string;
@@ -8,6 +10,7 @@ type InboxSummaryInput = {
   originalProposal: SavStructuredProposal | null;
   reviewStatus: string | null;
   hubspotTicketId: string | null;
+  partnershipTransferStatus?: SavInboxPartnershipStatus | null;
 };
 
 const cleanText = (value: string) => value.replace(/\s+/g, " ").trim();
@@ -26,7 +29,14 @@ const requestThemes: Record<string, string> = {
   non_support: "Sollicitation externe",
 };
 
-function nextAction(input: InboxSummaryInput) {
+const partnershipDeliveryLabels: Record<SavInboxPartnershipStatus, string> = {
+  succeeded: "Déjà transféré à Nathan.",
+  uncertain: "Résultat du transfert à Nathan incertain. Vérifier l’envoi dans Gmail avant toute reprise.",
+  pending: "Transfert à Nathan en attente. Vérifier son résultat dans le dossier.",
+  failed: "Transfert à Nathan non confirmé. Vérifier le dossier avant de préparer un nouvel aperçu.",
+};
+
+function suggestedNextAction(input: InboxSummaryInput) {
   const p = input.proposal;
   if (!p) return input.analysisStatus === "pending" || input.analysisStatus === "processing"
     ? "Consulter le message ; l’analyse est en attente."
@@ -39,7 +49,11 @@ function nextAction(input: InboxSummaryInput) {
     || p.understanding?.requests.some(request => ["cancellation", "financial_operation", "financial_data", "legal"].includes(request.nature))) {
     return input.reviewStatus === "approved" ? "Faire traiter la demande par l’équipe humaine." : "Valider le dossier pour une prise en charge humaine.";
   }
-  if (p.understanding?.status === "qualified" && p.understanding.requests.some(request => request.nature === "partnership")) return "Relire la demande de partenariat et préparer le transfert à Nathan.";
+  if (p.understanding?.status === "qualified" && p.understanding.requests.some(request => request.nature === "partnership")) {
+    if (!input.partnershipTransferStatus) return "Relire la demande de partenariat et préparer le transfert à Nathan.";
+    // A confirmed transfer does not settle another support or financial request.
+    if (p.understanding.requests.every(request => ["partnership", "acknowledgement"].includes(request.nature))) return "";
+  }
   if (input.analysisErrorCode && input.reviewStatus !== "approved") return "Relire la demande et vérifier la proposition avant toute action.";
   if (input.hubspotTicketId) return `Consulter le ticket lié #${input.hubspotTicketId} et vérifier la suite à donner.`;
   if (p.routing.kind === "matched") {
@@ -51,6 +65,13 @@ function nextAction(input: InboxSummaryInput) {
   if (p.routing.kind === "review") return "Vérifier le client et le ticket à utiliser.";
   if (p.replyDraft?.trim()) return "Relire le brouillon avant un éventuel envoi.";
   return "Examiner la demande et décider de la suite à donner.";
+}
+
+function nextAction(input: InboxSummaryInput) {
+  const delivery = input.partnershipTransferStatus ? partnershipDeliveryLabels[input.partnershipTransferStatus] : "";
+  // Keep the outstanding request first in the compact inbox, particularly a
+  // financial/cancellation handoff that the internal transfer does not resolve.
+  return [suggestedNextAction(input), delivery].filter(Boolean).join(" ");
 }
 
 /** Uses the current, already recorded understanding. No generation or write. */

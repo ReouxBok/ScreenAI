@@ -3,7 +3,7 @@ import { eq } from "drizzle-orm";
 import { createSavTestDb } from "../../../test/sav-db";
 import { v0Proposal } from "../../../test/sav-v0-review-fixture";
 import { understandingFixture } from "../../../test/sav-understanding-fixtures";
-import { savAgentRuns, savDecisions, savMailboxes, savMessages, savProposalReviews, savThreads } from "@/db/schema";
+import { savActions, savAgentRuns, savDecisions, savMailboxes, savMessages, savProposalReviews, savThreads } from "@/db/schema";
 import { activateSavV0Cutover } from "./cutover";
 import { encryptSavPayload } from "./crypto";
 import { getSavProposalReview, reviewSavProposal } from "./review";
@@ -82,4 +82,49 @@ it("separates a degraded composition diagnostic from the understood problem", as
   expect(row.analysisErrorCode).toBe("SAV_REPLY_COHERENCE_REJECTED");
   expect(row.summary.problem).toBe("L’agent téléphone cesse de répondre.");
   expect(row.summary.nextAction).toContain("vérifier la proposition");
+});
+
+async function partnershipProposal() {
+  proposal.understanding.requests[0].nature = "partnership";
+  proposal.understanding.requests[0].summary = "Propose un partenariat fictif.";
+  await fixture.db.update(savAgentRuns).set({ proposalCiphertext: encryptSavPayload(proposal) }).where(eq(savAgentRuns.id, runId));
+}
+
+it.each([
+  ["succeeded", true, "Déjà transféré à Nathan."],
+  ["failed", true, "Résultat du transfert à Nathan incertain."],
+  ["running", true, "Résultat du transfert à Nathan incertain."],
+  ["pending", false, "Transfert à Nathan en attente."],
+  ["running", false, "Transfert à Nathan en attente."],
+  ["failed", false, "Transfert à Nathan non confirmé."],
+  ["cancelled", false, "Transfert à Nathan non confirmé."],
+] as const)("reads transfer journal %s / dispatched=%s without duplicating inbox rows", async (status, dispatched, expected) => {
+  await partnershipProposal();
+  await fixture.db.insert(savActions).values({ threadId, messageId, decisionId, kind: "send_reply", actorType: "human", actorEmail: "ugo@limova.ai", status,
+    idempotencyKey: `gmail:partnership-forward:${messageId}`, payload: { purpose: "partnership_forward", ...(dispatched ? { forwardDispatchedAt: new Date().toISOString() } : {}) } });
+  const rows = await listSavInbox(10);
+  expect(rows).toHaveLength(1); expect(rows[0].summary.nextAction).toContain(expected);
+  expect(rows[0].summary.nextAction).not.toContain("Relire la demande de partenariat et préparer");
+});
+
+it("does not confuse a customer reply or a prior email transfer with the current request", async () => {
+  await partnershipProposal();
+  const [current] = await fixture.db.select().from(savMessages).where(eq(savMessages.id, messageId));
+  const [old] = await fixture.db.insert(savMessages).values({ threadId, mailboxId: current.mailboxId, gmailMessageId: "older-partnership-message", direction: "inbound", fromEmail: current.fromEmail, subject: current.subject, bodyCiphertext: current.bodyCiphertext, receivedAt: new Date("2026-10-12T10:00:00Z") }).returning();
+  await fixture.db.insert(savActions).values([
+    { threadId, messageId: old.id, kind: "send_reply", actorType: "human", actorEmail: "ugo@limova.ai", status: "succeeded", idempotencyKey: `gmail:partnership-forward:${old.id}`, payload: { purpose: "partnership_forward", forwardDispatchedAt: new Date().toISOString() } },
+    { threadId, messageId, decisionId, kind: "send_reply", actorType: "human", actorEmail: "ugo@limova.ai", status: "succeeded", idempotencyKey: `gmail:manual-reply:${messageId}`, payload: { manualReplyConfirmed: true, replySendDispatchedAt: new Date().toISOString() } },
+  ]);
+  const row = (await listSavInbox(10)).find(row => row.messageId === messageId)!;
+  expect(row.summary.nextAction).toBe("Relire la demande de partenariat et préparer le transfert à Nathan.");
+});
+
+it("keeps a financial request actionable after the partnership journal confirms delivery", async () => {
+  await partnershipProposal();
+  proposal.understanding.requests.push({ ...proposal.understanding.requests[0], id: "finance", nature: "financial_data", financialScope: "support_account", summary: "Demande aussi sa facture." });
+  await fixture.db.update(savAgentRuns).set({ proposalCiphertext: encryptSavPayload(proposal) }).where(eq(savAgentRuns.id, runId));
+  await fixture.db.insert(savActions).values({ threadId, messageId, decisionId, kind: "send_reply", actorType: "human", actorEmail: "ugo@limova.ai", status: "succeeded", idempotencyKey: `gmail:partnership-forward:${messageId}`, payload: { purpose: "partnership_forward" } });
+  const [row] = await listSavInbox(10);
+  expect(row.summary.problem).toContain("sa facture");
+  expect(row.summary.nextAction).toBe("Valider le dossier pour une prise en charge humaine. Déjà transféré à Nathan.");
 });
