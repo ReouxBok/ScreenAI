@@ -1,5 +1,5 @@
 import "server-only";
-import { and, desc, eq } from "drizzle-orm";
+import { and, count, desc, eq, sql } from "drizzle-orm";
 import { requireDb } from "@/db";
 import { auditLogs, contentItems, contentVersions, knowledgeFamilies, knowledgeFamilyRevisions, knowledgeFamilySources, knowledgeProjectionCandidates, knowledgeProjections, savLearningCandidates, savResolutionEvidence } from "@/db/schema";
 import { parseContentInput, articleMetadataSchema, onboardingMetadataSchema, type ContentInput } from "@/lib/content";
@@ -115,4 +115,23 @@ export async function listKnowledgeProjectionCandidates(limit = 100) {
     .innerJoin(knowledgeFamilySources, eq(knowledgeFamilySources.id, knowledgeProjectionCandidates.sourceId))
     .orderBy(desc(knowledgeProjectionCandidates.createdAt)).limit(Math.max(1, Math.min(250, limit)));
   return rows.map((row) => ({ ...row, canonicalKey: row.family.canonicalKey }));
+}
+
+/** Stable bounded pages; total and filters cover the entire candidate catalogue. */
+export async function paginateKnowledgeCandidates(input: { page?: number; pageSize?: number; status?: string; source?: string } = {}) {
+  const db = requireDb();
+  const pageSize = Math.max(1, Math.min(50, Math.floor(input.pageSize ?? 20) || 20));
+  const states = ["pending", "needs_completion", "needs_recording", "not_applicable", "approved", "rejected"];
+  const filter = and(input.status && states.includes(input.status) ? eq(knowledgeProjectionCandidates.status, input.status) : undefined,
+    input.source === "onboarding" ? and(eq(knowledgeProjectionCandidates.targetSurface, "sav"), sql`coalesce(${knowledgeFamilySources.evidence}->>'importKind','') <> 'hubspot'`) :
+      input.source === "hubspot" ? sql`${knowledgeFamilySources.evidence}->>'importKind' = 'hubspot'` :
+        input.source === "sav" ? eq(knowledgeProjectionCandidates.targetSurface, "onboarding") : undefined);
+  const [{ total }] = await db.select({ total: count() }).from(knowledgeProjectionCandidates).innerJoin(knowledgeFamilySources, eq(knowledgeFamilySources.id, knowledgeProjectionCandidates.sourceId)).where(filter);
+  const page = Math.max(1, Math.min(Math.ceil(total / pageSize) || 1, Math.floor(input.page ?? 1) || 1));
+  const rows = await db.select({ candidate: knowledgeProjectionCandidates, family: knowledgeFamilies, revision: knowledgeFamilyRevisions, source: knowledgeFamilySources })
+    .from(knowledgeProjectionCandidates).innerJoin(knowledgeFamilies, eq(knowledgeFamilies.id, knowledgeProjectionCandidates.familyId))
+    .innerJoin(knowledgeFamilyRevisions, eq(knowledgeFamilyRevisions.id, knowledgeProjectionCandidates.revisionId))
+    .innerJoin(knowledgeFamilySources, eq(knowledgeFamilySources.id, knowledgeProjectionCandidates.sourceId)).where(filter)
+    .orderBy(desc(knowledgeProjectionCandidates.createdAt), desc(knowledgeProjectionCandidates.id)).limit(pageSize).offset((page - 1) * pageSize);
+  return { rows: rows.map((row) => ({ ...row, canonicalKey: row.family.canonicalKey })), total, page, pageSize };
 }

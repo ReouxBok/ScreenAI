@@ -17,7 +17,7 @@ export async function knowledgeComparisonInventory(db: DbReader = requireDb()): 
   const articles = await db.select({ item: contentItems, version: contentVersions }).from(contentItems)
     .innerJoin(contentVersions, and(eq(contentVersions.itemId, contentItems.id), or(eq(contentVersions.id, contentItems.currentDraftVersionId), eq(contentVersions.id, contentItems.publishedVersionId))))
     .where(and(eq(contentItems.type, "article"), ne(contentItems.status, "archived")));
-  const candidates = await db.select().from(knowledgeProjectionCandidates).where(and(eq(knowledgeProjectionCandidates.targetSurface, "sav"), eq(knowledgeProjectionCandidates.status, "pending")));
+  const candidates = await db.select().from(knowledgeProjectionCandidates).where(and(eq(knowledgeProjectionCandidates.targetSurface, "sav"), or(eq(knowledgeProjectionCandidates.status, "pending"), eq(knowledgeProjectionCandidates.status, "needs_completion"))));
   return [...articles.map(({ item, version }) => ({ ref: `content:${item.id}`, versionId: version.id, title: item.title, body: version.bodyMarkdown, agentKey: item.agentKey })),
     ...candidates.map((candidate) => {
       const input = parseContentInput(candidate.proposedInput);

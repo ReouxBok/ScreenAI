@@ -26,7 +26,7 @@ import { assertKnowledgeUgoApproval } from "@/lib/knowledge/contracts";
 import { requireDb } from "@/db";
 import { knowledgeProjectionCandidates } from "@/db/schema";
 import { eq } from "drizzle-orm";
-import { proposeSavFromOnboarding } from "@/lib/knowledge/candidates";
+import { proposeActiveOnboardingKnowledge } from "@/lib/knowledge/onboarding-import";
 import { reviewSavProposal } from "@/lib/sav/review";
 import { queueSavManualTicket } from "@/lib/sav/manual-tickets";
 import { retrySavAnalysis, repairSavProposal } from "@/lib/sav/service";
@@ -358,7 +358,7 @@ export async function reviewKnowledgeAction(form: FormData) {
 export async function importOnboardingKnowledgeAction(form: FormData) {
   const staff = await requireApiStaff("admin");
   let errorCode = "";
-  try { await proposeSavFromOnboarding(id(form, "itemId"), id(form, "versionId"), staff.email); }
+  try { await proposeActiveOnboardingKnowledge(id(form, "itemId"), id(form, "versionId"), staff.email); }
   catch (error) { errorCode = error instanceof Error && /^[A-Z][A-Z_]+$/.test(error.message) ? error.message : "KNOWLEDGE_IMPORT_FAILED"; }
   revalidatePath("/studio/sav/connaissances");
   redirect(`/studio/sav/connaissances?result=${errorCode || "candidate_ready"}`);

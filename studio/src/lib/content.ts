@@ -29,7 +29,7 @@ export const articleMetadataSchema = z.object({
     audience: z.enum(["support", "lead"]).optional(),
     responseTemplate: z.string().trim().min(20).max(8000).optional(),
     symptoms: stringList,
-    steps: stringList,
+    steps: z.array(z.string().trim().min(1).max(2_000)).max(50).default([]),
     exceptions: stringList,
     escalation: z.string().trim().min(3).max(5_000),
     productVersion: z.string().trim().max(100).default(""),

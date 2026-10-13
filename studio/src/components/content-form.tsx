@@ -11,6 +11,8 @@ export function ContentForm({ defaults }: { defaults: Defaults }) {
   const type = defaults.type ?? "article";
   const resolution = (meta.resolution ?? {}) as Record<string, unknown>;
   const source = ((meta.sourceMetadata as Record<string, unknown> | undefined)?.editorialSource ?? {}) as Record<string, unknown>;
+  const tutorialSource = meta.sourceMetadata as Record<string, unknown> | undefined;
+  const fromTutorial = tutorialSource?.importKind === "onboarding_catalog";
   return <form id="content-editor-form" action={saveContentAction}>
     <input type="hidden" name="itemId" value={defaults.id ?? ""}/>
     <input type="hidden" name="type" value={type}/>
@@ -18,9 +20,9 @@ export function ContentForm({ defaults }: { defaults: Defaults }) {
     {type === "onboarding" && <><input type="hidden" name="branches" value={JSON.stringify(meta.branches ?? [])}/><input type="hidden" name="actionSteps" value={JSON.stringify(meta.actionSteps ?? [])}/></>}
     <div className="form-grid">
       <div className="field"><label htmlFor="type">Type</label><select id="type" defaultValue={type} disabled><option value="article">Article</option><option value="onboarding">Parcours d’onboarding</option></select></div>
-      <div className="field"><label htmlFor="agentKey">Agent concerné</label><select id="agentKey" name="agentKey" defaultValue={defaults.agentKey ?? "charly"}>{AGENTS.map(agent=><option key={agent.key} value={agent.key}>{agent.name} · {agent.role}</option>)}</select></div>
+      <div className="field"><label htmlFor="agentKey">Agent concerné</label><select id="agentKey" name="agentKey" disabled={fromTutorial} defaultValue={fromTutorial ? "sav" : defaults.agentKey ?? "charly"}>{AGENTS.map(agent=><option key={agent.key} value={agent.key}>{agent.name} · {agent.role}</option>)}</select>{fromTutorial && <input type="hidden" name="agentKey" value="sav"/>}</div>
     </div>
-    <div className="field"><label htmlFor="title">Titre</label><input id="title" name="title" required defaultValue={defaults.title}/></div>
+    <div className="field"><label htmlFor="title">Titre</label><input id="title" name="title" required readOnly={fromTutorial} defaultValue={fromTutorial ? String(tutorialSource?.sourceTitle ?? defaults.title ?? "") : defaults.title}/>{fromTutorial && <p>Le titre reste celui du tutoriel source. Cette connaissance est réservée au SAV.</p>}</div>
     <div className="form-grid">
       <div className="field"><label htmlFor="slug">Slug stable</label><input id="slug" name="slug" required pattern="[a-z0-9]+(?:-[a-z0-9]+)*" readOnly={Boolean(defaults.id)} defaultValue={defaults.slug}/></div>
       <div className="field"><label htmlFor="category">Catégorie</label><select id="category" name="categorySlug" defaultValue={defaults.categorySlug ?? CATEGORIES[0][0]}>{CATEGORIES.map(([slug,label]) => <option key={slug} value={slug}>{label}</option>)}</select></div>
