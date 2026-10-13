@@ -4,6 +4,52 @@ export function browserDocumentCommand(request) {
     let version;
     const documentId = crypto.randomUUID();
     let elements = new Map();
+    let captureRevision = 0;
+    let captureObserver;
+    const observedCaptureRoots = new WeakSet();
+    const screenshotGeometry = () => {
+      if (!captureObserver) {
+        const changed = () => { captureRevision++; };
+        captureObserver = new MutationObserver(changed);
+        for (const event of ['scroll', 'resize', 'input', 'change']) addEventListener(event, changed, true);
+      }
+      if (captureObserver.takeRecords().length) captureRevision++;
+      if (visualViewport && (visualViewport.scale !== 1 || visualViewport.offsetLeft !== 0 || visualViewport.offsetTop !== 0)) throw new Error('Pinch zoom is not supported for capture');
+      const masks = [];
+      const roots = [{ root: document, privateRoot: false }];
+      let count = 0;
+      for (const { root, privateRoot } of roots) {
+        if (!observedCaptureRoots.has(root)) {
+          captureObserver.observe(root, { subtree: true, childList: true, attributes: true, characterData: true });
+          observedCaptureRoots.add(root);
+        }
+        if (root.getAnimations().some(animation => animation.playState === 'running' || animation.pending)) throw new Error('Page is animating');
+        for (const element of root.querySelectorAll('*')) {
+          if (++count > 20000) throw new Error('Page is too complex for capture');
+          const privateRegion = privateRoot || Boolean(element.closest('[data-private],[data-sensitive],[data-limova-private]'));
+          const replaced = element.matches('input,textarea,select,iframe,object,embed,canvas,video');
+          if (element instanceof HTMLElement && !replaced) {
+            if (!chrome.dom?.openOrClosedShadowRoot) throw new Error('Shadow inspection unavailable');
+            const shadow = chrome.dom.openOrClosedShadowRoot(element);
+            if (shadow) roots.push({ root: shadow, privateRoot: privateRegion });
+          }
+          if (!privateRegion && !replaced && !element.matches('[contenteditable]')) continue;
+          const rectangles = [element.getBoundingClientRect()];
+          if (privateRegion) {
+            const range = document.createRange();
+            range.selectNodeContents(element);
+            rectangles.push(range.getBoundingClientRect());
+          }
+          for (const rect of rectangles) {
+            if (rect.width <= 0 || rect.height <= 0 || rect.bottom <= 0 || rect.right <= 0 || rect.left >= innerWidth || rect.top >= innerHeight) continue;
+            const left = Math.max(0, rect.left - 8), top = Math.max(0, rect.top - 8);
+            masks.push({ left, top, width: Math.min(innerWidth, rect.right + 8) - left, height: Math.min(innerHeight, rect.bottom + 8) - top });
+            if (masks.length > 1000) throw new Error('Too many private regions for capture');
+          }
+        }
+      }
+      return { viewportWidth: innerWidth, viewportHeight: innerHeight, scrollX, scrollY, revision: captureRevision, masks };
+    };
     const binding = () => ({ documentId, origin: location.origin, contextVersion: version });
     const visible = element => {
       const rect = element.getBoundingClientRect();
@@ -43,6 +89,10 @@ export function browserDocumentCommand(request) {
       }
       if (version === undefined || input.documentId !== documentId || input.contextVersion !== version) return rejected('Document changed');
       if (input.operation === 'inspect') return { status: 'completed', binding: binding() };
+      if (input.operation === 'screenshot_geometry') {
+        try { return { status: 'completed', geometry: screenshotGeometry(), binding: binding() }; }
+        catch { return rejected('Page is not stable or cannot be masked safely'); }
+      }
       if (!Number.isSafeInteger(input.nextContextVersion) || input.nextContextVersion <= version) return rejected('Invalid next context version');
       if (input.operation === 'navigate') {
         let destination;

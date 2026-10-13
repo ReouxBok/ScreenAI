@@ -79,7 +79,7 @@ export class LimovaDeepAgentClient {
     return this.#refreshPromise;
   }
 
-  async #request(path, { method = 'GET', body, workspaceId, signal, stream = false, browserSession } = {}) {
+  async #request(path, { method = 'GET', body, workspaceId, signal, stream = false, browserSession, expectedContext } = {}) {
     if (!signal && !stream) signal = AbortSignal.timeout(30_000);
     const generation = this.#refreshGeneration;
     const headers = { Accept: stream ? 'text/event-stream' : 'application/json' };
@@ -93,6 +93,7 @@ export class LimovaDeepAgentClient {
     if (response.status === 401) {
       if (generation === this.#refreshGeneration) await this.#refresh();
       signal?.throwIfAborted();
+      if (expectedContext) await this.#assertContext(expectedContext, signal);
       response = await this.#fetch(`${LIMOVA_API_URL}${path}`, options);
     }
     if (!response.ok) {
@@ -170,7 +171,7 @@ export class LimovaDeepAgentClient {
     const body = new FormData();
     body.append('file', image, image.type === 'image/png' ? 'browser-screenshot.png' : 'browser-screenshot.jpg');
     const file = await this.#request('/files?isTemporary=true&useAsDefaultContext=false', {
-      method: 'POST', body, workspaceId: context.workspaceId, signal,
+      method: 'POST', body, workspaceId: context.workspaceId, signal, expectedContext: { ...context },
     });
     return { fileId: id(file?.id) };
   }

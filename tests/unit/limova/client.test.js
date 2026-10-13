@@ -80,6 +80,21 @@ describe('Limova Deep Agent client', () => {
     expect(requests[1][1].body.get('file').name).toBe('browser-screenshot.jpg');
   });
 
+  it('does not resend an upload if cookie refresh switched the account', async () => {
+    const { client, fetch } = harness();
+    const original = fetch.getMockImplementation();
+    let switched = false;
+    fetch.mockImplementation(async (url, options) => {
+      if (url.endsWith('/auth/refresh-token')) { switched = true; return new Response(null, { status: 200 }); }
+      if (switched && url.endsWith('/users/me')) return json({ id: AGENT });
+      if (url.includes('/files?')) return new Response(null, { status: 401 });
+      return original(url, options);
+    });
+    await expect(client.uploadBrowserScreenshot(CONTEXT, CONVERSATION,
+      new Blob(['fixture'], { type: 'image/png' }))).rejects.toMatchObject({ code: 'LIMOVA_ACCOUNT_CHANGED' });
+    expect(fetch.mock.calls.filter(([url]) => url.includes('/files?'))).toHaveLength(1);
+  });
+
   it('does not replay an upload after an ambiguous network failure', async () => {
     const { client, fetch } = harness();
     const original = fetch.getMockImplementation();

@@ -177,3 +177,20 @@ it('requires fresh browser authorization before resume', async () => {
   await expect(h.background.handle({ type: 'LIMOVA_RESUME_BROWSER' })).rejects.toThrow('Autorise le navigateur');
   expect(h.client.sendMessage).not.toHaveBeenCalled();
 });
+
+
+it('binds screenshot uploads to the active account and conversation', async () => {
+  const image = new Blob(['masked'], { type: 'image/png' });
+  const target = { tabId: 1, origin: 'https://example.com', contextVersion: 1 };
+  const h = harness({ createDriver: ({ uploadScreenshot }) => ({
+    readPage: async signal => { await uploadScreenshot(image, signal); return target; },
+    authorize: vi.fn(), execute: vi.fn(),
+  }) });
+  h.client.uploadBrowserScreenshot = vi.fn(async () => ({ fileId: 'image' }));
+  h.client.sendMessage.mockImplementation(async function* () {
+    yield { event: 'custom', data: { type: 'extension.turn_state', turnId: 'backend-turn', state: 'completed' } };
+  });
+  await open(h.background);
+  await h.background.handle({ type: 'LIMOVA_SEND_MESSAGE', text: 'Observe', browser: true });
+  expect(h.client.uploadBrowserScreenshot).toHaveBeenCalledWith({ userId: 'user-1', workspaceId: 'workspace-1' }, 'conversation-1', image, expect.any(AbortSignal));
+});

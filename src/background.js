@@ -36,7 +36,7 @@ const VISUAL_CAPTURE_JPEG_QUALITY = 55;
 const DEFAULT_LANG = (chrome.i18n.getUILanguage() || 'en').split('-')[0].toLowerCase();
 let currentLang = DEFAULT_LANG;
 const limovaBackground = createLimovaBackground({
-  createDriver: ({ scope, journal, signal }) => createBrowserDriver({ chrome, scope, journal,
+  createDriver: ({ scope, journal, signal, uploadScreenshot }) => createBrowserDriver({ chrome, scope, journal, uploadScreenshot,
     hasConsent: async () => !signal.aborted && !trainingState.active && !evaluationState.active && await hasAIProcessingConsent() }),
   storage: chrome.storage.local,
   openTab: options => chrome.tabs.create(options),
