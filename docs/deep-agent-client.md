@@ -10,7 +10,7 @@ this interface as an authenticated API proxy.
 tokens. A 401 triggers at most one shared refresh and one retry; a network
 failure never automatically replays a mutation. An absent backend rollout
 decision disables the workspace. Each conversation operation rechecks the
-account and workspace, and agent resolution uses the existing `charly` slug.
+account and workspace, and agent resolution uses the existing `charly` slug. Workspace-scoped reads and mutations recheck identity after a refresh before retrying; cancellation still works with the rollout disabled when the account and workspace remain authorized. Unused error/refresh bodies are cancelled.
 
 `src/limova/background.js` retains only user/workspace/conversation IDs under
 `limova_deep_agent_context_v1`. Context changes are serialized. Account changes
@@ -42,11 +42,22 @@ The current API Deep Agent history returns the complete root thread with
 `pagination.hasMore: false`; the ordinary history endpoint uses `before` cursors.
 
 Still required: conversation-list pagination, full artifact parity and
-localization, validate actual Chrome cookie partition behavior, and implement
-browser/voice/training parity. Legacy voice, page analysis and privacy controls
+localization, real-account cookie handoff, and full browser/voice/training parity. Legacy voice, page analysis and privacy controls
 still need migration; this is not a release-ready package. Browser UI tests use
 a simulated Limova session, not a real-account cookie handoff. No production
 activation or real-account session-sharing proof is claimed.
+
+## App-session transport
+
+`session-fetch.js` and the isolated `app-session-bridge.js` use the first-party app context for every authenticated request. They reuse an app tab or open one inactive when none exists. The app context also handles refresh and logout. This keeps the same identity even if a valid unpartitioned cookie belongs to an older, different account: a Chromium regression reproduced the wrong identity when a direct-request fallback was allowed after the app tab closed. There is therefore no automatic switch to the direct worker session. It never reads/copies cookies and needs no `cookies` permission, new backend route or app deployment.
+
+The bridge is injected into the exact top-level Chrome document of `https://new.limova.ai` in the extension's isolated world. An extension-only port carries an allowlisted set of routes/methods/headers to `https://api.new.limova.ai`. Page scripts have no window-message proxy. Credentials remain browser-managed; response headers are limited to status/content type, and refresh/error bodies are discarded without parsing or forwarding tokens. JSON and bounded screenshot multipart uploads are supported. SSE bytes cross the port in acknowledged 16 KiB chunks, preserving incremental decoding and backpressure.
+
+This path requires a Limova tab while requests run; closing/navigation/disconnection aborts the fetch. An interrupted mutation is not replayed. A later explicit request can prepare another app tab, while browser-action recovery still uses its durable receipt. Abort also stops the caller while a new app document is loading. The document binding and port are transient, not credentials stored in extension storage. Shared refresh is coalesced within the extension client; cross-client app/extension rotation still relies on the existing backend grace handling and requires real-account validation.
+
+The Chromium suite uses a real local HTTPS server with native `Set-Cookie` responses, pinned DNS mapping for the fixture hosts and no external host resolution. It verifies actual partition metadata and shows a first-party partition cookie succeeds in the app but not in a direct worker fetch. Routed Playwright responses cannot prove this: `route.fulfill` did not preserve the Partitioned attribute in the initial experiment. The suite covers authenticated worker bootstrap, concurrent refresh, no token forwarding, ordinary cookies through the same app transport, reopening a closed app tab, incremental Unicode SSE, multipart upload, account switch, logout, disconnect/abort, allowlist rejection and conflicting ordinary/app identities with both open and closed app tabs. These are synthetic sessions, not proof of a production/staging account or deployed feature flag.
+
+Reference: [Chrome extension storage and cookie behavior](https://developer.chrome.com/docs/extensions/develop/concepts/storage-and-cookies).
 
 ## Browser transport foundation
 

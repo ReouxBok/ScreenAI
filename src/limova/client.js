@@ -69,7 +69,8 @@ export class LimovaDeepAgentClient {
       this.#refreshPromise = this.#fetch(`${LIMOVA_API_URL}/auth/refresh-token`, {
         method: 'POST', credentials: 'include', cache: 'no-store',
         signal: AbortSignal.timeout(20_000),
-      }).then(response => {
+      }).then(async response => {
+        await response.body?.cancel();
         if (!response.ok) throw new LimovaClientError(
           response.status === 401 || response.status === 403 ? 'LIMOVA_LOGIN_REQUIRED' : 'LIMOVA_REQUEST_FAILED',
           response.status === 401 || response.status === 403 ? 'Connecte-toi dans Limova pour utiliser l’extension.' : 'Limova est temporairement indisponible.', response.status);
@@ -79,7 +80,7 @@ export class LimovaDeepAgentClient {
     return this.#refreshPromise;
   }
 
-  async #request(path, { method = 'GET', body, workspaceId, signal, stream = false, browserSession, expectedContext } = {}) {
+  async #request(path, { method = 'GET', body, workspaceId, signal, stream = false, browserSession, expectedContext, requireEnabled = true } = {}) {
     if (!signal && !stream) signal = AbortSignal.timeout(30_000);
     const generation = this.#refreshGeneration;
     const headers = { Accept: stream ? 'text/event-stream' : 'application/json' };
@@ -91,12 +92,14 @@ export class LimovaDeepAgentClient {
       ...(body !== undefined ? { body: multipart ? body : JSON.stringify(body) } : {}) };
     let response = await this.#fetch(`${LIMOVA_API_URL}${path}`, options);
     if (response.status === 401) {
+      await response.body?.cancel();
       if (generation === this.#refreshGeneration) await this.#refresh();
       signal?.throwIfAborted();
-      if (expectedContext) await this.#assertContext(expectedContext, signal);
+      if (expectedContext) await this.#assertContext(expectedContext, signal, requireEnabled);
       response = await this.#fetch(`${LIMOVA_API_URL}${path}`, options);
     }
     if (!response.ok) {
+      await response.body?.cancel();
       const code = response.status === 401 ? 'LIMOVA_LOGIN_REQUIRED'
         : response.status === 403 ? 'LIMOVA_ACCESS_DENIED' : 'LIMOVA_REQUEST_FAILED';
       throw new LimovaClientError(code, response.status === 401
@@ -104,6 +107,7 @@ export class LimovaDeepAgentClient {
     }
     if (stream) {
       if (!response.headers.get('content-type')?.includes('text/event-stream')) {
+        await response.body?.cancel();
         throw new LimovaClientError('INVALID_STREAM', 'Le serveur n’a pas renvoyé de flux Deep Agent.');
       }
       return response;
@@ -122,20 +126,21 @@ export class LimovaDeepAgentClient {
     })) };
   }
 
-  async #assertContext(context, signal) {
+  async #assertContext(context, signal, requireEnabled = true) {
     id(context?.userId);
     id(context?.workspaceId);
     const current = await this.bootstrap(signal);
     if (current.user.id !== context.userId) throw new LimovaClientError('LIMOVA_ACCOUNT_CHANGED', 'Le compte Limova a changé. Sélectionne de nouveau ton espace.');
     const workspace = current.workspaces.find(item => item.id === context.workspaceId);
-    if (!workspace?.enabled) throw new LimovaClientError('LIMOVA_EXTENSION_DISABLED', 'L’extension n’est pas activée pour cet espace.');
+    if (!workspace || requireEnabled && !workspace.enabled) throw new LimovaClientError('LIMOVA_EXTENSION_DISABLED', 'L’extension n’est pas activée pour cet espace.');
   }
 
   async createConversation(context, title = 'Discussion avec Charly', signal) {
     await this.#assertContext(context, signal);
-    const agent = await this.#request('/agent/by-slug/charly', { workspaceId: context.workspaceId, signal });
+    const agent = await this.#request('/agent/by-slug/charly', { workspaceId: context.workspaceId, signal, expectedContext: { ...context } });
     if (agent?.slug !== 'charly') throw new LimovaClientError('INVALID_AGENT', 'L’agent principal Limova est indisponible.');
     const conversation = await this.#request('/conversation', { method: 'POST', workspaceId: context.workspaceId, signal,
+      expectedContext: { ...context },
       body: { title: String(title).slice(0, 200), type: 'general', engine: 'deep_agents', botAgentId: id(agent.id), disableFirstMessage: true } });
     id(conversation?.id);
     return conversation;
@@ -144,12 +149,12 @@ export class LimovaDeepAgentClient {
   async listConversations(context, page = 1, signal) {
     await this.#assertContext(context, signal);
     if (!Number.isInteger(page) || page < 1) throw new LimovaClientError('INVALID_PAGE', 'Page invalide.');
-    return this.#request(`/conversation?engine=deep_agents&type=general&page=${page}&limit=20`, { workspaceId: context.workspaceId, signal });
+    return this.#request(`/conversation?engine=deep_agents&type=general&page=${page}&limit=20`, { workspaceId: context.workspaceId, signal, expectedContext: { ...context } });
   }
 
   async getConversation(context, conversationId, signal, browserSession) {
     await this.#assertContext(context, signal);
-    const conversation = await this.#request(`/conversation/${id(conversationId)}`, { workspaceId: context.workspaceId, signal, browserSession });
+    const conversation = await this.#request(`/conversation/${id(conversationId)}`, { workspaceId: context.workspaceId, signal, browserSession, expectedContext: { ...context } });
     if (conversation?.engine !== 'deep_agents' || conversation?.mainAgent?.slug !== 'charly') {
       throw new LimovaClientError('INVALID_CONVERSATION', 'Sélectionne une conversation Deep Agent avec Charly.');
     }
@@ -159,7 +164,7 @@ export class LimovaDeepAgentClient {
   async getMessages(context, conversationId, cursor, signal) {
     await this.getConversation(context, conversationId, signal);
     const query = cursor ? `?before=${encodeURIComponent(id(cursor))}` : '';
-    return this.#request(`/conversation/${id(conversationId)}/messages${query}`, { workspaceId: context.workspaceId, signal });
+    return this.#request(`/conversation/${id(conversationId)}/messages${query}`, { workspaceId: context.workspaceId, signal, expectedContext: { ...context } });
   }
 
   async uploadBrowserScreenshot(context, conversationId, image, signal) {
@@ -184,6 +189,7 @@ export class LimovaDeepAgentClient {
     }
     const response = await this.#request(`/message/${id(conversationId)}`, {
       method: 'POST', workspaceId: context.workspaceId, signal, stream: true,
+      expectedContext: { ...context },
       browserSession: browser?.sessionId,
       body: { content, clientSurface: 'chrome_extension', userTimezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
         ...(page ? { browserContext: page } : {}) },
@@ -222,6 +228,7 @@ export class LimovaDeepAgentClient {
     await this.getConversation(context, conversationId, signal);
     const response = await this.#request(`/message/${id(conversationId)}`, {
       method: 'POST', workspaceId: context.workspaceId, signal, stream: true, browserSession,
+      expectedContext: { ...context },
       body: { ...body, clientSurface: 'chrome_extension' },
     });
     yield* readDeepAgentEvents(response.body, signal);
@@ -229,7 +236,9 @@ export class LimovaDeepAgentClient {
 
   async cancel(context, conversationId, signal) {
     // Cancellation remains possible after the rollout is disabled.
-    return this.#request(`/message/${id(conversationId)}/cancel`, { method: 'POST', workspaceId: id(context.workspaceId), signal });
+    await this.#assertContext(context, signal, false);
+    return this.#request(`/message/${id(conversationId)}/cancel`, { method: 'POST', workspaceId: id(context.workspaceId), signal,
+      expectedContext: { ...context }, requireEnabled: false });
   }
 
   async logout(signal) {
