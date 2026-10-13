@@ -7,7 +7,7 @@ test("dossier and readonly draft have independent verdicts with no external send
  await page.getByRole("button",{name:"Valider le dossier / process",exact:true}).click();await expect(page.getByText("Revue enregistrée.",{exact:false})).toBeVisible();
  await page.getByRole("button",{name:"Refuser le brouillon",exact:true}).click();await expect(page.getByText("Brouillon refusé · traitement humain à observer.",{exact:true})).toBeVisible();
  await expect(page.getByText("En attente de ticket confirmé · cycle 1",{exact:true}).first()).toBeVisible();
- await expect(page.getByRole("button",{name:"Créer un ticket HubSpot",exact:true})).toBeEnabled();await expect(page.getByRole("button",{name:"Envoyer la réponse acceptée",exact:true})).toBeDisabled();expect(await draft.textContent()).toBe(text);
+ await expect(page.getByRole("button",{name:/^Ouvrir un nouveau ticket/})).toBeEnabled();await expect(page.getByRole("button",{name:"Envoyer la réponse acceptée",exact:true})).toBeDisabled();expect(await draft.textContent()).toBe(text);
  await page.getByRole("button",{name:"Accepter le brouillon",exact:true}).click();await expect(page.getByText("Brouillon accepté · envoi distinct à confirmer.",{exact:true})).toBeVisible();await expect(page.getByRole("button",{name:"Envoyer la réponse acceptée",exact:true})).toBeDisabled();expect(external).toEqual([]);
  await expect.poll(()=>page.evaluate(()=>document.documentElement.scrollWidth<=window.innerWidth+1)).toBe(true);
  await page.screenshot({path:testInfo.outputPath("sav-38.png"),fullPage:true});
