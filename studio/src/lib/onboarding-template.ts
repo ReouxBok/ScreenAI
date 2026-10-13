@@ -152,7 +152,7 @@ export type PublishedOnboardingStep = {
   completionHint: string;
 };
 
-export async function getPublishedOnboardingTemplate() {
+export async function getPublishedOnboardingTemplate(options: { excludeSav?: boolean } = {}) {
   const db = requireDb();
   const [state] = await db.select().from(activeOnboardingTemplate).where(eq(activeOnboardingTemplate.singleton, true)).limit(1);
   if (!state?.publishedVersionId) return null;
@@ -167,6 +167,7 @@ export async function getPublishedOnboardingTemplate() {
       isNotNull(contentItems.publishedVersionId),
       ne(contentItems.status, "archived"),
       eq(contentItems.aiEnabled, true),
+      options.excludeSav ? ne(contentItems.agentKey, "sav") : undefined,
     ));
   const byId = new Map(rows.map((row) => [row.item.id, row]));
   const steps: PublishedOnboardingStep[] = definition.nodes.flatMap((node) => {
