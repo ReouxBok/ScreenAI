@@ -1,7 +1,7 @@
 import { createBrowserAuthority } from './browser-authority.js';
 import { createBrowserBinding } from './browser-binding.js';
 
-const DOCUMENT_OPERATIONS = new Set(['read_page', 'click', 'type_text', 'scroll', 'highlight']);
+const DOCUMENT_OPERATIONS = new Set(['read_page', 'click', 'type_text', 'scroll', 'highlight', 'navigate']);
 
 export function createBrowserDriver({ chrome, journal, scope, hasConsent }) {
   scope = Object.freeze({ ...scope });
@@ -43,8 +43,20 @@ export function createBrowserDriver({ chrome, journal, scope, hasConsent }) {
       if (!DOCUMENT_OPERATIONS.has(action.input.operation)) {
         return { status: 'rejected', observation: 'This browser operation is not available in the current driver.' };
       }
-      return binding.execute(action.target, action.input.operation, action.input, signal,
-        () => authorize(scope, action, signal));
+      let destination;
+      if (action.input.operation === 'navigate') {
+        try { destination = new URL(action.input.url); } catch {
+          return { status: 'rejected', observation: 'Invalid navigation URL.' };
+        }
+        if (destination.protocol !== 'https:' || destination.username || destination.password
+          || action.input.url.length > 2048 || !await hasSiteAccess(destination.origin)) {
+          return { status: 'rejected', observation: 'Navigation destination is not authorized.' };
+        }
+      }
+      return binding.execute(action.target, action.input.operation, action.input, signal, async () => {
+        if (destination && !await hasSiteAccess(destination.origin)) throw new Error('Browser destination access revoked');
+        await authorize(scope, action, signal);
+      });
     },
   };
 }

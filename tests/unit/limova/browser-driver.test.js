@@ -59,3 +59,20 @@ describe('browser driver assembly', () => {
     await expect(h.driver.authorize({ ...h.scope, userId: 'other' }, { target })).rejects.toThrow('context changed');
   });
 });
+
+it('refuses navigation to an origin without Chrome permission', async () => {
+  const h = harness();
+  const target = await h.driver.readPage();
+  h.chrome.permissions.contains.mockImplementation(async ({ origins }) => origins[0] === 'https://example.com/*');
+  const result = await h.driver.execute({ target, input: { operation: 'navigate', url: 'https://other.example/page' } });
+  expect(result.status).toBe('rejected');
+  expect(h.chrome.scripting.executeScript.mock.calls.some(([call]) => call.args[0].operation === 'navigate')).toBe(false);
+});
+
+it('rejects executable URLs and credential-bearing navigation', async () => {
+  const h = harness();
+  const target = await h.driver.readPage();
+  for (const url of ['javascript:alert(1)', 'http://example.com', 'https://user:secret@example.com']) {
+    expect((await h.driver.execute({ target, input: { operation: 'navigate', url } })).status).toBe('rejected');
+  }
+});

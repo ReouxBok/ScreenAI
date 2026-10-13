@@ -44,6 +44,15 @@ export function browserDocumentCommand(request) {
       if (version === undefined || input.documentId !== documentId || input.contextVersion !== version) return rejected('Document changed');
       if (input.operation === 'inspect') return { status: 'completed', binding: binding() };
       if (!Number.isSafeInteger(input.nextContextVersion) || input.nextContextVersion <= version) return rejected('Invalid next context version');
+      if (input.operation === 'navigate') {
+        let destination;
+        try { destination = new URL(input.url); } catch { return rejected('Invalid navigation URL'); }
+        if (typeof input.url !== 'string' || input.url.length > 2048 || destination.protocol !== 'https:'
+          || destination.username || destination.password) return rejected('Navigation target not permitted');
+        version = input.nextContextVersion;
+        location.assign(destination.href);
+        return { status: 'completed', observation: 'Navigation requested; read the destination page to verify loading.', binding: binding() };
+      }
       if (input.operation === 'read_page') {
         elements = new Map();
         const candidates = [...document.querySelectorAll('button,a[href],input,textarea,select,[contenteditable="true"],[role="button"],[role="tab"]')]

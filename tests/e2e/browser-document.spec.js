@@ -179,3 +179,18 @@ test('assembled driver reads and clicks the active page with real Chrome permiss
   });
   expect(refused).toBe(true);
 });
+
+test('navigates from the bound document and rejects stale navigation without leaving the page', async ({ context, extensionId }) => {
+  const { site, controller } = await setup(context, extensionId);
+  await context.route('https://new.limova.ai/driver-destination', route => route.fulfill({ contentType: 'text/html', body: '<h1>Destination reached</h1>' }));
+  const refused = await controller.evaluate(() => invokeDocument({ ...binding, contextVersion: 0,
+    operation: 'navigate', url: 'https://new.limova.ai/driver-destination', nextContextVersion: 3 }));
+  expect(refused.status).toBe('rejected');
+  expect(site.url()).toBe('https://new.limova.ai/driver-fixture');
+  const [result] = await Promise.all([
+    controller.evaluate(() => invokeDocument({ ...binding, operation: 'navigate', url: 'https://new.limova.ai/driver-destination', nextContextVersion: 3 })),
+    site.waitForURL('https://new.limova.ai/driver-destination'),
+  ]);
+  expect(result.status).toBe('completed');
+  await expect(site.locator('h1')).toHaveText('Destination reached');
+});
