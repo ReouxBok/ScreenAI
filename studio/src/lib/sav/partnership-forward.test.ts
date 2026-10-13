@@ -85,6 +85,30 @@ describe("human-confirmed partnership forward", () => {
     const [thread] = await fixture.db.select().from(savThreads); expect(thread.hubspotTicketId).toBe("123"); expect(thread.status).not.toBe("awaiting_customer");
     expect(await getSavPartnershipTransferState(threadId)).toMatchObject({ status: "succeeded" });
   });
+  it.each([
+    { status: "human_requested" as const, aiPaused: true },
+    { status: "human_processing" as const, aiPaused: true },
+    { status: "resolved" as const, aiPaused: true },
+    { status: "resolved" as const, aiPaused: false },
+  ])("allows an explicitly confirmed human forward with $status / paused=$aiPaused without changing those states", async ({ status, aiPaused }) => {
+    await fixture.db.update(savThreads).set({ status, aiPaused }).where(eq(savThreads.id, threadId));
+    expect(await getSavPartnershipTransferState(threadId)).toMatchObject({ available: true });
+    const action = await queue();
+    expect((await processPendingGmailSendActions(1, action.id)).processed[0]).toMatchObject({ status: "succeeded" });
+    expect(posts()).toHaveLength(1);
+    const [thread] = await fixture.db.select().from(savThreads).where(eq(savThreads.id, threadId));
+    expect(thread).toMatchObject({ status, aiPaused, hubspotTicketId: "123" });
+    expect(await fixture.db.select().from(savMessages)).toHaveLength(1);
+    expect(await fixture.db.select().from(savFollowups)).toHaveLength(0);
+  });
+  it.each(["ai", "system"] as const)("does not extend the paused-human exception to a %s transfer", async actorType => {
+    await fixture.db.update(savThreads).set({ status: "human_requested", aiPaused: true }).where(eq(savThreads.id, threadId));
+    const action = await queue();
+    await fixture.db.update(savActions).set({ actorType }).where(eq(savActions.id, action.id));
+    await expect(assertSavCurrentPartnershipForward({ ...action, actorType })).rejects.toThrow("SAV_PARTNERSHIP_CONFIRMATION_REQUIRED");
+    await processPendingGmailSendActions(1, action.id);
+    expect(posts()).toHaveLength(0);
+  });
   it("rejects unauthorized staff and previews belonging to another allowed actor", async () => {
     await expect(prepareSavPartnershipForward(threadId, "fiction@example.invalid")).rejects.toThrow("SAV_ACCESS_FORBIDDEN");
     await expect(queueSavPartnershipForward((await prepare()).token, "reouven@limova.ai")).rejects.toThrow("SAV_PARTNERSHIP_PREVIEW_EXPIRED"); expect(network).not.toHaveBeenCalled();
