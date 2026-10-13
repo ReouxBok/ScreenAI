@@ -21,8 +21,19 @@ describe("SAV-53 inbox presentation", () => {
   it("uses the current semantic topic, problem and separate proposed action without AI", () => {
     const fetch = vi.fn(() => { throw new Error("NETWORK_FORBIDDEN"); }); vi.stubGlobal("fetch", fetch);
     const source = input(), before = JSON.stringify(source);
-    expect(buildSavInboxSummary(source)).toMatchObject({ title: "Problème technique : Limova · agent téléphone", problem: "L’agent téléphone cesse de répondre.", nextAction: "Valider le dossier puis ouvrir le ticket proposé.", sourceLabel: "Synthèse de la demande" });
+    expect(buildSavInboxSummary(source)).toMatchObject({ title: "Problème technique : Limova · agent téléphone", problem: "L’agent téléphone cesse de répondre.", nextAction: "Valider le dossier puis choisir l’action adaptée au ticket.", sourceLabel: "Synthèse de la demande" });
     expect(JSON.stringify(source)).toBe(before); expect(fetch).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["approved", "Vérifier les tickets existants puis choisir l’action adaptée."],
+    [null, "Valider le dossier puis choisir l’action adaptée au ticket."],
+  ] as const)("does not announce creation from a stored new-routing proposal after review %s", (reviewStatus, expected) => {
+    const source = input();
+    expect(source.proposal.routing.kind).toBe("new");
+    const action = buildSavInboxSummary({ ...source, reviewStatus }).nextAction;
+    expect(action).toBe(expected);
+    expect(action).not.toMatch(/ouvrir|créer|création/i);
   });
 
   it("preserves all requests and the human-only policy of a mixed financial request", () => {
@@ -60,7 +71,7 @@ describe("SAV-53 inbox presentation", () => {
 
   it("keeps a secondary support action after a successful transfer", () => {
     const source = input(); source.proposal.understanding.requests.push({ ...source.proposal.understanding.requests[0], id: "partner", nature: "partnership", summary: "Propose aussi un partenariat." });
-    expect(buildSavInboxSummary({ ...source, partnershipTransferStatus: "succeeded" }).nextAction).toBe("Valider le dossier puis ouvrir le ticket proposé. Déjà transféré à Nathan.");
+    expect(buildSavInboxSummary({ ...source, partnershipTransferStatus: "succeeded" }).nextAction).toBe("Valider le dossier puis choisir l’action adaptée au ticket. Déjà transféré à Nathan.");
   });
 
   it("retains a reliable understanding when composition is degraded", () => {

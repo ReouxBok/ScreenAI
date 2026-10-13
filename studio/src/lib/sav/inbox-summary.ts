@@ -61,7 +61,9 @@ function suggestedNextAction(input: InboxSummaryInput) {
     const name = p.dossierContext?.crm.data?.tickets.find(candidate => candidate.id === ticketId)?.subject;
     return name ? `Vérifier le ticket « ${cleanText(name)} » et choisir l’action.` : `Vérifier le ticket #${ticketId} et choisir l’action.`;
   }
-  if (p.routing.kind === "new") return input.reviewStatus === "approved" ? "Vérifier puis ouvrir le nouveau ticket proposé." : "Valider le dossier puis ouvrir le ticket proposé.";
+  // This routing snapshot predates later CRM refreshes. The dossier chooses the
+  // actual operation from its current context when the human opens it.
+  if (p.routing.kind === "new") return input.reviewStatus === "approved" ? "Vérifier les tickets existants puis choisir l’action adaptée." : "Valider le dossier puis choisir l’action adaptée au ticket.";
   if (p.routing.kind === "review") return "Vérifier le client et le ticket à utiliser.";
   if (p.replyDraft?.trim()) return "Relire le brouillon avant un éventuel envoi.";
   return "Examiner la demande et décider de la suite à donner.";
