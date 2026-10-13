@@ -1,5 +1,4 @@
 import { savTicketReturnPlan, savTicketReturnLabels, sortSavTicketsNewestFirst } from "@/lib/sav/ticket-lifecycle";
-import { selectSavTicketMatch } from "@/lib/sav/ticket-routing";
 import { formatParisDateTime } from "@/lib/paris-date";
 import Link from "next/link";
 import { ArrowLeft, Bot, CheckCircle2, CircleAlert, Clock3, ExternalLink, LockKeyhole, UserRound } from "lucide-react";
@@ -81,8 +80,8 @@ export default async function SavThreadPage({ params, searchParams }: { params: 
     ? savedDossier : undefined;
   const customerContextBlocked = Boolean(isForward && !dossier);
   const crmTickets = sortSavTicketsNewestFirst(dossier?.crm.data?.tickets ?? []);
-  const ticketMatch = selectSavTicketMatch({ subject: customerMessage?.subject ?? "", candidates: crmTickets, currentTicketId: detail.thread.hubspotTicketId, includeClosed: true });
-  const returnTicket = ticketMatch.kind === "matched" ? crmTickets.find(ticket => ticket.id === ticketMatch.ticket.id) : null;
+  const ticketMatch = dossier?.crm.data?.routing;
+  const returnTicket = ticketMatch?.kind === "matched" ? crmTickets.find(ticket => ticket.id === ticketMatch.ticketId) : null;
   const returnPlan = returnTicket && latestInbound ? savTicketReturnPlan(returnTicket, latestInbound.receivedAt) : null;
   const returnUncertain = detail.actions.some(action => action.payload.ticketReturnDispatchedAt && !action.payload.ticketReturnCompletedAt);
   const returnCompleted = detail.actions.some(action => action.messageId === latestInbound?.id && action.status === "succeeded" && ["create_ticket", "link_ticket"].includes(action.kind) && action.actorType === "human");

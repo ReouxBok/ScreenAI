@@ -9,6 +9,7 @@ import { getSavProposalReview, reviewSavProposal } from "./review";
 import { queueSavManualTicket } from "./manual-tickets";
 import { listSavInbox } from "./service";
 import { processPendingHubspotActions, reconcileSavManualTicket } from "./hubspot";
+import { geminiFixture } from "../../../test/sav-understanding-fixtures";
 
 const state = vi.hoisted(() => ({ db: null as unknown }));
 vi.mock("@/db", () => ({ requireDb: () => state.db }));
@@ -24,6 +25,12 @@ function reviewInput(reusability = "none") {
 function mockIntegrations(mode: "create" | "timeout" | "existing" | "unknown" | "different" = "create") {
   vi.stubEnv("GMAIL_CLIENT_ID", "test"); vi.stubEnv("GMAIL_CLIENT_SECRET", "test"); vi.stubEnv("GMAIL_REFRESH_TOKEN", "test");
   const network = vi.fn(async (url: string, init?: RequestInit) => {
+    if (url.includes("generativelanguage.googleapis.com")) {
+      const data = JSON.parse(JSON.parse(String(init?.body)).contents[0].parts[0].text);
+      return geminiFixture({ assessments: data.tickets.map((ticket: { id: string; text: string }) => ({ ticketId: ticket.id,
+        relation: mode === "different" ? "different_issue" : "same_issue", messageExcerpt: data.currentMessage, historyExcerpt: "",
+        ticketExcerpt: ticket.text.split("\n")[0], explanation: "Verdict provider simulé pour la demande synthétique." })) });
+    }
     if (url.includes("oauth2.googleapis.com/token")) return Response.json({ access_token: "fixture-token", expires_in: 3600 });
     if (url.includes("gmail.googleapis.com") && url.includes("threads/gmail-thread")) return Response.json({ messages: [{ id: "gmail-message", internalDate: String(Date.parse("2026-10-02T12:01:00Z")), labelIds: ["INBOX"], payload: { headers: [{ name: "From", value: "client@example.com" }] } }] });
     const stages = ["1", "2", "3", "4"].map((id) => ({ id, metadata: { isClosed: id === "4", ticketState: id === "4" ? "CLOSED" : "OPEN" } }));
@@ -46,6 +53,7 @@ afterEach(() => { vi.unstubAllEnvs(); vi.unstubAllGlobals(); vi.restoreAllMocks(
 beforeEach(async () => {
   vi.spyOn(console, "info").mockImplementation(() => {});
   vi.stubEnv("SAV_RELEASE_STAGE", "v0"); vi.stubEnv("SAV_AUTOMATION_MODE", "assist"); vi.stubEnv("SAV_WRITES_DISABLED", "false"); vi.stubEnv("SAV_ENCRYPTION_KEY_V1", "test-only-sav-encryption-key-32-characters"); vi.stubEnv("HUBSPOT_ACCESS_TOKEN", "test-only");
+  vi.stubEnv("SAV_GEMINI_API_KEY", "fixture-key"); vi.stubEnv("SAV_AI_ANALYSIS", "true");
   await fixture.client.exec("TRUNCATE sav.mailboxes CASCADE; TRUNCATE sav.sync_state; TRUNCATE active_knowledge; TRUNCATE audit_logs");
   const [mailbox] = await fixture.db.insert(savMailboxes).values({ email: "contact@limova.ai" }).returning();
   await activateSavV0Cutover({ receivedAfter: "2026-10-02T12:00:00Z", mailboxEmail: mailbox.email, intakeRecipient: "contact@limova.ai", deploymentSha: "a".repeat(40), activatedBy: "ugo@limova.ai" });

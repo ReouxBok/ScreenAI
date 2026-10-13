@@ -10,6 +10,7 @@ import { reviewSavProposal } from "./review";
 import { queueSavManualTicket } from "./manual-tickets";
 import { retrySavAction } from "./service";
 import { processPendingHubspotActions, reconcileSavTicketReturn, readSavHubspotContext } from "./hubspot";
+import { geminiFixture } from "../../../test/sav-understanding-fixtures";
 
 const state = vi.hoisted(() => ({ db: null as unknown }));
 vi.mock("@/db", () => ({ requireDb: () => state.db }));
@@ -27,10 +28,17 @@ let stage = "2", closedAt: string | null = null;
 let ownerId: string | null = "71";
 let remoteNote: { id: string; properties: Record<string, string> } | null = null;
 let failure: "none" | "note_timeout" | "patch_timeout" = "none";
+let matchingUnavailable = false;
 function mockIntegrations() {
   vi.stubEnv("GMAIL_CLIENT_ID", "test"); vi.stubEnv("GMAIL_CLIENT_SECRET", "test"); vi.stubEnv("GMAIL_REFRESH_TOKEN", "test");
   const record = () => ({ id: "401", createdAt: "2026-09-01T00:00:00Z", properties: { subject: "Connexion impossible", content: "Même demande", hs_pipeline: "0", hs_pipeline_stage: stage, hs_last_closed_date: closedAt, hubspot_owner_id: ownerId }, associations: { contacts: { results: [{ id: "21" }] } } });
   const network = vi.fn(async (url: string, init?: RequestInit): Promise<Response> => {
+    if (url.includes("generativelanguage.googleapis.com")) {
+      if (matchingUnavailable) return new Response("Provider unavailable", { status: 500 });
+      const data = JSON.parse(JSON.parse(String(init?.body)).contents[0].parts[0].text);
+      return geminiFixture({ assessments: data.tickets.map((ticket: { id: string; text: string }) => ({ ticketId: ticket.id, relation: "same_issue",
+        messageExcerpt: data.currentMessage, historyExcerpt: "", ticketExcerpt: ticket.text.split("\n")[0], explanation: "Même demande synthétique, verdict provider simulé." })) });
+    }
     if (url.includes("oauth2.googleapis.com/token")) return Response.json({ access_token: "fixture-token", expires_in: 3600 });
     if (url.includes("gmail.googleapis.com") && url.includes("threads/gmail-thread")) return Response.json({ messages: [{ id: "gmail-message", internalDate: String(Date.parse("2026-10-02T12:01:00Z")), labelIds: ["INBOX"], payload: { headers: [{ name: "From", value: "client@example.com" }] } }] });
     const stages = ["1", "2", "3", "4"].map(id => ({ id, metadata: { isClosed: id === "4", ticketState: id === "4" ? "CLOSED" : "OPEN" } }));
@@ -64,9 +72,10 @@ beforeAll(async () => { fixture = await createSavTestDb(); state.db = fixture.db
 afterAll(async () => { await fixture?.client.close(); });
 afterEach(() => { vi.unstubAllEnvs(); vi.unstubAllGlobals(); vi.restoreAllMocks(); });
 beforeEach(async () => {
-  predecessorStage = null; stage = "2"; closedAt = null; ownerId = "71"; remoteNote = null; failure = "none";
+  predecessorStage = null; stage = "2"; closedAt = null; ownerId = "71"; remoteNote = null; failure = "none"; matchingUnavailable = false;
   vi.spyOn(console, "info").mockImplementation(() => {});
   vi.stubEnv("SAV_RELEASE_STAGE", "v0"); vi.stubEnv("SAV_AUTOMATION_MODE", "assist"); vi.stubEnv("SAV_WRITES_DISABLED", "false"); vi.stubEnv("SAV_ENCRYPTION_KEY_V1", "test-only-sav-encryption-key-32-characters"); vi.stubEnv("HUBSPOT_ACCESS_TOKEN", "test-only");
+  vi.stubEnv("SAV_GEMINI_API_KEY", "fixture-key"); vi.stubEnv("SAV_AI_ANALYSIS", "true");
   await fixture.client.exec("TRUNCATE sav.mailboxes CASCADE; TRUNCATE sav.sync_state; TRUNCATE active_knowledge; TRUNCATE audit_logs");
   const [mailbox] = await fixture.db.insert(savMailboxes).values({ email: "contact@limova.ai" }).returning();
   await activateSavV0Cutover({ receivedAfter: "2026-10-02T12:00:00Z", mailboxEmail: mailbox.email, intakeRecipient: "contact@limova.ai", deploymentSha: "a".repeat(40), activatedBy: "ugo@limova.ai" });
@@ -83,7 +92,7 @@ async function prepare(operation: "keep" | "reactivate" | "create", linked = fal
   const body = decryptSavPayload<{ text: string }>(message.bodyCiphertext);
   const customer = resolveSavCustomerMessage({ fromEmail: message.fromEmail, subject: message.subject, body: body.text });
   const customerIdentity = resolveSavCustomerIdentity({ fromEmail: message.fromEmail, body: body.text });
-  const crm = await readSavHubspotContext({ email: customer.email!, subject: customer.subject, returnedAt: "2026-10-02T12:01:00Z" });
+  const crm = await readSavHubspotContext({ email: customer.email!, subject: customer.subject, body: customer.body, returnedAt: "2026-10-02T12:01:00Z" });
   await fixture.db.update(savMessages).set({ bodyCiphertext: encryptSavPayload({ ...body, supportContext: { version: 1, messageId, collectedAt: "2026-10-02T12:02:00Z", customerIdentity, crm: { status: "ready", errorCode: null, data: crm } } }) }).where(eq(savMessages.id, messageId));
   const review = await reviewSavProposal({ ...reviewInput(), reviewScope: "dossier" }, "ugo@limova.ai");
   const request = { threadId, reviewId: review.id, kind: operation === "create" ? "create_ticket" : "link_ticket", ticketId: "401", returnOperation: operation };
@@ -91,6 +100,26 @@ async function prepare(operation: "keep" | "reactivate" | "create", linked = fal
   return { network, action, request };
 }
 function mutations(network: ReturnType<typeof mockIntegrations>) { return network.mock.calls.filter(([url, init]) => /\/objects\/(notes|tickets)(?:\/\d+)?$/.test(url) && ["POST", "PATCH"].includes(init?.method ?? "")); }
+
+it("reactivates a content-matched issue despite a generic inherited subject, across queue and worker", async () => {
+  const generic = "Re: Suite à votre demande - Urgent", text = "Le test de connexion échoue toujours, je reviens sur ce problème.";
+  await fixture.db.update(savThreads).set({ subject: generic }).where(eq(savThreads.id, threadId));
+  await fixture.db.update(savMessages).set({ subject: generic, bodyCiphertext: encryptSavPayload({ text }) }).where(eq(savMessages.id, messageId));
+  const { network, action } = await prepare("reactivate");
+  expect((await processPendingHubspotActions(1)).processed[0]).toMatchObject({ actionId: action.id, status: "succeeded", ticketId: "401" });
+  expect(mutations(network)).toHaveLength(2);
+  const checks = network.mock.calls.filter(([url]) => url.includes("generativelanguage.googleapis.com"));
+  expect(checks).toHaveLength(2);
+  for (const [, init] of checks) expect(JSON.parse(JSON.parse(String(init?.body)).contents[0].parts[0].text)).toMatchObject({ currentMessage: text });
+  expect(action.payload.ticketReturn).toMatchObject({ ticketId: "401", ownerId: "71", operation: "reactivate" });
+});
+
+it("does not mutate CRM when the fresh semantic check becomes unavailable after queueing", async () => {
+  const { network } = await prepare("reactivate"); matchingUnavailable = true;
+  expect((await processPendingHubspotActions(1)).processed[0].status).toBe("failed");
+  expect(mutations(network)).toHaveLength(0);
+  expect(stage).toBe("2");
+});
 
 it.each(["1", "2", "3", "4"])("handles stage %s without duplicate note or ticket", async initialStage => {
   stage = initialStage;
