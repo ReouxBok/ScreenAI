@@ -1,4 +1,4 @@
-import { liveBrowserBinding, liveBrowserContinuation } from './live-browser-contract.js';
+import { liveBrowserBinding, liveBrowserContinuation, liveBrowserContextReply } from './live-browser-contract.js';
 import { createLimovaAppTarget } from './app-target.js';
 import { LIVE_PORT } from './live-bridge.js';
 
@@ -51,6 +51,7 @@ export function createLimovaLiveTransport(chrome) {
                     || bytes.length > message.payload.maxAudioFrameBytes) throw new TypeError('Invalid PCM frame');
                   send({ kind: 'audio', sequence: audioSequence++, bytes: Array.from(bytes) });
                 },
+                refreshBrowserContext(payload) { send({ kind: 'browser_context', payload: liveBrowserContextReply(payload) }); },
                 continueBrowser(continuation) { send({ kind: 'browser_continue', payload: liveBrowserContinuation(continuation) }); },
                 cancel(playedAudioMs = 0) { send({ kind: 'cancel', playedAudioMs }); },
                 stop() { close(); },

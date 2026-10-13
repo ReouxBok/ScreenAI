@@ -30,6 +30,25 @@ function fixture(sender = 'own-extension') {
 afterEach(() => vi.useRealTimers());
 
 describe('first-party live bridge', () => {
+  it('sends one context reply for the exact server request and refuses replay', () => {
+    const f = fixture();
+    const browserContext = { tabId: 7, origin: 'https://example.com', contextVersion: 1 };
+    f.open({ browserSession: userId, browserContext });
+    f.server('turn.browser_context_requested', { sessionId, turnId: conversationId, requestId: workspaceId });
+    const payload = { turnId: conversationId, requestId: workspaceId, browserContext: { ...browserContext, contextVersion: 9 } };
+    f.port.onMessage.fire({ kind: 'browser_context', payload });
+    expect(f.socket.emit).toHaveBeenCalledWith('turn.browser_context', { sessionId, ...payload });
+    f.port.onMessage.fire({ kind: 'browser_context', payload });
+    expect(f.socket.emit.mock.calls.filter(([name]) => name === 'turn.browser_context')).toHaveLength(1);
+    expect(f.socket.disconnect).toHaveBeenCalledOnce();
+  });
+
+  it('refuses a context request on a voice session without browser permission', () => {
+    const f = fixture(); f.open();
+    f.server('turn.browser_context_requested', { sessionId, turnId: conversationId, requestId: workspaceId });
+    expect(f.socket.disconnect).toHaveBeenCalledOnce();
+  });
+
   it('only uses the configured Limova namespace, cookies and workspace auth', () => {
     const f = fixture(); f.open();
     expect(f.io).toHaveBeenCalledWith(`${LIMOVA_API_URL}/conversation/live`, expect.objectContaining({

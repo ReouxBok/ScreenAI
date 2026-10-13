@@ -20,7 +20,7 @@ Le handle retourné expose `continueBrowser({ turnId, kind, browserContext, brow
 
 Les champs sont limités au contrat existant : résultats completed/rejected/failed, observation de 32 000 caractères maximum, identifiants d’action/outil bornés, référence image UUID éventuelle et contexte de page validé. Aucun contenu utilisateur supplémentaire, agent alternatif ou destination arbitraire. Une continuation ne peut partir que pour le tour vocal actif d’une session ayant déclaré son binding navigateur ; au maximum 100 envois par tour, sans mise en file Socket.IO hors connexion. Annulation et fin de tour invalident cette possibilité.
 
-Le transport seul ne lance pas d’actions. Le contrôleur décrit ci-dessous compose ce transport avec le driver et le journal ; le rafraîchissement proactif du contexte entre tours reste à réaliser. Le panneau utilise désormais cette composition pour la voix utilisateur. `onEvent` doit rapidement enregistrer les frames dans sa propre file puis rendre la main : ne pas attendre l’exécution d’une action ou sa réponse vocale dans ce callback, car l’acquittement transport est borné à 5 secondes.
+Le transport seul ne lance pas d’actions. Le contrôleur décrit ci-dessous compose ce transport avec le driver et le journal ; le contexte est relu à la demande du backend avant chaque tour vocal disposant des outils navigateur. Le panneau utilise désormais cette composition pour la voix utilisateur. `onEvent` doit rapidement enregistrer les frames dans sa propre file puis rendre la main : ne pas attendre l’exécution d’une action ou sa réponse vocale dans ce callback, car l’acquittement transport est borné à 5 secondes.
 
 ## Contrôleur navigateur vocal
 
@@ -55,3 +55,11 @@ Les builds production et staging embarquent chacun leurs origines fixes. Le vali
 Sans consentement navigateur, aucune session de journal ni aucun driver DOM n’est construit pour la voix. Le contrôleur continue à traiter les événements natifs, mais refuse les commandes navigateur. Le consentement AI reste requis.
 
 `limova-native-voice-panel.spec.js` clique sur le vrai bouton, avec le vrai transport first-party et un microphone Chromium simulé. Il vérifie l’identité et la conversation au démarrage, les trames PCM, l’absence d’appel `/api/live-session`, puis l’arrêt après retrait du consentement. Le serveur local simule l’API et le provider. `native-audio.spec.js` qualifie séparément le worklet et la lecture ; il neutralise la fermeture automatique de sa page de permission, sans prétendre qualifier le parcours réel d’autorisation. Un test avec compte/provider réels reste requis avant activation.
+
+## Contexte frais avant chaque tour vocal navigateur
+
+Avant le premier segment natif de chaque tour, le backend émet `turn.browser_context_requested` avec `sessionId`, `turnId` vocal et `requestId` unique. L’extension revalide le compte/workspace/conversation puis appelle le driver pour relire le binding autorisé. Elle répond par `turn.browser_context` avec ces identifiants et `browserContext` (tabId, origin, contextVersion). Le backend attend au plus dix secondes ; une réponse absente, étrangère ou invalide ne déclenche aucun segment natif avec l’ancien contexte.
+
+La passerelle accepte une seule réponse pour la demande courante, ajoute le sessionId confirmé et refuse les champs libres. La lecture est asynchrone et ne bloque pas l’ACK des événements. Cancel, interruption et fermeture annulent la lecture en cours ; un résultat tardif est ignoré. Sans autorisation navigateur, aucun échange de contexte n’est admis. Le driver conserve son onglet lié : un changement vers un autre onglet arrête la session au lieu de transférer implicitement son autorisation. La navigation du document reste soumise à ses contrôles de permissions et de version.
+
+Ce contrat nécessite les deux couches API/extension correspondantes avant activation du flag. Il s’agit d’une évolution du protocole en draft, pas d’une capacité déjà déployée. La lecture avant le tour ne garantit pas qu’une page restera immobile ensuite : l’autorisation et le binding sont à nouveau contrôlés lors de chaque action.

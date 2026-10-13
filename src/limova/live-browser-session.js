@@ -5,12 +5,13 @@ export function createBrowserLiveSession({ openTransport, client, journal, creat
     onEvent = () => {}, onNativeEvent = () => {}, onError = () => {} }) => {
     context = Object.freeze({ ...context });
     const abort = new AbortController();
-    let live, browser, closed = false;
+    let live, browser, closed = false, refresh;
     const stop = () => {
       if (closed) return;
       closed = true;
       signal?.removeEventListener('abort', stop);
       abort.abort();
+      refresh?.abort();
       browser?.stop();
       live?.stop();
     };
@@ -33,6 +34,22 @@ export function createBrowserLiveSession({ openTransport, client, journal, creat
       live = await openTransport({ context, conversationId, languageCode, userTimezone,
         browserSession, browserContext, signal: abort.signal, onError: fail,
         onEvent(event, payload) {
+          if (event === 'turn.browser_context_requested') {
+            if (!driver || refresh) { fail(new Error('Unexpected browser context request')); return; }
+            const current = new AbortController(); refresh = current;
+            const refreshSignal = AbortSignal.any([abort.signal, current.signal]);
+            void (async () => {
+              await client.getConversation(context, conversationId, refreshSignal);
+              const page = await driver.readPage(refreshSignal);
+              refreshSignal.throwIfAborted();
+              live.refreshBrowserContext({ turnId: payload.turnId, requestId: payload.requestId, browserContext: page });
+            })().catch(error => { if (!current.signal.aborted) fail(error); })
+              .finally(() => { if (refresh === current) refresh = undefined; });
+            return;
+          }
+          if (['turn.interrupted', 'turn.deep_agent_stream.failed', 'turn.deep_agent_stream.interrupted'].includes(event)) {
+            refresh?.abort(); refresh = undefined;
+          }
           browser.onEvent(event, payload);
           if (closed) return;
           try {
@@ -48,6 +65,7 @@ export function createBrowserLiveSession({ openTransport, client, journal, creat
         sendAudio(bytes) { abort.signal.throwIfAborted(); live.sendAudio(bytes); },
         cancel(playedAudioMs = 0) {
           abort.signal.throwIfAborted();
+          refresh?.abort(); refresh = undefined;
           browser.onEvent('turn.interrupted', { sessionId: live.session.sessionId });
           live.cancel(playedAudioMs);
         },

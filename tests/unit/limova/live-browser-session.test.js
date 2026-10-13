@@ -7,7 +7,7 @@ const page = { tabId: 7, origin: 'https://example.com', contextVersion: 1 };
 
 function harness() {
   let callbacks, driverOptions;
-  const live = { session: { sessionId: id }, sendAudio: vi.fn(), cancel: vi.fn(), stop: vi.fn(), continueBrowser: vi.fn() };
+  const live = { session: { sessionId: id }, sendAudio: vi.fn(), cancel: vi.fn(), stop: vi.fn(), continueBrowser: vi.fn(), refreshBrowserContext: vi.fn() };
   const openTransport = vi.fn(async options => { callbacks = options; options.onEvent('session.ready', live.session); return live; });
   const client = { getConversation: vi.fn().mockResolvedValue({}), uploadBrowserScreenshot: vi.fn().mockResolvedValue({ fileId: id }) };
   const journal = { getSession: vi.fn().mockResolvedValue(id) };
@@ -19,6 +19,31 @@ function harness() {
 }
 
 describe('browser-enabled live session composition', () => {
+  it('reads a fresh authorized page for the requested turn without blocking event ingestion', async () => {
+    const h = harness();
+    const session = await h.start({ context, conversationId: id });
+    const fresh = { ...page, contextVersion: 8 };
+    h.driver.readPage.mockResolvedValue(fresh);
+    const request = { sessionId: id, turnId: id, requestId: id };
+    expect(h.callbacks().onEvent('turn.browser_context_requested', request)).toBeUndefined();
+    await vi.waitFor(() => expect(h.live.refreshBrowserContext).toHaveBeenCalledWith({ turnId: id, requestId: id, browserContext: fresh }));
+    expect(h.client.getConversation).toHaveBeenCalledTimes(2);
+    session.stop();
+  });
+
+  it('discards a context read that finishes after cancellation', async () => {
+    const h = harness();
+    const session = await h.start({ context, conversationId: id });
+    let finish;
+    h.driver.readPage.mockReturnValue(new Promise(resolve => { finish = resolve; }));
+    h.callbacks().onEvent('turn.browser_context_requested', { sessionId: id, turnId: id, requestId: id });
+    await vi.waitFor(() => expect(h.driver.readPage).toHaveBeenCalledTimes(2));
+    session.cancel(); finish(page);
+    await new Promise(resolve => setTimeout(resolve, 0));
+    expect(h.live.refreshBrowserContext).not.toHaveBeenCalled();
+    session.stop();
+  });
+
   it('opens voice without inspecting any page when browser consent is absent', async () => {
     const h = harness();
     const session = await h.start({ context, conversationId: id, browserEnabled: false });

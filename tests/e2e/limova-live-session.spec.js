@@ -58,13 +58,23 @@ test(`live transport ${browserDriver ? 'with real DOM driver and journal' : 'wir
       socket.emit('session.ready', { sessionId: SESSION, conversationId: CONVERSATION, userId: USER, workspaceId: WORKSPACE,
         clientSurface: 'chrome_extension', inputSampleRate: 16_000, outputSampleRate: 24_000, maxAudioFrameBytes: 2_560 });
     });
-    socket.on('audio.append', payload => {
-      seen.pcm = { sequence: payload.sequence, bytes: Array.from(payload.audio) };
+    const startNativeTurn = () => {
       socket.emit('turn.deep_agent_stream.started', { sessionId: SESSION, turnId: VOICE_TURN });
       seen.action = { type: 'extension.action_requested', protocolVersion: 1, turnId: BROWSER_TURN, actionId: 'action-1', toolCallId: 'tool-1', target: seen.browserBinding.browserContext, input: { operation: 'read_page' }, expiresAt: new Date(Date.now() + 60_000).toISOString() };
       const frames = [...(browserDriver ? [seen.action] : []), { type: 'extension.turn_state', state: 'waiting', turnId: BROWSER_TURN }];
       socket.emit('turn.deep_agent_stream.delta', { sessionId: SESSION, turnId: VOICE_TURN, chunk: Buffer.from(frames.map(data => `event: custom\ndata: ${JSON.stringify(data)}\n\n`).join('')) });
       socket.emit('assistant.audio.delta', { sessionId: SESSION, sequence: 0, audio: Buffer.from([0, 128, 255, 127]) });
+    };
+    socket.on('audio.append', payload => {
+      seen.pcm = { sequence: payload.sequence, bytes: Array.from(payload.audio) };
+      if (browserDriver) socket.emit('turn.browser_context_requested', { sessionId: SESSION, turnId: VOICE_TURN, requestId: USER });
+      else startNativeTurn();
+    });
+    socket.on('turn.browser_context', payload => {
+      seen.contextReply = payload;
+      if (payload.sessionId !== SESSION || payload.turnId !== VOICE_TURN || payload.requestId !== USER) return socket.disconnect();
+      seen.browserBinding.browserContext = payload.browserContext;
+      startNativeTurn();
     });
     socket.on('turn.browser_continue', payload => {
       seen.browserResult = payload;
@@ -134,6 +144,7 @@ test(`live transport ${browserDriver ? 'with real DOM driver and journal' : 'wir
       await expect.poll(() => seen.browserResult).toEqual({ sessionId: SESSION, ...continuation });
     } else {
       await expect.poll(() => seen.results.length).toBe(2);
+      expect(seen.contextReply).toMatchObject({ sessionId: SESSION, turnId: VOICE_TURN, requestId: USER, browserContext: seen.browserBinding.browserContext });
       expect(seen.results[0].browserResult).toEqual(seen.results[1].browserResult);
       expect(seen.browserResult).toMatchObject({ sessionId: SESSION, turnId: VOICE_TURN,
         browserResult: { turnId: BROWSER_TURN, actionId: 'action-1', status: 'completed' } });
