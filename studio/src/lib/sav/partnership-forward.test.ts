@@ -3,13 +3,14 @@ import { eq } from "drizzle-orm";
 import { createSavTestDb } from "../../../test/sav-db";
 import { understandingFixture } from "../../../test/sav-understanding-fixtures";
 import { v0Proposal } from "../../../test/sav-v0-review-fixture";
-import { savActions, savAgentRuns, savDecisions, savFollowups, savMailboxes, savMessages, savThreads } from "@/db/schema";
+import { savActions, savAgentRuns, savDecisions, savFollowups, savMailboxes, savMessages, savProposalReviews, savThreads } from "@/db/schema";
 import { activateSavV0Cutover } from "./cutover";
 import { decryptSavPayload, encryptSavPayload } from "./crypto";
 import { assertSavCurrentPartnershipForward, getSavPartnershipTransferState, prepareSavPartnershipForward, queueSavPartnershipForward } from "./partnership-forward";
 import { processPendingGmailSendActions } from "./gmail";
 import { retrySavAction } from "./service";
 import { savSemanticPlan } from "./understanding";
+import { savDossierSourceHash } from "./review-contract";
 const state = vi.hoisted(() => ({ db: null as unknown }));
 vi.mock("@/db", () => ({ requireDb: () => state.db }));
 let fixture: Awaited<ReturnType<typeof createSavTestDb>>;
@@ -44,6 +45,15 @@ const queue = async () => queueSavPartnershipForward((await prepare()).token, "u
 async function changeProposal(mutator: (p: ReturnType<typeof proposal>) => void) {
   const p = proposal(); mutator(p);
   await fixture.db.update(savAgentRuns).set({ proposalCiphertext: encryptSavPayload(p) }).where(eq(savAgentRuns.id, runId));
+}
+async function addCurrentReview(change: (value: ReturnType<typeof proposal>) => void, classification = "correct") {
+  const before = proposal(); const after = structuredClone(before); change(after);
+  const [message] = await fixture.db.select().from(savMessages).where(eq(savMessages.id, messageId));
+  const [decision] = await fixture.db.select().from(savDecisions).where(eq(savDecisions.messageId, messageId));
+  await fixture.db.insert(savProposalReviews).values({ messageId, decisionId: decision.id, agentRunId: runId,
+    reviewScope: "dossier", dossierSourceHash: savDossierSourceHash(before, message), revision: 1, status: "approved", verdict: "correct",
+    dimensions: { classification, routing: "correct", grounding: "correct", tone: "correct", escalation: "correct" },
+    beforeCiphertext: encryptSavPayload(before), afterCiphertext: encryptSavPayload(after), commentCiphertext: encryptSavPayload({ text: "Revue humaine fictive" }), reviewedBy: "ugo@limova.ai" });
 }
 beforeAll(async () => { fixture = await createSavTestDb(); state.db = fixture.db; }, 30000);
 afterAll(async () => { await fixture.client.close(); });
@@ -166,6 +176,35 @@ describe("human-confirmed partnership forward", () => {
     await processPendingGmailSendActions(1, action.id); expect(posts()).toHaveLength(1);
     await changeProposal(p => { p.understanding.requests[0].nature = "technical"; });
     expect(await getSavPartnershipTransferState(threadId)).toMatchObject({ status: "uncertain" });
+  });
+  it.each(["no_ticket_needed", "spam", "internal_notification", "automatic_reply", "bounce", "duplicate"])("honors the current human non-actionable decision %s despite an overall correct verdict", async kind => {
+    const action = await queue();
+    await addCurrentReview(p => { p.decision.kind = kind; p.category = "acknowledgement"; p.ticket.title = "Simple accusé de réception"; });
+    expect(await getSavPartnershipTransferState(threadId)).toMatchObject({ available: false });
+    await expect(prepare()).rejects.toThrow("SAV_PARTNERSHIP_REVIEW_REQUIRED");
+    expect((await processPendingGmailSendActions(1, action.id)).processed[0]).toMatchObject({ status: "failed", errorCode: "SAV_PARTNERSHIP_REVIEW_REQUIRED" });
+    expect(posts()).toHaveLength(0);
+  });
+  it.each(["category", "process", "reason", "classification"])("requires renewed detection for an incompatible current human %s correction", async field => {
+    await addCurrentReview(p => {
+      if (field === "category") p.category = "acknowledgement";
+      if (field === "process") p.process = [{ kind: "verify_outcome", label: "Aucune action nécessaire", sourceIds: [] }];
+      if (field === "reason") p.decision.reasonCode = "simple_acknowledgement";
+    }, field === "classification" ? "partial" : "correct");
+    await expect(prepare()).rejects.toThrow("SAV_PARTNERSHIP_REVIEW_REQUIRED");
+    expect(posts()).toHaveLength(0);
+  });
+  it("preserves compatible human wording improvements without demanding another analysis", async () => {
+    await addCurrentReview(p => {
+      p.ticket.title = "Demande de partenariat de distribution";
+      p.ticket.description = "Description reformulée pour clarifier la collaboration demandée.";
+      p.decision.explanation = "La demande doit être transmise au responsable des partenariats.";
+      p.process[0].label = "Relire le dossier de partenariat avant de confirmer le transfert.";
+    });
+    expect(await getSavPartnershipTransferState(threadId)).toMatchObject({ available: true });
+    const action = await queue();
+    expect((await processPendingGmailSendActions(1, action.id)).processed[0]).toMatchObject({ status: "succeeded" });
+    expect(posts()).toHaveLength(1);
   });
   it("keeps secondary support and finance requests in policy", () => {
     const p = proposal(); expect(savSemanticPlan(p.understanding)).toMatchObject({ ticketRequired: false, replyPolicy: "none" });

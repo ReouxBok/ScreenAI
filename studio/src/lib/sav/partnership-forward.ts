@@ -62,7 +62,19 @@ async function loadContext(threadId: string, db: Reader = requireDb()) {
     return evidence?.source === "current_message" && evidence.sourceId === "current_body" && normalize(current).includes(normalize(evidence.excerpt));
   }))) throw new Error("SAV_PARTNERSHIP_NOT_DETECTED");
   const [review] = await db.select().from(savProposalReviews).where(and(eq(savProposalReviews.messageId, message.id), eq(savProposalReviews.isCurrent, true))).limit(1);
-  if (review && savReviewMatchesProposal(review, { decisionId: decision.id, agentRunId: run.id, proposal, message }) && (review.status !== "approved" || review.verdict !== "correct")) throw new Error("SAV_PARTNERSHIP_REVIEW_REQUIRED");
+  if (review && savReviewMatchesProposal(review, { decisionId: decision.id, agentRunId: run.id, proposal, message })) {
+    const after = savStructuredProposalSchema.parse(decryptSavPayload(review.afterCiphertext));
+    // An overall "correct" verdict does not override the actual human edits.
+    // Wording may improve without new model work, but changed classification,
+    // decision semantics or workflow structure requires a fresh detection.
+    const processStructure = (value: typeof proposal) => value.process.map(step => ({ kind: step.kind, sourceIds: [...step.sourceIds].sort() }));
+    if (review.status !== "approved" || review.verdict !== "correct"
+      || review.dimensions.classification && review.dimensions.classification !== "correct"
+      || !["human_review_required", "ticket_pending", "ticket_created", "attached_to_existing_ticket"].includes(after.decision.kind)
+      || after.category !== proposal.category || after.decision.reasonCode !== proposal.decision.reasonCode
+      || savContentHash(after.understanding) !== savContentHash(proposal.understanding)
+      || savContentHash(processStructure(after)) !== savContentHash(processStructure(proposal))) throw new Error("SAV_PARTNERSHIP_REVIEW_REQUIRED");
+  }
   const body = decryptSavPayload<{ text: string }>(message.bodyCiphertext).text;
   if (body.length > 100000) throw new Error("SAV_PARTNERSHIP_MESSAGE_TOO_LARGE");
   const subject = `Transfert partenariat : ${oneLine(message.subject) || "Demande de partenariat"}`;
