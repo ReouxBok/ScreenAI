@@ -1038,7 +1038,7 @@ async function toggleVoice() {
       onStatus: updateVoiceStatus,
       onState: active => {
         limovaPanel.setVoiceBusy(active);
-        void chrome.runtime.sendMessage({ type: 'VOICE_SESSION_STATE', active }).catch(() => {});
+        void chrome.runtime.sendMessage({ type: 'VOICE_SESSION_STATE', active, engine: 'deep_agents' }).catch(() => {});
       },
     });
     limovaPanel.setVoiceBusy(true);

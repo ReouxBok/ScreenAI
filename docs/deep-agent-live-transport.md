@@ -63,3 +63,9 @@ Avant le premier segment natif de chaque tour, le backend émet `turn.browser_co
 La passerelle accepte une seule réponse pour la demande courante, ajoute le sessionId confirmé et refuse les champs libres. La lecture est asynchrone et ne bloque pas l’ACK des événements. Cancel, interruption et fermeture annulent la lecture en cours ; un résultat tardif est ignoré. Sans autorisation navigateur, aucun échange de contexte n’est admis. Le driver conserve son onglet lié : un changement vers un autre onglet arrête la session au lieu de transférer implicitement son autorisation. La navigation du document reste soumise à ses contrôles de permissions et de version.
 
 Ce contrat nécessite les deux couches API/extension correspondantes avant activation du flag. Il s’agit d’une évolution du protocole en draft, pas d’une capacité déjà déployée. La lecture avant le tour ne garantit pas qu’une page restera immobile ensuite : l’autorisation et le binding sont à nouveau contrôlés lors de chaque action.
+
+## Isolation de l’observateur legacy
+
+Le panneau signale `engine: deep_agents` avec l’état vocal actif. Le background suspend alors son ancien observateur automatique (navigation, modale, interaction) et n’active pas son écouteur de page via `SESSION_STATE`. Les observations en attente sont abandonnées avant capture ou publication dès que la session native est connue. Les commandes vocales legacy tardives sont refusées, y compris le démarrage de leur transport et l’insertion de transcriptions dans leur historique. Le driver Deep Agent demeure responsable des lectures/actions autorisées. Le bouton de capture legacy demande d’utiliser la conversation ; il ne déclenche pas une seconde capture pendant la voix native.
+
+Cette distinction ne modifie pas le chemin entraînement/évaluation encore legacy. L’arrêt natif remet à zéro cet état ; la migration de ces modes reste requise avant de retirer le proxy.

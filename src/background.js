@@ -99,6 +99,7 @@ let lastUserMessage = '';
 let lastUserTurn = null;
 let userTurnSequence = 0;
 let voiceSessionActive = false;
+let nativeVoiceSessionActive = false;
 const userPageInteractionSequences = new Map();
 let trainingState = { active: false, stopping: false, token: null, session: null };
 let evaluationState = { active: false, token: null, run: null, testCase: null, content: null };
@@ -352,6 +353,7 @@ async function finalizeExternalPopupFlow(flow) {
 }
 
 async function handleUrlChange(tabId, url, { force = false } = {}) {
+  if (nativeVoiceSessionActive) return { ok: true, ignored: true };
   if (trainingState.active) {
     await sendContentMessage(tabId, { type: 'TRAINING_STATE', active: true }).catch(() => {});
     const context = await getPageContext(tabId).catch(() => '');
@@ -378,7 +380,9 @@ async function handleUrlChange(tabId, url, { force = false } = {}) {
 
   try {
     const pageContext = await getPageContext(tabId);
+    if (nativeVoiceSessionActive) return { ok: true, ignored: true };
     const pageAnalysis = await capturePageAnalysis(tabId);
+    if (nativeVoiceSessionActive) return { ok: true, ignored: true };
     if (voiceSessionActive) {
       broadcastToSidebar({
         type: 'VOICE_PAGE_CONTEXT',
@@ -495,6 +499,10 @@ function isTrustedMessageSource(request, sender) {
 }
 
 async function handleMessage(request, sender) {
+  if (nativeVoiceSessionActive && ['GET_LIVE_SESSION', 'VOICE_CONTEXT_REQUEST', 'VOICE_ACTION_REQUEST',
+    'VOICE_TEXT_INPUT_REQUEST', 'VOICE_SCROLL_REQUEST', 'VOICE_KB_SEARCH', 'VOICE_TRANSCRIPT'].includes(request.type)) {
+    return { ok: false, error: 'La session vocale utilise la conversation Deep Agent.' };
+  }
   await initializationPromise;
   if (LIMOVA_MESSAGE_TYPES.has(request.type)) {
     if (['LIMOVA_SEND_MESSAGE', 'LIMOVA_RESUME_BROWSER'].includes(request.type) && !(await hasAIProcessingConsent())) {
@@ -671,11 +679,12 @@ async function handleMessage(request, sender) {
 
     case 'VOICE_SESSION_STATE':
       voiceSessionActive = request.active === true;
+      nativeVoiceSessionActive = voiceSessionActive && request.engine === 'deep_agents';
       if (voiceSessionActive && activeAbortController) activeAbortController.abort();
       if (sessionState.lockedTabId) {
         sendContentMessage(sessionState.lockedTabId, {
           type: 'SESSION_STATE',
-          active: sessionState.isActive || voiceSessionActive
+          active: !nativeVoiceSessionActive && (sessionState.isActive || voiceSessionActive)
         }).catch(() => {});
       }
       Logger.event('voice', voiceSessionActive ? 'VOICE_SESSION_MARKED_ACTIVE' : 'VOICE_SESSION_MARKED_INACTIVE');
@@ -1295,6 +1304,7 @@ async function handleUserMessage(text) {
 // ============================================================================
 
 async function handleTakeScreenshot() {
+  if (nativeVoiceSessionActive) return { ok: false, error: 'Demande la capture dans ta conversation Limova.' };
   if (!(await hasAIProcessingConsent())) {
     broadcastToSidebar({ type: 'CONSENT_REQUIRED' });
     return { ok: false, consentRequired: true };
@@ -1400,6 +1410,7 @@ async function handleNextStep() {
 // ============================================================================
 
 async function handleModalDetected(sender, modal = {}) {
+  if (nativeVoiceSessionActive) return { ok: true, ignored: true };
   const tabId = sender?.tab?.id || sessionState.lockedTabId;
   if (!tabId) return { ok: false };
 
@@ -1430,7 +1441,9 @@ async function handleModalDetected(sender, modal = {}) {
 
   try {
     const pageContext = await getPageContext(tabId);
+    if (nativeVoiceSessionActive) return { ok: true, ignored: true };
     const pageAnalysis = await capturePageAnalysis(tabId, operationId);
+    if (nativeVoiceSessionActive) return { ok: true, ignored: true };
 
     if (voiceSessionActive) {
       broadcastToSidebar({
@@ -2813,6 +2826,7 @@ function handleResetSession() {
   userTurnSequence = 0;
   userPageInteractionSequences.clear();
   voiceSessionActive = false;
+  nativeVoiceSessionActive = false;
   externalPopupTabs.clear();
   externalPopupFlow = null;
   if (externalPopupCloseTimer) clearTimeout(externalPopupCloseTimer);
@@ -3241,6 +3255,7 @@ async function getFreshVoiceContext(parentOperationId = null, { capture = false 
 }
 
 async function handleUserPageInteraction(rawInteraction, sender) {
+  if (nativeVoiceSessionActive) return { ok: true, ignored: true };
   if (evaluationState.active) {
     await recordEvaluationEvent({
       kind: 'manual_intervention',
@@ -3261,7 +3276,7 @@ async function handleUserPageInteraction(rawInteraction, sender) {
   const sequence = (userPageInteractionSequences.get(kind) || 0) + 1;
   userPageInteractionSequences.set(kind, sequence);
   await new Promise(resolve => setTimeout(resolve, kind === 'scroll' ? 220 : 320));
-  if (sequence !== userPageInteractionSequences.get(kind) || (!sessionState.isActive && !voiceSessionActive)) {
+  if (nativeVoiceSessionActive || sequence !== userPageInteractionSequences.get(kind) || (!sessionState.isActive && !voiceSessionActive)) {
     return { ok: true, deduplicated: true };
   }
 
@@ -3276,6 +3291,7 @@ async function handleUserPageInteraction(rawInteraction, sender) {
   const operationId = Logger.createOperationId('user-interaction');
   try {
     const pageContext = await getPageContext(tabId);
+    if (nativeVoiceSessionActive) return { ok: true, ignored: true };
     const interactionSummary = kind === 'click'
       ? `Interaction utilisateur observée : clic sur « ${label || 'contrôle sans libellé'} » (${zone}).`
       : kind === 'input'
@@ -3285,6 +3301,7 @@ async function handleUserPageInteraction(rawInteraction, sender) {
     const visualCapture = voiceSessionActive && kind !== 'input'
       ? await capturePageAnalysis(tabId, operationId)
       : null;
+    if (nativeVoiceSessionActive) return { ok: true, ignored: true };
 
     if (voiceSessionActive) {
       broadcastToSidebar({

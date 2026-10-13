@@ -419,6 +419,36 @@ describe('controlled page actions', () => {
     }));
   });
 
+  it('does not inspect or capture pages through the legacy observer during native voice', async () => {
+    chromeMock.scripting.executeScript.mockClear();
+    chromeMock.tabs.captureVisibleTab.mockClear();
+    await background.handleMessage({ type: 'VOICE_SESSION_STATE', active: true, engine: 'deep_agents' }, {});
+    expect(chromeMock.tabs.sendMessage).toHaveBeenCalledWith(17, { type: 'SESSION_STATE', active: false });
+    const interaction = await background.handleMessage({ type: 'USER_PAGE_INTERACTION', interaction: { kind: 'click', label: 'Private page' } }, { tab: { id: 17 } });
+    expect(interaction).toEqual({ ok: true, ignored: true });
+    expect(await background.handleTakeScreenshot()).toMatchObject({ ok: false });
+    expect(chromeMock.scripting.executeScript).not.toHaveBeenCalled();
+    expect(chromeMock.tabs.captureVisibleTab).not.toHaveBeenCalled();
+    expect(sidebarMessages.some(message => message.type === 'VOICE_PAGE_CONTEXT')).toBe(false);
+  });
+
+  it('drops a legacy observation queued before native voice took over', async () => {
+    await background.handleMessage({ type: 'VOICE_SESSION_STATE', active: true }, {});
+    const pending = background.handleMessage({ type: 'USER_PAGE_INTERACTION', interaction: { kind: 'click' } }, { tab: { id: 17 } });
+    await background.handleMessage({ type: 'VOICE_SESSION_STATE', active: true, engine: 'deep_agents' }, {});
+    chromeMock.scripting.executeScript.mockClear();
+    expect(await pending).toMatchObject({ ok: true, deduplicated: true });
+    expect(chromeMock.scripting.executeScript).not.toHaveBeenCalled();
+  });
+
+  it.each(['GET_LIVE_SESSION', 'VOICE_CONTEXT_REQUEST', 'VOICE_ACTION_REQUEST', 'VOICE_TEXT_INPUT_REQUEST', 'VOICE_SCROLL_REQUEST', 'VOICE_KB_SEARCH', 'VOICE_TRANSCRIPT'])(
+    'rejects the late legacy command %s during native voice', async type => {
+      await background.handleMessage({ type: 'VOICE_SESSION_STATE', active: true, engine: 'deep_agents' }, {});
+      chromeMock.scripting.executeScript.mockClear();
+      expect(await background.handleMessage({ type }, {})).toMatchObject({ ok: false });
+      expect(chromeMock.scripting.executeScript).not.toHaveBeenCalled();
+    });
+
   it('keeps observing manual page interactions while a voice session is active', async () => {
     await background.handleMessage({ type: 'VOICE_SESSION_STATE', active: true }, {});
 
