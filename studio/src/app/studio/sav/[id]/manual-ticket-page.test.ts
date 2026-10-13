@@ -8,6 +8,8 @@ vi.mock("@/lib/sav/service", () => ({ getSavThreadDetail: dependencies.detail })
 vi.mock("@/lib/sav/observations", () => ({ getSavObservations: async () => [] }));
 vi.mock("./draft-review", () => ({ DraftReview: () => null }));
 vi.mock("@/lib/sav/review", () => ({ getSavProposalReview: dependencies.review }));
+vi.mock("@/lib/sav/partnership-forward", () => ({ getSavPartnershipTransferState: async () => ({ available: false, status: "unavailable" }), isSavPartnershipForward: (action: { payload: { purpose?: string } }) => action.payload.purpose === "partnership_forward" }));
+vi.mock("../partnership-transfer", () => ({ PartnershipTransfer: () => null }));
 vi.mock("@/lib/sav/cutover", () => ({ isSavMessageEligible: async () => true }));
 vi.mock("@/lib/sav/thread-context", () => ({ getSavRelatedThreads: async () => [] }));
 vi.mock("@/lib/sav/drafts", () => ({ getSavReplyDrafts: async () => ({ versions: [], knowledgeRevision: null }) }));

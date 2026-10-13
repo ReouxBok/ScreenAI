@@ -20,7 +20,7 @@ export function savInboxSubject(subject: string) {
 const requestThemes: Record<string, string> = {
   technical: "Problème technique", account: "Compte et accès", integration: "Aide à une intégration",
   how_to: "Aide à l’utilisation", financial_operation: "Demande financière", financial_data: "Facturation",
-  cancellation: "Demande de résiliation", commercial: "Demande commerciale", callback: "Demande de rappel",
+  cancellation: "Demande de résiliation", commercial: "Demande commerciale", partnership: "Demande de partenariat", callback: "Demande de rappel",
   human_request: "Demande d’assistance humaine", security: "Sécurité", privacy: "Confidentialité",
   data_deletion: "Suppression de données", legal: "Demande juridique", acknowledgement: "Remerciement ou confirmation",
   non_support: "Sollicitation externe",
@@ -39,6 +39,7 @@ function nextAction(input: InboxSummaryInput) {
     || p.understanding?.requests.some(request => ["cancellation", "financial_operation", "financial_data", "legal"].includes(request.nature))) {
     return input.reviewStatus === "approved" ? "Faire traiter la demande par l’équipe humaine." : "Valider le dossier pour une prise en charge humaine.";
   }
+  if (p.understanding?.status === "qualified" && p.understanding.requests.some(request => request.nature === "partnership")) return "Relire la demande de partenariat et préparer le transfert à Nathan.";
   if (input.analysisErrorCode && input.reviewStatus !== "approved") return "Relire la demande et vérifier la proposition avant toute action.";
   if (input.hubspotTicketId) return `Consulter le ticket lié #${input.hubspotTicketId} et vérifier la suite à donner.`;
   if (p.routing.kind === "matched") {

@@ -15,7 +15,11 @@ describe("copilot memory encryption", () => {
 
   it("rejects modified ciphertext", () => {
     const encrypted = encryptMemory({ value: "stable" });
-    expect(() => decryptMemory(`${encrypted.slice(0, -1)}x`)).toThrow();
+    const parts = encrypted.split(".");
+    const ciphertext = Buffer.from(parts[3], "base64url");
+    ciphertext[0] ^= 1; // Change an actual byte, not optional base64 padding bits.
+    parts[3] = ciphertext.toString("base64url");
+    expect(() => decryptMemory(parts.join("."))).toThrow();
   });
 
   it("uses deterministic opaque fingerprints", () => {

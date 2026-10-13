@@ -12,6 +12,8 @@ import { isSavMessageEligible } from "@/lib/sav/cutover";
 import { getSavRelatedThreads } from "@/lib/sav/thread-context";
 import { resolveSavCustomerMessage } from "@/lib/sav/forwarded-identity";
 import { savActionLabels, savToolStatusLabels, savDecisionLabels, savLabel, savRunStatusLabels, savThreadStatusLabels } from "@/lib/sav/labels";
+import { getSavPartnershipTransferState, isSavPartnershipForward } from "@/lib/sav/partnership-forward";
+import { PartnershipTransfer } from "../partnership-transfer";
 import { MailConversation } from "./mail-conversation";
 import { ProposalReview } from "./proposal-review";
 import { ManualTicketStatus } from "./manual-ticket-status";
@@ -66,11 +68,12 @@ export default async function SavThreadPage({ params, searchParams }: { params: 
   const customerMessage = latestInbound ? resolveSavCustomerMessage({ fromEmail: latestInbound.fromEmail, subject: latestInbound.subject, body: latestInbound.body.text }) : null;
   const isForward = customerMessage && customerMessage.kind !== "sender";
   const eligible = latestInbound ? await isSavMessageEligible(latestInbound.id) : false;
-  const [proposalReview, relatedThreads, replyDrafts, observations] = await Promise.all([
+  const [proposalReview, relatedThreads, replyDrafts, observations, partnershipState] = await Promise.all([
     v0 && latestInbound ? getSavProposalReview(latestInbound.id) : null,
     isForward ? Promise.resolve([]) : getSavRelatedThreads(id),
     getSavReplyDrafts(id),
     getSavObservations(id),
+    v0 && !detail.pilotItem ? getSavPartnershipTransferState(id) : null,
   ]);
   const routing = proposalReview?.proposal.routing;
   const savedDossier = latestInbound?.body.supportContext;
@@ -102,7 +105,7 @@ export default async function SavThreadPage({ params, searchParams }: { params: 
   const notes = detail.actions.filter((action) => action.kind === "create_note" && action.noteText);
   const pilotExternalActions = new Set(["create_ticket", "link_ticket", "log_email", "create_note", "send_reply", "update_ticket_status"]);
   const hubspotPortalId = process.env.HUBSPOT_PORTAL_ID ?? "143641967";
-  const replyAction = detail.actions.find((action) => action.kind === "send_reply" && action.messageId === latestInbound?.id && action.payload.manualReplyConfirmed === true);
+  const replyAction = detail.actions.find((action) => action.kind === "send_reply" && !isSavPartnershipForward(action) && action.messageId === latestInbound?.id && action.payload.manualReplyConfirmed === true);
   const replyState = replyAction?.status === "succeeded" ? "sent" : replyAction?.payload.replySendDispatchedAt ? "uncertain" : replyAction && ["pending", "running"].includes(replyAction.status) ? "pending" : null;
   const sendDisabledReason = detail.pilotItem ? "Simulation : aucun email réel ne peut être envoyé depuis ce dossier."
     : customerContextBlocked ? "Identité du client transféré à vérifier : actualisez le contexte avant toute réponse."
@@ -120,7 +123,8 @@ export default async function SavThreadPage({ params, searchParams }: { params: 
     <a className={styles.contextJump} href="#sav-client-context">Voir le contexte client et les actions</a>
     <section className={`sav-thread-grid ${styles.layout}`}>
       <div className={`sav-conversation ${styles.main}`}>
-        <MailConversation key={latestInbound?.id ?? id} messages={detail.messages.map(message => ({ id: message.id, receivedAt: message.receivedAt, direction: message.direction, fromEmail: message.fromEmail, body: { text: message.body.text, attachments: message.body.attachments } }))}/>
+        <MailConversation key={latestInbound?.id ?? id} messages={detail.messages.map(message => ({ id: message.id, receivedAt: message.receivedAt, createdAt: message.createdAt, direction: message.direction, fromEmail: message.fromEmail, body: { text: message.body.text, attachments: message.body.attachments } }))}/>
+        {partnershipState && <PartnershipTransfer key={latestInbound?.id ?? id} threadId={id} state={partnershipState}/>}
         {proposalReview && latestInbound && <ProposalReview data={proposalReview} threadId={detail.thread.id} messageId={latestInbound.id} drafts={replyDrafts} context={{ subject: customerMessage?.subject ?? latestInbound.subject, messageCount: detail.messages.length, relatedCount: relatedThreads.length + (isForward ? dossier?.otherConversations.length ?? 0 : 0), linkedTicketId: detail.thread.hubspotTicketId }} sendAllowed={!sendDisabledReason} sendDisabledReason={sendDisabledReason} replyState={replyState}/>}
         {proposalReview && latestInbound && <DraftReview data={proposalReview} threadId={id} messageId={latestInbound.id} drafts={replyDrafts} sendAllowed={!sendDisabledReason} sendDisabledReason={sendDisabledReason} replyState={replyState}/>}
         <ResolutionObservation rows={observations} isUgo={staff.email.toLowerCase()==="ugo@limova.ai"}/>
@@ -193,12 +197,12 @@ export default async function SavThreadPage({ params, searchParams }: { params: 
               </div>}
               {returnTicket && returnPlan && ticketPresentation && <div><h3>{ticketPresentation.label}</h3><p><strong>{returnTicket.subject}</strong> · #{returnTicket.id}</p><p>{ticketPresentation.explanation}</p>
                 {returnPlan.operation === "reactivate" && <p>La note indiquera que le client est revenu et contiendra le texte de son email affiché dans ce dossier.</p>}
-                {returnCompleted ? <p>Action déjà traitée pour cet email.</p> : returnPlan.operation !== "review" && proposalReview?.review?.status === "approved" ?
+                {returnCompleted ? <p>Action déjà traitée pour cet email.</p> : returnPlan.operation !== "review" && proposalReview?.review?.status === "approved" && ["ticket_pending", "human_review_required"].includes(proposalReview.proposal.decision.kind) ?
                   <form action={returnPlan.operation === "create" ? createTicketAction : linkTicketAction}>
                     <input type="hidden" name="threadId" value={id}/><input type="hidden" name="reviewId" value={proposalReview.review.id}/>
                     <input type="hidden" name="ticketId" value={returnTicket.id}/><input type="hidden" name="returnOperation" value={returnPlan.operation}/>
                     <button className={`primary ${styles.ticketButton}`} disabled={ticketRequestPending || returnUncertain || needsTicketReconciliation || dossier?.crm.status !== "ready"}><span>{ticketPresentation.label}</span><small>{ticketPresentation.title}</small></button>
-                  </form> : <p>{returnPlan.operation === "review" ? "Date de clôture ou statut insuffisant : vérification humaine nécessaire." : "Validez d’abord le dossier pour confirmer cette action."}</p>}
+                  </form> : <p>{returnPlan.operation === "review" ? "Date de clôture ou statut insuffisant : vérification humaine nécessaire." : proposalReview?.review?.status === "approved" ? "La décision validée ne demande aucune action sur ce ticket." : "Validez d’abord le dossier pour confirmer cette action."}</p>}
               </div>}
               {!returnTicket && !returnUncertain && !detail.thread.hubspotTicketId && (needsTicketReconciliation ? <><button className={`primary ${styles.ticketButton}`} disabled><span>Ouvrir un nouveau ticket</span><small>{newTicketTitle}</small></button><p>Création bloquée : vérifiez et rapprochez le ticket existant ci-dessous.</p></> : ticketRequestPending ? <><button className="primary" disabled>Demande HubSpot en attente</button><p>Une demande de création ou de rattachement est déjà enregistrée. Suivi disponible dans le journal d’actions.</p></> : proposalReview?.review?.status === "approved" && ["ticket_pending", "human_review_required"].includes(proposalReview.proposal.decision.kind) ? <>
                 <form action={createTicketAction}><input type="hidden" name="threadId" value={id}/><input type="hidden" name="reviewId" value={proposalReview.review.id}/><label>Si ce client a déjà un ticket ouvert : pourquoi est-ce un problème distinct ?<textarea name="distinctIssueReason" maxLength={2_000} placeholder="Justification humaine, au moins 20 caractères si nécessaire"/></label><button className={`primary ${styles.ticketButton}`} disabled={customerContextBlocked}><span>Ouvrir un nouveau ticket</span><small>{newTicketTitle}</small></button></form>
@@ -219,7 +223,7 @@ export default async function SavThreadPage({ params, searchParams }: { params: 
         <details className={`card ${styles.audit}`}><summary>Traçabilité et journal d’actions</summary>
         <section className="sav-agent-runs"><span className="eyebrow">Traçabilité technique</span><h2>Exécutions de l’agent</h2>{detail.agentRuns.length === 0 ? <p>Aucune exécution enregistrée pour les anciens messages.</p> : <ol>{[...detail.agentRuns].reverse().map((run) => <li key={run.id}><details><summary><span><Bot size={14}/>{run.runtime === "google_adk" ? "Google ADK" : run.runtime.replaceAll("_", " ")}</span><em className={`run-status ${run.status}`}>{savLabel(savRunStatusLabels, run.status)}</em></summary><div className="agent-run-detail"><dl><div><dt>Mode</dt><dd>{run.mode}</dd></div><div><dt>Modèle</dt><dd>{run.model}</dd></div><div><dt>Prompt</dt><dd>{run.promptRevision}</dd></div><div><dt>Durée</dt><dd>{run.durationMs} ms</dd></div></dl>{run.errorCode && <code>{run.errorCode}</code>}{run.fallbackRuntime && <p>Repli de sécurité : {run.fallbackRuntime}</p>}<div><strong>Sources retenues</strong>{run.evidence.length ? <ul>{run.evidence.map((source, index) => <li key={`${run.id}:${source.sourceType}:${source.sourceId}:${index}`}>{source.sourceType} · {source.title}</li>)}</ul> : <small>Aucune source retenue.</small>}</div><div><strong>Outils appelés</strong>{run.toolTrace.length ? <ul>{run.toolTrace.map((tool) => <li key={`${run.id}:${tool.sequence}`}>{tool.name} · {savLabel(savToolStatusLabels, tool.status)} · {tool.durationMs} ms</li>)}</ul> : <small>Aucun outil appelé.</small>}</div></div></details></li>)}</ol>}</section>
 
-        <section className="sav-timeline"><span className="eyebrow">Journal d’actions</span><ol>{detail.actions.map((action) => { const simulated = Boolean(detail.pilotItem && pilotExternalActions.has(action.kind)); return <li key={action.id}><span className={`action-icon ${action.status}`}>{action.status === "succeeded" ? <CheckCircle2 size={14}/> : action.status === "failed" ? <CircleAlert size={14}/> : <Clock3 size={14}/>}</span><div><strong>{savLabel(savActionLabels, action.kind)}</strong><small>{savLabel(savToolStatusLabels, action.status)} · {simulated && action.status === "pending" ? "Simulation · non exécutée" : simulated && action.status === "succeeded" ? "Exécutée · incident du pilote précédent" : action.actorType === "human" ? action.actorEmail : "Charly / système"} · {formatParisDateTime(action.createdAt, { dateStyle: "short", timeStyle: "short" })}</small>{action.errorCode && <code>{action.errorCode}</code>}{action.status === "failed" && !detail.pilotItem && !action.payload.replySendDispatchedAt && !(action.payload.ticketReturnDispatchedAt && !action.payload.ticketReturnCompletedAt) && !(action.payload.ticketCreateDispatchedAt && !action.payload.hubspotTicketId) && <form action={retryAction}><input type="hidden" name="threadId" value={detail.thread.id}/><input type="hidden" name="actionId" value={action.id}/><button className="button small secondary" type="submit">Réessayer</button></form>}</div></li>; })}</ol></section>
+        <section className="sav-timeline"><span className="eyebrow">Journal d’actions</span><ol>{detail.actions.map((action) => { const simulated = Boolean(detail.pilotItem && pilotExternalActions.has(action.kind)); return <li key={action.id}><span className={`action-icon ${action.status}`}>{action.status === "succeeded" ? <CheckCircle2 size={14}/> : action.status === "failed" ? <CircleAlert size={14}/> : <Clock3 size={14}/>}</span><div><strong>{isSavPartnershipForward(action) ? "Transfert partenariat à Nathan" : savLabel(savActionLabels, action.kind)}</strong><small>{savLabel(savToolStatusLabels, action.status)} · {simulated && action.status === "pending" ? "Simulation · non exécutée" : simulated && action.status === "succeeded" ? "Exécutée · incident du pilote précédent" : action.actorType === "human" ? action.actorEmail : "Charly / système"} · {formatParisDateTime(action.createdAt, { dateStyle: "short", timeStyle: "short" })}</small>{action.errorCode && <code>{action.errorCode}</code>}{action.status === "failed" && !detail.pilotItem && !action.payload.replySendDispatchedAt && !action.payload.forwardDispatchedAt && !(action.payload.ticketReturnDispatchedAt && !action.payload.ticketReturnCompletedAt) && !(action.payload.ticketCreateDispatchedAt && !action.payload.hubspotTicketId) && <form action={retryAction}><input type="hidden" name="threadId" value={detail.thread.id}/><input type="hidden" name="actionId" value={action.id}/><button className="button small secondary" type="submit">Réessayer</button></form>}</div></li>; })}</ol></section>
         </details>
       </aside>
     </section>

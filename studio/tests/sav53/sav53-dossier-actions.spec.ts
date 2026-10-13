@@ -79,7 +79,8 @@ test("la liste distingue thème, souci et action sans exposer une erreur techniq
   const failed = page.getByRole("button", { name: "Ouvrir l’email : Assistance téléphonie fictive", exact: true });
   await expect(failed).toContainText("Objet de l’email");
   await expect(failed).toContainText("Aucun résumé fiable disponible. Le message doit être relu.");
-  await expect(failed).toContainText("SAV_AI_TIMEOUT");
+  await expect(failed).toContainText("Diagnostic disponible dans le dossier");
+  await expect(failed.locator('[title="SAV_AI_TIMEOUT"]')).toHaveCount(1);
   await page.screenshot({ path: testInfo.outputPath("sav53-liste-resumes.png"), fullPage: true });
 });
 

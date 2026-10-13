@@ -7,7 +7,7 @@ import type { getSavThreadDetail } from "@/lib/sav/service";
 import styles from "./thread.module.css";
 
 type Message = NonNullable<Awaited<ReturnType<typeof getSavThreadDetail>>>["messages"][number];
-type Messages = Array<Pick<Message, "id" | "receivedAt" | "direction" | "fromEmail"> & { body: Pick<Message["body"], "text" | "attachments"> }>;
+type Messages = Array<Pick<Message, "id" | "receivedAt" | "createdAt" | "direction" | "fromEmail"> & { body: Pick<Message["body"], "text" | "attachments"> }>;
 const dateFormat = { format: (value: Date) => formatParisDateTime(value, { dateStyle: "medium", timeStyle: "short" }) };
 
 function EmailMessage({ message, text = message.body.text }: { message: Messages[number]; text?: string }) {
@@ -21,7 +21,7 @@ function EmailMessage({ message, text = message.body.text }: { message: Messages
 export function MailConversation({ messages }: { messages: Messages }) {
   const [expanded, setExpanded] = useState(false);
   const conversationId = useId();
-  const newestFirst = [...messages].sort((a, b) => b.receivedAt.getTime() - a.receivedAt.getTime() || b.id.localeCompare(a.id));
+  const newestFirst = [...messages].sort((a, b) => b.receivedAt.getTime() - a.receivedAt.getTime() || b.createdAt.getTime() - a.createdAt.getTime() || b.id.localeCompare(a.id));
   const latestInbound = newestFirst.find((message) => message.direction === "inbound");
   const currentText = latestInbound ? splitSavMessageText(latestInbound.body.text).currentText : "";
   // Display-only extraction: the expanded view always uses the complete original

@@ -14,6 +14,8 @@ const dependencies = vi.hoisted(() => ({
     retryAction: vi.fn(), retryAnalysisAction: vi.fn(), reviewPilotItemAction: vi.fn(), qualifyObservationAction: vi.fn(), reviewDraftAction: vi.fn(), reviewProposalAction: vi.fn(), saveReplyDraftAction: vi.fn(), sendStudioReplyAction: vi.fn(),
   },
 }));
+vi.mock("@/lib/sav/partnership-forward", () => ({ getSavPartnershipTransferState: async () => ({ available: false, status: "unavailable" }), isSavPartnershipForward: (action: { payload: { purpose?: string } }) => action.payload.purpose === "partnership_forward" }));
+vi.mock("../partnership-transfer", () => ({ PartnershipTransfer: () => null }));
 vi.mock("@/lib/sav/cutover", () => ({ isSavMessageEligible: dependencies.eligible }));
 vi.mock("@/lib/sav/auth", () => ({ requireSavStaff: dependencies.auth }));
 vi.mock("@/lib/sav/service", () => ({ getSavThreadDetail: dependencies.detail }));
@@ -257,6 +259,18 @@ describe("SAV dossier SSR and human-review guardrails", () => {
     expect(buttonAttributes(await renderPage(), "Envoyer la réponse acceptée")[0]).toContain("disabled");
   });
 
+  it.each(["succeeded", "pending", "failed"] as const)("keeps internal partnership transfer %s separate from customer replies", async status => {
+    vi.stubEnv("SAV_WRITES_DISABLED", "false");
+    const detail = detailFixture();
+    dependencies.review.mockResolvedValue({...reviewFixture(),draftVerdict:{id:"verdict",status:"accepted",draftId:"accepted-draft",stale:false,reason:"",reviewedBy:"ugo@limova.ai"}});
+    detail.actions = [actionFixture({ kind: "send_reply", messageId, status, payload: { purpose: "partnership_forward", manualReplyConfirmed: true, forwardDispatchedAt: now.toISOString() } })];
+    dependencies.detail.mockResolvedValue(detail);
+    const html = await renderPage();
+    expect(buttonAttributes(html, "Envoyer la réponse acceptée")[0]).not.toContain("disabled");
+    expect(html).toContain("Transfert partenariat à Nathan");
+    expect(buttonAttributes(html, "Réessayer")).toHaveLength(0);
+  });
+
   it("shows the reviewed correction in the decision rail instead of the original AI decision", async () => {
     const reviewed = reviewFixture(true);
     reviewed.proposal.decision = { ...reviewed.proposal.decision, kind: "no_ticket_needed", explanation: "DECISION_CORRIGEE_PAR_HUMAIN" };
@@ -413,6 +427,21 @@ it("shows the original customer and the same forwarded return CTA as the backend
   expect(html).toContain('name="returnOperation" value="reactivate"');
   expect(dependencies.related).not.toHaveBeenCalled();
   expect(detail.messages[0].fromEmail).toBe("colleague@limova.ai");
+});
+
+it("does not offer to reopen a matching ticket after a reviewed no-ticket correction", async () => {
+  const detail = detailFixture();
+  detail.messages[0].body.supportContext = { version: 1, messageId, collectedAt: now.toISOString(), customerIdentity: { kind: "sender", email: detail.messages[0].fromEmail },
+    crm: { status: "ready", errorCode: null, data: { errorCode: null, contactFound: true, contactId: "42", identityCandidates: [],
+      tickets: [{ id: "401", subject: detail.messages[0].subject, description: "", status: "open", pipelineId: "0", stageId: "2", ownerId: "71", createdAt: null, updatedAt: null }],
+      routing: { kind: "matched", ticketId: "401", reason: "exact_subject", returnOperation: "reactivate" } } },
+    conversation: null, conversationError: null, otherConversations: [], otherConversationsError: null };
+  const review = reviewFixture(true); review.proposal.decision.kind = "no_ticket_needed";
+  dependencies.detail.mockResolvedValue(detail); dependencies.review.mockResolvedValue(review);
+  const html = await renderPage();
+  expect(buttonAttributes(html, "Repasser en Nouveau")).toHaveLength(0);
+  expect(html).not.toContain('name="returnOperation"');
+  expect(html).toContain("La décision validée ne demande aucune action sur ce ticket.");
 });
 
 it.each([false, true])("does not expose the colleague's old CRM/history for a forward (ambiguous=%s)", async ambiguous => {

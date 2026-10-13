@@ -13,7 +13,7 @@ const threadId = "10000000-0000-4000-8000-000000000001";
 const messageId = "10000000-0000-4000-8000-000000000002";
 beforeEach(() => {
   vi.clearAllMocks(); dependencies.cutover.mockResolvedValue(null); dependencies.incidents.mockResolvedValue([]); dependencies.actions.mockResolvedValue([]);
-  dependencies.inbox.mockResolvedValue([{ threadId, messageId, subject: "Retrouver mes factures", fromEmail: "fiction@example.invalid", receivedAt: new Date("2026-10-02T12:01:00Z"), preview: "Fixture", decisionKind: null, explanation: null, confidence: null, reviewId: null, reviewStatus: null, analysisStatus: "pending", analysisErrorCode: null, aiPaused: false, hubspotTicketId: null }]);
+  dependencies.inbox.mockResolvedValue([{ threadId, messageId, subject: "Retrouver mes factures", fromEmail: "fiction@example.invalid", receivedAt: new Date("2026-10-02T12:01:00Z"), preview: "Fixture", summary: { title: "Retrouver mes factures", problem: "La demande n’a pas encore été analysée.", nextAction: "Consulter le message ; l’analyse est en attente.", sourceLabel: "Objet de l’email", additionalRequests: 0 }, decisionKind: null, explanation: null, confidence: null, reviewId: null, reviewStatus: null, analysisStatus: "pending", analysisErrorCode: null, aiPaused: false, hubspotTicketId: null }]);
 });
 describe("SAV inbox explicit open forms", () => {
   it("renders an accessible POST form bound to the exact row, without running the action during render/prefetch", async () => {

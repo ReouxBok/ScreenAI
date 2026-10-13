@@ -33,6 +33,13 @@ describe("SAV-53 inbox presentation", () => {
     expect(result.additionalRequests).toBe(1); expect(result.nextAction).toContain("prise en charge humaine");
   });
 
+  it("suggests the dedicated partnership preview while keeping mixed financial requests human-led", () => {
+    const source = input(); source.proposal.understanding.requests[0].nature = "partnership";
+    expect(buildSavInboxSummary(source).nextAction).toContain("transfert à Nathan");
+    source.proposal.understanding.requests.push({ ...source.proposal.understanding.requests[0], id: "refund", nature: "financial_operation", financialScope: "support_account" });
+    expect(buildSavInboxSummary(source).nextAction).toContain("prise en charge humaine");
+  });
+
   it("retains a reliable understanding when composition is degraded", () => {
     const result = buildSavInboxSummary({ ...input(), analysisErrorCode: "SAV_REPLY_COHERENCE_REJECTED" });
     expect(result.problem).toBe("L’agent téléphone cesse de répondre."); expect(result.nextAction).toContain("vérifier la proposition");

@@ -36,6 +36,16 @@ describe("Customer mail before SAV proposal", () => {
     expect(html).toContain("Afficher toute la conversation");
   });
 
+  it("breaks a receivedAt tie by createdAt before the id, like the action context", () => {
+    const first = message("z", "inbound", "FIRST_SAME_DATE");
+    const latest = message("a", "inbound", "LATEST_SAME_DATE");
+    first.createdAt = new Date("2026-10-02T12:01:00Z");
+    latest.createdAt = new Date("2026-10-02T12:02:00Z");
+    const html = render([latest, first]);
+    expect(html).toContain("LATEST_SAME_DATE");
+    expect(html).not.toContain("FIRST_SAME_DATE");
+  });
+
   it.each([
     "Le 12 octobre, Support a écrit :\nANCIEN_MESSAGE",
     "De : Support\nEnvoyé : 12 octobre\nÀ : Client\nObjet : Test\nANCIEN_MESSAGE",
