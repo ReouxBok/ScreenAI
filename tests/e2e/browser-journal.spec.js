@@ -209,7 +209,7 @@ test('the continuation runner recovers a lost result response without repeating 
   const result = await page.evaluate(async () => {
     const { createBrowserTurnRunner } = await import('../limova/browser-turn.js');
     const journal = createJournal();
-    let executed = 0, messages = 0, submissions = 0, resumes = 0;
+    let executed = 0, messages = 0, submissions = 0, resumes = 0, authorizations = 0;
     const custom = data => ({ event: 'custom', data });
     async function* waiting() {
       yield custom(action);
@@ -228,18 +228,19 @@ test('the continuation runner recovers a lost result response without repeating 
     };
     const makeRunner = () => createBrowserTurnRunner({ client, journal, readPage: async () => action.target,
       execute: async () => { executed++; return { status: 'completed', observation: 'Clicked once' }; },
-      authorize: async () => {}, notify: () => {} });
+      authorize: async () => { authorizations++; if (executed) throw new Error('Original page has changed'); }, notify: () => {} });
     let failure;
     try { await makeRunner().send(scope, scope.conversationId, 'Act'); } catch (error) { failure = error.message; }
     await journal.close();
     const resumed = await makeRunner().resume(scope, scope.conversationId);
     await journal.close();
-    return { executed, messages, submissions, resumes, failure, resumed };
+    return { executed, messages, submissions, resumes, authorizations, failure, resumed };
   });
   expect(result.executed).toBe(1);
   expect(result.messages).toBe(1);
   expect(result.submissions).toBe(2);
   expect(result.resumes).toBe(1);
+  expect(result.authorizations).toBe(1);
   expect(result.failure).toBe('Lost response');
   expect(result.resumed.state).toBe('completed');
 });

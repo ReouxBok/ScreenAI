@@ -55,7 +55,10 @@ describe('browser turn continuation', () => {
   it('reconnects through recovery without another human message or repeated local action', async () => {
     const h = harness();
     h.journal.run.mockResolvedValue({ state: 'completed', result: { actionId: 'action-1', status: 'completed', observation: 'Saved' } });
+    h.authorize.mockRejectedValue(new Error('Old page version'));
     await h.runner.resume(context, 'conversation');
+    expect(h.authorize).not.toHaveBeenCalled();
+    expect(h.client.getConversation).toHaveBeenCalledTimes(1);
     expect(h.client.sendMessage).not.toHaveBeenCalled();
     expect(h.execute).not.toHaveBeenCalled();
     expect(h.client.sendBrowserResult).toHaveBeenCalledTimes(1);
@@ -67,11 +70,13 @@ describe('browser turn continuation', () => {
     expect(h.execute).toHaveBeenCalledTimes(1);
     expect(h.client.sendBrowserResult).toHaveBeenCalledTimes(1);
   });
-  it('rechecks authorization before claiming an action', async () => {
+  it('records a refusal when authorization fails after the durable claim', async () => {
     const h = harness();
     h.authorize.mockRejectedValue(new Error('Permission revoked'));
-    await expect(h.runner.send(context, 'conversation', 'Hello')).rejects.toThrow('Permission revoked');
-    expect(h.journal.run).not.toHaveBeenCalled();
+    await h.runner.send(context, 'conversation', 'Hello');
+    expect(h.journal.run).toHaveBeenCalledTimes(1);
+    expect(h.execute).not.toHaveBeenCalled();
+    expect(h.client.sendBrowserResult.mock.calls[0][3].status).toBe('rejected');
   });
   it('rejects a continuation from a different turn', async () => {
     const h = harness();
@@ -95,4 +100,13 @@ it('reconciles each result response before deciding which next action to execute
   h.client.sendBrowserResult.mockReturnValueOnce(events(event(second), waiting)).mockReturnValueOnce(events(complete));
   expect(await h.runner.send(context, 'conversation', 'Hello')).toEqual({ state: 'completed', turnId: 'turn' });
   expect(h.execute.mock.calls.map(([action]) => action.actionId)).toEqual(['action-1', 'action-2']);
+});
+
+it('does not dispatch when cancellation occurs during authorization', async () => {
+  const h = harness();
+  const controller = new AbortController();
+  h.authorize.mockImplementation(async () => controller.abort());
+  await expect(h.runner.send(context, 'conversation', 'Hello', controller.signal)).rejects.toThrow();
+  expect(h.execute).not.toHaveBeenCalled();
+  expect(h.client.sendBrowserResult).not.toHaveBeenCalled();
 });
