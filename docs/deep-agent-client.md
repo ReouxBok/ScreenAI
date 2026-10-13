@@ -116,3 +116,26 @@ has finished, so paused browser turns can be cancelled.
 
 The live action dispatcher, page executor, permission checks and uncertainty UI
 remain outstanding. Session creation alone does not activate browser tools.
+
+## Browser continuation runner
+
+`browser-turn.js` coordinates the existing client transport and durable journal.
+It consumes a whole SSE response before executing any advertised action or
+posting a result, so it does not overlap the backend's conversation writer lease.
+Only `custom` / `extension.action_requested` frames followed by a durable waiting
+state can execute. Raw SDK interrupts, conflicting turn IDs, error events and
+missing final browser states cannot produce a successful completion.
+
+Each action rechecks the Limova conversation and an injected browser-authority
+check before entering the journal. A completed receipt is submitted on the same
+turn; an uncertain receipt stops for inspection. The next response determines
+which actions remain pending. Reconnect uses the existing recovery GET and
+`browser_resume`, never a second human message. A lost result response does not
+trigger an automatic retry. The action budget bounds a malformed repeating
+response; it does not mark the backend turn completed.
+
+Ten unit tests and a Chromium test joining the runner with real IndexedDB cover
+these decisions, including lost-response recovery with exactly one local effect.
+The API and executor in this browser test are fixtures. The runner is not yet
+invoked by the worker: the actual authorized page driver, immediate target checks,
+uncertainty UI and end-to-end backend/browser validation remain required.

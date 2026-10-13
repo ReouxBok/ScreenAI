@@ -203,3 +203,43 @@ test('session creation is atomic, persistent and rotated on workspace revocation
   expect(result.executed).toBe(0);
   expect(result.error).toBe('Browser session revoked');
 });
+
+test('the continuation runner recovers a lost result response without repeating the persisted action', async ({ context, extensionId }) => {
+  const page = await journalPage(context, extensionId);
+  const result = await page.evaluate(async () => {
+    const { createBrowserTurnRunner } = await import('../limova/browser-turn.js');
+    const journal = createJournal();
+    let executed = 0, messages = 0, submissions = 0, resumes = 0;
+    const custom = data => ({ event: 'custom', data });
+    async function* waiting() {
+      yield custom(action);
+      yield custom({ type: 'extension.turn_state', turnId: action.turnId, state: 'waiting' });
+    }
+    const client = {
+      getConversation: async () => ({}),
+      sendMessage: () => { messages++; return waiting(); },
+      getBrowserTurn: async () => ({ turnId: action.turnId, status: 'open' }),
+      resumeBrowserTurn: () => { resumes++; return waiting(); },
+      sendBrowserResult: async function* () {
+        submissions++;
+        if (submissions === 1) throw new Error('Lost response');
+        yield custom({ type: 'extension.turn_state', turnId: action.turnId, state: 'completed' });
+      },
+    };
+    const makeRunner = () => createBrowserTurnRunner({ client, journal, readPage: async () => action.target,
+      execute: async () => { executed++; return { status: 'completed', observation: 'Clicked once' }; },
+      authorize: async () => {}, notify: () => {} });
+    let failure;
+    try { await makeRunner().send(scope, scope.conversationId, 'Act'); } catch (error) { failure = error.message; }
+    await journal.close();
+    const resumed = await makeRunner().resume(scope, scope.conversationId);
+    await journal.close();
+    return { executed, messages, submissions, resumes, failure, resumed };
+  });
+  expect(result.executed).toBe(1);
+  expect(result.messages).toBe(1);
+  expect(result.submissions).toBe(2);
+  expect(result.resumes).toBe(1);
+  expect(result.failure).toBe('Lost response');
+  expect(result.resumed.state).toBe('completed');
+});
