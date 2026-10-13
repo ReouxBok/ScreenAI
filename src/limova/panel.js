@@ -1,6 +1,6 @@
 import { createConversationView } from './conversation-view.js';
 
-export function createLimovaPanel({ document, request, render, onBusy }) {
+export function createLimovaPanel({ document, request, render, onBusy, onContextChange = () => {} }) {
   const view = createConversationView();
   const element = id => document.getElementById(id);
   let context = null;
@@ -8,6 +8,7 @@ export function createLimovaPanel({ document, request, render, onBusy }) {
   let turnId = null;
   let generation = 0;
   let busy = false;
+  let voiceBusy = false;
   let sending = false;
 
   async function call(type, fields = {}) {
@@ -16,6 +17,7 @@ export function createLimovaPanel({ document, request, render, onBusy }) {
     return response;
   }
   function setBusy(value) {
+    value = value || voiceBusy;
     busy = value;
     element('limovaCancel').hidden = !value;
     element('limovaWorkspace').disabled = value;
@@ -25,7 +27,7 @@ export function createLimovaPanel({ document, request, render, onBusy }) {
     onBusy(value);
   }
   function feedback(text) { element('authFeedback').textContent = text; element('limovaFeedback').textContent = text; }
-  function clear() { if (element('limovaBrowser')) element('limovaBrowser').checked = false; conversationId = null; turnId = null; sending = false; view.reset(); render(view.snapshot()); setBusy(false); }
+  function clear() { onContextChange(); voiceBusy = false; if (element('limovaBrowser')) element('limovaBrowser').checked = false; conversationId = null; turnId = null; sending = false; view.reset(); render(view.snapshot()); setBusy(false); }
   function options(select, items, placeholder) {
     select.replaceChildren();
     const empty = document.createElement('option');
@@ -137,7 +139,7 @@ export function createLimovaPanel({ document, request, render, onBusy }) {
   function listen(id, event, action) {
     element(id).addEventListener(event, () => { void Promise.resolve().then(action).catch(error => feedback(error.message)); });
   }
-  element('limovaBrowser')?.addEventListener('change', () => { if (!element('limovaBrowser').checked && busy) void call('LIMOVA_CANCEL').catch(error => feedback(error.message)); });
+  element('limovaBrowser')?.addEventListener('change', () => { if (!element('limovaBrowser').checked && busy) { onContextChange(); void call('LIMOVA_CANCEL').catch(error => feedback(error.message)); } });
   element('limovaResume')?.addEventListener('click', () => { void send('', true); });
   listen('limovaLogin', 'click', () => call('LIMOVA_OPEN_APP'));
   listen('limovaRefresh', 'click', refresh);
@@ -150,8 +152,20 @@ export function createLimovaPanel({ document, request, render, onBusy }) {
   });
   listen('limovaConversation', 'change', () => { const id = element('limovaConversation').value; if (id) return open(id); });
   listen('limovaNew', 'click', create);
-  listen('limovaCancel', 'click', () => call('LIMOVA_CANCEL'));
-  return { refresh, send, create, handle, async logout() {
+  listen('limovaCancel', 'click', () => { onContextChange(); return call('LIMOVA_CANCEL'); });
+  return { refresh, send, create, handle,
+    setVoiceBusy(active) { voiceBusy = active; setBusy(Boolean(turnId) || sending); },
+    async prepareVoice() {
+      if (!context || busy) throw new Error('Sélectionne une conversation Limova disponible.');
+      if (!conversationId) await create(true);
+      if (!conversationId || !context) throw new Error('Conversation Limova indisponible.');
+      const current = generation;
+      return { context: { ...context }, conversationId, browserEnabled: element('limovaBrowser')?.checked === true,
+        onNativeEvent(event) { if (current === generation) { view.event(event); render(view.snapshot()); } },
+      };
+    },
+    async logout() {
+    onContextChange();
     await call('LIMOVA_LOGOUT'); ++generation; context = null; clear(); await refresh();
   } };
 }

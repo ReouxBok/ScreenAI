@@ -1,7 +1,7 @@
 import { createLiveBrowserController } from './live-browser-controller.js';
 
 export function createBrowserLiveSession({ openTransport, client, journal, createDriver }) {
-  return async ({ context, conversationId, languageCode, userTimezone, signal,
+  return async ({ context, conversationId, languageCode, userTimezone, signal, browserEnabled = true,
     onEvent = () => {}, onNativeEvent = () => {}, onError = () => {} }) => {
     context = Object.freeze({ ...context });
     const abort = new AbortController();
@@ -21,11 +21,11 @@ export function createBrowserLiveSession({ openTransport, client, journal, creat
       abort.signal.throwIfAborted();
       await client.getConversation(context, conversationId, abort.signal);
       abort.signal.throwIfAborted();
-      const browserSession = await journal.getSession(context);
+      const browserSession = browserEnabled ? await journal.getSession(context) : undefined;
       abort.signal.throwIfAborted();
-      const driver = createDriver({ scope: { ...context, sessionId: browserSession }, journal, signal: abort.signal,
-        uploadScreenshot: (image, signal = abort.signal) => client.uploadBrowserScreenshot(context, conversationId, image, signal) });
-      const browserContext = await driver.readPage(abort.signal);
+      const driver = browserEnabled ? createDriver({ scope: { ...context, sessionId: browserSession }, journal, signal: abort.signal,
+        uploadScreenshot: (image, signal = abort.signal) => client.uploadBrowserScreenshot(context, conversationId, image, signal) }) : undefined;
+      const browserContext = await driver?.readPage(abort.signal);
       abort.signal.throwIfAborted();
       browser = createLiveBrowserController({ context, conversationId, browserSession,
         client, journal, driver, signal: abort.signal,

@@ -8,7 +8,7 @@ export function createLiveBrowserController({ context, conversationId, browserSe
   client, journal, driver, continueBrowser, onError, notify = () => {}, signal }) {
   context = Object.freeze({ ...context });
   const scope = Object.freeze({ ...context, conversationId, sessionId: browserSession });
-  if (![scope.userId, scope.workspaceId, conversationId, browserSession].every(liveUuid)) throw new TypeError('Invalid voice browser scope');
+  if (![scope.userId, scope.workspaceId, conversationId].every(liveUuid) || (browserSession !== undefined && !liveUuid(browserSession))) throw new TypeError('Invalid voice browser scope');
   let current, sessionId, closed = false;
   const cancelTurn = () => {
     const turn = current;
@@ -51,6 +51,7 @@ export function createLiveBrowserController({ context, conversationId, browserSe
     if (event.event === 'error') throw new Error('Native voice stream failed');
     const data = event.event === 'custom' ? event.data : undefined;
     if (['extension.action_requested', 'extension.turn_state'].includes(data?.type)) {
+      if (!browserSession) throw new Error('Browser actions were not authorized for this voice session');
       if (!liveUuid(data.turnId) || (turn.browserId && turn.browserId !== data.turnId)) throw new Error('Browser turn identity changed');
       turn.browserId = data.turnId;
       if (data.type === 'extension.action_requested') {

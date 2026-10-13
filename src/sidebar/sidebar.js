@@ -1,3 +1,10 @@
+import { DeepAgentVoiceSession } from './deep-agent-voice.js';
+import { createBrowserLiveSession } from '../limova/live-browser-session.js';
+import { createLimovaLiveTransport } from '../limova/live-transport.js';
+import { createBrowserJournal } from '../limova/browser-journal.js';
+import { createBrowserDriver } from '../limova/browser-driver.js';
+import { LimovaDeepAgentClient } from '../limova/client.js';
+import { createLimovaSessionFetch } from '../limova/session-fetch.js';
 import { bindSitePermissions } from '../limova/site-permissions.js';
 import { createLimovaPanel } from '../limova/panel.js';
 import { LIMOVA_APP_URL } from '../limova/environment.js';
@@ -87,6 +94,7 @@ document.addEventListener('DOMContentLoaded', async () => {
   bindSitePermissions({ document, permissions: chrome.permissions, tabs: chrome.tabs });
   limovaPanel = createLimovaPanel({
     document,
+    onContextChange: () => { if (voiceSession?.native) voiceSession.stop(); },
     request: request => chrome.runtime.sendMessage(request),
     onBusy: busy => { isLoading = busy; elements.sendBtn.disabled = busy; },
     render: renderLimovaConversation,
@@ -97,6 +105,15 @@ document.addEventListener('DOMContentLoaded', async () => {
 });
 
 function initEventListeners() {
+  chrome.storage.onChanged.addListener((changes, area) => {
+    if (area !== 'local' || !voiceSession?.native || !voiceSession.active) return;
+    const scope = changes.limova_deep_agent_context_v1?.newValue;
+    const expected = voiceSession.parameters;
+    if ((changes.limova_deep_agent_context_v1 && (!scope || scope.userId !== expected.context.userId
+      || scope.workspaceId !== expected.context.workspaceId || scope.conversationId !== expected.conversationId))
+      || changes.limova_ai_processing_consent_v1?.newValue === false) voiceSession.stop();
+  });
+
   elements.userInput.addEventListener('input', handleInputChange);
   elements.userInput.addEventListener('keydown', handleInputKeydown);
   elements.sendBtn.addEventListener('click', sendMessage);
@@ -410,6 +427,7 @@ async function recoverTrainingMicrophonePermission() {
 }
 
 async function startEvaluation() {
+  if (voiceSession?.native) voiceSession.stop();
   const token = elements.evaluationToken.value.trim();
   if (token.length < 24) { elements.evaluationFeedback.textContent = 'Collez le code complet créé dans le Studio.'; return; }
   elements.evaluationStart.disabled = true;
@@ -664,7 +682,7 @@ function handleBackgroundMessage(message) {
       break;
 
     case 'VOICE_PAGE_CONTEXT':
-      voiceSession?.updatePageContext(
+      voiceSession?.updatePageContext?.(
         message.pageContext,
         message.contextVersion,
         message.source,
@@ -972,13 +990,60 @@ async function toggleVoice() {
     voiceSession.stop();
     return;
   }
-  if (!(await ensureAIConsent())) return;
-  if (!voiceSession || voiceSession.trainingMode !== trainingCaptureActive) {
-    voiceSession = new window.LimovaVoiceSession({ trainingMode: trainingCaptureActive });
-  }
   try {
+    if (!(await ensureAIConsent())) return;
+    const mode = await chrome.runtime.sendMessage({ type: 'GET_STATE', clientSurface: 'chrome_extension' });
+    if (trainingCaptureActive || mode?.training || mode?.evaluation) {
+      voiceSession = new window.LimovaVoiceSession({ trainingMode: Boolean(trainingCaptureActive || mode?.training) });
+      try { await voiceSession.start(); } catch (_) {}
+      return;
+    }
+    const parameters = await limovaPanel.prepareVoice();
+    const client = new LimovaDeepAgentClient(createLimovaSessionFetch(chrome));
+    const journal = createBrowserJournal();
+    const openSession = createBrowserLiveSession({ client, journal, openTransport: createLimovaLiveTransport(chrome),
+      createDriver: options => createBrowserDriver({ ...options, chrome, hasConsent: async () => {
+        const [privacy, state] = await Promise.all([
+          chrome.runtime.sendMessage({ type: 'GET_PRIVACY_STATE' }),
+          chrome.runtime.sendMessage({ type: 'GET_STATE', clientSurface: 'chrome_extension' }),
+        ]);
+        return privacy?.aiProcessing === true && !state?.training && !state?.evaluation
+          && document.getElementById('limovaBrowser')?.checked === true;
+      } }),
+    });
+    voiceSession = new DeepAgentVoiceSession({ openSession,
+      parameters: { ...parameters, languageCode: getLangCode(), userTimezone: Intl.DateTimeFormat().resolvedOptions().timeZone },
+      onNativeEvent: parameters.onNativeEvent,
+      requestMicrophone: async () => {
+        const [target] = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
+        const stream = await new window.LimovaVoiceSession().requestMicrophone();
+        try {
+          const [active] = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
+          if (target?.id && active?.url === chrome.runtime.getURL('src/sidebar/microphone-permission.html'))
+            await chrome.tabs.update(target.id, { active: true });
+          return stream;
+        } catch (error) {
+          stream.getTracks().forEach(track => track.stop());
+          throw error;
+        }
+      },
+      validate: async signal => {
+        const [privacy, state] = await Promise.all([
+          chrome.runtime.sendMessage({ type: 'GET_PRIVACY_STATE' }),
+          chrome.runtime.sendMessage({ type: 'GET_STATE', clientSurface: 'chrome_extension' }),
+          client.getConversation(parameters.context, parameters.conversationId, signal),
+        ]);
+        if (!privacy?.aiProcessing || state?.training || state?.evaluation) throw new Error('Le contexte de la session vocale a changé.');
+      },
+      onStatus: updateVoiceStatus,
+      onState: active => {
+        limovaPanel.setVoiceBusy(active);
+        void chrome.runtime.sendMessage({ type: 'VOICE_SESSION_STATE', active }).catch(() => {});
+      },
+    });
+    limovaPanel.setVoiceBusy(true);
     await voiceSession.start();
-  } catch (_) {}
+  } catch (error) { limovaPanel.setVoiceBusy(false); updateVoiceStatus({ status: 'error', error: error.message }); }
 }
 
 function updateVoiceStatus({ status, error, errorKey }) {

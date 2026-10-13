@@ -27,6 +27,21 @@ beforeEach(() => {
 });
 
 describe('Limova panel session and turn boundaries', () => {
+  it('binds voice to the selected chat, locks selection and drops events after logout', async () => {
+    const { panel, render } = setup({ LIMOVA_GET_STATE: () => state });
+    await panel.refresh();
+    const voice = await panel.prepareVoice();
+    expect(voice).toMatchObject({ context: state.context, conversationId: 'c', browserEnabled: false });
+    panel.setVoiceBusy(true);
+    expect(element('limovaConversation').disabled).toBe(true);
+    await expect(panel.prepareVoice()).rejects.toThrow();
+    panel.setVoiceBusy(false);
+    expect(element('limovaConversation').disabled).toBe(false);
+    await panel.logout(); render.mockClear();
+    voice.onNativeEvent({ event: 'messages', data: [{ id: 'late', type: 'ai', content: 'obsolete' }, {}] });
+    expect(render).not.toHaveBeenCalled();
+  });
+
   it('restores the authorized workspace and history using Limova only', async () => {
     const { panel, render, request } = setup();
     await panel.refresh();
