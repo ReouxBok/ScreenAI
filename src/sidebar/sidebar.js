@@ -1,3 +1,5 @@
+import { TrainingTranscriptionSession } from './training-transcription.js';
+import { createTranscriptionTransport } from '../limova/transcription-transport.js';
 import { DeepAgentVoiceSession } from './deep-agent-voice.js';
 import { createBrowserLiveSession } from '../limova/live-browser-session.js';
 import { createLimovaLiveTransport } from '../limova/live-transport.js';
@@ -487,7 +489,7 @@ function showTrainingActive(session) {
 
 async function stopTrainingCapture() {
   elements.trainingStop.disabled = true;
-  if (voiceSession?.active) voiceSession.stop();
+  if (voiceSession?.active) await voiceSession.stop();
   voiceSession = null;
   if (!trainingScreenRecorder || !activeTrainingSession || !activeTrainingToken) {
     elements.trainingStop.disabled = false;
@@ -985,6 +987,20 @@ function sendNextStepRequest() {
   });
 }
 
+async function requestVoiceMicrophone() {
+  const [target] = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
+  const stream = await new window.LimovaVoiceSession().requestMicrophone();
+  try {
+    const [active] = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
+    if (target?.id && active?.url === chrome.runtime.getURL('src/sidebar/microphone-permission.html'))
+      await chrome.tabs.update(target.id, { active: true });
+    return stream;
+  } catch (error) {
+    stream.getTracks().forEach(track => track.stop());
+    throw error;
+  }
+}
+
 async function toggleVoice() {
   if (voiceSession?.active) {
     voiceSession.stop();
@@ -993,8 +1009,36 @@ async function toggleVoice() {
   try {
     if (!(await ensureAIConsent())) return;
     const mode = await chrome.runtime.sendMessage({ type: 'GET_STATE', clientSurface: 'chrome_extension' });
-    if (trainingCaptureActive || mode?.training || mode?.evaluation) {
-      voiceSession = new window.LimovaVoiceSession({ trainingMode: Boolean(trainingCaptureActive || mode?.training) });
+    if (trainingCaptureActive || mode?.training) {
+      if (!mode?.training?.id) throw new Error('Aucune démonstration active.');
+      const parameters = { ...limovaPanel.prepareTranscription(), languageCode: getLangCode(), trainingSessionId: mode.training.id };
+      const client = new LimovaDeepAgentClient(createLimovaSessionFetch(chrome));
+      const transcription = new TrainingTranscriptionSession({ parameters, openSession: createTranscriptionTransport(chrome), requestMicrophone: requestVoiceMicrophone,
+        validate: async signal => {
+          const [privacy, current] = await Promise.all([
+            chrome.runtime.sendMessage({ type: 'GET_PRIVACY_STATE', clientSurface: 'chrome_extension' }),
+            chrome.runtime.sendMessage({ type: 'GET_STATE', clientSurface: 'chrome_extension' }),
+            client.validateContext(parameters.context, signal),
+          ]);
+          if (!privacy?.aiProcessing || current?.training?.id !== parameters.trainingSessionId || current?.evaluation)
+            throw new Error('La démonstration ou son autorisation a changé.');
+        },
+        saveNote: async (text, partial) => {
+          const result = await chrome.runtime.sendMessage({ type: 'TRAINING_TRANSCRIPT', trainingSessionId: parameters.trainingSessionId, text, partial });
+          if (!result?.ok) throw new Error(result?.error || 'La note vocale n’a pas pu être enregistrée.');
+          elements.trainingFeedback.textContent = 'Explication enregistrée. Continuez votre démonstration : Charly observe sans agir.';
+        },
+        onStatus: status => { if (voiceSession === transcription) updateVoiceStatus(status); },
+        onState: active => {
+          limovaPanel.setVoiceBusy(active);
+          void chrome.runtime.sendMessage({ type: 'VOICE_SESSION_STATE', active, trainingMode: true, engine: 'transcription' }).catch(() => {});
+        },
+      });
+      voiceSession = transcription;
+      await transcription.start(); return;
+    }
+    if (mode?.evaluation) {
+      voiceSession = new window.LimovaVoiceSession();
       try { await voiceSession.start(); } catch (_) {}
       return;
     }
@@ -1004,7 +1048,7 @@ async function toggleVoice() {
     const openSession = createBrowserLiveSession({ client, journal, openTransport: createLimovaLiveTransport(chrome),
       createDriver: options => createBrowserDriver({ ...options, chrome, hasConsent: async () => {
         const [privacy, state] = await Promise.all([
-          chrome.runtime.sendMessage({ type: 'GET_PRIVACY_STATE' }),
+          chrome.runtime.sendMessage({ type: 'GET_PRIVACY_STATE', clientSurface: 'chrome_extension' }),
           chrome.runtime.sendMessage({ type: 'GET_STATE', clientSurface: 'chrome_extension' }),
         ]);
         return privacy?.aiProcessing === true && !state?.training && !state?.evaluation
@@ -1014,22 +1058,10 @@ async function toggleVoice() {
     voiceSession = new DeepAgentVoiceSession({ openSession,
       parameters: { ...parameters, languageCode: getLangCode(), userTimezone: Intl.DateTimeFormat().resolvedOptions().timeZone },
       onNativeEvent: parameters.onNativeEvent,
-      requestMicrophone: async () => {
-        const [target] = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
-        const stream = await new window.LimovaVoiceSession().requestMicrophone();
-        try {
-          const [active] = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
-          if (target?.id && active?.url === chrome.runtime.getURL('src/sidebar/microphone-permission.html'))
-            await chrome.tabs.update(target.id, { active: true });
-          return stream;
-        } catch (error) {
-          stream.getTracks().forEach(track => track.stop());
-          throw error;
-        }
-      },
+      requestMicrophone: requestVoiceMicrophone,
       validate: async signal => {
         const [privacy, state] = await Promise.all([
-          chrome.runtime.sendMessage({ type: 'GET_PRIVACY_STATE' }),
+          chrome.runtime.sendMessage({ type: 'GET_PRIVACY_STATE', clientSurface: 'chrome_extension' }),
           chrome.runtime.sendMessage({ type: 'GET_STATE', clientSurface: 'chrome_extension' }),
           client.getConversation(parameters.context, parameters.conversationId, signal),
         ]);
@@ -1166,7 +1198,7 @@ function showAIConsent() {
 
 async function ensureAIConsent() {
   try {
-    const state = await chrome.runtime.sendMessage({ type: 'GET_PRIVACY_STATE' });
+    const state = await chrome.runtime.sendMessage({ type: 'GET_PRIVACY_STATE', clientSurface: 'chrome_extension' });
     if (state?.aiProcessing) return true;
   } catch (_) {}
   showAIConsent();

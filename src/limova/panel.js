@@ -155,6 +155,10 @@ export function createLimovaPanel({ document, request, render, onBusy, onContext
   listen('limovaCancel', 'click', () => { onContextChange(); return call('LIMOVA_CANCEL'); });
   return { refresh, send, create, handle,
     setVoiceBusy(active) { voiceBusy = active; setBusy(Boolean(turnId) || sending); },
+    prepareTranscription() {
+      if (!context || busy) throw new Error('Sélectionne un espace Limova disponible.');
+      return { context: { ...context }, conversationId };
+    },
     async prepareVoice() {
       if (!context || busy) throw new Error('Sélectionne une conversation Limova disponible.');
       if (!conversationId) await create(true);

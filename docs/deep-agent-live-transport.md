@@ -44,7 +44,7 @@ Le test Chromium comprend maintenant une variante avec le vrai client HTTP first
 
 Les tests unitaires couvrent le contrat d’identité, les commandes interdites, les séquences, les limites, les consommateurs bloqués et les coupures. Le test Chromium `tests/e2e/limova-live-session.spec.js` utilise un serveur HTTPS/Socket.IO local et un vrai cookie HttpOnly/Secure/Partitioned. Il vérifie l’origine app, le cookie reçu, les octets PCM, le binding navigateur, les identifiants distincts du tour vocal et navigateur, le retour exact d’un résultat, l’annulation et la fermeture sans répétition. Il simule le contrat backend de `session.ready` et de continuation : il ne qualifie pas un déploiement Limova ou un provider audio réel.
 
-Les builds production et staging embarquent chacun leurs origines fixes. Le validateur vérifie les deux passerelles compilées et refuse un endpoint production dans le paquet staging.
+Les builds production et staging embarquent chacun leurs origines fixes. Le validateur vérifie les trois passerelles compilées et refuse un endpoint production dans le paquet staging.
 
 ## Microphone du panneau
 
@@ -68,4 +68,15 @@ Ce contrat nécessite les deux couches API/extension correspondantes avant activ
 
 Le panneau signale `engine: deep_agents` avec l’état vocal actif. Le background suspend alors son ancien observateur automatique (navigation, modale, interaction) et n’active pas son écouteur de page via `SESSION_STATE`. Les observations en attente sont abandonnées avant capture ou publication dès que la session native est connue. Les commandes vocales legacy tardives sont refusées, y compris le démarrage de leur transport et l’insertion de transcriptions dans leur historique. Le driver Deep Agent demeure responsable des lectures/actions autorisées. Le bouton de capture legacy demande d’utiliser la conversation ; il ne déclenche pas une seconde capture pendant la voix native.
 
-Cette distinction ne modifie pas le chemin entraînement/évaluation encore legacy. L’arrêt natif remet à zéro cet état ; la migration de ces modes reste requise avant de retirer le proxy.
+L’arrêt natif remet à zéro cet état. Le mode évaluation conserve encore son chemin legacy ; sa migration reste requise avant de retirer le proxy.
+
+
+## Transcription des démonstrations Studio
+
+Le micro d’entraînement utilise le namespace existant `/voice/transcribe` via une troisième passerelle first-party, avec le cookie de l’app et le workspace sélectionné. Il ne crée aucune conversation et aucun agent. La confirmation de session valide compte/workspace/surface, fréquence 16 kHz et taille maximale des trames ; les paquets audio portent le sessionId et une séquence. Aucun audio n’est conservé hors connexion ni rejoué après une coupure.
+
+Les transcriptions partielles remplacent l’aperçu courant. Chaque résultat final est enregistré comme `voice_note` dans la démonstration active ; le texte est découpé en labels de 500 unités UTF-16 sans couper les paires Unicode. L’arrêt explicite sauvegarde la dernière transcription partielle et attend les notes avant de terminer la capture. Une révocation des droits abandonne la transcription partielle. Le background vérifie le consentement et l’identité de démonstration avant chaque fragment ; une écriture échouée arrête le flux sans répétition automatique. Les événements Studio ont un délai réseau maximal de quinze secondes.
+
+Le micro réutilise le worklet PCM natif. Les contrôles d’identité, workspace, flag et consentement sont revérifiés toutes les cinq secondes ; l’arrêt ferme le transport et les pistes. L’observation de la démonstration reste active, alors que l’ancien moteur de décision vocal n’est pas démarré.
+
+Le test `limova-training-transcription.spec.js` utilise le vrai bouton micro, le transport, le worklet et le background avec API/provider/Studio simulés localement. Il vérifie les octets audio, une note finale unique, l’absence de session vocale legacy et l’arrêt après retrait du consentement. Il utilise le paquet production en environnement isolé : le paquet staging n’autorise volontairement pas le Studio de production. Un Studio staging et une qualification avec compte/provider réels restent nécessaires. Ce test ne couvre pas l’enregistrement vidéo complet.

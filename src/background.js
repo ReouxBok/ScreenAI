@@ -613,7 +613,7 @@ async function handleMessage(request, sender) {
 
     case 'GET_PRIVACY_STATE': {
       const state = await chrome.storage.local.get(AI_CONSENT_KEY);
-      const memory = await getCopilotBootstrap(false).catch(() => null);
+      const memory = request.clientSurface === 'chrome_extension' ? null : await getCopilotBootstrap(false).catch(() => null);
       return {
         aiProcessing: state[AI_CONSENT_KEY] === true,
         aiProcessingDecided: state[AI_CONSENT_KEY] !== undefined,
@@ -648,6 +648,9 @@ async function handleMessage(request, sender) {
         '',
         () => getFreshVoiceContext(null, { capture: request.capture === true })
       );
+
+    case 'TRAINING_TRANSCRIPT':
+      return storeTrainingTranscript(request);
 
     case 'VOICE_TRANSCRIPT':
       return storeVoiceTranscript(request.role, request.text);
@@ -860,7 +863,7 @@ async function recordTrainingEvent(rawEvent) {
   }
   const token = trainingState.token;
   const queued = trainingEventQueue.then(async () => {
-    const response = await fetch(`${TRAINING_API_URL}/events`, { method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` }, body: JSON.stringify(event) });
+    const response = await fetch(`${TRAINING_API_URL}/events`, { method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` }, body: JSON.stringify(event), signal: AbortSignal.timeout(15000) });
     if (!response.ok) Logger.warn('training', 'TRAINING_EVENT_REJECTED', { kind: event.kind, status: response.status });
     return { ok: response.ok };
   });
@@ -3328,6 +3331,23 @@ async function handleUserPageInteraction(rawInteraction, sender) {
     }, 'USER_PAGE_INTERACTION_REFRESH_FAILED', operationId);
     return { ok: false, error: 'Le contexte de page n’a pas pu être rafraîchi.' };
   }
+}
+
+async function storeTrainingTranscript({ trainingSessionId, text, partial }) {
+  if (!(await hasAIProcessingConsent()) || !trainingState.active || trainingState.session?.id !== trainingSessionId
+    || typeof text !== 'string' || !text.trim() || text.length > 32000) return { ok: false, error: 'Démonstration ou transcription indisponible.' };
+  const chunks = Array.from(text.trim()).reduce((result, character) => {
+    if (!result.length || result[result.length - 1].length + character.length > 500) result.push(character);
+    else result[result.length - 1] += character;
+    return result;
+  }, []);
+  for (const label of chunks) {
+    if (!(await hasAIProcessingConsent()) || !trainingState.active || trainingState.session?.id !== trainingSessionId) return { ok: false, error: 'La démonstration ou le consentement a changé.' };
+    const result = await recordTrainingEvent({ kind: 'voice_note', path: sessionState.lastUrl || '/', label,
+      payload: { source: 'limova_transcription', partial: partial === true } });
+    if (!result?.ok) return { ok: false, error: 'La note vocale n’a pas pu être enregistrée.' };
+  }
+  return { ok: true };
 }
 
 async function storeVoiceTranscript(role, text) {

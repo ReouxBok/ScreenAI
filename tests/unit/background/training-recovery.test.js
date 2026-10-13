@@ -27,6 +27,25 @@ describe('training recovery after a Manifest V3 worker restart', () => {
     vi.restoreAllMocks();
   });
 
+  it('stores native transcript notes only in the matching demonstration without truncating text', async () => {
+    const chromeMock = installFullChromeMock();
+    await chromeMock.storage.local.set({ limova_ai_processing_consent_v1: true });
+    await chromeMock.storage.session.set({ charly_training_active_v1: { token, session, savedAt: Date.now() } });
+    globalThis.fetch = vi.fn(async () => ({ ok: true, status: 200, json: async () => ({}) }));
+    vi.resetModules(); await import('../../../src/background.js');
+    const text = 'A'.repeat(499) + '🙂' + 'é'.repeat(501);
+    expect(await dispatchFromSidebar(chromeMock, { type: 'TRAINING_TRANSCRIPT', trainingSessionId: 'other', text })).toMatchObject({ ok: false });
+    expect(globalThis.fetch).not.toHaveBeenCalled();
+    expect(await dispatchFromSidebar(chromeMock, { type: 'TRAINING_TRANSCRIPT', trainingSessionId: session.id, text })).toEqual({ ok: true });
+    const notes = globalThis.fetch.mock.calls.filter(([url]) => String(url).endsWith('/events')).map(([, options]) => JSON.parse(options.body));
+    expect(notes.map(note => note.label).join('')).toBe(text);
+    expect(notes.every(note => note.kind === 'voice_note' && note.label.length <= 500 && note.payload.source === 'limova_transcription')).toBe(true);
+    await chromeMock.storage.local.set({ limova_ai_processing_consent_v1: false });
+    globalThis.fetch.mockClear();
+    expect(await dispatchFromSidebar(chromeMock, { type: 'TRAINING_TRANSCRIPT', trainingSessionId: session.id, text: 'After revocation' })).toMatchObject({ ok: false });
+    expect(globalThis.fetch).not.toHaveBeenCalled();
+  });
+
   it('restores event capture and finalizes with the persisted training token', async () => {
     const chromeMock = installFullChromeMock();
     await chromeMock.storage.session.set({

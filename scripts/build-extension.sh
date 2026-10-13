@@ -76,6 +76,13 @@ cp "$ROOT_DIR/src/limova/app-live-bridge.entry.js" "$BUILD_DIR/src/limova/app-li
   --outfile="$BUILD_DIR/src/limova/app-live-bridge.js" --log-level=warning
 rm "$BUILD_DIR/src/limova/app-live-bridge.entry.js"
 
+cp "$ROOT_DIR/src/limova/app-transcription-bridge.entry.js" "$BUILD_DIR/src/limova/app-transcription-bridge.entry.js"
+"$ROOT_DIR/node_modules/.bin/esbuild" \
+  "$BUILD_DIR/src/limova/app-transcription-bridge.entry.js" \
+  --bundle --format=iife --platform=browser --target=chrome114 \
+  --outfile="$BUILD_DIR/src/limova/app-transcription-bridge.js" --log-level=warning
+rm "$BUILD_DIR/src/limova/app-transcription-bridge.entry.js"
+
 echo "==> Bundling the private training-video uploader..."
 "$ROOT_DIR/node_modules/.bin/esbuild" \
   "$ROOT_DIR/src/sidebar/training-recording-upload.entry.js" \

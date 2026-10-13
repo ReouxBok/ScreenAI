@@ -13,7 +13,7 @@ try {
   if (fs.readFileSync(path.join(target, 'src/limova/environment.js'), 'utf8') !== environmentModule(environment)) {
     failures.push('runtime environment module does not match the package environment');
   }
-  for (const name of ['app-session-bridge', 'app-live-bridge']) {
+  for (const name of ['app-session-bridge', 'app-live-bridge', 'app-transcription-bridge']) {
     const bridge = fs.readFileSync(path.join(target, `src/limova/${name}.js`), 'utf8');
     if (!bridge.includes(environment.appOrigin) || !bridge.includes(environment.apiOrigin)) failures.push(`${name} environment mismatch`);
     if (environment.name === 'staging' && /https:\/\/(?:api\.)?new\.limova\.ai/.test(bridge)) failures.push(`${name} staging bridge contains a production endpoint`);

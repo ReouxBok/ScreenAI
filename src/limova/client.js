@@ -135,6 +135,8 @@ export class LimovaDeepAgentClient {
     if (!workspace || requireEnabled && !workspace.enabled) throw new LimovaClientError('LIMOVA_EXTENSION_DISABLED', 'L’extension n’est pas activée pour cet espace.');
   }
 
+  async validateContext(context, signal) { await this.#assertContext(context, signal); }
+
   async createConversation(context, title = 'Discussion avec Charly', signal) {
     await this.#assertContext(context, signal);
     const agent = await this.#request('/agent/by-slug/charly', { workspaceId: context.workspaceId, signal, expectedContext: { ...context } });
