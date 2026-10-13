@@ -24,7 +24,8 @@ import { analyzeSavMessage, type SavAnalysis } from "./intelligence";
 import { savPrimaryAnalysisDiagnostic } from "./analysis-errors";
 import { collectSavDossierContext, type SavDossierContext } from "./dossier-context";
 import { assertSavActor } from "./access";
-import { savStructuredProposalSchema, type SavProposalRouting } from "./proposal";
+import { savStructuredProposalSchema, type SavProposalRouting, type SavStructuredProposal } from "./proposal";
+import { buildSavInboxSummary } from "./inbox-summary";
 import { savReviewMatchesProposal } from "./review-contract";
 import { redactSavLearningText } from "./learning-extraction";
 import { invalidateSavReplies } from "./invalidation";
@@ -681,11 +682,22 @@ export async function listSavInbox(limit = 100, options: { offset?: number; quer
   const normalize = (row: Awaited<ReturnType<typeof readBatch>>[number]) => {
     const { _review: review, _proposal: ciphertext, _body: bodyCiphertext, _runId: runId, ...entry } = row;
     let matches = false;
+    let originalProposal: SavStructuredProposal | null = null;
+    let proposal: SavStructuredProposal | null = null;
     try {
-      matches = Boolean(entry.decisionId && runId && ciphertext && savReviewMatchesProposal(review, { decisionId: entry.decisionId, agentRunId: runId,
-        proposal: savStructuredProposalSchema.parse(decryptSavPayload(ciphertext)), message: { bodyCiphertext, subject: entry.subject, fromEmail: entry.fromEmail } }));
-    } catch { /* An unreadable proposal cannot retain a verdict. */ }
-    return { ...entry, reviewId: matches ? entry.reviewId : null, reviewStatus: matches ? entry.reviewStatus : null };
+      originalProposal = ciphertext ? savStructuredProposalSchema.parse(decryptSavPayload(ciphertext)) : null;
+      proposal = originalProposal;
+      matches = Boolean(entry.decisionId && runId && originalProposal && savReviewMatchesProposal(review, { decisionId: entry.decisionId, agentRunId: runId,
+        proposal: originalProposal, message: { bodyCiphertext, subject: entry.subject, fromEmail: entry.fromEmail } }));
+      // Same contract as the detail: current human corrections win, while the
+      // understanding and draft still belong to the current generation.
+      if (matches && review && originalProposal) proposal = { ...savStructuredProposalSchema.parse(decryptSavPayload(review.afterCiphertext)),
+        understanding: originalProposal.understanding, replyDraft: originalProposal.replyDraft, replyAssessment: originalProposal.replyAssessment };
+    } catch { matches = false; proposal = originalProposal; /* An unreadable proposal cannot retain a verdict. */ }
+    const reviewStatus = matches ? entry.reviewStatus : null;
+    return { ...entry, reviewId: matches ? entry.reviewId : null, reviewStatus,
+      summary: buildSavInboxSummary({ subject: entry.subject, analysisStatus: entry.analysisStatus, analysisErrorCode: entry.analysisErrorCode,
+        hubspotTicketId: entry.hubspotTicketId, proposal, originalProposal, reviewStatus }) };
   };
   const pageSize = Math.min(250, Math.max(1, limit));
   const offset = Math.max(0, Math.min(100_000, options.offset ?? 0));

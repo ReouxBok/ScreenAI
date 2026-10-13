@@ -2,7 +2,7 @@ import { formatParisDateTime } from "@/lib/paris-date";
 import Link from "next/link";
 import { getSavV0Cutover } from "@/lib/sav/cutover";
 import { listSavActionIncidents, listSavInbox, listSavWebhookIncidents } from "@/lib/sav/service";
-import { savActionLabels, savDecisionLabels, savLabel } from "@/lib/sav/labels";
+import { savActionLabels, savLabel } from "@/lib/sav/labels";
 import { retryWebhookAction } from "./actions";
 import { openSavEmailAction } from "./open-email-actions";
 import { OpenEmailButton } from "./open-email-button";
@@ -18,7 +18,7 @@ export async function SavV0Inbox({ searchParams }: { searchParams: Promise<{ vie
     <p className="login-notice">{cutover ? `Activation : ${formatParisDateTime(cutover.receivedAfter)}. Les anciens emails restent hors de cette file.` : "Activation non effectuée : aucun ancien email ne sera proposé rétroactivement."}{process.env.SAV_WRITES_DISABLED === "true" && " Écritures externes bloquées."}</p>
     <nav className="sav-tabs" aria-label="Vues SAV">{[["all", "Tous les emails"], ["pending", "À valider"], ["reviewed", "Revues faites"], ["human", "Reprise humaine"], ["errors", "Erreurs"], ["technical", "Exclusions techniques"]].map(([key, label]) => <Link key={key} className={view === key ? "active" : ""} href={`/studio/sav?view=${key}`}>{label}</Link>)}<Link href="/studio/sav/connaissances">Connaissances</Link><Link href="/studio/sav/resolutions">Résolutions</Link><Link href="/studio/sav/pilote">Laboratoire</Link><Link href="/studio/sav/evaluation">Évaluation et décision</Link></nav>
     <form className="sav-search" method="get"><input type="hidden" name="view" value={view}/><label htmlFor="sav-q">Rechercher dans toute la file</label><div><input id="sav-q" name="q" defaultValue={q} maxLength={200} placeholder="Expéditeur, objet ou extrait…"/><button>Rechercher</button></div></form>
-    <section className="decision-ledger" aria-label="Emails synchronisés"><header><span>Email</span><span>Qualification</span><span>État de la proposition</span></header>
+    <section className="decision-ledger" aria-label="Emails synchronisés"><header><span>Demande</span><span>Suite à donner</span><span>État de la proposition</span></header>
       {rows.slice(0, 50).map((row) => {
         const hasReview = row.reviewStatus === "approved" || row.reviewStatus === "rejected";
         const proposalState = row.reviewStatus === "approved" ? "Validée"
@@ -28,13 +28,13 @@ export async function SavV0Inbox({ searchParams }: { searchParams: Promise<{ vie
           : row.analysisStatus === "done" ? "À relire" : "Analyse en attente";
         return <form action={openSavEmailAction} key={row.messageId} className={styles.openForm}>
         <input type="hidden" name="threadId" value={row.threadId}/><input type="hidden" name="messageId" value={row.messageId}/>
-        <OpenEmailButton subject={row.subject}>
+        <OpenEmailButton subject={row.summary.title}>
         <span className="ledger-rail" aria-hidden="true"><i className={row.reviewId ? "decided" : "missing"}/></span>
-        <span className="ledger-mail"><small>{formatParisDateTime(row.receivedAt)}</small><strong>{row.subject}</strong><span>{row.fromEmail}</span><p>{row.preview}</p></span>
-        <span className="ledger-decision"><strong>{row.decisionKind ? savLabel(savDecisionLabels, row.decisionKind) : "Analyse en attente"}</strong><p>{row.explanation}</p>{row.confidence !== null && <small>Estimation IA non calibrée · validation humaine requise.</small>}</span>
+        <span className={`ledger-mail ${styles.demand}`}><small>{formatParisDateTime(row.receivedAt)} · {row.summary.sourceLabel}</small><strong title={row.summary.title}>{row.summary.title}</strong><span>{row.fromEmail}</span><p title={row.summary.problem}>{row.summary.problem}</p>{row.summary.additionalRequests > 0 && <small>{row.summary.additionalRequests} autre{row.summary.additionalRequests > 1 ? "s" : ""} demande{row.summary.additionalRequests > 1 ? "s" : ""} dans le dossier</small>}</span>
+        <span className={`ledger-decision ${styles.nextAction}`}><strong>Action proposée</strong><p title={row.summary.nextAction}>{row.summary.nextAction}</p><small>{hasReview ? "Décision humaine enregistrée" : "À confirmer par un humain"}</small></span>
         <span className={`ledger-action ${styles.state}`}>
           <strong>{proposalState}</strong>
-          {row.analysisErrorCode && <><small>{hasReview ? "Analyse IA dégradée" : "Revue humaine nécessaire"}</small><code>{row.analysisErrorCode}</code></>}
+          {row.analysisErrorCode && <><small>{hasReview ? "Analyse IA dégradée" : "Revue humaine nécessaire"}</small><small className={styles.diagnostic} title={row.analysisErrorCode}>Diagnostic disponible dans le dossier</small></>}
           {row.hubspotTicketId && <small>HubSpot #{row.hubspotTicketId}</small>}
         </span>
         </OpenEmailButton>
