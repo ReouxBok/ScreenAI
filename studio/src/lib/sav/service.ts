@@ -1113,8 +1113,8 @@ export async function getSavThreadDetail(threadId: string) {
           noteText = null;
         }
       }
-      const { bodyCiphertext: _privateBody, ...safePayload } = action.payload;
-      void _privateBody;
+      const { bodyCiphertext: _privateBody, previewCiphertext: _privatePreview, ...safePayload } = action.payload;
+      void _privateBody; void _privatePreview;
       return { ...action, payload: safePayload, draftText, noteText };
     }),
   };
@@ -1338,6 +1338,7 @@ export async function queueSavTicketCreation(threadId: string, actorEmail: strin
 export async function retrySavAction(actionId: string, actorEmail: string) {
   const db = requireDb();
   const [current] = await db.select().from(savActions).where(eq(savActions.id, actionId)).limit(1);
+  if (current?.payload.purpose === "partnership_forward") throw new Error(current.payload.forwardDispatchedAt ? "SAV_PARTNERSHIP_RECONCILIATION_REQUIRED" : "SAV_PARTNERSHIP_CONFIRMATION_REQUIRED");
   if (current?.payload.ticketReturnDispatchedAt && !current.payload.ticketReturnCompletedAt) throw new Error("SAV_TICKET_RETURN_RECONCILIATION_REQUIRED");
   if ((current?.errorCode === "SAV_MANUAL_RECONCILIATION_REQUIRED" || current?.payload.ticketCreateDispatchedAt) && !current?.payload.hubspotTicketId) throw new Error("SAV_MANUAL_RECONCILIATION_REQUIRED");
   const [action] = await db.update(savActions).set({ status: "pending", attemptCount: 0, scheduledAt: null, errorCode: null, updatedAt: new Date() })

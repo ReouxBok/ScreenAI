@@ -1,10 +1,10 @@
 import { z } from "zod";
 
-export const SAV_UNDERSTANDING_REVISION = "sav-understanding-2026-10-12.v1";
-export const SAV_UNDERSTANDING_PROMPT_REVISION = "sav-understanding-prompt-2026-10-12.v2";
+export const SAV_UNDERSTANDING_REVISION = "sav-understanding-2026-10-13.v2";
+export const SAV_UNDERSTANDING_PROMPT_REVISION = "sav-understanding-prompt-2026-10-13.v3";
 const id = z.string().trim().min(1).max(100);
 const ids = z.array(id).max(30);
-export const savRequestNatureSchema = z.enum(["technical", "account", "integration", "how_to", "financial_operation", "financial_data", "cancellation", "commercial", "callback", "human_request", "security", "privacy", "data_deletion", "legal", "acknowledgement", "non_support", "unknown"]);
+export const savRequestNatureSchema = z.enum(["technical", "account", "integration", "how_to", "financial_operation", "financial_data", "cancellation", "commercial", "partnership", "callback", "human_request", "security", "privacy", "data_deletion", "legal", "acknowledgement", "non_support", "unknown"]);
 const fact = z.object({ id, key: id, text: z.string().trim().min(1).max(1000), evidenceIds: ids.min(1) }).strict();
 
 /** Meaning first. Categories and reply permissions are computed separately below. */
@@ -86,12 +86,13 @@ export function savSemanticPlan(u: SavUnderstandingV1): SavSemanticPlan {
   if (u.requests.some(r => r.nature === "cancellation")) return { ...base, replyPolicy: "none", reasonCode: "cancellation_human_only" };
   if (u.requests.some(r => ["financial_operation", "financial_data"].includes(r.nature))) return { ...base, replyPolicy: "none", reasonCode: "finance_human_only" };
   if (u.requests.some(r => r.nature === "legal")) return { ...base, replyPolicy: "none", reasonCode: "legal_human_only" };
+  if (u.requests.every(r => ["partnership", "acknowledgement"].includes(r.nature)) && u.requests.some(r => r.nature === "partnership")) return { ...base, replyPolicy: "none", ticketRequired: false, reasonCode: "partnership_human_forward" };
   if (u.requests.every(r => r.nature === "commercial")) return u.customerRelationship?.kind === "prospect"
     ? { ...base, replyPolicy: "lead_template", ticketRequired: false, reasonCode: "lead_product_information" }
     : { ...base, replyPolicy: "none", ticketRequired: false, reasonCode: "commercial_context_to_review" };
   if (u.requests.every(r => ["non_support", "acknowledgement"].includes(r.nature))) return { ...base, replyPolicy: "none", ticketRequired: false, reasonCode: nature === "acknowledgement" ? "simple_acknowledgement" : "non_support_review" };
   // Commercial commitments in a mixed support request stay under human review.
-  const sensitive = u.requests.some(r => ["human_request", "callback", "security", "privacy", "data_deletion", "legal", "commercial"].includes(r.nature));
+  const sensitive = u.requests.some(r => ["human_request", "callback", "security", "privacy", "data_deletion", "legal", "commercial", "partnership"].includes(r.nature));
   return { ...base, replyPolicy: "compose", requiresHuman: sensitive || u.uncertainties.length > 0, reasonCode: sensitive ? "sensitive_or_human_request" : "semantic_support_request" };
 }
 

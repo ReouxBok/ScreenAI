@@ -421,6 +421,7 @@ function restrictedSemanticAnalysis(understanding: SavUnderstandingV1): SavAnaly
     : understanding.status === "needs_clarification" ? "La demande ne peut pas être qualifiée de façon fiable. Vérifier les ambiguïtés et les informations manquantes avant de préparer une réponse."
       : plan.reasonCode === "cancellation_human_only" ? "La demande actuelle inclut une résiliation : dossier humain uniquement, aucun brouillon IA."
         : ["finance_human_only", "legal_human_only"].includes(plan.reasonCode) ? "La demande financière ou juridique est réservée à l’équipe humaine : proposer un ticket, aucun brouillon de réponse."
+          : plan.reasonCode === "partnership_human_forward" ? "Demande de partenariat : préparer un transfert à Nathan, puis confirmer l’envoi après avoir relu l’aperçu."
           : "Aucune réponse IA ni création automatique de ticket n’est proposée pour ce message.";
   return { category: plan.category, urgency: "normal", model: understanding.trace.model ?? "rules-v1", understanding,
     proposal: { kind: plan.reasonCode === "simple_acknowledgement" ? "no_ticket_needed" : "human_review_required", reasonCode: plan.reasonCode,
