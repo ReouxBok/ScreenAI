@@ -19,6 +19,18 @@ function harness() {
 }
 
 describe('browser-enabled live session composition', () => {
+  it('opens voice without inspecting any page when browser consent is absent', async () => {
+    const h = harness();
+    const session = await h.start({ context, conversationId: id, browserEnabled: false });
+    expect(h.client.getConversation).toHaveBeenCalledOnce();
+    expect(h.journal.getSession).not.toHaveBeenCalled();
+    expect(h.createDriver).not.toHaveBeenCalled();
+    expect(h.openTransport).toHaveBeenCalledWith(expect.objectContaining({ browserSession: undefined, browserContext: undefined }));
+    session.sendAudio(new Uint8Array([0, 0]));
+    expect(h.live.sendAudio).toHaveBeenCalledOnce();
+    session.stop();
+  });
+
   it('opens an authorized page binding and scopes screenshot uploads to the conversation', async () => {
     const h = harness();
     const session = await h.start({ context, conversationId: id });

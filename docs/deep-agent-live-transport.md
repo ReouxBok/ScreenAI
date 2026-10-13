@@ -20,7 +20,7 @@ Le handle retourné expose `continueBrowser({ turnId, kind, browserContext, brow
 
 Les champs sont limités au contrat existant : résultats completed/rejected/failed, observation de 32 000 caractères maximum, identifiants d’action/outil bornés, référence image UUID éventuelle et contexte de page validé. Aucun contenu utilisateur supplémentaire, agent alternatif ou destination arbitraire. Une continuation ne peut partir que pour le tour vocal actif d’une session ayant déclaré son binding navigateur ; au maximum 100 envois par tour, sans mise en file Socket.IO hors connexion. Annulation et fin de tour invalident cette possibilité.
 
-Le transport seul ne lance pas d’actions. Le contrôleur décrit ci-dessous compose ce transport avec le driver et le journal ; le rafraîchissement proactif du contexte entre tours et le branchement au panneau restent à réaliser. `onEvent` doit rapidement enregistrer les frames dans sa propre file puis rendre la main : ne pas attendre l’exécution d’une action ou sa réponse vocale dans ce callback, car l’acquittement transport est borné à 5 secondes.
+Le transport seul ne lance pas d’actions. Le contrôleur décrit ci-dessous compose ce transport avec le driver et le journal ; le rafraîchissement proactif du contexte entre tours reste à réaliser. Le panneau utilise désormais cette composition pour la voix utilisateur. `onEvent` doit rapidement enregistrer les frames dans sa propre file puis rendre la main : ne pas attendre l’exécution d’une action ou sa réponse vocale dans ce callback, car l’acquittement transport est borné à 5 secondes.
 
 ## Contrôleur navigateur vocal
 
@@ -28,7 +28,7 @@ Le transport seul ne lance pas d’actions. Le contrôleur décrit ci-dessous co
 
 `createLiveBrowserController` ingère les octets SSE sans attendre les actions dans `onEvent`. Son buffer d’entrée est borné à 256 Ko et le parseur commun conserve ses limites de taille. Seules les frames `extension.action_requested` suivies d’un état `waiting` cohérent déclenchent le journal, après une nouvelle vérification HTTP et l’autorisation du driver. Le reçu obtenu est envoyé via `continueBrowser`, avec un contexte relu après l’action. Maximum 100 continuations par tour ; un reçu incertain provoque un arrêt explicite, jamais un rejeu automatique.
 
-L’annulation interrompt le parseur et le signal du driver ; un résultat tardif n’est pas envoyé. Une erreur ferme la session composée et remonte une seule notification. Le changement de compte/workspace et les modes entraînement/évaluation devront annuler cette session depuis le futur raccordement au panneau/background. Le bouton micro existant n’utilise pas encore cette composition.
+L’annulation interrompt le parseur et le signal du driver ; un résultat tardif n’est pas envoyé. Une erreur ferme la session composée et remonte une seule notification. Le panneau arrête la session lors du changement de contexte stocké ou du retrait du consentement. Une vérification HTTP toutes les cinq secondes contrôle le compte, le workspace et le flag ; elle contrôle aussi les modes entraînement/évaluation. Ces modes conservent temporairement leur transport legacy.
 
 Le test Chromium comprend maintenant une variante avec le vrai client HTTP first-party, le vrai driver DOM et IndexedDB. Le serveur local redemande le même `read_page` : deux reçus identiques sont transmis, pour une seule exécution DOM. Compte, flag, conversation et provider restent simulés par le serveur local ; cela ne prouve pas le fonctionnement d’un déploiement réel.
 
@@ -37,11 +37,21 @@ Le test Chromium comprend maintenant une variante avec le vrai client HTTP first
 - Aucune reconnexion, répétition du démarrage ni mise en file d’audio hors connexion. Une session interrompue nécessite un nouveau démarrage explicite.
 - Trames PCM paires, limitées par le serveur (au plus 8 KiB) et à 64 Ko/s ; arrêt si le buffer Socket.IO est congestionné.
 - Événements serveur livrés un à un avec acquittement du consommateur ; délai de 5 secondes, taille et nombre de trames en attente bornés. Une fermeture/navigation de l’app coupe le transport.
-- Pas de refresh automatique au milieu du WebSocket : le futur contrôleur doit vérifier/renouveler la session HTTP avant le démarrage puis vérifier l’identité confirmée par le serveur.
-- La coordination du flag en cours de session, du changement de workspace, des actions navigateur suspendues et de la lecture/interruption audio reste à implémenter. L’acquittement transport ne prouve ni lecture sonore ni exécution d’une action.
+- Pas de refresh automatique au milieu du WebSocket : le client vérifie la session HTTP avant le démarrage et le transport valide l’identité confirmée par le serveur. Le superviseur périodique réutilise la vérification HTTP, y compris son refresh existant.
+- Le contrôle périodique du flag peut laisser un délai maximal de cinq secondes côté panneau ; les autorisations backend restent nécessaires avant les effets. La qualification réelle des changements de contexte pendant une action suspendue reste à effectuer. L’acquittement transport ne prouve ni lecture sonore ni exécution d’une action.
 
 ## Vérification
 
 Les tests unitaires couvrent le contrat d’identité, les commandes interdites, les séquences, les limites, les consommateurs bloqués et les coupures. Le test Chromium `tests/e2e/limova-live-session.spec.js` utilise un serveur HTTPS/Socket.IO local et un vrai cookie HttpOnly/Secure/Partitioned. Il vérifie l’origine app, le cookie reçu, les octets PCM, le binding navigateur, les identifiants distincts du tour vocal et navigateur, le retour exact d’un résultat, l’annulation et la fermeture sans répétition. Il simule le contrat backend de `session.ready` et de continuation : il ne qualifie pas un déploiement Limova ou un provider audio réel.
 
 Les builds production et staging embarquent chacun leurs origines fixes. Le validateur vérifie les deux passerelles compilées et refuse un endpoint production dans le paquet staging.
+
+## Microphone du panneau
+
+`DeepAgentVoiceSession` relie le bouton micro à la conversation sélectionnée et aux événements natifs du même historique. Les transcriptions ne sont pas renvoyées comme un deuxième message humain. Pendant la connexion et la capture, les contrôles de sélection sont bloqués et la boucle legacy reçoit l’état vocal actif.
+
+`openNativeAudio` utilise un AudioWorklet local, mono PCM16 little-endian, avec trames de 20 ms à la fréquence négociée (16 ou 24 kHz en entrée). Le worklet dispose de 25 crédits et attend les acquittements de capture ; un dépassement arrête la session. La lecture conserve la séquence serveur et limite la file à 30 secondes. L’interruption arrête les sources audio et rapporte le temps joué. L’arrêt ferme les contextes et libère les pistes micro.
+
+Sans consentement navigateur, aucune session de journal ni aucun driver DOM n’est construit pour la voix. Le contrôleur continue à traiter les événements natifs, mais refuse les commandes navigateur. Le consentement AI reste requis.
+
+`limova-native-voice-panel.spec.js` clique sur le vrai bouton, avec le vrai transport first-party et un microphone Chromium simulé. Il vérifie l’identité et la conversation au démarrage, les trames PCM, l’absence d’appel `/api/live-session`, puis l’arrêt après retrait du consentement. Le serveur local simule l’API et le provider. `native-audio.spec.js` qualifie séparément le worklet et la lecture ; il neutralise la fermeture automatique de sa page de permission, sans prétendre qualifier le parcours réel d’autorisation. Un test avec compte/provider réels reste requis avant activation.
