@@ -3,6 +3,7 @@
 //          modal detection, and sidebar communication.
 // SECURITY: API keys are stored on the proxy server, never in the extension.
 
+import { createBrowserDriver } from './limova/browser-driver.js';
 import Logger from './utils/logger.js';
 import { createLimovaBackground, LIMOVA_MESSAGE_TYPES } from './limova/background.js';
 import { buildSystemPrompt } from './prompts/system-prompt.js';
@@ -35,6 +36,8 @@ const VISUAL_CAPTURE_JPEG_QUALITY = 55;
 const DEFAULT_LANG = (chrome.i18n.getUILanguage() || 'en').split('-')[0].toLowerCase();
 let currentLang = DEFAULT_LANG;
 const limovaBackground = createLimovaBackground({
+  createDriver: ({ scope, journal, signal }) => createBrowserDriver({ chrome, scope, journal,
+    hasConsent: async () => !signal.aborted && !trainingState.active && !evaluationState.active && await hasAIProcessingConsent() }),
   storage: chrome.storage.local,
   openTab: options => chrome.tabs.create(options),
   notify: message => broadcastToSidebar(message),
@@ -491,11 +494,11 @@ function isTrustedMessageSource(request, sender) {
 async function handleMessage(request, sender) {
   await initializationPromise;
   if (LIMOVA_MESSAGE_TYPES.has(request.type)) {
-    if (request.type === 'LIMOVA_SEND_MESSAGE' && !(await hasAIProcessingConsent())) {
+    if (['LIMOVA_SEND_MESSAGE', 'LIMOVA_RESUME_BROWSER'].includes(request.type) && !(await hasAIProcessingConsent())) {
       broadcastToSidebar({ type: 'CONSENT_REQUIRED' });
       return { ok: false, consentRequired: true, error: 'Consentement IA requis.' };
     }
-    if ((trainingState.active || evaluationState.active) && request.type === 'LIMOVA_SEND_MESSAGE') {
+    if ((trainingState.active || evaluationState.active) && ['LIMOVA_SEND_MESSAGE', 'LIMOVA_RESUME_BROWSER'].includes(request.type)) {
       return { ok: false, error: 'Termine le mode formateur ou évaluation avant de reprendre une conversation personnelle.' };
     }
     return limovaBackground.handle(request);

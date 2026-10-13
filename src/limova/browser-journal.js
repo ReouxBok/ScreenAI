@@ -120,6 +120,17 @@ export function createBrowserJournal() {
         return { record: { sessionId }, answer: sessionId };
       });
     },
+    async allocateVersion(scope) {
+      scope = Object.freeze(structuredClone(scope));
+      const key = sessionKey(scope);
+      if (!identifier(scope.sessionId)) throw new Error('Invalid browser session');
+      return change(await getDatabase(), key, current => {
+        const previous = current.contextVersion ?? 0;
+        if (!Number.isSafeInteger(previous) || previous < 0 || previous >= Number.MAX_SAFE_INTEGER) throw new Error('Browser context version exhausted');
+        const contextVersion = previous + 1;
+        return { record: { ...current, contextVersion }, answer: contextVersion };
+      }, scope);
+    },
     async revokeSession(scope) {
       sessionKey(scope);
       const prefix = JSON.stringify([scope.userId, scope.workspaceId]).slice(0, -1) + ',';

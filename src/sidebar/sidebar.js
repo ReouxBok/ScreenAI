@@ -1,3 +1,4 @@
+import { bindSitePermissions } from '../limova/site-permissions.js';
 import { createLimovaPanel } from '../limova/panel.js';
 
 /**
@@ -82,6 +83,7 @@ document.addEventListener('DOMContentLoaded', async () => {
   applyTranslations();
   updateLangSwitcher();
   renderAnnouncements();
+  bindSitePermissions({ document, permissions: chrome.permissions, tabs: chrome.tabs });
   limovaPanel = createLimovaPanel({
     document,
     request: request => chrome.runtime.sendMessage(request),

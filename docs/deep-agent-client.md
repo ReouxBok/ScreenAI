@@ -139,3 +139,39 @@ these decisions, including lost-response recovery with exactly one local effect.
 The API and executor in this browser test are fixtures. The runner is not yet
 invoked by the worker: the actual authorized page driver, immediate target checks,
 uncertainty UI and end-to-end backend/browser validation remain required.
+
+## Isolated document driver foundation
+
+`browser-document.js` is a self-contained function for `chrome.scripting` in the
+ISOLATED world. Its document token, context version and element map stay in a
+private closure. DOM `data-lid` attributes do not select targets. Detached nodes,
+changed target fingerprints, stale versions, covered targets and sensitive text
+fields are rejected. A successful document operation advances the context
+version; the driver must allocate versions and bind the Chrome document identity.
+
+It supports bounded visible-page observations, click, text input, scroll and
+highlight. Observations omit input values and explicitly private/sensitive DOM
+regions, and remain valid JSON within 32,000 characters. This is not a guarantee
+that arbitrary page text contains no sensitive data. Reading is viewport-bound
+and limited; frames/shadow roots and richer page extraction remain to validate.
+Clicks report dispatch, not business success, and scroll reports actual movement.
+
+Ten Chromium tests inject the actual function into a routed HTTPS fixture page
+and exercise real DOM effects and isolation. They do not exercise the final worker
+or a live Limova model. Navigation, redacted screenshots, the privileged Chrome
+driver, monotonic versions across navigation/restart and uncertainty handling
+remain to connect before enabling browser actions.
+
+The local Chrome binding transport keeps Chrome's `documentId` separate from the isolated registry token. Subsequent commands target `documentIds` explicitly; a missing document is never retried against the tab's replacement document. Context versions are allocated in strict IndexedDB transactions on the current private session record, shared across connections and retained after reopening storage. Revoked sessions cannot allocate versions. Session rotation starts a new counter namespace; backend session validation remains required. This transport is not yet connected to the worker's action dispatch or permission lifecycle.
+
+`browser-driver.js` assembles the authority checks, journal version allocator and document transport for a captured account/workspace/session. It pins the first active tab, requires consent and Chrome origin permission, and exposes only the public page tuple. Authority is checked again after allocating the next version and before dispatch. Navigation and screenshots are not implemented in this driver yet and return an explicit rejection; activeTab-only grants and the permission-request UI remain to be integrated before multi-site rollout. The worker does not activate this driver yet.
+
+The worker now constructs the browser runner for messages explicitly opted in through the panel checkbox. The opt-in resets after each send and account/conversation reset; unchecking during a turn requests cancellation. The outer worker checks AI processing consent and excludes staff training/evaluation, while the driver rechecks those conditions through its consent callback. Ordinary messages stay text-only. The panel surfaces uncertain results without replaying them. This is a local integration: backend HTTP publication, reconnect/resume UI, navigation/screenshots, multi-site permission requests and end-to-end live API validation remain outstanding.
+
+The panel now offers an explicit browser-turn resume button. It requires a fresh browser opt-in and invokes `LIMOVA_RESUME_BROWSER`; the worker uses the runner's existing-session recovery (`getBrowserTurn` then `resumeBrowserTurn`) without sending another human message. AI consent and staff-mode exclusion apply to resume as well as send. Absent/cancelled/uncertain states are displayed. Actual worker-restart recovery against the deployed API is still unverified.
+
+Navigation now dispatches `location.assign` inside the exact bound isolated document after destination HTTPS/credential validation and Chrome origin permission checks. Destination permission is checked again immediately before source authority validation and dispatch. The observation confirms dispatch only, never successful loading. A lost document response remains uncertain through the journal; it is not retried automatically. Waiting for destination readiness before submitting the receipt remains to be integrated; if the immediate page read encounters navigation in progress, explicit resume can recover the stored receipt. Screenshot transport remains unimplemented.
+
+`readPage` now waits up to 15 seconds while Chrome reports a loading or pending navigation, using tab update/removal events. Abort, closed/discarded tabs and timeout stop the wait and remove listeners; no action is retried. Site permission and authority are checked after readiness. This confirms Chrome's load status, not application hydration or business success; subsequent DOM reads still determine available targets.
+
+The manifest declares optional HTTPS host access; it does not grant all HTTPS sites at installation. The panel requests one normalized origin directly from the user's click, and can suggest the active origin when Chrome exposes its URL. Otherwise the user can paste the site's address. Credentials, wildcards and non-HTTPS URLs are refused. The per-message browser opt-in remains separate. See https://developer.chrome.com/docs/extensions/reference/api/permissions . A Chromium check verifies the real request call for an already granted host and absence of a wildcard grant; accepting a new host permission prompt still needs end-to-end validation.

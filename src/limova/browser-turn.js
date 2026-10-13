@@ -37,10 +37,16 @@ export function createBrowserTurnRunner({ client, journal, readPage, execute, au
       if (++count > MAX_ACTIONS_PER_TURN) throw new Error('Browser action limit reached');
       const action = pending.actions[0];
       await client.getConversation(context, conversationId, signal);
-      await authorize(context, action, signal);
       signal?.throwIfAborted();
       const scope = { ...context, conversationId, sessionId };
       const receipt = await journal.run(scope, action, async validated => {
+        signal?.throwIfAborted();
+        try {
+          await authorize(context, validated, signal);
+        } catch {
+          signal?.throwIfAborted();
+          return { status: 'rejected', observation: 'Browser action is no longer authorized for this page.' };
+        }
         signal?.throwIfAborted();
         return execute(validated, signal);
       });

@@ -2,7 +2,7 @@ import { describe, expect, it, vi } from 'vitest';
 import { createLimovaBackground } from '../../../src/limova/background.js';
 
 const KEY = 'limova_deep_agent_context_v1';
-function harness() {
+function harness(options = {}) {
   const state = {};
   const storage = {
     get: vi.fn(async key => ({ [key]: state[key] })),
@@ -24,7 +24,7 @@ function harness() {
     clearAccount: vi.fn().mockResolvedValue(undefined),
   };
   const notify = vi.fn();
-  return { state, storage, client, journal, notify, background: createLimovaBackground({ storage, client, journal, notify, openTab: vi.fn() }) };
+  return { state, storage, client, journal, notify, background: createLimovaBackground({ storage, client, journal, notify, openTab: vi.fn(), ...options }) };
 }
 async function open(background) {
   await background.handle({ type: 'LIMOVA_SELECT_WORKSPACE', workspaceId: 'workspace-1' });
@@ -131,4 +131,49 @@ describe('privileged browser session lifecycle', () => {
     await background.handle({ type: 'LIMOVA_GET_STATE' });
     expect(journal.clearAccount).toHaveBeenCalledWith('user-1');
   });
+});
+
+
+it('routes an explicitly browser-enabled message through the durable turn runner', async () => {
+  const driver = { readPage: vi.fn().mockResolvedValue({ tabId: 1, origin: 'https://example.com', contextVersion: 1 }),
+    authorize: vi.fn(), execute: vi.fn() };
+  const createDriver = vi.fn(() => driver);
+  const h = harness({ createDriver });
+  h.client.sendMessage.mockImplementation(async function* () {
+    yield { event: 'custom', data: { type: 'extension.turn_state', turnId: 'backend-turn', state: 'completed' } };
+  });
+  await open(h.background);
+  const result = await h.background.handle({ type: 'LIMOVA_SEND_MESSAGE', text: 'Lis cette page', browser: true });
+  expect(result.browserState).toBe('completed');
+  expect(createDriver.mock.calls[0][0].scope.sessionId).toBe('browser-session');
+  expect(h.client.sendMessage.mock.calls[0][4]).toEqual({ sessionId: 'browser-session', page: { tabId: 1, origin: 'https://example.com', contextVersion: 1 } });
+  expect(h.notify).toHaveBeenCalledWith(expect.objectContaining({ type: 'LIMOVA_BROWSER_STATE', state: 'completed', browserTurnId: 'backend-turn', turnId: result.turnId }));
+});
+
+it('does not silently send a browser request as a text-only request without a driver', async () => {
+  const h = harness();
+  await open(h.background);
+  await expect(h.background.handle({ type: 'LIMOVA_SEND_MESSAGE', text: 'Lis cette page', browser: true })).rejects.toThrow('pilote navigateur');
+  expect(h.client.sendMessage).not.toHaveBeenCalled();
+});
+
+it('resumes a browser turn without sending a new human message', async () => {
+  const driver = { readPage: vi.fn().mockResolvedValue({ tabId: 1, origin: 'https://example.com', contextVersion: 2 }), authorize: vi.fn(), execute: vi.fn() };
+  const h = harness({ createDriver: () => driver });
+  h.client.getBrowserTurn = vi.fn().mockResolvedValue({ turnId: 'backend-turn', status: 'open' });
+  h.client.resumeBrowserTurn = vi.fn(async function* () {
+    yield { event: 'custom', data: { type: 'extension.turn_state', turnId: 'backend-turn', state: 'completed' } };
+  });
+  await open(h.background);
+  const result = await h.background.handle({ type: 'LIMOVA_RESUME_BROWSER', browser: true });
+  expect(result.browserState).toBe('completed');
+  expect(h.client.sendMessage).not.toHaveBeenCalled();
+  expect(h.client.resumeBrowserTurn).toHaveBeenCalledTimes(1);
+});
+
+it('requires fresh browser authorization before resume', async () => {
+  const h = harness();
+  await open(h.background);
+  await expect(h.background.handle({ type: 'LIMOVA_RESUME_BROWSER' })).rejects.toThrow('Autorise le navigateur');
+  expect(h.client.sendMessage).not.toHaveBeenCalled();
 });
