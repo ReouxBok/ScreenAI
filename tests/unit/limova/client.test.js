@@ -281,3 +281,42 @@ describe('Limova browser turn transport', () => {
     expect(fetch.mock.calls.filter(([url]) => url.endsWith(`/message/${CONVERSATION}`))).toHaveLength(1);
   });
 });
+
+describe('Limova session refresh account boundary', () => {
+  const consume = async iterable => { for await (const _event of iterable) {} };
+  const browser = { sessionId: USER, page: { tabId: 17, origin: 'https://example.com', contextVersion: 1 } };
+  const receipt = { turnId: USER, actionId: 'action', toolCallId: 'tool', contextVersion: 1, status: 'completed', observation: 'done' };
+  it.each([
+    ['create', '/conversation', client => client.createConversation(CONTEXT)],
+    ['message', `/message/${CONVERSATION}`, client => consume(client.sendMessage(CONTEXT, CONVERSATION, 'hello'))],
+    ['result', `/message/${CONVERSATION}`, client => consume(client.sendBrowserResult(CONTEXT, CONVERSATION, browser, receipt))],
+    ['resume', `/message/${CONVERSATION}`, client => consume(client.resumeBrowserTurn(CONTEXT, CONVERSATION, browser, USER))],
+    ['cancel', `/message/${CONVERSATION}/cancel`, client => client.cancel(CONTEXT, CONVERSATION)],
+    ['history', `/conversation/${CONVERSATION}/messages`, client => client.getMessages(CONTEXT, CONVERSATION)],
+  ])('does not retry %s if refresh changes the user', async (_name, path, invoke) => {
+    const { client, fetch } = harness();
+    const original = fetch.getMockImplementation();
+    let switched = false;
+    fetch.mockImplementation(async (url, options) => {
+      if (url.endsWith('/auth/refresh-token')) { switched = true; return new Response('{}'); }
+      if (url.endsWith('/users/me') && switched) return json({ id: AGENT });
+      if (url.endsWith(path)) return new Response('{}', { status: 401 });
+      return original(url, options);
+    });
+    await expect(invoke(client)).rejects.toMatchObject({ code: 'LIMOVA_ACCOUNT_CHANGED' });
+    expect(fetch.mock.calls.filter(([url]) => url.endsWith(path))).toHaveLength(1);
+  });
+
+  it('allows cancellation after rollout revocation, including after refresh', async () => {
+    const { client, fetch } = harness({ enabled: false });
+    const original = fetch.getMockImplementation();
+    let cancelled = 0;
+    fetch.mockImplementation(async (url, options) => {
+      if (url.endsWith('/auth/refresh-token')) return new Response('{}');
+      if (url.endsWith('/cancel')) return ++cancelled === 1 ? new Response('{}', { status: 401 }) : json({ ok: true });
+      return original(url, options);
+    });
+    expect(await client.cancel(CONTEXT, CONVERSATION)).toEqual({ ok: true });
+    expect(cancelled).toBe(2);
+  });
+});

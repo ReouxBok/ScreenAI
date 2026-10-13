@@ -6,6 +6,8 @@
 import { createBrowserDriver } from './limova/browser-driver.js';
 import Logger from './utils/logger.js';
 import { createLimovaBackground, LIMOVA_MESSAGE_TYPES } from './limova/background.js';
+import { LimovaDeepAgentClient } from './limova/client.js';
+import { createLimovaSessionFetch, openLimovaApp } from './limova/session-fetch.js';
 import { buildSystemPrompt } from './prompts/system-prompt.js';
 import { searchKB } from './knowledge-base/kb-search.js';
 import { createOnboardingPlan, advanceStep } from './prompts/onboarding-plan.js';
@@ -36,10 +38,11 @@ const VISUAL_CAPTURE_JPEG_QUALITY = 55;
 const DEFAULT_LANG = (chrome.i18n.getUILanguage() || 'en').split('-')[0].toLowerCase();
 let currentLang = DEFAULT_LANG;
 const limovaBackground = createLimovaBackground({
+  client: new LimovaDeepAgentClient(createLimovaSessionFetch(chrome)),
   createDriver: ({ scope, journal, signal, uploadScreenshot }) => createBrowserDriver({ chrome, scope, journal, uploadScreenshot,
     hasConsent: async () => !signal.aborted && !trainingState.active && !evaluationState.active && await hasAIProcessingConsent() }),
   storage: chrome.storage.local,
-  openTab: options => chrome.tabs.create(options),
+  openTab: () => openLimovaApp(chrome),
   notify: message => broadcastToSidebar(message),
 });
 
