@@ -376,6 +376,21 @@ it.each(["2026-01-02T12:00:00Z", null, "invalid"])("shows the real ticket creati
   expect(html).not.toContain("02/10/2026");
 });
 
+it.each(["1", "2", "3"])("uses the saved semantic match for the generic-subject return CTA at stage %s", async stageId => {
+  const detail = detailFixture();
+  detail.messages[0].subject = "Re: Suite à votre demande - Urgent";
+  detail.messages[0].body.supportContext = { version: 1, messageId, collectedAt: now.toISOString(), customerIdentity: { kind: "sender", email: "client@example.invalid" },
+    crm: { status: "ready", errorCode: null, data: { errorCode: null, contactFound: true, contactId: "42", identityCandidates: [],
+      tickets: [{ id: "401", subject: "Incident du téléphone IA", description: "L'agent ne fonctionne plus", status: "open", pipelineId: "0", stageId, ownerId: "71", createdAt: null, updatedAt: null }],
+      routing: { kind: "matched", ticketId: "401", reason: "semantic_same_issue", returnOperation: stageId === "1" ? "keep" : "reactivate" } } },
+    conversation: null, conversationError: null, otherConversations: [], otherConversationsError: null };
+  dependencies.detail.mockResolvedValue(detail); dependencies.review.mockResolvedValue(reviewFixture(true));
+  const html = await renderPage();
+  expect(html).toContain(`name="returnOperation" value="${stageId === "1" ? "keep" : "reactivate"}"`);
+  expect(html).toContain('name="ticketId" value="401"');
+  expect(aside(html)).not.toContain("Créer un ticket HubSpot");
+});
+
 it("shows the original customer and the same forwarded return CTA as the backend", async () => {
   const detail = detailFixture();
   detail.thread.customerEmail = "colleague@limova.ai";

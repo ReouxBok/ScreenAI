@@ -8,10 +8,9 @@ import { savV0EligibleMessageFilter } from "./cutover";
 import { loadSavDraftContext } from "./draft-verdicts";
 import {savStructuredProposalSchema} from "./proposal";
 import type { SavDossierContext } from "./dossier-context";
-import { selectSavTicketMatch } from "./ticket-routing";
 import { savTicketReturnPlan } from "./ticket-lifecycle";
 import { decryptSavPayload, encryptSavPayload } from "./crypto";
-import { resolveSavCustomerIdentity, resolveSavCustomerMessage } from "./forwarded-identity";
+import { resolveSavCustomerIdentity } from "./forwarded-identity";
 
 const requestSchema = z.object({ threadId: z.uuid(), reviewId: z.uuid(), kind: z.enum(["create_ticket", "link_ticket"]), ticketId: z.string().regex(/^\d{1,30}$/).optional(), returnOperation: z.enum(["keep", "reactivate", "create"]).optional(), distinctIssueReason: z.string().trim().max(2_000).default("") });
 export async function queueSavManualTicket(raw: unknown, actorEmail: string) {
@@ -24,7 +23,6 @@ export async function queueSavManualTicket(raw: unknown, actorEmail: string) {
     const [message] = await tx.select().from(savMessages).where(and(eq(savMessages.threadId, thread.id), eq(savMessages.direction, "inbound"), savV0EligibleMessageFilter())).orderBy(desc(savMessages.receivedAt), desc(savMessages.createdAt), desc(savMessages.id)).limit(1);
     if (!message) throw new Error("SAV_MESSAGE_BEFORE_CUTOVER");
     const messageBody = decryptSavPayload<{ text: string }>(message.bodyCiphertext);
-    const customerMessage = resolveSavCustomerMessage({ fromEmail: message.fromEmail, subject: message.subject, body: messageBody.text });
     const customerIdentity = resolveSavCustomerIdentity({ fromEmail: message.fromEmail, body: messageBody.text });
     if (!customerIdentity.email) throw new Error("SAV_FORWARDED_CUSTOMER_UNRESOLVED");
     const [review] = await tx.select().from(savProposalReviews).where(and(eq(savProposalReviews.id, input.reviewId), eq(savProposalReviews.messageId, message.id), eq(savProposalReviews.isCurrent, true), eq(savProposalReviews.status, "approved"))).limit(1);
@@ -37,9 +35,9 @@ export async function queueSavManualTicket(raw: unknown, actorEmail: string) {
     if (input.returnOperation) {
       const context = decryptSavPayload<{ supportContext?: SavDossierContext }>(message.bodyCiphertext).supportContext;
       if (context?.messageId !== message.id || context.customerIdentity?.email !== customerIdentity.email || context.crm.status !== "ready" || !context.crm.data?.contactId) throw new Error("SAV_TICKET_RETURN_CONTEXT_CHANGED");
-      const match = selectSavTicketMatch({ subject: customerMessage.subject, candidates: context.crm.data.tickets, currentTicketId: thread.hubspotTicketId, includeClosed: true });
+      const match = context.crm.data.routing;
       const selected = context.crm.data.tickets.find(ticket => ticket.id === input.ticketId);
-      if (match.kind !== "matched" || !selected || match.ticket.id !== selected.id) throw new Error("SAV_TICKET_RETURN_CONTEXT_CHANGED");
+      if (match.kind !== "matched" || !selected || match.ticketId !== selected.id) throw new Error("SAV_TICKET_RETURN_CONTEXT_CHANGED");
       const plan = savTicketReturnPlan(selected, message.receivedAt);
       if (plan.operation !== input.returnOperation || (plan.operation === "create" ? input.kind !== "create_ticket" : input.kind !== "link_ticket")) throw new Error("SAV_TICKET_RETURN_CONTEXT_CHANGED");
       if ((plan.operation === "reactivate" || plan.operation === "create") && !selected.ownerId) throw new Error("SAV_TICKET_OWNER_REQUIRED");

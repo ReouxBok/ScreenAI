@@ -37,6 +37,17 @@ beforeEach(() => {
 afterEach(() => { vi.unstubAllEnvs(); vi.unstubAllGlobals(); vi.resetAllMocks(); });
 
 describe("SAV shared semantic pipeline with synthetic provider outputs", () => {
+  it.each(modes)("preserves a content-matched existing issue with a generic email subject in %s", async mode => {
+    const u = understandingFixture(); deps.understand.mockResolvedValue(u); deps.agent.mockResolvedValue(adkResult(u));
+    deps.crm.mockResolvedValue({ contactFound: true, contactId: "fixture-contact", tickets: [{ id: "401", subject: "Incident du téléphone IA" }],
+      routing: { kind: "matched", ticketId: "401", reason: "semantic_same_issue", returnOperation: "reactivate" } });
+    const network = vi.fn<typeof fetch>(async () => geminiFixture(outputFor(u)));
+    const result = await analyzeSavMessage({ from: "fixture@example.invalid", subject: "Re: Suite à votre demande - Urgent", body: "Le produit ne fonctionne pas." }, { evaluation: evaluation(mode, network) });
+    expect(result.ticketRouting).toMatchObject({ kind: "matched", ticketId: "401", reason: "customer_return_reactivate" });
+    expect(result.structuredProposal?.process.some(step => step.kind === "create_ticket")).toBe(false);
+    expect(result.structuredProposal?.process).toContainEqual(expect.objectContaining({ kind: "link_ticket", sourceIds: ["401"] }));
+    expect(deps.crm).toHaveBeenCalledWith(expect.objectContaining({ body: "Le produit ne fonctionne pas." }));
+  });
   it("uses the forwarded original in CRM and model context, not the colleague's stale enrichment", async () => {
     const u = understandingFixture(); deps.understand.mockResolvedValue(u);
     const network = vi.fn<typeof fetch>(async () => geminiFixture(outputFor(u)));

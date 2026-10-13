@@ -91,7 +91,7 @@ export async function collectSavDossierContext(messageId: string): Promise<SavDo
   const parts = splitSavMessageText(customerMessage.body);
   const customerIdentity = resolveSavCustomerIdentity({ fromEmail: message.fromEmail, body: body.text });
   const [crm, conversation, others] = await Promise.allSettled([
-    customerIdentity.email ? readSavHubspotContext({ email: customerIdentity.email, subject: customerMessage.subject, returnedAt: message.receivedAt,
+    customerIdentity.email ? readSavHubspotContext({ email: customerIdentity.email, subject: customerMessage.subject, body: customerMessage.body, returnedAt: message.receivedAt,
       currentTicketId: customerIdentity.kind === "sender" && thread?.customerEmail.toLowerCase() === customerIdentity.email.toLowerCase() ? thread.hubspotTicketId : undefined,
       identityHints: customerIdentity.kind === "sender" ? extractSavIdentityHints([parts.currentText, parts.signatureText].filter(Boolean).join("\n"), body.headers?.["from-display-name"]) : undefined, toleratePartial: true })
       : Promise.reject(new Error("SAV_FORWARDED_CUSTOMER_UNRESOLVED")),
