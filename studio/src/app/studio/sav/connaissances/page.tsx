@@ -12,6 +12,7 @@ import { hubspotComparison, knowledgeComparisonInventory } from "@/lib/knowledge
 import { HubspotReviewForm } from "./hubspot-review-form";
 import { getOnboardingImport, inventoryOnboardingSources, listOnboardingImports } from "@/lib/knowledge/onboarding-import";
 import { continueOnboardingImportAction, startOnboardingImportAction } from "./onboarding-actions";
+import { ONBOARDING_KNOWLEDGE_CONVERTER, onboardingSectionLabels } from "@/lib/knowledge/onboarding-sections";
 import { OnboardingReviewForm } from "./onboarding-review-form";
 import type { CanonicalKnowledge } from "@/lib/knowledge/contracts";
 
@@ -60,6 +61,9 @@ function KnowledgeDocument({ document }: { document: CanonicalKnowledge }) {
     <h3>Résultat attendu</h3><p style={{ whiteSpace: "pre-wrap" }}>{document.expectedResult || "À confirmer."}</p>
     <h3>Exceptions et limites</h3>{document.exceptions.length ? <ul>{document.exceptions.map((value, index) => <li key={index}>{value}</li>)}</ul> : <p>Non renseignées dans cette proposition.</p>}
     <h3>Passage à un humain</h3><p style={{ whiteSpace: "pre-wrap" }}>{document.escalation || "À préciser."}</p>
+    {Boolean(document.onboardingContext?.sourceSections?.length) && <details><summary>Sections sourcées et qualification · {document.onboardingContext?.sourceSections?.length}</summary>
+      {document.onboardingContext?.sourceSections?.map((section) => <section key={section.id}><h4>{section.heading}</h4><p>{onboardingSectionLabels[section.classification]}</p><p style={{ whiteSpace: "pre-wrap" }}>{section.content}</p>{section.rationale && <p>Justification : {section.rationale}</p>}</section>)}
+    </details>}
     {document.onboardingContext && document.onboardingContext.sourceNotes.length > 0 && <details><summary>Précisions complémentaires de la source · {document.onboardingContext.sourceNotes.length}</summary>{document.onboardingContext.sourceNotes.map((value, index) => <p key={index} style={{ whiteSpace: "pre-wrap" }}>{value}</p>)}</details>}
     {document.supportContext?.responseTemplate && <details><summary>Exemple de réponse à adapter</summary><p style={{ whiteSpace: "pre-wrap" }}>{document.supportContext.responseTemplate}</p></details>}
     {(document.productVersion || document.validUntil) && <p>{document.productVersion && `Version produit : ${document.productVersion}. `}{document.validUntil && `Validité : ${document.validUntil}.`}</p>}
@@ -187,6 +191,7 @@ export default async function SavKnowledgeCandidatesPage({ searchParams }: { sea
       {rows.map(({ candidate, family, revision, source }) => {
         const imported = source.evidence.importKind === "hubspot";
         const onboarding = source.evidence.importKind === "onboarding_catalog";
+        const converterStale = onboarding && source.evidence.converter !== ONBOARDING_KNOWLEDGE_CONVERTER;
         const sourceSnapshot = record(source.evidence.snapshot);
         const sourceChanged = onboarding && sourceChangeAlertStatuses.includes(candidate.status) && typeof sourceSnapshot.key === "string" && typeof sourceSnapshot.hash === "string" && currentOnboardingSources.get(sourceSnapshot.key) !== sourceSnapshot.hash;
         const title = typeof candidate.proposedInput.title === "string" ? candidate.proposedInput.title : typeof source.evidence.sourceTitle === "string" ? source.evidence.sourceTitle : family.title;
@@ -207,6 +212,7 @@ export default async function SavKnowledgeCandidatesPage({ searchParams }: { sea
           <p>{displayedDocument.steps.length} étape{displayedDocument.steps.length === 1 ? "" : "s"}{missing.length > 0 ? ` · ${missing.length} point${missing.length === 1 ? "" : "s"} ${candidate.status === "approved" ? "absent" + (missing.length === 1 ? "" : "s") + " de la source initiale" : "à compléter"}` : ""}{warnings.length > 0 ? ` · ${warnings.length} point${warnings.length === 1 ? "" : "s"} d’attention` : ""}.</p></>}
           {candidate.status === "needs_completion" && <p>Une correction sourcée est nécessaire avant validation.</p>}
           {candidate.status === "needs_recording" && <p>Un enregistrement réel est nécessaire. Ce candidat n’est pas exécutable.</p>}
+          {converterStale && <p className="login-notice" role="status">Cette carte nécessite une nouvelle préparation pour récupérer toutes les sections du tutoriel. Préparez un nouvel inventaire ; les décisions existantes et les connaissances déjà publiées sont conservées.</p>}
           {sourceChanged && <p className="login-notice" role="status">Le tutoriel source a changé. Les connaissances déjà publiées restent utilisables ; préparez puis validez une mise à jour.</p>}
           <details className="learning-preview" open={candidateId === candidate.id}>
           <summary>Lire la connaissance et ses limites</summary>

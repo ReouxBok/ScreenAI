@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import type { OnboardingMetadata } from "@/db/schema";
-import { canonicalKnowledgeSchema, type CanonicalKnowledge, type SemanticStep } from "./contracts";
+import { canonicalKnowledgeSchema, type CanonicalKnowledge, type SemanticStep, type OnboardingSourceSection } from "./contracts";
+import { onboardingSectionsBody, onboardingSectionsQualified } from "./onboarding-sections";
 import { redactSavLearningText } from "@/lib/sav/learning-extraction";
 
 export type OnboardingKnowledgePreparation = {
@@ -11,7 +12,7 @@ export type OnboardingKnowledgePreparation = {
   supportBody: string;
 };
 
-type Section = { heading: string; key: string; lines: string[] };
+type Section = { heading: string; key: string; lines: string[]; level?: number; omittedCode?: boolean };
 const normalize = (value: string) => value.normalize("NFD").replace(/[\u0300-\u036f]/g, "").toLowerCase().replace(/[’]/g, "'").trim();
 const technical = /(?:querySelector|data-testid|data-test-id|nth-child|testId\s*[:=]|domId\s*[:=]|selector\s*[:=]|sélecteur\s*[:=]|\bDOM\b|\b(?:xpath|css selector)\b|\b(?:coordinates|coordonnées)\s*[:=]|\b[xy]\s*[:=]\s*-?\d|\b(?:GET|POST|PUT|PATCH|DELETE)\s+\/)/i;
 const technicalHeading = /rep[eè]res techniques|donn[eé]es techniques|cibles? techniques?|d[eé]tails? (?:dom|techniques)|^dom$|s[eé]lecteurs?/i;
@@ -26,11 +27,11 @@ const headingKeys: Record<string, string> = {
   "variantes et blocages": "exceptions", "reprise sure": "escalation", demonstration: "demonstration",
 };
 
-function sectionsFromMarkdown(body: string): Section[] {
+function sectionsFromMarkdown(body: string, title: string): Section[] {
   const sections: Section[] = [{ heading: "Préambule", key: "preamble", lines: [] }];
   let fenced = false;
   for (const rawLine of body.replace(/\r/g, "").split("\n")) {
-    if (/^\s*(```|~~~)/.test(rawLine)) { fenced = !fenced; continue; }
+    if (/^\s*(```|~~~)/.test(rawLine)) { if (!fenced) sections.at(-1)!.omittedCode = true; fenced = !fenced; continue; }
     if (fenced) continue;
     const line = rawLine.trim();
     const markdownHeading = /^#{1,6}\s+(.+?)\s*#*$/.exec(line)?.[1];
@@ -38,9 +39,14 @@ function sectionsFromMarkdown(body: string): Section[] {
     const heading = markdownHeading ?? (knownHeading.test(plainHeading) ? plainHeading : null);
     if (heading) {
       const key = technicalHeading.test(heading) ? "technical" : headingKeys[normalize(heading)] ?? "other";
-      sections.push({ heading, key, lines: [] });
+      sections.push({ heading, key, lines: [], level: markdownHeading ? /^#+/.exec(line)![0].length : undefined });
     } else sections.at(-1)!.lines.push(line);
   }
+  const first = sections[1];
+  // Only a matching document title (or a content-free title line) can label the preamble.
+  // An arbitrary first H1 may itself carry a business restriction and must be qualified.
+  if (first?.key === "other" && first.level === 1 && (normalize(first.heading) === normalize(title)
+    || (!first.lines.some((line) => line.trim()) && !first.omittedCode))) first.key = "preamble";
   return sections;
 }
 
@@ -100,7 +106,7 @@ export function prepareOnboardingKnowledge(input: {
   const source = (field: string, origin: string) => {
     if (!provenance.some((entry) => entry.field === field && entry.source === origin)) provenance.push({ field, source: origin });
   };
-  const sections = sectionsFromMarkdown(input.bodyMarkdown);
+  const sections = sectionsFromMarkdown(input.bodyMarkdown, input.title);
   const navigationNote = sections.filter((section) => section.key !== "technical").flatMap((section) => section.lines)
     .find((line) => /narration de l['’]entr[eé]e de navigation/i.test(line));
   const navigation = navigationNote?.match(/(?:dire|utiliser)\s+[«“"]([^»”"]+)[»”"]/i)?.[1].trim();
@@ -167,13 +173,27 @@ export function prepareOnboardingKnowledge(input: {
     return kept.slice(0, 50);
   }
 
-  const firstBusinessSection = sections.findIndex((section) => Object.values(headingKeys).includes(section.key));
-  const preamble = sections.slice(0, firstBusinessSection < 0 ? sections.length : firstBusinessSection)
-    .filter((section) => section.key !== "technical" && !/compl[eé]ments (?:d[eé]j[àa] )?transmis par le staff/i.test(section.heading))
+  const isStaffSupplement = (section: Section) => /compl[eé]ments (?:d[eé]j[àa] )?transmis par le staff/i.test(section.heading);
+  const preamble = sections.filter((section) => section.key === "preamble")
     .flatMap((section) => listItems(withoutNavigationNotes(withoutTechnicalInventory(section.lines)))
       .map((value) => sanitize(value, "bodyMarkdown.preamble")).filter(Boolean));
-  const supplements = sections.filter((section) => /compl[eé]ments (?:d[eé]j[àa] )?transmis par le staff/i.test(section.heading))
+  const supplements = sections.filter(isStaffSupplement)
     .flatMap((section) => listItems(withoutNavigationNotes(withoutTechnicalInventory(section.lines))).map((value) => sanitize(value, "bodyMarkdown.staffSupplements")).filter(Boolean));
+  // Keep every occurrence and its position. Unknown business headings are evidence, never disposable prose.
+  const sourceSections: OnboardingSourceSection[] = sections.flatMap((section, order) => {
+    if (section.key !== "other" || isStaffSupplement(section)) return [];
+    const origin = `bodyMarkdown.section.${order}`;
+    const heading = sanitize(section.heading, `${origin}.heading`) || `Rubrique ${order}`;
+    const content = withoutNavigationNotes(withoutTechnicalInventory(section.lines))
+      .map((line) => sanitize(line, `${origin}.content`)).join("\n").trim();
+    if (section.omittedCode) addMissing(`Reformuler le passage de code exclu de la section « ${heading} » si son contenu est pertinent.`);
+    if (heading.length > 500 || content.length > 10_000) throw new Error("ONBOARDING_KNOWLEDGE_SOURCE_CONTEXT_REQUIRES_SPLIT");
+    addMissing(`Qualifier la section « ${heading} » (position ${order}) : la classer ou justifier qu’elle n’est pas pertinente pour le SAV.`);
+    source(`onboardingContext.sourceSections.${order}`, origin);
+    return [{ id: `section.${createHash("sha256").update(JSON.stringify([input.sourceKey, order, section.heading, section.lines])).digest("hex").slice(0, 24)}`,
+      order, heading, content, classification: "pending", rationale: "" }];
+  });
+  if (sourceSections.length > 50) throw new Error("ONBOARDING_KNOWLEDGE_SOURCE_CONTEXT_REQUIRES_SPLIT");
   const objectiveSource = cleanSection("objective")[0] || sanitize(input.metadata.objective || "", "metadata.objective");
   if (!objectiveSource || generic.test(objectiveSource)) addMissing("Préciser l’objectif métier du parcours.");
   const objective = limitedText(objectiveSource || input.title, 500, "objectif", input.title);
@@ -297,7 +317,7 @@ export function prepareOnboardingKnowledge(input: {
   const document = canonicalKnowledgeSchema.parse({ schemaVersion: 1, objective, applicability: "sav_only", locale: input.locale, productVersion,
     prerequisites, expectedResult, exceptions, escalation, steps: steps.slice(0, 50),
     supportContext: { symptoms: signals, diagnosticQuestions: questions, responseTemplate: "" },
-    onboardingContext: { entryPoint, sourceNotes } });
+    onboardingContext: { entryPoint, sourceNotes, sourceSections } });
   const supportBody = ["## Objectif", document.objective, "## Quand utiliser cette connaissance", ...signals,
     ...(entry.length ? ["## Point d’entrée", ...entry] : []), "## Prérequis", ...prerequisites, "## Questions de qualification", ...questions,
     "## Procédure sourcée", ...document.steps.map((step, index) => `${index + 1}. ${step.instruction}`),
@@ -305,6 +325,7 @@ export function prepareOnboardingKnowledge(input: {
     ...(preamble.length ? ["## Précisions préalables de la source", ...preamble] : []),
     ...(supplements.length ? ["## Compléments transmis par le staff", ...supplements] : []),
     ...(overflow.length ? ["## Éléments sourcés à structurer avant validation", ...overflow] : []),
+    ...(sourceSections.length ? ["## Sections sourcées à qualifier", ...onboardingSectionsBody(document)] : []),
     ...(missing.length ? ["## À compléter avant validation", ...missing.map((value) => `- ${value}`)] : []),
   ].filter(Boolean).join("\n\n");
   assertSafeOnboardingKnowledge(document);
@@ -337,6 +358,7 @@ export function assertSafeOnboardingKnowledge(document: CanonicalKnowledge): voi
 /** Structural completion is required in addition to Ugo's sourced human review. */
 export function assertCompleteOnboardingKnowledge(document: CanonicalKnowledge): void {
   const parsed = canonicalKnowledgeSchema.parse(document);
+  if (!onboardingSectionsQualified(parsed)) throw new Error("ONBOARDING_SOURCE_SECTIONS_REVIEW_REQUIRED");
   if (!parsed.steps.length) throw new Error("ONBOARDING_KNOWLEDGE_STEPS_REQUIRED");
   // An old display objective can survive an edit; the actual procedure must be concrete.
   if (parsed.steps.some((step) => generic.test(step.instruction) || truncation.test(step.instruction))) throw new Error("ONBOARDING_KNOWLEDGE_GENERIC_STEPS");

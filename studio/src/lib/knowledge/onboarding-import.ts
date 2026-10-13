@@ -13,8 +13,9 @@ import { canonicalKnowledgeSchema } from "./contracts";
 import { savProjectionBody } from "./conversion";
 import { prepareOnboardingKnowledge } from "./onboarding-extraction";
 import { hubspotComparison, knowledgeComparisonInventory } from "./hubspot-import";
+import { assertOnboardingSectionEvidence, ONBOARDING_KNOWLEDGE_CONVERTER } from "./onboarding-sections";
 
-const CONVERTER = "onboarding-sav-51-v1";
+const CONVERTER = ONBOARDING_KNOWLEDGE_CONVERTER;
 const BATCH_ACTION = "knowledge_onboarding_batch";
 type Reader = Pick<ReturnType<typeof requireDb>, "select">;
 type Transaction = Parameters<Parameters<ReturnType<typeof requireDb>["transaction"]>[0]>[0];
@@ -199,9 +200,11 @@ export async function prepareOnboardingReview(candidate: typeof knowledgeProject
   const [source] = await db.select().from(knowledgeFamilySources).where(eq(knowledgeFamilySources.id, candidate.sourceId));
   const [revision] = await db.select().from(knowledgeFamilyRevisions).where(eq(knowledgeFamilyRevisions.id, candidate.revisionId));
   if (!source || !revision || source.evidence.importKind !== "onboarding_catalog" || source.revisionId !== revision.id || source.familyId !== candidate.familyId) throw new Error("KNOWLEDGE_PROVENANCE_REQUIRED");
+  if (source.evidence.converter !== CONVERTER) throw new Error("ONBOARDING_CONVERTER_STALE");
   const snapshot = source.evidence.snapshot as Source;
   await readSource(snapshot, db);
   const document = canonicalKnowledgeSchema.parse(rawDocument ?? revision.document);
+  assertOnboardingSectionEvidence(document, canonicalKnowledgeSchema.parse(revision.document));
   const original = parseContentInput(candidate.proposedInput);
   const proposed = parseContentInput({ ...original, title: snapshot.title, summary: document.objective, bodyMarkdown: savProjectionBody(document) });
   const targets = await db.select({ item: contentItems }).from(knowledgeProjections).innerJoin(contentItems, eq(contentItems.id, knowledgeProjections.itemId)).where(and(eq(knowledgeProjections.familyId, candidate.familyId), eq(knowledgeProjections.surface, "sav")));
@@ -226,6 +229,7 @@ export async function assertOnboardingPublicationSource(metadata: { sourceMetada
   if (!candidate || candidate.status !== "approved") throw new Error("KNOWLEDGE_CANONICAL_APPROVAL_REQUIRED");
   const [source] = await db.select().from(knowledgeFamilySources).where(eq(knowledgeFamilySources.id, candidate.sourceId));
   if (!source || source.evidence.importKind !== "onboarding_catalog") throw new Error("KNOWLEDGE_PROVENANCE_REQUIRED");
+  if (source.evidence.converter !== CONVERTER) throw new Error("ONBOARDING_CONVERTER_STALE");
   const snapshot = source.evidence.snapshot as Source;
   if (lock && snapshot.itemId) await db.select({ id: contentItems.id }).from(contentItems).where(eq(contentItems.id, snapshot.itemId)).for("update");
   await readSource(snapshot, db);
@@ -238,6 +242,7 @@ export async function onboardingSourceStatus(metadata: { sourceMetadata?: Record
     await assertOnboardingPublicationSource(metadata);
     return "current" as const;
   } catch (error) {
+    if (error instanceof Error && error.message === "ONBOARDING_CONVERTER_STALE") return "preparation_stale" as const;
     return error instanceof Error && error.message === "ONBOARDING_SOURCE_STALE" ? "changed" as const : "unavailable" as const;
   }
 }

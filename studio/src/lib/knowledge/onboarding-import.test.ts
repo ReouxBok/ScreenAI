@@ -8,6 +8,8 @@ import { searchKnowledge } from "@/lib/search";
 import { parseContentInput } from "@/lib/content";
 import { publish, rollback, saveDraft, setContentAiEnabled } from "@/lib/workflow";
 import { canonicalKnowledgeSchema } from "./contracts";
+import { savContentHash } from "@/lib/sav/crypto";
+import { ONBOARDING_KNOWLEDGE_CONVERTER } from "./onboarding-sections";
 import { registerCanonicalKnowledge } from "./families";
 import { prepareOnboardingKnowledge } from "./onboarding-extraction";
 import { paginateKnowledgeCandidates } from "./candidates";
@@ -95,6 +97,82 @@ async function reread(candidate: Candidate) {
 }
 
 describe("SAV-51 onboarding inventory and resumable import", () => {
+  it.each(["needs_completion", "pending"])("blocks cosmetic approval with unresolved source sections even with status %s", async (status) => {
+    const source = await tutorial({ body: body + "\n## Précaution particulière\nNe jamais désactiver l’authentification avant le transfert de propriété." });
+    const candidate = await candidateFor(source);
+    await fixture.db.update(knowledgeProjectionCandidates).set({ status: status as Candidate["status"] }).where(eq(knowledgeProjectionCandidates.id, candidate.id));
+    const document = await documentFor(candidate);
+    document.objective += " Objectif relu.";
+    await expect(reviewKnowledgeCandidate(candidate.id, { ...await approval(candidate, document), missingAcknowledged: true,
+      completionNote: "Relecture de la source avec une correction du titre uniquement." }, actor)).rejects.toThrow("ONBOARDING_SOURCE_SECTIONS_REVIEW_REQUIRED");
+    expect((await fixture.db.select().from(knowledgeProjections).where(eq(knowledgeProjections.surface, "sav")))).toHaveLength(0);
+  });
+  it.each(["remove", "edit", "duplicate", "reorder"])("blocks source section tampering in the server comparison and approval: %s", async (change) => {
+    const candidate = await candidateFor(await tutorial({ body: body + "\n## Précaution particulière\nVérifier le propriétaire.\n## Seconde précaution\nConserver le nom exact." }));
+    const document = await documentFor(candidate);
+    const originalComparison = await prepareOnboardingReview(candidate, document);
+    const sections = document.onboardingContext!.sourceSections!;
+    if (change === "remove") delete document.onboardingContext!.sourceSections;
+    if (change === "edit") sections[0].content = "Autre condition";
+    if (change === "duplicate") sections.push({ ...sections[0] });
+    if (change === "reorder") sections.reverse();
+    await expect(prepareOnboardingReview(candidate, document)).rejects.toThrow("ONBOARDING_SOURCE_SECTIONS_CHANGED");
+    await expect(reviewKnowledgeCandidate(candidate.id, { expectedRevisionId: candidate.revisionId, decision: "approve", reason: "Tentative synthétique de contournement du formulaire.", document,
+      comparison: { snapshot: originalComparison.snapshot, acknowledged: true }, completionNote: "Toutes les sections ont été relues dans le scénario fictif.", missingAcknowledged: true }, actor)).rejects.toThrow("ONBOARDING_SOURCE_SECTIONS_CHANGED");
+  });
+  it("keeps classified restrictions in the draft and excluded sections only in immutable review evidence", async () => {
+    const candidate = await candidateFor(await tutorial({ body: body + "\n## Précaution particulière\nVérifier le propriétaire avant le transfert.\n## Organisation du tournage\nLa capture a été réalisée un mardi." }));
+    const original = await documentFor(candidate);
+    const document = structuredClone(original);
+    const sections = document.onboardingContext!.sourceSections!;
+    sections[0].classification = "exception"; sections[0].rationale = "La condition de propriété limite la procédure de transfert.";
+    sections[1].classification = "not_applicable"; sections[1].rationale = "La date du tournage ne change pas la procédure ou ses conditions.";
+    const input = { ...await approval(candidate, document), missingAcknowledged: true, completionNote: "Les deux sections de la source ont été explicitement qualifiées." };
+    // A classification change also invalidates the comparison fingerprint.
+    const changed = structuredClone(document); changed.onboardingContext!.sourceSections![0].classification = "prerequisite";
+    await expect(reviewKnowledgeCandidate(candidate.id, { ...input, document: changed }, actor)).rejects.toThrow("ONBOARDING_COMPARISON_STALE");
+    const approved = await reviewKnowledgeCandidate(candidate.id, input, actor);
+    const [version] = await fixture.db.select().from(contentVersions).where(eq(contentVersions.id, approved.materializedVersionId!));
+    expect(version.bodyMarkdown).toContain("Vérifier le propriétaire avant le transfert.");
+    expect(version.bodyMarkdown).not.toContain("réalisée un mardi");
+    expect(await documentFor(candidate)).toEqual(original);
+    const [projection] = await fixture.db.select().from(knowledgeProjections).where(eq(knowledgeProjections.versionId, version.id));
+    const [reviewed] = await fixture.db.select().from(knowledgeFamilyRevisions).where(eq(knowledgeFamilyRevisions.id, projection.revisionId));
+    expect(reviewed.document).toEqual(document);
+    const [item] = await fixture.db.select().from(contentItems).where(eq(contentItems.id, approved.targetItemId!));
+    expect(item).toMatchObject({ aiEnabled: false, publishedVersionId: null, status: "in_review" });
+  });
+  it("requires regeneration of legacy pending candidates and keeps the old evidence on an idempotent v2 import", async () => {
+    const source = await tutorial(); const old = await candidateFor(source);
+    const [proof] = await fixture.db.select().from(knowledgeFamilySources).where(eq(knowledgeFamilySources.id, old.sourceId));
+    const legacyHash = savContentHash({ converter: "onboarding-sav-51-v1", key: proof.sourceRef, sourceHash: proof.evidence.sourceHash, versionId: proof.sourceVersionId });
+    await fixture.db.update(knowledgeFamilySources).set({ evidence: { ...proof.evidence, converter: "onboarding-sav-51-v1" }, sourceHash: legacyHash }).where(eq(knowledgeFamilySources.id, proof.id));
+    await fixture.db.update(knowledgeFamilyRevisions).set({ canonicalHash: savContentHash({ document: await documentFor(old), hash: legacyHash }) }).where(eq(knowledgeFamilyRevisions.id, old.revisionId));
+    // Model the previous converter's distinct manifest ID instead of overwriting its completed outcome.
+    const [oldBatch] = await fixture.db.select().from(auditLogs).where(eq(auditLogs.action, "knowledge_onboarding_batch"));
+    const manifest = JSON.parse(String(oldBatch.technicalMetadata.manifest)); manifest.converter = "onboarding-sav-51-v1";
+    await fixture.db.update(auditLogs).set({ id: "00000000-0000-4000-9000-000000000051", technicalMetadata: { ...oldBatch.technicalMetadata, converter: manifest.converter, manifest: JSON.stringify(manifest) } }).where(eq(auditLogs.id, oldBatch.id));
+    await expect(prepareOnboardingReview(old)).rejects.toThrow("ONBOARDING_CONVERTER_STALE");
+    await expect(reviewKnowledgeCandidate(old.id, { expectedRevisionId: old.revisionId, decision: "approve", reason: "Ancienne préparation relue sans conversion.", comparison: { snapshot: "old", acknowledged: true } }, actor)).rejects.toThrow("ONBOARDING_CONVERTER_STALE");
+    const fresh = await candidateFor(source); const again = await candidateFor(source);
+    expect(fresh.id).not.toBe(old.id); expect(again.id).toBe(fresh.id);
+    expect(await reread(old)).toEqual(old);
+    const [freshProof] = await fixture.db.select().from(knowledgeFamilySources).where(eq(knowledgeFamilySources.id, fresh.sourceId));
+    expect(freshProof.evidence.converter).toBe(ONBOARDING_KNOWLEDGE_CONVERTER);
+  });
+  it.each([false, true])("blocks publication of an old approved draft while preserving already published knowledge=%s", async (alreadyPublished) => {
+    const candidate = await candidateFor(await tutorial());
+    const approved = await reviewKnowledgeCandidate(candidate.id, await approval(candidate), actor);
+    if (alreadyPublished) { await publish(approved.targetItemId!, actor); await setContentAiEnabled(approved.targetItemId!, true, actor); }
+    const [proof] = await fixture.db.select().from(knowledgeFamilySources).where(eq(knowledgeFamilySources.id, candidate.sourceId));
+    await fixture.db.update(knowledgeFamilySources).set({ evidence: { ...proof.evidence, converter: "onboarding-sav-51-v1" } }).where(eq(knowledgeFamilySources.id, proof.id));
+    const [version] = await fixture.db.select().from(contentVersions).where(eq(contentVersions.id, approved.materializedVersionId!));
+    await expect(publish(approved.targetItemId!, actor)).rejects.toThrow("ONBOARDING_CONVERTER_STALE");
+    expect(await onboardingSourceStatus(version.metadata)).toBe("preparation_stale");
+    expect((await reread(approved)).status).toBe("approved");
+    const found = await searchKnowledge({ query: "Renommer un espace", scope: "sav", contentTypes: ["article"], limit: 10 });
+    expect(found.results.length).toBe(alreadyPublished ? 1 : 0);
+  });
   it.each([true, false])("keeps a candidate with no documented recovery, including exceptions=%s", async (hasExceptions) => {
     const incomplete = body.split("## Reprise sûre")[0];
     const source = await tutorial({ body: hasExceptions ? incomplete : incomplete.split("## Variantes et blocages")[0] });

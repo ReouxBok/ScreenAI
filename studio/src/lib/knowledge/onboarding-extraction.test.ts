@@ -2,6 +2,8 @@ import { describe, expect, it } from "vitest";
 import type { OnboardingMetadata } from "@/db/schema";
 import { canonicalKnowledgeSchema, semanticStepSchema } from "./contracts";
 import { assertCompleteOnboardingKnowledge, assertSafeOnboardingKnowledge, prepareOnboardingKnowledge } from "./onboarding-extraction";
+import { assertOnboardingSectionEvidence } from "./onboarding-sections";
+import { savProjectionBody } from "./conversion";
 
 const metadata: OnboardingMetadata = { objective: "Renommer un espace de travail", proposalSignals: [], qualificationQuestions: [], expectedPages: [], successCriteria: [], branches: [], fallbacks: [], actionSteps: [] };
 const body = `# Renommer un espace
@@ -28,6 +30,94 @@ function prepare(overrides: Partial<Parameters<typeof prepareOnboardingKnowledge
 }
 
 describe("SAV-51 onboarding knowledge extraction", () => {
+  it("keeps unknown headings, paragraphs, repeated occurrences and order across known sections", () => {
+    const source = body.replace("## Prérequis", "## Condition locale\nPremière condition.\n\n- Une limite locale.\n## Prérequis")
+      + "\n## Condition locale\nSeconde condition.\n### Sous-condition\nTroisième condition.";
+    const result = prepare({ bodyMarkdown: source });
+    const sections = result.document.onboardingContext!.sourceSections!;
+    expect(sections.map(({ heading, content }) => ({ heading, content }))).toEqual([
+      { heading: "Condition locale", content: "Première condition.\n\n- Une limite locale." },
+      { heading: "Condition locale", content: "Seconde condition." },
+      { heading: "Sous-condition", content: "Troisième condition." },
+    ]);
+    expect(new Set(sections.map(({ id }) => id)).size).toBe(3);
+    expect(sections.map(({ order }) => order)).toEqual([...sections.map(({ order }) => order)].sort((a, b) => a - b));
+    expect(prepare({ bodyMarkdown: source }).document).toEqual(result.document);
+    expect(result.quality.missing.filter((value) => value.startsWith("Qualifier la section"))).toHaveLength(3);
+    expect(result.document.onboardingContext!.sourceNotes.join("\n")).not.toContain("Première condition");
+  });
+  it("retains an unknown heading before the first known section and empty sections for explicit qualification", () => {
+    const result = prepare({ bodyMarkdown: "## Avant de commencer\nDemander confirmation avant de continuer.\n" + body + "\n## Rubrique sans explication" });
+    expect(result.document.onboardingContext!.sourceSections!.map((section) => section.heading)).toEqual(["Avant de commencer", "Renommer un espace", "Rubrique sans explication"]);
+    expect(result.quality.state).toBe("needs_completion");
+  });
+  it("does not let a first known H1 become a preamble", () => {
+    expect(prepare({ bodyMarkdown: "# Objectif\nUn objectif explicite.\n" + body }).document.objective).toBe("Un objectif explicite.");
+  });
+  it("qualifies a first unknown H1 carrying a precaution instead of assuming it is the document title", () => {
+    const result = prepare({ bodyMarkdown: "# Précaution particulière\nNe jamais désactiver l’authentification avant le transfert de propriété.\n" + body });
+    expect(result.document.onboardingContext!.sourceSections![0]).toMatchObject({ heading: "Précaution particulière", content: "Ne jamais désactiver l’authentification avant le transfert de propriété.", classification: "pending" });
+    expect(result.quality.state).toBe("needs_completion");
+  });
+  it("signals removed code and sensitive text inside unclassified sections", () => {
+    const result = prepare({ bodyMarkdown: body + '\n## Contact test@example.test\nNe jamais partager son mot de passe.\nEmail test@example.test\n```js\nsecret=private\n```' });
+    expect(JSON.stringify(result.document)).not.toMatch(/test@example|secret=private/);
+    expect(JSON.stringify(result.document)).toContain("Ne jamais partager son mot de passe.");
+    expect(result.quality.missing.join(" ")).toMatch(/code exclu/);
+    expect(result.quality.warnings.join(" ")).toMatch(/sensibles/);
+  });
+  it.each(["x".repeat(501), "Court\n" + "x".repeat(10_001)])("fails visibly on oversized unclassified evidence instead of truncating", (section) => {
+    expect(() => prepare({ bodyMarkdown: body + `\n## ${section}` })).toThrow("ONBOARDING_KNOWLEDGE_SOURCE_CONTEXT_REQUIRES_SPLIT");
+  });
+  it("keeps technical sections excluded while retaining following business sections", () => {
+    const result = prepare({ bodyMarkdown: body + "\n## Repères techniques appris\nselector: #private\n## Précaution métier\nConserver une copie avant de continuer." });
+    expect(JSON.stringify(result.document)).not.toContain("#private");
+    expect(result.document.onboardingContext!.sourceSections!).toHaveLength(1);
+    expect(result.document.onboardingContext!.sourceSections![0].content).toBe("Conserver une copie avant de continuer.");
+  });
+  it.each(["objective", "classification", "short-reason"])("refuses cosmetic or incomplete qualification: %s", (change) => {
+    const document = prepare({ bodyMarkdown: body + "\n## Précaution métier\nVérifier le propriétaire avant le transfert." }).document;
+    const section = document.onboardingContext!.sourceSections![0];
+    if (change === "objective") document.objective += " Objectif relu.";
+    if (change !== "objective") section.classification = "exception";
+    if (change === "short-reason") section.rationale = "Vérifié";
+    expect(() => assertCompleteOnboardingKnowledge(document)).toThrow("ONBOARDING_SOURCE_SECTIONS_REVIEW_REQUIRED");
+  });
+  it.each(["remove", "add", "duplicate", "reorder", "heading", "content", "id", "order"])("rejects source section evidence tampering: %s", (change) => {
+    const original = prepare({ bodyMarkdown: body + "\n## Première condition\nVérifier le nom.\n## Seconde condition\nVérifier le propriétaire." }).document;
+    const edited = structuredClone(original);
+    const sections = edited.onboardingContext!.sourceSections!;
+    if (change === "remove") sections.pop();
+    if (change === "add" || change === "duplicate") sections.push({ ...sections[0], ...(change === "add" ? { id: "section.000000000000000000000000" } : {}) });
+    if (change === "reorder") sections.reverse();
+    if (change === "heading") sections[0].heading = "Autre titre";
+    if (change === "content") sections[0].content = "Consigne remplacée";
+    if (change === "id") sections[0].id = "section.000000000000000000000000";
+    if (change === "order") sections[0].order += 1;
+    expect(() => assertOnboardingSectionEvidence(edited, original)).toThrow("ONBOARDING_SOURCE_SECTIONS_CHANGED");
+  });
+  it("projects each relevant classified section in order and retains excluded evidence only in the canonical revision", () => {
+    const original = prepare({ bodyMarkdown: body + "\n## Précaution métier\nVérifier le propriétaire avant le transfert.\n## Note éditoriale\nDémonstration enregistrée un mardi." }).document;
+    const document = structuredClone(original);
+    const [precaution, editorial] = document.onboardingContext!.sourceSections!;
+    precaution.classification = "exception"; precaution.rationale = "Cette condition limite explicitement le transfert de propriété.";
+    editorial.classification = "not_applicable"; editorial.rationale = "Le jour d’enregistrement ne change pas la procédure du membre.";
+    expect(() => assertCompleteOnboardingKnowledge(document)).not.toThrow();
+    expect(() => assertOnboardingSectionEvidence(document, original)).not.toThrow();
+    expect(savProjectionBody(document)).toContain("Vérifier le propriétaire avant le transfert.");
+    expect(savProjectionBody(document)).toContain("Exception ou limite");
+    expect(savProjectionBody(document)).not.toContain("enregistrée un mardi");
+    expect(document.onboardingContext!.sourceSections![1].content).toContain("enregistrée un mardi");
+  });
+  it("preserves an unclassified business precaution after the known recovery section and blocks completeness", () => {
+    const precaution = "Ne jamais désactiver l’authentification avant le transfert de propriété.";
+    const result = prepare({ bodyMarkdown: `${body}\n## Précaution particulière\n${precaution}` });
+    expect(JSON.stringify(result.document)).toContain(precaution);
+    expect(result.supportBody).toContain("Précaution particulière");
+    expect(result.quality.state).toBe("needs_completion");
+    expect(result.quality.missing.join(" ")).toContain("Précaution particulière");
+    expect(() => assertCompleteOnboardingKnowledge(result.document)).toThrow("ONBOARDING_SOURCE_SECTIONS_REVIEW_REQUIRED");
+  });
   it("preserves exact title and structured business procedure, conditions and source order", () => {
     const result = prepare({ title: "Renommer un espace — édition test" });
     expect(result.title).toBe("Renommer un espace — édition test");
@@ -231,8 +321,8 @@ Ne pas saisir le prompt dans une autre conversation.
 Pages repérées dans le front Limova :
 - /organization/conversations
 ${body}` });
-    expect(result.document.onboardingContext?.sourceNotes.join("\n")).toContain("Avant toute saisie, vérifier que « Conversations Bêta » est ouvert ; sinon revenir au bon menu.");
-    expect(result.document.onboardingContext?.sourceNotes.join("\n")).toContain("Ne pas saisir le prompt dans une autre conversation.");
+    expect(result.document.onboardingContext?.sourceSections?.[0].content).toContain("Avant toute saisie, vérifier que « Conversations Bêta » est ouvert ; sinon revenir au bon menu.");
+    expect(result.document.onboardingContext?.sourceSections?.[0].content).toContain("Ne pas saisir le prompt dans une autre conversation.");
     expect(result.supportBody).not.toMatch(/Narration de l’entrée|anciens libellés|\/organization|chemin technique retiré/);
     expect(result.title).toBe("Créer une image — Limova Bêta");
   });

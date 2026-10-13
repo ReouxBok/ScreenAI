@@ -119,7 +119,7 @@ function candidateRow(id = candidateId, title = "Connecter son compte et conserv
     candidate: { id, familyId: id, status: "needs_completion", targetSurface: "sav", explanation: "Résultat à confirmer dans la source", proposedInput: { title }, diff: { before: "", after: "## Objectif\n\nProcédure complète et vérifiable." }, targetItemId: null, materializedVersionId: null as string | null, reviewedAt: null },
     family: { canonicalKey: `content:${id}`, title: "Ancien titre de la famille" },
     revision: { id: revisionId, revision: 1, reviewState: "pending", document: { schemaVersion: 1, locale: "fr-FR", applicability: "shared", objective: "Permettre au membre de connecter son compte.", prerequisites: ["Avoir accès au compte"], expectedResult: "Le compte est connecté", exceptions: ["Faire vérifier un refus"], escalation: "Contacter un humain si le résultat diffère", productVersion: "", steps: [{ id: "step.connect", userLabel: "Ouvrir les intégrations", objective: "Accéder au bon écran", instruction: "Ouvrir le catalogue des intégrations.", location: "Menu principal", prerequisites: [], expectedResult: "Catalogue visible", exceptions: [], escalation: "", variants: [] }] } },
-    source: { sourceRef: `content:${id}`, sourceVersionId: revisionId, evidence: { importKind: "onboarding_catalog", sourceTitle: title, sourceItemId: importId, snapshot: { key: `content:${id}`, hash: "source-hash" }, quality: { missing: ["Résultat source à vérifier"], warnings: ["Différence avec le catalogue"] } } },
+    source: { sourceRef: `content:${id}`, sourceVersionId: revisionId, evidence: { converter: "onboarding-sav-51-v2", importKind: "onboarding_catalog", sourceTitle: title, sourceItemId: importId, snapshot: { key: `content:${id}`, hash: "source-hash" }, quality: { missing: ["Résultat source à vérifier"], warnings: ["Différence avec le catalogue"] } } },
   };
 }
 function batchFixture() {
@@ -134,6 +134,15 @@ async function pageHtml(searchParams: Record<string, string> = {}) {
 }
 
 describe("SAV onboarding catalogue presentation", () => {
+  it("alerts on a legacy preparation without overwriting its decision or starting an import", async () => {
+    const row = candidateRow(); row.source.evidence.converter = "onboarding-sav-51-v1";
+    state.paginate.mockResolvedValue({ rows: [row], total: 1, page: 1, pageSize: 20 });
+    const html = await pageHtml();
+    expect(html).toContain("Cette carte nécessite une nouvelle préparation pour récupérer toutes les sections du tutoriel.");
+    expect(row.candidate.status).toBe("needs_completion");
+    expect(state.start).not.toHaveBeenCalled(); expect(state.review).not.toHaveBeenCalled();
+  });
+
   it("keeps titles visible while knowledge and review details start collapsed", async () => {
     const row = candidateRow();
     state.paginate.mockResolvedValue({ rows: [row], total: 123, page: 1, pageSize: 20 });

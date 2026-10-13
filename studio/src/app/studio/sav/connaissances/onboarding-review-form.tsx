@@ -3,7 +3,8 @@
 import Link from "next/link";
 import { useState } from "react";
 import { useFormStatus } from "react-dom";
-import type { CanonicalKnowledge, SemanticStep } from "@/lib/knowledge/contracts";
+import type { CanonicalKnowledge, SemanticStep, OnboardingSourceSection } from "@/lib/knowledge/contracts";
+import { onboardingSectionLabels, onboardingSectionsQualified } from "@/lib/knowledge/onboarding-sections";
 import { previewOnboardingReviewAction, reviewOnboardingKnowledgeAction } from "./onboarding-actions";
 
 type Comparison = NonNullable<Awaited<ReturnType<typeof previewOnboardingReviewAction>>["comparison"]>;
@@ -28,6 +29,8 @@ function SubmitButtons({ canApprove, busy }: { canApprove: boolean; busy: boolea
 }
 
 function errorMessage(code: string) {
+  if (code === "ONBOARDING_CONVERTER_STALE") return "Cette carte a été préparée avec une ancienne extraction. Préparez un nouvel inventaire pour récupérer toutes les consignes de la source.";
+  if (code === "ONBOARDING_SOURCE_SECTIONS_CHANGED") return "Les passages de la source doivent rester intacts. Rechargez la carte, puis qualifiez chaque section.";
   if (/SOURCE.*(?:STALE|CHANGED|INACTIVE)|ONBOARDING.*(?:STALE|CHANGED|INACTIVE)/.test(code)) return "Le tutoriel source a changé ou n’est plus actif. Préparez un nouveau lot avant de valider cette connaissance.";
   if (code === "KNOWLEDGE_CANDIDATE_STALE") return "Ce candidat a changé. Rechargez la page pour consulter sa dernière version.";
   return "La comparaison n’a pas pu être préparée. Vérifiez les champs et la source, puis réessayez.";
@@ -50,6 +53,11 @@ export function OnboardingReviewForm({ candidateId, revisionId, title, initialDo
   function updateStep(index: number, patch: Partial<SemanticStep>) {
     update({ ...document, steps: document.steps.map((step, position) => position === index ? { ...step, ...patch } : step) });
   }
+  function updateSection(index: number, patch: Partial<Pick<OnboardingSourceSection, "classification" | "rationale">>) {
+    if (!document.onboardingContext) return;
+    update({ ...document, onboardingContext: { ...document.onboardingContext,
+      sourceSections: document.onboardingContext.sourceSections?.map((section, position) => position === index ? { ...section, ...patch } : section) } });
+  }
   async function preview() {
     setBusy(true); setComparison(null); setAcknowledged(false); setMissingAcknowledged(false); setError("");
     const form = new FormData();
@@ -62,7 +70,7 @@ export function OnboardingReviewForm({ candidateId, revisionId, title, initialDo
   }
   const completionRequired = needsCompletion || Boolean(comparison?.missing.length);
   const contentChanged = JSON.stringify(cleanDocument(document)) !== JSON.stringify(cleanDocument(initialDocument));
-  const canApprove = Boolean(comparison?.sourceCurrent && acknowledged && (!completionRequired || (contentChanged && missingAcknowledged && completionNote.trim().length >= 20)));
+  const canApprove = Boolean(comparison?.sourceCurrent && acknowledged && onboardingSectionsQualified(document) && (!completionRequired || (contentChanged && missingAcknowledged && completionNote.trim().length >= 20)));
 
   return <form action={reviewOnboardingKnowledgeAction} aria-label={`Revoir ${title}`}>
     <input type="hidden" name="candidateId" value={candidateId}/><input type="hidden" name="revisionId" value={revisionId}/>
@@ -73,11 +81,25 @@ export function OnboardingReviewForm({ candidateId, revisionId, title, initialDo
       <summary>Corriger ou compléter la connaissance</summary>
       <p>Le titre « {title} » reste celui du tutoriel. Décrivez les informations utiles au support et citez les preuves dans le motif de revue.</p>
       <fieldset disabled={busy} style={{ border: 0, padding: 0 }}>
+        {Boolean(document.onboardingContext?.sourceSections?.length) && <section aria-label="Qualifier les sections de la source">
+          <h3>Qualifier les sections de la source</h3>
+          <p>Ces passages ne correspondent pas aux rubriques habituelles. Classez chacun et justifiez votre choix. Les passages pertinents seront repris intégralement dans la connaissance ; les autres resteront conservés dans la preuve de revue.</p>
+          {document.onboardingContext?.sourceSections?.map((section, index) => <fieldset key={section.id}>
+            <legend>{index + 1}. {section.heading}</legend>
+            <p style={{ whiteSpace: "pre-wrap" }}>{section.content || "Section sans texte exploitable : vérifier la source avant de qualifier."}</p>
+            <div><label htmlFor={`onboarding-${candidateId}-section-${section.id}-classification`}>Classement de la section {index + 1}</label>
+              <select id={`onboarding-${candidateId}-section-${section.id}-classification`} value={section.classification} onChange={(event) => updateSection(index, { classification: event.target.value as OnboardingSourceSection["classification"] })}>
+                {Object.entries(onboardingSectionLabels).map(([value, label]) => <option key={value} value={value}>{label}</option>)}
+              </select></div>
+            <div><label htmlFor={`onboarding-${candidateId}-section-${section.id}-rationale`}>Justification du classement {index + 1}</label>
+              <textarea id={`onboarding-${candidateId}-section-${section.id}-rationale`} rows={3} minLength={20} maxLength={2000} value={section.rationale} onChange={(event) => updateSection(index, { rationale: event.target.value })} style={fieldStyle}/></div>
+          </fieldset>)}
+        </section>}
         <div><label htmlFor={`onboarding-${candidateId}-objective`}>Objectif et valeur pour le membre</label><textarea id={`onboarding-${candidateId}-objective`} rows={3} maxLength={500} value={document.objective} onChange={(event) => update({ ...document, objective: event.target.value })} style={fieldStyle}/></div>
         <div><label htmlFor={`onboarding-${candidateId}-entry`}>Point d’entrée de la procédure</label><textarea id={`onboarding-${candidateId}-entry`} rows={3} maxLength={5000} value={document.onboardingContext?.entryPoint ?? ""} onChange={(event) => update({ ...document, onboardingContext: { ...(document.onboardingContext ?? { entryPoint: "", sourceNotes: [] }), entryPoint: event.target.value } })} style={fieldStyle}/></div>
         <details><summary>Précisions conservées depuis la source</summary>
-          {(document.onboardingContext?.sourceNotes ?? []).map((note, index) => <div key={index}><label htmlFor={`onboarding-${candidateId}-note-${index}`}>Précision {index + 1}</label><textarea id={`onboarding-${candidateId}-note-${index}`} rows={4} maxLength={10000} value={note} onChange={(event) => update({ ...document, onboardingContext: { entryPoint: document.onboardingContext?.entryPoint ?? "", sourceNotes: (document.onboardingContext?.sourceNotes ?? []).map((value, position) => position === index ? event.target.value : value) } })} style={fieldStyle}/></div>)}
-          <button type="button" className="secondary" disabled={(document.onboardingContext?.sourceNotes.length ?? 0) >= 50} onClick={() => update({ ...document, onboardingContext: { entryPoint: document.onboardingContext?.entryPoint ?? "", sourceNotes: [...(document.onboardingContext?.sourceNotes ?? []), ""] } })}>Ajouter une précision sourcée</button>
+          {(document.onboardingContext?.sourceNotes ?? []).map((note, index) => <div key={index}><label htmlFor={`onboarding-${candidateId}-note-${index}`}>Précision {index + 1}</label><textarea id={`onboarding-${candidateId}-note-${index}`} rows={4} maxLength={10000} value={note} onChange={(event) => update({ ...document, onboardingContext: { ...document.onboardingContext, entryPoint: document.onboardingContext?.entryPoint ?? "", sourceNotes: (document.onboardingContext?.sourceNotes ?? []).map((value, position) => position === index ? event.target.value : value) } })} style={fieldStyle}/></div>)}
+          <button type="button" className="secondary" disabled={(document.onboardingContext?.sourceNotes.length ?? 0) >= 50} onClick={() => update({ ...document, onboardingContext: { ...document.onboardingContext, entryPoint: document.onboardingContext?.entryPoint ?? "", sourceNotes: [...(document.onboardingContext?.sourceNotes ?? []), ""] } })}>Ajouter une précision sourcée</button>
         </details>
         <div><label htmlFor={`onboarding-${candidateId}-prerequisites`}>Prérequis — un par ligne</label><textarea id={`onboarding-${candidateId}-prerequisites`} rows={3} value={document.prerequisites.join("\n")} onChange={(event) => update({ ...document, prerequisites: event.target.value.split("\n") })} style={fieldStyle}/></div>
         <div><label htmlFor={`onboarding-${candidateId}-expected-result`}>Résultat attendu</label><textarea id={`onboarding-${candidateId}-expected-result`} rows={3} maxLength={5000} value={document.expectedResult} onChange={(event) => update({ ...document, expectedResult: event.target.value })} style={fieldStyle}/></div>

@@ -32,6 +32,7 @@ export default async function DetailPage({ params, searchParams }: {
   const published = detail.versions.find((version) => version.id === detail.item.publishedVersionId);
   const sourceStates = await Promise.all([current, published].filter((version) => Boolean(version)).map((version) => onboardingSourceStatus(version!.metadata)));
   const sourceChanged = sourceStates.includes("changed");
+  const preparationStale = sourceStates.includes("preparation_stale");
   const sourceUnavailable = sourceStates.includes("unavailable");
   const sourceTraining = await getTrainingByContentItemId(id);
   const evaluationData = detail.item.type === "onboarding" ? await getEvaluationForContent(id) : null;
@@ -49,8 +50,8 @@ export default async function DetailPage({ params, searchParams }: {
   return <>
     <span className="eyebrow">{detail.item.type === "article" ? "Article" : "Parcours"} · version {current?.version ?? 0}</span>
     <h1 className="page-title">{detail.item.title}</h1>
-    {(sourceChanged || sourceUnavailable) && <section className="card" role="status" style={{ padding: 20 }}>
-      <h2>{sourceChanged ? "Le tutoriel source a changé" : "La provenance doit être vérifiée"}</h2>
+    {(sourceChanged || sourceUnavailable || preparationStale) && <section className="card" role="status" style={{ padding: 20 }}>
+      <h2>{preparationStale ? "La connaissance nécessite une nouvelle préparation" : sourceChanged ? "Le tutoriel source a changé" : "La provenance doit être vérifiée"}</h2>
       <p>{detail.item.publishedVersionId ? "La dernière connaissance publiée conserve son état d’activation. Sa mise à jour nécessite une nouvelle préparation et une revalidation d’Ugo." : "Vérifiez la source actuelle et préparez une nouvelle proposition avant publication."}</p>
       <Link href="/studio/sav/connaissances?source=onboarding">Revoir les connaissances issues des tutoriels</Link>
     </section>}
