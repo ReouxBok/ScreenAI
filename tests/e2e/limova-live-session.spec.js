@@ -19,19 +19,32 @@ const BROWSER_TURN = '66666666-6666-4666-8666-666666666666';
 const BROWSER_SESSION = '77777777-7777-4777-8777-777777777777';
 const PAGE = { tabId: 7, origin: 'https://example.com', contextVersion: 1 };
 
-test('live transport uses real first-party cookies, preserves PCM and stops when the app closes', async () => {
+for (const browserDriver of [false, true]) {
+test(`live transport ${browserDriver ? 'with real DOM driver and journal' : 'wire contract'} uses first-party cookies and stops when the app closes`, async () => {
   const directory = await mkdtemp(path.join(tmpdir(), 'limova-live-test-'));
   const key = path.join(directory, 'key.pem'), cert = path.join(directory, 'cert.pem');
   execFileSync('openssl', ['req', '-x509', '-newkey', 'rsa:2048', '-nodes', '-keyout', key,
     '-out', cert, '-days', '1', '-subj', '/CN=limova-live-test'], { stdio: 'ignore' });
-  const seen = { starts: 0, connected: 0, stopped: 0, disconnected: 0, pcm: null, cancelled: null, browserBinding: null, browserResult: null, cookie: false, origin: null };
+  const seen = { starts: 0, connected: 0, stopped: 0, disconnected: 0, pcm: null, cancelled: null, browserBinding: null, browserResult: null, results: [], action: null, httpChecks: [], cookie: false, origin: null };
   const server = createServer({ key: await readFile(key), cert: await readFile(cert) }, (request, response) => {
     if (request.headers.host === new URL(APP).host) {
-      response.writeHead(200, { 'content-type': 'text/html' }); response.end('<title>Live fixture</title>'); return;
+      response.writeHead(200, { 'content-type': 'text/html' }); response.end('<title>Live fixture</title><main>Browser knowledge fixture</main>'); return;
     }
-    response.writeHead(200, { 'access-control-allow-origin': APP, 'access-control-allow-credentials': 'true',
-      'set-cookie': 'live_fixture=authenticated; Path=/; HttpOnly; Secure; SameSite=None; Partitioned' });
-    response.end('{}');
+    const headers = { 'access-control-allow-origin': APP, 'access-control-allow-credentials': 'true',
+      'access-control-allow-headers': 'x-workspace-id,content-type', 'access-control-allow-methods': 'GET,POST,OPTIONS', 'content-type': 'application/json' };
+    if (request.method === 'OPTIONS') { response.writeHead(204, headers); response.end(); return; }
+    if (request.url === '/fixture-login') {
+      response.writeHead(200, { ...headers, 'set-cookie': 'live_fixture=authenticated; Path=/; HttpOnly; Secure; SameSite=None; Partitioned' });
+      response.end('{}'); return;
+    }
+    const authenticated = request.headers.cookie?.includes('live_fixture=authenticated') === true;
+    seen.httpChecks.push({ path: request.url, authenticated, workspaceId: request.headers['x-workspace-id'] });
+    let data = {};
+    if (request.url === '/users/me') data = { id: USER };
+    if (request.url === '/workspaces') data = [{ id: WORKSPACE, is_charly_extension_enabled: true }];
+    if (request.url === `/conversation/${CONVERSATION}`) data = { id: CONVERSATION, engine: 'deep_agents', mainAgent: { slug: 'charly' } };
+    response.writeHead(authenticated ? 200 : 401, headers);
+    response.end(JSON.stringify(data));
   });
   const io = new Server(server, { cors: { origin: APP, credentials: true }, transports: ['websocket'] });
   io.of('/conversation/live').on('connection', socket => {
@@ -48,11 +61,19 @@ test('live transport uses real first-party cookies, preserves PCM and stops when
     socket.on('audio.append', payload => {
       seen.pcm = { sequence: payload.sequence, bytes: Array.from(payload.audio) };
       socket.emit('turn.deep_agent_stream.started', { sessionId: SESSION, turnId: VOICE_TURN });
-      socket.emit('turn.deep_agent_stream.delta', { sessionId: SESSION, turnId: VOICE_TURN, chunk: Buffer.from(`event: custom\ndata: ${JSON.stringify({ type: 'extension.turn_state', state: 'waiting', turnId: BROWSER_TURN })}\n\n`) });
+      seen.action = { type: 'extension.action_requested', protocolVersion: 1, turnId: BROWSER_TURN, actionId: 'action-1', toolCallId: 'tool-1', target: seen.browserBinding.browserContext, input: { operation: 'read_page' }, expiresAt: new Date(Date.now() + 60_000).toISOString() };
+      const frames = [...(browserDriver ? [seen.action] : []), { type: 'extension.turn_state', state: 'waiting', turnId: BROWSER_TURN }];
+      socket.emit('turn.deep_agent_stream.delta', { sessionId: SESSION, turnId: VOICE_TURN, chunk: Buffer.from(frames.map(data => `event: custom\ndata: ${JSON.stringify(data)}\n\n`).join('')) });
       socket.emit('assistant.audio.delta', { sessionId: SESSION, sequence: 0, audio: Buffer.from([0, 128, 255, 127]) });
     });
     socket.on('turn.browser_continue', payload => {
       seen.browserResult = payload;
+      seen.results.push(payload);
+      if (browserDriver && seen.results.length === 1) {
+        const frames = [seen.action, { type: 'extension.turn_state', state: 'waiting', turnId: BROWSER_TURN }];
+        socket.emit('turn.deep_agent_stream.delta', { sessionId: SESSION, turnId: VOICE_TURN, chunk: Buffer.from(frames.map(data => `event: custom\ndata: ${JSON.stringify(data)}\n\n`).join('')) });
+        return;
+      }
       socket.emit('turn.deep_agent_stream.completed', { sessionId: SESSION, turnId: VOICE_TURN });
     });
     socket.on('response.cancel', payload => { seen.cancelled = payload.playedAudioMs; });
@@ -74,24 +95,54 @@ test('live transport uses real first-party cookies, preserves PCM and stops when
     await extensionPage.goto(`chrome-extension://${new URL(worker.url()).host}/src/sidebar/microphone-permission.html`);
     const app = await context.newPage(); await app.goto(APP);
     await app.evaluate(api => fetch(`${api}/fixture-login`, { credentials: 'include' }), API);
-    await extensionPage.evaluate(async ({ USER, WORKSPACE, CONVERSATION, BROWSER_SESSION, PAGE }) => {
+    await extensionPage.evaluate(async ({ USER, WORKSPACE, CONVERSATION, BROWSER_SESSION, PAGE, browserDriver }) => {
       const { createLimovaLiveTransport } = await import(chrome.runtime.getURL('src/limova/live-transport.js'));
       globalThis.liveEvents = []; globalThis.liveErrors = [];
-      globalThis.live = await createLimovaLiveTransport(chrome)({ context: { userId: USER, workspaceId: WORKSPACE },
+      let start = createLimovaLiveTransport(chrome);
+      if (browserDriver) {
+        const { createBrowserLiveSession } = await import(chrome.runtime.getURL('src/limova/live-browser-session.js'));
+        const { createBrowserJournal } = await import(chrome.runtime.getURL('src/limova/browser-journal.js'));
+        const { createBrowserDriver } = await import(chrome.runtime.getURL('src/limova/browser-driver.js'));
+        const { LimovaDeepAgentClient } = await import(chrome.runtime.getURL('src/limova/client.js'));
+        const { createLimovaSessionFetch } = await import(chrome.runtime.getURL('src/limova/session-fetch.js'));
+        globalThis.executions = 0;
+        start = createBrowserLiveSession({ openTransport: start, journal: createBrowserJournal(),
+          client: new LimovaDeepAgentClient(createLimovaSessionFetch(chrome)),
+          createDriver: options => {
+            const driver = createBrowserDriver({ ...options, chrome, hasConsent: async () => true });
+            const execute = driver.execute;
+            driver.execute = (...args) => { globalThis.executions += 1; return execute(...args); };
+            return driver;
+          },
+        });
+      }
+      globalThis.live = await start({ context: { userId: USER, workspaceId: WORKSPACE },
         browserSession: BROWSER_SESSION, browserContext: PAGE,
         conversationId: CONVERSATION, languageCode: 'fr', userTimezone: 'Europe/Paris',
         onEvent: (event, payload) => { globalThis.liveEvents.push({ event, payload }); },
         onError: error => { globalThis.liveErrors.push(error.message); },
       });
       globalThis.live.sendAudio(new Uint8Array([0, 128, 255, 127]));
-    }, { USER, WORKSPACE, CONVERSATION, BROWSER_SESSION, PAGE });
+    }, { USER, WORKSPACE, CONVERSATION, BROWSER_SESSION, PAGE, browserDriver });
     await expect.poll(() => seen.pcm).toEqual({ sequence: 0, bytes: [0, 128, 255, 127] });
     await expect.poll(() => extensionPage.evaluate(() => globalThis.liveEvents.some(item => item.event === 'turn.deep_agent_stream.delta'))).toBe(true);
-    expect(seen.browserBinding).toEqual({ browserSession: BROWSER_SESSION, browserContext: PAGE });
+    if (!browserDriver) expect(seen.browserBinding).toEqual({ browserSession: BROWSER_SESSION, browserContext: PAGE });
     const continuation = { turnId: VOICE_TURN, kind: 'browser_tool_result', browserContext: PAGE,
       browserResult: { turnId: BROWSER_TURN, actionId: 'action-1', toolCallId: 'tool-1', contextVersion: 1, status: 'completed', observation: 'Page inspectée' } };
-    await extensionPage.evaluate(payload => globalThis.live.continueBrowser(payload), continuation);
-    await expect.poll(() => seen.browserResult).toEqual({ sessionId: SESSION, ...continuation });
+    if (!browserDriver) {
+      await extensionPage.evaluate(payload => globalThis.live.continueBrowser(payload), continuation);
+      await expect.poll(() => seen.browserResult).toEqual({ sessionId: SESSION, ...continuation });
+    } else {
+      await expect.poll(() => seen.results.length).toBe(2);
+      expect(seen.results[0].browserResult).toEqual(seen.results[1].browserResult);
+      expect(seen.browserResult).toMatchObject({ sessionId: SESSION, turnId: VOICE_TURN,
+        browserResult: { turnId: BROWSER_TURN, actionId: 'action-1', status: 'completed' } });
+      expect(seen.browserResult.browserResult.observation).toContain('Browser knowledge fixture');
+      expect(await extensionPage.evaluate(() => globalThis.executions)).toBe(1);
+      expect(seen.httpChecks.length).toBeGreaterThanOrEqual(6);
+      expect(seen.httpChecks.every(check => check.authenticated)).toBe(true);
+      expect(seen.httpChecks.filter(check => check.path.startsWith('/conversation/')).every(check => check.workspaceId === WORKSPACE)).toBe(true);
+    }
     await expect.poll(() => extensionPage.evaluate(() => globalThis.liveEvents.some(item => item.event === 'turn.deep_agent_stream.completed'))).toBe(true);
     await extensionPage.evaluate(() => globalThis.live.cancel(120));
     await expect.poll(() => seen.cancelled).toBe(120);
@@ -111,3 +162,5 @@ test('live transport uses real first-party cookies, preserves PCM and stops when
     await rm(directory, { recursive: true, force: true });
   }
 });
+
+}

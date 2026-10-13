@@ -2,7 +2,7 @@
 
 Le transport `createLimovaLiveTransport` ouvre le namespace Socket.IO existant `/conversation/live` depuis le document exact de l’app Limova, via un port interne dans le monde isolé de l’extension. Il réutilise les cookies du navigateur sans les lire ni les copier. Le worker ou le panneau prépare l’onglet avec le même helper que le chat HTTP. La dépendance Socket.IO est embarquée dans le paquet, sans script distant.
 
-Cette couche n’est pas encore branchée au bouton micro. Les PR API #2212–#2214 préparent le contrat extension et sa reprise navigateur ; leur disponibilité sur le déploiement cible reste à vérifier. La capture PCM, la lecture audio et le contrôleur d’actions restent à raccorder. Le moteur cible reste le Charly Deep Agent existant.
+Cette couche n’est pas encore branchée au bouton micro. Les PR API #2212–#2214 préparent le contrat extension et sa reprise navigateur ; leur disponibilité sur le déploiement cible reste à vérifier. La capture PCM, la lecture audio et le raccordement au panneau restent à réaliser. Le moteur cible reste le Charly Deep Agent existant.
 
 ## Contrat requis côté backend
 
@@ -20,7 +20,17 @@ Le handle retourné expose `continueBrowser({ turnId, kind, browserContext, brow
 
 Les champs sont limités au contrat existant : résultats completed/rejected/failed, observation de 32 000 caractères maximum, identifiants d’action/outil bornés, référence image UUID éventuelle et contexte de page validé. Aucun contenu utilisateur supplémentaire, agent alternatif ou destination arbitraire. Une continuation ne peut partir que pour le tour vocal actif d’une session ayant déclaré son binding navigateur ; au maximum 100 envois par tour, sans mise en file Socket.IO hors connexion. Annulation et fin de tour invalident cette possibilité.
 
-Cette couche transporte les continuations ; elle n’exécute pas encore les actions et ne rafraîchit pas seule le contexte de page entre tours. Le futur contrôleur doit réutiliser le driver/journal d’actions et obtenir le contexte courant. `onEvent` doit rapidement enregistrer les frames dans sa propre file puis rendre la main : ne pas attendre l’exécution d’une action ou sa réponse vocale dans ce callback, car l’acquittement transport est borné à 5 secondes.
+Le transport seul ne lance pas d’actions. Le contrôleur décrit ci-dessous compose ce transport avec le driver et le journal ; le rafraîchissement proactif du contexte entre tours et le branchement au panneau restent à réaliser. `onEvent` doit rapidement enregistrer les frames dans sa propre file puis rendre la main : ne pas attendre l’exécution d’une action ou sa réponse vocale dans ce callback, car l’acquittement transport est borné à 5 secondes.
+
+## Contrôleur navigateur vocal
+
+`createBrowserLiveSession` compose le transport, le client HTTP Limova, le driver et le journal existants. Avant le socket : vérification du compte/workspace/conversation par `getConversation`, récupération de la session du journal, puis lecture du contexte de page autorisé. Les uploads éventuels gardent la conversation et le signal d’annulation de l’action.
+
+`createLiveBrowserController` ingère les octets SSE sans attendre les actions dans `onEvent`. Son buffer d’entrée est borné à 256 Ko et le parseur commun conserve ses limites de taille. Seules les frames `extension.action_requested` suivies d’un état `waiting` cohérent déclenchent le journal, après une nouvelle vérification HTTP et l’autorisation du driver. Le reçu obtenu est envoyé via `continueBrowser`, avec un contexte relu après l’action. Maximum 100 continuations par tour ; un reçu incertain provoque un arrêt explicite, jamais un rejeu automatique.
+
+L’annulation interrompt le parseur et le signal du driver ; un résultat tardif n’est pas envoyé. Une erreur ferme la session composée et remonte une seule notification. Le changement de compte/workspace et les modes entraînement/évaluation devront annuler cette session depuis le futur raccordement au panneau/background. Le bouton micro existant n’utilise pas encore cette composition.
+
+Le test Chromium comprend maintenant une variante avec le vrai client HTTP first-party, le vrai driver DOM et IndexedDB. Le serveur local redemande le même `read_page` : deux reçus identiques sont transmis, pour une seule exécution DOM. Compte, flag, conversation et provider restent simulés par le serveur local ; cela ne prouve pas le fonctionnement d’un déploiement réel.
 
 ## Coupures et limites
 
