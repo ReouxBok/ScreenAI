@@ -37,7 +37,7 @@
   "dependencies": {
     "@clerk/backend": "^2.33.6",
     "@clerk/nextjs": "^7.8.2",
-    "@google/adk": "^1.5.0",
+    "@google/adk": "2.3.0",
     "@google/genai": "^2.15.0",
     "@modelcontextprotocol/sdk": "^1.32.1",
     "@tiptap/markdown": "^3.31.0",
@@ -83,6 +83,10 @@
     "adm-zip": "0.6.1",
     "mariadb": "3.5.4",
     "mysql2": "3.24.3",
-    "tar": "7.5.22"
+    "tar": "7.5.22",
+    "gaxios": {
+      "uuid": "11.1.1"
+    },
+    "devalue": "5.9.4"
   }
 }

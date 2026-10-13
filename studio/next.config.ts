@@ -3,7 +3,7 @@ import { withWorkflow } from "workflow/next";
 
 const nextConfig: NextConfig = {
   turbopack: { root: process.cwd() },
-  serverExternalPackages: ["@electric-sql/pglite", "@electric-sql/pglite-pgvector"],
+  serverExternalPackages: ["@electric-sql/pglite", "@electric-sql/pglite-pgvector", "@google/adk"],
   allowedDevOrigins: ["127.0.0.1"],
 };
 
