@@ -494,11 +494,11 @@ function isTrustedMessageSource(request, sender) {
 async function handleMessage(request, sender) {
   await initializationPromise;
   if (LIMOVA_MESSAGE_TYPES.has(request.type)) {
-    if (request.type === 'LIMOVA_SEND_MESSAGE' && !(await hasAIProcessingConsent())) {
+    if (['LIMOVA_SEND_MESSAGE', 'LIMOVA_RESUME_BROWSER'].includes(request.type) && !(await hasAIProcessingConsent())) {
       broadcastToSidebar({ type: 'CONSENT_REQUIRED' });
       return { ok: false, consentRequired: true, error: 'Consentement IA requis.' };
     }
-    if ((trainingState.active || evaluationState.active) && request.type === 'LIMOVA_SEND_MESSAGE') {
+    if ((trainingState.active || evaluationState.active) && ['LIMOVA_SEND_MESSAGE', 'LIMOVA_RESUME_BROWSER'].includes(request.type)) {
       return { ok: false, error: 'Termine le mode formateur ou évaluation avant de reprendre une conversation personnelle.' };
     }
     return limovaBackground.handle(request);

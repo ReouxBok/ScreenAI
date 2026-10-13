@@ -23,7 +23,7 @@ function setup(overrides = {}) {
 beforeEach(() => {
   document.body.innerHTML = '<input id="limovaBrowser" type="checkbox">' + ['authPanel', 'limovaControls', 'authFeedback', 'limovaFeedback'].map(id => `<div id="${id}"></div>`).join('')
     + ['limovaWorkspace', 'limovaConversation'].map(id => `<select id="${id}"></select>`).join('')
-    + ['limovaLogin', 'limovaRefresh', 'limovaRefreshSession', 'limovaNew', 'limovaCancel'].map(id => `<button id="${id}"></button>`).join('');
+    + ['limovaLogin', 'limovaRefresh', 'limovaRefreshSession', 'limovaNew', 'limovaCancel', 'limovaResume'].map(id => `<button id="${id}"></button>`).join('');
 });
 
 describe('Limova panel session and turn boundaries', () => {
@@ -93,4 +93,18 @@ it('requires a fresh browser opt-in and surfaces uncertainty without automatic r
   expect(element('limovaBrowser').checked).toBe(false);
   expect(element('limovaFeedback').textContent).toContain('incertain');
   expect(request.mock.calls.filter(([request]) => request.type === 'LIMOVA_SEND_MESSAGE')).toHaveLength(1);
+});
+
+
+it('resumes explicitly without resending user text', async () => {
+  const { panel, request } = setup({ LIMOVA_RESUME_BROWSER: () => ({ ok: true, browserState: 'completed' }) });
+  await panel.refresh();
+  element('limovaResume').click();
+  expect(element('limovaFeedback').textContent).toContain('Autorise');
+  expect(request.mock.calls.some(([request]) => request.type === 'LIMOVA_RESUME_BROWSER')).toBe(false);
+  element('limovaBrowser').checked = true;
+  element('limovaResume').click();
+  await vi.waitFor(() => expect(request).toHaveBeenCalledWith({ type: 'LIMOVA_RESUME_BROWSER', browser: true }));
+  await vi.waitFor(() => expect(element('limovaBrowser').checked).toBe(false));
+  expect(request.mock.calls.some(([request]) => request.type === 'LIMOVA_SEND_MESSAGE')).toBe(false);
 });

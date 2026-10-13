@@ -7,7 +7,7 @@ export const LIMOVA_MESSAGE_TYPES = new Set([
   'LIMOVA_GET_STATE', 'LIMOVA_SELECT_WORKSPACE', 'LIMOVA_LIST_CONVERSATIONS',
   'LIMOVA_CREATE_CONVERSATION', 'LIMOVA_OPEN_CONVERSATION', 'LIMOVA_SEND_MESSAGE',
   'LIMOVA_CANCEL', 'LIMOVA_OPEN_APP', 'LIMOVA_LOGOUT',
-  'LIMOVA_GET_MESSAGES',
+  'LIMOVA_GET_MESSAGES', 'LIMOVA_RESUME_BROWSER',
 ]);
 
 export function createLimovaBackground({ storage, openTab, notify, client = new LimovaDeepAgentClient(), journal = createBrowserJournal(), createDriver }) {
@@ -110,7 +110,9 @@ export function createLimovaBackground({ storage, openTab, notify, client = new 
         await save();
         return { conversation, messages };
       }
+      case 'LIMOVA_RESUME_BROWSER':
       case 'LIMOVA_SEND_MESSAGE': {
+        if (request.type === 'LIMOVA_RESUME_BROWSER' && request.browser !== true) throw new Error('Autorise le navigateur avant de reprendre ce tour.');
         if (activeTurn) throw new Error('Un tour est déjà en cours.');
         if (!conversationId) throw new Error('Ouvre une conversation Limova.');
         const turn = { id: crypto.randomUUID(), context: requireContext(), conversationId, controller: new AbortController() };
@@ -126,7 +128,9 @@ export function createLimovaBackground({ storage, openTab, notify, client = new 
             const driver = createDriver({ scope: { ...turn.context, sessionId }, journal, signal: turn.controller.signal });
             const runner = createBrowserTurnRunner({ client, journal, readPage: driver.readPage,
               execute: driver.execute, authorize: driver.authorize, notify: emit });
-            const outcome = await runner.send(turn.context, turn.conversationId, request.text, turn.controller.signal);
+            const outcome = request.type === 'LIMOVA_RESUME_BROWSER'
+              ? await runner.resume(turn.context, turn.conversationId, turn.controller.signal)
+              : await runner.send(turn.context, turn.conversationId, request.text, turn.controller.signal);
             notify({ type: 'LIMOVA_BROWSER_STATE', turnId: turn.id, conversationId: turn.conversationId, state: outcome.state, actionId: outcome.actionId, browserTurnId: outcome.turnId });
             return { ok: true, turnId: turn.id, browserState: outcome.state };
           }

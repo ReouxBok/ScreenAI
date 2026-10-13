@@ -156,3 +156,24 @@ it('does not silently send a browser request as a text-only request without a dr
   await expect(h.background.handle({ type: 'LIMOVA_SEND_MESSAGE', text: 'Lis cette page', browser: true })).rejects.toThrow('pilote navigateur');
   expect(h.client.sendMessage).not.toHaveBeenCalled();
 });
+
+it('resumes a browser turn without sending a new human message', async () => {
+  const driver = { readPage: vi.fn().mockResolvedValue({ tabId: 1, origin: 'https://example.com', contextVersion: 2 }), authorize: vi.fn(), execute: vi.fn() };
+  const h = harness({ createDriver: () => driver });
+  h.client.getBrowserTurn = vi.fn().mockResolvedValue({ turnId: 'backend-turn', status: 'open' });
+  h.client.resumeBrowserTurn = vi.fn(async function* () {
+    yield { event: 'custom', data: { type: 'extension.turn_state', turnId: 'backend-turn', state: 'completed' } };
+  });
+  await open(h.background);
+  const result = await h.background.handle({ type: 'LIMOVA_RESUME_BROWSER', browser: true });
+  expect(result.browserState).toBe('completed');
+  expect(h.client.sendMessage).not.toHaveBeenCalled();
+  expect(h.client.resumeBrowserTurn).toHaveBeenCalledTimes(1);
+});
+
+it('requires fresh browser authorization before resume', async () => {
+  const h = harness();
+  await open(h.background);
+  await expect(h.background.handle({ type: 'LIMOVA_RESUME_BROWSER' })).rejects.toThrow('Autorise le navigateur');
+  expect(h.client.sendMessage).not.toHaveBeenCalled();
+});
