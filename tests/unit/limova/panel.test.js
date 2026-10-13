@@ -108,3 +108,16 @@ it('resumes explicitly without resending user text', async () => {
   await vi.waitFor(() => expect(element('limovaBrowser').checked).toBe(false));
   expect(request.mock.calls.some(([request]) => request.type === 'LIMOVA_SEND_MESSAGE')).toBe(false);
 });
+
+
+it('preserves explicit consent while creating the conversation for the first message', async () => {
+  const { panel, request } = setup({
+    LIMOVA_GET_STATE: () => ({ ...state, conversationId: null }),
+    LIMOVA_CREATE_CONVERSATION: () => ({ id: 'new-conversation' }),
+  });
+  await panel.refresh();
+  element('limovaBrowser').checked = true;
+  await panel.send('Lis la page');
+  expect(request).toHaveBeenCalledWith({ type: 'LIMOVA_SEND_MESSAGE', text: 'Lis la page', browser: true });
+  expect(element('limovaBrowser').checked).toBe(false);
+});

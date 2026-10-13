@@ -89,9 +89,12 @@ export function createLimovaPanel({ document, request, render, onBusy }) {
     } catch (error) { if (current === generation) feedback(error.message); }
     finally { if (current === generation) setBusy(false); }
   }
-  async function create() {
+  async function create(preserveBrowserConsent = false) {
     if (!context || busy) return;
-    const current = ++generation; clear(); setBusy(true);
+    const browserConsent = preserveBrowserConsent && element('limovaBrowser')?.checked === true;
+    const current = ++generation; clear();
+    if (element('limovaBrowser')) element('limovaBrowser').checked = browserConsent;
+    setBusy(true);
     try {
       const conversation = await call('LIMOVA_CREATE_CONVERSATION');
       if (current !== generation) return;
@@ -103,12 +106,13 @@ export function createLimovaPanel({ document, request, render, onBusy }) {
   async function send(text, resume = false) {
     if (!context || busy || (!resume && !text.trim())) return false;
     if (resume && (!conversationId || element('limovaBrowser')?.checked !== true)) { feedback('Autorise le navigateur pour reprendre le tour interrompu.'); return false; }
-    if (!conversationId) await create();
+    if (!conversationId) await create(true);
     if (!conversationId) return false;
     const current = generation;
     sending = true; setBusy(true); feedback('');
     try {
       const result = await call(resume ? 'LIMOVA_RESUME_BROWSER' : 'LIMOVA_SEND_MESSAGE', { ...(resume ? {} : { text }), browser: element('limovaBrowser')?.checked === true });
+      if (current !== generation) return false;
       if (result.browserState === 'uncertain') feedback('Le résultat de l’action est incertain. Vérifie la page avant de poursuivre ; l’action ne sera pas répétée automatiquement.');
       else if (result.browserState === 'waiting') feedback('Le tour navigateur est en attente.');
       else if (result.browserState === 'absent') feedback('Aucun tour navigateur à reprendre.');
