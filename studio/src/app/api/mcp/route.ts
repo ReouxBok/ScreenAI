@@ -1,6 +1,6 @@
 import { timingSafeEqual } from "node:crypto";
 import { WebStandardStreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js";
-import { createStudioMcpServer } from "@/lib/studio-mcp";
+import { createStudioEvaluationMcpServer, createStudioMcpServer } from "@/lib/studio-mcp";
 
 export const runtime = "nodejs";
 
@@ -17,7 +17,11 @@ export async function POST(request: Request) {
   if (request.headers.has("origin")) {
     return Response.json({ error: "forbidden_origin" }, { status: 403 });
   }
-  const server = createStudioMcpServer();
+  const evaluationCode = request.headers.get("x-limova-evaluation-code");
+  if (evaluationCode !== null && !/^[A-Za-z0-9_-]{24,100}$/.test(evaluationCode)) {
+    return Response.json({ error: "invalid_evaluation" }, { status: 400, headers: { "Cache-Control": "no-store" } });
+  }
+  const server = evaluationCode === null ? createStudioMcpServer() : createStudioEvaluationMcpServer(evaluationCode);
   const transport = new WebStandardStreamableHTTPServerTransport({
     sessionIdGenerator: undefined,
     enableJsonResponse: true,
