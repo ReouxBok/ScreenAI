@@ -15,6 +15,7 @@ node_modules/
 
 # Build artefacts
 build/
+build-staging/
 build.zip
 dist/
 **/.next/

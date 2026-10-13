@@ -1,7 +1,7 @@
 import { readDeepAgentEvents } from './sse.js';
+import { LIMOVA_API_URL } from './environment.js';
 
-export const LIMOVA_APP_URL = 'https://new.limova.ai';
-export const LIMOVA_API_URL = 'https://api.new.limova.ai';
+export { LIMOVA_APP_URL, LIMOVA_API_URL } from './environment.js';
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 export class LimovaClientError extends Error {

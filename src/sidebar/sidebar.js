@@ -1,5 +1,6 @@
 import { bindSitePermissions } from '../limova/site-permissions.js';
 import { createLimovaPanel } from '../limova/panel.js';
+import { LIMOVA_APP_URL } from '../limova/environment.js';
 
 /**
  * Limova AI - Charly Onboarding Assistant - Sidebar Logic
@@ -560,7 +561,7 @@ async function checkIfOnLimova() {
   if (!goBtn) return;
   try {
     const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
-    if (tab?.url && !tab.url.startsWith('https://new.limova.ai')) {
+    if (tab?.url && !tab.url.startsWith(`${LIMOVA_APP_URL}/`)) {
       goBtn.hidden = false;
     } else {
       goBtn.hidden = true;

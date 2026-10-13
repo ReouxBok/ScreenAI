@@ -6,7 +6,7 @@
 import { createBrowserDriver } from './limova/browser-driver.js';
 import Logger from './utils/logger.js';
 import { createLimovaBackground, LIMOVA_MESSAGE_TYPES } from './limova/background.js';
-import { LimovaDeepAgentClient } from './limova/client.js';
+import { LimovaDeepAgentClient, LIMOVA_APP_URL, LIMOVA_API_URL } from './limova/client.js';
 import { createLimovaSessionFetch, openLimovaApp } from './limova/session-fetch.js';
 import { buildSystemPrompt } from './prompts/system-prompt.js';
 import { searchKB } from './knowledge-base/kb-search.js';
@@ -16,8 +16,8 @@ import { createOnboardingPlan, advanceStep } from './prompts/onboarding-plan.js'
 // Config
 // ============================================================================
 
-const LIMOVA_DOMAIN = 'https://new.limova.ai';
-const LIMOVA_API_DOMAIN = 'https://api.new.limova.ai';
+const LIMOVA_DOMAIN = LIMOVA_APP_URL;
+const LIMOVA_API_DOMAIN = LIMOVA_API_URL;
 const PROXY_URL = 'https://limova-proxy-479c7fb78ccf.herokuapp.com';
 const TRAINING_API_URL = 'https://studio.limova.ai/api/training/sessions';
 const EVALUATION_API_URL = 'https://studio.limova.ai/api/evaluations/runs';
@@ -279,7 +279,7 @@ chrome.webNavigation.onHistoryStateUpdated.addListener((details) => {
 
   if (urlChangeTimeout) clearTimeout(urlChangeTimeout);
   urlChangeTimeout = setTimeout(() => handleUrlChange(details.tabId, details.url), URL_CHANGE_DEBOUNCE);
-}, { url: [{ schemes: ['https'], hostEquals: 'new.limova.ai' }] });
+}, { url: [{ schemes: ['https'], hostEquals: new URL(LIMOVA_DOMAIN).hostname }] });
 
 chrome.tabs.onCreated.addListener((tab) => {
   trackExternalPopup(tab).catch(error => Logger.warn('popup', 'External popup tracking failed', error));
@@ -1301,7 +1301,7 @@ async function handleTakeScreenshot() {
   }
   const tab = await getActiveLimovaTab();
   if (!tab) {
-    broadcastToSidebar({ type: 'ERROR', content: 'Ouvre new.limova.ai pour analyser une page.' });
+    broadcastToSidebar({ type: 'ERROR', content: `Ouvre ${new URL(LIMOVA_DOMAIN).hostname} pour analyser une page.` });
     return { ok: false };
   }
 
@@ -3208,7 +3208,7 @@ async function getFreshVoiceContext(parentOperationId = null, { capture = false 
 
   const tab = await getLimovaTabForAuthentication();
   if (!tab?.id) {
-    const error = codedError('VOICE_CONTEXT_TAB_MISSING', 'Ouvre un onglet new.limova.ai pour que Charly puisse analyser et piloter la page.');
+    const error = codedError('VOICE_CONTEXT_TAB_MISSING', `Ouvre un onglet ${new URL(LIMOVA_DOMAIN).hostname} pour que Charly puisse analyser et piloter la page.`);
     Logger.error('voice', 'Voice context tab missing', error, error.code, operationId);
     throw error;
   }
