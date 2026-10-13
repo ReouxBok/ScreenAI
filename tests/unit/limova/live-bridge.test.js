@@ -24,7 +24,7 @@ function fixture(sender = 'own-extension') {
   attachLimovaLiveBridge(runtime, io);
   runtime.onConnect.fire(port);
   const server = (name, value) => callbacks.get(name)?.(value);
-  const open = () => { port.onMessage.fire(start); server('connect'); server('session.ready', ready); port.onMessage.fire({ kind: 'ack', sequence: 1 }); };
+  const open = (binding = {}) => { port.onMessage.fire({ ...start, ...binding }); server('connect'); server('session.ready', ready); port.onMessage.fire({ kind: 'ack', sequence: 1 }); };
   return { port, socket, io, server, open };
 }
 afterEach(() => vi.useRealTimers());
@@ -43,6 +43,43 @@ describe('first-party live bridge', () => {
     f.port.onDisconnect.fire();
     expect(f.socket.disconnect).toHaveBeenCalledTimes(1);
     expect(f.socket.emit).toHaveBeenLastCalledWith('session.stop');
+  });
+
+  it('binds browser continuations to the active voice turn and server session', () => {
+    const f = fixture();
+    const browserSession = '55555555-5555-4555-8555-555555555555';
+    const browserContext = { tabId: 7, origin: 'https://example.com', contextVersion: 1 };
+    f.open({ browserSession, browserContext });
+    expect(f.socket.emit).toHaveBeenCalledWith('session.start', expect.objectContaining({ browserSession, browserContext }));
+    const turnId = '66666666-6666-4666-8666-666666666666';
+    f.server('turn.deep_agent_stream.started', { sessionId, turnId });
+    const payload = { turnId, kind: 'browser_resume', browserTurnId: conversationId, browserContext };
+    f.port.onMessage.fire({ kind: 'browser_continue', payload });
+    expect(f.socket.emit).toHaveBeenCalledWith('turn.browser_continue', { sessionId, ...payload });
+    f.port.onMessage.fire({ kind: 'cancel', playedAudioMs: 0 });
+    f.port.onMessage.fire({ kind: 'browser_continue', payload });
+    expect(f.socket.emit.mock.calls.filter(([name]) => name === 'turn.browser_continue')).toHaveLength(1);
+    expect(f.socket.disconnect).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([
+    { browserSession: userId },
+    { browserContext: { tabId: 7, origin: 'https://example.com', contextVersion: 1 } },
+    { browserSession: userId, browserContext: { tabId: 7, origin: 'http://example.com', contextVersion: 1 } },
+  ])('rejects incomplete or unsafe browser bindings before opening a socket: %j', binding => {
+    const f = fixture(); f.port.onMessage.fire({ ...start, ...binding });
+    expect(f.io).not.toHaveBeenCalled();
+    expect(f.port.disconnect).toHaveBeenCalledTimes(1);
+  });
+
+  it('rejects browser continuations for a foreign voice turn', () => {
+    const f = fixture();
+    const browserContext = { tabId: 7, origin: 'https://example.com', contextVersion: 1 };
+    f.open({ browserSession: userId, browserContext });
+    f.server('turn.deep_agent_stream.started', { sessionId, turnId: workspaceId });
+    f.port.onMessage.fire({ kind: 'browser_continue', payload: { turnId: conversationId, kind: 'browser_resume', browserTurnId: userId, browserContext } });
+    expect(f.socket.emit).not.toHaveBeenCalledWith('turn.browser_continue', expect.anything());
+    expect(f.socket.disconnect).toHaveBeenCalledTimes(1);
   });
 
   it('ignores foreign extension ports', () => {

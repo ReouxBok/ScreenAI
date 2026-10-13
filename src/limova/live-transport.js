@@ -1,3 +1,4 @@
+import { liveBrowserBinding, liveBrowserContinuation } from './live-browser-contract.js';
 import { createLimovaAppTarget } from './app-target.js';
 import { LIVE_PORT } from './live-bridge.js';
 
@@ -5,7 +6,8 @@ const unavailable = () => new Error('La connexion vocale Limova a été interrom
 
 export function createLimovaLiveTransport(chrome) {
   const prepare = createLimovaAppTarget(chrome, 'src/limova/app-live-bridge.js');
-  return async ({ context, conversationId, languageCode, userTimezone, signal, onEvent, onError }) => {
+  return async ({ context, conversationId, languageCode, userTimezone, browserSession, browserContext, signal, onEvent, onError }) => {
+    const browserBinding = liveBrowserBinding(browserSession, browserContext);
     signal?.throwIfAborted();
     const target = await prepare(signal);
     signal?.throwIfAborted();
@@ -49,6 +51,7 @@ export function createLimovaLiveTransport(chrome) {
                     || bytes.length > message.payload.maxAudioFrameBytes) throw new TypeError('Invalid PCM frame');
                   send({ kind: 'audio', sequence: audioSequence++, bytes: Array.from(bytes) });
                 },
+                continueBrowser(continuation) { send({ kind: 'browser_continue', payload: liveBrowserContinuation(continuation) }); },
                 cancel(playedAudioMs = 0) { send({ kind: 'cancel', playedAudioMs }); },
                 stop() { close(); },
               });
@@ -65,7 +68,7 @@ export function createLimovaLiveTransport(chrome) {
       if (signal?.aborted) { abort(); return; }
       try {
         send({ kind: 'start', userId: context.userId, workspaceId: context.workspaceId,
-          conversationId, languageCode, userTimezone });
+          conversationId, languageCode, userTimezone, ...browserBinding });
       } catch { close(unavailable()); }
     });
   };
