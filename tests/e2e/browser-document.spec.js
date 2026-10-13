@@ -194,3 +194,31 @@ test('navigates from the bound document and rejects stale navigation without lea
   expect(result.status).toBe('completed');
   await expect(site.locator('h1')).toHaveText('Destination reached');
 });
+
+test('waits for a real in-progress Chrome navigation before returning the destination tab', async ({ context, extensionId }) => {
+  const { site, controller } = await setup(context, extensionId);
+  let release;
+  let markRequested;
+  const requested = new Promise(resolve => { markRequested = resolve; });
+  const response = new Promise(resolve => { release = resolve; });
+  await context.route('https://new.limova.ai/driver-slow', async route => {
+    markRequested();
+    await response;
+    await route.fulfill({ contentType: 'text/html', body: '<h1>Loaded</h1>' });
+  });
+  const navigating = site.goto('https://new.limova.ai/driver-slow');
+  await requested;
+  await controller.evaluate(async () => {
+    const { waitForBrowserReady } = await import('../limova/browser-ready.js');
+    const tabs = await chrome.tabs.query({});
+    const tab = tabs.find(tab => tab.pendingUrl?.includes('/driver-slow') || tab.url?.includes('/driver-'));
+    window.readySettled = false;
+    window.readyResult = waitForBrowserReady(chrome.tabs, tab.id).then(result => { readySettled = true; return result; });
+  });
+  expect(await controller.evaluate(() => readySettled)).toBe(false);
+  release();
+  await navigating;
+  const result = await controller.evaluate(() => readyResult);
+  expect(result.status).toBe('complete');
+  expect(result.url).toBe('https://new.limova.ai/driver-slow');
+});

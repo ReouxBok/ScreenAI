@@ -6,7 +6,7 @@ function harness() {
   let sequence = 0;
   const tab = { id: 1, active: true, url: 'https://example.com/page' };
   const chrome = {
-    tabs: { query: vi.fn(async () => [tab]), get: vi.fn(async () => tab) },
+    tabs: { onUpdated: { addListener: vi.fn(), removeListener: vi.fn() }, onRemoved: { addListener: vi.fn(), removeListener: vi.fn() }, query: vi.fn(async () => [tab]), get: vi.fn(async () => tab) },
     permissions: { contains: vi.fn(async () => true) },
     scripting: { executeScript: vi.fn(async ({ args }) => {
       const input = args[0];

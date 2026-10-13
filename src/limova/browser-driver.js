@@ -1,3 +1,4 @@
+import { waitForBrowserReady } from './browser-ready.js';
 import { createBrowserAuthority } from './browser-authority.js';
 import { createBrowserBinding } from './browser-binding.js';
 
@@ -23,7 +24,8 @@ export function createBrowserDriver({ chrome, journal, scope, hasConsent }) {
       if (!await hasConsent(scope, signal)) throw new Error('Browser consent required');
       const active = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
       if (active.length !== 1 || !Number.isSafeInteger(active[0].id)) throw new Error('Browser active tab unavailable');
-      const tab = active[0];
+      if (tabId !== undefined && active[0].id !== tabId) throw new Error('Browser target changed');
+      const tab = await waitForBrowserReady(chrome.tabs, active[0].id, signal);
       if (tabId !== undefined && tab.id !== tabId) throw new Error('Browser target changed');
       const url = new URL(tab.url);
       if (url.protocol !== 'https:' || tab.pendingUrl || tab.discarded) throw new Error('Browser page unavailable');
