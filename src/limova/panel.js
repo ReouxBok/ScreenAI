@@ -1,6 +1,6 @@
 import { createConversationView } from './conversation-view.js';
 
-export function createLimovaPanel({ document, request, render, onBusy, onContextChange = () => {}, translate: translateText = (_key, fallback) => fallback }) {
+export function createLimovaPanel({ document, request, render, onBusy, onContextChange = () => {}, onBrowserTarget = () => {}, translate: translateText = (_key, fallback) => fallback }) {
   const translations = new Map();
   function translate(key, fallback) {
     const value = translateText(key, fallback);
@@ -204,6 +204,7 @@ export function createLimovaPanel({ document, request, render, onBusy, onContext
     if (message.type === 'LIMOVA_SESSION_CHANGED') { ++generation; context = null; clear(); void refresh(); return true; }
     if (!message.type?.startsWith('LIMOVA_')) return false;
     if (message.conversationId !== conversationId) return true;
+    if (message.type === 'LIMOVA_BROWSER_TARGET' && message.turnId === turnId) onBrowserTarget(message.tabId);
     if (message.type === 'LIMOVA_TURN_STARTED') { turnId = message.turnId; setBusy(true); }
     if (message.type === 'LIMOVA_STREAM_EVENT' && message.turnId === turnId) { view.event(message.event); render(view.snapshot()); }
     if (message.type === 'LIMOVA_TURN_ENDED' && message.turnId === turnId) { turnId = null; if (!sending) setBusy(false); }

@@ -39,7 +39,7 @@ const DEFAULT_LANG = (chrome.i18n.getUILanguage() || 'en').split('-')[0].toLower
 let currentLang = DEFAULT_LANG;
 const limovaBackground = createLimovaBackground({
   client: new LimovaDeepAgentClient(createLimovaSessionFetch(chrome)),
-  createDriver: ({ scope, journal, signal, uploadScreenshot }) => createBrowserDriver({ chrome, scope, journal, uploadScreenshot,
+  createDriver: ({ scope, journal, signal, uploadScreenshot, onBound }) => createBrowserDriver({ chrome, scope, journal, uploadScreenshot, onBound,
     hasConsent: async () => !signal.aborted && !trainingState.active && await hasAIProcessingConsent() }),
   recordEvaluation: async (event, token) => {
     const response = await evaluationFetch('events', { token, body: event });

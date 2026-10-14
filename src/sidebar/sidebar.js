@@ -1,3 +1,4 @@
+import { createTabGuidance } from '../limova/tab-guidance.js';
 import { TrainingTranscriptionSession } from './training-transcription.js';
 import { createTranscriptionTransport } from '../limova/transcription-transport.js';
 import { DeepAgentVoiceSession } from './deep-agent-voice.js';
@@ -78,6 +79,7 @@ let activeTrainingSession = null;
 let activeTrainingToken = '';
 let sitePermissionUI;
 let limovaPanel = null;
+let nativeTabGuidance = null;
 let backgroundPort = null;
 let backgroundReconnectTimer = null;
 let backgroundReconnectAttempts = 0;
@@ -95,10 +97,17 @@ document.addEventListener('DOMContentLoaded', async () => {
   updateLangSwitcher();
   renderAnnouncements();
   sitePermissionUI = bindSitePermissions({ document, permissions: chrome.permissions, tabs: chrome.tabs, translate: key => t(key) });
+  const returnTab = document.getElementById('limovaReturnTab');
+  nativeTabGuidance = createTabGuidance({ chrome, onChange: state => { returnTab.hidden = state !== 'away'; } });
+  returnTab.addEventListener('click', () => { void nativeTabGuidance.returnToTarget(); });
+  document.getElementById('limovaBrowser').addEventListener('change', event => {
+    if (!event.target.checked) nativeTabGuidance.clear();
+  });
   limovaPanel = createLimovaPanel({
     document,
     translate: key => t(key),
-    onContextChange: () => { if (voiceSession?.native) voiceSession.stop(); },
+    onBrowserTarget: tabId => nativeTabGuidance.bind(tabId),
+    onContextChange: () => { nativeTabGuidance.clear(); if (voiceSession?.native) voiceSession.stop(); },
     request: request => chrome.runtime.sendMessage(request),
     onBusy: busy => { isLoading = busy; elements.sendBtn.disabled = busy; elements.screenshotBtn.disabled = busy; elements.chatContainer.querySelectorAll('.next-step-link').forEach(button => { button.disabled = busy; }); },
     render: renderLimovaConversation,
@@ -1097,7 +1106,7 @@ async function toggleVoice() {
     const client = new LimovaDeepAgentClient(createLimovaSessionFetch(chrome));
     const journal = createBrowserJournal();
     const openSession = createBrowserLiveSession({ client, journal, openTransport: createLimovaLiveTransport(chrome),
-      createDriver: options => createBrowserDriver({ ...options, chrome, hasConsent: async () => {
+      createDriver: options => createBrowserDriver({ ...options, chrome, onBound: tabId => nativeTabGuidance.bind(tabId), hasConsent: async () => {
         const [privacy, state] = await Promise.all([
           chrome.runtime.sendMessage({ type: 'GET_PRIVACY_STATE', clientSurface: 'chrome_extension' }),
           chrome.runtime.sendMessage({ type: 'GET_STATE', clientSurface: 'chrome_extension' }),

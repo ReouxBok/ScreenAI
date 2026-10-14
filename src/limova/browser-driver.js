@@ -5,7 +5,7 @@ import { createBrowserBinding } from './browser-binding.js';
 
 const DOCUMENT_OPERATIONS = new Set(['read_page', 'click', 'type_text', 'scroll', 'highlight', 'navigate']);
 
-export function createBrowserDriver({ chrome, journal, scope, hasConsent, uploadScreenshot }) {
+export function createBrowserDriver({ chrome, journal, scope, hasConsent, uploadScreenshot, onBound = () => {} }) {
   scope = Object.freeze({ ...scope });
   let tabId;
   const hasSiteAccess = origin => chrome.permissions.contains({ origins: [`${origin}/*`] });
@@ -34,6 +34,7 @@ export function createBrowserDriver({ chrome, journal, scope, hasConsent, upload
       const page = await binding.bind(tab.id, url.origin, signal);
       await authorize(scope, { target: pageOnly(page) }, signal);
       tabId = tab.id;
+      onBound(tabId);
       return pageOnly(page);
     },
     async authorize(context, action, signal) {

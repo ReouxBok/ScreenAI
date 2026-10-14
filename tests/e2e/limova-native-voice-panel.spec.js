@@ -183,6 +183,10 @@ for (const ending of ['consent', 'disconnect', 'startup-timeout', 'permission-di
         await expect(extensionPage.locator('#voiceBtn')).toHaveAttribute('aria-pressed', 'false');
         await expect.poll(() => seen.disconnected).toBe(1);
         await expect(extensionPage.locator('.message.error .message-content').last()).not.toBeEmpty();
+        await expect(extensionPage.locator('#limovaReturnTab')).toBeVisible();
+        await extensionPage.evaluate(() => document.getElementById('limovaReturnTab').click());
+        await expect(extensionPage.locator('#limovaReturnTab')).toBeHidden();
+        await expect(extensionPage.locator('#voiceBtn')).toHaveAttribute('aria-pressed', 'false');
         expect(seen.contextReply).toBeUndefined();
         expect(seen.results).toEqual([]);
         expect(seen.starts).toBe(1); expect(seen.connected).toBe(1);
