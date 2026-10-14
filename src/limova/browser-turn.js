@@ -1,6 +1,6 @@
 const MAX_ACTIONS_PER_TURN = 100;
 
-export function createBrowserTurnRunner({ client, journal, readPage, execute, authorize, notify, evaluationCode }) {
+export function createBrowserTurnRunner({ client, journal, readPage, execute, authorize, notify, evaluationCode, onActionResult = async () => {} }) {
   async function consume(stream, expectedTurnId, signal) {
     const actions = new Map();
     let turnId = expectedTurnId;
@@ -50,6 +50,8 @@ export function createBrowserTurnRunner({ client, journal, readPage, execute, au
         signal?.throwIfAborted();
         return execute(validated, signal);
       });
+      await onActionResult(action, receipt);
+      signal?.throwIfAborted();
       if (receipt.state !== 'completed') return { state: 'uncertain', turnId: pending.turnId, actionId: action.actionId };
       signal?.throwIfAborted();
       const page = await readPage(signal);

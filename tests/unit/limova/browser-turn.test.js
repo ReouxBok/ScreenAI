@@ -7,7 +7,7 @@ const event = data => ({ event: 'custom', data });
 const waiting = event({ type: 'extension.turn_state', turnId: 'turn', state: 'waiting' });
 const complete = event({ type: 'extension.turn_state', turnId: 'turn', state: 'completed' });
 async function* events(...items) { yield* items; }
-function harness(evaluationCode) {
+function harness(evaluationCode, onActionResult) {
   const client = {
     getConversation: vi.fn().mockResolvedValue({}),
     sendMessage: vi.fn(() => events(event(action), waiting)),
@@ -20,7 +20,7 @@ function harness(evaluationCode) {
   const authorize = vi.fn().mockResolvedValue(undefined);
   const readPage = vi.fn().mockResolvedValue({ tabId: 1, origin: 'https://example.com', contextVersion: 2 });
   const notify = vi.fn();
-  return { client, execute, journal, authorize, readPage, notify, runner: createBrowserTurnRunner({ client, journal, execute, authorize, readPage, notify, evaluationCode }) };
+  return { client, execute, journal, authorize, readPage, notify, runner: createBrowserTurnRunner({ client, journal, execute, authorize, readPage, notify, evaluationCode, onActionResult }) };
 }
 
 describe('browser turn continuation', () => {
@@ -125,4 +125,19 @@ describe('evaluation browser continuation', () => {
     expect(JSON.stringify(h.notify.mock.calls)).not.toContain(code);
     expect(JSON.stringify(h.execute.mock.calls)).not.toContain(code);
   });
+});
+
+
+it('waits for the evaluation receipt before continuing the text turn and stops on delivery failure', async () => {
+  let reject;
+  const report = vi.fn(() => new Promise((_, fail) => { reject = fail; }));
+  const h = harness('private-staff-evaluation-code', report);
+  const running = h.runner.send(context, 'conversation', 'Test');
+  const rejected = expect(running).rejects.toThrow('Studio offline');
+  await vi.waitFor(() => expect(report).toHaveBeenCalledOnce());
+  expect(h.client.sendBrowserResult).not.toHaveBeenCalled();
+  reject(new Error('Studio offline'));
+  await rejected;
+  expect(h.execute).toHaveBeenCalledOnce();
+  expect(h.client.sendBrowserResult).not.toHaveBeenCalled();
 });

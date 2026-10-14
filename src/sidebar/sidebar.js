@@ -1055,7 +1055,13 @@ async function toggleVoice() {
       } }),
     });
     voiceSession = new DeepAgentVoiceSession({ openSession,
-      parameters: { ...parameters, languageCode: getLangCode(), userTimezone: Intl.DateTimeFormat().resolvedOptions().timeZone },
+      parameters: { ...parameters, languageCode: getLangCode(), userTimezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
+        onActionResult: async (action, receipt) => {
+          if (!parameters.evaluationCode) return;
+          const result = await chrome.runtime.sendMessage({ type: 'LIMOVA_EVALUATION_ACTION', conversationId: parameters.conversationId, action, receipt });
+          if (!result?.ok || result.error) throw new Error(result?.error || 'Preuve Studio indisponible.');
+        },
+      },
       onNativeEvent: parameters.onNativeEvent,
       requestMicrophone: requestVoiceMicrophone,
       validate: async signal => {

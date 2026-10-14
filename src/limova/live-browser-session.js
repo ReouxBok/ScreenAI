@@ -2,7 +2,7 @@ import { createLiveBrowserController } from './live-browser-controller.js';
 
 export function createBrowserLiveSession({ openTransport, client, journal, createDriver }) {
   return async ({ context, conversationId, languageCode, userTimezone, evaluationCode, signal, browserEnabled = true,
-    onEvent = () => {}, onNativeEvent = () => {}, onError = () => {} }) => {
+    onActionResult = async () => {}, onEvent = () => {}, onNativeEvent = () => {}, onError = () => {} }) => {
     context = Object.freeze({ ...context });
     const abort = new AbortController();
     let live, browser, closed = false, refresh;
@@ -30,7 +30,7 @@ export function createBrowserLiveSession({ openTransport, client, journal, creat
       abort.signal.throwIfAborted();
       browser = createLiveBrowserController({ context, conversationId, browserSession,
         client, journal, driver, signal: abort.signal,
-        continueBrowser: payload => live.continueBrowser(payload), onError: fail, notify: onNativeEvent });
+        continueBrowser: payload => live.continueBrowser(payload), onError: fail, notify: onNativeEvent, onActionResult });
       live = await openTransport({ context, conversationId, languageCode, userTimezone,
         browserSession, browserContext, evaluationCode, signal: abort.signal, onError: fail,
         onEvent(event, payload) {

@@ -7,12 +7,12 @@ const action = { type: 'extension.action_requested', turnId: browserId, actionId
 const waiting = { type: 'extension.turn_state', turnId: browserId, state: 'waiting' };
 const page = { tabId: 7, origin: 'https://example.com', contextVersion: 2 };
 
-function harness() {
+function harness(onActionResult) {
   const client = { getConversation: vi.fn().mockResolvedValue({}) };
   const driver = { authorize: vi.fn().mockResolvedValue(undefined), execute: vi.fn().mockResolvedValue({ status: 'completed', observation: 'Done' }), readPage: vi.fn().mockResolvedValue(page) };
   const journal = { run: vi.fn(async (_scope, action, execute) => ({ state: 'completed', result: { turnId: action.turnId, actionId: action.actionId, ...await execute(action) } })) };
   const continueBrowser = vi.fn(), onError = vi.fn(), notify = vi.fn();
-  const controller = createLiveBrowserController({ context: { userId: uuid(4), workspaceId: uuid(5) }, conversationId: uuid(6), browserSession: uuid(7), client, driver, journal, continueBrowser, onError, notify });
+  const controller = createLiveBrowserController({ context: { userId: uuid(4), workspaceId: uuid(5) }, conversationId: uuid(6), browserSession: uuid(7), client, driver, journal, continueBrowser, onError, notify, onActionResult });
   controller.onEvent('session.ready', { sessionId });
   controller.onEvent('turn.deep_agent_stream.started', { sessionId, turnId });
   const bytes = chunk => controller.onEvent('turn.deep_agent_stream.delta', { sessionId, turnId, chunk: Array.from(chunk) });
@@ -113,4 +113,16 @@ describe('voice browser controller', () => {
     await vi.waitFor(() => expect(h.onError).toHaveBeenCalled());
     expect(h.driver.execute).not.toHaveBeenCalled();
   });
+});
+
+
+it('stops the voice turn if its executed action cannot be recorded in Studio', async () => {
+  const report = vi.fn().mockRejectedValue(new Error('Studio offline'));
+  const h = harness(report);
+  h.send(action, waiting);
+  await vi.waitFor(() => expect(h.onError).toHaveBeenCalledWith(expect.objectContaining({ message: 'Studio offline' })));
+  expect(h.driver.execute).toHaveBeenCalledOnce();
+  expect(report).toHaveBeenCalledOnce();
+  expect(h.continueBrowser).not.toHaveBeenCalled();
+  h.controller.stop();
 });

@@ -21,3 +21,11 @@ Le bouton `START_EVALUATION` crée maintenant la conversation via ce gestionnair
 La voix utilise le chemin Deep Agent ordinaire avec le grant obtenu par `LIMOVA_PREPARE_VOICE` sur le port interne. Le worker vérifie la conversation sélectionnée ; le panneau vérifie identité, workspace et génération après l’attente. Les sélecteurs restent verrouillés pendant une évaluation. Le grant n’entre ni dans le rendu ni dans le pilote de page.
 
 Le verdict arrête la voix du panneau, annule le tour texte et bloque de nouveaux envois/préparations vocales pendant sa transmission. Une erreur de transmission conserve le test pour réessayer ; un succès ferme le contexte local. Les événements de preuve du moteur natif, le scoring et une qualification complète du parcours restent nécessaires : les tests unitaires ne prouvent pas une évaluation réelle réussie.
+
+## Preuves d’exécution navigateur
+
+Les reçus locaux du journal sont projetés vers les événements Studio après exécution, sur les chemins texte et voix. La projection conserve uniquement le nom d’opération compatible Studio, son statut et la version du contexte. Elle exclut texte saisi, contenu de page, captures, URL et grant. `completed` signifie ici que l’opération a été exécutée : aucune lecture de page, capture ou action n’est convertie en `verify_expected_result`.
+
+Le worker lie la preuve à la conversation d’évaluation active et capture son grant pour l’envoi. Les reçus identiques sont dédupliqués par action ; un reçu contradictoire est refusé. Une erreur d’enregistrement arrête la continuation et reste visible au flush, sans retry aveugle d’un POST non idempotent. Le verdict attend les tours texte en cours et les enregistrements connus. Les lectures/écritures du journal navigateur ne contiennent pas le grant.
+
+Restent à réaliser : preuve de réponse canonique, vérification explicite du résultat attendu et qualification des interruptions vocales en cours d’action. Les scores ne sont donc pas encore qualifiés pour ce nouveau parcours. Tests : 264 cas composants Limova passent ; 27 tests du gestionnaire repassés après l’ajout de l’attente des tours texte.

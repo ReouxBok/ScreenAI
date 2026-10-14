@@ -5,7 +5,7 @@ const MAX_BUFFER = 256_000;
 const MAX_ACTIONS = 100;
 
 export function createLiveBrowserController({ context, conversationId, browserSession,
-  client, journal, driver, continueBrowser, onError, notify = () => {}, signal }) {
+  client, journal, driver, continueBrowser, onError, notify = () => {}, onActionResult = async () => {}, signal }) {
   context = Object.freeze({ ...context });
   const scope = Object.freeze({ ...context, conversationId, sessionId: browserSession });
   if (![scope.userId, scope.workspaceId, conversationId].every(liveUuid) || (browserSession !== undefined && !liveUuid(browserSession))) throw new TypeError('Invalid voice browser scope');
@@ -38,6 +38,8 @@ export function createLiveBrowserController({ context, conversationId, browserSe
       signal.throwIfAborted();
       return driver.execute(validated, signal);
     });
+    signal.throwIfAborted();
+    await onActionResult(action, receipt);
     signal.throwIfAborted();
     if (receipt.state !== 'completed') throw new Error('Browser action outcome is uncertain; no replay was attempted');
     const page = await driver.readPage(signal);

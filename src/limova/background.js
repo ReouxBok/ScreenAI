@@ -1,3 +1,4 @@
+import { projectEvaluationAction } from './evaluation-evidence.js';
 import { evaluationGrant } from './evaluation-grant.js';
 import { createBrowserTurnRunner } from './browser-turn.js';
 import { createBrowserJournal } from './browser-journal.js';
@@ -9,10 +10,10 @@ export const LIMOVA_MESSAGE_TYPES = new Set([
   'LIMOVA_CREATE_CONVERSATION', 'LIMOVA_OPEN_CONVERSATION', 'LIMOVA_SEND_MESSAGE',
   'LIMOVA_CANCEL', 'LIMOVA_OPEN_APP', 'LIMOVA_LOGOUT',
   'LIMOVA_GET_MESSAGES', 'LIMOVA_RESUME_BROWSER',
-  'LIMOVA_START_EVALUATION', 'LIMOVA_END_EVALUATION', 'LIMOVA_PREPARE_VOICE',
+  'LIMOVA_START_EVALUATION', 'LIMOVA_END_EVALUATION', 'LIMOVA_PREPARE_VOICE', 'LIMOVA_EVALUATION_ACTION', 'LIMOVA_FLUSH_EVALUATION',
 ]);
 
-export function createLimovaBackground({ storage, openTab, notify, client = new LimovaDeepAgentClient(), journal = createBrowserJournal(), createDriver }) {
+export function createLimovaBackground({ storage, openTab, notify, client = new LimovaDeepAgentClient(), journal = createBrowserJournal(), createDriver, recordEvaluation = async () => { throw new Error('Studio evidence transport unavailable'); } }) {
   let context = null;
   let conversationId = null;
   let activeTurn = null;
@@ -66,6 +67,23 @@ export function createLimovaBackground({ storage, openTab, notify, client = new 
     return { ...context };
   }
 
+  async function recordAction(selectedConversation, action, receipt) {
+    if (!evaluation || selectedConversation !== conversationId) throw new Error('Le test Studio a changé.');
+    const event = projectEvaluationAction(action, receipt);
+    if (!event) throw new Error('Preuve navigateur invalide.');
+    const current = evaluation;
+    const key = action.actionId;
+    if (!current.evidence.has(key)) {
+      if (current.evidence.size >= 1000) throw new Error('Limite de preuves Studio atteinte.');
+      const pending = Promise.resolve().then(() => recordEvaluation(event, current.code));
+      current.evidence.set(key, { payload: JSON.stringify(event), pending });
+    }
+    const saved = current.evidence.get(key);
+    if (saved.payload !== JSON.stringify(event)) throw new Error('Preuves contradictoires pour cette action.');
+    await saved.pending;
+    return { ok: true };
+  }
+
   async function handle(request) {
     if (evaluation && ['LIMOVA_SELECT_WORKSPACE', 'LIMOVA_CREATE_CONVERSATION', 'LIMOVA_OPEN_CONVERSATION'].includes(request.type)) {
       throw new Error('Termine le test Studio avant de changer de conversation ou d’espace.');
@@ -84,6 +102,15 @@ export function createLimovaBackground({ storage, openTab, notify, client = new 
           await save();
           return { authenticated: false, workspaces: [], context: null, conversationId: null };
         }
+      case 'LIMOVA_EVALUATION_ACTION':
+        return recordAction(request.conversationId, request.action, request.receipt);
+      case 'LIMOVA_FLUSH_EVALUATION':
+        if (evaluation) {
+          const current = evaluation;
+          await Promise.all([...current.pendingTurns]);
+          await Promise.all([...current.evidence.values()].map(entry => entry.pending));
+        }
+        return { ok: true };
       case 'LIMOVA_PREPARE_VOICE': {
         await state();
         const identity = requireContext();
@@ -98,7 +125,7 @@ export function createLimovaBackground({ storage, openTab, notify, client = new 
         const identity = requireContext();
         await cancel();
         const conversation = await client.createConversation(identity, 'Évaluation Studio', undefined, code);
-        evaluation = { code, previousConversationId: conversationId };
+        evaluation = { code, previousConversationId: conversationId, evidence: new Map(), pendingTurns: new Set() };
         conversationId = conversation.id;
         await save();
         return { ok: true, conversationId, context: identity, evaluationActive: true };
@@ -154,6 +181,10 @@ export function createLimovaBackground({ storage, openTab, notify, client = new 
         if (!conversationId) throw new Error('Ouvre une conversation Limova.');
         const turn = { id: crypto.randomUUID(), context: requireContext(), conversationId, evaluationCode: evaluation?.code, controller: new AbortController() };
         activeTurn = turn;
+        const currentEvaluation = evaluation;
+        let finish;
+        const finished = new Promise(resolve => { finish = resolve; });
+        currentEvaluation?.pendingTurns.add(finished);
         notify({ type: 'LIMOVA_TURN_STARTED', turnId: turn.id, conversationId });
         try {
           const emit = event => {
@@ -165,7 +196,12 @@ export function createLimovaBackground({ storage, openTab, notify, client = new 
             const driver = createDriver({ scope: { ...turn.context, sessionId }, journal, signal: turn.controller.signal,
               uploadScreenshot: (image, signal) => client.uploadBrowserScreenshot(turn.context, turn.conversationId, image, signal) });
             const runner = createBrowserTurnRunner({ client, journal, readPage: driver.readPage,
-              execute: driver.execute, authorize: driver.authorize, notify: emit, evaluationCode: turn.evaluationCode });
+              execute: driver.execute, authorize: driver.authorize, notify: emit, evaluationCode: turn.evaluationCode,
+              onActionResult: async (action, receipt) => {
+                if (!turn.evaluationCode) return;
+                if (evaluation?.code !== turn.evaluationCode) throw new Error('Le test Studio a changé.');
+                await recordAction(turn.conversationId, action, receipt);
+              } });
             const outcome = request.type === 'LIMOVA_RESUME_BROWSER'
               ? await runner.resume(turn.context, turn.conversationId, turn.controller.signal)
               : await runner.send(turn.context, turn.conversationId, request.text, turn.controller.signal);
@@ -188,6 +224,8 @@ export function createLimovaBackground({ storage, openTab, notify, client = new 
           }
           throw error;
         } finally {
+          finish();
+          currentEvaluation?.pendingTurns.delete(finished);
           if (activeTurn === turn) activeTurn = null;
           notify({ type: 'LIMOVA_TURN_ENDED', turnId: turn.id, conversationId: turn.conversationId });
         }

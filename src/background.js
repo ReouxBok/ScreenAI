@@ -41,6 +41,10 @@ const limovaBackground = createLimovaBackground({
   client: new LimovaDeepAgentClient(createLimovaSessionFetch(chrome)),
   createDriver: ({ scope, journal, signal, uploadScreenshot }) => createBrowserDriver({ chrome, scope, journal, uploadScreenshot,
     hasConsent: async () => !signal.aborted && !trainingState.active && await hasAIProcessingConsent() }),
+  recordEvaluation: async (event, token) => {
+    const response = await evaluationFetch('events', { token, body: event });
+    if (!response?.ok) throw new Error('La preuve d’exécution n’a pas pu être enregistrée dans le Studio.');
+  },
   storage: chrome.storage.local,
   openTab: () => openLimovaApp(chrome),
   notify: message => broadcastToSidebar(message),
@@ -1018,6 +1022,7 @@ async function completeEvaluationRun(verdict) {
   evaluationState.completing = true;
   try {
     await limovaBackground.handle({ type: 'LIMOVA_CANCEL' });
+    await limovaBackground.handle({ type: 'LIMOVA_FLUSH_EVALUATION' });
     const response = await evaluationFetch('complete', { body: { verdict } });
     const data = await response?.json().catch(() => ({}));
     if (!response?.ok) return { ok: false, error: data?.error || 'Le résultat n’a pas pu être transmis.' };

@@ -262,3 +262,34 @@ it('only prepares the grant for the current evaluation conversation', async () =
     .toEqual({ context: { userId: 'user-1', workspaceId: 'workspace-1' }, conversationId: 'evaluation-conversation', evaluationCode: code });
   expect(JSON.stringify(await f.background.handle({ type: 'LIMOVA_GET_STATE' }))).not.toContain(code);
 });
+
+describe('Studio evidence delivery', () => {
+  const code = 'private-staff-evaluation-code';
+  const action = { actionId: 'a', input: { operation: 'click' }, target: { contextVersion: 3 } };
+  const receipt = { state: 'completed', result: { actionId: 'a', status: 'completed' } };
+  async function begin(recordEvaluation) {
+    const f = harness({ recordEvaluation }); await open(f.background);
+    f.client.createConversation.mockResolvedValueOnce({ id: 'evaluation' });
+    await f.background.handle({ type: 'LIMOVA_START_EVALUATION', evaluationCode: code });
+    return f;
+  }
+  it('deduplicates a receipt and binds delivery to the current grant', async () => {
+    const record = vi.fn().mockResolvedValue(undefined);
+    const f = await begin(record);
+    const request = { type: 'LIMOVA_EVALUATION_ACTION', conversationId: 'evaluation', action, receipt };
+    await Promise.all([f.background.handle(request), f.background.handle(request)]);
+    await f.background.handle({ type: 'LIMOVA_FLUSH_EVALUATION' });
+    expect(record).toHaveBeenCalledOnce();
+    expect(record).toHaveBeenCalledWith({ kind: 'tool_result', toolName: 'click_element', status: 'ok', contextVersion: 3 }, code);
+    await expect(f.background.handle({ ...request, receipt: { ...receipt, result: { ...receipt.result, status: 'rejected' } } })).rejects.toThrow('contradictoires');
+    await f.background.handle({ type: 'LIMOVA_END_EVALUATION' });
+    await expect(f.background.handle(request)).rejects.toThrow();
+  });
+  it('keeps a delivery failure visible when flushing rather than blindly retrying it', async () => {
+    const record = vi.fn().mockRejectedValue(new Error('Studio unavailable'));
+    const f = await begin(record);
+    await expect(f.background.handle({ type: 'LIMOVA_EVALUATION_ACTION', conversationId: 'evaluation', action, receipt })).rejects.toThrow('Studio unavailable');
+    await expect(f.background.handle({ type: 'LIMOVA_FLUSH_EVALUATION' })).rejects.toThrow('Studio unavailable');
+    expect(record).toHaveBeenCalledOnce();
+  });
+});
