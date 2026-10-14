@@ -84,17 +84,34 @@ for (const scenario of [
 }
 
 test("la liste distingue thème, souci et action sans exposer une erreur technique comme résumé", async ({ page }, testInfo) => {
-  await page.goto("/studio/sav");
-  const row = page.getByRole("button", { name: "Ouvrir l’email : Problème technique : Produit fictif · Export", exact: true }).filter({ has: page.getByText("singlePlain@example.invalid", { exact: true }) });
+  // The current inbox classifies the latest message by its local opening state.
+  // Open both fixtures explicitly so this scenario also works when run alone.
+  for (const threadId of [SAV53_THREADS.singlePlain, SAV53_THREADS.failed]) {
+    const path = `/studio/sav/${threadId}`;
+    const opened = page.waitForResponse(response => response.request().method() === "POST"
+      && new URL(response.url()).pathname === path && Boolean(response.request().headers()["next-action"]));
+    await page.goto(path);
+    const response = await opened;
+    await response.finished();
+    expect(response.ok()).toBe(true);
+  }
+  await page.goto("/studio/sav?view=to_validate&q=example.invalid");
+  const tabs = page.getByRole("navigation", { name: "Vues SAV", exact: true });
+  await expect(tabs.getByRole("link", { name: /^À valider/ })).toHaveAttribute("aria-current", "page");
+  const ledger = page.getByRole("region", { name: "Dossiers SAV", exact: true });
+  const row = ledger.getByRole("button", { name: "Ouvrir l’email : Problème technique : Produit fictif · Export", exact: true }).filter({ has: page.getByText("singlePlain@example.invalid", { exact: true }) });
   await expect(row).toBeVisible();
   await expect(row).toContainText("L’export du document échoue malgré une nouvelle tentative.");
-  await expect(row).toContainText("Valider le dossier puis choisir l’action adaptée au ticket.");
+  await expect(row).toContainText("Relire et valider le dossier");
+  await expect(row).toContainText("Dossier à valider");
+  await expect(row).toContainText("Action ticket à confirmer");
   await expect(row).not.toContainText("Re: Re:");
-  const failed = page.getByRole("button", { name: "Ouvrir l’email : Assistance téléphonie fictive", exact: true });
-  await expect(failed).toContainText("Objet de l’email");
+  const failed = ledger.getByRole("button", { name: "Ouvrir l’email : Assistance téléphonie fictive", exact: true });
   await expect(failed).toContainText("Aucun résumé fiable disponible. Le message doit être relu.");
-  await expect(failed).toContainText("Diagnostic disponible dans le dossier");
-  await expect(failed.locator('[title="SAV_AI_TIMEOUT"]')).toHaveCount(1);
+  await expect(failed).toContainText("Qualifier la demande manuellement");
+  await expect(failed).toContainText("Vérification nécessaire");
+  await expect(failed).not.toContainText("SAV_AI_TIMEOUT");
+  await expect(failed.locator('[title="SAV_AI_TIMEOUT"]')).toHaveCount(0);
   await page.screenshot({ path: testInfo.outputPath("sav53-liste-resumes.png"), fullPage: true });
 });
 
