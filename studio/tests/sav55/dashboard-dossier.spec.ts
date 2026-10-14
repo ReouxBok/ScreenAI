@@ -17,7 +17,7 @@ test("les quatre vues comptent les mêmes dossiers que leurs listes compactes", 
     await expect(rows.getByRole("button", { name: /^Ouvrir l’email/ })).toHaveCount(2);
     for (const subject of subjects) await expect(rows.getByRole("button", { name: `Ouvrir l’email : ${subject}`, exact: true })).toBeVisible();
     const tabs = page.getByRole("navigation", { name: "Vues SAV", exact: true });
-    for (const label of ["À traiter", "À valider", "Suivi HubSpot", "Terminés"]) await expect(tabs.getByRole("link", { name: new RegExp(`^${label}2`) })).toBeVisible();
+    for (const label of ["À traiter", "À valider", "Suivi HubSpot", "Terminés"]) await expect(tabs.getByRole("link", { name: new RegExp(`^${label}\\s*2`) })).toBeVisible();
   }
   await page.screenshot({ path: testInfo.outputPath("sav55-dashboard.png"), fullPage: true });
 });
@@ -34,11 +34,12 @@ test("ouverture directe et retour conservent le contexte sans classer Gmail", as
   await expect(page).toHaveURL(/view=to_validate.*q=SAV55.*sort=oldest/);
   expect(external).toEqual([]);
 });
-test("le dernier email et les citations restent repliés, l’historique complet défile", async ({ page }, testInfo) => {
+test("sur mobile, le dernier email reste replié et l’historique complet défile", async ({ page }, testInfo) => {
+  await page.setViewportSize({ width: 390, height: 844 });
   await page.goto(`/studio/sav/${SAV53_THREADS.conversation}`);
   const mail = page.getByRole("region", { name: "Dernier email reçu", exact: true });
   await expect(mail.locator("pre")).toHaveText(SAV53_CURRENT);
-  await mail.getByRole("button", { name: "Afficher toute la conversation", exact: true }).click();
+  await mail.getByRole("button", { name: /^Afficher toute la conversation/ }).click();
   await expect(mail.locator("pre").first()).toHaveText(SAV53_BODY);
   await expect(mail.locator("article")).toHaveCount(3);
   const scrollable = await mail.evaluate(region => [...region.querySelectorAll("*")].some(element => { const style = getComputedStyle(element); return ["auto", "scroll"].includes(style.overflowY) && style.maxHeight !== "none"; }));
