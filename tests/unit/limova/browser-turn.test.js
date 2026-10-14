@@ -16,7 +16,7 @@ function harness(evaluationCode, onActionResult) {
     resumeBrowserTurn: vi.fn(() => events(event(action), waiting)),
   };
   const execute = vi.fn().mockResolvedValue({ status: 'completed', observation: 'Done' });
-  const journal = { getSession: vi.fn().mockResolvedValue('session'), run: vi.fn(async (_scope, action, callback) => ({ state: 'completed', result: { actionId: action.actionId, ...await callback(action) } })) };
+  const journal = { setTurnMode: vi.fn().mockResolvedValue('act'), getTurnMode: vi.fn().mockResolvedValue('act'), getSession: vi.fn().mockResolvedValue('session'), run: vi.fn(async (_scope, action, callback) => ({ state: 'completed', result: { actionId: action.actionId, ...await callback(action) } })) };
   const authorize = vi.fn().mockResolvedValue(undefined);
   const readPage = vi.fn().mockResolvedValue({ tabId: 1, origin: 'https://example.com', contextVersion: 2 });
   const notify = vi.fn();
@@ -141,3 +141,16 @@ it('waits for the evaluation receipt before continuing the text turn and stops o
   expect(h.execute).toHaveBeenCalledOnce();
   expect(h.client.sendBrowserResult).not.toHaveBeenCalled();
 });
+
+ it('persists observation authority before a broken stream and restores it on resume', async () => {
+   const h = harness();
+   const runner = createBrowserTurnRunner({ ...h, browserMode: 'observe' });
+   h.client.sendMessage.mockImplementation(async function* () { yield event(action); throw new Error('Disconnected'); });
+   await expect(runner.send(context, 'conversation', 'Analyze')).rejects.toThrow('Disconnected');
+   expect(h.journal.setTurnMode).toHaveBeenCalledWith({ ...context, conversationId: 'conversation', sessionId: 'session' }, 'turn', 'observe');
+   expect(h.execute).not.toHaveBeenCalled();
+   h.journal.getTurnMode.mockResolvedValue('observe');
+   h.journal.setTurnMode.mockClear();
+   await h.runner.resume(context, 'conversation');
+   expect(h.journal.setTurnMode.mock.calls.every(call => call[2] === 'observe')).toBe(true);
+ });

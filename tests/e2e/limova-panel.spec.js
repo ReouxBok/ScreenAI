@@ -30,6 +30,9 @@ test('mounts the Limova session panel and renders the existing Charly history', 
           ] } },
       ], pagination: { hasMore: true, nextCursor: 'older-cursor' } };
       if (request.type === 'LIMOVA_OPEN_GENERATED_FILE') { window.openedGeneratedFile = request; return { ok: true }; }
+      if (request.type === 'GET_PRIVACY_STATE') return { aiProcessing: true };
+      if (request.type === 'LIMOVA_SEND_MESSAGE') { window.analysisRequest = request; return { ok: true }; }
+      if (request.type === 'ANALYZE_PAGE') throw new Error('Legacy analysis called');
       if (request.type === 'GET_STATE') return { capabilities: {}, training: null, evaluation: null };
       return original(request);
     };
@@ -75,6 +78,10 @@ test('mounts the Limova session panel and renders the existing Charly history', 
     await expect(page.locator('#chatContainer')).toContainText('Mon premier message historique');
     expect(await page.evaluate(() => window.nativeRequests.length)).toBe(requestCount);
   }
+  await page.locator('#limovaBrowser').uncheck();
+  await page.locator('#screenshotBtn').click();
+  await expect.poll(() => page.evaluate(() => window.analysisRequest)).toMatchObject({ type: 'LIMOVA_SEND_MESSAGE', browser: true, browserMode: 'observe' });
+  await expect(page.locator('#limovaBrowser')).not.toBeChecked();
   expect(errors).toEqual([]);
   await page.close();
 });

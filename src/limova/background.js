@@ -216,6 +216,7 @@ export function createLimovaBackground({ storage, openTab, openFile = async () =
       case 'LIMOVA_RESUME_BROWSER':
       case 'LIMOVA_SEND_MESSAGE': {
         if (request.type === 'LIMOVA_RESUME_BROWSER' && request.browser !== true) throw new Error('Autorise le navigateur avant de reprendre ce tour.');
+        if (request.browserMode !== undefined && request.browserMode !== 'observe') throw new Error('Mode navigateur invalide.');
         if (activeTurn) throw new Error('Un tour est déjà en cours.');
         if (!conversationId) throw new Error('Ouvre une conversation Limova.');
         const turn = { id: crypto.randomUUID(), context: requireContext(), conversationId, evaluationCode: evaluation?.code, controller: new AbortController() };
@@ -239,7 +240,7 @@ export function createLimovaBackground({ storage, openTab, openFile = async () =
             const driver = createDriver({ scope: { ...turn.context, sessionId }, journal, signal: turn.controller.signal,
               uploadScreenshot: (image, signal) => client.uploadBrowserScreenshot(turn.context, turn.conversationId, image, signal) });
             const runner = createBrowserTurnRunner({ client, journal, readPage: driver.readPage,
-              execute: driver.execute, authorize: driver.authorize, notify: emit, evaluationCode: turn.evaluationCode,
+              execute: driver.execute, authorize: driver.authorize, notify: emit, evaluationCode: turn.evaluationCode, browserMode: request.browserMode ?? 'act',
               onActionResult: async (action, receipt) => {
                 if (!turn.evaluationCode) return;
                 if (evaluation?.code !== turn.evaluationCode) throw new Error('Le test Studio a changé.');

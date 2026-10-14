@@ -19,6 +19,8 @@ function harness(options = {}) {
     sendMessage: vi.fn(async function* () { yield { event: 'values', data: { messages: [] } }; }),
   };
   const journal = {
+    setTurnMode: vi.fn().mockResolvedValue('act'),
+    getTurnMode: vi.fn().mockResolvedValue('act'),
     getSession: vi.fn().mockResolvedValue('browser-session'),
     revokeSession: vi.fn().mockResolvedValue(undefined),
     clearAccount: vi.fn().mockResolvedValue(undefined),

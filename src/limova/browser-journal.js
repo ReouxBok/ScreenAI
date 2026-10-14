@@ -48,6 +48,12 @@ function validate(scope, action) {
   return JSON.stringify([scope.userId, scope.workspaceId, scope.conversationId, scope.sessionId, action.turnId, action.actionId]);
 }
 
+function turnPolicyKey(scope, turnId) {
+  if (!['userId', 'workspaceId', 'conversationId', 'sessionId'].every(key => identifier(scope?.[key]))
+    || !identifier(turnId)) throw new Error('Invalid browser turn policy');
+  return JSON.stringify([scope.userId, scope.workspaceId, scope.conversationId, scope.sessionId, turnId, 'policy', 'turn-mode']);
+}
+
 function openDatabase() {
   return new Promise((resolve, reject) => {
     const request = indexedDB.open(DATABASE, 1);
@@ -112,6 +118,18 @@ export function createBrowserJournal() {
   let database;
   const getDatabase = () => database ??= openDatabase();
   return {
+    async setTurnMode(scope, turnId, mode) {
+      scope = Object.freeze(structuredClone(scope));
+      if (!['observe', 'act'].includes(mode)) throw new Error('Invalid browser mode');
+      return change(await getDatabase(), turnPolicyKey(scope, turnId), current => {
+        if (current && current.mode !== mode) throw new Error('Browser turn mode cannot change');
+        return { record: { mode }, answer: mode };
+      }, scope);
+    },
+    async getTurnMode(scope, turnId) {
+      scope = Object.freeze(structuredClone(scope));
+      return change(await getDatabase(), turnPolicyKey(scope, turnId), current => ({ answer: current?.mode === 'act' ? 'act' : 'observe' }), scope);
+    },
     async getSession(scope) {
       const key = sessionKey(scope);
       return change(await getDatabase(), key, current => {
@@ -159,7 +177,12 @@ export function createBrowserJournal() {
       }, scope);
       if (claim.state !== 'execute') return claim;
       let observation;
-      try { observation = await execute(action); } catch { return { state: 'uncertain', result: null }; }
+      try {
+        const mode = await change(db, turnPolicyKey(scope, action.turnId), current => ({ answer: current?.mode }), scope);
+        observation = mode !== undefined && mode !== 'act' && !['read_page', 'screenshot'].includes(action.input.operation)
+          ? { status: 'rejected', observation: 'This turn only permits page observation, not browser actions.' }
+          : await execute(action);
+      } catch { return { state: 'uncertain', result: null }; }
       if (!['completed', 'rejected', 'failed'].includes(observation?.status)
         || typeof observation.observation !== 'string' || observation.observation.length > 32000) {
         throw new Error('Invalid browser observation; execution must be inspected');

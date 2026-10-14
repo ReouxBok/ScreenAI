@@ -1,7 +1,8 @@
 const MAX_ACTIONS_PER_TURN = 100;
 
-export function createBrowserTurnRunner({ client, journal, readPage, execute, authorize, notify, evaluationCode, onActionResult = async () => {} }) {
-  async function consume(stream, expectedTurnId, signal) {
+export function createBrowserTurnRunner({ client, journal, readPage, execute, authorize, notify, evaluationCode, browserMode = 'act', onActionResult = async () => {} }) {
+  if (!['observe', 'act'].includes(browserMode)) throw new Error('Invalid browser mode');
+  async function consume(stream, expectedTurnId, signal, scope, mode) {
     const actions = new Map();
     let turnId = expectedTurnId;
     let state;
@@ -13,6 +14,7 @@ export function createBrowserTurnRunner({ client, journal, readPage, execute, au
         if (data?.type === 'extension.action_requested' || data?.type === 'extension.turn_state') {
           if (!data.turnId || (turnId && data.turnId !== turnId)) throw new Error('Browser turn identity changed');
           turnId = data.turnId;
+          await journal.setTurnMode(scope, turnId, mode);
           if (data.type === 'extension.action_requested') {
             const previous = actions.get(data.actionId);
             if (previous && JSON.stringify(previous) !== JSON.stringify(data)) throw new Error('Conflicting browser action frames');
@@ -30,7 +32,7 @@ export function createBrowserTurnRunner({ client, journal, readPage, execute, au
     return { turnId, state, actions: [...actions.values()] };
   }
 
-  async function continueTurn(context, conversationId, sessionId, pending, signal) {
+  async function continueTurn(context, conversationId, sessionId, pending, signal, mode) {
     let count = 0;
     while (pending.state === 'waiting' && pending.actions.length) {
       signal?.throwIfAborted();
@@ -56,7 +58,7 @@ export function createBrowserTurnRunner({ client, journal, readPage, execute, au
       signal?.throwIfAborted();
       const page = await readPage(signal);
       const stream = client.sendBrowserResult(context, conversationId, { sessionId, page }, receipt.result, signal, evaluationCode);
-      pending = await consume(stream, pending.turnId, signal);
+      pending = await consume(stream, pending.turnId, signal, scope, mode);
     }
     return { state: pending.state, turnId: pending.turnId };
   }
@@ -67,18 +69,19 @@ export function createBrowserTurnRunner({ client, journal, readPage, execute, au
       const sessionId = await journal.getSession(context);
       const page = await readPage(signal);
       const stream = client.sendMessage(context, conversationId, content, signal, { sessionId, page }, evaluationCode);
-      const pending = await consume(stream, undefined, signal);
-      return continueTurn(context, conversationId, sessionId, pending, signal);
+      const pending = await consume(stream, undefined, signal, { ...context, conversationId, sessionId }, browserMode);
+      return continueTurn(context, conversationId, sessionId, pending, signal, browserMode);
     },
     async resume(context, conversationId, signal) {
       context = Object.freeze({ ...context });
       const sessionId = await journal.getSession(context);
       const turn = await client.getBrowserTurn(context, conversationId, sessionId, signal);
       if (!turn || turn.status !== 'open') return { state: turn?.status ?? 'absent', turnId: turn?.turnId };
+      const mode = await journal.getTurnMode({ ...context, conversationId, sessionId }, turn.turnId);
       const page = await readPage(signal);
       const stream = client.resumeBrowserTurn(context, conversationId, { sessionId, page }, turn.turnId, signal, evaluationCode);
-      const pending = await consume(stream, turn.turnId, signal);
-      return continueTurn(context, conversationId, sessionId, pending, signal);
+      const pending = await consume(stream, turn.turnId, signal, { ...context, conversationId, sessionId }, mode);
+      return continueTurn(context, conversationId, sessionId, pending, signal, mode);
     },
   };
 }

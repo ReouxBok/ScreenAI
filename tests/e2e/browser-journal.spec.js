@@ -325,3 +325,47 @@ test('an invalid screenshot receipt remains uncertain and is never re-executed',
   });
   expect(result).toEqual(Array.from({ length: 4 }, () => ['Invalid screenshot receipt; execution must be inspected', 'uncertain']).flat());
 });
+
+test('observation policy survives reopening and refuses mutations with durable receipts', async ({ context, extensionId }) => {
+  const page = await journalPage(context, extensionId);
+  const result = await page.evaluate(async () => {
+    const first = createJournal();
+    await first.setTurnMode(scope, action.turnId, 'observe');
+    await first.close();
+    const journal = createJournal();
+    let executed = 0;
+    let escalation;
+    try { await journal.setTurnMode(scope, action.turnId, 'act'); } catch (error) { escalation = error.message; }
+    const receipts = [];
+    for (const input of [
+      { operation: 'click', elementId: 1 }, { operation: 'type_text', elementId: 1, text: 'test' },
+      { operation: 'scroll', direction: 'down' }, { operation: 'navigate', url: 'https://example.com/next' },
+      { operation: 'highlight', elementId: 1 },
+    ]) {
+      receipts.push(await journal.run(scope, { ...action, actionId: input.operation === 'click' ? 'policy' : input.operation, input }, async () => {
+        executed++; return { status: 'completed', observation: 'Unexpected mutation' };
+      }));
+    }
+    const mode = await journal.getTurnMode(scope, action.turnId);
+    const read = await journal.run(scope, { ...action, actionId: 'read', input: { operation: 'read_page' } }, async () => {
+      executed++; return { status: 'completed', observation: 'Page read' };
+    });
+    const screenshot = await journal.run(scope, { ...action, actionId: 'screenshot', input: { operation: 'screenshot' } }, async () => {
+      executed++; return { status: 'completed', observation: 'Captured', imageFileId: crypto.randomUUID() };
+    });
+    const unknown = await journal.getTurnMode(scope, crypto.randomUUID());
+    await journal.revokeSession(scope);
+    let revoked;
+    try { await journal.getTurnMode(scope, action.turnId); } catch (error) { revoked = error.message; }
+    await journal.close();
+    return { executed, escalation, mode, unknown, receipts, read, screenshot, revoked };
+  });
+  expect(result.executed).toBe(2);
+  expect(result.escalation).toBe('Browser turn mode cannot change');
+  expect(result.mode).toBe('observe');
+  expect(result.unknown).toBe('observe');
+  expect(result.receipts.every(receipt => receipt.state === 'completed' && receipt.result.status === 'rejected')).toBe(true);
+  expect(result.read.result.status).toBe('completed');
+  expect(result.screenshot.result.status).toBe('completed');
+  expect(result.revoked).toBe('Browser session revoked');
+});

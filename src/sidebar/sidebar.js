@@ -100,7 +100,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     translate: key => t(key),
     onContextChange: () => { if (voiceSession?.native) voiceSession.stop(); },
     request: request => chrome.runtime.sendMessage(request),
-    onBusy: busy => { isLoading = busy; elements.sendBtn.disabled = busy; },
+    onBusy: busy => { isLoading = busy; elements.sendBtn.disabled = busy; elements.screenshotBtn.disabled = busy; },
     render: renderLimovaConversation,
   });
   initEventListeners();
@@ -993,21 +993,9 @@ async function sendMessage() {
 }
 
 async function analyzePage() {
-  if (trainingCaptureActive) return;
+  if (trainingCaptureActive || isLoading) return;
   if (!(await ensureAIConsent())) return;
-  showPondering();
-  updateStatus('analyzing');
-  try {
-    const response = await chrome.runtime.sendMessage({ type: 'ANALYZE_PAGE' });
-    if (response?.voiceSessionActive) {
-      hidePondering();
-      updateStatus(voiceSession?.active ? 'voice' : 'ready', voiceSession?.active ? t('voiceListening') : undefined);
-    }
-  } catch (e) {
-    hidePondering();
-    addMessage('error', t('errorScreenshot'));
-    updateStatus('error');
-  }
+  await limovaPanel.analyzePage();
 }
 
 function sendNextStepRequest() {
