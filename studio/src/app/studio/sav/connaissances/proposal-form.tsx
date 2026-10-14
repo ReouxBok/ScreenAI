@@ -11,8 +11,8 @@ import { knowledgeDetailUrl } from "./workspace-labels";
 import styles from "./workspace.module.css";
 
 type Preview = NonNullable<Awaited<ReturnType<typeof previewKnowledgeProposalAction>>["preview"]>;
-export function KnowledgeProposalPreviewDocument({ draft }: { draft: Pick<SavKnowledgeDraft, "title" | "document" | "sources"> }) {
-  return <section><h3>Proposition : {draft.title}</h3><KnowledgeDocument document={draft.document}/><h4>Sources de cette proposition</h4><ul>{draft.sources.map((source, index) => <li key={`${source.ref}:${index}`}>{source.label} — {source.ref}</li>)}</ul></section>;
+export function KnowledgeProposalPreviewDocument({ draft, sources = draft.sources }: { draft: Pick<SavKnowledgeDraft, "title" | "document" | "sources">; sources?: SavKnowledgeSource[] }) {
+  return <section><h3>Proposition : {draft.title}</h3><KnowledgeDocument document={draft.document}/><h4>Sources de cette proposition</h4><ul>{sources.map((source, index) => <li key={`${source.ref}:${index}`}>{source.label} — {source.ref}</li>)}</ul></section>;
 }
 export function KnowledgeProposalForm({ initial, learningCandidateId }: { initial: SavKnowledgeDetail | null; learningCandidateId?: string }) {
   const router = useRouter();
@@ -92,7 +92,7 @@ export function KnowledgeProposalForm({ initial, learningCandidateId }: { initia
     {error && <p className={`${styles.alert} ${styles.error}`} role="alert">{error}</p>}{notice && <p className={styles.alert} role="status">{notice}</p>}
     {preview && <section ref={previewRef} tabIndex={-1} className={styles.panel} aria-label="Aperçu avant soumission">
       <h2>Aperçu avant soumission</h2><p>Relisez la procédure et les sujets proches. La soumission crée une proposition à valider ; elle ne remplace aucune version active.</p>
-      <div className={styles.comparison}><section><h3>Version active conservée</h3><pre className={styles.text}>{preview.activeVersion?.body ?? "Nouvelle connaissance : aucune version active."}</pre></section><KnowledgeProposalPreviewDocument draft={preview.draft}/></div>
+      <div className={styles.comparison}><section><h3>Version active conservée</h3><pre className={styles.text}>{preview.activeVersion?.body ?? "Nouvelle connaissance : aucune version active."}</pre></section><KnowledgeProposalPreviewDocument draft={preview.draft} sources={preview.sources}/></div>
       {preview.missing.length > 0 && <div className={styles.alert}><h3>À compléter</h3><ul>{preview.missing.map(entry => <li key={entry}>{entry}</li>)}</ul></div>}
       <h3>Sujets proches à vérifier</h3>{preview.comparison.length === 0 ? <p>Aucun rapprochement automatique. Vérifiez les conditions et les éventuelles contradictions.</p> : preview.comparison.map(finding => <details key={`${finding.ref}:${finding.versionId}`}><summary>{finding.title} · {finding.signal === "duplicate" ? "Doublon possible" : "Sujet proche"}</summary><p>{finding.explanation}</p><pre className={styles.text}>{finding.body}</pre></details>)}
       <label className={styles.choice}><input type="checkbox" checked={acknowledged} onChange={event => setAcknowledged(event.target.checked)} disabled={busy}/>J’ai vérifié les sources, la procédure complète et les connaissances proches.</label>

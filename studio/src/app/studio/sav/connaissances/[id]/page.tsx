@@ -12,7 +12,8 @@ import styles from "../workspace.module.css";
 
 export const dynamic = "force-dynamic";
 function sourceUrl(ref: string) {
-  if (/^content:[a-f0-9-]{36}$/i.test(ref)) return `/studio/contenus/${ref.slice(8)}`;
+  if (/^content:[a-f0-9-]{36}(?::[a-f0-9-]{36})?$/i.test(ref)) return `/studio/contenus/${ref.split(":")[1]}`;
+  if (/^sav-learning:[a-f0-9-]{36}$/i.test(ref)) return `/studio/sav/connaissances/${ref.slice(13)}?kind=learning`;
   if (/^\/studio\//.test(ref) && !ref.includes("\\")) return ref;
   try { const parsed = new URL(ref); return parsed.protocol === "https:" ? parsed.href : null; } catch { return null; }
 }

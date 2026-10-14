@@ -29,6 +29,6 @@ export function knowledgeErrorMessage(code: string) {
 }
 
 export function knowledgeHistoryLabel(action: string) {
-  const labels: Record<string, string> = { knowledge_candidate_approved: "Proposition validée", knowledge_candidate_rejected: "Proposition écartée", knowledge_candidate_completion_requested: "Complément demandé", sav_knowledge_proposal_saved: "Brouillon enregistré", sav_knowledge_proposal_submitted: "Proposition soumise", sav_knowledge_activated: "Version activée pour le SAV", published: "Version publiée", content_published: "Version publiée", content_ai_enabled: "Utilisation activée", content_ai_disabled: "Utilisation suspendue" };
+  const labels: Record<string, string> = { knowledge_candidate_approved: "Proposition validée", knowledge_candidate_rejected: "Proposition écartée", knowledge_candidate_completion_requested: "Complément demandé", sav_knowledge_proposal_saved: "Brouillon enregistré", sav_knowledge_proposal_submitted: "Proposition soumise", sav_knowledge_activated: "Version activée pour le SAV", sav_knowledge_version_activated: "Version activée pour le SAV", sav_knowledge_completion_requested: "Complément demandé", sav_knowledge_revision_started: "Nouvelle révision préparée", sav_learning_revision_started: "Preuve reprise pour une nouvelle révision", published: "Version publiée", content_published: "Version publiée", content_ai_enabled: "Utilisation activée", content_ai_disabled: "Utilisation suspendue" };
   return labels[action] ?? "Événement de suivi de la connaissance";
 }
