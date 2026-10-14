@@ -8,4 +8,8 @@ Pour le multipart progressif, l’état appartient à son instance. Pour l’upl
 
 Cette reprise reste en mémoire dans le panneau ouvert. Elle ne permet pas de récupérer une vidéo après fermeture/rechargement du panneau et ne remplace pas une reprise durable côté serveur.
 
-Les tests reproduisent une confirmation HTTP 503, une erreur réseau et deux appels concurrents dans les deux chemins ; ils vérifient aussi l’isolation session/token et la reprise explicite après échec du stockage multipart. Les appels SDK Blob et HTTP sont simulés. L’enregistrement OS, le stockage distant et le parcours complet OAuth/vidéo restent à qualifier.
+Les tests unitaires reproduisent une confirmation HTTP 503, une erreur réseau et deux appels concurrents dans les deux chemins ; ils vérifient aussi l’isolation session/token et la reprise explicite après échec du stockage multipart. Les appels SDK Blob et HTTP sont simulés. L’enregistrement OS, le stockage distant et le parcours complet OAuth/vidéo restent à qualifier.
+
+Le test navigateur `tests/e2e/training-real-media.spec.js` utilise le recorder empaqueté et le SDK Blob réels. Chromium encode une vidéo canvas et son microphone de test en WebM : les octets envoyés sont décodables en 320 × 180. Après une confirmation 503, la reprise envoie seulement une seconde confirmation identique ; création, transfert de partie et finalisation du stockage restent uniques. Les pistes audio/vidéo sont arrêtées et un nouvel appel après succès conserve le résultat.
+
+Ce test vise le paquet production et intercepte les réponses HTTP Studio/Blob. Il ne vérifie ni le sélecteur système, ni un microphone physique, ni un stockage distant, ni le parcours OAuth complet. Il complète les tests unitaires sans remplacer la recette complète d’entraînement. Commande : `npx playwright test tests/e2e/training-real-media.spec.js`.
