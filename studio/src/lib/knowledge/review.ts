@@ -4,7 +4,7 @@ import { requireDb } from "@/db";
 import { auditLogs, categories, contentItems, contentVersions, knowledgeFamilies, knowledgeFamilyRevisions, knowledgeFamilySources, knowledgeProjectionCandidates, knowledgeProjections, reviewEvents } from "@/db/schema";
 import { parseContentInput } from "@/lib/content";
 import { savContentHash } from "@/lib/sav/crypto";
-import { assertKnowledgeUgoApproval, canonicalKnowledgeSchema } from "./contracts";
+import { assertKnowledgeCandidateReview, canonicalKnowledgeSchema } from "./contracts";
 import { savProjectionBody } from "./conversion";
 import { prepareHubspotReview } from "./hubspot-import";
 import { prepareOnboardingReview } from "./onboarding-import";
@@ -12,11 +12,12 @@ import { assertCompleteOnboardingKnowledge, assertSafeOnboardingKnowledge } from
 
 /** Approval creates an in-review SAV draft, never publishes or edits Chrome. */
 export async function reviewKnowledgeCandidate(candidateId: string, input: { expectedRevisionId: string; decision: "approve" | "reject"; reason: string; document?: unknown; completionNote?: string; missingAcknowledged?: boolean; comparison?: { snapshot: string; acknowledged: boolean } }, actorEmail: string) {
-  assertKnowledgeUgoApproval(actorEmail);
+  assertKnowledgeCandidateReview(actorEmail, "sav");
   if (input.reason.trim().length < 10) throw new Error("KNOWLEDGE_REVIEW_REASON_REQUIRED");
   return requireDb().transaction(async (tx) => {
     const [candidate] = await tx.select().from(knowledgeProjectionCandidates).where(eq(knowledgeProjectionCandidates.id, candidateId)).for("update");
     if (!candidate || candidate.revisionId !== input.expectedRevisionId) throw new Error("KNOWLEDGE_CANDIDATE_STALE");
+    assertKnowledgeCandidateReview(actorEmail, candidate.targetSurface);
     if (candidate.status === "approved" && input.decision === "approve") return candidate;
     if (!["pending", "needs_completion", "needs_recording", "not_applicable"].includes(candidate.status)) throw new Error("KNOWLEDGE_CANDIDATE_NOT_REVIEWABLE");
     if (input.decision === "reject") {

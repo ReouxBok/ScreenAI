@@ -6,7 +6,7 @@ const state = vi.hoisted(() => ({
   paginate: vi.fn(), imports: vi.fn(), batch: vi.fn(), inventory: vi.fn(), sourceInventory: vi.fn(), approvedRevisions: vi.fn(),
 }));
 vi.mock("@/lib/auth", () => ({ requireApiStaff: state.auth, hasRole: (role: string) => ["admin", "owner"].includes(role) }));
-vi.mock("@/lib/sav/auth", () => ({ requireSavStaff: state.auth }));
+vi.mock("@/lib/sav/auth", () => ({ requireSavStaff: state.auth, requireSavApiStaff: state.auth }));
 vi.mock("@/db", () => ({ requireDb: () => ({ select: (selection: Record<string, unknown> = {}) => {
   if ("projectionVersionId" in selection) return { from: () => ({ innerJoin: () => ({ where: state.approvedRevisions }) }) };
   const query = { from: () => query, innerJoin: () => query, where: () => query, limit: state.select };
@@ -34,7 +34,7 @@ function form(values: Record<string, string> = {}) {
 beforeEach(() => {
   vi.clearAllMocks();
   state.auth.mockResolvedValue({ email: "ugo@limova.ai", role: "owner" });
-  state.select.mockResolvedValue([{ id: candidateId, revisionId, status: "pending" }]);
+  state.select.mockResolvedValue([{ id: candidateId, revisionId, status: "pending", targetSurface: "sav" }]);
   state.start.mockResolvedValue({ id: importId, total: 119 });
   state.resume.mockResolvedValue({ id: importId, total: 119, processed: 10, remaining: 109 });
   state.prepare.mockResolvedValue({ snapshot: "snapshot", sourceCurrent: true });
@@ -72,7 +72,7 @@ describe("SAV onboarding knowledge actions", () => {
     expect(state.resume).not.toHaveBeenCalled();
   });
 
-  it("reserves previews for Ugo before reading candidates", async () => {
+  it("reserves previews for delegated reviewers before reading candidates", async () => {
     state.auth.mockResolvedValue({ email: "reouven@limova.ai", role: "admin" });
     await expect(previewOnboardingReviewAction(form({ document: "{}" }))).rejects.toThrow("KNOWLEDGE_UGO_APPROVAL_REQUIRED");
     expect(state.select).not.toHaveBeenCalled();
@@ -86,7 +86,7 @@ describe("SAV onboarding knowledge actions", () => {
   });
 
   it("previews the corrected document for a candidate needing completion", async () => {
-    const candidate = { id: candidateId, revisionId, status: "needs_completion" };
+    const candidate = { id: candidateId, revisionId, status: "needs_completion", targetSurface: "sav" };
     state.select.mockResolvedValue([candidate]);
     const result = await previewOnboardingReviewAction(form({ document: JSON.stringify({ objective: "Document corrigé" }) }));
     expect(result.error).toBeNull();
@@ -112,6 +112,20 @@ describe("SAV onboarding knowledge actions", () => {
   it("keeps the selected candidate, lot and filters after a review", async () => {
     await expect(reviewOnboardingKnowledgeAction(form({ decision: "reject", returnPage: "4", returnStatus: "needs_completion", returnSource: "onboarding", returnBatch: importId, returnCandidate: candidateId }))).rejects.toThrow(`page=4&status=needs_completion&source=onboarding&batch=${importId}&candidate=${candidateId}#candidate-${candidateId}`);
   });
+  it("allows the existing contact member session to compare and validate without granting global admin", async () => {
+    state.auth.mockResolvedValue({ email: "contact@limova.ai", role: "member" });
+    expect(await previewOnboardingReviewAction(form({ document: "{}" }))).toMatchObject({ error: null });
+    await expect(reviewOnboardingKnowledgeAction(form({ decision: "approve", document: "{}", comparisonSnapshot: "snapshot", comparisonAcknowledged: "on" }))).rejects.toThrow("result=draft_ready");
+    expect(state.review).toHaveBeenCalledWith(candidateId, expect.objectContaining({ decision: "approve" }), "contact@limova.ai");
+    expect(state.auth.mock.calls.every((args) => args.length === 0)).toBe(true);
+    expect(state.start).not.toHaveBeenCalled();
+  });
+  it("does not preview a forged onboarding destination as SAV", async () => {
+    state.auth.mockResolvedValue({ email: "contact@limova.ai", role: "member" });
+    state.select.mockResolvedValue([{ id: candidateId, revisionId, status: "pending", targetSurface: "onboarding" }]);
+    expect(await previewOnboardingReviewAction(form({ document: "{}" }))).toMatchObject({ error: "KNOWLEDGE_CANDIDATE_STALE" });
+    expect(state.prepare).not.toHaveBeenCalled();
+  });
 });
 
 function candidateRow(id = candidateId, title = "Connecter son compte et conserver le même titre") {
@@ -134,6 +148,27 @@ async function pageHtml(searchParams: Record<string, string> = {}) {
 }
 
 describe("SAV onboarding catalogue presentation", () => {
+  it("shows contact the SAV review form without granting global admin or publication", async () => {
+    state.auth.mockResolvedValue({ email: "contact@limova.ai", role: "member" });
+    state.paginate.mockResolvedValue({ rows: [candidateRow()], total: 1, page: 1, pageSize: 20 });
+    const html = await pageHtml();
+    expect(html).toContain("Revoir, corriger ou écarter cette connaissance");
+    expect(html).toContain("Valider et préparer le brouillon SAV");
+    expect(html).toContain("Publication et activation restent réservées à Ugo.");
+    expect(html).not.toContain("Préparer un nouvel inventaire");
+  });
+  it.each(["contact@limova.ai", "reouven@limova.ai"])("does not show %s review controls for Chrome candidates", async (email) => {
+    state.auth.mockResolvedValue({ email, role: "member" });
+    const row = candidateRow(); row.candidate.targetSurface = "onboarding";
+    row.candidate.status = "needs_recording"; row.source.evidence.importKind = "sav";
+    state.paginate.mockResolvedValue({ rows: [row], total: 1, page: 1, pageSize: 20 });
+    expect(await pageHtml()).not.toContain("Revoir, corriger ou écarter cette connaissance");
+  });
+  it("keeps non-delegated SAV staff read-only", async () => {
+    state.auth.mockResolvedValue({ email: "reouven@limova.ai", role: "owner" });
+    state.paginate.mockResolvedValue({ rows: [candidateRow()], total: 1, page: 1, pageSize: 20 });
+    expect(await pageHtml()).not.toContain("Revoir, corriger ou écarter cette connaissance");
+  });
   it("alerts on a legacy preparation without overwriting its decision or starting an import", async () => {
     const row = candidateRow(); row.source.evidence.converter = "onboarding-sav-51-v1";
     state.paginate.mockResolvedValue({ rows: [row], total: 1, page: 1, pageSize: 20 });

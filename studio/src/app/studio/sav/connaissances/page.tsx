@@ -14,11 +14,11 @@ import { getOnboardingImport, inventoryOnboardingSources, listOnboardingImports 
 import { continueOnboardingImportAction, startOnboardingImportAction } from "./onboarding-actions";
 import { ONBOARDING_KNOWLEDGE_CONVERTER, onboardingSectionLabels } from "@/lib/knowledge/onboarding-sections";
 import { OnboardingReviewForm } from "./onboarding-review-form";
-import type { CanonicalKnowledge } from "@/lib/knowledge/contracts";
+import { canReviewKnowledgeCandidate, type CanonicalKnowledge } from "@/lib/knowledge/contracts";
 
 export const dynamic = "force-dynamic";
 
-const statusLabels: Record<string, string> = { pending: "À valider par Ugo", needs_completion: "À compléter", needs_recording: "À compléter par un tutoriel", not_applicable: "Non applicable", approved: "Validé", rejected: "Écarté" };
+const statusLabels: Record<string, string> = { pending: "À valider", needs_completion: "À compléter", needs_recording: "À compléter par un tutoriel", not_applicable: "Non applicable", approved: "Validé", rejected: "Écarté" };
 const sourceLabels: Record<string, string> = { all: "Toutes les sources", onboarding: "Tutoriels → SAV", hubspot: "Fiches HubSpot", sav: "Résolutions SAV → tutoriels" };
 const sourceChangeAlertStatuses = ["pending", "needs_completion", "approved"];
 const notices: Record<string, string> = {
@@ -100,7 +100,7 @@ export default async function SavKnowledgeCandidatesPage({ searchParams }: { sea
   }
   const approvedCandidates = rows.map(({ candidate }) => candidate).filter((candidate) => candidate.status === "approved" && candidate.targetSurface === "sav" && candidate.materializedVersionId);
   const [inventory, onboardingInventory, approvedRevisions] = await Promise.all([
-    staff.email !== "ugo@limova.ai" && rows.some(({ source, candidate }) => source.evidence.importKind === "hubspot" && candidate.status === "pending") ? knowledgeComparisonInventory() : Promise.resolve([]),
+    rows.some(({ source, candidate }) => !canReviewKnowledgeCandidate(staff.email, candidate.targetSurface) && source.evidence.importKind === "hubspot" && candidate.status === "pending") ? knowledgeComparisonInventory() : Promise.resolve([]),
     rows.some(({ source, candidate }) => source.evidence.importKind === "onboarding_catalog" && sourceChangeAlertStatuses.includes(candidate.status)) ? inventoryOnboardingSources() : Promise.resolve(null),
     approvedCandidates.length ? requireDb().select({ projectionVersionId: knowledgeProjections.versionId, familyId: knowledgeProjections.familyId, revision: knowledgeFamilyRevisions })
       .from(knowledgeProjections).innerJoin(knowledgeFamilyRevisions, and(eq(knowledgeFamilyRevisions.id, knowledgeProjections.revisionId), eq(knowledgeFamilyRevisions.familyId, knowledgeProjections.familyId)))
@@ -111,7 +111,7 @@ export default async function SavKnowledgeCandidatesPage({ searchParams }: { sea
   return <>
     <Link className="back-link" href="/studio/sav">← Retour au SAV</Link>
     <div className="page-intro compact"><div>
-      <span className="eyebrow">Connaissance partagée · validation Ugo</span>
+      <span className="eyebrow">Connaissance partagée · validation humaine</span>
       <h1>Connaissances SAV à valider</h1>
       <p>Une même connaissance métier, des versions sources traçables et des projections distinctes. Aucun candidat n’est publié ou exécuté depuis cette page.</p>
     </div></div>
@@ -120,7 +120,7 @@ export default async function SavKnowledgeCandidatesPage({ searchParams }: { sea
     <details className="card" style={{ padding: 24 }} open={Boolean(selectedBatch) && !query.candidate}>
       <summary>Lots de conversion des tutoriels · {imports.length} lot{imports.length === 1 ? "" : "s"} récent{imports.length === 1 ? "" : "s"}</summary>
       <h2>Préparer les connaissances depuis les tutoriels actifs</h2>
-      <p>Chaque connaissance conserve le titre du tutoriel. Les étapes, prérequis, résultats et limites sont préparés pour la revue d’Ugo. Les informations insuffisantes restent visibles comme points à compléter.</p>
+      <p>Chaque connaissance conserve le titre du tutoriel. Les étapes, prérequis, résultats et limites sont préparés pour la revue humaine autorisée. Les informations insuffisantes restent visibles comme points à compléter.</p>
       {canImport && <form action={startOnboardingImportAction}>
         <input type="hidden" name="returnPage" value={page}/><input type="hidden" name="returnStatus" value={status}/><input type="hidden" name="returnSource" value={sourceFilter}/>
         <button className="secondary">Préparer l’inventaire des tutoriels actifs</button>
@@ -171,7 +171,7 @@ export default async function SavKnowledgeCandidatesPage({ searchParams }: { sea
       </details>}
     </details>
     <details className="card" style={{ padding: 24 }}><summary>Importer des fiches HubSpot</summary>
-      <p>Choisissez le fichier JSON privé au format Studio (800 Ko maximum). Les fiches restent à valider par Ugo. Aucun email brut ne doit être inclus.</p>
+      <p>Choisissez le fichier JSON privé au format Studio (800 Ko maximum). Les fiches SAV restent à valider par Ugo ou le compte contact autorisé. Aucun email brut ne doit être inclus.</p>
       <p>Si une tentative échoue, vous pouvez renvoyer le fichier : les fiches déjà préparées sont conservées sans doublon.</p>
       <form action={importHubspotKnowledgeAction}><label>Base de connaissances privée<input type="file" name="knowledgeFile" accept="application/json,.json" required/></label><button className="secondary">Préparer les candidats SAV</button></form>
     </details>
@@ -199,8 +199,9 @@ export default async function SavKnowledgeCandidatesPage({ searchParams }: { sea
         const missing = stringList(quality.missing);
         const warnings = stringList(quality.warnings);
         const sourceItemId = typeof source.evidence.sourceItemId === "string" ? source.evidence.sourceItemId : null;
-        const comparison = imported && candidate.status === "pending" && staff.email !== "ugo@limova.ai" ? hubspotComparison(candidate, inventory) : null;
-        const canReview = staff.email === "ugo@limova.ai" && ["pending", "needs_completion", "needs_recording", "not_applicable"].includes(candidate.status);
+        const reviewer = canReviewKnowledgeCandidate(staff.email, candidate.targetSurface);
+        const comparison = imported && candidate.status === "pending" && !reviewer ? hubspotComparison(candidate, inventory) : null;
+        const canReview = reviewer && ["pending", "needs_completion", "needs_recording", "not_applicable"].includes(candidate.status);
         const displayedRevision = candidate.status === "approved" && candidate.targetSurface === "sav" ? approvedRevisionByVersion.get(`${candidate.familyId}:${candidate.materializedVersionId}`) : revision;
         const displayedDocument = displayedRevision?.document;
         return <article id={`candidate-${candidate.id}`} className="card" style={{ padding: 24, minWidth: 0, overflowWrap: "anywhere", scrollMarginTop: 24 }} key={candidate.id}>
@@ -245,9 +246,9 @@ export default async function SavKnowledgeCandidatesPage({ searchParams }: { sea
           </details>
           {canReview && <details className="learning-preview">
           <summary>Revoir, corriger ou écarter cette connaissance</summary>
-          {staff.email === "ugo@limova.ai" && imported && candidate.status === "pending" && <HubspotReviewForm candidateId={candidate.id} revisionId={revision.id} initialDocument={JSON.stringify(revision.document, null, 2)}/>}
-          {staff.email === "ugo@limova.ai" && onboarding && ["pending", "needs_completion"].includes(candidate.status) && <OnboardingReviewForm candidateId={candidate.id} revisionId={revision.id} title={title} initialDocument={revision.document} needsCompletion={candidate.status === "needs_completion"} filters={filters}/>}
-          {staff.email === "ugo@limova.ai" && !onboarding && !(imported && candidate.status === "pending") && ["pending", "needs_recording", "not_applicable"].includes(candidate.status) && <form action={reviewKnowledgeAction}>
+          {imported && candidate.status === "pending" && <HubspotReviewForm candidateId={candidate.id} revisionId={revision.id} initialDocument={JSON.stringify(revision.document, null, 2)}/>}
+          {onboarding && ["pending", "needs_completion"].includes(candidate.status) && <OnboardingReviewForm candidateId={candidate.id} revisionId={revision.id} title={title} initialDocument={revision.document} needsCompletion={candidate.status === "needs_completion"} filters={filters}/>}
+          {!onboarding && !(imported && candidate.status === "pending") && ["pending", "needs_recording", "not_applicable"].includes(candidate.status) && <form action={reviewKnowledgeAction}>
             <input type="hidden" name="candidateId" value={candidate.id}/><input type="hidden" name="revisionId" value={revision.id}/>
             {candidate.status === "pending" && candidate.targetSurface === "sav" && <details><summary>Corriger la connaissance avant validation (JSON métier, sans DOM)</summary><label>Connaissance complète<textarea name="document" rows={16} defaultValue={JSON.stringify(revision.document, null, 2)} style={{ width: "100%" }}/></label></details>}
             <label>Motif de la décision<input name="reason" required minLength={10}/></label>
@@ -255,7 +256,8 @@ export default async function SavKnowledgeCandidatesPage({ searchParams }: { sea
             <button className="secondary" name="decision" value="reject">Écarter le candidat</button>
           </form>}
           </details>}
-          {staff.email !== "ugo@limova.ai" && <p>Validation et publication réservées à Ugo. Vos autres accès Studio restent inchangés.</p>}
+          {!reviewer && <p>Validation réservée à Ugo et, pour les fiches SAV, au compte contact autorisé. Vos autres accès Studio restent inchangés.</p>}
+          {staff.email !== "ugo@limova.ai" && <p>Publication et activation restent réservées à Ugo. Une validation prépare seulement un brouillon SAV.</p>}
         </div>
       </article>;
       })}

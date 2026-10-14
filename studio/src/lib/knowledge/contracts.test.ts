@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { assertKnowledgeUgoApproval, canonicalKnowledgeSchema, supportProcedure } from "./contracts";
+import { assertKnowledgeCandidateReview, assertKnowledgeUgoApproval, canReviewKnowledgeCandidate, canonicalKnowledgeSchema, supportProcedure } from "./contracts";
 const document = canonicalKnowledgeSchema.parse({ schemaVersion: 1, objective: "Retrouver ses factures", applicability: "shared", locale: "fr-FR", expectedResult: "Liste des factures visible", escalation: "Contacter le support si le menu manque.", steps: [{ id: "billing.open-settings", userLabel: "Paramètres", objective: "Ouvrir les paramètres", instruction: "Ouvrez Paramètres en bas à gauche.", location: "en bas à gauche", expectedResult: "Paramètres visibles", escalation: "Vérifier les droits." }, { id: "billing.list-invoices", userLabel: "Factures", objective: "Consulter les factures", instruction: "Ouvrez Facturation, puis Factures.", expectedResult: "Liste des factures visible", escalation: "Contacter le support." }] });
 describe("shared semantic steps", () => {
   it("provides the written navigation with no execution details", () => {
@@ -18,6 +18,20 @@ describe("shared semantic steps", () => {
   });
   it("requires Ugo for knowledge publication, including emergency paths", () => {
     expect(() => assertKnowledgeUgoApproval("reouven@limova.ai")).toThrow("KNOWLEDGE_UGO_APPROVAL_REQUIRED");
+    expect(() => assertKnowledgeUgoApproval("contact@limova.ai")).toThrow("KNOWLEDGE_UGO_APPROVAL_REQUIRED");
     expect(() => assertKnowledgeUgoApproval(" UGO@limova.ai ")).not.toThrow();
+  });
+  it.each(["ugo@limova.ai", "contact@limova.ai", " CONTACT@limova.ai "])("allows the delegated SAV reviewer %s", (email) => {
+    expect(canReviewKnowledgeCandidate(email, "sav")).toBe(true);
+    expect(() => assertKnowledgeCandidateReview(email, "sav")).not.toThrow();
+  });
+  it.each(["reouven@limova.ai", "arnaud@limova.ai", "another-admin@example.com", "contact@limova.ai.attacker.invalid", ""])("rejects non-delegated SAV reviewer %s", (email) => {
+    expect(canReviewKnowledgeCandidate(email, "sav")).toBe(false);
+    expect(() => assertKnowledgeCandidateReview(email, "sav")).toThrow("KNOWLEDGE_UGO_APPROVAL_REQUIRED");
+  });
+  it.each(["onboarding", "unknown", ""])("does not delegate review of %s candidates to contact", (surface) => {
+    expect(canReviewKnowledgeCandidate("contact@limova.ai", surface)).toBe(false);
+    expect(() => assertKnowledgeCandidateReview("contact@limova.ai", surface)).toThrow("KNOWLEDGE_UGO_APPROVAL_REQUIRED");
+    expect(canReviewKnowledgeCandidate("ugo@limova.ai", surface)).toBe(true);
   });
 });
