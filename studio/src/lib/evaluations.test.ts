@@ -41,3 +41,22 @@ describe("real-condition evaluation scoring", () => {
     })).toEqual({ score: 40, passed: false, failureCode: "criteria_not_met" });
   });
 });
+
+
+describe("mandatory evaluation evidence", () => {
+  const valid = { isLive: true, delivered: true, actionSucceeded: true, verified: true,
+    failed: false, manual: false, verdict: "correct" as const, threshold: 0 };
+  it.each(["delivered", "actionSucceeded", "verified"] as const)("requires %s even with a zero threshold", missing => {
+    expect(scoreEvaluation({ ...valid, [missing]: false })).toMatchObject({ passed: false, failureCode: "criteria_not_met" });
+  });
+  it("requires a delivered response for an explanation-only case", () => {
+    expect(scoreEvaluation({ ...valid, isLive: false, delivered: false })).toMatchObject({ passed: false, failureCode: "criteria_not_met" });
+  });
+  it("allows an explanation without browser actions once its response is delivered", () => {
+    expect(scoreEvaluation({ ...valid, isLive: false, actionSucceeded: false, verified: false, threshold: 100 }))
+      .toEqual({ score: 100, passed: true, failureCode: null });
+  });
+  it.each([NaN, Infinity, -1, 101])("rejects invalid threshold %s", threshold => {
+    expect(scoreEvaluation({ ...valid, threshold })).toMatchObject({ passed: false, failureCode: "criteria_not_met" });
+  });
+});

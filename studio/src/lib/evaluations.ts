@@ -39,10 +39,13 @@ export function scoreEvaluation(input: EvaluationScoreInput) {
     - (input.failed ? 30 : 0)
     - (input.manual ? 30 : 0)
   ));
+  const evidenceComplete = input.delivered && (!input.isLive || (input.actionSucceeded && input.verified));
+  const criteriaMet = evidenceComplete && Number.isFinite(input.threshold)
+    && input.threshold >= 0 && input.threshold <= 100 && score >= input.threshold && input.verdict === "correct";
   return {
     score,
-    passed: input.verdict === "correct" && !input.failed && !input.manual && score >= input.threshold,
-    failureCode: input.manual ? "manual_intervention" : input.failed ? "tool_failure" : score < input.threshold || input.verdict !== "correct" ? "criteria_not_met" : null,
+    passed: criteriaMet && !input.failed && !input.manual,
+    failureCode: input.manual ? "manual_intervention" : input.failed ? "tool_failure" : !criteriaMet ? "criteria_not_met" : null,
   };
 }
 

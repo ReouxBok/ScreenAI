@@ -45,3 +45,11 @@ La session charge l’historique avant l’ouverture du fournisseur vocal. Chaqu
 Le panneau envoie au worker seulement l’identifiant du message final et la conversation. Le worker exige le test actif, déduplique cet identifiant et transmet au Studio le statut de réponse sans son texte. L’arrêt audio conserve la possibilité d’attendre les enregistrements déjà engagés ; leur échec bloque le verdict. Cela prouve la réception de la réponse canonique dans l’extension, pas que tout l’audio a été entendu.
 
 La vérification explicite de l’objectif métier reste à raccorder ; aucune capture, lecture de page ou affirmation du modèle n’est implicitement transformée en réussite de ce contrôle. La qualification réelle du parcours demeure nécessaire.
+
+## Conditions obligatoires du scoring
+
+Le calcul Studio exige désormais les preuves minimales indépendamment du seuil numérique : réponse livrée pour tous les scénarios ; action exécutée et résultat vérifié en plus pour un scénario `live_action`. Un seuil invalide est refusé. Les points restent affichés pour le diagnostic, mais un seuil bas ne contourne plus une preuve manquante. Les erreurs d’outil et interventions manuelles restent éliminatoires.
+
+La relecture de l’ancien `verify_expected_result` a confirmé qu’il renvoyait `ok` après une simple relecture de page, avec l’attendu dans un message. Ce comportement ne constitue pas une comparaison avec les critères métier. Le parcours natif ne reprend pas cette équivalence : la vérification explicite reste à implémenter avant de qualifier les tests d’action.
+
+Validation de cette correction : 19 tests Studio ciblés passent, ainsi que TypeScript et ESLint. Pas de migration de données ni de déploiement.
