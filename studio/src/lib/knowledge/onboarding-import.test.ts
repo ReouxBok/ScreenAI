@@ -1,7 +1,7 @@
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { eq } from "drizzle-orm";
 import { createSavTestDb } from "../../../test/sav-db";
-import { activeOnboardingTemplate, auditLogs, categories, contentChunks, contentItems, contentVersions, knowledgeFamilies, knowledgeFamilyRevisions, knowledgeFamilySources, knowledgeProjectionCandidates, knowledgeProjections, onboardingTemplateVersions } from "@/db/schema";
+import { activeOnboardingTemplate, auditLogs, categories, contentChunks, contentItems, contentVersions, savKnowledgeActivations, knowledgeFamilies, knowledgeFamilyRevisions, knowledgeFamilySources, knowledgeProjectionCandidates, knowledgeProjections, onboardingTemplateVersions } from "@/db/schema";
 import type { OnboardingMetadata } from "@/db/schema";
 import type { CurriculumJourney } from "@/lib/limova-curriculum";
 import { searchKnowledge } from "@/lib/search";
@@ -33,6 +33,12 @@ beforeEach(async () => {
   await fixture.db.insert(categories).values([{ slug: "bien-demarrer", label: "Démarrer" }, { slug: "depannage", label: "Dépannage" }]);
   state.curriculum.splice(0); state.embed.mockClear(); sequence = 0;
 });
+
+async function activatePublished(itemId: string) {
+  const [item] = await fixture.db.select().from(contentItems).where(eq(contentItems.id, itemId));
+  const [active] = await fixture.db.select().from(savKnowledgeActivations).where(eq(savKnowledgeActivations.itemId, itemId));
+  return setContentAiEnabled(itemId, true, actor, { expectedPublishedVersionId: item.publishedVersionId ?? "", expectedActiveVersionId: active?.versionId ?? null });
+}
 
 // All content in this file is synthetic. No provider, model or production corpus is used.
 const body = `# Renommer un espace de démonstration
@@ -163,7 +169,7 @@ describe("SAV-51 onboarding inventory and resumable import", () => {
   it.each([false, true])("blocks publication of an old approved draft while preserving already published knowledge=%s", async (alreadyPublished) => {
     const candidate = await candidateFor(await tutorial());
     const approved = await reviewKnowledgeCandidate(candidate.id, await approval(candidate), actor);
-    if (alreadyPublished) { await publish(approved.targetItemId!, actor); await setContentAiEnabled(approved.targetItemId!, true, actor); }
+    if (alreadyPublished) { await publish(approved.targetItemId!, actor); await activatePublished(approved.targetItemId!); }
     const [proof] = await fixture.db.select().from(knowledgeFamilySources).where(eq(knowledgeFamilySources.id, candidate.sourceId));
     await fixture.db.update(knowledgeFamilySources).set({ evidence: { ...proof.evidence, converter: "onboarding-sav-51-v1" } }).where(eq(knowledgeFamilySources.id, proof.id));
     const [version] = await fixture.db.select().from(contentVersions).where(eq(contentVersions.id, approved.materializedVersionId!));
@@ -381,14 +387,14 @@ describe("SAV-51 supervised review and publication separation", () => {
     const [published] = await fixture.db.select().from(contentItems).where(eq(contentItems.id, item.id));
     expect(published).toMatchObject({ status: "published", publishedVersionId: approved.materializedVersionId, aiEnabled: false });
     await expect(setContentAiEnabled(item.id, true, "contact@limova.ai")).rejects.toThrow("KNOWLEDGE_UGO_APPROVAL_REQUIRED");
-    await setContentAiEnabled(item.id, true, actor);
+    await activatePublished(item.id);
     expect((await fixture.db.select().from(contentItems).where(eq(contentItems.id, item.id)))[0].aiEnabled).toBe(true);
   });
   it("does not pre-arm an unpublished SAV candidate for automatic activation on publication", async () => {
     const candidate = await candidateFor(await tutorial());
     const approved = await reviewKnowledgeCandidate(candidate.id, await approval(candidate), actor);
     await expect(setContentAiEnabled(approved.targetItemId!, true, "reouven@limova.ai")).rejects.toThrow("KNOWLEDGE_UGO_APPROVAL_REQUIRED");
-    await expect(setContentAiEnabled(approved.targetItemId!, true, actor)).rejects.toThrow("ONBOARDING_PUBLICATION_REQUIRED");
+    await expect(activatePublished(approved.targetItemId!)).rejects.toThrow("ONBOARDING_PUBLICATION_REQUIRED");
     const [item] = await fixture.db.select().from(contentItems).where(eq(contentItems.id, approved.targetItemId!));
     expect(item.aiEnabled).toBe(false);
     expect(item.publishedVersionId).toBeNull();
@@ -476,7 +482,7 @@ describe("SAV-51 supervised review and publication separation", () => {
     const approved = await reviewKnowledgeCandidate(candidate.id, await approval(candidate), actor);
     await publish(approved.targetItemId!, actor, { expectedVersionId: approved.materializedVersionId! });
     expect((await searchKnowledge({ query: "Renommer un espace", scope: "sav" })).results).toEqual([]);
-    await setContentAiEnabled(approved.targetItemId!, true, actor);
+    await activatePublished(approved.targetItemId!);
     const found = await searchKnowledge({ query: "Renommer un espace", scope: "sav" });
     const [version] = await fixture.db.select().from(contentVersions).where(eq(contentVersions.id, approved.materializedVersionId!));
     expect(found.results).toHaveLength(1);
@@ -491,7 +497,7 @@ describe("SAV-51 supervised review and publication separation", () => {
     const source = await tutorial(); const candidate = await candidateFor(source);
     const approved = await reviewKnowledgeCandidate(candidate.id, await approval(candidate), actor);
     await publish(approved.targetItemId!, actor);
-    await setContentAiEnabled(approved.targetItemId!, true, actor);
+    await activatePublished(approved.targetItemId!);
     const input = parseContentInput(approved.proposedInput);
     if (field === "title") input.title = "Un autre titre fictif";
     if (field === "scope") input.agentKey = "charly";
@@ -507,7 +513,7 @@ describe("SAV-51 supervised review and publication separation", () => {
     const first = await candidateFor(source);
     const approvedFirst = await reviewKnowledgeCandidate(first.id, await approval(first), actor);
     await publish(approvedFirst.targetItemId!, actor, { expectedVersionId: approvedFirst.materializedVersionId! });
-    await setContentAiEnabled(approvedFirst.targetItemId!, true, actor);
+    await activatePublished(approvedFirst.targetItemId!);
     const renamedTitle = "Renommer un espace — titre corrigé";
     await fixture.db.update(contentItems).set({ title: renamedTitle }).where(eq(contentItems.id, source.item.id));
     const republished = await republish(source);
@@ -519,6 +525,9 @@ describe("SAV-51 supervised review and publication separation", () => {
     const before = await searchKnowledge({ query: "Renommer un espace", scope: "sav" });
     expect(before.results[0]).toMatchObject({ title: source.item.title, contentVersionId: approvedFirst.materializedVersionId });
     await publish(approvedSecond.targetItemId!, actor, { expectedVersionId: approvedSecond.materializedVersionId! });
+    const stillActive = await searchKnowledge({ query: "Renommer un espace", scope: "sav" });
+    expect(stillActive.results[0]).toMatchObject({ title: source.item.title, contentVersionId: approvedFirst.materializedVersionId });
+    await activatePublished(approvedSecond.targetItemId!);
     const after = await searchKnowledge({ query: "Renommer un espace", scope: "sav" });
     expect(after.results[0]).toMatchObject({ title: renamedTitle, contentVersionId: approvedSecond.materializedVersionId });
   });
@@ -527,7 +536,7 @@ describe("SAV-51 supervised review and publication separation", () => {
     const source = await tutorial(); const candidate = await candidateFor(source);
     const approved = await reviewKnowledgeCandidate(candidate.id, await approval(candidate), actor);
     await publish(approved.targetItemId!, actor);
-    await setContentAiEnabled(approved.targetItemId!, true, actor);
+    await activatePublished(approved.targetItemId!);
     const [version] = await fixture.db.select().from(contentVersions).where(eq(contentVersions.id, approved.materializedVersionId!));
     expect(await onboardingSourceStatus(version.metadata)).toBe("current");
     if (change === "disabled") await fixture.db.update(contentItems).set({ aiEnabled: false }).where(eq(contentItems.id, source.item.id));
@@ -568,7 +577,7 @@ describe("SAV-51 supervised review and publication separation", () => {
     const approved = await reviewKnowledgeCandidate(candidate.id, await approval(candidate), actor);
     await publish(approved.targetItemId!, actor, { expectedVersionId: approved.materializedVersionId! });
     await fixture.db.update(contentItems).set({ aiEnabled: false }).where(eq(contentItems.id, source.item.id));
-    await expect(setContentAiEnabled(approved.targetItemId!, true, actor)).rejects.toThrow("ONBOARDING_SOURCE_STALE");
+    await expect(activatePublished(approved.targetItemId!)).rejects.toThrow("ONBOARDING_SOURCE_STALE");
     expect((await fixture.db.select().from(contentItems).where(eq(contentItems.id, approved.targetItemId!)))[0].aiEnabled).toBe(false);
     expect((await searchKnowledge({ query: "Renommer un espace", scope: "sav" })).results).toEqual([]);
   });

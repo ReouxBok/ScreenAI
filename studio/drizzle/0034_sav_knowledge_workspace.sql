@@ -27,6 +27,8 @@ CREATE INDEX "sav_knowledge_publication_item_idx" ON "sav_knowledge_publication_
 --> statement-breakpoint
 CREATE TABLE "sav_knowledge_proposal_drafts" (
   "id" uuid PRIMARY KEY DEFAULT gen_random_uuid(), "revision" integer NOT NULL DEFAULT 1,
+  "family_id" uuid REFERENCES knowledge_families(id) ON DELETE RESTRICT,
+  "source_candidate_id" uuid REFERENCES knowledge_projection_candidates(id) ON DELETE RESTRICT,
   "mode" text NOT NULL, "target_item_id" uuid REFERENCES content_items(id) ON DELETE RESTRICT,
   "base_version_id" uuid REFERENCES content_versions(id) ON DELETE RESTRICT,
   "active_version_id" uuid REFERENCES content_versions(id) ON DELETE RESTRICT,

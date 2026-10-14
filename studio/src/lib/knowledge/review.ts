@@ -1,7 +1,7 @@
 import "server-only";
 import { and, eq, max } from "drizzle-orm";
 import { requireDb } from "@/db";
-import { auditLogs, categories, contentItems, contentVersions, knowledgeFamilies, knowledgeFamilyRevisions, knowledgeFamilySources, knowledgeProjectionCandidates, knowledgeProjections, reviewEvents } from "@/db/schema";
+import { auditLogs, categories, contentItems, contentVersions, knowledgeFamilies, knowledgeFamilyRevisions, knowledgeFamilySources, knowledgeProjectionCandidates, knowledgeProjections, reviewEvents, savKnowledgeProposalDrafts } from "@/db/schema";
 import { parseContentInput } from "@/lib/content";
 import { savContentHash } from "@/lib/sav/crypto";
 import { assertKnowledgeCandidateReview, canonicalKnowledgeSchema } from "./contracts";
@@ -11,16 +11,33 @@ import { prepareOnboardingReview } from "./onboarding-import";
 import { assertCompleteOnboardingKnowledge, assertSafeOnboardingKnowledge } from "./onboarding-extraction";
 
 /** Approval creates an in-review SAV draft, never publishes or edits Chrome. */
-export async function reviewKnowledgeCandidate(candidateId: string, input: { expectedRevisionId: string; decision: "approve" | "reject"; reason: string; document?: unknown; completionNote?: string; missingAcknowledged?: boolean; comparison?: { snapshot: string; acknowledged: boolean } }, actorEmail: string) {
+export async function reviewKnowledgeCandidate(candidateId: string, input: { expectedRevisionId: string; decision: "approve" | "reject"; reason: string; document?: unknown; completionNote?: string; missingAcknowledged?: boolean; workspaceSnapshot?: string; comparison?: { snapshot: string; acknowledged: boolean } }, actorEmail: string) {
   assertKnowledgeCandidateReview(actorEmail, "sav");
   if (input.reason.trim().length < 10) throw new Error("KNOWLEDGE_REVIEW_REASON_REQUIRED");
   return requireDb().transaction(async (tx) => {
+    const { assertWorkspaceReview, finishWorkspaceLearningReview, finishWorkspaceLearningRejection, lockWorkspaceLearningSource, previewSavKnowledgeReview, readSavLearningEvidence } = await import("./proposals");
+    const [unlocked] = await tx.select().from(knowledgeProjectionCandidates).where(eq(knowledgeProjectionCandidates.id, candidateId));
+    const [unlockedSource] = unlocked ? await tx.select().from(knowledgeFamilySources).where(eq(knowledgeFamilySources.id, unlocked.sourceId)) : [];
+    if (unlockedSource?.evidence.importKind === "sav_workspace" && typeof unlockedSource.evidence.learningCandidateId === "string") {
+      await lockWorkspaceLearningSource(unlockedSource.evidence.learningCandidateId, tx);
+      if (input.decision === "approve") await readSavLearningEvidence(unlockedSource.evidence.learningCandidateId, tx, true);
+    }
     const [candidate] = await tx.select().from(knowledgeProjectionCandidates).where(eq(knowledgeProjectionCandidates.id, candidateId)).for("update");
     if (!candidate || candidate.revisionId !== input.expectedRevisionId) throw new Error("KNOWLEDGE_CANDIDATE_STALE");
     assertKnowledgeCandidateReview(actorEmail, candidate.targetSurface);
+    if (input.decision === "approve") {
+      const [replacement] = await tx.select().from(savKnowledgeProposalDrafts).where(eq(savKnowledgeProposalDrafts.sourceCandidateId, candidate.id)).limit(1);
+      if (replacement) throw new Error("KNOWLEDGE_REVIEW_STALE");
+    }
+    if (input.workspaceSnapshot) {
+      if (candidate.targetItemId) await tx.select().from(contentItems).where(eq(contentItems.id, candidate.targetItemId)).for("update");
+      const preview = await previewSavKnowledgeReview(candidate.id, actorEmail, input.document, tx);
+      if (preview.snapshot !== input.workspaceSnapshot) throw new Error("KNOWLEDGE_REVIEW_STALE");
+    }
     if (candidate.status === "approved" && input.decision === "approve") return candidate;
     if (!["pending", "needs_completion", "needs_recording", "not_applicable"].includes(candidate.status)) throw new Error("KNOWLEDGE_CANDIDATE_NOT_REVIEWABLE");
     if (input.decision === "reject") {
+      await finishWorkspaceLearningRejection(candidate, actorEmail, tx);
       const [updated] = await tx.update(knowledgeProjectionCandidates).set({ status: "rejected", reviewedBy: actorEmail, reviewedAt: new Date() }).where(eq(knowledgeProjectionCandidates.id, candidate.id)).returning();
       await tx.insert(auditLogs).values({ actorEmail, action: "knowledge_candidate_rejected", entityType: "knowledge_candidate", entityId: candidate.id, technicalMetadata: { revisionId: candidate.revisionId, sourceId: candidate.sourceId, reason: input.reason } });
       return updated;
@@ -30,6 +47,11 @@ export async function reviewKnowledgeCandidate(candidateId: string, input: { exp
     const [originalRevision] = await tx.select().from(knowledgeFamilyRevisions).where(and(eq(knowledgeFamilyRevisions.id, candidate.revisionId), eq(knowledgeFamilyRevisions.familyId, candidate.familyId)));
     const [source] = await tx.select().from(knowledgeFamilySources).where(eq(knowledgeFamilySources.id, candidate.sourceId));
     if (!originalRevision || !source) throw new Error("KNOWLEDGE_PROVENANCE_REQUIRED");
+    if (source.evidence.importKind === "sav_workspace") {
+      if (!input.workspaceSnapshot) throw new Error("KNOWLEDGE_COMPARISON_REVIEW_REQUIRED");
+      await assertWorkspaceReview(candidate, canonicalKnowledgeSchema.parse(input.document ?? originalRevision.document), tx);
+    }
+    if (candidate.targetItemId) await tx.select().from(contentItems).where(eq(contentItems.id, candidate.targetItemId)).for("update");
     const catalog = source.evidence.importKind === "onboarding_catalog";
     let comparisonReview;
     let targetItemId = candidate.targetItemId;
@@ -78,7 +100,7 @@ export async function reviewKnowledgeCandidate(candidateId: string, input: { exp
     const proposed = parseContentInput({ ...original, ...(catalog ? { title: source.evidence.sourceTitle } : comparisonReview ? { title: document.objective } : {}), summary: document.objective, bodyMarkdown: savProjectionBody(document), metadata: {
       ...original.metadata, semanticSteps: document.steps, prerequisites: document.prerequisites, expectedResult: document.expectedResult, troubleshooting: document.escalation,
       sourceMetadata: { ...original.metadata.sourceMetadata, canonicalRevisionId: revision.id, canonicalObjective: document.objective, approvedCandidateId: candidate.id, ...(comparisonReview ? { comparisonReview } : {}) },
-      resolution: { symptoms: document.supportContext?.symptoms ?? [document.objective], steps: document.steps.map((step) => step.instruction), exceptions: document.exceptions, escalation: document.escalation, productVersion: document.productVersion, ...(document.validUntil ? { validUntil: document.validUntil } : {}), supersedes: [], conflictsWith: [] },
+      resolution: { ...("resolution" in original.metadata ? original.metadata.resolution : {}), ...(document.supportContext?.responseTemplate ? { responseTemplate: document.supportContext.responseTemplate } : {}), symptoms: document.supportContext?.symptoms ?? [document.objective], steps: document.steps.map((step) => step.instruction), exceptions: document.exceptions, escalation: document.escalation, productVersion: document.productVersion, ...(document.validUntil ? { validUntil: document.validUntil } : {}), supersedes: [], conflictsWith: [] },
     } });
     if (catalog && proposed.bodyMarkdown.length > 12_000) throw new Error("ONBOARDING_PROCEDURE_TOO_LONG");
     if (!catalog && comparisonReview && proposed.bodyMarkdown.length > 12_000) throw new Error("HUBSPOT_PROCEDURE_TOO_LONG");
@@ -101,6 +123,7 @@ export async function reviewKnowledgeCandidate(candidateId: string, input: { exp
     await tx.insert(reviewEvents).values({ itemId: item.id, versionId: version.id, action: "submitted", actorEmail, comment: input.reason });
     const diff = { before, after: proposed.bodyMarkdown };
     const [updated] = await tx.update(knowledgeProjectionCandidates).set({ status: "approved", targetItemId: item.id, baseVersionId, materializedVersionId: version.id, proposedInput: proposed, diff, reviewedBy: actorEmail, reviewedAt: new Date() }).where(eq(knowledgeProjectionCandidates.id, candidate.id)).returning();
+    await finishWorkspaceLearningReview(candidate, item.id, version.id, actorEmail, tx);
     await tx.insert(auditLogs).values({ actorEmail, action: "knowledge_candidate_approved", entityType: "knowledge_candidate", entityId: candidate.id, technicalMetadata: { sourceId: source.id, sourceVersionId: source.sourceVersionId, originalRevisionId: originalRevision.id, approvedRevisionId: revision.id, versionId: version.id, diff: JSON.stringify(diff), canonicalBefore: JSON.stringify(originalRevision.document), canonicalAfter: JSON.stringify(document), reason: input.reason } });
     return updated;
   });

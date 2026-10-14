@@ -881,6 +881,8 @@ export const savKnowledgeProposalDrafts = pgTable("sav_knowledge_proposal_drafts
   id: uuid("id").defaultRandom().primaryKey(),
   revision: integer("revision").notNull().default(1),
   mode: text("mode").notNull(),
+  familyId: uuid("family_id").references(() => knowledgeFamilies.id, { onDelete: "restrict" }),
+  sourceCandidateId: uuid("source_candidate_id").references(() => knowledgeProjectionCandidates.id, { onDelete: "restrict" }),
   targetItemId: uuid("target_item_id").references(() => contentItems.id, { onDelete: "restrict" }),
   baseVersionId: uuid("base_version_id").references(() => contentVersions.id, { onDelete: "restrict" }),
   activeVersionId: uuid("active_version_id").references(() => contentVersions.id, { onDelete: "restrict" }),
