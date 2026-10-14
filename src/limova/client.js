@@ -5,6 +5,9 @@ import { LIMOVA_API_URL } from './environment.js';
 export { LIMOVA_APP_URL, LIMOVA_API_URL } from './environment.js';
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
+const requestFailureCode = status => status === 429 ? 'LIMOVA_RATE_LIMITED'
+  : status >= 500 ? 'LIMOVA_HTTP_5XX' : 'LIMOVA_REQUEST_FAILED';
+
 export class LimovaClientError extends Error {
   constructor(code, message, status = 0) {
     super(message);
@@ -73,7 +76,7 @@ export class LimovaDeepAgentClient {
       }).then(async response => {
         await response.body?.cancel();
         if (!response.ok) throw new LimovaClientError(
-          response.status === 401 || response.status === 403 ? 'LIMOVA_LOGIN_REQUIRED' : 'LIMOVA_REQUEST_FAILED',
+          response.status === 401 || response.status === 403 ? 'LIMOVA_LOGIN_REQUIRED' : requestFailureCode(response.status),
           response.status === 401 || response.status === 403 ? 'Connecte-toi dans Limova pour utiliser l’extension.' : 'Limova est temporairement indisponible.', response.status);
         this.#refreshGeneration += 1;
       }).finally(() => { this.#refreshPromise = null; });
@@ -103,7 +106,7 @@ export class LimovaDeepAgentClient {
     if (!response.ok) {
       await response.body?.cancel();
       const code = response.status === 401 ? 'LIMOVA_LOGIN_REQUIRED'
-        : response.status === 403 ? 'LIMOVA_ACCESS_DENIED' : 'LIMOVA_REQUEST_FAILED';
+        : response.status === 403 ? 'LIMOVA_ACCESS_DENIED' : requestFailureCode(response.status);
       throw new LimovaClientError(code, response.status === 401
         ? 'Connecte-toi dans Limova pour utiliser l’extension.' : 'La requête Limova n’a pas abouti.', response.status);
     }

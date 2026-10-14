@@ -6,7 +6,7 @@
 import { createBrowserDriver } from './limova/browser-driver.js';
 import Logger from './utils/logger.js';
 import { createLimovaBackground, LIMOVA_MESSAGE_TYPES } from './limova/background.js';
-import { LimovaDeepAgentClient, LIMOVA_APP_URL, LIMOVA_API_URL } from './limova/client.js';
+import { LimovaDeepAgentClient, LimovaClientError, LIMOVA_APP_URL, LIMOVA_API_URL } from './limova/client.js';
 import { createLimovaSessionFetch, openLimovaApp } from './limova/session-fetch.js';
 import { buildSystemPrompt } from './prompts/system-prompt.js';
 import { searchKB } from './knowledge-base/kb-search.js';
@@ -479,8 +479,9 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
     return false;
   }
   handleMessage(request, sender).then(sendResponse).catch(err => {
-    Logger.error('background', 'Message handler error', err);
-    sendResponse({ error: err.message });
+    const code = LIMOVA_MESSAGE_TYPES.has(request.type) && err instanceof LimovaClientError ? err.code : undefined;
+    Logger.error('background', 'Message handler error', err, code);
+    sendResponse({ error: err.message, ...(code ? { code } : {}) });
   });
   return true;
 });

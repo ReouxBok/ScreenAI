@@ -45,6 +45,14 @@ export function createLimovaPanel({ document, request, render, onBusy, onContext
 
   async function call(type, fields = {}) {
     const response = await request({ type, ...fields });
+    if (response?.error && ['LIMOVA_HTTP_5XX', 'LIMOVA_RATE_LIMITED'].includes(response.code)) {
+      const message = response.code === 'LIMOVA_RATE_LIMITED'
+        ? translate('limovaRateLimited', 'Limova reçoit trop de demandes. Réessaie plus tard.')
+        : translate('limovaServiceUnavailable', 'Limova est temporairement indisponible.');
+      const advice = ['LIMOVA_SEND_MESSAGE', 'LIMOVA_RESUME_BROWSER'].includes(type)
+        ? ` ${translate('limovaCheckConversation', 'Vérifie l’historique et le résultat des actions avant de renvoyer une demande.')}` : '';
+      throw new Error(`${message} (${response.code})${advice}`);
+    }
     if (!response || response.error) throw new Error(response?.error || translate("limovaServiceUnavailable", 'Limova est temporairement indisponible.'));
     return response;
   }

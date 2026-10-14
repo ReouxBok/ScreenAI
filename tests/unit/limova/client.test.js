@@ -445,3 +445,10 @@ it('refreshes an expired CSV download once without changing its route or scope',
   expect(downloads).toBe(2);
   expect(fetch.mock.calls.filter(([url]) => url.endsWith('/auth/refresh-token'))).toHaveLength(1);
 });
+
+it.each([[429, 'LIMOVA_RATE_LIMITED'], [500, 'LIMOVA_HTTP_5XX'], [503, 'LIMOVA_HTTP_5XX']])('classifies HTTP %s without exposing the response body or retrying', async (status, code) => {
+  const fetch = vi.fn().mockResolvedValue(new Response('PRIVATE_SERVER_ERROR', { status }));
+  const client = new LimovaDeepAgentClient(fetch);
+  await expect(client.bootstrap()).rejects.toMatchObject({ code, status, message: 'La requête Limova n’a pas abouti.' });
+  expect(fetch).toHaveBeenCalledTimes(1);
+});
