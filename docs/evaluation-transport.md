@@ -53,3 +53,13 @@ Le calcul Studio exige désormais les preuves minimales indépendamment du seuil
 La relecture de l’ancien `verify_expected_result` a confirmé qu’il renvoyait `ok` après une simple relecture de page, avec l’attendu dans un message. Ce comportement ne constitue pas une comparaison avec les critères métier. Le parcours natif ne reprend pas cette équivalence : la vérification explicite reste à implémenter avant de qualifier les tests d’action.
 
 Validation de cette correction : 19 tests Studio ciblés passent, ainsi que TypeScript et ESLint. Pas de migration de données ni de déploiement.
+
+## Vérificateur des critères côté Studio
+
+La route existante `POST /api/evaluations/runs/events` accepte maintenant `kind: native_verification` avec une observation bornée (texte, origine HTTPS, chemin sans query/hash, version de contexte et date). Le service charge les critères du scénario depuis le grant ; le client ne choisit pas les critères à valider. Seuls les tests `live_action` en cours hors SAV sont admis. Le grant, le scénario et la version sont relus après l’appel modèle.
+
+Un appel Gemini sans outils compare tous les critères au texte observé. Il utilise la configuration de clé du scope extension déjà disponible dans Studio, jamais la clé SAV. Le modèle reprend la référence `gemini-3.6-flash` présente dans le proxy existant ; sa disponibilité et sa qualité sur le déploiement cible restent à qualifier. Aucune identité d’agent n’est créée. Les observations ont moins de 60 secondes, les pages attendues sont contrôlées lorsqu’elles sont définies, et chaque critère positif doit citer un extrait exact non vide du texte observé. Une sortie tronquée, une erreur fournisseur ou une preuve invalide ne produit pas de vérification positive.
+
+Le résultat reste un jugement de modèle, pas une preuve formelle de l’état du backend. Les extraits exacts réduisent les affirmations sans source mais ne garantissent pas une interprétation correcte. Il faut tester notamment les pages contradictoires, les erreurs métier et les instructions hostiles dans la page avant activation. Le service n’enregistre que le statut et la version de contexte, sans texte de page ni citations.
+
+Le raccordement de l’observation depuis l’extension reste à faire. Les 39 tests ciblés utilisent un fournisseur simulé ; TypeScript et ESLint passent. Aucun appel réel au fournisseur ni déploiement effectué.

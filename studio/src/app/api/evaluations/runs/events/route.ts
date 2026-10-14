@@ -1,3 +1,4 @@
+import { verifyStudioEvaluation } from "@/lib/verify-studio-evaluation";
 import { NextResponse } from "next/server";
 import { appendEvaluationEvent } from "@/lib/evaluations";
 
@@ -9,7 +10,11 @@ const cors = (request: Request): Record<string, string> => {
 export async function OPTIONS(request: Request) { return new Response(null, { status: 204, headers: cors(request) }); }
 export async function POST(request: Request) {
   const token = request.headers.get("authorization")?.replace(/^Bearer\s+/i, "").trim() ?? "";
-  const event = await appendEvaluationEvent(token, await request.json().catch(() => ({})));
+  const input: unknown = await request.json().catch(() => null);
+  if (!input || typeof input !== "object" || Array.isArray(input)) return NextResponse.json({ error: "Événement invalide." }, { status: 400, headers: cors(request) });
+  const event = "kind" in input && input.kind === "native_verification"
+    ? await verifyStudioEvaluation(token, "observation" in input ? input.observation : undefined, request.signal)
+    : await appendEvaluationEvent(token, Object.fromEntries(Object.entries(input)));
   if (!event) return NextResponse.json({ error: "Test indisponible." }, { status: 404, headers: cors(request) });
   return NextResponse.json({ ok: true }, { headers: { ...cors(request), "Cache-Control": "no-store" } });
 }
