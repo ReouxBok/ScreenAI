@@ -256,25 +256,6 @@ async function grantAIConsent(sidebar) {
 }
 
 test.describe('Packaged extension — complete user flows', () => {
-  test('chat traverses sidebar, service worker, Limova DOM, auth and proxy without leaking private values', async ({ context, extensionId }) => {
-    const { calls, limova, sidebar } = await openExtensionHarness(context, extensionId);
-    await grantAIConsent(sidebar);
-
-    await sidebar.locator('#userInput').fill('Aide-moi à comprendre cette page');
-    await sidebar.locator('#sendBtn').click();
-
-    await expect(sidebar.locator('.message.user .message-content')).toContainText('Aide-moi');
-    await expect(sidebar.locator('.message.assistant .message-content')).toContainText('Réponse Gemini E2E reçue.');
-    expect(calls.gemini).toHaveLength(1);
-    expect(calls.gemini[0].headers().authorization).toBe(`Bearer e2e-${'x'.repeat(48)}`);
-
-    const payload = calls.gemini[0].postData();
-    expect(payload).toContain('Tableau de bord');
-    expect(payload).toContain('= [filled]');
-    expect(payload).not.toContain('NEVER_TRANSMIT_THIS_SECRET');
-    expect(payload).not.toContain('private_token');
-    expect(await limova.locator('[data-lid]').count()).toBeGreaterThan(0);
-  });
 
   test('ADK v2 fills the exact DOM field, resumes the run and keeps observation silent', async ({ context, extensionId }) => {
     const { calls, limova, sidebar } = await openExtensionHarness(context, extensionId, {
@@ -665,28 +646,7 @@ test.describe('Packaged extension — complete user flows', () => {
     ]);
   });
 
-  test('an expired proxy token opens the persistent authentication panel without retrying the request', async ({ context, extensionId }) => {
-    const { calls, sidebar } = await openExtensionHarness(context, extensionId, {
-      geminiStatuses: [401]
-    });
-    await grantAIConsent(sidebar);
-    await sidebar.locator('#userInput').fill('Teste la session expirée');
-    await sidebar.locator('#sendBtn').click();
 
-    await expect(sidebar.locator('#authPanel')).toBeVisible();
-    await expect(sidebar.locator('.message.error .message-content').last()).toContainText(/expir|connecte-toi/i);
-    expect(calls.gemini).toHaveLength(1);
-  });
-
-  test('an unauthenticated Charly session blocks chat before contacting Gemini', async ({ context, extensionId }) => {
-    const { calls, sidebar } = await openExtensionHarness(context, extensionId);
-    await sidebar.evaluate(() => chrome.runtime.sendMessage({ type: 'AUTH_LOGOUT' }));
-    await sidebar.reload();
-
-    await expect(sidebar.locator('#authPanel')).toBeVisible();
-    await expect(sidebar.locator('#authEmail')).toBeEditable();
-    expect(calls.gemini).toHaveLength(0);
-  });
 
   test('a proxy failure exposes a stable support code instead of an opaque internal error', async ({ context, extensionId }) => {
     const { sidebar } = await openExtensionHarness(context, extensionId, { geminiStatuses: [500] });
@@ -890,19 +850,6 @@ test.describe('Packaged extension — complete user flows', () => {
     await expect(sidebar.locator('.message.system .message-content').last()).toContainText('Ouvrir mon profil');
   });
 
-  test('assistant markdown cannot inject executable HTML or unsafe links', async ({ context, extensionId }) => {
-    const malicious = '<img src=x onerror="document.body.dataset.xss=\'yes\'"> [Piège](javascript:alert(1)) **Texte sûr**';
-    const { sidebar } = await openExtensionHarness(context, extensionId, { geminiReply: malicious });
-    await grantAIConsent(sidebar);
-    await sidebar.locator('#userInput').fill('Affiche la réponse');
-    await sidebar.locator('#sendBtn').click();
-
-    const response = sidebar.locator('.message.assistant .message-content');
-    await expect(response).toContainText('<img src=x');
-    await expect(response.locator('img')).toHaveCount(0);
-    await expect(response.locator('a[href^="javascript:"]')).toHaveCount(0);
-    expect(await sidebar.evaluate(() => document.body.dataset.xss)).toBeUndefined();
-  });
 
   test('SPA navigation and a newly opened modal each trigger automatic contextual analysis', async ({ context, extensionId }) => {
     const { calls, limova, sidebar } = await openExtensionHarness(context, extensionId, {

@@ -1,11 +1,14 @@
 import { test, expect } from './fixtures.js';
+import { extensionEnvironment } from '../../scripts/extension-environments.mjs';
+
+const environment = extensionEnvironment(process.env.LIMOVA_E2E_ENV ?? 'production');
 
 test.describe('Extension — loading and bootstrap', () => {
   test('the service worker registers and exposes a chrome-extension:// URL', async ({ serviceWorker, extensionId }) => {
     expect(serviceWorker).toBeTruthy();
     // The packaged public key keeps local builds on the same origin accepted
     // by the production proxy and assigned by the Chrome Web Store.
-    expect(extensionId).toBe('fpkgfhhomlijmhbgcpbpjnfafdedfccj');
+    expect(extensionId).toBe(environment.name === 'staging' ? 'nfdhginlmmnfaglcbhoiecpjpaopbjjg' : 'fpkgfhhomlijmhbgcpbpjnfafdedfccj');
     expect(serviceWorker.url()).toContain(extensionId);
     expect(serviceWorker.url()).toMatch(/background\.js$/);
   });
@@ -29,20 +32,26 @@ test.describe('Extension — loading and bootstrap', () => {
     expect(manifest.permissions).not.toContain('cookies');
   });
 
-  test('host permissions are limited to the Limova app and proxy', async ({ serviceWorker }) => {
+  test('host permissions match the target environment and optional sites stay ungranted', async ({ serviceWorker }) => {
     const manifest = await serviceWorker.evaluate(() => chrome.runtime.getManifest());
-    expect(manifest.host_permissions.some(h => h.includes('new.limova.ai'))).toBe(true);
-    expect(manifest.host_permissions).not.toContain('https://api.new.limova.ai/*');
-    expect(manifest.host_permissions.some(h => h.includes('limova-proxy'))).toBe(true);
-    expect(manifest.host_permissions).toContain('https://vercel.com/*');
-    expect(manifest.content_security_policy.extension_pages).toContain('https://vercel.com');
+    const origins = [environment.apiOrigin, environment.appOrigin];
+    if (environment.name === 'production') origins.push('https://studio.limova.ai', 'https://vercel.com',
+      'https://pihloilpc5svuzjv.private.blob.vercel-storage.com', 'https://limova-proxy-479c7fb78ccf.herokuapp.com');
+    expect(manifest.host_permissions).toEqual(origins.map(origin => `${origin}/*`));
+    expect(manifest.optional_host_permissions).toEqual(['https://*/*']);
+    expect(await serviceWorker.evaluate(() => chrome.permissions.contains({ origins: ['https://*/*'] }))).toBe(false);
+    expect(manifest.content_security_policy.extension_pages).toContain(`connect-src ${environment.apiOrigin}`);
+    if (environment.name === 'staging') {
+      expect(manifest.content_security_policy.extension_pages).not.toContain('https://api.new.limova.ai');
+      expect(manifest.content_security_policy.extension_pages).not.toContain('https://studio.limova.ai');
+    }
   });
 
   test('content script matches are configured for Limova only', async ({ serviceWorker }) => {
     const manifest = await serviceWorker.evaluate(() => chrome.runtime.getManifest());
     expect(manifest.content_scripts.length).toBeGreaterThan(0);
     for (const cs of manifest.content_scripts) {
-      expect(cs.matches).toEqual(['https://new.limova.ai/*']);
+      expect(cs.matches).toEqual([`${environment.appOrigin}/*`]);
     }
   });
 });
