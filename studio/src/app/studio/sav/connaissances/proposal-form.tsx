@@ -20,7 +20,7 @@ export function KnowledgeProposalForm({ initial, learningCandidateId }: { initia
   const [draft, setDraft] = useState<SavKnowledgeDraft | null>(initialDraft ?? null);
   const [mode, setMode] = useState<"new" | "improve">(initialDraft?.mode ?? (initial?.row.itemId ? "improve" : "new"));
   const [targetItemId, setTargetItemId] = useState(initialDraft?.targetItemId ?? initial?.row.itemId ?? "");
-  const [targetTitle, setTargetTitle] = useState(initial?.row.title ?? "");
+  const [targetTitle, setTargetTitle] = useState(initial?.activeVersion?.title ?? initial?.publishedVersion?.title ?? initial?.row.title ?? "");
   const [title, setTitle] = useState(initialDraft?.title ?? initial?.row.title ?? "");
   const [document, setDocument] = useState(initialDraft?.document ?? initial?.document ?? emptyKnowledgeDocument);
   const [sources, setSources] = useState<SavKnowledgeSource[]>(initialDraft?.sources ?? (learningCandidateId ? initial?.sources : undefined) ?? [{ label: "", ref: "" }]);
@@ -41,8 +41,9 @@ export function KnowledgeProposalForm({ initial, learningCandidateId }: { initia
     locked.current = true;
     startTransition(async () => { setError(""); try { await operation(); } catch { setError("L’action n’a pas abouti. Vos saisies sont conservées ; réessayez."); } finally { locked.current = false; } });
   }
-  function useSavedDraft(saved: SavKnowledgeDraft) {
+  function useSavedDraft(saved: SavKnowledgeDraft, activeTitle?: string) {
     setDraft(saved); setMode(saved.mode); setTargetItemId(saved.targetItemId ?? "");
+    if (activeTitle) setTargetTitle(activeTitle); else if (saved.targetItemId !== targetItemId) setTargetTitle("Consultez la connaissance liée avant confirmation");
     setTitle(saved.title); setDocument(saved.document); setSources(saved.sources); setReason(saved.reason);
   }
   async function save(showPreview: boolean) {
@@ -54,7 +55,7 @@ export function KnowledgeProposalForm({ initial, learningCandidateId }: { initia
     if (showPreview) {
       const response = await previewKnowledgeProposalAction(result.draft.id);
       setPreview(response.preview); setError(response.error ?? ""); setAcknowledged(false);
-      if (response.preview) { useSavedDraft(response.preview.draft); requestAnimationFrame(() => previewRef.current?.focus()); }
+      if (response.preview) { useSavedDraft(response.preview.draft, response.preview.activeVersion?.title); requestAnimationFrame(() => previewRef.current?.focus()); }
     }
   }
   return <div className={styles.workspace}>
@@ -71,6 +72,7 @@ export function KnowledgeProposalForm({ initial, learningCandidateId }: { initia
         {matches.map(row => <div className={styles.choice} key={row.id}><div><Link href={knowledgeDetailUrl(row)} target="_blank" rel="noreferrer">{row.title}</Link><p className={styles.subtle}>{row.summary}</p>
           <button type="button" className="secondary" onClick={() => run(async () => { if (!row.itemId) return; const result = await loadKnowledgeTargetAction(row.itemId); if (!result.detail) { setError(result.error ?? "Cette connaissance n’est plus accessible."); return; } setMode("improve"); setTargetItemId(row.itemId); setTargetTitle(row.title); setTitle(row.title); if (result.detail.document) setDocument(result.detail.document); change(); })}>Améliorer cette connaissance</button></div></div>)}
         {mode === "improve" && <p className={targetItemId ? styles.subtle : styles.alert}>{targetItemId ? `Connaissance ciblée : ${targetTitle}. La version active restera utilisée jusqu’à une activation distincte.` : "Choisissez la connaissance à améliorer dans les résultats."}</p>}
+        {mode === "improve" && targetItemId && <Link href={`/studio/sav/connaissances/${targetItemId}?kind=item`} target="_blank" rel="noreferrer">Consulter la connaissance ciblée</Link>}
       </fieldset>
       <fieldset disabled={busy} className={styles.panel}><legend>Proposition</legend>
         <label>Titre de la connaissance<input value={title} maxLength={200} onChange={event => { setTitle(event.target.value); change(); }}/></label>

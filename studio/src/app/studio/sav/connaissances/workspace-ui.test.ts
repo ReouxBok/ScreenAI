@@ -64,6 +64,11 @@ describe("SAV-55 knowledge screens", () => {
     expect(html).toContain("Nouvelle connaissance"); expect(html).toContain("Améliorer une connaissance existante"); expect(html).toContain("Enregistrer le brouillon"); expect(html).toContain("Sources et preuves");
     expect(html).not.toContain("Confirmer et soumettre à validation"); expect(html).not.toContain("JSON");
   });
+  it("names the active target independently from the proposed draft title", () => {
+    const html = renderToStaticMarkup(createElement(KnowledgeProposalForm, { initial: { ...detail, row: { ...row, title: "Nouveau titre proposé" }, activeVersion: { ...detail.activeVersion!, title: "Procédure active ciblée" } } }));
+    expect(html).toContain("Connaissance ciblée : Procédure active ciblée.");
+    expect(html).not.toContain("Connaissance ciblée : Nouveau titre proposé.");
+  });
   it("previews the persisted draft title, procedure and sources returned by the server", () => {
     const html = renderToStaticMarkup(createElement(KnowledgeProposalPreviewDocument, { draft: { title: "Titre du tutoriel conservé", document: { ...document, objective: "Procédure A enregistrée dans un autre onglet" }, sources: [{ ref: "studio:preuve-A", label: "Preuve enregistrée A" }] } }));
     expect(html).toContain("Titre du tutoriel conservé"); expect(html).toContain("Procédure A enregistrée dans un autre onglet"); expect(html).toContain("Preuve enregistrée A"); expect(html).toContain("studio:preuve-A");
