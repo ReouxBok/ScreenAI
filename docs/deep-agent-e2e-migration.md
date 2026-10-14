@@ -220,3 +220,11 @@ La même recette accepte `STUDIO_MCP_API_CHECKOUT`, chemin du checkout API conte
 Trois tests API sont exigés par le rapport JSON du sous-processus, sans échec ni test ignoré : lecture de la trame et recherche publiées ; révocation du flag après construction des outils ; retour indisponible pour un mauvais token. Le fournisseur de flag reste simulé. Les traces distantes sont désactivées dans ce processus de qualification.
 
 Depuis `studio`, fournir les variables `STUDIO_MCP_API_CHECKOUT` et `STUDIO_MCP_TEST_DATABASE_URL` puis exécuter `npm run test:mcp:postgres`. La base doit être locale, isolée et nommée `extension_mcp_test`. Sans checkout API, les quatre scénarios Studio habituels restent exécutés seuls. La recette combinée prouve le contrat du service API vers Studio ; elle ne démarre pas le serveur NestJS complet, le modèle, l’authentification utilisateur ni LangSmith. Ces validations restent ouvertes.
+
+## Surface active des modales natives
+
+Le driver détecte les dialogues visibles (`dialog[open]`, rôles dialog/alertdialog et `aria-modal`). Il privilégie les dialogues au premier plan au point central visible et, pour les dialogues imbriqués, le dernier candidat de cette surface. La lecture expose `surface: modal` et limite texte/références à ce dialogue. Les contrôles privés restent filtrés. Une référence de page ne peut plus agir après ouverture d’un dialogue ; une référence de dialogue est refusée après fermeture ou changement de surface, avant tout événement pointeur.
+
+Le scroll utilise le premier conteneur vertical défilable visible du dialogue, ou indique qu’aucun déplacement n’est possible. Il ne fait pas défiler l’arrière-plan. Les tests Chromium couvrent un bouton d’arrière-plan encore découvert, la lecture/clic dans la modale, des dialogues imbriqués, leur fermeture et le défilement isolé.
+
+Les deux premières recettes échouaient avant correction. Cette couche rend les observations et actions explicites sensibles aux modales ; elle ne déclenche pas encore automatiquement un nouveau tour à leur ouverture. Le scénario legacy d’analyse automatique reste donc présent. Les overlays dépourvus de sémantique de dialogue ne sont pas tous identifiés par cette détection ; le contrôle de recouvrement continue à protéger les clics.

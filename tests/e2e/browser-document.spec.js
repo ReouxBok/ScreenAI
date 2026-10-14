@@ -60,6 +60,69 @@ test('reads visible text without input values or explicitly private content', as
   expect(observation).not.toContain('PRIVATE_CONTENT');
 });
 
+test('reads the foreground modal and rejects background references even when uncovered', async ({ context, extensionId }) => {
+  const { site, controller } = await setup(context, extensionId);
+  await site.evaluate(() => {
+    const modal = document.createElement('div');
+    modal.id = 'modal'; modal.setAttribute('role', 'dialog'); modal.setAttribute('aria-modal', 'true');
+    modal.style.cssText = 'position:fixed;left:200px;top:180px;width:280px;height:220px;background:white;z-index:20';
+    modal.innerHTML = '<h2>Connexion Gmail</h2><button id="confirm">Confirmer</button><input type="password" value="PRIVATE_MODAL_PASSWORD"><div data-private>PRIVATE_MODAL_CONTENT</div>';
+    window.confirmed = 0;
+    modal.querySelector('button').onclick = () => window.confirmed++;
+    document.body.append(modal);
+  });
+  const stale = await controller.evaluate(() => invokeDocument({ ...binding, operation: 'click', elementId: 1, nextContextVersion: 3 }));
+  expect(stale.status).toBe('rejected');
+  expect(await site.evaluate(() => saved)).toBe(0);
+  const result = await controller.evaluate(async () => {
+    snapshot = await invokeDocument({ ...binding, operation: 'read_page', nextContextVersion: 4 });
+    binding = snapshot.binding;
+    const observation = JSON.parse(snapshot.observation);
+    return { observation, click: await invokeDocument({ ...binding, operation: 'click',
+      elementId: observation.elements.find(item => item.label === 'Confirmer').elementId, nextContextVersion: 5 }) };
+  });
+  expect(result.observation.surface).toBe('modal');
+  expect(result.observation.text).toContain('Connexion Gmail');
+  expect(JSON.stringify(result.observation)).not.toMatch(/Account settings|Save|Delete|PRIVATE_/);
+  expect(result.click.status).toBe('completed');
+  expect(await site.evaluate(() => confirmed)).toBe(1);
+});
+
+test('refreshes modal scope after nesting and closing without reusing old controls', async ({ context, extensionId }) => {
+  const { site, controller } = await setup(context, extensionId);
+  await site.evaluate(() => {
+    document.body.insertAdjacentHTML('beforeend', '<div id="outer" role="dialog" style="position:fixed;inset:100px;background:white;z-index:10"><button>Outer control</button><div id="inner" role="dialog" style="position:fixed;inset:150px;background:white;z-index:11"><button>Inner control</button></div></div>');
+  });
+  const read = version => controller.evaluate(async version => {
+    snapshot = await invokeDocument({ ...binding, operation: 'read_page', nextContextVersion: version });
+    binding = snapshot.binding;
+    return JSON.parse(snapshot.observation);
+  }, version);
+  expect((await read(3)).elements.map(item => item.label)).toEqual(['Inner control']);
+  await site.evaluate(() => document.getElementById('inner').remove());
+  expect((await controller.evaluate(() => invokeDocument({ ...binding, operation: 'click', elementId: 1, nextContextVersion: 4 }))).status).toBe('rejected');
+  expect((await read(5)).elements.map(item => item.label)).toEqual(['Outer control']);
+  await site.evaluate(() => document.getElementById('outer').hidden = true);
+  expect((await controller.evaluate(() => invokeDocument({ ...binding, operation: 'click', elementId: 1, nextContextVersion: 6 }))).status).toBe('rejected');
+  const page = await read(7);
+  expect(page.surface).toBe('page');
+  expect(page.text).toContain('Account settings');
+  expect(page.text).not.toContain('Outer control');
+});
+
+test('scrolls the active modal without scrolling the background page', async ({ context, extensionId }) => {
+  const { site, controller } = await setup(context, extensionId);
+  await site.evaluate(() => {
+    document.body.style.height = '3000px';
+    document.body.insertAdjacentHTML('beforeend', '<div id="modal" role="dialog" style="position:fixed;left:150px;top:100px;width:280px;height:180px;overflow:auto;background:white;z-index:20"><div style="height:800px">Modal steps</div></div>');
+  });
+  const result = await controller.evaluate(() => invokeDocument({ ...binding, operation: 'scroll', direction: 'down', nextContextVersion: 3 }));
+  expect(result.status).toBe('completed');
+  expect(JSON.parse(result.observation)).toMatchObject({ surface: 'modal', moved: true, atStart: false, atEnd: false });
+  expect(await site.evaluate(() => scrollY)).toBe(0);
+  expect(await site.locator('#modal').evaluate(element => element.scrollTop)).toBeGreaterThan(0);
+});
+
 test('types through a private reference and advances the document version', async ({ context, extensionId }) => {
   const { site, controller } = await setup(context, extensionId);
   const result = await controller.evaluate(() => {
