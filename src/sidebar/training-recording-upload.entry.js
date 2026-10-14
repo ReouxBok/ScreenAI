@@ -2,45 +2,54 @@ import { createMultipartUploader, upload } from '@vercel/blob/client';
 
 const STUDIO_URL = 'https://studio.limova.ai';
 
+const recordingUploads = new WeakMap();
+
 globalThis.LimovaTrainingRecordingUpload = async function uploadTrainingRecording({
-  blob,
-  token,
-  sessionId,
-  durationMs,
-  onProgress
+  blob, token, sessionId, durationMs, onProgress
 }) {
-  const extension = blob.type === 'video/mp4' ? 'mp4' : 'webm';
-  const pathname = `training-recordings/${sessionId}/${crypto.randomUUID()}.${extension}`;
-  let result;
-  try {
-    result = await upload(pathname, blob, {
-      access: 'private',
-      contentType: blob.type || 'video/webm',
-      handleUploadUrl: `${STUDIO_URL}/api/training/sessions/recording-upload`,
-      clientPayload: JSON.stringify({ token, sessionId, durationMs }),
-      multipart: blob.size >= 8 * 1024 * 1024,
-      onUploadProgress: progress => onProgress?.(progress)
-    });
-  } catch (cause) {
-    const error = new Error('L’envoi vidéo a échoué. Vérifie ta connexion puis clique sur « Réessayer l’envoi » sans fermer le panneau.');
-    error.code = 'TRAINING_BLOB_UPLOAD_FAILED';
-    error.stage = 'blob_upload';
-    error.cause = cause;
-    throw error;
+  let state = recordingUploads.get(blob);
+  if (!state || state.token !== token || state.sessionId !== sessionId) {
+    state = { token, sessionId, result: undefined, promise: undefined };
+    recordingUploads.set(blob, state);
   }
-  const confirmation = await fetch(`${STUDIO_URL}/api/training/sessions/recording-confirm`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
-    body: JSON.stringify({ sessionId, pathname: result.pathname, durationMs })
-  });
-  if (!confirmation.ok) {
-    const error = new Error('La vidéo a été envoyée, mais le Studio n’a pas pu la vérifier. Clique sur « Réessayer l’envoi ».');
-    error.code = 'TRAINING_RECORDING_CONFIRMATION_FAILED';
-    error.stage = 'studio_confirmation';
-    error.status = confirmation.status;
-    throw error;
+  if (!state.promise) {
+    state.promise = (async () => {
+      if (!state.result) {
+        const extension = blob.type === 'video/mp4' ? 'mp4' : 'webm';
+        const pathname = `training-recordings/${sessionId}/${crypto.randomUUID()}.${extension}`;
+        try {
+          state.result = await upload(pathname, blob, {
+            access: 'private',
+            contentType: blob.type || 'video/webm',
+            handleUploadUrl: `${STUDIO_URL}/api/training/sessions/recording-upload`,
+            clientPayload: JSON.stringify({ token, sessionId, durationMs }),
+            multipart: blob.size >= 8 * 1024 * 1024,
+            onUploadProgress: progress => onProgress?.(progress)
+          });
+        } catch (cause) {
+          const error = new Error('L’envoi vidéo a échoué. Vérifie ta connexion puis clique sur « Réessayer l’envoi » sans fermer le panneau.');
+          error.code = 'TRAINING_BLOB_UPLOAD_FAILED';
+          error.stage = 'blob_upload';
+          error.cause = cause;
+          throw error;
+        }
+      }
+      const confirmation = await fetch(`${STUDIO_URL}/api/training/sessions/recording-confirm`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+        body: JSON.stringify({ sessionId, pathname: state.result.pathname, durationMs })
+      });
+      if (!confirmation.ok) {
+        const error = new Error('La vidéo a été envoyée, mais le Studio n’a pas pu la vérifier. Clique sur « Réessayer l’envoi ».');
+        error.code = 'TRAINING_RECORDING_CONFIRMATION_FAILED';
+        error.stage = 'studio_confirmation';
+        error.status = confirmation.status;
+        throw error;
+      }
+      return state.result;
+    })().catch(error => { state.promise = undefined; throw error; });
   }
-  return result;
+  return state.promise;
 };
 
 globalThis.LimovaTrainingMultipartUpload = async function createTrainingMultipartUpload({ token, sessionId, contentType = 'video/webm' }) {
@@ -55,6 +64,8 @@ globalThis.LimovaTrainingMultipartUpload = async function createTrainingMultipar
   if (!tokenResponse.ok || !tokenData.clientToken) throw Object.assign(new Error('La synchronisation vidéo n’a pas pu démarrer.'), { code: 'TRAINING_MULTIPART_TOKEN_FAILED' });
   const uploader = await createMultipartUploader(pathname, { access: 'private', token: tokenData.clientToken, contentType });
   const parts = [];
+  let completedBlob;
+  let completionPromise;
   return {
     pathname,
     async uploadPart(partNumber, blob) {
@@ -72,14 +83,19 @@ globalThis.LimovaTrainingMultipartUpload = async function createTrainingMultipar
       throw Object.assign(new Error('Une partie de la vidéo n’a pas pu être synchronisée. Gardez le panneau ouvert et réessayez.'), { code: 'TRAINING_MULTIPART_PART_FAILED', cause: lastError });
     },
     async complete({ durationMs }) {
-      const result = await uploader.complete(parts.sort((a, b) => a.partNumber - b.partNumber));
-      const confirmation = await fetch(`${STUDIO_URL}/api/training/sessions/recording-confirm`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
-        body: JSON.stringify({ sessionId, pathname: result.pathname, durationMs })
-      });
-      if (!confirmation.ok) throw Object.assign(new Error('La vidéo est envoyée mais sa vérification a échoué. Réessayez sans fermer le panneau.'), { code: 'TRAINING_RECORDING_CONFIRMATION_FAILED' });
-      return result;
+      if (!completionPromise) {
+        completionPromise = (async () => {
+          completedBlob ??= await uploader.complete(parts.sort((a, b) => a.partNumber - b.partNumber));
+          const confirmation = await fetch(`${STUDIO_URL}/api/training/sessions/recording-confirm`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+            body: JSON.stringify({ sessionId, pathname: completedBlob.pathname, durationMs })
+          });
+          if (!confirmation.ok) throw Object.assign(new Error('La vidéo est envoyée mais sa vérification a échoué. Réessayez sans fermer le panneau.'), { code: 'TRAINING_RECORDING_CONFIRMATION_FAILED' });
+          return completedBlob;
+        })().catch(error => { completionPromise = undefined; throw error; });
+      }
+      return completionPromise;
     }
   };
 };
