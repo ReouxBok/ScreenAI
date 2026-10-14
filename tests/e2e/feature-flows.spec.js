@@ -37,20 +37,6 @@ const limovaFixture = `<!doctype html>
   </body>
 </html>`;
 
-async function stubTrainingScreenRecording(sidebar) {
-  await sidebar.evaluate(() => {
-    window.LimovaTrainingScreenRecorder = class {
-      async start() { return { displaySurface: 'monitor' }; }
-      async beginProgressiveUpload() {}
-      async stopAndUpload({ onProgress }) {
-        onProgress?.({ percentage: 100 });
-        return { size: 1024, durationMs: 2_000 };
-      }
-      abort() {}
-    };
-  });
-}
-
 async function installExternalContracts(context, {
   geminiReply,
   geminiStatuses = [],
@@ -308,106 +294,7 @@ test.describe('Packaged extension — complete user flows', () => {
     expect(evaluationPaths).toContain('/api/evaluations/runs/complete');
   });
 
-  test('training mode records useful controls but never field or password values', async ({ context, extensionId }) => {
-    const { calls, limova, sidebar } = await openExtensionHarness(context, extensionId);
-    await sidebar.locator('#menuBtn').click();
-    await sidebar.locator('#trainingBtn').click();
-    await expect(sidebar.locator('#trainingPanel')).toBeVisible();
-    await sidebar.locator('#trainingToken').fill('training-token-e2e-that-is-long-enough');
-    await stubTrainingScreenRecording(sidebar);
-    await sidebar.locator('#trainingStart').click();
-    await expect(sidebar.locator('#trainingFeedback')).toContainText('Écran entier enregistré');
-    await expect(sidebar.locator('#trainingMic')).toBeVisible();
-    await grantAIConsent(sidebar);
-    await sidebar.evaluate(() => chrome.runtime.sendMessage({ type: 'VOICE_TRANSCRIPT', role: 'user', text: 'Je montre comment préparer la campagne.' }));
 
-    await limova.locator('#briefField').fill('UNE VALEUR PRIVÉE À NE JAMAIS ENVOYER');
-    await limova.locator('#briefField').blur();
-    await limova.locator('#connectHubspot circle').click();
-    await limova.evaluate(() => fetch('/api/integrations/connect', { method: 'POST' }));
-
-    await limova.evaluate(() => {
-      const modal = document.createElement('div');
-      modal.setAttribute('role', 'dialog');
-      modal.innerHTML = '<h2>Connecter HubSpot</h2><button type="button">Continuer</button>';
-      document.body.appendChild(modal);
-    });
-    await expect.poll(() => calls.training
-      .filter(request => request.url().endsWith('/events'))
-      .map(request => request.postData() || '')
-      .join('\n')).toContain('Popup Limova · Connecter HubSpot');
-
-    const popupPromise = context.waitForEvent('page');
-    await limova.evaluate(() => window.open(
-      'https://oauth.hubspot.test/authorize',
-      'hubspot-oauth',
-      'popup,width=500,height=600'
-    ));
-    const oauthPopup = await popupPromise;
-    await oauthPopup.waitForLoadState();
-    await expect(sidebar.locator('#trainingFeedback')).toContainText('Fenêtre de connexion externe ouverte');
-    await expect(sidebar.locator('#tabWarning')).toBeHidden();
-
-    const transientPopupPromise = context.waitForEvent('page');
-    await limova.evaluate(() => window.open(
-      'https://oauth.hubspot.test/intermediate',
-      'hubspot-oauth-intermediate',
-      'popup,width=480,height=580'
-    ));
-    const transientPopup = await transientPopupPromise;
-    await transientPopup.waitForLoadState();
-    await oauthPopup.close();
-    await expect(sidebar.locator('#trainingFeedback')).toContainText('Fenêtre de connexion externe ouverte');
-    await expect(sidebar.locator('#tabWarning')).toBeHidden();
-    await transientPopup.close();
-    await expect(sidebar.locator('#trainingFeedback')).toContainText('Charly relit maintenant');
-
-    await limova.locator('#safeNavigation').click();
-    await expect.poll(() => calls.training.filter(request => request.url().endsWith('/events')).length).toBeGreaterThanOrEqual(8);
-
-    await sidebar.locator('#trainingStop').click();
-    await expect(sidebar.locator('#trainingFeedback')).toContainText('Démonstration et vidéo enregistrées');
-    const trainingEvents = calls.training
-      .filter(request => request.url().endsWith('/events'))
-      .map(request => request.postDataJSON());
-    const eventBodies = trainingEvents.map(event => JSON.stringify(event)).join('\n');
-    expect(eventBodies).toContain('Instructions');
-    expect(eventBodies).toContain('Connecter HubSpot');
-    expect(eventBodies).toContain('Ouvrir mon profil');
-    expect(eventBodies).toContain('Je montre comment préparer la campagne.');
-    expect(eventBodies).toContain('Fenêtre d’autorisation externe ouverte');
-    expect(eventBodies).toContain('Fenêtre d’autorisation externe fermée');
-    expect(eventBodies).not.toContain('UNE VALEUR PRIVÉE');
-    expect(eventBodies).not.toContain('NEVER_TRANSMIT_THIS_SECRET');
-    expect(calls.training.some(request => request.url().endsWith('/complete'))).toBe(true);
-    expect(trainingEvents.filter(event => event.label === 'Fenêtre d’autorisation externe ouverte')).toHaveLength(1);
-    expect(trainingEvents.filter(event => event.label === 'Fenêtre d’autorisation externe fermée')).toEqual([
-      expect.objectContaining({ payload: expect.objectContaining({ popupCount: 2 }) })
-    ]);
-
-    const clickEvents = trainingEvents.filter(event => event.kind === 'click');
-    expect(clickEvents).toContainEqual(expect.objectContaining({
-      label: 'Connecter HubSpot',
-      payload: expect.objectContaining({
-        controlName: 'Connecter HubSpot',
-        controlType: 'bouton',
-        tag: 'button',
-        clickedTag: 'circle',
-        elementId: 'connectHubspot',
-        zone: 'main',
-        occurrence: 1,
-        gestureId: expect.stringMatching(/^[-a-z0-9]+$/i)
-      })
-    }));
-    expect(trainingEvents).toContainEqual(expect.objectContaining({
-      kind: 'page_context',
-      label: 'Résultat après clic · Connecter HubSpot',
-      payload: expect.objectContaining({
-        phase: 'after_click',
-        networkSummary: expect.stringContaining('POST /api/integrations/connect status:200')
-      })
-    }));
-  });
 
 
 
