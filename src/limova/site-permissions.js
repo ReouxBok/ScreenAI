@@ -21,11 +21,13 @@ export function bindSitePermissions({ document, permissions, tabs, translate = (
     let origin;
     try {
       const url = new URL(input.value.trim());
-      if (url.protocol !== 'https:' || url.username || url.password || url.hostname.includes('*')) throw new Error();
+      if (url.protocol !== 'https:' || url.username || url.password || /[*%]/.test(url.hostname)) throw new Error();
       origin = url.origin;
     } catch { report("limovaSiteInvalid", "Indique une adresse HTTPS valide, sans identifiants."); return; }
     // Invoke synchronously from the click so Chrome retains the user gesture.
-    const requested = permissions.request({ origins: [`${origin}/*`] });
+    let requested;
+    try { requested = permissions.request({ origins: [`${origin}/*`] }); }
+    catch { report("limovaSiteError", "Chrome n’a pas pu accorder cet accès. Réessaie depuis le bouton."); return; }
     button.disabled = true;
     Promise.resolve(requested).then(granted => {
       if (granted) report('limovaSiteGranted', 'Accès autorisé à {origin}. Coche ensuite l’autorisation pour ton message.', origin);

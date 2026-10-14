@@ -21,7 +21,7 @@ it('requests only the chosen HTTPS origin synchronously from the click', async (
 });
 it('rejects broad host patterns, credentials and non-HTTPS addresses', () => {
   const { permissions } = setup();
-  for (const value of ['https://*.example.com', 'https://user:pass@example.com', 'http://example.com', 'javascript:alert(1)']) {
+  for (const value of ['https://*.example.com', 'https://%2A.example.com', 'https://user:pass@example.com', 'http://example.com', 'javascript:alert(1)']) {
     el('limovaSiteOrigin').value = value;
     el('limovaSiteAllow').click();
   }
@@ -50,4 +50,13 @@ it('relocalizes the existing permission result without requesting access again',
   language = 'es'; ui.relocalize();
   expect(el('limovaSiteStatus').textContent).toBe('es: https://example.com');
   expect(permissions.request).toHaveBeenCalledTimes(1);
+});
+
+it('reports synchronous Chrome errors and keeps the control usable', () => {
+  const { permissions } = setup();
+  permissions.request.mockImplementation(() => { throw new Error('Invalid origin'); });
+  el('limovaSiteOrigin').value = 'https://example.com';
+  el('limovaSiteAllow').click();
+  expect(el('limovaSiteStatus').textContent).toContain('Chrome n’a pas pu accorder');
+  expect(el('limovaSiteAllow').disabled).toBe(false);
 });
