@@ -1286,3 +1286,21 @@ input:focus-visible {
 [hidden] {
   display: none !important;
 }
+
+.native-plan-progress {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 8px;
+}
+
+.native-plan-progress progress {
+  flex: 1;
+  min-width: 0;
+  height: 8px;
+  accent-color: #7c3aed;
+}
+
+.native-plan-progress span {
+  font-variant-numeric: tabular-nums;
+}

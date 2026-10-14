@@ -161,18 +161,42 @@ test('native plan follows backend statuses and survives reload without exposing 
   const plan = panel.locator('.native-agent-plan');
   await expect(plan).toHaveCount(1);
   await expect(plan.locator('li')).toHaveCount(3);
+  await expect(plan.getByRole('progressbar', { name: 'Étapes terminées du plan' })).toHaveAttribute('value', '1');
+  await expect(plan.locator('progress')).toHaveAttribute('max', '3');
+  await expect(plan.locator('.native-plan-progress span')).toHaveText('1 / 3');
   await expect(plan.locator('[data-status="in_progress"]')).toContainText('En cours');
   await expect(plan.locator('img')).toHaveCount(0);
   await expect(panel.locator('#sendBtn')).toBeEnabled();
   await panel.reload();
   await expect(plan).toHaveCount(1);
   await expect(plan.locator('[data-status="completed"]')).toContainText('Ouvrir les intégrations');
+  await expect(plan.locator('progress')).toHaveAttribute('value', '1');
+  await panel.locator('#menuBtn').click();
+  await panel.locator('.lang-option[data-lang="en"]').click();
+  await expect(plan.getByRole('progressbar', { name: 'Completed plan steps' })).toBeVisible();
+  await panel.locator('#menuBtn').click();
   await expect(panel.locator('body')).not.toContainText('PRIVATE_PLAN_REASONING');
   state.todos = undefined;
   await panel.locator('#userInput').fill('Merci');
   await panel.locator('#sendBtn').click();
   await expect(panel.locator('.message.assistant')).toHaveCount(2);
   await expect(plan).toHaveCount(1);
+  state.todos = [
+    { content: 'Ouvrir les intégrations', status: 'completed' },
+    { content: 'Connecter Gmail', status: 'completed' },
+    { content: 'Vérifier la connexion', status: 'completed' },
+  ];
+  await panel.locator('#userInput').fill('Confirme le résultat du parcours');
+  await panel.locator('#sendBtn').click();
+  await expect(plan).toHaveCount(2);
+  await expect(plan.last().locator('progress')).toHaveAttribute('value', '3');
+  await expect(plan.last().locator('.native-plan-progress span')).toHaveText('3 / 3');
+  await expect(plan.first().locator('progress')).toHaveAttribute('value', '1');
+  await panel.reload();
+  await expect(plan.last().getByRole('progressbar', { name: 'Completed plan steps' })).toHaveAttribute('value', '3');
+  await test.info().attach('native-plan-progress', { body: await plan.last().screenshot(), contentType: 'image/png' });
+  await panel.locator('#limovaNew').click();
+  await expect(plan).toHaveCount(0);
   expect(legacy).toEqual([]);
   expect(errors).toEqual([]);
 });

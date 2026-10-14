@@ -309,6 +309,19 @@ function renderLimovaConversation(snapshot, { showOlder = false } = {}) {
       heading.dataset.i18n = 'limovaPlan';
       heading.textContent = t('limovaPlan');
       section.append(heading);
+      const completed = plan.todos.filter(todo => todo.status === 'completed').length;
+      const progressRow = document.createElement('div');
+      progressRow.className = 'native-plan-progress';
+      const progress = document.createElement('progress');
+      progress.max = plan.todos.length;
+      progress.value = completed;
+      progress.dataset.i18nAriaLabel = 'limovaPlanProgress';
+      progress.setAttribute('aria-label', t('limovaPlanProgress'));
+      progress.setAttribute('aria-valuetext', `${completed} / ${plan.todos.length}`);
+      const count = document.createElement('span');
+      count.textContent = `${completed} / ${plan.todos.length}`;
+      progressRow.append(progress, count);
+      section.append(progressRow);
       const list = document.createElement('ol');
       plan.todos.forEach(todo => {
         const item = document.createElement('li');

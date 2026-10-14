@@ -200,3 +200,9 @@ Les trois scénarios legacy restent à ce stade : la correspondance finale de la
 ## Micro formateur après navigation
 
 La recette de formation garde maintenant le micro actif pendant les contrôles, les fenêtres OAuth et la navigation complète. Elle reproduisait un arrêt au changement de document avant correction. L’onglet app dédié à la transcription conserve la connexion : une note avant et une note après navigation rejoignent la même session Studio, sans seconde connexion. Le retrait du consentement arrête ensuite le PCM et retire uniquement l’onglet technique ; la vidéo est finalisée séparément par l’utilisateur. Deux variantes OAuth passent avec services simulés. Les trois scénarios legacy restent inchangés.
+
+## Progression des plans du main agent
+
+Chaque plan natif affiche le nombre d’étapes `completed` parmi les éléments `write_todos` reçus du backend, avec une barre accessible traduite en français, anglais et espagnol. Le test du chat vérifie 1/3 puis 3/3, la conservation des anciens plans, le rechargement, le changement de langue et l’absence de plan dans une nouvelle conversation. Aucun état métier d’onboarding supplémentaire n’est stocké dans l’extension.
+
+Cette progression décrit le plan émis par Charly ; elle ne certifie pas l’exécution des actions et ne mesure pas l’onboarding global du compte. Les statuts sont simulés dans cette recette Chromium. La consultation réelle de la trame Studio et la qualification du parcours complet restent des validations distinctes ; les trois scénarios legacy sont conservés.
