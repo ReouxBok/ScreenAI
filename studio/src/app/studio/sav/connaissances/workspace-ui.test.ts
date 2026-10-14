@@ -5,7 +5,7 @@ import type { SavKnowledgeDetail, SavKnowledgeRow } from "@/lib/knowledge/worksp
 const state = vi.hoisted(() => ({ auth: vi.fn(), list: vi.fn(), detail: vi.fn() }));
 vi.mock("@/lib/sav/auth", () => ({ requireSavStaff: state.auth }));
 vi.mock("@/lib/knowledge/workspace", () => ({ paginateSavKnowledge: state.list, getSavKnowledgeDetail: state.detail }));
-vi.mock("./workspace-actions", () => ({ saveKnowledgeProposalAction: vi.fn(), previewKnowledgeProposalAction: vi.fn(), submitKnowledgeProposalAction: vi.fn(), findKnowledgeAction: vi.fn(), loadKnowledgeTargetAction: vi.fn(), previewKnowledgeReviewAction: vi.fn(), reviewKnowledgeWorkspaceAction: vi.fn(), publishKnowledgeWorkspaceAction: vi.fn(), activateKnowledgeWorkspaceAction: vi.fn() }));
+vi.mock("./workspace-actions", () => ({ startKnowledgeRevisionAction: vi.fn(), saveKnowledgeProposalAction: vi.fn(), previewKnowledgeProposalAction: vi.fn(), submitKnowledgeProposalAction: vi.fn(), findKnowledgeAction: vi.fn(), loadKnowledgeTargetAction: vi.fn(), previewKnowledgeReviewAction: vi.fn(), reviewKnowledgeWorkspaceAction: vi.fn(), publishKnowledgeWorkspaceAction: vi.fn(), activateKnowledgeWorkspaceAction: vi.fn() }));
 vi.mock("./onboarding-review-form", () => ({ OnboardingReviewForm: () => createElement("div", null, "Formulaire source tutoriel") }));
 vi.mock("./hubspot-review-form", () => ({ HubspotReviewForm: () => createElement("div", null, "Formulaire source HubSpot") }));
 vi.mock("next/navigation", () => ({ useRouter: () => ({ refresh: vi.fn(), push: vi.fn() }), redirect: (url: string) => { throw new Error(`REDIRECT:${url}`); }, notFound: () => { throw new Error("NOT_FOUND"); } }));

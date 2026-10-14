@@ -13,6 +13,7 @@ import { resolveSavCustomerMessage } from "@/lib/sav/forwarded-identity";
 import { savActionLabels, savToolStatusLabels, savDecisionLabels, savLabel, savRunStatusLabels, savThreadStatusLabels } from "@/lib/sav/labels";
 import { getSavPartnershipTransferState, isSavPartnershipForward } from "@/lib/sav/partnership-forward";
 import { PartnershipTransfer } from "../partnership-transfer";
+import { SavDossierOpened, SavDossierBackLink } from "../dossier-opened";
 import { TicketSelector } from "./ticket-selector";
 import { MailConversation } from "./mail-conversation";
 import { ProposalReview } from "./proposal-review";
@@ -57,10 +58,10 @@ const filingNotices: Record<string, string> = {
   SAV_GMAIL_FILING_FAILED: "Le classement Gmail n’a pas pu être confirmé. Vous pouvez consulter le dossier SAV ; vérifiez Gmail avant de considérer le mail comme classé.",
 };
 
-export default async function SavThreadPage({ params, searchParams }: { params: Promise<{ id: string }>; searchParams: Promise<{ from?: string; batch?: string; review?: string; filing?: string; context?: string }> }) {
+export default async function SavThreadPage({ params, searchParams }: { params: Promise<{ id: string }>; searchParams: Promise<{ from?: string; batch?: string; review?: string; filing?: string; context?: string; returnTo?: string }> }) {
   const staff = await requireStaff("admin");
   const { id } = await params;
-  const { from = "", batch = "", review = "", filing = "", context = "" } = await searchParams;
+  const { from = "", batch = "", review = "", filing = "", context = "", returnTo } = await searchParams;
   const detail = await getSavThreadDetail(id);
   if (!detail) notFound();
   const v0 = savReleaseStage() === "v0";
@@ -111,10 +112,11 @@ export default async function SavThreadPage({ params, searchParams }: { params: 
     : null;
 
   return <>
+    {v0 && !detail.pilotItem && eligible && latestInbound && <SavDossierOpened threadId={id} messageId={latestInbound.id}/>}
     {filing && <p className={`login-notice ${["filed", "already_filed", "SAV_GMAIL_FILING_DISABLED", "SAV_GMAIL_FILING_PILOT_BLOCKED"].includes(filing) ? "" : "error"}`} role="status">{filingNotices[filing] ?? filingNotices.SAV_GMAIL_FILING_FAILED}</p>}
     {context && <p className={`login-notice ${context === "refreshed" ? "" : "error"}`} role="status">{context === "refreshed" ? "Contexte client actualisé à l’ouverture du dossier." : "Contexte HubSpot incomplet : vérifiez l’accès puis utilisez « Actualiser le contexte client »."}</p>}
     {review && <p className="login-notice" role="status">{({ observation_qualified: "Bilan qualifié. Aucune connaissance publiée.", draft_reviewed: "Verdict du brouillon enregistré. Aucun email envoyé, aucun ticket créé.", SAV_DRAFT_READ_ONLY: "Le brouillon IA est en lecture seule.", context_refreshed: "Contexte client actualisé. La proposition existante n’a pas été modifiée.", proposal_repaired: "Proposition reconstituée. Aucun email envoyé, aucun ticket créé." } as Record<string, string>)[review] ?? manualReplyNotices[review] ?? reviewNotices[review] ?? (review === "saved" ? "Revue enregistrée. Aucun email envoyé, aucun ticket créé par cette validation." : review === "ticket_queued" ? "Action manuelle enregistrée. Le worker vérifie Gmail et HubSpot avant de l’exécuter ; si les écritures sont bloquées, elle reste en attente." : review === "ticket_reconciled" ? "Ticket existant vérifié et rapproché. Aucun nouveau ticket créé." : review.startsWith("SAV_TICKET_") || review.startsWith("SAV_LINK_") || ["SAV_MANUAL_TICKET_INVALID", "SAV_MANUAL_RECONCILIATION_REQUIRED", "SAV_VALIDATED_CURRENT_PROPOSAL_REQUIRED", "SAV_MESSAGE_BEFORE_CUTOVER"].includes(review) ? savManualTicketError(review) : `Action refusée : ${review.slice(0, 100)}`)}</p>}
-    <Link className="back-link" href={from === "pilot" ? `/studio/sav/pilote?batch=${encodeURIComponent(batch || detail.pilotItem?.batchId || "")}#batch-review` : "/studio/sav"}><ArrowLeft size={14}/> {from === "pilot" ? "Retour au lot de test" : "Retour à tous les mails"}</Link>
+    {from === "pilot" ? <Link className="back-link" href={`/studio/sav/pilote?batch=${encodeURIComponent(batch || detail.pilotItem?.batchId || "")}#batch-review`}><ArrowLeft size={14}/> Retour au lot de test</Link> : <div className="back-link"><SavDossierBackLink threadId={id} returnTo={returnTo}/></div>}
     <div className={`sav-thread-heading ${styles.heading}`}><div><span className="eyebrow">Dossier SAV</span><h1>{customerMessage?.subject ?? detail.thread.subject}</h1></div><div className={styles.customer}><small>Client</small><strong>{customerMessage?.email ?? (isForward ? "Identité à vérifier" : detail.thread.customerEmail)}</strong>{isForward && <small>Transféré par {latestInbound?.fromEmail}. Une réponse Gmail restera adressée à ce collègue dans le fil d’origine.</small>}<span className={`sav-thread-status ${detail.thread.status}`}>{detail.thread.aiPaused ? <UserRound size={15}/> : <Bot size={15}/>} {savLabel(savThreadStatusLabels, detail.thread.status)}</span></div></div>
 
     <a className={styles.contextJump} href="#sav-client-context">Voir le contexte client et les actions</a>

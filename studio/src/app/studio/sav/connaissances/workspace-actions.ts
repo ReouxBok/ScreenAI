@@ -2,7 +2,7 @@
 
 import { revalidatePath } from "next/cache";
 import { requireSavApiStaff } from "@/lib/sav/auth";
-import { activateSavKnowledgeVersion, getSavKnowledgeDetail, paginateSavKnowledge, previewSavKnowledgeProposal, previewSavKnowledgeReview, publishSavKnowledgeVersion, reviewSavKnowledgeProposal, saveSavKnowledgeProposal, submitSavKnowledgeProposal } from "@/lib/knowledge/workspace";
+import { activateSavKnowledgeVersion, getSavKnowledgeDetail, paginateSavKnowledge, previewSavKnowledgeProposal, previewSavKnowledgeReview, publishSavKnowledgeVersion, reviewSavKnowledgeProposal, saveSavKnowledgeProposal, startSavKnowledgeRevision, submitSavKnowledgeProposal } from "@/lib/knowledge/workspace";
 import { knowledgeErrorMessage } from "./workspace-labels";
 
 function message(error: unknown) { return knowledgeErrorMessage(error instanceof Error ? error.message : "ACTION_FAILED"); }
@@ -51,4 +51,10 @@ export async function activateKnowledgeWorkspaceAction(input: Parameters<typeof 
   const staff = await requireSavApiStaff();
   try { await activateSavKnowledgeVersion(input, staff.email); refresh(); return { success: true, error: null }; }
   catch (error) { return { success: false, error: message(error) }; }
+}
+
+export async function startKnowledgeRevisionAction(candidateId: string) {
+  const staff = await requireSavApiStaff();
+  try { const draft = await startSavKnowledgeRevision(candidateId, staff.email); refresh(); return { draft, error: null }; }
+  catch (error) { return { draft: null, error: message(error) }; }
 }

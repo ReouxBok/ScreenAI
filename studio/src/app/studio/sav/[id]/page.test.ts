@@ -15,6 +15,7 @@ const dependencies = vi.hoisted(() => ({
   },
 }));
 vi.mock("@/lib/sav/partnership-forward", () => ({ getSavPartnershipTransferState: async () => ({ available: false, status: "unavailable" }), isSavPartnershipForward: (action: { payload: { purpose?: string } }) => action.payload.purpose === "partnership_forward" }));
+vi.mock("../dossier-opened", () => ({ SavDossierOpened: () => null, SavDossierBackLink: () => createElement("a", { href: "/studio/sav" }, "Retour aux dossiers") }));
 vi.mock("../partnership-transfer", () => ({ PartnershipTransfer: () => null }));
 vi.mock("@/lib/sav/cutover", () => ({ isSavMessageEligible: dependencies.eligible }));
 vi.mock("@/lib/sav/auth", () => ({ requireSavStaff: dependencies.auth }));
@@ -49,7 +50,7 @@ function detailFixture(): ThreadDetail {
     messages: [{ id: messageId, mailboxId: "mailbox", threadId, gmailMessageId: "gmail-message", hubspotEmailId: null,
       direction: "inbound", fromEmail: "client@example.invalid", toEmails: ["contact@limova.ai"], subject: "Retrouver mes factures",
       preview: "EMAIL_CLIENT_TEST", bodyCiphertext: undefined, body: { text: "EMAIL_CLIENT_TEST" }, receivedAt: now,
-      processedAt: now, analysisStatus: "done", analysisAttempts: 1, analysisStartedAt: null, analysisErrorCode: null, createdAt: now }],
+      studioOpenedAt: null, studioOpeningTracked: true, processedAt: now, analysisStatus: "done", analysisAttempts: 1, analysisStartedAt: null, analysisErrorCode: null, createdAt: now }],
     decisions: [{ id: decisionId, agentRunId: runId, messageId, kind: "ticket_pending", reasonCode: "new_customer_support_request",
       explanation: "DECISION_IA_ORIGINALE", confidence: 900, evidence: [], model: "fixture", actorType: "ai", actorEmail: null,
       supersedesDecisionId: null, isCurrent: true, createdAt: now }],

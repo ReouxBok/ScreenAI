@@ -9,7 +9,7 @@ function message(id: string, direction: "inbound" | "outbound", text: string): M
   return { id, mailboxId: "mailbox", threadId: "thread", gmailMessageId: id, hubspotEmailId: null, direction,
     fromEmail: direction === "inbound" ? "client@example.invalid" : "contact@limova.ai", toEmails: [], subject: "Factures",
     preview: text, bodyCiphertext: undefined, body: { text }, receivedAt: new Date("2026-10-02T12:00:00Z"),
-    processedAt: null, analysisStatus: "pending", analysisAttempts: 0, analysisStartedAt: null, analysisErrorCode: null, createdAt: new Date(),
+    studioOpenedAt: null, studioOpeningTracked: true, processedAt: null, analysisStatus: "pending", analysisAttempts: 0, analysisStartedAt: null, analysisErrorCode: null, createdAt: new Date(),
   };
 }
 const render = (messages: Message[]) => renderToStaticMarkup(createElement(MailConversation, { messages }));

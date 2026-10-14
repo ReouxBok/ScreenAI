@@ -5,7 +5,7 @@ import { useRouter } from "next/navigation";
 import type { CanonicalKnowledge } from "@/lib/knowledge/contracts";
 import { KnowledgeDocument } from "./knowledge-document";
 import { KnowledgeEditor, cleanKnowledgeDocument } from "./knowledge-editor";
-import { activateKnowledgeWorkspaceAction, previewKnowledgeReviewAction, publishKnowledgeWorkspaceAction, reviewKnowledgeWorkspaceAction } from "./workspace-actions";
+import { activateKnowledgeWorkspaceAction, previewKnowledgeReviewAction, publishKnowledgeWorkspaceAction, reviewKnowledgeWorkspaceAction, startKnowledgeRevisionAction } from "./workspace-actions";
 import styles from "./workspace.module.css";
 
 type ReviewPreview = NonNullable<Awaited<ReturnType<typeof previewKnowledgeReviewAction>>["preview"]>;
@@ -20,8 +20,8 @@ export function KnowledgeWorkspaceReview({ candidateId, revisionId, initialDocum
   const lock = useRef(false);
   function run(operation: () => Promise<void>) { if (lock.current) return; lock.current = true; startTransition(async () => { setError(""); try { await operation(); } catch { setError("La décision n’a pas pu être enregistrée. Vos corrections sont conservées."); } finally { lock.current = false; } }); }
   function decide(decision: "approve" | "reject" | "needs_completion") { run(async () => {
-    if (!preview) return;
-    const result = await reviewKnowledgeWorkspaceAction({ candidateId, expectedRevisionId: revisionId, snapshot: preview.snapshot, decision, reason, document: cleanKnowledgeDocument(document) });
+    if (!preview && decision === "approve") return;
+    const result = await reviewKnowledgeWorkspaceAction({ candidateId, expectedRevisionId: revisionId, snapshot: preview?.snapshot ?? "", decision, reason, document: cleanKnowledgeDocument(document) });
     if (!result.success) { setError(result.error ?? "Décision non enregistrée."); setPreview(null); setAcknowledged(false); return; }
     router.refresh();
   }); }
@@ -37,8 +37,8 @@ export function KnowledgeWorkspaceReview({ candidateId, revisionId, initialDocum
     </section>}
     <label className={styles.editor}>Motif de la décision<textarea value={reason} maxLength={2000} minLength={10} disabled={busy} onChange={event => setReason(event.target.value)}/></label>
     <div className={styles.row}><button className="primary" disabled={busy || !preview || !acknowledged || reason.trim().length < 10 || Boolean(preview?.missing.length)} onClick={() => decide("approve")}>{busy ? "Enregistrement…" : "Valider la proposition"}</button>
-      <button className="secondary" disabled={busy || !preview || reason.trim().length < 10} onClick={() => decide("needs_completion")}>Demander un complément</button>
-      <button className="secondary" disabled={busy || !preview || reason.trim().length < 10} onClick={() => decide("reject")}>Écarter avec ce motif</button></div>
+      <button className="secondary" disabled={busy || reason.trim().length < 10} onClick={() => decide("needs_completion")}>Demander un complément</button>
+      <button className="secondary" disabled={busy || reason.trim().length < 10} onClick={() => decide("reject")}>Écarter avec ce motif</button></div>
     {error && <p className={`${styles.alert} ${styles.error}`} role="alert">{error}</p>}
   </section>;
 }
@@ -64,4 +64,16 @@ export function KnowledgePublication({ itemId, proposedVersionId, publishedVersi
     {confirmation && <div className={styles.alert} role="region" aria-label="Confirmer l’action sur la connaissance"><h3>{confirmation === "publish" ? "Confirmer la publication" : "Confirmer l’activation"} : {title}</h3><p>{confirmation === "publish" ? "La version sera publiée et indexée. La version utilisée par l’agent ne change pas à cette étape." : "La version publiée remplacera la version actuellement utilisée par l’agent SAV après vérification de son index."}</p><div className={styles.row}><button className="primary" disabled={busy} onClick={confirm}>{busy ? "Action en cours…" : confirmation === "publish" ? "Confirmer la publication" : "Confirmer l’activation"}</button><button className="secondary" disabled={busy} onClick={() => setConfirmation(null)}>Annuler</button></div></div>}
     {error && <p className={`${styles.alert} ${styles.error}`} role="alert">{error}</p>}
   </section>;
+}
+
+export function KnowledgeRevisionButton({ candidateId }: { candidateId: string }) {
+  const router = useRouter();
+  const [busy, startTransition] = useTransition();
+  const [error, setError] = useState("");
+  return <div><button className="secondary" disabled={busy} onClick={() => startTransition(async () => {
+    setError("");
+    try { const result = await startKnowledgeRevisionAction(candidateId); if (!result.draft) { setError(result.error ?? "La proposition ne peut pas être reprise."); return; }
+      router.push(result.draft.status === "submitted" && result.draft.candidateId ? `/studio/sav/connaissances/${result.draft.candidateId}?kind=candidate` : `/studio/sav/connaissances/proposer?draft=${result.draft.id}`);
+    } catch { setError("La proposition ne peut pas être reprise. Réessayez après avoir rechargé la fiche."); }
+  })}>{busy ? "Préparation…" : "Compléter la proposition et ses sources"}</button>{error && <p className={styles.alert} role="alert">{error}</p>}</div>;
 }
