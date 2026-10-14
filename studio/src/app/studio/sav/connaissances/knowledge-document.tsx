@@ -30,4 +30,3 @@ export function KnowledgeDocument({ document }: { document: CanonicalKnowledge }
     {(document.productVersion || document.validUntil) && <p>{document.productVersion && `Version produit : ${document.productVersion}. `}{document.validUntil && `Validité : ${document.validUntil}.`}</p>}
   </section>;
 }
-
