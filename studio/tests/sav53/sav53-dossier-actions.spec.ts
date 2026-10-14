@@ -64,8 +64,10 @@ for (const scenario of [
   test(`${scenario.key} : sélection nommée et aperçu séparé après validation locale`, async ({ page }) => {
     await page.goto(`/studio/sav/${SAV53_THREADS[scenario.key]}`);
     const rail = page.getByRole("complementary", { name: "Contexte client et actions", exact: true });
-    const selected = rail.getByRole("radio", { name: new RegExp(SAV53_TICKET_TITLE) });
+    const selected = rail.getByRole("radio", { name: new RegExp(`^${SAV53_TICKET_TITLE} #\\d+`) });
+    const newTicket = rail.getByRole("radio", { name: `Ouvrir un nouveau ticket ${SAV53_TICKET_TITLE}`, exact: true });
     await expect(selected).toBeChecked();
+    await expect(newTicket).not.toBeChecked();
     const prepare = rail.getByRole("button", { name: "Préparer l’aperçu de l’action", exact: true });
     await expect(prepare).toBeDisabled();
     await expect(rail.getByRole("region", { name: "Aperçu de l’action HubSpot", exact: true })).toHaveCount(0);
@@ -74,6 +76,7 @@ for (const scenario of [
     await expect(page.getByRole("region", { name: "Proposition de l’IA", exact: true })).toContainText("Process validé par ugo@limova.ai");
     await expect(prepare).toBeEnabled();
     await expect(selected).toBeChecked();
+    await expect(newTicket).not.toBeChecked();
     // Selecting a target never queues an action. Fresh CRM checks are tested
     // with synthetic responses in the isolated DB combination suite.
     await expect(rail.locator('input[name="ticketId"]')).toHaveCount(0);
