@@ -20,7 +20,7 @@ import {
 import { chunkMarkdown } from "./chunking";
 import { parseContentInput } from "./content";
 import { embedTexts } from "./embeddings";
-import { assertKnowledgeUgoApproval, requiresKnowledgeUgoApproval } from "./knowledge/contracts";
+import { assertKnowledgeUgoApproval, canReviewKnowledgeCandidate, requiresKnowledgeUgoApproval } from "./knowledge/contracts";
 import { assertOnboardingPublicationSource } from "./knowledge/onboarding-import";
 
 function revisionId() {
@@ -125,8 +125,8 @@ async function prepareVersion(itemId: string, actorEmail: string, expectedVersio
     const revisionId = String(version.metadata.sourceMetadata.canonicalRevisionId);
     const [approved] = await db.select({ revision: knowledgeFamilyRevisions }).from(knowledgeProjections)
       .innerJoin(knowledgeFamilyRevisions, eq(knowledgeFamilyRevisions.id, knowledgeProjections.revisionId))
-      .where(and(eq(knowledgeProjections.itemId, itemId), eq(knowledgeProjections.versionId, version.id), eq(knowledgeProjections.revisionId, revisionId), eq(knowledgeFamilyRevisions.reviewState, "approved"), eq(knowledgeFamilyRevisions.reviewedBy, "ugo@limova.ai"))).limit(1);
-    if (!approved) throw new Error("KNOWLEDGE_CANONICAL_APPROVAL_REQUIRED");
+      .where(and(eq(knowledgeProjections.itemId, itemId), eq(knowledgeProjections.versionId, version.id), eq(knowledgeProjections.surface, "sav"), eq(knowledgeProjections.revisionId, revisionId), eq(knowledgeFamilyRevisions.reviewState, "approved"))).limit(1);
+    if (!approved || !canReviewKnowledgeCandidate(approved.revision.reviewedBy ?? "", "sav")) throw new Error("KNOWLEDGE_CANONICAL_APPROVAL_REQUIRED");
     if (approved.revision.document.steps.some((step) => step.variants.length)) throw new Error("KNOWLEDGE_VARIANT_CONTEXT_REQUIRED");
     if (approved.revision.document.validUntil && approved.revision.document.validUntil < new Date().toISOString().slice(0, 10)) throw new Error("KNOWLEDGE_EXPIRED");
   }

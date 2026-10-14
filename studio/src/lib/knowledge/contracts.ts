@@ -74,6 +74,16 @@ export function assertKnowledgeUgoApproval(actorEmail: string) {
   if (actorEmail.trim().toLowerCase() !== "ugo@limova.ai") throw new Error("KNOWLEDGE_UGO_APPROVAL_REQUIRED");
 }
 
+/** Delegation is limited to candidate review for SAV, never publication or Chrome. */
+export function canReviewKnowledgeCandidate(actorEmail: string, targetSurface: string) {
+  const email = actorEmail.trim().toLowerCase();
+  return email === "ugo@limova.ai" || email === "contact@limova.ai" && targetSurface === "sav";
+}
+
+export function assertKnowledgeCandidateReview(actorEmail: string, targetSurface: string) {
+  if (!canReviewKnowledgeCandidate(actorEmail, targetSurface)) throw new Error("KNOWLEDGE_UGO_APPROVAL_REQUIRED");
+}
+
 /** Keep legacy Studio publication permissions; only SAV/new shared projections require Ugo. */
 export function requiresKnowledgeUgoApproval(agentKey: string, metadata?: { sourceMetadata?: Record<string, unknown> }) {
   return agentKey === "sav" || Boolean(metadata?.sourceMetadata?.canonicalRevisionId);

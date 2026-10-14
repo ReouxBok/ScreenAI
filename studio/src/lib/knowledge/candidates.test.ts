@@ -2,7 +2,7 @@ import { beforeAll, beforeEach, afterAll, describe, expect, it, vi } from "vites
 import { eq } from "drizzle-orm";
 import { createSavTestDb } from "../../../test/sav-db";
 import { auditLogs, categories, contentItems, contentVersions, knowledgeFamilies, knowledgeFamilyRevisions, knowledgeFamilySources, knowledgeProjectionCandidates, knowledgeProjections, savLearningCandidates, savResolutionEvidence } from "@/db/schema";
-import { saveDraft, publish, rollback, submitForReview } from "@/lib/workflow";
+import { saveDraft, publish, rollback, setContentAiEnabled, submitForReview } from "@/lib/workflow";
 import { registerCanonicalKnowledge, getCanonicalFamily } from "./families";
 import { proposeSavFromOnboarding, proposeOnboardingFromSav, storeCandidate } from "./candidates";
 import { articleMetadataSchema } from "@/lib/content";
@@ -34,6 +34,33 @@ async function savCandidate(steps: string[]) {
   return { ...draft, candidate };
 }
 describe("canonical families and supervised projections", () => {
+  it("audits delegated contact approval without publishing, activating or touching the source", async () => {
+    const source = await onboarding();
+    const candidate = (await proposeSavFromOnboarding(source.item.id, source.version.id, "ugo@limova.ai")).candidate!;
+    const family = await getCanonicalFamily(candidate.familyId);
+    const document = { ...family.revisions[0].document, prerequisites: ["Être connecté"], steps: family.revisions[0].document.steps.map((step) => ({ ...step, expectedResult: "Contrôle visible et sélectionné" })) };
+    const approved = await reviewKnowledgeCandidate(candidate.id, { expectedRevisionId: candidate.revisionId, decision: "approve", reason: "Procédure relue par le compte contact autorisé", document }, "contact@limova.ai");
+    expect(approved).toMatchObject({ status: "approved", reviewedBy: "contact@limova.ai" });
+    const [target] = await fixture.db.select().from(contentItems).where(eq(contentItems.id, approved.targetItemId!));
+    expect(target).toMatchObject({ status: "in_review", publishedVersionId: null });
+    const [audit] = (await fixture.db.select().from(auditLogs)).filter((row) => row.action === "knowledge_candidate_approved");
+    expect(audit).toMatchObject({ actorEmail: "contact@limova.ai" });
+    expect(audit.technicalMetadata).toMatchObject({ sourceVersionId: source.version.id, versionId: approved.materializedVersionId });
+    expect((await fixture.db.select().from(contentVersions).where(eq(contentVersions.id, source.version.id)))[0]).toEqual(source.version);
+    await expect(publish(target.id, "contact@limova.ai", { emergency: true, reason: "Tentative de publication non déléguée" })).rejects.toThrow("KNOWLEDGE_UGO_APPROVAL_REQUIRED");
+    await expect(setContentAiEnabled(target.id, true, "contact@limova.ai")).rejects.toThrow("KNOWLEDGE_UGO_APPROVAL_REQUIRED");
+    expect(state.embed).not.toHaveBeenCalled();
+  });
+  it("allows contact to reject SAV but never a forged Chrome candidate, including idempotent approval", async () => {
+    const source = await onboarding();
+    const sav = (await proposeSavFromOnboarding(source.item.id, source.version.id, "ugo@limova.ai")).candidate!;
+    const decision = { expectedRevisionId: sav.revisionId, decision: "reject" as const, reason: "Procédure écartée par le compte contact" };
+    expect(await reviewKnowledgeCandidate(sav.id, decision, "contact@limova.ai")).toMatchObject({ status: "rejected", reviewedBy: "contact@limova.ai" });
+    await fixture.db.update(knowledgeProjectionCandidates).set({ targetSurface: "onboarding", status: "pending" }).where(eq(knowledgeProjectionCandidates.id, sav.id));
+    await expect(reviewKnowledgeCandidate(sav.id, decision, "contact@limova.ai")).rejects.toThrow("KNOWLEDGE_UGO_APPROVAL_REQUIRED");
+    await fixture.db.update(knowledgeProjectionCandidates).set({ status: "approved" }).where(eq(knowledgeProjectionCandidates.id, sav.id));
+    await expect(reviewKnowledgeCandidate(sav.id, { ...decision, decision: "approve" }, "contact@limova.ai")).rejects.toThrow("KNOWLEDGE_UGO_APPROVAL_REQUIRED");
+  });
   it("requires Ugo and prepares an auditable corrected SAV draft without touching its tutorial", async () => {
     const source = await onboarding();
     const [sourceSnapshot] = await fixture.db.select().from(contentItems).where(eq(contentItems.id, source.item.id));
