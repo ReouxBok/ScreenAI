@@ -1,5 +1,5 @@
 import "server-only";
-import { and, desc, eq, max } from "drizzle-orm";
+import { and, desc, eq, max, sql } from "drizzle-orm";
 import { z } from "zod";
 import { requireDb } from "@/db";
 import { activeKnowledge, auditLogs, savActions, savAgentRuns, savDecisions, savDraftVerdicts, savMessages, savProposalReviews, savReplyDrafts, savResolutionObservations, savThreads } from "@/db/schema";
@@ -44,7 +44,7 @@ export async function reviewSavDraft(raw: unknown, actorEmail: string) {
         const [thread] = await tx.select().from(savThreads).where(eq(savThreads.id, input.threadId)).for("update");
         if (!thread)
             throw new Error("SAV_THREAD_NOT_FOUND");
-        const [sent] = await tx.select().from(savActions).where(and(eq(savActions.messageId, input.messageId), eq(savActions.kind, "send_reply"))).limit(1);
+        const [sent] = await tx.select().from(savActions).where(and(eq(savActions.messageId, input.messageId), eq(savActions.kind, "send_reply"), sql`coalesce(${savActions.payload}->>'purpose', '') <> 'partnership_forward'`)).limit(1);
         if (sent?.status === "succeeded" || sent?.payload.replySendDispatchedAt)
             throw new Error("SAV_DRAFT_ALREADY_DISPATCHED");
         const c = await loadSavDraftContext(input.messageId, tx);

@@ -1,7 +1,7 @@
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { createSavTestDb } from "../../test/sav-db";
 import { eq } from "drizzle-orm";
-import { activeKnowledge, knowledgeRevisions, contentItems, contentVersions, contentChunks } from "@/db/schema";
+import { activeKnowledge, knowledgeRevisions, contentItems, contentVersions, contentChunks, savKnowledgeActivations } from "@/db/schema";
 
 const state = vi.hoisted(() => ({ db: null as unknown, embed: vi.fn(async () => [new Array(768).fill(1)]) }));
 vi.mock("@/db", () => ({ requireDb: () => state.db }));
@@ -31,6 +31,7 @@ describe("SAV knowledge freshness", () => {
       );
       UPDATE content_items SET published_version_id = '30000000-0000-4000-8000-000000000002'
       WHERE id = '30000000-0000-4000-8000-000000000001';
+      INSERT INTO sav_knowledge_activations(item_id,version_id,title,activated_by) VALUES ('30000000-0000-4000-8000-000000000001','30000000-0000-4000-8000-000000000002','Article SAV ancien','fixture');
       INSERT INTO content_chunks (item_id, version_id, ordinal, content, embedding)
       VALUES (
         '30000000-0000-4000-8000-000000000001',
@@ -56,6 +57,7 @@ describe("SAV knowledge freshness", () => {
       const [item] = await fixture.db.insert(contentItems).values({ slug, type: "article", locale: "fr-FR", title: "Retrouver les factures", ownerEmail: "ugo@limova.ai", status: "published", agentKey: "sav", aiEnabled: true }).returning();
       const [version] = await fixture.db.insert(contentVersions).values({ itemId: item.id, version: 1, bodyMarkdown: "Ouvrez Paramètres puis Facturation", metadata: { intents: [], limovaPaths: [], prerequisites: [], expectedResult: "Factures visibles", troubleshooting: "Revue humaine", resolution: { symptoms: ["Factures introuvables"], steps: ["Ouvrez Paramètres puis Facturation"], exceptions: [], escalation: "Revue humaine", productVersion: "", supersedes: [], conflictsWith: [] } }, changeNote: "Fixture", authorEmail: "ugo@limova.ai" }).returning();
       await fixture.db.update(contentItems).set({ publishedVersionId: version.id }).where(eq(contentItems.id, item.id));
+      if (item.agentKey === "sav") await fixture.db.insert(savKnowledgeActivations).values({ itemId: item.id, versionId: version.id, title: item.title, activatedBy: "fixture" });
       await fixture.db.insert(contentChunks).values({ itemId: item.id, versionId: version.id, ordinal: 0, content: "Ouvrez Paramètres puis Facturation", embedding: new Array(768).fill(1) });
       expected.push(version.id);
     }
@@ -68,6 +70,7 @@ describe("SAV knowledge freshness", () => {
     const [item] = await fixture.db.insert(contentItems).values({ slug: `${scope}-publication-race`, type: "article", locale: "fr-FR", title: "Parcours historique", ownerEmail: "ugo@limova.ai", status: "published", agentKey: scope === "extension" ? "charly" : "sav", aiEnabled: true }).returning();
     const [version] = await fixture.db.insert(contentVersions).values({ itemId: item.id, version: 1, bodyMarkdown: "Ouvrez Paramètres puis Facturation", metadata: { intents: [], limovaPaths: [], prerequisites: [], expectedResult: "Factures visibles", troubleshooting: "Revue humaine", resolution: { symptoms: ["Factures introuvables"], steps: ["Ouvrez Paramètres puis Facturation"], exceptions: [], escalation: "Revue humaine", productVersion: "", supersedes: [], conflictsWith: [] } }, changeNote: "Fixture isolée", authorEmail: "ugo@limova.ai" }).returning();
     await fixture.db.update(contentItems).set({ publishedVersionId: version.id }).where(eq(contentItems.id, item.id));
+      if (item.agentKey === "sav") await fixture.db.insert(savKnowledgeActivations).values({ itemId: item.id, versionId: version.id, title: item.title, activatedBy: "fixture" });
     await fixture.db.insert(contentChunks).values({ itemId: item.id, versionId: version.id, ordinal: 0, content: "Ouvrez Paramètres puis Facturation", embedding: new Array(768).fill(1) });
     const before = `kb_${scope}_before`;
     const after = `kb_${scope}_after`;
@@ -97,6 +100,7 @@ describe("SAV knowledge freshness", () => {
     const [version] = await fixture.db.insert(contentVersions).values({ itemId: item.id, version: 1, bodyMarkdown: "Modèle fictif sans donnée réelle.", metadata: { intents: [], limovaPaths: [], prerequisites: [], expectedResult: "", troubleshooting: "",
       resolution: { audience: "lead", symptoms: [], steps: [], exceptions: [], escalation: "Qualification humaine", productVersion: "", supersedes: [], conflictsWith: [] } }, changeNote: "Donnée historique volontairement mal classée", authorEmail: "staff@example.invalid" }).returning();
     await fixture.db.update(contentItems).set({ publishedVersionId: version.id }).where(eq(contentItems.id, item.id));
+      if (item.agentKey === "sav") await fixture.db.insert(savKnowledgeActivations).values({ itemId: item.id, versionId: version.id, title: item.title, activatedBy: "fixture" });
     await fixture.db.insert(contentChunks).values({ itemId: item.id, versionId: version.id, ordinal: 0, content: "Modèle fictif sans donnée réelle.", embedding: new Array(768).fill(1) });
     const found = await searchKnowledge({ query: "Découverte produit fictive", contentTypes: ["article"] });
     expect(found.results.some(result => result.id === item.id)).toBe(false);

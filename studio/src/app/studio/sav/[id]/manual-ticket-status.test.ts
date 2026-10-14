@@ -29,7 +29,7 @@ describe("manual ticket progress", () => {
     ["SAV_HUBSPOT_CONTACT_REQUIRED", "Aucun contact HubSpot confirmé"],
     ["SAV_EXISTING_TICKET_REQUIRES_LINK", "rattachement à un ticket existant"],
     ["SAV_DISTINCT_ISSUE_CONFIRMATION_REQUIRED", "problème distinct"],
-    ["SAV_LINK_TARGET_INVALID", "corrigez l’ID du ticket"],
+    ["SAV_LINK_TARGET_INVALID", "sélectionnez à nouveau le ticket"],
     ["SAV_GMAIL_THREAD_CHANGED", "Actualisez le contexte du dossier"],
     ["SAV_GMAIL_PREFLIGHT_INCOMPLETE", "Vérifiez la synchronisation"],
     ["HUBSPOT_HTTP_403:MISSING_SCOPES", "droits de l’intégration"],

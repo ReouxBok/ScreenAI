@@ -16,6 +16,7 @@ import {
   testCases,
   knowledgeFamilyRevisions,
   knowledgeProjections,
+  savKnowledgeActivations,
 } from "@/db/schema";
 import { chunkMarkdown } from "./chunking";
 import { parseContentInput } from "./content";
@@ -131,7 +132,9 @@ async function prepareVersion(itemId: string, actorEmail: string, expectedVersio
     if (approved.revision.document.validUntil && approved.revision.document.validUntil < new Date().toISOString().slice(0, 10)) throw new Error("KNOWLEDGE_EXPIRED");
   }
   await assertOnboardingPublicationSource(version.metadata);
-  const publicationTitle = version.metadata.sourceMetadata?.importKind === "onboarding_catalog" ? String(version.metadata.sourceMetadata.sourceTitle) : item.title;
+  const { assertWorkspacePublicationSource } = await import("./knowledge/proposals");
+  await assertWorkspacePublicationSource(version.metadata);
+  const publicationTitle = version.metadata.sourceMetadata?.importKind === "onboarding_catalog" ? String(version.metadata.sourceMetadata.sourceTitle) : typeof version.metadata.sourceMetadata?.knowledgeTitle === "string" ? version.metadata.sourceMetadata.knowledgeTitle : item.title;
   const chunks = chunkMarkdown(version.bodyMarkdown);
   if (!chunks.length) throw new Error("EMPTY_CHUNKS");
   const intents = "intents" in version.metadata ? version.metadata.intents : version.metadata.proposalSignals;
@@ -161,6 +164,8 @@ export async function publish(itemId: string, actorEmail: string, options: { eme
 
   await db.transaction(async (tx) => {
     await assertOnboardingPublicationSource(prepared.version.metadata, tx, true);
+    const { assertWorkspacePublicationSource } = await import("./knowledge/proposals");
+    await assertWorkspacePublicationSource(prepared.version.metadata, tx, true);
     const [current] = await tx.select().from(contentItems).where(eq(contentItems.id, itemId)).for("update");
     if (!current || current.currentDraftVersionId !== prepared.version.id || (!options.emergency && current.status !== "in_review")) throw new Error("KNOWLEDGE_REVIEW_STALE");
     await tx.delete(contentChunks).where(eq(contentChunks.versionId, prepared.version.id));
@@ -205,7 +210,7 @@ export async function rollback(itemId: string, versionId: string, actorEmail: st
   if (!item) throw new Error("CONTENT_NOT_FOUND");
   const [version] = await db.select().from(contentVersions).where(and(eq(contentVersions.id, versionId), eq(contentVersions.itemId, itemId))).limit(1);
   if (!version) throw new Error("VERSION_NOT_FOUND");
-  if (requiresKnowledgeUgoApproval(item.agentKey, version.metadata)) assertKnowledgeUgoApproval(actorEmail);
+  if (item.agentKey === "sav" || requiresKnowledgeUgoApproval(item.agentKey, version.metadata)) assertKnowledgeUgoApproval(actorEmail);
   // Restoring an old version must not bypass approval on a current SAV projection.
   if (item.currentDraftVersionId) {
     const [current] = await db.select().from(contentVersions).where(eq(contentVersions.id, item.currentDraftVersionId)).limit(1);
@@ -216,11 +221,15 @@ export async function rollback(itemId: string, versionId: string, actorEmail: st
   const revision = revisionId();
   await db.transaction(async (tx) => {
     await assertOnboardingPublicationSource(version.metadata, tx, true);
-    await tx.update(contentItems).set({ currentDraftVersionId: version.id, publishedVersionId: version.id, status: "published", ...(version.metadata.sourceMetadata?.importKind === "onboarding_catalog" ? { title: String(version.metadata.sourceMetadata.sourceTitle) } : {}), updatedAt: new Date() }).where(eq(contentItems.id, itemId));
+    const { assertWorkspacePublicationSource } = await import("./knowledge/proposals");
+    await assertWorkspacePublicationSource(version.metadata, tx, true, true);
+    await tx.select().from(contentItems).where(eq(contentItems.id, itemId)).for("update");
+    const [previousActive] = await tx.select().from(savKnowledgeActivations).where(eq(savKnowledgeActivations.itemId, itemId));
+    await tx.update(contentItems).set({ currentDraftVersionId: version.id, publishedVersionId: version.id, status: "published", ...(version.metadata.sourceMetadata?.importKind === "onboarding_catalog" ? { title: String(version.metadata.sourceMetadata.sourceTitle) } : typeof version.metadata.sourceMetadata?.knowledgeTitle === "string" ? { title: version.metadata.sourceMetadata.knowledgeTitle } : {}), updatedAt: new Date() }).where(eq(contentItems.id, itemId));
     await tx.insert(knowledgeRevisions).values({ id: revision, actorEmail });
     await tx.insert(activeKnowledge).values({ singleton: true, revisionId: revision }).onConflictDoUpdate({ target: activeKnowledge.singleton, set: { revisionId: revision, updatedAt: new Date() } });
     await tx.insert(reviewEvents).values({ itemId, versionId, action: "rolled_back", actorEmail, comment: reason });
-    await tx.insert(auditLogs).values({ actorEmail, action: "rolled_back", entityType: "content", entityId: itemId, technicalMetadata: { revision, version: version.version } });
+    await tx.insert(auditLogs).values({ actorEmail, action: "rolled_back", entityType: "content", entityId: itemId, technicalMetadata: { revision, version: version.version, versionId: version.id, previousActiveVersionId: previousActive?.versionId ?? null } });
   });
   return { revision };
 }
@@ -278,7 +287,19 @@ export async function deleteContent(itemId: string, actorEmail: string) {
   });
 }
 
-export async function setContentAiEnabled(itemId: string, enabled: boolean, actorEmail: string) {
+export async function setContentAiEnabled(itemId: string, enabled: boolean, actorEmail: string, activation?: { expectedPublishedVersionId: string; expectedActiveVersionId: string | null }) {
+  const [scope] = await requireDb().select().from(contentItems).where(eq(contentItems.id, itemId));
+  if (scope?.agentKey === "sav") {
+    assertKnowledgeUgoApproval(actorEmail);
+    if (enabled) {
+      if (!scope.publishedVersionId) throw new Error("ONBOARDING_PUBLICATION_REQUIRED");
+      if (!activation) throw new Error("KNOWLEDGE_EXPLICIT_VERSION_ACTIVATION_REQUIRED");
+      const { activateSavKnowledgeVersion } = await import("./knowledge/activation");
+      await activateSavKnowledgeVersion({ itemId, ...activation }, actorEmail);
+      const [activated] = await requireDb().select().from(contentItems).where(eq(contentItems.id, itemId));
+      return activated;
+    }
+  }
   const db = requireDb();
   const revision = revisionId();
   return db.transaction(async (tx) => {
@@ -319,10 +340,12 @@ export async function listContent() {
   const db = requireDb();
   return db.select({
     item: contentItems,
+    savActiveVersionId: savKnowledgeActivations.versionId,
     category: categories,
     metadata: contentVersions.metadata,
     stale: sql<boolean>`${contentItems.verifiedAt} IS NULL OR ${contentItems.verifiedAt} < now() - interval '90 days'`,
   }).from(contentItems)
+    .leftJoin(savKnowledgeActivations, eq(savKnowledgeActivations.itemId, contentItems.id))
     .leftJoin(categories, eq(contentItems.categoryId, categories.id))
     .leftJoin(contentVersions, eq(contentItems.currentDraftVersionId, contentVersions.id))
     .orderBy(desc(contentItems.updatedAt));

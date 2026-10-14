@@ -3,7 +3,7 @@ import { createHash } from "node:crypto";
 import { and, asc, desc, eq, max, sql } from "drizzle-orm";
 import { z } from "zod";
 import { requireDb } from "@/db";
-import { activeOnboardingTemplate, auditLogs, contentItems, contentVersions, knowledgeFamilies, knowledgeFamilyRevisions, knowledgeFamilySources, knowledgeProjectionCandidates, knowledgeProjections, onboardingTemplateVersions } from "@/db/schema";
+import { activeOnboardingTemplate, auditLogs, contentItems, contentVersions, knowledgeFamilies, knowledgeFamilyRevisions, knowledgeFamilySources, knowledgeProjectionCandidates, knowledgeProjections, savKnowledgeActivations, onboardingTemplateVersions } from "@/db/schema";
 import { onboardingMetadataSchema, parseContentInput } from "@/lib/content";
 import { assertSavActor } from "@/lib/sav/access";
 import { savContentHash } from "@/lib/sav/crypto";
@@ -214,9 +214,10 @@ export async function prepareOnboardingReview(candidate: typeof knowledgeProject
   if (target && (target.status === "archived" || target.agentKey !== "sav")) throw new Error("KNOWLEDGE_TARGET_STALE");
   const baseVersionId = target?.currentDraftVersionId ?? target?.publishedVersionId ?? null;
   const [base] = baseVersionId ? await db.select().from(contentVersions).where(eq(contentVersions.id, baseVersionId)) : [];
+  const [active] = target ? await db.select().from(savKnowledgeActivations).where(eq(savKnowledgeActivations.itemId, target.id)) : [];
   const comparison = hubspotComparison({ id: candidate.id, proposedInput: proposed }, await knowledgeComparisonInventory(db));
   const quality = source.evidence.quality as { missing: string[]; warnings: string[] };
-  return { ...comparison, snapshot: savContentHash({ comparison: comparison.snapshot, source: snapshot, document, target: target?.id ?? null, baseVersionId }),
+  return { ...comparison, snapshot: savContentHash({ comparison: comparison.snapshot, source: snapshot, document, target: target?.id ?? null, baseVersionId, activeVersionId: active?.versionId ?? null }),
     sourceCurrent: true, title: snapshot.title, missing: quality.missing, warnings: quality.warnings,
     targetItemId: target?.id ?? null, baseVersionId, before: base?.bodyMarkdown ?? "", after: proposed.bodyMarkdown };
 }

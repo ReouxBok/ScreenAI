@@ -4,7 +4,7 @@ test("SAV-40 : Ugo prépare et réédite un modèle lead privé sans l’activer
   test.setTimeout(120_000);
   await page.setExtraHTTPHeaders({ "x-studio-test-user": "ugo@limova.ai" });
   const errors: string[] = []; page.on("pageerror", error => errors.push(error.message));
-  await page.goto("/studio/sav/connaissances");
+  await page.goto("/studio/sav/connaissances/imports");
   await page.getByRole("link", { name: "Préparer une connaissance SAV" }).click();
   await page.getByRole("textbox", { name: "Titre", exact: true }).fill("Découverte produit fictive SAV40 E2E");
   await page.getByLabel("Slug stable").fill("lead-knowledge-sav40-e2e");

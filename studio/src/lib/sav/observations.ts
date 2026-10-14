@@ -1,6 +1,6 @@
 import "server-only";
 import { randomUUID } from "node:crypto";
-import { and, asc, desc, eq, isNotNull, isNull, lte, or } from "drizzle-orm";
+import { and, asc, desc, eq, isNotNull, isNull, lte, or, sql } from "drizzle-orm";
 import { z } from "zod";
 import { requireDb } from "@/db";
 import { auditLogs, knowledgeFamilySources, knowledgeProjectionCandidates, savDraftVerdicts, savLearningCandidates, savResolutionEvidence, savMessages, savObservationCycles, savObservationEvents, savResolutionObservations, savThreads, savTicketSnapshots } from "@/db/schema";
@@ -22,7 +22,7 @@ async function invalidateObservationCandidates(tx: Parameters<Parameters<ReturnT
         if (candidate.id === exceptId || candidate.status === "rejected") continue;
         await tx.update(savLearningCandidates).set({ status: "rejected", explanation: `${candidate.explanation}\nPreuves actualisées : qualification antérieure devenue obsolète.` }).where(eq(savLearningCandidates.id, candidate.id));
         if (candidate.contentItemId) await tx.update(savResolutionEvidence).set({ outcome: "superseded", weight: 0 }).where(and(eq(savResolutionEvidence.sourceRef, sourceRef), eq(savResolutionEvidence.itemId, candidate.contentItemId)));
-        const sources = await tx.select().from(knowledgeFamilySources).where(eq(knowledgeFamilySources.sourceRef, `sav-learning:${candidate.id}`));
+        const sources = await tx.select().from(knowledgeFamilySources).where(or(eq(knowledgeFamilySources.sourceRef, `sav-learning:${candidate.id}`), sql`${knowledgeFamilySources.evidence}->>'learningCandidateId' = ${candidate.id}`));
         for (const source of sources) await tx.update(knowledgeProjectionCandidates).set({ status: "rejected", explanation: "La preuve SAV source est devenue obsolète. Nouvelle qualification requise." }).where(eq(knowledgeProjectionCandidates.sourceId, source.id));
         await tx.insert(auditLogs).values({ actorEmail: "system", action: "sav_observation_candidate_invalidated", entityType: "sav_learning_candidate", entityId: candidate.id, technicalMetadata: { previousStatus: candidate.status, sourceRef } });
     }

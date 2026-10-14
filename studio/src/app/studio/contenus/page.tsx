@@ -38,8 +38,8 @@ export default async function ContentPage({ searchParams }: { searchParams: Prom
       const published = items.filter(({ item }) => item.status === "published").length;
       return <section className="agent-group card" key={agent.key} id={agent.key}>
         <header><span className="agent-monogram" style={{ background: agent.color }}>{agent.name[0]}</span><div><h2>{agent.name}</h2><p>{agent.role}</p></div><span className="mastery">{published}/{items.length} validés</span></header>
-        <div className="agent-content-list">{items.map(({ item, category, metadata }) => {
-          const toggleAllowed = canEditContent(staff.role, item.publishedVersionId);
+        <div className="agent-content-list">{items.map(({ item, category, metadata, savActiveVersionId }) => {
+          const toggleAllowed = canEditContent(staff.role, item.publishedVersionId) && (item.agentKey !== "sav" || staff.email === "ugo@limova.ai");
           const readiness = assessContentReadiness({
             type: item.type,
             metadata: (metadata ?? {}) as Record<string, unknown>,
@@ -53,6 +53,7 @@ export default async function ContentPage({ searchParams }: { searchParams: Prom
             <form action={setAiEnabledAction} className="ai-toggle-form">
               <input type="hidden" name="itemId" value={item.id}/>
               <input type="hidden" name="enabled" value={String(!item.aiEnabled)}/>
+              {item.agentKey === "sav" && <><input type="hidden" name="expectedPublishedVersionId" value={item.publishedVersionId ?? ""}/><input type="hidden" name="expectedActiveVersionId" value={savActiveVersionId ?? ""}/></>}
               <button
                 type="submit"
                 role="switch"

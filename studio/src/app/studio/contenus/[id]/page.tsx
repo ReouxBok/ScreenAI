@@ -111,9 +111,9 @@ export default async function DetailPage({ params, searchParams }: {
         </section>
         <div className="section-heading"><h2>Historique</h2></div>
         <div className="table-wrap"><table><thead><tr><th>Version</th><th>Auteur</th><th>Commentaire</th><th>Date</th><th></th></tr></thead><tbody>{detail.versions.map((version) => <tr key={version.id}>
-          <td>v{version.version}{detail.item.publishedVersionId === version.id ? " · active" : ""}</td>
+          <td>v{version.version}{detail.item.publishedVersionId === version.id ? (detail.item.agentKey === "sav" ? " · publiée" : " · active") : ""}</td>
           <td>{version.authorEmail}</td><td>{version.changeNote}</td><td>{version.createdAt.toLocaleString("fr-FR")}</td>
-          <td>{isAdmin && detail.item.publishedVersionId !== version.id && <details><summary>Restaurer</summary><form action={rollbackAction} className="admin-action compact"><input type="hidden" name="itemId" value={id}/><input type="hidden" name="versionId" value={version.id}/><input type="hidden" name="reason" value={`Restauration manuelle de la version ${version.version}`}/><button>Confirmer</button></form></details>}</td>
+          <td>{isAdmin && detail.item.publishedVersionId !== version.id && <details><summary>{detail.item.agentKey === "sav" ? "Restaurer la version publiée" : "Restaurer"}</summary><form action={rollbackAction} className="admin-action compact"><input type="hidden" name="itemId" value={id}/><input type="hidden" name="versionId" value={version.id}/><input type="hidden" name="reason" value={`Restauration manuelle de la version ${version.version}`}/>{detail.item.agentKey === "sav" && <p>La version actuellement utilisée par le SAV reste active. Une activation séparée sera nécessaire.</p>}<button>Confirmer</button></form></details>}</td>
         </tr>)}</tbody></table></div>
       </section>
       <aside className="publication-rail card"><span className="eyebrow">Chemin éditorial</span><div style={{ height: 18 }}/>{steps.map((step) => <div key={step} className={`rail-step ${detail.item.status === step ? "active" : ""}`}>{step === "draft" ? "Brouillon" : step === "in_review" ? "À valider" : step === "published" ? "Publié" : "Archivé"}</div>)}<hr/><p className="muted">La version active reste servie tant que les embeddings et les tests de la suivante ne sont pas validés.</p></aside>

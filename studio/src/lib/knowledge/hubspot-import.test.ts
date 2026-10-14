@@ -206,7 +206,7 @@ describe("private HubSpot knowledge import", () => {
     expect(await searchKnowledge({ query: "export démonstration", scope: "sav" })).toMatchObject({ results: [] });
     await publish(approved.targetItemId!, "ugo@limova.ai", { expectedVersionId: approved.materializedVersionId! });
     expect(await searchKnowledge({ query: "export démonstration", scope: "sav" })).toMatchObject({ results: [] });
-    await setContentAiEnabled(approved.targetItemId!, true, "ugo@limova.ai");
+    await setContentAiEnabled(approved.targetItemId!, true, "ugo@limova.ai", { expectedPublishedVersionId: approved.materializedVersionId!, expectedActiveVersionId: null });
     const found = await searchKnowledge({ query: "export démonstration", scope: "sav" });
     const [version] = await fixture.db.select().from(contentVersions);
     expect(found.results).toHaveLength(1);

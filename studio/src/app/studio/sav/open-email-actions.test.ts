@@ -1,11 +1,11 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-const dependencies = vi.hoisted(() => ({ auth: vi.fn(), context: vi.fn(), opened: vi.fn(), revalidate: vi.fn(), redirect: vi.fn() }));
+const dependencies = vi.hoisted(() => ({ auth: vi.fn(), context: vi.fn(), opened: vi.fn(), localOpened: vi.fn(), revalidate: vi.fn(), redirect: vi.fn() }));
 vi.mock("@/lib/sav/auth", () => ({ requireSavApiStaff: dependencies.auth }));
-vi.mock("@/lib/sav/opened-email", () => ({ recordSavEmailOpened: dependencies.opened }));
+vi.mock("@/lib/sav/opened-email", () => ({ recordSavEmailOpened: dependencies.opened, recordSavDossierOpened: dependencies.localOpened }));
 vi.mock("next/cache", () => ({ revalidatePath: dependencies.revalidate }));
 vi.mock("next/navigation", () => ({ redirect: dependencies.redirect }));
 vi.mock("@/lib/sav/dossier-context", () => ({ collectLatestSavDossierContext: dependencies.context }));
-import { openSavEmailAction } from "./open-email-actions";
+import { openSavEmailAction, recordSavDossierOpenedAction } from "./open-email-actions";
 const threadId = "10000000-0000-4000-8000-000000000001";
 const messageId = "10000000-0000-4000-8000-000000000002";
 function form() { const data = new FormData(); data.set("threadId", threadId); data.set("messageId", messageId); data.set("actorEmail", "untrusted@example.invalid"); return data; }
@@ -48,4 +48,16 @@ it.each(["partial", "error"])("opens the dossier with a failure notice for %s CR
 it("keeps the dossier readable if context refresh throws", async () => {
   dependencies.context.mockRejectedValue(new Error("fixture"));
   await expect(openSavEmailAction(form())).rejects.toThrow("&context=failed");
+});
+
+it("records direct displayed opening through authenticated local POST only", async () => {
+  dependencies.localOpened.mockResolvedValue({ opened: true });
+  expect(await recordSavDossierOpenedAction(threadId, messageId)).toEqual({ ok: true });
+  expect(dependencies.localOpened).toHaveBeenCalledWith({ threadId, messageId }, "ugo@limova.ai");
+  expect(dependencies.context).not.toHaveBeenCalled(); expect(dependencies.opened).not.toHaveBeenCalled();
+});
+it("reports a local opening failure without filing or enriching", async () => {
+  dependencies.localOpened.mockRejectedValue(new Error("fixture"));
+  expect(await recordSavDossierOpenedAction(threadId, messageId)).toEqual({ ok: false });
+  expect(dependencies.context).not.toHaveBeenCalled(); expect(dependencies.opened).not.toHaveBeenCalled();
 });
