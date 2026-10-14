@@ -11,7 +11,7 @@ vi.mock("./hubspot-review-form", () => ({ HubspotReviewForm: () => createElement
 vi.mock("next/navigation", () => ({ useRouter: () => ({ refresh: vi.fn(), push: vi.fn() }), redirect: (url: string) => { throw new Error(`REDIRECT:${url}`); }, notFound: () => { throw new Error("NOT_FOUND"); } }));
 import Library from "./page";
 import Detail from "./[id]/page";
-import { KnowledgeProposalForm } from "./proposal-form";
+import { KnowledgeProposalForm, KnowledgeProposalPreviewDocument } from "./proposal-form";
 import { KnowledgePublication } from "./workspace-review";
 import { safeKnowledgeReturn, knowledgeErrorMessage } from "./workspace-labels";
 const id = "00550000-0000-4000-8000-000000000001";
@@ -63,6 +63,10 @@ describe("SAV-55 knowledge screens", () => {
     const html = renderToStaticMarkup(createElement(KnowledgeProposalForm, { initial: null }));
     expect(html).toContain("Nouvelle connaissance"); expect(html).toContain("Améliorer une connaissance existante"); expect(html).toContain("Enregistrer le brouillon"); expect(html).toContain("Sources et preuves");
     expect(html).not.toContain("Confirmer et soumettre à validation"); expect(html).not.toContain("JSON");
+  });
+  it("previews the persisted draft title, procedure and sources returned by the server", () => {
+    const html = renderToStaticMarkup(createElement(KnowledgeProposalPreviewDocument, { draft: { title: "Titre du tutoriel conservé", document: { ...document, objective: "Procédure A enregistrée dans un autre onglet" }, sources: [{ ref: "studio:preuve-A", label: "Preuve enregistrée A" }] } }));
+    expect(html).toContain("Titre du tutoriel conservé"); expect(html).toContain("Procédure A enregistrée dans un autre onglet"); expect(html).toContain("Preuve enregistrée A"); expect(html).toContain("studio:preuve-A");
   });
   it("blocks external return targets and translates stale errors", () => {
     expect(safeKnowledgeReturn("https://example.invalid/steal")).toBe("/studio/sav/connaissances");
