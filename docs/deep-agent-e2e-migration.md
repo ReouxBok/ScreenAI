@@ -196,3 +196,7 @@ La recette `limova-voice-browser-workflow.spec.js` ajoute dix résultats dans un
 Cette recette a révélé une coupure du socket au neuvième outil quand la page pilotée hébergeait aussi la passerelle vocale. La connexion navigateur utilise maintenant un onglet app inactif dédié et libéré à l’arrêt, avec protection des onglets repris par l’utilisateur. Voir `deep-agent-live-transport.md`. Le faux serveur choisit les actions et conserve l’historique ; ni intelligence modèle ni stockage distant ne sont revendiqués.
 
 Les trois scénarios legacy restent à ce stade : la correspondance finale de la recherche de connaissances, des relances et des suggestions vocales doit encore être explicitée, ainsi que les deux autres parcours restants. Aucun scénario n’est supprimé par cette correction.
+
+## Micro formateur après navigation
+
+La recette de formation garde maintenant le micro actif pendant les contrôles, les fenêtres OAuth et la navigation complète. Elle reproduisait un arrêt au changement de document avant correction. L’onglet app dédié à la transcription conserve la connexion : une note avant et une note après navigation rejoignent la même session Studio, sans seconde connexion. Le retrait du consentement arrête ensuite le PCM et retire uniquement l’onglet technique ; la vidéo est finalisée séparément par l’utilisateur. Deux variantes OAuth passent avec services simulés. Les trois scénarios legacy restent inchangés.
