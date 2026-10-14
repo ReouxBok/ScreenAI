@@ -68,8 +68,10 @@ for (const popupMode of ['sequential', 'overlapping']) test(`training preserves 
     response.writeHead(authenticated ? 200 : 401, headers);
     response.end(JSON.stringify(data));
   });
+  let transcriptionSocket;
   const io = new Server(server, { cors: { origin: APP, credentials: true }, transports: ['websocket'] });
   io.of('/voice/transcribe').on('connection', socket => {
+    transcriptionSocket = socket;
     seen.connected += 1;
     seen.cookie = socket.handshake.headers.cookie?.includes('live_fixture=authenticated') === true;
     seen.origin = socket.handshake.headers.origin;
@@ -163,13 +165,6 @@ for (const popupMode of ['sequential', 'overlapping']) test(`training preserves 
     expect(seen.pcm.sessionId).toBe(SESSION);
     await expect.poll(() => notes.filter(note => note.kind === 'voice_note').map(note => note.label)).toEqual(['Je sélectionne le compte HubSpot.']);
     await expect(extensionPage.locator('#limovaConversation')).toBeDisabled();
-    await worker.evaluate(() => chrome.storage.local.set({ limova_ai_processing_consent_v1: false }));
-    await expect(extensionPage.locator('#voiceBtn')).toHaveAttribute('aria-pressed', 'false');
-    await expect.poll(() => seen.disconnected).toBe(1);
-    await expect(extensionPage.locator('#limovaConversation')).toBeEnabled();
-    const sequence = seen.pcm.sequence;
-    await extensionPage.waitForTimeout(200);
-    expect(seen.pcm.sequence).toBe(sequence);
     expect(await app.evaluate(() => window.clicks)).toBe(0);
     expect(seen.httpChecks.filter(call => call.method === 'POST')).toEqual([]);
     await expect(extensionPage.locator('.message.user, .message.assistant')).toHaveCount(0);
@@ -231,6 +226,24 @@ for (const popupMode of ['sequential', 'overlapping']) test(`training preserves 
     expect(await extensionPage.evaluate(() => window.trainingVideoStream.getTracks().every(track => track.readyState === 'live'))).toBe(true);
     await app.locator('#safeNavigation').click();
     await expect.poll(() => JSON.stringify(notes)).toContain('Ouvrir mon profil');
+    await expect(app).toHaveURL(`${APP}/profile`);
+    await expect(extensionPage.locator('#voiceBtn')).toHaveAttribute('aria-pressed', 'true');
+    expect((await worker.evaluate(async origin => chrome.tabs.query({ url: `${origin}/*` }), APP))).toHaveLength(2);
+    const afterNavigationSequence = seen.pcm.sequence;
+    await expect.poll(() => seen.pcm.sequence).toBeGreaterThan(afterNavigationSequence);
+    expect(seen.disconnected).toBe(0);
+    transcriptionSocket.emit('final_transcript', { text: 'Le profil est maintenant ouvert.' });
+    await expect.poll(() => notes.filter(note => note.kind === 'voice_note').map(note => note.label))
+      .toEqual(['Je sélectionne le compte HubSpot.', 'Le profil est maintenant ouvert.']);
+    await worker.evaluate(() => chrome.storage.local.set({ limova_ai_processing_consent_v1: false }));
+    await expect(extensionPage.locator('#voiceBtn')).toHaveAttribute('aria-pressed', 'false');
+    await expect.poll(() => seen.disconnected).toBe(1);
+    await expect.poll(() => worker.evaluate(async origin => (await chrome.tabs.query({ url: `${origin}/*` })).length, APP)).toBe(1);
+    await expect(extensionPage.locator('#limovaConversation')).toBeEnabled();
+    const sequence = seen.pcm.sequence;
+    await extensionPage.waitForTimeout(200);
+    expect(seen.pcm.sequence).toBe(sequence);
+
     await extensionPage.locator('#trainingStop').click();
     if (popupMode === 'sequential') {
       await expect(extensionPage.locator('#trainingStop')).toHaveText('Réessayer l’envoi de la vidéo');
@@ -267,7 +280,7 @@ for (const popupMode of ['sequential', 'overlapping']) test(`training preserves 
     }, videoParts[0].toString('base64'));
     expect(dimensions).toEqual([320, 180]);
     expect(JSON.stringify(notes)).not.toMatch(/OAUTH_PRIVATE|TRAINING_PRIVATE_TYPED_VALUE|PRIVATE_FIELD_VALUE|NEVER_TRANSMIT_THIS_SECRET/);
-    expect(notes.filter(note => note.kind === 'voice_note').map(note => note.label)).toEqual(['Je sélectionne le compte HubSpot.']);
+    expect(notes.filter(note => note.kind === 'voice_note').map(note => note.label)).toEqual(['Je sélectionne le compte HubSpot.', 'Le profil est maintenant ouvert.']);
     expect(JSON.stringify(notes)).toContain('Instructions');
     expect(studioCalls.find(call => call.path.endsWith('/connect') && call.method === 'POST')?.body)
       .toEqual({ token: 'local-training-fixture-token-no-secret' });

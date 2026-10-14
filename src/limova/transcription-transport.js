@@ -1,19 +1,23 @@
-import { createLimovaAppTarget } from './app-target.js';
+import { createLimovaAppLease } from './app-target.js';
 import { TRANSCRIPTION_PORT } from './transcription-bridge.js';
 
 const unavailable = () => new Error('La transcription Limova a été interrompue.');
 
 export function createTranscriptionTransport(chrome) {
-  const prepare = createLimovaAppTarget(chrome, 'src/limova/app-transcription-bridge.js');
   return async ({ context, languageCode, signal, onEvent = () => {}, onError = () => {} }) => {
     signal?.throwIfAborted();
-    const target = await prepare(signal); signal?.throwIfAborted();
-    const port = chrome.tabs.connect(target.tabId, { documentId: target.documentId, name: TRANSCRIPTION_PORT });
+    const target = await createLimovaAppLease(chrome, 'src/limova/app-transcription-bridge.js', signal);
+    let port;
+    try {
+      signal?.throwIfAborted();
+      port = chrome.tabs.connect(target.tabId, { documentId: target.documentId, name: TRANSCRIPTION_PORT });
+    } catch (error) { await target.release(); throw error; }
     return new Promise((resolve, reject) => {
       let ready = false, closed = false, consuming = false, sequence = 1, audioSequence = 0;
       const stop = error => {
         if (closed) return;
         closed = true; signal?.removeEventListener('abort', abort); port.disconnect();
+        void target.release();
         if (!ready) reject(error ?? unavailable()); else if (error) onError(error);
       };
       const abort = () => stop(signal.reason ?? unavailable());
