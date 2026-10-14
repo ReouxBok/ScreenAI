@@ -82,6 +82,12 @@ describe("SAV-55 dashboard read model", () => {
     expect(result.counts).toMatchObject({ to_process: 0, to_validate: 2, completed: 1 });
     expect(result.rows.find(r => r.messageId === linked.message.id)).toMatchObject({ ticketProgress: "required", ticket: { id: "456", status: "Statut à actualiser" } });
   });
+  it("honors a legacy opening audit emitted after the migration during a rolling release", async () => {
+    const row = await seed();
+    await fixture.db.insert(auditLogs).values({ actorEmail: "ugo@limova.ai", action: "sav_email_opened", entityType: "sav_message", entityId: row.message.id, technicalMetadata: { gmailFilingStatus: "failed" } });
+    const result = await listSavDossierDashboard({ view: "to_validate" });
+    expect(result.rows[0].opening).toBe("opened"); expect(result.counts.to_process).toBe(0);
+  });
   it("does not call failed, pending or dispatched-but-unacknowledged actions confirmed", async () => {
     for (const status of ["pending", "failed", "succeeded"] as const) { const row = await seed({ approved: true, opening: "opened" }); await ticket(row, status); }
     const uncertain = await seed({ approved: true, opening: "opened" }); await ticket(uncertain, "failed", { ticketCreateDispatchedAt: new Date().toISOString() });

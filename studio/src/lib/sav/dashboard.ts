@@ -1,7 +1,7 @@
 import "server-only";
 import { and, asc, desc, eq, inArray, isNull, sql } from "drizzle-orm";
 import { requireDb } from "@/db";
-import { activeKnowledge, savActions, savAgentRuns, savDecisions, savDraftVerdicts, savLearningCandidates, savMessages, savObservationCycles, savPilotItems, savProposalReviews, savResolutionObservations, savThreads } from "@/db/schema";
+import { activeKnowledge, auditLogs, savActions, savAgentRuns, savDecisions, savDraftVerdicts, savLearningCandidates, savMessages, savObservationCycles, savPilotItems, savProposalReviews, savResolutionObservations, savThreads } from "@/db/schema";
 import { decryptSavPayload } from "./crypto";
 import { savV0EligibleMessageFilter } from "./cutover";
 import { buildSavInboxSummary, type SavInboxPartnershipStatus } from "./inbox-summary";
@@ -72,14 +72,18 @@ export async function listSavDossierDashboard(options: { view?: string; query?: 
         .orderBy(options.sort === "oldest" ? asc(savMessages.receivedAt) : desc(savMessages.receivedAt), options.sort === "oldest" ? asc(savMessages.id) : desc(savMessages.id)).limit(250).offset(offset);
       if (!batch.length) break;
       const ids = batch.map(r => r.message.id), threads = batch.map(r => r.thread.id);
-      const [actions, observations, verdicts] = await Promise.all([
+      const [actions, observations, verdicts, openingProofs] = await Promise.all([
         db.select().from(savActions).where(inArray(savActions.threadId, threads)).orderBy(desc(savActions.createdAt), desc(savActions.id)),
         db.select().from(savResolutionObservations).where(inArray(savResolutionObservations.threadId, threads)),
         db.select().from(savDraftVerdicts).where(and(inArray(savDraftVerdicts.messageId, ids), eq(savDraftVerdicts.isCurrent, true))),
+        // Legacy writers can still emit an opening audit during a rolling
+        // deployment after the additive migration. Such a proof is not unread.
+        db.select({ messageId: auditLogs.entityId }).from(auditLogs).where(and(inArray(auditLogs.entityId, ids), eq(auditLogs.entityType, "sav_message"), inArray(auditLogs.action, ["sav_email_opened", "sav_dossier_opened"]))),
       ]);
       const cycles = observations.length ? await db.select().from(savObservationCycles).where(inArray(savObservationCycles.observationId, observations.map(o => o.id))) : [];
       const candidateIds = cycles.flatMap(c => c.candidateId ? [c.candidateId] : []);
       const candidates = candidateIds.length ? await db.select({ id: savLearningCandidates.id, status: savLearningCandidates.status }).from(savLearningCandidates).where(inArray(savLearningCandidates.id, candidateIds)) : [];
+      const openedIds = new Set(openingProofs.map(proof => proof.messageId));
       for (const { message, thread, decision, run, review } of batch) {
         let original: SavStructuredProposal | null = null, proposal: SavStructuredProposal | null = null, reviewStatus: string | null = null;
         let context: SavDossierContext | null = null, draftStatus = "Non disponible";
@@ -106,7 +110,7 @@ export async function listSavDossierDashboard(options: { view?: string; query?: 
         const partnershipTransferStatus: SavInboxPartnershipStatus | null = !partnership ? null : partnership.status === "succeeded" ? "succeeded" : partnership.payload.forwardDispatchedAt ? "uncertain" : ["pending", "running"].includes(partnership.status) ? "pending" : "failed";
         const analysisErrorCode = message.analysisErrorCode || (run && ["fallback", "failed"].includes(run.status) ? run.errorCode || "SAV_AI_GENERATION_FAILED" : null);
         const summary = buildSavInboxSummary({ subject: message.subject, analysisStatus: message.analysisStatus, analysisErrorCode, hubspotTicketId: thread.hubspotTicketId, proposal, originalProposal: original, reviewStatus, partnershipTransferStatus });
-        const opening: SavOpeningState = message.studioOpenedAt ? "opened" : message.studioOpeningTracked ? "unopened" : "unknown";
+        const opening: SavOpeningState = message.studioOpenedAt || openedIds.has(message.id) ? "opened" : message.studioOpeningTracked ? "unopened" : "unknown";
         const ticketProgress = savDashboardTicketProgress(threadActions, message.id, proposal?.decision.kind, thread.hubspotTicketId);
         const learning = savDashboardLearningProgress(observations.filter(o => o.threadId === thread.id), cycles, candidates);
         const state = classifySavDossier({ opening, reviewStatus, ticket: ticketProgress, learning });
