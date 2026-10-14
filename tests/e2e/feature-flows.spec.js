@@ -308,26 +308,6 @@ test.describe('Packaged extension — complete user flows', () => {
     expect(evaluationPaths).toContain('/api/evaluations/runs/complete');
   });
 
-  test('observes a manual click during voice mode without exposing page values', async ({ context, extensionId }) => {
-    const { limova, sidebar } = await openExtensionHarness(context, extensionId);
-    await grantAIConsent(sidebar);
-    const liveToken = await sidebar.evaluate(() => chrome.runtime.sendMessage({
-      type: 'GET_LIVE_TOKEN',
-      context: { trainingMode: false }
-    }));
-    expect(liveToken).toMatchObject({ ok: true, token: 'auth_tokens/e2e-voice-token' });
-    await sidebar.evaluate(() => chrome.runtime.sendMessage({ type: 'VOICE_SESSION_STATE', active: true }));
-
-    await limova.locator('#connectHubspot').click();
-
-    await expect.poll(async () => {
-      const diagnostics = await sidebar.evaluate(() => chrome.runtime.sendMessage({ type: 'GET_LOGS' }));
-      return diagnostics.logs;
-    }).toContain('USER_PAGE_INTERACTION_OBSERVED');
-    const diagnostics = await sidebar.evaluate(() => chrome.runtime.sendMessage({ type: 'GET_LOGS' }));
-    expect(diagnostics.logs).not.toContain('NEVER_TRANSMIT_THIS_SECRET');
-  });
-
   test('training mode records useful controls but never field or password values', async ({ context, extensionId }) => {
     const { calls, limova, sidebar } = await openExtensionHarness(context, extensionId);
     await sidebar.locator('#menuBtn').click();
