@@ -31,7 +31,8 @@ test("ouverture directe et retour conservent le contexte sans classer Gmail", as
   await page.goto(`/studio/sav/${SAV55_THREADS.review}?review=saved`);
   await expect(page.getByRole("link", { name: "← Retour aux dossiers", exact: true })).toHaveAttribute("href", returnTo);
   await page.getByRole("link", { name: "← Retour aux dossiers", exact: true }).click();
-  await expect(page).toHaveURL(/view=to_validate.*q=SAV55.*sort=oldest/);
+  // The opening action invalidates the router cache; navigation waits for its streamed response.
+  await expect(page).toHaveURL(/view=to_validate.*q=SAV55.*sort=oldest/, { timeout: 30_000 });
   expect(external).toEqual([]);
 });
 test("sur ordinateur, le dernier email reste replié et l’historique complet défile", async ({ page }, testInfo) => {

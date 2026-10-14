@@ -47,3 +47,7 @@
 .timeline p { margin: 5px 0; }
 @media(max-width: 1000px) { .comparison { grid-template-columns: 1fr; } .tabs { display: flex; flex-wrap: wrap; } .tab { flex: 1 1 220px; } }
 @media(max-width: 650px) { .panel { padding: 18px; } .sources { grid-template-columns: 1fr; } .toolbar label { flex: 1 1 100%; } .toolbar input { min-width: 0; width: 100%; } .text { max-height: 480px; } }
+
+/* Match the existing Studio field treatment on the dedicated SAV forms. */
+.workspace input:not([type=checkbox]):not([type=radio]), .workspace textarea, .workspace select { min-width: 0; border: 1px solid #cad2cc; border-radius: 9px; background: #fff; color: #141a17; padding: 11px 12px; line-height: 1.4; }
+.editor fieldset > button { justify-self: start; }
