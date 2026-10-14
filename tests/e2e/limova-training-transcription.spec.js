@@ -19,7 +19,7 @@ const BROWSER_TURN = '66666666-6666-4666-8666-666666666666';
 const BROWSER_SESSION = '77777777-7777-4777-8777-777777777777';
 const PAGE = { tabId: 7, origin: 'https://example.com', contextVersion: 1 };
 
-test('training microphone sends native PCM and writes the final note into the active Studio demonstration', async () => {
+for (const popupMode of ['sequential', 'overlapping']) test(`training preserves native PCM notes across ${popupMode} OAuth windows`, async () => {
   test.skip(environment.name === 'staging', 'The isolated staging package intentionally has no production Studio permission.');
   const directory = await mkdtemp(path.join(tmpdir(), 'limova-live-test-'));
   const key = path.join(directory, 'key.pem'), cert = path.join(directory, 'cert.pem');
@@ -149,6 +149,46 @@ test('training microphone sends native PCM and writes the final note into the ac
     expect(seen.httpChecks.filter(call => call.method === 'POST')).toEqual([]);
     await expect(extensionPage.locator('.message.user, .message.assistant')).toHaveCount(0);
     expect(JSON.stringify(notes)).not.toMatch(/PRIVATE_FIELD_VALUE|NEVER_TRANSMIT_THIS_SECRET/);
+    await context.route('https://accounts.google.com/**', route => route.fulfill({
+      contentType: 'text/html', body: '<title>OAuth fixture</title><input type="password" value="OAUTH_PRIVATE_PASSWORD"><p>OAUTH_PRIVATE_CONTENT</p>',
+    }));
+    const openPopup = async name => {
+      const opened = context.waitForEvent('page');
+      await app.evaluate(name => window.open(
+        `https://accounts.google.com/o/oauth2/v2/auth?state=OAUTH_PRIVATE_STATE&window=${name}`,
+        name, 'popup,width=500,height=620'), name);
+      const popup = await opened;
+      await popup.waitForLoadState();
+      await popup.bringToFront();
+      return popup;
+    };
+    const firstPopup = await openPopup('first-account-chooser');
+    await expect(extensionPage.locator('#trainingFeedback')).toContainText('Fenêtre de connexion externe ouverte');
+    await expect(extensionPage.locator('#tabWarning')).toBeHidden();
+    await expect(extensionPage.locator('#limovaReturnTab')).toBeHidden();
+    if (popupMode === 'sequential') {
+      await firstPopup.close();
+      // Exercise Google's short gap between account chooser and consent window.
+      await extensionPage.waitForTimeout(800);
+    }
+    expect(notes.filter(note => note.label === 'Fenêtre d’autorisation externe fermée')).toHaveLength(0);
+    const secondPopup = await openPopup('second-consent');
+    if (popupMode === 'overlapping') {
+      await firstPopup.close();
+      await expect(extensionPage.locator('#trainingFeedback')).toContainText('Fenêtre de connexion externe ouverte');
+      expect(notes.filter(note => note.label === 'Fenêtre d’autorisation externe fermée')).toHaveLength(0);
+    }
+    await expect(extensionPage.locator('#tabWarning')).toBeHidden();
+    await expect(extensionPage.locator('#limovaReturnTab')).toBeHidden();
+    await secondPopup.close();
+    await expect(extensionPage.locator('#trainingFeedback')).toContainText('Charly relit maintenant', { timeout: 6000 });
+    await expect.poll(() => notes.filter(note => note.label === 'Fenêtre d’autorisation externe fermée').length).toBe(1);
+    expect(notes.filter(note => note.label === 'Fenêtre d’autorisation externe ouverte')).toHaveLength(1);
+    expect(notes.find(note => note.label === 'Fenêtre d’autorisation externe fermée')).toMatchObject({
+      payload: { phase: 'closed', popupCount: 2 },
+    });
+    expect(JSON.stringify(notes)).not.toMatch(/OAUTH_PRIVATE|PRIVATE_FIELD_VALUE|NEVER_TRANSMIT_THIS_SECRET/);
+    expect(await extensionPage.evaluate(() => window.recordingCalls)).toEqual(['start', 'begin']);
     await extensionPage.locator('#trainingStop').click();
     await expect(extensionPage.locator('#trainingFeedback')).toContainText('Démonstration et vidéo enregistrées');
     expect(await extensionPage.evaluate(() => window.recordingCalls)).toEqual(['start', 'begin', 'upload']);

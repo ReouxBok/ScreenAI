@@ -409,52 +409,7 @@ test.describe('Packaged extension — complete user flows', () => {
     }));
   });
 
-  test('sequential Gmail OAuth windows stay one stable flow without a wrong-tab warning', async ({ context, extensionId }) => {
-    const { calls, limova, sidebar } = await openExtensionHarness(context, extensionId);
-    await sidebar.locator('#menuBtn').click();
-    await sidebar.locator('#trainingBtn').click();
-    await sidebar.locator('#trainingToken').fill('training-token-gmail-oauth-e2e-long-enough');
-    await stubTrainingScreenRecording(sidebar);
-    await sidebar.locator('#trainingStart').click();
-    await expect(sidebar.locator('#trainingFeedback')).toContainText('Écran entier enregistré');
 
-    const firstPopupPromise = context.waitForEvent('page');
-    await limova.evaluate(() => window.open(
-      'https://accounts.google.com/o/oauth2/v2/auth?client_id=redacted',
-      'gmail-oauth-first',
-      'popup,width=500,height=620'
-    ));
-    const firstPopup = await firstPopupPromise;
-    await firstPopup.waitForLoadState();
-    await expect(sidebar.locator('#trainingFeedback')).toContainText('Fenêtre de connexion externe ouverte');
-    await expect(sidebar.locator('#tabWarning')).toBeHidden();
-    await firstPopup.close();
-
-    // Google can replace a short-lived account chooser with a second window.
-    // The three-second grace period must keep both tabs in one OAuth lifecycle.
-    await new Promise(resolve => setTimeout(resolve, 800));
-    const secondPopupPromise = context.waitForEvent('page');
-    await limova.evaluate(() => window.open(
-      'https://accounts.google.com/signin/oauth/consent?client_id=redacted',
-      'gmail-oauth-second',
-      'popup,width=500,height=620'
-    ));
-    const secondPopup = await secondPopupPromise;
-    await secondPopup.waitForLoadState();
-    await expect(sidebar.locator('#tabWarning')).toBeHidden();
-    await secondPopup.close();
-    await expect(sidebar.locator('#trainingFeedback')).toContainText('Charly relit maintenant', { timeout: 6_000 });
-
-    await sidebar.locator('#trainingStop').click();
-    await expect(sidebar.locator('#trainingFeedback')).toContainText('Démonstration et vidéo enregistrées');
-    const trainingEvents = calls.training
-      .filter(request => request.url().endsWith('/events'))
-      .map(request => request.postDataJSON());
-    expect(trainingEvents.filter(event => event.label === 'Fenêtre d’autorisation externe ouverte')).toHaveLength(1);
-    expect(trainingEvents.filter(event => event.label === 'Fenêtre d’autorisation externe fermée')).toEqual([
-      expect.objectContaining({ payload: expect.objectContaining({ popupCount: 2 }) })
-    ]);
-  });
 
 
 
