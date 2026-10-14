@@ -466,10 +466,7 @@ export async function forgetMemory(userKey: string, query: string) {
   return { ok: true, forgotten: 1 };
 }
 
-export async function exportMemory(userKey: string) {
-  const context = await bootstrapMemory(userKey, "profil projets préférences décisions");
-  return { exportedAt: new Date().toISOString(), profile: context.profile, goals: context.goals, memories: context.memories, recentMessages: context.recentMessages, summary: context.summary };
-}
+export { exportMemory } from "./export";
 
 export async function deleteAllMemory(userKey: string) {
   await requireMemoryDb().delete(copilotUsers).where(eq(copilotUsers.identityKey, userKey));
