@@ -955,29 +955,6 @@ test.describe('Packaged extension — complete user flows', () => {
     await expect(sidebar.locator('#voiceBtn')).toHaveAttribute('aria-pressed', 'false');
   });
 
-  test('voice automatically recovers once after an unexpected Live socket closure', async ({ mediaContext, mediaExtensionId }) => {
-    const context = mediaContext;
-    const sockets = [];
-    await context.routeWebSocket(/generativelanguage\.googleapis\.com\/ws\//, socket => {
-      sockets.push(socket);
-      socket.onMessage(raw => {
-        const message = JSON.parse(String(raw));
-        if (message.setup) socket.send(JSON.stringify({ setupComplete: {} }));
-      });
-    });
-    const { calls, sidebar } = await openExtensionHarness(context, mediaExtensionId);
-    await grantAIConsent(sidebar);
-    await sidebar.locator('#voiceBtn').click();
-    await expect(sidebar.locator('#statusBadge')).toContainText(/Listening|écoute|escucho/i);
-
-    await sockets[0].close({ code: 1011, reason: 'controlled-e2e-failure' });
-
-    await expect.poll(() => sockets.length).toBe(2);
-    await expect(sidebar.locator('#statusBadge')).toContainText(/Listening|écoute|escucho/i);
-    expect(calls.liveToken).toHaveLength(1);
-    await sidebar.locator('#voiceBtn').click();
-  });
-
   test('voice retries twice then displays a fallback when Gemini Live stays silent', async ({ mediaContext, mediaExtensionId }) => {
     test.setTimeout(45_000);
     const context = mediaContext;
@@ -1012,30 +989,6 @@ test.describe('Packaged extension — complete user flows', () => {
     ).length).toBe(2);
 
     await sidebar.locator('#voiceBtn').click();
-  });
-
-  test('first voice use opens the full-tab permission bridge before requesting any token', async ({ context, extensionId }) => {
-    let liveSocket;
-    await context.routeWebSocket(/generativelanguage\.googleapis\.com\/ws\//, socket => {
-      liveSocket = socket;
-      socket.onMessage(raw => {
-        const message = JSON.parse(String(raw));
-        if (message.setup) socket.send(JSON.stringify({ setupComplete: {} }));
-      });
-    });
-    const { calls, sidebar } = await openExtensionHarness(context, extensionId);
-    await grantAIConsent(sidebar);
-
-    await sidebar.locator('#voiceBtn').click();
-    await expect.poll(() => context.pages().some(page => page.url().endsWith('/microphone-permission.html'))).toBe(true);
-    const permissionPage = context.pages().find(page => page.url().endsWith('/microphone-permission.html'));
-    await expect(permissionPage.locator('#allowMicrophone')).toBeVisible();
-    expect(calls.liveToken).toHaveLength(0);
-
-    await permissionPage.close();
-    await expect(sidebar.locator('.message.error .message-content').last()).toContainText(/authorization|autorisation|autorización/i);
-    expect(calls.liveToken).toHaveLength(0);
-    expect(liveSocket).toBeFalsy();
   });
 
   test('language, onboarding state, next-step request, log download and reset work from the real UI', async ({ context, extensionId }) => {

@@ -54,3 +54,13 @@ Le passage par le vrai démarrage a révélé une fuite d’alias : le texte ini
 `limova-training-permissions.spec.js` remplace le scénario legacy de récupération d’autorisation micro, avec une session Limova réelle dans la fixture. Les frontières OS de refus et de récupération sont simulées ; le panneau doit abandonner le recorder et inviter à réessayer sans contacter Studio ni commencer un tour. Ce cas fonctionne aussi avec le paquet staging, sans accès au Studio production.
 
 Il reste 19 scénarios legacy dans feature-flows. Le scénario complet d’enregistrement avec popups OAuth et le stockage réel de vidéo restent à qualifier ; les deux tests transférés ne valent pas validation de tout le Studio.
+
+## Coupures et autorisation de la voix native
+
+Le panneau vocal est testé sur quatre sorties : retrait du consentement, déconnexion serveur, absence de `session.ready` et fermeture de l’onglet d’autorisation micro. Les tests utilisent la session first-party, le transport Socket.IO et le micro/worklet Chromium ; le serveur et l’audio assistant sont contrôlés.
+
+Après déconnexion, l’extension coupe le PCM, affiche l’erreur, libère la sélection de conversation et ne se reconnecte pas automatiquement. Un nouveau clic utilisateur ouvre une nouvelle session vocale dans le même fil. Cela remplace explicitement l’ancienne récupération automatique Gemini, conformément au choix de ne pas rejouer un tour à la reconnexion. Aucune nouvelle requête HTTP de message ni appel au proxy/Gemini n’est envoyé par ces parcours.
+
+Un serveur qui ne confirme pas le démarrage provoque la fermeture après le délai réel du transport, sans commencer le PCM. Fermer l’onglet de permission rend la main sans ouvrir de socket. Les deux anciens tests correspondants (reconnexion Gemini et première autorisation) sont remplacés ; le délai de démarrage est une couverture supplémentaire.
+
+Le scénario legacy « Gemini reste silencieux après une transcription » reste présent : un timeout de démarrage ne démontre pas le traitement d’une réponse manquante après l’acceptation d’un tour. Il reste 17 scénarios legacy à traiter ; cette couche ne déclare pas la suite globale verte.
