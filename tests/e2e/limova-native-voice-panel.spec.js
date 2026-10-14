@@ -19,7 +19,7 @@ const BROWSER_TURN = '66666666-6666-4666-8666-666666666666';
 const BROWSER_SESSION = '77777777-7777-4777-8777-777777777777';
 const PAGE = { tabId: 7, origin: 'https://example.com', contextVersion: 1 };
 
-for (const ending of ['consent', 'disconnect', 'startup-timeout', 'permission-dismissed']) test(`native voice handles ${ending} without replaying a turn`, async () => {
+for (const ending of ['consent', 'disconnect', 'startup-timeout', 'permission-dismissed', 'turn-failed', 'response-timeout']) test(`native voice handles ${ending} without replaying a turn`, async () => {
   test.setTimeout(40_000);
   const directory = await mkdtemp(path.join(tmpdir(), 'limova-live-test-'));
   const key = path.join(directory, 'key.pem'), cert = path.join(directory, 'cert.pem');
@@ -70,6 +70,16 @@ for (const ending of ['consent', 'disconnect', 'startup-timeout', 'permission-di
       if (seen.action) return;
       seen.action = true;
       socket.emit('turn.deep_agent_stream.started', { sessionId: socketSessionId, turnId: VOICE_TURN });
+      if (ending === 'turn-failed') {
+        socket.emit('turn.deep_agent_stream.failed', { sessionId: socketSessionId, turnId: VOICE_TURN, error: 'PRIVATE_BACKEND_DETAIL' });
+        return;
+      }
+      if (ending === 'response-timeout') {
+        socket.emit('input.transcript.final', { sessionId: socketSessionId, turnId: VOICE_TURN, text: 'Question vocale sans réponse' });
+        socket.emit('turn.deep_agent_stream.delta', { sessionId: socketSessionId, turnId: VOICE_TURN,
+          chunk: Buffer.from(`event: values\ndata: ${JSON.stringify({ messages: [{ id: USER, role: 'user', content: 'Question vocale sans réponse' }] })}\n\n`) });
+        return;
+      }
       socket.emit('assistant.audio.delta', { sessionId: socketSessionId, sequence: 0, audio: Buffer.alloc(4800) });
       socket.emit('turn.deep_agent_stream.completed', { sessionId: socketSessionId, turnId: VOICE_TURN });
     });
@@ -103,6 +113,7 @@ for (const ending of ['consent', 'disconnect', 'startup-timeout', 'permission-di
     await extensionPage.goto(`chrome-extension://${new URL(worker.url()).host}/src/sidebar/sidebar.html`);
     await expect(extensionPage.locator('html')).toHaveAttribute('data-sidebar-ready', 'true');
     await expect(extensionPage.locator('#limovaConversation')).toHaveValue(CONVERSATION);
+    if (ending === 'response-timeout') await extensionPage.clock.install();
     await extensionPage.locator('#voiceBtn').click();
     if (ending === 'permission-dismissed') {
       await expect.poll(() => context.pages().some(page => page.url().endsWith('/microphone-permission.html'))).toBe(true);
@@ -132,6 +143,24 @@ for (const ending of ['consent', 'disconnect', 'startup-timeout', 'permission-di
       return;
     }
     await expect.poll(() => seen.pcm?.length).toBe(640);
+    if (['turn-failed', 'response-timeout'].includes(ending)) {
+      if (ending === 'response-timeout') {
+        await expect(extensionPage.locator('.message.user .message-content')).toHaveText('Question vocale sans réponse');
+        await extensionPage.clock.fastForward(90_001);
+      }
+      await expect(extensionPage.locator('#voiceBtn')).toHaveAttribute('aria-pressed', 'false');
+      await expect(extensionPage.locator('.message.error .message-content').last()).toContainText(/historique|history|historial/i);
+      await expect(extensionPage.locator('.message.error .message-content').last()).not.toContainText('PRIVATE_BACKEND_DETAIL');
+      await expect(extensionPage.locator('#limovaConversation')).toBeEnabled();
+      await expect.poll(() => seen.disconnected).toBe(1);
+      const sequence = seen.pcm.sequence;
+      await extensionPage.waitForTimeout(1_200);
+      expect(seen.pcm.sequence).toBe(sequence);
+      expect(seen.starts).toBe(1); expect(seen.connected).toBe(1);
+      expect(seen.httpChecks.filter(call => call.method === 'POST')).toEqual([]);
+      expect(legacyRequests).toEqual([]); expect(errors).toEqual([]);
+      return;
+    }
     await expect(extensionPage.locator('#voiceBtn')).toHaveAttribute('aria-pressed', 'true');
     expect(seen.browserBinding).toEqual({ browserSession: undefined, browserContext: undefined });
     expect(seen.cookie).toBe(true); expect(seen.origin).toBe(APP);

@@ -57,4 +57,60 @@ describe('native voice lifecycle', () => {
     await f.session.start(); expect(f.track.stop).toHaveBeenCalledOnce();
     expect(f.session.active).toBe(false); expect(f.options.openAudio).not.toHaveBeenCalled();
   });
+  it('waits only for a requested response, renews on progress, then stops without replay', async () => {
+    vi.useFakeTimers(); const f = fixture(); await f.session.start();
+    const callbacks = f.options.openSession.mock.calls[0][0];
+    await vi.advanceTimersByTimeAsync(120_000);
+    expect(f.session.active).toBe(true);
+    callbacks.onEvent('input.transcript.final', { text: 'Ouvre mon profil' });
+    await vi.advanceTimersByTimeAsync(89_000);
+    callbacks.onEvent('turn.deep_agent_stream.delta', { chunk: [1] });
+    await vi.advanceTimersByTimeAsync(89_000);
+    expect(f.session.active).toBe(true);
+    await vi.advanceTimersByTimeAsync(1_001);
+    expect(f.session.active).toBe(false);
+    expect(f.options.onStatus).toHaveBeenLastCalledWith(expect.objectContaining({ status: 'error', errorKey: 'voiceResponseTimeout' }));
+    expect(f.audio.stop).toHaveBeenCalledOnce(); expect(f.live.stop).toHaveBeenCalledOnce();
+    expect(f.options.openSession).toHaveBeenCalledOnce(); expect(f.live.sendAudio).not.toHaveBeenCalled();
+    callbacks.onEvent('assistant.audio.delta', { audio: [0, 1], sequence: 0 });
+    expect(f.audio.play).not.toHaveBeenCalled();
+  });
+
+  it.each(['assistant.audio.delta', 'assistant.transcript.final', 'turn.interrupted', 'turn.deep_agent_stream.interrupted'])('clears the response wait on %s', async event => {
+    vi.useFakeTimers(); const f = fixture(); await f.session.start();
+    const callbacks = f.options.openSession.mock.calls[0][0];
+    callbacks.onEvent('turn.deep_agent_stream.started', {});
+    await vi.advanceTimersByTimeAsync(89_000);
+    callbacks.onEvent(event, { audio: [0, 1], text: 'Terminé' });
+    await vi.advanceTimersByTimeAsync(120_000);
+    expect(f.session.active).toBe(true);
+    expect(f.options.onStatus).not.toHaveBeenCalledWith(expect.objectContaining({ status: 'error' }));
+    f.session.stop();
+  });
+
+  it('surfaces a native turn failure and ignores late audio without displaying server internals', async () => {
+    vi.useFakeTimers(); const f = fixture(); await f.session.start();
+    const callbacks = f.options.openSession.mock.calls[0][0];
+    callbacks.onEvent('turn.deep_agent_stream.started', {});
+    callbacks.onEvent('turn.deep_agent_stream.failed', { error: 'PRIVATE_BACKEND_DETAIL' });
+    expect(f.session.active).toBe(false);
+    expect(f.options.onStatus).toHaveBeenLastCalledWith(expect.objectContaining({ status: 'error', errorKey: 'voiceTurnFailed' }));
+    expect(JSON.stringify(f.options.onStatus.mock.calls)).not.toContain('PRIVATE_BACKEND_DETAIL');
+    await vi.advanceTimersByTimeAsync(120_000);
+    expect(f.audio.stop).toHaveBeenCalledOnce(); expect(f.live.stop).toHaveBeenCalledOnce();
+  });
+
+  it('still bounds the wait for speech after the canonical agent answer completes', async () => {
+    vi.useFakeTimers(); const f = fixture(); await f.session.start();
+    const callbacks = f.options.openSession.mock.calls[0][0];
+    callbacks.onEvent('turn.deep_agent_stream.started', {});
+    await vi.advanceTimersByTimeAsync(89_000);
+    callbacks.onEvent('turn.deep_agent_stream.completed', {});
+    await vi.advanceTimersByTimeAsync(89_000);
+    expect(f.session.active).toBe(true);
+    await vi.advanceTimersByTimeAsync(1_001);
+    expect(f.session.active).toBe(false);
+    expect(f.options.onStatus).toHaveBeenLastCalledWith(expect.objectContaining({ errorKey: 'voiceResponseTimeout' }));
+  });
+
 });

@@ -13,6 +13,7 @@ export class DeepAgentVoiceSession {
   stop(notify = true) {
     if (!this.abort) return;
     clearInterval(this.guardTimer);
+    clearTimeout(this.responseTimer); this.responseTimer = undefined;
     this.abort.abort(); this.abort = null;
     if (this.audio) this.audio.stop();
     else this.stream?.getTracks().forEach(track => track.stop());
@@ -39,6 +40,18 @@ export class DeepAgentVoiceSession {
       this.stop(false);
       this.onStatus({ status: 'error', error: error.message, errorKey: error.voiceErrorKey });
     };
+    const clearResponseWait = () => {
+      clearTimeout(this.responseTimer);
+      this.responseTimer = undefined;
+    };
+    const waitForResponse = () => {
+      clearResponseWait();
+      this.responseTimer = setTimeout(() => {
+        const error = new Error('Native voice response timed out');
+        error.voiceErrorKey = 'voiceResponseTimeout';
+        fail(error);
+      }, 90_000);
+    };
     this.onStatus({ status: 'connecting' });
     try {
       this.onState(true);
@@ -49,6 +62,15 @@ export class DeepAgentVoiceSession {
         onNativeEvent: event => { if (!abort.signal.aborted) this.onNativeEvent(event); },
         onEvent: (event, payload) => {
           if (abort.signal.aborted) return;
+          if (event === 'turn.deep_agent_stream.failed') {
+            const error = new Error('Native voice turn failed');
+            error.voiceErrorKey = 'voiceTurnFailed';
+            fail(error);
+            return;
+          }
+          if ((event === 'input.transcript.final' && payload.text?.trim()) || ['turn.deep_agent_stream.started', 'turn.deep_agent_stream.completed'].includes(event)) waitForResponse();
+          else if (this.responseTimer !== undefined && ['turn.deep_agent_stream.delta', 'assistant.transcript.delta'].includes(event)) waitForResponse();
+          else if (['assistant.audio.delta', 'assistant.transcript.final', 'turn.interrupted', 'turn.deep_agent_stream.interrupted'].includes(event)) clearResponseWait();
           if (event === 'assistant.audio.delta') {
             if (this.audio) this.audio.play(payload);
             else {

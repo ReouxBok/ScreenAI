@@ -64,3 +64,13 @@ Après déconnexion, l’extension coupe le PCM, affiche l’erreur, libère la 
 Un serveur qui ne confirme pas le démarrage provoque la fermeture après le délai réel du transport, sans commencer le PCM. Fermer l’onglet de permission rend la main sans ouvrir de socket. Les deux anciens tests correspondants (reconnexion Gemini et première autorisation) sont remplacés ; le délai de démarrage est une couverture supplémentaire.
 
 Le scénario legacy « Gemini reste silencieux après une transcription » reste présent : un timeout de démarrage ne démontre pas le traitement d’une réponse manquante après l’acceptation d’un tour. Il reste 17 scénarios legacy à traiter ; cette couche ne déclare pas la suite globale verte.
+
+## Réponse vocale manquante après le début du tour
+
+La recette ajoute maintenant l’échec explicite `turn.deep_agent_stream.failed` et un tour accepté qui cesse de progresser. Le panneau arrête la session avec un message FR/EN/ES invitant à vérifier l’historique avant de relancer une action ; il ne réutilise pas les anciennes relances techniques Gemini.
+
+Le délai de 90 secondes commence sur la transcription finale utilisateur ou le début du flux Deep Agent. Il est renouvelé par les deltas du flux ou du texte assistant, ainsi que par la fin du flux canonique qui précède la restitution vocale. Il est supprimé lors de l’audio, du texte final assistant ou de l’interruption. La fin du calcul Deep Agent ne prouve pas à elle seule que le provider vocal a répondu. Il n’expire pas une session simplement en écoute. Il n’annule pas rétroactivement un effet externe déjà exécuté.
+
+Tests unitaires avec horloge contrôlée : écoute sans demande, progression, expiration, réponses terminales, échec, arrêt audio/transport, événements tardifs et absence de détails serveur. Tests Chromium avec vrai transport : le serveur publie la question dans le flux canonique puis reste silencieux ; l’horloge du panneau avance pour vérifier le délai sans attendre 90 secondes réelles. Le backend et le provider ne sont pas qualifiés par cette simulation.
+
+Le test legacy de silence après transcription est désormais remplacé par ces cas natifs. Il reste 16 scénarios legacy. Le délai choisi doit être observé pendant le pilote, notamment pour les outils longs sans événements de progression ; aucun mécanisme de rejeu automatique n’est ajouté.

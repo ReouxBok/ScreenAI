@@ -955,42 +955,6 @@ test.describe('Packaged extension — complete user flows', () => {
     await expect(sidebar.locator('#voiceBtn')).toHaveAttribute('aria-pressed', 'false');
   });
 
-  test('voice retries twice then displays a fallback when Gemini Live stays silent', async ({ mediaContext, mediaExtensionId }) => {
-    test.setTimeout(45_000);
-    const context = mediaContext;
-    const socketMessages = [];
-    let liveSocket;
-    await context.routeWebSocket(/generativelanguage\.googleapis\.com\/ws\//, socket => {
-      liveSocket = socket;
-      socket.onMessage(raw => {
-        const message = JSON.parse(String(raw));
-        socketMessages.push(message);
-        if (message.setup) socket.send(Buffer.from(JSON.stringify({ setupComplete: {} })));
-      });
-    });
-    const { sidebar } = await openExtensionHarness(context, mediaExtensionId);
-    await grantAIConsent(sidebar);
-    await sidebar.locator('#voiceBtn').click();
-    await expect(sidebar.locator('#statusBadge')).toContainText(/Listening|écoute|escucho/i);
-
-    liveSocket.send(JSON.stringify({
-      serverContent: {
-        inputTranscription: { text: 'Ouvre les intégrations' },
-        turnComplete: true
-      }
-    }));
-    await expect(sidebar.locator('.message.user .message-content').last()).toContainText('Ouvre les intégrations');
-    await expect(sidebar.locator('.message.assistant .message-content').last()).toContainText(
-      /réponse vocale n’est pas arrivée|voice response did not arrive|respuesta de voz no ha llegado/i,
-      { timeout: 18_000 }
-    );
-    await expect.poll(() => socketMessages.filter(message =>
-      message.clientContent?.turns?.[0]?.parts?.[0]?.text?.includes('[RELANCE TECHNIQUE')
-    ).length).toBe(2);
-
-    await sidebar.locator('#voiceBtn').click();
-  });
-
   test('language, onboarding state, next-step request, log download and reset work from the real UI', async ({ context, extensionId }) => {
     const { calls, limova, sidebar } = await openExtensionHarness(context, extensionId, {
       geminiReply: ({ index }) => `Réponse de parcours ${index + 1}`
