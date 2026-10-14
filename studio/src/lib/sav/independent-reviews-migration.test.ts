@@ -9,7 +9,7 @@ it("migrates the real populated V0 journal without interpreting or altering lega
  const client=new PGlite({extensions:{vector}});const folder=await mkdtemp(path.join(tmpdir(),"sav-v0-38-39-migration-"));
  try {
   const migrations=new URL("../../../drizzle/",import.meta.url);const journal=JSON.parse(await readFile(new URL("meta/_journal.json",migrations),"utf8"));
-  const oldEntries=journal.entries.filter((e:{tag:string})=>e.tag!=="0033_sav_v0_independent_reviews");
+  const oldEntries=journal.entries.filter((e:{tag:string})=>e.tag<"0033_sav_v0_independent_reviews");
   const {mkdir}=await import("node:fs/promises");await mkdir(path.join(folder,"meta"));
   for(const e of oldEntries)await copyFile(new URL(`${e.tag}.sql`,migrations),path.join(folder,`${e.tag}.sql`));
   await writeFile(path.join(folder,"meta/_journal.json"),JSON.stringify({...journal,entries:oldEntries}));
@@ -22,7 +22,7 @@ it("migrates the real populated V0 journal without interpreting or altering lega
   await client.query("INSERT INTO sav.decisions(id,message_id,agent_run_id,kind,reason_code,explanation,confidence) VALUES ('10000000-0000-4000-8000-000000000005','10000000-0000-4000-8000-000000000003','10000000-0000-4000-8000-000000000004','ticket_pending','fixture','Fictif',800)");
   await client.query("INSERT INTO sav.proposal_reviews(id,message_id,decision_id,agent_run_id,revision,status,verdict,dimensions,before_ciphertext,after_ciphertext,comment_ciphertext,reusability,reviewed_by) VALUES ('10000000-0000-4000-8000-000000000006','10000000-0000-4000-8000-000000000003','10000000-0000-4000-8000-000000000005','10000000-0000-4000-8000-000000000004',1,'approved','correct','{}',$1,$1,$1,'none','ugo@limova.ai')",[cipher]);
   await client.query("INSERT INTO sav.reply_drafts(thread_id,message_id,decision_id,agent_run_id,review_id,revision,status,body_ciphertext,created_by) VALUES ('10000000-0000-4000-8000-000000000002','10000000-0000-4000-8000-000000000003','10000000-0000-4000-8000-000000000005','10000000-0000-4000-8000-000000000004','10000000-0000-4000-8000-000000000006',1,'validated',$1,'ugo@limova.ai')",[cipher]);
-  await copyFile(new URL("0033_sav_v0_independent_reviews.sql",migrations),path.join(folder,"0033_sav_v0_independent_reviews.sql"));await writeFile(path.join(folder,"meta/_journal.json"),JSON.stringify(journal));await migrate(db,{migrationsFolder:folder});await migrate(db,{migrationsFolder:folder});
+  for(const e of journal.entries.filter((e:{tag:string})=>e.tag>="0033_sav_v0_independent_reviews"))await copyFile(new URL(`${e.tag}.sql`,migrations),path.join(folder,`${e.tag}.sql`));await writeFile(path.join(folder,"meta/_journal.json"),JSON.stringify(journal));await migrate(db,{migrationsFolder:folder});await migrate(db,{migrationsFolder:folder});
   const reviews=await client.query<{review_scope:string;dossier_source_hash:null;after_ciphertext:string}>("SELECT review_scope,dossier_source_hash,after_ciphertext FROM sav.proposal_reviews");expect(reviews.rows).toEqual([{review_scope:"legacy_global",dossier_source_hash:null,after_ciphertext:cipher}]);
   expect((await client.query("SELECT source_hash,body_ciphertext FROM sav.reply_drafts")).rows).toEqual([{source_hash:null,body_ciphertext:cipher}]);expect((await client.query("SELECT count(*)::int AS count FROM sav.draft_verdicts")).rows).toEqual([{count:0}]);
   await client.query("DELETE FROM sav.threads WHERE id='10000000-0000-4000-8000-000000000002'");expect((await client.query("SELECT count(*)::int AS count FROM sav.reply_drafts")).rows).toEqual([{count:0}]);

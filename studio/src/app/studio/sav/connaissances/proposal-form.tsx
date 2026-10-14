@@ -41,7 +41,7 @@ export function KnowledgeProposalForm({ initial, learningCandidateId }: { initia
     locked.current = true;
     startTransition(async () => { setError(""); try { await operation(); } catch { setError("L’action n’a pas abouti. Vos saisies sont conservées ; réessayez."); } finally { locked.current = false; } });
   }
-  function useSavedDraft(saved: SavKnowledgeDraft, activeTitle?: string) {
+  function applySavedDraft(saved: SavKnowledgeDraft, activeTitle?: string) {
     setDraft(saved); setMode(saved.mode); setTargetItemId(saved.targetItemId ?? "");
     if (activeTitle) setTargetTitle(activeTitle); else if (saved.targetItemId !== targetItemId) setTargetTitle("Consultez la connaissance liée avant confirmation");
     setTitle(saved.title); setDocument(saved.document); setSources(saved.sources); setReason(saved.reason);
@@ -50,12 +50,12 @@ export function KnowledgeProposalForm({ initial, learningCandidateId }: { initia
     const result = await saveKnowledgeProposalAction({ ...(draft ? { draftId: draft.id, expectedRevision: draft.revision } : {}), mode, ...(mode === "improve" ? { targetItemId } : {}), title, document: cleanKnowledgeDocument(document), sources: sources.filter(source => source.label.trim() || source.ref.trim()), reason, ...(learningCandidateId ? { learningCandidateId } : {}) });
     if (!result.draft) { setError(result.error ?? "Enregistrement impossible."); return; }
     if (result.draft.status === "submitted" && result.draft.candidateId) { router.push(`/studio/sav/connaissances/${result.draft.candidateId}?kind=candidate`); return; }
-    useSavedDraft(result.draft); setNotice("Brouillon interne enregistré. Aucune proposition n’est soumise sans votre confirmation.");
+    applySavedDraft(result.draft); setNotice("Brouillon interne enregistré. Aucune proposition n’est soumise sans votre confirmation.");
     window.history.replaceState(null, "", `/studio/sav/connaissances/proposer?draft=${encodeURIComponent(result.draft.id)}`);
     if (showPreview) {
       const response = await previewKnowledgeProposalAction(result.draft.id);
       setPreview(response.preview); setError(response.error ?? ""); setAcknowledged(false);
-      if (response.preview) { useSavedDraft(response.preview.draft, response.preview.activeVersion?.title); requestAnimationFrame(() => previewRef.current?.focus()); }
+      if (response.preview) { applySavedDraft(response.preview.draft, response.preview.activeVersion?.title); requestAnimationFrame(() => previewRef.current?.focus()); }
     }
   }
   return <div className={styles.workspace}>
