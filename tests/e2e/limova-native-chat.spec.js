@@ -73,3 +73,26 @@ for (const reason of ['session', 'flag']) test(`native chat refuses a turn after
     await expect(panel.locator('#authEmail')).toHaveCount(0);
   }
 });
+
+
+test('downloads the selected conversation as CSV through the first-party app bridge', async ({ nativeChat }) => {
+  const { panel, calls, legacy } = nativeChat;
+  await panel.locator('#userInput').fill('Bonjour');
+  await panel.locator('#sendBtn').click();
+  await expect(panel.locator('.message.assistant')).toHaveCount(1);
+  await expect(panel.locator('#sendBtn')).toBeEnabled();
+  await panel.locator('#menuBtn').click();
+  await expect(panel.locator('#limovaExport')).toBeEnabled();
+  const downloaded = panel.waitForEvent('download');
+  await panel.locator('#limovaExport').click();
+  const download = await downloaded;
+  expect(download.suggestedFilename()).toBe(`limova-conversation-${CONVERSATION}.csv`);
+  const stream = await download.createReadStream();
+  const chunks = [];
+  for await (const chunk of stream) chunks.push(chunk);
+  expect(Buffer.concat(chunks).toString('utf8')).toBe('Timestamp,Sender,Content\n2026-10-14,Charly,"Bonjour é"\n');
+  expect(calls.filter(call => call.path.endsWith('/download'))).toEqual([
+    expect.objectContaining({ path: `/conversation/${CONVERSATION}/download`, authenticated: true, workspace: WORKSPACE, method: 'GET' }),
+  ]);
+  expect(legacy).toEqual([]);
+});

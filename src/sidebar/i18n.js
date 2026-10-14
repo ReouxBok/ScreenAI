@@ -13,6 +13,8 @@ const LANG_LABELS = { fr: 'Français', en: 'English', es: 'Español' };
 
 const translations = {
   fr: {
+    limovaExport: 'Exporter cette conversation (CSV)',
+    limovaExporting: 'Préparation de l’export…',
     limovaNextStepPrompt: 'Guide-moi pour la prochaine étape en tenant compte de notre conversation.',
     limovaAnalyzePrompt: "Analyse la page active et explique ce que tu observes. Utilise une capture si nécessaire. Ne clique pas, ne saisis rien et ne navigue pas.",
     limovaSiteReview: "Vérifie le site, puis clique sur « Autoriser ce site ».",
@@ -123,7 +125,7 @@ const translations = {
     aiConsentDeclined: 'Charly reste désactivé. Tu pourras l’activer en envoyant un message ou en lançant la voix.',
     memoryEnabled: 'Personnalisation active',
     memoryDisabled: 'Personnalisation désactivée',
-    memoryExport: 'Exporter mes données Charly',
+    memoryExport: 'Exporter les données de l’ancienne extension',
     memoryDelete: 'Effacer les données Charly',
     memoryDeleteConfirm: 'Effacer définitivement les conversations, objectifs et préférences utilisés par Charly ?',
     memoryDeleted: 'Les données personnelles utilisées par Charly ont été effacées.',
@@ -134,6 +136,8 @@ const translations = {
     actionFailed: 'L’action n’a pas pu être exécutée.'
   },
   en: {
+    limovaExport: 'Export this conversation (CSV)',
+    limovaExporting: 'Preparing export…',
     limovaNextStepPrompt: 'Guide me through the next step based on our conversation.',
     limovaAnalyzePrompt: "Analyze the active page and explain what you observe. Use a screenshot if needed. Do not click, type or navigate.",
     limovaSiteReview: "Check the website, then click “Allow this website”.",
@@ -244,7 +248,7 @@ const translations = {
     aiConsentDeclined: 'Charly remains disabled. You can enable it by sending a message or starting voice.',
     memoryEnabled: 'Personalization on',
     memoryDisabled: 'Personalization off',
-    memoryExport: 'Export my Charly data',
+    memoryExport: 'Export data from the previous extension',
     memoryDelete: 'Delete Charly data',
     memoryDeleteConfirm: 'Permanently delete the conversations, goals, and preferences used by Charly?',
     memoryDeleted: 'The personal data used by Charly has been deleted.',
@@ -255,6 +259,8 @@ const translations = {
     actionFailed: 'The action could not be completed.'
   },
   es: {
+    limovaExport: 'Exportar esta conversación (CSV)',
+    limovaExporting: 'Preparando la exportación…',
     limovaNextStepPrompt: 'Guíame en el siguiente paso teniendo en cuenta nuestra conversación.',
     limovaAnalyzePrompt: "Analiza la página activa y explica lo que observas. Usa una captura si es necesario. No hagas clic, no escribas ni navegues.",
     limovaSiteReview: "Revisa el sitio y pulsa «Autorizar este sitio».",
@@ -365,7 +371,7 @@ const translations = {
     aiConsentDeclined: 'Charly permanece desactivado. Puedes activarlo enviando un mensaje o iniciando la voz.',
     memoryEnabled: 'Personalización activa',
     memoryDisabled: 'Personalización desactivada',
-    memoryExport: 'Exportar mis datos de Charly',
+    memoryExport: 'Exportar datos de la extensión anterior',
     memoryDelete: 'Borrar los datos de Charly',
     memoryDeleteConfirm: '¿Borrar definitivamente las conversaciones, objetivos y preferencias utilizados por Charly?',
     memoryDeleted: 'Los datos personales utilizados por Charly se han borrado.',

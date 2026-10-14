@@ -81,10 +81,10 @@ export class LimovaDeepAgentClient {
     return this.#refreshPromise;
   }
 
-  async #request(path, { method = 'GET', body, workspaceId, signal, stream = false, browserSession, evaluationCode, expectedContext, requireEnabled = true } = {}) {
+  async #request(path, { method = 'GET', body, workspaceId, signal, stream = false, download = false, browserSession, evaluationCode, expectedContext, requireEnabled = true } = {}) {
     if (!signal && !stream) signal = AbortSignal.timeout(30_000);
     const generation = this.#refreshGeneration;
-    const headers = { Accept: stream ? 'text/event-stream' : 'application/json' };
+    const headers = { Accept: download ? 'text/csv' : stream ? 'text/event-stream' : 'application/json' };
     const multipart = body instanceof FormData;
     if (body !== undefined && !multipart) headers['Content-Type'] = 'application/json';
     if (workspaceId) headers['x-workspace-id'] = id(workspaceId);
@@ -107,6 +107,7 @@ export class LimovaDeepAgentClient {
       throw new LimovaClientError(code, response.status === 401
         ? 'Connecte-toi dans Limova pour utiliser l’extension.' : 'La requête Limova n’a pas abouti.', response.status);
     }
+    if (download) return response;
     if (stream) {
       if (!response.headers.get('content-type')?.includes('text/event-stream')) {
         await response.body?.cancel();
@@ -149,6 +150,35 @@ export class LimovaDeepAgentClient {
       body: { title: String(title).slice(0, 200), type: 'general', engine: 'deep_agents', botAgentId: id(agent.id), disableFirstMessage: true } });
     id(conversation?.id);
     return conversation;
+  }
+
+  async exportConversation(context, conversationId, signal = AbortSignal.timeout(30_000)) {
+    context = Object.freeze({ ...context });
+    await this.getConversation(context, conversationId, signal);
+    const response = await this.#request(`/conversation/${id(conversationId)}/download`, {
+      workspaceId: context.workspaceId, signal, expectedContext: context, download: true,
+    });
+    if (response.headers.get('content-type')?.split(';')[0].trim().toLowerCase() !== 'text/csv') {
+      await response.body?.cancel();
+      throw new LimovaClientError('INVALID_EXPORT', 'Le serveur n’a pas renvoyé un export CSV.');
+    }
+    const reader = response.body?.getReader();
+    if (!reader) throw new LimovaClientError('INVALID_EXPORT', 'Export indisponible.');
+    const chunks = [];
+    let size = 0;
+    try {
+      while (true) {
+        signal.throwIfAborted();
+        const { value, done } = await reader.read();
+        if (done) break;
+        size += value.byteLength;
+        if (size > 10 * 1024 * 1024) throw new LimovaClientError('EXPORT_TOO_LARGE', 'L’export dépasse 10 Mo. Télécharge-le depuis l’app Limova.');
+        chunks.push(value);
+      }
+    } finally { await reader.cancel().catch(() => {}); reader.releaseLock(); }
+    const content = await new Blob(chunks).text();
+    await this.#assertContext(context, signal);
+    return { content, mimeType: 'text/csv;charset=utf-8', filename: `limova-conversation-${conversationId}.csv` };
   }
 
   async listConversations(context, page = 1, signal) {

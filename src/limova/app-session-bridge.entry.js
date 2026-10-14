@@ -9,7 +9,7 @@ import { LIMOVA_APP_URL, LIMOVA_API_URL } from './environment.js';
   globalThis.__limovaAppSessionBridgeV1 = true;
   const UUID = '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}';
   const uuid = new RegExp(`^${UUID}$`, 'i');
-  const read = new RegExp(`^/conversation/${UUID}(?:/messages)?$`, 'i');
+  const read = new RegExp(`^/conversation/${UUID}(?:/messages|/download)?$`, 'i');
   const evaluationMessage = new RegExp(`^/message/${UUID}$`, 'i');
   const write = new RegExp(`^/message/${UUID}(?:/cancel)?$`, 'i');
 
@@ -24,7 +24,7 @@ import { LIMOVA_APP_URL, LIMOVA_API_URL } from './environment.js';
     const headers = new Headers();
     for (const [key, value] of Object.entries(request.headers ?? {})) {
       const name = key.toLowerCase();
-      if (name === 'accept' && ['application/json', 'text/event-stream'].includes(value)
+      if (name === 'accept' && ['application/json', 'text/event-stream', 'text/csv'].includes(value)
         || name === 'content-type' && value === 'application/json'
         || name === EVALUATION_CODE_HEADER && request.method === 'POST'
           && (url.pathname === '/conversation' || evaluationMessage.test(url.pathname))

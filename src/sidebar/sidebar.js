@@ -128,6 +128,7 @@ function initEventListeners() {
   document.getElementById('logoutBtn')?.addEventListener('click', logoutCharly);
   elements.memoryToggleBtn?.addEventListener('click', toggleCopilotMemory);
   elements.exportDataBtn?.addEventListener('click', exportCopilotData);
+  document.getElementById('limovaExport').addEventListener('click', exportLimovaConversation);
   elements.deleteDataBtn?.addEventListener('click', deleteCopilotData);
 
   // Three-dot menu
@@ -353,6 +354,18 @@ async function toggleCopilotMemory() {
   const response = await chrome.runtime.sendMessage({ type: 'SET_MEMORY_PREFERENCE', enabled }).catch(error => ({ error: error.message }));
   if (!response?.ok) return addMessage('error', response?.error || t('errorGeneric'));
   updateMemoryControls({ available: true, enabled: response.enabled });
+}
+
+async function exportLimovaConversation() {
+  document.getElementById('headerMenu').hidden = true;
+  const file = await limovaPanel.exportConversation();
+  if (!file) return;
+  const url = URL.createObjectURL(new Blob([file.content], { type: file.mimeType }));
+  const link = document.createElement('a');
+  link.href = url;
+  link.download = file.filename;
+  link.click();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
 }
 
 async function exportCopilotData() {

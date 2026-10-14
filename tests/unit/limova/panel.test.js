@@ -281,3 +281,18 @@ it('does not send a second next-step message while the first is pending', async 
   finish({ ok: true });
   await first;
 });
+
+it('exports only the selected conversation, rejects duplicate exports and drops stale results', async () => {
+  let finish;
+  const pending = new Promise(resolve => { finish = resolve; });
+  const { panel, request } = setup({ LIMOVA_EXPORT_CONVERSATION: () => pending });
+  await panel.refresh();
+  const first = panel.exportConversation();
+  expect(await panel.exportConversation()).toBeNull();
+  expect(request).toHaveBeenCalledWith({ type: 'LIMOVA_EXPORT_CONVERSATION', conversationId: 'c' });
+  await panel.refresh();
+  finish({ content: 'old private data', filename: 'old.csv' });
+  expect(await first).toBeNull();
+  panel.setVoiceBusy(true);
+  expect(await panel.exportConversation()).toBeNull();
+});

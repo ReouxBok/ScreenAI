@@ -49,6 +49,10 @@ export const test = base.extend({
         if (url.pathname === '/conversation' && request.method === 'POST') { state.created = true; return json({ id: CONVERSATION }); }
         if (url.pathname === '/conversation') return json({ data: state.created ? [{ id: CONVERSATION, title: 'Discussion native' }] : [], pagination: { hasNext: false } });
         if (url.pathname === `/conversation/${CONVERSATION}`) return json({ id: CONVERSATION, engine: 'deep_agents', mainAgent: { id: AGENT, slug: 'charly' } });
+        if (url.pathname === `/conversation/${CONVERSATION}/download`) {
+          response.writeHead(200, { ...headers, 'content-type': 'text/csv; charset=utf-8' });
+          response.end('Timestamp,Sender,Content\n2026-10-14,Charly,"Bonjour é"\n'); return;
+        }
         if (url.pathname === `/conversation/${CONVERSATION}/messages`) return json({ data: history, pagination: { hasMore: false } });
         if (url.pathname === `/message/${CONVERSATION}`) {
           if (request.headers['x-workspace-id'] !== WORKSPACE) return json({ error: 'workspace' }, 403);

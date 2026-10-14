@@ -395,3 +395,53 @@ it('honors cancellation before attempting any file lookup', async () => {
   await expect(client.resolveGeneratedFile(CONTEXT, CONVERSATION, AGENT, controller.signal)).rejects.toMatchObject({ name: 'AbortError' });
   expect(fetch).not.toHaveBeenCalled();
 });
+
+describe('native conversation CSV export', () => {
+  it('downloads through the existing scoped route and preserves CSV text', async () => {
+    const { client, fetch } = harness();
+    const original = fetch.getMockImplementation();
+    fetch.mockImplementation((url, options) => url.endsWith('/download')
+      ? new Response('Timestamp,Sender,Content\n1,Charly,"Bonjour é"\n', { headers: { 'content-type': 'text/csv; charset=utf-8' } }) : original(url, options));
+    const file = await client.exportConversation(CONTEXT, CONVERSATION);
+    expect(file.content).toContain('Bonjour é');
+    expect(file.filename).toBe(`limova-conversation-${CONVERSATION}.csv`);
+    expect(fetch.mock.calls.find(([url]) => url.endsWith('/download'))[1]).toMatchObject({ method: 'GET', headers: { Accept: 'text/csv', 'x-workspace-id': WORKSPACE } });
+  });
+
+  it('rejects non-CSV responses and oversized exports without returning a partial file', async () => {
+    for (const response of [new Response('<html>login</html>', { headers: { 'content-type': 'text/html' } }),
+      new Response(new Uint8Array(10 * 1024 * 1024 + 1), { headers: { 'content-type': 'text/csv' } })]) {
+      const { client, fetch } = harness();
+      const original = fetch.getMockImplementation();
+      fetch.mockImplementation((url, options) => url.endsWith('/download') ? response : original(url, options));
+      await expect(client.exportConversation(CONTEXT, CONVERSATION)).rejects.toBeInstanceOf(Error);
+    }
+  });
+
+  it('discards the downloaded file if the account changes during the request', async () => {
+    const { client, fetch } = harness();
+    const original = fetch.getMockImplementation();
+    let downloaded = false;
+    fetch.mockImplementation((url, options) => {
+      if (url.endsWith('/download')) { downloaded = true; return new Response('private', { headers: { 'content-type': 'text/csv' } }); }
+      if (downloaded && url.endsWith('/users/me')) return json({ id: AGENT });
+      return original(url, options);
+    });
+    await expect(client.exportConversation(CONTEXT, CONVERSATION)).rejects.toMatchObject({ code: 'LIMOVA_ACCOUNT_CHANGED' });
+  });
+});
+
+it('refreshes an expired CSV download once without changing its route or scope', async () => {
+  const { client, fetch } = harness();
+  const original = fetch.getMockImplementation();
+  let downloads = 0;
+  fetch.mockImplementation(async (url, options) => {
+    if (url.endsWith('/auth/refresh-token')) return new Response(null, { status: 200 });
+    if (url.endsWith('/download')) return ++downloads === 1 ? new Response(null, { status: 401 })
+      : new Response('CSV after refresh', { headers: { 'content-type': 'text/csv' } });
+    return original(url, options);
+  });
+  expect((await client.exportConversation(CONTEXT, CONVERSATION)).content).toBe('CSV after refresh');
+  expect(downloads).toBe(2);
+  expect(fetch.mock.calls.filter(([url]) => url.endsWith('/auth/refresh-token'))).toHaveLength(1);
+});

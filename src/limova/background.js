@@ -10,7 +10,7 @@ export const LIMOVA_MESSAGE_TYPES = new Set([
   'LIMOVA_GET_STATE', 'LIMOVA_SELECT_WORKSPACE', 'LIMOVA_LIST_CONVERSATIONS',
   'LIMOVA_CREATE_CONVERSATION', 'LIMOVA_OPEN_CONVERSATION', 'LIMOVA_SEND_MESSAGE',
   'LIMOVA_CANCEL', 'LIMOVA_OPEN_APP', 'LIMOVA_LOGOUT',
-  'LIMOVA_GET_MESSAGES', 'LIMOVA_RESUME_BROWSER', 'LIMOVA_OPEN_GENERATED_FILE',
+  'LIMOVA_EXPORT_CONVERSATION', 'LIMOVA_GET_MESSAGES', 'LIMOVA_RESUME_BROWSER', 'LIMOVA_OPEN_GENERATED_FILE',
   'LIMOVA_START_EVALUATION', 'LIMOVA_END_EVALUATION', 'LIMOVA_PREPARE_VOICE', 'LIMOVA_EVALUATION_ACTION', 'LIMOVA_FLUSH_EVALUATION', 'LIMOVA_EVALUATION_RESPONSE',
 ]);
 
@@ -195,6 +195,16 @@ export function createLimovaBackground({ storage, openTab, openFile = async () =
           throw new Error('La session Limova a changé.');
         await openFile(file.url);
         return { ok: true };
+      }
+      case 'LIMOVA_EXPORT_CONVERSATION': {
+        const identity = requireContext();
+        const selected = conversationId;
+        if (!selected || request.conversationId !== selected) throw new Error('La conversation a changé.');
+        if (evaluation) throw new Error('Termine le test Studio avant d’exporter une conversation.');
+        const exported = await client.exportConversation(identity, selected);
+        if (conversationId !== selected || context?.userId !== identity.userId || context?.workspaceId !== identity.workspaceId)
+          throw new Error('La session Limova a changé.');
+        return exported;
       }
       case 'LIMOVA_GET_MESSAGES':
         return client.getMessages(requireContext(), conversationId, request.cursor);

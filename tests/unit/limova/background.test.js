@@ -389,3 +389,27 @@ it('does not open a file resolved after a context change', async () => {
   await expect(pending).rejects.toThrow('session');
   expect(openFile).not.toHaveBeenCalled();
 });
+
+it('exports the selected native conversation and rejects another conversation ID', async () => {
+  const h = harness();
+  h.client.exportConversation = vi.fn().mockResolvedValue({ content: 'csv', filename: 'chat.csv' });
+  await open(h.background);
+  await expect(h.background.handle({ type: 'LIMOVA_EXPORT_CONVERSATION', conversationId: 'other' })).rejects.toThrow('conversation');
+  expect(h.client.exportConversation).not.toHaveBeenCalled();
+  expect(await h.background.handle({ type: 'LIMOVA_EXPORT_CONVERSATION', conversationId: 'conversation-1' })).toEqual({ content: 'csv', filename: 'chat.csv' });
+  expect(h.client.exportConversation).toHaveBeenCalledWith({ userId: 'user-1', workspaceId: 'workspace-1' }, 'conversation-1');
+});
+
+it('discards a completed export after selection changes', async () => {
+  const h = harness();
+  let finish;
+  h.client.exportConversation = vi.fn(() => new Promise(resolve => { finish = resolve; }));
+  await open(h.background);
+  const download = h.background.handle({ type: 'LIMOVA_EXPORT_CONVERSATION', conversationId: 'conversation-1' });
+  const rejected = expect(download).rejects.toThrow('session Limova a changé');
+  await vi.waitFor(() => expect(h.client.exportConversation).toHaveBeenCalled());
+  h.client.getConversation.mockResolvedValue({ id: 'other' });
+  await h.background.handle({ type: 'LIMOVA_OPEN_CONVERSATION', conversationId: 'other' });
+  finish({ content: 'private data', filename: 'old.csv' });
+  await rejected;
+});

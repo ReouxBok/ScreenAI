@@ -17,6 +17,7 @@ export function createLimovaPanel({ document, request, render, onBusy, onContext
   let voiceBusy = false;
   let sending = false;
   let evaluationActive = false;
+  let exporting = false;
   let catalog = new Map();
   let nextPage = null;
   let olderCursor = null;
@@ -25,6 +26,8 @@ export function createLimovaPanel({ document, request, render, onBusy, onContext
   let historyInitialized = false;
 
   function pagingControls() {
+    const exportButton = element('limovaExport');
+    if (exportButton) exportButton.disabled = !context || !conversationId || busy || evaluationActive || exporting;
     const more = element('limovaMoreConversations');
     const older = element('limovaOlderMessages');
     if (more) { more.hidden = !nextPage; more.disabled = busy || catalogLoading || evaluationActive; }
@@ -233,6 +236,19 @@ export function createLimovaPanel({ document, request, render, onBusy, onContext
         if (option.dataset.originalName) option.textContent = option.dataset.originalName
           + (option.disabled ? ` — ${translate('limovaUnavailable', 'extension indisponible')}` : '');
       });
+    },
+    async exportConversation() {
+      if (!context || !conversationId || busy || evaluationActive || exporting) return null;
+      const current = generation;
+      exporting = true; pagingControls();
+      feedback(translate('limovaExporting', 'Préparation de l’export…'));
+      try {
+        const file = await call('LIMOVA_EXPORT_CONVERSATION', { conversationId });
+        if (current !== generation) return null;
+        feedback('');
+        return file;
+      } catch (error) { if (current === generation) feedback(error.message); return null; }
+      finally { exporting = false; pagingControls(); }
     },
     async openGeneratedFile(fileId) {
       if (!context || !conversationId) return;
