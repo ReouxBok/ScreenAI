@@ -293,3 +293,34 @@ describe('Studio evidence delivery', () => {
     expect(record).toHaveBeenCalledOnce();
   });
 });
+
+describe('evaluation text response delivery', () => {
+  const answer = { id: 'answer-new', type: 'ai', content: 'Private text', tool_calls: [] };
+  async function start(history = []) {
+    const record = vi.fn().mockResolvedValue(undefined);
+    const f = harness({ recordEvaluation: record }); await open(f.background);
+    await f.background.handle({ type: 'LIMOVA_START_EVALUATION', evaluationCode: 'private-staff-evaluation-code' });
+    f.client.getMessages.mockResolvedValue({ data: history });
+    f.client.sendMessage.mockImplementation(async function* () {
+      yield { event: 'values', data: { messages: [{ id: 'human-new', type: 'human' }, answer] } };
+    });
+    return { ...f, record };
+  }
+  it('records only the delivery status of the new final answer', async () => {
+    const f = await start();
+    await f.background.handle({ type: 'LIMOVA_SEND_MESSAGE', text: 'Test' });
+    expect(f.record).toHaveBeenCalledWith({ kind: 'response', status: 'ok' }, 'private-staff-evaluation-code');
+    expect(JSON.stringify(f.record.mock.calls)).not.toContain('Private text');
+    await f.background.handle({ type: 'LIMOVA_FLUSH_EVALUATION' });
+  });
+  it('ignores an answer already present before the turn', async () => {
+    const f = await start([answer]);
+    await f.background.handle({ type: 'LIMOVA_SEND_MESSAGE', text: 'Test' });
+    expect(f.record).not.toHaveBeenCalled();
+  });
+  it('blocks finalization if the response evidence could not be delivered', async () => {
+    const f = await start(); f.record.mockRejectedValue(new Error('Studio offline'));
+    await expect(f.background.handle({ type: 'LIMOVA_SEND_MESSAGE', text: 'Test' })).rejects.toThrow('Studio offline');
+    await expect(f.background.handle({ type: 'LIMOVA_FLUSH_EVALUATION' })).rejects.toThrow('Studio offline');
+  });
+});

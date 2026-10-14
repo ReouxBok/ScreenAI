@@ -29,3 +29,11 @@ Les reçus locaux du journal sont projetés vers les événements Studio après 
 Le worker lie la preuve à la conversation d’évaluation active et capture son grant pour l’envoi. Les reçus identiques sont dédupliqués par action ; un reçu contradictoire est refusé. Une erreur d’enregistrement arrête la continuation et reste visible au flush, sans retry aveugle d’un POST non idempotent. Le verdict attend les tours texte en cours et les enregistrements connus. Les lectures/écritures du journal navigateur ne contiennent pas le grant.
 
 Restent à réaliser : preuve de réponse canonique, vérification explicite du résultat attendu et qualification des interruptions vocales en cours d’action. Les scores ne sont donc pas encore qualifiés pour ce nouveau parcours. Tests : 264 cas composants Limova passent ; 27 tests du gestionnaire repassés après l’ajout de l’attente des tours texte.
+
+## Preuve de réponse texte canonique
+
+Avant un tour d’évaluation texte (y compris navigateur), le worker charge l’historique de la conversation. Il en conserve les identifiants comme référence, puis observe uniquement les snapshots `values` du graphe racine. À la fin réussie du flux, il exige une nouvelle réponse assistant visible, non vide, sans appel outil, après le dernier message humain, et aucune action navigateur encore en attente. Un événement d’erreur invalide la preuve. Les tokens partiels et les événements de sous-agent ne suffisent pas.
+
+La preuve envoyée est seulement `{kind: 'response', status: 'ok'}`. Le texte reste dans Limova ; l’identifiant sert à la déduplication locale. Un refus d’enregistrement demeure bloquant au flush du verdict. Ce raccordement couvre le texte ; la preuve de réponse vocale et la vérification explicite du résultat attendu restent à ajouter.
+
+Vérification locale : 278 tests des composants Limova passent et le build production réussit. Aucun parcours réel ni scoring complet n’est revendiqué.

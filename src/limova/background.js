@@ -1,3 +1,4 @@
+import { createEvaluationResponseEvidence } from './evaluation-response.js';
 import { projectEvaluationAction } from './evaluation-evidence.js';
 import { evaluationGrant } from './evaluation-grant.js';
 import { createBrowserTurnRunner } from './browser-turn.js';
@@ -72,7 +73,7 @@ export function createLimovaBackground({ storage, openTab, notify, client = new 
     const event = projectEvaluationAction(action, receipt);
     if (!event) throw new Error('Preuve navigateur invalide.');
     const current = evaluation;
-    const key = action.actionId;
+    const key = `action:${action.actionId}`;
     if (!current.evidence.has(key)) {
       if (current.evidence.size >= 1000) throw new Error('Limite de preuves Studio atteinte.');
       const pending = Promise.resolve().then(() => recordEvaluation(event, current.code));
@@ -82,6 +83,19 @@ export function createLimovaBackground({ storage, openTab, notify, client = new 
     if (saved.payload !== JSON.stringify(event)) throw new Error('Preuves contradictoires pour cette action.');
     await saved.pending;
     return { ok: true };
+  }
+
+  async function recordResponse(selectedConversation, evidence) {
+    if (!evidence) return;
+    if (!evaluation || selectedConversation !== conversationId) throw new Error('Le test Studio a changé.');
+    const current = evaluation;
+    const key = `response:${evidence.id}`;
+    if (!current.evidence.has(key)) {
+      if (current.evidence.size >= 1000) throw new Error('Limite de preuves Studio atteinte.');
+      const pending = Promise.resolve().then(() => recordEvaluation(evidence.event, current.code));
+      current.evidence.set(key, { payload: JSON.stringify(evidence.event), pending });
+    }
+    await current.evidence.get(key).pending;
   }
 
   async function handle(request) {
@@ -187,7 +201,11 @@ export function createLimovaBackground({ storage, openTab, notify, client = new 
         currentEvaluation?.pendingTurns.add(finished);
         notify({ type: 'LIMOVA_TURN_STARTED', turnId: turn.id, conversationId });
         try {
+          const responseEvidence = turn.evaluationCode
+            ? createEvaluationResponseEvidence(await client.getMessages(turn.context, turn.conversationId, undefined, turn.controller.signal)) : null;
+          turn.controller.signal.throwIfAborted();
           const emit = event => {
+            responseEvidence?.consume(event);
             if (activeTurn === turn) notify({ type: 'LIMOVA_STREAM_EVENT', turnId: turn.id, conversationId: turn.conversationId, event });
           };
           if (request.browser === true) {
@@ -205,6 +223,8 @@ export function createLimovaBackground({ storage, openTab, notify, client = new 
             const outcome = request.type === 'LIMOVA_RESUME_BROWSER'
               ? await runner.resume(turn.context, turn.conversationId, turn.controller.signal)
               : await runner.send(turn.context, turn.conversationId, request.text, turn.controller.signal);
+            turn.controller.signal.throwIfAborted();
+            await recordResponse(turn.conversationId, responseEvidence?.finish());
             notify({ type: 'LIMOVA_BROWSER_STATE', turnId: turn.id, conversationId: turn.conversationId, state: outcome.state, actionId: outcome.actionId, browserTurnId: outcome.turnId });
             return { ok: true, turnId: turn.id, browserState: outcome.state };
           }
@@ -212,6 +232,8 @@ export function createLimovaBackground({ storage, openTab, notify, client = new 
             if (activeTurn !== turn) break;
             emit(event);
           }
+          turn.controller.signal.throwIfAborted();
+          await recordResponse(turn.conversationId, responseEvidence?.finish());
           return { ok: true, turnId: turn.id };
         } catch (error) {
           if (activeTurn === turn && ['LIMOVA_ACCOUNT_CHANGED', 'LIMOVA_LOGIN_REQUIRED', 'LIMOVA_EXTENSION_DISABLED'].includes(error.code)) {
