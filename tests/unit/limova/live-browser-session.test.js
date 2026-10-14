@@ -9,7 +9,7 @@ function harness() {
   let callbacks, driverOptions;
   const live = { session: { sessionId: id }, sendAudio: vi.fn(), cancel: vi.fn(), stop: vi.fn(), continueBrowser: vi.fn(), refreshBrowserContext: vi.fn() };
   const openTransport = vi.fn(async options => { callbacks = options; options.onEvent('session.ready', live.session); return live; });
-  const client = { getConversation: vi.fn().mockResolvedValue({}), uploadBrowserScreenshot: vi.fn().mockResolvedValue({ fileId: id }) };
+  const client = { getMessages: vi.fn().mockResolvedValue({ data: [] }), getConversation: vi.fn().mockResolvedValue({}), uploadBrowserScreenshot: vi.fn().mockResolvedValue({ fileId: id }) };
   const journal = { getSession: vi.fn().mockResolvedValue(id) };
   const driver = { readPage: vi.fn().mockResolvedValue(page) };
   const createDriver = vi.fn(options => { driverOptions = options; return driver; });

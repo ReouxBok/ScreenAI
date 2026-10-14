@@ -11,7 +11,7 @@ export const LIMOVA_MESSAGE_TYPES = new Set([
   'LIMOVA_CREATE_CONVERSATION', 'LIMOVA_OPEN_CONVERSATION', 'LIMOVA_SEND_MESSAGE',
   'LIMOVA_CANCEL', 'LIMOVA_OPEN_APP', 'LIMOVA_LOGOUT',
   'LIMOVA_GET_MESSAGES', 'LIMOVA_RESUME_BROWSER',
-  'LIMOVA_START_EVALUATION', 'LIMOVA_END_EVALUATION', 'LIMOVA_PREPARE_VOICE', 'LIMOVA_EVALUATION_ACTION', 'LIMOVA_FLUSH_EVALUATION',
+  'LIMOVA_START_EVALUATION', 'LIMOVA_END_EVALUATION', 'LIMOVA_PREPARE_VOICE', 'LIMOVA_EVALUATION_ACTION', 'LIMOVA_FLUSH_EVALUATION', 'LIMOVA_EVALUATION_RESPONSE',
 ]);
 
 export function createLimovaBackground({ storage, openTab, notify, client = new LimovaDeepAgentClient(), journal = createBrowserJournal(), createDriver, recordEvaluation = async () => { throw new Error('Studio evidence transport unavailable'); } }) {
@@ -116,6 +116,10 @@ export function createLimovaBackground({ storage, openTab, notify, client = new 
           await save();
           return { authenticated: false, workspaces: [], context: null, conversationId: null };
         }
+      case 'LIMOVA_EVALUATION_RESPONSE':
+        if (typeof request.messageId !== 'string' || !request.messageId || request.messageId.length > 256) throw new Error('Réponse Studio invalide.');
+        await recordResponse(request.conversationId, { id: request.messageId, event: { kind: 'response', status: 'ok' } });
+        return { ok: true };
       case 'LIMOVA_EVALUATION_ACTION':
         return recordAction(request.conversationId, request.action, request.receipt);
       case 'LIMOVA_FLUSH_EVALUATION':

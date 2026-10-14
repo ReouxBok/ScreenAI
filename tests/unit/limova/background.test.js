@@ -324,3 +324,17 @@ describe('evaluation text response delivery', () => {
     await expect(f.background.handle({ type: 'LIMOVA_FLUSH_EVALUATION' })).rejects.toThrow('Studio offline');
   });
 });
+
+it('binds canonical voice evidence to the active evaluation and deduplicates its message ID', async () => {
+  const record = vi.fn().mockResolvedValue(undefined);
+  const f = harness({ recordEvaluation: record }); await open(f.background);
+  f.client.createConversation.mockResolvedValueOnce({ id: 'evaluation' });
+  await f.background.handle({ type: 'LIMOVA_START_EVALUATION', evaluationCode: 'private-staff-evaluation-code' });
+  const request = { type: 'LIMOVA_EVALUATION_RESPONSE', conversationId: 'evaluation', messageId: 'answer-1' };
+  await f.background.handle(request); await f.background.handle(request);
+  expect(record).toHaveBeenCalledExactlyOnceWith({ kind: 'response', status: 'ok' }, 'private-staff-evaluation-code');
+  await expect(f.background.handle({ ...request, conversationId: 'other' })).rejects.toThrow();
+  await expect(f.background.handle({ ...request, messageId: '' })).rejects.toThrow();
+  await f.background.handle({ type: 'LIMOVA_END_EVALUATION' });
+  await expect(f.background.handle(request)).rejects.toThrow();
+});

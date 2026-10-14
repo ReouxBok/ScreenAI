@@ -22,6 +22,10 @@ export class DeepAgentVoiceSession {
     if (notify) this.onStatus({ status: 'stopped' });
   }
 
+  async flushEvidence() {
+    await this.evidence?.();
+  }
+
   cancel() {
     if (this.live) this.live.cancel(this.audio?.interrupt() ?? 0);
   }
@@ -66,6 +70,7 @@ export class DeepAgentVoiceSession {
       });
       if (abort.signal.aborted) { live.stop(); return; }
       this.live = live;
+      this.evidence = live.flushEvidence?.bind(live);
       const audio = await this.openAudio({ stream, session: this.live.session, signal: abort.signal,
         onFrame: bytes => this.live.sendAudio(bytes), onError: fail });
       if (abort.signal.aborted) { audio.stop(); return; }

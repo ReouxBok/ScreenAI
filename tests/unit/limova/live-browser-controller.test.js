@@ -7,12 +7,12 @@ const action = { type: 'extension.action_requested', turnId: browserId, actionId
 const waiting = { type: 'extension.turn_state', turnId: browserId, state: 'waiting' };
 const page = { tabId: 7, origin: 'https://example.com', contextVersion: 2 };
 
-function harness(onActionResult) {
+function harness(onActionResult, evidence = {}) {
   const client = { getConversation: vi.fn().mockResolvedValue({}) };
   const driver = { authorize: vi.fn().mockResolvedValue(undefined), execute: vi.fn().mockResolvedValue({ status: 'completed', observation: 'Done' }), readPage: vi.fn().mockResolvedValue(page) };
   const journal = { run: vi.fn(async (_scope, action, execute) => ({ state: 'completed', result: { turnId: action.turnId, actionId: action.actionId, ...await execute(action) } })) };
   const continueBrowser = vi.fn(), onError = vi.fn(), notify = vi.fn();
-  const controller = createLiveBrowserController({ context: { userId: uuid(4), workspaceId: uuid(5) }, conversationId: uuid(6), browserSession: uuid(7), client, driver, journal, continueBrowser, onError, notify, onActionResult });
+  const controller = createLiveBrowserController({ context: { userId: uuid(4), workspaceId: uuid(5) }, conversationId: uuid(6), browserSession: uuid(7), client, driver, journal, continueBrowser, onError, notify, onActionResult, ...evidence });
   controller.onEvent('session.ready', { sessionId });
   controller.onEvent('turn.deep_agent_stream.started', { sessionId, turnId });
   const bytes = chunk => controller.onEvent('turn.deep_agent_stream.delta', { sessionId, turnId, chunk: Array.from(chunk) });
@@ -124,5 +124,52 @@ it('stops the voice turn if its executed action cannot be recorded in Studio', a
   expect(h.driver.execute).toHaveBeenCalledOnce();
   expect(report).toHaveBeenCalledOnce();
   expect(h.continueBrowser).not.toHaveBeenCalled();
+  h.controller.stop();
+});
+
+
+const canonicalVoiceFrame = (answerId = 'new-answer') => new TextEncoder().encode(`event: values\ndata: ${JSON.stringify({ messages: [
+  { id: 'human', type: 'human', content: 'Question' },
+  { id: answerId, type: 'ai', content: 'Private answer', tool_calls: [] },
+] })}\n\n`);
+
+it('records canonical voice response only after explicit completion and excludes its text', async () => {
+  const record = vi.fn().mockResolvedValue(undefined);
+  const h = harness(undefined, { evaluationHistory: { data: [] }, onCanonicalResponse: record });
+  h.bytes(canonicalVoiceFrame());
+  await vi.waitFor(() => expect(h.notify).toHaveBeenCalled());
+  expect(record).not.toHaveBeenCalled();
+  h.controller.onEvent('turn.deep_agent_stream.completed', { sessionId, turnId });
+  await h.controller.flushEvidence();
+  expect(record).toHaveBeenCalledExactlyOnceWith('new-answer');
+  h.controller.stop();
+});
+
+it.each(['turn.interrupted', 'turn.deep_agent_stream.failed'])('does not count interrupted voice output: %s', event => {
+  const record = vi.fn();
+  const h = harness(undefined, { evaluationHistory: { data: [] }, onCanonicalResponse: record });
+  h.bytes(canonicalVoiceFrame());
+  h.controller.onEvent(event, { sessionId, turnId });
+  expect(record).not.toHaveBeenCalled();
+  h.controller.stop();
+});
+
+it('keeps a failed voice evidence delivery visible to finalization', async () => {
+  const record = vi.fn().mockRejectedValue(new Error('Studio offline'));
+  const h = harness(undefined, { evaluationHistory: { data: [] }, onCanonicalResponse: record });
+  h.bytes(canonicalVoiceFrame());
+  h.controller.onEvent('turn.deep_agent_stream.completed', { sessionId, turnId });
+  await expect(h.controller.flushEvidence()).rejects.toThrow('Studio offline');
+  expect(h.onError).toHaveBeenCalledWith(expect.objectContaining({ message: 'Studio offline' }));
+  h.controller.stop();
+});
+
+it('does not count a previous voice response replayed in a new turn', async () => {
+  const record = vi.fn();
+  const h = harness(undefined, { evaluationHistory: { data: [{ id: 'old-answer' }] }, onCanonicalResponse: record });
+  h.bytes(canonicalVoiceFrame('old-answer'));
+  h.controller.onEvent('turn.deep_agent_stream.completed', { sessionId, turnId });
+  await h.controller.flushEvidence();
+  expect(record).not.toHaveBeenCalled();
   h.controller.stop();
 });

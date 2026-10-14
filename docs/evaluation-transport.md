@@ -37,3 +37,11 @@ Avant un tour d’évaluation texte (y compris navigateur), le worker charge l�
 La preuve envoyée est seulement `{kind: 'response', status: 'ok'}`. Le texte reste dans Limova ; l’identifiant sert à la déduplication locale. Un refus d’enregistrement demeure bloquant au flush du verdict. Ce raccordement couvre le texte ; la preuve de réponse vocale et la vérification explicite du résultat attendu restent à ajouter.
 
 Vérification locale : 278 tests des composants Limova passent et le build production réussit. Aucun parcours réel ni scoring complet n’est revendiqué.
+
+## Preuve de réponse native pendant la voix
+
+La session charge l’historique avant l’ouverture du fournisseur vocal. Chaque tour observe ensuite les snapshots du graphe racine avec le même filtre que le texte. Seul `turn.deep_agent_stream.completed`, après consommation du flux et sans interruption, permet d’enregistrer la réponse. Les identifiants déjà vus sont conservés pendant la session pour ignorer les relectures d’historique.
+
+Le panneau envoie au worker seulement l’identifiant du message final et la conversation. Le worker exige le test actif, déduplique cet identifiant et transmet au Studio le statut de réponse sans son texte. L’arrêt audio conserve la possibilité d’attendre les enregistrements déjà engagés ; leur échec bloque le verdict. Cela prouve la réception de la réponse canonique dans l’extension, pas que tout l’audio a été entendu.
+
+La vérification explicite de l’objectif métier reste à raccorder ; aucune capture, lecture de page ou affirmation du modèle n’est implicitement transformée en réussite de ce contrôle. La qualification réelle du parcours demeure nécessaire.

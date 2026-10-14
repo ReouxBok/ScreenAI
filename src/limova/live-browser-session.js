@@ -2,7 +2,7 @@ import { createLiveBrowserController } from './live-browser-controller.js';
 
 export function createBrowserLiveSession({ openTransport, client, journal, createDriver }) {
   return async ({ context, conversationId, languageCode, userTimezone, evaluationCode, signal, browserEnabled = true,
-    onActionResult = async () => {}, onEvent = () => {}, onNativeEvent = () => {}, onError = () => {} }) => {
+    onCanonicalResponse = async () => {}, onActionResult = async () => {}, onEvent = () => {}, onNativeEvent = () => {}, onError = () => {} }) => {
     context = Object.freeze({ ...context });
     const abort = new AbortController();
     let live, browser, closed = false, refresh;
@@ -22,6 +22,8 @@ export function createBrowserLiveSession({ openTransport, client, journal, creat
       abort.signal.throwIfAborted();
       await client.getConversation(context, conversationId, abort.signal);
       abort.signal.throwIfAborted();
+      const evaluationHistory = evaluationCode ? await client.getMessages(context, conversationId, undefined, abort.signal) : undefined;
+      abort.signal.throwIfAborted();
       const browserSession = browserEnabled ? await journal.getSession(context) : undefined;
       abort.signal.throwIfAborted();
       const driver = browserEnabled ? createDriver({ scope: { ...context, sessionId: browserSession }, journal, signal: abort.signal,
@@ -30,7 +32,7 @@ export function createBrowserLiveSession({ openTransport, client, journal, creat
       abort.signal.throwIfAborted();
       browser = createLiveBrowserController({ context, conversationId, browserSession,
         client, journal, driver, signal: abort.signal,
-        continueBrowser: payload => live.continueBrowser(payload), onError: fail, notify: onNativeEvent, onActionResult });
+        continueBrowser: payload => live.continueBrowser(payload), onError: fail, notify: onNativeEvent, onActionResult, evaluationHistory, onCanonicalResponse });
       live = await openTransport({ context, conversationId, languageCode, userTimezone,
         browserSession, browserContext, evaluationCode, signal: abort.signal, onError: fail,
         onEvent(event, payload) {
@@ -61,6 +63,7 @@ export function createBrowserLiveSession({ openTransport, client, journal, creat
       });
       if (closed) { live.stop(); abort.signal.throwIfAborted(); }
       return {
+        flushEvidence: () => browser.flushEvidence(),
         session: live.session,
         sendAudio(bytes) { abort.signal.throwIfAborted(); live.sendAudio(bytes); },
         cancel(playedAudioMs = 0) {

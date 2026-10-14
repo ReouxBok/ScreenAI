@@ -1,3 +1,4 @@
+import { createEvaluationResponseEvidence } from './evaluation-response.js';
 import { readDeepAgentEvents } from './sse.js';
 import { liveUuid } from './live-browser-contract.js';
 
@@ -5,11 +6,13 @@ const MAX_BUFFER = 256_000;
 const MAX_ACTIONS = 100;
 
 export function createLiveBrowserController({ context, conversationId, browserSession,
-  client, journal, driver, continueBrowser, onError, notify = () => {}, onActionResult = async () => {}, signal }) {
+  client, journal, driver, continueBrowser, onError, notify = () => {}, onActionResult = async () => {}, evaluationHistory, onCanonicalResponse = async () => {}, signal }) {
   context = Object.freeze({ ...context });
   const scope = Object.freeze({ ...context, conversationId, sessionId: browserSession });
   if (![scope.userId, scope.workspaceId, conversationId].every(liveUuid) || (browserSession !== undefined && !liveUuid(browserSession))) throw new TypeError('Invalid voice browser scope');
   let current, sessionId, closed = false;
+  const responseJobs = [];
+  const responseHistory = evaluationHistory ? { data: [...evaluationHistory.data] } : undefined;
   const cancelTurn = () => {
     const turn = current;
     current = undefined;
@@ -50,6 +53,7 @@ export function createLiveBrowserController({ context, conversationId, browserSe
   }
 
   function consume(turn, event) {
+    turn.responseEvidence?.consume(event);
     if (event.event === 'error') throw new Error('Native voice stream failed');
     const data = event.event === 'custom' ? event.data : undefined;
     if (['extension.action_requested', 'extension.turn_state'].includes(data?.type)) {
@@ -79,6 +83,7 @@ export function createLiveBrowserController({ context, conversationId, browserSe
   function startTurn(id) {
     if (!liveUuid(id) || current) throw new Error('Unexpected voice turn');
     const turn = { id, abort: new AbortController(), actions: new Map(), count: 0, busy: false, ending: false, job: Promise.resolve() };
+    turn.responseEvidence = responseHistory ? createEvaluationResponseEvidence(responseHistory) : null;
     const body = new ReadableStream({ start(controller) { turn.input = controller; } },
       { highWaterMark: MAX_BUFFER, size: chunk => chunk.byteLength });
     current = turn;
@@ -114,7 +119,20 @@ export function createLiveBrowserController({ context, conversationId, browserSe
         if (event === 'turn.deep_agent_stream.completed') {
           turn.ending = true;
           turn.input.close();
-          void turn.parsing.then(() => { if (current === turn) current = undefined; }).catch(() => {});
+          if (turn.responseEvidence && responseJobs.length >= 1000) throw new Error('Evaluation response limit reached');
+          const completed = turn.parsing.then(async () => {
+            if (closed || turn.abort.signal.aborted || current !== turn) return;
+            current = undefined;
+            const evidence = turn.responseEvidence?.finish();
+            if (evidence) {
+              responseHistory.data.push({ id: evidence.id });
+              await onCanonicalResponse(evidence.id);
+            }
+          });
+          if (turn.responseEvidence) {
+            responseJobs.push(completed);
+          }
+          void completed.catch(error => { if (!turn.abort.signal.aborted) fail(error); });
           return;
         }
         const bytes = payload.chunk;
@@ -124,6 +142,7 @@ export function createLiveBrowserController({ context, conversationId, browserSe
         turn.input.enqueue(Uint8Array.from(bytes));
       } catch (error) { fail(error); }
     },
+    flushEvidence: () => Promise.all(responseJobs),
     stop,
   };
 }

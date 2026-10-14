@@ -460,6 +460,10 @@ function showEvaluationActive(evaluation) {
 
 async function completeEvaluation(verdict) {
   voiceSession?.stop();
+  try { await voiceSession?.flushEvidence?.(); } catch (error) {
+    elements.evaluationFeedback.textContent = error.message;
+    return;
+  }
   elements.evaluationCorrect.disabled = true;
   elements.evaluationProblem.disabled = true;
   elements.evaluationFeedback.textContent = 'Transmission du résultat au Studio…';
@@ -1056,6 +1060,11 @@ async function toggleVoice() {
     });
     voiceSession = new DeepAgentVoiceSession({ openSession,
       parameters: { ...parameters, languageCode: getLangCode(), userTimezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
+        onCanonicalResponse: async messageId => {
+          if (!parameters.evaluationCode) return;
+          const result = await chrome.runtime.sendMessage({ type: 'LIMOVA_EVALUATION_RESPONSE', conversationId: parameters.conversationId, messageId });
+          if (!result?.ok || result.error) throw new Error(result?.error || 'Preuve de réponse Studio indisponible.');
+        },
         onActionResult: async (action, receipt) => {
           if (!parameters.evaluationCode) return;
           const result = await chrome.runtime.sendMessage({ type: 'LIMOVA_EVALUATION_ACTION', conversationId: parameters.conversationId, action, receipt });
