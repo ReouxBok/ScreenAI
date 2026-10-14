@@ -9,7 +9,7 @@ test("contact validates a SAV candidate without gaining publication or global ad
     provenance: { sources: [{ emailId: "123", url: "https://app.hubspot.com/contacts/1/email/123", date: "2026-10-01T10:00:00.000Z", ticketIds: [] }], validationNotes: ["Fixture synthétique uniquement."] },
   }] };
   await page.setExtraHTTPHeaders({ "x-studio-test-user": "ugo@limova.ai" });
-  await page.goto("/studio/sav/connaissances");
+  await page.goto("/studio/sav/connaissances/imports");
   await page.getByText("Importer des fiches HubSpot", { exact: true }).click();
   await page.getByLabel("Base de connaissances privée").setInputFiles({ name: "fixture.json", mimeType: "application/json", buffer: Buffer.from(JSON.stringify(bundle)) });
   await page.getByRole("button", { name: "Préparer les candidats SAV" }).click();

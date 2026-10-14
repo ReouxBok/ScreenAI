@@ -169,11 +169,13 @@ test("le banc E2E utilise l’identité owner et expose les espaces administrate
 test("la V0 SAV expose la frontière, les vues et le laboratoire isolé", async ({ page }) => {
   await login(page);
   await page.goto("/studio/sav");
-  await expect(page.getByRole("heading", { name: "Propositions à piloter" })).toBeVisible();
-  await expect(page.getByText("Activation non effectuée : aucun ancien email ne sera proposé rétroactivement.", { exact: false })).toBeVisible();
-  await expect(page.getByRole("navigation", { name: "Vues SAV" })).toBeVisible();
-  await expect(page.getByRole("region", { name: "Emails synchronisés" })).toBeVisible();
-  await expect(page.getByRole("heading", { name: "Évaluation des propositions" })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "Piloter les demandes", exact: true })).toBeVisible();
+  const views = page.getByRole("navigation", { name: "Vues SAV", exact: true });
+  await expect(views).toBeVisible();
+  for (const name of [/^À traiter/, /^À valider/, /^Suivi HubSpot/, /^Terminés/]) {
+    await expect(views.getByRole("link", { name })).toBeVisible();
+  }
+  await expect(page.getByRole("region", { name: "Dossiers SAV", exact: true })).toBeVisible();
   await page.getByRole("link", { name: "Laboratoire", exact: true }).click();
   await page.waitForURL(/\/studio\/sav\/pilote$/);
   await expect(page.getByRole("heading", { name: "Un lot. Dix mails. Zéro action externe." })).toBeVisible();
