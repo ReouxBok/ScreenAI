@@ -352,7 +352,9 @@ export async function reviewKnowledgeAction(form: FormData) {
     await reviewKnowledgeCandidate(id(form, "candidateId"), { expectedRevisionId: id(form, "revisionId"), decision, reason: String(form.get("reason") || ""), comparison: { snapshot: String(form.get("comparisonSnapshot") || ""), acknowledged: form.get("comparisonAcknowledged") === "on" }, ...(decision === "approve" ? { document: JSON.parse(String(form.get("document"))) } : {}) }, staff.email);
   } catch (error) { errorCode = error instanceof Error && /^[A-Z][A-Z_]+$/.test(error.message) ? error.message : "KNOWLEDGE_REVIEW_INVALID"; }
   revalidatePath("/studio/sav/connaissances");
-  redirect(`/studio/sav/connaissances?result=${errorCode || "draft_ready"}`);
+  const detailCandidate = String(form.get("candidateId") || "");
+  if (form.get("returnDetail") === "true" && /^[a-f0-9-]{36}$/i.test(detailCandidate)) redirect(`/studio/sav/connaissances/${detailCandidate}?kind=candidate&result=${errorCode || "draft_ready"}`);
+  redirect(`/studio/sav/connaissances/imports?result=${errorCode || "draft_ready"}`);
 }
 
 export async function importOnboardingKnowledgeAction(form: FormData) {
@@ -361,7 +363,7 @@ export async function importOnboardingKnowledgeAction(form: FormData) {
   try { await proposeActiveOnboardingKnowledge(id(form, "itemId"), id(form, "versionId"), staff.email); }
   catch (error) { errorCode = error instanceof Error && /^[A-Z][A-Z_]+$/.test(error.message) ? error.message : "KNOWLEDGE_IMPORT_FAILED"; }
   revalidatePath("/studio/sav/connaissances");
-  redirect(`/studio/sav/connaissances?result=${errorCode || "candidate_ready"}`);
+  redirect(`/studio/sav/connaissances/imports?result=${errorCode || "candidate_ready"}`);
 }
 
 export async function reviewProposalAction(form: FormData) {
@@ -400,7 +402,7 @@ export async function importHubspotKnowledgeAction(form: FormData) {
     result = error instanceof Error && /^[A-Z][A-Z_]+$/.test(error.message) ? error.message : "HUBSPOT_IMPORT_INVALID";
   }
   revalidatePath("/studio/sav/connaissances");
-  redirect(`/studio/sav/connaissances?result=${result}`);
+  redirect(`/studio/sav/connaissances/imports?result=${result}`);
 }
 
 export async function reconcileTicketReturnAction(form: FormData) {

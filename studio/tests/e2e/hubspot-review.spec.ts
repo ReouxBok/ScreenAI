@@ -12,8 +12,8 @@ test("Ugo recompare le contenu corrigé avant de préparer un brouillon SAV", as
       steps: [{ id: "export.step-1", userLabel: "Format", objective: title, instruction: "Choisir le format fictif.", expectedResult: "Format choisi.", escalation: "Consulter un humain." }] },
     provenance: { sources: [{ emailId: "123", url: "https://app.hubspot.com/contacts/1/email/123", date: "2026-09-08T10:00:00.000Z", ticketIds: [] }], validationNotes: ["Fixture synthétique uniquement."] },
   }] };
-  await page.goto("/studio/sav/connaissances");
-  await expect(page.getByRole("heading", { name: "Connaissances SAV à valider" })).toBeVisible();
+  await page.goto("/studio/sav/connaissances/imports");
+  await expect(page.getByRole("heading", { name: "Imports et conversion des connaissances" })).toBeVisible();
   await page.getByText("Importer des fiches HubSpot", { exact: true }).click();
   await page.getByLabel("Base de connaissances privée").setInputFiles({ name: "fixture.json", mimeType: "application/json", buffer: Buffer.from(JSON.stringify(bundle)) });
   await submitServerAction(page, page.getByRole("button", { name: "Préparer les candidats SAV" }));

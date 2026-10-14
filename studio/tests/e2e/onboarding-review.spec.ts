@@ -4,7 +4,7 @@ import { expect, test, type Locator } from "@playwright/test";
 const title = "Renommer l’espace — démo SAV-51 (titre exact)";
 const sourceItemId = "00000051-0000-4000-8000-000000000001";
 const sourceVersionId = "00000051-0000-4000-9000-000000000001";
-const path = "/studio/sav/connaissances";
+const path = "/studio/sav/connaissances/imports";
 async function openDetails(summary: Locator) {
   if (await summary.locator("..").getAttribute("open") === null) await summary.click();
 }

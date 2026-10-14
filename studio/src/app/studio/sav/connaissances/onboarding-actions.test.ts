@@ -21,7 +21,7 @@ vi.mock("next/cache", () => ({ revalidatePath: state.revalidate }));
 vi.mock("next/navigation", () => ({ redirect: (url: string) => { throw new Error(`REDIRECT:${url}`); } }));
 
 import { continueOnboardingImportAction, previewOnboardingReviewAction, reviewOnboardingKnowledgeAction, startOnboardingImportAction } from "./onboarding-actions";
-import SavKnowledgeCandidatesPage from "./page";
+import SavKnowledgeCandidatesPage from "./imports/page";
 
 const candidateId = "10000000-0000-4000-8000-000000000001";
 const revisionId = "10000000-0000-4000-8000-000000000002";
@@ -68,7 +68,7 @@ describe("SAV onboarding knowledge actions", () => {
   });
 
   it("does not call the backend for a malformed lot reference", async () => {
-    await expect(continueOnboardingImportAction(form({ importId: "bad", returnPage: "-1", returnStatus: "unknown", returnSource: "https://example.com" }))).rejects.toThrow("/studio/sav/connaissances?result=ONBOARDING_ACTION_INVALID");
+    await expect(continueOnboardingImportAction(form({ importId: "bad", returnPage: "-1", returnStatus: "unknown", returnSource: "https://example.com" }))).rejects.toThrow("/studio/sav/connaissances/imports?result=ONBOARDING_ACTION_INVALID");
     expect(state.resume).not.toHaveBeenCalled();
   });
 

@@ -13,7 +13,7 @@ import { continueOnboardingImport, prepareOnboardingReview, startOnboardingImpor
 import { reviewKnowledgeCandidate } from "@/lib/knowledge/review";
 import { assertSavActor } from "@/lib/sav/access";
 
-const path = "/studio/sav/connaissances";
+const path = "/studio/sav/connaissances/imports";
 const statuses = new Set(["all", "pending", "needs_completion", "needs_recording", "not_applicable", "approved", "rejected"]);
 const sources = new Set(["all", "onboarding", "hubspot", "sav"]);
 
@@ -32,6 +32,7 @@ function returnUrl(form: FormData, result: string) {
   const batch = z.uuid().safeParse(form.get("returnBatch"));
   const candidate = z.uuid().safeParse(form.get("returnCandidate"));
   if (batch.success) query.set("batch", batch.data);
+  if (candidate.success && form.get("returnDetail") === "true") return `/studio/sav/connaissances/${candidate.data}?kind=candidate&result=${encodeURIComponent(result)}`;
   if (candidate.success) query.set("candidate", candidate.data);
   return `${path}?${query.toString()}${candidate.success ? `#candidate-${candidate.data}` : ""}`;
 }
@@ -42,7 +43,7 @@ export async function startOnboardingImportAction(form: FormData) {
   let result = "onboarding_import_started";
   try { await startOnboardingImport(staff.email); }
   catch (error) { result = errorCode(error); }
-  revalidatePath(path);
+  revalidatePath("/studio/sav/connaissances", "layout");
   redirect(returnUrl(form, result));
 }
 
@@ -52,7 +53,7 @@ export async function continueOnboardingImportAction(form: FormData) {
   let result = "onboarding_import_continued";
   try { await continueOnboardingImport(z.uuid().parse(form.get("importId")), staff.email, 10); }
   catch (error) { result = errorCode(error); }
-  revalidatePath(path);
+  revalidatePath("/studio/sav/connaissances", "layout");
   redirect(returnUrl(form, result));
 }
 
@@ -88,6 +89,6 @@ export async function reviewOnboardingKnowledgeAction(form: FormData) {
       } : {}),
     }, staff.email);
   } catch (error) { result = errorCode(error); }
-  revalidatePath(path);
+  revalidatePath("/studio/sav/connaissances", "layout");
   redirect(returnUrl(form, result));
 }
