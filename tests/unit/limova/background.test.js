@@ -194,3 +194,59 @@ it('binds screenshot uploads to the active account and conversation', async () =
   await h.background.handle({ type: 'LIMOVA_SEND_MESSAGE', text: 'Observe', browser: true });
   expect(h.client.uploadBrowserScreenshot).toHaveBeenCalledWith({ userId: 'user-1', workspaceId: 'workspace-1' }, 'conversation-1', image, expect.any(AbortSignal));
 });
+
+describe('Studio evaluation lifecycle', () => {
+  const code = 'private-staff-evaluation-code';
+  async function begin(f) {
+    await open(f.background);
+    f.client.createConversation.mockResolvedValueOnce({ id: 'evaluation-conversation' });
+    return f.background.handle({ type: 'LIMOVA_START_EVALUATION', evaluationCode: code });
+  }
+  it('keeps the grant and evaluation selection out of storage and restores the personal selection', async () => {
+    const f = harness();
+    const started = await begin(f);
+    expect(started).toMatchObject({ conversationId: 'evaluation-conversation', evaluationActive: true });
+    expect(JSON.stringify(started)).not.toContain(code);
+    expect(f.state[KEY].conversationId).toBe('conversation-1');
+    expect(JSON.stringify(f.storage.set.mock.calls)).not.toContain(code);
+    await f.background.handle({ type: 'LIMOVA_SEND_MESSAGE', text: 'Test' });
+    expect(f.client.sendMessage).toHaveBeenCalledWith(
+      { userId: 'user-1', workspaceId: 'workspace-1' }, 'evaluation-conversation', 'Test', expect.any(AbortSignal), undefined, code);
+    expect(JSON.stringify(f.notify.mock.calls)).not.toContain(code);
+    await f.background.handle({ type: 'LIMOVA_END_EVALUATION' });
+    expect(f.client.cancel).toHaveBeenCalledWith({ userId: 'user-1', workspaceId: 'workspace-1' }, 'evaluation-conversation');
+    await f.background.handle({ type: 'LIMOVA_SEND_MESSAGE', text: 'Personnel' });
+    expect(f.client.sendMessage).toHaveBeenLastCalledWith(
+      { userId: 'user-1', workspaceId: 'workspace-1' }, 'conversation-1', 'Personnel', expect.any(AbortSignal), undefined, undefined);
+  });
+
+  it.each(['LIMOVA_CREATE_CONVERSATION', 'LIMOVA_OPEN_CONVERSATION', 'LIMOVA_SELECT_WORKSPACE', 'LIMOVA_START_EVALUATION'])('prevents changing the evaluation scope through %s', async type => {
+    const f = harness(); await begin(f);
+    await expect(f.background.handle({ type, evaluationCode: code })).rejects.toThrow();
+    expect((await f.background.handle({ type: 'LIMOVA_GET_STATE' })).conversationId).toBe('evaluation-conversation');
+  });
+
+  it('does not retain a grant after an account switch', async () => {
+    const f = harness(); await begin(f);
+    f.client.bootstrap.mockResolvedValue({ user: { id: 'user-2' }, workspaces: [{ id: 'workspace-1', enabled: true }] });
+    expect(await f.background.handle({ type: 'LIMOVA_GET_STATE' })).toMatchObject({ evaluationActive: false, conversationId: null });
+    await f.background.handle({ type: 'LIMOVA_SELECT_WORKSPACE', workspaceId: 'workspace-1' });
+    await f.background.handle({ type: 'LIMOVA_CREATE_CONVERSATION' });
+    await f.background.handle({ type: 'LIMOVA_SEND_MESSAGE', text: 'Hello' });
+    expect(f.client.sendMessage.mock.calls.at(-1).at(-1)).toBeUndefined();
+  });
+
+  it('clears the local grant even if remote cancellation fails', async () => {
+    const f = harness(); await begin(f);
+    f.client.cancel.mockRejectedValueOnce(new Error('offline'));
+    await expect(f.background.handle({ type: 'LIMOVA_END_EVALUATION' })).rejects.toThrow('offline');
+    expect(await f.background.handle({ type: 'LIMOVA_GET_STATE' })).toMatchObject({ evaluationActive: false, conversationId: 'conversation-1' });
+  });
+
+  it('leaves the personal selection intact when evaluation authorization fails', async () => {
+    const f = harness(); await open(f.background);
+    f.client.createConversation.mockRejectedValueOnce(new Error('denied'));
+    await expect(f.background.handle({ type: 'LIMOVA_START_EVALUATION', evaluationCode: code })).rejects.toThrow('denied');
+    expect(await f.background.handle({ type: 'LIMOVA_GET_STATE' })).toMatchObject({ evaluationActive: false, conversationId: 'conversation-1' });
+  });
+});

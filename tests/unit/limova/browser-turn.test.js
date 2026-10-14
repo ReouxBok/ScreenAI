@@ -7,7 +7,7 @@ const event = data => ({ event: 'custom', data });
 const waiting = event({ type: 'extension.turn_state', turnId: 'turn', state: 'waiting' });
 const complete = event({ type: 'extension.turn_state', turnId: 'turn', state: 'completed' });
 async function* events(...items) { yield* items; }
-function harness() {
+function harness(evaluationCode) {
   const client = {
     getConversation: vi.fn().mockResolvedValue({}),
     sendMessage: vi.fn(() => events(event(action), waiting)),
@@ -20,7 +20,7 @@ function harness() {
   const authorize = vi.fn().mockResolvedValue(undefined);
   const readPage = vi.fn().mockResolvedValue({ tabId: 1, origin: 'https://example.com', contextVersion: 2 });
   const notify = vi.fn();
-  return { client, execute, journal, authorize, readPage, notify, runner: createBrowserTurnRunner({ client, journal, execute, authorize, readPage, notify }) };
+  return { client, execute, journal, authorize, readPage, notify, runner: createBrowserTurnRunner({ client, journal, execute, authorize, readPage, notify, evaluationCode }) };
 }
 
 describe('browser turn continuation', () => {
@@ -109,4 +109,20 @@ it('does not dispatch when cancellation occurs during authorization', async () =
   await expect(h.runner.send(context, 'conversation', 'Hello', controller.signal)).rejects.toThrow();
   expect(h.execute).not.toHaveBeenCalled();
   expect(h.client.sendBrowserResult).not.toHaveBeenCalled();
+});
+
+
+describe('evaluation browser continuation', () => {
+  it.each(['send', 'resume'])('preserves the grant through %s without journaling it', async operation => {
+    const code = 'private-staff-evaluation-code';
+    const h = harness(code);
+    if (operation === 'send') await h.runner.send(context, 'conversation', 'Test');
+    else await h.runner.resume(context, 'conversation');
+    const initial = operation === 'send' ? h.client.sendMessage : h.client.resumeBrowserTurn;
+    expect(initial.mock.calls[0].at(-1)).toBe(code);
+    expect(h.client.sendBrowserResult.mock.calls[0].at(-1)).toBe(code);
+    expect(JSON.stringify(h.journal.run.mock.calls)).not.toContain(code);
+    expect(JSON.stringify(h.notify.mock.calls)).not.toContain(code);
+    expect(JSON.stringify(h.execute.mock.calls)).not.toContain(code);
+  });
 });

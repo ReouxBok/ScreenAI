@@ -1,6 +1,6 @@
 const MAX_ACTIONS_PER_TURN = 100;
 
-export function createBrowserTurnRunner({ client, journal, readPage, execute, authorize, notify }) {
+export function createBrowserTurnRunner({ client, journal, readPage, execute, authorize, notify, evaluationCode }) {
   async function consume(stream, expectedTurnId, signal) {
     const actions = new Map();
     let turnId = expectedTurnId;
@@ -53,7 +53,7 @@ export function createBrowserTurnRunner({ client, journal, readPage, execute, au
       if (receipt.state !== 'completed') return { state: 'uncertain', turnId: pending.turnId, actionId: action.actionId };
       signal?.throwIfAborted();
       const page = await readPage(signal);
-      const stream = client.sendBrowserResult(context, conversationId, { sessionId, page }, receipt.result, signal);
+      const stream = client.sendBrowserResult(context, conversationId, { sessionId, page }, receipt.result, signal, evaluationCode);
       pending = await consume(stream, pending.turnId, signal);
     }
     return { state: pending.state, turnId: pending.turnId };
@@ -64,7 +64,7 @@ export function createBrowserTurnRunner({ client, journal, readPage, execute, au
       context = Object.freeze({ ...context });
       const sessionId = await journal.getSession(context);
       const page = await readPage(signal);
-      const stream = client.sendMessage(context, conversationId, content, signal, { sessionId, page });
+      const stream = client.sendMessage(context, conversationId, content, signal, { sessionId, page }, evaluationCode);
       const pending = await consume(stream, undefined, signal);
       return continueTurn(context, conversationId, sessionId, pending, signal);
     },
@@ -74,7 +74,7 @@ export function createBrowserTurnRunner({ client, journal, readPage, execute, au
       const turn = await client.getBrowserTurn(context, conversationId, sessionId, signal);
       if (!turn || turn.status !== 'open') return { state: turn?.status ?? 'absent', turnId: turn?.turnId };
       const page = await readPage(signal);
-      const stream = client.resumeBrowserTurn(context, conversationId, { sessionId, page }, turn.turnId, signal);
+      const stream = client.resumeBrowserTurn(context, conversationId, { sessionId, page }, turn.turnId, signal, evaluationCode);
       const pending = await consume(stream, turn.turnId, signal);
       return continueTurn(context, conversationId, sessionId, pending, signal);
     },

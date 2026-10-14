@@ -1,3 +1,4 @@
+import { evaluationGrant } from './evaluation-grant.js';
 import { createBrowserTurnRunner } from './browser-turn.js';
 import { createBrowserJournal } from './browser-journal.js';
 import { LimovaDeepAgentClient, LIMOVA_APP_URL } from './client.js';
@@ -8,17 +9,19 @@ export const LIMOVA_MESSAGE_TYPES = new Set([
   'LIMOVA_CREATE_CONVERSATION', 'LIMOVA_OPEN_CONVERSATION', 'LIMOVA_SEND_MESSAGE',
   'LIMOVA_CANCEL', 'LIMOVA_OPEN_APP', 'LIMOVA_LOGOUT',
   'LIMOVA_GET_MESSAGES', 'LIMOVA_RESUME_BROWSER',
+  'LIMOVA_START_EVALUATION', 'LIMOVA_END_EVALUATION',
 ]);
 
 export function createLimovaBackground({ storage, openTab, notify, client = new LimovaDeepAgentClient(), journal = createBrowserJournal(), createDriver }) {
   let context = null;
   let conversationId = null;
   let activeTurn = null;
+  let evaluation = null;
   let contextQueue = Promise.resolve();
 
   async function save() {
     if (!context) return storage.remove(STORAGE_KEY);
-    await storage.set({ [STORAGE_KEY]: { ...context, conversationId } });
+    await storage.set({ [STORAGE_KEY]: { ...context, conversationId: evaluation ? evaluation.previousConversationId : conversationId } });
   }
 
   async function cancel() {
@@ -48,13 +51,14 @@ export function createLimovaBackground({ storage, openTab, notify, client = new 
       if (previous?.userId) await journal.clearAccount(previous.userId);
       context = null;
       conversationId = null;
+      evaluation = null;
       await save();
     } else {
       context = { userId: current.user.id, workspaceId: workspace.id };
       await journal.getSession(context);
       conversationId = conversationId ?? stored?.conversationId ?? null;
     }
-    return { authenticated: true, ...current, context, conversationId, activeTurnId: activeTurn?.id ?? null };
+    return { authenticated: true, ...current, context, conversationId, evaluationActive: Boolean(evaluation), activeTurnId: activeTurn?.id ?? null };
   }
 
   function requireContext() {
@@ -63,6 +67,9 @@ export function createLimovaBackground({ storage, openTab, notify, client = new 
   }
 
   async function handle(request) {
+    if (evaluation && ['LIMOVA_SELECT_WORKSPACE', 'LIMOVA_CREATE_CONVERSATION', 'LIMOVA_OPEN_CONVERSATION'].includes(request.type)) {
+      throw new Error('Termine le test Studio avant de changer de conversation ou d’espace.');
+    }
     switch (request.type) {
       case 'LIMOVA_GET_STATE':
         try { return await state(); } catch (error) {
@@ -73,9 +80,33 @@ export function createLimovaBackground({ storage, openTab, notify, client = new 
           activeTurn = null;
           context = null;
           conversationId = null;
+          evaluation = null;
           await save();
           return { authenticated: false, workspaces: [], context: null, conversationId: null };
         }
+      case 'LIMOVA_START_EVALUATION': {
+        if (evaluation) throw new Error('Un test Studio est déjà actif.');
+        const code = evaluationGrant(request.evaluationCode);
+        if (!code) throw new Error('Code de test Studio requis.');
+        await state();
+        const identity = requireContext();
+        await cancel();
+        const conversation = await client.createConversation(identity, 'Évaluation Studio', undefined, code);
+        evaluation = { code, previousConversationId: conversationId };
+        conversationId = conversation.id;
+        await save();
+        return { ok: true, conversationId, context: identity, evaluationActive: true };
+      }
+      case 'LIMOVA_END_EVALUATION': {
+        if (!evaluation) return { ok: true };
+        const previous = evaluation.previousConversationId;
+        try { await cancel(); } finally {
+          evaluation = null;
+          conversationId = previous;
+          await save();
+        }
+        return { ok: true, conversationId };
+      }
       case 'LIMOVA_OPEN_APP':
         await openTab({ url: LIMOVA_APP_URL });
         return { ok: true };
@@ -115,7 +146,7 @@ export function createLimovaBackground({ storage, openTab, notify, client = new 
         if (request.type === 'LIMOVA_RESUME_BROWSER' && request.browser !== true) throw new Error('Autorise le navigateur avant de reprendre ce tour.');
         if (activeTurn) throw new Error('Un tour est déjà en cours.');
         if (!conversationId) throw new Error('Ouvre une conversation Limova.');
-        const turn = { id: crypto.randomUUID(), context: requireContext(), conversationId, controller: new AbortController() };
+        const turn = { id: crypto.randomUUID(), context: requireContext(), conversationId, evaluationCode: evaluation?.code, controller: new AbortController() };
         activeTurn = turn;
         notify({ type: 'LIMOVA_TURN_STARTED', turnId: turn.id, conversationId });
         try {
@@ -128,14 +159,14 @@ export function createLimovaBackground({ storage, openTab, notify, client = new 
             const driver = createDriver({ scope: { ...turn.context, sessionId }, journal, signal: turn.controller.signal,
               uploadScreenshot: (image, signal) => client.uploadBrowserScreenshot(turn.context, turn.conversationId, image, signal) });
             const runner = createBrowserTurnRunner({ client, journal, readPage: driver.readPage,
-              execute: driver.execute, authorize: driver.authorize, notify: emit });
+              execute: driver.execute, authorize: driver.authorize, notify: emit, evaluationCode: turn.evaluationCode });
             const outcome = request.type === 'LIMOVA_RESUME_BROWSER'
               ? await runner.resume(turn.context, turn.conversationId, turn.controller.signal)
               : await runner.send(turn.context, turn.conversationId, request.text, turn.controller.signal);
             notify({ type: 'LIMOVA_BROWSER_STATE', turnId: turn.id, conversationId: turn.conversationId, state: outcome.state, actionId: outcome.actionId, browserTurnId: outcome.turnId });
             return { ok: true, turnId: turn.id, browserState: outcome.state };
           }
-          for await (const event of client.sendMessage(turn.context, turn.conversationId, request.text, turn.controller.signal)) {
+          for await (const event of client.sendMessage(turn.context, turn.conversationId, request.text, turn.controller.signal, undefined, turn.evaluationCode)) {
             if (activeTurn !== turn) break;
             emit(event);
           }
@@ -145,6 +176,7 @@ export function createLimovaBackground({ storage, openTab, notify, client = new 
             await journal.clearAccount(turn.context.userId);
             context = null;
             conversationId = null;
+            evaluation = null;
             await save();
             notify({ type: 'LIMOVA_SESSION_CHANGED' });
           }
@@ -162,6 +194,7 @@ export function createLimovaBackground({ storage, openTab, notify, client = new 
           if (previous?.userId) await journal.clearAccount(previous.userId);
           context = null;
           conversationId = null;
+          evaluation = null;
           await save();
         }
         await client.logout();
@@ -172,7 +205,7 @@ export function createLimovaBackground({ storage, openTab, notify, client = new 
     }
   }
   return { handle(request) {
-    if (['LIMOVA_GET_STATE', 'LIMOVA_SELECT_WORKSPACE', 'LIMOVA_CREATE_CONVERSATION', 'LIMOVA_OPEN_CONVERSATION', 'LIMOVA_LOGOUT'].includes(request.type)) {
+    if (['LIMOVA_GET_STATE', 'LIMOVA_SELECT_WORKSPACE', 'LIMOVA_CREATE_CONVERSATION', 'LIMOVA_OPEN_CONVERSATION', 'LIMOVA_LOGOUT', 'LIMOVA_START_EVALUATION', 'LIMOVA_END_EVALUATION'].includes(request.type)) {
       const operation = contextQueue.then(() => handle(request));
       contextQueue = operation.catch(() => {});
       return operation;
