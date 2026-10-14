@@ -5,11 +5,20 @@ test("dossier and readonly draft have independent verdicts with no external send
  await page.goto("/studio/sav");await submitServerAction(page, page.getByRole("button",{name:/Démo — retrouver mes factures/}));await page.waitForURL(/\/studio\/sav\/[0-9a-f-]+\?/);
  await expect(page.getByRole("heading",{name:"Verdict du brouillon"})).toBeVisible();expect(await page.locator('textarea[name="replyDraft"]').count()).toBe(0);
  const draft=page.locator('section[aria-labelledby="draft-review-title"] pre').first();const text=await draft.textContent();
+ const dossier=page.getByRole("region",{name:"Proposition de l’IA",exact:true});
+ const prepare=page.getByRole("button",{name:"Préparer l’aperçu de l’action",exact:true});
+ const crmUnavailable=page.getByRole("alert").filter({hasText:"Le contexte HubSpot est indisponible ou incomplet. Actualisez-le avant de choisir une action."});
+ await expect(prepare).toBeDisabled();
  await submitServerAction(page, page.getByRole("button",{name:"Valider le dossier / process",exact:true}));await page.waitForURL(/review=saved/);await expect(page.getByText("Revue enregistrée.",{exact:false})).toBeVisible();
+ await expect(dossier).toContainText("Process validé par ugo@limova.ai");await expect(crmUnavailable).toBeVisible();await expect(prepare).toBeDisabled();
  await submitServerAction(page, page.getByRole("button",{name:"Refuser le brouillon",exact:true}));await page.waitForURL(/review=draft_reviewed/);await expect(page.getByText("Brouillon refusé · traitement humain à observer.",{exact:true})).toBeVisible();
  await expect(page.getByText("En attente de ticket confirmé · cycle 1",{exact:true}).first()).toBeVisible();
- await expect(page.getByRole("button",{name:"Préparer l’aperçu de l’action",exact:true})).toBeEnabled();await expect(page.getByRole("button",{name:"Envoyer la réponse acceptée",exact:true})).toBeDisabled();expect(await draft.textContent()).toBe(text);
+ // Inbox opening refreshes CRM without provider credentials in this harness.
+ // Verdicts remain independent, but missing CRM must keep the ticket action
+ // locked. SAV semantic/SAV53 fixtures cover the complete CRM + enabled case.
+ await expect(dossier).toContainText("Process validé par ugo@limova.ai");await expect(crmUnavailable).toBeVisible();await expect(prepare).toBeDisabled();await expect(page.getByRole("button",{name:"Envoyer la réponse acceptée",exact:true})).toBeDisabled();expect(await draft.textContent()).toBe(text);
  await submitServerAction(page, page.getByRole("button",{name:"Accepter le brouillon",exact:true}));await page.waitForURL(/review=draft_reviewed/);await expect(page.getByText("Brouillon accepté · envoi distinct à confirmer.",{exact:true})).toBeVisible();await expect(page.getByRole("button",{name:"Envoyer la réponse acceptée",exact:true})).toBeDisabled();expect(external).toEqual([]);
+ await expect(dossier).toContainText("Process validé par ugo@limova.ai");await expect(crmUnavailable).toBeVisible();await expect(prepare).toBeDisabled();expect(await draft.textContent()).toBe(text);
  await expect.poll(()=>page.evaluate(()=>document.documentElement.scrollWidth<=window.innerWidth+1)).toBe(true);
  await page.screenshot({path:testInfo.outputPath("sav-38.png"),fullPage:true});
 });
