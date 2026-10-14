@@ -299,3 +299,59 @@ test('native turn rejects a pre-navigation reference and continues only after re
   expect(legacy).toEqual([]);
   expect(errors).toEqual([]);
 });
+
+test('native turn scrolls to an unseen link and navigates with a pointer after a fresh read', async ({ nativeChat }) => {
+  const { app, panel, state, calls, legacy, errors } = nativeChat;
+  state.reply = 'Action traitée.';
+  await app.evaluate(() => {
+    const spacer = document.createElement('div'); spacer.style.height = `${innerHeight * 2}px`;
+    const link = document.createElement('a'); link.href = '/profil'; link.textContent = 'Profil en bas de page';
+    link.style.cssText = 'display:block;height:40px;width:200px';
+    link.addEventListener('click', () => {
+      const pointer = document.querySelector('[data-limova-native-pointer]');
+      const target = link.getBoundingClientRect(), cursor = pointer?.getBoundingClientRect();
+      sessionStorage.setItem('offscreenNavigation', JSON.stringify({
+        clicks: Number(sessionStorage.getItem('offscreenCount') ?? 0) + 1,
+        scrollY, pointer: Boolean(pointer),
+        centered: Boolean(cursor && Math.abs(cursor.x - target.x - target.width / 2) < 1
+          && Math.abs(cursor.y - target.y - target.height / 2) < 1),
+        intercepts: getComputedStyle(pointer).pointerEvents !== 'none',
+      }));
+      sessionStorage.setItem('offscreenCount', '1');
+    });
+    document.querySelector('main').append(spacer, link);
+  });
+  let scrolls = 0;
+  const seek = body => {
+    const page = JSON.parse(body.browserResult.observation);
+    const target = page.elements.find(item => item.label === 'Profil en bas de page');
+    if (target) {
+      state.browserActions.push(read);
+      return { operation: 'click', elementId: target.elementId };
+    }
+    expect(scrolls++).toBeLessThan(8);
+    state.browserActions.push(read, seek);
+    return { operation: 'scroll', direction: 'down' };
+  };
+  state.browserActions = [read, seek];
+  await send(panel, 'Descends dans la page et ouvre le profil en bas.');
+  await expect(app).toHaveURL(`${APP}/profil`);
+  const navigation = await app.evaluate(() => JSON.parse(sessionStorage.getItem('offscreenNavigation')));
+  expect(navigation).toMatchObject({ clicks: 1, pointer: true, centered: true, intercepts: false });
+  expect(navigation.scrollY).toBeGreaterThan(0);
+  expect(scrolls).toBeGreaterThan(0);
+  const requests = messageCalls(calls);
+  expect(requests.filter(call => !call.body.kind)).toHaveLength(1);
+  const receipts = requests.slice(1).map(call => call.body.browserResult);
+  expect(receipts.every(receipt => receipt.status === 'completed')).toBe(true);
+  expect(JSON.parse(receipts[0].observation).elements.some(item => item.label === 'Profil en bas de page')).toBe(false);
+  const movements = receipts.map(receipt => JSON.parse(receipt.observation.startsWith('{') ? receipt.observation : '{}'))
+    .filter(observation => Object.hasOwn(observation, 'moved'));
+  expect(movements).toHaveLength(scrolls);
+  expect(movements.every(item => item.moved && item.scrollY > 0)).toBe(true);
+  expect(new Set(receipts.map(receipt => receipt.turnId)).size).toBe(1);
+  expect(new Set(receipts.map(receipt => receipt.actionId)).size).toBe(receipts.length);
+  expect(JSON.parse(receipts.at(-1).observation).url).toBe(`${APP}/profil`);
+  await expect(panel.locator('.action-card, .message.error')).toHaveCount(0);
+  expect(legacy).toEqual([]); expect(errors).toEqual([]);
+});

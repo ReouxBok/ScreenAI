@@ -251,21 +251,7 @@ test.describe('Packaged extension — complete user flows', () => {
 
 
 
-  test('a safe action displays a computer-use cursor and clicks without confirmation', async ({ context, extensionId }) => {
-    const { limova, sidebar } = await openExtensionHarness(context, extensionId, {
-      geminiReply: ({ body }) => {
-        const prompt = body.systemInstruction.parts[0].text;
-        const profileId = prompt.match(/\[(\d+)\] clickable\(a\) "Ouvrir mon profil"/)?.[1];
-        return `J’ouvre ton profil. {{ACTION:${profileId}}}`;
-      }
-    });
-    await grantAIConsent(sidebar);
-    await sidebar.locator('#screenshotBtn').click();
 
-    await expect(sidebar.locator('.action-card')).toHaveCount(0);
-    await expect(limova.locator('#limova-computer-use-pointer')).toBeVisible();
-    await expect(limova).toHaveURL(`${LIMOVA_ORIGIN}/profil`);
-  });
 
   test('SPA navigation and a newly opened modal each trigger automatic contextual analysis', async ({ context, extensionId }) => {
     const { calls, limova, sidebar } = await openExtensionHarness(context, extensionId, {
