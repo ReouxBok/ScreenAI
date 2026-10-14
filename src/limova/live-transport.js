@@ -1,6 +1,6 @@
 import { evaluationGrant } from './evaluation-grant.js';
 import { liveBrowserBinding, liveBrowserContinuation, liveBrowserContextReply } from './live-browser-contract.js';
-import { createLimovaAppTarget } from './app-target.js';
+import { createLimovaAppTarget, createLimovaAppLease } from './app-target.js';
 import { LIVE_PORT } from './live-bridge.js';
 
 const unavailable = () => new Error('La connexion vocale Limova a été interrompue.');
@@ -11,9 +11,14 @@ export function createLimovaLiveTransport(chrome) {
     const grant = evaluationGrant(evaluationCode);
     const browserBinding = liveBrowserBinding(browserSession, browserContext);
     signal?.throwIfAborted();
-    const target = await prepare(signal);
-    signal?.throwIfAborted();
-    const port = chrome.tabs.connect(target.tabId, { documentId: target.documentId, name: LIVE_PORT });
+    const target = browserBinding.browserSession
+      ? await createLimovaAppLease(chrome, 'src/limova/app-live-bridge.js', signal)
+      : await prepare(signal);
+    let port;
+    try {
+      signal?.throwIfAborted();
+      port = chrome.tabs.connect(target.tabId, { documentId: target.documentId, name: LIVE_PORT });
+    } catch (error) { await target.release?.(); throw error; }
     return new Promise((resolve, reject) => {
       let ready = false;
       let closed = false;
@@ -25,6 +30,7 @@ export function createLimovaLiveTransport(chrome) {
         closed = true;
         signal?.removeEventListener('abort', abort);
         port.disconnect();
+        void target.release?.();
         if (!ready) reject(error ?? unavailable());
         else if (error) onError?.(error);
       };

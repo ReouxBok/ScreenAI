@@ -17,7 +17,8 @@ const frame = (event, data) => `event: ${event}\ndata: ${JSON.stringify(data)}\n
 
 export const test = base.extend({
   nativeViewport: [false, { option: true }],
-  nativeChat: async ({ nativeViewport }, use) => {
+  nativeMicrophone: [false, { option: true }],
+  nativeChat: async ({ nativeViewport, nativeMicrophone }, use) => {
     const directory = await mkdtemp(path.join(tmpdir(), 'limova-native-chat-'));
     const key = path.join(directory, 'key.pem'), cert = path.join(directory, 'cert.pem');
     execFileSync('openssl', ['req', '-x509', '-newkey', 'rsa:2048', '-nodes', '-keyout', key, '-out', cert, '-days', '1', '-subj', '/CN=limova-native-chat'], { stdio: 'ignore' });
@@ -109,6 +110,7 @@ export const test = base.extend({
         ...(nativeViewport ? { viewport: null } : {}),
         args: [`--disable-extensions-except=${extension}`, `--load-extension=${extension}`, '--no-proxy-server', '--ignore-certificate-errors',
           '--enable-unsafe-extension-debugging',
+          ...(nativeMicrophone ? ['--use-fake-device-for-media-stream', '--use-fake-ui-for-media-stream'] : []),
           `--host-resolver-rules=MAP ${new URL(API).hostname} 127.0.0.1:${port}, MAP ${new URL(APP).hostname} 127.0.0.1:${port}, MAP * ~NOTFOUND`] });
       context.on('request', request => { if (/limova-proxy|generativelanguage|\/api\/copilot/.test(request.url())) legacy.push(request.url()); });
       const worker = context.serviceWorkers()[0] ?? await context.waitForEvent('serviceworker');
@@ -122,7 +124,7 @@ export const test = base.extend({
       await panel.goto(`chrome-extension://${new URL(worker.url()).host}/src/sidebar/sidebar.html`);
       await panel.waitForFunction(() => document.documentElement.dataset.sidebarReady === 'true');
       await app.bringToFront();
-      await use({ context, worker, app, panel, calls, history, legacy, errors, state });
+      await use({ context, worker, app, panel, calls, history, legacy, errors, state, server });
     } finally {
       await context?.close(); server.closeAllConnections();
       await new Promise(resolve => server.close(resolve));

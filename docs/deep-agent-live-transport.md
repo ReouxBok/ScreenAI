@@ -1,8 +1,8 @@
-# Transport vocal Limova — couche préparatoire
+# Transport vocal natif Limova
 
-Le transport `createLimovaLiveTransport` ouvre le namespace Socket.IO existant `/conversation/live` depuis le document exact de l’app Limova, via un port interne dans le monde isolé de l’extension. Il réutilise les cookies du navigateur sans les lire ni les copier. Le worker ou le panneau prépare l’onglet avec le même helper que le chat HTTP. La dépendance Socket.IO est embarquée dans le paquet, sans script distant.
+Le transport `createLimovaLiveTransport` ouvre le namespace Socket.IO existant `/conversation/live` depuis le document exact de l’app Limova, via un port interne dans le monde isolé de l’extension. Il réutilise les cookies du navigateur sans les lire ni les copier. Sans navigateur autorisé, le panneau prépare un onglet app existant comme le chat HTTP. Avec navigateur autorisé, il crée un onglet app inactif dédié à la connexion vocale, indépendant du document piloté. La dépendance Socket.IO est embarquée dans le paquet, sans script distant.
 
-Cette couche n’est pas encore branchée au bouton micro. Les PR API #2212–#2214 préparent le contrat extension et sa reprise navigateur ; leur disponibilité sur le déploiement cible reste à vérifier. La capture PCM, la lecture audio et le raccordement au panneau restent à réaliser. Le moteur cible reste le Charly Deep Agent existant.
+Le bouton micro, la capture PCM, la lecture audio et le contrôleur navigateur sont raccordés dans le worktree. Les PR API #2212–#2214 portent le contrat extension et sa reprise navigateur ; leur disponibilité sur le déploiement cible reste à vérifier. Le moteur cible reste le Charly Deep Agent existant.
 
 ## Contrat requis côté backend
 
@@ -80,3 +80,11 @@ Les transcriptions partielles remplacent l’aperçu courant. Chaque résultat f
 Le micro réutilise le worklet PCM natif. Les contrôles d’identité, workspace, flag et consentement sont revérifiés toutes les cinq secondes ; l’arrêt ferme le transport et les pistes. L’observation de la démonstration reste active, alors que l’ancien moteur de décision vocal n’est pas démarré.
 
 Le test `limova-training-transcription.spec.js` utilise le vrai bouton micro, le transport, le worklet et le background avec API/provider/Studio simulés localement. Il vérifie les octets audio, une note finale unique, l’absence de session vocale legacy et l’arrêt après retrait du consentement. Il utilise le paquet production en environnement isolé : le paquet staging n’autorise volontairement pas le Studio de production. Un Studio staging et une qualification avec compte/provider réels restent nécessaires. Ce test ne couvre pas l’enregistrement vidéo complet.
+
+## Connexion indépendante de l’onglet piloté
+
+Une navigation complète détruit les ports attachés à l’ancien document. La recette vocale intégrée reproduisait une coupure après le clic vers le profil : la même page hébergeait aussi Socket.IO. Pour les sessions avec navigateur autorisé, `createLimovaAppLease` crée désormais un onglet Limova inactif pour cette connexion first-party. Aucun cookie n’est lu ni copié ni nouvelle route ajoutée ; l’onglet est visible dans la barre Chrome et ne prend pas le focus.
+
+À l’arrêt, à la déconnexion ou à l’échec de préparation, cet onglet est fermé seulement s’il appartient toujours à la session, reste inactif et conserve le document attendu. S’il a été activé par l’utilisateur ou a changé de document, il est conservé. L’annulation d’un chargement nettoie ses listeners et son onglet initial. Un crash du navigateur ou la destruction abrupte du panneau ne constitue pas une garantie de nettoyage durable ; aucun état de propriété persistant n’est ajouté.
+
+`limova-voice-browser-workflow.spec.js` vérifie en une session : capture masquée réellement transférée, scroll, relecture, saisie unique, refus d’une référence inexistante, navigation complète, lecture de destination et réponse canonique après rechargement du panneau. L’onglet technique reste ouvert pendant le tour et est retiré à l’arrêt ; la page pilotée reste ouverte. Les actions Chrome, le driver et les pixels sont réels ; le serveur Socket.IO, l’API et le stockage sont des fixtures. Les connaissances Studio/MCP et la planification réelle restent des recettes backend/distantes distinctes.
