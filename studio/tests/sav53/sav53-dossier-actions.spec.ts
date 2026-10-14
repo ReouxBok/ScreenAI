@@ -83,7 +83,7 @@ test("la liste distingue thème, souci et action sans exposer une erreur techniq
   const row = page.getByRole("button", { name: "Ouvrir l’email : Problème technique : Produit fictif · Export", exact: true }).filter({ has: page.getByText("singlePlain@example.invalid", { exact: true }) });
   await expect(row).toBeVisible();
   await expect(row).toContainText("L’export du document échoue malgré une nouvelle tentative.");
-  await expect(row).toContainText("Valider le dossier puis ouvrir le ticket proposé.");
+  await expect(row).toContainText("Valider le dossier puis choisir l’action adaptée au ticket.");
   await expect(row).not.toContainText("Re: Re:");
   const failed = page.getByRole("button", { name: "Ouvrir l’email : Assistance téléphonie fictive", exact: true });
   await expect(failed).toContainText("Objet de l’email");

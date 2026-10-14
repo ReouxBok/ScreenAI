@@ -1,3 +1,4 @@
+import { submitServerAction } from "../helpers/server-action";
 import { expect, test } from "@playwright/test";
 import { SAV_SEMANTIC_E2E_DRAFT, SAV_SEMANTIC_E2E_THREAD } from "../../test/sav-semantic-e2e-fixture";
 
@@ -27,14 +28,16 @@ test("SAV44 exposes understanding and persists independent dossier/draft feedbac
   const reason = "Recette synthétique : le brouillon doit être repris par un humain.";
   await draft.getByRole("textbox", { name: "Motif du refus (facultatif)", exact: true }).fill(reason);
   await draft.getByRole("checkbox", { name: "Réponse hors sujet", exact: true }).check();
-  await draft.getByRole("button", { name: "Refuser le brouillon", exact: true }).click();
+  await submitServerAction(page, draft.getByRole("button", { name: "Refuser le brouillon", exact: true }));
+  await page.waitForURL(/review=draft_reviewed/, { timeout: 30_000 });
   await expect(draft.getByText("Brouillon refusé · traitement humain à observer.", { exact: true })).toBeVisible();
 
   await dossier.getByText("Évaluer la proposition et proposer une connaissance", { exact: true }).click();
   await dossier.getByRole("checkbox", { name: "Connaissance manquante", exact: true }).check();
   await dossier.getByRole("combobox", { name: "Verdict global", exact: true }).selectOption("partial");
   await dossier.getByRole("combobox", { name: "Fiabilité", exact: true }).selectOption("partial");
-  await dossier.getByRole("button", { name: "Valider le dossier / process", exact: true }).click();
+  await submitServerAction(page, dossier.getByRole("button", { name: "Valider le dossier / process", exact: true }));
+  await page.waitForURL(/review=saved/, { timeout: 30_000 });
   await expect(dossier).toContainText("Dossier · Process validé par ugo@limova.ai");
   await expect(draft).toContainText("Brouillon refusé · traitement humain à observer.");
   await expect(page.getByRole("button", { name: /^Ouvrir un nouveau ticket/ })).toBeEnabled();

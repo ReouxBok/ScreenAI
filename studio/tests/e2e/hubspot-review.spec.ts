@@ -1,3 +1,4 @@
+import { submitServerAction } from "../helpers/server-action";
 import { expect, test } from "@playwright/test";
 
 test("Ugo recompare le contenu corrigé avant de préparer un brouillon SAV", async ({ page }) => {
@@ -15,12 +16,12 @@ test("Ugo recompare le contenu corrigé avant de préparer un brouillon SAV", as
   await expect(page.getByRole("heading", { name: "Connaissances SAV à valider" })).toBeVisible();
   await page.getByText("Importer des fiches HubSpot", { exact: true }).click();
   await page.getByLabel("Base de connaissances privée").setInputFiles({ name: "fixture.json", mimeType: "application/json", buffer: Buffer.from(JSON.stringify(bundle)) });
-  await page.getByRole("button", { name: "Préparer les candidats SAV" }).click();
+  await submitServerAction(page, page.getByRole("button", { name: "Préparer les candidats SAV" }));
   await expect(page.getByRole("status")).toContainText("Import préparé");
   await page.getByText("Revoir, corriger ou écarter cette connaissance", { exact: true }).click();
   const approve = page.getByRole("button", { name: "Valider et préparer le brouillon SAV" });
   await expect(approve).toBeDisabled();
-  await page.getByRole("button", { name: "Actualiser la comparaison" }).click();
+  await submitServerAction(page, page.getByRole("button", { name: "Actualiser la comparaison" }));
   const acknowledgment = page.getByRole("checkbox", { name: /J’ai vérifié les sources, le contenu corrigé/ });
   await acknowledgment.check();
   await expect(approve).toBeEnabled();
@@ -31,15 +32,16 @@ test("Ugo recompare le contenu corrigé avant de préparer un brouillon SAV", as
   await editor.fill(JSON.stringify(document));
   await expect(approve).toBeDisabled();
   await expect(acknowledgment).toHaveCount(0);
-  await page.getByRole("button", { name: "Actualiser la comparaison" }).click();
+  await submitServerAction(page, page.getByRole("button", { name: "Actualiser la comparaison" }));
   await expect(page.getByRole("region", { name: "Comparaison du contenu corrigé" })).toContainText(document.steps[0].instruction);
   await acknowledgment.check();
   await page.getByLabel("Motif de la décision").fill("Sources fictives et correction revues dans le test navigateur.");
-  await approve.click();
+  await submitServerAction(page, approve);
   await expect(page.getByRole("status")).toContainText("Décision enregistrée");
   await expect(page.locator("article").filter({ hasText: title }).getByText("Validé", { exact: true })).toBeVisible();
   await page.getByText("Lire la connaissance et ses limites", { exact: true }).click();
   await page.getByRole("link", { name: "Ouvrir la projection existante →" }).click();
+  await page.waitForURL(/\/studio\/contenus\/[0-9a-f-]+$/, { timeout: 30_000 });
   await expect(page.getByText("À valider", { exact: true }).first()).toBeVisible();
   await expect(page.locator(".tiptap")).toContainText(document.steps[0].instruction);
   await expect(page.locator("[data-nextjs-dialog]")).toHaveCount(0);

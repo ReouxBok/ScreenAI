@@ -1,3 +1,4 @@
+import { submitServerAction } from "../helpers/server-action";
 import { expect, test, type Locator } from "@playwright/test";
 
 const title = "Renommer l’espace — démo SAV-51 (titre exact)";
@@ -9,7 +10,7 @@ async function openDetails(summary: Locator) {
 }
 
 test("SAV-51 : qualifier un tutoriel incomplet depuis le lot sans publier ni activer sa connaissance", async ({ page, request }) => {
-  test.setTimeout(180_000);
+  test.setTimeout(120_000);
   await page.setExtraHTTPHeaders({ "x-studio-test-user": "ugo@limova.ai" });
   const errors: string[] = [];
   page.on("pageerror", (error) => errors.push(error.message));
@@ -19,8 +20,8 @@ test("SAV-51 : qualifier un tutoriel incomplet depuis le lot sans publier ni act
   await openDetails(page.getByText("Proposer une version de tutoriel au SAV", { exact: true }));
   await page.getByLabel("ID du contenu", { exact: true }).fill(sourceItemId);
   await page.getByLabel("ID de la version source", { exact: true }).fill(sourceVersionId);
-  await page.getByRole("button", { name: "Préparer un candidat", exact: true }).click();
-  await expect(page).toHaveURL(/result=candidate_ready/);
+  await submitServerAction(page, page.getByRole("button", { name: "Préparer un candidat", exact: true }));
+  await page.waitForURL(/result=candidate_ready/);
   const initialCard = page.locator("article[id^='candidate-']").filter({ has: page.getByRole("heading", { name: title, exact: true }) });
   await expect(initialCard).toHaveCount(1);
   await expect(initialCard.getByText("À compléter", { exact: true })).toBeVisible();
@@ -28,12 +29,12 @@ test("SAV-51 : qualifier un tutoriel incomplet depuis le lot sans publier ni act
   expect(cardId).toMatch(/^candidate-[0-9a-f-]+$/);
 
   await openDetails(page.getByText(/^Lots de conversion des tutoriels ·/));
-  await page.getByRole("button", { name: "Préparer l’inventaire des tutoriels actifs", exact: true }).click();
-  await expect(page).toHaveURL(/result=onboarding_import_started/);
+  await submitServerAction(page, page.getByRole("button", { name: "Préparer l’inventaire des tutoriels actifs", exact: true }));
+  await page.waitForURL(/result=onboarding_import_started/);
   for (let pass = 0; pass < 3; pass++) {
     await openDetails(page.getByText(/^Lots de conversion des tutoriels ·/));
-    await page.getByRole("button", { name: /(?:Préparer les premiers candidats|Poursuivre ou reprendre le lot) · 10 sources maximum/ }).click();
-    await expect(page).toHaveURL(/result=onboarding_import_continued/);
+    await submitServerAction(page, page.getByRole("button", { name: /(?:Préparer les premiers candidats|Poursuivre ou reprendre le lot) · 10 sources maximum/ }));
+    await page.waitForURL(/result=onboarding_import_continued/);
     await openDetails(page.getByText(/^Lots de conversion des tutoriels ·/));
     await expect(page.getByRole("progressbar", { name: /^Progression du lot du/ })).toHaveAttribute("value", String((pass + 1) * 10));
   }
@@ -42,10 +43,10 @@ test("SAV-51 : qualifier un tutoriel incomplet depuis le lot sans publier ni act
   await filters.getByLabel("Statut", { exact: true }).selectOption("needs_completion");
   await filters.getByLabel("Source", { exact: true }).selectOption("onboarding");
   await filters.getByRole("button", { name: "Afficher les connaissances", exact: true }).click();
-  await expect(page).toHaveURL(/status=needs_completion/);
-  await expect(page).toHaveURL(/source=onboarding/);
+  await page.waitForURL(/status=needs_completion/);
+  await page.waitForURL(/source=onboarding/);
   await page.getByRole("navigation", { name: "Pagination des connaissances", exact: true }).getByRole("link", { name: "Page suivante →", exact: true }).click();
-  await expect(page).toHaveURL(/page=2/);
+  await page.waitForURL(/page=2/);
   await expect(page.locator(`article#${cardId}`).getByRole("heading", { name: title, exact: true })).toBeVisible();
 
   // Coverage links reach a candidate even when the current filter deliberately excludes it.
@@ -53,11 +54,11 @@ test("SAV-51 : qualifier un tutoriel incomplet depuis le lot sans publier ni act
   await filters.getByRole("button", { name: "Afficher les connaissances", exact: true }).click();
   await openDetails(page.getByText(/^Lots de conversion des tutoriels ·/));
   await page.getByRole("link", { name: "Voir la couverture et les sources du lot", exact: true }).click();
-  await expect(page).toHaveURL(/batch=[0-9a-f-]+/);
+  await page.waitForURL(/batch=[0-9a-f-]+/);
   const sourceRow = page.getByRole("table", { name: "Sources du lot et résultat de leur préparation" }).getByRole("row").filter({ has: page.getByRole("link", { name: title, exact: true }) });
   await sourceRow.getByRole("link", { name: "Ouvrir la connaissance", exact: true }).click();
-  await expect(page).toHaveURL(/candidate=[0-9a-f-]+#candidate-/);
-  await expect(page).toHaveURL(/status=approved/);
+  await page.waitForURL(/candidate=[0-9a-f-]+#candidate-/);
+  await page.waitForURL(/status=approved/);
   const card = page.locator(`article#${cardId}`);
   await expect(card.getByRole("heading", { name: title, exact: true })).toBeVisible();
   await expect(card.getByRole("region", { name: "Connaissance complète", exact: true })).toBeVisible();
@@ -65,7 +66,7 @@ test("SAV-51 : qualifier un tutoriel incomplet depuis le lot sans publier ni act
   const form = card.getByRole("form", { name: `Revoir ${title}`, exact: true });
   const approve = form.getByRole("button", { name: "Valider et préparer le brouillon SAV", exact: true });
   await expect(approve).toBeDisabled();
-  await form.getByRole("button", { name: "Vérifier la source et comparer", exact: true }).click();
+  await submitServerAction(page, form.getByRole("button", { name: "Vérifier la source et comparer", exact: true }));
   await expect(form.getByText(/Version du tutoriel source vérifiée/)).toBeVisible();
   await form.getByLabel("J’ai vérifié la source, la procédure complète et les sujets proches.", { exact: true }).check();
   await form.getByLabel("Preuves et précisions apportées", { exact: true }).fill("La procédure fictive a été relue pour cette recette isolée.");
@@ -81,14 +82,14 @@ test("SAV-51 : qualifier un tutoriel incomplet depuis le lot sans publier ni act
   await firstStep.getByLabel("Résultat observable", { exact: true }).fill("Le champ « Nom de l’espace » est visible.");
   await expect(form.getByLabel("J’ai vérifié la source, la procédure complète et les sujets proches.", { exact: true })).toHaveCount(0);
   await expect(approve).toBeDisabled();
-  await form.getByRole("button", { name: "Vérifier la source et comparer", exact: true }).click();
+  await submitServerAction(page, form.getByRole("button", { name: "Vérifier la source et comparer", exact: true }));
   await expect(form.getByText(/Version du tutoriel source vérifiée/)).toBeVisible();
   await form.getByLabel("J’ai vérifié la source, la procédure complète et les sujets proches.", { exact: true }).check();
   await form.getByLabel("J’ai vérifié et traité les informations manquantes indiquées.", { exact: true }).check();
   await expect(approve).toBeEnabled();
-  await approve.click();
-  await expect(page).toHaveURL(/result=draft_ready/);
-  await expect(page).toHaveURL(/candidate=[0-9a-f-]+/);
+  await submitServerAction(page, approve);
+  await page.waitForURL(/result=draft_ready/);
+  await page.waitForURL(/candidate=[0-9a-f-]+/);
   await expect(card.getByText("Validé", { exact: true })).toBeVisible();
   await expect(card.getByRole("heading", { name: title, exact: true })).toBeVisible();
   const reviewedKnowledge = card.getByRole("region", { name: "Connaissance complète", exact: true });
@@ -96,7 +97,7 @@ test("SAV-51 : qualifier un tutoriel incomplet depuis le lot sans publier ni act
   await expect(reviewedKnowledge.getByText("Ouvrir « Paramètres » en bas à gauche, puis « Général ».", { exact: true })).toBeVisible();
   await expect(reviewedKnowledge.getByText("Ouvrir la liste concernée et sélectionner l’élément exact à modifier.", { exact: true })).toHaveCount(0);
   await card.getByRole("link", { name: "Ouvrir la projection existante →", exact: true }).click();
-  await expect(page).toHaveURL(/\/studio\/contenus\/[0-9a-f-]+$/);
+  await page.waitForURL(/\/studio\/contenus\/[0-9a-f-]+$/);
   await expect(page.getByRole("textbox", { name: "Titre", exact: true })).toHaveValue(title);
   await expect(page.getByRole("textbox", { name: "Titre", exact: true })).toHaveAttribute("readonly", "");
   await expect(page.getByLabel("Agent concerné", { exact: true })).toBeDisabled();
@@ -130,8 +131,8 @@ test("SAV-51 : qualifier chaque section inconnue avant de préparer un brouillon
   await openDetails(page.getByText("Proposer une version de tutoriel au SAV", { exact: true }));
   await page.getByLabel("ID du contenu", { exact: true }).fill(sectionsItemId);
   await page.getByLabel("ID de la version source", { exact: true }).fill(sectionsVersionId);
-  await page.getByRole("button", { name: "Préparer un candidat", exact: true }).click();
-  await expect(page).toHaveURL(/result=candidate_ready/);
+  await submitServerAction(page, page.getByRole("button", { name: "Préparer un candidat", exact: true }));
+  await page.waitForURL(/result=candidate_ready/);
   const card = page.locator("article[id^='candidate-']").filter({ has: page.getByRole("heading", { name: sectionsTitle, exact: true }) });
   await expect(card.getByText("À compléter", { exact: true })).toBeVisible();
   await openDetails(card.getByText("Revoir, corriger ou écarter cette connaissance", { exact: true }));
@@ -158,7 +159,7 @@ test("SAV-51 : qualifier chaque section inconnue avant de préparer un brouillon
   await form.getByLabel("Preuves et précisions apportées", { exact: true }).fill("Sections fictives relues dans cette recette isolée ; chaque décision doit être motivée.");
   await form.getByLabel("Motif de la décision", { exact: true }).fill("Qualification des deux sections fictives de la source SAV-51.");
   await missingAcknowledgment.check();
-  await compare.click();
+  await submitServerAction(page, compare);
   await expect(form.getByText(/Version du tutoriel source vérifiée/)).toBeVisible();
   await comparisonAcknowledgment.check();
   await missingAcknowledgment.check();
@@ -168,7 +169,7 @@ test("SAV-51 : qualifier chaque section inconnue avant de préparer un brouillon
   await expect(comparisonAcknowledgment).toHaveCount(0);
   await expect(approve).toBeDisabled();
   await secondClassification.selectOption("not_applicable");
-  await compare.click();
+  await submitServerAction(page, compare);
   await expect(form.getByText(/Version du tutoriel source vérifiée/)).toBeVisible();
   await comparisonAcknowledgment.check();
   await missingAcknowledgment.check();
@@ -178,7 +179,7 @@ test("SAV-51 : qualifier chaque section inconnue avant de préparer un brouillon
   await form.getByLabel("Justification du classement 1", { exact: true }).fill("Le badge confirme le périmètre de démonstration et doit être contrôlé avant de modifier le nom.");
   await expect(comparisonAcknowledgment).toHaveCount(0);
   await expect(approve).toBeDisabled();
-  await compare.click();
+  await submitServerAction(page, compare);
   await expect(form.getByText(/Version du tutoriel source vérifiée/)).toBeVisible();
   await comparisonAcknowledgment.check();
   await missingAcknowledgment.check();
@@ -186,17 +187,17 @@ test("SAV-51 : qualifier chaque section inconnue avant de préparer un brouillon
   await form.getByLabel("Justification du classement 2", { exact: true }).fill("Cette note décrit uniquement la décoration de la fiche de recette ; elle ne guide aucune action du membre.");
   await expect(comparisonAcknowledgment).toHaveCount(0);
   await expect(approve).toBeDisabled();
-  await compare.click();
+  await submitServerAction(page, compare);
   await expect(form.getByText(/Version du tutoriel source vérifiée/)).toBeVisible();
   await comparisonAcknowledgment.check();
   await missingAcknowledgment.check();
   await expect(approve).toBeEnabled();
-  await approve.click();
-  await expect(page).toHaveURL(/result=draft_ready/);
+  await submitServerAction(page, approve);
+  await page.waitForURL(/result=draft_ready/);
   await expect(card.getByText("Validé", { exact: true })).toBeVisible();
   await openDetails(card.getByText("Lire la connaissance et ses limites", { exact: true }));
   await card.getByRole("link", { name: "Ouvrir la projection existante →", exact: true }).click();
-  await expect(page).toHaveURL(/\/studio\/contenus\/[0-9a-f-]+$/);
+  await page.waitForURL(/\/studio\/contenus\/[0-9a-f-]+$/);
   await expect(page.getByRole("textbox", { name: "Titre", exact: true })).toHaveValue(sectionsTitle);
   await expect(page.getByRole("textbox", { name: "Titre", exact: true })).toHaveAttribute("readonly", "");
   await expect(page.getByLabel("Agent concerné", { exact: true })).toBeDisabled();
