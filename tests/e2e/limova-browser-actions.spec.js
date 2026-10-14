@@ -185,7 +185,7 @@ for (const observe of [false, true]) test(`native ${observe ? 'analysis refuses'
   expect(errors).toEqual([]);
 });
 
-for (const change of ['detach', 'private', 'covered']) test(`native click stops its remaining events when pointerdown makes the target ${change}`, async ({ nativeChat }) => {
+for (const change of ['detach', 'private', 'covered', 'navigate']) test(`native click stops its remaining events when pointerdown makes the target ${change}`, async ({ nativeChat }) => {
   const { panel, app, calls, state } = nativeChat;
   state.reply = 'Action traitée.';
   await app.evaluate(change => {
@@ -198,6 +198,7 @@ for (const change of ['detach', 'private', 'covered']) test(`native click stops 
         replacement.onclick = () => window.clicks++;
         target.replaceWith(replacement);
       } else if (change === 'private') target.dataset.limovaPrivate = '';
+      else if (change === 'navigate') history.pushState({}, '', '/autre-contexte');
       else {
         const cover = document.createElement('div');
         cover.style.cssText = 'position:fixed;inset:0;z-index:100000;background:white';
@@ -270,6 +271,31 @@ test('native diagnostics report repeated rejected actions without replay or priv
   await expect(panel.locator('.message.user')).toHaveCount(0);
   await panel.locator('#diagnoseBtn').click();
   await expect(panel.locator('#diagnosticResult')).toHaveAttribute('data-status', 'healthy');
+  expect(legacy).toEqual([]);
+  expect(errors).toEqual([]);
+});
+
+
+test('native turn rejects a pre-navigation reference and continues only after reading the new SPA page', async ({ nativeChat }) => {
+  const { panel, app, calls, state, legacy, errors } = nativeChat;
+  state.reply = 'Action traitée.';
+  state.browserActions = [read,
+    async body => {
+      const elementId = reference(body, 'Continuer');
+      await app.evaluate(() => history.pushState({}, '', '/nouvelle-page?private_token=PRIVATE_ROUTE'));
+      return { operation: 'click', elementId };
+    },
+    read,
+    body => ({ operation: 'click', elementId: reference(body, 'Continuer') }),
+  ];
+  await send(panel, 'Continue le parcours');
+  const receipts = messageCalls(calls).slice(1).map(call => call.body.browserResult);
+  expect(receipts.map(receipt => receipt.status)).toEqual(['completed', 'rejected', 'completed', 'completed']);
+  expect(JSON.parse(receipts[2].observation).url).toBe(`${APP}/nouvelle-page`);
+  expect(receipts[2].contextVersion).toBeGreaterThan(receipts[1].contextVersion);
+  expect(await app.evaluate(() => window.clicks)).toBe(1);
+  expect(new Set(receipts.map(receipt => receipt.turnId)).size).toBe(1);
+  expect(JSON.stringify(messageCalls(calls))).not.toContain('PRIVATE_ROUTE');
   expect(legacy).toEqual([]);
   expect(errors).toEqual([]);
 });

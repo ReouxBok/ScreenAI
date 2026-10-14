@@ -1,27 +1,31 @@
 import { test, expect } from './fixtures.js';
+import { extensionEnvironment } from '../../scripts/extension-environments.mjs';
+
+const { appOrigin: APP, apiOrigin: API } = extensionEnvironment(process.env.LIMOVA_E2E_ENV ?? 'production');
 
 async function setup(context, extensionId) {
-  await context.route('https://api.new.limova.ai/**', route => route.abort());
-  await context.route('https://new.limova.ai/driver-fixture', route => route.fulfill({ contentType: 'text/html', body: `<!doctype html><html><body>
+  await context.route(`${API}/**`, route => route.abort());
+  await context.route(`${APP}/driver-fixture`, route => route.fulfill({ contentType: 'text/html', body: `<!doctype html><html><body>
     <h1>Account settings</h1><button id="original">Save</button><button id="decoy">Delete</button>
     <input id="name" aria-label="Name"><input type="password" value="SECRET_PASSWORD">
     <div data-private>PRIVATE_CONTENT</div><script>window.saved=0;window.deleted=0;
     original.onclick=()=>window.saved++;decoy.onclick=()=>window.deleted++;</script></body></html>` }));
   const site = await context.newPage();
-  await site.goto('https://new.limova.ai/driver-fixture');
+  await site.goto(`${APP}/driver-fixture`);
   const controller = await context.newPage();
   await controller.goto(`chrome-extension://${extensionId}/src/sidebar/sidebar.html`);
-  await controller.evaluate(async () => {
+  await controller.evaluate(async APP => {
+    window.APP = APP;
     const { browserDocumentCommand } = await import('../limova/browser-document.js');
-    const [tab] = await chrome.tabs.query({ url: 'https://new.limova.ai/driver-fixture' });
+    const [tab] = await chrome.tabs.query({ url: `${APP}/driver-fixture` });
     window.invokeDocument = async request => {
       const [result] = await chrome.scripting.executeScript({ target: { tabId: tab.id }, world: 'ISOLATED', func: browserDocumentCommand, args: [request] });
       return result.result;
     };
-    window.binding = (await invokeDocument({ operation: 'bind', origin: 'https://new.limova.ai', contextVersion: 1 })).binding;
+    window.binding = (await invokeDocument({ operation: 'bind', origin: APP, contextVersion: 1 })).binding;
     window.snapshot = await invokeDocument({ ...binding, operation: 'read_page', nextContextVersion: 2 });
     window.binding = snapshot.binding;
-  });
+  }, APP);
   return { site, controller };
 }
 
@@ -129,8 +133,8 @@ test('Chrome document binding refuses an action after page reload and allocates 
     await driverJournal.allocateVersion(scope);
     window.driver = createBrowserBinding({ scripting: chrome.scripting,
       allocateVersion: () => driverJournal.allocateVersion(scope) });
-    const [tab] = await chrome.tabs.query({ url: 'https://new.limova.ai/driver-fixture' });
-    window.driverPage = await driver.bind(tab.id, 'https://new.limova.ai');
+    const [tab] = await chrome.tabs.query({ url: `${APP}/driver-fixture` });
+    window.driverPage = await driver.bind(tab.id, APP);
     await driver.execute(driverPage, 'read_page', {});
     window.driverPage = await driver.inspect(tab.id);
   });
@@ -182,14 +186,14 @@ test('assembled driver reads and clicks the active page with real Chrome permiss
 
 test('navigates from the bound document and rejects stale navigation without leaving the page', async ({ context, extensionId }) => {
   const { site, controller } = await setup(context, extensionId);
-  await context.route('https://new.limova.ai/driver-destination', route => route.fulfill({ contentType: 'text/html', body: '<h1>Destination reached</h1>' }));
+  await context.route(`${APP}/driver-destination`, route => route.fulfill({ contentType: 'text/html', body: '<h1>Destination reached</h1>' }));
   const refused = await controller.evaluate(() => invokeDocument({ ...binding, contextVersion: 0,
-    operation: 'navigate', url: 'https://new.limova.ai/driver-destination', nextContextVersion: 3 }));
+    operation: 'navigate', url: `${APP}/driver-destination`, nextContextVersion: 3 }));
   expect(refused.status).toBe('rejected');
-  expect(site.url()).toBe('https://new.limova.ai/driver-fixture');
+  expect(site.url()).toBe(`${APP}/driver-fixture`);
   const [result] = await Promise.all([
-    controller.evaluate(() => invokeDocument({ ...binding, operation: 'navigate', url: 'https://new.limova.ai/driver-destination', nextContextVersion: 3 })),
-    site.waitForURL('https://new.limova.ai/driver-destination'),
+    controller.evaluate(() => invokeDocument({ ...binding, operation: 'navigate', url: `${APP}/driver-destination`, nextContextVersion: 3 })),
+    site.waitForURL(`${APP}/driver-destination`),
   ]);
   expect(result.status).toBe('completed');
   await expect(site.locator('h1')).toHaveText('Destination reached');
@@ -201,12 +205,12 @@ test('waits for a real in-progress Chrome navigation before returning the destin
   let markRequested;
   const requested = new Promise(resolve => { markRequested = resolve; });
   const response = new Promise(resolve => { release = resolve; });
-  await context.route('https://new.limova.ai/driver-slow', async route => {
+  await context.route(`${APP}/driver-slow`, async route => {
     markRequested();
     await response;
     await route.fulfill({ contentType: 'text/html', body: '<h1>Loaded</h1>' });
   });
-  const navigating = site.goto('https://new.limova.ai/driver-slow');
+  const navigating = site.goto(`${APP}/driver-slow`);
   await requested;
   await controller.evaluate(async () => {
     const { waitForBrowserReady } = await import('../limova/browser-ready.js');
@@ -220,7 +224,7 @@ test('waits for a real in-progress Chrome navigation before returning the destin
   await navigating;
   const result = await controller.evaluate(() => readyResult);
   expect(result.status).toBe('complete');
-  expect(result.url).toBe('https://new.limova.ai/driver-slow');
+  expect(result.url).toBe(`${APP}/driver-slow`);
 });
 
 test('native action pointer clears on scroll and does not block screenshot geometry', async ({ context, extensionId }) => {
@@ -234,4 +238,28 @@ test('native action pointer clears on scroll and does not block screenshot geome
   await site.evaluate(() => window.dispatchEvent(new Event('scroll')));
   await expect(site.locator('[data-limova-native-pointer]')).toHaveCount(0);
   expect(await site.evaluate(() => saved)).toBe(1);
+});
+
+for (const navigation of ['push', 'replace', 'hash']) test(`invalidates element references after ${navigation} navigation in the same document`, async ({ context, extensionId }) => {
+  const { site, controller } = await setup(context, extensionId);
+  await site.evaluate(navigation => {
+    if (navigation === 'hash') location.hash = 'PRIVATE_ROUTE';
+    else history[navigation === 'push' ? 'pushState' : 'replaceState']({}, '', '/driver-fixture?account=PRIVATE_ROUTE');
+  }, navigation);
+  const stale = await controller.evaluate(() => invokeDocument({ ...binding, operation: 'click', elementId: 1, nextContextVersion: 3 }));
+  expect(stale.status).toBe('rejected');
+  expect(await site.evaluate(() => saved)).toBe(0);
+  const result = await controller.evaluate(async () => {
+    const rebound = await invokeDocument({ operation: 'bind', origin: APP, contextVersion: 4 });
+    const oldReference = await invokeDocument({ ...rebound.binding, operation: 'click', elementId: 1, nextContextVersion: 5 });
+    const fresh = await invokeDocument({ ...rebound.binding, operation: 'read_page', nextContextVersion: 6 });
+    const click = await invokeDocument({ ...fresh.binding, operation: 'click', elementId: 1, nextContextVersion: 7 });
+    return { rebound, oldReference, fresh, click };
+  });
+  expect(result.oldReference.status).toBe('rejected');
+  expect(result.fresh.status).toBe('completed');
+  expect(result.click.status).toBe('completed');
+  expect(result.rebound.binding.contextVersion).toBe(4);
+  expect(await site.evaluate(() => saved)).toBe(1);
+  expect(JSON.stringify(result)).not.toContain('PRIVATE_ROUTE');
 });

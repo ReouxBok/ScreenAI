@@ -130,3 +130,11 @@ Les tests Chromium vérifient persistance, absence de double comptage, exclusion
 La capture utilise le vrai `captureVisibleTab`, le vrai masquage et l’upload multipart via la passerelle first-party et son cookie partitionné. Le test ouvre l’action de l’extension dans Chromium isolé pour accorder activeTab, sans remplacer les API Chrome. Les pixels du fichier effectivement reçu par le serveur sont contrôlés : zone publique bleue préservée ; mot de passe, textarea et région privée grisées. Un seul upload temporaire, dans le workspace attendu, puis son fileId dans le reçu du même tour. Aucun base64 ni contenu privé dans les messages. Le surlignage réel cible uniquement le champ ; aucune bulle de capture ou overlay de capture résiduel.
 
 Le choix de capturer est désormais une commande du Deep Agent, pas un envoi JPEG systématique à Gemini. Cette différence de contrat est intentionnelle. La décision du modèle, le stockage distant et la lecture de l’image par un vrai provider ne sont pas qualifiés par cette fixture. Il reste 9 scénarios legacy à migrer.
+
+## Invalidation après navigation SPA
+
+Un changement d’URL dans le même document pouvait conserver une référence d’élément et autoriser un clic issu de l’ancienne page. Trois régressions ont été reproduites avant correction : pushState, replaceState et fragment. Le registre privé garde maintenant l’URL complète uniquement en mémoire locale ; une différence invalide les commandes précédentes. Le rebinding impose une version supérieure et efface les références : il faut relire la page avant d’utiliser ses contrôles. L’URL privée n’est pas ajoutée au protocole ni aux observations.
+
+Les tests vérifient aussi une navigation déclenchée pendant pointerdown (aucun click final) et un tour complet : ancienne commande refusée, nouvelle page relue, nouvelle commande exécutée une seule fois dans le même tour, sans query sensible transmise. Les 9 scénarios legacy restent : cette correction ne remplace pas le parcours d’analyse automatique après navigation/modal. Elle ne prétend pas détecter tous les changements sémantiques d’un SPA à URL identique.
+
+Les fixtures `browser-document` sélectionnent désormais les origines de l’environnement : leur première invocation avec le paquet staging échouait sur les URL production non autorisées. Les permissions des paquets restent inchangées.

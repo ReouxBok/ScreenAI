@@ -86,7 +86,7 @@ export const test = base.extend({
           }
           if (body.browserContext && actionIndex < state.browserActions.length) {
             const step = state.browserActions[actionIndex++];
-            const input = typeof step === 'function' ? step(body) : step;
+            const input = typeof step === 'function' ? await step(body) : step;
             response.end(frame('custom', { type: 'extension.action_requested', protocolVersion: 1, turnId,
               actionId: `${turnId}:action-${actionIndex}`, toolCallId: `tool-${actionIndex}`, target: body.browserContext, input,
               expiresAt: new Date(Date.now() + 60000).toISOString() }) + frame('custom', { type: 'extension.turn_state', turnId, state: 'waiting' })); return;

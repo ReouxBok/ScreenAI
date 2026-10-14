@@ -2,6 +2,7 @@ export function browserDocumentCommand(request) {
   const key = '__limovaDeepAgentDocumentV1';
   if (!globalThis[key]) {
     let version;
+    let boundUrl;
     const documentId = crypto.randomUUID();
     let elements = new Map();
     let captureRevision = 0;
@@ -106,13 +107,17 @@ export function browserDocumentCommand(request) {
     const dispatch = input => {
       if (input?.origin !== location.origin || location.protocol !== 'https:') return rejected('Origin changed');
       if (input.operation === 'bind') {
-        if (version === undefined) {
-          if (!Number.isSafeInteger(input.contextVersion) || input.contextVersion < 0) return rejected('Invalid context version');
+        if (version === undefined || boundUrl !== location.href) {
+          if (!Number.isSafeInteger(input.contextVersion) || input.contextVersion < 0
+            || (version !== undefined && input.contextVersion <= version)) return rejected('Invalid context version');
           version = input.contextVersion;
+          boundUrl = location.href;
+          elements = new Map();
+          clearPointer();
         }
         return { status: 'completed', binding: binding() };
       }
-      if (version === undefined || input.documentId !== documentId || input.contextVersion !== version) return rejected('Document changed');
+      if (version === undefined || boundUrl !== location.href || input.documentId !== documentId || input.contextVersion !== version) return rejected('Document changed');
       if (input.operation === 'inspect') return { status: 'completed', binding: binding() };
       if (input.operation === 'screenshot_geometry') {
         try { return { status: 'completed', geometry: screenshotGeometry(), binding: binding() }; }
@@ -157,7 +162,7 @@ export function browserDocumentCommand(request) {
       if (!['click', 'type_text', 'highlight'].includes(input.operation)) return rejected('Unsupported document operation');
       const reference = elements.get(input.elementId);
       const element = reference?.element;
-      const targetAvailable = () => element instanceof HTMLElement && visible(element) && !sensitive(element)
+      const targetAvailable = () => boundUrl === location.href && element instanceof HTMLElement && visible(element) && !sensitive(element)
         && !element.closest(privateSelector) && reference.fingerprint === fingerprint(element)
         && !element.matches(':disabled,[aria-disabled="true"],[readonly]');
       if (!targetAvailable()) return rejected('Target unavailable');
