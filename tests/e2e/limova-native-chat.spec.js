@@ -176,3 +176,41 @@ test('native plan follows backend statuses and survives reload without exposing 
   expect(legacy).toEqual([]);
   expect(errors).toEqual([]);
 });
+
+for (const failure of [null, 'session', 'flag']) test(`native diagnostic download preserves privacy after ${failure ?? 'healthy chat'}`, async ({ nativeChat }) => {
+  const { panel, state, calls, legacy, errors, context } = nativeChat;
+  const privateQuestion = 'PRIVATE_SUPPORT_QUESTION_DO_NOT_EXPORT';
+  const privateAnswer = 'PRIVATE_SUPPORT_ANSWER_DO_NOT_EXPORT';
+  state.reply = privateAnswer;
+  await panel.locator('#userInput').fill(privateQuestion);
+  await panel.locator('#sendBtn').click();
+  await expect(panel.locator('.message.assistant .message-content')).toHaveText(privateAnswer);
+  await expect(panel.locator('#sendBtn')).toBeEnabled();
+  const before = calls.length;
+  const pagesBefore = context.pages().length;
+  if (failure === 'session') state.authenticated = false;
+  if (failure === 'flag') state.enabled = false;
+  const downloadPromise = panel.waitForEvent('download');
+  await panel.locator('#downloadLogsBtn').click();
+  const download = await downloadPromise;
+  expect(download.suggestedFilename()).toMatch(/^limova-ai-logs-\d{4}-\d{2}-\d{2}\.txt$/);
+  const stream = await download.createReadStream();
+  let logs = '';
+  for await (const chunk of stream) logs += chunk.toString();
+  expect(logs).toContain('Limova AI - Paquet de diagnostic sécurisé');
+  expect(logs).toMatch(/Incident: \S+/);
+  expect(logs).toContain('DIAGNOSTIC_COMPLETED');
+  const code = failure === 'session' ? 'DIAGNOSTIC_LIMOVA_LOGIN_REQUIRED'
+    : failure === 'flag' ? 'DIAGNOSTIC_LIMOVA_WORKSPACE_DISABLED' : 'DIAGNOSTIC_LIMOVA_CONVERSATION_OK';
+  expect(logs).toContain(code);
+  await expect(panel.locator('#diagnosticResult')).toHaveAttribute('data-status', failure ? 'degraded' : 'healthy');
+  if (!failure) expect(logs).toContain('DIAGNOSTIC_DEEP_AGENT_NOT_EXECUTED');
+  for (const secret of [privateQuestion, privateAnswer, 'NEVER_TRANSMIT_THIS_SECRET', 'PRIVATE_FIELD_VALUE',
+    'native_chat=authenticated', 'private_token', 'must-not-leak', CONVERSATION, WORKSPACE]) expect(logs).not.toContain(secret);
+  const probes = calls.slice(before);
+  expect(probes.filter(call => call.method !== 'GET').map(({ path, method }) => ({ path, method })))
+    .toEqual(failure === 'session' ? [{ path: '/auth/refresh-token', method: 'POST' }] : []);
+  expect(context.pages()).toHaveLength(pagesBefore);
+  expect(legacy).toEqual([]);
+  expect(errors).toEqual([]);
+});

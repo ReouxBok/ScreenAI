@@ -90,3 +90,11 @@ Le panneau projette les tâches structurées `write_todos` des checkpoints racin
 Aucun moteur de progression ni achèvement automatique n’est ajouté : une tâche reste en cours si le backend la conserve ainsi, même après la fin du flux. Le plan est celui du tour Deep Agent, pas une preuve d’achèvement du parcours métier d’onboarding. Les mises à jour arrivent avec les checkpoints `values`, pas avec les fragments JSON incomplets des appels d’outil.
 
 Les tests unitaires couvrent les mises à jour, l’ancrage, le retrait, les messages masqués et la pagination. Chromium couvre l’affichage, la restauration après reload, le tour suivant sans nouveau plan et l’injection HTML rendue comme texte. L’API reste simulée. Le scénario legacy combiné onboarding/langue/logs reste à transférer intégralement ; aucun des 16 scénarios restants n’est retiré dans cette couche.
+
+## Téléchargement du diagnostic natif
+
+Le téléchargement réel du fichier TXT est vérifié après un échange Deep Agent, avec une connexion valide, une session expirée et un flag désactivé. Le paquet conserve l’incident et les codes des contrôles Limova, mais exclut les messages, les valeurs de formulaire, le cookie et les UUID de conversation/workspace utilisés dans le scénario. Il reste téléchargeable quand la connexion est dégradée.
+
+Le diagnostic ne crée ni conversation ni tour IA et n’ouvre aucun onglet. Une session expirée déclenche la tentative normale `POST /auth/refresh-token` ; les autres sondes sont des GET. L’absence de POST absolue serait une assertion incorrecte du contrat d’authentification. Le test confirme l’absence d’appels legacy et ne qualifie pas une rotation réelle de refresh token.
+
+Cette couche est limitée aux tests et à la documentation : le téléchargement existant appelle déjà le diagnostic natif. Le scénario legacy combiné reste présent tant que ses exigences d’accompagnement ne sont pas entièrement transférées.
