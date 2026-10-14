@@ -188,3 +188,11 @@ Le parcours `playback-interruption` de `limova-native-voice-panel.spec.js` obser
 L’arrêt ferme les deux contextes audio et cesse l’envoi PCM. Après rechargement du panneau, les messages canoniques sont relus via l’API de la conversation, sans nouveau tour POST ni nouvelle session vocale. La fixture API conserve ces messages en mémoire : ce n’est pas une preuve de persistance NestJS/PostgreSQL ni une écoute sur haut-parleur physique.
 
 Le scénario vocal legacy complet reste présent : la recette intégrée vocale de capture/scroll/saisie/navigation et les anciennes relances/suggestions nécessitent encore une correspondance explicite. Cette couche n’en retire aucune exigence par assimilation avec le seul test audio.
+
+## Voix, navigateur et navigation complète
+
+La recette `limova-voice-browser-workflow.spec.js` ajoute dix résultats dans une seule session : lecture, capture, scroll, lecture, saisie, lecture, clic invalide refusé, lecture, clic de navigation, lecture de destination. Les pixels publics sont conservés tandis que mot de passe/textarea sont masqués dans l’image effectivement transférée ; les observations ne contiennent pas les valeurs des champs. Les actions ne passent pas par un POST de chat parallèle.
+
+Cette recette a révélé une coupure du socket au neuvième outil quand la page pilotée hébergeait aussi la passerelle vocale. La connexion navigateur utilise maintenant un onglet app inactif dédié et libéré à l’arrêt, avec protection des onglets repris par l’utilisateur. Voir `deep-agent-live-transport.md`. Le faux serveur choisit les actions et conserve l’historique ; ni intelligence modèle ni stockage distant ne sont revendiqués.
+
+Les trois scénarios legacy restent à ce stade : la correspondance finale de la recherche de connaissances, des relances et des suggestions vocales doit encore être explicitée, ainsi que les deux autres parcours restants. Aucun scénario n’est supprimé par cette correction.
