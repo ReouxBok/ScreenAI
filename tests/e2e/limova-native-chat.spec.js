@@ -96,3 +96,23 @@ test('downloads the selected conversation as CSV through the first-party app bri
   ]);
   expect(legacy).toEqual([]);
 });
+
+for (const enabled of [true, false]) test(`native diagnostics report flag ${enabled} without contacting the proxy or starting an AI turn`, async ({ nativeChat }) => {
+  const { panel, calls, state, legacy, context } = nativeChat;
+  const pagesBefore = context.pages().length;
+  state.enabled = enabled;
+  await panel.locator('#diagnoseBtn').click();
+  await expect(panel.locator('#diagnosticResult')).toHaveAttribute('data-status', enabled ? 'healthy' : 'degraded');
+  expect(context.pages()).toHaveLength(pagesBefore);
+  if (enabled) await expect(panel.locator('#diagnosticText')).toContainText('Aucun test IA lancé');
+  else await expect(panel.locator('#diagnosticText')).toContainText('désactivée');
+  expect(calls.every(call => call.method === 'GET')).toBe(true);
+  expect(calls.filter(call => call.path === '/agent/by-slug/charly')).toHaveLength(enabled ? 1 : 0);
+  expect(legacy).toEqual([]);
+  const result = await panel.evaluate(() => chrome.runtime.sendMessage({ type: 'RUN_DIAGNOSTICS', client: {} }));
+  expect(result.checks.some(check => check.name === 'proxy')).toBe(false);
+  expect(result.checks.some(check => check.code === 'DIAGNOSTIC_DEEP_AGENT_NOT_EXECUTED')).toBe(enabled);
+  expect(JSON.stringify(result)).not.toContain('native_chat=authenticated');
+  expect(JSON.stringify(result)).not.toContain('private_token');
+  expect(JSON.stringify(result)).not.toContain('PRIVATE_FIELD_VALUE');
+});

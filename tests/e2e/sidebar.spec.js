@@ -95,23 +95,6 @@ test.describe('Sidebar UI', () => {
     await page.close();
   });
 
-  test('runs an inline degraded diagnostic without opening a popup', async ({ context, extensionId }) => {
-    await context.route('https://limova-proxy-479c7fb78ccf.herokuapp.com/healthz', route => route.fulfill({
-      status: 503,
-      contentType: 'application/json',
-      body: JSON.stringify({ status: 'unavailable' })
-    }));
-    const page = await context.newPage();
-    await page.goto(`chrome-extension://${extensionId}/src/sidebar/sidebar.html`);
-    const pageCountBeforeDiagnostic = context.pages().length;
-    await page.locator('#diagnoseBtn').click();
-
-    await expect(page.locator('#diagnosticResult')).toBeVisible();
-    await expect(page.locator('#diagnosticResult')).toHaveAttribute('data-status', 'degraded');
-    await expect(page.locator('#diagnosticText')).toContainText(/problème|problem|problema/i);
-    expect(context.pages()).toHaveLength(pageCountBeforeDiagnostic);
-    await page.close();
-  });
 
   for (const action of [
     { name: 'message', prepare: async page => page.locator('#userInput').fill('Bonjour Charly'), target: '#sendBtn' },
