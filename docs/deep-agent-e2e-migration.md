@@ -1,5 +1,7 @@
 # Migration de la recette E2E vers Deep Agent
 
+**État courant : 5 scénarios legacy restent dans `feature-flows.spec.js`.** Les sections suivantes retracent les couches de migration ; leurs anciens décomptes décrivent ces étapes, pas le total actuel. La suite globale et la qualification distante restent ouvertes.
+
 ## Audit du 14 octobre 2026
 
 `npx playwright test --max-failures=8` a terminé avec 42 réussites, 8 échecs et 64 tests non exécutés. L’arrêt à huit échecs sert à borner le diagnostic ; la commande complète et ses seuils CI ne sont pas modifiés. La suite globale n’est pas déclarée verte.
@@ -45,7 +47,7 @@ Le scénario legacy de guidage reste présent : son exigence de capture automati
 
 ## Entraînement et transcription native
 
-`limova-training-transcription.spec.js` utilise maintenant le panneau réel pour ouvrir l’entraînement, entrer le code Studio, démarrer, activer le microphone puis finaliser. Le flux PCM, la passerelle first-party, Socket.IO et le worker sont réels ; le serveur Limova/Studio est contrôlé et la sélection d’écran/l’upload vidéo sont simulés. Cette recette ne qualifie donc pas une vidéo réellement stockée.
+`limova-training-transcription.spec.js` utilise maintenant le panneau réel pour ouvrir l’entraînement, entrer le code Studio, démarrer, activer le microphone puis finaliser. Le flux PCM, la passerelle first-party, Socket.IO et le worker sont réels ; le serveur Limova/Studio est contrôlé et la sélection d’écran est remplacée par un canvas ; le recorder et le SDK Blob embarqués sont réels, avec réponses HTTP de stockage simulées. Cette recette ne qualifie donc pas une vidéo réellement stockée.
 
 Le test vérifie qu’une seule note finale est enregistrée, sans chat, requête POST de conversation ni clic, y compris si le canal de transcription émet une commande étrangère. Il conserve la vérification de l’arrêt du PCM après retrait du consentement et ajoute la finalisation Studio via le bouton. Il remplace le scénario legacy de microphone passif.
 
@@ -155,4 +157,12 @@ Ce repère reste local au panneau ouvert et ne remplace aucune vérification d�
 
 `limova-training-transcription.spec.js` couvre désormais deux fenêtres OAuth successives (pause de 800 ms entre sélecteur et consentement), puis deux fenêtres qui se chevauchent. Les vraies fenêtres Chromium sont classées par le worker : une seule ouverture/fermeture Studio, `popupCount: 2`, aucun avertissement d’onglet, aucune lecture du contenu externe ni arrêt anticipé du recorder. Les notes PCM natives demeurent enregistrées, puis la démonstration est finalisée une fois. Le scénario legacy limité aux fenêtres Gmail successives est remplacé ; 6 scénarios legacy restent.
 
-Les pages OAuth et services Studio/API/provider sont des fixtures ; aucun compte Google n’est connecté. Le recorder de cette recette reste simulé : la qualification MediaRecorder/SDK Blob est séparée dans `training-real-media.spec.js`. Le parcours complet de contrôles/modales/navigation/vidéo conserve son scénario legacy jusqu’à couverture intégrale. Le paquet staging ne dispose pas des permissions Studio production et conserve l’exclusion explicite de cette recette.
+Les pages OAuth et services Studio/API/provider sont des fixtures ; aucun compte Google n’est connecté. La recette utilise désormais le vrai recorder et le SDK Blob, avec écran canvas et microphone Chromium de test. Le scénario legacy complet de contrôles/modales/navigation/vidéo est remplacé par cette chaîne ; `training-real-media.spec.js` conserve la vérification ciblée de reprise. Le paquet staging ne dispose pas des permissions Studio production et conserve l’exclusion explicite de cette recette.
+
+## Démonstration Studio complète dans le panneau natif
+
+La même session combine champ « Instructions », clic sur un cercle SVG appartenant au bouton HubSpot, résumé réseau après clic, modale, fenêtres OAuth successives ou simultanées et navigation réelle vers le profil. Les notes vocales natives et les événements rejoignent le transport Studio ; les valeurs tapées, mots de passe et marqueurs OAuth n’apparaissent pas dans les événements. Cela ne constitue pas un masquage des pixels vidéo : l’écran de cette fixture est un canvas.
+
+La finalisation utilise MediaRecorder et le SDK Blob empaquetés. Les octets envoyés sont décodables en WebM 320 × 180, les pistes audio/vidéo sont arrêtées, et le chemin ainsi que la confirmation sont liés à la session de démonstration. La confirmation précède `/complete`. Une réponse 503 dans le parcours successif affiche le bouton de reprise : avant le second clic, aucune complétion Studio ; après, confirmation identique, un seul transfert/finalisation Blob et une seule complétion Studio.
+
+Les deux parcours réussissent avec serveur et stockage simulés. La sélection OS, le microphone physique, un compte OAuth réel et la persistance Studio/Blob distante restent à qualifier. Le raccordement initial Studio utilise son token dans le corps de `/connect` ; les autres POST utilisent le Bearer correspondant. Aucun changement produit requis pour cette couche.

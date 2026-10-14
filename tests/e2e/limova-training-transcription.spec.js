@@ -25,21 +25,30 @@ for (const popupMode of ['sequential', 'overlapping']) test(`training preserves 
   const key = path.join(directory, 'key.pem'), cert = path.join(directory, 'cert.pem');
   execFileSync('openssl', ['req', '-x509', '-newkey', 'rsa:2048', '-nodes', '-keyout', key,
     '-out', cert, '-days', '1', '-subj', '/CN=limova-live-test'], { stdio: 'ignore' });
-  const notes = [], studioCalls = [];
+  const notes = [], studioCalls = [], blobCalls = [], videoParts = [];
+  let videoPath;
+  let confirmationAttempts = 0;
   const training = { id: '88888888-8888-4888-8888-888888888888', title: 'Démonstration', agentKey: 'charly', startPath: '/' };
   const seen = { starts: 0, connected: 0, stopped: 0, disconnected: 0, pcm: null, cancelled: null, browserBinding: null, browserResult: null, results: [], action: null, httpChecks: [], cookie: false, origin: null };
   const server = createServer({ key: await readFile(key), cert: await readFile(cert) }, (request, response) => {
     if (request.headers.host === 'studio.limova.ai') {
       let body = ''; request.on('data', chunk => { body += chunk; });
       request.on('end', () => {
-        response.writeHead(200, { 'content-type': 'application/json', 'access-control-allow-origin': '*', 'access-control-allow-headers': 'authorization,content-type' });
-        studioCalls.push({ path: request.url, method: request.method });
+        const failedConfirmation = request.url.endsWith('/recording-confirm') && request.method === 'POST'
+          && ++confirmationAttempts === 1 && popupMode === 'sequential';
+        response.writeHead(failedConfirmation ? 503 : 200, { 'content-type': 'application/json', 'access-control-allow-origin': '*', 'access-control-allow-headers': 'authorization,content-type' });
+        studioCalls.push({ path: request.url, method: request.method, body: body ? JSON.parse(body) : undefined, authorized: request.headers.authorization === 'Bearer local-training-fixture-token-no-secret' });
+        if (request.url.endsWith('/recording-token') && request.method === 'POST') {
+          const upload = JSON.parse(body);
+          videoPath = upload.pathname;
+          response.end(JSON.stringify({ clientToken: 'vercel_blob_client_fixture_localtoken' })); return;
+        }
         if (request.url.endsWith('/events') && request.method === 'POST') notes.push(JSON.parse(body));
         response.end(JSON.stringify(request.url.endsWith('/connect') ? training : { ok: true }));
       }); return;
     }
     if (request.headers.host === new URL(APP).host) {
-      response.writeHead(200, { 'content-type': 'text/html' }); response.end('<title>Live fixture</title><main>Browser knowledge fixture<button id="action">Connecter HubSpot</button><textarea aria-label="Brief">PRIVATE_FIELD_VALUE</textarea><input type="password" value="NEVER_TRANSMIT_THIS_SECRET"></main><script>window.clicks=0;document.getElementById("action").onclick=()=>window.clicks++;</script>'); return;
+      response.writeHead(200, { 'content-type': 'text/html; charset=utf-8' }); response.end('<title>Live fixture</title><main>Browser knowledge fixture<button id="action">Connecter HubSpot<svg width="20" height="20"><circle cx="10" cy="10" r="8"></circle></svg></button><a id="safeNavigation" href="/profile">Ouvrir mon profil</a><textarea aria-label="Instructions">PRIVATE_FIELD_VALUE</textarea><input type="password" value="NEVER_TRANSMIT_THIS_SECRET"></main><script>window.clicks=0;document.getElementById("action").onclick=()=>window.clicks++;</script>'); return;
     }
     const headers = { 'access-control-allow-origin': APP, 'access-control-allow-credentials': 'true',
       'access-control-allow-headers': 'x-workspace-id,content-type', 'access-control-allow-methods': 'GET,POST,OPTIONS', 'content-type': 'application/json' };
@@ -114,16 +123,32 @@ for (const popupMode of ['sequential', 'overlapping']) test(`training preserves 
     await extensionPage.locator('#menuBtn').click();
     await extensionPage.locator('#trainingBtn').click();
     await extensionPage.locator('#trainingToken').fill('local-training-fixture-token-no-secret');
-    // Desktop selection and video upload are a separate OS/media boundary.
-    // Keep the real panel/worker, Studio event transport and native PCM path.
+    await context.route('https://vercel.com/api/blob/**', async route => {
+      const request = route.request();
+      const headers = { 'access-control-allow-origin': '*', 'access-control-allow-headers': '*', 'content-type': 'application/json' };
+      if (request.method() === 'OPTIONS') return route.fulfill({ status: 204, headers });
+      const action = request.headers()['x-mpu-action'];
+      blobCalls.push(action);
+      expect(new URL(request.url()).searchParams.get('pathname')).toBe(videoPath);
+      expect(request.headers().authorization).toBe('Bearer vercel_blob_client_fixture_localtoken');
+      if (action === 'create') return route.fulfill({ headers, body: JSON.stringify({ key: videoPath, uploadId: 'training-upload' }) });
+      if (action === 'upload') {
+        videoParts.push(request.postDataBuffer());
+        return route.fulfill({ headers, body: JSON.stringify({ etag: 'training-part' }) });
+      }
+      expect(action).toBe('complete');
+      expect(request.postDataJSON()).toEqual([{ partNumber: 1, etag: 'training-part' }]);
+      return route.fulfill({ headers, body: JSON.stringify({ pathname: videoPath, url: `https://fixture.private.blob.vercel-storage.com/${videoPath}`, contentType: 'video/webm' }) });
+    });
+    // Substitute only OS display selection. Use the packaged recorder and Blob SDK.
     await extensionPage.evaluate(() => {
-      window.recordingCalls = [];
-      window.LimovaTrainingScreenRecorder = class {
-        async start() { window.recordingCalls.push('start'); }
-        async beginProgressiveUpload() { window.recordingCalls.push('begin'); }
-        async stopAndUpload({ onProgress }) { window.recordingCalls.push('upload'); onProgress?.({ percentage: 100 }); }
-        abort() { window.recordingCalls.push('abort'); }
-      };
+      const canvas = document.createElement('canvas'); canvas.width = 320; canvas.height = 180;
+      const drawing = canvas.getContext('2d'); let frame = 0;
+      window.paintTraining = setInterval(() => {
+        drawing.fillStyle = frame++ % 2 ? '#117744' : '#335588'; drawing.fillRect(0, 0, 320, 180);
+      }, 50);
+      window.trainingVideoStream = canvas.captureStream(12);
+      navigator.mediaDevices.getDisplayMedia = async () => window.trainingVideoStream;
     });
     await extensionPage.locator('#trainingStart').click();
     await expect(extensionPage.locator('#trainingFeedback')).toContainText('mode passif');
@@ -149,6 +174,21 @@ for (const popupMode of ['sequential', 'overlapping']) test(`training preserves 
     expect(seen.httpChecks.filter(call => call.method === 'POST')).toEqual([]);
     await expect(extensionPage.locator('.message.user, .message.assistant')).toHaveCount(0);
     expect(JSON.stringify(notes)).not.toMatch(/PRIVATE_FIELD_VALUE|NEVER_TRANSMIT_THIS_SECRET/);
+    await app.locator('textarea').fill('TRAINING_PRIVATE_TYPED_VALUE');
+    await app.locator('textarea').blur();
+    await app.locator('#action circle').click();
+    await app.evaluate(() => fetch('/api/integrations/connect', { method: 'POST' }));
+    await app.evaluate(() => {
+      const modal = document.createElement('div'); modal.setAttribute('role', 'dialog');
+      modal.innerHTML = '<h2>Connecter HubSpot</h2><button>Continuer</button>';
+      document.body.append(modal);
+    });
+    await expect.poll(() => JSON.stringify(notes)).toContain('Popup Limova · Connecter HubSpot');
+    await expect.poll(() => notes.some(note => note.label === 'Résultat après clic · Connecter HubSpot'
+      && note.payload?.networkSummary?.includes('POST /api/integrations/connect status:200'))).toBe(true);
+    expect(notes).toContainEqual(expect.objectContaining({ kind: 'click', label: 'Connecter HubSpot',
+      payload: expect.objectContaining({ controlName: 'Connecter HubSpot', controlType: 'bouton', tag: 'button',
+        clickedTag: 'circle', elementId: 'action', zone: 'main', occurrence: 1, gestureId: expect.stringMatching(/^[-a-z0-9]+$/i) }) }));
     await context.route('https://accounts.google.com/**', route => route.fulfill({
       contentType: 'text/html', body: '<title>OAuth fixture</title><input type="password" value="OAUTH_PRIVATE_PASSWORD"><p>OAUTH_PRIVATE_CONTENT</p>',
     }));
@@ -188,10 +228,50 @@ for (const popupMode of ['sequential', 'overlapping']) test(`training preserves 
       payload: { phase: 'closed', popupCount: 2 },
     });
     expect(JSON.stringify(notes)).not.toMatch(/OAUTH_PRIVATE|PRIVATE_FIELD_VALUE|NEVER_TRANSMIT_THIS_SECRET/);
-    expect(await extensionPage.evaluate(() => window.recordingCalls)).toEqual(['start', 'begin']);
+    expect(await extensionPage.evaluate(() => window.trainingVideoStream.getTracks().every(track => track.readyState === 'live'))).toBe(true);
+    await app.locator('#safeNavigation').click();
+    await expect.poll(() => JSON.stringify(notes)).toContain('Ouvrir mon profil');
     await extensionPage.locator('#trainingStop').click();
+    if (popupMode === 'sequential') {
+      await expect(extensionPage.locator('#trainingStop')).toHaveText('Réessayer l’envoi de la vidéo');
+      await expect(extensionPage.locator('#trainingStop')).toBeEnabled();
+      expect(studioCalls.filter(call => call.path.endsWith('/complete') && call.method === 'POST')).toHaveLength(0);
+      expect(blobCalls).toEqual(['create', 'upload', 'complete']);
+      await extensionPage.locator('#trainingStop').click();
+    }
     await expect(extensionPage.locator('#trainingFeedback')).toContainText('Démonstration et vidéo enregistrées');
-    expect(await extensionPage.evaluate(() => window.recordingCalls)).toEqual(['start', 'begin', 'upload']);
+    expect(blobCalls).toEqual(['create', 'upload', 'complete']);
+    expect(videoParts).toHaveLength(1);
+    expect([...videoParts[0].subarray(0, 4)]).toEqual([0x1a, 0x45, 0xdf, 0xa3]);
+    const confirmation = studioCalls.filter(call => call.path.endsWith('/recording-confirm') && call.method === 'POST');
+    expect(confirmation).toHaveLength(popupMode === 'sequential' ? 2 : 1);
+    if (popupMode === 'sequential') expect(confirmation[0].body).toEqual(confirmation[1].body);
+    expect(confirmation[0].body).toMatchObject({ sessionId: training.id, pathname: videoPath });
+    expect(confirmation[0].body.durationMs).toBeGreaterThan(1000);
+    expect(videoPath).toMatch(new RegExp(`^training-recordings/${training.id}/`));
+    expect(studioCalls.findIndex(call => call.path.endsWith('/recording-confirm') && call.method === 'POST'))
+      .toBeLessThan(studioCalls.findIndex(call => call.path.endsWith('/complete') && call.method === 'POST'));
+    expect(await extensionPage.evaluate(() => {
+      clearInterval(window.paintTraining);
+      return window.trainingVideoStream.getTracks().map(track => ({ kind: track.kind, state: track.readyState }));
+    })).toEqual(expect.arrayContaining([{ kind: 'video', state: 'ended' }, { kind: 'audio', state: 'ended' }]));
+    const dimensions = await extensionPage.evaluate(async encoded => {
+      const bytes = Uint8Array.from(atob(encoded), character => character.charCodeAt(0));
+      const url = URL.createObjectURL(new Blob([bytes], { type: 'video/webm' }));
+      try {
+        const video = document.createElement('video'); video.muted = true;
+        const loaded = new Promise((resolve, reject) => { video.onloadeddata = resolve; video.onerror = reject; });
+        video.src = url; await loaded;
+        return [video.videoWidth, video.videoHeight];
+      } finally { URL.revokeObjectURL(url); }
+    }, videoParts[0].toString('base64'));
+    expect(dimensions).toEqual([320, 180]);
+    expect(JSON.stringify(notes)).not.toMatch(/OAUTH_PRIVATE|TRAINING_PRIVATE_TYPED_VALUE|PRIVATE_FIELD_VALUE|NEVER_TRANSMIT_THIS_SECRET/);
+    expect(notes.filter(note => note.kind === 'voice_note').map(note => note.label)).toEqual(['Je sélectionne le compte HubSpot.']);
+    expect(JSON.stringify(notes)).toContain('Instructions');
+    expect(studioCalls.find(call => call.path.endsWith('/connect') && call.method === 'POST')?.body)
+      .toEqual({ token: 'local-training-fixture-token-no-secret' });
+    expect(studioCalls.filter(call => call.method === 'POST' && !call.path.endsWith('/connect')).every(call => call.authorized)).toBe(true);
     expect(studioCalls.filter(call => call.path.endsWith('/complete') && call.method === 'POST')).toHaveLength(1);
     expect(seen.connected).toBe(1); expect(legacyRequests).toEqual([]); expect(errors).toEqual([]);
   } finally {
