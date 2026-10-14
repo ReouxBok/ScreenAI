@@ -201,6 +201,59 @@ test('native plan follows backend statuses and survives reload without exposing 
   expect(errors).toEqual([]);
 });
 
+test('native onboarding journey keeps language, plan, next step and diagnostics in one Charly conversation before reset', async ({ nativeChat }) => {
+  const { panel, state, calls, worker, legacy, errors } = nativeChat;
+  await panel.locator('#menuBtn').click();
+  await panel.locator('.lang-option[data-lang="en"]').click();
+  await expect(panel.locator('#userInput')).toHaveAttribute('placeholder', 'Write to Charly...');
+  await panel.reload();
+  await expect(panel.locator('#userInput')).toHaveAttribute('placeholder', 'Write to Charly...');
+  await panel.locator('#menuBtn').click();
+  await panel.locator('.lang-option[data-lang="fr"]').click();
+  await panel.locator('#menuBtn').click();
+  await panel.reload();
+  await expect(panel.locator('#userInput')).toHaveAttribute('placeholder', 'Écris à Charly...');
+
+  state.reply = 'Je te propose le parcours publié pour connecter Gmail.';
+  state.todos = [
+    { content: 'Ouvrir les intégrations', status: 'completed' },
+    { content: 'Connecter Gmail', status: 'in_progress' },
+    { content: 'Vérifier la connexion', status: 'pending' },
+  ];
+  await panel.locator('#userInput').fill('Démarre mon accompagnement Gmail');
+  await panel.locator('#sendBtn').click();
+  await expect(panel.locator('.message.assistant .message-content')).toHaveText(state.reply);
+  await expect(panel.locator('.native-agent-plan')).toHaveCount(1);
+  await expect(panel.locator('.native-plan-progress span')).toHaveText('1 / 3');
+  state.todos = undefined;
+  state.reply = 'La prochaine étape est de terminer la connexion Gmail.';
+  await panel.locator('.next-step-link').click();
+  await expect(panel.locator('.message.assistant .message-content')).toHaveCount(2);
+  await expect(panel.locator('.message.assistant .message-content').last()).toHaveText(state.reply);
+  expect(calls.filter(call => call.path === `/message/${CONVERSATION}` && !call.body.kind).map(call => call.body.content))
+    .toEqual(['Démarre mon accompagnement Gmail', expect.stringContaining('prochaine étape')]);
+
+  await panel.locator('#diagnoseBtn').click();
+  await expect(panel.locator('#diagnosticResult')).toHaveAttribute('data-status', 'healthy');
+  const downloadPromise = panel.waitForEvent('download');
+  await panel.locator('#downloadLogsBtn').click();
+  const stream = await (await downloadPromise).createReadStream();
+  let logs = '';
+  for await (const chunk of stream) logs += chunk.toString();
+  expect(logs).toContain('DIAGNOSTIC_COMPLETED');
+  for (const value of ['Démarre mon accompagnement Gmail', state.reply, CONVERSATION, WORKSPACE]) expect(logs).not.toContain(value);
+
+  await panel.locator('#menuBtn').click();
+  await panel.locator('#resetBtn').click();
+  await expect.poll(() => calls.filter(call => call.path === '/conversation' && call.method === 'POST').length).toBe(2);
+  await expect(panel.locator('.message.user, .message.assistant, .native-agent-plan')).toHaveCount(0);
+  await expect(panel.locator('#limovaConversation')).not.toHaveValue(CONVERSATION);
+  const storage = await worker.evaluate(() => chrome.storage.local.get(null));
+  expect(storage.limova_lang).toBe('fr');
+  expect(storage.limova_deep_agent_context_v1.conversationId).not.toBe(CONVERSATION);
+  expect(legacy).toEqual([]); expect(errors).toEqual([]);
+});
+
 for (const failure of [null, 'session', 'flag']) test(`native diagnostic download preserves privacy after ${failure ?? 'healthy chat'}`, async ({ nativeChat }) => {
   const { panel, state, calls, legacy, errors, context } = nativeChat;
   const privateQuestion = 'PRIVATE_SUPPORT_QUESTION_DO_NOT_EXPORT';

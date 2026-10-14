@@ -1,6 +1,6 @@
 # Migration de la recette E2E vers Deep Agent
 
-**État courant : 3 scénarios legacy restent dans `feature-flows.spec.js`.** Les sections suivantes retracent les couches de migration ; leurs anciens décomptes décrivent ces étapes, pas le total actuel. La suite globale et la qualification distante restent ouvertes.
+**État courant : 1 scénario legacy reste dans `feature-flows.spec.js`.** Les sections suivantes retracent les couches de migration ; leurs anciens décomptes décrivent ces étapes, pas le total actuel. La suite globale et la qualification distante restent ouvertes.
 
 ## Audit du 14 octobre 2026
 
@@ -238,3 +238,11 @@ Le suivi est local au panneau et n’est pas restauré après rechargement. Il s
 Les changements qui surviennent pendant un tour sont regroupés et analysés une fois le tour terminé. Une modale ouverte puis refermée entièrement pendant cette période peut ne pas être observée. La sonde n’extrait ni texte ni attributs métier ; le contenu est lu ensuite par le driver privé et filtré. Les tests Chromium couvrent navigation SPA, navigation complète, modale, tentative de clic refusée, retrait manuel, autre onglet, nouvelle conversation, confidentialité, flag, session et rechargement du panneau. Les tests unitaires couvrent la première référence, le regroupement, les réponses tardives, la perte de focus, le retrait de permission et l’onglet fixé.
 
 Cette recette remplace le scénario legacy d’analyse automatique par un consentement de suivi explicite et limité à l’onglet. Deux scénarios legacy restent : le parcours vocal intégré et le parcours combiné onboarding/diagnostic/reset.
+
+## Parcours natif combiné d’accompagnement
+
+Un même scénario du panneau natif vérifie maintenant le changement EN puis FR et sa persistance après rechargement, un plan `write_todos` à 1/3, la demande de prochaine étape dans le même `conversationId`, le diagnostic sain, le téléchargement de logs sans contenu du chat ni identifiants, puis la création d’une nouvelle conversation via la commande de réinitialisation. La langue reste en français tandis que messages et plan ne sont pas transportés dans le nouveau fil.
+
+La provenance de la trame n’est pas simulée comme prompt local dans ce scénario. Les recettes PostgreSQL/MCP des sections précédentes prouvent séparément que le Studio conserve le brouillon privé, publie la nouvelle révision et expose ses étapes au vrai service API. Les tests de factory API prouvent que ces outils appartiennent au main agent Charly et que mémoire/skills restent dans son runtime ordinaire. Aucun de ces tests n’appelle un modèle distant ; la qualité de la réponse réelle demeure un gate de qualification.
+
+Ce parcours remplace le scénario legacy combiné, qui dépendait du prompt local et de Gemini. Il reste un seul scénario legacy : le parcours vocal intégré, dont les attentes de connaissances, clarification et suggestions doivent encore être rapprochées du comportement Deep Agent.
