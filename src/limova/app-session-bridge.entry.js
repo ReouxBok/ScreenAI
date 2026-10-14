@@ -1,3 +1,4 @@
+import { evaluationGrant, EVALUATION_CODE_HEADER } from './evaluation-grant.js';
 import { LIMOVA_APP_URL, LIMOVA_API_URL } from './environment.js';
 
 (() => {
@@ -9,6 +10,7 @@ import { LIMOVA_APP_URL, LIMOVA_API_URL } from './environment.js';
   const UUID = '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}';
   const uuid = new RegExp(`^${UUID}$`, 'i');
   const read = new RegExp(`^/conversation/${UUID}(?:/messages)?$`, 'i');
+  const evaluationMessage = new RegExp(`^/message/${UUID}$`, 'i');
   const write = new RegExp(`^/message/${UUID}(?:/cancel)?$`, 'i');
 
   function decode(request) {
@@ -24,6 +26,9 @@ import { LIMOVA_APP_URL, LIMOVA_API_URL } from './environment.js';
       const name = key.toLowerCase();
       if (name === 'accept' && ['application/json', 'text/event-stream'].includes(value)
         || name === 'content-type' && value === 'application/json'
+        || name === EVALUATION_CODE_HEADER && request.method === 'POST'
+          && (url.pathname === '/conversation' || evaluationMessage.test(url.pathname))
+          && evaluationGrant(value) !== undefined
         || ['x-workspace-id', 'x-extension-session'].includes(name) && typeof value === 'string' && uuid.test(value)) {
         headers.set(name, value);
       } else throw new Error();

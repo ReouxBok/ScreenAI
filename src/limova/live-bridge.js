@@ -1,3 +1,4 @@
+import { evaluationGrant } from './evaluation-grant.js';
 import { liveBrowserBinding, liveBrowserContinuation, liveBrowserContextReply, liveUuid } from './live-browser-contract.js';
 import { LIMOVA_API_URL } from './environment.js';
 
@@ -107,6 +108,7 @@ export function attachLimovaLiveBridge(runtime, io) {
           if (![request.userId, request.workspaceId, request.conversationId].every(value => typeof value === 'string' && uuid.test(value))
             || typeof request.languageCode !== 'string' || request.languageCode.length > 32
             || typeof request.userTimezone !== 'string' || request.userTimezone.length > 100) throw new Error();
+          evaluationGrant(request.evaluationCode);
           browserBinding = liveBrowserBinding(request.browserSession, request.browserContext);
           socket = io(`${LIMOVA_API_URL}/conversation/live`, {
             withCredentials: true, transports: ['websocket'], auth: { workspaceId: request.workspaceId },
@@ -120,6 +122,7 @@ export function attachLimovaLiveBridge(runtime, io) {
               conversationId: request.conversationId, languageCode: request.languageCode,
               userTimezone: request.userTimezone, clientSurface: 'chrome_extension', expectedUserId: request.userId,
               ...browserBinding,
+              ...(request.evaluationCode !== undefined ? { evaluationCode: request.evaluationCode } : {}),
             });
           });
           socket.on('disconnect', () => close(true));

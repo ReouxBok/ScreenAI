@@ -1,3 +1,4 @@
+import { evaluationGrant } from './evaluation-grant.js';
 import { liveBrowserBinding, liveBrowserContinuation, liveBrowserContextReply } from './live-browser-contract.js';
 import { createLimovaAppTarget } from './app-target.js';
 import { LIVE_PORT } from './live-bridge.js';
@@ -6,7 +7,8 @@ const unavailable = () => new Error('La connexion vocale Limova a été interrom
 
 export function createLimovaLiveTransport(chrome) {
   const prepare = createLimovaAppTarget(chrome, 'src/limova/app-live-bridge.js');
-  return async ({ context, conversationId, languageCode, userTimezone, browserSession, browserContext, signal, onEvent, onError }) => {
+  return async ({ context, conversationId, languageCode, userTimezone, browserSession, browserContext, evaluationCode, signal, onEvent, onError }) => {
+    const grant = evaluationGrant(evaluationCode);
     const browserBinding = liveBrowserBinding(browserSession, browserContext);
     signal?.throwIfAborted();
     const target = await prepare(signal);
@@ -69,7 +71,8 @@ export function createLimovaLiveTransport(chrome) {
       if (signal?.aborted) { abort(); return; }
       try {
         send({ kind: 'start', userId: context.userId, workspaceId: context.workspaceId,
-          conversationId, languageCode, userTimezone, ...browserBinding });
+          conversationId, languageCode, userTimezone, ...browserBinding,
+          ...(grant !== undefined ? { evaluationCode: grant } : {}) });
       } catch { close(unavailable()); }
     });
   };

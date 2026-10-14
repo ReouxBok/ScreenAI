@@ -30,6 +30,21 @@ function fixture(sender = 'own-extension') {
 afterEach(() => vi.useRealTimers());
 
 describe('first-party live bridge', () => {
+  it('passes a validated evaluation grant only in session.start', () => {
+    const f = fixture();
+    f.port.onMessage.fire({ ...start, evaluationCode: 'private-staff-evaluation-code' });
+    f.server('connect');
+    expect(f.socket.emit).toHaveBeenCalledWith('session.start', expect.objectContaining({ evaluationCode: 'private-staff-evaluation-code' }));
+    expect(JSON.stringify(f.io.mock.calls)).not.toContain('private-staff-evaluation-code');
+    f.port.onDisconnect.fire();
+  });
+
+  it.each(['short', null, 'x'.repeat(101)])('rejects an invalid evaluation grant before opening the socket: %j', evaluationCode => {
+    const f = fixture();
+    f.port.onMessage.fire({ ...start, evaluationCode });
+    expect(f.io).not.toHaveBeenCalled();
+  });
+
   it('sends one context reply for the exact server request and refuses replay', () => {
     const f = fixture();
     const browserContext = { tabId: 7, origin: 'https://example.com', contextVersion: 1 };

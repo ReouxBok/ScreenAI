@@ -1,3 +1,4 @@
+import { evaluationGrant, EVALUATION_CODE_HEADER } from './evaluation-grant.js';
 import { readDeepAgentEvents } from './sse.js';
 import { LIMOVA_API_URL } from './environment.js';
 
@@ -80,7 +81,7 @@ export class LimovaDeepAgentClient {
     return this.#refreshPromise;
   }
 
-  async #request(path, { method = 'GET', body, workspaceId, signal, stream = false, browserSession, expectedContext, requireEnabled = true } = {}) {
+  async #request(path, { method = 'GET', body, workspaceId, signal, stream = false, browserSession, evaluationCode, expectedContext, requireEnabled = true } = {}) {
     if (!signal && !stream) signal = AbortSignal.timeout(30_000);
     const generation = this.#refreshGeneration;
     const headers = { Accept: stream ? 'text/event-stream' : 'application/json' };
@@ -88,6 +89,7 @@ export class LimovaDeepAgentClient {
     if (body !== undefined && !multipart) headers['Content-Type'] = 'application/json';
     if (workspaceId) headers['x-workspace-id'] = id(workspaceId);
     if (browserSession !== undefined) headers['x-extension-session'] = id(browserSession);
+    if (evaluationCode !== undefined) headers[EVALUATION_CODE_HEADER] = evaluationGrant(evaluationCode);
     const options = { method, headers, credentials: 'include', cache: 'no-store', signal,
       ...(body !== undefined ? { body: multipart ? body : JSON.stringify(body) } : {}) };
     let response = await this.#fetch(`${LIMOVA_API_URL}${path}`, options);
@@ -137,11 +139,12 @@ export class LimovaDeepAgentClient {
 
   async validateContext(context, signal) { await this.#assertContext(context, signal); }
 
-  async createConversation(context, title = 'Discussion avec Charly', signal) {
+  async createConversation(context, title = 'Discussion avec Charly', signal, evaluationCode) {
+    evaluationGrant(evaluationCode);
     await this.#assertContext(context, signal);
     const agent = await this.#request('/agent/by-slug/charly', { workspaceId: context.workspaceId, signal, expectedContext: { ...context } });
     if (agent?.slug !== 'charly') throw new LimovaClientError('INVALID_AGENT', 'L’agent principal Limova est indisponible.');
-    const conversation = await this.#request('/conversation', { method: 'POST', workspaceId: context.workspaceId, signal,
+    const conversation = await this.#request('/conversation', { evaluationCode, method: 'POST', workspaceId: context.workspaceId, signal,
       expectedContext: { ...context },
       body: { title: String(title).slice(0, 200), type: 'general', engine: 'deep_agents', botAgentId: id(agent.id), disableFirstMessage: true } });
     id(conversation?.id);
@@ -183,7 +186,8 @@ export class LimovaDeepAgentClient {
     return { fileId: id(file?.id) };
   }
 
-  async *sendMessage(context, conversationId, content, signal, browser) {
+  async *sendMessage(context, conversationId, content, signal, browser, evaluationCode) {
+    evaluationGrant(evaluationCode);
     const page = browser === undefined ? undefined : browserContext(browser);
     await this.getConversation(context, conversationId, signal);
     if (typeof content !== 'string' || !content.trim() || content.length > 8000) {
@@ -192,7 +196,7 @@ export class LimovaDeepAgentClient {
     const response = await this.#request(`/message/${id(conversationId)}`, {
       method: 'POST', workspaceId: context.workspaceId, signal, stream: true,
       expectedContext: { ...context },
-      browserSession: browser?.sessionId,
+      browserSession: browser?.sessionId, evaluationCode,
       body: { content, clientSurface: 'chrome_extension', userTimezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
         ...(page ? { browserContext: page } : {}) },
     });
@@ -211,25 +215,27 @@ export class LimovaDeepAgentClient {
     return { turnId: turn.turnId, status: turn.status };
   }
 
-  async *sendBrowserResult(context, conversationId, browser, result, signal) {
+  async *sendBrowserResult(context, conversationId, browser, result, signal, evaluationCode) {
+    evaluationGrant(evaluationCode);
     const page = browserContext(browser);
     const receipt = browserResult(result);
     yield* this.#continueBrowser(context, conversationId, browser.sessionId, {
       kind: 'browser_tool_result', browserContext: page, browserResult: receipt,
-    }, signal);
+    }, signal, evaluationCode);
   }
 
-  async *resumeBrowserTurn(context, conversationId, browser, turnId, signal) {
+  async *resumeBrowserTurn(context, conversationId, browser, turnId, signal, evaluationCode) {
+    evaluationGrant(evaluationCode);
     const page = browserContext(browser);
     yield* this.#continueBrowser(context, conversationId, browser.sessionId, {
       kind: 'browser_resume', browserContext: page, browserTurnId: id(turnId),
-    }, signal);
+    }, signal, evaluationCode);
   }
 
-  async *#continueBrowser(context, conversationId, browserSession, body, signal) {
+  async *#continueBrowser(context, conversationId, browserSession, body, signal, evaluationCode) {
     await this.getConversation(context, conversationId, signal);
     const response = await this.#request(`/message/${id(conversationId)}`, {
-      method: 'POST', workspaceId: context.workspaceId, signal, stream: true, browserSession,
+      method: 'POST', workspaceId: context.workspaceId, signal, stream: true, browserSession, evaluationCode,
       expectedContext: { ...context },
       body: { ...body, clientSurface: 'chrome_extension' },
     });

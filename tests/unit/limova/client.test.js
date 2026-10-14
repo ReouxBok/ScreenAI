@@ -320,3 +320,29 @@ describe('Limova session refresh account boundary', () => {
     expect(cancelled).toBe(2);
   });
 });
+
+describe('Studio evaluation grant transport', () => {
+  const code = 'private-staff-evaluation-code';
+  it.each([
+    ['create', client => client.createConversation(CONTEXT, 'Evaluation', undefined, code)],
+    ['message', client => consume(client.sendMessage(CONTEXT, CONVERSATION, 'Test', undefined, BROWSER, code))],
+    ['result', client => consume(client.sendBrowserResult(CONTEXT, CONVERSATION, BROWSER, RESULT, undefined, code))],
+    ['resume', client => consume(client.resumeBrowserTurn(CONTEXT, CONVERSATION, BROWSER, USER, undefined, code))],
+  ])('sends the grant only on the target mutation header: %s', async (_, execute) => {
+    const { client, fetch } = harness();
+    await execute(client);
+    const mutations = fetch.mock.calls.filter(([, options]) => options.method === 'POST');
+    expect(mutations).toHaveLength(1);
+    expect(mutations[0][1].headers['x-limova-evaluation-code']).toBe(code);
+    expect(mutations[0][1].body).not.toContain(code);
+    expect(fetch.mock.calls.filter(([, options]) => options.method === 'GET')
+      .every(([, options]) => !('x-limova-evaluation-code' in options.headers))).toBe(true);
+  });
+
+  it.each(['short', '', null, 'x'.repeat(101), 'a'.repeat(24) + '\n'])('refuses invalid grants before accessing the account: %j', async code => {
+    const { client, fetch } = harness();
+    await expect(client.createConversation(CONTEXT, 'Evaluation', undefined, code)).rejects.toThrow();
+    await expect(consume(client.sendMessage(CONTEXT, CONVERSATION, 'Test', undefined, undefined, code))).rejects.toThrow();
+    expect(fetch).not.toHaveBeenCalled();
+  });
+});
