@@ -6,7 +6,8 @@ Le proxy construit l’identité mémoire comme `v1:` + HMAC-SHA256 de `charly-m
 
 Le schéma `charly_memory` contient neuf tables : utilisateurs/préférences, sessions, messages, résumés, souvenirs, objectifs, tombstones, runs et événements d’audit. Les contenus et états sont chiffrés ; les embeddings et métadonnées ne sont pas une sauvegarde de remplacement. La clé de chiffrement et la clé d’identité remplissent des rôles différents.
 
-**L’export historique actuel n’est pas exhaustif.** `exportMemory` appelle `bootstrapMemory`, qui peut écrire lastSeenAt, créer/fermer une session et mettre à jour lastUsedAt. Il retourne au plus 24 messages de la session active, huit souvenirs classés par pertinence, cinq objectifs ouverts et un résumé. Si la personnalisation est désactivée, le contexte exporté est vide malgré d’éventuelles données stockées. Ce contrat ne doit pas servir de source unique d’import ni de preuve que l’utilisateur n’a pas de données. Sa correction/export exhaustif reste à réaliser.
+**L’ancien export était un contexte partiel et mutait la base.** Il appelait `bootstrapMemory` (lastSeenAt, sessions, lastUsedAt), limité à 24 messages, huit souvenirs, cinq objectifs ouverts et un résumé. Le service local est maintenant remplacé par un [export dédié en lecture seule](legacy-memory-export.md), version 2, couvrant les neuf tables et les préférences désactivées. Cette correction locale ne prouve ni son déploiement ni un export effectif de production. Les anciens fichiers exportés restent partiels.
+
 
 ## Commande disponible
 
@@ -32,7 +33,7 @@ Validation locale : migrations réelles appliquées dans PGlite avec pgvector, j
 
 1. Mesurer la base cible de l’ancien service avec cette commande et conserver un rapport daté ainsi que la référence du déploiement choisi.
 2. Établir côté serveur le lien entre email vérifié du compte Limova et HMAC historique avec la clé d’identité d’origine. Ne pas accepter un UUID fourni par le DOM ou le profil comme preuve. Définir explicitement l’organisation de destination ; une identité historique ne fournit pas cette information.
-3. Produire un export exhaustif et cohérent, avec identifiants source, statuts, dates, expirations et tombstones ; vérifier le déchiffrement. L’export de contexte actuel n’est pas suffisant.
+3. Produire un export exhaustif et cohérent, avec identifiants source, statuts, dates, expirations et tombstones ; vérifier le déchiffrement. Utiliser le format version 2 et qualifier sa volumétrie sur le déploiement cible ; les anciens exports de contexte ne sont pas suffisants.
 4. Prévisualiser un import idempotent vers les stores utilisateur/organisation natifs. Préserver les souvenirs existants, les demandes d’oubli et la préférence désactivée. Traiter l’historique comme archive, sans rejouer messages, commandes ou runs ADK.
 5. Réconcilier les volumes, dédoublonnages, conflits, éléments exclus et erreurs avant tout retrait. Garder l’ancien service disponible tant que cette vérification, l’export et l’effacement n’ont pas de remplacement qualifié.
 

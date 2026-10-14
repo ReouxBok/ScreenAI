@@ -1,6 +1,6 @@
 import { NextResponse } from "next/server";
 import { authorizedMemoryRequest, validUserKey } from "@/memory/internal-auth";
-import { exportMemory } from "@/memory/service";
+import { exportMemory } from "@/memory/export";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
