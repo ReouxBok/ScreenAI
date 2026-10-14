@@ -138,3 +138,13 @@ Un changement d’URL dans le même document pouvait conserver une référence d
 Les tests vérifient aussi une navigation déclenchée pendant pointerdown (aucun click final) et un tour complet : ancienne commande refusée, nouvelle page relue, nouvelle commande exécutée une seule fois dans le même tour, sans query sensible transmise. Les 9 scénarios legacy restent : cette correction ne remplace pas le parcours d’analyse automatique après navigation/modal. Elle ne prétend pas détecter tous les changements sémantiques d’un SPA à URL identique.
 
 Les fixtures `browser-document` sélectionnent désormais les origines de l’environnement : leur première invocation avec le paquet staging échouait sur les URL production non autorisées. Les permissions des paquets restent inchangées.
+
+## Contexte vocal après interaction manuelle
+
+Le scénario legacy qui inspectait seulement le log `USER_PAGE_INTERACTION_OBSERVED` est remplacé par deux parcours du panneau vocal natif. Micro Chromium de test, PCM, Socket.IO, cookies first-party, contrôleur navigateur, registre de documents et journal sont réels ; serveur API et réponse du modèle restent simulés.
+
+Après un clic manuel, la page navigue via pushState et ouvre une modale. Le prochain tour demande le contexte, obtient une version supérieure pour le même onglet, puis lit le nouveau texte. Valeurs du mot de passe/textarea et query privée sont absentes des résultats et logs ; la réponse canonique apparaît dans le chat, sans POST texte en doublon ni appel legacy. Une seule session et un seul résultat navigateur sont observés.
+
+Si l’utilisateur a changé d’onglet avant cette demande, la session vocale s’arrête avec une erreur visible, sans transmettre le contexte de l’autre onglet ni résultat d’action et sans reconnexion automatique. Ce test ne fournit pas encore le bouton de retour à l’onglet du parcours historique.
+
+La relecture est déclenchée au tour natif suivant ; ce n’est pas une analyse automatique supplémentaire à chaque clic. Le scénario général d’analyse automatique et celui d’avertissement/retour d’onglet restent à migrer. Huit scénarios legacy restent au total. Une première exécution de la nouvelle fixture a échoué sur l’encodage de son HTML ; le serveur de test indique maintenant UTF-8.

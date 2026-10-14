@@ -19,7 +19,7 @@ const BROWSER_TURN = '66666666-6666-4666-8666-666666666666';
 const BROWSER_SESSION = '77777777-7777-4777-8777-777777777777';
 const PAGE = { tabId: 7, origin: 'https://example.com', contextVersion: 1 };
 
-for (const ending of ['consent', 'disconnect', 'startup-timeout', 'permission-dismissed', 'turn-failed', 'response-timeout']) test(`native voice handles ${ending} without replaying a turn`, async () => {
+for (const ending of ['consent', 'disconnect', 'startup-timeout', 'permission-dismissed', 'turn-failed', 'response-timeout', 'manual-context', 'manual-other-tab']) test(`native voice handles ${ending} without replaying a turn`, async () => {
   test.setTimeout(40_000);
   const directory = await mkdtemp(path.join(tmpdir(), 'limova-live-test-'));
   const key = path.join(directory, 'key.pem'), cert = path.join(directory, 'cert.pem');
@@ -28,7 +28,7 @@ for (const ending of ['consent', 'disconnect', 'startup-timeout', 'permission-di
   const seen = { starts: 0, connected: 0, stopped: 0, disconnected: 0, pcm: null, cancelled: null, browserBinding: null, browserResult: null, results: [], action: null, httpChecks: [], cookie: false, origin: null };
   const server = createServer({ key: await readFile(key), cert: await readFile(cert) }, (request, response) => {
     if (request.headers.host === new URL(APP).host) {
-      response.writeHead(200, { 'content-type': 'text/html' }); response.end('<title>Live fixture</title><main>Browser knowledge fixture</main>'); return;
+      response.writeHead(200, { 'content-type': 'text/html; charset=utf-8' }); response.end(`<title>Live fixture</title><main>Browser knowledge fixture<input type="password" value="NEVER_TRANSMIT_THIS_SECRET"><textarea>PRIVATE_FIELD_VALUE</textarea><button id="manual">Connecter HubSpot</button></main><script>window.manualClicks=0;manual.onclick=()=>{window.manualClicks++;history.pushState({},'', '/integrations?private_token=PRIVATE_ROUTE');const dialog=document.createElement('div');dialog.setAttribute('role','dialog');dialog.textContent='HubSpot connecté';document.body.append(dialog);};</script>`); return;
     }
     const headers = { 'access-control-allow-origin': APP, 'access-control-allow-credentials': 'true',
       'access-control-allow-headers': 'x-workspace-id,content-type', 'access-control-allow-methods': 'GET,POST,OPTIONS', 'content-type': 'application/json' };
@@ -53,6 +53,7 @@ for (const ending of ['consent', 'disconnect', 'startup-timeout', 'permission-di
   io.of('/conversation/live').on('connection', socket => {
     const socketSessionId = randomUUID();
     activeSocket = socket;
+    seen.sessionId = socketSessionId;
     seen.connected += 1;
     seen.cookie = socket.handshake.headers.cookie?.includes('live_fixture=authenticated') === true;
     seen.origin = socket.handshake.headers.origin;
@@ -60,6 +61,7 @@ for (const ending of ['consent', 'disconnect', 'startup-timeout', 'permission-di
       seen.starts += 1;
       seen.startPayload = payload;
       seen.browserBinding = { browserSession: payload.browserSession, browserContext: payload.browserContext };
+      seen.initialBrowserBinding = structuredClone(seen.browserBinding);
       if (!seen.cookie || payload.expectedUserId !== USER || socket.handshake.auth.workspaceId !== WORKSPACE) return socket.disconnect();
       if (ending === 'startup-timeout') return;
       socket.emit('session.ready', { sessionId: socketSessionId, conversationId: CONVERSATION, userId: USER, workspaceId: WORKSPACE,
@@ -67,6 +69,7 @@ for (const ending of ['consent', 'disconnect', 'startup-timeout', 'permission-di
     });
     socket.on('audio.append', payload => {
       seen.pcm = { sequence: payload.sequence, length: payload.audio.length };
+      if (ending.startsWith('manual-')) return;
       if (seen.action) return;
       seen.action = true;
       socket.emit('turn.deep_agent_stream.started', { sessionId: socketSessionId, turnId: VOICE_TURN });
@@ -82,6 +85,25 @@ for (const ending of ['consent', 'disconnect', 'startup-timeout', 'permission-di
       }
       socket.emit('assistant.audio.delta', { sessionId: socketSessionId, sequence: 0, audio: Buffer.alloc(4800) });
       socket.emit('turn.deep_agent_stream.completed', { sessionId: socketSessionId, turnId: VOICE_TURN });
+    });
+    socket.on('turn.browser_context', payload => {
+      seen.contextReply = payload;
+      seen.browserBinding.browserContext = payload.browserContext;
+      socket.emit('turn.deep_agent_stream.started', { sessionId: socketSessionId, turnId: VOICE_TURN });
+      const action = { type: 'extension.action_requested', protocolVersion: 1, turnId: BROWSER_TURN,
+        actionId: 'manual-context-read', toolCallId: 'manual-context-tool', target: payload.browserContext,
+        input: { operation: 'read_page' }, expiresAt: new Date(Date.now() + 60_000).toISOString() };
+      const frames = [action, { type: 'extension.turn_state', state: 'waiting', turnId: BROWSER_TURN }];
+      socket.emit('turn.deep_agent_stream.delta', { sessionId: socketSessionId, turnId: VOICE_TURN,
+        chunk: Buffer.from(frames.map(data => `event: custom\ndata: ${JSON.stringify(data)}\n\n`).join('')) });
+    });
+    socket.on('turn.browser_continue', payload => {
+      seen.results.push(payload);
+      const values = { messages: [{ id: USER, role: 'user', content: 'Que vois-tu ?' }, { id: WORKSPACE, role: 'assistant', content: 'HubSpot connecté.' }] };
+      socket.emit('turn.deep_agent_stream.delta', { sessionId: socketSessionId, turnId: VOICE_TURN,
+        chunk: Buffer.from(`event: values\ndata: ${JSON.stringify(values)}\n\nevent: custom\ndata: ${JSON.stringify({ type: 'extension.turn_state', state: 'completed', turnId: BROWSER_TURN })}\n\n`) });
+      socket.emit('turn.deep_agent_stream.completed', { sessionId: socketSessionId, turnId: VOICE_TURN });
+      socket.emit('assistant.transcript.final', { sessionId: socketSessionId, turnId: VOICE_TURN, text: 'HubSpot connecté.' });
     });
     socket.on('response.cancel', payload => { seen.cancelled = payload.playedAudioMs; });
     socket.on('session.stop', () => { seen.stopped += 1; });
@@ -114,7 +136,10 @@ for (const ending of ['consent', 'disconnect', 'startup-timeout', 'permission-di
     await expect(extensionPage.locator('html')).toHaveAttribute('data-sidebar-ready', 'true');
     await expect(extensionPage.locator('#limovaConversation')).toHaveValue(CONVERSATION);
     if (ending === 'response-timeout') await extensionPage.clock.install();
-    await extensionPage.locator('#voiceBtn').click();
+    if (ending.startsWith('manual-')) {
+      await app.bringToFront();
+      await extensionPage.evaluate(() => { document.getElementById('limovaBrowser').checked = true; document.getElementById('voiceBtn').click(); });
+    } else await extensionPage.locator('#voiceBtn').click();
     if (ending === 'permission-dismissed') {
       await expect.poll(() => context.pages().some(page => page.url().endsWith('/microphone-permission.html'))).toBe(true);
       const permissionPage = context.pages().find(page => page.url().endsWith('/microphone-permission.html'));
@@ -143,6 +168,50 @@ for (const ending of ['consent', 'disconnect', 'startup-timeout', 'permission-di
       return;
     }
     await expect.poll(() => seen.pcm?.length).toBe(640);
+    if (ending.startsWith('manual-')) {
+      await expect(extensionPage.locator('#voiceBtn')).toHaveAttribute('aria-pressed', 'true');
+      await app.locator('#manual').click();
+      await expect(app.locator('[role="dialog"]')).toHaveText('HubSpot connecté');
+      expect(seen.results).toHaveLength(0);
+      if (ending === 'manual-other-tab') {
+        const other = await context.newPage();
+        await other.goto(`${APP}/other-tab`);
+        await other.bringToFront();
+      }
+      activeSocket.emit('turn.browser_context_requested', { sessionId: seen.sessionId, turnId: VOICE_TURN, requestId: USER });
+      if (ending === 'manual-other-tab') {
+        await expect(extensionPage.locator('#voiceBtn')).toHaveAttribute('aria-pressed', 'false');
+        await expect.poll(() => seen.disconnected).toBe(1);
+        await expect(extensionPage.locator('.message.error .message-content').last()).not.toBeEmpty();
+        expect(seen.contextReply).toBeUndefined();
+        expect(seen.results).toEqual([]);
+        expect(seen.starts).toBe(1); expect(seen.connected).toBe(1);
+        expect(seen.httpChecks.filter(call => call.method === 'POST')).toEqual([]);
+        expect(legacyRequests).toEqual([]); expect(errors).toEqual([]);
+        return;
+      }
+
+      await expect.poll(() => seen.results.length).toBe(1);
+      const receipt = seen.results[0].browserResult;
+      expect(receipt.status).toBe('completed');
+      const page = JSON.parse(receipt.observation);
+      expect(page.url).toBe(`${APP}/integrations`);
+      expect(page.text).toContain('HubSpot connecté');
+      expect(seen.contextReply.browserContext.contextVersion).toBeGreaterThan(seen.initialBrowserBinding.browserContext.contextVersion);
+      expect(seen.contextReply.browserContext.tabId).toBe(seen.initialBrowserBinding.browserContext.tabId);
+      expect(JSON.stringify(seen.results)).not.toMatch(/NEVER_TRANSMIT_THIS_SECRET|PRIVATE_FIELD_VALUE|PRIVATE_ROUTE/);
+      await expect(extensionPage.locator('.message.assistant .message-content')).toHaveText('HubSpot connecté.');
+      expect(await app.evaluate(() => window.manualClicks)).toBe(1);
+      const diagnostics = await extensionPage.evaluate(() => chrome.runtime.sendMessage({ type: 'GET_LOGS' }));
+      expect(diagnostics.logs).not.toMatch(/NEVER_TRANSMIT_THIS_SECRET|PRIVATE_FIELD_VALUE|PRIVATE_ROUTE/);
+      await extensionPage.evaluate(() => document.getElementById('voiceBtn').click());
+      await expect(extensionPage.locator('#voiceBtn')).toHaveAttribute('aria-pressed', 'false');
+      await expect.poll(() => seen.disconnected).toBe(1);
+      expect(seen.starts).toBe(1); expect(seen.connected).toBe(1);
+      expect(seen.httpChecks.filter(call => call.method === 'POST')).toEqual([]);
+      expect(legacyRequests).toEqual([]); expect(errors).toEqual([]);
+      return;
+    }
     if (['turn-failed', 'response-timeout'].includes(ending)) {
       if (ending === 'response-timeout') {
         await expect(extensionPage.locator('.message.user .message-content')).toHaveText('Question vocale sans réponse');
