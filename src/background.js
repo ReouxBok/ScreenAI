@@ -47,6 +47,7 @@ const limovaBackground = createLimovaBackground({
   },
   storage: chrome.storage.local,
   openTab: () => openLimovaApp(chrome),
+  openFile: url => chrome.tabs.create({ url }),
   notify: message => broadcastToSidebar(message),
 });
 

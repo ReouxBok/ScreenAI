@@ -27,6 +27,7 @@ test('mounts the Limova session panel and renders the existing Charly history', 
             { fileId: 'slide2', fileName: 'Deuxième diapositive.png', mimeType: 'image/png', fileUrl: 'https://files.example/2.png' },
           ] } },
       ], pagination: { hasMore: true, nextCursor: 'older-cursor' } };
+      if (request.type === 'LIMOVA_OPEN_GENERATED_FILE') { window.openedGeneratedFile = request; return { ok: true }; }
       if (request.type === 'GET_STATE') return { capabilities: {}, training: null, evaluation: null };
       return original(request);
     };
@@ -41,8 +42,9 @@ test('mounts the Limova session panel and renders the existing Charly history', 
   await expect(page.locator('.generated-file')).toHaveCount(3);
   await expect(page.locator('.generated-caption')).toHaveText('<script>window.unsafeCaption=true</script>');
   expect(await page.evaluate(() => window.unsafeCaption)).toBeUndefined();
-  await expect(page.locator('.generated-file').first()).toHaveAttribute('href', 'https://files.example/video.mp4');
-  await expect(page.locator('.generated-file').first()).toHaveAttribute('rel', 'noopener noreferrer');
+  await page.locator('.generated-file').first().click();
+  expect(await page.evaluate(() => window.openedGeneratedFile)).toEqual({ type: 'LIMOVA_OPEN_GENERATED_FILE', conversationId: 'conversation', fileId: 'video' });
+  await expect(page.locator('.generated-file').first()).not.toHaveAttribute('href');
   expect(await page.locator('#chatContainer > .message').evaluateAll(nodes => nodes.map(node => node.textContent))).toEqual([
     expect.stringContaining('Bonjour Charly'), expect.stringContaining('je retrouve ta conversation'),
     'Présentation.mp4', '<script>window.unsafeCaption=true</script>', 'Première diapositive.png', 'Deuxième diapositive.png',

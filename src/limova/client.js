@@ -172,6 +172,36 @@ export class LimovaDeepAgentClient {
     return this.#request(`/conversation/${id(conversationId)}/messages${query}`, { workspaceId: context.workspaceId, signal, expectedContext: { ...context } });
   }
 
+  async resolveGeneratedFile(context, conversationId, fileId, signal = AbortSignal.timeout(30_000)) {
+    id(fileId);
+    const visited = new Set();
+    let cursor;
+    while (true) {
+      signal.throwIfAborted();
+      const page = await this.getMessages(context, conversationId, cursor, signal);
+      const attached = (Array.isArray(page?.data) ? page.data : [])
+        .filter(message => message?.toShow !== false && ['assistant', 'ai', 'user', 'human'].includes(message.role ?? message.type))
+        .flatMap(message => [message.generatedFiles, message.generatedImages, message.generatedVideos, message.generatedCarousel?.slides]
+          .flatMap(items => Array.isArray(items) ? items : []));
+      const files = [...attached, ...(Array.isArray(page?.unanchoredGeneratedFiles) ? page.unanchoredGeneratedFiles : [])];
+      const file = files.find(item => item?.fileId === fileId);
+      if (file) {
+        let url;
+        try { url = new URL(file.fileUrl); } catch { /* Invalid URLs are rejected below. */ }
+        if (!url || url.protocol !== 'https:' || url.username || url.password)
+          throw new LimovaClientError('INVALID_FILE_URL', 'Le lien du fichier est invalide.');
+        await this.#assertContext(context, signal);
+        return { fileId, url: url.href };
+      }
+      if (page?.pagination?.hasMore !== true) break;
+      const next = id(page.pagination.nextCursor);
+      if (visited.has(next)) throw new LimovaClientError('INVALID_PAGINATION', 'Impossible de parcourir cet historique.');
+      visited.add(next);
+      cursor = next;
+    }
+    throw new LimovaClientError('FILE_NOT_FOUND', 'Ce fichier n’est plus disponible dans cette conversation.');
+  }
+
   async uploadBrowserScreenshot(context, conversationId, image, signal) {
     if (!(image instanceof Blob) || !['image/png', 'image/jpeg'].includes(image.type)
       || image.size === 0 || image.size > 5 * 1024 * 1024) {

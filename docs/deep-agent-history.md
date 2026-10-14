@@ -13,8 +13,19 @@ Tests : catalogue multipage/sélection/déduplication, ordre et chevauchement de
 
 La projection lit désormais `generatedFiles`, `generatedImages`, `generatedVideos`, `generatedCaption` et les `slides` de `generatedCarousel` des messages visibles, selon les DTO existants de l’API. Les fichiers sont associés au message qui les porte ; les diapositives suivent l’ordre du carrousel. Une réponse contenant uniquement des pièces jointes ou une légende reste affichable. Un événement ultérieur de fichier peut renouveler son URL sans perdre son association au message.
 
-Le panneau affiche les liens HTTPS sous la réponse, les légendes en texte brut et les fichiers sans message connu en fin de fil. Les liens s’ouvrent séparément avec `noopener noreferrer` et sans référent. Il ne monte pas de HTML distant, iframe, lecteur média ou script provenant d’un contenu généré ; la CSP reste inchangée.
+Le panneau affiche les fichiers sous la réponse, les légendes en texte brut et les fichiers sans message connu en fin de fil. Les boutons de fichier demandent maintenant une URL renouvelée au worker avant ouverture dans un nouvel onglet. Il ne monte pas de HTML distant, iframe, lecteur média ou script provenant d’un contenu généré ; la CSP reste inchangée.
 
 Validation : tests de projection des vidéos/carrousels/légendes seules, ordre, déduplication, réconciliation des URLs, exclusions des outils/messages cachés/URLs non HTTPS ; Chromium vérifie leur place dans le panneau et l’inertie d’une légende contenant une balise script.
 
-Cette couche donne accès aux médias par leurs liens signés ; elle ne réalise pas encore l’aperçu embarqué, l’édition/versionnage des artefacts, ni le renouvellement à la demande d’un lien expiré sur une ancienne page d’historique. Ces points restent ouverts pour la parité complète.
+L’aperçu embarqué et l’édition/versionnage des artefacts restent ouverts pour la parité complète. Le renouvellement des liens est décrit ci-dessous.
+
+
+## Ouverture avec URL renouvelée
+
+Le clic ne navigue plus vers l’URL conservée dans le rendu. Le worker résout l’ID du fichier dans l’historique canonique de la conversation sélectionnée, via `GET /conversation/:id/messages` et ses curseurs. Cette route renouvelle déjà les URLs signées et applique les droits de conversation. La route `GET /files/:id` est volontairement évitée : sa portée `uploadedBy=userId` ne couvre pas tous les fichiers accessibles via un chat partagé.
+
+Le client parcourt les pages jusqu’au fichier, avec timeout global de 30 secondes, annulation et détection des curseurs répétés. Il considère uniquement les messages visibles et les fichiers explicitement sans ancrage. L’URL doit être HTTPS sans identifiants intégrés ; l’identité est revérifiée après sa résolution. Le worker refuse une réponse tardive si le contexte sélectionné a changé, puis crée l’onglet. Le panneau transmet uniquement les identifiants de conversation/fichier, jamais une URL à ouvrir. Aucun élargissement des routes autorisées par la passerelle first-party.
+
+Les fichiers supprimés/inaccessibles, la perte du flag ou les changements de compte entraînent une erreur visible, sans repli sur l’ancienne URL. Limite de performance : un ancien fichier peut nécessiter plusieurs pages de lecture ; un très long historique peut atteindre le timeout et rester réessayable. Pas de garantie d’accès hors ligne ni de renouvellement après ouverture de l’onglet externe.
+
+Tests : fichier sur une ancienne page, absence, URL malformée/non HTTPS/avec identifiants, contenu caché, curseur répété, annulation, changement de compte après résolution et changement de sélection avant ouverture. Chromium vérifie que le clic du panneau transmet les IDs au worker ; il ne qualifie pas un téléchargement sur le stockage déployé.

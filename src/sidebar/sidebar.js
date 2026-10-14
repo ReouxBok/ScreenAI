@@ -272,14 +272,19 @@ function renderLimovaConversation(snapshot, { showOlder = false } = {}) {
   function appendFile(file) {
     if (shownFiles.has(file.id)) return;
     shownFiles.add(file.id);
-    const link = document.createElement('a');
-    link.href = file.url;
+    const link = document.createElement('button');
+    link.type = 'button';
     link.textContent = file.name;
-    link.target = '_blank';
-    link.rel = 'noopener noreferrer';
-    link.referrerPolicy = 'no-referrer';
     link.className = 'message generated-file';
     link.dataset.fileId = file.id;
+    let opening = false;
+    link.addEventListener('click', async event => {
+      event.preventDefault();
+      if (opening) return;
+      opening = true; link.setAttribute('aria-busy', 'true');
+      try { await limovaPanel.openGeneratedFile(file.id); }
+      finally { opening = false; link.removeAttribute('aria-busy'); }
+    });
     elements.chatContainer.append(link);
   }
   snapshot.messages.forEach(message => {

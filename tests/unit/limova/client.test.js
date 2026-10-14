@@ -346,3 +346,52 @@ describe('Studio evaluation grant transport', () => {
     expect(fetch).not.toHaveBeenCalled();
   });
 });
+
+
+it('renews a generated file from paginated conversation history, including shared files', async () => {
+  const { client, fetch } = harness();
+  const original = fetch.getMockImplementation();
+  fetch.mockImplementation((url, options) => url.includes('/messages') ? json(url.includes('?before=')
+    ? { data: [{ id: USER, role: 'assistant', generatedVideos: [{ fileId: AGENT, fileUrl: 'https://files.example/renewed?signature=new' }] }], pagination: { hasMore: false } }
+    : { data: [], pagination: { hasMore: true, nextCursor: USER } }) : original(url, options));
+  expect(await client.resolveGeneratedFile(CONTEXT, CONVERSATION, AGENT)).toEqual({ fileId: AGENT, url: 'https://files.example/renewed?signature=new' });
+  expect(fetch.mock.calls.some(([url]) => url.endsWith(`/messages?before=${USER}`))).toBe(true);
+  expect(fetch.mock.calls.some(([url]) => url.includes('/files'))).toBe(false);
+});
+
+it.each(['javascript:alert(1)', 'http://files.example/a', 'https://user:password@files.example/a'])('rejects an unsafe renewed URL %s', async fileUrl => {
+  const { client, fetch } = harness(); const original = fetch.getMockImplementation();
+  fetch.mockImplementation((url, options) => url.endsWith('/messages') ? json({ data: [], unanchoredGeneratedFiles: [{ fileId: AGENT, fileUrl }] }) : original(url, options));
+  await expect(client.resolveGeneratedFile(CONTEXT, CONVERSATION, AGENT)).rejects.toMatchObject({ code: 'INVALID_FILE_URL' });
+});
+
+it('does not expose hidden files or loop forever on an invalid history cursor', async () => {
+  const { client, fetch } = harness(); const original = fetch.getMockImplementation();
+  fetch.mockImplementation((url, options) => url.includes('/messages') ? json({ data: [{ id: USER, role: 'assistant', toShow: false,
+    generatedFiles: [{ fileId: AGENT, fileUrl: 'https://files.example/hidden' }] }], pagination: { hasMore: true, nextCursor: USER } }) : original(url, options));
+  await expect(client.resolveGeneratedFile(CONTEXT, CONVERSATION, AGENT)).rejects.toMatchObject({ code: 'INVALID_PAGINATION' });
+  expect(fetch.mock.calls.filter(([url]) => url.includes('/messages'))).toHaveLength(2);
+});
+
+it('rechecks identity after resolving the file and rejects an account switch', async () => {
+  const { client, fetch } = harness(); const original = fetch.getMockImplementation(); let changed = false;
+  fetch.mockImplementation((url, options) => {
+    if (url.endsWith('/messages')) { changed = true; return json({ data: [], unanchoredGeneratedFiles: [{ fileId: AGENT, fileUrl: 'https://files.example/a' }] }); }
+    if (changed && url.endsWith('/users/me')) return json({ id: AGENT });
+    return original(url, options);
+  });
+  await expect(client.resolveGeneratedFile(CONTEXT, CONVERSATION, AGENT)).rejects.toMatchObject({ code: 'LIMOVA_ACCOUNT_CHANGED' });
+});
+
+
+it('does not return a cached link when the file disappears from the conversation', async () => {
+  const { client, fetch } = harness(); const original = fetch.getMockImplementation();
+  fetch.mockImplementation((url, options) => url.endsWith('/messages') ? json({ data: [], pagination: { hasMore: false } }) : original(url, options));
+  await expect(client.resolveGeneratedFile(CONTEXT, CONVERSATION, AGENT)).rejects.toMatchObject({ code: 'FILE_NOT_FOUND' });
+});
+
+it('honors cancellation before attempting any file lookup', async () => {
+  const { client, fetch } = harness(); const controller = new AbortController(); controller.abort();
+  await expect(client.resolveGeneratedFile(CONTEXT, CONVERSATION, AGENT, controller.signal)).rejects.toMatchObject({ name: 'AbortError' });
+  expect(fetch).not.toHaveBeenCalled();
+});

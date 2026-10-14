@@ -362,3 +362,28 @@ it('verifies a fresh read after a mutation and keeps the observation out of publ
   expect(JSON.stringify(await f.background.handle({ type: 'LIMOVA_GET_STATE' }))).not.toContain(snapshot.text);
   expect(JSON.stringify(f.storage.set.mock.calls)).not.toContain(snapshot.text);
 });
+
+
+it('opens only a freshly resolved generated file for the selected conversation', async () => {
+  const openFile = vi.fn();
+  const { background, client } = harness({ openFile });
+  client.resolveGeneratedFile = vi.fn().mockResolvedValue({ url: 'https://files.example/fresh' });
+  await open(background);
+  await background.handle({ type: 'LIMOVA_OPEN_GENERATED_FILE', conversationId: 'conversation-1', fileId: 'file' });
+  expect(openFile).toHaveBeenCalledWith('https://files.example/fresh');
+  await expect(background.handle({ type: 'LIMOVA_OPEN_GENERATED_FILE', conversationId: 'other', fileId: 'file' })).rejects.toThrow('conversation');
+  expect(client.resolveGeneratedFile).toHaveBeenCalledTimes(1);
+});
+
+it('does not open a file resolved after a context change', async () => {
+  const openFile = vi.fn(); let resolve;
+  const { background, client } = harness({ openFile });
+  client.resolveGeneratedFile = vi.fn(() => new Promise(done => { resolve = done; }));
+  await open(background);
+  const pending = background.handle({ type: 'LIMOVA_OPEN_GENERATED_FILE', conversationId: 'conversation-1', fileId: 'file' });
+  await vi.waitFor(() => expect(resolve).toBeDefined());
+  await background.handle({ type: 'LIMOVA_SELECT_WORKSPACE', workspaceId: 'workspace-1' });
+  resolve({ url: 'https://files.example/obsolete' });
+  await expect(pending).rejects.toThrow('session');
+  expect(openFile).not.toHaveBeenCalled();
+});

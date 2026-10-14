@@ -208,6 +208,15 @@ export function createLimovaPanel({ document, request, render, onBusy, onContext
   listen('limovaNew', 'click', create);
   listen('limovaCancel', 'click', () => { onContextChange(); return call('LIMOVA_CANCEL'); });
   return { refresh, send, create, handle,
+    async openGeneratedFile(fileId) {
+      if (!context || !conversationId) return;
+      const current = generation;
+      feedback('Ouverture du fichier…');
+      try {
+        await call('LIMOVA_OPEN_GENERATED_FILE', { conversationId, fileId });
+        if (current === generation) feedback('');
+      } catch (error) { if (current === generation) feedback(error.message); }
+    },
     setVoiceBusy(active) { voiceBusy = active; setBusy(Boolean(turnId) || sending); },
     prepareTranscription() {
       if (!context || busy) throw new Error('Sélectionne un espace Limova disponible.');
