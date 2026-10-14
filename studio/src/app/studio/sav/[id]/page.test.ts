@@ -24,8 +24,9 @@ vi.mock("@/lib/sav/observations", () => ({getSavObservations:dependencies.observ
 vi.mock("@/lib/sav/drafts", () => ({ getSavReplyDrafts: dependencies.drafts }));
 vi.mock("@/lib/sav/thread-context", () => ({ getSavRelatedThreads: dependencies.related }));
 vi.mock("@/lib/sav/config", () => ({ savReleaseStage: dependencies.stage, savAutomationMode: () => "assist" }));
-vi.mock("next/navigation", () => ({ notFound: dependencies.notFound }));
+vi.mock("next/navigation", () => ({ notFound: dependencies.notFound, useRouter: () => ({ refresh: vi.fn() }) }));
 vi.mock("next/link", () => ({ default: (props: ComponentProps<"a">) => createElement("a", props) }));
+vi.mock("../ticket-preview-actions", () => ({ prepareTicketPreviewAction: vi.fn(), confirmTicketPreviewAction: vi.fn() }));
 vi.mock("../actions", () => dependencies.actions);
 
 import SavThreadPage from "./page";
@@ -286,7 +287,7 @@ describe("SAV dossier SSR and human-review guardrails", () => {
     const review = reviewFixture();
     review.proposal.routing = { kind: "matched", reason: "exact_subject", contactId: "456", ticketId: "789" };
     dependencies.review.mockResolvedValue(review);
-    const ticketCard = sectionWithHeading(aside(await renderPage()), "Ticket lié");
+    const ticketCard = sectionWithHeading(aside(await renderPage()), "Ticket réellement lié");
     expect(ticketCard).toContain("Aucun ticket lié à ce dossier.");
     expect(ticketCard).toContain("Correspondance proposée");
     expect(ticketCard).toContain("Rattachement manuel à confirmer");
@@ -300,7 +301,7 @@ describe("SAV dossier SSR and human-review guardrails", () => {
     dependencies.detail.mockResolvedValue(detail);
     dependencies.review.mockResolvedValue(reviewFixture(true));
     const html = await renderPage();
-    const ticketCard = sectionWithHeading(aside(html), "Ticket lié");
+    const ticketCard = sectionWithHeading(aside(html), "Ticket réellement lié");
     expect(ticketCard).toContain("Ticket #987");
     expect(ticketCard).not.toContain("Correspondance proposée");
     expect(buttonAttributes(html, "Ouvrir un nouveau ticket")).toEqual([]);
@@ -330,8 +331,8 @@ describe("SAV dossier SSR and human-review guardrails", () => {
     dependencies.detail.mockResolvedValue(detail);
     dependencies.review.mockResolvedValue(reviewFixture(true));
     const html = await renderPage();
-    expect(buttonAttributes(aside(html), "Ouvrir un nouveau ticket")).toEqual([expect.stringContaining('disabled=""')]);
-    expect(html).toContain("Création bloquée");
+    expect(buttonAttributes(aside(html), "Préparer l’aperçu de l’action")).toEqual([expect.stringContaining('disabled=""')]);
+    expect(html).toContain("Résultat HubSpot incertain");
     expect(html).not.toContain("Confirmer le rattachement");
   });
 
@@ -341,7 +342,8 @@ describe("SAV dossier SSR and human-review guardrails", () => {
     dependencies.detail.mockResolvedValue(detail);
     dependencies.review.mockResolvedValue(reviewFixture(true));
     const html = await renderPage();
-    expect(buttonAttributes(aside(html), "Demande HubSpot en attente")).toEqual([expect.stringContaining('disabled=""')]);
+    expect(buttonAttributes(aside(html), "Préparer l’aperçu de l’action")).toEqual([expect.stringContaining('disabled=""')]);
+    expect(html).toContain("Demande HubSpot en attente de confirmation");
     expect(buttonAttributes(html, "Ouvrir un nouveau ticket")).toEqual([]);
     expect(html).not.toContain("Confirmer le rattachement");
   });
@@ -352,10 +354,12 @@ describe("SAV dossier SSR and human-review guardrails", () => {
     dependencies.review.mockResolvedValue(reviewFixture(true));
     const html = await renderPage();
     expect(buttonAttributes(html, "Demande HubSpot en attente")).toHaveLength(0);
-    expect(buttonAttributes(html, "Ouvrir un nouveau ticket")[0]).not.toContain("disabled");
+    expect(html).not.toContain("Demande HubSpot en attente de confirmation");
+    expect(buttonAttributes(html, "Préparer l’aperçu de l’action")).toHaveLength(1);
+    expect(html).toContain("Le contexte HubSpot est indisponible ou incomplet");
     dependencies.review.mockResolvedValue(reviewFixture(false));
     const unreviewed = await renderPage();
-    expect(buttonAttributes(unreviewed, "Ouvrir un nouveau ticket")[0]).toContain("disabled");
+    expect(buttonAttributes(unreviewed, "Préparer l’aperçu de l’action")[0]).toContain("disabled");
     expect(unreviewed).toContain("Validez d’abord le dossier / process");
   });
 
@@ -372,7 +376,7 @@ describe("SAV dossier SSR and human-review guardrails", () => {
     expect(html).not.toContain("Valider le dossier / process");
     expect(html).not.toContain("Refuser le process");
     expect(html).not.toContain("Approuver et mettre en file d’envoi");
-    expect(buttonAttributes(html, "Ouvrir un nouveau ticket")).toEqual([expect.stringContaining('disabled=""')]);
+    expect(buttonAttributes(html, "Préparer l’aperçu de l’action")).toEqual([expect.stringContaining('disabled=""')]);
   });
 });
 
@@ -385,7 +389,7 @@ it.each(["2026-01-02T12:00:00Z", null, "invalid"])("shows the real ticket creati
       routing: { kind: "new", reason: "distinct_issue", candidateIds: [] } } },
     conversation: null, conversationError: null, otherConversations: [], otherConversationsError: null };
   dependencies.detail.mockResolvedValue(detail);
-  const html = sectionWithHeading(await renderPage(), "Ticket lié");
+  const html = sectionWithHeading(await renderPage(), "Ticket réellement lié");
   expect(html).toContain(createdAt && createdAt !== "invalid" ? "02/01/2026 13:00" : "Date indisponible");
   expect(html).not.toContain("02/10/2026");
 });
@@ -400,8 +404,10 @@ it.each(["1", "2", "3"])("uses the saved semantic match for the generic-subject 
     conversation: null, conversationError: null, otherConversations: [], otherConversationsError: null };
   dependencies.detail.mockResolvedValue(detail); dependencies.review.mockResolvedValue(reviewFixture(true));
   const html = await renderPage();
-  expect(html).toContain(`name="returnOperation" value="${stageId === "1" ? "keep" : "reactivate"}"`);
-  expect(html).toContain('name="ticketId" value="401"');
+  expect(html).toContain('type="radio"');
+  expect(html).toMatch(/checked="" value="401"/);
+  expect(buttonAttributes(html, "Préparer l’aperçu de l’action")[0]).not.toContain("disabled");
+  expect(html).not.toContain("Confirmation explicite");
   expect(aside(html)).not.toContain("Créer un ticket HubSpot");
 });
 
@@ -424,7 +430,8 @@ it("shows the original customer and the same forwarded return CTA as the backend
   expect(html).toContain("Une réponse Gmail restera adressée à ce collègue");
   expect(html).toContain("Fiche reconnue pour le client transféré alice@example.com");
   expect(html).not.toContain("Fiche reconnue pour l’expéditeur colleague@limova.ai");
-  expect(html).toContain('name="returnOperation" value="reactivate"');
+  expect(html).toMatch(/checked="" value="401"/);
+  expect(html).toContain("Préparer l’aperçu de l’action");
   expect(dependencies.related).not.toHaveBeenCalled();
   expect(detail.messages[0].fromEmail).toBe("colleague@limova.ai");
 });
@@ -441,7 +448,7 @@ it("does not offer to reopen a matching ticket after a reviewed no-ticket correc
   const html = await renderPage();
   expect(buttonAttributes(html, "Repasser en Nouveau")).toHaveLength(0);
   expect(html).not.toContain('name="returnOperation"');
-  expect(html).toContain("La décision validée ne demande aucune action sur ce ticket.");
+  expect(html).toContain("La décision validée ne demande aucune action sur un ticket.");
 });
 
 it.each([false, true])("does not expose the colleague's old CRM/history for a forward (ambiguous=%s)", async ambiguous => {
@@ -458,6 +465,6 @@ it.each([false, true])("does not expose the colleague's old CRM/history for a fo
   expect(html).toContain("Actualiser le contexte client");
   expect(html).not.toContain("Ouvrir la fiche #999");
   expect(html).not.toContain("HISTORIQUE_COLLEGUE");
-  expect(buttonAttributes(html, "Ouvrir un nouveau ticket")).toEqual([expect.stringContaining('disabled=""')]);
+  expect(buttonAttributes(html, "Préparer l’aperçu de l’action")).toEqual([expect.stringContaining('disabled=""')]);
   expect(dependencies.related).not.toHaveBeenCalled();
 });

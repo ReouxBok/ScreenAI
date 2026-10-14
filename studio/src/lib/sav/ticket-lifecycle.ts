@@ -35,7 +35,7 @@ export function sortSavTicketsNewestFirst<T extends { id: string; createdAt?: st
 
 export const savTicketReturnLabels: Record<SavTicketReturnOperation, string> = {
   keep: "Rattacher sans modifier le ticket Nouveau",
-  reactivate: "Remettre en Nouveau et ajouter l’email en note",
+  reactivate: "Remettre en Nouveau et ajouter une note de retour",
   create: "Créer un nouveau ticket (clôture de plus de 15 jours)",
   review: "Vérifier la clôture ou le statut dans HubSpot",
 };

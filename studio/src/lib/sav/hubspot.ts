@@ -1,4 +1,5 @@
 import "server-only";
+import { SAV_TICKET_RETURN_NOTE_VERSION, savTicketReturnNote } from "./ticket-return-note";
 
 import { createHmac, timingSafeEqual } from "node:crypto";
 import { and, asc, desc, eq, inArray, isNull, lt, lte, or, sql } from "drizzle-orm";
@@ -265,7 +266,11 @@ function escapeSavNoteHtml(value: string) {
  * they are never replayed as another note. Every write retains the live V0 authorization guard. */
 async function reactivateSavTicketForReturn(action: typeof savActions.$inferSelect, ticketId: string, contactId: string, expectedStage: string | null | undefined, expectedClosedAt: string | null | undefined, expectedOwnerId: string, message: typeof savMessages.$inferSelect, mailboxEmail: string, gmailThreadId: string, replacesClosedTicketId?: string) {
   const body = decryptSavPayload<SavMessageBody>(message.bodyCiphertext);
-  const note = `Le client est revenu sur le même sujet. Retour reçu le ${message.receivedAt.toISOString()}.\nDe : ${message.fromEmail}\nObjet : ${message.subject}\nEmail source : ${message.gmailMessageId}\n\n${body.text}`;
+  const noteVersion = action.payload.ticketReturnNoteVersion ?? 1;
+  if (noteVersion !== 1 && noteVersion !== SAV_TICKET_RETURN_NOTE_VERSION) throw new Error("SAV_TICKET_RETURN_NOTE_VERSION_INVALID");
+  const note = noteVersion === SAV_TICKET_RETURN_NOTE_VERSION
+    ? savTicketReturnNote(expectedStage === SAV_HUBSPOT_SUPPORT.stages.closed ? "closed" : "open")
+    : `Le client est revenu sur le même sujet. Retour reçu le ${message.receivedAt.toISOString()}.\nDe : ${message.fromEmail}\nObjet : ${message.subject}\nEmail source : ${message.gmailMessageId}\n\n${body.text}`;
   const html = `<p>${escapeSavNoteHtml(note).replace(/\n/g, "<br>")}</p>`;
   if (html.length > 60_000) throw new Error("SAV_TICKET_RETURN_EMAIL_TOO_LARGE");
   const checkTarget = async () => {
@@ -289,7 +294,7 @@ async function reactivateSavTicketForReturn(action: typeof savActions.$inferSele
   await assertSavGmailThreadCurrent(mailboxEmail, gmailThreadId, message.gmailMessageId!);
   await assertSavWriteAllowed(action.id);
   const db = requireDb();
-  const [claimed] = await db.update(savActions).set({ payload: sql`${savActions.payload} || ${JSON.stringify({ ticketReturnDispatchedAt: new Date().toISOString(), ticketReturnRequestCiphertext: encryptSavPayload({ ticketId, contactId, html, expectedOwnerId, replacesClosedTicketId }) })}::jsonb`, updatedAt: new Date() })
+  const [claimed] = await db.update(savActions).set({ payload: sql`${savActions.payload} || ${JSON.stringify({ ticketReturnDispatchedAt: new Date().toISOString(), ticketReturnRequestCiphertext: encryptSavPayload({ ticketId, contactId, html, expectedOwnerId, replacesClosedTicketId, noteVersion: action.payload.ticketReturnNoteVersion ?? 1, sourceMessageId: message.id }) })}::jsonb`, updatedAt: new Date() })
     .where(and(eq(savActions.id, action.id), eq(savActions.status, "running"), sql`${savActions.payload}->>'ticketReturnDispatchedAt' is null`)).returning();
   if (!claimed) throw new Error("SAV_TICKET_RETURN_RECONCILIATION_REQUIRED");
   let noteAcknowledged = false;
@@ -344,6 +349,10 @@ async function finalizeSavV0TicketAction(action: typeof savActions.$inferSelect)
     const context = await readSavHubspotContext({ email: customerEmail, subject: customerMessage.subject, body: customerMessage.body, returnedAt: latest.receivedAt,
       currentTicketId: customerIdentity.kind === "sender" && thread.customerEmail.toLowerCase() === customerEmail.toLowerCase() ? thread.hubspotTicketId : undefined });
     if (!context.contactId) throw new Error("SAV_HUBSPOT_CONTACT_REQUIRED");
+    const previewDetails = typeof action.payload.ticketPreviewSnapshotCiphertext === "string"
+      ? decryptSavPayload<{ contactId: string; targetId: string | null; targetTitle: string | null }>(action.payload.ticketPreviewSnapshotCiphertext) : null;
+    if (previewDetails && (context.contactId !== previewDetails.contactId
+      || previewDetails.targetId && context.tickets.find(ticket => ticket.id === previewDetails.targetId)?.subject !== previewDetails.targetTitle)) throw new Error("SAV_TICKET_PREVIEW_CHANGED");
     const returnTarget = returnRequest ? context.tickets.find(value => value.id === returnRequest.ticketId) : null;
     if (returnRequest && (!returnTarget || context.routing.kind !== "matched" || context.routing.ticketId !== returnTarget.id
       || returnTarget.stageId !== returnRequest.stageId || returnTarget.closedAt !== returnRequest.closedAt

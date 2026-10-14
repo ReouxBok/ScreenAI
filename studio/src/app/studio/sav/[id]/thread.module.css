@@ -226,3 +226,8 @@
   .rail.rail { grid-template-columns: minmax(0, 1fr); }
   .context, .actions, .mail, .audit { padding: 18px; }
 }
+
+.historyExpanded { max-height: min(65vh, 640px); overflow-y: auto; overscroll-behavior-y: contain; scrollbar-gutter: stable; padding-right: 8px; }
+.historyExpanded:focus-visible { outline: 2px solid var(--ink); outline-offset: 4px; }
+.conversationWarning { padding: 12px; border: 1px solid var(--line); border-left: 3px solid #f4b942; border-radius: 8px; font-size: 13px; line-height: 1.6; }
+@media (max-width: 760px) { .historyExpanded { max-height: 65svh; } }

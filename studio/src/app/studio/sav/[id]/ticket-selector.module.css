@@ -1,0 +1,21 @@
+.selector { display: grid; gap: 14px; min-width: 0; }
+.selector h3, .selector p { margin: 0; }
+.selector label { display: grid; gap: 7px; font-size: 12px; }
+.selector fieldset { border: 0; padding: 0; margin: 0; min-width: 0; }
+.selector legend { font-size: 12px; font-weight: 700; margin-bottom: 8px; }
+.selector input[type="search"], .selector textarea { width: 100%; min-width: 0; border: 1px solid var(--line); border-radius: 9px; padding: 10px; font: inherit; background: var(--surface); }
+.options { max-height: 310px; overflow-y: auto; overscroll-behavior-y: contain; display: grid; gap: 7px; }
+.selector .option { display: flex; align-items: flex-start; gap: 9px; padding: 12px; border: 1px solid var(--line); border-radius: 9px; cursor: pointer; margin: 4px 0; }
+.selector .option:has(input:checked) { border-color: var(--ink); background: #f3f5f4; }
+.selector .option input[type="radio"] { width: 15px; min-width: 15px; height: 15px; margin: 3px 0 0; accent-color: var(--ink); }
+.option span { display: grid; gap: 4px; min-width: 0; }
+.option strong { font-size: 13px; line-height: 1.5; }
+.option small, .hint { font-size: 11px; line-height: 1.5; color: var(--muted); }
+.preview { padding: 15px; background: #f3f5f4; border: 1px solid var(--line); border-radius: 12px; display: grid; gap: 12px; }
+.preview h3 { line-height: 1.5; font-size: 16px; }
+.preview blockquote { margin: 0; padding: 10px 12px; background: white; border-left: 3px solid #f4b942; font-size: 13px; line-height: 1.6; }
+.preview dl { margin: 0; display: grid; gap: 4px; font-size: 12px; }
+.preview dt { color: var(--muted); } .preview dd { margin: 0 0 8px; }
+.description { white-space: pre-wrap; overflow-wrap: anywhere; }
+.error { padding: 12px; border: 1px solid #e96659; border-radius: 9px; color: #8e2f27; }
+.selector button { white-space: normal; }

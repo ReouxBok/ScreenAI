@@ -2,7 +2,7 @@
 
 import { useId, useState } from "react";
 import { formatParisDateTime } from "@/lib/paris-date";
-import { splitSavMessageText } from "@/lib/sav/message-context";
+import { savMailDisplay } from "@/lib/sav/mail-display";
 import type { getSavThreadDetail } from "@/lib/sav/service";
 import styles from "./thread.module.css";
 
@@ -23,17 +23,19 @@ export function MailConversation({ messages }: { messages: Messages }) {
   const conversationId = useId();
   const newestFirst = [...messages].sort((a, b) => b.receivedAt.getTime() - a.receivedAt.getTime() || b.createdAt.getTime() - a.createdAt.getTime() || b.id.localeCompare(a.id));
   const latestInbound = newestFirst.find((message) => message.direction === "inbound");
-  const currentText = latestInbound ? splitSavMessageText(latestInbound.body.text).currentText : "";
+  const display = latestInbound ? savMailDisplay(latestInbound.body.text) : null;
+  const currentText = display?.text ?? "";
   // Display-only extraction: the expanded view always uses the complete original
   // body, including text beyond the analysis splitter's limit and attachments.
-  const canExpand = (!latestInbound && messages.length > 0) || messages.length > 1 || Boolean(latestInbound && currentText !== latestInbound.body.text.trim());
+  const canExpand = (!latestInbound && messages.length > 0) || messages.length > 1 || Boolean(display?.ambiguous || latestInbound && currentText !== latestInbound.body.text.trim());
   const visibleMessages = latestInbound ? [latestInbound, ...newestFirst.filter(message => message.id !== latestInbound.id)] : newestFirst;
   return <section className={`card ${styles.mail}`} aria-labelledby="customer-mail-title">
     <div className={styles.mailHeading}><div><span className="eyebrow">Demande du client</span><h2 id="customer-mail-title">Dernier email reçu</h2></div><span>{messages.length} message{messages.length > 1 ? "s" : ""}</span></div>
-    {canExpand && <button className={`secondary ${styles.conversationToggle}`} type="button" aria-expanded={expanded} aria-controls={conversationId} onClick={() => setExpanded(value => !value)}>{expanded ? "Réduire la conversation" : "Afficher toute la conversation"}</button>}
-    <div id={conversationId} className={styles.historyMessages}>
+    {canExpand && <button className={`secondary ${styles.conversationToggle}`} type="button" aria-expanded={expanded} aria-controls={conversationId} onClick={() => setExpanded(value => !value)}>{expanded ? "Réduire la conversation" : `Afficher toute la conversation (${messages.length} message${messages.length > 1 ? "s" : ""})`}</button>}
+    {!expanded && display?.warning && <p className={styles.conversationWarning} role="status">{display.warning}</p>}
+    <div id={conversationId} className={`${styles.historyMessages} ${expanded ? styles.historyExpanded : ""}`} tabIndex={expanded ? 0 : undefined} role={expanded ? "region" : undefined} aria-label={expanded ? "Conversation complète avec défilement" : undefined}>
       {expanded ? visibleMessages.map(message => <EmailMessage key={message.id} message={message}/>) : latestInbound ? <EmailMessage message={latestInbound} text={currentText || "Cet email contient uniquement un historique cité ou une signature. Affichez toute la conversation pour le consulter."}/> : <p>Aucun email entrant dans cette conversation.</p>}
     </div>
-    {!expanded && canExpand && <p className={styles.conversationHint}>Les anciens messages, les citations et la signature sont repliés. Le texte intégral reste disponible.</p>}
+    {!expanded && canExpand && !display?.ambiguous && <p className={styles.conversationHint}>Les anciens messages, les citations détectées et la signature sont repliés. L’extraction est automatique : le texte intégral reste disponible si une réponse est intercalée.</p>}
   </section>;
 }

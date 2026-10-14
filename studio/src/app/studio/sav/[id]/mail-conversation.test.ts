@@ -87,3 +87,15 @@ describe("Customer mail before SAV proposal", () => {
     expect(html).toContain("Afficher toute la conversation");
   });
 });
+
+
+describe("SAV55 ambiguous display", () => {
+  it("keeps the original forwarded request visible with an explicit limitation", () => {
+    const html = render([message("forward", "inbound", "Pour le support\n---------- Forwarded message ---------\nFrom: customer@example.invalid\nSubject: Téléphonie\n\nDEMANDE_ORIGINALE")]);
+    expect(html).toContain("DEMANDE_ORIGINALE"); expect(html).toContain("transfert ou des réponses intercalées");
+  });
+  it("does not hide current replies interleaved after quoted headers", () => {
+    const html = render([message("interleaved", "inbound", "Voici mes réponses\nLe 12 octobre, Support a écrit :\n> Quelle erreur ?\nERREUR_ACTUELLE\n> Quel compte ?\nCOMPTE_ACTUEL")]);
+    expect(html).toContain("ERREUR_ACTUELLE"); expect(html).toContain("COMPTE_ACTUEL");
+  });
+});

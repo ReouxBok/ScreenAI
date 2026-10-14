@@ -21,9 +21,13 @@ test("le dernier email reçu est seul visible puis la conversation entière remp
   await expect(mail).not.toContainText("Signature synthétique à replier");
   await expect(mail).not.toContainText("Ancien email entrant conservé intégralement.");
   await expect(mail).not.toContainText("Réponse sortante plus récente, masquée au départ.");
-  await expect(mail.getByRole("button", { name: "Afficher toute la conversation", exact: true })).toHaveAttribute("aria-expanded", "false");
-  await mail.getByRole("button", { name: "Afficher toute la conversation", exact: true }).click();
+  await expect(mail.getByRole("button", { name: /^Afficher toute la conversation/ })).toHaveAttribute("aria-expanded", "false");
+  await mail.getByRole("button", { name: /^Afficher toute la conversation/ }).click();
   await expect(mail.locator("article")).toHaveCount(3);
+  const history = mail.getByRole("region", { name: "Conversation complète avec défilement", exact: true });
+  await expect(history).toHaveAttribute("tabindex", "0");
+  await expect(history).toHaveCSS("overflow-y", "auto");
+  expect(await history.evaluate(element => Number.parseFloat(getComputedStyle(element).maxHeight))).toBeLessThanOrEqual(640);
   await expect(mail.locator("pre").nth(0)).toHaveText(SAV53_BODY);
   await expect(mail.locator("pre").nth(1)).toHaveText("Réponse sortante plus récente, masquée au départ.");
   await expect(mail.locator("pre").nth(2)).toHaveText("Ancien email entrant conservé intégralement.");
@@ -42,13 +46,13 @@ test("un email unique avec citation peut être développé, un email sans citati
   await page.goto(`/studio/sav/${SAV53_THREADS.singleQuoted}`);
   let mail = page.getByRole("region", { name: "Dernier email reçu", exact: true });
   await expect(mail.locator("pre")).toHaveText(SAV53_CURRENT);
-  await mail.getByRole("button", { name: "Afficher toute la conversation", exact: true }).click();
+  await mail.getByRole("button", { name: /^Afficher toute la conversation/ }).click();
   await expect(mail.locator("pre")).toHaveText(SAV53_BODY);
   await expect(mail.locator("article")).toHaveCount(1);
   await page.goto(`/studio/sav/${SAV53_THREADS.singlePlain}`);
   mail = page.getByRole("region", { name: "Dernier email reçu", exact: true });
   await expect(mail.locator("pre")).toHaveText(SAV53_CURRENT);
-  await expect(mail.getByRole("button", { name: "Afficher toute la conversation", exact: true })).toHaveCount(0);
+  await expect(mail.getByRole("button", { name: /^Afficher toute la conversation/ })).toHaveCount(0);
 });
 
 for (const scenario of [
@@ -57,23 +61,24 @@ for (const scenario of [
   { key: "successor", label: "Ouvrir un nouveau ticket", explanation: "fermé depuis plus de 15 jours" },
   { key: "alreadyNew", label: "Rattacher le ticket", explanation: "Ce ticket est déjà en Nouveau." },
 ] as const) {
-  test(`${scenario.key} : action adaptée et nom du ticket dans le bouton après validation locale`, async ({ page }) => {
+  test(`${scenario.key} : sélection nommée et aperçu séparé après validation locale`, async ({ page }) => {
     await page.goto(`/studio/sav/${SAV53_THREADS[scenario.key]}`);
     const rail = page.getByRole("complementary", { name: "Contexte client et actions", exact: true });
-    await expect(rail.getByRole("heading", { name: scenario.label, exact: true })).toBeVisible();
-    await expect(rail).toContainText(scenario.explanation);
-    await expect(rail.getByRole("button", { name: new RegExp(`^${scenario.label}`) })).toHaveCount(0);
+    const selected = rail.getByRole("radio", { name: new RegExp(SAV53_TICKET_TITLE) });
+    await expect(selected).toBeChecked();
+    const prepare = rail.getByRole("button", { name: "Préparer l’aperçu de l’action", exact: true });
+    await expect(prepare).toBeDisabled();
+    await expect(rail.getByRole("region", { name: "Aperçu de l’action HubSpot", exact: true })).toHaveCount(0);
     await page.getByRole("region", { name: "Proposition de l’IA", exact: true }).getByRole("button", { name: "Valider le dossier / process", exact: true }).click();
-    // The server action redirects only once the local review has committed.
     await page.waitForURL(/\?review=saved$/, { timeout: 30_000 });
     await expect(page.getByRole("region", { name: "Proposition de l’IA", exact: true })).toContainText("Process validé par ugo@limova.ai");
-    const button = rail.getByRole("button", { name: `${scenario.label} ${SAV53_TICKET_TITLE}`, exact: true });
-    await expect(button).toBeVisible();
-    await expect(button).toBeEnabled();
-    await expect(button.locator("small")).toHaveText(SAV53_TICKET_TITLE);
-    // Do not queue a HubSpot action. The test validates presentation and internal review only.
+    await expect(prepare).toBeEnabled();
+    await expect(selected).toBeChecked();
+    // Selecting a target never queues an action. Fresh CRM checks are tested
+    // with synthetic responses in the isolated DB combination suite.
+    await expect(rail.locator('input[name="ticketId"]')).toHaveCount(0);
     await page.reload();
-    await expect(button).toBeVisible();
+    await expect(prepare).toBeEnabled();
     await expect(rail).toContainText("Écritures HubSpot désactivées");
   });
 }
