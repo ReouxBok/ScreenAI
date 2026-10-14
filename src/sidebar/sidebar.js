@@ -268,16 +268,32 @@ function renderLimovaConversation(snapshot, { showOlder = false } = {}) {
   lastMessageSender = null;
   hidePondering();
   if (snapshot.messages.length || snapshot.files.length) hideWelcomeScreen();
-  snapshot.messages.forEach(message => addMessage(message.role, message.content, { skipScroll: true, nextStep: false }));
-  snapshot.files.forEach(file => {
+  const shownFiles = new Set();
+  function appendFile(file) {
+    if (shownFiles.has(file.id)) return;
+    shownFiles.add(file.id);
     const link = document.createElement('a');
     link.href = file.url;
     link.textContent = file.name;
     link.target = '_blank';
     link.rel = 'noopener noreferrer';
+    link.referrerPolicy = 'no-referrer';
     link.className = 'message generated-file';
+    link.dataset.fileId = file.id;
     elements.chatContainer.append(link);
+  }
+  snapshot.messages.forEach(message => {
+    if (message.content) addMessage(message.role, message.content, { skipScroll: true, nextStep: false });
+    if (message.caption) {
+      const caption = document.createElement('blockquote');
+      caption.className = 'message generated-caption';
+      caption.textContent = message.caption;
+      caption.setAttribute('aria-label', 'Légende générée');
+      elements.chatContainer.append(caption);
+    }
+    snapshot.files.filter(file => file.messageId === message.id).forEach(appendFile);
   });
+  snapshot.files.filter(file => !shownFiles.has(file.id)).forEach(appendFile);
   if (snapshot.error) addMessage('error', snapshot.error, { skipScroll: showOlder });
   if (showOlder) elements.chatContainer.scrollTop = 0;
   else scrollToBottom();

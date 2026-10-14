@@ -43,3 +43,41 @@ describe('Deep Agent conversation projection', () => {
     expect(view.snapshot().error).not.toContain('secret');
   });
 });
+
+
+it('restores video, carousel and caption-only answers with their message ownership', () => {
+  const view = createConversationView();
+  const file = (fileId, fileName, mimeType = 'image/png') => ({ fileId, fileName, mimeType, fileUrl: `https://files.example/${fileId}` });
+  view.event({ event: 'custom', data: { type: 'deep_agent_generated_files', files: [file('slide2', 'Second'), file('slide1', 'First')] } });
+  view.history({ data: [
+    { id: 'video-answer', role: 'assistant', content: '', generatedVideos: [file('video', 'Demo.mp4', 'video/mp4')] },
+    { id: 'social-answer', role: 'assistant', content: '', generatedCaption: { text: '<script>not executable</script>', platform: 'linkedin' },
+      generatedCarousel: { slides: [file('slide1', 'First'), file('slide2', 'Second')] } },
+  ] });
+  const result = view.snapshot();
+  expect(result.messages.map(message => message.id)).toEqual(['video-answer', 'social-answer']);
+  expect(result.messages[1].caption).toBe('<script>not executable</script>');
+  expect(result.files.filter(file => file.messageId === 'social-answer').map(file => file.id)).toEqual(['slide1', 'slide2']);
+  expect(result.files.find(file => file.id === 'video')).toMatchObject({ messageId: 'video-answer', mimeType: 'video/mp4' });
+  view.reset();
+  expect(view.snapshot()).toEqual({ messages: [], files: [], error: null });
+});
+
+it('refreshes file URLs without losing their message anchor on a subsequent stream event', () => {
+  const view = createConversationView();
+  const file = { fileId: 'f', fileName: 'Report', mimeType: 'application/pdf', fileUrl: 'https://files.example/old' };
+  view.history({ data: [{ id: 'a', role: 'assistant', content: 'Report', generatedFiles: [file] }] });
+  view.event({ event: 'custom', data: { type: 'deep_agent_generated_files', files: [{ ...file, fileUrl: 'https://files.example/new' }] } });
+  expect(view.snapshot().files).toEqual([{ id: 'f', name: 'Report', mimeType: 'application/pdf', url: 'https://files.example/new', messageId: 'a' }]);
+});
+
+it('excludes hidden generated content, tool payloads and unsafe carousel URLs', () => {
+  const view = createConversationView();
+  const file = { fileId: 'bad', fileName: 'Secret', mimeType: 'video/mp4', fileUrl: 'https://files.example/private' };
+  view.history({ data: [
+    { id: 'hidden', role: 'assistant', toShow: false, generatedVideos: [file], generatedCaption: { text: 'secret' } },
+    { id: 'tool', role: 'tool', generatedCarousel: { slides: [file] } },
+    { id: 'visible', role: 'assistant', content: '', generatedCarousel: { slides: [{ ...file, fileUrl: 'javascript:alert(1)' }] } },
+  ] });
+  expect(view.snapshot()).toEqual({ messages: [], files: [], error: null });
+});

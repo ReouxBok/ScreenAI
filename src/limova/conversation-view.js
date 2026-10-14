@@ -28,13 +28,17 @@ export function createConversationView() {
   const messages = new Map();
   const files = new Map();
   const sealed = new Set();
+  const captions = new Map();
   let error = null;
 
-  function addFiles(items) {
+  function addFiles(items, messageId, reorder = false) {
     if (!Array.isArray(items)) return;
     items.forEach(item => {
       const file = visibleFile(item);
-      if (file) files.set(file.id, file);
+      if (!file) return;
+      const owner = messageId ?? files.get(file.id)?.messageId;
+      if (reorder) files.delete(file.id);
+      files.set(file.id, { ...file, ...(owner ? { messageId: owner } : {}) });
     });
   }
 
@@ -44,7 +48,7 @@ export function createConversationView() {
   }
 
   return {
-    reset() { messages.clear(); files.clear(); sealed.clear(); error = null; },
+    reset() { messages.clear(); files.clear(); sealed.clear(); captions.clear(); error = null; },
     history(page, { prepend = false } = {}) {
       const recent = prepend ? [...messages.entries()] : null;
       if (prepend) messages.clear();
@@ -52,8 +56,15 @@ export function createConversationView() {
       items.forEach(message => {
         replace(message);
         if (message.toShow === false || !visibleMessage(message)) return;
-        addFiles(message.generatedFiles);
-        addFiles(message.generatedImages);
+        addFiles(message.generatedFiles, message.id);
+        addFiles(message.generatedImages, message.id);
+        addFiles(message.generatedVideos, message.id);
+        addFiles(message.generatedCarousel?.slides, message.id, true);
+        if (Object.hasOwn(message, 'generatedCaption')) {
+          if (typeof message.generatedCaption?.text === 'string' && message.generatedCaption.text.trim())
+            captions.set(message.id, message.generatedCaption.text);
+          else captions.delete(message.id);
+        }
       });
       if (recent) recent.forEach(([id, message]) => messages.set(id, message));
       addFiles(page?.unanchoredGeneratedFiles);
@@ -81,7 +92,11 @@ export function createConversationView() {
       }
     },
     snapshot() {
-      return { messages: [...messages.values()].filter(message => message.content), files: [...files.values()], error };
+      const attached = new Set([...files.values()].map(file => file.messageId));
+      return { messages: [...messages.values()]
+        .filter(message => message.content || captions.has(message.id) || attached.has(message.id))
+        .map(message => captions.has(message.id) ? { ...message, caption: captions.get(message.id) } : message),
+        files: [...files.values()], error };
     },
   };
 }
