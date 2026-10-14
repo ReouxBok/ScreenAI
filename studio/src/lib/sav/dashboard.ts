@@ -72,13 +72,14 @@ export async function listSavDossierDashboard(options: { view?: string; query?: 
         .orderBy(options.sort === "oldest" ? asc(savMessages.receivedAt) : desc(savMessages.receivedAt), options.sort === "oldest" ? asc(savMessages.id) : desc(savMessages.id)).limit(250).offset(offset);
       if (!batch.length) break;
       const ids = batch.map(r => r.message.id), threads = batch.map(r => r.thread.id);
+      const unrecordedIds = batch.filter(row => !row.message.studioOpenedAt).map(row => row.message.id);
       const [actions, observations, verdicts, openingProofs] = await Promise.all([
         db.select().from(savActions).where(inArray(savActions.threadId, threads)).orderBy(desc(savActions.createdAt), desc(savActions.id)),
         db.select().from(savResolutionObservations).where(inArray(savResolutionObservations.threadId, threads)),
         db.select().from(savDraftVerdicts).where(and(inArray(savDraftVerdicts.messageId, ids), eq(savDraftVerdicts.isCurrent, true))),
         // Legacy writers can still emit an opening audit during a rolling
         // deployment after the additive migration. Such a proof is not unread.
-        db.select({ messageId: auditLogs.entityId }).from(auditLogs).where(and(inArray(auditLogs.entityId, ids), eq(auditLogs.entityType, "sav_message"), inArray(auditLogs.action, ["sav_email_opened", "sav_dossier_opened"]))),
+        unrecordedIds.length ? db.select({ messageId: auditLogs.entityId }).from(auditLogs).where(and(inArray(auditLogs.entityId, unrecordedIds), eq(auditLogs.entityType, "sav_message"), inArray(auditLogs.action, ["sav_email_opened", "sav_dossier_opened"]))) : Promise.resolve([]),
       ]);
       const cycles = observations.length ? await db.select().from(savObservationCycles).where(inArray(savObservationCycles.observationId, observations.map(o => o.id))) : [];
       const candidateIds = cycles.flatMap(c => c.candidateId ? [c.candidateId] : []);
