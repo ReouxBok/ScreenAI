@@ -7,7 +7,7 @@ export const knowledgeStateLabels: Record<string, string> = {
   approved: "Validée · à publier", awaiting_publication: "Validée · à publier", approved_unpublished: "Validée · à publier",
   published: "Publiée · à activer", awaiting_activation: "Publiée · à activer", published_inactive: "Publiée · à activer",
   indexing: "Indexation en cours", index_pending: "Indexation en attente", indexing_pending: "Indexation en attente",
-  index_error: "Indexation en erreur", indexing_error: "Indexation en erreur", rejected: "Écartée", unknown: "À qualifier", learning: "Résolution à transformer",
+  needs_revalidation: "À revalider", unavailable: "Index indisponible", index_error: "Indexation en erreur", indexing_error: "Indexation en erreur", rejected: "Écartée", unknown: "À qualifier", learning: "Résolution à transformer",
 };
 export function knowledgeState(state: string) { return knowledgeStateLabels[state] ?? "État à vérifier"; }
 export function knowledgeDetailUrl(row: Pick<SavKnowledgeRow, "id" | "kind">, from?: string) {

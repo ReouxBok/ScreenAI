@@ -20,7 +20,7 @@ function message(error: unknown) {
 function refresh() { revalidatePath("/studio/sav/connaissances", "layout"); revalidatePath("/studio/contenus"); revalidatePath("/studio/sav"); }
 export async function saveKnowledgeProposalAction(input: Parameters<typeof saveSavKnowledgeProposal>[0]) {
   const staff = await requireSavApiStaff();
-  try { const draft = await saveSavKnowledgeProposal(input, staff.email); refresh(); return { draft, error: null }; }
+  try { const draft = await saveSavKnowledgeProposal(input, staff.email); return { draft, error: null }; }
   catch (error) { return { draft: null, error: message(error) }; }
 }
 export async function previewKnowledgeProposalAction(draftId: string) {

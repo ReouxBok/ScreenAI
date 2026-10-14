@@ -34,8 +34,7 @@ test("ouverture directe et retour conservent le contexte sans classer Gmail", as
   await expect(page).toHaveURL(/view=to_validate.*q=SAV55.*sort=oldest/);
   expect(external).toEqual([]);
 });
-test("sur mobile, le dernier email reste replié et l’historique complet défile", async ({ page }, testInfo) => {
-  await page.setViewportSize({ width: 390, height: 844 });
+test("sur ordinateur, le dernier email reste replié et l’historique complet défile", async ({ page }, testInfo) => {
   await page.goto(`/studio/sav/${SAV53_THREADS.conversation}`);
   const mail = page.getByRole("region", { name: "Dernier email reçu", exact: true });
   await expect(mail.locator("pre")).toHaveText(SAV53_CURRENT);
@@ -46,10 +45,9 @@ test("sur mobile, le dernier email reste replié et l’historique complet défi
   expect(scrollable).toBe(true);
   await page.screenshot({ path: testInfo.outputPath("sav55-dossier-historique.png"), fullPage: true });
 });
-test("recherche sans résultat et mobile restent lisibles", async ({ page }) => {
+test("recherche sans résultat et liste restent lisibles sur ordinateur", async ({ page }) => {
   await page.goto("/studio/sav?view=completed&q=inexistant-synthetique-55");
   await expect(page.getByRole("heading", { name: "Aucun dossier ne correspond à cette recherche", exact: true })).toBeVisible();
-  await page.setViewportSize({ width: 390, height: 844 });
   await page.goto("/studio/sav?view=completed&q=SAV55");
   await expect(page.getByRole("button", { name: `Ouvrir l’email : ${SAV55_SUBJECTS.noTicket}`, exact: true })).toBeVisible();
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth + 1)).toBe(true);

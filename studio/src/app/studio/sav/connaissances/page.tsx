@@ -8,7 +8,7 @@ import { knowledgeDetailUrl, knowledgeErrorMessage, knowledgeState, knowledgeTab
 import styles from "./workspace.module.css";
 
 export const dynamic = "force-dynamic";
-const statuses = { all: "Tous les états", pending: "À valider", draft: "Brouillons internes", needs_completion: "Compléments demandés", approved: "Validées · à publier", published_inactive: "Publiées · à activer", index_error: "Indexation en erreur", rejected: "Écartées" };
+const statuses = { all: "Tous les états", pending: "À valider", draft: "Brouillons internes", needs_completion: "Compléments demandés", approved: "Validées · à publier", published_inactive: "Publiées · à activer", needs_revalidation: "À revalider", unavailable: "Index indisponible", index_error: "Indexation en erreur", rejected: "Écartées" };
 
 export default async function SavKnowledgeLibrary({ searchParams }: { searchParams: Promise<{ tab?: string; q?: string; status?: string; page?: string; candidate?: string; batch?: string; result?: string }> }) {
   await requireSavStaff();
