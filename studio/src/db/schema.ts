@@ -196,6 +196,25 @@ export const knowledgeProjectionCandidates = pgTable("knowledge_projection_candi
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
 }, (table) => [uniqueIndex("knowledge_candidate_revision_target_idx").on(table.revisionId, table.targetSurface)]);
 
+// SAV activation is version-specific; Chrome keeps publishedVersionId unchanged.
+export const savKnowledgeActivations = pgTable("sav_knowledge_activations", {
+  itemId: uuid("item_id").primaryKey().references(() => contentItems.id, { onDelete: "cascade" }),
+  versionId: uuid("version_id").notNull().references(() => contentVersions.id, { onDelete: "restrict" }),
+  title: text("title").notNull(),
+  activatedBy: text("activated_by").notNull(),
+  activatedAt: timestamp("activated_at", { withTimezone: true }).notNull().defaultNow(),
+});
+export const savKnowledgePublicationAttempts = pgTable("sav_knowledge_publication_attempts", {
+  id: uuid("id").defaultRandom().primaryKey(),
+  itemId: uuid("item_id").notNull().references(() => contentItems.id, { onDelete: "cascade" }),
+  versionId: uuid("version_id").notNull().references(() => contentVersions.id, { onDelete: "cascade" }),
+  status: text("status").notNull(),
+  errorCode: text("error_code"),
+  actorEmail: text("actor_email").notNull(),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  completedAt: timestamp("completed_at", { withTimezone: true }),
+}, (table) => [index("sav_knowledge_publication_item_idx").on(table.itemId, table.createdAt)]);
+
 export const contentChunks = pgTable("content_chunks", {
   id: uuid("id").defaultRandom().primaryKey(),
   itemId: uuid("item_id").notNull().references(() => contentItems.id, { onDelete: "cascade" }),
@@ -548,6 +567,8 @@ export const savMessages = sav.table("messages", {
   analysisAttempts: integer("analysis_attempts").notNull().default(0),
   analysisStartedAt: timestamp("analysis_started_at", { withTimezone: true }),
   analysisErrorCode: text("analysis_error_code"),
+  studioOpenedAt: timestamp("studio_opened_at", { withTimezone: true }),
+  studioOpeningTracked: boolean("studio_opening_tracked").notNull().default(true),
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
 }, (table) => [
   uniqueIndex("sav_messages_mailbox_gmail_idx").on(table.mailboxId, table.gmailMessageId),
@@ -853,3 +874,28 @@ export const savLearningCandidates = sav.table("learning_candidates", {
   index("sav_learning_status_created_idx").on(table.status, table.createdAt),
   index("sav_learning_ticket_idx").on(table.hubspotTicketId),
 ]);
+
+
+/** Internal editable proposals. Submission materializes canonical revisions/candidates. */
+export const savKnowledgeProposalDrafts = pgTable("sav_knowledge_proposal_drafts", {
+  id: uuid("id").defaultRandom().primaryKey(),
+  revision: integer("revision").notNull().default(1),
+  mode: text("mode").notNull(),
+  familyId: uuid("family_id").references(() => knowledgeFamilies.id, { onDelete: "restrict" }),
+  sourceCandidateId: uuid("source_candidate_id").references(() => knowledgeProjectionCandidates.id, { onDelete: "restrict" }),
+  targetItemId: uuid("target_item_id").references(() => contentItems.id, { onDelete: "restrict" }),
+  baseVersionId: uuid("base_version_id").references(() => contentVersions.id, { onDelete: "restrict" }),
+  activeVersionId: uuid("active_version_id").references(() => contentVersions.id, { onDelete: "restrict" }),
+  title: text("title").notNull(),
+  document: jsonb("document").$type<CanonicalKnowledge>().notNull(),
+  sources: jsonb("sources").$type<Array<{ref: string; label: string}>>().notNull().default([]),
+  reason: text("reason").notNull(),
+  origin: text("origin").notNull().default("human"),
+  learningCandidateId: uuid("learning_candidate_id").references(() => savLearningCandidates.id, { onDelete: "set null" }),
+  learningSourceHash: text("learning_source_hash"),
+  candidateId: uuid("candidate_id").references(() => knowledgeProjectionCandidates.id, { onDelete: "restrict" }),
+  status: text("status").notNull().default("draft"),
+  createdBy: text("created_by").notNull(),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+}, (table) => [index("sav_knowledge_proposal_updated_idx").on(table.updatedAt)]);

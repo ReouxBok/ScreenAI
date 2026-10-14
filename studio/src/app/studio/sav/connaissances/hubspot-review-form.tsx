@@ -5,7 +5,7 @@ import { previewHubspotReviewAction, reviewKnowledgeAction } from "../actions";
 
 type Comparison = NonNullable<Awaited<ReturnType<typeof previewHubspotReviewAction>>["comparison"]>;
 
-export function HubspotReviewForm({ candidateId, revisionId, initialDocument }: { candidateId: string; revisionId: string; initialDocument: string }) {
+export function HubspotReviewForm({ candidateId, revisionId, initialDocument, detail = false }: { detail?: boolean; candidateId: string; revisionId: string; initialDocument: string }) {
   const [document, setDocument] = useState(initialDocument);
   const [comparison, setComparison] = useState<Comparison | null>(null);
   const [acknowledged, setAcknowledged] = useState(false);
@@ -22,7 +22,7 @@ export function HubspotReviewForm({ candidateId, revisionId, initialDocument }: 
     finally { setBusy(false); }
   }
   return <form action={reviewKnowledgeAction}>
-    <input type="hidden" name="candidateId" value={candidateId}/><input type="hidden" name="revisionId" value={revisionId}/>
+    <input type="hidden" name="returnDetail" value={detail ? "true" : "false"}/><input type="hidden" name="candidateId" value={candidateId}/><input type="hidden" name="revisionId" value={revisionId}/>
     <details><summary>Corriger la connaissance avant validation (JSON métier, sans DOM)</summary>
       <label>Connaissance complète<textarea name="document" rows={16} value={document} readOnly={busy} onChange={(event) => { setDocument(event.target.value); setComparison(null); setAcknowledged(false); }} style={{ width: "100%" }}/></label>
     </details>

@@ -344,14 +344,18 @@ function hasUnsafeKnowledgeText(value: string) {
 
 /** Re-check the semantic allowlist after a human edit; this is not publication approval. */
 export function assertSafeOnboardingKnowledge(document: CanonicalKnowledge): void {
-  const parsed = canonicalKnowledgeSchema.parse(document);
+  assertSafeKnowledgeDraft(canonicalKnowledgeSchema.parse(document));
+}
+
+/** Drafts keep the same privacy check while their procedure is still incomplete. */
+export function assertSafeKnowledgeDraft(document: CanonicalKnowledge): void {
   const inspect = (value: unknown): void => {
     if (typeof value === "string") {
       if (hasUnsafeKnowledgeText(value)) throw new Error("ONBOARDING_KNOWLEDGE_UNSAFE_CONTENT");
     } else if (Array.isArray(value)) value.forEach(inspect);
     else if (value && typeof value === "object") Object.entries(value).forEach(([key, child]) => { if (key !== "id") inspect(child); });
   };
-  inspect(parsed);
+  inspect(document);
 }
 
 

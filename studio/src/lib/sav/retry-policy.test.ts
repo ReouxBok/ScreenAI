@@ -9,6 +9,7 @@ describe("SAV external action retry policy", () => {
     expect(savActionFailurePlan("HUBSPOT_HTTP_503", 5, now)).toMatchObject({ status: "failed", terminal: true });
   });
   it("does not retry invalid, ambiguous or obsolete operations", () => {
+    expect(savActionFailurePlan("SAV_TICKET_PREVIEW_CHANGED", 1, now)).toEqual({ status: "failed", scheduledAt: null, terminal: true });
     expect(savActionFailurePlan("SAV_TICKET_MATCH_AMBIGUOUS:1,2", 1, now).status).toBe("failed");
     expect(savActionFailurePlan("SAV_REPLY_OBSOLETE", 1, now).status).toBe("cancelled");
     expect(savActionFailurePlan("GMAIL_HTTP_400", 1, now).status).toBe("failed");

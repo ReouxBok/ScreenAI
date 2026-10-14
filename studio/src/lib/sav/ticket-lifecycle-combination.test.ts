@@ -7,6 +7,7 @@ import { decryptSavPayload, encryptSavPayload } from "./crypto";
 import { resolveSavCustomerIdentity, resolveSavCustomerMessage } from "./forwarded-identity";
 import { savStructuredProposalSchema } from "./proposal";
 import { reviewSavProposal } from "./review";
+import { prepareSavManualTicketPreview, readSavTicketPreviewToken, readSavManualTicketPreviewContext } from "./manual-ticket-preview";
 import { queueSavManualTicket } from "./manual-tickets";
 import { retrySavAction } from "./service";
 import { processPendingHubspotActions, reconcileSavTicketReturn, readSavHubspotContext } from "./hubspot";
@@ -129,9 +130,11 @@ it.each(["1", "2", "3", "4"])("handles stage %s without duplicate note or ticket
   expect(stage).toBe("1");
   expect(mutations(network)).toHaveLength(initialStage === "1" ? 0 : 2);
   if (initialStage !== "1") {
-    expect(remoteNote?.properties.hs_note_body).toContain("Le client est revenu");
-    expect(remoteNote?.properties.hs_note_body).toContain("Connexion impossible &lt;script&gt;test&lt;/script&gt;.");
-    expect(remoteNote?.properties.hs_note_body).toContain("gmail-message");
+    expect(remoteNote?.properties.hs_note_body).toBe(initialStage === "4"
+      ? "<p>Le client a renvoyé un email sur ce sujet. Le ticket est rouvert et repasse en Nouveau.</p>"
+      : "<p>Le client a renvoyé un email sur ce sujet. Le ticket repasse en Nouveau.</p>");
+    expect(remoteNote?.properties.hs_note_body).not.toContain("Connexion impossible");
+    expect(remoteNote?.properties.hs_note_body).not.toContain("gmail-message");
   }
   await queueSavManualTicket(request, "ugo@limova.ai");
   await processPendingHubspotActions(1);
@@ -264,5 +267,62 @@ it("requires an explicit context refresh for a legacy snapshot without customer 
   const review = await reviewSavProposal({ ...reviewInput(), reviewScope: "dossier" }, "ugo@limova.ai");
   await expect(queueSavManualTicket({ threadId, reviewId: review.id, kind: "link_ticket", ticketId: "401", returnOperation: "reactivate" }, "ugo@limova.ai")).rejects.toThrow("SAV_TICKET_RETURN_CONTEXT_CHANGED");
   expect(await fixture.db.select().from(savActions)).toHaveLength(0);
+  expect(mutations(network)).toHaveLength(0);
+});
+
+
+it("preserves the original body for a queued legacy action and reconciles its snapshot", async () => {
+  const { network, action } = await prepare("reactivate");
+  const { ticketReturnNoteVersion: _version, ...legacy } = action.payload; void _version;
+  await fixture.db.update(savActions).set({ payload: legacy }).where(eq(savActions.id, action.id));
+  failure = "patch_timeout"; await processPendingHubspotActions(1);
+  expect(remoteNote?.properties.hs_note_body).toContain("Connexion impossible &lt;script&gt;test&lt;/script&gt;.");
+  expect(remoteNote?.properties.hs_note_body).toContain("gmail-message");
+  const count = mutations(network).length;
+  await reconcileSavTicketReturn(action.id, "501", "ugo@limova.ai");
+  expect(mutations(network)).toHaveLength(count);
+});
+it("confirms the encrypted preview once and preserves idempotence without network writes during preview", async () => {
+  const { network, action, request } = await prepare("reactivate");
+  await fixture.db.delete(savActions).where(eq(savActions.id, action.id));
+  const [before] = await fixture.db.select().from(savMessages).where(eq(savMessages.id, messageId));
+  const preview = await prepareSavManualTicketPreview(request, "ugo@limova.ai");
+  const fresh = await readSavManualTicketPreviewContext(threadId);
+  const [after] = await fixture.db.select().from(savMessages).where(eq(savMessages.id, messageId));
+  expect(after.bodyCiphertext).toBe(before.bodyCiphertext);
+  expect(mutations(network)).toHaveLength(0);
+  const signed = readSavTicketPreviewToken(preview.token, "ugo@limova.ai");
+  const first = await queueSavManualTicket({ ...signed.command, previewToken: preview.token }, "ugo@limova.ai", fresh);
+  const second = await queueSavManualTicket({ ...signed.command, previewToken: preview.token }, "ugo@limova.ai", fresh);
+  expect(first.id).toBe(second.id);
+  expect(first.payload.ticketPreviewConfirmed).toBe(true);
+  expect((await processPendingHubspotActions(1)).processed[0].status).toBe("succeeded");
+  expect(mutations(network)).toHaveLength(2);
+});
+it("rejects a stale preview before queuing a CRM command", async () => {
+  const { action, request } = await prepare("reactivate");
+  await fixture.db.delete(savActions).where(eq(savActions.id, action.id));
+  const preview = await prepareSavManualTicketPreview(request, "ugo@limova.ai");
+  const [source] = await fixture.db.select().from(savMessages).where(eq(savMessages.id, messageId));
+  const body = decryptSavPayload<{ text: string; supportContext: { crm: { data: { tickets: Array<{ ownerId: string }> } } } }>(source.bodyCiphertext);
+  body.supportContext.crm.data.tickets[0].ownerId = "72";
+  await fixture.db.update(savMessages).set({ bodyCiphertext: encryptSavPayload(body) }).where(eq(savMessages.id, source.id));
+  const signed = readSavTicketPreviewToken(preview.token, "ugo@limova.ai");
+  await expect(queueSavManualTicket({ ...signed.command, previewToken: preview.token }, "ugo@limova.ai")).rejects.toThrow(/SAV_(TICKET_PREVIEW_CHANGED|VALIDATED_CURRENT_PROPOSAL_REQUIRED)/);
+  expect(await fixture.db.select().from(savActions)).toHaveLength(0);
+});
+
+
+it("never falls back to a full email note for an unknown future note version", async () => {
+  const { network, action } = await prepare("reactivate");
+  await fixture.db.update(savActions).set({ payload: { ...action.payload, ticketReturnNoteVersion: 99 } }).where(eq(savActions.id, action.id));
+  expect((await processPendingHubspotActions(1)).processed[0]).toMatchObject({ status: "failed", errorCode: "SAV_TICKET_RETURN_NOTE_VERSION_INVALID" });
+  expect(mutations(network)).toHaveLength(0);
+});
+it("checks the preview contact again in the worker before any write", async () => {
+  const { network, action } = await prepare("reactivate");
+  await fixture.db.update(savActions).set({ payload: { ...action.payload, ticketPreviewSnapshotCiphertext: encryptSavPayload({ contactId: "other-contact", targetId: "401", targetTitle: "Connexion impossible" }) } }).where(eq(savActions.id, action.id));
+  expect((await processPendingHubspotActions(1)).processed[0]).toMatchObject({ status: "failed", errorCode: "SAV_TICKET_PREVIEW_CHANGED" });
+  await expect(retrySavAction(action.id, "ugo@limova.ai")).rejects.toThrow("SAV_TICKET_PREVIEW_CHANGED");
   expect(mutations(network)).toHaveLength(0);
 });

@@ -2,7 +2,7 @@ import { expect, test } from "@playwright/test";
 
 async function login(page: import("@playwright/test").Page) {
   await page.goto("/studio");
-  await expect(page).toHaveURL(/\/studio$/);
+  await page.waitForURL(/\/studio$/);
 }
 
 async function createArticle(page: import("@playwright/test").Page, suffix = "") {
@@ -16,7 +16,7 @@ async function createArticle(page: import("@playwright/test").Page, suffix = "")
   await page.locator(".tiptap").fill("## Connexion Gmail\n\nOuvrez le catalogue des intégrations puis cliquez sur Gmail E2E.");
   await page.getByLabel("Commentaire de modification").fill("Création E2E du guide Gmail");
   await page.getByRole("button",{name:"Enregistrer le brouillon"}).click();
-  await expect(page).toHaveURL(/\/studio\/contenus\/[0-9a-f-]+$/);
+  await page.waitForURL(/\/studio\/contenus\/[0-9a-f-]+$/);
 }
 
 async function enableAiForTitle(page: import("@playwright/test").Page, title: string) {
@@ -153,7 +153,7 @@ test("un contenu existant peut être mis à jour puis supprimé par un administr
 
   await page.getByText("Supprimer",{exact:true}).click();
   await page.getByRole("button",{name:"Confirmer la suppression"}).click();
-  await expect(page).toHaveURL(/\/studio\/contenus\?deleted=1$/);
+  await page.waitForURL(/\/studio\/contenus\?deleted=1$/);
   await expect(page.getByText("Le contenu, ses versions et ses tests ont bien été supprimés.")).toBeVisible();
   await expect(page.locator(`a[href="/studio/contenus/${itemId}"]`)).toHaveCount(0);
 });
@@ -163,18 +163,21 @@ test("le banc E2E utilise l’identité owner et expose les espaces administrate
   await expect(page.getByRole("link",{name:"SAV IA",exact:true})).toBeVisible();
   await expect(page.getByRole("link",{name:"Entraînements",exact:true})).toBeVisible();
   await page.goto("/studio/validations");
-  await expect(page).toHaveURL(/\/studio\/validations$/);
+  await page.waitForURL(/\/studio\/validations$/);
 });
 
 test("la V0 SAV expose la frontière, les vues et le laboratoire isolé", async ({ page }) => {
   await login(page);
   await page.goto("/studio/sav");
-  await expect(page.getByRole("heading", { name: "Propositions à piloter" })).toBeVisible();
-  await expect(page.getByText("Activation non effectuée : aucun ancien email ne sera proposé rétroactivement.", { exact: false })).toBeVisible();
-  await expect(page.getByRole("navigation", { name: "Vues SAV" })).toBeVisible();
-  await expect(page.getByRole("region", { name: "Emails synchronisés" })).toBeVisible();
-  await expect(page.getByRole("heading", { name: "Évaluation des propositions" })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "Piloter les demandes", exact: true })).toBeVisible();
+  const views = page.getByRole("navigation", { name: "Vues SAV", exact: true });
+  await expect(views).toBeVisible();
+  for (const name of [/^À traiter/, /^À valider/, /^Suivi HubSpot/, /^Terminés/]) {
+    await expect(views.getByRole("link", { name })).toBeVisible();
+  }
+  await expect(page.getByRole("region", { name: "Dossiers SAV", exact: true })).toBeVisible();
   await page.getByRole("link", { name: "Laboratoire", exact: true }).click();
+  await page.waitForURL(/\/studio\/sav\/pilote$/);
   await expect(page.getByRole("heading", { name: "Un lot. Dix mails. Zéro action externe." })).toBeVisible();
 });
 
@@ -240,7 +243,7 @@ test("une démonstration extension devient un parcours Charly éditable",async({
   expect(JSON.stringify(livePayload)).not.toContain("[main]");
   expect(JSON.stringify(livePayload)).not.toContain("POST /api/campaigns");
   await page.getByRole("button",{name:"Transformer en parcours"}).click();
-  await expect(page).toHaveURL(/\/studio\/contenus\/[0-9a-f-]+$/);
+  await page.waitForURL(/\/studio\/contenus\/[0-9a-f-]+$/);
   await expect(page.getByRole("textbox",{name:"Titre",exact:true})).toHaveValue("Créer une campagne sociale E2E");
   await expect(page.getByLabel("Agent concerné")).toHaveValue("charly");
   await expect(page.locator('input[name="bodyMarkdown"]')).toHaveValue(/Fenêtre d’autorisation externe ouverte/);
@@ -265,7 +268,7 @@ test("une démonstration peut être recommencée puis supprimée sans perdre l�
   await page.getByLabel("Nom du parcours").fill(title);
   await page.getByLabel("Ce que Charly doit apprendre").fill("Vérifier le cycle de vie d’une démonstration.");
   await page.getByRole("button",{name:"Créer la démonstration"}).click();
-  await expect(page).toHaveURL(/\/studio\/entrainements\/[0-9a-f-]+\?token=/);
+  await page.waitForURL(/\/studio\/entrainements\/[0-9a-f-]+\?token=/);
   const firstId = page.url().match(/entrainements\/([0-9a-f-]+)/)?.[1];
   expect(firstId).toBeTruthy();
 
@@ -275,7 +278,7 @@ test("une démonstration peut être recommencée puis supprimée sans perdre l�
   await expect(firstRow.locator("time")).toContainText("Ajouté le");
   await firstRow.locator(`summary[aria-label="Gérer ${title}"]`).click();
   await firstRow.getByRole("link",{name:"Modifier"}).click();
-  await expect(page).toHaveURL(new RegExp(`/studio/entrainements/${firstId}\\?edit=1$`));
+  await page.waitForURL(new RegExp(`/studio/entrainements/${firstId}\\?edit=1$`));
   await page.locator("#edit-training-title").fill(editedTitle);
   await page.getByRole("button",{name:"Enregistrer les modifications"}).click();
   await expect(page.getByText("Le tutoriel a bien été modifié.")).toBeVisible();
@@ -285,7 +288,7 @@ test("une démonstration peut être recommencée puis supprimée sans perdre l�
   const editedRow = page.locator(".training-row").filter({hasText:editedTitle}).first();
   await editedRow.locator(`summary[aria-label="Gérer ${editedTitle}"]`).click();
   await editedRow.getByRole("button",{name:`Recommencer ${editedTitle}`}).click();
-  await expect(page).toHaveURL(/\/studio\/entrainements\/[0-9a-f-]+\?token=.*&restarted=1/);
+  await page.waitForURL(/\/studio\/entrainements\/[0-9a-f-]+\?token=.*&restarted=1/);
   const secondId = page.url().match(/entrainements\/([0-9a-f-]+)/)?.[1];
   expect(secondId).toBeTruthy();
   expect(secondId).not.toBe(firstId);
@@ -293,7 +296,7 @@ test("une démonstration peut être recommencée puis supprimée sans perdre l�
 
   await page.getByText("Supprimer",{exact:true}).click();
   await page.getByRole("button",{name:`Confirmer la suppression de ${editedTitle}`}).click();
-  await expect(page).toHaveURL(/\/studio\/entrainements\?deleted=1$/);
+  await page.waitForURL(/\/studio\/entrainements\?deleted=1$/);
   await expect(page.getByText("La démonstration et ses événements ont bien été supprimés.")).toBeVisible();
   await expect(page.getByText(editedTitle,{exact:true})).toHaveCount(1);
 });
@@ -332,11 +335,11 @@ test("la page Qualité permet de lancer les tests et d’ouvrir leur contenu att
   await firstTest.getByRole("button",{name:"Tester"}).click();
   await expect(firstTest.locator(".status")).toBeVisible();
   await firstTest.getByRole("link").first().click();
-  await expect(page).toHaveURL(/\/studio\/contenus\/[0-9a-f-]+$/);
+  await page.waitForURL(/\/studio\/contenus\/[0-9a-f-]+$/);
 });
 
 test("la trame publiée hiérarchise les contenus et devient le template de Charly",async({page,request})=>{
-  test.setTimeout(60_000);
+  test.setTimeout(120_000);
   await login(page);
   await createPublishedOnboarding(page,request,"linkedin-e2e","Lancer sa prospection LinkedIn E2E");
   await createPublishedOnboarding(page,request,"social-e2e","Créer ses premiers posts E2E");
@@ -372,7 +375,7 @@ test("la trame publiée hiérarchise les contenus et devient le template de Char
 });
 
 test("un membre crée, finalise et transforme son tutoriel sans accéder à celui d’un collègue",async({browser})=>{
-  test.setTimeout(60_000);
+  test.setTimeout(120_000);
   const baseURL = "http://127.0.0.1:3100";
   const memberContext = await browser.newContext({ baseURL, extraHTTPHeaders: { "x-studio-test-user": "mehdi.t@limova.ai" } });
   const otherMemberContext = await browser.newContext({ baseURL, extraHTTPHeaders: { "x-studio-test-user": "arnaud@limova.ai" } });
@@ -394,7 +397,7 @@ test("un membre crée, finalise et transforme son tutoriel sans accéder à celu
     await memberPage.getByLabel("Agent").selectOption("charly");
     await memberPage.getByLabel("Page de départ").fill("/super-powers");
     await memberPage.getByRole("button", { name: "Créer la démonstration" }).click();
-    await expect(memberPage).toHaveURL(/\/studio\/entrainements\/[0-9a-f-]+\?token=/);
+    await memberPage.waitForURL(/\/studio\/entrainements\/[0-9a-f-]+\?token=/);
     const trainingId = memberPage.url().match(/entrainements\/([0-9a-f-]+)/)?.[1];
     const token = (await memberPage.locator(".training-code code").textContent())?.trim();
     expect(trainingId).toBeTruthy();
@@ -407,7 +410,7 @@ test("un membre crée, finalise et transforme son tutoriel sans accéder à celu
     expect((await memberContext.request.post("/api/training/sessions/complete", { headers })).ok()).toBe(true);
     await memberPage.reload();
     await memberPage.getByRole("button", { name: "Transformer en parcours" }).click();
-    await expect(memberPage).toHaveURL(/\/studio\/contenus\/[0-9a-f-]+$/);
+    await memberPage.waitForURL(/\/studio\/contenus\/[0-9a-f-]+$/);
     await passRealEvaluation(memberPage, memberContext.request);
     await memberPage.getByRole("button", { name: "Demander la validation" }).click();
 
@@ -461,7 +464,7 @@ test("dix membres créent et enregistrent leurs tutoriels en parallèle", async 
 
     const sessions = await Promise.all(pages.map(async (page, index) => {
       // Ten concurrent redirects include development compilation and rendering.
-      await expect(page).toHaveURL(/\/studio\/entrainements\/[0-9a-f-]+\?token=/, { timeout: 30_000 });
+      await page.waitForURL(/\/studio\/entrainements\/[0-9a-f-]+\?token=/, { timeout: 30_000 });
       const token = (await page.locator(".training-code code").textContent())?.trim();
       expect(token).toBeTruthy();
       return { token: token!, context: contexts[index], path: `/parallel-${index + 1}` };

@@ -4,7 +4,7 @@ import { savCategoryLabels, savLabel } from "@/lib/sav/labels";
 const natureLabels: Record<string, string> = {
   technical: "Dysfonctionnement", technical_issue: "Dysfonctionnement", incident: "Dysfonctionnement", account: "Compte et accès", account_access: "Compte et accès",
   financial_operation: "Opération financière sur le compte", financial_data: "Informations financières du compte", integration: "Intégration", how_to: "Aide à l’utilisation",
-  cancellation: "Résiliation", commercial: "Demande commerciale", callback: "Demande de rappel", human_request: "Demande de prise en charge humaine", security: "Sécurité", privacy: "Confidentialité", data_deletion: "Suppression de données", legal: "Demande juridique", non_support: "Demande hors support", acknowledgement: "Accusé de réception", unknown: "Demande à qualifier",
+  cancellation: "Résiliation", commercial: "Demande commerciale", partnership: "Partenariat", callback: "Demande de rappel", human_request: "Demande de prise en charge humaine", security: "Sécurité", privacy: "Confidentialité", data_deletion: "Suppression de données", legal: "Demande juridique", non_support: "Demande hors support", acknowledgement: "Accusé de réception", unknown: "Demande à qualifier",
 };
 const uncertaintyLabels: Record<string, string> = {
   ambiguous_intent: "La demande reste ambiguë.",

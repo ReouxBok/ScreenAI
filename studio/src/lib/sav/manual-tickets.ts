@@ -1,4 +1,5 @@
 import "server-only";
+import { isDeepStrictEqual } from "node:util";
 import { and, desc, eq } from "drizzle-orm";
 import { z } from "zod";
 import { requireDb } from "@/db";
@@ -10,10 +11,12 @@ import {savStructuredProposalSchema} from "./proposal";
 import type { SavDossierContext } from "./dossier-context";
 import { savTicketReturnPlan } from "./ticket-lifecycle";
 import { decryptSavPayload, encryptSavPayload } from "./crypto";
+import { assertSavTicketPreview } from "./manual-ticket-preview";
+import { SAV_TICKET_RETURN_NOTE_VERSION } from "./ticket-return-note";
 import { resolveSavCustomerIdentity } from "./forwarded-identity";
 
-const requestSchema = z.object({ threadId: z.uuid(), reviewId: z.uuid(), kind: z.enum(["create_ticket", "link_ticket"]), ticketId: z.string().regex(/^\d{1,30}$/).optional(), returnOperation: z.enum(["keep", "reactivate", "create"]).optional(), distinctIssueReason: z.string().trim().max(2_000).default("") });
-export async function queueSavManualTicket(raw: unknown, actorEmail: string) {
+const requestSchema = z.object({ threadId: z.uuid(), reviewId: z.uuid(), kind: z.enum(["create_ticket", "link_ticket"]), ticketId: z.string().regex(/^\d{1,30}$/).optional(), returnOperation: z.enum(["keep", "reactivate", "create"]).optional(), previewToken: z.string().max(40_000).optional(), distinctIssueReason: z.string().trim().max(2_000).default("") });
+export async function queueSavManualTicket(raw: unknown, actorEmail: string, verifiedContext?: SavDossierContext) {
   assertSavActor(actorEmail);
   const input = requestSchema.parse(raw);
   if (input.kind === "link_ticket" && !input.ticketId) throw new Error("SAV_LINK_TICKET_ID_REQUIRED");
@@ -31,9 +34,15 @@ export async function queueSavManualTicket(raw: unknown, actorEmail: string) {
     const decision = c?.decision ?? legacyDecision;
     if (c && (c.review?.id !== review?.id || !["ticket_pending", "human_review_required"].includes(c.proposal.decision.kind))) throw new Error("SAV_VALIDATED_CURRENT_PROPOSAL_REQUIRED");
     if (!review || !decision || !["ticket_pending","human_review_required"].includes(savStructuredProposalSchema.parse(decryptSavPayload(review.afterCiphertext)).decision.kind)) throw new Error("SAV_VALIDATED_CURRENT_PROPOSAL_REQUIRED");
+    const preview = input.previewToken ? assertSavTicketPreview(input.previewToken, actorEmail, input, {
+      threadId: thread.id, linkedTicketId: thread.hubspotTicketId, messageId: message.id, receivedAt: message.receivedAt,
+      fromEmail: message.fromEmail, subject: message.subject, text: messageBody.text, reviewId: review.id,
+      proposal: c?.proposal ?? savStructuredProposalSchema.parse(decryptSavPayload(review.afterCiphertext)),
+      context: verifiedContext ?? decryptSavPayload<{ supportContext?: SavDossierContext }>(message.bodyCiphertext).supportContext,
+    }) : null;
     let ticketReturn: { ticketId: string; operation: "keep" | "reactivate" | "create"; replacesClosedTicketId?: string; stageId: string | null | undefined; closedAt: string | null | undefined; ownerId?: string } | undefined;
     if (input.returnOperation) {
-      const context = decryptSavPayload<{ supportContext?: SavDossierContext }>(message.bodyCiphertext).supportContext;
+      const context = verifiedContext ?? decryptSavPayload<{ supportContext?: SavDossierContext }>(message.bodyCiphertext).supportContext;
       if (context?.messageId !== message.id || context.customerIdentity?.email !== customerIdentity.email || context.crm.status !== "ready" || !context.crm.data?.contactId) throw new Error("SAV_TICKET_RETURN_CONTEXT_CHANGED");
       const match = context.crm.data.routing;
       const selected = context.crm.data.tickets.find(ticket => ticket.id === input.ticketId);
@@ -62,14 +71,14 @@ export async function queueSavManualTicket(raw: unknown, actorEmail: string) {
       // A dispatch with unknown outcome is never turned into a fresh command.
       if (existing.payload.ticketCreateDispatchedAt && !existing.payload.hubspotTicketId) throw new Error("SAV_MANUAL_RECONCILIATION_REQUIRED");
       if (!["failed", "cancelled"].includes(existing.status)) {
-        if (existing.kind !== input.kind || (input.ticketId && existing.payload.ticketId !== input.ticketId) || JSON.stringify(existing.payload.ticketReturn) !== JSON.stringify(ticketReturn)) throw new Error("SAV_TICKET_ACTION_ALREADY_QUEUED");
+        if (existing.kind !== input.kind || (input.ticketId && existing.payload.ticketId !== input.ticketId) || !isDeepStrictEqual(existing.payload.ticketReturn ?? null, JSON.parse(JSON.stringify(ticketReturn ?? null)))) throw new Error("SAV_TICKET_ACTION_ALREADY_QUEUED");
         if (existing.payload.savReviewId === review.id) return existing;
         if (existing.status !== "pending") throw new Error("SAV_TICKET_ACTION_IN_PROGRESS");
       }
       if (existing.payload.hubspotTicketId) throw new Error("SAV_MANUAL_RECONCILIATION_REQUIRED");
     }
     const values = { threadId: thread.id, messageId: message.id, decisionId: decision.id, kind: input.kind, status: "pending" as const,
-      payload: { savReviewId: review.id, previousTicketId: thread.hubspotTicketId, ...(ticketReturn ? { ticketReturn } : {}), ticketReviewSnapshotCiphertext: encryptSavPayload({ reviewId: review.id, decisionId: decision.id, messageId: message.id, threadId: thread.id,
+      payload: { ticketReturnNoteVersion: SAV_TICKET_RETURN_NOTE_VERSION, ...(preview ? { ticketPreviewConfirmed: true, ticketPreviewSnapshotCiphertext: encryptSavPayload(preview.details) } : {}), savReviewId: review.id, previousTicketId: thread.hubspotTicketId, ...(ticketReturn ? { ticketReturn } : {}), ticketReviewSnapshotCiphertext: encryptSavPayload({ reviewId: review.id, decisionId: decision.id, messageId: message.id, threadId: thread.id,
         customerEmail: customerIdentity.email, customerIdentityKind: customerIdentity.kind, proposal: savStructuredProposalSchema.parse(decryptSavPayload(review.afterCiphertext)) }), ...(input.ticketId ? { ticketId: input.ticketId } : {}), ...(input.distinctIssueReason ? { distinctIssueReasonCiphertext: encryptSavPayload({ text: input.distinctIssueReason }) } : {}) }, actorType: "human" as const, actorEmail, errorCode: null, scheduledAt: null, updatedAt: new Date() };
     const [action] = existing ? await tx.update(savActions).set(values).where(eq(savActions.id, existing.id)).returning()
       : await tx.insert(savActions).values({ ...values, idempotencyKey: key }).returning();

@@ -8,7 +8,7 @@ import { onboardingSectionLabels, onboardingSectionsQualified } from "@/lib/know
 import { previewOnboardingReviewAction, reviewOnboardingKnowledgeAction } from "./onboarding-actions";
 
 type Comparison = NonNullable<Awaited<ReturnType<typeof previewOnboardingReviewAction>>["comparison"]>;
-type ReturnFilters = { page: number; status: string; source: string; batch?: string; candidate?: string };
+type ReturnFilters = { page: number; status: string; source: string; batch?: string; candidate?: string; detail?: boolean };
 const lines = (value: string[]) => value.map((entry) => entry.trim()).filter(Boolean);
 const fieldStyle = { width: "100%" };
 
@@ -73,7 +73,7 @@ export function OnboardingReviewForm({ candidateId, revisionId, title, initialDo
   const canApprove = Boolean(comparison?.sourceCurrent && acknowledged && onboardingSectionsQualified(document) && (!completionRequired || (contentChanged && missingAcknowledged && completionNote.trim().length >= 20)));
 
   return <form action={reviewOnboardingKnowledgeAction} aria-label={`Revoir ${title}`}>
-    <input type="hidden" name="candidateId" value={candidateId}/><input type="hidden" name="revisionId" value={revisionId}/>
+    <input type="hidden" name="returnDetail" value={filters.detail ? "true" : "false"}/><input type="hidden" name="candidateId" value={candidateId}/><input type="hidden" name="revisionId" value={revisionId}/>
     <input type="hidden" name="document" value={JSON.stringify(cleanDocument(document))}/>
     <input type="hidden" name="returnPage" value={filters.page}/><input type="hidden" name="returnStatus" value={filters.status}/><input type="hidden" name="returnSource" value={filters.source}/>
     {filters.batch && <input type="hidden" name="returnBatch" value={filters.batch}/>}{filters.candidate && <input type="hidden" name="returnCandidate" value={filters.candidate}/>}

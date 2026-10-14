@@ -1,7 +1,7 @@
 import "server-only";
 import { and, eq, ne, or } from "drizzle-orm";
 import { requireDb } from "@/db";
-import { contentItems, contentVersions, knowledgeProjectionCandidates, knowledgeFamilyRevisions, knowledgeFamilySources, knowledgeProjections } from "@/db/schema";
+import { contentItems, contentVersions, knowledgeProjectionCandidates, knowledgeFamilyRevisions, knowledgeFamilySources, knowledgeProjections, savKnowledgeActivations } from "@/db/schema";
 import { parseContentInput } from "@/lib/content";
 import { savContentHash } from "@/lib/sav/crypto";
 import { assertSavActor } from "@/lib/sav/access";
@@ -15,7 +15,8 @@ type DbReader = Pick<ReturnType<typeof requireDb>, "select">;
 export async function knowledgeComparisonInventory(db: DbReader = requireDb()): Promise<KnowledgeComparisonEntry[]> {
   // Compare published AND draft articles, including existing common/Charly knowledge.
   const articles = await db.select({ item: contentItems, version: contentVersions }).from(contentItems)
-    .innerJoin(contentVersions, and(eq(contentVersions.itemId, contentItems.id), or(eq(contentVersions.id, contentItems.currentDraftVersionId), eq(contentVersions.id, contentItems.publishedVersionId))))
+    .leftJoin(savKnowledgeActivations, eq(savKnowledgeActivations.itemId, contentItems.id))
+    .innerJoin(contentVersions, and(eq(contentVersions.itemId, contentItems.id), or(eq(contentVersions.id, contentItems.currentDraftVersionId), eq(contentVersions.id, contentItems.publishedVersionId), eq(contentVersions.id, savKnowledgeActivations.versionId))))
     .where(and(eq(contentItems.type, "article"), ne(contentItems.status, "archived")));
   const candidates = await db.select().from(knowledgeProjectionCandidates).where(and(eq(knowledgeProjectionCandidates.targetSurface, "sav"), or(eq(knowledgeProjectionCandidates.status, "pending"), eq(knowledgeProjectionCandidates.status, "needs_completion"))));
   return [...articles.map(({ item, version }) => ({ ref: `content:${item.id}`, versionId: version.id, title: item.title, body: version.bodyMarkdown, agentKey: item.agentKey })),
@@ -44,12 +45,13 @@ export async function prepareHubspotReview(candidate: typeof knowledgeProjection
   const target = targets.values().next().value ?? null;
   if (target && (target.status === "archived" || target.type !== "article" || target.agentKey !== "sav")) throw new Error("KNOWLEDGE_TARGET_STALE");
   const baseVersionId = target?.currentDraftVersionId ?? target?.publishedVersionId ?? null;
+  const [active] = target ? await db.select().from(savKnowledgeActivations).where(eq(savKnowledgeActivations.itemId, target.id)) : [];
   const [base] = baseVersionId ? await db.select().from(contentVersions).where(eq(contentVersions.id, baseVersionId)) : [];
   const original = parseContentInput(candidate.proposedInput);
   const proposed = parseContentInput({ ...original, title: document.objective, summary: document.objective, bodyMarkdown: savProjectionBody(document) });
   if (proposed.bodyMarkdown.length > 12_000) throw new Error("HUBSPOT_PROCEDURE_TOO_LONG");
   const comparison = hubspotComparison({ id: candidate.id, proposedInput: proposed }, await knowledgeComparisonInventory(db));
-  return { ...comparison, snapshot: savContentHash({ comparison: comparison.snapshot, document, sourceId: source.id, sourceHash: source.sourceHash, evidence: source.evidence, targetItemId: target?.id ?? null, baseVersionId }),
+  return { ...comparison, snapshot: savContentHash({ comparison: comparison.snapshot, document, sourceId: source.id, sourceHash: source.sourceHash, evidence: source.evidence, targetItemId: target?.id ?? null, baseVersionId, activeVersionId: active?.versionId ?? null }),
     targetItemId: target?.id ?? null, baseVersionId, before: base?.bodyMarkdown ?? "", after: proposed.bodyMarkdown };
 }
 

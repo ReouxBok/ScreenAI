@@ -8,11 +8,15 @@ vi.mock("@/lib/sav/service", () => ({ getSavThreadDetail: dependencies.detail })
 vi.mock("@/lib/sav/observations", () => ({ getSavObservations: async () => [] }));
 vi.mock("./draft-review", () => ({ DraftReview: () => null }));
 vi.mock("@/lib/sav/review", () => ({ getSavProposalReview: dependencies.review }));
+vi.mock("@/lib/sav/partnership-forward", () => ({ getSavPartnershipTransferState: async () => ({ available: false, status: "unavailable" }), isSavPartnershipForward: (action: { payload: { purpose?: string } }) => action.payload.purpose === "partnership_forward" }));
+vi.mock("../partnership-transfer", () => ({ PartnershipTransfer: () => null }));
 vi.mock("@/lib/sav/cutover", () => ({ isSavMessageEligible: async () => true }));
 vi.mock("@/lib/sav/thread-context", () => ({ getSavRelatedThreads: async () => [] }));
 vi.mock("@/lib/sav/drafts", () => ({ getSavReplyDrafts: async () => ({ versions: [], knowledgeRevision: null }) }));
 vi.mock("./mail-conversation", () => ({ MailConversation: () => null }));
 vi.mock("./proposal-review", () => ({ ProposalReview: () => null }));
+vi.mock("next/navigation", () => ({ useRouter: () => ({ refresh: vi.fn() }), notFound: () => { throw new Error("NOT_FOUND"); } }));
+vi.mock("../ticket-preview-actions", () => ({ prepareTicketPreviewAction: vi.fn(), confirmTicketPreviewAction: vi.fn() }));
 vi.mock("next/link", () => ({ default: (props: ComponentProps<"a">) => createElement("a", props) }));
 vi.mock("../actions", () => Object.fromEntries([
   "approveDraftAction", "correctDecisionAction", "createTicketAction", "linkTicketAction", "reconcileTicketAction", "requestHumanAction", "retryAction", "retryAnalysisAction", "reviewPilotItemAction", "refreshSavContextAction", "repairSavProposalAction",
@@ -26,8 +30,8 @@ beforeEach(() => {
   vi.clearAllMocks(); vi.stubEnv("SAV_RELEASE_STAGE", "v0"); vi.stubEnv("SAV_AUTOMATION_MODE", "assist"); vi.stubEnv("SAV_WRITES_DISABLED", "false"); vi.stubEnv("HUBSPOT_PORTAL_ID", "143641967");
   dependencies.auth.mockResolvedValue({ email: "ugo@limova.ai" });
   dependencies.detail.mockResolvedValue({ thread: { id: threadId, subject: "Fixture", customerEmail: "fixture@example.invalid", status: "human_requested", aiPaused: true, hubspotTicketId: null },
-    messages: [{ id: "fixture-message", direction: "inbound", body: {}, subject: "Fixture", fromEmail: "fixture@example.invalid" }], decisions: [], actions: [], agentRuns: [], pilotItem: null });
-  dependencies.review.mockResolvedValue({ review: { id: reviewId, status: "approved" }, proposal: { routing: { kind: "new", contactId: "21" }, decision: { kind: "ticket_pending", explanation: "Fixture", confidence: 800 } } });
+    messages: [{ id: "fixture-message", direction: "inbound", body: { text: "Fixture", supportContext: { version: 1, messageId: "fixture-message", collectedAt: "2026-10-14T12:00:00Z", customerIdentity: { kind: "sender", email: "fixture@example.invalid" }, crm: { status: "ready", data: { contactId: "21", tickets: [], routing: { kind: "new" } } }, otherConversations: [] } }, subject: "Fixture", fromEmail: "fixture@example.invalid" }], decisions: [], actions: [], agentRuns: [], pilotItem: null });
+  dependencies.review.mockResolvedValue({ review: { id: reviewId, status: "approved" }, proposal: { ticket: { title: "Demande fictive" }, routing: { kind: "new", contactId: "21" }, decision: { kind: "ticket_pending", explanation: "Fixture", confidence: 800 } } });
 });
 afterEach(() => vi.unstubAllEnvs());
 async function render(overrides = {}, review = "") {
@@ -40,16 +44,16 @@ async function render(overrides = {}, review = "") {
 }
 describe("manual ticket controls in the dossier", () => {
   it("binds the human creation to the exact current review", async () => {
-    expect(await render()).toContain(`name="reviewId" value="${reviewId}"`);
+    const html = await render(); expect(html).toContain("Préparer l’aperçu de l’action"); expect(html).not.toContain("Confirmation explicite");
   });
   it("shows pending progress and disables a second creation", async () => {
     const html = await render({ actions: [action] });
-    expect(html).toContain('disabled="">Demande HubSpot en attente');
+    expect(html).toContain("Demande HubSpot en attente de confirmation"); expect(html).toMatch(/<button[^>]*disabled=""[^>]*>Préparer l’aperçu de l’action/);
     expect(html).toContain("en attente de confirmation"); expect(html).not.toContain('name="reviewId"');
   });
   it("does not treat an AI suggestion as a queued human creation", async () => {
     const html = await render({ actions: [{ ...action, actorType: "ai" }] });
-    expect(html).toContain(`name="reviewId" value="${reviewId}"`);
+    expect(html).toMatch(/<button[^>]*>Préparer l’aperçu de l’action/);
     expect(html).not.toContain("Suivi de la demande HubSpot");
   });
   it("shows a confirmed ticket ID and usable link after persistence", async () => {
@@ -75,11 +79,11 @@ describe("manual ticket controls in the dossier", () => {
     expect(await render({}, "SAV_VALIDATED_CURRENT_PROPOSAL_REQUIRED")).toContain("Validez la proposition courante");
   });
   it("keeps a validated no-ticket dossier from enabling human creation", async () => {
-    dependencies.review.mockResolvedValue({ review: { id: reviewId, status: "approved" }, proposal: { routing: { kind: "new", contactId: "21" }, decision: { kind: "no_ticket_needed", explanation: "Fixture", confidence: 800 } } });
+    dependencies.review.mockResolvedValue({ review: { id: reviewId, status: "approved" }, proposal: { ticket: { title: "Demande fictive" }, routing: { kind: "new", contactId: "21" }, decision: { kind: "no_ticket_needed", explanation: "Fixture", confidence: 800 } } });
     const html = await render(); expect(html).not.toContain('name="reviewId"'); expect(html).not.toContain("Créer le ticket HubSpot");
   });
   it("requires a current approval before showing the creation form", async () => {
     dependencies.review.mockResolvedValue(null);
-    const html = await render(); expect(html).toContain("Validez d’abord la proposition courante"); expect(html).not.toContain('name="reviewId"');
+    const html = await render(); expect(html).toContain("Validez d’abord le dossier / process"); expect(html).not.toContain('name="reviewId"');
   });
 });

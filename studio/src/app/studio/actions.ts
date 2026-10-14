@@ -86,7 +86,8 @@ export async function setAiEnabledAction(form: FormData) {
   const staff = await requireApiStaff();
   const id = String(form.get("itemId"));
   await assertContentEditable(staff, id);
-  await setContentAiEnabled(id, String(form.get("enabled")) === "true", staff.email);
+  await setContentAiEnabled(id, String(form.get("enabled")) === "true", staff.email,
+    form.has("expectedPublishedVersionId") ? { expectedPublishedVersionId: String(form.get("expectedPublishedVersionId")), expectedActiveVersionId: String(form.get("expectedActiveVersionId") || "") || null } : undefined);
   revalidatePath("/studio");
   revalidatePath("/studio/contenus");
   revalidatePath(`/studio/contenus/${id}`);

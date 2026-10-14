@@ -21,7 +21,7 @@ export type KnowledgeSearchResult = {
 
 // Historical articles predate the structured resolution schema. Keep their
 // metadata from turning one malformed date into a failed support search.
-const savResolutionIsCurrent = sql`
+export const savResolutionIsCurrent = sql`
   version.metadata ? 'resolution'
   AND CASE
     WHEN NULLIF(version.metadata -> 'resolution' ->> 'validUntil', '') IS NULL THEN TRUE
@@ -45,13 +45,17 @@ export async function searchKnowledge(rawInput: unknown) {
   const typeFilter = input.contentTypes.length === 2
     ? sql`item.type IN ('article', 'onboarding')`
     : sql`item.type = ${input.contentTypes[0]}::content_type`;
+  const consumedVersion = input.scope === "sav" ? sql`activation.version_id` : sql`item.published_version_id`;
+  const consumedTitle = input.scope === "sav" ? sql`activation.title` : sql`item.title`;
+  const activationJoin = input.scope === "sav" ? sql`JOIN sav_knowledge_activations activation ON activation.item_id = item.id` : sql``;
   const availability = await db.execute(sql`
     SELECT EXISTS (
       SELECT 1
       FROM content_items item
-      JOIN content_chunks chunk ON chunk.item_id = item.id AND chunk.version_id = item.published_version_id
-      JOIN content_versions version ON version.id = item.published_version_id
-      WHERE item.published_version_id IS NOT NULL
+      ${activationJoin}
+      JOIN content_chunks chunk ON chunk.item_id = item.id AND chunk.version_id = ${consumedVersion}
+      JOIN content_versions version ON version.id = ${consumedVersion}
+      WHERE ${consumedVersion} IS NOT NULL
         AND item.status <> 'archived'
         AND item.ai_enabled = true
         AND ${input.scope === "sav" ? sql`item.agent_key = 'sav'` : sql`item.agent_key <> 'sav'`}
@@ -86,7 +90,7 @@ export async function searchKnowledge(rawInput: unknown) {
     SELECT
       item.id,
       version.id AS "contentVersionId",
-      item.title,
+      ${consumedTitle} AS title,
       ${input.scope === "sav" ? sql`CASE
         WHEN version.metadata -> 'sourceMetadata' ->> 'importKind' IN ('hubspot', 'onboarding_catalog')
           AND length(version.body_markdown) <= 12000 THEN version.body_markdown
@@ -97,7 +101,7 @@ export async function searchKnowledge(rawInput: unknown) {
       version.metadata -> 'resolution' AS "resolution",
       (
         (1 - (chunk.embedding <=> ${vectorLiteral}::vector)) * 0.58
-        + ts_rank_cd(to_tsvector('french', item.title || ' ' || chunk.heading || ' ' || chunk.content), plainto_tsquery('french', ${input.query})) * 0.30
+        + ts_rank_cd(to_tsvector('french', ${consumedTitle} || ' ' || chunk.heading || ' ' || chunk.content), plainto_tsquery('french', ${input.query})) * 0.30
         + CASE WHEN ${input.path} <> '' AND EXISTS (
             SELECT 1 FROM unnest(chunk.limova_paths) known_path
             WHERE known_path = ${input.path}
@@ -110,7 +114,7 @@ export async function searchKnowledge(rawInput: unknown) {
           ) THEN 0.04 ELSE 0 END
         + LEAST(0.48, COALESCE((
             SELECT count(DISTINCT title_term)::float * 0.12
-            FROM regexp_split_to_table(lower(item.title), '[^[:alnum:]]+') title_term
+            FROM regexp_split_to_table(lower(${consumedTitle}), '[^[:alnum:]]+') title_term
             WHERE (length(title_term) >= 3 OR title_term = 'ia')
               AND title_term NOT IN ('comment', 'avec', 'pour', 'dans', 'mes', 'mon', 'une', 'des', 'les', 'que', 'quoi', 'sont', 'faire', 'peut', 'peuvent', 'limova')
               AND lower(${input.query}) LIKE '%' || title_term || '%'
@@ -124,9 +128,10 @@ export async function searchKnowledge(rawInput: unknown) {
       )::float AS score
     FROM content_chunks chunk
     JOIN content_items item ON item.id = chunk.item_id
-    JOIN content_versions version ON version.id = item.published_version_id
-    WHERE chunk.version_id = item.published_version_id
-      AND item.published_version_id IS NOT NULL
+    ${activationJoin}
+    JOIN content_versions version ON version.id = ${consumedVersion}
+    WHERE chunk.version_id = ${consumedVersion}
+      AND ${consumedVersion} IS NOT NULL
       AND item.status <> 'archived'
       AND item.ai_enabled = true
       AND item.locale = ${input.locale}

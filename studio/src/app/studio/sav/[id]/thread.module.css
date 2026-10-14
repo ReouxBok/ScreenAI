@@ -175,6 +175,34 @@
   margin-top: 18px;
 }
 
+.conversationToggle {
+  margin-top: 4px;
+}
+
+.conversationHint, .attachments {
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--muted);
+}
+
+.attachments summary {
+  cursor: pointer;
+}
+
+.ticketButton {
+  display: grid;
+  gap: 5px;
+  text-align: left;
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+
+.ticketButton small {
+  font-size: 12px;
+  font-weight: 400;
+  color: inherit;
+}
+
 .audit > section {
   padding: 16px 0 0;
   border: 0;
@@ -198,3 +226,8 @@
   .rail.rail { grid-template-columns: minmax(0, 1fr); }
   .context, .actions, .mail, .audit { padding: 18px; }
 }
+
+.historyExpanded { max-height: min(65vh, 640px); overflow-y: auto; overscroll-behavior-y: contain; scrollbar-gutter: stable; padding-right: 8px; }
+.historyExpanded:focus-visible { outline: 2px solid var(--ink); outline-offset: 4px; }
+.conversationWarning { padding: 12px; border: 1px solid var(--line); border-left: 3px solid #f4b942; border-radius: 8px; font-size: 13px; line-height: 1.6; }
+@media (max-width: 760px) { .historyExpanded { max-height: 65svh; } }

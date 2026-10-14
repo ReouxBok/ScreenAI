@@ -55,7 +55,7 @@ describe("Staff lead knowledge: authenticated form through isolated database ret
     await expect(publish(item.id, "staff@example.invalid", { expectedVersionId: v1.id })).rejects.toThrow("KNOWLEDGE_UGO_APPROVAL_REQUIRED");
     await publish(item.id, actor.email, { expectedVersionId: v1.id });
     expect((await searchKnowledge(query)).results).toHaveLength(0);
-    await setContentAiEnabled(item.id, true, actor.email);
+    await setContentAiEnabled(item.id, true, actor.email, { expectedPublishedVersionId: v1.id, expectedActiveVersionId: null });
     const found = await searchKnowledge(query);
     expect(found.results).toHaveLength(1);
     expect(found.results[0]).toMatchObject({ id: item.id, contentVersionId: v1.id, resolution: { audience: "lead", responseTemplate: data.get("savResponseTemplate") } });

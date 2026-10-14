@@ -2,79 +2,65 @@
 import { createElement, Fragment, type ComponentProps } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import { beforeEach, describe, expect, it, vi } from "vitest";
-const dependencies = vi.hoisted(() => ({ cutover: vi.fn(), inbox: vi.fn(), incidents: vi.fn(), actions: vi.fn(), open: vi.fn() }));
+const dependencies = vi.hoisted(() => ({ cutover: vi.fn(), dashboard: vi.fn(), incidents: vi.fn(), actions: vi.fn(), open: vi.fn() }));
 vi.mock("@/lib/sav/cutover", () => ({ getSavV0Cutover: dependencies.cutover }));
-vi.mock("@/lib/sav/service", () => ({ listSavInbox: dependencies.inbox, listSavWebhookIncidents: dependencies.incidents, listSavActionIncidents: dependencies.actions }));
+vi.mock("@/lib/sav/dashboard", () => ({ listSavDossierDashboard: dependencies.dashboard }));
+vi.mock("@/lib/sav/service", () => ({ listSavWebhookIncidents: dependencies.incidents, listSavActionIncidents: dependencies.actions }));
 vi.mock("./actions", () => ({ retryWebhookAction: vi.fn() }));
 vi.mock("./open-email-actions", () => ({ openSavEmailAction: dependencies.open }));
 vi.mock("next/link", () => ({ default: (props: ComponentProps<"a">) => createElement("a", props) }));
 import { SavV0Inbox } from "./inbox";
 const threadId = "10000000-0000-4000-8000-000000000001";
 const messageId = "10000000-0000-4000-8000-000000000002";
-beforeEach(() => {
-  vi.clearAllMocks(); dependencies.cutover.mockResolvedValue(null); dependencies.incidents.mockResolvedValue([]); dependencies.actions.mockResolvedValue([]);
-  dependencies.inbox.mockResolvedValue([{ threadId, messageId, subject: "Retrouver mes factures", fromEmail: "fiction@example.invalid", receivedAt: new Date("2026-10-02T12:01:00Z"), preview: "Fixture", decisionKind: null, explanation: null, confidence: null, reviewId: null, reviewStatus: null, analysisStatus: "pending", analysisErrorCode: null, aiPaused: false, hubspotTicketId: null }]);
-});
-describe("SAV inbox explicit open forms", () => {
-  it("renders an accessible POST form bound to the exact row, without running the action during render/prefetch", async () => {
-    const element = await SavV0Inbox({ searchParams: Promise.resolve({}) });
-    const html = renderToStaticMarkup(createElement(Fragment, null, element));
+const row = { threadId, messageId, fromEmail: "fiction@example.invalid", receivedAt: new Date("2026-10-02T12:01:00Z"), summary: { title: "Retrouver mes factures", problem: "Le client cherche où trouver sa facture.", nextAction: "Ouvrir et qualifier", sourceLabel: "Objet de l’email", additionalRequests: 0 }, opening: "unopened", state: "to_process", reviewStatus: null, draftStatus: "À relire", replyStatus: "Aucun envoi", partnershipStatus: null, ticketProgress: "required", learning: "none", ticket: null, crmStatus: "unknown", nextAction: "Ouvrir et qualifier la demande", incident: false, technical: false };
+const result = { rows: [row], counts: { to_process: 1, to_validate: 0, learning: 0, completed: 0, technical: 0, incidents: 0 }, page: 1, pageSize: 25, total: 1, totalPages: 1, view: "to_process" };
+beforeEach(() => { vi.clearAllMocks(); dependencies.cutover.mockResolvedValue(null); dependencies.incidents.mockResolvedValue([]); dependencies.actions.mockResolvedValue([]); dependencies.dashboard.mockResolvedValue(result); });
+const render = async (search: { view?: string; q?: string; page?: string; sort?: string } = {}) => renderToStaticMarkup(createElement(Fragment, null, await SavV0Inbox({ searchParams: Promise.resolve(search) })));
+describe("SAV-55 compact dashboard", () => {
+  it("renders a POST for the exact current message, without action on render or prefetch", async () => {
+    const html = await render();
     expect(html).toContain('aria-label="Ouvrir l’email : Retrouver mes factures"');
-    expect(html).toContain(`name="threadId" value="${threadId}"`);
-    expect(html).toContain(`name="messageId" value="${messageId}"`);
-    expect(html).not.toContain(`href="/studio/sav/${threadId}"`);
+    expect(html).toContain(`name="threadId" value="${threadId}"`); expect(html).toContain(`name="messageId" value="${messageId}"`);
+    expect(html).toContain('name="returnTo"'); expect(html).toContain(`#dossier-${threadId}`);
     expect(dependencies.open).not.toHaveBeenCalled();
   });
-  it("keeps search and tab navigation read-only and does not file anything on an empty inbox", async () => {
-    dependencies.inbox.mockResolvedValue([]);
-    const element = await SavV0Inbox({ searchParams: Promise.resolve({ view: "pending", q: "facture" }) });
-    const html = renderToStaticMarkup(createElement(Fragment, null, element));
-    expect(html).toContain('method="get"'); expect(html).toContain('href="/studio/sav?view=pending"');
-    expect(html).toContain("Aucun email dans cette vue"); expect(dependencies.open).not.toHaveBeenCalled();
+  it("uses the four views and a compact problem/action without diagnostics in the list", async () => {
+    const html = await render();
+    for (const label of ["À traiter", "À valider", "Suivi HubSpot", "Terminés", "Le client cherche où trouver sa facture.", "Ouvrir et qualifier la demande"]) expect(html).toContain(label);
+    expect(html).not.toContain("SAV_AI_");
   });
-});
-
-async function renderInboxRow(overrides: Record<string, unknown>, view = "all") {
-  const [row] = await dependencies.inbox();
-  dependencies.inbox.mockResolvedValue([{ ...row, ...overrides }]);
-  const element = await SavV0Inbox({ searchParams: Promise.resolve({ view }) });
-  return renderToStaticMarkup(createElement(Fragment, null, element));
-}
-
-describe("SAV inbox human verdict and AI diagnostic", () => {
-  const reviewedCases = (["approved", "rejected"] as const).flatMap((status) =>
-    [false, true].flatMap((aiPaused) => ["all", "reviewed", "errors"].map((view) => ({ status, aiPaused, view }))));
-
-  it.each(reviewedCases)("keeps $status visible with an AI diagnostic in $view (paused=$aiPaused)", async ({ status, aiPaused, view }) => {
-    const html = await renderInboxRow({ reviewId: "review-current", reviewStatus: status,
-      analysisStatus: "done", analysisErrorCode: "SAV_AI_INVALID_JSON", aiPaused }, view);
-    expect(html).toContain(`<strong>${status === "approved" ? "Validée" : "Refusée"}</strong>`);
-    expect(html).toContain("Analyse IA dégradée");
-    expect(html).toContain("SAV_AI_INVALID_JSON");
-    expect(html).not.toContain("Revue humaine nécessaire");
-    expect(html).not.toContain("<strong>Analyse dégradée</strong>");
-    expect(dependencies.open).not.toHaveBeenCalled();
+  it("keeps search, sorting and pagination server-side and preserves the selected context", async () => {
+    dependencies.dashboard.mockResolvedValue({ ...result, page: 2, totalPages: 3, view: "to_validate" });
+    const html = await render({ view: "to_validate", q: "facture", page: "2", sort: "oldest" });
+    expect(dependencies.dashboard).toHaveBeenCalledWith({ view: "to_validate", query: "facture", page: 2, sort: "oldest" });
+    expect(html).toContain('method="get"'); expect(html).toContain("view=to_validate&amp;q=facture&amp;page=2&amp;sort=oldest");
+    expect(html).toContain("Page 2 sur 3"); expect(dependencies.open).not.toHaveBeenCalled();
   });
-
-  it.each([false, true])("requests a review for an unreviewed degradation (paused=%s)", async (aiPaused) => {
-    const html = await renderInboxRow({ analysisStatus: "done", analysisErrorCode: "SAV_AI_OUTPUT_TRUNCATED", aiPaused }, "errors");
-    expect(html).toContain("<strong>Analyse dégradée</strong>");
-    expect(html).toContain("Revue humaine nécessaire");
-    expect(html).toContain("SAV_AI_OUTPUT_TRUNCATED");
-    expect(dependencies.open).not.toHaveBeenCalled();
+  it("shows a search empty state without claiming a successful zero on load errors", async () => {
+    dependencies.dashboard.mockResolvedValue({ ...result, rows: [], total: 0 });
+    expect(await render({ q: "absent" })).toContain("Aucun dossier ne correspond à cette recherche");
+    dependencies.dashboard.mockRejectedValue(new Error("fixture"));
+    const failed = await render(); expect(failed).toContain("Les dossiers ne sont pas disponibles"); expect(failed).not.toContain("Aucune nouvelle demande");
   });
-
-  it.each([
-    { reviewStatus: "approved", aiPaused: true, analysisStatus: "done", label: "Validée" },
-    { reviewStatus: "rejected", aiPaused: true, analysisStatus: "done", label: "Refusée" },
-    { reviewStatus: null, aiPaused: true, analysisStatus: "done", label: "Reprise humaine" },
-    { reviewStatus: null, aiPaused: false, analysisStatus: "done", label: "À relire" },
-    { reviewStatus: null, aiPaused: false, analysisStatus: "pending", label: "Analyse en attente" },
-  ])("keeps the normal $label state without an AI diagnostic", async ({ label, ...row }) => {
-    const html = await renderInboxRow({ ...row, reviewId: row.reviewStatus ? "review-current" : null });
-    expect(html).toContain(`<strong>${label}</strong>`);
-    expect(html).not.toContain("Analyse IA dégradée");
-    expect(html).not.toContain("Revue humaine nécessaire");
-    expect(dependencies.open).not.toHaveBeenCalled();
+  it.each(["approved", "rejected", null])("keeps the %s human verdict visible while an incident remains separate", async reviewStatus => {
+    dependencies.dashboard.mockResolvedValue({ ...result, rows: [{ ...row, reviewStatus, incident: true, draftStatus: "Refusé" }] });
+    const html = await render();
+    expect(html).toContain(reviewStatus === "approved" ? "Dossier validé" : reviewStatus === "rejected" ? "Dossier à corriger" : "Dossier à valider");
+    expect(html).toContain("Vérification nécessaire"); expect(html).toContain("Brouillon : Refusé"); expect(dependencies.open).not.toHaveBeenCalled();
+  });
+  it.each(["partial", "error", "unknown"])("does not describe %s CRM data as no ticket", async crmStatus => {
+    dependencies.dashboard.mockResolvedValue({ ...result, rows: [{ ...row, crmStatus }] });
+    const html = await render(); expect(html).not.toContain("Aucun ticket lié"); expect(html).not.toContain("Aucun ticket nécessaire");
+  });
+  it.each(["pending", "uncertain", "failed", "succeeded"])("preserves the SAV-53 %s partnership transfer independently", async partnershipStatus => {
+    dependencies.dashboard.mockResolvedValue({ ...result, rows: [{ ...row, partnershipStatus }] });
+    const html = await render(); expect(html).toContain(partnershipStatus === "succeeded" ? "Transféré à Nathan" : "Transfert à Nathan");
+    expect(html).toContain("Brouillon : À relire");
+  });
+  it("keeps incidents and exclusions accessible without adding them to primary counts", async () => {
+    const html = await render(); expect(html).toContain("Incidents"); expect(html).toContain("Exclusions (0)");
+    expect(dependencies.incidents).not.toHaveBeenCalled();
+    dependencies.dashboard.mockResolvedValue({ ...result, view: "incidents" });
+    await render({ view: "incidents" }); expect(dependencies.incidents).toHaveBeenCalledWith(20);
   });
 });
