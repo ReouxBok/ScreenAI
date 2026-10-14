@@ -26,6 +26,6 @@ export function sav55Proposal(kind: keyof typeof SAV55_THREADS) {
     p.understanding.requests[0].summary = SAV55_SUBJECTS[kind];
     p.understanding.requests[0].product = null; p.understanding.requests[0].feature = null;
   }
-  if (kind === "noTicket" || kind === "candidate") p.decision.kind = "no_ticket_needed";
-  return p;
+  const decisionKind: "no_ticket_needed" | "ticket_pending" = kind === "noTicket" || kind === "candidate" ? "no_ticket_needed" : "ticket_pending";
+  return { ...p, decision: { ...p.decision, kind: decisionKind } };
 }

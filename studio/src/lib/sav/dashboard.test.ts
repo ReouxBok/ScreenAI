@@ -20,11 +20,11 @@ async function seed(options: { approved?: boolean; noTicket?: boolean; opening?:
   const i = ++sequence;
   const [thread] = options.threadId ? await fixture.db.select().from(savThreads).where(eq(savThreads.id, options.threadId)) : await fixture.db.insert(savThreads).values({ mailboxId, gmailThreadId: `gmail-${i}`, subject: options.subject ?? `Demande ${i}`, customerEmail: `fixture-${i}@example.invalid` }).returning();
   const proposal = structuredClone(base);
-  if (options.noTicket) proposal.decision.kind = "no_ticket_needed";
-  if (options.technical) proposal.decision.kind = "spam";
+  const decisionKind = options.technical ? "spam" : options.noTicket ? "no_ticket_needed" : "ticket_pending";
+  proposal.decision.kind = decisionKind;
   const [message] = await fixture.db.insert(savMessages).values({ mailboxId, threadId: thread.id, gmailMessageId: `message-${i}`, direction: "inbound", fromEmail: thread.customerEmail, subject: options.subject ?? thread.subject, bodyCiphertext: encryptSavPayload({ text: "Question synthétique sur le réglage de la téléphonie." }), receivedAt: new Date(Date.parse("2026-10-03T10:00:00Z") + i * 60_000), analysisStatus: "done", studioOpenedAt: options.opening === "opened" ? new Date() : null, studioOpeningTracked: options.opening !== "unknown" }).returning();
   const [run] = await fixture.db.insert(savAgentRuns).values({ messageId: message.id, runtime: "fixture", mode: "off", status: "succeeded", model: "fixture", promptRevision: "fixture", inputHash: "fixture", proposalCiphertext: encryptSavPayload(proposal) }).returning();
-  const [decision] = await fixture.db.insert(savDecisions).values({ messageId: message.id, agentRunId: run.id, kind: proposal.decision.kind, reasonCode: "fixture", explanation: "Demande synthétique", confidence: 800 }).returning();
+  const [decision] = await fixture.db.insert(savDecisions).values({ messageId: message.id, agentRunId: run.id, kind: decisionKind, reasonCode: "fixture", explanation: "Demande synthétique", confidence: 800 }).returning();
   if (options.approved) await fixture.db.insert(savProposalReviews).values({ messageId: message.id, agentRunId: run.id, decisionId: decision.id, reviewScope: "dossier", dossierSourceHash: savDossierSourceHash(proposal, message), revision: 1, status: "approved", verdict: "correct", dimensions: {}, beforeCiphertext: encryptSavPayload(proposal), afterCiphertext: encryptSavPayload(proposal), commentCiphertext: encryptSavPayload({ text: "Fictif" }), reviewedBy: "ugo@limova.ai" });
   return { thread, message, run, decision, proposal };
 }

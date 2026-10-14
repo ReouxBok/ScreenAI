@@ -139,5 +139,5 @@ export async function listSavDossierDashboard(options: { view?: string; query?: 
     const totalPages = Math.max(1, Math.ceil(total / pageSize));
     const page = Math.min(requestedPage, totalPages);
     return { rows: page === requestedPage ? requestedRows : lastPageRows, counts, page, pageSize, total, totalPages, view };
-  }, { isolationLevel: "repeatable read", readOnly: true });
+  }, { isolationLevel: "repeatable read", accessMode: "read only" });
 }
