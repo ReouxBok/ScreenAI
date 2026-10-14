@@ -43,7 +43,7 @@ export function savDashboardLearningProgress(observations: Observation[], cycles
 export type SavDashboardRow = {
   threadId: string; messageId: string; receivedAt: Date; fromEmail: string;
   summary: ReturnType<typeof buildSavInboxSummary>; opening: SavOpeningState; state: SavDashboardView;
-  reviewStatus: string | null; draftStatus: string; replyStatus: string; ticketProgress: SavTicketProgress; learning: SavLearningProgress;
+  reviewStatus: string | null; draftStatus: string; replyStatus: string; partnershipStatus: SavInboxPartnershipStatus | null; ticketProgress: SavTicketProgress; learning: SavLearningProgress;
   ticket: { id: string; title: string; status: string } | null; crmStatus: "ready" | "partial" | "error" | "unknown";
   nextAction: string; incident: boolean; technical: boolean;
 };
@@ -111,11 +111,11 @@ export async function listSavDossierDashboard(options: { view?: string; query?: 
         const learning = savDashboardLearningProgress(observations.filter(o => o.threadId === thread.id), cycles, candidates);
         const state = classifySavDossier({ opening, reviewStatus, ticket: ticketProgress, learning });
         const linkedTicket = context?.crm.data?.tickets.find(t => t.id === thread.hubspotTicketId);
-        const incident = Boolean(analysisErrorCode || ["failed", "uncertain"].includes(ticketProgress));
+        const incident = Boolean(analysisErrorCode || ["failed", "uncertain"].includes(ticketProgress) || partnershipTransferStatus && ["failed", "uncertain"].includes(partnershipTransferStatus));
         const technical = technicalKinds.has(proposal?.decision.kind ?? decision?.kind ?? "");
-        const row: SavDashboardRow = { threadId: thread.id, messageId: message.id, receivedAt: message.receivedAt, fromEmail: message.fromEmail, summary, opening, state, reviewStatus, draftStatus, replyStatus, ticketProgress, learning, incident, technical,
+        const row: SavDashboardRow = { threadId: thread.id, messageId: message.id, receivedAt: message.receivedAt, fromEmail: message.fromEmail, summary, opening, state, reviewStatus, draftStatus, replyStatus, partnershipStatus: partnershipTransferStatus, ticketProgress, learning, incident, technical,
           ticket: thread.hubspotTicketId ? { id: thread.hubspotTicketId, title: linkedTicket?.subject || `Ticket #${thread.hubspotTicketId}`, status: linkedTicket?.status === "closed" ? "Fermé" : linkedTicket?.status === "open" ? "Ouvert" : "Statut à actualiser" } : null,
-          crmStatus: context?.crm.status ?? "unknown", nextAction: savDashboardNextAction({ state, reviewStatus, ticket: ticketProgress, learning, analysisFailed: Boolean(analysisErrorCode) }) };
+          crmStatus: context?.crm.status ?? "unknown", nextAction: state === "completed" && (partnershipTransferStatus || proposal?.understanding?.requests.some(r => r.nature === "partnership")) ? summary.nextAction : savDashboardNextAction({ state, reviewStatus, ticket: ticketProgress, learning, analysisFailed: Boolean(analysisErrorCode) }) };
         if (query && ![row.fromEmail, message.subject, message.preview, summary.title, summary.problem, row.ticket?.title, row.ticket?.id].filter(Boolean).join(" ").toLocaleLowerCase("fr").includes(query)) continue;
         if (technical) counts.technical++; else { counts[state]++; if (incident) counts.incidents++; }
         if (view === "technical" ? technical : view === "incidents" ? !technical && incident : !technical && state === view) {
