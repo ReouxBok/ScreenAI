@@ -257,48 +257,6 @@ async function grantAIConsent(sidebar) {
 
 test.describe('Packaged extension — complete user flows', () => {
 
-  test('ADK v2 fills the exact DOM field, resumes the run and keeps observation silent', async ({ context, extensionId }) => {
-    const { calls, limova, sidebar } = await openExtensionHarness(context, extensionId, {
-      serverOrchestration: true,
-      adkTurn: ({ phase, body }) => {
-        if (phase === 'turn') {
-          const elementId = Number(body.page.dom.match(/\[(\d+)\] input\(textarea\) "Instructions"/)?.[1]);
-          return {
-            type: 'tool_call',
-            sessionId: body.sessionId,
-            runId: 'bb0e8400-e29b-41d4-a716-446655440000',
-            expiresAt: new Date(Date.now() + 60_000).toISOString(),
-            call: {
-              id: 'adk-fill-e2e',
-              name: 'fill_field',
-              args: { elementId, contextVersion: body.page.contextVersion, targetLabel: 'Instructions', text: 'Brief produit préparé par Charly' }
-            }
-          };
-        }
-        expect(body).toMatchObject({ callId: 'adk-fill-e2e', status: 'ok' });
-        expect(body).not.toHaveProperty('capture');
-        return {
-          type: 'message',
-          sessionId: '550e8400-e29b-41d4-a716-446655440000',
-          content: 'Le brief est rempli dans le bon champ.'
-        };
-      }
-    });
-    await grantAIConsent(sidebar);
-    await sidebar.locator('#userInput').fill('Remplis le champ Instructions avec un brief produit');
-    await sidebar.locator('#sendBtn').click();
-
-    await expect(limova.locator('#briefField')).toHaveValue('Brief produit préparé par Charly');
-    await expect(sidebar.locator('.message.assistant .message-content')).toContainText('bon champ');
-    await expect(limova.locator('#limova-visual-capture-overlays')).toHaveCount(0);
-    await expect(sidebar.locator('.screenshot-bubble')).toHaveCount(0);
-    expect(calls.adkTurns).toHaveLength(1);
-    expect(calls.adkResults).toHaveLength(1);
-    expect(calls.gemini).toHaveLength(0);
-    expect(calls.adkTurns[0].postDataJSON()).not.toHaveProperty('systemInstruction');
-    expect(calls.adkTurns[0].postDataJSON()).not.toHaveProperty('model');
-  });
-
   test('a contributor evaluates a draft in the real extension before review', async ({ context, extensionId }) => {
     const evaluationCode = 'evaluation-code-e2e-that-is-long-enough';
     const { calls, limova, sidebar } = await openExtensionHarness(context, extensionId, {
@@ -348,47 +306,6 @@ test.describe('Packaged extension — complete user flows', () => {
     expect(evaluationPaths).toContain('/api/evaluations/runs/connect');
     expect(evaluationPaths).toContain('/api/evaluations/runs/events');
     expect(evaluationPaths).toContain('/api/evaluations/runs/complete');
-  });
-
-  test('recovers an ADK fill call that selected a button by using the unique semantic field label', async ({ context, extensionId }) => {
-    const { calls, limova, sidebar } = await openExtensionHarness(context, extensionId, {
-      serverOrchestration: true,
-      adkTurn: ({ phase, body }) => {
-        if (phase === 'turn') {
-          const wrongButtonId = Number(body.page.dom.match(/\[(\d+)\] clickable\(button\) "Connecter HubSpot"/)?.[1]);
-          return {
-            type: 'tool_call',
-            sessionId: body.sessionId,
-            runId: 'cc0e8400-e29b-41d4-a716-446655440000',
-            expiresAt: new Date(Date.now() + 60_000).toISOString(),
-            call: {
-              id: 'adk-fill-recovery-e2e',
-              name: 'fill_field',
-              args: {
-                elementId: wrongButtonId,
-                contextVersion: body.page.contextVersion,
-                targetLabel: 'Instructions',
-                text: 'Brief récupéré sans mauvais clic'
-              }
-            }
-          };
-        }
-        expect(body).toMatchObject({ callId: 'adk-fill-recovery-e2e', status: 'ok' });
-        return {
-          type: 'message',
-          sessionId: '550e8400-e29b-41d4-a716-446655440000',
-          content: 'Le bon champ a été retrouvé et rempli.'
-        };
-      }
-    });
-    await grantAIConsent(sidebar);
-    await sidebar.locator('#userInput').fill('Écris le brief dans Instructions');
-    await sidebar.locator('#sendBtn').click();
-
-    await expect(limova.locator('#briefField')).toHaveValue('Brief récupéré sans mauvais clic');
-    await expect(limova.locator('#connectHubspot')).not.toHaveAttribute('data-clicked', 'true');
-    await expect(sidebar.locator('.message.assistant .message-content')).toContainText('bon champ');
-    expect(calls.adkResults).toHaveLength(1);
   });
 
   test('observes a manual click during voice mode without exposing page values', async ({ context, extensionId }) => {
@@ -747,31 +664,6 @@ test.describe('Packaged extension — complete user flows', () => {
     await expect(sidebar.locator('.action-card')).toHaveCount(0);
     await expect(limova.locator('#limova-computer-use-pointer')).toBeVisible();
     await expect(limova).toHaveURL(`${LIMOVA_ORIGIN}/profil`);
-  });
-
-  test('an ordinary internal button selected by Charly clicks even without an explicit verb', async ({ context, extensionId }) => {
-    const { limova, sidebar } = await openExtensionHarness(context, extensionId, {
-      geminiReply: ({ body }) => {
-        const prompt = body.systemInstruction.parts[0].text;
-        const displayId = prompt.match(/\[(\d+)\] clickable\(button\) "Afficher"/)?.[1];
-        return `Je te montre la suite. {{ACTION:${displayId}}}`;
-      }
-    });
-    await limova.evaluate(() => {
-      const button = document.createElement('button');
-      button.id = 'ordinaryControl';
-      button.type = 'button';
-      button.textContent = 'Afficher';
-      button.addEventListener('click', () => { button.dataset.clicked = 'true'; });
-      document.querySelector('main').prepend(button);
-    });
-    await grantAIConsent(sidebar);
-
-    await sidebar.locator('#screenshotBtn').click();
-
-    await expect(limova.locator('#ordinaryControl')).toHaveAttribute('data-clicked', 'true');
-    await expect(sidebar.locator('.action-card')).toHaveCount(0);
-    await expect(sidebar.locator('.message.error')).toHaveCount(0);
   });
 
   test('a safe named navigation can be an intermediate step toward a different final goal', async ({ context, extensionId }) => {

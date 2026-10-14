@@ -1,5 +1,6 @@
 import { test as base, chromium } from '@playwright/test';
 import { createServer } from 'node:https';
+import { randomUUID } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
 import { mkdtemp, readFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -12,7 +13,6 @@ export const USER = '11111111-1111-4111-8111-111111111111';
 export const WORKSPACE = '22222222-2222-4222-8222-222222222222';
 export const AGENT = '33333333-3333-4333-8333-333333333333';
 export const CONVERSATION = '44444444-4444-4444-8444-444444444444';
-const TURN = '55555555-5555-4555-8555-555555555555';
 const frame = (event, data) => `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
 
 export const test = base.extend({
@@ -21,7 +21,8 @@ export const test = base.extend({
     const key = path.join(directory, 'key.pem'), cert = path.join(directory, 'cert.pem');
     execFileSync('openssl', ['req', '-x509', '-newkey', 'rsa:2048', '-nodes', '-keyout', key, '-out', cert, '-days', '1', '-subj', '/CN=limova-native-chat'], { stdio: 'ignore' });
     const calls = [], history = [], legacy = [], errors = [];
-    const state = { created: false, reply: 'Je retrouve le tableau de bord.', authenticated: true, enabled: true };
+    const state = { created: false, reply: 'Je retrouve le tableau de bord.', authenticated: true, enabled: true, browserActions: [{ operation: 'read_page' }] };
+    let turnId, actionIndex = 0;
     let context;
     const server = createServer({ key: await readFile(key), cert: await readFile(cert) }, (request, response) => {
       let raw = ''; request.on('data', chunk => { raw += chunk; });
@@ -34,7 +35,7 @@ export const test = base.extend({
         if (request.method === 'OPTIONS') { response.writeHead(204, headers); response.end(); return; }
         if (request.headers.host === new URL(APP).host) {
           response.writeHead(200, { 'content-type': 'text/html' });
-          response.end('<!doctype html><title>Limova</title><main><h1>Tableau de bord</h1><input type="password" value="NEVER_TRANSMIT_THIS_SECRET"><textarea aria-label="Brief">PRIVATE_FIELD_VALUE</textarea><button id="action">Continuer</button></main><script>window.clicks=0;document.getElementById("action").onclick=()=>window.clicks++;</script>'); return;
+          response.end('<!doctype html><title>Limova</title><main><h1>Tableau de bord</h1><input type="password" value="NEVER_TRANSMIT_THIS_SECRET"><textarea aria-label="Brief">PRIVATE_FIELD_VALUE</textarea><button id="action">Continuer</button></main><script>window.inputEvents=0;document.querySelector("textarea").addEventListener("input",()=>window.inputEvents++);window.clicks=0;document.getElementById("action").onclick=()=>window.clicks++;</script>'); return;
         }
         if (url.pathname === '/fixture-login') {
           response.writeHead(200, { ...headers, 'set-cookie': 'native_chat=authenticated; Path=/; HttpOnly; Secure; SameSite=None; Partitioned' }); response.end('{}'); return;
@@ -59,21 +60,24 @@ export const test = base.extend({
           response.writeHead(201, { ...headers, 'content-type': 'text/event-stream' });
           if (!body.kind) {
             history.push({ id: `human-${history.length}`, role: 'user', content: body.content });
-            if (body.browserContext) {
-              response.end(frame('custom', { type: 'extension.action_requested', protocolVersion: 1, turnId: TURN,
-                actionId: 'read-initial', toolCallId: 'read-initial', target: body.browserContext, input: { operation: 'read_page' },
-                expiresAt: new Date(Date.now() + 60000).toISOString() }) + frame('custom', { type: 'extension.turn_state', turnId: TURN, state: 'waiting' })); return;
-            }
+            turnId = randomUUID(); actionIndex = 0;
+          }
+          if (body.browserContext && actionIndex < state.browserActions.length) {
+            const step = state.browserActions[actionIndex++];
+            const input = typeof step === 'function' ? step(body) : step;
+            response.end(frame('custom', { type: 'extension.action_requested', protocolVersion: 1, turnId,
+              actionId: `${turnId}:action-${actionIndex}`, toolCallId: `tool-${actionIndex}`, target: body.browserContext, input,
+              expiresAt: new Date(Date.now() + 60000).toISOString() }) + frame('custom', { type: 'extension.turn_state', turnId, state: 'waiting' })); return;
           }
           history.push({ id: `assistant-${history.length}`, role: 'assistant', content: state.reply });
-          response.end(frame('values', { messages: history }) + (body.browserContext ? frame('custom', { type: 'extension.turn_state', turnId: TURN, state: 'completed' }) : '')); return;
+          response.end(frame('values', { messages: history }) + (body.browserContext ? frame('custom', { type: 'extension.turn_state', turnId, state: 'completed' }) : '')); return;
         }
         return json({ error: 'route' }, 404);
       });
     });
     await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
     try {
-      const port = server.address().port, extension = path.resolve(process.env.EXTENSION_PATH ?? 'build');
+      const port = server.address().port, extension = path.resolve(process.env.EXTENSION_PATH ?? (process.env.LIMOVA_E2E_ENV === 'staging' ? 'build-staging' : 'build'));
       context = await chromium.launchPersistentContext('', { channel: 'chromium', headless: true, ignoreHTTPSErrors: true,
         args: [`--disable-extensions-except=${extension}`, `--load-extension=${extension}`, '--no-proxy-server', '--ignore-certificate-errors',
           `--host-resolver-rules=MAP ${new URL(API).hostname} 127.0.0.1:${port}, MAP ${new URL(APP).hostname} 127.0.0.1:${port}, MAP * ~NOTFOUND`] });
