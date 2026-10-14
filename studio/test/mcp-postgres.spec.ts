@@ -1,6 +1,9 @@
 import { randomUUID } from "node:crypto";
 import { createServer, type Server } from "node:https";
 import { readFileSync } from "node:fs";
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
+import path from "node:path";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
@@ -187,7 +190,21 @@ describe.sequential("Studio MCP with migrated PostgreSQL and real content servic
     expect(audits.map(row => row.action)).toEqual(expect.arrayContaining([
       "onboarding_template_draft_saved", "onboarding_template_published",
     ]));
-  });
+    const apiCheckout = process.env.STUDIO_MCP_API_CHECKOUT;
+    if (apiCheckout) {
+      const run = promisify(execFile);
+      const qualification = await run(path.join(apiCheckout, "node_modules/.bin/vitest"), ["run", "--reporter=json",
+        "src/modules/agentic-v2/__test__/integration/studio-mcp-real-service.integration.spec.ts"], {
+        cwd: apiCheckout, timeout: 45_000,
+        env: { ...process.env, STUDIO_MCP_QUALIFICATION_URL: `${origin}/api/mcp`,
+          STUDIO_MCP_QUALIFICATION_TOKEN: token, STUDIO_MCP_QUALIFICATION_REVISION: publication.revision,
+          LANGCHAIN_TRACING_V2: "false", LANGSMITH_TRACING: "false" },
+      });
+      expect(JSON.parse(qualification.stdout)).toMatchObject({
+        success: true, numPassedTests: 3, numPendingTests: 0, numFailedTests: 0,
+      });
+    }
+  }, 60_000);
 
   it("stops returning a published item as soon as AI access is disabled", async () => {
     await requireDb().update(schema.contentItems).set({ aiEnabled: false }).where(eq(schema.contentItems.id, publishedId));
