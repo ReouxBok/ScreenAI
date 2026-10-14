@@ -145,11 +145,25 @@ it('routes an explicitly browser-enabled message through the durable turn runner
     yield { event: 'custom', data: { type: 'extension.turn_state', turnId: 'backend-turn', state: 'completed' } };
   });
   await open(h.background);
-  const result = await h.background.handle({ type: 'LIMOVA_SEND_MESSAGE', text: 'Lis cette page', browser: true });
+  const result = await h.background.handle({ type: 'LIMOVA_SEND_MESSAGE', text: 'Lis cette page', browser: true,
+    browserMode: 'observe', browserTabId: 42 });
   expect(result.browserState).toBe('completed');
   expect(createDriver.mock.calls[0][0].scope.sessionId).toBe('browser-session');
+  expect(createDriver.mock.calls[0][0].expectedTabId).toBe(42);
   expect(h.client.sendMessage.mock.calls[0][4]).toEqual({ sessionId: 'browser-session', page: { tabId: 1, origin: 'https://example.com', contextVersion: 1 } });
   expect(h.notify).toHaveBeenCalledWith(expect.objectContaining({ type: 'LIMOVA_BROWSER_STATE', state: 'completed', browserTurnId: 'backend-turn', turnId: result.turnId }));
+});
+
+it.each([
+  { browser: true, browserTabId: 1 },
+  { browser: false, browserMode: 'observe', browserTabId: 1 },
+  { browser: true, browserMode: 'observe', browserTabId: -1 },
+  { browser: true, browserMode: 'observe', browserTabId: 1.5 },
+])('rejects an invalid pinned browser target %#', async request => {
+  const h = harness({ createDriver: vi.fn() });
+  await open(h.background);
+  await expect(h.background.handle({ type: 'LIMOVA_SEND_MESSAGE', text: 'Observe', ...request })).rejects.toThrow('Onglet de suivi invalide');
+  expect(h.client.sendMessage).not.toHaveBeenCalled();
 });
 
 it('does not silently send a browser request as a text-only request without a driver', async () => {

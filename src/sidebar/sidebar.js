@@ -1,4 +1,5 @@
 import { createTabGuidance } from '../limova/tab-guidance.js';
+import { createContextFollow } from '../limova/context-follow.js';
 import { TrainingTranscriptionSession } from './training-transcription.js';
 import { createTranscriptionTransport } from '../limova/transcription-transport.js';
 import { DeepAgentVoiceSession } from './deep-agent-voice.js';
@@ -79,6 +80,7 @@ let activeTrainingSession = null;
 let activeTrainingToken = '';
 let sitePermissionUI;
 let limovaPanel = null;
+let contextFollow = null;
 let nativeTabGuidance = null;
 let backgroundPort = null;
 let backgroundReconnectTimer = null;
@@ -99,6 +101,34 @@ document.addEventListener('DOMContentLoaded', async () => {
   sitePermissionUI = bindSitePermissions({ document, permissions: chrome.permissions, tabs: chrome.tabs, translate: key => t(key) });
   const returnTab = document.getElementById('limovaReturnTab');
   nativeTabGuidance = createTabGuidance({ chrome, onChange: state => { returnTab.hidden = state !== 'away'; } });
+  const follow = document.getElementById('limovaFollow');
+  let followTarget, followGeneration = 0, followStarting = false;
+  const stopFollowing = () => { ++followGeneration; follow.checked = false; };
+  contextFollow = createContextFollow({ chrome, isBusy: () => isLoading,
+    isAllowed: async () => !trainingCaptureActive && !voiceSession?.active
+      && (await chrome.runtime.sendMessage({ type: 'GET_PRIVACY_STATE', clientSurface: 'chrome_extension' }))?.aiProcessing === true,
+    observe: tabId => trainingCaptureActive || voiceSession?.active ? false : limovaPanel.analyzePage(tabId), onStop: stopFollowing,
+    cancel: () => chrome.runtime.sendMessage({ type: 'LIMOVA_CANCEL' }).catch(() => {}),
+  });
+  follow.addEventListener('change', async () => {
+    if (!follow.checked) {
+      contextFollow.stop();
+      if (followStarting) await chrome.runtime.sendMessage({ type: 'LIMOVA_CANCEL' }).catch(() => {});
+      return;
+    }
+    const current = ++followGeneration;
+    if (!await ensureAIConsent()) { contextFollow.stop(); return; }
+    const [active] = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
+    if (current !== followGeneration || !Number.isSafeInteger(active?.id)) return;
+    followTarget = undefined;
+    followStarting = true;
+    const ok = await limovaPanel.analyzePage(active.id);
+    followStarting = false;
+    if (current !== followGeneration) return;
+    if (!ok || followTarget === undefined) { contextFollow.stop(); return; }
+    contextFollow.start(followTarget);
+    follow.checked = true;
+  });
   returnTab.addEventListener('click', () => { void nativeTabGuidance.returnToTarget(); });
   document.getElementById('limovaBrowser').addEventListener('change', event => {
     if (!event.target.checked) nativeTabGuidance.clear();
@@ -106,8 +136,8 @@ document.addEventListener('DOMContentLoaded', async () => {
   limovaPanel = createLimovaPanel({
     document,
     translate: key => t(key),
-    onBrowserTarget: tabId => nativeTabGuidance.bind(tabId),
-    onContextChange: () => { nativeTabGuidance.clear(); if (voiceSession?.native) voiceSession.stop(); },
+    onBrowserTarget: tabId => { followTarget = tabId; nativeTabGuidance.bind(tabId); },
+    onContextChange: () => { contextFollow.stop(); nativeTabGuidance.clear(); if (voiceSession?.native) voiceSession.stop(); },
     request: request => chrome.runtime.sendMessage(request),
     onBusy: busy => { isLoading = busy; elements.sendBtn.disabled = busy; elements.screenshotBtn.disabled = busy; elements.chatContainer.querySelectorAll('.next-step-link').forEach(button => { button.disabled = busy; }); },
     render: renderLimovaConversation,
@@ -566,6 +596,7 @@ async function completeEvaluation(verdict) {
 }
 
 function showTrainingActive(session) {
+  contextFollow?.stop();
   trainingCaptureActive = true;
   elements.trainingPanel.hidden = false;
   elements.trainingToken.hidden = true;
@@ -1086,6 +1117,7 @@ async function toggleVoice() {
   }
   try {
     if (!(await ensureAIConsent())) return;
+    contextFollow?.stop();
     const mode = await chrome.runtime.sendMessage({ type: 'GET_STATE', clientSurface: 'chrome_extension' });
     if (trainingCaptureActive || mode?.training) {
       if (!mode?.training?.id) throw new Error('Aucune démonstration active.');

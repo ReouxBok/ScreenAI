@@ -254,8 +254,8 @@ it('relocalizes selectors without interrupting an active native voice session', 
  it('analyzes through a native observation turn without granting general browser actions', async () => {
    const { panel, request } = setup();
    await panel.refresh();
-   await panel.analyzePage();
-   expect(request).toHaveBeenCalledWith(expect.objectContaining({ type: 'LIMOVA_SEND_MESSAGE', browser: true, browserMode: 'observe' }));
+   await panel.analyzePage(42);
+   expect(request).toHaveBeenCalledWith(expect.objectContaining({ type: 'LIMOVA_SEND_MESSAGE', browser: true, browserMode: 'observe', browserTabId: 42 }));
    expect(element('limovaBrowser').checked).toBe(false);
    request.mockClear();
    panel.setVoiceBusy(true);

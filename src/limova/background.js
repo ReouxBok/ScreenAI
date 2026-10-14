@@ -228,6 +228,8 @@ export function createLimovaBackground({ storage, openTab, openFile = async () =
       case 'LIMOVA_SEND_MESSAGE': {
         if (request.type === 'LIMOVA_RESUME_BROWSER' && request.browser !== true) throw new Error('Autorise le navigateur avant de reprendre ce tour.');
         if (request.browserMode !== undefined && request.browserMode !== 'observe') throw new Error('Mode navigateur invalide.');
+        if (request.browserTabId !== undefined && (request.browser !== true || request.browserMode !== 'observe'
+          || !Number.isSafeInteger(request.browserTabId) || request.browserTabId < 0)) throw new Error('Onglet de suivi invalide.');
         if (activeTurn) throw new Error('Un tour est déjà en cours.');
         if (!conversationId) throw new Error('Ouvre une conversation Limova.');
         const turn = { id: crypto.randomUUID(), context: requireContext(), conversationId, evaluationCode: evaluation?.code, controller: new AbortController() };
@@ -249,6 +251,7 @@ export function createLimovaBackground({ storage, openTab, openFile = async () =
             if (!createDriver) throw new Error('Le pilote navigateur est indisponible.');
             const sessionId = await journal.getSession(turn.context);
             const driver = createDriver({ scope: { ...turn.context, sessionId }, journal, signal: turn.controller.signal,
+              expectedTabId: request.browserTabId,
               onBound: tabId => { if (activeTurn === turn && !turn.controller.signal.aborted) notify({ type: 'LIMOVA_BROWSER_TARGET', conversationId: turn.conversationId, turnId: turn.id, tabId }); },
               uploadScreenshot: (image, signal) => client.uploadBrowserScreenshot(turn.context, turn.conversationId, image, signal) });
             const runner = createBrowserTurnRunner({ client, journal, readPage: driver.readPage,
