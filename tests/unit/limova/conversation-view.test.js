@@ -81,3 +81,56 @@ it('excludes hidden generated content, tool payloads and unsafe carousel URLs', 
   ] });
   expect(view.snapshot()).toEqual({ messages: [], files: [], error: null });
 });
+
+it('projects only structured root plans, updates their anchor and preserves historical turns', () => {
+  const view = createConversationView();
+  const human = { id: 'h', type: 'human', content: 'Accompagne-moi' };
+  const plan = todos => ({ id: 'p', type: 'ai', content: '', tool_calls: [{ name: 'write_todos', args: { todos } }] });
+  const todo = { content: 'Connecter Gmail', status: 'in_progress' };
+  view.event({ event: 'values', data: { messages: [human, plan([todo])] } });
+  expect(view.snapshot().plans).toEqual([{ messageId: 'h', todos: [todo] }]);
+  const answer = { id: 'a', type: 'ai', content: 'Connexion terminée' };
+  const completed = { ...todo, status: 'completed' };
+  view.event({ event: 'values', data: { messages: [human, plan([completed]), answer] } });
+  expect(view.snapshot().plans).toEqual([{ messageId: 'a', todos: [completed] }]);
+  view.event({ event: 'values|subagent', data: { messages: [human, plan([])] } });
+  expect(view.snapshot().plans[0].todos).toEqual([completed]);
+  view.event({ event: 'values', data: { messages: [human, plan([completed]), answer,
+    { id: 'h2', type: 'human', content: 'Bonjour' }, { id: 'a2', type: 'ai', content: 'Bonjour' }], todos: [completed] } });
+  expect(view.snapshot().plans).toHaveLength(1);
+  view.reset();
+  expect(view.snapshot().plans).toBeUndefined();
+});
+
+it('restores persisted plans without exposing reasoning and ignores hidden or invalid anchors', () => {
+  const view = createConversationView();
+  const todo = { content: '<img onerror=alert(1)>', status: 'pending', secret: 'omit' };
+  view.history({ data: [{ id: 'a', role: 'assistant', content: 'Réponse' },
+    { id: 'hidden', role: 'assistant', content: 'secret', toShow: false }], reasoning: [
+    { anchorMessageId: 'a', todos: [todo, null, { content: 'invalid', status: 'other' }], reasoningText: 'PRIVATE_REASONING' },
+    { anchorMessageId: 'hidden', todos: [todo] }, { anchorMessageId: 'missing', todos: [todo] },
+  ] });
+  expect(view.snapshot().plans).toEqual([{ messageId: 'a', todos: [{ content: todo.content, status: 'pending' }] }]);
+  expect(JSON.stringify(view.snapshot())).not.toContain('PRIVATE_REASONING');
+  view.history({ data: [{ id: 'older', role: 'assistant', content: 'Ancien' }], reasoning: [
+    { anchorMessageId: 'older', todos: [{ content: 'Ancien plan', status: 'completed' }] },
+    { anchorMessageId: 'a', todos: [] },
+  ] }, { prepend: true });
+  expect(view.snapshot().plans).toHaveLength(2);
+});
+
+it('clears a withdrawn plan and never reads hidden planning calls', () => {
+  const view = createConversationView();
+  const human = { id: 'h', type: 'human', content: 'Aide-moi' };
+  const call = { id: 'p', type: 'ai', content: '', tool_calls: [{ name: 'write_todos', args: {
+    todos: [{ content: 'Étape', status: 'pending' }],
+  } }] };
+  view.event({ event: 'values', data: { messages: [human, call] } });
+  expect(view.snapshot().plans).toHaveLength(1);
+  view.event({ event: 'values', data: { messages: [human, { ...call,
+    tool_calls: [{ name: 'write_todos', args: { todos: [] } }],
+  }] } });
+  expect(view.snapshot().plans).toBeUndefined();
+  view.event({ event: 'values', data: { messages: [human, { ...call, toShow: false }] } });
+  expect(view.snapshot().plans).toBeUndefined();
+});

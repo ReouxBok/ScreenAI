@@ -148,3 +148,31 @@ for (const entry of ['limovaNew', 'resetBtn']) test(`native ${entry} starts a se
   expect(calls.some(call => call.method === 'DELETE' || call.path.includes('/auth/logout'))).toBe(false);
   expect(legacy).toEqual([]); expect(errors).toEqual([]);
 });
+
+test('native plan follows backend statuses and survives reload without exposing reasoning or HTML', async ({ nativeChat }) => {
+  const { panel, state, legacy, errors } = nativeChat;
+  state.todos = [
+    { content: 'Ouvrir les intégrations', status: 'completed' },
+    { content: '<img src=x onerror=alert(1)> Connecter Gmail', status: 'in_progress' },
+    { content: 'Vérifier la connexion', status: 'pending' },
+  ];
+  await panel.locator('#userInput').fill('Guide-moi pour connecter Gmail');
+  await panel.locator('#sendBtn').click();
+  const plan = panel.locator('.native-agent-plan');
+  await expect(plan).toHaveCount(1);
+  await expect(plan.locator('li')).toHaveCount(3);
+  await expect(plan.locator('[data-status="in_progress"]')).toContainText('En cours');
+  await expect(plan.locator('img')).toHaveCount(0);
+  await expect(panel.locator('#sendBtn')).toBeEnabled();
+  await panel.reload();
+  await expect(plan).toHaveCount(1);
+  await expect(plan.locator('[data-status="completed"]')).toContainText('Ouvrir les intégrations');
+  await expect(panel.locator('body')).not.toContainText('PRIVATE_PLAN_REASONING');
+  state.todos = undefined;
+  await panel.locator('#userInput').fill('Merci');
+  await panel.locator('#sendBtn').click();
+  await expect(panel.locator('.message.assistant')).toHaveCount(2);
+  await expect(plan).toHaveCount(1);
+  expect(legacy).toEqual([]);
+  expect(errors).toEqual([]);
+});

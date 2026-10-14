@@ -24,11 +24,18 @@ function visibleFile(file) {
   } catch { return null; }
 }
 
+function visibleTodos(items) {
+  return Array.isArray(items) ? items.filter(item => item && typeof item.content === 'string'
+    && item.content.trim() && ['pending', 'in_progress', 'completed'].includes(item.status))
+    .map(({ content, status }) => ({ content, status })) : [];
+}
+
 export function createConversationView() {
   const messages = new Map();
   const files = new Map();
   const sealed = new Set();
   const captions = new Map();
+  const plans = new Map();
   let error = null;
 
   function addFiles(items, messageId, reorder = false) {
@@ -48,8 +55,9 @@ export function createConversationView() {
   }
 
   return {
-    reset() { messages.clear(); files.clear(); sealed.clear(); captions.clear(); error = null; },
+    reset() { messages.clear(); files.clear(); sealed.clear(); captions.clear(); plans.clear(); error = null; },
     history(page, { prepend = false } = {}) {
+      if (!prepend) plans.clear();
       const recent = prepend ? [...messages.entries()] : null;
       if (prepend) messages.clear();
       const items = Array.isArray(page?.data) ? page.data : [];
@@ -67,6 +75,10 @@ export function createConversationView() {
         }
       });
       if (recent) recent.forEach(([id, message]) => messages.set(id, message));
+      if (Array.isArray(page?.reasoning)) page.reasoning.forEach(turn => {
+        if (typeof turn?.anchorMessageId !== 'string' || !messages.has(turn.anchorMessageId)) return;
+        if (!prepend || !plans.has(turn.anchorMessageId)) plans.set(turn.anchorMessageId, visibleTodos(turn.todos));
+      });
       addFiles(page?.unanchoredGeneratedFiles);
     },
     event(frame) {
@@ -76,10 +88,29 @@ export function createConversationView() {
       if (frame.event === 'error') {
         error = 'La réponse a été interrompue. Recharge la conversation avant de réessayer.';
       } else if (frame.event === 'values' && Array.isArray(frame.data?.messages)) {
+        let anchor = null;
+        let todos = null;
+        let turnAnchors = [];
+        const finishPlan = () => {
+          if (todos === null || !anchor) return;
+          turnAnchors.forEach(id => plans.delete(id));
+          plans.set(anchor, todos);
+        };
         frame.data.messages.forEach(message => {
+          const visible = visibleMessage(message);
+          if (visible?.role === 'user') {
+            finishPlan(); anchor = visible.id; todos = null; turnAnchors = [visible.id];
+          } else if (visible?.role === 'assistant') {
+            turnAnchors.push(visible.id);
+            if (visible.content.trim()) anchor = visible.id;
+            if (Array.isArray(message.tool_calls)) message.tool_calls.forEach(call => {
+              if (call?.name === 'write_todos') todos = visibleTodos(call.args?.todos);
+            });
+          }
           replace(message);
           if (typeof message?.id === 'string') sealed.add(message.id);
         });
+        finishPlan();
       } else if (frame.event === 'messages' && Array.isArray(frame.data)) {
         const [chunk, metadata] = frame.data;
         if (metadata?.langgraph_checkpoint_ns?.includes('|')) return;
@@ -96,7 +127,9 @@ export function createConversationView() {
       return { messages: [...messages.values()]
         .filter(message => message.content || captions.has(message.id) || attached.has(message.id))
         .map(message => captions.has(message.id) ? { ...message, caption: captions.get(message.id) } : message),
-        files: [...files.values()], error };
+        files: [...files.values()], error,
+        ...([...plans.values()].some(items => items.length) ? { plans: [...plans.entries()]
+          .filter(([, items]) => items.length).map(([messageId, todos]) => ({ messageId, todos })) } : {}) };
     },
   };
 }
