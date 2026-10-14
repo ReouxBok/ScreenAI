@@ -6,7 +6,9 @@ test('mounts the Limova session panel and renders the existing Charly history', 
   page.on('pageerror', error => errors.push(error.message));
   await page.addInitScript(() => {
     const original = chrome.runtime.sendMessage.bind(chrome.runtime);
+    window.nativeRequests = [];
     chrome.runtime.sendMessage = async request => {
+      if (request.type.startsWith('LIMOVA_')) window.nativeRequests.push(request.type);
       if (request.type === 'LIMOVA_GET_STATE') return {
         authenticated: true, user: { id: 'user' }, context: { userId: 'user', workspaceId: 'workspace' },
         workspaces: [{ id: 'workspace', name: 'Équipe de test', enabled: true }], conversationId: 'conversation', activeTurnId: null,
@@ -57,6 +59,22 @@ test('mounts the Limova session panel and renders the existing Charly history', 
   await expect(page.locator('#chatContainer')).toContainText('Mon premier message historique');
   await expect(page.locator('#chatContainer .message').first()).toContainText('Mon premier message historique');
   await expect(page.locator('#limovaOlderMessages')).toBeHidden();
+  await page.locator('#limovaBrowser').check();
+  const requestCount = await page.evaluate(() => window.nativeRequests.length);
+  for (const [lang, label, placeholder] of [
+    ['en', 'New conversation', 'Resume a conversation'],
+    ['es', 'Nueva conversación', 'Retomar una conversación'],
+    ['fr', 'Nouvelle conversation', 'Reprendre une conversation'],
+  ]) {
+    await page.evaluate(lang => document.querySelector(`.lang-option[data-lang="${lang}"]`).click(), lang);
+    await expect(page.locator('html')).toHaveAttribute('lang', lang);
+    await expect(page.locator('#limovaNew')).toHaveText(label);
+    await expect(page.locator('#limovaConversation option').first()).toHaveText(placeholder);
+    await expect(page.locator('#limovaConversation')).toHaveValue('conversation');
+    await expect(page.locator('#limovaBrowser')).toBeChecked();
+    await expect(page.locator('#chatContainer')).toContainText('Mon premier message historique');
+    expect(await page.evaluate(() => window.nativeRequests.length)).toBe(requestCount);
+  }
   expect(errors).toEqual([]);
   await page.close();
 });

@@ -38,3 +38,16 @@ it('suggests only the origin without page path or query', async () => {
   el('limovaSiteDetect').click();
   await vi.waitFor(() => expect(el('limovaSiteOrigin').value).toBe('https://example.com'));
 });
+
+
+it('relocalizes the existing permission result without requesting access again', async () => {
+  let language = 'en';
+  const permissions = { request: vi.fn().mockResolvedValue(true) };
+  const ui = bindSitePermissions({ document, permissions, tabs: {}, translate: () => `${language}: {origin}` });
+  el('limovaSiteOrigin').value = 'https://example.com/private?secret=hidden';
+  el('limovaSiteAllow').click();
+  await vi.waitFor(() => expect(el('limovaSiteStatus').textContent).toBe('en: https://example.com'));
+  language = 'es'; ui.relocalize();
+  expect(el('limovaSiteStatus').textContent).toBe('es: https://example.com');
+  expect(permissions.request).toHaveBeenCalledTimes(1);
+});

@@ -128,6 +128,17 @@ describe('sidebar/i18n.js', () => {
   });
 
   describe('translation coverage', () => {
+    it('localizes an existing Deep Agent status without replacing controls', async () => {
+      document.body.innerHTML = '<p data-i18n="limovaLoginHint"></p><label><input type="checkbox" checked><span data-i18n="limovaBrowserConsent"></span></label>';
+      const checkbox = document.querySelector('input');
+      for (const language of ['en', 'es', 'fr']) {
+        await i18n.setLang(language);
+        expect(document.querySelector('p').textContent).toBe(i18n.translations[language].limovaLoginHint);
+        expect(document.querySelector('input')).toBe(checkbox);
+        expect(checkbox.checked).toBe(true);
+      }
+    });
+
     it('all locales share the same keys', () => {
       const fr = Object.keys(i18n.translations.fr);
       const en = Object.keys(i18n.translations.en);

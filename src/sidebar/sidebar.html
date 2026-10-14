@@ -11,36 +11,36 @@
     <section class="auth-panel" id="authPanel" aria-labelledby="authTitle" hidden>
       <div class="auth-card">
         <img src="../../assets/branding/charly.png" alt="" class="auth-avatar">
-        <span class="auth-kicker">Accès Limova</span>
-        <h1 id="authTitle">Retrouve ton compte Limova</h1>
-        <p id="authIntro">Connecte-toi dans l’application Limova pour retrouver Charly, tes conversations et tes intégrations.</p>
-        <button type="button" id="limovaLogin">Ouvrir Limova</button>
-        <button type="button" class="auth-secondary" id="limovaRefresh">Actualiser ma connexion</button>
+        <span class="auth-kicker" data-i18n="limovaAccess">Accès Limova</span>
+        <h1 id="authTitle" data-i18n="limovaAccountTitle">Retrouve ton compte Limova</h1>
+        <p id="authIntro" data-i18n="limovaAccountIntro">Connecte-toi dans l’application Limova pour retrouver Charly, tes conversations et tes intégrations.</p>
+        <button type="button" id="limovaLogin" data-i18n="limovaOpenApp">Ouvrir Limova</button>
+        <button type="button" class="auth-secondary" id="limovaRefresh" data-i18n="limovaRefreshLogin">Actualiser ma connexion</button>
         <p class="auth-feedback" id="authFeedback" role="status" aria-live="polite"></p>
-        <a href="https://bienvenue.limova.ai/" target="_blank" rel="noopener noreferrer">Je n’ai pas encore de compte Limova</a>
+        <a href="https://bienvenue.limova.ai/" target="_blank" rel="noopener noreferrer" data-i18n="limovaNoAccount">Je n’ai pas encore de compte Limova</a>
       </div>
     </section>
 
-    <section id="limovaControls" class="limova-controls" aria-label="Conversations Limova" hidden>
-      <label for="limovaWorkspace">Espace Limova</label>
+    <section id="limovaControls" class="limova-controls" aria-label="Conversations Limova" data-i18n-aria-label="limovaConversations" hidden>
+      <label for="limovaWorkspace" data-i18n="limovaWorkspace">Espace Limova</label>
       <select id="limovaWorkspace"></select>
-      <label for="limovaConversation">Conversation</label>
+      <label for="limovaConversation" data-i18n="limovaConversationName">Conversation</label>
       <select id="limovaConversation"></select>
       <div class="limova-control-actions">
-        <button id="limovaMoreConversations" type="button" hidden>Plus de conversations</button>
-        <button id="limovaOlderMessages" type="button" hidden>Messages précédents</button>
-        <button id="limovaNew" type="button" disabled>Nouvelle conversation</button>
-        <button id="limovaRefreshSession" type="button">Actualiser</button>
-        <button id="limovaResume" type="button">Reprendre le tour navigateur</button>
-        <button id="limovaCancel" type="button" hidden>Arrêter</button>
+        <button id="limovaMoreConversations" type="button" hidden data-i18n="limovaMoreConversations">Plus de conversations</button>
+        <button id="limovaOlderMessages" type="button" hidden data-i18n="limovaOlderMessages">Messages précédents</button>
+        <button id="limovaNew" type="button" disabled data-i18n="limovaNew">Nouvelle conversation</button>
+        <button id="limovaRefreshSession" type="button" data-i18n="limovaRefresh">Actualiser</button>
+        <button id="limovaResume" type="button" data-i18n="limovaResume">Reprendre le tour navigateur</button>
+        <button id="limovaCancel" type="button" hidden data-i18n="limovaStop">Arrêter</button>
       </div>
-      <label><input id="limovaBrowser" type="checkbox"> Autoriser Charly à lire et agir sur l’onglet actif pour ce message</label>
+      <label><input id="limovaBrowser" type="checkbox"> <span data-i18n="limovaBrowserConsent">Autoriser Charly à lire et agir sur l’onglet actif pour ce message</span></label>
       <details>
-        <summary>Autoriser un autre site</summary>
-        <label for="limovaSiteOrigin">Adresse du site (HTTPS)</label>
+        <summary data-i18n="limovaOtherSite">Autoriser un autre site</summary>
+        <label for="limovaSiteOrigin" data-i18n="limovaSiteAddress">Adresse du site (HTTPS)</label>
         <input id="limovaSiteOrigin" type="url" placeholder="https://exemple.com">
-        <button id="limovaSiteDetect" type="button">Utiliser le site actif</button>
-        <button id="limovaSiteAllow" type="button">Autoriser ce site</button>
+        <button id="limovaSiteDetect" type="button" data-i18n="limovaSiteDetect">Utiliser le site actif</button>
+        <button id="limovaSiteAllow" type="button" data-i18n="limovaSiteAllow">Autoriser ce site</button>
         <p id="limovaSiteStatus" role="status" aria-live="polite"></p>
       </details>
       <p id="limovaFeedback" role="status" aria-live="polite"></p>

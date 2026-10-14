@@ -76,6 +76,7 @@ let trainingCaptureActive = false;
 let trainingScreenRecorder = null;
 let activeTrainingSession = null;
 let activeTrainingToken = '';
+let sitePermissionUI;
 let limovaPanel = null;
 let backgroundPort = null;
 let backgroundReconnectTimer = null;
@@ -93,9 +94,10 @@ document.addEventListener('DOMContentLoaded', async () => {
   applyTranslations();
   updateLangSwitcher();
   renderAnnouncements();
-  bindSitePermissions({ document, permissions: chrome.permissions, tabs: chrome.tabs });
+  sitePermissionUI = bindSitePermissions({ document, permissions: chrome.permissions, tabs: chrome.tabs, translate: key => t(key) });
   limovaPanel = createLimovaPanel({
     document,
+    translate: key => t(key),
     onContextChange: () => { if (voiceSession?.native) voiceSession.stop(); },
     request: request => chrome.runtime.sendMessage(request),
     onBusy: busy => { isLoading = busy; elements.sendBtn.disabled = busy; },
@@ -157,7 +159,7 @@ function initEventListeners() {
   document.getElementById('langSwitcher')?.addEventListener('click', (e) => {
     const btn = e.target.closest('.lang-option');
     if (btn?.dataset.lang) {
-      setLang(btn.dataset.lang);
+      void setLang(btn.dataset.lang).then(() => { limovaPanel?.relocalize(); sitePermissionUI?.relocalize(); });
     }
   });
 
@@ -293,7 +295,8 @@ function renderLimovaConversation(snapshot, { showOlder = false } = {}) {
       const caption = document.createElement('blockquote');
       caption.className = 'message generated-caption';
       caption.textContent = message.caption;
-      caption.setAttribute('aria-label', 'Légende générée');
+      caption.dataset.i18nAriaLabel = 'limovaGeneratedCaption';
+      caption.setAttribute('aria-label', t('limovaGeneratedCaption'));
       elements.chatContainer.append(caption);
     }
     snapshot.files.filter(file => file.messageId === message.id).forEach(appendFile);

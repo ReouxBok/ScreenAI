@@ -1,6 +1,12 @@
 import { createConversationView } from './conversation-view.js';
 
-export function createLimovaPanel({ document, request, render, onBusy, onContextChange = () => {} }) {
+export function createLimovaPanel({ document, request, render, onBusy, onContextChange = () => {}, translate: translateText = (_key, fallback) => fallback }) {
+  const translations = new Map();
+  function translate(key, fallback) {
+    const value = translateText(key, fallback);
+    translations.set(value, key);
+    return value;
+  }
   const view = createConversationView();
   const element = id => document.getElementById(id);
   let context = null;
@@ -36,7 +42,7 @@ export function createLimovaPanel({ document, request, render, onBusy, onContext
 
   async function call(type, fields = {}) {
     const response = await request({ type, ...fields });
-    if (!response || response.error) throw new Error(response?.error || 'Limova est temporairement indisponible.');
+    if (!response || response.error) throw new Error(response?.error || translate("limovaServiceUnavailable", 'Limova est temporairement indisponible.'));
     return response;
   }
   function setBusy(value) {
@@ -50,7 +56,13 @@ export function createLimovaPanel({ document, request, render, onBusy, onContext
     pagingControls();
     onBusy(value);
   }
-  function feedback(text) { element('authFeedback').textContent = text; element('limovaFeedback').textContent = text; }
+  function feedback(text) {
+    ['authFeedback', 'limovaFeedback'].forEach(id => {
+      element(id).textContent = text;
+      if (translations.has(text)) element(id).dataset.i18n = translations.get(text);
+      else delete element(id).dataset.i18n;
+    });
+  }
   function clear(resetCatalog = true) { if (resetCatalog) { catalog = new Map(); nextPage = null; } historyInitialized = false; olderCursor = null; catalogLoading = false; historyLoading = false; onContextChange(); voiceBusy = false; if (element('limovaBrowser')) element('limovaBrowser').checked = false; conversationId = null; turnId = null; sending = false; view.reset(); render(view.snapshot()); setBusy(false); }
   function options(select, items, placeholder) {
     select.replaceChildren();
@@ -59,6 +71,8 @@ export function createLimovaPanel({ document, request, render, onBusy, onContext
     items.forEach(item => {
       const option = document.createElement('option');
       option.value = item.id; option.textContent = item.name; option.disabled = item.disabled === true;
+      if (item.i18nKey) option.dataset.i18n = item.i18nKey;
+      if (item.originalName) option.dataset.originalName = item.originalName;
       select.append(option);
     });
   }
@@ -68,10 +82,10 @@ export function createLimovaPanel({ document, request, render, onBusy, onContext
       const page = await call('LIMOVA_LIST_CONVERSATIONS', { page: pageNumber });
       if (expectedGeneration !== generation) return;
       if (pageNumber === 1) catalog = new Map();
-      (page.data ?? []).forEach(item => catalog.set(item.id, { id: item.id, name: item.title || 'Conversation' }));
+      (page.data ?? []).forEach(item => catalog.set(item.id, { id: item.id, name: item.title || translate("limovaConversationName", 'Conversation'), i18nKey: item.title ? null : 'limovaConversationName' }));
       const items = [...catalog.values()];
-      if (conversationId && !catalog.has(conversationId)) items.unshift({ id: conversationId, name: 'Conversation actuelle' });
-      options(element('limovaConversation'), items, 'Reprendre une conversation');
+      if (conversationId && !catalog.has(conversationId)) items.unshift({ id: conversationId, name: translate("limovaCurrentConversation", 'Conversation actuelle'), i18nKey: 'limovaCurrentConversation' });
+      options(element('limovaConversation'), items, translate("limovaChooseConversation", 'Reprendre une conversation'));
       element('limovaConversation').value = conversationId ?? '';
       nextPage = page.pagination?.hasNext === true ? pageNumber + 1 : null;
     } finally {
@@ -94,7 +108,7 @@ export function createLimovaPanel({ document, request, render, onBusy, onContext
   async function refresh() {
     const current = ++generation;
     catalogLoading = false; historyLoading = false;
-    feedback('Vérification de la session Limova…');
+    feedback(translate("limovaChecking", 'Vérification de la session Limova…'));
     try {
       const state = await call('LIMOVA_GET_STATE');
       if (current !== generation) return;
@@ -105,13 +119,13 @@ export function createLimovaPanel({ document, request, render, onBusy, onContext
       document.documentElement.dataset.authState = state.authenticated ? 'authenticated' : 'required';
       element('authPanel').hidden = state.authenticated;
       element('limovaControls').hidden = !state.authenticated;
-      options(element('limovaWorkspace'), (state.workspaces ?? []).map(item => ({ id: item.id, name: item.enabled ? item.name : `${item.name} — extension indisponible`, disabled: !item.enabled })), 'Choisir un espace');
+      options(element('limovaWorkspace'), (state.workspaces ?? []).map(item => ({ id: item.id, name: item.enabled ? item.name : `${item.name} — ${translate("limovaUnavailable", "extension indisponible")}`, disabled: !item.enabled, originalName: item.name })), translate("limovaChooseWorkspace", 'Choisir un espace'));
       element('limovaWorkspace').value = context?.workspaceId ?? '';
       conversationId = state.conversationId;
       turnId = state.activeTurnId;
       setBusy(Boolean(turnId));
-      feedback(!state.authenticated ? 'Connecte-toi dans Limova, puis clique sur « Actualiser ma connexion ».'
-        : !context ? 'Choisis un espace activé pour l’extension.' : '');
+      feedback(!state.authenticated ? translate("limovaLoginHint", 'Connecte-toi dans Limova, puis clique sur « Actualiser ma connexion ».')
+        : !context ? translate("limovaWorkspaceHint", 'Choisis un espace activé pour l’extension.') : '');
       if (!context) return;
       await list(current);
       if (conversationId) {
@@ -155,7 +169,7 @@ export function createLimovaPanel({ document, request, render, onBusy, onContext
   }
   async function send(text, resume = false) {
     if (!context || busy || (!resume && !text.trim())) return false;
-    if (resume && (!conversationId || element('limovaBrowser')?.checked !== true)) { feedback('Autorise le navigateur pour reprendre le tour interrompu.'); return false; }
+    if (resume && (!conversationId || element('limovaBrowser')?.checked !== true)) { feedback(translate("limovaResumeConsent", 'Autorise le navigateur pour reprendre le tour interrompu.')); return false; }
     if (!conversationId) await create(true);
     if (!conversationId) return false;
     const current = generation;
@@ -163,10 +177,10 @@ export function createLimovaPanel({ document, request, render, onBusy, onContext
     try {
       const result = await call(resume ? 'LIMOVA_RESUME_BROWSER' : 'LIMOVA_SEND_MESSAGE', { ...(resume ? {} : { text }), browser: element('limovaBrowser')?.checked === true });
       if (current !== generation) return false;
-      if (result.browserState === 'uncertain') feedback('Le résultat de l’action est incertain. Vérifie la page avant de poursuivre ; l’action ne sera pas répétée automatiquement.');
-      else if (result.browserState === 'waiting') feedback('Le tour navigateur est en attente.');
-      else if (result.browserState === 'absent') feedback('Aucun tour navigateur à reprendre.');
-      else if (result.browserState === 'cancelled') feedback('Ce tour navigateur a été annulé.');
+      if (result.browserState === 'uncertain') feedback(translate("limovaUncertain", 'Le résultat de l’action est incertain. Vérifie la page avant de poursuivre ; l’action ne sera pas répétée automatiquement.'));
+      else if (result.browserState === 'waiting') feedback(translate("limovaWaiting", 'Le tour navigateur est en attente.'));
+      else if (result.browserState === 'absent') feedback(translate("limovaNoPendingTurn", 'Aucun tour navigateur à reprendre.'));
+      else if (result.browserState === 'cancelled') feedback(translate("limovaCancelled", 'Ce tour navigateur a été annulé.'));
       if (current !== generation) return false;
       const page = await call('LIMOVA_GET_MESSAGES');
       if (current !== generation) return false;
@@ -208,10 +222,20 @@ export function createLimovaPanel({ document, request, render, onBusy, onContext
   listen('limovaNew', 'click', create);
   listen('limovaCancel', 'click', () => { onContextChange(); return call('LIMOVA_CANCEL'); });
   return { refresh, send, create, handle,
+    relocalize() {
+      const workspace = element('limovaWorkspace');
+      if (workspace.options[0]) workspace.options[0].textContent = translate('limovaChooseWorkspace', 'Choisir un espace');
+      const conversations = element('limovaConversation');
+      if (conversations.options[0]) conversations.options[0].textContent = translate('limovaChooseConversation', 'Reprendre une conversation');
+      [...workspace.options].forEach(option => {
+        if (option.dataset.originalName) option.textContent = option.dataset.originalName
+          + (option.disabled ? ` — ${translate('limovaUnavailable', 'extension indisponible')}` : '');
+      });
+    },
     async openGeneratedFile(fileId) {
       if (!context || !conversationId) return;
       const current = generation;
-      feedback('Ouverture du fichier…');
+      feedback(translate("limovaOpeningFile", 'Ouverture du fichier…'));
       try {
         await call('LIMOVA_OPEN_GENERATED_FILE', { conversationId, fileId });
         if (current === generation) feedback('');
@@ -219,18 +243,18 @@ export function createLimovaPanel({ document, request, render, onBusy, onContext
     },
     setVoiceBusy(active) { voiceBusy = active; setBusy(Boolean(turnId) || sending); },
     prepareTranscription() {
-      if (!context || busy) throw new Error('Sélectionne un espace Limova disponible.');
+      if (!context || busy) throw new Error(translate("limovaWorkspaceRequired", 'Sélectionne un espace Limova disponible.'));
       return { context: { ...context }, conversationId };
     },
     async prepareVoice() {
-      if (!context || busy) throw new Error('Sélectionne une conversation Limova disponible.');
+      if (!context || busy) throw new Error(translate("limovaConversationRequired", 'Sélectionne une conversation Limova disponible.'));
       if (!conversationId) await create(true);
-      if (!conversationId || !context) throw new Error('Conversation Limova indisponible.');
+      if (!conversationId || !context) throw new Error(translate("limovaConversationUnavailable", 'Conversation Limova indisponible.'));
       const current = generation;
       const authorized = await call('LIMOVA_PREPARE_VOICE', { conversationId });
-      if (current !== generation || !context) throw new Error('La session Limova a changé.');
+      if (current !== generation || !context) throw new Error(translate("limovaSessionChanged", 'La session Limova a changé.'));
       if (authorized.conversationId !== conversationId || authorized.context?.userId !== context.userId
-        || authorized.context?.workspaceId !== context.workspaceId) throw new Error('La session Limova a changé.');
+        || authorized.context?.workspaceId !== context.workspaceId) throw new Error(translate("limovaSessionChanged", 'La session Limova a changé.'));
       return { ...(authorized.evaluationCode ? { evaluationCode: authorized.evaluationCode } : {}), context: { ...context }, conversationId, browserEnabled: element('limovaBrowser')?.checked === true,
         onNativeEvent(event) { if (current === generation) { view.event(event); render(view.snapshot()); } },
       };

@@ -229,3 +229,15 @@ it('releases pagination after refreshing while an older request is pending', asy
   await new Promise(done => setTimeout(done, 0));
   expect(render.mock.lastCall[0].messages).toEqual([]);
 });
+
+
+it('relocalizes selectors without interrupting an active native voice session', async () => {
+  const { panel, request, render } = setup();
+  await panel.refresh(); panel.setVoiceBusy(true); request.mockClear(); render.mockClear();
+  panel.relocalize();
+  expect(element('limovaConversation').disabled).toBe(true);
+  expect(element('limovaCancel').hidden).toBe(false);
+  expect(element('limovaConversation').value).toBe('c');
+  expect(request).not.toHaveBeenCalled();
+  expect(render).not.toHaveBeenCalled();
+});
