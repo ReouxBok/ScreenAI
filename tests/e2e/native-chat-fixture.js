@@ -16,7 +16,8 @@ export const CONVERSATION = '44444444-4444-4444-8444-444444444444';
 const frame = (event, data) => `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
 
 export const test = base.extend({
-  nativeChat: async ({}, use) => {
+  nativeViewport: [false, { option: true }],
+  nativeChat: async ({ nativeViewport }, use) => {
     const directory = await mkdtemp(path.join(tmpdir(), 'limova-native-chat-'));
     const key = path.join(directory, 'key.pem'), cert = path.join(directory, 'cert.pem');
     execFileSync('openssl', ['req', '-x509', '-newkey', 'rsa:2048', '-nodes', '-keyout', key, '-out', cert, '-days', '1', '-subj', '/CN=limova-native-chat'], { stdio: 'ignore' });
@@ -26,8 +27,9 @@ export const test = base.extend({
     let turnId, actionIndex = 0;
     let context;
     const server = createServer({ key: await readFile(key), cert: await readFile(cert) }, (request, response) => {
-      let raw = ''; request.on('data', chunk => { raw += chunk; });
-      request.on('end', () => {
+      const chunks = []; request.on('data', chunk => { chunks.push(chunk); });
+      request.on('end', async () => {
+        const raw = Buffer.concat(chunks);
         const url = new URL(request.url, API);
         const headers = { 'content-type': 'application/json', 'access-control-allow-origin': APP,
           'access-control-allow-credentials': 'true', 'access-control-allow-headers': 'content-type,x-workspace-id,x-extension-session',
@@ -42,9 +44,17 @@ export const test = base.extend({
           response.writeHead(200, { ...headers, 'set-cookie': 'native_chat=authenticated; Path=/; HttpOnly; Secure; SameSite=None; Partitioned' }); response.end('{}'); return;
         }
         const authenticated = state.authenticated && request.headers.cookie?.includes('native_chat=authenticated');
-        const body = raw ? JSON.parse(raw) : undefined;
+        const multipart = request.headers['content-type']?.startsWith('multipart/form-data');
+        const body = multipart ? undefined : raw.length ? JSON.parse(raw.toString()) : undefined;
         calls.push({ path: url.pathname, method: request.method, body, authenticated, workspace: request.headers['x-workspace-id'] });
         if (!authenticated) return json({ error: 'auth' }, 401);
+        if (url.pathname === '/files' && request.method === 'POST' && multipart) {
+          const form = await new Response(raw, { headers: { 'content-type': request.headers['content-type'] } }).formData();
+          const file = form.get('file');
+          state.uploads ??= [];
+          state.uploads.push({ name: file.name, type: file.type, data: Buffer.from(await file.arrayBuffer()).toString('base64'), query: url.search });
+          return json({ id: '77777777-7777-4777-8777-777777777777' });
+        }
         if (url.pathname === '/users/me') return json({ id: USER });
         if (url.pathname === '/workspaces') return json([{ id: WORKSPACE, name: 'Native fixture', is_charly_extension_enabled: state.enabled }]);
         if (url.pathname === '/agent/by-slug/charly') return json({ id: AGENT, slug: 'charly' });
@@ -96,7 +106,9 @@ export const test = base.extend({
     try {
       const port = server.address().port, extension = path.resolve(process.env.EXTENSION_PATH ?? (process.env.LIMOVA_E2E_ENV === 'staging' ? 'build-staging' : 'build'));
       context = await chromium.launchPersistentContext('', { channel: 'chromium', headless: true, ignoreHTTPSErrors: true,
+        ...(nativeViewport ? { viewport: null } : {}),
         args: [`--disable-extensions-except=${extension}`, `--load-extension=${extension}`, '--no-proxy-server', '--ignore-certificate-errors',
+          '--enable-unsafe-extension-debugging',
           `--host-resolver-rules=MAP ${new URL(API).hostname} 127.0.0.1:${port}, MAP ${new URL(APP).hostname} 127.0.0.1:${port}, MAP * ~NOTFOUND`] });
       context.on('request', request => { if (/limova-proxy|generativelanguage|\/api\/copilot/.test(request.url())) legacy.push(request.url()); });
       const worker = context.serviceWorkers()[0] ?? await context.waitForEvent('serviceworker');
