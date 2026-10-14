@@ -50,6 +50,30 @@ export function browserDocumentCommand(request) {
       }
       return { viewportWidth: innerWidth, viewportHeight: innerHeight, scrollX, scrollY, revision: captureRevision, masks };
     };
+    let actionPointer, pointerTimer;
+    const clearPointer = () => {
+      clearTimeout(pointerTimer);
+      actionPointer?.remove();
+      actionPointer = undefined;
+    };
+    for (const event of ['scroll', 'resize', 'pagehide']) addEventListener(event, clearPointer, true);
+    const showPointer = (x, y) => {
+      clearPointer();
+      const pointer = document.createElement('div');
+      pointer.dataset.limovaNativePointer = '';
+      pointer.setAttribute('aria-hidden', 'true');
+      pointer.style.cssText = `all:initial;position:fixed;left:${x}px;top:${y}px;width:30px;height:32px;pointer-events:none;z-index:2147483647;`;
+      const shadow = pointer.attachShadow({ mode: 'closed' });
+      const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+      svg.setAttribute('width', '30'); svg.setAttribute('height', '32'); svg.setAttribute('viewBox', '0 0 32 32');
+      svg.style.pointerEvents = 'none';
+      const arrow = document.createElementNS('http://www.w3.org/2000/svg', 'path');
+      for (const [name, value] of Object.entries({ d: 'M1 1v24l7-7 5 11 5-2-5-10 10-1Z', fill: '#7c3aed', stroke: 'white', 'stroke-width': '2', 'stroke-linejoin': 'round' })) arrow.setAttribute(name, value);
+      svg.appendChild(arrow); shadow.appendChild(svg);
+      document.documentElement.appendChild(pointer);
+      actionPointer = pointer;
+      pointerTimer = setTimeout(clearPointer, 900);
+    };
     const binding = () => ({ documentId, origin: location.origin, contextVersion: version });
     const visible = element => {
       const rect = element.getBoundingClientRect();
@@ -142,6 +166,8 @@ export function browserDocumentCommand(request) {
         if (sensitive(element) || !element.matches('input:not([type="file"]):not([type="checkbox"]):not([type="radio"]):not([type="submit"]):not([type="button"]):not([type="reset"]),textarea,[contenteditable="true"]')
           || typeof input.text !== 'string' || input.text.length > 8000) return rejected('Text target not permitted');
         element.focus();
+        const focusedRect = element.getBoundingClientRect();
+        showPointer(focusedRect.left + focusedRect.width / 2, focusedRect.top + focusedRect.height / 2);
         if (element.isContentEditable) element.textContent = input.text;
         else {
           const prototype = element instanceof HTMLTextAreaElement ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
@@ -149,8 +175,10 @@ export function browserDocumentCommand(request) {
         }
         element.dispatchEvent(new Event('input', { bubbles: true }));
         element.dispatchEvent(new Event('change', { bubbles: true }));
-      } else if (input.operation === 'click') element.click();
-      else element.animate([{ outline: '3px solid #7c3aed' }, { outline: '3px solid transparent' }], { duration: 1000 });
+      } else if (input.operation === 'click') {
+        showPointer(x, y);
+        element.click();
+      } else element.animate([{ outline: '3px solid #7c3aed' }, { outline: '3px solid transparent' }], { duration: 1000 });
       version = input.nextContextVersion;
       return { status: 'completed', observation: 'Action dispatched; read the page to verify its result.', binding: binding() };
     };

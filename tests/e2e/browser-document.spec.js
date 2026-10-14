@@ -222,3 +222,16 @@ test('waits for a real in-progress Chrome navigation before returning the destin
   expect(result.status).toBe('complete');
   expect(result.url).toBe('https://new.limova.ai/driver-slow');
 });
+
+test('native action pointer clears on scroll and does not block screenshot geometry', async ({ context, extensionId }) => {
+  const { site, controller } = await setup(context, extensionId);
+  const result = await controller.evaluate(async () => {
+    const clicked = await invokeDocument({ ...binding, operation: 'click', elementId: 1, nextContextVersion: 3 });
+    return invokeDocument({ ...clicked.binding, operation: 'screenshot_geometry' });
+  });
+  expect(result.status).toBe('completed');
+  await expect(site.locator('[data-limova-native-pointer]')).toHaveCount(1);
+  await site.evaluate(() => window.dispatchEvent(new Event('scroll')));
+  await expect(site.locator('[data-limova-native-pointer]')).toHaveCount(0);
+  expect(await site.evaluate(() => saved)).toBe(1);
+});
