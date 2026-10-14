@@ -97,10 +97,13 @@ export async function reviewKnowledgeCandidate(candidateId: string, input: { exp
       }
     }
     const original = parseContentInput(candidate.proposedInput);
+    // Removing the canonical expiry must also clear the candidate projection.
+    const inheritedResolution = { ...("resolution" in original.metadata ? original.metadata.resolution : {}) };
+    delete inheritedResolution.validUntil;
     const proposed = parseContentInput({ ...original, ...(catalog ? { title: source.evidence.sourceTitle } : comparisonReview ? { title: document.objective } : {}), summary: document.objective, bodyMarkdown: savProjectionBody(document), metadata: {
       ...original.metadata, semanticSteps: document.steps, prerequisites: document.prerequisites, expectedResult: document.expectedResult, troubleshooting: document.escalation,
       sourceMetadata: { ...original.metadata.sourceMetadata, canonicalRevisionId: revision.id, canonicalObjective: document.objective, approvedCandidateId: candidate.id, ...(comparisonReview ? { comparisonReview } : {}) },
-      resolution: { ...("resolution" in original.metadata ? original.metadata.resolution : {}), ...(document.supportContext?.responseTemplate ? { responseTemplate: document.supportContext.responseTemplate } : {}), symptoms: document.supportContext?.symptoms ?? [document.objective], steps: document.steps.map((step) => step.instruction), exceptions: document.exceptions, escalation: document.escalation, productVersion: document.productVersion, ...(document.validUntil ? { validUntil: document.validUntil } : {}), supersedes: [], conflictsWith: [] },
+      resolution: { ...inheritedResolution, ...(document.supportContext?.responseTemplate ? { responseTemplate: document.supportContext.responseTemplate } : {}), symptoms: document.supportContext?.symptoms ?? [document.objective], steps: document.steps.map((step) => step.instruction), exceptions: document.exceptions, escalation: document.escalation, productVersion: document.productVersion, ...(document.validUntil ? { validUntil: document.validUntil } : {}), supersedes: [], conflictsWith: [] },
     } });
     if (catalog && proposed.bodyMarkdown.length > 12_000) throw new Error("ONBOARDING_PROCEDURE_TOO_LONG");
     if (!catalog && comparisonReview && proposed.bodyMarkdown.length > 12_000) throw new Error("HUBSPOT_PROCEDURE_TOO_LONG");

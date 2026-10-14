@@ -128,14 +128,62 @@ describe("SAV-55 canonical knowledge workspace", () => {
     await approve(replacement);
     expect(await fixture.db.select().from(knowledgeFamilies)).toHaveLength(1);
   });
-  it("preserves the lead audience, template and validity while improving the same knowledge", async () => {
+  it.each(["2099-12-31", "2098-06-30"])("preserves unedited lead metadata and uses the explicit canonical expiry %s", async (validUntil) => {
     const first = await active();
     const [version] = await fixture.db.select().from(contentVersions).where(eq(contentVersions.id, first.materializedVersionId!));
     const resolution = "resolution" in version.metadata ? version.metadata.resolution! : undefined;
     await fixture.db.update(contentVersions).set({ metadata: { ...version.metadata, resolution: { ...resolution!, audience: "lead", responseTemplate: "Bonjour, voici les informations produit validées.", validUntil: "2099-12-31" } } }).where(eq(contentVersions.id, version.id));
-    const approved = await approve(await submit({ ...proposal, mode: "improve", targetItemId: first.targetItemId! }));
+    const dated = { ...document, validUntil };
+    const candidate = await submit({ ...proposal, mode: "improve", targetItemId: first.targetItemId!, document: dated });
+    expect(candidate.proposedInput).toMatchObject({ metadata: { resolution: { audience: "lead", responseTemplate: "Bonjour, voici les informations produit validées.", validUntil } } });
+    const approved = await approve(candidate, actor, dated);
     const [updated] = await fixture.db.select().from(contentVersions).where(eq(contentVersions.id, approved.materializedVersionId!));
-    expect(updated.metadata).toMatchObject({ resolution: { audience: "lead", responseTemplate: "Bonjour, voici les informations produit validées.", validUntil: "2099-12-31" } });
+    expect(updated.metadata).toMatchObject({ resolution: { audience: "lead", responseTemplate: "Bonjour, voici les informations produit validées.", validUntil } });
+  });
+  it("clears canonical expiry and product version at submission while preserving unedited lead metadata", async () => {
+    const first = await active();
+    const [version] = await fixture.db.select().from(contentVersions).where(eq(contentVersions.id, first.materializedVersionId!));
+    const metadata = articleMetadataSchema.parse(version.metadata);
+    await fixture.db.update(contentVersions).set({ metadata: { ...metadata, resolution: { ...metadata.resolution!, audience: "lead", responseTemplate: "Bonjour, voici les informations produit validées.", validUntil: "2099-12-31", productVersion: "version précédente" } } }).where(eq(contentVersions.id, version.id));
+    const candidate = await submit({ ...proposal, mode: "improve", targetItemId: first.targetItemId!, document });
+    const proposedResolution = articleMetadataSchema.parse(candidate.proposedInput.metadata).resolution;
+    expect(proposedResolution).not.toHaveProperty("validUntil");
+    expect(proposedResolution).toMatchObject({ productVersion: "", audience: "lead", responseTemplate: "Bonjour, voici les informations produit validées." });
+    const approved = await approve(candidate);
+    const [updated] = await fixture.db.select().from(contentVersions).where(eq(contentVersions.id, approved.materializedVersionId!));
+    expect(articleMetadataSchema.parse(updated.metadata).resolution).not.toHaveProperty("validUntil");
+    expect(updated.metadata).toMatchObject({ resolution: { productVersion: "", audience: "lead", responseTemplate: "Bonjour, voici les informations produit validées." } });
+    expect((await getSavKnowledgeDetail({ candidateId: candidate.id }, actor))?.document?.validUntil).toBeUndefined();
+  });
+  it("clears an expiry removed only during review from both the approved candidate and its materialized version", async () => {
+    const dated = { ...document, validUntil: "2099-12-31", productVersion: "version précédente" };
+    const candidate = await submit({ ...proposal, document: dated });
+    expect(candidate.proposedInput).toMatchObject({ metadata: { resolution: { validUntil: dated.validUntil, productVersion: dated.productVersion } } });
+    const approved = await approve(candidate, actor, document);
+    expect(articleMetadataSchema.parse(approved.proposedInput.metadata).resolution).not.toHaveProperty("validUntil");
+    const [updated] = await fixture.db.select().from(contentVersions).where(eq(contentVersions.id, approved.materializedVersionId!));
+    expect(articleMetadataSchema.parse(updated.metadata).resolution).not.toHaveProperty("validUntil");
+    expect(updated.metadata).toMatchObject({ resolution: { productVersion: "" } });
+    expect((await getSavKnowledgeDetail({ candidateId: candidate.id }, actor))?.document?.validUntil).toBeUndefined();
+  });
+  it.each(["support", "lead"] as const)("retrieves formerly expired %s knowledge only after explicit revalidation, publication and activation", async (audience) => {
+    const first = await active();
+    const [version] = await fixture.db.select().from(contentVersions).where(eq(contentVersions.id, first.materializedVersionId!));
+    const metadata = articleMetadataSchema.parse(version.metadata);
+    await fixture.db.update(contentVersions).set({ metadata: { ...metadata, resolution: { ...metadata.resolution!, audience, responseTemplate: "Bonjour, voici les informations produit validées.", validUntil: "2020-01-01" } } }).where(eq(contentVersions.id, version.id));
+    const search = () => searchKnowledge({ query: "Renommer un espace", scope: "sav", contentTypes: ["article"], savAudience: audience });
+    expect((await search()).results).toHaveLength(0);
+    const approved = await approve(await submit({ ...proposal, mode: "improve", targetItemId: first.targetItemId!, document }));
+    expect((await search()).results).toHaveLength(0);
+    await publishSavKnowledgeVersion({ itemId: approved.targetItemId!, expectedVersionId: approved.materializedVersionId! }, actor);
+    expect((await fixture.db.select().from(savKnowledgeActivations))[0].versionId).toBe(first.materializedVersionId);
+    expect((await search()).results).toHaveLength(0);
+    await activateSavKnowledgeVersion({ itemId: approved.targetItemId!, expectedPublishedVersionId: approved.materializedVersionId!, expectedActiveVersionId: first.materializedVersionId! }, actor);
+    const results = (await search()).results;
+    expect(results.some((row) => row.contentVersionId === approved.materializedVersionId)).toBe(true);
+    expect(results[0].resolution).toMatchObject({ audience, responseTemplate: "Bonjour, voici les informations produit validées." });
+    expect(results[0].resolution).not.toHaveProperty("validUntil");
+    expect((await searchKnowledge({ query: "Renommer un espace", scope: "sav", contentTypes: ["article"], savAudience: audience === "lead" ? "support" : "lead" })).results).toHaveLength(0);
   });
   it("blocks publication if a declared Studio source changed after approval", async () => {
     const first = await active();
