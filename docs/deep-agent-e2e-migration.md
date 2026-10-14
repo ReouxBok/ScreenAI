@@ -42,3 +42,15 @@ Validation de cette couche : 12 tests ciblés réussis avec le paquet production
 Le mode observation autorise désormais `highlight` en plus de la lecture et de la capture. Le driver applique son animation au contrôle exact enregistré dans son registre privé ; il ne recherche pas un autre contrôle à partir d’un identifiant inventé. Un test du parcours complet vérifie le champ animé, le refus d’une référence inconnue, l’absence de saisie/clic et le maintien du mode observation. Les tests du journal couvrent la persistance de cette permission après réouverture et le refus des quatre opérations mutantes ; ceux du document vérifient le rejet d’un contrôle remplacé.
 
 Le scénario legacy de guidage reste présent : son exigence de capture automatique et les anciens overlays ne sont pas assimilés à la preuve du surlignage natif. Le [curseur natif](deep-agent-action-pointer.md) indique maintenant les clics et saisies ; sa trajectoire et le défilement automatique legacy restent à évaluer.
+
+## Entraînement et transcription native
+
+`limova-training-transcription.spec.js` utilise maintenant le panneau réel pour ouvrir l’entraînement, entrer le code Studio, démarrer, activer le microphone puis finaliser. Le flux PCM, la passerelle first-party, Socket.IO et le worker sont réels ; le serveur Limova/Studio est contrôlé et la sélection d’écran/l’upload vidéo sont simulés. Cette recette ne qualifie donc pas une vidéo réellement stockée.
+
+Le test vérifie qu’une seule note finale est enregistrée, sans chat, requête POST de conversation ni clic, y compris si le canal de transcription émet une commande étrangère. Il conserve la vérification de l’arrêt du PCM après retrait du consentement et ajoute la finalisation Studio via le bouton. Il remplace le scénario legacy de microphone passif.
+
+Le passage par le vrai démarrage a révélé une fuite d’alias : le texte initial d’un textarea voisin pouvait devenir un alias de bouton dans le contexte envoyé au Studio. L’extraction sémantique retire désormais les champs, zones éditables et régions marquées privées avant de construire les libellés et alias. Les régressions vérifient le contenu initial des textarea, les descendants éditables et privés, tout en conservant les noms utiles des intégrations.
+
+`limova-training-permissions.spec.js` remplace le scénario legacy de récupération d’autorisation micro, avec une session Limova réelle dans la fixture. Les frontières OS de refus et de récupération sont simulées ; le panneau doit abandonner le recorder et inviter à réessayer sans contacter Studio ni commencer un tour. Ce cas fonctionne aussi avec le paquet staging, sans accès au Studio production.
+
+Il reste 19 scénarios legacy dans feature-flows. Le scénario complet d’enregistrement avec popups OAuth et le stockage réel de vidéo restent à qualifier ; les deux tests transférés ne valent pas validation de tout le Studio.

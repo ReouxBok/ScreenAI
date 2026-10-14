@@ -2254,22 +2254,31 @@ async function getPageContext(tabId) {
             .slice(0, maxLength);
         }
 
+        function semanticText(node) {
+          if (!(node instanceof Element)) return '';
+          const excluded = 'input,textarea,select,[contenteditable],script,style,[data-private],[data-sensitive],[data-limova-private]';
+          if (node.closest(excluded)) return '';
+          const copy = node.cloneNode(true);
+          copy.querySelectorAll(excluded).forEach(child => child.remove());
+          return copy.textContent || '';
+        }
+
         function getExplicitLabel(el) {
           const labelledBy = String(el.getAttribute('aria-labelledby') || '')
             .split(/\s+/)
             .filter(Boolean)
-            .map(id => document.getElementById(id)?.textContent || '')
+            .map(id => semanticText(document.getElementById(id)))
             .join(' ');
           let associatedLabel = '';
           if (el.id) {
-            try { associatedLabel = document.querySelector(`label[for="${CSS.escape(el.id)}"]`)?.textContent || ''; } catch (_) {}
+            try { associatedLabel = semanticText(document.querySelector(`label[for="${CSS.escape(el.id)}"]`)); } catch (_) {}
           }
           return el.getAttribute('aria-label')
             || labelledBy
             || associatedLabel
-            || el.closest('label')?.textContent
+            || semanticText(el.closest('label'))
             || el.getAttribute('title')
-            || el.getAttribute('value')
+            || (el.matches('input[type="button"],input[type="submit"],input[type="reset"]') ? el.getAttribute('value') : '')
             || el.querySelector('img')?.getAttribute('alt')
             || el.querySelector('svg title')?.textContent
             || '';
@@ -2308,7 +2317,7 @@ async function getPageContext(tabId) {
             if (candidate === control || candidate.contains(control)) continue;
             const value = candidate.matches('img[alt]')
               ? candidate.getAttribute('alt')
-              : candidate.textContent;
+              : semanticText(candidate);
             const title = sanitizeVisibleText(value, 80);
             if (title && title.length <= 80) return title;
           }
@@ -2324,7 +2333,7 @@ async function getPageContext(tabId) {
           ];
           for (const candidate of candidates) {
             if (!(candidate instanceof HTMLElement) || candidate === el || candidate.contains(el)) continue;
-            const value = sanitizeVisibleText(candidate.textContent || candidate.getAttribute('aria-label'), 80);
+            const value = sanitizeVisibleText(semanticText(candidate) || candidate.getAttribute('aria-label'), 80);
             if (value && value.length >= 2 && value.length <= 80) return value;
           }
           return '';
@@ -2356,7 +2365,7 @@ async function getPageContext(tabId) {
             ? [...scope.querySelectorAll('button, [role="button"], a[href], [tabindex="0"], span, p')]
             : [];
           const actionPhrase = scopeControls
-            .map(node => sanitizeVisibleText(node.textContent, 100))
+            .map(node => sanitizeVisibleText(semanticText(node), 100))
             .find(value => /^(?:connecter|reconnecter|configurer|ajouter un compte|continuer avec|ouvrir|créer|lancer|démarrer)\b/i.test(value)) || '';
           const attributeHint = sanitizeVisibleText([
             el.getAttribute('data-testid'), el.getAttribute('data-cy'), el.getAttribute('data-qa'),
@@ -2411,7 +2420,7 @@ async function getPageContext(tabId) {
             const unlabeledButtons = [...scope.querySelectorAll('button, [role="button"], input[type="submit"]')]
               .filter(button => isVisible(button))
               .filter(button => !sanitizeVisibleText(getExplicitLabel(button), 80))
-              .filter(button => !sanitizeVisibleText(button.textContent, 80));
+              .filter(button => !sanitizeVisibleText(semanticText(button), 80));
             return unlabeledButtons.length === 1 && unlabeledButtons[0] === el;
           }
           return false;
@@ -2423,7 +2432,7 @@ async function getPageContext(tabId) {
           // elements. Their actionable footer is nested inside the tile, so use
           // that concise instruction instead of the whole card description.
           const nestedAction = [...el.querySelectorAll('button, [role="button"], span, p, div')]
-            .map(node => sanitizeVisibleText(node.textContent, 80))
+            .map(node => sanitizeVisibleText(semanticText(node), 80))
             .find(value => /^(?:connecter|reconnecter|configurer|commencer|continuer|ouvrir|voir)\b/i.test(value));
           if (nestedAction) return nestedAction;
 
@@ -2432,7 +2441,7 @@ async function getPageContext(tabId) {
           for (const child of el.childNodes) {
             if (child.nodeType === 3) text += child.textContent;
             else if (child.nodeType === 1 && !['SVG', 'IMG', 'BUTTON', 'A'].includes(child.tagName)) {
-              text += child.textContent;
+              text += semanticText(child);
             }
           }
           text = text.trim().replace(/\s+/g, ' ');
@@ -2440,7 +2449,7 @@ async function getPageContext(tabId) {
           // Fallback: aria-label, title, alt (for icon buttons)
           return getExplicitLabel(el)
             || (isInferredMessageSendButton(el) ? 'Envoyer le message' : '')
-            || (el.textContent || '').trim().replace(/\s+/g, ' ').substring(0, 80)
+            || semanticText(el).trim().replace(/\s+/g, ' ').substring(0, 80)
             || '';
         }
 
