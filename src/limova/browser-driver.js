@@ -5,9 +5,9 @@ import { createBrowserBinding } from './browser-binding.js';
 
 const DOCUMENT_OPERATIONS = new Set(['read_page', 'click', 'type_text', 'scroll', 'highlight', 'navigate']);
 
-export function createBrowserDriver({ chrome, journal, scope, hasConsent, uploadScreenshot, onBound = () => {} }) {
+export function createBrowserDriver({ chrome, journal, scope, hasConsent, uploadScreenshot, onBound = () => {}, expectedTabId }) {
   scope = Object.freeze({ ...scope });
-  let tabId;
+  let tabId = expectedTabId;
   const hasSiteAccess = origin => chrome.permissions.contains({ origins: [`${origin}/*`] });
   const binding = createBrowserBinding({ scripting: chrome.scripting,
     allocateVersion: async signal => {

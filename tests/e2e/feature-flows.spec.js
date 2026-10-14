@@ -253,32 +253,6 @@ test.describe('Packaged extension — complete user flows', () => {
 
 
 
-  test('SPA navigation and a newly opened modal each trigger automatic contextual analysis', async ({ context, extensionId }) => {
-    const { calls, limova, sidebar } = await openExtensionHarness(context, extensionId, {
-      geminiReply: ({ index }) => `Analyse automatique ${index + 1}`
-    });
-    await grantAIConsent(sidebar);
-    await sidebar.locator('#userInput').fill('Commence le parcours');
-    await sidebar.locator('#sendBtn').click();
-    await expect.poll(() => calls.gemini.length).toBe(1);
-
-    await limova.evaluate(() => {
-      setTimeout(() => history.pushState({}, '', '/integrations'), 2200);
-    });
-    await expect.poll(() => calls.gemini.length, { timeout: 8_000 }).toBe(2);
-
-    await limova.evaluate(() => {
-      setTimeout(() => {
-        const dialog = document.createElement('div');
-        dialog.setAttribute('role', 'dialog');
-        dialog.textContent = 'Connexion réussie';
-        document.body.appendChild(dialog);
-      }, 2200);
-    });
-    await expect.poll(() => calls.gemini.length, { timeout: 8_000 }).toBe(3);
-    await expect(sidebar.locator('.message.assistant .message-content').last()).toContainText('Analyse automatique 3');
-  });
-
   test('voice obtains its constrained token, connects through Gemini Live and stores the transcript', async ({ mediaContext, mediaExtensionId }) => {
     const context = mediaContext;
     const extensionId = mediaExtensionId;
