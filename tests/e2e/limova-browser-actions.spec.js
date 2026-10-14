@@ -75,3 +75,39 @@ test('native navigation continues the same conversation after the destination do
   expect(legacy).toEqual([]);
   expect(errors).toEqual([]);
 });
+
+test('page analysis highlights the exact field and refuses invented references without acting', async ({ nativeChat }) => {
+  const { panel, app, calls, state, legacy, errors } = nativeChat;
+  state.reply = 'Action traitée.';
+  await app.evaluate(() => {
+    const field = document.querySelector('textarea');
+    const row = document.createElement('div');
+    row.style.cssText = 'display:flex;width:900px;padding:10px';
+    field.before(row); row.append(field);
+    field.style.cssText = 'width:360px;height:42px';
+    // Observe real animations without replacing Element.animate or the driver.
+    window.guidanceTargets = [];
+    window.guidanceObserver = setInterval(() => {
+      for (const animation of document.getAnimations()) {
+        const target = animation.effect?.target;
+        if (target && !window.guidanceTargets.includes(target)) window.guidanceTargets.push(target);
+      }
+    }, 10);
+  });
+  state.browserActions = [read,
+    body => ({ operation: 'highlight', elementId: reference(body, 'Brief') }),
+    { operation: 'highlight', elementId: 999999 },
+  ];
+  await send(panel, '', true);
+  await expect.poll(() => app.evaluate(() => window.guidanceTargets.length)).toBe(1);
+  expect(await app.evaluate(() => {
+    clearInterval(window.guidanceObserver);
+    return window.guidanceTargets[0] === document.querySelector('textarea');
+  })).toBe(true);
+  expect(messageCalls(calls).slice(1).map(call => call.body.browserResult.status)).toEqual(['completed', 'completed', 'rejected']);
+  await expect(app.locator('textarea')).toHaveValue('PRIVATE_FIELD_VALUE');
+  expect(await app.evaluate(() => ({ clicks: window.clicks, inputs: window.inputEvents }))).toEqual({ clicks: 0, inputs: 0 });
+  await expect(panel.locator('#limovaBrowser')).not.toBeChecked();
+  expect(legacy).toEqual([]);
+  expect(errors).toEqual([]);
+});
