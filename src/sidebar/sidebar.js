@@ -12,6 +12,7 @@ import { createLimovaSessionFetch } from '../limova/session-fetch.js';
 import { bindSitePermissions } from '../limova/site-permissions.js';
 import { createLimovaPanel } from '../limova/panel.js';
 import { LIMOVA_APP_URL } from '../limova/environment.js';
+import { requestMicrophone, requestMicrophonePermissionInTab } from './microphone-access.js';
 
 /**
  * Limova AI - Charly Onboarding Assistant - Sidebar Logic
@@ -27,9 +28,6 @@ const elements = {
   statusBadge: document.getElementById('statusBadge'),
   resetBtn: document.getElementById('resetBtn'),
   welcomeScreen: document.getElementById('welcomeScreen'),
-  stepInfo: document.getElementById('stepInfo'),
-  stepName: document.getElementById('stepName'),
-  stepProgress: document.getElementById('stepProgress'),
   chatContainer: document.getElementById('chatContainer'),
   userInput: document.getElementById('userInput'),
   sendBtn: document.getElementById('sendBtn'),
@@ -41,7 +39,6 @@ const elements = {
   diagnosticText: document.getElementById('diagnosticText'),
   tabWarning: document.getElementById('tabWarning'),
   tabWarningText: document.getElementById('tabWarningText'),
-  stepClose: document.getElementById('stepClose'),
   aiConsentPanel: document.getElementById('aiConsentPanel'),
   aiConsentAccept: document.getElementById('aiConsentAccept'),
   aiConsentDecline: document.getElementById('aiConsentDecline'),
@@ -60,9 +57,6 @@ const elements = {
   evaluationProblem: document.getElementById('evaluationProblem'),
   authPanel: document.getElementById('authPanel'),
   authFeedback: document.getElementById('authFeedback'),
-  memoryToggleBtn: document.getElementById('memoryToggleBtn'),
-  exportDataBtn: document.getElementById('exportDataBtn'),
-  deleteDataBtn: document.getElementById('deleteDataBtn'),
 };
 
 // ============================================================================
@@ -86,7 +80,6 @@ let backgroundPort = null;
 let backgroundReconnectTimer = null;
 let backgroundReconnectAttempts = 0;
 let hasConnectedBackgroundPort = false;
-const voiceTranscriptBuffers = { user: '', assistant: '' };
 
 // ============================================================================
 // Initialization
@@ -165,10 +158,7 @@ function initEventListeners() {
 
   elements.resetBtn.addEventListener('click', () => { document.getElementById('headerMenu').hidden = true; resetSession(); });
   document.getElementById('logoutBtn')?.addEventListener('click', logoutCharly);
-  elements.memoryToggleBtn?.addEventListener('click', toggleCopilotMemory);
-  elements.exportDataBtn?.addEventListener('click', exportCopilotData);
   document.getElementById('limovaExport').addEventListener('click', exportLimovaConversation);
-  elements.deleteDataBtn?.addEventListener('click', deleteCopilotData);
 
   // Three-dot menu
   const menuBtn = document.getElementById('menuBtn');
@@ -188,12 +178,6 @@ function initEventListeners() {
   elements.downloadLogsBtn.addEventListener('click', downloadLogs);
   elements.diagnoseBtn.addEventListener('click', () => runDiagnostics(false));
   elements.tabWarning.addEventListener('click', handleTabWarningClick);
-
-  // Dismiss onboarding
-  elements.stepClose.addEventListener('click', () => {
-    elements.stepInfo.hidden = true;
-    chrome.runtime.sendMessage({ type: 'DISMISS_ONBOARDING' });
-  });
 
   // Language switcher
   document.getElementById('langSwitcher')?.addEventListener('click', (e) => {
@@ -242,12 +226,9 @@ function initEventListeners() {
       e.preventDefault();
       sendNextStepRequest();
     }
-    const actionButton = e.target.closest('[data-action-id]');
-    if (actionButton) handleActionDecision(actionButton.dataset.actionId, actionButton.dataset.decision === 'confirm');
   });
 
   window.addEventListener('limova-voice-status', event => updateVoiceStatus(event.detail));
-  window.addEventListener('limova-voice-transcript', event => handleVoiceTranscript(event.detail));
   window.addEventListener('limova-voice-consent-required', () => showAIConsent());
   window.addEventListener('limova-training-screen-ended', handleTrainingScreenEnded);
   window.addEventListener('limova-training-recording-limit', handleTrainingRecordingLimit);
@@ -410,25 +391,6 @@ async function logoutCharly() {
   catch (error) { addMessage('error', error.message); }
 }
 
-function updateMemoryControls(copilot) {
-  if (!elements.memoryToggleBtn) return;
-  const available = copilot?.available === true;
-  const enabled = copilot?.enabled !== false;
-  elements.memoryToggleBtn.hidden = !available;
-  if (elements.exportDataBtn) elements.exportDataBtn.hidden = !available;
-  if (elements.deleteDataBtn) elements.deleteDataBtn.hidden = !available;
-  elements.memoryToggleBtn.setAttribute('aria-checked', String(enabled));
-  const label = elements.memoryToggleBtn.querySelector('span');
-  if (label) label.textContent = enabled ? t('memoryEnabled') : t('memoryDisabled');
-}
-
-async function toggleCopilotMemory() {
-  const enabled = elements.memoryToggleBtn?.getAttribute('aria-checked') !== 'true';
-  const response = await chrome.runtime.sendMessage({ type: 'SET_MEMORY_PREFERENCE', enabled }).catch(error => ({ error: error.message }));
-  if (!response?.ok) return addMessage('error', response?.error || t('errorGeneric'));
-  updateMemoryControls({ available: true, enabled: response.enabled });
-}
-
 async function exportLimovaConversation() {
   document.getElementById('headerMenu').hidden = true;
   const file = await limovaPanel.exportConversation();
@@ -439,28 +401,6 @@ async function exportLimovaConversation() {
   link.download = file.filename;
   link.click();
   setTimeout(() => URL.revokeObjectURL(url), 1000);
-}
-
-async function exportCopilotData() {
-  document.getElementById('headerMenu').hidden = true;
-  const response = await chrome.runtime.sendMessage({ type: 'EXPORT_COPILOT_DATA' }).catch(error => ({ error: error.message }));
-  if (!response?.ok) return addMessage('error', response?.error || t('errorGeneric'));
-  const blob = new Blob([JSON.stringify(response.data, null, 2)], { type: 'application/json' });
-  const url = URL.createObjectURL(blob);
-  const link = document.createElement('a');
-  link.href = url;
-  link.download = response.filename || 'charly-data.json';
-  link.click();
-  URL.revokeObjectURL(url);
-}
-
-async function deleteCopilotData() {
-  document.getElementById('headerMenu').hidden = true;
-  if (!confirm(t('memoryDeleteConfirm'))) return;
-  const response = await chrome.runtime.sendMessage({ type: 'DELETE_COPILOT_DATA' }).catch(error => ({ error: error.message }));
-  if (!response?.ok) return addMessage('error', response?.error || t('errorGeneric'));
-  elements.chatContainer.textContent = '';
-  addMessage('system', t('memoryDeleted'));
 }
 
 async function startTrainingCapture() {
@@ -526,14 +466,9 @@ async function startTrainingCapture() {
 }
 
 async function recoverTrainingMicrophonePermission() {
-  if (!window.LimovaVoiceSession) {
-    elements.trainingFeedback.textContent = 'Le microphone est bloqué. Recharge Limova AI depuis chrome://extensions, puis réessaie.';
-    return;
-  }
   elements.trainingFeedback.textContent = 'Autorise le microphone dans le nouvel onglet Chrome, puis reviens ici.';
   try {
-    const permissionSession = new window.LimovaVoiceSession({ trainingMode: true });
-    await permissionSession.requestMicrophonePermissionInTab();
+    await requestMicrophonePermissionInTab(chrome);
     elements.trainingFeedback.textContent = 'Microphone autorisé. Clique à nouveau sur « Choisir l’écran entier et commencer ».';
   } catch (_) {
     elements.trainingFeedback.textContent = 'Le microphone reste bloqué. Dans l’onglet d’autorisation, ouvre les paramètres Chrome, autorise Limova AI, puis réessaie.';
@@ -718,39 +653,7 @@ async function checkIfOnLimova() {
 
 function handleBackgroundMessage(message) {
   if (limovaPanel?.handle(message)) return;
-  if (trainingCaptureActive && [
-    'GEMINI_RESPONSE', 'STATUS_UPDATE', 'ACTION_PROPOSAL', 'ACTION_RESULT',
-    'STEP_UPDATE', 'ONBOARDING_COMPLETE', 'VOICE_PAGE_CONTEXT'
-  ].includes(message.type)) return;
   switch (message.type) {
-    case 'AUTH_REQUIRED':
-      hidePondering();
-      isLoading = false;
-      void limovaPanel.refresh();
-      break;
-
-    case 'GEMINI_RESPONSE':
-      hidePondering();
-      hideWelcomeScreen();
-      addMessage('assistant', message.content);
-      updateStatus('ready');
-      break;
-
-    case 'STATUS_UPDATE':
-      updateStatus(message.status, message.text);
-      if (message.status === 'analyzing') {
-        showPondering(message.ponderingText ? t(message.ponderingText) : null);
-      } else if (message.status === 'ready') {
-        hidePondering();
-      }
-      break;
-
-    case 'ERROR':
-      hidePondering();
-      addMessage('error', `${message.content || t('errorGeneric')}${message.code ? ` (${t('errorCode')}: ${message.code})` : ''}`);
-      updateStatus('error');
-      break;
-
     case 'WRONG_TAB':
       showTabWarning(t('wrongTab'));
       { const goBtn = document.getElementById('goToLimova'); if (goBtn) goBtn.hidden = false; }
@@ -779,72 +682,13 @@ function handleBackgroundMessage(message) {
       }
       break;
 
-    case 'STEP_UPDATE':
-      updateStepInfo(message.step, message.progress);
-      break;
-
-    case 'ONBOARDING_COMPLETE':
-      updateStepInfo(null);
-      addMessage('system', t('onboardingComplete'));
-      break;
-
     case 'CONSENT_REQUIRED':
       hidePondering();
       isLoading = false;
       showAIConsent();
       break;
 
-    case 'ACTION_PROPOSAL':
-      renderActionProposal(message);
-      break;
-
-    case 'ACTION_RESULT':
-      addMessage(message.ok ? 'system' : 'error', message.ok
-        ? `${t('actionDone')} ${message.label || ''}`
-        : (message.error || t('actionFailed')));
-      break;
-
-    case 'VOICE_PAGE_CONTEXT':
-      voiceSession?.updatePageContext?.(
-        message.pageContext,
-        message.contextVersion,
-        message.source,
-        message.visualCapture
-      );
-      break;
   }
-}
-
-function renderActionProposal(action) {
-  const card = document.createElement('div');
-  card.className = 'action-card';
-  card.dataset.pendingAction = action.actionId;
-  const text = document.createElement('p');
-  text.textContent = `${t('actionConfirm')} « ${action.label} »`;
-  const actions = document.createElement('div');
-  actions.className = 'action-card-buttons';
-  const confirm = document.createElement('button');
-  confirm.className = 'action-confirm';
-  confirm.dataset.actionId = action.actionId;
-  confirm.dataset.decision = 'confirm';
-  confirm.textContent = t('actionExecute');
-  const cancel = document.createElement('button');
-  cancel.className = 'action-cancel';
-  cancel.dataset.actionId = action.actionId;
-  cancel.dataset.decision = 'cancel';
-  cancel.textContent = t('actionCancel');
-  actions.append(confirm, cancel);
-  card.append(text, actions);
-  elements.chatContainer.appendChild(card);
-  scrollToBottom();
-}
-
-async function handleActionDecision(actionId, confirmed) {
-  const card = elements.chatContainer.querySelector(`[data-pending-action="${CSS.escape(actionId)}"]`);
-  card?.querySelectorAll('button').forEach(button => { button.disabled = true; });
-  const result = await chrome.runtime.sendMessage({ type: confirmed ? 'CONFIRM_ACTION' : 'CANCEL_ACTION', actionId });
-  card?.remove();
-  if (!result?.ok && result?.error) addMessage('error', result.error);
 }
 
 // ============================================================================
@@ -1098,7 +942,7 @@ async function sendNextStepRequest() {
 
 async function requestVoiceMicrophone() {
   const [target] = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
-  const stream = await new window.LimovaVoiceSession().requestMicrophone();
+  const stream = await requestMicrophone(chrome, navigator);
   try {
     const [active] = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
     if (target?.id && active?.url === chrome.runtime.getURL('src/sidebar/microphone-permission.html'))
@@ -1214,31 +1058,6 @@ function updateVoiceStatus({ status, error, errorKey }) {
   } else updateStatus('ready');
 }
 
-function handleVoiceTranscript({ role, text, final }) {
-  if (!(role in voiceTranscriptBuffers)) return;
-  voiceTranscriptBuffers[role] += text || '';
-  if (trainingCaptureActive) {
-    if (role !== 'user') {
-      voiceTranscriptBuffers.assistant = '';
-      return;
-    }
-    if (final && voiceTranscriptBuffers.user.trim()) {
-      const transcript = voiceTranscriptBuffers.user.trim();
-      chrome.runtime.sendMessage({ type: 'VOICE_TRANSCRIPT', role: 'user', text: transcript }).catch(() => {});
-      voiceTranscriptBuffers.user = '';
-      elements.trainingFeedback.textContent = 'Explication enregistrée. Continuez votre démonstration : Charly observe sans agir.';
-    }
-    return;
-  }
-  if (final && voiceTranscriptBuffers[role].trim()) {
-    hideWelcomeScreen();
-    const transcript = voiceTranscriptBuffers[role].trim();
-    addMessage(role, transcript);
-    chrome.runtime.sendMessage({ type: 'VOICE_TRANSCRIPT', role, text: transcript }).catch(() => {});
-    voiceTranscriptBuffers[role] = '';
-  }
-}
-
 // ============================================================================
 // UI State
 // ============================================================================
@@ -1268,16 +1087,6 @@ function updateStatus(status, text) {
       break;
     default:
       badge.textContent = t('statusReady');
-  }
-}
-
-function updateStepInfo(stepName, progress) {
-  if (stepName) {
-    elements.stepInfo.hidden = false;
-    elements.stepName.textContent = stepName;
-    elements.stepProgress.textContent = progress || '';
-  } else {
-    elements.stepInfo.hidden = true;
   }
 }
 

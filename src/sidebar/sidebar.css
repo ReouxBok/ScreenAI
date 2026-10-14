@@ -629,57 +629,6 @@ body {
 }
 
 /* ============================================================================
-   Step Info Bar
-   ============================================================================ */
-
-.step-info {
-  display: flex;
-  align-items: center;
-  gap: var(--spacing-sm);
-  margin: var(--spacing-sm) var(--spacing-lg) 0;
-  padding: var(--spacing-sm) var(--spacing-md);
-  background: var(--color-primary-light);
-  border: 1px solid #bbf7d0;
-  border-radius: var(--radius-md);
-}
-
-.step-info[hidden] {
-  display: none !important;
-}
-
-.step-label {
-  font-size: var(--font-size-sm);
-  color: var(--color-gray-500);
-}
-
-.step-name {
-  font-weight: 600;
-  color: var(--color-gray-800);
-  flex: 1;
-}
-
-.step-close {
-  background: none;
-  border: none;
-  cursor: pointer;
-  padding: 2px;
-  color: var(--color-gray-400);
-  border-radius: var(--radius-sm);
-  display: flex;
-  align-items: center;
-}
-.step-close:hover {
-  color: var(--color-gray-600);
-  background: rgba(0,0,0,0.05);
-}
-
-.step-progress {
-  font-size: var(--font-size-xs);
-  color: var(--color-primary-hover);
-  font-weight: 600;
-}
-
-/* ============================================================================
    Chat Container
    ============================================================================ */
 
@@ -1251,33 +1200,10 @@ input:focus-visible {
   font-size: 22px;
 }
 
-.ai-consent-actions,
-.action-card-buttons {
+.ai-consent-actions {
   display: flex;
   gap: var(--spacing-sm);
 }
-
-.action-card {
-  padding: var(--spacing-md);
-  border: 1px solid #fed7aa;
-  border-radius: var(--radius-lg);
-  background: #fff7ed;
-  color: var(--color-gray-700);
-  font-size: var(--font-size-sm);
-}
-
-.action-card p { margin-bottom: var(--spacing-sm); }
-
-.action-card button {
-  padding: 6px 10px;
-  border-radius: var(--radius-md);
-  border: 1px solid var(--color-gray-300);
-  cursor: pointer;
-  font: inherit;
-}
-
-.action-confirm { background: var(--color-dark); color: var(--color-white); }
-.action-cancel { background: var(--color-white); color: var(--color-gray-600); }
 
 /* ============================================================================
    Utilities

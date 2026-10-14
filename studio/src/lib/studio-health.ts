@@ -24,33 +24,10 @@ export type StudioHealthCheck = {
   detail: string;
 };
 
-async function proxyHealth(): Promise<StudioHealthCheck> {
-  const endpoint = process.env.CHARLY_PROXY_HEALTH_URL || "https://limova-proxy-479c7fb78ccf.herokuapp.com/healthz";
-  const startedAt = performance.now();
-  try {
-    const response = await fetch(endpoint, { cache: "no-store", signal: AbortSignal.timeout(4_000) });
-    return {
-      key: "proxy",
-      label: "Proxy Charly",
-      level: response.ok ? "healthy" : "error",
-      summary: response.ok ? "Disponible" : `HTTP ${response.status}`,
-      detail: `${Math.round(performance.now() - startedAt)} ms · vérification sans donnée client`,
-    };
-  } catch (error) {
-    return {
-      key: "proxy",
-      label: "Proxy Charly",
-      level: "error",
-      summary: "Injoignable",
-      detail: `${error instanceof Error ? error.name : "NETWORK_ERROR"} · ${Math.round(performance.now() - startedAt)} ms`,
-    };
-  }
-}
-
 export async function getStudioHealth(options: { probeKnowledge?: boolean } = {}) {
   const db = requireDb();
   const now = new Date();
-  const [mailboxRows, receiptCounts, quarantineCount, hubspotFailures, knowledgeCounts, expiredEvaluations, trainingCandidates, proxy] = await Promise.all([
+  const [mailboxRows, receiptCounts, quarantineCount, hubspotFailures, knowledgeCounts, expiredEvaluations, trainingCandidates] = await Promise.all([
     db.select().from(savMailboxes).where(eq(savMailboxes.active, true)),
     db.select({
       pending: sql<number>`count(*) filter (where ${savWebhookReceipts.status} in ('pending', 'processing'))::int`,
@@ -70,7 +47,6 @@ export async function getStudioHealth(options: { probeKnowledge?: boolean } = {}
       lt(evaluationRuns.expiresAt, now),
     )),
     getTrainingReconciliationCandidates(now),
-    proxyHealth(),
   ]);
 
   const receipts = receiptCounts[0] ?? { pending: 0, failed: 0 };
@@ -128,7 +104,6 @@ export async function getStudioHealth(options: { probeKnowledge?: boolean } = {}
       detail: "Un brouillon n’est jamais indexé avant validation et publication",
     },
     embedding,
-    proxy,
     {
       key: "trainings",
       label: "Sessions tutoriels",

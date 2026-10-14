@@ -257,4 +257,4 @@ La connaissance publiée passe par le MCP Studio du main agent, qualifié sépar
 
 Les 11 scénarios vocaux/visuels natifs passent sur les paquets production et staging locaux. La suite complète passe avec 156 succès et 1 contrôle staging ignoré sur le paquet production, puis 148 succès et 9 contrôles production-only ignorés sur le paquet staging. Les fixtures de capture sélectionnent l’origine du paquet ; le test MediaRecorder/Blob reste explicitement production-only, car le manifeste staging refuse Studio et Blob production.
 
-Le fichier legacy est supprimé en entier : aucun skip ni ancienne fixture Gemini n’est conservé. Cela clôt la migration des tests d’interface, mais pas le retrait du code legacy, la migration globale ni les qualifications de services réels listées dans le plan.
+Le fichier legacy est supprimé en entier : aucun skip ni ancienne fixture Gemini n’est conservé. La couche S4 retire ensuite le proxy, OTP, ADK, la mémoire séparée, les prompts/KB locaux et le client vocal legacy. Les qualifications de services réels listées dans le plan restent ouvertes.

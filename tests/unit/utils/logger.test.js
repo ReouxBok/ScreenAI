@@ -54,19 +54,10 @@ describe('Logger', () => {
       expect(Logger.getLogsAsText()).not.toContain('SECRET_SENTINEL');
     });
 
-    it('records response metadata without storing model output', () => {
-      const long = `MODEL_SECRET_${'a'.repeat(500)}`;
-      Logger.logGeminiResponse(long, { hasHighlight: true });
-      const entry = Logger.getLogs().at(-1);
-      expect(entry.data.responseLength).toBe(long.length);
-      expect(entry.data.textIncluded).toBe(false);
-      expect(entry.data.markers).toEqual({ hasHighlight: true });
-      expect(JSON.stringify(entry)).not.toContain('MODEL_SECRET');
-    });
   });
 
   describe('_sanitize (via log data)', () => {
-    it('redacts Gemini API keys (AIza...)', () => {
+    it('redacts provider API keys', () => {
       Logger.log('x', 'msg', 'AIzaSyABCDEFGHIJKLMNOPQRSTUVWX1234');
       const entry = Logger.getLogs().at(-1);
       expect(entry.data).toBe('[api-key-redacted]');
@@ -142,24 +133,19 @@ describe('Logger', () => {
     it('produces a readable header and formatted entries', () => {
       Logger.logTurnStart('url_change', { url: 'https://x', historyLength: 2 });
       Logger.logUserMessage('Salut', 'https://x');
-      Logger.logGeminiResponse('Bonjour !');
-      Logger.logApiRequest({ model: 'gemini-2.5-flash', messageCount: 3 });
-      Logger.logApiResponse({ success: true, responseTime: 420 });
+      Logger.event('deep_agent', 'DEEP_AGENT_SESSION_READY', { engine: 'deep_agents' });
 
       const text = Logger.getLogsAsText();
       expect(text).toContain('Limova AI');
       expect(text).toContain('Paquet de diagnostic sécurisé');
       expect(text).toContain('TURN_STARTED');
       expect(text).toContain('USER_MESSAGE_ACCEPTED');
-      expect(text).toContain('GEMINI_RESPONSE_ACCEPTED');
-      expect(text).toContain('API_REQUEST_STARTED');
-      expect(text).toContain('API_REQUEST_SUCCEEDED');
-      expect(text).toContain('gemini-2.5-flash');
+      expect(text).toContain('DEEP_AGENT_SESSION_READY');
     });
 
-    it('formats API errors distinctly', () => {
-      Logger.logApiResponse({ success: false, error: 'rate_limit', responseTime: 50 });
-      expect(Logger.getLogsAsText()).toContain('API_REQUEST_FAILED');
+    it('formats native transport errors distinctly', () => {
+      Logger.error('deep_agent', 'Native transport failed', { reason: 'rate_limit' }, 'DEEP_AGENT_TRANSPORT_FAILED');
+      expect(Logger.getLogsAsText()).toContain('DEEP_AGENT_TRANSPORT_FAILED');
       expect(Logger.getLogsAsText()).toContain('rate_limit');
     });
   });

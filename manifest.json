@@ -25,12 +25,11 @@
     "https://new.limova.ai/*",
     "https://studio.limova.ai/*",
     "https://vercel.com/*",
-    "https://pihloilpc5svuzjv.private.blob.vercel-storage.com/*",
-    "https://limova-proxy-479c7fb78ccf.herokuapp.com/*"
+    "https://pihloilpc5svuzjv.private.blob.vercel-storage.com/*"
   ],
 
   "content_security_policy": {
-    "extension_pages": "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data: blob:; connect-src https://api.new.limova.ai https://limova-proxy-479c7fb78ccf.herokuapp.com https://studio.limova.ai https://vercel.com https://pihloilpc5svuzjv.private.blob.vercel-storage.com; media-src 'self' blob:; object-src 'none';"
+    "extension_pages": "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data: blob:; connect-src https://api.new.limova.ai https://studio.limova.ai https://vercel.com https://pihloilpc5svuzjv.private.blob.vercel-storage.com; media-src 'self' blob:; object-src 'none';"
   },
 
   "background": {
@@ -50,7 +49,7 @@
   "content_scripts": [
     {
       "matches": ["https://new.limova.ai/*"],
-      "js": ["src/content/console-interceptor.js"],
+      "js": ["src/content/training-network.js"],
       "run_at": "document_start",
       "world": "MAIN"
     },

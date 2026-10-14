@@ -158,35 +158,6 @@ const Logger = {
     }, operationId);
   },
 
-  logGeminiResponse(response, markers = {}, operationId = null) {
-    return this.record('INFO', 'gemini', 'GEMINI_RESPONSE_ACCEPTED', 'Gemini response accepted', {
-      responseLength: String(response || '').length,
-      markers,
-      textIncluded: false
-    }, operationId);
-  },
-
-  logApiRequest(details = {}) {
-    return this.record('INFO', 'gemini_api', 'API_REQUEST_STARTED', 'API request started', {
-      model: details.model || 'unknown',
-      messageCount: Number(details.messageCount || 0),
-      hasPageContext: Boolean(details.hasPageContext),
-      systemPromptLength: Number(details.systemPromptLength || 0),
-      attempt: Number(details.attempt || 1)
-    }, details.operationId || null);
-  },
-
-  logApiResponse(details = {}) {
-    const success = details.success !== false;
-    return this.record(success ? 'INFO' : 'ERROR', 'gemini_api', details.code || (success ? 'API_REQUEST_SUCCEEDED' : 'API_REQUEST_FAILED'), success ? 'API request succeeded' : 'API request failed', {
-      success,
-      status: Number(details.status || 0),
-      responseTime: Number(details.responseTime || 0),
-      error: details.error || null,
-      attempt: Number(details.attempt || 1)
-    }, details.operationId || null);
-  },
-
   getSummary() {
     const errors = this.logs.filter(entry => entry.level === 'ERROR');
     const warnings = this.logs.filter(entry => entry.level === 'WARN');

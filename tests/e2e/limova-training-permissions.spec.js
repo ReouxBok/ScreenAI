@@ -7,22 +7,28 @@ test('training microphone refusal offers permission recovery before contacting S
   await panel.locator('#menuBtn').click();
   await panel.locator('#trainingBtn').click();
   await panel.locator('#trainingToken').fill('training-permission-local-fixture-token');
+  await context.addInitScript(() => {
+    if (location.protocol !== 'chrome-extension:') return;
+    Object.defineProperty(navigator, 'mediaDevices', {
+      configurable: true,
+      value: { getUserMedia: () => new Promise(() => {}) },
+    });
+  });
   await panel.evaluate(() => {
-    window.trainingPermissionRequests = 0;
     window.recordingAborts = 0;
     window.LimovaTrainingScreenRecorder = class {
       async start() { const error = new Error('Autorise le microphone.'); error.code = 'TRAINING_MIC_REQUIRED'; throw error; }
       abort() { window.recordingAborts++; }
     };
-    window.LimovaVoiceSession = class {
-      async requestMicrophonePermissionInTab() { window.trainingPermissionRequests++; }
-    };
   });
+  const permissionTabPromise = context.waitForEvent('page');
   await panel.locator('#trainingStart').click();
+  const permissionTab = await permissionTabPromise;
+  await permissionTab.waitForURL(/microphone-permission\.html/);
+  await permissionTab.evaluate(() => chrome.runtime.sendMessage({ type: 'MICROPHONE_PERMISSION_RESULT', granted: true }));
   await expect(panel.locator('#trainingFeedback')).toContainText('Microphone autorisé');
   await expect(panel.locator('#trainingStart')).toBeEnabled();
-  expect(await panel.evaluate(() => ({ permissions: window.trainingPermissionRequests, aborted: window.recordingAborts })))
-    .toEqual({ permissions: 1, aborted: 1 });
+  expect(await panel.evaluate(() => window.recordingAborts)).toBe(1);
   expect(calls.filter(call => call.method === 'POST')).toEqual([]);
   expect(studioRequests).toEqual([]);
   expect(legacy).toEqual([]); expect(errors).toEqual([]);

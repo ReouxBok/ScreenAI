@@ -92,7 +92,6 @@ const translations = {
     voiceMicUnsupported: 'Le microphone n’est pas disponible dans ce navigateur.',
     sendMessage: 'Envoyer le message',
     closeQuickLinks: 'Fermer les liens rapides',
-    closeOnboarding: 'Fermer le parcours',
     inputPlaceholder: 'Écris à Charly...',
     greeting: 'Bonjour ! Je suis Charly, ton assistante onboarding Limova',
     howItWorksTitle: 'Voici comment ça va fonctionner',
@@ -101,7 +100,6 @@ const translations = {
     howItWorks3: 'Si tu es bloqué, clique sur {CAPTURE_ICON} en bas à gauche',
     howItWorks4: 'Pose-moi n\'importe quelle question en chemin',
     cta: 'Prêt ? Dis-moi ce que tu veux faire sur Limova, ou rends-toi sur la plateforme pour commencer !',
-    stepLabel: 'Étape :',
     downloadLogs: 'Télécharger les logs',
     runDiagnostics: 'Vérifier Charly',
     diagnosticRunning: 'Vérification en cours…',
@@ -126,7 +124,6 @@ const translations = {
     limovaReturnTab: 'Tu es sur un autre onglet. Revenir à l’onglet accompagné',
     wrongTab: 'Tu es sur un autre onglet. Clique ici pour revenir à Limova.',
     goToLimova: 'Ouvrir Limova',
-    onboardingComplete: 'Onboarding terminé !',
     screenshotCaptured: 'Page analysée',
     aiConsentTitle: 'Activer l’intelligence de Charly',
     aiConsentText: 'Avec ton accord, Charly utilise les services IA de Limova, dont OpenAI pour la voix, afin de traiter la structure de la page, les erreurs filtrées et tes messages. Tes conversations peuvent être conservées jusqu’à 12 mois pour reprendre tes objectifs. Les captures, DOM, requêtes et valeurs de formulaires ne sont jamais mémorisés. Tu gardes le contrôle dans le menu.',
@@ -134,17 +131,6 @@ const translations = {
     aiConsentAccept: 'Activer Charly',
     aiConsentDecline: 'Pas maintenant',
     aiConsentDeclined: 'Charly reste désactivé. Tu pourras l’activer en envoyant un message ou en lançant la voix.',
-    memoryEnabled: 'Personnalisation active',
-    memoryDisabled: 'Personnalisation désactivée',
-    memoryExport: 'Exporter les données de l’ancienne extension',
-    memoryDelete: 'Effacer les données Charly',
-    memoryDeleteConfirm: 'Effacer définitivement les conversations, objectifs et préférences utilisés par Charly ?',
-    memoryDeleted: 'Les données personnelles utilisées par Charly ont été effacées.',
-    actionConfirm: 'Charly propose d’exécuter',
-    actionExecute: 'Exécuter',
-    actionCancel: 'Annuler',
-    actionDone: 'Action exécutée :',
-    actionFailed: 'L’action n’a pas pu être exécutée.'
   },
   en: {
     limovaExport: 'Export this conversation (CSV)',
@@ -226,7 +212,6 @@ const translations = {
     voiceMicUnsupported: 'The microphone is not available in this browser.',
     sendMessage: 'Send message',
     closeQuickLinks: 'Close quick links',
-    closeOnboarding: 'Close onboarding',
     inputPlaceholder: 'Write to Charly...',
     greeting: 'Hi! I\'m Charly, your Limova onboarding assistant',
     howItWorksTitle: 'Here\'s how it works',
@@ -235,7 +220,6 @@ const translations = {
     howItWorks3: 'If you\'re stuck, click {CAPTURE_ICON} at the bottom left',
     howItWorks4: 'Ask me any question along the way',
     cta: 'Ready? Tell me what you want to do on Limova, or head to the platform to get started!',
-    stepLabel: 'Step:',
     downloadLogs: 'Download logs',
     runDiagnostics: 'Check Charly',
     diagnosticRunning: 'Running checks…',
@@ -260,7 +244,6 @@ const translations = {
     limovaReturnTab: 'You are on another tab. Return to the assisted tab',
     wrongTab: 'You\'re on another tab. Click here to go back to Limova.',
     goToLimova: 'Open Limova',
-    onboardingComplete: 'Onboarding complete!',
     screenshotCaptured: 'Page analyzed',
     aiConsentTitle: 'Enable Charly’s intelligence',
     aiConsentText: 'With your consent, Charly uses Limova AI services, including OpenAI for voice, to process the Limova page structure, filtered errors, and your messages. Conversations may be retained for up to 12 months to resume your goals. Captures, DOM, requests, and form values are never added to memory. You stay in control from the menu.',
@@ -268,17 +251,6 @@ const translations = {
     aiConsentAccept: 'Enable Charly',
     aiConsentDecline: 'Not now',
     aiConsentDeclined: 'Charly remains disabled. You can enable it by sending a message or starting voice.',
-    memoryEnabled: 'Personalization on',
-    memoryDisabled: 'Personalization off',
-    memoryExport: 'Export data from the previous extension',
-    memoryDelete: 'Delete Charly data',
-    memoryDeleteConfirm: 'Permanently delete the conversations, goals, and preferences used by Charly?',
-    memoryDeleted: 'The personal data used by Charly has been deleted.',
-    actionConfirm: 'Charly proposes to run',
-    actionExecute: 'Run',
-    actionCancel: 'Cancel',
-    actionDone: 'Action completed:',
-    actionFailed: 'The action could not be completed.'
   },
   es: {
     limovaExport: 'Exportar esta conversación (CSV)',
@@ -360,7 +332,6 @@ const translations = {
     voiceMicUnsupported: 'El micrófono no está disponible en este navegador.',
     sendMessage: 'Enviar mensaje',
     closeQuickLinks: 'Cerrar enlaces rápidos',
-    closeOnboarding: 'Cerrar el onboarding',
     inputPlaceholder: 'Escribe a Charly...',
     greeting: '¡Hola! Soy Charly, tu asistente de onboarding de Limova',
     howItWorksTitle: 'Así es como funciona',
@@ -369,7 +340,6 @@ const translations = {
     howItWorks3: 'Si te bloqueas, haz clic en {CAPTURE_ICON} abajo a la izquierda',
     howItWorks4: 'Hazme cualquier pregunta en el camino',
     cta: '¿Listo? Dime qué quieres hacer en Limova, ¡o ve a la plataforma para empezar!',
-    stepLabel: 'Paso:',
     downloadLogs: 'Descargar logs',
     runDiagnostics: 'Verificar Charly',
     diagnosticRunning: 'Comprobación en curso…',
@@ -394,7 +364,6 @@ const translations = {
     limovaReturnTab: 'Estás en otra pestaña. Volver a la pestaña asistida',
     wrongTab: 'Estás en otra pestaña. Haz clic aquí para volver a Limova.',
     goToLimova: 'Abrir Limova',
-    onboardingComplete: '¡Onboarding completado!',
     screenshotCaptured: 'Página analizada',
     aiConsentTitle: 'Activar la inteligencia de Charly',
     aiConsentText: 'Con tu consentimiento, Charly usa los servicios de IA de Limova, incluido OpenAI para la voz, para procesar la estructura de la página, los errores filtrados y tus mensajes. Las conversaciones pueden conservarse hasta 12 meses para retomar tus objetivos. Las capturas, el DOM, las solicitudes y los valores de formularios nunca se añaden a la memoria. Mantienes el control desde el menú.',
@@ -402,17 +371,6 @@ const translations = {
     aiConsentAccept: 'Activar Charly',
     aiConsentDecline: 'Ahora no',
     aiConsentDeclined: 'Charly permanece desactivado. Puedes activarlo enviando un mensaje o iniciando la voz.',
-    memoryEnabled: 'Personalización activa',
-    memoryDisabled: 'Personalización desactivada',
-    memoryExport: 'Exportar datos de la extensión anterior',
-    memoryDelete: 'Borrar los datos de Charly',
-    memoryDeleteConfirm: '¿Borrar definitivamente las conversaciones, objetivos y preferencias utilizados por Charly?',
-    memoryDeleted: 'Los datos personales utilizados por Charly se han borrado.',
-    actionConfirm: 'Charly propone ejecutar',
-    actionExecute: 'Ejecutar',
-    actionCancel: 'Cancelar',
-    actionDone: 'Acción completada:',
-    actionFailed: 'No se pudo completar la acción.'
   }
 };
 
@@ -455,7 +413,7 @@ async function setLang(lang) {
   await chrome.storage.local.set({ limova_lang: lang });
   applyTranslations();
   updateLangSwitcher();
-  // Notify background so Gemini uses the new language
+  // Notify the service worker so diagnostics and local UI state stay aligned.
   chrome.runtime.sendMessage({ type: 'SET_LANG', lang }).catch(() => {});
 }
 

@@ -147,7 +147,7 @@ for (const scenario of ['success', 'verification_failure', 'manual_voice', 'manu
     const app = await context.newPage(); await app.goto(`${APP}/settings`);
     await app.evaluate(api => fetch(`${api}/fixture-login`, { credentials: 'include' }), API);
     await worker.evaluate(async ({ USER, WORKSPACE, PERSONAL }) => {
-      await chrome.storage.local.set({ limova_deep_agent_context_v1: { userId: USER, workspaceId: WORKSPACE, conversationId: PERSONAL }, limova_ai_processing_consent_v1: true, limova_onboarding_dismissed: true });
+      await chrome.storage.local.set({ limova_deep_agent_context_v1: { userId: USER, workspaceId: WORKSPACE, conversationId: PERSONAL }, limova_ai_processing_consent_v1: true });
     }, { USER, WORKSPACE, PERSONAL });
     const panel = await context.newPage(); panel.on('pageerror', error => errors.push(error.message));
     context.on('request', request => { if (/limova-proxy|generativelanguage|\/api\/copilot|\/api\/live-session/.test(request.url())) legacy.push(request.url()); });

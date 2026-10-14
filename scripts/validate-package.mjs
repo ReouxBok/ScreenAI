@@ -64,8 +64,7 @@ const expectedHosts = environment.name === 'staging' ? [`${environment.apiOrigin
   'https://new.limova.ai/*',
   'https://studio.limova.ai/*',
   'https://vercel.com/*',
-  'https://pihloilpc5svuzjv.private.blob.vercel-storage.com/*',
-  'https://limova-proxy-479c7fb78ccf.herokuapp.com/*'
+  'https://pihloilpc5svuzjv.private.blob.vercel-storage.com/*'
 ];
 const actualHosts = [...(manifest.host_permissions || [])].sort();
 if (JSON.stringify(actualHosts) !== JSON.stringify([...expectedHosts].sort())) {

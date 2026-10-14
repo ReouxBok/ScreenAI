@@ -36,7 +36,7 @@ test.describe('Extension — loading and bootstrap', () => {
     const manifest = await serviceWorker.evaluate(() => chrome.runtime.getManifest());
     const origins = [environment.apiOrigin, environment.appOrigin];
     if (environment.name === 'production') origins.push('https://studio.limova.ai', 'https://vercel.com',
-      'https://pihloilpc5svuzjv.private.blob.vercel-storage.com', 'https://limova-proxy-479c7fb78ccf.herokuapp.com');
+      'https://pihloilpc5svuzjv.private.blob.vercel-storage.com');
     expect(manifest.host_permissions).toEqual(origins.map(origin => `${origin}/*`));
     expect(manifest.optional_host_permissions).toEqual(['https://*/*']);
     expect(await serviceWorker.evaluate(() => chrome.permissions.contains({ origins: ['https://*/*'] }))).toBe(false);
@@ -80,13 +80,13 @@ test.describe('Extension — messaging', () => {
     await page.close();
   });
 
-  test('GET_SETTINGS returns hasApiKey: true (server-side keys)', async ({ context, extensionId }) => {
+  test('legacy settings routes are no longer exposed', async ({ context, extensionId }) => {
     const page = await context.newPage();
     await page.goto(`chrome-extension://${extensionId}/src/sidebar/sidebar.html`);
     const result = await page.evaluate(() =>
       chrome.runtime.sendMessage({ type: 'GET_SETTINGS' })
     );
-    expect(result).toEqual({ hasApiKey: true });
+    expect(result).toEqual({ error: 'Unknown message type' });
     await page.close();
   });
 });

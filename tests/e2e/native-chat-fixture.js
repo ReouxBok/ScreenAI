@@ -118,7 +118,7 @@ export const test = base.extend({
       await app.evaluate(api => fetch(`${api}/fixture-login`, { credentials: 'include' }), API);
       await worker.evaluate(async ({ USER, WORKSPACE }) => chrome.storage.local.set({
         limova_deep_agent_context_v1: { userId: USER, workspaceId: WORKSPACE },
-        limova_ai_processing_consent_v1: true, limova_onboarding_dismissed: true, limova_lang: 'fr',
+        limova_ai_processing_consent_v1: true, limova_lang: 'fr',
       }), { USER, WORKSPACE });
       const panel = await context.newPage(); panel.on('pageerror', error => errors.push(error.message));
       await panel.goto(`chrome-extension://${new URL(worker.url()).host}/src/sidebar/sidebar.html`);

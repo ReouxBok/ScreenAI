@@ -99,7 +99,7 @@ const test = base.extend({
     await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
     const port = server.address().port;
     const productionMappings = environment.name === 'staging'
-      ? `, MAP api.new.limova.ai 127.0.0.1:${port}, MAP studio.limova.ai 127.0.0.1:${port}, MAP limova-proxy-479c7fb78ccf.herokuapp.com 127.0.0.1:${port}` : '';
+      ? `, MAP api.new.limova.ai 127.0.0.1:${port}, MAP studio.limova.ai 127.0.0.1:${port}` : '';
     const extensionPath = path.resolve(process.env.EXTENSION_PATH ?? 'build');
     const context = await chromium.launchPersistentContext('', {
       channel: 'chromium', headless: true, ignoreHTTPSErrors: true,
@@ -376,11 +376,10 @@ test('offers the existing app tab for login without creating a duplicate', async
   expect(after[0].active).toBe(true);
 });
 
-test('the staging worker cannot send requests to production API, Studio or proxy', async ({ sessionFixture }) => {
+test('the staging worker cannot send requests to the production API or Studio', async ({ sessionFixture }) => {
   test.skip(environment.name !== 'staging', 'Only the staging package excludes production services');
   const count = sessionFixture.observations.length;
-  for (const url of ['https://api.new.limova.ai/users/me', 'https://studio.limova.ai/api/training/sessions',
-    'https://limova-proxy-479c7fb78ccf.herokuapp.com/healthz']) {
+  for (const url of ['https://api.new.limova.ai/users/me', 'https://studio.limova.ai/api/training/sessions']) {
     expect(await sessionFixture.worker.evaluate(async url => {
       try { await fetch(url, { credentials: 'include' }); return true; } catch { return false; }
     }, url)).toBe(false);

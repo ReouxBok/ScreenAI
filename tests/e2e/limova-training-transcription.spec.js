@@ -111,7 +111,7 @@ for (const popupMode of ['sequential', 'overlapping']) test(`training preserves 
     await worker.evaluate(async ({ USER, WORKSPACE, CONVERSATION }) => {
       await chrome.storage.local.set({
         limova_deep_agent_context_v1: { userId: USER, workspaceId: WORKSPACE, conversationId: CONVERSATION },
-        limova_ai_processing_consent_v1: true, limova_onboarding_dismissed: true,
+        limova_ai_processing_consent_v1: true,
       });
     }, { USER, WORKSPACE, CONVERSATION });
     const extensionPage = await context.newPage();
@@ -294,4 +294,3 @@ for (const popupMode of ['sequential', 'overlapping']) test(`training preserves 
     await rm(directory, { recursive: true, force: true });
   }
 });
-

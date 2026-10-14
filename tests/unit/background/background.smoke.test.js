@@ -47,43 +47,10 @@ describe('background.js — service worker smoke test', () => {
     expect(chromeMock.i18n.getUILanguage).toHaveBeenCalled();
   });
 
-  it('reads onboarding dismissal flag from storage on boot', async () => {
-    // Verify via the storage mock: one of the gets was for limova_lang or limova_session
-    const calledKeys = chromeMock.storage.local.get.mock.calls.map(c => c[0]);
-    expect(calledKeys).toEqual(expect.arrayContaining([
-      expect.any(String)
-    ]));
-  });
-
-  it('keeps up to the 200 most recent messages in model context', () => {
-    const history = Array.from({ length: 250 }, (_, index) => ({
-      role: index % 2 === 0 ? 'user' : 'assistant',
-      content: `message-${index}`
-    }));
-
-    const selected = background.boundedConversationHistory(history, 200, 60_000);
-
-    expect(selected).toHaveLength(200);
-    expect(selected[0].content).toBe('message-50');
-    expect(selected.at(-1).content).toBe('message-249');
-  });
-
-  it('drops the oldest messages when the safe context size is reached', () => {
-    const history = Array.from({ length: 200 }, (_, index) => ({
-      role: 'user',
-      content: `${index}-${'x'.repeat(1_000)}`
-    }));
-
-    const selected = background.boundedConversationHistory(history, 200, 60_000);
-    const characterCount = selected.reduce((total, message) => total + message.content.length, 0);
-
-    expect(selected.length).toBeLessThan(200);
-    expect(selected.at(-1).content).toContain('199-');
-    expect(characterCount).toBeLessThanOrEqual(60_000);
-  });
-
-  it('removes the legacy analytics consent flag on boot', () => {
-    expect(chromeMock.storage.local.remove).toHaveBeenCalledWith('limova_analytics_consent');
+  it('removes legacy local sessions on boot', () => {
+    expect(chromeMock.storage.local.remove).toHaveBeenCalledWith([
+      'limova_analytics_consent', 'limova_session', 'charly_auth_session_v1'
+    ]);
   });
 });
 
@@ -135,18 +102,17 @@ describe('background.js — onMessage router', () => {
     expect(result).toEqual({ error: 'Unauthorized message source' });
   });
 
-  it('GET_STATE advertises training and popup support', async () => {
+  it('GET_STATE advertises only native Studio capabilities', async () => {
     const result = await dispatch({ type: 'GET_STATE' });
     expect(result.extensionVersion).toBeTruthy();
     expect(result.capabilities).toEqual({
       training: true,
-      domPopups: true,
       externalPopupLifecycle: true,
-      charlyOtp: true,
       realEvaluation: true,
       longTrainingRecording: true
     });
-    expect(result.auth).toHaveProperty('authenticated');
+    expect(result).not.toHaveProperty('auth');
+    expect(result).not.toHaveProperty('copilot');
   });
 
   it('rejects messages without the extension sender identity', async () => {
@@ -165,15 +131,11 @@ describe('background.js — onMessage router', () => {
       .toEqual({ error: 'Unauthorized message source' });
   });
 
-  it('GET_SETTINGS returns hasApiKey: true (keys are server-side)', async () => {
-    const result = await dispatch({ type: 'GET_SETTINGS' });
-    expect(result).toEqual({ hasApiKey: true });
-  });
-
-  it('SAVE_SETTINGS returns ok: true (keys managed server-side)', async () => {
-    const result = await dispatch({ type: 'SAVE_SETTINGS', apiKey: 'anything' });
-    expect(result).toEqual({ ok: true });
-  });
+  it.each(['GET_SETTINGS', 'SAVE_SETTINGS', 'AUTH_REQUEST_OTP', 'VOICE_TRANSCRIPT'])(
+    'rejects removed legacy route %s', async type => {
+      expect(await dispatch({ type })).toEqual({ error: 'Unknown message type' });
+    }
+  );
 
   it('GET_LOGS returns a logs string', async () => {
     const result = await dispatch({ type: 'GET_LOGS' });
@@ -203,11 +165,4 @@ describe('background.js — onMessage router', () => {
     expect(result).toEqual({ error: 'Unknown message type' });
   });
 
-  it('DISMISS_ONBOARDING persists the flag and returns ok', async () => {
-    const result = await dispatch({ type: 'DISMISS_ONBOARDING' });
-    expect(result).toEqual({ ok: true });
-    expect(chromeMock.storage.local.set).toHaveBeenCalledWith(
-      expect.objectContaining({ limova_onboarding_dismissed: true })
-    );
-  });
 });
