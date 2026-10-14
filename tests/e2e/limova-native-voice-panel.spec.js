@@ -19,12 +19,13 @@ const BROWSER_TURN = '66666666-6666-4666-8666-666666666666';
 const BROWSER_SESSION = '77777777-7777-4777-8777-777777777777';
 const PAGE = { tabId: 7, origin: 'https://example.com', contextVersion: 1 };
 
-for (const ending of ['consent', 'disconnect', 'startup-timeout', 'permission-dismissed', 'turn-failed', 'response-timeout', 'manual-context', 'manual-other-tab']) test(`native voice handles ${ending} without replaying a turn`, async () => {
+for (const ending of ['consent', 'disconnect', 'startup-timeout', 'permission-dismissed', 'turn-failed', 'response-timeout', 'manual-context', 'manual-other-tab', 'playback-interruption']) test(`native voice handles ${ending} without replaying a turn`, async () => {
   test.setTimeout(40_000);
   const directory = await mkdtemp(path.join(tmpdir(), 'limova-live-test-'));
   const key = path.join(directory, 'key.pem'), cert = path.join(directory, 'cert.pem');
   execFileSync('openssl', ['req', '-x509', '-newkey', 'rsa:2048', '-nodes', '-keyout', key,
     '-out', cert, '-days', '1', '-subj', '/CN=limova-live-test'], { stdio: 'ignore' });
+  const history = [];
   const seen = { starts: 0, connected: 0, stopped: 0, disconnected: 0, pcm: null, cancelled: null, browserBinding: null, browserResult: null, results: [], action: null, httpChecks: [], cookie: false, origin: null };
   const server = createServer({ key: await readFile(key), cert: await readFile(cert) }, (request, response) => {
     if (request.headers.host === new URL(APP).host) {
@@ -41,7 +42,7 @@ for (const ending of ['consent', 'disconnect', 'startup-timeout', 'permission-di
     seen.httpChecks.push({ method: request.method, path: request.url, authenticated, workspaceId: request.headers['x-workspace-id'] });
     let data = {};
     if (request.url.startsWith('/conversation?')) data = { data: { data: [{ id: CONVERSATION, title: 'Conversation vocale' }] } };
-    if (request.url === `/conversation/${CONVERSATION}/messages`) data = { data: { data: [] } };
+    if (request.url === `/conversation/${CONVERSATION}/messages`) data = { data: { data: history } };
     if (request.url === '/users/me') data = { id: USER };
     if (request.url === '/workspaces') data = [{ id: WORKSPACE, is_charly_extension_enabled: true }];
     if (request.url === `/conversation/${CONVERSATION}`) data = { id: CONVERSATION, engine: 'deep_agents', mainAgent: { slug: 'charly' } };
@@ -69,7 +70,7 @@ for (const ending of ['consent', 'disconnect', 'startup-timeout', 'permission-di
     });
     socket.on('audio.append', payload => {
       seen.pcm = { sequence: payload.sequence, length: payload.audio.length };
-      if (ending.startsWith('manual-')) return;
+      if (ending.startsWith('manual-') || ending === 'playback-interruption') return;
       if (seen.action) return;
       seen.action = true;
       socket.emit('turn.deep_agent_stream.started', { sessionId: socketSessionId, turnId: VOICE_TURN });
@@ -129,12 +130,33 @@ for (const ending of ['consent', 'disconnect', 'startup-timeout', 'permission-di
       });
     }, { USER, WORKSPACE, CONVERSATION });
     const extensionPage = await context.newPage();
-    const errors = [], legacyRequests = [];
+    const errors = [], legacyRequests = [], deprecatedAudioWarnings = [];
+    extensionPage.on('console', message => {
+      if (/ScriptProcessorNode|createScriptProcessor/i.test(message.text())) deprecatedAudioWarnings.push(message.text());
+    });
     extensionPage.on('pageerror', error => errors.push(error.message));
     context.on('request', request => { if (/limova-proxy|generativelanguage|\/api\/live-session/.test(request.url())) legacyRequests.push(request.url()); });
     await extensionPage.goto(`chrome-extension://${new URL(worker.url()).host}/src/sidebar/sidebar.html`);
     await expect(extensionPage.locator('html')).toHaveAttribute('data-sidebar-ready', 'true');
     await expect(extensionPage.locator('#limovaConversation')).toHaveValue(CONVERSATION);
+    if (ending === 'playback-interruption') await extensionPage.evaluate(() => {
+      const NativeAudioContext = window.AudioContext;
+      window.audioInspection = { contexts: [], starts: [], stops: 0 };
+      window.AudioContext = class extends NativeAudioContext {
+        constructor(...args) { super(...args); window.audioInspection.contexts.push(this); }
+        createBufferSource() {
+          const node = super.createBufferSource();
+          const start = node.start.bind(node), stop = node.stop.bind(node);
+          node.start = (...args) => {
+            window.audioInspection.starts.push({ sampleRate: node.buffer.sampleRate,
+              samples: [...node.buffer.getChannelData(0).slice(0, 2)], duration: node.buffer.duration });
+            return start(...args);
+          };
+          node.stop = (...args) => { window.audioInspection.stops++; return stop(...args); };
+          return node;
+        }
+      };
+    });
     if (ending === 'response-timeout') await extensionPage.clock.install();
     if (ending.startsWith('manual-')) {
       await app.bringToFront();
@@ -168,6 +190,52 @@ for (const ending of ['consent', 'disconnect', 'startup-timeout', 'permission-di
       return;
     }
     await expect.poll(() => seen.pcm?.length).toBe(640);
+    if (ending === 'playback-interruption') {
+      expect(seen.startPayload).toMatchObject({ conversationId: CONVERSATION, expectedUserId: USER, clientSurface: 'chrome_extension' });
+      expect(seen.cookie).toBe(true); expect(seen.origin).toBe(APP);
+      const sessionId = seen.sessionId;
+      activeSocket.emit('turn.deep_agent_stream.started', { sessionId, turnId: VOICE_TURN });
+      const pcm = Buffer.alloc(48000);
+      for (let offset = 0; offset < pcm.length; offset += 4) { pcm.writeInt16LE(-32768, offset); pcm.writeInt16LE(32767, offset + 2); }
+      activeSocket.emit('assistant.audio.delta', { sessionId, sequence: 0, audio: pcm });
+      activeSocket.emit('assistant.audio.delta', { sessionId, sequence: 1, audio: pcm });
+      await expect.poll(() => extensionPage.evaluate(() => window.audioInspection.starts.length)).toBe(2);
+      expect(await extensionPage.evaluate(() => window.audioInspection.starts)).toEqual([
+        { sampleRate: 24000, samples: [-1, 32767 / 32768], duration: 1 },
+        { sampleRate: 24000, samples: [-1, 32767 / 32768], duration: 1 },
+      ]);
+      activeSocket.emit('turn.interrupted', { sessionId, turnId: VOICE_TURN });
+      await expect.poll(() => extensionPage.evaluate(() => window.audioInspection.stops)).toBe(2);
+      await expect(extensionPage.locator('#voiceBtn')).toHaveAttribute('aria-pressed', 'true');
+      const resumedTurn = randomUUID();
+      history.push({ id: USER, role: 'user', content: 'Question vocale conservée' },
+        { id: WORKSPACE, role: 'assistant', content: 'Réponse canonique conservée' });
+      activeSocket.emit('input.transcript.final', { sessionId, turnId: resumedTurn, text: 'Question vocale conservée' });
+      activeSocket.emit('turn.deep_agent_stream.started', { sessionId, turnId: resumedTurn });
+      activeSocket.emit('turn.deep_agent_stream.delta', { sessionId, turnId: resumedTurn,
+        chunk: Buffer.from(`event: values\ndata: ${JSON.stringify({ messages: history })}\n\n`) });
+      activeSocket.emit('turn.deep_agent_stream.completed', { sessionId, turnId: resumedTurn });
+      activeSocket.emit('assistant.audio.delta', { sessionId, sequence: 2, audio: Buffer.alloc(4800) });
+      activeSocket.emit('assistant.transcript.final', { sessionId, turnId: resumedTurn, text: 'Réponse canonique conservée' });
+      await expect.poll(() => extensionPage.evaluate(() => window.audioInspection.starts.length)).toBe(3);
+      await expect(extensionPage.locator('.message.user .message-content')).toHaveText('Question vocale conservée');
+      await expect(extensionPage.locator('.message.assistant .message-content')).toHaveText('Réponse canonique conservée');
+      await extensionPage.locator('#voiceBtn').click();
+      await expect.poll(() => seen.disconnected).toBe(1);
+      await expect.poll(() => extensionPage.evaluate(() => window.audioInspection.contexts.map(context => context.state))).toEqual(['closed', 'closed']);
+      const lastSequence = seen.pcm.sequence;
+      await extensionPage.waitForTimeout(300);
+      expect(seen.pcm.sequence).toBe(lastSequence);
+      await extensionPage.reload();
+      await expect(extensionPage.locator('html')).toHaveAttribute('data-sidebar-ready', 'true');
+      await expect(extensionPage.locator('#limovaConversation')).toHaveValue(CONVERSATION);
+      await expect(extensionPage.locator('.message.user .message-content')).toHaveText('Question vocale conservée');
+      await expect(extensionPage.locator('.message.assistant .message-content')).toHaveText('Réponse canonique conservée');
+      expect(seen.starts).toBe(1); expect(seen.connected).toBe(1);
+      expect(seen.httpChecks.filter(call => call.method === 'POST')).toEqual([]);
+      expect(deprecatedAudioWarnings).toEqual([]); expect(legacyRequests).toEqual([]); expect(errors).toEqual([]);
+      return;
+    }
     if (ending.startsWith('manual-')) {
       await expect(extensionPage.locator('#voiceBtn')).toHaveAttribute('aria-pressed', 'true');
       await app.locator('#manual').click();

@@ -180,3 +180,11 @@ L’ancien scénario contributeur utilisant ADK et un token Gemini est remplacé
 Le parcours ajouté à `limova-browser-actions.spec.js` part d’un lien absent des références visibles. Les commandes de défilement renvoient un mouvement réel ; chaque recherche relit la page, puis le lien devient référencé, reçoit un seul clic avec curseur centré et ouvre réellement le profil. Une seule demande utilisateur, un même tour, des reçus distincts et une lecture de la destination sont vérifiés. Aucune carte de confirmation supplémentaire ni appel legacy.
 
 Le scénario legacy curseur/navigation est remplacé. L’analyse conserve son contrat d’observation ; la navigation exige le consentement navigateur du tour. Le curseur est immédiat et le scroll explicite, sans reprise de la trajectoire animée legacy. Voir `deep-agent-action-pointer.md` pour cette différence de présentation. Les choix du serveur restent simulés ; les actions Chrome/DOM et la navigation sont réels.
+
+## Audio natif, interruption et historique relu
+
+Le parcours `playback-interruption` de `limova-native-voice-panel.spec.js` observe les vrais AudioContext/AudioBufferSourceNode de Chromium sans remplacer leurs méthodes d’exécution. Deux morceaux PCM sont décodés à 24 kHz (échantillons négatif/positif vérifiés), programmés puis arrêtés lors d’une interruption. Un nouveau tour reprend la restitution avec la séquence audio suivante. La capture micro reste sur le worklet ; aucun avertissement ScriptProcessor n’est observé.
+
+L’arrêt ferme les deux contextes audio et cesse l’envoi PCM. Après rechargement du panneau, les messages canoniques sont relus via l’API de la conversation, sans nouveau tour POST ni nouvelle session vocale. La fixture API conserve ces messages en mémoire : ce n’est pas une preuve de persistance NestJS/PostgreSQL ni une écoute sur haut-parleur physique.
+
+Le scénario vocal legacy complet reste présent : la recette intégrée vocale de capture/scroll/saisie/navigation et les anciennes relances/suggestions nécessitent encore une correspondance explicite. Cette couche n’en retire aucune exigence par assimilation avec le seul test audio.
