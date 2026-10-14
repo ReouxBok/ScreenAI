@@ -60,7 +60,7 @@ export const test = base.extend({
           response.writeHead(200, { ...headers, 'content-type': 'text/csv; charset=utf-8' });
           response.end('Timestamp,Sender,Content\n2026-10-14,Charly,"Bonjour é"\n'); return;
         }
-        if (selected && url.pathname === `/conversation/${selected.id}/messages`) return json({ data: selected.history, pagination: { hasMore: false } });
+        if (selected && url.pathname === `/conversation/${selected.id}/messages`) return json({ data: selected.history, reasoning: selected.reasoning ?? [], pagination: { hasMore: false } });
         if (selected && url.pathname === `/message/${selected.id}/cancel` && request.method === 'POST') return json({ ok: true });
         if (selected && url.pathname === `/message/${selected.id}`) {
           const history = selected.history;
@@ -77,7 +77,12 @@ export const test = base.extend({
               actionId: `${turnId}:action-${actionIndex}`, toolCallId: `tool-${actionIndex}`, target: body.browserContext, input,
               expiresAt: new Date(Date.now() + 60000).toISOString() }) + frame('custom', { type: 'extension.turn_state', turnId, state: 'waiting' })); return;
           }
+          if (state.todos) history.push({ id: `plan-${history.length}`, type: 'ai', content: '',
+            tool_calls: [{ name: 'write_todos', args: { todos: state.todos } }] });
           history.push({ id: `assistant-${history.length}`, role: 'assistant', content: state.reply });
+          if (state.todos) selected.reasoning = [...(selected.reasoning ?? []), {
+            anchorMessageId: history.at(-1).id, todos: state.todos, reasoningText: 'PRIVATE_PLAN_REASONING', steps: [],
+          }];
           response.end(frame('values', { messages: history }) + (body.browserContext ? frame('custom', { type: 'extension.turn_state', turnId, state: 'completed' }) : '')); return;
         }
         return json({ error: 'route' }, 404);

@@ -292,6 +292,27 @@ function renderLimovaConversation(snapshot, { showOlder = false } = {}) {
   }
   snapshot.messages.forEach(message => {
     if (message.content) addMessage(message.role, message.content, { skipScroll: true, nextStep: false });
+    const plan = snapshot.plans?.find(item => item.messageId === message.id);
+    if (plan) {
+      const section = document.createElement('section');
+      section.className = 'message native-agent-plan';
+      const heading = document.createElement('strong');
+      heading.dataset.i18n = 'limovaPlan';
+      heading.textContent = t('limovaPlan');
+      section.append(heading);
+      const list = document.createElement('ol');
+      plan.todos.forEach(todo => {
+        const item = document.createElement('li');
+        item.dataset.status = todo.status;
+        const status = document.createElement('span');
+        status.dataset.i18n = `limovaPlan_${todo.status}`;
+        status.textContent = t(status.dataset.i18n);
+        item.append(status, document.createTextNode(` — ${todo.content}`));
+        list.append(item);
+      });
+      section.append(list);
+      elements.chatContainer.append(section);
+    }
     if (message.caption) {
       const caption = document.createElement('blockquote');
       caption.className = 'message generated-caption';

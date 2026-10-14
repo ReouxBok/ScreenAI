@@ -82,3 +82,11 @@ La fixture native gère plusieurs UUID de conversation, des historiques indépen
 Cette couche ne modifie pas le code produit. Le helper de listener retire l’événement de clic avant la création ; le consentement n’est donc conservé que lors de la création implicite nécessaire à un envoi déjà autorisé. La fixture doit accepter cancel pour représenter le parcours existant.
 
 Le scénario legacy combinant langue/onboarding/diagnostics/export de logs/reset reste présent, car les assertions liées au prompt d’onboarding et aux logs doivent encore être transférées. La vérification du reset ne remplace pas ce scénario entier.
+
+## Plan du main agent dans le panneau natif
+
+Le panneau projette les tâches structurées `write_todos` des checkpoints racine et restaure `reasoning[].todos` de l’historique, sur leur `anchorMessageId`. Il affiche les statuts backend pending/in_progress/completed avec des libellés FR/EN/ES. Pendant un tour sans réponse textuelle, le plan se rattache au message utilisateur ; il rejoint la réponse lorsqu’elle arrive. Un nouveau tour sans plan n’hérite pas du plan précédent. Les sous-agents, messages masqués, textes de raisonnement et sorties brutes des outils ne sont pas rendus.
+
+Aucun moteur de progression ni achèvement automatique n’est ajouté : une tâche reste en cours si le backend la conserve ainsi, même après la fin du flux. Le plan est celui du tour Deep Agent, pas une preuve d’achèvement du parcours métier d’onboarding. Les mises à jour arrivent avec les checkpoints `values`, pas avec les fragments JSON incomplets des appels d’outil.
+
+Les tests unitaires couvrent les mises à jour, l’ancrage, le retrait, les messages masqués et la pagination. Chromium couvre l’affichage, la restauration après reload, le tour suivant sans nouveau plan et l’injection HTML rendue comme texte. L’API reste simulée. Le scénario legacy combiné onboarding/langue/logs reste à transférer intégralement ; aucun des 16 scénarios restants n’est retiré dans cette couche.
