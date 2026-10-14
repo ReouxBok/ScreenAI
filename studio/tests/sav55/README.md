@@ -16,3 +16,7 @@ Fournisseurs sans clé, écritures externes désactivées, mode test actif ; nav
 limité à l’origine locale. Les seules mutations éventuelles concernent des données
 fictives dans cette base. Ne pas ajouter `reuseExistingServer` ni utiliser un serveur
 ayant un fichier d’environnement. Recette séquentielle : un seul serveur/browser.
+
+Périmètre de livraison confirmé par Ugo : ordinateur. Le mobile est exclu de cette recette.
+Les routes connaissances sont précompilées par GET local avant le chronomètre du
+scénario navigateur ; cela ne modifie aucune donnée. Les assertions métier restent inchangées.

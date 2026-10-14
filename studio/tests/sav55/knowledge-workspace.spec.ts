@@ -1,6 +1,15 @@
 import { expect, test } from "@playwright/test";
 import { submitServerAction } from "../helpers/server-action";
 
+// Cold webpack compilation of the knowledge route can take several minutes on
+// the local 8 GB test machine. Warm read-only routes before the browser scenario
+// timer; keep all business assertions and action timeouts unchanged.
+test.beforeAll(async ({ request }) => {
+  test.setTimeout(600_000);
+  expect((await request.get("/studio/sav/connaissances/proposer", { timeout: 300_000 })).status()).toBe(200);
+  expect((await request.get("/studio/sav/connaissances/00000000-0000-4000-8000-000000000000?kind=item", { timeout: 300_000 })).status()).toBe(404);
+});
+
 test.beforeEach(async ({ page, baseURL }) => {
   await page.route("**/*", route => new URL(route.request().url()).origin === baseURL ? route.continue() : route.abort());
 });
@@ -33,6 +42,7 @@ test("proposition humaine : brouillon, revue Contact, publication puis activatio
   await expect(preview).toBeVisible();
   const submit = preview.getByRole("button", { name: "Confirmer et soumettre à validation" });
   await expect(submit).toBeDisabled();
+  await page.screenshot({ path: "test-results/sav55-proposal-preview.png", fullPage: true });
   await preview.getByRole("checkbox").check();
   await submitServerAction(page, submit);
   await page.waitForURL(/\/connaissances\/[a-f0-9-]+\?kind=candidate/);
