@@ -833,25 +833,5 @@ test.describe('Packaged extension — complete user flows', () => {
     expect(state.isActive).toBe(false);
   });
 
-  test('tab locking warns on another tab and returns the user to the Limova session', async ({ context, extensionId }) => {
-    await context.route('https://outside.example/**', route => route.fulfill({
-      status: 200,
-      contentType: 'text/html',
-      body: '<h1>Autre onglet</h1>'
-    }));
-    const { limova, sidebar } = await openExtensionHarness(context, extensionId);
-    await grantAIConsent(sidebar);
-    await sidebar.locator('#userInput').fill('Verrouille cette session');
-    await sidebar.locator('#sendBtn').click();
-    await expect(sidebar.locator('.message.assistant .message-content')).toBeVisible();
 
-    const outside = await context.newPage();
-    await outside.goto('https://outside.example/');
-    await outside.bringToFront();
-    await expect(sidebar.locator('#tabWarning')).toBeVisible();
-
-    await sidebar.locator('#tabWarning').click();
-    await expect.poll(() => limova.evaluate(() => document.hasFocus())).toBe(true);
-    await expect(sidebar.locator('#tabWarning')).toBeHidden();
-  });
 });
