@@ -310,7 +310,19 @@ export function createLimovaBackground({ storage, openTab, openFile = async () =
   return { async diagnose() {
     const stored = (await storage.get(STORAGE_KEY))[STORAGE_KEY];
     const selection = context ? { ...context, conversationId } : stored;
-    return diagnoseLimovaClient(client, selection);
+    const checks = await diagnoseLimovaClient(client, selection);
+    if (!checks.some(check => check.code === 'DIAGNOSTIC_LIMOVA_CONVERSATION_OK')) return checks;
+    try {
+      const counts = await journal.recentOutcomes(selection);
+      const degraded = counts.failed > 0 || counts.rejected >= 2 || counts.unconfirmed > 0;
+      checks.push({ name: 'recentBrowserActions', status: degraded ? 'error' : 'info',
+        code: degraded ? 'DIAGNOSTIC_BROWSER_ACTIONS_DEGRADED' : 'DIAGNOSTIC_BROWSER_ACTIONS_RECENT',
+        detail: `Conversation sélectionnée, 15 dernières minutes : ${counts.completed} résultats terminés, ${counts.rejected} actions bloquées, ${counts.failed} échecs, ${counts.unconfirmed} actions non confirmées (anciennes entrées sans date incluses). Une action non confirmée peut être en cours. Les blocages peuvent être des protections attendues ; aucun test d’action effectué.` });
+    } catch {
+      checks.push({ name: 'recentBrowserActions', status: 'error', code: 'DIAGNOSTIC_BROWSER_JOURNAL_UNAVAILABLE',
+        detail: 'Journal des actions navigateur indisponible ; résultats récents non vérifiés.' });
+    }
+    return checks;
   }, handle(request) {
     if (['LIMOVA_GET_STATE', 'LIMOVA_SELECT_WORKSPACE', 'LIMOVA_CREATE_CONVERSATION', 'LIMOVA_OPEN_CONVERSATION', 'LIMOVA_LOGOUT', 'LIMOVA_START_EVALUATION', 'LIMOVA_END_EVALUATION'].includes(request.type)) {
       const operation = contextQueue.then(() => handle(request));

@@ -118,6 +118,30 @@ export function createBrowserJournal() {
   let database;
   const getDatabase = () => database ??= openDatabase();
   return {
+    async recentOutcomes(scope, now = Date.now()) {
+      if (!scope || !['userId', 'workspaceId', 'conversationId'].every(key => identifier(scope[key]))) throw new Error('Invalid diagnostic scope');
+      const prefix = JSON.stringify([scope.userId, scope.workspaceId, scope.conversationId]).slice(0, -1) + ',';
+      const db = await getDatabase();
+      return new Promise((resolve, reject) => {
+        const counts = { completed: 0, rejected: 0, failed: 0, unconfirmed: 0 };
+        const transaction = db.transaction(STORE, 'readonly');
+        const request = transaction.objectStore(STORE).openCursor(IDBKeyRange.bound(prefix, prefix + '\uffff'));
+        request.onsuccess = () => {
+          const cursor = request.result;
+          if (!cursor) return;
+          const record = cursor.value;
+          const timestamp = Date.parse(record?.observedAt);
+          const started = Date.parse(record?.startedAt);
+          if (record?.state === 'started' && (!Number.isFinite(started) || (started <= now && now - started <= 15 * 60_000))) counts.unconfirmed += 1;
+          if (record?.state === 'completed' && Number.isFinite(timestamp) && timestamp <= now && now - timestamp <= 15 * 60_000
+            && Object.hasOwn(counts, record.result?.status ?? '')) counts[record.result.status] += 1;
+          cursor.continue();
+        };
+        transaction.oncomplete = () => resolve(counts);
+        transaction.onerror = () => reject(transaction.error);
+        transaction.onabort = () => reject(transaction.error ?? new Error('Browser diagnostic read aborted'));
+      });
+    },
     async setTurnMode(scope, turnId, mode) {
       scope = Object.freeze(structuredClone(scope));
       if (!['observe', 'act'].includes(mode)) throw new Error('Invalid browser mode');
@@ -173,7 +197,7 @@ export function createBrowserJournal() {
             : { state: 'uncertain', result: null } };
         }
         if (Date.parse(action.expiresAt) <= Date.now()) throw new Error('Browser action expired');
-        return { record: { digest, owner, state: 'started' }, answer: { state: 'execute' } };
+        return { record: { digest, owner, state: 'started', startedAt: new Date().toISOString() }, answer: { state: 'execute' } };
       }, scope);
       if (claim.state !== 'execute') return claim;
       let observation;

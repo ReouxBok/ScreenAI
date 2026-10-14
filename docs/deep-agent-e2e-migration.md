@@ -114,3 +114,11 @@ Trois scénarios legacy sont remplacés : navigation intermédiaire vers Intégr
 Le scénario de code support du proxy est remplacé par deux scénarios natifs : HTTP 503 et 429. Le client conserve des codes stables `LIMOVA_HTTP_5XX` et `LIMOVA_RATE_LIMITED`, transmis au panneau et aux diagnostics. Le panneau traduit le message en français, anglais ou espagnol et invite à vérifier l’historique et les actions avant un nouvel envoi. Aucun corps d’erreur serveur n’est affiché.
 
 La fixture sauvegarde le message puis renvoie une erreur HTTP : le rechargement retrouve ce message, sans second POST automatique. Le téléchargement réel des diagnostics contient le code, sans la question privée ni le détail serveur. Les routes API sont simulées ; ces tests ne prouvent pas une exécution distante ni le traitement de toutes les erreurs de streaming. Il reste 12 scénarios legacy à migrer.
+
+## Diagnostic des résultats navigateur natifs
+
+Le diagnostic consulte maintenant le journal IndexedDB durable partagé par les parcours texte et voix, seulement après vérification de l’accès à la conversation sélectionnée. La lecture est sans mutation et ne restitue que des compteurs : résultats terminés, refus, échecs et actions non confirmées. Aucun argument, observation, identifiant ou contenu de page n’est ajouté aux logs.
+
+La fenêtre est de 15 minutes ; les anciennes actions démarrées sans date restent signalées comme non confirmées. Deux refus, un échec ou une action non confirmée rendent le diagnostic dégradé. Le texte précise qu’un refus peut être une protection attendue et qu’une action non confirmée peut encore être en cours. Ce signal ne prouve pas une panne du backend et ne relance aucune action. Un journal inaccessible est explicitement signalé.
+
+Les tests Chromium vérifient persistance, absence de double comptage, exclusion des autres comptes/workspaces/conversations et des dates futures/expirées ; le parcours réel du panneau vérifie le signal dégradé après deux refus, son export sans valeurs privées et son absence dans une nouvelle conversation. Les réponses API restent simulées. Le scénario diagnostic legacy est remplacé ; 11 scénarios legacy restent à migrer.

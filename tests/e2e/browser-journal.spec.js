@@ -372,3 +372,26 @@ test('observation policy survives reopening and refuses mutations with durable r
   expect(result.highlight.result.status).toBe('completed');
   expect(result.revoked).toBe('Browser session revoked');
 });
+
+
+test('diagnostic counts are scoped, durable, deduplicated and expire without exporting observations', async ({ context, extensionId }) => {
+  const page = await journalPage(context, extensionId);
+  const result = await page.evaluate(async () => {
+    const journal = createJournal();
+    const execute = async () => ({ status: 'rejected', observation: 'PRIVATE_OBSERVATION' });
+    await journal.run(scope, action, execute);
+    await journal.run(scope, action, execute);
+    await journal.run(scope, { ...action, actionId: 'failed' }, async () => ({ status: 'failed', observation: 'PRIVATE_FAILURE' }));
+    await journal.run(scope, { ...action, actionId: 'uncertain' }, async () => { throw new Error('PRIVATE_ERROR'); });
+    await journal.close();
+    const reopened = createJournal();
+    const current = await reopened.recentOutcomes(scope);
+    const foreign = await Promise.all(['userId', 'workspaceId', 'conversationId'].map(key => reopened.recentOutcomes({ ...scope, [key]: crypto.randomUUID() })));
+    const expired = await reopened.recentOutcomes(scope, Date.now() + 16 * 60_000);
+    const future = await reopened.recentOutcomes(scope, Date.now() - 60_000);
+    await reopened.close();
+    return { current, foreign, expired, future };
+  });
+  const empty = { completed: 0, rejected: 0, failed: 0, unconfirmed: 0 };
+  expect(result).toEqual({ current: { completed: 0, rejected: 1, failed: 1, unconfirmed: 1 }, foreign: [empty, empty, empty], expired: empty, future: empty });
+});

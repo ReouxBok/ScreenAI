@@ -244,3 +244,32 @@ for (const destination of [
   expect(legacy).toEqual([]);
   expect(errors).toEqual([]);
 });
+
+
+test('native diagnostics report repeated rejected actions without replay or private observations', async ({ nativeChat }) => {
+  const { panel, app, state, calls, legacy, errors } = nativeChat;
+  state.reply = 'Action traitée.';
+  state.browserActions = [read, { operation: 'click', elementId: 999998 }, { operation: 'click', elementId: 999999 }];
+  await send(panel);
+  expect(await app.evaluate(() => window.clicks)).toBe(0);
+  const before = messageCalls(calls).length;
+  await panel.reload();
+  await panel.locator('#menuBtn').click();
+  await panel.locator('#diagnoseBtn').click();
+  await expect(panel.locator('#diagnosticResult')).toHaveAttribute('data-status', 'degraded');
+  await expect(panel.locator('#diagnosticText')).toContainText('2 actions bloquées');
+  const downloadPromise = panel.waitForEvent('download');
+  await panel.locator('#downloadLogsBtn').click();
+  const stream = await (await downloadPromise).createReadStream();
+  let logs = '';
+  for await (const chunk of stream) logs += chunk.toString();
+  expect(logs).toContain('DIAGNOSTIC_BROWSER_ACTIONS_DEGRADED');
+  expect(logs).not.toMatch(/PRIVATE_FIELD_VALUE|NEVER_TRANSMIT_THIS_SECRET/);
+  expect(messageCalls(calls)).toHaveLength(before);
+  await panel.locator('#limovaNew').click();
+  await expect(panel.locator('.message.user')).toHaveCount(0);
+  await panel.locator('#diagnoseBtn').click();
+  await expect(panel.locator('#diagnosticResult')).toHaveAttribute('data-status', 'healthy');
+  expect(legacy).toEqual([]);
+  expect(errors).toEqual([]);
+});

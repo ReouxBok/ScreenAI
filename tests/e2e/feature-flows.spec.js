@@ -534,24 +534,6 @@ test.describe('Packaged extension — complete user flows', () => {
     expect(calls.gemini).toHaveLength(1);
   });
 
-  test('diagnostics becomes degraded after repeated blocked actions', async ({ context, extensionId }) => {
-    const { sidebar } = await openExtensionHarness(context, extensionId, {
-      geminiReply: 'Cette action reste bloquée. {{ACTION:1}}'
-    });
-    await grantAIConsent(sidebar);
-
-    await sidebar.locator('#screenshotBtn').click();
-    await expect(sidebar.locator('.message.error .message-content').last()).toContainText('sensible');
-    await new Promise(resolve => setTimeout(resolve, 2_100));
-    await sidebar.locator('#screenshotBtn').click();
-    await expect(sidebar.locator('.message.error .message-content')).toHaveCount(2);
-
-    await sidebar.locator('#menuBtn').click();
-    await sidebar.locator('#diagnoseBtn').click();
-    await expect(sidebar.locator('#diagnosticResult')).toHaveAttribute('data-status', 'degraded');
-    await expect(sidebar.locator('#diagnosticText')).toContainText(/actions bloquées|blocked actions/i);
-  });
-
   test('a safe action displays a computer-use cursor and clicks without confirmation', async ({ context, extensionId }) => {
     const { limova, sidebar } = await openExtensionHarness(context, extensionId, {
       geminiReply: ({ body }) => {
