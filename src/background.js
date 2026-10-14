@@ -40,7 +40,7 @@ let currentLang = DEFAULT_LANG;
 const limovaBackground = createLimovaBackground({
   client: new LimovaDeepAgentClient(createLimovaSessionFetch(chrome)),
   createDriver: ({ scope, journal, signal, uploadScreenshot }) => createBrowserDriver({ chrome, scope, journal, uploadScreenshot,
-    hasConsent: async () => !signal.aborted && !trainingState.active && !evaluationState.active && await hasAIProcessingConsent() }),
+    hasConsent: async () => !signal.aborted && !trainingState.active && await hasAIProcessingConsent() }),
   storage: chrome.storage.local,
   openTab: () => openLimovaApp(chrome),
   notify: message => broadcastToSidebar(message),
@@ -236,10 +236,7 @@ const initializationPromise = loggerInitializationPromise.then(() => Promise.all
   chrome.storage.local.get('limova_lang').then(result => {
     if (result.limova_lang) currentLang = result.limova_lang;
   }).catch(() => {}),
-  chrome.storage.session.get('charly_evaluation_active').then(result => {
-    const stored = result.charly_evaluation_active;
-    if (stored?.token && stored?.run) evaluationState = { active: true, token: stored.token, run: stored.run, testCase: stored.testCase || null, content: stored.content || null };
-  }).catch(() => {})
+  chrome.storage.session.remove('charly_evaluation_active').catch(() => {})
 ]));
 
 globalThis.addEventListener?.('unhandledrejection', event => {
@@ -505,14 +502,19 @@ async function handleMessage(request, sender) {
     return { ok: false, error: 'La session vocale utilise la conversation Deep Agent.' };
   }
   if (LIMOVA_MESSAGE_TYPES.has(request.type)) {
+    if (evaluationState.completing && ['LIMOVA_SEND_MESSAGE', 'LIMOVA_RESUME_BROWSER', 'LIMOVA_PREPARE_VOICE'].includes(request.type))
+      return { ok: false, error: 'Transmission du résultat Studio en cours.' };
     if (['LIMOVA_SEND_MESSAGE', 'LIMOVA_RESUME_BROWSER'].includes(request.type) && !(await hasAIProcessingConsent())) {
       broadcastToSidebar({ type: 'CONSENT_REQUIRED' });
       return { ok: false, consentRequired: true, error: 'Consentement IA requis.' };
     }
-    if ((trainingState.active || evaluationState.active) && ['LIMOVA_SEND_MESSAGE', 'LIMOVA_RESUME_BROWSER'].includes(request.type)) {
+    if (trainingState.active && ['LIMOVA_SEND_MESSAGE', 'LIMOVA_RESUME_BROWSER'].includes(request.type)) {
       return { ok: false, error: 'Termine le mode formateur ou évaluation avant de reprendre une conversation personnelle.' };
     }
-    return limovaBackground.handle(request);
+    const result = await limovaBackground.handle(request);
+    if (request.type === 'LIMOVA_GET_STATE' && evaluationState.active && result.evaluationActive !== true)
+      await cancelEvaluation();
+    return result;
   }
   if (trainingState.active && [
     'USER_MESSAGE', 'ANALYZE_PAGE', 'TAKE_SCREENSHOT', 'NEXT_STEP',
@@ -945,7 +947,8 @@ async function evaluationFetch(path, options = {}) {
   return fetch(`${EVALUATION_API_URL}/${path}`, {
     method: 'POST',
     headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
-    body: JSON.stringify(options.body || {})
+    body: JSON.stringify(options.body || {}),
+    signal: AbortSignal.timeout(15_000),
   });
 }
 
@@ -956,16 +959,26 @@ async function startEvaluation(rawToken) {
   if (evaluationState.active) return { ok: false, error: 'Un test est déjà en cours. Termine-le avant d’en lancer un autre.' };
   const tab = await getActiveLimovaTab();
   if (!tab?.id) return { ok: false, error: 'Ouvre Limova avant de lancer le test.' };
-  const response = await evaluationFetch('connect', { token, body: { extensionVersion: chrome.runtime.getManifest().version } });
+  await limovaBackground.handle({ type: 'LIMOVA_START_EVALUATION', evaluationCode: token });
+  let response;
+  try {
+    response = await evaluationFetch('connect', { token, body: { extensionVersion: chrome.runtime.getManifest().version } });
+  } catch (error) {
+    await limovaBackground.handle({ type: 'LIMOVA_END_EVALUATION' }).catch(() => {});
+    throw error;
+  }
   const data = await response?.json().catch(() => ({}));
-  if (!response?.ok) return { ok: false, error: data?.error || 'Test introuvable ou expiré.' };
+  if (!response?.ok) {
+    await limovaBackground.handle({ type: 'LIMOVA_END_EVALUATION' }).catch(() => {});
+    return { ok: false, error: data?.error || 'Test introuvable ou expiré.' };
+  }
   if (activeAbortController) activeAbortController.abort();
   evaluationState = { active: true, token, run: data.run, testCase: data.case, content: { id: data.content?.id, title: data.content?.title, versionId: data.content?.versionId } };
   sessionState.conversationHistory = [];
   sessionState.remoteSessionId = null;
   sessionState.isActive = true;
   lockTab(tab.id, { activateAssistant: true });
-  await chrome.storage.session.set({ charly_evaluation_active: { token, run: data.run, testCase: data.case, content: evaluationState.content } });
+  await chrome.storage.session.remove('charly_evaluation_active');
   scheduleSave();
   Logger.event('evaluation', 'REAL_EVALUATION_STARTED', { runId: data.run?.id || null, caseKind: data.case?.kind || null });
   return { ok: true, run: data.run, testCase: data.case, content: evaluationState.content };
@@ -1001,19 +1014,26 @@ async function runEvaluatedVoiceTool(toolName, targetLabel, operation) {
 
 async function completeEvaluationRun(verdict) {
   if (!evaluationState.active || !['correct', 'problem'].includes(verdict)) return { ok: false, error: 'Aucun test actif.' };
-  const response = await evaluationFetch('complete', { body: { verdict } });
-  const data = await response?.json().catch(() => ({}));
-  if (!response?.ok) return { ok: false, error: data?.error || 'Le résultat n’a pas pu être transmis.' };
-  Logger.event('evaluation', data.run?.status === 'passed' ? 'REAL_EVALUATION_PASSED' : 'REAL_EVALUATION_FAILED', { runId: evaluationState.run?.id || null, score: data.run?.score ?? null });
-  evaluationState = { active: false, token: null, run: null, testCase: null, content: null };
-  await chrome.storage.session.remove('charly_evaluation_active');
-  sessionState.conversationHistory = [];
-  sessionState.remoteSessionId = null;
-  scheduleSave();
-  return { ok: true, run: data.run, suite: data.suite };
+  if (evaluationState.completing) return { ok: false, error: 'Transmission déjà en cours.' };
+  evaluationState.completing = true;
+  try {
+    await limovaBackground.handle({ type: 'LIMOVA_CANCEL' });
+    const response = await evaluationFetch('complete', { body: { verdict } });
+    const data = await response?.json().catch(() => ({}));
+    if (!response?.ok) return { ok: false, error: data?.error || 'Le résultat n’a pas pu être transmis.' };
+    await limovaBackground.handle({ type: 'LIMOVA_END_EVALUATION' }).catch(() => {});
+    Logger.event('evaluation', data.run?.status === 'passed' ? 'REAL_EVALUATION_PASSED' : 'REAL_EVALUATION_FAILED', { runId: evaluationState.run?.id || null, score: data.run?.score ?? null });
+    evaluationState = { active: false, token: null, run: null, testCase: null, content: null };
+    await chrome.storage.session.remove('charly_evaluation_active');
+    sessionState.conversationHistory = [];
+    sessionState.remoteSessionId = null;
+    scheduleSave();
+    return { ok: true, run: data.run, suite: data.suite };
+  } finally { evaluationState.completing = false; }
 }
 
 async function cancelEvaluation() {
+  await limovaBackground.handle({ type: 'LIMOVA_END_EVALUATION' }).catch(() => {});
   evaluationState = { active: false, token: null, run: null, testCase: null, content: null };
   await chrome.storage.session.remove('charly_evaluation_active');
   sessionState.conversationHistory = [];

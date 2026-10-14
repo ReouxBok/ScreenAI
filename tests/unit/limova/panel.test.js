@@ -10,6 +10,7 @@ function setup(overrides = {}) {
   const request = vi.fn(async ({ type }) => {
     if (overrides[type]) return overrides[type]();
     if (type === 'LIMOVA_GET_STATE') return state;
+    if (type === 'LIMOVA_PREPARE_VOICE') return { context: state.context, conversationId: state.conversationId };
     if (type === 'LIMOVA_LIST_CONVERSATIONS') return { data: [{ id: 'c', title: 'Mon chat' }] };
     if (type === 'LIMOVA_GET_MESSAGES') return { data: [{ id: 'h', role: 'user', content: 'Bonjour' }] };
     return { ok: true };
@@ -135,4 +136,19 @@ it('preserves explicit consent while creating the conversation for the first mes
   await panel.send('Lis la page');
   expect(request).toHaveBeenCalledWith({ type: 'LIMOVA_SEND_MESSAGE', text: 'Lis la page', browser: true });
   expect(element('limovaBrowser').checked).toBe(false);
+});
+
+
+it('locks evaluation selection and obtains its voice grant without rendering it', async () => {
+  const code = 'private-staff-evaluation-code';
+  const { panel, render } = setup({
+    LIMOVA_GET_STATE: () => ({ ...state, evaluationActive: true }),
+    LIMOVA_PREPARE_VOICE: () => ({ context: state.context, conversationId: state.conversationId, evaluationCode: code }),
+  });
+  await panel.refresh();
+  expect(element('limovaWorkspace').disabled).toBe(true);
+  expect(element('limovaConversation').disabled).toBe(true);
+  expect(element('limovaNew').disabled).toBe(true);
+  expect((await panel.prepareVoice()).evaluationCode).toBe(code);
+  expect(JSON.stringify(render.mock.calls)).not.toContain(code);
 });

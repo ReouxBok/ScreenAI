@@ -250,3 +250,15 @@ describe('Studio evaluation lifecycle', () => {
     expect(await f.background.handle({ type: 'LIMOVA_GET_STATE' })).toMatchObject({ evaluationActive: false, conversationId: 'conversation-1' });
   });
 });
+
+
+it('only prepares the grant for the current evaluation conversation', async () => {
+  const f = harness(); await open(f.background);
+  f.client.createConversation.mockResolvedValueOnce({ id: 'evaluation-conversation' });
+  const code = 'private-staff-evaluation-code';
+  await f.background.handle({ type: 'LIMOVA_START_EVALUATION', evaluationCode: code });
+  await expect(f.background.handle({ type: 'LIMOVA_PREPARE_VOICE', conversationId: 'conversation-1' })).rejects.toThrow();
+  expect(await f.background.handle({ type: 'LIMOVA_PREPARE_VOICE', conversationId: 'evaluation-conversation' }))
+    .toEqual({ context: { userId: 'user-1', workspaceId: 'workspace-1' }, conversationId: 'evaluation-conversation', evaluationCode: code });
+  expect(JSON.stringify(await f.background.handle({ type: 'LIMOVA_GET_STATE' }))).not.toContain(code);
+});

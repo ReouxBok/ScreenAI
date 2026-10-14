@@ -9,7 +9,7 @@ export const LIMOVA_MESSAGE_TYPES = new Set([
   'LIMOVA_CREATE_CONVERSATION', 'LIMOVA_OPEN_CONVERSATION', 'LIMOVA_SEND_MESSAGE',
   'LIMOVA_CANCEL', 'LIMOVA_OPEN_APP', 'LIMOVA_LOGOUT',
   'LIMOVA_GET_MESSAGES', 'LIMOVA_RESUME_BROWSER',
-  'LIMOVA_START_EVALUATION', 'LIMOVA_END_EVALUATION',
+  'LIMOVA_START_EVALUATION', 'LIMOVA_END_EVALUATION', 'LIMOVA_PREPARE_VOICE',
 ]);
 
 export function createLimovaBackground({ storage, openTab, notify, client = new LimovaDeepAgentClient(), journal = createBrowserJournal(), createDriver }) {
@@ -84,6 +84,12 @@ export function createLimovaBackground({ storage, openTab, notify, client = new 
           await save();
           return { authenticated: false, workspaces: [], context: null, conversationId: null };
         }
+      case 'LIMOVA_PREPARE_VOICE': {
+        await state();
+        const identity = requireContext();
+        if (!conversationId || request.conversationId !== conversationId) throw new Error('La conversation vocale a changé.');
+        return { context: identity, conversationId, ...(evaluation ? { evaluationCode: evaluation.code } : {}) };
+      }
       case 'LIMOVA_START_EVALUATION': {
         if (evaluation) throw new Error('Un test Studio est déjà actif.');
         const code = evaluationGrant(request.evaluationCode);

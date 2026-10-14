@@ -437,6 +437,8 @@ async function startEvaluation() {
   const response = await chrome.runtime.sendMessage({ type: 'START_EVALUATION', token }).catch(error => ({ ok: false, error: error.message }));
   elements.evaluationStart.disabled = false;
   if (!response?.ok) { elements.evaluationFeedback.textContent = response?.error || 'Impossible de lancer le test.'; return; }
+  elements.evaluationToken.value = '';
+  await limovaPanel.refresh();
   showEvaluationActive(response);
   const scenario = response.testCase?.prompt || response.testCase?.title;
   elements.evaluationFeedback.textContent = `Scénario : ${scenario}. Formulez maintenant la demande à Charly dans le chat.`;
@@ -457,6 +459,7 @@ function showEvaluationActive(evaluation) {
 }
 
 async function completeEvaluation(verdict) {
+  voiceSession?.stop();
   elements.evaluationCorrect.disabled = true;
   elements.evaluationProblem.disabled = true;
   elements.evaluationFeedback.textContent = 'Transmission du résultat au Studio…';
@@ -473,6 +476,7 @@ async function completeEvaluation(verdict) {
   elements.evaluationToken.value = '';
   elements.evaluationStart.hidden = false;
   document.body.classList.remove('evaluation-active');
+  await limovaPanel.refresh();
 }
 
 function showTrainingActive(session) {
@@ -1037,11 +1041,6 @@ async function toggleVoice() {
       voiceSession = transcription;
       await transcription.start(); return;
     }
-    if (mode?.evaluation) {
-      voiceSession = new window.LimovaVoiceSession();
-      try { await voiceSession.start(); } catch (_) {}
-      return;
-    }
     const parameters = await limovaPanel.prepareVoice();
     const client = new LimovaDeepAgentClient(createLimovaSessionFetch(chrome));
     const journal = createBrowserJournal();
@@ -1051,7 +1050,7 @@ async function toggleVoice() {
           chrome.runtime.sendMessage({ type: 'GET_PRIVACY_STATE', clientSurface: 'chrome_extension' }),
           chrome.runtime.sendMessage({ type: 'GET_STATE', clientSurface: 'chrome_extension' }),
         ]);
-        return privacy?.aiProcessing === true && !state?.training && !state?.evaluation
+        return privacy?.aiProcessing === true && !state?.training && Boolean(state?.evaluation) === Boolean(parameters.evaluationCode)
           && document.getElementById('limovaBrowser')?.checked === true;
       } }),
     });
@@ -1065,7 +1064,7 @@ async function toggleVoice() {
           chrome.runtime.sendMessage({ type: 'GET_STATE', clientSurface: 'chrome_extension' }),
           client.getConversation(parameters.context, parameters.conversationId, signal),
         ]);
-        if (!privacy?.aiProcessing || state?.training || state?.evaluation) throw new Error('Le contexte de la session vocale a changé.');
+        if (!privacy?.aiProcessing || state?.training || Boolean(state?.evaluation) !== Boolean(parameters.evaluationCode)) throw new Error('Le contexte de la session vocale a changé.');
       },
       onStatus: updateVoiceStatus,
       onState: active => {

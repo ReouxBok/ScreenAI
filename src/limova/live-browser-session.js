@@ -1,7 +1,7 @@
 import { createLiveBrowserController } from './live-browser-controller.js';
 
 export function createBrowserLiveSession({ openTransport, client, journal, createDriver }) {
-  return async ({ context, conversationId, languageCode, userTimezone, signal, browserEnabled = true,
+  return async ({ context, conversationId, languageCode, userTimezone, evaluationCode, signal, browserEnabled = true,
     onEvent = () => {}, onNativeEvent = () => {}, onError = () => {} }) => {
     context = Object.freeze({ ...context });
     const abort = new AbortController();
@@ -32,7 +32,7 @@ export function createBrowserLiveSession({ openTransport, client, journal, creat
         client, journal, driver, signal: abort.signal,
         continueBrowser: payload => live.continueBrowser(payload), onError: fail, notify: onNativeEvent });
       live = await openTransport({ context, conversationId, languageCode, userTimezone,
-        browserSession, browserContext, signal: abort.signal, onError: fail,
+        browserSession, browserContext, evaluationCode, signal: abort.signal, onError: fail,
         onEvent(event, payload) {
           if (event === 'turn.browser_context_requested') {
             if (!driver || refresh) { fail(new Error('Unexpected browser context request')); return; }

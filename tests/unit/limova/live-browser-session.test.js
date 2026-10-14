@@ -102,3 +102,14 @@ describe('browser-enabled live session composition', () => {
     expect(h.createDriver).not.toHaveBeenCalled();
   });
 });
+
+
+it('passes the evaluation grant to the voice transport without exposing it to the browser driver', async () => {
+  const h = harness();
+  const code = 'private-staff-evaluation-code';
+  const session = await h.start({ context, conversationId: id, evaluationCode: code });
+  expect(h.openTransport).toHaveBeenCalledWith(expect.objectContaining({ evaluationCode: code }));
+  expect(JSON.stringify(h.driverOptions())).not.toContain(code);
+  expect(JSON.stringify(h.client.getConversation.mock.calls)).not.toContain(code);
+  session.stop();
+});

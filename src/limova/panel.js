@@ -10,6 +10,7 @@ export function createLimovaPanel({ document, request, render, onBusy, onContext
   let busy = false;
   let voiceBusy = false;
   let sending = false;
+  let evaluationActive = false;
 
   async function call(type, fields = {}) {
     const response = await request({ type, ...fields });
@@ -20,9 +21,9 @@ export function createLimovaPanel({ document, request, render, onBusy, onContext
     value = value || voiceBusy;
     busy = value;
     element('limovaCancel').hidden = !value;
-    element('limovaWorkspace').disabled = value;
-    element('limovaConversation').disabled = value;
-    element('limovaNew').disabled = value || !context;
+    element('limovaWorkspace').disabled = value || evaluationActive;
+    element('limovaConversation').disabled = value || evaluationActive;
+    element('limovaNew').disabled = value || !context || evaluationActive;
     if (element('limovaResume')) element('limovaResume').disabled = value || !context || !conversationId;
     onBusy(value);
   }
@@ -53,6 +54,7 @@ export function createLimovaPanel({ document, request, render, onBusy, onContext
       const changed = context?.userId !== state.context?.userId || context?.workspaceId !== state.context?.workspaceId || conversationId !== state.conversationId;
       if (changed || !state.authenticated) clear();
       context = state.context;
+      evaluationActive = state.evaluationActive === true;
       document.documentElement.dataset.authState = state.authenticated ? 'authenticated' : 'required';
       element('authPanel').hidden = state.authenticated;
       element('limovaControls').hidden = !state.authenticated;
@@ -164,7 +166,11 @@ export function createLimovaPanel({ document, request, render, onBusy, onContext
       if (!conversationId) await create(true);
       if (!conversationId || !context) throw new Error('Conversation Limova indisponible.');
       const current = generation;
-      return { context: { ...context }, conversationId, browserEnabled: element('limovaBrowser')?.checked === true,
+      const authorized = await call('LIMOVA_PREPARE_VOICE', { conversationId });
+      if (current !== generation || !context) throw new Error('La session Limova a changé.');
+      if (authorized.conversationId !== conversationId || authorized.context?.userId !== context.userId
+        || authorized.context?.workspaceId !== context.workspaceId) throw new Error('La session Limova a changé.');
+      return { ...(authorized.evaluationCode ? { evaluationCode: authorized.evaluationCode } : {}), context: { ...context }, conversationId, browserEnabled: element('limovaBrowser')?.checked === true,
         onNativeEvent(event) { if (current === generation) { view.event(event); render(view.snapshot()); } },
       };
     },
