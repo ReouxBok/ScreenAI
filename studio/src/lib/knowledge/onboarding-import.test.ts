@@ -362,6 +362,28 @@ describe("SAV-51 onboarding inventory and resumable import", () => {
 });
 
 describe("SAV-51 supervised review and publication separation", () => {
+  it("lets contact review an imported tutorial while publication and activation stay restricted", async () => {
+    const candidate = await candidateFor(await tutorial());
+    const input = await approval(candidate);
+    await expect(reviewKnowledgeCandidate(candidate.id, { ...input, comparison: undefined }, "contact@limova.ai")).rejects.toThrow("ONBOARDING_COMPARISON_REVIEW_REQUIRED");
+    const approved = await reviewKnowledgeCandidate(candidate.id, input, "contact@limova.ai");
+    expect(approved).toMatchObject({ status: "approved", reviewedBy: "contact@limova.ai" });
+    const [item] = await fixture.db.select().from(contentItems).where(eq(contentItems.id, approved.targetItemId!));
+    expect(item).toMatchObject({ status: "in_review", aiEnabled: false, publishedVersionId: null });
+    await expect(publish(item.id, "contact@limova.ai")).rejects.toThrow("KNOWLEDGE_UGO_APPROVAL_REQUIRED");
+    await expect(setContentAiEnabled(item.id, true, "contact@limova.ai")).rejects.toThrow("KNOWLEDGE_UGO_APPROVAL_REQUIRED");
+    const [projection] = await fixture.db.select().from(knowledgeProjections).where(eq(knowledgeProjections.versionId, approved.materializedVersionId!));
+    await fixture.db.update(knowledgeFamilyRevisions).set({ reviewedBy: "reouven@limova.ai" }).where(eq(knowledgeFamilyRevisions.id, projection.revisionId));
+    await expect(publish(item.id, actor)).rejects.toThrow("KNOWLEDGE_CANONICAL_APPROVAL_REQUIRED");
+    expect(state.embed).not.toHaveBeenCalled();
+    await fixture.db.update(knowledgeFamilyRevisions).set({ reviewedBy: "contact@limova.ai" }).where(eq(knowledgeFamilyRevisions.id, projection.revisionId));
+    await publish(item.id, actor);
+    const [published] = await fixture.db.select().from(contentItems).where(eq(contentItems.id, item.id));
+    expect(published).toMatchObject({ status: "published", publishedVersionId: approved.materializedVersionId, aiEnabled: false });
+    await expect(setContentAiEnabled(item.id, true, "contact@limova.ai")).rejects.toThrow("KNOWLEDGE_UGO_APPROVAL_REQUIRED");
+    await setContentAiEnabled(item.id, true, actor);
+    expect((await fixture.db.select().from(contentItems).where(eq(contentItems.id, item.id)))[0].aiEnabled).toBe(true);
+  });
   it("does not pre-arm an unpublished SAV candidate for automatic activation on publication", async () => {
     const candidate = await candidateFor(await tutorial());
     const approved = await reviewKnowledgeCandidate(candidate.id, await approval(candidate), actor);

@@ -7,7 +7,8 @@ import { z } from "zod";
 import { requireDb } from "@/db";
 import { knowledgeProjectionCandidates } from "@/db/schema";
 import { requireApiStaff } from "@/lib/auth";
-import { assertKnowledgeUgoApproval } from "@/lib/knowledge/contracts";
+import { requireSavApiStaff } from "@/lib/sav/auth";
+import { assertKnowledgeCandidateReview } from "@/lib/knowledge/contracts";
 import { continueOnboardingImport, prepareOnboardingReview, startOnboardingImport } from "@/lib/knowledge/onboarding-import";
 import { reviewKnowledgeCandidate } from "@/lib/knowledge/review";
 import { assertSavActor } from "@/lib/sav/access";
@@ -56,13 +57,13 @@ export async function continueOnboardingImportAction(form: FormData) {
 }
 
 export async function previewOnboardingReviewAction(form: FormData) {
-  const staff = await requireApiStaff("admin");
-  assertKnowledgeUgoApproval(staff.email);
+  const staff = await requireSavApiStaff();
+  assertKnowledgeCandidateReview(staff.email, "sav");
   try {
     const candidateId = z.uuid().parse(form.get("candidateId"));
     const revisionId = z.uuid().parse(form.get("revisionId"));
     const [candidate] = await requireDb().select().from(knowledgeProjectionCandidates).where(eq(knowledgeProjectionCandidates.id, candidateId)).limit(1);
-    if (!candidate || candidate.revisionId !== revisionId || !["pending", "needs_completion"].includes(candidate.status)) throw new Error("KNOWLEDGE_CANDIDATE_STALE");
+    if (!candidate || candidate.targetSurface !== "sav" || candidate.revisionId !== revisionId || !["pending", "needs_completion"].includes(candidate.status)) throw new Error("KNOWLEDGE_CANDIDATE_STALE");
     const comparison = await prepareOnboardingReview(candidate, JSON.parse(String(form.get("document"))));
     return { comparison, error: null };
   } catch (error) {
@@ -71,8 +72,8 @@ export async function previewOnboardingReviewAction(form: FormData) {
 }
 
 export async function reviewOnboardingKnowledgeAction(form: FormData) {
-  const staff = await requireApiStaff("admin");
-  assertKnowledgeUgoApproval(staff.email);
+  const staff = await requireSavApiStaff();
+  assertKnowledgeCandidateReview(staff.email, "sav");
   let result = "draft_ready";
   try {
     const decision = z.enum(["approve", "reject"]).parse(form.get("decision"));

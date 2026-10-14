@@ -22,7 +22,7 @@ import { analyzeSavPilotBatchWorkflow } from "@/workflows/sav-pilot";
 import { reviewKnowledgeCandidate } from "@/lib/knowledge/review";
 import { HUBSPOT_IMPORT_MAX_BYTES } from "@/lib/knowledge/hubspot-input";
 import { importHubspotKnowledge, prepareHubspotReview } from "@/lib/knowledge/hubspot-import";
-import { assertKnowledgeUgoApproval } from "@/lib/knowledge/contracts";
+import { assertKnowledgeCandidateReview } from "@/lib/knowledge/contracts";
 import { requireDb } from "@/db";
 import { knowledgeProjectionCandidates } from "@/db/schema";
 import { eq } from "drizzle-orm";
@@ -333,7 +333,7 @@ export async function reviewLearningAction(form: FormData) {
 
 export async function previewHubspotReviewAction(form: FormData) {
   const staff = await requireApiStaff("admin");
-  assertKnowledgeUgoApproval(staff.email);
+  assertKnowledgeCandidateReview(staff.email, "sav");
   try {
     const [candidate] = await requireDb().select().from(knowledgeProjectionCandidates).where(eq(knowledgeProjectionCandidates.id, id(form, "candidateId")));
     if (!candidate || candidate.status !== "pending" || candidate.targetSurface !== "sav" || candidate.revisionId !== id(form, "revisionId")) throw new Error("KNOWLEDGE_CANDIDATE_STALE");
