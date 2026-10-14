@@ -1,52 +1,45 @@
 import { formatParisDateTime } from "@/lib/paris-date";
 import Link from "next/link";
+import { ArrowUpRight, BookOpen, CheckCheck, Inbox, ListChecks, RefreshCw, Search } from "lucide-react";
 import { getSavV0Cutover } from "@/lib/sav/cutover";
-import { listSavActionIncidents, listSavInbox, listSavWebhookIncidents } from "@/lib/sav/service";
-import { savActionLabels, savLabel } from "@/lib/sav/labels";
+import { listSavActionIncidents, listSavWebhookIncidents } from "@/lib/sav/service";
+import { listSavDossierDashboard } from "@/lib/sav/dashboard";
+import { savDashboardLabels, savDashboardViews } from "@/lib/sav/dashboard-state";
 import { retryWebhookAction } from "./actions";
 import { openSavEmailAction } from "./open-email-actions";
 import { OpenEmailButton } from "./open-email-button";
 import styles from "./inbox.module.css";
 
-export async function SavV0Inbox({ searchParams }: { searchParams: Promise<{ view?: string; q?: string; page?: string }> }) {
-  const { view = "all", q = "", page = "1" } = await searchParams;
-  const currentPage = Math.max(1, Math.min(2000, Math.trunc(Number(page)) || 1));
-  const [cutover, rows, syncIncidents, actionIncidents] = await Promise.all([getSavV0Cutover(), listSavInbox(51, { offset: (currentPage - 1) * 50, view, query: q }), listSavWebhookIncidents(20), listSavActionIncidents(20)]);
-  const href = (page: number) => `/studio/sav?${new URLSearchParams({ view, q, page: String(page) })}`;
-  return <>
-    <div className="page-intro compact"><div><span className="eyebrow">SAV IA · V0 supervisée</span><h1>Propositions à piloter</h1><p>Emails entrants de contact@limova.ai après activation. Brouillons dans le Studio uniquement ; création ou rattachement HubSpot par clic humain séparé.</p></div></div>
-    <p className="login-notice">{cutover ? `Activation : ${formatParisDateTime(cutover.receivedAfter)}. Les anciens emails restent hors de cette file.` : "Activation non effectuée : aucun ancien email ne sera proposé rétroactivement."}{process.env.SAV_WRITES_DISABLED === "true" && " Écritures externes bloquées."}</p>
-    <nav className="sav-tabs" aria-label="Vues SAV">{[["all", "Tous les emails"], ["pending", "À valider"], ["reviewed", "Revues faites"], ["human", "Reprise humaine"], ["errors", "Erreurs"], ["technical", "Exclusions techniques"]].map(([key, label]) => <Link key={key} className={view === key ? "active" : ""} href={`/studio/sav?view=${key}`}>{label}</Link>)}<Link href="/studio/sav/connaissances">Connaissances</Link><Link href="/studio/sav/resolutions">Résolutions</Link><Link href="/studio/sav/pilote">Laboratoire</Link><Link href="/studio/sav/evaluation">Évaluation et décision</Link></nav>
-    <form className="sav-search" method="get"><input type="hidden" name="view" value={view}/><label htmlFor="sav-q">Rechercher dans toute la file</label><div><input id="sav-q" name="q" defaultValue={q} maxLength={200} placeholder="Expéditeur, objet ou extrait…"/><button>Rechercher</button></div></form>
-    <section className="decision-ledger" aria-label="Emails synchronisés"><header><span>Demande</span><span>Suite à donner</span><span>État de la proposition</span></header>
-      {rows.slice(0, 50).map((row) => {
-        const hasReview = row.reviewStatus === "approved" || row.reviewStatus === "rejected";
-        const proposalState = row.reviewStatus === "approved" ? "Validée"
-          : row.reviewStatus === "rejected" ? "Refusée"
-          : row.analysisErrorCode ? row.analysisStatus === "done" ? "Analyse dégradée" : "Erreur d’analyse"
-          : row.aiPaused ? "Reprise humaine"
-          : row.analysisStatus === "done" ? "À relire" : "Analyse en attente";
-        return <form action={openSavEmailAction} key={row.messageId} className={styles.openForm}>
-        <input type="hidden" name="threadId" value={row.threadId}/><input type="hidden" name="messageId" value={row.messageId}/>
-        <OpenEmailButton subject={row.summary.title}>
-        <span className="ledger-rail" aria-hidden="true"><i className={row.reviewId ? "decided" : "missing"}/></span>
-        <span className={`ledger-mail ${styles.demand}`}><small>{formatParisDateTime(row.receivedAt)} · {row.summary.sourceLabel}</small><strong title={row.summary.title}>{row.summary.title}</strong><span>{row.fromEmail}</span><p title={row.summary.problem}>{row.summary.problem}</p>{row.summary.additionalRequests > 0 && <small>{row.summary.additionalRequests} autre{row.summary.additionalRequests > 1 ? "s" : ""} demande{row.summary.additionalRequests > 1 ? "s" : ""} dans le dossier</small>}</span>
-        <span className={`ledger-decision ${styles.nextAction}`}><strong>Action proposée</strong><p title={row.summary.nextAction}>{row.summary.nextAction}</p><small>{hasReview ? "Décision humaine enregistrée" : "À confirmer par un humain"}</small></span>
-        <span className={`ledger-action ${styles.state}`}>
-          <strong>{proposalState}</strong>
-          {row.analysisErrorCode && <><small>{hasReview ? "Analyse IA dégradée" : "Revue humaine nécessaire"}</small><small className={styles.diagnostic} title={row.analysisErrorCode}>Diagnostic disponible dans le dossier</small></>}
-          {row.hubspotTicketId && <small>HubSpot #{row.hubspotTicketId}</small>}
-        </span>
+const viewIcons = { to_process: Inbox, to_validate: ListChecks, learning: RefreshCw, completed: CheckCheck };
+const descriptions = { to_process: "Derniers emails non ouverts", to_validate: "Validation ou action à confirmer", learning: "Résolution humaine et apprentissage", completed: "Traitement Studio terminé" };
+const ticketLabels = { not_required: "Sans ticket nécessaire", required: "Action ticket à confirmer", pending: "Action en attente", uncertain: "Résultat incertain", failed: "Action non confirmée", confirmed: "Action confirmée" };
+
+export async function SavV0Inbox({ searchParams }: { searchParams: Promise<{ view?: string; q?: string; page?: string; sort?: string }> }) {
+  const { view = "to_process", q = "", page = "1", sort = "newest" } = await searchParams;
+  let data: Awaited<ReturnType<typeof listSavDossierDashboard>>;
+  try { data = await listSavDossierDashboard({ view, query: q, page: Number(page), sort }); }
+  catch { return <><div className="page-intro compact"><div><span className="eyebrow">SAV IA</span><h1>Piloter les demandes</h1></div></div><section className="card" role="alert"><h2>Les dossiers ne sont pas disponibles</h2><p>Le chargement a échoué. Aucun compteur ni résultat vide n’est présenté comme confirmé.</p><Link className="button secondary" href="/studio/sav">Réessayer</Link></section></>; }
+  const cutover = await getSavV0Cutover();
+  const [syncIncidents, actionIncidents] = data.view === "incidents" ? await Promise.all([listSavWebhookIncidents(20), listSavActionIncidents(20)]) : [[], []];
+  const href = (selectedView: string, selectedPage = 1) => `/studio/sav?${new URLSearchParams({ view: selectedView, q: q.slice(0, 200), page: String(selectedPage), sort: sort === "oldest" ? "oldest" : "newest" })}`;
+  return <div className={styles.dashboard}>
+    <div className={`page-intro compact ${styles.intro}`}><div><span className="eyebrow">SAV IA</span><h1>Piloter les demandes</h1><p>Une ligne par dossier, avec la prochaine action à effectuer.</p></div><Link className="button secondary" href="/studio/sav/connaissances"><BookOpen size={16}/> Connaissances</Link></div>
+    {!cutover && <p className="login-notice">La réception SAV n’est pas encore activée. Aucun ancien email n’est ajouté à cette file.</p>}
+    <nav className={styles.views} aria-label="Vues SAV">{savDashboardViews.map(key => { const Icon = viewIcons[key]; return <Link key={key} href={href(key)} className={`${styles.view} ${data.view === key ? styles.active : ""}`} aria-current={data.view === key ? "page" : undefined}><span><Icon size={18}/>{savDashboardLabels[key]}<b>{data.counts[key]}</b></span><small>{descriptions[key]}</small></Link>; })}</nav>
+    <div className={styles.toolbar}><form method="get" className={styles.search}><input type="hidden" name="view" value={data.view}/><label htmlFor="sav-q"><Search size={16}/><span className={styles.visuallyHidden}>Rechercher un dossier</span><input id="sav-q" name="q" defaultValue={q} maxLength={200} placeholder="Rechercher un client, une demande, un ticket…"/></label><label className={styles.sort}>Trier<select name="sort" defaultValue={sort === "oldest" ? "oldest" : "newest"}><option value="newest">Plus récents</option><option value="oldest">Plus anciens</option></select></label><button className="secondary" type="submit">Rechercher</button></form><Link href={href("incidents")}>Incidents {data.counts.incidents > 0 && `(${data.counts.incidents})`}</Link><Link href={href("technical")}>Exclusions ({data.counts.technical})</Link></div>
+    <section className={styles.ledger} aria-label="Dossiers SAV"><header className={styles.heading}><span>Demande / client</span><span>Revue et ticket</span><span>Prochaine action</span></header>
+      {data.rows.map(row => <form action={openSavEmailAction} key={row.threadId} id={`dossier-${row.threadId}`} className={styles.openForm}>
+        <input type="hidden" name="threadId" value={row.threadId}/><input type="hidden" name="messageId" value={row.messageId}/><input type="hidden" name="returnTo" value={`${href(data.view, data.page)}#dossier-${row.threadId}`}/>
+        <OpenEmailButton subject={row.summary.title} compact>
+          <span className={styles.demand}><span className={styles.date}>{formatParisDateTime(row.receivedAt)}{row.opening === "unopened" && <i className={styles.newDot} aria-label="Dernier email non ouvert"/>}</span><strong title={row.summary.title}>{row.summary.title}</strong><span className={styles.customer}>{row.fromEmail}</span><span className={styles.problem}>{row.summary.problem}</span>{row.opening === "unknown" && <small>Consultation historique non connue</small>}</span>
+          <span className={styles.state}><span className={styles.badges}><span className={row.reviewStatus === "approved" ? styles.approved : styles.badge}>Dossier {row.reviewStatus === "approved" ? "validé" : row.reviewStatus === "rejected" ? "à corriger" : "à valider"}</span><span className={styles.badge}>Brouillon : {row.draftStatus}</span></span><span>{row.ticket ? `${row.ticket.title} · ${row.ticket.status}` : row.ticketProgress === "not_required" ? "Aucun ticket nécessaire" : row.crmStatus === "error" ? "HubSpot indisponible" : row.crmStatus === "partial" ? "Contexte HubSpot incomplet" : row.crmStatus === "unknown" ? "Contexte HubSpot à vérifier" : "Aucun ticket lié"}</span>{row.ticket && <small>Ticket lié #{row.ticket.id}</small>}<small>{ticketLabels[row.ticketProgress]} · {row.replyStatus}</small>{row.incident && <span className={styles.warning}>Vérification nécessaire</span>}</span>
+          <span className={styles.nextAction}><strong>{row.nextAction}</strong><span>Ouvrir le dossier <ArrowUpRight size={15}/></span></span>
         </OpenEmailButton>
-      </form>;
-      })}
-      {!rows.length && <div className="empty card">Aucun email dans cette vue. Les exclusions restent consultables séparément.</div>}
+      </form>)}
+      {!data.rows.length && <div className={styles.empty}><Inbox size={28}/><h2>{q.trim() ? "Aucun dossier ne correspond à cette recherche" : data.view === "completed" ? "Aucun dossier terminé" : data.view === "learning" ? "Aucun apprentissage en cours" : data.view === "to_validate" ? "Aucun dossier à valider" : data.view === "to_process" ? "Aucune nouvelle demande à ouvrir" : "Aucun dossier dans cette vue"}</h2><p>{q.trim() ? "Essayez un autre nom, thème ou numéro de ticket." : "Les dossiers apparaîtront ici dès que leur état le permettra."}</p>{q.trim() && <Link href={`/studio/sav?view=${data.view}`}>Effacer la recherche</Link>}</div>}
     </section>
-    <nav className="sav-tabs" aria-label="Pagination">{currentPage > 1 && <Link href={href(currentPage - 1)}>← Page précédente</Link>}<span>Page {currentPage}</span>{rows.length > 50 && <Link href={href(currentPage + 1)}>Page suivante →</Link>}</nav>
-    {(syncIncidents.length > 0 || actionIncidents.length > 0) && <section className="sav-incidents card"><h2>Incidents techniques</h2><p>Une relance ne valide aucune proposition. Une création HubSpot au résultat incertain nécessite une réconciliation dans le dossier, jamais une nouvelle création automatique.</p><ol>
-      {syncIncidents.map((incident) => <li key={incident.id}><div><strong>Synchronisation {incident.provider}</strong><small>{formatParisDateTime(incident.receivedAt)} · {incident.attempts} tentative(s)</small><code>{incident.errorCode || "Traitement bloqué"}</code></div><form action={retryWebhookAction}><input type="hidden" name="receiptId" value={incident.id}/><button className="button secondary" type="submit">Relancer la synchronisation</button></form></li>)}
-      {actionIncidents.map((incident) => <li key={incident.id}><div><strong>{incident.subject}</strong><small>{savLabel(savActionLabels, incident.kind)}</small><code>{incident.errorCode}</code></div><Link href={`/studio/sav/${incident.threadId}`}>Vérifier le dossier</Link></li>)}
-    </ol></section>}
-    <section className="card" style={{ padding: 24 }}><h2>Évaluation des propositions</h2><p>Les résultats réels, tests et simulations sont séparés par modèle, prompt, connaissance, code et catégorie. Corriger une proposition ne modifie pas son verdict IA d’origine.</p><Link href="/studio/sav/evaluation">Ouvrir le dashboard d’évaluation</Link></section>
-  </>;
+    <nav className={styles.pagination} aria-label="Pagination"><span>{data.total} dossier{data.total > 1 ? "s" : ""}{q.trim() ? " correspondant à la recherche" : ""}</span><span>{data.page > 1 && <Link href={href(data.view, data.page - 1)}>← Précédente</Link>} Page {data.page} sur {data.totalPages} {data.page < data.totalPages && <Link href={href(data.view, data.page + 1)}>Suivante →</Link>}</span></nav>
+    {data.view === "incidents" && (syncIncidents.length > 0 || actionIncidents.length > 0) && <section className="sav-incidents card"><h2>Journal des incidents</h2><p>Un résultat HubSpot incertain exige une vérification dans le dossier avant toute reprise.</p><ol>{syncIncidents.map(incident => <li key={incident.id}><div><strong>Synchronisation {incident.provider}</strong><small>{formatParisDateTime(incident.receivedAt)}</small></div><form action={retryWebhookAction}><input type="hidden" name="receiptId" value={incident.id}/><button className="button secondary" type="submit">Relancer la synchronisation</button></form></li>)}{actionIncidents.map(incident => <li key={incident.id}><strong>{incident.subject}</strong><Link href={`/studio/sav/${incident.threadId}`}>Vérifier le dossier</Link></li>)}</ol></section>}
+    <nav className={styles.secondaryLinks} aria-label="Outils SAV"><Link href="/studio/sav/resolutions">Bilans de résolution</Link><Link href="/studio/sav/pilote">Laboratoire</Link><Link href="/studio/sav/evaluation">Évaluation</Link></nav>
+  </div>;
 }

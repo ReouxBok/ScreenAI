@@ -39,7 +39,7 @@ const feedbackLabels: Record<string, string> = {
   good_without_change: "Bonne réponse sans changement",
 };
 
-export default async function SavDashboardPage({ searchParams }: { searchParams: Promise<{ view?: string; q?: string; page?: string; batch?: string; batchCancelled?: string; launch?: string }> }) {
+export default async function SavDashboardPage({ searchParams }: { searchParams: Promise<{ view?: string; q?: string; page?: string; sort?: string; batch?: string; batchCancelled?: string; launch?: string }> }) {
   await requireStaff("admin");
   if (savReleaseStage() === "v0") return <SavV0Inbox searchParams={searchParams}/>;
   const configured = isDatabaseConfigured();
