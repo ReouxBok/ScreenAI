@@ -27,7 +27,7 @@ export function savDashboardTicketProgress(actions: Action[], messageId: string,
 }
 type Observation = typeof savResolutionObservations.$inferSelect;
 type Cycle = typeof savObservationCycles.$inferSelect;
-export function savDashboardLearningProgress(observations: Observation[], cycles: Cycle[], candidates: Array<{ id: string; status: string }>): SavLearningProgress {
+export function savDashboardLearningProgress(observations: Observation[], cycles: Cycle[], candidates: Array<{ id: string; status: string; sourceRef?: string }>): SavLearningProgress {
   const states = observations.map((observation): SavLearningProgress => {
     const cycle = cycles.find(c => c.observationId === observation.id && c.cycle === observation.cycle);
     if (observation.state === "waiting_ticket") return "waiting_ticket";
@@ -38,6 +38,9 @@ export function savDashboardLearningProgress(observations: Observation[], cycles
     if (cycle.candidateId && !["approved", "rejected"].includes(candidates.find(c => c.id === cycle.candidateId)?.status ?? "")) return "candidate";
     return "none";
   });
+  // A reusable human dossier review can create learning without a refused
+  // draft/observation. Older observation cycles stay excluded from this path.
+  if (candidates.some(candidate => candidate.status === "pending" && candidate.sourceRef && !candidate.sourceRef.startsWith("sav-observation:"))) states.push("candidate");
   return (["incomplete", "qualification", "candidate", "waiting_ticket", "collecting", "catchup"] as const).find(state => states.includes(state)) ?? "none";
 }
 export type SavDashboardRow = {
@@ -83,7 +86,7 @@ export async function listSavDossierDashboard(options: { view?: string; query?: 
       ]);
       const cycles = observations.length ? await db.select().from(savObservationCycles).where(inArray(savObservationCycles.observationId, observations.map(o => o.id))) : [];
       const candidateIds = cycles.flatMap(c => c.candidateId ? [c.candidateId] : []);
-      const candidates = candidateIds.length ? await db.select({ id: savLearningCandidates.id, status: savLearningCandidates.status }).from(savLearningCandidates).where(inArray(savLearningCandidates.id, candidateIds)) : [];
+      const candidates = await db.select({ id: savLearningCandidates.id, status: savLearningCandidates.status, threadId: savLearningCandidates.threadId, sourceRef: savLearningCandidates.sourceRef }).from(savLearningCandidates).where(sql`(${inArray(savLearningCandidates.threadId, threads)} and ${savLearningCandidates.status} = 'pending') or ${candidateIds.length ? inArray(savLearningCandidates.id, candidateIds) : sql`false`}`);
       const openedIds = new Set(openingProofs.map(proof => proof.messageId));
       for (const { message, thread, decision, run, review } of batch) {
         let original: SavStructuredProposal | null = null, proposal: SavStructuredProposal | null = null, reviewStatus: string | null = null;
@@ -113,7 +116,7 @@ export async function listSavDossierDashboard(options: { view?: string; query?: 
         const summary = buildSavInboxSummary({ subject: message.subject, analysisStatus: message.analysisStatus, analysisErrorCode, hubspotTicketId: thread.hubspotTicketId, proposal, originalProposal: original, reviewStatus, partnershipTransferStatus });
         const opening: SavOpeningState = message.studioOpenedAt || openedIds.has(message.id) ? "opened" : message.studioOpeningTracked ? "unopened" : "unknown";
         const ticketProgress = savDashboardTicketProgress(threadActions, message.id, proposal?.decision.kind, thread.hubspotTicketId);
-        const learning = savDashboardLearningProgress(observations.filter(o => o.threadId === thread.id), cycles, candidates);
+        const learning = savDashboardLearningProgress(observations.filter(o => o.threadId === thread.id), cycles, candidates.filter(c => c.threadId === thread.id));
         const state = classifySavDossier({ opening, reviewStatus, ticket: ticketProgress, learning });
         const linkedTicket = context?.crm.data?.tickets.find(t => t.id === thread.hubspotTicketId);
         const incident = Boolean(analysisErrorCode || ["failed", "uncertain"].includes(ticketProgress) || partnershipTransferStatus && ["failed", "uncertain"].includes(partnershipTransferStatus));

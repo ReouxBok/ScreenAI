@@ -105,6 +105,13 @@ describe("SAV-55 dashboard read model", () => {
     expect(result.counts).toMatchObject({ learning: 3, completed: 2 });
     expect(result.rows.map(r => r.learning)).toEqual(["incomplete", "candidate", "qualification"]);
   });
+  it("keeps a reusable review candidate under follow-up even without an observation cycle", async () => {
+    const row = await seed({ approved: true, noTicket: true, opening: "opened" });
+    await fixture.db.insert(savLearningCandidates).values({ threadId: row.thread.id, sourceRef: `sav-review:${row.message.id}`, sourceContentHash: "fixture-review", proposedPatch: {}, explanation: "Proposition réutilisable fictive", status: "pending" });
+    const result = await listSavDossierDashboard({ view: "learning" });
+    expect(result.counts.completed).toBe(0);
+    expect(result.rows[0]?.learning).toBe("candidate");
+  });
   it("does not finish a resolved cycle whose expected candidate is missing", async () => {
     const row = await seed({ approved: true, noTicket: true, opening: "opened" });
     await observation(row, "resolved");
