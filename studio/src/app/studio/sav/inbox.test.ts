@@ -52,6 +52,11 @@ describe("SAV-55 compact dashboard", () => {
     dependencies.dashboard.mockResolvedValue({ ...result, rows: [{ ...row, crmStatus }] });
     const html = await render(); expect(html).not.toContain("Aucun ticket lié"); expect(html).not.toContain("Aucun ticket nécessaire");
   });
+  it.each(["pending", "uncertain", "failed", "succeeded"])("preserves the SAV-53 %s partnership transfer independently", async partnershipStatus => {
+    dependencies.dashboard.mockResolvedValue({ ...result, rows: [{ ...row, partnershipStatus }] });
+    const html = await render(); expect(html).toContain(partnershipStatus === "succeeded" ? "Transféré à Nathan" : "Transfert à Nathan");
+    expect(html).toContain("Brouillon : À relire");
+  });
   it("keeps incidents and exclusions accessible without adding them to primary counts", async () => {
     const html = await render(); expect(html).toContain("Incidents"); expect(html).toContain("Exclusions (0)");
     expect(dependencies.incidents).not.toHaveBeenCalled();
