@@ -1,6 +1,6 @@
 # Migration de la recette E2E vers Deep Agent
 
-**État courant : 4 scénarios legacy restent dans `feature-flows.spec.js`.** Les sections suivantes retracent les couches de migration ; leurs anciens décomptes décrivent ces étapes, pas le total actuel. La suite globale et la qualification distante restent ouvertes.
+**État courant : 3 scénarios legacy restent dans `feature-flows.spec.js`.** Les sections suivantes retracent les couches de migration ; leurs anciens décomptes décrivent ces étapes, pas le total actuel. La suite globale et la qualification distante restent ouvertes.
 
 ## Audit du 14 octobre 2026
 
@@ -174,3 +174,9 @@ Les deux parcours réussissent avec serveur et stockage simulés. La sélection 
 Si Studio refuse la preuve de vérification, le verdict ne provoque aucune complétion et la conversation d’évaluation reste sélectionnée. Dans les deux cas, la voix est arrêtée et ne redémarre pas ; le code n’est pas persisté dans le stockage local. Les appels proxy/Gemini sont surveillés comme interdits.
 
 L’ancien scénario contributeur utilisant ADK et un token Gemini est remplacé par ces parcours et les quatre scénarios natifs texte/intervention déjà présents. Le contrat vocal est désormais la session Deep Agent, sans demande de token vocal legacy. Les serveurs API/Studio/provider et le calcul du score restent simulés : le test ne prouve pas une évaluation modèle ni une publication/review Studio réelle. L’exclusion staging liée aux permissions Studio production reste explicite.
+
+## Navigation vers une cible hors écran et curseur
+
+Le parcours ajouté à `limova-browser-actions.spec.js` part d’un lien absent des références visibles. Les commandes de défilement renvoient un mouvement réel ; chaque recherche relit la page, puis le lien devient référencé, reçoit un seul clic avec curseur centré et ouvre réellement le profil. Une seule demande utilisateur, un même tour, des reçus distincts et une lecture de la destination sont vérifiés. Aucune carte de confirmation supplémentaire ni appel legacy.
+
+Le scénario legacy curseur/navigation est remplacé. L’analyse conserve son contrat d’observation ; la navigation exige le consentement navigateur du tour. Le curseur est immédiat et le scroll explicite, sans reprise de la trajectoire animée legacy. Voir `deep-agent-action-pointer.md` pour cette différence de présentation. Les choix du serveur restent simulés ; les actions Chrome/DOM et la navigation sont réels.
