@@ -116,3 +116,35 @@ for (const enabled of [true, false]) test(`native diagnostics report flag ${enab
   expect(JSON.stringify(result)).not.toContain('private_token');
   expect(JSON.stringify(result)).not.toContain('PRIVATE_FIELD_VALUE');
 });
+
+for (const entry of ['limovaNew', 'resetBtn']) test(`native ${entry} starts a separate chat without carrying browser consent or deleting history`, async ({ nativeChat }) => {
+  const { panel, calls, state, legacy, errors } = nativeChat;
+  await panel.locator('#userInput').fill('Premier échange conservé');
+  await panel.locator('#sendBtn').click();
+  await expect(panel.locator('.message.assistant .message-content')).toHaveText(state.reply);
+  await expect(panel.locator('#sendBtn')).toBeEnabled();
+  await panel.locator('#limovaBrowser').check();
+  if (entry === 'resetBtn') await panel.locator('#menuBtn').click();
+  await panel.locator(`#${entry}`).click();
+  await expect.poll(() => calls.filter(call => call.path === '/conversation' && call.method === 'POST').length).toBe(2);
+  await expect(panel.locator('#limovaFeedback')).toHaveText('');
+  await expect(panel.locator('#limovaConversation')).not.toHaveValue(CONVERSATION);
+  await expect(panel.locator('#sendBtn')).toBeEnabled();
+  const nextId = await panel.locator('#limovaConversation').inputValue();
+  expect(nextId).toMatch(/^[0-9a-f-]{36}$/);
+  await expect(panel.locator('.message.user, .message.assistant')).toHaveCount(0);
+  await expect(panel.locator('#limovaBrowser')).not.toBeChecked();
+  state.reply = 'Réponse du second fil';
+  await panel.locator('#userInput').fill('Deuxième échange indépendant');
+  await panel.locator('#sendBtn').click();
+  await expect(panel.locator('.message.assistant .message-content')).toHaveText(state.reply);
+  const secondTurn = calls.find(call => call.path === `/message/${nextId}`);
+  expect(secondTurn.body.browserContext).toBeUndefined();
+  expect(secondTurn).toMatchObject({ authenticated: true, workspace: WORKSPACE });
+  await panel.locator('#limovaConversation').selectOption(CONVERSATION);
+  await expect(panel.locator('.message.user .message-content')).toHaveText('Premier échange conservé');
+  await expect(panel.locator('.message.assistant .message-content')).toHaveText('Je retrouve le tableau de bord.');
+  expect(calls.filter(call => call.path === '/conversation' && call.method === 'POST')).toHaveLength(2);
+  expect(calls.some(call => call.method === 'DELETE' || call.path.includes('/auth/logout'))).toBe(false);
+  expect(legacy).toEqual([]); expect(errors).toEqual([]);
+});

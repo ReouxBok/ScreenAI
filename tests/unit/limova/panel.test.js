@@ -53,6 +53,15 @@ describe('Limova panel session and turn boundaries', () => {
     expect(request.mock.calls.every(([request]) => request.type.startsWith('LIMOVA_'))).toBe(true);
   });
 
+  it('clears browser consent when the New button creates a conversation', async () => {
+    const { panel, request } = setup({ LIMOVA_CREATE_CONVERSATION: () => ({ id: 'new-chat' }) });
+    await panel.refresh();
+    element('limovaBrowser').checked = true;
+    element('limovaNew').click();
+    await vi.waitFor(() => expect(request).toHaveBeenCalledWith({ type: 'LIMOVA_CREATE_CONVERSATION' }));
+    expect(element('limovaBrowser').checked).toBe(false);
+  });
+
   it('opens the app for login without requesting an OTP', async () => {
     const { panel, request } = setup({ LIMOVA_GET_STATE: () => ({ authenticated: false, workspaces: [], context: null }) });
     await panel.refresh();

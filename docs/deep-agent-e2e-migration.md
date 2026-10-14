@@ -74,3 +74,11 @@ Le délai de 90 secondes commence sur la transcription finale utilisateur ou le 
 Tests unitaires avec horloge contrôlée : écoute sans demande, progression, expiration, réponses terminales, échec, arrêt audio/transport, événements tardifs et absence de détails serveur. Tests Chromium avec vrai transport : le serveur publie la question dans le flux canonique puis reste silencieux ; l’horloge du panneau avance pour vérifier le délai sans attendre 90 secondes réelles. Le backend et le provider ne sont pas qualifiés par cette simulation.
 
 Le test legacy de silence après transcription est désormais remplacé par ces cas natifs. Il reste 16 scénarios legacy. Le délai choisi doit être observé pendant le pilote, notamment pour les outils longs sans événements de progression ; aucun mécanisme de rejeu automatique n’est ajouté.
+
+## Nouvelle conversation et remise à zéro du panneau
+
+La fixture native gère plusieurs UUID de conversation, des historiques indépendants et la route existante `/message/:id/cancel`, appelée avant un changement de fil. Les deux entrées UI (`limovaNew` et `resetBtn`) créent un second fil, décochent le consentement navigateur et conservent l’historique du premier. Le test envoie ensuite un message dans le second fil sans contexte navigateur, puis reprend le premier et retrouve exactement ses messages. Aucun DELETE ni logout n’est envoyé.
+
+Cette couche ne modifie pas le code produit. Le helper de listener retire l’événement de clic avant la création ; le consentement n’est donc conservé que lors de la création implicite nécessaire à un envoi déjà autorisé. La fixture doit accepter cancel pour représenter le parcours existant.
+
+Le scénario legacy combinant langue/onboarding/diagnostics/export de logs/reset reste présent, car les assertions liées au prompt d’onboarding et aux logs doivent encore être transférées. La vérification du reset ne remplace pas ce scénario entier.

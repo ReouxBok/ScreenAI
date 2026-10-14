@@ -22,6 +22,7 @@ export const test = base.extend({
     execFileSync('openssl', ['req', '-x509', '-newkey', 'rsa:2048', '-nodes', '-keyout', key, '-out', cert, '-days', '1', '-subj', '/CN=limova-native-chat'], { stdio: 'ignore' });
     const calls = [], history = [], legacy = [], errors = [];
     const state = { created: false, reply: 'Je retrouve le tableau de bord.', authenticated: true, enabled: true, browserActions: [{ operation: 'read_page' }] };
+    const conversations = new Map();
     let turnId, actionIndex = 0;
     let context;
     const server = createServer({ key: await readFile(key), cert: await readFile(cert) }, (request, response) => {
@@ -47,15 +48,22 @@ export const test = base.extend({
         if (url.pathname === '/users/me') return json({ id: USER });
         if (url.pathname === '/workspaces') return json([{ id: WORKSPACE, name: 'Native fixture', is_charly_extension_enabled: state.enabled }]);
         if (url.pathname === '/agent/by-slug/charly') return json({ id: AGENT, slug: 'charly' });
-        if (url.pathname === '/conversation' && request.method === 'POST') { state.created = true; return json({ id: CONVERSATION }); }
-        if (url.pathname === '/conversation') return json({ data: state.created ? [{ id: CONVERSATION, title: 'Discussion native' }] : [], pagination: { hasNext: false } });
-        if (url.pathname === `/conversation/${CONVERSATION}`) return json({ id: CONVERSATION, engine: 'deep_agents', mainAgent: { id: AGENT, slug: 'charly' } });
-        if (url.pathname === `/conversation/${CONVERSATION}/download`) {
+        if (url.pathname === '/conversation' && request.method === 'POST') {
+          const id = conversations.size ? randomUUID() : CONVERSATION;
+          conversations.set(id, { id, title: `Discussion ${conversations.size + 1}`, history: conversations.size ? [] : history });
+          state.created = true; return json({ id });
+        }
+        if (url.pathname === '/conversation') return json({ data: [...conversations.values()].map(({ id, title }) => ({ id, title })), pagination: { hasNext: false } });
+        const selected = conversations.get(url.pathname.split('/')[2]);
+        if (selected && url.pathname === `/conversation/${selected.id}`) return json({ id: selected.id, engine: 'deep_agents', mainAgent: { id: AGENT, slug: 'charly' } });
+        if (selected && url.pathname === `/conversation/${selected.id}/download`) {
           response.writeHead(200, { ...headers, 'content-type': 'text/csv; charset=utf-8' });
           response.end('Timestamp,Sender,Content\n2026-10-14,Charly,"Bonjour é"\n'); return;
         }
-        if (url.pathname === `/conversation/${CONVERSATION}/messages`) return json({ data: history, pagination: { hasMore: false } });
-        if (url.pathname === `/message/${CONVERSATION}`) {
+        if (selected && url.pathname === `/conversation/${selected.id}/messages`) return json({ data: selected.history, pagination: { hasMore: false } });
+        if (selected && url.pathname === `/message/${selected.id}/cancel` && request.method === 'POST') return json({ ok: true });
+        if (selected && url.pathname === `/message/${selected.id}`) {
+          const history = selected.history;
           if (request.headers['x-workspace-id'] !== WORKSPACE) return json({ error: 'workspace' }, 403);
           response.writeHead(201, { ...headers, 'content-type': 'text/event-stream' });
           if (!body.kind) {
