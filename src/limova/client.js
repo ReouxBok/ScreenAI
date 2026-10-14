@@ -140,11 +140,17 @@ export class LimovaDeepAgentClient {
 
   async validateContext(context, signal) { await this.#assertContext(context, signal); }
 
-  async createConversation(context, title = 'Discussion avec Charly', signal, evaluationCode) {
-    evaluationGrant(evaluationCode);
+  async getMainAgent(context, signal) {
     await this.#assertContext(context, signal);
     const agent = await this.#request('/agent/by-slug/charly', { workspaceId: context.workspaceId, signal, expectedContext: { ...context } });
     if (agent?.slug !== 'charly') throw new LimovaClientError('INVALID_AGENT', 'L’agent principal Limova est indisponible.');
+    id(agent.id);
+    return agent;
+  }
+
+  async createConversation(context, title = 'Discussion avec Charly', signal, evaluationCode) {
+    evaluationGrant(evaluationCode);
+    const agent = await this.getMainAgent(context, signal);
     const conversation = await this.#request('/conversation', { evaluationCode, method: 'POST', workspaceId: context.workspaceId, signal,
       expectedContext: { ...context },
       body: { title: String(title).slice(0, 200), type: 'general', engine: 'deep_agents', botAgentId: id(agent.id), disableFirstMessage: true } });

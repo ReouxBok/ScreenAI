@@ -1,3 +1,4 @@
+import { diagnoseLimovaClient } from './diagnostics.js';
 import { createEvaluationResponseEvidence } from './evaluation-response.js';
 import { projectEvaluationAction, projectEvaluationObservation } from './evaluation-evidence.js';
 import { evaluationGrant } from './evaluation-grant.js';
@@ -306,7 +307,11 @@ export function createLimovaBackground({ storage, openTab, openFile = async () =
         throw new Error('Opération Limova non reconnue.');
     }
   }
-  return { handle(request) {
+  return { async diagnose() {
+    const stored = (await storage.get(STORAGE_KEY))[STORAGE_KEY];
+    const selection = context ? { ...context, conversationId } : stored;
+    return diagnoseLimovaClient(client, selection);
+  }, handle(request) {
     if (['LIMOVA_GET_STATE', 'LIMOVA_SELECT_WORKSPACE', 'LIMOVA_CREATE_CONVERSATION', 'LIMOVA_OPEN_CONVERSATION', 'LIMOVA_LOGOUT', 'LIMOVA_START_EVALUATION', 'LIMOVA_END_EVALUATION'].includes(request.type)) {
       const operation = contextQueue.then(() => handle(request));
       contextQueue = operation.catch(() => {});

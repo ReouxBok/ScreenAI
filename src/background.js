@@ -1145,10 +1145,17 @@ async function runDiagnostics(client = {}) {
     'DIAGNOSTIC_CONSENT_STATE'
   );
 
+  try {
+    const nativeChecks = await limovaBackground.diagnose();
+    nativeChecks.forEach(check => addCheck(check.name, check.status, check.detail, check.code));
+  } catch {
+    addCheck('limovaSession', 'error', 'Diagnostic Limova indisponible', 'DIAGNOSTIC_LIMOVA_PROBE_FAILED');
+  }
+
   const tab = await getLimovaTabForAuthentication().catch(() => null);
   if (!tab?.id) {
-    addCheck('limovaTab', 'error', 'Aucun onglet Limova ouvert', 'DIAGNOSTIC_LIMOVA_TAB_MISSING');
-    addCheck('contentScript', 'error', 'Content script non vérifiable sans onglet Limova', 'DIAGNOSTIC_CONTENT_SCRIPT_UNAVAILABLE');
+    addCheck('limovaTab', 'info', 'Aucun onglet Limova ouvert', 'DIAGNOSTIC_LIMOVA_TAB_MISSING');
+    addCheck('contentScript', 'info', 'Content script non vérifiable sans onglet Limova', 'DIAGNOSTIC_CONTENT_SCRIPT_UNAVAILABLE');
   } else {
     addCheck('limovaTab', 'ok', 'Onglet Limova détecté', 'DIAGNOSTIC_LIMOVA_TAB_OK');
     try {
@@ -1158,30 +1165,14 @@ async function runDiagnostics(client = {}) {
       ]);
       addCheck(
         'contentScript',
-        pong?.ok ? 'ok' : 'error',
+        pong?.ok ? 'ok' : 'info',
         pong?.ok ? `Content script joignable (${pong.documentReadyState || 'ready'})` : 'Réponse content script invalide',
         pong?.ok ? 'DIAGNOSTIC_CONTENT_SCRIPT_OK' : 'DIAGNOSTIC_CONTENT_SCRIPT_INVALID'
       );
     } catch (error) {
-      addCheck('contentScript', 'error', 'Content script absent ou non joignable', 'DIAGNOSTIC_CONTENT_SCRIPT_UNREACHABLE');
+      addCheck('contentScript', 'info', 'Content script absent ou non joignable', 'DIAGNOSTIC_CONTENT_SCRIPT_UNREACHABLE');
       Logger.error('diagnostics', 'Content script probe failed', error, 'DIAGNOSTIC_CONTENT_SCRIPT_UNREACHABLE', incidentId);
     }
-  }
-
-  try {
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 3500);
-    const response = await fetch(`${PROXY_URL}/healthz`, { signal: controller.signal, cache: 'no-store' });
-    clearTimeout(timeout);
-    addCheck(
-      'proxy',
-      response.ok ? 'ok' : 'error',
-      response.ok ? `Proxy joignable (${response.status})` : `Proxy indisponible (${response.status})`,
-      response.ok ? 'DIAGNOSTIC_PROXY_OK' : 'DIAGNOSTIC_PROXY_HTTP_ERROR'
-    );
-  } catch (error) {
-    addCheck('proxy', 'error', 'Proxy indisponible ou délai dépassé', 'DIAGNOSTIC_PROXY_UNREACHABLE');
-    Logger.error('diagnostics', 'Proxy health probe failed', error, 'DIAGNOSTIC_PROXY_UNREACHABLE', incidentId);
   }
 
   const micState = ['granted', 'prompt', 'denied'].includes(client.microphonePermission)
@@ -1195,54 +1186,8 @@ async function runDiagnostics(client = {}) {
     micStatus === 'error' ? 'DIAGNOSTIC_MICROPHONE_BLOCKED' : 'DIAGNOSTIC_MICROPHONE_STATE'
   );
 
-  const voiceEntries = Logger.getLogs().filter(entry => entry.component === 'voice');
-  const latestVoiceSuccess = voiceEntries.findLast(entry => entry.code === 'LIVE_SETUP_COMPLETED');
-  const latestVoiceFailure = voiceEntries.findLast(entry => {
-    if (entry.code === 'VOICE_REPLY_FALLBACK_SHOWN') return true;
-    if (entry.level !== 'ERROR') return false;
-    return /^(LIVE_|VOICE_(SESSION|MICROPHONE|PERMISSION|AUDIO|SOCKET|CONNECTION))/.test(String(entry.code || ''));
-  });
-  const failureIsCurrent = latestVoiceFailure
-    && (!latestVoiceSuccess || Date.parse(latestVoiceFailure.timestamp) > Date.parse(latestVoiceSuccess.timestamp))
-    && Date.now() - Date.parse(latestVoiceFailure.timestamp) < 30 * 60_000;
-  if (failureIsCurrent) {
-    addCheck(
-      'voice',
-      'error',
-      latestVoiceFailure.code === 'VOICE_REPLY_FALLBACK_SHOWN'
-        ? 'Une réponse vocale récente n’est pas arrivée après deux relances'
-        : `Dernière connexion vocale en échec (${latestVoiceFailure.code})`,
-      'DIAGNOSTIC_VOICE_RECENT_FAILURE'
-    );
-  } else if (latestVoiceSuccess) {
-    addCheck('voice', 'ok', 'Dernière connexion vocale établie', 'DIAGNOSTIC_VOICE_OK');
-  } else {
-    addCheck('voice', 'info', 'Aucune connexion vocale récente à évaluer', 'DIAGNOSTIC_VOICE_NOT_TESTED');
-  }
-
-  const operationalIssues = summarizeRecentOperationalIssues(Logger.getLogs());
-  addCheck(
-    'pageActions',
-    operationalIssues.blockedActionCount >= 2 ? 'error' : operationalIssues.blockedActionCount === 1 ? 'info' : 'ok',
-    operationalIssues.blockedActionCount >= 2
-      ? `${operationalIssues.blockedActionCount} actions bloquées ou échouées récemment`
-      : operationalIssues.blockedActionCount === 1
-        ? 'Une action a été bloquée récemment'
-        : 'Aucun blocage d’action récent',
-    operationalIssues.blockedActionCount >= 2 ? 'DIAGNOSTIC_ACTIONS_REPEATEDLY_BLOCKED' : 'DIAGNOSTIC_ACTIONS_STATE'
-  );
-  addCheck(
-    'oauthStability',
-    operationalIssues.popupChurn ? 'error' : operationalIssues.popupOpenedCount > 0 ? 'info' : 'ok',
-    operationalIssues.popupFlowStuck
-      ? 'Une fenêtre OAuth semble rester bloquée'
-      : operationalIssues.popupChurn
-        ? `${operationalIssues.popupOpenedCount} fenêtres OAuth détectées dans ${operationalIssues.popupClosedCount} cycle(s)`
-        : operationalIssues.popupOpenedCount > 0
-          ? 'Un cycle OAuth récent s’est terminé normalement'
-          : 'Aucune instabilité OAuth récente',
-    operationalIssues.popupChurn ? 'DIAGNOSTIC_OAUTH_POPUP_CHURN' : 'DIAGNOSTIC_OAUTH_STATE'
-  );
+  addCheck('voice', 'info', 'Connexion vocale non testée ; aucun microphone ouvert', 'DIAGNOSTIC_VOICE_NOT_TESTED');
+  addCheck('pageActions', 'info', 'Actions navigateur non exécutées par le diagnostic', 'DIAGNOSTIC_ACTIONS_NOT_TESTED');
 
   const failing = checks.filter(check => check.status === 'error');
   const probableCause = failing[0]?.detail || null;
