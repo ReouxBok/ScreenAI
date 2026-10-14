@@ -1,6 +1,6 @@
 # Migration de la recette E2E vers Deep Agent
 
-**État courant : 5 scénarios legacy restent dans `feature-flows.spec.js`.** Les sections suivantes retracent les couches de migration ; leurs anciens décomptes décrivent ces étapes, pas le total actuel. La suite globale et la qualification distante restent ouvertes.
+**État courant : 4 scénarios legacy restent dans `feature-flows.spec.js`.** Les sections suivantes retracent les couches de migration ; leurs anciens décomptes décrivent ces étapes, pas le total actuel. La suite globale et la qualification distante restent ouvertes.
 
 ## Audit du 14 octobre 2026
 
@@ -166,3 +166,11 @@ La même session combine champ « Instructions », clic sur un cercle SVG appart
 La finalisation utilise MediaRecorder et le SDK Blob empaquetés. Les octets envoyés sont décodables en WebM 320 × 180, les pistes audio/vidéo sont arrêtées, et le chemin ainsi que la confirmation sont liés à la session de démonstration. La confirmation précède `/complete`. Une réponse 503 dans le parcours successif affiche le bouton de reprise : avant le second clic, aucune complétion Studio ; après, confirmation identique, un seul transfert/finalisation Blob et une seule complétion Studio.
 
 Les deux parcours réussissent avec serveur et stockage simulés. La sélection OS, le microphone physique, un compte OAuth réel et la persistance Studio/Blob distante restent à qualifier. Le raccordement initial Studio utilise son token dans le corps de `/connect` ; les autres POST utilisent le Bearer correspondant. Aucun changement produit requis pour cette couche.
+
+## Évaluation vocale native d’un brouillon
+
+`limova-evaluation.spec.js` couvre désormais aussi le vrai panneau vocal, le microphone/worklet Chromium et la passerelle Socket.IO : même Charly, conversation d’évaluation isolée, code Studio dans `session.start`, cookie first-party et workspace vérifiés. Lecture, clic et relecture passent par le driver et les preuves natives, puis la réponse canonique déclenche la preuve de réponse. Le succès affiche le résultat Studio et restaure la conversation personnelle ; le clic reste unique et aucun POST de message texte n’est utilisé pour le tour vocal.
+
+Si Studio refuse la preuve de vérification, le verdict ne provoque aucune complétion et la conversation d’évaluation reste sélectionnée. Dans les deux cas, la voix est arrêtée et ne redémarre pas ; le code n’est pas persisté dans le stockage local. Les appels proxy/Gemini sont surveillés comme interdits.
+
+L’ancien scénario contributeur utilisant ADK et un token Gemini est remplacé par ces parcours et les quatre scénarios natifs texte/intervention déjà présents. Le contrat vocal est désormais la session Deep Agent, sans demande de token vocal legacy. Les serveurs API/Studio/provider et le calcul du score restent simulés : le test ne prouve pas une évaluation modèle ni une publication/review Studio réelle. L’exclusion staging liée aux permissions Studio production reste explicite.
