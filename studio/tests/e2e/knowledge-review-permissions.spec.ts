@@ -6,7 +6,7 @@ test("contact validates a SAV candidate without gaining publication or global ad
   const bundle = { schemaVersion: 1, namespace: "e2e-sav54", entries: [{ externalId: "format", title,
     document: { schemaVersion: 1, objective: title, applicability: "sav_only", locale: "fr-FR", prerequisites: [], expectedResult: "Format fictif choisi.", exceptions: [], escalation: "Demander une vérification humaine.",
       steps: [{ id: "format.choose", userLabel: "Format", objective: title, instruction: "Sélectionner le format de démonstration.", expectedResult: "Format fictif choisi.", escalation: "Demander une vérification humaine." }] },
-    provenance: { sources: [{ emailId: "fixture-sav54", url: "https://app.hubspot.com/contacts/1/email/123", date: "2026-10-01T10:00:00.000Z", ticketIds: [] }], validationNotes: ["Fixture synthétique uniquement."] },
+    provenance: { sources: [{ emailId: "123", url: "https://app.hubspot.com/contacts/1/email/123", date: "2026-10-01T10:00:00.000Z", ticketIds: [] }], validationNotes: ["Fixture synthétique uniquement."] },
   }] };
   await page.setExtraHTTPHeaders({ "x-studio-test-user": "ugo@limova.ai" });
   await page.goto("/studio/sav/connaissances");
