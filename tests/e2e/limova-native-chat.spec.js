@@ -214,3 +214,28 @@ for (const failure of [null, 'session', 'flag']) test(`native diagnostic downloa
   expect(legacy).toEqual([]);
   expect(errors).toEqual([]);
 });
+
+for (const [status, code] of [[503, 'LIMOVA_HTTP_5XX'], [429, 'LIMOVA_RATE_LIMITED']]) test(`native HTTP ${status} shows a stable support code without replaying an accepted message`, async ({ nativeChat }) => {
+  const { panel, state, calls, legacy, errors } = nativeChat;
+  state.messageFailure = status;
+  await panel.locator('#userInput').fill('PRIVATE_QUESTION_ACCEPTED_BEFORE_FAILURE');
+  await panel.locator('#sendBtn').click();
+  await expect(panel.locator('#limovaFeedback')).toContainText(code);
+  await expect(panel.locator('#limovaFeedback')).toContainText('historique');
+  await expect(panel.locator('#limovaFeedback')).not.toContainText('PRIVATE_SERVER_ERROR');
+  await expect(panel.locator('#sendBtn')).toBeEnabled();
+  await expect(panel.locator('#limovaCancel')).toBeHidden();
+  const downloadPromise = panel.waitForEvent('download');
+  await panel.locator('#downloadLogsBtn').click();
+  const stream = await (await downloadPromise).createReadStream();
+  let logs = '';
+  for await (const chunk of stream) logs += chunk.toString();
+  expect(logs).toContain(code);
+  expect(logs).not.toMatch(/PRIVATE_SERVER_ERROR|PRIVATE_QUESTION_ACCEPTED_BEFORE_FAILURE/);
+  state.messageFailure = undefined;
+  await panel.reload();
+  await expect(panel.locator('.message.user .message-content')).toHaveText('PRIVATE_QUESTION_ACCEPTED_BEFORE_FAILURE');
+  expect(calls.filter(call => call.path === `/message/${CONVERSATION}` && call.method === 'POST')).toHaveLength(1);
+  expect(legacy).toEqual([]);
+  expect(errors).toEqual([]);
+});

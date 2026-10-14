@@ -305,3 +305,13 @@ it('exports only the selected conversation, rejects duplicate exports and drops 
   panel.setVoiceBusy(true);
   expect(await panel.exportConversation()).toBeNull();
 });
+
+it.each(['LIMOVA_HTTP_5XX', 'LIMOVA_RATE_LIMITED'])('shows a stable %s code and asks to check history without resending', async code => {
+  const { panel, request } = setup({ LIMOVA_SEND_MESSAGE: () => ({ error: 'PRIVATE_SERVER_ERROR', code }) });
+  await panel.refresh();
+  expect(await panel.send('Demande')).toBe(false);
+  expect(element('limovaFeedback').textContent).toContain(code);
+  expect(element('limovaFeedback').textContent).toContain('historique');
+  expect(element('limovaFeedback').textContent).not.toContain('PRIVATE_SERVER_ERROR');
+  expect(request.mock.calls.filter(([input]) => input.type === 'LIMOVA_SEND_MESSAGE')).toHaveLength(1);
+});

@@ -478,17 +478,6 @@ test.describe('Packaged extension — complete user flows', () => {
 
 
 
-  test('a proxy failure exposes a stable support code instead of an opaque internal error', async ({ context, extensionId }) => {
-    const { sidebar } = await openExtensionHarness(context, extensionId, { geminiStatuses: [500] });
-    await grantAIConsent(sidebar);
-    await sidebar.locator('#userInput').fill('Déclenche une panne contrôlée');
-    await sidebar.locator('#sendBtn').click();
-
-    const error = sidebar.locator('.message.error .message-content').last();
-    await expect(error).toContainText('GEMINI_HTTP_5XX');
-    await expect(error).not.toContainText('An internal server error occurred');
-  });
-
   test('page guidance highlights only the exact control and ignores invented element IDs', async ({ context, extensionId }) => {
     const { calls, limova, sidebar } = await openExtensionHarness(context, extensionId, {
       geminiReply: ({ body }) => {

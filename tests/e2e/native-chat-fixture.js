@@ -64,6 +64,10 @@ export const test = base.extend({
         if (selected && url.pathname === `/message/${selected.id}/cancel` && request.method === 'POST') return json({ ok: true });
         if (selected && url.pathname === `/message/${selected.id}`) {
           const history = selected.history;
+          if (state.messageFailure) {
+            history.push({ id: `human-${history.length}`, role: 'user', content: body.content });
+            return json({ error: 'PRIVATE_SERVER_ERROR_DO_NOT_EXPOSE' }, state.messageFailure);
+          }
           if (request.headers['x-workspace-id'] !== WORKSPACE) return json({ error: 'workspace' }, 403);
           response.writeHead(201, { ...headers, 'content-type': 'text/event-stream' });
           if (!body.kind) {
