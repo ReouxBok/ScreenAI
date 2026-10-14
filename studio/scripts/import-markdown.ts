@@ -1,7 +1,7 @@
 import "dotenv/config";
 import { readFile, readdir } from "node:fs/promises";
 import path from "node:path";
-import matter from "gray-matter";
+import { parseMarkdownFrontmatter } from "../src/lib/markdown-frontmatter";
 import { eq } from "drizzle-orm";
 import { closeDb, requireDb } from "../src/db/client";
 import { categories, contentItems, contentVersions, testCases } from "../src/db/schema";
@@ -25,19 +25,22 @@ function categoryFor(slug: string, title: string) {
   return "bien-demarrer";
 }
 
+const files = (await readdir(SOURCE)).filter(file => file.endsWith(".md")).sort();
+if (files.length !== 106) throw new Error(`Expected 106 Markdown files, found ${files.length}`);
+const documents = await Promise.all(files.map(async file => {
+  const parsed = parseMarkdownFrontmatter(await readFile(path.join(SOURCE, file), "utf8"));
+  const sourceMetadata = JSON.parse(JSON.stringify(parsed.data)) as Record<string, unknown>;
+  return { file, parsed, sourceMetadata };
+}));
+
 await db.insert(categories).values(CATEGORIES.map(([slug,label],position)=>({slug,label,position}))).onConflictDoNothing();
 const categoryRows = await db.select().from(categories);
 const categoryMap = new Map(categoryRows.map(category => [category.slug, category.id]));
-const files = (await readdir(SOURCE)).filter(file => file.endsWith(".md")).sort();
-if (files.length !== 106) throw new Error(`Expected 106 Markdown files, found ${files.length}`);
 
 let imported = 0;
-for (const file of files) {
-  const raw = await readFile(path.join(SOURCE,file),"utf8");
-  const parsed = matter(raw);
+for (const { file, parsed, sourceMetadata } of documents) {
   const slug = String(parsed.data.slug ?? file.replace(/\.md$/, ""));
   const title = String(parsed.data.title ?? parsed.content.match(/^#\s+(.+)$/m)?.[1] ?? slug);
-  const sourceMetadata = JSON.parse(JSON.stringify(parsed.data)) as Record<string, unknown>;
   const [existing] = await db.select().from(contentItems).where(eq(contentItems.slug,slug)).limit(1);
   if (existing) continue;
   const categorySlug = categoryFor(slug,title);
