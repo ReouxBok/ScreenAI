@@ -7,8 +7,9 @@ const state = { authenticated: true, user: { id: 'u' }, context: { userId: 'u', 
 const element = id => document.getElementById(id);
 
 function setup(overrides = {}) {
-  const request = vi.fn(async ({ type }) => {
-    if (overrides[type]) return overrides[type]();
+  const request = vi.fn(async (input) => {
+    const { type } = input;
+    if (overrides[type]) return overrides[type](input);
     if (type === 'LIMOVA_GET_STATE') return state;
     if (type === 'LIMOVA_PREPARE_VOICE') return { context: state.context, conversationId: state.conversationId };
     if (type === 'LIMOVA_LIST_CONVERSATIONS') return { data: [{ id: 'c', title: 'Mon chat' }] };
@@ -24,7 +25,7 @@ function setup(overrides = {}) {
 beforeEach(() => {
   document.body.innerHTML = '<input id="limovaBrowser" type="checkbox">' + ['authPanel', 'limovaControls', 'authFeedback', 'limovaFeedback'].map(id => `<div id="${id}"></div>`).join('')
     + ['limovaWorkspace', 'limovaConversation'].map(id => `<select id="${id}"></select>`).join('')
-    + ['limovaLogin', 'limovaRefresh', 'limovaRefreshSession', 'limovaNew', 'limovaCancel', 'limovaResume'].map(id => `<button id="${id}"></button>`).join('');
+    + ['limovaMoreConversations', 'limovaOlderMessages', 'limovaLogin', 'limovaRefresh', 'limovaRefreshSession', 'limovaNew', 'limovaCancel', 'limovaResume'].map(id => `<button id="${id}"></button>`).join('');
 });
 
 describe('Limova panel session and turn boundaries', () => {
@@ -151,4 +152,80 @@ it('locks evaluation selection and obtains its voice grant without rendering it'
   expect(element('limovaNew').disabled).toBe(true);
   expect((await panel.prepareVoice()).evaluationCode).toBe(code);
   expect(JSON.stringify(render.mock.calls)).not.toContain(code);
+});
+
+
+it('paginates conversations without losing the selected chat or duplicating entries', async () => {
+  const { panel, request } = setup({ LIMOVA_LIST_CONVERSATIONS: ({ page }) => page === 1
+    ? { data: [{ id: 'a', title: 'First' }], pagination: { hasNext: true } }
+    : { data: [{ id: 'a', title: 'Renamed' }, { id: 'c', title: 'Current' }], pagination: { hasNext: false } } });
+  await panel.refresh();
+  expect(element('limovaConversation').value).toBe('c');
+  element('limovaMoreConversations').click();
+  await vi.waitFor(() => expect(element('limovaMoreConversations').hidden).toBe(true));
+  expect(request).toHaveBeenCalledWith({ type: 'LIMOVA_LIST_CONVERSATIONS', page: 2 });
+  expect([...element('limovaConversation').options].map(item => item.value)).toEqual(['', 'a', 'c']);
+  expect(element('limovaConversation').value).toBe('c');
+});
+
+it('prepends older messages and ignores duplicate clicks while loading', async () => {
+  let resolve;
+  const { panel, request, render } = setup({ LIMOVA_GET_MESSAGES: ({ cursor }) => cursor
+    ? new Promise(done => { resolve = done; })
+    : { data: [{ id: 'h', role: 'user', content: 'Recent' }], pagination: { hasMore: true, nextCursor: 'before-h' } } });
+  await panel.refresh();
+  element('limovaOlderMessages').click(); element('limovaOlderMessages').click();
+  expect(request.mock.calls.filter(([input]) => input.cursor).length).toBe(1);
+  resolve({ data: [{ id: 'old', role: 'user', content: 'Earlier' }, { id: 'h', role: 'user', content: 'Stale' }], pagination: { hasMore: false } });
+  await vi.waitFor(() => expect(element('limovaOlderMessages').hidden).toBe(true));
+  expect(render.mock.lastCall[0].messages.map(item => item.content)).toEqual(['Earlier', 'Recent']);
+});
+
+it('drops an older page when the user opens another conversation', async () => {
+  let resolve;
+  const { panel, render } = setup({
+    LIMOVA_GET_MESSAGES: ({ cursor }) => cursor ? new Promise(done => { resolve = done; })
+      : { data: [], pagination: { hasMore: true, nextCursor: 'old-cursor' } },
+    LIMOVA_OPEN_CONVERSATION: () => ({ conversation: { id: 'other' }, messages: { data: [{ id: 'new', role: 'user', content: 'Other chat' }] } }),
+  });
+  await panel.refresh(); element('limovaOlderMessages').click();
+  element('limovaConversation').append(new Option('Other', 'other'));
+  element('limovaConversation').value = 'other'; element('limovaConversation').dispatchEvent(new Event('change'));
+  await vi.waitFor(() => expect(render.mock.lastCall[0].messages[0]?.content).toBe('Other chat'));
+  resolve({ data: [{ id: 'secret', role: 'user', content: 'Old chat' }] });
+  await new Promise(done => setTimeout(done, 0));
+  expect(render.mock.lastCall[0].messages.map(item => item.content)).toEqual(['Other chat']);
+});
+
+
+it('keeps the older cursor available after a failed read and preserves it after a new answer', async () => {
+  let failures = 1;
+  const { panel, request } = setup({ LIMOVA_GET_MESSAGES: ({ cursor }) => {
+    if (cursor && failures-- > 0) throw new Error('Network unavailable');
+    if (cursor) return { data: [], pagination: { hasMore: true, nextCursor: 'earliest' } };
+    return { data: [], pagination: { hasMore: true, nextCursor: 'recent' } };
+  } });
+  await panel.refresh(); element('limovaOlderMessages').click();
+  await vi.waitFor(() => expect(element('limovaFeedback').textContent).toBe('Network unavailable'));
+  expect(element('limovaOlderMessages').hidden).toBe(false);
+  element('limovaOlderMessages').click();
+  await vi.waitFor(() => expect(element('limovaOlderMessages').disabled).toBe(false));
+  await panel.send('New question');
+  element('limovaOlderMessages').click();
+  await vi.waitFor(() => expect(request).toHaveBeenCalledWith({ type: 'LIMOVA_GET_MESSAGES', cursor: 'earliest' }));
+});
+
+
+it('releases pagination after refreshing while an older request is pending', async () => {
+  let resolve;
+  const { panel, render } = setup({ LIMOVA_GET_MESSAGES: ({ cursor }) => cursor
+    ? new Promise(done => { resolve = done; })
+    : { data: [], pagination: { hasMore: true, nextCursor: 'older' } } });
+  await panel.refresh(); element('limovaOlderMessages').click();
+  expect(element('limovaOlderMessages').disabled).toBe(true);
+  await panel.refresh();
+  expect(element('limovaOlderMessages').disabled).toBe(false);
+  resolve({ data: [{ id: 'late', role: 'user', content: 'Discarded' }] });
+  await new Promise(done => setTimeout(done, 0));
+  expect(render.mock.lastCall[0].messages).toEqual([]);
 });

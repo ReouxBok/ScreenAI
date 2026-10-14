@@ -45,7 +45,9 @@ export function createConversationView() {
 
   return {
     reset() { messages.clear(); files.clear(); sealed.clear(); error = null; },
-    history(page) {
+    history(page, { prepend = false } = {}) {
+      const recent = prepend ? [...messages.entries()] : null;
+      if (prepend) messages.clear();
       const items = Array.isArray(page?.data) ? page.data : [];
       items.forEach(message => {
         replace(message);
@@ -53,6 +55,7 @@ export function createConversationView() {
         addFiles(message.generatedFiles);
         addFiles(message.generatedImages);
       });
+      if (recent) recent.forEach(([id, message]) => messages.set(id, message));
       addFiles(page?.unanchoredGeneratedFiles);
     },
     event(frame) {

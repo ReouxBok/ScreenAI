@@ -263,7 +263,7 @@ async function refreshAuthenticationState() {
   await limovaPanel.refresh();
 }
 
-function renderLimovaConversation(snapshot) {
+function renderLimovaConversation(snapshot, { showOlder = false } = {}) {
   elements.chatContainer.replaceChildren();
   lastMessageSender = null;
   hidePondering();
@@ -278,8 +278,9 @@ function renderLimovaConversation(snapshot) {
     link.className = 'message generated-file';
     elements.chatContainer.append(link);
   });
-  if (snapshot.error) addMessage('error', snapshot.error);
-  scrollToBottom();
+  if (snapshot.error) addMessage('error', snapshot.error, { skipScroll: showOlder });
+  if (showOlder) elements.chatContainer.scrollTop = 0;
+  else scrollToBottom();
 }
 
 async function loadInitialState() {
