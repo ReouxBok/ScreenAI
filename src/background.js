@@ -485,7 +485,7 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
 });
 
 const CONTENT_SCRIPT_MESSAGE_TYPES = new Set([
-  'GET_SESSION_STATE', 'MODAL_DETECTED', 'TRAINING_EVENT', 'LIMOVA_PROFILE', 'USER_PAGE_INTERACTION'
+  'GET_SESSION_STATE', 'MODAL_DETECTED', 'TRAINING_EVENT', 'LIMOVA_PROFILE', 'USER_PAGE_INTERACTION', 'EVALUATION_MANUAL_INTERVENTION'
 ]);
 
 function isTrustedMessageSource(request, sender) {
@@ -575,7 +575,24 @@ async function handleMessage(request, sender) {
       return syncLimovaProfile(request.profile);
 
     case 'GET_SESSION_STATE':
-      return { active: sessionState.isActive, training: trainingState.active };
+      return { active: sessionState.isActive, training: trainingState.active,
+        evaluationRunId: evaluationState.active && sender?.tab?.id === sessionState.lockedTabId ? evaluationState.run?.id : null };
+
+    case 'EVALUATION_MANUAL_INTERVENTION': {
+      if (!evaluationState.active || request.runId !== evaluationState.run?.id
+        || sender?.tab?.id !== sessionState.lockedTabId || sender.frameId !== 0)
+        return { ok: false };
+      if (!evaluationState.manualEvidence) {
+        const token = evaluationState.token;
+        evaluationState.manualEvidence = evaluationFetch('events', { token, body: {
+          kind: 'manual_intervention', status: 'unexpected', manualIntervention: true
+        } }).then(response => {
+          if (!response?.ok) throw new Error('Intervention manuelle non enregistrée dans Studio.');
+        });
+      }
+      await evaluationState.manualEvidence;
+      return { ok: true };
+    }
 
     case 'GET_SETTINGS':
       return { hasApiKey: true }; // Keys are on the proxy server
@@ -982,6 +999,11 @@ async function startEvaluation(rawToken) {
   sessionState.remoteSessionId = null;
   sessionState.isActive = true;
   lockTab(tab.id, { activateAssistant: true });
+  const observation = await sendContentMessage(tab.id, { type: 'EVALUATION_OBSERVATION', runId: data.run?.id }).catch(() => null);
+  if (!observation?.ok) {
+    await cancelEvaluation();
+    throw new Error('Observation du test indisponible.');
+  }
   await chrome.storage.session.remove('charly_evaluation_active');
   scheduleSave();
   Logger.event('evaluation', 'REAL_EVALUATION_STARTED', { runId: data.run?.id || null, caseKind: data.case?.kind || null });
@@ -1022,22 +1044,34 @@ async function completeEvaluationRun(verdict) {
   evaluationState.completing = true;
   try {
     await limovaBackground.handle({ type: 'LIMOVA_CANCEL' });
+    const observation = await sendContentMessage(sessionState.lockedTabId, {
+      type: 'FLUSH_EVALUATION_OBSERVATION', runId: evaluationState.run?.id
+    });
+    if (!observation?.ok) throw new Error('Preuve d’intervention manuelle indisponible.');
+    await evaluationState.manualEvidence;
     await limovaBackground.handle({ type: 'LIMOVA_FLUSH_EVALUATION' });
     const response = await evaluationFetch('complete', { body: { verdict } });
     const data = await response?.json().catch(() => ({}));
     if (!response?.ok) return { ok: false, error: data?.error || 'Le résultat n’a pas pu être transmis.' };
     await limovaBackground.handle({ type: 'LIMOVA_END_EVALUATION' }).catch(() => {});
     Logger.event('evaluation', data.run?.status === 'passed' ? 'REAL_EVALUATION_PASSED' : 'REAL_EVALUATION_FAILED', { runId: evaluationState.run?.id || null, score: data.run?.score ?? null });
+    await sendContentMessage(sessionState.lockedTabId, { type: 'EVALUATION_OBSERVATION', runId: null }).catch(() => {});
     evaluationState = { active: false, token: null, run: null, testCase: null, content: null };
     await chrome.storage.session.remove('charly_evaluation_active');
     sessionState.conversationHistory = [];
     sessionState.remoteSessionId = null;
     scheduleSave();
     return { ok: true, run: data.run, suite: data.suite };
-  } finally { evaluationState.completing = false; }
+  } finally {
+    evaluationState.completing = false;
+    if (evaluationState.active) await sendContentMessage(sessionState.lockedTabId, {
+      type: 'EVALUATION_OBSERVATION', runId: evaluationState.run?.id
+    }).catch(() => {});
+  }
 }
 
 async function cancelEvaluation() {
+  await sendContentMessage(sessionState.lockedTabId, { type: 'EVALUATION_OBSERVATION', runId: null }).catch(() => {});
   await limovaBackground.handle({ type: 'LIMOVA_END_EVALUATION' }).catch(() => {});
   evaluationState = { active: false, token: null, run: null, testCase: null, content: null };
   await chrome.storage.session.remove('charly_evaluation_active');
@@ -3284,16 +3318,7 @@ async function getFreshVoiceContext(parentOperationId = null, { capture = false 
 
 async function handleUserPageInteraction(rawInteraction, sender) {
   if (nativeVoiceSessionActive) return { ok: true, ignored: true };
-  if (evaluationState.active) {
-    await recordEvaluationEvent({
-      kind: 'manual_intervention',
-      status: 'unexpected',
-      path: sender?.tab?.url,
-      targetLabel: String(rawInteraction?.label || '').slice(0, 160),
-      manualIntervention: true,
-      contextVersion: pageContextVersion
-    });
-  }
+  if (evaluationState.active) return { ok: true, ignored: true };
   if ((!sessionState.isActive && !voiceSessionActive) || trainingState.active) return { ok: true, ignored: true };
   const tabId = sender?.tab?.id;
   if (!tabId || (sessionState.lockedTabId && tabId !== sessionState.lockedTabId)) {

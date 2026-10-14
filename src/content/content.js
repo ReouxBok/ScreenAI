@@ -4,6 +4,31 @@
  *          and DOM context extraction.
  */
 
+let evaluationObservationRun = null;
+let evaluationObservationEnabled = false;
+let evaluationObservationPending = null;
+
+function setEvaluationObservation(runId) {
+  evaluationObservationEnabled = Boolean(runId);
+  if (evaluationObservationRun === runId) return;
+  evaluationObservationRun = runId;
+  evaluationObservationPending = null;
+}
+
+function captureEvaluationIntervention(event) {
+  if (!evaluationObservationEnabled || !evaluationObservationRun || evaluationObservationPending || !event.isTrusted) return;
+  if (event.type === 'keydown' && ['Shift', 'Control', 'Alt', 'Meta', 'Tab', 'Escape'].includes(event.key)) return;
+  evaluationObservationPending = chrome.runtime.sendMessage({
+    type: 'EVALUATION_MANUAL_INTERVENTION', runId: evaluationObservationRun
+  }).then(result => {
+    if (!result?.ok) throw new Error('Intervention non enregistrée.');
+  });
+  evaluationObservationPending.catch(() => {});
+}
+
+for (const type of ['pointerdown', 'keydown', 'wheel'])
+  document.addEventListener(type, captureEvaluationIntervention, { capture: true, passive: true });
+
 let trainingCaptureActive = false;
 let assistantSessionActive = false;
 let assistantInteractionCaptureActive = false;
@@ -114,6 +139,22 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
   if (request.type === 'CLEAR_VISUAL_CAPTURE') {
     clearVisualCaptureOverlays();
     sendResponse({ ok: true });
+  }
+
+  if (request.type === 'EVALUATION_OBSERVATION') {
+    setEvaluationObservation(request.runId || null);
+    sendResponse({ ok: true });
+  }
+  if (request.type === 'FLUSH_EVALUATION_OBSERVATION') {
+    if (request.runId !== evaluationObservationRun) {
+      sendResponse({ ok: false });
+      return;
+    }
+    evaluationObservationEnabled = false;
+    Promise.resolve(evaluationObservationPending).then(
+      () => sendResponse({ ok: true }), () => sendResponse({ ok: false })
+    );
+    return true;
   }
 
   if (request.type === 'SESSION_STATE') {
@@ -891,6 +932,7 @@ function findElementByText(searchText) {
 // ============================================================================
 
 chrome.runtime.sendMessage({ type: 'GET_SESSION_STATE' }).then(response => {
+  setEvaluationObservation(response?.evaluationRunId || null);
   assistantSessionActive = response?.active === true;
   setTrainingCapture(response?.training === true);
   refreshModalObserver();

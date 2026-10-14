@@ -13,7 +13,10 @@ const USER = id(1), WORKSPACE = id(2), AGENT = id(3), PERSONAL = id(4), EVALUATI
 const CODE = 'local-studio-evaluation-fixture-code';
 const frame = (event, data) => `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
 
-for (const verificationUnavailable of [false, true]) test(`Studio native evaluation ${verificationUnavailable ? 'blocks verdict when evidence delivery fails' : 'executes and records evidence before verdict'}`, async () => {
+for (const scenario of ['success', 'verification_failure', 'manual_voice', 'manual_delivery_failure']) test(`Studio native evaluation ${scenario}`, async () => {
+  const verificationUnavailable = scenario === 'verification_failure';
+  const manual = scenario.startsWith('manual_');
+  const manualUnavailable = scenario === 'manual_delivery_failure';
   test.skip(environment.name === 'staging', 'Staging intentionally has no production Studio permission.');
   const directory = await mkdtemp(path.join(tmpdir(), 'limova-evaluation-test-'));
   const key = path.join(directory, 'key.pem'), cert = path.join(directory, 'cert.pem');
@@ -32,12 +35,12 @@ for (const verificationUnavailable of [false, true]) test(`Studio native evaluat
       if (request.headers.host === 'studio.limova.ai') {
         if (request.headers.authorization !== `Bearer ${CODE}`) return json({ error: 'grant' }, 403);
         if (request.url.endsWith('/connect')) return json({ run: { id: TURN }, case: { kind: 'live_action', title: 'Connect', prompt: 'Connect the integration' }, content: { id: AGENT, title: 'Connection', versionId: TURN } });
-        if (request.url.endsWith('/events')) { evidence.push(body); return json({ ok: !verificationUnavailable }, verificationUnavailable && body.kind === 'native_verification' ? 503 : 200); }
+        if (request.url.endsWith('/events')) { evidence.push(body); return json({ ok: !verificationUnavailable }, (verificationUnavailable && body.kind === 'native_verification') || (manualUnavailable && body.kind === 'manual_intervention') ? 503 : 200); }
         if (request.url.endsWith('/complete')) {
           completionRequests += 1;
           completed = evidence.some(item => item.kind === 'native_verification' && item.observation.text.includes('Connection status: Connected'))
             && evidence.some(item => item.kind === 'response' && item.status === 'ok');
-          return json({ run: { status: completed ? 'passed' : 'failed', score: completed ? 100 : 0 }, suite: {} });
+          return json({ run: { status: completed && !evidence.some(item => item.manualIntervention) ? 'passed' : 'failed', score: completed ? 100 : 0 }, suite: {} });
         }
         return json({ error: 'route' }, 404);
       }
@@ -110,8 +113,22 @@ for (const verificationUnavailable of [false, true]) test(`Studio native evaluat
     await expect(panel.locator('#sendBtn')).toBeEnabled();
     expect(await app.evaluate(() => window.clicks)).toBe(1);
     expect(evidence.some(item => item.kind === 'native_verification' && item.observation.text.includes('Connection status: Connected'))).toBe(true);
+    expect(evidence.some(item => item.manualIntervention)).toBe(false);
+    if (manual) {
+      await panel.evaluate(() => chrome.runtime.sendMessage({ type: 'VOICE_SESSION_STATE', active: true, engine: 'deep_agents' }));
+      expect(await panel.evaluate(runId => chrome.runtime.sendMessage({ type: 'EVALUATION_MANUAL_INTERVENTION', runId }), TURN)).toEqual({ ok: false });
+      expect(evidence.some(item => item.manualIntervention)).toBe(false);
+      await app.locator('#connect').click();
+      await app.locator('#connect').click();
+      await expect.poll(() => evidence.filter(item => item.manualIntervention).length).toBe(1);
+      expect(evidence.find(item => item.manualIntervention)).toEqual({ kind: 'manual_intervention', status: 'unexpected', manualIntervention: true });
+    }
     await panel.evaluate(() => document.getElementById('evaluationCorrect').click());
-    if (verificationUnavailable) {
+    if (manualUnavailable) {
+      await expect(panel.locator('#evaluationFeedback')).toContainText('intervention manuelle');
+      expect(completionRequests).toBe(0);
+      await expect(panel.locator('#limovaConversation')).toHaveValue(EVALUATION);
+    } else if (verificationUnavailable) {
       await expect(panel.locator('#evaluationFeedback')).toContainText('preuve d’exécution');
       expect(completionRequests).toBe(0);
       expect(evidence.some(item => item.kind === 'response')).toBe(false);
@@ -119,6 +136,7 @@ for (const verificationUnavailable of [false, true]) test(`Studio native evaluat
     } else {
       await expect.poll(() => completed).toBe(true);
       await expect(panel.locator('#limovaConversation')).toHaveValue(PERSONAL);
+      if (manual) await expect(panel.locator('#evaluationFeedback')).toContainText(/échou|Échou|failed|corriger/i);
     }
     expect(mutations[0]).toMatchObject({ code: CODE, body: { botAgentId: AGENT, engine: 'deep_agents', type: 'general' } });
     expect(mutations.every(item => item.code === CODE && !JSON.stringify(item.body).includes(CODE))).toBe(true);

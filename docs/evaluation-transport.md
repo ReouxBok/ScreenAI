@@ -87,3 +87,12 @@ Qualification locale : 26 tests passent, dont deux tests contre un PostgreSQL 16
 Deux scénarios passent : succès du transport complet et refus de la vérification par Studio. Dans ce dernier cas, aucune requête de verdict ne part. Le code reste absent du corps des messages et des stockages local/session, et aucun appel aux anciens endpoints copilot/live-session n’est observé.
 
 L’API, Studio et le modèle sont simulés dans ce test ; seul le navigateur et le code de l’extension s’exécutent réellement. Le paquet staging est explicitement exclu de cette fixture car il n’autorise pas le Studio de production. Ce résultat ne remplace pas la qualification des services déployés.
+
+
+## Interventions manuelles pendant les évaluations natives
+
+Une observation dédiée au run détecte les événements humains `pointerdown`, `keydown` (hors touches de contrôle seules, Tab et Escape) et `wheel` dans le document Limova ciblé. Elle reste active lorsque la voix native désactive l’ancien observateur. Aucun texte saisi, label ou URL n’est transmis ; les événements synthétiques et les scrolls programmatiques ne sont pas assimilés à une intervention humaine. La première preuve suffit à rendre le test non réussi ; elle est dédupliquée dans le document et le worker.
+
+Le worker exige le run actif, l’onglet verrouillé et le frame principal. Un appel provenant du panneau ne peut pas fabriquer cette preuve. La clôture suspend l’observation et attend l’acquittement de la preuve en cours, ainsi que la promesse retenue par le worker. Un refus Studio demeure bloquant ; un échec de clôture réactive l’observation. Navigation/rechargement récupèrent le run autorisé via l’état de session ; aucune preuve ni grant n’est écrit dans le stockage du content script.
+
+Limite de ce lot : observation du document principal Limova actuellement utilisé par le parcours d’évaluation, pas de couverture revendiquée des iframes, menus natifs du navigateur ou sites tiers. Le test vocal active l’état natif mais n’ouvre pas un vrai fournisseur audio. Les scénarios Chromium utilisent toujours Studio/API simulés ; le calcul de verdict réel reste couvert séparément par les tests Studio.
