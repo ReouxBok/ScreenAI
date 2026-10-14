@@ -31,7 +31,8 @@ test("contact validates a SAV candidate without gaining publication or global ad
   await card.getByText("Lire la connaissance et ses limites", { exact: true }).click();
   await expect(card.getByText(/Revu par contact@limova.ai/)).toBeVisible();
   await card.getByRole("link", { name: "Ouvrir la projection existante →", exact: true }).click();
-  await expect(page.getByText("À valider", { exact: true }).first()).toBeVisible();
+  await expect(page).toHaveURL(/\/studio\/contenus\/[0-9a-f-]+$/, { timeout: 30_000 });
+  await expect(page.getByRole("region", { name: "Gestion du contenu", exact: true }).getByText("À valider", { exact: true })).toBeVisible();
   await expect(page.getByRole("button", { name: "Valider et publier", exact: true })).toHaveCount(0);
   const result = await request.post("/api/internal/knowledge/search", {
     headers: { Authorization: "Bearer e2e-service-token-that-is-at-least-32-characters" },
