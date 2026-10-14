@@ -953,8 +953,12 @@ body {
   color: var(--color-white);
 }
 
-/* Next step fallback link */
+/* Conversation continuation */
 .next-step-link {
+  background: none;
+  border: 0;
+  padding: 0;
+  font-family: inherit;
   display: block;
   margin-top: 6px;
   margin-left: 2px;
@@ -964,7 +968,12 @@ body {
   cursor: pointer;
 }
 
-.next-step-link:hover {
+.next-step-link:disabled {
+  cursor: default;
+  opacity: 0.5;
+}
+
+.next-step-link:hover:not(:disabled) {
   color: var(--color-gray-700);
   text-decoration: underline;
 }

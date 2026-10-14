@@ -222,6 +222,7 @@ export function createLimovaPanel({ document, request, render, onBusy, onContext
   listen('limovaNew', 'click', create);
   listen('limovaCancel', 'click', () => { onContextChange(); return call('LIMOVA_CANCEL'); });
   return { refresh, send, create, handle,
+    nextStep() { return send(translate('limovaNextStepPrompt', 'Guide-moi pour la prochaine étape en tenant compte de notre conversation.')); },
     analyzePage() { return send(translate('limovaAnalyzePrompt', 'Analyse la page active et explique ce que tu observes. Utilise une capture si nécessaire. Ne clique pas, ne saisis rien et ne navigue pas.'), false, true); },
     relocalize() {
       const workspace = element('limovaWorkspace');

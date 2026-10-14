@@ -32,7 +32,7 @@ test('mounts the Limova session panel and renders the existing Charly history', 
       if (request.type === 'LIMOVA_OPEN_GENERATED_FILE') { window.openedGeneratedFile = request; return { ok: true }; }
       if (request.type === 'GET_PRIVACY_STATE') return { aiProcessing: true };
       if (request.type === 'LIMOVA_SEND_MESSAGE') { window.analysisRequest = request; return { ok: true }; }
-      if (request.type === 'ANALYZE_PAGE') throw new Error('Legacy analysis called');
+      if (request.type === 'ANALYZE_PAGE' || request.type === 'NEXT_STEP') throw new Error('Legacy analysis called');
       if (request.type === 'GET_STATE') return { capabilities: {}, training: null, evaluation: null };
       return original(request);
     };
@@ -43,7 +43,8 @@ test('mounts the Limova session panel and renders the existing Charly history', 
   await expect(page.locator('#limovaWorkspace')).toHaveValue('workspace');
   await expect(page.locator('#chatContainer')).toContainText('je retrouve ta conversation Limova');
   await expect(page.locator('#authEmailForm')).toHaveCount(0);
-  await expect(page.locator('.next-step-link')).toHaveCount(0);
+  await expect(page.locator('.next-step-link')).toHaveCount(1);
+  await expect(page.locator('.next-step-link')).toHaveAttribute('type', 'button');
   await expect(page.locator('.generated-file')).toHaveCount(3);
   await expect(page.locator('.generated-caption')).toHaveText('<script>window.unsafeCaption=true</script>');
   expect(await page.evaluate(() => window.unsafeCaption)).toBeUndefined();
@@ -79,6 +80,9 @@ test('mounts the Limova session panel and renders the existing Charly history', 
     expect(await page.evaluate(() => window.nativeRequests.length)).toBe(requestCount);
   }
   await page.locator('#limovaBrowser').uncheck();
+  await page.locator('.next-step-link').click();
+  await expect.poll(() => page.evaluate(() => window.analysisRequest)).toMatchObject({ type: 'LIMOVA_SEND_MESSAGE', browser: false });
+  expect(await page.evaluate(() => window.analysisRequest.browserMode)).toBeUndefined();
   await page.locator('#screenshotBtn').click();
   await expect.poll(() => page.evaluate(() => window.analysisRequest)).toMatchObject({ type: 'LIMOVA_SEND_MESSAGE', browser: true, browserMode: 'observe' });
   await expect(page.locator('#limovaBrowser')).not.toBeChecked();

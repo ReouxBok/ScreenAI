@@ -253,3 +253,31 @@ it('relocalizes selectors without interrupting an active native voice session', 
    await panel.analyzePage();
    expect(request).not.toHaveBeenCalled();
  });
+
+ it('continues the selected conversation and honors per-turn browser consent', async () => {
+   const { panel, request } = setup();
+   await panel.refresh();
+   await panel.nextStep();
+   expect(request).toHaveBeenCalledWith({ type: 'LIMOVA_SEND_MESSAGE', text: 'Guide-moi pour la prochaine étape en tenant compte de notre conversation.', browser: false });
+   expect(request.mock.calls.some(([input]) => input.type === 'LIMOVA_CREATE_CONVERSATION')).toBe(false);
+   element('limovaBrowser').checked = true;
+   await panel.nextStep();
+   expect(request).toHaveBeenCalledWith(expect.objectContaining({ type: 'LIMOVA_SEND_MESSAGE', browser: true }));
+   expect(element('limovaBrowser').checked).toBe(false);
+   request.mockClear();
+   panel.setVoiceBusy(true);
+   await panel.nextStep();
+   expect(request).not.toHaveBeenCalled();
+ });
+
+it('does not send a second next-step message while the first is pending', async () => {
+  let finish;
+  const pending = new Promise(resolve => { finish = resolve; });
+  const { panel, request } = setup({ LIMOVA_SEND_MESSAGE: () => pending });
+  await panel.refresh();
+  const first = panel.nextStep();
+  await panel.nextStep();
+  expect(request.mock.calls.filter(([input]) => input.type === 'LIMOVA_SEND_MESSAGE')).toHaveLength(1);
+  finish({ ok: true });
+  await first;
+});

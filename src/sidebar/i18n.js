@@ -13,6 +13,7 @@ const LANG_LABELS = { fr: 'Français', en: 'English', es: 'Español' };
 
 const translations = {
   fr: {
+    limovaNextStepPrompt: 'Guide-moi pour la prochaine étape en tenant compte de notre conversation.',
     limovaAnalyzePrompt: "Analyse la page active et explique ce que tu observes. Utilise une capture si nécessaire. Ne clique pas, ne saisis rien et ne navigue pas.",
     limovaSiteReview: "Vérifie le site, puis clique sur « Autoriser ce site ».",
     limovaSitePaste: "Colle l’adresse HTTPS du site à autoriser.",
@@ -133,6 +134,7 @@ const translations = {
     actionFailed: 'L’action n’a pas pu être exécutée.'
   },
   en: {
+    limovaNextStepPrompt: 'Guide me through the next step based on our conversation.',
     limovaAnalyzePrompt: "Analyze the active page and explain what you observe. Use a screenshot if needed. Do not click, type or navigate.",
     limovaSiteReview: "Check the website, then click “Allow this website”.",
     limovaSitePaste: "Paste the HTTPS address of the website to allow.",
@@ -253,6 +255,7 @@ const translations = {
     actionFailed: 'The action could not be completed.'
   },
   es: {
+    limovaNextStepPrompt: 'Guíame en el siguiente paso teniendo en cuenta nuestra conversación.',
     limovaAnalyzePrompt: "Analiza la página activa y explica lo que observas. Usa una captura si es necesario. No hagas clic, no escribas ni navegues.",
     limovaSiteReview: "Revisa el sitio y pulsa «Autorizar este sitio».",
     limovaSitePaste: "Pega la dirección HTTPS del sitio que quieras autorizar.",

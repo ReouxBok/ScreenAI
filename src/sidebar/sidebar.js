@@ -100,7 +100,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     translate: key => t(key),
     onContextChange: () => { if (voiceSession?.native) voiceSession.stop(); },
     request: request => chrome.runtime.sendMessage(request),
-    onBusy: busy => { isLoading = busy; elements.sendBtn.disabled = busy; elements.screenshotBtn.disabled = busy; },
+    onBusy: busy => { isLoading = busy; elements.sendBtn.disabled = busy; elements.screenshotBtn.disabled = busy; elements.chatContainer.querySelectorAll('.next-step-link').forEach(button => { button.disabled = busy; }); },
     render: renderLimovaConversation,
   });
   initEventListeners();
@@ -303,6 +303,7 @@ function renderLimovaConversation(snapshot, { showOlder = false } = {}) {
   });
   snapshot.files.filter(file => !shownFiles.has(file.id)).forEach(appendFile);
   if (snapshot.error) addMessage('error', snapshot.error, { skipScroll: showOlder });
+  else if (snapshot.messages.at(-1)?.role === 'assistant') appendNextStepButton();
   if (showOlder) elements.chatContainer.scrollTop = 0;
   else scrollToBottom();
 }
@@ -809,16 +810,20 @@ function addMessage(role, content, options = {}) {
   msgDiv.appendChild(contentDiv);
   elements.chatContainer.appendChild(msgDiv);
 
-  if (role === 'assistant' && options.nextStep !== false) {
-    removeNextStepLinks();
-    const link = document.createElement('a');
-    link.className = 'next-step-link';
-    link.href = '#';
-    link.textContent = t('nextStep');
-    elements.chatContainer.appendChild(link);
-  }
+  if (role === 'assistant' && options.nextStep !== false) appendNextStepButton();
 
   if (!options.skipScroll) scrollToBottom();
+}
+
+function appendNextStepButton() {
+  removeNextStepLinks();
+  const button = document.createElement('button');
+  button.type = 'button';
+  button.className = 'next-step-link';
+  button.dataset.i18n = 'nextStep';
+  button.textContent = t('nextStep');
+  button.disabled = isLoading || trainingCaptureActive;
+  elements.chatContainer.appendChild(button);
 }
 
 function removeNextStepLinks() {
@@ -998,14 +1003,10 @@ async function analyzePage() {
   await limovaPanel.analyzePage();
 }
 
-function sendNextStepRequest() {
-  hideWelcomeScreen();
-  showPondering();
-  updateStatus('analyzing');
-  chrome.runtime.sendMessage({ type: 'NEXT_STEP' }).catch(() => {
-    hidePondering();
-    updateStatus('ready');
-  });
+async function sendNextStepRequest() {
+  if (trainingCaptureActive || isLoading) return;
+  if (!(await ensureAIConsent())) return;
+  await limovaPanel.nextStep();
 }
 
 async function requestVoiceMicrophone() {
