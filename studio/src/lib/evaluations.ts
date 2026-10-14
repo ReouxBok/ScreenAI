@@ -1,5 +1,7 @@
 import "server-only";
 
+import { readOrderedEvaluationEvidence } from "./evaluation-evidence-order";
+
 import { createHash, randomBytes } from "node:crypto";
 import { and, asc, desc, eq, lt, max, ne } from "drizzle-orm";
 import { requireDb } from "@/db";
@@ -190,6 +192,8 @@ export async function appendEvaluationEvent(token: string, raw: Record<string, u
   const allowedStatus = ["ok", "not_found", "ambiguous", "blocked", "unexpected", "failed"];
   const db = requireDb();
   return db.transaction(async (tx) => {
+    const [locked] = await tx.select().from(evaluationRuns).where(eq(evaluationRuns.id, detail.run.id)).for("update");
+    if (!locked || locked.status !== "running" || locked.expiresAt.getTime() <= Date.now()) return null;
     const [{ lastOrdinal }] = await tx.select({ lastOrdinal: max(evaluationEvents.ordinal) }).from(evaluationEvents).where(eq(evaluationEvents.runId, detail.run.id));
     const [event] = await tx.insert(evaluationEvents).values({
       runId: detail.run.id,
@@ -231,23 +235,25 @@ export async function completeEvaluation(token: string, verdict: "correct" | "pr
   const detail = await findEvaluationByToken(token);
   if (!detail || detail.run.status !== "running") return null;
   const db = requireDb();
-  const events = await db.select().from(evaluationEvents).where(eq(evaluationEvents.runId, detail.run.id)).orderBy(asc(evaluationEvents.ordinal));
-  const failed = events.some((event) => ["failed", "blocked", "unexpected"].includes(event.status ?? ""));
-  const manual = events.some((event) => event.technicalMetadata.manualIntervention === true);
-  const delivered = events.some((event) => event.kind === "response" && event.status === "ok");
-  const actionSucceeded = events.some((event) => ["click_element", "fill_field", "navigate_internal", "scroll_page"].includes(event.toolName ?? "") && event.status === "ok");
-  const verified = events.some((event) => event.toolName === "verify_expected_result" && event.status === "ok");
-  const isLive = detail.testCase.kind === "live_action";
-  const result = scoreEvaluation({ isLive, delivered, actionSucceeded, verified, failed, manual, verdict, threshold: detail.suite.threshold });
-  const [run] = await db.update(evaluationRuns).set({
-    status: result.passed ? "passed" : "failed",
-    score: result.score,
-    contributorVerdict: verdict,
-    failureCode: result.failureCode,
-    promptRevision: safeText(promptRevision, 160),
-    knowledgeRevision: safeText(knowledgeRevision, 160),
-    completedAt: new Date(),
-  }).where(eq(evaluationRuns.id, detail.run.id)).returning();
+  const run = await db.transaction(async (tx) => {
+    const [locked] = await tx.select().from(evaluationRuns).where(eq(evaluationRuns.id, detail.run.id)).for("update");
+    if (!locked || locked.status !== "running" || locked.expiresAt.getTime() <= Date.now()) return null;
+    const events = await tx.select().from(evaluationEvents).where(eq(evaluationEvents.runId, detail.run.id)).orderBy(asc(evaluationEvents.ordinal));
+    const { failed, manual, delivered, actionSucceeded, verified } = readOrderedEvaluationEvidence(events);
+    const isLive = detail.testCase.kind === "live_action";
+    const result = scoreEvaluation({ isLive, delivered, actionSucceeded, verified, failed, manual, verdict, threshold: detail.suite.threshold });
+    const [completed] = await tx.update(evaluationRuns).set({
+      status: result.passed ? "passed" : "failed",
+      score: result.score,
+      contributorVerdict: verdict,
+      failureCode: result.failureCode,
+      promptRevision: safeText(promptRevision, 160),
+      knowledgeRevision: safeText(knowledgeRevision, 160),
+      completedAt: new Date(),
+    }).where(eq(evaluationRuns.id, detail.run.id)).returning();
+    return completed;
+  });
+  if (!run) return null;
   const suite = await refreshSuite(detail.suite.id);
   return { run, suite };
 }
