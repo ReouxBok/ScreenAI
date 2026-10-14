@@ -33,6 +33,8 @@ test('durable receipts survive closing the database and do not repeat execution'
   expect(result.executed).toBe(1);
   expect(result.recovered).toEqual(result.receipt);
   expect(result.receipt.result.observation).toBe('Clicked once');
+  expect(Number.isFinite(Date.parse(result.receipt.observedAt))).toBe(true);
+  expect(result.recovered.observedAt).toBe(result.receipt.observedAt);
 });
 
 test('atomic claims across independent connections allow only one action', async ({ context, extensionId }) => {

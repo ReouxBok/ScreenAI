@@ -338,3 +338,27 @@ it('binds canonical voice evidence to the active evaluation and deduplicates its
   await f.background.handle({ type: 'LIMOVA_END_EVALUATION' });
   await expect(f.background.handle(request)).rejects.toThrow();
 });
+
+it('verifies a fresh read after a mutation and keeps the observation out of public state', async () => {
+  const record = vi.fn().mockResolvedValue(undefined);
+  const f = harness({ recordEvaluation: record }); await open(f.background);
+  f.client.createConversation.mockResolvedValueOnce({ id: 'evaluation' });
+  const code = 'private-staff-evaluation-code';
+  await f.background.handle({ type: 'LIMOVA_START_EVALUATION', evaluationCode: code });
+  const observedAt = new Date().toISOString();
+  await f.background.handle({ type: 'LIMOVA_EVALUATION_ACTION', conversationId: 'evaluation',
+    action: { actionId: 'click', input: { operation: 'click' }, target: { contextVersion: 2 } },
+    receipt: { state: 'completed', observedAt, result: { actionId: 'click', status: 'completed' } } });
+  const snapshot = { text: 'Integration is connected', url: 'https://app.example/settings', contextVersion: 5 };
+  const reading = { type: 'LIMOVA_EVALUATION_ACTION', conversationId: 'evaluation',
+    action: { actionId: 'read', input: { operation: 'read_page' }, target: { origin: 'https://app.example', contextVersion: 4 } },
+    receipt: { state: 'completed', observedAt: new Date().toISOString(), result: { actionId: 'read', contextVersion: 4, status: 'completed', observation: JSON.stringify(snapshot) } } };
+  await f.background.handle(reading); await f.background.handle(reading);
+  await f.background.handle({ type: 'LIMOVA_FLUSH_EVALUATION' });
+  expect(record).toHaveBeenCalledTimes(3);
+  expect(record).toHaveBeenLastCalledWith({ kind: 'native_verification', observation: {
+    text: snapshot.text, origin: 'https://app.example', path: '/settings', contextVersion: 5, observedAt: reading.receipt.observedAt,
+  } }, code);
+  expect(JSON.stringify(await f.background.handle({ type: 'LIMOVA_GET_STATE' }))).not.toContain(snapshot.text);
+  expect(JSON.stringify(f.storage.set.mock.calls)).not.toContain(snapshot.text);
+});

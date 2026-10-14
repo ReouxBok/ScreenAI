@@ -151,7 +151,7 @@ export function createBrowserJournal() {
         if (current) {
           if (current.digest !== digest) throw new Error('Browser action changed after receipt');
           return { answer: current.state === 'completed'
-            ? { state: 'completed', result: current.result }
+            ? { state: 'completed', result: current.result, observedAt: current.observedAt }
             : { state: 'uncertain', result: null } };
         }
         if (Date.parse(action.expiresAt) <= Date.now()) throw new Error('Browser action expired');
@@ -172,9 +172,10 @@ export function createBrowserJournal() {
       const result = { turnId: action.turnId, actionId: action.actionId, toolCallId: action.toolCallId,
         contextVersion: action.target.contextVersion, status: observation.status, observation: observation.observation,
         ...(expectsImage ? { imageFileId: observation.imageFileId } : {}) };
+      const observedAt = new Date().toISOString();
       return change(db, key, current => {
         if (current?.owner !== owner || current.digest !== digest || current.state !== 'started') throw new Error('Browser receipt was invalidated');
-        return { record: { ...current, state: 'completed', result }, answer: { state: 'completed', result } };
+        return { record: { ...current, state: 'completed', result, observedAt }, answer: { state: 'completed', result, observedAt } };
       }, scope);
     },
     async clearScope(scope) {

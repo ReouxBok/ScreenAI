@@ -1,5 +1,5 @@
 import { createEvaluationResponseEvidence } from './evaluation-response.js';
-import { projectEvaluationAction } from './evaluation-evidence.js';
+import { projectEvaluationAction, projectEvaluationObservation } from './evaluation-evidence.js';
 import { evaluationGrant } from './evaluation-grant.js';
 import { createBrowserTurnRunner } from './browser-turn.js';
 import { createBrowserJournal } from './browser-journal.js';
@@ -76,7 +76,18 @@ export function createLimovaBackground({ storage, openTab, notify, client = new 
     const key = `action:${action.actionId}`;
     if (!current.evidence.has(key)) {
       if (current.evidence.size >= 1000) throw new Error('Limite de preuves Studio atteinte.');
-      const pending = Promise.resolve().then(() => recordEvaluation(event, current.code));
+      const pending = Promise.resolve().then(async () => {
+        await recordEvaluation(event, current.code);
+        if (evaluation !== current) throw new Error('Le test Studio a changé.');
+        if (event.status === 'ok' && ['click_element', 'fill_field', 'navigate_internal', 'scroll_page'].includes(event.toolName)) {
+          const observedAt = Date.parse(receipt.observedAt);
+          if (Number.isFinite(observedAt) && Date.now() - observedAt <= 60_000 && observedAt <= Date.now()
+            && (!current.mutation || action.target.contextVersion > current.mutation.contextVersion))
+            current.mutation = { contextVersion: action.target.contextVersion, observedAt };
+        }
+        const verification = projectEvaluationObservation(action, receipt, current.mutation);
+        if (verification) await recordEvaluation(verification, current.code);
+      });
       current.evidence.set(key, { payload: JSON.stringify(event), pending });
     }
     const saved = current.evidence.get(key);

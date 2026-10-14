@@ -63,3 +63,11 @@ Un appel Gemini sans outils compare tous les critères au texte observé. Il uti
 Le résultat reste un jugement de modèle, pas une preuve formelle de l’état du backend. Les extraits exacts réduisent les affirmations sans source mais ne garantissent pas une interprétation correcte. Il faut tester notamment les pages contradictoires, les erreurs métier et les instructions hostiles dans la page avant activation. Le service n’enregistre que le statut et la version de contexte, sans texte de page ni citations.
 
 Le raccordement de l’observation depuis l’extension reste à faire. Les 39 tests ciblés utilisent un fournisseur simulé ; TypeScript et ESLint passent. Aucun appel réel au fournisseur ni déploiement effectué.
+
+## Transmission de l’observation après action
+
+Les reçus du journal conservent désormais `observedAt` à côté du résultat, sans modifier le DTO de résultat transmis à Limova. Une relecture du journal conserve cette date. Les anciens reçus sans date restent utilisables pour la reprise d’action, mais ne peuvent pas constituer une observation fraîche de vérification.
+
+Après un clic, une saisie, une navigation ou un scroll réussi, un reçu `read_page` plus récent peut déclencher la vérification Studio. Le worker exige une version de contexte supérieure, une date postérieure à l’action et de moins de 60 secondes, l’origine liée au reçu et un chemin sans paramètres. Il transmet le texte déjà filtré du lecteur de page, sans ses éléments interactifs ni les valeurs saisies. Un screenshot seul ne déclenche pas ce contrôle. L’enregistrement et la vérification sont inclus dans la même promesse suivie pour la finalisation.
+
+Tests locaux : 291 tests des composants Limova passent ; 15 tests Chromium du journal IndexedDB passent, dont la conservation de la date lors de la reprise. Le build production réussit. Cela ne qualifie pas encore le modèle réel ni le parcours complet avec Studio et l’API déployés. L’ordre des preuves dans le scoring doit encore être audité pour ne pas conserver une ancienne vérification après une nouvelle action.
