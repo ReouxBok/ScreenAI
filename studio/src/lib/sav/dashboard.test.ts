@@ -99,6 +99,11 @@ describe("SAV-55 dashboard read model", () => {
     expect(result.counts).toMatchObject({ learning: 3, completed: 2 });
     expect(result.rows.map(r => r.learning)).toEqual(["incomplete", "candidate", "qualification"]);
   });
+  it("does not finish a resolved cycle whose expected candidate is missing", async () => {
+    const row = await seed({ approved: true, noTicket: true, opening: "opened" });
+    await observation(row, "resolved");
+    expect((await listSavDossierDashboard({ view: "learning" })).rows[0].learning).toBe("qualification");
+  });
   it("keeps the last catch-up in progress even after qualification", async () => {
     const row = await seed({ approved: true, noTicket: true, opening: "opened" });
     const { obs } = await observation(row, "abandoned");
