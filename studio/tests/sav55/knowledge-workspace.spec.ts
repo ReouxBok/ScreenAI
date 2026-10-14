@@ -1,6 +1,10 @@
 import { expect, test } from "@playwright/test";
 import { submitServerAction } from "../helpers/server-action";
 
+test.beforeEach(async ({ page, baseURL }) => {
+  await page.route("**/*", route => new URL(route.request().url()).origin === baseURL ? route.continue() : route.abort());
+});
+
 test("proposition humaine : brouillon, revue Contact, publication puis activation Ugo séparées", async ({ page, request }) => {
   test.setTimeout(240_000);
   const errors: string[] = []; page.on("pageerror", error => errors.push(error.message));

@@ -23,7 +23,7 @@ test("SAV44 exposes understanding and persists independent dossier/draft feedbac
   await expect(understanding.getByRole("blockquote")).toContainText("L’export PDF échoue encore après une nouvelle tentative.");
   await expect(draft.locator("pre").first()).toHaveText(SAV_SEMANTIC_E2E_DRAFT);
   await expect(page.locator('textarea[name="replyDraft"]')).toHaveCount(0);
-  await expect(page.getByRole("button", { name: /^Ouvrir un nouveau ticket/ })).toBeDisabled();
+  await expect(page.getByRole("button", { name: "Préparer l’aperçu de l’action", exact: true })).toBeDisabled();
 
   const reason = "Recette synthétique : le brouillon doit être repris par un humain.";
   await draft.getByRole("textbox", { name: "Motif du refus (facultatif)", exact: true }).fill(reason);
@@ -40,7 +40,7 @@ test("SAV44 exposes understanding and persists independent dossier/draft feedbac
   await page.waitForURL(/review=saved/, { timeout: 30_000 });
   await expect(dossier).toContainText("Dossier · Process validé par ugo@limova.ai");
   await expect(draft).toContainText("Brouillon refusé · traitement humain à observer.");
-  await expect(page.getByRole("button", { name: /^Ouvrir un nouveau ticket/ })).toBeEnabled();
+  await expect(page.getByRole("button", { name: "Préparer l’aperçu de l’action", exact: true })).toBeEnabled();
   await expect(draft.getByRole("button", { name: "Envoyer la réponse acceptée", exact: true })).toBeDisabled();
 
   await page.reload();
@@ -55,7 +55,7 @@ test("SAV44 exposes understanding and persists independent dossier/draft feedbac
   await expect(draft.locator("pre").first()).toHaveText(SAV_SEMANTIC_E2E_DRAFT);
   await expect(understanding).toContainText("L’export du document échoue malgré une nouvelle tentative.");
   await expect(page.getByText("Aucun ticket lié à ce dossier.", { exact: true })).toBeVisible();
-  await expect(page.getByRole("button", { name: /^Ouvrir un nouveau ticket/ })).toBeEnabled();
+  await expect(page.getByRole("button", { name: "Préparer l’aperçu de l’action", exact: true })).toBeEnabled();
   await expect(draft.getByRole("button", { name: "Envoyer la réponse acceptée", exact: true })).toBeDisabled();
   expect(externalRequests).toEqual([]); expect(browserErrors).toEqual([]);
   await page.screenshot({ path: testInfo.outputPath("sav44-independent-semantic-review.png"), fullPage: true });

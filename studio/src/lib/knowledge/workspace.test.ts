@@ -186,6 +186,7 @@ describe("SAV-55 canonical knowledge workspace", () => {
   it("saves incomplete internal drafts but requires completion before submission", async () => {
     const draft = await saveSavKnowledgeProposal({ ...proposal, title: "", document: { ...document, objective: "", steps: [{ ...document.steps[0], userLabel: "", objective: "", instruction: "" }] } }, contact);
     expect(draft.document.steps[0].instruction).toBe("");
+    expect((await paginateSavKnowledge({ tab: "human" })).rows.find(row => row.id === draft.id)?.title).toBe("Brouillon sans titre");
     const preview = await previewSavKnowledgeProposal(draft.id, contact);
     expect(preview.missing).toContain("Donner un titre clair à la connaissance.");
     await expect(submitSavKnowledgeProposal({ draftId: draft.id, snapshot: preview.snapshot }, contact)).rejects.toThrow("KNOWLEDGE_PROPOSAL_INCOMPLETE");
