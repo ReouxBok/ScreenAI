@@ -54,3 +54,15 @@ test("recherche sans résultat et mobile restent lisibles", async ({ page }) => 
   await expect(page.getByRole("button", { name: `Ouvrir l’email : ${SAV55_SUBJECTS.noTicket}`, exact: true })).toBeVisible();
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth + 1)).toBe(true);
 });
+
+test("un accès direct enregistre le dernier entrant et le fait passer à valider", async ({ page }) => {
+  const path = `/studio/sav/${SAV55_THREADS.unopened}`;
+  const recorded = page.waitForResponse(response => response.request().method() === "POST" && new URL(response.url()).pathname === path);
+  await page.goto(path);
+  const response = await recorded;
+  await response.finished(); expect(response.ok()).toBe(true);
+  await page.goto("/studio/sav?view=to_validate&q=SAV55");
+  await expect(page.getByRole("button", { name: `Ouvrir l’email : ${SAV55_SUBJECTS.unopened}`, exact: true })).toBeVisible();
+  await page.goto("/studio/sav?view=to_process&q=SAV55");
+  await expect(page.getByRole("region", { name: "Dossiers SAV", exact: true }).getByRole("button", { name: /^Ouvrir l’email/ })).toHaveCount(1);
+});
