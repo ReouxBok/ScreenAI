@@ -111,3 +111,36 @@ test('page analysis highlights the exact field and refuses invented references w
   expect(legacy).toEqual([]);
   expect(errors).toEqual([]);
 });
+
+for (const operation of ['click', 'type_text']) test(`native ${operation} shows its target without changing the page layout or intercepting input`, async ({ nativeChat }) => {
+  const { panel, app, state, calls } = nativeChat;
+  state.reply = 'Action traitée.';
+  await app.evaluate(operation => {
+    const target = document.querySelector(operation === 'click' ? '#action' : 'textarea');
+    window.beforeActionBox = target.getBoundingClientRect().toJSON();
+    target.addEventListener(operation === 'click' ? 'click' : 'input', () => {
+      const pointer = document.querySelector('[data-limova-native-pointer]');
+      const box = pointer?.getBoundingClientRect();
+      const targetBox = target.getBoundingClientRect();
+      window.pointerAtAction = {
+        present: Boolean(pointer), hidden: pointer?.getAttribute('aria-hidden'),
+        x: box?.left, y: box?.top, expectedX: targetBox.left + targetBox.width / 2,
+        expectedY: targetBox.top + targetBox.height / 2,
+        intercepts: document.elementFromPoint(targetBox.left + targetBox.width / 2, targetBox.top + targetBox.height / 2) !== target,
+        layoutUnchanged: JSON.stringify(targetBox.toJSON()) === JSON.stringify(window.beforeActionBox),
+      };
+    });
+  }, operation);
+  state.browserActions = [read, body => ({ operation, elementId: reference(body, operation === 'click' ? 'Continuer' : 'Brief'),
+    ...(operation === 'type_text' ? { text: 'Texte natif' } : {}) }), read];
+  await send(panel);
+  const pointer = await app.evaluate(() => window.pointerAtAction);
+  expect(pointer).toMatchObject({ present: true, hidden: 'true', intercepts: false, layoutUnchanged: true });
+  expect(Math.abs(pointer.x - pointer.expectedX)).toBeLessThan(1);
+  expect(Math.abs(pointer.y - pointer.expectedY)).toBeLessThan(1);
+  await expect(app.locator('[data-limova-native-pointer]')).toHaveCount(0);
+  const observed = messageCalls(calls).at(-1).body.browserResult.observation;
+  expect(observed).not.toContain('limova-native-pointer');
+  expect(await app.evaluate(() => ({ clicks: window.clicks, inputs: window.inputEvents })))
+    .toEqual(operation === 'click' ? { clicks: 1, inputs: 0 } : { clicks: 0, inputs: 1 });
+});
