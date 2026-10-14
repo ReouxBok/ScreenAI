@@ -70,7 +70,7 @@ describe('background privacy boundaries', () => {
         }
       ])
     });
-    chromeMock.scripting.executeScript.mockImplementation(async ({ func, args = [] }) => [
+    chromeMock.scripting.executeScript.mockReset().mockImplementation(async ({ func, args = [] }) => [
       { result: await func(...args) }
     ]);
   });
@@ -297,4 +297,16 @@ describe('background privacy boundaries', () => {
     expect(result.ok).toBe(false);
     expect(result.error).toContain('Aucun article pertinent');
   });
+  it('never derives control aliases from neighboring or nested form values', async () => {
+    document.body.innerHTML = `<main><article>
+      <h3>HubSpot</h3><button>Connecter HubSpot</button>
+      <div><textarea>PRIVATE_DEFAULT_VALUE</textarea><span contenteditable="true">PRIVATE_EDITABLE_VALUE</span></div>
+      <p>Documentation <span data-private>PRIVATE_MARKED_VALUE</span></p>
+    </article></main>`;
+    const context = await background.getPageContext(7);
+    expect(context).toContain('Connecter HubSpot');
+    expect(context).toContain('HubSpot');
+    expect(context).not.toMatch(/PRIVATE_DEFAULT_VALUE|PRIVATE_EDITABLE_VALUE|PRIVATE_MARKED_VALUE/);
+  });
+
 });

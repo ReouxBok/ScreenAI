@@ -25,7 +25,7 @@ test('training microphone sends native PCM and writes the final note into the ac
   const key = path.join(directory, 'key.pem'), cert = path.join(directory, 'cert.pem');
   execFileSync('openssl', ['req', '-x509', '-newkey', 'rsa:2048', '-nodes', '-keyout', key,
     '-out', cert, '-days', '1', '-subj', '/CN=limova-live-test'], { stdio: 'ignore' });
-  const notes = [];
+  const notes = [], studioCalls = [];
   const training = { id: '88888888-8888-4888-8888-888888888888', title: 'Démonstration', agentKey: 'charly', startPath: '/' };
   const seen = { starts: 0, connected: 0, stopped: 0, disconnected: 0, pcm: null, cancelled: null, browserBinding: null, browserResult: null, results: [], action: null, httpChecks: [], cookie: false, origin: null };
   const server = createServer({ key: await readFile(key), cert: await readFile(cert) }, (request, response) => {
@@ -33,12 +33,13 @@ test('training microphone sends native PCM and writes the final note into the ac
       let body = ''; request.on('data', chunk => { body += chunk; });
       request.on('end', () => {
         response.writeHead(200, { 'content-type': 'application/json', 'access-control-allow-origin': '*', 'access-control-allow-headers': 'authorization,content-type' });
+        studioCalls.push({ path: request.url, method: request.method });
         if (request.url.endsWith('/events') && request.method === 'POST') notes.push(JSON.parse(body));
         response.end(JSON.stringify(request.url.endsWith('/connect') ? training : { ok: true }));
       }); return;
     }
     if (request.headers.host === new URL(APP).host) {
-      response.writeHead(200, { 'content-type': 'text/html' }); response.end('<title>Live fixture</title><main>Browser knowledge fixture</main>'); return;
+      response.writeHead(200, { 'content-type': 'text/html' }); response.end('<title>Live fixture</title><main>Browser knowledge fixture<button id="action">Connecter HubSpot</button><textarea aria-label="Brief">PRIVATE_FIELD_VALUE</textarea><input type="password" value="NEVER_TRANSMIT_THIS_SECRET"></main><script>window.clicks=0;document.getElementById("action").onclick=()=>window.clicks++;</script>'); return;
     }
     const headers = { 'access-control-allow-origin': APP, 'access-control-allow-credentials': 'true',
       'access-control-allow-headers': 'x-workspace-id,content-type', 'access-control-allow-methods': 'GET,POST,OPTIONS', 'content-type': 'application/json' };
@@ -48,7 +49,7 @@ test('training microphone sends native PCM and writes the final note into the ac
       response.end('{}'); return;
     }
     const authenticated = request.headers.cookie?.includes('live_fixture=authenticated') === true;
-    seen.httpChecks.push({ path: request.url, authenticated, workspaceId: request.headers['x-workspace-id'] });
+    seen.httpChecks.push({ method: request.method, path: request.url, authenticated, workspaceId: request.headers['x-workspace-id'] });
     let data = {};
     if (request.url.startsWith('/conversation?')) data = { data: { data: [{ id: CONVERSATION, title: 'Conversation vocale' }] } };
     if (request.url === `/conversation/${CONVERSATION}/messages`) data = { data: { data: [] } };
@@ -74,6 +75,8 @@ test('training microphone sends native PCM and writes the final note into the ac
     socket.on('audio_chunk', payload => {
       seen.pcm = { sequence: payload.sequence, length: Buffer.from(payload.audio, 'base64').length, sessionId: payload.sessionId };
       if (seen.action) return; seen.action = true;
+      socket.emit('extension.action_requested', { input: { operation: 'click', elementId: 1 } });
+      socket.emit('toolCall', { functionCalls: [{ name: 'request_page_action', args: { elementId: 1 } }] });
       socket.emit('partial_transcript', { text: 'Je sélectionne' });
       socket.emit('final_transcript', { text: 'Je sélectionne le compte HubSpot.' });
     });
@@ -108,9 +111,23 @@ test('training microphone sends native PCM and writes the final note into the ac
     await expect(extensionPage.locator('html')).toHaveAttribute('data-sidebar-ready', 'true');
     await expect(extensionPage.locator('#limovaConversation')).toHaveValue(CONVERSATION);
     await app.bringToFront();
-    const started = await extensionPage.evaluate(() => chrome.runtime.sendMessage({ type: 'START_TRAINING', token: 'local-training-fixture-token-no-secret' }));
-    expect(started.ok).toBe(true);
-    await extensionPage.locator('#voiceBtn').click();
+    await extensionPage.locator('#menuBtn').click();
+    await extensionPage.locator('#trainingBtn').click();
+    await extensionPage.locator('#trainingToken').fill('local-training-fixture-token-no-secret');
+    // Desktop selection and video upload are a separate OS/media boundary.
+    // Keep the real panel/worker, Studio event transport and native PCM path.
+    await extensionPage.evaluate(() => {
+      window.recordingCalls = [];
+      window.LimovaTrainingScreenRecorder = class {
+        async start() { window.recordingCalls.push('start'); }
+        async beginProgressiveUpload() { window.recordingCalls.push('begin'); }
+        async stopAndUpload({ onProgress }) { window.recordingCalls.push('upload'); onProgress?.({ percentage: 100 }); }
+        abort() { window.recordingCalls.push('abort'); }
+      };
+    });
+    await extensionPage.locator('#trainingStart').click();
+    await expect(extensionPage.locator('#trainingFeedback')).toContainText('mode passif');
+    await extensionPage.locator('#trainingMic').click();
     await expect.poll(() => seen.starts).toBe(1);
     await expect.poll(() => seen.pcm?.length).toBe(640);
     await expect(extensionPage.locator('#voiceBtn')).toHaveAttribute('aria-pressed', 'true');
@@ -128,6 +145,14 @@ test('training microphone sends native PCM and writes the final note into the ac
     const sequence = seen.pcm.sequence;
     await extensionPage.waitForTimeout(200);
     expect(seen.pcm.sequence).toBe(sequence);
+    expect(await app.evaluate(() => window.clicks)).toBe(0);
+    expect(seen.httpChecks.filter(call => call.method === 'POST')).toEqual([]);
+    await expect(extensionPage.locator('.message.user, .message.assistant')).toHaveCount(0);
+    expect(JSON.stringify(notes)).not.toMatch(/PRIVATE_FIELD_VALUE|NEVER_TRANSMIT_THIS_SECRET/);
+    await extensionPage.locator('#trainingStop').click();
+    await expect(extensionPage.locator('#trainingFeedback')).toContainText('Démonstration et vidéo enregistrées');
+    expect(await extensionPage.evaluate(() => window.recordingCalls)).toEqual(['start', 'begin', 'upload']);
+    expect(studioCalls.filter(call => call.path.endsWith('/complete') && call.method === 'POST')).toHaveLength(1);
     expect(seen.connected).toBe(1); expect(legacyRequests).toEqual([]); expect(errors).toEqual([]);
   } finally {
     await context?.close();
