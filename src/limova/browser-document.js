@@ -5,6 +5,7 @@ export function browserDocumentCommand(request) {
     let boundUrl;
     const documentId = crypto.randomUUID();
     let elements = new Map();
+    let referenceSurface;
     let captureRevision = 0;
     let captureObserver;
     const observedCaptureRoots = new WeakSet();
@@ -86,6 +87,16 @@ export function browserDocumentCommand(request) {
     };
     const sensitive = element => /password|passcode|secret|token|api.?key|credit|card|payment|iban|cvv/i.test(
       ['type', 'name', 'autocomplete', 'aria-label'].map(name => element.getAttribute(name) ?? '').join(' '));
+    const activeSurface = () => {
+      const dialogs = [...document.querySelectorAll('dialog[open],[role="dialog"],[role="alertdialog"],[aria-modal="true"]')].filter(visible);
+      const foreground = dialogs.filter(dialog => {
+        const rect = dialog.getBoundingClientRect();
+        const x = Math.max(0, rect.left) + (Math.min(innerWidth, rect.right) - Math.max(0, rect.left)) / 2;
+        const y = Math.max(0, rect.top) + (Math.min(innerHeight, rect.bottom) - Math.max(0, rect.top)) / 2;
+        return dialog.contains(document.elementFromPoint(x, y));
+      });
+      return foreground.at(-1) ?? dialogs.at(-1) ?? document.body;
+    };
     const privateSelector = '[data-private],[data-sensitive],[data-limova-private]';
     const fingerprint = element => JSON.stringify([
       element.tagName, ...['href', 'type', 'name', 'role', 'aria-label', 'placeholder'].map(name => element.getAttribute(name)),
@@ -113,6 +124,7 @@ export function browserDocumentCommand(request) {
           version = input.contextVersion;
           boundUrl = location.href;
           elements = new Map();
+          referenceSurface = undefined;
           clearPointer();
         }
         return { status: 'completed', binding: binding() };
@@ -135,7 +147,8 @@ export function browserDocumentCommand(request) {
       }
       if (input.operation === 'read_page') {
         elements = new Map();
-        const candidates = [...document.querySelectorAll('button,a[href],input,textarea,select,[contenteditable="true"],[role="button"],[role="tab"],[role="link"],[role="menuitem"],[role="switch"],[role="checkbox"],[role="option"],[tabindex="0"],[onclick],.cursor-pointer')]
+        referenceSurface = activeSurface();
+        const candidates = [...referenceSurface.querySelectorAll('button,a[href],input,textarea,select,[contenteditable="true"],[role="button"],[role="tab"],[role="link"],[role="menuitem"],[role="switch"],[role="checkbox"],[role="option"],[tabindex="0"],[onclick],.cursor-pointer')]
           .filter(element => visible(element) && !sensitive(element) && !element.closest(privateSelector)).slice(0, 60);
         const descriptions = candidates.map((element, index) => {
           const id = index + 1;
@@ -145,7 +158,8 @@ export function browserDocumentCommand(request) {
         });
         version = input.nextContextVersion;
         const observation = { title: document.title.slice(0, 200),
-          url: (location.origin + location.pathname).slice(0, 2048), contextVersion: version, text: readText(), elements: descriptions };
+          url: (location.origin + location.pathname).slice(0, 2048), contextVersion: version,
+          surface: referenceSurface === document.body ? 'page' : 'modal', text: readText(referenceSurface), elements: descriptions };
         while (JSON.stringify(observation).length > 32000) {
           if (observation.text) observation.text = observation.text.slice(0, Math.floor(observation.text.length / 2));
           else elements.delete(observation.elements.pop().elementId);
@@ -154,6 +168,18 @@ export function browserDocumentCommand(request) {
       }
       if (input.operation === 'scroll') {
         if (!['up', 'down'].includes(input.direction)) return rejected('Invalid scroll direction');
+        const surface = activeSurface();
+        if (surface !== document.body) {
+          const scroller = [surface, ...surface.querySelectorAll('*')].find(element => visible(element)
+            && /auto|scroll|overlay/.test(getComputedStyle(element).overflowY)
+            && element.scrollHeight > element.clientHeight + 1);
+          const before = scroller?.scrollTop ?? 0;
+          scroller?.scrollBy({ top: (input.direction === 'down' ? 1 : -1) * scroller.clientHeight * 0.65, behavior: 'instant' });
+          version = input.nextContextVersion;
+          return { status: 'completed', observation: JSON.stringify({ surface: 'modal', moved: (scroller?.scrollTop ?? 0) !== before,
+            scrollY: scroller?.scrollTop ?? 0, atStart: !scroller || scroller.scrollTop <= 0,
+            atEnd: !scroller || scroller.scrollTop + scroller.clientHeight >= scroller.scrollHeight }), binding: binding() };
+        }
         const before = scrollY;
         window.scrollBy({ top: (input.direction === 'down' ? 1 : -1) * innerHeight * 0.65, behavior: 'instant' });
         version = input.nextContextVersion;
@@ -163,6 +189,7 @@ export function browserDocumentCommand(request) {
       const reference = elements.get(input.elementId);
       const element = reference?.element;
       const targetAvailable = () => boundUrl === location.href && element instanceof HTMLElement && visible(element) && !sensitive(element)
+        && referenceSurface === activeSurface() && referenceSurface.contains(element)
         && !element.closest(privateSelector) && reference.fingerprint === fingerprint(element)
         && !element.matches(':disabled,[aria-disabled="true"],[readonly]');
       if (!targetAvailable()) return rejected('Target unavailable');
