@@ -24,3 +24,15 @@ Le test de manifeste vérifie désormais la liste exacte des hôtes par environn
 `native-chat-fixture.js` démarre un serveur HTTPS temporaire, utilise de vrais cookies HttpOnly/Secure/Partitioned, et charge le paquet dans un profil Chromium isolé. Les domaines app/API sont résolus vers localhost ; les autres domaines ne sont pas résolus. Les requêtes legacy sont surveillées et refusées par les assertions. Les méthodes d’envoi du panneau ne sont pas remplacées.
 
 Le contrat API est simulé : ce test prouve l’intégration client/Chrome, pas l’exécution réelle de NestJS, du modèle, de la mémoire, du MCP Studio ou de LangSmith. La continuité testée est le rechargement du panneau sur la même conversation persistée dans la fixture ; une reprise dans l’app Limova réelle reste à qualifier.
+
+## Actions navigateur sur le transport natif
+
+`limova-browser-actions.spec.js` remplace trois scénarios legacy : remplissage exact et silencieux, récupération après mauvaise cible et clic ordinaire sans verbe explicite. La fixture émet plusieurs commandes canoniques dans le même tour ; le worker, le journal et le driver réels exécutent les commandes et renvoient les résultats. Chaque nouveau message reçoit un identifiant de tour distinct.
+
+La récupération change de responsabilité : une saisie visant un bouton est refusée sans effet ; le serveur relit ensuite la page et désigne le champ correct. Le test simule cette décision serveur et ne démontre pas le raisonnement d’un modèle réel. Il vérifie une seule saisie effective, aucun clic accidentel, les identifiants du même tour et l’absence des anciennes valeurs privées dans les résultats.
+
+Le clic ordinaire utilise désormais le consentement navigateur explicite du tour de chat. Le mode analyse refuse les mutations, même si le serveur demande de supprimer un brouillon. Un scénario supplémentaire vérifie la navigation et la lecture du nouveau document avec une version de contexte augmentée, dans la même conversation.
+
+Les anciens scénarios de guidage visuel, curseur et analyse destructive restent présents tant que leur couverture visuelle n’est pas transférée. Les tests de navigation sémantique restent également présents : naviguer vers une URL ne démontre pas la sélection d’un contrôle mal étiqueté. Aucun seuil CI ni skip supplémentaire n’est ajouté.
+
+Validation de cette couche : 12 tests ciblés réussis avec le paquet production, puis 12 avec le paquet staging (`limova-browser-actions.spec.js` et `limova-native-chat.spec.js`). La fixture sélectionne maintenant `build-staging` par défaut lorsque `LIMOVA_E2E_ENV=staging`, tout en respectant `EXTENSION_PATH`. Une première invocation staging avait chargé le paquet production ; elle a été interrompue et corrigée. Il reste 21 scénarios legacy dans `feature-flows.spec.js` ; la suite globale n’est pas déclarée verte.
