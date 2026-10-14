@@ -179,7 +179,7 @@ export function createBrowserJournal() {
       let observation;
       try {
         const mode = await change(db, turnPolicyKey(scope, action.turnId), current => ({ answer: current?.mode }), scope);
-        observation = mode !== undefined && mode !== 'act' && !['read_page', 'screenshot'].includes(action.input.operation)
+        observation = mode !== undefined && mode !== 'act' && !['read_page', 'screenshot', 'highlight'].includes(action.input.operation)
           ? { status: 'rejected', observation: 'This turn only permits page observation, not browser actions.' }
           : await execute(action);
       } catch { return { state: 'uncertain', result: null }; }

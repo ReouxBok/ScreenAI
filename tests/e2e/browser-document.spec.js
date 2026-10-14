@@ -33,10 +33,10 @@ test('uses private element references despite page-controlled data attributes', 
   expect(await site.evaluate(() => ({ saved, deleted, exposed: typeof globalThis.__limovaDeepAgentDocumentV1 }))).toEqual({ saved: 1, deleted: 0, exposed: 'undefined' });
 });
 
-test('rejects a detached reference instead of targeting a replacement with the same ID', async ({ context, extensionId }) => {
+for (const operation of ['click', 'highlight']) test(`rejects a detached ${operation} reference instead of targeting a replacement with the same ID`, async ({ context, extensionId }) => {
   const { site, controller } = await setup(context, extensionId);
   await site.evaluate(() => { const replacement = original.cloneNode(true); replacement.onclick = () => window.deleted++; original.replaceWith(replacement); });
-  const result = await controller.evaluate(() => invokeDocument({ ...binding, operation: 'click', elementId: 1, nextContextVersion: 3 }));
+  const result = await controller.evaluate(operation => invokeDocument({ ...binding, operation, elementId: 1, nextContextVersion: 3 }), operation);
   expect(result.status).toBe('rejected');
   expect(await site.evaluate(() => deleted)).toBe(0);
 });

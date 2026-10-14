@@ -340,7 +340,6 @@ test('observation policy survives reopening and refuses mutations with durable r
     for (const input of [
       { operation: 'click', elementId: 1 }, { operation: 'type_text', elementId: 1, text: 'test' },
       { operation: 'scroll', direction: 'down' }, { operation: 'navigate', url: 'https://example.com/next' },
-      { operation: 'highlight', elementId: 1 },
     ]) {
       receipts.push(await journal.run(scope, { ...action, actionId: input.operation === 'click' ? 'policy' : input.operation, input }, async () => {
         executed++; return { status: 'completed', observation: 'Unexpected mutation' };
@@ -353,19 +352,23 @@ test('observation policy survives reopening and refuses mutations with durable r
     const screenshot = await journal.run(scope, { ...action, actionId: 'screenshot', input: { operation: 'screenshot' } }, async () => {
       executed++; return { status: 'completed', observation: 'Captured', imageFileId: crypto.randomUUID() };
     });
+    const highlight = await journal.run(scope, { ...action, actionId: 'highlight', input: { operation: 'highlight', elementId: 1 } }, async () => {
+      executed++; return { status: 'completed', observation: 'Target highlighted' };
+    });
     const unknown = await journal.getTurnMode(scope, crypto.randomUUID());
     await journal.revokeSession(scope);
     let revoked;
     try { await journal.getTurnMode(scope, action.turnId); } catch (error) { revoked = error.message; }
     await journal.close();
-    return { executed, escalation, mode, unknown, receipts, read, screenshot, revoked };
+    return { executed, escalation, mode, unknown, receipts, read, screenshot, highlight, revoked };
   });
-  expect(result.executed).toBe(2);
+  expect(result.executed).toBe(3);
   expect(result.escalation).toBe('Browser turn mode cannot change');
   expect(result.mode).toBe('observe');
   expect(result.unknown).toBe('observe');
   expect(result.receipts.every(receipt => receipt.state === 'completed' && receipt.result.status === 'rejected')).toBe(true);
   expect(result.read.result.status).toBe('completed');
   expect(result.screenshot.result.status).toBe('completed');
+  expect(result.highlight.result.status).toBe('completed');
   expect(result.revoked).toBe('Browser session revoked');
 });
