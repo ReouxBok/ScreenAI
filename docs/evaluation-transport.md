@@ -79,3 +79,11 @@ Studio trie les preuves par ordinal et refuse un ordre ambigu ou invalide. Pour 
 L’ajout d’un événement et la clôture verrouillent désormais la ligne du run dans une transaction PostgreSQL, puis revérifient son statut et son expiration. L’attribution de l’ordinal est sérialisée avec les autres ajouts. La clôture lit les événements et écrit son verdict dans cette même transaction ; une autre clôture ou un événement tardif ne peut plus modifier ce run terminé.
 
 Qualification locale : 26 tests passent, dont deux tests contre un PostgreSQL 16 temporaire utilisant les fonctions réelles `appendEvaluationEvent` et `completeEvaluation`, avec huit connexions possibles. Douze ajouts concurrents produisent les ordinaux 1 à 12 ; deux clôtures concurrentes produisent un seul résultat ; un ajout après clôture est refusé. Les tables de fixture reprennent les colonnes Drizzle nécessaires, pas toutes les migrations/contraintes de production. TypeScript et ESLint passent. L’instance temporaire a été arrêtée ; aucune base existante n’a été modifiée.
+
+## Parcours Chromium assemblé
+
+`tests/e2e/limova-evaluation.spec.js` charge le paquet réel dans un profil Chromium isolé et sert l’app, l’API et Studio via un serveur HTTPS local. Le test passe par le bouton du panneau, les cookies first-party, la création de conversation `charly`, le flux natif, le pilote de page et le journal. Il lit une page, clique une seule fois, relit le résultat, transmet une observation puis une réponse finale, et restaure la conversation personnelle après verdict.
+
+Deux scénarios passent : succès du transport complet et refus de la vérification par Studio. Dans ce dernier cas, aucune requête de verdict ne part. Le code reste absent du corps des messages et des stockages local/session, et aucun appel aux anciens endpoints copilot/live-session n’est observé.
+
+L’API, Studio et le modèle sont simulés dans ce test ; seul le navigateur et le code de l’extension s’exécutent réellement. Le paquet staging est explicitement exclu de cette fixture car il n’autorise pas le Studio de production. Ce résultat ne remplace pas la qualification des services déployés.
