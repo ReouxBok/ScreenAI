@@ -1,5 +1,6 @@
 import { test, expect, chromium } from '@playwright/test';
 import { createServer } from 'node:https';
+import { Server } from 'socket.io';
 import { execFileSync } from 'node:child_process';
 import { mkdtemp, readFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -13,8 +14,9 @@ const USER = id(1), WORKSPACE = id(2), AGENT = id(3), PERSONAL = id(4), EVALUATI
 const CODE = 'local-studio-evaluation-fixture-code';
 const frame = (event, data) => `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
 
-for (const scenario of ['success', 'verification_failure', 'manual_voice', 'manual_delivery_failure']) test(`Studio native evaluation ${scenario}`, async () => {
-  const verificationUnavailable = scenario === 'verification_failure';
+for (const scenario of ['success', 'verification_failure', 'manual_voice', 'manual_delivery_failure', 'voice_success', 'voice_verification_failure']) test(`Studio native evaluation ${scenario}`, async () => {
+  const verificationUnavailable = scenario.endsWith('verification_failure');
+  const voice = scenario.startsWith('voice_');
   const manual = scenario.startsWith('manual_');
   const manualUnavailable = scenario === 'manual_delivery_failure';
   test.skip(environment.name === 'staging', 'Staging intentionally has no production Studio permission.');
@@ -22,6 +24,7 @@ for (const scenario of ['success', 'verification_failure', 'manual_voice', 'manu
   const key = path.join(directory, 'key.pem'), cert = path.join(directory, 'cert.pem');
   execFileSync('openssl', ['req', '-x509', '-newkey', 'rsa:2048', '-nodes', '-keyout', key, '-out', cert, '-days', '1', '-subj', '/CN=limova-evaluation-test'], { stdio: 'ignore' });
   const evidence = [], mutations = [], errors = [], legacy = [];
+  const live = { starts: [], results: [], pcm: 0, disconnected: 0 };
   let actionCount = 0, elementId, completed = false, completionRequests = 0, context;
   const server = createServer({ key: await readFile(key), cert: await readFile(cert) }, (request, response) => {
     let raw = ''; request.on('data', chunk => { raw += chunk; });
@@ -87,11 +90,58 @@ for (const scenario of ['success', 'verification_failure', 'manual_voice', 'manu
       return json({ error: 'route' }, 404);
     });
   });
+  const io = new Server(server, { cors: { origin: APP, credentials: true }, transports: ['websocket'] });
+  io.of('/conversation/live').on('connection', socket => {
+    const sessionId = id(7), voiceTurnId = id(8);
+    let started = false, page, voiceAction = 0;
+    const emitAction = input => {
+      voiceAction += 1;
+      socket.emit('turn.deep_agent_stream.delta', { sessionId, turnId: voiceTurnId,
+        chunk: Buffer.from(frame('custom', { type: 'extension.action_requested', protocolVersion: 1, turnId: TURN,
+          actionId: `${TURN}:voice-${voiceAction}`, toolCallId: `voice-${voiceAction}`, target: page, input,
+          expiresAt: new Date(Date.now() + 60000).toISOString() })
+          + frame('custom', { type: 'extension.turn_state', turnId: TURN, state: 'waiting' })) });
+    };
+    socket.on('session.start', payload => {
+      live.starts.push({ payload, authenticated: socket.handshake.headers.cookie?.includes('evaluation_fixture=authenticated'),
+        origin: socket.handshake.headers.origin, workspaceId: socket.handshake.auth.workspaceId });
+      if (payload.evaluationCode !== CODE || payload.conversationId !== EVALUATION
+        || payload.expectedUserId !== USER || socket.handshake.auth.workspaceId !== WORKSPACE
+        || !socket.handshake.headers.cookie?.includes('evaluation_fixture=authenticated')) return socket.disconnect();
+      page = payload.browserContext;
+      socket.emit('session.ready', { sessionId, conversationId: EVALUATION, userId: USER, workspaceId: WORKSPACE,
+        clientSurface: 'chrome_extension', inputSampleRate: 16000, outputSampleRate: 24000, maxAudioFrameBytes: 2560 });
+    });
+    socket.on('audio.append', () => {
+      live.pcm += 1;
+      if (started) return; started = true;
+      socket.emit('turn.deep_agent_stream.started', { sessionId, turnId: voiceTurnId });
+      emitAction({ operation: 'read_page' });
+    });
+    socket.on('turn.browser_continue', payload => {
+      live.results.push(payload);
+      page = payload.browserContext;
+      if (voiceAction === 1) {
+        const observed = JSON.parse(payload.browserResult.observation);
+        emitAction({ operation: 'click', elementId: observed.elements.find(item => item.label === 'Connect integration')?.elementId });
+      } else if (voiceAction === 2) emitAction({ operation: 'read_page' });
+      else {
+        socket.emit('turn.deep_agent_stream.delta', { sessionId, turnId: voiceTurnId,
+          chunk: Buffer.from(frame('values', { messages: [
+            { id: 'voice-human', type: 'human', content: 'Connect integration' },
+            { id: 'voice-answer', type: 'ai', content: 'The integration is connected.', tool_calls: [] },
+          ] }) + frame('custom', { type: 'extension.turn_state', turnId: TURN, state: 'completed' })) });
+        socket.emit('turn.deep_agent_stream.completed', { sessionId, turnId: voiceTurnId });
+        socket.emit('assistant.transcript.final', { sessionId, turnId: voiceTurnId, text: 'The integration is connected.' });
+      }
+    });
+    socket.on('disconnect', () => { live.disconnected += 1; });
+  });
   await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
   try {
     const port = server.address().port, extension = path.resolve(process.env.EXTENSION_PATH ?? 'build');
     context = await chromium.launchPersistentContext('', { channel: 'chromium', headless: true, ignoreHTTPSErrors: true,
-      args: [`--disable-extensions-except=${extension}`, `--load-extension=${extension}`, '--no-proxy-server', '--ignore-certificate-errors',
+      args: [`--disable-extensions-except=${extension}`, `--load-extension=${extension}`, '--no-proxy-server', '--ignore-certificate-errors', '--use-fake-device-for-media-stream', '--use-fake-ui-for-media-stream',
         `--host-resolver-rules=MAP ${new URL(API).hostname} 127.0.0.1:${port}, MAP ${new URL(APP).hostname} 127.0.0.1:${port}, MAP studio.limova.ai 127.0.0.1:${port}, MAP * ~NOTFOUND`] });
     const worker = context.serviceWorkers()[0] ?? await context.waitForEvent('serviceworker');
     const app = await context.newPage(); await app.goto(`${APP}/settings`);
@@ -100,7 +150,7 @@ for (const scenario of ['success', 'verification_failure', 'manual_voice', 'manu
       await chrome.storage.local.set({ limova_deep_agent_context_v1: { userId: USER, workspaceId: WORKSPACE, conversationId: PERSONAL }, limova_ai_processing_consent_v1: true, limova_onboarding_dismissed: true });
     }, { USER, WORKSPACE, PERSONAL });
     const panel = await context.newPage(); panel.on('pageerror', error => errors.push(error.message));
-    context.on('request', request => { if (request.url().includes('/api/copilot') || request.url().includes('/api/live-session')) legacy.push(request.url()); });
+    context.on('request', request => { if (/limova-proxy|generativelanguage|\/api\/copilot|\/api\/live-session/.test(request.url())) legacy.push(request.url()); });
     await panel.goto(`chrome-extension://${new URL(worker.url()).host}/src/sidebar/sidebar.html`);
     await expect(panel.locator('html')).toHaveAttribute('data-sidebar-ready', 'true');
     await expect(panel.locator('#limovaConversation')).toHaveValue(PERSONAL);
@@ -108,9 +158,20 @@ for (const scenario of ['success', 'verification_failure', 'manual_voice', 'manu
     await panel.evaluate(code => { document.getElementById('evaluationToken').value = code; document.getElementById('evaluationStart').click(); }, CODE);
     await expect(panel.locator('body')).toHaveClass(/evaluation-active/);
     await expect(panel.locator('#limovaConversation')).toHaveValue(EVALUATION);
-    await panel.evaluate(() => { document.getElementById('limovaBrowser').checked = true; document.getElementById('userInput').value = 'Connect integration'; document.getElementById('sendBtn').click(); });
+    await panel.evaluate(voice => { document.getElementById('limovaBrowser').checked = true; document.getElementById('userInput').value = 'Connect integration'; document.getElementById(voice ? 'voiceBtn' : 'sendBtn').click(); }, voice);
     await expect.poll(() => evidence.some(item => item.kind === (verificationUnavailable ? 'native_verification' : 'response')), { timeout: 12_000 }).toBe(true);
-    await expect(panel.locator('#sendBtn')).toBeEnabled();
+    if (!voice) await expect(panel.locator('#sendBtn')).toBeEnabled();
+    if (voice) {
+      expect(live.starts).toHaveLength(1);
+      expect(live.starts[0]).toMatchObject({ authenticated: true, origin: APP, workspaceId: WORKSPACE,
+        payload: { evaluationCode: CODE, conversationId: EVALUATION, expectedUserId: USER, clientSurface: 'chrome_extension' } });
+      expect(live.pcm).toBeGreaterThan(0);
+      expect(mutations).toHaveLength(1);
+      if (!verificationUnavailable) {
+        expect(live.results).toHaveLength(3);
+        await expect(panel.locator('.message.assistant .message-content')).toHaveText('The integration is connected.');
+      }
+    }
     expect(await app.evaluate(() => window.clicks)).toBe(1);
     expect(evidence.some(item => item.kind === 'native_verification' && item.observation.text.includes('Connection status: Connected'))).toBe(true);
     expect(evidence.some(item => item.manualIntervention)).toBe(false);
@@ -129,7 +190,7 @@ for (const scenario of ['success', 'verification_failure', 'manual_voice', 'manu
       expect(completionRequests).toBe(0);
       await expect(panel.locator('#limovaConversation')).toHaveValue(EVALUATION);
     } else if (verificationUnavailable) {
-      await expect(panel.locator('#evaluationFeedback')).toContainText('preuve d’exécution');
+      await expect(panel.locator('#evaluationFeedback')).toContainText(/preuve|evidence/i);
       expect(completionRequests).toBe(0);
       expect(evidence.some(item => item.kind === 'response')).toBe(false);
       await expect(panel.locator('#limovaConversation')).toHaveValue(EVALUATION);
@@ -137,6 +198,14 @@ for (const scenario of ['success', 'verification_failure', 'manual_voice', 'manu
       await expect.poll(() => completed).toBe(true);
       await expect(panel.locator('#limovaConversation')).toHaveValue(PERSONAL);
       if (manual) await expect(panel.locator('#evaluationFeedback')).toContainText(/échou|Échou|failed|corriger/i);
+      else await expect(panel.locator('#evaluationFeedback')).toContainText('Test réussi · 100/100');
+      await expect(panel.locator('body')).not.toHaveClass(/evaluation-active/);
+      expect(completionRequests).toBe(1);
+    }
+    if (voice) {
+      await expect(panel.locator('#voiceBtn')).toHaveAttribute('aria-pressed', 'false');
+      await expect.poll(() => live.disconnected).toBe(1);
+      expect(live.starts).toHaveLength(1);
     }
     expect(mutations[0]).toMatchObject({ code: CODE, body: { botAgentId: AGENT, engine: 'deep_agents', type: 'general' } });
     expect(mutations.every(item => item.code === CODE && !JSON.stringify(item.body).includes(CODE))).toBe(true);
@@ -144,7 +213,7 @@ for (const scenario of ['success', 'verification_failure', 'manual_voice', 'manu
     expect(await worker.evaluate(async () => (await chrome.storage.session.get('charly_evaluation_active')).charly_evaluation_active)).toBeUndefined();
     expect(legacy).toEqual([]); expect(errors).toEqual([]);
   } finally {
-    await context?.close(); server.closeAllConnections(); await new Promise(resolve => server.close(resolve));
+    await context?.close(); await new Promise(resolve => io.close(resolve)); server.closeAllConnections();
     await rm(directory, { recursive: true, force: true });
   }
 });

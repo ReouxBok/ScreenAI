@@ -243,56 +243,7 @@ async function grantAIConsent(sidebar) {
 
 test.describe('Packaged extension — complete user flows', () => {
 
-  test('a contributor evaluates a draft in the real extension before review', async ({ context, extensionId }) => {
-    const evaluationCode = 'evaluation-code-e2e-that-is-long-enough';
-    const { calls, limova, sidebar } = await openExtensionHarness(context, extensionId, {
-      serverOrchestration: true,
-      adkTurn: ({ phase, body, index }) => {
-        if (phase === 'turn') {
-          const elementId = Number(body.page.dom.match(/\[(\d+)\] clickable\(button\) "Connecter HubSpot"/)?.[1]);
-          return {
-            type: 'tool_call', sessionId: body.sessionId, runId: 'db0e8400-e29b-41d4-a716-446655440000', expiresAt: new Date(Date.now() + 60_000).toISOString(),
-            call: { id: 'evaluation-click', name: 'click_element', args: { elementId, contextVersion: body.page.contextVersion, targetLabel: 'Connecter HubSpot' } }
-          };
-        }
-        if (index === 0) return {
-          type: 'tool_call', sessionId: '550e8400-e29b-41d4-a716-446655440000', runId: 'eb0e8400-e29b-41d4-a716-446655440000', expiresAt: new Date(Date.now() + 60_000).toISOString(),
-          call: { id: 'evaluation-verify', name: 'verify_expected_result', args: { expectation: 'Le bouton HubSpot a été activé', contextVersion: body.contextVersion } }
-        };
-        return { type: 'message', sessionId: '550e8400-e29b-41d4-a716-446655440000', content: 'Le parcours brouillon a été exécuté et vérifié.' };
-      }
-    });
-    await grantAIConsent(sidebar);
-    await sidebar.locator('#menuBtn').click();
-    await sidebar.locator('#evaluationBtn').click();
-    await sidebar.locator('#evaluationToken').fill(evaluationCode);
-    await sidebar.locator('#evaluationStart').click();
-    await expect(sidebar.locator('.message.system .message-content')).toContainText('Test réel actif');
 
-    const evaluationLiveToken = await sidebar.evaluate(() => chrome.runtime.sendMessage({
-      type: 'GET_LIVE_TOKEN',
-      context: { trainingMode: false }
-    }));
-    expect(evaluationLiveToken).toMatchObject({ ok: true, token: 'auth_tokens/e2e-voice-token' });
-    expect(calls.liveToken.at(-1).postDataJSON()).toMatchObject({ evaluationCode, history: [] });
-    expect(calls.liveToken.at(-1).postDataJSON()).not.toHaveProperty('sessionId');
-
-    await sidebar.locator('#userInput').fill('Connecte HubSpot');
-    await sidebar.locator('#sendBtn').click();
-    await expect(limova.locator('#connectHubspot')).toHaveAttribute('data-clicked', 'true');
-    await expect(sidebar.locator('.message.assistant .message-content')).toContainText('exécuté et vérifié');
-    expect(calls.adkTurns[0].postDataJSON()).toMatchObject({ evaluationCode });
-    expect(calls.adkResults).toHaveLength(2);
-
-    await sidebar.locator('#menuBtn').click();
-    await sidebar.locator('#evaluationBtn').click();
-    await sidebar.locator('#evaluationCorrect').click();
-    await expect(sidebar.locator('#evaluationFeedback')).toContainText('Test réussi · 100/100');
-    const evaluationPaths = calls.evaluations.map(request => new URL(request.url()).pathname);
-    expect(evaluationPaths).toContain('/api/evaluations/runs/connect');
-    expect(evaluationPaths).toContain('/api/evaluations/runs/events');
-    expect(evaluationPaths).toContain('/api/evaluations/runs/complete');
-  });
 
 
 
