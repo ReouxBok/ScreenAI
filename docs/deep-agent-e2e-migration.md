@@ -206,3 +206,9 @@ La recette de formation garde maintenant le micro actif pendant les contrôles, 
 Chaque plan natif affiche le nombre d’étapes `completed` parmi les éléments `write_todos` reçus du backend, avec une barre accessible traduite en français, anglais et espagnol. Le test du chat vérifie 1/3 puis 3/3, la conservation des anciens plans, le rechargement, le changement de langue et l’absence de plan dans une nouvelle conversation. Aucun état métier d’onboarding supplémentaire n’est stocké dans l’extension.
 
 Cette progression décrit le plan émis par Charly ; elle ne certifie pas l’exécution des actions et ne mesure pas l’onboarding global du compte. Les statuts sont simulés dans cette recette Chromium. La consultation réelle de la trame Studio et la qualification du parcours complet restent des validations distinctes ; les trois scénarios legacy sont conservés.
+
+## Publication de la trame et lecture MCP
+
+La recette PostgreSQL `studio/test/mcp-postgres.spec.ts` utilise désormais les services réels d’enregistrement et de publication d’une trame. Le même client MCP HTTPS continue de recevoir la version publiée précédente après création du brouillon, puis reçoit la nouvelle révision, les consignes, l’étape optionnelle et ses critères de réussite après publication. La recherche expose la nouvelle révision de connaissances et les deux opérations produisent leurs audits en base. Les brouillons des contenus et les contenus privés restent absents de la réponse.
+
+Quatre scénarios passent sur une base locale temporaire avec les migrations du Studio. Cette preuve concerne le cycle de publication et le transport MCP réel ; elle ne comprend pas le modèle Charly, l’API NestJS, les traces LangSmith distantes ou l’interface d’édition Studio. Le scénario legacy d’onboarding reste conservé jusqu’à qualification de la chaîne complète.

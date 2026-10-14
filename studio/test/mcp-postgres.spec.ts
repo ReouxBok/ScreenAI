@@ -8,10 +8,12 @@ import postgres from "postgres";
 import { drizzle } from "drizzle-orm/postgres-js";
 import { migrate } from "drizzle-orm/postgres-js/migrator";
 import { eq, inArray } from "drizzle-orm";
+import { z } from "zod";
 import { POST } from "@/app/api/mcp/route";
 import { closeDb, requireDb } from "@/db";
 import * as schema from "@/db/schema";
 import { deterministicEmbedding } from "@/lib/embeddings";
+import { publishOnboardingTemplate, saveOnboardingTemplateDraft } from "@/lib/onboarding-template";
 
 const databaseUrl = process.env.STUDIO_MCP_TEST_DATABASE_URL;
 if (!databaseUrl) throw new Error("STUDIO_MCP_TEST_DATABASE_URL must name an isolated local test database");
@@ -23,8 +25,9 @@ const token = randomUUID() + randomUUID();
 const actor = "mcp-fixture@example.test";
 const query = "connecter gmail";
 const revision = `mcp-test-${randomUUID()}`;
+const revisionIds = [revision];
 const itemIds: string[] = [];
-const templateIds = [randomUUID(), randomUUID()];
+const templateIds: string[] = [randomUUID(), randomUUID()];
 let server: Server | undefined;
 let client: Client | undefined;
 let sql: ReturnType<typeof postgres> | undefined;
@@ -106,8 +109,8 @@ afterAll(async () => {
     const db = requireDb();
     await db.delete(schema.activeOnboardingTemplate).where(inArray(schema.activeOnboardingTemplate.publishedVersionId, templateIds));
     await db.delete(schema.onboardingTemplateVersions).where(inArray(schema.onboardingTemplateVersions.id, templateIds));
-    await db.delete(schema.activeKnowledge).where(eq(schema.activeKnowledge.revisionId, revision));
-    await db.delete(schema.knowledgeRevisions).where(eq(schema.knowledgeRevisions.id, revision));
+    await db.delete(schema.activeKnowledge).where(inArray(schema.activeKnowledge.revisionId, revisionIds));
+    await db.delete(schema.knowledgeRevisions).where(inArray(schema.knowledgeRevisions.id, revisionIds));
     await db.delete(schema.contentItems).where(inArray(schema.contentItems.id, itemIds));
   }
   await closeDb();
@@ -140,6 +143,50 @@ describe.sequential("Studio MCP with migrated PostgreSQL and real content servic
       expect(result.isError).toBe(true);
       expect(JSON.stringify(result.content)).not.toContain("PRIVATE_");
     }
+  });
+
+  it("exposes a saved journey only after publication, with its steps and revision", async () => {
+    const definition = {
+      name: "Parcours connexion Gmail",
+      openingPrompt: "Demande le sujet que le membre veut traiter.",
+      fallbackPrompt: "Propose un parcours adapté sans forcer.",
+      nodes: [{ id: "connect-gmail", contentItemId: publishedId, depth: 0,
+        trigger: "Le membre souhaite connecter Gmail", optional: true }],
+    };
+    const draft = await saveOnboardingTemplateDraft(definition, actor, "Qualifier le parcours MCP");
+    templateIds.push(draft.id);
+    const readGuidance = async () => {
+      const result = await client!.callTool({ name: "get_onboarding_guidance", arguments: {} });
+      expect(result.isError).not.toBe(true);
+      const [block] = z.array(z.object({ type: z.literal("text"), text: z.string() })).min(1).parse(result.content);
+      return JSON.parse(block.text);
+    };
+    expect(await readGuidance()).toMatchObject({ revision: "onboarding_v1", name: "Published journey" });
+    expect(JSON.stringify(await readGuidance())).not.toContain(definition.openingPrompt);
+
+    const publication = await publishOnboardingTemplate(draft.id, actor);
+    revisionIds.push(publication.revision);
+    expect(publication.version).toBe(draft.version);
+    expect(await readGuidance()).toMatchObject({
+      revision: `onboarding_v${draft.version}`, version: draft.version,
+      name: definition.name, openingPrompt: definition.openingPrompt,
+      fallbackPrompt: definition.fallbackPrompt,
+      steps: [{ id: "connect-gmail", contentItemId: publishedId, depth: 0, optional: true,
+        trigger: definition.nodes[0].trigger, successCriteria: ["Gmail connecté"],
+        completionHint: "Gmail connecté" }],
+      publishedAt: expect.any(String),
+    });
+    const guidance = await readGuidance();
+    expect(guidance.steps).toHaveLength(1);
+    expect(guidance.steps[0].description).toContain("PUBLIC_GUIDANCE");
+    expect(JSON.stringify(guidance)).not.toContain("PRIVATE_");
+    const search = await client!.callTool({ name: "search_knowledge", arguments: { query } });
+    expect(search.isError).not.toBe(true);
+    expect(JSON.stringify(search.content)).toContain(publication.revision);
+    const audits = await requireDb().select().from(schema.auditLogs).where(eq(schema.auditLogs.entityId, draft.id));
+    expect(audits.map(row => row.action)).toEqual(expect.arrayContaining([
+      "onboarding_template_draft_saved", "onboarding_template_published",
+    ]));
   });
 
   it("stops returning a published item as soon as AI access is disabled", async () => {
