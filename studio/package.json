@@ -14,6 +14,7 @@
     "test:e2e": "playwright test",
     "db:generate": "drizzle-kit generate",
     "db:migrate": "tsx scripts/migrate.ts",
+    "memory:inventory": "tsx scripts/inventory-legacy-memory.ts",
     "memory:generate": "drizzle-kit generate --config drizzle.memory.config.ts",
     "memory:migrate": "tsx scripts/migrate-memory.ts",
     "kb:import": "tsx scripts/import-markdown.ts",
