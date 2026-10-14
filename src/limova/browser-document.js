@@ -85,18 +85,19 @@ export function browserDocumentCommand(request) {
     };
     const sensitive = element => /password|passcode|secret|token|api.?key|credit|card|payment|iban|cvv/i.test(
       ['type', 'name', 'autocomplete', 'aria-label'].map(name => element.getAttribute(name) ?? '').join(' '));
+    const privateSelector = '[data-private],[data-sensitive],[data-limova-private]';
     const fingerprint = element => JSON.stringify([
       element.tagName, ...['href', 'type', 'name', 'role', 'aria-label', 'placeholder'].map(name => element.getAttribute(name)),
       element.matches('input,textarea,[contenteditable="true"]') ? null : element.textContent,
     ]);
-    const readText = () => {
-      const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
+    const readText = (root = document.body, limit = 16000) => {
+      const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
       const parts = [];
       let size = 0, visited = 0, node;
-      while (size < 16000 && visited++ < 10000 && (node = walker.nextNode())) {
+      while (size < limit && visited++ < 10000 && (node = walker.nextNode())) {
         const parent = node.parentElement;
-        if (!parent || parent.closest('script,style,noscript,input,textarea,select,[contenteditable="true"],[data-private],[data-sensitive]') || !visible(parent) || sensitive(parent)) continue;
-        const text = node.textContent.trim().replace(/\s+/g, ' ').slice(0, 16000 - size);
+        if (!parent || parent.closest(`script,style,noscript,input,textarea,select,[contenteditable],${privateSelector}`) || !visible(parent) || sensitive(parent)) continue;
+        const text = node.textContent.trim().replace(/\s+/g, ' ').slice(0, limit - size);
         if (text) { parts.push(text); size += text.length + 1; }
       }
       return parts.join(' ');
@@ -129,13 +130,13 @@ export function browserDocumentCommand(request) {
       }
       if (input.operation === 'read_page') {
         elements = new Map();
-        const candidates = [...document.querySelectorAll('button,a[href],input,textarea,select,[contenteditable="true"],[role="button"],[role="tab"]')]
-          .filter(element => visible(element) && !sensitive(element) && !element.closest('[data-private],[data-sensitive]')).slice(0, 60);
+        const candidates = [...document.querySelectorAll('button,a[href],input,textarea,select,[contenteditable="true"],[role="button"],[role="tab"],[role="link"],[role="menuitem"],[role="switch"],[role="checkbox"],[role="option"],[tabindex="0"],[onclick],.cursor-pointer')]
+          .filter(element => visible(element) && !sensitive(element) && !element.closest(privateSelector)).slice(0, 60);
         const descriptions = candidates.map((element, index) => {
           const id = index + 1;
           elements.set(id, { element, fingerprint: fingerprint(element) });
           return { elementId: id, tag: element.tagName.toLowerCase().slice(0, 50), role: element.getAttribute('role')?.slice(0, 80) ?? null,
-            label: (element.getAttribute('aria-label') ?? element.getAttribute('placeholder') ?? element.innerText ?? '').slice(0, 160) };
+            label: (element.getAttribute('aria-label') ?? element.getAttribute('placeholder') ?? readText(element, 160)).slice(0, 160) };
         });
         version = input.nextContextVersion;
         const observation = { title: document.title.slice(0, 200),
@@ -156,12 +157,16 @@ export function browserDocumentCommand(request) {
       if (!['click', 'type_text', 'highlight'].includes(input.operation)) return rejected('Unsupported document operation');
       const reference = elements.get(input.elementId);
       const element = reference?.element;
-      if (!(element instanceof HTMLElement) || !visible(element) || sensitive(element) || reference.fingerprint !== fingerprint(element) || element.matches(':disabled,[aria-disabled="true"],[readonly]')) return rejected('Target unavailable');
+      const targetAvailable = () => element instanceof HTMLElement && visible(element) && !sensitive(element)
+        && !element.closest(privateSelector) && reference.fingerprint === fingerprint(element)
+        && !element.matches(':disabled,[aria-disabled="true"],[readonly]');
+      if (!targetAvailable()) return rejected('Target unavailable');
       const rect = element.getBoundingClientRect();
       const x = rect.left + rect.width / 2, y = rect.top + rect.height / 2;
       if (x < 0 || y < 0 || x >= innerWidth || y >= innerHeight) return rejected('Target outside viewport');
       const top = document.elementFromPoint(x, y);
       if (!top || (top !== element && !element.contains(top))) return rejected('Target covered');
+      let observation = 'Action dispatched; read the page to verify its result.';
       if (input.operation === 'type_text') {
         if (sensitive(element) || !element.matches('input:not([type="file"]):not([type="checkbox"]):not([type="radio"]):not([type="submit"]):not([type="button"]):not([type="reset"]),textarea,[contenteditable="true"]')
           || typeof input.text !== 'string' || input.text.length > 8000) return rejected('Text target not permitted');
@@ -177,10 +182,29 @@ export function browserDocumentCommand(request) {
         element.dispatchEvent(new Event('change', { bubbles: true }));
       } else if (input.operation === 'click') {
         showPointer(x, y);
-        element.click();
+        const stillAtTarget = () => {
+          const current = document.elementFromPoint(x, y);
+          return targetAvailable() && current && (current === element || element.contains(current));
+        };
+        const pointer = (type, buttons) => element.dispatchEvent(new PointerEvent(type, {
+          bubbles: true, cancelable: true, composed: true, clientX: x, clientY: y,
+          button: 0, buttons, pointerId: 1, pointerType: 'mouse', isPrimary: true,
+        }));
+        const mouse = (type, buttons) => element.dispatchEvent(new MouseEvent(type, {
+          bubbles: true, cancelable: true, composed: true, clientX: x, clientY: y, button: 0, buttons, detail: 1,
+        }));
+        const compatibilityMouse = pointer('pointerdown', 1);
+        if (stillAtTarget() && compatibilityMouse) {
+          const focusAllowed = mouse('mousedown', 1);
+          if (focusAllowed && stillAtTarget()) element.focus({ preventScroll: true });
+        }
+        if (stillAtTarget()) pointer('pointerup', 0);
+        if (stillAtTarget() && compatibilityMouse) mouse('mouseup', 0);
+        if (stillAtTarget()) element.click();
+        else observation = 'Pointer events dispatched, but the target changed before click. Read the page before deciding another action.';
       } else element.animate([{ outline: '3px solid #7c3aed' }, { outline: '3px solid transparent' }], { duration: 1000 });
       version = input.nextContextVersion;
-      return { status: 'completed', observation: 'Action dispatched; read the page to verify its result.', binding: binding() };
+      return { status: 'completed', observation, binding: binding() };
     };
     Object.defineProperty(globalThis, key, { value: dispatch, configurable: false, writable: false });
   }

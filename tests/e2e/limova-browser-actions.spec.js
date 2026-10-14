@@ -144,3 +144,103 @@ for (const operation of ['click', 'type_text']) test(`native ${operation} shows 
   expect(await app.evaluate(() => ({ clicks: window.clicks, inputs: window.inputEvents })))
     .toEqual(operation === 'click' ? { clicks: 1, inputs: 0 } : { clicks: 0, inputs: 1 });
 });
+
+for (const observe of [false, true]) test(`native ${observe ? 'analysis refuses' : 'consented action activates'} a custom integration control`, async ({ nativeChat }) => {
+  const { panel, app, calls, state, legacy, errors } = nativeChat;
+  state.reply = 'Action traitée.';
+  await app.evaluate(() => {
+    const main = document.querySelector('main');
+    main.replaceChildren();
+    const heading = document.createElement('h1'); heading.textContent = 'Intégrations';
+    const description = document.createElement('p'); description.textContent = 'Connectez votre compte Gmail';
+    const control = document.createElement('div'); control.className = 'cursor-pointer'; control.id = 'gmail-control';
+    control.style.cssText = 'width:180px;padding:16px';
+    control.textContent = 'Gmail';
+    const secret = document.createElement('span'); secret.dataset.limovaPrivate = ''; secret.textContent = 'PRIVATE_CONTROL_VALUE';
+    control.append(secret);
+    const hidden = document.createElement('span'); hidden.hidden = true; hidden.textContent = 'PRIVATE_HIDDEN_LABEL'; control.append(hidden);
+    const draft = document.createElement('textarea'); draft.textContent = 'PRIVATE_NESTED_FIELD'; control.append(draft);
+    window.controlEvents = [];
+    for (const type of ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click']) control.addEventListener(type, event => {
+      window.controlEvents.push({ type, buttons: event.buttons, pointer: Boolean(document.querySelector('[data-limova-native-pointer]')) });
+      if (type === 'pointerdown') control.dataset.activated = 'true';
+    });
+    main.append(heading, description, control);
+  });
+  state.browserActions = [read, body => ({ operation: 'click', elementId: reference(body, 'Gmail') }), read];
+  await send(panel, 'Ouvre la connexion Gmail', observe);
+  expect(await app.locator('#gmail-control').getAttribute('data-activated')).toBe(observe ? null : 'true');
+  const events = await app.evaluate(() => window.controlEvents);
+  expect(events.map(event => event.type)).toEqual(observe ? [] : ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click']);
+  if (!observe) {
+    expect(events.every(event => event.pointer)).toBe(true);
+    expect(events.find(event => event.type === 'pointerup').buttons).toBe(0);
+  }
+  const receipts = messageCalls(calls).slice(1).map(call => call.body.browserResult);
+  expect(receipts.map(receipt => receipt.status)).toEqual(['completed', observe ? 'rejected' : 'completed', 'completed']);
+  expect(receipts[0].observation).toContain('Connectez votre compte Gmail');
+  expect(JSON.stringify(receipts)).not.toMatch(/PRIVATE_CONTROL_VALUE|PRIVATE_NESTED_FIELD|PRIVATE_HIDDEN_LABEL/);
+  await expect(panel.locator('.action-card')).toHaveCount(0);
+  expect(legacy).toEqual([]);
+  expect(errors).toEqual([]);
+});
+
+for (const change of ['detach', 'private', 'covered']) test(`native click stops its remaining events when pointerdown makes the target ${change}`, async ({ nativeChat }) => {
+  const { panel, app, calls, state } = nativeChat;
+  state.reply = 'Action traitée.';
+  await app.evaluate(change => {
+    const target = document.querySelector('#action');
+    window.pointerDowns = 0;
+    target.addEventListener('pointerdown', () => {
+      window.pointerDowns++;
+      if (change === 'detach') {
+        const replacement = target.cloneNode(true);
+        replacement.onclick = () => window.clicks++;
+        target.replaceWith(replacement);
+      } else if (change === 'private') target.dataset.limovaPrivate = '';
+      else {
+        const cover = document.createElement('div');
+        cover.style.cssText = 'position:fixed;inset:0;z-index:100000;background:white';
+        document.body.append(cover);
+      }
+    });
+  }, change);
+  state.browserActions = [read, body => ({ operation: 'click', elementId: reference(body, 'Continuer') })];
+  await send(panel, 'Clique sur Continuer');
+  expect(await app.evaluate(() => ({ clicks: window.clicks, down: window.pointerDowns }))).toEqual({ clicks: 0, down: 1 });
+  expect(messageCalls(calls).at(-1).body.browserResult.status).toBe('completed');
+  expect(messageCalls(calls).at(-1).body.browserResult.observation).toContain('target changed before click');
+  expect(messageCalls(calls)).toHaveLength(3);
+});
+
+for (const destination of [
+  { path: '/profil', label: 'Ouvrir mon profil', request: 'Ouvre mon profil' },
+  { path: '/integrations/catalog', label: 'Intégrations', request: 'Je veux connecter Gmail, emmène-moi là où je peux le faire.' },
+]) test(`native named navigation reaches ${destination.path} as an authorized step in the same turn`, async ({ nativeChat }) => {
+  const { app, panel, state, calls, legacy, errors } = nativeChat;
+  state.reply = 'Action traitée.';
+  await app.evaluate(({ path, label }) => {
+    const link = document.createElement('a');
+    link.href = path; link.textContent = label;
+    link.addEventListener('click', () => {
+      sessionStorage.setItem('nativeNavigation', JSON.stringify({
+        clicks: Number(sessionStorage.getItem('nativeNavigationCount') ?? 0) + 1,
+        pointer: Boolean(document.querySelector('[data-limova-native-pointer]')),
+      }));
+      sessionStorage.setItem('nativeNavigationCount', '1');
+    });
+    document.querySelector('main').prepend(link);
+  }, destination);
+  state.browserActions = [read, body => ({ operation: 'click', elementId: reference(body, destination.label) }), read];
+  await send(panel, destination.request);
+  await expect(app).toHaveURL(`${APP}${destination.path}`);
+  expect(await app.evaluate(() => JSON.parse(sessionStorage.getItem('nativeNavigation')))).toEqual({ clicks: 1, pointer: true });
+  const receipts = messageCalls(calls).slice(1).map(call => call.body.browserResult);
+  expect(receipts.map(receipt => receipt.status)).toEqual(['completed', 'completed', 'completed']);
+  expect(new Set(receipts.map(receipt => receipt.turnId)).size).toBe(1);
+  expect(JSON.parse(receipts.at(-1).observation).url).toBe(`${APP}${destination.path}`);
+  await expect(panel.locator('.action-card')).toHaveCount(0);
+  await expect(panel.locator('.message.error')).toHaveCount(0);
+  expect(legacy).toEqual([]);
+  expect(errors).toEqual([]);
+});
