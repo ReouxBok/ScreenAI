@@ -4,9 +4,10 @@ import { createSavTestDb } from "../../../test/sav-db";
 import { auditLogs, categories, contentItems, contentVersions, knowledgeFamilies, knowledgeProjectionCandidates, savKnowledgeActivations, savKnowledgePublicationAttempts, savLearningCandidates } from "@/db/schema";
 import type { SaveSavKnowledgeProposalInput } from "./proposals";
 import { canonicalKnowledgeSchema } from "./contracts";
+import { articleMetadataSchema } from "@/lib/content";
 import { saveSavKnowledgeProposal, previewSavKnowledgeProposal, submitSavKnowledgeProposal, previewSavKnowledgeReview, reviewSavKnowledgeProposal, publishSavKnowledgeVersion, activateSavKnowledgeVersion, startSavKnowledgeRevision, paginateSavKnowledge, getSavKnowledgeDetail } from "./workspace";
 import { searchKnowledge } from "@/lib/search";
-import { rollback, setContentAiEnabled } from "@/lib/workflow";
+import { rollback, saveDraft, setContentAiEnabled } from "@/lib/workflow";
 import { encryptSavPayload, savContentHash } from "@/lib/sav/crypto";
 
 const state = vi.hoisted(() => ({ db: null as unknown, embed: vi.fn(async (texts: string[]) => texts.map(() => Array(768).fill(1))) }));
@@ -192,6 +193,37 @@ describe("SAV-55 canonical knowledge workspace", () => {
     await expect(submitSavKnowledgeProposal({ draftId: draft.id, snapshot: preview.snapshot }, contact)).rejects.toThrow("KNOWLEDGE_PROPOSAL_INCOMPLETE");
     await expect(saveSavKnowledgeProposal({ ...proposal, document: { ...draft.document, steps: [{ ...draft.document.steps[0], instruction: "client.private@example.test" }] } }, contact)).rejects.toThrow("ONBOARDING_KNOWLEDGE_UNSAFE_CONTENT");
     expect(await fixture.db.select().from(knowledgeProjectionCandidates)).toHaveLength(0);
+  });
+
+  it("keeps an expired active version visible for revalidation without listing it as production", async () => {
+    const approved = await active();
+    const [version] = await fixture.db.select().from(contentVersions).where(eq(contentVersions.id, approved.materializedVersionId!));
+    await fixture.db.update(contentVersions).set({ metadata: { ...version.metadata, resolution: { ...articleMetadataSchema.parse(version.metadata).resolution!, validUntil: "2000-01-01" } } }).where(eq(contentVersions.id, version.id));
+    expect((await paginateSavKnowledge({ tab: "production" })).total).toBe(0);
+    const human = await paginateSavKnowledge({ tab: "human", status: "needs_revalidation" });
+    expect(human.total).toBe(1);
+    expect(human.rows[0]).toMatchObject({ candidateId: approved.id, state: "needs_revalidation", origin: "human" });
+    expect(human.counts).toMatchObject({ production: 0, human: 1 });
+    expect((await searchKnowledge({ query: "Renommer un espace", scope: "sav", contentTypes: ["article"] })).results).toHaveLength(0);
+  });
+  it("lists historical SAV drafts and inactive publications with unknown provenance, without duplicating candidates", async () => {
+    const current = await active();
+    const [base] = await fixture.db.select().from(contentVersions).where(eq(contentVersions.id, current.materializedVersionId!));
+    const legacy = await saveDraft({ type: "article", slug: "legacy-internal", locale: "fr-FR", title: "Ancienne procédure sans candidat", summary: "Fiche historique à qualifier", categorySlug: "depannage", visibility: "charly_only", agentKey: "sav", ownerEmail: actor, bodyMarkdown: base.bodyMarkdown, changeNote: "Fiche historique de démonstration", metadata: { ...base.metadata, sourceMetadata: {} } }, actor);
+    let automatic = await paginateSavKnowledge({ tab: "automatic" });
+    expect(automatic.rows).toHaveLength(1);
+    expect(automatic.rows[0]).toMatchObject({ itemId: legacy.item.id, state: "draft", origin: "unknown" });
+    await fixture.db.update(contentItems).set({ status: "in_review" }).where(eq(contentItems.id, legacy.item.id));
+    expect((await paginateSavKnowledge({ tab: "automatic", status: "pending" })).total).toBe(1);
+    await publishSavKnowledgeVersion({ itemId: legacy.item.id, expectedVersionId: legacy.version.id }, actor);
+    automatic = await paginateSavKnowledge({ tab: "automatic" });
+    expect(automatic.rows[0]).toMatchObject({ itemId: legacy.item.id, state: "published_inactive", origin: "unknown" });
+    expect(automatic.counts).toMatchObject({ production: 1, automatic: 1, human: 0 });
+    await activateSavKnowledgeVersion({ itemId: legacy.item.id, expectedPublishedVersionId: legacy.version.id, expectedActiveVersionId: null }, actor);
+    await setContentAiEnabled(legacy.item.id, false, actor);
+    expect((await paginateSavKnowledge({ tab: "automatic" })).rows[0]).toMatchObject({ itemId: legacy.item.id, state: "published_inactive" });
+    await fixture.db.update(contentVersions).set({ metadata: { ...legacy.version.metadata, resolution: { ...articleMetadataSchema.parse(legacy.version.metadata).resolution!, validUntil: "2000-01-01" } } }).where(eq(contentVersions.id, legacy.version.id));
+    expect((await paginateSavKnowledge({ tab: "automatic", status: "needs_revalidation" })).total).toBe(1);
   });
 
 });

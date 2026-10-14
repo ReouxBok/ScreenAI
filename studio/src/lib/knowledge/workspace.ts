@@ -24,21 +24,26 @@ const workspaceRows = sql`
  WITH catalogue AS (
  SELECT item.id, 'item'::text AS kind, item.id AS item_id, NULL::uuid AS candidate_id, NULL::uuid AS draft_id, NULL::uuid AS learning_candidate_id,
    (SELECT p.family_id FROM knowledge_projections p WHERE p.item_id=item.id AND p.surface='sav' LIMIT 1) AS family_id,
-   active.title, item.summary,
+   coalesce(active.title,item.title) AS title, item.summary,
    coalesce((SELECT CASE WHEN source.evidence->>'origin' IN ('human','automatic') THEN source.evidence->>'origin' WHEN source.evidence->>'importKind' IN ('hubspot','onboarding_catalog') OR source.source_ref LIKE 'sav-learning:%' OR source.source_ref LIKE 'content:%' OR source.source_ref LIKE 'training:%' THEN 'automatic' ELSE 'unknown' END
-     FROM knowledge_family_sources source WHERE source.id IN (SELECT c.source_id FROM knowledge_projection_candidates c WHERE c.materialized_version_id=active.version_id) OR source.revision_id IN (SELECT p.revision_id FROM knowledge_projections p WHERE p.version_id=active.version_id AND p.surface='sav') ORDER BY source.created_at DESC LIMIT 1),'unknown') AS origin, 'production'::text AS state, version.version, active.activated_at AS updated_at,
-   'Version activée dans le SAV'::text AS source_label, active.version_id AS active_version_id, item.published_version_id,
+     FROM knowledge_family_sources source WHERE source.id IN (SELECT c.source_id FROM knowledge_projection_candidates c WHERE c.materialized_version_id=version.id) OR source.revision_id IN (SELECT p.revision_id FROM knowledge_projections p WHERE p.version_id=version.id AND p.surface='sav') ORDER BY source.created_at DESC LIMIT 1),'unknown') AS origin,
+   CASE WHEN active.version_id IS NOT NULL AND item.ai_enabled AND EXISTS(SELECT 1 FROM content_chunks chunk WHERE chunk.item_id=item.id AND chunk.version_id=active.version_id)
+     THEN CASE WHEN ${savResolutionIsCurrent} THEN 'production' ELSE 'needs_revalidation' END
+     WHEN item.published_version_id IS NOT NULL THEN CASE WHEN NOT coalesce((${savResolutionIsCurrent}),false) THEN 'needs_revalidation' WHEN EXISTS(SELECT 1 FROM content_chunks chunk WHERE chunk.item_id=item.id AND chunk.version_id=item.published_version_id) THEN 'published_inactive' ELSE 'unavailable' END
+     WHEN item.status='in_review' THEN 'pending' ELSE 'draft' END AS state,
+   version.version, coalesce(active.activated_at,item.updated_at) AS updated_at,
+   CASE WHEN active.version_id IS NOT NULL AND item.ai_enabled THEN 'Version activée dans le SAV' ELSE 'Fiche SAV historique · provenance à qualifier' END AS source_label, active.version_id AS active_version_id, item.published_version_id,
    (EXISTS(SELECT 1 FROM sav_knowledge_proposal_drafts d WHERE d.target_item_id=item.id AND d.status='draft') OR EXISTS(SELECT 1 FROM knowledge_projection_candidates c WHERE c.target_item_id=item.id AND c.target_surface='sav' AND NOT EXISTS(SELECT 1 FROM sav_knowledge_proposal_drafts replacement WHERE replacement.source_candidate_id=c.id) AND (c.status IN ('pending','needs_completion') OR c.status='approved' AND c.materialized_version_id IS DISTINCT FROM active.version_id AND c.materialized_version_id IN (item.current_draft_version_id,item.published_version_id)))) AS has_pending_update
- FROM content_items item JOIN sav_knowledge_activations active ON active.item_id=item.id JOIN content_versions version ON version.id=active.version_id
- WHERE item.agent_key='sav' AND item.type='article' AND item.status <> 'archived' AND item.ai_enabled=true
-   AND EXISTS(SELECT 1 FROM content_chunks chunk WHERE chunk.item_id=item.id AND chunk.version_id=active.version_id)
-   AND ${savResolutionIsCurrent}
+ FROM content_items item LEFT JOIN sav_knowledge_activations active ON active.item_id=item.id LEFT JOIN content_versions version ON version.id=coalesce(CASE WHEN item.ai_enabled THEN active.version_id END,item.published_version_id,item.current_draft_version_id,active.version_id)
+ WHERE item.agent_key='sav' AND item.type='article' AND item.status <> 'archived'
+   AND ((active.version_id IS NOT NULL AND item.ai_enabled AND EXISTS(SELECT 1 FROM content_chunks chunk WHERE chunk.item_id=item.id AND chunk.version_id=active.version_id) AND ${savResolutionIsCurrent})
+     OR NOT EXISTS(SELECT 1 FROM knowledge_projection_candidates c WHERE c.target_item_id=item.id AND c.target_surface='sav' AND c.materialized_version_id IN (active.version_id,item.published_version_id,item.current_draft_version_id)))
  UNION ALL
  SELECT candidate.id, 'candidate', candidate.target_item_id, candidate.id, NULL::uuid, NULL::uuid, candidate.family_id,
    coalesce(candidate.proposed_input->>'title',family.title), candidate.explanation, ${originExpression},
    CASE WHEN EXISTS(SELECT 1 FROM sav_knowledge_proposal_drafts replacement WHERE replacement.source_candidate_id=candidate.id) THEN 'superseded' WHEN candidate.status='approved' AND candidate.materialized_version_id IS NOT NULL AND candidate.materialized_version_id IS DISTINCT FROM active.version_id AND candidate.materialized_version_id IS DISTINCT FROM item.current_draft_version_id AND candidate.materialized_version_id IS DISTINCT FROM item.published_version_id THEN 'superseded' WHEN candidate.status='approved' THEN
-     CASE WHEN active.version_id=candidate.materialized_version_id AND item.ai_enabled AND item.status<>'archived' AND EXISTS(SELECT 1 FROM content_chunks chunk WHERE chunk.version_id=active.version_id AND chunk.item_id=item.id) THEN 'production'
-       WHEN item.published_version_id=candidate.materialized_version_id THEN 'published_inactive'
+     CASE WHEN active.version_id=candidate.materialized_version_id AND item.ai_enabled AND item.status<>'archived' AND EXISTS(SELECT 1 FROM content_chunks chunk WHERE chunk.version_id=active.version_id AND chunk.item_id=item.id) THEN CASE WHEN ${savResolutionIsCurrent} THEN 'production' ELSE 'needs_revalidation' END
+       WHEN item.published_version_id=candidate.materialized_version_id THEN CASE WHEN NOT coalesce((${savResolutionIsCurrent}),false) THEN 'needs_revalidation' WHEN EXISTS(SELECT 1 FROM content_chunks chunk WHERE chunk.item_id=item.id AND chunk.version_id=candidate.materialized_version_id) THEN 'published_inactive' ELSE 'unavailable' END
        WHEN (SELECT attempt.status FROM sav_knowledge_publication_attempts attempt WHERE attempt.version_id=candidate.materialized_version_id ORDER BY attempt.created_at DESC LIMIT 1)='failed' THEN 'index_error'
        WHEN (SELECT attempt.status FROM sav_knowledge_publication_attempts attempt WHERE attempt.version_id=candidate.materialized_version_id ORDER BY attempt.created_at DESC LIMIT 1)='indexing' THEN 'indexing'
        ELSE 'approved' END
@@ -62,7 +67,7 @@ const workspaceRows = sql`
  WHERE learning.status='pending' AND NOT EXISTS(SELECT 1 FROM sav_knowledge_proposal_drafts draft WHERE draft.learning_candidate_id=learning.id)
  )`;
 function resultRows<T>(result: unknown): T[] { return (Array.isArray(result) ? result : (result as { rows: T[] }).rows) as T[]; }
-const actions: Record<string, string> = { production: "Consulter la version active", pending: "Examiner la proposition", draft: "Terminer puis soumettre", needs_completion: "Compléter les sources ou la procédure", approved: "Publier la version validée", published_inactive: "Activer la version publiée", index_error: "Vérifier l’erreur de publication", indexing: "Publication en attente", rejected: "Consulter le motif du refus", superseded: "Consulter la proposition suivante", needs_recording: "Compléter la démonstration", not_applicable: "Qualifier la proposition" };
+const actions: Record<string, string> = { production: "Consulter la version active", needs_revalidation: "Vérifier la validité et proposer une version à revalider", unavailable: "Vérifier pourquoi cette version est indisponible", pending: "Examiner la proposition", draft: "Terminer puis soumettre", needs_completion: "Compléter les sources ou la procédure", approved: "Publier la version validée", published_inactive: "Activer la version publiée", index_error: "Vérifier l’erreur de publication", indexing: "Publication en attente", rejected: "Consulter le motif du refus", superseded: "Consulter la proposition suivante", needs_recording: "Compléter la démonstration", not_applicable: "Qualifier la proposition" };
 function rowDto(raw: Record<string, unknown>): SavKnowledgeRow {
   return { id: String(raw.id), kind: raw.kind as SavKnowledgeRow["kind"], itemId: raw.item_id as string | null, candidateId: raw.candidate_id as string | null, draftId: raw.draft_id as string | null, learningCandidateId: raw.learning_candidate_id as string | null, familyId: raw.family_id as string | null, title: String(raw.title || "Brouillon sans titre"), summary: String(raw.summary), origin: raw.origin as SavKnowledgeOrigin, state: String(raw.state), version: raw.version == null ? null : Number(raw.version), updatedAt: new Date(String(raw.updated_at)), sourceLabel: String(raw.source_label), activeVersionId: raw.active_version_id as string | null, publishedVersionId: raw.published_version_id as string | null, hasPendingUpdate: raw.has_pending_update === true, nextAction: actions[String(raw.state)] ?? "Consulter le détail" };
 }
@@ -72,13 +77,13 @@ export async function paginateSavKnowledge(input: { tab?: SavKnowledgeTab; q?: s
   const pageSize = Math.min(50, Math.max(1, Math.floor(input.pageSize ?? 20) || 20));
   const q = (input.q ?? "").trim().slice(0, 200).replace(/[\\%_]/g, "\\$&");
   const search = q ? sql`(title ILIKE ${`%${q}%`} OR summary ILIKE ${`%${q}%`} OR source_label ILIKE ${`%${q}%`})` : sql`TRUE`;
-  const tabFilter = tab === "production" ? sql`kind='item'` : sql`kind<>'item' AND state NOT IN ('production','superseded') AND ${tab === "human" ? sql`origin='human'` : sql`origin IN ('automatic','unknown')`}`;
+  const tabFilter = tab === "production" ? sql`kind='item' AND state='production'` : sql`state NOT IN ('production','superseded') AND ${tab === "human" ? sql`origin='human'` : sql`origin IN ('automatic','unknown')`}`;
   const status = input.status && Object.hasOwn(actions, input.status) ? input.status : "all";
   const filter = sql`${search} AND ${tabFilter} AND ${status === "all" ? sql`TRUE` : sql`state=${status}`}`;
   const countsRows = resultRows<{ production: number; automatic: number; human: number }>(await db.execute(sql`${workspaceRows} SELECT
-   count(*) FILTER(WHERE kind='item')::int AS production,
-   count(*) FILTER(WHERE kind<>'item' AND state NOT IN ('production','superseded') AND origin IN ('automatic','unknown'))::int AS automatic,
-   count(*) FILTER(WHERE kind<>'item' AND state NOT IN ('production','superseded') AND origin='human')::int AS human FROM catalogue WHERE ${search}`));
+   count(*) FILTER(WHERE kind='item' AND state='production')::int AS production,
+   count(*) FILTER(WHERE state NOT IN ('production','superseded') AND origin IN ('automatic','unknown'))::int AS automatic,
+   count(*) FILTER(WHERE state NOT IN ('production','superseded') AND origin='human')::int AS human FROM catalogue WHERE ${search}`));
   const [{ total }] = resultRows<{ total: number }>(await db.execute(sql`${workspaceRows} SELECT count(*)::int AS total FROM catalogue WHERE ${filter}`));
   const page = Math.max(1, Math.min(Math.ceil(total / pageSize) || 1, Math.floor(input.page ?? 1) || 1));
   const rows = resultRows<Record<string, unknown>>(await db.execute(sql`${workspaceRows} SELECT * FROM catalogue WHERE ${filter} ORDER BY updated_at DESC,id DESC LIMIT ${pageSize} OFFSET ${(page - 1) * pageSize}`));
