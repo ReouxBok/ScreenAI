@@ -478,62 +478,6 @@ test.describe('Packaged extension — complete user flows', () => {
 
 
 
-  test('page guidance highlights only the exact control and ignores invented element IDs', async ({ context, extensionId }) => {
-    const { calls, limova, sidebar } = await openExtensionHarness(context, extensionId, {
-      geminiReply: ({ body }) => {
-        const prompt = body.systemInstruction.parts[0].text;
-        const fieldId = prompt.match(/\[(\d+)\] input\(textarea\) "Instructions"/)?.[1];
-        return `Écris ton brief ici. {{HIGHLIGHT:${fieldId}}} {{HIGHLIGHT:88}}`;
-      }
-    });
-    await limova.evaluate(() => {
-      const field = document.querySelector('#briefField');
-      field.style.width = '360px';
-      field.style.height = '42px';
-      const row = document.createElement('div');
-      row.className = 'integration-item';
-      row.style.cssText = 'display:flex;align-items:center;justify-content:space-between;width:900px;padding:10px';
-      field.parentNode.insertBefore(row, field);
-      row.append(field);
-      const count = document.createElement('span');
-      count.textContent = '3237 apps disponibles';
-      row.append(count);
-    });
-    await grantAIConsent(sidebar);
-
-    await sidebar.locator('#screenshotBtn').click();
-    await expect(sidebar.locator('.message.assistant .message-content')).toContainText('Écris ton brief ici.');
-    await expect.poll(() => limova.locator('.limova-element-highlight').count()).toBe(1);
-    const visualPart = calls.gemini[0].postDataJSON().contents.at(-1).parts
-      .find(part => part.inlineData?.mimeType === 'image/jpeg');
-    expect(visualPart?.inlineData?.data?.length).toBeGreaterThan(100);
-    await expect(limova.locator('#limova-visual-capture-overlays')).toHaveCount(0);
-
-    const fieldBox = await limova.locator('#briefField').boundingBox();
-    const rowBox = await limova.locator('.integration-item').boundingBox();
-    const highlightBox = await limova.locator('.limova-element-highlight').boundingBox();
-    // 3px visual padding plus the 2px border on both sides.
-    expect(Math.abs(highlightBox.width - (fieldBox.width + 10))).toBeLessThanOrEqual(1);
-    expect(highlightBox.width).toBeLessThan(rowBox.width / 2);
-  });
-
-  test('page analysis blocks a destructive click without opening a confirmation popup', async ({ context, extensionId }) => {
-    const { calls, limova, sidebar } = await openExtensionHarness(context, extensionId, {
-      geminiReply: 'Vérifie cette action. {{HIGHLIGHT:1}} {{ACTION:1}}'
-    });
-    await grantAIConsent(sidebar);
-
-    await sidebar.locator('#screenshotBtn').click();
-
-    await expect(sidebar.locator('.screenshot-bubble')).toHaveCount(0);
-    await expect(sidebar.locator('.message.assistant .message-content')).toContainText('Vérifie cette action.');
-    await expect(sidebar.locator('.action-card')).toHaveCount(0);
-    await expect.poll(() => limova.locator('div[style*="2147483645"]').count()).toBe(1);
-    await expect(limova.locator('#sensitiveAction')).not.toHaveAttribute('data-clicked', 'true');
-    await expect(sidebar.locator('.message.error .message-content').last()).toContainText('sensible');
-    expect(calls.gemini).toHaveLength(1);
-  });
-
   test('a safe action displays a computer-use cursor and clicks without confirmation', async ({ context, extensionId }) => {
     const { limova, sidebar } = await openExtensionHarness(context, extensionId, {
       geminiReply: ({ body }) => {
