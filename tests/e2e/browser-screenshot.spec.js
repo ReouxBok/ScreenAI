@@ -1,9 +1,12 @@
 import { test, expect } from './fixtures.js';
+import { extensionEnvironment } from '../../scripts/extension-environments.mjs';
+
+const { appOrigin: APP, apiOrigin: API } = extensionEnvironment(process.env.LIMOVA_E2E_ENV ?? 'production');
 
 test.use({ nativeViewport: true });
 
 async function controllerPage(context, extensionId) {
-  await context.route('https://api.new.limova.ai/**', route => route.abort());
+  await context.route(`${API}/**`, route => route.abort());
   const page = await context.newPage();
   await page.goto(`chrome-extension://${extensionId}/src/sidebar/sidebar.html`);
   return page;
@@ -42,7 +45,7 @@ test('rejects changed aspect ratio rather than masking the wrong pixels', async 
 });
 
 test('captures a real active tab and delivers only masked pixels through the assembled driver', async ({ context, extensionId }) => {
-  await context.route('https://new.limova.ai/capture-fixture', route => route.fulfill({ contentType: 'text/html', body: `<!doctype html><html><body style="margin:0;background:white">
+  await context.route(`${APP}/capture-fixture`, route => route.fulfill({ contentType: 'text/html', body: `<!doctype html><html><body style="margin:0;background:white">
     <div style="position:absolute;left:20px;top:20px;width:30px;height:30px;background:blue"></div>
     <input value="SECRET_VALUE" style="position:absolute;left:80px;top:20px;width:80px;height:30px;background:red">
     <div data-private style="position:absolute;left:80px;top:80px;width:80px;height:30px;background:red">PRIVATE</div>
@@ -50,7 +53,7 @@ test('captures a real active tab and delivers only masked pixels through the ass
     <script>document.querySelector('secret-box').attachShadow({mode:'closed'}).innerHTML='<input value="SHADOW_SECRET" style="width:180px;height:30px;background:red">';</script>
   </body></html>` }));
   const site = await context.newPage();
-  await site.goto('https://new.limova.ai/capture-fixture');
+  await site.goto(`${APP}/capture-fixture`);
   const controller = await controllerPage(context, extensionId);
   await site.bringToFront();
   const browserCdp = await context.browser().newBrowserCDPSession();
@@ -95,21 +98,21 @@ test('captures a real active tab and delivers only masked pixels through the ass
 
 
 test('binds masking geometry to the document and observes private-region changes', async ({ context, extensionId }) => {
-  await context.route('https://new.limova.ai/geometry-fixture', route => route.fulfill({ contentType: 'text/html', body: `<!doctype html><html><body>
+  await context.route(`${APP}/geometry-fixture`, route => route.fulfill({ contentType: 'text/html', body: `<!doctype html><html><body>
     <input value="SECRET"><svg width="40" height="40" data-private><text>SECRET_SVG</text></svg>
     <secret-box style="display:block;width:50px;height:50px"></secret-box>
     <script>document.querySelector('secret-box').attachShadow({mode:'closed'}).innerHTML='<input value="SHADOW_SECRET">';</script>
   </body></html>` }));
-  const site = await context.newPage(); await site.goto('https://new.limova.ai/geometry-fixture');
+  const site = await context.newPage(); await site.goto(`${APP}/geometry-fixture`);
   const controller = await controllerPage(context, extensionId);
-  const before = await controller.evaluate(async () => {
+  const before = await controller.evaluate(async APP => {
     const { createBrowserBinding } = await import('../limova/browser-binding.js');
     let version = 0;
     window.screenshotBinding = createBrowserBinding({ scripting: chrome.scripting, allocateVersion: async () => ++version });
-    const [tab] = await chrome.tabs.query({ url: 'https://new.limova.ai/geometry-fixture' });
-    window.screenshotTarget = await screenshotBinding.bind(tab.id, 'https://new.limova.ai');
+    const [tab] = await chrome.tabs.query({ url: `${APP}/geometry-fixture` });
+    window.screenshotTarget = await screenshotBinding.bind(tab.id, APP);
     return screenshotBinding.readScreenshotGeometry(screenshotTarget);
-  });
+  }, APP);
   expect(before.masks.length).toBeGreaterThanOrEqual(3);
   expect(JSON.stringify(before)).not.toContain('SECRET');
   await site.evaluate(() => { const privateRegion = document.createElement('div'); privateRegion.dataset.private = ''; privateRegion.style.cssText = 'width:40px;height:40px'; privateRegion.textContent = 'NEW_SECRET'; document.body.append(privateRegion); });

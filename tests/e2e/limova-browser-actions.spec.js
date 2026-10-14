@@ -267,8 +267,11 @@ test('native diagnostics report repeated rejected actions without replay or priv
   expect(logs).toContain('DIAGNOSTIC_BROWSER_ACTIONS_DEGRADED');
   expect(logs).not.toMatch(/PRIVATE_FIELD_VALUE|NEVER_TRANSMIT_THIS_SECRET/);
   expect(messageCalls(calls)).toHaveLength(before);
+  const previousConversation = await panel.locator('#limovaConversation').inputValue();
   await panel.locator('#limovaNew').click();
   await expect(panel.locator('.message.user')).toHaveCount(0);
+  await expect(panel.locator('#limovaConversation')).not.toHaveValue(previousConversation);
+  await expect(panel.locator('#sendBtn')).toBeEnabled();
   await panel.locator('#diagnoseBtn').click();
   await expect(panel.locator('#diagnosticResult')).toHaveAttribute('data-status', 'healthy');
   expect(legacy).toEqual([]);

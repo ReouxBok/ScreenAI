@@ -1,8 +1,11 @@
 import { test, expect } from './fixtures.js';
+import { extensionEnvironment } from '../../scripts/extension-environments.mjs';
 
 const SESSION = '88888888-8888-4888-8888-888888888888';
+const environment = extensionEnvironment(process.env.LIMOVA_E2E_ENV ?? 'production');
 
 test('real MediaRecorder and Blob SDK retain a video when Studio confirmation must be retried', async ({ mediaContext: context, mediaExtensionId: extensionId }) => {
+  test.skip(environment.name === 'staging', 'The isolated staging package intentionally has no production Studio or Blob permission.');
   const requests = [], parts = [], confirmations = [];
   let pathname;
   const headers = { 'access-control-allow-origin': '*', 'access-control-allow-headers': '*', 'content-type': 'application/json' };

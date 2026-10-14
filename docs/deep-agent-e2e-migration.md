@@ -1,6 +1,6 @@
 # Migration de la recette E2E vers Deep Agent
 
-**État courant : 1 scénario legacy reste dans `feature-flows.spec.js`.** Les sections suivantes retracent les couches de migration ; leurs anciens décomptes décrivent ces étapes, pas le total actuel. La suite globale et la qualification distante restent ouvertes.
+**État courant : aucun scénario legacy ne reste. Le fichier `feature-flows.spec.js` est retiré.** Les sections suivantes retracent les couches de migration ; leurs anciens décomptes décrivent ces étapes, pas le total actuel. Les suites locales production et staging passent ; la qualification distante reste ouverte.
 
 ## Audit du 14 octobre 2026
 
@@ -246,3 +246,15 @@ Un même scénario du panneau natif vérifie maintenant le changement EN puis FR
 La provenance de la trame n’est pas simulée comme prompt local dans ce scénario. Les recettes PostgreSQL/MCP des sections précédentes prouvent séparément que le Studio conserve le brouillon privé, publie la nouvelle révision et expose ses étapes au vrai service API. Les tests de factory API prouvent que ces outils appartiennent au main agent Charly et que mémoire/skills restent dans son runtime ordinaire. Aucun de ces tests n’appelle un modèle distant ; la qualité de la réponse réelle demeure un gate de qualification.
 
 Ce parcours remplace le scénario legacy combiné, qui dépendait du prompt local et de Gemini. Il reste un seul scénario legacy : le parcours vocal intégré, dont les attentes de connaissances, clarification et suggestions doivent encore être rapprochées du comportement Deep Agent.
+
+## Retrait du dernier parcours vocal Gemini
+
+Le dernier scénario legacy vérifiait une architecture désormais supprimée de la cible : jeton Gemini Live, modèle fixé dans le client, images JPEG envoyées directement au provider, outils locaux `search_knowledge_base`/`click_element` et relances techniques injectées par l’extension. Le conserver comme gate aurait imposé le backend parallèle que la migration remplace.
+
+La recette vocale native répartit le contrat utilisateur entre des preuves plus ciblées : session first-party du même utilisateur/workspace/conversation Charly ; PCM micro et audio 24 kHz ; interruption et reprise ; historique canonique après rechargement ; pixels privés masqués ; lecture, capture, scroll, saisie, refus d’une référence absente, navigation complète et relecture dans un même tour ; contexte frais après une interaction manuelle ; arrêt sur changement d’onglet et bouton de retour. Aucune requête Gemini/proxy ou POST de chat parallèle n’est tolérée.
+
+La connaissance publiée passe par le MCP Studio du main agent, qualifié séparément avec PostgreSQL et les vrais outils API. La clarification s’appuie sur les résultats `rejected`/`uncertain` et une nouvelle lecture ; l’extension ne tente plus de comparer un `targetLabel` inventé par le modèle avec le DOM. Les suggestions comme « je peux ouvrir le profil » et la compréhension d’un « Vas-y » relèvent du modèle Deep Agent et de l’historique canonique, pas d’une relance codée dans l’extension. Leur qualité avec le modèle réel reste un gate distant et n’est pas transformée en réponse simulée pour justifier le retrait.
+
+Les 11 scénarios vocaux/visuels natifs passent sur les paquets production et staging locaux. La suite complète passe avec 156 succès et 1 contrôle staging ignoré sur le paquet production, puis 148 succès et 9 contrôles production-only ignorés sur le paquet staging. Les fixtures de capture sélectionnent l’origine du paquet ; le test MediaRecorder/Blob reste explicitement production-only, car le manifeste staging refuse Studio et Blob production.
+
+Le fichier legacy est supprimé en entier : aucun skip ni ancienne fixture Gemini n’est conservé. Cela clôt la migration des tests d’interface, mais pas le retrait du code legacy, la migration globale ni les qualifications de services réels listées dans le plan.

@@ -20,7 +20,7 @@ const BROWSER_SESSION = '77777777-7777-4777-8777-777777777777';
 const PAGE = { tabId: 7, origin: 'https://example.com', contextVersion: 1 };
 
 for (const browserDriver of [false, true]) {
-test(`live transport ${browserDriver ? 'with real DOM driver and journal' : 'wire contract'} uses first-party cookies and stops when the app closes`, async () => {
+test(`live transport ${browserDriver ? 'with real DOM driver and journal' : 'wire contract'} uses first-party cookies and stops when its app lease closes`, async () => {
   const directory = await mkdtemp(path.join(tmpdir(), 'limova-live-test-'));
   const key = path.join(directory, 'key.pem'), cert = path.join(directory, 'cert.pem');
   execFileSync('openssl', ['req', '-x509', '-newkey', 'rsa:2048', '-nodes', '-keyout', key,
@@ -105,6 +105,8 @@ test(`live transport ${browserDriver ? 'with real DOM driver and journal' : 'wir
     await extensionPage.goto(`chrome-extension://${new URL(worker.url()).host}/src/sidebar/microphone-permission.html`);
     const app = await context.newPage(); await app.goto(APP);
     await app.evaluate(api => fetch(`${api}/fixture-login`, { credentials: 'include' }), API);
+    const initialAppTabIds = await worker.evaluate(async origin =>
+      (await chrome.tabs.query({ url: `${origin}/*` })).map(tab => tab.id), APP);
     await extensionPage.evaluate(async ({ USER, WORKSPACE, CONVERSATION, BROWSER_SESSION, PAGE, browserDriver }) => {
       const { createLimovaLiveTransport } = await import(chrome.runtime.getURL('src/limova/live-transport.js'));
       globalThis.liveEvents = []; globalThis.liveErrors = [];
@@ -159,7 +161,11 @@ test(`live transport ${browserDriver ? 'with real DOM driver and journal' : 'wir
     await expect.poll(() => seen.cancelled).toBe(120);
     expect(seen.cookie).toBe(true); expect(seen.origin).toBe(APP);
     await expect.poll(() => extensionPage.evaluate(() => globalThis.liveEvents.find(item => item.event === 'assistant.audio.delta')?.payload.audio)).toEqual([0, 128, 255, 127]);
-    await app.close();
+    const leaseTabId = await worker.evaluate(async ({ origin, initialAppTabIds }) =>
+      (await chrome.tabs.query({ url: `${origin}/*` })).find(tab => !initialAppTabIds.includes(tab.id))?.id,
+    { origin: APP, initialAppTabIds });
+    expect(leaseTabId).toEqual(expect.any(Number));
+    await worker.evaluate(tabId => chrome.tabs.remove(tabId), leaseTabId);
     await expect.poll(() => seen.disconnected).toBe(1);
     await expect.poll(() => extensionPage.evaluate(() => globalThis.liveErrors.length)).toBe(1);
     expect(await extensionPage.evaluate(() => {
