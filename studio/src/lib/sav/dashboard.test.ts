@@ -8,7 +8,7 @@ import { savStructuredProposalSchema } from "./proposal";
 import { savDossierSourceHash } from "./review-contract";
 import { listSavDossierDashboard } from "./dashboard";
 import { recordSavDossierOpened } from "./opened-email";
-import { findSavExternalCompletion, markSavDossiersHandledExternally, revertSavExternalCompletionBatch, SAV_EXTERNAL_COMPLETION } from "./external-completion";
+import { findSavExternalCompletion, getSavExternalCompletion, markSavDossiersHandledExternally, revertSavExternalCompletionBatch, SAV_EXTERNAL_COMPLETION } from "./external-completion";
 
 const state = vi.hoisted(() => ({ db: null as unknown }));
 vi.mock("@/db", () => ({ requireDb: () => state.db }));
@@ -162,6 +162,37 @@ describe("SAV-62 external administrative completion", () => {
   const batchId = "10000000-0000-4000-8000-000000000062";
   const boundary = "2026-10-14T16:05:00Z";
   const input = (rows: Array<Awaited<ReturnType<typeof seed>>>, receivedBefore = boundary) => ({ batchId, receivedBefore, messages: rows.map(row => ({ threadId: row.thread.id, messageId: row.message.id })) });
+  it.each(["request_human", "schedule_followup", "create_learning_candidate"] as const)("does not mask a pending human %s command", async kind => {
+    const row = await seed();
+    await fixture.db.insert(savActions).values({ threadId: row.thread.id, messageId: row.message.id, kind, actorType: "human", status: "pending", idempotencyKey: `human-pending:${row.message.id}`, payload: {} });
+    expect(await markSavDossiersHandledExternally(input([row]), "ugo@limova.ai")).toMatchObject({ marked: 0, skipped: { unsettled_action: 1 } });
+  });
+  it("protects pending learning linked only to the HubSpot ticket", async () => {
+    const row = await seed();
+    await fixture.db.update(savThreads).set({ hubspotTicketId: "62001" }).where(eq(savThreads.id, row.thread.id));
+    await fixture.db.insert(savLearningCandidates).values({ hubspotTicketId: "62001", sourceRef: "hubspot:62001", sourceContentHash: "fixture", proposedPatch: {}, explanation: "Apprentissage synthétique sans thread", status: "pending" });
+    expect(await markSavDossiersHandledExternally(input([row]), "ugo@limova.ai")).toMatchObject({ marked: 0, skipped: { learning_history: 1 } });
+  });
+  it("aligns the detail banner and dashboard when a new human request reopens the dossier", async () => {
+    const row = await seed(); await markSavDossiersHandledExternally(input([row]), "ugo@limova.ai");
+    expect(await getSavExternalCompletion(row.message)).not.toBeNull();
+    await fixture.db.insert(savActions).values({ threadId: row.thread.id, messageId: row.message.id, kind: "request_human", actorType: "human", status: "pending", idempotencyKey: "new-request-human", payload: {} });
+    expect(await getSavExternalCompletion(row.message)).toBeNull();
+    expect((await listSavDossierDashboard()).counts.completed).toBe(0);
+  });
+  it("aligns detail and list when ticket-only learning appears after marking", async () => {
+    const row = await seed(); await markSavDossiersHandledExternally(input([row]), "ugo@limova.ai");
+    await fixture.db.update(savThreads).set({ hubspotTicketId: "62002" }).where(eq(savThreads.id, row.thread.id));
+    await fixture.db.insert(savLearningCandidates).values({ hubspotTicketId: "62002", sourceRef: "hubspot:62002", sourceContentHash: "fixture", proposedPatch: {}, explanation: "Apprentissage synthétique tardif", status: "pending" });
+    expect(await getSavExternalCompletion(row.message)).toBeNull();
+    expect((await listSavDossierDashboard()).counts.completed).toBe(0);
+  });
+  it("hides the detail banner while a thread-linked learning candidate is pending", async () => {
+    const row = await seed(); await markSavDossiersHandledExternally(input([row]), "ugo@limova.ai");
+    await fixture.db.insert(savLearningCandidates).values({ threadId: row.thread.id, sourceRef: "sav-review:fixture62", sourceContentHash: "fixture", proposedPatch: {}, explanation: "Cas synthétique tardif", status: "pending" });
+    expect(await getSavExternalCompletion(row.message)).toBeNull();
+    expect((await listSavDossierDashboard()).counts.completed).toBe(0);
+  });
   it("finishes unopened or unreviewed dossiers without approving anything or calling providers", async () => {
     const row = await seed();
     expect((await markSavDossiersHandledExternally(input([row]), "ugo@limova.ai")).marked).toBe(1);
@@ -181,6 +212,8 @@ describe("SAV-62 external administrative completion", () => {
   it("reopens on a new latest inbound and skips a stale preview even before the boundary", async () => {
     const old = await seed(); await markSavDossiersHandledExternally(input([old]), "ugo@limova.ai");
     const current = await seed({ threadId: old.thread.id });
+    expect(await getSavExternalCompletion(old.message)).toBeNull();
+    expect(await getSavExternalCompletion(current.message)).toBeNull();
     expect((await listSavDossierDashboard()).rows[0]).toMatchObject({ messageId: current.message.id, handledExternally: false });
     expect(await markSavDossiersHandledExternally(input([old]), "ugo@limova.ai")).toMatchObject({ marked: 0, skipped: { new_inbound: 1 } });
   });

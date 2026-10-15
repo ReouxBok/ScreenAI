@@ -2,8 +2,9 @@ import "server-only";
 import { and, asc, desc, eq, inArray, sql } from "drizzle-orm";
 import { z } from "zod";
 import { requireDb } from "@/db";
-import { auditLogs, savActions, savDecisions, savLearningCandidates, savMessages, savPilotItems, savResolutionObservations, savThreads } from "@/db/schema";
+import { auditLogs, savActions, savDecisions, savLearningCandidates, savMessages, savObservationCycles, savPilotItems, savResolutionObservations, savThreads } from "@/db/schema";
 import { savV0EligibleMessageFilter } from "./cutover";
+import { savDashboardLearningProgress } from "./learning-progress";
 
 export const SAV_EXTERNAL_COMPLETION = "sav_dossier_completed_externally";
 export const SAV_EXTERNAL_COMPLETION_REVERTED = "sav_dossier_external_completion_reverted";
@@ -25,8 +26,7 @@ export function findSavExternalCompletion(message: { id: string; threadId: strin
 
 /** Do not hide a real queued request or an uncertain provider result. */
 export function hasUnsettledSavHumanAction(actions: Action[]) {
-  const external = new Set(["create_ticket", "link_ticket", "send_reply", "log_email", "create_note", "update_ticket_status"]);
-  return actions.some(action => action.actorType === "human" && external.has(action.kind) && (
+  return actions.some(action => action.actorType === "human" && (
     ["pending", "running"].includes(action.status)
     || Boolean(action.payload.ticketCreateDispatchedAt && !action.payload.hubspotTicketId)
     || Boolean(action.payload.ticketReturnDispatchedAt && !action.payload.ticketReturnCompletedAt)
@@ -36,8 +36,24 @@ export function hasUnsettledSavHumanAction(actions: Action[]) {
 }
 
 export async function getSavExternalCompletion(message: { id: string; threadId: string; receivedAt: Date }) {
-  const events = await requireDb().select().from(auditLogs).where(and(eq(auditLogs.entityType, "sav_message"), eq(auditLogs.entityId, message.id), inArray(auditLogs.action, savExternalCompletionEvents)));
-  return findSavExternalCompletion(message, events);
+  return requireDb().transaction(async tx => {
+    const events = await tx.select().from(auditLogs).where(and(eq(auditLogs.entityType, "sav_message"), eq(auditLogs.entityId, message.id), inArray(auditLogs.action, savExternalCompletionEvents)));
+    const marker = findSavExternalCompletion(message, events);
+    if (!marker) return null;
+    const [thread] = await tx.select().from(savThreads).where(eq(savThreads.id, message.threadId)).limit(1);
+    const [latest] = await tx.select({ id: savMessages.id }).from(savMessages).where(and(eq(savMessages.threadId, message.threadId), eq(savMessages.direction, "inbound"))).orderBy(desc(savMessages.receivedAt), desc(savMessages.createdAt), desc(savMessages.id)).limit(1);
+    if (!thread || latest?.id !== message.id) return null;
+    const [actions, observations] = await Promise.all([
+      tx.select().from(savActions).where(eq(savActions.threadId, message.threadId)),
+      tx.select().from(savResolutionObservations).where(eq(savResolutionObservations.threadId, message.threadId)),
+    ]);
+    if (hasUnsettledSavHumanAction(actions)) return null;
+    const cycles = observations.length ? await tx.select().from(savObservationCycles).where(inArray(savObservationCycles.observationId, observations.map(row => row.id))) : [];
+    const candidateIds = cycles.flatMap(cycle => cycle.candidateId ? [cycle.candidateId] : []);
+    const candidates = await tx.select().from(savLearningCandidates).where(sql`((${savLearningCandidates.threadId} = ${message.threadId} or ${thread.hubspotTicketId ? eq(savLearningCandidates.hubspotTicketId, thread.hubspotTicketId) : sql`false`}) and ${savLearningCandidates.status} = 'pending') or ${candidateIds.length ? inArray(savLearningCandidates.id, candidateIds) : sql`false`}`);
+    if (thread.hubspotTicketId && candidates.some(candidate => candidate.hubspotTicketId === thread.hubspotTicketId && candidate.status === "pending")) return null;
+    return savDashboardLearningProgress(observations, cycles, candidates.filter(candidate => candidate.threadId === message.threadId)) === "none" ? marker : null;
+  }, { isolationLevel: "repeatable read", accessMode: "read only" });
 }
 
 const batchSchema = z.object({ batchId: z.uuid(), receivedBefore: z.iso.datetime({ offset: true }), messages: z.array(z.object({ threadId: z.uuid(), messageId: z.uuid() })).min(1).max(1_000) });
@@ -60,7 +76,7 @@ export async function markSavDossiersHandledExternally(raw: unknown, actorEmail:
     await tx.execute(sql`set local lock_timeout = '5s'`);
     await tx.execute(sql`set local statement_timeout = '30s'`);
     await tx.execute(sql`select pg_advisory_xact_lock(hashtext(${input.batchId}))`);
-    const threads = await tx.select({ id: savThreads.id }).from(savThreads).where(inArray(savThreads.id, threadIds)).orderBy(asc(savThreads.id)).for("update");
+    const threads = await tx.select({ id: savThreads.id, hubspotTicketId: savThreads.hubspotTicketId }).from(savThreads).where(inArray(savThreads.id, threadIds)).orderBy(asc(savThreads.id)).for("update");
     if (threads.length !== threadIds.length) throw new Error("SAV_EXTERNAL_COMPLETION_THREAD_MISSING");
     const latest = await tx.selectDistinctOn([savMessages.threadId]).from(savMessages).where(and(inArray(savMessages.threadId, threadIds), eq(savMessages.direction, "inbound")))
       .orderBy(asc(savMessages.threadId), desc(savMessages.receivedAt), desc(savMessages.createdAt), desc(savMessages.id));
@@ -71,9 +87,12 @@ export async function markSavDossiersHandledExternally(raw: unknown, actorEmail:
     const decisions = await tx.select({ messageId: savDecisions.messageId, kind: savDecisions.kind }).from(savDecisions).where(and(inArray(savDecisions.messageId, ids), eq(savDecisions.isCurrent, true)));
     const technicalMessages = new Set(decisions.filter(row => technicalKinds.has(row.kind)).map(row => row.messageId));
     const observations = await tx.select({ threadId: savResolutionObservations.threadId }).from(savResolutionObservations).where(inArray(savResolutionObservations.threadId, threadIds));
-    const candidates = await tx.select({ threadId: savLearningCandidates.threadId }).from(savLearningCandidates).where(and(inArray(savLearningCandidates.threadId, threadIds), eq(savLearningCandidates.status, "pending")));
+    const ticketIds = threads.flatMap(thread => thread.hubspotTicketId ? [thread.hubspotTicketId] : []);
+    const candidates = await tx.select({ threadId: savLearningCandidates.threadId, hubspotTicketId: savLearningCandidates.hubspotTicketId }).from(savLearningCandidates).where(sql`(${inArray(savLearningCandidates.threadId, threadIds)} or ${ticketIds.length ? inArray(savLearningCandidates.hubspotTicketId, ticketIds) : sql`false`}) and ${savLearningCandidates.status} = 'pending'`);
     const events = await tx.select().from(auditLogs).where(and(eq(auditLogs.entityType, "sav_message"), inArray(auditLogs.entityId, ids), inArray(auditLogs.action, savExternalCompletionEvents)));
     const blockedLearning = new Set([...observations, ...candidates].map(row => row.threadId));
+    const pendingTickets = new Set(candidates.filter(candidate => candidate.hubspotTicketId).map(candidate => candidate.hubspotTicketId));
+    for (const thread of threads) if (thread.hubspotTicketId && pendingTickets.has(thread.hubspotTicketId)) blockedLearning.add(thread.id);
     const rows: Array<typeof auditLogs.$inferInsert> = [];
     const skipped: Record<string, number> = {};
     let alreadyCompleted = 0;
