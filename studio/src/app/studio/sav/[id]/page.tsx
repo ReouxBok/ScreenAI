@@ -5,6 +5,7 @@ import { ArrowLeft, Bot, CheckCircle2, CircleAlert, Clock3, ExternalLink, LockKe
 import { notFound } from "next/navigation";
 import { requireSavStaff as requireStaff } from "@/lib/sav/auth";
 import { getSavThreadDetail } from "@/lib/sav/service";
+import { getSavExternalCompletion } from "@/lib/sav/external-completion";
 import { getSavProposalReview } from "@/lib/sav/review";
 import { savAutomationMode, savReleaseStage } from "@/lib/sav/config";
 import { isSavMessageEligible } from "@/lib/sav/cutover";
@@ -69,12 +70,13 @@ export default async function SavThreadPage({ params, searchParams }: { params: 
   const customerMessage = latestInbound ? resolveSavCustomerMessage({ fromEmail: latestInbound.fromEmail, subject: latestInbound.subject, body: latestInbound.body.text }) : null;
   const isForward = customerMessage && customerMessage.kind !== "sender";
   const eligible = latestInbound ? await isSavMessageEligible(latestInbound.id) : false;
-  const [proposalReview, relatedThreads, replyDrafts, observations, partnershipState] = await Promise.all([
+  const [proposalReview, relatedThreads, replyDrafts, observations, partnershipState, externalCompletion] = await Promise.all([
     v0 && latestInbound ? getSavProposalReview(latestInbound.id) : null,
     isForward ? Promise.resolve([]) : getSavRelatedThreads(id),
     getSavReplyDrafts(id),
     getSavObservations(id),
     v0 && !detail.pilotItem ? getSavPartnershipTransferState(id) : null,
+    v0 && !detail.pilotItem && latestInbound ? getSavExternalCompletion(latestInbound) : null,
   ]);
   const routing = proposalReview?.proposal.routing;
   const savedDossier = latestInbound?.body.supportContext;
@@ -112,6 +114,7 @@ export default async function SavThreadPage({ params, searchParams }: { params: 
     : null;
 
   return <>
+    {externalCompletion && <p className="login-notice" role="status"><strong>Traité hors Studio.</strong> Ce message a été classé administrativement le {formatParisDateTime(externalCompletion.createdAt)}. Cela ne valide ni la proposition IA ni le brouillon et ne crée aucun apprentissage. Un nouvel email revient dans le flux normal.</p>}
     {v0 && !detail.pilotItem && eligible && latestInbound && <SavDossierOpened threadId={id} messageId={latestInbound.id}/>}
     {filing && <p className={`login-notice ${["filed", "already_filed", "SAV_GMAIL_FILING_DISABLED", "SAV_GMAIL_FILING_PILOT_BLOCKED"].includes(filing) ? "" : "error"}`} role="status">{filingNotices[filing] ?? filingNotices.SAV_GMAIL_FILING_FAILED}</p>}
     {context && <p className={`login-notice ${context === "refreshed" ? "" : "error"}`} role="status">{context === "refreshed" ? "Contexte client actualisé à l’ouverture du dossier." : "Contexte HubSpot incomplet : vérifiez l’accès puis utilisez « Actualiser le contexte client »."}</p>}

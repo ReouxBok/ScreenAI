@@ -5,6 +5,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 const dependencies = vi.hoisted(() => ({ detail: vi.fn(), review: vi.fn(), action: vi.fn(), auth: vi.fn() }));
 vi.mock("@/lib/sav/auth", () => ({ requireSavStaff: dependencies.auth }));
 vi.mock("@/lib/sav/service", () => ({ getSavThreadDetail: dependencies.detail }));
+vi.mock("@/lib/sav/external-completion", () => ({ getSavExternalCompletion: async () => null }));
 vi.mock("@/lib/sav/observations", () => ({ getSavObservations: async () => [] }));
 vi.mock("./draft-review", () => ({ DraftReview: () => null }));
 vi.mock("@/lib/sav/review", () => ({ getSavProposalReview: dependencies.review }));
