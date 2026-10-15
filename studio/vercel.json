@@ -2,6 +2,7 @@
   "$schema": "https://openapi.vercel.sh/vercel.json",
   "git": {
     "deploymentEnabled": {
+      "codex/sav-bug-62-external-completion": false,
       "codex/sav-v0": false,
       "codex/sav-50-release": false,
       "codex/sav-51-release": false,

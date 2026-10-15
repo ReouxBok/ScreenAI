@@ -17,6 +17,13 @@ const result = { rows: [row], counts: { to_process: 1, to_validate: 0, learning:
 beforeEach(() => { vi.clearAllMocks(); dependencies.cutover.mockResolvedValue(null); dependencies.incidents.mockResolvedValue([]); dependencies.actions.mockResolvedValue([]); dependencies.dashboard.mockResolvedValue(result); });
 const render = async (search: { view?: string; q?: string; page?: string; sort?: string } = {}) => renderToStaticMarkup(createElement(Fragment, null, await SavV0Inbox({ searchParams: Promise.resolve(search) })));
 describe("SAV-55 compact dashboard", () => {
+  it("labels external completion without claiming dossier or draft approval", async () => {
+    dependencies.dashboard.mockResolvedValue({ ...result, view: "completed", rows: [{ ...row, state: "completed", handledExternally: true, nextAction: "Traité hors Studio" }] });
+    const html = await render({ view: "completed" });
+    expect(html).toContain("Traité hors Studio"); expect(html).toContain("Classement administratif");
+    expect(html).not.toContain("Dossier validé"); expect(html).not.toContain("Dossier à valider");
+    expect(html).toContain("Brouillon : À relire"); expect(dependencies.open).not.toHaveBeenCalled();
+  });
   it("renders a POST for the exact current message, without action on render or prefetch", async () => {
     const html = await render();
     expect(html).toContain('aria-label="Ouvrir l’email : Retrouver mes factures"');
