@@ -9,6 +9,7 @@ import { savStructuredProposalSchema, type SavStructuredProposal } from "./propo
 import { savDraftNotApplicable, savDraftSourceHash, savReviewMatchesProposal } from "./review-contract";
 import { classifySavDossier, savDashboardNextAction, type SavDashboardView, type SavLearningProgress, type SavOpeningState, type SavTicketProgress } from "./dashboard-state";
 import type { SavDossierContext } from "./dossier-context";
+import { findSavExternalCompletion, hasUnsettledSavHumanAction, savExternalCompletionEvents } from "./external-completion";
 
 const technicalKinds = new Set(["spam", "automatic_reply", "bounce", "internal_notification", "duplicate"]);
 type Action = typeof savActions.$inferSelect;
@@ -49,6 +50,7 @@ export type SavDashboardRow = {
   reviewStatus: string | null; draftStatus: string; replyStatus: string; partnershipStatus: SavInboxPartnershipStatus | null; ticketProgress: SavTicketProgress; learning: SavLearningProgress;
   ticket: { id: string; title: string; status: string } | null; crmStatus: "ready" | "partial" | "error" | "unknown";
   nextAction: string; incident: boolean; technical: boolean;
+  handledExternally?: boolean;
 };
 /** One snapshot and one classification predicate for counts and page rows. Private
  * proposal content is decrypted on the server and never returned to the browser. */
@@ -76,13 +78,14 @@ export async function listSavDossierDashboard(options: { view?: string; query?: 
       if (!batch.length) break;
       const ids = batch.map(r => r.message.id), threads = batch.map(r => r.thread.id);
       const unrecordedIds = batch.filter(row => !row.message.studioOpenedAt).map(row => row.message.id);
-      const [actions, observations, verdicts, openingProofs] = await Promise.all([
+      const [actions, observations, verdicts, openingProofs, completionProofs] = await Promise.all([
         db.select().from(savActions).where(inArray(savActions.threadId, threads)).orderBy(desc(savActions.createdAt), desc(savActions.id)),
         db.select().from(savResolutionObservations).where(inArray(savResolutionObservations.threadId, threads)),
         db.select().from(savDraftVerdicts).where(and(inArray(savDraftVerdicts.messageId, ids), eq(savDraftVerdicts.isCurrent, true))),
         // Legacy writers can still emit an opening audit during a rolling
         // deployment after the additive migration. Such a proof is not unread.
         unrecordedIds.length ? db.select({ messageId: auditLogs.entityId }).from(auditLogs).where(and(inArray(auditLogs.entityId, unrecordedIds), eq(auditLogs.entityType, "sav_message"), inArray(auditLogs.action, ["sav_email_opened", "sav_dossier_opened"]))) : Promise.resolve([]),
+        db.select().from(auditLogs).where(and(inArray(auditLogs.entityId, ids), eq(auditLogs.entityType, "sav_message"), inArray(auditLogs.action, savExternalCompletionEvents))),
       ]);
       const cycles = observations.length ? await db.select().from(savObservationCycles).where(inArray(savObservationCycles.observationId, observations.map(o => o.id))) : [];
       const candidateIds = cycles.flatMap(c => c.candidateId ? [c.candidateId] : []);
@@ -117,13 +120,14 @@ export async function listSavDossierDashboard(options: { view?: string; query?: 
         const opening: SavOpeningState = message.studioOpenedAt || openedIds.has(message.id) ? "opened" : message.studioOpeningTracked ? "unopened" : "unknown";
         const ticketProgress = savDashboardTicketProgress(threadActions, message.id, proposal?.decision.kind, thread.hubspotTicketId);
         const learning = savDashboardLearningProgress(observations.filter(o => o.threadId === thread.id), cycles, candidates.filter(c => c.threadId === thread.id));
-        const state = classifySavDossier({ opening, reviewStatus, ticket: ticketProgress, learning });
+        const handledExternally = learning === "none" && !hasUnsettledSavHumanAction(threadActions) && Boolean(findSavExternalCompletion(message, completionProofs));
+        const state = handledExternally ? "completed" : classifySavDossier({ opening, reviewStatus, ticket: ticketProgress, learning });
         const linkedTicket = context?.crm.data?.tickets.find(t => t.id === thread.hubspotTicketId);
         const incident = Boolean(analysisErrorCode || ["failed", "uncertain"].includes(ticketProgress) || partnershipTransferStatus && ["failed", "uncertain"].includes(partnershipTransferStatus));
         const technical = technicalKinds.has(proposal?.decision.kind ?? decision?.kind ?? "");
-        const row: SavDashboardRow = { threadId: thread.id, messageId: message.id, receivedAt: message.receivedAt, fromEmail: message.fromEmail, summary, opening, state, reviewStatus, draftStatus, replyStatus, partnershipStatus: partnershipTransferStatus, ticketProgress, learning, incident, technical,
+        const row: SavDashboardRow = { threadId: thread.id, messageId: message.id, receivedAt: message.receivedAt, fromEmail: message.fromEmail, summary, opening, state, reviewStatus, draftStatus, replyStatus, partnershipStatus: partnershipTransferStatus, ticketProgress, learning, incident, technical, handledExternally,
           ticket: thread.hubspotTicketId ? { id: thread.hubspotTicketId, title: linkedTicket?.subject || `Ticket #${thread.hubspotTicketId}`, status: linkedTicket?.status === "closed" ? "Fermé" : linkedTicket?.status === "open" ? "Ouvert" : "Statut à actualiser" } : null,
-          crmStatus: context?.crm.status ?? "unknown", nextAction: state === "completed" && (partnershipTransferStatus || proposal?.understanding?.requests.some(r => r.nature === "partnership")) ? summary.nextAction : savDashboardNextAction({ state, reviewStatus, ticket: ticketProgress, learning, analysisFailed: Boolean(analysisErrorCode) }) };
+          crmStatus: context?.crm.status ?? "unknown", nextAction: handledExternally ? "Traité hors Studio" : state === "completed" && (partnershipTransferStatus || proposal?.understanding?.requests.some(r => r.nature === "partnership")) ? summary.nextAction : savDashboardNextAction({ state, reviewStatus, ticket: ticketProgress, learning, analysisFailed: Boolean(analysisErrorCode) }) };
         if (query && ![row.fromEmail, message.subject, message.preview, summary.title, summary.problem, row.ticket?.title, row.ticket?.id].filter(Boolean).join(" ").toLocaleLowerCase("fr").includes(query)) continue;
         if (technical) counts.technical++; else { counts[state]++; if (incident) counts.incidents++; }
         if (view === "technical" ? technical : view === "incidents" ? !technical && incident : !technical && state === view) {

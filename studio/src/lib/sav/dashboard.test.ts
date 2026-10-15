@@ -8,6 +8,7 @@ import { savStructuredProposalSchema } from "./proposal";
 import { savDossierSourceHash } from "./review-contract";
 import { listSavDossierDashboard } from "./dashboard";
 import { recordSavDossierOpened } from "./opened-email";
+import { findSavExternalCompletion, markSavDossiersHandledExternally, revertSavExternalCompletionBatch, SAV_EXTERNAL_COMPLETION } from "./external-completion";
 
 const state = vi.hoisted(() => ({ db: null as unknown }));
 vi.mock("@/db", () => ({ requireDb: () => state.db }));
@@ -154,5 +155,87 @@ describe("Studio direct URL opening", () => {
     await expect(recordSavDossierOpened({ threadId: old.thread.id, messageId: old.message.id }, "ugo@limova.ai")).rejects.toThrow("SAV_OPENING_CONTEXT_CHANGED");
     await expect(recordSavDossierOpened({ threadId: other.thread.id, messageId: other.message.id }, "other@example.invalid")).rejects.toThrow("SAV_ACCESS_FORBIDDEN");
     expect(await fixture.db.select().from(auditLogs).where(eq(auditLogs.action, "sav_dossier_opened"))).toHaveLength(0);
+  });
+});
+
+describe("SAV-62 external administrative completion", () => {
+  const batchId = "10000000-0000-4000-8000-000000000062";
+  const boundary = "2026-10-14T16:05:00Z";
+  const input = (rows: Array<Awaited<ReturnType<typeof seed>>>, receivedBefore = boundary) => ({ batchId, receivedBefore, messages: rows.map(row => ({ threadId: row.thread.id, messageId: row.message.id })) });
+  it("finishes unopened or unreviewed dossiers without approving anything or calling providers", async () => {
+    const row = await seed();
+    expect((await markSavDossiersHandledExternally(input([row]), "ugo@limova.ai")).marked).toBe(1);
+    const result = await listSavDossierDashboard({ view: "completed" });
+    expect(result.counts).toMatchObject({ completed: 1, to_process: 0, to_validate: 0 });
+    expect(result.rows[0]).toMatchObject({ handledExternally: true, reviewStatus: null, ticketProgress: "required", nextAction: "Traité hors Studio", opening: "unopened" });
+    for (const table of [savActions, savProposalReviews, savDraftVerdicts, savLearningCandidates, savResolutionObservations]) expect(await fixture.db.select().from(table)).toHaveLength(0);
+    const [thread] = await fixture.db.select().from(savThreads); expect(thread.status).toBe("new"); expect(thread.hubspotTicketId).toBeNull();
+    expect(network).not.toHaveBeenCalled();
+  });
+  it("uses an exclusive received-at boundary, not thread creation or synchronization time", async () => {
+    const rows = [await seed(), await seed(), await seed()];
+    for (let i = 0; i < rows.length; i++) await fixture.db.update(savMessages).set({ receivedAt: new Date(Date.parse(boundary) + (i - 1)) }).where(eq(savMessages.id, rows[i].message.id));
+    expect(await markSavDossiersHandledExternally(input(rows), "ugo@limova.ai")).toMatchObject({ marked: 1, skipped: { after_boundary: 2 } });
+    expect((await listSavDossierDashboard()).counts).toMatchObject({ completed: 1, to_process: 2 });
+  });
+  it("reopens on a new latest inbound and skips a stale preview even before the boundary", async () => {
+    const old = await seed(); await markSavDossiersHandledExternally(input([old]), "ugo@limova.ai");
+    const current = await seed({ threadId: old.thread.id });
+    expect((await listSavDossierDashboard()).rows[0]).toMatchObject({ messageId: current.message.id, handledExternally: false });
+    expect(await markSavDossiersHandledExternally(input([old]), "ugo@limova.ai")).toMatchObject({ marked: 0, skipped: { new_inbound: 1 } });
+  });
+  it("does not admit a dossier with a newer inbound after the boundary", async () => {
+    const old = await seed(); const current = await seed({ threadId: old.thread.id });
+    await fixture.db.update(savMessages).set({ receivedAt: new Date("2026-10-15T08:00:00Z") }).where(eq(savMessages.id, current.message.id));
+    expect((await markSavDossiersHandledExternally(input([old]), "ugo@limova.ai")).marked).toBe(0);
+    expect((await listSavDossierDashboard()).counts).toMatchObject({ completed: 0, to_process: 1 });
+  });
+  it("is idempotent, reversible and never silently reapplies a reverted batch", async () => {
+    const row = await seed(); const frozen = input([row]);
+    await markSavDossiersHandledExternally(frozen, "ugo@limova.ai");
+    expect(await markSavDossiersHandledExternally(frozen, "ugo@limova.ai")).toMatchObject({ marked: 0, alreadyCompleted: 1 });
+    expect(await revertSavExternalCompletionBatch(batchId, "ugo@limova.ai")).toEqual({ reverted: 1 });
+    expect(await revertSavExternalCompletionBatch(batchId, "ugo@limova.ai")).toEqual({ reverted: 0 });
+    expect((await listSavDossierDashboard()).counts).toMatchObject({ completed: 0, to_process: 1 });
+    expect(await markSavDossiersHandledExternally(frozen, "ugo@limova.ai")).toMatchObject({ marked: 0, skipped: { previously_applied_batch: 1 } });
+    expect(await fixture.db.select().from(auditLogs).where(eq(auditLogs.action, SAV_EXTERNAL_COMPLETION))).toHaveLength(1);
+  });
+  it("preserves human pending/uncertain requests and learning", async () => {
+    const pending = await seed(); await ticket(pending, "pending");
+    const uncertain = await seed(); await ticket(uncertain, "failed", { ticketCreateDispatchedAt: "2026-10-03T10:10:00Z" });
+    const learning = await seed(); await observation(learning);
+    expect(await markSavDossiersHandledExternally(input([pending, uncertain, learning]), "ugo@limova.ai")).toMatchObject({ marked: 0, skipped: { unsettled_action: 2, learning_history: 1 } });
+  });
+  it("never hides a human action queued after marking, even from another message", async () => {
+    const row = await seed(); await markSavDossiersHandledExternally(input([row]), "ugo@limova.ai");
+    await ticket(row, "pending");
+    expect((await listSavDossierDashboard()).counts.completed).toBe(0);
+    expect((await listSavDossierDashboard()).rows[0].handledExternally).toBe(false);
+  });
+  it("keeps technical exclusions separate and search/pagination counts consistent", async () => {
+    const rows = [await seed({ subject: "Alpha fixture" }), await seed({ subject: "Beta fixture" }), await seed({ technical: true })];
+    expect(await markSavDossiersHandledExternally(input(rows), "ugo@limova.ai")).toMatchObject({ marked: 2, skipped: { technical_exclusion: 1 } });
+    const result = await listSavDossierDashboard({ view: "completed", query: "fixture", pageSize: 1, page: 2 });
+    expect(result.counts.completed).toBe(2); expect(result.totalPages).toBe(2); expect(result.rows).toHaveLength(1);
+    expect((await listSavDossierDashboard({ view: "technical" })).counts.technical).toBe(1);
+  });
+  it("rejects another actor, future boundary, duplicates, pilot and historical messages", async () => {
+    const row = await seed();
+    await expect(markSavDossiersHandledExternally(input([row]), "contact@limova.ai")).rejects.toThrow("FORBIDDEN");
+    await expect(markSavDossiersHandledExternally(input([row], "2099-01-01T00:00:00Z"), "ugo@limova.ai")).rejects.toThrow("FUTURE_BOUNDARY");
+    await expect(markSavDossiersHandledExternally(input([row, row]), "ugo@limova.ai")).rejects.toThrow("DUPLICATE_INPUT");
+    const [batch] = await fixture.db.insert(savPilotBatches).values({ createdBy: "ugo@limova.ai" }).returning();
+    await fixture.db.insert(savPilotItems).values({ batchId: batch.id, messageId: row.message.id });
+    expect((await markSavDossiersHandledExternally(input([row]), "ugo@limova.ai")).skipped).toEqual({ not_live_eligible: 1 });
+    vi.stubEnv("SAV_PILOT_MODE", "true");
+    await expect(markSavDossiersHandledExternally(input([row]), "ugo@limova.ai")).rejects.toThrow("V0_ONLY");
+  });
+  it("ignores malformed, cross-thread and unauthorized audit markers", async () => {
+    const row = await seed();
+    const [event] = await fixture.db.insert(auditLogs).values({ actorEmail: "ugo@limova.ai", action: SAV_EXTERNAL_COMPLETION, entityType: "sav_message", entityId: row.message.id, technicalMetadata: { version: 1, batchId, threadId: row.thread.id, receivedBefore: boundary, reason: "processed_outside_studio" } }).returning();
+    expect(findSavExternalCompletion(row.message, [event])?.id).toBe(event.id);
+    expect(findSavExternalCompletion(row.message, [{ ...event, actorEmail: "other@example.invalid" }])).toBeNull();
+    expect(findSavExternalCompletion(row.message, [{ ...event, technicalMetadata: { ...event.technicalMetadata, threadId: batchId } }])).toBeNull();
+    expect(findSavExternalCompletion(row.message, [{ ...event, technicalMetadata: { version: 9 } }])).toBeNull();
   });
 });

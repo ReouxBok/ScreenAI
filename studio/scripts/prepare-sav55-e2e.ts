@@ -4,7 +4,7 @@ import { PGlite } from "@electric-sql/pglite";
 import { vector } from "@electric-sql/pglite-pgvector";
 import { drizzle } from "drizzle-orm/pglite";
 import { eq } from "drizzle-orm";
-import { savActions, savAgentRuns, savDecisions, savDraftVerdicts, savLearningCandidates, savMailboxes, savMessages, savObservationCycles, savProposalReviews, savResolutionObservations, savThreads } from "../src/db/schema";
+import { auditLogs, savActions, savAgentRuns, savDecisions, savDraftVerdicts, savLearningCandidates, savMailboxes, savMessages, savObservationCycles, savProposalReviews, savResolutionObservations, savThreads } from "../src/db/schema";
 import { SAV55_E2E_KEY, SAV55_SUBJECTS, SAV55_THREADS, sav55Proposal } from "../test/sav55-e2e-fixture";
 
 const target = path.resolve(process.env.STUDIO_E2E_DB_DIR ?? ".e2e-db-sav55");
@@ -39,5 +39,13 @@ try {
       await db.insert(savObservationCycles).values({ observationId: observation.id, cycle: 1, status: "closed", sourceHash: "fixture-only", summaryCiphertext: encrypt({ subject, events: [], humanEvidence: [], customerConfirmation: [], sourceErrors: [], outcome: "human_evidence_to_qualify", coverage: "Fixture locale uniquement." }), qualification: candidate ? "resolved" : null, qualifiedAt: candidate ? new Date("2026-10-13") : null, qualifiedBy: candidate ? "ugo@limova.ai" : null, candidateId: candidate?.id });
     }
   }
-  console.log("SAV-55 fixture ready: eight synthetic local dossiers, two per primary view.");
+  for (const reopened of [false, true]) {
+    const threadId = reopened ? "62000000-0000-4000-8000-000000000002" : "62000000-0000-4000-8000-000000000001";
+    const subject = reopened ? "SAV62 nouvelle réponse après traitement externe" : "SAV62 traité hors Studio";
+    const [thread] = await db.insert(savThreads).values({ id: threadId, mailboxId: mailbox.id, gmailThreadId: `synthetic-sav62-${reopened}`, customerEmail: "sav62@example.invalid", subject }).returning();
+    const [message] = await db.insert(savMessages).values({ mailboxId: mailbox.id, threadId: thread.id, direction: "inbound", fromEmail: thread.customerEmail, subject, bodyCiphertext: encrypt({ text: "Cas entièrement synthétique déjà traité en dehors du Studio." }), receivedAt: new Date("2026-10-14T16:04:00Z"), analysisStatus: "done" }).returning();
+    await db.insert(auditLogs).values({ actorEmail: "ugo@limova.ai", action: "sav_dossier_completed_externally", entityType: "sav_message", entityId: message.id, technicalMetadata: { version: 1, threadId: thread.id, batchId: "62000000-0000-4000-8000-000000000062", receivedBefore: "2026-10-14T16:05:00Z", reason: "processed_outside_studio" } });
+    if (reopened) await db.insert(savMessages).values({ mailboxId: mailbox.id, threadId: thread.id, direction: "inbound", fromEmail: thread.customerEmail, subject, bodyCiphertext: encrypt({ text: "Nouvelle demande fictive après le classement." }), receivedAt: new Date("2026-10-14T16:06:00Z"), analysisStatus: "done" });
+  }
+  console.log("SAV-55/SAV-62 synthetic local fixtures ready.");
 } finally { await client.close(); }
