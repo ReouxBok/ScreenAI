@@ -384,7 +384,9 @@ class CharlyAdkOrchestrator {
       idempotencyKey: `${input.idempotencyKey}:user`,
       requestId
     });
-    const memory = evaluationContext ? null : await this.personalContext(userKey, input.message, input.sessionId, requestId);
+    const memory = evaluationContext || input.resetContext === true
+      ? null
+      : await this.personalContext(userKey, input.message, input.sessionId, requestId);
     const response = await this.consumeEvents({
       userKey,
       sessionId: input.sessionId,
