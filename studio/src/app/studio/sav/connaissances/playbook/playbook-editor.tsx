@@ -12,7 +12,9 @@ export function PlaybookEditor({ initial, canManage }: { initial: Workspace; can
   const [message, setMessage] = useState("");
   const [pending, startTransition] = useTransition();
   const [dirty, setDirty] = useState(false);
+  const promptTooLong = prompt.length > SAV_PLAYBOOK_PROMPT_MAX_LENGTH;
   function change(action: "save" | "review" | "activate", versionId?: string) {
+    if (action === "save" && promptTooLong) return;
     startTransition(async () => {
       // Keep the existing fact dictionary; only merge the editable prose into one field.
       const result = await changeSavPlaybook({ action, document: action === "save" ? { ...document, tone: prompt, handling: "", escalation: "" } : undefined, versionId,
@@ -33,7 +35,8 @@ export function PlaybookEditor({ initial, canManage }: { initial: Workspace; can
     <fieldset disabled={!canManage || pending} className={styles.editor}><legend>Master prompt SAV</legend>
       <label>Consignes générales de l’agent<textarea rows={24} maxLength={SAV_PLAYBOOK_PROMPT_MAX_LENGTH} value={prompt} onChange={e => { setPrompt(e.target.value); setDirty(true); setMessage(""); }}/></label>
       <p>{prompt.length} / {SAV_PLAYBOOK_PROMPT_MAX_LENGTH} caractères</p>
-      <button type="button" onClick={() => change("save")}>Enregistrer le brouillon</button>
+      {promptTooLong && <p role="alert">Les anciennes consignes sont affichées en entier. Réduisez le texte à {SAV_PLAYBOOK_PROMPT_MAX_LENGTH} caractères avant de l’enregistrer ; aucune version existante n’a été modifiée.</p>}
+      <button type="button" disabled={promptTooLong} onClick={() => change("save")}>Enregistrer le brouillon</button>
     </fieldset>
     {canManage && current && <div className={styles.row}><button disabled={pending || dirty || current.reviewed} onClick={() => change("review", current.id)}>Valider la version {current.version} après relecture</button><button disabled={pending || dirty || !current.reviewed || workspace.activeId === current.id} onClick={() => change("activate", current.id)}>Activer la version {current.version}</button></div>}
     <h2>Historique et retour à une version précédente</h2>

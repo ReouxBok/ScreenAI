@@ -2,8 +2,8 @@ import { z } from "zod";
 import { SAV_TICKET_RETURN_WINDOW_MS } from "./ticket-lifecycle";
 
 export const SAV_PLAYBOOK_SLUG = "sav-master-playbook";
-// The former three text fields fit without truncation, including their separators.
-export const SAV_PLAYBOOK_PROMPT_MAX_LENGTH = 6504;
+// Keep persisted documents readable by the previous production version.
+export const SAV_PLAYBOOK_PROMPT_MAX_LENGTH = 2000;
 export const savFactKeySchema = z.string().regex(/^[a-z][a-z0-9_]{1,79}$/);
 export const savDomainSchema = z.enum(["seo", "integration", "account", "telephony", "billing_navigation", "general"]);
 export type SavDomain = z.infer<typeof savDomainSchema>;
