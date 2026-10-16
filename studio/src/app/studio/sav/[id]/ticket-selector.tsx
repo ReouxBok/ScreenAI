@@ -22,14 +22,14 @@ export function TicketSelector({ threadId, reviewId, tickets, linkedTicketId, su
   const [reason, setReason] = useState(humanChoice?.reason ?? "");
   const [preview, setPreview] = useState<SavTicketPreview | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const [queued, setQueued] = useState(false);
+  const [execution, setExecution] = useState<"completed" | "pending" | "failed" | "deferred" | null>(null);
   const [busy, startTransition] = useTransition();
   const router = useRouter(), name = useId(), previewRef = useRef<HTMLElement>(null);
   useEffect(() => {
     if (preview) { previewRef.current?.scrollIntoView({ block: "nearest", behavior: "smooth" }); previewRef.current?.focus(); }
   }, [preview]);
   useEffect(() => {
-    if ((!queued && !pending) || completed) return;
+    if ((execution !== "pending" && execution !== "deferred" && !pending) || completed) return;
     let timer: ReturnType<typeof setTimeout>, stopped=false, attempts=0;
     const controller=new AbortController();
     async function poll() {
@@ -37,14 +37,14 @@ export function TicketSelector({ threadId, reviewId, tickets, linkedTicketId, su
         const response=await fetch(`/api/internal/sav/dossiers/${threadId}/status`,{ cache:"no-store",signal:controller.signal });
         if (!response.ok) throw new Error();
         const state=await response.json();
-        if (state.ticket && !["pending","running"].includes(state.ticket.status)) { setQueued(false);router.refresh();return; }
+        if (state.ticket && !["pending","running"].includes(state.ticket.status)) { setExecution(state.ticket.status === "succeeded" ? "completed" : "failed");router.refresh();return; }
       } catch { if(controller.signal.aborted) return; }
       if (!stopped && ++attempts<100) timer=setTimeout(poll,3000);
     }
     void poll();return () => { stopped=true;controller.abort();clearTimeout(timer); };
-  },[queued,pending,completed,threadId,router]);
+  },[execution,pending,completed,threadId,router]);
   const filtered = sortSavTicketsNewestFirst(tickets).filter(ticket => `${ticket.subject} ${ticket.id} ${ticket.ownerId ?? ""} ${ticket.ownerName ?? ""}`.toLocaleLowerCase("fr").includes(query.toLocaleLowerCase("fr")));
-  const disabled = !reviewId || !crmReady || completed || pending || queued || Boolean(blockedReason);
+  const disabled = !reviewId || !crmReady || completed || pending || Boolean(execution) || Boolean(blockedReason);
   function choose(value: string) { setSelected(value); setPreview(null); setError(null); }
   function prepare() {
     if (!reviewId) return;
@@ -62,7 +62,7 @@ export function TicketSelector({ threadId, reviewId, tickets, linkedTicketId, su
       try {
         const result = await confirmTicketPreviewAction(preview.token);
         setError(result.error);
-        if (result.actionId) { setQueued(true); setPreview(null); router.refresh(); }
+        if (result.actionId) { setExecution(result.status); setPreview(null); router.refresh(); }
         else setPreview(null);
       } catch { setError("Le résultat de la confirmation n’est pas connu. Actualisez le dossier pour vérifier la file avant toute reprise."); setPreview(null); router.refresh(); }
     });
@@ -71,7 +71,7 @@ export function TicketSelector({ threadId, reviewId, tickets, linkedTicketId, su
     <h3>Choisir l’action ticket</h3>
     {linkedTicketId && <p><strong>Ticket réellement lié : {tickets.find(ticket => ticket.id === linkedTicketId)?.subject || "Ticket HubSpot"}</strong></p>}
     {suggestedTicketId && <p>Correspondance proposée : {tickets.find(ticket => ticket.id === suggestedTicketId)?.subject || "ticket HubSpot"}. Cette proposition ne rattache pas le dossier.</p>}
-    {completed ? <p role="status">Action déjà traitée pour cet email.</p> : queued || pending ? <p role="status">Demande HubSpot en attente de confirmation. Consultez son résultat dans le journal d’actions.</p> : blockedReason ? <p role="status">{blockedReason}</p> : !reviewId ? <p>Validez d’abord le dossier / process pour choisir une action.</p> : !crmReady ? <p role="alert">Le contexte HubSpot est indisponible ou incomplet. Actualisez-le avant de choisir une action.</p> : null}
+    {completed || execution === "completed" ? <p role="status">Action déjà traitée pour cet email. Résultat confirmé dans le journal d’actions.</p> : execution === "failed" ? <p role="status">Action refusée. Consultez le motif et le journal avant toute reprise.</p> : execution === "deferred" ? <p role="status">Action enregistrée durablement. Le traitement planifié la reprendra ; consultez le journal avant toute reprise.</p> : execution === "pending" || pending ? <p role="status">Demande HubSpot en attente de confirmation. Consultez son résultat dans le journal d’actions.</p> : blockedReason ? <p role="status">{blockedReason}</p> : !reviewId ? <p>Validez d’abord le dossier / process pour choisir une action.</p> : !crmReady ? <p role="alert">Le contexte HubSpot est indisponible ou incomplet. Actualisez-le avant de choisir une action.</p> : null}
     {!completed && <>
       <label>Rechercher un ticket<input type="search" value={query} onChange={event => setQuery(event.target.value)} placeholder="Titre, numéro ou propriétaire" disabled={busy}/></label>
       {humanChoice && <p>Choix issu du process validé. Pour changer l’action ou le ticket, corrigez puis revalidez le process ci-dessus.</p>}

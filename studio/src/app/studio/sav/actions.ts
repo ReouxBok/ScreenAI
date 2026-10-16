@@ -1,6 +1,6 @@
 "use server";
 
-import { reconcileSavTicketReturn } from "@/lib/sav/hubspot";
+import { processManualSavTicketActionImmediately, processPendingHubspotActions, reconcileSavTicketReturn } from "@/lib/sav/hubspot";
 
 import { revalidatePath } from "next/cache";
 import { redirect } from "next/navigation";
@@ -164,7 +164,11 @@ export async function createTicketAction(form: FormData) {
   const staff = await requireApiStaff("admin");
   const threadId = id(form, "threadId");
   let errorCode = "";
-  try { await refreshTicketContext(threadId); await queueSavManualTicket({ threadId, reviewId: id(form, "reviewId"), kind: "create_ticket", ticketId: String(form.get("ticketId") || "") || undefined, returnOperation: String(form.get("returnOperation") || "") || undefined, distinctIssueReason: String(form.get("distinctIssueReason") || "") }, staff.email); }
+  try {
+    await refreshTicketContext(threadId);
+    const action = await queueSavManualTicket({ threadId, reviewId: id(form, "reviewId"), kind: "create_ticket", ticketId: String(form.get("ticketId") || "") || undefined, returnOperation: String(form.get("returnOperation") || "") || undefined, distinctIssueReason: String(form.get("distinctIssueReason") || "") }, staff.email);
+    errorCode = await executeQueuedTicketAction(action.id);
+  }
   catch (error) { errorCode = error instanceof Error && /^[A-Z][A-Z_]+$/.test(error.message) ? error.message : "SAV_MANUAL_TICKET_INVALID"; }
   revalidatePath("/studio/sav");
   revalidatePath(`/studio/sav/${threadId}`);
@@ -175,10 +179,28 @@ export async function linkTicketAction(form: FormData) {
   const staff = await requireApiStaff("admin");
   const threadId = id(form, "threadId");
   let errorCode = "";
-  try { await refreshTicketContext(threadId); await queueSavManualTicket({ threadId, reviewId: id(form, "reviewId"), kind: "link_ticket", ticketId: id(form, "ticketId"), returnOperation: String(form.get("returnOperation") || "") || undefined }, staff.email); }
+  try {
+    await refreshTicketContext(threadId);
+    const action = await queueSavManualTicket({ threadId, reviewId: id(form, "reviewId"), kind: "link_ticket", ticketId: id(form, "ticketId"), returnOperation: String(form.get("returnOperation") || "") || undefined }, staff.email);
+    errorCode = await executeQueuedTicketAction(action.id);
+  }
   catch (error) { errorCode = error instanceof Error && /^[A-Z][A-Z_]+$/.test(error.message) ? error.message : "SAV_MANUAL_TICKET_INVALID"; }
   revalidatePath("/studio/sav"); revalidatePath(`/studio/sav/${threadId}`);
   redirect(`/studio/sav/${encodeURIComponent(threadId)}?review=${errorCode || "ticket_queued"}`);
+}
+
+async function executeQueuedTicketAction(actionId: string) {
+  try {
+    const result = await processManualSavTicketActionImmediately(actionId);
+    if (result.status === "completed") return "ticket_done";
+    if (result.status === "failed" && /^[A-Z][A-Z0-9_]+$/.test(result.errorCode)) return result.errorCode;
+    // A cron worker may already own the durable action, or writes may be paused.
+    // In both cases the action remains visible and the cron stays its recovery path.
+    return "ticket_queued";
+  } catch {
+    // Preserve the durable command if the fast path itself is unavailable.
+    return "ticket_processing_deferred";
+  }
 }
 
 async function refreshTicketContext(threadId: string) {
@@ -236,7 +258,12 @@ export async function approveDraftAction(form: FormData) {
 export async function retryAction(form: FormData) {
   const staff = await requireApiStaff("admin");
   const threadId = id(form, "threadId");
-  await retrySavAction(id(form, "actionId"), staff.email);
+  const action = await retrySavAction(id(form, "actionId"), staff.email);
+  if (["create_ticket", "link_ticket"].includes(action.kind)) {
+    await processManualSavTicketActionImmediately(action.id);
+  } else if (["log_email", "update_ticket_status"].includes(action.kind)) {
+    await processPendingHubspotActions(1, action.id);
+  }
   revalidatePath(`/studio/sav/${threadId}`);
 }
 

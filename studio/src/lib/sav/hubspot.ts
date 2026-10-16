@@ -993,6 +993,17 @@ export async function processPendingHubspotActions(limit = 20, actionId?: string
   return { processed };
 }
 
+/** Execute one human-confirmed ticket action and its email association, without
+ * draining unrelated HubSpot work from the shared cron queue. */
+export async function processManualSavTicketActionImmediately(actionId: string) {
+  await processPendingHubspotActions(1, actionId);
+  const db = requireDb();
+  const [action] = await db.select().from(savActions).where(eq(savActions.id, actionId)).limit(1);
+  if (!action) return { status: "failed" as const, errorCode: "SAV_ACTION_NOT_FOUND" };
+  if (action.status === "failed") return { status: "failed" as const, errorCode: action.errorCode || "SAV_HUBSPOT_ACTION_FAILED" };
+  return action.status === "succeeded" ? { status: "completed" as const } : { status: "pending" as const };
+}
+
 export async function processPendingPilotHubspotActions(batchId: string, limit = 50) {
   // Deliberately return before touching the database or HubSpot. Pilot actions
   // are proposals displayed in the Studio, never commands to execute.

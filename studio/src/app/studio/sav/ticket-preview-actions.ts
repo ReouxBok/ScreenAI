@@ -11,6 +11,7 @@ import { queueSavManualTicket } from "@/lib/sav/manual-tickets";
 import { savReleaseStage } from "@/lib/sav/config";
 import { savManualTicketError } from "@/lib/sav/manual-ticket-status";
 import { dispatchSavTicketCommand } from "@/lib/sav/dispatch";
+import { processManualSavTicketActionImmediately } from "@/lib/sav/hubspot";
 
 function errorMessage(error: unknown) {
   return savManualTicketError(error instanceof Error ? error.message : null);
@@ -50,12 +51,18 @@ export async function confirmTicketPreviewAction(token: string) {
     if (context.crm.status !== "ready") throw new Error("SAV_TICKET_RETURN_CONTEXT_CHANGED");
     const action = await queueSavManualTicket({ ...signed.command, previewToken: token }, staff.email, context);
     await recordInteraction(staff.email, requestId, "confirm", "succeeded", threadId, action.id);
-    if (action.status === "pending") await dispatchSavTicketCommand(action.id);
+    let result: Awaited<ReturnType<typeof processManualSavTicketActionImmediately>> | { status: "deferred" };
+    try {
+      result = await processManualSavTicketActionImmediately(action.id);
+    } catch {
+      // The command is already durable. Do not ask the user to submit it again.
+      result = { status: "deferred" };
+    }
+    if (result.status === "pending" || result.status === "deferred") await dispatchSavTicketCommand(action.id);
     revalidatePath("/studio/sav");
     revalidatePath(`/studio/sav/${signed.command.threadId}`);
-    return { actionId: action.id, error: null };
+    return { actionId: action.id, status: result.status, error: result.status === "failed" ? savManualTicketError(result.errorCode) : null };
   } catch (error) {
     await recordInteraction(staff.email, requestId, "confirm", "refused", threadId, undefined, error);
-    return { actionId: null, error: errorMessage(error) };
-  }
+    return { actionId: null, status: "failed" as const, error: errorMessage(error) }; }
 }
