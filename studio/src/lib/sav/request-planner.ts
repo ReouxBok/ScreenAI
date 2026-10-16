@@ -65,7 +65,7 @@ export function planSavRequests(u: SavUnderstandingV1, retrieval: SavRequestRetr
         if (attempts.length) return { ...base, limits: [...limits, "procedure_attempt_requires_review"] };
         const procedures = savDeliveryGroups(delivery.data).filter(g => g.steps.every(step => savEvidenceContains(source.content, step.instruction)
           && sourceSteps(source).some(instruction => savEvidenceContains(instruction, step.instruction)))
-          && renderSavProcedureGroup(g, u.language === "en" ? "en" : "fr").length <= 7400);
+          && renderSavProcedureGroup(g, u.language === "en" ? "en" : "fr").length + request.summary.length + 100 <= 4000);
         return procedures.length === delivery.data.groups.length && procedures.length ? { ...base, mode: procedures.some(g => !g.requiresHuman) ? "solution" : "knowledge_gap", procedures } : { ...base, limits: [...limits, "procedure_requires_review"] };
       }
       const diagnostic = diagnosticKnowledgeSchema.safeParse(source.resolution?.diagnostic);

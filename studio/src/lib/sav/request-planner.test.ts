@@ -170,6 +170,13 @@ describe("complete qualified procedures", () => {
     const [reply] = assembleSavPlannedReply(u, [{ ...part, procedureGroupId: "method.other" }], p);
     expect(reply.text).toContain("Lire le résultat fictif."); expect(reply.text).not.toContain("Ouvrir le diagnostic fictif.");
   });
+  it("hands off an oversized full procedure without truncating it or expanding the persisted reply contract", () => {
+    const r = procedural(); const delivery = savSupportDeliveryProjectionSchema.parse(r.sources[0].resolution!.delivery);
+    for (const step of delivery.steps) step.instruction = "Instruction fictive. ".repeat(95).trim();
+    r.sources[0].resolution!.delivery = delivery; r.sources[0].content = delivery.steps.map(s => s.instruction).join("\n");
+    const u = understanding(); u.requests[0].summary = "Résumé fictif. ".repeat(35);
+    expect(planSavRequests(u, r, playbook)[0]).toMatchObject({ mode: "knowledge_gap", limits: ["procedure_requires_review"] });
+  });
   it("blocks repeated attempts, internal instructions, uncertain context and non-source steps", () => {
     const r = procedural();
     expect(planSavRequests(understanding({ attemptedSteps: [{ id: "a", key: "old", text: "Déjà essayé", evidenceIds: ["e1"] }] }), r, playbook)[0].mode).toBe("knowledge_gap");

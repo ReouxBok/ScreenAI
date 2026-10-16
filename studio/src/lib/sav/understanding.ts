@@ -137,7 +137,7 @@ export function savSemanticPlan(u: SavUnderstandingV1): SavSemanticPlan {
 }
 
 export const savReplyCoverageSchema = z.array(z.object({
-  requestId: id, text: z.string().trim().min(1).max(8000), procedureGroupId: id.nullable().optional(),
+  requestId: id, text: z.string().trim().min(1).max(4000), procedureGroupId: id.nullable().optional(),
   kind: z.enum(["acknowledgement", "clarification", "solution", "handoff"]),
   sourceIds: ids, missingInformationIds: ids, repeatedAttemptIds: ids,
   repeatJustification: z.string().max(500),
