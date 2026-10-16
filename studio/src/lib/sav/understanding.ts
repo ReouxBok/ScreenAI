@@ -2,7 +2,7 @@ import { z } from "zod";
 import { normalizeSavEvidenceText, savEvidenceContains } from "./evidence-text";
 import { cleanSavModelDraft } from "./reply-format";
 
-export const SAV_UNDERSTANDING_REVISION = "sav-understanding-2026-10-16.v5";
+export const SAV_UNDERSTANDING_REVISION = "sav-understanding-2026-10-16.v6";
 export const SAV_UNDERSTANDING_PROMPT_REVISION = "sav-understanding-prompt-2026-10-16.v6";
 const id = z.string().trim().min(1).max(100);
 const ids = z.array(id).max(30);
@@ -137,7 +137,7 @@ export function savSemanticPlan(u: SavUnderstandingV1): SavSemanticPlan {
 }
 
 export const savReplyCoverageSchema = z.array(z.object({
-  requestId: id, text: z.string().trim().min(1).max(4000),
+  requestId: id, text: z.string().trim().min(1).max(8000), procedureGroupId: id.nullable().optional(),
   kind: z.enum(["acknowledgement", "clarification", "solution", "handoff"]),
   sourceIds: ids, missingInformationIds: ids, repeatedAttemptIds: ids,
   repeatJustification: z.string().max(500),

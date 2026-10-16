@@ -1,4 +1,5 @@
 import type { CanonicalKnowledge } from "./contracts";
+import type { SavSupportDelivery } from "./support-delivery";
 
 export type SavKnowledgeTab = "production" | "automatic" | "human";
 export type SavKnowledgeOrigin = "automatic" | "human" | "unknown";
@@ -13,6 +14,7 @@ export type SavKnowledgeRow = {
 };
 export type SavKnowledgeVersion = { id: string; version: number; title: string; body: string; createdAt: Date; authorEmail: string };
 export type SavKnowledgeDraft = {
+  delivery?: SavSupportDelivery;
   id: string; revision: number; mode: "new" | "improve"; targetItemId: string | null;
   title: string; document: CanonicalKnowledge; sources: SavKnowledgeSource[]; reason: string;
   origin: SavKnowledgeOrigin; learningCandidateId: string | null; candidateId: string | null;
@@ -20,6 +22,7 @@ export type SavKnowledgeDraft = {
 };
 export type SavKnowledgeComparison = { ref: string; title: string; body: string; versionId: string; signal: "duplicate" | "related"; explanation: string };
 export type SavKnowledgeDetail = {
+  delivery?: SavSupportDelivery;
   reviewKind: "workspace" | "onboarding" | "hubspot" | "legacy" | null;
   row: SavKnowledgeRow; document: CanonicalKnowledge | null; sources: SavKnowledgeSource[];
   activeVersion: SavKnowledgeVersion | null; publishedVersion: SavKnowledgeVersion | null;

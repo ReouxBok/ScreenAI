@@ -8,7 +8,7 @@ type Workspace = Awaited<ReturnType<typeof getSavPlaybookWorkspace>>;
 export function PlaybookEditor({ initial, canManage }: { initial: Workspace; canManage: boolean }) {
   const [workspace, setWorkspace] = useState(initial);
   const [document, setDocument] = useState(initial.versions.find(v => v.id === initial.draftId)?.document ?? initial.fallback);
-  const [prompt, setPrompt] = useState(() => savPlaybookPrompt(document));
+  const [prompt, setPrompt] = useState(() => initial.versions.find(v => v.id === initial.draftId)?.prompt ?? savPlaybookPrompt(document));
   const [message, setMessage] = useState("");
   const [pending, startTransition] = useTransition();
   const [dirty, setDirty] = useState(false);
@@ -17,13 +17,13 @@ export function PlaybookEditor({ initial, canManage }: { initial: Workspace; can
     if (action === "save" && promptTooLong) return;
     startTransition(async () => {
       // Keep the existing fact dictionary; only merge the editable prose into one field.
-      const result = await changeSavPlaybook({ action, document: action === "save" ? { ...document, tone: prompt, handling: "", escalation: "" } : undefined, versionId,
+      const result = await changeSavPlaybook({ action, document: action === "save" ? document : undefined, prompt: action === "save" ? prompt : undefined, versionId,
         expectedDraftId: workspace.draftId, expectedActiveId: workspace.activeId });
       const nextWorkspace = result.workspace;
       if (nextWorkspace) {
         setWorkspace(nextWorkspace);
         const saved = nextWorkspace.versions.find(v => v.id === nextWorkspace.draftId)?.document ?? nextWorkspace.fallback;
-        setDocument(saved); setPrompt(savPlaybookPrompt(saved)); setDirty(false);
+        setDocument(saved); setPrompt(nextWorkspace.versions.find(v => v.id === nextWorkspace.draftId)?.prompt ?? savPlaybookPrompt(saved)); setDirty(false);
       }
       setMessage(result.error ?? (action === "save" ? "Brouillon enregistré. La version active reste utilisée." : action === "review" ? "Version relue et contrôlée. Vous pouvez maintenant l’activer." : "Version activée pour les prochaines analyses."));
     });

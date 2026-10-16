@@ -76,3 +76,16 @@ export function savProjectionBody(document: CanonicalKnowledge) {
     ...step.variants.map((variant) => `Variante à qualifier (${variant.roles.join(", ") || "rôle non précisé"} ; ${variant.productVersion || "version non précisée"}) : ${variant.instruction}`),
   ]), "## Résultat attendu", document.expectedResult || "À confirmer par Ugo.", "## Exceptions", ...document.exceptions, "## Escalade", document.escalation, ...(document.onboardingContext?.sourceNotes.length ? ["## Compléments sourcés à examiner", ...document.onboardingContext.sourceNotes] : []), ...onboardingSectionsBody(document), ...(document.supportContext?.responseTemplate ? ["## Exemple de réponse à adapter", document.supportContext.responseTemplate] : [])].join("\n\n");
 }
+
+/** Keep archived source material in the canonical revision and review UI, not in
+ * every retrieval payload. The actual entry point and all procedure fields stay. */
+export function savQualifiedProjectionBody(document: CanonicalKnowledge) {
+  const text = [document.objective, document.onboardingContext?.entryPoint ?? "", ...document.prerequisites,
+    ...document.steps.flatMap(step => [step.userLabel, step.instruction, step.location, ...step.prerequisites, step.expectedResult, ...step.exceptions, step.escalation]),
+    document.expectedResult, ...document.exceptions, document.escalation, ...(document.supportContext?.symptoms ?? []),
+    ...(document.supportContext?.diagnosticQuestions ?? []), document.supportContext?.responseTemplate ?? "",
+    // Explicit diagnostic facts and edges remain available to grounding.
+    ...(document.diagnostic ? [savProjectionBody({ ...document, steps: [], prerequisites: [], exceptions: [], expectedResult: "", escalation: "", onboardingContext: undefined, supportContext: undefined })] : []),
+  ];
+  return [...new Set(text.map(value => value.trim()).filter(Boolean))].join("\n\n");
+}

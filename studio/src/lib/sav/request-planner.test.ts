@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { savSupportDeliveryProjectionSchema, savDeliveryGroups, serializeSavDeliveryGroups } from "@/lib/knowledge/support-delivery";
 import { planSavRequests, assembleSavPlannedReply } from "./request-planner";
 import { defaultSavPlaybook } from "./playbook-contract";
 import { savSemanticPlan, type SavUnderstandingV1 } from "./understanding";
@@ -137,5 +138,45 @@ describe("SAV-68 thirteen synthetic acceptance scenarios (no model call)", () =>
   it("English uses an approved English question and preserves answered context", () => {
     const u = understanding({ language: "en", knownFacts: [] }); const r = retrieval(); const d = r.sources[0].resolution!.diagnostic as { requiredFacts: Array<{ questionEn?: string }> }; d.requiredFacts[0].questionEn = "What is the page URL?";
     expect(planSavRequests(u, r, playbook)[0].missingFacts[0].question).toBe("What is the page URL?");
+  });
+});
+
+describe("complete qualified procedures", () => {
+  function procedural() {
+    const r = retrieval(); delete r.sources[0].resolution!.diagnostic;
+    const group = { id: "method.first", label: "Première méthode fictive", requiresHuman: false, prerequisites: [], exceptions: [], expectedResult: "", escalation: "", steps: [
+      { id: "first.open", userLabel: "Ouvrir", instruction: "Ouvrir le diagnostic fictif.", expectedResult: "", prerequisites: [], exceptions: [], escalation: "" },
+      { id: "first.read", userLabel: "Lire", instruction: "Lire le résultat fictif.", expectedResult: "", prerequisites: [], exceptions: [], escalation: "" },
+    ] };
+    r.sources[0].resolution!.delivery = serializeSavDeliveryGroups("procedure", [group]); return r;
+  }
+  const part = { requestId: "r1", text: "Texte du modèle ignoré.", kind: "solution" as const, sourceIds: ["card"], missingInformationIds: [], repeatedAttemptIds: [], repeatJustification: "" };
+  it("sends the full source procedure without invented questions or free model advice", () => {
+    const u = understanding({ knownFacts: [] }); const p = planSavRequests(u, procedural(), playbook);
+    const [reply] = assembleSavPlannedReply(u, [{ ...part, procedureGroupId: "method.first" }], p);
+    expect(reply.text).toContain("Ouvrir le diagnostic fictif."); expect(reply.text).toContain("Lire le résultat fictif.");
+    expect(reply.text).not.toContain("Texte du modèle"); expect(p[0].missingFacts).toEqual([]);
+  });
+  it("requires one explicit method when there are alternatives and withholds sensitive objectives", () => {
+    const r = procedural(); const groups = savDeliveryGroups(r.sources[0].resolution!.delivery); const d = { groups };
+    d.groups.push({ ...d.groups[0], id: "method.other", label: "Autre méthode fictive", steps: [d.groups[0].steps[1]] });
+    d.groups.push({ ...d.groups[0], id: "method.sensitive", requiresHuman: true });
+    r.sources[0].resolution!.delivery = serializeSavDeliveryGroups("procedure", d.groups);
+    const u = understanding(); const p = planSavRequests(u, r, playbook);
+    expect(p[0].procedures).toHaveLength(3);
+    expect(() => assembleSavPlannedReply(u, [part], p)).toThrow("SELECTION_REQUIRED");
+    expect(assembleSavPlannedReply(u, [{ ...part, kind: "handoff", procedureGroupId: null, sourceIds: [] }], p)[0]).toMatchObject({ kind: "handoff", sourceIds: [] });
+    expect(assembleSavPlannedReply(u, [{ ...part, procedureGroupId: "method.sensitive" }], p)[0]).toMatchObject({ kind: "handoff", sourceIds: [] });
+    const [reply] = assembleSavPlannedReply(u, [{ ...part, procedureGroupId: "method.other" }], p);
+    expect(reply.text).toContain("Lire le résultat fictif."); expect(reply.text).not.toContain("Ouvrir le diagnostic fictif.");
+  });
+  it("blocks repeated attempts, internal instructions, uncertain context and non-source steps", () => {
+    const r = procedural();
+    expect(planSavRequests(understanding({ attemptedSteps: [{ id: "a", key: "old", text: "Déjà essayé", evidenceIds: ["e1"] }] }), r, playbook)[0].mode).toBe("knowledge_gap");
+    expect(planSavRequests(understanding({ status: "needs_clarification" }), r, playbook)[0].mode).toBe("knowledge_gap");
+    r.sources[0].resolution!.delivery = serializeSavDeliveryGroups("internal", []);
+    expect(planSavRequests(understanding(), r, playbook)[0].limits).toContain("internal_guidance_only");
+    const invalid = procedural(); const invalidDelivery = savSupportDeliveryProjectionSchema.parse(invalid.sources[0].resolution!.delivery); invalidDelivery.steps[0].instruction = "Instruction inventée."; invalid.sources[0].resolution!.delivery = invalidDelivery;
+    expect(planSavRequests(understanding(), invalid, playbook)[0].procedures).toBeUndefined();
   });
 });

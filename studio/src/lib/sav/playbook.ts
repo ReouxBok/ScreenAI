@@ -3,7 +3,7 @@ import { and, desc, eq } from "drizzle-orm";
 import { requireDb } from "@/db";
 import { activeKnowledge, knowledgeRevisions, auditLogs, contentItems, contentVersions, savKnowledgeActivations } from "@/db/schema";
 import { assertSavActor } from "./access";
-import { assertSavPlaybookActor, defaultSavPlaybook, renderSavPlaybook, SAV_PLAYBOOK_SLUG, savPlaybookSchema, type SavActivePlaybook } from "./playbook-contract";
+import { assertSavPlaybookActor, defaultSavPlaybook, renderSavPlaybook, SAV_PLAYBOOK_SLUG, savPlaybookSchema, packSavPlaybookPrompt, readSavPlaybookPrompt, type SavActivePlaybook } from "./playbook-contract";
 
 function playbookDocument(metadata: typeof contentVersions.$inferSelect.metadata) {
   if (metadata.sourceMetadata?.kind !== "sav_playbook") throw new Error("SAV_PLAYBOOK_VERSION_INVALID");
@@ -17,7 +17,7 @@ export async function getSavPlaybookWorkspace(actorEmail: string) {
   const [active] = item ? await db.select().from(savKnowledgeActivations).where(eq(savKnowledgeActivations.itemId, item.id)) : [];
   const reviews = item ? await db.select().from(auditLogs).where(and(eq(auditLogs.entityId, item.id), eq(auditLogs.action, "sav_playbook_reviewed"))) : [];
   return { itemId: item?.id ?? null, draftId: item?.currentDraftVersionId ?? null, activeId: active?.versionId ?? null,
-    versions: versions.map(v => ({ id: v.id, version: v.version, document: playbookDocument(v.metadata),
+    versions: versions.map(v => ({ id: v.id, version: v.version, document: playbookDocument(v.metadata), prompt: readSavPlaybookPrompt(playbookDocument(v.metadata), v.metadata.sourceMetadata?.playbookPrompt),
       author: v.authorEmail, createdAt: v.createdAt, reviewed: reviews.some(r => r.technicalMetadata?.versionId === v.id) })),
     fallback: defaultSavPlaybook };
 }
@@ -27,21 +27,23 @@ export async function readActiveSavPlaybook(): Promise<SavActivePlaybook> {
     .innerJoin(savKnowledgeActivations, eq(savKnowledgeActivations.itemId, contentItems.id))
     .innerJoin(contentVersions, and(eq(contentVersions.id, savKnowledgeActivations.versionId), eq(contentVersions.itemId, contentItems.id)))
     .where(and(eq(contentItems.slug, SAV_PLAYBOOK_SLUG), eq(contentItems.locale, "fr-FR"), eq(contentItems.agentKey, "sav")));
-  return row ? { versionId: row.version.id, version: row.version.version, document: playbookDocument(row.version.metadata) }
+  return row ? { versionId: row.version.id, version: row.version.version, document: playbookDocument(row.version.metadata), prompt: row.version.metadata.sourceMetadata?.playbookPrompt === undefined ? undefined : readSavPlaybookPrompt(playbookDocument(row.version.metadata), row.version.metadata.sourceMetadata.playbookPrompt) }
     : { versionId: "existing-process-v1", version: 0, document: defaultSavPlaybook };
 }
-export async function saveSavPlaybook(input: { document: unknown; expectedDraftId: string | null }, actorEmail: string) {
+export async function saveSavPlaybook(input: { document: unknown; prompt?: string; expectedDraftId: string | null }, actorEmail: string) {
   assertSavPlaybookActor(actorEmail);
-  const document = savPlaybookSchema.parse(input.document);
-  renderSavPlaybook({ versionId: "draft", version: 0, document }, ["seo", "integration", "account", "telephony", "billing_navigation", "general"]);
+  const parsed = savPlaybookSchema.parse(input.document);
+  const document = input.prompt === undefined ? parsed : savPlaybookSchema.parse({ ...parsed, ...packSavPlaybookPrompt(input.prompt) });
+  const prompt = readSavPlaybookPrompt(document, input.prompt);
+  renderSavPlaybook({ versionId: "draft", version: 0, document, prompt }, ["seo", "integration", "account", "telephony", "billing_navigation", "general"]);
   return requireDb().transaction(async tx => {
     await tx.insert(contentItems).values({ slug: SAV_PLAYBOOK_SLUG, type: "article", locale: "fr-FR", agentKey: "sav", title: "Master prompt SAV", ownerEmail: actorEmail, aiEnabled: false }).onConflictDoNothing();
     const [item] = await tx.select().from(contentItems).where(and(eq(contentItems.slug, SAV_PLAYBOOK_SLUG), eq(contentItems.locale, "fr-FR"))).for("update");
     if (!item || item.agentKey !== "sav" || item.currentDraftVersionId !== input.expectedDraftId) throw new Error("SAV_PLAYBOOK_STALE");
     const [last] = await tx.select().from(contentVersions).where(eq(contentVersions.itemId, item.id)).orderBy(desc(contentVersions.version)).limit(1);
     const [version] = await tx.insert(contentVersions).values({ itemId: item.id, version: (last?.version ?? 0) + 1,
-      bodyMarkdown: document.tone + "\n\n" + document.handling + "\n\n" + document.escalation,
-      metadata: { intents: [], limovaPaths: [], prerequisites: [], expectedResult: "", troubleshooting: "", sourceMetadata: { kind: "sav_playbook", playbook: document } },
+      bodyMarkdown: prompt,
+      metadata: { intents: [], limovaPaths: [], prerequisites: [], expectedResult: "", troubleshooting: "", sourceMetadata: { kind: "sav_playbook", playbook: document, playbookPrompt: prompt } },
       changeNote: "Brouillon du master prompt SAV", authorEmail: actorEmail }).returning();
     await tx.update(contentItems).set({ currentDraftVersionId: version.id, updatedAt: new Date() }).where(eq(contentItems.id, item.id));
     await tx.insert(auditLogs).values({ actorEmail, action: "sav_playbook_saved", entityType: "content", entityId: item.id, technicalMetadata: { versionId: version.id } });
@@ -55,7 +57,7 @@ export async function reviewSavPlaybook(input: { versionId: string }, actorEmail
     if (!item || item.currentDraftVersionId !== input.versionId) throw new Error("SAV_PLAYBOOK_STALE");
     const [version] = await tx.select().from(contentVersions).where(and(eq(contentVersions.itemId, item.id), eq(contentVersions.id, input.versionId)));
     if (!version) throw new Error("SAV_PLAYBOOK_VERSION_INVALID");
-    renderSavPlaybook({ versionId: version.id, version: version.version, document: playbookDocument(version.metadata) }, ["seo", "integration", "account", "telephony", "billing_navigation", "general"]);
+    renderSavPlaybook({ versionId: version.id, version: version.version, document: playbookDocument(version.metadata), prompt: version.metadata.sourceMetadata?.playbookPrompt === undefined ? undefined : readSavPlaybookPrompt(playbookDocument(version.metadata), version.metadata.sourceMetadata.playbookPrompt) }, ["seo", "integration", "account", "telephony", "billing_navigation", "general"]);
     await tx.insert(auditLogs).values({ actorEmail, action: "sav_playbook_reviewed", entityType: "content", entityId: item.id,
       technicalMetadata: { versionId: version.id, validation: "deterministic-schema-budget-v1", semanticComparison: "not_requested" } });
   });
@@ -70,7 +72,7 @@ export async function activateSavPlaybook(input: { versionId: string; expectedAc
     const [version] = await tx.select().from(contentVersions).where(and(eq(contentVersions.id, input.versionId), eq(contentVersions.itemId, item.id)));
     const reviews = await tx.select().from(auditLogs).where(and(eq(auditLogs.entityId, item.id), eq(auditLogs.action, "sav_playbook_reviewed")));
     if (!version || !reviews.some(r => r.technicalMetadata?.versionId === version.id)) throw new Error("SAV_PLAYBOOK_REVIEW_REQUIRED");
-    renderSavPlaybook({ versionId: version.id, version: version.version, document: playbookDocument(version.metadata) }, ["seo", "integration", "account", "telephony", "billing_navigation", "general"]);
+    renderSavPlaybook({ versionId: version.id, version: version.version, document: playbookDocument(version.metadata), prompt: version.metadata.sourceMetadata?.playbookPrompt === undefined ? undefined : readSavPlaybookPrompt(playbookDocument(version.metadata), version.metadata.sourceMetadata.playbookPrompt) }, ["seo", "integration", "account", "telephony", "billing_navigation", "general"]);
     const values = { itemId: item.id, versionId: version.id, title: item.title, activatedBy: actorEmail, activatedAt: new Date() };
     await tx.insert(savKnowledgeActivations).values(values).onConflictDoUpdate({ target: savKnowledgeActivations.itemId, set: values });
     await tx.update(contentItems).set({ publishedVersionId: version.id, status: "published", aiEnabled: false, updatedAt: new Date() }).where(eq(contentItems.id, item.id));

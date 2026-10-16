@@ -2,7 +2,7 @@ import "server-only";
 import { and, asc, eq, gt } from "drizzle-orm";
 import { requireDb } from "@/db";
 import { contentItems, contentVersions, knowledgeFamilyRevisions, savKnowledgeActivations, savKnowledgeProposalDrafts } from "@/db/schema";
-import { defaultSavPlaybook, assertSavPlaybookActor } from "@/lib/sav/playbook-contract";
+import { assertSavPlaybookActor } from "@/lib/sav/playbook-contract";
 import { articleMetadataSchema } from "@/lib/content";
 import { canonicalKnowledgeSchema, type CanonicalKnowledge } from "./contracts";
 import { canonicalFromSav } from "./conversion";
@@ -10,29 +10,9 @@ import { saveSavKnowledgeProposal } from "./proposals";
 
 /** Structure only existing evidence. No model call, invented result or verifiedAt refresh. */
 export function enrichSavDiagnosticDocument(document: CanonicalKnowledge): CanonicalKnowledge {
-  if (document.diagnostic) return document;
-  const patterns: Array<[string, RegExp]> = [
-    ["page_url", /\burl\b|adresse.*page|page.*address/i],
-    ["registration_email", /e.?mail|adresse.*inscri|account.*address/i],
-    ["integration_name", /(?:quelle|nom|which|name).*int[eé]gration|(?:quel|which).*connecteur/i],
-    ["connection_mode", /mode.*connexion|connection.*mode|api.*oauth/i],
-    ["error_message", /message.*erreur|error.*message|code.*erreur/i],
-    ["phone_number", /num[eé]ro.*t[eé]l[eé]phone|phone.*number/i],
-    ["publication_date", /date.*publication|quand.*publi|publication.*date/i],
-  ];
-  const mapped = new Map<string, { key: string; label: string; question: string; questionEn?: string; requiredFor: string[] }>();
-  for (const question of document.supportContext?.diagnosticQuestions ?? []) {
-    const matches = patterns.filter(([, pattern]) => pattern.test(question));
-    if (matches.length !== 1 || mapped.has(matches[0][0])) continue;
-    const key = matches[0][0], label = defaultSavPlaybook.facts.find(f => f.key === key)!.label;
-    mapped.set(key, { key, label, question, ...(document.locale === "en-US" ? { questionEn: question } : {}), requiredFor: document.steps.map(step => step.id) });
-  }
-  return canonicalKnowledgeSchema.parse({ ...document, diagnostic: {
-    requiredFacts: [...mapped.values()], knownCauses: [],
-    checks: document.steps.map((step, index) => ({ id: step.id, evidenceStepId: step.id,
-      instruction: step.instruction, expectedResult: step.expectedResult,
-      ifExpected: document.steps[index + 1]?.id ?? null, ifNot: null, prerequisites: [] })),
-  } });
+  // Copy evidence only. Classification is an explicit, separately reviewed envelope.
+  // Words in a source question and paragraph order prove neither a required fact nor a branch.
+  return canonicalKnowledgeSchema.parse(document);
 }
 export async function listSavDiagnosticEnrichment(afterId?: string) {
   const db = requireDb();

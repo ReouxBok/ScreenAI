@@ -2,6 +2,7 @@ import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vites
 import { eq } from "drizzle-orm";
 import { createSavTestDb } from "../../../test/sav-db";
 import { auditLogs, categories, contentItems, contentVersions, knowledgeFamilies, knowledgeProjectionCandidates, savKnowledgeActivations, savKnowledgeProposalDrafts, savKnowledgePublicationAttempts, savLearningCandidates } from "@/db/schema";
+import type { SavSupportDelivery } from "./support-delivery";
 import type { SaveSavKnowledgeProposalInput } from "./proposals";
 import { canonicalKnowledgeSchema } from "./contracts";
 import { articleMetadataSchema } from "@/lib/content";
@@ -17,7 +18,8 @@ let fixture: Awaited<ReturnType<typeof createSavTestDb>>;
 const actor = "ugo@limova.ai";
 const contact = "contact@limova.ai";
 const document = canonicalKnowledgeSchema.parse({ schemaVersion: 1, objective: "Renommer un espace de démonstration", applicability: "sav_only", locale: "fr-FR", prerequisites: ["Disposer des droits de gestion de l’espace."], expectedResult: "Le nom apparaît dans la liste des espaces.", exceptions: ["Un nom déjà employé doit être remplacé."], escalation: "Transmettre à un humain si le nom reste inchangé.", steps: [{ id: "workspace.rename", userLabel: "Modifier le nom", objective: "Choisir le nouveau nom", instruction: "Ouvrir les paramètres de l’espace, modifier le nom puis enregistrer.", expectedResult: "Le nom choisi apparaît dans la liste.", prerequisites: [], exceptions: [], escalation: "", variants: [] }] });
-const proposal = { mode: "new" as const, title: document.objective, document, sources: [{ ref: "https://docs.example.test/workspaces", label: "Procédure de démonstration vérifiée par l’équipe" }], reason: "Formaliser une procédure sourcée et réutilisable." };
+const delivery: SavSupportDelivery = { version: 1, mode: "procedure", internalStepIds: [], groups: [{ id: "workspace.rename", label: "Renommer un espace de démonstration", stepIds: ["workspace.rename"], requiresHuman: false, prerequisiteIndexes: [0], exceptionIndexes: [0], includeExpectedResult: true, includeEscalation: true }] };
+const proposal = { delivery, mode: "new" as const, title: document.objective, document, sources: [{ ref: "https://docs.example.test/workspaces", label: "Procédure de démonstration vérifiée par l’équipe" }], reason: "Formaliser une procédure sourcée et réutilisable." };
 beforeAll(async () => { vi.stubEnv("SAV_ENCRYPTION_KEY_V1", "synthetic-workspace-test-key-not-production"); fixture = await createSavTestDb(); state.db = fixture.db; }, 30_000);
 afterAll(async () => { await fixture?.client.close(); vi.unstubAllEnvs(); });
 beforeEach(async () => { await fixture.client.exec("TRUNCATE sav_knowledge_proposal_drafts, sav.learning_candidates, knowledge_families, content_items, categories CASCADE; TRUNCATE audit_logs"); await fixture.db.insert(categories).values({ slug: "depannage", label: "Dépannage" }); state.embed.mockReset().mockImplementation(async (texts: string[]) => texts.map(() => Array(768).fill(1))); });
@@ -41,7 +43,7 @@ describe("SAV-55 canonical knowledge workspace", () => {
       requiredFacts: [{ key: "workspace_name", label: "Nom de l’espace", question: "Quel espace de démonstration voulez-vous renommer ?", requiredFor: ["workspace.rename"] }],
       checks: [{ id: "workspace.rename", evidenceStepId: "workspace.rename", instruction: document.steps[0].instruction, expectedResult: document.steps[0].expectedResult, prerequisites: [], ifExpected: null, ifNot: null }], knownCauses: [],
     } });
-    const candidate = await submit({ ...proposal, document: guided });
+    const candidate = await submit({ ...proposal, document: guided, delivery: { version: 1, mode: "diagnostic" } });
     const approved = await approve(candidate, actor, guided);
     await publishSavKnowledgeVersion({ itemId: approved.targetItemId!, expectedVersionId: approved.materializedVersionId! }, actor);
     await activateSavKnowledgeVersion({ itemId: approved.targetItemId!, expectedPublishedVersionId: approved.materializedVersionId!, expectedActiveVersionId: null }, actor);
@@ -297,4 +299,32 @@ describe("SAV-55 canonical knowledge workspace", () => {
     expect((await paginateSavKnowledge({ tab: "automatic", status: "needs_revalidation" })).total).toBe(1);
   });
 
+});
+
+
+describe("qualified delivery review gates", () => {
+  it("keeps unclassified drafts internal and invalidates previews when delivery changes", async () => {
+    const draft = await saveSavKnowledgeProposal({ ...proposal, delivery: undefined }, actor);
+    const old = await previewSavKnowledgeProposal(draft.id, actor);
+    expect(old.draft.delivery?.mode).toBe("unclassified"); expect(old.missing.join(" ")).toContain("Qualifier la restitution");
+    await expect(submitSavKnowledgeProposal({ draftId: draft.id, snapshot: old.snapshot }, actor)).rejects.toThrow("PROPOSAL_INCOMPLETE");
+    const updated = await saveSavKnowledgeProposal({ ...proposal, draftId: draft.id, expectedRevision: draft.revision }, actor);
+    const current = await previewSavKnowledgeProposal(updated.id, actor);
+    expect(current.draft.delivery).toEqual(delivery);
+    await expect(submitSavKnowledgeProposal({ draftId: updated.id, snapshot: old.snapshot }, actor)).rejects.toThrow("PREVIEW_STALE");
+  });
+  it("rebinds corrected prose only after a new review preview and rejects changed projected instructions", async () => {
+    const candidate = await submit();
+    const old = await previewSavKnowledgeReview(candidate.id, actor, document);
+    const corrected = { ...document, steps: [{ ...document.steps[0], instruction: "Ouvrir le panneau fictif corrigé puis enregistrer le nom." }] };
+    await expect(reviewSavKnowledgeProposal({ candidateId: candidate.id, expectedRevisionId: candidate.revisionId, snapshot: old.snapshot, decision: "approve", reason: "Revue synthétique du contenu corrigé.", document: corrected }, actor)).rejects.toThrow("REVIEW_STALE");
+    const approved = await approve(candidate, actor, corrected);
+    const [version] = await fixture.db.select().from(contentVersions).where(eq(contentVersions.id, approved.materializedVersionId!));
+    const metadata = articleMetadataSchema.parse(version.metadata);
+    expect(metadata.resolution!.delivery!.steps[0].instruction).toBe(corrected.steps[0].instruction);
+    const changed = structuredClone(metadata); changed.resolution!.delivery!.steps[0].instruction = "Conseil inventé hors revue.";
+    await fixture.db.update(contentVersions).set({ metadata: changed }).where(eq(contentVersions.id, version.id));
+    await expect(publishSavKnowledgeVersion({ itemId: approved.targetItemId!, expectedVersionId: version.id }, actor)).rejects.toThrow("SAV_DELIVERY_DOCUMENT_CHANGED");
+    expect(await fixture.db.select().from(savKnowledgeActivations)).toHaveLength(0);
+  });
 });
