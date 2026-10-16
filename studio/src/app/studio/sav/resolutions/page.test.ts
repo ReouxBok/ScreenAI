@@ -2,7 +2,8 @@ import { describe, expect, it, vi } from "vitest";
 import { renderToStaticMarkup } from "react-dom/server";
 vi.mock("@/lib/sav/auth",()=>({requireSavStaff:async()=>({email:"ugo@limova.ai"})}));
 vi.mock("@/lib/sav/hubspot",()=>({getHubspotBackfillState:async()=>null,HUBSPOT_EMAIL_READ_SCOPE:"fixture",isHubspotEmailReadScopeError:()=>false}));
-vi.mock("@/lib/sav/learning",()=>({listLearningCandidates:async()=>[{id:"fixture",status:"pending",syncInProgress:true,proposedSubject:"Résolution fictive",proposedResolution:"Procédure fictive",explanation:"Preuves en cours de lecture",createdAt:new Date(),hubspotTicketId:"123"}]}));
+vi.mock("@/lib/sav/learning",()=>({listLearningCandidates:async()=>[{id:"fixture",status:"pending",syncInProgress:true,proposedSubject:"Résolution fictive",proposedResolution:"Procédure fictive",explanation:"Preuves en cours de lecture",createdAt:new Date(),hubspotTicketId:"123",evidenceCaseCount:2,evidenceTicketIds:["123","456"]}]}));
+vi.mock("@/lib/sav/learning-admission",()=>({savLearningAdmissionMetrics:async()=>({cutover:null,dailyModelCalls:0,dailyModelLimit:null,openAutomaticProposals:0,openLimit:10,weeklyLimit:5,signals:[],recentSignals:[]})}));
 vi.mock("../actions",()=>({continueBackfillAction:()=>{},reviewLearningAction:()=>{}}));
 import Page from "./page";
 describe("Resolution approval during refresh",()=>{
@@ -13,4 +14,16 @@ describe("Resolution approval during refresh",()=>{
  it("explains a stale source without a technical exception",async()=>{
   const html=renderToStaticMarkup(await Page({searchParams:Promise.resolve({review:"stale"})}));expect(html).toContain("Les preuves ou la qualification ont changé");
  });
+ it("keeps the historical intake closed and exposes the bounded learning policy",async()=>{
+  const html=renderToStaticMarkup(await Page({searchParams:Promise.resolve({})}));
+  expect(html).toContain("Activation explicite requise");expect(html).toContain("Aucun ticket historique ne sera retraité");
+  expect(html).toContain("sans plafond journalier et avec déduplication");expect(html).toContain("5 nouvelles propositions / 7 jours glissants");expect(html).not.toContain("Analyser 25 maintenant");
+ });
+});
+
+it("retains representative evidence links without raw identifier labels after composition",async()=>{
+ const html=renderToStaticMarkup(await Page({searchParams:Promise.resolve({})}));
+ expect(html).toContain("Preuve 1");expect(html).toContain("Preuve 2");
+ expect(html).toContain("/ticket/123");expect(html).toContain("/ticket/456");
+ expect(html).not.toContain("#123");expect(html).not.toContain("#456");
 });

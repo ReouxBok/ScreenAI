@@ -14,6 +14,9 @@ import { saveDraft } from "@/lib/workflow";
 import { decryptSavPayload } from "./crypto";
 import { proposeOnboardingFromSav } from "@/lib/knowledge/candidates";
 import { assertKnowledgeUgoApproval } from "@/lib/knowledge/contracts";
+import { closeSavLearningReservationTx } from "./learning-admission";
+import { assertSavLearningAdmitted, isSavAutomaticLearning } from "./learning-origin";
+import { assertSavCrmLearningSource } from "./learning-source";
 
 type LearningPatch = {
   subject: string;
@@ -22,6 +25,10 @@ type LearningPatch = {
   provenance?: "human_resolution" | "ai_resolution" | "ticket_content" | "pilot_human_review";
   customerConfirmed?: boolean;
   sourceMessageId?: string | null;
+  cycleSourceHash?: string;
+  conditions?: string[];
+  expectedResult?: string;
+  limitations?: string[];
 };
 
 function plainText(value: string) {
@@ -42,11 +49,12 @@ function plainText(value: string) {
     .slice(0, 20_000);
 }
 
-function candidatePatch(candidate: typeof savLearningCandidates.$inferSelect) {
-  const ciphertext = candidate.proposedPatch.ciphertext;
+function decryptCandidatePatch(proposedPatch: Record<string, unknown>) {
+  const ciphertext = proposedPatch.ciphertext;
   if (typeof ciphertext !== "string") throw new Error("SAV_LEARNING_PATCH_INVALID");
   return decryptSavPayload<LearningPatch>(ciphertext);
 }
+function candidatePatch(candidate: typeof savLearningCandidates.$inferSelect) { return decryptCandidatePatch(candidate.proposedPatch); }
 
 export async function listLearningCandidates(limit = 100) {
   const candidates = await requireDb().select({
@@ -56,10 +64,14 @@ export async function listLearningCandidates(limit = 100) {
     status: savLearningCandidates.status,
     explanation: savLearningCandidates.explanation,
     evidenceTicketIds: savLearningCandidates.evidenceTicketIds,
+    evidenceCaseCount: savLearningCandidates.evidenceCaseCount,
     createdAt: savLearningCandidates.createdAt,
     reviewedBy: savLearningCandidates.reviewedBy,
     reviewedAt: savLearningCandidates.reviewedAt,
     proposedPatch: savLearningCandidates.proposedPatch,
+    createdBy: savLearningCandidates.createdBy,
+    sourceRef: savLearningCandidates.sourceRef,
+    admitted: sql<boolean>`exists(select 1 from sav.learning_admission_attempts attempt where attempt.candidate_id = ${savLearningCandidates.id})`,
     syncLeaseUntil: savResolutionObservations.leaseUntil,
   }).from(savLearningCandidates)
     .leftJoin(savObservationCycles, eq(savLearningCandidates.sourceRef, sql`'sav-observation:' || ${savObservationCycles.id}::text`))
@@ -68,21 +80,30 @@ export async function listLearningCandidates(limit = 100) {
     const { syncLeaseUntil, ...candidate } = row;
     const syncInProgress = Boolean(syncLeaseUntil && syncLeaseUntil > new Date());
     try {
-      const patch = candidatePatch(candidate as typeof savLearningCandidates.$inferSelect);
+      const patch = decryptCandidatePatch(candidate.proposedPatch);
       return {
         ...candidate,
         proposedPatch: undefined,
         syncInProgress,
+        historical: isSavAutomaticLearning(candidate) && !candidate.admitted,
         proposedSubject: plainText(patch.subject).slice(0, 500),
         proposedResolution: plainText(patch.finalHumanResolution).slice(0, 4_000),
+        proposedConditions: (patch.conditions ?? []).map((value) => plainText(value).slice(0, 500)),
+        proposedExpectedResult: plainText(patch.expectedResult ?? "").slice(0, 500),
+        proposedLimitations: (patch.limitations ?? []).map((value) => plainText(value).slice(0, 500)),
+        evidenceCaseCount: candidate.evidenceCaseCount,
       };
     } catch {
       return {
         ...candidate,
         proposedPatch: undefined,
         syncInProgress,
+        historical: true,
         proposedSubject: "Proposition illisible",
         proposedResolution: "Le contenu chiffré de cette proposition n’a pas pu être relu.",
+        proposedConditions: [],
+        proposedExpectedResult: "",
+        proposedLimitations: [],
       };
     }
   });
@@ -93,6 +114,8 @@ export async function approveLearningCandidate(candidateId: string, actorEmail: 
   const result = await requireDb().transaction(async (tx) => {
   const db = tx;
   const [source] = await db.select().from(savLearningCandidates).where(eq(savLearningCandidates.id,candidateId));
+  if (source?.status === "pending") await assertSavLearningAdmitted(source, db);
+  if (source) await assertSavCrmLearningSource(source, db, true);
   if(source?.sourceRef.startsWith("sav-observation:")) {
     const [cycle] = await db.select().from(savObservationCycles).where(eq(savObservationCycles.id,source.sourceRef.slice("sav-observation:".length)));
     if(cycle) await db.select().from(savResolutionObservations).where(eq(savResolutionObservations.id,cycle.observationId)).for("update");
@@ -100,12 +123,15 @@ export async function approveLearningCandidate(candidateId: string, actorEmail: 
   const [candidate] = await db.select().from(savLearningCandidates)
     .where(eq(savLearningCandidates.id, candidateId)).for("update");
   if (!candidate) throw new Error("SAV_LEARNING_CANDIDATE_NOT_PENDING");
+  if (source?.sourceRef.startsWith("hubspot:") && (source.sourceContentHash !== candidate.sourceContentHash || source.sourceRef !== candidate.sourceRef || source.hubspotTicketId !== candidate.hubspotTicketId)) throw new Error("SAV_OBSERVATION_STALE");
+  if (candidate.status === "pending") await assertSavLearningAdmitted(candidate, db);
+  await assertSavCrmLearningSource(candidate, db);
   if(candidate.sourceRef.startsWith("sav-observation:")) {
     const patch = candidatePatch(candidate);
     const [cycle]=await db.select().from(savObservationCycles).where(eq(savObservationCycles.id,candidate.sourceRef.slice("sav-observation:".length)));
     const [observation]=cycle?await db.select().from(savResolutionObservations).where(eq(savResolutionObservations.id,cycle.observationId)).for("update"):[];
     if (observation?.leaseUntil && observation.leaseUntil > new Date()) throw new Error("SAV_OBSERVATION_SYNC_IN_PROGRESS");
-    if(!cycle || !observation?.closed || cycle.cycle!==observation.cycle || cycle.candidateId!==candidate.id || cycle.qualification!=="resolved" || observation.sourceErrors.length || (patch as LearningPatch & {sourceHash?:string}).sourceHash!==cycle.sourceHash)throw new Error("SAV_OBSERVATION_STALE");
+    if(!cycle || !observation?.closed || cycle.cycle!==observation.cycle || cycle.candidateId!==candidate.id || cycle.qualification!=="resolved" || observation.sourceErrors.length || patch.cycleSourceHash!==cycle.sourceHash)throw new Error("SAV_OBSERVATION_STALE");
   }
   if (candidate.status === "approved" && candidate.contentItemId) {
     const [evidence] = await db.select().from(savResolutionEvidence).where(and(eq(savResolutionEvidence.itemId, candidate.contentItemId), eq(savResolutionEvidence.sourceRef, candidate.sourceRef), eq(savResolutionEvidence.outcome, "human_resolution"))).orderBy(desc(savResolutionEvidence.createdAt)).limit(1);
@@ -120,6 +146,9 @@ export async function approveLearningCandidate(candidateId: string, actorEmail: 
   const sourceLabel = candidate.hubspotTicketId ? `ticket HubSpot ${candidate.hubspotTicketId}` : `dossier SAV ${candidate.threadId ?? candidate.sourceRef}`;
   const subject = plainText(patch.subject) || `Résolution du ${sourceLabel}`;
   const resolution = plainText(patch.finalHumanResolution);
+  const conditions = (patch.conditions ?? []).map(plainText).filter(Boolean);
+  const limitations = (patch.limitations ?? []).map(plainText).filter(Boolean);
+  const expectedResult = plainText(patch.expectedResult ?? "");
   if (resolution.length < 20) throw new Error("SAV_LEARNING_RESOLUTION_TOO_SHORT");
 
   let result: Awaited<ReturnType<typeof saveDraft>>;
@@ -141,11 +170,16 @@ export async function approveLearningCandidate(candidateId: string, actorEmail: 
       visibility: current.item.visibility,
       agentKey: "sav",
       ownerEmail: current.item.ownerEmail,
-      bodyMarkdown: candidate.sourceRef.startsWith("sav-observation:") ? `## Problème observé\n\n${subject}\n\n## Solution confirmée par l’équipe\n\n${resolution}\n\n## Escalade\n\n${metadata.resolution?.escalation ?? "Transférer à un humain si la situation diffère de ce cas."}` : `${current.version.bodyMarkdown.trim()}\n\n## Correction issue du ${sourceLabel}\n\n${resolution}`,
+      bodyMarkdown: candidate.sourceRef.startsWith("sav-observation:")
+        ? `## Problème observé\n\n${subject}\n\n## Conditions\n\n${conditions.length ? conditions.map((value) => "- " + value).join("\n") : "- À préciser lors de la revue humaine."}\n\n## Solution confirmée par l’équipe\n\n${resolution}\n\n## Résultat attendu\n\n${expectedResult || "À préciser lors de la revue humaine."}\n\n## Limites et escalade\n\n${[...limitations, metadata.resolution?.escalation ?? "Transférer à un humain si la situation diffère de ce cas."].join("\n\n")}`
+        : `${current.version.bodyMarkdown.trim()}\n\n## Correction issue du ${sourceLabel}\n\n${resolution}\n\n## Conditions et limites vérifiées\n\n${[...conditions, ...limitations, expectedResult].filter(Boolean).join("\n\n")}`,
       changeNote: `Apprentissage après intervention humaine sur le ${sourceLabel}`,
       metadata: {
         ...metadata,
         semanticSteps: undefined,
+        prerequisites: [...new Set([...(metadata.prerequisites ?? []), ...conditions])],
+        expectedResult: expectedResult || metadata.expectedResult,
+        troubleshooting: [...limitations, metadata.troubleshooting].filter(Boolean).join("\n\n").slice(0, 10_000),
         sourceMetadata: {
           ...(metadata.sourceMetadata ?? {}),
           supportResolution: true,
@@ -156,12 +190,13 @@ export async function approveLearningCandidate(candidateId: string, actorEmail: 
         },
         resolution: {
           ...(metadata.resolution ?? { symptoms: [subject.slice(0, 500)], exceptions: [], escalation: "Transférer à un humain si la situation diffère de ce cas ou si la procédure échoue.", productVersion: "" }),
+          exceptions: limitations,
           steps: [resolution],
         },
       },
     }, actorEmail, current.item.id, tx);
   } else {
-    const slugId = candidate.sourceRef.toLocaleLowerCase("en").replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "").slice(0, 80) || candidate.id.slice(0, 8);
+    const slugId = `${candidate.sourceRef.toLocaleLowerCase("en").replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "").slice(0, 80) || "resolution"}-${candidate.id.slice(0, 8)}`;
     result = await saveDraft({
       type: "article",
       slug: `resolution-sav-${slugId}`,
@@ -172,17 +207,17 @@ export async function approveLearningCandidate(candidateId: string, actorEmail: 
       visibility: "charly_only",
       agentKey: "sav",
       ownerEmail: actorEmail,
-      bodyMarkdown: `## Problème observé\n\n${subject}\n\n## Solution confirmée par l’équipe\n\n${resolution}\n\n## Escalade\n\nTransférer à un humain si la situation diffère de ce cas ou si la procédure ne produit pas le résultat attendu.`,
+      bodyMarkdown: `## Problème observé\n\n${subject}\n\n## Conditions\n\n${conditions.length ? conditions.map((value) => "- " + value).join("\n") : "- À préciser lors de la revue humaine."}\n\n## Solution confirmée par l’équipe\n\n${resolution}\n\n## Résultat attendu\n\n${expectedResult || "À préciser lors de la revue humaine."}\n\n## Limites et escalade\n\n${[...limitations, "Transférer à un humain si la situation diffère de ce cas ou si la procédure ne produit pas le résultat attendu."].join("\n\n")}`,
       changeNote: `Fiche créée après intervention humaine sur le ${sourceLabel}`,
       metadata: {
         intents: [subject.slice(0, 500)],
         limovaPaths: [],
-        prerequisites: [],
-        expectedResult: "Vérifier que le problème décrit est résolu ; recueillir une confirmation du client si nécessaire.",
+        prerequisites: conditions,
+        expectedResult: expectedResult || "Vérifier que le problème décrit est résolu ; recueillir une confirmation du client si nécessaire.",
         troubleshooting: "Transférer à un humain si la procédure validée ne fonctionne pas.",
         sourceMetadata: { supportResolution: true, evidenceTicketIds: candidate.hubspotTicketId ? [candidate.hubspotTicketId] : [], evidenceSourceRefs: [candidate.sourceRef], sourceSnapshotId: patch.sourceSnapshotId, resolutionProvenance: patch.provenance ?? "unknown", customerConfirmed: patch.customerConfirmed === true },
         resolution: {
-          symptoms: [subject.slice(0, 500)], steps: [resolution], exceptions: [],
+          symptoms: [subject.slice(0, 500)], steps: [resolution], exceptions: limitations,
           escalation: "Transférer à un humain si la situation diffère de ce cas ou si la procédure ne produit pas le résultat attendu.",
           productVersion: "",
         },
@@ -212,11 +247,15 @@ export async function approveLearningCandidate(candidateId: string, actorEmail: 
 }
 
 export async function rejectLearningCandidate(candidateId: string, actorEmail: string) {
-  const [updated] = await requireDb().update(savLearningCandidates).set({
-    status: "rejected",
-    reviewedBy: actorEmail,
-    reviewedAt: new Date(),
-  }).where(and(eq(savLearningCandidates.id, candidateId), eq(savLearningCandidates.status, "pending"))).returning();
-  if (!updated) throw new Error("SAV_LEARNING_CANDIDATE_NOT_PENDING");
-  return updated;
+  assertKnowledgeUgoApproval(actorEmail);
+  return requireDb().transaction(async (tx) => {
+    const [updated] = await tx.update(savLearningCandidates).set({
+      status: "rejected", rejectionKind: "human",
+      reviewedBy: actorEmail,
+      reviewedAt: new Date(),
+    }).where(and(eq(savLearningCandidates.id, candidateId), eq(savLearningCandidates.status, "pending"))).returning();
+    if (!updated) throw new Error("SAV_LEARNING_CANDIDATE_NOT_PENDING");
+    await closeSavLearningReservationTx(tx, candidateId);
+    return updated;
+  });
 }

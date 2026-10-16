@@ -1,6 +1,6 @@
 "use server";
 
-import { reconcileSavTicketReturn } from "@/lib/sav/hubspot";
+import { processManualSavTicketActionImmediately, processPendingHubspotActions, reconcileSavTicketReturn } from "@/lib/sav/hubspot";
 
 import { revalidatePath } from "next/cache";
 import { redirect } from "next/navigation";
@@ -33,8 +33,10 @@ import { retrySavAnalysis, repairSavProposal } from "@/lib/sav/service";
 import { collectLatestSavDossierContext } from "@/lib/sav/dossier-context";
 import { qualifySavObservation } from "@/lib/sav/observations";
 import { reviewSavDraft } from "@/lib/sav/draft-verdicts";
+import { saveSavHumanReplyDraft } from "@/lib/sav/drafts";
 import { assertSavManualReplyEnabled, queueSavManualReply } from "@/lib/sav/manual-replies";
 import { processPendingGmailSendActions } from "@/lib/sav/gmail";
+import { enqueueSavContextRefresh } from "@/lib/sav/dispatch";
 import { recordSavDeploymentDecision } from "@/lib/sav/metrics";
 import { createReviewedSavReplay, runReviewedSavRuleReplay } from "@/lib/sav/reviewed-replay";
 
@@ -79,10 +81,20 @@ export async function reviewDraftAction(form: FormData) {
   let result = "draft_reviewed";
   try {
     if (form.has("replyDraft") || form.has("text")) throw new Error("SAV_DRAFT_READ_ONLY");
-    await reviewSavDraft({ threadId, messageId: id(form,"messageId"), decisionId: id(form,"decisionId"), agentRunId: id(form,"agentRunId"), sourceHash: id(form,"sourceHash"), expectedVerdictId: String(form.get("verdictId") || "") || null, status: String(form.get("status")), reason: String(form.get("reason") || ""), reasons: form.getAll("reasons").map(String) }, staff.email);
+    await reviewSavDraft({ threadId, messageId: id(form,"messageId"), decisionId: id(form,"decisionId"), agentRunId: id(form,"agentRunId"), sourceHash: id(form,"sourceHash"), expectedVerdictId: String(form.get("verdictId") || "") || null, ...(form.get("draftId") ? {draftId:String(form.get("draftId"))} : {}), status: String(form.get("status")), reason: String(form.get("reason") || ""), reasons: form.getAll("reasons").map(String) }, staff.email);
   } catch (error) { result = error instanceof Error && /^SAV_[A-Z_]+$/.test(error.message) ? error.message : "SAV_DRAFT_INVALID"; }
   revalidatePath(`/studio/sav/${threadId}`);
   revalidatePath("/studio/sav/evaluation");
+  redirect(`/studio/sav/${encodeURIComponent(threadId)}?review=${result}`);
+}
+
+export async function saveHumanDraftAction(form: FormData) {
+  const staff=await requireApiStaff("admin");
+  const threadId=id(form,"threadId");
+  let result="draft_saved";
+  try { await saveSavHumanReplyDraft({threadId,messageId:id(form,"messageId"),expectedDraftId:String(form.get("expectedDraftId") || "") || null,text:String(form.get("text") || "")},staff.email); }
+  catch(error) { result=error instanceof Error && /^SAV_[A-Z_]+$/.test(error.message) ? error.message : "SAV_DRAFT_INVALID"; }
+  revalidatePath(`/studio/sav/${threadId}`);revalidatePath("/studio/sav");
   redirect(`/studio/sav/${encodeURIComponent(threadId)}?review=${result}`);
 }
 
@@ -152,7 +164,11 @@ export async function createTicketAction(form: FormData) {
   const staff = await requireApiStaff("admin");
   const threadId = id(form, "threadId");
   let errorCode = "";
-  try { await refreshTicketContext(threadId); await queueSavManualTicket({ threadId, reviewId: id(form, "reviewId"), kind: "create_ticket", ticketId: String(form.get("ticketId") || "") || undefined, returnOperation: String(form.get("returnOperation") || "") || undefined, distinctIssueReason: String(form.get("distinctIssueReason") || "") }, staff.email); }
+  try {
+    await refreshTicketContext(threadId);
+    const action = await queueSavManualTicket({ threadId, reviewId: id(form, "reviewId"), kind: "create_ticket", ticketId: String(form.get("ticketId") || "") || undefined, returnOperation: String(form.get("returnOperation") || "") || undefined, distinctIssueReason: String(form.get("distinctIssueReason") || "") }, staff.email);
+    errorCode = await executeQueuedTicketAction(action.id);
+  }
   catch (error) { errorCode = error instanceof Error && /^[A-Z][A-Z_]+$/.test(error.message) ? error.message : "SAV_MANUAL_TICKET_INVALID"; }
   revalidatePath("/studio/sav");
   revalidatePath(`/studio/sav/${threadId}`);
@@ -163,10 +179,28 @@ export async function linkTicketAction(form: FormData) {
   const staff = await requireApiStaff("admin");
   const threadId = id(form, "threadId");
   let errorCode = "";
-  try { await refreshTicketContext(threadId); await queueSavManualTicket({ threadId, reviewId: id(form, "reviewId"), kind: "link_ticket", ticketId: id(form, "ticketId"), returnOperation: String(form.get("returnOperation") || "") || undefined }, staff.email); }
+  try {
+    await refreshTicketContext(threadId);
+    const action = await queueSavManualTicket({ threadId, reviewId: id(form, "reviewId"), kind: "link_ticket", ticketId: id(form, "ticketId"), returnOperation: String(form.get("returnOperation") || "") || undefined }, staff.email);
+    errorCode = await executeQueuedTicketAction(action.id);
+  }
   catch (error) { errorCode = error instanceof Error && /^[A-Z][A-Z_]+$/.test(error.message) ? error.message : "SAV_MANUAL_TICKET_INVALID"; }
   revalidatePath("/studio/sav"); revalidatePath(`/studio/sav/${threadId}`);
   redirect(`/studio/sav/${encodeURIComponent(threadId)}?review=${errorCode || "ticket_queued"}`);
+}
+
+async function executeQueuedTicketAction(actionId: string) {
+  try {
+    const result = await processManualSavTicketActionImmediately(actionId);
+    if (result.status === "completed") return "ticket_done";
+    if (result.status === "failed" && /^[A-Z][A-Z0-9_]+$/.test(result.errorCode)) return result.errorCode;
+    // A cron worker may already own the durable action, or writes may be paused.
+    // In both cases the action remains visible and the cron stays its recovery path.
+    return "ticket_queued";
+  } catch {
+    // Preserve the durable command if the fast path itself is unavailable.
+    return "ticket_processing_deferred";
+  }
 }
 
 async function refreshTicketContext(threadId: string) {
@@ -185,13 +219,13 @@ export async function retryAnalysisAction(form: FormData) {
 }
 
 export async function refreshSavContextAction(form: FormData) {
-  await requireApiStaff("admin");
+  const staff = await requireApiStaff("admin");
   const threadId = id(form, "threadId");
-  let notice = "context_refreshed";
-  try { await refreshTicketContext(threadId); }
-  catch { notice = "SAV_CONTEXT_REFRESH_FAILED"; }
+  let refreshId = "";
+  try { refreshId = await enqueueSavContextRefresh(threadId,staff.email); }
+  catch { /* Keep the dossier readable if the refresh could not be scheduled. */ }
   revalidatePath(`/studio/sav/${threadId}`);
-  redirect(`/studio/sav/${encodeURIComponent(threadId)}?review=${notice}`);
+  redirect(`/studio/sav/${encodeURIComponent(threadId)}?${refreshId ? `context=refreshing&refreshId=${refreshId}` : "context=failed"}`);
 }
 
 export async function repairSavProposalAction(form: FormData) {
@@ -224,7 +258,12 @@ export async function approveDraftAction(form: FormData) {
 export async function retryAction(form: FormData) {
   const staff = await requireApiStaff("admin");
   const threadId = id(form, "threadId");
-  await retrySavAction(id(form, "actionId"), staff.email);
+  const action = await retrySavAction(id(form, "actionId"), staff.email);
+  if (["create_ticket", "link_ticket"].includes(action.kind)) {
+    await processManualSavTicketActionImmediately(action.id);
+  } else if (["log_email", "update_ticket_status"].includes(action.kind)) {
+    await processPendingHubspotActions(1, action.id);
+  }
   revalidatePath(`/studio/sav/${threadId}`);
 }
 
@@ -322,7 +361,7 @@ export async function reviewLearningAction(form: FormData) {
     else if (decision === "reject") await rejectLearningCandidate(candidateId, staff.email);
     else throw new Error("INVALID_LEARNING_DECISION");
   } catch (error) {
-    if (error instanceof Error && ["SAV_OBSERVATION_SYNC_IN_PROGRESS", "SAV_OBSERVATION_STALE"].includes(error.message))
+    if (error instanceof Error && ["SAV_OBSERVATION_SYNC_IN_PROGRESS", "SAV_OBSERVATION_STALE", "SAV_LEARNING_HISTORICAL_REVIEW_BLOCKED"].includes(error.message))
       redirect(`/studio/sav/resolutions?review=${error.message === "SAV_OBSERVATION_SYNC_IN_PROGRESS" ? "sync_in_progress" : "stale"}`);
     throw error;
   }
@@ -370,6 +409,7 @@ export async function reviewProposalAction(form: FormData) {
   const staff = await requireApiStaff("admin");
   const threadId = id(form, "threadId");
   let errorCode = "";
+  let refreshId = "";
   try {
     if (form.has("replyDraft")) throw new Error("SAV_DRAFT_READ_ONLY");
     await reviewSavProposal({ reviewScope: "dossier", messageId: id(form, "messageId"), decisionId: id(form, "decisionId"), agentRunId: id(form, "agentRunId"), expectedReviewId: String(form.get("reviewId") || "") || null,
@@ -379,14 +419,19 @@ export async function reviewProposalAction(form: FormData) {
       correction: { category: String(form.get("category")), urgency: String(form.get("urgency")), decisionKind: String(form.get("decisionKind")), reasonCode: String(form.get("reasonCode")), explanation: String(form.get("explanation")), title: String(form.get("title")), description: String(form.get("description")), process: [
         ...Array.from({ length: Math.max(0, Math.min(30, Number(form.get("processCount")) || 0)) }, (_, index) => ({ kind: String(form.get(`processKind_${index}`)), label: String(form.get(`processLabel_${index}`)), sourceIds: JSON.parse(String(form.get(`processSources_${index}`))) })),
         ...String(form.get("additionalSteps") || "").split("\n").map((value) => value.trim()).filter(Boolean).map((label) => ({ kind: "product_step", label, sourceIds: [] })),
-      ], internalNote: String(form.get("internalNote") || ""), replyDraft: "", registrationEmail: String(form.get("registrationEmail") || "").trim().toLowerCase(), identityVerified: form.get("identityVerified") === "on" },
+      ], internalNote: String(form.get("internalNote") || ""), replyDraft: "", registrationEmail: String(form.get("registrationEmail") || "").trim().toLowerCase(), identityVerified: form.get("identityVerified") === "on",
+        ...(form.get("humanProcess") ? { humanProcess: JSON.parse(String(form.get("humanProcess"))) } : {}) },
     }, staff.email);
   } catch (error) { errorCode = error instanceof Error && /^[A-Z][A-Z_]+$/.test(error.message) ? error.message : "SAV_REVIEW_INVALID"; }
+  if (!errorCode) {
+    try { refreshId = await enqueueSavContextRefresh(threadId,staff.email); }
+    catch { /* The review is committed; enrichment failure cannot undo validation. */ }
+  }
   revalidatePath("/studio/sav");
   revalidatePath(`/studio/sav/${threadId}`);
   revalidatePath("/studio/sav/resolutions");
   revalidatePath("/studio/sav/evaluation");
-  redirect(`/studio/sav/${encodeURIComponent(threadId)}?review=${errorCode || "saved"}`);
+  redirect(`/studio/sav/${encodeURIComponent(threadId)}?review=${errorCode || "saved"}${refreshId ? `&context=refreshing&refreshId=${refreshId}` : ""}`);
 }
 
 export async function importHubspotKnowledgeAction(form: FormData) {

@@ -10,7 +10,7 @@ export function savDashboardLearningProgress(observations: Observation[], cycles
     if (observation.sourceErrors.length || observation.state === "sources_incomplete" || cycle?.qualification === "insufficient_sources") return "incomplete";
     if (!observation.closed) return "collecting";
     if (!observation.closedCatchupUntil || !observation.lastSyncAt || observation.lastSyncAt < observation.closedCatchupUntil) return "catchup";
-    if (!cycle?.qualifiedAt || !cycle.qualification || cycle.qualification === "resolved" && !cycle.candidateId) return "qualification";
+    if (!cycle?.qualifiedAt || !cycle.qualification || cycle.qualification === "resolved" && !cycle.candidateId && !cycle.learningDisposition) return "qualification";
     if (cycle.candidateId && !["approved", "rejected"].includes(candidates.find(c => c.id === cycle.candidateId)?.status ?? "")) return "candidate";
     return "none";
   });
@@ -19,4 +19,3 @@ export function savDashboardLearningProgress(observations: Observation[], cycles
   if (candidates.some(candidate => candidate.status === "pending" && candidate.sourceRef && !candidate.sourceRef.startsWith("sav-observation:"))) states.push("candidate");
   return (["incomplete", "qualification", "candidate", "waiting_ticket", "collecting", "catchup"] as const).find(state => states.includes(state)) ?? "none";
 }
-

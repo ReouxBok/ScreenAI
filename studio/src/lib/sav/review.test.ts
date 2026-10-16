@@ -12,7 +12,7 @@ import { savModeAllowsWrite } from "./action-policy";
 import { createElement } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import { ManualTicketStatus } from "@/app/studio/sav/[id]/manual-ticket-status";
-import { findSavContactCandidates, processPendingHubspotActions, reconcileSavManualTicket } from "./hubspot";
+import { findSavContactCandidates, processManualSavTicketActionImmediately, processPendingHubspotActions, reconcileSavManualTicket } from "./hubspot";
 import { extractSavIdentityHints, phoneMatchesHint } from "./identity";
 import { geminiFixture } from "../../../test/sav-understanding-fixtures";
 
@@ -43,6 +43,8 @@ function mockIntegrations(mode: "create" | "timeout" | "existing" | "unknown" | 
     if (url.endsWith("/pipelines/tickets")) return Response.json({ results: [{ id: "0", stages }] });
     if (url.endsWith("/contacts/search")) return Response.json({ results: mode === "unknown" ? [] : [{ id: "21", properties: { email: "client@example.com" } }] });
     if (url.endsWith("/tickets/search")) return Response.json({ results: ["existing", "different"].includes(mode) ? [{ id: "401", properties: { subject: mode === "different" ? "Intégration Slack impossible" : "Retrouver les factures", hs_pipeline: "0", hs_pipeline_stage: "1", hs_lastmodifieddate: new Date().toISOString() } }] : [] });
+    if (url.endsWith("/objects/emails") && init?.method === "POST") return Response.json({ id: "501", properties: {} });
+    if (url.includes("/associations/default/") && init?.method === "PUT") return new Response(null, { status: 204 });
     if (url.endsWith("/objects/tickets") && init?.method === "POST") {
       if (mode === "timeout") throw new TypeError("Simulated ambiguous transport failure");
       return Response.json({ id: "301", properties: { subject: "Retrouver les factures", hs_pipeline: "0", hs_pipeline_stage: "1" } });
@@ -268,6 +270,24 @@ describe("SAV supervised reviews and manual tickets", () => {
     await processPendingHubspotActions();
     await expect(retrySavAction(action.id, "ugo@limova.ai")).rejects.toThrow("SAV_MANUAL_RECONCILIATION_REQUIRED");
     expect(network.mock.calls.filter(([url]) => url.endsWith("/objects/tickets"))).toHaveLength(1);
+  });
+  it("does not offer a blind retry for a stale ticket proposal", async () => {
+    const review = await reviewSavProposal(reviewInput(), "ugo@limova.ai");
+    const action = await queueSavManualTicket({ threadId, reviewId: review.id, kind: "link_ticket", ticketId: "401" }, "ugo@limova.ai");
+    await fixture.db.update(savActions).set({ status: "failed", errorCode: "SAV_PROPOSAL_STALE" }).where(eq(savActions.id, action.id));
+    await expect(retrySavAction(action.id, "ugo@limova.ai")).rejects.toThrow("SAV_PROPOSAL_STALE");
+    expect((await fixture.db.select().from(savActions).where(eq(savActions.id, action.id)))[0]).toMatchObject({ status: "failed", errorCode: "SAV_PROPOSAL_STALE" });
+  });
+  it("processes only the explicitly requested ticket action in the fast path", async () => {
+    const review = await reviewSavProposal(reviewInput(), "ugo@limova.ai");
+    const target = await queueSavManualTicket({ threadId, reviewId: review.id, kind: "link_ticket", ticketId: "401" }, "ugo@limova.ai");
+    const [unrelated] = await fixture.db.insert(savActions).values({
+      threadId, messageId, kind: "log_email", idempotencyKey: "fixture:unrelated-log-email", payload: { hubspotTicketId: "401" }, actorType: "system",
+    }).returning();
+    mockIntegrations("existing");
+    const result = await processManualSavTicketActionImmediately(target.id);
+    expect(result).toEqual({ status: "completed" });
+    expect((await fixture.db.select().from(savActions).where(eq(savActions.id, unrelated.id)))[0]).toMatchObject({ status: "pending" });
   });
   it("blocks unknown-contact ticket creation instead of creating a CRM contact", async () => {
     const review = await reviewSavProposal(reviewInput(), "ugo@limova.ai");

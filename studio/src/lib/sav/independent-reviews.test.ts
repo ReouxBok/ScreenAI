@@ -4,6 +4,7 @@ import { createSavTestDb } from "../../../test/sav-db";
 import { v0Proposal } from "../../../test/sav-v0-review-fixture";
 import { savMailboxes, savThreads, savMessages, savAgentRuns, savDecisions, savActions, savDraftVerdicts, savReplyDrafts, savResolutionObservations, savLearningCandidates, savObservationEvents } from "@/db/schema";
 import { activateSavV0Cutover } from "./cutover";
+import { activateSavLearningCutover } from "./learning-admission";
 import {acceptHubspotWebhook,processPendingHubspotReceipts} from "./hubspot";
 import { encryptSavPayload, decryptSavPayload } from "./crypto";
 import { loadSavDraftContext, reviewSavDraft } from "./draft-verdicts";
@@ -15,6 +16,17 @@ import { getSavObservations, syncSavObservation, reconcileSavObservations, quali
 import { collectSavObservationSources, type ObservationSnapshot, type ObservationEvent } from "./observation-source";
 const state = vi.hoisted(() => ({ db: null as unknown }));
 vi.mock("@/db", () => ({ requireDb: () => state.db }));
+vi.mock("./learning-comparator", () => ({
+    SAV_LEARNING_COMPARATOR_REVISION: "fixture-comparator-v1", SAV_LEARNING_COMPARATOR_PROMPT_REVISION: "fixture-prompt-v1",
+    compareSavLearningResolution: async (input: { evidenceRef: string; evidenceExcerpt: string; resolution: string; knowledge: Array<{ ref: string; title: string }> }) => {
+        const target = input.resolution.includes("Paramètres") ? input.knowledge.find((entry) => entry.title === "Procédure fictive de support") : null;
+        return ({ decision: { outcome: target ? "amendment" : "new", matchedRef: target?.ref ?? null, groupSignature: "synthetic-support-resolution", subject: "Procédure fictive de support", resolution: input.resolution,
+            conditions: ["Dossier support fictif"], expectedResult: "Le problème fictif est résolu", limitations: ["Ne couvre que le scénario synthétique"],
+            evidenceRef: input.evidenceRef, evidenceExcerpt: input.evidenceExcerpt, rationale: "Résolution humaine synthétique avec résultat observable." },
+        revision: "fixture-comparator-v1", promptRevision: "fixture-prompt-v1", model: "fixture", inputHash: "fixture", durationMs: 1, inputTokens: 1, outputTokens: 1,
+    });
+    },
+}));
 let f: Awaited<ReturnType<typeof createSavTestDb>>, threadId: string, messageId: string, decisionId: string, runId: string;
 let proposal = v0Proposal();
 const now = new Date("2026-10-08T12:00:00Z");
@@ -33,6 +45,7 @@ beforeEach(async () => {
     proposal = v0Proposal();
     const [mb] = await f.db.insert(savMailboxes).values({ email: "contact@limova.ai" }).returning();
     await activateSavV0Cutover({ receivedAfter: "2026-10-02T12:00:00Z", mailboxEmail: mb.email, intakeRecipient: "contact@limova.ai", deploymentSha: "a".repeat(40), activatedBy: "ugo@limova.ai" });
+    await activateSavLearningCutover({ activatedAt: "2026-10-07T00:00:00.000Z", activatedBy: "ugo@limova.ai", deploymentSha: "b".repeat(40) }, "ugo@limova.ai");
     const [thread] = await f.db.insert(savThreads).values({ mailboxId: mb.id, gmailThreadId: "fixture-thread", subject: "Fictif", customerEmail: "fixture@example.invalid" }).returning();
     threadId = thread.id;
     const [message] = await f.db.insert(savMessages).values({ threadId, mailboxId: mb.id, gmailMessageId: "fixture-message", direction: "inbound", fromEmail: thread.customerEmail, subject: thread.subject, bodyCiphertext: encryptSavPayload({ text: "Demande fictive", headers: { "message-id": "<fixture@example.invalid>" } }), receivedAt: new Date("2026-10-08T10:00:00Z") }).returning();

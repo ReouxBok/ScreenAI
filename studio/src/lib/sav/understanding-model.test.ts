@@ -17,19 +17,19 @@ describe("SAV understanding provider boundary", () => {
     expect(request.tools).toBeUndefined();
     expect(JSON.parse(request.contents[0].parts[0].text).sources).toContainEqual({ source: "current_message", sourceId: "current_body", text: input.body });
   });
-  it.each([402, 429, 500])("returns unavailable without retry or lexical fallback for HTTP %i", async status => {
+  it.each([402, 429, 500])("applies only the bounded transient retry and returns unavailable for HTTP %i", async status => {
     const network = vi.fn<typeof fetch>(async () => new Response("fixture", { status }));
     const result = await understandSavMessage({ subject: "Remboursement", body: "Je souhaite résilier et être remboursé." }, { apiKey: "fixture", fetch: network });
-    expect(network).toHaveBeenCalledOnce();
+    expect(network).toHaveBeenCalledTimes(status === 429 ? 2 : 1);
     expect(result).toMatchObject({ status: "unavailable", requests: [], primaryRequestId: null, trace: { errorCode: `SAV_AI_HTTP_${status}` } });
   });
   it.each(["schema", "proof", "json"])("rejects invalid %s without retry", async invalid => {
     const content = understandingContent(); content.evidence[0].excerpt = "Une preuve qui n’existe pas.";
     const network = vi.fn<typeof fetch>(async () => invalid === "json" ? new Response("not-json") : geminiFixture(invalid === "schema" ? { version: 2 } : content));
     const result = await understandSavMessage(input, { apiKey: "fixture", fetch: network });
-    expect(network).toHaveBeenCalledOnce(); expect(result.status).toBe("unavailable");
+    expect(network).toHaveBeenCalledTimes(invalid === "proof" ? 2 : 1); expect(result.status).toBe("unavailable");
     expect(result.uncertainties).toContainEqual({ code: "invalid_output", requestIds: [] });
-    expect(result.trace.errorCode).toMatch(/INVALID/);
+    expect(result.trace.errorCode).toMatch(/INVALID|REPAIR_REJECTED/);
   });
   it.each([false, true])("does not call the provider when disabled or missing a key: %s", disabled => {
     vi.stubEnv("SAV_AI_ANALYSIS", disabled ? "false" : "true");
@@ -39,15 +39,18 @@ describe("SAV understanding provider boundary", () => {
       expect(result.trace.errorCode).toBe(disabled ? "SAV_AI_ANALYSIS_DISABLED" : "SAV_AI_KEY_MISSING");
     });
   });
-  it("aborts at the 18 second bound without another request", async () => {
+  it("aborts two full 18 second attempts within the 37 second phase bound", async () => {
     vi.useFakeTimers();
     const network = vi.fn((_url: string | URL | Request, init?: RequestInit) => new Promise<Response>((_resolve, reject) => {
       init?.signal?.addEventListener("abort", () => reject(new DOMException("aborted", "AbortError")));
     }));
     const pending = understandSavMessage(input, { apiKey: "fixture", fetch: network });
-    await vi.advanceTimersByTimeAsync(18_000);
-    expect(await pending).toMatchObject({ status: "unavailable", trace: { errorCode: "SAV_AI_TIMEOUT", durationMs: 18_000 } });
-    expect(network).toHaveBeenCalledOnce(); expect(vi.getTimerCount()).toBe(0);
+    await vi.advanceTimersByTimeAsync(37_000);
+    const result = await pending;
+    expect(result).toMatchObject({ status: "unavailable", trace: { errorCode: "SAV_AI_TIMEOUT" } });
+    expect(result.trace.durationMs).toBeGreaterThanOrEqual(36_000);
+    expect(result.trace.durationMs).toBeLessThanOrEqual(37_000);
+    expect(network).toHaveBeenCalledTimes(2); expect(vi.getTimerCount()).toBe(0);
   });
 });
 

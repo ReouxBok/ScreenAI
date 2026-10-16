@@ -1,0 +1,66 @@
+{
+  "version": "sav-evidence-typography-v1",
+  "origin": "synthetic",
+  "cases": [
+    {
+      "id": "apostrophe",
+      "source": "L’agent ne répond pas",
+      "excerpt": "L'agent ne répond pas",
+      "expected": true
+    },
+    {
+      "id": "fine_space",
+      "source": "Prix de 79 €",
+      "excerpt": "Prix de 79 €",
+      "expected": true
+    },
+    {
+      "id": "french_quotes",
+      "source": "Il affiche « Bonjour »",
+      "excerpt": "Il affiche \"Bonjour\"",
+      "expected": true
+    },
+    {
+      "id": "dash",
+      "source": "Étape A — étape B",
+      "excerpt": "Étape A - étape B",
+      "expected": true
+    },
+    {
+      "id": "negation",
+      "source": "Je ne veux pas résilier",
+      "excerpt": "Je veux résilier",
+      "expected": false
+    },
+    {
+      "id": "amount",
+      "source": "Le prix est de 790 €",
+      "excerpt": "Le prix est de 79 €",
+      "expected": false
+    },
+    {
+      "id": "unit",
+      "source": "Surface de 25 m²",
+      "excerpt": "Surface de 25 m2",
+      "expected": false
+    },
+    {
+      "id": "unit_case",
+      "source": "Télécharger 10 Mo",
+      "excerpt": "Télécharger 10 mo",
+      "expected": false
+    },
+    {
+      "id": "negative",
+      "source": "Solde −5 €",
+      "excerpt": "5 €",
+      "expected": false
+    },
+    {
+      "id": "exact",
+      "source": "Connexion impossible depuis hier",
+      "excerpt": "Connexion impossible depuis hier",
+      "expected": true
+    }
+  ]
+}

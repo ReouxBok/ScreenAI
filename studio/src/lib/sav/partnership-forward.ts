@@ -49,31 +49,31 @@ async function loadContext(threadId: string, db: Reader = requireDb()) {
   if (from !== mailbox.email.toLowerCase()) throw new Error("SAV_PARTNERSHIP_MAILBOX_INVALID");
   const [decision] = await db.select().from(savDecisions).where(and(eq(savDecisions.messageId, message.id), eq(savDecisions.isCurrent, true))).limit(1);
   const [run] = decision?.agentRunId ? await db.select().from(savAgentRuns).where(eq(savAgentRuns.id, decision.agentRunId)).limit(1) : [];
-  if (!decision || !run?.proposalCiphertext || run.status !== "succeeded" || run.messageId !== message.id || run.pilotBatchId) throw new Error("SAV_PARTNERSHIP_ANALYSIS_REQUIRED");
+  if (!decision || !run?.proposalCiphertext || run.messageId !== message.id || run.pilotBatchId) throw new Error("SAV_PARTNERSHIP_ANALYSIS_REQUIRED");
   const proposal = savStructuredProposalSchema.parse(decryptSavPayload(run.proposalCiphertext));
-  const u = proposal.understanding;
-  const partnership = u?.requests.filter(request => request.nature === "partnership") ?? [];
-  const current = splitSavMessageText(decryptSavPayload<{ text: string }>(message.bodyCiphertext).text).currentText;
-  if (u?.status !== "qualified" || !partnership.length || u.uncertainties.some(item => !item.requestIds.length || item.requestIds.some(id => partnership.some(request => request.id === id))) || !current) throw new Error("SAV_PARTNERSHIP_NOT_DETECTED");
-  // The server requires an exact excerpt from the current body, never a keyword,
-  // an inherited subject, signature or old CRM/conversation evidence.
-  if (partnership.some(request => !request.evidenceIds.some(id => {
-    const evidence = u.evidence.find(item => item.id === id);
-    return evidence?.source === "current_message" && evidence.sourceId === "current_body" && normalize(current).includes(normalize(evidence.excerpt));
-  }))) throw new Error("SAV_PARTNERSHIP_NOT_DETECTED");
   const [review] = await db.select().from(savProposalReviews).where(and(eq(savProposalReviews.messageId, message.id), eq(savProposalReviews.isCurrent, true))).limit(1);
-  if (review && savReviewMatchesProposal(review, { decisionId: decision.id, agentRunId: run.id, proposal, message })) {
-    const after = savStructuredProposalSchema.parse(decryptSavPayload(review.afterCiphertext));
-    // An overall "correct" verdict does not override the actual human edits.
-    // Wording may improve without new model work, but changed classification,
-    // decision semantics or workflow structure requires a fresh detection.
-    const processStructure = (value: typeof proposal) => value.process.map(step => ({ kind: step.kind, sourceIds: [...step.sourceIds].sort() }));
-    if (review.status !== "approved" || review.verdict !== "correct"
-      || review.dimensions.classification && review.dimensions.classification !== "correct"
-      || !["human_review_required", "ticket_pending", "ticket_created", "attached_to_existing_ticket"].includes(after.decision.kind)
-      || after.category !== proposal.category || after.decision.reasonCode !== proposal.decision.reasonCode
-      || savContentHash(after.understanding) !== savContentHash(proposal.understanding)
-      || savContentHash(processStructure(after)) !== savContentHash(processStructure(proposal))) throw new Error("SAV_PARTNERSHIP_REVIEW_REQUIRED");
+  const matches = review && savReviewMatchesProposal(review, { decisionId:decision.id,agentRunId:run.id,proposal,message });
+  const after = matches ? savStructuredProposalSchema.parse(decryptSavPayload(review.afterCiphertext)) : null;
+  const human = after?.humanProcess;
+  const current = splitSavMessageText(decryptSavPayload<{ text:string }>(message.bodyCiphertext).text).currentText;
+  if (human) {
+    if (review?.status !== "approved" || review.reviewScope !== "dossier" || human.action !== "partnership" || !human.confirmed
+      || !human.understanding.requests.some(r => r.nature === "partnership") || !current) throw new Error("SAV_PARTNERSHIP_REVIEW_REQUIRED");
+  } else {
+    const u = proposal.understanding;
+    const partnership = u?.requests.filter(request => request.nature === "partnership") ?? [];
+    if (run.status !== "succeeded" || u?.status !== "qualified" || !partnership.length || u.uncertainties.some(item => !item.requestIds.length || item.requestIds.some(id => partnership.some(request => request.id === id))) || !current) throw new Error("SAV_PARTNERSHIP_NOT_DETECTED");
+    if (partnership.some(request => !request.evidenceIds.some(id => {
+      const evidence=u.evidence.find(item => item.id===id);
+      return evidence?.source === "current_message" && evidence.sourceId === "current_body" && normalize(current).includes(normalize(evidence.excerpt));
+    }))) throw new Error("SAV_PARTNERSHIP_NOT_DETECTED");
+    if (matches && after) {
+      const structure=(value:typeof proposal)=>value.process.map(step=>({kind:step.kind,sourceIds:[...step.sourceIds].sort()}));
+      if (review.status !== "approved" || review.verdict !== "correct" || review.dimensions.classification && review.dimensions.classification !== "correct"
+        || !["human_review_required","ticket_pending","ticket_created","attached_to_existing_ticket"].includes(after.decision.kind)
+        || after.category!==proposal.category || after.decision.reasonCode!==proposal.decision.reasonCode
+        || savContentHash(after.understanding)!==savContentHash(proposal.understanding) || savContentHash(structure(after))!==savContentHash(structure(proposal))) throw new Error("SAV_PARTNERSHIP_REVIEW_REQUIRED");
+    }
   }
   const body = decryptSavPayload<{ text: string }>(message.bodyCiphertext).text;
   if (body.length > 100000) throw new Error("SAV_PARTNERSHIP_MESSAGE_TOO_LARGE");
@@ -81,7 +81,7 @@ async function loadContext(threadId: string, db: Reader = requireDb()) {
   // Footer belongs to the forwarding note, preserving every original character.
   const text = `Bonjour Nathan,\n\nUne demande de partenariat a été reçue. Voici l’email pour examen.\nLes pièces jointes ne sont pas incluses dans ce transfert.\n\n${savReplyFooter("fr")}\n\n---------- Email transféré ----------\nDe : ${oneLine(message.fromEmail)}\nDate : ${message.receivedAt.toISOString()}\nObjet : ${oneLine(message.subject)}\n\n${body}`;
   const outbound = { from, to: SAV_PARTNERSHIP_RECIPIENT, subject, text, formatRevision };
-  const sourceHash = savContentHash({ messageId: message.id, gmailMessageId: message.gmailMessageId, bodyCiphertext: message.bodyCiphertext, subject: message.subject, fromEmail: message.fromEmail, mailboxId: mailbox.id, gmailThreadId: thread.gmailThreadId, decisionId: decision.id, runId: run.id, proposalCiphertext: run.proposalCiphertext, reviewId: review?.id ?? null, reviewStatus: review?.status ?? null, reviewBody: review?.afterCiphertext ?? null, outbound });
+  const sourceHash = savContentHash({ messageId: message.id, gmailMessageId: message.gmailMessageId, body: decryptSavPayload<{text:string}>(message.bodyCiphertext).text, subject: message.subject, fromEmail: message.fromEmail, mailboxId: mailbox.id, gmailThreadId: thread.gmailThreadId, decisionId: decision.id, runId: run.id, proposalCiphertext: run.proposalCiphertext, reviewId: review?.id ?? null, reviewStatus: review?.status ?? null, reviewBody: review?.afterCiphertext ?? null, outbound });
   return { thread, message, mailbox, decision, sourceHash, outbound, outboundHash: savContentHash(outbound) };
 }
 

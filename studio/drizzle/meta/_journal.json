@@ -218,6 +218,13 @@
       "when": 1791964800000,
       "tag": "0034_sav_knowledge_workspace",
       "breakpoints": true
+    },
+    {
+      "idx": 31,
+      "version": "7",
+      "when": 1792070000000,
+      "tag": "0035_sav_learning_admission",
+      "breakpoints": true
     }
   ]
 }

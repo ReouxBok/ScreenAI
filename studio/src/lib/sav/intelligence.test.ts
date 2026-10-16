@@ -37,6 +37,25 @@ beforeEach(() => {
 afterEach(() => { vi.unstubAllEnvs(); vi.unstubAllGlobals(); vi.resetAllMocks(); });
 
 describe("SAV shared semantic pipeline with synthetic provider outputs", () => {
+  it("requires sections once and assembles the draft without a model-supplied duplicate", async () => {
+    const u = understandingFixture(); deps.understand.mockResolvedValue(u);
+    const output = outputFor(u);
+    const network = vi.fn<typeof fetch>(async () => geminiFixture({ ...output, replyDraft: undefined }));
+    const result = await analyzeSavMessage({ from: "fixture@example.invalid", subject: "Support", body: "Le produit ne fonctionne pas." }, { evaluation: evaluation("off", network) });
+    expect(result.replyDraft).toBe(output.coverage.map(p => p.text).join("\n\n"));
+    const body = JSON.parse(network.mock.calls[0][1]!.body as string);
+    expect(body.generationConfig.responseSchema.properties).not.toHaveProperty("replyDraft");
+    expect(result.replyAssessment?.coverage).toEqual(output.coverage);
+  });
+  it("does not run a shadow comparator on the live dossier path", async () => {
+    vi.stubEnv("SAV_ADK_MODE", "shadow");
+    const u = understandingFixture(); deps.understand.mockResolvedValue(u);
+    const network = vi.fn<typeof fetch>(async () => geminiFixture(outputFor(u)));
+    vi.stubGlobal("fetch", network);
+    const result = await analyzeSavMessage({ from: "fixture@example.invalid", subject: "Support", body: "Le produit ne fonctionne pas." });
+    expect(result.understanding?.status).toBe("qualified");
+    expect(network).toHaveBeenCalledOnce(); expect(deps.agent).not.toHaveBeenCalled();
+  });
   it.each(modes)("preserves a content-matched existing issue with a generic email subject in %s", async mode => {
     const u = understandingFixture(); deps.understand.mockResolvedValue(u); deps.agent.mockResolvedValue(adkResult(u));
     deps.crm.mockResolvedValue({ contactFound: true, contactId: "fixture-contact", tickets: [{ id: "401", subject: "Incident du téléphone IA" }],
