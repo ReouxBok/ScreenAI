@@ -15,12 +15,13 @@ vi.mock("@/lib/sav/cutover", () => ({ isSavMessageEligible: async () => true }))
 vi.mock("@/lib/sav/thread-context", () => ({ getSavRelatedThreads: async () => [] }));
 vi.mock("@/lib/sav/drafts", () => ({ getSavReplyDrafts: async () => ({ versions: [], knowledgeRevision: null }) }));
 vi.mock("./mail-conversation", () => ({ MailConversation: () => null }));
-vi.mock("./proposal-review", () => ({ ProposalReview: () => null }));
+vi.mock("./proposal-review", () => ({ ProposalReview: () => null, IdentityCheck: () => null, IdentityCandidates: () => null }));
+vi.mock("./findings-summary", () => ({ FindingsSummary: () => null, UsedKnowledge: () => null }));
 vi.mock("next/navigation", () => ({ useRouter: () => ({ refresh: vi.fn() }), notFound: () => { throw new Error("NOT_FOUND"); } }));
 vi.mock("../ticket-preview-actions", () => ({ prepareTicketPreviewAction: vi.fn(), confirmTicketPreviewAction: vi.fn() }));
 vi.mock("next/link", () => ({ default: (props: ComponentProps<"a">) => createElement("a", props) }));
 vi.mock("../actions", () => Object.fromEntries([
-  "approveDraftAction", "correctDecisionAction", "createTicketAction", "linkTicketAction", "reconcileTicketAction", "requestHumanAction", "retryAction", "retryAnalysisAction", "reviewPilotItemAction", "refreshSavContextAction", "repairSavProposalAction",
+  "approveDraftAction", "correctDecisionAction", "createTicketAction", "linkTicketAction", "reconcileTicketAction", "reconcileTicketReturnAction", "requestHumanAction", "retryAction", "retryAnalysisAction", "reviewPilotItemAction", "refreshSavContextAction", "repairSavProposalAction",
 ].map((name) => [name, dependencies.action])));
 import SavThreadPage from "./page";
 
@@ -44,6 +45,19 @@ async function render(overrides = {}, review = "") {
   return html;
 }
 describe("manual ticket controls in the dossier", () => {
+  it.each([
+    { status: "pending", payload: {}, errorCode: null, expected: "En cours" },
+    { status: "running", payload: {}, errorCode: null, expected: "En cours" },
+    { status: "failed", payload: { ticketReturnDispatchedAt: "fixture" }, errorCode: null, expected: "Résultat à vérifier" },
+    { status: "pending", payload: { ticketReturnDispatchedAt: "fixture" }, errorCode: null, expected: "Résultat à vérifier" },
+    { status: "failed", payload: {}, errorCode: "SAV_MANUAL_RECONCILIATION_REQUIRED", expected: "Résultat à vérifier" },
+    { status: "succeeded", payload: { hubspotTicketId: "301", ticketReturnDispatchedAt: "fixture", ticketReturnCompletedAt: "fixture" }, errorCode: null, expected: "Ticket lié" },
+  ])("shows $expected for a linked ticket with a $status action", async ({ expected, ...operation }) => {
+    const detail = await dependencies.detail();
+    const html = await render({ thread: { ...detail.thread, hubspotTicketId: "301" }, actions: [{ ...action, kind: "link_ticket", ...operation }] });
+    const progress = html.match(/<li\b[^>]*>[\s\S]*?<strong>Action HubSpot<\/strong><small>([^<]+)<\/small>/)?.[1];
+    expect(progress).toBe(expected);
+  });
   it("binds the human creation to the exact current review", async () => {
     const html = await render(); expect(html).toContain("Préparer l’aperçu de l’action"); expect(html).not.toContain("Confirmation explicite");
   });

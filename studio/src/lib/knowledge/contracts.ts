@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { diagnosticKnowledgeSchema } from "./diagnostic-contract";
 
 const label = z.string().trim().min(1).max(500);
 const text = z.string().trim().max(5_000);
@@ -37,6 +38,7 @@ export const canonicalKnowledgeSchema = z.object({
   exceptions: list,
   escalation: text,
   steps: z.array(semanticStepSchema).max(50),
+  diagnostic: diagnosticKnowledgeSchema.optional(),
   // Written support evidence stays with the reviewed revision, never in a prompt.
   supportContext: z.object({
     symptoms: list,
@@ -50,6 +52,7 @@ export const canonicalKnowledgeSchema = z.object({
     sourceSections: z.array(onboardingSourceSectionSchema).max(50).optional(),
   }).strict().optional(),
 }).strict().superRefine((value, ctx) => {
+  if (value.diagnostic?.checks.some(check => !value.steps.some(step => step.id === check.evidenceStepId))) ctx.addIssue({ code: "custom", message: "SAV_DIAGNOSTIC_STEP_REFERENCE_INVALID", path: ["diagnostic"] });
   if (new Set(value.steps.map((step) => step.id)).size !== value.steps.length) ctx.addIssue({ code: "custom", message: "SEMANTIC_STEP_IDS_MUST_BE_UNIQUE", path: ["steps"] });
 });
 export type CanonicalKnowledge = z.infer<typeof canonicalKnowledgeSchema>;

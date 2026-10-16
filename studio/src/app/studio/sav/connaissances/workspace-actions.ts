@@ -69,3 +69,10 @@ export async function startKnowledgeRevisionAction(candidateId: string) {
   try { const draft = await startSavKnowledgeRevision(candidateId, staff.email); refresh(); return { draft, error: null }; }
   catch (error) { return { draft: null, error: message(error) }; }
 }
+
+export async function loadSavFactDictionaryAction() {
+  await requireSavApiStaff();
+  const { readActiveSavPlaybook } = await import("@/lib/sav/playbook");
+  const book = await readActiveSavPlaybook();
+  return book.document.facts.map(f => ({ key: f.key, label: f.label }));
+}

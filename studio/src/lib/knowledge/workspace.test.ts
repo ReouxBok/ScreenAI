@@ -1,7 +1,7 @@
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { eq } from "drizzle-orm";
 import { createSavTestDb } from "../../../test/sav-db";
-import { auditLogs, categories, contentItems, contentVersions, knowledgeFamilies, knowledgeProjectionCandidates, savKnowledgeActivations, savKnowledgePublicationAttempts, savLearningCandidates } from "@/db/schema";
+import { auditLogs, categories, contentItems, contentVersions, knowledgeFamilies, knowledgeProjectionCandidates, savKnowledgeActivations, savKnowledgeProposalDrafts, savKnowledgePublicationAttempts, savLearningCandidates } from "@/db/schema";
 import type { SaveSavKnowledgeProposalInput } from "./proposals";
 import { canonicalKnowledgeSchema } from "./contracts";
 import { articleMetadataSchema } from "@/lib/content";
@@ -26,6 +26,30 @@ async function approve(candidate: Awaited<ReturnType<typeof submit>>, who = acto
 async function active() { const approved = await approve(await submit()); await publishSavKnowledgeVersion({ itemId: approved.targetItemId!, expectedVersionId: approved.materializedVersionId! }, actor); await activateSavKnowledgeVersion({ itemId: approved.targetItemId!, expectedPublishedVersionId: approved.materializedVersionId!, expectedActiveVersionId: null }, actor); return approved; }
 
 describe("SAV-55 canonical knowledge workspace", () => {
+  it("saves a learning preparation in its caller transaction so an aborted triage leaves no orphan draft", async () => {
+    await expect(fixture.db.transaction(async tx => {
+      await saveSavKnowledgeProposal(proposal, contact, tx);
+      throw new Error("SYNTHETIC_TRIAGE_ABORT");
+    })).rejects.toThrow("SYNTHETIC_TRIAGE_ABORT");
+    expect(await fixture.db.select().from(savKnowledgeProposalDrafts)).toHaveLength(0);
+    expect(await fixture.db.select().from(auditLogs)).toHaveLength(0);
+    await fixture.db.transaction(tx => saveSavKnowledgeProposal(proposal, contact, tx));
+    expect(await fixture.db.select().from(savKnowledgeProposalDrafts)).toHaveLength(1);
+  });
+  it("preserves diagnostic questions and branches through review, publication and active search", async () => {
+    const guided = canonicalKnowledgeSchema.parse({ ...document, diagnostic: {
+      requiredFacts: [{ key: "workspace_name", label: "Nom de l’espace", question: "Quel espace de démonstration voulez-vous renommer ?", requiredFor: ["workspace.rename"] }],
+      checks: [{ id: "workspace.rename", evidenceStepId: "workspace.rename", instruction: document.steps[0].instruction, expectedResult: document.steps[0].expectedResult, prerequisites: [], ifExpected: null, ifNot: null }], knownCauses: [],
+    } });
+    const candidate = await submit({ ...proposal, document: guided });
+    const approved = await approve(candidate, actor, guided);
+    await publishSavKnowledgeVersion({ itemId: approved.targetItemId!, expectedVersionId: approved.materializedVersionId! }, actor);
+    await activateSavKnowledgeVersion({ itemId: approved.targetItemId!, expectedPublishedVersionId: approved.materializedVersionId!, expectedActiveVersionId: null }, actor);
+    const result = await searchKnowledge({ query: "Renommer un espace", scope: "sav", contentTypes: ["article"] });
+    expect(result.results[0].resolution?.diagnostic).toEqual(guided.diagnostic);
+    expect(result.results[0].contentVersionId).toBe(approved.materializedVersionId);
+  });
+
   it("saves internal drafts, requires a preview, deduplicates submission and classifies explicit human provenance", async () => {
     const draft = await saveSavKnowledgeProposal(proposal, contact);
     expect(await fixture.db.select().from(knowledgeProjectionCandidates)).toHaveLength(0);

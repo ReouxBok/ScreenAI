@@ -5,12 +5,15 @@ import { coverageFixture, geminiFixture, understandingContent, understandingFixt
 import { savAgentRuns, savMailboxes, savMessages, savThreads } from "@/db/schema";
 import { analyzeSavMessage } from "./intelligence";
 import { decryptSavPayload } from "./crypto";
+import { defaultSavPlaybook } from "./playbook-contract";
 import { savSemanticPlan, type SavUnderstandingV1 } from "./understanding";
 import type { SavAgentOutput } from "./agent/contracts";
 import type { SavStructuredProposal } from "./proposal";
 
-const state = vi.hoisted(() => ({ db: null as unknown, failTrace: false, search: vi.fn(), agent: vi.fn(), crm: vi.fn(), context: vi.fn() }));
+const state = vi.hoisted(() => ({ db: null as unknown, failTrace: false, search: vi.fn(), agent: vi.fn(), crm: vi.fn(), context: vi.fn(), playbook: vi.fn(), retrieval: vi.fn() }));
 vi.mock("@/db", () => ({ requireDb: () => state.failTrace ? { insert: () => { throw new Error("fixture-db-failed"); } } : state.db }));
+vi.mock("./playbook", () => ({ readActiveSavPlaybook: state.playbook }));
+vi.mock("./request-retrieval-db", () => ({ searchSavKnowledgeByRequest: state.retrieval }));
 vi.mock("@/lib/search", () => ({ searchKnowledge: state.search }));
 vi.mock("./agent/orchestrator", () => ({ runSavAdkAgent: state.agent }));
 vi.mock("./hubspot", () => ({ readSavHubspotContext: state.crm }));
@@ -27,7 +30,7 @@ const understanding = understandingFixture({
 });
 function outputFor(u = understanding): SavAgentOutput {
   const coverage = coverageFixture(u).map(part => ({ ...part, text: u.language === "en"
-    ? `The team needs to review your request: ${u.requests.find(request => request.id === part.requestId)!.summary}` : part.text }));
+    ? `The team needs to review your request: ${u.requests.find(request => request.id === part.requestId)!.summary.replace(/\?/g, ".")}` : part.text.replace(/\?/g, ".") }));
   return { category: savSemanticPlan(u).category, urgency: "normal", ticketRequired: true,
     reasonCode: "needs_context", explanation: "Le dossier nécessite une vérification humaine.", confidence: 0.99,
     requiresHuman: true, replyDraft: coverage.map(part => part.text).join("\n\n"), internalNote: "Dossier interne fictif.",
@@ -76,6 +79,12 @@ afterAll(async () => { await fixture.client.close(); });
 afterEach(() => { vi.unstubAllEnvs(); vi.unstubAllGlobals(); warnings.mockRestore(); errors.mockRestore(); });
 beforeEach(async () => {
   vi.resetAllMocks(); state.failTrace = false;
+  state.playbook.mockResolvedValue({ versionId: "existing-process-v1", version: 0, document: defaultSavPlaybook });
+  state.retrieval.mockImplementation(async options => {
+    let failed = false;
+    for (const request of options.requests) try { await state.search({ query: [request.product, request.feature, request.summary].filter(Boolean).join(" — "), locale: options.locale }); } catch { failed = true; }
+    return { contractRevision: "fixture", revision: "offline", requests: options.requests.map((r: { id: string }) => ({ requestId: r.id, status: failed ? "search_unavailable" : "no_source", candidateKeys: [], limitations: [] })), sources: [], alerts: [], metrics: { attempts: 1, queryCount: options.requests.length, embeddingBatchesUpperBound: 1, serializedBytes: 100, contextTextTokensUpperBound: 100 } };
+  });
   vi.stubEnv("SAV_ADK_MODE", "pilot"); vi.stubEnv("SAV_AI_ANALYSIS", "true");
   vi.stubEnv("SAV_GEMINI_API_KEY", "fixture-not-a-real-key"); vi.stubEnv("SAV_AI_MODEL", "fixture-model");
   vi.stubEnv("SAV_ENCRYPTION_KEY_V1", "test-only-generation-diagnostics-key-32-characters");
@@ -100,7 +109,7 @@ describe("SAV generation diagnostics on isolated PostgreSQL", () => {
     expect(state.crm.mock.invocationCallOrder[0]).toBeLessThan(network.mock.invocationCallOrder[0]);
     const qualification = JSON.parse(promptAt(0));
     expect(qualification.sources).toContainEqual({ source: "crm", sourceId: "crm_snapshot", text: JSON.stringify(await state.crm.mock.results[0].value) });
-    expect(promptAt(1)).toContain('"contactId":"31"');
+    expect(JSON.parse(promptAt(1)).context.payload.crm).toMatchObject({ contactFound: true, status: "ready" });
     expect(network).toHaveBeenCalledTimes(3);
     expect((await persistedProposal()).dossierContext?.crm.data?.contactId).toBe("31");
   });
@@ -110,7 +119,7 @@ describe("SAV generation diagnostics on isolated PostgreSQL", () => {
     successfulGeneration();
     const analysis = await analyzeSavMessage(input, { messageId });
     expect(network).toHaveBeenCalledTimes(3);
-    expect(analysis.replyDraft).toBe(outputFor().replyDraft);
+    expect(analysis.replyDraft).toBe(`L’équipe doit vérifier votre demande : ${input.body}`);
     expect(analysis.replyAssessment?.coherence?.status).toBe("passed");
     expect(analysis.proposal).toMatchObject({ kind: "human_review_required", requiresHumanApproval: true });
     expect(analysis.structuredProposal?.dossierContext?.crm.data?.contactId).toBe("31");
@@ -128,7 +137,7 @@ describe("SAV generation diagnostics on isolated PostgreSQL", () => {
       { source: "current_message", sourceId: "current_body", text: "Hello, how can I invite 3 users?\nI am available Tuesday at 14:00." },
       expect.objectContaining({ source: "history", sourceId: "quoted_history", text: expect.stringContaining("cancel my subscription") }),
     ]));
-    expect(promptAt(1)).toContain("DERNIER TEXTE ENTRANT:\nHello, how can I invite 3 users?");
+    expect(JSON.parse(promptAt(1)).context.payload.current.text).toContain("Hello, how can I invite 3 users?");
     expect(state.search).toHaveBeenCalledWith(expect.objectContaining({ locale: "en-US", query: expect.not.stringContaining("cancel my subscription") }));
     const snapshot = await persistedProposal();
     expect(snapshot.messageContext?.currentText).not.toContain("cancel");
@@ -202,12 +211,12 @@ describe("SAV generation diagnostics on isolated PostgreSQL", () => {
   });
   it("does not run a second model after the required trace write fails", async () => {
     vi.stubEnv("SAV_ADK_MODE", "on"); state.failTrace = true;
-    network.mockResolvedValueOnce(geminiFixture(understandingContent(understanding)));
+    network.mockResolvedValueOnce(geminiFixture(understandingContent(understanding))).mockResolvedValueOnce(geminiFixture(outputFor()));
     state.agent.mockResolvedValue({ output: outputFor(), evidence: [], toolTrace: [], model: "fixture-model", knowledgeRevision: "not_consulted",
       promptRevision: "fixture-prompt", inputHash: "fixture-input", outputHash: "fixture-output", durationMs: 1, inputTokens: 10, outputTokens: 20, totalTokens: 30,
       ticketRouting: { kind: "new", contactId: "31", reason: "fixture" } });
     await expect(analyzeSavMessage(input, { messageId })).rejects.toThrow("SAV_ANALYSIS_TRACE_REQUIRED");
-    expect(state.agent).toHaveBeenCalledTimes(1); expect(state.search).not.toHaveBeenCalled(); expect(network).toHaveBeenCalledOnce();
+    expect(state.agent).not.toHaveBeenCalled(); expect(state.search).toHaveBeenCalledOnce(); expect(network).toHaveBeenCalledTimes(2);
     expect(await runs()).toEqual([]);
     expect(errors).toHaveBeenCalledWith("sav_agent_trace_write_failed", { errorCode: "Error" });
   });

@@ -68,3 +68,4 @@
 .review button:disabled { opacity: .45; cursor: not-allowed; }
 
 .draft, .observation { padding: 22px; }
+.draftTitle { margin: 0; font-size: 13px; font-weight: 700; color: var(--muted); }

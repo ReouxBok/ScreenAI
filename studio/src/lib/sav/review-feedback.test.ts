@@ -119,6 +119,7 @@ it("stores the original understanding in encrypted before and after snapshots", 
 });
 
 it("retains verdicts when model-local IDs and coverage links are consistently renamed", async () => {
+  for (const fact of [...proposal.understanding!.knownFacts, ...proposal.understanding!.attemptedSteps]) fact.requestIds = ["request-1"];
   proposal.understanding!.customerRelationship = { kind: "existing_customer", evidenceIds: ["evidence-1"] };
   proposal.understanding!.uncertainties = [{ code: "missing_context", requestIds: ["request-1"] }];
   proposal.replyAssessment = { kind: "contextualized", errorCode: null, coverage: [{ requestId: "request-1", text: proposal.replyDraft!, kind: "clarification", sourceIds: ["persistent-kb-source"], missingInformationIds: ["missing-1"], repeatedAttemptIds: ["attempt-1"], repeatJustification: "Une preuve nouvelle fictive." }] };

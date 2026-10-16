@@ -25,7 +25,7 @@ export default async function SavKnowledgeLibrary({ searchParams }: { searchPara
   const pages = catalog ? Math.max(1, Math.ceil(catalog.total / catalog.pageSize)) : 1;
   return <div className={styles.workspace}>
     <div className={styles.heading}><div><span className="eyebrow">SAV IA · Connaissances</span><h1>Bibliothèque des connaissances</h1><p className={styles.subtle}>Les procédures utilisées par l’agent et les propositions à relire.</p></div>
-      <Link className="button primary" href="/studio/sav/connaissances/proposer">Proposer une connaissance</Link></div>
+      <Link className="button secondary" href="/studio/sav/connaissances/apprentissage">Apprentissage</Link><Link className="button secondary" href="/studio/sav/connaissances/playbook">Master prompt SAV</Link><Link className="button secondary" href="/studio/sav/connaissances/diagnostic">Enrichir les fiches actives</Link><Link className="button primary" href="/studio/sav/connaissances/proposer">Proposer une connaissance</Link></div>
     <nav className={styles.tabs} aria-label="Vues de la bibliothèque">{Object.entries(knowledgeTabs).map(([key, label]) => <Link key={key} href={url(key as SavKnowledgeTab)} className={styles.tab} aria-current={tab === key ? "page" : undefined}>{label}<strong>{catalog?.counts[key as SavKnowledgeTab] ?? "—"}</strong></Link>)}</nav>
     <form method="get" className={styles.toolbar} aria-label="Rechercher les connaissances"><input type="hidden" name="tab" value={tab}/>
       <label>Rechercher une connaissance<input name="q" type="search" placeholder="Titre, thème ou procédure…" defaultValue={q} maxLength={200}/></label>

@@ -100,10 +100,19 @@ function aside(html: string) {
   return content!;
 }
 
-function sectionWithHeading(html: string, heading: string) {
-  const headingAt = html.indexOf(`<h2>${heading}</h2>`);
-  expect(headingAt).toBeGreaterThanOrEqual(0);
-  return html.slice(html.lastIndexOf("<section", headingAt), html.indexOf("</section>", headingAt) + "</section>".length);
+/** The action panel of section 3, where every HubSpot CTA now lives. */
+function actionPanel(html: string) {
+  const start = html.indexOf('aria-label="Exécution de l’action"');
+  expect(start).toBeGreaterThanOrEqual(0);
+  return html.slice(start, html.indexOf("</details>", start));
+}
+
+/** A block of the dossier sections, from its h3 title to the next block title. */
+function blockWithHeading(html: string, heading: string) {
+  const start = html.search(new RegExp(`>${heading}</h3>`));
+  expect(start).toBeGreaterThanOrEqual(0);
+  const next = html.slice(start + 1).search(/class="_blockTitle_|<\/details>/);
+  return html.slice(start, next < 0 ? undefined : start + 1 + next);
 }
 
 function selectOptions(html: string, name: string) {
@@ -182,15 +191,16 @@ describe("SAV dossier SSR and human-review guardrails", () => {
     expect(dependencies.related).not.toHaveBeenCalled();
   });
 
-  it("shows the client mail before the proposal, puts external-action CTAs in the aside and offers a context jump", async () => {
+  it("shows the client mail before the proposal, puts external-action CTAs in the action section and offers a jump to it", async () => {
     dependencies.review.mockResolvedValue(reviewFixture(true));
     const html = await renderPage();
     expect(html.indexOf("EMAIL_CLIENT_TEST")).toBeLessThan(html.indexOf('id="proposal-review-title"'));
-    expect(html.indexOf("Dernier email reçu")).toBeLessThan(html.indexOf("Proposition de l’IA"));
-    expect(aside(html)).toContain("Ouvrir un nouveau ticket");
-    expect(html.slice(0, html.indexOf("<aside"))).not.toContain("Ouvrir un nouveau ticket");
-    expect(html).toContain('href="#sav-client-context"');
-    expect(html).toContain('<aside id="sav-client-context" tabindex="-1"');
+    expect(html.indexOf("<h2>Conversation</h2>")).toBeLessThan(html.indexOf("Proposition de l’IA"));
+    expect(actionPanel(html)).toContain("Ouvrir un nouveau ticket");
+    expect(html.slice(0, html.indexOf('id="sav-action"'))).not.toContain("Ouvrir un nouveau ticket");
+    expect(aside(html)).not.toContain("Ouvrir un nouveau ticket");
+    expect(html).toContain('href="#sav-action"');
+    expect(html).toMatch(/<details id="sav-action"[^>]*open=""/);
     expect(html).toContain("Aucun email envoyé, aucun ticket créé, aucune connaissance publiée par ce bouton.");
     expect(html).not.toContain("Approuver et mettre en file d’envoi");
     for (const action of Object.values(dependencies.actions)) expect(action).not.toHaveBeenCalled();
@@ -203,9 +213,9 @@ describe("SAV dossier SSR and human-review guardrails", () => {
       ["integration", "Intégration"], ["how_to", "Utilisation du produit"], ["acknowledgement", "Remerciement ou confirmation"], ["other", "Autre"],
     ]);
     expect(selectOptions(html, "urgency")).toEqual([["low", "Faible"], ["normal", "Normale"], ["high", "Élevée"], ["critical", "Critique"]]);
-    const actions = html.match(/<label>Action à préparer<select>([\s\S]*?)<\/select>/)?.[1];
+    const actions = html.match(/<legend[^>]*>Que faire de ce dossier \?<\/legend>([\s\S]*?)<\/fieldset>/)?.[1];
     expect(actions).toBeDefined();
-    expect([...actions!.matchAll(/<option\b[^>]*value="([^"]+)"[^>]*>([^<]*)<\/option>/g)].map(([,value,label])=>[value,label])).toEqual([
+    expect([...actions!.matchAll(/<input type="radio" name="humanAction"[^>]*value="([^"]+)"\/>([^<]*)<\/label>/g)].map(([,value,label])=>[value,label])).toEqual([
       ["create_ticket","Créer un nouveau ticket"], ["link_ticket","Rattacher à un ticket ouvert"],
       ["reopen_ticket","Traiter le retour sur un ticket fermé"], ["partnership","Transférer une demande de partenariat"],
       ["commercial","Demande commerciale · règle existante"], ["no_ticket","Aucun ticket nécessaire"],
@@ -218,15 +228,15 @@ describe("SAV dossier SSR and human-review guardrails", () => {
     expect(selectOptions(html, "reusability").map(([value]) => value)).toEqual(["none", "tone_only", "customer_specific", "reusable"]);
     expect(html).toContain(`name="decisionId" value="${decisionId}"`);
     expect(html).toContain(`name="agentRunId" value="${runId}"`);
-    expect(selectOptions(html,"processKind_0")).toContainEqual(["product_step","Étape dans le produit"]);
-    expect(html).toContain('value="product_step" selected=""');
-    expect(buttonAttributes(html, "Valider le dossier / process")).toHaveLength(1);
+    expect(html).toContain('name="processKind_0" value="product_step"');
+    expect(html).not.toContain(">Monter<"); expect(html).not.toContain(">Descendre<");
+    expect(buttonAttributes(html, "Valider le dossier")).toHaveLength(1);
     expect(buttonAttributes(html, "Refuser le process")).toHaveLength(0);
   });
 
   it("keeps process validation above a separately editable draft and disabled send CTA", async () => {
     const html = await renderPage();
-    const titles = ["Résumé du sujet", "Action proposée", "Connaissances utilisées", "Valider le dossier / process", "Verdict du brouillon"];
+    const titles = ["<h2>Conversation</h2>", "<h2>Ce que l’agent a trouvé</h2>", "Connaissances utilisées", "<h2>Action proposée</h2>", "Que faire de ce dossier ?", ">Valider le dossier<", "<h2>Brouillon de réponse</h2>", "Verdict du brouillon"];
     for (let index = 1; index < titles.length; index++) expect(html.indexOf(titles[index])).toBeGreaterThan(html.indexOf(titles[index - 1]));
     expect(html).not.toMatch(/<textarea[^>]*name="replyDraft"/);
     expect(html).toMatch(/<textarea[^>]*name="text"/);
@@ -307,7 +317,7 @@ describe("SAV dossier SSR and human-review guardrails", () => {
     const review = reviewFixture();
     review.proposal.routing = { kind: "matched", reason: "exact_subject", contactId: "456", ticketId: "789" };
     dependencies.review.mockResolvedValue(review);
-    const ticketCard = sectionWithHeading(aside(await renderPage()), "Ticket réellement lié");
+    const ticketCard = blockWithHeading(await renderPage(), "Tickets de la fiche");
     expect(ticketCard).toContain("Aucun ticket lié à ce dossier.");
     expect(ticketCard).toContain("Correspondance proposée");
     expect(ticketCard).toContain("Rattachement manuel à confirmer");
@@ -322,8 +332,8 @@ describe("SAV dossier SSR and human-review guardrails", () => {
     dependencies.detail.mockResolvedValue(detail);
     dependencies.review.mockResolvedValue(reviewFixture(true));
     const html = await renderPage();
-    const ticketCard = sectionWithHeading(aside(html), "Ticket réellement lié");
-    expect(ticketCard).toContain("Ouvrir le ticket HubSpot"); expect(ticketCard).not.toContain("#987");
+    const ticketCard = blockWithHeading(html, "Tickets de la fiche");
+    expect(ticketCard).toContain("Ticket réellement lié"); expect(ticketCard).toContain("Ouvrir le ticket HubSpot"); expect(ticketCard).not.toContain("#987");
     expect(ticketCard).not.toContain("Correspondance proposée");
     expect(buttonAttributes(html, "Ouvrir un nouveau ticket")).toEqual([]);
   });
@@ -334,7 +344,7 @@ describe("SAV dossier SSR and human-review guardrails", () => {
     review.proposal.identityCandidates = [{ contactId: "654", name: "Camille Test", email: "compte@example.invalid", phoneHint: "•••1234", matchedBy: "phone", confirmed: false }];
     dependencies.review.mockResolvedValue(review);
     const html = await renderPage();
-    const contactCard = sectionWithHeading(aside(html), "Fiche HubSpot liée");
+    const contactCard = blockWithHeading(html, "Fiche HubSpot");
     expect(html).toContain("Camille Test");
     expect(html).toContain("correspondance par téléphone, à vérifier humainement");
     expect(contactCard).toContain("ne sont pas encore une fiche liée");
@@ -352,7 +362,7 @@ describe("SAV dossier SSR and human-review guardrails", () => {
     dependencies.detail.mockResolvedValue(detail);
     dependencies.review.mockResolvedValue(reviewFixture(true));
     const html = await renderPage();
-    expect(buttonAttributes(aside(html), "Préparer l’aperçu de l’action")).toEqual([expect.stringContaining('disabled=""')]);
+    expect(buttonAttributes(actionPanel(html), "Préparer l’aperçu de l’action")).toEqual([expect.stringContaining('disabled=""')]);
     expect(html).toContain("Résultat HubSpot incertain");
     expect(html).not.toContain("Confirmer le rattachement");
   });
@@ -363,7 +373,7 @@ describe("SAV dossier SSR and human-review guardrails", () => {
     dependencies.detail.mockResolvedValue(detail);
     dependencies.review.mockResolvedValue(reviewFixture(true));
     const html = await renderPage();
-    expect(buttonAttributes(aside(html), "Préparer l’aperçu de l’action")).toEqual([expect.stringContaining('disabled=""')]);
+    expect(buttonAttributes(actionPanel(html), "Préparer l’aperçu de l’action")).toEqual([expect.stringContaining('disabled=""')]);
     expect(html).toContain("Demande HubSpot en attente de confirmation");
     expect(buttonAttributes(html, "Ouvrir un nouveau ticket")).toEqual([]);
     expect(html).not.toContain("Confirmer le rattachement");
@@ -394,7 +404,7 @@ describe("SAV dossier SSR and human-review guardrails", () => {
     const html = await renderPage();
     expect(html).toContain("EMAIL_CLIENT_TEST");
     expect(html).toContain("Les anciens emails ne sont pas retraités");
-    expect(html).not.toContain("Valider le dossier / process");
+    expect(html).not.toContain(">Valider le dossier<");
     expect(html).not.toContain("Refuser le process");
     expect(html).not.toContain("Approuver et mettre en file d’envoi");
     expect(buttonAttributes(html, "Préparer l’aperçu de l’action")).toEqual([expect.stringContaining('disabled=""')]);
@@ -410,7 +420,7 @@ it.each(["2026-01-02T12:00:00Z", null, "invalid"])("shows the real ticket creati
       routing: { kind: "new", reason: "distinct_issue", candidateIds: [] } } },
     conversation: null, conversationError: null, otherConversations: [], otherConversationsError: null };
   dependencies.detail.mockResolvedValue(detail);
-  const html = sectionWithHeading(await renderPage(), "Ticket réellement lié");
+  const html = blockWithHeading(await renderPage(), "Tickets de la fiche");
   expect(html).toContain(createdAt && createdAt !== "invalid" ? "02/01/2026 13:00" : "Date indisponible");
   expect(html).not.toContain("02/10/2026");
 });
@@ -429,7 +439,7 @@ it.each(["1", "2", "3"])("uses the saved semantic match for the generic-subject 
   expect(html).toMatch(/checked="" value="401"/);
   expect(buttonAttributes(html, "Préparer l’aperçu de l’action")[0]).not.toContain("disabled");
   expect(html).not.toContain("Confirmation explicite");
-  expect(aside(html)).not.toContain("Créer un ticket HubSpot");
+  expect(actionPanel(html)).not.toContain("Créer le ticket HubSpot");
 });
 
 it("shows the original customer and the same forwarded return CTA as the backend", async () => {
