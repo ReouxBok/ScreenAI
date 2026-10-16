@@ -31,6 +31,7 @@ export function ProcessEditor({ proposal: p, tickets }: { proposal: SavStructure
   const initial = p.humanProcess;
   const [action, setAction] = useState<Action>(() => defaultAction(p, tickets));
   const [ticketId, setTicketId] = useState(initial?.ticketId ?? (p.routing.kind === "matched" ? p.routing.ticketId : ""));
+  const [ticketQuery, setTicketQuery] = useState("");
   const [reason, setReason] = useState(initial?.reason ?? p.decision.explanation);
   const [confirmed, setConfirmed] = useState(false);
   const [understanding, setUnderstanding] = useState<SavHumanProcess["understanding"]>(() => initial?.understanding ?? {
@@ -42,6 +43,7 @@ export function ProcessEditor({ proposal: p, tickets }: { proposal: SavStructure
   const selectsTicket = action === "link_ticket" || action === "reopen_ticket";
   const createsTicket = action === "create_ticket" || action === "reopen_ticket";
   const ticketOptions = tickets.filter(t => action === "reopen_ticket" ? t.status === "closed" : t.status === "open");
+  const filteredTickets = ticketOptions.filter(ticket => `${ticket.id} ${ticket.subject} ${ticket.ownerName ?? ""} ${ticket.ownerId ?? ""}`.toLocaleLowerCase("fr").includes(ticketQuery.trim().toLocaleLowerCase("fr")));
   const change = () => setConfirmed(false);
   function updateRequest(index: number, patch: Partial<typeof understanding.requests[number]>) {
     setUnderstanding({ ...understanding, requests: understanding.requests.map((r,i) => i === index ? { ...r, ...patch } : r) }); change();
@@ -68,17 +70,18 @@ export function ProcessEditor({ proposal: p, tickets }: { proposal: SavStructure
       </details>
 
       <fieldset className={styles.actions}><legend className={styles.blockTitle}>Que faire de ce dossier ?</legend>
-        {(Object.entries(savHumanActionLabels) as [Action, string][]).map(([key,label]) => <label key={key} className={styles.action}><input type="radio" name="humanAction" value={key} checked={action === key} onChange={() => { setAction(key); setTicketId(""); change(); }}/>{label}</label>)}
+        {(Object.entries(savHumanActionLabels) as [Action, string][]).map(([key,label]) => <label key={key} className={styles.action}><input type="radio" name="humanAction" value={key} checked={action === key} onChange={() => { setAction(key); setTicketId(""); setTicketQuery(""); change(); }}/>{label}</label>)}
       </fieldset>
       <label className={styles.why}>Pourquoi ce choix<textarea required minLength={20} maxLength={2000} value={reason} onChange={e => { setReason(e.target.value); change(); }}/></label>
     </div>
 
     {selectsTicket && <div className={styles.panel}>
       <h3 className={styles.blockTitle}>{action === "reopen_ticket" ? "Ticket fermé concerné" : "Ticket ouvert concerné"}</h3>
-      {ticketOptions.length ? <div className={styles.ticketChoices} role="radiogroup" aria-label="Ticket concerné">{ticketOptions.map(t => <label key={t.id} className={styles.ticketChoice}>
+      <label>Rechercher le ticket concerné<input type="search" value={ticketQuery} onChange={e => setTicketQuery(e.target.value)} placeholder="Titre, numéro ou propriétaire"/></label>
+      {ticketOptions.length ? <div className={styles.ticketChoices} role="radiogroup" aria-label="Ticket concerné">{ticketOptions.map(t => <div key={t.id} hidden={!filteredTickets.includes(t)}><label className={styles.ticketChoice}>
         <input type="radio" name="humanTicket" value={t.id} required checked={ticketId === t.id} onChange={() => { setTicketId(t.id); change(); }}/>
         <span><strong>{t.subject || "Ticket sans titre"}</strong><small>{t.status === "closed" ? "Fermé" : stageLabels[t.stageId ?? ""] ?? "Ouvert"} · {t.ownerName ? t.ownerName : t.ownerId ? "Propriétaire non résolu" : "Non assigné"}</small></span>
-      </label>)}</div> : <p className={styles.hint}>Aucun ticket {action === "reopen_ticket" ? "fermé" : "ouvert"} sur cette fiche. Choisissez une autre action.</p>}
+      </label></div>)}{!filteredTickets.length && <p className={styles.hint}>Aucun ticket ne correspond à cette recherche.</p>}</div> : <p className={styles.hint}>Aucun ticket {action === "reopen_ticket" ? "fermé" : "ouvert"} sur cette fiche. Choisissez une autre action.</p>}
       {action === "link_ticket" && <p className={styles.hint}>Si le ticket est déjà en Nouveau, il est rattaché sans changement. Sinon il repasse en Nouveau, avec le retour du client en note ; son propriétaire est conservé. L’opération exacte est présentée avant confirmation.</p>}
       {action === "reopen_ticket" && <ul className={styles.rules}>
         <li><span className={`${styles.badge} ${styles.done}`}>≤ 15 jours</span>Réouvrir en Nouveau, note de retour, propriétaire conservé</li>

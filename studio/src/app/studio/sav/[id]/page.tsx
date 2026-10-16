@@ -15,7 +15,8 @@ import { savActionLabels, savToolStatusLabels, savDecisionLabels, savLabel, savR
 import { getSavPartnershipTransferState, isSavPartnershipForward } from "@/lib/sav/partnership-forward";
 import { PartnershipTransfer } from "../partnership-transfer";
 import { SavDossierOpened, SavDossierBackLink } from "../dossier-opened";
-import { TicketSelector, savTicketStageLabel } from "./ticket-selector";
+import { TicketSelector } from "./ticket-selector";
+import { savTicketStageLabel } from "./ticket-status-label";
 import { DossierSection } from "./dossier-section";
 import { FindingsSummary, UsedKnowledge } from "./findings-summary";
 import { UnderstandingReview } from "./understanding-review";
@@ -130,9 +131,9 @@ export default async function SavThreadPage({ params, searchParams }: { params: 
     dossierApproved ? { label: "Dossier validé", detail: `Par ${proposalReview?.review?.reviewedBy}`, state: "done" }
       : proposalReview?.review ? { label: "Dossier validé", detail: "À reprendre", state: "alert" }
       : proposalReview ? { label: "Dossier validé", detail: "À valider", state: "todo" } : { label: "Dossier validé", detail: "Après l’analyse", state: "pending" },
-    detail.thread.hubspotTicketId ? { label: "Action HubSpot", detail: "Ticket lié", state: "done" }
-      : returnUncertain || needsTicketReconciliation ? { label: "Action HubSpot", detail: "Résultat à vérifier", state: "alert" }
+    returnUncertain || needsTicketReconciliation ? { label: "Action HubSpot", detail: "Résultat à vérifier", state: "alert" }
       : ticketRequestPending ? { label: "Action HubSpot", detail: "En cours", state: "todo" }
+      : detail.thread.hubspotTicketId ? { label: "Action HubSpot", detail: "Ticket lié", state: "done" }
       : !ticketActionNeeded ? { label: "Action HubSpot", detail: "Aucune action ticket", state: "done" }
       : dossierApproved ? { label: "Action HubSpot", detail: "À préparer", state: "todo" } : { label: "Action HubSpot", detail: "Après validation", state: "pending" },
     replyState === "sent" ? { label: "Réponse", detail: "Envoyée", state: "done" }

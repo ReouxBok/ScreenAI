@@ -8,11 +8,9 @@ import type { SavTicketPreview } from "@/lib/sav/manual-ticket-preview";
 import type { SavHumanProcess } from "@/lib/sav/human-process";
 import { prepareTicketPreviewAction, confirmTicketPreviewAction } from "../ticket-preview-actions";
 import styles from "./ticket-selector.module.css";
+import { savTicketStageLabel } from "./ticket-status-label";
 
 type Ticket = SavLifecycleTicket & { subject: string; updatedAt?: string | null };
-export function savTicketStageLabel(ticket: Pick<Ticket, "status" | "stageId">) {
-  return ticket.status === "closed" ? "Fermé" : ({ "1": "Nouveau", "2": "En attente du client", "3": "En attente de l’équipe" } as Record<string, string>)[ticket.stageId ?? ""] ?? "Statut à vérifier";
-}
 export function TicketSelector({ threadId, reviewId, tickets, linkedTicketId, suggestedTicketId, newTicketTitle, crmReady, completed, pending, blockedReason, humanChoice }: {
   threadId: string; reviewId: string | null; tickets: Ticket[]; linkedTicketId: string | null; suggestedTicketId: string | null;
   newTicketTitle: string; crmReady: boolean; completed: boolean; pending: boolean; blockedReason?: string | null; humanChoice?: SavHumanProcess;
