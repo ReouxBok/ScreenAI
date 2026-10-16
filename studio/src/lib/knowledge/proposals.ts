@@ -25,6 +25,7 @@ const draftDocumentSchema = canonicalKnowledgeSchema.safeExtend({
   steps: z.array(semanticStepSchema.extend({ userLabel: z.string().trim().max(500), objective: z.string().trim().max(500), instruction: z.string().trim().max(2000) })).max(50),
 });
 const proposalSchema = z.object({
+  preparationKind: z.literal("diagnostic_enrichment").optional(),
   draftId: z.uuid().optional(), expectedRevision: z.number().int().positive().optional(),
   mode: z.enum(["new", "improve"]), targetItemId: z.uuid().nullable().optional(),
   title: z.string().trim().max(500), document: draftDocumentSchema,
@@ -65,7 +66,7 @@ async function targetState(itemId: string | null | undefined, db: Db = requireDb
   if (!itemId) return { item: null, base: null, active: null, activeVersion: null };
   const query = db.select().from(contentItems).where(eq(contentItems.id, itemId));
   const [item] = await (lock ? query.for("update") : query);
-  if (!item || item.agentKey !== "sav" || item.type !== "article" || item.status === "archived") throw new Error("SAV_KNOWLEDGE_SCOPE_REQUIRED");
+  if (!item || item.slug === "sav-master-playbook" || item.agentKey !== "sav" || item.type !== "article" || item.status === "archived") throw new Error("SAV_KNOWLEDGE_SCOPE_REQUIRED");
   const [active] = await db.select().from(savKnowledgeActivations).where(eq(savKnowledgeActivations.itemId, item.id));
   const [base] = item.currentDraftVersionId || item.publishedVersionId ? await db.select().from(contentVersions).where(eq(contentVersions.id, (item.currentDraftVersionId ?? item.publishedVersionId)!)) : [];
   const [version] = active ? await db.select().from(contentVersions).where(eq(contentVersions.id, active.versionId)) : [];
@@ -101,14 +102,14 @@ async function sourceFingerprint(sources: SavKnowledgeSource[], db: Db = require
   }
   return savContentHash(proofs);
 }
-export async function saveSavKnowledgeProposal(raw: SaveSavKnowledgeProposalInput, actorEmail: string) {
+export async function saveSavKnowledgeProposal(raw: SaveSavKnowledgeProposalInput, actorEmail: string, transaction?: Tx) {
   assertSavActor(actorEmail);
   const input = proposalSchema.parse(raw);
   assertSafeKnowledgeDraft({ ...input.document, objective: input.title });
   assertSafeKnowledgeDraft(input.document);
   if (input.sources.some((source) => source.ref.startsWith("sav-learning:") && source.ref !== `sav-learning:${input.learningCandidateId}`)) throw new Error("KNOWLEDGE_LEARNING_ORIGIN_REQUIRED");
   if (input.learningCandidateId) assertKnowledgeUgoApproval(actorEmail);
-  return requireDb().transaction(async (tx) => {
+  const persist = async (tx: Tx) => {
     if (!input.draftId && input.learningCandidateId) {
       await lockWorkspaceLearningSource(input.learningCandidateId, tx);
       await tx.select().from(savLearningCandidates).where(eq(savLearningCandidates.id, input.learningCandidateId)).for("update");
@@ -120,6 +121,13 @@ export async function saveSavKnowledgeProposal(raw: SaveSavKnowledgeProposalInpu
     if (existing && existing.createdBy !== actorEmail && actorEmail !== "ugo@limova.ai") throw new Error("KNOWLEDGE_DRAFT_OWNER_REQUIRED");
     if (existing && (existing.learningCandidateId ?? null) !== (input.learningCandidateId ?? null)) throw new Error("KNOWLEDGE_ORIGIN_IMMUTABLE");
     const target = await targetState(input.targetItemId, tx, true);
+    if (input.preparationKind === "diagnostic_enrichment") {
+      if (input.mode !== "improve" || !target.active || target.item!.publishedVersionId !== target.active.versionId
+        || target.item!.currentDraftVersionId && target.item!.currentDraftVersionId !== target.active.versionId
+        || !input.sources.some(source => source.ref === `content:${target.item!.id}:${target.active!.versionId}`)) throw new Error("KNOWLEDGE_SOURCE_STALE");
+      const [retained] = await tx.select().from(savKnowledgeProposalDrafts).where(and(eq(savKnowledgeProposalDrafts.targetItemId, target.item!.id), eq(savKnowledgeProposalDrafts.status, "draft"))).limit(1);
+      if (retained) return toSavKnowledgeDraft(retained);
+    }
     const learning = input.learningCandidateId ? await readSavLearningEvidence(input.learningCandidateId, tx, true) : null;
     const values = { mode: input.mode, targetItemId: input.targetItemId ?? null, baseVersionId: target.base?.id ?? null, activeVersionId: target.active?.versionId ?? null,
       title: target.base?.metadata.sourceMetadata?.importKind === "onboarding_catalog" ? target.item!.title : input.title,
@@ -128,7 +136,8 @@ export async function saveSavKnowledgeProposal(raw: SaveSavKnowledgeProposalInpu
     const [draft] = existing ? await tx.update(savKnowledgeProposalDrafts).set(values).where(eq(savKnowledgeProposalDrafts.id, existing.id)).returning() : await tx.insert(savKnowledgeProposalDrafts).values({ ...values, createdBy: actorEmail }).returning();
     await tx.insert(auditLogs).values({ actorEmail, action: "sav_knowledge_proposal_saved", entityType: "knowledge_draft", entityId: draft.id, technicalMetadata: { revision: draft.revision, targetItemId: draft.targetItemId, origin: draft.origin } });
     return toSavKnowledgeDraft(draft);
-  });
+  };
+  return transaction ? persist(transaction) : requireDb().transaction(persist);
 }
 function completeness(document: CanonicalKnowledge, sources: SavKnowledgeSource[], reason: string) {
   return [!canonicalKnowledgeSchema.safeParse(document).success && "Compléter l’objectif, les intitulés et les instructions des étapes.", !sources.length && "Ajouter au moins une source de preuve.", reason.trim().length < 10 && "Expliquer le motif de la proposition.", !document.steps.length && "Décrire la procédure.", !document.expectedResult && "Préciser le résultat attendu.", !document.prerequisites.length && "Préciser les conditions d’utilisation.", !document.escalation && "Préciser les limites et le passage à un humain.", document.steps.some((step) => !step.expectedResult) && "Préciser le résultat observable de chaque étape."].filter((value): value is string => Boolean(value));
@@ -195,7 +204,7 @@ export async function submitSavKnowledgeProposal(input: { draftId: string; snaps
     const proposed = parseContentInput({ type: "article", slug: preview.target.item?.slug ?? `sav-${family!.id}`, locale: document.locale, title: draft.title, summary: document.objective, categorySlug: "depannage", visibility: "charly_only", agentKey: "sav", ownerEmail: preview.target.item?.ownerEmail ?? actorEmail, bodyMarkdown: savProjectionBody(document), changeNote: draft.reason,
       metadata: { intents: [document.objective, ...(document.supportContext?.symptoms ?? [])], limovaPaths: [], prerequisites: document.prerequisites, expectedResult: document.expectedResult, troubleshooting: document.escalation, semanticSteps: document.steps,
         sourceMetadata: { importKind: "sav_workspace", knowledgeTitle: draft.title, canonicalFamilyId: family!.id, canonicalRevisionId: revision.id, canonicalObjective: document.objective, proposalDraftId: draft.id, sourceId: source.id, origin: draft.origin },
-        resolution: { ...inheritedResolution, ...(document.supportContext?.responseTemplate ? { responseTemplate: document.supportContext.responseTemplate } : {}), ...(document.validUntil ? { validUntil: document.validUntil } : {}), symptoms: document.supportContext?.symptoms ?? [document.objective], steps: document.steps.map((step) => step.instruction), exceptions: document.exceptions, escalation: document.escalation, productVersion: document.productVersion, supersedes: [], conflictsWith: [] } } });
+        resolution: { ...inheritedResolution, diagnostic: document.diagnostic, ...(document.supportContext?.responseTemplate ? { responseTemplate: document.supportContext.responseTemplate } : {}), ...(document.validUntil ? { validUntil: document.validUntil } : {}), symptoms: document.supportContext?.symptoms ?? [document.objective], steps: document.steps.map((step) => step.instruction), exceptions: document.exceptions, escalation: document.escalation, productVersion: document.productVersion, supersedes: [], conflictsWith: [] } } });
     const [candidate] = await tx.insert(knowledgeProjectionCandidates).values({ familyId: family!.id, revisionId: revision.id, sourceId: source.id, targetSurface: "sav", targetItemId: draft.targetItemId, baseVersionId: draft.baseVersionId, status: "pending", explanation: draft.reason, proposedInput: proposed, diff: { before: preview.activeVersion?.body ?? preview.target.base?.bodyMarkdown ?? "", after: proposed.bodyMarkdown }, createdBy: actorEmail }).returning();
     await tx.update(savKnowledgeProposalDrafts).set({ status: "submitted", candidateId: candidate.id, updatedAt: new Date() }).where(eq(savKnowledgeProposalDrafts.id, draft.id));
     await tx.insert(auditLogs).values({ actorEmail, action: "sav_knowledge_proposal_submitted", entityType: "knowledge_candidate", entityId: candidate.id, technicalMetadata: { draftId: draft.id, revision: draft.revision, familyId: family!.id, origin: draft.origin, sourceId: source.id } });

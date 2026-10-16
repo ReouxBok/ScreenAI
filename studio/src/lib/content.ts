@@ -1,5 +1,6 @@
 import { z } from "zod";
 import { AGENTS } from "./agents";
+import { diagnosticKnowledgeSchema } from "./knowledge/diagnostic-contract";
 import { semanticStepSchema } from "./knowledge/contracts";
 
 export const CATEGORIES = [
@@ -26,6 +27,7 @@ export const articleMetadataSchema = z.object({
   troubleshooting: z.string().trim().max(10000).default(""),
   sourceMetadata: z.record(z.string(), z.unknown()).optional(),
   resolution: z.object({
+    diagnostic: diagnosticKnowledgeSchema.optional(),
     audience: z.enum(["support", "lead"]).optional(),
     responseTemplate: z.string().trim().min(20).max(8000).optional(),
     symptoms: stringList,

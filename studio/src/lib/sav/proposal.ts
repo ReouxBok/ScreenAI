@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { savHarnessTraceSchema } from "./request-planner";
 import type { SavDecisionEvidence } from "@/db/schema";
 import type { SavAnalysis } from "./intelligence";
 import type { SavDossierContext } from "./dossier-context";
@@ -9,6 +10,7 @@ import { savHumanProcessSchema } from "./human-process";
 export const savReplyAssessmentSchema = z.object({
   kind: z.enum(["contextualized", "finance_standard", "lead_template", "human_handoff", "unavailable", "forbidden", "none"]),
   coverage: savReplyCoverageSchema,
+  harness: savHarnessTraceSchema.optional(),
   errorCode: z.string().nullable(),
   coherence: z.object({
     transport: savAiTransportTraceSchema.optional(),

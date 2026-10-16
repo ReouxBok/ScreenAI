@@ -1,6 +1,6 @@
 import "server-only";
 
-import { and, desc, eq, inArray, max, sql } from "drizzle-orm";
+import { and, desc, eq, inArray, max, ne, sql } from "drizzle-orm";
 import { requireDb } from "@/db";
 import {
   activeKnowledge,
@@ -30,9 +30,14 @@ function revisionId() {
   return `kb_${date}_${now.getTime().toString(36)}`;
 }
 
+function assertGeneralContentScope(item: { slug: string } | undefined) {
+  if (item?.slug === "sav-master-playbook") throw new Error("SAV_PLAYBOOK_DEDICATED_WORKSPACE_REQUIRED");
+}
+
 export type WorkflowTransaction = Parameters<Parameters<ReturnType<typeof requireDb>["transaction"]>[0]>[0];
 export async function saveDraft(rawInput: unknown, actorEmail: string, itemId?: string, transaction?: WorkflowTransaction) {
   const input = parseContentInput(rawInput);
+  assertGeneralContentScope(input);
   const db = requireDb();
   const [category] = await (transaction ?? db).select().from(categories).where(eq(categories.slug, input.categorySlug)).limit(1);
   if (!category) throw new Error("CATEGORY_NOT_FOUND");
@@ -41,7 +46,8 @@ export async function saveDraft(rawInput: unknown, actorEmail: string, itemId?: 
     let item: typeof contentItems.$inferSelect;
     if (itemId) {
       [item] = await tx.select().from(contentItems).where(eq(contentItems.id, itemId)).for("update");
-      if (!item) throw new Error("CONTENT_NOT_FOUND");
+      assertGeneralContentScope(item);
+  if (!item) throw new Error("CONTENT_NOT_FOUND");
       const versionIds = [item.currentDraftVersionId, item.publishedVersionId].filter((id): id is string => Boolean(id));
       const versions = versionIds.length ? await tx.select().from(contentVersions).where(inArray(contentVersions.id, versionIds)) : [];
       const catalogueVersion = versions.find((version) => version.id === item.currentDraftVersionId && version.metadata.sourceMetadata?.importKind === "onboarding_catalog")
@@ -95,6 +101,7 @@ export async function saveDraft(rawInput: unknown, actorEmail: string, itemId?: 
 export async function submitForReview(itemId: string, actorEmail: string, comment: string) {
   const db = requireDb();
   const [item] = await db.select().from(contentItems).where(eq(contentItems.id, itemId)).limit(1);
+  assertGeneralContentScope(item);
   if (!item?.currentDraftVersionId) throw new Error("DRAFT_NOT_FOUND");
   await db.transaction(async (tx) => {
     await tx.update(contentItems).set({ status: "in_review", updatedAt: new Date() }).where(eq(contentItems.id, itemId));
@@ -106,6 +113,7 @@ export async function rejectReview(itemId: string, actorEmail: string, comment: 
   if (comment.trim().length < 3) throw new Error("COMMENT_REQUIRED");
   const db = requireDb();
   const [item] = await db.select().from(contentItems).where(eq(contentItems.id, itemId)).limit(1);
+  assertGeneralContentScope(item);
   if (!item?.currentDraftVersionId || item.status !== "in_review") throw new Error("CONTENT_NOT_IN_REVIEW");
   await db.transaction(async (tx) => {
     await tx.update(contentItems).set({ status: "draft", updatedAt: new Date() }).where(eq(contentItems.id, itemId));
@@ -116,6 +124,7 @@ export async function rejectReview(itemId: string, actorEmail: string, comment: 
 async function prepareVersion(itemId: string, actorEmail: string, expectedVersionId?: string) {
   const db = requireDb();
   const [item] = await db.select().from(contentItems).where(eq(contentItems.id, itemId)).limit(1);
+  assertGeneralContentScope(item);
   if (!item?.currentDraftVersionId) throw new Error("DRAFT_NOT_FOUND");
   const [version] = await db.select().from(contentVersions).where(eq(contentVersions.id, item.currentDraftVersionId)).limit(1);
   if (!version) throw new Error("VERSION_NOT_FOUND");
@@ -207,6 +216,7 @@ export async function rollback(itemId: string, versionId: string, actorEmail: st
   if (reason.trim().length < 10) throw new Error("ROLLBACK_REASON_REQUIRED");
   const db = requireDb();
   const [item] = await db.select().from(contentItems).where(eq(contentItems.id, itemId)).limit(1);
+  assertGeneralContentScope(item);
   if (!item) throw new Error("CONTENT_NOT_FOUND");
   const [version] = await db.select().from(contentVersions).where(and(eq(contentVersions.id, versionId), eq(contentVersions.itemId, itemId))).limit(1);
   if (!version) throw new Error("VERSION_NOT_FOUND");
@@ -239,8 +249,11 @@ export async function archiveContent(itemId: string, actorEmail: string, reason:
   const db = requireDb();
   const revision = revisionId();
   await db.transaction(async (tx) => {
+    const [retained] = await tx.select().from(contentItems).where(eq(contentItems.id, itemId)).for("update");
+    assertGeneralContentScope(retained);
     const [item] = await tx.update(contentItems).set({ status: "archived", updatedAt: new Date() }).where(eq(contentItems.id, itemId)).returning();
-    if (!item) throw new Error("CONTENT_NOT_FOUND");
+    assertGeneralContentScope(item);
+  if (!item) throw new Error("CONTENT_NOT_FOUND");
     await tx.insert(knowledgeRevisions).values({ id: revision, actorEmail });
     await tx.insert(activeKnowledge).values({ singleton: true, revisionId: revision }).onConflictDoUpdate({ target: activeKnowledge.singleton, set: { revisionId: revision, updatedAt: new Date() } });
     await tx.insert(reviewEvents).values({ itemId, versionId: item.publishedVersionId, action: "archived", actorEmail, comment: reason });
@@ -252,7 +265,8 @@ export async function deleteContent(itemId: string, actorEmail: string) {
   const revision = revisionId();
   return db.transaction(async (tx) => {
     const [item] = await tx.select().from(contentItems).where(eq(contentItems.id, itemId)).limit(1);
-    if (!item) throw new Error("CONTENT_NOT_FOUND");
+    assertGeneralContentScope(item);
+  if (!item) throw new Error("CONTENT_NOT_FOUND");
 
     // The template stores content ids inside versioned JSON. Protect both the
     // active draft and active published template from dangling references.
@@ -289,6 +303,7 @@ export async function deleteContent(itemId: string, actorEmail: string) {
 
 export async function setContentAiEnabled(itemId: string, enabled: boolean, actorEmail: string, activation?: { expectedPublishedVersionId: string; expectedActiveVersionId: string | null }) {
   const [scope] = await requireDb().select().from(contentItems).where(eq(contentItems.id, itemId));
+  assertGeneralContentScope(scope);
   if (scope?.agentKey === "sav") {
     assertKnowledgeUgoApproval(actorEmail);
     if (enabled) {
@@ -317,7 +332,8 @@ export async function setContentAiEnabled(itemId: string, enabled: boolean, acto
     }
     const [item] = await tx.update(contentItems).set({ aiEnabled: enabled, updatedAt: new Date() })
       .where(eq(contentItems.id, itemId)).returning();
-    if (!item) throw new Error("CONTENT_NOT_FOUND");
+    assertGeneralContentScope(item);
+  if (!item) throw new Error("CONTENT_NOT_FOUND");
     await tx.insert(auditLogs).values({
       actorEmail,
       action: enabled ? "ai_content_enabled" : "ai_content_disabled",
@@ -348,6 +364,7 @@ export async function listContent() {
     .leftJoin(savKnowledgeActivations, eq(savKnowledgeActivations.itemId, contentItems.id))
     .leftJoin(categories, eq(contentItems.categoryId, categories.id))
     .leftJoin(contentVersions, eq(contentItems.currentDraftVersionId, contentVersions.id))
+    .where(ne(contentItems.slug, "sav-master-playbook"))
     .orderBy(desc(contentItems.updatedAt));
 }
 

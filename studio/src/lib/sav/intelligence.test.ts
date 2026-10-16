@@ -1,10 +1,13 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { analyzeSavMessage, type SavEvaluationResources } from "./intelligence";
+import { defaultSavPlaybook } from "./playbook-contract";
 import { savSemanticPlan, type SavUnderstandingV1 } from "./understanding";
 import { coverageFixture, geminiFixture, understandingFixture } from "../../../test/sav-understanding-fixtures";
 import type { SavAgentOutput } from "./agent/contracts";
 
-const deps = vi.hoisted(() => ({ search: vi.fn(), agent: vi.fn(), crm: vi.fn(), understand: vi.fn(), coherence: vi.fn() }));
+const deps = vi.hoisted(() => ({ search: vi.fn(), agent: vi.fn(), crm: vi.fn(), understand: vi.fn(), coherence: vi.fn(), playbook: vi.fn(), retrieval: vi.fn() }));
+vi.mock("./playbook", () => ({ readActiveSavPlaybook: deps.playbook }));
+vi.mock("./request-retrieval-db", () => ({ searchSavKnowledgeByRequest: deps.retrieval }));
 vi.mock("@/lib/search", () => ({ searchKnowledge: deps.search }));
 vi.mock("./agent/orchestrator", () => ({ runSavAdkAgent: deps.agent }));
 vi.mock("./hubspot", () => ({ readSavHubspotContext: deps.crm }));
@@ -28,6 +31,8 @@ function evaluation(mode: typeof modes[number], network: typeof fetch): SavEvalu
   return { apiKey: "fixture-key", model: "fixture-model", mode, pilot: mode === "pilot", searchKnowledge: deps.search, readHubspotContext: deps.crm, fetch: network };
 }
 beforeEach(() => {
+  deps.playbook.mockResolvedValue({ versionId: "fixture-playbook", version: 1, document: defaultSavPlaybook });
+  deps.retrieval.mockImplementation(async input => ({ contractRevision: "fixture", revision: "fixture-kb", requests: input.requests.map((r: { id: string }) => ({ requestId: r.id, status: "no_source", candidateKeys: [], limitations: [] })), sources: [], alerts: [], metrics: { attempts: 1, queryCount: 1, embeddingBatchesUpperBound: 1, serializedBytes: 100, contextTextTokensUpperBound: 100 } }));
   vi.stubEnv("SAV_AI_ANALYSIS", "true"); vi.stubEnv("SAV_GEMINI_API_KEY", "fixture-key");
   deps.search.mockResolvedValue({ revision: "fixture-kb", results: [] });
   deps.crm.mockResolvedValue({ contactFound: true, contactId: "fixture-contact", tickets: [], routing: { kind: "new", reason: "fixture" } });
@@ -55,6 +60,16 @@ describe("SAV shared semantic pipeline with synthetic provider outputs", () => {
     const result = await analyzeSavMessage({ from: "fixture@example.invalid", subject: "Support", body: "Le produit ne fonctionne pas." });
     expect(result.understanding?.status).toBe("qualified");
     expect(network).toHaveBeenCalledOnce(); expect(deps.agent).not.toHaveBeenCalled();
+  });
+  it("retains rejected source alerts and the plan when model composition is disabled", async () => {
+    vi.stubEnv("SAV_AI_ANALYSIS", "false");
+    deps.understand.mockResolvedValue(understandingFixture());
+    deps.search.mockResolvedValue({ revision: "fixture-kb", results: [{ id: "expired-card", contentVersionId: "expired-v1", title: "Procédure fictive périmée", content: "Ouvrez le contrôle fictif.", score: .9, verifiedAt: new Date().toISOString(), resolution: { steps: ["Ouvrez le contrôle fictif."], validUntil: "2020-01-01" } }] });
+    const network = vi.fn();
+    const result = await analyzeSavMessage(input, { evaluation: evaluation("off", network) });
+    expect(result.replyAssessment?.harness?.retrievalAlerts).toContainEqual({ code: "expired", sourceKey: "expired-card:expired-v1" });
+    expect(result.replyAssessment?.harness?.plans[0]).toMatchObject({ mode: "knowledge_gap", nextCheck: null });
+    expect(network).not.toHaveBeenCalled();
   });
   it.each(modes)("preserves a content-matched existing issue with a generic email subject in %s", async mode => {
     const u = understandingFixture(); deps.understand.mockResolvedValue(u); deps.agent.mockResolvedValue(adkResult(u));
@@ -94,7 +109,7 @@ describe("SAV shared semantic pipeline with synthetic provider outputs", () => {
     const answer = { ...outputFor(u), ticketRequired: false, requiresHuman: false };
     deps.agent.mockResolvedValue({ ...adkResult(u), output: answer });
     const result = await analyzeSavMessage(input, { evaluation: evaluation(mode, vi.fn<typeof fetch>(async () => geminiFixture(answer))) });
-    expect(result.proposal.kind).toBe("ticket_pending");
+    expect(result.proposal.kind).toBe(mode === "off" ? "human_review_required" : "ticket_pending");
     expect(result.ticketRouting?.kind).toBe("new");
   });
   it.each(modes)("understands once before retrieval and preserves technical meaning in %s", async mode => {
@@ -193,15 +208,16 @@ describe("SAV shared semantic pipeline with synthetic provider outputs", () => {
     expect(result.proposal.reasonCode).toBe("agent_runtime_degraded"); expect(result.replyAssessment?.kind).toBe("human_handoff");
     expect(deps.agent).toHaveBeenCalledOnce(); expect(network).not.toHaveBeenCalled(); expect(deps.search).not.toHaveBeenCalled();
   });
-  it("retains both claims and the exact version when two claims cite the same card", async () => {
+  it("retains the exact source version for the server-selected next control", async () => {
     const u = understandingFixture(); deps.understand.mockResolvedValue(u);
     const first = "Consultez le panneau de diagnostic fictif."; const second = "Relevez le code d’erreur affiché dans ce panneau.";
     deps.search.mockResolvedValue({ revision: "fixture-kb", results: [{ id: "card", contentVersionId: "card-version-1", title: "Procédure fictive", content: `${first}\n${second}`, score: 0.9, verifiedAt: new Date().toISOString(), resolution: { steps: [first, second], conflictsWith: [] } }] });
     const answer = outputFor(u); answer.responseKind = "solution";
-    answer.coverage[0] = { ...answer.coverage[0], kind: "solution", text: `${first} ${second}`, sourceIds: ["card"] }; answer.replyDraft = answer.coverage[0].text;
+    answer.coverage[0] = { ...answer.coverage[0], kind: "solution", text: "Vous signalez un problème technique.", sourceIds: ["card"] }; answer.replyDraft = answer.coverage[0].text;
     answer.citations = [{ sourceId: "card", claim: "Ouvrir le diagnostic", quote: first }, { sourceId: "card", claim: "Relever le code", quote: second }];
     const result = await analyzeSavMessage(input, { evaluation: evaluation("off", vi.fn<typeof fetch>(async () => geminiFixture(answer))) });
-    expect(result.replyDraft).toBe(answer.replyDraft);
+    expect(result.replyDraft).toContain(first);
+    expect(result.replyAssessment?.harness?.plans[0].nextCheck?.instruction).toBe(first);
     expect(result.evidence.filter(e => e.sourceId === "card")).toEqual(expect.arrayContaining([
       expect.objectContaining({ contentVersionId: "card-version-1", claim: "Ouvrir le diagnostic", excerpt: first }),
       expect.objectContaining({ contentVersionId: "card-version-1", claim: "Relever le code", excerpt: second }),
@@ -213,7 +229,7 @@ describe("SAV shared semantic pipeline with synthetic provider outputs", () => {
     answer.citations = [{ sourceId: "missing-card", claim: "Cliquer sur ce bouton", quote: "Une quote qui n’a jamais été fournie." }];
     const result = await analyzeSavMessage(input, { evaluation: evaluation("off", vi.fn<typeof fetch>(async () => geminiFixture(answer))) });
     expect(result.replyDraft).not.toContain("bouton inventé"); expect(result.replyAssessment?.kind).toBe("human_handoff");
-    expect(deps.coherence).not.toHaveBeenCalled(); expect(result.diagnostics?.some(d => d.errorCode === "SAV_UNKNOWN_EVIDENCE")).toBe(true);
+    expect(deps.coherence).not.toHaveBeenCalled(); expect(result.diagnostics?.some(d => d.errorCode === "SAV_REPLY_OUTSIDE_REQUEST_PLAN")).toBe(true);
   });
   it.each([{ messageId: "fixture" }, { pilotBatchId: "fixture" }])("forbids any persisted identity on an evaluation run: %j", async persisted => {
     await expect(analyzeSavMessage(input, { ...persisted, evaluation: evaluation("off", vi.fn()) })).rejects.toThrow("SAV_EVALUATION_PERSISTENCE_FORBIDDEN");

@@ -370,8 +370,17 @@ test("la trame publiée hiérarchise les contenus et devient le template de Char
 
   await page.goto(`/studio/contenus/${template.steps[0].contentItemId}`);
   await page.getByText("Supprimer",{exact:true}).click();
-  await page.getByRole("button",{name:"Confirmer la suppression"}).click();
+  // The click can finish before the Server Action redirects and streams its UI.
+  // Wait for the actual refusal, including a native form POST before hydration.
+  await Promise.all([
+    page.waitForURL(url => url.pathname === `/studio/contenus/${template.steps[0].contentItemId}`
+      && url.searchParams.get("delete") === "used-in-template", { timeout: 30_000 }),
+    page.getByRole("button",{name:"Confirmer la suppression"}).click(),
+  ]);
   await expect(page.getByText("Ce contenu est utilisé dans la trame d’onboarding. Retirez-le d’abord de la trame, puis republiez celle-ci.")).toBeVisible();
+  const retainedTemplate = await request.get("/api/internal/onboarding/template", { headers: { Authorization: "Bearer e2e-service-token-that-is-at-least-32-characters" } });
+  expect(retainedTemplate.ok()).toBe(true);
+  expect(await retainedTemplate.json()).toEqual(template);
 });
 
 test("un membre crée, finalise et transforme son tutoriel sans accéder à celui d’un collègue",async({browser})=>{

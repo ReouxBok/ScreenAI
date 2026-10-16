@@ -27,7 +27,11 @@ try {
   // local CRM snapshot. The V0 inbox scenario covers unavailable CRM instead.
   // No provider is called; preview preparation still requires its own preflight.
   const supportContext = { version: 1, messageId, collectedAt: "2026-10-02T12:00:00Z", customerIdentity: { kind: "sender", email: thread.customerEmail },
-    crm: { status: "ready", errorCode: null, data: { errorCode: null, contactFound: true, contactId: "999001", identityCandidates: [], tickets: [], routing: { kind: "new", reason: "no_open_ticket", candidateIds: [] } } },
+    crm: { status: "ready", errorCode: null, data: { errorCode: null, contactFound: true, contactId: "999001", identityCandidates: [], tickets: [
+      { id: "999101", subject: "Connexion VPN fictive", description: "Cas synthétique", status: "open", stageId: "2", pipelineId: "0", ownerName: "Support fixture", ownerId: "999201", createdAt: "2026-10-01T12:00:00Z", updatedAt: "2026-10-02T12:00:00Z" },
+      { id: "999102", subject: "Facture fictive", description: "Cas synthétique", status: "open", stageId: "1", pipelineId: "0", ownerName: "Comptabilité fixture", ownerId: "999202", createdAt: "2026-10-01T12:00:00Z", updatedAt: "2026-10-02T12:00:00Z" },
+      { id: "999103", subject: "Export PDF fictif fermé", description: "Cas synthétique", status: "closed", stageId: "4", pipelineId: "0", ownerName: "Support fixture", ownerId: "999201", createdAt: "2026-09-01T12:00:00Z", updatedAt: "2026-10-01T12:00:00Z" },
+    ], routing: { kind: "new", reason: "no_open_ticket", candidateIds: [] } } },
     conversation: null, conversationError: null, otherConversations: [], otherConversationsError: null };
   const [message] = await db.insert(savMessages).values({ id: messageId, mailboxId: mailbox.id, threadId: thread.id, gmailMessageId: "synthetic-sav44-message", direction: "inbound", fromEmail: thread.customerEmail, toEmails: [mailbox.email], subject: thread.subject, bodyCiphertext: encryptFixture({ text: SAV_SEMANTIC_E2E_BODY, supportContext }), receivedAt: new Date("2026-10-02T12:00:00Z"), analysisStatus: "done", processedAt: new Date("2026-10-02T12:00:01Z") }).returning();
   const [run] = await db.insert(savAgentRuns).values({ messageId: message.id, runtime: "synthetic_fixture", mode: "off", status: "succeeded", model: "synthetic-e2e-model", promptRevision: "synthetic-e2e-prompt", codeRevision: "a".repeat(40), dataOrigin: "test", inputHash: "synthetic-input", proposalCiphertext: encryptFixture(proposal), completedAt: new Date("2026-10-02T12:00:01Z") }).returning();

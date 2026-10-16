@@ -2,12 +2,12 @@ import { z } from "zod";
 import { normalizeSavEvidenceText, savEvidenceContains } from "./evidence-text";
 import { cleanSavModelDraft } from "./reply-format";
 
-export const SAV_UNDERSTANDING_REVISION = "sav-understanding-2026-10-16.v3";
-export const SAV_UNDERSTANDING_PROMPT_REVISION = "sav-understanding-prompt-2026-10-16.v4";
+export const SAV_UNDERSTANDING_REVISION = "sav-understanding-2026-10-16.v5";
+export const SAV_UNDERSTANDING_PROMPT_REVISION = "sav-understanding-prompt-2026-10-16.v6";
 const id = z.string().trim().min(1).max(100);
 const ids = z.array(id).max(30);
 export const savRequestNatureSchema = z.enum(["technical", "account", "integration", "how_to", "financial_operation", "financial_data", "cancellation", "commercial", "partnership", "callback", "human_request", "security", "privacy", "data_deletion", "legal", "acknowledgement", "non_support", "unknown"]);
-const fact = z.object({ id, key: id, text: z.string().trim().min(1).max(1000), evidenceIds: ids.min(1) }).strict();
+const fact = z.object({ id, key: id, requestIds: ids.optional(), checkId: id.nullable().optional(), checkCardId: id.nullable().optional(), checkVersionId: id.nullable().optional(), outcome: z.enum(["expected", "not_expected", "unknown"]).nullable().optional(), text: z.string().trim().min(1).max(1000), evidenceIds: ids.min(1) }).strict();
 
 /** Meaning first. Categories and reply permissions are computed separately below. */
 export const savUnderstandingContentSchema = z.object({
@@ -36,6 +36,7 @@ export const savUnderstandingSchema = savUnderstandingContentSchema.extend({
     transport: savAiTransportTraceSchema.optional(),
     finishReason: z.string().optional(), blockReason: z.string().optional(), thoughtTokens: z.number().nonnegative().optional(),
     normalizationRevision: z.string().optional(),
+    playbookVersionId: z.string().optional(),
     removedKnownQuestions: z.number().int().nonnegative().optional(),
     validationRepair: z.object({ attempted: z.literal(true), succeeded: z.boolean(), originalErrorCode: z.string(), errorCode: z.string().nullable(), originalOutputHash: z.string(), repairedOutputHash: z.string().nullable(), transport: savAiTransportTraceSchema.optional() }).strict().optional(),
   }).strict(),
@@ -69,6 +70,8 @@ export function validateSavUnderstanding(raw: unknown, sources: SavUnderstanding
   }
   for (const item of [...u.requests, ...u.knownFacts, ...u.attemptedSteps]) {
     if (item.evidenceIds.some(e => !evidence.has(e))) fail();
+    if ("requestIds" in item && item.requestIds?.some(r => !requestIds.has(r))) fail();
+    if (item.evidenceIds.every(e => evidence.get(e)?.sourceId === "diagnostic_checks")) fail();
   }
   if (u.customerRelationship && (u.customerRelationship.evidenceIds.some(e => !evidence.has(e)) || (u.customerRelationship.kind !== "unknown" && !u.customerRelationship.evidenceIds.length))) fail();
   for (const r of u.requests) {
@@ -76,6 +79,17 @@ export function validateSavUnderstanding(raw: unknown, sources: SavUnderstanding
     if (!r.evidenceIds.some(e => evidence.get(e)?.source === "current_message")) fail();
     const financial = ["financial_operation", "financial_data"].includes(r.nature);
     if (financial !== (r.financialScope === "support_account")) fail();
+  }
+  for (const attempt of u.attemptedSteps) if (attempt.checkId || attempt.checkCardId || attempt.checkVersionId || attempt.outcome === "expected" || attempt.outcome === "not_expected") {
+    if (!attempt.checkId) fail();
+    const reference = sources.find(source => source.sourceId === "diagnostic_checks" && source.source === "history");
+    let checks: Array<{ cardId?: string; id: string; versionId: string }> = [];
+    try { checks = z.object({ checks: z.array(z.object({ cardId: z.string().optional(), id: z.string(), versionId: z.string() })) }).parse(JSON.parse(reference?.text ?? "{}")).checks; } catch { /* No validated diagnostic reference is available. */ }
+    const referenced = checks.find(check => check.id === attempt.checkId && check.versionId === attempt.checkVersionId);
+    if (!referenced || attempt.checkCardId && referenced.cardId !== attempt.checkCardId) fail();
+    // Scope comes from the server-owned sent-control reference, never a guessed model key.
+    if (referenced?.cardId) attempt.checkCardId = referenced.cardId;
+    if (!attempt.evidenceIds.some(id => { const proof = evidence.get(id); const source = sources.find(s => s.sourceId === proof?.sourceId && s.source === proof?.source); return proof?.source === "current_message" || source?.text.startsWith("[inbound]"); })) fail();
   }
   for (const item of [...u.missingInformation, ...u.uncertainties]) if (item.requestIds.some(r => !requestIds.has(r))) fail();
   // Only redundant questions are recoverable locally, after every reference
@@ -107,10 +121,11 @@ export function savSemanticPlan(u: SavUnderstandingV1): SavSemanticPlan {
   const category: SavSemanticPlan["category"] = nature === "technical" || nature === "account" || nature === "integration" || nature === "how_to" || nature === "acknowledgement" ? nature
     : nature === "financial_operation" || nature === "financial_data" ? "billing" : "other";
   const base = { category, requiresHuman: true, ticketRequired: true, retrievalQuery: u.requests.map(r => [r.product, r.feature, r.summary].filter(Boolean).join(" — ")).join("\n").slice(0, 2000) };
-  if (u.status !== "qualified") return { ...base, replyPolicy: "none", reasonCode: u.status === "unavailable" ? "understanding_unavailable" : "understanding_needs_clarification" };
+  if (u.status === "unavailable" || u.language === "unknown" || !u.requests.length) return { ...base, replyPolicy: "none", reasonCode: u.status === "unavailable" ? "understanding_unavailable" : "understanding_needs_clarification" };
   if (u.requests.some(r => r.nature === "cancellation")) return { ...base, replyPolicy: "none", reasonCode: "cancellation_human_only" };
   if (u.requests.some(r => ["financial_operation", "financial_data"].includes(r.nature))) return { ...base, replyPolicy: "none", reasonCode: "finance_human_only" };
   if (u.requests.some(r => r.nature === "legal")) return { ...base, replyPolicy: "none", reasonCode: "legal_human_only" };
+  if (u.status === "needs_clarification") return { ...base, replyPolicy: "compose", reasonCode: "safe_clarification_required" };
   if (u.requests.every(r => ["partnership", "acknowledgement"].includes(r.nature)) && u.requests.some(r => r.nature === "partnership")) return { ...base, replyPolicy: "none", ticketRequired: false, reasonCode: "partnership_human_forward" };
   if (u.requests.every(r => r.nature === "commercial")) return u.customerRelationship?.kind === "prospect"
     ? { ...base, replyPolicy: "lead_template", ticketRequired: false, reasonCode: "lead_product_information" }

@@ -50,8 +50,9 @@ describe("SAV semantic server policy", () => {
     u.requests.push({ ...u.requests[0], id: "setup", nature: "integration" });
     expect(savSemanticPlan(u)).toMatchObject({ replyPolicy: "compose", ticketRequired: true, requiresHuman: true });
   });
-  it.each(["needs_clarification", "unavailable"] as const)("never composes for status %s", status => {
-    expect(savSemanticPlan(understandingFixture({ status }))).toMatchObject({ replyPolicy: "none", requiresHuman: true });
+  it("keeps unavailable understanding blocked and permits only supervised clarification for a proven current request", () => {
+    expect(savSemanticPlan(understandingFixture({ status: "unavailable" }))).toMatchObject({ replyPolicy: "none", requiresHuman: true });
+    expect(savSemanticPlan(understandingFixture({ status: "needs_clarification" }))).toMatchObject({ replyPolicy: "compose", requiresHuman: true, reasonCode: "safe_clarification_required" });
   });
   it.each(["human_request", "callback", "security", "privacy", "data_deletion", "legal"] as const)("retains review for %s without erasing the draft policy", nature => {
     const u = understandingFixture(); u.requests[0].nature = nature;

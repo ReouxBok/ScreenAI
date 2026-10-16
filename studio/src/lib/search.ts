@@ -58,6 +58,7 @@ export async function searchKnowledge(rawInput: unknown) {
       WHERE ${consumedVersion} IS NOT NULL
         AND item.status <> 'archived'
         AND item.ai_enabled = true
+        AND item.slug <> 'sav-master-playbook'
         AND ${input.scope === "sav" ? sql`item.agent_key = 'sav'` : sql`item.agent_key <> 'sav'`}
         AND ${input.scope === "sav" ? savResolutionIsCurrent : sql`TRUE`}
         AND ${audienceFilter}
@@ -134,6 +135,7 @@ export async function searchKnowledge(rawInput: unknown) {
       AND ${consumedVersion} IS NOT NULL
       AND item.status <> 'archived'
       AND item.ai_enabled = true
+        AND item.slug <> 'sav-master-playbook'
       AND item.locale = ${input.locale}
       AND ${input.scope === "sav" ? sql`item.agent_key = 'sav'` : sql`item.agent_key <> 'sav'`}
       AND ${input.scope === "sav" ? savResolutionIsCurrent : sql`TRUE`}
