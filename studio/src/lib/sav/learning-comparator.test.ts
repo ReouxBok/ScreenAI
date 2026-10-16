@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { validateSavLearningComparison, type SavLearningComparisonInput } from "./learning-comparator";
+import { compareSavLearningResolution, validateSavLearningComparison, type SavLearningComparisonInput } from "./learning-comparator";
 
 const input: SavLearningComparisonInput = {
   sourceRef: "hubspot:synthetic-1", subject: "Connexion API", resolution: "Ugo a régénéré la clé API puis la connexion a fonctionné.",
@@ -13,6 +13,18 @@ const decision = {
 };
 
 describe("SAV learning comparator evidence contract", () => {
+  it("keeps its strict single call and authenticates by header without a key in the URL", async () => {
+    let calls = 0;
+    const result = await compareSavLearningResolution(input, { apiKey: "synthetic-header-key", model: "fixture", fetch: async (url, init) => {
+      calls++;
+      expect(String(url)).not.toContain("key=");
+      expect(String(url)).not.toContain("synthetic-header-key");
+      expect(new Headers(init?.headers).get("x-goog-api-key")).toBe("synthetic-header-key");
+      return Response.json({ candidates: [{ finishReason: "STOP", content: { parts: [{ text: JSON.stringify(decision) }] } }] });
+    } });
+    expect(calls).toBe(1);
+    expect(result.decision).toEqual(decision);
+  });
   it("accepts a synthetic proposal only when its quote and group are grounded in supplied evidence", () => {
     expect(validateSavLearningComparison(decision, input)).toEqual(decision);
   });

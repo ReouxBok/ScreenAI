@@ -10,7 +10,7 @@ import { backfillHubspotTickets } from './hubspot';
 import { paginateSavKnowledge } from '@/lib/knowledge/workspace';
 import { decryptSavPayload, encryptSavPayload } from './crypto';
 
-const state=vi.hoisted(()=>({db:null as unknown, inventory:[] as Array<{ref:string;versionId:string;title:string;body:string}>, payloads:[] as Record<string,unknown>[], match:null as string|null, beforeResponse:null as null|(()=>Promise<void>)}));
+const state=vi.hoisted(()=>({db:null as unknown, inventory:[] as Array<{ref:string;versionId:string;title:string;body:string}>, payloads:[] as Record<string,unknown>[], match:null as string|null, coveredCandidate:null as string|null, beforeResponse:null as null|(()=>Promise<void>)}));
 vi.mock('@/db',()=>({requireDb:()=>state.db}));
 vi.mock('@/lib/knowledge/hubspot-import',async(importOriginal)=>({...await importOriginal<typeof import('@/lib/knowledge/hubspot-import')>(),knowledgeComparisonInventory:async()=>structuredClone(state.inventory)}));
 let f:Awaited<ReturnType<typeof createSavTestDb>>;
@@ -21,7 +21,7 @@ function input(n:number,origin:'hubspot'|'observation'='hubspot') {return {ticke
 const modelFetch=vi.fn(async(_url:unknown,init?:RequestInit)=>{
  const request=JSON.parse(String(init?.body));const p=JSON.parse(request.contents[0].parts[0].text);state.payloads.push(p);
  if(state.beforeResponse)await state.beforeResponse();
- const decision={outcome:state.match?'amendment':'new',matchedRef:state.match,groupSignature:p.subject,subject:p.subject,resolution:p.resolution,conditions:['Connexion du produit fictif uniquement'],expectedResult:'La connexion est rétablie',limitations:['Escalader si la connexion échoue'],evidenceRef:p.evidence.ref,evidenceExcerpt:p.resolution.slice(0,80),rationale:'Action humaine observée et résultat reproductible dans ce cas synthétique.'};
+ const decision={outcome:state.coveredCandidate?'already_covered':state.match?'amendment':'new',matchedRef:state.coveredCandidate??state.match,groupSignature:p.subject,subject:p.subject,resolution:p.resolution,conditions:['Connexion du produit fictif uniquement'],expectedResult:'La connexion est rétablie',limitations:['Escalader si la connexion échoue'],evidenceRef:p.evidence.ref,evidenceExcerpt:p.resolution.slice(0,80),rationale:'Action humaine observée et résultat reproductible dans ce cas synthétique.'};
  return new Response(JSON.stringify({candidates:[{finishReason:'STOP',content:{parts:[{text:JSON.stringify(decision)}]}}],usageMetadata:{promptTokenCount:10,candidatesTokenCount:20}}));
 });
 async function run(i:ReturnType<typeof input>,at=now){
@@ -39,7 +39,7 @@ beforeEach(async()=>{
  await f.client.exec('TRUNCATE sav.learning_candidates, sav.learning_admission_signals, sav.learning_admission_stats, sav.learning_admission_reservations, sav.learning_admission_cases, sav.learning_model_usage, sav.sync_state, sav.ticket_snapshots, content_items, categories, audit_logs, active_knowledge, knowledge_revisions CASCADE');
  vi.stubEnv('SAV_ENCRYPTION_KEY_V1','independent-review-synthetic-key-2026');vi.stubEnv('SAV_GEMINI_API_KEY','synthetic-only-key');vi.stubEnv('SAV_RELEASE_STAGE','v0');vi.stubEnv('HUBSPOT_ACCESS_TOKEN','synthetic-only-token');
  vi.stubGlobal('fetch',()=>{throw new Error('UNEXPECTED_NETWORK');});
- state.inventory=[];state.payloads=[];state.match=null;state.beforeResponse=null;modelFetch.mockClear();
+ state.inventory=[];state.payloads=[];state.match=null;state.coveredCandidate=null;state.beforeResponse=null;modelFetch.mockClear();
  await activateSavLearningCutover(boundary,'ugo@limova.ai');
 });
 
@@ -250,3 +250,50 @@ it('F2 reclaims a crashed worker only after expiry and fences its late completio
  expect(await f.db.select().from(savLearningAdmissionReservations)).toHaveLength(1);
  expect(modelFetch).toHaveBeenCalledTimes(1);
 });
+
+
+it('review regression: includes a pending candidate with NULL rejection kind and groups a differently phrased proof', async()=>{
+ const first=await run({...input(130),subject:'Rétablir la connexion du produit fictif'});
+ expect(first).toMatchObject({disposition:'admitted'});
+ const candidateId=String((first as {candidateId:string}).candidateId);
+ state.coveredCandidate=`candidate:${candidateId}`;
+ const second=await run({...input(131),subject:'Reconnexion après réparation de la configuration'});
+ expect(state.payloads[1].openCandidates).toEqual(expect.arrayContaining([expect.objectContaining({ref:`candidate:${candidateId}`})]));
+ expect(second).toMatchObject({disposition:'grouped',candidateId,caseCount:2});
+ expect(await f.db.select().from(savLearningCandidates)).toHaveLength(1);
+ expect(await f.db.select().from(savLearningAdmissionReservations)).toHaveLength(1);
+});
+
+it('review regression: invalidates comparison when a pending NULL-rejection candidate appears during the model call', async()=>{
+ state.beforeResponse=async()=>{
+  await f.db.insert(savLearningCandidates).values({sourceRef:'human:concurrent-synthetic',sourceContentHash:'concurrent-synthetic',createdBy:'human',status:'pending',
+   proposedPatch:{ciphertext:encryptSavPayload({subject:'Procédure humaine concurrente',finalHumanResolution:resolution})},explanation:'Fixture synthétique concurrente'});
+ };
+ expect(await run(input(132))).toMatchObject({disposition:'signal',reasonCode:'comparison_context_changed'});
+ expect(await f.db.select().from(savLearningCandidates)).toHaveLength(1);
+ expect(await f.db.select().from(savLearningAdmissionReservations)).toHaveLength(0);
+});
+
+it.skipIf(!process.env.SAV_TEST_POSTGRES_URL)('native review contention: aborts without waiting, releases the claim and resumes once', async()=>{
+ const first=await run(input(140));
+ const candidateId=String((first as {candidateId:string}).candidateId);
+ let ready!:()=>void, release!:()=>void;
+ const locked=new Promise<void>(resolve=>{ready=resolve;});
+ const released=new Promise<void>(resolve=>{release=resolve;});
+ const holder=f.db.transaction(async tx=>{
+  await tx.select().from(savLearningCandidates).where(eq(savLearningCandidates.id,candidateId)).for('update');
+  ready(); await released;
+ });
+ await locked;
+ try {
+  const attempt=run(input(141));
+  await expect(attempt).rejects.toMatchObject({cause:expect.objectContaining({code:'55P03'})});
+  const attempts=await f.db.select().from(savLearningAdmissionAttempts);
+  expect(attempts.find(row=>row.sourceRef===input(141).sourceRef)).toMatchObject({state:'retryable',comparisonLeaseToken:null});
+  expect(await f.db.select().from(savLearningCandidates)).toHaveLength(1);
+  expect(await f.db.select().from(savLearningAdmissionReservations)).toHaveLength(1);
+ } finally { release(); await holder; }
+ expect(await run(input(141))).toMatchObject({disposition:'admitted'});
+ expect(await f.db.select().from(savLearningCandidates)).toHaveLength(2);
+ expect(await f.db.select().from(savLearningAdmissionReservations)).toHaveLength(2);
+},15000);

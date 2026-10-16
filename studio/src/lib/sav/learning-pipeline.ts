@@ -1,5 +1,5 @@
 import "server-only";
-import { and, count, eq, inArray, isNotNull, ne, or } from "drizzle-orm";
+import { and, count, eq, inArray, isNotNull, isNull, ne, or } from "drizzle-orm";
 import { requireDb } from "@/db";
 import { contentItems, knowledgeProjectionCandidates, savLearningAdmissionAttempts, savLearningAdmissionCases, savLearningCandidates, savObservationCycles, savResolutionObservations } from "@/db/schema";
 import { knowledgeComparisonInventory } from "@/lib/knowledge/hubspot-import";
@@ -23,9 +23,8 @@ async function comparisonContext(db: Pick<Db, "select"> = requireDb()) {
   if (inventory.length > 100) throw new Error("SAV_LEARNING_COMPARATOR_CONTEXT_INCOMPLETE");
   const rows = await db.select().from(savLearningCandidates).where(and(
     or(isNotNull(savLearningCandidates.admissionGroupKey), eq(savLearningCandidates.createdBy, "human")),
-    ne(savLearningCandidates.rejectionKind, "superseded"),
+    or(isNull(savLearningCandidates.rejectionKind), ne(savLearningCandidates.rejectionKind, "superseded")),
   )).orderBy(savLearningCandidates.id).limit(101);
-  // SQL NULL is not equal to 'superseded'; include it explicitly below instead.
   return buildComparisonContext(inventory, rows);
 }
 async function buildComparisonContext(inventory: Awaited<ReturnType<typeof knowledgeComparisonInventory>>, rows: Array<typeof savLearningCandidates.$inferSelect>) {
@@ -103,9 +102,11 @@ export async function processSavLearningResolution(input: SavLearningResolutionI
       await finishSavLearningComparisonTx(tx, claim.signalId, { reasonCode: "source_changed", state: "signal" }, now, claim.leaseToken);
       return { disposition: "signal" as const, reasonCode: "source_changed" };
     }
-    await tx.select({ id: contentItems.id }).from(contentItems).for("share");
-    await tx.select({ id: knowledgeProjectionCandidates.id }).from(knowledgeProjectionCandidates).for("share");
-    await tx.select({ id: savLearningCandidates.id }).from(savLearningCandidates).for("share");
+    // A human review can own candidate/projection before its content item. Never
+    // wait in the reverse order: abort and release this comparison for a later invocation.
+    await tx.select({ id: contentItems.id }).from(contentItems).for("share", { noWait: true });
+    await tx.select({ id: knowledgeProjectionCandidates.id }).from(knowledgeProjectionCandidates).for("share", { noWait: true });
+    await tx.select({ id: savLearningCandidates.id }).from(savLearningCandidates).for("share", { noWait: true });
     const finish = (reasonCode: string, candidateId: string | null = null, groupKey: string | null = null) => finishSavLearningComparisonTx(tx, claim.signalId, {
       reasonCode, candidateId, groupKey, state: candidateId ? "open" : "signal", comparatorRevision: comparison.revision, promptRevision: comparison.promptRevision,
       modelName: comparison.model, inputHash: comparison.inputHash, inputTokens: comparison.inputTokens, outputTokens: comparison.outputTokens, durationMs: comparison.durationMs,
