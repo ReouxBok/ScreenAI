@@ -5,7 +5,8 @@ import { auditLogs, categories, contentItems, contentVersions, knowledgeFamilies
 import { parseContentInput } from "@/lib/content";
 import { savContentHash } from "@/lib/sav/crypto";
 import { assertKnowledgeCandidateReview, canonicalKnowledgeSchema } from "./contracts";
-import { savProjectionBody } from "./conversion";
+import { createSavDeliveryEnvelope, readSavDeliveryEnvelope, savDeliveryMetadata } from "./delivery-envelope";
+import { savQualifiedProjectionBody, savProjectionBody } from "./conversion";
 import { prepareHubspotReview } from "./hubspot-import";
 import { prepareOnboardingReview } from "./onboarding-import";
 import { assertCompleteOnboardingKnowledge, assertSafeOnboardingKnowledge } from "./onboarding-extraction";
@@ -97,13 +98,15 @@ export async function reviewKnowledgeCandidate(candidateId: string, input: { exp
       }
     }
     const original = parseContentInput(candidate.proposedInput);
+    const qualifiedDelivery = source.evidence.importKind === "sav_workspace" && source.evidence.delivery
+      ? savDeliveryMetadata(document, createSavDeliveryEnvelope(document, readSavDeliveryEnvelope(canonicalKnowledgeSchema.parse(originalRevision.document), source.evidence.delivery).qualification)) : null;
     // Removing the canonical expiry must also clear the candidate projection.
     const inheritedResolution = { ...("resolution" in original.metadata ? original.metadata.resolution : {}) };
     delete inheritedResolution.validUntil;
-    const proposed = parseContentInput({ ...original, ...(catalog ? { title: source.evidence.sourceTitle } : comparisonReview ? { title: document.objective } : {}), summary: document.objective, bodyMarkdown: savProjectionBody(document), metadata: {
+    const proposed = parseContentInput({ ...original, ...(catalog ? { title: source.evidence.sourceTitle } : comparisonReview ? { title: document.objective } : {}), summary: document.objective, bodyMarkdown: qualifiedDelivery ? savQualifiedProjectionBody(document) : savProjectionBody(document), metadata: {
       ...original.metadata, semanticSteps: document.steps, prerequisites: document.prerequisites, expectedResult: document.expectedResult, troubleshooting: document.escalation,
-      sourceMetadata: { ...original.metadata.sourceMetadata, canonicalRevisionId: revision.id, canonicalObjective: document.objective, approvedCandidateId: candidate.id, ...(comparisonReview ? { comparisonReview } : {}) },
-      resolution: { ...inheritedResolution, diagnostic: document.diagnostic, ...(document.supportContext?.responseTemplate ? { responseTemplate: document.supportContext.responseTemplate } : {}), symptoms: document.supportContext?.symptoms ?? [document.objective], steps: document.steps.map((step) => step.instruction), exceptions: document.exceptions, escalation: document.escalation, productVersion: document.productVersion, ...(document.validUntil ? { validUntil: document.validUntil } : {}), supersedes: [], conflictsWith: [] },
+      sourceMetadata: { ...original.metadata.sourceMetadata, ...(qualifiedDelivery ? { savDelivery: qualifiedDelivery.envelope } : {}), canonicalRevisionId: revision.id, canonicalObjective: document.objective, approvedCandidateId: candidate.id, ...(comparisonReview ? { comparisonReview } : {}) },
+      resolution: { ...inheritedResolution, ...(qualifiedDelivery ? { delivery: qualifiedDelivery.projection } : {}), diagnostic: document.diagnostic, ...(document.supportContext?.responseTemplate ? { responseTemplate: document.supportContext.responseTemplate } : {}), symptoms: document.supportContext?.symptoms ?? [document.objective], steps: document.steps.map((step) => step.instruction), exceptions: document.exceptions, escalation: document.escalation, productVersion: document.productVersion, ...(document.validUntil ? { validUntil: document.validUntil } : {}), supersedes: [], conflictsWith: [] },
     } });
     if (catalog && proposed.bodyMarkdown.length > 12_000) throw new Error("ONBOARDING_PROCEDURE_TOO_LONG");
     if (!catalog && comparisonReview && proposed.bodyMarkdown.length > 12_000) throw new Error("HUBSPOT_PROCEDURE_TOO_LONG");

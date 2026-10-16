@@ -78,6 +78,7 @@ export type ArticleMetadata = {
   troubleshooting: string;
   sourceMetadata?: Record<string, unknown>;
   resolution?: {
+    delivery?: import("@/lib/knowledge/support-delivery").SavSupportDeliveryProjection;
     diagnostic?: DiagnosticKnowledge;
     audience?: "support" | "lead";
     responseTemplate?: string;

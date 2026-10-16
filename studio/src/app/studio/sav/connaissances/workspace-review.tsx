@@ -3,6 +3,7 @@
 import { useRef, useState, useTransition } from "react";
 import { useRouter } from "next/navigation";
 import type { CanonicalKnowledge } from "@/lib/knowledge/contracts";
+import { DeliveryPreview } from "./delivery-editor";
 import { KnowledgeDocument } from "./knowledge-document";
 import { KnowledgeEditor, cleanKnowledgeDocument } from "./knowledge-editor";
 import { activateKnowledgeWorkspaceAction, previewKnowledgeReviewAction, publishKnowledgeWorkspaceAction, reviewKnowledgeWorkspaceAction, startKnowledgeRevisionAction } from "./workspace-actions";
@@ -30,7 +31,7 @@ export function KnowledgeWorkspaceReview({ candidateId, revisionId, initialDocum
     <details><summary>Corriger la proposition</summary><KnowledgeEditor disabled={busy} document={document} onChange={next => { setDocument(next); setPreview(null); setAcknowledged(false); }}/></details>
     <button className="secondary" disabled={busy} onClick={() => run(async () => { setPreview(null); setAcknowledged(false); const result = await previewKnowledgeReviewAction(candidateId, cleanKnowledgeDocument(document)); setPreview(result.preview); setError(result.error ?? ""); })}>{busy ? "Vérification…" : "Vérifier les sources et comparer"}</button>
     {preview && <section aria-live="polite"><h3>Comparaison courante</h3><p>La version active et les sources seront revérifiées lors de la décision.</p>
-      <div className={styles.comparison}><section><h3>Version active conservée</h3><pre className={styles.text}>{preview.activeVersion?.body ?? "Aucune version active."}</pre></section><section><h3>Proposition corrigée</h3><KnowledgeDocument document={cleanKnowledgeDocument(document)}/></section></div>
+      <div className={styles.comparison}><section><h3>Version active conservée</h3><pre className={styles.text}>{preview.activeVersion?.body ?? "Aucune version active."}</pre></section><section><h3>Proposition corrigée</h3><KnowledgeDocument document={cleanKnowledgeDocument(document)}/><DeliveryPreview document={cleanKnowledgeDocument(document)} delivery={preview.delivery}/></section></div>
       {preview.missing.length > 0 && <ul className={styles.alert}>{preview.missing.map(entry => <li key={entry}>{entry}</li>)}</ul>}
       {preview.comparison.map(finding => <details key={`${finding.ref}:${finding.versionId}`}><summary>{finding.title} · {finding.signal === "duplicate" ? "Doublon possible" : "Sujet proche"}</summary><p>{finding.explanation}</p><pre className={styles.text}>{finding.body}</pre></details>)}
       <label className={styles.choice}><input type="checkbox" checked={acknowledged} disabled={busy} onChange={event => setAcknowledged(event.target.checked)}/>J’ai vérifié les sources, la version active et les différences de cette proposition.</label>

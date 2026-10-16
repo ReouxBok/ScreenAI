@@ -45,7 +45,7 @@ export async function loadKnowledgeTargetAction(itemId: string) {
 }
 export async function previewKnowledgeReviewAction(candidateId: string, document?: Parameters<typeof previewSavKnowledgeReview>[2]) {
   const staff = await requireSavApiStaff();
-  try { const { snapshot, comparison, missing, activeVersion } = await previewSavKnowledgeReview(candidateId, staff.email, document); return { preview: { snapshot, comparison, missing, activeVersion }, error: null }; }
+  try { const { snapshot, comparison, missing, activeVersion, delivery } = await previewSavKnowledgeReview(candidateId, staff.email, document); return { preview: { snapshot, comparison, missing, activeVersion, delivery }, error: null }; }
   catch (error) { return { preview: null, error: message(error) }; }
 }
 export async function reviewKnowledgeWorkspaceAction(input: Parameters<typeof reviewSavKnowledgeProposal>[0]) {

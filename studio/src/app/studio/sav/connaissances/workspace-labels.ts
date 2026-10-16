@@ -19,6 +19,7 @@ export function safeKnowledgeReturn(value?: string) {
   try { const url = new URL(value, "https://studio.invalid"); return url.origin === "https://studio.invalid" && url.pathname === "/studio/sav/connaissances" ? `${url.pathname}${url.search}` : "/studio/sav/connaissances"; } catch { return "/studio/sav/connaissances"; }
 }
 export function knowledgeErrorMessage(code: string) {
+  if (/SAV_DELIVERY/.test(code)) return "La restitution doit être qualifiée ou relue. Affectez chaque étape à un objectif client ou au SAV ; séparez les variantes et vérifiez l’aperçu. Si le contenu a changé, préparez une nouvelle révision.";
   if (/FORBIDDEN|UGO_APPROVAL|ACCESS|UNAUTHORIZED/.test(code)) return "Cette action est réservée à un compte autorisé. La publication et l’activation sont réservées à Ugo.";
   if (/STALE|CHANGED|CONFLICT/.test(code)) return "La proposition, sa source ou la version active a changé. Rechargez la fiche et comparez les versions avant de confirmer à nouveau. La version active est conservée.";
   if (/SOURCE|EVIDENCE|INCOMPLETE|COMPLETION|MISSING/.test(code)) return "Les sources ou les informations nécessaires sont incomplètes. Complétez la proposition avant de la soumettre ou de la valider.";

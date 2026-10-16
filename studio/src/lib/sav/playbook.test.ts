@@ -1,3 +1,5 @@
+import { eq } from "drizzle-orm";
+import { contentVersions } from "@/db/schema";
 import { afterAll, beforeAll, beforeEach, expect, it, vi } from "vitest";
 import { createSavTestDb } from "../../../test/sav-db";
 import { saveSavPlaybook, reviewSavPlaybook, activateSavPlaybook, readActiveSavPlaybook, getSavPlaybookWorkspace } from "./playbook";
@@ -57,4 +59,29 @@ it("keeps the master prompt out of product inventories and prevents generic publ
   expect(await knowledgeComparisonInventory()).toEqual([]); expect(await listContent()).toEqual([]);
   await expect(publish(workspace.itemId!, "ugo@limova.ai")).rejects.toThrow("SAV_PLAYBOOK_DEDICATED_WORKSPACE_REQUIRED");
   await expect(setContentAiEnabled(workspace.itemId!, true, "ugo@limova.ai")).rejects.toThrow("SAV_PLAYBOOK_DEDICATED_WORKSPACE_REQUIRED");
+});
+
+it("round-trips a long single prompt with exact layout, facts, review and explicit activation", async () => {
+  const prompt = ("Méthode fictive : comprendre la demande puis citer la source.\n\n".repeat(85)).trim();
+  expect(prompt.length).toBeGreaterThan(4000);
+  const saved = await saveSavPlaybook({ document: defaultSavPlaybook, prompt, expectedDraftId: null }, "ugo@limova.ai");
+  const workspace = await getSavPlaybookWorkspace("ugo@limova.ai");
+  expect(workspace.versions[0].prompt).toBe(prompt);
+  const persisted = workspace.versions[0].document;
+  expect(persisted.tone.length).toBeLessThanOrEqual(2000); expect(persisted.handling.length).toBeLessThanOrEqual(3000); expect(persisted.escalation.length).toBeLessThanOrEqual(1500);
+  expect(persisted.facts).toEqual(defaultSavPlaybook.facts);
+  expect(savPlaybookSchema.parse(persisted)).toEqual(persisted);
+  expect((await readActiveSavPlaybook()).version).toBe(0);
+  await reviewSavPlaybook(saved, "ugo@limova.ai"); await activateSavPlaybook({ ...saved, expectedActiveId: null }, "ugo@limova.ai");
+  expect(renderSavPlaybook(await readActiveSavPlaybook(), ["general"]).text).toContain(prompt);
+  await expect(saveSavPlaybook({ document: defaultSavPlaybook, prompt: "x".repeat(6001), expectedDraftId: saved.versionId }, "ugo@limova.ai")).rejects.toThrow();
+});
+
+it("keeps a valid historical 6504-character concatenation readable and activatable", async () => {
+  const saved = await saveSavPlaybook({ document: defaultSavPlaybook, expectedDraftId: null }, "ugo@limova.ai");
+  const legacy = savPlaybookSchema.parse({ ...defaultSavPlaybook, tone: "a ".repeat(999) + "aa", handling: "b ".repeat(1499) + "bb", escalation: "c ".repeat(749) + "cc" });
+  await f.db.update(contentVersions).set({ metadata: { intents: [], limovaPaths: [], prerequisites: [], expectedResult: "", troubleshooting: "", sourceMetadata: { kind: "sav_playbook", playbook: legacy } } }).where(eq(contentVersions.id, saved.versionId));
+  await reviewSavPlaybook(saved, "ugo@limova.ai"); await activateSavPlaybook({ ...saved, expectedActiveId: null }, "ugo@limova.ai");
+  expect(renderSavPlaybook(await readActiveSavPlaybook(), ["general"]).text).toContain(legacy.handling);
+  expect((await getSavPlaybookWorkspace("ugo@limova.ai")).versions[0].prompt.length).toBe(6504);
 });

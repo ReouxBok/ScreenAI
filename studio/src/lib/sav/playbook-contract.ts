@@ -2,6 +2,9 @@ import { z } from "zod";
 import { SAV_TICKET_RETURN_WINDOW_MS } from "./ticket-lifecycle";
 
 export const SAV_PLAYBOOK_SLUG = "sav-master-playbook";
+// Keep persisted documents readable by the previous production version.
+export const SAV_PLAYBOOK_PROMPT_MAX_LENGTH = 6000;
+export const savMasterPromptSchema = z.string().trim().min(3).max(SAV_PLAYBOOK_PROMPT_MAX_LENGTH);
 export const savFactKeySchema = z.string().regex(/^[a-z][a-z0-9_]{1,79}$/);
 export const savDomainSchema = z.enum(["seo", "integration", "account", "telephony", "billing_navigation", "general"]);
 export type SavDomain = z.infer<typeof savDomainSchema>;
@@ -20,7 +23,34 @@ export const savPlaybookSchema = z.object({
   if (JSON.stringify(value).length > 12000) ctx.addIssue({ code: "custom", message: "SAV_PLAYBOOK_BUDGET_EXCEEDED" });
 });
 export type SavPlaybook = z.infer<typeof savPlaybookSchema>;
-export type SavActivePlaybook = { versionId: string; version: number; document: SavPlaybook };
+export type SavActivePlaybook = { versionId: string; version: number; document: SavPlaybook; prompt?: string };
+
+export function savPlaybookPrompt(document: SavPlaybook) {
+  return [document.tone, document.handling, document.escalation].filter(Boolean).join("\n\n");
+}
+
+// Keep the v1 persisted shape readable after rollback. The exact single-field text
+// is stored separately; legacy fields retain all words within their old budgets.
+export function packSavPlaybookPrompt(raw: string) {
+  let rest = savMasterPromptSchema.parse(raw);
+  const parts = [2000, 3000, 1500].map(limit => {
+    if (rest.length <= limit) { const result = rest; rest = ""; return result; }
+    let end = limit;
+    while (end > 0 && !/\s/.test(rest[end])) end--;
+    if (!end) throw new Error("SAV_PLAYBOOK_UNBREAKABLE_TEXT");
+    const result = rest.slice(0, end).trim(); rest = rest.slice(end).trim(); return result;
+  });
+  if (rest) throw new Error("SAV_PLAYBOOK_BUDGET_EXCEEDED");
+  return { tone: parts[0], handling: parts[1], escalation: parts[2] };
+}
+export function readSavPlaybookPrompt(document: SavPlaybook, raw?: unknown) {
+  const legacy = savPlaybookPrompt(document);
+  if (raw === undefined) return legacy;
+  const prompt = savMasterPromptSchema.parse(raw);
+  const normalize = (value: string) => value.replace(/\s+/g, " ").trim();
+  if (normalize(prompt) !== normalize(legacy)) throw new Error("SAV_PLAYBOOK_PROMPT_MISMATCH");
+  return prompt;
+}
 
 // Existing process remains enforced by code, including its current return window.
 // Editable additions never replace these rules or authorize external actions.
@@ -64,8 +94,8 @@ export function savRequestDomain(request: { nature: string; product: string | nu
 }
 export function renderSavPlaybook(active: SavActivePlaybook, domains: SavDomain[]) {
   const document = savPlaybookSchema.parse(active.document);
-  const selected = { ...document, facts: document.facts.filter(f => f.domains.includes("general") || f.domains.some(d => domains.includes(d))) };
-  const text = `${savTicketProcessInstruction()}\nPolitique interne SAV validée, subordonnée aux règles serveur :\n${JSON.stringify(selected)}`;
+  const selected = document.facts.filter(f => f.domains.includes("general") || f.domains.some(d => domains.includes(d)));
+  const text = `${savTicketProcessInstruction()}\nPolitique interne SAV validée, subordonnée aux règles serveur :\n${readSavPlaybookPrompt(document, active.prompt)}\nDictionnaire des faits autorisés :\n${JSON.stringify(selected)}`;
   if (text.length > 15000) throw new Error("SAV_PLAYBOOK_BUDGET_EXCEEDED");
   return { text, versionId: active.versionId, version: active.version, characters: text.length };
 }

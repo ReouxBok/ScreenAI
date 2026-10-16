@@ -1,5 +1,5 @@
 import "server-only";
-import { and, desc, eq, max } from "drizzle-orm";
+import { and, desc, eq, max, sql } from "drizzle-orm";
 import { z } from "zod";
 import { requireDb } from "@/db";
 import { auditLogs, contentItems, contentVersions, knowledgeFamilies, knowledgeFamilyRevisions, knowledgeFamilySources, knowledgeProjectionCandidates, knowledgeProjections, savKnowledgeActivations, savKnowledgeProposalDrafts, savLearningCandidates, savObservationCycles, savResolutionObservations, savResolutionEvidence } from "@/db/schema";
@@ -11,12 +11,14 @@ import { assertSavLearningAdmitted } from "@/lib/sav/learning-origin";
 import { assertSavCrmLearningSource } from "@/lib/sav/learning-source";
 import { assertKnowledgeCandidateReview, assertKnowledgeUgoApproval, canonicalKnowledgeSchema, semanticStepSchema, type CanonicalKnowledge } from "./contracts";
 import { assertSafeKnowledgeDraft, assertSafeOnboardingKnowledge } from "./onboarding-extraction";
-import { savProjectionBody } from "./conversion";
+import { savQualifiedProjectionBody as savProjectionBody } from "./conversion";
 import { knowledgeComparisonInventory, prepareHubspotReview } from "./hubspot-import";
 import { prepareOnboardingReview } from "./onboarding-import";
 import { compareKnowledge } from "./hubspot-input";
 import { reviewKnowledgeCandidate } from "./review";
 import type { SavKnowledgeDraft, SavKnowledgeSource, SavKnowledgeVersion } from "./workspace-contract";
+import { assertSavSupportDelivery, savSupportDeliverySchema, unclassifiedSavDelivery } from "./support-delivery";
+import { createSavDeliveryEnvelope, readSavDeliveryEnvelope, savDeliveryHash, savDeliveryMetadata } from "./delivery-envelope";
 
 type Db = Pick<ReturnType<typeof requireDb>, "select">;
 type Tx = Parameters<Parameters<ReturnType<typeof requireDb>["transaction"]>[0]>[0];
@@ -25,6 +27,7 @@ const draftDocumentSchema = canonicalKnowledgeSchema.safeExtend({
   steps: z.array(semanticStepSchema.extend({ userLabel: z.string().trim().max(500), objective: z.string().trim().max(500), instruction: z.string().trim().max(2000) })).max(50),
 });
 const proposalSchema = z.object({
+  delivery: savSupportDeliverySchema.optional(),
   preparationKind: z.literal("diagnostic_enrichment").optional(),
   draftId: z.uuid().optional(), expectedRevision: z.number().int().positive().optional(),
   mode: z.enum(["new", "improve"]), targetItemId: z.uuid().nullable().optional(),
@@ -35,6 +38,15 @@ const proposalSchema = z.object({
 export type SaveSavKnowledgeProposalInput = z.input<typeof proposalSchema>;
 export function toSavKnowledgeDraft(row: typeof savKnowledgeProposalDrafts.$inferSelect): SavKnowledgeDraft {
   return { ...row, mode: row.mode as "new" | "improve", origin: row.origin as "human" | "automatic" | "unknown", document: draftDocumentSchema.parse(row.document) };
+}
+async function draftWithDelivery(row: typeof savKnowledgeProposalDrafts.$inferSelect, db: Db) {
+  const draft = toSavKnowledgeDraft(row);
+  const [saved] = await db.select().from(auditLogs).where(and(eq(auditLogs.entityId, row.id), eq(auditLogs.action, "sav_knowledge_proposal_saved"), sql`${auditLogs.technicalMetadata}->>'revision' = ${String(row.revision)}`)).orderBy(desc(auditLogs.createdAt)).limit(1);
+  let delivery = unclassifiedSavDelivery;
+  if (saved?.technicalMetadata.revision === row.revision && saved.technicalMetadata.delivery) {
+    try { delivery = readSavDeliveryEnvelope(draft.document, typeof saved.technicalMetadata.delivery === "string" ? JSON.parse(saved.technicalMetadata.delivery) : saved.technicalMetadata.delivery).qualification; } catch { /* A changed/legacy draft must be qualified again. */ }
+  }
+  return { ...draft, delivery };
 }
 export async function lockWorkspaceLearningSource(id: string, db: Db) {
   const [learning] = await db.select().from(savLearningCandidates).where(eq(savLearningCandidates.id, id));
@@ -105,6 +117,7 @@ async function sourceFingerprint(sources: SavKnowledgeSource[], db: Db = require
 export async function saveSavKnowledgeProposal(raw: SaveSavKnowledgeProposalInput, actorEmail: string, transaction?: Tx) {
   assertSavActor(actorEmail);
   const input = proposalSchema.parse(raw);
+  const delivery = assertSavSupportDelivery(input.document, input.delivery ?? unclassifiedSavDelivery);
   assertSafeKnowledgeDraft({ ...input.document, objective: input.title });
   assertSafeKnowledgeDraft(input.document);
   if (input.sources.some((source) => source.ref.startsWith("sav-learning:") && source.ref !== `sav-learning:${input.learningCandidateId}`)) throw new Error("KNOWLEDGE_LEARNING_ORIGIN_REQUIRED");
@@ -114,7 +127,7 @@ export async function saveSavKnowledgeProposal(raw: SaveSavKnowledgeProposalInpu
       await lockWorkspaceLearningSource(input.learningCandidateId, tx);
       await tx.select().from(savLearningCandidates).where(eq(savLearningCandidates.id, input.learningCandidateId)).for("update");
       const [prior] = await tx.select().from(savKnowledgeProposalDrafts).where(eq(savKnowledgeProposalDrafts.learningCandidateId, input.learningCandidateId));
-      if (prior) return toSavKnowledgeDraft(prior);
+      if (prior) return draftWithDelivery(prior, tx);
     }
     const [existing] = input.draftId ? await tx.select().from(savKnowledgeProposalDrafts).where(eq(savKnowledgeProposalDrafts.id, input.draftId)).for("update") : [];
     if (input.draftId && (!existing || existing.revision !== input.expectedRevision || existing.status !== "draft")) throw new Error("KNOWLEDGE_DRAFT_STALE");
@@ -126,7 +139,7 @@ export async function saveSavKnowledgeProposal(raw: SaveSavKnowledgeProposalInpu
         || target.item!.currentDraftVersionId && target.item!.currentDraftVersionId !== target.active.versionId
         || !input.sources.some(source => source.ref === `content:${target.item!.id}:${target.active!.versionId}`)) throw new Error("KNOWLEDGE_SOURCE_STALE");
       const [retained] = await tx.select().from(savKnowledgeProposalDrafts).where(and(eq(savKnowledgeProposalDrafts.targetItemId, target.item!.id), eq(savKnowledgeProposalDrafts.status, "draft"))).limit(1);
-      if (retained) return toSavKnowledgeDraft(retained);
+      if (retained) return draftWithDelivery(retained, tx);
     }
     const learning = input.learningCandidateId ? await readSavLearningEvidence(input.learningCandidateId, tx, true) : null;
     const values = { mode: input.mode, targetItemId: input.targetItemId ?? null, baseVersionId: target.base?.id ?? null, activeVersionId: target.active?.versionId ?? null,
@@ -134,8 +147,8 @@ export async function saveSavKnowledgeProposal(raw: SaveSavKnowledgeProposalInpu
       document: input.document, sources: input.sources, reason: input.reason, origin: existing?.origin ?? (learning ? "automatic" : "human"), learningCandidateId: input.learningCandidateId ?? null, learningSourceHash: learning?.fingerprint ?? null,
       revision: (existing?.revision ?? 0) + 1, updatedAt: new Date() };
     const [draft] = existing ? await tx.update(savKnowledgeProposalDrafts).set(values).where(eq(savKnowledgeProposalDrafts.id, existing.id)).returning() : await tx.insert(savKnowledgeProposalDrafts).values({ ...values, createdBy: actorEmail }).returning();
-    await tx.insert(auditLogs).values({ actorEmail, action: "sav_knowledge_proposal_saved", entityType: "knowledge_draft", entityId: draft.id, technicalMetadata: { revision: draft.revision, targetItemId: draft.targetItemId, origin: draft.origin } });
-    return toSavKnowledgeDraft(draft);
+    await tx.insert(auditLogs).values({ actorEmail, action: "sav_knowledge_proposal_saved", entityType: "knowledge_draft", entityId: draft.id, technicalMetadata: { revision: draft.revision, targetItemId: draft.targetItemId, origin: draft.origin, delivery: JSON.stringify(createSavDeliveryEnvelope(input.document, delivery)) } });
+    return { ...toSavKnowledgeDraft(draft), delivery };
   };
   return transaction ? persist(transaction) : requireDb().transaction(persist);
 }
@@ -154,10 +167,12 @@ async function draftPreview(draft: typeof savKnowledgeProposalDrafts.$inferSelec
   const comparison = compareKnowledge({ title: draft.title, body: savProjectionBody(draft.document) }, inventory);
   const targetStale = (target.base?.id ?? null) !== draft.baseVersionId || (target.active?.versionId ?? null) !== draft.activeVersionId;
   const missing = completeness(draft.document, sources, draft.reason);
+  const qualifiedDraft = await draftWithDelivery(draft, db);
+  if (qualifiedDraft.delivery.mode === "unclassified") missing.push("Qualifier la restitution : procédure complète, diagnostic conditionnel ou consignes internes.");
   if (draft.title.trim().length < 3) missing.push("Donner un titre clair à la connaissance.");
   if (targetStale) missing.push("La version de référence a changé. Enregistrer à nouveau après comparaison.");
-  return { draft: toSavKnowledgeDraft(draft), sources, sourceHash, target, inventory, comparison, missing, activeVersion: target.activeVersion,
-    snapshot: savContentHash({ draftId: draft.id, revision: draft.revision, document: draft.document, sources, sourceHash, baseVersionId: target.base?.id ?? null, activeVersionId: target.active?.versionId ?? null, publishedVersionId: target.item?.publishedVersionId ?? null, inventory }) };
+  return { draft: qualifiedDraft, sources, sourceHash, target, inventory, comparison, missing, activeVersion: target.activeVersion,
+    snapshot: savContentHash({ draftId: draft.id, revision: draft.revision, document: draft.document, delivery: qualifiedDraft.delivery, sources, sourceHash, baseVersionId: target.base?.id ?? null, activeVersionId: target.active?.versionId ?? null, publishedVersionId: target.item?.publishedVersionId ?? null, inventory }) };
 }
 export async function previewSavKnowledgeProposal(draftId: string, actorEmail: string) {
   assertSavActor(actorEmail);
@@ -191,11 +206,12 @@ export async function submitSavKnowledgeProposal(input: { draftId: string; snaps
     const canonicalKey = family?.canonicalKey ?? (draft.targetItemId ? `content:${draft.targetItemId}` : `human-proposal:${draft.id}`);
     if (!family) { await tx.insert(knowledgeFamilies).values({ canonicalKey, title: draft.title, createdBy: actorEmail }).onConflictDoNothing(); [family] = await tx.select().from(knowledgeFamilies).where(eq(knowledgeFamilies.canonicalKey, canonicalKey)); }
     await tx.select().from(knowledgeFamilies).where(eq(knowledgeFamilies.id, family!.id)).for("update");
-    const canonicalHash = savContentHash({ document: draft.document, draftId: draft.id, revision: draft.revision, sourceHash: preview.sourceHash });
+    const deliveryMetadata = savDeliveryMetadata(draft.document, createSavDeliveryEnvelope(draft.document, preview.draft.delivery));
+    const canonicalHash = savContentHash({ document: draft.document, delivery: deliveryMetadata.envelope, draftId: draft.id, revision: draft.revision, sourceHash: preview.sourceHash });
     const [{ latest }] = await tx.select({ latest: max(knowledgeFamilyRevisions.revision) }).from(knowledgeFamilyRevisions).where(eq(knowledgeFamilyRevisions.familyId, family!.id));
     const [revision] = await tx.insert(knowledgeFamilyRevisions).values({ familyId: family!.id, revision: (latest ?? 0) + 1, canonicalHash, document: draft.document }).returning();
     const [source] = await tx.insert(knowledgeFamilySources).values({ familyId: family!.id, revisionId: revision.id, sourceRef: `sav-proposal:${draft.id}:${draft.revision}`, sourceHash: preview.sourceHash,
-      evidence: { importKind: "sav_workspace", origin: draft.origin, submittedBy: actorEmail, draftId: draft.id, draftRevision: draft.revision, sourceCandidateId: draft.sourceCandidateId, sources: preview.sources, sourceHash: preview.sourceHash, learningCandidateId: draft.learningCandidateId, learningSourceHash: draft.learningSourceHash, baseVersionId: draft.baseVersionId, activeVersionId: draft.activeVersionId, publishedVersionId: preview.target.item?.publishedVersionId ?? null } }).returning();
+      evidence: { importKind: "sav_workspace", delivery: deliveryMetadata.envelope, origin: draft.origin, submittedBy: actorEmail, draftId: draft.id, draftRevision: draft.revision, sourceCandidateId: draft.sourceCandidateId, sources: preview.sources, sourceHash: preview.sourceHash, learningCandidateId: draft.learningCandidateId, learningSourceHash: draft.learningSourceHash, baseVersionId: draft.baseVersionId, activeVersionId: draft.activeVersionId, publishedVersionId: preview.target.item?.publishedVersionId ?? null } }).returning();
     const document = canonicalKnowledgeSchema.parse(draft.document);
     const baseResolution = preview.target.base && "resolution" in preview.target.base.metadata ? preview.target.base.metadata.resolution : undefined;
     // Canonical fields can be explicitly cleared; retain only unedited metadata.
@@ -203,8 +219,8 @@ export async function submitSavKnowledgeProposal(input: { draftId: string; snaps
     delete inheritedResolution.validUntil;
     const proposed = parseContentInput({ type: "article", slug: preview.target.item?.slug ?? `sav-${family!.id}`, locale: document.locale, title: draft.title, summary: document.objective, categorySlug: "depannage", visibility: "charly_only", agentKey: "sav", ownerEmail: preview.target.item?.ownerEmail ?? actorEmail, bodyMarkdown: savProjectionBody(document), changeNote: draft.reason,
       metadata: { intents: [document.objective, ...(document.supportContext?.symptoms ?? [])], limovaPaths: [], prerequisites: document.prerequisites, expectedResult: document.expectedResult, troubleshooting: document.escalation, semanticSteps: document.steps,
-        sourceMetadata: { importKind: "sav_workspace", knowledgeTitle: draft.title, canonicalFamilyId: family!.id, canonicalRevisionId: revision.id, canonicalObjective: document.objective, proposalDraftId: draft.id, sourceId: source.id, origin: draft.origin },
-        resolution: { ...inheritedResolution, diagnostic: document.diagnostic, ...(document.supportContext?.responseTemplate ? { responseTemplate: document.supportContext.responseTemplate } : {}), ...(document.validUntil ? { validUntil: document.validUntil } : {}), symptoms: document.supportContext?.symptoms ?? [document.objective], steps: document.steps.map((step) => step.instruction), exceptions: document.exceptions, escalation: document.escalation, productVersion: document.productVersion, supersedes: [], conflictsWith: [] } } });
+        sourceMetadata: { importKind: "sav_workspace", savDelivery: deliveryMetadata.envelope, knowledgeTitle: draft.title, canonicalFamilyId: family!.id, canonicalRevisionId: revision.id, canonicalObjective: document.objective, proposalDraftId: draft.id, sourceId: source.id, origin: draft.origin },
+        resolution: { ...inheritedResolution, delivery: deliveryMetadata.projection, diagnostic: document.diagnostic, ...(document.supportContext?.responseTemplate ? { responseTemplate: document.supportContext.responseTemplate } : {}), ...(document.validUntil ? { validUntil: document.validUntil } : {}), symptoms: document.supportContext?.symptoms ?? [document.objective], steps: document.steps.map((step) => step.instruction), exceptions: document.exceptions, escalation: document.escalation, productVersion: document.productVersion, supersedes: [], conflictsWith: [] } } });
     const [candidate] = await tx.insert(knowledgeProjectionCandidates).values({ familyId: family!.id, revisionId: revision.id, sourceId: source.id, targetSurface: "sav", targetItemId: draft.targetItemId, baseVersionId: draft.baseVersionId, status: "pending", explanation: draft.reason, proposedInput: proposed, diff: { before: preview.activeVersion?.body ?? preview.target.base?.bodyMarkdown ?? "", after: proposed.bodyMarkdown }, createdBy: actorEmail }).returning();
     await tx.update(savKnowledgeProposalDrafts).set({ status: "submitted", candidateId: candidate.id, updatedAt: new Date() }).where(eq(savKnowledgeProposalDrafts.id, draft.id));
     await tx.insert(auditLogs).values({ actorEmail, action: "sav_knowledge_proposal_submitted", entityType: "knowledge_candidate", entityId: candidate.id, technicalMetadata: { draftId: draft.id, revision: draft.revision, familyId: family!.id, origin: draft.origin, sourceId: source.id } });
@@ -220,6 +236,13 @@ export async function previewSavKnowledgeReview(candidateId: string, actorEmail:
   const [revision] = await db.select().from(knowledgeFamilyRevisions).where(eq(knowledgeFamilyRevisions.id, candidate.revisionId));
   if (!source || !revision) throw new Error("KNOWLEDGE_PROVENANCE_REQUIRED");
   const document = canonicalKnowledgeSchema.parse(rawDocument ?? revision.document);
+  let delivery = unclassifiedSavDelivery;
+  if (source.evidence.importKind === "sav_workspace" && source.evidence.delivery) {
+    // Bind the submitted qualification to its immutable source first. A review
+    // correction requires a new preview and acknowledgement of the full rendering.
+    delivery = readSavDeliveryEnvelope(canonicalKnowledgeSchema.parse(revision.document), source.evidence.delivery).qualification;
+    assertSavSupportDelivery(document, delivery);
+  }
   const target = await targetState(candidate.targetItemId, db);
   const inventory = await knowledgeComparisonInventory(db);
   const proposed = parseContentInput(candidate.proposedInput);
@@ -233,9 +256,9 @@ export async function previewSavKnowledgeReview(candidateId: string, actorEmail:
   } else if (source.evidence.importKind === "onboarding_catalog") legacySnapshot = (await prepareOnboardingReview(candidate, document, db)).snapshot;
   else if (source.evidence.importKind === "hubspot") legacySnapshot = (await prepareHubspotReview(candidate, document, db)).snapshot;
   const comparison = compareKnowledge({ title: proposed.title, body: savProjectionBody(document) }, inventory.filter((entry) => entry.ref !== `candidate:${candidate.id}`));
-  return { candidate, source, revision, document, sources, comparison, activeVersion: target.activeVersion, legacySnapshot,
-    missing: source.evidence.importKind === "sav_workspace" ? completeness(document, sources, candidate.explanation) : [],
-    snapshot: savContentHash({ candidateId, revisionId: revision.id, sourceHash, document, activeVersionId: target.active?.versionId ?? null, baseVersionId: target.base?.id ?? null, publishedVersionId: target.item?.publishedVersionId ?? null, inventory, legacySnapshot }) };
+  return { candidate, source, revision, document, delivery, sources, comparison, activeVersion: target.activeVersion, legacySnapshot,
+    missing: source.evidence.importKind === "sav_workspace" ? [...completeness(document, sources, candidate.explanation), ...(delivery.mode === "unclassified" ? ["Qualifier la restitution avant validation."] : [])] : [],
+    snapshot: savContentHash({ candidateId, revisionId: revision.id, sourceHash, document, delivery, activeVersionId: target.active?.versionId ?? null, baseVersionId: target.base?.id ?? null, publishedVersionId: target.item?.publishedVersionId ?? null, inventory, legacySnapshot }) };
 }
 
 /** Called inside review's transaction so source/active-version checks cannot race materialization. */
@@ -280,12 +303,23 @@ export async function finishWorkspaceLearningReview(candidate: typeof knowledgeP
 }
 
 /** New publications/activations require the exact reviewed proof; old active content stays available. */
-export async function assertWorkspacePublicationSource(metadata: { sourceMetadata?: Record<string, unknown> }, db: Db = requireDb(), lock = false, restoring = false) {
+export async function assertWorkspacePublicationSource(metadata: { sourceMetadata?: Record<string, unknown>; resolution?: { delivery?: unknown } }, db: Db = requireDb(), lock = false, restoring = false) {
   if (metadata.sourceMetadata?.importKind !== "sav_workspace") return;
   const id = z.uuid().parse(metadata.sourceMetadata.approvedCandidateId);
   const [candidate] = await db.select().from(knowledgeProjectionCandidates).where(eq(knowledgeProjectionCandidates.id, id));
   const [source] = candidate ? await db.select().from(knowledgeFamilySources).where(eq(knowledgeFamilySources.id, candidate.sourceId)) : [];
   if (!candidate || candidate.status !== "approved" || !source || source.evidence.importKind !== "sav_workspace") throw new Error("KNOWLEDGE_CANONICAL_APPROVAL_REQUIRED");
+  if (source.evidence.delivery) {
+    const [approved] = await db.select().from(knowledgeFamilyRevisions).where(eq(knowledgeFamilyRevisions.id, String(metadata.sourceMetadata?.canonicalRevisionId)));
+    if (!approved) throw new Error("SAV_DELIVERY_DOCUMENT_CHANGED");
+    const document = canonicalKnowledgeSchema.parse(approved.document);
+    const [original] = await db.select().from(knowledgeFamilyRevisions).where(eq(knowledgeFamilyRevisions.id, candidate.revisionId));
+    if (!original) throw new Error("SAV_DELIVERY_DOCUMENT_CHANGED");
+    const qualification = readSavDeliveryEnvelope(canonicalKnowledgeSchema.parse(original.document), source.evidence.delivery).qualification;
+    const expected = savDeliveryMetadata(document, createSavDeliveryEnvelope(document, qualification));
+    if (savDeliveryHash(metadata.sourceMetadata?.savDelivery) !== savDeliveryHash(expected.envelope)
+      || savDeliveryHash(metadata.resolution?.delivery) !== savDeliveryHash(expected.projection)) throw new Error("SAV_DELIVERY_DOCUMENT_CHANGED");
+  }
   if (typeof source.evidence.learningCandidateId === "string" && lock) await lockWorkspaceLearningSource(source.evidence.learningCandidateId, db);
   const target = await targetState(candidate.targetItemId, db, lock);
   const [restoration] = target.item ? await db.select().from(auditLogs).where(and(eq(auditLogs.entityType, "content"), eq(auditLogs.entityId, target.item.id), eq(auditLogs.action, "rolled_back"))).orderBy(desc(auditLogs.createdAt)).limit(1) : [];
