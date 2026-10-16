@@ -1,16 +1,18 @@
 import { z } from "zod";
+import { renderSavProcedureGroup, savSupportDeliveryProjectionSchema, savDeliveryGroups, savProcedureGroupsSchema } from "@/lib/knowledge/support-delivery";
 import { diagnosticKnowledgeSchema } from "@/lib/knowledge/diagnostic-contract";
 import { savEvidenceContains, normalizeSavEvidenceText } from "./evidence-text";
 import { canonicalSavFactKey, savRequestDomain, type SavActivePlaybook } from "./playbook-contract";
 import { savSemanticPlan, type SavUnderstandingV1, type SavReplyCoverage } from "./understanding";
 import type { SavRequestRetrievalResult, SavRequestRetrievalSource } from "./request-retrieval";
 
-export const SAV_REQUEST_PLANNER_REVISION = "sav-request-planner-2026-10-16.v2";
+export const SAV_REQUEST_PLANNER_REVISION = "sav-request-planner-2026-10-16.v3";
 export const savRequestPlanSchema = z.object({
   requestId: z.string(), domain: z.string(), mode: z.enum(["solution", "clarification", "knowledge_gap", "reserved", "provider_failure"]),
   card: z.object({ id: z.string(), versionId: z.string() }).nullable(),
   missingFacts: z.array(z.object({ id: z.string(), key: z.string(), question: z.string(), origin: z.string() })),
   nextCheck: z.object({ id: z.string(), instruction: z.string(), expectedResult: z.string(), sourceId: z.string() }).nullable(),
+  procedures: savProcedureGroupsSchema.optional(),
   repeatAllowed: z.boolean(), limits: z.array(z.string()),
 });
 export type SavRequestPlan = z.infer<typeof savRequestPlanSchema>;
@@ -20,9 +22,16 @@ export const savHarnessTraceSchema = z.object({ revision: z.string(), playbookVe
 }).strict();
 export type SavHarnessTrace = z.infer<typeof savHarnessTraceSchema>;
 
+function sourceSteps(source: SavRequestRetrievalSource): string[] {
+  const delivery = savSupportDeliveryProjectionSchema.safeParse(source.resolution?.delivery);
+  // The retrieval wire format serializes qualified instructions once in its
+  // catalog; persisted resolution.steps remains readable by the previous code.
+  if (delivery.success && delivery.data.mode === "procedure") return delivery.data.steps.map(s => s.instruction);
+  return Array.isArray(source.resolution?.steps) ? source.resolution.steps as string[] : [];
+}
 function cardCanSupport(source: SavRequestRetrievalSource, now: Date) {
   const verified = Date.parse(source.verifiedAt ?? "");
-  return source.contentVersionId && Array.isArray(source.resolution?.steps) && source.resolution.steps.length
+  return source.contentVersionId && (sourceSteps(source).length || source.resolution?.delivery && savSupportDeliveryProjectionSchema.safeParse(source.resolution.delivery).success)
     && Number.isFinite(verified) && verified <= now.getTime() && now.getTime() - verified <= 90 * 86400000
     && (!source.resolution?.validUntil || String(source.resolution.validUntil) >= now.toISOString().slice(0, 10));
 }
@@ -46,6 +55,19 @@ export function planSavRequests(u: SavUnderstandingV1, retrieval: SavRequestRetr
     const source = sources[0];
     if (source) {
       base.card = { id: source.id, versionId: source.contentVersionId };
+      const delivery = source.resolution?.delivery === undefined ? null : savSupportDeliveryProjectionSchema.safeParse(source.resolution.delivery);
+      if (delivery && !delivery.success) return { ...base, limits: [...limits, "invalid_support_delivery"] };
+      if (delivery?.success && delivery.data.mode === "internal") return { ...base, limits: [...limits, "internal_guidance_only"] };
+      if (delivery?.success && delivery.data.mode === "procedure") {
+        const attempts = u.attemptedSteps.filter(a => (!a.checkCardId || a.checkCardId === source.id) && (!a.requestIds?.length || a.requestIds.includes(request.id)));
+        if (u.status !== "qualified" || u.uncertainties.some(e => (!e.requestIds.length || e.requestIds.includes(request.id)) && ["ambiguous_intent", "conflicting_evidence", "unread_attachment", "truncated_context"].includes(e.code)))
+          return { ...base, limits: [...limits, "procedure_context_requires_review"] };
+        if (attempts.length) return { ...base, limits: [...limits, "procedure_attempt_requires_review"] };
+        const procedures = savDeliveryGroups(delivery.data).filter(g => g.steps.every(step => savEvidenceContains(source.content, step.instruction)
+          && sourceSteps(source).some(instruction => savEvidenceContains(instruction, step.instruction)))
+          && renderSavProcedureGroup(g, u.language === "en" ? "en" : "fr").length + request.summary.length + 100 <= 4000);
+        return procedures.length === delivery.data.groups.length && procedures.length ? { ...base, mode: procedures.some(g => !g.requiresHuman) ? "solution" : "knowledge_gap", procedures } : { ...base, limits: [...limits, "procedure_requires_review"] };
+      }
       const diagnostic = diagnosticKnowledgeSchema.safeParse(source.resolution?.diagnostic);
       if (source.resolution?.diagnostic && !diagnostic.success) base.limits.push("invalid_diagnostic");
       if (diagnostic.success) {
@@ -107,18 +129,23 @@ export function assembleSavPlannedReply(u: SavUnderstandingV1, raw: SavReplyCove
     // A free-form question cannot bypass the validated question dictionary.
     if (/[?？]/u.test(part.text) || part.sourceIds.some(id => id !== plan.card?.id) || part.repeatedAttemptIds.length)
       throw new Error("SAV_REPLY_OUTSIDE_REQUEST_PLAN");
-    if (part.kind === "solution" && !plan.nextCheck) throw new Error("SAV_REPLY_OUTSIDE_REQUEST_PLAN");
+    if (part.kind === "solution" && !plan.nextCheck && !plan.procedures?.length) throw new Error("SAV_REPLY_OUTSIDE_REQUEST_PLAN");
     // No free-form composition can insert another advice/step outside the selected plan.
-    const needsHuman = !plan.nextCheck && !plan.missingFacts.length;
+    const options = plan.procedures ?? [];
+    const selected = options.find(g => g.id === part.procedureGroupId);
+    const procedure = selected?.requiresHuman ? undefined : selected;
+    if ((part.procedureGroupId && !selected) || (options.length > 0 && !selected && part.kind === "solution")) throw new Error("SAV_PROCEDURE_SELECTION_REQUIRED");
+    const needsHuman = !plan.nextCheck && !procedure && !plan.missingFacts.length;
     const fragments = [u.language === "en"
       ? `${needsHuman ? "The team needs to review your request" : "Your request"}: ${request.summary}`
       : `${needsHuman ? "L’équipe doit vérifier votre demande" : "Votre demande"} : ${request.summary}`];
+    if (procedure) fragments.push(renderSavProcedureGroup(procedure, u.language === "en" ? "en" : "fr"));
     if (plan.nextCheck) {
       fragments.push(plan.nextCheck.instruction);
       if (plan.nextCheck.expectedResult) fragments.push(plan.nextCheck.expectedResult);
     }
     for (const fact of plan.missingFacts) if (!fragments.some(text => normalizeSavEvidenceText(text).includes(normalizeSavEvidenceText(fact.question)))) fragments.push(fact.question);
-    return { ...part, text: fragments.join("\n\n"), kind: plan.nextCheck ? "solution" as const : plan.missingFacts.length ? "clarification" as const : "handoff" as const,
-      sourceIds: plan.nextCheck ? [plan.nextCheck.sourceId] : [], missingInformationIds: plan.missingFacts.map(f => f.id), repeatedAttemptIds: [], repeatJustification: "" };
+    return { ...part, procedureGroupId: undefined, text: fragments.join("\n\n"), kind: plan.nextCheck || procedure ? "solution" as const : plan.missingFacts.length ? "clarification" as const : "handoff" as const,
+      sourceIds: plan.nextCheck ? [plan.nextCheck.sourceId] : procedure && plan.card ? [plan.card.id] : [], missingInformationIds: plan.missingFacts.map(f => f.id), repeatedAttemptIds: [], repeatJustification: "" };
   });
 }

@@ -8,11 +8,13 @@ import { KnowledgeEditor, cleanKnowledgeDocument, emptyKnowledgeDocument } from 
 import { KnowledgeDocument } from "./knowledge-document";
 import { findKnowledgeAction, loadKnowledgeTargetAction, previewKnowledgeProposalAction, saveKnowledgeProposalAction, submitKnowledgeProposalAction } from "./workspace-actions";
 import { knowledgeDetailUrl } from "./workspace-labels";
+import { DeliveryEditor, DeliveryPreview } from "./delivery-editor";
+import { unclassifiedSavDelivery, type SavSupportDelivery } from "@/lib/knowledge/support-delivery";
 import styles from "./workspace.module.css";
 
 type Preview = NonNullable<Awaited<ReturnType<typeof previewKnowledgeProposalAction>>["preview"]>;
-export function KnowledgeProposalPreviewDocument({ draft, sources = draft.sources }: { draft: Pick<SavKnowledgeDraft, "title" | "document" | "sources">; sources?: SavKnowledgeSource[] }) {
-  return <section><h3>Proposition : {draft.title}</h3><KnowledgeDocument document={draft.document}/><h4>Sources de cette proposition</h4><ul>{sources.map((source, index) => <li key={`${source.ref}:${index}`}>{source.label} — {source.ref}</li>)}</ul></section>;
+export function KnowledgeProposalPreviewDocument({ draft, sources = draft.sources }: { draft: Pick<SavKnowledgeDraft, "title" | "document" | "sources" | "delivery">; sources?: SavKnowledgeSource[] }) {
+  return <section><h3>Proposition : {draft.title}</h3><KnowledgeDocument document={draft.document}/><DeliveryPreview document={draft.document} delivery={draft.delivery}/><h4>Sources de cette proposition</h4><ul>{sources.map((source, index) => <li key={`${source.ref}:${index}`}>{source.label} — {source.ref}</li>)}</ul></section>;
 }
 export function KnowledgeProposalForm({ initial, learningCandidateId }: { initial: SavKnowledgeDetail | null; learningCandidateId?: string }) {
   const router = useRouter();
@@ -23,6 +25,7 @@ export function KnowledgeProposalForm({ initial, learningCandidateId }: { initia
   const [targetTitle, setTargetTitle] = useState(initial?.activeVersion?.title ?? initial?.publishedVersion?.title ?? initial?.row.title ?? "");
   const [title, setTitle] = useState(initialDraft?.title ?? initial?.row.title ?? "");
   const [document, setDocument] = useState(initialDraft?.document ?? initial?.document ?? emptyKnowledgeDocument);
+  const [delivery, setDelivery] = useState<SavSupportDelivery>(initialDraft?.delivery ?? initial?.delivery ?? unclassifiedSavDelivery);
   const [sources, setSources] = useState<SavKnowledgeSource[]>(initialDraft?.sources ?? (learningCandidateId ? initial?.sources : undefined) ?? [{ label: "", ref: "" }]);
   const [reason, setReason] = useState(initialDraft?.reason ?? "");
   const [q, setQ] = useState("");
@@ -44,10 +47,10 @@ export function KnowledgeProposalForm({ initial, learningCandidateId }: { initia
   function applySavedDraft(saved: SavKnowledgeDraft, activeTitle?: string) {
     setDraft(saved); setMode(saved.mode); setTargetItemId(saved.targetItemId ?? "");
     if (activeTitle) setTargetTitle(activeTitle); else if (saved.targetItemId !== targetItemId) setTargetTitle("Consultez la connaissance liée avant confirmation");
-    setTitle(saved.title); setDocument(saved.document); setSources(saved.sources); setReason(saved.reason);
+    setTitle(saved.title); setDocument(saved.document); setDelivery(saved.delivery ?? unclassifiedSavDelivery); setSources(saved.sources); setReason(saved.reason);
   }
   async function save(showPreview: boolean) {
-    const result = await saveKnowledgeProposalAction({ ...(draft ? { draftId: draft.id, expectedRevision: draft.revision } : {}), mode, ...(mode === "improve" ? { targetItemId } : {}), title, document: cleanKnowledgeDocument(document), sources: sources.filter(source => source.label.trim() || source.ref.trim()), reason, ...(learningCandidateId ? { learningCandidateId } : {}) });
+    const result = await saveKnowledgeProposalAction({ ...(draft ? { draftId: draft.id, expectedRevision: draft.revision } : {}), mode, ...(mode === "improve" ? { targetItemId } : {}), title, document: cleanKnowledgeDocument(document), delivery, sources: sources.filter(source => source.label.trim() || source.ref.trim()), reason, ...(learningCandidateId ? { learningCandidateId } : {}) });
     if (!result.draft) { setError(result.error ?? "Enregistrement impossible."); return; }
     if (result.draft.status === "submitted" && result.draft.candidateId) { router.push(`/studio/sav/connaissances/${result.draft.candidateId}?kind=candidate`); return; }
     applySavedDraft(result.draft); setNotice("Brouillon interne enregistré. Aucune proposition n’est soumise sans votre confirmation.");
@@ -70,15 +73,15 @@ export function KnowledgeProposalForm({ initial, learningCandidateId }: { initia
         <div><button type="button" className="secondary" onClick={() => run(async () => { const result = await findKnowledgeAction(q); setMatches(result.rows); setSearched(true); setError(result.error ?? ""); })}>Rechercher avant de créer</button></div>
         {searched && matches.length === 0 && <p>Aucune connaissance active trouvée. La comparaison complète sera effectuée avant soumission.</p>}
         {matches.map(row => <div className={styles.choice} key={row.id}><div><Link href={knowledgeDetailUrl(row)} target="_blank" rel="noreferrer">{row.title}</Link><p className={styles.subtle}>{row.summary}</p>
-          <button type="button" className="secondary" onClick={() => run(async () => { if (!row.itemId) return; const result = await loadKnowledgeTargetAction(row.itemId); if (!result.detail) { setError(result.error ?? "Cette connaissance n’est plus accessible."); return; } setMode("improve"); setTargetItemId(row.itemId); setTargetTitle(row.title); setTitle(row.title); if (result.detail.document) setDocument(result.detail.document); change(); })}>Améliorer cette connaissance</button></div></div>)}
+          <button type="button" className="secondary" onClick={() => run(async () => { if (!row.itemId) return; const result = await loadKnowledgeTargetAction(row.itemId); if (!result.detail) { setError(result.error ?? "Cette connaissance n’est plus accessible."); return; } setMode("improve"); setTargetItemId(row.itemId); setTargetTitle(row.title); setTitle(row.title); setDelivery(result.detail.delivery ?? unclassifiedSavDelivery); if (result.detail.document) setDocument(result.detail.document); change(); })}>Améliorer cette connaissance</button></div></div>)}
         {mode === "improve" && <p className={targetItemId ? styles.subtle : styles.alert}>{targetItemId ? `Connaissance ciblée : ${targetTitle}. La version active restera utilisée jusqu’à une activation distincte.` : "Choisissez la connaissance à améliorer dans les résultats."}</p>}
         {mode === "improve" && targetItemId && <Link href={`/studio/sav/connaissances/${targetItemId}?kind=item`} target="_blank" rel="noreferrer">Consulter la connaissance ciblée</Link>}
       </fieldset>
       <fieldset disabled={busy} className={styles.panel}><legend>Proposition</legend>
         <label>Titre de la connaissance<input value={title} maxLength={200} onChange={event => { setTitle(event.target.value); change(); }}/></label>
         <p className={styles.subtle}>Conservez le titre du tutoriel lorsqu’il est la source. Rédigez une procédure générique, sans identité ni corps de mail client.</p>
-        <KnowledgeEditor document={document} onChange={next => { setDocument(next); change(); }} disabled={busy}/>
-        <label>Motif de la création ou de l’amélioration<textarea value={reason} maxLength={2000} onChange={event => { setReason(event.target.value); change(); }}/></label>
+        <KnowledgeEditor document={document} onChange={next => { setDocument(next); setDelivery(unclassifiedSavDelivery); change(); }} disabled={busy}/>
+        <DeliveryEditor document={cleanKnowledgeDocument(document)} value={delivery} onChange={(next, doc) => { setDelivery(next); setDocument(doc); change(); }}/><label>Motif de la création ou de l’amélioration<textarea value={reason} maxLength={2000} onChange={event => { setReason(event.target.value); change(); }}/></label>
       </fieldset>
       <fieldset disabled={busy} className={styles.panel}><legend>Sources et preuves</legend>
         <p className={styles.subtle}>Ajoutez les références vérifiables qui justifient cette procédure. Les preuves privées restent dans le Studio.</p>

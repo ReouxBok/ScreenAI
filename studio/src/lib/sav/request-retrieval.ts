@@ -1,5 +1,6 @@
 import { z } from "zod";
 import { diagnosticKnowledgeSchema } from "@/lib/knowledge/diagnostic-contract";
+import { savSupportDeliveryProjectionSchema } from "@/lib/knowledge/support-delivery";
 
 export const SAV_REQUEST_RETRIEVAL_REVISION = "sav-request-retrieval-2026-10-15.v1";
 export const SAV_RETRIEVAL_LIMITS = Object.freeze({
@@ -25,12 +26,13 @@ const bytes = (value: unknown) => new TextEncoder().encode(JSON.stringify(value)
 const day = (value: Date) => value.toISOString().slice(0, 10);
 const strings = z.array(z.string());
 const resolutionProjection = z.object({
+  delivery: savSupportDeliveryProjectionSchema.optional(),
   diagnostic: diagnosticKnowledgeSchema.optional(),
   steps: strings.min(1), symptoms: strings.optional(), exceptions: strings.optional(),
   prerequisites: strings.optional(), expectedResult: z.string().optional(), troubleshooting: z.string().optional(),
   escalation: z.string().optional(), productVersion: z.string().optional(), audience: z.string().optional(),
   validUntil: z.string().optional(), conflictsWith: strings.optional(), supersedes: strings.optional(),
-});
+}).transform(value => value.delivery?.mode === "procedure" ? { ...value, steps: [] } : value);
 
 /** Ranking and a valid publication are not proof that a card supports a claim. */
 export function assessSavKnowledgeValidity(candidate: SavRetrievalCandidate, locale: string, audience: string, now: Date) {

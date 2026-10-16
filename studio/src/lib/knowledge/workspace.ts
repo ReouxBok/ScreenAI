@@ -1,3 +1,4 @@
+import { readSavDeliveryEnvelope } from "./delivery-envelope";
 import "server-only";
 import { and, desc, eq, or, sql } from "drizzle-orm";
 import { savResolutionIsCurrent } from "@/lib/search";
@@ -126,6 +127,7 @@ export async function getSavKnowledgeDetail(input: { candidateId?: string; itemI
   const activeVersion = versionDto(versions.find((version) => version.id === active?.versionId), active?.title ?? row.title);
   const publishedVersion = versionDto(versions.find((version) => version.id === item?.publishedVersionId), item?.title ?? row.title);
   let proposedVersion = versionDto(versions.find((version) => version.id === item?.currentDraftVersionId), item?.title ?? row.title);
+  let delivery: SavKnowledgeDetail["delivery"];
   let reviewKind: SavKnowledgeDetail["reviewKind"] = null;
   let document: CanonicalKnowledge | null = null;
   let sources: SavKnowledgeDetail["sources"] = [];
@@ -150,13 +152,14 @@ export async function getSavKnowledgeDetail(input: { candidateId?: string; itemI
     }
     const [source] = await db.select().from(knowledgeFamilySources).where(eq(knowledgeFamilySources.id, candidate.sourceId));
     reviewKind = source?.evidence.importKind === "sav_workspace" ? "workspace" : source?.evidence.importKind === "onboarding_catalog" ? "onboarding" : source?.evidence.importKind === "hubspot" ? "hubspot" : "legacy";
+    if (document && source?.evidence.delivery) { try { delivery = readSavDeliveryEnvelope(canonicalKnowledgeSchema.parse(revision.document), source.evidence.delivery).qualification; } catch { alerts.push("SAV_DELIVERY_DOCUMENT_CHANGED"); } }
     sources = source ? displaySources(source.evidence, source.sourceRef, row.sourceLabel) : [];
-    try { if (["pending", "needs_completion"].includes(candidate.status)) { const preview = await previewSavKnowledgeReview(candidate.id, actorEmail); snapshot = preview.snapshot; comparison = preview.comparison; missing = preview.missing; } }
+    try { if (["pending", "needs_completion"].includes(candidate.status)) { const preview = await previewSavKnowledgeReview(candidate.id, actorEmail); delivery = preview.delivery; snapshot = preview.snapshot; comparison = preview.comparison; missing = preview.missing; } }
     catch (error) { alerts.push(error instanceof Error ? error.message : "KNOWLEDGE_REVIEW_UNAVAILABLE"); }
   } else if (row.draftId) {
     const [stored] = await db.select().from(savKnowledgeProposalDrafts).where(eq(savKnowledgeProposalDrafts.id, row.draftId));
     draft = toSavKnowledgeDraft(stored); document = draft.document; sources = draft.sources; proposedBody = savProjectionBody(document);
-    try { const preview = await previewSavKnowledgeProposal(draft.id, actorEmail); snapshot = preview.snapshot; comparison = preview.comparison; missing = preview.missing; sources = preview.sources; }
+    try { const preview = await previewSavKnowledgeProposal(draft.id, actorEmail); draft = preview.draft; delivery = draft.delivery; snapshot = preview.snapshot; comparison = preview.comparison; missing = preview.missing; sources = preview.sources; }
     catch (error) { alerts.push(error instanceof Error ? error.message : "KNOWLEDGE_REVIEW_UNAVAILABLE"); }
   } else if (row.learningCandidateId) {
     const [learning] = await db.select().from(savLearningCandidates).where(eq(savLearningCandidates.id, row.learningCandidateId));
@@ -179,6 +182,7 @@ export async function getSavKnowledgeDetail(input: { candidateId?: string; itemI
       const [revision] = projection ? await db.select().from(knowledgeFamilyRevisions).where(eq(knowledgeFamilyRevisions.id, projection.revisionId)) : [];
       try { document = revision ? canonicalKnowledgeSchema.parse(revision.document) : canonicalFromSav(`content:${row.itemId}`, articleMetadataSchema.parse(version.metadata), item!.locale, row.title).document; }
       catch { alerts.push("KNOWLEDGE_CANONICAL_DOCUMENT_UNAVAILABLE"); }
+      if (document && version.metadata.sourceMetadata?.savDelivery) { try { delivery = readSavDeliveryEnvelope(document, version.metadata.sourceMetadata.savDelivery).qualification; } catch { alerts.push("SAV_DELIVERY_DOCUMENT_CHANGED"); } }
       const [materialized] = await db.select().from(knowledgeProjectionCandidates).where(eq(knowledgeProjectionCandidates.materializedVersionId, version.id)).limit(1);
       const sourceRows = materialized ? await db.select().from(knowledgeFamilySources).where(eq(knowledgeFamilySources.id, materialized.sourceId)) : projection ? await db.select().from(knowledgeFamilySources).where(eq(knowledgeFamilySources.revisionId, projection.revisionId)) : [];
       sources = sourceRows.flatMap((source) => displaySources(source.evidence, source.sourceRef, "Preuve conservée dans le Studio"));
@@ -188,7 +192,7 @@ export async function getSavKnowledgeDetail(input: { candidateId?: string; itemI
   }
   const ids = [id, row.itemId, row.candidateId, row.draftId].filter((value): value is string => Boolean(value));
   const logs = await db.select().from(auditLogs).where(or(...ids.map((entityId) => eq(auditLogs.entityId, entityId)))).orderBy(desc(auditLogs.createdAt)).limit(50);
-  return { reviewKind, row, document, sources, activeVersion, publishedVersion, proposedVersion, proposedBody, revisionId, draft, comparison, snapshot, missing, alerts,
+  return { delivery, reviewKind, row, document, sources, activeVersion, publishedVersion, proposedVersion, proposedBody, revisionId, draft, comparison, snapshot, missing, alerts,
     history: logs.map((log) => ({ action: log.action, actor: log.actorEmail, at: log.createdAt, reason: typeof log.technicalMetadata.reason === "string" ? log.technicalMetadata.reason : "" })),
     canReview: Boolean(row.candidateId && canReviewKnowledgeCandidate(actorEmail, "sav") && ["pending", "needs_completion"].includes(row.state)),
     canPublish: Boolean(!row.learningCandidateId && (!row.candidateId || proposedVersion?.id === item?.currentDraftVersionId) && actorEmail === "ugo@limova.ai" && item?.status === "in_review" && item.currentDraftVersionId && item.currentDraftVersionId !== item.publishedVersionId),

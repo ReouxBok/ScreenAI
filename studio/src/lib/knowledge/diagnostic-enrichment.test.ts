@@ -29,7 +29,8 @@ it("covers every active card across pages without changing active versions, veri
 it("adds no invented fact, cause, branch or observable result", () => {
   const document = canonicalKnowledgeSchema.parse({ schemaVersion: 1, objective: "Procédure fictive", applicability: "sav_only", locale: "fr-FR", prerequisites: [], expectedResult: "", escalation: "Revue humaine", steps: [{ id: "test.step", userLabel: "Étape", objective: "Procédure fictive", instruction: "Ouvrir le panneau fictif.", escalation: "Revue humaine", expectedResult: "" }] });
   const enriched = enrichSavDiagnosticDocument(document);
-  expect(enriched.diagnostic).toMatchObject({ requiredFacts: [], knownCauses: [], checks: [{ instruction: "Ouvrir le panneau fictif.", expectedResult: "", ifNot: null }] });
+  expect(enriched.diagnostic).toBeUndefined();
+  expect(enriched).toEqual(document);
   expect(enrichSavDiagnosticDocument(enriched)).toEqual(enriched);
 });
 
@@ -45,4 +46,12 @@ it.each(["draft", "published"])("rejects enrichment if the %s version changes af
   await f.db.update(contentItems).set(kind === "draft" ? { currentDraftVersionId: changed.id } : { publishedVersionId: changed.id }).where(eq(contentItems.id, item.id));
   await expect(saveSavKnowledgeProposal({ preparationKind: "diagnostic_enrichment", mode: "improve", targetItemId: item.id, title: item.title, document, sources: [{ ref: `content:${item.id}:${active.id}`, label: "Version active" }], reason: "Enrichissement de la procédure existante." }, "ugo@limova.ai")).rejects.toThrow("KNOWLEDGE_SOURCE_STALE");
   expect(await f.db.select().from(savKnowledgeProposalDrafts).where(eq(savKnowledgeProposalDrafts.targetItemId, item.id))).toHaveLength(0);
+});
+
+it("never turns conditional questions, alternatives or internal wording into requirements or branches", () => {
+  const document = canonicalKnowledgeSchema.parse({ schemaVersion: 1, objective: "Options fictives", applicability: "sav_only", locale: "fr-FR", prerequisites: [], expectedResult: "", escalation: "Revue humaine", steps: [
+    { id: "option.first", userLabel: "Premier accès", objective: "Un accès", instruction: "Utiliser la première entrée fictive. Si une erreur apparaît, demander son texte.", expectedResult: "", escalation: "" },
+    { id: "option.other", userLabel: "Autre accès", objective: "Un autre accès", instruction: "Utiliser plutôt la seconde entrée fictive, sans compte à créer.", expectedResult: "", escalation: "" },
+  ] });
+  expect(enrichSavDiagnosticDocument(document)).toEqual(document);
 });

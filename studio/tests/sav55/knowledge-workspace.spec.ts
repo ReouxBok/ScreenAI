@@ -39,6 +39,10 @@ test("proposition humaine : brouillon, revue Contact, publication puis activatio
   await page.getByLabel("Motif de la création ou de l’amélioration", { exact: true }).fill("Procédure synthétique et sourcée pour vérifier le parcours SAV55.");
   await page.getByLabel("Nom de la source 1", { exact: true }).fill("Documentation fictive de recette");
   await page.getByLabel("Référence de la source 1", { exact: true }).fill("https://example.invalid/sav55/maquette");
+  await page.getByLabel("Usage validé", { exact: true }).selectOption("procedure");
+  await page.getByRole("button", { name: "Ajouter un objectif", exact: true }).click();
+  await page.getByLabel("Demande couverte", { exact: true }).fill("Renommer un panneau fictif");
+  await page.getByRole("group", { name: "Objectif 1", exact: true }).getByRole("checkbox", { name: "Choisir le nom de la maquette" }).check();
   await submitServerAction(page, page.getByRole("button", { name: "Enregistrer le brouillon", exact: true }));
   await expect(page.getByRole("status")).toContainText("Brouillon interne enregistré");
   expect(page.url()).toContain("?draft=");
