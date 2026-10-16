@@ -21,6 +21,7 @@ import {
 } from "@/db/schema";
 import { decryptSavPayload, encryptSavPayload, savContentHash } from "./crypto";
 import { analyzeSavMessage, type SavAnalysis } from "./intelligence";
+import { withSavAiBudget } from "./gemini-transport";
 import { savPrimaryAnalysisDiagnostic } from "./analysis-errors";
 import { collectSavDossierContext, type SavDossierContext } from "./dossier-context";
 import { assertSavActor } from "./access";
@@ -325,6 +326,11 @@ export async function ingestInboundMessage(rawInput: unknown) {
   return { ...result, decision };
 }
 
+/** Collection can call ticket matching before analysis; both consume one budget. */
+export function analyzeStoredSavMessage(input: Parameters<typeof analyzeSavMessage>[0], context: Parameters<typeof analyzeSavMessage>[1] & { messageId: string }) {
+  return withSavAiBudget(async () => analyzeSavMessage({ ...input, dossierContext: await collectSavDossierContext(context.messageId) }, context));
+}
+
 export async function processStoredSavMessage(messageId: string) {
   if (isSavPilotMode()) return null;
   const db = requireDb();
@@ -340,8 +346,7 @@ export async function processStoredSavMessage(messageId: string) {
   if (!message) return null;
   try {
     const body = decryptSavPayload<SavMessageBody>(message.bodyCiphertext);
-    const analysis = await analyzeSavMessage({
-      dossierContext: await collectSavDossierContext(message.id),
+    const analysis = await analyzeStoredSavMessage({
       from: message.fromEmail, subject: message.subject, body: body.text,
       autoSubmitted: body.headers?.["auto-submitted"],
       contentType: body.headers?.["content-type"],
@@ -401,8 +406,8 @@ export async function processSavPilotItem(itemId: string) {
     if (!message) throw new Error("SAV_PILOT_MESSAGE_NOT_FOUND");
     if (!await isSavMessageEligible(message.id)) throw new Error("SAV_MESSAGE_BEFORE_CUTOVER");
     const body = decryptSavPayload<SavMessageBody>(message.bodyCiphertext);
-    const analysis = await analyzeSavMessage(
-      { dossierContext: await collectSavDossierContext(message.id), from: message.fromEmail, subject: message.subject, body: body.text,
+    const analysis = await analyzeStoredSavMessage(
+      { from: message.fromEmail, subject: message.subject, body: body.text,
         autoSubmitted: body.headers?.["auto-submitted"], contentType: body.headers?.["content-type"], displayName: body.headers?.["from-display-name"] },
       { messageId: message.id, pilotBatchId: claimed.batchId },
     );
@@ -761,10 +766,9 @@ export async function repairSavProposal(messageId: string, actorEmail: string) {
   if (decisions[0]?.proposal) throw new Error("SAV_PROPOSAL_ALREADY_AVAILABLE");
   // Generate first. The existing decision stays intact if generation fails.
   const body = decryptSavPayload<SavMessageBody>(message.bodyCiphertext);
-  const dossierContext = await collectSavDossierContext(messageId);
-  const analysis = await analyzeSavMessage({ from: message.fromEmail, subject: message.subject, body: body.text,
+  const analysis = await analyzeStoredSavMessage({ from: message.fromEmail, subject: message.subject, body: body.text,
     autoSubmitted: body.headers?.["auto-submitted"], contentType: body.headers?.["content-type"],
-    displayName: body.headers?.["from-display-name"], dossierContext }, { messageId });
+    displayName: body.headers?.["from-display-name"] }, { messageId });
   await db.transaction(async (tx) => {
     await tx.select().from(savThreads).where(eq(savThreads.id, message.threadId)).for("update");
     const [locked] = await tx.select().from(savMessages).where(eq(savMessages.id, messageId)).for("update");

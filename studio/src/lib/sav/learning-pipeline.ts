@@ -8,9 +8,10 @@ import { redactSavLearningText } from "./learning-extraction";
 import { SAV_LEARNING_POLICY_REVISION, bindSavLearningReservationTx, claimSavLearningComparisonTx, finishSavLearningComparisonTx, getSavLearningCutover, isSavLearningCycleEligible, lockSavLearningAdmissionTx, recordSavLearningSignal, reserveSavLearningCapacityTx, reserveSavLearningModelCallTx } from "./learning-admission";
 import { compareSavLearningResolution, SAV_LEARNING_COMPARATOR_PROMPT_REVISION, SAV_LEARNING_COMPARATOR_REVISION, type SavLearningComparisonInput } from "./learning-comparator";
 import { savGeminiApiKey } from "./config";
+import { isSavCrmLearningSourceCurrent } from "./learning-source";
 
 type Db = ReturnType<typeof requireDb>;
-type LearningPatch = { subject: string; finalHumanResolution: string; sourceSnapshotId: string; cycleSourceHash?: string; provenance: "human_resolution"; customerConfirmed: boolean; sourceMessageId: string; conditions: string[]; expectedResult: string; limitations: string[]; groupSignature?: string; comparisonSnapshot?: string };
+type LearningPatch = { subject: string; finalHumanResolution: string; sourceSnapshotId: string; sourceSnapshotHash?: string; sourceCycleStartedAt?: string; cycleSourceHash?: string; provenance: "human_resolution"; customerConfirmed: boolean; sourceMessageId: string; conditions: string[]; expectedResult: string; limitations: string[]; groupSignature?: string; comparisonSnapshot?: string };
 function safeText(value: string, max: number) { return redactSavLearningText(value).replace(/\s+/g, " ").trim().slice(0, max); }
 export function savLearningMaterialText(value: string) { return safeText(value, 4000).normalize("NFKC").toLocaleLowerCase("fr").replace(/[^\p{L}\p{N}]+/gu, " ").trim(); }
 export function savLearningProofHash(input: { sourceRef: string; cycleStartedAt: Date | string; evidenceRef: string; sourceMessageId: string; resolution: string; customerConfirmed: boolean }) {
@@ -86,6 +87,11 @@ export async function processSavLearningResolution(input: SavLearningResolutionI
   }
   const decision = comparison.decision;
   return requireDb().transaction(async tx => {
+    if (origin === "hubspot" && (!input.ticketId || !await isSavCrmLearningSourceCurrent({ ticketId: input.ticketId,
+      snapshotId: input.snapshotId, snapshotHash: input.snapshotHash, cycleStartedAt: input.cycleStartedAt }, tx, true))) {
+      await finishSavLearningComparisonTx(tx, claim.signalId, { reasonCode: "source_changed", state: "signal" }, now);
+      return { disposition: "signal" as const, reasonCode: "source_changed" };
+    }
     // Lock the proof first, matching the observation writer's lock order.
     if (input.observationId && input.cycleId) {
       const [observation] = await tx.select().from(savResolutionObservations).where(eq(savResolutionObservations.id, input.observationId)).for("update");
@@ -136,11 +142,12 @@ export async function processSavLearningResolution(input: SavLearningResolutionI
     const capacity = await reserveSavLearningCapacityTx(tx, { reservationKey: savContentHash({ sourceRef, sourceHash, groupKey }), proposalKind: decision.outcome === "amendment" ? "amendment" : "new", now });
     if (!capacity.ok) { await finish(capacity.reasonCode); return { disposition: "signal" as const, reasonCode: capacity.reasonCode }; }
     const patch: LearningPatch = { subject: safeText(decision.subject, 500), finalHumanResolution: safeText(decision.resolution, 4000), sourceSnapshotId: input.snapshotId,
+      sourceSnapshotHash: input.snapshotHash, sourceCycleStartedAt: new Date(input.cycleStartedAt).toISOString(),
       cycleSourceHash: input.cycleSourceHash, provenance: "human_resolution", customerConfirmed: input.customerConfirmed, sourceMessageId: input.sourceMessageId!,
       conditions: decision.conditions.map(value => safeText(value, 500)), expectedResult: safeText(decision.expectedResult, 500), limitations: decision.limitations.map(value => safeText(value, 500)),
       groupSignature: decision.groupSignature ?? undefined, comparisonSnapshot: context.snapshot };
     const [candidate] = await tx.insert(savLearningCandidates).values({ threadId: input.threadId ?? null, hubspotTicketId: input.ticketId ?? null, sourceRef,
-      sourceContentHash: savContentHash({ sourceHash, decision }), contentItemId: decision.outcome === "amendment" && decision.matchedRef?.startsWith("content:") ? decision.matchedRef.slice(8) : null,
+      sourceContentHash: savContentHash({ sourceHash, decision, snapshotHash: input.snapshotHash, cycleStartedAt: new Date(input.cycleStartedAt).toISOString() }), contentItemId: decision.outcome === "amendment" && decision.matchedRef?.startsWith("content:") ? decision.matchedRef.slice(8) : null,
       status: "pending", proposedPatch: { ciphertext: encryptSavPayload(patch) }, explanation: safeText(decision.rationale, 700), evidenceTicketIds: input.ticketId ? [input.ticketId] : [],
       evidenceCaseCount: 1, admissionGroupKey: groupKey, createdBy: "system" }).returning();
     await bindSavLearningReservationTx(tx, capacity.reservation.id, candidate.id);

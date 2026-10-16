@@ -1153,6 +1153,9 @@ async function snapshotTicket(ticket: HubspotRecord) {
     updatedAt: new Date(),
   }).onConflictDoUpdate({
     target: savTicketSnapshots.hubspotTicketId,
+    // Compare-and-swap prevents a read made before a concurrent refresh from overwriting it.
+    setWhere: previousSnapshot ? and(eq(savTicketSnapshots.id, previousSnapshot.id), eq(savTicketSnapshots.contentHash, previousSnapshot.contentHash),
+      eq(savTicketSnapshots.updatedAt, previousSnapshot.updatedAt)) : sql`false`,
     set: {
       pipelineId: ticket.properties.hs_pipeline,
       stageId: ticket.properties.hs_pipeline_stage,
@@ -1168,6 +1171,10 @@ async function snapshotTicket(ticket: HubspotRecord) {
       updatedAt: new Date(),
     },
   }).returning();
+  if (!snapshot) {
+    const [current] = await db.select().from(savTicketSnapshots).where(eq(savTicketSnapshots.hubspotTicketId, ticket.id));
+    return current ?? null;
+  }
   if (closed) {
     if (sourceTruncated) {
       await recordSavLearningSignal({ sourceRef: `hubspot:${ticket.id}`, sourceHash: contentHash, origin: "hubspot", reasonCode: "source_truncated" });

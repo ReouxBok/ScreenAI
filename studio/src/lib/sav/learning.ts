@@ -16,6 +16,7 @@ import { proposeOnboardingFromSav } from "@/lib/knowledge/candidates";
 import { assertKnowledgeUgoApproval } from "@/lib/knowledge/contracts";
 import { closeSavLearningReservationTx } from "./learning-admission";
 import { assertSavLearningAdmitted, isSavAutomaticLearning } from "./learning-origin";
+import { assertSavCrmLearningSource } from "./learning-source";
 
 type LearningPatch = {
   subject: string;
@@ -113,6 +114,8 @@ export async function approveLearningCandidate(candidateId: string, actorEmail: 
   const result = await requireDb().transaction(async (tx) => {
   const db = tx;
   const [source] = await db.select().from(savLearningCandidates).where(eq(savLearningCandidates.id,candidateId));
+  if (source?.status === "pending") await assertSavLearningAdmitted(source, db);
+  if (source) await assertSavCrmLearningSource(source, db, true);
   if(source?.sourceRef.startsWith("sav-observation:")) {
     const [cycle] = await db.select().from(savObservationCycles).where(eq(savObservationCycles.id,source.sourceRef.slice("sav-observation:".length)));
     if(cycle) await db.select().from(savResolutionObservations).where(eq(savResolutionObservations.id,cycle.observationId)).for("update");
@@ -120,7 +123,9 @@ export async function approveLearningCandidate(candidateId: string, actorEmail: 
   const [candidate] = await db.select().from(savLearningCandidates)
     .where(eq(savLearningCandidates.id, candidateId)).for("update");
   if (!candidate) throw new Error("SAV_LEARNING_CANDIDATE_NOT_PENDING");
+  if (source?.sourceRef.startsWith("hubspot:") && (source.sourceContentHash !== candidate.sourceContentHash || source.sourceRef !== candidate.sourceRef || source.hubspotTicketId !== candidate.hubspotTicketId)) throw new Error("SAV_OBSERVATION_STALE");
   if (candidate.status === "pending") await assertSavLearningAdmitted(candidate, db);
+  await assertSavCrmLearningSource(candidate, db);
   if(candidate.sourceRef.startsWith("sav-observation:")) {
     const patch = candidatePatch(candidate);
     const [cycle]=await db.select().from(savObservationCycles).where(eq(savObservationCycles.id,candidate.sourceRef.slice("sav-observation:".length)));

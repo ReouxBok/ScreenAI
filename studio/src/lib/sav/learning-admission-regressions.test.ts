@@ -24,7 +24,14 @@ const modelFetch=vi.fn(async(_url:unknown,init?:RequestInit)=>{
  const decision={outcome:state.match?'amendment':'new',matchedRef:state.match,groupSignature:p.subject,subject:p.subject,resolution:p.resolution,conditions:['Connexion du produit fictif uniquement'],expectedResult:'La connexion est rétablie',limitations:['Escalader si la connexion échoue'],evidenceRef:p.evidence.ref,evidenceExcerpt:p.resolution.slice(0,80),rationale:'Action humaine observée et résultat reproductible dans ce cas synthétique.'};
  return new Response(JSON.stringify({candidates:[{finishReason:'STOP',content:{parts:[{text:JSON.stringify(decision)}]}}],usageMetadata:{promptTokenCount:10,candidatesTokenCount:20}}));
 });
-function run(i:ReturnType<typeof input>,at=now){return processSavLearningResolution(i,{now:at,apiKey:'synthetic-only-key',model:'synthetic-comparator',fetch:modelFetch as typeof fetch});}
+async function run(i:ReturnType<typeof input>,at=now){
+ if(i.origin==='hubspot') {
+  await f.db.insert(savTicketSnapshots).values({hubspotTicketId:i.ticketId,status:'closed',subject:i.subject,transcriptCiphertext:encryptSavPayload({transcript:[]}),contentHash:i.snapshotHash,humanIntervened:true,learningCycleStartedAt:new Date(i.cycleStartedAt),hubspotUpdatedAt:now}).onConflictDoNothing();
+  const [snapshot]=await f.db.select().from(savTicketSnapshots).where(eq(savTicketSnapshots.hubspotTicketId,i.ticketId));
+  i={...i,snapshotId:snapshot.id};
+ }
+ return processSavLearningResolution(i,{now:at,apiKey:'synthetic-only-key',model:'synthetic-comparator',fetch:modelFetch as typeof fetch});
+}
 beforeAll(async()=>{f=await createSavTestDb();state.db=f.db;},30000);
 afterAll(async()=>{await f?.client.close();});
 afterEach(()=>{vi.unstubAllEnvs();vi.unstubAllGlobals();});
@@ -181,4 +188,29 @@ it('blocks a truncated CRM source before model admission',async()=>{
  vi.stubGlobal('fetch',snapshotFeed({closed:true,updatedAt:'2026-10-15T12:00:00Z',text:resolution+'x'.repeat(9000)}));await backfillHubspotTickets({maxPages:1});
  expect(await f.db.select().from(savLearningCandidates)).toHaveLength(0);expect(modelFetch).not.toHaveBeenCalled();
  expect((await f.db.select().from(savLearningAdmissionSignals))[0].reasonCode).toBe('source_truncated');
+});
+
+
+it.each(['reopened','hash','cycle','missing'] as const)('F1 blocks CRM evidence changed during comparison: %s',async kind=>{
+ const i=input(110);
+ state.beforeResponse=async()=>{
+  const where=eq(savTicketSnapshots.hubspotTicketId,i.ticketId);
+  if(kind==='missing')await f.db.delete(savTicketSnapshots).where(where);
+  else await f.db.update(savTicketSnapshots).set(kind==='reopened'?{status:'open'}:kind==='hash'?{contentHash:'new-source-hash'}:{learningCycleStartedAt:new Date('2026-10-15T11:00:00Z')}).where(where);
+ };
+ expect(await run(i)).toMatchObject({disposition:'signal',reasonCode:'source_changed'});
+ expect(await f.db.select().from(savLearningCandidates)).toHaveLength(0);
+ expect(await f.db.select().from(savLearningAdmissionReservations)).toHaveLength(0);
+});
+it('F1 binds the source proof and blocks both human review entry points after reopening',async()=>{
+ const i=input(111);const admitted=await run(i);expect(admitted).toMatchObject({disposition:'admitted'});
+ const id=String((admitted as {candidateId:string}).candidateId);
+ const {readSavLearningEvidence}=await import('@/lib/knowledge/proposals');
+ await expect(readSavLearningEvidence(id,f.db)).resolves.toMatchObject({candidate:{id}});
+ const [candidate]=await f.db.select().from(savLearningCandidates).where(eq(savLearningCandidates.id,id));
+ expect(decryptSavPayload(candidate.proposedPatch.ciphertext as string)).toMatchObject({sourceSnapshotHash:i.snapshotHash,sourceCycleStartedAt:new Date(i.cycleStartedAt).toISOString()});
+ await f.db.update(savTicketSnapshots).set({status:'open'}).where(eq(savTicketSnapshots.hubspotTicketId,i.ticketId));
+ await expect(approveLearningCandidate(id,'ugo@limova.ai')).rejects.toThrow('SAV_OBSERVATION_STALE');
+ await expect(readSavLearningEvidence(id,f.db)).rejects.toThrow('SAV_OBSERVATION_STALE');
+ expect((await f.db.select().from(savLearningCandidates).where(eq(savLearningCandidates.id,id)))[0].status).toBe('pending');
 });

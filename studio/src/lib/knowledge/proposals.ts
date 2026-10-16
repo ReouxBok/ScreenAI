@@ -8,6 +8,7 @@ import { savContentHash } from "@/lib/sav/crypto";
 import { assertSavActor } from "@/lib/sav/access";
 import { closeSavLearningReservationTx } from "@/lib/sav/learning-admission";
 import { assertSavLearningAdmitted } from "@/lib/sav/learning-origin";
+import { assertSavCrmLearningSource } from "@/lib/sav/learning-source";
 import { assertKnowledgeCandidateReview, assertKnowledgeUgoApproval, canonicalKnowledgeSchema, semanticStepSchema, type CanonicalKnowledge } from "./contracts";
 import { assertSafeKnowledgeDraft, assertSafeOnboardingKnowledge } from "./onboarding-extraction";
 import { savProjectionBody } from "./conversion";
@@ -36,15 +37,20 @@ export function toSavKnowledgeDraft(row: typeof savKnowledgeProposalDrafts.$infe
 }
 export async function lockWorkspaceLearningSource(id: string, db: Db) {
   const [learning] = await db.select().from(savLearningCandidates).where(eq(savLearningCandidates.id, id));
+  if (learning?.status === "pending") await assertSavLearningAdmitted(learning, db);
+  if (learning) await assertSavCrmLearningSource(learning, db, true);
   if (learning?.sourceRef.startsWith("sav-observation:")) {
     const [cycle] = await db.select().from(savObservationCycles).where(eq(savObservationCycles.id, learning.sourceRef.slice("sav-observation:".length)));
     if (cycle) await db.select().from(savResolutionObservations).where(eq(savResolutionObservations.id, cycle.observationId)).for("update");
   }
 }
 export async function readSavLearningEvidence(id: string, db: Db = requireDb(), lock = false, allowRejected = false) {
-  const [candidate] = await db.select().from(savLearningCandidates).where(eq(savLearningCandidates.id, id));
+  if (lock) await lockWorkspaceLearningSource(id, db);
+  const query = db.select().from(savLearningCandidates).where(eq(savLearningCandidates.id, id));
+  const [candidate] = await (lock ? query.for("update") : query);
   if (!candidate || !(allowRejected ? ["pending", "approved", "rejected"] : ["pending", "approved"]).includes(candidate.status)) throw new Error("SAV_OBSERVATION_STALE");
   if (candidate.status === "pending") await assertSavLearningAdmitted(candidate, db);
+  await assertSavCrmLearningSource(candidate, db);
   if (candidate.sourceRef.startsWith("sav-observation:")) {
     const [cycle] = await db.select().from(savObservationCycles).where(eq(savObservationCycles.id, candidate.sourceRef.slice("sav-observation:".length)));
     const query = cycle ? db.select().from(savResolutionObservations).where(eq(savResolutionObservations.id, cycle.observationId)) : null;
