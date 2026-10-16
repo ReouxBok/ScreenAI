@@ -1,6 +1,7 @@
 "use client";
 
 import type { CanonicalKnowledge, SemanticStep } from "@/lib/knowledge/contracts";
+import { DiagnosticEditor } from "./diagnostic-editor";
 import styles from "./workspace.module.css";
 
 export const emptyKnowledgeDocument: CanonicalKnowledge = {
@@ -18,7 +19,15 @@ export function cleanKnowledgeDocument(document: CanonicalKnowledge): CanonicalK
 
 export function KnowledgeEditor({ document, onChange, disabled = false }: { document: CanonicalKnowledge; onChange: (document: CanonicalKnowledge) => void; disabled?: boolean }) {
   function updateStep(index: number, patch: Partial<SemanticStep>) {
-    onChange({ ...document, steps: document.steps.map((step, position) => position === index ? { ...step, ...patch } : step) });
+    const source = { ...document.steps[index], ...patch };
+    onChange({ ...document, ...(document.diagnostic ? { diagnostic: { ...document.diagnostic, checks: document.diagnostic.checks.map(check => check.evidenceStepId === source.id ? { ...check, instruction: source.instruction, expectedResult: source.expectedResult } : check) } } : {}), steps: document.steps.map((step, position) => position === index ? { ...step, ...patch } : step) });
+  }
+  function removeStep(index: number) {
+    const removed = new Set(document.diagnostic?.checks.filter(check => check.evidenceStepId === document.steps[index].id).map(check => check.id) ?? []);
+    onChange({ ...document, steps: document.steps.filter((_, i) => i !== index), ...(document.diagnostic ? { diagnostic: { ...document.diagnostic,
+      checks: document.diagnostic.checks.filter(check => !removed.has(check.id)).map(check => ({ ...check, ifExpected: check.ifExpected && removed.has(check.ifExpected) ? null : check.ifExpected, ifNot: check.ifNot && removed.has(check.ifNot) ? null : check.ifNot })),
+      requiredFacts: document.diagnostic.requiredFacts.map(fact => ({ ...fact, requiredFor: fact.requiredFor.filter(id => !removed.has(id)) })),
+    } } : {}) });
   }
   return <fieldset disabled={disabled} className={styles.editor}>
     <legend>Contenu de la connaissance</legend>
@@ -40,12 +49,13 @@ export function KnowledgeEditor({ document, onChange, disabled = false }: { docu
         </div>
       </details>
       {step.variants.length > 0 && <p className={styles.alert}>Cette étape contient des variantes de contexte. Elles sont conservées et doivent être qualifiées avant validation.</p>}
-      <button type="button" className="secondary" onClick={() => onChange({ ...document, steps: document.steps.filter((_, position) => position !== index) })}>Retirer l’étape {index + 1}</button>
+      <button type="button" className="secondary" disabled={document.diagnostic?.knownCauses.some(cause => cause.evidence.some(id => document.diagnostic?.checks.some(check => check.id === id && check.evidenceStepId === step.id)))} title="Retirer d’abord toute cause qui utilise cette étape comme preuve" onClick={() => removeStep(index)}>Retirer l’étape {index + 1}</button>
     </fieldset>)}
     <div><button type="button" className="secondary" disabled={document.steps.length >= 50} onClick={() => onChange({ ...document, steps: [...document.steps, { id: `step.${crypto.randomUUID()}`, userLabel: "", objective: "", instruction: "", location: "", expectedResult: "", prerequisites: [], exceptions: [], escalation: "", variants: [] }] })}>Ajouter une étape</button></div>
     <label>Résultat attendu de la procédure<textarea maxLength={5000} value={document.expectedResult} onChange={event => onChange({ ...document, expectedResult: event.target.value })}/></label>
     <label>Exceptions et limites — une par ligne<textarea value={document.exceptions.join("\n")} onChange={event => onChange({ ...document, exceptions: event.target.value.split("\n") })}/></label>
     <label>Quand et comment passer la main<textarea maxLength={5000} value={document.escalation} onChange={event => onChange({ ...document, escalation: event.target.value })}/></label>
+    <DiagnosticEditor document={document} onChange={onChange}/>
     <details><summary>Contexte de diagnostic et validité</summary><div className={styles.editor}>
       <label>Situations ou symptômes — un par ligne<textarea value={document.supportContext?.symptoms.join("\n") ?? ""} onChange={event => onChange({ ...document, supportContext: { ...(document.supportContext ?? { symptoms: [], diagnosticQuestions: [], responseTemplate: "" }), symptoms: event.target.value.split("\n") } })}/></label>
       <label>Questions de diagnostic — une par ligne<textarea value={document.supportContext?.diagnosticQuestions.join("\n") ?? ""} onChange={event => onChange({ ...document, supportContext: { ...(document.supportContext ?? { symptoms: [], diagnosticQuestions: [], responseTemplate: "" }), diagnosticQuestions: event.target.value.split("\n") } })}/></label>

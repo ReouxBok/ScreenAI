@@ -15,6 +15,7 @@ import {
   uuid,
   vector,
 } from "drizzle-orm/pg-core";
+import type { DiagnosticKnowledge } from "@/lib/knowledge/diagnostic-contract";
 import type { CanonicalKnowledge, SemanticStep } from "@/lib/knowledge/contracts";
 
 export const staffRole = pgEnum("staff_role", ["contributor", "reviewer", "admin", "member", "owner"]);
@@ -77,6 +78,7 @@ export type ArticleMetadata = {
   troubleshooting: string;
   sourceMetadata?: Record<string, unknown>;
   resolution?: {
+    diagnostic?: DiagnosticKnowledge;
     audience?: "support" | "lead";
     responseTemplate?: string;
     symptoms: string[];

@@ -9,6 +9,7 @@ export function KnowledgeDocument({ document }: { document: CanonicalKnowledge }
       {document.supportContext.diagnosticQuestions.length > 0 && <><h3>Questions de diagnostic</h3><ul>{document.supportContext.diagnosticQuestions.map((value, index) => <li key={index}>{value}</li>)}</ul></>}
     </>}
     {document.onboardingContext?.entryPoint && <><h3>Point d’entrée</h3><p style={{ whiteSpace: "pre-wrap" }}>{document.onboardingContext.entryPoint}</p></>}
+    {document.diagnostic && <><h3>Informations nécessaires au diagnostic</h3><ul>{document.diagnostic.requiredFacts.map(f => <li key={f.key}>{f.label} : {f.question}</li>)}</ul><h3>Contrôles diagnostiques</h3><ol>{document.diagnostic.checks.map(c => <li key={c.id}>{c.instruction}<p>Résultat attendu : {c.expectedResult || "À confirmer."}</p></li>)}</ol></>}
     <h3>Prérequis</h3>{document.prerequisites.length ? <ul>{document.prerequisites.map((value, index) => <li key={index}>{value}</li>)}</ul> : <p>Non renseignés dans cette proposition.</p>}
     <h3>Procédure</h3>{document.steps.length ? <ol>{document.steps.map((step) => <li key={step.id} style={{ marginBottom: 20 }}>
       <h4>{step.userLabel}</h4><p style={{ whiteSpace: "pre-wrap" }}>{step.instruction}</p>

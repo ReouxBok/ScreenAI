@@ -1,8 +1,10 @@
 import "server-only";
-import { and, desc, eq, lte } from "drizzle-orm";
+import { and, desc, eq, inArray, lte } from "drizzle-orm";
 import { requireDb } from "@/db";
-import { savMessages, savThreads } from "@/db/schema";
+import { savAgentRuns, savMessages, savThreads } from "@/db/schema";
 import { decryptSavPayload } from "./crypto";
+import { savStructuredProposalSchema } from "./proposal";
+import { savEvidenceContains } from "./evidence-text";
 import { splitSavMessageText } from "./message-context";
 
 export type SavConversation = {
@@ -16,6 +18,7 @@ export type SavConversation = {
   olderSummary: Array<{ messageId: string; direction: string; receivedAt: string; excerpt: string }>;
   historyTruncated: boolean;
   attachmentNotice: string;
+  diagnosticChecks?: Array<{ id: string; versionId: string; instruction: string; expectedResult: string; messageId: string }>;
 };
 
 /** Preserve the original in storage. This only removes obvious quoted history from model context. */
@@ -48,7 +51,22 @@ export async function loadSavConversation(messageId: string): Promise<SavConvers
     summaryRemaining -= excerpt.length;
     return { messageId: row.id, direction: row.direction, receivedAt: row.receivedAt.toISOString(), excerpt };
   }).filter((item) => item.excerpt).reverse();
+  const previousInbound = rows.filter(row => row.id !== current.id && row.direction === "inbound").map(row => row.id);
+  const runs = previousInbound.length ? await db.select().from(savAgentRuns).where(inArray(savAgentRuns.messageId, previousInbound)).orderBy(desc(savAgentRuns.createdAt)).limit(12) : [];
+  const diagnosticChecks: NonNullable<SavConversation["diagnosticChecks"]> = [];
+  for (const run of runs) {
+    if (!run.proposalCiphertext) continue;
+    const parsed = savStructuredProposalSchema.safeParse(decryptSavPayload(run.proposalCiphertext));
+    if (!parsed.success) continue;
+    for (const plan of parsed.data.replyAssessment?.harness?.plans ?? []) {
+      const check = plan.nextCheck;
+      const sent = check ? messages.find(message => message.direction === "outbound" && savEvidenceContains(message.text, check.instruction)) : null;
+      if (check && plan.card && sent && !diagnosticChecks.some(saved => saved.id === check.id && saved.versionId === plan.card!.versionId))
+        diagnosticChecks.push({ id: check.id, versionId: plan.card.versionId, instruction: check.instruction, expectedResult: check.expectedResult, messageId: sent.id });
+    }
+  }
   return {
+    ...(diagnosticChecks.length ? { diagnosticChecks: diagnosticChecks.slice(0, 15) } : {}),
     threadId: thread.id, currentMessageId: current.id, hubspotTicketId: thread.hubspotTicketId,
     status: thread.status, aiPaused: thread.aiPaused,
     senderMatchesCustomer: current.fromEmail.toLowerCase() === thread.customerEmail.toLowerCase(),

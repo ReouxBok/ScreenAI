@@ -355,7 +355,13 @@ export function assertSafeKnowledgeDraft(document: CanonicalKnowledge): void {
     } else if (Array.isArray(value)) value.forEach(inspect);
     else if (value && typeof value === "object") Object.entries(value).forEach(([key, child]) => { if (key !== "id") inspect(child); });
   };
-  inspect(document);
+  // References are validated against canonical steps, not customer prose.
+  // In particular a generated step hash must not be mistaken for a phone number.
+  inspect({ ...document, diagnostic: document.diagnostic ? {
+    requiredFacts: document.diagnostic.requiredFacts.map(f => ({ key: f.key, label: f.label, question: f.question, questionEn: f.questionEn })),
+    checks: document.diagnostic.checks.map(c => ({ instruction: c.instruction, expectedResult: c.expectedResult })),
+    knownCauses: document.diagnostic.knownCauses.map(c => ({ symptom: c.symptom, cause: c.cause, fix: c.fix })),
+  } : undefined });
 }
 
 

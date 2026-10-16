@@ -12,7 +12,7 @@ export async function publishSavKnowledgeVersion(input: { itemId: string; expect
   assertKnowledgeUgoApproval(actorEmail);
   const db = requireDb();
   const [item] = await db.select().from(contentItems).where(eq(contentItems.id, input.itemId));
-  if (!item || item.agentKey !== "sav" || item.type !== "article") throw new Error("SAV_KNOWLEDGE_SCOPE_REQUIRED");
+  if (!item || item.slug === "sav-master-playbook" || item.agentKey !== "sav" || item.type !== "article") throw new Error("SAV_KNOWLEDGE_SCOPE_REQUIRED");
   const [version] = await db.select().from(contentVersions).where(and(eq(contentVersions.id, input.expectedVersionId), eq(contentVersions.itemId, item.id)));
   if (!version || item.currentDraftVersionId !== version.id) throw new Error("KNOWLEDGE_REVIEW_STALE");
   if (item.publishedVersionId === version.id && item.status === "published") {
@@ -47,7 +47,7 @@ export async function activateSavKnowledgeVersion(input: { itemId: string; expec
     const { assertWorkspacePublicationSource } = await import("./proposals");
     await assertWorkspacePublicationSource(requested.metadata, tx, true);
     const [item] = await tx.select().from(contentItems).where(eq(contentItems.id, input.itemId)).for("update");
-    if (!item || item.agentKey !== "sav" || item.type !== "article" || item.status === "archived") throw new Error("SAV_KNOWLEDGE_SCOPE_REQUIRED");
+    if (!item || item.slug === "sav-master-playbook" || item.agentKey !== "sav" || item.type !== "article" || item.status === "archived") throw new Error("SAV_KNOWLEDGE_SCOPE_REQUIRED");
     const [active] = await tx.select().from(savKnowledgeActivations).where(eq(savKnowledgeActivations.itemId, item.id));
     if (item.publishedVersionId !== input.expectedPublishedVersionId || (active?.versionId ?? null) !== input.expectedActiveVersionId) throw new Error("KNOWLEDGE_ACTIVATION_STALE");
     const [version] = await tx.select().from(contentVersions).where(and(eq(contentVersions.id, input.expectedPublishedVersionId), eq(contentVersions.itemId, item.id)));

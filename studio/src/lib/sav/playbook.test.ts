@@ -1,0 +1,45 @@
+import { afterAll, beforeAll, beforeEach, expect, it, vi } from "vitest";
+import { createSavTestDb } from "../../../test/sav-db";
+import { saveSavPlaybook, reviewSavPlaybook, activateSavPlaybook, readActiveSavPlaybook, getSavPlaybookWorkspace } from "./playbook";
+import { knowledgeComparisonInventory } from "@/lib/knowledge/hubspot-import";
+import { listContent, publish, setContentAiEnabled } from "@/lib/workflow";
+import { defaultSavPlaybook, renderSavPlaybook, savPlaybookSchema } from "./playbook-contract";
+const state = vi.hoisted(() => ({ db: null as unknown }));
+vi.mock("@/db", () => ({ requireDb: () => state.db }));
+let f: Awaited<ReturnType<typeof createSavTestDb>>;
+beforeAll(async () => { f = await createSavTestDb(); state.db = f.db; }, 30000);
+beforeEach(async () => { await f.client.exec("TRUNCATE content_items CASCADE; TRUNCATE audit_logs"); });
+afterAll(async () => { await f?.client.close(); });
+it("keeps the existing process until explicit reviewed activation, including for contact", async () => {
+  expect((await readActiveSavPlaybook()).version).toBe(0);
+  const first = await saveSavPlaybook({ document: defaultSavPlaybook, expectedDraftId: null }, "contact@limova.ai");
+  await expect(activateSavPlaybook({ versionId: first.versionId, expectedActiveId: null }, "contact@limova.ai")).rejects.toThrow("SAV_PLAYBOOK_REVIEW_REQUIRED");
+  await reviewSavPlaybook(first, "contact@limova.ai");
+  await activateSavPlaybook({ ...first, expectedActiveId: null }, "contact@limova.ai");
+  expect((await readActiveSavPlaybook()).versionId).toBe(first.versionId);
+});
+it("preserves history, rejects stale writes and permits explicit rollback of a reviewed version", async () => {
+  const first = await saveSavPlaybook({ document: defaultSavPlaybook, expectedDraftId: null }, "ugo@limova.ai"); await reviewSavPlaybook(first, "ugo@limova.ai"); await activateSavPlaybook({ ...first, expectedActiveId: null }, "ugo@limova.ai");
+  await expect(saveSavPlaybook({ document: defaultSavPlaybook, expectedDraftId: null }, "contact@limova.ai")).rejects.toThrow("SAV_PLAYBOOK_STALE");
+  const next = await saveSavPlaybook({ document: { ...defaultSavPlaybook, tone: "Réponse courte et factuelle." }, expectedDraftId: first.versionId }, "contact@limova.ai"); await reviewSavPlaybook(next, "contact@limova.ai");
+  await expect(activateSavPlaybook({ ...next, expectedActiveId: null }, "contact@limova.ai")).rejects.toThrow("SAV_PLAYBOOK_STALE");
+  await activateSavPlaybook({ ...next, expectedActiveId: first.versionId }, "contact@limova.ai"); await activateSavPlaybook({ ...first, expectedActiveId: next.versionId }, "ugo@limova.ai");
+  expect((await getSavPlaybookWorkspace("contact@limova.ai")).versions).toHaveLength(2); expect((await readActiveSavPlaybook()).versionId).toBe(first.versionId);
+});
+it("limits playbook management without broadening other SAV actors", async () => {
+  for (const actor of ["reouven@limova.ai", "unknown@example.invalid"]) await expect(saveSavPlaybook({ document: defaultSavPlaybook, expectedDraftId: null }, actor)).rejects.toThrow("SAV_PLAYBOOK_ACCESS_FORBIDDEN");
+});
+it("validates a single fact dictionary and injects only relevant domain questions with existing protections", () => {
+  expect(savPlaybookSchema.safeParse({ ...defaultSavPlaybook, facts: [defaultSavPlaybook.facts[0], defaultSavPlaybook.facts[0]] }).success).toBe(false);
+  const text = renderSavPlaybook({ versionId: "test", version: 1, document: defaultSavPlaybook }, ["seo"]).text;
+  expect(text).toContain("page_url"); expect(text).not.toContain("integration_name"); expect(text).toContain("15 jours"); expect(text).toContain("Finance");
+});
+
+it("keeps the master prompt out of product inventories and prevents generic publication or AI activation", async () => {
+  const version = await saveSavPlaybook({ document: defaultSavPlaybook, expectedDraftId: null }, "ugo@limova.ai");
+  await reviewSavPlaybook(version, "ugo@limova.ai"); await activateSavPlaybook({ ...version, expectedActiveId: null }, "ugo@limova.ai");
+  const workspace = await getSavPlaybookWorkspace("ugo@limova.ai");
+  expect(await knowledgeComparisonInventory()).toEqual([]); expect(await listContent()).toEqual([]);
+  await expect(publish(workspace.itemId!, "ugo@limova.ai")).rejects.toThrow("SAV_PLAYBOOK_DEDICATED_WORKSPACE_REQUIRED");
+  await expect(setContentAiEnabled(workspace.itemId!, true, "ugo@limova.ai")).rejects.toThrow("SAV_PLAYBOOK_DEDICATED_WORKSPACE_REQUIRED");
+});
