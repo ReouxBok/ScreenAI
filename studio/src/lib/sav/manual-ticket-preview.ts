@@ -7,15 +7,16 @@ import { assertSavActor } from "./access";
 import { savReleaseStage } from "./config";
 import { decryptSavPayload, encryptSavPayload, savContentHash } from "./crypto";
 import type { SavDossierContext } from "./dossier-context";
-import { loadSavDraftContext } from "./draft-verdicts";
+import { loadSavDossierReviewContext } from "./draft-verdicts";
 import { readSavHubspotContext } from "./hubspot";
 import { isSavMessageEligible } from "./cutover";
 import { resolveSavCustomerMessage, resolveSavCustomerIdentity } from "./forwarded-identity";
-import { SAV_HUBSPOT_SUPPORT, savSupportTicketProperties } from "./hubspot-mapping";
+import { SAV_HUBSPOT_SUPPORT, savReviewedTicketProperties } from "./hubspot-mapping";
 import type { SavStructuredProposal } from "./proposal";
 import { savTicketActionPresentation } from "./ticket-action-presentation";
 import { savTicketReturnPlan } from "./ticket-lifecycle";
 import { savTicketReturnNote } from "./ticket-return-note";
+import { applySavHumanTicketRouting, savEffectiveCustomerEmail, savHumanTicketAction } from "./human-process";
 
 const selectionSchema = z.object({ threadId: z.uuid(), reviewId: z.uuid(), ticketId: z.string().regex(/^\d{1,30}$/).optional(), distinctIssueReason: z.string().trim().max(2000).default("") });
 const commandSchema = selectionSchema.extend({ kind: z.enum(["create_ticket", "link_ticket"]), returnOperation: z.enum(["keep", "reactivate", "create"]).optional() });
@@ -24,6 +25,10 @@ type PreviewContext = { threadId: string; linkedTicketId: string | null; message
 
 /** Stable material fields only: a refresh timestamp or model timing cannot stale an otherwise identical preview. */
 export function buildSavTicketPreview(input: z.infer<typeof selectionSchema>, data: PreviewContext) {
+  if (data.proposal.humanProcess) {
+    const choice = savHumanTicketAction(data.proposal);
+    if (!choice || (choice.ticketId ?? undefined) !== input.ticketId) throw new Error("SAV_TICKET_SELECTION_UNVERIFIED");
+  }
   const crm = data.context?.crm;
   const identity = resolveSavCustomerIdentity({ fromEmail: data.fromEmail, body: data.text });
   if (data.threadId !== input.threadId || data.reviewId !== input.reviewId || data.context?.messageId !== data.messageId
@@ -37,12 +42,12 @@ export function buildSavTicketPreview(input: z.infer<typeof selectionSchema>, da
   if (operation === "review") throw new Error("SAV_TICKET_RETURN_CONTEXT_CHANGED");
   if (target && operation !== "keep" && !target.ownerId) throw new Error("SAV_TICKET_OWNER_REQUIRED");
   const command = { ...input, kind: operation === "create" ? "create_ticket" as const : "link_ticket" as const, ...(target ? { returnOperation: operation } : {}) };
-  const creation = operation === "create" ? savSupportTicketProperties(data.proposal.ticket) : null;
+  const creation = operation === "create" ? savReviewedTicketProperties(data.proposal) : null;
   const presentation = target ? savTicketActionPresentation(target, operation, creation?.subject) : { label: "Ouvrir un nouveau ticket", title: creation!.subject, explanation: "Créer un ticket dans le pipeline SAV pour cette demande validée." };
   const note = target && operation === "reactivate" ? savTicketReturnNote(target.status) : null;
   const details = { label: presentation.label, title: presentation.title, explanation: presentation.explanation, targetId: target?.id ?? null,
-    targetTitle: target?.subject ?? null, targetStatus: target?.status ?? null, stageId: target?.stageId ?? null, ownerId: target?.ownerId ?? null,
-    createdAt: target?.createdAt ?? null, contactId: crm.data.contactId, note, description: creation?.content ?? null };
+    targetTitle: target?.subject ?? null, targetStatus: target?.status ?? null, stageId: target?.stageId ?? null, ownerId: target?.ownerId ?? null, ownerName: target?.ownerName ?? null,
+    createdAt: target?.createdAt ?? null, contactId: crm.data.contactId, contactName: crm.data.contactName ?? null, note, description: creation?.content ?? null, category:creation?.hs_ticket_category ?? null, priority:creation?.hs_ticket_priority ?? null };
   const hash = savContentHash({ command, details, messageId: data.messageId, text: data.text, subject: data.subject, receivedAt: data.receivedAt,
     linkedTicketId: data.linkedTicketId, reviewId: data.reviewId, proposal: data.proposal, target: target ? { id: target.id, subject: target.subject, status: target.status, stageId: target.stageId, closedAt: target.closedAt, ownerId: target.ownerId, pipelineId: target.pipelineId } : null });
   return { command, details, hash };
@@ -70,14 +75,18 @@ export async function readSavManualTicketPreviewContext(threadId: string): Promi
   const [message] = await db.select().from(savMessages).where(and(eq(savMessages.threadId, threadId), eq(savMessages.direction, "inbound"))).orderBy(desc(savMessages.receivedAt), desc(savMessages.createdAt), desc(savMessages.id)).limit(1);
   if (!thread || !message) throw new Error("SAV_THREAD_NOT_FOUND");
   if (!await isSavMessageEligible(message.id)) throw new Error("SAV_MESSAGE_BEFORE_CUTOVER");
-  const body = decryptSavPayload<{ text: string }>(message.bodyCiphertext);
+  const body = decryptSavPayload<{ text: string; supportContext?: SavDossierContext }>(message.bodyCiphertext);
+  const c = await loadSavDossierReviewContext(message.id);
+  const proposal = c.review?.status === "approved" ? c.proposal : null;
   const customer = resolveSavCustomerMessage({ fromEmail: message.fromEmail, subject: message.subject, body: body.text });
   const customerIdentity = resolveSavCustomerIdentity({ fromEmail: message.fromEmail, body: body.text });
   if (!customer.email) throw new Error("SAV_FORWARDED_CUSTOMER_UNRESOLVED");
-  const crm = await readSavHubspotContext({ email: customer.email, subject: customer.subject, body: customer.body, returnedAt: message.receivedAt,
+  const crm = await readSavHubspotContext({ email: proposal ? savEffectiveCustomerEmail(proposal, customerIdentity)! : customer.email, subject: customer.subject, body: customer.body, returnedAt: message.receivedAt,
+    skipSemanticMatch: Boolean(proposal && savHumanTicketAction(proposal)), cachedMatching: body.supportContext?.crm.data?.matching,
     currentTicketId: customer.kind === "sender" && thread.customerEmail.toLowerCase() === customer.email.toLowerCase() ? thread.hubspotTicketId : undefined });
-  return { version: 1, messageId: message.id, collectedAt: new Date().toISOString(), customerIdentity,
+  const context: SavDossierContext = { version: 1, messageId: message.id, collectedAt: new Date().toISOString(), customerIdentity,
     crm: { status: crm.errorCode ? "partial" : "ready", errorCode: crm.errorCode, data: crm }, conversation: null, conversationError: null, otherConversations: [], otherConversationsError: null };
+  return proposal ? applySavHumanTicketRouting(proposal, context, message.receivedAt) : context;
 }
 export async function prepareSavManualTicketPreview(raw: unknown, actorEmail: string): Promise<SavTicketPreview> {
   assertSavActor(actorEmail);
@@ -86,7 +95,7 @@ export async function prepareSavManualTicketPreview(raw: unknown, actorEmail: st
   const [thread] = await db.select().from(savThreads).where(eq(savThreads.id, input.threadId));
   const [message] = await db.select().from(savMessages).where(and(eq(savMessages.threadId, input.threadId), eq(savMessages.direction, "inbound"))).orderBy(desc(savMessages.receivedAt), desc(savMessages.createdAt), desc(savMessages.id)).limit(1);
   if (!thread || !message) throw new Error("SAV_THREAD_NOT_FOUND");
-  const c = await loadSavDraftContext(message.id);
+  const c = await loadSavDossierReviewContext(message.id);
   if (c.review?.id !== input.reviewId || c.review.status !== "approved" || c.review.reviewScope !== "dossier") throw new Error("SAV_VALIDATED_CURRENT_PROPOSAL_REQUIRED");
   const body = decryptSavPayload<{ text: string; supportContext?: SavDossierContext }>(message.bodyCiphertext);
   const preview = buildSavTicketPreview(input, { threadId: thread.id, linkedTicketId: thread.hubspotTicketId, messageId: message.id, receivedAt: message.receivedAt,

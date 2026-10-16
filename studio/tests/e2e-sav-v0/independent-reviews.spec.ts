@@ -15,6 +15,9 @@ test("une demande financière reste sans brouillon ni envoi après validation du
  await expect(draft.locator("pre").first()).toHaveText("Aucun brouillon autorisé pour cette demande. Traitement humain via le ticket.");
  for(const name of ["Accepter le brouillon","Refuser le brouillon","Envoyer la réponse acceptée"]) await expect(page.getByRole("button",{name,exact:true})).toHaveCount(0);
  await expect(prepare).toBeDisabled();
+ const process=dossier.getByRole("region",{name:"Correction humaine du process",exact:true});
+ const processConfirmation=process.getByRole("checkbox",{name:/J’ai vérifié la demande et le choix d’action/});
+ await expect(processConfirmation).toHaveAttribute("required");await expect(processConfirmation).not.toBeChecked();await processConfirmation.check();
  await submitServerAction(page, page.getByRole("button",{name:"Valider le dossier / process",exact:true}));await page.waitForURL(/review=saved/);await expect(page.getByText("Revue enregistrée.",{exact:false})).toBeVisible();
  await expect(dossier).toContainText("Process validé par ugo@limova.ai");await expect(crmUnavailable).toBeVisible();await expect(prepare).toBeDisabled();
  for(const name of ["Accepter le brouillon","Refuser le brouillon","Envoyer la réponse acceptée"]) await expect(page.getByRole("button",{name,exact:true})).toHaveCount(0);

@@ -1,5 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
-const d = vi.hoisted(() => ({ context: vi.fn(), ticket: vi.fn(), approveLearning: vi.fn(), rejectLearning: vi.fn(), auth: vi.fn(), review: vi.fn(), verdict: vi.fn(), queue: vi.fn(), send: vi.fn(), enabled: vi.fn(), qualify: vi.fn(), redirect: vi.fn(), revalidate: vi.fn() }));
+const d = vi.hoisted(() => ({ context: vi.fn(), enqueue: vi.fn(), ticket: vi.fn(), approveLearning: vi.fn(), rejectLearning: vi.fn(), auth: vi.fn(), review: vi.fn(), verdict: vi.fn(), queue: vi.fn(), send: vi.fn(), enabled: vi.fn(), qualify: vi.fn(), redirect: vi.fn(), revalidate: vi.fn() }));
+vi.mock("@/lib/sav/dispatch", () => ({ enqueueSavContextRefresh: d.enqueue }));
 vi.mock("@/lib/sav/auth", () => ({ requireSavApiStaff: d.auth }));
 vi.mock("@/lib/sav/learning", () => ({ approveLearningCandidate: d.approveLearning, rejectLearningCandidate: d.rejectLearning }));
 vi.mock("@/lib/sav/review", () => ({ reviewSavProposal: d.review }));
@@ -14,7 +15,7 @@ vi.mock("@/lib/sav/manual-tickets", () => ({ queueSavManualTicket: d.ticket }));
 import { createTicketAction, linkTicketAction, refreshSavContextAction, reviewLearningAction, reviewDraftAction, reviewProposalAction, sendStudioReplyAction, saveReplyDraftAction, qualifyObservationAction } from "./actions";
 function form() { const f = new FormData(); for (const name of ["threadId", "messageId", "decisionId", "agentRunId", "draftId", "observationId", "cycleId"])
     f.set(name, "10000000-0000-4000-8000-000000000001"); f.set("sourceHash", "x".repeat(43)); f.set("status", "rejected"); f.set("actorEmail", "forged@example.invalid"); return f; }
-beforeEach(() => { vi.clearAllMocks(); d.auth.mockResolvedValue({ email: "ugo@limova.ai" }); d.redirect.mockImplementation((u: string) => { throw new Error(`REDIRECT:${u}`); }); d.queue.mockResolvedValue({ id: "queued", status: "pending" }); d.send.mockResolvedValue({ processed: [] }); });
+beforeEach(() => { vi.clearAllMocks(); d.auth.mockResolvedValue({ email: "ugo@limova.ai" }); d.enqueue.mockResolvedValue("10000000-0000-4000-8000-000000000009"); d.redirect.mockImplementation((u: string) => { throw new Error(`REDIRECT:${u}`); }); d.queue.mockResolvedValue({ id: "queued", status: "pending" }); d.send.mockResolvedValue({ processed: [] }); });
 describe("independent authenticated V0 POST handlers", () => {
     it.each([reviewDraftAction, reviewProposalAction, sendStudioReplyAction, qualifyObservationAction, saveReplyDraftAction])("authenticates before every mutation", async (action) => { d.auth.mockRejectedValue(new Error("SAV_ACCESS_FORBIDDEN")); await expect(action(form())).rejects.toThrow("SAV_ACCESS_FORBIDDEN"); for (const fn of [d.review, d.verdict, d.queue, d.send, d.qualify])
         expect(fn).not.toHaveBeenCalled(); });
@@ -45,7 +46,7 @@ describe("ticket context refresh", () => {
     expect(d.context.mock.invocationCallOrder[0]).toBeLessThan(d.ticket.mock.invocationCallOrder[0]);
     expect(d.ticket).toHaveBeenCalledWith(expect.objectContaining(action === linkTicketAction ? { ticketId: "99", kind: "link_ticket" } : { kind: "create_ticket" }), "ugo@limova.ai");
   });
-  it.each([createTicketAction, linkTicketAction, refreshSavContextAction])("rejects an incomplete refresh without queueing", async (action) => {
+  it.each([createTicketAction, linkTicketAction])("rejects an incomplete refresh without queueing", async (action) => {
     for (const status of ["partial", "error"]) {
       d.context.mockResolvedValue({ crm: { status } });
       await expect(action(form())).rejects.toThrow("SAV_CONTEXT_REFRESH_FAILED");
@@ -58,6 +59,17 @@ describe("ticket context refresh", () => {
   it.each([createTicketAction, linkTicketAction, refreshSavContextAction])("authenticates before refreshing", async (action) => {
     d.auth.mockRejectedValue(new Error("SAV_ACCESS_FORBIDDEN"));
     await expect(action(form())).rejects.toThrow("SAV_ACCESS_FORBIDDEN");
-    expect(d.context).not.toHaveBeenCalled(); expect(d.ticket).not.toHaveBeenCalled();
+    expect(d.context).not.toHaveBeenCalled(); expect(d.enqueue).not.toHaveBeenCalled(); expect(d.ticket).not.toHaveBeenCalled();
   });
+});
+
+it("registers a background refresh without queueing a ticket or waiting for CRM", async () => {
+  await expect(refreshSavContextAction(form())).rejects.toThrow("?context=refreshing&refreshId=10000000-0000-4000-8000-000000000009");
+  expect(d.enqueue).toHaveBeenCalledWith(form().get("threadId"), "ugo@limova.ai");
+  expect(d.context).not.toHaveBeenCalled(); expect(d.ticket).not.toHaveBeenCalled();
+});
+it("keeps the manual refresh failure on the readable dossier without a fake request ID", async () => {
+  d.enqueue.mockRejectedValue(new Error("PRIVATE_REFRESH_FAILURE"));
+  await expect(refreshSavContextAction(form())).rejects.toThrow("?context=failed");
+  expect(d.redirect.mock.calls[0][0]).not.toContain("refreshId="); expect(d.ticket).not.toHaveBeenCalled();
 });

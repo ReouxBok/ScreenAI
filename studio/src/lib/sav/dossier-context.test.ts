@@ -155,7 +155,7 @@ it("refreshes the latest inbound message instead of an older inbox row or an out
   expect(await fixture.db.select().from(savActions)).toHaveLength(0);
 });
 
-it("preserves a review on an unchanged refresh but invalidates it when CRM facts change", async () => {
+it("preserves the reviewed process across enrichment refreshes and exposes changed CRM facts for fresh action checks", async () => {
   const message = await seed(); await processStoredSavMessage(message.id);
   // Opening the dossier refreshes the thread state produced by analysis before review.
   await collectLatestSavDossierContext(message.threadId);
@@ -170,7 +170,13 @@ it("preserves a review on an unchanged refresh but invalidates it when CRM facts
   state.crm.mockResolvedValue({ contactFound: true, contactId: "43", identityCandidates: [], tickets: [], errorCode: null, routing: { kind: "new", reason: "no_candidates" } });
   await collectLatestSavDossierContext(message.threadId);
   const [changed] = await fixture.db.select().from(savMessages).where(eq(savMessages.id, message.id));
-  expect(savReviewMatchesProposal(review, { decisionId: decision.id, agentRunId: run.id, proposal, message: changed })).toBe(false);
+  expect(savReviewMatchesProposal(review, { decisionId: decision.id, agentRunId: run.id, proposal, message: changed })).toBe(true);
+  expect(decryptSavPayload<{supportContext:SavDossierContext}>(changed.bodyCiphertext).supportContext.crm.data?.contactId).toBe("43");
+  expect(proposal.dossierContext?.crm.data?.contactId).toBe("42");
+  // Changing the source mail or the approved process still requires a new review.
+  const changedBody = decryptSavPayload<Record<string,unknown>>(changed.bodyCiphertext);
+  expect(savReviewMatchesProposal(review, { decisionId:decision.id,agentRunId:run.id,proposal,message:{...changed,bodyCiphertext:encryptSavPayload({...changedBody,text:"Autre demande matérielle"})} })).toBe(false);
+  expect(savReviewMatchesProposal(review, { decisionId:decision.id,agentRunId:run.id,proposal:{...proposal,ticket:{...proposal.ticket,title:"Autre sujet"}},message:changed })).toBe(false);
 });
 
 // Independent review probe: UI and refresher must select the same inbound on a receivedAt tie.

@@ -19,4 +19,3 @@ export function savDashboardLearningProgress(observations: Observation[], cycles
   if (candidates.some(candidate => candidate.status === "pending" && candidate.sourceRef && !candidate.sourceRef.startsWith("sav-observation:"))) states.push("candidate");
   return (["incomplete", "qualification", "candidate", "waiting_ticket", "collecting", "catchup"] as const).find(state => states.includes(state)) ?? "none";
 }
-

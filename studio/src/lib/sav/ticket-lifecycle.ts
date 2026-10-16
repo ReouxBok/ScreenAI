@@ -3,6 +3,7 @@ import { SAV_HUBSPOT_SUPPORT } from "./hubspot-mapping";
 export type SavLifecycleTicket = {
   id: string; status: "open" | "closed"; stageId?: string | null;
   ownerId?: string | null;
+  ownerName?: string | null;
   createdAt?: string | null; closedAt?: string | null;
 };
 export type SavTicketReturnOperation = "keep" | "reactivate" | "create" | "review";

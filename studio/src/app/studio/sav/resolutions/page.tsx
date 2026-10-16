@@ -58,13 +58,13 @@ export default async function SavResolutionsPage({ searchParams }: { searchParam
           <span className={`sav-learning-status ${candidate.status}`}>
             {candidate.status === "pending" ? "À relire" : candidate.status === "approved" ? "Brouillon créé" : "Écarté"}
           </span>
-          <h3>{candidate.proposedSubject || `Ticket HubSpot #${candidate.hubspotTicketId}`}</h3>
+          <h3>{candidate.proposedSubject || "Résolution de ticket HubSpot"}</h3>
           <p>{candidate.explanation}</p>
           <details className="learning-preview">
             <summary>Voir la résolution proposée</summary>
             <pre>{candidate.proposedResolution}</pre>
           </details>
-          <small>Ticket HubSpot #{candidate.hubspotTicketId} · détecté le {formatParisDateTime(candidate.createdAt, { dateStyle: "medium" })}</small>
+          <small>Ticket HubSpot · détecté le {formatParisDateTime(candidate.createdAt, { dateStyle: "medium" })}</small>
           {candidate.status === "pending" && staff.email === "ugo@limova.ai" && <p><Link className="button secondary" href={`/studio/sav/connaissances/proposer?learning=${candidate.id}`}>Proposer une connaissance ou améliorer une existante</Link></p>}
           {candidate.contentItemId && <Link className="table-link" href={`/studio/contenus/${candidate.contentItemId}`}>Ouvrir la fiche →</Link>}
         </div>

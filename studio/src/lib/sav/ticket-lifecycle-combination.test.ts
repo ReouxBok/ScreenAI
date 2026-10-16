@@ -30,9 +30,10 @@ let ownerId: string | null = "71";
 let remoteNote: { id: string; properties: Record<string, string> } | null = null;
 let failure: "none" | "note_timeout" | "patch_timeout" = "none";
 let matchingUnavailable = false;
+let ticketDescription = "Même demande";
 function mockIntegrations() {
   vi.stubEnv("GMAIL_CLIENT_ID", "test"); vi.stubEnv("GMAIL_CLIENT_SECRET", "test"); vi.stubEnv("GMAIL_REFRESH_TOKEN", "test");
-  const record = () => ({ id: "401", createdAt: "2026-09-01T00:00:00Z", properties: { subject: "Connexion impossible", content: "Même demande", hs_pipeline: "0", hs_pipeline_stage: stage, hs_last_closed_date: closedAt, hubspot_owner_id: ownerId }, associations: { contacts: { results: [{ id: "21" }] } } });
+  const record = () => ({ id: "401", createdAt: "2026-09-01T00:00:00Z", properties: { subject: "Connexion impossible", content: ticketDescription, hs_pipeline: "0", hs_pipeline_stage: stage, hs_last_closed_date: closedAt, hubspot_owner_id: ownerId }, associations: { contacts: { results: [{ id: "21" }] } } });
   const network = vi.fn(async (url: string, init?: RequestInit): Promise<Response> => {
     if (url.includes("generativelanguage.googleapis.com")) {
       if (matchingUnavailable) return new Response("Provider unavailable", { status: 500 });
@@ -73,7 +74,7 @@ beforeAll(async () => { fixture = await createSavTestDb(); state.db = fixture.db
 afterAll(async () => { await fixture?.client.close(); });
 afterEach(() => { vi.unstubAllEnvs(); vi.unstubAllGlobals(); vi.restoreAllMocks(); });
 beforeEach(async () => {
-  predecessorStage = null; stage = "2"; closedAt = null; ownerId = "71"; remoteNote = null; failure = "none"; matchingUnavailable = false;
+  predecessorStage = null; stage = "2"; closedAt = null; ownerId = "71"; remoteNote = null; failure = "none"; matchingUnavailable = false; ticketDescription = "Même demande";
   vi.spyOn(console, "info").mockImplementation(() => {});
   vi.stubEnv("SAV_RELEASE_STAGE", "v0"); vi.stubEnv("SAV_AUTOMATION_MODE", "assist"); vi.stubEnv("SAV_WRITES_DISABLED", "false"); vi.stubEnv("SAV_ENCRYPTION_KEY_V1", "test-only-sav-encryption-key-32-characters"); vi.stubEnv("HUBSPOT_ACCESS_TOKEN", "test-only");
   vi.stubEnv("SAV_GEMINI_API_KEY", "fixture-key"); vi.stubEnv("SAV_AI_ANALYSIS", "true");
@@ -110,13 +111,13 @@ it("reactivates a content-matched issue despite a generic inherited subject, acr
   expect((await processPendingHubspotActions(1)).processed[0]).toMatchObject({ actionId: action.id, status: "succeeded", ticketId: "401" });
   expect(mutations(network)).toHaveLength(2);
   const checks = network.mock.calls.filter(([url]) => url.includes("generativelanguage.googleapis.com"));
-  expect(checks).toHaveLength(2);
+  expect(checks).toHaveLength(1); // Identical evidence is reused, remote lifecycle fields are still checked.
   for (const [, init] of checks) expect(JSON.parse(JSON.parse(String(init?.body)).contents[0].parts[0].text)).toMatchObject({ currentMessage: text });
   expect(action.payload.ticketReturn).toMatchObject({ ticketId: "401", ownerId: "71", operation: "reactivate" });
 });
 
-it("does not mutate CRM when the fresh semantic check becomes unavailable after queueing", async () => {
-  const { network } = await prepare("reactivate"); matchingUnavailable = true;
+it("does not mutate CRM when changed ticket content requires an unavailable new semantic check", async () => {
+  const { network } = await prepare("reactivate"); matchingUnavailable = true; ticketDescription = "Autre problème à qualifier";
   expect((await processPendingHubspotActions(1)).processed[0].status).toBe("failed");
   expect(mutations(network)).toHaveLength(0);
   expect(stage).toBe("2");
@@ -325,4 +326,11 @@ it("checks the preview contact again in the worker before any write", async () =
   expect((await processPendingHubspotActions(1)).processed[0]).toMatchObject({ status: "failed", errorCode: "SAV_TICKET_PREVIEW_CHANGED" });
   await expect(retrySavAction(action.id, "ugo@limova.ai")).rejects.toThrow("SAV_TICKET_PREVIEW_CHANGED");
   expect(mutations(network)).toHaveLength(0);
+});
+
+it("reuses verified identical semantic evidence when the model becomes unavailable", async () => {
+  const { network, action } = await prepare("reactivate"); matchingUnavailable=true;
+  expect((await processPendingHubspotActions(1)).processed[0]).toMatchObject({actionId:action.id,status:"succeeded"});
+  expect(network.mock.calls.filter(([url])=>url.includes("generativelanguage.googleapis.com"))).toHaveLength(1);
+  expect(mutations(network)).toHaveLength(2); expect(stage).toBe("1");
 });

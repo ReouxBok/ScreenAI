@@ -6,7 +6,7 @@ import { requireDb } from "@/db";
 import { auditLogs, savActions, savDecisions, savMessages, savProposalReviews, savThreads } from "@/db/schema";
 import { assertSavActor } from "./access";
 import { savV0EligibleMessageFilter } from "./cutover";
-import { loadSavDraftContext } from "./draft-verdicts";
+import { loadSavDossierReviewContext } from "./draft-verdicts";
 import {savStructuredProposalSchema} from "./proposal";
 import type { SavDossierContext } from "./dossier-context";
 import { savTicketReturnPlan } from "./ticket-lifecycle";
@@ -29,9 +29,10 @@ export async function queueSavManualTicket(raw: unknown, actorEmail: string, ver
     const customerIdentity = resolveSavCustomerIdentity({ fromEmail: message.fromEmail, body: messageBody.text });
     if (!customerIdentity.email) throw new Error("SAV_FORWARDED_CUSTOMER_UNRESOLVED");
     const [review] = await tx.select().from(savProposalReviews).where(and(eq(savProposalReviews.id, input.reviewId), eq(savProposalReviews.messageId, message.id), eq(savProposalReviews.isCurrent, true), eq(savProposalReviews.status, "approved"))).limit(1);
-    const c = review?.reviewScope === "dossier" ? await loadSavDraftContext(message.id, tx) : null;
+    const c = review?.reviewScope === "dossier" ? await loadSavDossierReviewContext(message.id, tx) : null;
     const [legacyDecision] = c ? [] : await tx.select().from(savDecisions).where(and(eq(savDecisions.id, review?.decisionId ?? input.reviewId),eq(savDecisions.isCurrent,true))).limit(1);
     const decision = c?.decision ?? legacyDecision;
+    if (c?.proposal.humanProcess && !input.previewToken) throw new Error("SAV_TICKET_PREVIEW_EXPIRED");
     if (c && (c.review?.id !== review?.id || !["ticket_pending", "human_review_required"].includes(c.proposal.decision.kind))) throw new Error("SAV_VALIDATED_CURRENT_PROPOSAL_REQUIRED");
     if (!review || !decision || !["ticket_pending","human_review_required"].includes(savStructuredProposalSchema.parse(decryptSavPayload(review.afterCiphertext)).decision.kind)) throw new Error("SAV_VALIDATED_CURRENT_PROPOSAL_REQUIRED");
     const preview = input.previewToken ? assertSavTicketPreview(input.previewToken, actorEmail, input, {
@@ -93,7 +94,8 @@ export async function assertSavCurrentTicketReview(action: typeof savActions.$in
   const [review] = await db.select().from(savProposalReviews).where(and(eq(savProposalReviews.id, action.payload.savReviewId), eq(savProposalReviews.messageId, action.messageId), eq(savProposalReviews.isCurrent, true), eq(savProposalReviews.status, "approved"))).limit(1);
   const [decision] = await db.select().from(savDecisions).where(and(eq(savDecisions.id, action.decisionId), eq(savDecisions.isCurrent, true))).limit(1);
   const [latest] = await db.select({ id: savMessages.id }).from(savMessages).where(and(eq(savMessages.threadId, action.threadId), eq(savMessages.direction, "inbound"))).orderBy(desc(savMessages.receivedAt), desc(savMessages.createdAt), desc(savMessages.id)).limit(1);
-  const c = review?.reviewScope === "dossier" ? await loadSavDraftContext(action.messageId) : null;
+  const c = review?.reviewScope === "dossier" ? await loadSavDossierReviewContext(action.messageId) : null;
+  if (c?.proposal.humanProcess && action.payload.ticketPreviewConfirmed !== true) throw new Error("SAV_TICKET_PREVIEW_EXPIRED");
   if (!review || !decision || (c ? c.review?.id !== review.id : review.decisionId !== decision.id) || latest?.id !== action.messageId) throw new Error("SAV_PROPOSAL_STALE");
   if(!["ticket_pending","human_review_required"].includes(savStructuredProposalSchema.parse(decryptSavPayload(review.afterCiphertext)).decision.kind))throw new Error("SAV_VALIDATED_CURRENT_PROPOSAL_REQUIRED");
   return review;

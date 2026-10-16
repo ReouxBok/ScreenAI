@@ -1,18 +1,20 @@
 import { formatParisDateTime } from "@/lib/paris-date";
 import type { getSavProposalReview } from "@/lib/sav/review";
 import type { getSavReplyDrafts } from "@/lib/sav/drafts";
-import { savCategoryLabels, savDecisionLabels, savLabel, savProcessLabels, savRoutingLabels, savRoutingReasonLabels, savUrgencyLabels, savVerdictLabels } from "@/lib/sav/labels";
+import { savCategoryLabels, savDecisionLabels, savLabel, savRoutingLabels, savRoutingReasonLabels, savUrgencyLabels, savVerdictLabels } from "@/lib/sav/labels";
 import { reviewProposalAction } from "../actions";
 import styles from "./proposal-review.module.css";
 import { savReviewReasonLabels, type SavReviewReason } from "@/lib/sav/review-contract";
 import { UnderstandingReview } from "./understanding-review";
+import { ProcessEditor } from "./process-editor";
+import { savSuggestedTicketTitle } from "@/lib/sav/human-process";
 
 const verdicts = [["correct", "Correct"], ["partial", "Partiel"], ["incorrect", "Incorrect"], ["critical", "Critique"]] as const;
-type Props = { data: NonNullable<Awaited<ReturnType<typeof getSavProposalReview>>>; threadId: string; messageId: string;
+type Props = { tickets?: Array<{ id:string; subject:string; status:"open" | "closed" }>; data: NonNullable<Awaited<ReturnType<typeof getSavProposalReview>>>; threadId: string; messageId: string;
   drafts?: Awaited<ReturnType<typeof getSavReplyDrafts>>; context?: { subject: string; messageCount: number; relatedCount: number; linkedTicketId: string | null };
   sendAllowed?: boolean; sendDisabledReason?: string | null; replyState?: "sent" | "pending" | "uncertain" | null };
 
-export function ProposalReview({ data, threadId, messageId, drafts, context }: Props) {
+export function ProposalReview({ data, threadId, messageId, drafts, context, tickets }: Props) {
   const p = data.proposal;
   const knowledge = p.sources.filter((source) => source.sourceType === "knowledge" && (source.claim || source.excerpt || p.process.some((step) => step.sourceIds.includes(source.sourceId))));
   const contactId = p.dossierContext?.crm.data?.contactId ?? (p.routing.kind === "new" || p.routing.kind === "matched" ? p.routing.contactId : null);
@@ -24,22 +26,23 @@ export function ProposalReview({ data, threadId, messageId, drafts, context }: P
     <UnderstandingReview original={data.before} corrected={p}/>
     <form action={reviewProposalAction} key={data.expectedReviewId ?? "unreviewed"}>
       <input type="hidden" name="threadId" value={threadId}/><input type="hidden" name="messageId" value={messageId}/><input type="hidden" name="decisionId" value={data.decisionId}/><input type="hidden" name="agentRunId" value={data.agentRunId}/><input type="hidden" name="reviewId" value={data.expectedReviewId ?? data.review?.id ?? ""}/><input type="hidden" name="knowledgeRevision" value={drafts?.knowledgeRevision ?? ""}/>
+      <ProcessEditor proposal={p} tickets={tickets ?? p.dossierContext?.crm.data?.tickets ?? []}/>
       <section className={styles.section}><h3>Résumé du sujet</h3>
         <p className={styles.summary}>{p.internalNote?.replace(/^Analyse pilote IA — à valider\s*/u, "").trim() || p.decision.explanation}</p>
         {context && <p>Sujet du client : {context.subject}</p>}
         <ul className={styles.contextList}>
-          <li>Fiche HubSpot : {contactId ? `retrouvée · contact #${contactId}` : p.routing.reason === "customer_identity_unverified" ? "email non reconnu, identité à confirmer" : "non confirmée dans cette analyse"}.</li>
-          <li>Ticket : {ticketId ? `retrouvé · #${ticketId}` : "aucun ticket confirmé pour cette demande"}.</li>
-          {!!p.dossierContext?.crm.data?.tickets.length && <li>Tickets sur la fiche : {p.dossierContext.crm.data.tickets.map(ticket => `${ticket.subject} (#${ticket.id})`).join(" ; ")}. À distinguer d’un rattachement confirmé à cette demande.</li>}
+          <li>Fiche HubSpot : {contactId ? `retrouvée${p.dossierContext?.crm.data?.contactName ? ` · ${p.dossierContext.crm.data.contactName}` : ""}` : p.routing.reason === "customer_identity_unverified" ? "email non reconnu, identité à confirmer" : "non confirmée dans cette analyse"}.</li>
+          <li>Ticket : {ticketId ? `retrouvé · ${p.dossierContext?.crm.data?.tickets.find(ticket => ticket.id === ticketId)?.subject || "Ticket HubSpot"}` : "aucun ticket confirmé pour cette demande"}.</li>
+          {!!p.dossierContext?.crm.data?.tickets.length && <li>Tickets sur la fiche : {p.dossierContext.crm.data.tickets.map(ticket => ticket.subject || "Ticket sans titre").join(" ; ")}. À distinguer d’un rattachement confirmé à cette demande.</li>}
           {!!p.dossierContext?.otherConversations.length && <li>Autres échanges du même expéditeur : {p.dossierContext.otherConversations.length}, sujets à vérifier.</li>}
           {context && <><li>Conversation : {context.messageCount} message{context.messageCount > 1 ? "s" : ""} dans ce fil.</li><li>Autres fils reliés : {context.relatedCount || "aucun"}.</li></>}
         </ul>
-        {p.routing.kind === "review" && p.routing.reason === "customer_identity_unverified" && <div className="login-notice"><p>Aucun contact ne sera créé. Le nom et le téléphone servent uniquement à retrouver des candidats.</p>{p.identityCandidates.length ? <ul>{p.identityCandidates.map((candidate) => <li key={candidate.contactId}>{candidate.name} · {candidate.email} · {candidate.phoneHint} · correspondance par {candidate.matchedBy === "phone" ? "téléphone" : "nom"}, à vérifier humainement (contact #{candidate.contactId}).</li>)}</ul> : <p>Aucune correspondance nom/téléphone confirmée. Vérifier les informations déjà fournies ; demander l’adresse email d’inscription uniquement si elle manque réellement.</p>}</div>}
+        {p.routing.kind === "review" && p.routing.reason === "customer_identity_unverified" && <div className="login-notice"><p>Aucun contact ne sera créé. Le nom et le téléphone servent uniquement à retrouver des candidats.</p>{p.identityCandidates.length ? <ul>{p.identityCandidates.map((candidate) => <li key={candidate.contactId}>{candidate.name || "Nom non renseigné"} · {candidate.email} · {candidate.phoneHint} · correspondance par {candidate.matchedBy === "phone" ? "téléphone" : "nom"}, à vérifier humainement.</li>)}</ul> : <p>Aucune correspondance nom/téléphone confirmée. Vérifier les informations déjà fournies ; demander l’adresse email d’inscription uniquement si elle manque réellement.</p>}</div>}
       </section>
       <section className={styles.section}><h3>Action proposée</h3>
         <p><strong>{ticketId ? "Rattacher au ticket existant" : p.routing.kind === "none" ? "Qualifier la demande · aucun ticket proposé" : ["ticket_pending", "human_review_required"].includes(p.decision.kind) ? p.routing.kind === "review" ? "Vérifier le client avant de créer un ticket" : "Proposer la création d’un ticket" : savLabel(savDecisionLabels, p.decision.kind)}</strong></p><p>{p.decision.explanation}</p>
         <fieldset><legend>Ticket proposé · création par un clic séparé</legend>
-          <label>Titre (5 mots maximum)<input name="title" defaultValue={p.ticket.title} required maxLength={500}/></label>
+          <label>Titre du ticket (4 à 6 mots)<input name="title" defaultValue={savSuggestedTicketTitle(p)} required maxLength={500}/></label>
           <div className={styles.ticketMetrics}><span>Pipeline <strong>Support</strong></span><span>Statut <strong>Nouveau</strong></span><span>Propriétaire <strong>Non assigné</strong></span><span>Source <strong>Email</strong></span></div>
           <div className="pilot-dimensions"><label>Catégorie<select name="category" defaultValue={p.category}>{["technical", "account", "billing", "integration", "how_to", "acknowledgement", "other"].map((value) => <option key={value} value={value}>{savLabel(savCategoryLabels, value)}</option>)}</select></label><label>Urgence<select name="urgency" defaultValue={p.urgency}>{["low", "normal", "high", "critical"].map((value) => <option key={value} value={value}>{savLabel(savUrgencyLabels, value)}</option>)}</select></label></div>
           <label>Description complète<textarea name="description" defaultValue={p.ticket.description} required rows={5}/></label>
@@ -48,8 +51,7 @@ export function ProposalReview({ data, threadId, messageId, drafts, context }: P
       </section>
       <section className={styles.section}><h3>Connaissances utilisées</h3>{knowledge.length ? <ul>{knowledge.map((source, index) => <li key={`${source.sourceId}:${index}`}><strong>{source.title}</strong>{source.claim && <p>{source.claim}</p>}{source.excerpt && <blockquote>{source.excerpt}</blockquote>}{source.contentVersionId && <small>Version de connaissance : {source.contentVersionId}</small>}</li>)}</ul> : <p>Aucune connaissance spécifique utilisée dans cette proposition.</p>}</section>
       <details className={styles.sources}><summary>Corriger le process et la qualification</summary>
-        <fieldset><legend>Process proposé</legend>{p.process.map((step, index) => <label key={index}>{index + 1}. {savLabel(savProcessLabels, step.kind)}<input type="hidden" name={`processKind_${index}`} value={step.kind}/><input type="hidden" name={`processSources_${index}`} value={JSON.stringify(step.sourceIds)}/><textarea name={`processLabel_${index}`} defaultValue={step.kind === "review_reply" && step.label.includes("Aucun envoi email") ? "Relire le brouillon, puis envoyer uniquement par le bouton distinct « Envoyer la réponse » dans le fil Gmail d’origine." : step.label} required minLength={3}/></label>)}<input type="hidden" name="processCount" value={p.process.length}/><label>Étapes supplémentaires (une par ligne)<textarea name="additionalSteps"/></label></fieldset>
-        <label>Décision<select name="decisionKind" defaultValue={p.decision.kind}>{["ticket_pending", "no_ticket_needed", "human_review_required", "spam", "internal_notification", "automatic_reply", "bounce", "duplicate"].map((value) => <option key={value} value={value}>{savLabel(savDecisionLabels, value)}</option>)}</select></label><input type="hidden" name="reasonCode" value={p.decision.reasonCode}/><label>Justification<textarea name="explanation" defaultValue={p.decision.explanation} required minLength={10}/></label>
+        <input type="hidden" name="reasonCode" value={p.decision.reasonCode}/><label>Justification générale<textarea name="explanation" defaultValue={p.decision.explanation} required minLength={10}/></label>
         <fieldset><legend>Compte Limova confirmé</legend><label>Email d’inscription vérifié<input type="email" name="registrationEmail" defaultValue={p.customerIdentity.registrationEmail ?? ""}/></label><label><input type="checkbox" name="identityVerified" defaultChecked={p.customerIdentity.verifiedByHuman}/> J’ai vérifié le compte du demandeur</label><p>Aucun nouveau contact ne sera créé.</p></fieldset><label>Résumé interne<textarea name="internalNote" defaultValue={p.internalNote ?? ""}/></label>
         <p>Rattachement : {savLabel(savRoutingLabels, p.routing.kind)} · {savLabel(savRoutingReasonLabels, p.routing.reason, "Motif à vérifier")}</p>
       </details>

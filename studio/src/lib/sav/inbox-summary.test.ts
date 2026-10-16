@@ -25,6 +25,13 @@ describe("SAV-53 inbox presentation", () => {
     expect(JSON.stringify(source)).toBe(before); expect(fetch).not.toHaveBeenCalled();
   });
 
+  it("keeps HubSpot ticket identifiers out of the visible next action", () => {
+    const source = input();
+    const summary = buildSavInboxSummary({ ...source, hubspotTicketId: "987654321" });
+    expect(JSON.stringify(summary)).not.toContain("987654321");
+    expect(summary.nextAction).toContain("ticket lié");
+  });
+
   it.each([
     ["approved", "Vérifier les tickets existants puis choisir l’action adaptée."],
     [null, "Valider le dossier puis choisir l’action adaptée au ticket."],

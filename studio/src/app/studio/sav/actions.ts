@@ -33,8 +33,10 @@ import { retrySavAnalysis, repairSavProposal } from "@/lib/sav/service";
 import { collectLatestSavDossierContext } from "@/lib/sav/dossier-context";
 import { qualifySavObservation } from "@/lib/sav/observations";
 import { reviewSavDraft } from "@/lib/sav/draft-verdicts";
+import { saveSavHumanReplyDraft } from "@/lib/sav/drafts";
 import { assertSavManualReplyEnabled, queueSavManualReply } from "@/lib/sav/manual-replies";
 import { processPendingGmailSendActions } from "@/lib/sav/gmail";
+import { enqueueSavContextRefresh } from "@/lib/sav/dispatch";
 import { recordSavDeploymentDecision } from "@/lib/sav/metrics";
 import { createReviewedSavReplay, runReviewedSavRuleReplay } from "@/lib/sav/reviewed-replay";
 
@@ -79,10 +81,20 @@ export async function reviewDraftAction(form: FormData) {
   let result = "draft_reviewed";
   try {
     if (form.has("replyDraft") || form.has("text")) throw new Error("SAV_DRAFT_READ_ONLY");
-    await reviewSavDraft({ threadId, messageId: id(form,"messageId"), decisionId: id(form,"decisionId"), agentRunId: id(form,"agentRunId"), sourceHash: id(form,"sourceHash"), expectedVerdictId: String(form.get("verdictId") || "") || null, status: String(form.get("status")), reason: String(form.get("reason") || ""), reasons: form.getAll("reasons").map(String) }, staff.email);
+    await reviewSavDraft({ threadId, messageId: id(form,"messageId"), decisionId: id(form,"decisionId"), agentRunId: id(form,"agentRunId"), sourceHash: id(form,"sourceHash"), expectedVerdictId: String(form.get("verdictId") || "") || null, ...(form.get("draftId") ? {draftId:String(form.get("draftId"))} : {}), status: String(form.get("status")), reason: String(form.get("reason") || ""), reasons: form.getAll("reasons").map(String) }, staff.email);
   } catch (error) { result = error instanceof Error && /^SAV_[A-Z_]+$/.test(error.message) ? error.message : "SAV_DRAFT_INVALID"; }
   revalidatePath(`/studio/sav/${threadId}`);
   revalidatePath("/studio/sav/evaluation");
+  redirect(`/studio/sav/${encodeURIComponent(threadId)}?review=${result}`);
+}
+
+export async function saveHumanDraftAction(form: FormData) {
+  const staff=await requireApiStaff("admin");
+  const threadId=id(form,"threadId");
+  let result="draft_saved";
+  try { await saveSavHumanReplyDraft({threadId,messageId:id(form,"messageId"),expectedDraftId:String(form.get("expectedDraftId") || "") || null,text:String(form.get("text") || "")},staff.email); }
+  catch(error) { result=error instanceof Error && /^SAV_[A-Z_]+$/.test(error.message) ? error.message : "SAV_DRAFT_INVALID"; }
+  revalidatePath(`/studio/sav/${threadId}`);revalidatePath("/studio/sav");
   redirect(`/studio/sav/${encodeURIComponent(threadId)}?review=${result}`);
 }
 
@@ -185,13 +197,13 @@ export async function retryAnalysisAction(form: FormData) {
 }
 
 export async function refreshSavContextAction(form: FormData) {
-  await requireApiStaff("admin");
+  const staff = await requireApiStaff("admin");
   const threadId = id(form, "threadId");
-  let notice = "context_refreshed";
-  try { await refreshTicketContext(threadId); }
-  catch { notice = "SAV_CONTEXT_REFRESH_FAILED"; }
+  let refreshId = "";
+  try { refreshId = await enqueueSavContextRefresh(threadId,staff.email); }
+  catch { /* Keep the dossier readable if the refresh could not be scheduled. */ }
   revalidatePath(`/studio/sav/${threadId}`);
-  redirect(`/studio/sav/${encodeURIComponent(threadId)}?review=${notice}`);
+  redirect(`/studio/sav/${encodeURIComponent(threadId)}?${refreshId ? `context=refreshing&refreshId=${refreshId}` : "context=failed"}`);
 }
 
 export async function repairSavProposalAction(form: FormData) {
@@ -370,6 +382,7 @@ export async function reviewProposalAction(form: FormData) {
   const staff = await requireApiStaff("admin");
   const threadId = id(form, "threadId");
   let errorCode = "";
+  let refreshId = "";
   try {
     if (form.has("replyDraft")) throw new Error("SAV_DRAFT_READ_ONLY");
     await reviewSavProposal({ reviewScope: "dossier", messageId: id(form, "messageId"), decisionId: id(form, "decisionId"), agentRunId: id(form, "agentRunId"), expectedReviewId: String(form.get("reviewId") || "") || null,
@@ -379,14 +392,19 @@ export async function reviewProposalAction(form: FormData) {
       correction: { category: String(form.get("category")), urgency: String(form.get("urgency")), decisionKind: String(form.get("decisionKind")), reasonCode: String(form.get("reasonCode")), explanation: String(form.get("explanation")), title: String(form.get("title")), description: String(form.get("description")), process: [
         ...Array.from({ length: Math.max(0, Math.min(30, Number(form.get("processCount")) || 0)) }, (_, index) => ({ kind: String(form.get(`processKind_${index}`)), label: String(form.get(`processLabel_${index}`)), sourceIds: JSON.parse(String(form.get(`processSources_${index}`))) })),
         ...String(form.get("additionalSteps") || "").split("\n").map((value) => value.trim()).filter(Boolean).map((label) => ({ kind: "product_step", label, sourceIds: [] })),
-      ], internalNote: String(form.get("internalNote") || ""), replyDraft: "", registrationEmail: String(form.get("registrationEmail") || "").trim().toLowerCase(), identityVerified: form.get("identityVerified") === "on" },
+      ], internalNote: String(form.get("internalNote") || ""), replyDraft: "", registrationEmail: String(form.get("registrationEmail") || "").trim().toLowerCase(), identityVerified: form.get("identityVerified") === "on",
+        ...(form.get("humanProcess") ? { humanProcess: JSON.parse(String(form.get("humanProcess"))) } : {}) },
     }, staff.email);
   } catch (error) { errorCode = error instanceof Error && /^[A-Z][A-Z_]+$/.test(error.message) ? error.message : "SAV_REVIEW_INVALID"; }
+  if (!errorCode) {
+    try { refreshId = await enqueueSavContextRefresh(threadId,staff.email); }
+    catch { /* The review is committed; enrichment failure cannot undo validation. */ }
+  }
   revalidatePath("/studio/sav");
   revalidatePath(`/studio/sav/${threadId}`);
   revalidatePath("/studio/sav/resolutions");
   revalidatePath("/studio/sav/evaluation");
-  redirect(`/studio/sav/${encodeURIComponent(threadId)}?review=${errorCode || "saved"}`);
+  redirect(`/studio/sav/${encodeURIComponent(threadId)}?review=${errorCode || "saved"}${refreshId ? `&context=refreshing&refreshId=${refreshId}` : ""}`);
 }
 
 export async function importHubspotKnowledgeAction(form: FormData) {

@@ -17,6 +17,7 @@ const assessmentSchema = z.object({
 const verdictSchema = z.object({ assessments: z.array(assessmentSchema).min(1).max(100) }).strict();
 type Ticket = SavTicketCandidate & { description: string; descriptionTruncated?: boolean; subjectTruncated?: boolean };
 type Assessment = z.infer<typeof assessmentSchema>;
+export type SavTicketMatchCache = { revision: string; model: string; inputHash: string; errorCode: string | null; assessments: Assessment[] };
 type Selection = ReturnType<typeof selectSavTicketMatch>;
 const normalize = (value: string) => value.normalize("NFKC").replace(/\s+/g, " ").trim();
 
@@ -63,7 +64,7 @@ export function selectSavAssessedTicket(tickets: Ticket[], assessments: Assessme
 }
 
 /** Supervised proposal only. One bounded read, no tools, writes or automatic retry. */
-export async function matchSavTicketsByContent(input: { subject: string; body: string; tickets: Ticket[] }, options: { apiKey?: string; model?: string; fetch?: typeof fetch } = {}) {
+export async function matchSavTicketsByContent(input: { subject: string; body: string; tickets: Ticket[] }, options: { apiKey?: string; model?: string; fetch?: typeof fetch; cached?: SavTicketMatchCache } = {}) {
   const message = buildSavInboundContext(input);
   const split = splitSavMessageText(input.body);
   const data = { currentMessage: [message.subjectInherited ? "" : input.subject.slice(0, 1000), message.currentText].filter(Boolean).join("\n"),
@@ -77,6 +78,12 @@ export async function matchSavTicketsByContent(input: { subject: string; body: s
     inputHash: savContentHash(data), durationMs: Date.now() - started, inputTokens: metadata.inputTokens ?? 0,
     outputTokens: metadata.outputTokens ?? 0, totalTokens: metadata.totalTokens ?? 0, errorCode, assessments, limitations: data.limitations });
   if (!input.tickets.length) return { selection: { kind: "new" as const, reason: "no_open_ticket" }, matching: trace(null) };
+  if (options.cached?.revision === SAV_TICKET_MATCH_REVISION && options.cached.model === model && !options.cached.errorCode && options.cached.inputHash === savContentHash(data)) {
+    try {
+      const assessments = validateSavTicketAssessments({ assessments: options.cached.assessments }, data);
+      return { selection: selectSavAssessedTicket(input.tickets, assessments, data.limitations), matching: trace(null, assessments) };
+    } catch { /* Invalid cached evidence requires a new assessment. */ }
+  }
   const controller = new AbortController(), timeout = setTimeout(() => controller.abort(), 12000);
   try {
     const key = options.apiKey ?? savGeminiApiKey();

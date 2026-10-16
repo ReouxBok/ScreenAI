@@ -9,6 +9,7 @@ import { extractSavIdentityHints } from "./identity";
 import { resolveSavCustomerMessage, resolveSavCustomerIdentity } from "./forwarded-identity";
 import { splitSavMessageText } from "./message-context";
 import { getSavRelatedThreads } from "./thread-context";
+import { applySavHumanTicketRouting, savEffectiveCustomerEmail, savHumanTicketAction } from "./human-process";
 
 export type SavDossierContext = {
   version: 1; messageId: string; collectedAt: string;
@@ -86,13 +87,21 @@ export async function collectSavDossierContext(messageId: string): Promise<SavDo
   const [message] = await db.select().from(savMessages).where(eq(savMessages.id, messageId)).limit(1);
   if (!message) throw new Error("SAV_MESSAGE_NOT_FOUND");
   const [thread] = await db.select().from(savThreads).where(eq(savThreads.id, message.threadId)).limit(1);
-  const body = decryptSavPayload<{ text: string; headers?: Record<string, string> }>(message.bodyCiphertext);
+  const body = decryptSavPayload<{ text: string; headers?: Record<string, string>; supportContext?: SavDossierContext }>(message.bodyCiphertext);
   const customerMessage = resolveSavCustomerMessage({ fromEmail: message.fromEmail, subject: message.subject, body: body.text });
   const parts = splitSavMessageText(customerMessage.body);
   const customerIdentity = resolveSavCustomerIdentity({ fromEmail: message.fromEmail, body: body.text });
+  let proposal: import("./proposal").SavStructuredProposal | null = null;
+  try {
+    const { loadSavDossierReviewContext } = await import("./draft-verdicts");
+    const reviewed = await loadSavDossierReviewContext(messageId);
+    if (reviewed.review?.status === "approved") proposal = reviewed.proposal;
+  } catch { /* An initial analysis has no review yet. */ }
+  const customerEmail = proposal ? savEffectiveCustomerEmail(proposal, customerIdentity) : customerIdentity.email;
   const [crm, conversation, others] = await Promise.allSettled([
-    customerIdentity.email ? readSavHubspotContext({ email: customerIdentity.email, subject: customerMessage.subject, body: customerMessage.body, returnedAt: message.receivedAt,
-      currentTicketId: customerIdentity.kind === "sender" && thread?.customerEmail.toLowerCase() === customerIdentity.email.toLowerCase() ? thread.hubspotTicketId : undefined,
+    customerEmail ? readSavHubspotContext({ email: customerEmail, subject: customerMessage.subject, body: customerMessage.body, returnedAt: message.receivedAt,
+      skipSemanticMatch: Boolean(proposal && savHumanTicketAction(proposal)), cachedMatching: body.supportContext?.crm.data?.matching,
+      currentTicketId: customerIdentity.kind === "sender" && thread?.customerEmail.toLowerCase() === customerEmail.toLowerCase() ? thread.hubspotTicketId : undefined,
       identityHints: customerIdentity.kind === "sender" ? extractSavIdentityHints([parts.currentText, parts.signatureText].filter(Boolean).join("\n"), body.headers?.["from-display-name"]) : undefined, toleratePartial: true })
       : Promise.reject(new Error("SAV_FORWARDED_CUSTOMER_UNRESOLVED")),
     customerMessage.kind !== "sender"
@@ -109,7 +118,7 @@ export async function collectSavDossierContext(messageId: string): Promise<SavDo
   if (customerMessage.kind === "forwarded" && conversation.status === "fulfilled" && crm.status === "fulfilled" && crm.value.routing.kind === "matched") {
     conversation.value.hubspotTicketId = crm.value.routing.ticketId;
   }
-  const context: SavDossierContext = {
+  let context: SavDossierContext = {
     version: 1, messageId, collectedAt: new Date().toISOString(), customerIdentity,
     crm: crm.status === "fulfilled" ? { status: crm.value.errorCode ? "partial" : "ready", data: crm.value, errorCode: crm.value.errorCode ?? null }
       : { status: "error", data: null, errorCode: customerIdentity.kind === "unresolved_forward" ? "SAV_FORWARDED_CUSTOMER_UNRESOLVED" : "SAV_HUBSPOT_CONTACT_UNAVAILABLE" },
@@ -118,6 +127,10 @@ export async function collectSavDossierContext(messageId: string): Promise<SavDo
     otherConversations: others.status === "fulfilled" ? others.value : [],
     otherConversationsError: others.status === "fulfilled" ? null : "SAV_OTHER_CONVERSATIONS_UNAVAILABLE",
   };
+  if (proposal && savHumanTicketAction(proposal) && context.crm.status === "ready") {
+    try { context = applySavHumanTicketRouting(proposal, context, message.receivedAt); }
+    catch { context.crm = { ...context.crm, status: "partial", errorCode: "SAV_TICKET_SELECTION_UNVERIFIED" }; }
+  }
   await db.transaction(async (tx) => {
     const [current] = await tx.select().from(savMessages).where(eq(savMessages.id, messageId)).for("update");
     if (!current) throw new Error("SAV_MESSAGE_NOT_FOUND");

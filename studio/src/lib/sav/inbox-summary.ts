@@ -42,6 +42,10 @@ function suggestedNextAction(input: InboxSummaryInput) {
     ? "Consulter le message ; l’analyse est en attente."
     : "Lire le message et qualifier la demande manuellement.";
   if (input.reviewStatus === "rejected") return "Corriger le dossier avant de poursuivre.";
+  if (p.humanProcess && input.reviewStatus === "approved") {
+  if (input.hubspotTicketId) return "Consulter le ticket lié.";
+    return ({create_ticket:"Préparer puis confirmer la création du ticket.",link_ticket:"Préparer puis confirmer le rattachement au ticket choisi.",reopen_ticket:"Préparer puis confirmer le retour sur le ticket choisi.",partnership:"Préparer puis confirmer le transfert partenariat.",commercial:"Traiter la demande commerciale selon la règle existante.",no_ticket:"Aucun ticket nécessaire selon le process validé."})[p.humanProcess.action];
+  }
   if (input.reviewStatus !== "approved" && p.understanding?.status !== "qualified") return "Vérifier la demande et compléter sa qualification.";
   if (p.decision.kind === "no_ticket_needed") return "Vérifier qu’aucune suite n’est nécessaire.";
   if (["spam", "automatic_reply", "bounce", "internal_notification", "duplicate"].includes(p.decision.kind)) return "Vérifier le classement de cet email.";
@@ -55,11 +59,11 @@ function suggestedNextAction(input: InboxSummaryInput) {
     if (p.understanding.requests.every(request => ["partnership", "acknowledgement"].includes(request.nature))) return "";
   }
   if (input.analysisErrorCode && input.reviewStatus !== "approved") return "Relire la demande et vérifier la proposition avant toute action.";
-  if (input.hubspotTicketId) return `Consulter le ticket lié #${input.hubspotTicketId} et vérifier la suite à donner.`;
+  if (input.hubspotTicketId) return "Consulter le ticket lié et vérifier la suite à donner.";
   if (p.routing.kind === "matched") {
     const ticketId = p.routing.ticketId;
     const name = p.dossierContext?.crm.data?.tickets.find(candidate => candidate.id === ticketId)?.subject;
-    return name ? `Vérifier le ticket « ${cleanText(name)} » et choisir l’action.` : `Vérifier le ticket #${ticketId} et choisir l’action.`;
+    return name ? `Vérifier le ticket « ${cleanText(name)} » et choisir l’action.` : "Vérifier le ticket HubSpot et choisir l’action.";
   }
   // This routing snapshot predates later CRM refreshes. The dossier chooses the
   // actual operation from its current context when the human opens it.
@@ -80,8 +84,8 @@ function nextAction(input: InboxSummaryInput) {
 export function buildSavInboxSummary(input: InboxSummaryInput) {
   const p = input.proposal;
   const u = p?.understanding;
-  const requests = u?.status === "qualified" ? u.requests : [];
-  const primary = requests.find(request => request.id === u?.primaryRequestId);
+  const requests = p?.humanProcess?.understanding.requests ?? (u?.status === "qualified" ? u.requests : []);
+  const primary = requests.find(request => request.id === (p?.humanProcess?.understanding.primaryRequestId ?? u?.primaryRequestId));
   const reviewed = input.reviewStatus === "approved" || input.reviewStatus === "rejected";
   const titleCorrected = reviewed && p && input.originalProposal && cleanText(p.ticket.title) !== cleanText(input.originalProposal.ticket.title);
   const descriptionCorrected = reviewed && p && input.originalProposal && cleanText(p.ticket.description) !== cleanText(input.originalProposal.ticket.description);
