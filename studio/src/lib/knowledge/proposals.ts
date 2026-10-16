@@ -6,6 +6,8 @@ import { auditLogs, contentItems, contentVersions, knowledgeFamilies, knowledgeF
 import { parseContentInput } from "@/lib/content";
 import { savContentHash } from "@/lib/sav/crypto";
 import { assertSavActor } from "@/lib/sav/access";
+import { closeSavLearningReservationTx } from "@/lib/sav/learning-admission";
+import { assertSavLearningAdmitted } from "@/lib/sav/learning-origin";
 import { assertKnowledgeCandidateReview, assertKnowledgeUgoApproval, canonicalKnowledgeSchema, semanticStepSchema, type CanonicalKnowledge } from "./contracts";
 import { assertSafeKnowledgeDraft, assertSafeOnboardingKnowledge } from "./onboarding-extraction";
 import { savProjectionBody } from "./conversion";
@@ -42,6 +44,7 @@ export async function lockWorkspaceLearningSource(id: string, db: Db) {
 export async function readSavLearningEvidence(id: string, db: Db = requireDb(), lock = false, allowRejected = false) {
   const [candidate] = await db.select().from(savLearningCandidates).where(eq(savLearningCandidates.id, id));
   if (!candidate || !(allowRejected ? ["pending", "approved", "rejected"] : ["pending", "approved"]).includes(candidate.status)) throw new Error("SAV_OBSERVATION_STALE");
+  if (candidate.status === "pending") await assertSavLearningAdmitted(candidate, db);
   if (candidate.sourceRef.startsWith("sav-observation:")) {
     const [cycle] = await db.select().from(savObservationCycles).where(eq(savObservationCycles.id, candidate.sourceRef.slice("sav-observation:".length)));
     const query = cycle ? db.select().from(savResolutionObservations).where(eq(savResolutionObservations.id, cycle.observationId)) : null;
@@ -285,7 +288,8 @@ export async function finishWorkspaceLearningRejection(candidate: typeof knowled
   const learningId = source?.evidence.importKind === "sav_workspace" ? source.evidence.learningCandidateId : null;
   if (typeof learningId !== "string") return;
   assertKnowledgeCandidateReview(actorEmail, "sav");
-  await tx.update(savLearningCandidates).set({ status: "rejected", reviewedBy: actorEmail, reviewedAt: new Date() }).where(and(eq(savLearningCandidates.id, learningId), eq(savLearningCandidates.status, "pending")));
+  await tx.update(savLearningCandidates).set({ status: "rejected", rejectionKind: "human", reviewedBy: actorEmail, reviewedAt: new Date() }).where(and(eq(savLearningCandidates.id, learningId), eq(savLearningCandidates.status, "pending")));
+  await closeSavLearningReservationTx(tx, learningId);
 }
 
 
@@ -306,8 +310,7 @@ export async function startSavKnowledgeRevision(candidateId: string, actorEmail:
     const learning = learningId ? await readSavLearningEvidence(learningId, tx, true, true) : null;
     if (learning && learning.fingerprint !== source.evidence.learningSourceHash) throw new Error("SAV_OBSERVATION_STALE");
     if (learning?.candidate.status === "rejected") {
-      await tx.insert(auditLogs).values({ actorEmail, action: "sav_learning_revision_started", entityType: "sav_learning_candidate", entityId: learning.candidate.id, technicalMetadata: { sourceCandidateId: candidate.id, previousReviewedBy: learning.candidate.reviewedBy, previousReviewedAt: learning.candidate.reviewedAt?.toISOString() ?? null } });
-      await tx.update(savLearningCandidates).set({ status: "pending", reviewedBy: null, reviewedAt: null }).where(eq(savLearningCandidates.id, learning.candidate.id));
+      throw new Error("SAV_LEARNING_REJECTION_FINAL");
     }
     const target = await targetState(candidate.targetItemId, tx, true);
     const proposed = parseContentInput(candidate.proposedInput);

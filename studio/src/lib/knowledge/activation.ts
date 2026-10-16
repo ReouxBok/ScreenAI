@@ -1,10 +1,11 @@
 import "server-only";
 import { and, desc, eq } from "drizzle-orm";
 import { requireDb } from "@/db";
-import { activeKnowledge, auditLogs, contentChunks, contentItems, contentVersions, knowledgeRevisions, savKnowledgeActivations, savKnowledgePublicationAttempts } from "@/db/schema";
+import { activeKnowledge, auditLogs, contentChunks, contentItems, contentVersions, knowledgeRevisions, savKnowledgeActivations, savKnowledgePublicationAttempts, savLearningCandidates, savResolutionEvidence } from "@/db/schema";
 import { assertKnowledgeUgoApproval } from "./contracts";
 import { assertOnboardingPublicationSource } from "./onboarding-import";
 import { publish } from "@/lib/workflow";
+import { closeSavLearningReservationTx } from "@/lib/sav/learning-admission";
 
 /** Publication indexes a reviewed version; activation remains a separate Ugo decision. */
 export async function publishSavKnowledgeVersion(input: { itemId: string; expectedVersionId: string }, actorEmail: string) {
@@ -57,6 +58,11 @@ export async function activateSavKnowledgeVersion(input: { itemId: string; expec
     const title = typeof version.metadata.sourceMetadata?.sourceTitle === "string" ? version.metadata.sourceMetadata.sourceTitle : typeof version.metadata.sourceMetadata?.knowledgeTitle === "string" ? version.metadata.sourceMetadata.knowledgeTitle : item.title;
     const values = { itemId: item.id, versionId: version.id, title, activatedBy: actorEmail, activatedAt: new Date() };
     await tx.insert(savKnowledgeActivations).values(values).onConflictDoUpdate({ target: savKnowledgeActivations.itemId, set: values });
+    // Activating an older/unrelated version does not activate a pending amendment.
+    const learned = await tx.select({ id: savLearningCandidates.id }).from(savLearningCandidates)
+      .innerJoin(savResolutionEvidence, and(eq(savResolutionEvidence.sourceRef, savLearningCandidates.sourceRef), eq(savResolutionEvidence.itemId, item.id), eq(savResolutionEvidence.versionId, version.id), eq(savResolutionEvidence.outcome, "human_resolution")))
+      .where(and(eq(savLearningCandidates.contentItemId, item.id), eq(savLearningCandidates.status, "approved")));
+    for (const candidate of learned) await closeSavLearningReservationTx(tx, candidate.id);
     await tx.update(contentItems).set({ aiEnabled: true, updatedAt: new Date() }).where(eq(contentItems.id, item.id));
     const revision = `kb_sav_activation_${crypto.randomUUID()}`;
     await tx.insert(knowledgeRevisions).values({ id: revision, actorEmail });

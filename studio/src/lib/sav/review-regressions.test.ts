@@ -4,6 +4,7 @@ import { createSavTestDb } from "../../../test/sav-db";
 import { v0Proposal } from "../../../test/sav-v0-review-fixture";
 import { savMailboxes, savThreads, savMessages, savAgentRuns, savDecisions, savActions, savDraftVerdicts, savResolutionObservations, savLearningCandidates, savResolutionEvidence, contentVersions, categories, knowledgeProjectionCandidates, knowledgeFamilySources, knowledgeFamilyRevisions, contentItems } from "@/db/schema";
 import { activateSavV0Cutover } from "./cutover";
+import { activateSavLearningCutover } from "./learning-admission";
 import {reconcileSavManualTicket} from "./hubspot";
 import { encryptSavPayload, savContentHash } from "./crypto";
 import { loadSavDraftContext, reviewSavDraft } from "./draft-verdicts";
@@ -12,8 +13,19 @@ import { queueSavManualTicket } from "./manual-tickets";
 import {approveLearningCandidate} from "./learning";
 import { getSavObservations, syncSavObservation, qualifySavObservation } from "./observations";
 import { type ObservationSnapshot, type ObservationEvent } from "./observation-source";
-const state = vi.hoisted(() => ({ db: null as unknown }));
+const state = vi.hoisted(() => ({ db: null as unknown, targetItemId: null as string | null }));
 vi.mock("@/db", () => ({ requireDb: () => state.db }));
+vi.mock("./learning-comparator", () => ({
+    SAV_LEARNING_COMPARATOR_REVISION: "fixture-comparator-v1", SAV_LEARNING_COMPARATOR_PROMPT_REVISION: "fixture-prompt-v1",
+    compareSavLearningResolution: async (input: { evidenceRef: string; evidenceExcerpt: string; resolution: string; knowledge: Array<{ ref: string; title: string }> }) => {
+        const target = state.targetItemId ? input.knowledge.find((entry) => entry.ref === `content:${state.targetItemId}`) : null;
+        return ({ decision: { outcome: target ? "amendment" : "new", matchedRef: target?.ref ?? null, groupSignature: "synthetic-support-resolution", subject: "Procédure fictive de support", resolution: input.resolution,
+            conditions: ["Dossier support fictif"], expectedResult: "Le problème fictif est résolu", limitations: ["Ne couvre que le scénario synthétique"],
+            evidenceRef: input.evidenceRef, evidenceExcerpt: input.evidenceExcerpt, rationale: "Résolution humaine synthétique avec résultat observable." },
+        revision: "fixture-comparator-v1", promptRevision: "fixture-prompt-v1", model: "fixture", inputHash: "fixture", durationMs: 1, inputTokens: 1, outputTokens: 1,
+    });
+    },
+}));
 let f: Awaited<ReturnType<typeof createSavTestDb>>, threadId: string, messageId: string, decisionId: string, runId: string;
 let proposal = v0Proposal();
 const now = new Date("2026-10-08T12:00:00Z");
@@ -22,6 +34,7 @@ beforeAll(async () => { f = await createSavTestDb(); state.db = f.db; }, 30000);
 afterAll(async () => f.client.close());
 afterEach(() => { vi.unstubAllEnvs(); vi.unstubAllGlobals(); });
 beforeEach(async () => {
+    state.targetItemId = null;
     vi.stubEnv("SAV_RELEASE_STAGE", "v0");
     vi.stubEnv("SAV_AUTOMATION_MODE", "assist");
     vi.stubEnv("SAV_WRITES_DISABLED", "false");
@@ -32,6 +45,7 @@ beforeEach(async () => {
     proposal = v0Proposal();
     const [mb] = await f.db.insert(savMailboxes).values({ email: "contact@limova.ai" }).returning();
     await activateSavV0Cutover({ receivedAfter: "2026-10-02T12:00:00Z", mailboxEmail: mb.email, intakeRecipient: "contact@limova.ai", deploymentSha: "a".repeat(40), activatedBy: "ugo@limova.ai" });
+    await activateSavLearningCutover({ activatedAt: "2026-10-07T00:00:00.000Z", activatedBy: "ugo@limova.ai", deploymentSha: "b".repeat(40) }, "ugo@limova.ai");
     const [thread] = await f.db.insert(savThreads).values({ mailboxId: mb.id, gmailThreadId: "fixture-thread", subject: "Fictif", customerEmail: "fixture@example.invalid" }).returning();
     threadId = thread.id;
     const [message] = await f.db.insert(savMessages).values({ threadId, mailboxId: mb.id, gmailMessageId: "fixture-message", direction: "inbound", fromEmail: thread.customerEmail, subject: thread.subject, bodyCiphertext: encryptSavPayload({ text: "Demande fictive", headers: { "message-id": "<fixture@example.invalid>" } }), receivedAt: new Date("2026-10-08T10:00:00Z") }).returning();
@@ -47,7 +61,7 @@ async function observation() { await verdict(); return (await f.db.select().from
 function event(kind = "human_reply", text = "La procédure réelle consiste à ouvrir Facturation puis télécharger la facture."): ObservationEvent { return { sourceRef: "hubspot:emails:999", kind, text, occurredAt: "2026-10-08T11:00:00.000Z", author: "owner:21", provenance: "HubSpot emails / association explicite", associationTicketId: "123", remoteUpdatedAt: "2026-10-08T11:00:00.000Z" }; }
 function snapshot(overrides: Partial<ObservationSnapshot> = {}): ObservationSnapshot { return { ticketId: "123", status: "closed", updatedAt: "2026-10-08T12:00:00.000Z", subject: "Dossier fictif", events: [event()], errors: [], ...overrides }; }
 async function linkedObservation() { await f.db.update(savThreads).set({ hubspotTicketId: "123" }).where(eq(savThreads.id, threadId)); return observation(); }
-async function qualifyInput(obsId: string) { const [row] = await getSavObservations(threadId); const c = row.cycles[0]; const proof = c.summary.humanEvidence[0]; return { observationId: obsId, cycleId: c.id, sourceHash: c.sourceHash, outcome: "resolved", evidenceRef: proof?.sourceRef ?? "", evidenceHash: proof?.contentHash ?? "", resolution: "Ouvrez Facturation puis téléchargez la facture dans votre compte.", justification: "Procédure générique vérifiée dans la réponse humaine réellement associée.", unconfirmedAcknowledged: true }; }
+async function qualifyInput(obsId: string, useLatestProof = false) { const [row] = await getSavObservations(threadId); const c = row.cycles[0]; const proof = useLatestProof ? c.summary.humanEvidence.find((entry) => entry.sourceRef.endsWith(":1000")) ?? c.summary.humanEvidence.at(-1) : c.summary.humanEvidence[0]; return { observationId: obsId, cycleId: c.id, sourceHash: c.sourceHash, outcome: "resolved", evidenceRef: proof?.sourceRef ?? "", evidenceHash: proof?.contentHash ?? "", resolution: "Ouvrez Facturation puis téléchargez la facture dans votre compte.", justification: "Procédure générique vérifiée dans la réponse humaine réellement associée.", unconfirmedAcknowledged: true }; }
 
 async function regenerateSame() {
  await f.db.update(savDecisions).set({isCurrent:false}).where(eq(savDecisions.id,decisionId));
@@ -67,6 +81,7 @@ it("F2 approves a corrected candidate after an earlier candidate for this cycle 
  await f.db.insert(categories).values({slug:"depannage",label:"Dépannage",position:0}).onConflictDoNothing();
  const o=await linkedObservation();await syncSavObservation(o.id,async()=>snapshot(),now);
  const first=await qualifySavObservation(await qualifyInput(o.id),"ugo@limova.ai");const initial=await approveLearningCandidate(first.candidateId!,"ugo@limova.ai");
+ state.targetItemId=initial.item.id;
  await syncSavObservation(o.id,async()=>snapshot({events:[event("human_reply","Nouvelle résolution humaine : ouvrir Paramètres et corriger le compte.")]}),now);
  const second=await qualifySavObservation({...await qualifyInput(o.id),resolution:"Ouvrez Paramètres puis corrigez le compte avant de recommencer."},"ugo@limova.ai");
  expect(second.candidateId).not.toBe(first.candidateId);
@@ -146,14 +161,14 @@ it("F7 creates an idempotent proposal from revalidated evidence without reviving
  await f.db.insert(categories).values({slug:"depannage",label:"Dépannage",position:0}).onConflictDoNothing();
  const o=await linkedObservation(); await syncSavObservation(o.id,async()=>snapshot(),now);
  const first=await qualifySavObservation(await qualifyInput(o.id),"ugo@limova.ai");
- await approveLearningCandidate(first.candidateId!,"ugo@limova.ai");
+ const firstApproved=await approveLearningCandidate(first.candidateId!,"ugo@limova.ai"); state.targetItemId=firstApproved.item.id;
  const [source]=await f.db.select().from(knowledgeFamilySources).where(eq(knowledgeFamilySources.sourceRef,`sav-learning:${first.candidateId}`));
  const [original]=await f.db.select().from(knowledgeProjectionCandidates).where(eq(knowledgeProjectionCandidates.sourceId,source.id));
  expect(original.status).toBe("needs_recording");
  await syncSavObservation(o.id,async()=>snapshot({events:[event(),{...event("human_reply","Confirmation humaine supplémentaire : la procédure de téléchargement reste valide."),sourceRef:"hubspot:emails:1000"}]}),now);
  const [historical]=await f.db.select().from(knowledgeProjectionCandidates).where(eq(knowledgeProjectionCandidates.id,original.id));
  expect(historical.status).toBe("rejected");
- const second=await qualifySavObservation(await qualifyInput(o.id),"ugo@limova.ai");
+ const second=await qualifySavObservation(await qualifyInput(o.id,true),"ugo@limova.ai");
  expect(second.candidateId).not.toBe(first.candidateId);
  const approved=await approveLearningCandidate(second.candidateId!,"ugo@limova.ai");
  await approveLearningCandidate(second.candidateId!,"ugo@limova.ai");

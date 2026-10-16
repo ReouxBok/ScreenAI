@@ -1,4 +1,6 @@
 import "server-only";
+import { getSavLearningCutover, recordSavLearningSignal } from "./learning-admission";
+import { processSavLearningResolution } from "./learning-pipeline";
 import { SAV_TICKET_RETURN_NOTE_VERSION, savTicketReturnNote } from "./ticket-return-note";
 
 import { createHmac, timingSafeEqual } from "node:crypto";
@@ -11,7 +13,6 @@ import {
   savActorType,
   savAgentRuns,
   savDecisions,
-  savLearningCandidates,
   savMessages,
   savMailboxes,
   savProposalReviews,
@@ -1007,8 +1008,9 @@ export async function processPendingPilotHubspotActionsAcrossBatches(limit = 100
 
 async function loadTicketEmails(ticket: HubspotRecord) {
   const ids = ticket.associations?.emails?.results?.map((association) => association.id) ?? [];
+  if (ids.length > 200) throw new Error("HUBSPOT_EMAILS_TRUNCATED");
   const emails: HubspotRecord[] = [];
-  for (const id of ids.slice(-200)) {
+  for (const id of ids) {
     emails.push(await hubspotFetch<HubspotRecord>(`/crm/v3/objects/emails/${encodeURIComponent(id)}?properties=hs_email_text,hs_email_html,hs_email_subject,hs_email_from_email,hs_email_to_email,hs_timestamp,hs_email_direction`));
   }
   return emails;
@@ -1081,13 +1083,22 @@ async function snapshotTicket(ticket: HubspotRecord) {
     hs_timestamp: String(email.properties.hs_timestamp || ""),
     hs_email_direction: String(email.properties.hs_email_direction || ""),
   })));
+  const sourceTruncated = transcript.length !== emails.length || emails.some(email => hubspotEmailPlainText(String(email.properties.hs_email_text || email.properties.hs_email_html || "")).length > HUBSPOT_TICKET_EMAIL_BODY_MAX_CHARS);
   const outbound = transcript.filter((email) => isHubspotOutboundDirection(String(email.hs_email_direction || "")));
   const humanIntervened = outbound.some((email) => !isSavAiAuthoredReply(String(email.hs_email_text || email.hs_email_html || "")));
   const closed = (await closedTicketStages()).has(String(ticket.properties.hs_pipeline_stage || ""));
   const updatedAt = new Date(ticket.updatedAt || ticket.properties.hs_lastmodifieddate || Date.now());
+  const db = requireDb();
+  const [previousSnapshot] = await db.select().from(savTicketSnapshots).where(eq(savTicketSnapshots.hubspotTicketId, ticket.id)).limit(1);
+  if (previousSnapshot && updatedAt < previousSnapshot.hubspotUpdatedAt) return previousSnapshot;
+  const cutover = await getSavLearningCutover();
+  const createdAt = ticket.createdAt ? new Date(ticket.createdAt) : null;
+  const validCreation = createdAt && Number.isFinite(createdAt.getTime()) && cutover && createdAt > new Date(cutover.activatedAt) ? createdAt : null;
+  // A closing timestamp never proves when the resolution cycle began.
+  const learningCycleStartedAt = !closed && previousSnapshot?.status === "closed" && updatedAt > previousSnapshot.hubspotUpdatedAt
+    ? updatedAt : previousSnapshot?.learningCycleStartedAt ?? validCreation;
   const ticketContent = hubspotEmailPlainText(ticket.properties.content || "").slice(0, 10_000);
   const contentHash = savContentHash({ transcript, ticketContent });
-  const db = requireDb();
   const [snapshot] = await db.insert(savTicketSnapshots).values({
     hubspotTicketId: ticket.id,
     pipelineId: ticket.properties.hs_pipeline,
@@ -1097,6 +1108,7 @@ async function snapshotTicket(ticket: HubspotRecord) {
     transcriptCiphertext: encryptSavPayload({ transcript }),
     contentHash,
     humanIntervened,
+    learningCycleStartedAt,
     resolvedAt: closed ? updatedAt : null,
     hubspotUpdatedAt: updatedAt,
     processedAt: new Date(),
@@ -1111,6 +1123,7 @@ async function snapshotTicket(ticket: HubspotRecord) {
       transcriptCiphertext: encryptSavPayload({ transcript }),
       contentHash,
       humanIntervened,
+      learningCycleStartedAt,
       resolvedAt: closed ? updatedAt : null,
       hubspotUpdatedAt: updatedAt,
       processedAt: new Date(),
@@ -1118,30 +1131,24 @@ async function snapshotTicket(ticket: HubspotRecord) {
     },
   }).returning();
   if (closed) {
-    const extracted = extractSavLearningResolution(ticketContent, transcript.map((email) => ({
-      id: email.id, direction: String(email.hs_email_direction || ""),
-      text: hubspotEmailPlainText(email.hs_email_text || email.hs_email_html || ""),
-      timestamp: email.hs_timestamp, aiAuthored: isSavAiAuthoredReply(String(email.hs_email_text || email.hs_email_html || "")),
-    })));
-    const finalResolution = extracted.resolution;
-    if (finalResolution.length >= 20) await db.insert(savLearningCandidates).values({
-      hubspotTicketId: ticket.id,
-      sourceRef: `hubspot:${ticket.id}`,
-      sourceContentHash: contentHash,
-      proposedPatch: {
-        ciphertext: encryptSavPayload({
-          subject: snapshot.subject,
-          finalHumanResolution: finalResolution,
-          sourceSnapshotId: snapshot.id,
-          provenance: extracted.provenance,
-          customerConfirmed: extracted.customerConfirmed,
-          sourceMessageId: extracted.sourceMessageId,
-        }),
-      },
-      explanation: `${extracted.provenance === "human_resolution" ? "Résolution humaine" : extracted.provenance === "ai_resolution" ? "Réponse IA" : "Contenu du ticket"}${extracted.customerConfirmed ? " confirmée par un message client ultérieur" : " sans confirmation client explicite"}. Cette proposition doit être relue avant de devenir une fiche de connaissance.`,
-      evidenceTicketIds: [ticket.id],
-      createdBy: "system",
-    }).onConflictDoNothing();
+    if (sourceTruncated) {
+      await recordSavLearningSignal({ sourceRef: `hubspot:${ticket.id}`, sourceHash: contentHash, origin: "hubspot", reasonCode: "source_truncated" });
+    } else if (!learningCycleStartedAt) {
+      await recordSavLearningSignal({ sourceRef: `hubspot:${ticket.id}`, sourceHash: contentHash, origin: "hubspot",
+        reasonCode: "no_new_resolution_cycle", details: { snapshotId: snapshot.id, policyRevision: "sav-learning-admission-2026-10-15.v1" } });
+    } else {
+      const extracted = extractSavLearningResolution(ticketContent, transcript.map((email) => ({
+        id: email.id, direction: String(email.hs_email_direction || ""),
+        text: hubspotEmailPlainText(email.hs_email_text || email.hs_email_html || ""),
+        timestamp: email.hs_timestamp, aiAuthored: isSavAiAuthoredReply(String(email.hs_email_text || email.hs_email_html || "")),
+      })));
+      await processSavLearningResolution({
+        ticketId: ticket.id, cycleStartedAt: learningCycleStartedAt, snapshotId: snapshot.id, snapshotHash: contentHash,
+        subject: snapshot.subject, resolution: extracted.resolution, provenance: extracted.provenance,
+        sourceMessageId: extracted.sourceMessageId, customerConfirmed: extracted.customerConfirmed,
+        evidenceOccurredAt: transcript.find(email => email.id === extracted.sourceMessageId)?.hs_timestamp || "invalid",
+      });
+    }
   }
   return snapshot;
 }

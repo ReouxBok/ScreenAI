@@ -1,6 +1,7 @@
 import { sql } from "drizzle-orm";
 import {
   boolean,
+  date,
   index,
   integer,
   jsonb,
@@ -739,7 +740,7 @@ export const savResolutionObservations = sav.table("resolution_observations", {
 export const savObservationCycles = sav.table("observation_cycles", {
   id:uuid("id").defaultRandom().primaryKey(),observationId:uuid("observation_id").notNull().references(()=>savResolutionObservations.id,{onDelete:"cascade"}),
   cycle:integer("cycle").notNull(),status:text("status").notNull(),summaryCiphertext:text("summary_ciphertext").notNull(),sourceHash:text("source_hash").notNull(),
-  candidateId:uuid("candidate_id"),qualification:text("qualification"),qualifiedBy:text("qualified_by"),qualifiedAt:timestamp("qualified_at",{withTimezone:true}),
+  candidateId:uuid("candidate_id"),qualification:text("qualification"),learningDisposition:text("learning_disposition"),qualifiedBy:text("qualified_by"),qualifiedAt:timestamp("qualified_at",{withTimezone:true}),
   closedAt:timestamp("closed_at",{withTimezone:true}),createdAt:timestamp("created_at",{withTimezone:true}).notNull().defaultNow(),updatedAt:timestamp("updated_at",{withTimezone:true}).notNull().defaultNow(),
 },t=>[uniqueIndex("sav_observation_cycle_idx").on(t.observationId,t.cycle)]);
 
@@ -832,6 +833,7 @@ export const savTicketSnapshots = sav.table("ticket_snapshots", {
   transcriptCiphertext: text("transcript_ciphertext").notNull(),
   contentHash: text("content_hash").notNull(),
   humanIntervened: boolean("human_intervened").notNull().default(false),
+  learningCycleStartedAt: timestamp("learning_cycle_started_at", { withTimezone: true }),
   resolvedAt: timestamp("resolved_at", { withTimezone: true }),
   hubspotUpdatedAt: timestamp("hubspot_updated_at", { withTimezone: true }).notNull(),
   processedAt: timestamp("processed_at", { withTimezone: true }),
@@ -865,15 +867,96 @@ export const savLearningCandidates = sav.table("learning_candidates", {
   explanation: text("explanation").notNull(),
   sourceContentHash: text("source_content_hash").notNull(),
   evidenceTicketIds: text("evidence_ticket_ids").array().notNull().default([]),
+  evidenceCaseCount: integer("evidence_case_count").notNull().default(1),
+  admissionGroupKey: text("admission_group_key"),
+  rejectionKind: text("rejection_kind"),
   createdBy: savActorType("created_by").notNull().default("system"),
   reviewedBy: text("reviewed_by"),
   reviewedAt: timestamp("reviewed_at", { withTimezone: true }),
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
 }, (table) => [
   uniqueIndex("sav_learning_source_content_idx").on(table.sourceRef, table.sourceContentHash),
+  uniqueIndex("sav_learning_open_group_idx").on(table.admissionGroupKey).where(sql`${table.admissionGroupKey} is not null and ${table.status} <> 'rejected'`),
   index("sav_learning_status_created_idx").on(table.status, table.createdAt),
   index("sav_learning_ticket_idx").on(table.hubspotTicketId),
 ]);
+
+/** Bounded, PII-free decisions from the automatic knowledge admission pipeline. */
+export const savLearningAdmissionSignals = sav.table("learning_admission_signals", {
+  id: uuid("id").defaultRandom().primaryKey(),
+  dedupeKey: text("dedupe_key").notNull().unique(),
+  sourceRef: text("source_ref").notNull(),
+  sourceHash: text("source_hash").notNull(),
+  origin: text("origin").notNull(),
+  reasonCode: text("reason_code").notNull(),
+  groupKey: text("group_key"),
+  candidateId: uuid("candidate_id").references(() => savLearningCandidates.id, { onDelete: "set null" }),
+  state: text("state").notNull().default("signal"),
+  comparatorRevision: text("comparator_revision"),
+  promptRevision: text("prompt_revision"),
+  modelName: text("model_name"),
+  inputHash: text("input_hash"),
+  inputTokens: integer("input_tokens"),
+  outputTokens: integer("output_tokens"),
+  durationMs: integer("duration_ms"),
+  errorCode: text("error_code"),
+  details: jsonb("details").$type<Record<string, unknown>>().notNull().default({}),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+}, (table) => [
+  index("sav_learning_signal_created_idx").on(table.createdAt),
+  index("sav_learning_signal_group_idx").on(table.groupKey, table.state),
+]);
+
+export const savLearningAdmissionStats = sav.table("learning_admission_stats", {
+  day: date("day").notNull(),
+  origin: text("origin").notNull(),
+  reasonCode: text("reason_code").notNull(),
+  count: integer("count").notNull().default(0),
+}, (table) => [primaryKey({ columns: [table.day, table.origin, table.reasonCode] })]);
+
+/** Durable terminal decisions, independent of the bounded display journal. No text/PII payload. */
+export const savLearningAdmissionAttempts = sav.table("learning_admission_attempts", {
+  id: uuid("id").defaultRandom().primaryKey(),
+  dedupeKey: text("dedupe_key").notNull().unique(),
+  sourceRef: text("source_ref").notNull(),
+  sourceHash: text("source_hash").notNull(),
+  origin: text("origin").notNull(),
+  reasonCode: text("reason_code").notNull(),
+  state: text("state").notNull(),
+  candidateId: uuid("candidate_id").references(() => savLearningCandidates.id, { onDelete: "set null" }),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  completedAt: timestamp("completed_at", { withTimezone: true }),
+}, (table) => [index("sav_learning_attempt_candidate_idx").on(table.candidateId)]);
+
+export const savLearningAdmissionReservations = sav.table("learning_admission_reservations", {
+  id: uuid("id").defaultRandom().primaryKey(),
+  reservationKey: text("reservation_key").notNull().unique(),
+  candidateId: uuid("candidate_id").references(() => savLearningCandidates.id, { onDelete: "set null" }),
+  proposalKind: text("proposal_kind").notNull(),
+  state: text("state").notNull().default("open"),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  closedAt: timestamp("closed_at", { withTimezone: true }),
+}, (table) => [
+  index("sav_learning_reservation_window_idx").on(table.createdAt, table.proposalKind),
+  index("sav_learning_reservation_open_idx").on(table.state, table.createdAt),
+]);
+
+export const savLearningAdmissionCases = sav.table("learning_admission_cases", {
+  groupKey: text("group_key").notNull(),
+  caseHash: text("case_hash").notNull(),
+  candidateId: uuid("candidate_id").notNull().references(() => savLearningCandidates.id, { onDelete: "cascade" }),
+  sourceRef: text("source_ref").notNull(),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+}, (table) => [
+  primaryKey({ columns: [table.candidateId, table.caseHash] }),
+  index("sav_learning_case_candidate_idx").on(table.candidateId),
+]);
+
+export const savLearningModelUsage = sav.table("learning_model_usage", {
+  day: date("day").primaryKey(),
+  callCount: integer("call_count").notNull().default(0),
+  updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+});
 
 
 /** Internal editable proposals. Submission materializes canonical revisions/candidates. */

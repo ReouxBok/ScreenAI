@@ -54,6 +54,18 @@ test("recherche sans résultat et liste restent lisibles sur ordinateur", async 
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth + 1)).toBe(true);
 });
 
+test("la bibliothèque d’apprentissage ferme le backfill et sépare le stock historique", async ({ page }) => {
+  const external: string[] = [];
+  page.on("request", request => { if (/googleapis|hubspot/.test(request.url())) external.push(request.url()); });
+  await page.goto("/studio/sav/resolutions");
+  await expect(page.getByRole("heading", { name: "Activation explicite requise", exact: true })).toBeVisible();
+  await expect(page.getByText("Aucun ticket historique ne sera retraité.", { exact: false })).toBeVisible();
+  await expect(page.getByText(/Stock historique conservé/)).toBeVisible();
+  await expect(page.getByRole("button", { name: /Analyser .* maintenant/ })).toHaveCount(0);
+  await expect(page.getByText("5 nouvelles propositions / 7 jours glissants", { exact: true })).toBeVisible();
+  expect(external).toEqual([]);
+});
+
 test("un accès direct enregistre le dernier entrant et le fait passer à valider", async ({ page }) => {
   const path = `/studio/sav/${SAV55_THREADS.unopened}`;
   const recorded = page.waitForResponse(response => response.request().method() === "POST" && new URL(response.url()).pathname === path);

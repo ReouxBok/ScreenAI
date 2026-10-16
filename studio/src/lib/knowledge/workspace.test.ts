@@ -201,7 +201,7 @@ describe("SAV-55 canonical knowledge workspace", () => {
     expect((await paginateSavKnowledge({ tab: "human" })).rows[0].state).toBe("indexing");
   });
 
-  it("reopens a rejected learning proposal only on the same fresh evidence and preserves the rejection", async () => {
+  it("keeps a rejected learning proposal final and requires a new separately qualified proof", async () => {
     const [learning] = await fixture.db.insert(savLearningCandidates).values({ sourceRef: "ticket:rejected-observation", sourceContentHash: savContentHash({ proof: "fresh" }), explanation: "Résolution fictive qualifiée.", proposedPatch: { ciphertext: encryptSavPayload({ subject: document.objective, finalHumanResolution: document.steps[0].instruction }) }, createdBy: "human" }).returning();
     const draft = await saveSavKnowledgeProposal({ ...proposal, learningCandidateId: learning.id }, actor);
     const preview = await previewSavKnowledgeProposal(draft.id, actor);
@@ -212,11 +212,10 @@ describe("SAV-55 canonical knowledge workspace", () => {
     await fixture.db.update(savLearningCandidates).set({ sourceContentHash: savContentHash({ proof: "changed" }) }).where(eq(savLearningCandidates.id, learning.id));
     await expect(startSavKnowledgeRevision(candidate.id, actor)).rejects.toThrow("SAV_OBSERVATION_STALE");
     await fixture.db.update(savLearningCandidates).set({ sourceContentHash: learning.sourceContentHash }).where(eq(savLearningCandidates.id, learning.id));
-    const revision = await startSavKnowledgeRevision(candidate.id, actor);
-    expect(revision.origin).toBe("automatic");
-    expect((await fixture.db.select().from(savLearningCandidates))[0].status).toBe("pending");
+    await expect(startSavKnowledgeRevision(candidate.id, actor)).rejects.toThrow("SAV_LEARNING_REJECTION_FINAL");
+    expect((await fixture.db.select().from(savLearningCandidates))[0].status).toBe("rejected");
     expect((await fixture.db.select().from(knowledgeProjectionCandidates).where(eq(knowledgeProjectionCandidates.id, candidate.id)))[0].status).toBe("rejected");
-    expect((await fixture.db.select().from(auditLogs)).some((row) => row.action === "sav_learning_revision_started")).toBe(true);
+    expect((await fixture.db.select().from(auditLogs)).some((row) => row.action === "sav_learning_revision_started")).toBe(false);
   });
 
   it("restores a published version without activation and lets Ugo activate the audited rollback separately", async () => {

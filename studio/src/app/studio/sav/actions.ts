@@ -334,7 +334,7 @@ export async function reviewLearningAction(form: FormData) {
     else if (decision === "reject") await rejectLearningCandidate(candidateId, staff.email);
     else throw new Error("INVALID_LEARNING_DECISION");
   } catch (error) {
-    if (error instanceof Error && ["SAV_OBSERVATION_SYNC_IN_PROGRESS", "SAV_OBSERVATION_STALE"].includes(error.message))
+    if (error instanceof Error && ["SAV_OBSERVATION_SYNC_IN_PROGRESS", "SAV_OBSERVATION_STALE", "SAV_LEARNING_HISTORICAL_REVIEW_BLOCKED"].includes(error.message))
       redirect(`/studio/sav/resolutions?review=${error.message === "SAV_OBSERVATION_SYNC_IN_PROGRESS" ? "sync_in_progress" : "stale"}`);
     throw error;
   }

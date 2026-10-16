@@ -1,13 +1,18 @@
-import { expect, test } from "@playwright/test";
+import { expect, request as playwrightRequest, test } from "@playwright/test";
 import { submitServerAction } from "../helpers/server-action";
 
 // Cold webpack compilation of the knowledge route can take several minutes on
 // the local 8 GB test machine. Warm read-only routes before the browser scenario
 // timer; keep all business assertions and action timeouts unchanged.
-test.beforeAll(async ({ request }) => {
+test.beforeAll(async () => {
   test.setTimeout(600_000);
-  expect((await request.get("/studio/sav/connaissances/proposer", { timeout: 300_000 })).status()).toBe(200);
-  expect((await request.get("/studio/sav/connaissances/00000000-0000-4000-8000-000000000000?kind=item", { timeout: 300_000 })).status()).toBe(404);
+  const api = await playwrightRequest.newContext({ baseURL: "http://127.0.0.1:3125" });
+  try {
+    expect((await api.get("/studio/sav/connaissances/proposer", { timeout: 300_000 })).status()).toBe(200);
+    expect((await api.get("/studio/sav/connaissances/00000000-0000-4000-8000-000000000000?kind=item", { timeout: 300_000 })).status()).toBe(404);
+  } finally {
+    await api.dispose();
+  }
 });
 
 test.beforeEach(async ({ page, baseURL }) => {
