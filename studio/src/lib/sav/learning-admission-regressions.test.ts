@@ -105,7 +105,7 @@ it('blocks old pre-cutover evidence despite a later closing timestamp',async()=>
  const fake=vi.fn(async(url:unknown,init?:RequestInit)=>{
   const u=String(url);if(u.startsWith('https://generativelanguage.googleapis.com/'))return modelFetch(url,init);
   if(u.startsWith('https://api.hubapi.com/crm/v3/objects/tickets?'))return new Response(JSON.stringify({results:[{id:'99991',updatedAt:'2026-10-15T10:00:00Z',properties:{subject:'Ancien dossier fictif',hs_pipeline_stage:'closed',content:'Contenu ancien fictif'},associations:{emails:{results:[{id:'old-human-email'}]}}}]}));
-  if(u.startsWith('https://api.hubapi.com/crm/v3/objects/emails/'))return new Response(JSON.stringify({id:'old-human-email',properties:{hs_email_text:resolution,hs_timestamp:'2026-10-13T10:00:00Z',hs_email_direction:'OUTGOING_EMAIL'}}));
+  if(u==='https://api.hubapi.com/crm/v3/objects/emails/batch/read')return Response.json({results:[{id:'old-human-email',properties:{hs_email_text:resolution,hs_timestamp:'2026-10-13T10:00:00Z',hs_email_direction:'OUTGOING_EMAIL'}}]});
   if(u==='https://api.hubapi.com/crm/v3/pipelines/tickets')return new Response(JSON.stringify({results:[{stages:[{id:'closed',metadata:{ticketState:'CLOSED'}}]}]}));
   throw new Error('UNEXPECTED_MOCK_URL');
  });vi.stubGlobal('fetch',fake);
@@ -162,7 +162,7 @@ function snapshotFeed(feed:{closed:boolean;updatedAt:string;text:string}) {
  return async(url:unknown,init?:RequestInit)=>{
   const u=String(url);if(u.startsWith('https://generativelanguage.googleapis.com/'))return modelFetch(url,init);
   if(u.startsWith('https://api.hubapi.com/crm/v3/objects/tickets?'))return new Response(JSON.stringify({results:[{id:'99992',createdAt:'2026-10-01T12:00:00Z',updatedAt:feed.updatedAt,properties:{subject:'Cycle fictif',hs_pipeline_stage:feed.closed?'closed':'open',content:'Contenu fictif'},associations:{emails:{results:[{id:'new-human-email'}]}}}]}));
-  if(u.startsWith('https://api.hubapi.com/crm/v3/objects/emails/'))return new Response(JSON.stringify({id:'new-human-email',properties:{hs_email_text:feed.text,hs_timestamp:'2026-10-15T11:00:00Z',hs_email_direction:'OUTGOING_EMAIL'}}));
+  if(u==='https://api.hubapi.com/crm/v3/objects/emails/batch/read')return Response.json({results:[{id:'new-human-email',properties:{hs_email_text:feed.text,hs_timestamp:'2026-10-15T11:00:00Z',hs_email_direction:'OUTGOING_EMAIL'}}]});
   if(u==='https://api.hubapi.com/crm/v3/pipelines/tickets')return new Response(JSON.stringify({results:[{stages:[{id:'closed',metadata:{ticketState:'CLOSED'}}]}]}));
   throw new Error('UNEXPECTED_MOCK_URL');
  };
