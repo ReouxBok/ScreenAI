@@ -7,6 +7,7 @@ import { encryptSavPayload } from "./crypto";
 import { savStructuredProposalSchema } from "./proposal";
 import { savDossierSourceHash } from "./review-contract";
 import { listSavDossierDashboard } from "./dashboard";
+import { savOtherSubjectHash } from "./other-observation";
 import { recordSavDossierOpened } from "./opened-email";
 import { findSavExternalCompletion, getSavExternalCompletion, markSavDossiersHandledExternally, revertSavExternalCompletionBatch, SAV_EXTERNAL_COMPLETION } from "./external-completion";
 
@@ -45,6 +46,7 @@ afterAll(async () => { await fixture?.client.close(); });
 afterEach(() => { vi.unstubAllEnvs(); vi.unstubAllGlobals(); });
 beforeEach(async () => {
   sequence = 0; network.mockClear();
+  vi.stubEnv("SAV_OTHER_OBSERVATION_RULES_JSON", "");
   vi.stubGlobal("fetch", network);
   vi.stubEnv("SAV_RELEASE_STAGE", "v0"); vi.stubEnv("SAV_PILOT_MODE", "false"); vi.stubEnv("SAV_ENCRYPTION_KEY_V1", "test-only-sav-encryption-key-32-characters");
   await fixture.client.exec("TRUNCATE sav.mailboxes CASCADE; TRUNCATE sav.sync_state; TRUNCATE active_knowledge; TRUNCATE audit_logs");
@@ -129,7 +131,7 @@ describe("SAV-55 dashboard read model", () => {
     const row = await seed();
     const [batch] = await fixture.db.insert(savPilotBatches).values({ createdBy: "ugo@limova.ai" }).returning();
     await fixture.db.insert(savPilotItems).values({ batchId: batch.id, messageId: row.message.id });
-    expect((await listSavDossierDashboard()).counts).toEqual({ to_process: 0, to_validate: 0, learning: 0, completed: 0, technical: 1, incidents: 0 });
+    expect((await listSavDossierDashboard()).counts).toEqual({ to_process: 0, to_validate: 0, learning: 0, completed: 0, other: 0, technical: 1, incidents: 0 });
     expect((await listSavDossierDashboard({ view: "technical" })).rows).toHaveLength(1);
   });
   it("does not carry an approval across a changed proposal", async () => {
@@ -270,5 +272,68 @@ describe("SAV-62 external administrative completion", () => {
     expect(findSavExternalCompletion(row.message, [{ ...event, actorEmail: "other@example.invalid" }])).toBeNull();
     expect(findSavExternalCompletion(row.message, [{ ...event, technicalMetadata: { ...event.technicalMetadata, threadId: batchId } }])).toBeNull();
     expect(findSavExternalCompletion(row.message, [{ ...event, technicalMetadata: { version: 9 } }])).toBeNull();
+  });
+});
+
+
+describe("Autre additive dashboard observation", () => {
+  async function candidate(options: Parameters<typeof seed>[0] = {}) {
+    const row = await seed({ noTicket: true, subject: "Autre fixture promotion Alpha", ...options });
+    const sender = "vistaprint@mail.vistaprint.fr";
+    await fixture.db.update(savThreads).set({ customerEmail: sender }).where(eq(savThreads.id, row.thread.id));
+    await fixture.db.update(savMessages).set({ fromEmail: sender, bodyCiphertext: encryptSavPayload({ text: "Promotion synthétique à observer uniquement.", headers: { "content-type": "text/plain", "message-id": `<fixture-${row.message.id}@example.invalid>`, references: "", "in-reply-to": "" } }) }).where(eq(savMessages.id, row.message.id));
+    await fixture.db.update(savAgentRuns).set({ proposalCiphertext: encryptSavPayload({ ...row.proposal, routing: { kind: "none", reason: "Notification fictive" } }) }).where(eq(savAgentRuns.id, row.run.id));
+    return row;
+  }
+  function configure(...rows: Awaited<ReturnType<typeof seed>>[]) {
+    vi.stubEnv("SAV_OTHER_OBSERVATION_RULES_JSON", JSON.stringify({ version: 1, rules: [{ family: "vistaprint_promotions", mailboxId, subjectSha256: [...new Set(rows.map(row => savOtherSubjectHash(row.message.subject)))] }] }));
+  }
+  it("keeps candidates in their original views and writes no action, review or audit", async () => {
+    const row = await candidate();
+    const effectTables = [savActions, savProposalReviews, auditLogs] as const;
+    const beforeEffects = await Promise.all(effectTables.map(table => fixture.db.select().from(table)));
+    const before = await listSavDossierDashboard(); configure(row);
+    const other = await listSavDossierDashboard({ view: "other" });
+    expect(other.rows.map(r => r.messageId)).toEqual([row.message.id]);
+    expect(other.rows[0].otherObservation).toMatchObject({ family: "vistaprint_promotions" });
+    expect(other.counts).toEqual({ ...before.counts, other: 1 });
+    expect((await listSavDossierDashboard()).rows.map(r => r.messageId)).toEqual([row.message.id]);
+    expect(await Promise.all(effectTables.map(table => fixture.db.select().from(table)))).toEqual(beforeEffects);
+    expect(network).not.toHaveBeenCalled();
+  });
+  it("shares search, sorting and pagination, including an out-of-range page", async () => {
+    const first = await candidate(), second = await candidate(), unrelated = await candidate({ subject: "Autre fixture autre thème" }); configure(first, second, unrelated);
+    const page = await listSavDossierDashboard({ view: "other", query: "Alpha", sort: "oldest", pageSize: 1, page: 2 });
+    expect(page).toMatchObject({ total: 2, totalPages: 2, page: 2, counts: { other: 2, to_process: 2 } });
+    expect(page.rows[0].messageId).toBe(second.message.id);
+    expect((await listSavDossierDashboard({ view: "other", query: "Alpha", sort: "oldest", pageSize: 1, page: 99 })).rows[0].messageId).toBe(second.message.id);
+    expect((await listSavDossierDashboard({ view: "other", query: "absent" })).total).toBe(0);
+  });
+  it("does not carry the prior candidate to a human reply or unknown latest message", async () => {
+    const old = await candidate(); configure(old);
+    expect((await listSavDossierDashboard({ view: "other" })).total).toBe(1);
+    const current = await seed({ threadId: old.thread.id });
+    expect((await listSavDossierDashboard({ view: "other" })).total).toBe(0);
+    expect((await listSavDossierDashboard()).rows[0].messageId).toBe(current.message.id);
+  });
+  it.each(["outbound", "other_sender", "historical_review", "ticket", "pause", "human_request", "action"])("keeps a %s context protected", async protection => {
+    const old = await candidate({ approved: protection === "historical_review" });
+    const current = protection === "historical_review" ? await candidate({ threadId: old.thread.id }) : old;
+    if (protection === "outbound" || protection === "other_sender") await fixture.db.insert(savMessages).values({ mailboxId, threadId: old.thread.id, direction: protection === "outbound" ? "outbound" : "inbound", fromEmail: "customer@example.invalid", subject: "Historique fictif", bodyCiphertext: encryptSavPayload({ text: "Historique client synthétique." }), receivedAt: new Date("2026-10-03T09:00:00Z") });
+    if (protection === "ticket") await fixture.db.update(savThreads).set({ hubspotTicketId: "fixture-ticket" }).where(eq(savThreads.id, old.thread.id));
+    if (protection === "pause") await fixture.db.update(savThreads).set({ aiPaused: true }).where(eq(savThreads.id, old.thread.id));
+    if (protection === "human_request") await fixture.db.update(savThreads).set({ humanRequestedAt: new Date() }).where(eq(savThreads.id, old.thread.id));
+    if (protection === "action") await fixture.db.insert(savActions).values({ threadId: old.thread.id, messageId: old.message.id, kind: "request_human", actorType: "human", status: "pending", idempotencyKey: "fixture-protection", payload: {} });
+    configure(current);
+    expect((await listSavDossierDashboard({ view: "other" })).total).toBe(0);
+    expect((await listSavDossierDashboard()).rows.some(row => row.messageId === current.message.id)).toBe(true);
+    expect(network).not.toHaveBeenCalled();
+  });
+  it("rejects invalid configuration and wrong mailbox without changing primary counts", async () => {
+    const row = await candidate();
+    for (const configuration of ["", "broken", JSON.stringify({ version: 1, rules: [{ family: "vistaprint_promotions", mailboxId: "10000000-0000-4000-8000-000000000001", subjectSha256: [savOtherSubjectHash(row.message.subject)] }] })]) {
+      vi.stubEnv("SAV_OTHER_OBSERVATION_RULES_JSON", configuration);
+      expect(await listSavDossierDashboard({ view: "other" })).toMatchObject({ total: 0, counts: { other: 0, to_process: 1 } });
+    }
   });
 });

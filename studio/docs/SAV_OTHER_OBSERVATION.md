@@ -78,3 +78,22 @@ migration, appel modèle ou arrêt d'analyse ajouté par cette fonctionnalité.
 
 Repli : retirer la configuration désactive le repérage, ou revenir au code
 précédent ; aucune donnée de classification n'a été écrite ou à restaurer.
+
+## Recette synthétique
+
+Tests unitaires/DB/SSR : `other-observation.test.ts`, les cas Autre de
+`dashboard.test.ts` et `inbox.test.ts`. Aucun accès fournisseur n'est nécessaire.
+
+La recette navigateur dédiée utilise uniquement des dossiers fictifs, quatre
+candidats et trois contre-exemples, dans `.e2e-db-sav-other` sur 127.0.0.1:3125.
+Elle réutilise les gardes de la recette SAV55 (aucun fichier `.env`, environnement
+opérationnel vide, écritures externes désactivées). À exécuter séquentiellement :
+
+```sh
+env -i PATH="$PATH" HOME="$HOME" TMPDIR="${TMPDIR:-/tmp}" CI=1 NEXT_TELEMETRY_DISABLED=1 \
+  node_modules/.bin/playwright test --config playwright.sav-other.config.ts
+```
+
+Le navigateur est limité à l'origine locale. Les ouvertures enregistrent seulement
+l'audit de consultation dans cette base fictive ; aucun message réel n'est lu,
+rejoué, déplacé ou envoyé. Cette recette ne qualifie pas les modèles de production.
