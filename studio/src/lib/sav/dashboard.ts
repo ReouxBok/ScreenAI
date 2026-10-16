@@ -7,10 +7,12 @@ import { savV0EligibleMessageFilter } from "./cutover";
 import { buildSavInboxSummary, type SavInboxPartnershipStatus } from "./inbox-summary";
 import { savStructuredProposalSchema, mergeSavReviewedProposal, type SavStructuredProposal } from "./proposal";
 import { savDraftNotApplicable, savDraftSourceHash, savReviewMatchesProposal } from "./review-contract";
-import { classifySavDossier, savDashboardNextAction, type SavDashboardView, type SavLearningProgress, type SavOpeningState, type SavTicketProgress } from "./dashboard-state";
+import { classifySavDossier, savDashboardNextAction, type SavDossierState, type SavLearningProgress, type SavOpeningState, type SavTicketProgress } from "./dashboard-state";
 import type { SavDossierContext } from "./dossier-context";
 import { findSavExternalCompletion, hasUnsettledSavHumanAction, savExternalCompletionEvents } from "./external-completion";
 import { savDashboardLearningProgress } from "./learning-progress";
+import { observeSavOther, readSavOtherConfiguration, type SavOtherObservation } from "./other-observation";
+import type { SavMessageBody } from "./service";
 
 const technicalKinds = new Set(["spam", "automatic_reply", "bounce", "internal_notification", "duplicate"]);
 type Action = typeof savActions.$inferSelect;
@@ -30,11 +32,12 @@ export function savDashboardTicketProgress(actions: Action[], messageId: string,
 export { savDashboardLearningProgress } from "./learning-progress";
 export type SavDashboardRow = {
   threadId: string; messageId: string; receivedAt: Date; fromEmail: string;
-  summary: ReturnType<typeof buildSavInboxSummary>; opening: SavOpeningState; state: SavDashboardView;
+  summary: ReturnType<typeof buildSavInboxSummary>; opening: SavOpeningState; state: SavDossierState;
   reviewStatus: string | null; draftStatus: string; replyStatus: string; partnershipStatus: SavInboxPartnershipStatus | null; ticketProgress: SavTicketProgress; learning: SavLearningProgress;
   ticket: { id: string; title: string; status: string } | null; crmStatus: "ready" | "partial" | "error" | "unknown";
   nextAction: string; incident: boolean; technical: boolean;
   handledExternally?: boolean;
+  otherObservation?: SavOtherObservation | null;
 };
 /** One snapshot and one classification predicate for counts and page rows. Private
  * proposal content is decrypted on the server and never returned to the browser. */
@@ -42,15 +45,18 @@ export async function listSavDossierDashboard(options: { view?: string; query?: 
   const pageSize = Math.min(50, Math.max(1, options.pageSize ?? 25));
   const query = options.query?.trim().slice(0, 200).toLocaleLowerCase("fr") ?? "";
   const requestedPage = Math.max(1, Math.min(100_000, Math.trunc(options.page ?? 1) || 1));
-  const view = ["to_process", "to_validate", "learning", "completed", "technical", "incidents"].includes(options.view ?? "") ? options.view! : "to_process";
+  const view = ["to_process", "to_validate", "learning", "completed", "other", "technical", "incidents"].includes(options.view ?? "") ? options.view! : "to_process";
+  const otherConfiguration = readSavOtherConfiguration();
   return requireDb().transaction(async (db) => {
     const [knowledge] = await db.select({ revisionId: activeKnowledge.revisionId }).from(activeKnowledge).limit(1);
-    const counts = { to_process: 0, to_validate: 0, learning: 0, completed: 0, technical: 0, incidents: 0 };
+    const counts = { to_process: 0, to_validate: 0, learning: 0, completed: 0, other: 0, technical: 0, incidents: 0 };
     const requestedRows: SavDashboardRow[] = [];
     let lastPageRows: SavDashboardRow[] = [], total = 0;
     let offset = 0;
     while (true) {
-      const batch = await db.select({ message: savMessages, thread: savThreads, decision: savDecisions, run: savAgentRuns, review: savProposalReviews })
+      const batch = await db.select({ message: savMessages, thread: savThreads, decision: savDecisions, run: savAgentRuns, review: savProposalReviews,
+        hasProtectedHistory: otherConfiguration.registry ? sql<boolean>`exists (select 1 from sav.messages correspondence where correspondence.thread_id = ${savThreads.id} and (correspondence.direction <> 'inbound' or lower(btrim(correspondence.from_email)) <> lower(btrim(${savMessages.fromEmail})) or exists (select 1 from sav.proposal_reviews historical_review where historical_review.message_id = correspondence.id)))` : sql<boolean>`true`,
+      })
         .from(savMessages).innerJoin(savThreads, eq(savThreads.id, savMessages.threadId))
         .leftJoin(savDecisions, and(eq(savDecisions.messageId, savMessages.id), eq(savDecisions.isCurrent, true)))
         .leftJoin(savAgentRuns, eq(savAgentRuns.id, savDecisions.agentRunId))
@@ -77,11 +83,13 @@ export async function listSavDossierDashboard(options: { view?: string; query?: 
       const ticketIds = batch.flatMap(row => row.thread.hubspotTicketId ? [row.thread.hubspotTicketId] : []);
       const candidates = await db.select({ id: savLearningCandidates.id, status: savLearningCandidates.status, threadId: savLearningCandidates.threadId, hubspotTicketId: savLearningCandidates.hubspotTicketId, sourceRef: savLearningCandidates.sourceRef }).from(savLearningCandidates).where(sql`((${inArray(savLearningCandidates.threadId, threads)} or ${ticketIds.length ? inArray(savLearningCandidates.hubspotTicketId, ticketIds) : sql`false`}) and ${savLearningCandidates.status} = 'pending') or ${candidateIds.length ? inArray(savLearningCandidates.id, candidateIds) : sql`false`}`);
       const openedIds = new Set(openingProofs.map(proof => proof.messageId));
-      for (const { message, thread, decision, run, review } of batch) {
+      for (const { message, thread, decision, run, review, hasProtectedHistory } of batch) {
         let original: SavStructuredProposal | null = null, proposal: SavStructuredProposal | null = null, reviewStatus: string | null = null;
         let context: SavDossierContext | null = null, draftStatus = "Non disponible";
+        let messageBody: SavMessageBody | null = null;
         try {
-          const body = decryptSavPayload<{ text: string; supportContext?: SavDossierContext }>(message.bodyCiphertext);
+          const body = decryptSavPayload<SavMessageBody>(message.bodyCiphertext);
+          messageBody = body;
           context = body.supportContext?.messageId === message.id ? body.supportContext : null;
           original = run?.proposalCiphertext ? savStructuredProposalSchema.parse(decryptSavPayload(run.proposalCiphertext)) : null;
           proposal = original;
@@ -116,12 +124,25 @@ export async function listSavDossierDashboard(options: { view?: string; query?: 
         const linkedTicket = context?.crm.data?.tickets.find(t => t.id === thread.hubspotTicketId);
         const incident = Boolean(analysisErrorCode || ["failed", "uncertain"].includes(ticketProgress) || partnershipTransferStatus && ["failed", "uncertain"].includes(partnershipTransferStatus));
         const technical = technicalKinds.has(proposal?.decision.kind ?? decision?.kind ?? "");
-        const row: SavDashboardRow = { threadId: thread.id, messageId: message.id, receivedAt: message.receivedAt, fromEmail: message.fromEmail, summary, opening, state, reviewStatus, draftStatus, replyStatus, partnershipStatus: partnershipTransferStatus, ticketProgress, learning, incident, technical, handledExternally,
+        const otherObservation = observeSavOther({
+          mailboxId: message.mailboxId, fromEmail: message.fromEmail, subject: message.subject, gmailMessageId: message.gmailMessageId, body: messageBody,
+          protectedContext: hasProtectedHistory !== false || Boolean(thread.hubspotTicketId || thread.aiPaused || thread.humanRequestedAt
+            || review || threadActions.length || observations.some(o => o.threadId === thread.id)
+            || candidates.some(c => c.threadId === thread.id) || context?.crm.data?.tickets.length
+            || proposal?.routing.kind === "matched" || proposal?.routing.kind === "new"
+            || proposal?.humanProcess?.action === "partnership" || ["high", "critical"].includes(proposal?.urgency ?? "")
+            || proposal?.understanding?.customerRelationship?.kind === "existing_customer"
+            || proposal?.understanding?.requests.some(r => !["non_support", "unknown"].includes(r.nature))),
+        }, otherConfiguration.registry);
+        const row: SavDashboardRow = { threadId: thread.id, messageId: message.id, receivedAt: message.receivedAt, fromEmail: message.fromEmail, summary, opening, state, reviewStatus, draftStatus, replyStatus, partnershipStatus: partnershipTransferStatus, ticketProgress, learning, incident, technical, handledExternally, otherObservation,
           ticket: thread.hubspotTicketId ? { id: thread.hubspotTicketId, title: linkedTicket?.subject || "Ticket HubSpot", status: linkedTicket?.status === "closed" ? "Fermé" : linkedTicket?.status === "open" ? "Ouvert" : "Statut à actualiser" } : null,
           crmStatus: context?.crm.status ?? "unknown", nextAction: handledExternally ? "Traité hors Studio" : proposal?.humanProcess?.action === "partnership" ? summary.nextAction : state === "completed" && (partnershipTransferStatus || proposal?.understanding?.requests.some(r => r.nature === "partnership")) ? summary.nextAction : savDashboardNextAction({ state, reviewStatus, ticket: ticketProgress, learning, analysisFailed: Boolean(analysisErrorCode) }) };
         if (query && ![row.fromEmail, message.subject, message.preview, summary.title, summary.problem, row.ticket?.title, row.ticket?.id].filter(Boolean).join(" ").toLocaleLowerCase("fr").includes(query)) continue;
         if (technical) counts.technical++; else { counts[state]++; if (incident) counts.incidents++; }
-        if (view === "technical" ? technical : view === "incidents" ? !technical && incident : !technical && state === view) {
+        // Observation is additive: business/technical counts and predicates above
+        // remain unchanged. A candidate is never removed from its current view.
+        if (otherObservation) counts.other++;
+        if (view === "other" ? Boolean(otherObservation) : view === "technical" ? technical : view === "incidents" ? !technical && incident : !technical && state === view) {
           if (total % pageSize === 0) lastPageRows = [];
           lastPageRows.push(row);
           if (total >= (requestedPage - 1) * pageSize && total < requestedPage * pageSize) requestedRows.push(row);
@@ -133,6 +154,6 @@ export async function listSavDossierDashboard(options: { view?: string; query?: 
     }
     const totalPages = Math.max(1, Math.ceil(total / pageSize));
     const page = Math.min(requestedPage, totalPages);
-    return { rows: page === requestedPage ? requestedRows : lastPageRows, counts, page, pageSize, total, totalPages, view };
+    return { rows: page === requestedPage ? requestedRows : lastPageRows, counts, page, pageSize, total, totalPages, view, otherConfigurationStatus: otherConfiguration.status };
   }, { isolationLevel: "repeatable read", accessMode: "read only" });
 }
