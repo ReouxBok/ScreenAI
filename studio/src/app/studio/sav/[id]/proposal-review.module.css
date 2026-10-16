@@ -32,7 +32,7 @@
   font-size: 12px;
 }
 
-.review input:not([type="hidden"]):not([type="checkbox"]),
+.review input:not([type="hidden"]):not([type="checkbox"]):not([type="radio"]),
 .review select {
   width: 100%;
   min-width: 0;
@@ -44,7 +44,8 @@
   font-size: 13px;
 }
 
-.review label:has(input[type="checkbox"]) {
+.review label:has(input[type="checkbox"]),
+.review label:has(input[type="radio"]) {
   display: flex;
   align-items: start;
 }

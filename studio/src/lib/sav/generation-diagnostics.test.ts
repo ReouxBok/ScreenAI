@@ -67,7 +67,7 @@ async function expectFailedPhase(phase: Phase, code: string) {
     expect(snapshot.replyDraft).toContain(input.body);
     if (phase === "coherence") expect(snapshot.replyAssessment?.coherence).toMatchObject({ status: "unavailable", errorCode: code });
   }
-  expect(network).toHaveBeenCalledTimes(phases.indexOf(phase) + 1);
+  expect(network).toHaveBeenCalledTimes(phases.indexOf(phase) + 1 + (["SAV_AI_TIMEOUT", "SAV_AI_GENERATION_FAILED", "SAV_AI_HTTP_429", "SAV_AI_HTTP_503"].includes(code) ? 1 : 0));
   expect(state.agent).not.toHaveBeenCalled();
 }
 
@@ -141,9 +141,10 @@ describe("SAV generation diagnostics on isolated PostgreSQL", () => {
     expect(result.structuredProposal?.ticket.description).toBe(body);
     expect(JSON.stringify(warnings.mock.calls)).not.toContain(body);
   });
-  it.each(phases.flatMap(phase => [401, 402, 404, 429, 503].map(status => ({ phase, status }))))("retains HTTP $status during $phase without recording success or retrying", async ({ phase, status }) => {
+  it.each(phases.flatMap(phase => [401, 402, 404, 429, 503].map(status => ({ phase, status }))))("retains HTTP $status during $phase without recording false success", async ({ phase, status }) => {
     beforeFailure(phase);
     network.mockResolvedValueOnce(new Response("private provider body", { status }));
+    if ([429, 503].includes(status)) network.mockResolvedValueOnce(new Response("private provider body", { status }));
     await expectFailedPhase(phase, `SAV_AI_HTTP_${status}`);
     const log = JSON.stringify(warnings.mock.calls);
     if (phase !== "coherence") expect(log).toContain(`SAV_AI_HTTP_${status}`);
@@ -157,8 +158,8 @@ describe("SAV generation diagnostics on isolated PostgreSQL", () => {
     beforeFailure(phase);
     if (kind === "invalid-json") network.mockResolvedValueOnce(Response.json({ candidates: [{ content: { parts: [{ text: "not JSON" }] } }] }));
     if (kind === "invalid-schema") network.mockResolvedValueOnce(geminiFixture({ private: "customer@example.com" }));
-    if (kind === "abort") { const error = new Error("private provider text"); error.name = "AbortError"; network.mockRejectedValueOnce(error); }
-    if (kind === "network") network.mockRejectedValueOnce(new Error("customer@example.com key=private-credential"));
+    if (kind === "abort") { const error = new Error("private provider text"); error.name = "AbortError"; network.mockRejectedValueOnce(error).mockRejectedValueOnce(error); }
+    if (kind === "network") network.mockRejectedValueOnce(new Error("customer@example.com key=private-credential")).mockRejectedValueOnce(new Error("private retry failure"));
     await expectFailedPhase(phase, code);
     expect(JSON.stringify(warnings.mock.calls)).not.toMatch(/customer@example.com|private-credential|private provider text/);
   });

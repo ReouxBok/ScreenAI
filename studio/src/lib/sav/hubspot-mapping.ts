@@ -1,3 +1,5 @@
+import type { SavStructuredProposal } from "./proposal";
+
 /** Verified via HubSpot property definitions in portal 143641967, 2026-10-02.
  * Keep the portal's exact option values, including existing spelling mistakes.
  */
@@ -38,8 +40,8 @@ export function assertSavSupportPipeline(pipeline: { id: string; stages: Array<{
   }
 }
 
-export function savSupportTicketProperties(input: { title: string; description: string; categories?: SavSupportCategory[] }) {
-  const subject = input.title.trim().split(/\s+/).slice(0, 5).join(" ");
+export function savSupportTicketProperties(input: { title: string; description: string; categories?: SavSupportCategory[]; reviewedTitle?: boolean }) {
+  const subject = input.title.trim().split(/\s+/).slice(0, input.reviewedTitle ? 6 : 5).join(" ");
   if (!subject || !input.description.trim()) throw new Error("SAV_HUBSPOT_TICKET_CONTENT_REQUIRED");
   const properties: Record<string, string> = {
     subject, content: input.description, hs_pipeline: SAV_HUBSPOT_SUPPORT.pipelineId,
@@ -54,4 +56,16 @@ export function savSupportTicketProperties(input: { title: string; description: 
   }
   // No owner assignment: Ugo's support procedure explicitly leaves it empty.
   return properties;
+}
+
+/** Human-reviewed fields affect new tickets only; existing ticket metadata stays
+ * outside the link/reactivation command. Priority options verified 2026-10-15. */
+export function savReviewedTicketProperties(proposal: SavStructuredProposal) {
+  if (!proposal.humanProcess) return savSupportTicketProperties(proposal.ticket);
+  const natures = proposal.humanProcess.understanding.requests.map(request => request.nature);
+  const category: SavSupportCategory = natures.includes("cancellation") ? "cancellation"
+    : natures.some(nature => ["financial_operation", "financial_data"].includes(nature)) ? "billing"
+    : ({ technical:"technical",account:"access",billing:"billing",integration:"technical",how_to:"misuse",acknowledgement:"other",other:"other" } as const)[proposal.category];
+  return { ...savSupportTicketProperties({ ...proposal.ticket, reviewedTitle:true, categories:[category] }),
+    hs_ticket_priority:({ low:"LOW",normal:"MEDIUM",high:"HIGH",critical:"URGENT" } as const)[proposal.urgency] };
 }

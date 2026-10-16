@@ -23,6 +23,7 @@ const responseSchema = z.object({
 // Only these allowlisted enums and numeric counters may enter logs or run traces.
 // Provider messages, text, thought summaries and signatures remain transient.
 export type SavGeminiMetadata = {
+  transport?: import("./gemini-transport").SavAiTransportTrace;
   finishReason?: typeof finishReasons[number] | "UNKNOWN";
   blockReason?: typeof blockReasons[number] | "UNKNOWN";
   inputTokens?: number;

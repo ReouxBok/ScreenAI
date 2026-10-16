@@ -36,16 +36,23 @@ test("SAV44 exposes understanding and persists independent dossier/draft feedbac
   await dossier.getByRole("checkbox", { name: "Connaissance manquante", exact: true }).check();
   await dossier.getByRole("combobox", { name: "Verdict global", exact: true }).selectOption("partial");
   await dossier.getByRole("combobox", { name: "Fiabilité", exact: true }).selectOption("partial");
+  const processConfirmation = dossier.getByRole("region", { name: "Correction humaine du process", exact: true })
+    .getByRole("checkbox", { name: /J’ai vérifié la demande et le choix d’action/ });
+  await expect(processConfirmation).toHaveAttribute("required");
+  await expect(processConfirmation).not.toBeChecked();
+  await processConfirmation.check();
   await submitServerAction(page, dossier.getByRole("button", { name: "Valider le dossier / process", exact: true }));
   await page.waitForURL(/review=saved/, { timeout: 30_000 });
   await expect(dossier).toContainText("Dossier · Process validé par ugo@limova.ai");
-  await expect(draft).toContainText("Brouillon refusé · traitement humain à observer.");
+  await expect(draft).toContainText("Contexte ou texte modifié : nouvelle lecture nécessaire.");
+  await expect(draft.getByRole("button", { name: "Accepter cette version", exact: true })).toBeEnabled();
   await expect(page.getByRole("button", { name: "Préparer l’aperçu de l’action", exact: true })).toBeEnabled();
   await expect(draft.getByRole("button", { name: "Envoyer la réponse acceptée", exact: true })).toBeDisabled();
 
   await page.reload();
   await expect(dossier).toContainText("Dossier · Process validé par ugo@limova.ai");
-  await expect(draft).toContainText("Brouillon refusé · traitement humain à observer.");
+  await expect(draft).toContainText("Contexte ou texte modifié : nouvelle lecture nécessaire.");
+  await expect(draft.getByRole("button", { name: "Accepter cette version", exact: true })).toBeEnabled();
   await expect(draft.getByRole("textbox", { name: "Motif du refus (facultatif)", exact: true })).toHaveValue(reason);
   await expect(draft.getByRole("checkbox", { name: "Réponse hors sujet", exact: true })).toBeChecked();
   await dossier.getByText("Évaluer la proposition et proposer une connaissance", { exact: true }).click();

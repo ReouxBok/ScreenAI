@@ -64,10 +64,10 @@ describe("supervised ticket content matching", () => {
     vi.useFakeTimers();
     const stalled = vi.fn<typeof fetch>(async (_url, init) => new Promise((_resolve, reject) => init?.signal?.addEventListener("abort", () => reject(new Error("aborted")))));
     const pending = matchSavTicketsByContent(input, { apiKey: "fixture", fetch: stalled });
-    await vi.advanceTimersByTimeAsync(12001);
+    await vi.advanceTimersByTimeAsync(37000);
     const result = await pending;
     expect(result.selection.kind).toBe("ambiguous"); expect(result.matching.errorCode).toBe("SAV_AI_TIMEOUT");
-    expect(stalled).toHaveBeenCalledTimes(1);
+    expect(stalled).toHaveBeenCalledTimes(2);
   });
   it("does not call a model when HubSpot has no associated ticket", async () => {
     const network = vi.fn<typeof fetch>();
@@ -113,5 +113,25 @@ describe("supervised ticket content matching", () => {
     expect(distinct.selection.kind).toBe("ambiguous");
     const same = await matchSavTicketsByContent(partial, { apiKey: "fixture", fetch: async () => geminiFixture({ assessments: [assessment()] }) });
     expect(same.selection.kind).toBe("matched");
+  });
+});
+
+describe("semantic evidence cache",()=>{
+  async function cached() { return matchSavTicketsByContent(input,{model:"fixture-cache-model",apiKey:"fixture",fetch:async()=>geminiFixture({assessments:[assessment()]})}); }
+  it("reuses identical evidence while deriving the lifecycle operation from the new status",async()=>{
+    const first=await cached();const network=vi.fn<typeof fetch>();const tickets=[{...input.tickets[0],stageId:"1"}];
+    const result=await matchSavTicketsByContent({...input,tickets},{model:"fixture-cache-model",cached:first.matching,fetch:network});
+    expect(network).not.toHaveBeenCalled();expect(result.selection).toMatchObject({kind:"matched",ticket:{stageId:"1"}});
+    expect(savTicketReturnPlan(tickets[0],"2026-10-13").operation).toBe("keep");
+  });
+  it.each(["content","model","revision","error","evidence"])("requires a new check for changed or untrusted %s",async(change)=>{
+    const first=await cached();const cache={...first.matching};
+    if(change==="revision")cache.revision="obsolete";
+    if(change==="error")cache.errorCode="SAV_AI_HTTP_500";
+    if(change==="evidence")cache.assessments=[{...assessment(),ticketExcerpt:"Invented quote"}];
+    const network=vi.fn<typeof fetch>(async()=>new Response("Unavailable",{status:500}));
+    const result=await matchSavTicketsByContent(change==="content" ? {...input,tickets:[{...input.tickets[0],description:"Different incident"}]} : input,
+      {model:change==="model" ? "other-model" : "fixture-cache-model",cached:cache,apiKey:"fixture",fetch:network});
+    expect(network).toHaveBeenCalledTimes(1);expect(result.selection.kind).toBe("ambiguous");
   });
 });

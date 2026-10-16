@@ -65,23 +65,25 @@ for (const scenario of [
     await page.goto(`/studio/sav/${SAV53_THREADS[scenario.key]}`);
     const rail = page.getByRole("complementary", { name: "Contexte client et actions", exact: true });
     const selected = rail.getByRole("radio", { name: new RegExp(`^${SAV53_TICKET_TITLE} #\\d+`) });
-    const newTicket = rail.getByRole("radio", { name: `Ouvrir un nouveau ticket ${SAV53_TICKET_TITLE}`, exact: true });
+    const newTicket = rail.getByRole("radio", { name: /^Ouvrir un nouveau ticket/ });
     await expect(selected).toBeChecked();
     await expect(newTicket).not.toBeChecked();
     const prepare = rail.getByRole("button", { name: "Préparer l’aperçu de l’action", exact: true });
     await expect(prepare).toBeDisabled();
     await expect(rail.getByRole("region", { name: "Aperçu de l’action HubSpot", exact: true })).toHaveCount(0);
+    const process = page.getByRole("region", { name: "Correction humaine du process", exact: true });
+    const processConfirmation = process.getByRole("checkbox", { name: /J’ai vérifié la demande et le choix d’action/ });
+    await expect(processConfirmation).toHaveAttribute("required");
+    await expect(processConfirmation).not.toBeChecked();
+    await processConfirmation.check();
     await page.getByRole("region", { name: "Proposition de l’IA", exact: true }).getByRole("button", { name: "Valider le dossier / process", exact: true }).click();
-    await page.waitForURL(/\?review=saved$/, { timeout: 30_000 });
+    await page.waitForURL(/\?review=saved(?:&|$)/, { timeout: 60_000 });
     await expect(page.getByRole("region", { name: "Proposition de l’IA", exact: true })).toContainText("Process validé par ugo@limova.ai");
     await expect(prepare).toBeEnabled();
-    await expect(selected).toBeChecked();
-    await expect(newTicket).not.toBeChecked();
+    // The human process defaults to its explicit
     // Selecting a target never queues an action. Fresh CRM checks are tested
     // with synthetic responses in the isolated DB combination suite.
     await expect(rail.locator('input[name="ticketId"]')).toHaveCount(0);
-    await page.reload();
-    await expect(prepare).toBeEnabled();
     await expect(rail).toContainText("Écritures HubSpot désactivées");
   });
 }

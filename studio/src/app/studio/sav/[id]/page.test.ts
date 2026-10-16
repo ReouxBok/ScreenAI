@@ -11,8 +11,8 @@ const dependencies = vi.hoisted(() => ({
   actions: {
     refreshSavContextAction: vi.fn(), repairSavProposalAction: vi.fn(),
     approveDraftAction: vi.fn(), correctDecisionAction: vi.fn(), createTicketAction: vi.fn(),
-    linkTicketAction: vi.fn(), reconcileTicketAction: vi.fn(), requestHumanAction: vi.fn(),
-    retryAction: vi.fn(), retryAnalysisAction: vi.fn(), reviewPilotItemAction: vi.fn(), qualifyObservationAction: vi.fn(), reviewDraftAction: vi.fn(), reviewProposalAction: vi.fn(), saveReplyDraftAction: vi.fn(), sendStudioReplyAction: vi.fn(),
+    linkTicketAction: vi.fn(), reconcileTicketAction: vi.fn(), reconcileTicketReturnAction: vi.fn(), requestHumanAction: vi.fn(),
+    retryAction: vi.fn(), retryAnalysisAction: vi.fn(), reviewPilotItemAction: vi.fn(), qualifyObservationAction: vi.fn(), reviewDraftAction: vi.fn(), reviewProposalAction: vi.fn(), saveReplyDraftAction: vi.fn(), saveHumanDraftAction: vi.fn(), sendStudioReplyAction: vi.fn(),
   },
 }));
 vi.mock("@/lib/sav/partnership-forward", () => ({ getSavPartnershipTransferState: async () => ({ available: false, status: "unavailable" }), isSavPartnershipForward: (action: { payload: { purpose?: string } }) => action.payload.purpose === "partnership_forward" }));
@@ -145,12 +145,12 @@ describe("SAV dossier SSR and human-review guardrails", () => {
     const detail = detailFixture();
     detail.messages[0].body.supportContext = { version: 1, messageId, collectedAt: now.toISOString(),
       customerIdentity: { kind: "sender", email: "client@example.invalid" },
-      crm: { status: "ready", errorCode: null, data: { errorCode: null, contactFound: true, contactId: "42", identityCandidates: [],
+      crm: { status: "ready", errorCode: null, data: { errorCode: null, contactFound: true, contactId: "42", contactName: "Camille Exemple", identityCandidates: [],
         tickets: [{ id: "99", subject: "Une autre question", description: "", status: "open", pipelineId: "0", stageId: "1", createdAt: null, updatedAt: null }], routing: { kind: "new", reason: "distinct_issue", candidateIds: [] } } },
       conversation: null, conversationError: null, otherConversations: [], otherConversationsError: null };
     dependencies.detail.mockResolvedValue(detail); dependencies.review.mockResolvedValue(null);
     const html = await renderPage();
-    expect(html).toContain("Ouvrir la fiche #42"); expect(html).toContain("Une autre question · #99");
+    expect(html).toContain("Fiche de Camille Exemple"); expect(html).toContain("Une autre question"); expect(html).not.toContain("#42"); expect(html).not.toContain("#99");
     expect(html).toContain("Reconstituer la proposition manquante");
     expect(html).not.toContain("Les anciens emails ne sont pas retraités");
   });
@@ -203,11 +203,14 @@ describe("SAV dossier SSR and human-review guardrails", () => {
       ["integration", "Intégration"], ["how_to", "Utilisation du produit"], ["acknowledgement", "Remerciement ou confirmation"], ["other", "Autre"],
     ]);
     expect(selectOptions(html, "urgency")).toEqual([["low", "Faible"], ["normal", "Normale"], ["high", "Élevée"], ["critical", "Critique"]]);
-    expect(selectOptions(html, "decisionKind")).toEqual([
-      ["ticket_pending", "Ticket à proposer"], ["no_ticket_needed", "Aucun ticket nécessaire"], ["human_review_required", "Revue humaine requise"],
-      ["spam", "Courrier indésirable"], ["internal_notification", "Notification interne"], ["automatic_reply", "Réponse automatique"],
-      ["bounce", "Échec de distribution"], ["duplicate", "Doublon"],
+    const actions = html.match(/<label>Action à préparer<select>([\s\S]*?)<\/select>/)?.[1];
+    expect(actions).toBeDefined();
+    expect([...actions!.matchAll(/<option\b[^>]*value="([^"]+)"[^>]*>([^<]*)<\/option>/g)].map(([,value,label])=>[value,label])).toEqual([
+      ["create_ticket","Créer un nouveau ticket"], ["link_ticket","Rattacher à un ticket ouvert"],
+      ["reopen_ticket","Traiter le retour sur un ticket fermé"], ["partnership","Transférer une demande de partenariat"],
+      ["commercial","Demande commerciale · règle existante"], ["no_ticket","Aucun ticket nécessaire"],
     ]);
+    expect(html).toContain('type="hidden" name="decisionKind" value="human_review_required"');
     const verdicts = [["correct", "Correct"], ["partial", "Partiel"], ["incorrect", "Incorrect"], ["critical", "Critique"]];
     for (const name of ["verdict", "dimension_classification", "dimension_routing", "dimension_grounding", "dimension_tone", "dimension_escalation"]) {
       expect(selectOptions(html, name)).toEqual(verdicts);
@@ -215,17 +218,21 @@ describe("SAV dossier SSR and human-review guardrails", () => {
     expect(selectOptions(html, "reusability").map(([value]) => value)).toEqual(["none", "tone_only", "customer_specific", "reusable"]);
     expect(html).toContain(`name="decisionId" value="${decisionId}"`);
     expect(html).toContain(`name="agentRunId" value="${runId}"`);
-    expect(html).toContain('name="processKind_0" value="product_step"');
+    expect(selectOptions(html,"processKind_0")).toContainEqual(["product_step","Étape dans le produit"]);
+    expect(html).toContain('value="product_step" selected=""');
     expect(buttonAttributes(html, "Valider le dossier / process")).toHaveLength(1);
     expect(buttonAttributes(html, "Refuser le process")).toHaveLength(0);
   });
 
-  it("shows the clean sections, a read-only draft and a separate disabled preview-send CTA", async () => {
+  it("keeps process validation above a separately editable draft and disabled send CTA", async () => {
     const html = await renderPage();
     const titles = ["Résumé du sujet", "Action proposée", "Connaissances utilisées", "Valider le dossier / process", "Verdict du brouillon"];
     for (let index = 1; index < titles.length; index++) expect(html.indexOf(titles[index])).toBeGreaterThan(html.indexOf(titles[index - 1]));
     expect(html).not.toMatch(/<textarea[^>]*name="replyDraft"/);
-    expect(html).not.toMatch(/<textarea[^>]*name="text"/);
+    expect(html).toMatch(/<textarea[^>]*name="text"/);
+    expect(buttonAttributes(html,"Enregistrer ma version")).toHaveLength(1);
+    const draftForms = [...html.matchAll(/<form\b[^>]*>([\s\S]*?)<\/form>/g)].map(match=>match[1]);
+    expect(draftForms.find(form=>form.includes('name="text"'))).not.toContain('name="status"');
     expect(buttonAttributes(html, "Envoyer la réponse acceptée")).toEqual([expect.stringContaining('disabled=""')]);
     expect(html).toContain("validée séparément par Ugo");
     expect(html).toContain("Non assigné");
@@ -306,6 +313,7 @@ describe("SAV dossier SSR and human-review guardrails", () => {
     expect(ticketCard).toContain("Rattachement manuel à confirmer");
     expect(ticketCard).toContain("/ticket/789");
     expect(ticketCard).not.toContain("Ticket #789");
+    expect(ticketCard).not.toContain("#789");
   });
 
   it("shows the actual linked ticket and no extra create-ticket CTA", async () => {
@@ -315,7 +323,7 @@ describe("SAV dossier SSR and human-review guardrails", () => {
     dependencies.review.mockResolvedValue(reviewFixture(true));
     const html = await renderPage();
     const ticketCard = sectionWithHeading(aside(html), "Ticket réellement lié");
-    expect(ticketCard).toContain("Ticket #987");
+    expect(ticketCard).toContain("Ouvrir le ticket HubSpot"); expect(ticketCard).not.toContain("#987");
     expect(ticketCard).not.toContain("Correspondance proposée");
     expect(buttonAttributes(html, "Ouvrir un nouveau ticket")).toEqual([]);
   });

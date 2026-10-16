@@ -39,41 +39,52 @@ function canonicalSemanticContent(p: SavStructuredProposal) {
         requestId: ref(requests, item.requestId), missingInformationIds: refs(missing, item.missingInformationIds), repeatedAttemptIds: refs(attempts, item.repeatedAttemptIds),
     })) };
 }
-function stable(value: unknown): unknown {
+function stable(value: unknown, material = false): unknown {
     if (Array.isArray(value))
-        return value.map(stable);
+        return value.map(item => stable(item, material));
     if (value && typeof value === "object")
-        return Object.fromEntries(Object.entries(value).filter(([key]) => key !== "collectedAt").sort(([a], [b]) => a.localeCompare(b)).map(([key, item]) => [key, stable(item)]));
+        return Object.fromEntries(Object.entries(value).filter(([key]) => key !== "collectedAt" && (!material || !["durationMs", "inputTokens", "outputTokens", "totalTokens"].includes(key))).sort(([a], [b]) => a.localeCompare(b)).map(([key, item]) => [key, stable(item, material)]));
     return value;
 }
 /** Generation IDs remain in the audit rows; hashes identify the content whose
  * verdict can survive regeneration. A draft alone cannot invalidate a dossier. */
+function sourceBody(ciphertext: string) {
+    const { supportContext, ...body } = decryptSavPayload<Record<string, unknown>>(ciphertext);
+    void supportContext;
+    return body;
+}
 export function savDossierSourceHash(p: SavStructuredProposal, message?: {
     bodyCiphertext: string;
     subject: string;
     fromEmail: string;
-}) {
-    return savContentHash(stable({ message: message ? { subject: message.subject, fromEmail: message.fromEmail, body: decryptSavPayload(message.bodyCiphertext) } : null, category: p.category, urgency: p.urgency, decision: { kind: p.decision.kind, reasonCode: p.decision.reasonCode, explanation: p.decision.explanation }, routing: p.routing,
+}, legacy = false) {
+    return (legacy ? "" : "v2:") + savContentHash(stable({ message: message ? { subject: message.subject, fromEmail: message.fromEmail, body: legacy ? decryptSavPayload(message.bodyCiphertext) : sourceBody(message.bodyCiphertext) } : null, category: p.category, urgency: p.urgency, decision: { kind: p.decision.kind, reasonCode: p.decision.reasonCode, explanation: p.decision.explanation }, routing: p.routing,
         ticket: p.ticket, process: p.process.filter(step => step.kind !== "review_reply"), internalNote: p.internalNote, sources: p.sources, customerIdentity: p.customerIdentity,
-        knowledgeRevision: p.knowledgeRevision, dossierContext: p.dossierContext, messageContext: p.messageContext, ...canonicalSemanticContent(p).understanding }));
+        humanProcess: p.humanProcess, knowledgeRevision: p.knowledgeRevision, dossierContext: p.dossierContext, messageContext: p.messageContext, ...canonicalSemanticContent(p).understanding }, !legacy));
 }
 export function savDraftSourceHash(p: SavStructuredProposal, message?: {
     bodyCiphertext: string;
     subject: string;
     fromEmail: string;
 }, activeRevision?: string | null) {
-    return savContentHash(stable({ activeRevision: activeRevision ?? null, text: p.replyDraft?.trim(), customerIdentity: p.customerIdentity, message: message ? { subject: message.subject, fromEmail: message.fromEmail, body: decryptSavPayload(message.bodyCiphertext) } : null, knowledgeRevision: p.knowledgeRevision, dossierContext: p.dossierContext, messageContext: p.messageContext, ...canonicalSemanticContent(p).understanding, ...(p.understanding ? { category: p.category, decision: { kind: p.decision.kind, reasonCode: p.decision.reasonCode } } : {}), ...(p.replyAssessment ? { replyAssessment: { kind: p.replyAssessment.kind, coverage: canonicalSemanticContent(p).coverage } } : {}) }));
+    return savContentHash(stable({ activeRevision: activeRevision ?? null, text: p.replyDraft?.trim(), customerIdentity: p.customerIdentity, humanProcess: p.humanProcess,
+        reviewedProcess: { category:p.category,urgency:p.urgency,decision:p.decision,ticket:p.ticket,process:p.process,internalNote:p.internalNote },
+        message: message ? { subject: message.subject, fromEmail: message.fromEmail, body: sourceBody(message.bodyCiphertext) } : null, knowledgeRevision: p.knowledgeRevision, dossierContext: p.dossierContext, messageContext: p.messageContext, ...canonicalSemanticContent(p).understanding, ...(p.understanding ? { category: p.category, decision: { kind: p.decision.kind, reasonCode: p.decision.reasonCode } } : {}), ...(p.replyAssessment ? { replyAssessment: { kind: p.replyAssessment.kind, coverage: canonicalSemanticContent(p).coverage } } : {}) }, true));
 }
 /** One validity contract for the detail, action guards and paginated inbox. */
 export function savReviewMatchesProposal(review: { reviewScope: string; dossierSourceHash: string | null; decisionId: string; agentRunId: string } | null | undefined,
     source: { decisionId: string; agentRunId: string; proposal: SavStructuredProposal; message: { bodyCiphertext: string; subject: string; fromEmail: string } }) {
     return Boolean(review && (review.reviewScope === "dossier"
-        ? review.dossierSourceHash === savDossierSourceHash(source.proposal, source.message)
+        ? review.dossierSourceHash === savDossierSourceHash(source.proposal, source.message, !review.dossierSourceHash?.startsWith("v2:"))
         : review.decisionId === source.decisionId && review.agentRunId === source.agentRunId));
 }
-export function savDraftNotApplicable(p: SavStructuredProposal) {
+export function savReplyForbidden(p: SavStructuredProposal) {
+    if (p.humanProcess) return p.humanProcess.understanding.requests.some(r => ["financial_operation", "financial_data", "legal", "cancellation"].includes(r.nature));
     return ["cancellation_human_only", "finance_human_only", "legal_human_only"].includes(p.decision.reasonCode)
         || p.replyAssessment?.kind === "finance_standard" || p.replyAssessment?.kind === "forbidden"
         || p.understanding?.requests.some(r => ["financial_operation", "financial_data", "legal", "cancellation"].includes(r.nature))
-        || (!p.understanding && p.category === "billing") || !p.replyDraft?.trim();
+        || (!p.understanding && p.category === "billing");
+}
+export function savDraftNotApplicable(p: SavStructuredProposal) {
+    return savReplyForbidden(p) || !p.replyDraft?.trim();
 }

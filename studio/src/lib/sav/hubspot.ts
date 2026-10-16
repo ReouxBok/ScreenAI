@@ -1,8 +1,12 @@
 import "server-only";
+import { getSavLearningCutover, recordSavLearningSignal } from "./learning-admission";
+import { processSavLearningResolution } from "./learning-pipeline";
 import { SAV_TICKET_RETURN_NOTE_VERSION, savTicketReturnNote } from "./ticket-return-note";
 
+import { shortlistSavTickets, savSubsetMatchIsComplete } from "./ticket-shortlist";
+import { requestSavHubspot } from "./hubspot-transport";
 import { createHmac, timingSafeEqual } from "node:crypto";
-import { and, asc, desc, eq, inArray, isNull, lt, lte, or, sql } from "drizzle-orm";
+import { and, asc, desc, eq, getTableColumns, inArray, isNull, lt, lte, or, sql } from "drizzle-orm";
 import { z } from "zod";
 import { requireDb } from "@/db";
 import {
@@ -11,7 +15,6 @@ import {
   savActorType,
   savAgentRuns,
   savDecisions,
-  savLearningCandidates,
   savMessages,
   savMailboxes,
   savProposalReviews,
@@ -23,14 +26,16 @@ import {
 import { decryptSavPayload, encryptSavPayload, savContentHash } from "./crypto";
 import { assertSavWriteAllowed } from "./write-guard";
 import { savModeAllowsWrite } from "./action-policy";
-import { SAV_HUBSPOT_SUPPORT, assertSavSupportConfiguration, assertSavSupportPipeline, savSupportTicketProperties } from "./hubspot-mapping";
+import { SAV_HUBSPOT_SUPPORT, assertSavSupportConfiguration, assertSavSupportPipeline, savSupportTicketProperties, savReviewedTicketProperties } from "./hubspot-mapping";
 import { autoReplyMinConfidence, canSendRepliesAutomatically, savAutoReplyCategories, savAutoReplyDailyLimit, savAutomationMode, savThreadInAutoReplyRollout, savReleaseStage } from "./config";
 import { assertSavTicketStageNotClosed, normalizeEmailAddress } from "./policy";
 import { isSavAiAuthoredReply } from "./reply-format";
 import { getSavAutonomyGate } from "./promotion";
 import { savTicketReturnPlan, sortSavTicketsNewestFirst, type SavLifecycleTicket } from "./ticket-lifecycle";
 import { selectSavTicketMatch } from "./ticket-routing";
-import { matchSavTicketsByContent } from "./ticket-routing-model";
+import { matchSavTicketsByContent, type SavTicketMatchCache } from "./ticket-routing-model";
+import { applySavHumanTicketRouting, savEffectiveCustomerEmail, savHumanTicketAction } from "./human-process";
+import type { SavDossierContext } from "./dossier-context";
 import { extractSavLearningResolution, isHubspotOutboundDirection } from "./learning-extraction";
 import { savActionFailurePlan } from "./retry-policy";
 import { claimWebhookReceipt, markWebhookReceipt, recordWebhookReceipt, type SavMessageBody } from "./service";
@@ -65,6 +70,7 @@ type HubspotRecord = {
   updatedAt?: string;
   associations?: Record<string, { results?: Array<{ id: string }> }>;
 };
+type HubspotOwner = { id: string; firstName?: string | null; lastName?: string | null; email?: string | null };
 type TicketEmailSnapshot = {
   id: string;
   hs_email_text: string;
@@ -76,7 +82,10 @@ type TicketEmailSnapshot = {
   hs_email_direction: string;
 };
 
-const globalForHubspot = globalThis as typeof globalThis & { __savClosedHubspotStages?: { values: Set<string>; expiresAt: number } };
+const globalForHubspot = globalThis as typeof globalThis & {
+  __savClosedHubspotStages?: { values: Set<string>; expiresAt: number };
+  __savHubspotOwnerNames?: { accountKey: string; values: Map<string, string>; expiresAt: number };
+};
 export const HUBSPOT_EMAIL_READ_SCOPE = "crm.objects.emails.read";
 const HUBSPOT_BACKFILL_RETRY_MS = 30 * 60 * 1_000;
 const HUBSPOT_BACKFILL_LEASE_MS = 10 * 60 * 1_000;
@@ -156,22 +165,9 @@ export async function acceptHubspotWebhook(rawInput: unknown) {
 }
 
 async function hubspotFetch<T>(path: string, init?: RequestInit): Promise<T> {
-  const response = await fetch(`https://api.hubapi.com${path}`, {
-    ...init,
-    headers: {
-      Authorization: `Bearer ${requiredEnv("HUBSPOT_ACCESS_TOKEN")}`,
-      "Content-Type": "application/json",
-      Accept: "application/json",
-      ...(init?.headers ?? {}),
-    },
-    signal: init?.signal ?? AbortSignal.timeout(20_000),
-  });
-  if (!response.ok) {
-    const payload = await response.json().catch(() => null);
-    throw new Error(summarizeHubspotError(response.status, payload));
-  }
-  if (response.status === 204) return undefined as T;
-  return response.json() as Promise<T>;
+  return requestSavHubspot<T>(path, {
+    ...init, headers: { Authorization: `Bearer ${requiredEnv("HUBSPOT_ACCESS_TOKEN")}`, "Content-Type": "application/json", Accept: "application/json", ...(init?.headers ?? {}) },
+  }, summarizeHubspotError);
 }
 
 export function summarizeHubspotError(status: number, payload: unknown) {
@@ -241,16 +237,53 @@ async function closedTicketStages() {
   return values;
 }
 
+async function hubspotOwnerNames(): Promise<Map<string, string>> {
+  const accountKey = savContentHash(requiredEnv("HUBSPOT_ACCESS_TOKEN"));
+  const cached = globalForHubspot.__savHubspotOwnerNames;
+  if (cached?.accountKey === accountKey && cached.expiresAt > Date.now()) return cached.values;
+  const values = new Map<string, string>();
+  try {
+    let after: string | undefined;
+    const signal = AbortSignal.timeout(3_000);
+    // Read the owner directory in cached pages, not once per ticket. Names are
+    // optional presentation data: the whole enrichment has a short time budget.
+    for (let page = 0; page < 10; page++) {
+      const query = new URLSearchParams({ limit: "500" });
+      if (after) query.set("after", after);
+      const response = await hubspotFetch<{ results?: HubspotOwner[]; paging?: { next?: { after?: string } } }>(`/crm/v3/owners?${query}`, { signal });
+      for (const owner of response.results ?? []) {
+        const name = [owner.firstName, owner.lastName].filter((part): part is string => Boolean(part?.trim())).join(" ").trim();
+        if (owner.id && name) values.set(owner.id, name);
+      }
+      after = response.paging?.next?.after;
+      if (!after) break;
+    }
+    // A short empty cache prevents repeated requests when HubSpot has no owners
+    // or the service account cannot read them; it never affects CRM actions.
+    globalForHubspot.__savHubspotOwnerNames = { accountKey, values, expiresAt: Date.now() + 5 * 60 * 1_000 };
+  } catch {
+    globalForHubspot.__savHubspotOwnerNames = { accountKey, values, expiresAt: Date.now() + 60 * 1_000 };
+  }
+  return values;
+}
+
 async function findContactByEmail(email: string) {
-  const response = await hubspotFetch<{ results?: HubspotRecord[] }>("/crm/v3/objects/contacts/search", {
-    method: "POST",
-    body: JSON.stringify({
-      filterGroups: [{ filters: [{ propertyName: "email", operator: "EQ", value: normalizeEmailAddress(email) }] }],
-      properties: ["email"],
-      limit: 1,
-    }),
+  const address = normalizeEmailAddress(email);
+  const primary = await hubspotFetch<{ results?: HubspotRecord[]; paging?: { next?: unknown } }>("/crm/v3/objects/contacts/search", {
+    method: "POST", body: JSON.stringify({ filterGroups: [{ filters: [{ propertyName: "email", operator: "EQ", value: address }] }],
+      properties: ["email", "hs_additional_emails", "firstname", "lastname"], limit: 2 }),
   });
-  return response.results?.[0] ?? null;
+  if (primary.paging?.next || (primary.results?.length ?? 0) > 1) throw new Error("SAV_HUBSPOT_IDENTITY_AMBIGUOUS");
+  if (primary.results?.length) return primary.results[0];
+  // Search's documented default text properties include hs_additional_emails.
+  // This broad query is only retrieval: exact address membership confirms identity.
+  const secondary = await hubspotFetch<{ results?: HubspotRecord[]; paging?: { next?: unknown } }>("/crm/v3/objects/contacts/search", {
+    method: "POST", body: JSON.stringify({ query: address, properties: ["email", "hs_additional_emails", "firstname", "lastname"], limit: 100 }),
+  });
+  if (secondary.paging?.next) throw new Error("SAV_HUBSPOT_IDENTITY_INCOMPLETE");
+  const matches = (secondary.results ?? []).filter(c => [c.properties.email, ...(c.properties.hs_additional_emails ?? "").split(";")].some(value => value && normalizeEmailAddress(value) === address));
+  if (matches.length > 1) throw new Error("SAV_HUBSPOT_IDENTITY_AMBIGUOUS");
+  return matches[0] ?? null;
 }
 
 async function guardedHubspotWrite<T>(actionId: string, path: string, init: RequestInit): Promise<T> {
@@ -344,10 +377,13 @@ async function finalizeSavV0TicketAction(action: typeof savActions.$inferSelect)
     const customerMessage = resolveSavCustomerMessage({ fromEmail: latest.fromEmail, subject: latest.subject, body: decryptSavPayload<SavMessageBody>(latest.bodyCiphertext).text });
     const customerIdentity = { kind: customerMessage.kind, email: customerMessage.email };
     if (!customerIdentity.email) throw new Error("SAV_FORWARDED_CUSTOMER_UNRESOLVED");
-    const customerEmail = customerIdentity.kind === "forwarded" ? customerIdentity.email
-      : proposal.customerIdentity.verifiedByHuman && proposal.customerIdentity.registrationEmail ? proposal.customerIdentity.registrationEmail : customerIdentity.email;
-    const context = await readSavHubspotContext({ email: customerEmail, subject: customerMessage.subject, body: customerMessage.body, returnedAt: latest.receivedAt,
+    const customerEmail = savEffectiveCustomerEmail(proposal, customerIdentity)!;
+    const savedContext = decryptSavPayload<{ supportContext?: SavDossierContext }>(latest.bodyCiphertext).supportContext;
+    const freshContext = await readSavHubspotContext({ email: customerEmail, subject: customerMessage.subject, body: customerMessage.body, returnedAt: latest.receivedAt,
+      skipSemanticMatch: Boolean(savHumanTicketAction(proposal)), cachedMatching: savedContext?.crm.data?.matching,
       currentTicketId: customerIdentity.kind === "sender" && thread.customerEmail.toLowerCase() === customerEmail.toLowerCase() ? thread.hubspotTicketId : undefined });
+    const context = applySavHumanTicketRouting(proposal, { version: 1, messageId: latest.id, collectedAt: new Date().toISOString(), customerIdentity,
+      crm: { status: freshContext.errorCode ? "partial" : "ready", errorCode: freshContext.errorCode, data: freshContext }, conversation: null, conversationError: null, otherConversations: [], otherConversationsError: null }, latest.receivedAt).crm.data!;
     if (!context.contactId) throw new Error("SAV_HUBSPOT_CONTACT_REQUIRED");
     const previewDetails = typeof action.payload.ticketPreviewSnapshotCiphertext === "string"
       ? decryptSavPayload<{ contactId: string; targetId: string | null; targetTitle: string | null }>(action.payload.ticketPreviewSnapshotCiphertext) : null;
@@ -378,7 +414,7 @@ async function finalizeSavV0TicketAction(action: typeof savActions.$inferSelect)
       if (!returnRequest && context.tickets.some((value) => value.status === "open") && distinctIssueReason.trim().length < 20) throw new Error("SAV_DISTINCT_ISSUE_CONFIRMATION_REQUIRED");
       await assertSavWriteAllowed(action.id);
       await assertSavGmailThreadCurrent(mailbox.email, thread.gmailThreadId, latest.gmailMessageId);
-      const properties = savSupportTicketProperties({ title: proposal.ticket.title, description: proposal.ticket.description });
+      const properties = savReviewedTicketProperties(proposal);
       if (returnRequest?.operation === "create") {
         if (!returnTarget?.ownerId || !returnRequest.ownerId || returnTarget.ownerId !== returnRequest.ownerId) throw new Error("SAV_TICKET_OWNER_REQUIRED");
         properties.hubspot_owner_id = returnTarget.ownerId;
@@ -469,7 +505,7 @@ export async function reconcileSavManualTicket(actionId: string, ticketId: strin
   const proposal = savStructuredProposalSchema.parse(decryptSavPayload(review.afterCiphertext));
   let email = sourceIdentity.kind === "forwarded" ? sourceIdentity.email
     : proposal.customerIdentity.verifiedByHuman && proposal.customerIdentity.registrationEmail ? proposal.customerIdentity.registrationEmail : sourceIdentity.email;
-  let expected = savSupportTicketProperties({ title: proposal.ticket.title, description: proposal.ticket.description });
+  let expected = savReviewedTicketProperties(proposal);
   let dispatchedContactId: string | null = null;
   if (typeof action.payload.ticketCreateRequestCiphertext === "string") {
     const request = decryptSavPayload<{ actionId: string; reviewId: string; decisionId: string; messageId: string; threadId: string; contactId: string; customerEmail: string; customerIdentityKind?: "sender" | "forwarded" | "unresolved_forward"; properties: typeof expected }>(action.payload.ticketCreateRequestCiphertext);
@@ -579,12 +615,23 @@ export async function findSavContactCandidates(hints: SavIdentityHints): Promise
   return [...candidates.values()].slice(0, 10);
 }
 
-export async function readSavHubspotContext(input: { email: string; subject: string; body?: string; currentTicketId?: string | null; returnedAt?: Date | string; identityHints?: SavIdentityHints; toleratePartial?: boolean }) {
+export type SavHubspotContext = {
+  errorCode: string | null; contactFound: boolean; contactId?: string; contactName?: string | null; identityCandidates: SavIdentityCandidate[];
+  tickets: Array<SavLifecycleTicket & { subject: string; description: string; descriptionTruncated?: boolean; subjectTruncated?: boolean; pipelineId: string | null; stageId: string | null; updatedAt: string | null }>;
+  matching?: Awaited<ReturnType<typeof matchSavTicketsByContent>>["matching"];
+  limitations?: { paginationComplete: boolean; total: number; shown: number; omittedOpen: number; omittedClosed: number };
+  routing: { kind: "matched"; ticketId: string; reason: string; returnOperation: ReturnType<typeof savTicketReturnPlan>["operation"] }
+    | { kind: "new" | "ambiguous"; reason: string; candidateIds: string[] };
+};
+
+export async function readSavHubspotContext(input: { email: string; subject: string; body?: string; currentTicketId?: string | null; returnedAt?: Date | string; identityHints?: SavIdentityHints; toleratePartial?: boolean; skipSemanticMatch?: boolean; cachedMatching?: SavTicketMatchCache }): Promise<SavHubspotContext> {
   const contact = await findContactByEmail(input.email);
+  const contactName = contact ? [contact.properties.firstname, contact.properties.lastname].filter((part): part is string => Boolean(part?.trim())).join(" ").trim() || null : null;
   let identityCandidates: SavIdentityCandidate[] = [];
   try {
     identityCandidates = !contact && input.identityHints ? await findSavContactCandidates(input.identityHints) : [];
-    let linkedTicket: HubspotRecord | null = null;
+    const readLinked = async () => {
+      let linkedTicket: HubspotRecord | null = null;
     if (input.currentTicketId) {
       try {
         linkedTicket = await hubspotFetch<HubspotRecord>(`/crm/v3/objects/tickets/${encodeURIComponent(input.currentTicketId)}?properties=subject,content,createdate,hs_pipeline,hs_pipeline_stage,hs_lastmodifieddate,hs_last_closed_date,closed_date,hubspot_owner_id&associations=contacts`);
@@ -592,40 +639,58 @@ export async function readSavHubspotContext(input: { email: string; subject: str
         if (!/HUBSPOT_HTTP_404/.test(error instanceof Error ? error.message : "")) throw error;
       }
     }
-    const response = contact ? await hubspotFetch<{ results?: HubspotRecord[]; paging?: { next?: unknown } }>("/crm/v3/objects/tickets/search", {
-        method: "POST",
-        body: JSON.stringify({
-          filterGroups: [{ filters: [{ propertyName: "associations.contact", operator: "EQ", value: contact.id }] }],
+      return linkedTicket;
+    };
+    const readAssociated = async () => {
+    const recordsById = new Map<string, HubspotRecord>();
+    let after: string | undefined;
+    let paginationComplete = true;
+    const seenCursors = new Set<string>();
+    if (contact) for (let page = 0; page < 5; page++) {
+      const response = await hubspotFetch<{ results?: HubspotRecord[]; paging?: { next?: { after?: string | number } } }>("/crm/v3/objects/tickets/search", {
+        method: "POST", body: JSON.stringify({ filterGroups: [{ filters: [{ propertyName: "associations.contact", operator: "EQ", value: contact.id }] }],
           properties: ["subject", "content", "hs_pipeline", "hs_pipeline_stage", "hs_lastmodifieddate", "createdate", "hs_last_closed_date", "closed_date", "hubspot_owner_id"],
-          sorts: ["-createdate"],
-          limit: 100,
-        }),
-      }) : { results: [] };
-    if ("paging" in response && response.paging?.next) throw new Error("SAV_HUBSPOT_TICKETS_TRUNCATED");
+          sorts: ["-createdate"], limit: 100, ...(after ? { after } : {}) }),
+      });
+      for (const ticket of response.results ?? []) recordsById.set(ticket.id, ticket);
+      if (!response.paging?.next) break;
+      const next = response.paging.next.after;
+      if (next === undefined || !/^\d+$/.test(String(next)) || seenCursors.has(String(next)) || page === 4) { paginationComplete = false; break; }
+      after = String(next); seenCursors.add(after);
+    }
+      return { recordsById, paginationComplete };
+    };
+    const [linked, { recordsById, paginationComplete }, closed] = await Promise.all([readLinked(), readAssociated(), closedTicketStages()]);
+    let linkedTicket = linked;
     if (linkedTicket && !linkedTicket.associations?.contacts?.results?.some(row => row.id === contact?.id)) linkedTicket = null;
-    const closed = await closedTicketStages();
-    const records = [...(linkedTicket ? [linkedTicket] : []), ...(response.results ?? []).filter((ticket) => ticket.id !== linkedTicket?.id)]
+    const records = [...(linkedTicket ? [linkedTicket] : []), ...[...recordsById.values()].filter((ticket) => ticket.id !== linkedTicket?.id)]
       .filter((ticket) => String(ticket.properties.hs_pipeline) === SAV_HUBSPOT_SUPPORT.pipelineId);
+    const ownerNames = records.some(ticket => ticket.properties.hubspot_owner_id) ? await hubspotOwnerNames() : new Map<string, string>();
     const tickets = sortSavTicketsNewestFirst(records.map((ticket): SavLifecycleTicket & { subject: string; description: string; descriptionTruncated?: boolean; subjectTruncated?: boolean; pipelineId: string | null; stageId: string | null; updatedAt: string | null } => ({
       id: ticket.id,
       subject: String(ticket.properties.subject || "Sans objet").slice(0, 500),
       subjectTruncated: String(ticket.properties.subject || "Sans objet").length > 500,
-      description: String(ticket.properties.content || "").slice(0, 2_500),
-      descriptionTruncated: String(ticket.properties.content || "").length > 2_500,
+      description: String(ticket.properties.content || "").slice(0, 8_000),
+      descriptionTruncated: String(ticket.properties.content || "").length > 8_000,
       pipelineId: ticket.properties.hs_pipeline,
       stageId: ticket.properties.hs_pipeline_stage,
       ownerId: ticket.properties.hubspot_owner_id || null,
+      ownerName: ticket.properties.hubspot_owner_id ? ownerNames.get(ticket.properties.hubspot_owner_id) ?? null : null,
       status: closed.has(String(ticket.properties.hs_pipeline_stage || "")) ? "closed" as const : "open" as const,
       createdAt: ticket.createdAt ?? ticket.properties.createdate ?? null,
       closedAt: ticket.properties.hs_last_closed_date || ticket.properties.closed_date || null,
       updatedAt: ticket.properties.hs_lastmodifieddate || ticket.updatedAt || null,
     })));
-    const assessed = input.body !== undefined ? await matchSavTicketsByContent({ subject: input.subject, body: input.body, tickets }) : null;
-    const routing = assessed?.selection ?? selectSavTicketMatch({ subject: input.subject, candidates: tickets, currentTicketId: input.currentTicketId, includeClosed: true });
+    const shortlist = shortlistSavTickets(tickets, `${input.subject}\n${input.body ?? ""}`, input.currentTicketId);
+    const assessed = input.body !== undefined && !input.skipSemanticMatch && paginationComplete ? await matchSavTicketsByContent({ subject: input.subject, body: input.body, tickets: shortlist.selected }, { cached: input.cachedMatching }) : null;
+    let routing = assessed?.selection ?? selectSavTicketMatch({ subject: input.subject, candidates: tickets, currentTicketId: input.currentTicketId, includeClosed: true });
+    if (!paginationComplete || assessed && !savSubsetMatchIsComplete(routing, shortlist.omitted)) routing = { kind: "ambiguous", candidates: tickets, reason: "ticket_context_incomplete" };
     return {
-      errorCode: null as string | null,
+      errorCode: paginationComplete ? null : "SAV_HUBSPOT_TICKETS_TRUNCATED",
+      limitations: { paginationComplete, ...shortlist.limits },
       contactFound: Boolean(contact),
       contactId: contact?.id,
+      ...(contactName ? { contactName } : {}),
       identityCandidates,
       tickets,
       ...(assessed ? { matching: assessed.matching } : {}),
@@ -637,7 +702,7 @@ export async function readSavHubspotContext(input: { email: string; subject: str
     // Reading the ticket pipeline must not erase a contact already found. Write
     // callers remain strict; only the read-only enrichment allows partial data.
     if (!input.toleratePartial) throw error;
-    return { contactFound: Boolean(contact), contactId: contact?.id, identityCandidates, tickets: [],
+    return { contactFound: Boolean(contact), contactId: contact?.id, ...(contactName ? { contactName } : {}), identityCandidates, tickets: [],
       errorCode: "SAV_HUBSPOT_TICKETS_UNAVAILABLE",
       routing: { kind: "ambiguous" as const, reason: "hubspot_context_unavailable", candidateIds: [] as string[] } };
   }
@@ -891,7 +956,7 @@ async function updateHubspotTicketStatus(action: typeof savActions.$inferSelect)
   return { ticketId, stageId };
 }
 
-export async function processPendingHubspotActions(limit = 20) {
+export async function processPendingHubspotActions(limit = 20, actionId?: string) {
   const mode = savAutomationMode();
   if (mode === "shadow" || process.env.SAV_WRITES_DISABLED === "true") return { skipped: "shadow_mode", processed: [] as Array<Record<string, unknown>> };
   const db = requireDb();
@@ -907,6 +972,7 @@ export async function processPendingHubspotActions(limit = 20) {
     .where(and(
       or(...eligibleKinds) ?? sql`false`,
       isNull(savActions.pilotBatchId),
+      actionId ? eq(savActions.id, actionId) : undefined,
       or(eq(savActions.status, "pending"), and(eq(savActions.status, "running"), lt(savActions.updatedAt, staleBefore))),
       or(isNull(savActions.scheduledAt), lte(savActions.scheduledAt, new Date())),
     ))
@@ -948,6 +1014,17 @@ export async function processPendingHubspotActions(limit = 20) {
   return { processed };
 }
 
+/** Execute one human-confirmed ticket action and its email association, without
+ * draining unrelated HubSpot work from the shared cron queue. */
+export async function processManualSavTicketActionImmediately(actionId: string) {
+  await processPendingHubspotActions(1, actionId);
+  const db = requireDb();
+  const [action] = await db.select().from(savActions).where(eq(savActions.id, actionId)).limit(1);
+  if (!action) return { status: "failed" as const, errorCode: "SAV_ACTION_NOT_FOUND" };
+  if (action.status === "failed") return { status: "failed" as const, errorCode: action.errorCode || "SAV_HUBSPOT_ACTION_FAILED" };
+  return action.status === "succeeded" ? { status: "completed" as const } : { status: "pending" as const };
+}
+
 export async function processPendingPilotHubspotActions(batchId: string, limit = 50) {
   // Deliberately return before touching the database or HubSpot. Pilot actions
   // are proposals displayed in the Studio, never commands to execute.
@@ -961,13 +1038,20 @@ export async function processPendingPilotHubspotActionsAcrossBatches(limit = 100
   return { skipped: "pilot_simulation_only", processed: [] as Array<Record<string, unknown>> };
 }
 
-async function loadTicketEmails(ticket: HubspotRecord) {
-  const ids = ticket.associations?.emails?.results?.map((association) => association.id) ?? [];
-  const emails: HubspotRecord[] = [];
-  for (const id of ids.slice(-200)) {
-    emails.push(await hubspotFetch<HubspotRecord>(`/crm/v3/objects/emails/${encodeURIComponent(id)}?properties=hs_email_text,hs_email_html,hs_email_subject,hs_email_from_email,hs_email_to_email,hs_timestamp,hs_email_direction`));
-  }
-  return emails;
+export async function loadSavHubspotTicketEmails(ticket: HubspotRecord) {
+  const ids = [...new Set(ticket.associations?.emails?.results?.map(a => a.id) ?? [])];
+  if (ids.length > 200) throw new Error("HUBSPOT_EMAILS_TRUNCATED");
+  if (!ids.length) return [];
+  const chunks = Array.from({ length: Math.ceil(ids.length / 100) }, (_, i) => ids.slice(i * 100, (i + 1) * 100));
+  const batches = await Promise.all(chunks.map(async chunk => {
+    const result = await hubspotFetch<{ results?: HubspotRecord[]; errors?: unknown[] }>("/crm/v3/objects/emails/batch/read", { method: "POST", body: JSON.stringify({
+      properties: ["hs_email_text", "hs_email_html", "hs_email_subject", "hs_email_from_email", "hs_email_to_email", "hs_timestamp", "hs_email_direction"], inputs: chunk.map(id => ({ id })),
+    }) });
+    if (result.errors?.length || result.results?.length !== chunk.length || new Set(result.results.map(e => e.id)).size !== chunk.length || result.results.some(e => !chunk.includes(e.id))) throw new Error("SAV_HUBSPOT_EMAIL_BATCH_INCOMPLETE");
+    return result.results;
+  }));
+  const byId = new Map(batches.flat().map(e => [e.id, e]));
+  return ids.map(id => byId.get(id)!);
 }
 
 function hubspotEmailPlainText(value: string) {
@@ -1026,7 +1110,7 @@ async function snapshotTicket(ticket: HubspotRecord) {
     const [snapshot] = await requireDb().select().from(savTicketSnapshots).where(eq(savTicketSnapshots.hubspotTicketId,ticket.id));
     return snapshot;
   }
-  const emails = await loadTicketEmails(ticket);
+  const emails = await loadSavHubspotTicketEmails(ticket);
   const transcript = compactHubspotTicketTranscript(emails.map((email) => ({
     id: email.id,
     hs_email_text: String(email.properties.hs_email_text || ""),
@@ -1037,13 +1121,25 @@ async function snapshotTicket(ticket: HubspotRecord) {
     hs_timestamp: String(email.properties.hs_timestamp || ""),
     hs_email_direction: String(email.properties.hs_email_direction || ""),
   })));
+  const sourceTruncated = transcript.length !== emails.length || emails.some(email => hubspotEmailPlainText(String(email.properties.hs_email_text || email.properties.hs_email_html || "")).length > HUBSPOT_TICKET_EMAIL_BODY_MAX_CHARS);
   const outbound = transcript.filter((email) => isHubspotOutboundDirection(String(email.hs_email_direction || "")));
   const humanIntervened = outbound.some((email) => !isSavAiAuthoredReply(String(email.hs_email_text || email.hs_email_html || "")));
   const closed = (await closedTicketStages()).has(String(ticket.properties.hs_pipeline_stage || ""));
   const updatedAt = new Date(ticket.updatedAt || ticket.properties.hs_lastmodifieddate || Date.now());
+  const db = requireDb();
+  // Keep PostgreSQL microseconds for the CAS; a JavaScript Date loses that precision.
+  const [previousSnapshot] = await db.select({ ...getTableColumns(savTicketSnapshots),
+    revisionTimestamp: sql<string>`${savTicketSnapshots.updatedAt}::text`,
+  }).from(savTicketSnapshots).where(eq(savTicketSnapshots.hubspotTicketId, ticket.id)).limit(1);
+  if (previousSnapshot && updatedAt < previousSnapshot.hubspotUpdatedAt) return previousSnapshot;
+  const cutover = await getSavLearningCutover();
+  const createdAt = ticket.createdAt ? new Date(ticket.createdAt) : null;
+  const validCreation = createdAt && Number.isFinite(createdAt.getTime()) && cutover && createdAt > new Date(cutover.activatedAt) ? createdAt : null;
+  // A closing timestamp never proves when the resolution cycle began.
+  const learningCycleStartedAt = !closed && previousSnapshot?.status === "closed" && updatedAt > previousSnapshot.hubspotUpdatedAt
+    ? updatedAt : previousSnapshot?.learningCycleStartedAt ?? validCreation;
   const ticketContent = hubspotEmailPlainText(ticket.properties.content || "").slice(0, 10_000);
   const contentHash = savContentHash({ transcript, ticketContent });
-  const db = requireDb();
   const [snapshot] = await db.insert(savTicketSnapshots).values({
     hubspotTicketId: ticket.id,
     pipelineId: ticket.properties.hs_pipeline,
@@ -1053,12 +1149,16 @@ async function snapshotTicket(ticket: HubspotRecord) {
     transcriptCiphertext: encryptSavPayload({ transcript }),
     contentHash,
     humanIntervened,
+    learningCycleStartedAt,
     resolvedAt: closed ? updatedAt : null,
     hubspotUpdatedAt: updatedAt,
     processedAt: new Date(),
     updatedAt: new Date(),
   }).onConflictDoUpdate({
     target: savTicketSnapshots.hubspotTicketId,
+    // Compare-and-swap prevents a read made before a concurrent refresh from overwriting it.
+    setWhere: previousSnapshot ? and(eq(savTicketSnapshots.id, previousSnapshot.id), eq(savTicketSnapshots.contentHash, previousSnapshot.contentHash),
+      sql`${savTicketSnapshots.updatedAt} = ${previousSnapshot.revisionTimestamp}::timestamptz`) : sql`false`,
     set: {
       pipelineId: ticket.properties.hs_pipeline,
       stageId: ticket.properties.hs_pipeline_stage,
@@ -1067,37 +1167,36 @@ async function snapshotTicket(ticket: HubspotRecord) {
       transcriptCiphertext: encryptSavPayload({ transcript }),
       contentHash,
       humanIntervened,
+      learningCycleStartedAt,
       resolvedAt: closed ? updatedAt : null,
       hubspotUpdatedAt: updatedAt,
       processedAt: new Date(),
       updatedAt: new Date(),
     },
   }).returning();
+  if (!snapshot) {
+    const [current] = await db.select().from(savTicketSnapshots).where(eq(savTicketSnapshots.hubspotTicketId, ticket.id));
+    return current ?? null;
+  }
   if (closed) {
-    const extracted = extractSavLearningResolution(ticketContent, transcript.map((email) => ({
-      id: email.id, direction: String(email.hs_email_direction || ""),
-      text: hubspotEmailPlainText(email.hs_email_text || email.hs_email_html || ""),
-      timestamp: email.hs_timestamp, aiAuthored: isSavAiAuthoredReply(String(email.hs_email_text || email.hs_email_html || "")),
-    })));
-    const finalResolution = extracted.resolution;
-    if (finalResolution.length >= 20) await db.insert(savLearningCandidates).values({
-      hubspotTicketId: ticket.id,
-      sourceRef: `hubspot:${ticket.id}`,
-      sourceContentHash: contentHash,
-      proposedPatch: {
-        ciphertext: encryptSavPayload({
-          subject: snapshot.subject,
-          finalHumanResolution: finalResolution,
-          sourceSnapshotId: snapshot.id,
-          provenance: extracted.provenance,
-          customerConfirmed: extracted.customerConfirmed,
-          sourceMessageId: extracted.sourceMessageId,
-        }),
-      },
-      explanation: `${extracted.provenance === "human_resolution" ? "Résolution humaine" : extracted.provenance === "ai_resolution" ? "Réponse IA" : "Contenu du ticket"}${extracted.customerConfirmed ? " confirmée par un message client ultérieur" : " sans confirmation client explicite"}. Cette proposition doit être relue avant de devenir une fiche de connaissance.`,
-      evidenceTicketIds: [ticket.id],
-      createdBy: "system",
-    }).onConflictDoNothing();
+    if (sourceTruncated) {
+      await recordSavLearningSignal({ sourceRef: `hubspot:${ticket.id}`, sourceHash: contentHash, origin: "hubspot", reasonCode: "source_truncated" });
+    } else if (!learningCycleStartedAt) {
+      await recordSavLearningSignal({ sourceRef: `hubspot:${ticket.id}`, sourceHash: contentHash, origin: "hubspot",
+        reasonCode: "no_new_resolution_cycle", details: { snapshotId: snapshot.id, policyRevision: "sav-learning-admission-2026-10-15.v1" } });
+    } else {
+      const extracted = extractSavLearningResolution(ticketContent, transcript.map((email) => ({
+        id: email.id, direction: String(email.hs_email_direction || ""),
+        text: hubspotEmailPlainText(email.hs_email_text || email.hs_email_html || ""),
+        timestamp: email.hs_timestamp, aiAuthored: isSavAiAuthoredReply(String(email.hs_email_text || email.hs_email_html || "")),
+      })));
+      await processSavLearningResolution({
+        ticketId: ticket.id, cycleStartedAt: learningCycleStartedAt, snapshotId: snapshot.id, snapshotHash: contentHash,
+        subject: snapshot.subject, resolution: extracted.resolution, provenance: extracted.provenance,
+        sourceMessageId: extracted.sourceMessageId, customerConfirmed: extracted.customerConfirmed,
+        evidenceOccurredAt: transcript.find(email => email.id === extracted.sourceMessageId)?.hs_timestamp || "invalid",
+      });
+    }
   }
   return snapshot;
 }
@@ -1194,20 +1293,25 @@ export async function continueHubspotBackfill(maxPages = 1, pageSize = 25) {
   }
 }
 
-async function processHubspotReceipt(receiptId: string) {
-  const receipt = await claimWebhookReceipt(receiptId, "hubspot");
-  if (!receipt) return;
+async function processHubspotReceiptGroup(receiptIds: string[]) {
+  const claimed = [];
+  for (const id of receiptIds) { const receipt = await claimWebhookReceipt(id, "hubspot"); if (receipt) claimed.push(receipt); }
+  if (!claimed.length) return [] as string[];
   try {
-    const event = hubspotEventSchema.parse(receipt.payload);
+    const events = claimed.map(receipt => hubspotEventSchema.parse(receipt.payload));
+    const event = events.sort((a, b) => (b.occurredAt ?? 0) - (a.occurredAt ?? 0))[0];
+    // Every raw receipt remains durable; one fresh snapshot covers this bounded
+    // group for the same object. Mark each claimed event only after it succeeds.
     if (event.objectId && event.subscriptionType.startsWith("ticket.") && await hasSavTicketObservation(String(event.objectId))) {
       await refreshSavTicketObservations(String(event.objectId));
     } else if (event.objectId && event.subscriptionType.startsWith("ticket.")) {
-      const ticket = await hubspotFetch<HubspotRecord>(`/crm/v3/objects/tickets/${event.objectId}?properties=subject,content,hs_pipeline,hs_pipeline_stage,hs_lastmodifieddate&associations=emails,contacts`);
+      const ticket = await hubspotFetch<HubspotRecord>(`/crm/v3/objects/tickets/${encodeURIComponent(String(event.objectId))}?properties=subject,content,hs_pipeline,hs_pipeline_stage,hs_lastmodifieddate&associations=emails,contacts`);
       await snapshotTicket(ticket);
     }
-    await markWebhookReceipt(receipt.id, "processed");
+    for (const receipt of claimed) await markWebhookReceipt(receipt.id, "processed");
+    return claimed.map(r => r.id);
   } catch (error) {
-    await markWebhookReceipt(receipt.id, "failed", error);
+    for (const receipt of claimed) await markWebhookReceipt(receipt.id, "failed", error);
     throw error;
   }
 }
@@ -1215,7 +1319,7 @@ async function processHubspotReceipt(receiptId: string) {
 export async function processPendingHubspotReceipts(limit = 20) {
   const db = requireDb();
   const staleBefore = new Date(Date.now() - 15 * 60 * 1_000);
-  const receipts = await db.select({ id: savWebhookReceipts.id }).from(savWebhookReceipts)
+  const receipts = await db.select({ id: savWebhookReceipts.id, payload: savWebhookReceipts.payload }).from(savWebhookReceipts)
     .where(and(
       eq(savWebhookReceipts.provider, "hubspot"),
       or(
@@ -1225,13 +1329,18 @@ export async function processPendingHubspotReceipts(limit = 20) {
       lt(savWebhookReceipts.attempts, 10),
     ))
     .orderBy(asc(savWebhookReceipts.receivedAt)).limit(Math.min(100, Math.max(1, limit)));
-  const results = [];
+  const groups = new Map<string, string[]>();
   for (const receipt of receipts) {
+    const event = hubspotEventSchema.safeParse(receipt.payload);
+    const key = event.success && event.data.objectId && event.data.subscriptionType.startsWith("ticket.") ? `ticket:${event.data.objectId}` : receipt.id;
+    groups.set(key, [...(groups.get(key) ?? []), receipt.id]);
+  }
+  const results = [];
+  for (const ids of groups.values()) {
     try {
-      await processHubspotReceipt(receipt.id);
-      results.push({ id: receipt.id, status: "processed" });
+      for (const id of await processHubspotReceiptGroup(ids)) results.push({ id, status: "processed" });
     } catch (error) {
-      results.push({ id: receipt.id, status: "failed", error: error instanceof Error ? error.message : "UNKNOWN_ERROR" });
+      for (const id of ids) results.push({ id, status: "failed", error: error instanceof Error ? error.message : "UNKNOWN_ERROR" });
     }
   }
   return results;

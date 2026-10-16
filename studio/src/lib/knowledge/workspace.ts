@@ -64,7 +64,7 @@ const workspaceRows = sql`
  UNION ALL
  SELECT learning.id,'learning',learning.content_item_id,NULL::uuid,NULL::uuid,learning.id,NULL::uuid,coalesce(snapshot.subject,'Résolution humaine à préparer'),learning.explanation,'automatic',learning.status::text,NULL::integer,learning.created_at,'Résolution HubSpot qualifiée',active.version_id,item.published_version_id,false
  FROM sav.learning_candidates learning LEFT JOIN content_items item ON item.id=learning.content_item_id LEFT JOIN sav_knowledge_activations active ON active.item_id=item.id LEFT JOIN sav.ticket_snapshots snapshot ON snapshot.hubspot_ticket_id=learning.hubspot_ticket_id
- WHERE learning.status='pending' AND NOT EXISTS(SELECT 1 FROM sav_knowledge_proposal_drafts draft WHERE draft.learning_candidate_id=learning.id)
+ WHERE learning.status='pending' AND ((learning.created_by='human' AND learning.source_ref NOT LIKE 'sav-observation:%') OR EXISTS(SELECT 1 FROM sav.learning_admission_attempts admitted WHERE admitted.candidate_id=learning.id)) AND NOT EXISTS(SELECT 1 FROM sav_knowledge_proposal_drafts draft WHERE draft.learning_candidate_id=learning.id)
  )`;
 function resultRows<T>(result: unknown): T[] { return (Array.isArray(result) ? result : (result as { rows: T[] }).rows) as T[]; }
 const actions: Record<string, string> = { production: "Consulter la version active", needs_revalidation: "Vérifier la validité et proposer une version à revalider", unavailable: "Vérifier pourquoi cette version est indisponible", pending: "Examiner la proposition", draft: "Terminer puis soumettre", needs_completion: "Compléter les sources ou la procédure", approved: "Publier la version validée", published_inactive: "Activer la version publiée", index_error: "Vérifier l’erreur de publication", indexing: "Publication en attente", rejected: "Consulter le motif du refus", superseded: "Consulter la proposition suivante", needs_recording: "Compléter la démonstration", not_applicable: "Qualifier la proposition" };
@@ -161,13 +161,16 @@ export async function getSavKnowledgeDetail(input: { candidateId?: string; itemI
   } else if (row.learningCandidateId) {
     const [learning] = await db.select().from(savLearningCandidates).where(eq(savLearningCandidates.id, row.learningCandidateId));
     try {
-      const patch = decryptSavPayload<{ subject: string; finalHumanResolution: string }>(String(learning.proposedPatch.ciphertext));
+      const patch = decryptSavPayload<{ subject: string; finalHumanResolution: string; conditions?: string[]; expectedResult?: string; limitations?: string[] }>(String(learning.proposedPatch.ciphertext));
       const title = publicKnowledgeText(patch.subject).slice(0, 500);
       row.title = title || row.title;
-      document = canonicalKnowledgeSchema.parse({ schemaVersion: 1, objective: title || row.title, applicability: "sav_only", locale: "fr-FR", prerequisites: [], expectedResult: "", escalation: "", exceptions: [], steps: [{ id: "resolution.observed", userLabel: "Résolution observée", objective: title || row.title, instruction: publicKnowledgeText(patch.finalHumanResolution).slice(0, 2000), expectedResult: "", prerequisites: [], exceptions: [], escalation: "", variants: [] }] });
+      const conditions = (patch.conditions ?? []).map(publicKnowledgeText).filter(Boolean);
+      const limitations = (patch.limitations ?? []).map(publicKnowledgeText).filter(Boolean);
+      const expectedResult = publicKnowledgeText(patch.expectedResult ?? "");
+      document = canonicalKnowledgeSchema.parse({ schemaVersion: 1, objective: title || row.title, applicability: "sav_only", locale: "fr-FR", prerequisites: conditions, expectedResult, escalation: "Escalader à un humain si une condition diffère ou si le résultat attendu n’est pas observé.", exceptions: limitations, steps: [{ id: "resolution.observed", userLabel: "Résolution observée", objective: title || row.title, instruction: publicKnowledgeText(patch.finalHumanResolution).slice(0, 2000), expectedResult, prerequisites: conditions, exceptions: limitations, escalation: "Escalader à un humain si la procédure échoue.", variants: [] }] });
       sources = [{ ref: `sav-learning:${learning.id}`, label: "Preuve de résolution qualifiée par Ugo" }];
       proposedBody = savProjectionBody(document);
-      missing = ["Préparer une procédure générique avec ses conditions, son résultat et ses limites avant soumission."];
+      missing = [...(!conditions.length ? ["Décrire les conditions d’application."] : []), ...(!expectedResult ? ["Définir le résultat observable attendu."] : []), ...(!limitations.length ? ["Qualifier les limites et les cas d’escalade."] : [])];
     } catch { alerts.push("SAV_LEARNING_PATCH_INVALID"); }
   } else {
     const version = versions.find((entry) => entry.id === (activeVersion?.id ?? proposedVersion?.id));
@@ -188,7 +191,7 @@ export async function getSavKnowledgeDetail(input: { candidateId?: string; itemI
   return { reviewKind, row, document, sources, activeVersion, publishedVersion, proposedVersion, proposedBody, revisionId, draft, comparison, snapshot, missing, alerts,
     history: logs.map((log) => ({ action: log.action, actor: log.actorEmail, at: log.createdAt, reason: typeof log.technicalMetadata.reason === "string" ? log.technicalMetadata.reason : "" })),
     canReview: Boolean(row.candidateId && canReviewKnowledgeCandidate(actorEmail, "sav") && ["pending", "needs_completion"].includes(row.state)),
-    canPublish: Boolean((!row.candidateId || proposedVersion?.id === item?.currentDraftVersionId) && actorEmail === "ugo@limova.ai" && item?.status === "in_review" && item.currentDraftVersionId && item.currentDraftVersionId !== item.publishedVersionId),
-    canActivate: Boolean((!row.candidateId || proposedVersion?.id === item?.publishedVersionId) && actorEmail === "ugo@limova.ai" && item && item.status !== "archived" && item.publishedVersionId && (item.publishedVersionId !== active?.versionId || !item.aiEnabled)),
+    canPublish: Boolean(!row.learningCandidateId && (!row.candidateId || proposedVersion?.id === item?.currentDraftVersionId) && actorEmail === "ugo@limova.ai" && item?.status === "in_review" && item.currentDraftVersionId && item.currentDraftVersionId !== item.publishedVersionId),
+    canActivate: Boolean(!row.learningCandidateId && (!row.candidateId || proposedVersion?.id === item?.publishedVersionId) && actorEmail === "ugo@limova.ai" && item && item.status !== "archived" && item.publishedVersionId && (item.publishedVersionId !== active?.versionId || !item.aiEnabled)),
   };
 }

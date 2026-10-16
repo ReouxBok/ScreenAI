@@ -17,14 +17,14 @@ import { savContentHash } from "../crypto";
 import { readSavHubspotContext } from "../hubspot";
 import { SAV_AGENT_ID, SAV_AGENT_SCOPE, SAV_PROMPT_REVISION, savAdkTimeoutMs } from "../config";
 import { assertSavAgentIsolation } from "./isolation";
-import { SAV_AGENT_TOOL_NAMES, savAgentOutputSchema, type SavAgentOutput } from "./contracts";
+import { SAV_AGENT_TOOL_NAMES, savAgentOutputSchema, savAgentProviderOutputSchema, type SavAgentOutput } from "./contracts";
 import type { SavConversation } from "../conversation";
 import type { SavDossierContext } from "../dossier-context";
 import { assertSavAnalysisComplete } from "./validation";
 import type { SavProposalRouting } from "../proposal";
 import { savAnalysisErrorCode } from "../analysis-errors";
 import type { SavInboundContext } from "../message-context";
-import { SAV_COMPOSITION_CONTRACT, assertSavReplyConsistency, savSemanticPlan, type SavUnderstandingV1 } from "../understanding";
+import { SAV_COMPOSITION_CONTRACT, assembleSavReplySections, assertSavReplyConsistency, savSemanticPlan, type SavUnderstandingV1 } from "../understanding";
 
 export type SavAgentInput = {
   from: string;
@@ -238,7 +238,7 @@ export async function runSavAdkAgent(input: SavAgentInput, options: {
     model,
     instruction,
     tools,
-    outputSchema: savAgentOutputSchema,
+    outputSchema: savAgentProviderOutputSchema,
     includeContents: "none",
     generateContentConfig: { temperature: 0, maxOutputTokens: 8_192 },
     disallowTransferToParent: true,
@@ -291,7 +291,7 @@ export async function runSavAdkAgent(input: SavAgentInput, options: {
   if (modelError) throw new Error(safeErrorCode(modelError));
   if (!rawOutput && finalText) rawOutput = JSON.parse(finalText);
   if (!rawOutput) throw new Error("SAV_ADK_EMPTY_OUTPUT");
-  const output = savAgentOutputSchema.parse(rawOutput);
+  const output = { ...savAgentOutputSchema.parse({ ...(rawOutput as object), replyDraft: "" }), ...assembleSavReplySections(input.understanding, (rawOutput as { coverage?: unknown }).coverage) };
   assertSavReplyConsistency(input.understanding, output);
   assertSavAnalysisComplete(output, toolTrace, [...evidenceById.values()], knowledgeById);
   const requestedEvidence = new Set(output.evidenceIds);

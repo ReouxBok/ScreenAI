@@ -21,6 +21,8 @@ export const savAgentOutputSchema = z.object({
   }).strict()).max(20),
 }).strict();
 
+export const savAgentProviderOutputSchema = savAgentOutputSchema.omit({ replyDraft: true });
+
 export type SavAgentOutput = z.infer<typeof savAgentOutputSchema>;
 
 export const SAV_AGENT_TOOL_NAMES = [

@@ -81,8 +81,9 @@ export async function assertSavCurrentManualReply(action: typeof savActions.$inf
   const [review] = await db.select().from(savProposalReviews).where(and(eq(savProposalReviews.messageId, draft.messageId), eq(savProposalReviews.isCurrent, true))).limit(1);
   const [knowledge] = await db.select().from(activeKnowledge).limit(1);
   if (!message || message.id !== draft.messageId || !message.gmailMessageId || decision?.messageId !== message.id || decision.agentRunId !== context.run.id || decision.id !== action.decisionId || run?.messageId !== message.id || run.pilotBatchId || !run.proposalCiphertext || (!draft.sourceHash && (review?.id ?? null) !== draft.reviewId) || (knowledge?.revisionId ?? null) !== draft.knowledgeRevision) throw new Error("SAV_REPLY_MANUAL_CONTEXT_CHANGED");
-  const proposal = decryptSavPayload<{ knowledgeRevision: string }>(run.proposalCiphertext);
-  if (!["not_consulted", "unavailable"].includes(proposal.knowledgeRevision) && proposal.knowledgeRevision !== knowledge?.revisionId) throw new Error("SAV_KNOWLEDGE_CHANGED_REANALYSIS_REQUIRED");
+  const proposal = context.proposal;
+  const authored=decryptSavPayload<{origin?:string}>(draft.bodyCiphertext).origin === "human";
+  if (!authored && !["not_consulted", "unavailable"].includes(proposal.knowledgeRevision) && proposal.knowledgeRevision !== knowledge?.revisionId) throw new Error("SAV_KNOWLEDGE_CHANGED_REANALYSIS_REQUIRED");
   const body = decryptSavPayload<{ text: string; headers?: Record<string, string> }>(message.bodyCiphertext);
   if (!/^<[^<>\s]+@[^<>\s]+>$/.test(body.headers?.["message-id"] ?? "")) throw new Error("SAV_REPLY_MANUAL_THREAD_HEADERS_MISSING");
   if (action.payload.replyFormatRevision !== SAV_REPLY_FORMAT_REVISION || typeof action.payload.outboundBodyCiphertext !== "string") throw new Error("SAV_REPLY_MANUAL_FORMAT_RECONFIRM_REQUIRED");

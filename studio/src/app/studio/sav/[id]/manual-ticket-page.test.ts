@@ -61,7 +61,7 @@ describe("manual ticket controls in the dossier", () => {
     const detail = await dependencies.detail();
     const html = await render({ thread: { ...detail.thread, hubspotTicketId: "301" }, actions: [{ ...action, status: "succeeded", payload: { hubspotTicketId: "301" } }] });
     expect(html).toContain('href="https://app.hubspot.com/contacts/143641967/ticket/301"');
-    expect(html).toContain("Ticket #301"); expect(html).not.toContain("en attente de confirmation");
+    expect(html).toContain("Ouvrir le ticket HubSpot"); expect(html).not.toContain("#301"); expect(html).not.toContain("en attente de confirmation");
   });
   it("explains failed contact verification and keeps its creation unconfirmed", async () => {
     const html = await render({ actions: [{ ...action, status: "failed", errorCode: "SAV_HUBSPOT_CONTACT_REQUIRED" }] });

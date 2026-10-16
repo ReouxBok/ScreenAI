@@ -14,6 +14,7 @@ import {
 import { GEMINI_EMBEDDING_MODEL, probeEmbedding } from "./embeddings";
 import { savAutomationMode } from "./sav/config";
 import { getTrainingReconciliationCandidates } from "./training";
+import { getSavProviderHealth } from "./sav/provider-health";
 
 export type StudioHealthLevel = "healthy" | "warning" | "error";
 export type StudioHealthCheck = {
@@ -50,7 +51,7 @@ async function proxyHealth(): Promise<StudioHealthCheck> {
 export async function getStudioHealth(options: { probeKnowledge?: boolean } = {}) {
   const db = requireDb();
   const now = new Date();
-  const [mailboxRows, receiptCounts, quarantineCount, hubspotFailures, knowledgeCounts, expiredEvaluations, trainingCandidates, proxy] = await Promise.all([
+  const [mailboxRows, receiptCounts, quarantineCount, hubspotFailures, knowledgeCounts, expiredEvaluations, trainingCandidates, proxy, savAiProvider] = await Promise.all([
     db.select().from(savMailboxes).where(eq(savMailboxes.active, true)),
     db.select({
       pending: sql<number>`count(*) filter (where ${savWebhookReceipts.status} in ('pending', 'processing'))::int`,
@@ -71,6 +72,7 @@ export async function getStudioHealth(options: { probeKnowledge?: boolean } = {}
     )),
     getTrainingReconciliationCandidates(now),
     proxyHealth(),
+    getSavProviderHealth(now),
   ]);
 
   const receipts = receiptCounts[0] ?? { pending: 0, failed: 0 };
@@ -106,6 +108,7 @@ export async function getStudioHealth(options: { probeKnowledge?: boolean } = {}
   }
 
   const checks: StudioHealthCheck[] = [
+    savAiProvider,
     {
       key: "gmail",
       label: "Gmail",

@@ -12,12 +12,13 @@ import { canonicalKnowledgeSchema } from "./contracts";
 import { compareKnowledge, parseHubspotKnowledgeImport, type KnowledgeComparisonEntry } from "./hubspot-input";
 
 type DbReader = Pick<ReturnType<typeof requireDb>, "select">;
-export async function knowledgeComparisonInventory(db: DbReader = requireDb()): Promise<KnowledgeComparisonEntry[]> {
-  // Compare published AND draft articles, including existing common/Charly knowledge.
+export async function knowledgeComparisonInventory(db: DbReader = requireDb(), scope: "all" | "sav" = "all"): Promise<KnowledgeComparisonEntry[]> {
+  // Human import review keeps the cross-surface catalogue. Automated SAV learning
+  // compares all SAV draft/published/active versions and pending SAV projections.
   const articles = await db.select({ item: contentItems, version: contentVersions }).from(contentItems)
     .leftJoin(savKnowledgeActivations, eq(savKnowledgeActivations.itemId, contentItems.id))
     .innerJoin(contentVersions, and(eq(contentVersions.itemId, contentItems.id), or(eq(contentVersions.id, contentItems.currentDraftVersionId), eq(contentVersions.id, contentItems.publishedVersionId), eq(contentVersions.id, savKnowledgeActivations.versionId))))
-    .where(and(eq(contentItems.type, "article"), ne(contentItems.status, "archived")));
+    .where(and(eq(contentItems.type, "article"), ne(contentItems.status, "archived"), scope === "sav" ? eq(contentItems.agentKey, "sav") : undefined));
   const candidates = await db.select().from(knowledgeProjectionCandidates).where(and(eq(knowledgeProjectionCandidates.targetSurface, "sav"), or(eq(knowledgeProjectionCandidates.status, "pending"), eq(knowledgeProjectionCandidates.status, "needs_completion"))));
   return [...articles.map(({ item, version }) => ({ ref: `content:${item.id}`, versionId: version.id, title: item.title, body: version.bodyMarkdown, agentKey: item.agentKey })),
     ...candidates.map((candidate) => {

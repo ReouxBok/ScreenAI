@@ -3,13 +3,15 @@ import type { SavDecisionEvidence } from "@/db/schema";
 import type { SavAnalysis } from "./intelligence";
 import type { SavDossierContext } from "./dossier-context";
 import { savInboundContextSchema, type SavInboundContext } from "./message-context";
-import { savUnderstandingSchema, savReplyCoverageSchema } from "./understanding";
+import { savUnderstandingSchema, savReplyCoverageSchema, savAiTransportTraceSchema } from "./understanding";
+import { savHumanProcessSchema } from "./human-process";
 
 export const savReplyAssessmentSchema = z.object({
   kind: z.enum(["contextualized", "finance_standard", "lead_template", "human_handoff", "unavailable", "forbidden", "none"]),
   coverage: savReplyCoverageSchema,
   errorCode: z.string().nullable(),
   coherence: z.object({
+    transport: savAiTransportTraceSchema.optional(),
     status: z.enum(["passed", "rejected", "unavailable"]), issues: z.array(z.string()),
     promptRevision: z.string(), model: z.string(), inputHash: z.string(), outputHash: z.string().nullable(),
     durationMs: z.number().nonnegative(), inputTokens: z.number().nonnegative(), outputTokens: z.number().nonnegative(), totalTokens: z.number().nonnegative(), errorCode: z.string().nullable(),
@@ -41,11 +43,18 @@ export const savStructuredProposalSchema = z.object({
   customerIdentity: z.object({ registrationEmail: z.email().nullable(), verifiedByHuman: z.boolean() }).default({ registrationEmail: null, verifiedByHuman: false }),
   messageContext: savInboundContextSchema.optional(),
   understanding: savUnderstandingSchema.optional(),
+  humanProcess: savHumanProcessSchema.optional(),
   replyAssessment: savReplyAssessmentSchema.optional(),
   // Server-owned, encrypted snapshot: keeps the evidence available for later audits.
   dossierContext: z.custom<SavDossierContext>((value) => !!value && typeof value === "object" && "version" in value && value.version === 1).optional(),
 }).strict();
 export type SavStructuredProposal = z.infer<typeof savStructuredProposalSchema>;
+/** Human edits never rewrite the original diagnosis or silently regenerate a reply. */
+export function mergeSavReviewedProposal(original: SavStructuredProposal, reviewed: SavStructuredProposal): SavStructuredProposal {
+  const commercial = reviewed.humanProcess?.action === "commercial";
+  return { ...reviewed, understanding: original.understanding, replyDraft: commercial ? reviewed.replyDraft : original.replyDraft,
+    replyAssessment: commercial ? reviewed.replyAssessment : original.replyAssessment };
+}
 
 /** This is a proposed process for the reviewer, never a queue of executable steps. */
 export function buildSavStructuredProposal(input: { subject: string; body: string; messageContext?: SavInboundContext; dossierContext?: SavDossierContext }, analysis: SavAnalysis) {

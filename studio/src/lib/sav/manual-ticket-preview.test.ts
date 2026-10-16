@@ -6,10 +6,10 @@ import type { SavDossierContext } from "./dossier-context";
 
 const input = { threadId: "10000000-0000-4000-8000-000000000001", reviewId: "10000000-0000-4000-8000-000000000002", ticketId: "401", distinctIssueReason: "" };
 function data() {
-  const ticket = { id: "401", subject: "Téléphonie à configurer", description: "La configuration téléphonie échoue.", status: "open" as const, stageId: "2", pipelineId: "0", ownerId: "71", createdAt: "2026-10-01T12:00:00Z", closedAt: null, updatedAt: null };
+  const ticket = { id: "401", subject: "Téléphonie à configurer", description: "La configuration téléphonie échoue.", status: "open" as const, stageId: "2", pipelineId: "0", ownerId: "71", ownerName: "Alex Support", createdAt: "2026-10-01T12:00:00Z", closedAt: null, updatedAt: null };
   return { threadId: input.threadId, reviewId: input.reviewId, linkedTicketId: null, messageId: "10000000-0000-4000-8000-000000000003", receivedAt: new Date("2026-10-14T12:00:00Z"), fromEmail: "client@example.invalid", subject: "Aide téléphonie", text: "La configuration téléphonie échoue.",
     proposal: savStructuredProposalSchema.parse({ schemaVersion: 1, category: "technical", urgency: "normal", decision: { kind: "ticket_pending", reasonCode: "fixture", explanation: "Revoir cette demande", confidence: 800 }, routing: { kind: "new", reason: "fixture", contactId: "21" }, ticket: { title: ticket.subject, description: ticket.description }, process: [{ kind: "human_review", label: "Vérifier la demande", sourceIds: [] }], internalNote: null, replyDraft: null, sources: [], knowledgeRevision: "not_consulted", model: "fixture" }),
-    context: { version: 1, messageId: "10000000-0000-4000-8000-000000000003", collectedAt: new Date().toISOString(), customerIdentity: { kind: "sender", email: "client@example.invalid", forwardedBy: null }, crm: { status: "ready", errorCode: null, data: { contactId: "21", contactFound: true, tickets: [ticket], routing: { kind: "matched", ticketId: "401", reason: "semantic_same_issue", returnOperation: "reactivate" }, identityCandidates: [], errorCode: null } }, conversation: null, conversationError: null, otherConversations: [], otherConversationsError: null } as SavDossierContext };
+    context: { version: 1, messageId: "10000000-0000-4000-8000-000000000003", collectedAt: new Date().toISOString(), customerIdentity: { kind: "sender", email: "client@example.invalid", forwardedBy: null }, crm: { status: "ready", errorCode: null, data: { contactId: "21", contactName: "Camille Exemple", contactFound: true, tickets: [ticket], routing: { kind: "matched", ticketId: "401", reason: "semantic_same_issue", returnOperation: "reactivate" }, identityCandidates: [], errorCode: null } }, conversation: null, conversationError: null, otherConversations: [], otherConversationsError: null } as SavDossierContext };
 }
 function signed(d = data()) {
   const value = buildSavTicketPreview(input, d);
@@ -21,14 +21,16 @@ afterEach(() => { vi.unstubAllEnvs(); vi.useRealTimers(); });
 describe("SAV55 ticket action preview", () => {
   it("shows the exact generic note, target and preserved owner", () => {
     const p = signed();
-    expect(p.details).toMatchObject({ targetId: "401", ownerId: "71", contactId: "21", note: "Le client a renvoyé un email sur ce sujet. Le ticket repasse en Nouveau." });
+    expect(p.details).toMatchObject({ targetId: "401", ownerId: "71", ownerName: "Alex Support", contactId: "21", contactName: "Camille Exemple", note: "Le client a renvoyé un email sur ce sujet. Le ticket repasse en Nouveau." });
     expect(p.details.note).not.toContain(data().text);
     expect(() => assertSavTicketPreview(p.token, "ugo@limova.ai", p.command, data())).not.toThrow();
   });
-  it.each(["stage", "owner", "subject", "message", "review", "contact", "linked", "proposal"])("rejects changed %s after preview", kind => {
+  it.each(["stage", "owner", "owner_name", "contact_name", "subject", "message", "review", "contact", "linked", "proposal"])("rejects changed %s after preview", kind => {
     const p = signed(), changed = data();
     if (kind === "stage") changed.context.crm.data!.tickets[0].stageId = "3";
     if (kind === "owner") changed.context.crm.data!.tickets[0].ownerId = "72";
+    if (kind === "owner_name") changed.context.crm.data!.tickets[0].ownerName = "Autre propriétaire";
+    if (kind === "contact_name") changed.context.crm.data!.contactName = "Autre nom de fiche";
     if (kind === "subject") changed.context.crm.data!.tickets[0].subject = "Autre sujet";
     if (kind === "message") changed.text += " Nouvelle demande.";
     if (kind === "review") changed.reviewId = "10000000-0000-4000-8000-000000000009";

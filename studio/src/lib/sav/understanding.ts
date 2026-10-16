@@ -1,7 +1,9 @@
 import { z } from "zod";
+import { normalizeSavEvidenceText, savEvidenceContains } from "./evidence-text";
+import { cleanSavModelDraft } from "./reply-format";
 
-export const SAV_UNDERSTANDING_REVISION = "sav-understanding-2026-10-13.v2";
-export const SAV_UNDERSTANDING_PROMPT_REVISION = "sav-understanding-prompt-2026-10-13.v3";
+export const SAV_UNDERSTANDING_REVISION = "sav-understanding-2026-10-16.v3";
+export const SAV_UNDERSTANDING_PROMPT_REVISION = "sav-understanding-prompt-2026-10-16.v4";
 const id = z.string().trim().min(1).max(100);
 const ids = z.array(id).max(30);
 export const savRequestNatureSchema = z.enum(["technical", "account", "integration", "how_to", "financial_operation", "financial_data", "cancellation", "commercial", "partnership", "callback", "human_request", "security", "privacy", "data_deletion", "legal", "acknowledgement", "non_support", "unknown"]);
@@ -25,26 +27,36 @@ export const savUnderstandingContentSchema = z.object({
   evidence: z.array(z.object({ id, source: z.enum(["current_message", "history", "crm"]), sourceId: id, excerpt: z.string().trim().min(2).max(1500) }).strict()).max(60),
   uncertainties: z.array(z.object({ code: z.enum(["ambiguous_intent", "missing_context", "unread_attachment", "truncated_context", "conflicting_evidence", "provider_unavailable", "invalid_output"]), requestIds: ids }).strict()).max(20),
 }).strict();
+export const savAiTransportTraceSchema = z.object({ transportRevision: z.string(), correlationId: z.string(), model: z.string(), promptRevision: z.string(), phase: z.enum(["understanding", "composition", "coherence", "ticket_matching", "repair", "learning_comparison"]), attempts: z.number().int().nonnegative(), retries: z.number().int().nonnegative(), durationMs: z.number().nonnegative(), errorCode: z.string().nullable(), failureCategory: z.enum(["authentication", "billing", "rate_limited", "provider_unavailable", "invalid_output", "blocked_output", "budget_exhausted"]).nullable() }).strict();
 export const savUnderstandingSchema = savUnderstandingContentSchema.extend({
   trace: z.object({
     contractRevision: z.string(), promptRevision: z.string(), model: z.string().nullable(), inputHash: z.string(), codeRevision: z.string().nullable(),
     durationMs: z.number().nonnegative(), inputTokens: z.number().nonnegative(), outputTokens: z.number().nonnegative(), totalTokens: z.number().nonnegative(),
     errorCode: z.string().nullable(),
+    transport: savAiTransportTraceSchema.optional(),
+    finishReason: z.string().optional(), blockReason: z.string().optional(), thoughtTokens: z.number().nonnegative().optional(),
+    normalizationRevision: z.string().optional(),
+    removedKnownQuestions: z.number().int().nonnegative().optional(),
+    validationRepair: z.object({ attempted: z.literal(true), succeeded: z.boolean(), originalErrorCode: z.string(), errorCode: z.string().nullable(), originalOutputHash: z.string(), repairedOutputHash: z.string().nullable(), transport: savAiTransportTraceSchema.optional() }).strict().optional(),
   }).strict(),
 });
 export type SavUnderstandingContent = z.infer<typeof savUnderstandingContentSchema>;
 export type SavUnderstandingV1 = z.infer<typeof savUnderstandingSchema>;
 export type SavUnderstandingSource = { source: "current_message" | "history" | "crm"; sourceId: string; text: string };
 
-const normalize = (text: string) => text.normalize("NFKC").replace(/\s+/g, " ").trim();
+const normalize = normalizeSavEvidenceText;
 function unique(values: string[]) { return new Set(values).size === values.length; }
+
+export class SavUnderstandingValidationError extends Error {
+  constructor(public readonly reason: "citation_mismatch" | "invalid_structure" | "source_mismatch") { super("SAV_UNDERSTANDING_INVALID_EVIDENCE"); }
+}
 
 /** No model-supplied fact or intent can refer to an invented/quoted-current source. */
 export function validateSavUnderstanding(raw: unknown, sources: SavUnderstandingSource[]): SavUnderstandingContent {
   const u = savUnderstandingContentSchema.parse(raw);
   const requestIds = new Set(u.requests.map(r => r.id));
   const evidence = new Map(u.evidence.map(e => [e.id, e]));
-  const fail = () => { throw new Error("SAV_UNDERSTANDING_INVALID_EVIDENCE"); };
+  const fail = (reason: "citation_mismatch" | "invalid_structure" | "source_mismatch" = "invalid_structure") => { throw new SavUnderstandingValidationError(reason); };
   if (!unique(u.requests.map(r => r.id)) || !unique(u.evidence.map(e => e.id)) || !unique([...u.knownFacts, ...u.attemptedSteps, ...u.missingInformation].map(f => f.id))) fail();
   if (u.primaryRequestId !== null && !requestIds.has(u.primaryRequestId)) fail();
   if (u.status === "qualified" && (!u.primaryRequestId || !u.requests.length || u.requests.some(r => r.nature === "unknown") || u.language === "unknown")) fail();
@@ -52,7 +64,8 @@ export function validateSavUnderstanding(raw: unknown, sources: SavUnderstanding
   if (u.status === "unavailable" && (u.requests.length || u.primaryRequestId)) fail();
   for (const e of u.evidence) {
     const source = sources.find(s => s.source === e.source && s.sourceId === e.sourceId);
-    if (!source || !normalize(source.text).includes(normalize(e.excerpt))) fail();
+    if (!source) fail("source_mismatch");
+    if (source && !savEvidenceContains(source.text, e.excerpt)) fail("citation_mismatch");
   }
   for (const item of [...u.requests, ...u.knownFacts, ...u.attemptedSteps]) {
     if (item.evidenceIds.some(e => !evidence.has(e))) fail();
@@ -65,8 +78,20 @@ export function validateSavUnderstanding(raw: unknown, sources: SavUnderstanding
     if (financial !== (r.financialScope === "support_account")) fail();
   }
   for (const item of [...u.missingInformation, ...u.uncertainties]) if (item.requestIds.some(r => !requestIds.has(r))) fail();
-  if (u.missingInformation.some(m => u.knownFacts.some(f => f.key === m.key))) fail();
+  // Only redundant questions are recoverable locally, after every reference
+  // and request has been validated. Never discard a demand or a source.
+  u.missingInformation = u.missingInformation.filter(m => !u.knownFacts.some(f => f.key === m.key));
   return u;
+}
+
+/** A citation repair cannot solve validation by removing/changing an intent,
+ * financial restriction, source identity, known fact or attempted step. */
+export function assertSavUnderstandingRepairPreserves(before: SavUnderstandingContent, after: SavUnderstandingContent) {
+  const retained = (u: SavUnderstandingContent) => ({ version: u.version, status: u.status, language: u.language, primaryRequestId: u.primaryRequestId,
+    customerRelationship: u.customerRelationship, requests: u.requests, knownFacts: u.knownFacts, attemptedSteps: u.attemptedSteps,
+    missingInformation: u.missingInformation.filter(m => !u.knownFacts.some(f => f.key === m.key)), uncertainties: u.uncertainties,
+    evidence: u.evidence.map(e => ({ id: e.id, source: e.source, sourceId: e.sourceId })) });
+  if (JSON.stringify(retained(before)) !== JSON.stringify(retained(after))) throw new Error("SAV_UNDERSTANDING_REPAIR_REJECTED");
 }
 
 export type SavSemanticPlan = {
@@ -104,6 +129,17 @@ export const savReplyCoverageSchema = z.array(z.object({
 }).strict()).max(15);
 export type SavReplyCoverage = z.infer<typeof savReplyCoverageSchema>;
 
+/** The model supplies sections once. The server owns order and the displayed draft. */
+export function assembleSavReplySections(u: SavUnderstandingV1, raw: unknown) {
+  const coverage = savReplyCoverageSchema.parse(savReplyCoverageSchema.parse(raw).map(part => ({ ...part, text: cleanSavModelDraft(part.text) })));
+  if (coverage.length !== u.requests.length || !unique(coverage.map(p => p.requestId)) || u.requests.some(r => !coverage.some(p => p.requestId === r.id)))
+    throw new Error("SAV_REPLY_INCONSISTENT_WITH_UNDERSTANDING");
+  const ordered = u.requests.map(r => coverage.find(p => p.requestId === r.id)!);
+  const replyDraft = ordered.map(p => p.text).join("\n\n");
+  if (replyDraft.length > 8000) throw new Error("SAV_REPLY_INCONSISTENT_WITH_UNDERSTANDING");
+  return { coverage: ordered, replyDraft };
+}
+
 /** Structural consistency complements citation checks; semantic accuracy still needs human evaluation. */
 export function assertSavReplyConsistency(u: SavUnderstandingV1, output: { category: string; replyDraft: string; responseKind: string; coverage?: SavReplyCoverage; citations: Array<{ sourceId: string }> }) {
   const plan = savSemanticPlan(u);
@@ -123,4 +159,4 @@ export function assertSavReplyConsistency(u: SavUnderstandingV1, output: { categ
   }
 }
 
-export const SAV_COMPOSITION_CONTRACT = `La compréhension structurée fournie par le serveur est le contrat de cette réponse. Ne requalifie pas les demandes ni leur catégorie. Couvre chaque request.id exactement une fois dans coverage, y compris les demandes secondaires. Chaque section text doit répondre à cette demande, dans la langue comprise. replyDraft doit être exactement les sections text jointes avec deux sauts de ligne, sans ajout. Une section solution exige les sourceIds des fiches validées qui justifient chaque conseil ; responseKind global devient solution dès qu'une section solution existe. Une clarification cite uniquement les missingInformationIds correspondants ; aucune question sur un fait connu. N'utilise pas une question libre comme accusé de réception. Ne répète pas une étape déjà tentée ; si une nouvelle preuve justifie une nouvelle tentative, cite repeatedAttemptIds et donne une repeatJustification explicite dans la réponse. Sans source pertinente ni information manquante utile, prépare seulement un transfert humain factuel qui reconnaît la demande. Aucun délai, promesse de résultat, de rappel, de geste commercial ou d'action déjà effectuée. Les faits CRM ne prouvent pas une procédure produit. Les champs confidence sont des estimations non calibrées et ne constituent jamais une permission d'action.`;
+export const SAV_COMPOSITION_CONTRACT = `La compréhension structurée fournie par le serveur est le contrat de cette réponse. Ne requalifie pas les demandes ni leur catégorie. Couvre chaque request.id exactement une fois dans coverage, y compris les demandes secondaires. Chaque section text doit répondre à cette demande, dans la langue comprise. Ne fournis pas de replyDraft : le serveur assemble les sections validées dans l’ordre des demandes, avec deux sauts de ligne et sans ajout. Une section solution exige les sourceIds des fiches validées qui justifient chaque conseil ; responseKind global devient solution dès qu'une section solution existe. Une clarification cite uniquement les missingInformationIds correspondants ; aucune question sur un fait connu. N'utilise pas une question libre comme accusé de réception. Ne répète pas une étape déjà tentée ; si une nouvelle preuve justifie une nouvelle tentative, cite repeatedAttemptIds et donne une repeatJustification explicite dans la réponse. Sans source pertinente ni information manquante utile, prépare seulement un transfert humain factuel qui reconnaît la demande. Aucun délai, promesse de résultat, de rappel, de geste commercial ou d'action déjà effectuée. Les faits CRM ne prouvent pas une procédure produit. Les champs confidence sont des estimations non calibrées et ne constituent jamais une permission d'action.`;
