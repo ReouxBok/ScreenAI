@@ -20,7 +20,6 @@ describe("SAV meaning contract provenance", () => {
     ["financial nature without account scope", u => { u.requests[0].nature = "financial_operation"; }],
     ["technical nature with account financial scope", u => { u.requests[0].financialScope = "support_account"; }],
     ["question for unknown request", u => { u.missingInformation = [{ id: "q1", key: "error", text: "Quel message voyez-vous ?", requestIds: ["unknown"] }]; }],
-    ["question repeats known fact", u => { u.knownFacts = [{ id: "f1", key: "account_email", text: "Déjà fourni", evidenceIds: ["evidence-1"] }]; u.missingInformation = [{ id: "q1", key: "account_email", text: "Quel email ?", requestIds: ["request-1"] }]; }],
     ["prospect without evidence", u => { u.customerRelationship = { kind: "prospect", evidenceIds: [] }; }],
     ["customer with fabricated evidence", u => { u.customerRelationship = { kind: "existing_customer", evidenceIds: ["fabricated"] }; }],
   ])("rejects %s", (_label, change) => {

@@ -46,7 +46,7 @@ async function otherConversations(message: typeof savMessages.$inferSelect, cust
       messages: [] });
     if (candidates.length === 5) break;
   }
-  for (const candidate of candidates) {
+  await Promise.all(candidates.map(async candidate => {
     const history = await db.select().from(savMessages).where(and(eq(savMessages.threadId, candidate.id),
       eq(savMessages.mailboxId, message.mailboxId), lte(savMessages.receivedAt, message.receivedAt)))
       .orderBy(desc(savMessages.receivedAt)).limit(6);
@@ -55,7 +55,7 @@ async function otherConversations(message: typeof savMessages.$inferSelect, cust
       : row.toEmails.some((email) => email.toLowerCase() === customerEmail.toLowerCase()))
       .map((row) => ({ from: row.fromEmail, direction: row.direction, receivedAt: row.receivedAt.toISOString(),
         text: splitSavMessageText(decryptSavPayload<{ text: string }>(row.bodyCiphertext).text).currentText.slice(0, 1_200) })).reverse();
-  }
+  }));
   return candidates;
 }
 

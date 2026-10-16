@@ -3,6 +3,8 @@ import { getSavLearningCutover, recordSavLearningSignal } from "./learning-admis
 import { processSavLearningResolution } from "./learning-pipeline";
 import { SAV_TICKET_RETURN_NOTE_VERSION, savTicketReturnNote } from "./ticket-return-note";
 
+import { shortlistSavTickets, savSubsetMatchIsComplete } from "./ticket-shortlist";
+import { requestSavHubspot } from "./hubspot-transport";
 import { createHmac, timingSafeEqual } from "node:crypto";
 import { and, asc, desc, eq, inArray, isNull, lt, lte, or, sql } from "drizzle-orm";
 import { z } from "zod";
@@ -163,22 +165,9 @@ export async function acceptHubspotWebhook(rawInput: unknown) {
 }
 
 async function hubspotFetch<T>(path: string, init?: RequestInit): Promise<T> {
-  const response = await fetch(`https://api.hubapi.com${path}`, {
-    ...init,
-    headers: {
-      Authorization: `Bearer ${requiredEnv("HUBSPOT_ACCESS_TOKEN")}`,
-      "Content-Type": "application/json",
-      Accept: "application/json",
-      ...(init?.headers ?? {}),
-    },
-    signal: init?.signal ?? AbortSignal.timeout(20_000),
-  });
-  if (!response.ok) {
-    const payload = await response.json().catch(() => null);
-    throw new Error(summarizeHubspotError(response.status, payload));
-  }
-  if (response.status === 204) return undefined as T;
-  return response.json() as Promise<T>;
+  return requestSavHubspot<T>(path, {
+    ...init, headers: { Authorization: `Bearer ${requiredEnv("HUBSPOT_ACCESS_TOKEN")}`, "Content-Type": "application/json", Accept: "application/json", ...(init?.headers ?? {}) },
+  }, summarizeHubspotError);
 }
 
 export function summarizeHubspotError(status: number, payload: unknown) {
@@ -279,15 +268,22 @@ async function hubspotOwnerNames(): Promise<Map<string, string>> {
 }
 
 async function findContactByEmail(email: string) {
-  const response = await hubspotFetch<{ results?: HubspotRecord[] }>("/crm/v3/objects/contacts/search", {
-    method: "POST",
-    body: JSON.stringify({
-      filterGroups: [{ filters: [{ propertyName: "email", operator: "EQ", value: normalizeEmailAddress(email) }] }],
-      properties: ["email", "firstname", "lastname"],
-      limit: 1,
-    }),
+  const address = normalizeEmailAddress(email);
+  const primary = await hubspotFetch<{ results?: HubspotRecord[]; paging?: { next?: unknown } }>("/crm/v3/objects/contacts/search", {
+    method: "POST", body: JSON.stringify({ filterGroups: [{ filters: [{ propertyName: "email", operator: "EQ", value: address }] }],
+      properties: ["email", "hs_additional_emails", "firstname", "lastname"], limit: 2 }),
   });
-  return response.results?.[0] ?? null;
+  if (primary.paging?.next || (primary.results?.length ?? 0) > 1) throw new Error("SAV_HUBSPOT_IDENTITY_AMBIGUOUS");
+  if (primary.results?.length) return primary.results[0];
+  // Search's documented default text properties include hs_additional_emails.
+  // This broad query is only retrieval: exact address membership confirms identity.
+  const secondary = await hubspotFetch<{ results?: HubspotRecord[]; paging?: { next?: unknown } }>("/crm/v3/objects/contacts/search", {
+    method: "POST", body: JSON.stringify({ query: address, properties: ["email", "hs_additional_emails", "firstname", "lastname"], limit: 100 }),
+  });
+  if (secondary.paging?.next) throw new Error("SAV_HUBSPOT_IDENTITY_INCOMPLETE");
+  const matches = (secondary.results ?? []).filter(c => [c.properties.email, ...(c.properties.hs_additional_emails ?? "").split(";")].some(value => value && normalizeEmailAddress(value) === address));
+  if (matches.length > 1) throw new Error("SAV_HUBSPOT_IDENTITY_AMBIGUOUS");
+  return matches[0] ?? null;
 }
 
 async function guardedHubspotWrite<T>(actionId: string, path: string, init: RequestInit): Promise<T> {
@@ -619,13 +615,23 @@ export async function findSavContactCandidates(hints: SavIdentityHints): Promise
   return [...candidates.values()].slice(0, 10);
 }
 
-export async function readSavHubspotContext(input: { email: string; subject: string; body?: string; currentTicketId?: string | null; returnedAt?: Date | string; identityHints?: SavIdentityHints; toleratePartial?: boolean; skipSemanticMatch?: boolean; cachedMatching?: SavTicketMatchCache }) {
+export type SavHubspotContext = {
+  errorCode: string | null; contactFound: boolean; contactId?: string; contactName?: string | null; identityCandidates: SavIdentityCandidate[];
+  tickets: Array<SavLifecycleTicket & { subject: string; description: string; descriptionTruncated?: boolean; subjectTruncated?: boolean; pipelineId: string | null; stageId: string | null; updatedAt: string | null }>;
+  matching?: Awaited<ReturnType<typeof matchSavTicketsByContent>>["matching"];
+  limitations?: { paginationComplete: boolean; total: number; shown: number; omittedOpen: number; omittedClosed: number };
+  routing: { kind: "matched"; ticketId: string; reason: string; returnOperation: ReturnType<typeof savTicketReturnPlan>["operation"] }
+    | { kind: "new" | "ambiguous"; reason: string; candidateIds: string[] };
+};
+
+export async function readSavHubspotContext(input: { email: string; subject: string; body?: string; currentTicketId?: string | null; returnedAt?: Date | string; identityHints?: SavIdentityHints; toleratePartial?: boolean; skipSemanticMatch?: boolean; cachedMatching?: SavTicketMatchCache }): Promise<SavHubspotContext> {
   const contact = await findContactByEmail(input.email);
   const contactName = contact ? [contact.properties.firstname, contact.properties.lastname].filter((part): part is string => Boolean(part?.trim())).join(" ").trim() || null : null;
   let identityCandidates: SavIdentityCandidate[] = [];
   try {
     identityCandidates = !contact && input.identityHints ? await findSavContactCandidates(input.identityHints) : [];
-    let linkedTicket: HubspotRecord | null = null;
+    const readLinked = async () => {
+      let linkedTicket: HubspotRecord | null = null;
     if (input.currentTicketId) {
       try {
         linkedTicket = await hubspotFetch<HubspotRecord>(`/crm/v3/objects/tickets/${encodeURIComponent(input.currentTicketId)}?properties=subject,content,createdate,hs_pipeline,hs_pipeline_stage,hs_lastmodifieddate,hs_last_closed_date,closed_date,hubspot_owner_id&associations=contacts`);
@@ -633,27 +639,39 @@ export async function readSavHubspotContext(input: { email: string; subject: str
         if (!/HUBSPOT_HTTP_404/.test(error instanceof Error ? error.message : "")) throw error;
       }
     }
-    const response = contact ? await hubspotFetch<{ results?: HubspotRecord[]; paging?: { next?: unknown } }>("/crm/v3/objects/tickets/search", {
-        method: "POST",
-        body: JSON.stringify({
-          filterGroups: [{ filters: [{ propertyName: "associations.contact", operator: "EQ", value: contact.id }] }],
+      return linkedTicket;
+    };
+    const readAssociated = async () => {
+    const recordsById = new Map<string, HubspotRecord>();
+    let after: string | undefined;
+    let paginationComplete = true;
+    const seenCursors = new Set<string>();
+    if (contact) for (let page = 0; page < 5; page++) {
+      const response = await hubspotFetch<{ results?: HubspotRecord[]; paging?: { next?: { after?: string | number } } }>("/crm/v3/objects/tickets/search", {
+        method: "POST", body: JSON.stringify({ filterGroups: [{ filters: [{ propertyName: "associations.contact", operator: "EQ", value: contact.id }] }],
           properties: ["subject", "content", "hs_pipeline", "hs_pipeline_stage", "hs_lastmodifieddate", "createdate", "hs_last_closed_date", "closed_date", "hubspot_owner_id"],
-          sorts: ["-createdate"],
-          limit: 100,
-        }),
-      }) : { results: [] };
-    if ("paging" in response && response.paging?.next) throw new Error("SAV_HUBSPOT_TICKETS_TRUNCATED");
+          sorts: ["-createdate"], limit: 100, ...(after ? { after } : {}) }),
+      });
+      for (const ticket of response.results ?? []) recordsById.set(ticket.id, ticket);
+      if (!response.paging?.next) break;
+      const next = response.paging.next.after;
+      if (next === undefined || !/^\d+$/.test(String(next)) || seenCursors.has(String(next)) || page === 4) { paginationComplete = false; break; }
+      after = String(next); seenCursors.add(after);
+    }
+      return { recordsById, paginationComplete };
+    };
+    const [linked, { recordsById, paginationComplete }, closed] = await Promise.all([readLinked(), readAssociated(), closedTicketStages()]);
+    let linkedTicket = linked;
     if (linkedTicket && !linkedTicket.associations?.contacts?.results?.some(row => row.id === contact?.id)) linkedTicket = null;
-    const closed = await closedTicketStages();
-    const records = [...(linkedTicket ? [linkedTicket] : []), ...(response.results ?? []).filter((ticket) => ticket.id !== linkedTicket?.id)]
+    const records = [...(linkedTicket ? [linkedTicket] : []), ...[...recordsById.values()].filter((ticket) => ticket.id !== linkedTicket?.id)]
       .filter((ticket) => String(ticket.properties.hs_pipeline) === SAV_HUBSPOT_SUPPORT.pipelineId);
     const ownerNames = records.some(ticket => ticket.properties.hubspot_owner_id) ? await hubspotOwnerNames() : new Map<string, string>();
     const tickets = sortSavTicketsNewestFirst(records.map((ticket): SavLifecycleTicket & { subject: string; description: string; descriptionTruncated?: boolean; subjectTruncated?: boolean; pipelineId: string | null; stageId: string | null; updatedAt: string | null } => ({
       id: ticket.id,
       subject: String(ticket.properties.subject || "Sans objet").slice(0, 500),
       subjectTruncated: String(ticket.properties.subject || "Sans objet").length > 500,
-      description: String(ticket.properties.content || "").slice(0, 2_500),
-      descriptionTruncated: String(ticket.properties.content || "").length > 2_500,
+      description: String(ticket.properties.content || "").slice(0, 8_000),
+      descriptionTruncated: String(ticket.properties.content || "").length > 8_000,
       pipelineId: ticket.properties.hs_pipeline,
       stageId: ticket.properties.hs_pipeline_stage,
       ownerId: ticket.properties.hubspot_owner_id || null,
@@ -663,10 +681,13 @@ export async function readSavHubspotContext(input: { email: string; subject: str
       closedAt: ticket.properties.hs_last_closed_date || ticket.properties.closed_date || null,
       updatedAt: ticket.properties.hs_lastmodifieddate || ticket.updatedAt || null,
     })));
-    const assessed = input.body !== undefined && !input.skipSemanticMatch ? await matchSavTicketsByContent({ subject: input.subject, body: input.body, tickets }, { cached: input.cachedMatching }) : null;
-    const routing = assessed?.selection ?? selectSavTicketMatch({ subject: input.subject, candidates: tickets, currentTicketId: input.currentTicketId, includeClosed: true });
+    const shortlist = shortlistSavTickets(tickets, `${input.subject}\n${input.body ?? ""}`, input.currentTicketId);
+    const assessed = input.body !== undefined && !input.skipSemanticMatch && paginationComplete ? await matchSavTicketsByContent({ subject: input.subject, body: input.body, tickets: shortlist.selected }, { cached: input.cachedMatching }) : null;
+    let routing = assessed?.selection ?? selectSavTicketMatch({ subject: input.subject, candidates: tickets, currentTicketId: input.currentTicketId, includeClosed: true });
+    if (!paginationComplete || assessed && !savSubsetMatchIsComplete(routing, shortlist.omitted)) routing = { kind: "ambiguous", candidates: tickets, reason: "ticket_context_incomplete" };
     return {
-      errorCode: null as string | null,
+      errorCode: paginationComplete ? null : "SAV_HUBSPOT_TICKETS_TRUNCATED",
+      limitations: { paginationComplete, ...shortlist.limits },
       contactFound: Boolean(contact),
       contactId: contact?.id,
       ...(contactName ? { contactName } : {}),
@@ -1017,14 +1038,20 @@ export async function processPendingPilotHubspotActionsAcrossBatches(limit = 100
   return { skipped: "pilot_simulation_only", processed: [] as Array<Record<string, unknown>> };
 }
 
-async function loadTicketEmails(ticket: HubspotRecord) {
-  const ids = ticket.associations?.emails?.results?.map((association) => association.id) ?? [];
+export async function loadSavHubspotTicketEmails(ticket: HubspotRecord) {
+  const ids = [...new Set(ticket.associations?.emails?.results?.map(a => a.id) ?? [])];
   if (ids.length > 200) throw new Error("HUBSPOT_EMAILS_TRUNCATED");
-  const emails: HubspotRecord[] = [];
-  for (const id of ids) {
-    emails.push(await hubspotFetch<HubspotRecord>(`/crm/v3/objects/emails/${encodeURIComponent(id)}?properties=hs_email_text,hs_email_html,hs_email_subject,hs_email_from_email,hs_email_to_email,hs_timestamp,hs_email_direction`));
-  }
-  return emails;
+  if (!ids.length) return [];
+  const chunks = Array.from({ length: Math.ceil(ids.length / 100) }, (_, i) => ids.slice(i * 100, (i + 1) * 100));
+  const batches = await Promise.all(chunks.map(async chunk => {
+    const result = await hubspotFetch<{ results?: HubspotRecord[]; errors?: unknown[] }>("/crm/v3/objects/emails/batch/read", { method: "POST", body: JSON.stringify({
+      properties: ["hs_email_text", "hs_email_html", "hs_email_subject", "hs_email_from_email", "hs_email_to_email", "hs_timestamp", "hs_email_direction"], inputs: chunk.map(id => ({ id })),
+    }) });
+    if (result.errors?.length || result.results?.length !== chunk.length || new Set(result.results.map(e => e.id)).size !== chunk.length || result.results.some(e => !chunk.includes(e.id))) throw new Error("SAV_HUBSPOT_EMAIL_BATCH_INCOMPLETE");
+    return result.results;
+  }));
+  const byId = new Map(batches.flat().map(e => [e.id, e]));
+  return ids.map(id => byId.get(id)!);
 }
 
 function hubspotEmailPlainText(value: string) {
@@ -1083,7 +1110,7 @@ async function snapshotTicket(ticket: HubspotRecord) {
     const [snapshot] = await requireDb().select().from(savTicketSnapshots).where(eq(savTicketSnapshots.hubspotTicketId,ticket.id));
     return snapshot;
   }
-  const emails = await loadTicketEmails(ticket);
+  const emails = await loadSavHubspotTicketEmails(ticket);
   const transcript = compactHubspotTicketTranscript(emails.map((email) => ({
     id: email.id,
     hs_email_text: String(email.properties.hs_email_text || ""),
@@ -1256,20 +1283,25 @@ export async function continueHubspotBackfill(maxPages = 1, pageSize = 25) {
   }
 }
 
-async function processHubspotReceipt(receiptId: string) {
-  const receipt = await claimWebhookReceipt(receiptId, "hubspot");
-  if (!receipt) return;
+async function processHubspotReceiptGroup(receiptIds: string[]) {
+  const claimed = [];
+  for (const id of receiptIds) { const receipt = await claimWebhookReceipt(id, "hubspot"); if (receipt) claimed.push(receipt); }
+  if (!claimed.length) return [] as string[];
   try {
-    const event = hubspotEventSchema.parse(receipt.payload);
+    const events = claimed.map(receipt => hubspotEventSchema.parse(receipt.payload));
+    const event = events.sort((a, b) => (b.occurredAt ?? 0) - (a.occurredAt ?? 0))[0];
+    // Every raw receipt remains durable; one fresh snapshot covers this bounded
+    // group for the same object. Mark each claimed event only after it succeeds.
     if (event.objectId && event.subscriptionType.startsWith("ticket.") && await hasSavTicketObservation(String(event.objectId))) {
       await refreshSavTicketObservations(String(event.objectId));
     } else if (event.objectId && event.subscriptionType.startsWith("ticket.")) {
-      const ticket = await hubspotFetch<HubspotRecord>(`/crm/v3/objects/tickets/${event.objectId}?properties=subject,content,hs_pipeline,hs_pipeline_stage,hs_lastmodifieddate&associations=emails,contacts`);
+      const ticket = await hubspotFetch<HubspotRecord>(`/crm/v3/objects/tickets/${encodeURIComponent(String(event.objectId))}?properties=subject,content,hs_pipeline,hs_pipeline_stage,hs_lastmodifieddate&associations=emails,contacts`);
       await snapshotTicket(ticket);
     }
-    await markWebhookReceipt(receipt.id, "processed");
+    for (const receipt of claimed) await markWebhookReceipt(receipt.id, "processed");
+    return claimed.map(r => r.id);
   } catch (error) {
-    await markWebhookReceipt(receipt.id, "failed", error);
+    for (const receipt of claimed) await markWebhookReceipt(receipt.id, "failed", error);
     throw error;
   }
 }
@@ -1277,7 +1309,7 @@ async function processHubspotReceipt(receiptId: string) {
 export async function processPendingHubspotReceipts(limit = 20) {
   const db = requireDb();
   const staleBefore = new Date(Date.now() - 15 * 60 * 1_000);
-  const receipts = await db.select({ id: savWebhookReceipts.id }).from(savWebhookReceipts)
+  const receipts = await db.select({ id: savWebhookReceipts.id, payload: savWebhookReceipts.payload }).from(savWebhookReceipts)
     .where(and(
       eq(savWebhookReceipts.provider, "hubspot"),
       or(
@@ -1287,13 +1319,18 @@ export async function processPendingHubspotReceipts(limit = 20) {
       lt(savWebhookReceipts.attempts, 10),
     ))
     .orderBy(asc(savWebhookReceipts.receivedAt)).limit(Math.min(100, Math.max(1, limit)));
-  const results = [];
+  const groups = new Map<string, string[]>();
   for (const receipt of receipts) {
+    const event = hubspotEventSchema.safeParse(receipt.payload);
+    const key = event.success && event.data.objectId && event.data.subscriptionType.startsWith("ticket.") ? `ticket:${event.data.objectId}` : receipt.id;
+    groups.set(key, [...(groups.get(key) ?? []), receipt.id]);
+  }
+  const results = [];
+  for (const ids of groups.values()) {
     try {
-      await processHubspotReceipt(receipt.id);
-      results.push({ id: receipt.id, status: "processed" });
+      for (const id of await processHubspotReceiptGroup(ids)) results.push({ id, status: "processed" });
     } catch (error) {
-      results.push({ id: receipt.id, status: "failed", error: error instanceof Error ? error.message : "UNKNOWN_ERROR" });
+      for (const id of ids) results.push({ id, status: "failed", error: error instanceof Error ? error.message : "UNKNOWN_ERROR" });
     }
   }
   return results;

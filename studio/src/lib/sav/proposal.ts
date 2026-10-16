@@ -3,7 +3,7 @@ import type { SavDecisionEvidence } from "@/db/schema";
 import type { SavAnalysis } from "./intelligence";
 import type { SavDossierContext } from "./dossier-context";
 import { savInboundContextSchema, type SavInboundContext } from "./message-context";
-import { savUnderstandingSchema, savReplyCoverageSchema } from "./understanding";
+import { savUnderstandingSchema, savReplyCoverageSchema, savAiTransportTraceSchema } from "./understanding";
 import { savHumanProcessSchema } from "./human-process";
 
 export const savReplyAssessmentSchema = z.object({
@@ -11,6 +11,7 @@ export const savReplyAssessmentSchema = z.object({
   coverage: savReplyCoverageSchema,
   errorCode: z.string().nullable(),
   coherence: z.object({
+    transport: savAiTransportTraceSchema.optional(),
     status: z.enum(["passed", "rejected", "unavailable"]), issues: z.array(z.string()),
     promptRevision: z.string(), model: z.string(), inputHash: z.string(), outputHash: z.string().nullable(),
     durationMs: z.number().nonnegative(), inputTokens: z.number().nonnegative(), outputTokens: z.number().nonnegative(), totalTokens: z.number().nonnegative(), errorCode: z.string().nullable(),

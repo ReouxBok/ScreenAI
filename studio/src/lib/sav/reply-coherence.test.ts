@@ -33,6 +33,6 @@ describe("SAV coherence verdict boundary (mocked model, not human accuracy)", ()
     const network = vi.fn((_url: string | URL | Request, init?: RequestInit) => new Promise<Response>((_resolve, reject) => init?.signal?.addEventListener("abort", () => reject(new DOMException("aborted", "AbortError")))));
     const pending = checkSavReplyCoherence(input, { apiKey: "fixture", fetch: network });
     await vi.advanceTimersByTimeAsync(18000);
-    expect(await pending).toMatchObject({ status: "unavailable", errorCode: "SAV_AI_TIMEOUT" }); expect(network).toHaveBeenCalledOnce();
+    expect(await pending).toMatchObject({ status: "unavailable", errorCode: "SAV_AI_TIMEOUT" }); expect(network).toHaveBeenCalledTimes(2);
   });
 });

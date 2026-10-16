@@ -67,7 +67,7 @@ describe("supervised ticket content matching", () => {
     await vi.advanceTimersByTimeAsync(12001);
     const result = await pending;
     expect(result.selection.kind).toBe("ambiguous"); expect(result.matching.errorCode).toBe("SAV_AI_TIMEOUT");
-    expect(stalled).toHaveBeenCalledTimes(1);
+    expect(stalled).toHaveBeenCalledTimes(2);
   });
   it("does not call a model when HubSpot has no associated ticket", async () => {
     const network = vi.fn<typeof fetch>();

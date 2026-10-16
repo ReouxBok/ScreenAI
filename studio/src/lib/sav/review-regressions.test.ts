@@ -74,8 +74,9 @@ it("F1 allows reconciliation after retained dossier approval and a new identical
  const action=await queueSavManualTicket({threadId,reviewId:review.id,kind:"create_ticket"},"ugo@limova.ai");expect(action.decisionId).toBe(decision.id);
  await f.db.update(savActions).set({status:"failed",payload:{...action.payload,ticketCreateDispatchedAt:now.toISOString()},errorCode:"SAV_MANUAL_RECONCILIATION_REQUIRED"}).where(eq(savActions.id,action.id));
  // Stop at a sentinel provider read: this must reach read-only reconciliation, not reject its valid retained review.
- vi.stubEnv("HUBSPOT_ACCESS_TOKEN","fixture");vi.stubGlobal("fetch",()=>{throw new Error("REVIEWER_READ_ONLY_RECONCILIATION_REACHED");});
- await expect(reconcileSavManualTicket(action.id,"123","ugo@limova.ai","Ticket fictif vérifié par le reviewer")).rejects.toThrow("REVIEWER_READ_ONLY_RECONCILIATION_REACHED");
+ vi.stubEnv("HUBSPOT_ACCESS_TOKEN","fixture");const readReached=vi.fn(()=>{throw new Error("REVIEWER_READ_ONLY_RECONCILIATION_REACHED");});vi.stubGlobal("fetch",readReached);
+ await expect(reconcileSavManualTicket(action.id,"123","ugo@limova.ai","Ticket fictif vérifié par le reviewer")).rejects.toThrow("SAV_HUBSPOT_READ_UNAVAILABLE");
+ expect(readReached).toHaveBeenCalled();
 });
 it("F2 approves a corrected candidate after an earlier candidate for this cycle was approved",async()=>{
  await f.db.insert(categories).values({slug:"depannage",label:"Dépannage",position:0}).onConflictDoNothing();

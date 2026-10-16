@@ -1,0 +1,77 @@
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { requestSavGeminiJson, savGeminiGenerationConfig, withSavAiBudget } from "./gemini-transport";
+import { geminiFixture } from "../../../test/sav-understanding-fixtures";
+
+const request = { phase: "understanding" as const, apiKey: "private-key-fixture", model: "gemini-3.6-flash", body: { contents: [{ parts: [{ text: "private-client-payload" }] }], generationConfig: { maxOutputTokens: 8192, temperature: 0 } } };
+beforeEach(() => { vi.useFakeTimers(); vi.spyOn(console, "warn").mockImplementation(() => {}); vi.spyOn(console, "info").mockImplementation(() => {}); });
+afterEach(() => { vi.useRealTimers(); vi.restoreAllMocks(); });
+
+describe("bounded read/generation transport", () => {
+  it.each([401, 402, 403, 404])("does not retry HTTP %s or leak provider body, URL key, input or exception text", async status => {
+    const network = vi.fn<typeof fetch>().mockResolvedValue(new Response("private-provider-error", { status }));
+    await expect(requestSavGeminiJson({ ...request, fetch: network })).rejects.toMatchObject({ message: `SAV_AI_HTTP_${status}`, metadata: { transport: { attempts: 1 } } });
+    expect(network).toHaveBeenCalledOnce();
+    expect(String(network.mock.calls[0][0])).not.toContain(request.apiKey);
+    expect(network.mock.calls[0][1]?.headers).toMatchObject({ "x-goog-api-key": request.apiKey });
+    expect(JSON.stringify([vi.mocked(console.warn).mock.calls, vi.mocked(console.info).mock.calls])).not.toMatch(/private-key-fixture|private-client-payload|private-provider-error/);
+  });
+  it.each([429, 503])("honors Retry-After for HTTP %s then records one retry and successful usage", async status => {
+    const network = vi.fn<typeof fetch>().mockResolvedValueOnce(new Response("", { status, headers: { "Retry-After": "2" } })).mockResolvedValueOnce(geminiFixture({ accepted: true }));
+    const result = requestSavGeminiJson({ ...request, fetch: network });
+    await vi.advanceTimersByTimeAsync(1999); expect(network).toHaveBeenCalledOnce();
+    await vi.advanceTimersByTimeAsync(101);
+    expect(await result).toMatchObject({ json: { accepted: true }, metadata: { transport: { attempts: 2, retries: 1, phase: "understanding" } } });
+    expect(network).toHaveBeenCalledTimes(2); expect(vi.getTimerCount()).toBe(0);
+  });
+  it("does not retry earlier than a Retry-After beyond the phase deadline", async () => {
+    const network = vi.fn<typeof fetch>().mockResolvedValue(new Response("", { status: 429, headers: { "Retry-After": "120" } }));
+    await expect(requestSavGeminiJson({ ...request, fetch: network })).rejects.toMatchObject({ message: "SAV_AI_HTTP_429" });
+    expect(network).toHaveBeenCalledOnce(); expect(vi.getTimerCount()).toBe(0);
+  });
+  it("shares one retry across all phases and keeps their correlation stable", async () => {
+    const network = vi.fn<typeof fetch>().mockResolvedValueOnce(new Response("", { status: 503 })).mockResolvedValueOnce(geminiFixture({ ok: true })).mockResolvedValueOnce(new Response("", { status: 429 }));
+    const result = withSavAiBudget(async () => {
+      const first = await requestSavGeminiJson({ ...request, fetch: network });
+      const second = await requestSavGeminiJson({ ...request, phase: "composition", fetch: network }).catch(error => error);
+      return { first, second };
+    });
+    await vi.advanceTimersByTimeAsync(300);
+    const { first, second } = await result;
+    expect(second).toMatchObject({ message: "SAV_AI_HTTP_429", metadata: { transport: { attempts: 1, correlationId: first.metadata.transport!.correlationId } } });
+    expect(network).toHaveBeenCalledTimes(3);
+  });
+  it("bounds timeout retries by the original 18s phase deadline", async () => {
+    const network = vi.fn<typeof fetch>((_, init) => new Promise((_, reject) => init!.signal!.addEventListener("abort", () => reject(new DOMException("private", "AbortError")))));
+    const pending = requestSavGeminiJson({ ...request, fetch: network });
+    const assertion = expect(pending).rejects.toMatchObject({ message: "SAV_AI_TIMEOUT", metadata: { transport: { attempts: 2, durationMs: 18000 } } });
+    await vi.advanceTimersByTimeAsync(18000); await assertion;
+    expect(network).toHaveBeenCalledTimes(2); expect(vi.getTimerCount()).toBe(0);
+  });
+  it.each([
+    ["SAV_AI_OUTPUT_TRUNCATED", { candidates: [{ finishReason: "MAX_TOKENS", content: { parts: [{ text: '{"partial":' }] } }] }],
+    ["SAV_AI_EMPTY_OUTPUT", { candidates: [{ finishReason: "STOP", content: { parts: [] } }] }],
+    ["SAV_AI_INVALID_JSON", { candidates: [{ content: { parts: [{ text: "invalid-json" }] } }] }],
+  ])("rejects %s without a transport retry or partial JSON acceptance", async (code, payload) => {
+    const network = vi.fn<typeof fetch>().mockResolvedValue(Response.json(payload));
+    await expect(requestSavGeminiJson({ ...request, fetch: network })).rejects.toMatchObject({ message: code }); expect(network).toHaveBeenCalledOnce();
+  });
+  it("caps calls across phases even after successful outputs", async () => {
+    const network = vi.fn<typeof fetch>().mockImplementation(async () => geminiFixture({ ok: true }));
+    await withSavAiBudget(async () => {
+      for (let i = 0; i < 5; i++) await requestSavGeminiJson({ ...request, fetch: network });
+      await expect(requestSavGeminiJson({ ...request, phase: "coherence", fetch: network })).rejects.toMatchObject({ message: "SAV_AI_BUDGET_EXCEEDED" });
+    });
+    expect(network).toHaveBeenCalledTimes(5);
+  });
+  it("refuses oversized input before the provider and respects strict no-retry callers", async () => {
+    const network = vi.fn<typeof fetch>().mockResolvedValue(new Response("", { status: 503 }));
+    await expect(requestSavGeminiJson({ ...request, body: { ...request.body, contents: "x".repeat(262144) }, fetch: network })).rejects.toMatchObject({ message: "SAV_AI_BUDGET_EXCEEDED" });
+    expect(network).not.toHaveBeenCalled();
+    await expect(requestSavGeminiJson({ ...request, fetch: network, allowRetry: false })).rejects.toMatchObject({ message: "SAV_AI_HTTP_503" });
+    expect(network).toHaveBeenCalledOnce();
+  });
+  it("uses the documented Gemini 3 setting and leaves unrecognized models untouched", () => {
+    expect(savGeminiGenerationConfig("gemini-3.6-flash", { temperature: 0, maxOutputTokens: 8192 })).toEqual({ maxOutputTokens: 8192, thinkingConfig: { thinkingLevel: "low" } });
+    expect(savGeminiGenerationConfig("gemini-2.5-flash", { temperature: 0 })).toEqual({ temperature: 0 });
+  });
+});

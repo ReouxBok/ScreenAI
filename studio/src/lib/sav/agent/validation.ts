@@ -1,3 +1,4 @@
+import { savEvidenceContains } from "../evidence-text";
 import type { SavAgentToolTrace, SavDecisionEvidence } from "@/db/schema";
 import { SAV_AGENT_TOOL_NAMES, type SavAgentOutput } from "./contracts";
 
@@ -34,8 +35,7 @@ export function assertSavGrounding(
     if (!source) throw new Error("SAV_CITATION_MUST_USE_KNOWLEDGE");
     if (!evidence.some(e => e.sourceType === "knowledge" && e.sourceId === citation.sourceId && e.contentVersionId)) throw new Error("SAV_CITATION_VERSION_REQUIRED");
     if (output.responseKind === "solution" && (!source.resolution || !Array.isArray(source.resolution.steps) || !source.resolution.steps.length)) throw new Error("SAV_CITATION_REQUIRES_RESOLUTION_CARD");
-    const normalize = (value: string) => value.normalize("NFKC").replace(/\s+/g, " ").trim().toLocaleLowerCase("fr");
-    if (!normalize(source.content).includes(normalize(citation.quote))) throw new Error("SAV_CITATION_QUOTE_MISMATCH");
+    if (!savEvidenceContains(source.content, citation.quote)) throw new Error("SAV_CITATION_QUOTE_MISMATCH");
     if (source.score < 0.5) throw new Error("SAV_CITATION_RELEVANCE_TOO_LOW");
     if (typeof source.resolution?.validUntil === "string" && source.resolution.validUntil < new Date().toISOString().slice(0, 10)) throw new Error("SAV_CITATION_EXPIRED");
     const verifiedAt = source.verifiedAt ? new Date(source.verifiedAt) : null;
