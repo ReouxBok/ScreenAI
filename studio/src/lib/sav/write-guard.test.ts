@@ -196,7 +196,7 @@ describe("write guard with migrated database", () => {
     const [processed] = await fixture.db.select().from(savPilotItems).where(eq(savPilotItems.id, item.id));
     const [run] = await fixture.db.select().from(savAgentRuns).where(eq(savAgentRuns.id, processed.agentRunId!));
     expect(processed.agentRunId).toBeTruthy();
-    expect(run).toMatchObject({ messageId, pilotBatchId: batch.id, promptRevision: "sav-understanding-prompt-2026-10-16.v5" });
+    expect(run).toMatchObject({ messageId, pilotBatchId: batch.id, promptRevision: "sav-understanding-prompt-2026-10-16.v6" });
     await fixture.db.insert(savAgentRuns).values({
       messageId, pilotBatchId: batch.id, scope: "sav_ticket_analysis", runtime: "google_adk", mode: "pilot",
       status: "succeeded", model: "fixture", promptRevision: "other-version", inputHash: "fixture",

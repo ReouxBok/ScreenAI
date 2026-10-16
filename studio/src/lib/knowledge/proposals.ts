@@ -122,7 +122,9 @@ export async function saveSavKnowledgeProposal(raw: SaveSavKnowledgeProposalInpu
     if (existing && (existing.learningCandidateId ?? null) !== (input.learningCandidateId ?? null)) throw new Error("KNOWLEDGE_ORIGIN_IMMUTABLE");
     const target = await targetState(input.targetItemId, tx, true);
     if (input.preparationKind === "diagnostic_enrichment") {
-      if (input.mode !== "improve" || !target.active || !input.sources.some(source => source.ref === `content:${target.item!.id}:${target.active!.versionId}`)) throw new Error("KNOWLEDGE_SOURCE_STALE");
+      if (input.mode !== "improve" || !target.active || target.item!.publishedVersionId !== target.active.versionId
+        || target.item!.currentDraftVersionId && target.item!.currentDraftVersionId !== target.active.versionId
+        || !input.sources.some(source => source.ref === `content:${target.item!.id}:${target.active!.versionId}`)) throw new Error("KNOWLEDGE_SOURCE_STALE");
       const [retained] = await tx.select().from(savKnowledgeProposalDrafts).where(and(eq(savKnowledgeProposalDrafts.targetItemId, target.item!.id), eq(savKnowledgeProposalDrafts.status, "draft"))).limit(1);
       if (retained) return toSavKnowledgeDraft(retained);
     }

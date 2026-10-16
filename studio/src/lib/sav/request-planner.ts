@@ -5,7 +5,7 @@ import { canonicalSavFactKey, savRequestDomain, type SavActivePlaybook } from ".
 import { savSemanticPlan, type SavUnderstandingV1, type SavReplyCoverage } from "./understanding";
 import type { SavRequestRetrievalResult, SavRequestRetrievalSource } from "./request-retrieval";
 
-export const SAV_REQUEST_PLANNER_REVISION = "sav-request-planner-2026-10-16.v1";
+export const SAV_REQUEST_PLANNER_REVISION = "sav-request-planner-2026-10-16.v2";
 export const savRequestPlanSchema = z.object({
   requestId: z.string(), domain: z.string(), mode: z.enum(["solution", "clarification", "knowledge_gap", "reserved", "provider_failure"]),
   card: z.object({ id: z.string(), versionId: z.string() }).nullable(),
@@ -29,13 +29,13 @@ function cardCanSupport(source: SavRequestRetrievalSource, now: Date) {
 export function planSavRequests(u: SavUnderstandingV1, retrieval: SavRequestRetrievalResult, playbook: SavActivePlaybook, now = new Date()): SavRequestPlan[] {
   const policy = savSemanticPlan(u);
   const canonical = (key: string) => canonicalSavFactKey(key, playbook.document);
-  const known = new Set(u.knownFacts.map(f => canonical(f.key)));
-  const attempted = new Set(u.attemptedSteps.flatMap(f => [f.key, ...(f.checkId ? [f.checkId] : [])]));
   let remainingQuestions = 15;
   return u.requests.map(request => {
+    const known = new Set(u.knownFacts.filter(f => f.requestIds?.includes(request.id) || !f.requestIds?.length && u.requests.length === 1).map(f => canonical(f.key)));
+    const ambiguousFacts = new Set(u.requests.length > 1 ? u.knownFacts.filter(f => !f.requestIds?.length).map(f => canonical(f.key)) : []);
     const domain = savRequestDomain(request);
     const found = retrieval.requests.find(r => r.requestId === request.id);
-    const limits = [...(u.knownFacts.some(f => !playbook.document.facts.some(known => known.key === canonical(f.key))) ? ["unknown_fact_key"] : []), ...(found?.limitations ?? []), ...u.uncertainties.filter(e => !e.requestIds.length || e.requestIds.includes(request.id)).map(e => e.code)];
+    const limits = [...(ambiguousFacts.size ? ["fact_scope_requires_review"] : []), ...(u.knownFacts.some(f => !playbook.document.facts.some(known => known.key === canonical(f.key))) ? ["unknown_fact_key"] : []), ...(found?.limitations ?? []), ...u.uncertainties.filter(e => !e.requestIds.length || e.requestIds.includes(request.id)).map(e => e.code)];
     const base: SavRequestPlan = { requestId: request.id, domain, mode: "knowledge_gap", card: null, missingFacts: [], nextCheck: null, repeatAllowed: false, limits };
     if (policy.replyPolicy !== "compose") return { ...base, mode: "reserved" };
     if (!found || ["search_unavailable", "revision_unstable"].includes(found.status)) return { ...base, mode: "provider_failure" };
@@ -52,10 +52,12 @@ export function planSavRequests(u: SavUnderstandingV1, retrieval: SavRequestRetr
         for (const fact of diagnostic.data.requiredFacts) {
           const key = canonical(fact.key);
           const question = u.language === "en" ? fact.questionEn : fact.question;
-          if (!known.has(key) && question && !base.missingFacts.some(f => f.key === key)) base.missingFacts.push({ id: `plan.${u.requests.indexOf(request)}.${key}`, key, question, origin: `card:${source.id}:${source.contentVersionId}` });
+          if (!known.has(key) && !ambiguousFacts.has(key) && question && !base.missingFacts.some(f => f.key === key)) base.missingFacts.push({ id: `plan.${u.requests.indexOf(request)}.${key}`, key, question, origin: `card:${source.id}:${source.contentVersionId}` });
         }
-        const blockedKeys = new Set(base.missingFacts.map(f => f.key));
-        const relevantAttempts = u.attemptedSteps.filter(f => !f.checkId || diagnostic.data.checks.some(c => c.id === f.checkId));
+        const blockedKeys = new Set([...base.missingFacts.map(f => f.key), ...ambiguousFacts]);
+        const scopedAttempts = u.attemptedSteps.filter(f => (!f.checkCardId || f.checkCardId === source.id) && (!f.requestIds?.length || f.requestIds.includes(request.id)));
+        const attempted = new Set(scopedAttempts.flatMap(f => [f.key, ...(f.checkId ? [f.checkId] : [])]));
+        const relevantAttempts = scopedAttempts.filter(f => !f.checkId || diagnostic.data.checks.some(c => c.id === f.checkId));
         const unlinkedAttempt = relevantAttempts.some(f => !diagnostic.data.checks.some(c => c.id === f.checkId || c.id === f.key || c.evidenceStepId === f.key));
         const branchTargets = new Set(diagnostic.data.checks.flatMap(c => [c.ifExpected, c.ifNot].filter(Boolean)));
         let check = diagnostic.data.checks.find(c => !branchTargets.has(c.id));
@@ -64,8 +66,8 @@ export function planSavRequests(u: SavUnderstandingV1, retrieval: SavRequestRetr
         while (check && (attempted.has(check.id) || attempted.has(check.evidenceStepId))) {
           if (visited.has(check.id)) { check = undefined; base.limits.push("diagnostic_cycle"); break; }
           visited.add(check.id);
-          const attemptedStep = u.attemptedSteps.find(f => f.checkId === check!.id || f.key === check!.id || f.key === check!.evidenceStepId);
-          const result = attemptedStep?.checkVersionId === source.contentVersionId ? attemptedStep.outcome : null;
+          const attemptedStep = scopedAttempts.find(f => f.checkId === check!.id || f.key === check!.id || f.key === check!.evidenceStepId);
+          const result = attemptedStep?.checkId === check.id && attemptedStep.checkVersionId === source.contentVersionId && (u.requests.length === 1 || attemptedStep.requestIds?.includes(request.id)) ? attemptedStep.outcome : null;
           const next = result === "expected" ? check.ifExpected : result === "not_expected" ? check.ifNot : null;
           if (!next) { check = undefined; base.limits.push("attempt_result_requires_review"); break; }
           check = diagnostic.data.checks.find(c => c.id === next);
@@ -74,7 +76,7 @@ export function planSavRequests(u: SavUnderstandingV1, retrieval: SavRequestRetr
           || diagnostic.data.requiredFacts.some(f => f.requiredFor.includes(check!.id) && blockedKeys.has(canonical(f.key))))) check = undefined;
         if (check && savEvidenceContains(source.content, check.instruction) && (source.resolution?.steps as string[]).some(step => savEvidenceContains(step, check.instruction)))
           base.nextCheck = { id: check.id, instruction: check.instruction, expectedResult: check.expectedResult, sourceId: source.id };
-      } else if (!u.attemptedSteps.length && u.status === "qualified") {
+      } else if (!u.attemptedSteps.some(f => (!f.checkCardId || f.checkCardId === source.id) && (!f.requestIds?.length || f.requestIds.includes(request.id))) && u.status === "qualified") {
         // Legacy active cards remain consumable. No invented branch or outcome.
         const instruction = (source.resolution!.steps as string[])[0];
         if (instruction && savEvidenceContains(source.content, instruction)) base.nextCheck = { id: "legacy.first", instruction, expectedResult: "", sourceId: source.id };
@@ -82,7 +84,7 @@ export function planSavRequests(u: SavUnderstandingV1, retrieval: SavRequestRetr
     }
     if (!base.missingFacts.length) for (const fact of playbook.document.facts) {
       const question = u.language === "en" ? fact.questionEn : fact.question;
-      if (question && !known.has(fact.key) && (fact.domains.includes(domain) || fact.domains.includes("general")))
+      if (question && !known.has(fact.key) && !ambiguousFacts.has(fact.key) && (fact.domains.includes(domain) || fact.domains.includes("general")))
         base.missingFacts.push({ id: `plan.${u.requests.indexOf(request)}.${fact.key}`, key: fact.key, question, origin: `playbook:${playbook.versionId}` });
     }
     const maximumQuestions = Math.min(3, remainingQuestions);
@@ -96,7 +98,7 @@ export function planSavRequests(u: SavUnderstandingV1, retrieval: SavRequestRetr
   });
 }
 
-/** Server-owned questions and steps; the model only supplies a short acknowledgement. */
+/** Server-owned acknowledgement, questions and steps; model coverage is checked before assembly. */
 export function assembleSavPlannedReply(u: SavUnderstandingV1, raw: SavReplyCoverage, plans: SavRequestPlan[]) {
   return u.requests.map(request => {
     const part = raw.find(p => p.requestId === request.id);
@@ -106,13 +108,16 @@ export function assembleSavPlannedReply(u: SavUnderstandingV1, raw: SavReplyCove
     if (/[?？]/u.test(part.text) || part.sourceIds.some(id => id !== plan.card?.id) || part.repeatedAttemptIds.length)
       throw new Error("SAV_REPLY_OUTSIDE_REQUEST_PLAN");
     if (part.kind === "solution" && !plan.nextCheck) throw new Error("SAV_REPLY_OUTSIDE_REQUEST_PLAN");
-    const fragments = [part.text];
+    // No free-form composition can insert another advice/step outside the selected plan.
+    const needsHuman = !plan.nextCheck && !plan.missingFacts.length;
+    const fragments = [u.language === "en"
+      ? `${needsHuman ? "The team needs to review your request" : "Your request"}: ${request.summary}`
+      : `${needsHuman ? "L’équipe doit vérifier votre demande" : "Votre demande"} : ${request.summary}`];
     if (plan.nextCheck) {
       fragments.push(plan.nextCheck.instruction);
       if (plan.nextCheck.expectedResult) fragments.push(plan.nextCheck.expectedResult);
     }
     for (const fact of plan.missingFacts) if (!fragments.some(text => normalizeSavEvidenceText(text).includes(normalizeSavEvidenceText(fact.question)))) fragments.push(fact.question);
-    if (!plan.nextCheck && !plan.missingFacts.length && part.kind !== "handoff") fragments.push(u.language === "en" ? "The Limova team needs to review this request before a reliable next step can be proposed." : "L’équipe Limova doit vérifier cette demande avant qu’une prochaine étape fiable puisse être proposée.");
     return { ...part, text: fragments.join("\n\n"), kind: plan.nextCheck ? "solution" as const : plan.missingFacts.length ? "clarification" as const : "handoff" as const,
       sourceIds: plan.nextCheck ? [plan.nextCheck.sourceId] : [], missingInformationIds: plan.missingFacts.map(f => f.id), repeatedAttemptIds: [], repeatJustification: "" };
   });

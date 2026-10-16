@@ -19,6 +19,38 @@ function retrieval(): SavRequestRetrievalResult {
         checks: [{ id: "open", evidenceStepId: "open", instruction: "Ouvrir le diagnostic fictif.", expectedResult: "", prerequisites: ["page_url"], ifExpected: "read", ifNot: null }, { id: "read", evidenceStepId: "read", instruction: "Lire le résultat fictif.", expectedResult: "", prerequisites: [], ifExpected: null, ifNot: null }] } } }], };
 }
 describe("SAV-68 server request plans", () => {
+  it("requires the fact for the current request rather than reusing another request’s URL", () => {
+    const u = understanding(); u.requests.push({ ...u.requests[0], id: "r2", summary: "Une autre page ne s’indexe pas" });
+    u.knownFacts[0].requestIds = ["r1"];
+    const r = retrieval(); r.requests.push({ ...r.requests[0], requestId: "r2" }); r.sources[0].requestIds.push("r2");
+    const plans = planSavRequests(u, r, playbook);
+    expect(plans[0].nextCheck?.id).toBe("open");
+    expect(plans[1].nextCheck).toBeNull();
+    expect(plans[1].missingFacts[0].key).toBe("page_url");
+    delete u.knownFacts[0].requestIds;
+    const ambiguous = planSavRequests(u, r, playbook)[1];
+    expect(ambiguous.nextCheck).toBeNull();
+    expect(ambiguous.missingFacts).toEqual([]);
+    expect(ambiguous.limits).toContain("fact_scope_requires_review");
+  });
+  it("keeps checks of distinct cards independent even when their local IDs match", () => {
+    const u = understanding({ attemptedSteps: [{ id: "old", key: "open", checkId: "open", checkCardId: "other-card", checkVersionId: "other-v1", outcome: "expected", text: "Autre contrôle effectué", evidenceIds: ["e1"] }] });
+    expect(planSavRequests(u, retrieval(), playbook)[0].nextCheck?.id).toBe("open");
+  });
+  it("never chooses a branch from a legacy key without a validated check reference", () => {
+    const u = understanding({ attemptedSteps: [{ id: "old", key: "open", checkId: null, checkVersionId: "v1", outcome: "expected", text: "Ancienne consigne sortante", evidenceIds: ["e1"] }] });
+    expect(planSavRequests(u, retrieval(), playbook)[0].nextCheck).toBeNull();
+  });
+
+  it("never includes free model advice outside the selected check, even with the same card ID", () => {
+    const u = understanding();
+    const plans = planSavRequests(u, retrieval(), playbook);
+    const [result] = assembleSavPlannedReply(u, [{ requestId: "r1", text: "Réinitialisez aussi l’intégration.", kind: "solution", sourceIds: ["card"], missingInformationIds: [], repeatedAttemptIds: [], repeatJustification: "" }], plans);
+    expect(result.text).not.toContain("Réinitialisez");
+    expect(result.text).toContain(u.requests[0].summary);
+    expect(result.text).toContain("Ouvrir le diagnostic fictif.");
+    expect(result.text).not.toContain("Lire le résultat fictif.");
+  });
   it("uses an already known alias without asking the URL again and chooses the first sourced check", () => {
     const [plan] = planSavRequests(understanding(), retrieval(), playbook);
     expect(plan.mode).toBe("solution"); expect(plan.missingFacts).toEqual([]); expect(plan.nextCheck?.id).toBe("open");

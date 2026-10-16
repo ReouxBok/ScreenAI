@@ -29,6 +29,21 @@ it("preserves history, rejects stale writes and permits explicit rollback of a r
 it("limits playbook management without broadening other SAV actors", async () => {
   for (const actor of ["reouven@limova.ai", "unknown@example.invalid"]) await expect(saveSavPlaybook({ document: defaultSavPlaybook, expectedDraftId: null }, actor)).rejects.toThrow("SAV_PLAYBOOK_ACCESS_FORBIDDEN");
 });
+it("serializes competing saves and activations instead of accepting both stale expectations", async () => {
+  const saves = await Promise.allSettled(["ugo@limova.ai", "contact@limova.ai"].map(actor => saveSavPlaybook({ document: defaultSavPlaybook, expectedDraftId: null }, actor)));
+  expect(saves.filter(result => result.status === "fulfilled")).toHaveLength(1);
+  expect(saves.filter(result => result.status === "rejected").map(result => String(result.reason))).toEqual(["Error: SAV_PLAYBOOK_STALE"]);
+  const workspace = await getSavPlaybookWorkspace("ugo@limova.ai");
+  expect(workspace.versions).toHaveLength(1);
+  const first = { versionId: workspace.versions[0].id };
+  await reviewSavPlaybook(first, "ugo@limova.ai");
+  const second = await saveSavPlaybook({ document: { ...defaultSavPlaybook, tone: "Réponse concise." }, expectedDraftId: first.versionId }, "contact@limova.ai");
+  await reviewSavPlaybook(second, "contact@limova.ai");
+  const activations = await Promise.allSettled([first, second].map(version => activateSavPlaybook({ ...version, expectedActiveId: null }, "ugo@limova.ai")));
+  expect(activations.filter(result => result.status === "fulfilled")).toHaveLength(1);
+  expect(activations.filter(result => result.status === "rejected").map(result => String(result.reason))).toEqual(["Error: SAV_PLAYBOOK_STALE"]);
+  expect([first.versionId, second.versionId]).toContain((await readActiveSavPlaybook()).versionId);
+});
 it("validates a single fact dictionary and injects only relevant domain questions with existing protections", () => {
   expect(savPlaybookSchema.safeParse({ ...defaultSavPlaybook, facts: [defaultSavPlaybook.facts[0], defaultSavPlaybook.facts[0]] }).success).toBe(false);
   const text = renderSavPlaybook({ versionId: "test", version: 1, document: defaultSavPlaybook }, ["seo"]).text;

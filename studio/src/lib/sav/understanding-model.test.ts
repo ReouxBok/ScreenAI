@@ -71,3 +71,17 @@ describe("SAV understanding bounded sources", () => {
     expect(result.uncertainties).toContainEqual({ code: "truncated_context", requestIds: [] });
   });
 });
+
+it("repairs only the model citation before deriving the server-owned card reference", async () => {
+  const valid = understandingContent();
+  valid.attemptedSteps = [{ id: "attempt-1", key: "open", checkId: "open", checkCardId: null, checkVersionId: "v1", outcome: "not_expected", text: input.body, evidenceIds: ["evidence-1"] }];
+  const invalid = structuredClone(valid); invalid.evidence[0].excerpt = "Une paraphrase non présente.";
+  let calls = 0;
+  const conversation: SavConversation = { threadId: "fixture", currentMessageId: "current", hubspotTicketId: null, status: "open", aiPaused: false, senderMatchesCustomer: true,
+    messages: [], olderSummary: [], historyTruncated: false, attachmentNotice: "Not read", diagnosticChecks: [{ cardId: "card", id: "open", versionId: "v1", instruction: "Contrôle fictif", expectedResult: "Résultat fictif", messageId: "sent" }] };
+  const result = await understandSavMessage({ ...input, conversation }, { apiKey: "fixture", fetch: vi.fn<typeof fetch>(async () => geminiFixture(calls++ ? valid : invalid)) });
+  expect(calls).toBe(2);
+  expect(result.status).toBe("qualified");
+  expect(result.trace.validationRepair?.succeeded).toBe(true);
+  expect(result.attemptedSteps[0].checkCardId).toBe("card");
+});
