@@ -2,12 +2,14 @@ import { z } from "zod";
 import { SAV_TICKET_RETURN_WINDOW_MS } from "./ticket-lifecycle";
 
 export const SAV_PLAYBOOK_SLUG = "sav-master-playbook";
+// The former three text fields fit without truncation, including their separators.
+export const SAV_PLAYBOOK_PROMPT_MAX_LENGTH = 6504;
 export const savFactKeySchema = z.string().regex(/^[a-z][a-z0-9_]{1,79}$/);
 export const savDomainSchema = z.enum(["seo", "integration", "account", "telephony", "billing_navigation", "general"]);
 export type SavDomain = z.infer<typeof savDomainSchema>;
 export const savPlaybookSchema = z.object({
   version: z.literal(1),
-  tone: z.string().trim().min(3).max(2000),
+  tone: z.string().trim().min(3).max(SAV_PLAYBOOK_PROMPT_MAX_LENGTH),
   handling: z.string().trim().max(3000),
   escalation: z.string().trim().max(1500),
   facts: z.array(z.object({ key: savFactKeySchema, label: z.string().trim().min(2).max(120),
@@ -21,6 +23,10 @@ export const savPlaybookSchema = z.object({
 });
 export type SavPlaybook = z.infer<typeof savPlaybookSchema>;
 export type SavActivePlaybook = { versionId: string; version: number; document: SavPlaybook };
+
+export function savPlaybookPrompt(document: SavPlaybook) {
+  return [document.tone, document.handling, document.escalation].filter(Boolean).join("\n\n");
+}
 
 // Existing process remains enforced by code, including its current return window.
 // Editable additions never replace these rules or authorize external actions.
