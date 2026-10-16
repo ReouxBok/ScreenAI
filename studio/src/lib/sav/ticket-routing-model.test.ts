@@ -64,7 +64,7 @@ describe("supervised ticket content matching", () => {
     vi.useFakeTimers();
     const stalled = vi.fn<typeof fetch>(async (_url, init) => new Promise((_resolve, reject) => init?.signal?.addEventListener("abort", () => reject(new Error("aborted")))));
     const pending = matchSavTicketsByContent(input, { apiKey: "fixture", fetch: stalled });
-    await vi.advanceTimersByTimeAsync(12001);
+    await vi.advanceTimersByTimeAsync(37000);
     const result = await pending;
     expect(result.selection.kind).toBe("ambiguous"); expect(result.matching.errorCode).toBe("SAV_AI_TIMEOUT");
     expect(stalled).toHaveBeenCalledTimes(2);

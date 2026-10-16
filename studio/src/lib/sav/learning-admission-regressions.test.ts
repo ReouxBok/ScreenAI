@@ -71,9 +71,15 @@ it('keeps a quota refusal terminal after journal eviction and capacity reset',as
 async function article(){
  const [item]=await f.db.insert(contentItems).values({type:'article',slug:'synthetic-support',title:'Support fictif',ownerEmail:'ugo@limova.ai',agentKey:'sav'}).returning();return item;
 }
+async function articleVersion(itemId:string,version:number,bodyMarkdown:string){
+ const [row]=await f.db.insert(contentVersions).values({itemId,version,bodyMarkdown,
+  metadata:{intents:['Support fictif'],limovaPaths:[],prerequisites:[],expectedResult:'Résultat fictif',troubleshooting:'Vérifier humainement.'},changeNote:'Fixture',authorEmail:'ugo@limova.ai'}).returning();
+ await f.db.update(contentItems).set({currentDraftVersionId:row.id}).where(eq(contentItems.id,itemId));
+ return row;
+}
 
 it('preserves two distinct amendments to the same article',async()=>{
- const item=await article();state.inventory=[{ref:`content:${item.id}`,versionId:'version-1',title:item.title,body:'Documentation synthétique de base.'}];state.match=`content:${item.id}`;
+ const item=await article();const version=await articleVersion(item.id,1,'Documentation synthétique de base.');state.inventory=[{ref:`content:${item.id}`,versionId:version.id,title:item.title,body:version.bodyMarkdown}];state.match=`content:${item.id}`;
  expect(await run({...input(1),resolution:'Régénérer la clé API puis vérifier la reconnexion du produit fictif.'})).toMatchObject({disposition:'admitted'});
  expect(await run({...input(2),resolution:'Configurer le proxy réseau puis vérifier la reconnexion du produit fictif.'})).toMatchObject({disposition:'admitted'});
  const rows=await f.db.select().from(savLearningCandidates);expect(rows).toHaveLength(2);
@@ -101,9 +107,10 @@ it('blocks historical admission through direct approval and the canonical librar
 });
 
 it('blocks stale comparison after catalogue changes during the model call',async()=>{
- state.inventory=[{ref:'content:fixture',versionId:'old-version',title:'Notice initiale',body:'Absence de procédure.'}];
- state.beforeResponse=async()=>{state.inventory=[{ref:'content:fixture',versionId:'new-version-covering-procedure',title:'Notice complétée',body:resolution}];};
- expect(await run(input(1))).toMatchObject({disposition:'signal',reasonCode:'comparison_context_changed'});expect((state.payloads[0].activeKnowledge as Array<{versionId:string}>)[0].versionId).toBe('old-version');
+ const item=await article();const original=await articleVersion(item.id,1,'Absence de procédure.');
+ state.inventory=[{ref:`content:${item.id}`,versionId:original.id,title:'Notice initiale',body:original.bodyMarkdown}];
+ state.beforeResponse=async()=>{const revised=await articleVersion(item.id,2,resolution);state.inventory=[{ref:`content:${item.id}`,versionId:revised.id,title:'Notice complétée',body:revised.bodyMarkdown}];};
+ expect(await run(input(1))).toMatchObject({disposition:'signal',reasonCode:'comparison_context_changed'});expect((state.payloads[0].activeKnowledge as Array<{versionId:string}>)[0].versionId).toBe(original.id);
 });
 
 it('blocks old pre-cutover evidence despite a later closing timestamp',async()=>{
