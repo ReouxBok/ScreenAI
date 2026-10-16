@@ -22,7 +22,7 @@ export function DeliveryEditor({ document, value, onChange }: { document: Canoni
   }
   const toggle = <T,>(values: T[], item: T) => values.includes(item) ? values.filter(v => v !== item) : [...values, item];
   return <section><h3>Comment utiliser cette connaissance ?</h3>
-    <label>Usage validé<select value={value.mode} onChange={e => select(e.target.value as SavSupportDelivery["mode"])}>{Object.entries(labels).map(([key, label]) => <option key={key} value={key}>{label}</option>)}</select></label>
+    <label>Usage validé<select aria-label="Usage validé" value={value.mode} onChange={e => select(e.target.value as SavSupportDelivery["mode"])}>{Object.entries(labels).map(([key, label]) => <option key={key} value={key}>{label}</option>)}</select></label>
     <p>Une procédure donne toutes les étapes d’un objectif. Séparez les autres méthodes et objectifs. Passer en procédure ou en consignes internes retire le diagnostic de ce brouillon ; la version active reste conservée.</p>
     {value.mode === "procedure" && <>
       {value.groups.map((g, index) => {
