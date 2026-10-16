@@ -2,8 +2,8 @@ import { afterAll, afterEach, beforeAll, beforeEach, expect, it, vi } from 'vite
 import { eq } from 'drizzle-orm';
 import { createSavTestDb } from '../../../test/sav-db';
 import { contentItems, contentVersions, contentChunks, categories, savLearningCandidates, savLearningAdmissionReservations, savLearningAdmissionSignals, savLearningAdmissionAttempts, savResolutionEvidence, savSyncState, savTicketSnapshots } from '@/db/schema';
-import { processSavLearningResolution } from './learning-pipeline';
-import { activateSavLearningCutover, recordSavLearningSignal, reserveSavLearningCapacityTx, savLearningAdmissionMetrics } from './learning-admission';
+import { processSavLearningResolution, savLearningProofHash } from './learning-pipeline';
+import { activateSavLearningCutover, recordSavLearningSignal, reserveSavLearningCapacityTx, savLearningAdmissionMetrics, claimSavLearningComparisonTx, finishSavLearningComparisonTx, SAV_LEARNING_COMPARISON_LEASE_MS } from './learning-admission';
 import { approveLearningCandidate, rejectLearningCandidate } from './learning';
 import { activateSavKnowledgeVersion } from '@/lib/knowledge/activation';
 import { backfillHubspotTickets } from './hubspot';
@@ -34,7 +34,7 @@ async function run(i:ReturnType<typeof input>,at=now){
 }
 beforeAll(async()=>{f=await createSavTestDb();state.db=f.db;},30000);
 afterAll(async()=>{await f?.client.close();});
-afterEach(()=>{vi.unstubAllEnvs();vi.unstubAllGlobals();});
+afterEach(()=>{vi.restoreAllMocks();vi.unstubAllEnvs();vi.unstubAllGlobals();});
 beforeEach(async()=>{
  await f.client.exec('TRUNCATE sav.learning_candidates, sav.learning_admission_signals, sav.learning_admission_stats, sav.learning_admission_reservations, sav.learning_admission_cases, sav.learning_model_usage, sav.sync_state, sav.ticket_snapshots, content_items, categories, audit_logs, active_knowledge, knowledge_revisions CASCADE');
  vi.stubEnv('SAV_ENCRYPTION_KEY_V1','independent-review-synthetic-key-2026');vi.stubEnv('SAV_GEMINI_API_KEY','synthetic-only-key');vi.stubEnv('SAV_RELEASE_STAGE','v0');vi.stubEnv('HUBSPOT_ACCESS_TOKEN','synthetic-only-token');
@@ -176,6 +176,8 @@ function snapshotFeed(feed:{closed:boolean;updatedAt:string;text:string}) {
 }
 it('admits an old ticket only after an observed reopening and fresh human evidence',async()=>{
  await f.db.insert(savTicketSnapshots).values({hubspotTicketId:'99992',status:'closed',subject:'Ancien dossier fictif',transcriptCiphertext:encryptSavPayload({transcript:[]}),contentHash:'old',humanIntervened:true,hubspotUpdatedAt:new Date('2026-10-13T12:00:00Z')});
+ // PostgreSQL timestamps retain microseconds, unlike JavaScript Date. The CAS must preserve them.
+ await f.client.exec("UPDATE sav.ticket_snapshots SET updated_at='2026-10-15T09:00:00.123456Z' WHERE hubspot_ticket_id='99992'");
  const feed={closed:false,updatedAt:'2026-10-15T10:00:00Z',text:resolution};vi.stubGlobal('fetch',snapshotFeed(feed));
  await backfillHubspotTickets({maxPages:1});
  expect((await f.db.select().from(savTicketSnapshots))[0].learningCycleStartedAt?.toISOString()).toBe('2026-10-15T10:00:00.000Z');
@@ -213,4 +215,38 @@ it('F1 binds the source proof and blocks both human review entry points after re
  await expect(approveLearningCandidate(id,'ugo@limova.ai')).rejects.toThrow('SAV_OBSERVATION_STALE');
  await expect(readSavLearningEvidence(id,f.db)).rejects.toThrow('SAV_OBSERVATION_STALE');
  expect((await f.db.select().from(savLearningCandidates).where(eq(savLearningCandidates.id,id)))[0].status).toBe('pending');
+});
+
+
+it('F2 resumes after final transaction abort and admits exactly once across concurrent retries',async()=>{
+ const i=input(120);
+ state.beforeResponse=async()=>{vi.spyOn(f.db,'transaction').mockRejectedValueOnce(new Error('SYNTHETIC_FINAL_ABORT'));};
+ await expect(run(i)).rejects.toThrow('SYNTHETIC_FINAL_ABORT');
+ const [attempt]=await f.db.select().from(savLearningAdmissionAttempts);
+ expect(attempt).toMatchObject({state:'retryable',completedAt:null,comparisonLeaseToken:null,comparisonLeaseUntil:null});
+ expect(await f.db.select().from(savLearningCandidates)).toHaveLength(0);
+ expect(await f.db.select().from(savLearningAdmissionReservations)).toHaveLength(0);
+ vi.restoreAllMocks();state.beforeResponse=null;
+ const results=await Promise.all([run(i),run(i)]);
+ expect(results.filter(r=>r.disposition==='admitted')).toHaveLength(1);
+ expect(results.filter(r=>r.disposition==='duplicate')).toHaveLength(1);
+ expect(await f.db.select().from(savLearningCandidates)).toHaveLength(1);
+ expect(await f.db.select().from(savLearningAdmissionReservations)).toHaveLength(1);
+ expect(modelFetch).toHaveBeenCalledTimes(2);
+});
+it('F2 reclaims a crashed worker only after expiry and fences its late completion',async()=>{
+ const i=input(121);
+ const sourceHash=savLearningProofHash({sourceRef:i.sourceRef,cycleStartedAt:i.cycleStartedAt,evidenceRef:'hubspot-message:'+i.sourceMessageId,sourceMessageId:i.sourceMessageId,resolution:i.resolution,customerConfirmed:i.customerConfirmed});
+ const first=await f.db.transaction(tx=>claimSavLearningComparisonTx(tx,{sourceRef:i.sourceRef,sourceHash,origin:'hubspot',inputHash:'synthetic-input',now}));
+ if(!first.claimed)throw new Error('EXPECTED_SYNTHETIC_CLAIM');
+ expect(await run(i,new Date(now.getTime()+SAV_LEARNING_COMPARISON_LEASE_MS-1))).toMatchObject({disposition:'duplicate'});
+ expect(modelFetch).not.toHaveBeenCalled();
+ const later=new Date(now.getTime()+SAV_LEARNING_COMPARISON_LEASE_MS+1);
+ state.beforeResponse=async()=>{
+  await expect(f.db.transaction(tx=>finishSavLearningComparisonTx(tx,first.signalId,{reasonCode:'late-worker',state:'signal'},later,first.leaseToken))).rejects.toThrow('SAV_LEARNING_SIGNAL_STALE');
+ };
+ expect(await run(i,later)).toMatchObject({disposition:'admitted'});
+ expect(await f.db.select().from(savLearningCandidates)).toHaveLength(1);
+ expect(await f.db.select().from(savLearningAdmissionReservations)).toHaveLength(1);
+ expect(modelFetch).toHaveBeenCalledTimes(1);
 });

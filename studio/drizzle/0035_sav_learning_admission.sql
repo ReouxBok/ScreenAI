@@ -9,6 +9,8 @@ CREATE TABLE "sav"."learning_admission_attempts" (
 	"candidate_id" uuid,
 	"created_at" timestamp with time zone DEFAULT now() NOT NULL,
 	"completed_at" timestamp with time zone,
+	"comparison_lease_token" uuid,
+	"comparison_lease_until" timestamp with time zone,
 	CONSTRAINT "learning_admission_attempts_dedupe_key_unique" UNIQUE("dedupe_key")
 );
 --> statement-breakpoint

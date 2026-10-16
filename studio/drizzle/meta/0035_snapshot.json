@@ -1,5 +1,5 @@
 {
-  "id": "cf3d7e7c-77a4-4a67-977e-e2e1134e1023",
+  "id": "ea25028a-1ed5-4adc-9041-630738eae844",
   "prevId": "7a437e68-b908-4e1e-b46b-eeb25287c36c",
   "version": "7",
   "dialect": "postgresql",
@@ -3882,6 +3882,18 @@
         },
         "completed_at": {
           "name": "completed_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "comparison_lease_token": {
+          "name": "comparison_lease_token",
+          "type": "uuid",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "comparison_lease_until": {
+          "name": "comparison_lease_until",
           "type": "timestamp with time zone",
           "primaryKey": false,
           "notNull": false

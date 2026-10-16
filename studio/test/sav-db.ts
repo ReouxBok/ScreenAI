@@ -5,8 +5,10 @@ import { drizzle } from "drizzle-orm/pglite";
 import * as schema from "../src/db/schema";
 import type { requireDb } from "../src/db";
 
-/** Production migrations against an isolated, in-memory PostgreSQL engine. */
+/** PGlite applies migrations; a native instance must already have passed the real migrator. */
 export async function createSavTestDb() {
+  const nativeUrl = process.env.SAV_TEST_POSTGRES_URL;
+  if (nativeUrl) return (await import("./sav-native-db")).createSavNativeTestDb(nativeUrl, process.env.SAV_TEST_POSTGRES_TOKEN);
   const client = new PGlite({ extensions: { vector } });
   const directory = new URL("../drizzle/", import.meta.url);
   for (const file of (await readdir(directory)).filter((name) => name.endsWith(".sql")).sort()) {

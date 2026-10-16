@@ -14,6 +14,7 @@ const reasonLabel: Record<string, string> = {
   weekly_limit: "Plafond hebdomadaire atteint", open_limit: "File ouverte complète",
   comparison_error: "Erreur de comparaison", cycle_before_learning_cutover: "Cycle antérieur à la frontière", cutover_not_active: "Frontière non activée",
   evidence_before_learning_cutover: "Preuve antérieure à la frontière", comparison_context_changed: "Catalogue modifié pendant la comparaison",
+  comparison_retryable: "Comparaison interrompue : reprise possible",
   comparison_context_incomplete: "Comparaison impossible : contexte incomplet", rejected_unchanged_proof: "Refus conservé : aucune preuve nouvelle",
   candidate_revision_required: "Nouvelle information : révision humaine de la proposition nécessaire", source_changed: "Preuve modifiée pendant la comparaison",
   no_new_resolution_cycle: "Aucun nouveau cycle de résolution prouvé", source_truncated: "Source tronquée : admission bloquée",

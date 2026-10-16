@@ -1,4 +1,5 @@
 import "server-only";
+import { randomUUID } from "node:crypto";
 import { and, count, desc, eq, gte, inArray, lt, sql } from "drizzle-orm";
 import { z } from "zod";
 import { requireDb } from "@/db";
@@ -15,7 +16,8 @@ import { savContentHash } from "./crypto";
 
 export const SAV_LEARNING_CUTOVER_KEY = "sav-learning-admission-cutover";
 export const SAV_LEARNING_ADMISSION_LOCK_KEY = "sav-learning-admission-lock";
-export const SAV_LEARNING_POLICY_REVISION = "sav-learning-admission-2026-10-15.v2";
+export const SAV_LEARNING_POLICY_REVISION = "sav-learning-admission-2026-10-16.v3";
+export const SAV_LEARNING_COMPARISON_LEASE_MS = 60_000;
 export const SAV_LEARNING_COMPARATOR_REVISION = "sav-learning-comparator-2026-10-15.v2";
 export const SAV_LEARNING_PROMPT_REVISION = "sav-learning-comparator-prompt-2026-10-15.v2";
 export const SAV_LEARNING_OPEN_LIMIT = 10;
@@ -100,7 +102,8 @@ export type SavLearningSignalInput = {
 };
 
 async function pruneSignalJournal(tx: Tx, now: Date) {
-  await tx.execute(sql`delete from sav.learning_admission_signals where created_at < ${new Date(now.getTime() - SAV_LEARNING_SIGNAL_RETENTION_DAYS * 86_400_000)} or id not in (select id from sav.learning_admission_signals order by created_at desc, id desc limit ${SAV_LEARNING_SIGNAL_LIMIT})`);
+  const retentionBoundary = new Date(now.getTime() - SAV_LEARNING_SIGNAL_RETENTION_DAYS * 86_400_000).toISOString();
+  await tx.execute(sql`delete from sav.learning_admission_signals where created_at < ${retentionBoundary}::timestamptz or id not in (select id from sav.learning_admission_signals order by created_at desc, id desc limit ${SAV_LEARNING_SIGNAL_LIMIT})`);
 }
 async function aggregateSignal(tx: Tx, origin: string, reasonCode: string, now: Date) {
   await tx.insert(savLearningAdmissionStats).values({ day: now.toISOString().slice(0, 10), origin, reasonCode, count: 1 })
@@ -120,25 +123,44 @@ export async function recordSavLearningSignalTx(tx: Tx, input: SavLearningSignal
   return { inserted: true as const, signalId: attempt.id };
 }
 
-/** Claim the durable ledger, not the disposable display journal, before calling a model. */
+/** A recoverable lease is distinct from a durable terminal decision. No source text is stored here. */
 export async function claimSavLearningComparisonTx(tx: Tx, input: { sourceRef: string; sourceHash: string; origin: SavLearningSignalInput["origin"]; inputHash: string; now?: Date }) {
-  const now = input.now ?? new Date();
+  await lockSavLearningAdmissionTx(tx);
+  const now = input.now ?? new Date(), comparisonLeaseToken = randomUUID();
+  const comparisonLeaseUntil = new Date(now.getTime() + SAV_LEARNING_COMPARISON_LEASE_MS);
   const dedupeKey = savContentHash({ sourceRef: input.sourceRef, sourceHash: input.sourceHash });
-  const [attempt] = await tx.insert(savLearningAdmissionAttempts).values({ dedupeKey, sourceRef: signalSourceRef(input.sourceRef), sourceHash: input.sourceHash,
-    origin: input.origin, reasonCode: "comparison_started", state: "comparing", createdAt: now }).onConflictDoNothing().returning();
-  if (!attempt) return { claimed: false as const };
-  await tx.insert(savLearningAdmissionSignals).values({ id: attempt.id, dedupeKey, sourceRef: attempt.sourceRef, sourceHash: input.sourceHash, origin: input.origin,
+  const [inserted] = await tx.insert(savLearningAdmissionAttempts).values({ dedupeKey, sourceRef: signalSourceRef(input.sourceRef), sourceHash: input.sourceHash,
+    origin: input.origin, reasonCode: "comparison_started", state: "comparing", createdAt: now, comparisonLeaseToken, comparisonLeaseUntil }).onConflictDoNothing().returning();
+  let attempt = inserted;
+  if (!attempt) {
+    const [prior] = await tx.select().from(savLearningAdmissionAttempts).where(eq(savLearningAdmissionAttempts.dedupeKey, dedupeKey)).for("update");
+    if (!prior || !["comparing", "retryable"].includes(prior.state) || prior.comparisonLeaseUntil && prior.comparisonLeaseUntil > now) return { claimed: false as const };
+    [attempt] = await tx.update(savLearningAdmissionAttempts).set({ state: "comparing", reasonCode: "comparison_started", completedAt: null,
+      comparisonLeaseToken, comparisonLeaseUntil }).where(eq(savLearningAdmissionAttempts.id, prior.id)).returning();
+  }
+  const values = { id: attempt.id, dedupeKey, sourceRef: attempt.sourceRef, sourceHash: input.sourceHash, origin: input.origin,
     reasonCode: "comparison_started", state: "comparing", comparatorRevision: SAV_LEARNING_COMPARATOR_REVISION,
-    promptRevision: SAV_LEARNING_PROMPT_REVISION, inputHash: input.inputHash, createdAt: now });
+    promptRevision: SAV_LEARNING_PROMPT_REVISION, inputHash: input.inputHash, createdAt: now };
+  await tx.insert(savLearningAdmissionSignals).values(values).onConflictDoUpdate({ target: savLearningAdmissionSignals.dedupeKey, set: values });
   await pruneSignalJournal(tx, now);
-  return { claimed: true as const, signalId: attempt.id };
+  return { claimed: true as const, signalId: attempt.id, leaseToken: comparisonLeaseToken };
+}
+export async function assertSavLearningComparisonClaimTx(tx: Tx, signalId: string, leaseToken: string) {
+  const [attempt] = await tx.select().from(savLearningAdmissionAttempts).where(eq(savLearningAdmissionAttempts.id, signalId)).for("update");
+  if (!attempt || attempt.state !== "comparing" || attempt.comparisonLeaseToken !== leaseToken) throw new Error("SAV_LEARNING_SIGNAL_STALE");
+  return attempt;
+}
+export async function releaseSavLearningComparisonTx(tx: Tx, signalId: string, leaseToken: string) {
+  const [released] = await tx.update(savLearningAdmissionAttempts).set({ state: "retryable", reasonCode: "comparison_retryable", comparisonLeaseToken: null, comparisonLeaseUntil: null })
+    .where(and(eq(savLearningAdmissionAttempts.id, signalId), eq(savLearningAdmissionAttempts.state, "comparing"), eq(savLearningAdmissionAttempts.comparisonLeaseToken, leaseToken)))
+    .returning({ id: savLearningAdmissionAttempts.id });
+  if (released) await tx.update(savLearningAdmissionSignals).set({ state: "retryable", reasonCode: "comparison_retryable" }).where(eq(savLearningAdmissionSignals.id, signalId));
 }
 
-export async function finishSavLearningComparisonTx(tx: Tx, signalId: string, input: Omit<SavLearningSignalInput, "sourceRef" | "sourceHash" | "origin">, now = new Date()) {
-  const [prior] = await tx.select().from(savLearningAdmissionAttempts).where(eq(savLearningAdmissionAttempts.id, signalId)).for("update");
-  if (!prior || prior.state !== "comparing") throw new Error("SAV_LEARNING_SIGNAL_STALE");
-  await tx.update(savLearningAdmissionAttempts).set({ state: input.state ?? "signal", reasonCode: input.reasonCode, candidateId: input.candidateId ?? null, completedAt: now })
-    .where(eq(savLearningAdmissionAttempts.id, signalId));
+export async function finishSavLearningComparisonTx(tx: Tx, signalId: string, input: Omit<SavLearningSignalInput, "sourceRef" | "sourceHash" | "origin">, now: Date, leaseToken: string) {
+  const prior = await assertSavLearningComparisonClaimTx(tx, signalId, leaseToken);
+  await tx.update(savLearningAdmissionAttempts).set({ state: input.state ?? "signal", reasonCode: input.reasonCode, candidateId: input.candidateId ?? null,
+    completedAt: now, comparisonLeaseToken: null, comparisonLeaseUntil: null }).where(eq(savLearningAdmissionAttempts.id, signalId));
   const values = { ...input, id: prior.id, dedupeKey: prior.dedupeKey, sourceRef: prior.sourceRef, sourceHash: prior.sourceHash, origin: prior.origin,
     state: input.state ?? "signal", details: safeSignalDetails(input.details), createdAt: now };
   await tx.insert(savLearningAdmissionSignals).values(values).onConflictDoUpdate({ target: savLearningAdmissionSignals.dedupeKey, set: values });

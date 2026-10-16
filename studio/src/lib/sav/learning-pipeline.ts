@@ -5,7 +5,7 @@ import { contentItems, knowledgeProjectionCandidates, savLearningAdmissionAttemp
 import { knowledgeComparisonInventory } from "@/lib/knowledge/hubspot-import";
 import { decryptSavPayload, encryptSavPayload, savContentHash } from "./crypto";
 import { redactSavLearningText } from "./learning-extraction";
-import { SAV_LEARNING_POLICY_REVISION, bindSavLearningReservationTx, claimSavLearningComparisonTx, finishSavLearningComparisonTx, getSavLearningCutover, isSavLearningCycleEligible, lockSavLearningAdmissionTx, recordSavLearningSignal, reserveSavLearningCapacityTx, reserveSavLearningModelCallTx } from "./learning-admission";
+import { SAV_LEARNING_POLICY_REVISION, bindSavLearningReservationTx, claimSavLearningComparisonTx, assertSavLearningComparisonClaimTx, releaseSavLearningComparisonTx, finishSavLearningComparisonTx, getSavLearningCutover, isSavLearningCycleEligible, lockSavLearningAdmissionTx, recordSavLearningSignal, reserveSavLearningCapacityTx, reserveSavLearningModelCallTx } from "./learning-admission";
 import { compareSavLearningResolution, SAV_LEARNING_COMPARATOR_PROMPT_REVISION, SAV_LEARNING_COMPARATOR_REVISION, type SavLearningComparisonInput } from "./learning-comparator";
 import { savGeminiApiKey } from "./config";
 import { isSavCrmLearningSourceCurrent } from "./learning-source";
@@ -71,37 +71,38 @@ export async function processSavLearningResolution(input: SavLearningResolutionI
     const claimed = await claimSavLearningComparisonTx(tx, { sourceRef, sourceHash, origin, inputHash, now });
     if (!claimed.claimed) return { duplicate: true as const };
     await reserveSavLearningModelCallTx(tx, now);
-    return { duplicate: false as const, signalId: claimed.signalId };
+    return { duplicate: false as const, signalId: claimed.signalId, leaseToken: claimed.leaseToken };
   });
   if (claim.duplicate) {
     const [prior] = await requireDb().select().from(savLearningAdmissionAttempts).where(and(eq(savLearningAdmissionAttempts.sourceRef, sourceRef), eq(savLearningAdmissionAttempts.sourceHash, sourceHash))).limit(1);
     return { disposition: "duplicate" as const, candidateId: prior?.candidateId ?? null, reasonCode: prior?.reasonCode ?? "duplicate_source" };
   }
+  try {
   let comparison: Awaited<ReturnType<typeof compareSavLearningResolution>>;
   try { comparison = await compareSavLearningResolution(comparisonInput, { apiKey: options.apiKey ?? savGeminiApiKey(), model: options.model ?? process.env.SAV_AI_MODEL ?? "gemini-3.6-flash", fetch: options.fetch }); }
   catch (error) {
     const errorCode = error instanceof Error && /^[A-Z0-9_:]+$/.test(error.message) ? error.message : "SAV_LEARNING_COMPARATOR_FAILED";
     await requireDb().transaction(tx => finishSavLearningComparisonTx(tx, claim.signalId, { reasonCode: "comparison_error", state: "signal", errorCode,
-      comparatorRevision: SAV_LEARNING_COMPARATOR_REVISION, promptRevision: SAV_LEARNING_COMPARATOR_PROMPT_REVISION, inputHash }, now));
+      comparatorRevision: SAV_LEARNING_COMPARATOR_REVISION, promptRevision: SAV_LEARNING_COMPARATOR_PROMPT_REVISION, inputHash }, now, claim.leaseToken));
     return { disposition: "signal" as const, reasonCode: "comparison_error", errorCode };
   }
   const decision = comparison.decision;
-  return requireDb().transaction(async tx => {
-    if (origin === "hubspot" && (!input.ticketId || !await isSavCrmLearningSourceCurrent({ ticketId: input.ticketId,
-      snapshotId: input.snapshotId, snapshotHash: input.snapshotHash, cycleStartedAt: input.cycleStartedAt }, tx, true))) {
-      await finishSavLearningComparisonTx(tx, claim.signalId, { reasonCode: "source_changed", state: "signal" }, now);
-      return { disposition: "signal" as const, reasonCode: "source_changed" };
-    }
-    // Lock the proof first, matching the observation writer's lock order.
+  return await requireDb().transaction(async tx => {
+    // Match source-writer order, then take the shared admission lock and fenced claim.
+    let sourceCurrent = origin !== "hubspot" || Boolean(input.ticketId && await isSavCrmLearningSourceCurrent({ ticketId: input.ticketId,
+      snapshotId: input.snapshotId, snapshotHash: input.snapshotHash, cycleStartedAt: input.cycleStartedAt }, tx, true));
     if (input.observationId && input.cycleId) {
       const [observation] = await tx.select().from(savResolutionObservations).where(eq(savResolutionObservations.id, input.observationId)).for("update");
       const [cycle] = await tx.select().from(savObservationCycles).where(eq(savObservationCycles.id, input.cycleId));
-      if (!observation?.closed || observation.sourceErrors.length || cycle?.observationId !== observation.id || cycle.cycle !== observation.cycle || cycle.sourceHash !== input.cycleSourceHash || cycle.qualification !== "resolved") {
-        await finishSavLearningComparisonTx(tx, claim.signalId, { reasonCode: "source_changed", state: "signal" }, now);
-        return { disposition: "signal" as const, reasonCode: "source_changed" };
-      }
+      sourceCurrent &&= Boolean(observation?.closed && !observation.sourceErrors.length && cycle?.observationId === observation.id
+        && cycle.cycle === observation.cycle && cycle.sourceHash === input.cycleSourceHash && cycle.qualification === "resolved");
     }
     await lockSavLearningAdmissionTx(tx);
+    await assertSavLearningComparisonClaimTx(tx, claim.signalId, claim.leaseToken);
+    if (!sourceCurrent) {
+      await finishSavLearningComparisonTx(tx, claim.signalId, { reasonCode: "source_changed", state: "signal" }, now, claim.leaseToken);
+      return { disposition: "signal" as const, reasonCode: "source_changed" };
+    }
     await tx.select({ id: contentItems.id }).from(contentItems).for("share");
     await tx.select({ id: knowledgeProjectionCandidates.id }).from(knowledgeProjectionCandidates).for("share");
     await tx.select({ id: savLearningCandidates.id }).from(savLearningCandidates).for("share");
@@ -109,7 +110,7 @@ export async function processSavLearningResolution(input: SavLearningResolutionI
       reasonCode, candidateId, groupKey, state: candidateId ? "open" : "signal", comparatorRevision: comparison.revision, promptRevision: comparison.promptRevision,
       modelName: comparison.model, inputHash: comparison.inputHash, inputTokens: comparison.inputTokens, outputTokens: comparison.outputTokens, durationMs: comparison.durationMs,
       details: { outcome: decision.outcome, policyRevision: SAV_LEARNING_POLICY_REVISION },
-    }, now);
+    }, now, claim.leaseToken);
     let currentSnapshot: string;
     try { currentSnapshot = (await comparisonContext(tx)).snapshot; } catch { await finish("comparison_context_incomplete"); return { disposition: "signal" as const, reasonCode: "comparison_context_incomplete" }; }
     if (currentSnapshot !== context.snapshot) {
@@ -155,4 +156,10 @@ export async function processSavLearningResolution(input: SavLearningResolutionI
     await finish(decision.outcome, candidate.id, groupKey);
     return { disposition: "admitted" as const, candidateId: candidate.id };
   });
+  } catch (error) {
+    // No provider/CRM mutation is retried here. A later invocation can reclaim the proof.
+    try { await requireDb().transaction(tx => releaseSavLearningComparisonTx(tx, claim.signalId, claim.leaseToken)); }
+    catch { /* A database outage leaves the fenced claim recoverable after lease expiry. */ }
+    throw error;
+  }
 }

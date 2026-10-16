@@ -926,6 +926,8 @@ export const savLearningAdmissionAttempts = sav.table("learning_admission_attemp
   candidateId: uuid("candidate_id").references(() => savLearningCandidates.id, { onDelete: "set null" }),
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
   completedAt: timestamp("completed_at", { withTimezone: true }),
+  comparisonLeaseToken: uuid("comparison_lease_token"),
+  comparisonLeaseUntil: timestamp("comparison_lease_until", { withTimezone: true }),
 }, (table) => [index("sav_learning_attempt_candidate_idx").on(table.candidateId)]);
 
 export const savLearningAdmissionReservations = sav.table("learning_admission_reservations", {

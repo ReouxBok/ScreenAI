@@ -6,7 +6,7 @@ import { SAV_TICKET_RETURN_NOTE_VERSION, savTicketReturnNote } from "./ticket-re
 import { shortlistSavTickets, savSubsetMatchIsComplete } from "./ticket-shortlist";
 import { requestSavHubspot } from "./hubspot-transport";
 import { createHmac, timingSafeEqual } from "node:crypto";
-import { and, asc, desc, eq, inArray, isNull, lt, lte, or, sql } from "drizzle-orm";
+import { and, asc, desc, eq, getTableColumns, inArray, isNull, lt, lte, or, sql } from "drizzle-orm";
 import { z } from "zod";
 import { requireDb } from "@/db";
 import {
@@ -1127,7 +1127,10 @@ async function snapshotTicket(ticket: HubspotRecord) {
   const closed = (await closedTicketStages()).has(String(ticket.properties.hs_pipeline_stage || ""));
   const updatedAt = new Date(ticket.updatedAt || ticket.properties.hs_lastmodifieddate || Date.now());
   const db = requireDb();
-  const [previousSnapshot] = await db.select().from(savTicketSnapshots).where(eq(savTicketSnapshots.hubspotTicketId, ticket.id)).limit(1);
+  // Keep PostgreSQL microseconds for the CAS; a JavaScript Date loses that precision.
+  const [previousSnapshot] = await db.select({ ...getTableColumns(savTicketSnapshots),
+    revisionTimestamp: sql<string>`${savTicketSnapshots.updatedAt}::text`,
+  }).from(savTicketSnapshots).where(eq(savTicketSnapshots.hubspotTicketId, ticket.id)).limit(1);
   if (previousSnapshot && updatedAt < previousSnapshot.hubspotUpdatedAt) return previousSnapshot;
   const cutover = await getSavLearningCutover();
   const createdAt = ticket.createdAt ? new Date(ticket.createdAt) : null;
@@ -1155,7 +1158,7 @@ async function snapshotTicket(ticket: HubspotRecord) {
     target: savTicketSnapshots.hubspotTicketId,
     // Compare-and-swap prevents a read made before a concurrent refresh from overwriting it.
     setWhere: previousSnapshot ? and(eq(savTicketSnapshots.id, previousSnapshot.id), eq(savTicketSnapshots.contentHash, previousSnapshot.contentHash),
-      eq(savTicketSnapshots.updatedAt, previousSnapshot.updatedAt)) : sql`false`,
+      sql`${savTicketSnapshots.updatedAt} = ${previousSnapshot.revisionTimestamp}::timestamptz`) : sql`false`,
     set: {
       pipelineId: ticket.properties.hs_pipeline,
       stageId: ticket.properties.hs_pipeline_stage,
