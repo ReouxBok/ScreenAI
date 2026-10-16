@@ -26,7 +26,7 @@ describe("SAV44 original understanding and independent feedback forms", () => {
     const html = renderToStaticMarkup(createElement(ProposalReview, { data: data(), threadId: "synthetic-thread", messageId: "synthetic-message" }));
     expect(html).toContain('name="reasons" value="wrong_category"'); expect(html).toContain("Mauvaise compréhension");
     expect(html).toContain("ne crée aucune connaissance produit"); expect(html).toContain('name="category"');
-    expect(html).not.toContain('name="replyDraft"'); expect(html).toContain("Valider le dossier / process");
+    expect(html).not.toContain('name="replyDraft"'); expect(html).toContain("Valider le dossier");
   });
   it("shows standard origin and rejected coherence separately from acceptance and sending", () => {
     const props: ComponentProps<typeof DraftReview> = { data: { ...data(), proposal: { ...original, replyAssessment: { kind: "human_handoff", coverage: [], errorCode: null, coherence: { status: "rejected", issues: ["off_topic"], promptRevision: "synthetic", model: "synthetic", inputHash: "synthetic", outputHash: "synthetic", durationMs: 1, inputTokens: 1, outputTokens: 1, totalTokens: 2, errorCode: "SYNTHETIC" } } } }, threadId: "synthetic-thread", messageId: "synthetic-message", drafts: { knowledgeRevision: "synthetic", versions: [] }, sendAllowed: true };

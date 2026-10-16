@@ -15,7 +15,8 @@ vi.mock("@/lib/sav/cutover", () => ({ isSavMessageEligible: async () => true }))
 vi.mock("@/lib/sav/thread-context", () => ({ getSavRelatedThreads: async () => [] }));
 vi.mock("@/lib/sav/drafts", () => ({ getSavReplyDrafts: async () => ({ versions: [], knowledgeRevision: null }) }));
 vi.mock("./mail-conversation", () => ({ MailConversation: () => null }));
-vi.mock("./proposal-review", () => ({ ProposalReview: () => null }));
+vi.mock("./proposal-review", () => ({ ProposalReview: () => null, IdentityCheck: () => null, IdentityCandidates: () => null }));
+vi.mock("./findings-summary", () => ({ FindingsSummary: () => null, UsedKnowledge: () => null }));
 vi.mock("next/navigation", () => ({ useRouter: () => ({ refresh: vi.fn() }), notFound: () => { throw new Error("NOT_FOUND"); } }));
 vi.mock("../ticket-preview-actions", () => ({ prepareTicketPreviewAction: vi.fn(), confirmTicketPreviewAction: vi.fn() }));
 vi.mock("next/link", () => ({ default: (props: ComponentProps<"a">) => createElement("a", props) }));

@@ -18,7 +18,7 @@ function EmailMessage({ message, text = message.body.text }: { message: Messages
   </article>;
 }
 
-export function MailConversation({ messages }: { messages: Messages }) {
+export function MailConversation({ messages, embedded = false }: { messages: Messages; embedded?: boolean }) {
   const [expanded, setExpanded] = useState(false);
   const conversationId = useId();
   const newestFirst = [...messages].sort((a, b) => b.receivedAt.getTime() - a.receivedAt.getTime() || b.createdAt.getTime() - a.createdAt.getTime() || b.id.localeCompare(a.id));
@@ -29,8 +29,8 @@ export function MailConversation({ messages }: { messages: Messages }) {
   // body, including text beyond the analysis splitter's limit and attachments.
   const canExpand = (!latestInbound && messages.length > 0) || messages.length > 1 || Boolean(display?.ambiguous || latestInbound && currentText !== latestInbound.body.text.trim());
   const visibleMessages = latestInbound ? [latestInbound, ...newestFirst.filter(message => message.id !== latestInbound.id)] : newestFirst;
-  return <section className={`card ${styles.mail}`} aria-labelledby="customer-mail-title">
-    <div className={styles.mailHeading}><div><span className="eyebrow">Demande du client</span><h2 id="customer-mail-title">Dernier email reçu</h2></div><span>{messages.length} message{messages.length > 1 ? "s" : ""}</span></div>
+  return <section className={embedded ? styles.mailEmbedded : `card ${styles.mail}`} {...embedded ? { "aria-label": "Emails du client" } : { "aria-labelledby": "customer-mail-title" }}>
+    {!embedded && <div className={styles.mailHeading}><div><span className="eyebrow">Demande du client</span><h2 id="customer-mail-title">Dernier email reçu</h2></div><span>{messages.length} message{messages.length > 1 ? "s" : ""}</span></div>}
     {canExpand && <button className={`secondary ${styles.conversationToggle}`} type="button" aria-expanded={expanded} aria-controls={conversationId} onClick={() => setExpanded(value => !value)}>{expanded ? "Réduire la conversation" : `Afficher toute la conversation (${messages.length} message${messages.length > 1 ? "s" : ""})`}</button>}
     {!expanded && display?.warning && <p className={styles.conversationWarning} role="status">{display.warning}</p>}
     <div id={conversationId} className={`${styles.historyMessages} ${expanded ? styles.historyExpanded : ""}`} tabIndex={expanded ? 0 : undefined} role={expanded ? "region" : undefined} aria-label={expanded ? "Conversation complète avec défilement" : undefined}>

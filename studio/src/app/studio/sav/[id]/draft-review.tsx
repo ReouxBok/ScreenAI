@@ -20,8 +20,8 @@ export function DraftReview({ data, threadId, messageId, drafts, sendAllowed, se
     const current=drafts.versions.find(d=>d.isCurrent) ?? null;
     const origin = data.proposal.replyAssessment?.kind;
     const originLabels: Record<string, string> = { contextualized: "Brouillon contextualisé proposé par l’IA · à relire.", finance_standard: "Réponse financière standard : elle ne confirme aucune opération exécutée.", lead_template: "Modèle standard d’orientation · à vérifier pour cette demande.", human_handoff: "Passage à un humain : aucune résolution automatisée n’est attestée.", unavailable: "Génération de réponse indisponible.", forbidden: "Aucune réponse IA autorisée pour cette demande.", none: "Aucune réponse proposée." };
-    return <section className={`card ${styles.review} ${styles.draft}`} aria-labelledby="draft-review-title">
-  <header><span className="eyebrow">Brouillon de réponse · correction humaine</span><h2 id="draft-review-title">Verdict du brouillon</h2></header>
+    return <section className={`${styles.review} ${styles.draft}`} aria-labelledby="draft-review-title">
+  <h3 id="draft-review-title" className={styles.draftTitle}>Verdict du brouillon</h3>
   <p role="status">{notApplicable ? "Non applicable : aucun brouillon à accepter ou envoyer." : verdict?.stale ? "Contexte ou texte modifié : nouvelle lecture nécessaire." : accepted ? "Brouillon accepté · envoi distinct à confirmer." : verdict?.status === "rejected" ? "Brouillon refusé · traitement humain à observer." : "Brouillon à relire."}</p>
   {origin && !notApplicable && <p>{originLabels[origin] ?? "Origine de la réponse à vérifier."}</p>}
   {data.proposal.replyAssessment?.coherence?.status === "unavailable" && <p role="status">Contrôle de cohérence indisponible : le brouillon contextualisé n’a pas été retenu.</p>}
