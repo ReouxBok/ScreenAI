@@ -55,7 +55,7 @@ export async function listSavDossierDashboard(options: { view?: string; query?: 
     let offset = 0;
     while (true) {
       const batch = await db.select({ message: savMessages, thread: savThreads, decision: savDecisions, run: savAgentRuns, review: savProposalReviews,
-        hasOtherCorrespondence: otherConfiguration.registry ? sql<boolean>`exists (select 1 from sav.messages correspondence where correspondence.thread_id = ${savThreads.id} and (correspondence.direction <> 'inbound' or lower(btrim(correspondence.from_email)) <> lower(btrim(${savMessages.fromEmail}))))` : sql<boolean>`true`,
+        hasProtectedHistory: otherConfiguration.registry ? sql<boolean>`exists (select 1 from sav.messages correspondence where correspondence.thread_id = ${savThreads.id} and (correspondence.direction <> 'inbound' or lower(btrim(correspondence.from_email)) <> lower(btrim(${savMessages.fromEmail})) or exists (select 1 from sav.proposal_reviews historical_review where historical_review.message_id = correspondence.id)))` : sql<boolean>`true`,
       })
         .from(savMessages).innerJoin(savThreads, eq(savThreads.id, savMessages.threadId))
         .leftJoin(savDecisions, and(eq(savDecisions.messageId, savMessages.id), eq(savDecisions.isCurrent, true)))
@@ -83,7 +83,7 @@ export async function listSavDossierDashboard(options: { view?: string; query?: 
       const ticketIds = batch.flatMap(row => row.thread.hubspotTicketId ? [row.thread.hubspotTicketId] : []);
       const candidates = await db.select({ id: savLearningCandidates.id, status: savLearningCandidates.status, threadId: savLearningCandidates.threadId, hubspotTicketId: savLearningCandidates.hubspotTicketId, sourceRef: savLearningCandidates.sourceRef }).from(savLearningCandidates).where(sql`((${inArray(savLearningCandidates.threadId, threads)} or ${ticketIds.length ? inArray(savLearningCandidates.hubspotTicketId, ticketIds) : sql`false`}) and ${savLearningCandidates.status} = 'pending') or ${candidateIds.length ? inArray(savLearningCandidates.id, candidateIds) : sql`false`}`);
       const openedIds = new Set(openingProofs.map(proof => proof.messageId));
-      for (const { message, thread, decision, run, review, hasOtherCorrespondence } of batch) {
+      for (const { message, thread, decision, run, review, hasProtectedHistory } of batch) {
         let original: SavStructuredProposal | null = null, proposal: SavStructuredProposal | null = null, reviewStatus: string | null = null;
         let context: SavDossierContext | null = null, draftStatus = "Non disponible";
         let messageBody: SavMessageBody | null = null;
@@ -126,7 +126,7 @@ export async function listSavDossierDashboard(options: { view?: string; query?: 
         const technical = technicalKinds.has(proposal?.decision.kind ?? decision?.kind ?? "");
         const otherObservation = observeSavOther({
           mailboxId: message.mailboxId, fromEmail: message.fromEmail, subject: message.subject, gmailMessageId: message.gmailMessageId, body: messageBody,
-          protectedContext: hasOtherCorrespondence !== false || Boolean(thread.hubspotTicketId || thread.aiPaused || thread.humanRequestedAt
+          protectedContext: hasProtectedHistory !== false || Boolean(thread.hubspotTicketId || thread.aiPaused || thread.humanRequestedAt
             || review || threadActions.length || observations.some(o => o.threadId === thread.id)
             || candidates.some(c => c.threadId === thread.id) || context?.crm.data?.tickets.length
             || proposal?.routing.kind === "matched" || proposal?.routing.kind === "new"

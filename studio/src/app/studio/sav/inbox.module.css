@@ -88,6 +88,10 @@
 .heading, .compactRow { display: grid; grid-template-columns: minmax(0,1.55fr) minmax(0,1fr) minmax(0,.85fr); gap: 24px; }
 .heading { padding: 14px 22px; border-bottom: 1px solid #dce2de; font-size: 10px; font-weight: 650; text-transform: uppercase; letter-spacing: .06em; color: #66706b; }
 .compactRow { padding: 19px 22px; align-items: center; }
+.observationRow { color: inherit; text-decoration: none; border-bottom: 1px solid #e8ede9; }
+.observationRow:last-child { border-bottom: 0; }
+.observationRow:hover { background: #fafcf9; }
+.observationRow:focus-visible { outline: 2px solid var(--moss); outline-offset: -2px; }
 .demand { display: grid; gap: 5px; min-width: 0; }
 .demand > strong { font-size: 13px; font-weight: 750; color: #141a17; line-height: 1.45; }
 .date { display: flex; align-items: center; gap: 8px; font-size: 10px; color: #66706b; }

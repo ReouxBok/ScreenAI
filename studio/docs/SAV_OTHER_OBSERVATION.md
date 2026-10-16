@@ -42,13 +42,24 @@ charge aucune configuration distante et n'ajoute aucun chemin de tri automatique
 ## Priorité au support
 
 Refus de repérage si : source non Gmail, corps/en-têtes absents ou invalides,
-corps à la limite de troncature, doublon de nom d'en-tête, réponse/références,
+corps à la limite de troncature, collision de casse de nom d'en-tête dans le dictionnaire stocké, réponse/références,
 transfert détectable ou pièce jointe ; correspondance sortante/autre expéditeur
 dans le fil ; pause/demande humaine/revue/action/historique d'apprentissage ;
 ticket lié ou trouvé dans le contexte ; intention client identifiée ou urgence
 haute/critique. Certains termes sensibles sont des **veto**, jamais une preuve
 de bruit. Les variantes non reconnues restent possibles : ces contrôles ne
 constituent pas une garantie de détection de toute demande humaine.
+
+L'ingestion actuelle conserve le premier exemplaire de certains en-têtes bruts,
+puis construit un dictionnaire unique. Le contrôle des collisions dans ce
+dictionnaire ne détecte donc pas les doublons RFC déjà perdus à l'ingestion.
+Les corps MIME peuvent aussi avoir été réduits au snippet à la réception : une
+longueur inférieure au plafond ne prouve pas leur complétude. Ces limites
+interdisent d'utiliser cette observation comme autorisation de classement.
+
+Dans Autre, le lien dossier n'appelle pas l'action de classement Gmail ni le
+rafraîchissement CRM de la ligne habituelle. Le détail conserve son journal de
+consultation après ouverture ; le lien ne précharge pas le dossier.
 
 Un objet Trustpilot doit aussi mentionner explicitement cinq étoiles. Ni
 `no_ticket_needed`, ni `no-reply`, ni un score IA n'autorisent le classement.

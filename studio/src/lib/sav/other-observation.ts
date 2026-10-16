@@ -81,7 +81,7 @@ export function observeSavOther(input: {
     && savOtherFamilies[rule.family].sender === sender && rule.subjectSha256.includes(subjectHash));
   if (matches.length !== 1) return null;
   const family = matches[0].family;
-  if (family === "trustpilot_positive" && !/5[\s-]*(?:étoiles?|stars?)/iu.test(input.subject)) return null;
+  if (family === "trustpilot_positive" && !/(?:^|[^\d])5[\s-]*(?:étoiles?|stars?)(?:$|[^\p{L}])/iu.test(input.subject)) return null;
   // Subject/sender matches are still unverified: body templates and trusted
   // authentication evidence have NOT been qualified. Never hide this message.
   return { family, label: savOtherFamilies[family].label, ruleVersion: "sav-other-observation-v1" };
