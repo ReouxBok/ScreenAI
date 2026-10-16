@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { requestSavGeminiJson, savGeminiGenerationConfig, withSavAiBudget } from "./gemini-transport";
+import { requestSavGeminiJson, SAV_AI_BUDGET, savGeminiGenerationConfig, withSavAiBudget } from "./gemini-transport";
 import { geminiFixture } from "../../../test/sav-understanding-fixtures";
 
 const request = { phase: "understanding" as const, apiKey: "private-key-fixture", model: "gemini-3.6-flash", body: { contents: [{ parts: [{ text: "private-client-payload" }] }], generationConfig: { maxOutputTokens: 8192, temperature: 0 } } };
@@ -40,11 +40,15 @@ describe("bounded read/generation transport", () => {
     expect(second).toMatchObject({ message: "SAV_AI_HTTP_429", metadata: { transport: { attempts: 1, correlationId: first.metadata.transport!.correlationId } } });
     expect(network).toHaveBeenCalledTimes(3);
   });
-  it("bounds timeout retries by the original 18s phase deadline", async () => {
+  it("allows a complete 18s retry within the 37s phase deadline", async () => {
     const network = vi.fn<typeof fetch>((_, init) => new Promise((_, reject) => init!.signal!.addEventListener("abort", () => reject(new DOMException("private", "AbortError")))));
     const pending = requestSavGeminiJson({ ...request, fetch: network });
-    const assertion = expect(pending).rejects.toMatchObject({ message: "SAV_AI_TIMEOUT", metadata: { transport: { attempts: 2, durationMs: 18000 } } });
-    await vi.advanceTimersByTimeAsync(18000); await assertion;
+    const assertion = expect(pending).rejects.toMatchObject({ message: "SAV_AI_TIMEOUT", metadata: { transport: { attempts: 2, durationMs: expect.any(Number) } } });
+    await vi.advanceTimersByTimeAsync(37000); await assertion;
+    await pending.catch(error => {
+      expect(error.metadata.transport.durationMs).toBeGreaterThanOrEqual(36000);
+      expect(error.metadata.transport.durationMs).toBeLessThanOrEqual(37000);
+    });
     expect(network).toHaveBeenCalledTimes(2); expect(vi.getTimerCount()).toBe(0);
   });
   it.each([
@@ -58,10 +62,10 @@ describe("bounded read/generation transport", () => {
   it("caps calls across phases even after successful outputs", async () => {
     const network = vi.fn<typeof fetch>().mockImplementation(async () => geminiFixture({ ok: true }));
     await withSavAiBudget(async () => {
-      for (let i = 0; i < 5; i++) await requestSavGeminiJson({ ...request, fetch: network });
+      for (let i = 0; i < SAV_AI_BUDGET.calls; i++) await requestSavGeminiJson({ ...request, fetch: network });
       await expect(requestSavGeminiJson({ ...request, phase: "coherence", fetch: network })).rejects.toMatchObject({ message: "SAV_AI_BUDGET_EXCEEDED" });
     });
-    expect(network).toHaveBeenCalledTimes(5);
+    expect(network).toHaveBeenCalledTimes(SAV_AI_BUDGET.calls);
   });
   it("refuses oversized input before the provider and respects strict no-retry callers", async () => {
     const network = vi.fn<typeof fetch>().mockResolvedValue(new Response("", { status: 503 }));

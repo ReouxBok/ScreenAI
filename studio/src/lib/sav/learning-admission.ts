@@ -16,9 +16,9 @@ import { savContentHash } from "./crypto";
 
 export const SAV_LEARNING_CUTOVER_KEY = "sav-learning-admission-cutover";
 export const SAV_LEARNING_ADMISSION_LOCK_KEY = "sav-learning-admission-lock";
-export const SAV_LEARNING_POLICY_REVISION = "sav-learning-admission-2026-10-16.v3";
+export const SAV_LEARNING_POLICY_REVISION = "sav-learning-admission-2026-10-16.v4";
 export const SAV_LEARNING_COMPARISON_LEASE_MS = 60_000;
-export const SAV_LEARNING_COMPARATOR_REVISION = "sav-learning-comparator-2026-10-15.v2";
+export const SAV_LEARNING_COMPARATOR_REVISION = "sav-learning-comparator-2026-10-16.v3";
 export const SAV_LEARNING_PROMPT_REVISION = "sav-learning-comparator-prompt-2026-10-15.v2";
 export const SAV_LEARNING_OPEN_LIMIT = 10;
 export const SAV_LEARNING_WEEKLY_LIMIT = 5;

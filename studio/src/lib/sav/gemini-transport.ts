@@ -4,23 +4,26 @@ import { randomUUID } from "node:crypto";
 import { savRunProvenance } from "./config";
 import { parseSavGeminiJson, readSavGeminiResponse, type SavGeminiMetadata } from "./gemini-response";
 
-export const SAV_AI_TRANSPORT_REVISION = "sav-gemini-transport-2026-10-16.v2";
-export type SavAiPhase = "understanding" | "composition" | "coherence" | "ticket_matching" | "repair";
+export const SAV_AI_TRANSPORT_REVISION = "sav-gemini-transport-2026-10-16.v3";
+export type SavAiPhase = "understanding" | "composition" | "coherence" | "ticket_matching" | "repair" | "learning_comparison";
 export type SavAiFailureCategory = "authentication" | "billing" | "rate_limited" | "provider_unavailable" | "invalid_output" | "blocked_output" | "budget_exhausted";
 export type SavAiTransportTrace = {
   transportRevision: string; correlationId: string; phase: SavAiPhase; model: string; promptRevision: string;
   attempts: number; retries: number; durationMs: number; errorCode: string | null;
   failureCategory: SavAiFailureCategory | null;
 };
-type Budget = { id: string; deadline: number; calls: number; retries: number; reservedTokens: number; outputTokens: number; repairs: number };
+type Budget = { id: string; elapsedMs: number; reservedMs: number; calls: number; retries: number; reservedTokens: number; outputTokens: number; repairs: number };
 const budgets = new AsyncLocalStorage<Budget>();
-export const SAV_AI_BUDGET = { durationMs: 60_000, calls: 5, retries: 1, tokenAllowance: 262_144, outputTokens: 40_960, repairs: 1 } as const;
-const phaseMs = (phase: SavAiPhase) => phase === "ticket_matching" ? 12_000 : 18_000;
+export const SAV_AI_BUDGET = { durationMs: 60_000, calls: 6, retries: 1, tokenAllowance: 262_144, outputTokens: 49_152, repairs: 1 } as const;
+const ATTEMPT_MS = 18_000;
+const PHASE_MS = 37_000;
+const remainingTime = (budget: Budget) => SAV_AI_BUDGET.durationMs - budget.elapsedMs - budget.reservedMs;
 
-/** One logical analysis shares call/time/token allowances, including nested CRM matching. */
+/** One correlation and shared allowances, including CRM matching. Only provider
+ * attempts and retry waits consume AI time; unrelated CRM/DB waits do not. */
 export function withSavAiBudget<T>(work: () => Promise<T>): Promise<T> {
   if (budgets.getStore()) return work();
-  return budgets.run({ id: randomUUID(), deadline: Date.now() + SAV_AI_BUDGET.durationMs, calls: 0, retries: 0, reservedTokens: 0, outputTokens: 0, repairs: 0 }, work);
+  return budgets.run({ id: randomUUID(), elapsedMs: 0, reservedMs: 0, calls: 0, retries: 0, reservedTokens: 0, outputTokens: 0, repairs: 0 }, work);
 }
 
 function category(code: string): SavAiFailureCategory {
@@ -54,7 +57,7 @@ export async function requestSavGeminiJson(input: {
 }): Promise<{ json: unknown; metadata: SavGeminiMetadata }> {
   if (!budgets.getStore()) return withSavAiBudget(() => requestSavGeminiJson(input));
   const budget = budgets.getStore()!;
-  const started = Date.now(), deadline = Math.min(budget.deadline, started + phaseMs(input.phase));
+  const started = Date.now(), deadline = started + PHASE_MS;
   let attempts = 0, metadata: SavGeminiMetadata = {};
   const trace = (code: string | null): SavAiTransportTrace => ({ transportRevision: SAV_AI_TRANSPORT_REVISION, correlationId: budget.id, phase: input.phase, model: /^[a-zA-Z0-9._-]{1,120}$/.test(input.model) ? input.model : "invalid", promptRevision: input.promptRevision ?? SAV_AI_TRANSPORT_REVISION,
     attempts, retries: Math.max(0, attempts - 1), durationMs: Date.now() - started, errorCode: code, failureCategory: code ? category(code) : null });
@@ -77,12 +80,15 @@ export async function requestSavGeminiJson(input: {
   // never refunded. This is an admission bound, not a provider billing estimate.
   const allowance = Buffer.byteLength(body, "utf8") + output;
   for (;;) {
-    const remaining = deadline - Date.now();
+    const remaining = Math.min(deadline - Date.now(), remainingTime(budget));
     if (remaining <= 0 || budget.calls >= SAV_AI_BUDGET.calls || budget.reservedTokens + allowance > SAV_AI_BUDGET.tokenAllowance || budget.outputTokens + output > SAV_AI_BUDGET.outputTokens)
       return fail("SAV_AI_BUDGET_EXCEEDED");
     budget.calls++; budget.reservedTokens += allowance; budget.outputTokens += output; attempts++;
     const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), Math.min(remaining, input.phase === "ticket_matching" ? 8_000 : 12_000));
+    // Reserve time before awaiting so concurrent phases cannot spend it twice.
+    const attemptMs = Math.min(remaining, ATTEMPT_MS), attemptStarted = Date.now();
+    budget.reservedMs += attemptMs;
+    const timer = setTimeout(() => controller.abort(), attemptMs);
     let code = "SAV_AI_GENERATION_FAILED", retryAfter = 0;
     try {
       const response = await (input.fetch ?? fetch)(`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(input.model)}:generateContent`, {
@@ -114,12 +120,19 @@ export async function requestSavGeminiJson(input: {
       if (error instanceof SavAiTransportError) throw error;
       if (controller.signal.aborted || error instanceof Error && error.name === "AbortError") code = "SAV_AI_TIMEOUT";
       else if (error instanceof Error && /^SAV_AI_(HTTP_[1-5]\d{2}|INVALID_RESPONSE|INVALID_JSON|OUTPUT_(BLOCKED|TRUNCATED|INCOMPLETE)|EMPTY_OUTPUT)$/.test(error.message)) code = error.message;
-      const transient = ["SAV_AI_TIMEOUT", "SAV_AI_GENERATION_FAILED", "SAV_AI_HTTP_429", "SAV_AI_HTTP_502", "SAV_AI_HTTP_503", "SAV_AI_HTTP_504"].includes(code);
-      const delay = Math.max(0, retryAfter, 200) + Math.floor(Math.random() * 100);
-      if (input.allowRetry === false || !transient || attempts >= 2 || budget.retries >= SAV_AI_BUDGET.retries || deadline - Date.now() <= delay + 100 || budget.calls >= SAV_AI_BUDGET.calls) return fail(code);
-      budget.retries++;
+    } finally {
       clearTimeout(timer);
-      await new Promise(resolve => setTimeout(resolve, delay));
-    } finally { clearTimeout(timer); }
+      budget.reservedMs -= attemptMs;
+      budget.elapsedMs += Math.max(0, Date.now() - attemptStarted);
+    }
+    const transient = ["SAV_AI_TIMEOUT", "SAV_AI_GENERATION_FAILED", "SAV_AI_HTTP_429", "SAV_AI_HTTP_502", "SAV_AI_HTTP_503", "SAV_AI_HTTP_504"].includes(code);
+    const delay = Math.max(0, retryAfter, 200) + Math.floor(Math.random() * 100);
+    // Admit a retry only with enough time for a complete second attempt.
+    if (input.allowRetry === false || !transient || attempts >= 2 || budget.retries >= SAV_AI_BUDGET.retries || Math.min(deadline - Date.now(), remainingTime(budget)) < delay + ATTEMPT_MS || budget.calls >= SAV_AI_BUDGET.calls) return fail(code);
+    budget.retries++;
+    const waitStarted = Date.now();
+    budget.reservedMs += delay;
+    try { await new Promise(resolve => setTimeout(resolve, delay)); }
+    finally { budget.reservedMs -= delay; budget.elapsedMs += Math.max(0, Date.now() - waitStarted); }
   }
 }

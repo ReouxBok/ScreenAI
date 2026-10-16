@@ -1,7 +1,7 @@
 import "server-only";
 import { and, count, eq, inArray, isNotNull, isNull, ne, or } from "drizzle-orm";
 import { requireDb } from "@/db";
-import { contentItems, knowledgeProjectionCandidates, savLearningAdmissionAttempts, savLearningAdmissionCases, savLearningCandidates, savObservationCycles, savResolutionObservations } from "@/db/schema";
+import { contentItems, contentVersions, knowledgeProjectionCandidates, savKnowledgeActivations, savLearningAdmissionAttempts, savLearningAdmissionCases, savLearningCandidates, savObservationCycles, savResolutionObservations } from "@/db/schema";
 import { knowledgeComparisonInventory } from "@/lib/knowledge/hubspot-import";
 import { decryptSavPayload, encryptSavPayload, savContentHash } from "./crypto";
 import { redactSavLearningText } from "./learning-extraction";
@@ -18,7 +18,7 @@ export function savLearningProofHash(input: { sourceRef: string; cycleStartedAt:
   return savContentHash({ sourceRef: input.sourceRef, cycleStartedAt: new Date(input.cycleStartedAt).toISOString(), evidenceRef: input.evidenceRef, sourceMessageId: input.sourceMessageId, normalizedResolution: savLearningMaterialText(input.resolution), customerConfirmed: input.customerConfirmed });
 }
 async function comparisonContext(db: Pick<Db, "select"> = requireDb()) {
-  const inventory = await knowledgeComparisonInventory(db);
+  const inventory = await knowledgeComparisonInventory(db, "sav");
   // Never silently hide part of the catalogue from the comparator.
   if (inventory.length > 100) throw new Error("SAV_LEARNING_COMPARATOR_CONTEXT_INCOMPLETE");
   const rows = await db.select().from(savLearningCandidates).where(and(
@@ -40,8 +40,13 @@ async function buildComparisonContext(inventory: Awaited<ReturnType<typeof knowl
   if (rows.length > 100 || openCandidates.length > 50 || priorRejections.length > 50) throw new Error("SAV_LEARNING_COMPARATOR_CONTEXT_INCOMPLETE");
   const knowledge = inventory.map(({ ref, versionId, title, body }) => ({ ref, versionId, title: safeText(title, 300), body: safeText(body, 2500) }));
   // Fingerprint full material, not only titles or a possibly unchanged version label.
-  const snapshot = savContentHash({ inventory, candidates: rows.map(row => ({ id: row.id, status: row.status, sourceHash: row.sourceContentHash, groupKey: row.admissionGroupKey, rejectionKind: row.rejectionKind })) });
-  return { knowledge, openCandidates, priorRejections, snapshot };
+  const snapshot = savContentHash({ inventory, openCandidates, priorRejections, candidates: rows.map(row => ({ id: row.id, status: row.status, sourceHash: row.sourceContentHash, groupKey: row.admissionGroupKey, rejectionKind: row.rejectionKind })) });
+  return { knowledge, openCandidates, priorRejections, snapshot, locks: {
+    contentIds: [...new Set(inventory.filter(entry => entry.ref.startsWith("content:")).map(entry => entry.ref.slice(8)))],
+    versionIds: [...new Set(inventory.filter(entry => entry.ref.startsWith("content:")).map(entry => entry.versionId))],
+    projectionIds: inventory.filter(entry => entry.ref.startsWith("candidate:")).map(entry => entry.ref.slice(10)),
+    learningIds: rows.map(row => row.id),
+  } };
 }
 
 export type SavLearningResolutionInput = {
@@ -104,9 +109,14 @@ export async function processSavLearningResolution(input: SavLearningResolutionI
     }
     // A human review can own candidate/projection before its content item. Never
     // wait in the reverse order: abort and release this comparison for a later invocation.
-    await tx.select({ id: contentItems.id }).from(contentItems).for("share", { noWait: true });
-    await tx.select({ id: knowledgeProjectionCandidates.id }).from(knowledgeProjectionCandidates).for("share", { noWait: true });
-    await tx.select({ id: savLearningCandidates.id }).from(savLearningCandidates).for("share", { noWait: true });
+    const { contentIds, versionIds, projectionIds, learningIds } = context.locks;
+    if (contentIds.length) {
+      await tx.select({ id: contentItems.id }).from(contentItems).where(inArray(contentItems.id, contentIds)).orderBy(contentItems.id).for("share", { noWait: true });
+      await tx.select({ id: savKnowledgeActivations.itemId }).from(savKnowledgeActivations).where(inArray(savKnowledgeActivations.itemId, contentIds)).orderBy(savKnowledgeActivations.itemId).for("share", { noWait: true });
+    }
+    if (versionIds.length) await tx.select({ id: contentVersions.id }).from(contentVersions).where(inArray(contentVersions.id, versionIds)).orderBy(contentVersions.id).for("share", { noWait: true });
+    if (projectionIds.length) await tx.select({ id: knowledgeProjectionCandidates.id }).from(knowledgeProjectionCandidates).where(inArray(knowledgeProjectionCandidates.id, projectionIds)).orderBy(knowledgeProjectionCandidates.id).for("share", { noWait: true });
+    if (learningIds.length) await tx.select({ id: savLearningCandidates.id }).from(savLearningCandidates).where(inArray(savLearningCandidates.id, learningIds)).orderBy(savLearningCandidates.id).for("share", { noWait: true });
     const finish = (reasonCode: string, candidateId: string | null = null, groupKey: string | null = null) => finishSavLearningComparisonTx(tx, claim.signalId, {
       reasonCode, candidateId, groupKey, state: candidateId ? "open" : "signal", comparatorRevision: comparison.revision, promptRevision: comparison.promptRevision,
       modelName: comparison.model, inputHash: comparison.inputHash, inputTokens: comparison.inputTokens, outputTokens: comparison.outputTokens, durationMs: comparison.durationMs,

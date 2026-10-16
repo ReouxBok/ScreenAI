@@ -39,14 +39,17 @@ describe("SAV understanding provider boundary", () => {
       expect(result.trace.errorCode).toBe(disabled ? "SAV_AI_ANALYSIS_DISABLED" : "SAV_AI_KEY_MISSING");
     });
   });
-  it("aborts both attempts within the 18 second phase bound", async () => {
+  it("aborts two full 18 second attempts within the 37 second phase bound", async () => {
     vi.useFakeTimers();
     const network = vi.fn((_url: string | URL | Request, init?: RequestInit) => new Promise<Response>((_resolve, reject) => {
       init?.signal?.addEventListener("abort", () => reject(new DOMException("aborted", "AbortError")));
     }));
     const pending = understandSavMessage(input, { apiKey: "fixture", fetch: network });
-    await vi.advanceTimersByTimeAsync(18_000);
-    expect(await pending).toMatchObject({ status: "unavailable", trace: { errorCode: "SAV_AI_TIMEOUT", durationMs: 18_000 } });
+    await vi.advanceTimersByTimeAsync(37_000);
+    const result = await pending;
+    expect(result).toMatchObject({ status: "unavailable", trace: { errorCode: "SAV_AI_TIMEOUT" } });
+    expect(result.trace.durationMs).toBeGreaterThanOrEqual(36_000);
+    expect(result.trace.durationMs).toBeLessThanOrEqual(37_000);
     expect(network).toHaveBeenCalledTimes(2); expect(vi.getTimerCount()).toBe(0);
   });
 });
