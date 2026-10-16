@@ -65,13 +65,18 @@
 .intro.intro { margin-bottom: 0; align-items: center; }
 .intro h1 { font-size: 32px; letter-spacing: -.035em; }
 .intro p { margin-bottom: 0; }
-.views { display: grid; grid-template-columns: repeat(4, minmax(0,1fr)); gap: 12px; }
+.views { display: grid; grid-template-columns: repeat(5, minmax(0,1fr)); gap: 12px; }
 .view { padding: 18px; border: 1px solid #dce2de; border-radius: 14px; color: #66706b; background: transparent; text-decoration: none; }
 .view.active { background: white; border-color: #141a17; color: #141a17; box-shadow: 0 3px 12px rgb(20 26 23 / 4%); }
 .view > span { display: flex; align-items: center; gap: 9px; font-size: 13px; font-weight: 750; }
 .view b { margin-left: auto; border-radius: 7px; padding: 3px 7px; background: #e9edeb; color: #141a17; }
 .view.active b { background: #dff36b; }
 .view small { display: block; margin-top: 8px; font-size: 11px; }
+.observation { padding: 20px; border: 1px solid #dce2de; border-radius: 14px; background: #fafcf9; color: #49544d; }
+.observation h2 { margin: 0 0 10px; font-size: 17px; }
+.observation p, .observation li { font-size: 13px; line-height: 1.6; }
+.observation ul { display: flex; flex-wrap: wrap; gap: 8px 28px; padding-left: 18px; }
+.observation p:last-child { margin-bottom: 0; }
 .toolbar { display: flex; align-items: center; gap: 18px; flex-wrap: wrap; font-size: 12px; }
 .toolbar > a { color: #66706b; }
 .search { display: flex; flex: 1; align-items: center; gap: 12px; min-width: 0; }
