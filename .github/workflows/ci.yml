@@ -40,6 +40,7 @@ jobs:
       - run: npx playwright install --with-deps chromium
       - run: npm run test:e2e --prefix studio
       - run: env -i PATH="$PATH" HOME="$HOME" CI=1 npm run test:e2e --prefix studio -- --config playwright.sav-semantic.config.ts
+      - run: env -i PATH="$PATH" HOME="$HOME" CI=1 npm run test:e2e --prefix studio -- --config playwright.sav-other.config.ts
       - run: npm run test:e2e
       - run: npm run validate:package
       - uses: actions/upload-artifact@v4

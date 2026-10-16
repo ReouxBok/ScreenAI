@@ -13,7 +13,7 @@ import { SavV0Inbox } from "./inbox";
 const threadId = "10000000-0000-4000-8000-000000000001";
 const messageId = "10000000-0000-4000-8000-000000000002";
 const row = { threadId, messageId, fromEmail: "fiction@example.invalid", receivedAt: new Date("2026-10-02T12:01:00Z"), summary: { title: "Retrouver mes factures", problem: "Le client cherche où trouver sa facture.", nextAction: "Ouvrir et qualifier", sourceLabel: "Objet de l’email", additionalRequests: 0 }, opening: "unopened", state: "to_process", reviewStatus: null, draftStatus: "À relire", replyStatus: "Aucun envoi", partnershipStatus: null, ticketProgress: "required", learning: "none", ticket: null, crmStatus: "unknown", nextAction: "Ouvrir et qualifier la demande", incident: false, technical: false };
-const result = { rows: [row], counts: { to_process: 1, to_validate: 0, learning: 0, completed: 0, technical: 0, incidents: 0 }, page: 1, pageSize: 25, total: 1, totalPages: 1, view: "to_process" };
+const result = { rows: [row], counts: { to_process: 1, to_validate: 0, learning: 0, completed: 0, other: 0, technical: 0, incidents: 0 }, otherConfigurationStatus: "not_configured", page: 1, pageSize: 25, total: 1, totalPages: 1, view: "to_process" };
 beforeEach(() => { vi.clearAllMocks(); dependencies.cutover.mockResolvedValue(null); dependencies.incidents.mockResolvedValue([]); dependencies.actions.mockResolvedValue([]); dependencies.dashboard.mockResolvedValue(result); });
 const render = async (search: { view?: string; q?: string; page?: string; sort?: string } = {}) => renderToStaticMarkup(createElement(Fragment, null, await SavV0Inbox({ searchParams: Promise.resolve(search) })));
 describe("SAV-55 compact dashboard", () => {
@@ -69,5 +69,24 @@ describe("SAV-55 compact dashboard", () => {
     expect(dependencies.incidents).not.toHaveBeenCalled();
     dependencies.dashboard.mockResolvedValue({ ...result, view: "incidents" });
     await render({ view: "incidents" }); expect(dependencies.incidents).toHaveBeenCalledWith(20);
+  });
+});
+
+
+describe("Autre observation inbox", () => {
+  it("shows an additive candidate with a direct dossier link and preserved return context", async () => {
+    dependencies.dashboard.mockResolvedValue({ ...result, view: "other", otherConfigurationStatus: "configured", counts: { ...result.counts, other: 1 }, rows: [{ ...row, otherObservation: { family: "vistaprint_promotions", label: "Promotions Vistaprint", ruleVersion: "sav-other-observation-v1" } }] });
+    const html = await render({ view: "other", q: "fixture", sort: "oldest" });
+    expect(html).toContain("Autre — observation"); expect(html).toContain("Ces candidats restent visibles dans leur vue habituelle");
+    expect(html).toContain("Promotions Vistaprint"); expect(html).toContain("Également dans À traiter");
+    expect(html).toContain(`/studio/sav/${threadId}?returnTo=`); expect(html).toContain("view%3Dother"); expect(html).toContain("sort%3Doldest");
+    expect(html).not.toContain('name="messageId"'); expect(html).not.toContain('name="threadId"');
+    expect(html).toContain("Examiner le candidat"); expect(dependencies.open).not.toHaveBeenCalled();
+  });
+  it.each(["invalid", "not_configured"])("explains the %s configuration instead of claiming verified zero noise", async otherConfigurationStatus => {
+    dependencies.dashboard.mockResolvedValue({ ...result, view: "other", otherConfigurationStatus, rows: [], total: 0 });
+    const html = await render({ view: "other" });
+    expect(html).toContain("Aucun candidat dans Autre"); expect(html).toContain("Aucun candidat n’est présenté comme confirmé");
+    expect(html).toContain("Continuez à consulter les vues habituelles"); expect(dependencies.open).not.toHaveBeenCalled();
   });
 });
