@@ -47,10 +47,12 @@ describe("SAV shared semantic pipeline with synthetic provider outputs", () => {
     const output = outputFor(u);
     const network = vi.fn<typeof fetch>(async () => geminiFixture({ ...output, replyDraft: undefined }));
     const result = await analyzeSavMessage({ from: "fixture@example.invalid", subject: "Support", body: "Le produit ne fonctionne pas." }, { evaluation: evaluation("off", network) });
-    expect(result.replyDraft).toBe(output.coverage.map(p => p.text).join("\n\n"));
+    expect(result.replyDraft).toBe(result.replyAssessment?.coverage.map(p => p.text).join("\n\n"));
+    expect(result.replyDraft).toContain("Quelle version");
     const body = JSON.parse(network.mock.calls[0][1]!.body as string);
     expect(body.generationConfig.responseSchema.properties).not.toHaveProperty("replyDraft");
-    expect(result.replyAssessment?.coverage).toEqual(output.coverage);
+    expect(result.replyAssessment?.coverage).toHaveLength(output.coverage.length);
+    expect(result.replyAssessment?.coverage[0]).toMatchObject({ requestId: output.coverage[0].requestId, kind: "clarification", sourceIds: [] });
   });
   it("does not run a shadow comparator on the live dossier path", async () => {
     vi.stubEnv("SAV_ADK_MODE", "shadow");
@@ -68,7 +70,7 @@ describe("SAV shared semantic pipeline with synthetic provider outputs", () => {
     const network = vi.fn();
     const result = await analyzeSavMessage(input, { evaluation: evaluation("off", network) });
     expect(result.replyAssessment?.harness?.retrievalAlerts).toContainEqual({ code: "expired", sourceKey: "expired-card:expired-v1" });
-    expect(result.replyAssessment?.harness?.plans[0]).toMatchObject({ mode: "knowledge_gap", nextCheck: null });
+    expect(result.replyAssessment?.harness?.plans[0]).toMatchObject({ mode: "clarification", nextCheck: null });
     expect(network).not.toHaveBeenCalled();
   });
   it.each(modes)("preserves a content-matched existing issue with a generic email subject in %s", async mode => {
@@ -118,7 +120,7 @@ describe("SAV shared semantic pipeline with synthetic provider outputs", () => {
     const network = vi.fn<typeof fetch>(async () => geminiFixture(outputFor(u)));
     const result = await analyzeSavMessage(input, { evaluation: evaluation(mode, network) });
     expect(deps.understand).toHaveBeenCalledOnce();
-    expect(result.category).toBe("technical"); expect(result.replyDraft).toBe(outputFor(u).replyDraft);
+    expect(result.category).toBe("technical"); expect(result.replyDraft).toContain(u.requests[0].summary);
     expect(result.understanding).toEqual(u); expect(result.structuredProposal?.understanding).toEqual(u);
     expect(result.replyAssessment?.coherence?.status).toBe("passed"); expect(deps.coherence).toHaveBeenCalledOnce();
     if (mode === "off" || mode === "shadow") {
@@ -136,7 +138,7 @@ describe("SAV shared semantic pipeline with synthetic provider outputs", () => {
     deps.understand.mockResolvedValue(u); deps.agent.mockResolvedValue(adkResult(u));
     deps.crm.mockResolvedValue({ contactFound: false, tickets: [], routing: { kind: "new", reason: "no_contact" } });
     const result = await analyzeSavMessage(input, { evaluation: evaluation(mode, vi.fn<typeof fetch>(async () => geminiFixture(outputFor(u)))) });
-    expect(result.replyDraft).toBe(outputFor(u).replyDraft); expect(result.replyDraft).not.toMatch(/Quelle adresse|Which email/);
+    expect(result.replyDraft).toContain(u.requests[0].summary); expect(result.replyDraft).not.toMatch(/Quelle adresse|Which email/);
     expect(result.ticketRouting).toMatchObject({ kind: "review", reason: "customer_identity_unverified" });
     expect(result.structuredProposal?.customerIdentity.verifiedByHuman).toBe(false);
   });
@@ -192,15 +194,17 @@ describe("SAV shared semantic pipeline with synthetic provider outputs", () => {
     const network = vi.fn<typeof fetch>(async () => geminiFixture(answer)); const result = await analyzeSavMessage(input, { evaluation: evaluation("off", network) });
     expect(result.replyDraft).not.toContain("doit être supprimée"); expect(result.replyDraft).toContain(u.requests[0].summary);
     expect(result.replyAssessment).toMatchObject({ kind: "human_handoff", coherence: { status } });
-    expect(result.proposal.confidence).toBe(0); expect(network).toHaveBeenCalledOnce(); expect(deps.coherence).toHaveBeenCalledOnce();
+    expect(result.proposal.confidence).toBe(0); expect(network).toHaveBeenCalledOnce(); expect(deps.coherence).toHaveBeenCalledTimes(status === "rejected" ? 2 : 1);
   });
   it.each(["off", "on"] as const)("rejects missing secondary request coverage in %s", async mode => {
     const u = understandingFixture(); u.requests.push({ ...u.requests[0], id: "second", summary: "Une seconde demande explicite." }); deps.understand.mockResolvedValue(u);
     const incomplete = outputFor(u); incomplete.coverage = incomplete.coverage.slice(0, 1); incomplete.replyDraft = incomplete.coverage[0].text;
     deps.agent.mockResolvedValue({ ...adkResult(u), output: incomplete });
     const result = await analyzeSavMessage(input, { evaluation: evaluation(mode, vi.fn<typeof fetch>(async () => geminiFixture(incomplete))) });
-    expect(result.replyAssessment?.kind).toBe("human_handoff"); expect(result.replyDraft).toContain("seconde demande");
-    expect(result.diagnostics).toContainEqual({ phase: "generation", errorCode: "SAV_REPLY_INCONSISTENT_WITH_UNDERSTANDING" }); expect(deps.coherence).not.toHaveBeenCalled();
+    expect(result.replyAssessment?.kind).toBe(mode === "off" ? "contextualized" : "human_handoff"); expect(result.replyDraft).toContain("seconde demande");
+    expect(result.diagnostics).toEqual(expect.arrayContaining([expect.objectContaining({ phase: "generation", errorCode: "SAV_REPLY_INCONSISTENT_WITH_UNDERSTANDING" })]));
+    expect(deps.coherence).toHaveBeenCalledTimes(mode === "off" ? 1 : 0);
+    if (mode === "off") expect(result.replyAssessment?.recovery).toMatchObject({ strategy: "investigation", validated: true });
   });
   it("does not retry another composer after ADK failure", async () => {
     deps.understand.mockResolvedValue(understandingFixture()); deps.agent.mockRejectedValue(new Error("SAV_ADK_TIMEOUT"));
@@ -228,8 +232,22 @@ describe("SAV shared semantic pipeline with synthetic provider outputs", () => {
     answer.responseKind = "solution"; answer.coverage[0] = { ...answer.coverage[0], kind: "solution", text: "Cliquez sur un bouton inventé.", sourceIds: ["missing-card"] }; answer.replyDraft = answer.coverage[0].text;
     answer.citations = [{ sourceId: "missing-card", claim: "Cliquer sur ce bouton", quote: "Une quote qui n’a jamais été fournie." }];
     const result = await analyzeSavMessage(input, { evaluation: evaluation("off", vi.fn<typeof fetch>(async () => geminiFixture(answer))) });
-    expect(result.replyDraft).not.toContain("bouton inventé"); expect(result.replyAssessment?.kind).toBe("human_handoff");
-    expect(deps.coherence).not.toHaveBeenCalled(); expect(result.diagnostics?.some(d => d.errorCode === "SAV_REPLY_OUTSIDE_REQUEST_PLAN")).toBe(true);
+    expect(result.replyDraft).not.toContain("bouton inventé"); expect(result.replyAssessment?.kind).toBe("contextualized");
+    expect(result.replyAssessment?.recovery).toMatchObject({ validated: true });
+    expect(deps.coherence).toHaveBeenCalledOnce(); expect(result.diagnostics?.some(d => d.errorCode === "SAV_REPLY_OUTSIDE_REQUEST_PLAN")).toBe(true);
+  });
+  it("rebuilds a rejected composition as an investigation only after independent coherence passes", async () => {
+    const u = understandingFixture(); deps.understand.mockResolvedValue(u);
+    deps.coherence.mockResolvedValueOnce(coherence("rejected")).mockResolvedValueOnce(coherence());
+    const result = await analyzeSavMessage(input, { evaluation: evaluation("off", vi.fn(async () => geminiFixture(outputFor(u)))) });
+    expect(deps.coherence).toHaveBeenCalledTimes(2);
+    expect(result.replyAssessment?.recovery).toMatchObject({ originalErrorCode: "SAV_REPLY_COHERENCE_REJECTED", validated: true });
+    expect(result.replyAssessment?.coherence?.totalTokens).toBe(30);
+    expect(result.replyAssessment?.coherenceAttempts?.map(c => c.status)).toEqual(["rejected", "passed"]);
+    expect(result.replyAssessment?.coherenceAttempts?.[0].issues).toContain("unsupported_advice");
+    expect(result.replyDraft).toContain("Quelle version");
+    expect(result.replyDraft).not.toContain("L’équipe doit vérifier");
+    expect(result.proposal.requiresHumanApproval).toBe(true);
   });
   it.each([{ messageId: "fixture" }, { pilotBatchId: "fixture" }])("forbids any persisted identity on an evaluation run: %j", async persisted => {
     await expect(analyzeSavMessage(input, { ...persisted, evaluation: evaluation("off", vi.fn()) })).rejects.toThrow("SAV_EVALUATION_PERSISTENCE_FORBIDDEN");

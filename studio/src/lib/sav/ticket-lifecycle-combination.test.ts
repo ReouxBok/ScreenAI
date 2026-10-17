@@ -46,6 +46,7 @@ function mockIntegrations() {
     const stages = ["1", "2", "3", "4"].map(id => ({ id, metadata: { isClosed: id === "4", ticketState: id === "4" ? "CLOSED" : "OPEN" } }));
     if (url.endsWith("/pipelines/tickets/0")) return Response.json({ id: "0", stages });
     if (url.endsWith("/pipelines/tickets")) return Response.json({ results: [{ id: "0", stages }] });
+    if (/\/tickets\/\d+\/associations\/(?:notes|emails)\?/.test(url)) return Response.json({ results: [] });
     if (url.endsWith("/contacts/search")) return Response.json({ results: [{ id: "21", properties: { email: "client@example.com" } }] });
     const predecessor = () => ({ ...record(), id: "400", properties: { ...record().properties, hs_pipeline_stage: predecessorStage, hs_last_closed_date: "2026-09-01T00:00:00Z" } });
     if (url.endsWith("/tickets/search")) return Response.json({ results: [...(predecessorStage ? [predecessor()] : []), record()] });

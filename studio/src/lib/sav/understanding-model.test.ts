@@ -23,11 +23,11 @@ describe("SAV understanding provider boundary", () => {
     expect(network).toHaveBeenCalledTimes(status === 429 ? 2 : 1);
     expect(result).toMatchObject({ status: "unavailable", requests: [], primaryRequestId: null, trace: { errorCode: `SAV_AI_HTTP_${status}` } });
   });
-  it.each(["schema", "proof", "json"])("rejects invalid %s without retry", async invalid => {
+  it.each(["schema", "proof", "json"])("rejects invalid %s after at most one contract recovery", async invalid => {
     const content = understandingContent(); content.evidence[0].excerpt = "Une preuve qui n’existe pas.";
     const network = vi.fn<typeof fetch>(async () => invalid === "json" ? new Response("not-json") : geminiFixture(invalid === "schema" ? { version: 2 } : content));
     const result = await understandSavMessage(input, { apiKey: "fixture", fetch: network });
-    expect(network).toHaveBeenCalledTimes(invalid === "proof" ? 2 : 1); expect(result.status).toBe("unavailable");
+    expect(network).toHaveBeenCalledTimes(invalid === "json" ? 1 : 2); expect(result.status).toBe("unavailable");
     expect(result.uncertainties).toContainEqual({ code: "invalid_output", requestIds: [] });
     expect(result.trace.errorCode).toMatch(/INVALID|REPAIR_REJECTED/);
   });

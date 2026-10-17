@@ -1,3 +1,5 @@
+import { addSavInvestigationQuestions, buildSavInvestigationReply } from "./investigation";
+import { savValidationDiagnostic } from "./validation-diagnostics-server";
 import { readActiveSavPlaybook } from "./playbook";
 import { defaultSavPlaybook, renderSavPlaybook, savRequestDomain, type SavActivePlaybook } from "./playbook-contract";
 import { planSavRequests, assembleSavPlannedReply, SAV_REQUEST_PLANNER_REVISION } from "./request-planner";
@@ -121,8 +123,8 @@ async function analyzeSavMessageLegacy(input: SavEnrichedInput, context: SavAnal
     score: Math.max(...source.signals.map(signal => signal.semanticScore ?? 0)), resolution: source.resolution ?? undefined })) };
   if (retrieval.requests.some(request => ["search_unavailable", "revision_unstable"].includes(request.status))) diagnostics.push({ phase: "knowledge", errorCode: "SAV_KNOWLEDGE_LOOKUP_FAILED" });
   if (!context.evaluation && (await readActiveSavPlaybook()).versionId !== activePlaybook.versionId) throw new Error("SAV_PLAYBOOK_UNAVAILABLE");
-  const requestPlans = planSavRequests(understanding, retrieval, activePlaybook);
-  // Missing questions now come exclusively from reviewed knowledge or the playbook.
+  const requestPlans = addSavInvestigationQuestions(understanding, planSavRequests(understanding, retrieval, activePlaybook));
+  // Questions come from reviewed knowledge, the playbook or the bounded generic investigation dictionary.
   understanding.missingInformation = requestPlans.flatMap(plan => plan.missingFacts.map(fact => ({ id: fact.id, key: fact.key, text: fact.question, requestIds: [plan.requestId] })));
   const harness = { revision: SAV_REQUEST_PLANNER_REVISION, playbookVersionId: playbook.versionId, playbookCharacters: playbook.characters,
     retrievalRevision: retrieval.revision, retrievalAlerts: retrieval.alerts, plans: requestPlans };
@@ -150,6 +152,7 @@ async function analyzeSavMessageLegacy(input: SavEnrichedInput, context: SavAnal
   if (compact.status === "blocked") return degradedWithHarness([{ phase: "generation", errorCode: "SAV_COMPACT_CONTEXT_BLOCKED" }]);
   const sources = JSON.stringify({ semanticPolicy: plan, context: compact, knowledge: retrieval, requestPlans });
   let generationMetadata: SavGeminiMetadata | undefined;
+  let rejectedCandidate: unknown;
   try {
     const generated = await requestSavGeminiJson({ phase: "composition", apiKey, model, promptRevision: SAV_LEGACY_PROMPT_REVISION, fetch: context.evaluation?.fetch,
       body: {
@@ -188,6 +191,7 @@ Le serveur a choisi requestPlans. Pour chaque demande, text contient UNIQUEMENT 
     });
     generationMetadata = generated.metadata;
     const raw = generated.json;
+    rejectedCandidate = raw;
     const parsed = aiAnalysisSchema.safeParse(raw);
     if (!parsed.success) throw new Error("SAV_AI_INVALID_SCHEMA");
     const original = assembleSavReplySections(understanding, parsed.data.coverage);
@@ -206,7 +210,7 @@ Le serveur a choisi requestPlans. Pour chaque demande, text contient UNIQUEMENT 
     const confidence = Math.round(analysis.confidence * 1_000);
     const lacksGrounding = !knowledge.results.length || Math.max(...knowledge.results.map((result) => result.score)) < 0.5;
     const needsGrounding = analysis.responseKind === "solution";
-    const requiresHuman = plan.requiresHuman || plannedCoverage.some(part => part.kind === "handoff") || requestPlans.some(p => ["knowledge_gap", "reserved", "provider_failure"].includes(p.mode)) || diagnostics.length > 0 || analysis.requiresHuman || analysis.urgency === "critical" || confidence < 850 || (needsGrounding && lacksGrounding);
+    const requiresHuman = plan.requiresHuman || plannedCoverage.some(part => part.kind === "handoff") || requestPlans.some(p => p.missingFacts.length > 0 || ["knowledge_gap", "reserved", "provider_failure"].includes(p.mode)) || diagnostics.length > 0 || analysis.requiresHuman || analysis.urgency === "critical" || confidence < 850 || (needsGrounding && lacksGrounding);
     const proposal: DecisionProposal = requiresHuman
       ? {
         kind: "human_review_required",
@@ -225,9 +229,10 @@ Le serveur a choisi requestPlans. Pour chaque demande, text contient UNIQUEMENT 
     return { category: plan.category, urgency: analysis.urgency, proposal, evidence: citedEvidence, replyDraft, internalNote, model, knowledgeRevision: knowledge.revision, diagnostics, generationMetadata, generationDurationMs: Date.now() - startedAt, understanding, replyAssessment: { kind: analysis.responseKind === "handoff" ? "human_handoff" : "contextualized", coverage: analysis.coverage!, errorCode: null, harness } };
   } catch (error) {
     generationMetadata = savAiErrorMetadata(error) ?? generationMetadata;
-    diagnostics.push({ phase: "generation", errorCode: savAnalysisErrorCode(error) });
-    const degraded = degradedComposition(input, evidence, knowledge.revision, diagnostics);
-    return { ...degraded, generationMetadata, generationDurationMs: Date.now() - startedAt, replyAssessment: { ...degraded.replyAssessment!, harness } };
+    diagnostics.push({ phase: "generation", errorCode: savAnalysisErrorCode(error), validation: savValidationDiagnostic(error, "composition", rejectedCandidate) });
+    const recoverable = ["SAV_AI_INVALID_SCHEMA", "SAV_AI_INVALID_JSON", "SAV_REPLY_INCONSISTENT_WITH_UNDERSTANDING", "SAV_REPLY_OUTSIDE_REQUEST_PLAN", "SAV_REQUEST_PLAN_COVERAGE_REQUIRED", "SAV_CITATION_QUOTE_MISMATCH", "SAV_CITATION_NOT_DECLARED", "SAV_CITATION_MUST_USE_KNOWLEDGE", "SAV_CITATION_REQUIRES_RESOLUTION_CARD", "SAV_UNGROUNDED_REPLY", "SAV_UNKNOWN_EVIDENCE", "SAV_RESPONSE_KIND_MISMATCH", "SAV_CITATION_VERSION_REQUIRED", "SAV_CITATION_RELEVANCE_TOO_LOW", "SAV_CITATION_EXPIRED", "SAV_CITATION_STALE", "SAV_CONTRADICTORY_RESOLUTION_CARDS"].includes(savAnalysisErrorCode(error));
+    const degraded = recoverable ? investigationComposition(input, evidence, knowledge.revision, diagnostics, harness) : degradedComposition(input, evidence, knowledge.revision, diagnostics);
+    return { ...degraded, generationMetadata, generationDurationMs: Date.now() - startedAt, replyAssessment: { ...degraded.replyAssessment!, harness: degraded.replyAssessment?.harness ?? harness } };
   }
 }
 
@@ -324,7 +329,7 @@ async function recordAgentRun(input: {
       evidence: input.analysis?.evidence ?? [],
       toolTrace: [...(input.toolTrace ?? []), ...diagnostics.map((item, index) => ({
         sequence: (input.toolTrace?.length ?? 0) + index + 1, name: `sav_${item.phase}_diagnostic`,
-        status: "failed" as const, durationMs: 0, errorCode: item.errorCode,
+        status: "failed" as const, durationMs: 0, errorCode: item.errorCode, ...(item.validation ? { resultSummary: { validation: item.validation } } : {}),
       })), ...(generationMetadata ? [{
         sequence: (input.toolTrace?.length ?? 0) + diagnostics.length + 1,
         name: "sav_legacy_generation_response", status: generationError ? "failed" as const : "succeeded" as const,
@@ -431,13 +436,32 @@ function contextualHandoff(understanding: SavUnderstandingV1) {
   return [standard, summary ? `${heading}\n${summary}` : null].filter(Boolean).join("\n\n");
 }
 
+function investigationComposition(input: SavEnrichedInput, evidence: SavDecisionEvidence[], revision: string, diagnostics: SavAnalysisDiagnostic[], harness: NonNullable<SavReplyAssessment["harness"]>): SavAnalysis {
+  const original = degradedComposition(input, evidence, revision, diagnostics);
+  try {
+    const understanding = input.understanding!;
+    const plans = addSavInvestigationQuestions(understanding, harness.plans.map(p => ({ ...p, nextCheck: null, procedures: undefined })));
+    const investigationUnderstanding = { ...understanding, missingInformation: plans.flatMap(p => p.missingFacts.map(f => ({ id: f.id, key: f.key, text: f.question, requestIds: [p.requestId] }))) };
+    const reply = buildSavInvestigationReply(investigationUnderstanding, plans);
+    // Persist the exact question contract used by the revalidated draft.
+    understanding.missingInformation = investigationUnderstanding.missingInformation;
+    harness = { ...harness, plans };
+    assertSavGrounding({ ...reply, evidenceIds: [], urgency: "normal", ticketRequired: true, reasonCode: "investigation", explanation: "Investigation", confidence: 0, requiresHuman: true, internalNote: "" }, []);
+    return { ...original, replyDraft: reply.replyDraft,
+      proposal: { ...original.proposal, reasonCode: "investigation_pending_validation", explanation: "Brouillon d’investigation reconstruit depuis la compréhension et les questions contrôlées. Validation humaine requise." },
+      replyAssessment: { kind: "contextualized", coverage: reply.coverage, errorCode: null, harness,
+        recovery: { strategy: "investigation", originalErrorCode: savPrimaryAnalysisDiagnostic(diagnostics)?.errorCode ?? "SAV_AI_GENERATION_FAILED", validated: false },
+        validationDiagnostics: diagnostics.flatMap(d => d.validation ? [d.validation] : []) } };
+  } catch { return { ...original, replyAssessment: { ...original.replyAssessment!, harness } }; }
+}
+
 function degradedComposition(input: SavEnrichedInput, evidence: SavDecisionEvidence[], knowledgeRevision: string, diagnostics: SavAnalysisDiagnostic[]): SavAnalysis {
   const understanding = input.understanding!;
   const plan = savSemanticPlan(understanding);
   return { category: plan.category, urgency: "high", model: "rules-v1", understanding, evidence, knowledgeRevision, diagnostics,
     proposal: { kind: "human_review_required", reasonCode: "analysis_unverified", explanation: "La compréhension est conservée, mais la génération ou ses sources n’ont pas pu être vérifiées. Le brouillon ci-dessous est un transfert humain standard, sans solution produit.", confidence: 0, requiresHumanApproval: true },
     replyDraft: plan.replyPolicy === "compose" ? contextualHandoff(understanding) : null, internalNote: null,
-    replyAssessment: { kind: plan.replyPolicy === "compose" ? "human_handoff" : "unavailable", coverage: [], errorCode: diagnostics[0]?.errorCode ?? null } };
+    replyAssessment: { kind: plan.replyPolicy === "compose" ? "human_handoff" : "unavailable", coverage: [], errorCode: diagnostics[0]?.errorCode ?? null, validationDiagnostics: diagnostics.flatMap(d => d.validation ? [d.validation] : []).slice(0, 8) } };
 }
 
 function restrictedSemanticAnalysis(understanding: SavUnderstandingV1): SavAnalysis {
@@ -483,7 +507,7 @@ async function analyzeSavMessageWithinBudget(input: SavEnrichedInput, context: S
       conversation ??= customerMessage.kind === "sender" && context.messageId ? await loadSavConversation(context.messageId) : undefined;
       const { extractSavIdentityHints } = await import("./identity");
       if (customerIdentity.email) crm = await (context.evaluation?.readHubspotContext ?? readSavHubspotContext)({ email: customerIdentity.email, subject: input.subject, body: input.body, currentTicketId: customerIdentity.kind === "sender" && conversation?.senderMatchesCustomer ? conversation.hubspotTicketId : undefined,
-        identityHints: customerMessage.kind === "sender" ? extractSavIdentityHints([messageContext.currentText, messageContext.signatureText].filter(Boolean).join("\n"), input.displayName) : undefined, toleratePartial: true });
+        identityHints: customerMessage.kind === "sender" ? extractSavIdentityHints([messageContext.currentText, messageContext.signatureText].filter(Boolean).join("\n"), input.displayName) : undefined, toleratePartial: true, includeHistory: true });
     } catch { /* An unavailable read is never interpreted as an absent customer. */ }
   }
   const enriched: SavEnrichedInput = { ...input, messageContext, conversation, dossierContext: input.dossierContext ?? { version: 1, messageId: context.messageId ?? "", collectedAt: new Date().toISOString(), customerIdentity,
@@ -509,13 +533,31 @@ async function analyzeSavMessageWithinBudget(input: SavEnrichedInput, context: S
     }
     analysis.understanding = understanding;
     if (plan.replyPolicy === "compose" && analysis.replyDraft && analysis.replyAssessment?.coverage.length && !analysis.replyAssessment.errorCode) {
-      const coherence = await checkSavReplyCoherence({ understanding, replyDraft: analysis.replyDraft, coverage: analysis.replyAssessment.coverage, evidence: analysis.evidence }, context.evaluation);
-      if (coherence.status === "passed") analysis.replyAssessment.coherence = coherence;
-      else {
+      let coherence = await checkSavReplyCoherence({ understanding, replyDraft: analysis.replyDraft, coverage: analysis.replyAssessment.coverage, evidence: analysis.evidence }, context.evaluation);
+      const coherenceAttempts = [coherence];
+      if (coherence.status === "rejected" && !analysis.replyAssessment.recovery && analysis.replyAssessment.harness) {
+        const previous = analysis;
+        analysis = { ...investigationComposition(enriched, analysis.evidence, analysis.knowledgeRevision ?? "not_consulted",
+          [...(analysis.diagnostics ?? []), { phase: "generation", errorCode: coherence.errorCode! }], analysis.replyAssessment.harness), agentRunId: analysis.agentRunId, generationMetadata: analysis.generationMetadata };
+        if (analysis.replyAssessment?.recovery && analysis.replyDraft) {
+          const next = await checkSavReplyCoherence({ understanding, replyDraft: analysis.replyDraft, coverage: analysis.replyAssessment.coverage, evidence: [] }, context.evaluation);
+          coherenceAttempts.push(next);
+          coherence = next;
+        } else analysis = previous;
+      }
+      if (coherence.status === "passed") {
+        analysis.replyAssessment!.coherence = coherence;
+        analysis.replyAssessment!.coherenceAttempts = coherenceAttempts;
+        if (analysis.replyAssessment!.recovery) {
+          analysis.replyAssessment!.recovery.validated = true;
+          analysis.diagnostics = analysis.diagnostics?.map(d => d.phase === "generation" ? { ...d, resolved: true } : d);
+          analysis.proposal.reasonCode = "investigation_ready_for_review";
+        }
+      } else {
         const runId = analysis.agentRunId;
         const degraded = degradedComposition(enriched, analysis.evidence, analysis.knowledgeRevision ?? "not_consulted", [...(analysis.diagnostics ?? []), { phase: "generation", errorCode: coherence.errorCode! }]);
         analysis = { ...degraded, agentRunId: runId, generationMetadata: analysis.generationMetadata,
-          replyAssessment: { ...degraded.replyAssessment!, coherence, harness: analysis.replyAssessment?.harness } };
+          replyAssessment: { ...degraded.replyAssessment!, coherence, coherenceAttempts, harness: analysis.replyAssessment?.harness, recovery: analysis.replyAssessment?.recovery } };
       }
     }
     // These restrictions apply equally to direct Gemini, ADK, and any degraded path.
@@ -555,17 +597,18 @@ async function analyzeSavMessageWithinBudget(input: SavEnrichedInput, context: S
   if (context.messageId) {
     if (!analysis.agentRunId) throw new Error("SAV_ANALYSIS_TRACE_REQUIRED");
     const coherence = analysis.replyAssessment?.coherence;
+    const coherenceUsage = (analysis.replyAssessment?.coherenceAttempts ?? (coherence ? [coherence] : [])).reduce((sum, c) => ({ inputTokens: sum.inputTokens + c.inputTokens, outputTokens: sum.outputTokens + c.outputTokens, totalTokens: sum.totalTokens + c.totalTokens, durationMs: sum.durationMs + c.durationMs }), { inputTokens: 0, outputTokens: 0, totalTokens: 0, durationMs: 0 });
     const diagnostic = savPrimaryAnalysisDiagnostic(analysis.diagnostics);
     await requireDb().update(savAgentRuns).set({ knowledgeRevision: analysis.structuredProposal.knowledgeRevision,
       proposalCiphertext: encryptSavPayload(analysis.structuredProposal), decisionKind: analysis.proposal.kind,
       confidence: analysis.proposal.confidence, evidence: analysis.evidence,
       outputHash: savContentHash(analysis.structuredProposal),
-      ...(diagnostic ? { status: "fallback", errorCode: diagnostic.errorCode } : {}),
+      ...(diagnostic ? { status: "fallback", errorCode: diagnostic.errorCode } : analysis.replyAssessment?.recovery?.validated ? { status: "succeeded", errorCode: null } : {}),
       ...(coherence ? {
-        inputTokens: sql`${savAgentRuns.inputTokens} + ${coherence.inputTokens}`,
-        outputTokens: sql`${savAgentRuns.outputTokens} + ${coherence.outputTokens}`,
-        totalTokens: sql`${savAgentRuns.totalTokens} + ${coherence.totalTokens}`,
-        durationMs: sql`${savAgentRuns.durationMs} + ${coherence.durationMs}`,
+        inputTokens: sql`${savAgentRuns.inputTokens} + ${coherenceUsage.inputTokens}`,
+        outputTokens: sql`${savAgentRuns.outputTokens} + ${coherenceUsage.outputTokens}`,
+        totalTokens: sql`${savAgentRuns.totalTokens} + ${coherenceUsage.totalTokens}`,
+        durationMs: sql`${savAgentRuns.durationMs} + ${coherenceUsage.durationMs}`,
       } : {}),
     }).where(eq(savAgentRuns.id, analysis.agentRunId));
   }

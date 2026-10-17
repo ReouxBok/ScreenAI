@@ -102,7 +102,7 @@ export async function collectSavDossierContext(messageId: string): Promise<SavDo
     customerEmail ? readSavHubspotContext({ email: customerEmail, subject: customerMessage.subject, body: customerMessage.body, returnedAt: message.receivedAt,
       skipSemanticMatch: Boolean(proposal && savHumanTicketAction(proposal)), cachedMatching: body.supportContext?.crm.data?.matching,
       currentTicketId: customerIdentity.kind === "sender" && thread?.customerEmail.toLowerCase() === customerEmail.toLowerCase() ? thread.hubspotTicketId : undefined,
-      identityHints: customerIdentity.kind === "sender" ? extractSavIdentityHints([parts.currentText, parts.signatureText].filter(Boolean).join("\n"), body.headers?.["from-display-name"]) : undefined, toleratePartial: true })
+      identityHints: customerIdentity.kind === "sender" ? extractSavIdentityHints([parts.currentText, parts.signatureText].filter(Boolean).join("\n"), body.headers?.["from-display-name"]) : undefined, toleratePartial: true, includeHistory: true })
       : Promise.reject(new Error("SAV_FORWARDED_CUSTOMER_UNRESOLVED")),
     customerMessage.kind !== "sender"
       ? Promise.resolve<SavConversation>({ threadId: message.threadId, currentMessageId: message.id, hubspotTicketId: null,

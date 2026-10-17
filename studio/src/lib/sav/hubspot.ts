@@ -1,4 +1,5 @@
 import "server-only";
+import { readSavTicketHistory, type SavTicketHistory } from "./ticket-history";
 import { getSavLearningCutover, recordSavLearningSignal } from "./learning-admission";
 import { processSavLearningResolution } from "./learning-pipeline";
 import { SAV_TICKET_RETURN_NOTE_VERSION, savTicketReturnNote } from "./ticket-return-note";
@@ -380,7 +381,7 @@ async function finalizeSavV0TicketAction(action: typeof savActions.$inferSelect)
     const customerEmail = savEffectiveCustomerEmail(proposal, customerIdentity)!;
     const savedContext = decryptSavPayload<{ supportContext?: SavDossierContext }>(latest.bodyCiphertext).supportContext;
     const freshContext = await readSavHubspotContext({ email: customerEmail, subject: customerMessage.subject, body: customerMessage.body, returnedAt: latest.receivedAt,
-      skipSemanticMatch: Boolean(savHumanTicketAction(proposal)), cachedMatching: savedContext?.crm.data?.matching,
+      includeHistory: true, historyTicketId: savHumanTicketAction(proposal)?.ticketId, skipSemanticMatch: Boolean(savHumanTicketAction(proposal)), cachedMatching: savedContext?.crm.data?.matching,
       currentTicketId: customerIdentity.kind === "sender" && thread.customerEmail.toLowerCase() === customerEmail.toLowerCase() ? thread.hubspotTicketId : undefined });
     const context = applySavHumanTicketRouting(proposal, { version: 1, messageId: latest.id, collectedAt: new Date().toISOString(), customerIdentity,
       crm: { status: freshContext.errorCode ? "partial" : "ready", errorCode: freshContext.errorCode, data: freshContext }, conversation: null, conversationError: null, otherConversations: [], otherConversationsError: null }, latest.receivedAt).crm.data!;
@@ -616,6 +617,7 @@ export async function findSavContactCandidates(hints: SavIdentityHints): Promise
 }
 
 export type SavHubspotContext = {
+  history?: SavTicketHistory;
   errorCode: string | null; contactFound: boolean; contactId?: string; contactName?: string | null; identityCandidates: SavIdentityCandidate[];
   tickets: Array<SavLifecycleTicket & { subject: string; description: string; descriptionTruncated?: boolean; subjectTruncated?: boolean; pipelineId: string | null; stageId: string | null; updatedAt: string | null }>;
   matching?: Awaited<ReturnType<typeof matchSavTicketsByContent>>["matching"];
@@ -624,7 +626,7 @@ export type SavHubspotContext = {
     | { kind: "new" | "ambiguous"; reason: string; candidateIds: string[] };
 };
 
-export async function readSavHubspotContext(input: { email: string; subject: string; body?: string; currentTicketId?: string | null; returnedAt?: Date | string; identityHints?: SavIdentityHints; toleratePartial?: boolean; skipSemanticMatch?: boolean; cachedMatching?: SavTicketMatchCache }): Promise<SavHubspotContext> {
+export async function readSavHubspotContext(input: { email: string; subject: string; body?: string; currentTicketId?: string | null; returnedAt?: Date | string; identityHints?: SavIdentityHints; toleratePartial?: boolean; skipSemanticMatch?: boolean; cachedMatching?: SavTicketMatchCache; includeHistory?: boolean; historyTicketId?: string | null }): Promise<SavHubspotContext> {
   const contact = await findContactByEmail(input.email);
   const contactName = contact ? [contact.properties.firstname, contact.properties.lastname].filter((part): part is string => Boolean(part?.trim())).join(" ").trim() || null : null;
   let identityCandidates: SavIdentityCandidate[] = [];
@@ -632,9 +634,10 @@ export async function readSavHubspotContext(input: { email: string; subject: str
     identityCandidates = !contact && input.identityHints ? await findSavContactCandidates(input.identityHints) : [];
     const readLinked = async () => {
       let linkedTicket: HubspotRecord | null = null;
-    if (input.currentTicketId) {
+    const linkedId = input.historyTicketId ?? input.currentTicketId;
+    if (linkedId) {
       try {
-        linkedTicket = await hubspotFetch<HubspotRecord>(`/crm/v3/objects/tickets/${encodeURIComponent(input.currentTicketId)}?properties=subject,content,createdate,hs_pipeline,hs_pipeline_stage,hs_lastmodifieddate,hs_last_closed_date,closed_date,hubspot_owner_id&associations=contacts`);
+        linkedTicket = await hubspotFetch<HubspotRecord>(`/crm/v3/objects/tickets/${encodeURIComponent(linkedId)}?properties=subject,content,createdate,hs_pipeline,hs_pipeline_stage,hs_lastmodifieddate,hs_last_closed_date,closed_date,hubspot_owner_id&associations=contacts`);
       } catch (error) {
         if (!/HUBSPOT_HTTP_404/.test(error instanceof Error ? error.message : "")) throw error;
       }
@@ -682,10 +685,28 @@ export async function readSavHubspotContext(input: { email: string; subject: str
       updatedAt: ticket.properties.hs_lastmodifieddate || ticket.updatedAt || null,
     })));
     const shortlist = shortlistSavTickets(tickets, `${input.subject}\n${input.body ?? ""}`, input.currentTicketId);
-    const assessed = input.body !== undefined && !input.skipSemanticMatch && paginationComplete ? await matchSavTicketsByContent({ subject: input.subject, body: input.body, tickets: shortlist.selected }, { cached: input.cachedMatching }) : null;
+    const historyDeadline = AbortSignal.timeout(8000);
+    let history = input.includeHistory && contact ? await readSavTicketHistory(shortlist.selected.map(t => t.id), new Date(input.returnedAt ?? new Date()), hubspotFetch, historyDeadline) : undefined;
+    const matchingTickets = shortlist.selected.map(ticket => {
+      const description = [ticket.description, ...(history?.events.filter(e => e.ticketId === ticket.id).map(e => `[Historical declaration / ticket ${ticket.id} / ${e.kind} / ${e.occurredAt} / source ${e.sourceId}] ${e.text}`) ?? [])].join("\n");
+      if (history && description.length > 11_000) history.limitations.push("history_matching_content_limited");
+      return { ...ticket, description: description.slice(0, 11_000) };
+    });
+    const assessed = input.body !== undefined && !input.skipSemanticMatch && paginationComplete ? await matchSavTicketsByContent({ subject: input.subject, body: input.body, tickets: matchingTickets }, { cached: input.cachedMatching }) : null;
     let routing = assessed?.selection ?? selectSavTicketMatch({ subject: input.subject, candidates: tickets, currentTicketId: input.currentTicketId, includeClosed: true });
     if (!paginationComplete || assessed && !savSubsetMatchIsComplete(routing, shortlist.omitted)) routing = { kind: "ambiguous", candidates: tickets, reason: "ticket_context_incomplete" };
+    if (history?.limitations.length && routing.kind === "new" && tickets.length) routing = { kind: "ambiguous", candidates: tickets, reason: "ticket_history_incomplete" };
+    const explicitHistoryTarget = input.historyTicketId && tickets.some(t => t.id === input.historyTicketId) ? input.historyTicketId : null;
+    const selectedId = explicitHistoryTarget ?? (routing.kind === "matched" ? routing.ticket.id : input.skipSemanticMatch && linkedTicket ? linkedTicket.id : null);
+    // Reserve one selected-ticket read when matching chose outside the two candidates.
+    // A separate eight-second bound keeps the selected issue readable after matching.
+    if (history && selectedId && !history.ticketIds.includes(selectedId)) {
+      const selectedHistory = await readSavTicketHistory([selectedId], new Date(input.returnedAt ?? new Date()), hubspotFetch);
+      history = { ...selectedHistory, limitations: [...new Set([...history.limitations, ...selectedHistory.limitations])].sort() };
+    }
+    if (history) history.relevantTicketId = selectedId && history.ticketIds.includes(selectedId) ? selectedId : null;
     return {
+      ...(history ? { history } : {}),
       errorCode: paginationComplete ? null : "SAV_HUBSPOT_TICKETS_TRUNCATED",
       limitations: { paginationComplete, ...shortlist.limits },
       contactFound: Boolean(contact),

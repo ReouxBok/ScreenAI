@@ -70,7 +70,7 @@ async function expectFailedPhase(phase: Phase, code: string) {
     expect(snapshot.replyDraft).toContain(input.body);
     if (phase === "coherence") expect(snapshot.replyAssessment?.coherence).toMatchObject({ status: "unavailable", errorCode: code });
   }
-  expect(network).toHaveBeenCalledTimes(phases.indexOf(phase) + 1 + (["SAV_AI_TIMEOUT", "SAV_AI_GENERATION_FAILED", "SAV_AI_HTTP_429", "SAV_AI_HTTP_503"].includes(code) ? 1 : 0));
+  expect(network).toHaveBeenCalledTimes(phases.indexOf(phase) + 1 + (["SAV_AI_TIMEOUT", "SAV_AI_GENERATION_FAILED", "SAV_AI_HTTP_429", "SAV_AI_HTTP_503"].includes(code) ? 1 : 0) + (phase === "understanding" && code === "SAV_AI_INVALID_SCHEMA" ? 1 : 0) + (phase === "composition" && ["SAV_AI_INVALID_SCHEMA", "SAV_AI_INVALID_JSON"].includes(code) ? 2 : 0));
   expect(state.agent).not.toHaveBeenCalled();
 }
 
@@ -119,7 +119,8 @@ describe("SAV generation diagnostics on isolated PostgreSQL", () => {
     successfulGeneration();
     const analysis = await analyzeSavMessage(input, { messageId });
     expect(network).toHaveBeenCalledTimes(3);
-    expect(analysis.replyDraft).toBe(`L’équipe doit vérifier votre demande : ${input.body}`);
+    expect(analysis.replyDraft).toContain(input.body);
+    expect(analysis.replyDraft).toContain("Sur quel produit");
     expect(analysis.replyAssessment?.coherence?.status).toBe("passed");
     expect(analysis.proposal).toMatchObject({ kind: "human_review_required", requiresHumanApproval: true });
     expect(analysis.structuredProposal?.dossierContext?.crm.data?.contactId).toBe("31");

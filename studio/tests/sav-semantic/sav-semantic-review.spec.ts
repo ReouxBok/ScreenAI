@@ -2,6 +2,18 @@ import { submitServerAction } from "../helpers/server-action";
 import { expect, test } from "@playwright/test";
 import { SAV_SEMANTIC_E2E_DRAFT, SAV_SEMANTIC_E2E_THREAD } from "../../test/sav-semantic-e2e-fixture";
 
+test("SAV76 diagnostics are readable directly without opening or replaying the dossier", async ({ request }) => {
+  const response = await request.get(`/api/internal/sav/dossiers/${SAV_SEMANTIC_E2E_THREAD}/diagnostics`);
+  expect(response.status()).toBe(200);
+  expect(response.headers()["cache-control"]).toBe("private, no-store");
+  const data = await response.json();
+  expect(data.runs).toHaveLength(1);
+  expect(data.runs[0]).toMatchObject({ historicalDetailUnavailable: true, proposalReadable: true });
+  expect(JSON.stringify(data)).not.toMatch(/fixture-customer|export PDF|Bonjour/);
+  const denied = await request.get(`/api/internal/sav/dossiers/${SAV_SEMANTIC_E2E_THREAD}/diagnostics`, { headers: { "x-studio-test-user": "stranger@example.invalid" } });
+  expect(denied.status()).toBe(403);
+});
+
 test("SAV44 exposes understanding and persists independent dossier/draft feedback", async ({ page, baseURL }, testInfo) => {
   const externalRequests: string[] = [];
   const browserErrors: string[] = [];

@@ -49,7 +49,8 @@ export function compactSavModelContext(input: {
   const crm = { sourceId: "crm_snapshot", collectedAt: identityMatches ? dossier!.collectedAt : null,
     status: identityMatches ? dossier!.crm.status : "unavailable", errorCode: identityMatches ? dossier!.crm.errorCode : "context_not_confirmed",
     contactFound: identityMatches ? dossier!.crm.data?.contactFound ?? false : false,
-    tickets: [] as Ticket[], ticketsOmitted: 0 };
+    tickets: [] as Ticket[], ticketsOmitted: 0,
+    events: [] as Array<{ sourceId: string; ticketId: string; kind: string; occurredAt: string; text: ReturnType<typeof clipped> }> };
   const history: Array<{ sourceId: string; receivedAt: string; direction: string; text: string; truncated: boolean; originalBytes: number }> = [];
   const payload = { ...critical, crm, history };
   if (identityMatches) {
@@ -69,6 +70,14 @@ export function compactSavModelContext(input: {
     crm.ticketsOmitted = tickets.length - crm.tickets.length;
     if (crm.ticketsOmitted) limitations.push("additional_ticket_candidates_omitted");
     if (dossier!.crm.status !== "ready") limitations.push("crm_incomplete");
+    const crmHistory = dossier!.crm.data?.history;
+    for (const event of (crmHistory?.events ?? []).filter(e => e.ticketId === crmHistory?.relevantTicketId).slice(0, 6)) {
+      const projected = { sourceId: event.sourceId, ticketId: event.ticketId, kind: event.kind, occurredAt: event.occurredAt, text: clipped(event.text, 1000) };
+      if (size({ ...payload, crm: { ...crm, events: [...crm.events, projected] } }) > limits.bytes - 1_000) { limitations.push("crm_history_over_budget"); break; }
+      crm.events.push(projected);
+      if (event.truncated || projected.text.truncated) limitations.push("crm_history_incomplete");
+    }
+    if (crmHistory?.limitations.length) limitations.push("crm_history_incomplete");
     const conversation = dossier!.conversation;
     if (conversation?.senderMatchesCustomer && conversation.currentMessageId === input.current.messageId && dossier!.customerIdentity.kind === "sender") {
       const messages = conversation.messages.filter(message => message.id !== input.current.messageId);
