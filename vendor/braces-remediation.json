@@ -1,0 +1,19 @@
+{
+  "advisory": "https://github.com/advisories/GHSA-vfj7-8cjw-p6xm",
+  "version": "3.0.3",
+  "patchRevision": "screenai.1",
+  "archive": "vendor/braces-3.0.3-screenai.1.tgz",
+  "integrity": "sha512-rTp5jf0TasRU0FCnA+PXKaOduOGeESjmnxk4G6XYbRe5fmyehySt2NLU9xFIbvPL9nrGEX18B2MBxcdXHX+KLA==",
+  "files": {
+    "LICENSE": "35bdd8a44339719441900fb50fbefc5e2dca1ca662cbaed7a687de842c8b70f2",
+    "index.js": "332ea07c7b006361aad12aa994ca75dc1db8e8382b884909e2f38f10b85c88a4",
+    "lib/compile.js": "74d322921d4aca8bb8e53fbfa5337359c8bd636e0663d3a36976bf28b85e48db",
+    "lib/constants.js": "c18ac5adb57308f1ce42a28552da3a31f5d83709743ebd9a636336813a744d4b",
+    "lib/expand.js": "77d8c63b4878dd9996cbdca2c58cd12abb2aa23aad5b3c6534c3f4765e349c0b",
+    "lib/limits.js": "44c7b20dbe5fe115483917ae5d238f9050a4b9aec7fb886d90064c8c52a6fd5c",
+    "lib/parse.js": "080aba1ed967d094f8f451e49f9c8d02225583071fac4c9f6e5b7ce8a0aed060",
+    "lib/stringify.js": "a4ef0a6ecd08db1ef3d4b78c8fa722d1bb2ce992b028cccfcc381a31b7c4b216",
+    "lib/utils.js": "8ae642f0129b1ef2f2c92ecdc3e5ddee2233687ca4a80877407e539f91b5d1aa",
+    "package.json": "56f08b888a4f30dc7cf8a7dbb36ffe92b737912ba36abe9d069d32167c957ac7"
+  }
+}

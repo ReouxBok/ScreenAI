@@ -1,6 +1,26 @@
 # SAV V0 — gate sécurité
 
-## Décision courante — renouvellement limité autorisé le 11 octobre 2026
+## Remédiation locale braces — 17 octobre 2026
+
+La préparation du correctif remplace la tolérance temporelle par une vérification
+technique du paquet réellement installé. Aucun renouvellement de l’échéance.
+`braces@3.0.3` reste identifié comme tel ; le correctif est local, pas officiel.
+Sources MIT, limite de récursion fixe, archives autonomes Studio/proxy et preuves
+d’intégrité sont détaillées dans `vendor/README.md` à la racine du dépôt.
+
+La gate vérifie chaque copie installée et refuse une archive, un lock ou un fichier
+runtime altéré, une copie amont ou une nouvelle alerte. L’avis initial reste visible
+dans les comptes npm bruts et est déclaré remédié uniquement pour les octets
+vérifiés. Aucune exception ne dépend désormais de la date du19octobre.
+
+Ce changement partagé exige les tests Studio/proxy/extension et la CI complète.
+Sa présence dans une PR n’est pas une preuve de déploiement ni une autorisation
+de livraison du proxy/Chrome. Aucun parcours métier ni permission modifié.
+
+Les décisions suivantes décrivent les anciennes tolérances et restent conservées
+pour l’historique ; elles ne prolongent pas une dérogation dans cette version.
+
+## Décision historique — renouvellement limité autorisé le 11 octobre 2026
 
 Ugo autorise explicitement l'exception braces pour livrer le Studio SAV V0 actif,
 jusqu'au **19 octobre 2026 à 00:00 UTC**, sans renouvellement automatique.

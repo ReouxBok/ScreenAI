@@ -3,21 +3,13 @@ import { readFileSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-export const bracesException = Object.freeze({
-  url: 'https://github.com/advisories/GHSA-vfj7-8cjw-p6xm',
-  dependency: 'braces',
-  version: '3.0.3',
-  severity: 'high',
-  reviewedAt: '2026-10-11T00:00:00Z',
-  expiresAt: '2026-10-19T00:00:00Z',
-  owner: 'Ugo Le Bras',
-});
+import { bracesAdvisory, verifyBracesRemediation } from './verify-braces-remediation.mjs';
 
 const severities = new Set(['info', 'low', 'moderate', 'high', 'critical']);
 const blocking = (severity) => severity === 'high' || severity === 'critical';
 
-/** Fail closed: an exception applies to an advisory, never an entire dependency tree. */
-export function evaluateAudit(report, lock, now = new Date()) {
+/** Fail closed: a verified local remediation applies to an advisory, never an entire dependency tree. */
+export function evaluateAudit(report, lock, remediatedLocations = new Set()) {
   if (report?.error || report?.auditReportVersion !== 2 || !report.vulnerabilities
     || typeof report.vulnerabilities !== 'object' || Array.isArray(report.vulnerabilities)
     || !report.metadata?.vulnerabilities || !lock?.packages) {
@@ -44,7 +36,7 @@ export function evaluateAudit(report, lock, now = new Date()) {
     }
   }
   const rejected = new Set();
-  const accepted = new Set();
+  const remediated = new Set();
   const visit = (name, ancestry = new Set()) => {
     if (ancestry.has(name)) throw new Error(`Cyclic blocking audit chain: ${name}`);
     const node = nodes[name];
@@ -55,31 +47,30 @@ export function evaluateAudit(report, lock, now = new Date()) {
         if (blocking(nodes[via].severity)) found = visit(via, next) || found;
       } else if (blocking(via.severity)) {
         found = true;
-        const exceptionMatches = name === 'braces' && via.dependency === bracesException.dependency
-          && via.url === bracesException.url && via.severity === bracesException.severity
+        const corrected = name === 'braces' && via.dependency === 'braces'
+          && via.url === bracesAdvisory && via.severity === 'high'
           && node.severity === 'high' && via.range === '<=3.0.3'
-          && node.nodes.every((location) => lock.packages[location]?.version === bracesException.version)
-          && Number.isFinite(now.getTime())
-          && now >= new Date(bracesException.reviewedAt) && now < new Date(bracesException.expiresAt);
-        (exceptionMatches ? accepted : rejected).add(via.url);
+          && node.nodes.every(location => lock.packages[location]?.version === '3.0.3' && remediatedLocations.has(location));
+        (corrected ? remediated : rejected).add(via.url);
       }
     }
     if (!found) throw new Error(`Blocking audit node has no blocking advisory: ${name}`);
     return found;
   };
   for (const [name, node] of Object.entries(nodes)) if (blocking(node.severity)) visit(name);
-  return { counts, accepted: [...accepted], rejected: [...rejected], ok: rejected.size === 0 };
+  return { counts, remediated: [...remediated], rejected: [...rejected], ok: rejected.size === 0 };
 }
 
-export function runAudit(prefix = '.', now = new Date()) {
+export function runAudit(prefix = '.') {
   const cwd = path.resolve(prefix);
   const audit = spawnSync('npm', ['audit', '--json'], { cwd, encoding: 'utf8', maxBuffer: 16 * 1024 * 1024 });
   if (audit.error || ![0, 1].includes(audit.status)) throw new Error('npm audit could not complete');
   const report = JSON.parse(audit.stdout);
   const lock = JSON.parse(readFileSync(path.join(cwd, 'package-lock.json'), 'utf8'));
-  const result = evaluateAudit(report, lock, now);
+  const verified = verifyBracesRemediation(cwd, lock);
+  const result = evaluateAudit(report, lock, verified);
   console.log(JSON.stringify({ scope: prefix, ...result }, null, 2));
-  if (result.accepted.length) console.warn(`::warning::Temporary braces exception, approved by ${bracesException.owner}; expires ${bracesException.expiresAt}. Vulnerability remains present. See studio/docs/SAV_V0_SECURITY.md.`);
+  console.log(JSON.stringify({ verifiedLocalBracesCopies: verified.size, temporaryExceptions: 0 }));
   if (!result.ok) process.exitCode = 1;
   return result;
 }
