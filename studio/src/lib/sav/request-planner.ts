@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { SavContractValidationError } from "./validation-diagnostics";
 import { renderSavProcedureGroup, savSupportDeliveryProjectionSchema, savDeliveryGroups, savProcedureGroupsSchema } from "@/lib/knowledge/support-delivery";
 import { diagnosticKnowledgeSchema } from "@/lib/knowledge/diagnostic-contract";
 import { savEvidenceContains, normalizeSavEvidenceText } from "./evidence-text";
@@ -6,7 +7,7 @@ import { canonicalSavFactKey, savRequestDomain, type SavActivePlaybook } from ".
 import { savSemanticPlan, type SavUnderstandingV1, type SavReplyCoverage } from "./understanding";
 import type { SavRequestRetrievalResult, SavRequestRetrievalSource } from "./request-retrieval";
 
-export const SAV_REQUEST_PLANNER_REVISION = "sav-request-planner-2026-10-16.v3";
+export const SAV_REQUEST_PLANNER_REVISION = "sav-request-planner-2026-10-17.v4";
 export const savRequestPlanSchema = z.object({
   requestId: z.string(), domain: z.string(), mode: z.enum(["solution", "clarification", "knowledge_gap", "reserved", "provider_failure"]),
   card: z.object({ id: z.string(), versionId: z.string() }).nullable(),
@@ -125,11 +126,11 @@ export function assembleSavPlannedReply(u: SavUnderstandingV1, raw: SavReplyCove
   return u.requests.map(request => {
     const part = raw.find(p => p.requestId === request.id);
     const plan = plans.find(p => p.requestId === request.id);
-    if (!part || !plan) throw new Error("SAV_REQUEST_PLAN_COVERAGE_REQUIRED");
+    if (!part || !plan) throw new SavContractValidationError("SAV_REQUEST_PLAN_COVERAGE_REQUIRED", "request_plan_required", "coverage.requestId");
     // A free-form question cannot bypass the validated question dictionary.
     if (/[?？]/u.test(part.text) || part.sourceIds.some(id => id !== plan.card?.id) || part.repeatedAttemptIds.length)
-      throw new Error("SAV_REPLY_OUTSIDE_REQUEST_PLAN");
-    if (part.kind === "solution" && !plan.nextCheck && !plan.procedures?.length) throw new Error("SAV_REPLY_OUTSIDE_REQUEST_PLAN");
+      throw new SavContractValidationError("SAV_REPLY_OUTSIDE_REQUEST_PLAN", "unplanned_content_or_reference", "coverage");
+    if (part.kind === "solution" && !plan.nextCheck && !plan.procedures?.length) throw new SavContractValidationError("SAV_REPLY_OUTSIDE_REQUEST_PLAN", "solution_without_authorized_step", "coverage.kind");
     // No free-form composition can insert another advice/step outside the selected plan.
     const options = plan.procedures ?? [];
     const selected = options.find(g => g.id === part.procedureGroupId);

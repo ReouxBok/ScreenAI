@@ -23,11 +23,11 @@ describe("SAV understanding provider boundary", () => {
     expect(network).toHaveBeenCalledTimes(status === 429 ? 2 : 1);
     expect(result).toMatchObject({ status: "unavailable", requests: [], primaryRequestId: null, trace: { errorCode: `SAV_AI_HTTP_${status}` } });
   });
-  it.each(["schema", "proof", "json"])("rejects invalid %s without retry", async invalid => {
+  it.each(["schema", "proof", "json"])("rejects invalid %s after at most one contract recovery", async invalid => {
     const content = understandingContent(); content.evidence[0].excerpt = "Une preuve qui n’existe pas.";
     const network = vi.fn<typeof fetch>(async () => invalid === "json" ? new Response("not-json") : geminiFixture(invalid === "schema" ? { version: 2 } : content));
     const result = await understandSavMessage(input, { apiKey: "fixture", fetch: network });
-    expect(network).toHaveBeenCalledTimes(invalid === "proof" ? 2 : 1); expect(result.status).toBe("unavailable");
+    expect(network).toHaveBeenCalledTimes(invalid === "json" ? 1 : 2); expect(result.status).toBe("unavailable");
     expect(result.uncertainties).toContainEqual({ code: "invalid_output", requestIds: [] });
     expect(result.trace.errorCode).toMatch(/INVALID|REPAIR_REJECTED/);
   });
@@ -60,6 +60,16 @@ describe("SAV understanding bounded sources", () => {
     expect(context.sources.filter(s => s.source === "current_message")).toEqual([{ source: "current_message", sourceId: "current_body", text: input.body }]);
     expect(context.sources).toContainEqual(expect.objectContaining({ source: "history", sourceId: "quoted_history" }));
     expect(context.sources).toContainEqual(expect.objectContaining({ source: "history", sourceId: "signature_identity_only" }));
+  });
+  it("keeps selected-ticket notes ahead of long older history and excludes candidate-only notes", () => {
+    const event = { sourceId: "hubspot:notes:1", ticketId: "99", kind: "note" as const, occurredAt: "2026-10-14T00:00:00Z", updatedAt: null, text: "Version déjà confirmée", truncated: false };
+    const context = savUnderstandingSources({ ...input, dossierContext: { version: 1, messageId: "fixture", collectedAt: "2026-10-16T00:00:00Z", customerIdentity: { kind: "sender", email: "fixture@example.invalid" },
+      crm: { status: "ready", errorCode: null, data: { errorCode: null, identityCandidates: [], contactFound: true, contactId: "42", tickets: [], routing: { kind: "new", reason: "fixture", candidateIds: [] }, history: { ticketIds: ["99", "98"], relevantTicketId: "99", limitations: [], events: [event, { ...event, sourceId: "candidate-only", ticketId: "98", text: "Unrelated private note" }] } } },
+      conversation: { threadId: "fixture", currentMessageId: "current", hubspotTicketId: "99", status: "open", aiPaused: false, senderMatchesCustomer: true, messages: Array.from({ length: 10 }, (_, i) => ({ id: `old-${i}`, direction: "inbound", from: "fixture@example.invalid", receivedAt: "2026-10-12T00:00:00Z", text: "a".repeat(16000), truncated: false })), olderSummary: [], historyTruncated: false, attachmentNotice: "Not read" },
+      conversationError: null, otherConversations: [], otherConversationsError: null } });
+    expect(context.sources).toContainEqual(expect.objectContaining({ sourceId: event.sourceId, text: expect.stringContaining(event.text) }));
+    expect(JSON.stringify(context.sources)).not.toContain("Unrelated private note");
+    expect(context.truncated).toBe(true);
   });
   it("enforces the source budget and preserves the explicit truncation signal", async () => {
     const conversation: SavConversation = { threadId: "fixture", currentMessageId: "current", hubspotTicketId: null, status: "open", aiPaused: false, senderMatchesCustomer: true,

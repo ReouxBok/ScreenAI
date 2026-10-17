@@ -45,6 +45,13 @@ describe("SAV mandatory analysis stages", () => {
     expect(() => assertSavAnalysisComplete(output, traces, evidence.map(({ contentVersionId, ...source }) => { void contentVersionId; return source; }), freshKnowledge)).toThrow("SAV_CITATION_VERSION_REQUIRED");
     expect(() => assertSavAnalysisComplete(output, traces, evidence, new Map([["card-1", { ...freshKnowledge.get("card-1")!, verifiedAt: new Date(Date.now() + 86400000).toISOString() }]]))).toThrow("SAV_CITATION_STALE");
   });
+  it.each(["valid", "human_only", "unproven_step", "bad_reference"])("checks the qualified procedure catalog strictly: %s", scenario => {
+    const delivery = { version: 1, mode: "procedure", steps: [{ id: "step-one", userLabel: "Contrôle", instruction: scenario === "unproven_step" ? "Instruction absente" : "Cliquez sur Enregistrer", expectedResult: "", prerequisites: [], exceptions: [], escalation: "" }], groups: [{ id: "procedure", label: "Parcours fictif", requiresHuman: scenario === "human_only", stepIds: [scenario === "bad_reference" ? "unknown-step" : "step-one"], prerequisites: [], exceptions: [], expectedResult: "", escalation: "" }] };
+    const sources = new Map([["card-1", { ...freshKnowledge.get("card-1")!, resolution: { steps: [], delivery } }]]);
+    const check = () => assertSavAnalysisComplete(output, traces, evidence, sources);
+    if (scenario === "valid") expect(check).not.toThrow();
+    else expect(check).toThrow("SAV_CITATION_REQUIRES_RESOLUTION_CARD");
+  });
   it("allows a claim-free acknowledgement without manufacturing a citation", () => {
     expect(() => assertSavAnalysisComplete({ ...output, responseKind: "acknowledgement", replyDraft: "Votre demande est bien reçue.", evidenceIds: [], citations: [] }, traces, [])).not.toThrow();
   });

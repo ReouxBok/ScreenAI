@@ -6,18 +6,24 @@ import type { SavDossierContext } from "./dossier-context";
 import { savInboundContextSchema, type SavInboundContext } from "./message-context";
 import { savUnderstandingSchema, savReplyCoverageSchema, savAiTransportTraceSchema } from "./understanding";
 import { savHumanProcessSchema } from "./human-process";
+import { savValidationDiagnosticSchema } from "./validation-diagnostics";
+
+const savCoherenceTraceSchema = z.object({
+    transport: savAiTransportTraceSchema.optional(),
+    status: z.enum(["passed", "rejected", "unavailable"]), issues: z.array(z.string()),
+    promptRevision: z.string(), model: z.string(), inputHash: z.string(), outputHash: z.string().nullable(),
+    durationMs: z.number().nonnegative(), inputTokens: z.number().nonnegative(), outputTokens: z.number().nonnegative(), totalTokens: z.number().nonnegative(), errorCode: z.string().nullable(),
+  }).strict();
 
 export const savReplyAssessmentSchema = z.object({
   kind: z.enum(["contextualized", "finance_standard", "lead_template", "human_handoff", "unavailable", "forbidden", "none"]),
   coverage: savReplyCoverageSchema,
   harness: savHarnessTraceSchema.optional(),
   errorCode: z.string().nullable(),
-  coherence: z.object({
-    transport: savAiTransportTraceSchema.optional(),
-    status: z.enum(["passed", "rejected", "unavailable"]), issues: z.array(z.string()),
-    promptRevision: z.string(), model: z.string(), inputHash: z.string(), outputHash: z.string().nullable(),
-    durationMs: z.number().nonnegative(), inputTokens: z.number().nonnegative(), outputTokens: z.number().nonnegative(), totalTokens: z.number().nonnegative(), errorCode: z.string().nullable(),
-  }).strict().optional(),
+  recovery: z.object({ strategy: z.literal("investigation"), originalErrorCode: z.string(), validated: z.boolean() }).strict().optional(),
+  validationDiagnostics: z.array(savValidationDiagnosticSchema).max(8).optional(),
+  coherence: savCoherenceTraceSchema.optional(),
+  coherenceAttempts: z.array(savCoherenceTraceSchema).max(2).optional(),
 }).strict();
 export type SavReplyAssessment = z.infer<typeof savReplyAssessmentSchema>;
 

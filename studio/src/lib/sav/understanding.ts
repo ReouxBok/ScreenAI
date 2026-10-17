@@ -1,9 +1,10 @@
 import { z } from "zod";
 import { normalizeSavEvidenceText, savEvidenceContains } from "./evidence-text";
 import { cleanSavModelDraft } from "./reply-format";
+import { SavContractValidationError, savValidationDiagnosticSchema } from "./validation-diagnostics";
 
-export const SAV_UNDERSTANDING_REVISION = "sav-understanding-2026-10-16.v6";
-export const SAV_UNDERSTANDING_PROMPT_REVISION = "sav-understanding-prompt-2026-10-16.v6";
+export const SAV_UNDERSTANDING_REVISION = "sav-understanding-2026-10-17.v7";
+export const SAV_UNDERSTANDING_PROMPT_REVISION = "sav-understanding-prompt-2026-10-17.v7";
 const id = z.string().trim().min(1).max(100);
 const ids = z.array(id).max(30);
 export const savRequestNatureSchema = z.enum(["technical", "account", "integration", "how_to", "financial_operation", "financial_data", "cancellation", "commercial", "partnership", "callback", "human_request", "security", "privacy", "data_deletion", "legal", "acknowledgement", "non_support", "unknown"]);
@@ -38,6 +39,8 @@ export const savUnderstandingSchema = savUnderstandingContentSchema.extend({
     normalizationRevision: z.string().optional(),
     playbookVersionId: z.string().optional(),
     removedKnownQuestions: z.number().int().nonnegative().optional(),
+    validationDiagnostics: z.array(savValidationDiagnosticSchema).max(3).optional(),
+    validationRecovery: z.object({ attempted: z.literal(true), succeeded: z.boolean(), errorCode: z.string().nullable(), transport: savAiTransportTraceSchema.optional() }).strict().optional(),
     validationRepair: z.object({ attempted: z.literal(true), succeeded: z.boolean(), originalErrorCode: z.string(), errorCode: z.string().nullable(), originalOutputHash: z.string(), repairedOutputHash: z.string().nullable(), transport: savAiTransportTraceSchema.optional() }).strict().optional(),
   }).strict(),
 });
@@ -48,8 +51,8 @@ export type SavUnderstandingSource = { source: "current_message" | "history" | "
 const normalize = normalizeSavEvidenceText;
 function unique(values: string[]) { return new Set(values).size === values.length; }
 
-export class SavUnderstandingValidationError extends Error {
-  constructor(public readonly reason: "citation_mismatch" | "invalid_structure" | "source_mismatch") { super("SAV_UNDERSTANDING_INVALID_EVIDENCE"); }
+export class SavUnderstandingValidationError extends SavContractValidationError {
+  constructor(public readonly reason: "citation_mismatch" | "invalid_structure" | "source_mismatch", rule = reason as string, path = "understanding") { super("SAV_UNDERSTANDING_INVALID_EVIDENCE", rule, path); }
 }
 
 /** No model-supplied fact or intent can refer to an invented/quoted-current source. */
@@ -57,41 +60,41 @@ export function validateSavUnderstanding(raw: unknown, sources: SavUnderstanding
   const u = savUnderstandingContentSchema.parse(raw);
   const requestIds = new Set(u.requests.map(r => r.id));
   const evidence = new Map(u.evidence.map(e => [e.id, e]));
-  const fail = (reason: "citation_mismatch" | "invalid_structure" | "source_mismatch" = "invalid_structure") => { throw new SavUnderstandingValidationError(reason); };
-  if (!unique(u.requests.map(r => r.id)) || !unique(u.evidence.map(e => e.id)) || !unique([...u.knownFacts, ...u.attemptedSteps, ...u.missingInformation].map(f => f.id))) fail();
-  if (u.primaryRequestId !== null && !requestIds.has(u.primaryRequestId)) fail();
-  if (u.status === "qualified" && (!u.primaryRequestId || !u.requests.length || u.requests.some(r => r.nature === "unknown") || u.language === "unknown")) fail();
-  if (u.status !== "qualified" && !u.uncertainties.length) fail();
-  if (u.status === "unavailable" && (u.requests.length || u.primaryRequestId)) fail();
+  const fail = (rule: string, path: string, reason: "citation_mismatch" | "invalid_structure" | "source_mismatch" = "invalid_structure") => { throw new SavUnderstandingValidationError(reason, rule, path); };
+  if (!unique(u.requests.map(r => r.id)) || !unique(u.evidence.map(e => e.id)) || !unique([...u.knownFacts, ...u.attemptedSteps, ...u.missingInformation].map(f => f.id))) fail("duplicate_identifier", "identifiers");
+  if (u.primaryRequestId !== null && !requestIds.has(u.primaryRequestId)) fail("primary_request_missing", "primaryRequestId");
+  if (u.status === "qualified" && (!u.primaryRequestId || !u.requests.length || u.requests.some(r => r.nature === "unknown") || u.language === "unknown")) fail("qualified_request_required", "requests");
+  if (u.status !== "qualified" && !u.uncertainties.length) fail("uncertainty_required", "uncertainties");
+  if (u.status === "unavailable" && (u.requests.length || u.primaryRequestId)) fail("unavailable_has_requests", "requests");
   for (const e of u.evidence) {
     const source = sources.find(s => s.source === e.source && s.sourceId === e.sourceId);
-    if (!source) fail("source_mismatch");
-    if (source && !savEvidenceContains(source.text, e.excerpt)) fail("citation_mismatch");
+    if (!source) fail("source_not_found", "evidence.sourceId", "source_mismatch");
+    if (source && !savEvidenceContains(source.text, e.excerpt)) fail("quote_not_in_source", "evidence.excerpt", "citation_mismatch");
   }
   for (const item of [...u.requests, ...u.knownFacts, ...u.attemptedSteps]) {
-    if (item.evidenceIds.some(e => !evidence.has(e))) fail();
-    if ("requestIds" in item && item.requestIds?.some(r => !requestIds.has(r))) fail();
-    if (item.evidenceIds.every(e => evidence.get(e)?.sourceId === "diagnostic_checks")) fail();
+    if (item.evidenceIds.some(e => !evidence.has(e))) fail("unknown_evidence_reference", "evidenceIds");
+    if ("requestIds" in item && item.requestIds?.some(r => !requestIds.has(r))) fail("unknown_request_reference", "requestIds");
+    if (item.evidenceIds.every(e => evidence.get(e)?.sourceId === "diagnostic_checks")) fail("diagnostic_is_not_customer_evidence", "evidenceIds");
   }
-  if (u.customerRelationship && (u.customerRelationship.evidenceIds.some(e => !evidence.has(e)) || (u.customerRelationship.kind !== "unknown" && !u.customerRelationship.evidenceIds.length))) fail();
+  if (u.customerRelationship && (u.customerRelationship.evidenceIds.some(e => !evidence.has(e)) || (u.customerRelationship.kind !== "unknown" && !u.customerRelationship.evidenceIds.length))) fail("relationship_evidence_required", "customerRelationship");
   for (const r of u.requests) {
     // An old demand, CRM record or signature cannot introduce a current request.
-    if (!r.evidenceIds.some(e => evidence.get(e)?.source === "current_message")) fail();
+    if (!r.evidenceIds.some(e => evidence.get(e)?.source === "current_message")) fail("current_request_evidence_required", "requests.evidenceIds");
     const financial = ["financial_operation", "financial_data"].includes(r.nature);
-    if (financial !== (r.financialScope === "support_account")) fail();
+    if (financial !== (r.financialScope === "support_account")) fail("financial_scope_mismatch", "requests.financialScope");
   }
   for (const attempt of u.attemptedSteps) if (attempt.checkId || attempt.checkCardId || attempt.checkVersionId || attempt.outcome === "expected" || attempt.outcome === "not_expected") {
-    if (!attempt.checkId) fail();
+    if (!attempt.checkId) fail("attempt_check_required", "attemptedSteps.checkId");
     const reference = sources.find(source => source.sourceId === "diagnostic_checks" && source.source === "history");
     let checks: Array<{ cardId?: string; id: string; versionId: string }> = [];
     try { checks = z.object({ checks: z.array(z.object({ cardId: z.string().optional(), id: z.string(), versionId: z.string() })) }).parse(JSON.parse(reference?.text ?? "{}")).checks; } catch { /* No validated diagnostic reference is available. */ }
     const referenced = checks.find(check => check.id === attempt.checkId && check.versionId === attempt.checkVersionId);
-    if (!referenced || attempt.checkCardId && referenced.cardId !== attempt.checkCardId) fail();
+    if (!referenced || attempt.checkCardId && referenced.cardId !== attempt.checkCardId) fail("attempt_check_reference_missing", "attemptedSteps.checkVersionId");
     // Scope comes from the server-owned sent-control reference, never a guessed model key.
     if (referenced?.cardId) attempt.checkCardId = referenced.cardId;
-    if (!attempt.evidenceIds.some(id => { const proof = evidence.get(id); const source = sources.find(s => s.sourceId === proof?.sourceId && s.source === proof?.source); return proof?.source === "current_message" || source?.text.startsWith("[inbound]"); })) fail();
+    if (!attempt.evidenceIds.some(id => { const proof = evidence.get(id); const source = sources.find(s => s.sourceId === proof?.sourceId && s.source === proof?.source); return proof?.source === "current_message" || source?.text.startsWith("[inbound]"); })) fail("attempt_customer_evidence_required", "attemptedSteps.evidenceIds");
   }
-  for (const item of [...u.missingInformation, ...u.uncertainties]) if (item.requestIds.some(r => !requestIds.has(r))) fail();
+  for (const item of [...u.missingInformation, ...u.uncertainties]) if (item.requestIds.some(r => !requestIds.has(r))) fail("unknown_scoped_request", "requestIds");
   // Only redundant questions are recoverable locally, after every reference
   // and request has been validated. Never discard a demand or a source.
   u.missingInformation = u.missingInformation.filter(m => !u.knownFacts.some(f => f.key === m.key));
@@ -106,6 +109,56 @@ export function assertSavUnderstandingRepairPreserves(before: SavUnderstandingCo
     missingInformation: u.missingInformation.filter(m => !u.knownFacts.some(f => f.key === m.key)), uncertainties: u.uncertainties,
     evidence: u.evidence.map(e => ({ id: e.id, source: e.source, sourceId: e.sourceId })) });
   if (JSON.stringify(retained(before)) !== JSON.stringify(retained(after))) throw new Error("SAV_UNDERSTANDING_REPAIR_REJECTED");
+}
+
+/** Re-extraction may fix references, never discard/reclassify an extracted request.
+ * Failed candidates have no authority to execute; the whole recovery is validated again. */
+export function assertSavUnderstandingRecoveryPreserves(before: unknown, after: SavUnderstandingContent) {
+  const raw = before && typeof before === "object" ? before as Record<string, unknown> : {};
+  for (const key of ["requests", "knownFacts", "attemptedSteps"] as const) {
+    if (!Array.isArray(raw[key])) throw new SavContractValidationError("SAV_UNDERSTANDING_REPAIR_REJECTED", "original_collection_not_preservable", key);
+  }
+  const signature = (r: Pick<SavUnderstandingContent["requests"][number], "summary" | "nature" | "product" | "feature">) => JSON.stringify([r.summary, r.nature, r.product, r.feature]);
+  const minimalRequest = z.object({ id: z.string().optional(), summary: z.string().min(3).max(600), nature: savRequestNatureSchema,
+    product: z.string().nullable().optional(), feature: z.string().nullable().optional() });
+  const requests = Array.isArray(raw.requests) ? raw.requests.map(r => {
+    const parsed = minimalRequest.safeParse(r);
+    if (!parsed.success) throw new SavContractValidationError("SAV_UNDERSTANDING_REPAIR_REJECTED", "original_request_not_preservable", "requests");
+    return { ...parsed.data, product: parsed.data.product ?? null, feature: parsed.data.feature ?? null };
+  }) : [];
+  const remaining = after.requests.map(signature);
+  for (const request of requests) {
+    const i = remaining.indexOf(signature(request));
+    if (i < 0) throw new SavContractValidationError("SAV_UNDERSTANDING_REPAIR_REJECTED", "recovery_changed_request", "requests");
+    remaining.splice(i, 1);
+  }
+  const primary = requests.filter(r => r.id === raw.primaryRequestId);
+  const recoveredPrimary = after.requests.find(r => r.id === after.primaryRequestId);
+  if (primary.length === 1 && (!recoveredPrimary || signature(primary[0]) !== signature(recoveredPrimary)))
+    throw new SavContractValidationError("SAV_UNDERSTANDING_REPAIR_REJECTED", "recovery_changed_primary_request", "primaryRequestId");
+  // Semantic content survives even when its identifiers/evidence references need repair.
+  const scope = (ids: unknown, originals: Array<Pick<typeof requests[number], "id" | "summary" | "nature" | "product" | "feature">>) => {
+    if (!Array.isArray(ids) || !ids.length) return [];
+    return ids.map(id => { const matches = originals.filter(r => r.id === id);
+      if (matches.length !== 1) throw new SavContractValidationError("SAV_UNDERSTANDING_REPAIR_REJECTED", "original_scope_not_preservable", "requestIds");
+      return signature(matches[0]); }).sort();
+  };
+  for (const key of ["knownFacts", "attemptedSteps"] as const) {
+    const original = Array.isArray(raw[key]) ? raw[key] as unknown[] : [];
+    const minimal = z.object({ key: z.string(), text: z.string().min(1), requestIds: z.array(z.string()).optional() });
+    const contents = after[key].map(f => JSON.stringify([f.key, f.text, scope(f.requestIds, after.requests)]));
+    for (const fact of original) {
+      const parsed = minimal.safeParse(fact);
+      if (!parsed.success) throw new SavContractValidationError("SAV_UNDERSTANDING_REPAIR_REJECTED", "original_fact_not_preservable", key);
+      const content = JSON.stringify([parsed.data.key, parsed.data.text, scope(parsed.data.requestIds, requests)]);
+      const index = contents.indexOf(content);
+      if (index < 0) throw new SavContractValidationError("SAV_UNDERSTANDING_REPAIR_REJECTED", "recovery_changed_fact_or_attempt", key);
+      contents.splice(index, 1);
+    }
+  }
+  const relationship = raw.customerRelationship as { kind?: string } | undefined;
+  if (relationship && ["prospect", "existing_customer"].includes(relationship.kind ?? "") && after.customerRelationship?.kind !== relationship.kind)
+    throw new SavContractValidationError("SAV_UNDERSTANDING_REPAIR_REJECTED", "recovery_changed_relationship", "customerRelationship");
 }
 
 export type SavSemanticPlan = {
@@ -148,29 +201,29 @@ export type SavReplyCoverage = z.infer<typeof savReplyCoverageSchema>;
 export function assembleSavReplySections(u: SavUnderstandingV1, raw: unknown) {
   const coverage = savReplyCoverageSchema.parse(savReplyCoverageSchema.parse(raw).map(part => ({ ...part, text: cleanSavModelDraft(part.text) })));
   if (coverage.length !== u.requests.length || !unique(coverage.map(p => p.requestId)) || u.requests.some(r => !coverage.some(p => p.requestId === r.id)))
-    throw new Error("SAV_REPLY_INCONSISTENT_WITH_UNDERSTANDING");
+    throw new SavContractValidationError("SAV_REPLY_INCONSISTENT_WITH_UNDERSTANDING", "request_coverage_mismatch", "coverage");
   const ordered = u.requests.map(r => coverage.find(p => p.requestId === r.id)!);
   const replyDraft = ordered.map(p => p.text).join("\n\n");
-  if (replyDraft.length > 8000) throw new Error("SAV_REPLY_INCONSISTENT_WITH_UNDERSTANDING");
+  if (replyDraft.length > 8000) throw new SavContractValidationError("SAV_REPLY_INCONSISTENT_WITH_UNDERSTANDING", "assembled_reply_too_long", "coverage.text");
   return { coverage: ordered, replyDraft };
 }
 
 /** Structural consistency complements citation checks; semantic accuracy still needs human evaluation. */
 export function assertSavReplyConsistency(u: SavUnderstandingV1, output: { category: string; replyDraft: string; responseKind: string; coverage?: SavReplyCoverage; citations: Array<{ sourceId: string }> }) {
   const plan = savSemanticPlan(u);
-  const fail = () => { throw new Error("SAV_REPLY_INCONSISTENT_WITH_UNDERSTANDING"); };
-  if (plan.replyPolicy !== "compose" || output.category !== plan.category) fail();
+  const fail = (rule: string, path: string) => { throw new SavContractValidationError("SAV_REPLY_INCONSISTENT_WITH_UNDERSTANDING", rule, path); };
+  if (plan.replyPolicy !== "compose" || output.category !== plan.category) fail("policy_category_mismatch", "category");
   const coverage = output.coverage;
-  if (!coverage || coverage.length !== u.requests.length || !unique(coverage.map(c => c.requestId)) || u.requests.some(r => !coverage.some(c => c.requestId === r.id))) fail();
+  if (!coverage || coverage.length !== u.requests.length || !unique(coverage.map(c => c.requestId)) || u.requests.some(r => !coverage.some(c => c.requestId === r.id))) fail("request_coverage_mismatch", "coverage");
   // The draft consists exclusively of assessed sections; no unassessed tail can add promises/advice.
-  if (normalize(output.replyDraft) !== normalize(coverage!.map(c => c.text).join("\n\n"))) fail();
+  if (normalize(output.replyDraft) !== normalize(coverage!.map(c => c.text).join("\n\n"))) fail("unassessed_reply_text", "replyDraft");
   for (const part of coverage!) {
-    if (part.kind === "solution" && (!part.sourceIds.length || output.responseKind !== "solution")) fail();
-    if (part.sourceIds.some(s => !output.citations.some(c => c.sourceId === s))) fail();
-    if (part.kind === "clarification" && !part.missingInformationIds.length) fail();
-    if (part.missingInformationIds.some(m => !u.missingInformation.some(i => i.id === m && i.requestIds.includes(part.requestId)))) fail();
-    if (part.repeatedAttemptIds.some(a => !u.attemptedSteps.some(s => s.id === a))) fail();
-    if (part.repeatedAttemptIds.length && !part.repeatJustification.trim()) fail();
+    if (part.kind === "solution" && (!part.sourceIds.length || output.responseKind !== "solution")) fail("solution_sources_required", "coverage.sourceIds");
+    if (part.sourceIds.some(s => !output.citations.some(c => c.sourceId === s))) fail("citation_for_source_required", "coverage.sourceIds");
+    if (part.kind === "clarification" && !part.missingInformationIds.length) fail("clarification_fact_required", "coverage.missingInformationIds");
+    if (part.missingInformationIds.some(m => !u.missingInformation.some(i => i.id === m && i.requestIds.includes(part.requestId)))) fail("unknown_missing_fact", "coverage.missingInformationIds");
+    if (part.repeatedAttemptIds.some(a => !u.attemptedSteps.some(s => s.id === a))) fail("unknown_attempt", "coverage.repeatedAttemptIds");
+    if (part.repeatedAttemptIds.length && !part.repeatJustification.trim()) fail("repeat_justification_required", "coverage.repeatJustification");
   }
 }
 
