@@ -11,13 +11,18 @@ function installedLocations(cwd) {
   const found = [];
   const visit = modules => {
     if (!existsSync(modules)) return;
+    if (realpathSync(modules) !== modules) throw Error('Linked dependency inventory refused');
     for (const item of readdirSync(modules, { withFileTypes: true })) {
       if (item.name.startsWith('.')) continue;
       const folder = path.join(modules, item.name);
       if (item.name === 'braces') found.push(path.relative(cwd, folder).split(path.sep).join('/'));
+      if (item.isSymbolicLink() && item.name !== 'braces') throw Error('Linked dependency inventory refused');
       if (!item.isDirectory()) continue;
       if (item.name.startsWith('@')) {
-        for (const child of readdirSync(folder)) visit(path.join(folder, child, 'node_modules'));
+        for (const child of readdirSync(folder, { withFileTypes: true })) {
+          if (child.isSymbolicLink()) throw Error('Linked dependency inventory refused');
+          if (child.isDirectory()) visit(path.join(folder, child.name, 'node_modules'));
+        }
       } else visit(path.join(folder, 'node_modules'));
     }
   };

@@ -99,4 +99,12 @@ describe('installed source and archive integrity, independent of audit results',
     symlinkSync(path.join(root, 'vendor/braces'), path.join(cwd, 'node_modules/braces'));
     expect(() => verifyBracesRemediation(cwd, lock)).toThrow('symlink refused');
   });
+  it.each(['other', '@scope/other'])('rejects a linked package parent hiding a nested copy: %s', name => {
+    const { cwd, lock } = installation();
+    const outside = mkdtempSync(path.join(tmpdir(), 'braces-linked-')); temporary.push(outside);
+    cpSync(path.join(root, 'vendor/braces'), path.join(outside, 'node_modules/braces'), { recursive: true });
+    mkdirSync(path.dirname(path.join(cwd, 'node_modules', name)), { recursive: true });
+    symlinkSync(outside, path.join(cwd, 'node_modules', name));
+    expect(() => verifyBracesRemediation(cwd, lock)).toThrow('Linked dependency inventory refused');
+  });
 });

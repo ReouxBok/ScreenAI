@@ -35,6 +35,9 @@ Each directory can be installed independently with `npm ci`.
 installed inventory, verifies tarball integrity, and hashes every runtime source
 file, package metadata and license. Unexpected, missing, symlinked, upstream or
 modified copies fail the gate, even if npm reports no vulnerability.
+Linked dependency parents and linked node_modules trees are also refused rather
+than allowing an uninspected external subtree; npm workspace links would require
+separate qualification before being introduced.
 Only this exact advisory and these verified copies qualify as locally remediated;
 new advisories and audit failures still fail. There is no time-based exception.
 
