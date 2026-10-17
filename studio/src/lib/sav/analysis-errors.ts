@@ -1,5 +1,6 @@
 import { ZodError } from "zod";
 import { SAV_AGENT_TOOL_NAMES } from "./agent/contracts";
+import type { SavValidationDiagnostic } from "./validation-diagnostics";
 
 /** Only application-owned codes may leave a provider boundary; never its body/message. */
 const validationCodes = new Set([
@@ -30,8 +31,11 @@ export function savAnalysisErrorCode(error: unknown) {
 export type SavAnalysisDiagnostic = {
   phase: "knowledge" | "generation";
   errorCode: string;
+  validation?: SavValidationDiagnostic;
+  resolved?: boolean;
 };
 
 export function savPrimaryAnalysisDiagnostic(diagnostics: SavAnalysisDiagnostic[] = []) {
-  return diagnostics.find((item) => item.phase === "generation") ?? diagnostics[0];
+  const active = diagnostics.filter(item => !item.resolved);
+  return active.find((item) => item.phase === "generation") ?? active[0];
 }

@@ -66,10 +66,10 @@ describe("one citation repair, original intents retained", () => {
     expect(result).toMatchObject({ status: "unavailable", trace: { errorCode: "SAV_UNDERSTANDING_REPAIR_REJECTED", validationRepair: { succeeded: false } } });
     expect(network).toHaveBeenCalledTimes(2);
   });
-  it("does not repair duplicated IDs or invented sources", async () => {
+  it("refuses duplicated IDs after at most one contract recovery", async () => {
     const original = broken(); original.requests.push({ ...original.requests[0] });
     const network = vi.fn<typeof fetch>().mockResolvedValue(geminiFixture(original));
     expect(await understandSavMessage(input, { apiKey: "fixture", fetch: network })).toMatchObject({ status: "unavailable", trace: { errorCode: "SAV_UNDERSTANDING_INVALID_EVIDENCE" } });
-    expect(network).toHaveBeenCalledOnce();
+    expect(network).toHaveBeenCalledTimes(2);
   });
 });
