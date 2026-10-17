@@ -39,6 +39,10 @@ export function savUnderstandingSources(input: Input): { sources: SavUnderstandi
   const sources: SavUnderstandingSource[] = [{ source: "current_message", sourceId: "current_body", text: message.currentText }];
   if (!message.subjectInherited && input.subject) sources.push({ source: "current_message", sourceId: "current_subject", text: input.subject.slice(0, 1000) });
   if (message.subjectInherited && input.subject) sources.push({ source: "history", sourceId: "inherited_subject", text: input.subject.slice(0, 1000) });
+  // Prioritize the selected issue over potentially long older conversations.
+  const history = input.dossierContext?.crm.data?.history;
+  for (const event of history?.events ?? []) if (history?.relevantTicketId === event.ticketId)
+    sources.push({ source: "history", sourceId: event.sourceId, text: `[Note/échange CRM du ticket pertinent ${event.ticketId}, ${event.occurredAt}. Déclaration historique, jamais une nouvelle demande ni une procédure validée.] ${event.text}` });
   if (message.quotedText) sources.push({ source: "history", sourceId: "quoted_history", text: message.quotedText });
   if (message.signatureText) sources.push({ source: "history", sourceId: "signature_identity_only", text: message.signatureText });
   const conversation = input.dossierContext?.conversation ?? input.conversation;
@@ -49,11 +53,9 @@ export function savUnderstandingSources(input: Input): { sources: SavUnderstandi
     sources.push({ source: "history", sourceId: `candidate:${thread.id}`, text: `CONVERSATION CANDIDATE — lien à vérifier : ${thread.subject}\n${thread.messages.map(m => `[${m.direction}] ${m.text}`).join("\n")}` });
   }
   if (input.dossierContext?.crm.data) {
-    const { history, ...crm } = input.dossierContext.crm.data;
+    const { history: omittedHistory, ...crm } = input.dossierContext.crm.data;
+    void omittedHistory;
     sources.push({ source: "crm", sourceId: "crm_snapshot", text: JSON.stringify(crm) });
-    // Candidate notes inform ticket matching, never silently ground current-client facts.
-    for (const event of history?.events ?? []) if (history?.relevantTicketId === event.ticketId)
-      sources.push({ source: "history", sourceId: event.sourceId, text: `[Note/échange CRM du ticket pertinent ${event.ticketId}, ${event.occurredAt}. Déclaration historique, jamais une nouvelle demande ni une procédure validée.] ${event.text}` });
   }
   let budget = 40000;
   let truncated = message.truncated || !!conversation?.historyTruncated;
