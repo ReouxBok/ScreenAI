@@ -227,6 +227,20 @@ describe("SAV shared semantic pipeline with synthetic provider outputs", () => {
       expect.objectContaining({ contentVersionId: "card-version-1", claim: "Relever le code", excerpt: second }),
     ]));
   });
+  it("carries a qualified procedure through real retrieval projection, planning and grounding", async () => {
+    const u = understandingFixture(); deps.understand.mockResolvedValue(u);
+    const instruction = "Consultez le panneau de démonstration.";
+    const delivery = { version: 1, mode: "procedure", steps: [{ id: "step-one", userLabel: "Contrôle fictif", instruction, expectedResult: "", prerequisites: [], exceptions: [], escalation: "" }], groups: [{ id: "procedure", label: "Parcours fictif", requiresHuman: false, stepIds: ["step-one"], prerequisites: [], exceptions: [], expectedResult: "", escalation: "" }] };
+    deps.search.mockResolvedValue({ revision: "fixture-kb", results: [{ id: "card", contentVersionId: "version", title: "Procédure fictive", content: instruction, score: .9, verifiedAt: new Date().toISOString(), resolution: { steps: [instruction], delivery } }] });
+    const answer = outputFor(u); answer.responseKind = "solution";
+    answer.coverage[0] = { ...answer.coverage[0], kind: "solution", text: "Un problème est signalé.", sourceIds: ["card"], procedureGroupId: "procedure" };
+    answer.citations = [{ sourceId: "card", claim: "Consulter le panneau", quote: instruction }];
+    const result = await analyzeSavMessage(input, { evaluation: evaluation("off", vi.fn(async () => geminiFixture(answer))) });
+    expect(result.replyDraft).toContain(instruction);
+    expect(result.replyAssessment?.coverage[0].kind).toBe("solution");
+    expect(result.replyAssessment?.recovery).toBeUndefined();
+    expect(result.diagnostics).toEqual([]);
+  });
   it("does not display an ungrounded solution even under human review", async () => {
     const u = understandingFixture(); deps.understand.mockResolvedValue(u); const answer = outputFor(u);
     answer.responseKind = "solution"; answer.coverage[0] = { ...answer.coverage[0], kind: "solution", text: "Cliquez sur un bouton inventé.", sourceIds: ["missing-card"] }; answer.replyDraft = answer.coverage[0].text;

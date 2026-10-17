@@ -1,6 +1,7 @@
 import { beforeAll, afterAll, afterEach, describe, it, expect, vi } from "vitest";
 import { createSavTestDb } from "../../../test/sav-db";
 import { auditLogs, savActions, savAgentRuns, savMailboxes, savMessages, savThreads } from "@/db/schema";
+import { savRollbackCompatibleProposal } from "./proposal-compatibility";
 import { savSemanticE2eProposal } from "../../../test/sav-semantic-e2e-fixture";
 import { encryptSavPayload } from "./crypto";
 import { GET } from "../../app/api/internal/sav/dossiers/[id]/diagnostics/route";
@@ -22,7 +23,7 @@ describe("read-only dossier diagnostic endpoint", () => {
     const diagnostic = { phase: "composition" as const, rule: "request_coverage_mismatch", path: "coverage", candidateHash: "fixture-hash", shape: { requests: 1, evidence: 0, knownFacts: 0, attemptedSteps: 0, coverage: 0, citations: 0 } };
     proposal.replyAssessment!.validationDiagnostics = [diagnostic];
     proposal.replyAssessment!.recovery = { strategy: "investigation", originalErrorCode: "SAV_REPLY_INCONSISTENT_WITH_UNDERSTANDING", validated: true };
-    await fixture.db.insert(savAgentRuns).values({ messageId: m.id, runtime: "fixture", mode: "off", status: "succeeded", model: "fixture", promptRevision: "fixture", inputHash: "fixture", proposalCiphertext: encryptSavPayload(proposal) });
+    await fixture.db.insert(savAgentRuns).values({ messageId: m.id, runtime: "fixture", mode: "off", status: "succeeded", model: "fixture", promptRevision: "fixture", inputHash: "fixture", proposalCiphertext: encryptSavPayload(savRollbackCompatibleProposal(proposal)), toolTrace: [{ sequence: 1, name: "sav_validation_outcome", status: "succeeded", durationMs: 0, resultSummary: { validationDiagnostics: [diagnostic], recovery: proposal.replyAssessment!.recovery, coherenceAttempts: [] } }] });
     const response = await GET(new Request("https://example.invalid/diagnostic"), { params: Promise.resolve({ id: thread.id }) });
     expect(response.status).toBe(200); expect(response.headers.get("cache-control")).toBe("private, no-store");
     const data = await response.json(); expect(data.runs).toHaveLength(2); expect(data.runs.some((r: { historicalDetailUnavailable: boolean }) => r.historicalDetailUnavailable)).toBe(true);

@@ -1,3 +1,4 @@
+import { savRollbackCompatibleProposal } from "./proposal-compatibility";
 import { addSavInvestigationQuestions, buildSavInvestigationReply } from "./investigation";
 import { savValidationDiagnostic } from "./validation-diagnostics-server";
 import { readActiveSavPlaybook } from "./playbook";
@@ -593,7 +594,9 @@ async function analyzeSavMessageWithinBudget(input: SavEnrichedInput, context: S
     analysis.replyDraft = null;
     analysis.ticketRouting = { kind: "review", reason: "forwarded_customer_unresolved", candidateIds: [] };
   }
-  analysis.structuredProposal = buildSavStructuredProposal(enriched, analysis);
+  const validationOutcome = { validationDiagnostics: [...(analysis.understanding?.trace.validationDiagnostics ?? []), ...(analysis.replyAssessment?.validationDiagnostics ?? [])],
+    understandingRecovery: analysis.understanding?.trace.validationRecovery ?? null, recovery: analysis.replyAssessment?.recovery ?? null, coherenceAttempts: analysis.replyAssessment?.coherenceAttempts ?? [] };
+  analysis.structuredProposal = savRollbackCompatibleProposal(buildSavStructuredProposal(enriched, analysis));
   if (context.messageId) {
     if (!analysis.agentRunId) throw new Error("SAV_ANALYSIS_TRACE_REQUIRED");
     const coherence = analysis.replyAssessment?.coherence;
@@ -601,6 +604,7 @@ async function analyzeSavMessageWithinBudget(input: SavEnrichedInput, context: S
     const diagnostic = savPrimaryAnalysisDiagnostic(analysis.diagnostics);
     await requireDb().update(savAgentRuns).set({ knowledgeRevision: analysis.structuredProposal.knowledgeRevision,
       proposalCiphertext: encryptSavPayload(analysis.structuredProposal), decisionKind: analysis.proposal.kind,
+      toolTrace: sql`${savAgentRuns.toolTrace} || jsonb_build_array(jsonb_build_object('sequence', jsonb_array_length(${savAgentRuns.toolTrace}) + 1, 'name', 'sav_validation_outcome', 'status', 'succeeded', 'durationMs', 0, 'resultSummary', ${JSON.stringify(validationOutcome)}::jsonb))`,
       confidence: analysis.proposal.confidence, evidence: analysis.evidence,
       outputHash: savContentHash(analysis.structuredProposal),
       ...(diagnostic ? { status: "fallback", errorCode: diagnostic.errorCode } : analysis.replyAssessment?.recovery?.validated ? { status: "succeeded", errorCode: null } : {}),

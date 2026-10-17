@@ -41,6 +41,7 @@ function mockIntegrations(mode: "create" | "timeout" | "existing" | "unknown" | 
     const stages = ["1", "2", "3", "4"].map((id) => ({ id, metadata: { isClosed: id === "4", ticketState: id === "4" ? "CLOSED" : "OPEN" } }));
     if (url.endsWith("/pipelines/tickets/0")) return Response.json({ id: "0", stages });
     if (url.endsWith("/pipelines/tickets")) return Response.json({ results: [{ id: "0", stages }] });
+    if (/\/tickets\/\d+\/associations\/(?:notes|emails)\?/.test(url)) return Response.json({ results: [] });
     if (url.endsWith("/contacts/search")) return Response.json({ results: mode === "unknown" ? [] : [{ id: "21", properties: { email: "client@example.com" } }] });
     if (url.endsWith("/tickets/search")) return Response.json({ results: ["existing", "different"].includes(mode) ? [{ id: "401", properties: { subject: mode === "different" ? "Intégration Slack impossible" : "Retrouver les factures", hs_pipeline: "0", hs_pipeline_stage: "1", hs_lastmodifieddate: new Date().toISOString() } }] : [] });
     if (url.endsWith("/objects/emails") && init?.method === "POST") return Response.json({ id: "501", properties: {} });

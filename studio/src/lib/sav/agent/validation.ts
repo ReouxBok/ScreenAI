@@ -1,3 +1,4 @@
+import { savSupportDeliveryProjectionSchema } from "@/lib/knowledge/support-delivery";
 import { SavContractValidationError } from "../validation-diagnostics";
 import { savEvidenceContains } from "../evidence-text";
 import type { SavAgentToolTrace, SavDecisionEvidence } from "@/db/schema";
@@ -35,7 +36,10 @@ export function assertSavGrounding(
     const source = knowledgeById.get(citation.sourceId);
     if (!source) throw new Error("SAV_CITATION_MUST_USE_KNOWLEDGE");
     if (!evidence.some(e => e.sourceType === "knowledge" && e.sourceId === citation.sourceId && e.contentVersionId)) throw new Error("SAV_CITATION_VERSION_REQUIRED");
-    if (output.responseKind === "solution" && (!source.resolution || !Array.isArray(source.resolution.steps) || !source.resolution.steps.length)) throw new Error("SAV_CITATION_REQUIRES_RESOLUTION_CARD");
+    const delivery = savSupportDeliveryProjectionSchema.safeParse(source.resolution?.delivery);
+    const qualifiedProcedure = delivery.success && delivery.data.mode === "procedure" && delivery.data.groups.some(group => !group.requiresHuman && group.stepIds.length > 0
+      && group.stepIds.every(id => { const step = delivery.data.steps.find(s => s.id === id); return !!step && savEvidenceContains(source.content, step.instruction); }));
+    if (output.responseKind === "solution" && (!source.resolution || !(Array.isArray(source.resolution.steps) && source.resolution.steps.length) && !qualifiedProcedure)) throw new Error("SAV_CITATION_REQUIRES_RESOLUTION_CARD");
     if (!savEvidenceContains(source.content, citation.quote)) throw new SavContractValidationError("SAV_CITATION_QUOTE_MISMATCH", "quote_not_in_resolution_card", "citations.quote");
     if (source.score < 0.5) throw new Error("SAV_CITATION_RELEVANCE_TOO_LOW");
     if (typeof source.resolution?.validUntil === "string" && source.resolution.validUntil < new Date().toISOString().slice(0, 10)) throw new Error("SAV_CITATION_EXPIRED");
