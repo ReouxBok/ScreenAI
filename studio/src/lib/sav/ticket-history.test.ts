@@ -1,4 +1,4 @@
-import { describe, expect, it, vi } from "vitest";
+import { describe, expect, it } from "vitest";
 import { readSavTicketHistory } from "./ticket-history";
 
 describe("bounded HubSpot investigation history", () => {
