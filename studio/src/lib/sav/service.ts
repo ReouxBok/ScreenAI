@@ -148,10 +148,11 @@ export async function ensureSavMailbox(email: string) {
   return existing;
 }
 
-export async function updateMailboxWatch(email: string, historyId: string, expiration: Date) {
+export async function updateMailboxWatch(email: string, _historyId: string, expiration: Date) {
   const mailbox = await ensureSavMailbox(email);
   const [updated] = await requireDb().update(savMailboxes).set({
-    historyId,
+    // A watch head is not a consumed cursor. Keep the existing cursor (even
+    // null) so renewal cannot skip mail whose notification has not arrived.
     watchExpiration: expiration,
     watchStatus: "active",
     updatedAt: new Date(),
@@ -160,8 +161,10 @@ export async function updateMailboxWatch(email: string, historyId: string, expir
 }
 
 export async function updateMailboxCursor(mailboxId: string, historyId: string) {
+  if (!/^\d{1,100}$/.test(historyId)) throw new Error("GMAIL_HISTORY_ID_INVALID");
   await requireDb().update(savMailboxes).set({ historyId, updatedAt: new Date() })
-    .where(eq(savMailboxes.id, mailboxId));
+    .where(and(eq(savMailboxes.id, mailboxId), or(isNull(savMailboxes.historyId),
+      sql`${savMailboxes.historyId}::numeric < ${historyId}::numeric`)));
 }
 
 async function createDecision(

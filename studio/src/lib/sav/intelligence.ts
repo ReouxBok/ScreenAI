@@ -594,7 +594,10 @@ async function analyzeSavMessageWithinBudget(input: SavEnrichedInput, context: S
     analysis.replyDraft = null;
     analysis.ticketRouting = { kind: "review", reason: "forwarded_customer_unresolved", candidateIds: [] };
   }
-  const validationOutcome = { validationDiagnostics: [...(analysis.understanding?.trace.validationDiagnostics ?? []), ...(analysis.replyAssessment?.validationDiagnostics ?? [])],
+  const validationOutcome = { understandingSummary: analysis.understanding ? { status: analysis.understanding.status, language: analysis.understanding.language,
+    requests: analysis.understanding.requests.length, knownFacts: analysis.understanding.knownFacts.length, attemptedSteps: analysis.understanding.attemptedSteps.length,
+    uncertainties: analysis.understanding.uncertainties.map(u => u.code) } : null,
+    validationDiagnostics: [...(analysis.understanding?.trace.validationDiagnostics ?? []), ...(analysis.replyAssessment?.validationDiagnostics ?? [])],
     understandingRecovery: analysis.understanding?.trace.validationRecovery ?? null, recovery: analysis.replyAssessment?.recovery ?? null, coherenceAttempts: analysis.replyAssessment?.coherenceAttempts ?? [] };
   analysis.structuredProposal = savRollbackCompatibleProposal(buildSavStructuredProposal(enriched, analysis));
   if (context.messageId) {

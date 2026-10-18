@@ -4,6 +4,7 @@ import type { SavRequestPlan } from "./request-planner";
 /** Generic investigation questions are product-independent. They authorize no action,
  * diagnosis, procedure, entitlement or promise. Known keys are deliberately conservative. */
 const questions = [
+  { key: "desired_outcome", aliases: ["desired_outcome", "expected_result", "goal", "objective"], fr: "Pouvez-vous préciser ce que vous souhaitez faire et ce qui vous bloque actuellement ?", en: "Could you clarify what you want to do and what is currently blocking you?" },
   { key: "product_name", aliases: ["product", "product_name", "application", "app_name"], fr: "Sur quel produit et dans quel écran effectuez-vous cette opération ?", en: "In which product and screen are you performing this operation?" },
   { key: "product_version", aliases: ["version", "app_version", "application_version", "limova_version", "platform_version", "product_version"], fr: "Quelle version du produit utilisez-vous actuellement ?", en: "Which version of the product are you currently using?" },
   { key: "reproduction_time", aliases: ["reproduction_time", "last_occurrence", "diagnostic_timestamp", "event_time", "incident_time"], fr: "À quelle date et heure avez-vous constaté le problème pour la dernière fois ?", en: "At what date and time did you last observe the issue?" },
@@ -22,6 +23,7 @@ export function addSavInvestigationQuestions(u: SavUnderstandingV1, plans: SavRe
     if (!missingFacts.length) {
       for (const question of questions) {
         if (missingFacts.length >= Math.min(2, remaining)) break;
+        if (question.key === "desired_outcome" && request.nature !== "unknown") continue;
         if (question.key === "product_name" && request.product) continue;
         if (question.key === "reproduction_time" && !["technical", "integration"].includes(request.nature)) continue;
         if (question.key === "product_version" && (!request.product || !["technical", "integration", "how_to"].includes(request.nature))) continue;

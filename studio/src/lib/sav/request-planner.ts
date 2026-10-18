@@ -7,7 +7,7 @@ import { canonicalSavFactKey, savRequestDomain, type SavActivePlaybook } from ".
 import { savSemanticPlan, type SavUnderstandingV1, type SavReplyCoverage } from "./understanding";
 import type { SavRequestRetrievalResult, SavRequestRetrievalSource } from "./request-retrieval";
 
-export const SAV_REQUEST_PLANNER_REVISION = "sav-request-planner-2026-10-17.v4";
+export const SAV_REQUEST_PLANNER_REVISION = "sav-request-planner-2026-10-18.v5";
 export const savRequestPlanSchema = z.object({
   requestId: z.string(), domain: z.string(), mode: z.enum(["solution", "clarification", "knowledge_gap", "reserved", "provider_failure"]),
   card: z.object({ id: z.string(), versionId: z.string() }).nullable(),
