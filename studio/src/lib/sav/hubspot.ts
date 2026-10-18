@@ -1,4 +1,5 @@
 import "server-only";
+import { assertSavTicketMatchesDispatch } from "./ticket-confirmation";
 import { readSavTicketHistory, type SavTicketHistory } from "./ticket-history";
 import { getSavLearningCutover, recordSavLearningSignal } from "./learning-admission";
 import { processSavLearningResolution } from "./learning-pipeline";
@@ -372,7 +373,34 @@ async function finalizeSavV0TicketAction(action: typeof savActions.$inferSelect)
   let ticket: HubspotRecord;
   if (knownTicketId) {
     // An acknowledged result is resumed, never replaced by another POST.
-    ticket = await hubspotFetch<HubspotRecord>(`/crm/v3/objects/tickets/${encodeURIComponent(knownTicketId)}?properties=subject,hs_pipeline,hs_pipeline_stage`);
+    const identity = resolveSavCustomerIdentity({ fromEmail: latest.fromEmail, body: decryptSavPayload<SavMessageBody>(latest.bodyCiphertext).text });
+    const email = savEffectiveCustomerEmail(proposal, identity);
+    if (!email) throw new Error("SAV_TICKET_ACK_CONTEXT_CHANGED");
+    const contact = await findContactByEmail(email);
+    let expectedContactId: string | undefined, properties: Record<string, string>;
+    if (action.kind === "create_ticket") {
+      const snapshot = typeof action.payload.ticketCreateRequestCiphertext === "string"
+        ? decryptSavPayload<{ actionId: string; reviewId: string; decisionId: string; messageId: string; threadId: string; contactId: string; customerEmail: string; properties: Record<string,string> }>(action.payload.ticketCreateRequestCiphertext) : null;
+      if (snapshot && (snapshot.actionId !== action.id || snapshot.reviewId !== review.id || snapshot.decisionId !== action.decisionId
+        || snapshot.messageId !== latest.id || snapshot.threadId !== thread.id || snapshot.customerEmail !== email)) throw new Error("SAV_TICKET_ACK_CONTEXT_CHANGED");
+      expectedContactId = snapshot?.contactId ?? (proposal.routing.kind === "new" || proposal.routing.kind === "matched" ? proposal.routing.contactId ?? undefined : undefined);
+      properties = snapshot?.properties ?? savReviewedTicketProperties(proposal);
+      if (!snapshot && returnRequest?.operation === "create") {
+        if (!returnRequest.ownerId) throw new Error("SAV_TICKET_ACK_CONTEXT_CHANGED");
+        properties.hubspot_owner_id = returnRequest.ownerId;
+      }
+    } else {
+      const snapshot = typeof action.payload.ticketReturnRequestCiphertext === "string"
+        ? decryptSavPayload<{ ticketId: string; contactId: string; expectedOwnerId: string; sourceMessageId?: string }>(action.payload.ticketReturnRequestCiphertext) : null;
+      if (!snapshot || !action.payload.ticketReturnCompletedAt || snapshot.ticketId !== knownTicketId || !snapshot.expectedOwnerId
+        || snapshot.sourceMessageId !== latest.id) throw new Error("SAV_TICKET_ACK_CONTEXT_CHANGED");
+      expectedContactId = snapshot.contactId;
+      properties = { hs_pipeline_stage: SAV_HUBSPOT_SUPPORT.stages.new, hubspot_owner_id: snapshot.expectedOwnerId };
+    }
+    if (!expectedContactId || !contact || contact.id !== expectedContactId) throw new Error("SAV_TICKET_ACK_CONTEXT_CHANGED");
+    const fields = [...new Set(["subject", "hs_pipeline", ...Object.keys(properties)])].join(",");
+    ticket = await hubspotFetch<HubspotRecord>(`/crm/v3/objects/tickets/${encodeURIComponent(knownTicketId)}?properties=${fields}&associations=contacts`);
+    assertSavTicketMatchesDispatch(ticket, { ticketId: knownTicketId, contactId: expectedContactId, properties });
   } else {
     await assertSavGmailThreadCurrent(mailbox.email, thread.gmailThreadId, latest.gmailMessageId);
     const customerMessage = resolveSavCustomerMessage({ fromEmail: latest.fromEmail, subject: latest.subject, body: decryptSavPayload<SavMessageBody>(latest.bodyCiphertext).text });

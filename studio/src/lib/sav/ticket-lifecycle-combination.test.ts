@@ -389,3 +389,31 @@ it("SAV49 denied patch after an acknowledged note remains uncertain and never re
   await expect(retrySavAction(action.id, "ugo@limova.ai")).rejects.toThrow("SAV_TICKET_RETURN_RECONCILIATION_REQUIRED");
   await processPendingHubspotActions(1, action.id); expect(mutations(network)).toHaveLength(count);
 });
+
+it.each(["nominal", "owner", "stage", "contact"])("SAV49 verifies a previously acknowledged return during local recovery: %s", async field => {
+  const { network, action } = await prepare("reactivate");
+  await processPendingHubspotActions(1, action.id);
+  await fixture.db.update(savActions).set({ status: "failed", errorCode: "LOCAL_FAILURE" }).where(eq(savActions.id, action.id));
+  await fixture.db.update(savThreads).set({ hubspotTicketId: null }).where(eq(savThreads.id, threadId));
+  await retrySavAction(action.id, "ugo@limova.ai");
+  if (field === "owner") ownerId = "72";
+  if (field === "stage") stage = "3";
+  vi.stubGlobal("fetch", async (url: string, init?: RequestInit) => {
+    const response = await network(url, init);
+    if (field !== "contact" || !url.includes("/objects/tickets/401?")) return response;
+    const ticket = await response.json(); ticket.associations.contacts.results = [{ id: "22" }];
+    return Response.json(ticket);
+  });
+  const count = mutations(network).length;
+  expect((await processPendingHubspotActions(1, action.id)).processed[0]).toMatchObject(field === "nominal"
+    ? { status: "succeeded" } : { status: "failed", errorCode: "SAV_TICKET_ACK_CONTEXT_CHANGED" });
+  expect((await fixture.db.select().from(savThreads).where(eq(savThreads.id, threadId)))[0].hubspotTicketId).toBe(field === "nominal" ? "401" : null);
+  expect(mutations(network)).toHaveLength(count);
+  if (field === "owner") {
+    await expect(retrySavAction(action.id, "ugo@limova.ai")).rejects.toThrow("SAV_TICKET_ACK_CONTEXT_CHANGED");
+    ownerId = "71";
+    await reconcileSavTicketReturn(action.id, "501", "ugo@limova.ai");
+    expect(mutations(network)).toHaveLength(count);
+    expect((await fixture.db.select().from(savActions).where(eq(savActions.id, action.id)))[0].status).toBe("succeeded");
+  }
+});

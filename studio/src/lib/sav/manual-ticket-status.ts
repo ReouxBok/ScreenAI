@@ -1,5 +1,6 @@
 /** Safe user-facing diagnostics: never echo provider text or payload content. */
 export function savManualTicketError(code: string | null): string {
+  if (code === "SAV_TICKET_ACK_CONTEXT_CHANGED") return "Le ticket déjà acquitté ne correspond plus à la fiche, au pipeline ou aux champs attendus. Vérifiez ce ticket dans HubSpot puis confirmez son rapprochement ci-dessous. Aucun nouveau ticket ne sera créé.";
   if (code === "SAV_TICKET_RETURN_CONTEXT_CHANGED") return "Le ticket ou sa clôture a changé. Actualisez le contexte et confirmez de nouveau l’action proposée.";
   if (code === "SAV_TICKET_RETURN_EMAIL_TOO_LARGE") return "L’email dépasse la taille autorisée pour une note. Ajoutez-le manuellement dans HubSpot.";
   if (code === "SAV_TICKET_RETURN_RECONCILIATION_REQUIRED") return "La note ou la réouverture a peut-être abouti. Vérifiez le ticket dans HubSpot ; aucune nouvelle tentative automatique.";

@@ -33,7 +33,7 @@ try {
     await db.insert(savThreads).values({ id: threadId, mailboxId: mailbox.id, gmailThreadId: `journey-${key}`, subject: `Recette ${key} export PDF`, customerEmail: email, hubspotTicketId: ["create", "link"].includes(key) ? null : ticketId, lastMessageAt: new Date(receivedAt) });
     await db.insert(savMessages).values({ id: messageId, mailboxId: mailbox.id, threadId, gmailMessageId: `journey-message-${key}`, direction: "inbound", fromEmail: email, toEmails: [mailbox.email], subject: `Recette ${key} export PDF`, bodyCiphertext: encrypted({ text: SAV_SEMANTIC_E2E_BODY, headers: { "message-id": `<journey-${key}@example.invalid>` }, supportContext: context }), receivedAt: new Date(receivedAt), analysisStatus: "done", processedAt: new Date(receivedAt) });
     const [run] = await db.insert(savAgentRuns).values({ messageId, runtime: "synthetic_fixture", mode: "off", status: "succeeded", model: "synthetic-only", promptRevision: "synthetic-only", dataOrigin: "test", inputHash: "fixture", proposalCiphertext: encrypted(proposal), completedAt: new Date(receivedAt) }).returning();
-    await db.insert(savDecisions).values({ messageId, agentRunId: run.id, kind: proposal.decision.kind, reasonCode: proposal.decision.reasonCode, explanation: proposal.decision.explanation, confidence: 0 });
+    await db.insert(savDecisions).values({ messageId, agentRunId: run.id, kind: "human_review_required", reasonCode: proposal.decision.reasonCode, explanation: proposal.decision.explanation, confidence: 0 });
   }
   writeFileSync(path.resolve(".e2e-journey-provider.json"), JSON.stringify(remote));
   writeFileSync(path.resolve(".e2e-journey-blocked.log"), "");

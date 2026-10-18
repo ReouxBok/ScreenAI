@@ -117,3 +117,12 @@ it.each(["ticket_done", "ticket_queued", "ticket_processing_deferred"])("SAV49 %
   expect(html).not.toContain("le worker planifié la reprendra");
   expect(html).toContain("proposition validée a changé");
 });
+
+it("SAV49 acknowledges the known ID but requires reconciliation after remote context changes", async () => {
+  const html = await render({ actions: [{ ...action, status: "failed", errorCode: "SAV_TICKET_ACK_CONTEXT_CHANGED", payload: { hubspotTicketId: "301", ticketCreateDispatchedAt: "fixture" } }] });
+  expect(html).toContain("ticket déjà acquitté");
+  expect(html).toContain("Vérifier et rapprocher ce ticket existant");
+  expect(html).toContain('name="ticketId"'); expect(html).toContain('value="301"');
+  expect(html).not.toContain(">Réessayer<");
+  expect(html).toMatch(/<button[^>]*disabled=""[^>]*>Préparer l’aperçu de l’action/);
+});

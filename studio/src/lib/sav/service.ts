@@ -1359,6 +1359,7 @@ export async function retrySavAction(actionId: string, actorEmail: string) {
   const [current] = await db.select().from(savActions).where(eq(savActions.id, actionId)).limit(1);
   if (current?.errorCode === "SAV_PROPOSAL_STALE" || current?.errorCode === "SAV_REVIEW_STALE") throw new Error(current.errorCode);
   if (current?.payload.purpose === "partnership_forward") throw new Error(current.payload.forwardDispatchedAt ? "SAV_PARTNERSHIP_RECONCILIATION_REQUIRED" : "SAV_PARTNERSHIP_CONFIRMATION_REQUIRED");
+  if (current?.errorCode === "SAV_TICKET_ACK_CONTEXT_CHANGED") throw new Error(current.errorCode);
   if (current?.errorCode?.startsWith("SAV_TICKET_PREVIEW_")) throw new Error("SAV_TICKET_PREVIEW_CHANGED");
   if (current?.payload.ticketReturnDispatchedAt && !current.payload.ticketReturnCompletedAt) throw new Error("SAV_TICKET_RETURN_RECONCILIATION_REQUIRED");
   if ((current?.errorCode === "SAV_MANUAL_RECONCILIATION_REQUIRED" || current?.payload.ticketCreateDispatchedAt) && !current?.payload.hubspotTicketId) throw new Error("SAV_MANUAL_RECONCILIATION_REQUIRED");
