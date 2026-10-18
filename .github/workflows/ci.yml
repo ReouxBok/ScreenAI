@@ -25,6 +25,7 @@ jobs:
       - run: npm ci
       - run: npm ci --prefix proxy
       - run: npm ci --prefix studio
+      - run: node scripts/package-braces-remediation.mjs --check
       - run: node scripts/audit-dependencies.mjs
       - run: node scripts/audit-dependencies.mjs proxy
       - run: node scripts/audit-dependencies.mjs studio
