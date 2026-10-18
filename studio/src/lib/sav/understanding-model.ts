@@ -159,7 +159,10 @@ async function understandWithinBudget(input: Input, options: Options): Promise<S
       }
     }
     const initial = savUnderstandingContentSchema.safeParse(generated.json);
-    removedKnownQuestions = initial.success ? initial.data.missingInformation.length - content.missingInformation.length : 0;
+    // A second reading can add questions. Count only redundant questions from
+    // the original output, never a delta between two different extractions.
+    removedKnownQuestions = initial.success ? initial.data.missingInformation.filter(question =>
+      initial.data.knownFacts.some(fact => fact.key === question.key)).length : 0;
     for (const code of [context.truncated ? "truncated_context" : null, context.missingContext ? "missing_context" : null] as const) {
       if (code && !content.uncertainties.some(u => u.code === code)) content.uncertainties.push({ code, requestIds: [] });
     }

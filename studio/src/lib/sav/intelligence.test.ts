@@ -56,6 +56,7 @@ describe("SAV shared semantic pipeline with synthetic provider outputs", () => {
     const u = understandingFixture({ status: "needs_clarification", language, uncertainties: [{ code: "ambiguous_intent", requestIds: ["request-1"] }] });
     u.requests[0] = { ...u.requests[0], summary: body, nature: "unknown", product: null, feature: null };
     u.evidence[0].excerpt = body;
+    u.missingInformation = [{ id: "question", key: "desired_outcome", text: language === "en" ? "What do you want to achieve?" : "Quel résultat souhaitez-vous obtenir ?", requestIds: ["request-1"] }];
     const network = vi.fn<typeof fetch>().mockResolvedValueOnce(geminiFixture(empty))
       .mockResolvedValueOnce(geminiFixture(understandingContent(u))).mockResolvedValueOnce(geminiFixture(outputFor(u)));
     const result = await analyzeSavMessage({ from: "fixture@example.invalid", subject: "Support", body }, { evaluation: evaluation("off", network) });

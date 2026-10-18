@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import { understandSavMessage } from "./understanding-model";
 import { repairSavUnderstandingRepresentation, retainSavUnderstandingProse } from "./understanding-representation";
-import { assertSavUnderstandingRecoveryPreserves, savSemanticPlan, validateSavUnderstanding } from "./understanding";
+import { assertSavUnderstandingRecoveryPreserves, savSemanticPlan, validateSavUnderstanding, savUnderstandingSchema } from "./understanding";
 import { addSavInvestigationQuestions, buildSavInvestigationReply } from "./investigation";
 import { geminiFixture, understandingContent } from "../../../test/sav-understanding-fixtures";
 import type { SavRequestPlan } from "./request-planner";
@@ -72,9 +72,11 @@ describe("one bounded second reading before clarification", () => {
   it("recovers a current, evidenced but ambiguous demand into concrete investigation questions", async () => {
     const clarified = understandingContent(); clarified.status = "needs_clarification"; clarified.requests[0].nature = "unknown";
     clarified.uncertainties = [{ code: "ambiguous_intent", requestIds: ["request-1"] }];
+    clarified.missingInformation = [{ id: "question", key: "desired_outcome", text: "Quel résultat souhaitez-vous obtenir ?", requestIds: ["request-1"] }];
     const network = vi.fn<typeof fetch>().mockResolvedValueOnce(geminiFixture(empty())).mockResolvedValueOnce(geminiFixture(clarified));
     const result = await understandSavMessage(input, { apiKey: "fixture", fetch: network });
     expect(network).toHaveBeenCalledTimes(2); expect(result.trace.validationRecovery?.succeeded).toBe(true);
+    expect(result.trace.removedKnownQuestions).toBe(0); expect(() => savUnderstandingSchema.parse(result)).not.toThrow();
     expect(savSemanticPlan(result).replyPolicy).toBe("compose");
     const plans = addSavInvestigationQuestions(result, [plan]);
     result.missingInformation = plans.flatMap(p => p.missingFacts.map(f => ({ id: f.id, key: f.key, text: f.question, requestIds: [p.requestId] })));
