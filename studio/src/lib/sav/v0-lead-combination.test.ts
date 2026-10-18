@@ -12,6 +12,7 @@ import { getSavProposalReview, reviewSavProposal } from "./review";
 import { syncSavObservation } from "./observations";
 import type { SavStructuredProposal } from "./proposal";
 import { decisionKindSchema } from "./policy";
+import { renderSavOutboundReply } from "./reply-format";
 
 import { understandingFixture } from "../../../test/sav-understanding-fixtures";
 
@@ -100,7 +101,8 @@ describe("Combined SAV-38/39/40 V0 contracts with a sourced fictitious lead draf
     const draftText = decryptSavPayload<{ text: string }>(String(action.payload.bodyCiphertext)).text;
     const outbound = decryptSavPayload<{ text: string }>(String(action.payload.outboundBodyCiphertext)).text;
     expect(draftText).toBe(template); expect(outbound.startsWith(template)).toBe(true);
-    expect(outbound.match(/Charly/g)).toHaveLength(1);
+    expect(outbound).toBe(renderSavOutboundReply(template, "fr", "manual_reviewed"));
+    expect(outbound.match(/L’équipe Limova/g)).toHaveLength(1);
     expect(await fixture.db.select().from(savActions)).toHaveLength(1);
     expect(action).toMatchObject({ kind: "send_reply", actorType: "human", status: "pending" });
     expect(denyNetwork).not.toHaveBeenCalled();

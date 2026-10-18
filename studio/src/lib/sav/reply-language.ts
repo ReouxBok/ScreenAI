@@ -11,4 +11,3 @@ export function savReplyLanguage(proposal: SavStructuredProposal, body: string) 
   const french = (current.match(/\b(?:bonjour|merci|mon|mes|je|vous|pour|souhaite|facture|abonnement|compte|disponible)\b/gi) ?? []).length;
   return english > french ? "en" : french > 0 ? "fr" : "unknown";
 }
-

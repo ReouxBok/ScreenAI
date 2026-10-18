@@ -8,7 +8,11 @@ export const SAV_EMAIL_WRITING_SKILL = `Écris un email professionnel, chaleureu
 /** Greeting and closing are part of assessed coverage, not an unchecked tail. */
 export function styleSavEmailCoverage(u: SavUnderstandingV1, coverage: SavReplyCoverage): SavReplyCoverage {
   if (!coverage.length) return coverage;
-  const result = coverage.map(part => ({ ...part }));
+  // Strip only standalone, recognized courtesy lines at section boundaries.
+  // Verified instructions inside a section are never rewritten.
+  const result = coverage.map(part => ({ ...part, text: part.text.trim()
+    .replace(/^(?:(?:bonjour|bonsoir|hello|hi)[,.!]?\s*(?:\r?\n|$)\s*)+/iu, "")
+    .replace(/(?:^|\r?\n)\s*(?:bien à vous|cordialement|kind regards|best regards|regards)[,.!]?\s*$/iu, "").trim() }));
   const greeting = u.language === "en" ? "Hello," : "Bonjour,";
   const closing = u.language === "en" ? "Kind regards," : "Bien à vous,";
   if (!/^(?:bonjour|bonsoir|hello|hi|dear)\b/iu.test(result[0].text.trim())) result[0].text = `${greeting}\n\n${result[0].text.trim()}`;

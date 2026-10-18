@@ -25,6 +25,19 @@ describe("independent writing skill within assessed coverage", () => {
     expect(result.replyDraft).toContain(parts[0].text);expect(result.coverage.map(p=>p.requestId)).toEqual(u.requests.map(r=>r.id));
     expect(()=>assertSavReplyConsistency(u,{...result,replyDraft:result.replyDraft+"\nPromesse ajoutée",category:"technical",responseKind:"handoff",citations:[]})).toThrow();
   });
+  it.each(["fr", "en"] as const)("normalizes already formatted %s sections without changing verified instructions", language => {
+    const u = understandingFixture({ language }); u.requests.push({ ...u.requests[0], id: "second" });
+    const greeting = language === "en" ? "Hello," : "Bonjour,";
+    const closing = language === "en" ? "Kind regards," : "Cordialement,";
+    const parts = coverageFixture(u).map((part, i) => ({ ...part, text: `${greeting}\n\nInstruction vérifiée ${i + 1}.\n\n${closing}` }));
+    const result = assembleSavReplySections(u, styleSavEmailCoverage(u, parts));
+    expect(result.replyDraft.split(greeting)).toHaveLength(2);
+    expect(result.replyDraft.match(/Bien à vous,|Kind regards,/g)).toHaveLength(1);
+    expect(result.replyDraft).toContain("Instruction vérifiée 1.");
+    expect(result.replyDraft).toContain("Instruction vérifiée 2.");
+    expect(styleSavEmailCoverage(u, result.coverage)).toEqual(result.coverage);
+    expect(() => assertSavReplyConsistency(u, { ...result, category: "technical", responseKind: "handoff", citations: [] })).not.toThrow();
+  });
 });
 describe("summarized ticket titles",()=>{
  it("uses the analyzed nominal subject rather than email or summary prefixes",()=>{

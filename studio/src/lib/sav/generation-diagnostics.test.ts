@@ -119,7 +119,9 @@ describe("SAV generation diagnostics on isolated PostgreSQL", () => {
     successfulGeneration();
     const analysis = await analyzeSavMessage(input, { messageId });
     expect(network).toHaveBeenCalledTimes(3);
-    expect(analysis.replyDraft).toContain(input.body);
+    expect(analysis.understanding?.requests[0].summary).toBe(input.body);
+    expect(analysis.replyDraft).toMatch(/^Bonjour,/);
+    expect(analysis.replyDraft).toMatch(/Bien à vous,$/);
     expect(analysis.replyDraft).toContain("Sur quel produit");
     expect(analysis.replyAssessment?.coherence?.status).toBe("passed");
     expect(analysis.proposal).toMatchObject({ kind: "human_review_required", requiresHumanApproval: true });
