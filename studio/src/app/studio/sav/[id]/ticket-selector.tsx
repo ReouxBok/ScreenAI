@@ -42,12 +42,12 @@ export function TicketSelector({ threadId, reviewId, tickets, linkedTicketId, su
     void poll();return () => { stopped=true;controller.abort();clearTimeout(timer); };
   },[execution,pending,completed,threadId,router]);
   const filtered = sortSavTicketsNewestFirst(tickets).filter(ticket => `${ticket.subject} ${ticket.id} ${ticket.ownerId ?? ""} ${ticket.ownerName ?? ""}`.toLocaleLowerCase("fr").includes(query.toLocaleLowerCase("fr")));
-  const disabled = !reviewId || !crmReady || completed || pending || Boolean(execution) || Boolean(blockedReason);
+  const disabled = !reviewId || !crmReady || completed || pending || Boolean(execution && execution !== "failed") || Boolean(blockedReason);
   function choose(value: string) { setSelected(value); setPreview(null); setError(null); }
   function prepare() {
     if (!reviewId) return;
     startTransition(async () => {
-      setError(null); setPreview(null);
+      setError(null); setPreview(null); setExecution(null);
       try {
         const result = await prepareTicketPreviewAction({ threadId, reviewId, ...(selected === "new" ? {} : { ticketId: selected }), distinctIssueReason: reason });
         setError(result.error); setPreview(result.preview);
