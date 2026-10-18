@@ -53,7 +53,8 @@
     "react-dom": "19.2.8",
     "server-only": "^0.0.1",
     "workflow": "^4.8.5",
-    "zod": "^4.4.3"
+    "zod": "^4.4.3",
+    "braces": "file:vendor/braces-3.0.3-screenai.1.tgz"
   },
   "devDependencies": {
     "@electric-sql/pglite": "^0.5.4",
@@ -85,6 +86,7 @@
     "adm-zip": "0.6.1",
     "mariadb": "3.5.4",
     "mysql2": "3.24.3",
-    "tar": "7.5.22"
+    "tar": "7.5.22",
+    "braces": "$braces"
   }
 }

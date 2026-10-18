@@ -16,13 +16,15 @@
     "express": "^5.2.1",
     "express-rate-limit": "^8.2.1",
     "jose": "^6.1.0",
-    "zod": "4.4.3"
+    "zod": "4.4.3",
+    "braces": "file:vendor/braces-3.0.3-screenai.1.tgz"
   },
   "overrides": {
     "@modelcontextprotocol/sdk": "1.31.0",
     "adm-zip": "0.6.1",
     "mariadb": "3.5.4",
     "mysql2": "3.24.3",
-    "tar": "7.5.22"
+    "tar": "7.5.22",
+    "braces": "$braces"
   }
 }
