@@ -1,3 +1,4 @@
+import { styleSavEmailCoverage } from "./email-writing";
 import { assembleSavReplySections, assertSavReplyConsistency, savSemanticPlan, type SavUnderstandingV1, type SavReplyCoverage } from "./understanding";
 import type { SavRequestPlan } from "./request-planner";
 
@@ -47,11 +48,11 @@ export function buildSavInvestigationReply(u: SavUnderstandingV1, plans: SavRequ
     const plan = plans.find(p => p.requestId === request.id);
     const missing = plan?.mode === "reserved" ? [] : plan?.missingFacts ?? [];
     return { requestId: request.id, kind: missing.length ? "clarification" : "acknowledgement",
-      text: [u.language === "en" ? `Your request: ${request.summary}` : `Votre demande : ${request.summary}`, ...missing.map(f => f.question)].join("\n\n"),
+      text: [...(u.requests.length > 1 ? [request.summary] : []), u.language === "en" ? "To move forward, I need a few details:" : "Pour avancer, j’ai besoin de quelques précisions :", ...missing.map(f => f.question)].join("\n\n"),
       sourceIds: [], missingInformationIds: missing.map(f => f.id), repeatedAttemptIds: [], repeatJustification: "" };
   });
   if (!coverage.some(p => p.kind === "clarification")) throw new Error("SAV_INVESTIGATION_QUESTION_UNAVAILABLE");
-  const assembled = assembleSavReplySections(u, coverage);
+  const assembled = assembleSavReplySections(u, styleSavEmailCoverage(u, coverage));
   const output = { ...assembled, category: policy.category, responseKind: "clarification" as const, citations: [] };
   assertSavReplyConsistency(u, output);
   return output;

@@ -1,3 +1,4 @@
+import { buildSavInboundContext } from "./message-context";
 import "server-only";
 
 import { timingSafeEqual } from "node:crypto";
@@ -604,7 +605,7 @@ async function sendReplyAction(action: typeof savActions.$inferSelect, text: str
   const inboundBody = decryptSavPayload<{ text: string; headers?: Record<string, string> }>(inbound.bodyCiphertext);
   // Explicit send captures draft + displayed send-only rule. Never re-render a
   // pending action here: its encrypted final body must match that approval.
-  const transparentText = manualV0 ? decryptSavPayload<{ text: string }>(String(action.payload.outboundBodyCiphertext)).text : ensureAiTransparency(text);
+  const transparentText = manualV0 ? decryptSavPayload<{ text: string }>(String(action.payload.outboundBodyCiphertext)).text : ensureAiTransparency(text, buildSavInboundContext({ subject: inbound.subject, body: inboundBody.text }).language);
   const replyFrom = normalizeEmailAddress(process.env.GMAIL_REPLY_FROM_ADDRESS || mailbox.email);
   const rfcMessageId = `<sav-${action.id}@studio.limova.ai>`;
   const priorId = inboundBody.headers?.["message-id"] || (manualV0 ? "" : inboundBody.headers?.["in-reply-to"]) || "";

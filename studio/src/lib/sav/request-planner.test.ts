@@ -48,7 +48,7 @@ describe("SAV-68 server request plans", () => {
     const plans = planSavRequests(u, retrieval(), playbook);
     const [result] = assembleSavPlannedReply(u, [{ requestId: "r1", text: "Réinitialisez aussi l’intégration.", kind: "solution", sourceIds: ["card"], missingInformationIds: [], repeatedAttemptIds: [], repeatJustification: "" }], plans);
     expect(result.text).not.toContain("Réinitialisez");
-    expect(result.text).toContain(u.requests[0].summary);
+    expect(result.requestId).toBe(u.requests[0].id);
     expect(result.text).toContain("Ouvrir le diagnostic fictif.");
     expect(result.text).not.toContain("Lire le résultat fictif.");
   });

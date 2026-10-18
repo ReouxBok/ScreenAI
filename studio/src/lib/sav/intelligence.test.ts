@@ -42,6 +42,15 @@ beforeEach(() => {
 afterEach(() => { vi.unstubAllEnvs(); vi.unstubAllGlobals(); vi.resetAllMocks(); });
 
 describe("SAV shared semantic pipeline with synthetic provider outputs", () => {
+  it("proposes the analyzed nominal title without copying the subject or changing a linked CRM record", async () => {
+    const u = understandingFixture({ ticketTitle: "Activation téléphonique et numéro dédié" });
+    deps.understand.mockResolvedValue(u);
+    const result = await analyzeSavMessage({from:"fixture@example.invalid",subject:"Bonjour je vous écris pour configurer",body:"Demande fictive de configuration."}, {evaluation:evaluation("off",vi.fn<typeof fetch>(async()=>geminiFixture(outputFor(u))))});
+    expect(result.structuredProposal?.ticket.title).toBe(u.ticketTitle);
+    expect(result.structuredProposal?.understanding).not.toHaveProperty("ticketTitle");
+    expect(result.replyDraft).toMatch(/^Bonjour,/); expect(result.replyDraft).toMatch(/Bien à vous,$/);
+    expect(deps.coherence).toHaveBeenCalledWith(expect.objectContaining({replyDraft:result.replyDraft}),expect.anything());
+  });
   it.each([
     ["fr", "L’agent ne répond toujours pas."],
     ["fr", "Je n’arrive pas à terminer la configuration."],
@@ -145,7 +154,7 @@ describe("SAV shared semantic pipeline with synthetic provider outputs", () => {
     const network = vi.fn<typeof fetch>(async () => geminiFixture(outputFor(u)));
     const result = await analyzeSavMessage(input, { evaluation: evaluation(mode, network) });
     expect(deps.understand).toHaveBeenCalledOnce();
-    expect(result.category).toBe("technical"); expect(result.replyDraft).toContain(u.requests[0].summary);
+    expect(result.category).toBe("technical"); expect(result.replyAssessment?.coverage.map(part => part.requestId)).toContain(u.requests[0].id);
     expect(result.understanding).toEqual(u); expect(result.structuredProposal?.understanding).toEqual(u);
     expect(result.replyAssessment?.coherence?.status).toBe("passed"); expect(deps.coherence).toHaveBeenCalledOnce();
     if (mode === "off" || mode === "shadow") {
@@ -163,7 +172,7 @@ describe("SAV shared semantic pipeline with synthetic provider outputs", () => {
     deps.understand.mockResolvedValue(u); deps.agent.mockResolvedValue(adkResult(u));
     deps.crm.mockResolvedValue({ contactFound: false, tickets: [], routing: { kind: "new", reason: "no_contact" } });
     const result = await analyzeSavMessage(input, { evaluation: evaluation(mode, vi.fn<typeof fetch>(async () => geminiFixture(outputFor(u)))) });
-    expect(result.replyDraft).toContain(u.requests[0].summary); expect(result.replyDraft).not.toMatch(/Quelle adresse|Which email/);
+    expect(result.replyAssessment?.coverage.map(part => part.requestId)).toContain(u.requests[0].id); expect(result.replyDraft).not.toMatch(/Quelle adresse|Which email/);
     expect(result.ticketRouting).toMatchObject({ kind: "review", reason: "customer_identity_unverified" });
     expect(result.structuredProposal?.customerIdentity.verifiedByHuman).toBe(false);
   });
