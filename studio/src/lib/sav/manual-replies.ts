@@ -9,7 +9,6 @@ import { savAutomationMode, savReleaseStage } from "./config";
 import { decryptSavPayload, encryptSavPayload, savContentHash } from "./crypto";
 import { savV0EligibleMessageFilter } from "./cutover";
 import { savReplyLanguage } from "./reply-language";
-import type { SavStructuredProposal } from "./proposal";
 import { renderSavOutboundReply, SAV_REPLY_FORMAT_REVISION, savManualReplyMode } from "./reply-format";
 
 const requestSchema = z.object({ threadId: z.uuid(), draftId: z.uuid() }).strict();
