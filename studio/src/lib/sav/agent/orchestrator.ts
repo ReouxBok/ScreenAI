@@ -1,3 +1,4 @@
+import { SAV_EMAIL_WRITING_SKILL, styleSavEmailCoverage } from "../email-writing";
 import { SAV_PRODUCT_GUIDANCE } from "../product-guidance";
 import "server-only";
 
@@ -24,7 +25,7 @@ import { assertSavAnalysisComplete } from "./validation";
 import type { SavProposalRouting } from "../proposal";
 import { savAnalysisErrorCode } from "../analysis-errors";
 import type { SavInboundContext } from "../message-context";
-import { SAV_COMPOSITION_CONTRACT, assembleSavReplySections, assertSavReplyConsistency, savSemanticPlan, type SavUnderstandingV1 } from "../understanding";
+import { SAV_COMPOSITION_CONTRACT, savReplyCoverageSchema, assembleSavReplySections, assertSavReplyConsistency, savSemanticPlan, type SavUnderstandingV1 } from "../understanding";
 
 export type SavAgentInput = {
   from: string;
@@ -55,6 +56,8 @@ export type SavAgentRunResult = {
 const instruction = `Tu es l’agent de qualification SAV Limova. Ton périmètre est strictement limité aux emails Gmail de contact@limova.ai, aux tickets HubSpot SAV et aux fiches de résolution SAV validées.
 
 ${SAV_PRODUCT_GUIDANCE}
+
+${SAV_EMAIL_WRITING_SKILL}
 
 ${SAV_COMPOSITION_CONTRACT}
 
@@ -291,7 +294,8 @@ export async function runSavAdkAgent(input: SavAgentInput, options: {
   if (modelError) throw new Error(safeErrorCode(modelError));
   if (!rawOutput && finalText) rawOutput = JSON.parse(finalText);
   if (!rawOutput) throw new Error("SAV_ADK_EMPTY_OUTPUT");
-  const output = { ...savAgentOutputSchema.parse({ ...(rawOutput as object), replyDraft: "" }), ...assembleSavReplySections(input.understanding, (rawOutput as { coverage?: unknown }).coverage) };
+  const parsedOutput = savAgentOutputSchema.parse({ ...(rawOutput as object), replyDraft: "" });
+  const output = { ...parsedOutput, ...assembleSavReplySections(input.understanding, styleSavEmailCoverage(input.understanding, savReplyCoverageSchema.parse(parsedOutput.coverage))) };
   assertSavReplyConsistency(input.understanding, output);
   assertSavAnalysisComplete(output, toolTrace, [...evidenceById.values()], knowledgeById);
   const requestedEvidence = new Set(output.evidenceIds);

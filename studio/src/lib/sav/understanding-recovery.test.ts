@@ -22,6 +22,9 @@ describe("one bounded contract recovery under unchanged validation", () => {
   });
   it("refuses recovery that changes a financial request into technical support", async () => {
     const financial = understandingContent(); financial.requests[0].nature = "financial_operation"; financial.requests[0].financialScope = "none";
+    // Force a full source recovery; a scope-only local correction must already
+    // keep this request financial, rather than asking the provider to rewrite it.
+    financial.evidence[0].sourceId = "missing_source";
     const network = vi.fn<typeof fetch>().mockResolvedValueOnce(geminiFixture(financial)).mockResolvedValueOnce(geminiFixture(understandingContent()));
     const result = await understandSavMessage(input, { apiKey: "fixture", fetch: network });
     expect(result.status).toBe("unavailable");

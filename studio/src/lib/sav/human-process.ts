@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { savTicketTitle, validSavTicketTitle } from "./ticket-title";
 import { savRequestNatureSchema } from "./understanding";
 import { SAV_HUBSPOT_SUPPORT } from "./hubspot-mapping";
 import { savTicketReturnPlan } from "./ticket-lifecycle";
@@ -47,10 +48,7 @@ export function savEffectiveCustomerEmail(p: SavStructuredProposal, identity: { 
   return identity.kind === "forwarded" ? identity.email : p.customerIdentity.verifiedByHuman && p.customerIdentity.registrationEmail ? p.customerIdentity.registrationEmail : identity.email;
 }
 export function savSuggestedTicketTitle(p: SavStructuredProposal) {
-  const existing=p.ticket.title.trim().split(/\s+/);
-  if (p.humanProcess && existing.length>=4 && existing.length<=6 && !/^(?:(?:re|fw|fwd|tr)\s*:\s*)+$/i.test(p.ticket.title.trim())) return p.ticket.title;
-  const u=p.humanProcess?.understanding ?? p.understanding;
-  const primary=u?.requests.find(r=>r.id===u.primaryRequestId);
-  const words=(primary?.summary || p.ticket.title).replace(/^(?:le client|la cliente)\s+(?:demande|souhaite)\s+/i,"").replace(/^(?:(?:re|fw|fwd|tr)\s*:\s*)+/i,"").replace(/[^\p{L}\p{N}’' -]/gu," ").trim().split(/\s+/).filter(Boolean);
-  return !words.length ? "Demande de support à qualifier" : words.length>=4 ? words.slice(0,6).join(" ") : ["Demande","support","concernant",...words].slice(0,6).join(" ");
+  if (p.humanProcess && p.ticket.title.trim()) return p.ticket.title;
+  if (validSavTicketTitle(p.ticket.title)) return p.ticket.title;
+  return savTicketTitle(p.understanding);
 }

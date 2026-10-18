@@ -3,7 +3,7 @@ import { eq } from "drizzle-orm";
 import { createSavTestDb } from "../../../test/sav-db";
 import { auditLogs, savActions, savAgentRuns, savDecisions, savMailboxes, savMessages, savSyncState, savThreads, savWebhookReceipts } from "@/db/schema";
 import { activateSavV0Cutover, getSavV0Cutover, isSavMessageEligible, SAV_V0_CUTOVER_KEY } from "./cutover";
-import { correctSavDecision, ingestInboundMessage, listSavPilotCandidates, processPendingSavMessages, processStoredSavMessage, recordWebhookReceipt } from "./service";
+import { correctSavDecision, ingestInboundMessage, listSavPilotCandidates, processPendingSavMessages, processStoredSavMessage, recordWebhookReceipt, updateMailboxWatch, updateMailboxCursor } from "./service";
 import { decryptSavPayload, encryptSavPayload } from "./crypto";
 import { processGmailReceipt } from "./gmail";
 
@@ -34,6 +34,29 @@ async function message(receivedAt: string, selectedMailboxId = mailboxId, select
   return row;
 }
 describe("immutable post-deployment SAV V0 cutover", () => {
+  it("renews the watch without advancing a consumed history cursor", async () => {
+    await updateMailboxCursor(mailboxId, "90071992547409930");
+    await updateMailboxWatch(boundary.mailboxEmail, "90071992547409999", new Date("2030-01-01T00:00:00Z"));
+    const [mailbox] = await fixture.db.select().from(savMailboxes).where(eq(savMailboxes.id, mailboxId));
+    expect(mailbox.historyId).toBe("90071992547409930"); expect(mailbox.watchStatus).toBe("active");
+  });
+  it("keeps a null cursor on watch renewal so initial recovery still runs", async () => {
+    await updateMailboxWatch(boundary.mailboxEmail, "999999", new Date("2030-01-01T00:00:00Z"));
+    const [mailbox] = await fixture.db.select().from(savMailboxes).where(eq(savMailboxes.id, mailboxId));
+    expect(mailbox.historyId).toBeNull();
+  });
+  it("cannot regress the cursor when receipts finish out of order or exceed Number precision", async () => {
+    await updateMailboxCursor(mailboxId, "90071992547409931");
+    await updateMailboxCursor(mailboxId, "90071992547409930");
+    await updateMailboxCursor(mailboxId, "90071992547409931");
+    const [mailbox] = await fixture.db.select().from(savMailboxes).where(eq(savMailboxes.id, mailboxId));
+    expect(mailbox.historyId).toBe("90071992547409931");
+  });
+  it("rejects malformed history IDs without changing the cursor", async () => {
+    await expect(updateMailboxCursor(mailboxId, "1e9")).rejects.toThrow("GMAIL_HISTORY_ID_INVALID");
+    const [mailbox] = await fixture.db.select().from(savMailboxes).where(eq(savMailboxes.id, mailboxId));
+    expect(mailbox.historyId).toBeNull();
+  });
   it("fails closed before activation without marking old messages processed", async () => {
     const old = await message("2026-10-02T11:59:59Z");
     expect(await isSavMessageEligible(old.id)).toBe(false);

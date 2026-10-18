@@ -1,8 +1,9 @@
 "use client";
 import { useState } from "react";
+import { renderSavOutboundReply, savManualReplyMode } from "@/lib/sav/reply-format";
 import { reviewDraftAction, saveHumanDraftAction, sendStudioReplyAction } from "../actions";
 
-type Props = {threadId:string;messageId:string;decisionId:string;agentRunId:string;sourceHash:string;verdictId:string|null;
+type Props = {language?:"fr"|"en"|"unknown";threadId:string;messageId:string;decisionId:string;agentRunId:string;sourceHash:string;verdictId:string|null;
   original:string|null;current:{id:string;text:string;stale:boolean;status:string;origin:string}|null;currentDraftId:string|null;
   acceptedDraftId:string|null;accepted:boolean;rejected:boolean;reason:string;reasons:string[];reasonLabels:Array<[string,string]>;
   sendAllowed:boolean;sendDisabledReason?:string|null;replyState?:string|null};
@@ -11,6 +12,8 @@ export function DraftEditor(p:Props) {
   const [text,setText]=useState(initial);
   const dirty=text!==initial, manual=p.current?.origin === "human" ? p.current : null;
   const busy=Boolean(p.replyState), needsSave=dirty || Boolean(manual?.stale) || manual?.status === "abandoned";
+  let preview = "";
+  try { if (text.trim()) preview = renderSavOutboundReply(text, p.language ?? "fr", savManualReplyMode(dirty || manual ? "human" : "ai")); } catch { /* Empty after signature normalization: keep the editor usable. */ }
   return <>
     <form action={saveHumanDraftAction}>
       <input type="hidden" name="threadId" value={p.threadId}/><input type="hidden" name="messageId" value={p.messageId}/><input type="hidden" name="expectedDraftId" value={p.currentDraftId ?? ""}/>
@@ -19,6 +22,7 @@ export function DraftEditor(p:Props) {
       <p>{needsSave ? "Enregistrez cette version avant de l’accepter ou de l’envoyer. La validation précédente ne vaut pas pour un texte modifié." : "Enregistrer conserve une version humaine ; cela n’accepte ni n’envoie la réponse."}</p>
     </form>
     {p.original && <details><summary>Brouillon initial de l’IA</summary><pre>{p.original}</pre></details>}
+    {preview && <details><summary>Aperçu de l’email après validation</summary><pre>{preview}</pre></details>}
     <form action={reviewDraftAction}>
       <input type="hidden" name="threadId" value={p.threadId}/><input type="hidden" name="messageId" value={p.messageId}/><input type="hidden" name="decisionId" value={p.decisionId}/><input type="hidden" name="agentRunId" value={p.agentRunId}/>
       <input type="hidden" name="sourceHash" value={p.sourceHash}/><input type="hidden" name="verdictId" value={p.verdictId ?? ""}/><input type="hidden" name="draftId" value={manual?.id ?? ""}/>

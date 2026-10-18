@@ -231,7 +231,7 @@ export default async function SavThreadPage({ params, searchParams }: { params: 
         </DossierSection>
 
         {proposalReview && latestInbound && <DossierSection id="sav-draft" number={4} title="Brouillon de réponse" badge={replyState === "sent" ? "Envoyée" : proposalReview.draftVerdict?.status === "accepted" && !proposalReview.draftVerdict.stale ? "Acceptée · à envoyer" : "À relire"} tone={replyState === "sent" ? "done" : "todo"}>
-          <div className={layout.block}><DraftReview data={proposalReview} threadId={id} messageId={latestInbound.id} drafts={replyDrafts} sendAllowed={!sendDisabledReason} sendDisabledReason={sendDisabledReason} replyState={replyState}/></div>
+          <div className={layout.block}><DraftReview inboundText={latestInbound.body.text} data={proposalReview} threadId={id} messageId={latestInbound.id} drafts={replyDrafts} sendAllowed={!sendDisabledReason} sendDisabledReason={sendDisabledReason} replyState={replyState}/></div>
         </DossierSection>}
 
         <ResolutionObservation rows={observations} isUgo={staff.email.toLowerCase()==="ugo@limova.ai"}/>

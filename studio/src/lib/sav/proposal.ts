@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { savTicketTitle } from "./ticket-title";
 import { savHarnessTraceSchema } from "./request-planner";
 import type { SavDecisionEvidence } from "@/db/schema";
 import type { SavAnalysis } from "./intelligence";
@@ -82,7 +83,7 @@ export function buildSavStructuredProposal(input: { subject: string; body: strin
   return savStructuredProposalSchema.parse({
     schemaVersion: 1, category: analysis.category, urgency: analysis.urgency,
     decision: { kind: analysis.proposal.kind, reasonCode: analysis.proposal.reasonCode, explanation: analysis.proposal.explanation, confidence: analysis.proposal.confidence },
-    routing, ticket: { title: input.subject.trim().split(/\s+/).slice(0, 5).join(" ").slice(0, 500) || "Demande support à vérifier", description: input.body },
+    routing, ticket: { title: savTicketTitle(analysis.understanding), description: input.body },
     process, internalNote: analysis.internalNote, replyDraft: analysis.replyDraft,
     sources: analysis.evidence.map((source: SavDecisionEvidence) => ({ sourceType: source.sourceType, sourceId: source.sourceId, contentVersionId: source.contentVersionId, title: source.title, claim: source.claim, excerpt: source.excerpt })),
     knowledgeRevision: analysis.knowledgeRevision ?? "not_consulted", model: analysis.model, identityCandidates: analysis.identityCandidates ?? [],

@@ -23,11 +23,12 @@ describe("read-only dossier diagnostic endpoint", () => {
     const diagnostic = { phase: "composition" as const, rule: "request_coverage_mismatch", path: "coverage", candidateHash: "fixture-hash", shape: { requests: 1, evidence: 0, knownFacts: 0, attemptedSteps: 0, coverage: 0, citations: 0 } };
     proposal.replyAssessment!.validationDiagnostics = [diagnostic];
     proposal.replyAssessment!.recovery = { strategy: "investigation", originalErrorCode: "SAV_REPLY_INCONSISTENT_WITH_UNDERSTANDING", validated: true };
-    await fixture.db.insert(savAgentRuns).values({ messageId: m.id, runtime: "fixture", mode: "off", status: "succeeded", model: "fixture", promptRevision: "fixture", inputHash: "fixture", proposalCiphertext: encryptSavPayload(savRollbackCompatibleProposal(proposal)), toolTrace: [{ sequence: 1, name: "sav_validation_outcome", status: "succeeded", durationMs: 0, resultSummary: { validationDiagnostics: [diagnostic], recovery: proposal.replyAssessment!.recovery, coherenceAttempts: [] } }] });
+    const understandingSummary = { status: "needs_clarification", language: "unknown", requests: 0, knownFacts: 0, attemptedSteps: 0, uncertainties: ["ambiguous_intent"] };
+    await fixture.db.insert(savAgentRuns).values({ messageId: m.id, runtime: "fixture", mode: "off", status: "succeeded", model: "fixture", promptRevision: "fixture", inputHash: "fixture", proposalCiphertext: encryptSavPayload(savRollbackCompatibleProposal(proposal)), toolTrace: [{ sequence: 1, name: "sav_validation_outcome", status: "succeeded", durationMs: 0, resultSummary: { understandingSummary, validationDiagnostics: [diagnostic], recovery: proposal.replyAssessment!.recovery, coherenceAttempts: [] } }] });
     const response = await GET(new Request("https://example.invalid/diagnostic"), { params: Promise.resolve({ id: thread.id }) });
     expect(response.status).toBe(200); expect(response.headers.get("cache-control")).toBe("private, no-store");
     const data = await response.json(); expect(data.runs).toHaveLength(2); expect(data.runs.some((r: { historicalDetailUnavailable: boolean }) => r.historicalDetailUnavailable)).toBe(true);
-    expect(data.runs.find((r: { proposalReadable: boolean }) => r.proposalReadable)).toMatchObject({ diagnostics: [diagnostic], recovery: { validated: true }, historicalDetailUnavailable: false });
+    expect(data.runs.find((r: { proposalReadable: boolean }) => r.proposalReadable)).toMatchObject({ diagnostics: [diagnostic], recovery: { validated: true }, historicalDetailUnavailable: false, understandingSummary });
     expect(JSON.stringify(data)).not.toMatch(/Private body|Bonjour|PDF|fixture-customer/);
     expect((await fixture.db.select().from(savMessages))[0].studioOpenedAt).toBeNull();
     expect(await fixture.db.select().from(savActions)).toHaveLength(0);

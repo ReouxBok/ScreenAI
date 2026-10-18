@@ -3,8 +3,8 @@ import { normalizeSavEvidenceText, savEvidenceContains } from "./evidence-text";
 import { cleanSavModelDraft } from "./reply-format";
 import { SavContractValidationError, savValidationDiagnosticSchema } from "./validation-diagnostics";
 
-export const SAV_UNDERSTANDING_REVISION = "sav-understanding-2026-10-17.v7";
-export const SAV_UNDERSTANDING_PROMPT_REVISION = "sav-understanding-prompt-2026-10-17.v7";
+export const SAV_UNDERSTANDING_REVISION = "sav-understanding-2026-10-18.v9";
+export const SAV_UNDERSTANDING_PROMPT_REVISION = "sav-understanding-prompt-2026-10-18.v9";
 const id = z.string().trim().min(1).max(100);
 const ids = z.array(id).max(30);
 export const savRequestNatureSchema = z.enum(["technical", "account", "integration", "how_to", "financial_operation", "financial_data", "cancellation", "commercial", "partnership", "callback", "human_request", "security", "privacy", "data_deletion", "legal", "acknowledgement", "non_support", "unknown"]);
@@ -15,6 +15,7 @@ export const savUnderstandingContentSchema = z.object({
   version: z.literal(1),
   status: z.enum(["qualified", "needs_clarification", "unavailable"]),
   language: z.enum(["fr", "en", "unknown"]),
+  ticketTitle: z.string().max(120).nullable().optional().catch(null),
   customerRelationship: z.object({ kind: z.enum(["prospect", "existing_customer", "unknown"]), evidenceIds: ids }).strict().optional(),
   primaryRequestId: id.nullable(),
   requests: z.array(z.object({
@@ -45,6 +46,14 @@ export const savUnderstandingSchema = savUnderstandingContentSchema.extend({
   }).strict(),
 });
 export type SavUnderstandingContent = z.infer<typeof savUnderstandingContentSchema>;
+/** Counts/enums only: distinguish unusable clarification from successful analysis
+ * without copying customer text into the diagnostics trace. */
+export const savUnderstandingSummarySchema = z.object({
+  status: savUnderstandingContentSchema.shape.status,
+  language: savUnderstandingContentSchema.shape.language,
+  requests: z.number().int().nonnegative(), knownFacts: z.number().int().nonnegative(), attemptedSteps: z.number().int().nonnegative(),
+  uncertainties: z.array(savUnderstandingContentSchema.shape.uncertainties.element.shape.code).max(20),
+}).strict();
 export type SavUnderstandingV1 = z.infer<typeof savUnderstandingSchema>;
 export type SavUnderstandingSource = { source: "current_message" | "history" | "crm"; sourceId: string; text: string };
 

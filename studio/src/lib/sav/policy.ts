@@ -71,8 +71,8 @@ export function followupDates(from: Date) {
   return FOLLOWUP_DAY_OFFSETS.map((days) => new Date(from.getTime() + days * 24 * 60 * 60 * 1_000));
 }
 
-export function ensureAiTransparency(body: string) {
-  return renderSavOutboundReply(cleanSavModelDraft(body));
+export function ensureAiTransparency(body: string, language: "fr" | "en" | "unknown" = "fr") {
+  return renderSavOutboundReply(cleanSavModelDraft(body), language, "automated");
 }
 
 export function safeSavTriageDraft(language: "fr" | "en" | "unknown" = "fr") {

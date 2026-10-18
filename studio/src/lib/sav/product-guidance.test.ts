@@ -10,7 +10,7 @@ describe("shared SAV product guidance", () => {
   });
   it("is used by both model runtimes without embedding imported procedures", async () => {
     const [legacy, adk] = await Promise.all([readFile(new URL("./intelligence.ts", import.meta.url), "utf8"), readFile(new URL("./agent/orchestrator.ts", import.meta.url), "utf8")]);
-    expect(legacy).toContain('text: SAV_PRODUCT_GUIDANCE +');
+    expect(legacy).toContain('SAV_PRODUCT_GUIDANCE + "\\n" + "La catégorie');
     expect(adk).toContain('${SAV_PRODUCT_GUIDANCE}');
   });
 });
