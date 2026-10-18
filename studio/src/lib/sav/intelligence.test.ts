@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { analyzeSavMessage, type SavEvaluationResources } from "./intelligence";
 import { defaultSavPlaybook } from "./playbook-contract";
 import { savSemanticPlan, type SavUnderstandingV1 } from "./understanding";
-import { coverageFixture, geminiFixture, understandingFixture } from "../../../test/sav-understanding-fixtures";
+import { coverageFixture, geminiFixture, understandingFixture, understandingContent } from "../../../test/sav-understanding-fixtures";
 import type { SavAgentOutput } from "./agent/contracts";
 
 const deps = vi.hoisted(() => ({ search: vi.fn(), agent: vi.fn(), crm: vi.fn(), understand: vi.fn(), coherence: vi.fn(), playbook: vi.fn(), retrieval: vi.fn() }));
@@ -42,6 +42,40 @@ beforeEach(() => {
 afterEach(() => { vi.unstubAllEnvs(); vi.unstubAllGlobals(); vi.resetAllMocks(); });
 
 describe("SAV shared semantic pipeline with synthetic provider outputs", () => {
+  it("proposes the analyzed nominal title without copying the subject or changing a linked CRM record", async () => {
+    const u = understandingFixture({ ticketTitle: "Activation téléphonique et numéro dédié" });
+    deps.understand.mockResolvedValue(u);
+    const result = await analyzeSavMessage({from:"fixture@example.invalid",subject:"Bonjour je vous écris pour configurer",body:"Demande fictive de configuration."}, {evaluation:evaluation("off",vi.fn<typeof fetch>(async()=>geminiFixture(outputFor(u))))});
+    expect(result.structuredProposal?.ticket.title).toBe(u.ticketTitle);
+    expect(result.structuredProposal?.understanding).not.toHaveProperty("ticketTitle");
+    expect(result.replyDraft).toMatch(/^Bonjour,/); expect(result.replyDraft).toMatch(/Bien à vous,$/);
+    expect(deps.coherence).toHaveBeenCalledWith(expect.objectContaining({replyDraft:result.replyDraft}),expect.anything());
+  });
+  it.each([
+    ["fr", "L’agent ne répond toujours pas."],
+    ["fr", "Je n’arrive pas à terminer la configuration."],
+    ["fr", "Ça recommence depuis ce matin."],
+    ["fr", "Je ne sais pas quelle information vous envoyer pour mon problème."],
+    ["en", "It still fails when I try again."],
+    ["fr", "La pièce jointe montre le problème, comment continuer ?"],
+  ] as const)("continues a proven but incomplete %s request to a reviewed draft: %s", async (language, body) => {
+    deps.understand.mockImplementation(async (...args) => (await vi.importActual<typeof import("./understanding-model")>("./understanding-model")).understandSavMessage(...args as Parameters<typeof import("./understanding-model").understandSavMessage>));
+    const empty = understandingContent(); empty.status = "needs_clarification"; empty.language = "unknown";
+    empty.requests = []; empty.primaryRequestId = null; empty.evidence = []; empty.uncertainties = [{ code: "ambiguous_intent", requestIds: [] }];
+    const u = understandingFixture({ status: "needs_clarification", language, uncertainties: [{ code: "ambiguous_intent", requestIds: ["request-1"] }] });
+    u.requests[0] = { ...u.requests[0], summary: body, nature: "unknown", product: null, feature: null };
+    u.evidence[0].excerpt = body;
+    u.missingInformation = [{ id: "question", key: "desired_outcome", text: language === "en" ? "What do you want to achieve?" : "Quel résultat souhaitez-vous obtenir ?", requestIds: ["request-1"] }];
+    const network = vi.fn<typeof fetch>().mockResolvedValueOnce(geminiFixture(empty))
+      .mockResolvedValueOnce(geminiFixture(understandingContent(u))).mockResolvedValueOnce(geminiFixture(outputFor(u)));
+    const result = await analyzeSavMessage({ from: "fixture@example.invalid", subject: "Support", body }, { evaluation: evaluation("off", network) });
+    expect(network).toHaveBeenCalledTimes(3); expect(result.understanding?.trace.validationRecovery?.succeeded).toBe(true);
+    expect(result.replyAssessment?.kind).toBe("contextualized"); expect(result.replyAssessment?.coherence?.status).toBe("passed");
+    expect(result.replyDraft).toContain(language === "en" ? "what you want to do" : "ce que vous souhaitez faire");
+    expect(result.proposal.requiresHumanApproval).toBe(true);
+    expect(result.replyDraft).not.toMatch(/L’équipe doit|humain doit|redémarr|résolu/i);
+    expect(deps.coherence).toHaveBeenCalledOnce();
+  });
   it("requires sections once and assembles the draft without a model-supplied duplicate", async () => {
     const u = understandingFixture(); deps.understand.mockResolvedValue(u);
     const output = outputFor(u);
@@ -120,7 +154,7 @@ describe("SAV shared semantic pipeline with synthetic provider outputs", () => {
     const network = vi.fn<typeof fetch>(async () => geminiFixture(outputFor(u)));
     const result = await analyzeSavMessage(input, { evaluation: evaluation(mode, network) });
     expect(deps.understand).toHaveBeenCalledOnce();
-    expect(result.category).toBe("technical"); expect(result.replyDraft).toContain(u.requests[0].summary);
+    expect(result.category).toBe("technical"); expect(result.replyAssessment?.coverage.map(part => part.requestId)).toContain(u.requests[0].id);
     expect(result.understanding).toEqual(u); expect(result.structuredProposal?.understanding).toEqual(u);
     expect(result.replyAssessment?.coherence?.status).toBe("passed"); expect(deps.coherence).toHaveBeenCalledOnce();
     if (mode === "off" || mode === "shadow") {
@@ -138,7 +172,7 @@ describe("SAV shared semantic pipeline with synthetic provider outputs", () => {
     deps.understand.mockResolvedValue(u); deps.agent.mockResolvedValue(adkResult(u));
     deps.crm.mockResolvedValue({ contactFound: false, tickets: [], routing: { kind: "new", reason: "no_contact" } });
     const result = await analyzeSavMessage(input, { evaluation: evaluation(mode, vi.fn<typeof fetch>(async () => geminiFixture(outputFor(u)))) });
-    expect(result.replyDraft).toContain(u.requests[0].summary); expect(result.replyDraft).not.toMatch(/Quelle adresse|Which email/);
+    expect(result.replyAssessment?.coverage.map(part => part.requestId)).toContain(u.requests[0].id); expect(result.replyDraft).not.toMatch(/Quelle adresse|Which email/);
     expect(result.ticketRouting).toMatchObject({ kind: "review", reason: "customer_identity_unverified" });
     expect(result.structuredProposal?.customerIdentity.verifiedByHuman).toBe(false);
   });

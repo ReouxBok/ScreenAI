@@ -41,6 +41,12 @@ test("SAV44 exposes understanding and persists independent dossier/draft feedbac
   await expect(page.getByRole("button", { name: "Préparer l’aperçu de l’action", exact: true })).toBeDisabled();
 
   const ticketTitle = reviewForm.getByRole("textbox", { name: "Titre (4 à 6 mots)", exact: true });
+  await expect(ticketTitle).toHaveValue("Échec export PDF fictif");
+  const preview = draft.locator("details").filter({has: page.getByText("Aperçu de l’email après validation", {exact:true})});
+  await preview.locator("summary").click();
+  await expect(preview.locator("pre")).toContainText("L’équipe Limova");
+  await expect(preview.locator("pre")).toContainText("validée par notre équipe");
+  await expect(preview.locator("pre")).not.toContainText("envoyée automatiquement");
   await expect(reviewForm.getByRole("radio")).toHaveCount(6);
   for (const action of ["partnership", "commercial", "no_ticket", "link_ticket", "reopen_ticket", "create_ticket"]) {
     await reviewForm.locator(`label:has(input[name="humanAction"][value="${action}"])`).click();

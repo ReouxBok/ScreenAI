@@ -7,7 +7,7 @@ import { canonicalSavFactKey, savRequestDomain, type SavActivePlaybook } from ".
 import { savSemanticPlan, type SavUnderstandingV1, type SavReplyCoverage } from "./understanding";
 import type { SavRequestRetrievalResult, SavRequestRetrievalSource } from "./request-retrieval";
 
-export const SAV_REQUEST_PLANNER_REVISION = "sav-request-planner-2026-10-17.v4";
+export const SAV_REQUEST_PLANNER_REVISION = "sav-request-planner-2026-10-18.v6";
 export const savRequestPlanSchema = z.object({
   requestId: z.string(), domain: z.string(), mode: z.enum(["solution", "clarification", "knowledge_gap", "reserved", "provider_failure"]),
   card: z.object({ id: z.string(), versionId: z.string() }).nullable(),
@@ -137,9 +137,10 @@ export function assembleSavPlannedReply(u: SavUnderstandingV1, raw: SavReplyCove
     const procedure = selected?.requiresHuman ? undefined : selected;
     if ((part.procedureGroupId && !selected) || (options.length > 0 && !selected && part.kind === "solution")) throw new Error("SAV_PROCEDURE_SELECTION_REQUIRED");
     const needsHuman = !plan.nextCheck && !procedure && !plan.missingFacts.length;
-    const fragments = [u.language === "en"
-      ? `${needsHuman ? "The team needs to review your request" : "Your request"}: ${request.summary}`
-      : `${needsHuman ? "L’équipe doit vérifier votre demande" : "Votre demande"} : ${request.summary}`];
+    const fragments = u.requests.length > 1 ? [request.summary] : [];
+    fragments.push(u.language === "en"
+      ? needsHuman ? "Your request needs further review before we can provide a reliable answer." : plan.missingFacts.length ? "To move forward, I need a few details:" : "Here are the steps to follow:"
+      : needsHuman ? "Votre demande nécessite une vérification avant de pouvoir vous apporter une réponse fiable." : plan.missingFacts.length ? "Pour avancer, j’ai besoin de quelques précisions :" : "Voici les étapes à suivre :");
     if (procedure) fragments.push(renderSavProcedureGroup(procedure, u.language === "en" ? "en" : "fr"));
     if (plan.nextCheck) {
       fragments.push(plan.nextCheck.instruction);

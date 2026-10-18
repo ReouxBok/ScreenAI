@@ -5,6 +5,7 @@ import type { SavStructuredProposal } from "./proposal";
 export function savRollbackCompatibleProposal(proposal: SavStructuredProposal): SavStructuredProposal {
   const copy = structuredClone(proposal);
   if (copy.understanding) {
+    delete copy.understanding.ticketTitle;
     delete copy.understanding.trace.validationDiagnostics;
     delete copy.understanding.trace.validationRecovery;
   }

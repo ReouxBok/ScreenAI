@@ -10,6 +10,7 @@ import { currentMessageText, loadSavConversation } from "./conversation";
 import { processPendingSavMessages, processSavPilotItem, reviewSavPilotItem } from "./service";
 import { getSavAutonomyGate } from "./promotion";
 import { activateSavV0Cutover } from "./cutover";
+import { SAV_UNDERSTANDING_PROMPT_REVISION } from "./understanding";
 
 const state = vi.hoisted(() => ({ db: null as unknown }));
 vi.mock("@/db", () => ({ requireDb: () => state.db }));
@@ -196,7 +197,7 @@ describe("write guard with migrated database", () => {
     const [processed] = await fixture.db.select().from(savPilotItems).where(eq(savPilotItems.id, item.id));
     const [run] = await fixture.db.select().from(savAgentRuns).where(eq(savAgentRuns.id, processed.agentRunId!));
     expect(processed.agentRunId).toBeTruthy();
-    expect(run).toMatchObject({ messageId, pilotBatchId: batch.id, promptRevision: "sav-understanding-prompt-2026-10-17.v7" });
+    expect(run).toMatchObject({ messageId, pilotBatchId: batch.id, promptRevision: SAV_UNDERSTANDING_PROMPT_REVISION });
     await fixture.db.insert(savAgentRuns).values({
       messageId, pilotBatchId: batch.id, scope: "sav_ticket_analysis", runtime: "google_adk", mode: "pilot",
       status: "succeeded", model: "fixture", promptRevision: "other-version", inputHash: "fixture",
