@@ -81,4 +81,3 @@ export async function executeSavEmailOpening(commandId: string) {
     .where(and(eq(auditLogs.id, commandId), sql`${auditLogs.technicalMetadata}->>'leaseToken' = ${leaseToken}`)).returning({ id: auditLogs.id });
   return { notice: completed ? notice : "pending" };
 }
-
