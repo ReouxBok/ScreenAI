@@ -112,7 +112,7 @@ describe("Combined SAV-38/39/40 V0 contracts with a sourced fictitious lead draf
     expect((await getSavProposalReview(messageId))?.review?.id).toBe(approved.id);
     expect((await getSavProposalReview(messageId))?.proposal.replyDraft).toBe(template);
     const [observation] = await fixture.db.select().from(savResolutionObservations);
-    expect(observation).toMatchObject({ state: "waiting_ticket", hubspotTicketId: null });
+    expect(observation).toMatchObject({ state: "gmail_only", hubspotTicketId: null });
     const collect = vi.fn(); await syncSavObservation(observation.id, collect, new Date());
     expect(collect).not.toHaveBeenCalled(); expect(state.crm).toHaveBeenCalledTimes(1);
     expect(await fixture.db.select().from(savActions)).toHaveLength(0);

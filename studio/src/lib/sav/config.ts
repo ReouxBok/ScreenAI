@@ -81,3 +81,6 @@ export function savThreadInAutoReplyRollout(threadId: string, percent = savAutoR
   for (const char of threadId) hash = Math.imul(hash ^ char.charCodeAt(0), 16777619) >>> 0;
   return (hash % 100) < percent;
 }
+
+/** Operational fallback on a SAV86-compatible deployment. Does not revoke queued human sends. */
+export function isSavCaseLearningFrozen() { return process.env.SAV_CASE_LEARNING_FROZEN === "true"; }

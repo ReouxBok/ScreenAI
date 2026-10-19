@@ -1,12 +1,12 @@
 import "server-only";
 import { and, asc, desc, eq, inArray, isNull, sql } from "drizzle-orm";
 import { requireDb } from "@/db";
-import { activeKnowledge, auditLogs, savActions, savAgentRuns, savDecisions, savDraftVerdicts, savLearningCandidates, savMessages, savObservationCycles, savPilotItems, savProposalReviews, savReplyDrafts, savResolutionObservations, savThreads } from "@/db/schema";
+import { activeKnowledge, auditLogs, savActions, savAgentRuns, savDecisions, savLearningCandidates, savMessages, savObservationCycles, savPilotItems, savProposalReviews, savReplyDrafts, savResolutionObservations, savThreads } from "@/db/schema";
 import { decryptSavPayload } from "./crypto";
 import { savV0EligibleMessageFilter } from "./cutover";
 import { buildSavInboxSummary, type SavInboxPartnershipStatus } from "./inbox-summary";
 import { savStructuredProposalSchema, mergeSavReviewedProposal, type SavStructuredProposal } from "./proposal";
-import { savDraftNotApplicable, savDraftSourceHash, savReviewMatchesProposal } from "./review-contract";
+import { savDraftNotApplicable, savReviewMatchesProposal } from "./review-contract";
 import { classifySavDossier, savDashboardNextAction, type SavDossierState, type SavLearningProgress, type SavOpeningState, type SavTicketProgress } from "./dashboard-state";
 import type { SavDossierContext } from "./dossier-context";
 import { findSavExternalCompletion, hasUnsettledSavHumanAction, savExternalCompletionEvents } from "./external-completion";
@@ -70,10 +70,9 @@ export async function listSavDossierDashboard(options: { view?: string; query?: 
       if (!batch.length) break;
       const ids = batch.map(r => r.message.id), threads = batch.map(r => r.thread.id);
       const unrecordedIds = batch.filter(row => !row.message.studioOpenedAt).map(row => row.message.id);
-      const [actions, observations, verdicts, openingProofs, currentDrafts, completionProofs] = await Promise.all([
+      const [actions, observations, openingProofs, currentDrafts, completionProofs] = await Promise.all([
         db.select().from(savActions).where(inArray(savActions.threadId, threads)).orderBy(desc(savActions.createdAt), desc(savActions.id)),
         db.select().from(savResolutionObservations).where(inArray(savResolutionObservations.threadId, threads)),
-        db.select().from(savDraftVerdicts).where(and(inArray(savDraftVerdicts.messageId, ids), eq(savDraftVerdicts.isCurrent, true))),
         // Legacy writers can still emit an opening audit during a rolling
         // deployment after the additive migration. Such a proof is not unread.
         unrecordedIds.length ? db.select({ messageId: auditLogs.entityId }).from(auditLogs).where(and(inArray(auditLogs.entityId, unrecordedIds), eq(auditLogs.entityType, "sav_message"), inArray(auditLogs.action, ["sav_email_opened", "sav_dossier_opened"]))) : Promise.resolve([]),
@@ -100,14 +99,11 @@ export async function listSavDossierDashboard(options: { view?: string; query?: 
             reviewStatus = review!.status;
           }
           if (proposal) {
-            const verdict = verdicts.find(v => v.messageId === message.id);
             const draft = currentDrafts.find(d => d.messageId === message.id);
             const body = draft ? decryptSavPayload<{text:string;origin?:string}>(draft.bodyCiphertext) : null;
             const effective = body?.origin === "human" ? {...proposal,replyDraft:body.text} : proposal;
             const validKnowledge = body?.origin === "human" ? draft!.knowledgeRevision === (knowledge?.revisionId ?? null) : ["not_consulted", "unavailable"].includes(proposal.knowledgeRevision) || proposal.knowledgeRevision === knowledge?.revisionId;
-            const currentVerdict = validKnowledge && verdict?.sourceHash === savDraftSourceHash(effective, message, knowledge?.revisionId)
-              && (verdict.status !== "accepted" || verdict.draftId === draft?.id && draft.status === "validated");
-            draftStatus = savDraftNotApplicable(effective) ? "Non prévu" : currentVerdict ? verdict.status === "accepted" ? "Accepté" : "Refusé" : verdict ? "À revoir" : "À relire";
+            draftStatus = savDraftNotApplicable(effective) ? "Non prévu" : effective.replyDraft && validKnowledge ? "Suggestion disponible" : "Aucune suggestion";
           }
         } catch { reviewStatus = null; proposal = original; }
         const threadActions = actions.filter(a => a.threadId === thread.id);
@@ -120,8 +116,7 @@ export async function listSavDossierDashboard(options: { view?: string; query?: 
         const opening: SavOpeningState = message.studioOpenedAt || openedIds.has(message.id) ? "opened" : message.studioOpeningTracked ? "unopened" : "unknown";
         const ticketProgress = proposal?.humanProcess?.action === "partnership" && partnershipTransferStatus !== "succeeded" ? partnershipTransferStatus === "uncertain" ? "uncertain" : partnershipTransferStatus === "failed" ? "failed" : partnershipTransferStatus === "pending" ? "pending" : "required" : savDashboardTicketProgress(threadActions, message.id, proposal?.decision.kind, thread.hubspotTicketId);
         const learning = savDashboardLearningProgress(observations.filter(o => o.threadId === thread.id), cycles, candidates.filter(c => c.threadId === thread.id || cycles.some(cycle => cycle.candidateId === c.id && observations.some(observation => observation.id === cycle.observationId && observation.threadId === thread.id))));
-        const ticketLearningPending = Boolean(thread.hubspotTicketId && candidates.some(candidate => candidate.status === "pending" && candidate.hubspotTicketId === thread.hubspotTicketId));
-        const handledExternally = learning === "none" && !ticketLearningPending && !hasUnsettledSavHumanAction(threadActions) && Boolean(findSavExternalCompletion(message, completionProofs));
+        const handledExternally = !hasUnsettledSavHumanAction(threadActions) && Boolean(findSavExternalCompletion(message, completionProofs));
         const state = handledExternally ? "completed" : classifySavDossier({ opening, reviewStatus, ticket: ticketProgress, learning });
         const linkedTicket = context?.crm.data?.tickets.find(t => t.id === thread.hubspotTicketId);
         const incident = Boolean(analysisErrorCode || ["failed", "uncertain"].includes(ticketProgress) || partnershipTransferStatus && ["failed", "uncertain"].includes(partnershipTransferStatus));

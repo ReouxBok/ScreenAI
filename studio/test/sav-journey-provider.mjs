@@ -37,7 +37,7 @@ globalThis.fetch = async (input, init = {}) => {
     if (route.endsWith('/contacts/search')) {
       const email = body.filterGroups?.[0]?.filters?.[0]?.value ?? body.query;
       const entry = Object.values(state.cases).find(c => c.email === email);
-      return Response.json({ results: entry ? [{ id: entry.contactId, properties: { email, firstname: 'Client', lastname: 'Fictif' } }] : [] });
+      return Response.json({ results: entry?.contactId ? [{ id: entry.contactId, properties: { email, firstname: 'Client', lastname: 'Fictif' } }] : [] });
     }
     if (route.endsWith('/tickets/search')) {
       const contactId = body.filterGroups[0].filters[0].value;

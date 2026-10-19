@@ -5,6 +5,7 @@ import { savLearningAdmissionSignals, savLearningModelUsage } from "@/db/schema"
 
 const state = vi.hoisted(() => ({ db: null as unknown }));
 vi.mock("@/db", () => ({ requireDb: () => state.db }));
+import {dispatchSavDerivedCall,settleSavDerivedCall} from "./derived-budget";
 import {
   activateSavLearningCutover, claimSavLearningComparisonTx, getSavLearningCutover, isSavLearningCycleEligible,
   recordSavLearningSignal, reserveSavLearningCapacityTx, reserveSavLearningModelCallTx,
@@ -50,9 +51,13 @@ describe("SAV learning admission contract", () => {
     expect(duplicate).toMatchObject({ ok: true, duplicate: true });
   });
 
-  it("records daily model volume without a cap and deduplicates duplicate sources", async () => {
+  it("records daily volume after proven low-cost settlements while preserving call quotas", async () => {
     const now = new Date("2026-10-15T12:00:00.000Z");
-    for (let index = 0; index < 12; index++) expect(await fixture.db.transaction((tx) => reserveSavLearningModelCallTx(tx, now))).toMatchObject({ ok: true });
+    for (let index = 0; index < 12; index++) {
+      const reservation=await fixture.db.transaction(tx=>reserveSavLearningModelCallTx(tx,now));expect(reservation).toMatchObject({ok:true});
+      await dispatchSavDerivedCall(reservation.reservationId,"comparison","gemini-3.6-flash",{systemInstruction:{parts:[{text:"Synthetic"}]},contents:[{parts:[{text:"Synthetic"}]}],generationConfig:{maxOutputTokens:4096}},now);
+      await settleSavDerivedCall(reservation.reservationId,{inputTokens:10,outputTokens:20,thoughtTokens:0,totalTokens:30},now);
+    }
     const [usage] = await fixture.db.select().from(savLearningModelUsage).where(eq(savLearningModelUsage.day, "2026-10-15"));
     expect(usage.callCount).toBe(12);
   });

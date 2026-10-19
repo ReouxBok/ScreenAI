@@ -23,6 +23,7 @@ vi.mock("next/link", () => ({ default: (props: ComponentProps<"a">) => createEle
 vi.mock("../actions", () => Object.fromEntries([
   "approveDraftAction", "correctDecisionAction", "createTicketAction", "linkTicketAction", "reconcileTicketAction", "reconcileTicketReturnAction", "requestHumanAction", "retryAction", "retryAnalysisAction", "reviewPilotItemAction", "refreshSavContextAction", "repairSavProposalAction",
 ].map((name) => [name, dependencies.action])));
+vi.mock("@/lib/sav/translations",()=>({getSavTranslations:async()=>({})}));
 import SavThreadPage from "./page";
 
 const threadId = "10000000-0000-4000-8000-000000000001";

@@ -1,15 +1,19 @@
 import "server-only";
-import { and, desc, eq } from "drizzle-orm";
+import { and, desc, eq, max } from "drizzle-orm";
 import { z } from "zod";
 import { requireDb } from "@/db";
-import { activeKnowledge, auditLogs, savActions, savAgentRuns, savDecisions, savMessages, savProposalReviews, savReplyDrafts, savThreads } from "@/db/schema";
+import { activeKnowledge, auditLogs, savActions, savAgentRuns, savDecisions, savMessages, savMessageTranslations, savProposalReviews, savReplyDrafts, savThreads } from "@/db/schema";
+import { SAV_TRANSLATOR_REVISION } from "./translations";
 import { assertSavActor } from "./access";
-import { assertSavAcceptedDraft } from "./draft-verdicts";
-import { savAutomationMode, savReleaseStage } from "./config";
+import { assertSavAcceptedDraft, loadSavDraftContext, loadSavDossierReviewContext } from "./draft-verdicts";
+import { isSavCaseLearningFrozen, savAutomationMode, savReleaseStage } from "./config";
 import { decryptSavPayload, encryptSavPayload, savContentHash } from "./crypto";
 import { savV0EligibleMessageFilter } from "./cutover";
+import { savDraftSourceHash, savReplyForbidden } from "./review-contract";
 import { savReplyLanguage } from "./reply-language";
 import { renderSavOutboundReply, SAV_REPLY_FORMAT_REVISION, savManualReplyMode } from "./reply-format";
+
+import { normalizeSavConfirmationText, SAV_REPLY_CONFIRMATION_TEXT_REVISION } from "./reply-confirmation-text";
 
 const requestSchema = z.object({ threadId: z.uuid(), draftId: z.uuid() }).strict();
 
@@ -22,8 +26,12 @@ export function assertSavManualReplyEnabled() {
 export async function queueSavManualReply(raw: unknown, actorEmail: string) {
   assertSavActor(actorEmail);
   assertSavManualReplyEnabled();
+  if(isSavCaseLearningFrozen())throw new Error("SAV_CASE_LEARNING_FROZEN");
   const input = requestSchema.parse(raw);
-  return requireDb().transaction(async (tx) => {
+  return requireDb().transaction(tx => queueSavManualReplyTx(input,actorEmail,tx));
+}
+type Tx = Parameters<Parameters<ReturnType<typeof requireDb>["transaction"]>[0]>[0];
+async function queueSavManualReplyTx(input:z.infer<typeof requestSchema>,actorEmail:string,tx:Tx,confirmation?:{hash:string;recipient:string}) {
     const [thread] = await tx.select().from(savThreads).where(eq(savThreads.id, input.threadId)).for("update");
     if (!thread) throw new Error("SAV_THREAD_NOT_FOUND");
     // V0 is human-only: pausing the agent must not prevent its owner replying.
@@ -45,7 +53,7 @@ export async function queueSavManualReply(raw: unknown, actorEmail: string) {
     const outboundText = renderSavOutboundReply(decryptSavPayload<{ text: string }>(draft.bodyCiphertext).text, language, savManualReplyMode(decryptSavPayload<{ origin?: string }>(draft.bodyCiphertext).origin));
     const values = { threadId: thread.id, messageId: draft.messageId, decisionId: context.decision.id,
       kind: "send_reply", actorType: "human", actorEmail, status: "pending", errorCode: null, scheduledAt: null,
-      payload: { manualReplyConfirmed: true, studioDraftId: draft.id, bodyCiphertext: draft.bodyCiphertext,
+      payload: { ...(confirmation ? {confirmationHash:confirmation.hash,confirmedRecipient:confirmation.recipient,confirmedAt:new Date().toISOString()} : {}), manualReplyConfirmed: true, studioDraftId: draft.id, bodyCiphertext: draft.bodyCiphertext,
         outboundBodyCiphertext: encryptSavPayload({ text: outboundText }), outboundBodyHash: savContentHash(outboundText), replyFormatRevision: SAV_REPLY_FORMAT_REVISION }, updatedAt: new Date() } as const;
     const [action] = existing ? await tx.update(savActions).set(values).where(eq(savActions.id, existing.id)).returning()
       : await tx.insert(savActions).values({ ...values, idempotencyKey: key }).returning();
@@ -53,6 +61,40 @@ export async function queueSavManualReply(raw: unknown, actorEmail: string) {
     await tx.insert(auditLogs).values({ actorEmail, action: "sav_manual_reply_requested", entityType: "sav_action", entityId: action.id,
       technicalMetadata: { draftId: draft.id, messageId: draft.messageId, reviewId: draft.reviewId, bodyHash: savContentHash(decryptSavPayload<{ text: string }>(draft.bodyCiphertext).text), outboundBodyHash: savContentHash(outboundText), replyFormatRevision: SAV_REPLY_FORMAT_REVISION } });
     return action;
+}
+
+const confirmationSchema = z.object({ threadId:z.uuid(),messageId:z.uuid(),decisionId:z.uuid(),agentRunId:z.uuid(),sourceHash:z.string().length(43),
+  expectedDraftId:z.uuid().nullable(),text:z.string().transform(normalizeSavConfirmationText).pipe(z.string().trim().min(1).max(10000)),recipient:z.email(),outboundHash:z.string().length(43),origin:z.enum(["ai","human"]) }).strict();
+/** Exact displayed text and recipient become a version and a send authorization in
+ * the same transaction. Neither a dossier review nor copying a suggestion sends. */
+export async function confirmSavSuggestedReply(raw:unknown,actorEmail:string) {
+  assertSavActor(actorEmail); assertSavManualReplyEnabled();
+  if(isSavCaseLearningFrozen())throw new Error("SAV_CASE_LEARNING_FROZEN");
+  const input=confirmationSchema.parse(raw);
+  return requireDb().transaction(async tx=>{
+    const [thread]=await tx.select().from(savThreads).where(eq(savThreads.id,input.threadId)).for("update");
+    if (!thread) throw new Error("SAV_THREAD_NOT_FOUND");
+    const context=await (input.origin==="human" ? loadSavDossierReviewContext(input.messageId,tx) : loadSavDraftContext(input.messageId,tx));
+    if (context.message.threadId!==thread.id || context.decision.id!==input.decisionId || context.run.id!==input.agentRunId || context.sourceHash!==input.sourceHash || context.message.fromEmail!==input.recipient || savReplyForbidden(context.proposal)) throw new Error("SAV_REPLY_MANUAL_CONTEXT_CHANGED");
+    const [eligible]=await tx.select({id:savMessages.id}).from(savMessages).where(and(eq(savMessages.id,input.messageId),savV0EligibleMessageFilter())).limit(1);
+    if (!eligible || !context.message.gmailMessageId) throw new Error("SAV_MESSAGE_BEFORE_CUTOVER");
+    const [translation]=await tx.select({language:savMessageTranslations.language}).from(savMessageTranslations).where(and(eq(savMessageTranslations.messageId,input.messageId),eq(savMessageTranslations.sourceHash,savContentHash(decryptSavPayload<{text:string}>(context.message.bodyCiphertext).text)),eq(savMessageTranslations.translatorRevision,SAV_TRANSLATOR_REVISION)));
+    if (input.origin==="ai" && translation && !["fr","en","unknown"].includes(translation.language)) throw new Error("SAV_REPLY_LANGUAGE_HUMAN_REQUIRED");
+    if (input.origin==="ai" && input.text!==normalizeSavConfirmationText(context.proposal.replyDraft??"").trim()) throw new Error("SAV_REPLY_MANUAL_OUTBOUND_CHANGED");
+    const outbound=renderSavOutboundReply(input.text,savReplyLanguage(context.proposal,decryptSavPayload<{text:string}>(context.message.bodyCiphertext).text),savManualReplyMode(input.origin));
+    if(savContentHash(outbound)!==input.outboundHash) throw new Error("SAV_REPLY_MANUAL_OUTBOUND_CHANGED");
+    const [existing]=await tx.select().from(savActions).where(eq(savActions.idempotencyKey,`gmail:manual-reply:${input.messageId}`));
+    const confirmationHash=savContentHash(input);
+    if(existing?.payload.confirmationHash===confirmationHash && !["failed","cancelled"].includes(existing.status)) return existing;
+    if(existing && (["pending","running","succeeded"].includes(existing.status)||existing.payload.replySendDispatchedAt)) throw new Error("SAV_REPLY_MANUAL_RECONCILIATION_REQUIRED");
+    const [current]=await tx.select().from(savReplyDrafts).where(and(eq(savReplyDrafts.threadId,thread.id),eq(savReplyDrafts.isCurrent,true)));
+    if((current?.id??null)!==input.expectedDraftId) throw new Error("SAV_DRAFT_VERSION_CHANGED");
+    const [{revision}]=await tx.select({revision:max(savReplyDrafts.revision)}).from(savReplyDrafts).where(eq(savReplyDrafts.threadId,thread.id));
+    if(current) await tx.update(savReplyDrafts).set({isCurrent:false}).where(eq(savReplyDrafts.id,current.id));
+    const [draft]=await tx.insert(savReplyDrafts).values({threadId:thread.id,messageId:input.messageId,decisionId:context.decision.id,agentRunId:context.run.id,reviewId:context.review?.id??null,knowledgeRevision:context.knowledgeRevision,revision:(revision??0)+1,status:"send_confirmed",sourceHash:input.origin==="ai"?context.sourceHash:savDraftSourceHash({...context.proposal,replyDraft:input.text},context.message,context.knowledgeRevision),bodyCiphertext:encryptSavPayload({text:input.text,origin:input.origin,confirmationTextRevision:SAV_REPLY_CONFIRMATION_TEXT_REVISION}),createdBy:actorEmail}).returning();
+    const action=await queueSavManualReplyTx({threadId:thread.id,draftId:draft.id},actorEmail,tx,{hash:confirmationHash,recipient:input.recipient});
+    await tx.update(savActions).set({payload:{...action.payload,confirmationHash,confirmedRecipient:input.recipient,confirmedAt:new Date().toISOString()}}).where(eq(savActions.id,action.id));
+    return {...action,payload:{...action.payload,confirmationHash}};
   });
 }
 
@@ -72,6 +114,7 @@ export async function assertSavCurrentManualReply(action: typeof savActions.$inf
   const proposal = context.proposal;
   const authored=decryptSavPayload<{origin?:string}>(draft.bodyCiphertext).origin === "human";
   if (!authored && !["not_consulted", "unavailable"].includes(proposal.knowledgeRevision) && proposal.knowledgeRevision !== knowledge?.revisionId) throw new Error("SAV_KNOWLEDGE_CHANGED_REANALYSIS_REQUIRED");
+  if (draft.status==="send_confirmed" && (typeof action.payload.confirmationHash!=="string" || action.payload.confirmedRecipient!==message.fromEmail)) throw new Error("SAV_REPLY_MANUAL_APPROVAL_REQUIRED");
   const body = decryptSavPayload<{ text: string; headers?: Record<string, string> }>(message.bodyCiphertext);
   if (!/^<[^<>\s]+@[^<>\s]+>$/.test(body.headers?.["message-id"] ?? "")) throw new Error("SAV_REPLY_MANUAL_THREAD_HEADERS_MISSING");
   if (action.payload.replyFormatRevision !== SAV_REPLY_FORMAT_REVISION || typeof action.payload.outboundBodyCiphertext !== "string") throw new Error("SAV_REPLY_MANUAL_FORMAT_RECONFIRM_REQUIRED");

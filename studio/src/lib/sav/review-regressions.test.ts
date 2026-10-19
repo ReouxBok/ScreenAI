@@ -17,7 +17,8 @@ const state = vi.hoisted(() => ({ db: null as unknown, targetItemId: null as str
 vi.mock("@/db", () => ({ requireDb: () => state.db }));
 vi.mock("./learning-comparator", () => ({
     SAV_LEARNING_COMPARATOR_REVISION: "fixture-comparator-v1", SAV_LEARNING_COMPARATOR_PROMPT_REVISION: "fixture-prompt-v1",
-    compareSavLearningResolution: async (input: { evidenceRef: string; evidenceExcerpt: string; resolution: string; knowledge: Array<{ ref: string; title: string }> }) => {
+    compareSavLearningResolution: async (input: { evidenceRef: string; evidenceExcerpt: string; resolution: string; knowledge: Array<{ ref: string; title: string }> }, options:{model:string;derivedReservationId?:string}) => {
+        if(options.derivedReservationId){const budget=await import("./derived-budget");await budget.dispatchSavDerivedCall(options.derivedReservationId,"comparison",options.model,{systemInstruction:{parts:[{text:"Synthetic"}]},contents:[{parts:[{text:"Synthetic"}]}],generationConfig:{maxOutputTokens:4096}});await budget.settleSavDerivedCall(options.derivedReservationId,{inputTokens:1,outputTokens:1,thoughtTokens:0,totalTokens:2});}
         const target = state.targetItemId ? input.knowledge.find((entry) => entry.ref === `content:${state.targetItemId}`) : null;
         return ({ decision: { outcome: target ? "amendment" : "new", matchedRef: target?.ref ?? null, groupSignature: "synthetic-support-resolution", subject: "Procédure fictive de support", resolution: input.resolution,
             conditions: ["Dossier support fictif"], expectedResult: "Le problème fictif est résolu", limitations: ["Ne couvre que le scénario synthétique"],

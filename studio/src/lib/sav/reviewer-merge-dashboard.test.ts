@@ -2,7 +2,7 @@ import { afterAll, afterEach, beforeAll, beforeEach, expect, it, vi } from "vite
 import { eq } from "drizzle-orm";
 import { createSavTestDb } from "../../../test/sav-db";
 import { v0Proposal } from "../../../test/sav-v0-review-fixture";
-import { savMailboxes, savThreads, savMessages, savAgentRuns, savDecisions, savActions, savDraftVerdicts, savReplyDrafts } from "@/db/schema";
+import { savMailboxes, savThreads, savMessages, savAgentRuns, savDecisions, savActions, savDraftVerdicts, savReplyDrafts, savResolutionObservations } from "@/db/schema";
 import { activateSavV0Cutover } from "./cutover";
 import { encryptSavPayload } from "./crypto";
 import { reviewSavDraft } from "./draft-verdicts";
@@ -69,16 +69,24 @@ it("preserves history and requires acceptance after rebinding an identical draft
 });
 
 import { listSavDossierDashboard } from "./dashboard";
+import { syncSavObservation } from "./observations";
 import { markSavDossiersHandledExternally } from "./external-completion";
 import { activeKnowledge, knowledgeRevisions } from "@/db/schema";
 it("merge SAV56/SAV62 preserves accepted human draft on administratively completed dossier",async()=>{
  await f.db.update(savMessages).set({studioOpenedAt:new Date()}).where(eq(savMessages.id,messageId));
  await approve(); const d=await save();await accept(d.id);
  const [m]=await f.db.select().from(savMessages).where(eq(savMessages.id,messageId));
- expect((await listSavDossierDashboard({view:"to_validate"})).rows[0]?.draftStatus).toBe("Accepté");
+ expect((await listSavDossierDashboard({view:"to_validate"})).rows[0]?.draftStatus).toBe("Suggestion disponible");
  expect(await markSavDossiersHandledExternally({batchId:crypto.randomUUID(),receivedBefore:"2026-10-14T16:05:00Z",messages:[{threadId,messageId:m.id}]},actor)).toMatchObject({marked:1});
  const rows=await listSavDossierDashboard({view:"completed"});
- expect(rows.rows[0]).toMatchObject({handledExternally:true,draftStatus:"Accepté",nextAction:"Traité hors Studio"});
+ expect(rows.rows[0]).toMatchObject({handledExternally:true,draftStatus:"Suggestion disponible",nextAction:"Traité hors Studio",learning:"incomplete"});
+ expect((await f.db.select().from(savResolutionObservations))[0]).toMatchObject({closed:false,state:"gmail_only"});
+ const [tracking]=await f.db.select().from(savResolutionObservations);
+ const collect=vi.fn(()=>{throw new Error("NO_CRM_READ_WITHOUT_TICKET");});
+ await syncSavObservation(tracking.id,collect);
+ const [continued]=await f.db.select().from(savResolutionObservations);
+ expect(continued.lastSyncAt).not.toBeNull();expect(continued.closed).toBe(false);expect(collect).not.toHaveBeenCalled();
+ expect((await listSavDossierDashboard({view:"completed"})).rows[0]?.handledExternally).toBe(true);
  expect(denyNetwork).not.toHaveBeenCalled();
 });
 it("merge preserves process but marks accepted human draft stale on KB revision",async()=>{
@@ -87,6 +95,6 @@ it("merge preserves process but marks accepted human draft stale on KB revision"
  await f.db.insert(knowledgeRevisions).values({id:"kb-next",actorEmail:actor});
  await f.db.insert(activeKnowledge).values({revisionId:"kb-next"});
  const result=await listSavDossierDashboard({view:"to_validate"});
- expect(result.rows[0]).toMatchObject({reviewStatus:"approved",draftStatus:"À revoir"});
+ expect(result.rows[0]).toMatchObject({reviewStatus:"approved",draftStatus:"Aucune suggestion"});
  expect(denyNetwork).not.toHaveBeenCalled();
 });

@@ -20,7 +20,7 @@ test("SAV-51 : qualifier un tutoriel incomplet depuis le lot sans publier ni act
   await openDetails(page.getByText("Proposer une version de tutoriel au SAV", { exact: true }));
   await page.getByLabel("ID du contenu", { exact: true }).fill(sourceItemId);
   await page.getByLabel("ID de la version source", { exact: true }).fill(sourceVersionId);
-  await submitServerAction(page, page.getByRole("button", { name: "Préparer un candidat", exact: true }));
+  await submitServerAction(page, page.getByRole("button", { name: "Préparer un candidat", exact: true }), /name="(?:_?\d+_)?versionId"/);
   await page.waitForURL(/result=candidate_ready/);
   const initialCard = page.locator("article[id^='candidate-']").filter({ has: page.getByRole("heading", { name: title, exact: true }) });
   await expect(initialCard).toHaveCount(1);
@@ -29,11 +29,11 @@ test("SAV-51 : qualifier un tutoriel incomplet depuis le lot sans publier ni act
   expect(cardId).toMatch(/^candidate-[0-9a-f-]+$/);
 
   await openDetails(page.getByText(/^Lots de conversion des tutoriels ·/));
-  await submitServerAction(page, page.getByRole("button", { name: "Préparer l’inventaire des tutoriels actifs", exact: true }));
+  await submitServerAction(page, page.getByRole("button", { name: "Préparer l’inventaire des tutoriels actifs", exact: true }), /name="(?:_?\d+_)?returnPage"/);
   await page.waitForURL(/result=onboarding_import_started/);
   for (let pass = 0; pass < 3; pass++) {
     await openDetails(page.getByText(/^Lots de conversion des tutoriels ·/));
-    await submitServerAction(page, page.getByRole("button", { name: /(?:Préparer les premiers candidats|Poursuivre ou reprendre le lot) · 10 sources maximum/ }));
+    await submitServerAction(page, page.getByRole("button", { name: /(?:Préparer les premiers candidats|Poursuivre ou reprendre le lot) · 10 sources maximum/ }), /name="(?:_?\d+_)?importId"/);
     await page.waitForURL(/result=onboarding_import_continued/);
     await openDetails(page.getByText(/^Lots de conversion des tutoriels ·/));
     await expect(page.getByRole("progressbar", { name: /^Progression du lot du/ })).toHaveAttribute("value", String((pass + 1) * 10));
@@ -66,7 +66,7 @@ test("SAV-51 : qualifier un tutoriel incomplet depuis le lot sans publier ni act
   const form = card.getByRole("form", { name: `Revoir ${title}`, exact: true });
   const approve = form.getByRole("button", { name: "Valider et préparer le brouillon SAV", exact: true });
   await expect(approve).toBeDisabled();
-  await submitServerAction(page, form.getByRole("button", { name: "Vérifier la source et comparer", exact: true }));
+  await submitServerAction(page, form.getByRole("button", { name: "Vérifier la source et comparer", exact: true }), /name="(?:_?\d+_)?document"/);
   await expect(form.getByText(/Version du tutoriel source vérifiée/)).toBeVisible();
   await form.getByLabel("J’ai vérifié la source, la procédure complète et les sujets proches.", { exact: true }).check();
   await form.getByLabel("Preuves et précisions apportées", { exact: true }).fill("La procédure fictive a été relue pour cette recette isolée.");
@@ -82,12 +82,12 @@ test("SAV-51 : qualifier un tutoriel incomplet depuis le lot sans publier ni act
   await firstStep.getByLabel("Résultat observable", { exact: true }).fill("Le champ « Nom de l’espace » est visible.");
   await expect(form.getByLabel("J’ai vérifié la source, la procédure complète et les sujets proches.", { exact: true })).toHaveCount(0);
   await expect(approve).toBeDisabled();
-  await submitServerAction(page, form.getByRole("button", { name: "Vérifier la source et comparer", exact: true }));
+  await submitServerAction(page, form.getByRole("button", { name: "Vérifier la source et comparer", exact: true }), /name="(?:_?\d+_)?document"/);
   await expect(form.getByText(/Version du tutoriel source vérifiée/)).toBeVisible();
   await form.getByLabel("J’ai vérifié la source, la procédure complète et les sujets proches.", { exact: true }).check();
   await form.getByLabel("J’ai vérifié et traité les informations manquantes indiquées.", { exact: true }).check();
   await expect(approve).toBeEnabled();
-  await submitServerAction(page, approve);
+  await submitServerAction(page, approve, /name="(?:_?\d+_)?comparisonSnapshot"/);
   await page.waitForURL(/result=draft_ready/);
   await page.waitForURL(/candidate=[0-9a-f-]+/);
   await expect(card.getByText("Validé", { exact: true })).toBeVisible();
@@ -131,7 +131,7 @@ test("SAV-51 : qualifier chaque section inconnue avant de préparer un brouillon
   await openDetails(page.getByText("Proposer une version de tutoriel au SAV", { exact: true }));
   await page.getByLabel("ID du contenu", { exact: true }).fill(sectionsItemId);
   await page.getByLabel("ID de la version source", { exact: true }).fill(sectionsVersionId);
-  await submitServerAction(page, page.getByRole("button", { name: "Préparer un candidat", exact: true }));
+  await submitServerAction(page, page.getByRole("button", { name: "Préparer un candidat", exact: true }), /name="(?:_?\d+_)?versionId"/);
   await page.waitForURL(/result=candidate_ready/);
   const card = page.locator("article[id^='candidate-']").filter({ has: page.getByRole("heading", { name: sectionsTitle, exact: true }) });
   await expect(card.getByText("À compléter", { exact: true })).toBeVisible();
@@ -159,7 +159,7 @@ test("SAV-51 : qualifier chaque section inconnue avant de préparer un brouillon
   await form.getByLabel("Preuves et précisions apportées", { exact: true }).fill("Sections fictives relues dans cette recette isolée ; chaque décision doit être motivée.");
   await form.getByLabel("Motif de la décision", { exact: true }).fill("Qualification des deux sections fictives de la source SAV-51.");
   await missingAcknowledgment.check();
-  await submitServerAction(page, compare);
+  await submitServerAction(page, compare, /name="(?:_?\d+_)?document"/);
   await expect(form.getByText(/Version du tutoriel source vérifiée/)).toBeVisible();
   await comparisonAcknowledgment.check();
   await missingAcknowledgment.check();
@@ -169,7 +169,7 @@ test("SAV-51 : qualifier chaque section inconnue avant de préparer un brouillon
   await expect(comparisonAcknowledgment).toHaveCount(0);
   await expect(approve).toBeDisabled();
   await secondClassification.selectOption("not_applicable");
-  await submitServerAction(page, compare);
+  await submitServerAction(page, compare, /name="(?:_?\d+_)?document"/);
   await expect(form.getByText(/Version du tutoriel source vérifiée/)).toBeVisible();
   await comparisonAcknowledgment.check();
   await missingAcknowledgment.check();
@@ -179,7 +179,7 @@ test("SAV-51 : qualifier chaque section inconnue avant de préparer un brouillon
   await form.getByLabel("Justification du classement 1", { exact: true }).fill("Le badge confirme le périmètre de démonstration et doit être contrôlé avant de modifier le nom.");
   await expect(comparisonAcknowledgment).toHaveCount(0);
   await expect(approve).toBeDisabled();
-  await submitServerAction(page, compare);
+  await submitServerAction(page, compare, /name="(?:_?\d+_)?document"/);
   await expect(form.getByText(/Version du tutoriel source vérifiée/)).toBeVisible();
   await comparisonAcknowledgment.check();
   await missingAcknowledgment.check();
@@ -187,12 +187,12 @@ test("SAV-51 : qualifier chaque section inconnue avant de préparer un brouillon
   await form.getByLabel("Justification du classement 2", { exact: true }).fill("Cette note décrit uniquement la décoration de la fiche de recette ; elle ne guide aucune action du membre.");
   await expect(comparisonAcknowledgment).toHaveCount(0);
   await expect(approve).toBeDisabled();
-  await submitServerAction(page, compare);
+  await submitServerAction(page, compare, /name="(?:_?\d+_)?document"/);
   await expect(form.getByText(/Version du tutoriel source vérifiée/)).toBeVisible();
   await comparisonAcknowledgment.check();
   await missingAcknowledgment.check();
   await expect(approve).toBeEnabled();
-  await submitServerAction(page, approve);
+  await submitServerAction(page, approve, /name="(?:_?\d+_)?comparisonSnapshot"/);
   await page.waitForURL(/result=draft_ready/);
   await expect(card.getByText("Validé", { exact: true })).toBeVisible();
   await openDetails(card.getByText("Lire la connaissance et ses limites", { exact: true }));

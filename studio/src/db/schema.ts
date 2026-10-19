@@ -726,11 +726,30 @@ export const savDraftVerdicts = sav.table("draft_verdicts", {
   reviewedBy:text("reviewed_by").notNull(),reviewedAt:timestamp("reviewed_at",{withTimezone:true}).notNull().defaultNow(),
 },t=>[uniqueIndex("sav_draft_verdict_current_idx").on(t.messageId).where(sql`${t.isCurrent}=true`)]);
 
+/** Immutable proposal and the context actually available before human correction. */
+export const savAnalysisSnapshots = sav.table("analysis_snapshots", {
+  id:uuid("id").defaultRandom().primaryKey(),
+  messageId:uuid("message_id").notNull().references(()=>savMessages.id,{onDelete:"cascade"}),
+  agentRunId:uuid("agent_run_id").notNull().unique().references(()=>savAgentRuns.id,{onDelete:"cascade"}),
+  contentHash:text("content_hash").notNull(),payloadCiphertext:text("payload_ciphertext").notNull(),
+  codeRevision:text("code_revision").notNull(),capturedAt:timestamp("captured_at",{withTimezone:true}).notNull().defaultNow(),
+});
+export const savMessageTranslations = sav.table("message_translations", {
+  id:uuid("id").defaultRandom().primaryKey(),messageId:uuid("message_id").notNull().references(()=>savMessages.id,{onDelete:"cascade"}),
+  sourceHash:text("source_hash").notNull(),translatorRevision:text("translator_revision").notNull(),language:text("language").notNull().default("unknown"),
+  status:text("status").notNull().default("pending"),payloadCiphertext:text("payload_ciphertext"),errorCode:text("error_code"),
+  leaseToken:uuid("lease_token"),leaseUntil:timestamp("lease_until",{withTimezone:true}),attempts:integer("attempts").notNull().default(0),
+  inputTokens:integer("input_tokens"),outputTokens:integer("output_tokens"),durationMs:integer("duration_ms"),
+  createdAt:timestamp("created_at",{withTimezone:true}).notNull().defaultNow(),updatedAt:timestamp("updated_at",{withTimezone:true}).notNull().defaultNow(),
+},t=>[uniqueIndex("sav_translation_content_idx").on(t.messageId,t.sourceHash,t.translatorRevision),index("sav_translation_due_idx").on(t.status,t.createdAt)]);
+
 export const savResolutionObservations = sav.table("resolution_observations", {
   id:uuid("id").defaultRandom().primaryKey(),
   threadId:uuid("thread_id").notNull().references(()=>savThreads.id,{onDelete:"cascade"}),
   messageId:uuid("message_id").notNull().references(()=>savMessages.id,{onDelete:"cascade"}),
-  verdictId:uuid("verdict_id").notNull().unique().references(()=>savDraftVerdicts.id,{onDelete:"cascade"}),
+  verdictId:uuid("verdict_id").unique().references(()=>savDraftVerdicts.id,{onDelete:"cascade"}),
+  snapshotId: uuid("snapshot_id").references(()=>savAnalysisSnapshots.id,{onDelete:"set null"}),
+  trackingOrigin:text("tracking_origin").notNull().default("draft_feedback"),
   hubspotTicketId:text("hubspot_ticket_id"),state:text("state").notNull().default("waiting_ticket"),
   closedCatchupUntil:timestamp("closed_catchup_until",{withTimezone:true}), remoteUpdatedAt:timestamp("remote_updated_at",{withTimezone:true}), closed:boolean("closed").notNull().default(false),
   cycle:integer("cycle").notNull().default(1),lastSyncAt:timestamp("last_sync_at",{withTimezone:true}),
