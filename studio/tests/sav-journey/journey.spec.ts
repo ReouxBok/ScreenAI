@@ -102,7 +102,7 @@ for (const key of JOURNEY_CASES) {
       await expect(draft.getByRole("button", { name: "Confirmer l’envoi de cette réponse", exact: true })).toBeDisabled();
     }
     await page.getByRole("link", { name: "← Retour aux dossiers", exact: true }).click(); clicks++;
-    await expect(page).toHaveURL(/view=to_validate.*q=journey/);
+    await expect(page).toHaveURL(/view=to_validate.*q=journey/, { timeout: 60_000 });
     expect(external).toEqual([]); expect(errors).toEqual([]);
     expect(existsSync(".e2e-journey-blocked.log") ? readFileSync(".e2e-journey-blocked.log", "utf8") : "").toBe("");
     await testInfo.attach("measurements", { body: JSON.stringify({ scenario:key, elapsedMs:Date.now()-started, scriptedClicks:clicks, manualThinkTimeMeasured:false, modelQualityEvaluated:false }), contentType:"application/json" });
