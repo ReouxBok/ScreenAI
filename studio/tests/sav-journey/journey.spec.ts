@@ -34,7 +34,10 @@ for (const key of JOURNEY_CASES) {
     const execution = page.getByLabel("Exécution de l’action", { exact: true });
     const prepare = execution.getByRole("button", { name: "Préparer l’aperçu de l’action", exact: true });
     await expect(prepare).toBeDisabled();
-    await expect(draft.getByRole("button", { name: "Confirmer l’envoi de cette réponse", exact: true })).toBeEnabled();
+    if(key==="reopen") {
+      await expect(draft.getByRole("button", { name: "Confirmer l’envoi de cette réponse", exact: true })).toBeDisabled();
+      await expect(draft.getByRole("alert")).toContainText("Rédigez une réponse humaine adaptée");
+    } else await expect(draft.getByRole("button", { name: "Confirmer l’envoi de cette réponse", exact: true })).toBeEnabled();
     if (key !== "create") {
       await review.getByRole("radiogroup", { name: "Ticket concerné", exact: true }).getByRole("radio").check(); clicks++;
     }
@@ -76,9 +79,9 @@ for (const key of JOURNEY_CASES) {
       expect(creates).toHaveLength(["create", "successor"].includes(key) ? 1 : 0);
       expect(notes).toHaveLength(["waiting", "reopen", "retry"].includes(key) ? 1 : 0);
       if (["waiting", "reopen", "retry"].includes(key)) expect(state.tickets[ticketId].properties).toMatchObject({ hs_pipeline_stage: "1", hubspot_owner_id: "999201" });
-      await expect(draft.getByRole("button", { name: "Confirmer l’envoi de cette réponse", exact: true })).toBeEnabled();
       const corrected = key === "create" ? "Hello, please send us the exact PDF export error message. We have noted your new attempt." : "Bonjour,\n\nPouvez-vous nous transmettre le message d’erreur exact de l’export PDF ? Nous avons bien noté votre nouvel essai.\n\nMerci pour votre aide.";
       await draft.getByRole("textbox", { name: "Suggestion de réponse", exact: true }).fill(corrected);
+      await expect(draft.getByRole("button", { name: "Confirmer l’envoi de cette réponse", exact: true })).toBeEnabled();
       await expect(draft.getByRole("button", { name: "Accepter cette version", exact: true })).toHaveCount(0);
       // No save/accept step: one confirmation binds the edited preview and recipient.
       await expect(draft).toContainText(`journey-${key}@example.invalid`);

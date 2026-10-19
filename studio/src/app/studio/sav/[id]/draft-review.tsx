@@ -29,7 +29,7 @@ export function DraftReview({ data, threadId, messageId, drafts, sendAllowed, se
   {origin && !notApplicable && <p>{originLabels[origin] ?? "Origine de la réponse à vérifier."}</p>}
   {data.proposal.replyAssessment?.coherence?.status === "unavailable" && <p role="status">Contrôle de cohérence indisponible : le brouillon contextualisé n’a pas été retenu.</p>}
   {data.proposal.replyAssessment?.coherence?.status === "rejected" && <p role="status">Le contrôle de cohérence a refusé le brouillon contextualisé. La proposition affichée demande une reprise humaine.</p>}
-  {notApplicable ? <p>Aucun brouillon autorisé pour cette demande. Traitement humain via le ticket.</p> : <DraftEditor key={current?.id ?? data.draftHash}
+  {notApplicable ? <p>Aucun brouillon autorisé pour cette demande. Traitement humain via le ticket.</p> : <DraftEditor key={JSON.stringify([messageId,data.decisionId,data.agentRunId,data.confirmationSourceHash??data.draftHash,current?.id??null,current?.stale??false])}
     requiresHumanLanguage={Boolean(sourceLanguage&&!(["fr","en","unknown"].includes(sourceLanguage)))} recipient={recipient} language={savReplyLanguage(data.proposal, inboundText)} threadId={threadId} messageId={messageId} decisionId={data.decisionId} agentRunId={data.agentRunId} sourceHash={data.confirmationSourceHash??data.draftHash} feedbackSourceHash={data.draftHash}
     verdictId={verdict?.id ?? null} original={data.proposal.replyDraft} current={current} currentDraftId={current?.id ?? null}
     reason={verdict?.reason ?? ""} reasons={verdict?.reasons ?? []} reasonLabels={Object.entries(savReviewReasonLabels) as [SavReviewReason,string][]}
