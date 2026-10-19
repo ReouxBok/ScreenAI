@@ -4,7 +4,7 @@ import { buildSavRegistrationClarification, savRegistrationIdentityStatus, savSu
 import { savUnderstandingSchema } from "./understanding";
 import type { SavDossierContext } from "./dossier-context";
 
-const absent = { status: "ready", errorCode: null, data: { contactFound: false, errorCode: null, identityCandidates: [], tickets: [], routing: { kind: "new", reason: "none" } } } as SavDossierContext["crm"];
+const absent: SavDossierContext["crm"] = { status: "ready", errorCode: null, data: { contactFound: false, errorCode: null, identityCandidates: [], tickets: [], routing: { kind: "new", reason: "none", candidateIds: [] } } };
 describe("registration identity prerequisite", () => {
   it("distinguishes absent, failed, incomplete and found contacts with failed tickets", () => {
     expect(savRegistrationIdentityStatus(absent)).toBe("not_found");

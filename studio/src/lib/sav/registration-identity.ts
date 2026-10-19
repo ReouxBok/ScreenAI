@@ -67,7 +67,7 @@ export function buildSavRegistrationClarification(u: SavUnderstandingV1, state: 
     kind: r.id === primary && state === "not_found" ? "clarification" as const : "acknowledgement" as const,
     sourceIds: [], missingInformationIds: r.id === primary && state === "not_found" ? [questionId] : [], repeatedAttemptIds: [], repeatJustification: "" })));
   const reply = assembleSavReplySections(understanding, coverage);
-  const responseKind = state === "not_found" ? "clarification" : "acknowledgement";
+  const responseKind: "clarification" | "acknowledgement" = state === "not_found" ? "clarification" : "acknowledgement";
   assertSavReplyConsistency(understanding, { ...reply, category: savSemanticPlan(u).category, responseKind, citations: [] });
   return { ...reply, understanding, responseKind };
 }
