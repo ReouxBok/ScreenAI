@@ -17,7 +17,8 @@ export function savRegistrationIdentityStatus(crm: SavDossierContext["crm"]) {
     && !crm.data.contactFound && !crm.data.contactId ? "not_found" as const : "unavailable" as const;
 }
 
-/** Only a customer's explicit, evidenced registration address can trigger a read.
+/** Retain a customer's evidenced registration address as an UNVERIFIED hint.
+ * It never authorizes a lookup, context disclosure or account action.
  * Callers supply current body / same-customer inbound history, never CRM notes,
  * signatures, quoted forwards, attachments or other-conversation candidates. */
 export function savSuppliedRegistrationEmail(u: SavUnderstandingV1, sources: SavUnderstandingSource[]) {
@@ -27,11 +28,10 @@ export function savSuppliedRegistrationEmail(u: SavUnderstandingV1, sources: Sav
       const proof = u.evidence.find(e => e.id === id);
       const source = sources.find(s => s.sourceId === proof?.sourceId && s.source === proof?.source);
       if (!proof || !source || !savEvidenceContains(source.text, proof.excerpt)) continue;
-      // The key alone is a model assertion. Require the actual customer quote to
-      // state the registration relationship and contain the same single address.
-      if (!/(?:inscri(?:ption|t[eo]?)|(?:registration|sign[ -]?up|registered)\b)/iu.test(proof.excerpt)) continue;
+      // The understanding supplies the meaning; the actual customer quote must
+      // contain the same address. A short reply may consist of that address only.
       if (/(?:n[’']est\s+pas|not\s+(?:my|our)|(?:is|was)\s+not)/iu.test(proof.excerpt)) continue;
-      if (!/(?:je\s+(?:me\s+suis|suis)\s+inscrit|(?:mon|notre)\s+(?:adresse|e-?mail|compte)|(?:my|our)\s+(?:registration|account|e-?mail)|I\s+(?:registered|signed\s+up)|(?:^|\n)(?:adresse\s+)?e-?mail\s+d[’']inscription\s*[:=])/iu.test(proof.excerpt)) continue;
+      if (/(?:\b(?:du|de mon|de notre|d’un autre|d'une autre)\s+(?:client|collègue)\b|\b(?:of|for)\s+(?:my|our|another)\s+(?:colleague|customer|client)\b)/iu.test(proof.excerpt)) continue;
       const emails = proof.excerpt.match(/[A-Z0-9.!#$%&'*+/=?^_`{|}~-]+@[A-Z0-9.-]+\.[A-Z]{2,}/giu) ?? [];
       if (emails.length !== 1 || !fact.text.toLowerCase().includes(emails[0].toLowerCase())) continue;
       const parsed = z.email().safeParse(emails[0]);

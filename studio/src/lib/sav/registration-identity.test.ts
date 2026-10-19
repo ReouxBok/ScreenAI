@@ -58,6 +58,14 @@ describe("registration identity prerequisite", () => {
     u.knownFacts = texts.map((text, i) => ({ id: `f${i}`, key: "registration_email", text, evidenceIds: [`e${i}`] }));
     expect(savSuppliedRegistrationEmail(u, [{ source: "current_message", sourceId: "current_body", text: texts.join("\n") }])).toEqual({ email: null, ambiguous: true });
   });
+  it("recognizes an evidenced short email reply without requiring the customer to repeat registration wording", () => {
+    const u = understandingFixture(); u.evidence[0].excerpt = "compte@example.invalid";
+    u.knownFacts = [{ id: "reg", key: "registration_email", text: "compte@example.invalid", evidenceIds: [u.evidence[0].id] }];
+    expect(savSuppliedRegistrationEmail(u, [{ source: "current_message", sourceId: "current_body", text: "compte@example.invalid" }])).toEqual({ email: "compte@example.invalid", ambiguous: false });
+    const reply = buildSavRegistrationClarification(u, "confirmation_required", { email: "compte@example.invalid", ambiguous: false });
+    expect(reply.replyDraft).toContain("Merci pour l’adresse email d’inscription indiquée");
+    expect(reply.replyDraft).not.toContain("?");
+  });
   it("reserves a unique question id and stays bounded with fifteen long requests", () => {
     const u = understandingFixture(); u.knownFacts = [{ id: "registration_identity_question", key: "version", text: "v2", evidenceIds: [u.evidence[0].id] }];
     u.requests = Array.from({ length: 15 }, (_, i) => ({ ...u.requests[0], id: `r${i}`, summary: "x".repeat(600) })); u.primaryRequestId = "r0";

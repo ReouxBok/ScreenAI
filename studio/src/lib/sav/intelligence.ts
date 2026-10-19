@@ -527,7 +527,7 @@ async function analyzeSavMessageWithinBudget(input: SavEnrichedInput, context: S
     enriched.understanding = await understandSavMessage(enriched, { ...context.evaluation, playbook: enriched.activePlaybook });
     let understanding = enriched.understanding;
     const registrationSources = [{ source: "current_message" as const, sourceId: "current_body", text: messageContext.currentText },
-      ...(conversation?.senderMatchesCustomer ? conversation.messages.filter(m => m.direction === "inbound" && m.from.toLowerCase() === enriched.from.toLowerCase() && m.id !== conversation.currentMessageId)
+      ...(conversation?.senderMatchesCustomer ? (conversation.messages ?? []).filter(m => m.direction === "inbound" && m.from.toLowerCase() === enriched.from.toLowerCase() && m.id !== conversation.currentMessageId)
         .map(m => ({ source: "history" as const, sourceId: `message:${m.id}`, text: `[inbound] ${m.text}` })) : [])];
     const suppliedRegistration = savSuppliedRegistrationEmail(understanding, registrationSources);
     // A declared address is not authorization to read another account. Retain
