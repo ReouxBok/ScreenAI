@@ -129,6 +129,7 @@ export const savRoutingReasonLabels = {
   no_contact: "Aucun contact reconnu",
   contact_not_found: "Aucun contact reconnu",
   customer_identity_unverified: "Identité du client à vérifier",
+  registration_email_confirmation_required: "Email d’inscription indiqué : rapprochement du compte à confirmer",
   hubspot_context_unavailable: "Contexte HubSpot indisponible",
 } as const;
 

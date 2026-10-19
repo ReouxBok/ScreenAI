@@ -1,6 +1,38 @@
 import { submitServerAction } from "../helpers/server-action";
 import { expect, test } from "@playwright/test";
-import { SAV_SEMANTIC_E2E_DRAFT, SAV_SEMANTIC_E2E_THREAD } from "../../test/sav-semantic-e2e-fixture";
+import { SAV_REGISTRATION_E2E_THREAD, SAV_SEMANTIC_E2E_DRAFT, SAV_SEMANTIC_E2E_THREAD } from "../../test/sav-semantic-e2e-fixture";
+
+test("SAV79 requests identity without suggesting a ticket and preserves dossier/draft review", async ({ page, baseURL }, testInfo) => {
+  const externalRequests: string[] = [];
+  await page.route("**/*", route => {
+    if (new URL(route.request().url()).origin !== baseURL) { externalRequests.push(route.request().url()); return route.abort(); }
+    return route.continue();
+  });
+  await page.goto(`/studio/sav/${SAV_REGISTRATION_E2E_THREAD}`);
+  const form = page.getByRole("form", { name: "Proposition de l’IA", exact: true });
+  const draft = page.getByRole("region", { name: "Verdict du brouillon", exact: true });
+  await expect(form).toContainText("Identifier le compte avant toute action");
+  await expect(form.locator('input[name="humanAction"]')).toHaveCount(0);
+  await expect(form.locator('input[name="humanProcess"]')).toHaveCount(0);
+  await expect(draft).toContainText("adresse email utilisée lors de votre inscription à Limova");
+  await expect(draft).toContainText("Bonjour,");
+  await expect(page.getByRole("button", { name: "Préparer l’aperçu de l’action", exact: true })).toBeDisabled();
+  await form.getByRole("checkbox", { name: "J’ai relu la demande et l’étape de vérification du compte.", exact: true }).check();
+  await submitServerAction(page, form.getByRole("button", { name: "Valider le dossier", exact: true }));
+  await page.waitForURL(/review=saved/, { timeout: 30_000 });
+  await expect(page.locator("#sav-action")).toContainText("Dossier · validé par ugo@limova.ai");
+  await page.reload();
+  await expect(form).toContainText("Identifier le compte avant toute action");
+  await expect(form.locator('input[name="humanAction"]')).toHaveCount(0);
+  await expect(draft).toContainText("adresse email utilisée lors de votre inscription à Limova");
+  await form.getByRole("button", { name: "Choisir manuellement une action après vérification du compte", exact: true }).click();
+  await expect(form.getByRole("radio", { name: "Créer un nouveau ticket", exact: true })).toBeVisible();
+  // Explicitly opening the manual editor is not a CRM action or a persisted choice.
+  await page.reload();
+  await expect(form.locator('input[name="humanAction"]')).toHaveCount(0);
+  expect(externalRequests).toEqual([]);
+  await page.screenshot({ path: testInfo.outputPath("sav79-registration-identity.png"), fullPage: true });
+});
 
 test("SAV76 diagnostics are readable directly without opening or replaying the dossier", async ({ request }) => {
   const response = await request.get(`/api/internal/sav/dossiers/${SAV_SEMANTIC_E2E_THREAD}/diagnostics`);
@@ -95,10 +127,14 @@ test("SAV44 exposes understanding and persists independent dossier/draft feedbac
   await processConfirmation.check();
   await submitServerAction(page, dossier.getByRole("button", { name: "Valider le dossier", exact: true }));
   await page.waitForURL(/review=saved/, { timeout: 30_000 });
+  // This harness has no CRM credentials. The fresh context read must fail;
+  // a cached ready snapshot before that asynchronous result is not readiness.
+  await page.waitForURL(/context=failed/, { timeout: 30_000 });
+  await expect(page.getByText("Le contexte HubSpot est indisponible ou incomplet. Actualisez-le avant de choisir une action.", { exact: true })).toBeVisible();
   await expect(dossier).toContainText("Dossier · validé par ugo@limova.ai");
   await expect(draft).toContainText("Contexte ou texte modifié : nouvelle lecture nécessaire.");
   await expect(draft.getByRole("button", { name: "Accepter cette version", exact: true })).toBeEnabled();
-  await expect(page.getByRole("button", { name: "Préparer l’aperçu de l’action", exact: true })).toBeEnabled();
+  await expect(page.getByRole("button", { name: "Préparer l’aperçu de l’action", exact: true })).toBeDisabled();
   await expect(draft.getByRole("button", { name: "Envoyer la réponse acceptée", exact: true })).toBeDisabled();
 
   await page.reload();
@@ -117,7 +153,7 @@ test("SAV44 exposes understanding and persists independent dossier/draft feedbac
   await openUnderstanding();
   await expect(understanding).toContainText("L’export du document échoue malgré une nouvelle tentative.");
   await expect(page.getByText("Aucun ticket lié à ce dossier.", { exact: true })).toBeVisible();
-  await expect(page.getByRole("button", { name: "Préparer l’aperçu de l’action", exact: true })).toBeEnabled();
+  await expect(page.getByRole("button", { name: "Préparer l’aperçu de l’action", exact: true })).toBeDisabled();
   await expect(draft.getByRole("button", { name: "Envoyer la réponse acceptée", exact: true })).toBeDisabled();
   expect(externalRequests).toEqual([]); expect(browserErrors).toEqual([]);
   await page.screenshot({ path: testInfo.outputPath("sav44-independent-semantic-review.png"), fullPage: true });
