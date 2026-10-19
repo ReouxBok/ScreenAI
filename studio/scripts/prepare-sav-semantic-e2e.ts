@@ -4,7 +4,7 @@ import { PGlite } from "@electric-sql/pglite";
 import { vector } from "@electric-sql/pglite-pgvector";
 import { drizzle } from "drizzle-orm/pglite";
 import { savAgentRuns, savDecisions, savMailboxes, savMessages, savSyncState, savThreads } from "../src/db/schema";
-import { SAV_SEMANTIC_E2E_BODY, SAV_SEMANTIC_E2E_KEY, SAV_SEMANTIC_E2E_THREAD, savSemanticE2eProposal } from "../test/sav-semantic-e2e-fixture";
+import { SAV_REGISTRATION_E2E_THREAD, savRegistrationE2eProposal, SAV_SEMANTIC_E2E_BODY, SAV_SEMANTIC_E2E_KEY, SAV_SEMANTIC_E2E_THREAD, savSemanticE2eProposal } from "../test/sav-semantic-e2e-fixture";
 
 const target = path.resolve(process.env.STUDIO_E2E_DB_DIR ?? ".e2e-db");
 if (process.env.NODE_ENV === "production" || process.env.DATABASE_URL !== `pglite://${target}` || process.env.SAV_ENCRYPTION_KEY_V1 !== SAV_SEMANTIC_E2E_KEY) throw new Error("LOCAL_SYNTHETIC_E2E_CONFIGURATION_REQUIRED");
@@ -36,5 +36,13 @@ try {
   const [message] = await db.insert(savMessages).values({ id: messageId, mailboxId: mailbox.id, threadId: thread.id, gmailMessageId: "synthetic-sav44-message", direction: "inbound", fromEmail: thread.customerEmail, toEmails: [mailbox.email], subject: thread.subject, bodyCiphertext: encryptFixture({ text: SAV_SEMANTIC_E2E_BODY, supportContext }), receivedAt: new Date("2026-10-02T12:00:00Z"), analysisStatus: "done", processedAt: new Date("2026-10-02T12:00:01Z") }).returning();
   const [run] = await db.insert(savAgentRuns).values({ messageId: message.id, runtime: "synthetic_fixture", mode: "off", status: "succeeded", model: "synthetic-e2e-model", promptRevision: "synthetic-e2e-prompt", codeRevision: "a".repeat(40), dataOrigin: "test", inputHash: "synthetic-input", proposalCiphertext: encryptFixture(proposal), completedAt: new Date("2026-10-02T12:00:01Z") }).returning();
   await db.insert(savDecisions).values({ messageId: message.id, agentRunId: run.id, kind: "human_review_required", reasonCode: proposal.decision.reasonCode, explanation: proposal.decision.explanation, confidence: 0, model: "synthetic-e2e-model" });
+  const identityProposal = savRegistrationE2eProposal();
+  const identityMessageId = randomUUID();
+  await db.insert(savThreads).values({ id: SAV_REGISTRATION_E2E_THREAD, mailboxId: mailbox.id, gmailThreadId: "synthetic-sav79-thread", subject: "E2E — identité avant action", customerEmail: "fixture-unknown@example.invalid", lastMessageAt: new Date("2026-10-02T12:00:00Z") });
+  const identityContext = { ...supportContext, messageId: identityMessageId, customerIdentity: { kind: "sender", email: "fixture-unknown@example.invalid" },
+    crm: { status: "ready", errorCode: null, data: { errorCode: null, contactFound: false, identityCandidates: [], tickets: [], routing: { kind: "new", reason: "no_contact", candidateIds: [] } } } };
+  await db.insert(savMessages).values({ id: identityMessageId, mailboxId: mailbox.id, threadId: SAV_REGISTRATION_E2E_THREAD, gmailMessageId: "synthetic-sav79-message", direction: "inbound", fromEmail: "fixture-unknown@example.invalid", toEmails: [mailbox.email], subject: "E2E — identité avant action", bodyCiphertext: encryptFixture({ text: SAV_SEMANTIC_E2E_BODY, supportContext: identityContext }), receivedAt: new Date("2026-10-02T12:00:00Z"), analysisStatus: "done", processedAt: new Date("2026-10-02T12:00:01Z") });
+  const [identityRun] = await db.insert(savAgentRuns).values({ messageId: identityMessageId, runtime: "synthetic_fixture", mode: "off", status: "succeeded", model: "synthetic-e2e-model", promptRevision: "sav-registration-identity-2026-10-19.v1", codeRevision: "a".repeat(40), dataOrigin: "test", inputHash: "synthetic-identity-input", proposalCiphertext: encryptFixture(identityProposal), completedAt: new Date("2026-10-02T12:00:01Z") }).returning();
+  await db.insert(savDecisions).values({ messageId: identityMessageId, agentRunId: identityRun.id, kind: "human_review_required", reasonCode: identityProposal.decision.reasonCode, explanation: identityProposal.decision.explanation, confidence: 0, model: "synthetic-e2e-model" });
   console.log("SAV semantic E2E fixture ready (synthetic local data only).");
 } finally { await client.close(); }

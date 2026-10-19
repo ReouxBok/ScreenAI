@@ -1,6 +1,7 @@
 import { enqueueSavTranslation } from "./translations";
 import { captureSavAnalysisSnapshot } from "./case-learning";
 import { SAV_EMAIL_WRITING_SKILL, SAV_EMAIL_WRITING_REVISION, styleSavEmailCoverage } from "./email-writing";
+import { buildSavRegistrationClarification, savRegistrationIdentityStatus, savRegistrationPrerequisiteApplies, savSuppliedRegistrationEmail, SAV_REGISTRATION_IDENTITY_REVISION } from "./registration-identity";
 import { savRollbackCompatibleProposal } from "./proposal-compatibility";
 import { addSavInvestigationQuestions, buildSavInvestigationReply } from "./investigation";
 import { savValidationDiagnostic } from "./validation-diagnostics-server";
@@ -518,6 +519,7 @@ async function analyzeSavMessageWithinBudget(input: SavEnrichedInput, context: S
     crm: { status: crm ? crm.errorCode ? "partial" : "ready" : "error", data: crm, errorCode: crm?.errorCode ?? (crm ? null : customerIdentity.kind === "unresolved_forward" ? "SAV_FORWARDED_CUSTOMER_UNRESOLVED" : "SAV_HUBSPOT_CONTEXT_UNAVAILABLE") },
     conversation: conversation ?? null, conversationError: null, otherConversations: [], otherConversationsError: null } };
   let analysis: SavAnalysis;
+  let registrationEmail: string | null = null;
   if (technical) {
     analysis = { category: "other", urgency: "normal", proposal: preflight, evidence: [{ sourceType: "rule", sourceId: preflight.reasonCode, title: preflight.explanation }], replyDraft: null, internalNote: null, model: "rules-v1", ticketRouting: { kind: "none", reason: preflight.reasonCode }, replyAssessment: { kind: "none", coverage: [], errorCode: null } };
     analysis.agentRunId = (await recordAgentRun({ context, source: enriched, analysis, runtime: "rules", mode: context.evaluation?.mode ?? savHarnessMode(), status: "succeeded", model: analysis.model, promptRevision: SAV_RULES_REVISION })) ?? undefined;
@@ -525,11 +527,36 @@ async function analyzeSavMessageWithinBudget(input: SavEnrichedInput, context: S
     try { enriched.activePlaybook = context.evaluation ? context.evaluation.playbook ?? { versionId: "existing-process-v1", version: 0, document: defaultSavPlaybook } : await readActiveSavPlaybook(); }
     catch { throw new Error("SAV_PLAYBOOK_UNAVAILABLE"); }
     enriched.understanding = await understandSavMessage(enriched, { ...context.evaluation, playbook: enriched.activePlaybook });
-    const understanding = enriched.understanding;
+    let understanding = enriched.understanding;
+    const registrationSources = [{ source: "current_message" as const, sourceId: "current_body", text: messageContext.currentText },
+      ...(conversation?.senderMatchesCustomer ? (conversation.messages ?? []).filter(m => m.direction === "inbound" && m.from.toLowerCase() === enriched.from.toLowerCase() && m.id !== conversation.currentMessageId)
+        .map(m => ({ source: "history" as const, sourceId: `message:${m.id}`, text: `[inbound] ${m.text}` })) : [])];
+    const suppliedRegistration = savSuppliedRegistrationEmail(understanding, registrationSources);
+    // A declared address is not authorization to read another account. Retain
+    // the hint for the existing human identity check, never fetch its CRM here.
+    if (savRegistrationPrerequisiteApplies(understanding) && savRegistrationIdentityStatus(enriched.dossierContext!.crm) !== "identified") registrationEmail = suppliedRegistration.email;
     const plan = savSemanticPlan(understanding);
     // Lexical hints from the old context builder are not part of model reasoning.
     enriched.messageContext = { ...messageContext, language: understanding.language, intents: [], facts: [] };
     if (plan.replyPolicy === "lead_template") analysis = await analyzeSavLeadInquiry(enriched, context);
+    else if (savRegistrationPrerequisiteApplies(understanding) && savRegistrationIdentityStatus(enriched.dossierContext!.crm) !== "identified") {
+      const state = savRegistrationIdentityStatus(enriched.dossierContext!.crm) !== "not_found" ? "unavailable"
+        : suppliedRegistration.email && suppliedRegistration.email !== enriched.from.toLowerCase() ? "confirmation_required" : "not_found";
+      const reply = buildSavRegistrationClarification(understanding, state, suppliedRegistration);
+      enriched.understanding = understanding = reply.understanding;
+      assertSavGrounding({ ...reply, category: plan.category, urgency: "normal", ticketRequired: true, reasonCode: "registration_identity", explanation: "Registration identity prerequisite", confidence: 0,
+        requiresHuman: true, internalNote: "", evidenceIds: [], citations: [] }, []);
+      analysis = { category: plan.category, urgency: "normal", model: "rules-registration-v1", understanding,
+        proposal: { kind: "human_review_required", reasonCode: state === "not_found" ? "registration_email_required" : state === "confirmation_required" ? "registration_email_confirmation_required" : "registration_lookup_unavailable",
+          explanation: state === "not_found" ? "Identifier le compte par l’email d’inscription avant toute proposition d’action sur celui-ci. Brouillon de clarification à valider."
+            : state === "confirmation_required" ? "Email d’inscription déjà fourni : vérifier l’identité du demandeur et confirmer cette adresse dans le dossier avant de lire le compte correspondant. Ne pas redemander l’adresse ni proposer d’action sur ce compte."
+              : "Recherche HubSpot non vérifiée : ne pas conclure à l’absence de client. Rétablir la lecture avant toute proposition d’action sur le compte.", confidence: 0, requiresHumanApproval: true },
+        evidence: [{ sourceType: "rule", sourceId: SAV_REGISTRATION_IDENTITY_REVISION, title: "Identité du compte avant action" }],
+        replyDraft: reply.replyDraft, internalNote: null, replyAssessment: { kind: "contextualized", coverage: reply.coverage, errorCode: null } };
+      analysis.agentRunId = (await recordAgentRun({ context, source: enriched, analysis, runtime: "semantic_policy", mode: context.evaluation?.mode ?? savHarnessMode(),
+        status: state === "unavailable" ? "fallback" : "succeeded", errorCode: state === "unavailable" ? "SAV_REGISTRATION_LOOKUP_UNAVAILABLE" : undefined,
+        model: analysis.model, promptRevision: SAV_REGISTRATION_IDENTITY_REVISION })) ?? undefined;
+    }
     else if (plan.replyPolicy === "compose") analysis = await analyzeSavMessageRaw(enriched, context);
     else {
       analysis = restrictedSemanticAnalysis(understanding);
@@ -575,6 +602,7 @@ async function analyzeSavMessageWithinBudget(input: SavEnrichedInput, context: S
       analysis.identityCandidates = crm?.identityCandidates ?? [];
       analysis.ticketRouting = !crm || crm.errorCode ? { kind: "review", reason: "hubspot_context_unavailable", candidateIds: [] }
         : !crm.contactFound || !crm.contactId ? { kind: "review", reason: "customer_identity_unverified", candidateIds: [] }
+          : registrationEmail ? { kind: "review", reason: "registration_email_confirmation_required", candidateIds: [] }
            : crm.routing.kind === "matched" && crm.routing.ticketId ? crm.routing.returnOperation === "create"
             ? { kind: "new", contactId: crm.contactId, reason: "closed_over_15_days" }
             : crm.routing.returnOperation === "review" ? { kind: "review", reason: "ticket_closure_or_stage_to_review", candidateIds: [crm.routing.ticketId] }
@@ -603,6 +631,7 @@ async function analyzeSavMessageWithinBudget(input: SavEnrichedInput, context: S
     validationDiagnostics: [...(analysis.understanding?.trace.validationDiagnostics ?? []), ...(analysis.replyAssessment?.validationDiagnostics ?? [])],
     understandingRecovery: analysis.understanding?.trace.validationRecovery ?? null, recovery: analysis.replyAssessment?.recovery ?? null, coherenceAttempts: analysis.replyAssessment?.coherenceAttempts ?? [] };
   analysis.structuredProposal = savRollbackCompatibleProposal(buildSavStructuredProposal(enriched, analysis));
+  if (registrationEmail) analysis.structuredProposal.customerIdentity = { registrationEmail, verifiedByHuman: false };
   if (context.messageId) {
     if (!analysis.agentRunId) throw new Error("SAV_ANALYSIS_TRACE_REQUIRED");
     const coherence = analysis.replyAssessment?.coherence;
