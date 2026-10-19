@@ -21,7 +21,7 @@ test("Ugo recompare le contenu corrigé avant de préparer un brouillon SAV", as
   await page.getByText("Revoir, corriger ou écarter cette connaissance", { exact: true }).click();
   const approve = page.getByRole("button", { name: "Valider et préparer le brouillon SAV" });
   await expect(approve).toBeDisabled();
-  await submitServerAction(page, page.getByRole("button", { name: "Actualiser la comparaison" }));
+  await submitServerAction(page, page.getByRole("button", { name: "Actualiser la comparaison" }), /name="(?:_?\d+_)?document"/);
   const acknowledgment = page.getByRole("checkbox", { name: /J’ai vérifié les sources, le contenu corrigé/ });
   await acknowledgment.check();
   await expect(approve).toBeEnabled();
@@ -32,11 +32,11 @@ test("Ugo recompare le contenu corrigé avant de préparer un brouillon SAV", as
   await editor.fill(JSON.stringify(document));
   await expect(approve).toBeDisabled();
   await expect(acknowledgment).toHaveCount(0);
-  await submitServerAction(page, page.getByRole("button", { name: "Actualiser la comparaison" }));
+  await submitServerAction(page, page.getByRole("button", { name: "Actualiser la comparaison" }), /name="(?:_?\d+_)?document"/);
   await expect(page.getByRole("region", { name: "Comparaison du contenu corrigé" })).toContainText(document.steps[0].instruction);
   await acknowledgment.check();
   await page.getByLabel("Motif de la décision").fill("Sources fictives et correction revues dans le test navigateur.");
-  await submitServerAction(page, approve);
+  await submitServerAction(page, approve, /name="(?:_?\d+_)?comparisonSnapshot"/);
   await expect(page.getByRole("status")).toContainText("Décision enregistrée");
   await expect(page.locator("article").filter({ hasText: title }).getByText("Validé", { exact: true })).toBeVisible();
   await page.getByText("Lire la connaissance et ses limites", { exact: true }).click();

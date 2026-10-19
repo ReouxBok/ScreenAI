@@ -9,7 +9,9 @@ export async function submitServerAction(page: Page, button: Locator, matchBody?
   // Bound forms expose their server action ID in the SSR transport field.
   // The dossier-open side effect also posts next-action; it must not satisfy this wait.
   const actionId = await button.evaluate(element => {
-    const form = (element as HTMLButtonElement).form;
+    const button = element as HTMLButtonElement;
+    // A type=button callback invokes its own action, not the enclosing form action.
+    const form = button.type === "button" ? null : button.form;
     const field = form?.querySelector<HTMLInputElement>('input[name^="$ACTION_ID_"]');
     return field?.name.slice("$ACTION_ID_".length) ?? null;
   });
