@@ -5,8 +5,8 @@ import { guardReanalysisDatabase, reanalysisServerIdentity } from "./reanalysis-
 afterEach(() => vi.unstubAllEnvs());
 describe("reanalysis database boundary", () => {
   it("permits SELECT and own audit envelopes, refuses every operational write", async () => {
-    const insert = vi.fn((_table: unknown) => ({ values: vi.fn(input => input) })), update = vi.fn((_table: unknown) => ({ set: vi.fn(input => input) }));
-    const native = { select: vi.fn(), insert, update, delete: vi.fn(), execute: vi.fn((_query: unknown) => undefined), transaction: async (fn: (tx: unknown) => unknown) => fn(native) };
+    const insert = vi.fn((table: unknown) => ({ table, values: vi.fn(input => input) })), update = vi.fn((table: unknown) => ({ table, set: vi.fn(input => input) }));
+    const native = { select: vi.fn(), insert, update, delete: vi.fn(), execute: vi.fn((query: unknown) => query), transaction: async (fn: (tx: unknown) => unknown) => fn(native) };
     const db = guardReanalysisDatabase(native);
     db.execute(sql`select 1`); expect(native.execute).toHaveBeenCalledOnce();
     for (const table of [savActions, savAgentRuns, savDecisions, savMessages, savThreads]) {

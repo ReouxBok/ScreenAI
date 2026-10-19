@@ -62,6 +62,7 @@ describe("authenticated server reanalysis with the actual guarded executor", () 
     await terminal;
     expect((await fixture.db.select().from(auditLogs).where(eq(auditLogs.id, ordinary.id)))[0].technicalMetadata).toEqual({ protected: true });
     expect(() => guarded.insert(auditLogs).values({ id: ordinary.id, actorEmail: "ugo@limova.ai", action: "sav_reanalysis_claim", entityType: "sav_reanalysis_message", entityId: randomUUID() }).onConflictDoUpdate({ target: auditLogs.id, set: { technicalMetadata: {} } })).toThrow("AUDIT_REFUSED");
+    expect(() => guarded.insert(auditLogs).values({ id: ordinary.id, actorEmail: "ugo@limova.ai", action: "sav_reanalysis_claim", entityType: "sav_reanalysis_message", entityId: randomUUID() }).$dynamic().onConflictDoUpdate({ target: auditLogs.id, set: { technicalMetadata: {} } })).toThrow("AUDIT_REFUSED");
   });
   it("authorizes, seals, executes and compares without changing the original dossier or creating normal runs", async () => {
     const p = await plan(), baseline = await readReanalysisBaseline(p.pair.threadId);

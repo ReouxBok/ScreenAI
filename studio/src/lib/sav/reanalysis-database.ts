@@ -33,7 +33,8 @@ export function guardReanalysisDatabase<T extends object>(db: T): T {
           eq(schema.auditLogs.action, "sav_reanalysis_claim"), eq(schema.auditLogs.entityType, "sav_reanalysis_message"))); } };
       } };
       const protectInsert = (query: object): object => new Proxy(query, { get(value, property) {
-        if (property === "onConflictDoUpdate") return () => { throw new Error("SAV_REANALYSIS_AUDIT_REFUSED"); };
+        if (!["returning", "onConflictDoNothing", "then", "catch", "finally", "execute"].includes(String(property)))
+          return () => { throw new Error("SAV_REANALYSIS_AUDIT_REFUSED"); };
         const fn = Reflect.get(value, property);
         if (property === "onConflictDoNothing" || property === "returning") return (...args: unknown[]) => protectInsert(Reflect.apply(fn, value, args));
         return typeof fn === "function" ? fn.bind(value) : fn;
