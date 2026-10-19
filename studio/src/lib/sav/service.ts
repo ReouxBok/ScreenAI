@@ -1,3 +1,5 @@
+import { enqueueSavTranslation } from "./translations";
+import { savResolutionObservations } from "@/db/schema";
 import "server-only";
 
 import { and, asc, desc, eq, ilike, inArray, isNotNull, isNull, lt, notInArray, or, sql } from "drizzle-orm";
@@ -316,6 +318,7 @@ export async function ingestInboundMessage(rawInput: unknown) {
     if (created && eligible) {
       const now = new Date();
       await invalidateSavReplies(tx, thread.id, "SAV_REPLY_OBSOLETE", now);
+      await tx.update(savResolutionObservations).set({nextSyncAt:now,closedCatchupUntil:null,sourceErrors:["new_inbound_awaiting_sync"]}).where(eq(savResolutionObservations.threadId,thread.id));
       // Any incoming message invalidates approvals immediately. Human handoff
       // is applied by createDecision after semantic qualification, not keywords.
     }
@@ -324,6 +327,7 @@ export async function ingestInboundMessage(rawInput: unknown) {
 
   if (result.duplicate) return result;
   if (!eligible) return { ...result, excludedFromProposals: true as const, proposalSkipReason: cutover ? "before_cutover" : "cutover_not_active" };
+  await enqueueSavTranslation(result.message.id).catch(()=>undefined);
   if (isSavPilotMode()) return { ...result, queuedForPilot: true as const };
   const decision = await processStoredSavMessage(result.message.id);
   return { ...result, decision };

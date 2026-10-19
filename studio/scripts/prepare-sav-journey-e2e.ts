@@ -4,7 +4,7 @@ import path from "node:path";
 import { PGlite } from "@electric-sql/pglite";
 import { vector } from "@electric-sql/pglite-pgvector";
 import { drizzle } from "drizzle-orm/pglite";
-import { savAgentRuns, savDecisions, savMailboxes, savMessages, savSyncState, savThreads } from "../src/db/schema";
+import { savAgentRuns, savDecisions, savMailboxes, savMessages, savMessageTranslations, savReplyDrafts, savSyncState, savThreads } from "../src/db/schema";
 import { savSemanticE2eProposal, SAV_SEMANTIC_E2E_BODY } from "../test/sav-semantic-e2e-fixture";
 import { JOURNEY_KEY, JOURNEY_CASES, journeyId } from "../test/sav-journey-fixture";
 const target = path.resolve(".e2e-journey-db");
@@ -27,13 +27,17 @@ try {
     remote.cases[key] = { email, contactId, ticketId, receivedAt, fault: key === "retry" ? "403" : key === "uncertain" ? "timeout" : null };
     if (key !== "create") remote.tickets[ticketId] = { id: ticketId, properties: { subject: ticket.subject, content: ticket.description, hs_pipeline: "0", hs_pipeline_stage: stage, hubspot_owner_id: "999201", hs_last_closed_date: closedAt, createdate: ticket.createdAt }, associations: { contacts: { results: [{ id: contactId }] } } };
     const proposal = savSemanticE2eProposal();
+    const inboundText = key === "create" ? "Hello, my PDF export fails with ERR_42. Please help. https://example.invalid/help 24 MB" : SAV_SEMANTIC_E2E_BODY;
+    if (key === "create") { if(proposal.understanding) proposal.understanding.language="en"; proposal.replyDraft = "Hello, please send us the exact PDF export error message."; if(proposal.messageContext) proposal.messageContext.language="en"; }
     if (key !== "create") proposal.routing = { kind: "matched", ticketId, reason: "fixture_same_issue", contactId };
     const messageId = randomUUID(), threadId = journeyId(key);
     const context = { version: 1, messageId, collectedAt: receivedAt, customerIdentity: { kind: "sender", email }, crm: { status: "ready", errorCode: null, data: { errorCode: null, contactFound: true, contactId, identityCandidates: [], tickets: key === "create" ? [] : [ticket], routing: key === "create" ? { kind: "new", reason: "fixture", candidateIds: [] } : { kind: "matched", ticketId, reason: "fixture_same_issue", returnOperation: "reactivate" } } }, conversation: null, conversationError: null, otherConversations: [], otherConversationsError: null };
     await db.insert(savThreads).values({ id: threadId, mailboxId: mailbox.id, gmailThreadId: `journey-${key}`, subject: `Recette ${key} export PDF`, customerEmail: email, hubspotTicketId: ["create", "link"].includes(key) ? null : ticketId, lastMessageAt: new Date(receivedAt) });
-    await db.insert(savMessages).values({ id: messageId, mailboxId: mailbox.id, threadId, gmailMessageId: `journey-message-${key}`, direction: "inbound", fromEmail: email, toEmails: [mailbox.email], subject: `Recette ${key} export PDF`, bodyCiphertext: encrypted({ text: SAV_SEMANTIC_E2E_BODY, headers: { "message-id": `<journey-${key}@example.invalid>` }, supportContext: context }), receivedAt: new Date(receivedAt), analysisStatus: "done", processedAt: new Date(receivedAt) });
+    await db.insert(savMessages).values({ id: messageId, mailboxId: mailbox.id, threadId, gmailMessageId: `journey-message-${key}`, direction: "inbound", fromEmail: email, toEmails: [mailbox.email], subject: `Recette ${key} export PDF`, bodyCiphertext: encrypted({ text: inboundText, headers: { "message-id": `<journey-${key}@example.invalid>` }, supportContext: context }), receivedAt: new Date(receivedAt), analysisStatus: "done", processedAt: new Date(receivedAt) });
+    await db.insert(savMessageTranslations).values({messageId,sourceHash:createHash("sha256").update(JSON.stringify(inboundText)).digest("base64url"),translatorRevision:"sav-fr-translation.v1",language:key==="create"?"en":key==="link"?"en":key==="reopen"?"mixed":"fr",status:key==="create"?"complete":key==="link"?"partial":key==="reopen"?"unsupported":"not_required",payloadCiphertext:key==="create"?encrypted({text:"Bonjour, mon export PDF échoue avec ERR_42. Merci de m’aider. https://example.invalid/help 24 MB"}):null});
     const [run] = await db.insert(savAgentRuns).values({ messageId, runtime: "synthetic_fixture", mode: "off", status: "succeeded", model: "synthetic-only", promptRevision: "synthetic-only", dataOrigin: "test", inputHash: "fixture", proposalCiphertext: encrypted(proposal), completedAt: new Date(receivedAt) }).returning();
-    await db.insert(savDecisions).values({ messageId, agentRunId: run.id, kind: "human_review_required", reasonCode: proposal.decision.reasonCode, explanation: proposal.decision.explanation, confidence: 0 });
+    const [decision]=await db.insert(savDecisions).values({ messageId, agentRunId: run.id, kind: "human_review_required", reasonCode: proposal.decision.reasonCode, explanation: proposal.decision.explanation, confidence: 0 }).returning();
+    if(key==="link")await db.insert(savReplyDrafts).values({threadId,messageId,decisionId:decision.id,agentRunId:run.id,knowledgeRevision:"stale-synthetic-revision",revision:1,status:"draft",sourceHash:"x".repeat(43),bodyCiphertext:encrypted({text:"Ancienne version humaine périmée.",origin:"human"}),createdBy:"ugo@limova.ai"});
   }
   writeFileSync(path.resolve(".e2e-journey-provider.json"), JSON.stringify(remote));
   writeFileSync(path.resolve(".e2e-journey-blocked.log"), "");

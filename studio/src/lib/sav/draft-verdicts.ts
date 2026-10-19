@@ -1,8 +1,9 @@
+import { ensureSavCaseObservationTx } from "./case-learning";
 import "server-only";
 import { and, desc, eq, max, sql } from "drizzle-orm";
 import { z } from "zod";
 import { requireDb } from "@/db";
-import { activeKnowledge, auditLogs, savActions, savAgentRuns, savDecisions, savDraftVerdicts, savMessages, savProposalReviews, savReplyDrafts, savResolutionObservations, savThreads } from "@/db/schema";
+import { activeKnowledge, auditLogs, savActions, savAgentRuns, savDecisions, savDraftVerdicts, savMessages, savProposalReviews, savReplyDrafts, savThreads } from "@/db/schema";
 import { assertSavActor } from "./access";
 import { isSavMessageEligible } from "./cutover";
 import { decryptSavPayload, encryptSavPayload, savContentHash } from "./crypto";
@@ -86,8 +87,7 @@ export async function reviewSavDraft(raw: unknown, actorEmail: string) {
         }
         const [result] = await tx.insert(savDraftVerdicts).values({ threadId: thread.id, messageId: c.message.id, decisionId: c.decision.id, agentRunId: c.run.id, draftId, sourceHash: currentHash, status: input.status,
             snapshotCiphertext: encryptSavPayload({ proposal: c.proposal, body: replyText, origin:manual ? "human" : "ai", dossierReviewId: c.review?.id ?? null, dossierHash: savDossierSourceHash(c.proposal) }), reasonCiphertext: encryptSavPayload({ text: input.reason, reasons: input.reasons }), reviewedBy: actorEmail }).returning();
-        if (input.status === "rejected")
-            await tx.insert(savResolutionObservations).values({ threadId: thread.id, messageId: c.message.id, verdictId: result.id, hubspotTicketId: thread.hubspotTicketId, state: thread.hubspotTicketId ? "active" : "waiting_ticket" }).onConflictDoNothing();
+        if (input.status === "rejected") await ensureSavCaseObservationTx(tx,c.message.id,"draft_feedback");
         await tx.insert(auditLogs).values({ actorEmail, action: "sav_draft_verdict_recorded", entityType: "sav_draft_verdict", entityId: result.id, technicalMetadata: { status: result.status, reasons: input.reasons.join(","), sourceHash: currentHash, messageId: c.message.id, decisionId: c.decision.id, agentRunId: c.run.id } });
         return result;
     });
@@ -98,7 +98,7 @@ export async function assertSavAcceptedDraft(draft: typeof savReplyDrafts.$infer
     const c = manual ? await loadSavDossierReviewContext(draft.messageId,db) : await loadSavDraftContext(draft.messageId, db);
     const sourceHash=manual ? savDraftSourceHash({...c.proposal,replyDraft:body.text},c.message,c.knowledgeRevision) : c.sourceHash;
     const [verdict] = await db.select().from(savDraftVerdicts).where(and(eq(savDraftVerdicts.messageId, draft.messageId), eq(savDraftVerdicts.isCurrent, true))).limit(1);
-    if (!draft.sourceHash || draft.status!=="validated" || verdict?.status !== "accepted" || verdict.draftId !== draft.id || verdict.sourceHash !== sourceHash || draft.sourceHash !== sourceHash || savReplyForbidden(c.proposal) || (!manual && savDraftNotApplicable(c.proposal))
+    if (!draft.sourceHash || (draft.status!=="send_confirmed" && (draft.status!=="validated" || verdict?.status !== "accepted" || verdict.draftId !== draft.id || verdict.sourceHash !== sourceHash)) || draft.sourceHash !== sourceHash || savReplyForbidden(c.proposal) || (!manual && savDraftNotApplicable(c.proposal))
         || savContentHash(decryptSavPayload<{
             text: string;
         }>(draft.bodyCiphertext).text) !== savContentHash((manual ? body.text : c.proposal.replyDraft!).trim()))

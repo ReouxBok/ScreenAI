@@ -10,7 +10,7 @@ export function savDashboardLearningProgress(observations: Observation[], cycles
     if (observation.sourceErrors.length || observation.state === "sources_incomplete" || cycle?.qualification === "insufficient_sources") return "incomplete";
     if (!observation.closed) return "collecting";
     if (!observation.closedCatchupUntil || !observation.lastSyncAt || observation.lastSyncAt < observation.closedCatchupUntil) return "catchup";
-    if (!cycle?.qualifiedAt || !cycle.qualification || cycle.qualification === "resolved" && !cycle.candidateId && !cycle.learningDisposition) return "qualification";
+    if (!cycle?.qualification || cycle.qualification!=="evidence_observed"&&!cycle.qualifiedAt || cycle.qualification === "resolved" && !cycle.candidateId && !cycle.learningDisposition) return "qualification";
     if (cycle.candidateId && !["approved", "rejected"].includes(candidates.find(c => c.id === cycle.candidateId)?.status ?? "")) return "candidate";
     return "none";
   });

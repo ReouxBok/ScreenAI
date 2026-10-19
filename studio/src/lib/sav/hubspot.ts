@@ -1,3 +1,4 @@
+import { ensureSavCaseObservationTx } from "./case-learning";
 import "server-only";
 import { assertSavTicketMatchesDispatch } from "./ticket-confirmation";
 import { readSavTicketHistory, type SavTicketHistory } from "./ticket-history";
@@ -481,6 +482,7 @@ async function finalizeSavV0TicketAction(action: typeof savActions.$inferSelect)
     await tx.update(savThreads).set({ hubspotTicketId: ticket.id, updatedAt: new Date() }).where(eq(savThreads.id, thread.id));
     await tx.update(savActions).set({ status: "succeeded", errorCode: null, executedAt: new Date(), updatedAt: new Date(), payload: sql`${savActions.payload} || ${JSON.stringify({ hubspotTicketId: ticket.id })}::jsonb` }).where(eq(savActions.id, action.id));
     await tx.insert(auditLogs).values({ actorEmail: action.actorEmail || "system", action: "sav_manual_ticket_completed", entityType: "sav_action", entityId: action.id, technicalMetadata: { ticketId: ticket.id, kind: action.kind, reviewId: review.id, messageId: latest.id } });
+    if (action.messageId) await ensureSavCaseObservationTx(tx,action.messageId,"ticket_confirmed");
     // No reply is queued. Only an explicitly confirmed return may add a note and reopen.
   });
   return ticket;
@@ -524,6 +526,7 @@ export async function reconcileSavTicketReturn(actionId: string, noteId: string,
     const [current] = await tx.select().from(savActions).where(eq(savActions.id, action.id)).for("update");
     if (!thread || current?.status !== "failed" || (thread.hubspotTicketId && thread.hubspotTicketId !== request.ticketId && !(thread.hubspotTicketId === request.replacesClosedTicketId && thread.hubspotTicketId === action.payload.previousTicketId))) throw new Error("SAV_RECONCILIATION_TARGET_INVALID");
     await tx.update(savThreads).set({ hubspotTicketId: request.ticketId, updatedAt: new Date() }).where(eq(savThreads.id, thread.id));
+    if (action.messageId) await ensureSavCaseObservationTx(tx,action.messageId,"ticket_confirmed");
     await tx.update(savActions).set({ status: "succeeded", errorCode: null, executedAt: new Date(), updatedAt: new Date(),
       payload: sql`${savActions.payload} || ${JSON.stringify({ ticketReturnCompletedAt: new Date().toISOString(), ticketReturnNoteId: noteId, hubspotTicketId: request.ticketId, ticketReturnReconciledBy: actorEmail })}::jsonb` }).where(eq(savActions.id, action.id));
     await tx.insert(auditLogs).values({ actorEmail, action: "sav_ticket_return_reconciled", entityType: "sav_action", entityId: action.id, technicalMetadata: { ticketId: request.ticketId, noteId } });
@@ -586,6 +589,7 @@ export async function reconcileSavManualTicket(actionId: string, ticketId: strin
     const [updated] = await tx.update(savActions).set({ status: "succeeded", executedAt: new Date(), updatedAt: new Date(), errorCode: null,
       payload: { ...current.payload, hubspotTicketId: ticketId, reconciledBy: actorEmail, reconciledAt: new Date().toISOString() } }).where(eq(savActions.id, current.id)).returning();
     await tx.update(savThreads).set({ hubspotTicketId: ticketId, updatedAt: new Date() }).where(eq(savThreads.id, thread.id));
+    if (current.messageId) await ensureSavCaseObservationTx(tx,current.messageId,"ticket_confirmed");
     await tx.insert(auditLogs).values({ actorEmail, action: "sav_ticket_manually_reconciled", entityType: "sav_action", entityId: current.id, technicalMetadata: { ticketId, reviewId: review.id, reason: reason.trim().slice(0, 2000) } });
     return updated;
   });

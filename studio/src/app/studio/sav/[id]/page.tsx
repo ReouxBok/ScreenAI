@@ -1,3 +1,4 @@
+import { getSavTranslations } from "@/lib/sav/translations";
 import { sortSavTicketsNewestFirst } from "@/lib/sav/ticket-lifecycle";
 import { formatParisDateTime } from "@/lib/paris-date";
 import Link from "next/link";
@@ -73,6 +74,7 @@ export default async function SavThreadPage({ params, searchParams }: { params: 
   if (!detail) notFound();
   const v0 = savReleaseStage() === "v0";
   const latestInbound = [...detail.messages].filter(message => message.direction === "inbound").sort((a, b) => b.receivedAt?.getTime() - a.receivedAt?.getTime() || b.createdAt?.getTime() - a.createdAt?.getTime() || b.id.localeCompare(a.id))[0];
+  const translations=await getSavTranslations(detail.messages.map(message=>message.id));
   const customerMessage = latestInbound ? resolveSavCustomerMessage({ fromEmail: latestInbound.fromEmail, subject: latestInbound.subject, body: latestInbound.body.text }) : null;
   const isForward = customerMessage && customerMessage.kind !== "sender";
   const eligible = latestInbound ? await isSavMessageEligible(latestInbound.id) : false;
@@ -124,6 +126,7 @@ export default async function SavThreadPage({ params, searchParams }: { params: 
   const replyAction = detail.actions.find((action) => action.kind === "send_reply" && !isSavPartnershipForward(action) && action.messageId === latestInbound?.id && action.payload.manualReplyConfirmed === true);
   const replyState = replyAction?.status === "succeeded" ? "sent" : replyAction?.payload.replySendDispatchedAt ? "uncertain" : replyAction && ["pending", "running"].includes(replyAction.status) ? "pending" : null;
   const sendDisabledReason = detail.pilotItem ? "Simulation : aucun email réel ne peut être envoyé depuis ce dossier."
+    : process.env.SAV_CASE_LEARNING_FROZEN === "true" ? "Les nouvelles confirmations sont suspendues. Les envois déjà confirmés restent conservés pour rapprochement."
     : customerContextBlocked ? "Identité du client transféré à vérifier : actualisez le contexte avant toute réponse."
     : savAutomationMode() === "shadow" || process.env.SAV_WRITES_DISABLED === "true" ? "Les envois sont désactivés dans cet environnement. Le brouillon reste dans le Studio."
     : !v0 ? "L’envoi manuel depuis ce brouillon est réservé à la V0."
@@ -148,7 +151,7 @@ export default async function SavThreadPage({ params, searchParams }: { params: 
       : dossierApproved ? { label: "Action HubSpot", detail: "À préparer", state: "todo" } : { label: "Action HubSpot", detail: "Après validation", state: "pending" },
     replyState === "sent" ? { label: "Réponse", detail: "Envoyée", state: "done" }
       : replyState === "uncertain" ? { label: "Réponse", detail: "Envoi à vérifier", state: "alert" }
-      : replyState === "pending" ? { label: "Réponse", detail: "En file d’envoi", state: "todo" } : { label: "Réponse", detail: "À relire", state: "pending" },
+      : replyState === "pending" ? { label: "Réponse", detail: "En file d’envoi", state: "todo" } : { label: "Réponse", detail: proposalReview?.proposal.replyDraft ? "Suggestion disponible" : "Aucune suggestion", state: "pending" },
   ];
 
   return <>
@@ -165,7 +168,7 @@ export default async function SavThreadPage({ params, searchParams }: { params: 
     <section className={layout.layout}>
       <div className={layout.flow}>
         <DossierSection id="sav-conversation" number={1} title="Conversation" subtitle={`${detail.messages.length} message${detail.messages.length > 1 ? "s" : ""}`}>
-          <MailConversation embedded key={`mail:${latestInbound?.id ?? id}`} messages={detail.messages.map(message => ({ id: message.id, receivedAt: message.receivedAt, createdAt: message.createdAt, direction: message.direction, fromEmail: message.fromEmail, body: { text: message.body.text, attachments: message.body.attachments } }))}/>
+          <MailConversation embedded key={`mail:${latestInbound?.id ?? id}`} messages={detail.messages.map(message => ({ translation:translations[message.id], id: message.id, receivedAt: message.receivedAt, createdAt: message.createdAt, direction: message.direction, fromEmail: message.fromEmail, body: { text: message.body.text, attachments: message.body.attachments } }))}/>
         </DossierSection>
 
         <DossierSection id="sav-findings" number={2} title="Ce que l’agent a trouvé">
@@ -240,8 +243,8 @@ export default async function SavThreadPage({ params, searchParams }: { params: 
           {partnershipState && <div className={layout.panel}><PartnershipTransfer key={`partnership:${latestInbound?.id ?? id}`} threadId={id} state={partnershipState}/></div>}
         </DossierSection>
 
-        {proposalReview && latestInbound && <DossierSection id="sav-draft" number={4} title="Brouillon de réponse" badge={replyState === "sent" ? "Envoyée" : proposalReview.draftVerdict?.status === "accepted" && !proposalReview.draftVerdict.stale ? "Acceptée · à envoyer" : "À relire"} tone={replyState === "sent" ? "done" : "todo"}>
-          <div className={layout.block}><DraftReview inboundText={latestInbound.body.text} data={proposalReview} threadId={id} messageId={latestInbound.id} drafts={replyDrafts} sendAllowed={!sendDisabledReason} sendDisabledReason={sendDisabledReason} replyState={replyState}/></div>
+        {proposalReview && latestInbound && <DossierSection id="sav-draft" number={4} title="Suggestion de réponse" badge={replyState === "sent" ? "Envoyée" : replyState === "pending" ? "Envoi en attente" : replyState === "uncertain" ? "Envoi à vérifier" : proposalReview.proposal.replyDraft ? "Suggestion disponible" : "Aucune suggestion"} tone={replyState === "sent" ? "done" : "neutral"}>
+          <div className={layout.block}><DraftReview sourceLanguage={translations[latestInbound.id]?.language} recipient={latestInbound.fromEmail} inboundText={latestInbound.body.text} data={proposalReview} threadId={id} messageId={latestInbound.id} drafts={replyDrafts} sendAllowed={!sendDisabledReason} sendDisabledReason={sendDisabledReason} replyState={replyState}/></div>
         </DossierSection>}
 
         <ResolutionObservation rows={observations} isUgo={staff.email.toLowerCase()==="ugo@limova.ai"}/>

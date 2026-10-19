@@ -1,3 +1,4 @@
+import { savCaseLearningMetrics } from "@/lib/sav/learning-metrics";
 import { formatParisDateTime } from "@/lib/paris-date";
 import Link from "next/link";
 import { ArrowLeft, BookOpenCheck, Gauge, History, ListChecks } from "lucide-react";
@@ -14,7 +15,7 @@ const reasonLabel: Record<string, string> = {
   weekly_limit: "Plafond hebdomadaire atteint", open_limit: "File ouverte complète",
   comparison_error: "Erreur de comparaison", cycle_before_learning_cutover: "Cycle antérieur à la frontière", cutover_not_active: "Frontière non activée",
   evidence_before_learning_cutover: "Preuve antérieure à la frontière", comparison_context_changed: "Catalogue modifié pendant la comparaison",
-  comparison_retryable: "Comparaison interrompue : reprise possible",
+  comparison_retryable: "Admission à reprendre", comparison_interrupted:"Comparaison interrompue : résultat incertain, aucun nouvel appel", deferred_knowledge_changed:"Connaissances modifiées : nouvelle revue nécessaire", deferred_comparison_requires_review:"Comparaison conservée : revue spécialisée requise", specialist_review_required:"Signal spécialisé à examiner",
   comparison_context_incomplete: "Comparaison impossible : contexte incomplet", rejected_unchanged_proof: "Refus conservé : aucune preuve nouvelle",
   candidate_revision_required: "Nouvelle information : révision humaine de la proposition nécessaire", source_changed: "Preuve modifiée pendant la comparaison",
   no_new_resolution_cycle: "Aucun nouveau cycle de résolution prouvé", source_truncated: "Source tronquée : admission bloquée",
@@ -23,7 +24,7 @@ const reasonLabel: Record<string, string> = {
 
 export default async function SavResolutionsPage({ searchParams }: { searchParams: Promise<{ review?: string }> }) {
   const staff = await requireStaff("admin");
-  const [allCandidates, metrics, query] = await Promise.all([listLearningCandidates(), savLearningAdmissionMetrics(), searchParams]);
+  const [allCandidates, metrics, coverage, query] = await Promise.all([listLearningCandidates(), savLearningAdmissionMetrics(), savCaseLearningMetrics(), searchParams]);
   const historical = allCandidates.filter((candidate) => candidate.historical);
   const candidates = allCandidates.filter((candidate) => !candidate.historical);
   const pendingCount = candidates.filter((candidate) => candidate.status === "pending").length;
@@ -34,8 +35,8 @@ export default async function SavResolutionsPage({ searchParams }: { searchParam
     <div className="page-intro compact">
       <div>
         <span className="eyebrow">Apprentissage supervisé · V0</span>
-        <h1>Propositions fondées sur des résolutions prouvées</h1>
-        <p>Une clôture seule ne crée pas de connaissance. Une proposition doit comparer une preuve humaine exploitable au catalogue, puis passer la revue Ugo.</p>
+        <h1>Connaissances candidates à valider</h1>
+        <p>Une clôture seule ne crée pas de connaissance. Une proposition compare le traitement observé au catalogue. La preuve humaine est à examiner ; elle ne vaut pas automatiquement vérité. Validation et publication humaines restent distinctes.</p>
       </div>
     </div>
 
@@ -48,10 +49,19 @@ export default async function SavResolutionsPage({ searchParams }: { searchParam
         <span className="eyebrow">Frontière d’apprentissage</span>
         <h2>{metrics.cutover ? "Flux postérieur à la frontière" : "Activation explicite requise"}</h2>
         <p>{metrics.cutover ? `Cycles de résolution commencés après le ${formatParisDateTime(new Date(metrics.cutover.activatedAt), { dateStyle: "medium" })} seulement.` : "Aucun ticket historique ne sera retraité. Le flux automatique reste fermé jusqu’à l’activation explicite du dispositif."}</p>
-        <p>Analyse IA : {metrics.dailyModelCalls} appel{metrics.dailyModelCalls === 1 ? "" : "s"} aujourd’hui, sans plafond journalier et avec déduplication · Propositions : {metrics.openAutomaticProposals}/{metrics.openLimit} ouvertes · {metrics.signals.reduce((sum, entry) => sum + entry.count, 0)} signaux agrégés sur les 7 derniers jours.</p>
+        <p>Analyse IA : {metrics.dailyModelCalls} appel{metrics.dailyModelCalls === 1 ? "" : "s"} aujourd’hui, plafond {metrics.dailyModelLimit ?? "non disponible"} et déduplication · Propositions : {metrics.openAutomaticProposals}/{metrics.openLimit} ouvertes · {metrics.signals.reduce((sum, entry) => sum + entry.count, 0)} signaux agrégés sur les 7 derniers jours.</p>
         <p className="subtle">Les signaux détaillés sont limités aux 100 plus récents et à 30 jours. Les preuves sources restent dans leurs dossiers privés.</p>
       </div>
       <div className="sav-learning-status pending">{metrics.weeklyLimit} nouvelles propositions / 7 jours glissants</div>
+    </section>
+
+    <section className="card" aria-label="Couverture et mesures d’apprentissage">
+      <h2>Couverture et usage observés</h2>
+      <p>{coverage.total} dossiers suivis · {coverage.late} synchronisations dues · {coverage.incomplete} couvertures incomplètes. Les fils Gmail locaux ne garantissent pas la lecture de tous les sortants externes.</p>
+      <p>Budget quotidien : comparaison {coverage.stages.find(s=>s.stage==="comparison")?.calls??0}/{coverage.budgets.comparison} · traduction {coverage.stages.find(s=>s.stage==="translation")?.calls??0}/{coverage.budgets.translation} · total {coverage.stages.reduce((n,s)=>n+s.calls,0)}/{coverage.budgets.total}. Appels réservés, y compris résultats inconnus ; coût monétaire non estimé.</p>
+      <p>Traductions : {coverage.translations.map(t=>`${t.status} : ${t.total}`).join(" · ")||"aucune préparée"}.</p>
+      <p>Comparaisons des 7 derniers jours : {coverage.sampledComparisons}/{coverage.comparisonCount} affichées. {coverage.truncated?"Échantillon borné à 200 comparaisons/cycles ; couverture partielle.":"Couverture de la fenêtre affichée."} Les révisions de preuves peuvent concerner le même cas ; ces volumes ne mesurent pas des cas indépendants ni un progrès causal.</p>
+      {coverage.cohorts.map(group=><article key={JSON.stringify([group.domain,group.revision,group.codeRevision,group.model,group.promptRevision,group.playbookVersion])}><h3>{group.domain} · {group.revision}</h3><p>{group.cases} évaluations sur {group.independentCases} dossiers distincts du suivi (plusieurs dossiers peuvent partager un ticket). Code {group.codeRevision} · modèle {group.model} · prompt {group.promptRevision} · playbook {group.playbookVersion}. Provenance inconnue affichée unknown. · {group.inputTokens} jetons entrants et {group.outputTokens} sortants connus · {group.unknownUsage} usages inconnus · {group.durationMs} ms de comparaison. Temps opérateur non mesuré.</p><table><thead><tr><th>Axe</th><th>Étayé</th><th>Écart</th><th>Non évaluable</th></tr></thead><tbody>{Object.entries(group.axes).map(([axis,counts])=><tr key={axis}><td>{axis}</td><td>{counts.supported}</td><td>{counts.gap}</td><td>{counts.not_evaluable}</td></tr>)}</tbody></table></article>)}
     </section>
 
     <section className="section-heading">

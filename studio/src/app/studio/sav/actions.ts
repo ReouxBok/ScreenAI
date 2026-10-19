@@ -34,7 +34,7 @@ import { collectLatestSavDossierContext } from "@/lib/sav/dossier-context";
 import { qualifySavObservation } from "@/lib/sav/observations";
 import { reviewSavDraft } from "@/lib/sav/draft-verdicts";
 import { saveSavHumanReplyDraft } from "@/lib/sav/drafts";
-import { assertSavManualReplyEnabled, queueSavManualReply } from "@/lib/sav/manual-replies";
+import { assertSavManualReplyEnabled, queueSavManualReply, confirmSavSuggestedReply } from "@/lib/sav/manual-replies";
 import { processPendingGmailSendActions } from "@/lib/sav/gmail";
 import { enqueueSavContextRefresh } from "@/lib/sav/dispatch";
 import { recordSavDeploymentDecision } from "@/lib/sav/metrics";
@@ -116,6 +116,16 @@ export async function sendStudioReplyAction(form: FormData) {
   revalidatePath(`/studio/sav/${threadId}`);
   revalidatePath("/studio/sav");
   redirect(`/studio/sav/${encodeURIComponent(threadId)}?review=${result}`);
+}
+
+export async function sendSuggestedReplyAction(form:FormData) {
+ const staff=await requireApiStaff("admin");const threadId=id(form,"threadId");let result="reply_queued";
+ try {
+  const action=await confirmSavSuggestedReply({threadId,messageId:id(form,"messageId"),decisionId:id(form,"decisionId"),agentRunId:id(form,"agentRunId"),sourceHash:id(form,"sourceHash"),expectedDraftId:String(form.get("expectedDraftId")||"")||null,text:String(form.get("text")||""),recipient:String(form.get("recipient")||""),outboundHash:id(form,"outboundHash"),origin:String(form.get("origin")||"")},staff.email);
+  if(action.status==="succeeded")result="reply_sent";
+  else {const delivery=await processPendingGmailSendActions(1,action.id);const processed=delivery.processed[0];result=processed?.status==="succeeded"?"reply_sent":typeof processed?.errorCode==="string"?processed.errorCode:"reply_queued";}
+ }catch(error){result=error instanceof Error&&/^SAV_[A-Z_]+$/.test(error.message)?error.message:"SAV_REPLY_MANUAL_INVALID";}
+ revalidatePath(`/studio/sav/${threadId}`);revalidatePath("/studio/sav");redirect(`/studio/sav/${encodeURIComponent(threadId)}?review=${result}`);
 }
 
 function id(form: FormData, name: string) {

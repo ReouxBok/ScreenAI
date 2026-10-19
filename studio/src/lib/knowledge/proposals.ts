@@ -1,4 +1,5 @@
 import "server-only";
+import { isSavCaseLearningFrozen } from "@/lib/sav/config";
 import { and, desc, eq, max, sql } from "drizzle-orm";
 import { z } from "zod";
 import { requireDb } from "@/db";
@@ -58,6 +59,7 @@ export async function lockWorkspaceLearningSource(id: string, db: Db) {
   }
 }
 export async function readSavLearningEvidence(id: string, db: Db = requireDb(), lock = false, allowRejected = false) {
+  if(isSavCaseLearningFrozen())throw new Error("SAV_CASE_LEARNING_FROZEN");
   if (lock) await lockWorkspaceLearningSource(id, db);
   const query = db.select().from(savLearningCandidates).where(eq(savLearningCandidates.id, id));
   const [candidate] = await (lock ? query.for("update") : query);
@@ -69,7 +71,7 @@ export async function readSavLearningEvidence(id: string, db: Db = requireDb(), 
     const query = cycle ? db.select().from(savResolutionObservations).where(eq(savResolutionObservations.id, cycle.observationId)) : null;
     const [observation] = query ? await (lock ? query.for("update") : query) : [];
     if (observation?.leaseUntil && observation.leaseUntil > new Date()) throw new Error("SAV_OBSERVATION_SYNC_IN_PROGRESS");
-    if (!cycle || !observation?.closed || cycle.cycle !== observation.cycle || cycle.candidateId !== candidate.id || cycle.qualification !== "resolved" || observation.sourceErrors.length) throw new Error("SAV_OBSERVATION_STALE");
+    if (!cycle || !observation?.closed || cycle.cycle !== observation.cycle || cycle.candidateId !== candidate.id || !["resolved","evidence_observed"].includes(cycle.qualification??"") || observation.sourceErrors.length) throw new Error("SAV_OBSERVATION_STALE");
     return { candidate, fingerprint: savContentHash({ id: candidate.id, sourceHash: candidate.sourceContentHash, cycleId: cycle.id, cycleSourceHash: cycle.sourceHash, qualification: cycle.qualification }) };
   }
   return { candidate, fingerprint: savContentHash({ id: candidate.id, sourceHash: candidate.sourceContentHash }) };
@@ -103,7 +105,7 @@ async function sourceFingerprint(sources: SavKnowledgeSource[], db: Db = require
       const [cycle] = await db.select().from(savObservationCycles).where(eq(savObservationCycles.id, cycleId));
       const query = cycle ? db.select().from(savResolutionObservations).where(eq(savResolutionObservations.id, cycle.observationId)) : null;
       const [observation] = query ? await (lock ? query.for("update") : query) : [];
-      if (!cycle || !observation?.closed || observation.cycle !== cycle.cycle || cycle.qualification !== "resolved" || observation.sourceErrors.length) throw new Error("SAV_OBSERVATION_STALE");
+      if (!cycle || !observation?.closed || observation.cycle !== cycle.cycle || !["resolved","evidence_observed"].includes(cycle.qualification??"") || observation.sourceErrors.length) throw new Error("SAV_OBSERVATION_STALE");
       if (observation.leaseUntil && observation.leaseUntil > new Date()) throw new Error("SAV_OBSERVATION_SYNC_IN_PROGRESS");
       proofs.push({ ref: source.ref, sourceHash: cycle.sourceHash, qualification: cycle.qualification, candidateId: cycle.candidateId });
     } else if (source.ref.startsWith("knowledge-source:")) {

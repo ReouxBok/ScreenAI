@@ -2,7 +2,7 @@
 config.local.js
 
 # Dependencies
-node_modules/
+node_modules
 **/node_modules/
 
 # Env / secrets
@@ -37,6 +37,7 @@ test-results/
 **/playwright-report/
 **/test-results/
 .vitest-cache/
+.swc/
 *.tsbuildinfo
 
 # IDE

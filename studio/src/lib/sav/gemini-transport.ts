@@ -5,7 +5,7 @@ import { savRunProvenance } from "./config";
 import { parseSavGeminiJson, readSavGeminiResponse, type SavGeminiMetadata } from "./gemini-response";
 
 export const SAV_AI_TRANSPORT_REVISION = "sav-gemini-transport-2026-10-16.v3";
-export type SavAiPhase = "understanding" | "composition" | "coherence" | "ticket_matching" | "repair" | "learning_comparison";
+export type SavAiPhase = "understanding" | "composition" | "coherence" | "ticket_matching" | "repair" | "learning_comparison" | "translation";
 export type SavAiFailureCategory = "authentication" | "billing" | "rate_limited" | "provider_unavailable" | "invalid_output" | "blocked_output" | "budget_exhausted";
 export type SavAiTransportTrace = {
   transportRevision: string; correlationId: string; phase: SavAiPhase; model: string; promptRevision: string;

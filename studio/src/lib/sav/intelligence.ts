@@ -1,3 +1,5 @@
+import { enqueueSavTranslation } from "./translations";
+import { captureSavAnalysisSnapshot } from "./case-learning";
 import { SAV_EMAIL_WRITING_SKILL, SAV_EMAIL_WRITING_REVISION, styleSavEmailCoverage } from "./email-writing";
 import { savRollbackCompatibleProposal } from "./proposal-compatibility";
 import { addSavInvestigationQuestions, buildSavInvestigationReply } from "./investigation";
@@ -619,6 +621,8 @@ async function analyzeSavMessageWithinBudget(input: SavEnrichedInput, context: S
         durationMs: sql`${savAgentRuns.durationMs} + ${coherenceUsage.durationMs}`,
       } : {}),
     }).where(eq(savAgentRuns.id, analysis.agentRunId));
+    await requireDb().transaction(tx => captureSavAnalysisSnapshot(tx, analysis.agentRunId!, enriched));
+    await enqueueSavTranslation(context.messageId).catch(()=>undefined);
   }
   return analysis;
 }

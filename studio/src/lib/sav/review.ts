@@ -1,3 +1,4 @@
+import { captureSavAnalysisSnapshot, ensureSavCaseObservationTx } from "./case-learning";
 import "server-only";
 import { and, desc, eq, max, sql } from "drizzle-orm";
 import { z } from "zod";
@@ -102,6 +103,7 @@ export async function reviewSavProposal(raw: unknown, actorEmail: string) {
     if (latest?.id !== message.id || !decision || decision.agentRunId !== run?.id || !run?.proposalCiphertext) throw new Error("SAV_PROPOSAL_STALE");
     const [current] = await tx.select().from(savProposalReviews).where(and(eq(savProposalReviews.messageId, message.id), eq(savProposalReviews.isCurrent, true))).limit(1);
     if ((current?.id ?? null) !== input.expectedReviewId) throw new Error("SAV_REVIEW_STALE");
+    await captureSavAnalysisSnapshot(tx,run.id);
     const before = savStructuredProposalSchema.parse(decryptSavPayload(run.proposalCiphertext));
     // A dossier review authorizes ticket intake independently of AI reply freshness.
     // Historical global reviews still cover the draft and retain that guard.
@@ -153,6 +155,7 @@ export async function reviewSavProposal(raw: unknown, actorEmail: string) {
     }
     await tx.insert(auditLogs).values({ actorEmail, action: "sav_proposal_reviewed", entityType: "sav_proposal_review", entityId: review.id,
       technicalMetadata: { messageId: message.id, decisionId: decision.id, agentRunId: run.id, verdict: review.verdict, status: review.status, reusability: input.reusability, reasons: input.reasons.join(","), beforeHash: savContentHash(before), afterHash: savContentHash(after) } });
+    if (review.status === "approved") await ensureSavCaseObservationTx(tx,message.id,"dossier_validated");
     return { id: review.id };
   });
 }

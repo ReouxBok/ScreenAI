@@ -1,9 +1,13 @@
+import { isSavCaseLearningFrozen } from "./config";
+import { savV0EligibleMessageFilter } from "./cutover";
+import { measureSavCase, explicitCustomerConfirmation, observedResolutionEvidence } from "./case-comparison";
+import type { SavStructuredProposal } from "./proposal";
 import "server-only";
 import { randomUUID } from "node:crypto";
-import { and, asc, desc, eq, isNull, lte, or, sql } from "drizzle-orm";
+import { and, asc, desc, eq, inArray, isNull, lte, or, sql } from "drizzle-orm";
 import { z } from "zod";
 import { requireDb } from "@/db";
-import { auditLogs, knowledgeFamilySources, knowledgeProjectionCandidates, savDraftVerdicts, savLearningCandidates, savResolutionEvidence, savMessages, savObservationCycles, savObservationEvents, savResolutionObservations, savThreads, savTicketSnapshots } from "@/db/schema";
+import { savActions, savProposalReviews, savAnalysisSnapshots, auditLogs, knowledgeFamilySources, knowledgeProjectionCandidates, savDraftVerdicts, savLearningCandidates, savResolutionEvidence, savMessages, savObservationCycles, savObservationEvents, savResolutionObservations, savThreads, savTicketSnapshots } from "@/db/schema";
 import { assertKnowledgeUgoApproval } from "@/lib/knowledge/contracts";
 import { publicKnowledgeText } from "@/lib/knowledge/conversion";
 import { decryptSavPayload, encryptSavPayload, savContentHash } from "./crypto";
@@ -13,10 +17,9 @@ import { savStoredReviewReasons, type SavReviewReason } from "./review-contract"
 import { processSavLearningResolution, savLearningMaterialText } from "./learning-pipeline";
 import { closeSavLearningReservationTx } from "./learning-admission";
 const DAY = 24 * 60 * 60 * 1000;
-const STOPPED = new Date("9999-01-01T00:00:00Z");
-function nextDue(row: {
-    closedCatchupUntil: Date | null;
-}, now: Date) { return row.closedCatchupUntil && now >= row.closedCatchupUntil ? STOPPED : new Date(now.getTime() + DAY); }
+// Keep closed cases observable for late evidence and reopenings until normal
+// terminal-dossier retention removes them. Closing alone is not resolution.
+function nextDue(now: Date) { return new Date(now.getTime() + DAY); }
 /** Invalidate dependent approvals but retain every candidate/version/event as history. */
 async function invalidateObservationCandidates(tx: Parameters<Parameters<ReturnType<typeof requireDb>["transaction"]>[0]>[0], sourceRef: string, exceptId?: string) {
     const candidates = await tx.select().from(savLearningCandidates).where(eq(savLearningCandidates.sourceRef, sourceRef));
@@ -48,18 +51,34 @@ export async function refreshSavTicketObservations(ticketId: string) {
 }
 /** Every tracked dossier is due once a day; small worker batches drain the due
  * queue across passages, rather than limiting daily coverage to five tickets. */
-export async function reconcileSavObservations(limit = 5, now = new Date()) {
+export async function reconcileSavObservations(limit = 5, now = new Date(), options:{deadlineMs?:number;maxComparisons?:number}={}) {
     const due = await requireDb().select({ id: savResolutionObservations.id }).from(savResolutionObservations).where(and(lte(savResolutionObservations.nextSyncAt, now), or(isNull(savResolutionObservations.leaseUntil), lte(savResolutionObservations.leaseUntil, now)))).orderBy(asc(savResolutionObservations.nextSyncAt), asc(savResolutionObservations.id)).limit(Math.min(20, Math.max(1, limit)));
     const results = [];
-    const deadline = Date.now() + 20000;const collect=cachedCollector();
+    const workDeadline=options.deadlineMs??Date.now()+40000;
+    const deadline = Math.min(workDeadline,Date.now() + 20000);const collect=cachedCollector();
     for (const row of due) {
-        if (Date.now() >= deadline)
+        if (Date.now()+12000 > deadline)
             break;
         results.push(await syncSavObservation(row.id, collect, now));
+
     }
-    return { processed: results };
+    const ready=await requireDb().select({id:savResolutionObservations.id}).from(savResolutionObservations)
+      .innerJoin(savObservationCycles,and(eq(savObservationCycles.observationId,savResolutionObservations.id),eq(savObservationCycles.cycle,savResolutionObservations.cycle)))
+      .innerJoin(savThreads,eq(savThreads.id,savResolutionObservations.threadId)).innerJoin(savMessages,eq(savMessages.id,savResolutionObservations.messageId))
+      .where(and(eq(savResolutionObservations.closed,true),eq(savThreads.aiPaused,false),savV0EligibleMessageFilter(),sql`jsonb_array_length(${savResolutionObservations.sourceErrors})=0`,
+        or(isNull(savResolutionObservations.leaseUntil),lte(savResolutionObservations.leaseUntil,now)),or(isNull(savObservationCycles.qualification),eq(savObservationCycles.qualification,"evidence_observed")),
+        or(isNull(savObservationCycles.learningDisposition),inArray(savObservationCycles.learningDisposition,["open_limit","weekly_limit"])),isNull(savObservationCycles.candidateId)))
+      .orderBy(asc(savObservationCycles.updatedAt)).limit(options.maxComparisons===0?0:20);
+    const comparisons=[];
+    for(const row of ready){
+      if(comparisons.length>=Math.min(1,options.maxComparisons??1)||Date.now()+19000>workDeadline)break;
+      const result=await prepareSavObservationLearning(row.id,now);
+      if(result.disposition!=="not_evaluable")comparisons.push(result);
+    }
+    return { processed: results,comparisons,deferred:ready.length>comparisons.length };
 }
 export async function syncSavObservation(id: string, collect: (id: string) => Promise<ObservationSnapshot> = collectSavObservationSources, now = new Date()) {
+    if(isSavCaseLearningFrozen())return {id,status:"frozen"};
     const db = requireDb();
     const token = randomUUID();
     const claim = await db.transaction(async (tx) => {
@@ -69,10 +88,6 @@ export async function syncSavObservation(id: string, collect: (id: string) => Pr
         const [thread] = await tx.select().from(savThreads).where(eq(savThreads.id, row.threadId));
         // The application's confirmed link is the only binding authority. No contact search.
         const ticketId = thread?.hubspotTicketId ?? row.hubspotTicketId;
-        if (!ticketId) {
-            await tx.update(savResolutionObservations).set({ state: "waiting_ticket", nextSyncAt: new Date(now.getTime() + DAY), updatedAt: now }).where(eq(savResolutionObservations.id, id));
-            return null;
-        }
         if (row.hubspotTicketId && row.hubspotTicketId !== ticketId) {
             await tx.update(savResolutionObservations).set({ state: "sources_incomplete", sourceErrors: ["ticket_link_changed"], nextSyncAt: new Date(now.getTime() + DAY), updatedAt: now }).where(eq(savResolutionObservations.id, id));
             return null;
@@ -84,12 +99,12 @@ export async function syncSavObservation(id: string, collect: (id: string) => Pr
         return { id, status: "waiting_or_leased" };
     let snapshot: ObservationSnapshot;
     try {
-        snapshot = await collect(claim.hubspotTicketId);
-        if (snapshot.ticketId !== claim.hubspotTicketId || !Number.isFinite(Date.parse(snapshot.updatedAt)))
+        snapshot = claim.hubspotTicketId ? await collect(claim.hubspotTicketId) : {ticketId:`gmail:${claim.threadId}`,updatedAt:now.toISOString(),status:"open",subject:"Fil Gmail autorisé",events:[],errors:["gmail:outbound_coverage_unverified"]};
+        if (snapshot.ticketId !== (claim.hubspotTicketId ?? `gmail:${claim.threadId}`) || !Number.isFinite(Date.parse(snapshot.updatedAt)))
             throw new Error("SAV_OBSERVATION_SOURCE_INVALID");
     }
     catch (error) {
-        await db.update(savResolutionObservations).set({ state: "sources_incomplete", sourceErrors: [sourceError(error)], leaseToken: null, leaseUntil: null, nextSyncAt: nextDue(claim, now), updatedAt: now }).where(and(eq(savResolutionObservations.id, id), eq(savResolutionObservations.leaseToken, token)));
+        await db.update(savResolutionObservations).set({ state: "sources_incomplete", sourceErrors: [sourceError(error)], leaseToken: null, leaseUntil: null, nextSyncAt: nextDue(now), updatedAt: now }).where(and(eq(savResolutionObservations.id, id), eq(savResolutionObservations.leaseToken, token)));
         return { id, status: "sources_incomplete" };
     }
     return db.transaction(async (tx) => {
@@ -99,7 +114,7 @@ export async function syncSavObservation(id: string, collect: (id: string) => Pr
         const [thread] = await tx.select().from(savThreads).where(eq(savThreads.id, row.threadId));
         if (thread?.hubspotTicketId && thread.hubspotTicketId !== snapshot.ticketId)
             throw new Error("SAV_OBSERVATION_LINK_CHANGED");
-        const release = { leaseToken: null, leaseUntil: null, nextSyncAt: nextDue(row, now), updatedAt: now };
+        const release = { leaseToken: null, leaseUntil: null, nextSyncAt: nextDue(now), updatedAt: now };
         if (row.remoteUpdatedAt && row.remoteUpdatedAt > new Date(snapshot.updatedAt)) {
             await tx.update(savResolutionObservations).set(release).where(eq(savResolutionObservations.id, id));
             return { id, status: "stale_source" };
@@ -109,12 +124,26 @@ export async function syncSavObservation(id: string, collect: (id: string) => Pr
             snapshot.errors.push("gmail:message_limit_200");
         const events: ObservationEvent[] = [...snapshot.events];
         for (const message of messages) {
-            const body = decryptSavPayload<{
-                text: string;
-            }>(message.bodyCiphertext).text;
+            const storedBody=decryptSavPayload<{text:string;headers?:Record<string,string>}>(message.bodyCiphertext);
+            const body=storedBody.text;
             if (body.length > 8000) snapshot.errors.push(`gmail:${message.gmailMessageId}:truncated_8000`);
-            events.push({ fullContentHash: savContentHash(body), truncated: body.length > 8000, sourceRef: `gmail:${message.gmailMessageId}`, kind: message.direction === "inbound" ? "customer_reply" : isSavAiAuthoredReply(body) ? "ai_reply" : "human_reply", occurredAt: message.receivedAt.toISOString(), text: body.slice(0, 8000), author: message.fromEmail, provenance: "Gmail / fil lié synchronisé", associationTicketId: snapshot.ticketId, remoteUpdatedAt: null });
+            events.push({ ...(storedBody.headers?.["message-id"]?{messageIdentity:storedBody.headers["message-id"].trim().toLowerCase()}:{}), fullContentHash: savContentHash(body), truncated: body.length > 8000, sourceRef: `gmail:${message.gmailMessageId}`, kind: message.direction === "inbound" ? "customer_reply" : isSavAiAuthoredReply(body) ? "ai_reply" : "human_reply", occurredAt: message.receivedAt.toISOString(), text: body.slice(0, 8000), author: message.fromEmail, provenance: "Gmail / fil lié synchronisé", associationTicketId: snapshot.ticketId, remoteUpdatedAt: null });
         }
+        const reviewRows=messages.length?await tx.select().from(savProposalReviews).where(inArray(savProposalReviews.messageId,messages.map(m=>m.id))).orderBy(asc(savProposalReviews.reviewedAt)).limit(201):[];
+        if(reviewRows.length>200)snapshot.errors.push("studio:review_limit_200");
+        for(const review of reviewRows.slice(0,200)){
+            const before=decryptSavPayload<Record<string,unknown>>(review.beforeCiphertext),after=decryptSavPayload<Record<string,unknown>>(review.afterCiphertext);
+            const changes=Object.fromEntries(Object.keys(after).filter(key=>JSON.stringify(before[key])!==JSON.stringify(after[key])).map(key=>[key,{before:before[key]??null,after:after[key]??null}]));
+            const comment=decryptSavPayload<{text:string;justification?:string}>(review.commentCiphertext);
+            const text=JSON.stringify({messageId:review.messageId,agentRunId:review.agentRunId,scope:review.reviewScope,status:review.status,verdict:review.verdict,dimensions:review.dimensions,changes,comment:comment.text,justification:comment.justification??null});
+            if(text.length>8000)snapshot.errors.push("studio:review_truncated_8000");
+            events.push({sourceRef:`studio:review:${review.id}`,kind:"dossier_review",occurredAt:review.reviewedAt.toISOString(),text:text.slice(0,8000),author:review.reviewedBy,provenance:"Studio / correction humaine, à examiner sans présumer sa justesse",associationTicketId:snapshot.ticketId,remoteUpdatedAt:null,fullContentHash:savContentHash(text),truncated:text.length>8000});
+        }
+        const confirmedActions=await tx.select().from(savActions).where(and(eq(savActions.threadId,row.threadId),eq(savActions.actorType,"human"),eq(savActions.status,"succeeded"))).orderBy(asc(savActions.executedAt)).limit(201);
+        if(confirmedActions.length>200)snapshot.errors.push("studio:action_limit_200");
+        for(const action of confirmedActions.slice(0,200))events.push({sourceRef:`studio:action:${action.id}`,kind:"action_confirmed",occurredAt:(action.executedAt??action.updatedAt).toISOString(),text:JSON.stringify({kind:action.kind,messageId:action.messageId,decisionId:action.decisionId,ticketId:action.payload.hubspotTicketId??null,ticketReturnCompletedAt:action.payload.ticketReturnCompletedAt??null}),author:action.actorEmail,provenance:"Studio / résultat fournisseur confirmé dans le journal d’action",associationTicketId:snapshot.ticketId,remoteUpdatedAt:null});
+        const identities=new Map<string,ObservationEvent>();
+        for(let index=events.length-1;index>=0;index--){const event=events[index];if(!event.messageIdentity)continue;const previous=identities.get(event.messageIdentity);if(previous){previous.sourceAliases=[...(previous.sourceAliases??[]),event.sourceRef];events.splice(index,1);}else identities.set(event.messageIdentity,event);}
         events.sort((a, b) => `${a.occurredAt}:${a.sourceRef}`.localeCompare(`${b.occurredAt}:${b.sourceRef}`));
         while (Buffer.byteLength(JSON.stringify(events), "utf8") > 64 * 1024) {
             events.shift();
@@ -127,25 +156,19 @@ export async function syncSavObservation(id: string, collect: (id: string) => Pr
             await tx.insert(savObservationEvents).values({ observationId: id, sourceRef: event.sourceRef, contentHash: savContentHash(event), kind: event.kind, occurredAt: new Date(event.occurredAt), payloadCiphertext: encryptSavPayload(event) }).onConflictDoNothing();
         }
         const cycle = row.closed && snapshot.status === "open" ? row.cycle + 1 : row.cycle;
-        const [verdict] = await tx.select().from(savDraftVerdicts).where(eq(savDraftVerdicts.id, row.verdictId));
-        const rejected = decryptSavPayload<{
-            body: string;
-            proposal: {
-                category: string;
-                decision: {
-                    reasonCode: string;
-                };
-            };
-        }>(verdict.snapshotCiphertext);
+        const [verdict] = row.verdictId ? await tx.select().from(savDraftVerdicts).where(eq(savDraftVerdicts.id,row.verdictId)) : [];
+        const [baseline] = row.snapshotId ? await tx.select().from(savAnalysisSnapshots).where(eq(savAnalysisSnapshots.id,row.snapshotId)) : [];
+        const baselinePayload=baseline ? decryptSavPayload<{proposal:SavStructuredProposal;analysisCreatedAt:string}>(baseline.payloadCiphertext) : null;
+        const rejected=verdict ? decryptSavPayload<{body:string;proposal:SavStructuredProposal}>(verdict.snapshotCiphertext) : {body:baselinePayload?.proposal.replyDraft??"",proposal:baselinePayload?.proposal??null};
         const [existing] = await tx.select().from(savObservationCycles).where(and(eq(savObservationCycles.observationId, id), eq(savObservationCycles.cycle, cycle)));
         const cycleStart = cycle > 1 ? existing?.createdAt ?? new Date(snapshot.updatedAt) : null;
         const relevant = events.filter(e => !cycleStart || new Date(e.occurredAt) >= cycleStart);
         const human = relevant.filter(e => e.kind === "human_reply" || e.kind === "note");
-        const customerConfirmation = relevant.filter(e => e.kind === "customer_reply" && !/\b(pas|non|not|never|encore|toujours|plus|jamais)\b/i.test(e.text) && human.some(h => h.occurredAt < e.occurredAt) && /(?:^|[^a-zà-ÿ])(?:résolu|réglé|fonctionne|ça marche|resolved|works now)(?:$|[^a-zà-ÿ])/i.test(e.text));
-        const refusalReasons = savStoredReviewReasons(decryptSavPayload<{ reasons?: unknown }>(verdict.reasonCiphertext).reasons);
-        const summary = { subject: snapshot.subject, draftRefused: rejected.body, ...(refusalReasons.length ? { refusalReasons } : {}), refusalReason: decryptSavPayload<{
-                text: string;
-            }>(verdict.reasonCiphertext).text, category: rejected.proposal.category, reasonCode: rejected.proposal.decision.reasonCode,
+        const lastCustomer=relevant.filter(e=>e.kind==="customer_reply").at(-1);
+        const customerConfirmation = lastCustomer&&explicitCustomerConfirmation(lastCustomer.text)&&human.some(h=>h.occurredAt<lastCustomer.occurredAt)?[lastCustomer]:[];
+        const refusalReasons=verdict?savStoredReviewReasons(decryptSavPayload<{reasons?:unknown}>(verdict.reasonCiphertext).reasons):[];
+        const measurements=measureSavCase(rejected.proposal,relevant,{ticketId:row.hubspotTicketId,closed:snapshot.status==="closed",errors:snapshot.errors,baselineAt:baselinePayload?.analysisCreatedAt??row.createdAt.toISOString(),cycle});
+        const summary = { subject: snapshot.subject, draftRefused: rejected.body, ...(refusalReasons.length ? { refusalReasons } : {}), refusalReason: verdict?decryptSavPayload<{text:string}>(verdict.reasonCiphertext).text:"", category: rejected.proposal?.category??"unknown", reasonCode: rejected.proposal?.decision.reasonCode??"unknown", measurements:{revision:measurements.revision,axes:measurements.axes,coverage:measurements.coverage}, baselineProposal:rejected.proposal, baselineAt:baselinePayload?.analysisCreatedAt??row.createdAt.toISOString(),
             events: relevant, humanEvidence: human.map(e => ({ sourceRef: e.sourceRef, contentHash: savContentHash(e), kind: e.kind, occurredAt: e.occurredAt })), customerConfirmation: customerConfirmation.map(e => e.sourceRef), sourceErrors: snapshot.errors, coverage: "Emails HubSpot associés et fil Gmail synchronisé uniquement. Boîtes externes non enregistrées, appels et opérations hors CRM non observables. Une tâche terminée n’atteste pas une opération exécutée.", outcome: snapshot.errors.length || snapshot.status === "unknown" ? "insufficient_sources" : human.length ? "human_evidence_to_qualify" : "closed_without_human_evidence" };
         const hash = savContentHash(summary);
         const changed = existing?.sourceHash !== hash;
@@ -160,10 +183,10 @@ export async function syncSavObservation(id: string, collect: (id: string) => Pr
         const values = { status, summaryCiphertext: encryptSavPayload(summary), sourceHash: hash, closedAt: closed ? (existing?.closedAt ?? new Date(snapshot.updatedAt)) : null, updatedAt: now, ...(changed ? { qualification: null, qualifiedBy: null, qualifiedAt: null, candidateId: null, learningDisposition: null } : {}) };
         const [savedCycle] = existing ? await tx.update(savObservationCycles).set(values).where(eq(savObservationCycles.id, existing.id)).returning() : await tx.insert(savObservationCycles).values({ ...values, observationId: id, cycle, ...(cycle > 1 ? { createdAt: new Date(snapshot.updatedAt) } : {}) }).returning();
         const closedCatchupUntil = snapshot.status === "open" ? null : closed ? (row.closedCatchupUntil ?? new Date(now.getTime() + DAY)) : row.closedCatchupUntil;
-        release.nextSyncAt = nextDue({ closedCatchupUntil }, now);
-        const state = snapshot.errors.length || snapshot.status === "unknown" ? "sources_incomplete" : closed ? savedCycle.candidateId ? "candidate_ready" : "closed_to_analyze" : "active";
+        release.nextSyncAt = nextDue(now);
+        const state = !row.hubspotTicketId ? "gmail_only" : snapshot.errors.length || snapshot.status === "unknown" ? "sources_incomplete" : closed ? savedCycle.candidateId ? "candidate_ready" : "closed_to_analyze" : "active";
         await tx.update(savResolutionObservations).set({ ...release, state, cycle, closedCatchupUntil, closed: snapshot.status === "unknown" ? row.closed : closed, remoteUpdatedAt: new Date(snapshot.updatedAt), lastSyncAt: now, sourceErrors: snapshot.errors }).where(eq(savResolutionObservations.id, id));
-        await tx.insert(savTicketSnapshots).values({ hubspotTicketId: snapshot.ticketId, subject: snapshot.subject, status, transcriptCiphertext: encryptSavPayload({ transcript: events }), contentHash: hash, humanIntervened: human.length > 0, resolvedAt: closed ? new Date(snapshot.updatedAt) : null, hubspotUpdatedAt: new Date(snapshot.updatedAt), processedAt: now, updatedAt: now }).onConflictDoUpdate({ target: savTicketSnapshots.hubspotTicketId, set: { subject: snapshot.subject, status, transcriptCiphertext: encryptSavPayload({ transcript: events }), contentHash: hash, humanIntervened: human.length > 0, resolvedAt: closed ? new Date(snapshot.updatedAt) : null, hubspotUpdatedAt: new Date(snapshot.updatedAt), processedAt: now, updatedAt: now } });
+        if(row.hubspotTicketId) await tx.insert(savTicketSnapshots).values({ hubspotTicketId: snapshot.ticketId, subject: snapshot.subject, status, transcriptCiphertext: encryptSavPayload({ transcript: events }), contentHash: hash, humanIntervened: human.length > 0, resolvedAt: closed ? new Date(snapshot.updatedAt) : null, hubspotUpdatedAt: new Date(snapshot.updatedAt), processedAt: now, updatedAt: now }).onConflictDoUpdate({ target: savTicketSnapshots.hubspotTicketId, set: { subject: snapshot.subject, status, transcriptCiphertext: encryptSavPayload({ transcript: events }), contentHash: hash, humanIntervened: human.length > 0, resolvedAt: closed ? new Date(snapshot.updatedAt) : null, hubspotUpdatedAt: new Date(snapshot.updatedAt), processedAt: now, updatedAt: now } });
         return { id, status: state, cycle };
     });
 }
@@ -252,7 +275,10 @@ export async function getSavObservations(threadId: string) {
     for (const row of rows) {
         const cycles = await requireDb().select().from(savObservationCycles).where(eq(savObservationCycles.observationId, row.id)).orderBy(desc(savObservationCycles.cycle));
         const qualifications=await requireDb().select().from(savObservationEvents).where(and(eq(savObservationEvents.observationId,row.id),eq(savObservationEvents.kind,"human_qualification"))).orderBy(desc(savObservationEvents.occurredAt)).limit(50);
-        result.push({ ...row,qualifications:qualifications.map(e=>decryptSavPayload<ObservationEvent>(e.payloadCiphertext)), cycles: cycles.map(c => ({ ...c, summary: decryptSavPayload<{
+        const comparisonRows=await requireDb().select().from(savObservationEvents).where(and(eq(savObservationEvents.observationId,row.id),eq(savObservationEvents.kind,"case_comparison"))).orderBy(desc(savObservationEvents.occurredAt)).limit(20);
+        result.push({ ...row,comparisons:comparisonRows.map(event=>decryptSavPayload<{revision:string;sourceHash:string;inputTokens:number|null;outputTokens:number|null;durationMs:number;decision:import("./learning-comparator").SavLearningComparison}>(event.payloadCiphertext)),qualifications:qualifications.map(e=>decryptSavPayload<ObservationEvent>(e.payloadCiphertext)), cycles: cycles.map(c => ({ ...c, summary: decryptSavPayload<{
+                    measurements?:ReturnType<typeof measureSavCase>;
+                    baselineProposal?:SavStructuredProposal|null;
                     subject: string;
                     draftRefused: string;
                     refusalReason: string;
@@ -270,4 +296,43 @@ export async function getSavObservations(threadId: string) {
                 }>(c.summaryCiphertext) })) });
     }
     return result;
+}
+
+/** Automatic preparation only. Human knowledge review/publication remains the
+ * existing gate. A source observation never becomes a human resolution verdict. */
+export async function prepareSavObservationLearning(id:string,now=new Date(),options:Parameters<typeof processSavLearningResolution>[1]={}) {
+ if(isSavCaseLearningFrozen())return {disposition:"frozen"};
+ const db=requireDb();
+ const prepared=await db.transaction(async tx=>{
+  const [row]=await tx.select().from(savResolutionObservations).where(eq(savResolutionObservations.id,id)).for("update");
+  if(!row?.closed||row.sourceErrors.length||row.leaseUntil&&row.leaseUntil>now)return null;
+  const [thread]=await tx.select({paused:savThreads.aiPaused}).from(savThreads).where(eq(savThreads.id,row.threadId));
+  const [eligible]=await tx.select({id:savMessages.id}).from(savMessages).where(and(eq(savMessages.id,row.messageId),savV0EligibleMessageFilter()));
+  if(thread?.paused || !eligible || process.env.SAV_AI_ANALYSIS==="false") return null;
+  const [cycle]=await tx.select().from(savObservationCycles).where(and(eq(savObservationCycles.observationId,id),eq(savObservationCycles.cycle,row.cycle)));
+  if(!cycle||cycle.candidateId||cycle.qualification&&cycle.qualification!=="evidence_observed"||cycle.learningDisposition&&!["open_limit","weekly_limit"].includes(cycle.learningDisposition))return null;
+  const summary=decryptSavPayload<{subject:string;category:string;reasonCode:string;events:ObservationEvent[];baselineProposal:SavStructuredProposal|null;baselineAt:string;sourceErrors:string[]}>(cycle.summaryCiphertext);
+  if(summary.sourceErrors.length||summary.category==="billing"||/cancellation|refund|legal|security/.test(summary.reasonCode)){
+    await tx.update(savObservationCycles).set({learningDisposition:summary.sourceErrors.length?"source_coverage_incomplete":"sensitive_review_required"}).where(eq(savObservationCycles.id,cycle.id));return null;
+  }
+  const proof=observedResolutionEvidence(summary.events.filter(e=>e.occurredAt>=(summary.baselineAt??row.createdAt.toISOString())),summary.baselineProposal??null);
+  if(!proof){await tx.update(savObservationCycles).set({learningDisposition:"insufficient_independent_evidence"}).where(eq(savObservationCycles.id,cycle.id));return null;}
+  await tx.update(savObservationCycles).set({qualification:"evidence_observed",qualifiedBy:null,qualifiedAt:null}).where(eq(savObservationCycles.id,cycle.id));
+  return {row,cycle,summary,proof};
+ });
+ if(!prepared)return {disposition:"not_evaluable"};
+ const {row,cycle,summary,proof}=prepared;
+ let result:Awaited<ReturnType<typeof processSavLearningResolution>>;
+ try { result=await processSavLearningResolution({ticketId:row.hubspotTicketId??undefined,threadId:row.threadId,sourceRef:`sav-observation:${cycle.id}`,origin:"observation",cycleStartedAt:cycle.createdAt,snapshotId:cycle.id,snapshotHash:cycle.sourceHash,subject:summary.subject,resolution:proof.text,provenance:"observed_treatment",sourceMessageId:proof.sourceRef,evidenceRef:proof.sourceRef,evidenceExcerpt:proof.text.slice(0,240),evidenceOccurredAt:proof.occurredAt,customerConfirmed:explicitCustomerConfirmation(summary.events.filter(e=>e.kind==="customer_reply"&&e.occurredAt>proof.occurredAt).at(-1)?.text??""),cycleSourceHash:cycle.sourceHash,observationId:row.id,cycleId:cycle.id,caseContext:{baseline:summary.baselineProposal,baselineAt:summary.baselineAt,events:summary.events}},{...options,now});
+ } catch(error) {if(error instanceof Error && error.message==="SAV_DERIVED_DAILY_BUDGET_EXHAUSTED") {await db.update(savResolutionObservations).set({state:"waiting_budget"}).where(eq(savResolutionObservations.id,id));return {disposition:"deferred",reasonCode:"daily_budget"};}throw error;}
+ if(result.disposition==="duplicate" && !result.candidateId && result.reasonCode==="comparison_started") return result;
+ const candidateId="candidateId" in result&&typeof result.candidateId==="string"?result.candidateId:null;
+ await db.transaction(async tx=>{
+  const [current]=await tx.select().from(savResolutionObservations).where(eq(savResolutionObservations.id,id)).for("update");
+  const [currentCycle]=await tx.select().from(savObservationCycles).where(eq(savObservationCycles.id,cycle.id));
+  if(!current?.closed||current.cycle!==cycle.cycle||currentCycle?.sourceHash!==cycle.sourceHash)return;
+  await tx.update(savObservationCycles).set({candidateId,learningDisposition:"reasonCode" in result?String(result.reasonCode):result.disposition}).where(eq(savObservationCycles.id,cycle.id));
+  await tx.update(savResolutionObservations).set({state:candidateId?"candidate_ready":"observed_without_candidate"}).where(eq(savResolutionObservations.id,id));
+ });
+ return result;
 }

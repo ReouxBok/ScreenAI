@@ -61,7 +61,7 @@ it("normalizes reason order for repeated clicks but versions a changed reason", 
   const second = await draft(["missing_knowledge"]); expect(second.id).not.toBe(first.id);
   expect(await f.db.select().from(savDraftVerdicts)).toHaveLength(2);
   expect((await getSavReviewFeedback()).entries.find(entry => entry.id === first.id)?.isCurrent).toBe(false);
-  expect(await f.db.select().from(savResolutionObservations)).toHaveLength(2);
+  expect(await f.db.select().from(savResolutionObservations)).toHaveLength(1);
 });
 it("preserves legacy encrypted feedback with no reason field", async () => {
   const reviewed = await reviewSavProposal(dossier(), "ugo@limova.ai"); const rejected = await draft();

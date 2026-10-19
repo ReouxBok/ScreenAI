@@ -10,6 +10,8 @@ export type ObservationEvent = {
     provenance: string;
     associationTicketId: string;
     remoteUpdatedAt: string | null;
+    messageIdentity?:string;
+    sourceAliases?:string[];
     fullContentHash?: string;
     truncated?: boolean;
 };
@@ -43,7 +45,7 @@ async function read<T>(path: string, ids?: string[], signal?: AbortSignal): Prom
         throw new Error(`HTTP_${response.status}`);
     return response.json();
 }
-const properties: Record<string, string[]> = { emails: ["hs_email_text", "hs_email_html", "hs_email_subject", "hs_email_direction", "hs_email_status", "hs_email_from_email", "hs_timestamp", "hubspot_owner_id"], notes: ["hs_note_body", "hs_timestamp", "hubspot_owner_id"], tasks: ["hs_task_body", "hs_task_subject", "hs_task_status", "hs_timestamp", "hubspot_owner_id"] };
+const properties: Record<string, string[]> = { emails: ["hs_email_message_id", "hs_email_text", "hs_email_html", "hs_email_subject", "hs_email_direction", "hs_email_status", "hs_email_from_email", "hs_timestamp", "hubspot_owner_id"], notes: ["hs_note_body", "hs_timestamp", "hubspot_owner_id"], tasks: ["hs_task_body", "hs_task_subject", "hs_task_status", "hs_timestamp", "hubspot_owner_id"] };
 export async function collectSavObservationSources(ticketId: string): Promise<ObservationSnapshot> {
     if (!/^\d{1,30}$/.test(ticketId))
         throw new Error("SAV_OBSERVATION_TICKET_INVALID");
@@ -126,7 +128,7 @@ export async function collectSavObservationSources(ticketId: string): Promise<Ob
                 const outbound = isHubspotOutboundDirection(p.hs_email_direction || "");
                 const direction = (p.hs_email_direction || "").toUpperCase();
                 if(type==="emails" && outbound && p.hs_email_status!=="SENT")errors.push("emails:delivery_unverified");
-                events.push({ sourceRef: `hubspot:${type}:${record.id}`, kind: type === "emails" ? outbound ? (p.hs_email_status!=="SENT" ? "email_unverified" : isSavAiAuthoredReply(text) ? "ai_reply" : "human_reply") : direction === "INCOMING_EMAIL" ? "customer_reply" : "email_unknown" : type === "notes" ? "note" : "task", occurredAt: at, text, author: type==="emails" ? p.hs_email_from_email || null : p.hubspot_owner_id || null, provenance: `HubSpot ${type} / association explicite`, associationTicketId: ticketId, remoteUpdatedAt: timestamp(record.updatedAt) });
+                events.push({ ...(type==="emails"&&p.hs_email_message_id?{messageIdentity:p.hs_email_message_id.trim().toLowerCase()}:{}), sourceRef: `hubspot:${type}:${record.id}`, kind: type === "emails" ? outbound ? (p.hs_email_status!=="SENT" ? "email_unverified" : isSavAiAuthoredReply(text) ? "ai_reply" : "human_reply") : direction === "INCOMING_EMAIL" ? "customer_reply" : "email_unknown" : type === "notes" ? "note" : "task", occurredAt: at, text, author: type==="emails" ? p.hs_email_from_email || null : p.hubspot_owner_id || null, provenance: `HubSpot ${type} / association explicite`, associationTicketId: ticketId, remoteUpdatedAt: timestamp(record.updatedAt) });
             }
         }
         catch (e) {

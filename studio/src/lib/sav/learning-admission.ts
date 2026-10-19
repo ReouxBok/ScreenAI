@@ -1,3 +1,4 @@
+import { reserveSavDerivedCallTx, savDerivedBudgets } from "./derived-budget";
 import "server-only";
 import { randomUUID } from "node:crypto";
 import { and, count, desc, eq, gte, inArray, lt, sql } from "drizzle-orm";
@@ -18,8 +19,8 @@ export const SAV_LEARNING_CUTOVER_KEY = "sav-learning-admission-cutover";
 export const SAV_LEARNING_ADMISSION_LOCK_KEY = "sav-learning-admission-lock";
 export const SAV_LEARNING_POLICY_REVISION = "sav-learning-admission-2026-10-16.v4";
 export const SAV_LEARNING_COMPARISON_LEASE_MS = 60_000;
-export const SAV_LEARNING_COMPARATOR_REVISION = "sav-learning-comparator-2026-10-16.v3";
-export const SAV_LEARNING_PROMPT_REVISION = "sav-learning-comparator-prompt-2026-10-15.v2";
+export const SAV_LEARNING_COMPARATOR_REVISION = "sav-learning-comparator-2026-10-19.v4";
+export const SAV_LEARNING_PROMPT_REVISION = "sav-learning-comparator-prompt-2026-10-19.v3";
 export const SAV_LEARNING_OPEN_LIMIT = 10;
 export const SAV_LEARNING_WEEKLY_LIMIT = 5;
 export const SAV_LEARNING_SIGNAL_LIMIT = 100;
@@ -124,7 +125,7 @@ export async function recordSavLearningSignalTx(tx: Tx, input: SavLearningSignal
 }
 
 /** A recoverable lease is distinct from a durable terminal decision. No source text is stored here. */
-export async function claimSavLearningComparisonTx(tx: Tx, input: { sourceRef: string; sourceHash: string; origin: SavLearningSignalInput["origin"]; inputHash: string; now?: Date }) {
+export async function claimSavLearningComparisonTx(tx: Tx, input: { sourceRef: string; sourceHash: string; origin: SavLearningSignalInput["origin"]; inputHash: string; now?: Date; resumeDeferred?: boolean }) {
   await lockSavLearningAdmissionTx(tx);
   const now = input.now ?? new Date(), comparisonLeaseToken = randomUUID();
   const comparisonLeaseUntil = new Date(now.getTime() + SAV_LEARNING_COMPARISON_LEASE_MS);
@@ -134,7 +135,7 @@ export async function claimSavLearningComparisonTx(tx: Tx, input: { sourceRef: s
   let attempt = inserted;
   if (!attempt) {
     const [prior] = await tx.select().from(savLearningAdmissionAttempts).where(eq(savLearningAdmissionAttempts.dedupeKey, dedupeKey)).for("update");
-    if (!prior || !["comparing", "retryable"].includes(prior.state) || prior.comparisonLeaseUntil && prior.comparisonLeaseUntil > now) return { claimed: false as const };
+    if (!prior || !(["comparing", "retryable"].includes(prior.state) || input.resumeDeferred && ["open_limit","weekly_limit"].includes(prior.reasonCode)) || prior.comparisonLeaseUntil && prior.comparisonLeaseUntil > now) return { claimed: false as const };
     [attempt] = await tx.update(savLearningAdmissionAttempts).set({ state: "comparing", reasonCode: "comparison_started", completedAt: null,
       comparisonLeaseToken, comparisonLeaseUntil }).where(eq(savLearningAdmissionAttempts.id, prior.id)).returning();
   }
@@ -208,8 +209,9 @@ export async function closeSavLearningReservationTx(tx: Tx, candidateId: string,
 }
 
 /** Atomically reserves a daily model call. Retries of a source should reuse its saved decision instead. */
-export async function reserveSavLearningModelCallTx(tx: Tx, now = new Date()) {
+export async function reserveSavLearningModelCallTx(tx: Tx, now = new Date(), proofKey?: string) {
   await lockSavLearningAdmissionTx(tx);
+  await reserveSavDerivedCallTx(tx,"comparison",now,proofKey);
   const day = now.toISOString().slice(0, 10);
   const [usage] = await tx.select().from(savLearningModelUsage).where(eq(savLearningModelUsage.day, day)).for("update");
   if (usage) await tx.update(savLearningModelUsage).set({ callCount: usage.callCount + 1, updatedAt: now }).where(eq(savLearningModelUsage.day, day));
@@ -228,5 +230,5 @@ export async function savLearningAdmissionMetrics(since = new Date(Date.now() - 
     .from(savLearningAdmissionSignals).where(gte(savLearningAdmissionSignals.createdAt, new Date(Date.now() - SAV_LEARNING_SIGNAL_RETENTION_DAYS * 86_400_000))).orderBy(desc(savLearningAdmissionSignals.createdAt)).limit(SAV_LEARNING_SIGNAL_LIMIT);
   const cutover = await getSavLearningCutover(db);
   return { since: since.toISOString(), windowDays: 7, openAutomaticProposals: open, weeklyLimit: SAV_LEARNING_WEEKLY_LIMIT, openLimit: SAV_LEARNING_OPEN_LIMIT,
-    dailyModelCalls: usage?.callCount ?? 0, dailyModelLimit: null, cutover, signals: stats, recentSignals, policyRevision: SAV_LEARNING_POLICY_REVISION };
+    dailyModelCalls: usage?.callCount ?? 0, dailyModelLimit: savDerivedBudgets().comparison, cutover, signals: stats, recentSignals, policyRevision: SAV_LEARNING_POLICY_REVISION };
 }
