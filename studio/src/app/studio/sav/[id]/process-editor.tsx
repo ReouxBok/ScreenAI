@@ -28,6 +28,28 @@ function defaultAction(p: SavStructuredProposal, tickets: Ticket[]): Action {
 
 /** Human correction of the dossier. Only the confirmed main action can produce a CRM command or a transfer, after a separate preview. */
 export function ProcessEditor({ proposal: p, tickets }: { proposal: SavStructuredProposal; tickets: Ticket[] }) {
+  const [manualChoice, setManualChoice] = useState(false);
+  const waitingIdentity = !p.humanProcess && p.routing.kind === "review" && (["registration_email_required", "registration_lookup_unavailable"].includes(p.decision.reasonCode)
+    || p.routing.reason === "registration_email_confirmation_required");
+  if (waitingIdentity && !manualChoice) return <>
+    <div className={styles.panel} role="status">
+      <h3 className={styles.blockTitle}>Identifier le compte avant toute action</h3>
+      <p>{p.decision.explanation}</p>
+      <p>Aucune création, aucun rattachement ni aucune réouverture de ticket n’est proposé à ce stade. Le brouillon reste à relire et à valider séparément.</p>
+      <button type="button" className="secondary" onClick={() => setManualChoice(true)}>Choisir manuellement une action après vérification du compte</button>
+    </div>
+    <input type="hidden" name="title" value={savSuggestedTicketTitle(p)}/>
+    <input type="hidden" name="description" value={p.ticket.description}/>
+    <input type="hidden" name="category" value={p.category}/><input type="hidden" name="urgency" value={p.urgency}/>
+    <input type="hidden" name="decisionKind" value={p.decision.kind}/>
+    <input type="hidden" name="processCount" value={p.process.length}/>
+    {p.process.map((step, index) => <span key={index} hidden><input type="hidden" name={`processKind_${index}`} value={step.kind}/><input type="hidden" name={`processLabel_${index}`} value={step.label}/><input type="hidden" name={`processSources_${index}`} value={JSON.stringify(step.sourceIds)}/></span>)}
+    <div className={styles.panel}><label><input type="checkbox" required/>J’ai relu la demande et l’étape de vérification du compte.</label></div>
+  </>;
+  return <EditableProcessEditor proposal={p} tickets={tickets}/>;
+}
+
+function EditableProcessEditor({ proposal: p, tickets }: { proposal: SavStructuredProposal; tickets: Ticket[] }) {
   const initial = p.humanProcess;
   const [action, setAction] = useState<Action>(() => defaultAction(p, tickets));
   const [ticketId, setTicketId] = useState(initial?.ticketId ?? (p.routing.kind === "matched" ? p.routing.ticketId : ""));
