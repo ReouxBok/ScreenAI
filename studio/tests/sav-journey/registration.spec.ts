@@ -1,7 +1,9 @@
 import {expect,test} from "@playwright/test";
 import {readFileSync} from "node:fs";
 import {REGISTRATION_JOURNEY_ID} from "../../test/sav-journey-fixture";
+import {warmSavJourneyRoutes} from "../helpers/journey-warmup";
 import {submitServerAction} from "../helpers/server-action";
+test.beforeAll(warmSavJourneyRoutes);
 const remote=()=>JSON.parse(readFileSync(".e2e-journey-provider.json","utf8"));
 test("SAV79 + SAV86: English registration clarification, French console, immutable source and one supervised send",async({page,baseURL},info)=>{
  const external:string[]=[],errors:string[]=[];const before=remote().events.length;

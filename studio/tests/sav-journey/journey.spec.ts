@@ -1,7 +1,9 @@
 import { expect, test } from "@playwright/test";
 import { readFileSync, writeFileSync, existsSync } from "node:fs";
 import { JOURNEY_CASES, journeyId } from "../../test/sav-journey-fixture";
+import { warmSavJourneyRoutes } from "../helpers/journey-warmup";
 import { submitServerAction } from "../helpers/server-action";
+test.beforeAll(warmSavJourneyRoutes);
 const statePath = ".e2e-journey-provider.json";
 function remote() { return JSON.parse(readFileSync(statePath, "utf8")); }
 for (const key of JOURNEY_CASES) {
@@ -47,19 +49,19 @@ for (const key of JOURNEY_CASES) {
     expect(remote().events).not.toContainEqual(expect.objectContaining({ contactId: remote().cases[key].contactId }));
     await expect(prepare).toBeEnabled();
     const eventsBeforePreview = remote().events.length;
-    await submitServerAction(page, prepare); clicks++;
+    await submitServerAction(page, prepare, /"distinctIssueReason":/); clicks++;
     const preview = execution.getByRole("region", { name: "Aperçu de l’action HubSpot", exact: true });
     await expect(preview).toBeVisible();
     const countBeforeConfirm = remote().events.length;
     expect(countBeforeConfirm).toBe(eventsBeforePreview);
-    await submitServerAction(page, preview.getByRole("button", { name: /^Confirmer :/ })); clicks++;
+    await submitServerAction(page, preview.getByRole("button", { name: /^Confirmer :/ }), /^\["v1\./); clicks++;
     if (key === "retry") {
       await expect(execution).toContainText("HubSpot refuse l’accès");
       await expect(prepare).toBeEnabled(); // No full document reload needed after a definite rejection.
       const state = remote(); state.cases.retry.fault = null; writeFileSync(statePath, JSON.stringify(state));
-      await submitServerAction(page, prepare); clicks++;
+      await submitServerAction(page, prepare, /"distinctIssueReason":/); clicks++;
       await expect(preview).toBeVisible();
-      await submitServerAction(page, preview.getByRole("button", { name: /^Confirmer :/ })); clicks++;
+      await submitServerAction(page, preview.getByRole("button", { name: /^Confirmer :/ }), /^\["v1\./); clicks++;
     }
     if (key === "uncertain") {
       await expect(execution).toContainText("Retour à vérifier dans HubSpot");
