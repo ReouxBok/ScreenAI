@@ -126,7 +126,9 @@ test("SAV44 exposes understanding and persists independent dossier/draft feedbac
   expect(formData).toEqual({ identityVerified: "on", registrationEmail: "fixture@example.invalid" });
 
   await processConfirmation.check();
-  await submitServerAction(page, dossier.getByRole("button", { name: "Valider le dossier", exact: true }));
+  // A form rendered by the feedback RSC has no SSR $ACTION_ID field.
+  // Match its existing humanProcess multipart contract, excluding recordOpened JSON.
+  await submitServerAction(page, dossier.getByRole("button", { name: "Valider le dossier", exact: true }), /name="(?:_\d+_)?humanProcess"/);
   await page.waitForURL(/review=saved/, { timeout: 30_000 });
   // This harness has no CRM credentials. The fresh context read must fail;
   // a cached ready snapshot before that asynchronous result is not readiness.
