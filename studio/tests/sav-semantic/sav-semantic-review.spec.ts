@@ -127,10 +127,14 @@ test("SAV44 exposes understanding and persists independent dossier/draft feedbac
   await processConfirmation.check();
   await submitServerAction(page, dossier.getByRole("button", { name: "Valider le dossier", exact: true }));
   await page.waitForURL(/review=saved/, { timeout: 30_000 });
+  // This harness has no CRM credentials. The fresh context read must fail;
+  // a cached ready snapshot before that asynchronous result is not readiness.
+  await page.waitForURL(/context=failed/, { timeout: 30_000 });
+  await expect(page.getByText("Le contexte HubSpot est indisponible ou incomplet. Actualisez-le avant de choisir une action.", { exact: true })).toBeVisible();
   await expect(dossier).toContainText("Dossier · validé par ugo@limova.ai");
   await expect(draft).toContainText("Contexte ou texte modifié : nouvelle lecture nécessaire.");
   await expect(draft.getByRole("button", { name: "Accepter cette version", exact: true })).toBeEnabled();
-  await expect(page.getByRole("button", { name: "Préparer l’aperçu de l’action", exact: true })).toBeEnabled();
+  await expect(page.getByRole("button", { name: "Préparer l’aperçu de l’action", exact: true })).toBeDisabled();
   await expect(draft.getByRole("button", { name: "Envoyer la réponse acceptée", exact: true })).toBeDisabled();
 
   await page.reload();
@@ -149,7 +153,7 @@ test("SAV44 exposes understanding and persists independent dossier/draft feedbac
   await openUnderstanding();
   await expect(understanding).toContainText("L’export du document échoue malgré une nouvelle tentative.");
   await expect(page.getByText("Aucun ticket lié à ce dossier.", { exact: true })).toBeVisible();
-  await expect(page.getByRole("button", { name: "Préparer l’aperçu de l’action", exact: true })).toBeEnabled();
+  await expect(page.getByRole("button", { name: "Préparer l’aperçu de l’action", exact: true })).toBeDisabled();
   await expect(draft.getByRole("button", { name: "Envoyer la réponse acceptée", exact: true })).toBeDisabled();
   expect(externalRequests).toEqual([]); expect(browserErrors).toEqual([]);
   await page.screenshot({ path: testInfo.outputPath("sav44-independent-semantic-review.png"), fullPage: true });
