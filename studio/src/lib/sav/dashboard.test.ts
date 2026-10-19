@@ -54,6 +54,13 @@ beforeEach(async () => {
   await activateSavV0Cutover({ receivedAfter: "2026-10-02T12:00:00Z", mailboxEmail: mailbox.email, intakeRecipient: "contact@limova.ai", deploymentSha: "a".repeat(40), activatedBy: "ugo@limova.ai" });
 });
 describe("SAV-55 dashboard read model", () => {
+  it("restricts the internal operator selection and its counts to one exact thread", async () => {
+    const selected = await seed(); await seed();
+    const result = await listSavDossierDashboard({ threadId: selected.thread.id });
+    expect(result.rows.map(row => row.messageId)).toEqual([selected.message.id]);
+    expect(result.counts.to_process).toBe(1);
+    await expect(listSavDossierDashboard({ threadId: "invalid" })).rejects.toThrow("INVALID");
+  });
   it("shows one latest inbound per dossier and does not inherit a prior opening or verdict", async () => {
     const old = await seed({ approved: true, noTicket: true, opening: "opened" });
     const current = await seed({ threadId: old.thread.id });

@@ -45,6 +45,18 @@ beforeEach(async () => {
 });
 
 describe("persisted dossier enrichment", () => {
+  it("can collect CRM notes and history without persisting enrichment or mutating the dossier", async () => {
+    const message = await seed();
+    const before = await fixture.db.select().from(savMessages);
+    const context = await collectSavDossierContext(message.id, { persist: false });
+    expect(context.crm.status).toBe("ready");
+    expect(context.conversation?.messages).toHaveLength(1);
+    expect(state.crm).toHaveBeenCalledWith(expect.objectContaining({ includeHistory: true }));
+    expect(await fixture.db.select().from(savMessages)).toEqual(before);
+    expect(await fixture.db.select().from(savActions)).toEqual([]);
+    expect(await fixture.db.select().from(savAgentRuns)).toEqual([]);
+    expect(state.analyze).not.toHaveBeenCalled();
+  });
   it("uses the actual sender and persists context before reasoning without changing the source email", async () => {
     const message = await seed();
     await processStoredSavMessage(message.id);

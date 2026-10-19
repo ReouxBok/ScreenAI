@@ -41,7 +41,9 @@ export type SavDashboardRow = {
 };
 /** One snapshot and one classification predicate for counts and page rows. Private
  * proposal content is decrypted on the server and never returned to the browser. */
-export async function listSavDossierDashboard(options: { view?: string; query?: string; page?: number; pageSize?: number; sort?: string } = {}) {
+export async function listSavDossierDashboard(options: { view?: string; query?: string; page?: number; pageSize?: number; sort?: string; threadId?: string } = {}) {
+  // Internal operator selection; public route parameters do not expose this option.
+  if (options.threadId !== undefined && !/^[a-f0-9-]{36}$/i.test(options.threadId)) throw new Error("SAV_THREAD_ID_INVALID");
   const pageSize = Math.min(50, Math.max(1, options.pageSize ?? 25));
   const query = options.query?.trim().slice(0, 200).toLocaleLowerCase("fr") ?? "";
   const requestedPage = Math.max(1, Math.min(100_000, Math.trunc(options.page ?? 1) || 1));
@@ -62,7 +64,7 @@ export async function listSavDossierDashboard(options: { view?: string; query?: 
         .leftJoin(savAgentRuns, eq(savAgentRuns.id, savDecisions.agentRunId))
         .leftJoin(savProposalReviews, and(eq(savProposalReviews.messageId, savMessages.id), eq(savProposalReviews.isCurrent, true)))
         .leftJoin(savPilotItems, eq(savPilotItems.messageId, savMessages.id))
-        .where(and(eq(savMessages.direction, "inbound"), savV0EligibleMessageFilter(), isNull(savPilotItems.id),
+        .where(and(eq(savMessages.direction, "inbound"), savV0EligibleMessageFilter(), isNull(savPilotItems.id), options.threadId ? eq(savThreads.id, options.threadId) : undefined,
           sql`${savMessages.id} = (select latest.id from sav.messages latest where latest.thread_id = ${savThreads.id} and latest.direction = 'inbound' order by latest.received_at desc, latest.created_at desc, latest.id desc limit 1)`))
         .orderBy(options.sort === "oldest" ? asc(savMessages.receivedAt) : desc(savMessages.receivedAt), options.sort === "oldest" ? asc(savMessages.id) : desc(savMessages.id)).limit(250).offset(offset);
       if (!batch.length) break;
