@@ -3,8 +3,8 @@ import { normalizeSavEvidenceText, savEvidenceContains } from "./evidence-text";
 import { cleanSavModelDraft } from "./reply-format";
 import { SavContractValidationError, savValidationDiagnosticSchema } from "./validation-diagnostics";
 
-export const SAV_UNDERSTANDING_REVISION = "sav-understanding-2026-10-18.v9";
-export const SAV_UNDERSTANDING_PROMPT_REVISION = "sav-understanding-prompt-2026-10-18.v9";
+export const SAV_UNDERSTANDING_REVISION = "sav-understanding-2026-10-19.v10";
+export const SAV_UNDERSTANDING_PROMPT_REVISION = "sav-understanding-prompt-2026-10-19.v10";
 const id = z.string().trim().min(1).max(100);
 const ids = z.array(id).max(30);
 export const savRequestNatureSchema = z.enum(["technical", "account", "integration", "how_to", "financial_operation", "financial_data", "cancellation", "commercial", "partnership", "callback", "human_request", "security", "privacy", "data_deletion", "legal", "acknowledgement", "non_support", "unknown"]);
