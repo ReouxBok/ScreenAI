@@ -41,6 +41,144 @@ beforeEach(() => {
 });
 afterEach(() => { vi.unstubAllEnvs(); vi.unstubAllGlobals(); vi.resetAllMocks(); });
 
+describe("SAV registration prerequisite before product composition", () => {
+  const absent = { contactFound: false, contactId: undefined, errorCode: null, identityCandidates: [], tickets: [], routing: { kind: "new", reason: "no_contact" } };
+  it.each(modes)("asks for registration email before any product plan in %s", async mode => {
+    const u = understandingFixture(); deps.understand.mockResolvedValue(u); deps.crm.mockResolvedValue(absent);
+    const network = vi.fn();
+    const result = await analyzeSavMessage({ from: "sender@example.invalid", subject: "Activation", body: "L’agent téléphone cesse de répondre." }, { evaluation: evaluation(mode, network) });
+    expect(result.proposal.reasonCode).toBe("registration_email_required");
+    expect(result.replyDraft).toContain("adresse email utilisée lors de votre inscription");
+    expect(result.replyAssessment).toMatchObject({ kind: "contextualized", coherence: { status: "passed" } });
+    expect(result.understanding?.requests).toEqual(u.requests);
+    expect(result.structuredProposal?.process.every(p => !["product_step", "create_ticket", "link_ticket"].includes(p.kind))).toBe(true);
+    expect(result.structuredProposal?.customerIdentity.verifiedByHuman).toBe(false);
+    expect(deps.agent).not.toHaveBeenCalled(); expect(deps.search).not.toHaveBeenCalled(); expect(deps.retrieval).not.toHaveBeenCalled(); expect(network).not.toHaveBeenCalled();
+    expect(deps.coherence).toHaveBeenCalledOnce(); expect(deps.crm).toHaveBeenCalledOnce();
+  });
+  it.each(["403", "429", "timeout", "SAV_HUBSPOT_TICKETS_TRUNCATED"])("never translates a %s failure into customer absence", async code => {
+    deps.understand.mockResolvedValue(understandingFixture()); deps.crm.mockRejectedValue(new Error(code));
+    const result = await analyzeSavMessage({ from: "sender@example.invalid", subject: "Support", body: "Demande fictive" }, { evaluation: evaluation("off", vi.fn()) });
+    expect(result.proposal.reasonCode).toBe("registration_lookup_unavailable");
+    expect(result.replyDraft).not.toMatch(/aucun|retrouv|inscription|\?/);
+    expect(result.ticketRouting).toMatchObject({ kind: "review", reason: "hubspot_context_unavailable" });
+  });
+  it("retains an evidenced address without reading or exposing another account before human identity confirmation", async () => {
+    const body = "L’agent téléphone cesse de répondre. Mon email d’inscription est account@example.invalid";
+    const u = understandingFixture(); u.evidence[0].excerpt = body;
+    u.knownFacts = [{ id: "reg", key: "registration_email", text: "account@example.invalid", evidenceIds: [u.evidence[0].id] }];
+    deps.understand.mockResolvedValue(u);
+    deps.crm.mockImplementation(async ({ email }) => email === "account@example.invalid"
+      ? { ...absent, contactFound: true, contactId: "PRIVATE_ALTERNATE_ACCOUNT", contactName: "PRIVATE_ALTERNATE_HISTORY" } : absent);
+    const source = { from: "sender@example.invalid", subject: "Support", body };
+    const network = vi.fn<typeof fetch>(async () => geminiFixture(outputFor(u)));
+    const result = await analyzeSavMessage(source, { evaluation: evaluation("off", network) });
+    expect(deps.crm).toHaveBeenCalledOnce();
+    expect(deps.crm).toHaveBeenLastCalledWith(expect.objectContaining({ email: "sender@example.invalid" }));
+    expect(deps.understand).toHaveBeenCalledOnce(); expect(network).not.toHaveBeenCalled();
+    expect(JSON.stringify([deps.understand.mock.calls, deps.coherence.mock.calls, result])).not.toMatch(/PRIVATE_ALTERNATE/);
+    expect(result.structuredProposal?.customerIdentity).toEqual({ registrationEmail: "account@example.invalid", verifiedByHuman: false });
+    expect(result.ticketRouting?.kind).toBe("review");
+    expect(result.proposal.reasonCode).toBe("registration_email_confirmation_required");
+    expect(result.structuredProposal?.process.some(p => p.kind === "create_ticket" || p.kind === "link_ticket")).toBe(false);
+    expect(result.replyDraft).not.toContain("adresse email utilisée lors de votre inscription");
+    expect(source.from).toBe("sender@example.invalid");
+  });
+  it("acknowledges a supplied alternate address rather than requesting it again", async () => {
+    const body = "Mon email d’inscription est account@example.invalid";
+    const u = understandingFixture(); u.evidence[0].excerpt = body;
+    u.knownFacts = [{ id: "reg", key: "registration_email", text: "account@example.invalid", evidenceIds: [u.evidence[0].id] }];
+    deps.understand.mockResolvedValue(u); deps.crm.mockResolvedValue(absent);
+    const result = await analyzeSavMessage({ from: "sender@example.invalid", subject: "Support", body }, { evaluation: evaluation("off", vi.fn()) });
+    expect(deps.crm).toHaveBeenCalledOnce(); expect(deps.understand).toHaveBeenCalledOnce();
+    expect(result.replyDraft).toContain("Merci pour l’adresse email d’inscription indiquée");
+    expect(result.replyDraft).not.toContain("?");
+    expect(result.replyDraft).not.toContain("préciser l’adresse email utilisée");
+  });
+  it("reuses an explicit address in the same customer's inbound history", async () => {
+    const text = "Mon email d’inscription est account@example.invalid";
+    const u = understandingFixture();
+    u.evidence.push({ id: "history-reg", source: "history", sourceId: "message:old-inbound", excerpt: text });
+    u.knownFacts = [{ id: "reg", key: "registration_email", text: "account@example.invalid", evidenceIds: ["history-reg"] }];
+    deps.understand.mockResolvedValue(u); deps.crm.mockResolvedValue(absent);
+    const result = await analyzeSavMessage({ from: "sender@example.invalid", subject: "Support", body: "Mon agent ne répond pas.",
+      conversation: { threadId: "fixture", currentMessageId: "new-inbound", hubspotTicketId: null, status: "new", aiPaused: false, senderMatchesCustomer: true,
+        messages: [{ id: "old-inbound", direction: "inbound", from: "sender@example.invalid", receivedAt: "2026-10-18T10:00:00.000Z", text, truncated: false }], olderSummary: [], historyTruncated: false, attachmentNotice: "Non lues" } }, { evaluation: evaluation("off", vi.fn()) });
+    expect(deps.crm).toHaveBeenCalledOnce();
+    expect(result.structuredProposal?.customerIdentity).toEqual({ registrationEmail: "account@example.invalid", verifiedByHuman: false });
+    expect(result.replyDraft).not.toContain("?");
+  });
+  it("does not use another participant's registration address", async () => {
+    const text = "Mon email d’inscription est other@example.invalid";
+    const u = understandingFixture();
+    u.evidence.push({ id: "history-reg", source: "history", sourceId: "message:other-inbound", excerpt: text });
+    u.knownFacts = [{ id: "reg", key: "registration_email", text: "other@example.invalid", evidenceIds: ["history-reg"] }];
+    deps.understand.mockResolvedValue(u); deps.crm.mockResolvedValue(absent);
+    const result = await analyzeSavMessage({ from: "sender@example.invalid", subject: "Support", body: "Mon agent ne répond pas.",
+      conversation: { threadId: "fixture", currentMessageId: "new-inbound", hubspotTicketId: null, status: "new", aiPaused: false, senderMatchesCustomer: true,
+        messages: [{ id: "other-inbound", direction: "inbound", from: "other@example.invalid", receivedAt: "2026-10-18T10:00:00.000Z", text, truncated: false }], olderSummary: [], historyTruncated: false, attachmentNotice: "Non lues" } }, { evaluation: evaluation("off", vi.fn()) });
+    expect(deps.crm).toHaveBeenCalledOnce(); expect(result.structuredProposal?.customerIdentity.registrationEmail).toBeNull();
+  });
+  it("does not attempt a failing alternate-address read before confirmation", async () => {
+    const body = "Mon email d’inscription est account@example.invalid";
+    const u = understandingFixture(); u.evidence[0].excerpt = body;
+    u.knownFacts = [{ id: "reg", key: "registration_email", text: "account@example.invalid", evidenceIds: [u.evidence[0].id] }];
+    deps.understand.mockResolvedValue(u); deps.crm.mockResolvedValueOnce(absent).mockRejectedValueOnce(new Error("403"));
+    const result = await analyzeSavMessage({ from: "sender@example.invalid", subject: "Support", body }, { evaluation: evaluation("off", vi.fn()) });
+    expect(deps.crm).toHaveBeenCalledOnce(); expect(result.proposal.reasonCode).toBe("registration_email_confirmation_required");
+    expect(result.replyDraft).not.toContain("vérifier l’adresse d’inscription indiquée");
+    expect(result.replyDraft).not.toMatch(/retrouv|aucun/);
+  });
+  it("does not ask a pre-purchase prospect for registration before general product information", async () => {
+    const u = understandingFixture({ customerRelationship: { kind: "prospect", evidenceIds: ["evidence-1"] } });
+    deps.understand.mockResolvedValue(u); deps.crm.mockResolvedValue(absent);
+    const result = await analyzeSavMessage(input, { evaluation: evaluation("off", vi.fn<typeof fetch>(async () => geminiFixture(outputFor(u)))) });
+    expect(result.proposal.reasonCode).not.toMatch(/^registration_/);
+    expect(result.replyDraft).not.toMatch(/inscription/);
+  });
+  it("does not repeat the question when the original address is already the declared registration email", async () => {
+    const body = "Mon email d’inscription est sender@example.invalid";
+    const u = understandingFixture(); u.evidence[0].excerpt = body;
+    u.knownFacts = [{ id: "reg", key: "registration_email", text: "sender@example.invalid", evidenceIds: [u.evidence[0].id] }];
+    deps.understand.mockResolvedValue(u); deps.crm.mockResolvedValue(absent);
+    const result = await analyzeSavMessage({ from: "sender@example.invalid", subject: "Support", body }, { evaluation: evaluation("off", vi.fn()) });
+    expect(deps.crm).toHaveBeenCalledOnce(); expect(result.replyDraft).toContain("vérifier l’adresse d’inscription indiquée");
+  });
+  it("does not ask for an address when a contact was found but ticket reads failed", async () => {
+    const u = understandingFixture(); deps.understand.mockResolvedValue(u);
+    deps.crm.mockResolvedValue({ ...absent, contactFound: true, contactId: "found", errorCode: "SAV_HUBSPOT_TICKETS_UNAVAILABLE" });
+    const result = await analyzeSavMessage(input, { evaluation: evaluation("off", vi.fn<typeof fetch>(async () => geminiFixture(outputFor(u)))) });
+    expect(result.proposal.reasonCode).not.toMatch(/^registration_/);
+    expect(result.replyDraft).not.toMatch(/inscription/); expect(deps.crm).toHaveBeenCalledOnce();
+    expect(result.ticketRouting).toMatchObject({ kind: "review", reason: "hubspot_context_unavailable" });
+  });
+  it("asks for registration when contact lookup completed with no match even if the later ticket pipeline failed", async () => {
+    deps.understand.mockResolvedValue(understandingFixture());
+    deps.crm.mockResolvedValue({ ...absent, errorCode: "SAV_HUBSPOT_TICKETS_UNAVAILABLE" });
+    const result = await analyzeSavMessage(input, { evaluation: evaluation("off", vi.fn()) });
+    expect(result.proposal.reasonCode).toBe("registration_email_required");
+    expect(result.replyDraft).toContain("adresse email utilisée lors de votre inscription");
+    expect(result.ticketRouting?.kind).toBe("review");
+  });
+  it("keeps the actual coherence guard on the server-owned clarification", async () => {
+    deps.understand.mockResolvedValue(understandingFixture()); deps.crm.mockResolvedValue(absent);
+    deps.coherence.mockImplementation((...args) => import("./reply-coherence").then(async () => {
+      const actual = await vi.importActual<typeof import("./reply-coherence")>("./reply-coherence");
+      return actual.checkSavReplyCoherence(...args as Parameters<typeof actual.checkSavReplyCoherence>);
+    }));
+    const network = vi.fn<typeof fetch>(async () => geminiFixture({ passed: true, issues: [], coveredRequestIds: ["request-1"] }));
+    const result = await analyzeSavMessage(input, { evaluation: evaluation("off", network) });
+    expect(network).toHaveBeenCalledOnce(); expect(result.replyAssessment?.coherence?.status).toBe("passed");
+    expect(JSON.parse(String(network.mock.calls[0][1]?.body)).contents[0].parts[0].text).toContain("registration_identity_question");
+  });
+  it.each(["rejected", "unavailable"])("does not bypass a %s coherence result", async status => {
+    deps.understand.mockResolvedValue(understandingFixture()); deps.crm.mockResolvedValue(absent); deps.coherence.mockResolvedValue(coherence(status));
+    const result = await analyzeSavMessage(input, { evaluation: evaluation("off", vi.fn()) });
+    expect(result.replyAssessment?.kind).not.toBe("contextualized");
+    expect(result.replyAssessment?.errorCode).toBeTruthy(); expect(result.ticketRouting?.kind).toBe("review");
+  });
+});
+
 describe("SAV shared semantic pipeline with synthetic provider outputs", () => {
   it("proposes the analyzed nominal title without copying the subject or changing a linked CRM record", async () => {
     const u = understandingFixture({ ticketTitle: "Activation téléphonique et numéro dédié" });
