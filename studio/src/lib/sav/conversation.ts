@@ -34,7 +34,10 @@ export async function loadSavConversation(messageId: string): Promise<SavConvers
   if (!thread) throw new Error("SAV_CONTEXT_THREAD_MISSING");
   const rows = await db.select().from(savMessages).where(and(
     eq(savMessages.threadId, thread.id), eq(savMessages.mailboxId, current.mailboxId),
-    lte(savMessages.receivedAt, current.receivedAt), lte(savMessages.createdAt, current.createdAt),
+    // Compare timestamps inside PostgreSQL: JS Date truncates microseconds and
+    // could exclude the current message (or a tied historical message).
+    lte(savMessages.receivedAt, sql`(select anchor.received_at from sav.messages anchor where anchor.id = ${current.id}::uuid)`),
+    lte(savMessages.createdAt, sql`(select anchor.created_at from sav.messages anchor where anchor.id = ${current.id}::uuid)`),
   )).orderBy(desc(savMessages.receivedAt), desc(savMessages.createdAt), desc(savMessages.id)).limit(33);
   const outboundProofs = new Map<string, { hash: string; messageId: string | null }>();
   let remaining = 15_000;

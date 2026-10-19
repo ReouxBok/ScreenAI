@@ -3,8 +3,14 @@ import { vector as pgliteVector } from "@electric-sql/pglite-pgvector";
 import { drizzle as drizzlePglite } from "drizzle-orm/pglite";
 import { drizzle, type PostgresJsDatabase } from "drizzle-orm/postgres-js";
 import postgres from "postgres";
+import { AsyncLocalStorage } from "node:async_hooks";
 import * as schema from "./schema";
 type StudioDb = PostgresJsDatabase<typeof schema>;
+const requestDatabases = new AsyncLocalStorage<StudioDb>();
+/** Internal server adapter only. Request-local DB never replaces the normal pool. */
+export function withStudioDatabase<T>(db: StudioDb, work: () => Promise<T>): Promise<T> {
+  return requestDatabases.run(db, work);
+}
 const globalForDb = globalThis as typeof globalThis & {
   __charlyStudioDb?: StudioDb;
   __charlyStudioCloseDb?: () => Promise<void>;
@@ -13,6 +19,8 @@ let cachedDb:StudioDb|null=globalForDb.__charlyStudioDb ?? null;
 let closeClient:(()=>Promise<void>)|null=globalForDb.__charlyStudioCloseDb ?? null;
 export function isDatabaseConfigured(){return Boolean(process.env.DATABASE_URL)}
 export function getDb(){
+  const scoped = requestDatabases.getStore();
+  if(scoped)return scoped;
   if(cachedDb)return cachedDb;
   const url=process.env.DATABASE_URL;
   if(!url)return null;
