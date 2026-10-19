@@ -1,11 +1,12 @@
 import "server-only";
 import { AsyncLocalStorage } from "node:async_hooks";
 import { randomUUID } from "node:crypto";
+import { dispatchSavDerivedCall, isSavDerivedBudgetDeferred, reserveSavDerivedCall, savDerivedCostQuote, settleSavDerivedCall } from "./derived-budget";
 import { savRunProvenance } from "./config";
 import { parseSavGeminiJson, readSavGeminiResponse, type SavGeminiMetadata } from "./gemini-response";
 
 export const SAV_AI_TRANSPORT_REVISION = "sav-gemini-transport-2026-10-16.v3";
-export type SavAiPhase = "understanding" | "composition" | "coherence" | "ticket_matching" | "repair" | "learning_comparison";
+export type SavAiPhase = "understanding" | "composition" | "coherence" | "ticket_matching" | "repair" | "learning_comparison" | "translation";
 export type SavAiFailureCategory = "authentication" | "billing" | "rate_limited" | "provider_unavailable" | "invalid_output" | "blocked_output" | "budget_exhausted";
 export type SavAiTransportTrace = {
   transportRevision: string; correlationId: string; phase: SavAiPhase; model: string; promptRevision: string;
@@ -53,7 +54,7 @@ export function savGeminiGenerationConfig(model: string, config: Record<string, 
 
 export async function requestSavGeminiJson(input: {
   phase: SavAiPhase; apiKey: string; model: string; body: { generationConfig: Record<string, unknown>; [key: string]: unknown };
-  fetch?: typeof fetch; allowRetry?: boolean; promptRevision?: string;
+  fetch?: typeof fetch; allowRetry?: boolean; promptRevision?: string; derivedReservationId?: string;
 }): Promise<{ json: unknown; metadata: SavGeminiMetadata }> {
   if (!budgets.getStore()) return withSavAiBudget(() => requestSavGeminiJson(input));
   const budget = budgets.getStore()!;
@@ -75,7 +76,10 @@ export async function requestSavGeminiJson(input: {
   const generationConfig = savGeminiGenerationConfig(input.model, input.body.generationConfig);
   const output = generationConfig.maxOutputTokens;
   if (typeof output !== "number" || !Number.isInteger(output) || output < 1 || output > 8192) return fail("SAV_AI_BUDGET_EXCEEDED");
-  const body = JSON.stringify({ ...input.body, generationConfig });
+  const requestBody = { ...input.body, generationConfig };
+  const body = JSON.stringify(requestBody);
+  const derivedStage = input.phase === "learning_comparison" ? "comparison" : input.phase === "translation" ? "translation" : null;
+  const reservationId = derivedStage ? input.derivedReservationId ?? (await reserveSavDerivedCall(derivedStage, input.model, output)).reservationId : null;
   // UTF-8 bytes conservatively reserve input capacity. Unknown failed usage is
   // never refunded. This is an admission bound, not a provider billing estimate.
   const allowance = Buffer.byteLength(body, "utf8") + output;
@@ -83,6 +87,7 @@ export async function requestSavGeminiJson(input: {
     const remaining = Math.min(deadline - Date.now(), remainingTime(budget));
     if (remaining <= 0 || budget.calls >= SAV_AI_BUDGET.calls || budget.reservedTokens + allowance > SAV_AI_BUDGET.tokenAllowance || budget.outputTokens + output > SAV_AI_BUDGET.outputTokens)
       return fail("SAV_AI_BUDGET_EXCEEDED");
+    if (derivedStage && reservationId) await dispatchSavDerivedCall(reservationId, derivedStage, input.model, requestBody);
     budget.calls++; budget.reservedTokens += allowance; budget.outputTokens += output; attempts++;
     const controller = new AbortController();
     // Reserve time before awaiting so concurrent phases cannot spend it twice.
@@ -91,6 +96,7 @@ export async function requestSavGeminiJson(input: {
     const timer = setTimeout(() => controller.abort(), attemptMs);
     let code = "SAV_AI_GENERATION_FAILED", retryAfter = 0;
     try {
+      if (derivedStage) savDerivedCostQuote(input.model, output);
       const response = await (input.fetch ?? fetch)(`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(input.model)}:generateContent`, {
         method: "POST", headers: { "Content-Type": "application/json", "x-goog-api-key": input.apiKey }, body, signal: controller.signal,
       });
@@ -109,15 +115,21 @@ export async function requestSavGeminiJson(input: {
         throw new Error("SAV_AI_INVALID_RESPONSE");
       }
       const generated = readSavGeminiResponse(payload);
-      for (const field of ["inputTokens", "outputTokens", "thoughtTokens", "totalTokens"] as const) metadata[field] = (metadata[field] ?? 0) + (generated.metadata[field] ?? 0);
+      for (const field of ["inputTokens", "outputTokens", "thoughtTokens", "totalTokens"] as const) metadata[field] = derivedStage ? generated.metadata[field] : (metadata[field] ?? 0) + (generated.metadata[field] ?? 0);
       metadata = { ...generated.metadata, ...metadata };
-      const json = parseSavGeminiJson(generated);
+      let json: unknown;
+      try { json = parseSavGeminiJson(generated); }
+      catch (error) {
+        if (derivedStage && reservationId && !controller.signal.aborted && Date.now() <= deadline) await settleSavDerivedCall(reservationId, metadata);
+        throw error;
+      }
       if (controller.signal.aborted || Date.now() > deadline) return fail("SAV_AI_TIMEOUT");
+      if (derivedStage && reservationId) await settleSavDerivedCall(reservationId, metadata);
       metadata.transport = trace(null);
       console.info("sav_ai_transport", { ...savRunProvenance(), ...metadata.transport, ...metadata, transport: undefined });
       return { json, metadata };
     } catch (error) {
-      if (error instanceof SavAiTransportError) throw error;
+      if (error instanceof SavAiTransportError || isSavDerivedBudgetDeferred(error)) throw error;
       if (controller.signal.aborted || error instanceof Error && error.name === "AbortError") code = "SAV_AI_TIMEOUT";
       else if (error instanceof Error && /^SAV_AI_(HTTP_[1-5]\d{2}|INVALID_RESPONSE|INVALID_JSON|OUTPUT_(BLOCKED|TRUNCATED|INCOMPLETE)|EMPTY_OUTPUT)$/.test(error.message)) code = error.message;
     } finally {
@@ -128,7 +140,7 @@ export async function requestSavGeminiJson(input: {
     const transient = ["SAV_AI_TIMEOUT", "SAV_AI_GENERATION_FAILED", "SAV_AI_HTTP_429", "SAV_AI_HTTP_502", "SAV_AI_HTTP_503", "SAV_AI_HTTP_504"].includes(code);
     const delay = Math.max(0, retryAfter, 200) + Math.floor(Math.random() * 100);
     // Admit a retry only with enough time for a complete second attempt.
-    if (input.allowRetry === false || !transient || attempts >= 2 || budget.retries >= SAV_AI_BUDGET.retries || Math.min(deadline - Date.now(), remainingTime(budget)) < delay + ATTEMPT_MS || budget.calls >= SAV_AI_BUDGET.calls) return fail(code);
+    if (derivedStage || input.allowRetry === false || !transient || attempts >= 2 || budget.retries >= SAV_AI_BUDGET.retries || Math.min(deadline - Date.now(), remainingTime(budget)) < delay + ATTEMPT_MS || budget.calls >= SAV_AI_BUDGET.calls) return fail(code);
     budget.retries++;
     const waitStarted = Date.now();
     budget.reservedMs += delay;

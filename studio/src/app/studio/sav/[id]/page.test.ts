@@ -12,7 +12,7 @@ const dependencies = vi.hoisted(() => ({
     refreshSavContextAction: vi.fn(), repairSavProposalAction: vi.fn(),
     approveDraftAction: vi.fn(), correctDecisionAction: vi.fn(), createTicketAction: vi.fn(),
     linkTicketAction: vi.fn(), reconcileTicketAction: vi.fn(), reconcileTicketReturnAction: vi.fn(), requestHumanAction: vi.fn(),
-    retryAction: vi.fn(), retryAnalysisAction: vi.fn(), reviewPilotItemAction: vi.fn(), qualifyObservationAction: vi.fn(), reviewDraftAction: vi.fn(), reviewProposalAction: vi.fn(), saveReplyDraftAction: vi.fn(), saveHumanDraftAction: vi.fn(), sendStudioReplyAction: vi.fn(),
+    retryAction: vi.fn(), retryAnalysisAction: vi.fn(), reviewPilotItemAction: vi.fn(), qualifyObservationAction: vi.fn(), reviewDraftAction: vi.fn(), reviewProposalAction: vi.fn(), saveReplyDraftAction: vi.fn(), saveHumanDraftAction: vi.fn(), sendStudioReplyAction: vi.fn(), sendSuggestedReplyAction: vi.fn(),
   },
 }));
 vi.mock("@/lib/sav/partnership-forward", () => ({ getSavPartnershipTransferState: async () => ({ available: false, status: "unavailable" }), isSavPartnershipForward: (action: { payload: { purpose?: string } }) => action.payload.purpose === "partnership_forward" }));
@@ -32,6 +32,7 @@ vi.mock("next/link", () => ({ default: (props: ComponentProps<"a">) => createEle
 vi.mock("../ticket-preview-actions", () => ({ prepareTicketPreviewAction: vi.fn(), confirmTicketPreviewAction: vi.fn() }));
 vi.mock("../actions", () => dependencies.actions);
 
+vi.mock("@/lib/sav/translations",()=>({getSavTranslations:async()=>({})}));
 import SavThreadPage from "./page";
 
 type ThreadDetail = NonNullable<Awaited<ReturnType<typeof getSavThreadDetail>>>;
@@ -236,41 +237,41 @@ describe("SAV dossier SSR and human-review guardrails", () => {
 
   it("keeps process validation above a separately editable draft and disabled send CTA", async () => {
     const html = await renderPage();
-    const titles = ["<h2>Conversation</h2>", "<h2>Ce que l’agent a trouvé</h2>", "Connaissances utilisées", "<h2>Action proposée</h2>", "Que faire de ce dossier ?", ">Valider le dossier<", "<h2>Brouillon de réponse</h2>", "Verdict du brouillon"];
+    const titles = ["<h2>Conversation</h2>", "<h2>Ce que l’agent a trouvé</h2>", "Connaissances utilisées", "<h2>Action proposée</h2>", "Que faire de ce dossier ?", ">Valider le dossier<", "<h2>Suggestion de réponse</h2>", "Feedback facultatif"];
     for (let index = 1; index < titles.length; index++) expect(html.indexOf(titles[index])).toBeGreaterThan(html.indexOf(titles[index - 1]));
     expect(html).not.toMatch(/<textarea[^>]*name="replyDraft"/);
     expect(html).toMatch(/<textarea[^>]*name="text"/);
     expect(buttonAttributes(html,"Enregistrer ma version")).toHaveLength(1);
     const draftForms = [...html.matchAll(/<form\b[^>]*>([\s\S]*?)<\/form>/g)].map(match=>match[1]);
     expect(draftForms.find(form=>form.includes('name="text"'))).not.toContain('name="status"');
-    expect(buttonAttributes(html, "Envoyer la réponse acceptée")).toEqual([expect.stringContaining('disabled=""')]);
+    expect(buttonAttributes(html, "Confirmer l’envoi de cette réponse")).toEqual([expect.stringContaining('disabled=""')]);
     expect(html).toContain("validée séparément par Ugo");
     expect(html).toContain("Non assigné");
     expect(html).not.toContain("Sources et preuves");
   });
 
-  it("allows sending independently of process approval when the server enables manual writes", async () => {
+  it("renders the independent send confirmation, waiting for the browser preview hash", async () => {
     vi.stubEnv("SAV_WRITES_DISABLED", "false");
     dependencies.review.mockResolvedValue({...reviewFixture(),draftVerdict:{id:"verdict",status:"accepted",draftId:"accepted-draft",stale:false,reason:"",reviewedBy:"ugo@limova.ai"}});
     const html = await renderPage();
-    expect(buttonAttributes(html, "Envoyer la réponse acceptée")[0]).not.toContain("disabled");
-    expect(html).toContain("Confirme l’envoi dans le fil Gmail d’origine.");
+    expect(buttonAttributes(html, "Confirmer l’envoi de cette réponse")[0]).toContain("disabled");
+    expect(html).toContain("Ce bouton confirme le texte et le destinataire affichés.");
   });
-  it("allows manual V0 send on a human-owned dossier, not an automatic resumption", async () => {
+  it("renders human V0 confirmation on a paused dossier, with browser hash still required", async () => {
     vi.stubEnv("SAV_WRITES_DISABLED", "false");
     const detail = detailFixture();
     detail.thread.aiPaused = true; detail.thread.status = "human_requested";
     dependencies.detail.mockResolvedValue(detail);
     dependencies.review.mockResolvedValue({...reviewFixture(),draftVerdict:{id:"verdict",status:"accepted",draftId:"accepted-draft",stale:false,reason:"",reviewedBy:"ugo@limova.ai"}});
     const html = await renderPage();
-    expect(buttonAttributes(html, "Envoyer la réponse acceptée")[0]).not.toContain("disabled");
+    expect(buttonAttributes(html, "Confirmer l’envoi de cette réponse")[0]).toContain("disabled");
     expect(html).not.toContain("Envoi désactivé dans cette prévisualisation");
     expect(buttonAttributes(html, "Transférer à un humain")).toHaveLength(0);
   });
   it("explains the real environment lock rather than claiming this is a preview", async () => {
     const html = await renderPage();
     expect(html).toContain("Les envois sont désactivés dans cet environnement");
-    expect(buttonAttributes(html, "Envoyer la réponse acceptée")[0]).toContain("disabled");
+    expect(buttonAttributes(html, "Confirmer l’envoi de cette réponse")[0]).toContain("disabled");
   });
 
   it("lists only knowledge actually supporting the response/process, not every retrieved search result", async () => {
@@ -287,7 +288,7 @@ describe("SAV dossier SSR and human-review guardrails", () => {
     const detail = detailFixture();
     detail.actions = [actionFixture({ kind: "send_reply", messageId, status, payload: { manualReplyConfirmed: true, ...(status === "failed" ? { replySendDispatchedAt: now.toISOString() } : {}) } })];
     dependencies.detail.mockResolvedValue(detail);
-    expect(buttonAttributes(await renderPage(), "Envoyer la réponse acceptée")[0]).toContain("disabled");
+    expect(buttonAttributes(await renderPage(), "Confirmer l’envoi de cette réponse")[0]).toContain("disabled");
   });
 
   it.each(["succeeded", "pending", "failed"] as const)("keeps internal partnership transfer %s separate from customer replies", async status => {
@@ -297,7 +298,7 @@ describe("SAV dossier SSR and human-review guardrails", () => {
     detail.actions = [actionFixture({ kind: "send_reply", messageId, status, payload: { purpose: "partnership_forward", manualReplyConfirmed: true, forwardDispatchedAt: now.toISOString() } })];
     dependencies.detail.mockResolvedValue(detail);
     const html = await renderPage();
-    expect(buttonAttributes(html, "Envoyer la réponse acceptée")[0]).not.toContain("disabled");
+    expect(buttonAttributes(html, "Confirmer l’envoi de cette réponse")[0]).toContain("disabled");
     expect(html).toContain("Transfert partenariat à Nathan");
     expect(buttonAttributes(html, "Réessayer")).toHaveLength(0);
   });

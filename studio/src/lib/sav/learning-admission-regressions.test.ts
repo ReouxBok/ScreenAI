@@ -1,8 +1,8 @@
 import { afterAll, afterEach, beforeAll, beforeEach, expect, it, vi } from 'vitest';
 import { eq } from 'drizzle-orm';
 import { createSavTestDb } from '../../../test/sav-db';
-import { contentItems, contentVersions, contentChunks, categories, savLearningCandidates, savLearningAdmissionReservations, savLearningAdmissionSignals, savLearningAdmissionAttempts, savResolutionEvidence, savSyncState, savTicketSnapshots } from '@/db/schema';
-import { processSavLearningResolution, savLearningProofHash } from './learning-pipeline';
+import { auditLogs, contentItems, contentVersions, contentChunks, categories, savLearningCandidates, savLearningAdmissionReservations, savLearningAdmissionSignals, savLearningAdmissionAttempts, savResolutionEvidence, savSyncState, savTicketSnapshots } from '@/db/schema';
+import { reconcileSavDeferredComparisons, processSavLearningResolution, savLearningProofHash } from './learning-pipeline';
 import { activateSavLearningCutover, recordSavLearningSignal, reserveSavLearningCapacityTx, savLearningAdmissionMetrics, claimSavLearningComparisonTx, finishSavLearningComparisonTx, SAV_LEARNING_COMPARISON_LEASE_MS } from './learning-admission';
 import { approveLearningCandidate, rejectLearningCandidate } from './learning';
 import { activateSavKnowledgeVersion } from '@/lib/knowledge/activation';
@@ -22,7 +22,7 @@ const modelFetch=vi.fn(async(_url:unknown,init?:RequestInit)=>{
  const request=JSON.parse(String(init?.body));const p=JSON.parse(request.contents[0].parts[0].text);state.payloads.push(p);
  if(state.beforeResponse)await state.beforeResponse();
  const decision={outcome:state.coveredCandidate?'already_covered':state.match?'amendment':'new',matchedRef:state.coveredCandidate??state.match,groupSignature:p.subject,subject:p.subject,resolution:p.resolution,conditions:['Connexion du produit fictif uniquement'],expectedResult:'La connexion est rétablie',limitations:['Escalader si la connexion échoue'],evidenceRef:p.evidence.ref,evidenceExcerpt:p.resolution.slice(0,80),rationale:'Action humaine observée et résultat reproductible dans ce cas synthétique.'};
- return new Response(JSON.stringify({candidates:[{finishReason:'STOP',content:{parts:[{text:JSON.stringify(decision)}]}}],usageMetadata:{promptTokenCount:10,candidatesTokenCount:20}}));
+ return new Response(JSON.stringify({candidates:[{finishReason:'STOP',content:{parts:[{text:JSON.stringify(decision)}]}}],usageMetadata:{promptTokenCount:10,candidatesTokenCount:20,thoughtsTokenCount:0,totalTokenCount:30}}));
 });
 async function run(i:ReturnType<typeof input>,at=now){
  if(i.origin==='hubspot') {
@@ -30,11 +30,11 @@ async function run(i:ReturnType<typeof input>,at=now){
   const [snapshot]=await f.db.select().from(savTicketSnapshots).where(eq(savTicketSnapshots.hubspotTicketId,i.ticketId));
   i={...i,snapshotId:snapshot.id};
  }
- return processSavLearningResolution(i,{now:at,apiKey:'synthetic-only-key',model:'synthetic-comparator',fetch:modelFetch as typeof fetch});
+ vi.useFakeTimers({toFake:['Date']});vi.setSystemTime(at);return processSavLearningResolution(i,{now:at,apiKey:'synthetic-only-key',model:'gemini-3.6-flash',fetch:modelFetch as typeof fetch});
 }
 beforeAll(async()=>{f=await createSavTestDb();state.db=f.db;},30000);
 afterAll(async()=>{await f?.client.close();});
-afterEach(()=>{vi.restoreAllMocks();vi.unstubAllEnvs();vi.unstubAllGlobals();});
+afterEach(()=>{vi.useRealTimers();vi.restoreAllMocks();vi.unstubAllEnvs();vi.unstubAllGlobals();});
 beforeEach(async()=>{
  await f.client.exec('TRUNCATE sav.learning_candidates, sav.learning_admission_signals, sav.learning_admission_stats, sav.learning_admission_reservations, sav.learning_admission_cases, sav.learning_model_usage, sav.sync_state, sav.ticket_snapshots, content_items, categories, audit_logs, active_knowledge, knowledge_revisions CASCADE');
  vi.stubEnv('SAV_ENCRYPTION_KEY_V1','independent-review-synthetic-key-2026');vi.stubEnv('SAV_GEMINI_API_KEY','synthetic-only-key');vi.stubEnv('SAV_RELEASE_STAGE','v0');vi.stubEnv('HUBSPOT_ACCESS_TOKEN','synthetic-only-token');
@@ -227,7 +227,8 @@ it('F1 binds the source proof and blocks both human review entry points after re
 
 it('F2 resumes after final transaction abort and admits exactly once across concurrent retries',async()=>{
  const i=input(120);
- state.beforeResponse=async()=>{vi.spyOn(f.db,'transaction').mockRejectedValueOnce(new Error('SYNTHETIC_FINAL_ABORT'));};
+ const originalTransaction=f.db.transaction.bind(f.db);
+ state.beforeResponse=async()=>{vi.spyOn(f.db,'transaction').mockImplementationOnce(originalTransaction).mockRejectedValueOnce(new Error('SYNTHETIC_FINAL_ABORT'));};
  await expect(run(i)).rejects.toThrow('SYNTHETIC_FINAL_ABORT');
  const [attempt]=await f.db.select().from(savLearningAdmissionAttempts);
  expect(attempt).toMatchObject({state:'retryable',completedAt:null,comparisonLeaseToken:null,comparisonLeaseUntil:null});
@@ -304,3 +305,18 @@ it.skipIf(!process.env.SAV_TEST_POSTGRES_URL)('native review contention: aborts 
  expect(await f.db.select().from(savLearningCandidates)).toHaveLength(2);
  expect(await f.db.select().from(savLearningAdmissionReservations)).toHaveLength(2);
 },15000);
+
+it('restarts a deferred legacy comparison without CRM or another human action and removes transient ciphertext',async()=>{
+ vi.stubEnv('SAV_COMPARISON_DAILY_CALLS','0');const i=input(801);expect(await run(i)).toMatchObject({disposition:'deferred'});expect(modelFetch).not.toHaveBeenCalled();
+ let [job]=await f.db.select().from(auditLogs).where(eq(auditLogs.action,'sav_derived_comparison_deferred'));expect(job.technicalMetadata.payloadCiphertext).toBeTypeOf('string');expect(JSON.stringify(job)).not.toContain(resolution);
+ vi.stubEnv('SAV_COMPARISON_DAILY_CALLS','20');
+ const results=await reconcileSavDeferredComparisons(1,now,{apiKey:'synthetic-only-key',model:'gemini-3.6-flash',fetch:modelFetch as typeof fetch});expect(results[0]).toMatchObject({disposition:'admitted'});expect(modelFetch).toHaveBeenCalledTimes(1);
+ [job]=await f.db.select().from(auditLogs).where(eq(auditLogs.action,'sav_derived_comparison_deferred'));expect(job.technicalMetadata).toMatchObject({state:'completed'});expect(job.technicalMetadata.payloadCiphertext).toBeUndefined();
+});
+it.each(['source_changed','expired'])('cleans the bounded deferred copy on %s without provider work',async(reason)=>{
+ vi.stubEnv('SAV_COMPARISON_DAILY_CALLS','0');await run(input(802));
+ if(reason==='source_changed')await f.db.update(savTicketSnapshots).set({status:'open'});
+ const later=reason==='expired'?new Date(now.getTime()+36*86400000):now;vi.setSystemTime(later);
+ expect(await reconcileSavDeferredComparisons(1,later,{apiKey:'synthetic-only-key',model:'gemini-3.6-flash',fetch:modelFetch as typeof fetch})).toHaveLength(0);
+ const [job]=await f.db.select().from(auditLogs).where(eq(auditLogs.action,'sav_derived_comparison_deferred'));expect(job.technicalMetadata.state).toBe('completed');expect(job.technicalMetadata.payloadCiphertext).toBeUndefined();expect(modelFetch).not.toHaveBeenCalled();
+});

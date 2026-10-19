@@ -2,9 +2,8 @@ import "server-only";
 import { and, asc, desc, eq, inArray, sql } from "drizzle-orm";
 import { z } from "zod";
 import { requireDb } from "@/db";
-import { auditLogs, savActions, savDecisions, savLearningCandidates, savMessages, savObservationCycles, savPilotItems, savResolutionObservations, savThreads } from "@/db/schema";
+import { auditLogs, savActions, savDecisions, savMessages, savPilotItems, savThreads } from "@/db/schema";
 import { savV0EligibleMessageFilter } from "./cutover";
-import { savDashboardLearningProgress } from "./learning-progress";
 
 export const SAV_EXTERNAL_COMPLETION = "sav_dossier_completed_externally";
 export const SAV_EXTERNAL_COMPLETION_REVERTED = "sav_dossier_external_completion_reverted";
@@ -43,16 +42,11 @@ export async function getSavExternalCompletion(message: { id: string; threadId: 
     const [thread] = await tx.select().from(savThreads).where(eq(savThreads.id, message.threadId)).limit(1);
     const [latest] = await tx.select({ id: savMessages.id }).from(savMessages).where(and(eq(savMessages.threadId, message.threadId), eq(savMessages.direction, "inbound"))).orderBy(desc(savMessages.receivedAt), desc(savMessages.createdAt), desc(savMessages.id)).limit(1);
     if (!thread || latest?.id !== message.id) return null;
-    const [actions, observations] = await Promise.all([
-      tx.select().from(savActions).where(eq(savActions.threadId, message.threadId)),
-      tx.select().from(savResolutionObservations).where(eq(savResolutionObservations.threadId, message.threadId)),
-    ]);
+    const actions = await tx.select().from(savActions).where(eq(savActions.threadId, message.threadId));
     if (hasUnsettledSavHumanAction(actions)) return null;
-    const cycles = observations.length ? await tx.select().from(savObservationCycles).where(inArray(savObservationCycles.observationId, observations.map(row => row.id))) : [];
-    const candidateIds = cycles.flatMap(cycle => cycle.candidateId ? [cycle.candidateId] : []);
-    const candidates = await tx.select().from(savLearningCandidates).where(sql`((${savLearningCandidates.threadId} = ${message.threadId} or ${thread.hubspotTicketId ? eq(savLearningCandidates.hubspotTicketId, thread.hubspotTicketId) : sql`false`}) and ${savLearningCandidates.status} = 'pending') or ${candidateIds.length ? inArray(savLearningCandidates.id, candidateIds) : sql`false`}`);
-    if (thread.hubspotTicketId && candidates.some(candidate => candidate.hubspotTicketId === thread.hubspotTicketId && candidate.status === "pending")) return null;
-    return savDashboardLearningProgress(observations, cycles, candidates.filter(candidate => candidate.threadId === message.threadId)) === "none" ? marker : null;
+    // Administrative handling and asynchronous learning have separate lifecycles.
+    // Keeping this marker never qualifies a resolution or stops its observation.
+    return marker;
   }, { isolationLevel: "repeatable read", accessMode: "read only" });
 }
 
@@ -86,13 +80,7 @@ export async function markSavDossiersHandledExternally(raw: unknown, actorEmail:
     const technicalKinds = new Set(["spam", "automatic_reply", "bounce", "internal_notification", "duplicate"]);
     const decisions = await tx.select({ messageId: savDecisions.messageId, kind: savDecisions.kind }).from(savDecisions).where(and(inArray(savDecisions.messageId, ids), eq(savDecisions.isCurrent, true)));
     const technicalMessages = new Set(decisions.filter(row => technicalKinds.has(row.kind)).map(row => row.messageId));
-    const observations = await tx.select({ threadId: savResolutionObservations.threadId }).from(savResolutionObservations).where(inArray(savResolutionObservations.threadId, threadIds));
-    const ticketIds = threads.flatMap(thread => thread.hubspotTicketId ? [thread.hubspotTicketId] : []);
-    const candidates = await tx.select({ threadId: savLearningCandidates.threadId, hubspotTicketId: savLearningCandidates.hubspotTicketId }).from(savLearningCandidates).where(sql`(${inArray(savLearningCandidates.threadId, threadIds)} or ${ticketIds.length ? inArray(savLearningCandidates.hubspotTicketId, ticketIds) : sql`false`}) and ${savLearningCandidates.status} = 'pending'`);
     const events = await tx.select().from(auditLogs).where(and(eq(auditLogs.entityType, "sav_message"), inArray(auditLogs.entityId, ids), inArray(auditLogs.action, savExternalCompletionEvents)));
-    const blockedLearning = new Set([...observations, ...candidates].map(row => row.threadId));
-    const pendingTickets = new Set(candidates.filter(candidate => candidate.hubspotTicketId).map(candidate => candidate.hubspotTicketId));
-    for (const thread of threads) if (thread.hubspotTicketId && pendingTickets.has(thread.hubspotTicketId)) blockedLearning.add(thread.id);
     const rows: Array<typeof auditLogs.$inferInsert> = [];
     const skipped: Record<string, number> = {};
     let alreadyCompleted = 0;
@@ -103,7 +91,6 @@ export async function markSavDossiersHandledExternally(raw: unknown, actorEmail:
       else if (message.receivedAt.getTime() >= Date.parse(input.receivedBefore)) reason = "after_boundary";
       else if (!eligible.has(message.id) || pilots.has(message.id)) reason = "not_live_eligible";
       else if (technicalMessages.has(message.id)) reason = "technical_exclusion";
-      else if (blockedLearning.has(message.threadId)) reason = "learning_history";
       else if (hasUnsettledSavHumanAction(actions.filter(action => action.threadId === message.threadId))) reason = "unsettled_action";
       if (reason) { skipped[reason] = (skipped[reason] ?? 0) + 1; continue; }
       if (findSavExternalCompletion(message!, events)) { alreadyCompleted++; continue; }

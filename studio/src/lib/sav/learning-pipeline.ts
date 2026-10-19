@@ -1,17 +1,20 @@
 import "server-only";
-import { and, count, eq, inArray, isNotNull, isNull, ne, or } from "drizzle-orm";
+import {savV0EligibleMessageFilter} from "./cutover";
+import {SAV_DERIVED_COST_REVISION,isSavDerivedBudgetDeferred} from "./derived-budget";
+import {readSavCaseLearningQualification} from "./case-qualification";
+import { and, count, eq, inArray, isNotNull, isNull, ne, or, sql } from "drizzle-orm";
 import { requireDb } from "@/db";
-import { contentItems, contentVersions, knowledgeProjectionCandidates, savKnowledgeActivations, savLearningAdmissionAttempts, savLearningAdmissionCases, savLearningCandidates, savObservationCycles, savResolutionObservations } from "@/db/schema";
+import { auditLogs, contentItems, contentVersions, knowledgeProjectionCandidates, savKnowledgeActivations, savLearningAdmissionAttempts, savLearningAdmissionCases, savLearningCandidates, savMessages, savObservationCycles, savObservationEvents, savResolutionObservations, savThreads } from "@/db/schema";
 import { knowledgeComparisonInventory } from "@/lib/knowledge/hubspot-import";
 import { decryptSavPayload, encryptSavPayload, savContentHash } from "./crypto";
 import { redactSavLearningText } from "./learning-extraction";
 import { SAV_LEARNING_POLICY_REVISION, bindSavLearningReservationTx, claimSavLearningComparisonTx, assertSavLearningComparisonClaimTx, releaseSavLearningComparisonTx, finishSavLearningComparisonTx, getSavLearningCutover, isSavLearningCycleEligible, lockSavLearningAdmissionTx, recordSavLearningSignal, reserveSavLearningCapacityTx, reserveSavLearningModelCallTx } from "./learning-admission";
-import { compareSavLearningResolution, SAV_LEARNING_COMPARATOR_PROMPT_REVISION, SAV_LEARNING_COMPARATOR_REVISION, type SavLearningComparisonInput } from "./learning-comparator";
-import { savGeminiApiKey } from "./config";
+import { compareSavLearningResolution, validateSavLearningComparison, SAV_LEARNING_COMPARATOR_PROMPT_REVISION, SAV_LEARNING_COMPARATOR_REVISION, type SavLearningComparisonInput } from "./learning-comparator";
+import { isSavCaseLearningFrozen, savGeminiApiKey, savReleaseStage } from "./config";
 import { isSavCrmLearningSourceCurrent } from "./learning-source";
 
 type Db = ReturnType<typeof requireDb>;
-type LearningPatch = { subject: string; finalHumanResolution: string; sourceSnapshotId: string; sourceSnapshotHash?: string; sourceCycleStartedAt?: string; cycleSourceHash?: string; provenance: "human_resolution"; customerConfirmed: boolean; sourceMessageId: string; conditions: string[]; expectedResult: string; limitations: string[]; groupSignature?: string; comparisonSnapshot?: string };
+type LearningPatch = { subject: string; finalHumanResolution: string; sourceSnapshotId: string; sourceSnapshotHash?: string; sourceCycleStartedAt?: string; cycleSourceHash?: string; provenance: "human_resolution"|"observed_treatment"; customerConfirmed: boolean; sourceMessageId: string; conditions: string[]; expectedResult: string; limitations: string[]; groupSignature?: string; comparisonSnapshot?: string };
 function safeText(value: string, max: number) { return redactSavLearningText(value).replace(/\s+/g, " ").trim().slice(0, max); }
 export function savLearningMaterialText(value: string) { return safeText(value, 4000).normalize("NFKC").toLocaleLowerCase("fr").replace(/[^\p{L}\p{N}]+/gu, " ").trim(); }
 export function savLearningProofHash(input: { sourceRef: string; cycleStartedAt: Date | string; evidenceRef: string; sourceMessageId: string; resolution: string; customerConfirmed: boolean }) {
@@ -50,10 +53,76 @@ async function buildComparisonContext(inventory: Awaited<ReturnType<typeof knowl
 }
 
 export type SavLearningResolutionInput = {
+  humanQualificationRevision?: string;
+  caseContext?: import("./learning-comparator").SavLearningComparisonInput["caseContext"];
   ticketId?: string; threadId?: string; sourceRef?: string; origin?: "hubspot" | "observation"; cycleStartedAt: Date | string; snapshotId: string; snapshotHash: string; subject: string;
   resolution: string; provenance: string; sourceMessageId: string | null; evidenceRef?: string; evidenceExcerpt?: string; evidenceOccurredAt?: string; customerConfirmed: boolean; productVersion?: string | null; cycleSourceHash?: string; observationId?: string; cycleId?: string;
 };
+/** Budget failures happen before dispatch. Keep the encrypted source input so
+ * legacy/manual callers can resume without another human click or CRM replay. */
+async function deferSavLearningComparison(input: SavLearningResolutionInput, errorCode: string, now: Date) {
+  // Automatic dossier input is rebuilt by prepareSavObservationLearning; do
+  // not copy its baseline/chronology into the technical audit journal.
+  if (input.caseContext) return;
+  const transientInput = { ...input, subject: safeText(input.subject,500), resolution: safeText(input.resolution,4000),
+    evidenceExcerpt: input.evidenceExcerpt ? safeText(input.evidenceExcerpt,500) : undefined };
+  const entityId = savContentHash(transientInput);
+  await requireDb().transaction(async tx => {
+    await lockSavLearningAdmissionTx(tx);
+    const [previous] = await tx.select().from(auditLogs).where(and(eq(auditLogs.action, "sav_derived_comparison_deferred"), eq(auditLogs.entityId, entityId))).limit(1);
+    const technicalMetadata = { state: "pending", errorCode, payloadCiphertext: encryptSavPayload(transientInput),
+      inputHash: entityId, nextAttemptAt: now.toISOString(),
+      expiresAt: typeof previous?.technicalMetadata.expiresAt === "string" ? previous.technicalMetadata.expiresAt : new Date(now.getTime()+35*86400000).toISOString() };
+    if (previous) await tx.update(auditLogs).set({ technicalMetadata }).where(eq(auditLogs.id, previous.id));
+    else await tx.insert(auditLogs).values({ actorEmail: "system", action: "sav_derived_comparison_deferred", entityType: "sav_derived_budget", entityId, technicalMetadata, createdAt: now });
+  });
+}
+export async function reconcileSavDeferredComparisons(limit = 1, now = new Date(), options: { deadlineMs?: number; apiKey?: string; model?: string; fetch?: typeof fetch } = {}) {
+  if (isSavCaseLearningFrozen() || savReleaseStage()!=="v0" || process.env.SAV_AI_ANALYSIS==="false") return [];
+  const db = requireDb();
+  const jobs = await db.select().from(auditLogs).where(and(eq(auditLogs.action, "sav_derived_comparison_deferred"), sql`${auditLogs.technicalMetadata}->>'state' = 'pending'`,sql`(${auditLogs.technicalMetadata}->>'nextAttemptAt')::timestamptz <= ${now.toISOString()}::timestamptz`)).orderBy(auditLogs.createdAt).limit(Math.max(0, Math.min(1, limit)));
+  const results = [];
+  for (const job of jobs) {
+    if (options.deadlineMs && Date.now() + 19000 > options.deadlineMs) break;
+    const clear = async (errorCode: string) => db.update(auditLogs).set({technicalMetadata:{state:"completed",errorCode,inputHash:job.entityId}}).where(eq(auditLogs.id,job.id));
+    if (!Number.isFinite(Date.parse(String(job.technicalMetadata.expiresAt))) || Date.parse(String(job.technicalMetadata.expiresAt))<=now.getTime()) {await clear("deferred_source_expired");continue;}
+    let input: SavLearningResolutionInput;
+    try {input=decryptSavPayload<SavLearningResolutionInput>(String(job.technicalMetadata.payloadCiphertext));}
+    catch {await clear("deferred_source_unreadable");continue;}
+    if (input.observationId && input.cycleId) {
+      const [observation] = await db.select().from(savResolutionObservations).where(eq(savResolutionObservations.id, input.observationId));
+      const [cycle] = await db.select().from(savObservationCycles).where(eq(savObservationCycles.id, input.cycleId));
+      const qualification = observation ? await readSavCaseLearningQualification(observation.threadId) : null;
+      const [thread] = observation ? await db.select().from(savThreads).where(eq(savThreads.id, observation.threadId)) : [];
+      const [message] = observation ? await db.select({ id: savMessages.id }).from(savMessages).where(and(eq(savMessages.id, observation.messageId),savV0EligibleMessageFilter())) : [];
+      if (!observation?.closed || !cycle || cycle.qualification!=="resolved" || input.humanQualificationRevision && decryptSavPayload<{humanQualificationRevision?:string}>(cycle.summaryCiphertext).humanQualificationRevision!==input.humanQualificationRevision || cycle.cycle !== observation.cycle || cycle.sourceHash !== input.cycleSourceHash || !qualification?.allowed || input.caseContext?.currentQualificationHash && qualification.fingerprint !== input.caseContext.currentQualificationHash || !message) {
+        await clear("source_changed");
+        continue;
+      }
+      if (thread?.aiPaused || observation.sourceErrors.length || observation.leaseUntil && observation.leaseUntil > now) {
+        await db.update(auditLogs).set({technicalMetadata:{...job.technicalMetadata,nextAttemptAt:new Date(now.getTime()+15*60000).toISOString()}}).where(eq(auditLogs.id,job.id));continue;
+      }
+    } else if (input.ticketId && !await isSavCrmLearningSourceCurrent({ticketId:input.ticketId,snapshotId:input.snapshotId,snapshotHash:input.snapshotHash,cycleStartedAt:input.cycleStartedAt},db)) {
+      await clear("source_changed");continue;
+    }
+    const result = await processSavLearningResolution(input, { ...options, now });
+    results.push(result);
+    if (result.disposition === "deferred" || result.disposition === "frozen" || result.disposition === "duplicate" && result.reasonCode === "comparison_started") continue;
+    await db.transaction(async tx => {
+      await tx.update(auditLogs).set({ technicalMetadata: { state: "completed", inputHash: job.entityId, completedAt: now.toISOString() } }).where(eq(auditLogs.id, job.id));
+      if (!input.observationId || !input.cycleId) return;
+      const [observation] = await tx.select().from(savResolutionObservations).where(eq(savResolutionObservations.id, input.observationId)).for("update");
+      const [cycle] = await tx.select().from(savObservationCycles).where(eq(savObservationCycles.id, input.cycleId));
+      if (!observation?.closed || observation.cycle !== cycle?.cycle || cycle.sourceHash !== input.cycleSourceHash || input.humanQualificationRevision && decryptSavPayload<{humanQualificationRevision?:string}>(cycle.summaryCiphertext).humanQualificationRevision!==input.humanQualificationRevision) return;
+      const candidateId = "candidateId" in result ? result.candidateId ?? null : null;
+      await tx.update(savObservationCycles).set({ candidateId, learningDisposition: "reasonCode" in result ? result.reasonCode : result.disposition }).where(eq(savObservationCycles.id, cycle.id));
+      await tx.update(savResolutionObservations).set({ state: candidateId ? "candidate_ready" : "observed_without_candidate" }).where(eq(savResolutionObservations.id, observation.id));
+    });
+  }
+  return results;
+}
 export async function processSavLearningResolution(input: SavLearningResolutionInput, options: { now?: Date; apiKey?: string; model?: string; fetch?: typeof fetch } = {}) {
+  if(isSavCaseLearningFrozen())return {disposition:"frozen" as const};
   const now = options.now ?? new Date(), origin = input.origin ?? "hubspot", sourceRef = input.sourceRef ?? ("hubspot:" + input.ticketId);
   const signal = async (reasonCode: string, sourceHash = input.snapshotHash) => {
     await recordSavLearningSignal({ sourceRef, sourceHash, origin, reasonCode, details: { policyRevision: SAV_LEARNING_POLICY_REVISION } }, now);
@@ -62,29 +131,66 @@ export async function processSavLearningResolution(input: SavLearningResolutionI
   const cutover = await getSavLearningCutover();
   if (!isSavLearningCycleEligible(input.cycleStartedAt, cutover)) return signal(cutover ? "cycle_before_learning_cutover" : "cutover_not_active");
   if (input.evidenceOccurredAt && !isSavLearningCycleEligible(input.evidenceOccurredAt, cutover)) return signal("evidence_before_learning_cutover");
-  if (input.provenance !== "human_resolution" || !input.sourceMessageId || input.resolution.trim().length < 20) return signal("human_resolution_proof_required");
+  if (!["human_resolution", "observed_treatment"].includes(input.provenance) || !input.sourceMessageId || input.resolution.trim().length < 20) return signal("human_resolution_proof_required");
   const resolution = safeText(input.resolution, 4000), subject = safeText(input.subject, 500), evidenceRef = input.evidenceRef ?? ("hubspot-message:" + input.sourceMessageId);
-  const sourceHash = savLearningProofHash({ sourceRef, cycleStartedAt: input.cycleStartedAt, evidenceRef, sourceMessageId: input.sourceMessageId, resolution, customerConfirmed: input.customerConfirmed });
+  const proofHash = savLearningProofHash({ sourceRef, cycleStartedAt: input.cycleStartedAt, evidenceRef, sourceMessageId: input.sourceMessageId, resolution, customerConfirmed: input.customerConfirmed });
+  const sourceHash=input.cycleSourceHash?savContentHash({proofHash,cycleSourceHash:input.cycleSourceHash,...(input.humanQualificationRevision?{humanQualificationRevision:input.humanQualificationRevision}:{})}):proofHash;
   let context: Awaited<ReturnType<typeof comparisonContext>>;
   try { context = await comparisonContext(); } catch { return signal("comparison_context_incomplete", sourceHash); }
   if (context.priorRejections.some(prior => savLearningMaterialText(prior.resolution) === savLearningMaterialText(resolution))) return signal("rejected_unchanged_proof", sourceHash);
   const comparisonInput: SavLearningComparisonInput = { sourceRef, subject, resolution, evidenceRef, evidenceExcerpt: input.evidenceExcerpt ?? resolution.slice(0, 240), productVersion: input.productVersion ?? null,
-    customerConfirmed: input.customerConfirmed, knowledge: context.knowledge, openCandidates: context.openCandidates, priorRejections: context.priorRejections };
+    caseContext: input.caseContext, customerConfirmed: input.customerConfirmed, knowledge: context.knowledge, openCandidates: context.openCandidates, priorRejections: context.priorRejections };
   const inputHash = savContentHash({ sourceHash, snapshot: context.snapshot });
+  let savedComparison: Awaited<ReturnType<typeof compareSavLearningResolution>> | null = null;
+  if (input.observationId && input.cycleId) {
+    const [saved] = await requireDb().select().from(savObservationEvents).where(and(eq(savObservationEvents.observationId,input.observationId),eq(savObservationEvents.sourceRef,`comparison:${input.cycleId}:${input.cycleSourceHash}`))).limit(1);
+    if (saved) {
+      const previous = decryptSavPayload<Awaited<ReturnType<typeof compareSavLearningResolution>> & {knowledgeHash?:string}>(saved.payloadCiphertext);
+      if (previous.knowledgeHash !== savContentHash(context.knowledge)) return signal("deferred_knowledge_changed",sourceHash);
+      try { validateSavLearningComparison(previous.decision,comparisonInput); savedComparison = previous; }
+      catch { return signal("deferred_comparison_requires_review",sourceHash); }
+    }
+  }
+  const model = options.model ?? process.env.SAV_AI_MODEL ?? "gemini-3.6-flash";
   const claim = await requireDb().transaction(async tx => {
-    const claimed = await claimSavLearningComparisonTx(tx, { sourceRef, sourceHash, origin, inputHash, now });
+    if(input.humanQualificationRevision && input.observationId && input.cycleId){
+      if(input.threadId)await tx.select({id:savThreads.id}).from(savThreads).where(eq(savThreads.id,input.threadId)).for("update");
+      const [observation]=await tx.select().from(savResolutionObservations).where(eq(savResolutionObservations.id,input.observationId)).for("update");
+      const [cycle]=await tx.select().from(savObservationCycles).where(eq(savObservationCycles.id,input.cycleId));
+      if(!observation?.closed || observation.sourceErrors.length || cycle?.qualification!=="resolved" || cycle.sourceHash!==input.cycleSourceHash || decryptSavPayload<{humanQualificationRevision?:string}>(cycle.summaryCiphertext).humanQualificationRevision!==input.humanQualificationRevision)return {stale:true as const};
+    }
+    const claimed = await claimSavLearningComparisonTx(tx, { sourceRef, sourceHash, origin, inputHash, now, resumeDeferred:Boolean(savedComparison) });
     if (!claimed.claimed) return { duplicate: true as const };
-    await reserveSavLearningModelCallTx(tx, now);
-    return { duplicate: false as const, signalId: claimed.signalId, leaseToken: claimed.leaseToken };
+    if (savedComparison) return {duplicate:false as const,signalId:claimed.signalId,leaseToken:claimed.leaseToken};
+    // A provider outcome lost to an interruption is uncertain, never permission
+    // to spend another call for the same cycle/evidence revision.
+    const proofKey = savContentHash({ sourceRef, sourceHash });
+    const [dispatched] = await tx.select({id:auditLogs.id}).from(auditLogs).where(and(eq(auditLogs.action,"sav_derived_call_reserved"),sql`${auditLogs.technicalMetadata}->>'proofKey' = ${proofKey}`,sql`((${auditLogs.technicalMetadata}->>'dispatchedAt') is not null or (${auditLogs.technicalMetadata}->>'budgetRevision') is distinct from ${SAV_DERIVED_COST_REVISION})`)).limit(1);
+    if (input.caseContext && dispatched) {
+      await finishSavLearningComparisonTx(tx, claimed.signalId, {state:"signal",reasonCode:"comparison_interrupted"}, now, claimed.leaseToken);
+      return {duplicate:true as const};
+    }
+    const reservation = await reserveSavLearningModelCallTx(tx, now, input.caseContext ? proofKey : undefined, model);
+    return { duplicate: false as const, signalId: claimed.signalId, leaseToken: claimed.leaseToken, reservationId: reservation.reservationId };
+  }).catch(error => {
+    if (isSavDerivedBudgetDeferred(error)) return { deferred: true as const, errorCode: (error as Error).message };
+    throw error;
   });
+  if ("stale" in claim) return signal("source_changed",sourceHash);
+  if ("deferred" in claim) { await deferSavLearningComparison(input, claim.errorCode, now); return { disposition: "deferred" as const, reasonCode: claim.errorCode === "SAV_DERIVED_DAILY_BUDGET_EXHAUSTED" ? "daily_budget" : "monetary_budget", errorCode: claim.errorCode }; }
   if (claim.duplicate) {
     const [prior] = await requireDb().select().from(savLearningAdmissionAttempts).where(and(eq(savLearningAdmissionAttempts.sourceRef, sourceRef), eq(savLearningAdmissionAttempts.sourceHash, sourceHash))).limit(1);
     return { disposition: "duplicate" as const, candidateId: prior?.candidateId ?? null, reasonCode: prior?.reasonCode ?? "duplicate_source" };
   }
   try {
   let comparison: Awaited<ReturnType<typeof compareSavLearningResolution>>;
-  try { comparison = await compareSavLearningResolution(comparisonInput, { apiKey: options.apiKey ?? savGeminiApiKey(), model: options.model ?? process.env.SAV_AI_MODEL ?? "gemini-3.6-flash", fetch: options.fetch }); }
+  try { comparison = savedComparison ?? await compareSavLearningResolution(comparisonInput, { apiKey: options.apiKey ?? savGeminiApiKey(), model, derivedReservationId: "reservationId" in claim ? claim.reservationId : undefined, fetch: options.fetch }); }
   catch (error) {
+    if(isSavDerivedBudgetDeferred(error)) {
+      await requireDb().transaction(tx=>releaseSavLearningComparisonTx(tx,claim.signalId,claim.leaseToken));
+      await deferSavLearningComparison(input,(error as Error).message,now);
+      return {disposition:"deferred" as const,reasonCode:"monetary_budget",errorCode:(error as Error).message};
+    }
     const errorCode = error instanceof Error && /^[A-Z0-9_:]+$/.test(error.message) ? error.message : "SAV_LEARNING_COMPARATOR_FAILED";
     await requireDb().transaction(tx => finishSavLearningComparisonTx(tx, claim.signalId, { reasonCode: "comparison_error", state: "signal", errorCode,
       comparatorRevision: SAV_LEARNING_COMPARATOR_REVISION, promptRevision: SAV_LEARNING_COMPARATOR_PROMPT_REVISION, inputHash }, now, claim.leaseToken));
@@ -93,13 +199,18 @@ export async function processSavLearningResolution(input: SavLearningResolutionI
   const decision = comparison.decision;
   return await requireDb().transaction(async tx => {
     // Match source-writer order, then take the shared admission lock and fenced claim.
-    let sourceCurrent = origin !== "hubspot" || Boolean(input.ticketId && await isSavCrmLearningSourceCurrent({ ticketId: input.ticketId,
+    let sourceCurrent = !isSavCaseLearningFrozen();
+    sourceCurrent &&= origin !== "hubspot" || Boolean(input.ticketId && await isSavCrmLearningSourceCurrent({ ticketId: input.ticketId,
       snapshotId: input.snapshotId, snapshotHash: input.snapshotHash, cycleStartedAt: input.cycleStartedAt }, tx, true));
     if (input.observationId && input.cycleId) {
+      if(input.threadId)await tx.select({id:savThreads.id}).from(savThreads).where(eq(savThreads.id,input.threadId)).for("update");
       const [observation] = await tx.select().from(savResolutionObservations).where(eq(savResolutionObservations.id, input.observationId)).for("update");
       const [cycle] = await tx.select().from(savObservationCycles).where(eq(savObservationCycles.id, input.cycleId));
+      const qualification=observation?await readSavCaseLearningQualification(observation.threadId,tx):null;
+      if(input.humanQualificationRevision)sourceCurrent &&= Boolean(cycle && decryptSavPayload<{humanQualificationRevision?:string}>(cycle.summaryCiphertext).humanQualificationRevision===input.humanQualificationRevision);
+      sourceCurrent &&= Boolean(qualification?.allowed && (!input.caseContext?.currentQualificationHash || qualification.fingerprint===input.caseContext.currentQualificationHash));
       sourceCurrent &&= Boolean(observation?.closed && !observation.sourceErrors.length && cycle?.observationId === observation.id
-        && cycle.cycle === observation.cycle && cycle.sourceHash === input.cycleSourceHash && cycle.qualification === "resolved");
+        && cycle.cycle === observation.cycle && cycle.sourceHash === input.cycleSourceHash && ["resolved","evidence_observed"].includes(cycle.qualification??""));
     }
     await lockSavLearningAdmissionTx(tx);
     await assertSavLearningComparisonClaimTx(tx, claim.signalId, claim.leaseToken);
@@ -117,6 +228,7 @@ export async function processSavLearningResolution(input: SavLearningResolutionI
     if (versionIds.length) await tx.select({ id: contentVersions.id }).from(contentVersions).where(inArray(contentVersions.id, versionIds)).orderBy(contentVersions.id).for("share", { noWait: true });
     if (projectionIds.length) await tx.select({ id: knowledgeProjectionCandidates.id }).from(knowledgeProjectionCandidates).where(inArray(knowledgeProjectionCandidates.id, projectionIds)).orderBy(knowledgeProjectionCandidates.id).for("share", { noWait: true });
     if (learningIds.length) await tx.select({ id: savLearningCandidates.id }).from(savLearningCandidates).where(inArray(savLearningCandidates.id, learningIds)).orderBy(savLearningCandidates.id).for("share", { noWait: true });
+    if(input.cycleId && input.observationId && input.caseContext) await tx.insert(savObservationEvents).values({observationId:input.observationId,sourceRef:`comparison:${input.cycleId}:${input.cycleSourceHash}`,contentHash:savContentHash(decision),kind:"case_comparison",occurredAt:now,payloadCiphertext:encryptSavPayload({inputHash:comparison.inputHash,knowledgeHash:savContentHash(context.knowledge),revision:comparison.revision,promptRevision:comparison.promptRevision,model:comparison.model,inputTokens:comparison.inputTokens,outputTokens:comparison.outputTokens,durationMs:comparison.durationMs,sourceHash:input.cycleSourceHash,decision})}).onConflictDoNothing();
     const finish = (reasonCode: string, candidateId: string | null = null, groupKey: string | null = null) => finishSavLearningComparisonTx(tx, claim.signalId, {
       reasonCode, candidateId, groupKey, state: candidateId ? "open" : "signal", comparatorRevision: comparison.revision, promptRevision: comparison.promptRevision,
       modelName: comparison.model, inputHash: comparison.inputHash, inputTokens: comparison.inputTokens, outputTokens: comparison.outputTokens, durationMs: comparison.durationMs,
@@ -127,6 +239,7 @@ export async function processSavLearningResolution(input: SavLearningResolutionI
     if (currentSnapshot !== context.snapshot) {
       await finish("comparison_context_changed"); return { disposition: "signal" as const, reasonCode: "comparison_context_changed" };
     }
+    if(input.caseContext && decision.suggestionKind!=="knowledge") {await finish("specialist_review_required");return {disposition:"signal" as const,reasonCode:"specialist_review_required"};}
     const matchedCandidate = context.openCandidates.find(candidate => candidate.ref === decision.matchedRef);
     if (["not_reusable", "insufficient_evidence", "conflict"].includes(decision.outcome) || decision.outcome === "already_covered" && !matchedCandidate) {
       await finish(decision.outcome); return { disposition: "signal" as const, reasonCode: decision.outcome };
@@ -155,7 +268,7 @@ export async function processSavLearningResolution(input: SavLearningResolutionI
     if (!capacity.ok) { await finish(capacity.reasonCode); return { disposition: "signal" as const, reasonCode: capacity.reasonCode }; }
     const patch: LearningPatch = { subject: safeText(decision.subject, 500), finalHumanResolution: safeText(decision.resolution, 4000), sourceSnapshotId: input.snapshotId,
       sourceSnapshotHash: input.snapshotHash, sourceCycleStartedAt: new Date(input.cycleStartedAt).toISOString(),
-      cycleSourceHash: input.cycleSourceHash, provenance: "human_resolution", customerConfirmed: input.customerConfirmed, sourceMessageId: input.sourceMessageId!,
+      cycleSourceHash: input.cycleSourceHash, provenance: input.provenance==="observed_treatment"?"observed_treatment":"human_resolution", customerConfirmed: input.customerConfirmed, sourceMessageId: input.sourceMessageId!,
       conditions: decision.conditions.map(value => safeText(value, 500)), expectedResult: safeText(decision.expectedResult, 500), limitations: decision.limitations.map(value => safeText(value, 500)),
       groupSignature: decision.groupSignature ?? undefined, comparisonSnapshot: context.snapshot };
     const [candidate] = await tx.insert(savLearningCandidates).values({ threadId: input.threadId ?? null, hubspotTicketId: input.ticketId ?? null, sourceRef,

@@ -5,6 +5,7 @@ vi.mock("@/lib/sav/hubspot",()=>({getHubspotBackfillState:async()=>null,HUBSPOT_
 vi.mock("@/lib/sav/learning",()=>({listLearningCandidates:async()=>[{id:"fixture",status:"pending",syncInProgress:true,proposedSubject:"Résolution fictive",proposedResolution:"Procédure fictive",explanation:"Preuves en cours de lecture",createdAt:new Date(),hubspotTicketId:"123",evidenceCaseCount:2,evidenceTicketIds:["123","456"]}]}));
 vi.mock("@/lib/sav/learning-admission",()=>({savLearningAdmissionMetrics:async()=>({cutover:null,dailyModelCalls:0,dailyModelLimit:null,openAutomaticProposals:0,openLimit:10,weeklyLimit:5,signals:[],recentSignals:[]})}));
 vi.mock("../actions",()=>({continueBackfillAction:()=>{},reviewLearningAction:()=>{}}));
+vi.mock("@/lib/sav/learning-metrics",()=>({savCaseLearningMetrics:async()=>({total:0,late:0,incomplete:0,stages:[],translations:[],budgets:{comparison:20,translation:50,total:60},cohorts:[],sampledComparisons:0,comparisonCount:0,truncated:false})}));
 import Page from "./page";
 describe("Resolution approval during refresh",()=>{
  it("disables approval and displays a synchronization notice",async()=>{
@@ -17,7 +18,7 @@ describe("Resolution approval during refresh",()=>{
  it("keeps the historical intake closed and exposes the bounded learning policy",async()=>{
   const html=renderToStaticMarkup(await Page({searchParams:Promise.resolve({})}));
   expect(html).toContain("Activation explicite requise");expect(html).toContain("Aucun ticket historique ne sera retraité");
-  expect(html).toContain("sans plafond journalier et avec déduplication");expect(html).toContain("5 nouvelles propositions / 7 jours glissants");expect(html).not.toContain("Analyser 25 maintenant");
+  expect(html).toContain("plafond non disponible et déduplication");expect(html).toContain("5 nouvelles propositions / 7 jours glissants");expect(html).not.toContain("Analyser 25 maintenant");
  });
 });
 

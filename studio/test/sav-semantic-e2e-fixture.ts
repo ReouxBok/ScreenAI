@@ -23,8 +23,10 @@ export function savSemanticE2eProposal() {
   });
 }
 
-export function savRegistrationE2eProposal() {
+export function savRegistrationE2eProposal(language:"fr"|"en"="fr") {
   const p = savSemanticE2eProposal();
+  p.understanding!.language=language;
+  if(language==="en"){p.understanding!.requests[0].summary="My PDF export fails.";p.understanding!.knownFacts=[];p.understanding!.attemptedSteps=[];p.understanding!.evidence[0].excerpt="Hello, my PDF export fails with ERR_42. Please help.";}
   const reply = buildSavRegistrationClarification(p.understanding!, "not_found", { email: null, ambiguous: false });
   return savStructuredProposalSchema.parse({ ...p,
     decision: { ...p.decision, reasonCode: "registration_email_required", explanation: "Identifier le compte par son email d’inscription avant toute proposition d’action sur celui-ci." },

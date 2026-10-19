@@ -1,4 +1,5 @@
 import "server-only";
+import { isSavCaseLearningFrozen } from "./config";
 
 import { and, desc, eq, sql } from "drizzle-orm";
 import { requireDb } from "@/db";
@@ -111,6 +112,7 @@ export async function listLearningCandidates(limit = 100) {
 
 export async function approveLearningCandidate(candidateId: string, actorEmail: string) {
   assertKnowledgeUgoApproval(actorEmail);
+  if(isSavCaseLearningFrozen())throw new Error("SAV_CASE_LEARNING_FROZEN");
   const result = await requireDb().transaction(async (tx) => {
   const db = tx;
   const [source] = await db.select().from(savLearningCandidates).where(eq(savLearningCandidates.id,candidateId));
@@ -131,7 +133,7 @@ export async function approveLearningCandidate(candidateId: string, actorEmail: 
     const [cycle]=await db.select().from(savObservationCycles).where(eq(savObservationCycles.id,candidate.sourceRef.slice("sav-observation:".length)));
     const [observation]=cycle?await db.select().from(savResolutionObservations).where(eq(savResolutionObservations.id,cycle.observationId)).for("update"):[];
     if (observation?.leaseUntil && observation.leaseUntil > new Date()) throw new Error("SAV_OBSERVATION_SYNC_IN_PROGRESS");
-    if(!cycle || !observation?.closed || cycle.cycle!==observation.cycle || cycle.candidateId!==candidate.id || cycle.qualification!=="resolved" || observation.sourceErrors.length || patch.cycleSourceHash!==cycle.sourceHash)throw new Error("SAV_OBSERVATION_STALE");
+    if(!cycle || !observation?.closed || cycle.cycle!==observation.cycle || cycle.candidateId!==candidate.id || !["resolved","evidence_observed"].includes(cycle.qualification??"") || observation.sourceErrors.length || patch.cycleSourceHash!==cycle.sourceHash)throw new Error("SAV_OBSERVATION_STALE");
   }
   if (candidate.status === "approved" && candidate.contentItemId) {
     const [evidence] = await db.select().from(savResolutionEvidence).where(and(eq(savResolutionEvidence.itemId, candidate.contentItemId), eq(savResolutionEvidence.sourceRef, candidate.sourceRef), eq(savResolutionEvidence.outcome, "human_resolution"))).orderBy(desc(savResolutionEvidence.createdAt)).limit(1);

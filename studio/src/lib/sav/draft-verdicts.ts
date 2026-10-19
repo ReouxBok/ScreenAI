@@ -1,14 +1,16 @@
+import { ensureSavCaseObservationTx } from "./case-learning";
 import "server-only";
 import { and, desc, eq, max, sql } from "drizzle-orm";
 import { z } from "zod";
 import { requireDb } from "@/db";
-import { activeKnowledge, auditLogs, savActions, savAgentRuns, savDecisions, savDraftVerdicts, savMessages, savProposalReviews, savReplyDrafts, savResolutionObservations, savThreads } from "@/db/schema";
+import { activeKnowledge, auditLogs, savActions, savAgentRuns, savDecisions, savDraftVerdicts, savMessages, savProposalReviews, savReplyDrafts, savThreads } from "@/db/schema";
 import { assertSavActor } from "./access";
 import { isSavMessageEligible } from "./cutover";
 import { decryptSavPayload, encryptSavPayload, savContentHash } from "./crypto";
 import { savStructuredProposalSchema, mergeSavReviewedProposal } from "./proposal";
 import { savReviewMatchesProposal, savDossierSourceHash, savDraftSourceHash, savDraftNotApplicable, savReplyForbidden, savReviewReasonsSchema, savStoredReviewReasons } from "./review-contract";
 import { savReleaseStage } from "./config";
+import { normalizeSavConfirmationText, SAV_REPLY_CONFIRMATION_TEXT_REVISION } from "./reply-confirmation-text";
 type Reader = Pick<ReturnType<typeof requireDb>, "select">;
 /** Called under the thread lock for mutations; exact IDs prevent stale forms,
  * content hashes allow only unchanged verdicts to survive a new generation. */
@@ -86,22 +88,22 @@ export async function reviewSavDraft(raw: unknown, actorEmail: string) {
         }
         const [result] = await tx.insert(savDraftVerdicts).values({ threadId: thread.id, messageId: c.message.id, decisionId: c.decision.id, agentRunId: c.run.id, draftId, sourceHash: currentHash, status: input.status,
             snapshotCiphertext: encryptSavPayload({ proposal: c.proposal, body: replyText, origin:manual ? "human" : "ai", dossierReviewId: c.review?.id ?? null, dossierHash: savDossierSourceHash(c.proposal) }), reasonCiphertext: encryptSavPayload({ text: input.reason, reasons: input.reasons }), reviewedBy: actorEmail }).returning();
-        if (input.status === "rejected")
-            await tx.insert(savResolutionObservations).values({ threadId: thread.id, messageId: c.message.id, verdictId: result.id, hubspotTicketId: thread.hubspotTicketId, state: thread.hubspotTicketId ? "active" : "waiting_ticket" }).onConflictDoNothing();
+        if (input.status === "rejected") await ensureSavCaseObservationTx(tx,c.message.id,"draft_feedback");
         await tx.insert(auditLogs).values({ actorEmail, action: "sav_draft_verdict_recorded", entityType: "sav_draft_verdict", entityId: result.id, technicalMetadata: { status: result.status, reasons: input.reasons.join(","), sourceHash: currentHash, messageId: c.message.id, decisionId: c.decision.id, agentRunId: c.run.id } });
         return result;
     });
 }
 export async function assertSavAcceptedDraft(draft: typeof savReplyDrafts.$inferSelect, db: Reader = requireDb()) {
-    const body=decryptSavPayload<{text:string;origin?:string}>(draft.bodyCiphertext);
+    const body=decryptSavPayload<{text:string;origin?:string;confirmationTextRevision?:string}>(draft.bodyCiphertext);
     const manual=body.origin==="human";
     const c = manual ? await loadSavDossierReviewContext(draft.messageId,db) : await loadSavDraftContext(draft.messageId, db);
     const sourceHash=manual ? savDraftSourceHash({...c.proposal,replyDraft:body.text},c.message,c.knowledgeRevision) : c.sourceHash;
     const [verdict] = await db.select().from(savDraftVerdicts).where(and(eq(savDraftVerdicts.messageId, draft.messageId), eq(savDraftVerdicts.isCurrent, true))).limit(1);
-    if (!draft.sourceHash || draft.status!=="validated" || verdict?.status !== "accepted" || verdict.draftId !== draft.id || verdict.sourceHash !== sourceHash || draft.sourceHash !== sourceHash || savReplyForbidden(c.proposal) || (!manual && savDraftNotApplicable(c.proposal))
+    const expectedText = manual ? body.text : draft.status === "send_confirmed" && body.confirmationTextRevision === SAV_REPLY_CONFIRMATION_TEXT_REVISION ? normalizeSavConfirmationText(c.proposal.replyDraft??"") : c.proposal.replyDraft??"";
+    if (!draft.sourceHash || (draft.status!=="send_confirmed" && (draft.status!=="validated" || verdict?.status !== "accepted" || verdict.draftId !== draft.id || verdict.sourceHash !== sourceHash)) || draft.sourceHash !== sourceHash || savReplyForbidden(c.proposal) || (!manual && savDraftNotApplicable(c.proposal))
         || savContentHash(decryptSavPayload<{
             text: string;
-        }>(draft.bodyCiphertext).text) !== savContentHash((manual ? body.text : c.proposal.replyDraft!).trim()))
+        }>(draft.bodyCiphertext).text) !== savContentHash(expectedText.trim()))
         throw new Error("SAV_DRAFT_ACCEPTANCE_REQUIRED");
     return c;
 }

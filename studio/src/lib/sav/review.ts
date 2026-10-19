@@ -1,8 +1,9 @@
+import { captureSavAnalysisSnapshot, ensureSavCaseObservationTx } from "./case-learning";
 import "server-only";
 import { and, desc, eq, max, sql } from "drizzle-orm";
 import { z } from "zod";
 import { requireDb } from "@/db";
-import { activeKnowledge, auditLogs, savActions, savAgentRuns, savDecisions, savLearningCandidates, savMessages, savDraftVerdicts, savProposalReviews, savReplyDrafts, savThreads } from "@/db/schema";
+import { activeKnowledge, auditLogs, savActions, savAgentRuns, savDecisions, savLearningCandidates, savMessages, savDraftVerdicts, savProposalReviews, savReplyDrafts, savResolutionObservations, savThreads } from "@/db/schema";
 import { assertSavActor } from "./access";
 import { isSavMessageEligible } from "./cutover";
 import { decryptSavPayload, encryptSavPayload, savContentHash } from "./crypto";
@@ -57,6 +58,7 @@ export async function getSavProposalReview(messageId: string) {
   const draftHash=savDraftSourceHash(draftBody?.origin === "human" ? {...proposal,replyDraft:draftBody.text} : proposal,message,knowledge?.revisionId);
   return { decisionId: decision.id, agentRunId: run.id, model: run.model, promptRevision: run.promptRevision, before, proposal,
     expectedReviewId: (review?.id ?? null) as string | null, draftHash,
+    ...({confirmationSourceHash:savDraftSourceHash(proposal,message,knowledge?.revisionId)} as {confirmationSourceHash?:string}),
     draftVerdict: draftVerdict ? { id:draftVerdict.id, status:draftVerdict.status, draftId:draftVerdict.draftId, stale:draftVerdict.sourceHash!==draftHash,reason:decryptSavPayload<{text:string}>(draftVerdict.reasonCiphertext).text,reasons:savStoredReviewReasons(decryptSavPayload<{reasons?:unknown}>(draftVerdict.reasonCiphertext).reasons),reviewedBy:draftVerdict.reviewedBy } : null,
     historicalReview: review && !matches ? {id:review.id,status:review.status,scope:review.reviewScope} : null,
     review: matches ? { id:review.id,scope:review.reviewScope,status:review.status,verdict:review.verdict,dimensions:review.dimensions,reviewedBy:review.reviewedBy,reviewedAt:review.reviewedAt,comment:decryptSavPayload<{text:string}>(review.commentCiphertext).text,reasons:savStoredReviewReasons(decryptSavPayload<{reasons?:unknown}>(review.commentCiphertext).reasons),reusability:review.reusability } : null };
@@ -102,6 +104,7 @@ export async function reviewSavProposal(raw: unknown, actorEmail: string) {
     if (latest?.id !== message.id || !decision || decision.agentRunId !== run?.id || !run?.proposalCiphertext) throw new Error("SAV_PROPOSAL_STALE");
     const [current] = await tx.select().from(savProposalReviews).where(and(eq(savProposalReviews.messageId, message.id), eq(savProposalReviews.isCurrent, true))).limit(1);
     if ((current?.id ?? null) !== input.expectedReviewId) throw new Error("SAV_REVIEW_STALE");
+    await captureSavAnalysisSnapshot(tx,run.id);
     const before = savStructuredProposalSchema.parse(decryptSavPayload(run.proposalCiphertext));
     // A dossier review authorizes ticket intake independently of AI reply freshness.
     // Historical global reviews still cover the draft and retain that guard.
@@ -153,6 +156,10 @@ export async function reviewSavProposal(raw: unknown, actorEmail: string) {
     }
     await tx.insert(auditLogs).values({ actorEmail, action: "sav_proposal_reviewed", entityType: "sav_proposal_review", entityId: review.id,
       technicalMetadata: { messageId: message.id, decisionId: decision.id, agentRunId: run.id, verdict: review.verdict, status: review.status, reusability: input.reusability, reasons: input.reasons.join(","), beforeHash: savContentHash(before), afterHash: savContentHash(after) } });
+    if (review.status === "approved") await ensureSavCaseObservationTx(tx,message.id,"dossier_validated");
+    // Both accepted and rejected dossier revisions invalidate already collected
+    // evidence immediately. A later sync versions the summary and candidates.
+    await tx.update(savResolutionObservations).set({sourceErrors:["dossier_review_awaiting_sync"],nextSyncAt:new Date(),closedCatchupUntil:null}).where(eq(savResolutionObservations.threadId,message.threadId));
     return { id: review.id };
   });
 }

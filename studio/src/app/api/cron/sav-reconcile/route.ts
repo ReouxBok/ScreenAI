@@ -1,3 +1,4 @@
+import { reconcileSavTranslations } from "@/lib/sav/translations";
 import { processPendingGmailReceipts, processPendingGmailSendActions } from "@/lib/sav/gmail";
 import { continueHubspotBackfill, getHubspotBackfillState, processPendingHubspotActions, processPendingHubspotReceipts, processPendingPilotHubspotActionsAcrossBatches, shouldAttemptHubspotBackfill } from "@/lib/sav/hubspot";
 import { processDueFollowups } from "@/lib/sav/followups";
@@ -32,6 +33,7 @@ export async function GET(request: Request) {
   if (!process.env.CRON_SECRET || request.headers.get("authorization") !== `Bearer ${process.env.CRON_SECRET}`) {
     return Response.json({ error: "unauthorized" }, { status: 401 });
   }
+  const derivedDeadline=Date.now()+270000;
   const [gmail, hubspot] = await Promise.all([
     runStep("gmail_receipts", () => processPendingGmailReceipts(50)),
     runStep("hubspot_receipts", () => processPendingHubspotReceipts(50)),
@@ -58,9 +60,10 @@ export async function GET(request: Request) {
     : !shouldAttemptHubspotBackfill(backfillState)
       ? { status: "skipped" as const, durationMs: 0, data: { reason: "configuration_required", retry: "automatic_within_30_minutes_or_manual" } }
       : await runStep("hubspot_learning_backfill", () => continueHubspotBackfill(1, 10));
-  const observations = await runStep("resolution_observations", () => reconcileSavObservations(5));
+  const observations = await runStep("resolution_observations", () => reconcileSavObservations(5,new Date(),{deadlineMs:Math.min(derivedDeadline,Date.now()+40000),maxComparisons:1}));
+  const translations=await runStep("message_translations",()=>reconcileSavTranslations(2,{deadlineMs:derivedDeadline}));
   const retention = await runStep("retention", () => enforceSavRetention());
-  const payload = { gmail, hubspot, trainings, evaluations, ticketActions, pilotItems, pendingMessages, pilotActions, followups, replies, statusActions, learningBackfill, observations, retention };
+  const payload = { gmail, hubspot, trainings, evaluations, ticketActions, pilotItems, pendingMessages, pilotActions, followups, replies, statusActions, learningBackfill, observations, translations, retention };
   const hasStepFailure = Object.values(payload).some((step) => step.status === "error");
   return Response.json(payload, { status: hasStepFailure ? 500 : 200 });
 }

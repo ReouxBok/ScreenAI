@@ -4,7 +4,7 @@ import { createSavTestDb } from "../../../test/sav-db";
 import { coverageFixture, geminiFixture, understandingContent, understandingFixture } from "../../../test/sav-understanding-fixtures";
 import { savAgentRuns, savMailboxes, savMessages, savThreads } from "@/db/schema";
 import { analyzeSavMessage } from "./intelligence";
-import { decryptSavPayload } from "./crypto";
+import { decryptSavPayload, encryptSavPayload } from "./crypto";
 import { defaultSavPlaybook } from "./playbook-contract";
 import { savSemanticPlan, type SavUnderstandingV1 } from "./understanding";
 import type { SavAgentOutput } from "./agent/contracts";
@@ -98,7 +98,7 @@ beforeEach(async () => {
   await fixture.client.exec("TRUNCATE sav.mailboxes CASCADE");
   const [mailbox] = await fixture.db.insert(savMailboxes).values({ email: "contact@limova.ai" }).returning();
   const [thread] = await fixture.db.insert(savThreads).values({ mailboxId: mailbox.id, gmailThreadId: "fixture", subject: input.subject, customerEmail: input.from }).returning();
-  const [message] = await fixture.db.insert(savMessages).values({ mailboxId: mailbox.id, threadId: thread.id, direction: "inbound", fromEmail: input.from, bodyCiphertext: "fixture-unused", receivedAt: new Date() }).returning();
+  const [message] = await fixture.db.insert(savMessages).values({ mailboxId: mailbox.id, threadId: thread.id, direction: "inbound", fromEmail: input.from, bodyCiphertext: encryptSavPayload({text:input.body}), receivedAt: new Date() }).returning();
   messageId = message.id;
 });
 

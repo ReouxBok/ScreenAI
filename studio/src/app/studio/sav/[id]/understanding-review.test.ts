@@ -3,7 +3,7 @@ import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it, vi } from "vitest";
 import { v0Proposal } from "../../../../../test/sav-v0-review-fixture";
 import { sav44Understanding } from "../../../../../test/sav44-understanding-fixture";
-vi.mock("../actions", () => ({ reviewProposalAction: vi.fn(), saveHumanDraftAction: vi.fn(), reviewDraftAction: vi.fn(), sendStudioReplyAction: vi.fn() }));
+vi.mock("../actions", () => ({ reviewProposalAction: vi.fn(), saveHumanDraftAction: vi.fn(), reviewDraftAction: vi.fn(), sendStudioReplyAction: vi.fn(), sendSuggestedReplyAction: vi.fn() }));
 import { UnderstandingReview } from "./understanding-review";
 import { ProposalReview } from "./proposal-review";
 import { DraftReview } from "./draft-review";
@@ -42,7 +42,7 @@ describe("SAV44 original understanding and independent feedback forms", () => {
     const props: ComponentProps<typeof DraftReview> = { data: { ...data(), proposal: { ...original, replyAssessment: { kind: "human_handoff", coverage: [], errorCode: null, coherence: { status: "rejected", issues: ["off_topic"], promptRevision: "synthetic", model: "synthetic", inputHash: "synthetic", outputHash: "synthetic", durationMs: 1, inputTokens: 1, outputTokens: 1, totalTokens: 2, errorCode: "SYNTHETIC" } } } }, threadId: "synthetic-thread", messageId: "synthetic-message", drafts: { knowledgeRevision: "synthetic", versions: [] }, sendAllowed: true };
     const html = renderToStaticMarkup(createElement(DraftReview, props));
     expect(html).toContain("Passage à un humain"); expect(html).toContain("contrôle de cohérence a refusé");
-    expect(html).toContain('name="reasons" value="off_topic"'); expect(html).toContain("Accepter cette version"); expect(html).toContain("Refuser le brouillon");
-    expect(html).toContain('disabled="">Envoyer la réponse acceptée'); expect(html).not.toContain('name="replyDraft"');
+    expect(html).toContain('name="reasons" value="off_topic"'); expect(html).not.toContain("Accepter cette version"); expect(html).toContain("Feedback facultatif");
+    expect(html).toContain('disabled="">Confirmer l’envoi de cette réponse'); expect(html).not.toContain('name="replyDraft"');
   });
 });
