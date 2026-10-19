@@ -1,6 +1,9 @@
+import {warmSavJourneyRoutes} from "../helpers/journey-warmup";
 import { submitServerAction } from "../helpers/server-action";
 import { expect, test } from "@playwright/test";
 import { SAV_REGISTRATION_E2E_THREAD, SAV_SEMANTIC_E2E_DRAFT, SAV_SEMANTIC_E2E_THREAD } from "../../test/sav-semantic-e2e-fixture";
+
+test.beforeAll(warmSavJourneyRoutes);
 
 test("SAV79 requests identity without suggesting a ticket and preserves dossier/draft review", async ({ page, baseURL }, testInfo) => {
   const externalRequests: string[] = [];
