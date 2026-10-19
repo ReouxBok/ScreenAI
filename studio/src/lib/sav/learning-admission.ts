@@ -209,14 +209,14 @@ export async function closeSavLearningReservationTx(tx: Tx, candidateId: string,
 }
 
 /** Atomically reserves a daily model call. Retries of a source should reuse its saved decision instead. */
-export async function reserveSavLearningModelCallTx(tx: Tx, now = new Date(), proofKey?: string) {
+export async function reserveSavLearningModelCallTx(tx: Tx, now = new Date(), proofKey?: string, model = process.env.SAV_AI_MODEL ?? "gemini-3.6-flash") {
   await lockSavLearningAdmissionTx(tx);
-  await reserveSavDerivedCallTx(tx,"comparison",now,proofKey);
+  const reservation = await reserveSavDerivedCallTx(tx,"comparison",now,proofKey,{model,maxOutputTokens:4096});
   const day = now.toISOString().slice(0, 10);
   const [usage] = await tx.select().from(savLearningModelUsage).where(eq(savLearningModelUsage.day, day)).for("update");
   if (usage) await tx.update(savLearningModelUsage).set({ callCount: usage.callCount + 1, updatedAt: now }).where(eq(savLearningModelUsage.day, day));
   else await tx.insert(savLearningModelUsage).values({ day, callCount: 1, updatedAt: now });
-  return { ok: true as const, used: (usage?.callCount ?? 0) + 1 };
+  return { ok: true as const, used: (usage?.callCount ?? 0) + 1, reservationId: reservation.reservationId };
 }
 
 export async function savLearningAdmissionMetrics(since = new Date(Date.now() - 7 * 86_400_000)) {

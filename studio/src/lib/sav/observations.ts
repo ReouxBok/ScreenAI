@@ -1,3 +1,4 @@
+import { isSavDerivedBudgetDeferred } from "./derived-budget";
 import { readSavCaseLearningQualification } from "./case-qualification";
 import { isSavCaseLearningFrozen } from "./config";
 import { savV0EligibleMessageFilter } from "./cutover";
@@ -15,7 +16,7 @@ import { decryptSavPayload, encryptSavPayload, savContentHash } from "./crypto";
 import { isSavAiAuthoredReply } from "./reply-format";
 import { collectSavObservationSources, type ObservationEvent, type ObservationSnapshot } from "./observation-source";
 import { savStoredReviewReasons, type SavReviewReason } from "./review-contract";
-import { processSavLearningResolution, savLearningMaterialText } from "./learning-pipeline";
+import { reconcileSavDeferredComparisons, processSavLearningResolution, savLearningMaterialText } from "./learning-pipeline";
 import { closeSavLearningReservationTx } from "./learning-admission";
 const DAY = 24 * 60 * 60 * 1000;
 // Keep closed cases observable for late evidence and reopenings until normal
@@ -70,7 +71,7 @@ export async function reconcileSavObservations(limit = 5, now = new Date(), opti
         or(isNull(savResolutionObservations.leaseUntil),lte(savResolutionObservations.leaseUntil,now)),or(isNull(savObservationCycles.qualification),eq(savObservationCycles.qualification,"evidence_observed")),
         or(isNull(savObservationCycles.learningDisposition),inArray(savObservationCycles.learningDisposition,["open_limit","weekly_limit"])),isNull(savObservationCycles.candidateId)))
       .orderBy(asc(savObservationCycles.updatedAt)).limit(options.maxComparisons===0?0:20);
-    const comparisons=[];
+    const comparisons: Array<Awaited<ReturnType<typeof processSavLearningResolution>> | Awaited<ReturnType<typeof prepareSavObservationLearning>>>=await reconcileSavDeferredComparisons(options.maxComparisons===0?0:1,now,{deadlineMs:workDeadline});
     for(const row of ready){
       if(comparisons.length>=Math.min(1,options.maxComparisons??1)||Date.now()+19000>workDeadline)break;
       const result=await prepareSavObservationLearning(row.id,now);
@@ -259,13 +260,14 @@ export async function qualifySavObservation(raw: unknown, actorEmail: string) {
         snapshotHash: result.pipeline.sourceHash, subject: result.pipeline.subject, resolution: result.pipeline.resolution,
         provenance: "human_resolution", sourceMessageId: result.pipeline.evidenceRef, evidenceRef: result.pipeline.evidenceRef,
         evidenceExcerpt: result.pipeline.resolution.slice(0, 240), customerConfirmed: result.pipeline.customerConfirmed,
-        cycleSourceHash: result.pipeline.cycleSourceHash,
+        cycleSourceHash: result.pipeline.cycleSourceHash, humanQualificationHash:savContentHash({input,actorEmail}),
     });
     const candidateId = evaluated && typeof evaluated === "object" && "candidateId" in evaluated && typeof evaluated.candidateId === "string" ? evaluated.candidateId : null;
     await db.transaction(async (tx) => {
         const [current] = await tx.select().from(savResolutionObservations).where(eq(savResolutionObservations.id, input.observationId)).for("update");
         const [cycle] = await tx.select().from(savObservationCycles).where(eq(savObservationCycles.id, input.cycleId));
         if (!current?.closed || current.cycle !== cycle?.cycle || cycle?.sourceHash !== result.pipeline!.cycleSourceHash || cycle.qualification !== "resolved") return;
+        if(evaluated.disposition==="deferred"){await tx.update(savResolutionObservations).set({state:"waiting_budget"}).where(eq(savResolutionObservations.id,input.observationId));return;}
         const disposition = "reasonCode" in evaluated ? String(evaluated.reasonCode) : evaluated.disposition;
         await tx.update(savObservationCycles).set({ candidateId, learningDisposition: disposition }).where(eq(savObservationCycles.id, input.cycleId));
         await tx.update(savResolutionObservations).set({ state: candidateId ? "candidate_ready" : "qualified_without_candidate" }).where(eq(savResolutionObservations.id, input.observationId));
@@ -329,7 +331,8 @@ export async function prepareSavObservationLearning(id:string,now=new Date(),opt
  const {row,cycle,summary,proof,qualificationHash}=prepared;
  let result:Awaited<ReturnType<typeof processSavLearningResolution>>;
  try { result=await processSavLearningResolution({ticketId:row.hubspotTicketId??undefined,threadId:row.threadId,sourceRef:`sav-observation:${cycle.id}`,origin:"observation",cycleStartedAt:cycle.createdAt,snapshotId:cycle.id,snapshotHash:cycle.sourceHash,subject:summary.subject,resolution:proof.text,provenance:"observed_treatment",sourceMessageId:proof.sourceRef,evidenceRef:proof.sourceRef,evidenceExcerpt:proof.text.slice(0,240),evidenceOccurredAt:proof.occurredAt,customerConfirmed:explicitCustomerConfirmation(summary.events.filter(e=>e.kind==="customer_reply"&&e.occurredAt>proof.occurredAt).at(-1)?.text??""),cycleSourceHash:cycle.sourceHash,observationId:row.id,cycleId:cycle.id,caseContext:{baseline:summary.baselineProposal,baselineAt:summary.baselineAt,events:summary.events,currentQualificationHash:qualificationHash}},{...options,now});
- } catch(error) {if(error instanceof Error && error.message==="SAV_DERIVED_DAILY_BUDGET_EXHAUSTED") {await db.update(savResolutionObservations).set({state:"waiting_budget"}).where(eq(savResolutionObservations.id,id));return {disposition:"deferred",reasonCode:"daily_budget"};}throw error;}
+ } catch(error) {if(isSavDerivedBudgetDeferred(error)) {await db.update(savResolutionObservations).set({state:"waiting_budget"}).where(eq(savResolutionObservations.id,id));return {disposition:"deferred",reasonCode:"daily_budget"};}throw error;}
+ if(result.disposition==="deferred"){await db.update(savResolutionObservations).set({state:"waiting_budget"}).where(eq(savResolutionObservations.id,id));return result;}
  if(result.disposition==="duplicate" && !result.candidateId && result.reasonCode==="comparison_started") return result;
  const candidateId="candidateId" in result&&typeof result.candidateId==="string"?result.candidateId:null;
  await db.transaction(async tx=>{

@@ -3,7 +3,7 @@ import {and,count,desc,eq,gte,inArray,lte,sql} from "drizzle-orm";
 import {requireDb} from "@/db";
 import {auditLogs,savAnalysisSnapshots,savMessageTranslations,savObservationCycles,savObservationEvents,savResolutionObservations} from "@/db/schema";
 import {decryptSavPayload} from "./crypto";
-import {savDerivedBudgets} from "./derived-budget";
+import {getSavDerivedMoneyStatus,savDerivedBudgets} from "./derived-budget";
 import type {SavLearningComparison} from "./learning-comparator";
 /** Coverage and usage, never a causal quality score or operator time estimate. */
 export async function savCaseLearningMetrics(now=new Date()) {
@@ -35,5 +35,5 @@ export async function savCaseLearningMetrics(now=new Date()) {
   for(const axis of comparison.decision.caseAxes??[]){group.axes[axis.axis]??={supported:0,gap:0,not_evaluable:0};group.axes[axis.axis][axis.state]++;}
   cohorts.set(key,group);
  }
- return {total,late,incomplete,stages,translations,budgets:savDerivedBudgets(),cohorts:[...cohorts.values()],since:since.toISOString(),comparisonCount,sampledComparisons:Math.min(200,comparisons.length),truncated:comparisons.length>200||cycles.length>200};
+ return {money:await getSavDerivedMoneyStatus(now),total,late,incomplete,stages,translations,budgets:savDerivedBudgets(),cohorts:[...cohorts.values()],since:since.toISOString(),comparisonCount,sampledComparisons:Math.min(200,comparisons.length),truncated:comparisons.length>200||cycles.length>200};
 }

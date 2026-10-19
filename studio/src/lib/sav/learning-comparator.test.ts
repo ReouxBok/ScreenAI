@@ -1,5 +1,7 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { compareSavLearningResolution, validateSavLearningComparison, type SavLearningComparisonInput } from "./learning-comparator";
+
+vi.mock("./derived-budget",()=>({isSavDerivedBudgetDeferred:()=>false,savDerivedCostQuote:()=>({}),reserveSavDerivedCall:async()=>({reservationId:"synthetic-unit"}),dispatchSavDerivedCall:async()=>{},settleSavDerivedCall:async()=>({settled:false})}));
 
 const input: SavLearningComparisonInput = {
   sourceRef: "hubspot:synthetic-1", subject: "Connexion API", resolution: "Ugo a régénéré la clé API puis la connexion a fonctionné.",

@@ -4,7 +4,7 @@ import { savContentHash } from "@/lib/sav/crypto";
 import styles from "./proposal-review.module.css";
 import { qualifyObservationAction } from "../actions";
 import { savReviewReasonLabels } from "@/lib/sav/review-contract";
-const labels: Record<string, string> = { waiting_ticket: "En attente de ticket confirmé", active: "Suivi actif", sources_incomplete: "Sources incomplètes", closed_to_analyze: "Clôturé · preuves en cours d’analyse", waiting_budget:"En attente du budget quotidien · reprise automatique bornée", candidate_ready: "Candidat prêt · revue séparée requise", gmail_only:"Fil Gmail suivi · couverture externe limitée", observed_without_candidate:"Traitement observé · aucune connaissance publiée" };
+const labels: Record<string, string> = { waiting_ticket: "En attente de ticket confirmé", active: "Suivi actif", sources_incomplete: "Sources incomplètes", closed_to_analyze: "Clôturé · preuves en cours d’analyse", waiting_budget:"En attente du budget ou de sa vérification · reprise automatique bornée", candidate_ready: "Candidat prêt · revue séparée requise", gmail_only:"Fil Gmail suivi · couverture externe limitée", observed_without_candidate:"Traitement observé · aucune connaissance publiée" };
 export function ResolutionObservation({ rows, isUgo }: {
     rows: Awaited<ReturnType<typeof getSavObservations>>;
     isUgo: boolean;
