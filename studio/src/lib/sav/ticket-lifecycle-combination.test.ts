@@ -57,7 +57,7 @@ function mockIntegrations() {
       if (failure === "note_timeout") throw new TypeError("Simulated lost note acknowledgement");
       return Response.json(remoteNote);
     }
-    if (url.includes("/objects/notes/501?")) return Response.json({ ...remoteNote, associations: { tickets: { results: [{ id: "401" }] } } });
+    if (url.includes("/objects/notes/501?")) return Response.json({ ...remoteNote, createdAt: new Date().toISOString(), associations: { tickets: { results: [{ id: "401" }] } } });
     if (url.endsWith("/objects/tickets/401") && init?.method === "PATCH") {
       stage = JSON.parse(String(init.body)).properties.hs_pipeline_stage;
       if (failure === "patch_timeout") throw new TypeError("Simulated lost patch acknowledgement");
@@ -334,4 +334,86 @@ it("reuses verified identical semantic evidence when the model becomes unavailab
   expect((await processPendingHubspotActions(1)).processed[0]).toMatchObject({actionId:action.id,status:"succeeded"});
   expect(network.mock.calls.filter(([url])=>url.includes("generativelanguage.googleapis.com"))).toHaveLength(1);
   expect(mutations(network)).toHaveLength(2); expect(stage).toBe("1");
+});
+
+it.each(["wrong_acknowledged_id", "old_note", "wrong_source_time", "unknown_creation_time"])("SAV49 rejects an unrelated generic return note: %s", async fault => {
+  const { network, action } = await prepare("reactivate"); failure = "patch_timeout";
+  await processPendingHubspotActions(1);
+  const [stored] = await fixture.db.select().from(savActions).where(eq(savActions.id, action.id));
+  const payload = { ...stored.payload };
+  if (fault !== "wrong_acknowledged_id") delete payload.ticketReturnNoteId;
+  await fixture.db.update(savActions).set({ payload }).where(eq(savActions.id, action.id));
+  const dispatch = String(stored.payload.ticketReturnDispatchedAt);
+  vi.stubGlobal("fetch", async (url: string, init?: RequestInit) => url.includes("/objects/notes/502?")
+    ? Response.json({ id: "502", properties: { hs_note_body: remoteNote!.properties.hs_note_body,
+        hs_timestamp: fault === "wrong_source_time" ? "2026-10-01T12:01:00Z" : "2026-10-02T12:01:00Z" },
+        ...(fault === "unknown_creation_time" ? {} : { createdAt: fault === "old_note" ? "2026-09-01T00:00:00Z" : dispatch }),
+        associations: { tickets: { results: [{ id: "401" }] } } }) : network(url, init));
+  const count = mutations(network).length;
+  await expect(reconcileSavTicketReturn(action.id, "502", "ugo@limova.ai")).rejects.toThrow("SAV_RECONCILIATION_TARGET_INVALID");
+  expect(mutations(network)).toHaveLength(count);
+  expect((await fixture.db.select().from(savActions).where(eq(savActions.id, action.id)))[0].status).toBe("failed");
+});
+
+it.each([403, 429])("SAV49 definite rejection %s of a return note cannot be reported as success", async status => {
+  const { network, action } = await prepare("reactivate");
+  let reject = true;
+  vi.stubGlobal("fetch", async (url: string, init?: RequestInit) => reject && url.endsWith("/objects/notes") && init?.method === "POST"
+    ? Response.json({ category: "SYNTHETIC_REJECTION" }, { status }) : network(url, init));
+  const first = (await processPendingHubspotActions(1, action.id)).processed[0];
+  expect(first.status).toBe(status === 429 ? "pending" : "failed");
+  const [stored] = await fixture.db.select().from(savActions).where(eq(savActions.id, action.id));
+  expect(stored.payload.ticketReturnDispatchedAt).toBeUndefined();
+  expect(remoteNote).toBeNull(); expect(stage).toBe("2");
+  reject = false;
+  if (status === 429) {
+    await processPendingHubspotActions(1, action.id); expect(mutations(network)).toHaveLength(0);
+    await fixture.db.update(savActions).set({ scheduledAt: new Date(0) }).where(eq(savActions.id, action.id));
+  } else await retrySavAction(action.id, "ugo@limova.ai");
+  expect((await processPendingHubspotActions(1, action.id)).processed[0].status).toBe("succeeded");
+  expect(mutations(network)).toHaveLength(2);
+});
+it("SAV49 concurrent worker and direct command create one note and one reopening", async () => {
+  const { network, action } = await prepare("reactivate");
+  await Promise.all([processPendingHubspotActions(1, action.id), processPendingHubspotActions(1, action.id)]);
+  expect(mutations(network)).toHaveLength(2);
+  expect((await fixture.db.select().from(savActions).where(eq(savActions.id, action.id)))[0].status).toBe("succeeded");
+});
+it("SAV49 denied patch after an acknowledged note remains uncertain and never repeats it", async () => {
+  const { network, action } = await prepare("reactivate");
+  vi.stubGlobal("fetch", async (url: string, init?: RequestInit) => url.endsWith("/objects/tickets/401") && init?.method === "PATCH"
+    ? Response.json({}, { status: 403 }) : network(url, init));
+  expect((await processPendingHubspotActions(1, action.id)).processed[0]).toMatchObject({ status: "failed", errorCode: "SAV_TICKET_RETURN_RECONCILIATION_REQUIRED" });
+  const count = mutations(network).length;
+  expect(remoteNote).not.toBeNull(); expect(stage).toBe("2");
+  await expect(retrySavAction(action.id, "ugo@limova.ai")).rejects.toThrow("SAV_TICKET_RETURN_RECONCILIATION_REQUIRED");
+  await processPendingHubspotActions(1, action.id); expect(mutations(network)).toHaveLength(count);
+});
+
+it.each(["nominal", "owner", "stage", "contact"])("SAV49 verifies a previously acknowledged return during local recovery: %s", async field => {
+  const { network, action } = await prepare("reactivate");
+  await processPendingHubspotActions(1, action.id);
+  await fixture.db.update(savActions).set({ status: "failed", errorCode: "LOCAL_FAILURE" }).where(eq(savActions.id, action.id));
+  await fixture.db.update(savThreads).set({ hubspotTicketId: null }).where(eq(savThreads.id, threadId));
+  await retrySavAction(action.id, "ugo@limova.ai");
+  if (field === "owner") ownerId = "72";
+  if (field === "stage") stage = "3";
+  vi.stubGlobal("fetch", async (url: string, init?: RequestInit) => {
+    const response = await network(url, init);
+    if (field !== "contact" || !url.includes("/objects/tickets/401?")) return response;
+    const ticket = await response.json(); ticket.associations.contacts.results = [{ id: "22" }];
+    return Response.json(ticket);
+  });
+  const count = mutations(network).length;
+  expect((await processPendingHubspotActions(1, action.id)).processed[0]).toMatchObject(field === "nominal"
+    ? { status: "succeeded" } : { status: "failed", errorCode: "SAV_TICKET_ACK_CONTEXT_CHANGED" });
+  expect((await fixture.db.select().from(savThreads).where(eq(savThreads.id, threadId)))[0].hubspotTicketId).toBe(field === "nominal" ? "401" : null);
+  expect(mutations(network)).toHaveLength(count);
+  if (field === "owner") {
+    await expect(retrySavAction(action.id, "ugo@limova.ai")).rejects.toThrow("SAV_TICKET_ACK_CONTEXT_CHANGED");
+    ownerId = "71";
+    await reconcileSavTicketReturn(action.id, "501", "ugo@limova.ai");
+    expect(mutations(network)).toHaveLength(count);
+    expect((await fixture.db.select().from(savActions).where(eq(savActions.id, action.id)))[0].status).toBe("succeeded");
+  }
 });

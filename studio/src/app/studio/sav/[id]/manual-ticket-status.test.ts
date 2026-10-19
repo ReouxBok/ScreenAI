@@ -51,3 +51,10 @@ describe("manual ticket progress", () => {
     expect(renderToStaticMarkup(createElement(ManualTicketStatus, { action: null, writesDisabled: false }))).toBe("");
   });
 });
+
+it.each(["pending", "running", "failed"])("SAV49 never suggests retrying a partially dispatched return (%s)", status => {
+  const html = render({ kind: "link_ticket", status, payload: { ticketReturnDispatchedAt: "fixture" } });
+  expect(html).toContain("Retour à vérifier dans HubSpot");
+  expect(html).toContain("aucune nouvelle tentative automatique");
+  expect(html).not.toContain("Prochaine tentative");
+});

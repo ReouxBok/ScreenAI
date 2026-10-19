@@ -7,7 +7,7 @@ import { decryptSavPayload, encryptSavPayload } from "./crypto";
 import { savStructuredProposalSchema } from "./proposal";
 import { getSavProposalReview, reviewSavProposal } from "./review";
 import { queueSavManualTicket } from "./manual-tickets";
-import { listSavInbox } from "./service";
+import { listSavInbox, retrySavAction } from "./service";
 import { processPendingHubspotActions, reconcileSavManualTicket } from "./hubspot";
 import { geminiFixture } from "../../../test/sav-understanding-fixtures";
 
@@ -109,4 +109,27 @@ it.each(["subject","content","pipeline","contact"])("F1 rejects a recovered tick
  vi.stubGlobal("fetch",async(url:string,init?:RequestInit)=>url.includes("/objects/tickets/301?")?Response.json({id:"301",properties:{...proof.properties,hs_pipeline:field==="pipeline"?"wrong":"0",...(field==="subject"?{subject:"wrong"}:{}),...(field==="content"?{content:"wrong"}:{})},associations:{contacts:{results:[{id:field==="contact"?"wrong":"21"}]}}}):network(url,init));
  await expect(reconcileSavManualTicket(action.id,"301","ugo@limova.ai","Ticket retrouvé à comparer avant rattachement")).rejects.toThrow("SAV_RECONCILIATION_TARGET_INVALID");
  expect((await fixture.db.select().from(savThreads).where(eq(savThreads.id,threadId)))[0].hubspotTicketId).toBeNull();
+});
+
+it.each(["nominal", "contact", "pipeline", "content", "owner", "id", "stage"])("SAV49 verifies acknowledged creation again on local recovery: %s", async field => {
+  const review = await reviewSavProposal({ ...reviewInput(), reviewScope: "dossier" }, "ugo@limova.ai");
+  const action = await queueSavManualTicket({ threadId, reviewId: review.id, kind: "create_ticket" }, "ugo@limova.ai");
+  const network = mockIntegrations("timeout"); await processPendingHubspotActions(1, action.id);
+  const [stored] = await fixture.db.select().from(savActions).where(eq(savActions.id, action.id));
+  const request = decryptSavPayload<{ properties: Record<string,string> }>(String(stored.payload.ticketCreateRequestCiphertext));
+  request.properties.hubspot_owner_id = "71";
+  await fixture.db.update(savActions).set({ payload: { ...stored.payload, hubspotTicketId: "301", ticketCreateRequestCiphertext: encryptSavPayload(request) } }).where(eq(savActions.id, action.id));
+  await retrySavAction(action.id, "ugo@limova.ai");
+  vi.stubGlobal("fetch", async (url: string, init?: RequestInit) => url.includes("/objects/tickets/301?") ? Response.json({
+    id: field === "id" ? "999" : "301", properties: { ...request.properties,
+      ...(field === "pipeline" ? { hs_pipeline: "other" } : {}), ...(field === "content" ? { content: "Changed content" } : {}),
+      ...(field === "owner" ? { hubspot_owner_id: "72" } : {}), ...(field === "stage" ? { hs_pipeline_stage: "4" } : {}) },
+    associations: { contacts: { results: [{ id: field === "contact" ? "22" : "21" }] } },
+  }) : network(url, init));
+  const count = network.mock.calls.filter(([url, init]) => /\/objects\/(?:tickets|notes)(?:\/\d+)?$/.test(url) && ["POST", "PATCH", "PUT"].includes(init?.method ?? "")).length;
+  const result = (await processPendingHubspotActions(1, action.id)).processed[0];
+  expect(result.status).toBe(field === "nominal" ? "succeeded" : "failed");
+  if (field !== "nominal") expect(result.errorCode).toBe("SAV_TICKET_ACK_CONTEXT_CHANGED");
+  expect((await fixture.db.select().from(savThreads).where(eq(savThreads.id, threadId)))[0].hubspotTicketId).toBe(field === "nominal" ? "301" : null);
+  expect(network.mock.calls.filter(([url, init]) => /\/objects\/(?:tickets|notes)(?:\/\d+)?$/.test(url) && ["POST", "PATCH", "PUT"].includes(init?.method ?? ""))).toHaveLength(count);
 });
