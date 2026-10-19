@@ -82,7 +82,7 @@ export async function collectLatestSavDossierContext(threadId: string): Promise<
 }
 
 /** Persist enrichment before a rule or model can produce its decision. No CRM/Gmail writes. */
-export async function collectSavDossierContext(messageId: string): Promise<SavDossierContext> {
+export async function collectSavDossierContext(messageId: string, options: { persist?: boolean } = {}): Promise<SavDossierContext> {
   const db = requireDb();
   const [message] = await db.select().from(savMessages).where(eq(savMessages.id, messageId)).limit(1);
   if (!message) throw new Error("SAV_MESSAGE_NOT_FOUND");
@@ -131,7 +131,7 @@ export async function collectSavDossierContext(messageId: string): Promise<SavDo
     try { context = applySavHumanTicketRouting(proposal, context, message.receivedAt); }
     catch { context.crm = { ...context.crm, status: "partial", errorCode: "SAV_TICKET_SELECTION_UNVERIFIED" }; }
   }
-  await db.transaction(async (tx) => {
+  if (options.persist !== false) await db.transaction(async (tx) => {
     const [current] = await tx.select().from(savMessages).where(eq(savMessages.id, messageId)).for("update");
     if (!current) throw new Error("SAV_MESSAGE_NOT_FOUND");
     const original = decryptSavPayload<Record<string, unknown>>(current.bodyCiphertext);
