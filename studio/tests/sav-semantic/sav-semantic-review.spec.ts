@@ -1,6 +1,38 @@
 import { submitServerAction } from "../helpers/server-action";
 import { expect, test } from "@playwright/test";
-import { SAV_SEMANTIC_E2E_DRAFT, SAV_SEMANTIC_E2E_THREAD } from "../../test/sav-semantic-e2e-fixture";
+import { SAV_REGISTRATION_E2E_THREAD, SAV_SEMANTIC_E2E_DRAFT, SAV_SEMANTIC_E2E_THREAD } from "../../test/sav-semantic-e2e-fixture";
+
+test("SAV79 requests identity without suggesting a ticket and preserves dossier/draft review", async ({ page, baseURL }, testInfo) => {
+  const externalRequests: string[] = [];
+  page.route("**/*", route => {
+    if (new URL(route.request().url()).origin !== baseURL) { externalRequests.push(route.request().url()); return route.abort(); }
+    return route.continue();
+  });
+  await page.goto(`/studio/sav/${SAV_REGISTRATION_E2E_THREAD}`);
+  const form = page.getByRole("form", { name: "Proposition de l’IA", exact: true });
+  const draft = page.getByRole("region", { name: "Verdict du brouillon", exact: true });
+  await expect(form).toContainText("Identifier le compte avant toute action");
+  await expect(form.locator('input[name="humanAction"]')).toHaveCount(0);
+  await expect(form.locator('input[name="humanProcess"]')).toHaveCount(0);
+  await expect(draft).toContainText("adresse email utilisée lors de votre inscription à Limova");
+  await expect(draft).toContainText("Bonjour,");
+  await expect(page.getByRole("button", { name: "Préparer l’aperçu de l’action", exact: true })).toBeDisabled();
+  await form.getByRole("checkbox", { name: "J’ai relu la demande et l’étape de vérification du compte.", exact: true }).check();
+  await submitServerAction(page, form.getByRole("button", { name: "Valider le dossier", exact: true }));
+  await page.waitForURL(/review=saved/, { timeout: 30_000 });
+  await expect(page.locator("#sav-action")).toContainText("Dossier · validé par ugo@limova.ai");
+  await page.reload();
+  await expect(form).toContainText("Identifier le compte avant toute action");
+  await expect(form.locator('input[name="humanAction"]')).toHaveCount(0);
+  await expect(draft).toContainText("adresse email utilisée lors de votre inscription à Limova");
+  await form.getByRole("button", { name: "Choisir manuellement une action après vérification du compte", exact: true }).click();
+  await expect(form.getByRole("radio", { name: "Créer un nouveau ticket", exact: true })).toBeVisible();
+  // Explicitly opening the manual editor is not a CRM action or a persisted choice.
+  await page.reload();
+  await expect(form.locator('input[name="humanAction"]')).toHaveCount(0);
+  expect(externalRequests).toEqual([]);
+  await page.screenshot({ path: testInfo.outputPath("sav79-registration-identity.png"), fullPage: true });
+});
 
 test("SAV76 diagnostics are readable directly without opening or replaying the dossier", async ({ request }) => {
   const response = await request.get(`/api/internal/sav/dossiers/${SAV_SEMANTIC_E2E_THREAD}/diagnostics`);
