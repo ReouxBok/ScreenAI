@@ -29,7 +29,7 @@ function defaultAction(p: SavStructuredProposal, tickets: Ticket[]): Action {
 /** Human correction of the dossier. Only the confirmed main action can produce a CRM command or a transfer, after a separate preview. */
 export function ProcessEditor({ proposal: p, tickets }: { proposal: SavStructuredProposal; tickets: Ticket[] }) {
   const [manualChoice, setManualChoice] = useState(false);
-  const waitingIdentity = !p.humanProcess && p.routing.kind === "review" && (["registration_email_required", "registration_lookup_unavailable"].includes(p.decision.reasonCode)
+  const waitingIdentity = !p.humanProcess && p.routing.kind === "review" && (["registration_email_required", "registration_lookup_unavailable", "registration_email_confirmation_required"].includes(p.decision.reasonCode)
     || p.routing.reason === "registration_email_confirmation_required");
   if (waitingIdentity && !manualChoice) return <>
     <div className={styles.panel} role="status">

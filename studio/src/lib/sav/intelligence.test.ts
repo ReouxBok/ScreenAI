@@ -63,34 +63,36 @@ describe("SAV registration prerequisite before product composition", () => {
     expect(result.replyDraft).not.toMatch(/aucun|retrouv|inscription|\?/);
     expect(result.ticketRouting).toMatchObject({ kind: "review", reason: "hubspot_context_unavailable" });
   });
-  it("reuses an evidenced address once, reads its context before final understanding and keeps human identity confirmation", async () => {
+  it("retains an evidenced address without reading or exposing another account before human identity confirmation", async () => {
     const body = "L’agent téléphone cesse de répondre. Mon email d’inscription est account@example.invalid";
     const u = understandingFixture(); u.evidence[0].excerpt = body;
     u.knownFacts = [{ id: "reg", key: "registration_email", text: "account@example.invalid", evidenceIds: [u.evidence[0].id] }];
     deps.understand.mockResolvedValue(u);
-    deps.crm.mockResolvedValueOnce(absent).mockResolvedValueOnce({ ...absent, contactFound: true, contactId: "correct-account", contactName: "Compte fictif" });
+    deps.crm.mockImplementation(async ({ email }) => email === "account@example.invalid"
+      ? { ...absent, contactFound: true, contactId: "PRIVATE_ALTERNATE_ACCOUNT", contactName: "PRIVATE_ALTERNATE_HISTORY" } : absent);
     const source = { from: "sender@example.invalid", subject: "Support", body };
     const network = vi.fn<typeof fetch>(async () => geminiFixture(outputFor(u)));
     const result = await analyzeSavMessage(source, { evaluation: evaluation("off", network) });
-    expect(deps.crm).toHaveBeenCalledTimes(2);
-    expect(deps.crm).toHaveBeenLastCalledWith(expect.objectContaining({ email: "account@example.invalid", includeHistory: true, toleratePartial: true }));
-    expect(deps.crm.mock.calls[1][0]).not.toHaveProperty("currentTicketId");
-    expect(deps.understand).toHaveBeenCalledTimes(2);
-    expect(deps.understand.mock.calls[1][0].dossierContext.crm.data.contactId).toBe("correct-account");
+    expect(deps.crm).toHaveBeenCalledOnce();
+    expect(deps.crm).toHaveBeenLastCalledWith(expect.objectContaining({ email: "sender@example.invalid" }));
+    expect(deps.understand).toHaveBeenCalledOnce(); expect(network).not.toHaveBeenCalled();
+    expect(JSON.stringify([deps.understand.mock.calls, deps.coherence.mock.calls, result])).not.toMatch(/PRIVATE_ALTERNATE/);
     expect(result.structuredProposal?.customerIdentity).toEqual({ registrationEmail: "account@example.invalid", verifiedByHuman: false });
-    expect(result.ticketRouting).toMatchObject({ kind: "review", reason: "registration_email_confirmation_required" });
+    expect(result.ticketRouting?.kind).toBe("review");
+    expect(result.proposal.reasonCode).toBe("registration_email_confirmation_required");
     expect(result.structuredProposal?.process.some(p => p.kind === "create_ticket" || p.kind === "link_ticket")).toBe(false);
     expect(result.replyDraft).not.toContain("adresse email utilisée lors de votre inscription");
     expect(source.from).toBe("sender@example.invalid");
   });
-  it("asks to verify a provided but unmatched address rather than requesting it again", async () => {
+  it("acknowledges a supplied alternate address rather than requesting it again", async () => {
     const body = "Mon email d’inscription est account@example.invalid";
     const u = understandingFixture(); u.evidence[0].excerpt = body;
     u.knownFacts = [{ id: "reg", key: "registration_email", text: "account@example.invalid", evidenceIds: [u.evidence[0].id] }];
     deps.understand.mockResolvedValue(u); deps.crm.mockResolvedValue(absent);
     const result = await analyzeSavMessage({ from: "sender@example.invalid", subject: "Support", body }, { evaluation: evaluation("off", vi.fn()) });
-    expect(deps.crm).toHaveBeenCalledTimes(2); expect(deps.understand).toHaveBeenCalledOnce();
-    expect(result.replyDraft).toContain("vérifier l’adresse d’inscription indiquée");
+    expect(deps.crm).toHaveBeenCalledOnce(); expect(deps.understand).toHaveBeenCalledOnce();
+    expect(result.replyDraft).toContain("Merci pour l’adresse email d’inscription indiquée");
+    expect(result.replyDraft).not.toContain("?");
     expect(result.replyDraft).not.toContain("préciser l’adresse email utilisée");
   });
   it("reuses an explicit address in the same customer's inbound history", async () => {
@@ -99,11 +101,12 @@ describe("SAV registration prerequisite before product composition", () => {
     u.evidence.push({ id: "history-reg", source: "history", sourceId: "message:old-inbound", excerpt: text });
     u.knownFacts = [{ id: "reg", key: "registration_email", text: "account@example.invalid", evidenceIds: ["history-reg"] }];
     deps.understand.mockResolvedValue(u); deps.crm.mockResolvedValue(absent);
-    await analyzeSavMessage({ from: "sender@example.invalid", subject: "Support", body: "Mon agent ne répond pas.",
+    const result = await analyzeSavMessage({ from: "sender@example.invalid", subject: "Support", body: "Mon agent ne répond pas.",
       conversation: { threadId: "fixture", currentMessageId: "new-inbound", hubspotTicketId: null, status: "new", aiPaused: false, senderMatchesCustomer: true,
         messages: [{ id: "old-inbound", direction: "inbound", from: "sender@example.invalid", receivedAt: "2026-10-18T10:00:00.000Z", text, truncated: false }], olderSummary: [], historyTruncated: false, attachmentNotice: "Non lues" } }, { evaluation: evaluation("off", vi.fn()) });
-    expect(deps.crm).toHaveBeenCalledTimes(2);
-    expect(deps.crm).toHaveBeenLastCalledWith(expect.objectContaining({ email: "account@example.invalid" }));
+    expect(deps.crm).toHaveBeenCalledOnce();
+    expect(result.structuredProposal?.customerIdentity).toEqual({ registrationEmail: "account@example.invalid", verifiedByHuman: false });
+    expect(result.replyDraft).not.toContain("?");
   });
   it("does not use another participant's registration address", async () => {
     const text = "Mon email d’inscription est other@example.invalid";
@@ -116,13 +119,13 @@ describe("SAV registration prerequisite before product composition", () => {
         messages: [{ id: "other-inbound", direction: "inbound", from: "other@example.invalid", receivedAt: "2026-10-18T10:00:00.000Z", text, truncated: false }], olderSummary: [], historyTruncated: false, attachmentNotice: "Non lues" } }, { evaluation: evaluation("off", vi.fn()) });
     expect(deps.crm).toHaveBeenCalledOnce(); expect(result.structuredProposal?.customerIdentity.registrationEmail).toBeNull();
   });
-  it("does not turn a failed alternate-address read into customer absence or a second lookup", async () => {
+  it("does not attempt a failing alternate-address read before confirmation", async () => {
     const body = "Mon email d’inscription est account@example.invalid";
     const u = understandingFixture(); u.evidence[0].excerpt = body;
     u.knownFacts = [{ id: "reg", key: "registration_email", text: "account@example.invalid", evidenceIds: [u.evidence[0].id] }];
     deps.understand.mockResolvedValue(u); deps.crm.mockResolvedValueOnce(absent).mockRejectedValueOnce(new Error("403"));
     const result = await analyzeSavMessage({ from: "sender@example.invalid", subject: "Support", body }, { evaluation: evaluation("off", vi.fn()) });
-    expect(deps.crm).toHaveBeenCalledTimes(2); expect(result.proposal.reasonCode).toBe("registration_lookup_unavailable");
+    expect(deps.crm).toHaveBeenCalledOnce(); expect(result.proposal.reasonCode).toBe("registration_email_confirmation_required");
     expect(result.replyDraft).not.toContain("vérifier l’adresse d’inscription indiquée");
     expect(result.replyDraft).not.toMatch(/retrouv|aucun/);
   });

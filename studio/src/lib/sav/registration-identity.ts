@@ -43,7 +43,7 @@ export function savSuppliedRegistrationEmail(u: SavUnderstandingV1, sources: Sav
 
 /** Server-owned clarification, selected BEFORE product composition. It is still
  * assessed by the common consistency, grounding and semantic coherence guards. */
-export function buildSavRegistrationClarification(u: SavUnderstandingV1, state: "not_found" | "unavailable", supplied: { email: string | null; ambiguous: boolean }) {
+export function buildSavRegistrationClarification(u: SavUnderstandingV1, state: "not_found" | "unavailable" | "confirmation_required", supplied: { email: string | null; ambiguous: boolean }) {
   const en = u.language === "en";
   const question = supplied.ambiguous
     ? en ? "Which of the addresses you provided did you use to register with Limova?" : "Parmi les adresses indiquées, laquelle avez-vous utilisée lors de votre inscription à Limova ?"
@@ -52,6 +52,8 @@ export function buildSavRegistrationClarification(u: SavUnderstandingV1, state: 
       : en ? "To find your account and help you, could you tell us the email address you used to register with Limova?" : "Pour retrouver votre compte et vous accompagner, pourriez-vous nous préciser l’adresse email utilisée lors de votre inscription à Limova ?";
   const info = en ? "Before preparing an action on your account, we need to verify which account your request concerns."
     : "Avant de préparer une action sur votre compte, nous devons vérifier le compte concerné par votre demande.";
+  const suppliedNotice = state === "confirmation_required" ? en ? "Thank you for providing your registration email address."
+    : "Merci pour l’adresse email d’inscription indiquée." : "";
   const primary = u.primaryRequestId ?? u.requests[0].id;
   const ids = new Set([...u.requests, ...u.knownFacts, ...u.attemptedSteps, ...u.missingInformation, ...u.evidence].map(item => item.id));
   let questionId = "registration_identity_question";
@@ -61,7 +63,7 @@ export function buildSavRegistrationClarification(u: SavUnderstandingV1, state: 
   const understanding: SavUnderstandingV1 = { ...u, missingInformation: state === "not_found" ? [{ id: questionId,
     key: supplied.email || supplied.ambiguous ? "registration_email_confirmation" : "registration_email", text: question, requestIds: [primary] }] : [] };
   const coverage = styleSavEmailCoverage(understanding, u.requests.map(r => ({ requestId: r.id,
-    text: `${en ? "Your request concerns" : "Votre demande concerne"} : ${r.summary.slice(0, 320)}${r.id === primary ? `\n\n${info}${state === "not_found" ? `\n\n${question}` : ""}` : ""}`,
+    text: `${en ? "Your request concerns" : "Votre demande concerne"} : ${r.summary.slice(0, 320)}${r.id === primary ? `\n\n${suppliedNotice ? `${suppliedNotice}\n\n` : ""}${info}${state === "not_found" ? `\n\n${question}` : ""}` : ""}`,
     kind: r.id === primary && state === "not_found" ? "clarification" as const : "acknowledgement" as const,
     sourceIds: [], missingInformationIds: r.id === primary && state === "not_found" ? [questionId] : [], repeatedAttemptIds: [], repeatJustification: "" })));
   const reply = assembleSavReplySections(understanding, coverage);

@@ -530,44 +530,25 @@ async function analyzeSavMessageWithinBudget(input: SavEnrichedInput, context: S
       ...(conversation?.senderMatchesCustomer ? conversation.messages.filter(m => m.direction === "inbound" && m.from.toLowerCase() === enriched.from.toLowerCase() && m.id !== conversation.currentMessageId)
         .map(m => ({ source: "history" as const, sourceId: `message:${m.id}`, text: `[inbound] ${m.text}` })) : [])];
     const suppliedRegistration = savSuppliedRegistrationEmail(understanding, registrationSources);
-    // One read-only lookup, using a customer-provided address with checked evidence.
-    // A different address never sets verifiedByHuman or changes the Gmail recipient.
-    if (savRegistrationPrerequisiteApplies(understanding) && savRegistrationIdentityStatus(enriched.dossierContext!.crm) === "not_found"
-      && suppliedRegistration.email && suppliedRegistration.email !== enriched.from.toLowerCase()) {
-      registrationEmail = suppliedRegistration.email;
-      try {
-        crm = await (context.evaluation?.readHubspotContext ?? readSavHubspotContext)({ email: registrationEmail, subject: input.subject, body: input.body, toleratePartial: true, includeHistory: true });
-        enriched.dossierContext = { ...enriched.dossierContext!, collectedAt: new Date().toISOString(),
-          crm: { status: crm.errorCode ? "partial" : "ready", data: crm, errorCode: crm.errorCode ?? null } };
-      } catch {
-        crm = null;
-        enriched.dossierContext = { ...enriched.dossierContext!, crm: { status: "error", data: null, errorCode: "SAV_HUBSPOT_CONTACT_UNAVAILABLE" } };
-      }
-      // New notes are available before the final understanding, never bolted
-      // onto an old product plan after its consistency/coherence checks.
-      if (savRegistrationIdentityStatus(enriched.dossierContext!.crm) === "identified") {
-        const first = understanding.trace;
-        const final = await understandSavMessage(enriched, { ...context.evaluation, playbook: enriched.activePlaybook });
-        understanding = { ...final, trace: { ...final.trace, inputTokens: first.inputTokens + final.trace.inputTokens,
-          outputTokens: first.outputTokens + final.trace.outputTokens, totalTokens: first.totalTokens + final.trace.totalTokens,
-          durationMs: first.durationMs + final.trace.durationMs } };
-        enriched.understanding = understanding;
-      }
-    }
+    // A declared address is not authorization to read another account. Retain
+    // the hint for the existing human identity check, never fetch its CRM here.
+    if (savRegistrationPrerequisiteApplies(understanding) && savRegistrationIdentityStatus(enriched.dossierContext!.crm) !== "identified") registrationEmail = suppliedRegistration.email;
     const plan = savSemanticPlan(understanding);
     // Lexical hints from the old context builder are not part of model reasoning.
     enriched.messageContext = { ...messageContext, language: understanding.language, intents: [], facts: [] };
     if (plan.replyPolicy === "lead_template") analysis = await analyzeSavLeadInquiry(enriched, context);
     else if (savRegistrationPrerequisiteApplies(understanding) && savRegistrationIdentityStatus(enriched.dossierContext!.crm) !== "identified") {
-      const state = savRegistrationIdentityStatus(enriched.dossierContext!.crm) === "not_found" ? "not_found" : "unavailable";
+      const state = savRegistrationIdentityStatus(enriched.dossierContext!.crm) !== "not_found" ? "unavailable"
+        : suppliedRegistration.email && suppliedRegistration.email !== enriched.from.toLowerCase() ? "confirmation_required" : "not_found";
       const reply = buildSavRegistrationClarification(understanding, state, suppliedRegistration);
       enriched.understanding = understanding = reply.understanding;
       assertSavGrounding({ ...reply, category: plan.category, urgency: "normal", ticketRequired: true, reasonCode: "registration_identity", explanation: "Registration identity prerequisite", confidence: 0,
         requiresHuman: true, internalNote: "", evidenceIds: [], citations: [] }, []);
       analysis = { category: plan.category, urgency: "normal", model: "rules-registration-v1", understanding,
-        proposal: { kind: "human_review_required", reasonCode: state === "not_found" ? "registration_email_required" : "registration_lookup_unavailable",
+        proposal: { kind: "human_review_required", reasonCode: state === "not_found" ? "registration_email_required" : state === "confirmation_required" ? "registration_email_confirmation_required" : "registration_lookup_unavailable",
           explanation: state === "not_found" ? "Identifier le compte par l’email d’inscription avant toute proposition d’action sur celui-ci. Brouillon de clarification à valider."
-            : "Recherche HubSpot non vérifiée : ne pas conclure à l’absence de client. Rétablir la lecture avant toute proposition d’action sur le compte.", confidence: 0, requiresHumanApproval: true },
+            : state === "confirmation_required" ? "Email d’inscription déjà fourni : vérifier l’identité du demandeur et confirmer cette adresse dans le dossier avant de lire le compte correspondant. Ne pas redemander l’adresse ni proposer d’action sur ce compte."
+              : "Recherche HubSpot non vérifiée : ne pas conclure à l’absence de client. Rétablir la lecture avant toute proposition d’action sur le compte.", confidence: 0, requiresHumanApproval: true },
         evidence: [{ sourceType: "rule", sourceId: SAV_REGISTRATION_IDENTITY_REVISION, title: "Identité du compte avant action" }],
         replyDraft: reply.replyDraft, internalNote: null, replyAssessment: { kind: "contextualized", coverage: reply.coverage, errorCode: null } };
       analysis.agentRunId = (await recordAgentRun({ context, source: enriched, analysis, runtime: "semantic_policy", mode: context.evaluation?.mode ?? savHarnessMode(),
