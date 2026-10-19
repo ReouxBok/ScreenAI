@@ -6,6 +6,8 @@ import { expireStaleEvaluationRuns } from "@/lib/evaluations";
 import { enforceSavRetention } from "@/lib/sav/retention";
 import { reconcileSavObservations } from "@/lib/sav/observations";
 import { reconcileStaleTrainings } from "@/lib/training";
+import { processPendingSavContextRefreshes, dispatchPendingSavEmailOpenings } from "@/lib/sav/dispatch";
+import { refreshSavDashboardProjection, savSqlDashboardEnabled } from "@/lib/sav/dashboard-projection";
 
 export const runtime = "nodejs";
 export const maxDuration = 300;
@@ -36,6 +38,8 @@ export async function GET(request: Request) {
     runStep("gmail_receipts", () => processPendingGmailReceipts(50)),
     runStep("hubspot_receipts", () => processPendingHubspotReceipts(50)),
   ]);
+  const emailOpenings = await runStep("email_openings", () => dispatchPendingSavEmailOpenings(10));
+  const contextRefreshes = await runStep("context_refreshes", () => processPendingSavContextRefreshes(5));
   const [trainings, evaluations] = await Promise.all([
     runStep("training_sessions", () => reconcileStaleTrainings()),
     runStep("evaluation_runs", () => expireStaleEvaluationRuns()),
@@ -60,7 +64,10 @@ export async function GET(request: Request) {
       : await runStep("hubspot_learning_backfill", () => continueHubspotBackfill(1, 10));
   const observations = await runStep("resolution_observations", () => reconcileSavObservations(5));
   const retention = await runStep("retention", () => enforceSavRetention());
-  const payload = { gmail, hubspot, trainings, evaluations, ticketActions, pilotItems, pendingMessages, pilotActions, followups, replies, statusActions, learningBackfill, observations, retention };
+  const dashboardProjection = savSqlDashboardEnabled()
+    ? await runStep("dashboard_projection", () => refreshSavDashboardProjection(100))
+    : { status: "skipped" as const, durationMs: 0, data: { reason: "disabled" } };
+  const payload = { gmail, hubspot, emailOpenings, contextRefreshes, trainings, evaluations, ticketActions, pilotItems, pendingMessages, pilotActions, followups, replies, statusActions, learningBackfill, observations, retention, dashboardProjection };
   const hasStepFailure = Object.values(payload).some((step) => step.status === "error");
   return Response.json(payload, { status: hasStepFailure ? 500 : 200 });
 }

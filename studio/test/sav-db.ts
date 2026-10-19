@@ -13,8 +13,17 @@ export async function createSavTestDb() {
   const directory = new URL("../drizzle/", import.meta.url);
   for (const file of (await readdir(directory)).filter((name) => name.endsWith(".sql")).sort()) {
     const migration = await readFile(new URL(file, directory), "utf8");
-    for (const statement of migration.split("--> statement-breakpoint")) {
-      if (statement.trim()) await client.exec(statement);
+    // Match the real migrator's atomic DDL transaction (including LOCK TABLE).
+    await client.exec("BEGIN");
+    try {
+      for (const statement of migration.split("--> statement-breakpoint")) {
+        if (statement.trim()) await client.exec(statement);
+      }
+      await client.exec("COMMIT");
+    } catch (error) {
+      await client.exec("ROLLBACK");
+      await client.close();
+      throw error;
     }
   }
   return { client, db: drizzle(client, { schema }) as unknown as ReturnType<typeof requireDb> };

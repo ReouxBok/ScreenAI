@@ -36,6 +36,7 @@ import { reviewSavDraft } from "@/lib/sav/draft-verdicts";
 import { saveSavHumanReplyDraft } from "@/lib/sav/drafts";
 import { assertSavManualReplyEnabled, queueSavManualReply } from "@/lib/sav/manual-replies";
 import { processPendingGmailSendActions } from "@/lib/sav/gmail";
+import { after } from "next/server";
 import { enqueueSavContextRefresh } from "@/lib/sav/dispatch";
 import { recordSavDeploymentDecision } from "@/lib/sav/metrics";
 import { createReviewedSavReplay, runReviewedSavRuleReplay } from "@/lib/sav/reviewed-replay";
@@ -222,7 +223,7 @@ export async function refreshSavContextAction(form: FormData) {
   const staff = await requireApiStaff("admin");
   const threadId = id(form, "threadId");
   let refreshId = "";
-  try { refreshId = await enqueueSavContextRefresh(threadId,staff.email); }
+  try { refreshId = await enqueueSavContextRefresh(threadId,staff.email,after); }
   catch { /* Keep the dossier readable if the refresh could not be scheduled. */ }
   revalidatePath(`/studio/sav/${threadId}`);
   redirect(`/studio/sav/${encodeURIComponent(threadId)}?${refreshId ? `context=refreshing&refreshId=${refreshId}` : "context=failed"}`);
@@ -424,7 +425,7 @@ export async function reviewProposalAction(form: FormData) {
     }, staff.email);
   } catch (error) { errorCode = error instanceof Error && /^[A-Z][A-Z_]+$/.test(error.message) ? error.message : "SAV_REVIEW_INVALID"; }
   if (!errorCode) {
-    try { refreshId = await enqueueSavContextRefresh(threadId,staff.email); }
+    try { refreshId = await enqueueSavContextRefresh(threadId,staff.email,after); }
     catch { /* The review is committed; enrichment failure cannot undo validation. */ }
   }
   revalidatePath("/studio/sav");

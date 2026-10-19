@@ -225,6 +225,13 @@
       "when": 1792070000000,
       "tag": "0035_sav_learning_admission",
       "breakpoints": true
+    },
+    {
+      "idx": 32,
+      "version": "7",
+      "when": 1792404000000,
+      "tag": "0036_sav_dashboard_projection",
+      "breakpoints": true
     }
   ]
 }

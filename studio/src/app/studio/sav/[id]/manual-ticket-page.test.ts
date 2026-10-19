@@ -19,7 +19,7 @@ vi.mock("./proposal-review", () => ({ ProposalReview: () => null, IdentityCheck:
 vi.mock("./findings-summary", () => ({ FindingsSummary: () => null, UsedKnowledge: () => null }));
 vi.mock("next/navigation", () => ({ useRouter: () => ({ refresh: vi.fn() }), notFound: () => { throw new Error("NOT_FOUND"); } }));
 vi.mock("../ticket-preview-actions", () => ({ prepareTicketPreviewAction: vi.fn(), confirmTicketPreviewAction: vi.fn() }));
-vi.mock("next/link", () => ({ default: (props: ComponentProps<"a">) => createElement("a", props) }));
+vi.mock("next/link", () => ({ useLinkStatus: () => ({ pending: false }), default: (props: ComponentProps<"a">) => createElement("a", props) }));
 vi.mock("../actions", () => Object.fromEntries([
   "approveDraftAction", "correctDecisionAction", "createTicketAction", "linkTicketAction", "reconcileTicketAction", "reconcileTicketReturnAction", "requestHumanAction", "retryAction", "retryAnalysisAction", "reviewPilotItemAction", "refreshSavContextAction", "repairSavProposalAction",
 ].map((name) => [name, dependencies.action])));

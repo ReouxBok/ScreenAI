@@ -1,6 +1,8 @@
 import { sql } from "drizzle-orm";
 import {
   boolean,
+  bigint,
+  check,
   date,
   index,
   integer,
@@ -578,6 +580,31 @@ export const savMessages = sav.table("messages", {
   uniqueIndex("sav_messages_mailbox_gmail_idx").on(table.mailboxId, table.gmailMessageId),
   index("sav_messages_thread_received_idx").on(table.threadId, table.receivedAt),
   index("sav_messages_analysis_recovery_idx").on(table.analysisStatus, table.analysisStartedAt, table.analysisAttempts),
+  index("sav_messages_latest_inbound").on(table.threadId, table.receivedAt.desc(), table.createdAt.desc(), table.id.desc()).where(sql`${table.direction} = 'inbound'`),
+]);
+
+/** Derived read model only. Invalidation functions/triggers live in migration0036. */
+export const savDashboardProjection = sav.table("dashboard_projection", {
+  threadId: uuid("thread_id").primaryKey().references(() => savThreads.id, { onDelete: "cascade" }),
+  version: bigint("version", { mode: "number" }).notNull().default(1),
+  indexedVersion: bigint("indexed_version", { mode: "number" }).notNull().default(0),
+  generation: text("generation"),
+  messageId: uuid("message_id"),
+  receivedAt: timestamp("received_at", { withTimezone: true }),
+  state: text("state"),
+  technical: boolean("technical").notNull().default(false),
+  incident: boolean("incident").notNull().default(false),
+  isOther: boolean("is_other").notNull().default(false),
+  searchGrams: text("search_grams").array().notNull().default([]),
+  searchStream: text("search_stream").notNull().default(""),
+  updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+}, table => [
+  check("sav_dashboard_state_check", sql`${table.state} in ('to_process', 'to_validate', 'learning', 'completed')`),
+  index("sav_dashboard_state_page").on(table.state, table.receivedAt.desc(), table.messageId.desc()).where(sql`not ${table.technical} and ${table.messageId} is not null`),
+  index("sav_dashboard_technical_page").on(table.receivedAt.desc(), table.messageId.desc()).where(sql`${table.technical} and ${table.messageId} is not null`),
+  index("sav_dashboard_incident_page").on(table.receivedAt.desc(), table.messageId.desc()).where(sql`not ${table.technical} and ${table.incident} and ${table.messageId} is not null`),
+  index("sav_dashboard_other_page").on(table.receivedAt.desc(), table.messageId.desc()).where(sql`${table.isOther} and ${table.messageId} is not null`),
+  index("sav_dashboard_search").using("gin", table.searchGrams),
 ]);
 
 export const savPilotBatches = sav.table("pilot_batches", {

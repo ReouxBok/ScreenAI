@@ -3,6 +3,7 @@ import { requireDb } from "@/db";
 import { auditLogs } from "@/db/schema";
 import { collectLatestSavDossierContext } from "@/lib/sav/dossier-context";
 import { processPendingHubspotActions } from "@/lib/sav/hubspot";
+import { executeSavEmailOpening } from "@/lib/sav/email-opening-command";
 
 export async function executeSavTicketCommandStep(actionId: string) {
   "use step";
@@ -22,3 +23,9 @@ export async function refreshSavContextStep(threadId: string, requestId: string,
   return { status };
 }
 refreshSavContextStep.maxRetries = 1;
+
+export async function executeSavEmailOpeningStep(commandId: string) {
+  "use step";
+  return executeSavEmailOpening(commandId);
+}
+executeSavEmailOpeningStep.maxRetries = 0;
