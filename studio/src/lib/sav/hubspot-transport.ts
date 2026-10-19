@@ -1,6 +1,6 @@
 import "server-only";
 
-export const SAV_CRM_TRANSPORT_REVISION = "sav-crm-read-2026-10-16.v1";
+export const SAV_CRM_TRANSPORT_REVISION = "sav-crm-read-2026-10-19.v2";
 /** POST is retryable only for these documented read operations. */
 export function isSavHubspotRead(path: string, method = "GET") {
   if (method.toUpperCase() === "GET") return true;
@@ -9,20 +9,28 @@ export function isSavHubspotRead(path: string, method = "GET") {
 
 export function createSavHubspotTransport(network: typeof fetch = fetch) {
   let active = 0, nextSearchAt = 0;
-  const queue: Array<{ resolve: () => void; reject: () => void; timer: ReturnType<typeof setTimeout> }> = [];
-  async function acquire() {
+  const queue: Array<{ resolve: () => void }> = [];
+  async function acquire(signal?: AbortSignal | null) {
+    if (signal?.aborted) throw new Error("SAV_HUBSPOT_READ_CANCELLED");
     if (active < 3) { active++; return; }
     if (queue.length >= 64) throw new Error("SAV_HUBSPOT_READ_QUEUE_FULL");
     await new Promise<void>((resolve, reject) => {
-      const entry = { resolve, reject: () => reject(new Error("SAV_HUBSPOT_READ_QUEUE_TIMEOUT")), timer: undefined as unknown as ReturnType<typeof setTimeout> };
-      entry.timer = setTimeout(() => { const i = queue.indexOf(entry); if (i >= 0) queue.splice(i, 1); entry.reject(); }, 20_000);
+      const cleanup = () => { clearTimeout(timer); signal?.removeEventListener("abort", cancel); };
+      const fail = (code: string) => {
+        const i = queue.indexOf(entry); if (i >= 0) queue.splice(i, 1);
+        cleanup(); reject(new Error(code));
+      };
+      const cancel = () => fail("SAV_HUBSPOT_READ_CANCELLED");
+      const entry = { resolve: () => { cleanup(); resolve(); } };
+      const timer = setTimeout(() => fail("SAV_HUBSPOT_READ_QUEUE_TIMEOUT"), 20_000);
+      signal?.addEventListener("abort", cancel, { once: true });
       queue.push(entry);
     });
   }
-  function release() { const entry = queue.shift(); if (entry) { clearTimeout(entry.timer); entry.resolve(); } else active--; }
+  function release() { const entry = queue.shift(); if (entry) entry.resolve(); else active--; }
   return async function request<T>(path: string, init: RequestInit, summarize: (status: number, payload: unknown) => string): Promise<T> {
     const read = isSavHubspotRead(path, init.method), started = Date.now(), deadline = started + 20_000;
-    if (read) await acquire();
+    if (read) await acquire(init.signal);
     let attempts = 0, status = 0;
     try {
       for (;;) {
