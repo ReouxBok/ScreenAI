@@ -29,19 +29,19 @@ for (const key of JOURNEY_CASES) {
     expect(remote().events).not.toContainEqual(expect.objectContaining({ contactId: remote().cases[key].contactId }));
     await expect(prepare).toBeEnabled();
     const eventsBeforePreview = remote().events.length;
-    await prepare.click(); clicks++;
+    await submitServerAction(page, prepare); clicks++;
     const preview = execution.getByRole("region", { name: "Aperçu de l’action HubSpot", exact: true });
     await expect(preview).toBeVisible();
     const countBeforeConfirm = remote().events.length;
     expect(countBeforeConfirm).toBe(eventsBeforePreview);
-    await preview.getByRole("button", { name: /^Confirmer :/ }).click(); clicks++;
+    await submitServerAction(page, preview.getByRole("button", { name: /^Confirmer :/ })); clicks++;
     if (key === "retry") {
       await expect(execution).toContainText("HubSpot refuse l’accès");
       await expect(prepare).toBeEnabled(); // No full document reload needed after a definite rejection.
       const state = remote(); state.cases.retry.fault = null; writeFileSync(statePath, JSON.stringify(state));
-      await prepare.click(); clicks++;
+      await submitServerAction(page, prepare); clicks++;
       await expect(preview).toBeVisible();
-      await preview.getByRole("button", { name: /^Confirmer :/ }).click(); clicks++;
+      await submitServerAction(page, preview.getByRole("button", { name: /^Confirmer :/ })); clicks++;
     }
     if (key === "uncertain") {
       await expect(execution).toContainText("Retour à vérifier dans HubSpot");
