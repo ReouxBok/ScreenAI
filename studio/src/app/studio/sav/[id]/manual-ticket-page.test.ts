@@ -102,3 +102,27 @@ describe("manual ticket controls in the dossier", () => {
     const html = await render(); expect(html).toContain("Validez d’abord le dossier / process"); expect(html).not.toContain('name="reviewId"');
   });
 });
+
+it("SAV49 displays a failed reopening even when its predecessor ticket is already linked", async () => {
+  const detail = await dependencies.detail();
+  const html = await render({ thread: { ...detail.thread, hubspotTicketId: "401" }, actions: [{ ...action, kind: "link_ticket", status: "failed", errorCode: "HUBSPOT_HTTP_403:MISSING_SCOPES" }] });
+  expect(html).toContain("Suivi de la demande HubSpot");
+  expect(html).toContain("HubSpot refuse l’accès");
+  const progress = html.match(/<li\b[^>]*>[\s\S]*?<strong>Action HubSpot<\/strong><small>([^<]+)<\/small>/)?.[1];
+  expect(progress).toBe("Action non aboutie");
+});
+it.each(["ticket_done", "ticket_queued", "ticket_processing_deferred"])("SAV49 %s cannot override the persisted failure after reload", async review => {
+  const html = await render({ actions: [{ ...action, status: "failed", errorCode: "SAV_PROPOSAL_STALE" }] }, review);
+  expect(html).not.toContain("Action ticket exécutée et confirmée par HubSpot");
+  expect(html).not.toContain("le worker planifié la reprendra");
+  expect(html).toContain("proposition validée a changé");
+});
+
+it("SAV49 acknowledges the known ID but requires reconciliation after remote context changes", async () => {
+  const html = await render({ actions: [{ ...action, status: "failed", errorCode: "SAV_TICKET_ACK_CONTEXT_CHANGED", payload: { hubspotTicketId: "301", ticketCreateDispatchedAt: "fixture" } }] });
+  expect(html).toContain("ticket déjà acquitté");
+  expect(html).toContain("Vérifier et rapprocher ce ticket existant");
+  expect(html).toContain('name="ticketId"'); expect(html).toContain('value="301"');
+  expect(html).not.toContain(">Réessayer<");
+  expect(html).toMatch(/<button[^>]*disabled=""[^>]*>Préparer l’aperçu de l’action/);
+});

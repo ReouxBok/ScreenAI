@@ -3,6 +3,7 @@ import { eq } from "drizzle-orm";
 import { createSavTestDb } from "../../../test/sav-db";
 import { activeKnowledge, savActions, savAgentRuns, savDecisions, savLearningCandidates, savMailboxes, savMessages, savProposalReviews, savThreads } from "@/db/schema";
 import { activateSavV0Cutover } from "./cutover";
+import { savReviewedTicketProperties } from "./hubspot-mapping";
 import { decryptSavPayload, encryptSavPayload } from "./crypto";
 import { savStructuredProposalSchema } from "./proposal";
 import { getSavProposalReview, reviewSavProposal } from "./review";
@@ -343,14 +344,17 @@ describe("SAV supervised reviews and manual tickets", () => {
     expect(await fixture.db.select().from(savProposalReviews)).toHaveLength(0);
     expect(await fixture.db.select().from(savActions)).toHaveLength(0);
   });
-  it("resumes an acknowledged ticket after a local failure without another POST or email", async () => {
+  it("revalidates a legacy acknowledged ticket against its historical review contact", async () => {
     const review = await reviewSavProposal(reviewInput(), "ugo@limova.ai");
     const action = await queueSavManualTicket({ threadId, reviewId: review.id, kind: "create_ticket" }, "ugo@limova.ai");
     await fixture.db.update(savActions).set({ status: "failed", errorCode: "LOCAL_FAILURE", payload: { ...action.payload, ticketCreateDispatchedAt: new Date().toISOString(), hubspotTicketId: "301" } }).where(eq(savActions.id, action.id));
+    const [storedReview] = await fixture.db.select().from(savProposalReviews).where(eq(savProposalReviews.id, review.id));
+    const recoveredProperties = savReviewedTicketProperties(savStructuredProposalSchema.parse(decryptSavPayload(storedReview.afterCiphertext)));
     const network = vi.fn(async (url: string, init?: RequestInit) => {
+      if (url.endsWith("/contacts/search")) return Response.json({ results: [{ id: "21", properties: { email: "client@example.com" } }] });
       if (init?.method === "POST") throw new Error("No new creation allowed");
       if (url.includes("/pipelines/tickets/0")) return Response.json({ id: "0", stages: ["1", "2", "3", "4"].map((id) => ({ id, metadata: { isClosed: id === "4" } })) });
-      if (url.includes("/tickets/301")) return Response.json({ id: "301", properties: { subject: "Retrouver les factures", hs_pipeline: "0", hs_pipeline_stage: "1" } });
+      if (url.includes("/tickets/301")) return Response.json({ id: "301", properties: recoveredProperties, associations: { contacts: { results: [{ id: "21" }] } } });
       throw new Error("Unexpected external request");
     }); vi.stubGlobal("fetch", network);
     await retrySavAction(action.id, "ugo@limova.ai");
