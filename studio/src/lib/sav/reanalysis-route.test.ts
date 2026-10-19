@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { POST } from "@/app/api/internal/sav/reanalysis/route";
+import { GET, POST } from "@/app/api/internal/sav/reanalysis/route";
 const state = vi.hoisted(() => ({ current: vi.fn(), db: vi.fn(), run: vi.fn() }));
 vi.mock("@clerk/nextjs/server", () => ({ currentUser: state.current }));
 vi.mock("./reanalysis-database", () => ({ withReanalysisDatabase: state.db }));
@@ -14,6 +14,16 @@ function request(body: unknown = { op: "capabilities" }, origin = "https://studi
   return new Request("https://studio.limova.ai/api/internal/sav/reanalysis", { method: "POST", headers: { origin, "content-type": "application/json" }, body: JSON.stringify(body) });
 }
 describe("internal reanalysis route", () => {
+  it("serves a session-only operator surface without database access or exported credentials", async () => {
+    state.current.mockResolvedValueOnce(null);
+    expect((await GET()).status).toBe(403);
+    const page = await GET(); expect(page.status).toBe(200);
+    expect(page.headers.get("cache-control")).toBe("private, no-store");
+    expect(page.headers.get("content-security-policy")).toContain("frame-ancestors 'none'");
+    const body = await page.text(); expect(body).toContain("Réanalyse SAV"); expect(body).not.toContain("document.cookie");
+    expect(body).toContain("inputs.length>20"); expect(body).toContain("Ne pas relancer automatiquement");
+    expect(state.db).not.toHaveBeenCalled(); expect(state.run).not.toHaveBeenCalled();
+  });
   it.each([null, "contact@limova.ai", "reouven@limova.ai", "unknown@example.invalid"])("rejects non-Ugo actors before database/model access: %s", async email => {
     state.current.mockResolvedValue(email ? { id: "fixture", primaryEmailAddress: { emailAddress: email, verification: { status: "verified" } } } : null);
     expect((await POST(request())).status).toBe(403); expect(state.db).not.toHaveBeenCalled(); expect(state.run).not.toHaveBeenCalled();

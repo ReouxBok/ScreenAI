@@ -12,8 +12,9 @@ const dialect = new PgDialect();
 export function guardReanalysisDatabase<T extends object>(db: T): T {
   return new Proxy(db, { get(target, key) {
     const method: unknown = Reflect.get(target, key);
-    if (key === "delete" || key === "$client") return () => { throw new Error("SAV_REANALYSIS_DB_WRITE_REFUSED"); };
-    if (typeof method !== "function") return method;
+    if (!["select", "selectDistinct", "selectDistinctOn", "transaction", "execute", "insert", "update"].includes(String(key)))
+      return () => { throw new Error("SAV_REANALYSIS_DB_WRITE_REFUSED"); };
+    if (typeof method !== "function") throw new Error("SAV_REANALYSIS_DB_WRITE_REFUSED");
     if (key === "transaction") return (work: (tx: unknown) => unknown, options: unknown) => Reflect.apply(method, target, [(tx: object) => work(guardReanalysisDatabase(tx)), options]);
     if (key === "execute") return (query: SQL) => {
       const text = dialect.sqlToQuery(query).sql;

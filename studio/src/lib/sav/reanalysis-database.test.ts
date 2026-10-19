@@ -13,6 +13,7 @@ describe("reanalysis database boundary", () => {
       expect(() => db.insert(table)).toThrow("WRITE_REFUSED"); expect(() => db.update(table)).toThrow("WRITE_REFUSED");
     }
     expect(() => db.delete()).toThrow("WRITE_REFUSED");
+    expect(() => (db as unknown as { with(): unknown }).with()).toThrow("WRITE_REFUSED");
     for (const query of [sql`update sav.messages set subject='changed'`, sql`with changed as (delete from sav.actions returning *) select * from changed`])
       expect(() => db.execute(query)).toThrow("RAW_WRITE_REFUSED");
     expect(() => db.insert(auditLogs).values({ action: "other", actorEmail: "ugo@limova.ai", entityType: "sav_reanalysis_message" })).toThrow("AUDIT_REFUSED");
