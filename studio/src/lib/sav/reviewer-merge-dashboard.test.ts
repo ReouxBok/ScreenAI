@@ -79,7 +79,7 @@ it("merge SAV56/SAV62 preserves accepted human draft on administratively complet
  expect((await listSavDossierDashboard({view:"to_validate"})).rows[0]?.draftStatus).toBe("Suggestion disponible");
  expect(await markSavDossiersHandledExternally({batchId:crypto.randomUUID(),receivedBefore:"2026-10-14T16:05:00Z",messages:[{threadId,messageId:m.id}]},actor)).toMatchObject({marked:1});
  const rows=await listSavDossierDashboard({view:"completed"});
- expect(rows.rows[0]).toMatchObject({handledExternally:true,draftStatus:"Suggestion disponible",nextAction:"Traité hors Studio",learning:"collecting"});
+ expect(rows.rows[0]).toMatchObject({handledExternally:true,draftStatus:"Suggestion disponible",nextAction:"Traité hors Studio",learning:"incomplete"});
  expect((await f.db.select().from(savResolutionObservations))[0]).toMatchObject({closed:false,state:"gmail_only"});
  const [tracking]=await f.db.select().from(savResolutionObservations);
  const collect=vi.fn(()=>{throw new Error("NO_CRM_READ_WITHOUT_TICKET");});

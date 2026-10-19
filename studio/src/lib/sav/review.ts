@@ -3,7 +3,7 @@ import "server-only";
 import { and, desc, eq, max, sql } from "drizzle-orm";
 import { z } from "zod";
 import { requireDb } from "@/db";
-import { activeKnowledge, auditLogs, savActions, savAgentRuns, savDecisions, savLearningCandidates, savMessages, savDraftVerdicts, savProposalReviews, savReplyDrafts, savThreads } from "@/db/schema";
+import { activeKnowledge, auditLogs, savActions, savAgentRuns, savDecisions, savLearningCandidates, savMessages, savDraftVerdicts, savProposalReviews, savReplyDrafts, savResolutionObservations, savThreads } from "@/db/schema";
 import { assertSavActor } from "./access";
 import { isSavMessageEligible } from "./cutover";
 import { decryptSavPayload, encryptSavPayload, savContentHash } from "./crypto";
@@ -157,6 +157,9 @@ export async function reviewSavProposal(raw: unknown, actorEmail: string) {
     await tx.insert(auditLogs).values({ actorEmail, action: "sav_proposal_reviewed", entityType: "sav_proposal_review", entityId: review.id,
       technicalMetadata: { messageId: message.id, decisionId: decision.id, agentRunId: run.id, verdict: review.verdict, status: review.status, reusability: input.reusability, reasons: input.reasons.join(","), beforeHash: savContentHash(before), afterHash: savContentHash(after) } });
     if (review.status === "approved") await ensureSavCaseObservationTx(tx,message.id,"dossier_validated");
+    // Both accepted and rejected dossier revisions invalidate already collected
+    // evidence immediately. A later sync versions the summary and candidates.
+    await tx.update(savResolutionObservations).set({sourceErrors:["dossier_review_awaiting_sync"],nextSyncAt:new Date(),closedCatchupUntil:null}).where(eq(savResolutionObservations.threadId,message.threadId));
     return { id: review.id };
   });
 }

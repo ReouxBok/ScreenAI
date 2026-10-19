@@ -25,7 +25,7 @@ const decisionSchema = z.object({
 }).strict();
 export type SavLearningComparison = z.infer<typeof decisionSchema>;
 export type SavLearningComparisonInput = {
-  caseContext?: {baseline:import("./proposal").SavStructuredProposal|null;baselineAt:string;events:import("./observation-source").ObservationEvent[]};
+  caseContext?: {currentQualificationHash?:string;baseline:import("./proposal").SavStructuredProposal|null;baselineAt:string;events:import("./observation-source").ObservationEvent[]};
   sourceRef: string; subject: string; resolution: string; evidenceRef: string; evidenceExcerpt: string; productVersion: string | null;
   knowledge: Array<{ ref: string; versionId: string; title: string; body: string }>;
   openCandidates: Array<{ ref: string; groupKey: string | null; subject: string; resolution: string; caseCount: number }>;

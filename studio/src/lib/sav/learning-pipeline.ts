@@ -1,7 +1,8 @@
 import "server-only";
+import {readSavCaseLearningQualification} from "./case-qualification";
 import { and, count, eq, inArray, isNotNull, isNull, ne, or, sql } from "drizzle-orm";
 import { requireDb } from "@/db";
-import { auditLogs, contentItems, contentVersions, knowledgeProjectionCandidates, savKnowledgeActivations, savLearningAdmissionAttempts, savLearningAdmissionCases, savLearningCandidates, savObservationCycles, savObservationEvents, savResolutionObservations } from "@/db/schema";
+import { auditLogs, contentItems, contentVersions, knowledgeProjectionCandidates, savKnowledgeActivations, savLearningAdmissionAttempts, savLearningAdmissionCases, savLearningCandidates, savObservationCycles, savObservationEvents, savResolutionObservations, savThreads } from "@/db/schema";
 import { knowledgeComparisonInventory } from "@/lib/knowledge/hubspot-import";
 import { decryptSavPayload, encryptSavPayload, savContentHash } from "./crypto";
 import { redactSavLearningText } from "./learning-extraction";
@@ -119,8 +120,11 @@ export async function processSavLearningResolution(input: SavLearningResolutionI
     sourceCurrent &&= origin !== "hubspot" || Boolean(input.ticketId && await isSavCrmLearningSourceCurrent({ ticketId: input.ticketId,
       snapshotId: input.snapshotId, snapshotHash: input.snapshotHash, cycleStartedAt: input.cycleStartedAt }, tx, true));
     if (input.observationId && input.cycleId) {
+      if(input.threadId)await tx.select({id:savThreads.id}).from(savThreads).where(eq(savThreads.id,input.threadId)).for("update");
       const [observation] = await tx.select().from(savResolutionObservations).where(eq(savResolutionObservations.id, input.observationId)).for("update");
       const [cycle] = await tx.select().from(savObservationCycles).where(eq(savObservationCycles.id, input.cycleId));
+      const qualification=observation?await readSavCaseLearningQualification(observation.threadId,tx):null;
+      sourceCurrent &&= Boolean(qualification?.allowed && (!input.caseContext?.currentQualificationHash || qualification.fingerprint===input.caseContext.currentQualificationHash));
       sourceCurrent &&= Boolean(observation?.closed && !observation.sourceErrors.length && cycle?.observationId === observation.id
         && cycle.cycle === observation.cycle && cycle.sourceHash === input.cycleSourceHash && ["resolved","evidence_observed"].includes(cycle.qualification??""));
     }

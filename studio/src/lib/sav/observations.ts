@@ -1,3 +1,4 @@
+import { readSavCaseLearningQualification } from "./case-qualification";
 import { isSavCaseLearningFrozen } from "./config";
 import { savV0EligibleMessageFilter } from "./cutover";
 import { measureSavCase, explicitCustomerConfirmation, observedResolutionEvidence } from "./case-comparison";
@@ -218,6 +219,7 @@ export async function qualifySavObservation(raw: unknown, actorEmail: string) {
         let candidateId = cycle.candidateId;
         let pipeline: null | { ticketId: string; threadId: string; observationId: string; cycleId: string; evidenceOccurredAt: string; sourceRef: string; cycleStartedAt: Date; subject: string; resolution: string; evidenceRef: string; sourceHash: string; cycleSourceHash: string; customerConfirmed: boolean } = null;
         if (input.outcome === "resolved") {
+            if(!(await readSavCaseLearningQualification(observation.threadId,tx)).allowed)throw new Error("SAV_OBSERVATION_QUALIFICATION_REQUIRED");
             const proof = summary.humanEvidence.find(e => e.sourceRef === input.evidenceRef && e.contentHash === input.evidenceHash);
             if (observation.sourceErrors.length || summary.sourceErrors.length || !proof || input.resolution.length < 20 || (input.customerConfirmationRef ? !summary.customerConfirmation.includes(input.customerConfirmationRef) : !input.unconfirmedAcknowledged) || summary.category === "billing" || summary.reasonCode === "cancellation_human_only")
                 throw new Error("SAV_OBSERVATION_QUALIFICATION_REQUIRED");
@@ -310,6 +312,8 @@ export async function prepareSavObservationLearning(id:string,now=new Date(),opt
   const [thread]=await tx.select({paused:savThreads.aiPaused}).from(savThreads).where(eq(savThreads.id,row.threadId));
   const [eligible]=await tx.select({id:savMessages.id}).from(savMessages).where(and(eq(savMessages.id,row.messageId),savV0EligibleMessageFilter()));
   if(thread?.paused || !eligible || process.env.SAV_AI_ANALYSIS==="false") return null;
+  const qualification=await readSavCaseLearningQualification(row.threadId,tx);
+  if(!qualification.allowed){const [cycle]=await tx.select().from(savObservationCycles).where(and(eq(savObservationCycles.observationId,id),eq(savObservationCycles.cycle,row.cycle)));if(cycle)await tx.update(savObservationCycles).set({learningDisposition:"current_qualification_requires_review"}).where(eq(savObservationCycles.id,cycle.id));return null;}
   const [cycle]=await tx.select().from(savObservationCycles).where(and(eq(savObservationCycles.observationId,id),eq(savObservationCycles.cycle,row.cycle)));
   if(!cycle||cycle.candidateId||cycle.qualification&&cycle.qualification!=="evidence_observed"||cycle.learningDisposition&&!["open_limit","weekly_limit"].includes(cycle.learningDisposition))return null;
   const summary=decryptSavPayload<{subject:string;category:string;reasonCode:string;events:ObservationEvent[];baselineProposal:SavStructuredProposal|null;baselineAt:string;sourceErrors:string[]}>(cycle.summaryCiphertext);
@@ -319,12 +323,12 @@ export async function prepareSavObservationLearning(id:string,now=new Date(),opt
   const proof=observedResolutionEvidence(summary.events.filter(e=>e.occurredAt>=(summary.baselineAt??row.createdAt.toISOString())),summary.baselineProposal??null);
   if(!proof){await tx.update(savObservationCycles).set({learningDisposition:"insufficient_independent_evidence"}).where(eq(savObservationCycles.id,cycle.id));return null;}
   await tx.update(savObservationCycles).set({qualification:"evidence_observed",qualifiedBy:null,qualifiedAt:null}).where(eq(savObservationCycles.id,cycle.id));
-  return {row,cycle,summary,proof};
+  return {row,cycle,summary,proof,qualificationHash:qualification.fingerprint!};
  });
  if(!prepared)return {disposition:"not_evaluable"};
- const {row,cycle,summary,proof}=prepared;
+ const {row,cycle,summary,proof,qualificationHash}=prepared;
  let result:Awaited<ReturnType<typeof processSavLearningResolution>>;
- try { result=await processSavLearningResolution({ticketId:row.hubspotTicketId??undefined,threadId:row.threadId,sourceRef:`sav-observation:${cycle.id}`,origin:"observation",cycleStartedAt:cycle.createdAt,snapshotId:cycle.id,snapshotHash:cycle.sourceHash,subject:summary.subject,resolution:proof.text,provenance:"observed_treatment",sourceMessageId:proof.sourceRef,evidenceRef:proof.sourceRef,evidenceExcerpt:proof.text.slice(0,240),evidenceOccurredAt:proof.occurredAt,customerConfirmed:explicitCustomerConfirmation(summary.events.filter(e=>e.kind==="customer_reply"&&e.occurredAt>proof.occurredAt).at(-1)?.text??""),cycleSourceHash:cycle.sourceHash,observationId:row.id,cycleId:cycle.id,caseContext:{baseline:summary.baselineProposal,baselineAt:summary.baselineAt,events:summary.events}},{...options,now});
+ try { result=await processSavLearningResolution({ticketId:row.hubspotTicketId??undefined,threadId:row.threadId,sourceRef:`sav-observation:${cycle.id}`,origin:"observation",cycleStartedAt:cycle.createdAt,snapshotId:cycle.id,snapshotHash:cycle.sourceHash,subject:summary.subject,resolution:proof.text,provenance:"observed_treatment",sourceMessageId:proof.sourceRef,evidenceRef:proof.sourceRef,evidenceExcerpt:proof.text.slice(0,240),evidenceOccurredAt:proof.occurredAt,customerConfirmed:explicitCustomerConfirmation(summary.events.filter(e=>e.kind==="customer_reply"&&e.occurredAt>proof.occurredAt).at(-1)?.text??""),cycleSourceHash:cycle.sourceHash,observationId:row.id,cycleId:cycle.id,caseContext:{baseline:summary.baselineProposal,baselineAt:summary.baselineAt,events:summary.events,currentQualificationHash:qualificationHash}},{...options,now});
  } catch(error) {if(error instanceof Error && error.message==="SAV_DERIVED_DAILY_BUDGET_EXHAUSTED") {await db.update(savResolutionObservations).set({state:"waiting_budget"}).where(eq(savResolutionObservations.id,id));return {disposition:"deferred",reasonCode:"daily_budget"};}throw error;}
  if(result.disposition==="duplicate" && !result.candidateId && result.reasonCode==="comparison_started") return result;
  const candidateId="candidateId" in result&&typeof result.candidateId==="string"?result.candidateId:null;
