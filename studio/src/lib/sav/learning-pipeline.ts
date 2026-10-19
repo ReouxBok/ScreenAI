@@ -80,7 +80,7 @@ async function deferSavLearningComparison(input: SavLearningResolutionInput, err
 export async function reconcileSavDeferredComparisons(limit = 1, now = new Date(), options: { deadlineMs?: number; apiKey?: string; model?: string; fetch?: typeof fetch } = {}) {
   if (isSavCaseLearningFrozen() || savReleaseStage()!=="v0" || process.env.SAV_AI_ANALYSIS==="false") return [];
   const db = requireDb();
-  const jobs = await db.select().from(auditLogs).where(and(eq(auditLogs.action, "sav_derived_comparison_deferred"), sql`${auditLogs.technicalMetadata}->>'state' = 'pending'`,sql`(${auditLogs.technicalMetadata}->>'nextAttemptAt')::timestamptz <= ${now}`)).orderBy(auditLogs.createdAt).limit(Math.max(0, Math.min(1, limit)));
+  const jobs = await db.select().from(auditLogs).where(and(eq(auditLogs.action, "sav_derived_comparison_deferred"), sql`${auditLogs.technicalMetadata}->>'state' = 'pending'`,sql`(${auditLogs.technicalMetadata}->>'nextAttemptAt')::timestamptz <= ${now.toISOString()}::timestamptz`)).orderBy(auditLogs.createdAt).limit(Math.max(0, Math.min(1, limit)));
   const results = [];
   for (const job of jobs) {
     if (options.deadlineMs && Date.now() + 19000 > options.deadlineMs) break;
