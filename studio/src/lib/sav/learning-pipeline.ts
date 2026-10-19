@@ -1,6 +1,6 @@
 import "server-only";
 import {savV0EligibleMessageFilter} from "./cutover";
-import {isSavDerivedBudgetDeferred} from "./derived-budget";
+import {SAV_DERIVED_COST_REVISION,isSavDerivedBudgetDeferred} from "./derived-budget";
 import {readSavCaseLearningQualification} from "./case-qualification";
 import { and, count, eq, inArray, isNotNull, isNull, ne, or, sql } from "drizzle-orm";
 import { requireDb } from "@/db";
@@ -53,7 +53,7 @@ async function buildComparisonContext(inventory: Awaited<ReturnType<typeof knowl
 }
 
 export type SavLearningResolutionInput = {
-  humanQualificationHash?: string;
+  humanQualificationRevision?: string;
   caseContext?: import("./learning-comparator").SavLearningComparisonInput["caseContext"];
   ticketId?: string; threadId?: string; sourceRef?: string; origin?: "hubspot" | "observation"; cycleStartedAt: Date | string; snapshotId: string; snapshotHash: string; subject: string;
   resolution: string; provenance: string; sourceMessageId: string | null; evidenceRef?: string; evidenceExcerpt?: string; evidenceOccurredAt?: string; customerConfirmed: boolean; productVersion?: string | null; cycleSourceHash?: string; observationId?: string; cycleId?: string;
@@ -92,11 +92,10 @@ export async function reconcileSavDeferredComparisons(limit = 1, now = new Date(
     if (input.observationId && input.cycleId) {
       const [observation] = await db.select().from(savResolutionObservations).where(eq(savResolutionObservations.id, input.observationId));
       const [cycle] = await db.select().from(savObservationCycles).where(eq(savObservationCycles.id, input.cycleId));
-      const [humanEvent] = input.humanQualificationHash ? await db.select({hash:savObservationEvents.contentHash}).from(savObservationEvents).where(and(eq(savObservationEvents.observationId,input.observationId),eq(savObservationEvents.sourceRef,`qualification:${input.cycleId}`))).orderBy(sql`${savObservationEvents.occurredAt} desc`,sql`${savObservationEvents.createdAt} desc`).limit(1) : [];
       const qualification = observation ? await readSavCaseLearningQualification(observation.threadId) : null;
       const [thread] = observation ? await db.select().from(savThreads).where(eq(savThreads.id, observation.threadId)) : [];
       const [message] = observation ? await db.select({ id: savMessages.id }).from(savMessages).where(and(eq(savMessages.id, observation.messageId),savV0EligibleMessageFilter())) : [];
-      if (!observation?.closed || !cycle || cycle.qualification!=="resolved" || input.humanQualificationHash && humanEvent?.hash!==input.humanQualificationHash || cycle.cycle !== observation.cycle || cycle.sourceHash !== input.cycleSourceHash || !qualification?.allowed || input.caseContext?.currentQualificationHash && qualification.fingerprint !== input.caseContext.currentQualificationHash || !message) {
+      if (!observation?.closed || !cycle || cycle.qualification!=="resolved" || input.humanQualificationRevision && decryptSavPayload<{humanQualificationRevision?:string}>(cycle.summaryCiphertext).humanQualificationRevision!==input.humanQualificationRevision || cycle.cycle !== observation.cycle || cycle.sourceHash !== input.cycleSourceHash || !qualification?.allowed || input.caseContext?.currentQualificationHash && qualification.fingerprint !== input.caseContext.currentQualificationHash || !message) {
         await clear("source_changed");
         continue;
       }
@@ -114,7 +113,7 @@ export async function reconcileSavDeferredComparisons(limit = 1, now = new Date(
       if (!input.observationId || !input.cycleId) return;
       const [observation] = await tx.select().from(savResolutionObservations).where(eq(savResolutionObservations.id, input.observationId)).for("update");
       const [cycle] = await tx.select().from(savObservationCycles).where(eq(savObservationCycles.id, input.cycleId));
-      if (!observation?.closed || observation.cycle !== cycle?.cycle || cycle.sourceHash !== input.cycleSourceHash) return;
+      if (!observation?.closed || observation.cycle !== cycle?.cycle || cycle.sourceHash !== input.cycleSourceHash || input.humanQualificationRevision && decryptSavPayload<{humanQualificationRevision?:string}>(cycle.summaryCiphertext).humanQualificationRevision!==input.humanQualificationRevision) return;
       const candidateId = "candidateId" in result ? result.candidateId ?? null : null;
       await tx.update(savObservationCycles).set({ candidateId, learningDisposition: "reasonCode" in result ? result.reasonCode : result.disposition }).where(eq(savObservationCycles.id, cycle.id));
       await tx.update(savResolutionObservations).set({ state: candidateId ? "candidate_ready" : "observed_without_candidate" }).where(eq(savResolutionObservations.id, observation.id));
@@ -135,7 +134,7 @@ export async function processSavLearningResolution(input: SavLearningResolutionI
   if (!["human_resolution", "observed_treatment"].includes(input.provenance) || !input.sourceMessageId || input.resolution.trim().length < 20) return signal("human_resolution_proof_required");
   const resolution = safeText(input.resolution, 4000), subject = safeText(input.subject, 500), evidenceRef = input.evidenceRef ?? ("hubspot-message:" + input.sourceMessageId);
   const proofHash = savLearningProofHash({ sourceRef, cycleStartedAt: input.cycleStartedAt, evidenceRef, sourceMessageId: input.sourceMessageId, resolution, customerConfirmed: input.customerConfirmed });
-  const sourceHash=input.cycleSourceHash?savContentHash({proofHash,cycleSourceHash:input.cycleSourceHash}):proofHash;
+  const sourceHash=input.cycleSourceHash?savContentHash({proofHash,cycleSourceHash:input.cycleSourceHash,...(input.humanQualificationRevision?{humanQualificationRevision:input.humanQualificationRevision}:{})}):proofHash;
   let context: Awaited<ReturnType<typeof comparisonContext>>;
   try { context = await comparisonContext(); } catch { return signal("comparison_context_incomplete", sourceHash); }
   if (context.priorRejections.some(prior => savLearningMaterialText(prior.resolution) === savLearningMaterialText(resolution))) return signal("rejected_unchanged_proof", sourceHash);
@@ -154,13 +153,19 @@ export async function processSavLearningResolution(input: SavLearningResolutionI
   }
   const model = options.model ?? process.env.SAV_AI_MODEL ?? "gemini-3.6-flash";
   const claim = await requireDb().transaction(async tx => {
+    if(input.humanQualificationRevision && input.observationId && input.cycleId){
+      if(input.threadId)await tx.select({id:savThreads.id}).from(savThreads).where(eq(savThreads.id,input.threadId)).for("update");
+      const [observation]=await tx.select().from(savResolutionObservations).where(eq(savResolutionObservations.id,input.observationId)).for("update");
+      const [cycle]=await tx.select().from(savObservationCycles).where(eq(savObservationCycles.id,input.cycleId));
+      if(!observation?.closed || observation.sourceErrors.length || cycle?.qualification!=="resolved" || cycle.sourceHash!==input.cycleSourceHash || decryptSavPayload<{humanQualificationRevision?:string}>(cycle.summaryCiphertext).humanQualificationRevision!==input.humanQualificationRevision)return {stale:true as const};
+    }
     const claimed = await claimSavLearningComparisonTx(tx, { sourceRef, sourceHash, origin, inputHash, now, resumeDeferred:Boolean(savedComparison) });
     if (!claimed.claimed) return { duplicate: true as const };
     if (savedComparison) return {duplicate:false as const,signalId:claimed.signalId,leaseToken:claimed.leaseToken};
     // A provider outcome lost to an interruption is uncertain, never permission
     // to spend another call for the same cycle/evidence revision.
     const proofKey = savContentHash({ sourceRef, sourceHash });
-    const [dispatched] = await tx.select({id:auditLogs.id}).from(auditLogs).where(and(eq(auditLogs.action,"sav_derived_call_reserved"),sql`${auditLogs.technicalMetadata}->>'proofKey' = ${proofKey}`,sql`(${auditLogs.technicalMetadata}->>'dispatchedAt') is not null`)).limit(1);
+    const [dispatched] = await tx.select({id:auditLogs.id}).from(auditLogs).where(and(eq(auditLogs.action,"sav_derived_call_reserved"),sql`${auditLogs.technicalMetadata}->>'proofKey' = ${proofKey}`,sql`((${auditLogs.technicalMetadata}->>'dispatchedAt') is not null or (${auditLogs.technicalMetadata}->>'budgetRevision') is distinct from ${SAV_DERIVED_COST_REVISION})`)).limit(1);
     if (input.caseContext && dispatched) {
       await finishSavLearningComparisonTx(tx, claimed.signalId, {state:"signal",reasonCode:"comparison_interrupted"}, now, claimed.leaseToken);
       return {duplicate:true as const};
@@ -171,6 +176,7 @@ export async function processSavLearningResolution(input: SavLearningResolutionI
     if (isSavDerivedBudgetDeferred(error)) return { deferred: true as const, errorCode: (error as Error).message };
     throw error;
   });
+  if ("stale" in claim) return signal("source_changed",sourceHash);
   if ("deferred" in claim) { await deferSavLearningComparison(input, claim.errorCode, now); return { disposition: "deferred" as const, reasonCode: claim.errorCode === "SAV_DERIVED_DAILY_BUDGET_EXHAUSTED" ? "daily_budget" : "monetary_budget", errorCode: claim.errorCode }; }
   if (claim.duplicate) {
     const [prior] = await requireDb().select().from(savLearningAdmissionAttempts).where(and(eq(savLearningAdmissionAttempts.sourceRef, sourceRef), eq(savLearningAdmissionAttempts.sourceHash, sourceHash))).limit(1);
@@ -201,10 +207,7 @@ export async function processSavLearningResolution(input: SavLearningResolutionI
       const [observation] = await tx.select().from(savResolutionObservations).where(eq(savResolutionObservations.id, input.observationId)).for("update");
       const [cycle] = await tx.select().from(savObservationCycles).where(eq(savObservationCycles.id, input.cycleId));
       const qualification=observation?await readSavCaseLearningQualification(observation.threadId,tx):null;
-      if(input.humanQualificationHash){
-        const [humanEvent]=await tx.select({hash:savObservationEvents.contentHash}).from(savObservationEvents).where(and(eq(savObservationEvents.observationId,input.observationId),eq(savObservationEvents.sourceRef,`qualification:${input.cycleId}`))).orderBy(sql`${savObservationEvents.occurredAt} desc`,sql`${savObservationEvents.createdAt} desc`).limit(1);
-        sourceCurrent &&= humanEvent?.hash===input.humanQualificationHash;
-      }
+      if(input.humanQualificationRevision)sourceCurrent &&= Boolean(cycle && decryptSavPayload<{humanQualificationRevision?:string}>(cycle.summaryCiphertext).humanQualificationRevision===input.humanQualificationRevision);
       sourceCurrent &&= Boolean(qualification?.allowed && (!input.caseContext?.currentQualificationHash || qualification.fingerprint===input.caseContext.currentQualificationHash));
       sourceCurrent &&= Boolean(observation?.closed && !observation.sourceErrors.length && cycle?.observationId === observation.id
         && cycle.cycle === observation.cycle && cycle.sourceHash === input.cycleSourceHash && ["resolved","evidence_observed"].includes(cycle.qualification??""));

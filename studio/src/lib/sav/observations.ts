@@ -182,7 +182,8 @@ export async function syncSavObservation(id: string, collect: (id: string) => Pr
         }
         const closed = snapshot.status === "closed";
         const status = snapshot.status === "unknown" ? "unknown" : closed ? "closed" : "open";
-        const values = { status, summaryCiphertext: encryptSavPayload(summary), sourceHash: hash, closedAt: closed ? (existing?.closedAt ?? new Date(snapshot.updatedAt)) : null, updatedAt: now, ...(changed ? { qualification: null, qualifiedBy: null, qualifiedAt: null, candidateId: null, learningDisposition: null } : {}) };
+        const humanQualificationRevision = !changed && existing?.qualification ? decryptSavPayload<{humanQualificationRevision?:string}>(existing.summaryCiphertext).humanQualificationRevision : undefined;
+        const values = { status, summaryCiphertext: encryptSavPayload({...summary,...(humanQualificationRevision?{humanQualificationRevision}:{})}), sourceHash: hash, closedAt: closed ? (existing?.closedAt ?? new Date(snapshot.updatedAt)) : null, updatedAt: now, ...(changed ? { qualification: null, qualifiedBy: null, qualifiedAt: null, candidateId: null, learningDisposition: null } : {}) };
         const [savedCycle] = existing ? await tx.update(savObservationCycles).set(values).where(eq(savObservationCycles.id, existing.id)).returning() : await tx.insert(savObservationCycles).values({ ...values, observationId: id, cycle, ...(cycle > 1 ? { createdAt: new Date(snapshot.updatedAt) } : {}) }).returning();
         const closedCatchupUntil = snapshot.status === "open" ? null : closed ? (row.closedCatchupUntil ?? new Date(now.getTime() + DAY)) : row.closedCatchupUntil;
         release.nextSyncAt = nextDue(now);
@@ -217,6 +218,7 @@ export async function qualifySavObservation(raw: unknown, actorEmail: string) {
             customerConfirmation: string[];
             sourceErrors: string[];
         }>(cycle.summaryCiphertext);
+        const humanQualificationRevision=randomUUID();
         let candidateId = cycle.candidateId;
         let pipeline: null | { ticketId: string; threadId: string; observationId: string; cycleId: string; evidenceOccurredAt: string; sourceRef: string; cycleStartedAt: Date; subject: string; resolution: string; evidenceRef: string; sourceHash: string; cycleSourceHash: string; customerConfirmed: boolean } = null;
         if (input.outcome === "resolved") {
@@ -246,12 +248,12 @@ export async function qualifySavObservation(raw: unknown, actorEmail: string) {
         else
             candidateId = null;
         if (candidateId !== cycle.candidateId) await invalidateObservationCandidates(tx, `sav-observation:${cycle.id}`, candidateId ?? undefined);
-        await tx.update(savObservationCycles).set({ candidateId, learningDisposition: null, qualification: input.outcome, qualifiedBy: actorEmail, qualifiedAt: new Date() }).where(eq(savObservationCycles.id, cycle.id));
+        await tx.update(savObservationCycles).set({ summaryCiphertext:encryptSavPayload({...summary,humanQualificationRevision}), candidateId, learningDisposition: null, qualification: input.outcome, qualifiedBy: actorEmail, qualifiedAt: new Date() }).where(eq(savObservationCycles.id, cycle.id));
         await tx.update(savResolutionObservations).set({ state: candidateId ? "candidate_ready" : "closed_to_analyze" }).where(eq(savResolutionObservations.id, observation.id));
         const qualificationEvent:ObservationEvent={sourceRef:`qualification:${cycle.id}`,kind:"human_qualification",occurredAt:new Date().toISOString(),text:`Résultat : ${input.outcome}\nJustification : ${input.justification}\nPreuve : ${input.evidenceRef || "aucune"}`,author:actorEmail,provenance:"Qualification explicite Studio Ugo",associationTicketId:observation.hubspotTicketId!,remoteUpdatedAt:null};
         await tx.insert(savObservationEvents).values({observationId:observation.id,sourceRef:qualificationEvent.sourceRef,contentHash:savContentHash({input,actorEmail}),kind:qualificationEvent.kind,occurredAt:new Date(qualificationEvent.occurredAt),payloadCiphertext:encryptSavPayload(qualificationEvent)}).onConflictDoNothing();
-        await tx.insert(auditLogs).values({ actorEmail, action: "sav_observation_qualified", entityType: "sav_observation_cycle", entityId: cycle.id, technicalMetadata: { sourceHash: cycle.sourceHash, outcome: input.outcome, candidateId } });
-        return { candidateId, pipeline };
+        await tx.insert(auditLogs).values({ actorEmail, action: "sav_observation_qualified", entityType: "sav_observation_cycle", entityId: cycle.id, technicalMetadata: { sourceHash: cycle.sourceHash, outcome: input.outcome, candidateId, humanQualificationRevision } });
+        return { candidateId, pipeline, humanQualificationRevision };
     });
     if (!result.pipeline) return { candidateId: result.candidateId };
     const evaluated = await processSavLearningResolution({
@@ -260,13 +262,13 @@ export async function qualifySavObservation(raw: unknown, actorEmail: string) {
         snapshotHash: result.pipeline.sourceHash, subject: result.pipeline.subject, resolution: result.pipeline.resolution,
         provenance: "human_resolution", sourceMessageId: result.pipeline.evidenceRef, evidenceRef: result.pipeline.evidenceRef,
         evidenceExcerpt: result.pipeline.resolution.slice(0, 240), customerConfirmed: result.pipeline.customerConfirmed,
-        cycleSourceHash: result.pipeline.cycleSourceHash, humanQualificationHash:savContentHash({input,actorEmail}),
+        cycleSourceHash: result.pipeline.cycleSourceHash, humanQualificationRevision:result.humanQualificationRevision,
     });
     const candidateId = evaluated && typeof evaluated === "object" && "candidateId" in evaluated && typeof evaluated.candidateId === "string" ? evaluated.candidateId : null;
     await db.transaction(async (tx) => {
         const [current] = await tx.select().from(savResolutionObservations).where(eq(savResolutionObservations.id, input.observationId)).for("update");
         const [cycle] = await tx.select().from(savObservationCycles).where(eq(savObservationCycles.id, input.cycleId));
-        if (!current?.closed || current.cycle !== cycle?.cycle || cycle?.sourceHash !== result.pipeline!.cycleSourceHash || cycle.qualification !== "resolved") return;
+        if (!current?.closed || current.cycle !== cycle?.cycle || cycle?.sourceHash !== result.pipeline!.cycleSourceHash || cycle.qualification !== "resolved" || decryptSavPayload<{humanQualificationRevision?:string}>(cycle.summaryCiphertext).humanQualificationRevision!==result.humanQualificationRevision) return;
         if(evaluated.disposition==="deferred"){await tx.update(savResolutionObservations).set({state:"waiting_budget"}).where(eq(savResolutionObservations.id,input.observationId));return;}
         const disposition = "reasonCode" in evaluated ? String(evaluated.reasonCode) : evaluated.disposition;
         await tx.update(savObservationCycles).set({ candidateId, learningDisposition: disposition }).where(eq(savObservationCycles.id, input.cycleId));

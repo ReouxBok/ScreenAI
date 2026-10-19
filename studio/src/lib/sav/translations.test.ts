@@ -46,3 +46,18 @@ it("preserves pending translation and resumes automatically after a monetary wai
  const tomorrow=new Date(Date.now()+86400000);vi.useFakeTimers({toFake:["Date"]});vi.setSystemTime(tomorrow);
  try{await reconcileSavTranslations(2,{apiKey:"synthetic",model:"gemini-3.6-flash",fetch:translatedFetch,now:tomorrow});expect(translatedFetch).toHaveBeenCalledTimes(1);expect((await getSavTranslations([messageId]))[messageId].status).toBe("complete");}finally{vi.useRealTimers();}
 });
+
+it("releases its own untranslated lease when dispatch crosses UTC midnight and resumes without a lost attempt",async()=>{
+ const reservedAt=new Date("2026-10-19T23:59:59Z"), dispatchedAt=new Date("2026-10-20T00:00:00Z");
+ await enqueueSavTranslation(messageId);
+ vi.useFakeTimers({toFake:["Date"]});vi.setSystemTime(dispatchedAt);
+ try{
+  await reconcileSavTranslations(2,{apiKey:"synthetic",model:"gemini-3.6-flash",fetch:translatedFetch,now:reservedAt});
+  expect(translatedFetch).not.toHaveBeenCalled();
+  const [pending]=await f.db.select().from(savMessageTranslations);
+  expect(pending).toMatchObject({status:"pending",errorCode:"SAV_DERIVED_RESERVATION_STALE",attempts:0,leaseToken:null,leaseUntil:null});
+  await reconcileSavTranslations(2,{apiKey:"synthetic",model:"gemini-3.6-flash",fetch:translatedFetch,now:dispatchedAt});
+  expect(translatedFetch).toHaveBeenCalledTimes(1);
+  expect((await getSavTranslations([messageId]))[messageId]).toMatchObject({status:"complete",errorCode:null});
+ }finally{vi.useRealTimers();}
+});
