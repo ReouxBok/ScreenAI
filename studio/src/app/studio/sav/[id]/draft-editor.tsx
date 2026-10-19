@@ -3,7 +3,7 @@ import { useEffect, useState } from "react";
 import { useFormStatus } from "react-dom";
 import { renderSavOutboundReply, savManualReplyMode } from "@/lib/sav/reply-format";
 import { reviewDraftAction, saveHumanDraftAction, sendSuggestedReplyAction } from "../actions";
-type Props={requiresHumanLanguage?:boolean;language?:"fr"|"en"|"unknown";recipient:string;threadId:string;messageId:string;decisionId:string;agentRunId:string;sourceHash:string;verdictId:string|null;
+type Props={requiresHumanLanguage?:boolean;language?:"fr"|"en"|"unknown";recipient:string;threadId:string;messageId:string;decisionId:string;agentRunId:string;sourceHash:string;feedbackSourceHash?:string;verdictId:string|null;
  original:string|null;current:{id:string;text:string;stale:boolean;status:string;origin:string}|null;currentDraftId:string|null;reason:string;reasons:string[];reasonLabels:Array<[string,string]>;
  sendAllowed:boolean;sendDisabledReason?:string|null;replyState?:string|null};
 function ConfirmSend({disabled}:{disabled:boolean}) {const {pending}=useFormStatus();return <button className="primary" disabled={disabled||pending}>{pending?"Envoi en cours…":"Confirmer l’envoi de cette réponse"}</button>;}
@@ -29,7 +29,7 @@ export function DraftEditor(p:Props) {
    <p>{p.replyState==="sent"?"Réponse déjà envoyée.":p.replyState==="uncertain"?"Résultat à vérifier dans Gmail avant toute reprise.":p.replyState==="pending"?"Envoi en attente. Aucun second envoi.":!p.sendAllowed?p.sendDisabledReason:"Ce bouton confirme le texte et le destinataire affichés. Aucun verdict préalable n’est requis."}</p>
   </form>
   <details><summary>Feedback facultatif sur la suggestion</summary><form action={reviewDraftAction}>
-   <input type="hidden" name="threadId" value={p.threadId}/><input type="hidden" name="messageId" value={p.messageId}/><input type="hidden" name="decisionId" value={p.decisionId}/><input type="hidden" name="agentRunId" value={p.agentRunId}/><input type="hidden" name="sourceHash" value={p.sourceHash}/><input type="hidden" name="verdictId" value={p.verdictId??""}/>
+   <input type="hidden" name="threadId" value={p.threadId}/><input type="hidden" name="messageId" value={p.messageId}/><input type="hidden" name="decisionId" value={p.decisionId}/><input type="hidden" name="agentRunId" value={p.agentRunId}/><input type="hidden" name="sourceHash" value={p.feedbackSourceHash??p.sourceHash}/><input type="hidden" name="verdictId" value={p.verdictId??""}/>
    <label>Commentaire<textarea name="reason" maxLength={500} defaultValue={p.reason}/></label><fieldset><legend>Retours sur la suggestion</legend>{p.reasonLabels.map(([value,label])=><label key={value}><input type="checkbox" name="reasons" value={value} defaultChecked={p.reasons.includes(value)}/>{label}</label>)}</fieldset>
    <button className="secondary" name="status" value="rejected" disabled={busy||dirty}>Signaler un problème dans la suggestion initiale</button>
   </form></details>

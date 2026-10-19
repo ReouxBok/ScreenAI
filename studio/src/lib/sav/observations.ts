@@ -193,6 +193,7 @@ export async function syncSavObservation(id: string, collect: (id: string) => Pr
 const qualification = z.object({ observationId: z.uuid(), cycleId: z.uuid(), sourceHash: z.string().length(43), outcome: z.enum(["resolved", "closed_without_resolution", "abandoned", "duplicate", "finance", "cancellation", "insufficient_sources"]), evidenceRef: z.string().max(300).default(""), evidenceHash: z.string().max(43).default(""), resolution: z.string().trim().max(10000).default(""), justification: z.string().trim().min(20).max(2000), customerConfirmationRef:z.string().max(300).default(""), unconfirmedAcknowledged: z.boolean().default(false) }).strict();
 export async function qualifySavObservation(raw: unknown, actorEmail: string) {
     assertKnowledgeUgoApproval(actorEmail);
+    if(isSavCaseLearningFrozen())throw new Error("SAV_CASE_LEARNING_FROZEN");
     const input = qualification.parse(raw);
     const db = requireDb();
     const result = await db.transaction(async (tx) => {

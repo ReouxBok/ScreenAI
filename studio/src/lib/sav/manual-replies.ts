@@ -24,6 +24,7 @@ export function assertSavManualReplyEnabled() {
 export async function queueSavManualReply(raw: unknown, actorEmail: string) {
   assertSavActor(actorEmail);
   assertSavManualReplyEnabled();
+  if(isSavCaseLearningFrozen())throw new Error("SAV_CASE_LEARNING_FROZEN");
   const input = requestSchema.parse(raw);
   return requireDb().transaction(tx => queueSavManualReplyTx(input,actorEmail,tx));
 }

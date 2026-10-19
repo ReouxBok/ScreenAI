@@ -55,7 +55,7 @@ export type SavLearningResolutionInput = {
   resolution: string; provenance: string; sourceMessageId: string | null; evidenceRef?: string; evidenceExcerpt?: string; evidenceOccurredAt?: string; customerConfirmed: boolean; productVersion?: string | null; cycleSourceHash?: string; observationId?: string; cycleId?: string;
 };
 export async function processSavLearningResolution(input: SavLearningResolutionInput, options: { now?: Date; apiKey?: string; model?: string; fetch?: typeof fetch } = {}) {
-  if(input.caseContext&&isSavCaseLearningFrozen())return {disposition:"frozen" as const};
+  if(isSavCaseLearningFrozen())return {disposition:"frozen" as const};
   const now = options.now ?? new Date(), origin = input.origin ?? "hubspot", sourceRef = input.sourceRef ?? ("hubspot:" + input.ticketId);
   const signal = async (reasonCode: string, sourceHash = input.snapshotHash) => {
     await recordSavLearningSignal({ sourceRef, sourceHash, origin, reasonCode, details: { policyRevision: SAV_LEARNING_POLICY_REVISION } }, now);
@@ -115,7 +115,7 @@ export async function processSavLearningResolution(input: SavLearningResolutionI
   const decision = comparison.decision;
   return await requireDb().transaction(async tx => {
     // Match source-writer order, then take the shared admission lock and fenced claim.
-    let sourceCurrent = !input.caseContext || !isSavCaseLearningFrozen();
+    let sourceCurrent = !isSavCaseLearningFrozen();
     sourceCurrent &&= origin !== "hubspot" || Boolean(input.ticketId && await isSavCrmLearningSourceCurrent({ ticketId: input.ticketId,
       snapshotId: input.snapshotId, snapshotHash: input.snapshotHash, cycleStartedAt: input.cycleStartedAt }, tx, true));
     if (input.observationId && input.cycleId) {

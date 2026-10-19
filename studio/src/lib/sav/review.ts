@@ -58,6 +58,7 @@ export async function getSavProposalReview(messageId: string) {
   const draftHash=savDraftSourceHash(draftBody?.origin === "human" ? {...proposal,replyDraft:draftBody.text} : proposal,message,knowledge?.revisionId);
   return { decisionId: decision.id, agentRunId: run.id, model: run.model, promptRevision: run.promptRevision, before, proposal,
     expectedReviewId: (review?.id ?? null) as string | null, draftHash,
+    ...({confirmationSourceHash:savDraftSourceHash(proposal,message,knowledge?.revisionId)} as {confirmationSourceHash?:string}),
     draftVerdict: draftVerdict ? { id:draftVerdict.id, status:draftVerdict.status, draftId:draftVerdict.draftId, stale:draftVerdict.sourceHash!==draftHash,reason:decryptSavPayload<{text:string}>(draftVerdict.reasonCiphertext).text,reasons:savStoredReviewReasons(decryptSavPayload<{reasons?:unknown}>(draftVerdict.reasonCiphertext).reasons),reviewedBy:draftVerdict.reviewedBy } : null,
     historicalReview: review && !matches ? {id:review.id,status:review.status,scope:review.reviewScope} : null,
     review: matches ? { id:review.id,scope:review.reviewScope,status:review.status,verdict:review.verdict,dimensions:review.dimensions,reviewedBy:review.reviewedBy,reviewedAt:review.reviewedAt,comment:decryptSavPayload<{text:string}>(review.commentCiphertext).text,reasons:savStoredReviewReasons(decryptSavPayload<{reasons?:unknown}>(review.commentCiphertext).reasons),reusability:review.reusability } : null };
