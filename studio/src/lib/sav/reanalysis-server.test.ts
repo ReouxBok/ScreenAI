@@ -57,7 +57,9 @@ describe("authenticated server reanalysis with the actual guarded executor", () 
   it("cannot overwrite an ordinary audit even with its exact ID, or escape via upsert", async () => {
     const [ordinary] = await fixture.db.insert(auditLogs).values({ actorEmail: "ugo@limova.ai", action: "human_review", entityType: "sav_message", entityId: randomUUID(), technicalMetadata: { protected: true } }).returning();
     const guarded = guardReanalysisDatabase(fixture.db);
-    await guarded.update(auditLogs).set({ technicalMetadata: {} }).where(eq(auditLogs.id, ordinary.id));
+    const terminal = guarded.update(auditLogs).set({ technicalMetadata: {} }).where(eq(auditLogs.id, ordinary.id));
+    expect("where" in terminal).toBe(false); expect("$dynamic" in terminal).toBe(false);
+    await terminal;
     expect((await fixture.db.select().from(auditLogs).where(eq(auditLogs.id, ordinary.id)))[0].technicalMetadata).toEqual({ protected: true });
     expect(() => guarded.insert(auditLogs).values({ id: ordinary.id, actorEmail: "ugo@limova.ai", action: "sav_reanalysis_claim", entityType: "sav_reanalysis_message", entityId: randomUUID() }).onConflictDoUpdate({ target: auditLogs.id, set: { technicalMetadata: {} } })).toThrow("AUDIT_REFUSED");
   });

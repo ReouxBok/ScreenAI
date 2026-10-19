@@ -28,7 +28,7 @@ export function guardReanalysisDatabase<T extends object>(db: T): T {
         if (Object.keys(input).some(name => name !== "technicalMetadata")) throw new Error("SAV_REANALYSIS_AUDIT_REFUSED");
         const query = Reflect.apply(Reflect.get(builder, "set"), builder, [input]) as { where(condition: SQL | undefined): unknown };
         // No executable builder escapes before a mandatory, server-owned filter.
-        return { where(condition: SQL) { return query.where(and(condition, eq(schema.auditLogs.actorEmail, "ugo@limova.ai"),
+        return { async where(condition: SQL) { return await query.where(and(condition, eq(schema.auditLogs.actorEmail, "ugo@limova.ai"),
           eq(schema.auditLogs.action, "sav_reanalysis_claim"), eq(schema.auditLogs.entityType, "sav_reanalysis_message"))); } };
       } };
       const protectInsert = (query: object): object => new Proxy(query, { get(value, property) {
