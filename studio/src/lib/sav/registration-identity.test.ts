@@ -12,6 +12,7 @@ describe("registration identity prerequisite", () => {
     expect(savRegistrationIdentityStatus({ ...absent, errorCode: "403" })).toBe("unavailable");
     expect(savRegistrationIdentityStatus({ ...absent, data: null })).toBe("unavailable");
     expect(savRegistrationIdentityStatus({ ...absent, data: { ...absent.data!, contactFound: true } })).toBe("unavailable");
+    expect(savRegistrationIdentityStatus({ status: "partial", errorCode: "SAV_HUBSPOT_TICKETS_UNAVAILABLE", data: { ...absent.data!, errorCode: "SAV_HUBSPOT_TICKETS_UNAVAILABLE" } })).toBe("not_found");
     expect(savRegistrationIdentityStatus({ status: "partial", errorCode: "tickets_unavailable", data: { ...absent.data!, contactFound: true, contactId: "42", errorCode: "tickets_unavailable" } })).toBe("identified");
   });
   it.each(["fr", "en"] as const)("builds a courteous %s clarification with every request and no product instruction", language => {

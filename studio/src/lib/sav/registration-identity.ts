@@ -13,7 +13,12 @@ export function savRegistrationPrerequisiteApplies(u: SavUnderstandingV1) {
 /** A contact lookup failure is never evidence that the customer does not exist. */
 export function savRegistrationIdentityStatus(crm: SavDossierContext["crm"]) {
   if (crm.data?.contactFound && crm.data.contactId) return "identified" as const;
-  return crm.status === "ready" && !crm.errorCode && crm.data && !crm.data.errorCode
+  // readSavHubspotContext awaits findContactByEmail BEFORE its tolerant ticket
+  // try/catch. This exact partial result still proves a completed contact read;
+  // a failed contact read instead yields crm.data=null in dossier-context.
+  const contactReadCompleted = crm.status === "ready" && !crm.errorCode && !crm.data?.errorCode
+    || crm.status === "partial" && crm.errorCode === "SAV_HUBSPOT_TICKETS_UNAVAILABLE" && crm.data?.errorCode === crm.errorCode;
+  return contactReadCompleted && crm.data
     && !crm.data.contactFound && !crm.data.contactId ? "not_found" as const : "unavailable" as const;
 }
 

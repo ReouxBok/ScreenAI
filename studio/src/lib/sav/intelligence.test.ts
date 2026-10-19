@@ -152,6 +152,14 @@ describe("SAV registration prerequisite before product composition", () => {
     expect(result.replyDraft).not.toMatch(/inscription/); expect(deps.crm).toHaveBeenCalledOnce();
     expect(result.ticketRouting).toMatchObject({ kind: "review", reason: "hubspot_context_unavailable" });
   });
+  it("asks for registration when contact lookup completed with no match even if the later ticket pipeline failed", async () => {
+    deps.understand.mockResolvedValue(understandingFixture());
+    deps.crm.mockResolvedValue({ ...absent, errorCode: "SAV_HUBSPOT_TICKETS_UNAVAILABLE" });
+    const result = await analyzeSavMessage(input, { evaluation: evaluation("off", vi.fn()) });
+    expect(result.proposal.reasonCode).toBe("registration_email_required");
+    expect(result.replyDraft).toContain("adresse email utilisée lors de votre inscription");
+    expect(result.ticketRouting?.kind).toBe("review");
+  });
   it("keeps the actual coherence guard on the server-owned clarification", async () => {
     deps.understand.mockResolvedValue(understandingFixture()); deps.crm.mockResolvedValue(absent);
     deps.coherence.mockImplementation((...args) => import("./reply-coherence").then(async () => {
