@@ -167,4 +167,19 @@ describe("candidate-only reanalysis executor", () => {
     } finally { release(); }
     expect((await first)[0].state).toBe("ready"); expect(generate).toHaveBeenCalledOnce();
   });
+  it.runIf(Boolean(process.env.SAV_TEST_POSTGRES_URL))("serializes separate batches on disjoint dossiers with a global durable claim", async () => {
+    const m = await plan([await seed()]), other = await plan([await seed()]);
+    let release!: () => void, entered!: () => void;
+    const started = new Promise<void>(resolve => { entered = resolve; });
+    const hold = new Promise<void>(resolve => { release = resolve; });
+    const firstGenerate = vi.fn(async () => { entered(); await hold; return generated(); });
+    const secondGenerate = vi.fn(async () => generated());
+    const first = executeReanalysis(m, approval(m), m.target, firstGenerate);
+    await started;
+    try {
+      expect((await executeReanalysis(other, approval(other), other.target, secondGenerate))[0].state).toBe("uncertain");
+      expect(secondGenerate).not.toHaveBeenCalled();
+    } finally { release(); }
+    expect((await first)[0].state).toBe("ready");
+  });
 });

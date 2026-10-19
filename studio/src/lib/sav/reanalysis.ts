@@ -99,11 +99,15 @@ export async function cancelReanalysis(batchId: string) {
 async function claimItem(item: ReanalysisItem, manifest: ReanalysisManifest) {
   const id = reanalysisClaimId(item, manifest.target);
   return requireDb().transaction(async tx => {
+    // Serialize claim admission across operator processes, including disjoint
+    // dossiers. The durable running claim outlives this short SQL lock.
+    await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended('sav_reanalysis_executor_v1', 0))`);
+    const [active] = await tx.select({ id: auditLogs.id }).from(auditLogs).where(and(eq(auditLogs.action, claimAction),
+      sql`${auditLogs.technicalMetadata}->>'state' = 'running'`)).limit(1);
+    if (active) return "uncertain" as const;
     await tx.select({ id: savThreads.id }).from(savThreads).where(eq(savThreads.id, item.threadId)).for("update");
     if (await isCancelled(manifest.batchId, tx) || await readReanalysisBaseline(item.threadId, tx) !== item.baselineHash
       || await reanalysisResourcesHash(tx) !== manifest.target.resourcesHash) return "stale" as const;
-    const claims = await tx.select().from(auditLogs).where(and(eq(auditLogs.action, claimAction), eq(auditLogs.entityId, item.messageId)));
-    if (claims.some(c => c.technicalMetadata.state === "running")) return "uncertain" as const;
     const [inserted] = await tx.insert(auditLogs).values({ id, actorEmail: "ugo@limova.ai", action: claimAction, entityType: "sav_reanalysis_message", entityId: item.messageId,
       technicalMetadata: { version: 1, batchId: manifest.batchId, manifestHash: reanalysisHash(manifest), state: "running", baselineHash: item.baselineHash, codeRevision: manifest.target.codeRevision } })
       .onConflictDoNothing().returning({ id: auditLogs.id });

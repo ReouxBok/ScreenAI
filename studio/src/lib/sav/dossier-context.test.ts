@@ -47,6 +47,9 @@ beforeEach(async () => {
 describe("persisted dossier enrichment", () => {
   it("can collect CRM notes and history without persisting enrichment or mutating the dossier", async () => {
     const message = await seed();
+    // Real PostgreSQL stores microseconds; this must not round the anchor down
+    // through JS Date and lose the current message from its own history.
+    await fixture.client.query("update sav.messages set created_at = '2026-10-06 12:00:00.123456+00' where id=$1", [message.id]);
     const before = await fixture.db.select().from(savMessages);
     const context = await collectSavDossierContext(message.id, { persist: false });
     expect(context.crm.status).toBe("ready");
