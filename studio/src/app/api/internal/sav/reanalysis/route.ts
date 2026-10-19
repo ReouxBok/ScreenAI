@@ -31,7 +31,7 @@ try{const value=JSON.parse(document.getElementById('request').value),inputs=Arra
 for(const input of inputs){status.textContent='Opération '+(receipts.length+1)+' / '+inputs.length+' en cours';
 const response=await fetch('/api/internal/sav/reanalysis',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(input)});
 const result=await response.json();receipts.push({status:response.status,result});output.textContent=JSON.stringify(receipts,null,2);
-if(!response.ok||result.results?.some(item=>item.state!=='ready'&&item.state!=='already_claimed')){status.textContent='Arrêt : résultat à examiner. Ne pas relancer automatiquement.';return;}}
+if(!response.ok||result.results?.some(item=>item.state!=='ready')){status.textContent='Arrêt : résultat à examiner. Ne pas relancer automatiquement.';return;}}
 status.textContent='Terminé. Examiner les reçus et comparer avant de poursuivre.';
 }catch{status.textContent='Interruption ou requête invalide. Rapprocher les reçus avant toute reprise, sans relance automatique.';}
 finally{button.disabled=false;}});

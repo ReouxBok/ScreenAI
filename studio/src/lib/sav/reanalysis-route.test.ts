@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { GET, POST } from "@/app/api/internal/sav/reanalysis/route";
+import { runInNewContext } from "node:vm";
 const state = vi.hoisted(() => ({ current: vi.fn(), db: vi.fn(), run: vi.fn() }));
 vi.mock("@clerk/nextjs/server", () => ({ currentUser: state.current }));
 vi.mock("./reanalysis-database", () => ({ withReanalysisDatabase: state.db }));
@@ -14,6 +15,16 @@ function request(body: unknown = { op: "capabilities" }, origin = "https://studi
   return new Request("https://studio.limova.ai/api/internal/sav/reanalysis", { method: "POST", headers: { origin, "content-type": "application/json" }, body: JSON.stringify(body) });
 }
 describe("internal reanalysis route", () => {
+  it.each(["already_claimed", "failed", "degraded", "stale", "cancelled", "uncertain"])("stops the operator list after %s without a second POST", async resultState => {
+    const body = await (await GET()).text(), script = body.match(/<script[^>]*>([\s\S]*?)<\/script>/)![1];
+    let clicked!: () => Promise<void>;
+    const nodes: Record<string, object> = { run: { disabled: false, addEventListener: (_name: string, listener: () => Promise<void>) => { clicked = listener; } }, status: { textContent: "" }, result: { textContent: "" }, request: { value: JSON.stringify([{ op: "execute" }, { op: "execute" }]) } };
+    const fetch = vi.fn(async () => ({ ok: true, status: 200, json: async () => ({ results: [{ state: resultState }] }) }));
+    runInNewContext(script, { document: { getElementById: (id: string) => nodes[id] }, fetch });
+    await clicked(); expect(fetch).toHaveBeenCalledOnce();
+    expect(nodes.status).toMatchObject({ textContent: "Arrêt : résultat à examiner. Ne pas relancer automatiquement." });
+    expect(nodes.run).toMatchObject({ disabled: false });
+  });
   it("serves a session-only operator surface without database access or exported credentials", async () => {
     state.current.mockResolvedValueOnce(null);
     expect((await GET()).status).toBe(403);
