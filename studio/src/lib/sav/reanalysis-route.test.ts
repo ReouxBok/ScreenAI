@@ -15,7 +15,7 @@ function request(body: unknown = { op: "capabilities" }, origin = "https://studi
   return new Request("https://studio.limova.ai/api/internal/sav/reanalysis", { method: "POST", headers: { origin, "content-type": "application/json" }, body: JSON.stringify(body) });
 }
 describe("internal reanalysis route", () => {
-  it.each([[], undefined, [{ state: "ready" }, { state: "ready" }]])("stops after a missing, empty or oversized execute receipt: %j", async results => {
+  it.each([{ results: [] }, { results: undefined }, { results: [{ state: "ready" }, { state: "ready" }] }])("stops after a missing, empty or oversized execute receipt: %j", async ({ results }) => {
     const body = await (await GET()).text(), script = body.match(/<script[^>]*>([\s\S]*?)<\/script>/)![1];
     let clicked!: () => Promise<void>;
     const nodes: Record<string, object> = { run: { disabled: false, addEventListener: (_name: string, listener: () => Promise<void>) => { clicked = listener; } }, status: { textContent: "" }, result: { textContent: "" }, request: { value: JSON.stringify([{ op: "execute" }, { op: "execute" }]) } };
