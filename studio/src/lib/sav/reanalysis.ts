@@ -11,6 +11,7 @@ import { withSavAiBudget } from "./gemini-transport";
 import { savStructuredProposalSchema } from "./proposal";
 import { SAV_UNDERSTANDING_PROMPT_REVISION } from "./understanding";
 import { hasUnsettledSavHumanAction } from "./external-completion";
+import { assertSavReanalysisAdmission, hasSavReanalysisAuthority } from "./reanalysis-authority";
 import { assertReanalysisApproval, reanalysisClaimId, reanalysisHash, reanalysisItemSchema, reanalysisManifestSchema,
   type ReanalysisApproval, type ReanalysisItem, type ReanalysisManifest, type ReanalysisTarget } from "./reanalysis-contract";
 
@@ -102,6 +103,7 @@ async function claimItem(item: ReanalysisItem, manifest: ReanalysisManifest) {
     // Serialize claim admission across operator processes, including disjoint
     // dossiers. The durable running claim outlives this short SQL lock.
     await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended('sav_reanalysis_executor_v1', 0))`);
+    await assertSavReanalysisAdmission(tx as unknown as ReturnType<typeof requireDb>, manifest.target);
     const [active] = await tx.select({ id: auditLogs.id }).from(auditLogs).where(and(eq(auditLogs.action, claimAction),
       sql`${auditLogs.technicalMetadata}->>'state' = 'running'`)).limit(1);
     if (active) return "uncertain" as const;
@@ -128,7 +130,7 @@ export async function generateReanalysisCandidate(item: ReanalysisItem): Promise
 
 export async function executeReanalysis(manifest: ReanalysisManifest, approval: ReanalysisApproval, target: ReanalysisTarget,
   generate: (item: ReanalysisItem) => Promise<SavAnalysis> = generateReanalysisCandidate) {
-  if (process.env.SAV_REANALYSIS_EXECUTION_ENABLED !== "true") throw new Error("SAV_REANALYSIS_EXECUTION_DISABLED");
+  if (process.env.SAV_REANALYSIS_EXECUTION_ENABLED !== "true" && !hasSavReanalysisAuthority(target)) throw new Error("SAV_REANALYSIS_EXECUTION_DISABLED");
   assertReanalysisApproval(manifest, approval, target);
   if (approval.stage === "continuation") {
     const previous = await requireDb().select().from(auditLogs).where(and(eq(auditLogs.action, claimAction),
