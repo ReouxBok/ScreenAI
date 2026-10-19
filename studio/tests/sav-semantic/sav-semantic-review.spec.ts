@@ -4,7 +4,7 @@ import { SAV_REGISTRATION_E2E_THREAD, SAV_SEMANTIC_E2E_DRAFT, SAV_SEMANTIC_E2E_T
 
 test("SAV79 requests identity without suggesting a ticket and preserves dossier/draft review", async ({ page, baseURL }, testInfo) => {
   const externalRequests: string[] = [];
-  page.route("**/*", route => {
+  await page.route("**/*", route => {
     if (new URL(route.request().url()).origin !== baseURL) { externalRequests.push(route.request().url()); return route.abort(); }
     return route.continue();
   });

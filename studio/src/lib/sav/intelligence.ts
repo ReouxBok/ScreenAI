@@ -570,7 +570,9 @@ async function analyzeSavMessageWithinBudget(input: SavEnrichedInput, context: S
             : "Recherche HubSpot non vérifiée : ne pas conclure à l’absence de client. Rétablir la lecture avant toute proposition d’action sur le compte.", confidence: 0, requiresHumanApproval: true },
         evidence: [{ sourceType: "rule", sourceId: SAV_REGISTRATION_IDENTITY_REVISION, title: "Identité du compte avant action" }],
         replyDraft: reply.replyDraft, internalNote: null, replyAssessment: { kind: "contextualized", coverage: reply.coverage, errorCode: null } };
-      analysis.agentRunId = (await recordAgentRun({ context, source: enriched, analysis, runtime: "semantic_policy", mode: context.evaluation?.mode ?? savHarnessMode(), status: "succeeded", model: analysis.model, promptRevision: SAV_REGISTRATION_IDENTITY_REVISION })) ?? undefined;
+      analysis.agentRunId = (await recordAgentRun({ context, source: enriched, analysis, runtime: "semantic_policy", mode: context.evaluation?.mode ?? savHarnessMode(),
+        status: state === "unavailable" ? "fallback" : "succeeded", errorCode: state === "unavailable" ? "SAV_REGISTRATION_LOOKUP_UNAVAILABLE" : undefined,
+        model: analysis.model, promptRevision: SAV_REGISTRATION_IDENTITY_REVISION })) ?? undefined;
     }
     else if (plan.replyPolicy === "compose") analysis = await analyzeSavMessageRaw(enriched, context);
     else {
