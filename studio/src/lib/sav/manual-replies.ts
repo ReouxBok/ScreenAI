@@ -13,6 +13,8 @@ import { savDraftSourceHash, savReplyForbidden } from "./review-contract";
 import { savReplyLanguage } from "./reply-language";
 import { renderSavOutboundReply, SAV_REPLY_FORMAT_REVISION, savManualReplyMode } from "./reply-format";
 
+import { normalizeSavConfirmationText, SAV_REPLY_CONFIRMATION_TEXT_REVISION } from "./reply-confirmation-text";
+
 const requestSchema = z.object({ threadId: z.uuid(), draftId: z.uuid() }).strict();
 
 export function assertSavManualReplyEnabled() {
@@ -62,7 +64,7 @@ async function queueSavManualReplyTx(input:z.infer<typeof requestSchema>,actorEm
 }
 
 const confirmationSchema = z.object({ threadId:z.uuid(),messageId:z.uuid(),decisionId:z.uuid(),agentRunId:z.uuid(),sourceHash:z.string().length(43),
-  expectedDraftId:z.uuid().nullable(),text:z.string().trim().min(1).max(10000),recipient:z.email(),outboundHash:z.string().length(43),origin:z.enum(["ai","human"]) }).strict();
+  expectedDraftId:z.uuid().nullable(),text:z.string().transform(normalizeSavConfirmationText).pipe(z.string().trim().min(1).max(10000)),recipient:z.email(),outboundHash:z.string().length(43),origin:z.enum(["ai","human"]) }).strict();
 /** Exact displayed text and recipient become a version and a send authorization in
  * the same transaction. Neither a dossier review nor copying a suggestion sends. */
 export async function confirmSavSuggestedReply(raw:unknown,actorEmail:string) {
@@ -78,7 +80,7 @@ export async function confirmSavSuggestedReply(raw:unknown,actorEmail:string) {
     if (!eligible || !context.message.gmailMessageId) throw new Error("SAV_MESSAGE_BEFORE_CUTOVER");
     const [translation]=await tx.select({language:savMessageTranslations.language}).from(savMessageTranslations).where(and(eq(savMessageTranslations.messageId,input.messageId),eq(savMessageTranslations.sourceHash,savContentHash(decryptSavPayload<{text:string}>(context.message.bodyCiphertext).text)),eq(savMessageTranslations.translatorRevision,SAV_TRANSLATOR_REVISION)));
     if (input.origin==="ai" && translation && !["fr","en","unknown"].includes(translation.language)) throw new Error("SAV_REPLY_LANGUAGE_HUMAN_REQUIRED");
-    if (input.origin==="ai" && input.text!==context.proposal.replyDraft?.trim()) throw new Error("SAV_REPLY_MANUAL_OUTBOUND_CHANGED");
+    if (input.origin==="ai" && input.text!==normalizeSavConfirmationText(context.proposal.replyDraft??"").trim()) throw new Error("SAV_REPLY_MANUAL_OUTBOUND_CHANGED");
     const outbound=renderSavOutboundReply(input.text,savReplyLanguage(context.proposal,decryptSavPayload<{text:string}>(context.message.bodyCiphertext).text),savManualReplyMode(input.origin));
     if(savContentHash(outbound)!==input.outboundHash) throw new Error("SAV_REPLY_MANUAL_OUTBOUND_CHANGED");
     const [existing]=await tx.select().from(savActions).where(eq(savActions.idempotencyKey,`gmail:manual-reply:${input.messageId}`));
@@ -89,7 +91,7 @@ export async function confirmSavSuggestedReply(raw:unknown,actorEmail:string) {
     if((current?.id??null)!==input.expectedDraftId) throw new Error("SAV_DRAFT_VERSION_CHANGED");
     const [{revision}]=await tx.select({revision:max(savReplyDrafts.revision)}).from(savReplyDrafts).where(eq(savReplyDrafts.threadId,thread.id));
     if(current) await tx.update(savReplyDrafts).set({isCurrent:false}).where(eq(savReplyDrafts.id,current.id));
-    const [draft]=await tx.insert(savReplyDrafts).values({threadId:thread.id,messageId:input.messageId,decisionId:context.decision.id,agentRunId:context.run.id,reviewId:context.review?.id??null,knowledgeRevision:context.knowledgeRevision,revision:(revision??0)+1,status:"send_confirmed",sourceHash:savDraftSourceHash({...context.proposal,replyDraft:input.text},context.message,context.knowledgeRevision),bodyCiphertext:encryptSavPayload({text:input.text,origin:input.origin}),createdBy:actorEmail}).returning();
+    const [draft]=await tx.insert(savReplyDrafts).values({threadId:thread.id,messageId:input.messageId,decisionId:context.decision.id,agentRunId:context.run.id,reviewId:context.review?.id??null,knowledgeRevision:context.knowledgeRevision,revision:(revision??0)+1,status:"send_confirmed",sourceHash:input.origin==="ai"?context.sourceHash:savDraftSourceHash({...context.proposal,replyDraft:input.text},context.message,context.knowledgeRevision),bodyCiphertext:encryptSavPayload({text:input.text,origin:input.origin,confirmationTextRevision:SAV_REPLY_CONFIRMATION_TEXT_REVISION}),createdBy:actorEmail}).returning();
     const action=await queueSavManualReplyTx({threadId:thread.id,draftId:draft.id},actorEmail,tx,{hash:confirmationHash,recipient:input.recipient});
     await tx.update(savActions).set({payload:{...action.payload,confirmationHash,confirmedRecipient:input.recipient,confirmedAt:new Date().toISOString()}}).where(eq(savActions.id,action.id));
     return {...action,payload:{...action.payload,confirmationHash}};
