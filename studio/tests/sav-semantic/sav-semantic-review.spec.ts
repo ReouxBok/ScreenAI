@@ -10,7 +10,7 @@ test("SAV79 requests identity without suggesting a ticket and preserves dossier/
   });
   await page.goto(`/studio/sav/${SAV_REGISTRATION_E2E_THREAD}`);
   const form = page.getByRole("form", { name: "Proposition de l’IA", exact: true });
-  const draft = page.getByRole("region", { name: "Verdict du brouillon", exact: true });
+  const draft = page.locator("#sav-draft");
   await expect(form).toContainText("Identifier le compte avant toute action");
   await expect(form.locator('input[name="humanAction"]')).toHaveCount(0);
   await expect(form.locator('input[name="humanProcess"]')).toHaveCount(0);
@@ -60,7 +60,7 @@ test("SAV44 exposes understanding and persists independent dossier/draft feedbac
   const reviewForm = page.getByRole("form", { name: "Proposition de l’IA", exact: true });
   const openUnderstanding = () => page.locator("#sav-findings summary").filter({ hasText: "Compréhension initiale de l’IA" }).click();
   await openUnderstanding();
-  const draft = page.getByRole("region", { name: "Verdict du brouillon", exact: true });
+  const draft = page.locator("#sav-draft");
   await expect(understanding).toContainText("L’export du document échoue malgré une nouvelle tentative.");
   await expect(understanding).toContainText("Le document est au format PDF.");
   await expect(understanding).toContainText("Le client a déjà relancé l’export.");
@@ -68,14 +68,13 @@ test("SAV44 exposes understanding and persists independent dossier/draft feedbac
   await expect(understanding).toContainText("Une pièce jointe n’a pas été lue.");
   await understanding.getByText("Éléments retenus dans les sources", { exact: true }).click();
   await expect(understanding.getByRole("blockquote")).toContainText("L’export PDF échoue encore après une nouvelle tentative.");
-  await expect(draft.locator("pre").first()).toHaveText(SAV_SEMANTIC_E2E_DRAFT);
+  await expect(draft.getByRole("textbox",{name:"Suggestion de réponse",exact:true})).toHaveValue(SAV_SEMANTIC_E2E_DRAFT);
   await expect(page.locator('textarea[name="replyDraft"]')).toHaveCount(0);
   await expect(page.getByRole("button", { name: "Préparer l’aperçu de l’action", exact: true })).toBeDisabled();
 
   const ticketTitle = reviewForm.getByRole("textbox", { name: "Titre (4 à 6 mots)", exact: true });
   await expect(ticketTitle).toHaveValue("Échec export PDF fictif");
-  const preview = draft.locator("details").filter({has: page.getByText("Aperçu de l’email après validation", {exact:true})});
-  await preview.locator("summary").click();
+  const preview = draft.locator("form").filter({has:page.getByRole("button",{name:"Confirmer l’envoi de cette réponse",exact:true})});
   await expect(preview.locator("pre")).toContainText("L’équipe Limova");
   await expect(preview.locator("pre")).toContainText("validée par notre équipe");
   await expect(preview.locator("pre")).not.toContainText("envoyée automatiquement");
@@ -102,11 +101,13 @@ test("SAV44 exposes understanding and persists independent dossier/draft feedbac
     }
   }
   const reason = "Recette synthétique : le brouillon doit être repris par un humain.";
-  await draft.getByRole("textbox", { name: "Motif du refus (facultatif)", exact: true }).fill(reason);
+  await draft.getByText("Feedback facultatif sur la suggestion",{exact:true}).click();
+  await draft.getByRole("textbox", { name: "Commentaire", exact: true }).fill(reason);
   await draft.getByRole("checkbox", { name: "Réponse hors sujet", exact: true }).check();
-  await submitServerAction(page, draft.getByRole("button", { name: "Refuser le brouillon", exact: true }));
+  await submitServerAction(page, draft.getByRole("button", { name: "Signaler un problème dans la suggestion initiale", exact: true }));
   await page.waitForURL(/review=draft_reviewed/, { timeout: 30_000 });
-  await expect(draft.getByText("Brouillon refusé · traitement humain à observer.", { exact: true })).toBeVisible();
+  await expect(draft).toContainText("Le dossier est suivi sans verdict de brouillon");
+  await expect(draft.getByRole("button",{name:"Accepter cette version",exact:true})).toHaveCount(0);
 
   await dossier.getByText("Évaluer la proposition de l’IA · facultatif", { exact: false }).click();
   await dossier.getByRole("checkbox", { name: "Connaissance manquante", exact: true }).check();
@@ -132,29 +133,30 @@ test("SAV44 exposes understanding and persists independent dossier/draft feedbac
   await page.waitForURL(/context=failed/, { timeout: 30_000 });
   await expect(page.getByText("Le contexte HubSpot est indisponible ou incomplet. Actualisez-le avant de choisir une action.", { exact: true })).toBeVisible();
   await expect(dossier).toContainText("Dossier · validé par ugo@limova.ai");
-  await expect(draft).toContainText("Contexte ou texte modifié : nouvelle lecture nécessaire.");
-  await expect(draft.getByRole("button", { name: "Accepter cette version", exact: true })).toBeEnabled();
+  await expect(draft).toContainText("Suggestion disponible");
+  await expect(draft.getByRole("button", { name: "Accepter cette version", exact: true })).toHaveCount(0);
   await expect(page.getByRole("button", { name: "Préparer l’aperçu de l’action", exact: true })).toBeDisabled();
-  await expect(draft.getByRole("button", { name: "Envoyer la réponse acceptée", exact: true })).toBeDisabled();
+  await expect(draft.getByRole("button", { name: "Confirmer l’envoi de cette réponse", exact: true })).toBeDisabled();
 
   await page.reload();
   await expect(page.getByRole("checkbox", { name: "J’ai vérifié le compte du demandeur", exact: true })).toBeChecked();
   await expect(page.getByRole("textbox", { name: "Email d’inscription vérifié", exact: true })).toHaveValue("fixture@example.invalid");
   await expect(dossier).toContainText("Dossier · validé par ugo@limova.ai");
-  await expect(draft).toContainText("Contexte ou texte modifié : nouvelle lecture nécessaire.");
-  await expect(draft.getByRole("button", { name: "Accepter cette version", exact: true })).toBeEnabled();
-  await expect(draft.getByRole("textbox", { name: "Motif du refus (facultatif)", exact: true })).toHaveValue(reason);
+  await expect(draft).toContainText("Suggestion disponible");
+  await expect(draft.getByRole("button", { name: "Accepter cette version", exact: true })).toHaveCount(0);
+  await draft.getByText("Feedback facultatif sur la suggestion",{exact:true}).click();
+  await expect(draft.getByRole("textbox", { name: "Commentaire", exact: true })).toHaveValue(reason);
   await expect(draft.getByRole("checkbox", { name: "Réponse hors sujet", exact: true })).toBeChecked();
   await dossier.getByText("Évaluer la proposition de l’IA · facultatif", { exact: false }).click();
   await expect(dossier.getByRole("checkbox", { name: "Connaissance manquante", exact: true })).toBeChecked();
   await expect(dossier.getByRole("combobox", { name: "Verdict global", exact: true })).toHaveValue("partial");
   await expect(dossier.getByRole("combobox", { name: "Fiabilité", exact: true })).toHaveValue("partial");
-  await expect(draft.locator("pre").first()).toHaveText(SAV_SEMANTIC_E2E_DRAFT);
+  await expect(draft.getByRole("textbox",{name:"Suggestion de réponse",exact:true})).toHaveValue(SAV_SEMANTIC_E2E_DRAFT);
   await openUnderstanding();
   await expect(understanding).toContainText("L’export du document échoue malgré une nouvelle tentative.");
   await expect(page.getByText("Aucun ticket lié à ce dossier.", { exact: true })).toBeVisible();
   await expect(page.getByRole("button", { name: "Préparer l’aperçu de l’action", exact: true })).toBeDisabled();
-  await expect(draft.getByRole("button", { name: "Envoyer la réponse acceptée", exact: true })).toBeDisabled();
+  await expect(draft.getByRole("button", { name: "Confirmer l’envoi de cette réponse", exact: true })).toBeDisabled();
   expect(externalRequests).toEqual([]); expect(browserErrors).toEqual([]);
   await page.screenshot({ path: testInfo.outputPath("sav44-independent-semantic-review.png"), fullPage: true });
   await page.setViewportSize({ width: 390, height: 844 });

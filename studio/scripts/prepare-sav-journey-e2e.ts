@@ -5,8 +5,8 @@ import { PGlite } from "@electric-sql/pglite";
 import { vector } from "@electric-sql/pglite-pgvector";
 import { drizzle } from "drizzle-orm/pglite";
 import { savAgentRuns, savDecisions, savMailboxes, savMessages, savMessageTranslations, savReplyDrafts, savSyncState, savThreads } from "../src/db/schema";
-import { savSemanticE2eProposal, SAV_SEMANTIC_E2E_BODY } from "../test/sav-semantic-e2e-fixture";
-import { JOURNEY_KEY, JOURNEY_CASES, journeyId } from "../test/sav-journey-fixture";
+import { savRegistrationE2eProposal, savSemanticE2eProposal, SAV_SEMANTIC_E2E_BODY } from "../test/sav-semantic-e2e-fixture";
+import { JOURNEY_KEY, JOURNEY_CASES, REGISTRATION_JOURNEY_ID, journeyId } from "../test/sav-journey-fixture";
 const target = path.resolve(".e2e-journey-db");
 if (process.env.NODE_ENV === "production" || process.env.DATABASE_URL !== `pglite://${target}` || process.env.SAV_ENCRYPTION_KEY_V1 !== JOURNEY_KEY) throw new Error("JOURNEY_SYNTHETIC_TARGET_REQUIRED");
 function encrypted(value: unknown) {
@@ -39,6 +39,14 @@ try {
     const [decision]=await db.insert(savDecisions).values({ messageId, agentRunId: run.id, kind: "human_review_required", reasonCode: proposal.decision.reasonCode, explanation: proposal.decision.explanation, confidence: 0 }).returning();
     if(key==="link")await db.insert(savReplyDrafts).values({threadId,messageId,decisionId:decision.id,agentRunId:run.id,knowledgeRevision:"stale-synthetic-revision",revision:1,status:"draft",sourceHash:"x".repeat(43),bodyCiphertext:encrypted({text:"Ancienne version humaine périmée.",origin:"human"}),createdBy:"ugo@limova.ai"});
   }
+  const registrationEmail="journey-registration@example.invalid",receivedAt="2026-10-02T12:00:00Z",messageId=randomUUID(),proposal=savRegistrationE2eProposal("en"),inboundText="Hello, my PDF export fails with ERR_42. Please help.";
+  remote.cases.registration={email:registrationEmail,contactId:null,ticketId:null,receivedAt,fault:null};
+  const context={version:1,messageId,collectedAt:receivedAt,customerIdentity:{kind:"sender",email:registrationEmail},crm:{status:"ready",errorCode:null,data:{errorCode:null,contactFound:false,identityCandidates:[],tickets:[],routing:{kind:"new",reason:"no_contact",candidateIds:[]}}},conversation:null,conversationError:null,otherConversations:[],otherConversationsError:null};
+  await db.insert(savThreads).values({id:REGISTRATION_JOURNEY_ID,mailboxId:mailbox.id,gmailThreadId:"journey-registration",subject:"Registration before account action",customerEmail:registrationEmail,lastMessageAt:new Date(receivedAt)});
+  await db.insert(savMessages).values({id:messageId,mailboxId:mailbox.id,threadId:REGISTRATION_JOURNEY_ID,gmailMessageId:"journey-message-registration",direction:"inbound",fromEmail:registrationEmail,toEmails:[mailbox.email],subject:"Registration before account action",bodyCiphertext:encrypted({text:inboundText,headers:{"message-id":"<journey-registration@example.invalid>"},supportContext:context}),receivedAt:new Date(receivedAt),analysisStatus:"done",processedAt:new Date(receivedAt)});
+  await db.insert(savMessageTranslations).values({messageId,sourceHash:createHash("sha256").update(JSON.stringify(inboundText)).digest("base64url"),translatorRevision:"sav-fr-translation.v1",language:"en",status:"complete",payloadCiphertext:encrypted({text:"Bonjour, mon export PDF échoue avec ERR_42. Merci de m’aider."})});
+  const [run]=await db.insert(savAgentRuns).values({messageId,runtime:"synthetic_fixture",mode:"off",status:"succeeded",model:"synthetic-only",promptRevision:"sav-registration-identity-2026-10-19.v1",dataOrigin:"test",inputHash:"fixture",proposalCiphertext:encrypted(proposal),completedAt:new Date(receivedAt)}).returning();
+  await db.insert(savDecisions).values({messageId,agentRunId:run.id,kind:"human_review_required",reasonCode:proposal.decision.reasonCode,explanation:proposal.decision.explanation,confidence:0});
   writeFileSync(path.resolve(".e2e-journey-provider.json"), JSON.stringify(remote));
   writeFileSync(path.resolve(".e2e-journey-blocked.log"), "");
 } finally { await client.close(); }
