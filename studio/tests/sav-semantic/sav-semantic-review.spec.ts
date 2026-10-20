@@ -135,7 +135,7 @@ test("SAV44 exposes understanding and persists independent dossier/draft feedbac
   await page.waitForURL(/review=saved/, { timeout: 30_000 });
   // This harness has no CRM credentials. The fresh context read must fail;
   // a cached ready snapshot before that asynchronous result is not readiness.
-  await page.waitForURL(/context=failed/, { timeout: 30_000 });
+  await expect(page.getByText("Contexte non confirmé. Utilisez Actualiser le contexte client pour reprendre.", { exact: true })).toBeVisible({ timeout: 30_000 });
   await expect(page.getByText("Le contexte HubSpot est indisponible ou incomplet. Actualisez-le avant de choisir une action.", { exact: true })).toBeVisible();
   await expect(dossier).toContainText("Dossier · validé par ugo@limova.ai");
   await expect(draft).toContainText("Suggestion disponible");

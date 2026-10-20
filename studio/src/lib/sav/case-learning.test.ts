@@ -24,8 +24,11 @@ vi.mock("./learning-comparator",async importOriginal=>({...await importOriginal<
 let f:Awaited<ReturnType<typeof createSavTestDb>>,threadId:string,messageId:string,runId:string,decisionId:string;
 const baselineAt=new Date("2026-10-19T12:00:00Z"),now=new Date("2026-10-19T16:00:00Z"),actor="ugo@limova.ai",proposal=v0Proposal("Veuillez ouvrir Réglages puis vérifier votre configuration.");
 const noNetwork=vi.fn(()=>{throw new Error("UNEXPECTED_REAL_NETWORK");});
-beforeAll(async()=>{f=await createSavTestDb();state.db=f.db;},30000);afterAll(async()=>f.client.close());afterEach(()=>{vi.restoreAllMocks();vi.unstubAllEnvs();vi.unstubAllGlobals();});
+beforeAll(async()=>{f=await createSavTestDb();state.db=f.db;},30000);afterAll(async()=>f.client.close());afterEach(()=>{vi.restoreAllMocks();vi.unstubAllEnvs();vi.unstubAllGlobals();vi.useRealTimers();});
 beforeEach(async()=>{
+ // Reservations and their real dispatch guard must share the fixture day.
+ // Keep timers real for database/network cancellation and concurrent workers.
+ vi.useFakeTimers({toFake:["Date"]});vi.setSystemTime(now);
  vi.stubEnv("SAV_ENCRYPTION_KEY_V1","synthetic-sav86-encryption-key-only-32-characters");vi.stubEnv("SAV_RELEASE_STAGE","v0");vi.stubEnv("SAV_AUTOMATION_MODE","assist");vi.stubEnv("SAV_WRITES_DISABLED","false");vi.stubGlobal("fetch",noNetwork);state.calls=0;state.beforeReturn=null;noNetwork.mockClear();
  await f.client.exec("TRUNCATE content_items CASCADE; TRUNCATE sav.mailboxes CASCADE; TRUNCATE sav.sync_state; TRUNCATE sav.learning_candidates CASCADE; TRUNCATE audit_logs; TRUNCATE active_knowledge; TRUNCATE sav.ticket_snapshots CASCADE; TRUNCATE sav.learning_admission_attempts CASCADE; TRUNCATE sav.learning_admission_reservations CASCADE");
  await f.db.insert(categories).values({slug:"depannage",label:"Dépannage"}).onConflictDoNothing();

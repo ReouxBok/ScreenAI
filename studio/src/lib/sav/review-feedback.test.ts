@@ -3,13 +3,14 @@ import { eq } from "drizzle-orm";
 import { createSavTestDb } from "../../../test/sav-db";
 import { v0Proposal } from "../../../test/sav-v0-review-fixture";
 import { sav44Understanding } from "../../../test/sav44-understanding-fixture";
-import { savActions, savAgentRuns, savDecisions, savDraftVerdicts, savLearningCandidates, savMailboxes, savMessages, savProposalReviews, savResolutionObservations, savThreads } from "@/db/schema";
+import { savActions, savAgentRuns, savDecisions, savDraftVerdicts, savLearningCandidates, savMailboxes, savMessages, savProposalReviews, savReplyDrafts, savResolutionObservations, savThreads } from "@/db/schema";
 import { activateSavV0Cutover } from "./cutover";
 import { decryptSavPayload, encryptSavPayload } from "./crypto";
 import { getSavProposalReview, reviewSavProposal } from "./review";
 import { loadSavDraftContext, reviewSavDraft } from "./draft-verdicts";
 import { savDossierSourceHash, savDraftSourceHash, savReviewReasonsSchema } from "./review-contract";
 import { getSavReviewFeedback } from "./metrics";
+import { saveSavHumanReplyDraft } from "./drafts";
 import { queueSavManualTicket } from "./manual-tickets";
 import { getSavObservations, syncSavObservation } from "./observations";
 import type { SavStructuredProposal } from "./proposal";
@@ -40,6 +41,41 @@ async function draft(reasons: string[] = [], status = "rejected") {
   const [current] = await f.db.select().from(savDraftVerdicts).where(eq(savDraftVerdicts.isCurrent, true));
   return reviewSavDraft({ threadId, messageId, decisionId, agentRunId: runId, sourceHash: context.sourceHash, expectedVerdictId: current?.id ?? null, status, reason: "", reasons }, "ugo@limova.ai");
 }
+it("keeps feedback bound to the AI suggestion after saving a separate human version", async () => {
+  await reviewSavProposal(dossier(), "ugo@limova.ai");
+  const human = await saveSavHumanReplyDraft({ threadId, messageId, expectedDraftId: null, text: "Bonjour, voici une version humaine distincte et synthétique." }, "ugo@limova.ai");
+  const before = (await getSavProposalReview(messageId))!;
+  expect(before.suggestionFeedbackHash).toBe((await loadSavDraftContext(messageId)).sourceHash);
+  expect(before.suggestionFeedbackHash).not.toBe(before.draftHash);
+  await reviewSavDraft({ threadId, messageId, decisionId, agentRunId: runId, sourceHash: before.suggestionFeedbackHash, expectedVerdictId: null,
+    status: "rejected", reason: "La suggestion initiale manque de précision.", reasons: ["incorrect_answer"] }, "ugo@limova.ai");
+  expect((await getSavProposalReview(messageId))?.draftVerdict?.stale).toBe(false);
+  const [saved] = await f.db.select().from(savReplyDrafts).where(eq(savReplyDrafts.id, human.id));
+  expect(saved).toMatchObject({ isCurrent: true, status: "draft" });
+  expect(decryptSavPayload<{text:string}>(saved.bodyCiphertext).text).toBe("Bonjour, voici une version humaine distincte et synthétique.");
+  expect(await f.db.select().from(savActions)).toHaveLength(0); expect(denyNetwork).not.toHaveBeenCalled();
+});
+it.each(["proposal", "inbound"])("rejects stale AI feedback after a real %s change without creating a verdict", async changed => {
+  const before = (await getSavProposalReview(messageId))!;
+  await saveSavHumanReplyDraft({ threadId, messageId, expectedDraftId: null, text: "Version humaine distincte à conserver pour le test." }, "ugo@limova.ai");
+  if (changed === "proposal") await f.db.update(savAgentRuns).set({ proposalCiphertext: encryptSavPayload({ ...proposal, replyDraft: "Nouvelle suggestion différente à relire." }) }).where(eq(savAgentRuns.id, runId));
+  else await f.db.update(savMessages).set({ bodyCiphertext: encryptSavPayload({text:"Nouvelles informations de contexte à relire."}) }).where(eq(savMessages.id, messageId));
+  const draftsBefore = await f.db.select().from(savReplyDrafts);
+  await expect(reviewSavDraft({ threadId, messageId, decisionId, agentRunId: runId, sourceHash: before.suggestionFeedbackHash, expectedVerdictId: null,
+    status: "rejected", reason: "Retour depuis un ancien contexte.", reasons: [] }, "ugo@limova.ai")).rejects.toThrow("SAV_DRAFT_CONTEXT_CHANGED");
+  expect(await f.db.select().from(savDraftVerdicts)).toHaveLength(0);
+  expect(await f.db.select().from(savReplyDrafts)).toEqual(draftsBefore);
+  expect(await f.db.select().from(savActions)).toHaveLength(0); expect(denyNetwork).not.toHaveBeenCalled();
+});
+it("refuses feedback when the initial suggestion is absent and preserves the saved human version", async () => {
+  await f.db.update(savAgentRuns).set({ proposalCiphertext: encryptSavPayload({ ...proposal, replyDraft: null }) }).where(eq(savAgentRuns.id, runId));
+  await saveSavHumanReplyDraft({ threadId, messageId, expectedDraftId: null, text: "Réponse humaine sans suggestion IA initiale à conserver." }, "ugo@limova.ai");
+  const before=(await getSavProposalReview(messageId))!, draftsBefore=await f.db.select().from(savReplyDrafts);
+  await expect(reviewSavDraft({ threadId, messageId, decisionId, agentRunId: runId, sourceHash: before.suggestionFeedbackHash, expectedVerdictId: null,
+    status: "rejected", reason: "Aucune suggestion initiale.", reasons: [] }, "ugo@limova.ai")).rejects.toThrow("SAV_DRAFT_NOT_APPLICABLE");
+  expect(await f.db.select().from(savDraftVerdicts)).toHaveLength(0); expect(await f.db.select().from(savReplyDrafts)).toEqual(draftsBefore);
+  expect(denyNetwork).not.toHaveBeenCalled();
+});
 it("persists independent structured feedback as versioned evaluation cases without knowledge or dispatch", async () => {
   const reviewed = await reviewSavProposal(dossier(), "ugo@limova.ai");
   const rejected = await draft(["off_topic", "misunderstanding"]);

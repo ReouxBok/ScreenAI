@@ -1,6 +1,7 @@
 import "server-only";
 
 import { createCipheriv, createDecipheriv, createHash, randomBytes } from "node:crypto";
+import { countSavRead } from "./read-metrics";
 
 const CURRENT_VERSION = "v1";
 
@@ -25,12 +26,17 @@ export function encryptSavPayload(value: unknown) {
 }
 
 export function decryptSavPayload<T>(payload: string): T {
-  const [version, iv, tag, ciphertext, extra] = String(payload || "").split(".");
-  if (!version || !iv || !tag || !ciphertext || extra) throw new Error("SAV_CIPHERTEXT_INVALID");
-  const decipher = createDecipheriv("aes-256-gcm", encryptionKey(version), Buffer.from(iv, "base64url"));
-  decipher.setAuthTag(Buffer.from(tag, "base64url"));
-  const plaintext = Buffer.concat([decipher.update(Buffer.from(ciphertext, "base64url")), decipher.final()]);
-  return JSON.parse(plaintext.toString("utf8")) as T;
+  const started = performance.now();
+  try {
+    countSavRead("decryptions");
+    countSavRead("ciphertextBytes", Buffer.byteLength(String(payload || ""), "utf8"));
+    const [version, iv, tag, ciphertext, extra] = String(payload || "").split(".");
+    if (!version || !iv || !tag || !ciphertext || extra) throw new Error("SAV_CIPHERTEXT_INVALID");
+    const decipher = createDecipheriv("aes-256-gcm", encryptionKey(version), Buffer.from(iv, "base64url"));
+    decipher.setAuthTag(Buffer.from(tag, "base64url"));
+    const plaintext = Buffer.concat([decipher.update(Buffer.from(ciphertext, "base64url")), decipher.final()]);
+    return JSON.parse(plaintext.toString("utf8")) as T;
+  } finally { countSavRead("decryptionMs", performance.now() - started); }
 }
 
 export function savContentHash(value: unknown) {

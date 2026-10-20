@@ -673,6 +673,7 @@ export type SavHubspotContext = {
 };
 
 export async function readSavHubspotContext(input: { email: string; subject: string; body?: string; currentTicketId?: string | null; returnedAt?: Date | string; identityHints?: SavIdentityHints; toleratePartial?: boolean; skipSemanticMatch?: boolean; cachedMatching?: SavTicketMatchCache; includeHistory?: boolean; historyTicketId?: string | null }): Promise<SavHubspotContext> {
+  const contextStarted = Date.now();
   const contact = await findContactByEmail(input.email);
   const contactName = contact ? [contact.properties.firstname, contact.properties.lastname].filter((part): part is string => Boolean(part?.trim())).join(" ").trim() || null : null;
   let identityCandidates: SavIdentityCandidate[] = [];
@@ -731,8 +732,11 @@ export async function readSavHubspotContext(input: { email: string; subject: str
       updatedAt: ticket.properties.hs_lastmodifieddate || ticket.updatedAt || null,
     })));
     const shortlist = shortlistSavTickets(tickets, `${input.subject}\n${input.body ?? ""}`, input.currentTicketId);
+    const initialHistoryStarted = Date.now();
     const historyDeadline = AbortSignal.timeout(8000);
     let history = input.includeHistory && contact ? await readSavTicketHistory(shortlist.selected.map(t => t.id), new Date(input.returnedAt ?? new Date()), hubspotFetch, historyDeadline) : undefined;
+    const initialHistoryMs = Date.now() - initialHistoryStarted;
+    const matchingStarted = Date.now();
     const matchingTickets = shortlist.selected.map(ticket => {
       const description = [ticket.description, ...(history?.events.filter(e => e.ticketId === ticket.id).map(e => `[Historical declaration / ticket ${ticket.id} / ${e.kind} / ${e.occurredAt} / source ${e.sourceId}] ${e.text}`) ?? [])].join("\n");
       if (history && description.length > 11_000) history.limitations.push("history_matching_content_limited");
@@ -744,12 +748,20 @@ export async function readSavHubspotContext(input: { email: string; subject: str
     if (history?.limitations.length && routing.kind === "new" && tickets.length) routing = { kind: "ambiguous", candidates: tickets, reason: "ticket_history_incomplete" };
     const explicitHistoryTarget = input.historyTicketId && tickets.some(t => t.id === input.historyTicketId) ? input.historyTicketId : null;
     const selectedId = explicitHistoryTarget ?? (routing.kind === "matched" ? routing.ticket.id : input.skipSemanticMatch && linkedTicket ? linkedTicket.id : null);
+    const matchingMs = Date.now() - matchingStarted;
     // Reserve one selected-ticket read when matching chose outside the two candidates.
     // A separate eight-second bound keeps the selected issue readable after matching.
-    if (history && selectedId && !history.ticketIds.includes(selectedId)) {
+    const selectedHistoryStarted = Date.now();
+    const selectedHistoryRequired = Boolean(history && selectedId && !history.ticketIds.includes(selectedId));
+    if (history && selectedId && selectedHistoryRequired) {
       const selectedHistory = await readSavTicketHistory([selectedId], new Date(input.returnedAt ?? new Date()), hubspotFetch);
       history = { ...selectedHistory, limitations: [...new Set([...history.limitations, ...selectedHistory.limitations])].sort() };
     }
+    if (input.includeHistory) console.info("sav_hubspot_history_phases", {
+      revision: "sav-history-phases-2026-10-20.v1", initialBudgetMs: 8000, selectedBudgetMs: 8000,
+      initialHistoryMs, matchingMs, selectedHistoryRequired, selectedHistoryMs: Date.now() - selectedHistoryStarted,
+      contextDurationMs: Date.now() - contextStarted, limitations: history?.limitations.length ?? 0,
+    });
     if (history) history.relevantTicketId = selectedId && history.ticketIds.includes(selectedId) ? selectedId : null;
     return {
       ...(history ? { history } : {}),

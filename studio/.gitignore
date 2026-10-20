@@ -49,3 +49,6 @@ next-env.d.ts
 
 # Synthetic SAV journey harness
 /.e2e-journey-*
+
+/.e2e-sav73-db
+/.e2e-sav-performance-*-db

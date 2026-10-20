@@ -55,11 +55,16 @@ export async function getSavProposalReview(messageId: string) {
   const [draftVerdict] = await db.select().from(savDraftVerdicts).where(and(eq(savDraftVerdicts.messageId, messageId), eq(savDraftVerdicts.isCurrent, true))).limit(1);
   const [currentDraft] = await db.select().from(savReplyDrafts).where(and(eq(savReplyDrafts.messageId,messageId),eq(savReplyDrafts.isCurrent,true))).limit(1);
   const draftBody = currentDraft ? decryptSavPayload<{text:string;origin?:string}>(currentDraft.bodyCiphertext) : null;
+  // The optional feedback form targets the displayed AI suggestion, even when
+  // a separate human version is current. Keep its freshness proof independent.
+  const suggestionFeedbackHash=savDraftSourceHash(proposal,message,knowledge?.revisionId);
   const draftHash=savDraftSourceHash(draftBody?.origin === "human" ? {...proposal,replyDraft:draftBody.text} : proposal,message,knowledge?.revisionId);
+  const verdictOrigin=draftVerdict ? decryptSavPayload<{origin?:string}>(draftVerdict.snapshotCiphertext).origin : null;
+  const verdictHash=verdictOrigin==="human" ? draftHash : suggestionFeedbackHash;
   return { decisionId: decision.id, agentRunId: run.id, model: run.model, promptRevision: run.promptRevision, before, proposal,
-    expectedReviewId: (review?.id ?? null) as string | null, draftHash,
+    expectedReviewId: (review?.id ?? null) as string | null, draftHash, suggestionFeedbackHash,
     ...({confirmationSourceHash:savDraftSourceHash(proposal,message,knowledge?.revisionId)} as {confirmationSourceHash?:string}),
-    draftVerdict: draftVerdict ? { id:draftVerdict.id, status:draftVerdict.status, draftId:draftVerdict.draftId, stale:draftVerdict.sourceHash!==draftHash,reason:decryptSavPayload<{text:string}>(draftVerdict.reasonCiphertext).text,reasons:savStoredReviewReasons(decryptSavPayload<{reasons?:unknown}>(draftVerdict.reasonCiphertext).reasons),reviewedBy:draftVerdict.reviewedBy } : null,
+    draftVerdict: draftVerdict ? { id:draftVerdict.id, status:draftVerdict.status, draftId:draftVerdict.draftId, stale:draftVerdict.sourceHash!==verdictHash,reason:decryptSavPayload<{text:string}>(draftVerdict.reasonCiphertext).text,reasons:savStoredReviewReasons(decryptSavPayload<{reasons?:unknown}>(draftVerdict.reasonCiphertext).reasons),reviewedBy:draftVerdict.reviewedBy } : null,
     historicalReview: review && !matches ? {id:review.id,status:review.status,scope:review.reviewScope} : null,
     review: matches ? { id:review.id,scope:review.reviewScope,status:review.status,verdict:review.verdict,dimensions:review.dimensions,reviewedBy:review.reviewedBy,reviewedAt:review.reviewedAt,comment:decryptSavPayload<{text:string}>(review.commentCiphertext).text,reasons:savStoredReviewReasons(decryptSavPayload<{reasons?:unknown}>(review.commentCiphertext).reasons),reusability:review.reusability } : null };
 

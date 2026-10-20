@@ -10,7 +10,7 @@ type Props=ComponentProps<typeof DraftReview>;
 let host:HTMLDivElement,root:Root;
 function props(stale=true):Props {
  const proposal=v0Proposal("Suggestion IA initiale.");
- return {threadId:"thread",messageId:"message",recipient:"synthetic@example.invalid",data:{before:proposal,proposal,decisionId:"decision",agentRunId:"run",model:"fixture",promptRevision:"fixture",expectedReviewId:null,draftHash:"a".repeat(43),confirmationSourceHash:"a".repeat(43),draftVerdict:null,historicalReview:null,review:null},drafts:{knowledgeRevision:"synthetic",versions:[{id:"same-current-draft",revision:1,status:"draft",createdAt:new Date(),createdBy:"ugo@limova.ai",text:"Version humaine historique.",origin:"human",sourceHash:"old",isCurrent:true,stale}]},sendAllowed:true};
+ return {threadId:"thread",messageId:"message",recipient:"synthetic@example.invalid",data:{before:proposal,proposal,decisionId:"decision",agentRunId:"run",model:"fixture",promptRevision:"fixture",expectedReviewId:null,suggestionFeedbackHash:"s".repeat(43),draftHash:"a".repeat(43),confirmationSourceHash:"a".repeat(43),draftVerdict:null,historicalReview:null,review:null},drafts:{knowledgeRevision:"synthetic",versions:[{id:"same-current-draft",revision:1,status:"draft",createdAt:new Date(),createdBy:"ugo@limova.ai",text:"Version humaine historique.",origin:"human",sourceHash:"old",isCurrent:true,stale}]},sendAllowed:true};
 }
 beforeEach(()=>{vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT",true);vi.stubGlobal("crypto",webcrypto);host=document.createElement("div");document.body.append(host);root=createRoot(host);});
 afterEach(async()=>{await act(async()=>root.unmount());host.remove();vi.unstubAllGlobals();});
@@ -27,4 +27,17 @@ it("replaces an applicable human version with the new AI suggestion when that sa
  const before=props(false);await render(before);expect(field().value).toBe("Version humaine historique.");expect(origin()).toBe("human");
  const next={...before,data:{...before.data,confirmationSourceHash:"b".repeat(43),proposal:{...before.data.proposal,replyDraft:"Nouvelle suggestion IA."}},drafts:{...before.drafts,versions:before.drafts.versions.map(d=>({...d,stale:true}))}};
  await render(next);expect(field().value).toBe("Nouvelle suggestion IA.");expect(origin()).toBe("ai");expect(host.textContent).toContain("Version humaine historique.");
+});
+it("binds optional AI feedback to the suggestion hash independently of the saved human version",async()=>{
+ const data=props(false);data.data.draftHash="h".repeat(43);await render(data);
+ const form=host.querySelector<HTMLButtonElement>('button[name="status"]')!.closest("form")!;
+ expect(form.querySelector<HTMLInputElement>('input[name="sourceHash"]')!.value).toBe("s".repeat(43));
+ expect(field().value).toBe("Version humaine historique.");
+});
+it("preserves the human version when no AI suggestion exists and offers no initial-suggestion feedback",async()=>{
+ const data=props(false);data.data.proposal={...data.data.proposal,replyDraft:null};await render(data);
+ expect(field().value).toBe("Version humaine historique.");
+ expect(host.querySelector('button[name="status"]')).toBeNull();
+ expect(host.textContent).not.toContain("Feedback facultatif sur la suggestion");
+ expect(host.textContent).toContain("Historique des brouillons");
 });

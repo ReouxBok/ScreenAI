@@ -1,7 +1,7 @@
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { eq } from "drizzle-orm";
 import { createSavTestDb } from "../../../test/sav-db";
-import { auditLogs, savActions, savAgentRuns, savDecisions, savDraftVerdicts, savLearningCandidates, savMailboxes, savMessages, savObservationCycles, savPilotBatches, savPilotItems, savProposalReviews, savResolutionObservations, savThreads } from "@/db/schema";
+import { auditLogs, savActions, savAgentRuns, savAnalysisSnapshots, savDecisions, savDraftVerdicts, savLearningCandidates, savMailboxes, savMessages, savObservationCycles, savPilotBatches, savPilotItems, savProposalReviews, savResolutionObservations, savThreads } from "@/db/schema";
 import { activateSavV0Cutover } from "./cutover";
 import { encryptSavPayload } from "./crypto";
 import { savStructuredProposalSchema } from "./proposal";
@@ -54,6 +54,28 @@ beforeEach(async () => {
   await activateSavV0Cutover({ receivedAfter: "2026-10-02T12:00:00Z", mailboxEmail: mailbox.email, intakeRecipient: "contact@limova.ai", deploymentSha: "a".repeat(40), activatedBy: "ugo@limova.ai" });
 });
 describe("SAV-55 dashboard read model", () => {
+  it("keeps SAV86 suggestions available without a draft verdict", async () => {
+    const row = await seed();
+    expect((await listSavDossierDashboard()).rows[0]).toMatchObject({ messageId: row.message.id, draftStatus: "Suggestion disponible" });
+    await fixture.db.insert(savDraftVerdicts).values({ threadId: row.thread.id, messageId: row.message.id, decisionId: row.decision.id, agentRunId: row.run.id,
+      sourceHash: "fixture", status: "rejected", snapshotCiphertext: encryptSavPayload({}), reasonCiphertext: encryptSavPayload({}), reviewedBy: "ugo@limova.ai" });
+    expect((await listSavDossierDashboard()).rows[0].draftStatus).toBe("Suggestion disponible");
+  });
+  it("invalidates SAV86 snapshot observations with no verdict through qualification and candidate review", async () => {
+    const row = await seed({ approved: true, noTicket: true, opening: "opened" });
+    expect((await listSavDossierDashboard({ view: "completed" })).total).toBe(1);
+    const [snapshot] = await fixture.db.insert(savAnalysisSnapshots).values({ messageId: row.message.id, agentRunId: row.run.id, contentHash: "fixture86", payloadCiphertext: encryptSavPayload({}), codeRevision: "fixture86" }).returning();
+    const [obs] = await fixture.db.insert(savResolutionObservations).values({ threadId: row.thread.id, messageId: row.message.id, verdictId: null,
+      snapshotId: snapshot.id, trackingOrigin: "analysis_snapshot", hubspotTicketId: "86", state: "closed_to_analyze", closed: true,
+      closedCatchupUntil: new Date("2026-10-04"), lastSyncAt: new Date("2026-10-05") }).returning();
+    const [cycle] = await fixture.db.insert(savObservationCycles).values({ observationId: obs.id, cycle: 1, status: "closed", summaryCiphertext: encryptSavPayload({}), sourceHash: "fixture86" }).returning();
+    expect((await listSavDossierDashboard({ view: "learning" })).rows[0].learning).toBe("qualification");
+    const [candidate] = await fixture.db.insert(savLearningCandidates).values({ threadId: row.thread.id, sourceRef: `fixture86:${obs.id}`, sourceContentHash: "fixture86", proposedPatch: {}, explanation: "Synthétique", status: "pending" }).returning();
+    await fixture.db.update(savObservationCycles).set({ qualification: "resolved", qualifiedAt: new Date(), candidateId: candidate.id }).where(eq(savObservationCycles.id, cycle.id));
+    expect((await listSavDossierDashboard({ view: "learning" })).rows[0].learning).toBe("candidate");
+    await fixture.db.update(savLearningCandidates).set({ status: "approved" }).where(eq(savLearningCandidates.id, candidate.id));
+    expect((await listSavDossierDashboard({ view: "completed" })).total).toBe(1);
+  });
   it("restricts the internal operator selection and its counts to one exact thread", async () => {
     const selected = await seed(); await seed();
     const result = await listSavDossierDashboard({ threadId: selected.thread.id });
