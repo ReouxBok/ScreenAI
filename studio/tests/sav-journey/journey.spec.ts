@@ -72,6 +72,24 @@ for (const key of JOURNEY_CASES) {
       expect(remote().events.length).toBe(before);
     } else {
       await expect(execution).toContainText("Action déjà traitée pour cet email");
+      // Reproduce the CI race: a real completed context response arrives while
+      // the send action is pending. Do not fake provider or freshness results.
+      let releaseContext: (() => void) | undefined;
+      if (key === "successor") {
+        const sendStarted = new Promise<void>(resolve => { releaseContext = resolve; });
+        await page.route("**/status?refreshId=*", async route => {
+          const response = await route.fetch();
+          if ((await response.json()).context === "completed") await sendStarted;
+          await route.fulfill({ response });
+        });
+        await page.route("**/studio/sav/*", async route => {
+          if (route.request().method() !== "POST" || !route.request().postData()?.includes("Pouvez-vous nous transmettre")) return route.fallback();
+          const response = await route.fetch();
+          releaseContext?.();
+          await expect(page.getByText("Contexte client actualisé.", { exact: true })).toBeVisible();
+          await route.fulfill({ response });
+        });
+      }
       await page.reload();
       await expect(execution).toContainText("Action déjà traitée pour cet email");
       if (key === "link") await expect(page.getByRole("link", { name: /Échec export PDF fictif/ }).first()).toHaveAttribute("href", /ticket\/991002$/);

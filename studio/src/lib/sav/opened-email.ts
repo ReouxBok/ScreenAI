@@ -18,7 +18,7 @@ function assertFilingEnabled() {
 }
 
 /** Called only by an authenticated POST from the inbox, never by rendering/prefetch. */
-export async function recordSavEmailOpened(rawInput: unknown, actorEmail: string) {
+export async function recordSavEmailOpened(rawInput: unknown, actorEmail: string, command?: { id: string; beforeModify: () => Promise<void> }) {
   assertSavActor(actorEmail);
   const input = openedEmailSchema.parse(rawInput);
   const db = requireDb();
@@ -34,7 +34,7 @@ export async function recordSavEmailOpened(rawInput: unknown, actorEmail: string
   const audit = await db.transaction(async tx => {
     const [entry] = await tx.insert(auditLogs).values({
       actorEmail, action: "sav_email_opened", entityType: "sav_message", entityId: input.messageId,
-      technicalMetadata: { threadId: input.threadId, gmailFilingStatus: "pending", labelName: SAV_STUDIO_GMAIL_LABEL_NAME },
+      technicalMetadata: { threadId: input.threadId, gmailFilingStatus: "pending", labelName: SAV_STUDIO_GMAIL_LABEL_NAME, ...(command ? { openingCommandId: command.id } : {}) },
     }).returning({ id: auditLogs.id });
     await tx.update(savMessages).set({ studioOpenedAt: new Date() }).where(and(eq(savMessages.id, input.messageId), isNull(savMessages.studioOpenedAt)));
     return entry;
@@ -42,6 +42,7 @@ export async function recordSavEmailOpened(rawInput: unknown, actorEmail: string
   let dispatched = false;
   const metadata: Record<string, string | number | boolean | null> = {
     threadId: input.threadId, labelName: SAV_STUDIO_GMAIL_LABEL_NAME,
+    ...(command ? { openingCommandId: command.id } : {}),
   };
   async function assertCurrentSource() {
     assertFilingEnabled();
@@ -57,6 +58,7 @@ export async function recordSavEmailOpened(rawInput: unknown, actorEmail: string
     await assertCurrentSource();
     const result = await fileOpenedGmailMessage({ mailboxEmail: source.mailboxEmail, gmailMessageId: source.gmailMessageId, gmailThreadId: source.gmailThreadId }, async () => {
       await assertCurrentSource();
+      await command?.beforeModify();
       metadata.dispatchedAt = new Date().toISOString();
       await db.update(auditLogs).set({ technicalMetadata: { ...metadata, gmailFilingStatus: "dispatching" } }).where(eq(auditLogs.id, audit.id));
       // Configuration may have changed while the trace was being persisted.
@@ -96,9 +98,9 @@ export async function recordSavDossierOpened(rawInput: unknown, actorEmail: stri
       .orderBy(desc(savMessages.receivedAt), desc(savMessages.createdAt), desc(savMessages.id)).limit(1);
     const [pilot] = await tx.select({ id: savPilotItems.id }).from(savPilotItems).where(eq(savPilotItems.messageId, input.messageId)).limit(1);
     if (!latest || latest.id !== input.messageId || pilot) throw new Error("SAV_OPENING_CONTEXT_CHANGED");
-    if (latest.studioOpenedAt) return { opened: true };
+    if (latest.studioOpenedAt) return { opened: true, changed: false };
     const [changed] = await tx.update(savMessages).set({ studioOpenedAt: new Date() }).where(and(eq(savMessages.id, input.messageId), isNull(savMessages.studioOpenedAt))).returning({ id: savMessages.id });
     if (changed) await tx.insert(auditLogs).values({ actorEmail, action: "sav_dossier_opened", entityType: "sav_message", entityId: input.messageId, technicalMetadata: { threadId: input.threadId, gmailFilingStatus: "not_requested" } });
-    return { opened: true };
+    return { opened: true, changed: Boolean(changed) };
   });
 }

@@ -12,9 +12,9 @@ export function validateSavNativeTestTarget(value: string, token: string | undef
 }
 
 /** A dedicated native instance only; never falls back to DATABASE_URL. */
-export async function createSavNativeTestDb(value: string, token: string | undefined) {
+export async function createSavNativeTestDb(value: string, token: string | undefined, options: { poolMax?: 1 | 4 } = {}) {
   validateSavNativeTestTarget(value, token);
-  const sql = postgres(value, { max: 4, prepare: false, connect_timeout: 5, onnotice: () => {},
+  const sql = postgres(value, { max: options.poolMax ?? 4, prepare: false, connect_timeout: 5, onnotice: () => {},
     connection: { application_name: "codex_sav_validation", statement_timeout: 10000, lock_timeout: 5000 } });
   try {
     const [identity] = await sql<{ token: string }[]>`select current_setting('codex.test_token', true) as token`;

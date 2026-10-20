@@ -24,7 +24,7 @@ test("SAV79 + SAV86: English registration clarification, French console, immutab
  await form.getByRole("checkbox",{name:"J’ai relu la demande et l’étape de vérification du compte.",exact:true}).check();
  await submitServerAction(page,form.getByRole("button",{name:"Valider le dossier",exact:true}));
  await page.waitForURL(/review=saved/, {timeout:60000});
- await page.waitForURL(/context=refreshed/,{timeout:60000});
+ await expect(page.getByText("Contexte client actualisé.",{exact:true})).toBeVisible({timeout:60000});
  await expect(form.locator('input[name="humanAction"]')).toHaveCount(0);
  await expect(page.getByRole("checkbox",{name:"J’ai vérifié le compte du demandeur",exact:true})).not.toBeChecked();
  await expect(page.getByText("Fil Gmail suivi · couverture externe limitée · cycle 1",{exact:true})).toBeVisible();

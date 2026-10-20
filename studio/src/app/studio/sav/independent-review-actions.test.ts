@@ -80,7 +80,7 @@ describe("ticket context refresh", () => {
 
 it("registers a background refresh without queueing a ticket or waiting for CRM", async () => {
   await expect(refreshSavContextAction(form())).rejects.toThrow("?context=refreshing&refreshId=10000000-0000-4000-8000-000000000009");
-  expect(d.enqueue).toHaveBeenCalledWith(form().get("threadId"), "ugo@limova.ai");
+  expect(d.enqueue).toHaveBeenCalledWith(form().get("threadId"), "ugo@limova.ai", expect.any(Function));
   expect(d.context).not.toHaveBeenCalled(); expect(d.ticket).not.toHaveBeenCalled();
 });
 it("keeps the manual refresh failure on the readable dossier without a fake request ID", async () => {

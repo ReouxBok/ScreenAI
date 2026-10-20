@@ -28,7 +28,7 @@ vi.mock("@/lib/sav/drafts", () => ({ getSavReplyDrafts: dependencies.drafts }));
 vi.mock("@/lib/sav/thread-context", () => ({ getSavRelatedThreads: dependencies.related }));
 vi.mock("@/lib/sav/config", () => ({ savReleaseStage: dependencies.stage, savAutomationMode: () => "assist" }));
 vi.mock("next/navigation", () => ({ notFound: dependencies.notFound, useRouter: () => ({ refresh: vi.fn() }) }));
-vi.mock("next/link", () => ({ default: (props: ComponentProps<"a">) => createElement("a", props) }));
+vi.mock("next/link", () => ({ useLinkStatus: () => ({ pending: false }), default: (props: ComponentProps<"a">) => createElement("a", props) }));
 vi.mock("../ticket-preview-actions", () => ({ prepareTicketPreviewAction: vi.fn(), confirmTicketPreviewAction: vi.fn() }));
 vi.mock("../actions", () => dependencies.actions);
 
@@ -76,7 +76,7 @@ function proposalFixture(): SavStructuredProposal {
 function reviewFixture(approved = false): ProposalReviewData {
   const proposal = proposalFixture();
   return { decisionId, agentRunId: runId, model: "fixture", promptRevision: "fixture-prompt", before: structuredClone(proposal), proposal,
-    expectedReviewId: approved?reviewId:null, draftHash:"x".repeat(43), draftVerdict:null,historicalReview:null,
+    expectedReviewId: approved?reviewId:null, suggestionFeedbackHash:"s".repeat(43),draftHash:"x".repeat(43), draftVerdict:null,historicalReview:null,
     review: approved ? { scope:"dossier", id: reviewId, status: "approved", verdict: "correct",
       dimensions: { classification: "correct", routing: "correct", grounding: "correct", tone: "correct", escalation: "correct" },
       reviewedBy: "ugo@limova.ai", reviewedAt: now, reasons: [], comment: "Process vérifié par un humain.", reusability: "none" } : null,

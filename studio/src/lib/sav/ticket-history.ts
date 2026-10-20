@@ -14,19 +14,21 @@ function time(value: string | null | undefined) { const n = /^\d{10,}$/.test(val
 export async function readSavTicketHistory(ticketIds: string[], at: Date, read: Read, signal?: AbortSignal): Promise<SavTicketHistory> {
   const selected = [...new Set(ticketIds.filter(id => /^\d{1,30}$/.test(id)))].slice(0, 2);
   const limitations: string[] = ticketIds.length > selected.length ? ["history_ticket_limit"] : [];
-  const events: SavTicketHistoryEvent[] = [];
-  if (!Number.isFinite(at.getTime())) return { events, limitations: ["history_time_invalid"], ticketIds: selected, relevantTicketId: null };
+  if (!Number.isFinite(at.getTime())) return { events: [], limitations: ["history_time_invalid"], ticketIds: selected, relevantTicketId: null };
   const deadline = signal ?? AbortSignal.timeout(8000);
   const until = Math.min(at.getTime(), Date.now());
-  await Promise.all(selected.map(async ticketId => {
-    for (const type of ["notes", "emails"] as const) {
+  // Notes and emails are independent; the shared transport still caps network
+  // reads at three. Keep each association -> batch dependency and one deadline.
+  const histories = await Promise.all(selected.flatMap(ticketId =>
+    (["notes", "emails"] as const).map(async type => {
+      const events: SavTicketHistoryEvent[] = [], limitations: string[] = [];
       try {
         const linked = await read<{ results?: Array<{ id?: string; toObjectId?: string | number }>; paging?: { next?: unknown } }>(`/crm/v4/objects/tickets/${ticketId}/associations/${type}?limit=20`, { signal: deadline });
         if (linked.paging?.next) limitations.push(`${type}_association_limit`);
         const allIds = [...new Set((linked.results ?? []).map(v => String(v.toObjectId ?? v.id ?? "")).filter(id => /^\d{1,30}$/.test(id)))];
         if (allIds.length > 20) limitations.push(`${type}_association_limit`);
         const ids = allIds.slice(0, 20);
-        if (!ids.length) continue;
+        if (!ids.length) return { events, limitations };
         const batch = await read<{ results?: RecordObject[]; errors?: unknown[]; status?: string }>(`/crm/v3/objects/${type}/batch/read`, { method: "POST", signal: deadline,
           body: JSON.stringify({ inputs: ids.map(id => ({ id })), properties: properties[type] }) });
         if (batch.errors?.length || batch.results?.length !== ids.length || batch.status && batch.status !== "COMPLETE") limitations.push(`${type}_partial_batch`);
@@ -40,8 +42,13 @@ export async function readSavTicketHistory(ticketIds: string[], at: Date, read: 
             updatedAt: updated === null ? null : new Date(updated).toISOString(), text: original.slice(0, 1500), truncated: original.length > 1500 });
         }
       } catch { limitations.push(`${type}_unavailable`); }
-    }
-  }));
+      return { events, limitations };
+    }),
+  ));
+  // Aggregate in ticket/type order, not completion order: equal sort keys must
+  // not change which text survives the shared content budget.
+  const events = histories.flatMap(history => history.events);
+  limitations.push(...histories.flatMap(history => history.limitations));
   let remaining = 6000;
   const bounded = events.sort((a, b) => b.occurredAt.localeCompare(a.occurredAt) || a.sourceId.localeCompare(b.sourceId)).slice(0, 12).flatMap(event => {
     const value = event.text.slice(0, remaining); remaining -= value.length;

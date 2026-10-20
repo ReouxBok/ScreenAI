@@ -7,6 +7,7 @@ export function OpenEmailButton({ children, subject, compact = false }: { childr
   const { pending } = useFormStatus();
   return <button type="submit" className={`${compact ? styles.compactRow : "decision-ledger-row"} ${styles.openButton}`} disabled={pending} aria-busy={pending}
     aria-label={pending ? "Ouverture de l’email en cours" : `Ouvrir l’email : ${subject}`}>
+    {pending && <span className={styles.openingNotice} role="status">Ouverture en cours…</span>}
     {children}
   </button>;
 }

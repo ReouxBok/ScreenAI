@@ -14,10 +14,14 @@ export function SavContextProgress({ threadId, requestId }: { threadId:string; r
         const response = await fetch(`/api/internal/sav/dossiers/${threadId}/status?refreshId=${encodeURIComponent(requestId)}`,{ cache:"no-store",signal:controller.signal });
         if (!response.ok) throw new Error();
         const data = await response.json();
+        if (stopped) return;
         if (data.context === "completed" || data.context === "failed") {
           setState(data.context);
-          const url = new URL(window.location.href); url.searchParams.delete("refreshId"); url.searchParams.set("context",data.context === "completed" ? "refreshed" : "failed");
-          router.replace(url.pathname+url.search+url.hash,{ scroll:false }); return;
+          // A background navigation can discard a pending server action's
+          // redirect (including a confirmed send). Refresh the current route
+          // instead: Next queues it after the action and preserves scroll.
+          // Keep refreshId until the next navigation; local state shows completion.
+          router.refresh(); return;
         }
       } catch { if (controller.signal.aborted) return; }
       if (++attempts < 100) timer = setTimeout(poll,3000); else setState("timeout");

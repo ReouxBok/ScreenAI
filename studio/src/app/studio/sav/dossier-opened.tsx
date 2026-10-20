@@ -1,6 +1,7 @@
 "use client";
 import { useEffect, useState, useSyncExternalStore } from "react";
 import Link from "next/link";
+import { SavNavigationPending } from "./navigation-pending";
 import { savDashboardReturnHref } from "@/lib/sav/dashboard-state";
 import { recordSavDossierOpenedAction } from "./open-email-actions";
 
@@ -28,7 +29,7 @@ export function SavDossierBackLink({ threadId, returnTo }: { threadId: string; r
     if (returnTo && safeHref !== "/studio/sav") return safeHref;
     try { return savDashboardReturnHref(sessionStorage.getItem(key)); } catch { return "/studio/sav"; }
   }, () => safeHref);
-  return <Link href={saved}>← Retour aux dossiers</Link>;
+  return <Link href={saved}>← Retour aux dossiers<SavNavigationPending label="Chargement des dossiers…"/></Link>;
 }
 function subscribeReturnLink(callback: () => void) {
   window.addEventListener("sav-inbox-return", callback);

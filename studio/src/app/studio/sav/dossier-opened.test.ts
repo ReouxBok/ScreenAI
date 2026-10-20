@@ -3,7 +3,7 @@ import { renderToStaticMarkup } from "react-dom/server";
 import { afterEach, describe, expect, it, vi } from "vitest";
 const action = vi.hoisted(() => vi.fn());
 vi.mock("./open-email-actions", () => ({ recordSavDossierOpenedAction: action }));
-vi.mock("next/link", () => ({ default: (props: ComponentProps<"a">) => createElement("a", props) }));
+vi.mock("next/link", () => ({ useLinkStatus: () => ({ pending: false }), default: (props: ComponentProps<"a">) => createElement("a", props) }));
 import { SavDossierBackLink, SavDossierOpened } from "./dossier-opened";
 afterEach(() => action.mockClear());
 describe("SAV-55 opening client boundary", () => {
