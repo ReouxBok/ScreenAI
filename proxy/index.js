@@ -847,7 +847,9 @@ async function handleCopilotTurn(req, res) {
   const requestId = crypto.randomUUID();
   const turn = cleanMemoryTurn(req.body.memoryTurn);
   try {
-    const personalContext = await getMemoryContext(req.auth.memoryUserKey, turn?.user || '', requestId);
+    const personalContext = req.body.resetContext === true
+      ? null
+      : await getMemoryContext(req.auth.memoryUserKey, turn?.user || '', requestId);
     const promptParts = [
       { text: SERVER_PROMPT },
       ...(Array.isArray(req.body.systemInstruction?.parts) ? req.body.systemInstruction.parts : []),
@@ -905,7 +907,9 @@ app.post('/api/live-token', verifyAssistantAuth, assistantLimiter, async (req, r
   const onboardingTemplateText = formatOnboardingTemplate(onboardingTemplate);
   const lastUserMessage = trainingMode || evaluationMode ? '' : [...(Array.isArray(req.body?.history) ? req.body.history : [])].reverse().find(item => item?.role === 'user')?.content || '';
   const liveSessionId = typeof req.body?.sessionId === 'string' && /^[0-9a-f-]{36}$/i.test(req.body.sessionId) ? req.body.sessionId : undefined;
-  const personalContext = trainingMode || evaluationMode ? null : await getMemoryContext(req.auth.memoryUserKey, lastUserMessage, requestId, liveSessionId);
+  const personalContext = trainingMode || evaluationMode || req.body?.resetContext === true
+    ? null
+    : await getMemoryContext(req.auth.memoryUserKey, lastUserMessage, requestId, liveSessionId);
   const now = Date.now();
   const expireTime = new Date(now + 30 * 60_000).toISOString();
   const newSessionExpireTime = new Date(now + 2 * 60_000).toISOString();
