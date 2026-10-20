@@ -7,10 +7,22 @@ class LimovaAudioInputProcessor extends AudioWorkletProcessor {
     super();
     this.batch = new Float32Array(2048);
     this.offset = 0;
+    this.muted = false;
+    this.epoch = 0;
+    this.port.onmessage = event => {
+      if (event.data?.type !== 'set-muted') return;
+      this.muted = event.data.muted === true;
+      this.epoch = Number.isInteger(event.data.epoch) ? event.data.epoch : this.epoch + 1;
+      this.discardBatch();
+    };
   }
 
   process(inputs) {
     const channel = inputs[0]?.[0];
+    if (this.muted) {
+      this.discardBatch();
+      return true;
+    }
     if (!channel?.length) return true;
 
     let sourceOffset = 0;
@@ -22,12 +34,17 @@ class LimovaAudioInputProcessor extends AudioWorkletProcessor {
 
       if (this.offset === this.batch.length) {
         const completeBatch = this.batch;
-        this.port.postMessage(completeBatch.buffer, [completeBatch.buffer]);
+        this.port.postMessage({ type: 'audio', epoch: this.epoch, buffer: completeBatch.buffer }, [completeBatch.buffer]);
         this.batch = new Float32Array(2048);
         this.offset = 0;
       }
     }
     return true;
+  }
+
+  discardBatch() {
+    this.batch.fill(0);
+    this.offset = 0;
   }
 }
 

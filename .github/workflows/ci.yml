@@ -48,10 +48,10 @@ jobs:
       - run: npm run validate:package
       - uses: actions/upload-artifact@v4
         with:
-          name: limova-ai-extension-2.2.45
+          name: limova-ai-extension-2.2.46
           path: |
-            dist/limova-ai-extension-2.2.45.zip
-            dist/limova-ai-extension-2.2.45.zip.sha256
+            dist/limova-ai-extension-2.2.46.zip
+            dist/limova-ai-extension-2.2.46.zip.sha256
           if-no-files-found: error
 
   sav-native:
