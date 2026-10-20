@@ -35,6 +35,7 @@ export function savIntakePlanFingerprint(plan: Pick<IntakePlan, "decision" | "no
 /** Read and plan only. There is deliberately no write, model client, DB or dispatch dependency. */
 export async function planSavIntake(
   input: EngineInput, adapters: IntakeAdapters, policy: EnginePolicy, overrides: Partial<EngineLimits> = {},
+  readClock?: () => Date,
 ): Promise<IntakePlan> {
   const message = intakeMessageSchema.parse(input.message);
   if (!z.iso.datetime().safeParse(input.now).success || Date.parse(input.now) < Date.parse(message.receivedAt)
@@ -45,6 +46,11 @@ export async function planSavIntake(
   if (Object.values(limits).some(n => !Number.isSafeInteger(n) || n < 1)
     || limits.contacts > 10 || limits.tickets > 20 || limits.readCalls > 100 || limits.timeoutMs > 10_000) throw new Error("SAV_INTAKE_LIMITS_INVALID");
   let calls = 0;
+  const readTime = () => {
+    const value = readClock ? readClock().getTime() : Date.parse(input.now);
+    if (!Number.isFinite(value) || value < Date.parse(input.now)) return fail("history_incomplete");
+    return value;
+  };
   const evidence: IntakeEvidence[] = [];
   const registerEvidence = (value: IntakeEvidence) => {
     const timestamp = observationTimeSchema.safeParse(value.observedAt);
@@ -112,7 +118,7 @@ export async function planSavIntake(
     finally { if (timer) clearTimeout(timer); }
   }
   function complete<T>(result: ReadResult<unknown>, schema: z.ZodType<T>, reason: ContextReason, temporal = false): T {
-    if (!result || result.status !== "complete" || !observationTimeSchema.safeParse(result.observedAt).success || Date.parse(result.observedAt) > Date.parse(input.now)) fail(reason);
+    if (!result || result.status !== "complete" || !observationTimeSchema.safeParse(result.observedAt).success || Date.parse(result.observedAt) > readTime()) fail(reason);
     if (temporal && input.mode === "at_receipt" && result.reconstructedAsOf !== message.receivedAt) fail("history_incomplete");
     const parsed = schema.safeParse(result.data);
     if (!parsed.success) return fail(reason);
@@ -121,7 +127,7 @@ export async function planSavIntake(
   async function collectHistory(ticketId: string, prefix = "") {
     const result = await bounded(signal => adapters.ticketHistory(ticketId, signal), "history_incomplete");
     const history = complete(result, intakeHistorySchema, "history_incomplete", true);
-    if (history.some(h => Date.parse(h.at) > Date.parse(input.now))) return fail("history_incomplete");
+    if (history.some(h => Date.parse(h.at) > readTime())) return fail("history_incomplete");
     const byId = new Map<string, typeof history[number]>();
     for (const h of history) {
       if (byId.has(h.id) && canonical(byId.get(h.id)) !== canonical(h)) fail("history_incomplete");
@@ -139,7 +145,7 @@ export async function planSavIntake(
     for (const raw of found) {
       const ticket = { ...raw, contactIds: unique(raw.contactIds).sort() };
       if (!ticket.contactIds.includes(contactId) || byId.has(ticket.id) && canonical(byId.get(ticket.id)) !== canonical(ticket)) fail("ticket_search_incomplete");
-      if (!ticket.createdAt || Date.parse(ticket.createdAt) > Date.parse(input.now)) fail("ticket_creation_date_unknown");
+      if (!ticket.createdAt || Date.parse(ticket.createdAt) > readTime()) fail("ticket_creation_date_unknown");
       byId.set(ticket.id, ticket);
     }
     // Apply the same temporal boundary before hashing or exposing candidates to
