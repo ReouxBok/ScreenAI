@@ -268,3 +268,71 @@ describe("independent review regressions F1-F7", () => {
     const p = await f.run(); expect(target(p).target).toMatchObject({ operation: "link", contactId: "102", ticketId: "202" });
   });
 });
+
+describe("counter-review regressions C1-C4", () => {
+  it("C1 returns a valid context plan for non-ISO source observations", async () => {
+    const f = fixture();
+    f.adapters.findContactsByEmail = async () => ({ ...read([contact()]), observedAt: "October 20, 2026 10:00:00 UTC" });
+    reason(await f.run(), "contact_lookup_incomplete");
+  });
+  it("C1 preserves the source instant while normalizing ISO offsets to UTC", async () => {
+    const f = fixture();
+    f.adapters.findContactsByEmail = async () => ({ ...read([contact()]), observedAt: "2026-10-20T11:30:00+02:00" });
+    const p = await f.run();
+    expect(target(p).target.operation).toBe("create");
+    expect(p.decision.evidence.find(e => e.id === "contact-101")?.observedAt).toBe("2026-10-20T09:30:00.000Z");
+  });
+  it("C1 rejects a non-ISO input clock at the input boundary", async () => {
+    const f = fixture(); f.input.now = "October 21, 2026 10:00:00 UTC";
+    await expect(f.run()).rejects.toThrow("SAV_INTAKE_INPUT_INVALID");
+    expect(f.calls).toEqual([]);
+  });
+  function ambiguous() {
+    const f = fixture(); f.input.now = "2026-10-20T10:01:00.000Z";
+    f.contacts["102"] = contact("102");
+    f.adapters.assessIdentity = async ({ evidence }) => ({ kind: "unique", investigationComplete: true, contactIds: ["102"], evidenceIds: evidence.map(e => e.id) });
+    f.adapters.directAssociations = async () => read([{ fromContactId: "102", toContactId: "101", typeId: 449, category: "HUBSPOT_DEFINED" }]);
+    return f;
+  }
+  it("C2 accepts identical contact content re-read later and preserves the earliest observation", async () => {
+    const f = ambiguous();
+    f.adapters.getContact = async () => ({ ...read(contact()), observedAt: "2026-10-20T10:00:01.000Z" });
+    const p = await f.run();
+    expect(target(p).target.contactId).toBe("102");
+    expect(target(p).contactScope.contacts.map(c => c.contactId)).toEqual(["102", "101"]);
+    expect(p.decision.evidence.find(e => e.id === "contact-101")?.observedAt).toBe(at);
+  });
+  it("C2 still refuses contradictory content for a previously observed contact", async () => {
+    const f = ambiguous(); f.adapters.getContact = async () => read(contact("101", "changed@example.test"));
+    reason(await f.run(), "history_incomplete");
+  });
+  it("C3 normalizes ticket contact membership before hashing both search paths", async () => {
+    for (const identity of [false, true]) {
+      const f = identity ? ambiguous() : fixture();
+      if (!identity) f.link();
+      f.tickets.push(ticket("201", { contactIds: ["101", "102"] }));
+      const a = await f.run(); expect(target(a).target.operation).toBe("link");
+      f.tickets[0].contactIds = ["102", "101", "102"];
+      const b = await f.run(); expect(b).toEqual(a);
+    }
+  });
+  it("C4 excludes post-reception tickets before identity investigation and evidence", async () => {
+    const f = ambiguous(); f.input.mode = "at_receipt";
+    f.tickets.push(ticket("202", { contactIds: ["102"], createdAt: "2026-10-20T10:00:30.000Z" }));
+    let investigated: string[] | undefined;
+    const qualify = f.adapters.assessIdentity!;
+    f.adapters.assessIdentity = async (args, signal) => {
+      investigated = args.candidates.flatMap(c => c.tickets.map(row => row.ticket.id));
+      return qualify(args, signal);
+    };
+    const p = await f.run();
+    expect(investigated).toEqual([]);
+    expect(target(p).target.operation).toBe("create");
+    expect(f.calls).not.toContain("history:202");
+    expect(p.decision.evidence.some(e => e.sourceId === "202")).toBe(false);
+  });
+  it("C4 requires known creation dates during identity investigation", async () => {
+    const f = ambiguous(); f.tickets.push(ticket("202", { contactIds: ["102"], createdAt: undefined }));
+    reason(await f.run(), "ticket_creation_date_unknown");
+  });
+});

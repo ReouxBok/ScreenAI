@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import { z } from "zod";
 import {
-  SAV_INTAKE_CONTRACT_REVISION, savIntakeDecisionSchema, savIntakePrivateResourceSchema, savIntakeProgressSchema,
+  SAV_INTAKE_CONTRACT_REVISION, savIntakeDecisionSchema, savIntakeEvidenceSchema, savIntakePrivateResourceSchema, savIntakeProgressSchema,
   type SavIntakeDecision, type SavIntakeProgress,
 } from "./contract";
 import { SAV_TICKET_RETURN_NOTE_VERSION, savTicketReturnNote } from "../ticket-return-note";
@@ -23,7 +23,7 @@ function canonical(value: unknown): string {
   return JSON.stringify(value) ?? "null";
 }
 const unique = <T>(values: T[]) => [...new Set(values)];
-const validTime = (value: string | undefined) => value !== undefined && Number.isFinite(Date.parse(value));
+const observationTimeSchema = z.iso.datetime({ offset: true });
 const DAY = 86_400_000;
 
 /** Content binding, not a signature, dispatch authorization or idempotency store. */
@@ -37,7 +37,7 @@ export async function planSavIntake(
   input: EngineInput, adapters: IntakeAdapters, policy: EnginePolicy, overrides: Partial<EngineLimits> = {},
 ): Promise<IntakePlan> {
   const message = intakeMessageSchema.parse(input.message);
-  if (!validTime(input.now) || Date.parse(input.now) < Date.parse(message.receivedAt)
+  if (!z.iso.datetime().safeParse(input.now).success || Date.parse(input.now) < Date.parse(message.receivedAt)
     || !z.uuid().safeParse(input.latestInboundMessageId).success
     || !["at_receipt", "current"].includes(input.mode)
     || !input.identificationAttemptId.trim()) throw new Error("SAV_INTAKE_INPUT_INVALID");
@@ -47,14 +47,22 @@ export async function planSavIntake(
   let calls = 0;
   const evidence: IntakeEvidence[] = [];
   const registerEvidence = (value: IntakeEvidence) => {
-    const existing = evidence.find(e => e.id === value.id);
+    const timestamp = observationTimeSchema.safeParse(value.observedAt);
+    if (!timestamp.success) return fail("history_incomplete");
+    const parsed = savIntakeEvidenceSchema.safeParse({ ...value, observedAt: new Date(timestamp.data).toISOString() });
+    if (!parsed.success) return fail("history_incomplete");
+    const record = parsed.data;
+    const existing = evidence.find(e => e.id === record.id);
     if (existing) {
-      if (canonical(existing) !== canonical(value)) fail("history_incomplete");
-      return value.id;
+      if (canonical({ ...existing, observedAt: record.observedAt }) !== canonical(record)) fail("history_incomplete");
+      // Identical content observed twice is not a contradiction. Keep the earliest
+      // source observation, so a re-read cannot manufacture fresher evidence.
+      if (Date.parse(record.observedAt) < Date.parse(existing.observedAt)) existing.observedAt = record.observedAt;
+      return record.id;
     }
     if (evidence.length >= 95) fail("history_incomplete");
-    evidence.push(value);
-    return value.id;
+    evidence.push(record);
+    return record.id;
   };
   const addEvidence = (id: string, source: IntakeEvidence["source"], sourceId: string, value: unknown, observedAt = input.now) => {
     return registerEvidence({ id, source, sourceId, observedAt, contentHash: sha(canonical(value)) } as IntakeEvidence);
@@ -104,7 +112,7 @@ export async function planSavIntake(
     finally { if (timer) clearTimeout(timer); }
   }
   function complete<T>(result: ReadResult<unknown>, schema: z.ZodType<T>, reason: ContextReason, temporal = false): T {
-    if (!result || result.status !== "complete" || !validTime(result.observedAt) || Date.parse(result.observedAt) > Date.parse(input.now)) fail(reason);
+    if (!result || result.status !== "complete" || !observationTimeSchema.safeParse(result.observedAt).success || Date.parse(result.observedAt) > Date.parse(input.now)) fail(reason);
     if (temporal && input.mode === "at_receipt" && result.reconstructedAsOf !== message.receivedAt) fail("history_incomplete");
     const parsed = schema.safeParse(result.data);
     if (!parsed.success) return fail(reason);
@@ -123,6 +131,24 @@ export async function planSavIntake(
       .sort((a, b) => Date.parse(a.at) - Date.parse(b.at) || a.id.localeCompare(b.id));
     addEvidence(`${prefix}history-${ticketId}`, "crm_event", ticketId, relevant, result.observedAt);
     return relevant;
+  }
+  async function collectTickets(contactId: string, prefix: "identity" | "ticket") {
+    const result = await bounded(signal => adapters.ticketsForContact(contactId, signal), "ticket_search_incomplete");
+    const found = complete(result, z.array(intakeTicketSchema).max(limits.tickets), "ticket_search_incomplete", true);
+    const byId = new Map<string, IntakeTicket>();
+    for (const raw of found) {
+      const ticket = { ...raw, contactIds: unique(raw.contactIds).sort() };
+      if (!ticket.contactIds.includes(contactId) || byId.has(ticket.id) && canonical(byId.get(ticket.id)) !== canonical(ticket)) fail("ticket_search_incomplete");
+      if (!ticket.createdAt || Date.parse(ticket.createdAt) > Date.parse(input.now)) fail("ticket_creation_date_unknown");
+      byId.set(ticket.id, ticket);
+    }
+    // Apply the same temporal boundary before hashing or exposing candidates to
+    // either semantic assessment. Current snapshots cannot become historical truth.
+    const relevant = [...byId.values()]
+      .filter(ticket => input.mode !== "at_receipt" || Date.parse(ticket.createdAt!) <= Date.parse(message.receivedAt))
+      .sort((a, b) => a.id.localeCompare(b.id));
+    addEvidence(`${prefix}-search-${contactId}`, "crm_ticket", `search-${contactId}`, relevant, result.observedAt);
+    return { tickets: relevant, observedAt: result.observedAt };
   }
   try {
     if (message.id !== input.latestInboundMessageId || message.direction !== "inbound") return context("history_incomplete");
@@ -200,7 +226,7 @@ export async function planSavIntake(
         template: { ...resource, variant: addressOrigin === "sender" ? "initial_registration_request" : "registration_address_not_found", language: "fr", additionalFooter: false },
         permissionRequired: "send_identity_template", learning: "not_started", evidenceIds: identityEvidenceIds }, { kind: "processing", phase: "dispatch", view: null });
     }
-    function contactEvidence(c: IntakeContact, observedAt: string) { return addEvidence(`contact-${c.id}`, "crm_contact", c.id, { ...c, emails: [...c.emails].sort() }, observedAt); }
+    function contactEvidence(c: IntakeContact, observedAt: string) { return addEvidence(`contact-${c.id}`, "crm_contact", c.id, { ...c, emails: unique(c.emails.map(normalizeEmail)).sort() }, observedAt); }
     if (contacts.length > 1) {
       candidateContactIds = contacts.map(c => c.id);
       for (const c of contacts) contactEvidence(c, lookup.observedAt);
@@ -209,13 +235,10 @@ export async function planSavIntake(
       const seenTickets = new Map<string, IntakeTicket>();
       const histories = new Map<string, Awaited<ReturnType<typeof collectHistory>>>();
       for (const c of contacts) {
-        const result = await bounded(signal => adapters.ticketsForContact(c.id, signal), "ticket_search_incomplete");
-        const found = complete(result, z.array(intakeTicketSchema).max(limits.tickets), "ticket_search_incomplete", true);
-        addEvidence(`identity-search-${c.id}`, "crm_ticket", `search-${c.id}`, [...found].sort((a, b) => a.id.localeCompare(b.id)), result.observedAt);
+        const result = await collectTickets(c.id, "identity");
         const rows: typeof candidateContexts[number]["tickets"] = [];
-        for (const raw of [...found].sort((a, b) => a.id.localeCompare(b.id))) {
-          const t = { ...raw, contactIds: unique(raw.contactIds).sort() };
-          if (!t.contactIds.includes(c.id) || seenTickets.has(t.id) && canonical(seenTickets.get(t.id)) !== canonical(t)) return context("ticket_search_incomplete");
+        for (const t of result.tickets) {
+          if (seenTickets.has(t.id) && canonical(seenTickets.get(t.id)) !== canonical(t)) return context("ticket_search_incomplete");
           if (!seenTickets.has(t.id)) {
             if (seenTickets.size >= limits.tickets) return context("ticket_search_incomplete");
             seenTickets.set(t.id, t); addEvidence(`identity-ticket-${t.id}`, "crm_ticket", t.id, t, result.observedAt);
@@ -264,22 +287,15 @@ export async function planSavIntake(
     const tickets = new Map<string, IntakeTicket>();
     const ticketObservedAt = new Map<string, string>();
     for (const c of scopeContacts) {
-      const result = await bounded(signal => adapters.ticketsForContact(c.contactId, signal), "ticket_search_incomplete");
-      // Current CRM stages are not historical stages. A historical adapter must explicitly
-      // attest its reconstruction; the engine never backdates a current snapshot.
-      const found = complete(result, z.array(intakeTicketSchema).max(limits.tickets), "ticket_search_incomplete", true);
-      addEvidence(`ticket-search-${c.contactId}`, "crm_ticket", `search-${c.contactId}`, [...found].sort((a, b) => a.id.localeCompare(b.id)), result.observedAt);
-      for (const t of found) {
-        const normalized = { ...t, contactIds: unique(t.contactIds).sort() };
-        if (!normalized.contactIds.includes(c.contactId) || tickets.has(t.id) && canonical(tickets.get(t.id)) !== canonical(normalized)) return context("ticket_search_incomplete");
-        tickets.set(t.id, normalized);
+      const result = await collectTickets(c.contactId, "ticket");
+      for (const t of result.tickets) {
+        if (tickets.has(t.id) && canonical(tickets.get(t.id)) !== canonical(t)) return context("ticket_search_incomplete");
+        tickets.set(t.id, t);
         if (!ticketObservedAt.has(t.id) || Date.parse(result.observedAt) < Date.parse(ticketObservedAt.get(t.id)!)) ticketObservedAt.set(t.id, result.observedAt);
       }
       if (tickets.size > limits.tickets) return context("ticket_search_incomplete");
     }
-    let candidateTickets = [...tickets.values()].sort((a, b) => a.id.localeCompare(b.id));
-    if (candidateTickets.some(t => !t.createdAt || Date.parse(t.createdAt) > Date.parse(input.now))) return context("ticket_creation_date_unknown");
-    if (input.mode === "at_receipt") candidateTickets = candidateTickets.filter(t => Date.parse(t.createdAt!) <= Date.parse(message.receivedAt));
+    const candidateTickets = [...tickets.values()].sort((a, b) => a.id.localeCompare(b.id));
     const collected: { ticket: IntakeTicket; history: z.infer<typeof intakeHistorySchema> }[] = [];
     for (const ticket of candidateTickets) {
       addEvidence(`ticket-${ticket.id}`, "crm_ticket", ticket.id, ticket, ticketObservedAt.get(ticket.id)!);
