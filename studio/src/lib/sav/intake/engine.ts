@@ -1,13 +1,13 @@
 import { createHash } from "node:crypto";
 import { z } from "zod";
 import {
-  SAV_INTAKE_CONTRACT_REVISION, savIntakeDecisionSchema, savIntakePrivateResourceSchema,
+  SAV_INTAKE_CONTRACT_REVISION, savIntakeDecisionSchema, savIntakePrivateResourceSchema, savIntakeProgressSchema,
   type SavIntakeDecision, type SavIntakeProgress,
 } from "./contract";
 import { SAV_TICKET_RETURN_NOTE_VERSION, savTicketReturnNote } from "../ticket-return-note";
 import {
   intakeMessageSchema, intakeContactSchema, intakeAssociationSchema, intakeTicketSchema, intakeHistorySchema,
-  messageAnalysisSchema, issueAssessmentSchema,
+  messageAnalysisSchema, issueAssessmentSchema, identityAssessmentSchema,
   type EngineInput, type EngineLimits, type EnginePolicy, type IntakeAdapters, type IntakeContact,
   type IntakeEvidence, type IntakePlan, type IntakeTicket, type ReadResult, type PrivateResource,
 } from "./engine-types";
@@ -26,6 +26,12 @@ const unique = <T>(values: T[]) => [...new Set(values)];
 const validTime = (value: string | undefined) => value !== undefined && Number.isFinite(Date.parse(value));
 const DAY = 86_400_000;
 
+/** Content binding, not a signature, dispatch authorization or idempotency store. */
+export function savIntakePlanFingerprint(plan: Pick<IntakePlan, "decision" | "noteText" | "newTicket" | "supervisedResource" | "originalThreadId" | "originalRecipientEmails" | "referenceMode">): string {
+  return sha(canonical({ decision: plan.decision, noteText: plan.noteText, newTicket: plan.newTicket ?? null, supervisedResource: plan.supervisedResource ?? null,
+    originalThreadId: plan.originalThreadId, originalRecipientEmails: plan.originalRecipientEmails, referenceMode: plan.referenceMode }));
+}
+
 /** Read and plan only. There is deliberately no write, model client, DB or dispatch dependency. */
 export async function planSavIntake(
   input: EngineInput, adapters: IntakeAdapters, policy: EnginePolicy, overrides: Partial<EngineLimits> = {},
@@ -40,16 +46,25 @@ export async function planSavIntake(
     || limits.contacts > 10 || limits.tickets > 20 || limits.readCalls > 100 || limits.timeoutMs > 10_000) throw new Error("SAV_INTAKE_LIMITS_INVALID");
   let calls = 0;
   const evidence: IntakeEvidence[] = [];
+  const registerEvidence = (value: IntakeEvidence) => {
+    const existing = evidence.find(e => e.id === value.id);
+    if (existing) {
+      if (canonical(existing) !== canonical(value)) fail("history_incomplete");
+      return value.id;
+    }
+    if (evidence.length >= 95) fail("history_incomplete");
+    evidence.push(value);
+    return value.id;
+  };
   const addEvidence = (id: string, source: IntakeEvidence["source"], sourceId: string, value: unknown, observedAt = input.now) => {
-    if (evidence.length >= 95 || evidence.some(e => e.id === id)) fail("history_incomplete");
-    evidence.push({ id, source, sourceId, observedAt, contentHash: sha(canonical(value)) } as IntakeEvidence);
-    return id;
+    return registerEvidence({ id, source, sourceId, observedAt, contentHash: sha(canonical(value)) } as IntakeEvidence);
   };
   const current = addEvidence("current", "current_message", message.id, message);
   let classification: SavIntakeDecision["classification"] = "unknown";
   let requests: SavIntakeDecision["requests"] = [];
   let noteText: string | null = null;
   let newTicket: IntakePlan["newTicket"];
+  let candidateContactIds: string[] | undefined;
   const finalize = (disposition: SavIntakeDecision["disposition"], progress: SavIntakeProgress = { kind: "processing", phase: "context", view: null }, supervisedResource?: PrivateResource): IntakePlan => {
     const decision = savIntakeDecisionSchema.parse({
       revision: SAV_INTAKE_CONTRACT_REVISION, messageId: message.id, latestInboundMessageId: input.latestInboundMessageId,
@@ -58,18 +73,22 @@ export async function planSavIntake(
     });
     const mutations = disposition.kind === "ticket" ? disposition.requiredPermissions : disposition.kind === "request_identification" ? [disposition.permissionRequired] : [];
     const ticketId = disposition.kind === "ticket" && disposition.target.operation !== "create" ? disposition.target.ticketId : null;
+    const finalNote = disposition.kind === "ticket" ? noteText : null;
+    const finalCreation = disposition.kind === "ticket" && disposition.target.operation === "create" ? newTicket : undefined;
+    const fingerprint = savIntakePlanFingerprint({ decision, noteText: finalNote, newTicket: finalCreation, supervisedResource,
+      originalThreadId: message.threadId, originalRecipientEmails: [message.fromEmail], referenceMode: input.mode });
     return {
-      revision: "sav-intake-engine-2026-10-20.v1", decision,
-      steps: mutations.map(mutation => ({ id: `${message.id}:${mutation}`, mutation, requiresPermission: mutation, ticketId, status: "not_dispatched" as const })),
-      progress, noteText: disposition.kind === "ticket" ? noteText : null, ...(supervisedResource ? { supervisedResource } : {}),
-      ...(disposition.kind === "ticket" && disposition.target.operation === "create" && newTicket ? { newTicket } : {}),
+      revision: "sav-intake-engine-2026-10-20.v1", fingerprint, decision,
+      steps: mutations.map(mutation => ({ id: `${message.id}:${mutation}:${fingerprint}`, mutation, requiresPermission: mutation, ticketId, status: "not_dispatched" as const })),
+      progress: savIntakeProgressSchema.parse(progress), noteText: finalNote, ...(supervisedResource ? { supervisedResource } : {}),
+      ...(finalCreation ? { newTicket: finalCreation } : {}), ...(candidateContactIds ? { candidateContactIds } : {}),
       originalThreadId: message.threadId, originalRecipientEmails: [message.fromEmail], referenceMode: input.mode,
       readCalls: calls, effects: "not_connected",
     };
   };
   const context = (reason: ContextReason, choice?: "equivalent_contact_choice" | "equivalent_ticket_choice" | "same_issue_uncertain") => finalize(
-    { kind: "collect_context", reasons: unique([reason, ...(!requests.length || requests.some(r => r.kind === "unknown") || classification === "mixed" ? ["classification_incomplete" as const] : [])]), evidenceIds: [current] },
-    choice ? { kind: "human_choice", messageId: message.id, classification: classification === "cancellation" || classification === "finance" ? classification : "support", questionCode: choice, investigation: "bounded_investigation_complete", evidenceIds: [current], view: "to_validate" }
+    { kind: "collect_context", reasons: unique([reason, ...(!requests.length || requests.some(r => r.kind === "unknown") || classification === "mixed" ? ["classification_incomplete" as const] : [])]), evidenceIds: evidence.map(e => e.id).sort() },
+    choice ? { kind: "human_choice", messageId: message.id, classification: classification === "cancellation" || classification === "finance" ? classification : "support", questionCode: choice, investigation: "bounded_investigation_complete", evidenceIds: evidence.map(e => e.id).sort(), view: "to_validate" }
       : { kind: "processing", phase: reason.startsWith("classification") ? "classification" : "context", view: null },
   );
   async function bounded<T>(fn: (signal: AbortSignal) => Promise<T>, reason: ContextReason): Promise<T> {
@@ -84,11 +103,26 @@ export async function planSavIntake(
     } catch { return fail(reason); }
     finally { if (timer) clearTimeout(timer); }
   }
-  function complete<T>(result: ReadResult<unknown>, schema: z.ZodType<T>, reason: ContextReason): T {
+  function complete<T>(result: ReadResult<unknown>, schema: z.ZodType<T>, reason: ContextReason, temporal = false): T {
     if (!result || result.status !== "complete" || !validTime(result.observedAt) || Date.parse(result.observedAt) > Date.parse(input.now)) fail(reason);
+    if (temporal && input.mode === "at_receipt" && result.reconstructedAsOf !== message.receivedAt) fail("history_incomplete");
     const parsed = schema.safeParse(result.data);
     if (!parsed.success) return fail(reason);
     return parsed.data;
+  }
+  async function collectHistory(ticketId: string, prefix = "") {
+    const result = await bounded(signal => adapters.ticketHistory(ticketId, signal), "history_incomplete");
+    const history = complete(result, intakeHistorySchema, "history_incomplete", true);
+    if (history.some(h => Date.parse(h.at) > Date.parse(input.now))) return fail("history_incomplete");
+    const byId = new Map<string, typeof history[number]>();
+    for (const h of history) {
+      if (byId.has(h.id) && canonical(byId.get(h.id)) !== canonical(h)) fail("history_incomplete");
+      byId.set(h.id, h);
+    }
+    const relevant = [...byId.values()].filter(h => input.mode !== "at_receipt" || Date.parse(h.at) <= Date.parse(message.receivedAt))
+      .sort((a, b) => Date.parse(a.at) - Date.parse(b.at) || a.id.localeCompare(b.id));
+    addEvidence(`${prefix}history-${ticketId}`, "crm_event", ticketId, relevant, result.observedAt);
+    return relevant;
   }
   try {
     if (message.id !== input.latestInboundMessageId || message.direction !== "inbound") return context("history_incomplete");
@@ -101,12 +135,13 @@ export async function planSavIntake(
     const analysis = parsedAnalysis.data;
     if (analysis.messageId !== message.id || analysis.requests.some(r => r.currentMessageId !== message.id)
       || new Set(analysis.requests.map(r => r.id)).size !== analysis.requests.length) return context("classification_incomplete");
+    analysis.requests.sort((a, b) => a.id.localeCompare(b.id));
     requests = analysis.requests.map(({ id, kind }) => ({ id, kind, evidenceIds: [current] }));
     const kinds = unique(requests.map(r => r.kind));
     classification = kinds.includes("cancellation") ? "cancellation" : kinds.includes("finance") ? "finance"
       : kinds.includes("unknown") || !kinds.length ? "unknown" : kinds.includes("support") ? "support"
       : kinds.filter(k => ["commercial", "investor", "partnership"].includes(k)).length > 1 ? "mixed"
-      : kinds.find(k => ["commercial", "investor", "partnership"].includes(k)) ?? kinds[0];
+      : kinds.find(k => ["commercial", "investor", "partnership"].includes(k)) ?? (kinds.includes("other") ? "other" : "acknowledgement");
     if (!requests.length || kinds.includes("unknown") || classification === "mixed") return context("classification_incomplete");
     if (policy.manualSupportOverride && classification === "other") {
       // Recompute from the current message. An override is not a fabricated support request.
@@ -139,11 +174,11 @@ export async function planSavIntake(
       if (!source || source.direction !== "inbound" || !source.contentComplete || normalizeEmail(source.fromEmail) !== address
         || !source.currentText.includes(declaration.quote) || !declaration.quote.toLowerCase().includes(declaration.address.toLowerCase())) return context("contact_lookup_incomplete");
       address = normalizeEmail(declaration.address); addressOrigin = "customer_declared_registration";
-      if (source.id !== message.id) identityEvidenceIds.push(addEvidence("registration-declaration", "customer_history", source.id, source));
+      if (source.id !== message.id) identityEvidenceIds.push(addEvidence("registration-declaration", "customer_history", source.id, source, input.conversation.observedAt));
     }
     const lookup = await bounded(signal => adapters.findContactsByEmail(address, signal), "contact_lookup_failed");
     if (lookup.status === "failed") return context("contact_lookup_failed");
-    let contacts = complete(lookup, z.array(intakeContactSchema).max(limits.contacts), "contact_lookup_incomplete");
+    let contacts = complete(lookup, z.array(intakeContactSchema).max(limits.contacts), "contact_lookup_incomplete", true);
     // An email search can return a different primary email. Require the full alias list.
     if (contacts.some(c => !c.emails.some(e => normalizeEmail(e) === address))) return context("contact_lookup_incomplete");
     const distinctContacts = new Map<string, IntakeContact>();
@@ -153,46 +188,92 @@ export async function planSavIntake(
       distinctContacts.set(c.id, normalized);
     }
     contacts = [...distinctContacts.values()].sort((a, b) => a.id.localeCompare(b.id));
+    identityEvidenceIds.push(addEvidence("email-lookup", "crm_contact", `lookup-${sha(address)}`,
+      { address, status: lookup.status, contacts, reconstructedAsOf: lookup.reconstructedAsOf }, lookup.observedAt));
     if (!contacts.length) {
       if (input.previousIdentification?.messageId === message.id && normalizeEmail(input.previousIdentification.address) === address) return context("history_incomplete");
       const resource = addressOrigin === "sender" ? policy.resources.identification : policy.resources.registrationNotFound;
       if (!resource) return context("private_resource_unavailable");
       savIntakePrivateResourceSchema.parse(resource);
       return finalize({ kind: "request_identification", lookup: "complete_without_contact", reason: addressOrigin === "sender" ? "sender_contact_absent" : "declared_registration_address_absent",
-        identificationAttemptId: input.identificationAttemptId, declaredAddressEvidenceIds: addressOrigin === "sender" ? [] : identityEvidenceIds,
+        identificationAttemptId: input.identificationAttemptId, declaredAddressEvidenceIds: addressOrigin === "sender" ? [] : identityEvidenceIds.filter(id => evidence.some(e => e.id === id && ["current_message", "customer_history"].includes(e.source))),
         template: { ...resource, variant: addressOrigin === "sender" ? "initial_registration_request" : "registration_address_not_found", language: "fr", additionalFooter: false },
         permissionRequired: "send_identity_template", learning: "not_started", evidenceIds: identityEvidenceIds }, { kind: "processing", phase: "dispatch", view: null });
     }
-    if (contacts.length > 1) return context("contact_ambiguous", "equivalent_contact_choice");
+    function contactEvidence(c: IntakeContact, observedAt: string) { return addEvidence(`contact-${c.id}`, "crm_contact", c.id, { ...c, emails: [...c.emails].sort() }, observedAt); }
+    if (contacts.length > 1) {
+      candidateContactIds = contacts.map(c => c.id);
+      for (const c of contacts) contactEvidence(c, lookup.observedAt);
+      if (!adapters.assessIdentity) return context("contact_ambiguous");
+      const candidateContexts: Parameters<NonNullable<IntakeAdapters["assessIdentity"]>>[0]["candidates"][number][] = [];
+      const seenTickets = new Map<string, IntakeTicket>();
+      const histories = new Map<string, Awaited<ReturnType<typeof collectHistory>>>();
+      for (const c of contacts) {
+        const result = await bounded(signal => adapters.ticketsForContact(c.id, signal), "ticket_search_incomplete");
+        const found = complete(result, z.array(intakeTicketSchema).max(limits.tickets), "ticket_search_incomplete", true);
+        addEvidence(`identity-search-${c.id}`, "crm_ticket", `search-${c.id}`, [...found].sort((a, b) => a.id.localeCompare(b.id)), result.observedAt);
+        const rows: typeof candidateContexts[number]["tickets"] = [];
+        for (const raw of [...found].sort((a, b) => a.id.localeCompare(b.id))) {
+          const t = { ...raw, contactIds: unique(raw.contactIds).sort() };
+          if (!t.contactIds.includes(c.id) || seenTickets.has(t.id) && canonical(seenTickets.get(t.id)) !== canonical(t)) return context("ticket_search_incomplete");
+          if (!seenTickets.has(t.id)) {
+            if (seenTickets.size >= limits.tickets) return context("ticket_search_incomplete");
+            seenTickets.set(t.id, t); addEvidence(`identity-ticket-${t.id}`, "crm_ticket", t.id, t, result.observedAt);
+            histories.set(t.id, await collectHistory(t.id, "identity-"));
+          }
+          rows.push({ ticket: t, history: histories.get(t.id)! });
+        }
+        candidateContexts.push({ contact: c, tickets: rows });
+      }
+      const parsed = identityAssessmentSchema.safeParse(await bounded(signal => adapters.assessIdentity!({ message, address, candidates: candidateContexts, evidence: [...evidence] }, signal), "contact_ambiguous"));
+      if (!parsed.success) return context("contact_ambiguous");
+      const resolution = parsed.data;
+      const required = [current, ...contacts.flatMap(c => [`contact-${c.id}`, `identity-search-${c.id}`]), ...[...seenTickets.keys()].flatMap(id => [`identity-ticket-${id}`, `identity-history-${id}`])];
+      if (!resolution.investigationComplete || resolution.kind === "unknown" || required.some(id => !resolution.evidenceIds.includes(id))
+        || resolution.evidenceIds.some(id => !evidence.some(e => e.id === id)) || unique(resolution.contactIds).length !== resolution.contactIds.length
+        || resolution.contactIds.some(id => !contacts.some(c => c.id === id))) return context("contact_ambiguous");
+      if (resolution.kind === "equivalent") {
+        if (resolution.contactIds.length < 2) return context("contact_ambiguous");
+        candidateContactIds = [...resolution.contactIds].sort();
+        return context("contact_ambiguous", "equivalent_contact_choice");
+      }
+      if (resolution.contactIds.length !== 1) return context("contact_ambiguous");
+      contacts = contacts.filter(c => c.id === resolution.contactIds[0]);
+      candidateContactIds = undefined;
+    }
     const primary = contacts[0];
     const scopeContacts: Extract<SavIntakeDecision["disposition"], { kind: "ticket" }>["contactScope"]["contacts"] = [];
-    function contactEvidence(c: IntakeContact) { return addEvidence(`contact-${c.id}`, "crm_contact", c.id, { ...c, emails: [...c.emails].sort() }); }
-    const primaryProof = contactEvidence(primary); identityEvidenceIds.push(primaryProof);
+    const primaryProof = contactEvidence(primary, lookup.observedAt); identityEvidenceIds.push(primaryProof);
     scopeContacts.push({ origin: "email_lookup", addressOrigin, contactId: primary.id, evidenceIds: [primaryProof] });
-    const edges = complete(await bounded(signal => adapters.directAssociations(primary.id, signal), "association_incomplete"), z.array(intakeAssociationSchema).max(100), "association_incomplete");
+    const edgeResult = await bounded(signal => adapters.directAssociations(primary.id, signal), "association_incomplete");
+    const edges = complete(edgeResult, z.array(intakeAssociationSchema).max(100), "association_incomplete", true);
+    addEvidence("association-search", "contact_association", `relations-${primary.id}`, [...edges].sort((a, b) => canonical(a).localeCompare(canonical(b))), edgeResult.observedAt);
     const admitted = edges.filter(edge => edge.fromContactId === primary.id && edge.toContactId !== primary.id
       && policy.admittedRelations.some(p => p.typeId === edge.typeId && p.category === edge.category));
     const direct = [...new Map(admitted.sort((a, b) => canonical(a).localeCompare(canonical(b))).map(e => [e.toContactId, e])).values()].sort((a, b) => a.toContactId.localeCompare(b.toContactId));
     if (direct.length + 1 > limits.contacts) return context("association_incomplete");
     for (const edge of direct) {
-      const c = complete(await bounded(signal => adapters.getContact(edge.toContactId, signal), "association_incomplete"), intakeContactSchema, "association_incomplete");
+      const contactResult = await bounded(signal => adapters.getContact(edge.toContactId, signal), "association_incomplete");
+      const c = complete(contactResult, intakeContactSchema, "association_incomplete", true);
       if (c.id !== edge.toContactId) return context("association_incomplete");
-      const contactProof = contactEvidence(c);
-      const edgeProof = addEvidence(`association-${c.id}`, "contact_association", `${primary.id}:${c.id}:${edge.typeId}`, edge);
+      const contactProof = contactEvidence(c, contactResult.observedAt);
+      const edgeProof = addEvidence(`association-${c.id}`, "contact_association", `${primary.id}:${c.id}:${edge.typeId}`, edge, edgeResult.observedAt);
       scopeContacts.push({ origin: "direct_association", contactId: c.id, fromContactId: primary.id, associationTypeId: edge.typeId,
         associationCategory: edge.category, direction: "primary_to_contact", relationPolicyRevisionId: policy.relationRevision, evidenceIds: [contactProof, edgeProof] });
     }
     const tickets = new Map<string, IntakeTicket>();
+    const ticketObservedAt = new Map<string, string>();
     for (const c of scopeContacts) {
       const result = await bounded(signal => adapters.ticketsForContact(c.contactId, signal), "ticket_search_incomplete");
       // Current CRM stages are not historical stages. A historical adapter must explicitly
       // attest its reconstruction; the engine never backdates a current snapshot.
-      if (input.mode === "at_receipt" && result.reconstructedAsOf !== message.receivedAt) return context("history_incomplete");
-      const found = complete(result, z.array(intakeTicketSchema).max(limits.tickets), "ticket_search_incomplete");
+      const found = complete(result, z.array(intakeTicketSchema).max(limits.tickets), "ticket_search_incomplete", true);
+      addEvidence(`ticket-search-${c.contactId}`, "crm_ticket", `search-${c.contactId}`, [...found].sort((a, b) => a.id.localeCompare(b.id)), result.observedAt);
       for (const t of found) {
         const normalized = { ...t, contactIds: unique(t.contactIds).sort() };
         if (!normalized.contactIds.includes(c.contactId) || tickets.has(t.id) && canonical(tickets.get(t.id)) !== canonical(normalized)) return context("ticket_search_incomplete");
         tickets.set(t.id, normalized);
+        if (!ticketObservedAt.has(t.id) || Date.parse(result.observedAt) < Date.parse(ticketObservedAt.get(t.id)!)) ticketObservedAt.set(t.id, result.observedAt);
       }
       if (tickets.size > limits.tickets) return context("ticket_search_incomplete");
     }
@@ -201,16 +282,13 @@ export async function planSavIntake(
     if (input.mode === "at_receipt") candidateTickets = candidateTickets.filter(t => Date.parse(t.createdAt!) <= Date.parse(message.receivedAt));
     const collected: { ticket: IntakeTicket; history: z.infer<typeof intakeHistorySchema> }[] = [];
     for (const ticket of candidateTickets) {
-      addEvidence(`ticket-${ticket.id}`, "crm_ticket", ticket.id, ticket);
-      const history = complete(await bounded(signal => adapters.ticketHistory(ticket.id, signal), "history_incomplete"), intakeHistorySchema, "history_incomplete");
-      if (history.some(h => Date.parse(h.at) > Date.parse(input.now))) return context("history_incomplete");
-      const relevantHistory = input.mode === "at_receipt" ? history.filter(h => Date.parse(h.at) <= Date.parse(message.receivedAt)) : history;
-      addEvidence(`history-${ticket.id}`, "crm_event", ticket.id, relevantHistory);
+      addEvidence(`ticket-${ticket.id}`, "crm_ticket", ticket.id, ticket, ticketObservedAt.get(ticket.id)!);
+      const relevantHistory = await collectHistory(ticket.id);
       collected.push({ ticket, history: relevantHistory });
       for (const contactId of ticket.contactIds.filter(id => scopeContacts.some(c => c.contactId === id))) {
         const eid = `membership-${ticket.id}-${contactId}`;
         const hash = sha(canonical({ ticketId: ticket.id, contactId }));
-        evidence.push({ id: eid, source: "ticket_contact_association", sourceId: eid, observedAt: input.now, contentHash: hash, ticketId: ticket.id, contactId, direction: "ticket_to_contact" });
+        registerEvidence({ id: eid, source: "ticket_contact_association", sourceId: eid, observedAt: ticketObservedAt.get(ticket.id)!, contentHash: hash, ticketId: ticket.id, contactId, direction: "ticket_to_contact" });
       }
     }
     if (evidence.length > 95) return context("history_incomplete");
@@ -250,7 +328,7 @@ export async function planSavIntake(
       const summary = analysis.ticketSummary;
       if (!summary || summary.title.split(/\s+/).length > 6 || summary.requestIds.length !== requests.length
         || unique(summary.requestIds).length !== requests.length || requests.some(r => !summary.requestIds.includes(r.id))) return context("classification_incomplete");
-      newTicket = { ...summary, contactId: primary.id, pipeline: "support", stage: "new", source: "email", owner: "leave_unassigned" };
+      newTicket = { ...summary, requestIds: [...summary.requestIds].sort(), contactId: primary.id, pipeline: "support", stage: "new", source: "email", owner: "leave_unassigned" };
     }
     const openIds = candidateTickets.filter(t => t.stage !== "closed" && t.contactIds.includes(targetContactId)).map(t => t.id).sort();
     const multiple = openIds.length + (target.operation === "link" ? 0 : 1) > 1;
@@ -267,7 +345,7 @@ export async function planSavIntake(
     if (returns) permissions.push("set_ticket_new");
     return finalize({ kind: "ticket", target, requestIds: requests.map(r => r.id), contactScope: { primaryContactId: primary.id, contacts: scopeContacts, complete: true },
       search: "complete", history: "complete", identity: { kind: "unique_crm_match_for_intake", addressOrigin, scope: "intake_only", evidenceIds: identityEvidenceIds },
-      sameIssueEvidenceIds: unique([current, ...assessment.tickets.filter(m => m.relation === "same").flatMap(m => m.evidenceIds)]), requiredPermissions: permissions,
+      sameIssueEvidenceIds: unique([current, ...assessment.tickets.filter(m => m.relation === "same").flatMap(m => m.evidenceIds)]).sort(), requiredPermissions: permissions,
       multiTicketNote: { openTicketIdsOnTargetContact: openIds }, note, learning: classification === "support" ? "eligible_after_confirmed_effect" : "excluded", evidenceIds: [current, primaryProof] },
     { kind: "processing", phase: "dispatch", view: null });
   } catch (error) {

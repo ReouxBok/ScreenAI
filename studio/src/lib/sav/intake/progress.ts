@@ -2,6 +2,8 @@ import {
   savIntakeProgressSchema, savIntakeStepReceiptSchema,
   type SavIntakeProgress, type SavIntakeStepReceipt,
 } from "./contract";
+import { z } from "zod";
+import { savIntakePlanFingerprint } from "./engine";
 import type { IntakePlan } from "./engine-types";
 
 export type IntakeProgressInput = {
@@ -21,6 +23,8 @@ export type IntakeProgressInput = {
  * No persisted view/counter or learning process is changed by this function. */
 export function projectSavIntakeProgress(plan: IntakePlan, input: IntakeProgressInput): SavIntakeProgress {
   const processing = (phase: "verification" | "reconciliation" = "verification"): SavIntakeProgress => ({ kind: "processing", phase, view: null });
+  if (!input || typeof input.attemptId !== "string" || !input.attemptId.trim()) return processing();
+  if (plan.fingerprint !== savIntakePlanFingerprint(plan)) return processing();
   const disposition = plan.decision.disposition;
   if (disposition.kind === "no_ticket" || disposition.kind === "collect_context") {
     if (input.retry && disposition.kind === "collect_context" && plan.progress.kind !== "human_choice") {
@@ -29,15 +33,21 @@ export function projectSavIntakeProgress(plan: IntakePlan, input: IntakeProgress
     }
     return plan.progress;
   }
-  if (!input.attemptId.trim() || new Set(input.receipts.map(r => r.stepId)).size !== input.receipts.length) return processing();
+  const parsedReceipts = z.array(savIntakeStepReceiptSchema).max(20).safeParse(input.receipts);
+  if (!parsedReceipts.success) return processing();
+  const expectedMutations = disposition.kind === "ticket" ? disposition.requiredPermissions : [disposition.permissionRequired];
+  const expectedTicket = disposition.kind === "ticket" && disposition.target.operation !== "create" ? disposition.target.ticketId : null;
+  if (plan.steps.length !== expectedMutations.length || plan.steps.some((step, i) => step.mutation !== expectedMutations[i]
+    || step.requiresPermission !== expectedMutations[i] || step.ticketId !== expectedTicket
+    || step.id !== `${plan.decision.messageId}:${expectedMutations[i]}:${plan.fingerprint}`)) return processing();
+  if (new Set(parsedReceipts.data.map(r => r.stepId)).size !== parsedReceipts.data.length) return processing();
   const receipts: SavIntakeStepReceipt[] = [];
-  for (const value of input.receipts) {
-    const parsed = savIntakeStepReceiptSchema.safeParse(value);
+  for (const value of parsedReceipts.data) {
     const step = plan.steps.find(s => s.id === value.stepId);
-    if (!parsed.success || !step || step.mutation !== value.mutation || value.attemptId !== input.attemptId
+    if (!step || step.mutation !== value.mutation || value.attemptId !== input.attemptId
       || value.messageId !== plan.decision.messageId
       || step.ticketId !== null && value.targetTicketId !== step.ticketId) return processing();
-    receipts.push(parsed.data);
+    receipts.push(value);
   }
   if (receipts.some(r => r.outcome.kind === "uncertain" || r.outcome.kind === "dispatched")) return processing("reconciliation");
   if (receipts.length !== plan.steps.length || receipts.some(r => r.outcome.kind !== "confirmed")) return processing();

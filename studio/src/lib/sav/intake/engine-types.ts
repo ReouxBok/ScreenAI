@@ -49,6 +49,11 @@ export const issueAssessmentSchema = z.object({
   }).strict()).max(20),
 }).strict();
 export type IssueAssessment = z.infer<typeof issueAssessmentSchema>;
+export const identityAssessmentSchema = z.object({
+  kind: z.enum(["unique", "equivalent", "unknown"]), investigationComplete: z.boolean(),
+  contactIds: z.array(id).max(10), evidenceIds: z.array(ref).min(1).max(95),
+}).strict();
+export type IdentityAssessment = z.infer<typeof identityAssessmentSchema>;
 export type IntakeEvidence = SavIntakeDecision["evidence"][number];
 export type PrivateResource = { resourceId: string; revisionId: string; sha256: string };
 export type EnginePolicy = {
@@ -70,6 +75,9 @@ export type IntakeAdapters = {
   getContact(contactId: string, signal: AbortSignal): Promise<ReadResult<IntakeContact>>;
   ticketsForContact(contactId: string, signal: AbortSignal): Promise<ReadResult<IntakeTicket[]>>;
   ticketHistory(ticketId: string, signal: AbortSignal): Promise<ReadResult<IntakeHistory>>;
+  assessIdentity?(input: { message: IntakeMessage; address: string;
+    candidates: readonly { contact: IntakeContact; tickets: { ticket: IntakeTicket; history: IntakeHistory }[] }[];
+    evidence: readonly IntakeEvidence[] }, signal: AbortSignal): Promise<IdentityAssessment>;
   assessIssues(input: {
     message: IntakeMessage; requests: MessageAnalysis["requests"];
     tickets: readonly { ticket: IntakeTicket; history: IntakeHistory }[]; evidence: readonly IntakeEvidence[];
@@ -86,11 +94,13 @@ export type IntakePlanStep = {
 };
 export type IntakePlan = {
   revision: "sav-intake-engine-2026-10-20.v1";
+  fingerprint: string;
   decision: SavIntakeDecision;
   steps: IntakePlanStep[];
   progress: import("./contract").SavIntakeProgress;
   noteText: string | null;
   supervisedResource?: PrivateResource;
+  candidateContactIds?: string[];
   // Provider-independent creation intent. The future writer must reuse the existing
   // savSupportTicketProperties mapper; this is not a HubSpot POST payload.
   newTicket?: { contactId: string; title: string; description: string; requestIds: string[];

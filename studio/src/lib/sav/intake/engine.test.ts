@@ -11,7 +11,7 @@ const mid = "10000000-0000-4000-8000-000000000001";
 const otherMid = "10000000-0000-4000-8000-000000000002";
 const resource = { resourceId: "synthetic-private-resource", revisionId: "fixture-v1", sha256: "0".repeat(64) };
 const warning = "SYNTHETIC MULTIPLE OPEN TICKETS WARNING";
-const read = <T>(data: T): ReadResult<T> => ({ status: "complete", data, observedAt: at });
+const read = <T>(data: T): ReadResult<T> => ({ status: "complete", data, observedAt: at, reconstructedAsOf: at });
 const contact = (id = "101", email = "sender@example.test"): IntakeContact => ({ id, emails: [email] });
 const ticket = (id = "201", properties: Partial<IntakeTicket> = {}): IntakeTicket => ({
   id, contactIds: ["101"], stage: "open", createdAt: "2026-10-01T00:00:00.000Z", ownerId: null,
@@ -40,6 +40,7 @@ function fixture(kinds: MessageAnalysis["requests"][number]["kind"][] = ["suppor
     getContact: async id => { calls.push(`contact:${id}`); return read(contacts[id]); },
     ticketsForContact: async id => { calls.push(`tickets:${id}`); return { ...read(tickets.filter(t => t.contactIds.includes(id))), reconstructedAsOf: at }; },
     ticketHistory: async id => { calls.push(`history:${id}`); return read([{ id: `note-${id}`, kind: "note", text: "Synthetic full history", at }]); },
+    assessIdentity: async ({ evidence }) => ({ kind: "unknown", investigationComplete: false, contactIds: [], evidenceIds: evidence.map(e => e.id) }),
     assessIssues: async ({ tickets: found, requests }) => { calls.push("assess"); return { investigationComplete: true, tickets: found.map(({ ticket: t }) => ({
       ticketId: t.id, relation: matches[t.id] ?? "same", requestIds: requests.map(r => r.id), evidenceIds: ["current", `ticket-${t.id}`, `history-${t.id}`],
     })) }; },
@@ -94,7 +95,7 @@ scenarios.I03 = async () => { const f = declared(); const p = await f.run(); exp
 scenarios.I04 = async () => { const f = declared(); delete f.contacts["103"]; expect((await f.run()).decision.disposition).toMatchObject({ kind: "request_identification", template: { variant: "registration_address_not_found" } }); };
 scenarios.I05 = async () => { const f = fixture(); f.link(); f.tickets.push(ticket("202", { contactIds: ["102"] })); const t = target(await f.run()); expect(t.target).toMatchObject({ ticketId: "202", contactId: "102" }); expect(t.contactScope.contacts).toHaveLength(2); };
 scenarios.I06 = async () => { const f = fixture(); f.tickets.push(ticket("202", { contactIds: ["102"] })); expect(target(await f.run()).target.operation).toBe("create"); expect(f.calls).not.toContain("tickets:102"); };
-scenarios.I07 = async () => { const f = fixture(); f.contacts["102"] = contact("102"); const p = await f.run(); reason(p, "contact_ambiguous"); expect(p.progress.kind).toBe("human_choice"); };
+scenarios.I07 = async () => { const f = fixture(); f.contacts["102"] = contact("102"); const p = await f.run(); reason(p, "contact_ambiguous"); expect(p.progress.kind).toBe("processing"); expect(p.candidateContactIds).toEqual(["101", "102"]); };
 scenarios.I08 = async () => { const f = declared(); f.analysis.registration!.sourceMessageId = otherMid; f.input.conversation = read([{ ...f.input.message, id: otherMid, fromEmail: "thirdparty@example.test" }]); reason(await f.run(), "contact_lookup_incomplete"); };
 scenarios.R01 = async () => { const p = await fixture().run(); expect(target(p).target).toMatchObject({ operation: "create", contactId: "101", selection: { kind: "retained_email_match" } }); expect(p.newTicket).toMatchObject({ pipeline: "support", stage: "new", source: "email", owner: "leave_unassigned", requestIds: ["r0"] }); expect(p.effects).toBe("not_connected"); };
 scenarios.R02 = async () => { const f = fixture(); f.tickets.push(ticket()); const p = await f.run(); expect(target(p).target).toMatchObject({ operation: "link", alreadyNew: false }); expect(p.steps.map(s => s.mutation)).toEqual(["link_ticket", "associate_email", "append_ticket_note", "set_ticket_new"]); };
@@ -118,7 +119,10 @@ scenarios.R18 = scenarios.R05;
 scenarios.R19 = async () => { const f = closed(1); delete f.tickets[0].ownerId; reason(await f.run(), "ticket_owner_unknown"); };
 scenarios.R20 = async () => { const f = fixture(); f.tickets.push(ticket("201", { stage: "new" }), ticket("202", { createdAt: "2026-09-01T00:00:00.000Z" })); f.matches["202"] = "different"; const p = await f.run(); expect(target(p).note?.kind).toBe("multi_ticket_warning_only"); expect(p.steps.map(s => s.mutation)).not.toContain("set_ticket_new"); };
 scenarios.R21 = async () => { const f = fixture(); f.link(); expect(target(await f.run()).target.contactId).toBe("101"); };
-scenarios.R22 = scenarios.I07;
+scenarios.R22 = async () => { const f = fixture(); f.contacts["102"] = contact("102"); f.adapters.assessIdentity = async ({ candidates, evidence }) => {
+  expect(candidates).toHaveLength(2); expect(f.calls).toContain("tickets:101"); expect(f.calls).toContain("tickets:102");
+  return { kind: "equivalent", investigationComplete: true, contactIds: ["101", "102"], evidenceIds: evidence.map(e => e.id) };
+}; const p = await f.run(); reason(p, "contact_ambiguous"); expect(p.progress.kind).toBe("human_choice"); expect(p.candidateContactIds).toEqual(["101", "102"]); expect(p.progress).toMatchObject({ evidenceIds: expect.arrayContaining(["contact-101", "contact-102"]) }); };
 scenarios.R23 = async () => { const f = fixture(); f.adapters.ticketsForContact = async () => read([ticket("201", { contactIds: ["102"] })]); reason(await f.run(), "ticket_search_incomplete"); };
 scenarios.R24 = async () => { const f = fixture(); f.tickets.push(ticket()); f.adapters.assessIssues = async () => ({ investigationComplete: true, tickets: [{ ticketId: "201", relation: "same", requestIds: ["r0"], evidenceIds: ["current", "ticket-201"] }] }); reason(await f.run(), "same_issue_unresolved"); };
 scenarios.R25 = async () => { const f = closed(16); f.link(); f.tickets[0].contactIds = ["102"]; const t = target(await f.run()); expect(t.target).toMatchObject({ operation: "create", contactId: "101", predecessor: { contactId: "102", contactAssociationEvidenceId: "membership-201-102" } }); };
@@ -189,7 +193,7 @@ describe("bounds, source bindings and fail-closed behavior", () => {
   it("ignores an old linked ticket when the latest proven equivalent is newer", scenarios.R04);
   it("refuses an alias lookup whose complete email list was not supplied", async () => { const f = fixture(); f.adapters.findContactsByEmail = async () => read([contact("101", "primary@example.test")]); reason(await f.run(), "contact_lookup_incomplete"); });
   it("fails closed on incomplete notes even with matching title", async () => { const f = fixture(); f.tickets.push(ticket()); f.adapters.ticketHistory = async () => ({ ...read([]), status: "partial" }); reason(await f.run(), "history_incomplete"); });
-  it("does not use current snapshots as historical truth", async () => { const f = fixture(); f.input.mode = "at_receipt"; f.adapters.ticketsForContact = async () => read([]); reason(await f.run(), "history_incomplete"); });
+  it("does not use current snapshots as historical truth", async () => { const f = fixture(); f.input.mode = "at_receipt"; f.adapters.ticketsForContact = async () => ({ ...read([]), reconstructedAsOf: undefined }); reason(await f.run(), "history_incomplete"); });
   it("includes a ticket created after reception in a current reprise, avoiding a duplicate", async () => { const f = fixture(); f.input.now = "2026-10-21T10:00:00.000Z"; f.tickets.push(ticket("201", { createdAt: "2026-10-20T10:03:00.000Z" })); expect(target(await f.run()).target.operation).toBe("link"); });
   it("does not choose a ticket created after reception for a reconstructed historical decision", async () => { const f = fixture(); f.input.mode = "at_receipt"; f.input.now = "2026-10-21T10:00:00.000Z"; f.tickets.push(ticket("201", { createdAt: "2026-10-20T10:03:00.000Z" })); expect(target(await f.run()).target.operation).toBe("create"); });
   it("does not break a tie between equivalent closed tickets arbitrarily", async () => { const f = closed(1); f.tickets.push(ticket("202", { stage: "closed", closedAt: "2026-10-19T12:00:00.000Z" })); reason(await f.run(), "same_issue_unresolved"); });
@@ -204,4 +208,63 @@ describe("bounds, source bindings and fail-closed behavior", () => {
   it("rejects a false matching result covering only one of two requests", async () => { const f = fixture(["support", "support"]); f.tickets.push(ticket()); f.adapters.assessIssues = async () => ({ investigationComplete: true, tickets: [{ ticketId: "201", relation: "same", requestIds: ["r0"], evidenceIds: ["current", "ticket-201", "history-201"] }] }); reason(await f.run(), "same_issue_unresolved"); });
   it("rejects mutation substitution in otherwise confirmed receipts", async () => { const p = await fixture().run(); const rs = receipts(p); rs[0].mutation = "link_ticket"; expect(projectSavIntakeProgress(p, { attemptId: "attempt", receipts: rs, learningObservationId: "observation" }).view).toBeNull(); });
   it("does not claim an executable creation summary when one request is omitted", async () => { const f = fixture(["support", "support"]); f.analysis.ticketSummary!.requestIds = ["r0"]; reason(await f.run(), "classification_incomplete"); });
+});
+
+describe("independent review regressions F1-F7", () => {
+  it("F1 rejects confirmed receipts from an older creation targeting a different contact", async () => {
+    const f = fixture(); const old = await f.run(); const oldReceipts = receipts(old);
+    delete f.contacts["101"]; f.contacts["103"] = contact("103"); const next = await f.run();
+    expect(target(next).target.contactId).toBe("103"); expect(next.fingerprint).not.toBe(old.fingerprint);
+    expect(projectSavIntakeProgress(next, { attemptId: "attempt", receipts: oldReceipts, learningObservationId: "observation" }).view).toBeNull();
+  });
+  it("F1 binds receipt step IDs to summary content and refuses a trimmed step list", async () => {
+    const f = fixture(); const old = await f.run(); f.analysis.ticketSummary!.description += " Changed context.";
+    const next = await f.run(); expect(projectSavIntakeProgress(next, { attemptId: "attempt", receipts: receipts(old), learningObservationId: "observation" }).view).toBeNull();
+    const shortened = structuredClone(old); shortened.steps.pop(); expect(projectSavIntakeProgress(shortened, { attemptId: "attempt", receipts: receipts(shortened), learningObservationId: "observation" }).view).toBeNull();
+  });
+  it("F1 rejects a modified plan and malformed receipt without throwing", async () => {
+    const p = await fixture().run(); const modified = structuredClone(p); modified.newTicket!.description += " tampered";
+    expect(projectSavIntakeProgress(modified, { attemptId: "attempt", receipts: receipts(p), learningObservationId: "observation" }).view).toBeNull();
+    expect(projectSavIntakeProgress(p, { attemptId: "attempt", receipts: [null] as unknown as SavIntakeStepReceipt[] }).view).toBeNull();
+  });
+  it("F2 preserves actual observation dates including negative lookup evidence", async () => {
+    const f = fixture(); const observedAt = "2026-10-18T10:00:00.000Z"; f.adapters.findContactsByEmail = async () => ({ ...read([contact()]), observedAt });
+    f.adapters.ticketsForContact = async () => ({ ...read([]), observedAt }); f.adapters.directAssociations = async () => ({ ...read([]), observedAt });
+    const p = await f.run(); for (const id of ["email-lookup", "contact-101", "ticket-search-101", "association-search"]) expect(p.decision.evidence.find(e => e.id === id)?.observedAt).toBe(observedAt);
+    f.adapters.findContactsByEmail = async () => ({ ...read([]), observedAt }); const missing = await f.run(); expect(missing.decision.evidence.find(e => e.id === "email-lookup")?.observedAt).toBe(observedAt);
+  });
+  it("F3 requires historical reconstruction for lookup, associations, related contact and histories", async () => {
+    for (const part of ["lookup", "associations", "contact", "history"]) {
+      const f = fixture(); f.input.mode = "at_receipt"; f.link(); f.tickets.push(ticket());
+      if (part === "lookup") f.adapters.findContactsByEmail = async () => ({ ...read([contact()]), reconstructedAsOf: undefined });
+      if (part === "associations") f.adapters.directAssociations = async () => ({ ...read([]), reconstructedAsOf: undefined });
+      if (part === "contact") f.adapters.getContact = async () => ({ ...read(contact("102", "linked@example.test")), reconstructedAsOf: undefined });
+      if (part === "history") f.adapters.ticketHistory = async () => ({ ...read([]), reconstructedAsOf: undefined });
+      reason(await f.run(), "history_incomplete");
+    }
+  });
+  it("F4 stops at the evidence cap safely when tickets have dense multi-contact membership", async () => {
+    const f = fixture(); const ids = Array.from({ length: 10 }, (_, i) => String(101 + i));
+    for (const id of ids.slice(1)) f.contacts[id] = contact(id, `linked${id}@example.test`);
+    f.adapters.directAssociations = async () => read(ids.slice(1).map(id => ({ fromContactId: "101", toContactId: id, category: "HUBSPOT_DEFINED", typeId: 449 })));
+    for (let i = 0; i < 7; i++) f.tickets.push(ticket(String(201 + i), { contactIds: ids }));
+    const p = await f.run(); reason(p, "history_incomplete"); expect(p.decision.evidence.length).toBeLessThanOrEqual(95);
+  });
+  it("F5 neutral request permutations preserve classification, view and plan", async () => {
+    const f = fixture(["other", "acknowledgement"]); const a = await f.run(); f.analysis.requests.reverse(); const b = await f.run(); expect(a).toEqual(b);
+  });
+  it("F6 normalizes history and issue assessment order", async () => {
+    const f = fixture(); f.tickets.push(ticket(), ticket("202", { createdAt: "2026-10-02T00:00:00.000Z" }));
+    let reverse = false; f.adapters.ticketHistory = async () => { const h = [ { id: "a", kind: "note" as const, text: "first", at: "2026-10-19T10:00:00.000Z" }, { id: "b", kind: "email" as const, text: "second", at } ]; return read(reverse ? h.reverse() : h); };
+    const assess = f.adapters.assessIssues; f.adapters.assessIssues = async (arg, signal) => { const r = await assess(arg, signal); if (reverse) { r.tickets.reverse(); for (const row of r.tickets) row.evidenceIds.reverse(); } return r; };
+    const a = await f.run(); reverse = true; const b = await f.run(); expect(a).toEqual(b);
+  });
+  it("F6 rejects conflicting history records sharing one event ID", async () => { const f = fixture(); f.tickets.push(ticket()); f.adapters.ticketHistory = async () => read([{ id: "a", kind: "note", text: "first", at }, { id: "a", kind: "note", text: "contradiction", at }]); reason(await f.run(), "history_incomplete"); });
+  it("F7 preserves unresolved contacts without claiming investigation complete", scenarios.I07);
+  it("F7 permits only a targeted choice after complete candidate investigation and explicit equivalence", scenarios.R22);
+  it("F7 resolves a uniquely qualified candidate after reading both candidate histories", async () => {
+    const f = fixture(); f.contacts["102"] = contact("102"); f.tickets.push(ticket("202", { contactIds: ["102"] }));
+    f.adapters.assessIdentity = async ({ candidates, evidence }) => { expect(candidates[1].tickets[0].history).toHaveLength(1); return { kind: "unique", investigationComplete: true, contactIds: ["102"], evidenceIds: evidence.map(e => e.id) }; };
+    const p = await f.run(); expect(target(p).target).toMatchObject({ operation: "link", contactId: "102", ticketId: "202" });
+  });
 });
