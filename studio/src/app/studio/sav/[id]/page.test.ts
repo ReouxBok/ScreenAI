@@ -76,7 +76,7 @@ function proposalFixture(): SavStructuredProposal {
 function reviewFixture(approved = false): ProposalReviewData {
   const proposal = proposalFixture();
   return { decisionId, agentRunId: runId, model: "fixture", promptRevision: "fixture-prompt", before: structuredClone(proposal), proposal,
-    expectedReviewId: approved?reviewId:null, draftHash:"x".repeat(43), draftVerdict:null,historicalReview:null,
+    expectedReviewId: approved?reviewId:null, suggestionFeedbackHash:"s".repeat(43),draftHash:"x".repeat(43), draftVerdict:null,historicalReview:null,
     review: approved ? { scope:"dossier", id: reviewId, status: "approved", verdict: "correct",
       dimensions: { classification: "correct", routing: "correct", grounding: "correct", tone: "correct", escalation: "correct" },
       reviewedBy: "ugo@limova.ai", reviewedAt: now, reasons: [], comment: "Process vérifié par un humain.", reusability: "none" } : null,

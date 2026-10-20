@@ -68,7 +68,7 @@ export async function GET(request: Request) {
   const translations=await runStep("message_translations",()=>reconcileSavTranslations(2,{deadlineMs:derivedDeadline}));
   const retention = await runStep("retention", () => enforceSavRetention());
   const dashboardProjection = savSqlDashboardEnabled()
-    ? await runStep("dashboard_projection", () => refreshSavDashboardProjection(100))
+    ? await runStep("dashboard_projection", () => refreshSavDashboardProjection(25, undefined, { deadlineMs: derivedDeadline }))
     : { status: "skipped" as const, durationMs: 0, data: { reason: "disabled" } };
   const payload = { gmail, hubspot, emailOpenings, contextRefreshes, trainings, evaluations, ticketActions, pilotItems, pendingMessages, pilotActions, followups, replies, statusActions, learningBackfill, observations, translations, retention, dashboardProjection };
   const hasStepFailure = Object.values(payload).some((step) => step.status === "error");

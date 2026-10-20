@@ -51,3 +51,4 @@ next-env.d.ts
 /.e2e-journey-*
 
 /.e2e-sav73-db
+/.e2e-sav-performance-*-db

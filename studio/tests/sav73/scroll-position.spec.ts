@@ -29,7 +29,8 @@ async function submitWithoutJump(page: Page, button: Locator) {
 }
 
 test("same-dossier actions preserve reading position, including repeated redirects", async ({ page }) => {
-  await page.goto(`/studio/sav/${SAV53_THREADS.singlePlain}`);
+  const returnTo = "/studio/sav?view=learning&q=Échec+export+PDF+fictif&sort=oldest";
+  await page.goto(`/studio/sav/${SAV53_THREADS.singlePlain}?returnTo=${encodeURIComponent(returnTo)}`);
   const process = page.locator("#sav-review-form");
   await process.getByText("Aucun ticket nécessaire", { exact: true }).click();
   await expect(process.getByRole("radio", { name: "Aucun ticket nécessaire", exact: true })).toBeChecked();
@@ -41,20 +42,25 @@ test("same-dossier actions preserve reading position, including repeated redirec
   await process.getByRole("checkbox", { name: /J’ai vérifié/ }).check();
   await submitWithoutJump(page, validate); // Revalidate the same dossier.
 
-  const draft = page.getByRole("region", { name: "Verdict du brouillon", exact: true });
-  await draft.getByLabel("Corriger le brouillon").fill("Bonjour, voici une réponse humaine synthétique pour cette demande.");
+  const draft = page.getByRole("region", { name: "Suggestion de réponse", exact: true });
+  await draft.getByRole("textbox", { name: "Suggestion de réponse", exact: true }).fill("Bonjour, voici une réponse humaine synthétique pour cette demande.");
   await submitWithoutJump(page, draft.getByRole("button", { name: "Enregistrer ma version", exact: true }));
-  await submitWithoutJump(page, draft.getByRole("button", { name: "Accepter cette version", exact: true }));
-  await expect(draft).toContainText("Brouillon accepté");
-  await draft.getByLabel("Motif du refus (facultatif)").fill("Vérification synthétique du parcours de refus.");
-  await submitWithoutJump(page, draft.getByRole("button", { name: "Refuser le brouillon", exact: true }));
-  await expect(draft).toContainText("Brouillon refusé");
+  await expect(draft.getByRole("textbox", { name: "Suggestion de réponse", exact: true })).toHaveValue("Bonjour, voici une réponse humaine synthétique pour cette demande.");
+  await draft.getByText("Feedback facultatif sur la suggestion", { exact: true }).click();
+  await draft.getByLabel("Commentaire", { exact: true }).fill("Vérification synthétique du parcours de refus.");
+  await submitWithoutJump(page, draft.getByRole("button", { name: "Signaler un problème dans la suggestion initiale", exact: true }));
+  await expect(page).toHaveURL(/review=draft_reviewed/);
+  await expect(draft).toContainText("Suggestion disponible");
 
   const beforeReload = await page.evaluate(() => window.scrollY);
   await page.reload();
-  await expect(draft).toContainText("Brouillon refusé");
+  await expect(draft.getByRole("textbox", { name: "Suggestion de réponse", exact: true })).toHaveValue("Bonjour, voici une réponse humaine synthétique pour cette demande.");
   await expect.poll(async () => Math.abs(await page.evaluate(() => window.scrollY) - beforeReload)).toBeLessThan(4);
-
+  await expect(page.getByRole("region", { name: "Journal du suivi", exact: true })).toContainText("Fil Gmail suivi");
+  await page.getByRole("link", { name: "← Retour aux dossiers", exact: true }).click();
+  await expect(page).toHaveURL(/view=learning&q=.*sort=oldest/);
+  await expect(page.getByLabel("Rechercher un dossier")).toHaveValue("Échec export PDF fictif");
+  await expect(page.locator(`#dossier-${SAV53_THREADS.singlePlain}`)).toBeVisible();
 });
 
 test("intentional section links and a different dossier keep normal navigation", async ({ page }) => {

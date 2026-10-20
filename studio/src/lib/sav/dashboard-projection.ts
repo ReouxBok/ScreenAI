@@ -36,12 +36,17 @@ async function generation(db: SavDashboardDb): Promise<Generation> {
  * Lock cache versions before reading any source. A concurrent writer either
  * precedes this snapshot or invalidates again after this transaction commits.
  * Bounded retries handle repeatable-read conflicts; no provider/model calls. */
-export async function refreshSavDashboardProjection(limit = SAV_DASHBOARD_REPAIR_LIMIT, threadId?: string) {
+export async function refreshSavDashboardProjection(limit = SAV_DASHBOARD_REPAIR_LIMIT, threadId?: string, options: { deadlineMs?: number } = {}) {
   const batchSize = Math.max(1, Math.min(100, Math.trunc(limit) || SAV_DASHBOARD_REPAIR_LIMIT));
+  const checkDeadline = () => {
+    if (options.deadlineMs !== undefined && Date.now() >= options.deadlineMs) throw new Error("SAV_DASHBOARD_REPAIR_DEADLINE");
+  };
   for (let attempt = 0; ; attempt++) {
     try {
+      checkDeadline();
       return await requireDb().transaction(async db => {
         const current = await generation(db);
+        checkDeadline();
         // Restore missing cache entries too; a partial cache must never look
         // like an empty business list after maintenance or restoration.
         await execute(db, sql`insert into sav.dashboard_projection(thread_id)
@@ -51,13 +56,16 @@ export async function refreshSavDashboardProjection(limit = SAV_DASHBOARD_REPAIR
         const dirty = await execute<{ thread_id: string; version: string }>(db, sql`select thread_id, version::text from sav.dashboard_projection
           where ${scope(threadId)} and (indexed_version <> version or generation is distinct from ${current.key})
           order by thread_id limit ${batchSize} for update skip locked`);
+        checkDeadline();
         if (!dirty.length) return { refreshed: 0 };
         const rows = new Map<string, { row: SavDashboardRow; search: string }>();
         await listSavDossierDashboardReference({ db, threadIds: dirty.map(item => item.thread_id), capture: (row, search) => {
           if (rows.has(row.threadId)) throw new Error("SAV_DASHBOARD_SOURCE_AMBIGUOUS");
           rows.set(row.threadId, { row, search });
         } });
+        checkDeadline();
         for (const item of dirty) {
+          checkDeadline();
           const projected = rows.get(item.thread_id);
           if (!projected) {
             await execute(db, sql`update sav.dashboard_projection set indexed_version = version, generation = ${current.key},
@@ -66,15 +74,18 @@ export async function refreshSavDashboardProjection(limit = SAV_DASHBOARD_REPAIR
             continue;
           }
           const { row, search } = projected, index = indexSavDashboardSearch(search);
+          checkDeadline();
           await execute(db, sql`update sav.dashboard_projection set indexed_version = version, generation = ${current.key},
             message_id = ${row.messageId}::uuid, received_at = (select received_at from sav.messages where id = ${row.messageId}::uuid),
             state = ${row.state}, technical = ${row.technical}, incident = ${row.incident}, is_other = ${Boolean(row.otherObservation)},
             search_grams = ${textArray(index.grams)}, search_stream = ${index.stream}, updated_at = now()
             where thread_id = ${item.thread_id}::uuid`);
         }
+        checkDeadline();
         return { refreshed: dirty.length };
       }, { isolationLevel: "repeatable read" });
     } catch (error) {
+      if (error instanceof Error && error.message === "SAV_DASHBOARD_REPAIR_DEADLINE") return { refreshed: 0, deferred: "deadline" as const };
       // Drizzle retains PostgreSQL's SQLSTATE on cause. Retry the entire snapshot.
       const code = (error as { code?: string; cause?: { code?: string } }).cause?.code ?? (error as { code?: string }).code;
       if (attempt >= 1 || !["40001", "40P01"].includes(code ?? "")) throw error;

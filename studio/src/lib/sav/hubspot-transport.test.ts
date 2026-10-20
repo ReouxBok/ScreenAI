@@ -60,6 +60,35 @@ describe("classified CRM reads", () => {
       .rejects.toThrow("SAV_HUBSPOT_READ_CANCELLED");
     expect(network).not.toHaveBeenCalled();
   });
+  it.each(["backoff", "search spacing"])("cancels during %s and transfers exactly one slot", async phase => {
+    vi.useFakeTimers();
+    const releases: Array<() => void> = [];
+    const network = vi.fn<typeof fetch>(async url => {
+      if (String(url).includes("/cancel/")) return new Response("", { status: 429, headers: { "Retry-After": "12" } });
+      if (String(url).endsWith("/search")) return Response.json({ results: [] });
+      return new Promise(resolve => releases.push(() => resolve(Response.json({ ok: true }))));
+    });
+    const transport = createSavHubspotTransport(network);
+    if (phase === "search spacing") await transport("/crm/v3/objects/contacts/search", { method: "POST" }, summarize);
+    const occupied = Array.from({ length: 2 }, () => transport("/crm/v3/pipelines/tickets", {}, summarize));
+    const controller = new AbortController();
+    let cancelled = false;
+    const cancelledRead = transport(phase === "backoff" ? "/cancel/read" : "/crm/v3/objects/tickets/search", { signal: controller.signal }, summarize)
+      .catch(error => { expect(error.message).toBe("SAV_HUBSPOT_READ_CANCELLED"); cancelled = true; });
+    await vi.advanceTimersByTimeAsync(0);
+    const waiting = Array.from({ length: 2 }, () => transport("/crm/v3/pipelines/tickets", {}, summarize));
+    await vi.advanceTimersByTimeAsync(phase === "backoff" ? 8000 : 100);
+    controller.abort();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(cancelled).toBe(true);
+    expect(releases).toHaveLength(3);
+    releases[0](); await vi.advanceTimersByTimeAsync(0);
+    expect(releases).toHaveLength(4);
+    releases[1](); releases[2](); releases[3]();
+    await Promise.all([...occupied, ...waiting, cancelledRead]);
+    expect(network.mock.calls.filter(([url]) => String(url).includes("/cancel/")).length).toBe(phase === "backoff" ? 1 : 0);
+    expect(vi.getTimerCount()).toBe(0);
+  });
   it("does not leak provider body, URL IDs or credentials to metrics", async () => {
     const network = vi.fn<typeof fetch>().mockResolvedValue(new Response("private-body customer@invalid.test", { status: 403 }));
     await expect(createSavHubspotTransport(network)("/crm/v3/objects/tickets/private-ticket-id", { headers: { Authorization: "Bearer private-key" } }, summarize)).rejects.toThrow("HUBSPOT_HTTP_403");

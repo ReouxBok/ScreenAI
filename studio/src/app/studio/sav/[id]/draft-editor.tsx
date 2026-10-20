@@ -30,10 +30,10 @@ export function DraftEditor(p:Props) {
    <ConfirmSend disabled={Boolean(p.requiresHumanLanguage&&origin!=="human")||!p.sendAllowed||busy||!preview||hash?.preview!==preview||!p.recipient}/>
    <p>{p.replyState==="sent"?"Réponse déjà envoyée.":p.replyState==="uncertain"?"Résultat à vérifier dans Gmail avant toute reprise.":p.replyState==="pending"?"Envoi en attente. Aucun second envoi.":!p.sendAllowed?p.sendDisabledReason:"Ce bouton confirme le texte et le destinataire affichés. Aucun verdict préalable n’est requis."}</p>
   </form>
-  <details><summary>Feedback facultatif sur la suggestion</summary><form action={reviewDraftAction}>
+  {p.original&&<details><summary>Feedback facultatif sur la suggestion</summary><form action={reviewDraftAction}>
    <input type="hidden" name="threadId" value={p.threadId}/><input type="hidden" name="messageId" value={p.messageId}/><input type="hidden" name="decisionId" value={p.decisionId}/><input type="hidden" name="agentRunId" value={p.agentRunId}/><input type="hidden" name="sourceHash" value={p.feedbackSourceHash??p.sourceHash}/><input type="hidden" name="verdictId" value={p.verdictId??""}/>
    <label>Commentaire<textarea name="reason" maxLength={500} defaultValue={p.reason}/></label><fieldset><legend>Retours sur la suggestion</legend>{p.reasonLabels.map(([value,label])=><label key={value}><input type="checkbox" name="reasons" value={value} defaultChecked={p.reasons.includes(value)}/>{label}</label>)}</fieldset>
    <button className="secondary" name="status" value="rejected" disabled={busy||dirty}>Signaler un problème dans la suggestion initiale</button>
-  </form></details>
+  </form></details>}
  </>;
 }

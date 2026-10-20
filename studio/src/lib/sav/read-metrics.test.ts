@@ -7,7 +7,7 @@ it("isolates concurrent read counters and only emits aggregate fields",async()=>
   await Promise.all([1,2].map(count=>measureSavDashboardRead("sql",async()=>{countSavRead("queries",count);await Promise.resolve();countSavRead("sourceRows",count);})));
   expect(info.mock.calls.map(args=>args[1].queries).sort()).toEqual([1,2]);
   expect(info.mock.calls.map(args=>args[1].sourceRows).sort()).toEqual([1,2]);
-  expect(Object.keys(info.mock.calls[0][1]).sort()).toEqual(["ciphertextBytes","classifiedRows","decryptions","durationMs","mode","queries","relatedRows","revision","sourceRows","status"].sort());
+  expect(Object.keys(info.mock.calls[0][1]).sort()).toEqual(["ciphertextBytes","classifiedRows","decryptions","decryptionMs","durationMs","mode","queries","relatedRows","revision","sourceRows","status"].sort());
 });
 it("distinguishes pending projection from failure without swallowing errors",async()=>{
   const info=vi.spyOn(console,"info").mockImplementation(()=>{});

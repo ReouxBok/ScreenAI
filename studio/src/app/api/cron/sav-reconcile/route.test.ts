@@ -6,6 +6,7 @@ vi.mock("@/lib/sav/service",()=>({processPendingSavPilotItems:d.pilot,processPen
 vi.mock("@/lib/sav/followups",()=>({processDueFollowups:d.followups}));
 vi.mock("@/lib/sav/observations",()=>({reconcileSavObservations:d.observations}));
 vi.mock("@/lib/sav/retention",()=>({enforceSavRetention:d.retention}));
+vi.mock("@/lib/sav/translations",()=>({reconcileSavTranslations:vi.fn(async()=>({processed:0}))}));
 vi.mock("@/lib/training",()=>({reconcileStaleTrainings:d.trainings}));
 vi.mock("@/lib/evaluations",()=>({expireStaleEvaluationRuns:d.evaluations}));
 vi.mock("@/lib/sav/dispatch",()=>({dispatchPendingSavEmailOpenings:d.openings,processPendingSavContextRefreshes:d.context}));
@@ -36,5 +37,5 @@ it("continues shared recovery after a dispatch failure and reports that failure"
   expect(await response.json()).toMatchObject({emailOpenings:{status:"error",errorCode:"SYNTHETIC_DISPATCH_UNAVAILABLE"}});
 });
 it("only repairs a bounded projection batch when explicitly enabled",async()=>{
-  d.enabled.mockReturnValue(true);expect((await GET(request())).status).toBe(200);expect(d.projection).toHaveBeenCalledWith(100);
+  d.enabled.mockReturnValue(true);expect((await GET(request())).status).toBe(200);expect(d.projection).toHaveBeenCalledWith(25,undefined,{deadlineMs:expect.any(Number)});
 });

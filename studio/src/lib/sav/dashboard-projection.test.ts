@@ -81,6 +81,21 @@ it("detects global cutover and registry changes, and supports explicit bounded w
   await fixture.client.exec("update sav.sync_state set status='active' where key='sav-v0-cutover'");
   expect(await refreshSavDashboardProjection(100)).toEqual({ refreshed: 1 }); await equivalent();
 });
+it("defers expired maintenance without touching a dirty projection", async () => {
+  await seed();
+  expect(await refreshSavDashboardProjection(25, undefined, { deadlineMs: Date.now() - 1 })).toEqual({ refreshed: 0, deferred: "deadline" });
+  expect((await fixture.client.query<{ dirty: boolean }>("select indexed_version<>version as dirty from sav.dashboard_projection")).rows[0].dirty).toBe(true);
+  await equivalent();
+});
+it("rolls a maintenance transaction back when its deadline expires after selecting dirty versions", async () => {
+  await seed();
+  const clock = vi.spyOn(Date, "now").mockReturnValueOnce(100).mockReturnValueOnce(100).mockReturnValue(200);
+  expect(await refreshSavDashboardProjection(25, undefined, { deadlineMs: 150 })).toEqual({ refreshed: 0, deferred: "deadline" });
+  clock.mockRestore();
+  const [projection] = (await fixture.client.query<{ indexed_version: string; generation: string | null }>("select indexed_version::text,generation from sav.dashboard_projection")).rows;
+  expect(projection).toEqual({ indexed_version: "0", generation: null });
+  await equivalent();
+});
 
 it("invalidates cutover membership when the source mailbox changes", async () => {
   await seed(); await equivalent();

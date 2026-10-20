@@ -1,6 +1,16 @@
 import "server-only";
 
-export const SAV_CRM_TRANSPORT_REVISION = "sav-crm-read-2026-10-19.v2";
+export const SAV_CRM_TRANSPORT_REVISION = "sav-crm-read-2026-10-20.v3";
+/** All scheduling waits must release their timer/listener when the caller expires. */
+async function waitForRead(delay: number, signal?: AbortSignal | null) {
+  if (signal?.aborted) throw new Error("SAV_HUBSPOT_READ_CANCELLED");
+  await new Promise<void>((resolve, reject) => {
+    const cleanup = () => { clearTimeout(timer); signal?.removeEventListener("abort", cancel); };
+    const cancel = () => { cleanup(); reject(new Error("SAV_HUBSPOT_READ_CANCELLED")); };
+    const timer = setTimeout(() => { cleanup(); resolve(); }, delay);
+    signal?.addEventListener("abort", cancel, { once: true });
+  });
+}
 /** POST is retryable only for these documented read operations. */
 export function isSavHubspotRead(path: string, method = "GET") {
   if (method.toUpperCase() === "GET") return true;
@@ -38,7 +48,7 @@ export function createSavHubspotTransport(network: typeof fetch = fetch) {
         if (path.endsWith("/search") && read) {
           const scheduled = Math.max(Date.now(), nextSearchAt); nextSearchAt = scheduled + 250;
           if (scheduled >= deadline) throw new Error("SAV_HUBSPOT_READ_QUEUE_TIMEOUT");
-          if (scheduled > Date.now()) await new Promise(r => setTimeout(r, scheduled - Date.now()));
+          if (scheduled > Date.now()) await waitForRead(scheduled - Date.now(), init.signal);
         }
         const remaining = deadline - Date.now();
         if (remaining <= 0) throw new Error("SAV_HUBSPOT_READ_TIMEOUT");
@@ -61,12 +71,12 @@ export function createSavHubspotTransport(network: typeof fetch = fetch) {
           try { return await response.json() as T; }
           catch { throw new Error("SAV_HUBSPOT_INVALID_RESPONSE"); }
         } catch (error) {
-          const code = controller.signal.aborted ? "SAV_HUBSPOT_READ_TIMEOUT" : error instanceof Error && /^(HUBSPOT_HTTP_\d{3}|SAV_HUBSPOT_INVALID_RESPONSE)/.test(error.message) ? error.message : "SAV_HUBSPOT_READ_UNAVAILABLE";
+          const code = init.signal?.aborted ? "SAV_HUBSPOT_READ_CANCELLED" : controller.signal.aborted ? "SAV_HUBSPOT_READ_TIMEOUT" : error instanceof Error && /^(HUBSPOT_HTTP_\d{3}|SAV_HUBSPOT_INVALID_RESPONSE)/.test(error.message) ? error.message : "SAV_HUBSPOT_READ_UNAVAILABLE";
           const transient = /^(HUBSPOT_HTTP_(429|502|503|504)|SAV_HUBSPOT_READ_(TIMEOUT|UNAVAILABLE))/.test(code);
           const delay = Math.max(200, retryAfter) + Math.floor(Math.random() * 100);
           if (!read || !transient || attempts >= 2 || init.signal?.aborted || deadline - Date.now() <= delay + 100) throw new Error(code);
           clearTimeout(timer);
-          await new Promise(r => setTimeout(r, delay));
+          await waitForRead(delay, init.signal);
         } finally { clearTimeout(timer); }
       }
     } finally {

@@ -8,7 +8,7 @@ import { UnderstandingReview } from "./understanding-review";
 import { ProposalReview } from "./proposal-review";
 import { DraftReview } from "./draft-review";
 const original = { ...v0Proposal(), category: "billing" as const, understanding: sav44Understanding() };
-const data = () => ({ before: original, proposal: { ...original, category: "technical" as const }, decisionId: "synthetic-decision", agentRunId: "synthetic-run", model: "synthetic-model", promptRevision: "synthetic-prompt", expectedReviewId: null, draftHash: "x".repeat(43), draftVerdict: null, historicalReview: null, review: null });
+const data = () => ({ before: original, proposal: { ...original, category: "technical" as const }, decisionId: "synthetic-decision", agentRunId: "synthetic-run", model: "synthetic-model", promptRevision: "synthetic-prompt", expectedReviewId: null, suggestionFeedbackHash:"s".repeat(43),draftHash: "x".repeat(43), draftVerdict: null, historicalReview: null, review: null });
 describe("SAV44 original understanding and independent feedback forms", () => {
   it.each(["registration_email_required", "registration_lookup_unavailable", "registration_email_confirmation_required"])("does not preselect ticket creation while identity is pending: %s", reason => {
     const current = data();
