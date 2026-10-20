@@ -162,10 +162,11 @@ export function createSavIntakeHubspotReaders(options: {
         if (!members.includes(contactId)) throw new ReadFault("partial", "ticket_membership_conflict");
         const stage = row.properties.hs_pipeline_stage;
         const owner = Object.hasOwn(row.properties, "hubspot_owner_id") ? row.properties.hubspot_owner_id || null : undefined;
+        if (!Object.hasOwn(row.properties, "content")) throw new ReadFault("partial", "ticket_content_unavailable");
         tickets.push(intakeTicketSchema.parse({ id: row.id, contactIds: members,
           stage: stage === "1" ? "new" : stage === "4" ? "closed" : ["2", "3"].includes(stage ?? "") ? "open" : "unknown",
           createdAt: iso(row.properties.createdate ?? row.createdAt), closedAt: iso(row.properties.hs_last_closed_date || row.properties.closed_date),
-          ...(owner === undefined ? {} : { ownerId: owner }), subject: z.string().parse(row.properties.subject), content: z.string().parse(row.properties.content) }));
+          ...(owner === undefined ? {} : { ownerId: owner }), subject: z.string().parse(row.properties.subject), content: z.string().parse(row.properties.content ?? "") }));
       }
       return tickets;
     }),

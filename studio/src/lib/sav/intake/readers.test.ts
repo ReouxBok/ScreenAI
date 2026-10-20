@@ -167,3 +167,47 @@ describe("bounded evaluation, with no operational writer", () => {
     expect(result.stopReason).toBe("EXISTING_TOTAL_BUDGET_EXHAUSTED");
   });
 });
+
+describe("independent review corrections", () => {
+  it("F1 requires comparative citations for every identity candidate, ticket and nonempty history", async () => {
+    const candidates = ["101", "102"].map(id => ({ contact: { id, emails: [msg.fromEmail] },
+      tickets: [{ ticket: { id: `2${id}`, contactIds: [id], stage: "new" as const, subject: "Upload", content: "Complete context" },
+        history: [{ id: `note-${id}`, kind: "note" as const, at, text: `Specific context ${id}` }] }] }));
+    const raw = { kind: "unique", investigationComplete: true, contactIds: ["101"], evidenceIds: ["current"], rationale: "Only first fits",
+      grounding: [{ sourceId: "current", quote: msg.currentText }, { sourceId: "contact-101", quote: "101" }] };
+    const args = { message: msg, address: msg.fromEmail, candidates, evidence: [] };
+    await expect(createSavIntakeSemanticReaders({ model: "gemini-configured", call: call(raw) }).assessIdentity!(args, signal())).rejects.toThrow("CITATION_REJECTED");
+    raw.grounding.push({ sourceId: "contact-102", quote: "102" },
+      ...["101", "102"].flatMap(id => [{ sourceId: `identity-ticket-2${id}`, quote: "Complete context" }, { sourceId: `identity-history-2${id}`, quote: `Specific context ${id}` }]));
+    await expect(createSavIntakeSemanticReaders({ model: "gemini-configured", call: call(raw) }).assessIdentity!(args, signal())).resolves.toMatchObject({ kind: "unique" });
+  });
+  it.each(["", "Bonjour"])("F2 preserves an initial subject as current evidence with body '%s'", async body => {
+    const subject = "Cancel my subscription";
+    const prepared = prepareSavIntakeMessage({ ...msg, subject, body, bodyComplete: true, unresolvedAttachments: false });
+    expect(prepared.message.currentText).toContain(subject); expect(prepared.message.contentComplete).toBe(true);
+    const raw = { messageId: mid, requests: [{ id: "r0", kind: "cancellation", currentMessageId: mid, quote: subject }] };
+    const models = createSavIntakeSemanticReaders({ model: "gemini-configured", call: call(raw), provenance: new Map([[mid, prepared.provenance]]) });
+    await expect(models.analyseMessage({ message: prepared.message, conversation: [] }, signal())).resolves.toMatchObject({ requests: [{ kind: "cancellation" }] });
+  });
+  it("F2 excludes inherited/forwarded subjects and marks a truncated initial subject incomplete", () => {
+    for (const subject of ["Re: Cancel my subscription", "Fwd: Cancel my subscription"]) {
+      const p = prepareSavIntakeMessage({ ...msg, subject, body: "", bodyComplete: true, unresolvedAttachments: false });
+      expect(p.message.currentText).toBe(""); expect(p.provenance.subjectInherited).toBe(true);
+    }
+    expect(prepareSavIntakeMessage({ ...msg, subject: "x".repeat(2001), body: "", bodyComplete: true, unresolvedAttachments: false }).message.contentComplete).toBe(false);
+  });
+  it("F3 distinguishes an explicitly null ticket description from an unreturned property", async () => {
+    for (const known of [true, false]) {
+      const f = crm(url => {
+        if (url.pathname === "/crm/v4/objects/contacts/101/associations/tickets") return { results: [edge("201")] };
+        if (url.pathname === "/crm/v4/objects/tickets/201/associations/contacts") return { results: [edge("101")] };
+        if (url.pathname.endsWith("/tickets/batch/read")) return { status: "COMPLETE", results: [{ id: "201", properties: {
+          subject: "Upload", ...(known ? { content: null } : {}), createdate: at, hs_pipeline: "0", hs_pipeline_stage: "1", hubspot_owner_id: null,
+        } }] };
+      });
+      const result = await f.readers.ticketsForContact("101", signal());
+      if (known) expect(result).toMatchObject({ status: "complete", data: [{ content: "" }] });
+      else expect(result.status).toBe("partial");
+    }
+  });
+});
