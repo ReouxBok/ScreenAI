@@ -15,6 +15,8 @@ import { resolveSavCustomerMessage } from "@/lib/sav/forwarded-identity";
 import { savActionLabels, savToolStatusLabels, savDecisionLabels, savLabel, savRunStatusLabels, savThreadStatusLabels } from "@/lib/sav/labels";
 import { getSavPartnershipTransferState, isSavPartnershipForward } from "@/lib/sav/partnership-forward";
 import { PartnershipTransfer } from "../partnership-transfer";
+import { DossierViewport } from "./dossier-viewport";
+import { SavFilingProgress } from "../filing-progress";
 import { SavDossierOpened, SavDossierBackLink } from "../dossier-opened";
 import { TicketSelector } from "./ticket-selector";
 import { savTicketStageLabel } from "./ticket-status-label";
@@ -66,10 +68,10 @@ const filingNotices: Record<string, string> = {
   SAV_GMAIL_FILING_FAILED: "Le classement Gmail n’a pas pu être confirmé. Vous pouvez consulter le dossier SAV ; vérifiez Gmail avant de considérer le mail comme classé.",
 };
 
-export default async function SavThreadPage({ params, searchParams }: { params: Promise<{ id: string }>; searchParams: Promise<{ from?: string; batch?: string; review?: string; filing?: string; context?: string; refreshId?: string; returnTo?: string }> }) {
+export default async function SavThreadPage({ params, searchParams }: { params: Promise<{ id: string }>; searchParams: Promise<{ from?: string; batch?: string; review?: string; filing?: string; filingId?: string; context?: string; refreshId?: string; returnTo?: string }> }) {
   const staff = await requireStaff("admin");
   const { id } = await params;
-  const { from = "", batch = "", review = "", filing = "", context = "", refreshId = "", returnTo } = await searchParams;
+  const { from = "", batch = "", review = "", filing = "", filingId = "", context = "", refreshId = "", returnTo } = await searchParams;
   const detail = await getSavThreadDetail(id);
   if (!detail) notFound();
   const v0 = savReleaseStage() === "v0";
@@ -154,10 +156,11 @@ export default async function SavThreadPage({ params, searchParams }: { params: 
       : replyState === "pending" ? { label: "Réponse", detail: "En file d’envoi", state: "todo" } : { label: "Réponse", detail: proposalReview?.proposal.replyDraft ? "Suggestion disponible" : "Aucune suggestion", state: "pending" },
   ];
 
-  return <>
+  return <DossierViewport key={id}>
     {externalCompletion && <p className="login-notice" role="status"><strong>Traité hors Studio.</strong> Ce message a été classé administrativement le {formatParisDateTime(externalCompletion.createdAt)}. Cela ne valide ni la proposition IA ni le brouillon et ne crée aucun apprentissage. Un nouvel email revient dans le flux normal.</p>}
-    {v0 && !detail.pilotItem && eligible && latestInbound && <SavDossierOpened threadId={id} messageId={latestInbound.id}/>}
-    {filing && <p className={`login-notice ${["filed", "already_filed", "SAV_GMAIL_FILING_DISABLED", "SAV_GMAIL_FILING_PILOT_BLOCKED"].includes(filing) ? "" : "error"}`} role="status">{filingNotices[filing] ?? filingNotices.SAV_GMAIL_FILING_FAILED}</p>}
+    {v0 && !detail.pilotItem && eligible && latestInbound && !latestInbound.studioOpenedAt && <SavDossierOpened threadId={id} messageId={latestInbound.id}/>}
+    {filing === "pending" && /^[a-f0-9-]{36}$/i.test(filingId) && <SavFilingProgress threadId={id} commandId={filingId}/> }
+    {filing && (filing !== "pending" || !/^[a-f0-9-]{36}$/i.test(filingId)) && <p className={`login-notice ${["filed", "already_filed", "SAV_GMAIL_FILING_DISABLED", "SAV_GMAIL_FILING_PILOT_BLOCKED"].includes(filing) ? "" : "error"}`} role="status">{filingNotices[filing] ?? filingNotices.SAV_GMAIL_FILING_FAILED}</p>}
     {refreshId && <SavContextProgress threadId={id} requestId={refreshId}/>}
     {context && !refreshId && <p className={`login-notice ${context === "refreshed" ? "" : "error"}`} role="status">{context === "refreshed" ? "Contexte client actualisé à l’ouverture du dossier." : "Contexte HubSpot incomplet : vérifiez l’accès puis utilisez « Actualiser le contexte client »."}</p>}
     {review && <p className="login-notice" role="status">{({ observation_qualified: "Bilan qualifié. Aucune connaissance publiée.", draft_reviewed: "Verdict du brouillon enregistré. Aucun email envoyé, aucun ticket créé.", SAV_DRAFT_READ_ONLY: "Le brouillon IA est en lecture seule.", context_refreshed: "Contexte client actualisé. La proposition existante n’a pas été modifiée.", proposal_repaired: "Proposition reconstituée. Aucun email envoyé, aucun ticket créé." } as Record<string, string>)[review] ?? persistedTicketNotice ?? manualReplyNotices[review] ?? reviewNotices[review] ?? (review === "saved" ? "Revue enregistrée. Aucun email envoyé, aucun ticket créé par cette validation." : review === "ticket_queued" ? "Action enregistrée. Son exécution immédiate ou son état en cours est visible dans le journal ; le worker planifié reprend toute action encore en attente." : review === "ticket_done" ? "Action ticket exécutée et confirmée par HubSpot. Consultez le journal pour le ticket concerné." : review === "ticket_processing_deferred" ? "Action enregistrée durablement. Le traitement immédiat n’a pas pu démarrer ; le worker planifié la reprendra et son état restera visible dans le journal." : review === "ticket_reconciled" ? "Ticket existant vérifié et rapproché. Aucun nouveau ticket créé." : review.startsWith("SAV_TICKET_") || review.startsWith("SAV_LINK_") || ["SAV_MANUAL_TICKET_INVALID", "SAV_MANUAL_RECONCILIATION_REQUIRED", "SAV_VALIDATED_CURRENT_PROPOSAL_REQUIRED", "SAV_PROPOSAL_STALE", "SAV_MESSAGE_BEFORE_CUTOVER"].includes(review) ? savManualTicketError(review) : `Action refusée : ${review.slice(0, 100)}`)}</p>}
@@ -305,5 +308,5 @@ export default async function SavThreadPage({ params, searchParams }: { params: 
         </details>
       </aside>
     </section>
-  </>;
+  </DossierViewport>;
 }

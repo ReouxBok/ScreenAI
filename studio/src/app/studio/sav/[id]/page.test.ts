@@ -28,7 +28,7 @@ vi.mock("@/lib/sav/drafts", () => ({ getSavReplyDrafts: dependencies.drafts }));
 vi.mock("@/lib/sav/thread-context", () => ({ getSavRelatedThreads: dependencies.related }));
 vi.mock("@/lib/sav/config", () => ({ savReleaseStage: dependencies.stage, savAutomationMode: () => "assist" }));
 vi.mock("next/navigation", () => ({ notFound: dependencies.notFound, useRouter: () => ({ refresh: vi.fn() }) }));
-vi.mock("next/link", () => ({ default: (props: ComponentProps<"a">) => createElement("a", props) }));
+vi.mock("next/link", () => ({ useLinkStatus: () => ({ pending: false }), default: (props: ComponentProps<"a">) => createElement("a", props) }));
 vi.mock("../ticket-preview-actions", () => ({ prepareTicketPreviewAction: vi.fn(), confirmTicketPreviewAction: vi.fn() }));
 vi.mock("../actions", () => dependencies.actions);
 

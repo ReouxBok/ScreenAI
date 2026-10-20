@@ -8,7 +8,7 @@ vi.mock("@/lib/sav/dashboard", () => ({ listSavDossierDashboard: dependencies.da
 vi.mock("@/lib/sav/service", () => ({ listSavWebhookIncidents: dependencies.incidents, listSavActionIncidents: dependencies.actions }));
 vi.mock("./actions", () => ({ retryWebhookAction: vi.fn() }));
 vi.mock("./open-email-actions", () => ({ openSavEmailAction: dependencies.open }));
-vi.mock("next/link", () => ({ default: (props: ComponentProps<"a">) => createElement("a", props) }));
+vi.mock("next/link", () => ({ useLinkStatus: () => ({ pending: false }), default: (props: ComponentProps<"a">) => createElement("a", props) }));
 import { SavV0Inbox } from "./inbox";
 const threadId = "10000000-0000-4000-8000-000000000001";
 const messageId = "10000000-0000-4000-8000-000000000002";
@@ -40,7 +40,7 @@ describe("SAV-55 compact dashboard", () => {
     dependencies.dashboard.mockResolvedValue({ ...result, page: 2, totalPages: 3, view: "to_validate" });
     const html = await render({ view: "to_validate", q: "facture", page: "2", sort: "oldest" });
     expect(dependencies.dashboard).toHaveBeenCalledWith({ view: "to_validate", query: "facture", page: 2, sort: "oldest" });
-    expect(html).toContain('method="get"'); expect(html).toContain("view=to_validate&amp;q=facture&amp;page=2&amp;sort=oldest");
+    expect(html).toContain('action="/studio/sav"'); expect(html).toContain("view=to_validate&amp;q=facture&amp;page=2&amp;sort=oldest");
     expect(html).toContain("Page 2 sur 3"); expect(dependencies.open).not.toHaveBeenCalled();
   });
   it("shows a search empty state without claiming a successful zero on load errors", async () => {

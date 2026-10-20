@@ -232,6 +232,13 @@
       "when": 1792415756266,
       "tag": "0037_sav_case_learning",
       "breakpoints": true
+    },
+    {
+      "idx": 33,
+      "version": "7",
+      "when": 1792490400000,
+      "tag": "0039_sav_dashboard_projection",
+      "breakpoints": true
     }
   ]
 }

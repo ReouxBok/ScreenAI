@@ -1,4 +1,4 @@
-import { executeSavTicketCommandStep, refreshSavContextStep } from "./steps";
+import { executeSavTicketCommandStep, refreshSavContextStep, executeSavEmailOpeningStep } from "./steps";
 
 export async function executeSavTicketCommandWorkflow(actionId: string) {
   "use workflow";
@@ -7,4 +7,8 @@ export async function executeSavTicketCommandWorkflow(actionId: string) {
 export async function refreshSavContextWorkflow(threadId: string, requestId: string, actorEmail: string) {
   "use workflow";
   return refreshSavContextStep(threadId, requestId, actorEmail);
+}
+export async function executeSavEmailOpeningWorkflow(commandId: string) {
+  "use workflow";
+  return executeSavEmailOpeningStep(commandId);
 }

@@ -1,10 +1,12 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-const dependencies = vi.hoisted(() => ({ auth: vi.fn(), enqueue: vi.fn(), opened: vi.fn(), localOpened: vi.fn(), revalidate: vi.fn(), redirect: vi.fn() }));
+const dependencies = vi.hoisted(() => ({ auth: vi.fn(), enqueue: vi.fn(), opened: vi.fn(), localOpened: vi.fn(), after: vi.fn(), dispatch: vi.fn(), revalidate: vi.fn(), redirect: vi.fn() }));
 vi.mock("@/lib/sav/auth", () => ({ requireSavApiStaff: dependencies.auth }));
-vi.mock("@/lib/sav/opened-email", () => ({ recordSavEmailOpened: dependencies.opened, recordSavDossierOpened: dependencies.localOpened }));
+vi.mock("@/lib/sav/opened-email", () => ({ recordSavDossierOpened: dependencies.localOpened }));
+vi.mock("@/lib/sav/email-opening-command", () => ({ requestSavEmailOpening: dependencies.opened }));
+vi.mock("next/server", () => ({ after: dependencies.after }));
 vi.mock("next/cache", () => ({ revalidatePath: dependencies.revalidate }));
 vi.mock("next/navigation", () => ({ redirect: dependencies.redirect }));
-vi.mock("@/lib/sav/dispatch", () => ({ enqueueSavContextRefresh: dependencies.enqueue }));
+vi.mock("@/lib/sav/dispatch", () => ({ enqueueSavContextRefresh: dependencies.enqueue, dispatchSavEmailOpening: dependencies.dispatch }));
 import { openSavEmailAction, recordSavDossierOpenedAction } from "./open-email-actions";
 const threadId = "10000000-0000-4000-8000-000000000001";
 const messageId = "10000000-0000-4000-8000-000000000002";
@@ -13,14 +15,14 @@ beforeEach(() => {
   vi.resetAllMocks();
   dependencies.enqueue.mockResolvedValue("10000000-0000-4000-8000-000000000003");
   dependencies.auth.mockResolvedValue({ email: "ugo@limova.ai", role: "admin" });
-  dependencies.opened.mockResolvedValue({ notice: "filed", auditId: "fixture" });
+  dependencies.opened.mockResolvedValue({ notice: "pending", commandId: "10000000-0000-4000-8000-000000000004" });
   dependencies.redirect.mockImplementation((url: string) => { throw new Error(`REDIRECT:${url}`); });
 });
 afterEach(() => vi.unstubAllEnvs());
 describe("authenticated POST to open and file a SAV email", () => {
   it("uses the authenticated actor, not client-provided identity, then opens the dossier", async () => {
-    await expect(openSavEmailAction(form())).rejects.toThrow(`REDIRECT:/studio/sav/${threadId}?filing=filed`);
-    expect(dependencies.enqueue).toHaveBeenCalledWith(threadId, "ugo@limova.ai");
+    await expect(openSavEmailAction(form())).rejects.toThrow(`REDIRECT:/studio/sav/${threadId}?filing=pending&filingId=10000000-0000-4000-8000-000000000004`);
+    expect(dependencies.enqueue).toHaveBeenCalledWith(threadId, "ugo@limova.ai", dependencies.after);
     expect(dependencies.enqueue.mock.invocationCallOrder[0]).toBeLessThan(dependencies.redirect.mock.invocationCallOrder[0]);
     expect(dependencies.opened).toHaveBeenCalledWith({ threadId, messageId }, "ugo@limova.ai");
     expect(dependencies.auth.mock.invocationCallOrder[0]).toBeLessThan(dependencies.opened.mock.invocationCallOrder[0]);
@@ -46,7 +48,7 @@ it("redirects with a request ID only after background refresh was registered", a
 });
 it("keeps the dossier readable if refresh scheduling fails before registering a request", async () => {
   dependencies.enqueue.mockRejectedValue(new Error("SAV_CONTEXT_REFRESH_UNAVAILABLE"));
-  await expect(openSavEmailAction(form())).rejects.toThrow(`REDIRECT:/studio/sav/${threadId}?filing=filed&context=failed&returnTo=`);
+  await expect(openSavEmailAction(form())).rejects.toThrow(`REDIRECT:/studio/sav/${threadId}?filing=pending&filingId=10000000-0000-4000-8000-000000000004&context=failed&returnTo=`);
   expect(dependencies.redirect.mock.calls[0][0]).not.toContain("refreshId=");
   expect(dependencies.opened).toHaveBeenCalledWith({ threadId, messageId }, "ugo@limova.ai");
 });
@@ -67,4 +69,21 @@ it("reports a local opening failure without filing or enriching", async () => {
   dependencies.localOpened.mockRejectedValue(new Error("fixture"));
   expect(await recordSavDossierOpenedAction(threadId, messageId)).toEqual({ ok: false });
   expect(dependencies.enqueue).not.toHaveBeenCalled(); expect(dependencies.opened).not.toHaveBeenCalled();
+});
+
+it("commits the command before scheduling provider work and redirects without waiting for it", async () => {
+  await expect(openSavEmailAction(form())).rejects.toThrow("REDIRECT:");
+  expect(dependencies.after).toHaveBeenCalledTimes(1);
+  expect(dependencies.opened.mock.invocationCallOrder[0]).toBeLessThan(dependencies.after.mock.invocationCallOrder[0]);
+  expect(dependencies.dispatch).not.toHaveBeenCalled();
+  await dependencies.after.mock.calls[0][0]();
+  expect(dependencies.dispatch).toHaveBeenCalledWith("10000000-0000-4000-8000-000000000004");
+});
+it("only invalidates the list when consultation changes", async () => {
+  dependencies.localOpened.mockResolvedValue({ opened: true, changed: false });
+  await recordSavDossierOpenedAction(threadId, messageId);
+  expect(dependencies.revalidate).not.toHaveBeenCalled();
+  dependencies.localOpened.mockResolvedValue({ opened: true, changed: true });
+  await recordSavDossierOpenedAction(threadId, messageId);
+  expect(dependencies.revalidate).toHaveBeenCalledWith("/studio/sav");
 });
