@@ -79,6 +79,7 @@ let urlChangeTimeout = null;
 let activeAbortController = null;
 let sessionGeneration = 0;
 const voiceTranscriptControllers = new Set();
+const voiceTokenControllers = new Set();
 let proxyAccessToken = null;
 let proxyAccessTokenExpiresAt = 0;
 let pageContextVersion = 0;
@@ -657,7 +658,10 @@ async function handleMessage(request, sender) {
       return runEvaluatedVoiceTool('search_knowledge_base', '', () => searchVoiceKnowledge(request.query));
 
     case 'VOICE_SESSION_STATE':
-      if (request.active !== true || !voiceSessionActive) voiceSessionGeneration += 1;
+      if (request.active !== true || !voiceSessionActive) {
+        voiceSessionGeneration += 1;
+        for (const controller of voiceTokenControllers) controller.abort();
+      }
       voiceSessionActive = request.active === true;
       if (voiceSessionActive && activeAbortController) activeAbortController.abort();
       if (sessionState.lockedTabId) {
@@ -1489,11 +1493,11 @@ function copilotLocale() {
   return currentLang === 'es' ? 'es-ES' : currentLang === 'en' ? 'en-US' : 'fr-FR';
 }
 
-async function ensureRemoteCopilotSession(generation = sessionGeneration, signal) {
-  if (generation !== sessionGeneration) return null;
+async function ensureRemoteCopilotSession(generation = sessionGeneration, signal, operation = { generation }) {
+  if (!isCurrentOperation(operation)) return null;
   if (sessionState.remoteSessionId) return sessionState.remoteSessionId;
-  const bootstrap = sessionState.resetContext ? null : await getCopilotBootstrap(true);
-  if (generation !== sessionGeneration) return null;
+  const bootstrap = sessionState.resetContext ? null : await getCopilotBootstrap(true, signal);
+  if (!isCurrentOperation(operation)) return null;
   if (bootstrap?.sessionId) {
     sessionState.remoteSessionId = bootstrap.sessionId;
     scheduleSave();
@@ -1506,7 +1510,7 @@ async function ensureRemoteCopilotSession(generation = sessionGeneration, signal
     signal
   });
   const data = await response.json().catch(() => ({}));
-  if (generation !== sessionGeneration) return null;
+  if (!isCurrentOperation(operation)) return null;
   if (!response.ok || !data.sessionId) throw codedError('COPILOT_SESSION_FAILED', data.error || 'Impossible d’ouvrir la session Charly.');
   sessionState.remoteSessionId = data.sessionId;
   scheduleSave();
@@ -2845,6 +2849,7 @@ async function getPageTechnicalDiagnostics(tabId, since = 0) {
 
 function handleResetSession() {
   const generation = ++sessionGeneration;
+  for (const controller of voiceTokenControllers) controller.abort();
   for (const controller of voiceTranscriptControllers) controller.abort();
   voiceTranscriptControllers.clear();
   const previousRemoteSessionId = sessionState.remoteSessionId;
@@ -3127,9 +3132,9 @@ async function authorizedProxyFetch(path, options = {}, retry = true) {
   return response;
 }
 
-async function getCopilotBootstrap(force = false) {
+async function getCopilotBootstrap(force = false, signal) {
   if (!force && copilotBootstrapCache && copilotBootstrapCacheExpiresAt > Date.now()) return copilotBootstrapCache;
-  const response = await authorizedProxyFetch('/api/copilot/bootstrap', { method: 'GET', cache: 'no-store' });
+  const response = await authorizedProxyFetch('/api/copilot/bootstrap', { method: 'GET', cache: 'no-store', signal });
   const data = await response.json().catch(() => ({}));
   if (!response.ok) throw codedError('COPILOT_MEMORY_UNAVAILABLE', data.error || 'Mémoire temporairement indisponible.');
   copilotBootstrapCache = sessionState.resetContext ? {
@@ -3232,46 +3237,62 @@ async function persistVoiceTranscript(role, content, generation = sessionGenerat
 }
 
 async function getLiveToken(context) {
-  if (!(await hasAIProcessingConsent())) return { ok: false, consentRequired: true };
-  const operationId = Logger.createOperationId('voice-token');
-  Logger.event('voice', 'LIVE_TOKEN_REQUEST_STARTED', null, operationId);
-  const trainingMode = context?.trainingMode === true && trainingState.active;
-  const evaluationMode = evaluationState.active && Boolean(evaluationState.token);
-  const sessionId = trainingMode || evaluationMode ? null : await ensureRemoteCopilotSession();
-  const freshContext = trainingMode
-    ? { pageContext: '', contextVersion: pageContextVersion }
-    : await getFreshVoiceContext(operationId);
-  const response = await authorizedProxyFetch('/api/live-token', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      lang: currentLang,
-      trainingMode,
-      ...(sessionState.resetContext ? { resetContext: true } : {}),
-      ...(evaluationMode ? { evaluationCode: evaluationState.token } : {}),
-      ...(sessionId ? { sessionId } : {}),
-      pageContext: trainingMode ? '' : String(freshContext.pageContext || context.pageContext || lastPageContext).slice(0, 12_000),
-      history: trainingMode || evaluationMode ? [] : boundedConversationHistory(
-        sessionState.conversationHistory,
-        CONVERSATION_HISTORY_MAX_MESSAGES,
-        CONVERSATION_CONTEXT_MAX_CHARACTERS
-      )
-    })
-  });
-  const data = await response.json().catch(() => ({}));
-  if (!response.ok) {
-    const code = response.status === 429 ? 'LIVE_TOKEN_RATE_LIMITED' : response.status >= 500 ? 'LIVE_TOKEN_SERVICE_FAILED' : `LIVE_TOKEN_HTTP_${response.status}`;
-    const error = codedError(code, data.error?.message || data.error || 'Session vocale indisponible.');
-    Logger.error('voice', 'Live token request failed', error, code, operationId);
+  const operation = captureVoiceOperation();
+  const controller = new AbortController();
+  voiceTokenControllers.add(controller);
+  try {
+    if (!(await hasAIProcessingConsent())) return { ok: false, consentRequired: true };
+    if (!isCurrentOperation(operation)) return cancelledOperation();
+    const operationId = Logger.createOperationId('voice-token');
+    Logger.event('voice', 'LIVE_TOKEN_REQUEST_STARTED', null, operationId);
+    const trainingMode = context?.trainingMode === true && trainingState.active;
+    const evaluationMode = evaluationState.active && Boolean(evaluationState.token);
+    const sessionId = trainingMode || evaluationMode ? null : await ensureRemoteCopilotSession(operation.generation, controller.signal, operation);
+    if (!isCurrentOperation(operation)) return cancelledOperation();
+    const freshContext = trainingMode
+      ? { pageContext: '', contextVersion: pageContextVersion }
+      : await getFreshVoiceContext(operationId, { operation });
+    if (!isCurrentOperation(operation)) return cancelledOperation();
+    const response = await authorizedProxyFetch('/api/live-token', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      signal: controller.signal,
+      body: JSON.stringify({
+        lang: currentLang,
+        trainingMode,
+        ...(sessionState.resetContext ? { resetContext: true } : {}),
+        ...(evaluationMode ? { evaluationCode: evaluationState.token } : {}),
+        ...(sessionId ? { sessionId } : {}),
+        pageContext: trainingMode ? '' : String(freshContext.pageContext || context.pageContext || lastPageContext).slice(0, 12_000),
+        history: trainingMode || evaluationMode ? [] : boundedConversationHistory(
+          sessionState.conversationHistory,
+          CONVERSATION_HISTORY_MAX_MESSAGES,
+          CONVERSATION_CONTEXT_MAX_CHARACTERS
+        )
+      })
+    });
+    if (!isCurrentOperation(operation)) return cancelledOperation();
+    const data = await response.json().catch(() => ({}));
+    if (!isCurrentOperation(operation)) return cancelledOperation();
+    if (!response.ok) {
+      const code = response.status === 429 ? 'LIVE_TOKEN_RATE_LIMITED' : response.status >= 500 ? 'LIVE_TOKEN_SERVICE_FAILED' : `LIVE_TOKEN_HTTP_${response.status}`;
+      const error = codedError(code, data.error?.message || data.error || 'Session vocale indisponible.');
+      Logger.error('voice', 'Live token request failed', error, code, operationId);
+      throw error;
+    }
+    Logger.event('voice', 'LIVE_TOKEN_REQUEST_SUCCEEDED', { model: data.model || 'unknown' }, operationId);
+    return {
+      ok: true,
+      ...data,
+      contextVersion: freshContext.contextVersion,
+      visualCapture: trainingMode ? null : freshContext.visualCapture || null
+    };
+  } catch (error) {
+    if (!isCurrentOperation(operation) || controller.signal.aborted) return cancelledOperation();
     throw error;
+  } finally {
+    voiceTokenControllers.delete(controller);
   }
-  Logger.event('voice', 'LIVE_TOKEN_REQUEST_SUCCEEDED', { model: data.model || 'unknown' }, operationId);
-  return {
-    ok: true,
-    ...data,
-    contextVersion: freshContext.contextVersion,
-    visualCapture: trainingMode ? null : freshContext.visualCapture || null
-  };
 }
 
 async function getFreshVoiceContext(parentOperationId = null, { capture = false, operation = { generation: sessionGeneration } } = {}) {
