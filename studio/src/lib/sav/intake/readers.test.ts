@@ -181,6 +181,23 @@ describe("independent review corrections", () => {
       ...["101", "102"].flatMap(id => [{ sourceId: `identity-ticket-2${id}`, quote: "Complete context" }, { sourceId: `identity-history-2${id}`, quote: `Specific context ${id}` }]));
     await expect(createSavIntakeSemanticReaders({ model: "gemini-configured", call: call(raw) }).assessIdentity!(args, signal())).resolves.toMatchObject({ kind: "unique" });
   });
+  it("F1 allows complete comparative citations within the full bounded candidate scope", async () => {
+    const candidates = Array.from({ length: 4 }, (_, i) => ({ contact: { id: String(101 + i), emails: [msg.fromEmail] },
+      tickets: Array.from({ length: i < 2 ? 5 : 4 }, (_, j) => ({
+        ticket: { id: String(201 + i * 5 + j), contactIds: [String(101 + i)], stage: "new" as const, subject: "Upload", content: `Specific ticket ${i}-${j}` },
+        history: [{ id: `note-${i}-${j}`, kind: "note" as const, at, text: `Specific history ${i}-${j}` }],
+      })) }));
+    const grounding = [{ sourceId: "current", quote: msg.currentText }, ...candidates.flatMap(c => [
+      { sourceId: `contact-${c.contact.id}`, quote: c.contact.id }, ...c.tickets.flatMap(row => [
+        { sourceId: `identity-ticket-${row.ticket.id}`, quote: row.ticket.content },
+        { sourceId: `identity-history-${row.ticket.id}`, quote: row.history[0].text },
+      ]),
+    ])];
+    expect(grounding).toHaveLength(41);
+    const model = createSavIntakeSemanticReaders({ model: "gemini-configured", call: call({ kind: "unique", investigationComplete: true,
+      contactIds: ["101"], evidenceIds: ["current"], rationale: "Complete comparison", grounding }) });
+    await expect(model.assessIdentity!({ message: msg, address: msg.fromEmail, candidates, evidence: [] }, signal())).resolves.toMatchObject({ kind: "unique" });
+  });
   it.each(["", "Bonjour"])("F2 preserves an initial subject as current evidence with body '%s'", async body => {
     const subject = "Cancel my subscription";
     const prepared = prepareSavIntakeMessage({ ...msg, subject, body, bodyComplete: true, unresolvedAttachments: false });

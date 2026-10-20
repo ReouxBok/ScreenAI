@@ -10,7 +10,8 @@ import type { prepareSavIntakeMessage } from "./message";
 
 export const SAV_INTAKE_MODEL_REVISION = "sav-intake-semantic-2026-10-20.v1";
 const quote = z.string().trim().min(1).max(2000);
-const grounding = z.array(z.object({ sourceId: z.string().min(1).max(200), quote }).strict()).min(1).max(40);
+// One current message + ten candidate contacts + twenty tickets and histories.
+const grounding = z.array(z.object({ sourceId: z.string().min(1).max(200), quote }).strict()).min(1).max(1 + 10 + 2 * 20);
 const analysisSchema = messageAnalysisSchema.extend({ requests: z.array(messageAnalysisSchema.shape.requests.element.extend({ quote })).max(15) });
 const issueSchema = issueAssessmentSchema.extend({ tickets: z.array(issueAssessmentSchema.shape.tickets.element.extend({ grounding, rationale: z.string().min(1).max(1000) })).max(20) });
 const identitySchema = identityAssessmentSchema.extend({ grounding, rationale: z.string().min(1).max(1000) });
