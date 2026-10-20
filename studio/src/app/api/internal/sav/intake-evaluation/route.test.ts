@@ -1,0 +1,18 @@
+import { beforeEach, afterEach, it, expect, vi } from "vitest";
+import { evaluationBatch, evaluationEnvironment } from "../../../../../../test/sav-intake-evaluation";
+const s = vi.hoisted(() => ({ auth: vi.fn(), run: vi.fn(), read: vi.fn() }));
+vi.mock("@/lib/sav/intake/server-auth", () => ({ evaluationAdministrator: s.auth }));
+vi.mock("@/lib/sav/intake/server-runner", () => ({ runServerEvaluation: s.run }));
+vi.mock("@/lib/sav/intake/server-ledger", () => ({ readServerEvaluation: s.read }));
+import { POST, GET } from "./route";
+const url = "https://studio.example.invalid/api/internal/sav/intake-evaluation";
+const req = (body = JSON.stringify(evaluationBatch())) => new Request(url, { method: "POST", headers: { origin: "https://studio.example.invalid", "content-type": "application/json" }, body });
+beforeEach(() => { for (const [key, value] of Object.entries(evaluationEnvironment())) vi.stubEnv(key, value); s.auth.mockReset().mockResolvedValue("ugo@limova.ai"); s.run.mockReset().mockResolvedValue({ state: "complete" }); s.read.mockReset().mockResolvedValue(null); });
+afterEach(() => vi.unstubAllEnvs());
+it("defaults to404 with no authentication or execution", async () => { vi.stubEnv("SAV_INTAKE_EVAL_ENABLED", ""); expect((await POST(req())).status).toBe(404); expect(s.auth).not.toHaveBeenCalled(); expect(s.run).not.toHaveBeenCalled(); });
+it("denies a non-administrator without reading the private body", async () => { s.auth.mockRejectedValue(Error("SAV_EVAL_UNAUTHORIZED")); expect((await POST(req())).status).toBe(403); expect(s.run).not.toHaveBeenCalled(); });
+it("rejects a substituted or reordered sealed body", async () => { expect((await POST(req(JSON.stringify({ ...evaluationBatch(), campaignId: "other" })))).status).toBe(400); expect(s.run).not.toHaveBeenCalled(); });
+it("does not disclose arbitrary error text", async () => { s.run.mockRejectedValue(Error("private-provider-text-must-not-leak")); const response = await POST(req()); expect(await response.text()).not.toContain("private-provider-text"); });
+it("runs only the sealed three-case batch and prevents caching", async () => { const response = await POST(req()); expect(response.status).toBe(200); expect(response.headers.get("cache-control")).toContain("no-store"); expect(s.run.mock.calls[0][0].cases).toHaveLength(3); });
+it("GET only reads prior results and cannot launch", async () => { expect((await GET(new Request(url, { headers: { "sec-fetch-site": "same-origin" } }))).status).toBe(200); expect(s.read).toHaveBeenCalledOnce(); expect(s.run).not.toHaveBeenCalled(); });
+it("denies cross-site origins before authentication", async () => { const request = new Request(url, { method: "POST", headers: { origin: "https://evil.example.invalid", "content-type": "application/json" }, body: "{}" }); expect((await POST(request)).status).toBe(400); expect(s.auth).not.toHaveBeenCalled(); });
