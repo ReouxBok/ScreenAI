@@ -66,6 +66,7 @@ function isLimovaUrl(value) {
 let sessionState = {
   conversationHistory: [],
   remoteSessionId: null,
+  resetContext: false,
   onboardingDocs: null,
   onboardingPlan: null,
   isActive: false,
@@ -76,6 +77,9 @@ let sessionState = {
 
 let urlChangeTimeout = null;
 let activeAbortController = null;
+let sessionGeneration = 0;
+const voiceTranscriptControllers = new Set();
+const voiceTokenControllers = new Set();
 let proxyAccessToken = null;
 let proxyAccessTokenExpiresAt = 0;
 let pageContextVersion = 0;
@@ -87,6 +91,7 @@ let lastUserMessage = '';
 let lastUserTurn = null;
 let userTurnSequence = 0;
 let voiceSessionActive = false;
+let voiceSessionGeneration = 0;
 const userPageInteractionSequences = new Map();
 let trainingState = { active: false, stopping: false, token: null, session: null };
 let evaluationState = { active: false, token: null, run: null, testCase: null, content: null };
@@ -112,7 +117,7 @@ let lastSyncedProfileHash = '';
 const SESSION_STORAGE_KEY = 'limova_session';
 
 // Keys to persist (exclude transient/non-serializable state)
-const PERSISTED_KEYS = ['conversationHistory', 'remoteSessionId', 'onboardingPlan', 'isActive', 'lastUrl', 'lockedTabId'];
+const PERSISTED_KEYS = ['conversationHistory', 'remoteSessionId', 'resetContext', 'onboardingPlan', 'isActive', 'lastUrl', 'lockedTabId'];
 
 async function saveSession() {
   const data = {};
@@ -340,6 +345,7 @@ async function finalizeExternalPopupFlow(flow) {
 }
 
 async function handleUrlChange(tabId, url, { force = false } = {}) {
+  const generation = sessionGeneration;
   if (trainingState.active) {
     await sendContentMessage(tabId, { type: 'TRAINING_STATE', active: true }).catch(() => {});
     const context = await getPageContext(tabId).catch(() => '');
@@ -348,6 +354,7 @@ async function handleUrlChange(tabId, url, { force = false } = {}) {
   }
   if (!sessionState.isActive) return;
   if (!(await hasAIProcessingConsent())) return;
+  if (generation !== sessionGeneration) return;
   url = privacySafeUrl(url);
   if (!force && url === sessionState.lastUrl) return;
   sessionState.lastUrl = url;
@@ -366,7 +373,9 @@ async function handleUrlChange(tabId, url, { force = false } = {}) {
 
   try {
     const pageContext = await getPageContext(tabId);
+    if (generation !== sessionGeneration) return;
     const pageAnalysis = await capturePageAnalysis(tabId);
+    if (generation !== sessionGeneration) return;
     if (voiceSessionActive) {
       broadcastToSidebar({
         type: 'VOICE_PAGE_CONTEXT',
@@ -389,9 +398,11 @@ async function handleUrlChange(tabId, url, { force = false } = {}) {
       url,
       pageContext,
       consoleLogs,
-      trigger: 'url_change'
+      trigger: 'url_change',
+      _sessionGeneration: generation
     });
   } catch (error) {
+    if (generation !== sessionGeneration) return;
     Logger.error('background', 'URL change handling failed', error);
     broadcastToSidebar({ type: 'ERROR', content: `Erreur d'analyse : ${error.message}` });
   }
@@ -616,7 +627,7 @@ async function handleMessage(request, sender) {
           ? request.toolName
           : 'inspect_current_page',
         '',
-        () => getFreshVoiceContext(null, { capture: request.capture === true })
+        () => getFreshVoiceContext(null, { capture: request.capture === true, operation: captureVoiceOperation() })
       );
 
     case 'VOICE_TRANSCRIPT':
@@ -647,6 +658,10 @@ async function handleMessage(request, sender) {
       return runEvaluatedVoiceTool('search_knowledge_base', '', () => searchVoiceKnowledge(request.query));
 
     case 'VOICE_SESSION_STATE':
+      if (request.active !== true || !voiceSessionActive) {
+        voiceSessionGeneration += 1;
+        for (const controller of voiceTokenControllers) controller.abort();
+      }
       voiceSessionActive = request.active === true;
       if (voiceSessionActive && activeAbortController) activeAbortController.abort();
       if (sessionState.lockedTabId) {
@@ -1189,14 +1204,17 @@ function rememberUserTurn(text, source = 'text') {
 }
 
 async function handleUserMessage(text) {
+  const generation = sessionGeneration;
   text = String(text || '').trim().slice(0, 8_000);
   if (!text) return { ok: false, error: 'Message vide.' };
   rememberUserTurn(text, 'text');
   if (!(await hasAIProcessingConsent())) {
+    if (generation !== sessionGeneration) return { ok: true };
     broadcastToSidebar({ type: 'CONSENT_REQUIRED' });
     return { ok: false, consentRequired: true };
   }
   const tab = await getActiveLimovaTab();
+  if (generation !== sessionGeneration) return { ok: true };
   if (tab && !sessionState.lockedTabId) lockTab(tab.id);
   const operationId = Logger.createOperationId('chat');
 
@@ -1214,8 +1232,10 @@ async function handleUserMessage(text) {
     // Initialize onboarding inside the guarded request flow so an expired
     // Limova session produces the same actionable error as every AI request.
     const { limova_onboarding_dismissed } = await chrome.storage.local.get('limova_onboarding_dismissed');
+    if (generation !== sessionGeneration) return { ok: true };
     if (!sessionState.onboardingPlan && sessionState.conversationHistory.length === 0 && !limova_onboarding_dismissed) {
       const publishedTemplate = await getPublishedOnboardingTemplate();
+      if (generation !== sessionGeneration) return { ok: true };
       sessionState.onboardingPlan = createOnboardingPlan(publishedTemplate);
       const current = sessionState.onboardingPlan.steps[0];
       broadcastToSidebar({ type: 'STEP_UPDATE', step: current.name, progress: `1 / ${sessionState.onboardingPlan.steps.length}` });
@@ -1223,6 +1243,7 @@ async function handleUserMessage(text) {
       scheduleSave();
     }
     const copilot = await getCopilotBootstrap(false).catch(() => null);
+    if (generation !== sessionGeneration) return { ok: true };
     if (copilot?.sessionId && !sessionState.remoteSessionId) {
       sessionState.remoteSessionId = copilot.sessionId;
       scheduleSave();
@@ -1233,8 +1254,10 @@ async function handleUserMessage(text) {
 
     if (tab) {
       pageContext = await getPageContext(tab.id);
+      if (generation !== sessionGeneration) return { ok: true };
       if (!copilot?.serverOrchestration) {
         pageAnalysis = await capturePageAnalysis(tab.id, operationId);
+        if (generation !== sessionGeneration) return { ok: true };
         consoleLogs = await getConsoleLogs(tab.id);
       }
     }
@@ -1244,7 +1267,8 @@ async function handleUserMessage(text) {
         tab,
         userMessage: text,
         pageContext,
-        operationId
+        operationId,
+        _sessionGeneration: generation
       });
       return { ok: true };
     }
@@ -1256,9 +1280,11 @@ async function handleUserMessage(text) {
       pageContext,
       consoleLogs,
       trigger: sessionState.conversationHistory.length === 0 ? 'doc_load' : 'user_message',
-      operationId
+      operationId,
+      _sessionGeneration: generation
     });
   } catch (error) {
+    if (generation !== sessionGeneration) return { ok: true };
     const code = errorCodeOf(error);
     Logger.error('background', 'User message handling failed', error, code, operationId);
     broadcastToSidebar({ type: 'ERROR', content: `Erreur : ${error.message}`, code });
@@ -1272,11 +1298,13 @@ async function handleUserMessage(text) {
 // ============================================================================
 
 async function handleTakeScreenshot() {
+  const generation = sessionGeneration;
   if (!(await hasAIProcessingConsent())) {
     broadcastToSidebar({ type: 'CONSENT_REQUIRED' });
     return { ok: false, consentRequired: true };
   }
   const tab = await getActiveLimovaTab();
+  if (generation !== sessionGeneration) return { ok: true };
   if (!tab) {
     broadcastToSidebar({ type: 'ERROR', content: 'Ouvre new.limova.ai pour analyser une page.' });
     return { ok: false };
@@ -1291,6 +1319,7 @@ async function handleTakeScreenshot() {
   if (voiceSessionActive) {
     try {
       const fresh = await getFreshVoiceContext(operationId, { capture: true });
+      if (generation !== sessionGeneration) return { ok: true };
       broadcastToSidebar({
         type: 'VOICE_PAGE_CONTEXT',
         pageContext: fresh.pageContext,
@@ -1306,6 +1335,7 @@ async function handleTakeScreenshot() {
       }, operationId);
       return { ok: true, voiceSessionActive: true };
     } catch (error) {
+      if (generation !== sessionGeneration) return { ok: true };
       Logger.warn('voice', 'Manual voice context refresh failed', {
         code: errorCodeOf(error, 'VOICE_CONTEXT_REFRESH_FAILED')
       }, 'VOICE_CONTEXT_REFRESH_FAILED', operationId);
@@ -1318,7 +1348,9 @@ async function handleTakeScreenshot() {
 
   try {
     const pageContext = await getPageContext(tab.id);
+    if (generation !== sessionGeneration) return { ok: true };
     const pageAnalysis = await capturePageAnalysis(tab.id, operationId);
+    if (generation !== sessionGeneration) return { ok: true };
     const consoleLogs = await getConsoleLogs(tab.id);
 
     await sendToGemini({
@@ -1327,9 +1359,11 @@ async function handleTakeScreenshot() {
       pageContext,
       consoleLogs,
       trigger: 'page_analysis_button',
-      operationId
+      operationId,
+      _sessionGeneration: generation
     });
   } catch (error) {
+    if (generation !== sessionGeneration) return { ok: true };
     const code = errorCodeOf(error, 'PAGE_ANALYSIS_FAILED');
     Logger.error('background', 'Page analysis failed', error, code, operationId);
     broadcastToSidebar({ type: 'ERROR', content: `Erreur d’analyse : ${error.message}`, code });
@@ -1339,11 +1373,13 @@ async function handleTakeScreenshot() {
 }
 
 async function handleNextStep() {
+  const generation = sessionGeneration;
   if (!(await hasAIProcessingConsent())) {
     broadcastToSidebar({ type: 'CONSENT_REQUIRED' });
     return { ok: false, consentRequired: true };
   }
   const tab = await getActiveLimovaTab();
+  if (generation !== sessionGeneration) return { ok: true };
   if (!tab) return { ok: false };
 
   const operationId = Logger.createOperationId('next-step');
@@ -1352,7 +1388,9 @@ async function handleNextStep() {
 
   try {
     const pageContext = await getPageContext(tab.id);
+    if (generation !== sessionGeneration) return { ok: true };
     const pageAnalysis = await capturePageAnalysis(tab.id, operationId);
+    if (generation !== sessionGeneration) return { ok: true };
     const consoleLogs = await getConsoleLogs(tab.id);
 
     await sendToGemini({
@@ -1362,9 +1400,11 @@ async function handleNextStep() {
       pageContext,
       consoleLogs,
       trigger: 'user_message',
-      operationId
+      operationId,
+      _sessionGeneration: generation
     });
   } catch (error) {
+    if (generation !== sessionGeneration) return { ok: true };
     const code = errorCodeOf(error, 'NEXT_STEP_FAILED');
     Logger.error('background', 'Next step failed', error, code, operationId);
     broadcastToSidebar({ type: 'ERROR', content: error.message, code });
@@ -1377,6 +1417,7 @@ async function handleNextStep() {
 // ============================================================================
 
 async function handleModalDetected(sender, modal = {}) {
+  const generation = sessionGeneration;
   const tabId = sender?.tab?.id || sessionState.lockedTabId;
   if (!tabId) return { ok: false };
 
@@ -1395,6 +1436,7 @@ async function handleModalDetected(sender, modal = {}) {
   }
   if (!sessionState.isActive) return { ok: true };
   if (!(await hasAIProcessingConsent())) return { ok: false };
+  if (generation !== sessionGeneration) return { ok: true };
 
   const now = Date.now();
   if (now - sessionState.lastAnalysisTime < MIN_API_INTERVAL) return { ok: false };
@@ -1407,7 +1449,9 @@ async function handleModalDetected(sender, modal = {}) {
 
   try {
     const pageContext = await getPageContext(tabId);
+    if (generation !== sessionGeneration) return { ok: true };
     const pageAnalysis = await capturePageAnalysis(tabId, operationId);
+    if (generation !== sessionGeneration) return { ok: true };
 
     if (voiceSessionActive) {
       broadcastToSidebar({
@@ -1430,9 +1474,11 @@ async function handleModalDetected(sender, modal = {}) {
       url: sessionState.lastUrl || '',
       pageContext,
       trigger: 'modal_detected',
-      operationId
+      operationId,
+      _sessionGeneration: generation
     });
   } catch (error) {
+    if (generation !== sessionGeneration) return { ok: true };
     Logger.error('background', 'Modal detection handling failed', error, errorCodeOf(error, 'MODAL_ANALYSIS_FAILED'), operationId);
   }
 
@@ -1447,9 +1493,11 @@ function copilotLocale() {
   return currentLang === 'es' ? 'es-ES' : currentLang === 'en' ? 'en-US' : 'fr-FR';
 }
 
-async function ensureRemoteCopilotSession() {
+async function ensureRemoteCopilotSession(generation = sessionGeneration, signal, operation = { generation }) {
+  if (!isCurrentOperation(operation)) return null;
   if (sessionState.remoteSessionId) return sessionState.remoteSessionId;
-  const bootstrap = await getCopilotBootstrap(true);
+  const bootstrap = sessionState.resetContext ? null : await getCopilotBootstrap(true, signal);
+  if (!isCurrentOperation(operation)) return null;
   if (bootstrap?.sessionId) {
     sessionState.remoteSessionId = bootstrap.sessionId;
     scheduleSave();
@@ -1458,9 +1506,11 @@ async function ensureRemoteCopilotSession() {
   const response = await authorizedProxyFetch('/api/copilot/v2/sessions', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: '{}'
+    body: JSON.stringify(sessionState.resetContext ? { closePrevious: true } : {}),
+    signal
   });
   const data = await response.json().catch(() => ({}));
+  if (!isCurrentOperation(operation)) return null;
   if (!response.ok || !data.sessionId) throw codedError('COPILOT_SESSION_FAILED', data.error || 'Impossible d’ouvrir la session Charly.');
   sessionState.remoteSessionId = data.sessionId;
   scheduleSave();
@@ -1558,17 +1608,22 @@ async function executeCopilotTool(call, userMessage, operationId) {
   };
 }
 
-async function sendToCopilotV2({ tab, userMessage, pageContext, operationId }) {
+async function sendToCopilotV2({ tab, userMessage, pageContext, operationId, _sessionGeneration: generation = sessionGeneration }) {
+  if (generation !== sessionGeneration) return;
   if (activeAbortController) activeAbortController.abort();
-  activeAbortController = new AbortController();
-  const sessionId = await ensureRemoteCopilotSession();
+  const controller = new AbortController();
+  activeAbortController = controller;
+  const sessionId = await ensureRemoteCopilotSession(generation, controller.signal);
+  if (generation !== sessionGeneration) return;
   const idempotencyKey = `${operationId || 'text'}:${userTurnSequence}`;
   const page = await currentCopilotPage(tab, pageContext);
+  if (generation !== sessionGeneration) return;
   let response = await authorizedProxyFetch('/api/copilot/v2/turn', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
       sessionId,
+      ...(sessionState.resetContext ? { resetContext: true } : {}),
       message: userMessage,
       source: 'text',
       locale: copilotLocale(),
@@ -1586,13 +1641,15 @@ async function sendToCopilotV2({ tab, userMessage, pageContext, operationId }) {
         }
       } : {})
     }),
-    signal: activeAbortController?.signal
+    signal: controller.signal
   });
+  if (generation !== sessionGeneration) return;
   if ([404, 409, 503].includes(response.status)) {
     copilotBootstrapCache = null;
     copilotBootstrapCacheExpiresAt = 0;
     Logger.warn('copilot', 'ADK unavailable; legacy text fallback used', { status: response.status }, 'ADK_FALLBACK', operationId);
     const fallbackCapture = tab?.id ? await capturePageAnalysis(tab.id, operationId) : null;
+    if (generation !== sessionGeneration) return;
     const consoleLogs = tab?.id ? await getConsoleLogs(tab.id) : '';
     return sendToGemini({
       pageAnalysis: fallbackCapture,
@@ -1602,16 +1659,19 @@ async function sendToCopilotV2({ tab, userMessage, pageContext, operationId }) {
       consoleLogs,
       trigger: sessionState.conversationHistory.length === 0 ? 'doc_load' : 'user_message',
       operationId,
-      _suppressMemoryTurn: true
+      _suppressMemoryTurn: true,
+      _sessionGeneration: generation
     });
   }
   let data = await response.json().catch(() => ({}));
+  if (generation !== sessionGeneration) return;
   if (!response.ok) throw codedError('COPILOT_ADK_FAILED', data.error || 'Charly est temporairement indisponible.');
   let actionCount = 0;
   while (data.type === 'tool_call') {
     actionCount += 1;
     if (actionCount > 6) throw codedError('COPILOT_ACTION_LIMIT', 'Charly s’est arrêtée pour éviter une boucle d’actions.');
     const result = await executeCopilotTool(data.call, userMessage, operationId);
+    if (generation !== sessionGeneration) return;
     if (evaluationState.active) await recordEvaluationEvent({
       kind: 'tool_result',
       toolName: data.call?.name,
@@ -1620,18 +1680,21 @@ async function sendToCopilotV2({ tab, userMessage, pageContext, operationId }) {
       targetLabel: data.call?.args?.targetLabel,
       contextVersion: result.contextVersion
     });
+    if (generation !== sessionGeneration) return;
     response = await authorizedProxyFetch(`/api/copilot/v2/runs/${encodeURIComponent(data.runId)}/result`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(result),
-      signal: activeAbortController?.signal
+      signal: controller.signal
     });
     data = await response.json().catch(() => ({}));
+    if (generation !== sessionGeneration) return;
     if (!response.ok) throw codedError(response.status === 410 ? 'COPILOT_RUN_EXPIRED' : 'COPILOT_RUN_FAILED', data.error || 'L’action de Charly a expiré. Réessaie.');
   }
   if (data.type !== 'message' || typeof data.content !== 'string') throw codedError('COPILOT_INVALID_RESPONSE', 'Réponse Charly invalide.');
   const content = data.content.trim();
   if (evaluationState.active) await recordEvaluationEvent({ kind: 'response', status: 'ok', contextVersion: page.contextVersion });
+  if (generation !== sessionGeneration) return;
   sessionState.conversationHistory.push({ role: 'user', content: userMessage });
   sessionState.conversationHistory.push({ role: 'assistant', content });
   if (sessionState.conversationHistory.length > CONVERSATION_HISTORY_MAX_MESSAGES) {
@@ -1657,8 +1720,11 @@ async function sendToGemini({
   _retryCount = 0,
   _contextVersion = pageContextVersion,
   _elementSnapshot = new Map(lastPageElements),
-  _suppressMemoryTurn = false
+  _suppressMemoryTurn = false,
+  _sessionGeneration: generation = sessionGeneration
 }) {
+  // A turn keeps the generation from its entry point, including fallbacks and retries.
+  if (generation !== sessionGeneration) return;
   url = privacySafeUrl(url);
   const now = Date.now();
   if (now - sessionState.lastAnalysisTime < MIN_API_INTERVAL) {
@@ -1669,7 +1735,8 @@ async function sendToGemini({
   sessionState.lastAnalysisTime = now;
 
   if (activeAbortController) activeAbortController.abort();
-  activeAbortController = new AbortController();
+  const controller = new AbortController();
+  activeAbortController = controller;
 
   // API keys are stored on the proxy server, not in the extension
 
@@ -1695,6 +1762,7 @@ async function sendToGemini({
         '## Articles de la base de connaissances Limova\n\n' + kbResults;
     }
   }
+  if (generation !== sessionGeneration) return;
 
   const systemPrompt = buildSystemPrompt({
     onboardingDocs: kbContext || null,
@@ -1761,6 +1829,7 @@ async function sendToGemini({
       body: JSON.stringify({
         systemInstruction: { parts: [{ text: systemPrompt }] },
         contents,
+        ...(sessionState.resetContext ? { resetContext: true } : {}),
         ...(userMessage && !_suppressMemoryTurn ? {
           memoryTurn: {
             user: userMessage,
@@ -1769,8 +1838,9 @@ async function sendToGemini({
           }
         } : {})
       }),
-      signal: activeAbortController.signal
+      signal: controller.signal
     });
+    if (generation !== sessionGeneration) return;
 
     if (!response.ok) {
       // Retry on 429 (rate limit) or 503 (high demand) — up to 2 retries
@@ -1779,6 +1849,7 @@ async function sendToGemini({
         Logger.log('background', `Gemini ${response.status}, retry ${_retryCount + 1}/2 in ${delay}ms`);
         broadcastToSidebar({ type: 'STATUS_UPDATE', status: 'analyzing', text: 'Charly réfléchit...' });
         await new Promise(r => setTimeout(r, delay));
+        if (generation !== sessionGeneration) return;
         return sendToGemini({
           pageAnalysis,
           url,
@@ -1789,7 +1860,9 @@ async function sendToGemini({
           operationId,
           _retryCount: _retryCount + 1,
           _contextVersion,
-          _elementSnapshot
+          _elementSnapshot,
+          _suppressMemoryTurn,
+          _sessionGeneration: generation
         });
       }
       let errorMessage = response.status === 429
@@ -1809,6 +1882,7 @@ async function sendToGemini({
     }
 
     const json = await response.json();
+    if (generation !== sessionGeneration) return;
 
     // A voice session may have started while the legacy request was already
     // returning. Do not let that stale response speak, mutate history or click
@@ -1846,6 +1920,7 @@ async function sendToGemini({
       }
       Logger.log('background', `Loading screen detected, retry ${retryCount}/3 in 2s`);
       setTimeout(() => {
+        if (generation !== sessionGeneration) return;
         if (sessionState.lockedTabId) handleUrlChange(sessionState.lockedTabId, url, { force: true });
       }, 2000);
       return;
@@ -1922,6 +1997,7 @@ async function sendToGemini({
       Logger.log('background', `Highlight: ${resolvedHighlights.map(command => command.id).join(', ') || 'none'}`);
       resolvedHighlights.forEach((command, i) => {
         setTimeout(() => {
+          if (generation !== sessionGeneration) return;
           sendContentMessage(sessionState.lockedTabId, {
             type: 'HIGHLIGHT_ELEMENT',
             id: command.id,
@@ -1932,11 +2008,13 @@ async function sendToGemini({
     }
 
     for (const elementId of actionCommands) {
+      if (generation !== sessionGeneration) return;
       const command = resolveElementCommand(elementId, _contextVersion, _elementSnapshot, 'action');
       if (command) await proposeOrExecuteAction(command.id, userMessage || lastUserMessage);
     }
 
   } catch (error) {
+    if (generation !== sessionGeneration) return;
     if (error.name === 'AbortError') {
       Logger.log('background', 'API call aborted (superseded)');
       broadcastToSidebar({ type: 'STATUS_UPDATE', status: 'ready' });
@@ -2100,7 +2178,8 @@ async function capturePageAnalysis(tabId = sessionState.lockedTabId, operationId
 // Page Context Extraction
 // ============================================================================
 
-async function getPageContext(tabId) {
+async function getPageContext(tabId, operation = { generation: sessionGeneration }) {
+  if (!isCurrentOperation(operation)) return '';
   try {
     const results = await chrome.scripting.executeScript({
       target: { tabId },
@@ -2641,6 +2720,7 @@ async function getPageContext(tabId) {
       args: [pageContextVersion + 1]
     });
 
+    if (!isCurrentOperation(operation)) return '';
     if (results?.[0]?.result) {
       const pc = results[0].result;
       pageContextVersion += 1;
@@ -2768,9 +2848,18 @@ async function getPageTechnicalDiagnostics(tabId, since = 0) {
 // API keys are managed server-side on the proxy — no local key storage needed
 
 function handleResetSession() {
+  const generation = ++sessionGeneration;
+  for (const controller of voiceTokenControllers) controller.abort();
+  for (const controller of voiceTranscriptControllers) controller.abort();
+  voiceTranscriptControllers.clear();
   const previousRemoteSessionId = sessionState.remoteSessionId;
+  activeAbortController?.abort();
+  activeAbortController = null;
   sessionState.conversationHistory = [];
   sessionState.remoteSessionId = null;
+  // Keep a reset conversation isolated from account-wide memory, including
+  // after voice reconnects or a service-worker restart. This does not delete it.
+  sessionState.resetContext = true;
   sessionState.onboardingDocs = null;
   sessionState.onboardingPlan = null;
   sessionState.isActive = false;
@@ -2790,6 +2879,7 @@ function handleResetSession() {
   userTurnSequence = 0;
   userPageInteractionSequences.clear();
   voiceSessionActive = false;
+  voiceSessionGeneration += 1;
   externalPopupTabs.clear();
   externalPopupFlow = null;
   if (externalPopupCloseTimer) clearTimeout(externalPopupCloseTimer);
@@ -2812,6 +2902,7 @@ function handleResetSession() {
     body: JSON.stringify({ previousSessionId: previousRemoteSessionId, closePrevious: true })
   }).then(async response => {
     const data = await response.json().catch(() => ({}));
+    if (generation !== sessionGeneration) return { ok: true };
     if (response.ok && data.sessionId) {
       sessionState.remoteSessionId = data.sessionId;
       await saveSession();
@@ -2997,10 +3088,12 @@ async function getLimovaTabForAuthentication() {
 }
 
 async function authorizedProxyFetch(path, options = {}, retry = true) {
+  options.signal?.throwIfAborted();
   const operationId = Logger.createOperationId('proxy');
   const startedAt = Date.now();
   Logger.event('proxy', 'PROXY_REQUEST_STARTED', { path, method: options.method || 'GET', retryAllowed: retry }, operationId);
   const token = await getProxyAccessToken();
+  options.signal?.throwIfAborted();
   let response;
   const controller = new AbortController();
   let timedOut = false;
@@ -3039,14 +3132,20 @@ async function authorizedProxyFetch(path, options = {}, retry = true) {
   return response;
 }
 
-async function getCopilotBootstrap(force = false) {
+async function getCopilotBootstrap(force = false, signal) {
   if (!force && copilotBootstrapCache && copilotBootstrapCacheExpiresAt > Date.now()) return copilotBootstrapCache;
-  const response = await authorizedProxyFetch('/api/copilot/bootstrap', { method: 'GET', cache: 'no-store' });
+  const response = await authorizedProxyFetch('/api/copilot/bootstrap', { method: 'GET', cache: 'no-store', signal });
   const data = await response.json().catch(() => ({}));
   if (!response.ok) throw codedError('COPILOT_MEMORY_UNAVAILABLE', data.error || 'Mémoire temporairement indisponible.');
-  copilotBootstrapCache = data;
+  copilotBootstrapCache = sessionState.resetContext ? {
+    ...data,
+    sessionId: sessionState.remoteSessionId,
+    recentMessages: [],
+    goals: [],
+    greeting: null
+  } : data;
   copilotBootstrapCacheExpiresAt = Date.now() + 30_000;
-  return data;
+  return copilotBootstrapCache;
 }
 
 function sanitizeLimovaProfile(raw) {
@@ -3113,72 +3212,99 @@ async function deleteCopilotData() {
   return { ok: true };
 }
 
-async function persistVoiceTranscript(role, content) {
+async function persistVoiceTranscript(role, content, generation = sessionGeneration) {
+  if (generation !== sessionGeneration) return;
+  const controller = new AbortController();
+  voiceTranscriptControllers.add(controller);
   try {
-    const sessionId = await ensureRemoteCopilotSession();
+    const sessionId = await ensureRemoteCopilotSession(generation, controller.signal);
+    if (generation !== sessionGeneration || !sessionId) return;
     const response = await authorizedProxyFetch('/api/copilot/voice-turn', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ role, text: content, sessionId, idempotencyKey: `voice:${crypto.randomUUID()}` })
+      body: JSON.stringify({ role, text: content, sessionId, idempotencyKey: `voice:${crypto.randomUUID()}` }),
+      signal: controller.signal
     });
-    if (response.ok) {
+    if (response.ok && generation === sessionGeneration) {
       copilotBootstrapCache = null;
       copilotBootstrapCacheExpiresAt = 0;
     }
   } catch (error) {
-    Logger.warn('memory', 'Voice transcript memory unavailable', { code: errorCodeOf(error) });
+    if (generation === sessionGeneration) Logger.warn('memory', 'Voice transcript memory unavailable', { code: errorCodeOf(error) });
+  } finally {
+    voiceTranscriptControllers.delete(controller);
   }
 }
 
 async function getLiveToken(context) {
-  if (!(await hasAIProcessingConsent())) return { ok: false, consentRequired: true };
-  const operationId = Logger.createOperationId('voice-token');
-  Logger.event('voice', 'LIVE_TOKEN_REQUEST_STARTED', null, operationId);
-  const trainingMode = context?.trainingMode === true && trainingState.active;
-  const evaluationMode = evaluationState.active && Boolean(evaluationState.token);
-  const sessionId = trainingMode || evaluationMode ? null : await ensureRemoteCopilotSession();
-  const freshContext = trainingMode
-    ? { pageContext: '', contextVersion: pageContextVersion }
-    : await getFreshVoiceContext(operationId);
-  const response = await authorizedProxyFetch('/api/live-token', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      lang: currentLang,
-      trainingMode,
-      ...(evaluationMode ? { evaluationCode: evaluationState.token } : {}),
-      ...(sessionId ? { sessionId } : {}),
-      pageContext: trainingMode ? '' : String(freshContext.pageContext || context.pageContext || lastPageContext).slice(0, 12_000),
-      history: trainingMode || evaluationMode ? [] : boundedConversationHistory(
-        sessionState.conversationHistory,
-        CONVERSATION_HISTORY_MAX_MESSAGES,
-        CONVERSATION_CONTEXT_MAX_CHARACTERS
-      )
-    })
-  });
-  const data = await response.json().catch(() => ({}));
-  if (!response.ok) {
-    const code = response.status === 429 ? 'LIVE_TOKEN_RATE_LIMITED' : response.status >= 500 ? 'LIVE_TOKEN_SERVICE_FAILED' : `LIVE_TOKEN_HTTP_${response.status}`;
-    const error = codedError(code, data.error?.message || data.error || 'Session vocale indisponible.');
-    Logger.error('voice', 'Live token request failed', error, code, operationId);
+  const operation = captureVoiceOperation();
+  const controller = new AbortController();
+  voiceTokenControllers.add(controller);
+  try {
+    if (!(await hasAIProcessingConsent())) return { ok: false, consentRequired: true };
+    if (!isCurrentOperation(operation)) return cancelledOperation();
+    const operationId = Logger.createOperationId('voice-token');
+    Logger.event('voice', 'LIVE_TOKEN_REQUEST_STARTED', null, operationId);
+    const trainingMode = context?.trainingMode === true && trainingState.active;
+    const evaluationMode = evaluationState.active && Boolean(evaluationState.token);
+    const sessionId = trainingMode || evaluationMode ? null : await ensureRemoteCopilotSession(operation.generation, controller.signal, operation);
+    if (!isCurrentOperation(operation)) return cancelledOperation();
+    const freshContext = trainingMode
+      ? { pageContext: '', contextVersion: pageContextVersion }
+      : await getFreshVoiceContext(operationId, { operation });
+    if (!isCurrentOperation(operation)) return cancelledOperation();
+    const response = await authorizedProxyFetch('/api/live-token', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      signal: controller.signal,
+      body: JSON.stringify({
+        lang: currentLang,
+        trainingMode,
+        ...(sessionState.resetContext ? { resetContext: true } : {}),
+        ...(evaluationMode ? { evaluationCode: evaluationState.token } : {}),
+        ...(sessionId ? { sessionId } : {}),
+        pageContext: trainingMode ? '' : String(freshContext.pageContext || context.pageContext || lastPageContext).slice(0, 12_000),
+        history: trainingMode || evaluationMode ? [] : boundedConversationHistory(
+          sessionState.conversationHistory,
+          CONVERSATION_HISTORY_MAX_MESSAGES,
+          CONVERSATION_CONTEXT_MAX_CHARACTERS
+        )
+      })
+    });
+    if (!isCurrentOperation(operation)) return cancelledOperation();
+    const data = await response.json().catch(() => ({}));
+    if (!isCurrentOperation(operation)) return cancelledOperation();
+    if (!response.ok) {
+      const code = response.status === 429 ? 'LIVE_TOKEN_RATE_LIMITED' : response.status >= 500 ? 'LIVE_TOKEN_SERVICE_FAILED' : `LIVE_TOKEN_HTTP_${response.status}`;
+      const error = codedError(code, data.error?.message || data.error || 'Session vocale indisponible.');
+      Logger.error('voice', 'Live token request failed', error, code, operationId);
+      throw error;
+    }
+    Logger.event('voice', 'LIVE_TOKEN_REQUEST_SUCCEEDED', { model: data.model || 'unknown' }, operationId);
+    return {
+      ok: true,
+      ...data,
+      contextVersion: freshContext.contextVersion,
+      visualCapture: trainingMode ? null : freshContext.visualCapture || null
+    };
+  } catch (error) {
+    if (!isCurrentOperation(operation) || controller.signal.aborted) return cancelledOperation();
     throw error;
+  } finally {
+    voiceTokenControllers.delete(controller);
   }
-  Logger.event('voice', 'LIVE_TOKEN_REQUEST_SUCCEEDED', { model: data.model || 'unknown' }, operationId);
-  return {
-    ok: true,
-    ...data,
-    contextVersion: freshContext.contextVersion,
-    visualCapture: trainingMode ? null : freshContext.visualCapture || null
-  };
 }
 
-async function getFreshVoiceContext(parentOperationId = null, { capture = false } = {}) {
+async function getFreshVoiceContext(parentOperationId = null, { capture = false, operation = { generation: sessionGeneration } } = {}) {
+  if (!isCurrentOperation(operation)) return cancelledOperation();
   if (!(await hasAIProcessingConsent())) return { ok: false, consentRequired: true };
+  if (!isCurrentOperation(operation)) return cancelledOperation();
   const operationId = parentOperationId || Logger.createOperationId('voice-context');
   const startedAt = Date.now();
   Logger.event('voice', 'VOICE_CONTEXT_REFRESH_STARTED', null, operationId);
 
   const tab = await getLimovaTabForAuthentication();
+  if (!isCurrentOperation(operation)) return cancelledOperation();
   if (!tab?.id) {
     const error = codedError('VOICE_CONTEXT_TAB_MISSING', 'Ouvre un onglet new.limova.ai pour que Charly puisse analyser et piloter la page.');
     Logger.error('voice', 'Voice context tab missing', error, error.code, operationId);
@@ -3186,7 +3312,9 @@ async function getFreshVoiceContext(parentOperationId = null, { capture = false 
   }
 
   if (sessionState.lockedTabId !== tab.id) lockTab(tab.id);
-  const pageContext = await getPageContext(tab.id);
+  const pageOperation = { ...operation, tabId: tab.id };
+  const pageContext = await getPageContext(tab.id, pageOperation);
+  if (!isCurrentOperation(pageOperation)) return cancelledOperation();
   if (!pageContext) {
     const error = codedError('VOICE_CONTEXT_UNAVAILABLE', 'Charly ne peut pas lire la page Limova. Actualise l’onglet puis réessaie.');
     Logger.error('voice', 'Voice page context extraction failed', error, error.code, operationId);
@@ -3194,6 +3322,7 @@ async function getFreshVoiceContext(parentOperationId = null, { capture = false 
   }
 
   const visualCapture = capture ? await capturePageAnalysis(tab.id, operationId) : null;
+  if (!isCurrentOperation(pageOperation)) return cancelledOperation();
   const result = {
     ok: true,
     pageContext: pageContext.slice(0, 12_000),
@@ -3286,7 +3415,9 @@ async function handleUserPageInteraction(rawInteraction, sender) {
 }
 
 async function storeVoiceTranscript(role, text) {
+  const generation = sessionGeneration;
   if (!(await hasAIProcessingConsent()) || !['user', 'assistant'].includes(role)) return { ok: false };
+  if (generation !== sessionGeneration) return { ok: false };
   const content = String(text || '').trim().slice(0, 4_000);
   if (!content) return { ok: false };
   Logger.event('voice', 'VOICE_TRANSCRIPT_FINALIZED', { role, characterCount: content.length, contentExported: false });
@@ -3314,7 +3445,7 @@ async function storeVoiceTranscript(role, text) {
     sessionState.conversationHistory = sessionState.conversationHistory.slice(-CONVERSATION_HISTORY_MAX_MESSAGES);
   }
   scheduleSave();
-  await persistVoiceTranscript(role, content);
+  await persistVoiceTranscript(role, content, generation);
   return { ok: true };
 }
 
@@ -3426,9 +3557,24 @@ async function getPublishedOnboardingTemplate() {
   }
 }
 
-async function proposeVoiceAction(elementId, requestedContextVersion, toolIntent = {}) {
+function captureVoiceOperation() {
+  return { generation: sessionGeneration, voiceGeneration: voiceSessionGeneration, tabId: sessionState.lockedTabId };
+}
+
+function isCurrentOperation(operation) {
+  return operation.generation === sessionGeneration
+    && (operation.voiceGeneration === undefined || operation.voiceGeneration === voiceSessionGeneration)
+    && (operation.tabId == null || operation.tabId === sessionState.lockedTabId);
+}
+
+function cancelledOperation() {
+  return { ok: false, cancelled: true, error: 'Cette commande appartient à une session arrêtée ou réinitialisée.' };
+}
+
+async function proposeVoiceAction(elementId, requestedContextVersion, toolIntent = {}, operation = captureVoiceOperation()) {
   if (trainingState.active) return { ok: false, error: 'Mode formateur actif : Charly observe sans agir.' };
   if (!(await hasAIProcessingConsent()) || !Number.isInteger(elementId)) return { ok: false };
+  if (!isCurrentOperation(operation)) return cancelledOperation();
   if (!sessionState.lockedTabId) return { ok: false, error: 'Aucun onglet Limova actif.' };
   if (Number.isInteger(requestedContextVersion) && requestedContextVersion !== pageContextVersion) {
     return { ok: false, status: 'unexpected', error: 'La carte DOM a changé.', retryWithFreshContext: true };
@@ -3450,13 +3596,15 @@ async function proposeVoiceAction(elementId, requestedContextVersion, toolIntent
   return proposeOrExecuteAction(elementId, voiceTurn.message, {
     toolExplicitRequest: toolIntent.explicitRequest === true,
     targetLabel: toolIntent.targetLabel,
-    requestedContextVersion
+    requestedContextVersion,
+    operation
   });
 }
 
-async function scrollVoicePage(rawDirection, rawAmount, rawElementId, requestedContextVersion) {
+async function scrollVoicePage(rawDirection, rawAmount, rawElementId, requestedContextVersion, operation = captureVoiceOperation()) {
   if (trainingState.active) return { ok: false, error: 'Mode formateur actif : Charly observe sans agir.' };
   if (!(await hasAIProcessingConsent())) return { ok: false, error: 'Consentement IA requis.' };
+  if (!isCurrentOperation(operation)) return cancelledOperation();
   if (!sessionState.lockedTabId) return { ok: false, error: 'Aucun onglet Limova actif.' };
   const direction = ['up', 'down', 'top', 'bottom'].includes(rawDirection) ? rawDirection : null;
   const amount = ['small', 'medium', 'large'].includes(rawAmount) ? rawAmount : 'medium';
@@ -3465,7 +3613,8 @@ async function scrollVoicePage(rawDirection, rawAmount, rawElementId, requestedC
   if (!direction) return { ok: false, clarificationRequired: true, error: 'Direction de défilement invalide.' };
   if (Number.isInteger(requestedContextVersion) && requestedContextVersion !== pageContextVersion) {
     const original = elementId ? pageElementSnapshots.get(requestedContextVersion)?.get(elementId) : null;
-    const fresh = await getFreshVoiceContext().catch(() => null);
+    const fresh = await getFreshVoiceContext(null, { operation }).catch(() => null);
+    if (!isCurrentOperation(operation)) return cancelledOperation();
     activeContextVersion = fresh?.contextVersion || pageContextVersion;
     if (elementId) {
       const remapped = original
@@ -3499,17 +3648,19 @@ async function scrollVoicePage(rawDirection, rawAmount, rawElementId, requestedC
   const operationId = Logger.createOperationId('scroll');
   let result;
   try {
-    result = await sendContentMessage(sessionState.lockedTabId, {
+    result = await sendContentMessage(operation.tabId, {
       type: 'EXECUTE_PAGE_SCROLL',
       direction,
       amount,
       ...(elementId ? { elementId } : {}),
       contextVersion: activeContextVersion
-    });
+    }, true, operation);
   } catch (_) {
     result = { ok: false, error: 'La page Limova ne répond plus.' };
   }
-  const pageContext = await getPageContext(sessionState.lockedTabId).catch(() => '');
+  if (!isCurrentOperation(operation)) return cancelledOperation();
+  const pageContext = await getPageContext(operation.tabId, operation).catch(() => '');
+  if (!isCurrentOperation(operation)) return cancelledOperation();
   Logger.event('action', result?.ok ? 'PAGE_SCROLL_SUCCEEDED' : 'PAGE_SCROLL_FAILED', {
     direction,
     amount,
@@ -3603,8 +3754,9 @@ function resolveCurrentTextField(elementId, requestedVersion, targetLabel = '') 
   };
 }
 
-async function typeVoiceText(elementId, rawText, requestedContextVersion, targetLabel = '') {
+async function typeVoiceText(elementId, rawText, requestedContextVersion, targetLabel = '', operation = captureVoiceOperation()) {
   if (!(await hasAIProcessingConsent()) || !Number.isInteger(elementId)) return { ok: false };
+  if (!isCurrentOperation(operation)) return cancelledOperation();
   if (!sessionState.lockedTabId) return { ok: false, error: 'Aucun onglet Limova actif.' };
   const operationId = Logger.createOperationId('text-input');
   const requestedVersion = Number.isInteger(requestedContextVersion) ? requestedContextVersion : pageContextVersion;
@@ -3625,11 +3777,12 @@ async function typeVoiceText(elementId, rawText, requestedContextVersion, target
       clarificationRequired: Boolean(options.clarificationRequired),
       error,
       failureCode
-    }, operationId, failureCode);
+    }, operationId, failureCode, operation);
   };
 
   if (Number.isInteger(requestedContextVersion) && requestedContextVersion !== pageContextVersion) {
-    await getFreshVoiceContext(operationId).catch(() => null);
+    await getFreshVoiceContext(operationId, { operation }).catch(() => null);
+    if (!isCurrentOperation(operation)) return cancelledOperation();
   }
 
   const requestedElement = pageElementSnapshots.get(requestedVersion)?.get(elementId)
@@ -3710,15 +3863,16 @@ async function typeVoiceText(elementId, rawText, requestedContextVersion, target
 
   let result;
   try {
-    result = await sendContentMessage(sessionState.lockedTabId, {
+    result = await sendContentMessage(operation.tabId, {
       type: 'TYPE_ELEMENT_TEXT',
       id: resolvedElementId,
       contextVersion: pageContextVersion,
       text
-    });
+    }, true, operation);
   } catch (_) {
     result = { ok: false, error: 'La page Limova ne répond plus.' };
   }
+  if (!isCurrentOperation(operation)) return cancelledOperation();
   let executedElementId = resolvedElementId;
   if (result?.ok !== true) {
     Logger.warn('action', 'Initial text input attempt rejected by page', {
@@ -3735,8 +3889,10 @@ async function typeVoiceText(elementId, rawText, requestedContextVersion, target
       descriptor: element,
       commandType: 'text_input',
       message: { type: 'TYPE_ELEMENT_TEXT', text },
-      operationId
+      operationId,
+      operation
     }).catch(() => null);
+    if (!isCurrentOperation(operation)) return cancelledOperation();
     if (recovery?.result?.ok === true) {
       result = recovery.result;
       executedElementId = recovery.command.id;
@@ -3756,7 +3912,7 @@ async function typeVoiceText(elementId, rawText, requestedContextVersion, target
         clarificationRequired: Boolean(result?.clarificationRequired),
         error,
         failureCode: textInputFailureCode(error)
-      }, operationId, 'text_input_retry_failed');
+      }, operationId, 'text_input_retry_failed', operation);
     }
   }
   Logger.event('action', result?.ok === true ? 'TEXT_INPUT_SUCCEEDED' : 'TEXT_INPUT_FAILED', {
@@ -3892,11 +4048,14 @@ async function refreshAndRetryElementCommand({
   descriptor,
   commandType,
   message,
-  operationId
+  operationId,
+  operation = { generation: sessionGeneration, tabId: sessionState.lockedTabId }
 }) {
+  if (!isCurrentOperation(operation)) return null;
   if (!descriptor || !sessionState.lockedTabId) return null;
   const snapshot = new Map([[requestedId, descriptor]]);
-  const fresh = await getFreshVoiceContext(operationId);
+  const fresh = await getFreshVoiceContext(operationId, { operation });
+  if (!isCurrentOperation(operation)) return null;
   const command = resolveElementCommand(
     requestedId,
     expectedContextVersion,
@@ -3908,14 +4067,15 @@ async function refreshAndRetryElementCommand({
   if (!command) return { fresh, command: null, result: null };
   let result;
   try {
-    result = await sendContentMessage(sessionState.lockedTabId, {
+    result = await sendContentMessage(operation.tabId, {
       ...message,
       id: command.id,
       contextVersion: command.contextVersion
-    }, false);
+    }, false, operation);
   } catch (_) {
     result = { ok: false, error: 'La page Limova ne répond plus après actualisation.' };
   }
+  if (!isCurrentOperation(operation)) return null;
   Logger.event('action', result?.ok === true ? 'ELEMENT_RECOVERY_RETRY_SUCCEEDED' : 'ELEMENT_RECOVERY_RETRY_FAILED', {
     commandType,
     requestedId,
@@ -4106,6 +4266,8 @@ function repeatedRejectedAction(intent, element, userMessage) {
 }
 
 async function proposeOrExecuteAction(elementId, userMessage, options = {}) {
+  const operation = options.operation || { generation: sessionGeneration, tabId: sessionState.lockedTabId };
+  if (!isCurrentOperation(operation)) return cancelledOperation();
   if (!sessionState.lockedTabId) return { ok: false, error: 'Aucun onglet Limova actif.' };
   const operationId = Logger.createOperationId('action');
   const requestedContextVersion = Number(options.requestedContextVersion);
@@ -4114,7 +4276,7 @@ async function proposeOrExecuteAction(elementId, userMessage, options = {}) {
       ok: false,
       status: 'unexpected',
       error: 'La carte DOM a changé avant le clic.'
-    }, operationId, 'stale_click_context');
+    }, operationId, 'stale_click_context', operation);
   }
   const element = lastPageElements.get(elementId);
   if (!element || element.disabled) {
@@ -4123,7 +4285,7 @@ async function proposeOrExecuteAction(elementId, userMessage, options = {}) {
       status: 'blocked',
       clarificationRequired: true,
       error: 'Élément absent ou indisponible.'
-    }, operationId, 'target_unavailable');
+    }, operationId, 'target_unavailable', operation);
   }
   const assistantText = recentAssistantActionText();
   const intent = resolveActionIntent(userMessage, element, assistantText);
@@ -4172,7 +4334,8 @@ async function proposeOrExecuteAction(elementId, userMessage, options = {}) {
       broadcastToSidebar({ type: 'ACTION_RESULT', ...payload });
       return payload;
     }
-    payload = await enrichBlockedActionWithFreshContext(payload, operationId, 'message_target_mismatch');
+    payload = await enrichBlockedActionWithFreshContext(payload, operationId, 'message_target_mismatch', operation);
+    if (!isCurrentOperation(operation)) return cancelledOperation();
     if (!payload.retryWithFreshContext) broadcastToSidebar({ type: 'ACTION_RESULT', ...payload });
     return payload;
   }
@@ -4206,7 +4369,8 @@ async function proposeOrExecuteAction(elementId, userMessage, options = {}) {
       userTurnId: intent.turnId,
       labelLength: payload.label.length
     }, 'ACTION_INTENT_MISMATCH', operationId);
-    payload = await enrichBlockedActionWithFreshContext(payload, operationId, 'intent_target_mismatch');
+    payload = await enrichBlockedActionWithFreshContext(payload, operationId, 'intent_target_mismatch', operation);
+    if (!isCurrentOperation(operation)) return cancelledOperation();
     if (!payload.retryWithFreshContext) broadcastToSidebar({ type: 'ACTION_RESULT', ...payload });
     return payload;
   }
@@ -4238,7 +4402,8 @@ async function proposeOrExecuteAction(elementId, userMessage, options = {}) {
       label: risk.label,
       targetDescriptor: element,
       operationId,
-      userTurnId: intent.turnId
+      userTurnId: intent.turnId,
+      operation
     });
   }
 
@@ -4266,6 +4431,7 @@ async function proposeOrExecuteAction(elementId, userMessage, options = {}) {
     risk: risk.level,
     targetDescriptor: element,
     operationId,
+    operation,
     expiresAt: Date.now() + 30_000
   };
   pendingActions.set(actionId, action);
@@ -4275,6 +4441,8 @@ async function proposeOrExecuteAction(elementId, userMessage, options = {}) {
 }
 
 async function executeElementAction(action) {
+  const operation = action.operation || { generation: sessionGeneration, tabId: sessionState.lockedTabId };
+  if (!isCurrentOperation(operation)) return cancelledOperation();
   if (!sessionState.lockedTabId) return { type: 'ACTION_RESULT', ok: false, error: 'Aucun onglet Limova actif.' };
   const actionStartedAt = Date.now();
   let activeAction = action;
@@ -4296,24 +4464,27 @@ async function executeElementAction(action) {
       label: action.label,
       error: 'La page a changé. Demande à Charly de l’analyser à nouveau.'
     };
-    payload = await enrichBlockedActionWithFreshContext(payload, action.operationId, 'stale_context');
+    payload = await enrichBlockedActionWithFreshContext(payload, action.operationId, 'stale_context', operation);
+    if (!isCurrentOperation(operation)) return cancelledOperation();
     broadcastToSidebar(payload);
     Logger.warn('action', 'Action rejected because page context changed', { elementId: action.elementId }, 'ACTION_CONTEXT_CHANGED', action.operationId);
     return payload;
     }
   }
   let contextBeforeClick = lastPageContext;
-  let tabBeforeClick = await chrome.tabs.get(sessionState.lockedTabId).catch(() => null);
+  let tabBeforeClick = await chrome.tabs.get(operation.tabId).catch(() => null);
+  if (!isCurrentOperation(operation)) return cancelledOperation();
   let result;
   try {
-    result = await sendContentMessage(sessionState.lockedTabId, {
+    result = await sendContentMessage(operation.tabId, {
       type: 'EXECUTE_ELEMENT_ACTION',
       id: activeAction.elementId,
       contextVersion: activeAction.contextVersion
-    });
+    }, true, operation);
   } catch (_) {
     result = { ok: false, error: 'La page Limova ne répond plus.' };
   }
+  if (!isCurrentOperation(operation)) return cancelledOperation();
   if (result?.ok !== true) {
     const recovery = await refreshAndRetryElementCommand({
       requestedId: activeAction.elementId,
@@ -4321,8 +4492,10 @@ async function executeElementAction(action) {
       descriptor: activeAction.targetDescriptor,
       commandType: 'action',
       message: { type: 'EXECUTE_ELEMENT_ACTION' },
-      operationId: activeAction.operationId
+      operationId: activeAction.operationId,
+      operation
     }).catch(() => null);
+    if (!isCurrentOperation(operation)) return cancelledOperation();
     if (recovery?.result?.ok === true) {
       result = recovery.result;
       activeAction = {
@@ -4332,7 +4505,8 @@ async function executeElementAction(action) {
         targetDescriptor: lastPageElements.get(recovery.command.id) || activeAction.targetDescriptor
       };
       contextBeforeClick = recovery.fresh.pageContext;
-      tabBeforeClick = await chrome.tabs.get(sessionState.lockedTabId).catch(() => tabBeforeClick);
+      tabBeforeClick = await chrome.tabs.get(operation.tabId).catch(() => tabBeforeClick);
+      if (!isCurrentOperation(operation)) return cancelledOperation();
     }
   }
   let payload = {
@@ -4346,10 +4520,12 @@ async function executeElementAction(action) {
     // settle. The former 350 ms window incorrectly marked valid Limova clicks
     // as failed on components that update after a debounce.
     await new Promise(resolve => setTimeout(resolve, 700));
+    if (!isCurrentOperation(operation)) return cancelledOperation();
     const [refreshedContext, technical] = await Promise.all([
-      getPageContext(sessionState.lockedTabId).catch(() => ''),
-      getPageTechnicalDiagnostics(sessionState.lockedTabId, actionStartedAt)
+      getPageContext(operation.tabId, operation).catch(() => ''),
+      getPageTechnicalDiagnostics(operation.tabId, actionStartedAt)
     ]);
+    if (!isCurrentOperation(operation)) return cancelledOperation();
     if (refreshedContext) {
       payload.pageContext = refreshedContext;
       payload.contextVersion = pageContextVersion;
@@ -4357,7 +4533,8 @@ async function executeElementAction(action) {
     }
     if (technical.summary) payload.technicalDiagnostics = technical.summary;
     if (result.clickDispatched === true) {
-      const tabAfterClick = await chrome.tabs.get(sessionState.lockedTabId).catch(() => null);
+      const tabAfterClick = await chrome.tabs.get(operation.tabId).catch(() => null);
+      if (!isCurrentOperation(operation)) return cancelledOperation();
       const comparable = value => String(value || '').replace(/\b\d+ms\b/g, 'Nms').replace(/\s+/g, ' ').trim();
       const routeChanged = privacySafeUrl(tabBeforeClick?.url || '') !== privacySafeUrl(tabAfterClick?.url || '');
       const domChanged = Boolean(refreshedContext) && comparable(contextBeforeClick) !== comparable(refreshedContext);
@@ -4377,17 +4554,18 @@ async function executeElementAction(action) {
         payload.status = 'unexpected';
         payload.verificationRequired = true;
         payload.error = 'Le clic a été déclenché, mais aucun effet visible n’a encore été confirmé. Charly doit relire la page avant de continuer.';
-        payload.visualCapture = await capturePageAnalysis(sessionState.lockedTabId, activeAction.operationId);
+        payload.visualCapture = await capturePageAnalysis(operation.tabId, activeAction.operationId);
       } else if (networkFailed && !routeChanged && !domChanged && !popupObserved) {
         payload.status = 'unexpected';
         payload.verificationRequired = true;
         payload.error = 'Le clic a déclenché une requête en erreur. Charly doit vérifier l’état affiché avant de continuer.';
-        payload.visualCapture = await capturePageAnalysis(sessionState.lockedTabId, activeAction.operationId);
+        payload.visualCapture = await capturePageAnalysis(operation.tabId, activeAction.operationId);
       }
     }
   } else {
-    payload = await enrichBlockedActionWithFreshContext(payload, activeAction.operationId, 'execution_failed');
+    payload = await enrichBlockedActionWithFreshContext(payload, activeAction.operationId, 'execution_failed', operation);
   }
+  if (!isCurrentOperation(operation)) return cancelledOperation();
   broadcastToSidebar(payload);
   const actionResultCode = result?.ok !== true
     ? 'ACTION_EXECUTION_FAILED'
@@ -4411,9 +4589,10 @@ async function executeElementAction(action) {
   return payload;
 }
 
-async function enrichBlockedActionWithFreshContext(payload, operationId, reason) {
+async function enrichBlockedActionWithFreshContext(payload, operationId, reason, operation = { generation: sessionGeneration }) {
   try {
-    const fresh = await getFreshVoiceContext(operationId, { capture: true });
+    const fresh = await getFreshVoiceContext(operationId, { capture: true, operation });
+    if (!isCurrentOperation(operation)) return cancelledOperation();
     Logger.event('visual', 'BLOCKED_ACTION_VISUAL_RECOVERY_READY', {
       reason,
       contextVersion: fresh.contextVersion,
@@ -4437,10 +4616,12 @@ async function enrichBlockedActionWithFreshContext(payload, operationId, reason)
   }
 }
 
-async function sendContentMessage(tabId, message, allowRepair = true) {
+async function sendContentMessage(tabId, message, allowRepair = true, operation = { generation: sessionGeneration }) {
+  if (!isCurrentOperation(operation)) return cancelledOperation();
   try {
     return await chrome.tabs.sendMessage(tabId, message);
   } catch (error) {
+    if (!isCurrentOperation(operation)) return cancelledOperation();
     if (!allowRepair) throw error;
     Logger.warn('content_script', 'Content script unreachable; attempting one reinjection', {
       tabId,
@@ -4451,6 +4632,7 @@ async function sendContentMessage(tabId, message, allowRepair = true) {
         target: { tabId },
         files: ['src/content/content.js']
       });
+      if (!isCurrentOperation(operation)) return cancelledOperation();
       Logger.event('content_script', 'CONTENT_SCRIPT_REPAIR_SUCCEEDED', { tabId, messageType: message?.type || 'unknown' });
       const mutatingMessage = ['EXECUTE_ELEMENT_ACTION', 'TYPE_ELEMENT_TEXT', 'EXECUTE_PAGE_SCROLL'].includes(message?.type);
       if (mutatingMessage) {
