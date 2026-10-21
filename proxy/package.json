@@ -20,7 +20,7 @@
     "braces": "file:vendor/braces-3.0.3-screenai.1.tgz"
   },
   "overrides": {
-    "@modelcontextprotocol/sdk": "1.31.0",
+    "@modelcontextprotocol/sdk": "1.32.0",
     "adm-zip": "0.6.1",
     "mariadb": "3.5.4",
     "mysql2": "3.24.3",
