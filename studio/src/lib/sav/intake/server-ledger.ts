@@ -29,16 +29,38 @@ function verifiedCost(metadata: Record<string, unknown>) {
     || Number(inputTokens) + Number(outputTokens) + Number(thoughtTokens) !== totalTokens) return null;
   return Number(inputTokens) * 750 + (Number(outputTokens) + Number(thoughtTokens)) * 3750;
 }
-export async function claimServerEvaluation(config: ServerEvaluationConfig, actorEmail: string) {
+export async function claimServerEvaluation(config: ServerEvaluationConfig, actorEmail: string, continuationProof?: string) {
   return requireDb().transaction(async tx => {
     await lock(tx);
     const existing = await tx.select().from(auditLogs).where(eq(auditLogs.action, EVALUATION_ACTION));
-    if (existing.length) {
-      if (existing.length !== 1 || existing[0].entityId !== config.manifestHash || existing[0].technicalMetadata.campaignId !== config.campaignId || existing[0].technicalMetadata.codeRevision !== config.codeRevision) return bad();
+    const matches = (row: typeof existing[number]) => row.entityId === config.manifestHash && row.technicalMetadata.campaignId === config.campaignId && row.technicalMetadata.codeRevision === config.codeRevision;
+    if (!config.continuation && existing.length) {
+      if (existing.length !== 1 || !matches(existing[0])) return bad();
       return { claimed: false, id: existing[0].id };
     }
+    if (config.continuation) {
+      const prior = config.continuation;
+      if (continuationProof !== prior.manifestHash || existing.length < 1 || existing.length > 2
+        || prior.campaignId === config.campaignId || prior.manifestHash === config.manifestHash || prior.codeRevision === config.codeRevision) return bad();
+      const baseline = existing.find(row => row.id === prior.runId);
+      if (!baseline || baseline.actorEmail !== actorEmail || baseline.entityId !== prior.manifestHash
+        || baseline.technicalMetadata.campaignId !== prior.campaignId || baseline.technicalMetadata.codeRevision !== prior.codeRevision
+        || baseline.technicalMetadata.state !== "complete" || baseline.technicalMetadata.continuationOfRunId !== undefined) return bad();
+      const current = existing.find(matches);
+      if (existing.length === 2) {
+        if (!current || current.technicalMetadata.continuationOfRunId !== prior.runId) return bad();
+        return { claimed: false, id: current.id }; // Never restart the second run either.
+      }
+      if (current) return bad();
+      const calls = await tx.select().from(auditLogs).where(eq(auditLogs.action, EVALUATION_CALL));
+      if (!calls.length || calls.length >= EVALUATION_MAX_CALLS
+        || calls.some(call => call.entityId !== baseline.id || call.technicalMetadata.state !== "settled")) return bad();
+      const used = calls.reduce((total, call) => total + charge(call.technicalMetadata), 0);
+      if (used + quote().reservedNanoUsd > EVALUATION_CAP) throw Error("SAV_EVAL_BUDGET_EXHAUSTED");
+    }
     const [row] = await tx.insert(auditLogs).values({ actorEmail, action: EVALUATION_ACTION, entityType: "private_intake_evaluation", entityId: config.manifestHash,
-      technicalMetadata: { state: "running", campaignId: config.campaignId, codeRevision: config.codeRevision, resultCiphertext: encryptSavPayload({ results: [], modelCalls: 0 }), startedAt: new Date().toISOString() } }).returning({ id: auditLogs.id });
+      technicalMetadata: { state: "running", campaignId: config.campaignId, codeRevision: config.codeRevision, resultCiphertext: encryptSavPayload({ results: [], modelCalls: 0 }), startedAt: new Date().toISOString(),
+        ...(config.continuation ? { continuationOfRunId: config.continuation.runId } : {}) } }).returning({ id: auditLogs.id });
     return { claimed: true, id: row.id };
   });
 }

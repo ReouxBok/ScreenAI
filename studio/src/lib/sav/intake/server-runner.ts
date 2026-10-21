@@ -2,7 +2,7 @@ import "server-only";
 import { planSavIntake } from "./engine";
 import { createSavIntakeSemanticReaders, type IntakeGeminiCall, type IntakeModelTrace } from "./model-readers";
 import { withSavAiBudget, requestSavGeminiJson, savGeminiGenerationConfig, savAiErrorMetadata } from "../gemini-transport";
-import { evaluationHash, evaluationConfig, type EvaluationBatch, type ServerEvaluationConfig } from "./server-contract";
+import { evaluationHash, evaluationConfig, evaluationContinuationProof, type EvaluationBatch, type ServerEvaluationConfig } from "./server-contract";
 import { claimServerEvaluation, reserveServerEvaluationCall, settleServerEvaluationCall, saveServerEvaluationResult, readServerEvaluation } from "./server-ledger";
 import type { IntakeAdapters, ReadResult } from "./engine-types";
 
@@ -51,10 +51,11 @@ export async function runServerEvaluation(batch: EvaluationBatch, config: Server
   const assertLive = () => {
     const fresh = evaluationConfig(env());
     if (JSON.stringify(fresh) !== JSON.stringify(config) || sealedBatch !== config.manifestHash || evaluationHash(JSON.stringify(batch)) !== sealedBatch || batch.campaignId !== config.campaignId || requestSignal.aborted || lifecycle.signal.aborted) throw Error("SAV_EVAL_CONTEXT_CHANGED");
+    evaluationContinuationProof(batch, config);
     if (!env().SAV_GEMINI_API_KEY || !env().SAV_ENCRYPTION_KEY_V1 || env().SAV_ENCRYPTION_KEY_V1!.length < 32) throw Error("SAV_EVAL_SERVER_ACCESS_MISSING");
   };
   assertLive();
-  const claim = await claimServerEvaluation(config, actorEmail);
+  const claim = await claimServerEvaluation(config, actorEmail, evaluationContinuationProof(batch, config));
   if (!claim.claimed) return readServerEvaluation(config); // Never redispatch a lost/incomplete claim.
   const evidence: { codeRevision: string; model: string; results: unknown[]; modelCalls: number; stopReason: string | null } = { codeRevision: config.codeRevision, model: config.model, results: [], modelCalls: 0, stopReason: null };
   let uncertain = false;
