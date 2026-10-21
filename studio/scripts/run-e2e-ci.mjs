@@ -38,10 +38,15 @@ export function assertPartition(report, expected) {
   }
 }
 
+export function childEnvironment(env) {
+  // Direct node invocation does not add the npm script binary directory.
+  return { ...env, PATH: `${path.join(studio, "node_modules/.bin")}${path.delimiter}${env.PATH ?? ""}` };
+}
+
 function run(args, { capture = false, env = process.env } = {}) {
   return new Promise((resolve, reject) => {
     const child = spawn(process.execPath, [cli, ...args], {
-      cwd: studio, env, stdio: capture ? ["ignore", "pipe", "inherit"] : "inherit",
+      cwd: studio, env: childEnvironment(env), stdio: capture ? ["ignore", "pipe", "inherit"] : "inherit",
     });
     let output = "", requestedSignal = null;
     if (capture) child.stdout.setEncoding("utf8").on("data", chunk => { output += chunk; });

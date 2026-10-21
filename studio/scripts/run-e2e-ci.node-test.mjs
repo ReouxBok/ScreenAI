@@ -1,10 +1,19 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { discoveredCases, assertPartition } from "./run-e2e-ci.mjs";
+import { discoveredCases, assertPartition, childEnvironment } from "./run-e2e-ci.mjs";
 
 const spec = (line = 3, title = "synthetic", status = "passed") => ({ file: "tests/e2e/example.spec.ts", line, title,
   tests: [{ expectedStatus: "passed", results: [{ status }] }] });
 const report = (...specs) => ({ suites: [{ suites: [{ specs }] }], errors: [] });
+
+test("adds the absolute npm binary directory only to the child environment", () => {
+  const original = { PATH: "/synthetic/bin:/usr/bin", CI: "1", SYNTHETIC_SETTING: "preserved" };
+  const result = childEnvironment(original);
+  assert.equal(result.PATH, `${new URL("../node_modules/.bin", import.meta.url).pathname}:${original.PATH}`);
+  assert.deepEqual({ ...result, PATH: original.PATH }, original);
+  assert.notEqual(result, original);
+  assert.equal(original.PATH, "/synthetic/bin:/usr/bin");
+});
 
 test("discovers every nested test once and retains its selector/title", () => {
   const cases = discoveredCases(report(spec(), spec(9, "second")));
