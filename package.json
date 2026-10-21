@@ -36,5 +36,8 @@
   },
   "dependencies": {
     "@vercel/blob": "^2.7.0"
+  },
+  "overrides": {
+    "vite": "8.2.4"
   }
 }
