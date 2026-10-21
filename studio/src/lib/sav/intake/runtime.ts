@@ -1,4 +1,5 @@
 import "server-only";
+import { readSavGeminiResponse, type SavGeminiMetadata } from "../gemini-response";
 import { planSavIntake } from "./engine";
 import { createSavIntakeHubspotReaders } from "./hubspot-readers";
 import { createSavIntakeSemanticReaders, type IntakeGeminiCall } from "./model-readers";
@@ -50,6 +51,13 @@ export async function analyseSavIntakeRuntime(runId: string, config: IntakeRunti
       const reserved = await reserveSavIntakeCall(lease, config, intakeRuntimeHash(expectedBody));
       if (reserved.cached) return reserved.cached;
       const reservation = reserved.id;
+      let providerUsage: SavGeminiMetadata | undefined;
+      // The legacy transport sums absent counters as zero. Admission settlement
+      // must instead retain the exact presence of all four provider counters,
+      // including when the model text cannot be parsed as JSON.
+      const exactUsage = (metadata?: SavGeminiMetadata): SavGeminiMetadata => ({ ...metadata,
+        inputTokens: providerUsage?.inputTokens, outputTokens: providerUsage?.outputTokens,
+        thoughtTokens: providerUsage?.thoughtTokens, totalTokens: providerUsage?.totalTokens });
       const guardedNetwork: typeof fetch = async (url, init) => {
         await live();
         if (sent || input.signal.aborted || String(url) !== `https://generativelanguage.googleapis.com/v1beta/models/${config.model}:generateContent`
@@ -58,15 +66,21 @@ export async function analyseSavIntakeRuntime(runId: string, config: IntakeRunti
         await live();
         const signal = AbortSignal.any([controller.signal, input.signal, ...(init.signal ? [init.signal] : [])]);
         if (signal.aborted) throw Error("SAV_INTAKE_RUNTIME_CONTEXT_CHANGED");
-        return evaluationProviderResponse(await network(url, { ...init, signal, redirect: "error" }), signal);
+        const response = await evaluationProviderResponse(await network(url, { ...init, signal, redirect: "error" }), signal);
+        if (response.ok) {
+          try { providerUsage = readSavGeminiResponse(await response.clone().json()).metadata; }
+          catch { providerUsage = undefined; }
+        }
+        return response;
       };
       try {
-        const result = await requestSavGeminiJson({ ...input, apiKey: key, fetch: guardedNetwork, allowRetry: false });
+        const generated = await requestSavGeminiJson({ ...input, apiKey: key, fetch: guardedNetwork, allowRetry: false });
+        const result = { ...generated, metadata: exactUsage(generated.metadata) };
         if (!reservation) throw Error("SAV_INTAKE_RUNTIME_DISPATCH_REJECTED");
         uncertain = !await settleSavIntakeCall(reservation, result.metadata, result);
         return result;
       } catch (error) {
-        if (reservation) uncertain = !await settleSavIntakeCall(reservation, savAiErrorMetadata(error));
+        if (reservation) uncertain = !await settleSavIntakeCall(reservation, exactUsage(savAiErrorMetadata(error)));
         failureReason = error instanceof Error && /^SAV_[A-Z_]+$/.test(error.message) ? error.message : "SAV_INTAKE_RUNTIME_PROVIDER_UNAVAILABLE";
         throw error;
       }

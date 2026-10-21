@@ -247,3 +247,42 @@ it("a pause during provider completion settles usage and preserves a partial pla
   expect(current?.journal.some(event => event.kind === "obsolete_partial_result")).toBe(true);
   expect((await readSavIntakeBudget(config)).chargedNanoUsd).toBe(262_500); expect(network).toHaveBeenCalledTimes(1); expect(await f.db.select().from(savActions)).toHaveLength(0);
 });
+it.each(["promptTokenCount", "candidatesTokenCount", "thoughtsTokenCount", "totalTokenCount"].flatMap(counter => ["valid_json", "invalid_json"].map(output => ({ counter, output }))))("keeps missing $counter uncertain through provider $output", async ({ counter, output }) => {
+  const id = await enqueueSavIntakeMessage(messageId, config);
+  const providerUsage: Record<string, number> = { promptTokenCount: 100, candidatesTokenCount: 50, thoughtsTokenCount: 0, totalTokenCount: 150 };
+  delete providerUsage[counter];
+  const network = vi.fn(async () => Response.json({ candidates: [{ finishReason: "STOP", content: { parts: [{ text: output === "valid_json" ? JSON.stringify({ messageId, requests: [] }) : "{invalid-json" }] } }], usageMetadata: providerUsage }));
+  await analyseSavIntakeRuntime(id!, config, { env: () => environment, network });
+  const budget = await readSavIntakeBudget(config), current = await readSavIntakeCurrent(threadId, config);
+  expect(budget).toMatchObject({ callCount: 1, chargedNanoUsd: 817_152_000, uncertain: true });
+  expect(current?.state).toBe("uncertain"); expect(current?.fresh).toBe(false);
+  const [call] = await f.db.select().from(savIntakeModelCalls); expect(call.state).toBe("uncertain"); expect(call.resultCiphertext).toBeNull();
+  const tokenField = { promptTokenCount: "inputTokens", candidatesTokenCount: "outputTokens", thoughtsTokenCount: "thoughtTokens", totalTokenCount: "totalTokens" }[counter]!;
+  expect(decryptSavPayload<{metadata: unknown}>(call.payloadCiphertext).metadata).not.toHaveProperty(tokenField);
+  expect(await claimSavIntakeRun(id!, config)).toBeNull(); expect(network).toHaveBeenCalledTimes(1); expect(await f.db.select().from(savActions)).toHaveLength(0);
+});
+it.each(["valid_json", "invalid_json"])("settles four explicit provider counters after %s without altering the generic transport", async output => {
+  const id = await enqueueSavIntakeMessage(messageId, config);
+  const network = vi.fn(async () => Response.json({ candidates: [{ finishReason: "STOP", content: { parts: [{ text: output === "valid_json" ? JSON.stringify({ messageId, requests: [] }) : "{invalid-json" }] } }], usageMetadata: { promptTokenCount: 100, candidatesTokenCount: 50, thoughtsTokenCount: 0, totalTokenCount: 150 } }));
+  await analyseSavIntakeRuntime(id!, config, { env: () => environment, network });
+  expect(await readSavIntakeBudget(config)).toMatchObject({ callCount: 1, chargedNanoUsd: 262_500, uncertain: false }); expect(network).toHaveBeenCalledTimes(1);
+});
+it("never marks a current plan fresh with a retained configuration after its expiry", async () => {
+  const shortEnvironment = { ...environment, SAV_INTAKE_RUNTIME_CONFIG: JSON.stringify({ ...JSON.parse(environment.SAV_INTAKE_RUNTIME_CONFIG!), expiresAt: new Date(Date.now() + 10_000).toISOString() }) };
+  const shortConfig = savIntakeRuntimeConfig(shortEnvironment)!, id = await enqueueSavIntakeMessage(messageId, shortConfig);
+  const l = (await claimSavIntakeRun(id!, shortConfig))!;
+  await saveSavIntakeResult(l, shortConfig, payload(), "observed");
+  expect((await readSavIntakeCurrent(threadId, shortConfig, new Date(Date.parse(shortConfig.expiresAt) - 1)))?.fresh).toBe(true);
+  expect((await readSavIntakeCurrent(threadId, shortConfig, new Date(shortConfig.expiresAt)))?.fresh).toBe(false);
+  expect((await readSavIntakeCurrent(threadId, shortConfig, new Date(Date.parse(shortConfig.expiresAt) + 1)))?.fresh).toBe(false);
+});
+
+it("rejects a lease after expiry expressed without fractional seconds", async () => {
+  const expiry = new Date(Date.now() + 10_000).toISOString().replace(/\.\d{3}Z$/, "Z");
+  const shortEnvironment = { ...environment, SAV_INTAKE_RUNTIME_CONFIG: JSON.stringify({ ...JSON.parse(environment.SAV_INTAKE_RUNTIME_CONFIG!), expiresAt: expiry }) };
+  const shortConfig = savIntakeRuntimeConfig(shortEnvironment)!, id = await enqueueSavIntakeMessage(messageId, shortConfig);
+  const l = (await claimSavIntakeRun(id!, shortConfig))!;
+  await expect(assertSavIntakeLease(l, shortConfig, new Date(Date.parse(expiry) - 1))).resolves.toBeUndefined();
+  await expect(assertSavIntakeLease(l, shortConfig, new Date(expiry))).rejects.toThrow("CONTEXT_CHANGED");
+  await expect(assertSavIntakeLease(l, shortConfig, new Date(Date.parse(expiry) + 100))).rejects.toThrow("CONTEXT_CHANGED");
+});

@@ -123,7 +123,7 @@ async function assertLease(tx: Tx, lease: IntakeLease, config: IntakeRuntimeConf
   const [run] = await tx.select().from(savIntakeRuns).where(eq(savIntakeRuns.id, lease.run.id)).for("update");
   const message = await latest(tx, lease.run.threadId);
   if (!thread || thread.aiPaused || !run?.isCurrent || run.state !== "analysing" || run.leaseToken !== lease.token || !run.leaseUntil || run.leaseUntil <= now
-    || run.humanChoiceCiphertext !== lease.run.humanChoiceCiphertext || run.configHash !== config.configHash || config.expiresAt <= now.toISOString() || message?.id !== run.messageId) return fail();
+    || run.humanChoiceCiphertext !== lease.run.humanChoiceCiphertext || run.configHash !== config.configHash || Date.parse(config.expiresAt) <= now.getTime() || message?.id !== run.messageId) return fail();
   if ((await snapshot(tx, message, now)).sourceHash !== lease.sourceHash) return fail();
   return run;
 }
@@ -210,7 +210,7 @@ export async function readSavIntakeCurrent(threadId: string, config?: IntakeRunt
     .orderBy(desc(savMessages.receivedAt), desc(savMessages.createdAt), desc(savMessages.id)).limit(1);
   const sourceMatches = message?.id === run.messageId && await db.transaction(async tx => (await snapshot(tx, message, now)).sourceHash === run.sourceHash);
   const events = await db.select().from(savIntakeJournal).where(eq(savIntakeJournal.runId, run.id)).orderBy(savIntakeJournal.createdAt, savIntakeJournal.id);
-  return { ...run, fresh: Boolean(config && config.configHash === run.configHash && run.state === "observed" && run.freshUntil && run.freshUntil > now && !thread?.aiPaused && sourceMatches),
+  return { ...run, fresh: Boolean(config && Date.parse(config.expiresAt) > now.getTime() && config.configHash === run.configHash && run.state === "observed" && run.freshUntil && run.freshUntil > now && !thread?.aiPaused && sourceMatches),
     payload: decryptSavPayload<IntakeRuntimePayload>(run.payloadCiphertext),
     humanChoice: run.humanChoiceCiphertext ? decryptSavPayload<unknown>(run.humanChoiceCiphertext) : null,
     journal: events.map(event => ({ id: event.id, kind: event.kind, createdAt: event.createdAt, payload: decryptSavPayload<unknown>(event.payloadCiphertext) })) };
