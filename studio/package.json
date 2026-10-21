@@ -87,6 +87,7 @@
     "mariadb": "3.5.4",
     "mysql2": "3.24.3",
     "tar": "7.5.22",
-    "braces": "$braces"
+    "braces": "$braces",
+    "vite": "8.2.4"
   }
 }
