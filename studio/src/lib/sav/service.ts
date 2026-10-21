@@ -1,3 +1,4 @@
+import { historicalMessageSql, intakeMessageHistorical } from "./intake/launch-boundary";
 import { enqueueConfiguredSavIntake } from "./intake/runtime";
 import { enqueueSavTranslation } from "./translations";
 import { savResolutionObservations } from "@/db/schema";
@@ -328,9 +329,10 @@ export async function ingestInboundMessage(rawInput: unknown) {
 
   if (result.duplicate) return result;
   if (!eligible) return { ...result, excludedFromProposals: true as const, proposalSkipReason: cutover ? "before_cutover" : "cutover_not_active" };
-  const intake = await enqueueConfiguredSavIntake(result.message.id).catch(() => ({ deferred: true as const }));
-  if (("runId" in intake && intake.runId) || "deferred" in intake) return { ...result, queuedForIntake: true as const };
+  if (await intakeMessageHistorical(result.message.id)) return { ...result, archivedFromAutomation: true as const };
   await enqueueSavTranslation(result.message.id).catch(()=>undefined);
+  const intake = await enqueueConfiguredSavIntake(result.message.id).catch(() => ({ deferred: true as const }));
+  if (("runId" in intake && intake.runId) || "deferred" in intake || "archived" in intake) return { ...result, queuedForIntake: true as const };
   if (isSavPilotMode()) return { ...result, queuedForPilot: true as const };
   const decision = await processStoredSavMessage(result.message.id);
   return { ...result, decision };
@@ -342,8 +344,9 @@ export function analyzeStoredSavMessage(input: Parameters<typeof analyzeSavMessa
 }
 
 export async function processStoredSavMessage(messageId: string) {
+  if (await intakeMessageHistorical(messageId)) return null;
   const intake = await enqueueConfiguredSavIntake(messageId);
-  if ("runId" in intake && intake.runId) return null;
+  if ("archived" in intake || "runId" in intake && intake.runId) return null;
   if (isSavPilotMode()) return null;
   const db = requireDb();
   const staleBefore = new Date(Date.now() - 10 * 60 * 1_000);
@@ -393,7 +396,7 @@ export async function processPendingSavMessages(limit = 4) {
   const db = requireDb();
   const staleBefore = new Date(Date.now() - 10 * 60 * 1_000);
   const candidates = await db.select({ id: savMessages.id }).from(savMessages).leftJoin(savPilotItems, eq(savPilotItems.messageId, savMessages.id)).where(and(
-    eq(savMessages.direction, "inbound"), isNull(savMessages.processedAt), isNull(savPilotItems.id), lt(savMessages.analysisAttempts, 3), savV0EligibleMessageFilter(),
+    eq(savMessages.direction, "inbound"), isNull(savMessages.processedAt), isNull(savPilotItems.id), lt(savMessages.analysisAttempts, 3), savV0EligibleMessageFilter(), sql`not (${historicalMessageSql()})`,
     or(eq(savMessages.analysisStatus, "pending"), and(eq(savMessages.analysisStatus, "processing"), or(isNull(savMessages.analysisStartedAt), lt(savMessages.analysisStartedAt, staleBefore)))),
   )).orderBy(asc(savMessages.receivedAt)).limit(Math.min(20, Math.max(1, limit)));
   const processed = [];
@@ -406,6 +409,8 @@ export async function processPendingSavMessages(limit = 4) {
 
 export async function processSavPilotItem(itemId: string) {
   const db = requireDb();
+  const [candidate] = await db.select({messageId:savPilotItems.messageId}).from(savPilotItems).where(eq(savPilotItems.id,itemId));
+  if (candidate && await intakeMessageHistorical(candidate.messageId)) return null;
   const [claimed] = await db.update(savPilotItems).set({
     status: "processing",
     attemptCount: sql`${savPilotItems.attemptCount} + 1`,
@@ -636,7 +641,8 @@ export async function processPendingSavPilotItems(limit = 10) {
     .where(and(eq(savPilotItems.status, "processing"), lt(savPilotItems.updatedAt, staleBefore), sql`${savPilotItems.attemptCount} >= 3`));
   const items = await db.select({ id: savPilotItems.id, batchId: savPilotItems.batchId }).from(savPilotItems)
     .innerJoin(savPilotBatches, eq(savPilotBatches.id, savPilotItems.batchId))
-    .where(and(eq(savPilotBatches.status, "processing"), eq(savPilotItems.status, "pending")))
+    .innerJoin(savMessages,eq(savMessages.id,savPilotItems.messageId))
+    .where(and(eq(savPilotBatches.status, "processing"), eq(savPilotItems.status, "pending"), sql`not (${historicalMessageSql()})`))
     .orderBy(asc(savPilotItems.createdAt)).limit(Math.min(10, Math.max(1, limit)));
   const processed = [];
   for (const item of items) {

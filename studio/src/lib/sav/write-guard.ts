@@ -1,4 +1,5 @@
 import "server-only";
+import { intakeMessageHistorical } from "./intake/launch-boundary";
 import { guardLegacyIntakeOccupation } from "./intake/legacy-occupation";
 import { and, desc, eq } from "drizzle-orm";
 import { requireDb } from "@/db";
@@ -33,6 +34,7 @@ async function loadSavWriteAuthority(actionId: string) {
     manualReplyConfirmed: action.payload.manualReplyConfirmed === true,
   });
   if (denial) throw new Error(denial);
+  if (action.messageId && await intakeMessageHistorical(action.messageId)) throw new Error("SAV_MESSAGE_HISTORICAL_OUTSIDE_AUTOMATION");
   if (!action.messageId || !await isSavMessageEligible(action.messageId)) throw new Error("SAV_MESSAGE_BEFORE_CUTOVER");
   if (savReleaseStage() === "v0" && ["create_ticket", "link_ticket"].includes(action.kind)) await assertSavCurrentTicketReview(action);
   if (isSavPartnershipForward(action)) await assertSavCurrentPartnershipForward(action);

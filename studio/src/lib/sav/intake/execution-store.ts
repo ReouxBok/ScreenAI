@@ -1,8 +1,10 @@
 import "server-only";
+import { intakeConsoleInstalled } from "./console-capability";
+import { intakeRunConfigurationBound, intakeHumanRefused } from "./human-binding";
 import { randomUUID } from "node:crypto";
 import { and, desc, eq, inArray, sql } from "drizzle-orm";
 import { requireDb } from "@/db";
-import { savActions, savThreads, savMessages, savIntakeRuns, savSyncState, savIntakeExecutions, savIntakeEffects, savIntakeEffectJournal, savIntakeOccupations, savIntakeExecutionBudget, savIntakeIdentityEpisodes } from "@/db/schema";
+import { savActions, savThreads, savMessages, savIntakeRuns, savSyncState, savIntakeExecutions, savIntakeEffects, savIntakeEffectJournal, savIntakeOccupations, savIntakeExecutionBudget, savIntakeIdentityEpisodes, savIntakeEffectRevisions } from "@/db/schema";
 import { encryptSavPayload, decryptSavPayload } from "../crypto";
 import { intakeRuntimeHash, assertSavIntakeObservation } from "./runtime-contract";
 import { readSavIntakeCurrent, savIntakeSourceSnapshot } from "./runtime-store";
@@ -89,7 +91,7 @@ export async function admitIntakeExecution(runId: string, options: ExecutionOpti
     if (!run)
         return null;
     const current = await readSavIntakeCurrent(run.threadId, options.runtime);
-    if (!current || current.id !== runId || !current.sourceMatches || run.state !== "observed" || run.configHash !== options.runtime.configHash || Date.parse(options.runtime.expiresAt) <= Date.now())
+    if (!current || current.id !== runId || !current.sourceMatches || run.state !== "observed" || !await intakeRunConfigurationBound(run, options.runtime) || Date.parse(options.runtime.expiresAt) <= Date.now())
         return null;
     // Expired observations keep their dates. Before any mutation the writer makes
     // a full authoritative CRM/Gmail/source revalidation of the unchanged facts.
@@ -209,14 +211,32 @@ export async function expandExecutionScope(lease: ExecutionLease, keys: string[]
         }).where(eq(savIntakeExecutions.id, lease.row.id));
     });
 }
-export async function getExecutionEffects(id: string) { return requireDb().select().from(savIntakeEffects).where(eq(savIntakeEffects.executionId, id)).orderBy(savIntakeEffects.createdAt, savIntakeEffects.id); }
+export async function activeExecutionEffects(id: string, tx: Pick<ReturnType<typeof requireDb>, "select"> = requireDb()) {
+    const installed = await intakeConsoleInstalled(tx);
+    if (!installed) {
+      const proof = await tx.select({ id: savIntakeRuns.id }).from(savIntakeRuns).innerJoin(savIntakeExecutions, eq(savIntakeExecutions.runId, savIntakeRuns.id))
+        .where(and(eq(savIntakeExecutions.id, id), sql`${savIntakeRuns.humanChoiceCiphertext} is not null`)).limit(1);
+      if (proof.length) return fault("CONSOLE_MIGRATION_REQUIRED");
+    }
+    const active = installed ? sql`not exists (select 1 from sav.intake_effect_revisions r where r.effect_id=${savIntakeEffects.id} and not r.active)` : undefined;
+    return tx.select().from(savIntakeEffects).where(and(eq(savIntakeEffects.executionId, id), active)).orderBy(savIntakeEffects.createdAt, savIntakeEffects.id);
+}
+export async function getExecutionEffects(id: string) { return activeExecutionEffects(id); }
 export async function ensureExecutionEffect(lease: ExecutionLease, intent: EffectIntent) {
     return requireDb().transaction(async (tx) => {
         await assertExecutionLocal(tx, lease);
         const [old] = await tx.select().from(savIntakeEffects).where(eq(savIntakeEffects.businessKey, intent.key));
         const hash = intakeRuntimeHash(intent);
         if (old) {
-            if (old.executionId !== lease.row.id || old.intentHash !== hash)
+            const [revision] = await intakeConsoleInstalled(tx) ? await tx.select().from(savIntakeEffectRevisions).where(eq(savIntakeEffectRevisions.effectId, old.id)) : [];
+            if (revision && !revision.active && revision.revisionRunId === lease.payload.lastRunId
+                && old.executionId === lease.row.id && old.state === "planned" && !old.dispatchedAt && !old.dispatchToken && !old.ackCiphertext && !old.confirmedAt) {
+                await executionJournal(tx, lease.row.id, "human_intent_replaced", { previous: decryptSavPayload(old.intentCiphertext), next: intent, eventId: revision.eventId }, old.id);
+                const [updated] = await tx.update(savIntakeEffects).set({ intentHash: hash, intentCiphertext: encryptSavPayload(intent), kind: intent.kind, permission: intent.permission }).where(eq(savIntakeEffects.id, old.id)).returning();
+                await tx.update(savIntakeEffectRevisions).set({ active: true }).where(eq(savIntakeEffectRevisions.effectId, old.id));
+                return updated;
+            }
+            if (old.executionId !== lease.row.id || old.intentHash !== hash || revision && !revision.active)
                 return fault("EFFECT_INTENT_CHANGED");
             return old;
         }
@@ -329,6 +349,15 @@ export async function identityEpisodeEffect(lease: ExecutionLease, intent: Effec
                 }>(episode.recipientCiphertext);
                 // Only a fenced, provably never-dispatched intent can transfer.
                 // The same episode/effect/RFC key survives; no send quota reset.
+                const [revision] = prior && await intakeConsoleInstalled(tx) ? await tx.select().from(savIntakeEffectRevisions).where(eq(savIntakeEffectRevisions.effectId, prior.id)) : [];
+                if (prior?.executionId === lease.row.id && revision && !revision.active && revision.revisionRunId === lease.payload.lastRunId
+                    && prior.state === "planned" && !prior.dispatchedAt && !prior.dispatchToken && !prior.ackCiphertext && !prior.confirmedAt
+                    && binding.email === intent.recipient && binding.mailbox === intent.mailbox && binding.gmailThread === intent.threadId) {
+                    await executionJournal(tx, lease.row.id, "human_identity_intent_replaced", { eventId: revision.eventId, previous: decryptSavPayload(prior.intentCiphertext), next: intent }, prior.id);
+                    const [updated] = await tx.update(savIntakeEffects).set({ intentHash: intakeRuntimeHash(intent), intentCiphertext: encryptSavPayload(intent) }).where(eq(savIntakeEffects.id, prior.id)).returning();
+                    await tx.update(savIntakeEffectRevisions).set({ active: true }).where(eq(savIntakeEffectRevisions.effectId, prior.id));
+                    return updated;
+                }
                 if (prior?.state === "planned" && prior.dispatchedAt === null && prior.dispatchToken === null && prior.ackCiphertext === null && owner?.state === "refused" && binding.email === intent.recipient && binding.mailbox === intent.mailbox && binding.gmailThread === intent.threadId) {
                     const [moved] = await tx.update(savIntakeEffects).set({
                         executionId: lease.row.id, intentHash: intakeRuntimeHash(intent), intentCiphertext: encryptSavPayload(intent)
@@ -384,7 +413,7 @@ export async function finishExecution(lease: ExecutionLease, ticketId: string | 
     await requireDb().transaction(async (tx) => {
         await admissionLock(tx);
         await assertExecutionLocal(tx, lease);
-        const effects = await tx.select().from(savIntakeEffects).where(eq(savIntakeEffects.executionId, lease.row.id));
+        const effects = await activeExecutionEffects(lease.row.id, tx);
         if (!effects.length || effects.some(e => e.state !== "confirmed"))
             return fault("EFFECTS_INCOMPLETE");
         if (ticketId)
@@ -403,6 +432,11 @@ export async function finishExecution(lease: ExecutionLease, ticketId: string | 
                 hubspotEmailId: emailId
             } : {})
         }).where(eq(savMessages.id, lease.row.messageId));
+        const [completedMessage] = await tx.select().from(savMessages).where(eq(savMessages.id, lease.row.messageId));
+        const completion = { sourceHash: (await savIntakeSourceSnapshot(tx, completedMessage, new Date())).sourceHash,
+            messageHash: executionMessageHash(completedMessage) };
+        await tx.update(savIntakeExecutions).set({ payloadCiphertext: encryptSavPayload({ ...lease.payload, effectsConfirmed: true, completion }) })
+            .where(eq(savIntakeExecutions.id, lease.row.id));
         await releaseKeys(tx, lease.row.id);
         await executionJournal(tx, lease.row.id, "execution_confirmed", {
             ticketId, actorType: "ai", learning: "not_started"
@@ -415,7 +449,7 @@ export async function adoptCurrentExecutionVersion(lease: ExecutionLease, option
     const current = await readSavIntakeCurrent(lease.row.threadId, options.runtime);
     if (!current || current.id === lease.payload.lastRunId)
         return;
-    if (!current.sourceMatches || current.messageId !== lease.row.messageId || current.state !== "observed" || current.configHash !== options.runtime.configHash || !current.payload.plan)
+    if (!current.sourceMatches || current.messageId !== lease.row.messageId || current.state !== "observed" || !await intakeRunConfigurationBound(current, options.runtime) || !current.payload.plan)
         return fault("VERSION_INCOMPATIBLE");
     const next = current.payload.plan, old = lease.payload.plan, effects = await getExecutionEffects(lease.row.id);
     if (effects.some(e => !["planned", "confirmed"].includes(e.state)) || current.humanChoiceCiphertext !== lease.payload.local.humanChoice)
@@ -480,7 +514,7 @@ export async function releaseRecoveredExecutionScope(executionId: string) {
         const [latest] = await tx.select({
             id: savMessages.id
         }).from(savMessages).where(and(eq(savMessages.threadId, row.threadId), eq(savMessages.direction, "inbound"))).orderBy(desc(savMessages.receivedAt), desc(savMessages.createdAt), desc(savMessages.id)).limit(1);
-        if (thread && !thread.aiPaused && latest?.id === row.messageId)
+        if (thread && !thread.aiPaused && latest?.id === row.messageId && !await intakeHumanRefused(row.messageId, tx))
             return;
         const effects = await tx.select().from(savIntakeEffects).where(eq(savIntakeEffects.executionId, row.id));
         if (effects.some(e => !["planned", "confirmed"].includes(e.state)))

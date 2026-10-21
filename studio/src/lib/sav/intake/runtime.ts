@@ -1,4 +1,7 @@
 import "server-only";
+import { intakeMessageHistorical, intakeLaunchMatches } from "./launch-boundary";
+import { recordAcceptedIntakeSemantics,SAV_INTAKE_SEMANTIC_RECORD_REVISION } from "./semantic-records";
+import { SAV_INTAKE_MODEL_REVISION } from "./model-readers";
 import { readSavGeminiResponse, type SavGeminiMetadata } from "../gemini-response";
 import { planSavIntake } from "./engine";
 import { createSavIntakeHubspotReaders } from "./hubspot-readers";
@@ -15,6 +18,8 @@ import { assertSavIntakeLease, catchupSavIntake, checkpointSavIntakeRun, claimSa
 export async function enqueueConfiguredSavIntake(messageId: string) {
   const config = savIntakeRuntimeConfig();
   if (!config) return { skipped: "off" as const };
+  if (await intakeMessageHistorical(messageId)) return { archived: true as const };
+  if (!await intakeLaunchMatches(config)) throw Error("SAV_INTAKE_LAUNCH_MISMATCH");
   return { runId: await enqueueSavIntakeMessage(messageId, config) };
 }
 export async function analyseSavIntakeRuntime(runId: string, config: IntakeRuntimeConfig,
@@ -24,7 +29,7 @@ export async function analyseSavIntakeRuntime(runId: string, config: IntakeRunti
   const controller = new AbortController(), timer = setTimeout(() => controller.abort(), 45_000);
   const pending: Promise<unknown>[] = [], traces: unknown[] = [];
   let uncertain = false, failureReason: string | undefined;
-  const payload: IntakeRuntimePayload = { revision: SAV_INTAKE_RUNTIME_REVISION, input: lease.input, traces, effects: "not_connected" };
+  const payload: IntakeRuntimePayload = {configuration: { configHash: config.configHash, resourcesHash: config.resourcesHash, policyHash: config.policyHash, codeRevision: config.codeRevision, model: config.model }, semantics:{revision:SAV_INTAKE_SEMANTIC_RECORD_REVISION,validatorRevision:SAV_INTAKE_MODEL_REVISION,records:[]},provenance:[...lease.provenance], revision: SAV_INTAKE_RUNTIME_REVISION, input: lease.input, traces, effects: "not_connected" };
   const live = async () => {
     const current = savIntakeRuntimeConfig(env());
     if (!current || current.configHash !== config.configHash || controller.signal.aborted) throw Error("SAV_INTAKE_RUNTIME_CONTEXT_CHANGED");
@@ -89,7 +94,8 @@ export async function analyseSavIntakeRuntime(runId: string, config: IntakeRunti
       failureReason = error instanceof Error && /^SAV_[A-Z_]+$/.test(error.message) ? error.message : "SAV_INTAKE_RUNTIME_PROVIDER_UNAVAILABLE";
       throw error;
     }); pending.push(work); return work; };
-    const semantic = createSavIntakeSemanticReaders({ model: config.model, call, provenance: lease.provenance, onTrace: trace => { traces.push(trace); checkpoint(); } });
+    const semanticReader = createSavIntakeSemanticReaders({ model: config.model, call, provenance: lease.provenance, onTrace: trace => { traces.push(trace); checkpoint(); } });
+    const semantic=recordAcceptedIntakeSemantics(semanticReader,payload.semantics!,checkpoint);
     const crm = createSavIntakeHubspotReaders({ onRead: trace => { traces.push(trace); checkpoint(); }, network: async (url, init) => {
       await live();
       const signal = AbortSignal.any([controller.signal, ...(init?.signal ? [init.signal] : [])]);

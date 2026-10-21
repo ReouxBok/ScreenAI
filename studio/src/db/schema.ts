@@ -621,6 +621,39 @@ export const savIntakeExecutionPolicies = sav.table("intake_execution_policies",
 export const savIntakeExecutionBudget = sav.table("intake_execution_budget", {
     id: text("id").primaryKey(), admitted: integer("admitted").notNull().default(0)
 });
+// Companion tables keep historical SELECT * contracts usable before 0042.
+export const savIntakeConsole = sav.table("intake_console", {
+  threadId: uuid("thread_id").primaryKey().references(() => savThreads.id, { onDelete: "cascade" }),
+  epoch: bigint("epoch", { mode: "number" }).notNull().default(1),
+  projectedEpoch: bigint("projected_epoch", { mode: "number" }).notNull().default(0),
+  messageId: uuid("message_id"), runId: uuid("run_id"), version: integer("version"),
+  mailboxId: uuid("mailbox_id").notNull(), view: text("view"), status: text("status").notNull().default("processing"),
+  reason: text("reason"), updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+}, t => [index("sav_intake_console_list").on(t.mailboxId, t.updatedAt, t.threadId)]);
+
+export const savIntakeHumanEvents = sav.table("intake_human_events", {
+  id: uuid("id").primaryKey().defaultRandom(), commandKey: uuid("command_key").notNull().unique(),
+  threadId: uuid("thread_id").notNull(), messageId: uuid("message_id").notNull(),
+  parentRunId: uuid("parent_run_id").notNull(), parentVersion: integer("parent_version").notNull(),
+  revisionRunId: uuid("revision_run_id"), baseConfigHash: text("base_config_hash").notNull(),
+  sourceHash: text("source_hash").notNull(), kind: text("kind").notNull(),
+  state: text("state").notNull().default("pending"), leaseToken: uuid("lease_token"), leaseUntil: timestamp("lease_until", { withTimezone: true }), readAttempts: integer("read_attempts").notNull().default(0), payloadCiphertext: text("payload_ciphertext").notNull(),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+}, t => [index("sav_intake_human_pending").on(t.state, t.createdAt)]);
+
+export const savIntakeObservationBindings = sav.table("intake_observation_bindings", {
+  observationId: uuid("observation_id").primaryKey().references(() => savResolutionObservations.id, { onDelete: "cascade" }),
+  executionId: uuid("execution_id").notNull().unique(), runId: uuid("run_id").notNull(),
+  messageId: uuid("message_id").notNull(), threadId: uuid("thread_id").notNull(),
+  baselineCiphertext: text("baseline_ciphertext").notNull(), baselineHash: text("baseline_hash").notNull(),
+  sensitive: boolean("sensitive").notNull(), createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+});
+
+export const savIntakeEffectRevisions = sav.table("intake_effect_revisions", {
+  effectId: uuid("effect_id").primaryKey(), eventId: uuid("event_id").notNull(),
+  active: boolean("active").notNull(), revisionRunId: uuid("revision_run_id").notNull(),
+});
+
 export const savIntakeExecutions = sav.table("intake_executions", {
     id: uuid("id").defaultRandom().primaryKey(), messageId: uuid("message_id").notNull().unique(), threadId: uuid("thread_id").notNull(), runId: uuid("run_id"), runVersion: integer("run_version").notNull(),
     policyId: uuid("policy_id").notNull().references(() => savIntakeExecutionPolicies.id), policyHash: text("policy_hash").notNull(), actorType: text("actor_type").notNull().default("ai"),

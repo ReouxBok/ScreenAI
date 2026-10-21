@@ -1,3 +1,6 @@
+import { refreshIntakeConsole } from "@/lib/sav/intake/console-store";
+import { ensureIntakeObservations } from "@/lib/sav/intake/observation-binding";
+import { reconcileIntakeHumanChoices } from "@/lib/sav/intake/human-worker";
 import { reconcileIntakeExecutor } from "@/lib/sav/intake/executor";
 import { reconcileSavIntakeRuntime } from "@/lib/sav/intake/runtime";
 import { reconcileSavTranslations } from "@/lib/sav/translations";
@@ -66,15 +69,18 @@ export async function GET(request: Request) {
     : !shouldAttemptHubspotBackfill(backfillState)
       ? { status: "skipped" as const, durationMs: 0, data: { reason: "configuration_required", retry: "automatic_within_30_minutes_or_manual" } }
       : await runStep("hubspot_learning_backfill", () => continueHubspotBackfill(1, 10));
+  const intakeTracking = await runStep("intake_tracking", () => ensureIntakeObservations(4));
   const observations = await runStep("resolution_observations", () => reconcileSavObservations(5,new Date(),{deadlineMs:Math.min(derivedDeadline,Date.now()+40000),maxComparisons:1}));
   const translations=await runStep("message_translations",()=>reconcileSavTranslations(2,{deadlineMs:derivedDeadline}));
   const intakeObservation = await runStep("intake_observation", () => reconcileSavIntakeRuntime({ deadlineMs: derivedDeadline }));
+  const intakeChoices = await runStep("intake_choices", () => Date.now()+45_000>derivedDeadline?Promise.resolve({skipped:"deadline"}):reconcileIntakeHumanChoices());
   const intakeExecution = await runStep("intake_execution",()=>Date.now()+60_000>derivedDeadline?Promise.resolve({skipped:"deadline"}):reconcileIntakeExecutor({deadlineMs:derivedDeadline}));
+  const intakeConsole = await runStep("intake_console", () => refreshIntakeConsole(20));
   const retention = await runStep("retention", () => enforceSavRetention());
   const dashboardProjection = savSqlDashboardEnabled()
     ? await runStep("dashboard_projection", () => refreshSavDashboardProjection(25, undefined, { deadlineMs: derivedDeadline }))
     : { status: "skipped" as const, durationMs: 0, data: { reason: "disabled" } };
-  const payload = { intakeExecution, intakeObservation, gmail, hubspot, emailOpenings, contextRefreshes, trainings, evaluations, ticketActions, pilotItems, pendingMessages, pilotActions, followups, replies, statusActions, learningBackfill, observations, translations, retention, dashboardProjection };
+  const payload = { intakeTracking, intakeChoices, intakeConsole, intakeExecution, intakeObservation, gmail, hubspot, emailOpenings, contextRefreshes, trainings, evaluations, ticketActions, pilotItems, pendingMessages, pilotActions, followups, replies, statusActions, learningBackfill, observations, translations, retention, dashboardProjection };
   const hasStepFailure = Object.values(payload).some((step) => step.status === "error");
   return Response.json(payload, { status: hasStepFailure ? 500 : 200 });
 }

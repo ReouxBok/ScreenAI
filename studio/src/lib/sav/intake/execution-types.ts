@@ -32,6 +32,7 @@ export type ExecutionPayload = {
     lastRunId: string;
     acceptedFingerprint: string;
     effectsConfirmed?: boolean;
+    completion?: { sourceHash: string; messageHash: string };
 };
 export type EffectIntent = {
     kind: EffectKind;

@@ -1,4 +1,6 @@
 import "server-only";
+import { intakeRuntimeHash } from "./intake/runtime-contract";
+import { intakeComparisonSourceCurrent } from "./intake/observation-binding";
 import {savV0EligibleMessageFilter} from "./cutover";
 import {SAV_DERIVED_COST_REVISION,isSavDerivedBudgetDeferred} from "./derived-budget";
 import {readSavCaseLearningQualification} from "./case-qualification";
@@ -14,7 +16,7 @@ import { isSavCaseLearningFrozen, savGeminiApiKey, savReleaseStage } from "./con
 import { isSavCrmLearningSourceCurrent } from "./learning-source";
 
 type Db = ReturnType<typeof requireDb>;
-type LearningPatch = { subject: string; finalHumanResolution: string; sourceSnapshotId: string; sourceSnapshotHash?: string; sourceCycleStartedAt?: string; cycleSourceHash?: string; provenance: "human_resolution"|"observed_treatment"; customerConfirmed: boolean; sourceMessageId: string; conditions: string[]; expectedResult: string; limitations: string[]; groupSignature?: string; comparisonSnapshot?: string };
+type LearningPatch = { subject: string; finalHumanResolution: string; sourceSnapshotId: string; sourceSnapshotHash?: string; sourceCycleStartedAt?: string; cycleSourceHash?: string; provenance: "human_resolution"|"observed_treatment"; customerConfirmed: boolean; sourceMessageId: string; conditions: string[]; expectedResult: string; limitations: string[]; groupSignature?: string; comparisonSnapshot?: string; intakeOrigin?: { baselineHash: string; qualificationHash: string } };
 function safeText(value: string, max: number) { return redactSavLearningText(value).replace(/\s+/g, " ").trim().slice(0, max); }
 export function savLearningMaterialText(value: string) { return safeText(value, 4000).normalize("NFKC").toLocaleLowerCase("fr").replace(/[^\p{L}\p{N}]+/gu, " ").trim(); }
 export function savLearningProofHash(input: { sourceRef: string; cycleStartedAt: Date | string; evidenceRef: string; sourceMessageId: string; resolution: string; customerConfirmed: boolean }) {
@@ -95,7 +97,7 @@ export async function reconcileSavDeferredComparisons(limit = 1, now = new Date(
       const qualification = observation ? await readSavCaseLearningQualification(observation.threadId) : null;
       const [thread] = observation ? await db.select().from(savThreads).where(eq(savThreads.id, observation.threadId)) : [];
       const [message] = observation ? await db.select({ id: savMessages.id }).from(savMessages).where(and(eq(savMessages.id, observation.messageId),savV0EligibleMessageFilter())) : [];
-      if (!observation?.closed || !cycle || cycle.qualification!=="resolved" || input.humanQualificationRevision && decryptSavPayload<{humanQualificationRevision?:string}>(cycle.summaryCiphertext).humanQualificationRevision!==input.humanQualificationRevision || cycle.cycle !== observation.cycle || cycle.sourceHash !== input.cycleSourceHash || !qualification?.allowed || input.caseContext?.currentQualificationHash && qualification.fingerprint !== input.caseContext.currentQualificationHash || !message) {
+      if (!observation?.closed || !cycle || !["resolved","evidence_observed"].includes(cycle.qualification??"") || input.humanQualificationRevision && decryptSavPayload<{humanQualificationRevision?:string}>(cycle.summaryCiphertext).humanQualificationRevision!==input.humanQualificationRevision || cycle.cycle !== observation.cycle || cycle.sourceHash !== input.cycleSourceHash || !qualification?.allowed || input.caseContext?.currentQualificationHash && qualification.fingerprint !== input.caseContext.currentQualificationHash || !message) {
         await clear("source_changed");
         continue;
       }
@@ -159,6 +161,7 @@ export async function processSavLearningResolution(input: SavLearningResolutionI
       const [cycle]=await tx.select().from(savObservationCycles).where(eq(savObservationCycles.id,input.cycleId));
       if(!observation?.closed || observation.sourceErrors.length || cycle?.qualification!=="resolved" || cycle.sourceHash!==input.cycleSourceHash || decryptSavPayload<{humanQualificationRevision?:string}>(cycle.summaryCiphertext).humanQualificationRevision!==input.humanQualificationRevision)return {stale:true as const};
     }
+    if (!await intakeComparisonSourceCurrent(input, tx)) return { stale: true as const };
     const claimed = await claimSavLearningComparisonTx(tx, { sourceRef, sourceHash, origin, inputHash, now, resumeDeferred:Boolean(savedComparison) });
     if (!claimed.claimed) return { duplicate: true as const };
     if (savedComparison) return {duplicate:false as const,signalId:claimed.signalId,leaseToken:claimed.leaseToken};
@@ -184,7 +187,9 @@ export async function processSavLearningResolution(input: SavLearningResolutionI
   }
   try {
   let comparison: Awaited<ReturnType<typeof compareSavLearningResolution>>;
-  try { comparison = savedComparison ?? await compareSavLearningResolution(comparisonInput, { apiKey: options.apiKey ?? savGeminiApiKey(), model, derivedReservationId: "reservationId" in claim ? claim.reservationId : undefined, fetch: options.fetch }); }
+  try { comparison = savedComparison ?? await compareSavLearningResolution(comparisonInput, { apiKey: options.apiKey ?? savGeminiApiKey(), model, derivedReservationId: "reservationId" in claim ? claim.reservationId : undefined, fetch: options.fetch, beforeDispatch: async () => {
+      if (!await intakeComparisonSourceCurrent(input)) throw Error("SAV_OBSERVATION_STALE");
+    } }); }
   catch (error) {
     if(isSavDerivedBudgetDeferred(error)) {
       await requireDb().transaction(tx=>releaseSavLearningComparisonTx(tx,claim.signalId,claim.leaseToken));
@@ -199,7 +204,7 @@ export async function processSavLearningResolution(input: SavLearningResolutionI
   const decision = comparison.decision;
   return await requireDb().transaction(async tx => {
     // Match source-writer order, then take the shared admission lock and fenced claim.
-    let sourceCurrent = !isSavCaseLearningFrozen();
+    let sourceCurrent = !isSavCaseLearningFrozen() && await intakeComparisonSourceCurrent(input, tx);
     sourceCurrent &&= origin !== "hubspot" || Boolean(input.ticketId && await isSavCrmLearningSourceCurrent({ ticketId: input.ticketId,
       snapshotId: input.snapshotId, snapshotHash: input.snapshotHash, cycleStartedAt: input.cycleStartedAt }, tx, true));
     if (input.observationId && input.cycleId) {
@@ -266,7 +271,7 @@ export async function processSavLearningResolution(input: SavLearningResolutionI
     if (decision.outcome === "already_covered") { await finish("comparison_context_changed"); return { disposition: "signal" as const, reasonCode: "comparison_context_changed" }; }
     const capacity = await reserveSavLearningCapacityTx(tx, { reservationKey: savContentHash({ sourceRef, sourceHash, groupKey }), proposalKind: decision.outcome === "amendment" ? "amendment" : "new", now });
     if (!capacity.ok) { await finish(capacity.reasonCode); return { disposition: "signal" as const, reasonCode: capacity.reasonCode }; }
-    const patch: LearningPatch = { subject: safeText(decision.subject, 500), finalHumanResolution: safeText(decision.resolution, 4000), sourceSnapshotId: input.snapshotId,
+    const patch: LearningPatch = { ...(input.caseContext?.origin === "intake" ? { intakeOrigin: { baselineHash: intakeRuntimeHash(input.caseContext.intakeBaseline), qualificationHash: input.caseContext.currentQualificationHash! } } : {}), subject: safeText(decision.subject, 500), finalHumanResolution: safeText(decision.resolution, 4000), sourceSnapshotId: input.snapshotId,
       sourceSnapshotHash: input.snapshotHash, sourceCycleStartedAt: new Date(input.cycleStartedAt).toISOString(),
       cycleSourceHash: input.cycleSourceHash, provenance: input.provenance==="observed_treatment"?"observed_treatment":"human_resolution", customerConfirmed: input.customerConfirmed, sourceMessageId: input.sourceMessageId!,
       conditions: decision.conditions.map(value => safeText(value, 500)), expectedResult: safeText(decision.expectedResult, 500), limitations: decision.limitations.map(value => safeText(value, 500)),

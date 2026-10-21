@@ -1,4 +1,5 @@
 import "server-only";
+import { intakeRunConfigurationBound } from "./human-binding";
 import { createHash } from "node:crypto";
 import { and, eq, inArray, lte, or, sql } from "drizzle-orm";
 import { requireDb } from "@/db";
@@ -165,6 +166,8 @@ async function live(lease: ExecutionLease, options: ExecutionOptions, permission
     const config = intakeExecutionConfig(options.env()), runtime = savIntakeRuntimeConfig(options.env());
     if (!config || !runtime || lease.row.policyId !== options.config.policyId || lease.row.policyHash !== options.config.policyHash || lease.payload.runtimeConfigHash !== options.runtime.configHash || options.signal.aborted || config.policyId !== options.config.policyId || config.policyHash !== options.config.policyHash || runtime.configHash !== options.runtime.configHash)
         return fault("DISABLED");
+    const [boundRun] = await requireDb().select().from(savIntakeRuns).where(eq(savIntakeRuns.id, lease.payload.lastRunId));
+    if (!boundRun || !await intakeRunConfigurationBound(boundRun, runtime)) return fault("VERSION_INCOMPATIBLE");
     const { policy } = await readIntakeExecutionAuthority(config);
     if (permission && !policy.mutations.includes(permission as typeof policy.mutations[number]))
         return fault("MUTATION_NOT_GRANTED");
@@ -311,7 +314,7 @@ export async function pendingIntakeEffectRecoveries(now = new Date()) {
 }
 export async function scanIntakeExecutionCandidates(options: ExecutionOptions) {
     const key = "sav-intake-execution-scan-v1", db = requireDb(), [cursor] = await db.select().from(savSyncState).where(eq(savSyncState.key, key));
-    const base = and(eq(savIntakeRuns.isCurrent, true), eq(savIntakeRuns.state, "observed"), eq(savIntakeRuns.configHash, options.runtime.configHash), sql `not exists(select 1 from sav.intake_executions e where e.message_id=${savIntakeRuns.messageId})`, sql `exists(select 1 from sav.threads t where t.id=${savIntakeRuns.threadId} and not t.ai_paused)`);
+    const base = and(eq(savIntakeRuns.isCurrent, true), eq(savIntakeRuns.state, "observed"), sql `not exists(select 1 from sav.intake_executions e where e.message_id=${savIntakeRuns.messageId})`, sql `exists(select 1 from sav.threads t where t.id=${savIntakeRuns.threadId} and not t.ai_paused)`);
     const scanCursor = cursor?.cursor ? JSON.parse(cursor.cursor) as {
         at: string;
         id: string;
@@ -325,7 +328,8 @@ export async function scanIntakeExecutionCandidates(options: ExecutionOptions) {
         }).from(savIntakeRuns).where(base).orderBy(savIntakeRuns.createdAt, savIntakeRuns.id).limit(4);
     for (const run of candidates) {
         try {
-            await admitIntakeExecution(run.id, options);
+            const [candidate] = await db.select().from(savIntakeRuns).where(eq(savIntakeRuns.id, run.id));
+            if (candidate && await intakeRunConfigurationBound(candidate, options.runtime)) await admitIntakeExecution(run.id, options);
         }
         catch (error) {
             if (!["SAV_INTAKE_EXECUTION_SCOPE_OCCUPIED", "SAV_INTAKE_EXECUTION_LEGACY_SCOPE_OCCUPIED", "SAV_INTAKE_EXECUTION_LEGACY_SCOPE_UNKNOWN"].includes(code(error)))
@@ -400,7 +404,7 @@ export async function readIntakeExecutionProgress(messageId: string) {
     const payload = decryptSavPayload<ExecutionPayload>(row.payloadCiphertext), effects = await getExecutionEffects(row.id), required = requiredExecutionKinds(payload);
     const confirmed = row.state === "confirmed" && required.length > 0 && required.every(k => effects.some(e => e.kind === k && e.state === "confirmed"));
     return {
-        executionId: row.id, runId: row.runId, version: row.runVersion, actorType: "ai", state: row.state, ticketId: row.ticketId, confirmed, reason: payload.reason ?? null, effects: effects.map(e => ({
+        executionId: row.id, runId: row.runId, version: row.runVersion, actorType: "ai", completionSourceHash: payload.completion?.sourceHash ?? null, state: row.state, ticketId: row.ticketId, confirmed, reason: payload.reason ?? null, effects: effects.map(e => ({
             id: e.id, kind: e.kind, state: e.state, attemptId: e.attemptId, ack: ack(e), dispatchedAt: e.dispatchedAt, confirmedAt: e.confirmedAt
         })), learning: payload.plan.decision.classification === "finance" || payload.plan.decision.classification === "cancellation" ? "excluded" : "not_started", followupStarted: false
     };

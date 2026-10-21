@@ -1,4 +1,7 @@
 import "server-only";
+import { intakeLaunchMatches } from "./launch-boundary";
+import { intakeConsoleInstalled } from "./console-capability";
+import { intakeRunConfigurationBound, intakeHumanRefused, intakeHasHumanDecision } from "./human-binding";
 import { randomUUID } from "node:crypto";
 import { and, desc, eq, gt, inArray, lt, lte, or, sql } from "drizzle-orm";
 import { requireDb } from "@/db";
@@ -31,7 +34,7 @@ const latest = async (tx: Tx, threadId: string) => (await tx.select().from(savMe
 const journal = async (tx: Tx, runId: string, kind: string, value: unknown) => {
   await tx.insert(savIntakeJournal).values({ runId, kind, payloadCiphertext: encryptSavPayload(value) });
 };
-export async function savIntakeSourceSnapshot(tx: Tx, message: typeof savMessages.$inferSelect, now: Date) {
+export async function savIntakeSourceSnapshot(tx: Pick<Tx, "select">, message: typeof savMessages.$inferSelect, now: Date) {
   const rows = await tx.select().from(savMessages).where(and(eq(savMessages.threadId, message.threadId), lte(savMessages.receivedAt, message.receivedAt)))
     .orderBy(desc(savMessages.receivedAt), desc(savMessages.createdAt), desc(savMessages.id)).limit(51);
   const prepared = rows.slice(0, 50).map(row => {
@@ -60,11 +63,12 @@ const eligible = (message: typeof savMessages.$inferSelect, config: IntakeRuntim
 export async function enqueueSavIntakeMessage(messageId: string, config: IntakeRuntimeConfig) {
   return requireDb().transaction(async tx => {
     const [message] = await tx.select().from(savMessages).where(eq(savMessages.id, messageId));
-    if (!message || !eligible(message, config)) return null;
+    if (!await intakeLaunchMatches(config, tx) || !message || !eligible(message, config) || await intakeHumanRefused(messageId, tx)) return null;
     await tx.select().from(savThreads).where(eq(savThreads.id, message.threadId)).for("update");
     if ((await latest(tx, message.threadId))?.id !== message.id) return null;
     const [same] = await tx.select().from(savIntakeRuns).where(and(eq(savIntakeRuns.messageId, message.id), eq(savIntakeRuns.configHash, config.configHash)));
     if (same) return same.id;
+    if (await intakeHasHumanDecision(messageId, tx)) return null;
     // Atomic ownership claim races safely with the legacy pending->processing UPDATE.
     const owned = await tx.update(savMessages).set({ analysisStatus: "intake_pending" }).where(and(eq(savMessages.id, message.id),
       or(unclaimedMessage, sql`${savMessages.analysisStatus} like 'intake_%'`))).returning({ id: savMessages.id });
@@ -81,9 +85,10 @@ export async function enqueueSavIntakeMessage(messageId: string, config: IntakeR
 }
 /** Scope and latest-inbound predicate prevent a broad historical replay. */
 export async function catchupSavIntake(config: IntakeRuntimeConfig, limit = 4) {
+  const noHuman = await intakeConsoleInstalled() ? sql`not exists(select 1 from sav.intake_human_events h where h.message_id=${savMessages.id})` : undefined;
   const messages = await requireDb().select({ id: savMessages.id }).from(savMessages).where(and(eq(savMessages.mailboxId, config.mailboxId), eq(savMessages.direction, "inbound"),
     gt(savMessages.receivedAt, new Date(config.receivedAfter)), gt(savMessages.createdAt, new Date(config.createdAfter)),
-    or(unclaimedMessage, sql`${savMessages.analysisStatus} like 'intake_%'`),
+    or(unclaimedMessage, sql`${savMessages.analysisStatus} like 'intake_%'`), noHuman,
     sql`not exists (select 1 from sav.intake_runs r where r.message_id = ${savMessages.id} and r.config_hash = ${config.configHash})`,
     sql`not exists (select 1 from sav.messages m where m.thread_id = ${savMessages.threadId} and m.direction = 'inbound' and (m.received_at,m.created_at,m.id) > (${savMessages.receivedAt},${savMessages.createdAt},${savMessages.id}))`))
     .orderBy(savMessages.createdAt).limit(Math.min(4, Math.max(1, limit)));
@@ -95,7 +100,7 @@ export async function claimSavIntakeRun(id: string, config: IntakeRuntimeConfig,
     const [initial] = await tx.select().from(savIntakeRuns).where(eq(savIntakeRuns.id, id)); if (!initial) return null;
     const [thread] = await tx.select().from(savThreads).where(eq(savThreads.id, initial.threadId)).for("update");
     const [run] = await tx.select().from(savIntakeRuns).where(eq(savIntakeRuns.id, id)).for("update");
-    if (!run.isCurrent || run.configHash !== config.configHash || ["observed", "uncertain", "superseded"].includes(run.state)
+    if (!run.isCurrent || !await intakeRunConfigurationBound(run, config, tx) || ["observed", "uncertain", "superseded"].includes(run.state)
       || run.leaseUntil && run.leaseUntil > now) return null;
     const message = await latest(tx, run.threadId);
     if (!message || message.id !== run.messageId || !eligible(message, config)) {
@@ -123,7 +128,7 @@ async function assertLease(tx: Tx, lease: IntakeLease, config: IntakeRuntimeConf
   const [run] = await tx.select().from(savIntakeRuns).where(eq(savIntakeRuns.id, lease.run.id)).for("update");
   const message = await latest(tx, lease.run.threadId);
   if (!thread || thread.aiPaused || !run?.isCurrent || run.state !== "analysing" || run.leaseToken !== lease.token || !run.leaseUntil || run.leaseUntil <= now
-    || run.humanChoiceCiphertext !== lease.run.humanChoiceCiphertext || run.configHash !== config.configHash || Date.parse(config.expiresAt) <= now.getTime() || message?.id !== run.messageId) return fail();
+    || run.humanChoiceCiphertext !== lease.run.humanChoiceCiphertext || !await intakeRunConfigurationBound(run, config, tx) || Date.parse(config.expiresAt) <= now.getTime() || message?.id !== run.messageId) return fail();
   if ((await savIntakeSourceSnapshot(tx, message, now)).sourceHash !== lease.sourceHash) return fail();
   return run;
 }
@@ -158,8 +163,9 @@ export async function failSavIntakeRun(lease: IntakeLease, payload: IntakeRuntim
   });
 }
 export async function pendingSavIntakeRuns(config: IntakeRuntimeConfig, now = new Date()) {
+  const noHuman = await intakeConsoleInstalled() ? sql`not exists(select 1 from sav.intake_human_events h where h.message_id=${savIntakeRuns.messageId})` : undefined;
   return requireDb().select({ id: savIntakeRuns.id }).from(savIntakeRuns).where(and(eq(savIntakeRuns.isCurrent, true), eq(savIntakeRuns.configHash, config.configHash),
-    lt(savIntakeRuns.attempts, 2),
+    lt(savIntakeRuns.attempts, 2), noHuman,
     sql`(select coalesce(sum(s.attempts),0) from sav.intake_runs s where s.message_id = ${savIntakeRuns.messageId}) < 2`,
     sql`exists (select 1 from sav.threads t where t.id = ${savIntakeRuns.threadId} and not t.ai_paused)`,
     or(inArray(savIntakeRuns.state, ["pending", "waiting"]), and(eq(savIntakeRuns.state, "analysing"), lt(savIntakeRuns.leaseUntil, now)))))
@@ -210,7 +216,7 @@ export async function readSavIntakeCurrent(threadId: string, config?: IntakeRunt
     .orderBy(desc(savMessages.receivedAt), desc(savMessages.createdAt), desc(savMessages.id)).limit(1);
   const sourceMatches = message?.id === run.messageId && await db.transaction(async tx => (await savIntakeSourceSnapshot(tx, message, now)).sourceHash === run.sourceHash);
   const events = await db.select().from(savIntakeJournal).where(eq(savIntakeJournal.runId, run.id)).orderBy(savIntakeJournal.createdAt, savIntakeJournal.id);
-  return { ...run, sourceMatches, fresh: Boolean(config && Date.parse(config.expiresAt) > now.getTime() && config.configHash === run.configHash && run.state === "observed" && run.freshUntil && run.freshUntil > now && !thread?.aiPaused && sourceMatches),
+  return { ...run, sourceMatches, fresh: Boolean(config && Date.parse(config.expiresAt) > now.getTime() && await intakeRunConfigurationBound(run, config) && run.state === "observed" && run.freshUntil && run.freshUntil > now && !thread?.aiPaused && sourceMatches),
     payload: decryptSavPayload<IntakeRuntimePayload>(run.payloadCiphertext),
     humanChoice: run.humanChoiceCiphertext ? decryptSavPayload<unknown>(run.humanChoiceCiphertext) : null,
     journal: events.map(event => ({ id: event.id, kind: event.kind, createdAt: event.createdAt, payload: decryptSavPayload<unknown>(event.payloadCiphertext) })) };

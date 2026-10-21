@@ -1,0 +1,196 @@
+import "server-only";
+import { randomUUID } from "node:crypto";
+import { and, desc, eq, inArray, lt, or, sql } from "drizzle-orm";
+import { requireDb } from "@/db";
+import { savThreads, savMessages, savIntakeRuns, savIntakeJournal, savIntakeHumanEvents,
+  savIntakeExecutions, savIntakeEffects, savIntakeEffectRevisions } from "@/db/schema";
+import { decryptSavPayload, encryptSavPayload } from "../crypto";
+import { intakeRuntimeHash, savIntakeRuntimeConfig, type IntakeRuntimeConfig, type IntakeRuntimePayload } from "./runtime-contract";
+import { intakeConsoleInstalled } from "./console-capability";
+import { humanRevisionConfigHash, intakeRunConfigurationBound, type HumanEventPayload } from "./human-binding";
+import { acceptedIntakeResult } from "./semantic-records";
+import { savIntakeDecisionSchema } from "./contract";
+import { collectExecutionCrm, assertExecutionCrmUnchanged } from "./execution-context";
+import { planSavIntake, savIntakePlanFingerprint, savIntakeEvidenceContentHash } from "./engine";
+import { savIntakeSourceSnapshot } from "./runtime-store";
+import { admissionLock, executionJournal, occupyKeys, releaseKeys, assertNoLegacyConflict, executionMessageHash } from "./execution-store";
+import { createSavIntakeHubspotReaders } from "./hubspot-readers";
+import type { EngineInput, IntakeAdapters, IntakePlan } from "./engine-types";
+import type { ExecutionPayload, EffectAck } from "./execution-types";
+async function confirmedCreationRevision(original: IntakeRuntimePayload, input: EngineInput, ticketId: string,
+  config: IntakeRuntimeConfig, readers: Parameters<typeof consumeIntakeHumanEvent>[2]): Promise<IntakePlan | null> {
+  const [execution] = await requireDb().select().from(savIntakeExecutions).where(eq(savIntakeExecutions.messageId,input.message.id));
+  if (!execution) return null;
+  const payload=decryptSavPayload<ExecutionPayload>(execution.payloadCiphertext), old=original.plan;
+  const effects=await requireDb().select().from(savIntakeEffects).where(eq(savIntakeEffects.executionId,execution.id));
+  const created=effects.find(e=>e.kind==="ticket_create"&&e.state==="confirmed"&&e.ackCiphertext&&decryptSavPayload<EffectAck>(e.ackCiphertext).id===ticketId);
+  if (!created) return null;
+  if (!old || old.decision.disposition.kind!=="ticket" || old.decision.disposition.target.operation!=="create" || !payload.baseline
+    || effects.some(e=>!["planned","confirmed"].includes(e.state)) || input.humanResolution?.classification) return conflict();
+  acceptedIntakeResult(original.semantics,"analyseMessage",{message:input.message,conversation:input.conversation.data});
+  const current=await collectExecutionCrm(old,original.input,config,readers,AbortSignal.timeout(30000));
+  assertExecutionCrmUnchanged(payload.baseline,current,effects);
+  const actual=Object.values(current.tickets).flat().find(t=>t.id===ticketId);
+  if (!actual || actual.stage!=="new" || !actual.contactIds.includes(old.decision.disposition.target.contactId)) return conflict();
+  const choice=input.humanResolution!,humanId=`human-resume-${input.humanResolution!.choiceId}`,at=new Date().toISOString(),contactId=old.decision.disposition.target.contactId;
+  const plan=structuredClone(old),disposition=plan.decision.disposition;
+  if (disposition.kind!=="ticket") return conflict();
+  const ticketEvidenceId=`human-ticket-${ticketId}`,membership=`human-membership-${ticketId}-${contactId}`,history=`human-history-${ticketId}`;
+  plan.decision.evidence.push({id:humanId,source:"human_override",sourceId:choice.choiceId,observedAt:choice.at,contentHash:savIntakeEvidenceContentHash(choice)},
+    {id:ticketEvidenceId,source:"crm_ticket",sourceId:ticketId,observedAt:at,contentHash:savIntakeEvidenceContentHash(actual)},
+    {id:history,source:"crm_event",sourceId:ticketId,observedAt:at,contentHash:savIntakeEvidenceContentHash(current.histories[ticketId])},
+    {id:membership,source:"ticket_contact_association",sourceId:membership,ticketId,contactId,direction:"ticket_to_contact",observedAt:at,contentHash:savIntakeEvidenceContentHash({ticketId,contactId})});
+  disposition.target={operation:"link",ticketId,contactId,alreadyNew:true,ticketEvidenceId,contactAssociationEvidenceId:membership};
+  disposition.sameIssueEvidenceIds=[...new Set([...disposition.sameIssueEvidenceIds,ticketEvidenceId,history,humanId])];
+  disposition.multiTicketNote.openTicketIdsOnTargetContact=[...new Set(Object.values(current.tickets).flat().filter(t=>t.contactIds.includes(contactId)&&t.stage!=="closed").map(t=>t.id))].sort();
+  disposition.requiredPermissions=disposition.requiredPermissions.map(p=>p==="create_ticket"?"link_ticket":p);
+  delete plan.newTicket;
+  plan.decision=savIntakeDecisionSchema.parse(plan.decision);
+  plan.fingerprint=savIntakePlanFingerprint(plan);
+  plan.steps=disposition.requiredPermissions.map(mutation=>({id:`${input.message.id}:${mutation}:${plan.fingerprint}`,mutation,requiresPermission:mutation,ticketId,status:"not_dispatched"}));
+  return plan;
+}
+const conflict = (): never => { throw Error("SAV_INTAKE_HUMAN_REVALIDATION_REQUIRED"); };
+/** Atomic amendment of the same execution. Removed planned effects remain
+ * tombstones; their complete previous bytes remain in the encrypted journal. */
+async function amendExecution(tx: Parameters<typeof admissionLock>[0], event: typeof savIntakeHumanEvents.$inferSelect,
+  run: typeof savIntakeRuns.$inferSelect, plan: IntakePlan, input: EngineInput) {
+  const [execution] = await tx.select().from(savIntakeExecutions).where(eq(savIntakeExecutions.messageId, run.messageId)).for("update");
+  if (!execution) return;
+  if (execution.state === "confirmed") return conflict();
+  const effects = await tx.select().from(savIntakeEffects).where(eq(savIntakeEffects.executionId, execution.id)).for("update");
+  if (effects.some(e => !["planned", "confirmed"].includes(e.state)
+    || e.state === "planned" && (e.dispatchedAt || e.dispatchToken || e.ackCiphertext || e.confirmedAt))) return conflict();
+  const old = decryptSavPayload<ExecutionPayload>(execution.payloadCiphertext), confirmed = effects.filter(e => e.state === "confirmed");
+  const disposition = plan.decision.disposition;
+  if (confirmed.length) {
+    const prior = old.plan.decision.disposition, created = confirmed.find(e => e.kind === "ticket_create");
+    const target = prior.kind === "ticket" ? prior.target.operation === "create"
+      ? created?.ackCiphertext ? decryptSavPayload<EffectAck>(created.ackCiphertext).id : null : prior.target.ticketId : null;
+    if (prior.kind !== "ticket" || disposition.kind !== "ticket" || disposition.target.operation === "create" || disposition.target.ticketId !== target
+      || intakeRuntimeHash(prior.contactScope) !== intakeRuntimeHash(disposition.contactScope) || old.plan.noteText !== plan.noteText
+      || old.plan.decision.classification !== plan.decision.classification) return conflict();
+  }
+  const choice = decryptSavPayload<HumanEventPayload>(event.payloadCiphertext);
+  const keys = [...old.keys.filter(k => k.startsWith("email:")), ...choice.candidateContactIds.map(id => `contact:${id}`), `thread:${run.threadId}`, ...(plan.candidateContactIds ?? []).map(id => `contact:${id}`),
+    ...(disposition.kind === "ticket" ? disposition.contactScope.contacts.map(c => `contact:${c.contactId}`) : []),
+    ...(disposition.kind === "ticket" && disposition.target.operation !== "create" ? [`ticket:${disposition.target.ticketId}`] : [])];
+  await assertNoLegacyConflict(tx, keys);
+  await occupyKeys(tx, execution.id, "intake", keys);
+  for (const effect of effects.filter(e => e.state === "planned")) {
+    await executionJournal(tx, execution.id, "human_intent_retired", { eventId: event.id, priorRunId: execution.runId,
+      intent: decryptSavPayload(effect.intentCiphertext), intentHash: effect.intentHash, businessKey: effect.businessKey }, effect.id);
+    await tx.insert(savIntakeEffectRevisions).values({ effectId: effect.id, eventId: event.id, active: false, revisionRunId: run.id })
+      .onConflictDoUpdate({ target: savIntakeEffectRevisions.effectId, set: { eventId: event.id, active: false, revisionRunId: run.id } });
+  }
+  const [message] = await tx.select().from(savMessages).where(eq(savMessages.id, run.messageId));
+  const [thread] = await tx.select().from(savThreads).where(eq(savThreads.id, run.threadId));
+  if (!message || !thread) return conflict();
+  const payload: ExecutionPayload = { ...old, plan: confirmed.length ? old.plan : plan, input,
+    lastRunId: run.id, acceptedFingerprint: plan.fingerprint, keys: [...new Set([...old.keys, ...keys])].sort(),
+    local: { ...old.local, sourceHash: run.sourceHash, humanChoice: run.humanChoiceCiphertext,
+      messageHash: executionMessageHash(message), ticketId: thread.hubspotTicketId } };
+  if (!confirmed.length) delete payload.baseline;
+  await tx.update(savIntakeExecutions).set({ state: disposition.kind === "ticket" || disposition.kind === "request_identification" ? "pending" : "refused", runId: run.id, runVersion: run.version, leaseToken: null, leaseUntil: null,
+    payloadCiphertext: encryptSavPayload(payload), updatedAt: new Date() }).where(eq(savIntakeExecutions.id, execution.id));
+  await executionJournal(tx, execution.id, "human_revision_adopted", { eventId: event.id, previousRunId: execution.runId, runId: run.id,
+    retainedReceipts: confirmed.map(e => e.id), admissionCountUnchanged: true });
+  // No uncertain departure exists. Release only the old scope, then retain the
+  // exact current scope, within this same admission transaction.
+  await releaseKeys(tx, execution.id);
+  await occupyKeys(tx, execution.id, "intake", keys);
+  payload.keys = [...new Set(keys)].sort();
+  await tx.update(savIntakeExecutions).set({ payloadCiphertext: encryptSavPayload(payload) }).where(eq(savIntakeExecutions.id, execution.id));
+}
+export async function consumeIntakeHumanEvent(id: string, config: IntakeRuntimeConfig,
+  readers: Pick<IntakeAdapters, "findContactsByEmail" | "directAssociations" | "getContact" | "ticketsForContact" | "ticketHistory">) {
+  const token = randomUUID(), now = new Date(), db = requireDb();
+  const claim = await db.transaction(async tx => {
+    await admissionLock(tx);
+    const [event] = await tx.select().from(savIntakeHumanEvents).where(eq(savIntakeHumanEvents.id, id)).for("update");
+    if (!event || !["pending", "reading"].includes(event.state) || event.readAttempts >= 2 || event.leaseUntil && event.leaseUntil > now) return null;
+    const [parent] = await tx.select().from(savIntakeRuns).where(eq(savIntakeRuns.id, event.parentRunId));
+    const [thread] = await tx.select().from(savThreads).where(eq(savThreads.id, event.threadId)).for("update");
+    const [message] = await tx.select().from(savMessages).where(eq(savMessages.id, event.messageId));
+    if (!parent?.isCurrent || thread?.aiPaused || !message || !await intakeRunConfigurationBound(parent, config, tx, event.id)
+      || parent.sourceHash !== event.sourceHash || (await savIntakeSourceSnapshot(tx, message, now)).sourceHash !== event.sourceHash) {
+      await tx.update(savIntakeHumanEvents).set({state:"waiting",leaseToken:null,leaseUntil:null}).where(eq(savIntakeHumanEvents.id,id));
+      return null;
+    }
+    const [updated] = await tx.update(savIntakeHumanEvents).set({ state: "reading", leaseToken: token,
+      leaseUntil: new Date(now.getTime() + 60000), readAttempts: event.readAttempts + 1 }).where(eq(savIntakeHumanEvents.id, id)).returning();
+    return { event: updated, parent, snapshot: await savIntakeSourceSnapshot(tx, message, now) };
+  });
+  if (!claim) return { skipped: "not_claimed" };
+  try {
+    const { event, parent, snapshot } = claim, value = decryptSavPayload<HumanEventPayload>(event.payloadCiphertext);
+    const original = decryptSavPayload<IntakeRuntimePayload>(parent.payloadCiphertext);
+    if (value.parentPayloadHash !== intakeRuntimeHash(original) || original.configuration?.configHash !== config.configHash
+      || value.mailboxId !== config.mailboxId || value.policyHash !== config.policyHash || value.resourcesHash !== config.resourcesHash) return conflict();
+    const input: EngineInput = { ...snapshot.input, humanResolution: { choiceId: id, at: event.createdAt.toISOString(),
+      contactId: value.contactId, ticketId: value.ticketId, classification: value.classification, equivalentContactIds: value.candidateContactIds } };
+    let reason: string | undefined;
+    const accepted = <T>(method: "analyseMessage" | "assessIdentity" | "assessIssues", data: unknown): T => {
+      try { return acceptedIntakeResult<T>(original.semantics, method, data); }
+      catch (error) { reason = error instanceof Error ? error.message : "SAV_INTAKE_SEMANTIC_PROVENANCE_MISSING"; throw error; }
+    };
+    const deadline = AbortSignal.timeout(30000);
+    const boundedReaders = Object.fromEntries(Object.entries(readers).map(([name, fn]) => [name, async (argument: string, signal: AbortSignal) => {
+      if (deadline.aborted) throw Error("SAV_INTAKE_HUMAN_REVALIDATION_REQUIRED");
+      return fn(argument, AbortSignal.any([signal, deadline]));
+    }])) as typeof readers;
+    const confirmedPlan=value.ticketId ? await confirmedCreationRevision(original,input,value.ticketId,config,boundedReaders) : null;
+    const plan = confirmedPlan ?? await planSavIntake(input, { ...boundedReaders,
+      analyseMessage: async data => accepted("analyseMessage", data), assessIdentity: async data => accepted("assessIdentity", data),
+      assessIssues: async data => data.tickets.length ? accepted("assessIssues", data) : { investigationComplete: true, tickets: [] },
+    }, value.classification === "other" ? { ...config.policy, qualifiedOther: { evidenceSource: "human_override",
+      resource: { resourceId: id, revisionId: "sav-intake-human.v1", sha256: intakeRuntimeHash(value) } } } : config.policy, {}, () => new Date());
+    const result = await db.transaction(async tx => {
+      await admissionLock(tx);
+      const [execution] = await tx.select().from(savIntakeExecutions).where(eq(savIntakeExecutions.messageId, event.messageId)).for("update");
+      const [thread] = await tx.select().from(savThreads).where(eq(savThreads.id, event.threadId)).for("update");
+      const [current] = await tx.select().from(savIntakeRuns).where(eq(savIntakeRuns.id, parent.id)).for("update");
+      const [guard] = await tx.select().from(savIntakeHumanEvents).where(eq(savIntakeHumanEvents.id, id)).for("update");
+      const [latest] = await tx.select().from(savMessages).where(and(eq(savMessages.threadId, event.threadId), eq(savMessages.direction, "inbound")))
+        .orderBy(desc(savMessages.receivedAt), desc(savMessages.createdAt), desc(savMessages.id)).limit(1);
+      if (!guard || guard.leaseToken !== token || !guard.leaseUntil || guard.leaseUntil <= new Date() || !current?.isCurrent || thread?.aiPaused
+        || latest?.id !== event.messageId || (await savIntakeSourceSnapshot(tx, latest, new Date())).sourceHash !== event.sourceHash
+        || !await intakeRunConfigurationBound(current, config, tx, event.id)) return conflict();
+      const [last] = await tx.select({ version: savIntakeRuns.version }).from(savIntakeRuns).where(eq(savIntakeRuns.threadId, event.threadId)).orderBy(desc(savIntakeRuns.version)).limit(1);
+      await tx.update(savIntakeRuns).set({ isCurrent: false, state: "superseded", freshUntil: null, leaseToken: null, leaseUntil: null }).where(eq(savIntakeRuns.id, parent.id));
+      const payload: IntakeRuntimePayload = { ...original, input, plan, reason, traces: [...(original.traces ?? []), { humanEventId: id,
+        semanticReuse: "accepted_results_exact_inputs", modelCalled: false, automaticAttemptsUnchanged: true }] };
+      const [run] = await tx.insert(savIntakeRuns).values({ threadId: event.threadId, messageId: event.messageId, version: last.version + 1,
+        configHash: humanRevisionConfigHash(config.configHash, id), policyHash: config.policyHash, sourceHash: event.sourceHash,
+        state: plan.decision.disposition.kind === "collect_context" ? "waiting" : "observed", payloadCiphertext: encryptSavPayload(payload),
+        humanChoiceCiphertext: encryptSavPayload({ eventId: id }), freshUntil: new Date(Math.min(Date.parse(input.now), ...plan.decision.evidence.map(e => Date.parse(e.observedAt))) + 300000) }).returning();
+      if (execution) await amendExecution(tx, event, run, plan, input);
+      await tx.update(savIntakeHumanEvents).set({ state: "consumed", revisionRunId: run.id, leaseToken: null, leaseUntil: null }).where(eq(savIntakeHumanEvents.id, id));
+      await tx.update(savMessages).set({ analysisStatus: run.state === "observed" ? "intake_observed" : "intake_waiting" }).where(eq(savMessages.id, event.messageId));
+      await tx.insert(savIntakeJournal).values({ runId: run.id, kind: "human_revision", payloadCiphertext: encryptSavPayload({ eventId: id, parentRunId: parent.id,
+        automaticAttemptsUnchanged: true, callsUnchanged: true, reason: reason ?? null }) });
+      return { runId: run.id, state: run.state };
+    });
+    return result;
+  } catch (error) {
+    const reason = error instanceof Error && /^SAV_[A-Z_]+$/.test(error.message) ? error.message : "SAV_INTAKE_HUMAN_REVALIDATION_REQUIRED";
+    await db.update(savIntakeHumanEvents).set({ state: claim.event.readAttempts >= 2 ? "waiting" : "pending", leaseToken: null, leaseUntil: null })
+      .where(and(eq(savIntakeHumanEvents.id, id), eq(savIntakeHumanEvents.leaseToken, token)));
+    await db.insert(savIntakeJournal).values({ runId: claim.parent.id, kind: "human_revalidation_waiting", payloadCiphertext: encryptSavPayload({ eventId: id, reason }) });
+    return { waiting: reason };
+  }
+}
+export async function reconcileIntakeHumanChoices() {
+  const config = savIntakeRuntimeConfig();
+  if (!config || !await intakeConsoleInstalled()) return { skipped: "off" };
+  const expired = await requireDb().select({id:savIntakeHumanEvents.id}).from(savIntakeHumanEvents).where(and(eq(savIntakeHumanEvents.state,"reading"),eq(savIntakeHumanEvents.readAttempts,2),lt(savIntakeHumanEvents.leaseUntil,new Date()))).limit(4);
+  for (const row of expired) await requireDb().update(savIntakeHumanEvents).set({state:"waiting",leaseToken:null,leaseUntil:null}).where(and(eq(savIntakeHumanEvents.id,row.id),lt(savIntakeHumanEvents.leaseUntil,new Date())));
+  const [event] = await requireDb().select().from(savIntakeHumanEvents).where(and(inArray(savIntakeHumanEvents.state, ["pending", "reading"]),
+    lt(savIntakeHumanEvents.readAttempts, 2), or(sql`${savIntakeHumanEvents.leaseUntil} is null`, lt(savIntakeHumanEvents.leaseUntil, new Date()))))
+    .orderBy(savIntakeHumanEvents.createdAt, savIntakeHumanEvents.id).limit(1);
+  return event ? consumeIntakeHumanEvent(event.id, config, createSavIntakeHubspotReaders({ network: async (url, init) => {
+    const current = savIntakeRuntimeConfig();
+    if (!current || current.configHash !== config.configHash) return conflict();
+    return fetch(url, { ...init, redirect: "error", headers: { ...Object.fromEntries(new Headers(init?.headers)), Authorization: `Bearer ${process.env.HUBSPOT_ACCESS_TOKEN}` } });
+  } })) : { skipped: "empty" };
+}

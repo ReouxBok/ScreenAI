@@ -47,7 +47,10 @@ export function savIntakeRuntimeConfig(env: Record<string, string | undefined> =
 export type IntakeRuntimeState = "pending" | "analysing" | "observed" | "waiting" | "uncertain" | "superseded";
 export type IntakeRuntimePayload = {
   revision: typeof SAV_INTAKE_RUNTIME_REVISION;
-  input?: unknown; plan?: IntakePlan; traces?: unknown[]; reason?: string;
+  input?: unknown; plan?: IntakePlan;
+  configuration?: { configHash: string; resourcesHash: string; policyHash: string; codeRevision: string; model: string };
+  semantics?:import("./semantic-records").AcceptedIntakeSemantics;
+  provenance?:unknown; traces?: unknown[]; reason?: string;
   effects: "not_connected";
 };
 export function assertSavIntakeObservation(plan: IntakePlan) {
