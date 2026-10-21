@@ -1,3 +1,4 @@
+vi.mock("@/lib/sav/intake/runtime",()=>({reconcileSavIntakeRuntime:vi.fn(async()=>({skipped:"off"}))}));
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 const d=vi.hoisted(()=>({gmail:vi.fn(),hubspot:vi.fn(),send:vi.fn(),ticket:vi.fn(),pilotActions:vi.fn(),pilot:vi.fn(),messages:vi.fn(),followups:vi.fn(),observations:vi.fn(),retention:vi.fn(),trainings:vi.fn(),evaluations:vi.fn(),openings:vi.fn(),context:vi.fn(),projection:vi.fn(),enabled:vi.fn()}));
 vi.mock("@/lib/sav/gmail",()=>({processPendingGmailReceipts:d.gmail,processPendingGmailSendActions:d.send}));

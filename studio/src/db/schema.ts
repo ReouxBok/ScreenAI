@@ -583,6 +583,31 @@ export const savMessages = sav.table("messages", {
   index("sav_messages_latest_inbound").on(table.threadId, table.receivedAt.desc(), table.createdAt.desc(), table.id.desc()).where(sql`${table.direction} = 'inbound'`),
 ]);
 
+/** Intake observation only; effects and operator corrections require later lots. */
+export const savIntakeRuns = sav.table("intake_runs", {
+  id: uuid("id").defaultRandom().primaryKey(),
+  threadId: uuid("thread_id").notNull().references(() => savThreads.id, { onDelete: "cascade" }),
+  messageId: uuid("message_id").notNull().references(() => savMessages.id, { onDelete: "cascade" }),
+  version: integer("version").notNull(), isCurrent: boolean("is_current").notNull().default(true),
+  state: text("state").notNull().default("pending"), configHash: text("config_hash").notNull(), policyHash: text("policy_hash").notNull(),
+  sourceHash: text("source_hash"), payloadCiphertext: text("payload_ciphertext").notNull(), humanChoiceCiphertext: text("human_choice_ciphertext"),
+  leaseToken: uuid("lease_token"), leaseUntil: timestamp("lease_until", { withTimezone: true }),
+  attempts: integer("attempts").notNull().default(0), freshUntil: timestamp("fresh_until", { withTimezone: true }),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(), updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+}, table => [uniqueIndex("sav_intake_runs_current").on(table.threadId).where(sql`${table.isCurrent}`),
+  uniqueIndex("sav_intake_runs_version").on(table.threadId, table.version), uniqueIndex("sav_intake_runs_message_config").on(table.messageId, table.configHash),
+  index("sav_intake_runs_recovery").on(table.state, table.leaseUntil), check("sav_intake_attempts_bound", sql`${table.attempts} between 0 and 2`)]);
+export const savIntakeJournal = sav.table("intake_journal", {
+  id: uuid("id").defaultRandom().primaryKey(), runId: uuid("run_id").notNull().references(() => savIntakeRuns.id, { onDelete: "cascade" }),
+  kind: text("kind").notNull(), payloadCiphertext: text("payload_ciphertext").notNull(), createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+});
+export const savIntakeModelCalls = sav.table("intake_model_calls", {
+  id: uuid("id").defaultRandom().primaryKey(), runId: uuid("run_id").references(() => savIntakeRuns.id, { onDelete: "set null" }),
+  messageKey: text("message_key").notNull(), requestHash: text("request_hash").notNull(), state: text("state").notNull(),
+  reservedNanoUsd: bigint("reserved_nano_usd", { mode: "number" }).notNull(), chargedNanoUsd: bigint("charged_nano_usd", { mode: "number" }).notNull(),
+  resultCiphertext: text("result_ciphertext"), payloadCiphertext: text("payload_ciphertext").notNull(), createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(), settledAt: timestamp("settled_at", { withTimezone: true }),
+}, table => [uniqueIndex("sav_intake_model_request").on(table.messageKey, table.requestHash)]);
+
 /** Derived read model only. Invalidation functions/triggers live in migration0039. */
 export const savDashboardProjection = sav.table("dashboard_projection", {
   threadId: uuid("thread_id").primaryKey().references(() => savThreads.id, { onDelete: "cascade" }),

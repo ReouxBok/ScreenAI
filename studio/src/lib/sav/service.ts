@@ -1,3 +1,4 @@
+import { enqueueConfiguredSavIntake } from "./intake/runtime";
 import { enqueueSavTranslation } from "./translations";
 import { savResolutionObservations } from "@/db/schema";
 import "server-only";
@@ -327,6 +328,8 @@ export async function ingestInboundMessage(rawInput: unknown) {
 
   if (result.duplicate) return result;
   if (!eligible) return { ...result, excludedFromProposals: true as const, proposalSkipReason: cutover ? "before_cutover" : "cutover_not_active" };
+  const intake = await enqueueConfiguredSavIntake(result.message.id).catch(() => ({ deferred: true as const }));
+  if (("runId" in intake && intake.runId) || "deferred" in intake) return { ...result, queuedForIntake: true as const };
   await enqueueSavTranslation(result.message.id).catch(()=>undefined);
   if (isSavPilotMode()) return { ...result, queuedForPilot: true as const };
   const decision = await processStoredSavMessage(result.message.id);
@@ -339,6 +342,8 @@ export function analyzeStoredSavMessage(input: Parameters<typeof analyzeSavMessa
 }
 
 export async function processStoredSavMessage(messageId: string) {
+  const intake = await enqueueConfiguredSavIntake(messageId);
+  if ("runId" in intake && intake.runId) return null;
   if (isSavPilotMode()) return null;
   const db = requireDb();
   const staleBefore = new Date(Date.now() - 10 * 60 * 1_000);
