@@ -65,7 +65,9 @@ export async function assertNoLegacyConflict(tx: ExecutionTx, keys: string[]) {
 async function handoffObsoleteExecutions(tx: ExecutionTx, threadId: string, messageId: string) {
     const old = await tx.select().from(savIntakeExecutions).where(eq(savIntakeExecutions.threadId, threadId)).for("update");
     for (const execution of old) {
-        if (execution.messageId === messageId)
+        // A new message cannot rewrite the historical outcome of a terminal
+        // execution. Its receipts remain available for review and lot3.
+        if (execution.state === "confirmed" || execution.state === "refused" || execution.messageId === messageId)
             continue;
         const effects = await tx.select().from(savIntakeEffects).where(eq(savIntakeEffects.executionId, execution.id));
         if (effects.some(e => !["planned", "confirmed"].includes(e.state)))

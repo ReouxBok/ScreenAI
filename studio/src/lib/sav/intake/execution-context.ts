@@ -115,13 +115,16 @@ export function assertExecutionCrmUnchanged(baseline: CrmSnapshot, current: CrmS
         }
         if (effect.kind === "stage_new" && i.ticketId) {
             const old = Object.values(baseline.tickets).flat().find(t => t.id === i.ticketId);
-            if (old)
-                for (const rows of Object.values(clean.tickets)) {
-                    const t = rows.find(t => t.id === i.ticketId);
-                    if (!t || t.stage !== "new")
-                        return fault();
-                    t.stage = old.stage;
-                }
+            const present = Object.values(clean.tickets).flat().filter(t => t.id === i.ticketId);
+            if (!old || !present.length)
+                return fault();
+            // A target may belong only to a directly linked contact. Empty
+            // lists on other contacts stay intact for the final full comparison.
+            for (const ticket of present) {
+                if (ticket.stage !== "new")
+                    return fault();
+                ticket.stage = old.stage;
+            }
         }
     }
     for (const effect of effects.filter(e => e.state === "confirmed" && e.kind === "ticket_create")) {

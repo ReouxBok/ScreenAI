@@ -763,9 +763,12 @@ it("human confirmed registration identity occupies its actual contact and ticket
 it("RO confirmed late ACK releases a paused partial scope without linking or another POST", async () => {
     const row = await admission();
     expect(await executeIntakePass(row.id, options, {
-        afterAck: async () => { await f.db.update(savThreads).set({
-            aiPaused: true
-        }).where(eq(savThreads.id, threadId)); throw Error("CRASH_AFTER_ACK"); }
+        afterAck: async () => {
+            await f.db.update(savThreads).set({
+                aiPaused: true
+            }).where(eq(savThreads.id, threadId));
+            throw Error("CRASH_AFTER_ACK");
+        }
     })).toMatchObject({
         state: "uncertain"
     });
@@ -777,4 +780,86 @@ it("RO confirmed late ACK releases a paused partial scope without linking or ano
     expect(await f.db.select().from(savIntakeOccupations)).toHaveLength(0);
     expect((await f.db.select().from(savThreads).where(eq(savThreads.id, threadId)))[0].hubspotTicketId).toBeNull();
     expect(p.calls.filter(c => c.method === "POST" && c.path.endsWith("/tickets"))).toHaveLength(1);
+});
+// Review735: a directly linked contact can own the only matching ticket. The
+// primary contact's empty ticket list is valid and must remain independently read.
+function linkedContactTicket(stage: "open" | "closed", ownerId: string | null = null) {
+    p.setContacts([{
+            id: "101", emails: ["customer@example.invalid"]
+        }, {
+            id: "102", emails: ["linked@example.invalid"]
+        }]);
+    p.links.set("contacts:101:contacts", ["102"]);
+    p.seedTicket({
+        id: "201", contactIds: ["102"], stage, ownerId, closedAt: stage === "closed" ? new Date(Date.now() - 1000).toISOString() : undefined
+    });
+}
+it.each([
+    ["open", null], ["closed", null], ["open", "777"], ["closed", "777"]
+] as const)("review735 linked-contact-only %s ticket owner %s confirms with primary ticket list empty", async (stage, ownerId) => {
+    linkedContactTicket(stage, ownerId);
+    const row = await admission();
+    expect(await executeIntakePass(row.id, options)).toMatchObject({
+        state: "confirmed"
+    });
+    expect(p.links.get("contacts:101:tickets") ?? []).toEqual([]);
+    expect(p.links.get("contacts:102:tickets")).toEqual(["201"]);
+    expect(p.objects.tickets["201"].properties.hubspot_owner_id).toBe(ownerId);
+    expect(await executeIntakePass(row.id, options)).toEqual({
+        skipped: "occupied"
+    });
+    expect(p.calls.filter(c => c.method === "POST" && c.path.endsWith("/notes"))).toHaveLength(1);
+    expect(p.calls.filter(c => c.method === "POST" && c.path.endsWith("/emails"))).toHaveLength(1);
+    const effects = await getExecutionEffects(row.id);
+    expect(effects.every(e => e.state === "confirmed")).toBe(true);
+    expect(p.calls.filter(c => c.method === "PATCH")).toHaveLength(1);
+    expect(p.calls.filter(c => c.method === "POST" && c.path.endsWith("/tickets"))).toHaveLength(0);
+});
+it.each(["disappeared", "human_closed"] as const)("review735 linked ticket %s after PATCH still invalidates", async (change) => {
+    linkedContactTicket("open");
+    const row = await admission(), verify = options.adapters.verify;
+    options.adapters.verify = async (...args) => {
+        const proof = await verify(...args);
+        if (args[0].kind === "stage_new") {
+            if (change === "disappeared")
+                p.links.set("contacts:102:tickets", []);
+            else
+                p.objects.tickets["201"].properties.hs_pipeline_stage = "4";
+        }
+        return proof;
+    };
+    expect(await executeIntakePass(row.id, options)).toMatchObject({
+        state: "waiting", reason: "SAV_INTAKE_EXECUTION_CRM_CHANGED"
+    });
+    expect((await getExecutionEffects(row.id)).find(e => e.kind === "stage_new")?.state).toBe("confirmed");
+    expect((await f.db.select().from(savThreads).where(eq(savThreads.id, threadId)))[0].hubspotTicketId).toBeNull();
+});
+it("review735 confirmed history stays confirmed when a new entrant is admitted", async () => {
+    const first = await admission();
+    expect(await executeIntakePass(first.id, options)).toMatchObject({
+        state: "confirmed"
+    });
+    const before = await readIntakeExecutionProgress(messageId), receipts = await getExecutionEffects(first.id);
+    const newer = await storedMessage();
+    p.setGmail(newer.gmailMessageId!, "gmail-thread");
+    const nextRun = await observed(newer.id);
+    expect(await admitIntakeExecution(nextRun, options)).toBeTruthy();
+    expect(await readIntakeExecutionProgress(messageId)).toEqual(before);
+    expect(await getExecutionEffects(first.id)).toEqual(receipts);
+    expect(p.calls.filter(c => c.method === "POST" && c.path.endsWith("/tickets"))).toHaveLength(1);
+});
+it("review735 confirmed template history stays confirmed when the next identification message is admitted", async () => {
+    p.setContacts([]);
+    const first = await admission();
+    expect(await executeIntakePass(first.id, options)).toMatchObject({
+        state: "confirmed"
+    });
+    const before = await readIntakeExecutionProgress(messageId), receipts = await getExecutionEffects(first.id);
+    const newer = await storedMessage();
+    p.setGmail(newer.gmailMessageId!, "gmail-thread");
+    const nextRun = await observed(newer.id);
+    expect(await admitIntakeExecution(nextRun, options)).toBeTruthy();
+    expect(await readIntakeExecutionProgress(messageId)).toEqual(before);
+    expect(await getExecutionEffects(first.id)).toEqual(receipts);
+    expect(p.calls.filter(c => c.path === "gmail/messages/send")).toHaveLength(1);
 });
