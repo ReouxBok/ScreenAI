@@ -37,7 +37,13 @@ test("knowledge, enrichment and learning remain separate from the master prompt"
   await page.getByRole("link", { name: "Enrichir les fiches actives", exact: true }).click();
   await page.waitForURL(url => url.pathname === "/studio/sav/connaissances/diagnostic", { timeout: 30_000 });
   await expect(page.getByRole("heading", { name: "Enrichir toutes les fiches actives", exact: true })).toBeVisible();
-  await page.getByRole("button", { name: "Préparer toutes les fiches actives", exact: true }).click();
+  const [preparation] = await Promise.all([
+    page.waitForResponse(response => response.request().method() === "POST"
+      && new URL(response.url()).pathname === "/studio/sav/connaissances/diagnostic", { timeout: 30_000 }),
+    page.getByRole("button", { name: "Préparer toutes les fiches actives", exact: true }).click(),
+  ]);
+  await preparation.finished();
+  expect(preparation.status()).toBe(200);
   await expect(page.getByRole("status")).toContainText("Préparation terminée");
   await page.goto("/studio/sav/connaissances/apprentissage");
   await expect(page.getByRole("heading", { name: "Apprentissage : signaux à trier", exact: true })).toBeVisible();

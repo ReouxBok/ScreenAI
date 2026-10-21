@@ -83,6 +83,8 @@ test("une base publiée vide retourne immédiatement kb_empty", async ({ request
 });
 
 test("workflow complet, recherche Charly, rollback et archivage",async({page,request})=>{
+  // A fresh process compiles each page before this full publication/rollback journey.
+  test.setTimeout(60_000);
   await login(page);
   await createArticle(page);
   await expect(page.getByText("Brouillon",{exact:true}).first()).toBeVisible();
