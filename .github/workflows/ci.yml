@@ -39,7 +39,10 @@ jobs:
       - run: npm test --prefix proxy
       - run: npm run build --prefix studio
       - run: npx playwright install --with-deps chromium
-      - run: npm run test:e2e --prefix studio
+      - name: Studio browser tests in isolated processes
+        run: |
+          node --test studio/scripts/run-e2e-ci.node-test.mjs
+          node studio/scripts/run-e2e-ci.mjs
       - name: Preserve Studio browser diagnostics
         if: always()
         uses: actions/upload-artifact@v4
