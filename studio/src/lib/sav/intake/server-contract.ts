@@ -32,7 +32,8 @@ export const evaluationCaseSchema = z.object({
 export const evaluationBatchSchema = z.object({ version: z.literal(1), campaignId: z.string().regex(/^[a-z0-9-]{1,100}$/), cases: z.array(evaluationCaseSchema).length(3) }).strict()
   .refine(batch => new Set(batch.cases.map(c => c.caseId)).size === 3 && new Set(batch.cases.map(c => c.input.message.id)).size === 3, "Three distinct cases required");
 export type EvaluationBatch = z.infer<typeof evaluationBatchSchema>;
-export type ServerEvaluationConfig = { campaignId: string; manifestHash: string; codeRevision: string; origin: string; expiresAt: string; model: "gemini-3.6-flash" };
+const continuationSchema = z.object({ runId: z.uuid(), campaignId: z.string().regex(/^[a-z0-9-]{1,100}$/), manifestHash: digest, codeRevision: z.string().regex(/^[a-f0-9]{40}$/) }).strict();
+export type ServerEvaluationConfig = { campaignId: string; manifestHash: string; codeRevision: string; origin: string; expiresAt: string; model: "gemini-3.6-flash"; continuation?: z.infer<typeof continuationSchema> };
 export function evaluationHash(value: string) { return createHash("sha256").update(value, "utf8").digest("hex"); }
 export function evaluationConfig(env: Record<string, string | undefined>, now = new Date()): ServerEvaluationConfig {
   if (env.SAV_INTAKE_EVAL_ENABLED !== "1" || env.VERCEL_ENV !== "production") throw Error("SAV_EVAL_DISABLED");
@@ -43,7 +44,19 @@ export function evaluationConfig(env: Record<string, string | undefined>, now = 
   const url = new URL(parsed.origin), expires = Date.parse(parsed.expiresAt);
   if (url.protocol !== "https:" || url.origin !== parsed.origin || env.VERCEL_GIT_COMMIT_SHA !== parsed.codeRevision
     || !Number.isFinite(now.getTime()) || expires <= now.getTime() || expires - now.getTime() > 86_400_000) throw Error("SAV_EVAL_CONFIG_REJECTED");
-  return parsed;
+  const pins = [env.SAV_INTAKE_EVAL_PREVIOUS_RUN_ID, env.SAV_INTAKE_EVAL_PREVIOUS_CAMPAIGN_ID, env.SAV_INTAKE_EVAL_PREVIOUS_MANIFEST_SHA256, env.SAV_INTAKE_EVAL_PREVIOUS_CODE_SHA];
+  if (!pins.some(value => value !== undefined)) return parsed;
+  const continuation = continuationSchema.parse({ runId: pins[0], campaignId: pins[1], manifestHash: pins[2], codeRevision: pins[3] });
+  if (continuation.campaignId === parsed.campaignId || continuation.manifestHash === parsed.manifestHash || continuation.codeRevision === parsed.codeRevision) throw Error("SAV_EVAL_CONTINUATION_REJECTED");
+  return { ...parsed, continuation };
+}
+/** Reconstruct the exact first batch by changing ONLY the campaign name. A
+ * continuation cannot silently replace sources, policy, ordering or dates. */
+export function evaluationContinuationProof(batch: EvaluationBatch, config: ServerEvaluationConfig) {
+  if (!config.continuation) return undefined;
+  const reconstructed = evaluationHash(JSON.stringify({ ...batch, campaignId: config.continuation.campaignId }));
+  if (reconstructed !== config.continuation.manifestHash) throw Error("SAV_EVAL_CONTINUATION_REJECTED");
+  return reconstructed;
 }
 export function assertEvaluationOrigin(request: Request, config: ServerEvaluationConfig) {
   const origin = request.headers.get("origin");
