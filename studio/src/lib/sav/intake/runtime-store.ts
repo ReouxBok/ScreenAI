@@ -31,7 +31,7 @@ const latest = async (tx: Tx, threadId: string) => (await tx.select().from(savMe
 const journal = async (tx: Tx, runId: string, kind: string, value: unknown) => {
   await tx.insert(savIntakeJournal).values({ runId, kind, payloadCiphertext: encryptSavPayload(value) });
 };
-async function snapshot(tx: Tx, message: typeof savMessages.$inferSelect, now: Date) {
+export async function savIntakeSourceSnapshot(tx: Tx, message: typeof savMessages.$inferSelect, now: Date) {
   const rows = await tx.select().from(savMessages).where(and(eq(savMessages.threadId, message.threadId), lte(savMessages.receivedAt, message.receivedAt)))
     .orderBy(desc(savMessages.receivedAt), desc(savMessages.createdAt), desc(savMessages.id)).limit(51);
   const prepared = rows.slice(0, 50).map(row => {
@@ -110,7 +110,7 @@ export async function claimSavIntakeRun(id: string, config: IntakeRuntimeConfig,
       await tx.update(savMessages).set({ analysisStatus: pending.length ? "intake_uncertain" : "intake_waiting" }).where(eq(savMessages.id, run.messageId));
       await journal(tx, id, "waiting", { reason }); return null;
     }
-    const data = await snapshot(tx, message, now), token = randomUUID();
+    const data = await savIntakeSourceSnapshot(tx, message, now), token = randomUUID();
     const [claimed] = await tx.update(savIntakeRuns).set({ state: "analysing", leaseToken: token, leaseUntil: new Date(now.getTime() + 90_000),
       attempts: run.attempts + 1, sourceHash: data.sourceHash, updatedAt: now }).where(eq(savIntakeRuns.id, id)).returning();
     await tx.update(savMessages).set({ analysisStatus: "intake_analysing" }).where(eq(savMessages.id, run.messageId));
@@ -124,7 +124,7 @@ async function assertLease(tx: Tx, lease: IntakeLease, config: IntakeRuntimeConf
   const message = await latest(tx, lease.run.threadId);
   if (!thread || thread.aiPaused || !run?.isCurrent || run.state !== "analysing" || run.leaseToken !== lease.token || !run.leaseUntil || run.leaseUntil <= now
     || run.humanChoiceCiphertext !== lease.run.humanChoiceCiphertext || run.configHash !== config.configHash || Date.parse(config.expiresAt) <= now.getTime() || message?.id !== run.messageId) return fail();
-  if ((await snapshot(tx, message, now)).sourceHash !== lease.sourceHash) return fail();
+  if ((await savIntakeSourceSnapshot(tx, message, now)).sourceHash !== lease.sourceHash) return fail();
   return run;
 }
 export async function assertSavIntakeLease(lease: IntakeLease, config: IntakeRuntimeConfig, now = new Date()) {
@@ -208,9 +208,9 @@ export async function readSavIntakeCurrent(threadId: string, config?: IntakeRunt
   const [thread] = await db.select().from(savThreads).where(eq(savThreads.id, threadId));
   const [message] = await db.select().from(savMessages).where(and(eq(savMessages.threadId, threadId), eq(savMessages.direction, "inbound")))
     .orderBy(desc(savMessages.receivedAt), desc(savMessages.createdAt), desc(savMessages.id)).limit(1);
-  const sourceMatches = message?.id === run.messageId && await db.transaction(async tx => (await snapshot(tx, message, now)).sourceHash === run.sourceHash);
+  const sourceMatches = message?.id === run.messageId && await db.transaction(async tx => (await savIntakeSourceSnapshot(tx, message, now)).sourceHash === run.sourceHash);
   const events = await db.select().from(savIntakeJournal).where(eq(savIntakeJournal.runId, run.id)).orderBy(savIntakeJournal.createdAt, savIntakeJournal.id);
-  return { ...run, fresh: Boolean(config && Date.parse(config.expiresAt) > now.getTime() && config.configHash === run.configHash && run.state === "observed" && run.freshUntil && run.freshUntil > now && !thread?.aiPaused && sourceMatches),
+  return { ...run, sourceMatches, fresh: Boolean(config && Date.parse(config.expiresAt) > now.getTime() && config.configHash === run.configHash && run.state === "observed" && run.freshUntil && run.freshUntil > now && !thread?.aiPaused && sourceMatches),
     payload: decryptSavPayload<IntakeRuntimePayload>(run.payloadCiphertext),
     humanChoice: run.humanChoiceCiphertext ? decryptSavPayload<unknown>(run.humanChoiceCiphertext) : null,
     journal: events.map(event => ({ id: event.id, kind: event.kind, createdAt: event.createdAt, payload: decryptSavPayload<unknown>(event.payloadCiphertext) })) };

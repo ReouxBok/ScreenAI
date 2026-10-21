@@ -91,6 +91,8 @@ jobs:
         working-directory: studio
         run: >-
           node node_modules/vitest/vitest.mjs run --maxWorkers=1 --no-file-parallelism
+          src/lib/sav/intake/runtime.test.ts
+          src/lib/sav/intake/execution.test.ts
           src/lib/sav/dashboard.test.ts
           src/lib/sav/dashboard-projection.test.ts
           src/lib/sav/dashboard-sql-reference.test.ts

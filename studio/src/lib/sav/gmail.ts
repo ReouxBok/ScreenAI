@@ -1,5 +1,6 @@
 import { buildSavInboundContext } from "./message-context";
 import "server-only";
+import { withLegacyOccupationAction, markLegacyIntakeDispatch, releaseLegacyIntakeIfConfirmed } from "./intake/legacy-occupation";
 
 import { timingSafeEqual } from "node:crypto";
 import { and, asc, desc, eq, inArray, isNull, lt, lte, or, sql } from "drizzle-orm";
@@ -184,6 +185,9 @@ async function gmailFetch<T>(mailboxEmail: string, path: string, init?: RequestI
   }
   return response.json() as Promise<T>;
 }
+
+/** Internal transport only; intake supplies its own capability and durable effect guard. */
+export const requestSavGmail = gmailFetch;
 
 export const SAV_STUDIO_GMAIL_LABEL_NAME = "MAIL STUDIO SAV";
 
@@ -638,6 +642,7 @@ async function sendReplyAction(action: typeof savActions.$inferSelect, text: str
     if (!dispatched) throw new Error("SAV_REPLY_MANUAL_RECONCILIATION_REQUIRED");
     await assertSavWriteAllowed(action.id);
   }
+  if (!existing) await markLegacyIntakeDispatch(action.id);
   const sent = existing ?? await gmailFetch<{ id: string; threadId: string }>(mailbox.email, "messages/send", {
     method: "POST",
     body: JSON.stringify({ raw: Buffer.from(raw, "utf8").toString("base64url"), threadId: thread.gmailThreadId }),
@@ -737,6 +742,7 @@ async function sendPartnershipForwardAction(action: typeof savActions.$inferSele
   }
   // Token acquisition and all awaited preflights precede the last authorization.
   // No Gmail threadId, Reply-To, In-Reply-To, References, Cc or Bcc are transmitted.
+  await markLegacyIntakeDispatch(action.id);
   const response = await fetch(`https://gmail.googleapis.com/gmail/v1/users/${encodeURIComponent(c.mailbox.email)}/messages/send`, {
     method: "POST", headers: { Authorization: `Bearer ${accessToken}`, "Content-Type": "application/json" },
     body: JSON.stringify({ raw: Buffer.from(raw, "utf8").toString("base64url") }), signal: AbortSignal.timeout(20000),
@@ -779,16 +785,18 @@ export async function processPendingGmailSendActions(limit = 20, onlyActionId?: 
     )).returning();
     if (!claimed) continue;
     try {
-      if (isSavPartnershipForward(claimed)) {
-        const sent = await sendPartnershipForwardAction(claimed);
+      await withLegacyOccupationAction(claimed, async () => {
+        if (isSavPartnershipForward(claimed)) {
+          const sent = await sendPartnershipForwardAction(claimed);
+          processed.push({ actionId: claimed.id, status: "succeeded", gmailMessageId: sent.id });
+          return;
+        }
+        const text = claimed.kind === "request_human"
+          ? "Votre demande a bien été transmise à notre équipe. Un membre de l’équipe Limova vous répondra sous trois jours. Je reste disponible immédiatement si vous souhaitez poursuivre avec l’assistant IA en attendant."
+          : decryptSavPayload<{ text: string }>(String(claimed.payload.bodyCiphertext || "")).text;
+        const sent = await sendReplyAction(claimed, text);
         processed.push({ actionId: claimed.id, status: "succeeded", gmailMessageId: sent.id });
-        continue;
-      }
-      const text = claimed.kind === "request_human"
-        ? "Votre demande a bien été transmise à notre équipe. Un membre de l’équipe Limova vous répondra sous trois jours. Je reste disponible immédiatement si vous souhaitez poursuivre avec l’assistant IA en attendant."
-        : decryptSavPayload<{ text: string }>(String(claimed.payload.bodyCiphertext || "")).text;
-      const sent = await sendReplyAction(claimed, text);
-      processed.push({ actionId: claimed.id, status: "succeeded", gmailMessageId: sent.id });
+      });
     } catch (error) {
       let errorCode = (error instanceof Error ? error.message : "UNKNOWN_ERROR").slice(0, 160);
       if (savReleaseStage() === "v0" || isSavPartnershipForward(claimed)) {
@@ -801,6 +809,7 @@ export async function processPendingGmailSendActions(limit = 20, onlyActionId?: 
       await db.update(savActions).set({ status: failure.status, scheduledAt: failure.scheduledAt, errorCode, updatedAt: new Date() }).where(eq(savActions.id, claimed.id));
       processed.push({ actionId: claimed.id, status: failure.status, retryScheduledAt: failure.scheduledAt, errorCode });
     }
+    await releaseLegacyIntakeIfConfirmed(claimed.id);
   }
   return { processed };
 }

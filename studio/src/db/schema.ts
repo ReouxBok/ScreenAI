@@ -608,6 +608,63 @@ export const savIntakeModelCalls = sav.table("intake_model_calls", {
   resultCiphertext: text("result_ciphertext"), payloadCiphertext: text("payload_ciphertext").notNull(), createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(), settledAt: timestamp("settled_at", { withTimezone: true }),
 }, table => [uniqueIndex("sav_intake_model_request").on(table.messageKey, table.requestHash)]);
 
+/** Durable effect ledger: receipt lifetime is independent of message retention. */
+export const savIntakeExecutionPolicies = sav.table("intake_execution_policies", {
+    id: uuid("id").defaultRandom().primaryKey(), revision: text("revision").notNull(), state: text("state").notNull(),
+    administratorId: uuid("administrator_id").notNull().references(() => staffUsers.id), policyHash: text("policy_hash").notNull(), payloadCiphertext: text("payload_ciphertext").notNull(),
+    createdAt: timestamp("created_at", {
+        withTimezone: true
+    }).defaultNow().notNull(), updatedAt: timestamp("updated_at", {
+        withTimezone: true
+    }).defaultNow().notNull(),
+});
+export const savIntakeExecutionBudget = sav.table("intake_execution_budget", {
+    id: text("id").primaryKey(), admitted: integer("admitted").notNull().default(0)
+});
+export const savIntakeExecutions = sav.table("intake_executions", {
+    id: uuid("id").defaultRandom().primaryKey(), messageId: uuid("message_id").notNull().unique(), threadId: uuid("thread_id").notNull(), runId: uuid("run_id"), runVersion: integer("run_version").notNull(),
+    policyId: uuid("policy_id").notNull().references(() => savIntakeExecutionPolicies.id), policyHash: text("policy_hash").notNull(), actorType: text("actor_type").notNull().default("ai"),
+    state: text("state").notNull().default("pending"), ticketId: text("ticket_id"), leaseToken: uuid("lease_token"), leaseUntil: timestamp("lease_until", {
+        withTimezone: true
+    }), payloadCiphertext: text("payload_ciphertext").notNull(),
+    createdAt: timestamp("created_at", {
+        withTimezone: true
+    }).defaultNow().notNull(), updatedAt: timestamp("updated_at", {
+        withTimezone: true
+    }).defaultNow().notNull(),
+});
+export const savIntakeEffects = sav.table("intake_effects", {
+    id: uuid("id").defaultRandom().primaryKey(), businessKey: text("business_key").notNull().unique(), executionId: uuid("execution_id").notNull().references(() => savIntakeExecutions.id),
+    kind: text("kind").notNull(), permission: text("permission").notNull(), state: text("state").notNull().default("planned"), intentHash: text("intent_hash").notNull(), intentCiphertext: text("intent_ciphertext").notNull(),
+    attemptId: uuid("attempt_id").defaultRandom().notNull(), ackCiphertext: text("ack_ciphertext"), verificationCiphertext: text("verification_ciphertext"), dispatchToken: uuid("dispatch_token"),
+    dispatchedAt: timestamp("dispatched_at", {
+        withTimezone: true
+    }), confirmedAt: timestamp("confirmed_at", {
+        withTimezone: true
+    }), reconcileAttempts: integer("reconcile_attempts").notNull().default(0), nextReconcileAt: timestamp("next_reconcile_at", {
+        withTimezone: true
+    }), createdAt: timestamp("created_at", {
+        withTimezone: true
+    }).defaultNow().notNull(),
+});
+export const savIntakeEffectJournal = sav.table("intake_effect_journal", {
+    id: uuid("id").defaultRandom().primaryKey(), executionId: uuid("execution_id").notNull().references(() => savIntakeExecutions.id), effectId: uuid("effect_id").references(() => savIntakeEffects.id),
+    kind: text("kind").notNull(), payloadCiphertext: text("payload_ciphertext").notNull(), createdAt: timestamp("created_at", {
+        withTimezone: true
+    }).defaultNow().notNull(),
+});
+export const savIntakeOccupations = sav.table("intake_occupations", {
+    key: text("key").primaryKey(), ownerId: uuid("owner_id").notNull(), ownerKind: text("owner_kind").notNull(), acquiredAt: timestamp("acquired_at", {
+        withTimezone: true
+    }).defaultNow().notNull(),
+});
+export const savIntakeIdentityEpisodes = sav.table("intake_identity_episodes", {
+    id: uuid("id").defaultRandom().primaryKey(), threadId: uuid("thread_id").notNull().unique(), initialMessageId: uuid("initial_message_id").notNull(), recipientCiphertext: text("recipient_ciphertext").notNull(),
+    initialEffectId: uuid("initial_effect_id").unique().references(() => savIntakeEffects.id), retryEffectId: uuid("retry_effect_id").unique().references(() => savIntakeEffects.id), createdAt: timestamp("created_at", {
+        withTimezone: true
+    }).defaultNow().notNull(),
+});
+
 /** Derived read model only. Invalidation functions/triggers live in migration0039. */
 export const savDashboardProjection = sav.table("dashboard_projection", {
   threadId: uuid("thread_id").primaryKey().references(() => savThreads.id, { onDelete: "cascade" }),

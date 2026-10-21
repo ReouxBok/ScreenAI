@@ -1,5 +1,6 @@
 import { ensureSavCaseObservationTx } from "./case-learning";
 import "server-only";
+import { withLegacyOccupationAction, markLegacyIntakeDispatch, releaseLegacyIntakeIfConfirmed } from "./intake/legacy-occupation";
 import { assertSavTicketMatchesDispatch } from "./ticket-confirmation";
 import { readSavTicketHistory, type SavTicketHistory } from "./ticket-history";
 import { getSavLearningCutover, recordSavLearningSignal } from "./learning-admission";
@@ -291,6 +292,7 @@ async function findContactByEmail(email: string) {
 
 async function guardedHubspotWrite<T>(actionId: string, path: string, init: RequestInit): Promise<T> {
   await assertSavWriteAllowed(actionId);
+  await markLegacyIntakeDispatch(actionId);
   return hubspotFetch<T>(path, init);
 }
 
@@ -1066,21 +1068,24 @@ export async function processPendingHubspotActions(limit = 20, actionId?: string
     )).returning();
     if (!claimed) continue;
     try {
-      if (claimed.kind === "log_email") {
-        const result = await logHubspotEmail(claimed);
-        processed.push({ actionId: claimed.id, status: "succeeded", hubspotEmailId: result.emailId });
-      } else {
-        const result = claimed.kind === "update_ticket_status"
-          ? await updateHubspotTicketStatus(claimed)
-          : await finalizeTicketAction(claimed);
-        processed.push({ actionId: claimed.id, status: "succeeded", ticketId: "id" in result ? result.id : result.ticketId });
-      }
+      await withLegacyOccupationAction(claimed, async () => {
+        if (claimed.kind === "log_email") {
+          const result = await logHubspotEmail(claimed);
+          processed.push({ actionId: claimed.id, status: "succeeded", hubspotEmailId: result.emailId });
+        } else {
+          const result = claimed.kind === "update_ticket_status"
+            ? await updateHubspotTicketStatus(claimed)
+            : await finalizeTicketAction(claimed);
+          processed.push({ actionId: claimed.id, status: "succeeded", ticketId: "id" in result ? result.id : result.ticketId });
+        }
+      });
     } catch (error) {
       const errorCode = (error instanceof Error ? error.message : "UNKNOWN_ERROR").slice(0, 160);
       const failure = savActionFailurePlan(errorCode, claimed.attemptCount);
       await db.update(savActions).set({ status: failure.status, scheduledAt: failure.scheduledAt, errorCode, updatedAt: new Date() }).where(eq(savActions.id, claimed.id));
       processed.push({ actionId: claimed.id, status: failure.status, retryScheduledAt: failure.scheduledAt, errorCode });
     }
+    await releaseLegacyIntakeIfConfirmed(claimed.id);
     const result = processed.at(-1)!;
     console.info("sav_hubspot_action_result", {
       actionId: claimed.id, threadId: claimed.threadId, messageId: claimed.messageId,
