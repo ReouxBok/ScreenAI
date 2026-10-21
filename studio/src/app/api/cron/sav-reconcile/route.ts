@@ -54,6 +54,11 @@ export async function GET(request: Request) {
   // Ticket creation must precede reply sending, and status updates follow the
   // Gmail action. Keeping these steps ordered prevents orphaned conversations.
   const ticketActions = await runStep("hubspot_ticket_actions", () => processPendingHubspotActions(50));
+  const intakeObservation = await runStep("intake_observation", () => reconcileSavIntakeRuntime({ deadlineMs: derivedDeadline }));
+  const intakeChoices = await runStep("intake_choices", () => Date.now()+45_000>derivedDeadline?Promise.resolve({skipped:"deadline"}):reconcileIntakeHumanChoices());
+  const intakeExecution = await runStep("intake_execution",()=>Date.now()+60_000>derivedDeadline?Promise.resolve({skipped:"deadline"}):reconcileIntakeExecutor({deadlineMs:derivedDeadline}));
+  const intakeTracking = await runStep("intake_tracking", () => ensureIntakeObservations(4));
+  const intakeConsole = await runStep("intake_console", () => refreshIntakeConsole(20));
   // Four model runs leave enough headroom for the 45 s grounded-agent budget,
   // a guarded legacy fallback and the remaining integrations inside the 300 s
   // function deadline. A 10-mail batch advances over at most three passages.
@@ -69,13 +74,8 @@ export async function GET(request: Request) {
     : !shouldAttemptHubspotBackfill(backfillState)
       ? { status: "skipped" as const, durationMs: 0, data: { reason: "configuration_required", retry: "automatic_within_30_minutes_or_manual" } }
       : await runStep("hubspot_learning_backfill", () => continueHubspotBackfill(1, 10));
-  const intakeTracking = await runStep("intake_tracking", () => ensureIntakeObservations(4));
   const observations = await runStep("resolution_observations", () => reconcileSavObservations(5,new Date(),{deadlineMs:Math.min(derivedDeadline,Date.now()+40000),maxComparisons:1}));
   const translations=await runStep("message_translations",()=>reconcileSavTranslations(2,{deadlineMs:derivedDeadline}));
-  const intakeObservation = await runStep("intake_observation", () => reconcileSavIntakeRuntime({ deadlineMs: derivedDeadline }));
-  const intakeChoices = await runStep("intake_choices", () => Date.now()+45_000>derivedDeadline?Promise.resolve({skipped:"deadline"}):reconcileIntakeHumanChoices());
-  const intakeExecution = await runStep("intake_execution",()=>Date.now()+60_000>derivedDeadline?Promise.resolve({skipped:"deadline"}):reconcileIntakeExecutor({deadlineMs:derivedDeadline}));
-  const intakeConsole = await runStep("intake_console", () => refreshIntakeConsole(20));
   const retention = await runStep("retention", () => enforceSavRetention());
   const dashboardProjection = savSqlDashboardEnabled()
     ? await runStep("dashboard_projection", () => refreshSavDashboardProjection(25, undefined, { deadlineMs: derivedDeadline }))

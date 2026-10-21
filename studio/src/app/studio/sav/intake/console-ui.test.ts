@@ -57,3 +57,12 @@ it("exports the actual rendered synthetic pages only when the private qualificat
   const shell=(content:string)=>`<!doctype html><html lang="fr"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Qualification synthétique SAV</title><style>${globalCss}\n${css}\n:root{--font-body:Arial;--font-mono:monospace}body{font-family:Arial,sans-serif;padding:24px;max-width:1360px;margin:auto}button,a,input,textarea,select{font-family:Arial,sans-serif}</style><body>${content}</body></html>`;
   await writeFile(`${directory}/console-synthetic.html`,shell(await renderList()));await writeFile(`${directory}/detail-synthetic.html`,shell(await renderDetail()));
 });
+it("a new inbound or edited source cannot present the former plan as the current decision",async()=>{
+  for(const changed of [{...detail,latestMessageId:"10000000-0000-4000-8000-000000000099"},{...detail,current:{...detail.current,sourceMatches:false}}]) {
+    mocks.detail.mockResolvedValue(changed);const html=await renderDetail();
+    expect(html).toContain("Dernière analyse historique — non applicable");
+    const currentPanel=html.split("Décision actuelle</h2>")[1].split("</section>")[0];
+    expect(currentPanel).toContain("Analyse en cours ou attente technique");expect(currentPanel).not.toContain("Classification");expect(currentPanel).not.toContain("Fiche proposée");
+    expect(html).not.toContain('name="sourceHash"');expect(mocks.action).not.toHaveBeenCalled();
+  }
+});

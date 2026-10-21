@@ -88,6 +88,7 @@ export type EngineInput = {
   now: string; mode: "at_receipt" | "current"; identificationAttemptId: string;
   humanResolution?: {
     choiceId: string; at: string; contactId?: string; equivalentContactIds?: string[];
+    inheritedChoiceIds?:string[]; fieldSources?:Partial<Record<"contactId"|"ticketId"|"classification",string>>;
     ticketId?: string; classification?: MessageAnalysis["requests"][number]["kind"];
   };
   previousIdentification?: { messageId: string; address: string; state: "dispatched" | "uncertain" | "confirmed" };

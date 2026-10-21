@@ -1,5 +1,5 @@
 import "server-only";
-import { intakeMessageHistorical, intakeLaunchMatches } from "./launch-boundary";
+import { intakeMessageHistorical, intakeLaunchMatches, parkLaunchedIntakeMessage } from "./launch-boundary";
 import { recordAcceptedIntakeSemantics,SAV_INTAKE_SEMANTIC_RECORD_REVISION } from "./semantic-records";
 import { SAV_INTAKE_MODEL_REVISION } from "./model-readers";
 import { readSavGeminiResponse, type SavGeminiMetadata } from "../gemini-response";
@@ -16,11 +16,14 @@ import { assertSavIntakeLease, catchupSavIntake, checkpointSavIntakeRun, claimSa
 
 /** Enqueue only: ingestion never invokes CRM/model or marks a mail processed. */
 export async function enqueueConfiguredSavIntake(messageId: string) {
+  const launch=await parkLaunchedIntakeMessage(messageId);
+  if (launch && "archived" in launch) return launch;
   const config = savIntakeRuntimeConfig();
-  if (!config) return { skipped: "off" as const };
+  if (!config) return launch ?? { skipped: "off" as const };
   if (await intakeMessageHistorical(messageId)) return { archived: true as const };
   if (!await intakeLaunchMatches(config)) throw Error("SAV_INTAKE_LAUNCH_MISMATCH");
-  return { runId: await enqueueSavIntakeMessage(messageId, config) };
+  const runId=await enqueueSavIntakeMessage(messageId, config);
+  return !runId && launch ? launch : {runId};
 }
 export async function analyseSavIntakeRuntime(runId: string, config: IntakeRuntimeConfig,
   deps: { env?: () => Record<string, string | undefined>; network?: typeof fetch } = {}) {

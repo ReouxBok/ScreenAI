@@ -1,5 +1,6 @@
 import { ensureSavCaseObservationTx } from "./case-learning";
 import "server-only";
+import {historicalMessageForIdSql,historicalThreadSql} from "./intake/launch-boundary";
 import { withLegacyOccupationAction, markLegacyIntakeDispatch, releaseLegacyIntakeIfConfirmed } from "./intake/legacy-occupation";
 import { assertSavTicketMatchesDispatch } from "./ticket-confirmation";
 import { readSavTicketHistory, type SavTicketHistory } from "./ticket-history";
@@ -1052,6 +1053,7 @@ export async function processPendingHubspotActions(limit = 20, actionId?: string
   const candidates = await db.select().from(savActions)
     .where(and(
       or(...eligibleKinds) ?? sql`false`,
+      sql`not (${historicalMessageForIdSql(savActions.messageId)} or (${savActions.messageId} is null and ${historicalThreadSql(savActions.threadId)}))`,
       isNull(savActions.pilotBatchId),
       actionId ? eq(savActions.id, actionId) : undefined,
       or(eq(savActions.status, "pending"), and(eq(savActions.status, "running"), lt(savActions.updatedAt, staleBefore))),

@@ -5,7 +5,7 @@ import { createSavTestDb } from "../../../../test/sav-db";
 import { executionProvider } from "../../../../test/sav-intake-execution-provider";
 import { savMailboxes, savThreads, savMessages, staffUsers, savSyncState, savIntakeRuns, savIntakeModelCalls,
   savIntakeHumanEvents, savIntakeConsole, savIntakeExecutions, savIntakeEffects, savIntakeExecutionBudget,
-  savIntakeObservationBindings, savResolutionObservations, savLearningCandidates, savKnowledgeActivations, categories } from "@/db/schema";
+  savIntakeObservationBindings, savResolutionObservations, savAgentRuns, savDecisions, savActions, savFollowups, savLearningCandidates, savKnowledgeActivations, categories } from "@/db/schema";
 const state = vi.hoisted(() => ({ db: null as unknown, user: null as unknown }));
 vi.mock("@/db", () => ({ requireDb: () => { if (!state.db) throw Error("DB_FORBIDDEN"); return state.db; } }));
 vi.mock("@clerk/nextjs/server", () => ({ currentUser: async () => state.user }));
@@ -31,9 +31,18 @@ import { isSavMessageEligible } from "../cutover";
 import { enqueueSavTranslation, reconcileSavTranslations } from "../translations";
 import { activateSavV0Cutover } from "../cutover";
 import { activateSavLearningCutover } from "../learning-admission";
+import { processPendingHubspotActions } from "../hubspot";
+import { processPendingGmailSendActions } from "../gmail";
+import { processDueFollowups } from "../followups";
 import { approveLearningCandidate } from "../learning";
 import { syncSavObservation, prepareSavObservationLearning } from "../observations";
 import { recordIntakeLaunch, readIntakeLaunch } from "./launch-boundary";
+import { v0Proposal } from "../../../../test/sav-v0-review-fixture";
+import { ensureSavCaseObservationTx } from "../case-learning";
+import { readSavCaseLearningQualification } from "../case-qualification";
+import { reviewSavProposal } from "../review";
+import { previewIntakeLaunch, commitIntakeLaunch } from "./launch-admin";
+import { POST as adminPost } from "@/app/api/sav/intake-admin/route";
 import { getSavThreadDetail, processStoredSavMessage, processPendingSavMessages } from "../service";
 import { enqueueConfiguredSavIntake, reconcileSavIntakeRuntime } from "./runtime";
 import { saveIntakeChoice } from "@/app/studio/sav/intake/actions";
@@ -450,4 +459,118 @@ it("late ingestion of an old email and pre-launch creation both remain historica
   expect((await listIntakeConsole({view:"processing"})).rows[0].messageId).toBe(fresh.id);
   expect(await enqueueSavIntakeMessage(fresh.id,options.runtime)).toBeNull(); // A different launch cannot silently become a new runtime boundary.
   expect(mutationsSent()).toHaveLength(0);expect(await db.db.select().from(savIntakeModelCalls)).toHaveLength(0);
+});
+async function revise(kind:"select"|"classify",fields:Partial<IntakeHumanCommand>) {
+  const raw=await command(kind);
+  const saved=await recordIntakeHumanCommand({...raw,...fields});
+  return consumeIntakeHumanEvent(saved.eventId,options.runtime,createSavIntakeHubspotReaders({network:p.network}));
+}
+it("human select102 -> finance -> select102 keeps all authenticated overrides and quotas",async()=>{
+  await observed(true);
+  expect(await revise("select",{contactId:"102"})).toHaveProperty("state","observed");
+  expect(await revise("classify",{classification:"finance"})).toHaveProperty("state","observed");
+  expect(await revise("select",{contactId:"102"})).toHaveProperty("state","observed");
+  const current=(await readSavIntakeCurrent(threadId))!;
+  expect(current.payload.plan?.decision).toMatchObject({classification:"finance",disposition:{kind:"ticket",target:{contactId:"102"}}});
+  expect((current.payload.input as {humanResolution:{inheritedChoiceIds:string[]}}).humanResolution.inheritedChoiceIds).toHaveLength(2);
+  expect((await db.db.select().from(savIntakeRuns)).reduce((s,r)=>s+r.attempts,0)).toBe(1);
+  expect(await db.db.select().from(savIntakeModelCalls)).toHaveLength(0);expect(mutationsSent()).toHaveLength(0);
+});
+it("human finance -> select102 preserves the earlier sensitive classification",async()=>{
+  await observed(true);
+  expect(await revise("classify",{classification:"finance"})).toHaveProperty("state","waiting");
+  expect(await revise("select",{contactId:"102"})).toHaveProperty("state","observed");
+  expect((await readSavIntakeCurrent(threadId))?.payload.plan?.decision).toMatchObject({classification:"finance",disposition:{kind:"ticket",target:{contactId:"102"}}});
+});
+it("classification incompatible with a confirmed partial effect is held without changing receipts",async()=>{
+  const {execution}=await partiallyConfirmedCreate();
+  expect(await revise("classify",{classification:"finance"})).toHaveProperty("waiting","SAV_INTAKE_HUMAN_REVALIDATION_REQUIRED");
+  expect((await getExecutionEffects(execution.id)).filter(e=>e.kind==="ticket_create"&&e.state==="confirmed")).toHaveLength(1);expect(mutationsSent().filter(c=>c.path==="/crm/v3/objects/tickets")).toHaveLength(1);
+});
+it("new sensitive history on another ticket-linked thread dirties the support projection and follows sensitive closure/reopening",async()=>{
+  const {observation}=await supportClosedWithHumanEvidence();
+  const originalBinding=(await readIntakeObservationBinding(observation.id))!;expect(originalBinding.sensitive).toBe(false);
+  await projectIntakeThread(threadId);
+  const other=(await db.db.insert(savThreads).values({mailboxId,gmailThreadId:randomUUID(),customerEmail:"other@example.invalid",hubspotTicketId:observation.hubspotTicketId}).returning())[0];
+  const m=await message(other.id);
+  const current=(await readSavIntakeCurrent(threadId))!;
+  const plan=current.payload.plan!;
+  await db.db.insert(savIntakeRuns).values({threadId:other.id,messageId:m.id,version:1,configHash:"f".repeat(64),policyHash:current.policyHash,isCurrent:false,state:"observed",payloadCiphertext:encryptSavPayload({...current.payload,plan:{...plan,decision:{...plan.decision,classification:"finance"}}})});
+  expect((await listIntakeConsole({view:"learning"})).total).toBe(0);
+  await syncSavObservation(observation.id,async ticketId=>({ticketId,status:"closed",subject:"Synthetic sensitive closure",updatedAt:new Date().toISOString(),events:[],errors:[]}));
+  await projectIntakeThread(threadId);
+  expect((await listIntakeConsole({view:"completed"})).rows.find(r=>r.threadId===threadId)?.status).toBe("not_applicable_sensitive");
+  await syncSavObservation(observation.id,async ticketId=>({ticketId,status:"open",subject:"Synthetic reopened",updatedAt:new Date().toISOString(),events:[],errors:[]}));
+  await projectIntakeThread(threadId);expect((await listIntakeConsole({view:"sensitive"})).rows.some(r=>r.threadId===threadId)).toBe(true);
+  expect((await readIntakeObservationBinding(observation.id))?.baselineHash).toBe(originalBinding.baselineHash);
+});
+it("launch while OFF holds fresh arrivals for catchup instead of legacy analysis",async()=>{
+  await recordIntakeLaunch({mailboxId,receivedAfter:options.runtime.receivedAfter,createdAfter:options.runtime.createdAfter});
+  vi.stubEnv("SAV_INTAKE_RUNTIME_MODE","off");
+  expect(await enqueueConfiguredSavIntake(messageId)).toEqual({held:true});
+  expect(await processStoredSavMessage(messageId)).toBeNull();
+  expect((await db.db.select().from(savMessages).where(eq(savMessages.id,messageId)))[0]).toMatchObject({analysisStatus:"intake_pending",analysisAttempts:0,processedAt:null});
+  expect(await db.db.select().from(savIntakeRuns)).toHaveLength(0);expect(fetch).not.toHaveBeenCalled();
+  expect(await catchupSavIntake(options.runtime)).toBe(1);
+});
+
+it("new approved V0 message after intake keeps a separate baseline and can qualify; pending intake never falls back to old V0",async()=>{
+  const {observation}=await supportClosedWithHumanEvidence();
+  const baseline=(await readIntakeObservationBinding(observation.id))!.baselineHash;
+  const m=await message(threadId,new Date());
+  await db.db.update(savMessages).set({analysisStatus:"done"}).where(eq(savMessages.id,m.id));
+  const proposal=v0Proposal();
+  const [run]=await db.db.insert(savAgentRuns).values({messageId:m.id,runtime:"synthetic",mode:"off",status:"succeeded",model:"gemini-3.6-flash",promptRevision:"synthetic",inputHash:"synthetic",proposalCiphertext:encryptSavPayload(proposal)}).returning();
+  const [decision]=await db.db.insert(savDecisions).values({messageId:m.id,agentRunId:run.id,kind:"ticket_pending",reasonCode:"fixture",explanation:"Synthetic current approved V0",confidence:800}).returning();
+  await reviewSavProposal({reviewScope:"dossier",messageId:m.id,decisionId:decision.id,agentRunId:run.id,expectedReviewId:null,status:"approved",verdict:"correct",dimensions:{classification:"correct",routing:"correct",grounding:"correct",tone:"correct",escalation:"correct"},comment:"Synthetic current V0 validated manually.",reusability:"none",correction:{category:proposal.category,urgency:proposal.urgency,decisionKind:proposal.decision.kind,reasonCode:"fixture",explanation:"Synthetic current V0 review approved.",title:proposal.ticket.title,description:proposal.ticket.description,process:proposal.process,internalNote:"",replyDraft:proposal.replyDraft??""}},"ugo@limova.ai");
+  expect(await readSavCaseLearningQualification(threadId)).toHaveProperty("allowed",true);
+  const id=await db.db.transaction(tx=>ensureSavCaseObservationTx(tx,m.id,"ticket_confirmed"));
+  expect(id).not.toBe(observation.id);expect((await readIntakeObservationBinding(observation.id))?.baselineHash).toBe(baseline);
+  await db.db.update(savMessages).set({analysisStatus:"intake_pending"}).where(eq(savMessages.id,m.id));
+  expect(await readSavCaseLearningQualification(threadId)).toHaveProperty("allowed",false);
+});
+it("administrator preview is inert, immutable and commit is exact/idempotent while OFF",async()=>{
+  for(const [key,value] of Object.entries(environment))if(value!==undefined)vi.stubEnv(key,value);
+  vi.stubEnv("SAV_INTAKE_RUNTIME_MODE","off");
+  const input={runtime:JSON.parse(environment.SAV_INTAKE_RUNTIME_CONFIG!),policy:options.policy},commandId=randomUUID();
+  const previewResponse=await adminPost(new Request("https://studio.example.invalid/api/sav/intake-admin",{method:"POST",headers:{origin:"https://studio.example.invalid","content-type":"application/json"},body:JSON.stringify({operation:"preview",commandId,input})}));
+  expect(previewResponse.status).toBe(200);
+  const preview=await previewResponse.json();
+  expect(await readIntakeLaunch(mailboxId)).toBeNull();
+  expect(await previewIntakeLaunch(commandId,input)).toEqual(preview);
+  await expect(previewIntakeLaunch(commandId,{...input,policy:{...options.policy,maxDossiers:99}})).rejects.toThrow("PREVIEW_CONFLICT");
+  await expect(commitIntakeLaunch(commandId,"b".repeat(64))).rejects.toThrow("PREVIEW_CONFLICT");
+  const commitResponse=await adminPost(new Request("https://studio.example.invalid/api/sav/intake-admin",{method:"POST",headers:{origin:"https://studio.example.invalid","content-type":"application/json"},body:JSON.stringify({operation:"commit",commandId,hash:preview.hash})}));
+  expect(commitResponse.status).toBe(200);
+  const receipt=await commitResponse.json();
+  expect(await commitIntakeLaunch(commandId,preview.hash)).toEqual(receipt);
+  expect(await enqueueConfiguredSavIntake(messageId)).toEqual({held:true});
+  expect(fetch).not.toHaveBeenCalled();expect(mutationsSent()).toHaveLength(0);
+});
+it("admin HTTP requires same origin/JSON/strict active admin and bounds input",async()=>{
+  const url="https://studio.example.invalid/api/sav/intake-admin";
+  expect((await adminPost(new Request(url,{method:"POST",headers:{origin:"https://attacker.invalid","content-type":"application/json"},body:"{}"}))).status).toBe(403);
+  expect((await adminPost(new Request(url,{method:"POST",headers:{origin:"https://studio.example.invalid","content-type":"text/plain"},body:"{}"}))).status).toBe(415);
+  expect((await adminPost(new Request(url,{method:"POST",headers:{origin:"https://studio.example.invalid","content-type":"application/json"},body:"x".repeat(20001)}))).status).toBe(413);
+  state.user=null;
+  expect((await adminPost(new Request(url,{method:"POST",headers:{origin:"https://studio.example.invalid","content-type":"application/json"},body:JSON.stringify({operation:"revoke",policyId:options.config.policyId,reason:"Synthetic explicit revoke"})}))).status).toBe(403);
+});
+
+it("historical pending HubSpot/Gmail actions and followups cannot monopolize the worker LIMIT",async()=>{
+  vi.stubEnv("SAV_RELEASE_STAGE","v0");vi.stubEnv("SAV_AUTOMATION_MODE","assist");vi.stubEnv("SAV_WRITES_DISABLED","false");
+  await db.db.update(savMessages).set({receivedAt:new Date(Date.now()-3600000)}).where(eq(savMessages.id,messageId));
+  await recordIntakeLaunch({mailboxId,receivedAfter:new Date(Date.now()-1000).toISOString(),createdAfter:new Date(Date.now()-1000).toISOString()});
+  for(const kind of ["log_email","send_reply"] as const)await db.db.insert(savActions).values(Array.from({length:120},(_,i)=>({threadId,messageId:i%3?messageId:null,kind,actorType:"human" as const,idempotencyKey:randomUUID(),createdAt:new Date(Date.now()-3600000),payload:{manualReplyConfirmed:true}})));
+  await db.db.insert(savFollowups).values(Array.from({length:51},(_,i)=>({threadId,sequence:i+1,dueAt:new Date(Date.now()-3600000)})));
+  const freshThread=(await db.db.insert(savThreads).values({mailboxId,gmailThreadId:randomUUID(),customerEmail:"fresh@example.invalid",status:"awaiting_customer"}).returning())[0];
+  const fresh=await message(freshThread.id);
+  const [hs]=await db.db.insert(savActions).values({threadId:freshThread.id,messageId:fresh.id,kind:"log_email",actorType:"human",idempotencyKey:randomUUID(),payload:{}}).returning();
+  const [gm]=await db.db.insert(savActions).values({threadId:freshThread.id,messageId:fresh.id,kind:"send_reply",actorType:"human",idempotencyKey:randomUUID(),payload:{manualReplyConfirmed:true}}).returning();
+  const [followup]=await db.db.insert(savFollowups).values({threadId:freshThread.id,sequence:1,dueAt:new Date()}).returning();
+  await processPendingHubspotActions(1);await processPendingGmailSendActions(1);await processDueFollowups(1);
+  expect((await db.db.select().from(savActions).where(eq(savActions.id,hs.id)))[0].attemptCount).toBe(1);
+  expect((await db.db.select().from(savActions).where(eq(savActions.id,gm.id)))[0].attemptCount).toBe(1);
+  expect((await db.db.select().from(savActions).where(eq(savActions.threadId,threadId))).every(a=>a.attemptCount===0&&a.status==="pending")).toBe(true);
+  expect((await db.db.select().from(savFollowups).where(eq(savFollowups.id,followup.id)))[0].status).toBe("queued");
+  expect((await db.db.select().from(savFollowups).where(eq(savFollowups.threadId,threadId))).every(f=>f.status==="scheduled")).toBe(true);
 });

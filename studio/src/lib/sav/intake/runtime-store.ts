@@ -1,4 +1,5 @@
 import "server-only";
+import { SAV_INTAKE_OPERATIONAL_PROFILE, intakeBudgetUsage } from "./budget-profile";
 import { intakeLaunchMatches } from "./launch-boundary";
 import { intakeConsoleInstalled } from "./console-capability";
 import { intakeRunConfigurationBound, intakeHumanRefused, intakeHasHumanDecision } from "./human-binding";
@@ -18,7 +19,8 @@ type Run = typeof savIntakeRuns.$inferSelect;
 type Body = { text: string; headers?: Record<string, string>; attachments?: unknown[] };
 export type IntakeLease = { run: Run; token: string; input: EngineInput; provenance: Map<string, ReturnType<typeof prepareSavIntakeMessage>["provenance"]>; body: Body; sourceHash: string };
 const fail = (): never => { throw Error("SAV_INTAKE_RUNTIME_CONTEXT_CHANGED"); };
-function budgetRowsValid(rows: (typeof savIntakeModelCalls.$inferSelect)[]) {
+const budgetColumns={id:savIntakeModelCalls.id,messageKey:savIntakeModelCalls.messageKey,requestHash:savIntakeModelCalls.requestHash,state:savIntakeModelCalls.state,reservedNanoUsd:savIntakeModelCalls.reservedNanoUsd,chargedNanoUsd:savIntakeModelCalls.chargedNanoUsd,payloadCiphertext:savIntakeModelCalls.payloadCiphertext,createdAt:savIntakeModelCalls.createdAt};
+function budgetRowsValid(rows: Pick<typeof savIntakeModelCalls.$inferSelect,"reservedNanoUsd"|"chargedNanoUsd"|"payloadCiphertext"|"state">[]) {
   for (const row of rows) {
     const data = decryptSavPayload<{ metadata?: SavGeminiMetadata }>(row.payloadCiphertext), m = data.metadata ?? {};
     const { inputTokens: i, outputTokens: o, thoughtTokens: t, totalTokens: total } = m;
@@ -108,12 +110,31 @@ export async function claimSavIntakeRun(id: string, config: IntakeRuntimeConfig,
     }
     const siblings = await tx.select({ attempts: savIntakeRuns.attempts }).from(savIntakeRuns).where(eq(savIntakeRuns.messageId, run.messageId));
     const totalAttempts = siblings.reduce((sum, sibling) => sum + sibling.attempts, 0);
-    const pending = await tx.select().from(savIntakeModelCalls).where(and(eq(savIntakeModelCalls.runId, id), inArray(savIntakeModelCalls.state, ["dispatched", "uncertain"])));
+    const pending = await tx.select({id:savIntakeModelCalls.id}).from(savIntakeModelCalls).where(and(eq(savIntakeModelCalls.runId, id), inArray(savIntakeModelCalls.state, ["dispatched", "uncertain"])));
     const reason = pending.length ? "usage_uncertain" : thread.aiPaused ? "paused" : totalAttempts >= 2 ? "attempts_exhausted" : null;
     if (reason) {
       await tx.update(savIntakeRuns).set({ state: pending.length ? "uncertain" : "waiting", leaseToken: null, leaseUntil: null, freshUntil: null, updatedAt: now }).where(eq(savIntakeRuns.id, id));
       await tx.update(savMessages).set({ analysisStatus: pending.length ? "intake_uncertain" : "intake_waiting" }).where(eq(savMessages.id, run.messageId));
       await journal(tx, id, "waiting", { reason }); return null;
+    }
+    if(config.budgetProfile===SAV_INTAKE_OPERATIONAL_PROFILE) {
+      // Budget deferral is not an analysis attempt. Never burn the two durable
+      // attempts merely because another dossier used today's shared margin.
+      await tx.execute(sql`select pg_advisory_xact_lock(hashtext('sav-intake-runtime-model-budget-v1'))`);
+      const rows=await tx.select(budgetColumns).from(savIntakeModelCalls);
+      budgetRowsValid(rows);
+      const budgetNow=new Date(),usage=intakeBudgetUsage(rows,config,budgetNow);
+      const messageKey=intakeRuntimeHash(run.messageId);
+      const unknown=rows.some(row=>row.messageKey===messageKey&&row.state!=="settled");
+      const quote=savDerivedCostQuote(config.model,8192,budgetNow);
+      if(unknown||usage.remainingCalls<1||usage.remainingNanoUsd<quote.reservedNanoUsd||usage.remainingRollingNanoUsd<quote.reservedNanoUsd) {
+        const payload=decryptSavPayload<IntakeRuntimePayload>(run.payloadCiphertext);
+        const reason=unknown?"SAV_INTAKE_RUNTIME_USAGE_UNCERTAIN":"SAV_INTAKE_RUNTIME_BUDGET_EXHAUSTED";
+        await tx.update(savIntakeRuns).set({state:unknown?"uncertain":"waiting",payloadCiphertext:encryptSavPayload({...payload,reason}),leaseToken:null,leaseUntil:null,freshUntil:null,updatedAt:budgetNow}).where(eq(savIntakeRuns.id,id));
+        await tx.update(savMessages).set({analysisStatus:unknown?"intake_uncertain":"intake_waiting"}).where(eq(savMessages.id,run.messageId));
+        await journal(tx,id,"budget_deferred_before_attempt",{reason,attemptsUnchanged:true});
+        return null;
+      }
     }
     const data = await savIntakeSourceSnapshot(tx, message, now), token = randomUUID();
     const [claimed] = await tx.update(savIntakeRuns).set({ state: "analysing", leaseToken: token, leaseUntil: new Date(now.getTime() + 90_000),
@@ -175,21 +196,25 @@ export async function reserveSavIntakeCall(lease: IntakeLease, config: IntakeRun
   return requireDb().transaction(async tx => {
     await assertLease(tx, lease, config, now);
     await tx.execute(sql`select pg_advisory_xact_lock(hashtext('sav-intake-runtime-model-budget-v1'))`);
-    const rows = await tx.select().from(savIntakeModelCalls), messageKey = intakeRuntimeHash(lease.run.messageId);
+    const rows = await tx.select(budgetColumns).from(savIntakeModelCalls), messageKey = intakeRuntimeHash(lease.run.messageId);
     budgetRowsValid(rows);
     const prior = rows.find(row => row.messageKey === messageKey && row.requestHash === requestHash);
     if (prior) {
       if (prior.state !== "settled") throw Error("SAV_INTAKE_RUNTIME_USAGE_UNCERTAIN");
-      if (!prior.resultCiphertext) throw Error("SAV_INTAKE_RUNTIME_CALL_ALREADY_CONSUMED");
-      const saved = decryptSavPayload<{ json: unknown; metadata: SavGeminiMetadata }>(prior.resultCiphertext);
+      const [cache]=await tx.select({resultCiphertext:savIntakeModelCalls.resultCiphertext}).from(savIntakeModelCalls).where(eq(savIntakeModelCalls.id,prior.id));
+      if (!cache?.resultCiphertext) throw Error("SAV_INTAKE_RUNTIME_CALL_ALREADY_CONSUMED");
+      const saved = decryptSavPayload<{ json: unknown; metadata: SavGeminiMetadata }>(cache.resultCiphertext);
       return { id: prior.id, cached: saved };
     }
-    if (rows.some(row => row.state !== "settled")) throw Error("SAV_INTAKE_RUNTIME_USAGE_UNCERTAIN");
-    const price = savDerivedCostQuote(config.model, 8192, now);
-    if (rows.length >= config.maxCalls || rows.filter(row => row.messageKey === messageKey).length >= 3
-      || rows.reduce((total, row) => total + row.chargedNanoUsd, 0) + price.reservedNanoUsd > config.maxNanoUsd) throw Error("SAV_INTAKE_RUNTIME_BUDGET_EXHAUSTED");
+    if (rows.some(row => row.state !== "settled" && (config.budgetProfile !== SAV_INTAKE_OPERATIONAL_PROFILE || row.messageKey === messageKey))) throw Error("SAV_INTAKE_RUNTIME_USAGE_UNCERTAIN");
+    const budgetNow=config.budgetProfile===SAV_INTAKE_OPERATIONAL_PROFILE ? new Date() : now;
+    if(!Number.isFinite(now.getTime())||now>budgetNow)throw Error("SAV_INTAKE_RUNTIME_LEDGER_CLOCK_REJECTED");
+    const price = savDerivedCostQuote(config.model, 8192, budgetNow);
+    const usage = intakeBudgetUsage(rows,config,budgetNow);
+    if (usage.remainingCalls < 1 || rows.filter(row => row.messageKey === messageKey).length >= 3
+      || price.reservedNanoUsd > usage.remainingNanoUsd || price.reservedNanoUsd > usage.remainingRollingNanoUsd) throw Error("SAV_INTAKE_RUNTIME_BUDGET_EXHAUSTED");
     const [row] = await tx.insert(savIntakeModelCalls).values({ runId: lease.run.id, messageKey, requestHash, state: "dispatched", reservedNanoUsd: price.reservedNanoUsd,
-      chargedNanoUsd: price.reservedNanoUsd, payloadCiphertext: encryptSavPayload({ model: config.model, configHash: config.configHash }) }).returning();
+      chargedNanoUsd: price.reservedNanoUsd, createdAt:budgetNow, payloadCiphertext: encryptSavPayload({ model: config.model, configHash: config.configHash }) }).returning();
     return { id: row.id, cached: null };
   });
 }
@@ -226,11 +251,8 @@ export async function checkpointSavIntakeRun(lease: IntakeLease, payload: Intake
     .where(and(eq(savIntakeRuns.id, lease.run.id), eq(savIntakeRuns.leaseToken, lease.token), eq(savIntakeRuns.isCurrent, true), eq(savIntakeRuns.state, "analysing"))).returning({ id: savIntakeRuns.id });
   if (!rows.length) return fail();
 }
-export async function readSavIntakeBudget(config: IntakeRuntimeConfig) {
-  const rows = await requireDb().select().from(savIntakeModelCalls);
+export async function readSavIntakeBudget(config: IntakeRuntimeConfig, now = new Date()) {
+  const rows = await requireDb().select(budgetColumns).from(savIntakeModelCalls);
   budgetRowsValid(rows);
-  const chargedNanoUsd = rows.reduce((total, row) => total + row.chargedNanoUsd, 0);
-  return { maxNanoUsd: config.maxNanoUsd, maxCalls: config.maxCalls, chargedNanoUsd, callCount: rows.length,
-    remainingNanoUsd: Math.max(0, config.maxNanoUsd - chargedNanoUsd), remainingCalls: Math.max(0, config.maxCalls - rows.length),
-    uncertain: rows.some(row => row.state !== "settled") };
+  return intakeBudgetUsage(rows,config,now);
 }

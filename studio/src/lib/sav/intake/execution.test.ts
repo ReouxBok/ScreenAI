@@ -863,3 +863,30 @@ it("review735 confirmed template history stays confirmed when the next identific
     expect(await getExecutionEffects(first.id)).toEqual(receipts);
     expect(p.calls.filter(c => c.path === "gmail/messages/send")).toHaveLength(1);
 });
+async function operationalAdmissionProfile() {
+  const pins={...JSON.parse(environment.SAV_INTAKE_RUNTIME_CONFIG!),budgetProfile:"operational_utc_v1",maxRollingNanoUsd:90000000000,maxCalls:300};
+  environment.SAV_INTAKE_RUNTIME_CONFIG=JSON.stringify(pins);
+  options.runtime=savIntakeRuntimeConfig(environment)!;
+  options.policy={...options.policy,budgetProfile:"operational_utc_v1"};
+  await writePolicy();
+}
+async function historicalAdmissions(at:Date,count=100) {
+  await f.db.insert(savIntakeExecutions).values(Array.from({length:count},()=>({messageId:randomUUID(),threadId:randomUUID(),runVersion:1,policyId:options.config.policyId,policyHash:options.config.policyHash,state:"confirmed",payloadCiphertext:encryptSavPayload({synthetic:true}),createdAt:at})));
+  await f.db.update(savIntakeExecutionBudget).set({admitted:count});
+}
+it("operational100 admissions are UTC daily while the lifetime integrity counter keeps advancing",async()=>{
+  await operationalAdmissionProfile();
+  const yesterday=new Date(Date.parse(new Date().toISOString().slice(0,10)+"T00:00:00Z")-1);
+  await historicalAdmissions(yesterday);
+  await admission();
+  expect((await f.db.select().from(savIntakeExecutionBudget))[0].admitted).toBe(101);
+  expect(await f.db.select().from(savIntakeExecutions)).toHaveLength(101);
+});
+it("operational daily admission limit survives another policy and refuses future ledger clocks",async()=>{
+  await operationalAdmissionProfile();await historicalAdmissions(new Date());
+  options.policy={...options.policy,expiresAt:new Date(Date.now()+7200000).toISOString()};await writePolicy();
+  runId=await observed();await expect(admitIntakeExecution(runId,options)).rejects.toThrow("ADMISSION_LIMIT");
+  await f.db.update(savIntakeExecutions).set({createdAt:new Date(Date.now()+60000)});
+  await expect(admitIntakeExecution(runId,options)).rejects.toThrow("LEDGER_CLOCK_REJECTED");
+  expect((await f.db.select().from(savIntakeExecutionBudget))[0].admitted).toBe(100);
+});

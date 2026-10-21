@@ -2,7 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { afterAll, afterEach, beforeAll, beforeEach, expect, it, vi } from "vitest";
 import { eq } from "drizzle-orm";
 import { createSavTestDb } from "../../../../test/sav-db";
-import { savMailboxes, savMessages, savThreads, savIntakeRuns, savIntakeModelCalls, savIntakeJournal, savActions, savDecisions, auditLogs } from "@/db/schema";
+import { savSyncState, savMailboxes, savMessages, savThreads, savIntakeRuns, savIntakeModelCalls, savIntakeJournal, savActions, savDecisions, auditLogs } from "@/db/schema";
 const state = vi.hoisted(() => ({ db: null as unknown }));
 vi.mock("@/db", () => ({ requireDb: () => { if (!state.db) throw Error("NO_DATABASE_ALLOWED"); return state.db; } }));
 import { encryptSavPayload, decryptSavPayload } from "../crypto";
@@ -37,8 +37,8 @@ beforeEach(async () => {
   messageId = (await message()).id; environment = env(mailboxId); config = savIntakeRuntimeConfig(environment)!;
 });
 afterEach(() => vi.unstubAllEnvs());
-it("OFF returns before DB or the new tables, even with malformed optional pins", async () => {
-  const db = state.db; state.db = null;
+it("OFF reads only the historical capability marker and returns before new tables with malformed optional pins", async () => {
+  const db = state.db; state.db = {select:()=>({from:(table:unknown)=>{if(table!==savSyncState)throw Error("NEW_TABLE_FORBIDDEN");return {where:async()=>[]};}})};
   try { expect(savIntakeRuntimeConfig({ SAV_INTAKE_RUNTIME_CONFIG: "broken" })).toBeNull(); expect(await enqueueConfiguredSavIntake(messageId)).toEqual({ skipped: "off" }); expect(await reconcileSavIntakeRuntime()).toEqual({ skipped: "off" }); }
   finally { state.db = db; }
 });
@@ -285,4 +285,41 @@ it("rejects a lease after expiry expressed without fractional seconds", async ()
   await expect(assertSavIntakeLease(l, shortConfig, new Date(Date.parse(expiry) - 1))).resolves.toBeUndefined();
   await expect(assertSavIntakeLease(l, shortConfig, new Date(expiry))).rejects.toThrow("CONTEXT_CHANGED");
   await expect(assertSavIntakeLease(l, shortConfig, new Date(Date.parse(expiry) + 100))).rejects.toThrow("CONTEXT_CHANGED");
+});
+
+function operational() {
+  const pins={...JSON.parse(environment.SAV_INTAKE_RUNTIME_CONFIG!),budgetProfile:"operational_utc_v1",maxRollingNanoUsd:90000000000,maxCalls:300,expiresAt:new Date(Date.now()+29*86400000).toISOString()};
+  environment={...environment,SAV_INTAKE_RUNTIME_CONFIG:JSON.stringify(pins)};config=savIntakeRuntimeConfig(environment)!;
+}
+it("operational profile separates an old initial frontier from bounded30day authority and requires explicit rolling cap",()=>{
+  const pins={...JSON.parse(environment.SAV_INTAKE_RUNTIME_CONFIG!),budgetProfile:"operational_utc_v1",maxRollingNanoUsd:90000000000,maxCalls:300,createdAfter:"2020-01-01T00:00:00.000Z",expiresAt:new Date(Date.now()+29*86400000).toISOString()};
+  expect(savIntakeRuntimeConfig({...environment,SAV_INTAKE_RUNTIME_CONFIG:JSON.stringify(pins)})).toHaveProperty("budgetProfile","operational_utc_v1");
+  for(const change of [{maxRollingNanoUsd:undefined},{maxCalls:301},{maxRollingNanoUsd:90000000001},{expiresAt:new Date(Date.now()+31*86400000).toISOString()}]) expect(()=>savIntakeRuntimeConfig({...environment,SAV_INTAKE_RUNTIME_CONFIG:JSON.stringify({...pins,...change})})).toThrow();
+});
+it("one provider timeout reserves its full cost beyond30days, blocks its message, and permits a second dossier within both margins",async()=>{
+  operational();const first=await lease();
+  const a=await reserveSavIntakeCall(first,config,"timeout-a");
+  await f.db.update(savIntakeModelCalls).set({state:"uncertain",createdAt:new Date(Date.now()-31*86400000)}).where(eq(savIntakeModelCalls.id,a.id));
+  threadId=(await f.db.insert(savThreads).values({mailboxId,gmailThreadId:randomUUID(),customerEmail:"other@example.invalid"}).returning())[0].id;messageId=(await message()).id;
+  const second=await lease(),b=await reserveSavIntakeCall(second,config,"second-b");
+  expect(b.cached).toBeNull();expect((await readSavIntakeBudget(config))).toMatchObject({chargedNanoUsd:1634304000,rollingChargedNanoUsd:1634304000,lifetimeCallCount:2,uncertain:true});
+  await expect(reserveSavIntakeCall(first,config,"retry-a")).rejects.toThrow("USAGE_UNCERTAIN");
+  expect((await readSavIntakeBudget({...config,maxCalls:299}))).toHaveProperty("lifetimeCallCount",2);
+});
+it("operational profile still enforces three durable calls per message and rejects a future ledger timestamp",async()=>{
+  operational();const l=await lease();
+  for(let n=0;n<3;n++) {const call=await reserveSavIntakeCall(l,config,`call-${n}`);expect(await settleSavIntakeCall(call.id,{inputTokens:100,outputTokens:50,thoughtTokens:0,totalTokens:150})).toBe(true);}
+  await expect(reserveSavIntakeCall(l,config,"fourth")).rejects.toThrow("BUDGET_EXHAUSTED");
+  await f.db.update(savIntakeModelCalls).set({createdAt:new Date(Date.now()+60000)});
+  await expect(readSavIntakeBudget(config)).rejects.toThrow("CLOCK_REJECTED");
+});
+
+it("daily quota deferral consumes no attempt and a fresh UTC day can claim the same waiting run",async()=>{
+  operational();const id=(await enqueueSavIntakeMessage(messageId,config))!;
+  await f.db.insert(savIntakeModelCalls).values(Array.from({length:300},(_,i)=>({messageKey:intakeRuntimeHash(`prior-${i}`),requestHash:intakeRuntimeHash(`request-${i}`),state:"settled",reservedNanoUsd:817152000,chargedNanoUsd:262500,payloadCiphertext:encryptSavPayload({metadata:{inputTokens:100,outputTokens:50,thoughtTokens:0,totalTokens:150}}),createdAt:new Date()})));
+  expect(await claimSavIntakeRun(id,config)).toBeNull();expect(await claimSavIntakeRun(id,config)).toBeNull();
+  expect((await readSavIntakeCurrent(threadId,config))?.attempts).toBe(0);
+  expect((await readSavIntakeCurrent(threadId,config))?.payload.reason).toBe("SAV_INTAKE_RUNTIME_BUDGET_EXHAUSTED");
+  vi.useFakeTimers({toFake:["Date"]});vi.setSystemTime(new Date(Date.parse(new Date().toISOString().slice(0,10)+"T00:00:00Z")+86400000));
+  try {expect((await claimSavIntakeRun(id,config))?.run.attempts).toBe(1);}finally{vi.useRealTimers();}
 });

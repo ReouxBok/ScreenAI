@@ -16,7 +16,7 @@ export default async function IntakeConsolePage({ searchParams }: { searchParams
     ...(mailbox.success ? { mailbox: mailbox.data } : {}), page: String(page) })}`;
   return <div className={styles.console}>
     <header className={styles.heading}><div><span className="eyebrow">SAV · nouveaux dossiers</span><h1>Suivre le traitement</h1>
-      <p>Les actions confirmées et le suivi réel déterminent l’avancement.</p></div><Link className="button secondary" href="/studio/sav">File supervisée</Link></header>
+      <p>Les actions confirmées et le suivi réel déterminent l’avancement.</p></div><Link className="button secondary" href="/studio/sav?legacy=1">Archives supervisées</Link></header>
     {!data.installed ? <section className={styles.notice}><h2>Console non préparée</h2><p>Les données de ce parcours ne sont pas encore disponibles. La file supervisée reste accessible.</p></section> : <>
       <nav aria-label="Vues des nouveaux dossiers" className={styles.views}>
         {Object.entries(savIntakeViewLabels).map(([key, label]) => <Link key={key} href={href(key)} aria-current={view === key ? "page" : undefined}>

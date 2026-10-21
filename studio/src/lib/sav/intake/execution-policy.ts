@@ -1,4 +1,5 @@
 import "server-only";
+import { SAV_INTAKE_OPERATIONAL_PROFILE, intakeOperationalTermValid } from "./budget-profile";
 import { currentUser } from "@clerk/nextjs/server";
 import { and, eq } from "drizzle-orm";
 import { z } from "zod";
@@ -11,7 +12,7 @@ import { savIntakeMutationSchema } from "./contract";
 export const executionPolicySchema = z.object({
     revision: z.literal("sav-intake-execution-2026-10-21.v1"), mailboxId: z.uuid(), codeRevision: z.string().regex(/^[a-f0-9]{40}$/),
     enginePolicyHash: z.string().regex(/^[a-f0-9]{64}$/), resourcesHash: z.string().regex(/^[a-f0-9]{64}$/),
-    receivedAfter: z.iso.datetime(), createdAfter: z.iso.datetime(), expiresAt: z.iso.datetime(), maxDossiers: z.number().int().min(1).max(100),
+    receivedAfter: z.iso.datetime(), createdAfter: z.iso.datetime(), expiresAt: z.iso.datetime(), budgetProfile:z.literal(SAV_INTAKE_OPERATIONAL_PROFILE).optional(), maxDossiers: z.number().int().min(1).max(100),
     mutations: z.array(savIntakeMutationSchema).min(1).max(6).refine(a => new Set(a).size === a.length),
     admission: z.discriminatedUnion("kind", [z.object({
             kind: z.literal("automatic")
@@ -50,16 +51,24 @@ export async function executionAdministrator() {
     return staff;
 }
 /** Intentionally no route/UI in this lot; an explicit administrator operation only. */
-export async function approveIntakeExecutionPolicy(raw: unknown) {
+export async function approveIntakeExecutionPolicy(raw: unknown, commandId?: string) {
     const staff = await executionAdministrator(), policy = executionPolicySchema.parse(raw), now = Date.now();
-    if (Date.parse(policy.expiresAt) <= now || Date.parse(policy.expiresAt) - now > 86400000 || Date.parse(policy.createdAfter) > now || Date.parse(policy.receivedAfter) >= Date.parse(policy.expiresAt))
+    if (Date.parse(policy.expiresAt) <= now || (policy.budgetProfile===SAV_INTAKE_OPERATIONAL_PROFILE ? !intakeOperationalTermValid(policy.expiresAt,new Date(now)) : Date.parse(policy.expiresAt) - now > 86400000) || Date.parse(policy.createdAfter) > now || Date.parse(policy.receivedAfter) >= Date.parse(policy.expiresAt))
         throw Error("SAV_INTAKE_EXECUTION_POLICY_INVALID");
+    if(commandId) z.uuid().parse(commandId);
     const row = await requireDb().transaction(async (tx) => {
         const [current] = await tx.select().from(staffUsers).where(eq(staffUsers.id, staff.id)).for("update");
         if (!current?.active || !["admin", "owner"].includes(current.role) || !canAccessSav(current.email, current.role))
             throw Error("SAV_INTAKE_EXECUTION_UNAUTHORIZED");
+        if(commandId) {
+            const [existing]=await tx.select().from(savIntakeExecutionPolicies).where(eq(savIntakeExecutionPolicies.id,commandId));
+            if(existing) {
+                if(existing.state!=="approved"||existing.administratorId!==staff.id||existing.policyHash!==intakeRuntimeHash(policy)) throw Error("SAV_INTAKE_EXECUTION_POLICY_CONFLICT");
+                return existing;
+            }
+        }
         const [created] = await tx.insert(savIntakeExecutionPolicies).values({
-            revision: policy.revision, state: "approved", administratorId: staff.id, policyHash: intakeRuntimeHash(policy), payloadCiphertext: encryptSavPayload(policy)
+            id:commandId, revision: policy.revision, state: "approved", administratorId: staff.id, policyHash: intakeRuntimeHash(policy), payloadCiphertext: encryptSavPayload(policy)
         }).returning();
         await tx.insert(auditLogs).values({
             actorEmail: staff.email, action: "sav_intake_execution_policy_approved", entityType: "sav_intake_execution_policy", entityId: created.id, technicalMetadata: {
@@ -78,7 +87,8 @@ export async function readIntakeExecutionAuthority(config: ExecutionConfig, now 
     if (!row || row.state !== "approved" || row.policyHash !== config.policyHash || !staff?.active || !["admin", "owner"].includes(staff.role) || !canAccessSav(staff.email, staff.role))
         throw Error("SAV_INTAKE_EXECUTION_PERMISSION_REVOKED");
     const policy = executionPolicySchema.parse(decryptSavPayload(row.payloadCiphertext));
-    if (intakeRuntimeHash(policy) !== row.policyHash || policy.codeRevision !== config.codeRevision || Date.parse(policy.expiresAt) <= now.getTime())
+    if (intakeRuntimeHash(policy) !== row.policyHash || policy.codeRevision !== config.codeRevision || Date.parse(policy.expiresAt) <= now.getTime()
+        || policy.budgetProfile===SAV_INTAKE_OPERATIONAL_PROFILE && !intakeOperationalTermValid(policy.expiresAt,now))
         throw Error("SAV_INTAKE_EXECUTION_POLICY_EXPIRED");
     return {
         row, staff, policy

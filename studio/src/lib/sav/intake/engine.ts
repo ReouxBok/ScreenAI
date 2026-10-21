@@ -99,7 +99,7 @@ export async function planSavIntake(
       revision: "sav-intake-engine-2026-10-20.v1", fingerprint, decision,
       steps: mutations.map(mutation => ({ id: `${message.id}:${mutation}:${fingerprint}`, mutation, requiresPermission: mutation, ticketId, status: "not_dispatched" as const })),
       progress: savIntakeProgressSchema.parse(progress), noteText: finalNote, ...(supervisedResource ? { supervisedResource } : {}),
-      ...(finalCreation ? { newTicket: finalCreation } : {}), ...(candidateContactIds ? { candidateContactIds } : {}),
+      ...(finalCreation ? { newTicket: finalCreation } : {}), ...((candidateContactIds ?? selectedEquivalent) ? { candidateContactIds:candidateContactIds ?? selectedEquivalent } : {}),
       originalThreadId: message.threadId, originalRecipientEmails: [message.fromEmail], referenceMode: input.mode,
       readCalls: calls, effects: "not_connected",
     };

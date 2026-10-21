@@ -17,6 +17,35 @@ import { admissionLock, executionJournal, occupyKeys, releaseKeys, assertNoLegac
 import { createSavIntakeHubspotReaders } from "./hubspot-readers";
 import type { EngineInput, IntakeAdapters, IntakePlan } from "./engine-types";
 import type { ExecutionPayload, EffectAck } from "./execution-types";
+/** Reconstruct compatible overrides from authenticated immutable events, never
+ * from client fields or an arbitrary input snapshot. Every ancestor is already
+ * bound by intakeRunConfigurationBound and is checked again while traversing. */
+async function mergedHumanResolution(event:typeof savIntakeHumanEvents.$inferSelect,parent:typeof savIntakeRuns.$inferSelect,value:HumanEventPayload,config:IntakeRuntimeConfig) {
+  const resolution:NonNullable<EngineInput["humanResolution"]>={choiceId:event.id,at:event.createdAt.toISOString(),equivalentContactIds:value.candidateContactIds,inheritedChoiceIds:[],fieldSources:{}};
+  const apply=(source:typeof event,body:HumanEventPayload)=>{
+    if(body.policyHash!==config.policyHash||body.resourcesHash!==config.resourcesHash||body.candidatesHash!==value.candidatesHash||source.sourceHash!==event.sourceHash) return conflict();
+    for(const field of ["contactId","ticketId","classification"] as const) {
+      if(resolution[field]===undefined&&body[field]!==undefined) {
+        Object.assign(resolution,{[field]:body[field]});
+        resolution.fieldSources![field]=source.id;
+      }
+    }
+  };
+  apply(event,value);
+  let run=parent;
+  for(let depth=0;run.humanChoiceCiphertext;depth++) {
+    if(depth>=200)return conflict();
+    const choice=decryptSavPayload<{eventId:string}>(run.humanChoiceCiphertext);
+    const [ancestor]=await requireDb().select().from(savIntakeHumanEvents).where(eq(savIntakeHumanEvents.id,choice.eventId));
+    if(!ancestor||ancestor.state!=="consumed"||ancestor.kind==="refuse"||ancestor.revisionRunId!==run.id||ancestor.baseConfigHash!==config.configHash||ancestor.messageId!==event.messageId||ancestor.threadId!==event.threadId)return conflict();
+    const body=decryptSavPayload<HumanEventPayload>(ancestor.payloadCiphertext);
+    apply(ancestor,body);resolution.inheritedChoiceIds!.push(ancestor.id);
+    const [previous]=await requireDb().select().from(savIntakeRuns).where(eq(savIntakeRuns.id,ancestor.parentRunId));
+    if(!previous||previous.version>=run.version||body.parentPayloadHash!==intakeRuntimeHash(decryptSavPayload(previous.payloadCiphertext)))return conflict();
+    run=previous;
+  }
+  return resolution;
+}
 async function confirmedCreationRevision(original: IntakeRuntimePayload, input: EngineInput, ticketId: string,
   config: IntakeRuntimeConfig, readers: Parameters<typeof consumeIntakeHumanEvent>[2]): Promise<IntakePlan | null> {
   const [execution] = await requireDb().select().from(savIntakeExecutions).where(eq(savIntakeExecutions.messageId,input.message.id));
@@ -26,7 +55,7 @@ async function confirmedCreationRevision(original: IntakeRuntimePayload, input: 
   const created=effects.find(e=>e.kind==="ticket_create"&&e.state==="confirmed"&&e.ackCiphertext&&decryptSavPayload<EffectAck>(e.ackCiphertext).id===ticketId);
   if (!created) return null;
   if (!old || old.decision.disposition.kind!=="ticket" || old.decision.disposition.target.operation!=="create" || !payload.baseline
-    || effects.some(e=>!["planned","confirmed"].includes(e.state)) || input.humanResolution?.classification) return conflict();
+    || effects.some(e=>!["planned","confirmed"].includes(e.state)) || input.humanResolution?.classification && input.humanResolution.classification!==old.decision.classification) return conflict();
   acceptedIntakeResult(original.semantics,"analyseMessage",{message:input.message,conversation:input.conversation.data});
   const current=await collectExecutionCrm(old,original.input,config,readers,AbortSignal.timeout(30000));
   assertExecutionCrmUnchanged(payload.baseline,current,effects);
@@ -127,8 +156,7 @@ export async function consumeIntakeHumanEvent(id: string, config: IntakeRuntimeC
     const original = decryptSavPayload<IntakeRuntimePayload>(parent.payloadCiphertext);
     if (value.parentPayloadHash !== intakeRuntimeHash(original) || original.configuration?.configHash !== config.configHash
       || value.mailboxId !== config.mailboxId || value.policyHash !== config.policyHash || value.resourcesHash !== config.resourcesHash) return conflict();
-    const input: EngineInput = { ...snapshot.input, humanResolution: { choiceId: id, at: event.createdAt.toISOString(),
-      contactId: value.contactId, ticketId: value.ticketId, classification: value.classification, equivalentContactIds: value.candidateContactIds } };
+    const input: EngineInput = { ...snapshot.input, humanResolution: await mergedHumanResolution(event,parent,value,config) };
     let reason: string | undefined;
     const accepted = <T>(method: "analyseMessage" | "assessIdentity" | "assessIssues", data: unknown): T => {
       try { return acceptedIntakeResult<T>(original.semantics, method, data); }
@@ -139,12 +167,12 @@ export async function consumeIntakeHumanEvent(id: string, config: IntakeRuntimeC
       if (deadline.aborted) throw Error("SAV_INTAKE_HUMAN_REVALIDATION_REQUIRED");
       return fn(argument, AbortSignal.any([signal, deadline]));
     }])) as typeof readers;
-    const confirmedPlan=value.ticketId ? await confirmedCreationRevision(original,input,value.ticketId,config,boundedReaders) : null;
+    const confirmedPlan=input.humanResolution?.ticketId ? await confirmedCreationRevision(original,input,input.humanResolution.ticketId,config,boundedReaders) : null;
     const plan = confirmedPlan ?? await planSavIntake(input, { ...boundedReaders,
       analyseMessage: async data => accepted("analyseMessage", data), assessIdentity: async data => accepted("assessIdentity", data),
       assessIssues: async data => data.tickets.length ? accepted("assessIssues", data) : { investigationComplete: true, tickets: [] },
-    }, value.classification === "other" ? { ...config.policy, qualifiedOther: { evidenceSource: "human_override",
-      resource: { resourceId: id, revisionId: "sav-intake-human.v1", sha256: intakeRuntimeHash(value) } } } : config.policy, {}, () => new Date());
+    }, input.humanResolution?.classification === "other" ? { ...config.policy, qualifiedOther: { evidenceSource: "human_override",
+      resource: { resourceId: id, revisionId: "sav-intake-human.v1", sha256: intakeRuntimeHash(input.humanResolution) } } } : config.policy, {}, () => new Date());
     const result = await db.transaction(async tx => {
       await admissionLock(tx);
       const [execution] = await tx.select().from(savIntakeExecutions).where(eq(savIntakeExecutions.messageId, event.messageId)).for("update");

@@ -21,7 +21,10 @@ export default async function IntakeDetailPage({ params }: { params: Promise<{ i
   if (!z.uuid().safeParse(id).success) notFound();
   const data = await readIntakeConsoleDetail(id);
   if (!data) notFound();
-  const current = data.current, plan = current?.payload.plan, disposition = plan?.decision.disposition;
+  const current = data.current;
+  const applicable = Boolean(current && current.messageId === data.latestMessageId && current.sourceMatches);
+  const plan = applicable ? current?.payload.plan : undefined, disposition = plan?.decision.disposition;
+  const historicalPlan = !applicable ? current?.payload.plan : undefined;
   const contacts = [...(plan?.candidateContactIds ?? [])].sort();
   const tickets = [...new Set([...(data.progress?.effects.filter(e=>e.kind==="ticket_create"&&e.state==="confirmed"&&e.ack?.id).map(e=>e.ack!.id!)??[]),...(plan?.decision.evidence.filter(e => e.source === "crm_ticket" && /^\d+$/.test(e.sourceId)).map(e => e.sourceId) ?? [])])];
   const target = disposition?.kind === "ticket" ? disposition.target : null;
@@ -48,7 +51,8 @@ export default async function IntakeDetailPage({ params }: { params: Promise<{ i
           </ul></details>
         </>}
       </section>
-      <section className={styles.decision}><h2>Actions réellement accomplies</h2>
+      {historicalPlan && <section className={styles.history}><h2>Dernière analyse historique — non applicable à la demande actuelle</h2><p>Version {current?.version}. Les sources ou le dernier entrant ont changé ; ses anciennes propositions ne sont pas la décision actuelle.</p><details><summary>Consulter la proposition historique</summary><p>Classification historique : {historicalPlan.decision.classification}.</p>{historicalPlan.decision.disposition.kind === "ticket" && <p>Ancienne cible : contact {historicalPlan.decision.disposition.target.contactId}{historicalPlan.decision.disposition.target.operation !== "create" ? ` · ticket ${historicalPlan.decision.disposition.target.ticketId}` : " · création proposée"}.</p>}</details></section>}
+      <section className={styles.decision}><h2>{applicable ? "Actions réellement accomplies" : "Actions historiques conservées"}</h2>
         {data.progress ? <ol className={styles.effects}>{data.progress.effects.map(effect => <li key={effect.id}>
           <span>{effectLabels[effect.kind] ?? effect.kind}</span><strong>{stateLabels[effect.state] ?? effect.state}</strong>
           {effect.confirmedAt && <time>{formatParisDateTime(effect.confirmedAt)}</time>}</li>)}</ol> : <p>Aucun effet n’a été engagé.</p>}

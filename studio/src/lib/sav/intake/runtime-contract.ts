@@ -1,3 +1,4 @@
+import { SAV_INTAKE_OPERATIONAL_PROFILE, intakeOperationalTermValid } from "./budget-profile";
 import { createHash } from "node:crypto";
 import { z } from "zod";
 import { SAV_INTAKE_MODEL_REVISION } from "./model-readers";
@@ -15,14 +16,16 @@ const policySchema = z.object({
     multiTicketWarning: resource.extend({ text: z.string().min(1).max(4000) }).optional(),
     partnership: resource.optional(), commercial: resource.optional(), investor: resource.optional() }).strict(),
 }).strict();
-const pins = z.object({ mailboxId: z.uuid(), createdAfter: z.iso.datetime(), receivedAfter: z.iso.datetime(), expiresAt: z.iso.datetime(), codeRevision: z.string().regex(/^[a-f0-9]{40}$/),
-  resourcesHash: z.string().regex(/^[a-f0-9]{64}$/), policyHash: z.string().regex(/^[a-f0-9]{64}$/), maxNanoUsd: z.number().int().min(1).max(3_000_000_000), maxCalls: z.number().int().min(1).max(30) }).strict();
-export type IntakeRuntimeConfig = z.infer<typeof pins> & { mode: "observe"; policy: EnginePolicy; configHash: string; model: "gemini-3.6-flash" };
+export const savIntakeRuntimePins = z.object({ mailboxId: z.uuid(), createdAfter: z.iso.datetime(), receivedAfter: z.iso.datetime(), expiresAt: z.iso.datetime(), codeRevision: z.string().regex(/^[a-f0-9]{40}$/),
+  resourcesHash: z.string().regex(/^[a-f0-9]{64}$/), policyHash: z.string().regex(/^[a-f0-9]{64}$/), maxNanoUsd: z.number().int().min(1).max(3_000_000_000), maxCalls: z.number().int().min(1).max(300),
+  budgetProfile: z.literal(SAV_INTAKE_OPERATIONAL_PROFILE).optional(), maxRollingNanoUsd: z.number().int().min(1).max(90_000_000_000).optional() }).strict().refine(p =>
+    p.budgetProfile === SAV_INTAKE_OPERATIONAL_PROFILE ? p.maxRollingNanoUsd !== undefined : p.maxCalls <= 30 && p.maxRollingNanoUsd === undefined);
+export type IntakeRuntimeConfig = z.infer<typeof savIntakeRuntimePins> & { mode: "observe"; policy: EnginePolicy; configHash: string; model: "gemini-3.6-flash" };
 /** No permissive defaults, campaign resets or hidden reuse of another budget. */
 export function savIntakeRuntimeConfig(env: Record<string, string | undefined> = process.env, now = new Date()): IntakeRuntimeConfig | null {
   if (env.SAV_INTAKE_RUNTIME_MODE !== "observe") return null;
   try {
-    const p = pins.parse(JSON.parse(env.SAV_INTAKE_RUNTIME_CONFIG ?? ""));
+    const p = savIntakeRuntimePins.parse(JSON.parse(env.SAV_INTAKE_RUNTIME_CONFIG ?? ""));
     if ((env.SAV_INTAKE_RUNTIME_POLICY?.length ?? 0) > 32_000 || (env.SAV_INTAKE_RUNTIME_RESOURCES?.length ?? 0) > 64_000) throw Error();
     const rawPolicy = JSON.parse(env.SAV_INTAKE_RUNTIME_POLICY ?? ""), policy = policySchema.parse(rawPolicy);
     const catalogue = z.array(z.object({ resource: resource, text: z.string().min(1).max(8000), approvalId: z.string().min(1).max(200),
@@ -34,8 +37,8 @@ export function savIntakeRuntimeConfig(env: Record<string, string | undefined> =
       if (!approved || kind === "multiTicketWarning" && approved.text !== policy.resources.multiTicketWarning?.text) throw Error();
     }
     if (intakeRuntimeHash(rawPolicy) !== p.policyHash || (env.VERCEL_GIT_COMMIT_SHA ?? env.SAV_CODE_REVISION) !== p.codeRevision || env.SAV_AI_MODEL !== "gemini-3.6-flash"
-      || !Number.isFinite(now.getTime()) || Date.parse(p.createdAfter) > now.getTime() || now.getTime() - Date.parse(p.createdAfter) > 86_400_000 || Date.parse(p.receivedAfter) >= Date.parse(p.expiresAt) || now.getTime() >= Date.parse(p.expiresAt)
-      || Date.parse(p.expiresAt) - now.getTime() > 86_400_000 || !env.SAV_GEMINI_API_KEY || !env.HUBSPOT_ACCESS_TOKEN
+      || !Number.isFinite(now.getTime()) || Date.parse(p.createdAfter) > now.getTime() || (p.budgetProfile !== SAV_INTAKE_OPERATIONAL_PROFILE && now.getTime() - Date.parse(p.createdAfter) > 86_400_000) || Date.parse(p.receivedAfter) >= Date.parse(p.expiresAt) || now.getTime() >= Date.parse(p.expiresAt)
+      || (p.budgetProfile === SAV_INTAKE_OPERATIONAL_PROFILE ? !intakeOperationalTermValid(p.expiresAt,now) : Date.parse(p.expiresAt) - now.getTime() > 86_400_000) || !env.SAV_GEMINI_API_KEY || !env.HUBSPOT_ACCESS_TOKEN
       || (env.SAV_ENCRYPTION_KEY_V1?.length ?? 0) < 32) throw Error();
     const warning = policy.resources.multiTicketWarning;
     if (warning && createHash("sha256").update(warning.text).digest("hex") !== warning.sha256) throw Error();

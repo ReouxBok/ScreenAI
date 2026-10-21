@@ -9,6 +9,7 @@ import type { IntakeRuntimePayload } from "./runtime-contract";
 import { savIntakeViewSchema, type SavIntakeView } from "./contract";
 import { intakeConsoleInstalled } from "./console-capability";
 import { savIntakeSourceSnapshot } from "./runtime-store";
+import { intakeDossierSensitive } from "./observation-binding";
 import { readIntakeExecutionProgress } from "./executor";
 export type ConsoleProjection = { view: SavIntakeView | null; status: string; reason: string | null };
 /** Runs only in the worker. CAS against the monotone source epoch means a new
@@ -41,10 +42,11 @@ export async function projectIntakeThread(threadId: string, beforePublish?: () =
         const [binding] = await db.select().from(savIntakeObservationBindings).where(eq(savIntakeObservationBindings.executionId, progress.executionId));
         const [observation] = binding ? await db.select().from(savResolutionObservations).where(eq(savResolutionObservations.id, binding.observationId)) : [];
         const [cycle] = observation ? await db.select().from(savObservationCycles).where(and(eq(savObservationCycles.observationId, observation.id), eq(savObservationCycles.cycle, observation.cycle))) : [];
+        const sensitive = Boolean(binding?.sensitive || await intakeDossierSensitive(threadId,progress.ticketId));
         const started = Boolean(observation?.lastSyncAt && !observation.sourceErrors.length && observation.state !== "sources_incomplete" && cycle && cycle.status !== "unknown");
-        const finished = started && observation!.closed && Boolean(cycle && (binding.sensitive || ["resolved","closed_without_resolution","abandoned","duplicate"].includes(cycle.qualification ?? "") || ["new","already_covered","amendment","not_reusable","insufficient_evidence","conflict","candidate_revision_required","specialist_review_required","candidate_created","candidate_updated","candidate_linked","admitted","grouped","not_applicable"].includes(cycle.learningDisposition ?? "")));
-        result = finished ? { view: "completed", status: binding.sensitive ? "not_applicable_sensitive" : "summary_finished", reason: null }
-          : started ? { view: binding.sensitive ? "sensitive" : "learning", status: "followup_started", reason: null }
+        const finished = started && observation!.closed && Boolean(cycle && (sensitive || ["resolved","closed_without_resolution","abandoned","duplicate"].includes(cycle.qualification ?? "") || ["new","already_covered","amendment","not_reusable","insufficient_evidence","conflict","candidate_revision_required","specialist_review_required","candidate_created","candidate_updated","candidate_linked","admitted","grouped","not_applicable"].includes(cycle.learningDisposition ?? "")));
+        result = finished ? { view: "completed", status: sensitive ? "not_applicable_sensitive" : "summary_finished", reason: null }
+          : started ? { view: sensitive ? "sensitive" : "learning", status: "followup_started", reason: null }
           : { view: null, status: "followup_pending", reason: observation?.sourceErrors.length ? "Collecte du suivi incomplète" : "Actions confirmées, premier suivi en attente" };
       }
     } else if (plan?.progress.kind === "qualified_other" && progress?.state === "refused" && progress.effects.length === 0) result = { view: "other", status: "qualified_other", reason: null };

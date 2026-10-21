@@ -332,7 +332,7 @@ export async function ingestInboundMessage(rawInput: unknown) {
   if (await intakeMessageHistorical(result.message.id)) return { ...result, archivedFromAutomation: true as const };
   await enqueueSavTranslation(result.message.id).catch(()=>undefined);
   const intake = await enqueueConfiguredSavIntake(result.message.id).catch(() => ({ deferred: true as const }));
-  if (("runId" in intake && intake.runId) || "deferred" in intake || "archived" in intake) return { ...result, queuedForIntake: true as const };
+  if (("runId" in intake && intake.runId) || "deferred" in intake || "archived" in intake || "held" in intake) return { ...result, queuedForIntake: true as const };
   if (isSavPilotMode()) return { ...result, queuedForPilot: true as const };
   const decision = await processStoredSavMessage(result.message.id);
   return { ...result, decision };
@@ -346,7 +346,7 @@ export function analyzeStoredSavMessage(input: Parameters<typeof analyzeSavMessa
 export async function processStoredSavMessage(messageId: string) {
   if (await intakeMessageHistorical(messageId)) return null;
   const intake = await enqueueConfiguredSavIntake(messageId);
-  if ("archived" in intake || "runId" in intake && intake.runId) return null;
+  if ("held" in intake || "archived" in intake || "runId" in intake && intake.runId) return null;
   if (isSavPilotMode()) return null;
   const db = requireDb();
   const staleBefore = new Date(Date.now() - 10 * 60 * 1_000);

@@ -1,4 +1,5 @@
 import "server-only";
+import { SAV_INTAKE_OPERATIONAL_PROFILE, intakeAdmissionUsage } from "./budget-profile";
 import { intakeConsoleInstalled } from "./console-capability";
 import { intakeRunConfigurationBound, intakeHumanRefused } from "./human-binding";
 import { randomUUID } from "node:crypto";
@@ -103,7 +104,7 @@ export async function admitIntakeExecution(runId: string, options: ExecutionOpti
     if (plan.fingerprint !== savIntakePlanFingerprint(plan) || plan.decision.messageId !== run.messageId)
         return fault("PLAN_INVALID");
     const p = options.policy;
-    if (p.mailboxId !== options.runtime.mailboxId || p.enginePolicyHash !== options.runtime.policyHash || p.resourcesHash !== options.runtime.resourcesHash || p.admission.kind === "qualification" && !p.admission.runIds.includes(runId))
+    if (p.budgetProfile !== options.runtime.budgetProfile || p.mailboxId !== options.runtime.mailboxId || p.enginePolicyHash !== options.runtime.policyHash || p.resourcesHash !== options.runtime.resourcesHash || p.admission.kind === "qualification" && !p.admission.runIds.includes(runId))
         return fault("NOT_ADMITTED");
     return requireDb().transaction(async (tx) => {
         await admissionLock(tx);
@@ -116,9 +117,9 @@ export async function admitIntakeExecution(runId: string, options: ExecutionOpti
             return fault("NOT_ADMITTED");
         const [budget] = await tx.select().from(savIntakeExecutionBudget).where(eq(savIntakeExecutionBudget.id, "global")).for("update");
         const old = await tx.select({
-            id: savIntakeExecutions.id
+            id: savIntakeExecutions.id, createdAt:savIntakeExecutions.createdAt
         }).from(savIntakeExecutions);
-        if (!budget || budget.admitted !== old.length || budget.admitted >= p.maxDossiers)
+        if (!budget || budget.admitted !== old.length || intakeAdmissionUsage(old,p.budgetProfile===SAV_INTAKE_OPERATIONAL_PROFILE) >= p.maxDossiers)
             return fault("ADMISSION_LIMIT");
         const keys = [`thread:${thread.id}`, ...(plan.decision.disposition.kind === "ticket" ? plan.decision.disposition.contactScope.contacts.map(c => `contact:${c.contactId}`) : []), ...(plan.candidateContactIds ?? []).map(id => `contact:${id}`)];
         if (plan.decision.disposition.kind === "ticket" && plan.decision.disposition.target.operation !== "create")

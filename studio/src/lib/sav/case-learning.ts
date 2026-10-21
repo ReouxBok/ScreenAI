@@ -33,7 +33,8 @@ export async function ensureSavCaseObservationTx(tx:Tx, messageId:string, origin
   if (!thread || !currentRun) return null;
   const snapshot = await captureSavAnalysisSnapshot(tx,currentRun.id);
   const rows = await tx.select().from(savResolutionObservations).where(eq(savResolutionObservations.threadId,thread.id));
-  const existing = rows.find(r=>r.hubspotTicketId===thread.hubspotTicketId) ?? rows.find(r=>!r.hubspotTicketId);
+  const compatible=rows.filter(r=>r.trackingOrigin!=="intake" && r.messageId===messageId);
+  const existing = compatible.find(r=>r.hubspotTicketId===thread.hubspotTicketId) ?? compatible.find(r=>!r.hubspotTicketId);
   if (existing) {
     await tx.update(savResolutionObservations).set({snapshotId:existing.snapshotId ?? snapshot?.id,hubspotTicketId:thread.hubspotTicketId,nextSyncAt:new Date(),closedCatchupUntil:null}).where(eq(savResolutionObservations.id,existing.id));
     return existing.id;

@@ -1,8 +1,8 @@
 import "server-only";
-import { eq, sql } from "drizzle-orm";
+import { eq, sql, type SQLWrapper } from "drizzle-orm";
 import { z } from "zod";
 import { requireDb } from "@/db";
-import { savSyncState, savMessages, savMailboxes, staffUsers, auditLogs } from "@/db/schema";
+import { savSyncState, savMessages, savThreads, savMailboxes, staffUsers, auditLogs } from "@/db/schema";
 import { intakeConsoleInstalled } from "./console-capability";
 import type { IntakeRuntimeConfig } from "./runtime-contract";
 
@@ -62,4 +62,43 @@ export async function recordIntakeLaunch(raw: unknown) {
       on conflict(thread_id) do update set epoch=sav.intake_console.epoch+1,updated_at=now()`);
     return launch;
   });
+}
+
+/** A launched mailbox owns future arrivals even while runtime writers/models
+ * remain OFF. No tables0040/41/42 are read; legacy analysis cannot take over. */
+export async function parkLaunchedIntakeMessage(messageId: string) {
+  const db=requireDb();
+  if (!await intakeConsoleInstalled(db)) return null;
+  const [marker]=await db.select({key:savSyncState.key}).from(savSyncState).where(eq(savSyncState.status,"intake_launch_v1")).limit(1);
+  if (!marker) return null;
+  return db.transaction(async tx=>{
+    const [message]=await tx.select().from(savMessages).where(eq(savMessages.id,messageId));
+    if (!message || message.direction!=="inbound") return null;
+    const launch=await readIntakeLaunch(message.mailboxId,tx);
+    if (!launch) return null;
+    if (message.receivedAt.getTime()<=Date.parse(launch.receivedAfter)||message.createdAt.getTime()<=Date.parse(launch.createdAfter)) return {archived:true as const};
+    await tx.select({id:savThreads.id}).from(savThreads).where(eq(savThreads.id,message.threadId)).for("update");
+    // CAS never steals an already started legacy decision/action. Such workers
+    // must be stopped for rollout; their existing evidence remains untouched.
+    await tx.update(savMessages).set({analysisStatus:"intake_pending"}).where(sql`${savMessages.id}=${messageId}
+      and ${savMessages.analysisStatus}='pending' and ${savMessages.analysisAttempts}=0
+      and ${savMessages.analysisStartedAt} is null and ${savMessages.processedAt} is null
+      and not exists(select 1 from sav.decisions d where d.message_id=${messageId})
+      and not exists(select 1 from sav.actions a where a.message_id=${messageId})`);
+    return {held:true as const};
+  });
+}
+
+/** Worker candidate filter before LIMIT; source/proof readers do not use it. */
+export function historicalMessageForIdSql(messageId:SQLWrapper) {
+  return sql`exists(select 1 from sav.messages where ${savMessages.id}=${messageId} and ${historicalMessageSql()})`;
+}
+export function historicalThreadSql(threadId:SQLWrapper) {
+  return sql`exists(select 1 from sav.messages where ${savMessages.id}=(select latest.id from sav.messages latest where latest.thread_id=${threadId} and latest.direction='inbound' order by latest.received_at desc,latest.created_at desc,latest.id desc limit 1) and ${historicalMessageSql()})`;
+}
+
+export async function hasIntakeLaunch() {
+  if(!await intakeConsoleInstalled())return false;
+  const [row]=await requireDb().select({key:savSyncState.key}).from(savSyncState).where(eq(savSyncState.status,"intake_launch_v1")).limit(1);
+  return Boolean(row);
 }

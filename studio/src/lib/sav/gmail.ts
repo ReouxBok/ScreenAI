@@ -1,5 +1,6 @@
 import { buildSavInboundContext } from "./message-context";
 import "server-only";
+import {historicalMessageForIdSql,historicalThreadSql} from "./intake/launch-boundary";
 import { withLegacyOccupationAction, markLegacyIntakeDispatch, releaseLegacyIntakeIfConfirmed } from "./intake/legacy-occupation";
 
 import { timingSafeEqual } from "node:crypto";
@@ -770,6 +771,7 @@ export async function processPendingGmailSendActions(limit = 20, onlyActionId?: 
   const candidates = await db.select().from(savActions)
     .where(and(
       inArray(savActions.kind, [...allowedKinds]),
+      sql`not (${historicalMessageForIdSql(savActions.messageId)} or (${savActions.messageId} is null and ${historicalThreadSql(savActions.threadId)}))`,
       onlyActionId ? eq(savActions.id, onlyActionId) : undefined,
       isNull(savActions.pilotBatchId),
       or(eq(savActions.status, "pending"), and(eq(savActions.status, "running"), lt(savActions.updatedAt, staleBefore))),
