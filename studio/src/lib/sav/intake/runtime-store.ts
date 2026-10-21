@@ -1,6 +1,6 @@
 import "server-only";
 import { randomUUID } from "node:crypto";
-import { and, desc, eq, gt, inArray, lt, or, sql } from "drizzle-orm";
+import { and, desc, eq, gt, inArray, lt, lte, or, sql } from "drizzle-orm";
 import { requireDb } from "@/db";
 import { savMessages, savThreads, savIntakeRuns, savIntakeJournal, savIntakeModelCalls } from "@/db/schema";
 import { decryptSavPayload, encryptSavPayload } from "../crypto";
@@ -32,7 +32,7 @@ const journal = async (tx: Tx, runId: string, kind: string, value: unknown) => {
   await tx.insert(savIntakeJournal).values({ runId, kind, payloadCiphertext: encryptSavPayload(value) });
 };
 async function snapshot(tx: Tx, message: typeof savMessages.$inferSelect, now: Date) {
-  const rows = await tx.select().from(savMessages).where(and(eq(savMessages.threadId, message.threadId), sql`${savMessages.receivedAt} <= ${message.receivedAt}`))
+  const rows = await tx.select().from(savMessages).where(and(eq(savMessages.threadId, message.threadId), lte(savMessages.receivedAt, message.receivedAt)))
     .orderBy(desc(savMessages.receivedAt), desc(savMessages.createdAt), desc(savMessages.id)).limit(51);
   const prepared = rows.slice(0, 50).map(row => {
     const body = decryptSavPayload<Body>(row.bodyCiphertext);
