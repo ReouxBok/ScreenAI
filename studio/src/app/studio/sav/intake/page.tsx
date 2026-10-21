@@ -8,7 +8,7 @@ import { intakeStatusLabel, intakeReasonLabel } from "@/lib/sav/intake/console-p
 import styles from "./intake.module.css";
 export const dynamic = "force-dynamic";
 export default async function IntakeConsolePage({ searchParams }: { searchParams: Promise<{ view?: string; mailbox?: string; q?: string; page?: string }> }) {
-  await requireIntakeConsoleStaff();
+  const staff=await requireIntakeConsoleStaff();
   const query = await searchParams, selected = savIntakeViewSchema.safeParse(query.view);
   const view = selected.success ? selected.data : "processing", mailbox = z.uuid().safeParse(query.mailbox);
   const data = await listIntakeConsole({ view, mailboxId: mailbox.success ? mailbox.data : undefined, search: query.q, page: Number(query.page) || 1 });
@@ -16,7 +16,7 @@ export default async function IntakeConsolePage({ searchParams }: { searchParams
     ...(mailbox.success ? { mailbox: mailbox.data } : {}), page: String(page) })}`;
   return <div className={styles.console}>
     <header className={styles.heading}><div><span className="eyebrow">SAV · nouveaux dossiers</span><h1>Suivre le traitement</h1>
-      <p>Les actions confirmées et le suivi réel déterminent l’avancement.</p></div><Link className="button secondary" href="/studio/sav?legacy=1">Archives supervisées</Link></header>
+      <p>Les actions confirmées et le suivi réel déterminent l’avancement.</p></div><div className={styles.actions}>{["admin","owner"].includes(staff.role)&&<Link className="button secondary" href="/studio/sav/intake/launch">Administration du lancement</Link>}<Link className="button secondary" href="/studio/sav?legacy=1">Archives supervisées</Link></div></header>
     {!data.installed ? <section className={styles.notice}><h2>Console non préparée</h2><p>Les données de ce parcours ne sont pas encore disponibles. La file supervisée reste accessible.</p></section> : <>
       <nav aria-label="Vues des nouveaux dossiers" className={styles.views}>
         {Object.entries(savIntakeViewLabels).map(([key, label]) => <Link key={key} href={href(key)} aria-current={view === key ? "page" : undefined}>

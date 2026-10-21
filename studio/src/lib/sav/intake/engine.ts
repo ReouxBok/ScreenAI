@@ -240,6 +240,8 @@ export async function planSavIntake(
         permissionRequired: "send_identity_template", learning: "not_started", evidenceIds: identityEvidenceIds }, { kind: "processing", phase: "dispatch", view: null });
     }
     function contactEvidence(c: IntakeContact, observedAt: string) { return addEvidence(`contact-${c.id}`, "crm_contact", c.id, { ...c, emails: unique(c.emails.map(normalizeEmail)).sort() }, observedAt); }
+    const expectedHumanCandidates=input.humanResolution?.equivalentContactIds;
+    if(expectedHumanCandidates?.length && canonical(contacts.map(c=>c.id).sort())!==canonical([...expectedHumanCandidates].sort())) return context("contact_ambiguous");
     if (contacts.length > 1) {
       candidateContactIds = contacts.map(c => c.id);
       for (const c of contacts) contactEvidence(c, lookup.observedAt);

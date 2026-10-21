@@ -10,7 +10,7 @@
 .controls { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 16px; }
 .processing { display: flex; gap: 14px; padding: 10px 12px; border-radius: 8px; border: 1px solid var(--line); font-size: 12px; }
 .search { display: flex; gap: 8px; margin: 0; }
-.search input, .choice select, .choice textarea { border: 1px solid var(--line); background: var(--paper); border-radius: 8px; padding: 9px 10px; font: inherit; color: var(--ink); min-width: 0; }
+.search input, .choice select, .choice textarea, .choice input:not([type=radio]):not([type=hidden]) { border: 1px solid var(--line); background: var(--paper); border-radius: 8px; padding: 9px 10px; font: inherit; color: var(--ink); min-width: 0; }
 .search input { width: min(260px, 45vw); font-size: 13px; }
 .search button, .actions button { padding: 8px 12px; min-height: 36px; font-size: 12px; line-height: 20px; }
 .list { border-top: 1px solid var(--line); border-bottom: 1px solid var(--line); }
@@ -68,3 +68,5 @@
   .decision, .choice, .history { padding: 18px; }
   .pagination { align-items: flex-start; }
 }
+
+.adminForms { display: grid; gap: 18px; max-width: 920px; }

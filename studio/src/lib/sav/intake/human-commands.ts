@@ -9,7 +9,7 @@ import { canAccessSav } from "../access";
 import { admissionLock, releaseKeys } from "./execution-store";
 import { intakeRuntimeHash, type IntakeRuntimePayload } from "./runtime-contract";
 import { intakeConsoleInstalled } from "./console-capability";
-import { intakeHumanRefused, type HumanEventPayload } from "./human-binding";
+import { intakeHumanRefused, intakeRunCandidateContactIds, type HumanEventPayload } from "./human-binding";
 import { requireIntakeConsoleStaff } from "./console-auth";
 import { savIntakeSourceSnapshot } from "./runtime-store";
 export const intakeHumanCommandSchema = z.object({
@@ -37,6 +37,7 @@ export async function recordIntakeHumanCommand(raw: unknown) {
       return { eventId: replayed.id, status: "recorded" as const };
     }
     const [execution] = await tx.select().from(savIntakeExecutions).where(eq(savIntakeExecutions.messageId, command.messageId)).for("update");
+    if(execution?.state==="confirmed")throw Error("SAV_INTAKE_HUMAN_CONFLICT");
     const [thread] = await tx.select().from(savThreads).where(eq(savThreads.id, command.threadId)).for("update");
     const [run] = await tx.select().from(savIntakeRuns).where(eq(savIntakeRuns.id, command.runId)).for("update");
     const [message] = await tx.select().from(savMessages).where(and(eq(savMessages.threadId, command.threadId), eq(savMessages.direction, "inbound")))
@@ -45,7 +46,8 @@ export async function recordIntakeHumanCommand(raw: unknown) {
     if (!thread || thread.aiPaused || !run?.isCurrent || run.threadId !== thread.id || run.messageId !== command.messageId
       || message?.id !== command.messageId || run.version !== command.version || run.sourceHash !== command.sourceHash || pending.length
       || (await savIntakeSourceSnapshot(tx, message, new Date())).sourceHash !== run.sourceHash || await intakeHumanRefused(command.messageId, tx)) throw Error("SAV_INTAKE_HUMAN_CONFLICT");
-    const payload = decryptSavPayload<IntakeRuntimePayload>(run.payloadCiphertext), candidates = [...(payload.plan?.candidateContactIds ?? [])].sort();
+    const payload = decryptSavPayload<IntakeRuntimePayload>(run.payloadCiphertext), candidates = await intakeRunCandidateContactIds(run,payload,tx);
+    if(!candidates)throw Error("SAV_INTAKE_HUMAN_CONFLICT");
     const receipts = execution ? await tx.select().from(savIntakeEffects).where(and(eq(savIntakeEffects.executionId,execution.id),eq(savIntakeEffects.kind,"ticket_create"),eq(savIntakeEffects.state,"confirmed"))) : [];
     const confirmedTicketIds = receipts.flatMap(e=>e.ackCiphertext && e.verificationCiphertext ? [decryptSavPayload<{id:string}>(e.ackCiphertext).id] : []);
     const candidateTickets = [...confirmedTicketIds,...(payload.plan?.decision.evidence.filter(e => e.source === "crm_ticket" && /^\d+$/.test(e.sourceId)).map(e => e.sourceId) ?? [])];

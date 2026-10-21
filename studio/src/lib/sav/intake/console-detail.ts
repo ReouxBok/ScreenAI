@@ -33,7 +33,9 @@ export async function readIntakeConsoleDetail(threadId: string) {
     return { id: event.id, kind: event.kind, state: event.state, at: event.createdAt, actor: payload.actor.email,
       reason: payload.reason, parentVersion: event.parentVersion, contactId: payload.contactId, ticketId: payload.ticketId };
   });
-  return { thread: { id: thread.id, subject: latest?.subject ?? thread.subject, paused: thread.aiPaused, ticketId: thread.hubspotTicketId },
+  const progress=latest ? await readIntakeExecutionProgress(latest.id) : null;
+  const confirmedCurrent=Boolean(current && current.messageId===latest?.id && progress?.confirmed && progress.runId===current.id && progress.completionSourceHash && progress.completionSourceHash===current.currentSourceHash);
+  return { confirmedCurrent, thread: { id: thread.id, subject: latest?.subject ?? thread.subject, paused: thread.aiPaused, ticketId: thread.hubspotTicketId },
     projection, latestMessageId: latest?.id ?? null, current, messages, historyTruncated: rows.length > 200,
-    progress: latest ? await readIntakeExecutionProgress(latest.id) : null, choices };
+    progress, choices };
 }

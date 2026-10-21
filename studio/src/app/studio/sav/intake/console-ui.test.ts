@@ -19,10 +19,10 @@ const fixture={installed:true,counts:{learning:1,missing_contact:1,to_validate:2
   threadId,mailboxId:"10000000-0000-4000-8000-000000000004",messageId,version:7,subject:"Connexion interrompue après une modification de configuration — demande synthétique complète et longue",fromEmail:"fiction@example.invalid",receivedAt:at,updatedAt:at,
   view:null,status:"waiting",reason:"SAV_INTAKE_RUNTIME_BUDGET_EXHAUSTED"}],page:1,pages:2,total:26};
 const detail={thread:{id:threadId,subject:fixture.rows[0].subject,paused:false,ticketId:null},projection:{epoch:1,projectedEpoch:1,status:"human_choice",reason:null},latestMessageId:messageId,
-  current:{id:runId,messageId,sourceHash:"a".repeat(64),version:7,sourceMatches:true,payload:{reason:"SAV_INTAKE_RUNTIME_USAGE_UNCERTAIN",plan:{candidateContactIds:["101","102"],decision:{classification:"support",disposition:{kind:"collect_context",reasons:["contact_ambiguous"]},evidence:[{id:"current",source:"current_message",sourceId:messageId,observedAt:at.toISOString()}]}}}},
+  current:{id:runId,messageId,candidateContactIds:["101","102"],sourceHash:"a".repeat(64),version:7,sourceMatches:true,payload:{reason:"SAV_INTAKE_RUNTIME_USAGE_UNCERTAIN",plan:{candidateContactIds:["101","102"],decision:{classification:"support",disposition:{kind:"collect_context",reasons:["contact_ambiguous"]},evidence:[{id:"current",source:"current_message",sourceId:messageId,observedAt:at.toISOString()}]}}}},
   messages:[{id:messageId,direction:"inbound",fromEmail:"fiction@example.invalid",receivedAt:at,createdAt:at,body:{text:"My synthetic connection no longer works. Please inspect this complete test request.",attachments:[]},translation:{status:"complete",language:"en",text:"Ma connexion synthétique ne fonctionne plus. Merci de vérifier cette demande de test complète.",revision:"synthetic",sourceHash:"synthetic",errorCode:null}}],historyTruncated:false,
   progress:{confirmed:false,state:"uncertain",ticketId:"201",reason:"SAV_INTAKE_EXECUTION_RECONCILIATION_REQUIRED",effects:[{id:"effect-1",kind:"ticket_create",state:"confirmed",confirmedAt:at},{id:"effect-2",kind:"email_associate",state:"uncertain",confirmedAt:null}]},choices:[]};
-beforeEach(()=>{vi.clearAllMocks();mocks.staff.mockResolvedValue({id:"synthetic",email:"ugo@limova.ai"});mocks.list.mockResolvedValue(fixture);mocks.detail.mockResolvedValue(detail);});
+beforeEach(()=>{vi.clearAllMocks();mocks.staff.mockResolvedValue({id:"synthetic",email:"ugo@limova.ai",role:"admin"});mocks.list.mockResolvedValue(fixture);mocks.detail.mockResolvedValue(detail);});
 const renderList=async(query:{view?:string;q?:string;page?:string}={})=>renderToStaticMarkup(createElement(Fragment,null,await IntakeConsolePage({searchParams:Promise.resolve(query)})));
 const renderDetail=async()=>renderToStaticMarkup(createElement(Fragment,null,await IntakeDetailPage({params:Promise.resolve({id:threadId})})));
 it("six business views and distinct technical area use supplied counts and French states, without actions on GET",async()=>{
@@ -65,4 +65,10 @@ it("a new inbound or edited source cannot present the former plan as the current
     expect(currentPanel).toContain("Analyse en cours ou attente technique");expect(currentPanel).not.toContain("Classification");expect(currentPanel).not.toContain("Fiche proposée");
     expect(html).not.toContain('name="sourceHash"');expect(mocks.action).not.toHaveBeenCalled();
   }
+});
+
+it("confirmed own deltas render a current verified result, never a new correction form",async()=>{
+  mocks.detail.mockResolvedValue({...detail,confirmedCurrent:true,current:{...detail.current,sourceMatches:false},progress:{...detail.progress,confirmed:true}});
+  const html=await renderDetail();expect(html).toContain("Résultat confirmé pour cette demande");expect(html).toContain("Actions réellement accomplies");
+  expect(html).not.toContain("Dernière analyse historique");expect(html).not.toContain('name="sourceHash"');
 });

@@ -22,16 +22,16 @@ export default async function IntakeDetailPage({ params }: { params: Promise<{ i
   const data = await readIntakeConsoleDetail(id);
   if (!data) notFound();
   const current = data.current;
-  const applicable = Boolean(current && current.messageId === data.latestMessageId && current.sourceMatches);
+  const applicable = Boolean(data.confirmedCurrent || current && current.messageId === data.latestMessageId && current.sourceMatches);
   const plan = applicable ? current?.payload.plan : undefined, disposition = plan?.decision.disposition;
   const historicalPlan = !applicable ? current?.payload.plan : undefined;
-  const contacts = [...(plan?.candidateContactIds ?? [])].sort();
+  const contacts = [...(current?.candidateContactIds ?? [])].sort();
   const tickets = [...new Set([...(data.progress?.effects.filter(e=>e.kind==="ticket_create"&&e.state==="confirmed"&&e.ack?.id).map(e=>e.ack!.id!)??[]),...(plan?.decision.evidence.filter(e => e.source === "crm_ticket" && /^\d+$/.test(e.sourceId)).map(e => e.sourceId) ?? [])])];
   const target = disposition?.kind === "ticket" ? disposition.target : null;
   const portal = process.env.HUBSPOT_PORTAL_ID;
   const ticketUrl = portal && /^\d+$/.test(portal) && data.progress?.confirmed && data.progress.ticketId ? `https://app.hubspot.com/contacts/${portal}/ticket/${encodeURIComponent(data.progress.ticketId)}` : null;
   const dirty = data.projection.epoch !== data.projection.projectedEpoch;
-  const canCorrect = data.projection.status !== "historical_outside_automation" && Boolean(current && current.messageId === data.latestMessageId && current.sourceMatches && current.sourceHash && plan && !data.thread.paused
+  const canCorrect = data.projection.status !== "historical_outside_automation" && Boolean(current && current.messageId === data.latestMessageId && current.sourceMatches && current.candidateContactIds !== null && !data.progress?.confirmed && current.sourceHash && plan && !data.thread.paused
     && !data.choices.some(event => event.kind === "refuse" && event.parentVersion === current.version)
     && !data.choices.some(event => ["pending", "reading"].includes(event.state)));
   return <div className={styles.console}>
@@ -39,7 +39,7 @@ export default async function IntakeDetailPage({ params }: { params: Promise<{ i
     <header className={styles.heading}><div><span className="eyebrow">Dossier · version {current?.version ?? "en attente"}</span><h1>{data.thread.subject || "Nouvelle demande"}</h1>
       <p>{dirty ? "Mise à jour du traitement en cours" : intakeReasonLabel(data.projection.reason) ?? intakeStatusLabel(data.projection.status)}</p></div></header>
     <div className={styles.detailGrid}><div>
-      <section className={styles.decision}><h2>Décision actuelle</h2>
+      <section className={styles.decision}><h2>{data.confirmedCurrent ? "Résultat confirmé pour cette demande" : "Décision actuelle"}</h2>
         {data.projection.status === "historical_outside_automation" ? <p>Historique conservé, hors automatisation. Un nouvel entrant après le lancement reprendra normalement avec cet historique.</p> : !plan ? <p>Analyse en cours ou attente technique. Aucune action n’est présentée comme accomplie.</p> : <>
           <dl><div><dt>Classification</dt><dd>{plan.decision.classification}</dd></div><div><dt>Parcours</dt><dd>{disposition?.kind === "ticket" ? target?.operation === "create" ? "Créer une fiche ticket" : target?.operation === "reopen" ? "Rouvrir le ticket" : "Rattacher au ticket"
             : disposition?.kind === "request_identification" ? "Demander l’adresse d’inscription" : disposition?.kind === "collect_context" ? "Compléter les preuves" : "Sans ticket"}</dd></div>

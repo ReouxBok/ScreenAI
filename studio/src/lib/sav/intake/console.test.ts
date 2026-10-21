@@ -42,6 +42,7 @@ import { ensureSavCaseObservationTx } from "../case-learning";
 import { readSavCaseLearningQualification } from "../case-qualification";
 import { reviewSavProposal } from "../review";
 import { previewIntakeLaunch, commitIntakeLaunch } from "./launch-admin";
+import { previewLaunchAction, commitLaunchAction, revokeLaunchAction } from "@/app/studio/sav/intake/launch/actions";
 import { POST as adminPost } from "@/app/api/sav/intake-admin/route";
 import { getSavThreadDetail, processStoredSavMessage, processPendingSavMessages } from "../service";
 import { enqueueConfiguredSavIntake, reconcileSavIntakeRuntime } from "./runtime";
@@ -78,7 +79,7 @@ async function observed(multiple = false, sensitive = false, same = true) {
 async function command(kind: "select" | "classify" | "refuse" = "select"): Promise<IntakeHumanCommand> {
   const current = (await readSavIntakeCurrent(threadId))!;
   return { commandKey: randomUUID(), threadId, messageId, runId: current.id, version: current.version, sourceHash: current.sourceHash!,
-    candidatesHash: intakeRuntimeHash([...(current.payload.plan?.candidateContactIds ?? [])].sort()), kind,
+    candidatesHash: intakeRuntimeHash([...(current.candidateContactIds ?? [])].sort()), kind,
     ...(kind === "select" ? { contactId: "102" } : kind === "classify" ? { classification: "other" as const } : {}), reason: "Synthetic verified operator evidence." };
 }
 const mutationsSent = () => p.calls.filter(c => ["PUT", "PATCH"].includes(c.method) || c.method === "POST" && (/^\/crm\/v3\/objects\/(tickets|notes|emails)$/.test(c.path) || c.path === "gmail/messages/send"));
@@ -157,7 +158,8 @@ it("CRM candidate change after CAS cannot reuse the accepted equivalence", async
   p.setContacts([{id:"101",emails:["customer@example.invalid"]},{id:"102",emails:["customer@example.invalid"]},{id:"103",emails:["customer@example.invalid"]}]);
   const result = await consumeIntakeHumanEvent(saved.eventId,options.runtime,createSavIntakeHubspotReaders({network:p.network}));
   expect(result).toHaveProperty("state","waiting");
-  expect((await readSavIntakeCurrent(threadId))?.payload.reason).toBe("SAV_INTAKE_SEMANTIC_CONTEXT_CHANGED");
+  const current = (await readSavIntakeCurrent(threadId))!;
+  expect(current.payload.plan?.decision.disposition).toMatchObject({kind:"collect_context",reasons:expect.arrayContaining(["contact_ambiguous"])});
   expect(mutationsSent()).toHaveLength(0);
 });
 it("identity accepted but issue semantics absent never invents a ticket relation", async () => {
@@ -573,4 +575,40 @@ it("historical pending HubSpot/Gmail actions and followups cannot monopolize the
   expect((await db.db.select().from(savActions).where(eq(savActions.threadId,threadId))).every(a=>a.attemptCount===0&&a.status==="pending")).toBe(true);
   expect((await db.db.select().from(savFollowups).where(eq(savFollowups.id,followup.id)))[0].status).toBe("queued");
   expect((await db.db.select().from(savFollowups).where(eq(savFollowups.threadId,threadId))).every(f=>f.status==="scheduled")).toBe(true);
+});
+
+it("select102 -> Other -> Support/Finance preserves the separately authenticated candidate group",async()=>{
+  await observed(true);expect(await revise("select",{contactId:"102"})).toHaveProperty("state","observed");
+  expect(await revise("classify",{classification:"other"})).toHaveProperty("state","observed");
+  const other=(await readSavIntakeCurrent(threadId))!;expect(other.payload.plan?.candidateContactIds).toBeUndefined();expect(other.candidateContactIds).toEqual(["101","102"]);
+  expect(await revise("classify",{classification:"support"})).toHaveProperty("state","observed");
+  expect((await readSavIntakeCurrent(threadId))?.payload.plan?.decision).toMatchObject({classification:"support",disposition:{kind:"ticket",target:{contactId:"102"}}});
+  expect(await revise("classify",{classification:"other"})).toHaveProperty("state","observed");
+  expect(await revise("classify",{classification:"finance"})).toHaveProperty("state","observed");
+  expect((await readSavIntakeCurrent(threadId))?.payload.plan?.decision).toMatchObject({classification:"finance",disposition:{kind:"ticket",target:{contactId:"102"}}});
+  expect((await db.db.select().from(savIntakeRuns)).reduce((sum,r)=>sum+r.attempts,0)).toBe(1);expect(await db.db.select().from(savIntakeModelCalls)).toHaveLength(0);expect(mutationsSent()).toHaveLength(0);
+});
+it("returning from Other still revalidates real CRM candidates rather than trusting the inherited group",async()=>{
+  await observed(true);await revise("select",{contactId:"102"});await revise("classify",{classification:"other"});
+  p.setContacts([{id:"101",emails:["customer@example.invalid"]}]);
+  const result=await revise("classify",{classification:"support"});
+  expect("waiting" in result||"state" in result&&result.state==="waiting").toBe(true);expect(mutationsSent()).toHaveLength(0);
+});
+it("confirmed own local deltas show a current completion result without enabling another human execution",async()=>{
+  await observed();const execution=(await admitIntakeExecution(runId,options))!;await executeIntakePass(execution.id,options);
+  const detail=(await readIntakeConsoleDetail(threadId))!;
+  expect(detail.current?.sourceMatches).toBe(false);expect(detail.confirmedCurrent).toBe(true);expect(detail.progress?.confirmed).toBe(true);
+  await expect(recordIntakeHumanCommand(await command("classify"))).rejects.toThrow("HUMAN_CONFLICT");
+  await db.db.update(savMessages).set({bodyCiphertext:encryptSavPayload({text:"Actual later source edit",headers:{},attachments:[]})}).where(eq(savMessages.id,messageId));
+  expect((await readIntakeConsoleDetail(threadId))?.confirmedCurrent).toBe(false);
+});
+it("administrator server actions preserve the same exact preview/commit/revoke primitives with no provider effects",async()=>{
+  for(const [key,value] of Object.entries(environment))if(value!==undefined)vi.stubEnv(key,value);vi.stubEnv("SAV_INTAKE_RUNTIME_MODE","off");
+  const form=new FormData();form.set("commandId",randomUUID());form.set("configuration",JSON.stringify({runtime:JSON.parse(environment.SAV_INTAKE_RUNTIME_CONFIG!),policy:options.policy}));
+  const preview=await previewLaunchAction({ok:false,message:""},form);expect(preview.ok).toBe(true);expect(await readIntakeLaunch(mailboxId)).toBeNull();
+  const confirmation=new FormData();confirmation.set("previewId",preview.preview!.id);confirmation.set("hash",preview.preview!.hash);
+  const committed=await commitLaunchAction({ok:false,message:""},confirmation);expect(committed.ok).toBe(true);expect(await commitLaunchAction(committed,confirmation)).toEqual(committed);
+  const revoked=new FormData();revoked.set("policyId",committed.receipt!.policyId);revoked.set("reason","Synthetic explicit authority revocation.");
+  expect(await revokeLaunchAction({ok:false,message:""},revoked)).toHaveProperty("ok",true);expect(await revokeLaunchAction({ok:false,message:""},revoked)).toHaveProperty("ok",true);
+  expect(fetch).not.toHaveBeenCalled();expect(mutationsSent()).toHaveLength(0);
 });

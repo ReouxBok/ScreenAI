@@ -2,7 +2,7 @@ import "server-only";
 import { SAV_INTAKE_OPERATIONAL_PROFILE, intakeBudgetUsage } from "./budget-profile";
 import { intakeLaunchMatches } from "./launch-boundary";
 import { intakeConsoleInstalled } from "./console-capability";
-import { intakeRunConfigurationBound, intakeHumanRefused, intakeHasHumanDecision } from "./human-binding";
+import { intakeRunConfigurationBound, intakeHumanRefused, intakeHasHumanDecision, intakeRunCandidateContactIds } from "./human-binding";
 import { randomUUID } from "node:crypto";
 import { and, desc, eq, gt, inArray, lt, lte, or, sql } from "drizzle-orm";
 import { requireDb } from "@/db";
@@ -239,10 +239,13 @@ export async function readSavIntakeCurrent(threadId: string, config?: IntakeRunt
   const [thread] = await db.select().from(savThreads).where(eq(savThreads.id, threadId));
   const [message] = await db.select().from(savMessages).where(and(eq(savMessages.threadId, threadId), eq(savMessages.direction, "inbound")))
     .orderBy(desc(savMessages.receivedAt), desc(savMessages.createdAt), desc(savMessages.id)).limit(1);
-  const sourceMatches = message?.id === run.messageId && await db.transaction(async tx => (await savIntakeSourceSnapshot(tx, message, now)).sourceHash === run.sourceHash);
+  const currentSourceHash = message?.id === run.messageId ? await db.transaction(async tx => (await savIntakeSourceSnapshot(tx, message, now)).sourceHash) : null;
+  const sourceMatches = currentSourceHash !== null && currentSourceHash === run.sourceHash;
+  const payload=decryptSavPayload<IntakeRuntimePayload>(run.payloadCiphertext);
+  const candidateContactIds=await intakeRunCandidateContactIds(run,payload);
   const events = await db.select().from(savIntakeJournal).where(eq(savIntakeJournal.runId, run.id)).orderBy(savIntakeJournal.createdAt, savIntakeJournal.id);
-  return { ...run, sourceMatches, fresh: Boolean(config && Date.parse(config.expiresAt) > now.getTime() && await intakeRunConfigurationBound(run, config) && run.state === "observed" && run.freshUntil && run.freshUntil > now && !thread?.aiPaused && sourceMatches),
-    payload: decryptSavPayload<IntakeRuntimePayload>(run.payloadCiphertext),
+  return { ...run, sourceMatches, currentSourceHash, candidateContactIds, fresh: Boolean(config && Date.parse(config.expiresAt) > now.getTime() && await intakeRunConfigurationBound(run, config) && run.state === "observed" && run.freshUntil && run.freshUntil > now && !thread?.aiPaused && sourceMatches),
+    payload,
     humanChoice: run.humanChoiceCiphertext ? decryptSavPayload<unknown>(run.humanChoiceCiphertext) : null,
     journal: events.map(event => ({ id: event.id, kind: event.kind, createdAt: event.createdAt, payload: decryptSavPayload<unknown>(event.payloadCiphertext) })) };
 }

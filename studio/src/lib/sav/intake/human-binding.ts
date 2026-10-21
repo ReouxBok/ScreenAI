@@ -62,3 +62,22 @@ export async function intakeRunConfigurationBound(run: typeof savIntakeRuns.$inf
     && value.candidatesHash === intakeRuntimeHash(value.candidateContactIds)
     && (!value.contactId || value.candidateContactIds.includes(value.contactId)));
 }
+
+/** Candidate authority survives a decision branch that needs no CRM lookup
+ * (human Other). It comes from the immutable consumed event, not a permissive
+ * empty-plan fallback. The next worker still revalidates every real candidate. */
+export async function intakeRunCandidateContactIds(run:typeof savIntakeRuns.$inferSelect,payload:import("./runtime-contract").IntakeRuntimePayload,db:Pick<ReturnType<typeof requireDb>,"select">=requireDb()):Promise<string[]|null> {
+  if(!run.humanChoiceCiphertext)return [...(payload.plan?.candidateContactIds??[])].sort();
+  if(!await intakeConsoleInstalled(db))return null;
+  const choice=decryptSavPayload<{eventId?:string}>(run.humanChoiceCiphertext);
+  if(!choice.eventId)return null;
+  const [event]=await db.select().from(savIntakeHumanEvents).where(eq(savIntakeHumanEvents.id,choice.eventId));
+  if(!event||event.state!=="consumed"||event.kind==="refuse"||event.revisionRunId!==run.id||event.messageId!==run.messageId||event.threadId!==run.threadId
+    ||event.sourceHash!==run.sourceHash||event.baseConfigHash!==payload.configuration?.configHash||run.configHash!==humanRevisionConfigHash(event.baseConfigHash,event.id))return null;
+  const value=decryptSavPayload<HumanEventPayload>(event.payloadCiphertext);
+  const [parent]=await db.select().from(savIntakeRuns).where(eq(savIntakeRuns.id,event.parentRunId));
+  if(!parent||parent.version!==event.parentVersion||parent.version>=run.version||parent.messageId!==run.messageId||parent.threadId!==run.threadId
+    ||value.parentPayloadHash!==intakeRuntimeHash(decryptSavPayload(parent.payloadCiphertext))||value.policyHash!==run.policyHash||value.resourcesHash!==payload.configuration?.resourcesHash
+    ||value.candidatesHash!==intakeRuntimeHash(value.candidateContactIds)||new Set(value.candidateContactIds).size!==value.candidateContactIds.length)return null;
+  return [...value.candidateContactIds].sort();
+}
