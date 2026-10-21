@@ -1,6 +1,6 @@
 import { describe, it, expect } from "vitest";
 import { evaluationBatch, evaluationEnvironment } from "../../../../test/sav-intake-evaluation";
-import { evaluationBatchSchema, evaluationConfig, evaluationHash, readEvaluationBody, assertEvaluationOrigin, EVALUATION_MAX_BYTES } from "./server-contract";
+import { evaluationBatchSchema, evaluationConfig, evaluationHash, evaluationContinuationProof, readEvaluationBody, assertEvaluationOrigin, EVALUATION_MAX_BYTES } from "./server-contract";
 describe("closed three-case server evaluation contract", () => {
   it("accepts only the configured production model, commit, origin and short time window", () => {
     expect(evaluationConfig(evaluationEnvironment()).model).toBe("gemini-3.6-flash");
@@ -39,5 +39,29 @@ describe("closed three-case server evaluation contract", () => {
     const sets: Record<string, string>[] = [{ "content-type": "text/plain" }, { "content-type": "application/json", "content-encoding": "gzip" }];
     for (const headers of sets) await expect(readEvaluationBody(new Request("https://example.invalid", { method: "POST", headers, body: "{}" }))).rejects.toThrow();
     await expect(readEvaluationBody(new Request("https://example.invalid", { method: "POST", headers: { "content-type": "application/json" }, body: new Uint8Array([255]) }))).rejects.toThrow();
+  });
+  const continuation = () => {
+    const original = evaluationBatch(), batch = { ...original, campaignId: "synthetic-second" };
+    const pins = { SAV_INTAKE_EVAL_PREVIOUS_RUN_ID: "30000000-0000-4000-8000-000000000001", SAV_INTAKE_EVAL_PREVIOUS_CAMPAIGN_ID: original.campaignId,
+      SAV_INTAKE_EVAL_PREVIOUS_MANIFEST_SHA256: evaluationHash(JSON.stringify(original)), SAV_INTAKE_EVAL_PREVIOUS_CODE_SHA: "a".repeat(40) };
+    const env = { ...evaluationEnvironment(batch), SAV_INTAKE_EVAL_CODE_SHA: "b".repeat(40), VERCEL_GIT_COMMIT_SHA: "b".repeat(40), ...pins };
+    return { original, batch, pins, env };
+  };
+  it("requires all four explicit continuation pins and a distinct campaign, manifest and served code", () => {
+    const { env, pins } = continuation();
+    expect(evaluationConfig(env).continuation?.runId).toBe(pins.SAV_INTAKE_EVAL_PREVIOUS_RUN_ID);
+    for (const key of Object.keys(pins)) expect(() => evaluationConfig({ ...env, [key]: undefined })).toThrow();
+    for (const patch of [{ SAV_INTAKE_EVAL_PREVIOUS_CODE_SHA: "b".repeat(40) }, { SAV_INTAKE_EVAL_PREVIOUS_MANIFEST_SHA256: env.SAV_INTAKE_EVAL_MANIFEST_SHA256 }, { SAV_INTAKE_EVAL_PREVIOUS_CAMPAIGN_ID: env.SAV_INTAKE_EVAL_CAMPAIGN_ID }]) expect(() => evaluationConfig({ ...env, ...patch })).toThrow();
+  });
+  it("proves the same exact three-case inputs by changing only the campaign name", () => {
+    const { batch, env } = continuation(), config = evaluationConfig(env);
+    expect(evaluationContinuationProof(batch, config)).toBe(config.continuation?.manifestHash);
+    expect(evaluationContinuationProof(evaluationBatch(), evaluationConfig(evaluationEnvironment()))).toBeUndefined();
+    for (const change of [
+      (value: typeof batch) => { value.cases.reverse(); },
+      (value: typeof batch) => { value.cases[0].input.now = "2026-10-20T10:00:00.000Z"; },
+      (value: typeof batch) => { value.cases[0].input.message.currentText = "Replacement evidence"; },
+      (value: typeof batch) => { value.cases[0].policy.relationRevision = "replaced"; },
+    ]) { const altered = structuredClone(batch); change(altered); expect(() => evaluationContinuationProof(altered, config)).toThrow("SAV_EVAL_CONTINUATION_REJECTED"); }
   });
 });

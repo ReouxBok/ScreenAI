@@ -1,7 +1,7 @@
 import { beforeEach, afterEach, it, expect, vi } from "vitest";
 import type { planSavIntake } from "./engine";
 import { evaluationBatch, evaluationEnvironment } from "../../../../test/sav-intake-evaluation";
-import { evaluationConfig } from "./server-contract";
+import { evaluationConfig, evaluationHash } from "./server-contract";
 const s = vi.hoisted(() => ({ claim: vi.fn(), reserve: vi.fn(), settle: vi.fn(), save: vi.fn(), read: vi.fn(), engine: vi.fn(), realEngine: null as unknown,
   saved: [] as { state: string; value: unknown }[] }));
 vi.mock("./server-ledger", () => ({ claimServerEvaluation: s.claim, reserveServerEvaluationCall: s.reserve, settleServerEvaluationCall: s.settle, saveServerEvaluationResult: s.save, readServerEvaluation: s.read }));
@@ -70,4 +70,23 @@ it("waits for cancellation settlement before saving final status or starting the
 it("rejects oversized provider responses and honours cancellation", async () => {
   await expect(evaluationProviderResponse(new Response("x".repeat(262145)), new AbortController().signal)).rejects.toThrow("SAV_EVAL_PROVIDER_RESPONSE_REJECTED");
   const controller = new AbortController(); controller.abort(); await expect(evaluationProviderResponse(new Response("{}"), controller.signal)).rejects.toThrow("SAV_EVAL_CANCELLED");
+});
+function continuationFixture() {
+  const original = evaluationBatch(), batch = { ...original, campaignId: "synthetic-second" };
+  const env = { ...evaluationEnvironment(batch), SAV_INTAKE_EVAL_CODE_SHA: "b".repeat(40), VERCEL_GIT_COMMIT_SHA: "b".repeat(40),
+    SAV_INTAKE_EVAL_PREVIOUS_RUN_ID: "30000000-0000-4000-8000-000000000001", SAV_INTAKE_EVAL_PREVIOUS_CAMPAIGN_ID: original.campaignId,
+    SAV_INTAKE_EVAL_PREVIOUS_MANIFEST_SHA256: evaluationHash(JSON.stringify(original)), SAV_INTAKE_EVAL_PREVIOUS_CODE_SHA: "a".repeat(40) };
+  return { original, batch, env };
+}
+it("passes the reconstructed baseline proof to the durable claim before a pinned second evaluation", async () => {
+  const { batch, env } = continuationFixture(), config = evaluationConfig(env);
+  await runServerEvaluation(batch, config, "ugo@limova.ai", new AbortController().signal, { env: () => env, network });
+  expect(s.claim).toHaveBeenCalledExactlyOnceWith(config, "ugo@limova.ai", env.SAV_INTAKE_EVAL_PREVIOUS_MANIFEST_SHA256);
+  expect(network).toHaveBeenCalledTimes(3); expect(s.saved.at(-1)?.state).toBe("complete");
+});
+it("refuses replaced case data before any claim, engine, ledger write or model dispatch", async () => {
+  const { batch, env } = continuationFixture(); batch.cases[1].input.message.currentText = "Changed evidence";
+  env.SAV_INTAKE_EVAL_MANIFEST_SHA256 = evaluationHash(JSON.stringify(batch)); // Even the new manifest cannot rewrite the first one.
+  await expect(runServerEvaluation(batch, evaluationConfig(env), "ugo@limova.ai", new AbortController().signal, { env: () => env, network })).rejects.toThrow("SAV_EVAL_CONTINUATION_REJECTED");
+  expect(s.claim).not.toHaveBeenCalled(); expect(s.engine).not.toHaveBeenCalled(); expect(s.save).not.toHaveBeenCalled(); expect(network).not.toHaveBeenCalled();
 });
