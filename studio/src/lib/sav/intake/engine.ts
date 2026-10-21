@@ -229,6 +229,8 @@ export async function planSavIntake(
     contacts = [...distinctContacts.values()].sort((a, b) => a.id.localeCompare(b.id));
     identityEvidenceIds.push(addEvidence("email-lookup", "crm_contact", `lookup-${sha(address)}`,
       { address, status: lookup.status, contacts, reconstructedAsOf: lookup.reconstructedAsOf }, lookup.observedAt));
+    const expectedHumanCandidates = input.humanResolution?.equivalentContactIds;
+    if (expectedHumanCandidates?.some(id => !contacts.some(contact => contact.id === id))) return context("contact_ambiguous");
     if (!contacts.length) {
       if (input.previousIdentification?.messageId === message.id && normalizeEmail(input.previousIdentification.address) === address) return context("history_incomplete");
       const resource = addressOrigin === "sender" ? policy.resources.identification : policy.resources.registrationNotFound;
@@ -240,8 +242,6 @@ export async function planSavIntake(
         permissionRequired: "send_identity_template", learning: "not_started", evidenceIds: identityEvidenceIds }, { kind: "processing", phase: "dispatch", view: null });
     }
     function contactEvidence(c: IntakeContact, observedAt: string) { return addEvidence(`contact-${c.id}`, "crm_contact", c.id, { ...c, emails: unique(c.emails.map(normalizeEmail)).sort() }, observedAt); }
-    const expectedHumanCandidates=input.humanResolution?.equivalentContactIds;
-    if(expectedHumanCandidates?.length && canonical(contacts.map(c=>c.id).sort())!==canonical([...expectedHumanCandidates].sort())) return context("contact_ambiguous");
     if (contacts.length > 1) {
       candidateContactIds = contacts.map(c => c.id);
       for (const c of contacts) contactEvidence(c, lookup.observedAt);

@@ -56,7 +56,7 @@ async function message(thread = threadId, receivedAt = new Date(), subject = "Sy
     fromEmail: "customer@example.invalid", toEmails: ["support@example.invalid"], subject, receivedAt,
     bodyCiphertext: encryptSavPayload({ text: "The synthetic connection fails.", headers: { "message-id": "<incoming@example.invalid>" }, attachments: [] }) }).returning())[0];
 }
-async function observed(multiple = false, sensitive = false, same = true) {
+async function observed(multiple = false, sensitive = false, same = true, equivalentContactIds?: string[]) {
   if (multiple) p.setContacts([{ id: "101", emails: ["customer@example.invalid"] }, { id: "102", emails: ["customer@example.invalid"] }]);
   const id = (await enqueueSavIntakeMessage(messageId, options.runtime))!, lease = (await claimSavIntakeRun(id, options.runtime))!;
   const semantics: AcceptedIntakeSemantics = { revision: SAV_INTAKE_SEMANTIC_RECORD_REVISION, validatorRevision: SAV_INTAKE_MODEL_REVISION, records: [] };
@@ -64,7 +64,7 @@ async function observed(multiple = false, sensitive = false, same = true) {
     analyseMessage: async () => ({ messageId, requests: [{ id: "r1", kind: sensitive ? "finance" as const : "support" as const, currentMessageId: messageId }],
       ticketSummary: { title: "Synthetic connection failure", description: "The synthetic connection fails.", requestIds: ["r1"] } }),
     assessIdentity: async ({ candidates, evidence }) => ({ kind: "equivalent", investigationComplete: true,
-      contactIds: candidates.map(c => c.contact.id), evidenceIds: evidence.map(e => e.id) }),
+      contactIds: equivalentContactIds ?? candidates.map(c => c.contact.id), evidenceIds: evidence.map(e => e.id) }),
     assessIssues: async ({ tickets, requests }) => ({ investigationComplete: true, tickets: tickets.map(({ ticket }) => ({ ticketId: ticket.id,
       relation: same ? "same" as const : "different" as const, requestIds: requests.map(r => r.id), evidenceIds: ["current", `ticket-${ticket.id}`, `history-${ticket.id}`] })) }),
   }, semantics, () => {});
@@ -158,8 +158,7 @@ it("CRM candidate change after CAS cannot reuse the accepted equivalence", async
   p.setContacts([{id:"101",emails:["customer@example.invalid"]},{id:"102",emails:["customer@example.invalid"]},{id:"103",emails:["customer@example.invalid"]}]);
   const result = await consumeIntakeHumanEvent(saved.eventId,options.runtime,createSavIntakeHubspotReaders({network:p.network}));
   expect(result).toHaveProperty("state","waiting");
-  const current = (await readSavIntakeCurrent(threadId))!;
-  expect(current.payload.plan?.decision.disposition).toMatchObject({kind:"collect_context",reasons:expect.arrayContaining(["contact_ambiguous"])});
+  expect((await readSavIntakeCurrent(threadId))?.payload.reason).toBe("SAV_INTAKE_SEMANTIC_CONTEXT_CHANGED");
   expect(mutationsSent()).toHaveLength(0);
 });
 it("identity accepted but issue semantics absent never invents a ticket relation", async () => {
@@ -611,4 +610,25 @@ it("administrator server actions preserve the same exact preview/commit/revoke p
   const revoked=new FormData();revoked.set("policyId",committed.receipt!.policyId);revoked.set("reason","Synthetic explicit authority revocation.");
   expect(await revokeLaunchAction({ok:false,message:""},revoked)).toHaveProperty("ok",true);expect(await revokeLaunchAction({ok:false,message:""},revoked)).toHaveProperty("ok",true);
   expect(fetch).not.toHaveBeenCalled();expect(mutationsSent()).toHaveLength(0);
+});
+
+it("an accepted equivalent subset101/102 within lookup101/102/103 remains selectable after Other",async()=>{
+  p.setContacts(["101","102","103"].map(id=>({id,emails:["customer@example.invalid"]})));
+  await observed(false,false,true,["101","102"]);
+  expect((await readSavIntakeCurrent(threadId))?.candidateContactIds).toEqual(["101","102"]);
+  expect(await revise("select",{contactId:"102"})).toHaveProperty("state","observed");
+  await revise("classify",{classification:"other"});
+  expect(await revise("classify",{classification:"support"})).toHaveProperty("state","observed");
+  expect((await readSavIntakeCurrent(threadId))?.payload.plan?.decision.disposition).toMatchObject({kind:"ticket",target:{contactId:"102"}});
+  expect((await db.db.select().from(savIntakeRuns)).reduce((sum,run)=>sum+run.attempts,0)).toBe(1);
+  expect(await db.db.select().from(savIntakeModelCalls)).toHaveLength(0);expect(mutationsSent()).toHaveLength(0);
+});
+it("a formerly authenticated equivalent group disappearing entirely cannot become an identification template",async()=>{
+  await observed(true);await revise("select",{contactId:"102"});await revise("classify",{classification:"other"});
+  p.setContacts([]);await revise("classify",{classification:"support"});
+  const current=(await readSavIntakeCurrent(threadId))!;
+  expect(current.state).toBe("waiting");
+  expect(current.payload.plan?.decision.disposition).toMatchObject({kind:"collect_context",reasons:expect.arrayContaining(["contact_ambiguous"])});
+  expect(current.payload.plan?.steps).toEqual([]);expect(mutationsSent()).toHaveLength(0);
+  expect(await db.db.select().from(savIntakeModelCalls)).toHaveLength(0);
 });
