@@ -17,6 +17,7 @@ CREATE TABLE "sav"."intake_runs" (
 );
 --> statement-breakpoint
 CREATE UNIQUE INDEX "sav_intake_runs_current" ON "sav"."intake_runs"("thread_id") WHERE "is_current";
+--> statement-breakpoint
 CREATE INDEX "sav_intake_runs_recovery" ON "sav"."intake_runs"("state","lease_until");
 --> statement-breakpoint
 CREATE TABLE "sav"."intake_journal" (
@@ -52,6 +53,7 @@ BEGIN
  RETURN NEW;
 END;
 $$;
+--> statement-breakpoint
 CREATE TRIGGER sav_intake_thread_context AFTER UPDATE OF ai_paused, human_requested_at, hubspot_ticket_id ON sav.threads
 FOR EACH ROW WHEN (OLD.ai_paused IS DISTINCT FROM NEW.ai_paused OR OLD.human_requested_at IS DISTINCT FROM NEW.human_requested_at OR OLD.hubspot_ticket_id IS DISTINCT FROM NEW.hubspot_ticket_id)
 EXECUTE FUNCTION sav.invalidate_intake_thread_context();
@@ -64,6 +66,7 @@ BEGIN
  RETURN NEW;
 END;
 $$;
+--> statement-breakpoint
 CREATE TRIGGER sav_intake_orphan_result BEFORE UPDATE OF run_id ON sav.intake_model_calls
 FOR EACH ROW EXECUTE FUNCTION sav.purge_intake_orphan_result();
 --> statement-breakpoint
@@ -73,6 +76,7 @@ BEGIN
  RETURN NEW;
 END;
 $$;
+--> statement-breakpoint
 CREATE TRIGGER sav_intake_human_choice BEFORE UPDATE OF human_choice_ciphertext ON sav.intake_runs
 FOR EACH ROW WHEN (OLD.human_choice_ciphertext IS DISTINCT FROM NEW.human_choice_ciphertext)
 EXECUTE FUNCTION sav.invalidate_intake_human_choice();

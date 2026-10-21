@@ -24,4 +24,5 @@ BEGIN
  RETURN NEW;
 END;
 $$;
+--> statement-breakpoint
 CREATE TRIGGER sav_intake_console_agent_runs AFTER INSERT OR UPDATE ON sav.agent_runs FOR EACH ROW EXECUTE FUNCTION sav.dirty_intake_console_agent_run();

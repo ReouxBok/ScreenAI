@@ -5,6 +5,7 @@ CREATE TABLE sav.intake_execution_policies (
 );
 --> statement-breakpoint
 CREATE TABLE sav.intake_execution_budget (id text PRIMARY KEY CHECK(id='global'), admitted integer NOT NULL DEFAULT 0 CHECK(admitted>=0));
+--> statement-breakpoint
 INSERT INTO sav.intake_execution_budget(id) VALUES('global');
 --> statement-breakpoint
 CREATE TABLE sav.intake_executions (

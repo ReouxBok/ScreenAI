@@ -5,6 +5,7 @@ CREATE TABLE sav.intake_console (
  view text CHECK(view IN ('learning','missing_contact','to_validate','sensitive','completed','other')),
  status text NOT NULL DEFAULT 'processing', reason text, updated_at timestamptz NOT NULL DEFAULT now()
 );
+--> statement-breakpoint
 CREATE INDEX sav_intake_console_list ON sav.intake_console(mailbox_id,updated_at,thread_id);
 --> statement-breakpoint
 CREATE TABLE sav.intake_human_events (
@@ -15,6 +16,7 @@ CREATE TABLE sav.intake_human_events (
  lease_token uuid, lease_until timestamptz, read_attempts integer NOT NULL DEFAULT 0 CHECK(read_attempts BETWEEN 0 AND 2),
  payload_ciphertext text NOT NULL, created_at timestamptz NOT NULL DEFAULT now()
 );
+--> statement-breakpoint
 CREATE INDEX sav_intake_human_pending ON sav.intake_human_events(state,created_at);
 --> statement-breakpoint
 CREATE TABLE sav.intake_observation_bindings (
@@ -23,6 +25,7 @@ CREATE TABLE sav.intake_observation_bindings (
  thread_id uuid NOT NULL, baseline_ciphertext text NOT NULL, baseline_hash text NOT NULL,
  sensitive boolean NOT NULL, created_at timestamptz NOT NULL DEFAULT now()
 );
+--> statement-breakpoint
 CREATE TABLE sav.intake_effect_revisions (
  effect_id uuid PRIMARY KEY REFERENCES sav.intake_effects(id), event_id uuid NOT NULL REFERENCES sav.intake_human_events(id),
  active boolean NOT NULL, revision_run_id uuid NOT NULL
@@ -37,6 +40,7 @@ BEGIN
  ON CONFLICT(thread_id) DO UPDATE SET epoch=sav.intake_console.epoch+1,updated_at=now();
 END;
 $$;
+--> statement-breakpoint
 CREATE FUNCTION sav.dirty_intake_console_row() RETURNS trigger LANGUAGE plpgsql AS $$
 DECLARE target uuid;
 BEGIN
@@ -49,16 +53,25 @@ BEGIN
  RETURN NEW;
 END;
 $$;
+--> statement-breakpoint
 CREATE TRIGGER sav_intake_console_messages AFTER INSERT OR UPDATE ON sav.messages FOR EACH ROW EXECUTE FUNCTION sav.dirty_intake_console_row();
+--> statement-breakpoint
 CREATE TRIGGER sav_intake_console_threads AFTER UPDATE ON sav.threads FOR EACH ROW EXECUTE FUNCTION sav.dirty_intake_console_row();
+--> statement-breakpoint
 CREATE TRIGGER sav_intake_console_runs AFTER INSERT OR UPDATE ON sav.intake_runs FOR EACH ROW EXECUTE FUNCTION sav.dirty_intake_console_row();
+--> statement-breakpoint
 CREATE TRIGGER sav_intake_console_executions AFTER INSERT OR UPDATE ON sav.intake_executions FOR EACH ROW EXECUTE FUNCTION sav.dirty_intake_console_row();
+--> statement-breakpoint
 CREATE TRIGGER sav_intake_console_effects AFTER INSERT OR UPDATE ON sav.intake_effects FOR EACH ROW EXECUTE FUNCTION sav.dirty_intake_console_row();
+--> statement-breakpoint
 CREATE TRIGGER sav_intake_console_observations AFTER INSERT OR UPDATE ON sav.resolution_observations FOR EACH ROW EXECUTE FUNCTION sav.dirty_intake_console_row();
+--> statement-breakpoint
 CREATE TRIGGER sav_intake_console_cycles AFTER INSERT OR UPDATE ON sav.observation_cycles FOR EACH ROW EXECUTE FUNCTION sav.dirty_intake_console_row();
+--> statement-breakpoint
 CREATE TRIGGER sav_intake_console_choices AFTER INSERT OR UPDATE ON sav.intake_human_events FOR EACH ROW EXECUTE FUNCTION sav.dirty_intake_console_row();
 --> statement-breakpoint
 INSERT INTO sav.intake_console(thread_id,mailbox_id) SELECT DISTINCT t.id,t.mailbox_id FROM sav.threads t JOIN sav.messages m ON m.thread_id=t.id WHERE m.analysis_status LIKE 'intake_%';
+--> statement-breakpoint
 INSERT INTO sav.sync_state(key,status) VALUES('sav-intake-console-schema-v1','installed') ON CONFLICT(key) DO NOTHING;
 --> statement-breakpoint
 -- State/lease/result binding can advance, but the authenticated event bytes and
@@ -73,4 +86,5 @@ BEGIN
  RETURN NEW;
 END;
 $$;
+--> statement-breakpoint
 CREATE TRIGGER sav_intake_human_immutable BEFORE UPDATE ON sav.intake_human_events FOR EACH ROW EXECUTE FUNCTION sav.immutable_intake_human_event();
