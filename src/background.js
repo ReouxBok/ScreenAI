@@ -59,60 +59,34 @@ function isLimovaUrl(value) {
   }
 }
 
-// Sites the user opened to Charly through Chrome's optional permission prompt.
-// Hosts the manifest always requires (Limova, Studio, proxy, storage) are not "sites".
-const GRANTED_SITES_SCRIPT_ID = 'limova-granted-sites';
-let grantedSiteOrigins = new Set();
+// Charly works on any web page the user brings it to. Chrome keeps its own
+// pages (settings, Web Store) out of reach of every extension.
+const UNSCRIPTABLE_HOSTS = new Set(['chromewebstore.google.com', 'chrome.google.com']);
 
-function siteOriginFromPattern(pattern) {
-  const match = /^(https?):\/\/([^/*]+)\/\*$/.exec(String(pattern || ''));
-  return match ? `${match[1]}://${match[2]}` : null;
-}
-
-function isGrantedSiteUrl(value) {
+function isWebPageUrl(value) {
   try {
-    return grantedSiteOrigins.has(new URL(value).origin);
+    const url = new URL(value);
+    return ['https:', 'http:'].includes(url.protocol) && !UNSCRIPTABLE_HOSTS.has(url.hostname);
   } catch {
     return false;
   }
 }
 
+function isExternalSiteUrl(value) {
+  return isWebPageUrl(value) && !isLimovaUrl(value);
+}
+
 function isAssistedUrl(value) {
-  return isLimovaUrl(value) || isGrantedSiteUrl(value);
+  return isWebPageUrl(value);
 }
 
-async function refreshGrantedSites() {
-  const required = new Set((chrome.runtime.getManifest().host_permissions || []).map(siteOriginFromPattern));
-  const granted = await chrome.permissions?.getAll?.().catch(() => null);
-  grantedSiteOrigins = new Set((granted?.origins || [])
-    .map(siteOriginFromPattern)
-    .filter(origin => origin && !required.has(origin) && origin !== LIMOVA_DOMAIN));
-  const matches = [...grantedSiteOrigins].map(origin => `${origin}/*`);
-  await chrome.scripting?.unregisterContentScripts?.({ ids: [GRANTED_SITES_SCRIPT_ID] }).catch(() => {});
-  if (matches.length) {
-    await chrome.scripting?.registerContentScripts?.([{
-      id: GRANTED_SITES_SCRIPT_ID,
-      matches,
-      js: ['src/content/content.js'],
-      runAt: 'document_idle'
-    }]).catch(error => Logger.warn('sites', 'Granted site content script registration failed', error));
-  }
-  return [...grantedSiteOrigins];
-}
-
-const grantedSitesReady = refreshGrantedSites().catch(() => []);
-chrome.permissions?.onAdded?.addListener(() => { refreshGrantedSites().catch(() => {}); });
-chrome.permissions?.onRemoved?.addListener(() => { refreshGrantedSites().catch(() => {}); });
-
-async function prepareGrantedSiteTab(tabId) {
-  await refreshGrantedSites();
-  const tab = await chrome.tabs.get(tabId).catch(() => null);
-  if (!tab?.id || !isGrantedSiteUrl(tab.url)) return { ok: false, error: 'Ce site n’est pas autorisé.' };
-  // The registered script only reaches pages loaded after the grant.
-  const reachable = await chrome.tabs.sendMessage(tab.id, { type: 'DIAGNOSTIC_PING' }).catch(() => null);
-  if (!reachable) await chrome.scripting.executeScript({ target: { tabId: tab.id }, files: ['src/content/content.js'] });
-  Logger.event('sites', 'SITE_ACCESS_READY', { origin: new URL(tab.url).origin });
-  return { ok: true, origin: new URL(tab.url).origin };
+// The page driver is only injected into tabs where Charly is actually used,
+// never into every page the user browses.
+async function ensureContentScript(tabId) {
+  const reachable = await chrome.tabs.sendMessage(tabId, { type: 'DIAGNOSTIC_PING' }).catch(() => null);
+  if (reachable) return true;
+  await chrome.scripting.executeScript({ target: { tabId }, files: ['src/content/content.js'] });
+  return true;
 }
 
 // ============================================================================
@@ -538,6 +512,9 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
 const CONTENT_SCRIPT_MESSAGE_TYPES = new Set([
   'GET_SESSION_STATE', 'MODAL_DETECTED', 'TRAINING_EVENT', 'LIMOVA_PROFILE', 'USER_PAGE_INTERACTION', 'STOP_AGENT'
 ]);
+// Other sites run the same page driver, but only these messages are accepted
+// from them: profile, training and modal analysis stay bound to Limova.
+const EXTERNAL_SITE_MESSAGE_TYPES = new Set(['USER_PAGE_INTERACTION', 'STOP_AGENT']);
 
 function isTrustedMessageSource(request, sender) {
   if (!request || typeof request.type !== 'string') return false;
@@ -547,7 +524,9 @@ function isTrustedMessageSource(request, sender) {
   if (typeof sender.url === 'string' && sender.url.startsWith(extensionRoot)) return true;
 
   const pageUrl = sender.tab?.url || sender.url;
-  return CONTENT_SCRIPT_MESSAGE_TYPES.has(request.type) && isAssistedUrl(pageUrl);
+  if (!CONTENT_SCRIPT_MESSAGE_TYPES.has(request.type)) return false;
+  if (isLimovaUrl(pageUrl)) return true;
+  return EXTERNAL_SITE_MESSAGE_TYPES.has(request.type) && isExternalSiteUrl(pageUrl);
 }
 
 async function handleMessage(request, sender) {
@@ -627,13 +606,6 @@ async function handleMessage(request, sender) {
 
     case 'STOP_AGENT':
       return stopAgent();
-
-    case 'GET_SITE_ACCESS':
-      await grantedSitesReady;
-      return { origins: await refreshGrantedSites() };
-
-    case 'SITE_ACCESS_GRANTED':
-      return prepareGrantedSiteTab(request.tabId);
 
     case 'HANDOFF_TO_LIMOVA':
       return handoffToLimova(request.text);
@@ -1285,6 +1257,7 @@ async function handleUserMessage(text) {
   }
   const tab = await getActiveAssistedTab();
   if (generation !== sessionGeneration) return { ok: true };
+  if (tab && isExternalSiteUrl(tab.url)) await ensureContentScript(tab.id).catch(() => false);
   if (tab && tab.id !== sessionState.lockedTabId) lockTab(tab.id);
   const operationId = Logger.createOperationId('chat');
 
@@ -1376,7 +1349,7 @@ async function handleTakeScreenshot() {
   const tab = await getActiveAssistedTab();
   if (generation !== sessionGeneration) return { ok: true };
   if (!tab) {
-    broadcastToSidebar({ type: 'ERROR', content: 'Ouvre new.limova.ai ou autorise ce site pour analyser une page.' });
+    broadcastToSidebar({ type: 'ERROR', content: 'Ouvre une page web pour que Charly puisse l’analyser.' });
     return { ok: false };
   }
 
@@ -2553,7 +2526,22 @@ async function getPageContext(tabId, operation = { generation: sessionGeneration
           return getExplicitLabel(el)
             || (isInferredMessageSendButton(el) ? 'Envoyer le message' : '')
             || (el.textContent || '').trim().replace(/\s+/g, ' ').substring(0, 80)
+            || getIconLinkLabel(el)
             || '';
+        }
+
+        // Icon-only links (logo, house icon) have no text at all. Name them from
+        // what they point to so the model can still answer "va à l'accueil".
+        function getIconLinkLabel(el) {
+          if (!(el instanceof HTMLAnchorElement) || !el.href) return '';
+          const hints = `${el.className || ''} ${el.querySelector('img, svg')?.getAttribute('class') || ''} ${el.getAttribute('data-testid') || ''}`;
+          let target;
+          try { target = new URL(el.href, window.location.href); } catch (_) { return ''; }
+          if (target.origin !== window.location.origin) return '';
+          const segments = target.pathname.split('/').filter(Boolean);
+          const isRoot = segments.length === 0 || /^(?:home|accueil|dashboard|feed)$/i.test(segments.at(-1) || '');
+          if (/logo|brand|home/i.test(hints) || isRoot) return 'Accueil (logo)';
+          return `Lien vers /${segments.slice(-2).join('/')}`;
         }
 
         // Helper: detect if element looks disabled
@@ -4867,7 +4855,6 @@ async function sendComposeRequest(tabId, message, operation) {
 // Everything happens in the extension: read the page the user is on, open
 // Limova, then write and send the request in its chat like the user would.
 async function handoffToLimova(rawRequest) {
-  await grantedSitesReady;
   const request = String(rawRequest || '').trim().slice(0, 1500);
   if (!request) return { ok: false, error: 'Demande vide.' };
   if (!(await hasAIProcessingConsent())) {
@@ -4876,8 +4863,8 @@ async function handoffToLimova(rawRequest) {
   }
   const operation = { generation: sessionGeneration };
   const [source] = await chrome.tabs.query({ active: true, lastFocusedWindow: true }).catch(() => []);
-  if (!source?.id || !isGrantedSiteUrl(source.url)) {
-    return { ok: false, error: 'Autorise d’abord Charly sur ce site.' };
+  if (!source?.id || !isExternalSiteUrl(source.url)) {
+    return { ok: false, error: 'Ouvre la page à utiliser avant de demander un contenu.' };
   }
   const handoffId = `handoff-${Date.now()}-${++handoffSequence}`;
   Logger.event('handoff', 'LIMOVA_HANDOFF_STARTED', { origin: new URL(source.url).origin, handoffId });
@@ -4946,12 +4933,11 @@ async function getActiveLimovaTab() {
   return tabs.find(t => isLimovaUrl(t.url)) || null;
 }
 
-// A site the user explicitly allowed wins while it is in front; otherwise
-// Limova keeps its usual locked-tab behaviour.
+// Another site wins while it is in front; otherwise Limova keeps its usual
+// locked-tab behaviour.
 async function getActiveAssistedTab() {
-  await grantedSitesReady;
   const [active] = await chrome.tabs.query({ active: true, lastFocusedWindow: true }).catch(() => []);
-  if (active?.id && isGrantedSiteUrl(active.url)) return active;
+  if (active?.id && isExternalSiteUrl(active.url)) return active;
   return getActiveLimovaTab();
 }
 
@@ -4977,7 +4963,6 @@ export {
   handoffToLimova,
   buildLimovaHandoffPrompt,
   isAssistedUrl,
-  refreshGrantedSites,
   stopAgent,
   lockTab,
   privacySafeUrl,

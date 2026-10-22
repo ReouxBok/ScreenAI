@@ -18,12 +18,9 @@
     "webNavigation"
   ],
 
-  "optional_host_permissions": [
-    "https://*/*",
-    "http://*/*"
-  ],
-
   "host_permissions": [
+    "https://*/*",
+    "http://*/*",
     "https://new.limova.ai/*",
     "https://studio.limova.ai/*",
     "https://vercel.com/*",

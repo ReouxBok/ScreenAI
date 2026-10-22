@@ -2,6 +2,13 @@
  * Explicit, ephemeral Gemini Live audio session.
  * Audio exists only in memory and is never persisted by the extension.
  */
+// The Live model tends to stop after each tool and wait for the user. Each
+// successful page action reminds it to finish the user's goal on its own.
+const VOICE_PAGE_ACTION_TOOLS = new Set([
+  'click_element', 'navigate_internal', 'request_page_action', 'fill_field', 'type_text_into_page', 'scroll_page'
+]);
+const VOICE_CONTINUATION_HINT = 'Action réussie. Si l’objectif de la dernière demande de l’utilisateur demande encore des étapes, enchaîne tout de suite l’action suivante avec la carte DOM ci-jointe, sans attendre de nouvelle consigne ni lui demander de relancer. Ne t’arrête que lorsque l’objectif est atteint, qu’une information indispensable manque ou que l’étape suivante est sensible (paiement, suppression, données personnelles). Si l’utilisateur a demandé d’écrire puis d’envoyer, l’envoi fait partie de sa demande.';
+
 class LimovaVoiceSession {
   constructor(options = {}) {
     this.trainingMode = options.trainingMode === true;
@@ -94,6 +101,20 @@ class LimovaVoiceSession {
       source
     };
     return true;
+  }
+
+  // The DOM map carries text only; a first masked screenshot lets the model
+  // recognise icons and layout (logo, home, avatar) before the first request.
+  primeVisualContext() {
+    if (this.trainingMode) return;
+    const lifecycleId = this.lifecycleId;
+    chrome.runtime.sendMessage({ type: 'VOICE_CONTEXT_REQUEST', capture: true })
+      .then(result => {
+        if (lifecycleId !== this.lifecycleId || !result?.visualCapture) return;
+        this.queueVisualCapture(result.visualCapture, result.contextVersion, 'session_start');
+        this.flushVisualCapture();
+      })
+      .catch(() => {});
   }
 
   flushVisualCapture() {
@@ -398,6 +419,7 @@ class LimovaVoiceSession {
           this.emit('limova-voice-status', { status: 'listening' });
           this.flushPageContextUpdate();
           this.flushVisualCapture();
+          this.primeVisualContext();
           resolve();
         }
         this.handleServerMessage(message);
@@ -741,7 +763,7 @@ class LimovaVoiceSession {
           // Wait for the filtered cards to replace the previous 3,237-item map.
           await new Promise(resolve => setTimeout(resolve, 550));
           if (lifecycleId !== this.lifecycleId) return;
-          const refreshed = await chrome.runtime.sendMessage({ type: 'VOICE_CONTEXT_REQUEST' })
+          const refreshed = await chrome.runtime.sendMessage({ type: 'VOICE_CONTEXT_REQUEST', capture: true })
             .catch(() => null);
           if (refreshed?.ok) result = { ...result, ...refreshed };
         }
@@ -775,7 +797,7 @@ class LimovaVoiceSession {
         if (result?.ok) {
           await new Promise(resolve => setTimeout(resolve, 300));
           if (lifecycleId !== this.lifecycleId) return;
-          const refreshed = await chrome.runtime.sendMessage({ type: 'VOICE_CONTEXT_REQUEST' })
+          const refreshed = await chrome.runtime.sendMessage({ type: 'VOICE_CONTEXT_REQUEST', capture: true })
             .catch(() => null);
           if (refreshed?.ok) result = { ...result, ...refreshed };
         }
@@ -815,6 +837,9 @@ class LimovaVoiceSession {
         if (result.clarificationRequired) response.clarificationRequired = true;
       } else if (result?.knowledge) {
         response.knowledgeBase = String(result.knowledge).slice(0, 6_000);
+      }
+      if (response.status === 'ok' && VOICE_PAGE_ACTION_TOOLS.has(call.name)) {
+        response.nextStep = VOICE_CONTINUATION_HINT;
       }
         functionResponses.push({
         id: call.id,

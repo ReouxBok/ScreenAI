@@ -108,7 +108,7 @@ describe('content.js — Charly presence and Limova handoff', () => {
 
       expect(result).toEqual({ ok: true, sent: true, via: 'button' });
       expect(sent).toEqual([prompt]);
-      expect(document.getElementById('limova-agent-presence')).toBeNull();
+      expect(document.getElementById('limova-agent-presence')?.dataset.leaving).toBe('true');
     }, 10_000);
 
     it('does not send twice when the same handoff is replayed', async () => {
@@ -132,14 +132,26 @@ describe('content.js — Charly presence and Limova handoff', () => {
   });
 
   describe('agent presence', () => {
-    it('shows the frame while Charly acts and removes it when the session stops', () => {
+    it('fades the frame in while Charly acts and out when the session stops', async () => {
       content.setAgentPresence(true);
-      expect(document.getElementById('limova-agent-presence')).not.toBeNull();
+      const host = document.getElementById('limova-agent-presence');
+      expect(host).not.toBeNull();
 
       const [onMessage] = chrome.runtime.onMessage.addListener.mock.calls.at(-1);
       onMessage({ type: 'SESSION_STATE', active: false }, {}, () => {});
 
+      expect(host.style.opacity).toBe('0');
+      await new Promise(resolve => setTimeout(resolve, 450));
       expect(document.getElementById('limova-agent-presence')).toBeNull();
+    });
+
+    it('keeps the frame when Charly acts again during the fade-out', async () => {
+      content.setAgentPresence(true);
+      content.setAgentPresence(false);
+      content.setAgentPresence(true);
+      await new Promise(resolve => setTimeout(resolve, 450));
+
+      expect(document.getElementById('limova-agent-presence')?.style.opacity).toBe('1');
     });
   });
 

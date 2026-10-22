@@ -70,6 +70,18 @@ describe('controlled page actions', () => {
     sidebarMessages.length = 0;
   });
 
+  it('names icon-only links so a request like “va à l’accueil” finds the logo', async () => {
+    document.body.innerHTML = `
+      <a href="/" class="brand-logo"><svg viewBox="0 0 10 10"></svg></a>
+      <a href="/settings/billing"><svg viewBox="0 0 10 10"></svg></a>
+    `;
+
+    const context = await background.getPageContext(17);
+
+    expect(context).toContain('Accueil (logo)');
+    expect(context).toContain('Lien vers /settings/billing');
+  });
+
   it('executes a low-risk internal navigation only after an explicit command', async () => {
     const result = await background.proposeOrExecuteAction(1, 'Clique sur Documents');
     expect(result.ok).toBe(true);

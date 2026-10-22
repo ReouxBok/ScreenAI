@@ -366,7 +366,7 @@ describe('Gemini Live voice protocol', () => {
       return { getTracks: () => [mediaTrack] };
     });
     chromeMock.runtime.sendMessage.mockImplementation(async request => {
-      if (request?.type === 'DIAGNOSTIC_EVENT' || request?.type === 'VOICE_SESSION_STATE') return { ok: true };
+      if (['DIAGNOSTIC_EVENT', 'VOICE_SESSION_STATE', 'VOICE_CONTEXT_REQUEST'].includes(request?.type)) return { ok: true };
       order.push('token');
       return {
         ok: true,
@@ -383,6 +383,26 @@ describe('Gemini Live voice protocol', () => {
     await starting;
 
     expect(order).toEqual(['microphone', 'token']);
+  });
+
+  it('shows the model a masked screenshot as soon as the voice session is ready', async () => {
+    chromeMock.runtime.sendMessage.mockImplementation(async request => {
+      if (request?.type === 'VOICE_CONTEXT_REQUEST') {
+        return { ok: true, contextVersion: 3, visualCapture: { mimeType: 'image/jpeg', data: 'bWFza2VkLWNhcHR1cmU=' } };
+      }
+      if (['DIAGNOSTIC_EVENT', 'VOICE_SESSION_STATE'].includes(request?.type)) return { ok: true };
+      return { ok: true, token: 'auth_tokens/test value', model: 'gemini-3.1-flash-live-preview', expiresAt: new Date(Date.now() + 60_000).toISOString() };
+    });
+
+    const starting = new VoiceSession().start();
+    await vi.waitFor(() => expect(FakeWebSocket.instances).toHaveLength(1));
+    const socket = FakeWebSocket.instances[0];
+    socket.open();
+    socket.receive({ setupComplete: {} });
+    await starting;
+
+    expect(chromeMock.runtime.sendMessage).toHaveBeenCalledWith({ type: 'VOICE_CONTEXT_REQUEST', capture: true });
+    await vi.waitFor(() => expect(socket.sent.some(frame => frame.realtimeInput?.video?.data === 'bWFza2VkLWNhcHR1cmU=')).toBe(true));
   });
 
   it('opens a full extension tab for the first microphone authorization', async () => {
@@ -926,7 +946,11 @@ describe('Gemini Live voice protocol', () => {
       targetLabel: ''
     });
     expect(socket.sent[0].toolResponse.functionResponses).toEqual([
-      { id: 'call-1', name: 'click_element', response: { status: 'ok', contextVersion: 1 } },
+      {
+        id: 'call-1',
+        name: 'click_element',
+        response: { status: 'ok', contextVersion: 1, nextStep: expect.stringContaining('enchaîne tout de suite l’action suivante') }
+      },
       { id: 'call-2', name: 'remote_eval', response: { status: 'blocked', contextVersion: 0, reason: 'Fonction non autorisée.' } }
     ]);
   });
@@ -1122,7 +1146,8 @@ describe('Gemini Live voice protocol', () => {
         status: 'ok',
         pageContext: '[main]\n  [5] input(textarea) "Instructions" = [filled]',
         contextVersion: 6,
-        elementCount: 5
+        elementCount: 5,
+        nextStep: expect.stringContaining('enchaîne tout de suite l’action suivante')
       }
     });
   });

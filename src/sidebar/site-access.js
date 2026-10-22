@@ -1,7 +1,7 @@
 /**
- * Limova AI - Sites opened to Charly
- * Pure helpers for the sites the user allows outside Limova and for deciding
- * when a request asks for content that Charly should create inside Limova.
+ * Limova AI - Other sites
+ * Pure helpers to recognise web pages outside Limova and to decide when a
+ * request asks for content that Charly should create inside Limova.
  */
 
 const LIMOVA_APP_ORIGIN = 'https://new.limova.ai';
@@ -20,14 +20,6 @@ function siteOriginOf(url) {
     return parsed.origin;
   } catch {
     return null;
-  }
-}
-
-function siteLabelOf(origin) {
-  try {
-    return new URL(origin).hostname.replace(/^www\./, '');
-  } catch {
-    return '';
   }
 }
 

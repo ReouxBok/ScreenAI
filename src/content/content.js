@@ -191,23 +191,34 @@ function setAgentPresence(active, label = 'Arrêter Charly') {
   agentPresenceActive = active === true;
   const existing = document.getElementById(AGENT_PRESENCE_HOST_ID);
   if (!agentPresenceActive) {
-    existing?.remove();
+    if (existing) {
+      existing.dataset.leaving = 'true';
+      existing.style.opacity = '0';
+      setTimeout(() => { if (existing.dataset.leaving === 'true') existing.remove(); }, 420);
+    }
     releaseAgentPointer();
     return { ok: true, active: false };
   }
-  if (existing) return { ok: true, active: true };
+  if (existing) {
+    delete existing.dataset.leaving;
+    existing.style.opacity = '1';
+    return { ok: true, active: true };
+  }
 
   // A closed shadow root keeps the host site's CSS away from the frame and button.
   const host = document.createElement('div');
   host.id = AGENT_PRESENCE_HOST_ID;
-  host.style.cssText = 'all: initial;';
+  host.style.cssText = 'all: initial; opacity: 0; transition: opacity 400ms ease;';
   const root = host.attachShadow({ mode: 'closed' });
   const style = document.createElement('style');
   style.textContent = `
     .frame {
       position: fixed; inset: 0; pointer-events: none; z-index: 2147483644;
-      box-shadow: inset 0 0 0 2px rgba(241, 90, 36, .75), inset 0 0 42px 10px rgba(241, 90, 36, .28);
-      animation: breathe 2.4s ease-in-out infinite;
+      box-shadow:
+        inset 0 0 0 1.5px rgba(241, 90, 36, .55),
+        inset 0 0 22px 6px rgba(241, 90, 36, .42),
+        inset 0 0 90px 26px rgba(241, 90, 36, .16);
+      animation: breathe 2.6s ease-in-out infinite;
     }
     .stop {
       position: fixed; left: 50%; bottom: 22px; transform: translateX(-50%); z-index: 2147483647;
@@ -218,7 +229,7 @@ function setAgentPresence(active, label = 'Arrêter Charly') {
     }
     .stop:hover { background: #FFF4EE; border-color: rgba(241, 90, 36, .5); }
     .dot { width: 9px; height: 9px; border-radius: 50%; background: ${LIMOVA_ORANGE}; animation: ping 1.6s ease-out infinite; }
-    @keyframes breathe { 0%, 100% { opacity: .7; } 50% { opacity: 1; } }
+    @keyframes breathe { 0%, 100% { opacity: .78; } 50% { opacity: 1; } }
     @keyframes ping { from { box-shadow: 0 0 0 0 rgba(241, 90, 36, .55); } to { box-shadow: 0 0 0 9px rgba(241, 90, 36, 0); } }
     @media (prefers-reduced-motion: reduce) { .frame, .dot { animation: none; } }
   `;
@@ -241,6 +252,7 @@ function setAgentPresence(active, label = 'Arrêter Charly') {
   });
   root.append(style, frame, stop);
   document.documentElement.appendChild(host);
+  (window.requestAnimationFrame || (callback => setTimeout(callback, 16)))(() => { host.style.opacity = '1'; });
   return { ok: true, active: true };
 }
 
@@ -949,7 +961,7 @@ function dispatchCompletePointerClick(element, clientX, clientY) {
 
 const LIMOVA_ORANGE = '#F15A24';
 const AGENT_POINTER_ID = 'limova-computer-use-pointer';
-const AGENT_POINTER_SVG = `<svg viewBox="0 0 32 32" xmlns="http://www.w3.org/2000/svg"><path d="M5 3.5v22.8l6.5-6.2 4.2 8.4 4.1-2-4.1-8.1 8.8-.9L5 3.5Z" fill="${LIMOVA_ORANGE}" stroke="#fff" stroke-width="2.2" stroke-linejoin="round"/></svg>`;
+const AGENT_POINTER_SVG = '<span class="limova-pointer-halo"></span><svg viewBox="0 0 32 32" xmlns="http://www.w3.org/2000/svg"><path d="M5 3.5v22.8l6.5-6.2 4.2 8.4 4.1-2-4.1-8.1 8.8-.9L5 3.5Z" fill="#1D1D1E" stroke="#fff" stroke-width="2" stroke-linejoin="round"/></svg>';
 let agentPresenceActive = false;
 let agentStopRequested = false;
 
@@ -1004,10 +1016,24 @@ function ensurePointerStyles() {
       height: 34px;
       z-index: 2147483647;
       pointer-events: none;
-      filter: drop-shadow(0 3px 4px rgba(0, 0, 0, .35));
-      transition: transform 600ms cubic-bezier(.22,.8,.25,1), opacity 180ms ease;
+      transition: transform 600ms cubic-bezier(.22,.8,.25,1), opacity 220ms ease;
     }
-    #limova-computer-use-pointer svg { display: block; width: 30px; height: 30px; }
+    #limova-computer-use-pointer svg {
+      position: relative; display: block; width: 26px; height: 26px;
+      filter: drop-shadow(0 2px 3px rgba(0, 0, 0, .3));
+    }
+    #limova-computer-use-pointer .limova-pointer-halo {
+      position: absolute; left: -17px; top: -17px; width: 54px; height: 54px; border-radius: 50%;
+      background: radial-gradient(circle, rgba(241, 90, 36, .6) 0%, rgba(241, 90, 36, .26) 40%, rgba(241, 90, 36, 0) 70%);
+      animation: limova-pointer-glow 1.8s ease-in-out infinite;
+    }
+    @keyframes limova-pointer-glow {
+      0%, 100% { transform: scale(.88); opacity: .75; }
+      50% { transform: scale(1.08); opacity: 1; }
+    }
+    @media (prefers-reduced-motion: reduce) {
+      #limova-computer-use-pointer .limova-pointer-halo { animation: none; }
+    }
     .limova-computer-use-ripple {
       position: fixed;
       width: 18px;
@@ -1015,7 +1041,8 @@ function ensurePointerStyles() {
       margin: -9px 0 0 -9px;
       z-index: 2147483646;
       pointer-events: none;
-      border: 3px solid ${LIMOVA_ORANGE};
+      border: 2px solid rgba(241, 90, 36, .85);
+      background: rgba(241, 90, 36, .18);
       border-radius: 999px;
       animation: limova-computer-use-click 420ms ease-out forwards;
     }
