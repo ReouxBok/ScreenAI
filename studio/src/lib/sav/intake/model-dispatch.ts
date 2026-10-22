@@ -1,4 +1,5 @@
 import "server-only";
+import { reconcileIntakeZeroThoughtUsage } from "./model-usage";
 import type { IntakeGeminiCall } from "./model-readers";
 import { readSavGeminiResponse, type SavGeminiMetadata } from "../gemini-response";
 import { requestSavGeminiJson, savAiErrorMetadata, savGeminiWireBody } from "../gemini-transport";
@@ -26,12 +27,12 @@ export function createIntakeModelDispatcher(options: { config: IntakeRuntimeConf
       if (reserved.cached) return reserved.cached;
       const reservation = reserved.id;
       let providerUsage: SavGeminiMetadata | undefined;
-      // The legacy transport sums absent counters as zero. Admission settlement
-      // must instead retain the exact presence of all four provider counters,
-      // including when the model text cannot be parsed as JSON.
-      const exactUsage = (metadata?: SavGeminiMetadata): SavGeminiMetadata => ({ ...metadata,
-        inputTokens: providerUsage?.inputTokens, outputTokens: providerUsage?.outputTokens,
-        thoughtTokens: providerUsage?.thoughtTokens, totalTokens: providerUsage?.totalTokens });
+      // Gemini may omit a zero thoughts counter. Recognize only that zero when
+      // the three explicit counters prove the accounting equation; never infer
+      // other missing counters or a positive remainder. Settlement stays strict.
+      const exactUsage = (metadata?: SavGeminiMetadata) => reconcileIntakeZeroThoughtUsage({ ...metadata,
+        inputTokens:providerUsage?.inputTokens,outputTokens:providerUsage?.outputTokens,
+        thoughtTokens:providerUsage?.thoughtTokens,totalTokens:providerUsage?.totalTokens });
       const guardedNetwork: typeof fetch = async (url, init) => {
         await live();
         if (sent || input.signal.aborted || String(url) !== `https://generativelanguage.googleapis.com/v1beta/models/${config.model}:generateContent`

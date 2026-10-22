@@ -14,7 +14,7 @@ import { observeSavOther, readSavOtherConfiguration } from "../other-observation
 import { assertSavIntakeObservation, savIntakeRuntimeConfig, SAV_INTAKE_RUNTIME_REVISION,
   type IntakeRuntimeConfig, type IntakeRuntimePayload } from "./runtime-contract";
 import { assertSavIntakeLease, catchupSavIntake, checkpointSavIntakeRun, claimSavIntakeRun, enqueueSavIntakeMessage, failSavIntakeRun,
-  pendingSavIntakeRuns, readSavIntakeBudget, reserveSavIntakeCall, saveSavIntakeResult } from "./runtime-store";
+  pendingSavIntakeRuns, readSavIntakeBudget, reconcileConfinedIntakeUsage, reserveSavIntakeCall, saveSavIntakeResult } from "./runtime-store";
 
 /** Enqueue only: ingestion never invokes CRM/model or marks a mail processed. */
 export async function enqueueConfiguredSavIntake(messageId: string) {
@@ -111,6 +111,7 @@ export function analyseSavIntakeRuntime(...args: Parameters<typeof analyseSavInt
 export async function reconcileSavIntakeRuntime(options: { deadlineMs?: number } = {}) {
   const config = savIntakeRuntimeConfig(); if (!config) return { skipped: "off" as const };
   if (options.deadlineMs && options.deadlineMs - Date.now() < 65_000) return { skipped: "deadline" as const };
+  await reconcileConfinedIntakeUsage(config);
   const queued = await catchupSavIntake(config), runs = await pendingSavIntakeRuns(config);
   let result: Awaited<ReturnType<typeof analyseSavIntakeRuntime>> | null = null;
   for (const run of runs) {
