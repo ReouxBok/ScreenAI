@@ -1,5 +1,6 @@
 import { expect, test, type Locator, type Page } from "@playwright/test";
 import { SAV53_THREADS } from "../../test/sav53-e2e-fixture";
+import { fetchServerActionInFull } from "../helpers/server-action";
 
 test.beforeEach(async ({ page, baseURL }) => {
   page.setDefaultTimeout(15_000);
@@ -12,17 +13,18 @@ async function submitWithoutJump(page: Page, button: Locator) {
     const form = element.closest("form")!;
     return form.querySelector('[name="humanProcess"]') ? "humanProcess" : form.querySelector('[name="expectedDraftId"]') ? "expectedDraftId" : "sourceHash";
   });
-  const [response, before] = await Promise.all([
-    page.waitForResponse(response => response.request().method() === "POST" && Boolean(response.request().headers()["next-action"]) && Boolean(response.request().postDataBuffer()?.includes(Buffer.from(marker)))),
+  const action = await fetchServerActionInFull(page, request => request.method() === "POST" && Boolean(request.headers()["next-action"]) && Boolean(request.postDataBuffer()?.includes(Buffer.from(marker))));
+  const [, before] = await Promise.all([
+    action.settled(),
     // Clicking can itself scroll to focus the button. Compare against the
     // viewport at submission, before the server action navigates.
     button.evaluate(element => new Promise<number>(resolve => {
       element.closest("form")!.addEventListener("submit", () => resolve(window.scrollY), { capture: true, once: true });
     })),
     button.click(),
-  ]);
+  ]).finally(() => action.dispose());
   expect(before).toBeGreaterThan(300);
-  await response.finished();
+  await page.waitForLoadState("networkidle");
   // Let both the router's layout effects and the restoration frame finish.
   await page.evaluate(() => new Promise<void>(resolve => requestAnimationFrame(() => requestAnimationFrame(() => resolve()))));
   await expect.poll(async () => Math.abs(await page.evaluate(() => window.scrollY) - before)).toBeLessThan(4);

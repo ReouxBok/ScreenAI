@@ -1,4 +1,5 @@
 import { expect, test } from "@playwright/test";
+import { submitServerAction } from "../helpers/server-action";
 
 async function login(page: import("@playwright/test").Page) {
   await page.goto("/studio");
@@ -268,7 +269,8 @@ test("une démonstration extension devient un parcours Charly éditable",async({
   await test.step("Soumettre, publier et vérifier le parcours",async()=>{
     await page.getByRole("button",{name:"Demander la validation"}).click();
     await expect(page.getByRole("button",{name:"Valider et publier"})).toBeVisible();
-    await page.getByRole("button",{name:"Valider et publier"}).click();
+    // Let the publication finish before leaving the page, which would cancel it.
+    await submitServerAction(page, page.getByRole("button",{name:"Valider et publier"}), /name="(?:_?\d+_)?decision"\r?\n\r?\npublish/);
     await page.goto("/studio/entrainements");
     const publishedTraining = page.locator(".training-row").filter({hasText:"Créer une campagne sociale E2E"}).first();
     await expect(publishedTraining.getByText("Nouveau",{exact:true})).toHaveCount(0);
