@@ -8,7 +8,7 @@ import {canAccessSav} from "../access";
 import {decryptSavPayload,encryptSavPayload} from "../crypto";
 import {executionAdministrator} from "./execution-policy";
 import {admissionLock} from "./execution-store";
-import {intakeHumanRefused,type HumanEventPayload} from "./human-binding";
+import {intakeHumanRefused,operatorRecoveryConfigHash,type HumanEventPayload} from "./human-binding";
 import {intakeLaunchMatches} from "./launch-boundary";
 import {savIntakeSourceSnapshot} from "./runtime-store";
 import {savIntakeRuntimeConfig,intakeRuntimeHash,SAV_INTAKE_RUNTIME_REVISION,type IntakeRuntimePayload} from "./runtime-contract";
@@ -53,9 +53,10 @@ export async function requestIntakeReinvestigation(raw:unknown){
    configuration:{configHash:config.configHash,resourcesHash:config.resourcesHash,policyHash:config.policyHash,codeRevision:config.codeRevision,model:config.model}};
   await tx.update(savIntakeRuns).set({isCurrent:false,state:"superseded",leaseToken:null,leaseUntil:null,freshUntil:null})
    .where(and(eq(savIntakeRuns.threadId,thread.id),eq(savIntakeRuns.isCurrent,true)));
+  const eventId=randomUUID();
   const [parent]=await tx.insert(savIntakeRuns).values({threadId:thread.id,messageId:message.id,version:(last?.version??0)+1,
-   configHash:config.configHash,policyHash:config.policyHash,state:"waiting",sourceHash:snapshot.sourceHash,payloadCiphertext:encryptSavPayload(payload)}).returning();
-  const eventId=randomUUID(),value:HumanEventPayload={revision:"sav-intake-human.v1",actor:{id:actor.id,email:actor.email},mailboxId:config.mailboxId,
+   configHash:operatorRecoveryConfigHash(config.configHash,eventId),policyHash:config.policyHash,state:"waiting",sourceHash:snapshot.sourceHash,payloadCiphertext:encryptSavPayload(payload)}).returning();
+  const value:HumanEventPayload={revision:"sav-intake-human.v1",actor:{id:actor.id,email:actor.email},mailboxId:config.mailboxId,
    policyHash:config.policyHash,resourcesHash:config.resourcesHash,candidatesHash:intakeRuntimeHash([]),candidateContactIds:[],
    ...(choices[0]?{classification:choices[0]}:{}),reason:command.reason,parentPayloadHash:intakeRuntimeHash(payload),reinvestigate:true};
   await tx.insert(savIntakeHumanEvents).values({id:eventId,commandKey:eventId,threadId:thread.id,messageId:message.id,parentRunId:parent.id,parentVersion:parent.version,
