@@ -664,8 +664,10 @@ function notifyModalDetected(modal) {
   chrome.runtime.sendMessage({ type: 'MODAL_DETECTED', modal: describeModal(modal) }).catch(() => {});
 }
 
+// Popup analysis is a Limova onboarding feature; other sites only get the
+// page map when Charly reads them.
 function refreshModalObserver() {
-  if (assistantSessionActive || trainingCaptureActive) startModalObserver();
+  if ((assistantSessionActive || trainingCaptureActive) && window.location.origin === 'https://new.limova.ai') startModalObserver();
   else stopModalObserver();
 }
 

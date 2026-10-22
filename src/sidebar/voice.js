@@ -5,7 +5,7 @@
 // The Live model tends to stop after each tool and wait for the user. Each
 // successful page action reminds it to finish the user's goal on its own.
 const VOICE_PAGE_ACTION_TOOLS = new Set([
-  'click_element', 'navigate_internal', 'request_page_action', 'fill_field', 'type_text_into_page', 'scroll_page'
+  'click_element', 'navigate_internal', 'request_page_action', 'fill_field', 'type_text_into_page', 'scroll_page', 'open_page'
 ]);
 const VOICE_CONTINUATION_HINT = 'Action réussie. Si l’objectif de la dernière demande de l’utilisateur demande encore des étapes, enchaîne tout de suite l’action suivante avec la carte DOM ci-jointe, sans attendre de nouvelle consigne ni lui demander de relancer. Ne t’arrête que lorsque l’objectif est atteint, qu’une information indispensable manque ou que l’étape suivante est sensible (paiement, suppression, données personnelles). Si l’utilisateur a demandé d’écrire puis d’envoyer, l’envoi fait partie de sa demande.';
 
@@ -727,7 +727,7 @@ class LimovaVoiceSession {
           toolName: call.name,
           ...(call.name === 'capture_current_view' ? { capture: true } : {})
         })
-          .catch(() => ({ ok: false, error: 'La page Limova est indisponible.' }));
+          .catch(() => ({ ok: false, error: 'La page est indisponible.' }));
         this.diagnostic(result?.ok ? 'VOICE_PAGE_INSPECTION_SUCCEEDED' : 'VOICE_PAGE_INSPECTION_FAILED', {
           contextVersion: Number(result?.contextVersion || 0),
           characterCount: String(result?.pageContext || '').length,
@@ -751,7 +751,7 @@ class LimovaVoiceSession {
           contextVersion: call.args.contextVersion,
           targetLabel: typeof call.args?.targetLabel === 'string' ? call.args.targetLabel : '',
           text: call.args.text
-        }).catch(() => ({ ok: false, error: 'La page Limova est indisponible.' }));
+        }).catch(() => ({ ok: false, error: 'La page est indisponible.' }));
         this.diagnostic(result?.ok ? 'VOICE_TEXT_INPUT_SUCCEEDED' : 'VOICE_TEXT_INPUT_FAILED', {
           elementId: call.args.elementId,
           characterCount: call.args.text.length,
@@ -776,13 +776,24 @@ class LimovaVoiceSession {
           amount: ['small', 'medium', 'large'].includes(call.args?.amount) ? call.args.amount : 'medium',
           ...(Number.isInteger(call.args?.elementId) ? { elementId: call.args.elementId } : {}),
           contextVersion: call.args?.contextVersion
-        }).catch(() => ({ ok: false, error: 'La page Limova est indisponible.' }));
+        }).catch(() => ({ ok: false, error: 'La page est indisponible.' }));
         if (result?.ok) {
           await new Promise(resolve => setTimeout(resolve, 180));
           if (lifecycleId !== this.lifecycleId) return;
           const refreshed = await chrome.runtime.sendMessage({ type: 'VOICE_CONTEXT_REQUEST' }).catch(() => null);
           if (refreshed?.ok) result = { ...result, ...refreshed };
         }
+      } else if (call.name === 'open_page' && typeof call.args?.url === 'string') {
+        // The background waits for the page to load and returns its fresh map.
+        result = await chrome.runtime.sendMessage({
+          type: 'VOICE_OPEN_PAGE',
+          url: call.args.url,
+          newTab: call.args?.newTab === true
+        }).catch(() => ({ ok: false, error: 'Extension indisponible.' }));
+        this.diagnostic(result?.ok ? 'VOICE_PAGE_OPENED' : 'VOICE_PAGE_OPEN_FAILED', {
+          contextVersion: Number(result?.contextVersion || 0),
+          elementCount: Number(result?.elementCount || 0)
+        });
       } else if (['click_element', 'navigate_internal', 'request_page_action'].includes(call.name) && Number.isInteger(call.args?.elementId)) {
         result = await chrome.runtime.sendMessage({
           type: 'VOICE_ACTION_REQUEST',

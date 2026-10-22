@@ -148,6 +148,35 @@ describe('background privacy boundaries', () => {
     }
   });
 
+  it('keeps the whole page when a mini video player or a consent iframe is layered on top', async () => {
+    const defaultRect = HTMLElement.prototype.getBoundingClientRect;
+    HTMLElement.prototype.getBoundingClientRect = function getBoundingClientRect() {
+      if (!this.dataset.rect) return defaultRect.call(this);
+      const [left, top, width, height] = this.dataset.rect.split(',').map(Number);
+      return { left, top, width, height, right: left + width, bottom: top + height, x: left, y: top };
+    };
+    // Le Figaro: the article video sticks to the bottom-right corner while scrolling.
+    document.body.innerHTML = `
+      <main>
+        <h1>Gérald Darmanin partage les premières images des prisons préfabriquées</h1>
+        <a href="/actualite-france/suite">Lire la suite</a>
+        <div style="position: fixed; z-index: 100" data-rect="1056,650,328,185">
+          <div class="jw-overlays jw-reset" style="position: absolute" data-rect="1056,650,328,185"><button>Lecture</button></div>
+        </div>
+      </main>
+      <iframe title="Publicité" style="position: fixed; z-index: 2147483647" data-rect="0,0,1024,768"></iframe>
+    `;
+
+    try {
+      const context = await background.getPageContext(7);
+
+      expect(context).toContain('Surface active: page entière');
+      expect(context).toContain('"Lire la suite"');
+    } finally {
+      HTMLElement.prototype.getBoundingClientRect = defaultRect;
+    }
+  });
+
   it('returns useful DOM and network structure without secrets or direct identifiers', async () => {
     const context = await background.getPageContext(7);
     expect(context).toContain('input(password) "Mot de passe"');

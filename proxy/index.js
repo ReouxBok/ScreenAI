@@ -924,7 +924,8 @@ app.post('/api/live-token', verifyAssistantAuth, assistantLimiter, async (req, r
     evaluationMode
       ? ''
       : onboardingTemplateText || 'Trame de secours : pour démarrer, vérifie si l’utilisateur a déjà exprimé un objectif précis. Si oui, aide-le directement. Sinon, demande uniquement : « Est-ce qu’il y a un sujet en particulier que tu veux traiter aujourd’hui ? ». S’il n’a pas d’idée, propose la prospection LinkedIn ou la création de posts pour réseaux sociaux, puis adapte la suite à son métier. Pose une seule question par tour.',
-    'Tu peux inspecter et piloter la page Limova grâce à une carte DOM structurée : URL, titres, éléments visibles et cliquables avec identifiants, états, modales, erreurs et métadonnées réseau récentes filtrées. Tu peux aussi recevoir une capture visuelle temporaire de la zone visible : les pastilles #N sont des repères strictement internes ; elles servent uniquement à retrouver une cible et ne doivent jamais être prononcées ni mentionnées à l’utilisateur. Les valeurs de formulaires sont masquées. Utilise l’image pour comprendre la disposition et les contrôles graphiques, jamais pour deviner une valeur ou cliquer par coordonnées. Toute action doit utiliser un identifiant de la carte DOM actuelle ; ne dis jamais que tu ne vois pas l’écran ou que tu ne peux pas naviguer.',
+    'L’utilisateur peut travailler sur Limova ou sur n’importe quel autre site : la carte DOM la plus récente (URL et titre) indique toujours la page réellement affichée, et l’extension t’envoie une nouvelle carte dès qu’il change d’onglet ou de site. Ne réponds jamais à partir d’une page précédente. Sur un autre site, la section « contenu à l’écran » donne le texte que l’utilisateur lit. Pour aller sur un site ou une adresse qu’il nomme, appelle open_page avec l’adresse (par exemple lemonde.fr) ; pour suivre un lien visible, utilise son identifiant dans la carte DOM.',
+    'Tu peux inspecter et piloter la page affichée grâce à une carte DOM structurée : URL, titres, éléments visibles et cliquables avec identifiants, états, modales, erreurs et métadonnées réseau récentes filtrées. Tu peux aussi recevoir une capture visuelle temporaire de la zone visible : les pastilles #N sont des repères strictement internes ; elles servent uniquement à retrouver une cible et ne doivent jamais être prononcées ni mentionnées à l’utilisateur. Les valeurs de formulaires sont masquées. Utilise l’image pour comprendre la disposition et les contrôles graphiques, jamais pour deviner une valeur ou cliquer par coordonnées. Toute action doit utiliser un identifiant de la carte DOM actuelle ; ne dis jamais que tu ne vois pas l’écran ou que tu ne peux pas naviguer.',
     'Appelle inspect_current_page avant de répondre à toute question sur ce qui est affiché, après une navigation ou dès que le contexte peut avoir changé. Utilise exclusivement les identifiants de la carte DOM la plus récente. Une MISE À JOUR TECHNIQUE SILENCIEUSE remplace l’ancien contexte de page : assimile-la sans y répondre seule et considère sa version DOM comme la nouvelle référence. Une source user_click, user_input ou user_scroll signifie que l’utilisateur a déjà agi : ne répète pas son action. Utilise scroll_page pour découvrir les contrôles hors écran, puis inspecte de nouveau la page.',
     evaluationMode
       ? 'Pendant ce test, le brouillon isolé est l’unique source produit. N’appelle pas la base de connaissances publiée.'
@@ -1002,7 +1003,7 @@ app.post('/api/live-token', verifyAssistantAuth, assistantLimiter, async (req, r
               }
             }, {
               name: 'inspect_current_page',
-              description: 'Relit immédiatement la page Limova active et renvoie sa carte DOM, ses éléments actionnables, ses modales, ses erreurs et ses métadonnées réseau filtrées. À appeler avant toute observation ou après navigation.',
+              description: 'Relit immédiatement la page active (Limova ou autre site) et renvoie sa carte DOM, ses éléments actionnables, ses modales, ses erreurs et ses métadonnées réseau filtrées. À appeler avant toute observation ou après navigation.',
               parameters: {
                 type: 'OBJECT',
                 properties: {}
@@ -1027,7 +1028,7 @@ app.post('/api/live-token', verifyAssistantAuth, assistantLimiter, async (req, r
               }
             }] : []), {
               name: 'scroll_page',
-              description: 'Fait défiler la vue Limova ou la zone contenant un élément. Utilise cet outil pour découvrir les contrôles hors écran, puis appelle inspect_current_page avant de cliquer.',
+              description: 'Fait défiler la page active ou la zone contenant un élément. Utilise cet outil pour découvrir les contrôles hors écran, puis appelle inspect_current_page avant de cliquer.',
               parameters: {
                 type: 'OBJECT',
                 properties: {
@@ -1053,7 +1054,7 @@ app.post('/api/live-token', verifyAssistantAuth, assistantLimiter, async (req, r
               }
             }, {
               name: 'navigate_internal',
-              description: 'Navigue dans Limova en activant un identifiant DOM courant, jamais une URL arbitraire.',
+              description: 'Suit un lien ou un onglet de navigation visible de la page active en activant un identifiant DOM courant, jamais une URL arbitraire.',
               parameters: {
                 type: 'OBJECT',
                 properties: {
@@ -1062,6 +1063,17 @@ app.post('/api/live-token', verifyAssistantAuth, assistantLimiter, async (req, r
                   targetLabel: { type: 'STRING' }
                 },
                 required: ['elementId', 'contextVersion', 'targetLabel']
+              }
+            }, {
+              name: 'open_page',
+              description: 'Ouvre un site ou une adresse web que l’utilisateur demande (par exemple « va sur lemonde.fr »), attend son chargement et renvoie sa carte DOM. Remplace la page d’un autre site dans l’onglet actif ; depuis Limova, ouvre un nouvel onglet.',
+              parameters: {
+                type: 'OBJECT',
+                properties: {
+                  url: { type: 'STRING', description: 'Adresse web en http(s) ou nom de domaine, par exemple lemonde.fr.' },
+                  newTab: { type: 'BOOLEAN', description: 'Vrai si l’utilisateur demande un nouvel onglet.' }
+                },
+                required: ['url']
               }
             }, {
               name: 'verify_expected_result',

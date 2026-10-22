@@ -41,11 +41,11 @@ const actualPermissions = [...(manifest.permissions || [])].sort();
 if (JSON.stringify(actualPermissions) !== JSON.stringify([...expectedPermissions].sort())) {
   failures.push(`permissions must stay least-privilege: ${expectedPermissions.join(', ')}`);
 }
-// Charly assists the page the user is on, on any site; the explicit Limova
+// Charly assists the page the user is on, on any site (<all_urls> is also what
+// lets Chrome capture the visible tab for screenshots); the explicit Limova
 // hosts stay listed so they keep working if the broad patterns are dropped.
 const expectedHosts = [
-  'https://*/*',
-  'http://*/*',
+  '<all_urls>',
   'https://new.limova.ai/*',
   'https://studio.limova.ai/*',
   'https://vercel.com/*',

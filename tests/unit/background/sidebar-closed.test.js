@@ -114,4 +114,39 @@ describe('closed side panel keeps the assistant silent', () => {
     expect(result).not.toEqual({ ok: true, ignored: true });
     expect(chromeMock.runtime.getContexts).toHaveBeenCalledWith({ contextTypes: ['SIDE_PANEL'] });
   });
+
+  describe('switching tabs while the panel is open', () => {
+    const FIGARO_TAB = 31;
+
+    function activate(tabId, url) {
+      chromeMock.tabs.get.mockImplementation(async id => (
+        id === tabId ? { id, windowId: 1, active: true, url } : { id, windowId: 1, active: false, url: 'https://new.limova.ai/home' }
+      ));
+      return new Promise(resolve => {
+        chromeMock._listeners.tabs.onActivated[0]({ tabId });
+        setTimeout(resolve, 400);
+      });
+    }
+
+    afterEach(() => chromeMock.tabs.get.mockImplementation(async id => ({ id, windowId: 1, url: 'https://new.limova.ai/home', active: true })));
+
+    it('follows the user to another site instead of sending them back to Limova', async () => {
+      await activate(FIGARO_TAB, 'https://www.lefigaro.fr/actualite-france/article-20261022');
+
+      const types = port.messages.map(message => message.type);
+      expect(types).toContain('CORRECT_TAB');
+      expect(types).not.toContain('WRONG_TAB');
+      expect(chromeMock.tabs.sendMessage).toHaveBeenCalledWith(FIGARO_TAB, { type: 'SESSION_STATE', active: true });
+      expect(chromeMock.tabs.sendMessage).toHaveBeenCalledWith(LIMOVA_TAB, { type: 'SESSION_STATE', active: false });
+      // The written chat refreshes its page map silently on other sites.
+      expect(analysisStatuses(port, chromeMock)).toHaveLength(0);
+    });
+
+    it('still warns on a browser page Charly cannot read', async () => {
+      await activate(FIGARO_TAB, 'chrome://settings/');
+
+      expect(port.messages.map(message => message.type)).toContain('WRONG_TAB');
+      expect(chromeMock.tabs.sendMessage).not.toHaveBeenCalledWith(FIGARO_TAB, { type: 'SESSION_STATE', active: true });
+    });
+  });
 });

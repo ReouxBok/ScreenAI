@@ -66,4 +66,25 @@ describe('Charly on other sites and Limova handoff', () => {
     expect(result).toMatchObject({ ok: false });
     expect(chromeMock.tabs.create).not.toHaveBeenCalled();
   });
+
+  it('opens only web addresses the user names', () => {
+    expect(background.normalizeRequestedPageUrl('lemonde.fr')).toBe('https://lemonde.fr/');
+    expect(background.normalizeRequestedPageUrl('https://www.lefigaro.fr/actualite-france')).toBe('https://www.lefigaro.fr/actualite-france');
+    expect(background.normalizeRequestedPageUrl('javascript:alert(1)')).toBeNull();
+    expect(background.normalizeRequestedPageUrl('chrome://settings')).toBeNull();
+    expect(background.normalizeRequestedPageUrl('file:///etc/passwd')).toBeNull();
+    expect(background.normalizeRequestedPageUrl('https://user:pass@evil.example')).toBeNull();
+    expect(background.normalizeRequestedPageUrl('bonjour')).toBeNull();
+  });
+
+  it('opens a named site next to Limova instead of replacing it', async () => {
+    chromeMock.tabs.create.mockClear();
+    await chromeMock.storage.local.set({ limova_ai_processing_consent_v1: true });
+    chromeMock.tabs.query.mockResolvedValueOnce([{ id: 4, index: 2, url: 'https://new.limova.ai/home' }]);
+    chromeMock.tabs.get.mockResolvedValueOnce({ id: 99, status: 'complete', active: true, url: 'https://lemonde.fr/' });
+
+    await background.openPageForUser('lemonde.fr');
+
+    expect(chromeMock.tabs.create).toHaveBeenCalledWith(expect.objectContaining({ url: 'https://lemonde.fr/', index: 3, openerTabId: 4, active: true }));
+  });
 });

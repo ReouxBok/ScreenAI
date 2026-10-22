@@ -409,7 +409,9 @@ describe('POST /api/live-token', () => {
     expect(body.bidiGenerateContentSetup.tools[0].functionDeclarations[5].parameters.required).toEqual(['elementId', 'contextVersion', 'targetLabel', 'text']);
     expect(body.bidiGenerateContentSetup.tools[0].functionDeclarations[5].description).toContain('Ne soumet jamais');
     expect(body.bidiGenerateContentSetup.tools[0].functionDeclarations[6].name).toBe('navigate_internal');
-    expect(body.bidiGenerateContentSetup.tools[0].functionDeclarations[7].name).toBe('verify_expected_result');
+    expect(body.bidiGenerateContentSetup.tools[0].functionDeclarations[7].name).toBe('open_page');
+    expect(body.bidiGenerateContentSetup.tools[0].functionDeclarations[7].parameters.required).toEqual(['url']);
+    expect(body.bidiGenerateContentSetup.tools[0].functionDeclarations[8].name).toBe('verify_expected_result');
     expect(body.fieldMask.split(',')).toEqual(expect.arrayContaining([
       'model',
       'generationConfig.responseModalities',

@@ -391,6 +391,7 @@ async function handleUrlChange(tabId, url, { force = false } = {}) {
   if (!(await isSidebarOpen())) return;
   if (!(await hasAIProcessingConsent())) return;
   if (generation !== sessionGeneration) return;
+  const externalSite = isExternalSiteUrl(url);
   url = privacySafeUrl(url);
   if (!force && url === sessionState.lastUrl) return;
   sessionState.lastUrl = url;
@@ -403,13 +404,16 @@ async function handleUrlChange(tabId, url, { force = false } = {}) {
 
   if (activeAbortController) activeAbortController.abort();
 
-  if (!voiceSessionActive) {
+  if (!voiceSessionActive && !externalSite) {
     broadcastToSidebar({ type: 'STATUS_UPDATE', status: 'analyzing', text: 'Nouvelle page détectée...', ponderingText: 'ponderingNewPage' });
   }
 
   try {
     const pageContext = await getPageContext(tabId);
     if (generation !== sessionGeneration) return;
+    // On other sites the written chat only refreshes the page map: Charly
+    // comments a page when the user asks, not on every navigation.
+    if (externalSite && !voiceSessionActive) return;
     const pageAnalysis = await capturePageAnalysis(tabId);
     if (generation !== sessionGeneration) return;
     if (voiceSessionActive) {
@@ -474,7 +478,33 @@ async function handleTabActivated(tabId) {
     await trackExternalPopup(tab);
     if (externalPopupTabs.has(tabId)) return;
   }
+  if (await followActivatedTab(tabId)) return;
   broadcastToSidebar({ type: 'WRONG_TAB' });
+}
+
+// Like the Claude and ChatGPT side panels, Charly works on the tab in front:
+// switching to another web page moves it there and refreshes what it sees.
+// Training and flow tests stay bound to their Limova tab.
+async function followActivatedTab(tabId) {
+  if (trainingState.active || evaluationState.active) return false;
+  // The Limova tab opened by a handoff is driven by the handoff itself; an
+  // automatic page analysis there would talk over the chat being sent.
+  if (handoffsInProgress > 0) return true;
+  const tab = await chrome.tabs.get(tabId).catch(() => null);
+  if (!tab?.id || !tab.active || !isAssistedUrl(tab.url)) return false;
+  if (!(await isSidebarOpen())) return false;
+  const previousTabId = sessionState.lockedTabId;
+  if (isExternalSiteUrl(tab.url)) await ensureContentScript(tab.id).catch(() => {});
+  if (previousTabId && previousTabId !== tab.id) {
+    hideAgentPresence(previousTabId);
+    chrome.tabs.sendMessage(previousTabId, { type: 'SESSION_STATE', active: false }).catch(() => {});
+  }
+  lockTab(tab.id);
+  chrome.tabs.sendMessage(tab.id, { type: 'SESSION_STATE', active: true }).catch(() => {});
+  broadcastToSidebar({ type: 'CORRECT_TAB' });
+  Logger.event('tabs', 'ASSISTANT_FOLLOWED_ACTIVE_TAB', { external: isExternalSiteUrl(tab.url) });
+  await handleUrlChange(tab.id, tab.url, { force: true });
+  return true;
 }
 
 chrome.tabs.onRemoved.addListener((tabId) => {
@@ -519,7 +549,7 @@ const CONTENT_SCRIPT_MESSAGE_TYPES = new Set([
 ]);
 // Other sites run the same page driver, but only these messages are accepted
 // from them: profile, training and modal analysis stay bound to Limova.
-const EXTERNAL_SITE_MESSAGE_TYPES = new Set(['USER_PAGE_INTERACTION', 'STOP_AGENT']);
+const EXTERNAL_SITE_MESSAGE_TYPES = new Set(['USER_PAGE_INTERACTION', 'STOP_AGENT', 'GET_SESSION_STATE']);
 
 function isTrustedMessageSource(request, sender) {
   if (!request || typeof request.type !== 'string') return false;
@@ -699,6 +729,11 @@ async function handleMessage(request, sender) {
     case 'VOICE_SCROLL_REQUEST':
       return runEvaluatedVoiceTool('scroll_page', '', () =>
         scrollVoicePage(request.direction, request.amount, request.elementId, request.contextVersion)
+      );
+
+    case 'VOICE_OPEN_PAGE':
+      return runEvaluatedVoiceTool('open_page', request.url, () =>
+        openPageForUser(request.url, { newTab: request.newTab === true })
       );
 
     case 'VOICE_KB_SEARCH':
@@ -2303,19 +2338,31 @@ async function getPageContext(tabId, operation = { generation: sessionGeneration
           if (element.tagName === 'DIALOG' && element.hasAttribute('open')) return true;
           // A class name alone is not enough (Le Monde's live form is "--overlay"):
           // the surface must also sit above the page and be on screen.
-          if (/(modal|dialog|overlay|popup|lightbox|drawer)/i.test(String(element.className || ''))
-            && rect.width > 100 && rect.height > 100
-            && rect.bottom > 0 && rect.top < window.innerHeight
-            && isLayeredAbovePage(element)) return true;
           const zIndex = Number.parseInt(style.zIndex, 10) || 0;
           const coversViewportCenter = rect.left <= window.innerWidth / 2
             && rect.right >= window.innerWidth / 2
             && rect.top <= window.innerHeight / 2
             && rect.bottom >= window.innerHeight / 2;
+          const coverage = (rect.width * rect.height) / Math.max(1, window.innerWidth * window.innerHeight);
+          // A class name alone is not enough on the open web (Le Monde's live form
+          // is "--overlay", Le Figaro's mini video player "jw-overlays"): the
+          // surface must sit above the page and block its centre, like a real popup.
+          if (/(modal|dialog|overlay|popup|lightbox|drawer)/i.test(String(element.className || ''))
+            && rect.width > 100 && rect.height > 100
+            && coversViewportCenter
+            && coverage > 0.12
+            && isLayeredAbovePage(element)) return true;
           return style.position === 'fixed'
             && zIndex >= 10
             && coversViewportCenter
-            && (rect.width * rect.height) / Math.max(1, window.innerWidth * window.innerHeight) > 0.12;
+            && coverage > 0.12;
+        }
+
+        // A surface Charly cannot read (an iframe, an empty video layer) must not
+        // hide the page: it would leave Charly with nothing to see or click.
+        function hasReadableControls(element) {
+          return element.tagName !== 'IFRAME'
+            && Boolean(element.querySelector('a[href], button, input, select, textarea, [role="button"], [role="link"], [tabindex]:not([tabindex="-1"])'));
         }
 
         function findActiveModalSurface() {
@@ -2326,7 +2373,8 @@ async function getPageContext(tabId, operation = { generation: sessionGeneration
             '[class*="lightbox" i], [class*="drawer" i], [data-radix-portal] > *, [data-headlessui-portal] > *'
           );
           const shallow = [...document.body.children].flatMap(element => [element, ...element.children]);
-          const candidates = [...new Set([...signaled, ...shallow])].filter(isModalSurfaceCandidate);
+          const candidates = [...new Set([...signaled, ...shallow])]
+            .filter(element => isModalSurfaceCandidate(element) && hasReadableControls(element));
           if (!candidates.length) return null;
           const score = element => {
             const rect = element.getBoundingClientRect();
@@ -4850,6 +4898,7 @@ const HANDOFF_PAGE_TEXT_LIMIT = 6000;
 const HANDOFF_PROMPT_LIMIT = 8000;
 const presenceTabs = new Set();
 let handoffSequence = 0;
+let handoffsInProgress = 0;
 
 async function showAgentPresence(tabId) {
   if (!tabId) return;
@@ -4886,7 +4935,7 @@ function buildLimovaHandoffPrompt(request, page) {
   return text ? `${header}\n\nContenu de la page :\n"""\n${text}\n"""` : header;
 }
 
-function waitForTabLoaded(tabId, timeout = 30_000) {
+function waitForTabLoaded(tabId, timeout = 30_000, { afterNavigation = false } = {}) {
   return new Promise(resolve => {
     const done = value => {
       clearTimeout(timer);
@@ -4898,8 +4947,58 @@ function waitForTabLoaded(tabId, timeout = 30_000) {
     };
     const timer = setTimeout(() => done(false), timeout);
     chrome.tabs.onUpdated.addListener(listener);
+    // Right after tabs.update the tab still reports the previous page as complete.
+    if (afterNavigation) return;
     chrome.tabs.get(tabId).then(tab => { if (tab?.status === 'complete') done(true); }).catch(() => done(false));
   });
+}
+
+// Voice "open_page": the user names a site or an address. Only web pages are
+// opened; Limova stays in its tab and the site opens next to it.
+function normalizeRequestedPageUrl(rawUrl) {
+  const value = String(rawUrl || '').trim();
+  if (!value || value.length > 2048) return null;
+  const candidate = /^[a-z][a-z0-9+.-]*:/i.test(value) ? value : `https://${value}`;
+  try {
+    const url = new URL(candidate);
+    if (!['https:', 'http:'].includes(url.protocol) || !url.hostname.includes('.') || url.username || url.password) return null;
+    return isWebPageUrl(url.href) ? url.href : null;
+  } catch {
+    return null;
+  }
+}
+
+async function openPageForUser(rawUrl, { newTab = false } = {}) {
+  const url = normalizeRequestedPageUrl(rawUrl);
+  if (!url) return { ok: false, error: 'Adresse web invalide. Donne une adresse comme lemonde.fr.' };
+  if (!(await hasAIProcessingConsent())) return { ok: false, consentRequired: true };
+  const operation = { generation: sessionGeneration, voiceGeneration: voiceSessionGeneration };
+  const [current] = await chrome.tabs.query({ active: true, lastFocusedWindow: true }).catch(() => []);
+  const keepCurrent = newTab || !current?.id || isLimovaUrl(current.url);
+  let tab;
+  if (keepCurrent) {
+    tab = await chrome.tabs.create({
+      url,
+      active: true,
+      ...(Number.isInteger(current?.index) ? { index: current.index + 1 } : {}),
+      ...(current?.id ? { openerTabId: current.id } : {})
+    });
+  } else {
+    tab = await chrome.tabs.update(current.id, { url });
+  }
+  if (!tab?.id) return { ok: false, error: 'Impossible d’ouvrir cette page.' };
+  if (current?.id && current.id !== tab.id) hideAgentPresence(current.id);
+  lockTab(tab.id);
+  Logger.event('navigation', 'PAGE_OPENED_FOR_USER', { origin: new URL(url).origin, newTab: keepCurrent });
+  await waitForTabLoaded(tab.id, 12_000, { afterNavigation: !keepCurrent });
+  if (!isCurrentOperation(operation)) return cancelledOperation();
+  await ensureContentScript(tab.id).catch(() => {});
+  try {
+    return await getFreshVoiceContext(null, { capture: true, operation: { ...operation, tabId: tab.id } });
+  } catch {
+    // The page is open even when it is still too busy to be read.
+    return { ok: true, opened: true, retryWithFreshContext: true };
+  }
 }
 
 async function sendComposeRequest(tabId, message, operation) {
@@ -4943,17 +5042,24 @@ async function handoffToLimova(rawRequest) {
   if (!page?.ok) return { ok: false, error: 'Je n’arrive pas à lire cette page.' };
 
   const prompt = buildLimovaHandoffPrompt(request, page);
-  const limovaTab = await chrome.tabs.create({
-    url: `${LIMOVA_DOMAIN}/`,
-    index: Number.isInteger(source.index) ? source.index + 1 : undefined,
-    openerTabId: source.id,
-    active: true
-  });
-  await waitForTabLoaded(limovaTab.id);
-  if (!isCurrentOperation(operation)) return cancelledOperation();
-  presenceTabs.add(limovaTab.id);
-  const result = await sendComposeRequest(limovaTab.id, { type: 'LIMOVA_COMPOSE_AND_SEND', handoffId, prompt }, operation);
-  presenceTabs.delete(limovaTab.id);
+  handoffsInProgress += 1;
+  let limovaTab;
+  let result;
+  try {
+    limovaTab = await chrome.tabs.create({
+      url: `${LIMOVA_DOMAIN}/`,
+      index: Number.isInteger(source.index) ? source.index + 1 : undefined,
+      openerTabId: source.id,
+      active: true
+    });
+    await waitForTabLoaded(limovaTab.id);
+    if (!isCurrentOperation(operation)) return cancelledOperation();
+    presenceTabs.add(limovaTab.id);
+    result = await sendComposeRequest(limovaTab.id, { type: 'LIMOVA_COMPOSE_AND_SEND', handoffId, prompt }, operation);
+    presenceTabs.delete(limovaTab.id);
+  } finally {
+    handoffsInProgress -= 1;
+  }
   Logger.event('handoff', result?.ok ? 'LIMOVA_HANDOFF_SENT' : 'LIMOVA_HANDOFF_FAILED', {
     handoffId,
     code: result?.code || null,
@@ -5034,6 +5140,8 @@ export {
   handoffToLimova,
   buildLimovaHandoffPrompt,
   isAssistedUrl,
+  normalizeRequestedPageUrl,
+  openPageForUser,
   stopAgent,
   lockTab,
   privacySafeUrl,

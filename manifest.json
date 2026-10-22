@@ -19,8 +19,7 @@
   ],
 
   "host_permissions": [
-    "https://*/*",
-    "http://*/*",
+    "<all_urls>",
     "https://new.limova.ai/*",
     "https://studio.limova.ai/*",
     "https://vercel.com/*",
