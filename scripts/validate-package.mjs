@@ -41,7 +41,11 @@ const actualPermissions = [...(manifest.permissions || [])].sort();
 if (JSON.stringify(actualPermissions) !== JSON.stringify([...expectedPermissions].sort())) {
   failures.push(`permissions must stay least-privilege: ${expectedPermissions.join(', ')}`);
 }
+// Charly assists the page the user is on, on any site; the explicit Limova
+// hosts stay listed so they keep working if the broad patterns are dropped.
 const expectedHosts = [
+  'https://*/*',
+  'http://*/*',
   'https://new.limova.ai/*',
   'https://studio.limova.ai/*',
   'https://vercel.com/*',
@@ -50,7 +54,7 @@ const expectedHosts = [
 ];
 const actualHosts = [...(manifest.host_permissions || [])].sort();
 if (JSON.stringify(actualHosts) !== JSON.stringify([...expectedHosts].sort())) {
-  failures.push(`host_permissions must stay restricted to: ${expectedHosts.join(', ')}`);
+  failures.push(`host_permissions must be exactly: ${expectedHosts.join(', ')}`);
 }
 const extensionCsp = manifest.content_security_policy?.extension_pages || '';
 if (!extensionCsp.includes("script-src 'self'")) failures.push("CSP must restrict scripts to 'self'");
