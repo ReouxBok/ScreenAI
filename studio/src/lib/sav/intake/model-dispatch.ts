@@ -1,4 +1,5 @@
 import "server-only";
+import { reconcileIntakeZeroThoughtUsage } from "./model-usage";
 import type { IntakeGeminiCall } from "./model-readers";
 import { readSavGeminiResponse, type SavGeminiMetadata } from "../gemini-response";
 import { requestSavGeminiJson, savAiErrorMetadata, savGeminiWireBody } from "../gemini-transport";
@@ -29,15 +30,9 @@ export function createIntakeModelDispatcher(options: { config: IntakeRuntimeConf
       // Gemini may omit a zero thoughts counter. Recognize only that zero when
       // the three explicit counters prove the accounting equation; never infer
       // other missing counters or a positive remainder. Settlement stays strict.
-      const exactUsage = (metadata?: SavGeminiMetadata): SavGeminiMetadata & { usageReconciliation?: string } => {
-        const i = providerUsage?.inputTokens, o = providerUsage?.outputTokens, total = providerUsage?.totalTokens;
-        const omittedZeroThoughts = providerUsage?.thoughtTokens === undefined
-          && [i, o, total].every(n => Number.isSafeInteger(n) && Number(n) >= 0)
-          && Number(i) >= 1 && Number(i) <= 1_048_576 && Number(o) <= 8192 && Number(i) + Number(o) === total;
-        return { ...metadata, inputTokens: i, outputTokens: o,
-          thoughtTokens: omittedZeroThoughts ? 0 : providerUsage?.thoughtTokens, totalTokens: total,
-          ...(omittedZeroThoughts ? { usageReconciliation: "gemini_omitted_zero_thoughts.v1" } : {}) };
-      };
+      const exactUsage = (metadata?: SavGeminiMetadata) => reconcileIntakeZeroThoughtUsage({ ...metadata,
+        inputTokens:providerUsage?.inputTokens,outputTokens:providerUsage?.outputTokens,
+        thoughtTokens:providerUsage?.thoughtTokens,totalTokens:providerUsage?.totalTokens });
       const guardedNetwork: typeof fetch = async (url, init) => {
         await live();
         if (sent || input.signal.aborted || String(url) !== `https://generativelanguage.googleapis.com/v1beta/models/${config.model}:generateContent`
