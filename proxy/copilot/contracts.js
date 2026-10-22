@@ -75,8 +75,13 @@ function publicToolResult(result) {
   };
 }
 
+// "New conversation" starts a fresh exchange but keeps what Charly knows about
+// the user.
+const NEW_CONVERSATION_NOTE = 'NOUVELLE CONVERSATION. L’utilisateur vient d’en démarrer une nouvelle : garde ce que tu sais de lui, mais ne reprends pas de toi-même un sujet ou un objectif précédent ; n’en parle que s’il l’évoque.';
+
 module.exports = {
   CLIENT_TOOL_NAMES,
+  NEW_CONVERSATION_NOTE,
   localeSchema,
   pageSchema,
   publicToolResult,

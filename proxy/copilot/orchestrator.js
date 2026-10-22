@@ -8,7 +8,7 @@ const {
   getFunctionCalls,
   isFinalResponse
 } = require('@google/adk');
-const { CLIENT_TOOL_NAMES, publicToolResult, sanitizeToolResult } = require('./contracts');
+const { CLIENT_TOOL_NAMES, NEW_CONVERSATION_NOTE, publicToolResult, sanitizeToolResult } = require('./contracts');
 const { APP_NAME, CharlyMemoryService, CharlySessionService } = require('./services');
 const { createCharlyTools } = require('./tools');
 
@@ -384,7 +384,7 @@ class CharlyAdkOrchestrator {
       idempotencyKey: `${input.idempotencyKey}:user`,
       requestId
     });
-    const memory = evaluationContext || input.resetContext === true
+    const memory = evaluationContext
       ? null
       : await this.personalContext(userKey, input.message, input.sessionId, requestId);
     const response = await this.consumeEvents({
@@ -392,7 +392,9 @@ class CharlyAdkOrchestrator {
       sessionId: input.sessionId,
       message: { role: 'user', parts: [{ text: input.message }] },
       stateDelta: {
-        'temp:personalContext': memory?.context || (!evaluationContext && input.userFirstName
+        'temp:personalContext': memory?.context
+          ? `${input.resetContext === true ? `${NEW_CONVERSATION_NOTE}\n\n` : ''}${memory.context}`
+          : (!evaluationContext && input.userFirstName
           ? `PRÉNOM. L’utilisateur s’appelle ${input.userFirstName.replace(/[\r\n<>"«»]/g, ' ').trim()}. Utilise son prénom avec parcimonie.`
           : ''),
         'temp:pageContext': JSON.stringify(input.page),

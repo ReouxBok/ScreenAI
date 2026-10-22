@@ -3,7 +3,7 @@ const path = require('node:path');
 const express = require('express');
 const cors = require('cors');
 const rateLimit = require('express-rate-limit');
-const { sessionSchema, turnSchema, toolResultSchema } = require('./copilot/contracts');
+const { NEW_CONVERSATION_NOTE, sessionSchema, turnSchema, toolResultSchema } = require('./copilot/contracts');
 const { CharlyAdkOrchestrator } = require('./copilot/orchestrator');
 const { loadPromptBundle } = require('./copilot/prompt');
 const { sanitizeKnowledgeResponse } = require('./copilot/knowledge');
@@ -542,13 +542,13 @@ async function persistMemoryTurn(userKey, turn, assistant, requestId) {
   }
 }
 
-function memoryPrompt(context) {
+function memoryPrompt(context, { newConversation = false } = {}) {
   if (!context?.enabled || !context.context) return '';
-  return `CONTEXTE PERSONNEL PRIVÉ — ne le cite jamais comme une base de données et ne prétends jamais te souvenir d’un fait absent. Utilise le prénom avec parcimonie. Si un souvenir semble incertain ou contradictoire, demande une clarification.\n\n${String(context.context).slice(0, 18_000)}`;
+  return `CONTEXTE PERSONNEL PRIVÉ — ne le cite jamais comme une base de données et ne prétends jamais te souvenir d’un fait absent. Utilise le prénom avec parcimonie. Si un souvenir semble incertain ou contradictoire, demande une clarification.${newConversation ? `\n\n${NEW_CONVERSATION_NOTE}` : ''}\n\n${String(context.context).slice(0, 18_000)}`;
 }
 
-// The first name sent by the extension stays known after a "new conversation"
-// reset, which sets the account-wide memory aside.
+// The first name sent by the extension keeps Charly from forgetting it when the
+// memory service is unavailable.
 function firstNamePrompt(rawName) {
   const name = typeof rawName === 'string' ? rawName.replace(/[\r\n<>"«»]/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 80) : '';
   return name ? `PRÉNOM. L’utilisateur s’appelle ${name}. Utilise son prénom avec parcimonie.` : '';
@@ -858,13 +858,12 @@ async function handleCopilotTurn(req, res) {
   const requestId = crypto.randomUUID();
   const turn = cleanMemoryTurn(req.body.memoryTurn);
   try {
-    const personalContext = req.body.resetContext === true
-      ? null
-      : await getMemoryContext(req.auth.memoryUserKey, turn?.user || '', requestId);
+    const personalContext = await getMemoryContext(req.auth.memoryUserKey, turn?.user || '', requestId);
+    const personalPrompt = memoryPrompt(personalContext, { newConversation: req.body.resetContext === true });
     const promptParts = [
       { text: SERVER_PROMPT },
       ...(Array.isArray(req.body.systemInstruction?.parts) ? req.body.systemInstruction.parts : []),
-      ...(memoryPrompt(personalContext) ? [{ text: memoryPrompt(personalContext) }] : []),
+      ...(personalPrompt ? [{ text: personalPrompt }] : []),
       ...(!memoryPrompt(personalContext) && firstNamePrompt(req.body.userFirstName) ? [{ text: firstNamePrompt(req.body.userFirstName) }] : [])
     ];
     const url = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${GEMINI_API_KEY}`;
@@ -973,7 +972,7 @@ app.post('/api/live-token', verifyAssistantAuth, assistantLimiter, async (req, r
   const onboardingTemplateText = formatOnboardingTemplate(onboardingTemplate);
   const lastUserMessage = trainingMode || evaluationMode ? '' : [...(Array.isArray(req.body?.history) ? req.body.history : [])].reverse().find(item => item?.role === 'user')?.content || '';
   const liveSessionId = typeof req.body?.sessionId === 'string' && /^[0-9a-f-]{36}$/i.test(req.body.sessionId) ? req.body.sessionId : undefined;
-  const personalContext = trainingMode || evaluationMode || req.body?.resetContext === true
+  const personalContext = trainingMode || evaluationMode
     ? null
     : await getMemoryContext(req.auth.memoryUserKey, lastUserMessage, requestId, liveSessionId);
   const now = Date.now();
@@ -1012,7 +1011,7 @@ app.post('/api/live-token', verifyAssistantAuth, assistantLimiter, async (req, r
     evaluationMode ? `MODE TEST DE FLOW ISOLÉ. Exécute un seul parcours continu de bout en bout à partir du brouillon ci-dessous. Ce brouillon remplace la base publiée pour ce test. Comprends l’objectif, demande une précision uniquement si une donnée réellement nécessaire manque, agis avec les outils sur chaque étape, puis appelle verify_expected_result avant d’annoncer la réussite. N’utilise aucune mémoire personnelle et ne transforme rien de ce test en souvenir.\n${evaluationContext.context}` : '',
     pageContext ? `Contexte DOM privé de la page:\n${pageContext}` : '',
     history ? `Conversation récente:\n${history}` : ''
-    ,memoryPrompt(personalContext)
+    ,memoryPrompt(personalContext, { newConversation: req.body?.resetContext === true })
     ,trainingMode || evaluationMode || memoryPrompt(personalContext) ? '' : firstNamePrompt(req.body?.userFirstName)
   ].filter(Boolean).join('\n\n');
   const systemText = trainingMode
