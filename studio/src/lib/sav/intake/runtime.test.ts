@@ -392,6 +392,16 @@ it("fences a human pause during image download before any model dispatch",async(
   await analyseSavIntakeRuntime(id!,config,{env:()=>environment,network,downloadAttachments:async()=>{await f.db.update(savThreads).set({aiPaused:true}).where(eq(savThreads.id,threadId));return bytes;}});
   expect(network).not.toHaveBeenCalled();expect(await f.db.select().from(savIntakeModelCalls)).toHaveLength(0);
 });
+it("a readable attachment cannot promote an ambiguous HTML quotation to a complete current request",async()=>{
+  const {syntheticImage,attachmentMetadata}=await import("../../../../test/sav-attachments");const bytes=await syntheticImage();
+  const [m]=await f.db.select().from(savMessages).where(eq(savMessages.id,messageId)),[t]=await f.db.select().from(savThreads).where(eq(savThreads.id,threadId));
+  const meta=attachmentMetadata(bytes.length);meta.reference={...meta.reference!,mailboxEmail:"support@example.invalid",gmailMessageId:m.gmailMessageId!,gmailThreadId:t.gmailThreadId};
+  await f.db.update(savMessages).set({bodyCiphertext:encryptSavPayload({text:'<html><body>Merci, réglé.<div class=gmail_quote>Je veux résilier mon compte.</div></body></html>',attachments:[meta],attachmentInventory:{complete:true,limits:[]}})}).where(eq(savMessages.id,messageId));
+  const id=await enqueueSavIntakeMessage(messageId,config),network=vi.fn(async()=>{throw Error("NETWORK_FORBIDDEN");});
+  expect((await analyseSavIntakeRuntime(id!,config,{env:()=>environment,network,downloadAttachments:async()=>bytes})).state).toBe("waiting");
+  expect(network).not.toHaveBeenCalled();expect(await f.db.select().from(savIntakeModelCalls)).toHaveLength(0);
+  expect((await readSavIntakeCurrent(threadId,config))?.payload.attachments?.textComplete).toBe(false);
+});
 
 it.each([false,true])("publishes only a still-fresh authenticated Other qualification (expire=%s)",async(expire)=>{
   const {readSavOtherAuthentication}=await import("../other-auth"),sender="noreply.notifications@trustpilot.com",subject="Synthetic review 5 stars",text="Synthetic complete notification";
