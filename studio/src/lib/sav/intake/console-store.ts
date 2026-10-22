@@ -49,10 +49,10 @@ export async function projectIntakeThread(threadId: string, beforePublish?: () =
           : started ? { view: sensitive ? "sensitive" : "learning", status: "followup_started", reason: null }
           : { view: null, status: "followup_pending", reason: observation?.sourceErrors.length ? "Collecte du suivi incomplète" : "Actions confirmées, premier suivi en attente" };
       }
-    } else if (plan?.progress.kind === "qualified_other" && progress?.state === "refused" && progress.effects.length === 0) result = { view: "other", status: "qualified_other", reason: null };
+    } else if (plan?.progress.kind === "qualified_other" && progress?.state === "refused" && progress.effects.length === 0) result = { view: "other", status: "qualified_other", reason: payload.other ? `${payload.other.label} · règle ${payload.other.ruleId}` : "Classement confirmé par un opérateur" };
     else if (progress) result = { view: null, status: progress.state, reason: progress.reason };
     else if (plan?.progress.view === "to_validate") result = { view: "to_validate", status: "human_choice", reason: payload.reason ?? null };
-    else if (plan?.progress.kind === "qualified_other") result = { view: "other", status: "qualified_other", reason: null };
+    else if (plan?.progress.kind === "qualified_other") result = { view: "other", status: "qualified_other", reason: payload.other ? `${payload.other.label} · règle ${payload.other.ruleId}` : "Classement confirmé par un opérateur" };
     else result = { view: null, status: run.state, reason: payload.reason ?? null };
   }
   await beforePublish?.();

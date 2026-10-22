@@ -22,6 +22,7 @@ function validateAccepted(method: keyof SavIntakeSemanticReaders, input: unknown
   const reject = () => { throw Error("SAV_INTAKE_SEMANTIC_COVERAGE_REJECTED"); };
   if (method === "analyseMessage") {
     const i = input as Parameters<SavIntakeSemanticReaders["analyseMessage"]>[0], r = messageAnalysisSchema.parse(result);
+    if (r.attachmentObservations?.some(o => !i.message.attachmentInputs?.some(a => a.sourceId === o.sourceId && a.fileHash === o.fileHash))) reject();
     if (r.messageId !== i.message.id || r.requests.some(q => q.currentMessageId !== i.message.id)
       || new Set(r.requests.map(q => q.id)).size !== r.requests.length) reject();
   } else if (method === "assessIdentity") {

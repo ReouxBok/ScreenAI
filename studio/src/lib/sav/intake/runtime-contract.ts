@@ -44,6 +44,7 @@ export function savIntakeRuntimeConfig(env: Record<string, string | undefined> =
     if (warning && createHash("sha256").update(warning.text).digest("hex") !== warning.sha256) throw Error();
     return { ...p, mode: "observe", policy, model: "gemini-3.6-flash", configHash: intakeRuntimeHash({ ...p, revision: SAV_INTAKE_RUNTIME_REVISION, prompts: SAV_INTAKE_MODEL_REVISION, readers: SAV_INTAKE_READERS_REVISION, context: SAV_MESSAGE_CONTEXT_REVISION,
       otherRulesHash: intakeRuntimeHash(env.SAV_OTHER_OBSERVATION_RULES_JSON ?? null),
+      otherRoutingHash: intakeRuntimeHash(env.SAV_INTAKE_OTHER_RULES_JSON ?? null),
       accessBinding: intakeRuntimeHash({ model: env.SAV_GEMINI_API_KEY, crm: env.HUBSPOT_ACCESS_TOKEN }) }) };
   } catch { throw Error("SAV_INTAKE_RUNTIME_CONFIGURATION_REQUIRED"); }
 }
@@ -51,6 +52,8 @@ export type IntakeRuntimeState = "pending" | "analysing" | "observed" | "waiting
 export type IntakeRuntimePayload = {
   revision: typeof SAV_INTAKE_RUNTIME_REVISION;
   input?: unknown; plan?: IntakePlan;
+  other?: import("./other-routing").IntakeOtherQualification;
+  attachments?: import("./attachments").IntakeAttachmentState;
   configuration?: { configHash: string; resourcesHash: string; policyHash: string; codeRevision: string; model: string };
   semantics?:import("./semantic-records").AcceptedIntakeSemantics;
   provenance?:unknown; traces?: unknown[]; reason?: string;

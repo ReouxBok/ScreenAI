@@ -196,6 +196,11 @@ async function gmailFetch<T>(mailboxEmail: string, path: string, init?: RequestI
 
 /** Internal transport only; intake supplies its own capability and durable effect guard. */
 export const requestSavGmail = gmailFetch;
+/** Fixed metadata GET only; token remains inside the Gmail transport. */
+export async function readSavGmailOtherAuthentication(input: Parameters<typeof import("./other-auth").readSavOtherAuthentication>[0]) {
+  const {readSavOtherAuthentication}=await import("./other-auth");
+  return readSavOtherAuthentication(input,async(url,init)=>fetch(url,{...init,headers:{Authorization:`Bearer ${await gmailAccessToken()}`}}));
+}
 /** Read-only bytes for a server-owned, message-bound MIME reference. No modify or URL fetching. */
 export async function readSavGmailAttachment(reference: SavAttachmentReference, size: number, signal: AbortSignal, mimeType?: string) {
   return createSavGmailAttachmentDownloader()(reference, size, signal, mimeType);

@@ -2,7 +2,7 @@ import "server-only";
 import { intakeLaunchMatches } from "./launch-boundary";
 import { and, eq, inArray } from "drizzle-orm";
 import { requireDb } from "@/db";
-import { savIntakeHumanEvents, savIntakeRuns } from "@/db/schema";
+import { savIntakeHumanEvents, savIntakeRuns, savIntakeJournal } from "@/db/schema";
 import { decryptSavPayload } from "../crypto";
 import { intakeRuntimeHash, type IntakeRuntimeConfig } from "./runtime-contract";
 import { intakeConsoleInstalled } from "./console-capability";
@@ -79,5 +79,15 @@ export async function intakeRunCandidateContactIds(run:typeof savIntakeRuns.$inf
   if(!parent||parent.version!==event.parentVersion||parent.version>=run.version||parent.messageId!==run.messageId||parent.threadId!==run.threadId
     ||value.parentPayloadHash!==intakeRuntimeHash(decryptSavPayload(parent.payloadCiphertext))||value.policyHash!==run.policyHash||value.resourcesHash!==payload.configuration?.resourcesHash
     ||value.candidatesHash!==intakeRuntimeHash(value.candidateContactIds)||new Set(value.candidateContactIds).size!==value.candidateContactIds.length)return null;
+  const records=await db.select().from(savIntakeJournal).where(and(eq(savIntakeJournal.runId,run.id),eq(savIntakeJournal.kind,"human_reanalysis")));
+  if(records.length) {
+    if(records.length!==1||!payload.plan||!payload.input||!payload.semantics)return null;
+    const record=decryptSavPayload<{eventId:string;parentRunId:string;sourceHash:string;inputHash:string;planHash:string;semanticsHash:string;candidateContactIds:string[]}>(records[0].payloadCiphertext);
+    const candidates=[...(payload.plan.candidateContactIds??[])].sort();
+    if(record.eventId!==event.id||record.parentRunId!==parent.id||record.sourceHash!==run.sourceHash
+      ||record.inputHash!==intakeRuntimeHash(payload.input)||record.planHash!==intakeRuntimeHash(payload.plan)
+      ||record.semanticsHash!==intakeRuntimeHash(payload.semantics)||intakeRuntimeHash(record.candidateContactIds)!==intakeRuntimeHash(candidates))return null;
+    return candidates;
+  }
   return [...value.candidateContactIds].sort();
 }

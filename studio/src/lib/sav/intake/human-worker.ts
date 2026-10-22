@@ -1,4 +1,5 @@
 import "server-only";
+import { intakeInputWithAttachments } from "./attachments";
 import { randomUUID } from "node:crypto";
 import { and, desc, eq, inArray, lt, or, sql } from "drizzle-orm";
 import { requireDb } from "@/db";
@@ -8,11 +9,14 @@ import { decryptSavPayload, encryptSavPayload } from "../crypto";
 import { intakeRuntimeHash, savIntakeRuntimeConfig, type IntakeRuntimeConfig, type IntakeRuntimePayload } from "./runtime-contract";
 import { intakeConsoleInstalled } from "./console-capability";
 import { humanRevisionConfigHash, intakeRunConfigurationBound, type HumanEventPayload } from "./human-binding";
-import { acceptedIntakeResult } from "./semantic-records";
+import { createIntakeModelDispatcher } from "./model-dispatch";
+import { createSavIntakeSemanticReaders, SAV_INTAKE_MODEL_REVISION } from "./model-readers";
+import { withSavAiBudget } from "../gemini-transport";
+import { acceptedIntakeResult, recordAcceptedIntakeSemantics, SAV_INTAKE_SEMANTIC_RECORD_REVISION } from "./semantic-records";
 import { savIntakeDecisionSchema } from "./contract";
 import { collectExecutionCrm, assertExecutionCrmUnchanged } from "./execution-context";
 import { planSavIntake, savIntakePlanFingerprint, savIntakeEvidenceContentHash } from "./engine";
-import { savIntakeSourceSnapshot } from "./runtime-store";
+import { savIntakeSourceSnapshot, assertIntakeHumanAnalysis, reserveIntakeHumanCall } from "./runtime-store";
 import { admissionLock, executionJournal, occupyKeys, releaseKeys, assertNoLegacyConflict, executionMessageHash } from "./execution-store";
 import { createSavIntakeHubspotReaders } from "./hubspot-readers";
 import type { EngineInput, IntakeAdapters, IntakePlan } from "./engine-types";
@@ -23,7 +27,12 @@ import type { ExecutionPayload, EffectAck } from "./execution-types";
 async function mergedHumanResolution(event:typeof savIntakeHumanEvents.$inferSelect,parent:typeof savIntakeRuns.$inferSelect,value:HumanEventPayload,config:IntakeRuntimeConfig) {
   const resolution:NonNullable<EngineInput["humanResolution"]>={choiceId:event.id,at:event.createdAt.toISOString(),equivalentContactIds:value.candidateContactIds,inheritedChoiceIds:[],fieldSources:{}};
   const apply=(source:typeof event,body:HumanEventPayload)=>{
-    if(body.policyHash!==config.policyHash||body.resourcesHash!==config.resourcesHash||body.candidatesHash!==value.candidatesHash||source.sourceHash!==event.sourceHash) return conflict();
+    if(body.policyHash!==config.policyHash||body.resourcesHash!==config.resourcesHash||source.sourceHash!==event.sourceHash) return conflict();
+    if(body.candidatesHash!==value.candidatesHash) {
+      // A fresh server reanalysis can introduce candidates after an automatic
+      // Other decision. Never carry a contact/ticket choice across that scope.
+      if(body.contactId||body.ticketId)return conflict();
+    }
     for(const field of ["contactId","ticketId","classification"] as const) {
       if(resolution[field]===undefined&&body[field]!==undefined) {
         Object.assign(resolution,{[field]:body[field]});
@@ -156,23 +165,39 @@ export async function consumeIntakeHumanEvent(id: string, config: IntakeRuntimeC
     const original = decryptSavPayload<IntakeRuntimePayload>(parent.payloadCiphertext);
     if (value.parentPayloadHash !== intakeRuntimeHash(original) || original.configuration?.configHash !== config.configHash
       || value.mailboxId !== config.mailboxId || value.policyHash !== config.policyHash || value.resourcesHash !== config.resourcesHash) return conflict();
-    const input: EngineInput = { ...snapshot.input, humanResolution: await mergedHumanResolution(event,parent,value,config) };
+    const input: EngineInput = { ...intakeInputWithAttachments(snapshot.input, event.sourceHash, original.attachments), humanResolution: await mergedHumanResolution(event,parent,value,config) };
     let reason: string | undefined;
     const accepted = <T>(method: "analyseMessage" | "assessIdentity" | "assessIssues", data: unknown): T => {
       try { return acceptedIntakeResult<T>(original.semantics, method, data); }
       catch (error) { reason = error instanceof Error ? error.message : "SAV_INTAKE_SEMANTIC_PROVENANCE_MISSING"; throw error; }
     };
-    const deadline = AbortSignal.timeout(30000);
+    const deadline = AbortSignal.timeout(45000);
+    let reusableAnalysis: import("./engine-types").MessageAnalysis | null = null;
+    try { reusableAnalysis=acceptedIntakeResult(original.semantics,"analyseMessage",{message:input.message,conversation:input.conversation.data}); } catch { /* Missing accepted semantics require a real continuation below. */ }
+    const needsAnalysis=original.plan?.progress.kind==="qualified_other" && input.humanResolution?.classification!==undefined && input.humanResolution.classification!=="other"
+      && (!reusableAnalysis?.ticketSummary || reusableAnalysis.requests.some(r=>r.kind==="other"||r.kind==="unknown"));
+    const authority={eventId:id,parentRunId:parent.id,token};
+    const live=async()=>{if(savIntakeRuntimeConfig()?.configHash!==config.configHash||deadline.aborted)return conflict();await assertIntakeHumanAnalysis(authority,config);};
+    const dispatcher=needsAnalysis?createIntakeModelDispatcher({config,signal:deadline,live,reserve:hash=>reserveIntakeHumanCall(authority,config,hash)}):null;
+    const semantics: IntakeRuntimePayload["semantics"]=needsAnalysis?{revision:SAV_INTAKE_SEMANTIC_RECORD_REVISION,validatorRevision:SAV_INTAKE_MODEL_REVISION,records:[]}:original.semantics;
+    const fresh=dispatcher&&semantics?recordAcceptedIntakeSemantics(createSavIntakeSemanticReaders({model:config.model,call:dispatcher.call,humanClassification:input.humanResolution?.classification}),semantics,()=>{}):null;
     const boundedReaders = Object.fromEntries(Object.entries(readers).map(([name, fn]) => [name, async (argument: string, signal: AbortSignal) => {
       if (deadline.aborted) throw Error("SAV_INTAKE_HUMAN_REVALIDATION_REQUIRED");
       return fn(argument, AbortSignal.any([signal, deadline]));
     }])) as typeof readers;
     const confirmedPlan=input.humanResolution?.ticketId ? await confirmedCreationRevision(original,input,input.humanResolution.ticketId,config,boundedReaders) : null;
-    const plan = confirmedPlan ?? await planSavIntake(input, { ...boundedReaders,
-      analyseMessage: async data => accepted("analyseMessage", data), assessIdentity: async data => accepted("assessIdentity", data),
-      assessIssues: async data => data.tickets.length ? accepted("assessIssues", data) : { investigationComplete: true, tickets: [] },
+    const plan = confirmedPlan ?? await withSavAiBudget(()=>planSavIntake(input, { ...boundedReaders,
+      ...(fresh??{analyseMessage: async (data:Parameters<IntakeAdapters["analyseMessage"]>[0]) => accepted<Awaited<ReturnType<IntakeAdapters["analyseMessage"]>>>("analyseMessage", data),
+      assessIdentity: async (data:Parameters<NonNullable<IntakeAdapters["assessIdentity"]>>[0]) => accepted<Awaited<ReturnType<NonNullable<IntakeAdapters["assessIdentity"]>>>>("assessIdentity", data),
+      assessIssues: async (data:Parameters<IntakeAdapters["assessIssues"]>[0]) => data.tickets.length ? accepted<Awaited<ReturnType<IntakeAdapters["assessIssues"]>>>("assessIssues", data) : { investigationComplete: true, tickets: [] }}),
     }, input.humanResolution?.classification === "other" ? { ...config.policy, qualifiedOther: { evidenceSource: "human_override",
-      resource: { resourceId: id, revisionId: "sav-intake-human.v1", sha256: intakeRuntimeHash(input.humanResolution) } } } : config.policy, {}, () => new Date());
+      resource: { resourceId: id, revisionId: "sav-intake-human.v1", sha256: intakeRuntimeHash(input.humanResolution) } } } : config.policy, {}, () => new Date()));
+    if(dispatcher){
+      let timer:ReturnType<typeof setTimeout>|undefined;
+      try{await Promise.race([Promise.allSettled(dispatcher.pending),new Promise<never>((_,reject)=>{timer=setTimeout(()=>reject(Error("SAV_INTAKE_RUNTIME_SETTLEMENT_UNCERTAIN")),15000);})]);}finally{if(timer)clearTimeout(timer);}
+      if(dispatcher.uncertain)throw Error("SAV_INTAKE_RUNTIME_USAGE_UNCERTAIN");
+      await live(); reason=dispatcher.failureReason;
+    }
     const result = await db.transaction(async tx => {
       await admissionLock(tx);
       const [execution] = await tx.select().from(savIntakeExecutions).where(eq(savIntakeExecutions.messageId, event.messageId)).for("update");
@@ -186,17 +211,21 @@ export async function consumeIntakeHumanEvent(id: string, config: IntakeRuntimeC
         || !await intakeRunConfigurationBound(current, config, tx, event.id)) return conflict();
       const [last] = await tx.select({ version: savIntakeRuns.version }).from(savIntakeRuns).where(eq(savIntakeRuns.threadId, event.threadId)).orderBy(desc(savIntakeRuns.version)).limit(1);
       await tx.update(savIntakeRuns).set({ isCurrent: false, state: "superseded", freshUntil: null, leaseToken: null, leaseUntil: null }).where(eq(savIntakeRuns.id, parent.id));
-      const payload: IntakeRuntimePayload = { ...original, input, plan, reason, traces: [...(original.traces ?? []), { humanEventId: id,
-        semanticReuse: "accepted_results_exact_inputs", modelCalled: false, automaticAttemptsUnchanged: true }] };
+      const payload: IntakeRuntimePayload = { ...original, input, plan, reason, semantics, other:undefined, traces: [...(original.traces ?? []), { humanEventId: id,
+        semanticReuse: needsAnalysis?"new_budgeted_analysis":"accepted_results_exact_inputs", modelCalled: needsAnalysis, automaticAttemptsUnchanged: true }] };
       const [run] = await tx.insert(savIntakeRuns).values({ threadId: event.threadId, messageId: event.messageId, version: last.version + 1,
         configHash: humanRevisionConfigHash(config.configHash, id), policyHash: config.policyHash, sourceHash: event.sourceHash,
         state: plan.decision.disposition.kind === "collect_context" ? "waiting" : "observed", payloadCiphertext: encryptSavPayload(payload),
         humanChoiceCiphertext: encryptSavPayload({ eventId: id }), freshUntil: new Date(Math.min(Date.parse(input.now), ...plan.decision.evidence.map(e => Date.parse(e.observedAt))) + 300000) }).returning();
+      if(needsAnalysis) await tx.insert(savIntakeJournal).values({runId:run.id,kind:"human_reanalysis",payloadCiphertext:encryptSavPayload({
+        eventId:id,parentRunId:parent.id,sourceHash:event.sourceHash,inputHash:intakeRuntimeHash(input),planHash:intakeRuntimeHash(plan),
+        semanticsHash:intakeRuntimeHash(semantics),candidateContactIds:[...(plan.candidateContactIds??[])].sort(),
+      })});
       if (execution) await amendExecution(tx, event, run, plan, input);
       await tx.update(savIntakeHumanEvents).set({ state: "consumed", revisionRunId: run.id, leaseToken: null, leaseUntil: null }).where(eq(savIntakeHumanEvents.id, id));
       await tx.update(savMessages).set({ analysisStatus: run.state === "observed" ? "intake_observed" : "intake_waiting" }).where(eq(savMessages.id, event.messageId));
       await tx.insert(savIntakeJournal).values({ runId: run.id, kind: "human_revision", payloadCiphertext: encryptSavPayload({ eventId: id, parentRunId: parent.id,
-        automaticAttemptsUnchanged: true, callsUnchanged: true, reason: reason ?? null }) });
+        automaticAttemptsUnchanged: true, callsUnchanged: !needsAnalysis, reason: reason ?? null }) });
       return { runId: run.id, state: run.state };
     });
     return result;

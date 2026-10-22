@@ -323,3 +323,70 @@ it("daily quota deferral consumes no attempt and a fresh UTC day can claim the s
   vi.useFakeTimers({toFake:["Date"]});vi.setSystemTime(new Date(Date.parse(new Date().toISOString().slice(0,10)+"T00:00:00Z")+86400000));
   try {expect((await claimSavIntakeRun(id,config))?.run.attempts).toBe(1);}finally{vi.useRealTimers();}
 });
+
+it("does not analyze a truncated attachment inventory even when zero references were collected", async()=>{
+  await f.db.update(savMessages).set({bodyCiphertext:encryptSavPayload({text:"Synthetic complete customer request",headers:{},attachments:[],attachmentInventory:{complete:false,limits:["node_limit"]}})}).where(eq(savMessages.id,messageId));
+  const id=await enqueueSavIntakeMessage(messageId,config),network=vi.fn(async()=>{throw Error("NETWORK_FORBIDDEN");});
+  expect((await analyseSavIntakeRuntime(id!,config,{env:()=>environment,network})).state).toBe("waiting");
+  expect(network).not.toHaveBeenCalled();expect((await readSavIntakeCurrent(threadId,config))?.payload.plan?.decision.disposition.kind).toBe("collect_context");
+});
+it.each([false,true])("groups vision into understanding, masks before cache and preserves source (expansion=%s)",async(expansion)=>{
+  const {syntheticImage,attachmentMetadata}=await import("../../../../test/sav-attachments");
+  const bytes=await syntheticImage(),[source]=await f.db.select().from(savMessages).where(eq(savMessages.id,messageId)),[thread]=await f.db.select().from(savThreads).where(eq(savThreads.id,threadId));
+  const metadata=attachmentMetadata(bytes.length);metadata.reference={...metadata.reference!,mailboxEmail:"support@example.invalid",gmailMessageId:source.gmailMessageId!,gmailThreadId:thread.gmailThreadId};
+  const ciphertext=encryptSavPayload({text:"My configured application fails; the screenshot shows the error.",headers:{},attachments:[metadata],attachmentInventory:{complete:true,limits:[]}});
+  await f.db.update(savMessages).set({bodyCiphertext:ciphertext}).where(eq(savMessages.id,messageId));
+  const id=await enqueueSavIntakeMessage(messageId,config),canary="FAKE_VISUAL_SECRET_1234567890",wireBodies:unknown[]=[];
+  const network=vi.fn(async(url:Parameters<typeof fetch>[0],init?:RequestInit)=>{
+    if(String(url).startsWith("https://generativelanguage.googleapis.com/")){
+      const body=JSON.parse(String(init?.body)),data=JSON.parse(body.contents[0].parts[0].text);wireBodies.push(body);
+      expect(body.contents[0].parts).toHaveLength(2);expect(body.contents[0].parts[1].inlineData.data).toBe(bytes.toString("base64"));
+      expect(body.generationConfig.responseSchema.properties.images.items.properties.regions.items.properties.box).toMatchObject({type:"ARRAY",items:{type:"NUMBER"},nullable:true});
+      const answer={messageId,requests:[{id:"r1",kind:"support",currentMessageId:messageId,quoteId:data.citationCatalogue.find((x:{sourceId:string})=>x.sourceId==="current").id}],ticketSummary:{title:"Application connection error",description:`Error E42 token: ${canary}`,requestIds:["r1"]},images:[{index:0,readability:"readable",text:expansion?"a@b.co ".repeat(570):`Error E42 token: ${canary}`,uncertainties:[expansion?"a@b.co ".repeat(40):`token: ${canary}`],regions:[{text:expansion?"a@b.co ".repeat(140):`Error E42 token: ${canary}`,box:null}]}]};
+      return Response.json({candidates:[{finishReason:"STOP",content:{parts:[{text:JSON.stringify(answer)}]}}],usageMetadata:{promptTokenCount:1220,candidatesTokenCount:200,thoughtsTokenCount:0,totalTokenCount:1420}});
+    }
+    return Response.json({total:0,results:[]});
+  });
+  await analyseSavIntakeRuntime(id!,config,{env:()=>environment,network,downloadAttachments:async()=>bytes});
+  const current=await readSavIntakeCurrent(threadId,config);
+  expect(wireBodies).toHaveLength(1);expect(current?.payload.attachments?.read.observations[0]).toMatchObject({status:expansion?"partial":"analyzed",reason:expansion?"partial_content":"observed"});
+  expect(current?.payload.plan?.decision.evidence.some(e=>e.source==="current_attachment")).toBe(!expansion);
+  if(expansion){expect(current?.payload.plan?.decision.disposition.kind).toBe("collect_context");expect(JSON.stringify(current?.payload)).not.toContain("a@b.co");}
+  expect(JSON.stringify(current?.payload)).not.toContain(canary);
+  const calls=await f.db.select().from(savIntakeModelCalls);expect(calls).toHaveLength(1);expect(calls[0].state).toBe("settled");
+  expect(JSON.stringify(decryptSavPayload(calls[0].resultCiphertext!))).not.toContain(canary);
+  expect((await f.db.select().from(savMessages).where(eq(savMessages.id,messageId)))[0].bodyCiphertext).toBe(ciphertext);
+  expect(await f.db.select().from(savActions)).toHaveLength(0);
+});
+it("fences a human pause during image download before any model dispatch",async()=>{
+  const {syntheticImage,attachmentMetadata}=await import("../../../../test/sav-attachments");const bytes=await syntheticImage();
+  const [m]=await f.db.select().from(savMessages).where(eq(savMessages.id,messageId)),[t]=await f.db.select().from(savThreads).where(eq(savThreads.id,threadId));
+  const meta=attachmentMetadata(bytes.length);meta.reference={...meta.reference!,mailboxEmail:"support@example.invalid",gmailMessageId:m.gmailMessageId!,gmailThreadId:t.gmailThreadId};
+  await f.db.update(savMessages).set({bodyCiphertext:encryptSavPayload({text:"Synthetic application failure",attachments:[meta],attachmentInventory:{complete:true,limits:[]}})}).where(eq(savMessages.id,messageId));
+  const id=await enqueueSavIntakeMessage(messageId,config),network=vi.fn(async()=>{throw Error("NETWORK_FORBIDDEN");});
+  await analyseSavIntakeRuntime(id!,config,{env:()=>environment,network,downloadAttachments:async()=>{await f.db.update(savThreads).set({aiPaused:true}).where(eq(savThreads.id,threadId));return bytes;}});
+  expect(network).not.toHaveBeenCalled();expect(await f.db.select().from(savIntakeModelCalls)).toHaveLength(0);
+});
+
+it.each([false,true])("publishes only a still-fresh authenticated Other qualification (expire=%s)",async(expire)=>{
+  const {readSavOtherAuthentication}=await import("../other-auth"),sender="noreply.notifications@trustpilot.com",subject="Synthetic review 5 stars",text="Synthetic complete notification";
+  const hash=(s:string)=>createHash("sha256").update(s).digest("hex"),rules=[{id:"synthetic-rule",family:"trustpilot_positive",mailboxId,subjectSha256:hash(subject),bodySha256:hash(text)}];
+  environment={...environment,SAV_OTHER_OBSERVATION_RULES_JSON:JSON.stringify({version:1,rules:[{family:"trustpilot_positive",mailboxId,subjectSha256:[hash(subject)]}]}),
+    SAV_INTAKE_OTHER_RULES_JSON:JSON.stringify({version:1,resource:{resourceId:"synthetic-rule-resource",revisionId:"v1",sha256:hash(JSON.stringify(rules))},approvedBy:"synthetic-operator",approvedAt:new Date(Date.now()-60000).toISOString(),expiresAt:new Date(Date.now()+60000).toISOString(),rules})};
+  config=savIntakeRuntimeConfig(environment)!;
+  await f.db.update(savMessages).set({fromEmail:sender,subject,bodyCiphertext:encryptSavPayload({text,headers:{"in-reply-to":"",references:"","message-id":"synthetic-id","content-type":"text/plain"},attachments:[],attachmentInventory:{complete:true,limits:[]}})}).where(eq(savMessages.id,messageId));
+  const id=(await enqueueSavIntakeMessage(messageId,config))!,metadata=vi.fn(async(input:Parameters<typeof readSavOtherAuthentication>[0])=>readSavOtherAuthentication(input,async()=>Response.json({id:input.messageId,threadId:input.threadId,payload:{headers:[{name:"From",value:sender},{name:"Authentication-Results",value:"mx.google.com; dkim=pass header.i=@trustpilot.com; dmarc=pass header.from=trustpilot.com"}]}})));
+  const network=vi.fn(async(_url:Parameters<typeof fetch>[0],init?:RequestInit)=>{
+    const data=JSON.parse(JSON.parse(String(init?.body)).contents[0].parts[0].text);
+    if(expire) {vi.useFakeTimers({toFake:["Date"]});vi.setSystemTime(new Date(Date.now()+61000));}
+    return Response.json({candidates:[{finishReason:"STOP",content:{parts:[{text:JSON.stringify({messageId,requests:[{id:"noise",kind:"other",currentMessageId:messageId,quoteId:data.citationCatalogue.find((c:{sourceId:string})=>c.sourceId==="current").id}]})}]}}],usageMetadata:{promptTokenCount:100,candidatesTokenCount:50,thoughtsTokenCount:0,totalTokenCount:150}});
+  });
+  try {
+    await analyseSavIntakeRuntime(id,config,{env:()=>environment,network,authenticateOther:metadata});
+    const current=(await readSavIntakeCurrent(threadId,config))!;
+    expect(metadata).toHaveBeenCalledTimes(1);expect(network).toHaveBeenCalledTimes(1);
+    if(expire){expect(current.state).toBe("waiting");expect(current.payload.plan).toBeUndefined();expect(current.payload.other).toBeUndefined();}
+    else {expect(current.state).toBe("observed");expect(current.payload.plan?.progress.kind).toBe("qualified_other");expect(current.payload.other?.ruleId).toBe("synthetic-rule");}
+    expect(await f.db.select().from(savActions)).toHaveLength(0);
+  }finally{vi.useRealTimers();}
+});
