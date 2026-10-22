@@ -2,7 +2,8 @@ import { createElement, Fragment, type ComponentProps } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import { readFile, writeFile, mkdir } from "node:fs/promises";
 import { beforeEach, it, expect, vi } from "vitest";
-const mocks = vi.hoisted(() => ({ staff: vi.fn(), list: vi.fn(), detail: vi.fn(), action: vi.fn() }));
+const mocks = vi.hoisted(() => ({ staff: vi.fn(), list: vi.fn(), detail: vi.fn(), action: vi.fn(), crmDisplay: vi.fn() }));
+vi.mock("@/lib/sav/intake/crm-display-server",()=>({readIntakeCrmDisplay:mocks.crmDisplay}));
 vi.mock("@/lib/sav/intake/console-auth",()=>({requireIntakeConsoleStaff:mocks.staff}));
 vi.mock("@/lib/sav/intake/console-store",()=>({listIntakeConsole:mocks.list}));
 vi.mock("@/lib/sav/intake/console-detail",()=>({readIntakeConsoleDetail:mocks.detail}));
@@ -22,7 +23,7 @@ const detail={thread:{id:threadId,subject:fixture.rows[0].subject,paused:false,t
   current:{id:runId,messageId,candidateContactIds:["101","102"],sourceHash:"a".repeat(64),version:7,sourceMatches:true,payload:{reason:"SAV_INTAKE_RUNTIME_USAGE_UNCERTAIN",plan:{candidateContactIds:["101","102"],decision:{classification:"support",disposition:{kind:"collect_context",reasons:["contact_ambiguous"]},evidence:[{id:"current",source:"current_message",sourceId:messageId,observedAt:at.toISOString()}]}}}},
   messages:[{id:messageId,direction:"inbound",fromEmail:"fiction@example.invalid",receivedAt:at,createdAt:at,body:{text:"My synthetic connection no longer works. Please inspect this complete test request.",attachments:[]},translation:{status:"complete",language:"en",text:"Ma connexion synthétique ne fonctionne plus. Merci de vérifier cette demande de test complète.",revision:"synthetic",sourceHash:"synthetic",errorCode:null}}],historyTruncated:false,
   progress:{confirmed:false,state:"uncertain",ticketId:"201",reason:"SAV_INTAKE_EXECUTION_RECONCILIATION_REQUIRED",effects:[{id:"effect-1",kind:"ticket_create",state:"confirmed",confirmedAt:at},{id:"effect-2",kind:"email_associate",state:"uncertain",confirmedAt:null}]},choices:[]};
-beforeEach(()=>{vi.clearAllMocks();mocks.staff.mockResolvedValue({id:"synthetic",email:"ugo@limova.ai",role:"admin"});mocks.list.mockResolvedValue(fixture);mocks.detail.mockResolvedValue(detail);});
+beforeEach(()=>{vi.clearAllMocks();mocks.crmDisplay.mockResolvedValue({contacts:{"101":{label:"Alice Test",url:"https://app.hubspot.com/contacts/123/contact/101",available:true}},tickets:{"201":{label:"Connexion interrompue",url:"https://app.hubspot.com/contacts/123/ticket/201",available:true}}});mocks.staff.mockResolvedValue({id:"synthetic",email:"ugo@limova.ai",role:"admin"});mocks.list.mockResolvedValue(fixture);mocks.detail.mockResolvedValue(detail);});
 const renderList=async(query:{view?:string;q?:string;page?:string}={})=>renderToStaticMarkup(createElement(Fragment,null,await IntakeConsolePage({searchParams:Promise.resolve(query)})));
 const renderDetail=async()=>renderToStaticMarkup(createElement(Fragment,null,await IntakeDetailPage({params:Promise.resolve({id:threadId})})));
 it("six business views and distinct technical area use supplied counts and French states, without actions on GET",async()=>{
@@ -79,4 +80,9 @@ it("shows exhausted previous attempts on a pending new version without inheritin
   const html=await renderDetail();expect(html).toContain("Analyse bloquée");expect(html).toContain("deux tentatives");
   expect(html).toContain("Version 6");expect(html).toContain("qualification de la demande");
   expect(html).not.toContain("Aucun incident enregistré");expect(html).not.toContain('name="sourceHash"');expect(mocks.action).not.toHaveBeenCalled();
+});
+
+it("shows named clickable proposed contacts/tickets without turning the proposal into a confirmed result",async()=>{
+ mocks.detail.mockResolvedValue({...detail,current:{...detail.current,payload:{...detail.current.payload,plan:{...detail.current.payload.plan,decision:{...detail.current.payload.plan.decision,disposition:{kind:"ticket",target:{operation:"link",contactId:"101",ticketId:"201"}}}}}}});
+ const html=await renderDetail();expect(html).toContain("Alice Test");expect(html).toContain("Connexion interrompue");expect(html).toContain('href="https://app.hubspot.com/contacts/123/contact/101"');expect(html).toContain('href="https://app.hubspot.com/contacts/123/ticket/201"');expect(html).toContain('rel="noopener noreferrer"');expect(html).not.toContain("Contact HubSpot 101");expect(html).not.toContain("Ticket confirmé :");expect(mocks.action).not.toHaveBeenCalled();
 });

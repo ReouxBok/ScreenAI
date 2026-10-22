@@ -8,6 +8,8 @@ import { intakeRuntimeHash } from "@/lib/sav/intake/runtime-contract";
 import { formatParisDateTime } from "@/lib/paris-date";
 import { MailConversation } from "../../[id]/mail-conversation";
 import { IntakeChoiceForm } from "../choice-form";
+import {readIntakeCrmDisplay} from "@/lib/sav/intake/crm-display-server";
+import {crmDisplayFallback,type CrmDisplayRecord} from "@/lib/sav/intake/crm-display";
 import {IntakeRecoveryForm} from "../recovery-form";
 import { intakeStatusLabel, intakeReasonLabel, intakeContextReasonLabels } from "@/lib/sav/intake/console-presentation";
 import styles from "../intake.module.css";
@@ -16,6 +18,9 @@ const effectLabels: Record<string, string> = { ticket_create: "Création du tick
   email_create: "Conservation de l’email CRM", email_associate: "Rattachement de l’email", stage_new: "Statut Nouveau", identity_send: "Demande d’identification" };
 const stateLabels: Record<string, string> = { planned: "Prévu, sans départ", dispatched: "Départ enregistré, résultat à vérifier", acked: "Réponse fournisseur reçue, vérification en attente",
   confirmed: "Résultat vérifié", uncertain: "Résultat incertain, rapprochement requis" };
+function RecordLink({record}:{record:CrmDisplayRecord}) {
+  return record.url?<a href={record.url} target="_blank" rel="noopener noreferrer">{record.label}</a>:<span>{record.label}</span>;
+}
 export default async function IntakeDetailPage({ params }: { params: Promise<{ id: string }> }) {
   const staff=await requireIntakeConsoleStaff();
   const { id } = await params;
@@ -32,7 +37,11 @@ export default async function IntakeDetailPage({ params }: { params: Promise<{ i
   const tickets = [...new Set([...(data.progress?.effects.filter(e=>e.kind==="ticket_create"&&e.state==="confirmed"&&e.ack?.id).map(e=>e.ack!.id!)??[]),...(plan?.decision.evidence.filter(e => e.source === "crm_ticket" && /^\d+$/.test(e.sourceId)).map(e => e.sourceId) ?? [])])];
   const target = disposition?.kind === "ticket" ? disposition.target : null;
   const portal = process.env.HUBSPOT_PORTAL_ID;
-  const ticketUrl = portal && /^\d+$/.test(portal) && data.progress?.confirmed && data.progress.ticketId ? `https://app.hubspot.com/contacts/${portal}/ticket/${encodeURIComponent(data.progress.ticketId)}` : null;
+  const historicalTarget=historicalPlan?.decision.disposition.kind==="ticket"?historicalPlan.decision.disposition.target:null;
+  const display=await readIntakeCrmDisplay([...contacts,...(target?[target.contactId]:[]),...(historicalTarget?[historicalTarget.contactId]:[])],
+    [...tickets,...(target&&target.operation!=="create"?[target.ticketId]:[]),...(historicalTarget&&historicalTarget.operation!=="create"?[historicalTarget.ticketId]:[]),...(data.progress?.ticketId?[data.progress.ticketId]:[])]);
+  const contactRecord=(id:string)=>display.contacts[id]??crmDisplayFallback(portal,"contact",id);
+  const ticketRecord=(id:string)=>display.tickets[id]??crmDisplayFallback(portal,"ticket",id);
   const dirty = data.projection.epoch !== data.projection.projectedEpoch;
   const canCorrect = data.projection.status !== "historical_outside_automation" && Boolean(current && current.messageId === data.latestMessageId && current.sourceMatches && current.candidateContactIds !== null && !data.progress?.confirmed && current.sourceHash && plan && !data.thread.paused
     && !data.choices.some(event => event.kind === "refuse" && event.parentVersion === current.version)
@@ -47,21 +56,21 @@ export default async function IntakeDetailPage({ params }: { params: Promise<{ i
         {data.projection.status === "historical_outside_automation" ? <p>Historique conservé, hors automatisation. Un nouvel entrant après le lancement reprendra normalement avec cet historique.</p> : !plan ? <p>{blocked ? "Les diagnostics des tentatives précédentes sont conservés ci-dessous." : "Analyse en cours ou attente technique."} Aucune action n’est présentée comme accomplie.</p> : <>
           <dl><div><dt>Classification</dt><dd>{plan.decision.classification}</dd></div><div><dt>Parcours</dt><dd>{disposition?.kind === "ticket" ? target?.operation === "create" ? "Créer une fiche ticket" : target?.operation === "reopen" ? "Rouvrir le ticket" : "Rattacher au ticket"
             : disposition?.kind === "request_identification" ? "Demander l’adresse d’inscription" : disposition?.kind === "collect_context" ? "Compléter les preuves" : "Sans ticket"}</dd></div>
-            {target && <div><dt>Fiche proposée</dt><dd>Contact HubSpot {target.contactId}</dd></div>}
-            {target && target.operation !== "create" && <div><dt>Ticket proposé</dt><dd>{target.ticketId}</dd></div>}</dl>
+            {target && <div><dt>Fiche proposée</dt><dd><RecordLink record={contactRecord(target.contactId)}/></dd></div>}
+            {target && target.operation !== "create" && <div><dt>Ticket proposé</dt><dd><RecordLink record={ticketRecord(target.ticketId)}/></dd></div>}</dl>
           {disposition?.kind === "collect_context" && <p>À vérifier : {disposition.reasons.map(reason => intakeContextReasonLabels[reason] ?? "preuve à compléter").join(", ")}.</p>}
           <details><summary>Sources de la décision ({plan.decision.evidence.length})</summary><ul className={styles.evidence}>
             {plan.decision.evidence.map(e => <li key={e.id}><strong>{e.source.replaceAll("_", " ")}</strong> · {e.sourceId}<time>{formatParisDateTime(new Date(e.observedAt))}</time></li>)}
           </ul></details>
         </>}
       </section>
-      {historicalPlan && <section className={styles.history}><h2>Dernière analyse historique — non applicable à la demande actuelle</h2><p>Version {current?.version}. Les sources ou le dernier entrant ont changé ; ses anciennes propositions ne sont pas la décision actuelle.</p><details><summary>Consulter la proposition historique</summary><p>Classification historique : {historicalPlan.decision.classification}.</p>{historicalPlan.decision.disposition.kind === "ticket" && <p>Ancienne cible : contact {historicalPlan.decision.disposition.target.contactId}{historicalPlan.decision.disposition.target.operation !== "create" ? ` · ticket ${historicalPlan.decision.disposition.target.ticketId}` : " · création proposée"}.</p>}</details></section>}
+      {historicalPlan && <section className={styles.history}><h2>Dernière analyse historique — non applicable à la demande actuelle</h2><p>Version {current?.version}. Les sources ou le dernier entrant ont changé ; ses anciennes propositions ne sont pas la décision actuelle.</p><details><summary>Consulter la proposition historique</summary><p>Classification historique : {historicalPlan.decision.classification}.</p>{historicalPlan.decision.disposition.kind === "ticket" && <p>Ancienne cible : <RecordLink record={contactRecord(historicalPlan.decision.disposition.target.contactId)}/>{historicalPlan.decision.disposition.target.operation !== "create" ? <> · <RecordLink record={ticketRecord(historicalPlan.decision.disposition.target.ticketId)}/></> : " · création proposée"}.</p>}</details></section>}
       <section className={styles.decision}><h2>{applicable ? "Actions réellement accomplies" : "Actions historiques conservées"}</h2>
         {data.progress ? <ol className={styles.effects}>{data.progress.effects.map(effect => <li key={effect.id}>
           <span>{effectLabels[effect.kind] ?? effect.kind}</span><strong>{stateLabels[effect.state] ?? effect.state}</strong>
           {effect.confirmedAt && <time>{formatParisDateTime(effect.confirmedAt)}</time>}</li>)}</ol> : <p>Aucun effet n’a été engagé.</p>}
         {data.progress?.reason && <p>Attente : {intakeReasonLabel(data.progress.reason)}</p>}
-        {data.progress?.confirmed && data.progress.ticketId && <p>Ticket confirmé : <strong>{data.progress.ticketId}</strong>. {ticketUrl && <a href={ticketUrl} target="_blank" rel="noreferrer">Ouvrir le ticket HubSpot</a>} {data.projection.status === "followup_pending" ? "Premier suivi encore en attente." : "L’avancement du suivi reste fondé sur ses sources collectées."}</p>}
+        {data.progress?.confirmed && data.progress.ticketId && <p>Ticket confirmé : <RecordLink record={ticketRecord(data.progress.ticketId)}/>. {data.projection.status === "followup_pending" ? "Premier suivi encore en attente." : "L’avancement du suivi reste fondé sur ses sources collectées."}</p>}
         <p>Aucun brouillon de réponse de résolution n’a été produit par ce parcours. Les réponses supervisées existantes restent dans la file supervisée.</p>
       </section>
       <MailConversation messages={data.messages}/>
@@ -69,7 +78,7 @@ export default async function IntakeDetailPage({ params }: { params: Promise<{ i
     </div><aside className={styles.side}>
       {canCorrect && current?.sourceHash && plan ? <IntakeChoiceForm expected={{ commandKey: randomUUID(), threadId: id,
         messageId: current.messageId, runId: current.id, version: current.version, sourceHash: current.sourceHash,
-        candidatesHash: intakeRuntimeHash(contacts) }} contacts={contacts} tickets={tickets} classification={plan.decision.classification}/> :
+        candidatesHash: intakeRuntimeHash(contacts) }} contacts={contacts} tickets={tickets} display={display} classification={plan.decision.classification}/> :
         <section className={styles.notice}><h2>Correction indisponible</h2><p>{data.thread.paused ? "Le dossier est en pause." : "La version doit être courante, ses sources inchangées et aucun choix déjà en attente."}</p></section>}
       <section className={styles.history}><h2>Choix humains conservés</h2>{data.choices.length ? <ol>{data.choices.map(event => <li key={event.id}>
         <strong>{event.kind === "refuse" ? "Refus humain" : "Choix conditionnel"} · version {event.parentVersion}</strong><p>{event.reason}</p>

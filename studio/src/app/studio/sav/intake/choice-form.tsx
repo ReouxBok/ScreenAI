@@ -1,12 +1,13 @@
 "use client";
 import { useActionState, useState } from "react";
 import { saveIntakeChoice } from "./actions";
+import type {CrmDisplay} from "@/lib/sav/intake/crm-display";
 import styles from "./intake.module.css";
 export type IntakeChoiceFormProps = {
   expected: { commandKey: string; threadId: string; messageId: string; runId: string; version: number; sourceHash: string; candidatesHash: string };
-  contacts: string[]; tickets: string[]; classification: string;
+  contacts: string[]; tickets: string[]; classification: string; display?:CrmDisplay;
 };
-export function IntakeChoiceForm({ expected, contacts, tickets, classification }: IntakeChoiceFormProps) {
+export function IntakeChoiceForm({ expected, contacts, tickets, classification, display }: IntakeChoiceFormProps) {
   const [state, action, pending] = useActionState(saveIntakeChoice, { ok: false, message: "" });
   const [reason, setReason] = useState("");
   const [contact, setContact] = useState("");
@@ -26,11 +27,11 @@ export function IntakeChoiceForm({ expected, contacts, tickets, classification }
     <p>Votre choix reste conditionnel à la relecture des sources. Il ne donne aucun droit supplémentaire.</p>
     <fieldset disabled={pending || state.ok}>
       {contacts.length > 0 && <><legend>Fiche parmi les candidats équivalents</legend><div className={styles.radios}>
-        {contacts.map(id => <label key={id}><input type="radio" name="contactId" value={id} checked={contact === id} onChange={() => setContact(id)}/> Fiche HubSpot {id}</label>)}
+        {contacts.map(id => <label key={id}><input type="radio" name="contactId" value={id} checked={contact === id} onChange={() => setContact(id)}/> {display?.contacts[id]?.label??"Fiche client — nom indisponible"}{display?.contacts[id]?.url&&<> · <a href={display.contacts[id].url!} target="_blank" rel="noopener noreferrer">Ouvrir la fiche</a></>}</label>)}
       </div></>}
       {tickets.length > 0 && <label htmlFor="intake-ticket">Ticket à examiner<select id="intake-ticket" name="ticketId" value={ticket} onChange={event => setTicket(event.target.value)}>
-        <option value="">Conserver l’évaluation du sujet</option>{tickets.map(id => <option key={id} value={id}>Ticket {id}</option>)}
-      </select><small>Le worker vérifie sa pertinence et son lien réel à la fiche.</small></label>}
+        <option value="">Conserver l’évaluation du sujet</option>{tickets.map(id => <option key={id} value={id}>{display?.tickets[id]?.label??"Ticket — sujet indisponible"}</option>)}
+      </select><span>{tickets.map(id=>display?.tickets[id]?.url?<span key={id}><a href={display.tickets[id].url!} target="_blank" rel="noopener noreferrer">{display.tickets[id].label}</a>{" · "}</span>:null)}</span><small>Le worker vérifie sa pertinence et son lien réel à la fiche.</small></label>}
       <label htmlFor="intake-classification">Classification<select id="intake-classification" name="classification" value={category} onChange={event => setCategory(event.target.value)}>
         <option value="support">Support</option><option value="finance">Facturation</option><option value="cancellation">Résiliation</option>
         <option value="partnership">Partenariat</option><option value="commercial">Commercial</option><option value="investor">Investisseur</option><option value="other">Autres</option>
