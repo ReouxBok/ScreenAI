@@ -44,18 +44,18 @@
     "@tiptap/react": "^3.31.0",
     "@tiptap/starter-kit": "^3.31.0",
     "@vercel/blob": "^2.7.0",
+    "braces": "file:vendor/braces-3.0.3-screenai.1.tgz",
     "drizzle-orm": "^0.45.2",
     "gray-matter": "^4.0.3",
     "lucide-react": "^1.28.0",
-    "next": "16.3.8",
+    "next": "16.4.2",
     "postgres": "^3.4.9",
     "react": "19.2.8",
     "react-dom": "19.2.8",
     "server-only": "^0.0.1",
+    "sharp": "0.35.5",
     "workflow": "^4.8.5",
-    "zod": "^4.4.3",
-    "braces": "file:vendor/braces-3.0.3-screenai.1.tgz",
-    "sharp": "0.35.5"
+    "zod": "^4.4.3"
   },
   "devDependencies": {
     "@electric-sql/pglite": "^0.5.4",
@@ -67,7 +67,7 @@
     "dotenv-cli": "^11.0.0",
     "drizzle-kit": "^0.31.10",
     "eslint": "^9",
-    "eslint-config-next": "16.3.8",
+    "eslint-config-next": "16.4.2",
     "tsx": "^4.23.5",
     "typescript": "^5",
     "vitest": "^4.1.10"
