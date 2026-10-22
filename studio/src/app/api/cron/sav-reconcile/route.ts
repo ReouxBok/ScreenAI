@@ -14,6 +14,8 @@ import { reconcileSavObservations } from "@/lib/sav/observations";
 import { reconcileStaleTrainings } from "@/lib/training";
 import { processPendingSavContextRefreshes, dispatchPendingSavEmailOpenings } from "@/lib/sav/dispatch";
 import { refreshSavDashboardProjection, savSqlDashboardEnabled } from "@/lib/sav/dashboard-projection";
+import { randomUUID } from "node:crypto";
+import { recordSavWorkerPulse } from "@/lib/sav/monitor";
 
 export const runtime = "nodejs";
 export const maxDuration = 300;
@@ -40,6 +42,9 @@ export async function GET(request: Request) {
   if (!process.env.CRON_SECRET || request.headers.get("authorization") !== `Bearer ${process.env.CRON_SECRET}`) {
     return Response.json({ error: "unauthorized" }, { status: 401 });
   }
+  const pulseId = randomUUID(), pulseStartedAt = new Date().toISOString();
+  await recordSavWorkerPulse(pulseId, pulseStartedAt);
+  try {
   const derivedDeadline=Date.now()+270000;
   const [gmail, hubspot] = await Promise.all([
     runStep("gmail_receipts", () => processPendingGmailReceipts(50)),
@@ -56,7 +61,7 @@ export async function GET(request: Request) {
   const ticketActions = await runStep("hubspot_ticket_actions", () => processPendingHubspotActions(50));
   const intakeObservation = await runStep("intake_observation", () => reconcileSavIntakeRuntime({ deadlineMs: derivedDeadline }));
   const intakeChoices = await runStep("intake_choices", () => Date.now()+45_000>derivedDeadline?Promise.resolve({skipped:"deadline"}):reconcileIntakeHumanChoices());
-  const intakeExecution = await runStep("intake_execution",()=>Date.now()+60_000>derivedDeadline?Promise.resolve({skipped:"deadline"}):reconcileIntakeExecutor({deadlineMs:derivedDeadline}));
+  const intakeExecution = await runStep<Awaited<ReturnType<typeof reconcileIntakeExecutor>> | { skipped: string }>("intake_execution",()=>Date.now()+60_000>derivedDeadline?Promise.resolve({skipped:"deadline"}):reconcileIntakeExecutor({deadlineMs:derivedDeadline}));
   const intakeTracking = await runStep("intake_tracking", () => ensureIntakeObservations(4));
   const intakeConsole = await runStep("intake_console", () => refreshIntakeConsole(20));
   // Four model runs leave enough headroom for the 45 s grounded-agent budget,
@@ -82,5 +87,10 @@ export async function GET(request: Request) {
     : { status: "skipped" as const, durationMs: 0, data: { reason: "disabled" } };
   const payload = { intakeTracking, intakeChoices, intakeConsole, intakeExecution, intakeObservation, gmail, hubspot, emailOpenings, contextRefreshes, trainings, evaluations, ticketActions, pilotItems, pendingMessages, pilotActions, followups, replies, statusActions, learningBackfill, observations, translations, retention, dashboardProjection };
   const hasStepFailure = Object.values(payload).some((step) => step.status === "error");
+  await recordSavWorkerPulse(pulseId, pulseStartedAt, hasStepFailure);
   return Response.json(payload, { status: hasStepFailure ? 500 : 200 });
+  } catch (error) {
+    await recordSavWorkerPulse(pulseId, pulseStartedAt, true);
+    throw error;
+  }
 }
