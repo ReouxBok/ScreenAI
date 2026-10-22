@@ -108,6 +108,13 @@ it("keeps an unresolved old quarantine visible after its timestamps age",async()
   await f.db.insert(savGmailQuarantine).values({mailboxId,gmailMessageId:randomUUID(),cause:"synthetic",lastFailedAt:new Date(Date.now()-2*86400000)});
   expect((await collectSavMonitorSnapshot()).issues).toContainEqual({code:"quarantine",count:1,severity:"warning"});
 });
+it("preserves the last worker failure across later starts until a successful finish",async()=>{
+  await workerFailed();
+  const id=randomUUID(), startedAt=new Date().toISOString();await recordSavWorkerPulse(id,startedAt);
+  expect((await collectSavMonitorSnapshot()).issues).toContainEqual({code:"worker_failed",count:1,severity:"critical"});
+  await recordSavWorkerPulse(id,startedAt,false);
+  expect((await collectSavMonitorSnapshot()).issues.some(i=>i.code==='worker_failed')).toBe(false);
+});
 it("distinguishes exhausted technical analysis from a normal human context question",async()=>{
   await launch();
   const old=new Date(Date.now()-1200000);

@@ -58,7 +58,7 @@ export async function collectSavMonitorSnapshot(): Promise<MonitorSnapshot> {
         if (!Number.isFinite(age) || age < 0 || !Number.isFinite(completionAge) || completionAge < 0) throw Error("MONITOR_WORKER_CLOCK");
         metrics.workerAgeSeconds = Math.floor(age / 1000);
         metrics.workerCompletionAgeSeconds=Math.floor(completionAge/1000);
-        add("worker_stalled", age > 15 * 60000 || completionAge > 15*60000 ? 1 : 0, "critical"); add("worker_failed", worker.status === "failed" ? 1 : 0, "critical");
+        add("worker_stalled", age > 15 * 60000 || completionAge > 15*60000 ? 1 : 0, "critical"); add("worker_failed", worker.status === "failed" || p.failed === true ? 1 : 0, "critical");
       }
       const launches = rows.filter(r => r.status === "intake_launch_v1" && r.key.startsWith("sav-intake-launch:"));
       metrics.launchedMailboxes = launches.length;
