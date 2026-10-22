@@ -59,6 +59,44 @@ function isLimovaUrl(value) {
   }
 }
 
+function siteNameOf(value) {
+  try {
+    return new URL(value).hostname.replace(/^www\./, '');
+  } catch {
+    return 'site inconnu';
+  }
+}
+
+// Charly works on any web page the user brings it to. Chrome keeps its own
+// pages (settings, Web Store) out of reach of every extension.
+const UNSCRIPTABLE_HOSTS = new Set(['chromewebstore.google.com', 'chrome.google.com']);
+
+function isWebPageUrl(value) {
+  try {
+    const url = new URL(value);
+    return ['https:', 'http:'].includes(url.protocol) && !UNSCRIPTABLE_HOSTS.has(url.hostname);
+  } catch {
+    return false;
+  }
+}
+
+function isExternalSiteUrl(value) {
+  return isWebPageUrl(value) && !isLimovaUrl(value);
+}
+
+function isAssistedUrl(value) {
+  return isWebPageUrl(value);
+}
+
+// The page driver is only injected into tabs where Charly is actually used,
+// never into every page the user browses.
+async function ensureContentScript(tabId) {
+  const reachable = await chrome.tabs.sendMessage(tabId, { type: 'DIAGNOSTIC_PING' }).catch(() => null);
+  if (reachable) return true;
+  await chrome.scripting.executeScript({ target: { tabId }, files: ['src/content/content.js'] });
+  return true;
+}
+
 // ============================================================================
 // Session State
 // ============================================================================
@@ -257,7 +295,7 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
   if (!sessionState.isActive && !trainingState.active && !evaluationState.active) return;
   if (sessionState.lockedTabId && tabId !== sessionState.lockedTabId) return;
   if (changeInfo.status !== 'complete') return;
-  if (!isLimovaUrl(tab.url)) return;
+  if (!isFollowedPageUrl(tabId, tab.url)) return;
 
   if (urlChangeTimeout) clearTimeout(urlChangeTimeout);
   urlChangeTimeout = setTimeout(() => handleUrlChange(tabId, tab.url), URL_CHANGE_DEBOUNCE);
@@ -268,11 +306,16 @@ chrome.webNavigation.onHistoryStateUpdated.addListener((details) => {
   if (!sessionState.isActive && !trainingState.active) return;
   if (details.frameId !== 0) return; // main frame only
   if (sessionState.lockedTabId && details.tabId !== sessionState.lockedTabId) return;
-  if (!isLimovaUrl(details.url)) return;
+  if (!isFollowedPageUrl(details.tabId, details.url)) return;
 
   if (urlChangeTimeout) clearTimeout(urlChangeTimeout);
   urlChangeTimeout = setTimeout(() => handleUrlChange(details.tabId, details.url), URL_CHANGE_DEBOUNCE);
-}, { url: [{ schemes: ['https'], hostEquals: 'new.limova.ai' }] });
+}, { url: [{ schemes: ['https', 'http'] }] });
+
+// Limova pages are always followed; another site only once Charly works in that tab.
+function isFollowedPageUrl(tabId, url) {
+  return isLimovaUrl(url) || (tabId === sessionState.lockedTabId && isAssistedUrl(url));
+}
 
 chrome.tabs.onCreated.addListener((tab) => {
   trackExternalPopup(tab).catch(error => Logger.warn('popup', 'External popup tracking failed', error));
@@ -353,8 +396,10 @@ async function handleUrlChange(tabId, url, { force = false } = {}) {
     await recordTrainingContext(context, url);
   }
   if (!sessionState.isActive) return;
+  if (!(await isSidebarOpen())) return;
   if (!(await hasAIProcessingConsent())) return;
   if (generation !== sessionGeneration) return;
+  const externalSite = isExternalSiteUrl(url);
   url = privacySafeUrl(url);
   if (!force && url === sessionState.lastUrl) return;
   sessionState.lastUrl = url;
@@ -367,13 +412,16 @@ async function handleUrlChange(tabId, url, { force = false } = {}) {
 
   if (activeAbortController) activeAbortController.abort();
 
-  if (!voiceSessionActive) {
+  if (!voiceSessionActive && !externalSite) {
     broadcastToSidebar({ type: 'STATUS_UPDATE', status: 'analyzing', text: 'Nouvelle page détectée...', ponderingText: 'ponderingNewPage' });
   }
 
   try {
     const pageContext = await getPageContext(tabId);
     if (generation !== sessionGeneration) return;
+    // On other sites the written chat only refreshes the page map: Charly
+    // comments a page when the user asks, not on every navigation.
+    if (externalSite && !voiceSessionActive) return;
     const pageAnalysis = await capturePageAnalysis(tabId);
     if (generation !== sessionGeneration) return;
     if (voiceSessionActive) {
@@ -438,7 +486,34 @@ async function handleTabActivated(tabId) {
     await trackExternalPopup(tab);
     if (externalPopupTabs.has(tabId)) return;
   }
+  if (tabId === sessionState.lockedTabId) return;
+  if (await followActivatedTab(tabId)) return;
   broadcastToSidebar({ type: 'WRONG_TAB' });
+}
+
+// Like the Claude and ChatGPT side panels, Charly works on the tab in front:
+// switching to another web page moves it there and refreshes what it sees.
+// Training and flow tests stay bound to their Limova tab.
+async function followActivatedTab(tabId) {
+  if (trainingState.active || evaluationState.active) return false;
+  // A tab opened by a handoff or open_page is driven by that operation; an
+  // automatic page analysis there would talk over the chat being sent.
+  if (tabOpeningsInProgress > 0) return true;
+  const tab = await chrome.tabs.get(tabId).catch(() => null);
+  if (!tab?.id || !tab.active || !isAssistedUrl(tab.url)) return false;
+  if (!(await isSidebarOpen())) return false;
+  const previousTabId = sessionState.lockedTabId;
+  if (isExternalSiteUrl(tab.url)) await ensureContentScript(tab.id).catch(() => {});
+  if (previousTabId && previousTabId !== tab.id) {
+    hideAgentPresence(previousTabId);
+    chrome.tabs.sendMessage(previousTabId, { type: 'SESSION_STATE', active: false }).catch(() => {});
+  }
+  lockTab(tab.id);
+  chrome.tabs.sendMessage(tab.id, { type: 'SESSION_STATE', active: true }).catch(() => {});
+  broadcastToSidebar({ type: 'CORRECT_TAB' });
+  Logger.event('tabs', 'ASSISTANT_FOLLOWED_ACTIVE_TAB', { external: isExternalSiteUrl(tab.url) });
+  await handleUrlChange(tab.id, tab.url, { force: true });
+  return true;
 }
 
 chrome.tabs.onRemoved.addListener((tabId) => {
@@ -479,8 +554,11 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
 });
 
 const CONTENT_SCRIPT_MESSAGE_TYPES = new Set([
-  'GET_SESSION_STATE', 'MODAL_DETECTED', 'TRAINING_EVENT', 'LIMOVA_PROFILE', 'USER_PAGE_INTERACTION'
+  'GET_SESSION_STATE', 'MODAL_DETECTED', 'TRAINING_EVENT', 'LIMOVA_PROFILE', 'USER_PAGE_INTERACTION', 'STOP_AGENT'
 ]);
+// Other sites run the same page driver, but only these messages are accepted
+// from them: profile, training and modal analysis stay bound to Limova.
+const EXTERNAL_SITE_MESSAGE_TYPES = new Set(['USER_PAGE_INTERACTION', 'STOP_AGENT', 'GET_SESSION_STATE']);
 
 function isTrustedMessageSource(request, sender) {
   if (!request || typeof request.type !== 'string') return false;
@@ -490,7 +568,9 @@ function isTrustedMessageSource(request, sender) {
   if (typeof sender.url === 'string' && sender.url.startsWith(extensionRoot)) return true;
 
   const pageUrl = sender.tab?.url || sender.url;
-  return CONTENT_SCRIPT_MESSAGE_TYPES.has(request.type) && isLimovaUrl(pageUrl);
+  if (!CONTENT_SCRIPT_MESSAGE_TYPES.has(request.type)) return false;
+  if (isLimovaUrl(pageUrl)) return true;
+  return EXTERNAL_SITE_MESSAGE_TYPES.has(request.type) && isExternalSiteUrl(pageUrl);
 }
 
 async function handleMessage(request, sender) {
@@ -543,6 +623,7 @@ async function handleMessage(request, sender) {
 
     case 'AUTH_LOGOUT':
       await clearCharlyAuthSession(false);
+      await chrome.storage.local.remove(USER_FIRST_NAME_KEY).catch(() => {});
       handleResetSession();
       return { ok: true, authenticated: false };
 
@@ -567,6 +648,12 @@ async function handleMessage(request, sender) {
 
     case 'RESET_SESSION':
       return handleResetSession();
+
+    case 'STOP_AGENT':
+      return stopAgent();
+
+    case 'HANDOFF_TO_LIMOVA':
+      return handoffToLimova(request.text);
 
     case 'SWITCH_TO_LOCKED_TAB':
       if (sessionState.lockedTabId) {
@@ -654,6 +741,14 @@ async function handleMessage(request, sender) {
         scrollVoicePage(request.direction, request.amount, request.elementId, request.contextVersion)
       );
 
+    case 'VOICE_OPEN_PAGE':
+      return runEvaluatedVoiceTool('open_page', request.url, () =>
+        openPageForUser(request.url, { newTab: request.newTab === true })
+      );
+
+    case 'VOICE_CREATE_IN_LIMOVA':
+      return runEvaluatedVoiceTool('create_in_limova', '', () => createInLimovaByVoice(request.request));
+
     case 'VOICE_KB_SEARCH':
       return runEvaluatedVoiceTool('search_knowledge_base', '', () => searchVoiceKnowledge(request.query));
 
@@ -661,6 +756,10 @@ async function handleMessage(request, sender) {
       if (request.active !== true || !voiceSessionActive) {
         voiceSessionGeneration += 1;
         for (const controller of voiceTokenControllers) controller.abort();
+      }
+      // Ending the conversation also stops a Limova message Charly is still writing.
+      if (request.active !== true && voiceSessionActive) {
+        for (const tabId of [...presenceTabs]) hideAgentPresence(tabId, { stop: true });
       }
       voiceSessionActive = request.active === true;
       if (voiceSessionActive && activeAbortController) activeAbortController.abort();
@@ -1213,9 +1312,10 @@ async function handleUserMessage(text) {
     broadcastToSidebar({ type: 'CONSENT_REQUIRED' });
     return { ok: false, consentRequired: true };
   }
-  const tab = await getActiveLimovaTab();
+  const tab = await getActiveAssistedTab();
   if (generation !== sessionGeneration) return { ok: true };
-  if (tab && !sessionState.lockedTabId) lockTab(tab.id);
+  if (tab && isExternalSiteUrl(tab.url)) await ensureContentScript(tab.id).catch(() => false);
+  if (tab && tab.id !== sessionState.lockedTabId) lockTab(tab.id);
   const operationId = Logger.createOperationId('chat');
 
   Logger.logTurnStart('user_message', {
@@ -1303,10 +1403,10 @@ async function handleTakeScreenshot() {
     broadcastToSidebar({ type: 'CONSENT_REQUIRED' });
     return { ok: false, consentRequired: true };
   }
-  const tab = await getActiveLimovaTab();
+  const tab = await getActiveAssistedTab();
   if (generation !== sessionGeneration) return { ok: true };
   if (!tab) {
-    broadcastToSidebar({ type: 'ERROR', content: 'Ouvre new.limova.ai pour analyser une page.' });
+    broadcastToSidebar({ type: 'ERROR', content: 'Ouvre une page web pour que Charly puisse l’analyser.' });
     return { ok: false };
   }
 
@@ -1435,6 +1535,7 @@ async function handleModalDetected(sender, modal = {}) {
     });
   }
   if (!sessionState.isActive) return { ok: true };
+  if (!(await isSidebarOpen())) return { ok: true, ignored: true };
   if (!(await hasAIProcessingConsent())) return { ok: false };
   if (generation !== sessionGeneration) return { ok: true };
 
@@ -1624,6 +1725,7 @@ async function sendToCopilotV2({ tab, userMessage, pageContext, operationId, _se
     body: JSON.stringify({
       sessionId,
       ...(sessionState.resetContext ? { resetContext: true } : {}),
+      ...(await userFirstNameField()),
       message: userMessage,
       source: 'text',
       locale: copilotLocale(),
@@ -1667,29 +1769,35 @@ async function sendToCopilotV2({ tab, userMessage, pageContext, operationId, _se
   if (generation !== sessionGeneration) return;
   if (!response.ok) throw codedError('COPILOT_ADK_FAILED', data.error || 'Charly est temporairement indisponible.');
   let actionCount = 0;
-  while (data.type === 'tool_call') {
-    actionCount += 1;
-    if (actionCount > 6) throw codedError('COPILOT_ACTION_LIMIT', 'Charly s’est arrêtée pour éviter une boucle d’actions.');
-    const result = await executeCopilotTool(data.call, userMessage, operationId);
-    if (generation !== sessionGeneration) return;
-    if (evaluationState.active) await recordEvaluationEvent({
-      kind: 'tool_result',
-      toolName: data.call?.name,
-      status: result.status,
-      path: result.page?.url,
-      targetLabel: data.call?.args?.targetLabel,
-      contextVersion: result.contextVersion
-    });
-    if (generation !== sessionGeneration) return;
-    response = await authorizedProxyFetch(`/api/copilot/v2/runs/${encodeURIComponent(data.runId)}/result`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(result),
-      signal: controller.signal
-    });
-    data = await response.json().catch(() => ({}));
-    if (generation !== sessionGeneration) return;
-    if (!response.ok) throw codedError(response.status === 410 ? 'COPILOT_RUN_EXPIRED' : 'COPILOT_RUN_FAILED', data.error || 'L’action de Charly a expiré. Réessaie.');
+  const presenceTabId = tab?.id || sessionState.lockedTabId;
+  try {
+    while (data.type === 'tool_call') {
+      actionCount += 1;
+      if (actionCount > 6) throw codedError('COPILOT_ACTION_LIMIT', 'Charly s’est arrêtée pour éviter une boucle d’actions.');
+      if (PAGE_ACTION_TOOLS.has(data.call?.name)) await showAgentPresence(presenceTabId);
+      const result = await executeCopilotTool(data.call, userMessage, operationId);
+      if (generation !== sessionGeneration) return;
+      if (evaluationState.active) await recordEvaluationEvent({
+        kind: 'tool_result',
+        toolName: data.call?.name,
+        status: result.status,
+        path: result.page?.url,
+        targetLabel: data.call?.args?.targetLabel,
+        contextVersion: result.contextVersion
+      });
+      if (generation !== sessionGeneration) return;
+      response = await authorizedProxyFetch(`/api/copilot/v2/runs/${encodeURIComponent(data.runId)}/result`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(result),
+        signal: controller.signal
+      });
+      data = await response.json().catch(() => ({}));
+      if (generation !== sessionGeneration) return;
+      if (!response.ok) throw codedError(response.status === 410 ? 'COPILOT_RUN_EXPIRED' : 'COPILOT_RUN_FAILED', data.error || 'L’action de Charly a expiré. Réessaie.');
+    }
+  } finally {
+    hideAgentPresence(presenceTabId);
   }
   if (data.type !== 'message' || typeof data.content !== 'string') throw codedError('COPILOT_INVALID_RESPONSE', 'Réponse Charly invalide.');
   const content = data.content.trim();
@@ -1830,6 +1938,7 @@ async function sendToGemini({
         systemInstruction: { parts: [{ text: systemPrompt }] },
         contents,
         ...(sessionState.resetContext ? { resetContext: true } : {}),
+        ...(await userFirstNameField()),
         ...(userMessage && !_suppressMemoryTurn ? {
           memoryTurn: {
             user: userMessage,
@@ -2117,7 +2226,7 @@ async function capturePageAnalysis(tabId = sessionState.lockedTabId, operationId
   let prepared = false;
   try {
     const tab = await chrome.tabs.get(tabId);
-    if (!tab?.active || !isLimovaUrl(tab.url)) {
+    if (!tab?.active || !isAssistedUrl(tab.url)) {
       Logger.event('visual', 'VISUAL_CAPTURE_SKIPPED_INACTIVE_TAB', null, operationId);
       return null;
     }
@@ -2183,7 +2292,7 @@ async function getPageContext(tabId, operation = { generation: sessionGeneration
   try {
     const results = await chrome.scripting.executeScript({
       target: { tabId },
-      func: (contextVersion) => {
+      func: (contextVersion, limovaOrigin) => {
         document.documentElement.dataset.limovaContextVersion = String(contextVersion);
         // Clean up previous IDs
         document.querySelectorAll('[data-lid]').forEach(el => el.removeAttribute('data-lid'));
@@ -2193,8 +2302,13 @@ async function getPageContext(tabId, operation = { generation: sessionGeneration
 
         // Helper: get zone from DOM position
         function getZone(el) {
-          const modal = el.closest('[role="dialog"], [role="alertdialog"], [aria-modal="true"], dialog, [class*="modal" i], [class*="dialog" i], [class*="drawer" i], [class*="popup" i]');
-          if (modal) return 'modal';
+          if (activeModalSurface?.contains(el)) return 'modal';
+          if (el.closest('[role="dialog"], [role="alertdialog"], [aria-modal="true"], dialog[open]')) return 'modal';
+          // Limova names its own overlays modal/dialog/drawer/popup. Elsewhere
+          // such class names are layout wrappers (Drupal wraps whole sites in
+          // .dialog-off-canvas-main-canvas) and only the detected surface counts.
+          if (window.location.origin === limovaOrigin
+            && el.closest('dialog, [class*="modal" i], [class*="dialog" i], [class*="drawer" i], [class*="popup" i]')) return 'modal';
           const nav = el.closest('nav, [role="navigation"], [class*="sidebar"], [class*="nav"]');
           if (nav) return 'nav';
           const header = el.closest('header, [class*="header"], [class*="topbar"]');
@@ -2229,6 +2343,15 @@ async function getPageContext(tabId, operation = { generation: sessionGeneration
           return true;
         }
 
+        function isLayeredAbovePage(element) {
+          for (let current = element; current && current !== document.body; current = current.parentElement) {
+            const style = window.getComputedStyle(current);
+            if (style.position === 'fixed') return true;
+            if (style.position === 'absolute' && (Number.parseInt(style.zIndex, 10) || 0) >= 10) return true;
+          }
+          return false;
+        }
+
         function isModalSurfaceCandidate(element) {
           if (!(element instanceof HTMLElement)) return false;
           const rect = element.getBoundingClientRect();
@@ -2237,16 +2360,33 @@ async function getPageContext(tabId, operation = { generation: sessionGeneration
           const role = element.getAttribute('role');
           if (role === 'dialog' || role === 'alertdialog' || element.getAttribute('aria-modal') === 'true') return true;
           if (element.tagName === 'DIALOG' && element.hasAttribute('open')) return true;
-          if (/(modal|dialog|overlay|popup|lightbox|drawer)/i.test(String(element.className || '')) && rect.width > 100 && rect.height > 100) return true;
+          // A class name alone is not enough (Le Monde's live form is "--overlay"):
+          // the surface must also sit above the page and be on screen.
           const zIndex = Number.parseInt(style.zIndex, 10) || 0;
           const coversViewportCenter = rect.left <= window.innerWidth / 2
             && rect.right >= window.innerWidth / 2
             && rect.top <= window.innerHeight / 2
             && rect.bottom >= window.innerHeight / 2;
+          const coverage = (rect.width * rect.height) / Math.max(1, window.innerWidth * window.innerHeight);
+          // A class name alone is not enough on the open web (Le Monde's live form
+          // is "--overlay", Le Figaro's mini video player "jw-overlays"): the
+          // surface must sit above the page and block its centre, like a real popup.
+          if (/(modal|dialog|overlay|popup|lightbox|drawer)/i.test(String(element.className || ''))
+            && rect.width > 100 && rect.height > 100
+            && coversViewportCenter
+            && coverage > 0.12
+            && isLayeredAbovePage(element)) return true;
           return style.position === 'fixed'
             && zIndex >= 10
             && coversViewportCenter
-            && (rect.width * rect.height) / Math.max(1, window.innerWidth * window.innerHeight) > 0.12;
+            && coverage > 0.12;
+        }
+
+        // A surface Charly cannot read (an iframe, an empty video layer) must not
+        // hide the page: it would leave Charly with nothing to see or click.
+        function hasReadableControls(element) {
+          return element.tagName !== 'IFRAME'
+            && Boolean(element.querySelector('a[href], button, input, select, textarea, [role="button"], [role="link"], [tabindex]:not([tabindex="-1"])'));
         }
 
         function findActiveModalSurface() {
@@ -2257,7 +2397,8 @@ async function getPageContext(tabId, operation = { generation: sessionGeneration
             '[class*="lightbox" i], [class*="drawer" i], [data-radix-portal] > *, [data-headlessui-portal] > *'
           );
           const shallow = [...document.body.children].flatMap(element => [element, ...element.children]);
-          const candidates = [...new Set([...signaled, ...shallow])].filter(isModalSurfaceCandidate);
+          const candidates = [...new Set([...signaled, ...shallow])]
+            .filter(element => isModalSurfaceCandidate(element) && hasReadableControls(element));
           if (!candidates.length) return null;
           const score = element => {
             const rect = element.getBoundingClientRect();
@@ -2476,7 +2617,22 @@ async function getPageContext(tabId, operation = { generation: sessionGeneration
           return getExplicitLabel(el)
             || (isInferredMessageSendButton(el) ? 'Envoyer le message' : '')
             || (el.textContent || '').trim().replace(/\s+/g, ' ').substring(0, 80)
+            || getIconLinkLabel(el)
             || '';
+        }
+
+        // Icon-only links (logo, house icon) have no text at all. Name them from
+        // what they point to so the model can still answer "va à l'accueil".
+        function getIconLinkLabel(el) {
+          if (!(el instanceof HTMLAnchorElement) || !el.href) return '';
+          const hints = `${el.className || ''} ${el.querySelector('img, svg')?.getAttribute('class') || ''} ${el.getAttribute('data-testid') || ''}`;
+          let target;
+          try { target = new URL(el.href, window.location.href); } catch (_) { return ''; }
+          if (target.origin !== window.location.origin) return '';
+          const segments = target.pathname.split('/').filter(Boolean);
+          const isRoot = segments.length === 0 || /^(?:home|accueil|dashboard|feed)$/i.test(segments.at(-1) || '');
+          if (/logo|brand|home/i.test(hints) || isRoot) return 'Accueil (logo)';
+          return `Lien vers /${segments.slice(-2).join('/')}`;
         }
 
         // Helper: detect if element looks disabled
@@ -2708,16 +2864,49 @@ async function getPageContext(tabId, operation = { generation: sessionGeneration
           }
         }).filter(Boolean);
 
+        // 10. On other sites the controls say little: Charly also needs the text
+        // the user reads (article, post, message), on screen first, then below.
+        function getReadableText(maxLength = 4000) {
+          const root = activeModalSurface || document.querySelector('main, [role="main"], article') || document.body;
+          const onScreen = [];
+          const below = [];
+          const seen = new Set();
+          for (const block of root.querySelectorAll('h1, h2, h3, h4, p, li, blockquote, figcaption, dd, td, pre')) {
+            if (block.closest('nav, footer, [aria-hidden="true"], [contenteditable="true"]')) continue;
+            if (block.parentElement?.closest('p, li, blockquote, dd, td, pre')) continue;
+            const rect = block.getBoundingClientRect();
+            if (rect.width === 0 || rect.height === 0 || rect.bottom < 0) continue;
+            const text = sanitizeVisibleText(block.innerText || block.textContent, 600);
+            if (text.length < 2 || seen.has(text)) continue;
+            seen.add(text);
+            const line = /^H\d$/.test(block.tagName) ? `${block.tagName.toLowerCase()}: ${text}` : text;
+            (rect.top < window.innerHeight ? onScreen : below).push(line);
+          }
+          const take = (lines, budget) => {
+            const kept = [];
+            for (const line of lines) {
+              if (budget - line.length - 1 < 0) break;
+              kept.push(line);
+              budget -= line.length + 1;
+            }
+            return kept;
+          };
+          const visible = take(onScreen, maxLength);
+          const rest = take(below, maxLength - visible.join('\n').length);
+          return { visible, below: rest };
+        }
+
         return {
           title: sanitizeVisibleText(document.title, 120),
           url: `${window.location.origin}${generalizedPath(window.location.pathname)}`,
           viewport: `${window.innerWidth}x${window.innerHeight}`,
           surface: activeModalSurface ? 'modal' : 'page',
           elements: elementMap.slice(0, 150),
+          readable: window.location.origin === limovaOrigin ? null : getReadableText(),
           network
         };
       },
-      args: [pageContextVersion + 1]
+      args: [pageContextVersion + 1, LIMOVA_DOMAIN]
     });
 
     if (!isCurrentOperation(operation)) return '';
@@ -2730,12 +2919,26 @@ async function getPageContext(tabId, operation = { generation: sessionGeneration
         pageElementSnapshots.delete(pageElementSnapshots.keys().next().value);
       }
       const parts = [];
+      // Stated first on every map so the voice model never mistakes a site for Limova.
+      parts.push(isLimovaUrl(pc.url)
+        ? 'Site: Limova'
+        : `Site: ${siteNameOf(pc.url)} — site externe, ce n’est pas Limova`);
       parts.push(`Page: ${pc.title || '(no title)'} — ${pc.url}`);
       parts.push(`Viewport: ${pc.viewport}`);
       parts.push(`Surface active: ${pc.surface === 'modal' ? 'fenêtre au premier plan uniquement' : 'page entière'}`);
+      if (pc.readable?.visible?.length) {
+        parts.push('\n[contenu à l’écran]');
+        parts.push(pc.readable.visible.map(line => `  ${line}`).join('\n'));
+      }
+      if (pc.readable?.below?.length) {
+        parts.push('\n[suite de la page, plus bas]');
+        parts.push(pc.readable.below.map(line => `  ${line}`).join('\n'));
+      }
       if (pc.network?.length) {
+        // Other sites load dozens of third-party resources: keep the page text in budget.
+        const network = pc.readable ? pc.network.slice(-10) : pc.network;
         parts.push('\n[network]');
-        parts.push(pc.network.map(item => {
+        parts.push(network.map(item => {
           const status = item.status ? ` status:${item.status}` : '';
           return `  ${item.type} ${item.target}${status} ${item.durationMs}ms`;
         }).join('\n'));
@@ -3164,9 +3367,25 @@ function sanitizeLimovaProfile(raw) {
   return Object.keys(profile).length ? profile : null;
 }
 
+// The first name is who the user is, not conversation memory: it is kept
+// across "new conversation" resets and sent with every turn, so Charly still
+// knows it when the account-wide memory is set aside. Cleared on logout.
+const USER_FIRST_NAME_KEY = 'limova_user_first_name_v1';
+
+async function storedUserFirstName() {
+  const stored = await chrome.storage.local.get(USER_FIRST_NAME_KEY).catch(() => ({}));
+  return typeof stored?.[USER_FIRST_NAME_KEY] === 'string' ? stored[USER_FIRST_NAME_KEY].slice(0, 80) : '';
+}
+
+async function userFirstNameField() {
+  const firstName = await storedUserFirstName();
+  return firstName ? { userFirstName: firstName } : {};
+}
+
 async function syncLimovaProfile(rawProfile) {
   const profile = sanitizeLimovaProfile(rawProfile);
   if (!profile) return { ok: false, error: 'Profil invalide.' };
+  if (profile.firstName) await chrome.storage.local.set({ [USER_FIRST_NAME_KEY]: profile.firstName }).catch(() => {});
   const serialized = JSON.stringify(profile);
   if (serialized === lastSyncedProfileHash) return { ok: true, unchanged: true };
   try {
@@ -3237,7 +3456,9 @@ async function persistVoiceTranscript(role, content, generation = sessionGenerat
 }
 
 async function getLiveToken(context) {
-  const operation = captureVoiceOperation();
+  // Not bound to the locked tab: starting voice moves Charly to the tab in
+  // front. A stop or a reset still cancels it.
+  const operation = { generation: sessionGeneration, voiceGeneration: voiceSessionGeneration };
   const controller = new AbortController();
   voiceTokenControllers.add(controller);
   try {
@@ -3260,7 +3481,11 @@ async function getLiveToken(context) {
       body: JSON.stringify({
         lang: currentLang,
         trainingMode,
+        // Tells the proxy this extension follows every site and handles
+        // open_page and create_in_limova.
+        capabilities: ['any_site', 'limova_handoff'],
         ...(sessionState.resetContext ? { resetContext: true } : {}),
+        ...(trainingMode || evaluationMode ? {} : await userFirstNameField()),
         ...(evaluationMode ? { evaluationCode: evaluationState.token } : {}),
         ...(sessionId ? { sessionId } : {}),
         pageContext: trainingMode ? '' : String(freshContext.pageContext || context.pageContext || lastPageContext).slice(0, 12_000),
@@ -3303,20 +3528,21 @@ async function getFreshVoiceContext(parentOperationId = null, { capture = false,
   const startedAt = Date.now();
   Logger.event('voice', 'VOICE_CONTEXT_REFRESH_STARTED', null, operationId);
 
-  const tab = await getLimovaTabForAuthentication();
+  const tab = await getVoiceContextTab();
   if (!isCurrentOperation(operation)) return cancelledOperation();
   if (!tab?.id) {
-    const error = codedError('VOICE_CONTEXT_TAB_MISSING', 'Ouvre un onglet new.limova.ai pour que Charly puisse analyser et piloter la page.');
+    const error = codedError('VOICE_CONTEXT_TAB_MISSING', 'Ouvre une page web pour que Charly puisse l’analyser et la piloter.');
     Logger.error('voice', 'Voice context tab missing', error, error.code, operationId);
     throw error;
   }
 
+  if (isExternalSiteUrl(tab.url)) await ensureContentScript(tab.id).catch(() => {});
   if (sessionState.lockedTabId !== tab.id) lockTab(tab.id);
   const pageOperation = { ...operation, tabId: tab.id };
   const pageContext = await getPageContext(tab.id, pageOperation);
   if (!isCurrentOperation(pageOperation)) return cancelledOperation();
   if (!pageContext) {
-    const error = codedError('VOICE_CONTEXT_UNAVAILABLE', 'Charly ne peut pas lire la page Limova. Actualise l’onglet puis réessaie.');
+    const error = codedError('VOICE_CONTEXT_UNAVAILABLE', 'Charly ne peut pas lire la page. Actualise l’onglet puis réessaie.');
     Logger.error('voice', 'Voice page context extraction failed', error, error.code, operationId);
     throw error;
   }
@@ -3353,6 +3579,7 @@ async function handleUserPageInteraction(rawInteraction, sender) {
     });
   }
   if ((!sessionState.isActive && !voiceSessionActive) || trainingState.active) return { ok: true, ignored: true };
+  if (!(await isSidebarOpen())) return { ok: true, ignored: true };
   const tabId = sender?.tab?.id;
   if (!tabId || (sessionState.lockedTabId && tabId !== sessionState.lockedTabId)) {
     return { ok: true, ignored: true };
@@ -4669,13 +4896,269 @@ function cancelPendingAction(actionId) {
 
 // Port-based communication with sidebar (reliable for large payloads)
 let sidebarPort = null;
+const sidebarPorts = new Set();
 
 chrome.runtime.onConnect.addListener((port) => {
   if (port.name === 'sidebar') {
+    const wasClosed = sidebarPorts.size === 0;
+    sidebarPorts.add(port);
     sidebarPort = port;
-    port.onDisconnect.addListener(() => { sidebarPort = null; });
+    if (wasClosed) resumeAfterSidebarOpened();
+    port.onDisconnect.addListener(() => {
+      sidebarPorts.delete(port);
+      if (sidebarPort === port) sidebarPort = [...sidebarPorts].at(-1) || null;
+      if (sidebarPorts.size === 0) pauseWhileSidebarClosed();
+    });
   }
 });
+
+async function isSidebarOpen() {
+  if (sidebarPorts.size > 0) return true;
+  // A restarted service worker can receive a navigation event a few
+  // milliseconds before the still-open panel reconnects its port.
+  const contexts = await chrome.runtime.getContexts?.({ contextTypes: ['SIDE_PANEL'] }).catch(() => null);
+  return Array.isArray(contexts) && contexts.length > 0;
+}
+
+// A closed panel must leave the page alone: no analysis, highlight or action
+// keeps running behind the user's back. The conversation is kept for reopening.
+function pauseWhileSidebarClosed() {
+  sessionGeneration += 1;
+  activeAbortController?.abort();
+  activeAbortController = null;
+  if (urlChangeTimeout) clearTimeout(urlChangeTimeout);
+  urlChangeTimeout = null;
+  pendingActions.clear();
+  for (const controller of voiceTokenControllers) controller.abort();
+  voiceSessionActive = false;
+  voiceSessionGeneration += 1;
+  for (const tabId of [...presenceTabs]) hideAgentPresence(tabId);
+  if (sessionState.lockedTabId) {
+    chrome.tabs.sendMessage(sessionState.lockedTabId, { type: 'SESSION_STATE', active: false }).catch(() => {});
+  }
+  Logger.event('sidebar', 'SIDEBAR_CLOSED_ASSISTANT_PAUSED', { hadLockedTab: Boolean(sessionState.lockedTabId) });
+}
+
+// ============================================================================
+// Agent presence, stop and Limova handoff
+// ============================================================================
+
+const PAGE_ACTION_TOOLS = new Set(['click_element', 'navigate_internal', 'fill_field', 'scroll_page']);
+const HANDOFF_PAGE_TEXT_LIMIT = 6000;
+const HANDOFF_PROMPT_LIMIT = 8000;
+const presenceTabs = new Set();
+let handoffSequence = 0;
+// Tabs the extension is opening itself (handoff, open_page): their activation
+// is not a user tab switch.
+let tabOpeningsInProgress = 0;
+
+async function showAgentPresence(tabId) {
+  if (!tabId) return;
+  presenceTabs.add(tabId);
+  await chrome.tabs.sendMessage(tabId, { type: 'AGENT_PRESENCE', active: true }).catch(() => {});
+}
+
+// With stop, the page also abandons what Charly is typing or about to send.
+function hideAgentPresence(tabId, { stop = false } = {}) {
+  if (!tabId) return;
+  presenceTabs.delete(tabId);
+  chrome.tabs.sendMessage(tabId, { type: 'AGENT_PRESENCE', active: false, ...(stop ? { stop: true } : {}) }).catch(() => {});
+}
+
+function stopAgent() {
+  sessionGeneration += 1;
+  activeAbortController?.abort();
+  activeAbortController = null;
+  pendingActions.clear();
+  for (const tabId of [...presenceTabs]) hideAgentPresence(tabId, { stop: true });
+  broadcastToSidebar({ type: 'AGENT_STOPPED' });
+  broadcastToSidebar({ type: 'STATUS_UPDATE', status: 'ready' });
+  Logger.event('agent', 'AGENT_STOPPED_BY_USER');
+  return { ok: true };
+}
+
+function buildLimovaHandoffPrompt(request, page) {
+  const lines = [request, '', 'Contexte : voici le contenu de la page que je regarde.'];
+  if (page.title) lines.push(`Page : ${page.title}`);
+  if (page.url) lines.push(`Adresse : ${page.url}`);
+  if (page.selection) lines.push('', 'Passage que j’ai sélectionné :', '"""', page.selection, '"""');
+  const header = lines.join('\n');
+  const room = Math.max(0, Math.min(HANDOFF_PAGE_TEXT_LIMIT, HANDOFF_PROMPT_LIMIT - header.length - 40));
+  const text = String(page.text || '').slice(0, room);
+  return text ? `${header}\n\nContenu de la page :\n"""\n${text}\n"""` : header;
+}
+
+function waitForTabLoaded(tabId, timeout = 30_000, { afterNavigation = false } = {}) {
+  return new Promise(resolve => {
+    const done = value => {
+      clearTimeout(timer);
+      chrome.tabs.onUpdated.removeListener(listener);
+      resolve(value);
+    };
+    const listener = (updatedId, changeInfo) => {
+      if (updatedId === tabId && changeInfo.status === 'complete') done(true);
+    };
+    const timer = setTimeout(() => done(false), timeout);
+    chrome.tabs.onUpdated.addListener(listener);
+    // Right after tabs.update the tab still reports the previous page as complete.
+    if (afterNavigation) return;
+    chrome.tabs.get(tabId).then(tab => { if (tab?.status === 'complete') done(true); }).catch(() => done(false));
+  });
+}
+
+// The tab the extension just brought to the front becomes Charly's tab, and
+// the side panel stops warning about a wrong tab.
+function moveAssistantToTab(tabId, previousTabId) {
+  if (previousTabId && previousTabId !== tabId) {
+    hideAgentPresence(previousTabId);
+    chrome.tabs.sendMessage(previousTabId, { type: 'SESSION_STATE', active: false }).catch(() => {});
+  }
+  lockTab(tabId);
+  broadcastToSidebar({ type: 'CORRECT_TAB' });
+}
+
+// Voice "open_page": the user names a site or an address. Only web pages are
+// opened; Limova stays in its tab and the site opens next to it.
+function normalizeRequestedPageUrl(rawUrl) {
+  const value = String(rawUrl || '').trim();
+  if (!value || value.length > 2048) return null;
+  const candidate = /^[a-z][a-z0-9+.-]*:/i.test(value) ? value : `https://${value}`;
+  try {
+    const url = new URL(candidate);
+    if (!['https:', 'http:'].includes(url.protocol) || !url.hostname.includes('.') || url.username || url.password) return null;
+    return isWebPageUrl(url.href) ? url.href : null;
+  } catch {
+    return null;
+  }
+}
+
+async function openPageForUser(rawUrl, { newTab = false } = {}) {
+  const url = normalizeRequestedPageUrl(rawUrl);
+  if (!url) return { ok: false, error: 'Adresse web invalide. Donne une adresse comme lemonde.fr.' };
+  if (!(await hasAIProcessingConsent())) return { ok: false, consentRequired: true };
+  const operation = { generation: sessionGeneration, voiceGeneration: voiceSessionGeneration };
+  const [current] = await chrome.tabs.query({ active: true, lastFocusedWindow: true }).catch(() => []);
+  const keepCurrent = newTab || !current?.id || isLimovaUrl(current.url);
+  let tab;
+  tabOpeningsInProgress += 1;
+  try {
+    if (keepCurrent) {
+      tab = await chrome.tabs.create({
+        url,
+        active: true,
+        ...(Number.isInteger(current?.index) ? { index: current.index + 1 } : {}),
+        ...(current?.id ? { openerTabId: current.id } : {})
+      });
+    } else {
+      tab = await chrome.tabs.update(current.id, { url });
+    }
+    if (!tab?.id) return { ok: false, error: 'Impossible d’ouvrir cette page.' };
+    moveAssistantToTab(tab.id, current?.id);
+    Logger.event('navigation', 'PAGE_OPENED_FOR_USER', { origin: new URL(url).origin, newTab: keepCurrent });
+    await waitForTabLoaded(tab.id, 12_000, { afterNavigation: !keepCurrent });
+  } finally {
+    tabOpeningsInProgress -= 1;
+  }
+  if (!isCurrentOperation(operation)) return cancelledOperation();
+  await ensureContentScript(tab.id).catch(() => {});
+  try {
+    return await getFreshVoiceContext(null, { capture: true, operation: { ...operation, tabId: tab.id } });
+  } catch {
+    // The page is open even when it is still too busy to be read.
+    return { ok: true, opened: true, retryWithFreshContext: true };
+  }
+}
+
+async function sendComposeRequest(tabId, message, operation) {
+  // Limova may still be redirecting (workspace, new chat) when the tab first
+  // reports complete; retry while its content script is not reachable yet.
+  for (let attempt = 0; attempt < 12; attempt += 1) {
+    if (!isCurrentOperation(operation)) return cancelledOperation();
+    const response = await chrome.tabs.sendMessage(tabId, message).catch(() => null);
+    if (response) return response;
+    await new Promise(resolve => setTimeout(resolve, 750));
+    await waitForTabLoaded(tabId, 10_000);
+  }
+  return { ok: false, code: 'limova_unreachable', error: 'Limova ne répond pas dans l’onglet ouvert.' };
+}
+
+// Everything happens in the extension: read the page the user is on, open
+// Limova, then write and send the request in its chat like the user would.
+async function handoffToLimova(rawRequest, { voice = false } = {}) {
+  const request = String(rawRequest || '').trim().slice(0, 1500);
+  if (!request) return { ok: false, error: 'Demande vide.' };
+  if (!(await hasAIProcessingConsent())) {
+    broadcastToSidebar({ type: 'CONSENT_REQUIRED' });
+    return { ok: false, consentRequired: true };
+  }
+  const operation = voice
+    ? { generation: sessionGeneration, voiceGeneration: voiceSessionGeneration }
+    : { generation: sessionGeneration };
+  const [source] = await chrome.tabs.query({ active: true, lastFocusedWindow: true }).catch(() => []);
+  if (!source?.id || !isExternalSiteUrl(source.url)) {
+    return { ok: false, error: 'Ouvre la page à utiliser avant de demander un contenu.' };
+  }
+  const handoffId = `handoff-${Date.now()}-${++handoffSequence}`;
+  Logger.event('handoff', 'LIMOVA_HANDOFF_STARTED', { origin: new URL(source.url).origin, handoffId });
+
+  await showAgentPresence(source.id);
+  let page;
+  try {
+    page = await sendContentMessage(source.id, { type: 'GET_READABLE_CONTENT' }, true, operation);
+  } finally {
+    hideAgentPresence(source.id);
+  }
+  if (!isCurrentOperation(operation)) return cancelledOperation();
+  if (!page?.ok) return { ok: false, error: 'Je n’arrive pas à lire cette page.' };
+
+  const prompt = buildLimovaHandoffPrompt(request, page);
+  tabOpeningsInProgress += 1;
+  let limovaTab;
+  let result;
+  try {
+    limovaTab = await chrome.tabs.create({
+      url: `${LIMOVA_DOMAIN}/`,
+      index: Number.isInteger(source.index) ? source.index + 1 : undefined,
+      openerTabId: source.id,
+      active: true
+    });
+    await waitForTabLoaded(limovaTab.id);
+    if (!isCurrentOperation(operation)) return cancelledOperation();
+    presenceTabs.add(limovaTab.id);
+    result = await sendComposeRequest(limovaTab.id, { type: 'LIMOVA_COMPOSE_AND_SEND', handoffId, prompt }, operation);
+    presenceTabs.delete(limovaTab.id);
+  } finally {
+    tabOpeningsInProgress -= 1;
+  }
+  // The user now looks at the Limova conversation: Charly follows it there.
+  if (result?.ok && isCurrentOperation(operation)) moveAssistantToTab(limovaTab.id, source.id);
+  Logger.event('handoff', result?.ok ? 'LIMOVA_HANDOFF_SENT' : 'LIMOVA_HANDOFF_FAILED', {
+    handoffId,
+    code: result?.code || null,
+    promptLength: prompt.length,
+    truncated: Boolean(page.truncated)
+  });
+  return { ...result, limovaTabId: limovaTab.id, pageTitle: page.title || '' };
+}
+
+// Voice "create_in_limova": same handoff as the side panel, then Charly gets
+// the Limova conversation it just started so it can comment on the answer.
+async function createInLimovaByVoice(rawRequest) {
+  if (trainingState.active || evaluationState.active) return { ok: false, error: 'Indisponible pendant un test ou une formation.' };
+  const result = await handoffToLimova(rawRequest, { voice: true });
+  if (!result?.ok) return result;
+  try {
+    const context = await getFreshVoiceContext(null, { capture: true, operation: captureVoiceOperation() });
+    return { ...context, ok: true, sent: true, pageTitle: result.pageTitle };
+  } catch {
+    return { ok: true, sent: true, pageTitle: result.pageTitle };
+  }
+}
+
+function resumeAfterSidebarOpened() {
+  if (!sessionState.lockedTabId || !sessionState.isActive) return;
+  chrome.tabs.sendMessage(sessionState.lockedTabId, { type: 'SESSION_STATE', active: true }).catch(() => {});
+}
 
 function broadcastToSidebar(message) {
   if (sidebarPort) {
@@ -4705,6 +5188,22 @@ async function getActiveLimovaTab() {
   return tabs.find(t => isLimovaUrl(t.url)) || null;
 }
 
+// Another site wins while it is in front; otherwise Limova keeps its usual
+// locked-tab behaviour.
+async function getActiveAssistedTab() {
+  const [active] = await chrome.tabs.query({ active: true, lastFocusedWindow: true }).catch(() => []);
+  if (active?.id && isExternalSiteUrl(active.url)) return active;
+  return getActiveLimovaTab();
+}
+
+// Voice follows the page in front, Limova or any other site; on a browser
+// page it falls back to the signed-in Limova tab.
+async function getVoiceContextTab() {
+  const [active] = await chrome.tabs.query({ active: true, lastFocusedWindow: true }).catch(() => []);
+  if (active?.id && isAssistedUrl(active.url)) return active;
+  return getLimovaTabForAuthentication();
+}
+
 // Named exports keep critical privacy and policy boundaries directly testable.
 export {
   analyticsSafePath,
@@ -4724,6 +5223,14 @@ export {
   handleMessage,
   handleResetSession,
   handleTakeScreenshot,
+  handoffToLimova,
+  createInLimovaByVoice,
+  buildLimovaHandoffPrompt,
+  isAssistedUrl,
+  normalizeRequestedPageUrl,
+  openPageForUser,
+  stopAgent,
+  showAgentPresence,
   lockTab,
   privacySafeUrl,
   proposeOrExecuteAction,

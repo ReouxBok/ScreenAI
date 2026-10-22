@@ -392,7 +392,9 @@ class CharlyAdkOrchestrator {
       sessionId: input.sessionId,
       message: { role: 'user', parts: [{ text: input.message }] },
       stateDelta: {
-        'temp:personalContext': memory?.context || '',
+        'temp:personalContext': memory?.context || (!evaluationContext && input.userFirstName
+          ? `PRÉNOM. L’utilisateur s’appelle ${input.userFirstName.replace(/[\r\n<>"«»]/g, ' ').trim()}. Utilise son prénom avec parcimonie.`
+          : ''),
         'temp:pageContext': JSON.stringify(input.page),
         'temp:locale': input.locale,
         ...(evaluationContext ? { 'temp:evaluationContext': evaluationContext.context } : {}),

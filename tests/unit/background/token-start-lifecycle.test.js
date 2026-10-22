@@ -66,3 +66,16 @@ it.each(['reset', 'stop'])('does not dispatch a live-token POST after authentica
   expect((await pending).cancelled).toBe(true);
   expect(fetch.mock.calls.some(([url]) => String(url).endsWith('/api/live-token'))).toBe(false);
 });
+
+it('starts voice on the tab in front even when Charly was on another tab', async () => {
+  await setup(sessionId);
+  // The panel was last used on Limova (tab 17); the user reopens it on a news site.
+  background.lockTab(17);
+  chromeMock.tabs.query.mockResolvedValue([{ id: 31, url: 'https://www.tf1info.fr/politique/article', active: true }]);
+  chromeMock.scripting.executeScript.mockResolvedValue([{ result: { title: 'TF1 Info', url: 'https://www.tf1info.fr/politique/:id', elements: [] } }]);
+
+  const result = await message({ type: 'GET_LIVE_TOKEN', context: {} });
+
+  expect(result.cancelled).toBeUndefined();
+  expect(fetch.mock.calls.some(([url]) => String(url).endsWith('/api/live-token'))).toBe(true);
+});

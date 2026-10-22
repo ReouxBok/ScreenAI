@@ -108,16 +108,22 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
   }
 
   if (request.type === 'PREPARE_VISUAL_CAPTURE') {
+    setAgentPresenceHiddenForCapture(true);
     sendResponse(prepareVisualCapture(request.contextVersion));
   }
 
   if (request.type === 'CLEAR_VISUAL_CAPTURE') {
     clearVisualCaptureOverlays();
+    setAgentPresenceHiddenForCapture(false);
     sendResponse({ ok: true });
   }
 
   if (request.type === 'SESSION_STATE') {
     assistantSessionActive = request.active === true;
+    if (!assistantSessionActive) {
+      clearHighlights();
+      setAgentPresence(false);
+    }
     refreshModalObserver();
     refreshAssistantInteractionCapture();
   }
@@ -153,12 +159,325 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
     return true;
   }
 
+  if (request.type === 'AGENT_PRESENCE') {
+    if (request.stop === true) agentStopRequested = true;
+    sendResponse(setAgentPresence(request.active === true, request.label || undefined));
+  }
+
+  if (request.type === 'GET_READABLE_CONTENT') {
+    sendResponse(extractReadableContent());
+  }
+
+  if (request.type === 'LIMOVA_COMPOSE_AND_SEND') {
+    composeAndSendInChat(request.handoffId, request.prompt)
+      .then(sendResponse)
+      .catch(() => sendResponse({ ok: false, code: 'compose_failed', error: 'L’envoi dans Limova a échoué.' }));
+    return true;
+  }
+
   if (request.type === 'GET_PAGE_CONTENT') {
     const data = extractPageContent();
     sendResponse(data);
   }
 
 });
+
+// ============================================================================
+// Agent presence: orange frame and stop button while Charly acts on the page
+// ============================================================================
+
+const AGENT_PRESENCE_HOST_ID = 'limova-agent-presence';
+
+function setAgentPresence(active, label = 'Arrêter Charly') {
+  agentPresenceActive = active === true;
+  const existing = document.getElementById(AGENT_PRESENCE_HOST_ID);
+  if (!agentPresenceActive) {
+    if (existing) {
+      existing.dataset.leaving = 'true';
+      existing.style.opacity = '0';
+      setTimeout(() => { if (existing.dataset.leaving === 'true') existing.remove(); }, 420);
+    }
+    releaseAgentPointer();
+    return { ok: true, active: false };
+  }
+  if (existing) {
+    delete existing.dataset.leaving;
+    existing.style.opacity = '1';
+    return { ok: true, active: true };
+  }
+
+  // A closed shadow root keeps the host site's CSS away from the frame and button.
+  const host = document.createElement('div');
+  host.id = AGENT_PRESENCE_HOST_ID;
+  host.style.cssText = 'all: initial; opacity: 0; transition: opacity 400ms ease;';
+  const root = host.attachShadow({ mode: 'closed' });
+  const style = document.createElement('style');
+  style.textContent = `
+    .frame {
+      position: fixed; inset: 0; pointer-events: none; z-index: 2147483644;
+      box-shadow:
+        inset 0 0 0 1.5px rgba(241, 90, 36, .55),
+        inset 0 0 22px 6px rgba(241, 90, 36, .42),
+        inset 0 0 90px 26px rgba(241, 90, 36, .16);
+      animation: breathe 2.6s ease-in-out infinite;
+    }
+    .stop {
+      position: fixed; left: 50%; bottom: 22px; transform: translateX(-50%); z-index: 2147483647;
+      display: inline-flex; align-items: center; gap: 8px; padding: 9px 16px;
+      border: 1px solid rgba(29, 29, 30, .12); border-radius: 999px; background: #fff; color: #1D1D1E;
+      font: 600 13px/1 Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Arial, sans-serif;
+      box-shadow: 0 6px 20px rgba(0, 0, 0, .14); cursor: pointer;
+    }
+    .stop:hover { background: #FFF4EE; border-color: rgba(241, 90, 36, .5); }
+    .dot { width: 9px; height: 9px; border-radius: 50%; background: ${LIMOVA_ORANGE}; animation: ping 1.6s ease-out infinite; }
+    @keyframes breathe { 0%, 100% { opacity: .78; } 50% { opacity: 1; } }
+    @keyframes ping { from { box-shadow: 0 0 0 0 rgba(241, 90, 36, .55); } to { box-shadow: 0 0 0 9px rgba(241, 90, 36, 0); } }
+    @media (prefers-reduced-motion: reduce) { .frame, .dot { animation: none; } }
+  `;
+  const frame = document.createElement('div');
+  frame.className = 'frame';
+  const stop = document.createElement('button');
+  stop.type = 'button';
+  stop.className = 'stop';
+  const dot = document.createElement('span');
+  dot.className = 'dot';
+  const text = document.createElement('span');
+  text.textContent = label;
+  stop.append(dot, text);
+  stop.addEventListener('click', event => {
+    event.preventDefault();
+    event.stopPropagation();
+    agentStopRequested = true;
+    setAgentPresence(false);
+    chrome.runtime.sendMessage({ type: 'STOP_AGENT' }).catch(() => {});
+  });
+  root.append(style, frame, stop);
+  document.documentElement.appendChild(host);
+  (window.requestAnimationFrame || (callback => setTimeout(callback, 16)))(() => { host.style.opacity = '1'; });
+  return { ok: true, active: true };
+}
+
+function setAgentPresenceHiddenForCapture(hidden) {
+  const host = document.getElementById(AGENT_PRESENCE_HOST_ID);
+  const pointer = document.getElementById(AGENT_POINTER_ID);
+  for (const element of [host, pointer]) {
+    if (element) element.style.visibility = hidden ? 'hidden' : '';
+  }
+}
+
+// ============================================================================
+// Limova handoff: readable page content and chat composer
+// ============================================================================
+
+const READABLE_CONTENT_LIMIT = 6000;
+const COMPOSER_HINT = /(dis-moi|message|demande|écri|ask|tell me|prompt|chat|question|en tête|on your mind)/i;
+const SEARCH_HINT = /(recherch|search|filtr|filter)/i;
+const SEND_HINT = /(envoyer|send|submit|soumettre)/i;
+const NOT_SEND_HINT = /(joindre|attach|fichier|file|micro|voice|vocal|dict|emoji|annuler|cancel|stop)/i;
+let lastHandoff = null;
+
+function normalizeReadableText(value) {
+  return String(value || '')
+    .replace(/[ \t]+\n/g, '\n')
+    .replace(/\n{3,}/g, '\n\n')
+    .replace(/[ \t]{2,}/g, ' ')
+    .trim();
+}
+
+// innerText follows what is rendered, so hidden menus and field values stay out.
+function extractReadableContent() {
+  const root = document.querySelector('main, [role="main"], article') || document.body;
+  const text = normalizeReadableText(root?.innerText ?? root?.textContent);
+  const selection = normalizeReadableText(window.getSelection?.()?.toString());
+  return {
+    ok: true,
+    title: document.title || '',
+    url: `${window.location.origin}${window.location.pathname}`,
+    selection: selection.slice(0, READABLE_CONTENT_LIMIT),
+    text: text.slice(0, READABLE_CONTENT_LIMIT),
+    truncated: text.length > READABLE_CONTENT_LIMIT
+  };
+}
+
+function isVisibleControl(element) {
+  if (!(element instanceof HTMLElement) || !element.isConnected) return false;
+  if (element.closest('[aria-hidden="true"], [inert]')) return false;
+  const style = window.getComputedStyle(element);
+  if (style.display === 'none' || style.visibility === 'hidden') return false;
+  const rect = element.getBoundingClientRect();
+  return rect.width > 0 && rect.height > 0;
+}
+
+function controlHint(element) {
+  return ['aria-label', 'placeholder', 'title', 'name', 'id', 'data-placeholder']
+    .map(attribute => element.getAttribute(attribute) || '')
+    .join(' ');
+}
+
+function scoreComposerCandidate(element) {
+  if (!isVisibleControl(element) || element.disabled || element.readOnly) return -Infinity;
+  const hint = controlHint(element);
+  let score = 0;
+  if (element.closest('[data-slot="composer"], [class*="composer" i], [class*="chat-input" i]')) score += 40;
+  if (element.getAttribute('enterkeyhint') === 'send') score += 20;
+  if (COMPOSER_HINT.test(hint)) score += 20;
+  if (SEARCH_HINT.test(hint) || element.type === 'search' || element.getAttribute('role') === 'searchbox') score -= 60;
+  if (element instanceof HTMLTextAreaElement || element.isContentEditable) score += 10;
+  const rect = element.getBoundingClientRect();
+  if (rect.width >= 280) score += 10;
+  if (rect.top + rect.height / 2 > window.innerHeight * 0.4) score += 5;
+  if (document.activeElement === element) score += 5;
+  return score;
+}
+
+// The composer is found from what the page exposes (structure, labels and
+// position on screen) rather than one selector, so small UI changes survive.
+function findChatComposer() {
+  const candidates = document.querySelectorAll(
+    'textarea, [contenteditable="true"], [contenteditable=""], [role="textbox"], input[type="text"], input:not([type])'
+  );
+  let best = null;
+  let bestScore = 20;
+  candidates.forEach(element => {
+    const score = scoreComposerCandidate(element);
+    if (score > bestScore) {
+      best = element;
+      bestScore = score;
+    }
+  });
+  return best;
+}
+
+function isControlDisabled(button) {
+  return button.disabled || button.getAttribute('aria-disabled') === 'true';
+}
+
+function findSendButton(composer) {
+  const composerRect = composer.getBoundingClientRect();
+  let container = composer.parentElement;
+  for (let depth = 0; container && depth < 6; depth += 1, container = container.parentElement) {
+    let best = null;
+    let bestScore = 0;
+    container.querySelectorAll('button, [role="button"], input[type="submit"]').forEach(button => {
+      if (!isVisibleControl(button)) return;
+      const label = `${controlHint(button)} ${button.textContent || ''}`;
+      if (NOT_SEND_HINT.test(label)) return;
+      let score = 0;
+      if (SEND_HINT.test(label)) score += 40;
+      if (button.getAttribute('type') === 'submit') score += 20;
+      const rect = button.getBoundingClientRect();
+      if (rect.left >= composerRect.left + composerRect.width / 2) score += 5;
+      score -= Math.hypot(rect.left - composerRect.right, rect.top - composerRect.bottom) / 80;
+      if (score > bestScore) {
+        best = button;
+        bestScore = score;
+      }
+    });
+    if (best) return best;
+  }
+  return null;
+}
+
+async function waitForCondition(check, timeout, interval = 250) {
+  const deadline = Date.now() + timeout;
+  for (;;) {
+    const value = check();
+    if (value) return value;
+    if (Date.now() >= deadline) return null;
+    await waitForPointerDelay(interval);
+  }
+}
+
+function readComposerText(composer) {
+  return composer instanceof HTMLTextAreaElement || composer instanceof HTMLInputElement
+    ? composer.value
+    : composer.textContent || '';
+}
+
+function writeComposerText(composer, text) {
+  composer.focus();
+  if (composer instanceof HTMLTextAreaElement || composer instanceof HTMLInputElement) {
+    // React controls these fields: the native setter plus an input event keeps its state in sync.
+    const prototype = composer instanceof HTMLTextAreaElement ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+    Object.getOwnPropertyDescriptor(prototype, 'value')?.set?.call(composer, text);
+    composer.dispatchEvent(typeof InputEvent === 'function'
+      ? new InputEvent('input', { bubbles: true, inputType: 'insertText', data: text })
+      : new Event('input', { bubbles: true }));
+    return;
+  }
+  const selection = window.getSelection?.();
+  const range = document.createRange();
+  range.selectNodeContents(composer);
+  selection?.removeAllRanges();
+  selection?.addRange(range);
+  if (!document.execCommand?.('insertText', false, text)) composer.textContent = text;
+  composer.dispatchEvent(new Event('input', { bubbles: true }));
+}
+
+const STOPPED_BY_USER = { ok: false, code: 'stopped', error: 'Arrêté à ta demande.' };
+
+async function typeIntoComposer(composer, text) {
+  const steps = Math.min(24, Math.max(1, Math.ceil(text.length / 40)));
+  for (let step = 1; step <= steps; step += 1) {
+    if (agentStopRequested) return false;
+    writeComposerText(composer, text.slice(0, Math.ceil((text.length * step) / steps)));
+    await waitForPointerDelay(25);
+  }
+  return true;
+}
+
+async function composeAndSendInChat(handoffId, rawPrompt) {
+  if (lastHandoff?.id === handoffId) return lastHandoff.result;
+  const prompt = String(rawPrompt || '').trim();
+  if (!prompt) return { ok: false, code: 'empty_prompt', error: 'Rien à envoyer.' };
+  if (/\/(auth|login|sign-?in)\b/i.test(window.location.pathname)) {
+    return { ok: false, code: 'not_signed_in', error: 'Connecte-toi à Limova puis réessaie.' };
+  }
+  // A stop received while Limova is still loading also cancels this send.
+  agentStopRequested = false;
+  const composer = await waitForCondition(() => agentStopRequested || findChatComposer(), 25_000);
+  if (agentStopRequested) return STOPPED_BY_USER;
+  if (!composer) return { ok: false, code: 'composer_not_found', error: 'Je ne trouve pas la zone de discussion de Limova.' };
+  lastHandoff = { id: handoffId, result: { ok: false, code: 'in_progress' } };
+
+  setAgentPresence(true);
+  try {
+    composer.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    await waitForPointerDelay(220);
+    const composerRect = composer.getBoundingClientRect();
+    await glideAgentPointer(composerRect.left + Math.min(composerRect.width / 2, 40), composerRect.top + composerRect.height / 2 - 3);
+    showAgentClickRipple(composerRect.left + Math.min(composerRect.width / 2, 40), composerRect.top + composerRect.height / 2);
+    if (!(await typeIntoComposer(composer, prompt))) return (lastHandoff = { id: handoffId, result: STOPPED_BY_USER }).result;
+
+    const sendButton = await waitForCondition(() => {
+      if (agentStopRequested) return true;
+      const button = findSendButton(composer);
+      return button && !isControlDisabled(button) ? button : null;
+    }, 15_000);
+    if (agentStopRequested) return (lastHandoff = { id: handoffId, result: STOPPED_BY_USER }).result;
+    const beforeUrl = window.location.href;
+    if (sendButton) {
+      const rect = sendButton.getBoundingClientRect();
+      await glideAgentPointer(rect.left + rect.width / 2 - 4, rect.top + rect.height / 2 - 3);
+      if (agentStopRequested) return (lastHandoff = { id: handoffId, result: STOPPED_BY_USER }).result;
+      showAgentClickRipple(rect.left + rect.width / 2, rect.top + rect.height / 2);
+      dispatchCompletePointerClick(sendButton, Math.round(rect.left + rect.width / 2), Math.round(rect.top + rect.height / 2));
+    } else {
+      composer.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', code: 'Enter', keyCode: 13, bubbles: true, cancelable: true }));
+    }
+    const sent = await waitForCondition(
+      () => !composer.isConnected || !readComposerText(composer).trim() || window.location.href !== beforeUrl,
+      6_000
+    );
+    const result = sent
+      ? { ok: true, sent: true, via: sendButton ? 'button' : 'enter' }
+      : { ok: false, code: 'send_unconfirmed', error: 'Le message est prêt dans Limova mais je n’ai pas pu confirmer l’envoi.' };
+    lastHandoff = { id: handoffId, result };
+    return result;
+  } finally {
+    setAgentPresence(false);
+  }
+}
 
 // ============================================================================
 // Page Content Extraction
@@ -348,8 +667,10 @@ function notifyModalDetected(modal) {
   chrome.runtime.sendMessage({ type: 'MODAL_DETECTED', modal: describeModal(modal) }).catch(() => {});
 }
 
+// Popup analysis is a Limova onboarding feature; other sites only get the
+// page map when Charly reads them.
 function refreshModalObserver() {
-  if (assistantSessionActive || trainingCaptureActive) startModalObserver();
+  if ((assistantSessionActive || trainingCaptureActive) && window.location.origin === 'https://new.limova.ai') startModalObserver();
   else stopModalObserver();
 }
 
@@ -643,6 +964,50 @@ function dispatchCompletePointerClick(element, clientX, clientY) {
   };
 }
 
+const LIMOVA_ORANGE = '#F15A24';
+const AGENT_POINTER_ID = 'limova-computer-use-pointer';
+const AGENT_POINTER_SVG = '<span class="limova-pointer-halo"></span><svg viewBox="0 0 32 32" xmlns="http://www.w3.org/2000/svg"><path d="M5 3.5v22.8l6.5-6.2 4.2 8.4 4.1-2-4.1-8.1 8.8-.9L5 3.5Z" fill="#1D1D1E" stroke="#fff" stroke-width="2" stroke-linejoin="round"/></svg>';
+let agentPresenceActive = false;
+let agentStopRequested = false;
+
+// While Charly is acting, the pointer stays on screen and glides from one
+// target to the next instead of reappearing from the corner for every action.
+async function glideAgentPointer(x, y) {
+  ensurePointerStyles();
+  let pointer = document.getElementById(AGENT_POINTER_ID);
+  if (!pointer) {
+    pointer = document.createElement('div');
+    pointer.id = AGENT_POINTER_ID;
+    pointer.setAttribute('aria-hidden', 'true');
+    pointer.innerHTML = AGENT_POINTER_SVG;
+    pointer.style.transform = `translate3d(${Math.max(12, window.innerWidth - 48)}px, ${Math.max(12, window.innerHeight - 48)}px, 0)`;
+    document.body.appendChild(pointer);
+  }
+  pointer.style.opacity = '1';
+  await waitForPointerFrame();
+  pointer.style.transform = `translate3d(${x}px, ${y}px, 0)`;
+  await waitForPointerDelay(650);
+  return pointer;
+}
+
+function releaseAgentPointer() {
+  if (agentPresenceActive) return;
+  const pointer = document.getElementById(AGENT_POINTER_ID);
+  if (!pointer) return;
+  pointer.style.opacity = '0';
+  setTimeout(() => { if (!agentPresenceActive) pointer.remove(); }, 200);
+}
+
+function showAgentClickRipple(x, y) {
+  ensurePointerStyles();
+  const ripple = document.createElement('div');
+  ripple.className = 'limova-computer-use-ripple';
+  ripple.style.left = `${Math.round(x)}px`;
+  ripple.style.top = `${Math.round(y)}px`;
+  document.body.appendChild(ripple);
+  setTimeout(() => ripple.remove(), 450);
+}
+
 function ensurePointerStyles() {
   if (document.getElementById('limova-computer-use-styles')) return;
   const style = document.createElement('style');
@@ -656,10 +1021,24 @@ function ensurePointerStyles() {
       height: 34px;
       z-index: 2147483647;
       pointer-events: none;
-      filter: drop-shadow(0 3px 4px rgba(0, 0, 0, .35));
-      transition: transform 600ms cubic-bezier(.22,.8,.25,1), opacity 180ms ease;
+      transition: transform 600ms cubic-bezier(.22,.8,.25,1), opacity 220ms ease;
     }
-    #limova-computer-use-pointer svg { display: block; width: 30px; height: 30px; }
+    #limova-computer-use-pointer svg {
+      position: relative; display: block; width: 26px; height: 26px;
+      filter: drop-shadow(0 2px 3px rgba(0, 0, 0, .3));
+    }
+    #limova-computer-use-pointer .limova-pointer-halo {
+      position: absolute; left: -17px; top: -17px; width: 54px; height: 54px; border-radius: 50%;
+      background: radial-gradient(circle, rgba(241, 90, 36, .6) 0%, rgba(241, 90, 36, .26) 40%, rgba(241, 90, 36, 0) 70%);
+      animation: limova-pointer-glow 1.8s ease-in-out infinite;
+    }
+    @keyframes limova-pointer-glow {
+      0%, 100% { transform: scale(.88); opacity: .75; }
+      50% { transform: scale(1.08); opacity: 1; }
+    }
+    @media (prefers-reduced-motion: reduce) {
+      #limova-computer-use-pointer .limova-pointer-halo { animation: none; }
+    }
     .limova-computer-use-ripple {
       position: fixed;
       width: 18px;
@@ -667,7 +1046,8 @@ function ensurePointerStyles() {
       margin: -9px 0 0 -9px;
       z-index: 2147483646;
       pointer-events: none;
-      border: 3px solid #7c3aed;
+      border: 2px solid rgba(241, 90, 36, .85);
+      background: rgba(241, 90, 36, .18);
       border-radius: 999px;
       animation: limova-computer-use-click 420ms ease-out forwards;
     }
@@ -692,45 +1072,22 @@ async function executeElementActionWithCursor(id, contextVersion) {
   const rect = resolved.element.getBoundingClientRect();
   const targetX = Math.round(rect.left + rect.width / 2 - 4);
   const targetY = Math.round(rect.top + rect.height / 2 - 3);
-  const startX = Math.max(12, window.innerWidth - 48);
-  const startY = Math.max(12, window.innerHeight - 48);
-
-  ensurePointerStyles();
-  document.getElementById('limova-computer-use-pointer')?.remove();
-  const pointer = document.createElement('div');
-  pointer.id = 'limova-computer-use-pointer';
-  pointer.setAttribute('aria-hidden', 'true');
-  pointer.innerHTML = '<svg viewBox="0 0 32 32" xmlns="http://www.w3.org/2000/svg"><path d="M5 3.5v22.8l6.5-6.2 4.2 8.4 4.1-2-4.1-8.1 8.8-.9L5 3.5Z" fill="#fff" stroke="#18181b" stroke-width="2.2" stroke-linejoin="round"/></svg>';
-  pointer.style.transform = `translate3d(${startX}px, ${startY}px, 0)`;
-  document.body.appendChild(pointer);
-  await waitForPointerFrame();
-  pointer.style.transform = `translate3d(${targetX}px, ${targetY}px, 0)`;
-  await waitForPointerDelay(650);
+  await glideAgentPointer(targetX, targetY);
 
   resolved = resolveElementAction(id, contextVersion);
   if (!resolved.ok) {
-    pointer.remove();
+    releaseAgentPointer();
     return resolved;
   }
   const clickRect = resolved.element.getBoundingClientRect();
-  const ripple = document.createElement('div');
-  ripple.className = 'limova-computer-use-ripple';
-  ripple.style.left = `${Math.round(clickRect.left + clickRect.width / 2)}px`;
-  ripple.style.top = `${Math.round(clickRect.top + clickRect.height / 2)}px`;
-  document.body.appendChild(ripple);
+  showAgentClickRipple(clickRect.left + clickRect.width / 2, clickRect.top + clickRect.height / 2);
   const click = dispatchCompletePointerClick(
     resolved.element,
     Math.round(clickRect.left + clickRect.width / 2),
     Math.round(clickRect.top + clickRect.height / 2)
   );
-  if (!click.ok) {
-    pointer.remove();
-    ripple.remove();
-    return click;
-  }
-  pointer.style.opacity = '0';
-  setTimeout(() => pointer.remove(), 200);
-  setTimeout(() => ripple.remove(), 450);
+  releaseAgentPointer();
+  if (!click.ok) return click;
   return {
     ok: true,
     visualized: true,
@@ -753,41 +1110,24 @@ async function executeElementTextInputWithCursor(id, contextVersion, text) {
   const rect = resolved.element.getBoundingClientRect();
   const targetX = Math.round(rect.left + Math.min(rect.width / 2, 30));
   const targetY = Math.round(rect.top + rect.height / 2 - 3);
-  const startX = Math.max(12, window.innerWidth - 48);
-  const startY = Math.max(12, window.innerHeight - 48);
-
-  ensurePointerStyles();
-  document.getElementById('limova-computer-use-pointer')?.remove();
-  const pointer = document.createElement('div');
-  pointer.id = 'limova-computer-use-pointer';
-  pointer.setAttribute('aria-hidden', 'true');
-  pointer.innerHTML = '<svg viewBox="0 0 32 32" xmlns="http://www.w3.org/2000/svg"><path d="M5 3.5v22.8l6.5-6.2 4.2 8.4 4.1-2-4.1-8.1 8.8-.9L5 3.5Z" fill="#fff" stroke="#18181b" stroke-width="2.2" stroke-linejoin="round"/></svg>';
-  pointer.style.transform = `translate3d(${startX}px, ${startY}px, 0)`;
-  document.body.appendChild(pointer);
-  await waitForPointerFrame();
-  pointer.style.transform = `translate3d(${targetX}px, ${targetY}px, 0)`;
-  await waitForPointerDelay(650);
+  await glideAgentPointer(targetX, targetY);
 
   const result = setElementText(id, contextVersion, text);
   if (!result.ok) {
-    pointer.remove();
+    releaseAgentPointer();
     return result;
   }
   const inputRect = getElementByLid(id).getBoundingClientRect();
-  const ripple = document.createElement('div');
-  ripple.className = 'limova-computer-use-ripple';
-  ripple.style.left = `${Math.round(inputRect.left + Math.min(inputRect.width / 2, 30))}px`;
-  ripple.style.top = `${Math.round(inputRect.top + inputRect.height / 2)}px`;
-  document.body.appendChild(ripple);
-  pointer.style.opacity = '0';
-  setTimeout(() => pointer.remove(), 200);
-  setTimeout(() => ripple.remove(), 450);
+  showAgentClickRipple(inputRect.left + Math.min(inputRect.width / 2, 30), inputRect.top + inputRect.height / 2);
+  releaseAgentPointer();
   await waitForPointerDelay(80);
-  const verified = resolveTextInput(id, contextVersion);
-  if (!verified.ok) return verified;
-  const currentText = verified.element instanceof HTMLInputElement || verified.element instanceof HTMLTextAreaElement
-    ? verified.element.value
-    : verified.element.textContent;
+  // Check the value, not writability: some sites disable the field for a moment
+  // while they look up what was typed (Banque de France postal code search).
+  const typed = getElementByLid(id);
+  if (!(typed instanceof HTMLElement) || !typed.isConnected) return { ok: false, error: 'Champ non disponible.' };
+  const currentText = typed instanceof HTMLInputElement || typed instanceof HTMLTextAreaElement
+    ? typed.value
+    : typed.textContent;
   if (String(currentText || '').trim() !== String(text || '').trim()) {
     return { ok: false, error: 'La page a annulé la saisie.' };
   }
@@ -1056,6 +1396,7 @@ function assistantInteractionPayload(kind, target = null) {
 
 function captureAssistantClick(event) {
   if (!assistantSessionActive || trainingCaptureActive || !event.isTrusted || !(event.target instanceof Element)) return;
+  if (event.target.closest(`#${AGENT_PRESENCE_HOST_ID}`)) return;
   const target = resolveTrainingClickTarget(event.target);
   if (!target) return;
   chrome.runtime.sendMessage({
