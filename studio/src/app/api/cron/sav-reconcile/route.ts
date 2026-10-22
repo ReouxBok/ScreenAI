@@ -1,3 +1,8 @@
+import { refreshIntakeConsole } from "@/lib/sav/intake/console-store";
+import { ensureIntakeObservations } from "@/lib/sav/intake/observation-binding";
+import { reconcileIntakeHumanChoices } from "@/lib/sav/intake/human-worker";
+import { reconcileIntakeExecutor } from "@/lib/sav/intake/executor";
+import { reconcileSavIntakeRuntime } from "@/lib/sav/intake/runtime";
 import { reconcileSavTranslations } from "@/lib/sav/translations";
 import { processPendingGmailReceipts, processPendingGmailSendActions } from "@/lib/sav/gmail";
 import { continueHubspotBackfill, getHubspotBackfillState, processPendingHubspotActions, processPendingHubspotReceipts, processPendingPilotHubspotActionsAcrossBatches, shouldAttemptHubspotBackfill } from "@/lib/sav/hubspot";
@@ -49,6 +54,11 @@ export async function GET(request: Request) {
   // Ticket creation must precede reply sending, and status updates follow the
   // Gmail action. Keeping these steps ordered prevents orphaned conversations.
   const ticketActions = await runStep("hubspot_ticket_actions", () => processPendingHubspotActions(50));
+  const intakeObservation = await runStep("intake_observation", () => reconcileSavIntakeRuntime({ deadlineMs: derivedDeadline }));
+  const intakeChoices = await runStep("intake_choices", () => Date.now()+45_000>derivedDeadline?Promise.resolve({skipped:"deadline"}):reconcileIntakeHumanChoices());
+  const intakeExecution = await runStep("intake_execution",()=>Date.now()+60_000>derivedDeadline?Promise.resolve({skipped:"deadline"}):reconcileIntakeExecutor({deadlineMs:derivedDeadline}));
+  const intakeTracking = await runStep("intake_tracking", () => ensureIntakeObservations(4));
+  const intakeConsole = await runStep("intake_console", () => refreshIntakeConsole(20));
   // Four model runs leave enough headroom for the 45 s grounded-agent budget,
   // a guarded legacy fallback and the remaining integrations inside the 300 s
   // function deadline. A 10-mail batch advances over at most three passages.
@@ -70,7 +80,7 @@ export async function GET(request: Request) {
   const dashboardProjection = savSqlDashboardEnabled()
     ? await runStep("dashboard_projection", () => refreshSavDashboardProjection(25, undefined, { deadlineMs: derivedDeadline }))
     : { status: "skipped" as const, durationMs: 0, data: { reason: "disabled" } };
-  const payload = { gmail, hubspot, emailOpenings, contextRefreshes, trainings, evaluations, ticketActions, pilotItems, pendingMessages, pilotActions, followups, replies, statusActions, learningBackfill, observations, translations, retention, dashboardProjection };
+  const payload = { intakeTracking, intakeChoices, intakeConsole, intakeExecution, intakeObservation, gmail, hubspot, emailOpenings, contextRefreshes, trainings, evaluations, ticketActions, pilotItems, pendingMessages, pilotActions, followups, replies, statusActions, learningBackfill, observations, translations, retention, dashboardProjection };
   const hasStepFailure = Object.values(payload).some((step) => step.status === "error");
   return Response.json(payload, { status: hasStepFailure ? 500 : 200 });
 }

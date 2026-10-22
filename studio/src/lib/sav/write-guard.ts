@@ -1,4 +1,6 @@
 import "server-only";
+import { intakeMessageHistorical } from "./intake/launch-boundary";
+import { guardLegacyIntakeOccupation } from "./intake/legacy-occupation";
 import { and, desc, eq } from "drizzle-orm";
 import { requireDb } from "@/db";
 import { savActions, savMessages, savThreads } from "@/db/schema";
@@ -11,7 +13,7 @@ import { assertSavCurrentManualReply } from "./manual-replies";
 import { assertSavCurrentPartnershipForward, isSavPartnershipForward } from "./partnership-forward";
 
 /** Load current state as close as possible to the external mutation. */
-export async function assertSavWriteAllowed(actionId: string) {
+async function loadSavWriteAuthority(actionId: string) {
   const db = requireDb();
   const [action] = await db.select().from(savActions).where(eq(savActions.id, actionId)).limit(1);
   if (!action) throw new Error("SAV_ACTION_NOT_FOUND");
@@ -32,10 +34,17 @@ export async function assertSavWriteAllowed(actionId: string) {
     manualReplyConfirmed: action.payload.manualReplyConfirmed === true,
   });
   if (denial) throw new Error(denial);
+  if (action.messageId && await intakeMessageHistorical(action.messageId)) throw new Error("SAV_MESSAGE_HISTORICAL_OUTSIDE_AUTOMATION");
   if (!action.messageId || !await isSavMessageEligible(action.messageId)) throw new Error("SAV_MESSAGE_BEFORE_CUTOVER");
   if (savReleaseStage() === "v0" && ["create_ticket", "link_ticket"].includes(action.kind)) await assertSavCurrentTicketReview(action);
   if (isSavPartnershipForward(action)) await assertSavCurrentPartnershipForward(action);
   else if (savReleaseStage() === "v0" && action.kind === "send_reply") await assertSavCurrentManualReply(action);
   if (!isSavPartnershipForward(action) && ["send_reply", "request_human"].includes(action.kind)) assertSavOutboundRecipientAllowed(thread.customerEmail);
   return { action, thread, latest };
+}
+
+export async function assertSavWriteAllowed(actionId:string){
+ const authority=await loadSavWriteAuthority(actionId);
+ await guardLegacyIntakeOccupation(authority.action);
+ return loadSavWriteAuthority(actionId);
 }

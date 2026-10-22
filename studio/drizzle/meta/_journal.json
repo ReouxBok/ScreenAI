@@ -239,6 +239,34 @@
       "when": 1792490400000,
       "tag": "0039_sav_dashboard_projection",
       "breakpoints": true
+    },
+    {
+      "idx": 34,
+      "version": "7",
+      "when": 1792598400000,
+      "tag": "0040_sav_intake_runtime",
+      "breakpoints": true
+    },
+    {
+      "idx": 35,
+      "version": "7",
+      "when": 1792602000000,
+      "tag": "0041_sav_intake_execution",
+      "breakpoints": true
+    },
+    {
+      "idx": 36,
+      "version": "7",
+      "when": 1792605600000,
+      "tag": "0042_sav_intake_console",
+      "breakpoints": true
+    },
+    {
+      "idx": 37,
+      "version": "7",
+      "when": 1792609200000,
+      "tag": "0043_sav_intake_launch_guards",
+      "breakpoints": true
     }
   ]
 }

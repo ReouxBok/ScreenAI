@@ -1,6 +1,7 @@
 import "server-only";
+import {historicalMessageSql,intakeMessageHistorical} from "./intake/launch-boundary";
 import {randomUUID} from "node:crypto";
-import {and,asc,eq,inArray,isNull,lte,or} from "drizzle-orm";
+import {and,asc,eq,inArray,isNull,lte,or,sql} from "drizzle-orm";
 import {z} from "zod";
 import {requireDb} from "@/db";
 import {savMessages,savMessageTranslations,savDecisions,savAgentRuns,savThreads} from "@/db/schema";
@@ -40,14 +41,14 @@ export async function reconcileSavTranslations(limit=2,options:{apiKey?:string;m
  const now=options.now??new Date(),db=requireDb(),results=[] as Array<{id:string;status:string}>;
  if(isSavCaseLearningFrozen())return {processed:results,skipped:"frozen"};
  if(savReleaseStage()!=="v0"||process.env.SAV_AI_ANALYSIS==="false")return {processed:results,skipped:"analysis_disabled"};
- const selected=await db.select({translation:savMessageTranslations}).from(savMessageTranslations).innerJoin(savMessages,eq(savMessages.id,savMessageTranslations.messageId)).innerJoin(savThreads,eq(savThreads.id,savMessages.threadId)).where(and(eq(savThreads.aiPaused,false),savV0EligibleMessageFilter(),eq(savMessageTranslations.translatorRevision,SAV_TRANSLATOR_REVISION),eq(savMessageTranslations.status,"pending"),or(isNull(savMessageTranslations.leaseUntil),lte(savMessageTranslations.leaseUntil,now)))).orderBy(asc(savMessageTranslations.createdAt)).limit(Math.min(2,Math.max(1,limit)));
+ const selected=await db.select({translation:savMessageTranslations}).from(savMessageTranslations).innerJoin(savMessages,eq(savMessages.id,savMessageTranslations.messageId)).innerJoin(savThreads,eq(savThreads.id,savMessages.threadId)).where(and(eq(savThreads.aiPaused,false),savV0EligibleMessageFilter(),sql`not (${historicalMessageSql()})`,eq(savMessageTranslations.translatorRevision,SAV_TRANSLATOR_REVISION),eq(savMessageTranslations.status,"pending"),or(isNull(savMessageTranslations.leaseUntil),lte(savMessageTranslations.leaseUntil,now)))).orderBy(asc(savMessageTranslations.createdAt)).limit(Math.min(2,Math.max(1,limit)));
  const rows=selected.map(r=>r.translation);
  for(const row of rows){
   if(options.deadlineMs&&Date.now()+19000>options.deadlineMs)break;
   const token=randomUUID(),started=Date.now(),model=options.model??process.env.SAV_AI_MODEL??"gemini-3.6-flash";let claimed=false,reservationId:string|undefined;
   try{
    const [message]=await db.select().from(savMessages).where(eq(savMessages.id,row.messageId));
-   if(!message||!await isSavMessageEligible(message.id))continue;
+   if(!message||!await isSavMessageEligible(message.id)||await intakeMessageHistorical(message.id))continue;
    const [thread]=await db.select().from(savThreads).where(eq(savThreads.id,message.threadId));
    if(thread?.aiPaused)continue;
    if(row.attempts>0)throw new Error("SAV_TRANSLATION_INTERRUPTED");

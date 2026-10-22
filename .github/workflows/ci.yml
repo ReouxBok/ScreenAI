@@ -11,7 +11,7 @@ permissions:
 jobs:
   verify:
     runs-on: ubuntu-latest
-    timeout-minutes: 35
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -39,7 +39,18 @@ jobs:
       - run: npm test --prefix proxy
       - run: npm run build --prefix studio
       - run: npx playwright install --with-deps chromium
-      - run: npm run test:e2e --prefix studio
+      - name: Studio browser tests in isolated processes
+        run: |
+          node --test studio/scripts/run-e2e-ci.node-test.mjs
+          node studio/scripts/run-e2e-ci.mjs
+      - name: Preserve Studio browser diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: studio-browser-diagnostics
+          path: studio/test-results
+          if-no-files-found: warn
+          retention-days: 7
       - run: env -i PATH="$PATH" HOME="$HOME" CI=1 npm run test:e2e --prefix studio -- --config playwright.sav-semantic.config.ts
       - run: env -i PATH="$PATH" HOME="$HOME" CI=1 npm run test:e2e --prefix studio -- --config playwright.sav-journey.config.ts
       - run: env -i PATH="$PATH" HOME="$HOME" CI=1 npm run test:e2e --prefix studio -- --config playwright.sav-other.config.ts
@@ -91,6 +102,9 @@ jobs:
         working-directory: studio
         run: >-
           node node_modules/vitest/vitest.mjs run --maxWorkers=1 --no-file-parallelism
+          src/lib/sav/intake/runtime.test.ts
+          src/lib/sav/intake/execution.test.ts src/lib/sav/intake/console.test.ts
+          src/lib/sav/intake/budget-profile.test.ts
           src/lib/sav/dashboard.test.ts
           src/lib/sav/dashboard-projection.test.ts
           src/lib/sav/dashboard-sql-reference.test.ts
