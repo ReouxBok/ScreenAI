@@ -28,6 +28,7 @@ async function mergedHumanResolution(event:typeof savIntakeHumanEvents.$inferSel
   const resolution:NonNullable<EngineInput["humanResolution"]>={choiceId:event.id,at:event.createdAt.toISOString(),equivalentContactIds:value.candidateContactIds,inheritedChoiceIds:[],fieldSources:{}};
   if(value.reinvestigate) resolution.suppressOutbound=true;
   const apply=(source:typeof event,body:HumanEventPayload)=>{
+    if(body.reinvestigate)resolution.suppressOutbound=true;
     if(body.policyHash!==config.policyHash||body.resourcesHash!==config.resourcesHash||source.sourceHash!==event.sourceHash) return conflict();
     if(body.candidatesHash!==value.candidatesHash) {
       // A fresh server reanalysis can introduce candidates after an automatic
