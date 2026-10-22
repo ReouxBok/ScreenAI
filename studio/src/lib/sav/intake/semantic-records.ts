@@ -46,12 +46,17 @@ function validateAccepted(method: keyof SavIntakeSemanticReaders, input: unknown
   }
 }
 export function recordAcceptedIntakeSemantics(readers: SavIntakeSemanticReaders, envelope: AcceptedIntakeSemantics,
-  onAccepted: () => void): SavIntakeSemanticReaders {
+  onAccepted: () => void, onRejected?: (failure: { method: keyof SavIntakeSemanticReaders; errorCode: string }) => void): SavIntakeSemanticReaders {
   const wrap = (method: keyof SavIntakeSemanticReaders) => async (input: unknown, signal: AbortSignal) => {
     const fn = readers[method];
     if (!fn) throw Error("SAV_INTAKE_SEMANTIC_RESULT_MISSING");
     const result = await (fn as (i: unknown, s: AbortSignal) => Promise<unknown>)(input, signal);
-    validateAccepted(method, input, result);
+    try { validateAccepted(method, input, result); }
+    catch (error) {
+      onRejected?.({ method, errorCode: error instanceof Error && /^SAV_INTAKE_[A-Z_]+$/.test(error.message)
+        ? error.message : "SAV_INTAKE_SEMANTIC_OUTPUT_REJECTED" });
+      throw error;
+    }
     const record = { method, input: structuredClone(input), result: structuredClone(result), inputHash: intakeSemanticInputHash(input),
       resultHash: savIntakeEvidenceContentHash(JSON.parse(JSON.stringify(result))), acceptedAt: new Date().toISOString() };
     const prior = envelope.records.find(row => row.method === method && row.inputHash === record.inputHash);
