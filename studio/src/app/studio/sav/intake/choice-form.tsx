@@ -12,7 +12,15 @@ export function IntakeChoiceForm({ expected, contacts, tickets, classification }
   const [contact, setContact] = useState("");
   const [ticket, setTicket] = useState("");
   const [category, setCategory] = useState(classification);
-  return <form action={action} className={styles.choice}>
+  return <>
+    {classification === "other" && <form action={action} className={styles.choice} aria-label="Remettre le mail dans le support">
+      {Object.entries(expected).map(([name,value])=><input key={name} type="hidden" name={name} value={value}/>)}
+      <input type="hidden" name="kind" value="classify"/><input type="hidden" name="classification" value="support"/>
+      <input type="hidden" name="reason" value="Remise dans le support demandée par un opérateur ; réexaminer la demande et les tickets associés."/>
+      <h2>Ce mail nécessite du support ?</h2><p>Le mail revient dans le support. L’agent réexamine la demande avant toute action.</p>
+      <button type="submit" disabled={pending||state.ok}>Remettre dans le support</button>
+    </form>}
+    <form action={action} className={styles.choice}>
     {Object.entries(expected).map(([name, value]) => <input key={name} type="hidden" name={name} value={value}/>)}
     <h2>Corriger cette version</h2>
     <p>Votre choix reste conditionnel à la relecture des sources. Il ne donne aucun droit supplémentaire.</p>
@@ -37,5 +45,5 @@ export function IntakeChoiceForm({ expected, contacts, tickets, classification }
     </fieldset>
     {pending && <p role="status">Enregistrement en cours…</p>}
     {state.message && <p role={state.ok ? "status" : "alert"}>{state.message}</p>}
-  </form>;
+  </form></>;
 }

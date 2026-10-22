@@ -26,6 +26,8 @@ import {
 import { decryptSavPayload, encryptSavPayload, savContentHash } from "./crypto";
 import { analyzeSavMessage, type SavAnalysis } from "./intelligence";
 import { withSavAiBudget } from "./gemini-transport";
+import { acquireSavAttachmentRead } from "./attachment-store";
+import { savAttachmentMetadataSchema, savAttachmentInventorySchema, type SavAttachmentInventory, type SavAttachmentMetadata, type SavAttachmentRead } from "./attachment-contract";
 import { savPrimaryAnalysisDiagnostic } from "./analysis-errors";
 import { collectSavDossierContext, type SavDossierContext } from "./dossier-context";
 import { assertSavActor } from "./access";
@@ -45,7 +47,7 @@ import {
   type DecisionProposal,
 } from "./policy";
 
-export type SavMessageBody = { text: string; html?: string; headers?: Record<string, string>; attachments?: Array<{ filename: string; mimeType: string; size: number }>; supportContext?: SavDossierContext };
+export type SavMessageBody = { text: string; html?: string; headers?: Record<string, string>; attachments?: SavAttachmentMetadata[]; attachmentInventory?: SavAttachmentInventory; attachmentRead?: SavAttachmentRead; supportContext?: SavDossierContext };
 
 export const inboundMessageSchema = z.object({
   mailboxEmail: z.email(),
@@ -56,7 +58,8 @@ export const inboundMessageSchema = z.object({
   subject: z.string().trim().max(1_000).default("Sans objet"),
   bodyText: z.string().max(100_000).default(""),
   bodyHtml: z.string().max(300_000).optional(),
-  attachments: z.array(z.object({ filename: z.string().max(500), mimeType: z.string().max(200), size: z.number().int().nonnegative() })).max(100).default([]),
+  attachments: z.array(savAttachmentMetadataSchema).max(100).default([]),
+  attachmentInventory: savAttachmentInventorySchema.optional(),
   headers: z.record(z.string(), z.string().max(2_000)).optional(),
   autoSubmitted: z.string().trim().max(200).optional(),
   receivedAt: z.coerce.date(),
@@ -305,7 +308,7 @@ export async function ingestInboundMessage(rawInput: unknown) {
       toEmails: input.to.map(normalizeEmailAddress),
       subject: input.subject || "Sans objet",
       preview: redactSavLearningText(bodyText.replace(/\s+/g, " ")).slice(0, 280),
-      bodyCiphertext: encryptSavPayload({ text: bodyText, ...(input.bodyHtml ? { html: input.bodyHtml } : {}), headers, attachments: input.attachments }),
+      bodyCiphertext: encryptSavPayload({ text: bodyText, ...(input.bodyHtml ? { html: input.bodyHtml } : {}), headers, attachments: input.attachments, ...(input.attachmentInventory ? { attachmentInventory: input.attachmentInventory } : {}) }),
       receivedAt: input.receivedAt,
     }).onConflictDoNothing().returning();
     const [message] = created ? [created] : await tx.select().from(savMessages)
@@ -340,7 +343,11 @@ export async function ingestInboundMessage(rawInput: unknown) {
 
 /** Collection can call ticket matching before analysis; both consume one budget. */
 export function analyzeStoredSavMessage(input: Parameters<typeof analyzeSavMessage>[0], context: Parameters<typeof analyzeSavMessage>[1] & { messageId: string }) {
-  return withSavAiBudget(async () => analyzeSavMessage({ ...input, dossierContext: await collectSavDossierContext(context.messageId) }, context));
+  return withSavAiBudget(async () => {
+    const dossierContext = await collectSavDossierContext(context.messageId);
+    const attachmentRead = context.pilotBatchId || context.evaluation ? null : await acquireSavAttachmentRead(context.messageId);
+    return analyzeSavMessage({ ...input, dossierContext, attachmentRead }, context);
+  });
 }
 
 export async function processStoredSavMessage(messageId: string) {
@@ -362,7 +369,7 @@ export async function processStoredSavMessage(messageId: string) {
   try {
     const body = decryptSavPayload<SavMessageBody>(message.bodyCiphertext);
     const analysis = await analyzeStoredSavMessage({
-      from: message.fromEmail, subject: message.subject, body: body.text,
+      from: message.fromEmail, subject: message.subject, body: body.text, attachmentInventory: body.attachmentInventory,
       autoSubmitted: body.headers?.["auto-submitted"],
       contentType: body.headers?.["content-type"],
       displayName: body.headers?.["from-display-name"],
@@ -424,7 +431,7 @@ export async function processSavPilotItem(itemId: string) {
     if (!await isSavMessageEligible(message.id)) throw new Error("SAV_MESSAGE_BEFORE_CUTOVER");
     const body = decryptSavPayload<SavMessageBody>(message.bodyCiphertext);
     const analysis = await analyzeStoredSavMessage(
-      { from: message.fromEmail, subject: message.subject, body: body.text,
+      { from: message.fromEmail, subject: message.subject, body: body.text, attachmentInventory: body.attachmentInventory,
         autoSubmitted: body.headers?.["auto-submitted"], contentType: body.headers?.["content-type"], displayName: body.headers?.["from-display-name"] },
       { messageId: message.id, pilotBatchId: claimed.batchId },
     );
@@ -784,7 +791,7 @@ export async function repairSavProposal(messageId: string, actorEmail: string) {
   if (decisions[0]?.proposal) throw new Error("SAV_PROPOSAL_ALREADY_AVAILABLE");
   // Generate first. The existing decision stays intact if generation fails.
   const body = decryptSavPayload<SavMessageBody>(message.bodyCiphertext);
-  const analysis = await analyzeStoredSavMessage({ from: message.fromEmail, subject: message.subject, body: body.text,
+  const analysis = await analyzeStoredSavMessage({ from: message.fromEmail, subject: message.subject, body: body.text, attachmentInventory: body.attachmentInventory,
     autoSubmitted: body.headers?.["auto-submitted"], contentType: body.headers?.["content-type"],
     displayName: body.headers?.["from-display-name"] }, { messageId });
   await db.transaction(async (tx) => {

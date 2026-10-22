@@ -12,6 +12,7 @@ import { searchSavKnowledgeByRequest } from "./request-retrieval-db";
 import { retrieveSavKnowledgeByRequest, assertSavRequestCandidateLinks, type SavRequestRetrievalResult } from "./request-retrieval";
 import { compactSavModelContext } from "./compact-model-context";
 import { SAV_PRODUCT_GUIDANCE } from "./product-guidance";
+import type { SavAttachmentInventory, SavAttachmentRead } from "./attachment-contract";
 import "server-only";
 
 import { z } from "zod";
@@ -41,7 +42,7 @@ import { understandSavMessage } from "./understanding-model";
 import { checkSavReplyCoherence } from "./reply-coherence";
 import { assembleSavReplySections, assertSavReplyConsistency, savSemanticPlan, savReplyCoverageSchema, type SavUnderstandingV1 } from "./understanding";
 
-type SavEnrichedInput = SavClassificationInput & { conversation?: SavConversation; messageContext?: SavInboundContext; displayName?: string; dossierContext?: SavDossierContext; understanding?: SavUnderstandingV1; activePlaybook?: SavActivePlaybook };
+type SavEnrichedInput = SavClassificationInput & { conversation?: SavConversation; messageContext?: SavInboundContext; displayName?: string; dossierContext?: SavDossierContext; understanding?: SavUnderstandingV1; activePlaybook?: SavActivePlaybook; attachmentRead?: SavAttachmentRead | null; attachmentInventory?: SavAttachmentInventory | null };
 
 const aiAnalysisSchema = z.object({
   category: z.enum(["technical", "account", "billing", "integration", "how_to", "acknowledgement", "other"]),
@@ -153,7 +154,7 @@ async function analyzeSavMessageLegacy(input: SavEnrichedInput, context: SavAnal
   const model = context.evaluation?.model ?? process.env.SAV_AI_MODEL ?? "gemini-3.6-flash";
   const compact = compactSavModelContext({ current: { messageId: input.dossierContext?.messageId ?? "", sourceId: "current_body",
     receivedAt: input.dossierContext?.collectedAt ?? new Date().toISOString(), subject: input.subject, text: input.body },
-    expectedCustomerEmail: input.from, understanding, dossier: input.dossierContext });
+    expectedCustomerEmail: input.from, understanding, dossier: input.dossierContext, attachmentRead: input.attachmentRead, attachmentInventory: input.attachmentInventory });
   if (compact.status === "blocked") return degradedWithHarness([{ phase: "generation", errorCode: "SAV_COMPACT_CONTEXT_BLOCKED" }]);
   const sources = JSON.stringify({ semanticPolicy: plan, context: compact, knowledge: retrieval, requestPlans });
   let generationMetadata: SavGeminiMetadata | undefined;

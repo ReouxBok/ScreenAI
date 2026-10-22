@@ -4,7 +4,7 @@ import { eq, sql } from "drizzle-orm";
 import { createSavTestDb } from "../../../../test/sav-db";
 import { executionProvider } from "../../../../test/sav-intake-execution-provider";
 import { savMailboxes, savThreads, savMessages, staffUsers, savSyncState, savIntakeRuns, savIntakeModelCalls,
-  savIntakeHumanEvents, savIntakeConsole, savIntakeExecutions, savIntakeEffects, savIntakeExecutionBudget,
+  savIntakeHumanEvents, savIntakeJournal, savIntakeConsole, savIntakeExecutions, savIntakeEffects, savIntakeExecutionBudget,
   savIntakeObservationBindings, savResolutionObservations, savAgentRuns, savDecisions, savActions, savFollowups, savLearningCandidates, savKnowledgeActivations, categories } from "@/db/schema";
 const state = vi.hoisted(() => ({ db: null as unknown, user: null as unknown }));
 vi.mock("@/db", () => ({ requireDb: () => { if (!state.db) throw Error("DB_FORBIDDEN"); return state.db; } }));
@@ -23,7 +23,7 @@ import { admitIntakeExecution, claimExecution, ensureExecutionEffect, markEffect
 import { executeIntakePass, readIntakeExecutionProgress, reconcileIntakeEffectsReadOnly } from "./executor";
 import { recordIntakeHumanCommand, type IntakeHumanCommand } from "./human-commands";
 import { consumeIntakeHumanEvent } from "./human-worker";
-import { intakeRunConfigurationBound, humanRevisionConfigHash } from "./human-binding";
+import { intakeRunConfigurationBound, intakeRunCandidateContactIds, humanRevisionConfigHash } from "./human-binding";
 import { listIntakeConsole, projectIntakeThread, refreshIntakeConsole } from "./console-store";
 import { readIntakeConsoleDetail } from "./console-detail";
 import { ensureIntakeObservations, readIntakeObservationBinding, readIntakeLearningQualification, attributeIntakeObservationEvents } from "./observation-binding";
@@ -631,4 +631,59 @@ it("a formerly authenticated equivalent group disappearing entirely cannot becom
   expect(current.payload.plan?.decision.disposition).toMatchObject({kind:"collect_context",reasons:expect.arrayContaining(["contact_ambiguous"])});
   expect(current.payload.plan?.steps).toEqual([]);expect(mutationsSent()).toHaveLength(0);
   expect(await db.db.select().from(savIntakeModelCalls)).toHaveLength(0);
+});
+
+it.each(["single","equivalent","other"]) ("Other -> support reanalysis preserves ledger and fresh candidate selection (%s)",async(mode)=>{
+  const multiple=mode!=="single";
+  if(multiple)p.setContacts(["101","102"].map(id=>({id,emails:["customer@example.invalid"]})));
+  for(const [key,value] of Object.entries(environment)) if(value!==undefined)vi.stubEnv(key,value);
+  const id=(await enqueueSavIntakeMessage(messageId,options.runtime))!,lease=(await claimSavIntakeRun(id,options.runtime))!;
+  const semantics:AcceptedIntakeSemantics={revision:SAV_INTAKE_SEMANTIC_RECORD_REVISION,validatorRevision:SAV_INTAKE_MODEL_REVISION,records:[]};
+  const semantic=recordAcceptedIntakeSemantics({analyseMessage:async()=>({messageId,requests:[{id:"noise",kind:"other",currentMessageId:messageId}]}),
+    assessIssues:async()=>({investigationComplete:true,tickets:[]})},semantics,()=>{});
+  const plan=await planSavIntake(lease.input,{...createSavIntakeHubspotReaders({network:p.network}),...semantic},
+    {...options.runtime.policy,qualifiedOther:{evidenceSource:"private_rule",resource:{resourceId:"synthetic-rule",revisionId:"v1",sha256:"a".repeat(64)}}},{},()=>new Date());
+  expect(plan.progress.kind).toBe("qualified_other");
+  const original:IntakeRuntimePayload={revision:SAV_INTAKE_RUNTIME_REVISION,input:lease.input,plan,semantics,effects:"not_connected",configuration:{configHash:options.runtime.configHash,policyHash:options.runtime.policyHash,resourcesHash:options.runtime.resourcesHash,codeRevision:options.runtime.codeRevision,model:options.runtime.model}};
+  await saveSavIntakeResult(lease,options.runtime,original,"observed");runId=id;
+  const usage={inputTokens:100,outputTokens:50,thoughtTokens:0,totalTokens:150};
+  await db.db.insert(savIntakeModelCalls).values({runId:id,messageKey:intakeRuntimeHash(messageId),requestHash:"b".repeat(64),state:"settled",reservedNanoUsd:817152000,chargedNanoUsd:262500,payloadCiphertext:encryptSavPayload({metadata:usage})});
+  const network=vi.fn(async(url:Parameters<typeof fetch>[0],init?:RequestInit)=>{
+    expect(String(url)).toBe("https://generativelanguage.googleapis.com/v1beta/models/gemini-3.6-flash:generateContent");
+    const body=JSON.parse(String(init?.body)),data=JSON.parse(body.contents[0].parts[0].text);let answer:unknown;
+    if(data.candidates){
+      answer={kind:"equivalent",investigationComplete:true,contactIds:data.candidates.map((c:{contactId:string})=>c.contactId),evidenceIds:data.evidence.map((e:{id:string})=>e.id),grounding:data.citationCatalogue.map((c:{id:string})=>({quoteId:c.id})),rationale:"Synthetic equivalent candidates"};
+    }else if(!data.tickets){
+      expect(data.operatorCorrection).toBe("support");
+      answer={messageId,requests:[{id:"r1",kind:mode==="other"?"other":"support",currentMessageId:messageId,quoteId:data.citationCatalogue.find((c:{sourceId:string})=>c.sourceId==="current").id}],ticketSummary:{title:"Synthetic connection failure",description:"The synthetic connection fails.",requestIds:["r1"]}};
+    }else answer={investigationComplete:true,tickets:data.tickets.map((t:{ticket:{id:string}})=>({ticketId:t.ticket.id,relation:"same",requestIds:["r1"],evidenceIds:["current",`ticket-${t.ticket.id}`,`history-${t.ticket.id}`],grounding:data.citationCatalogue.map((c:{id:string})=>({quoteId:c.id})),rationale:"Synthetic matching sources"}))};
+    return Response.json({candidates:[{finishReason:"STOP",content:{parts:[{text:JSON.stringify(answer)}]}}],usageMetadata:{promptTokenCount:100,candidatesTokenCount:50,thoughtsTokenCount:0,totalTokenCount:150}});
+  });vi.stubGlobal("fetch",network);
+  const raw={...await command("classify"),classification:"support" as const},recorded=await recordIntakeHumanCommand(raw);
+  expect((await consumeIntakeHumanEvent(recorded.eventId,options.runtime,createSavIntakeHubspotReaders({network:p.network})))).toHaveProperty("state",multiple?"waiting":"observed");
+  const current=(await readSavIntakeCurrent(threadId,options.runtime))!;
+  expect(current.payload.plan?.decision.classification).toBe("support");expect(current.payload.plan?.decision.disposition.kind).toBe(multiple?"collect_context":"ticket");
+  if(multiple){
+    expect(current.candidateContactIds).toEqual(["101","102"]);
+    const changed=structuredClone(current.payload);changed.plan!.candidateContactIds=["999"];
+    expect(await intakeRunCandidateContactIds(current,changed)).toBeNull();
+    expect(await intakeRunCandidateContactIds({...current,sourceHash:"f".repeat(64)},current.payload)).toBeNull();
+    const journals=await db.db.select().from(savIntakeJournal).where(eq(savIntakeJournal.runId,current.id));
+    const reanalysis=journals.find(row=>row.kind==="human_reanalysis")!;expect(reanalysis).toBeTruthy();
+    const [duplicate]=await db.db.insert(savIntakeJournal).values({runId:current.id,kind:"human_reanalysis",payloadCiphertext:reanalysis.payloadCiphertext}).returning();
+    expect(await intakeRunCandidateContactIds(current,current.payload)).toBeNull();
+    await db.db.delete(savIntakeJournal).where(eq(savIntakeJournal.id,duplicate.id));
+    await db.db.delete(savIntakeJournal).where(eq(savIntakeJournal.id,reanalysis.id));
+    expect(await intakeRunCandidateContactIds(current,current.payload)).toEqual([]);
+    await db.db.insert(savIntakeJournal).values(reanalysis);
+    expect(await revise("select",{contactId:"102"})).toHaveProperty("state","observed");
+    const selected=(await readSavIntakeCurrent(threadId,options.runtime))!;
+    expect(selected.payload.plan?.decision.classification).toBe("support");
+    expect(selected.payload.plan?.decision.disposition).toMatchObject({kind:"ticket",target:{contactId:"102"}});
+  }
+  expect(current.id).not.toBe(id);expect(current.humanChoice).toMatchObject({eventId:recorded.eventId});
+  expect((await db.db.select().from(savIntakeRuns).where(eq(savIntakeRuns.id,id)))[0].state).toBe("superseded");
+  const calls=await db.db.select().from(savIntakeModelCalls);expect(calls).toHaveLength(multiple?3:2);expect(network).toHaveBeenCalledTimes(multiple?2:1);expect(calls.every(c=>c.state==="settled")).toBe(true);
+  expect(mutationsSent()).toHaveLength(0);await projectIntakeThread(threadId);
+  expect((await listIntakeConsole({view:"other"})).total).toBe(0);
 });
