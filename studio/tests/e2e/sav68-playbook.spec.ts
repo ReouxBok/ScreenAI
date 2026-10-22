@@ -42,7 +42,8 @@ test("knowledge, enrichment and learning remain separate from the master prompt"
       && new URL(response.url()).pathname === "/studio/sav/connaissances/diagnostic", { timeout: 30_000 }),
     page.getByRole("button", { name: "Préparer toutes les fiches actives", exact: true }).click(),
   ]);
-  await preparation.finished();
+  // The final message appears only once every page of the action has returned;
+  // Chromium may not report the streamed response as finished in development.
   expect(preparation.status()).toBe(200);
   await expect(page.getByRole("status")).toContainText("Préparation terminée");
   await page.goto("/studio/sav/connaissances/apprentissage");
