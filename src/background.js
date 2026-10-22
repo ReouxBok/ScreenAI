@@ -59,6 +59,14 @@ function isLimovaUrl(value) {
   }
 }
 
+function siteNameOf(value) {
+  try {
+    return new URL(value).hostname.replace(/^www\./, '');
+  } catch {
+    return 'site inconnu';
+  }
+}
+
 // Charly works on any web page the user brings it to. Chrome keeps its own
 // pages (settings, Web Store) out of reach of every extension.
 const UNSCRIPTABLE_HOSTS = new Set(['chromewebstore.google.com', 'chrome.google.com']);
@@ -2294,8 +2302,13 @@ async function getPageContext(tabId, operation = { generation: sessionGeneration
 
         // Helper: get zone from DOM position
         function getZone(el) {
-          const modal = el.closest('[role="dialog"], [role="alertdialog"], [aria-modal="true"], dialog, [class*="modal" i], [class*="dialog" i], [class*="drawer" i], [class*="popup" i]');
-          if (modal) return 'modal';
+          if (activeModalSurface?.contains(el)) return 'modal';
+          if (el.closest('[role="dialog"], [role="alertdialog"], [aria-modal="true"], dialog[open]')) return 'modal';
+          // Limova names its own overlays modal/dialog/drawer/popup. Elsewhere
+          // such class names are layout wrappers (Drupal wraps whole sites in
+          // .dialog-off-canvas-main-canvas) and only the detected surface counts.
+          if (window.location.origin === limovaOrigin
+            && el.closest('dialog, [class*="modal" i], [class*="dialog" i], [class*="drawer" i], [class*="popup" i]')) return 'modal';
           const nav = el.closest('nav, [role="navigation"], [class*="sidebar"], [class*="nav"]');
           if (nav) return 'nav';
           const header = el.closest('header, [class*="header"], [class*="topbar"]');
@@ -2906,6 +2919,10 @@ async function getPageContext(tabId, operation = { generation: sessionGeneration
         pageElementSnapshots.delete(pageElementSnapshots.keys().next().value);
       }
       const parts = [];
+      // Stated first on every map so the voice model never mistakes a site for Limova.
+      parts.push(isLimovaUrl(pc.url)
+        ? 'Site: Limova'
+        : `Site: ${siteNameOf(pc.url)} — site externe, ce n’est pas Limova`);
       parts.push(`Page: ${pc.title || '(no title)'} — ${pc.url}`);
       parts.push(`Viewport: ${pc.viewport}`);
       parts.push(`Surface active: ${pc.surface === 'modal' ? 'fenêtre au premier plan uniquement' : 'page entière'}`);

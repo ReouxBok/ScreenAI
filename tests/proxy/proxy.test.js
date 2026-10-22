@@ -460,6 +460,8 @@ describe('POST /api/live-token', () => {
     const handoff = declarations.find(tool => tool.name === 'create_in_limova');
     expect(handoff.parameters.required).toEqual(['request']);
     expect(systemText).toContain('HORS DE LIMOVA');
+    expect(systemText).toContain('n’appelle pas search_knowledge_base pour une question sur ce site');
+    expect(declarations.find(tool => tool.name === 'search_knowledge_base').description).toContain('jamais pour un autre site');
     expect(systemText).toContain('Appelle create_in_limova seulement après son oui');
     expect(systemText).toContain('n’ouvre jamais Limova toi-même');
     expect(systemText).toContain('« Je lance ? »');

@@ -148,6 +148,25 @@ describe('background privacy boundaries', () => {
     }
   });
 
+  it('names the external site and does not treat a Drupal page wrapper as a modal', async () => {
+    document.body.innerHTML = `
+      <div class="dialog-off-canvas-main-canvas">
+        <header><a href="/fr/nous-contacter">Nous contacter</a></header>
+        <main>
+          <h2>Trouver un guichet</h2>
+          <input type="text" aria-label="Renseigner votre code postal">
+        </main>
+      </div>
+    `;
+
+    const context = await background.getPageContext(7);
+
+    expect(context.split('\n')[0]).toMatch(/^Site: .+ — site externe, ce n’est pas Limova$/);
+    expect(context).toContain('Surface active: page entière');
+    expect(context).not.toContain('[modal]');
+    expect(context).toMatch(/\[header\]\n {2}\[\d+\] clickable\(a\) "Nous contacter"/);
+  });
+
   it('keeps the whole page when a mini video player or a consent iframe is layered on top', async () => {
     const defaultRect = HTMLElement.prototype.getBoundingClientRect;
     HTMLElement.prototype.getBoundingClientRect = function getBoundingClientRect() {

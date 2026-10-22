@@ -1121,11 +1121,13 @@ async function executeElementTextInputWithCursor(id, contextVersion, text) {
   showAgentClickRipple(inputRect.left + Math.min(inputRect.width / 2, 30), inputRect.top + inputRect.height / 2);
   releaseAgentPointer();
   await waitForPointerDelay(80);
-  const verified = resolveTextInput(id, contextVersion);
-  if (!verified.ok) return verified;
-  const currentText = verified.element instanceof HTMLInputElement || verified.element instanceof HTMLTextAreaElement
-    ? verified.element.value
-    : verified.element.textContent;
+  // Check the value, not writability: some sites disable the field for a moment
+  // while they look up what was typed (Banque de France postal code search).
+  const typed = getElementByLid(id);
+  if (!(typed instanceof HTMLElement) || !typed.isConnected) return { ok: false, error: 'Champ non disponible.' };
+  const currentText = typed instanceof HTMLInputElement || typed instanceof HTMLTextAreaElement
+    ? typed.value
+    : typed.textContent;
   if (String(currentText || '').trim() !== String(text || '').trim()) {
     return { ok: false, error: 'La page a annulé la saisie.' };
   }
