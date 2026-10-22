@@ -6,7 +6,7 @@ const mocks = vi.hoisted(() => ({ staff: vi.fn(), list: vi.fn(), detail: vi.fn()
 vi.mock("@/lib/sav/intake/console-auth",()=>({requireIntakeConsoleStaff:mocks.staff}));
 vi.mock("@/lib/sav/intake/console-store",()=>({listIntakeConsole:mocks.list}));
 vi.mock("@/lib/sav/intake/console-detail",()=>({readIntakeConsoleDetail:mocks.detail}));
-vi.mock("./actions",()=>({saveIntakeChoice:mocks.action}));
+vi.mock("./actions",()=>({saveIntakeChoice:mocks.action,requestRecoveryAction:mocks.action,reconcileIdentificationAction:mocks.action}));
 vi.mock("next/link",()=>({default:(props:ComponentProps<"a">)=>createElement("a",props)}));
 vi.mock("next/navigation",()=>({notFound:()=>{throw Error("NOT_FOUND");}}));
 import IntakeConsolePage from "./page";
