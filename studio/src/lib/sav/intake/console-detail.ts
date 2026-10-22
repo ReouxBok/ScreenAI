@@ -8,6 +8,7 @@ import { getSavTranslations } from "../translations";
 import { intakeConsoleInstalled } from "./console-capability";
 import { intakeMessageHistorical } from "./launch-boundary";
 import { readSavIntakeCurrent } from "./runtime-store";
+import { readIntakeRunDiagnostics } from "./run-diagnostics";
 import { readIntakeExecutionProgress } from "./executor";
 import type { HumanEventPayload } from "./human-binding";
 export async function readIntakeConsoleDetail(threadId: string) {
@@ -36,8 +37,9 @@ export async function readIntakeConsoleDetail(threadId: string) {
       reason: payload.reason, parentVersion: event.parentVersion, contactId: payload.contactId, ticketId: payload.ticketId };
   });
   const progress=latest ? await readIntakeExecutionProgress(latest.id) : null;
+  const diagnostics=await readIntakeRunDiagnostics(threadId);
   const confirmedCurrent=Boolean(current && current.messageId===latest?.id && progress?.confirmed && progress.runId===current.id && progress.completionSourceHash && progress.completionSourceHash===current.currentSourceHash);
   return { confirmedCurrent, thread: { id: thread.id, subject: latest?.subject ?? thread.subject, paused: thread.aiPaused, ticketId: thread.hubspotTicketId },
     projection, latestMessageId: latest?.id ?? null, current, messages, historyTruncated: rows.length > 200,
-    progress, choices };
+    progress, choices, diagnostics };
 }
