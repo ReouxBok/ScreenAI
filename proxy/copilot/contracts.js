@@ -11,6 +11,7 @@ const pageSchema = z.object({
 const turnSchema = z.object({
   sessionId: z.string().uuid(),
   resetContext: z.boolean().optional(),
+  userFirstName: z.string().trim().min(1).max(80).optional(),
   message: z.string().trim().min(1).max(8_000),
   source: z.literal('text'),
   locale: localeSchema,

@@ -615,6 +615,7 @@ async function handleMessage(request, sender) {
 
     case 'AUTH_LOGOUT':
       await clearCharlyAuthSession(false);
+      await chrome.storage.local.remove(USER_FIRST_NAME_KEY).catch(() => {});
       handleResetSession();
       return { ok: true, authenticated: false };
 
@@ -1716,6 +1717,7 @@ async function sendToCopilotV2({ tab, userMessage, pageContext, operationId, _se
     body: JSON.stringify({
       sessionId,
       ...(sessionState.resetContext ? { resetContext: true } : {}),
+      ...(await userFirstNameField()),
       message: userMessage,
       source: 'text',
       locale: copilotLocale(),
@@ -1928,6 +1930,7 @@ async function sendToGemini({
         systemInstruction: { parts: [{ text: systemPrompt }] },
         contents,
         ...(sessionState.resetContext ? { resetContext: true } : {}),
+        ...(await userFirstNameField()),
         ...(userMessage && !_suppressMemoryTurn ? {
           memoryTurn: {
             user: userMessage,
@@ -3347,9 +3350,25 @@ function sanitizeLimovaProfile(raw) {
   return Object.keys(profile).length ? profile : null;
 }
 
+// The first name is who the user is, not conversation memory: it is kept
+// across "new conversation" resets and sent with every turn, so Charly still
+// knows it when the account-wide memory is set aside. Cleared on logout.
+const USER_FIRST_NAME_KEY = 'limova_user_first_name_v1';
+
+async function storedUserFirstName() {
+  const stored = await chrome.storage.local.get(USER_FIRST_NAME_KEY).catch(() => ({}));
+  return typeof stored?.[USER_FIRST_NAME_KEY] === 'string' ? stored[USER_FIRST_NAME_KEY].slice(0, 80) : '';
+}
+
+async function userFirstNameField() {
+  const firstName = await storedUserFirstName();
+  return firstName ? { userFirstName: firstName } : {};
+}
+
 async function syncLimovaProfile(rawProfile) {
   const profile = sanitizeLimovaProfile(rawProfile);
   if (!profile) return { ok: false, error: 'Profil invalide.' };
+  if (profile.firstName) await chrome.storage.local.set({ [USER_FIRST_NAME_KEY]: profile.firstName }).catch(() => {});
   const serialized = JSON.stringify(profile);
   if (serialized === lastSyncedProfileHash) return { ok: true, unchanged: true };
   try {
@@ -3447,6 +3466,7 @@ async function getLiveToken(context) {
         // open_page and create_in_limova.
         capabilities: ['any_site', 'limova_handoff'],
         ...(sessionState.resetContext ? { resetContext: true } : {}),
+        ...(trainingMode || evaluationMode ? {} : await userFirstNameField()),
         ...(evaluationMode ? { evaluationCode: evaluationState.token } : {}),
         ...(sessionId ? { sessionId } : {}),
         pageContext: trainingMode ? '' : String(freshContext.pageContext || context.pageContext || lastPageContext).slice(0, 12_000),

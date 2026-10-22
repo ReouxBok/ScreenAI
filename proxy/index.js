@@ -547,6 +547,13 @@ function memoryPrompt(context) {
   return `CONTEXTE PERSONNEL PRIVÉ — ne le cite jamais comme une base de données et ne prétends jamais te souvenir d’un fait absent. Utilise le prénom avec parcimonie. Si un souvenir semble incertain ou contradictoire, demande une clarification.\n\n${String(context.context).slice(0, 18_000)}`;
 }
 
+// The first name sent by the extension stays known after a "new conversation"
+// reset, which sets the account-wide memory aside.
+function firstNamePrompt(rawName) {
+  const name = typeof rawName === 'string' ? rawName.replace(/[\r\n<>"«»]/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 80) : '';
+  return name ? `PRÉNOM. L’utilisateur s’appelle ${name}. Utilise son prénom avec parcimonie.` : '';
+}
+
 function responseText(data) {
   return data?.candidates?.[0]?.content?.parts?.map(part => typeof part?.text === 'string' ? part.text : '').join('') || '';
 }
@@ -857,7 +864,8 @@ async function handleCopilotTurn(req, res) {
     const promptParts = [
       { text: SERVER_PROMPT },
       ...(Array.isArray(req.body.systemInstruction?.parts) ? req.body.systemInstruction.parts : []),
-      ...(memoryPrompt(personalContext) ? [{ text: memoryPrompt(personalContext) }] : [])
+      ...(memoryPrompt(personalContext) ? [{ text: memoryPrompt(personalContext) }] : []),
+      ...(!memoryPrompt(personalContext) && firstNamePrompt(req.body.userFirstName) ? [{ text: firstNamePrompt(req.body.userFirstName) }] : [])
     ];
     const url = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${GEMINI_API_KEY}`;
     const response = await fetch(url, {
@@ -1005,6 +1013,7 @@ app.post('/api/live-token', verifyAssistantAuth, assistantLimiter, async (req, r
     pageContext ? `Contexte DOM privé de la page:\n${pageContext}` : '',
     history ? `Conversation récente:\n${history}` : ''
     ,memoryPrompt(personalContext)
+    ,trainingMode || evaluationMode || memoryPrompt(personalContext) ? '' : firstNamePrompt(req.body?.userFirstName)
   ].filter(Boolean).join('\n\n');
   const systemText = trainingMode
     ? `Mode transcription de démonstration Limova. Écoute et transcris fidèlement les explications du formateur en ${lang === 'fr' ? 'français' : lang === 'es' ? 'espagnol' : 'anglais'}. Tu es strictement passive : ne réponds jamais, ne produis aucun commentaire, ne suggère rien, ne navigue pas et n’appelle aucun outil.`

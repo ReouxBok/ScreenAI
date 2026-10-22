@@ -104,3 +104,27 @@ test('ADK excludes old memory after reset, while persisting new messages', async
     assert.equal(writes, 2);
   }
 });
+
+test('a reset keeps the user first name but not the prior memory', async () => {
+  let calls = mockServices();
+  assert.equal((await post('/api/live-token', { lang: 'fr', resetContext: true, userFirstName: 'Camille' })).status, 200);
+  const voicePrompt = JSON.parse(calls.find(([url]) => url.includes('/auth_tokens'))[1].body)
+    .bidiGenerateContentSetup.systemInstruction.parts[0].text;
+  assert.equal(voicePrompt.includes('L’utilisateur s’appelle Camille'), true);
+  assert.equal(voicePrompt.includes(OLD_CONTEXT), false);
+
+  calls = mockServices();
+  assert.equal((await post('/api/gemini', {
+    resetContext: true, userFirstName: 'Camille', systemInstruction: { parts: [{ text: 'Charly' }] },
+    contents: [{ role: 'user', parts: [{ text: 'Comment je m’appelle ?' }] }]
+  })).status, 200);
+  const textPrompt = JSON.stringify(JSON.parse(calls[0][1].body).systemInstruction);
+  assert.equal(textPrompt.includes('L’utilisateur s’appelle Camille'), true);
+  assert.equal(textPrompt.includes(OLD_CONTEXT), false);
+
+  assert.equal(turnSchema.safeParse({
+    sessionId: '550e8400-e29b-41d4-a716-446655440001', message: 'Bonjour', source: 'text', locale: 'fr-FR',
+    idempotencyKey: 'fresh-turn', resetContext: true, userFirstName: 'Camille',
+    page: { url: 'https://new.limova.ai/home', title: 'Accueil', contextVersion: 0, dom: '' }
+  }).success, true);
+});
