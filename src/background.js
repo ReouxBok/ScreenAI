@@ -3435,6 +3435,8 @@ async function getLiveToken(context) {
       body: JSON.stringify({
         lang: currentLang,
         trainingMode,
+        // Tells the proxy this extension follows every site and handles open_page.
+        capabilities: ['any_site'],
         ...(sessionState.resetContext ? { resetContext: true } : {}),
         ...(evaluationMode ? { evaluationCode: evaluationState.token } : {}),
         ...(sessionId ? { sessionId } : {}),

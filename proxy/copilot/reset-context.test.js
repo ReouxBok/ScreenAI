@@ -1,0 +1,106 @@
+const { test, before, after, afterEach } = require('node:test');
+const assert = require('node:assert/strict');
+
+Object.assign(process.env, {
+  NODE_ENV: 'test', EXTENSION_GEMINI_API_KEY: 'test-key', ALLOWED_EXTENSION_ID: 'test',
+  MEMORY_API_URL: 'https://memory.example', MEMORY_SERVICE_TOKEN: 'm'.repeat(40),
+  MEMORY_IDENTITY_SECRET_V1: 'test-memory-identity-secret-long-enough',
+  KNOWLEDGE_API_URL: '', KNOWLEDGE_SERVICE_TOKEN: ''
+});
+const app = require('../index');
+const { turnSchema } = require('./contracts');
+const { CharlyAdkOrchestrator } = require('./orchestrator');
+const realFetch = global.fetch;
+const OLD_CONTEXT = 'OBJECTIFS OUVERTS : Reprendre notre audit SEO';
+let server, base;
+before(async () => {
+  server = app.listen(0, '127.0.0.1');
+  await new Promise(resolve => server.once('listening', resolve));
+  base = `http://127.0.0.1:${server.address().port}`;
+});
+afterEach(() => { global.fetch = realFetch; });
+after(() => new Promise(resolve => server.close(resolve)));
+
+const post = (route, body) => realFetch(base + route, {
+  method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body)
+});
+function mockServices() {
+  const calls = [];
+  global.fetch = async (url, options) => {
+    calls.push([String(url), options]);
+    const data = String(url).includes('/memory/bootstrap')
+      ? { enabled: true, context: OLD_CONTEXT }
+      : { name: 'authTokens/test', candidates: [{ content: { parts: [{ text: 'Bonjour.' }] } }] };
+    return new Response(JSON.stringify(data), { status: 200, headers: { 'Content-Type': 'application/json' } });
+  };
+  return calls;
+}
+
+test('voice retains ordinary memory and excludes it after reset', async () => {
+  for (const resetContext of [false, true]) {
+    const calls = mockServices();
+    const result = await post('/api/live-token', { lang: 'fr', resetContext });
+    assert.equal(result.status, 200);
+    const provider = calls.find(([url]) => url.includes('/auth_tokens'));
+    const prompt = JSON.parse(provider[1].body).bidiGenerateContentSetup.systemInstruction.parts[0].text;
+    assert.equal(prompt.includes(OLD_CONTEXT), !resetContext);
+    if (resetContext) assert.equal(calls.some(([url]) => url.includes('/memory/bootstrap')), false);
+  }
+});
+
+for (const route of ['/api/gemini', '/api/copilot/turn']) {
+  test(`${route} excludes prior memory after reset and retains the new message`, async () => {
+    const calls = mockServices();
+    const result = await post(route, {
+      resetContext: true, systemInstruction: { parts: [{ text: 'Charly' }] },
+      contents: [{ role: 'user', parts: [{ text: 'Créer une image' }] }]
+    });
+    assert.equal(result.status, 200);
+    assert.equal(calls.length, 1);
+    const body = JSON.parse(calls[0][1].body);
+    assert.equal(JSON.stringify(body.systemInstruction).includes(OLD_CONTEXT), false);
+    assert.equal(body.contents[0].parts[0].text, 'Créer une image');
+  });
+}
+
+test('ordinary legacy text still receives personal memory', async () => {
+  const calls = mockServices();
+  assert.equal((await post('/api/gemini', {
+    systemInstruction: { parts: [{ text: 'Charly' }] },
+    contents: [{ role: 'user', parts: [{ text: 'Bonjour' }] }]
+  })).status, 200);
+  const provider = calls.find(([url]) => url.includes('/generateContent') || url.includes(':generateContent'));
+  assert.equal(JSON.stringify(JSON.parse(provider[1].body).systemInstruction).includes(OLD_CONTEXT), true);
+});
+
+test('ADK accepts the boolean reset contract and rejects invalid values', () => {
+  const input = {
+    sessionId: '550e8400-e29b-41d4-a716-446655440001', message: 'Bonjour',
+    source: 'text', locale: 'fr-FR', idempotencyKey: 'fresh-turn',
+    page: { url: 'https://new.limova.ai/home', title: 'Accueil', contextVersion: 0, dom: '' }
+  };
+  for (const resetContext of [undefined, false, true]) {
+    assert.equal(turnSchema.safeParse({ ...input, ...(resetContext !== undefined ? { resetContext } : {}) }).success, true);
+  }
+  assert.equal(turnSchema.safeParse({ ...input, resetContext: 'true' }).success, false);
+});
+
+test('ADK excludes old memory after reset, while persisting new messages', async () => {
+  for (const resetContext of [false, true]) {
+    const instance = Object.create(CharlyAdkOrchestrator.prototype);
+    let reads = 0, writes = 0, suppliedContext;
+    instance.memoryRequest = async () => null;
+    instance.sessionService = { getOrCreateSession: async () => ({}) };
+    instance.persistMessage = async () => { writes++; };
+    instance.personalContext = async () => { reads++; return { context: OLD_CONTEXT }; };
+    instance.consumeEvents = async input => { suppliedContext = input.stateDelta['temp:personalContext']; return { type: 'message', content: 'Bonjour.' }; };
+    instance.scrubEphemeralSession = () => {};
+    await instance._turnInternal('test-user', {
+      sessionId: '550e8400-e29b-41d4-a716-446655440001', resetContext,
+      message: 'Créer une image', idempotencyKey: 'fresh-turn', page: {}, locale: 'fr-FR'
+    }, 'reset-request');
+    assert.equal(reads, resetContext ? 0 : 1);
+    assert.equal(suppliedContext, resetContext ? '' : OLD_CONTEXT);
+    assert.equal(writes, 2);
+  }
+});

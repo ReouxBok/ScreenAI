@@ -409,9 +409,10 @@ describe('POST /api/live-token', () => {
     expect(body.bidiGenerateContentSetup.tools[0].functionDeclarations[5].parameters.required).toEqual(['elementId', 'contextVersion', 'targetLabel', 'text']);
     expect(body.bidiGenerateContentSetup.tools[0].functionDeclarations[5].description).toContain('Ne soumet jamais');
     expect(body.bidiGenerateContentSetup.tools[0].functionDeclarations[6].name).toBe('navigate_internal');
-    expect(body.bidiGenerateContentSetup.tools[0].functionDeclarations[7].name).toBe('open_page');
-    expect(body.bidiGenerateContentSetup.tools[0].functionDeclarations[7].parameters.required).toEqual(['url']);
-    expect(body.bidiGenerateContentSetup.tools[0].functionDeclarations[8].name).toBe('verify_expected_result');
+    expect(body.bidiGenerateContentSetup.tools[0].functionDeclarations[7].name).toBe('verify_expected_result');
+    // Extensions that do not announce any_site keep the Limova-only wording and tools.
+    expect(body.bidiGenerateContentSetup.tools[0].functionDeclarations.map(tool => tool.name)).not.toContain('open_page');
+    expect(body.bidiGenerateContentSetup.systemInstruction.parts[0].text).toContain('piloter la page Limova');
     expect(body.fieldMask.split(',')).toEqual(expect.arrayContaining([
       'model',
       'generationConfig.responseModalities',
@@ -420,6 +421,24 @@ describe('POST /api/live-token', () => {
       'systemInstruction',
       'tools'
     ]));
+  });
+
+  it('lets an extension that follows every site open pages and read the page in front', async () => {
+    fetch.mockResolvedValueOnce({ ok: true, status: 200, json: async () => ({ revision: 'onboarding_v7', name: 'Trame', steps: [] }) })
+      .mockResolvedValueOnce({ ok: true, status: 200, json: async () => ({ name: 'authTokens/any-site' }) });
+
+    const res = await req().post('/api/live-token').send({ lang: 'fr', pageContext: 'Page: Le Monde', capabilities: ['any_site'] });
+
+    expect(res.status).toBe(200);
+    const body = JSON.parse(fetch.mock.calls.at(-1)[1].body);
+    const systemText = body.bidiGenerateContentSetup.systemInstruction.parts[0].text;
+    const declarations = body.bidiGenerateContentSetup.tools[0].functionDeclarations;
+    expect(systemText).toContain('n’importe quel autre site');
+    expect(systemText).toContain('Ne réponds jamais à partir d’une page précédente');
+    expect(systemText).toContain('piloter la page affichée');
+    expect(declarations.map(tool => tool.name)).toContain('open_page');
+    expect(declarations.find(tool => tool.name === 'open_page').parameters.required).toEqual(['url']);
+    expect(declarations.find(tool => tool.name === 'inspect_current_page').description).toContain('Limova ou autre site');
   });
 
   it('creates a tool-free passive token for a trainer demonstration', async () => {
