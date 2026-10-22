@@ -17,7 +17,7 @@ export const savAttachmentInventorySchema = z.object({
 }).strict().refine(value => value.complete === (value.limits.length === 0) && new Set(value.limits).size === value.limits.length, "Inconsistent inventory completeness");
 export type SavAttachmentInventory = z.infer<typeof savAttachmentInventorySchema>;
 export const savAttachmentStatusSchema = z.enum(["analyzed", "partial", "unreadable", "unsupported", "not_read"]);
-export const savAttachmentReasonSchema = z.enum(["observed", "partial_content", "unreadable_content", "unsupported_type", "legacy_reference_missing", "image_limit", "byte_limit", "pixel_limit", "invalid_image", "type_mismatch", "association_mismatch", "permission_denied", "not_found", "rate_limited", "timeout", "download_failed", "provider_failed", "budget_exhausted", "model_unsupported", "in_progress", "outcome_uncertain", "context_changed", "reader_disabled"]);
+export const savAttachmentReasonSchema = z.enum(["observed", "partial_content", "unreadable_content", "unsupported_type", "legacy_reference_missing", "image_limit", "byte_limit", "pixel_limit", "invalid_image", "type_mismatch", "association_mismatch", "permission_denied", "not_found", "rate_limited", "timeout", "download_failed", "provider_failed", "budget_exhausted", "model_unsupported", "in_progress", "outcome_uncertain", "context_changed", "context_incomplete", "reader_disabled"]);
 export const savAttachmentObservationSchema = z.object({
   sourceId: z.string().max(100), filename: z.string().max(500), mimeType: z.string().max(200), referenceHash: z.string(),
   fileHash: z.string().nullable(), width: z.number().int().positive().nullable(), height: z.number().int().positive().nullable(),

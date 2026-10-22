@@ -29,7 +29,9 @@ export async function prepareIntakeAttachments(lease: IntakeLease, model: string
   const read: SavAttachmentRead = { version: 1, readerRevision: SAV_ATTACHMENT_READER_REVISION, model, messageId: message.id, mailboxId: message.mailboxId,
     gmailMessageId: message.gmailMessageId, selectionHash: savContentHash({ metadata, inventory }), claimId: randomUUID(), state: "reading", startedAt: new Date().toISOString(), completedAt: null, observations: prepared.observations };
   const state: IntakeAttachmentState = { textComplete: typeof lease.body.text === "string" && lease.body.text.length < 100_000 && lease.provenance.get(message.id)?.truncated === false, sourceHash: lease.sourceHash, read, inventory };
-  return { state, prepared, complete: inventory?.complete === true && metadata.length > 0 && prepared.selected.length === metadata.length };
+  const complete=inventory?.complete === true && metadata.length > 0 && prepared.selected.length === metadata.length;
+  if(!complete) finishIntakeAttachmentRead(state,"context_incomplete");
+  return { state, prepared, complete };
 }
 /** Never import pixels or mutate the encrypted source body. Derived inputs are
  * accepted only with the unchanged lease source and the current message. */
@@ -42,4 +44,12 @@ export function intakeInputWithAttachments(input: EngineInput, sourceHash: strin
   if (!ready) return input;
   const message = { ...input.message, contentComplete: true, attachmentInputs: observations.map(o => ({ sourceId: o.sourceId, fileHash: o.fileHash! })) };
   return { ...input, message, conversation: { ...input.conversation, data: input.conversation.data.map(m => m.id === message.id ? message : m) } };
+}
+
+/** Complete the attempt, never assert that an unobserved image was analyzed.
+ * Preparation failures retain their specific per-file reasons. */
+export function finishIntakeAttachmentRead(state:IntakeAttachmentState|undefined,reason:import("../attachment-contract").SavAttachmentObservation["reason"]) {
+  if(!state||state.read.state!=="reading")return;
+  state.read={...state.read,state:"complete",completedAt:new Date().toISOString(),observations:state.read.observations.map(o=>
+    o.reason==="in_progress"?{...o,status:"not_read",reason,text:"",regions:[],uncertainties:[]}:o)};
 }

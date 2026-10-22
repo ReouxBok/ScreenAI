@@ -2,7 +2,7 @@ import "server-only";
 import { intakeOtherQualificationFresh } from "./other-routing";
 import { qualifyRuntimeOther } from "./other-routing-runtime";
 import { createIntakeModelDispatcher } from "./model-dispatch";
-import { prepareIntakeAttachments, intakeInputWithAttachments } from "./attachments";
+import { prepareIntakeAttachments, intakeInputWithAttachments, finishIntakeAttachmentRead } from "./attachments";
 import { intakeMessageHistorical, intakeLaunchMatches, parkLaunchedIntakeMessage } from "./launch-boundary";
 import { recordAcceptedIntakeSemantics,SAV_INTAKE_SEMANTIC_RECORD_REVISION } from "./semantic-records";
 import { SAV_INTAKE_MODEL_REVISION } from "./model-readers";
@@ -90,6 +90,7 @@ async function analyseSavIntakeRuntimeWithinBudget(runId: string, config: Intake
     if (dispatcher.uncertain) throw Error("SAV_INTAKE_RUNTIME_USAGE_UNCERTAIN");
     await live();
     payload.reason = dispatcher.failureReason;
+    finishIntakeAttachmentRead(payload.attachments,attachmentFailureReason(payload.reason,dispatcher.uncertain));
     await saveSavIntakeResult(lease, config, payload, payload.plan.decision.disposition.kind === "collect_context" ? "waiting" : "observed");
     return { runId, state: payload.plan.decision.disposition.kind === "collect_context" ? "waiting" : "observed" };
   } catch (error) {
@@ -97,6 +98,7 @@ async function analyseSavIntakeRuntimeWithinBudget(runId: string, config: Intake
     // An expired routing authority must never leave a publishable Other plan.
     if(payload.other&&!intakeOtherQualificationFresh(payload.other,env().SAV_INTAKE_OTHER_RULES_JSON)){delete payload.plan;delete payload.other;}
     payload.reason = error instanceof Error && /^SAV_[A-Z_]+$/.test(error.message) ? error.message : "SAV_INTAKE_RUNTIME_INTERRUPTED";
+    finishIntakeAttachmentRead(payload.attachments,attachmentFailureReason(payload.reason,Boolean(dispatcher?.uncertain)));
     await failSavIntakeRun(lease, payload, Boolean(dispatcher?.uncertain) || payload.reason === "SAV_INTAKE_RUNTIME_SETTLEMENT_UNCERTAIN");
     return { runId, state: dispatcher?.uncertain ? "uncertain" : "waiting", reason: payload.reason };
   } finally { controller.abort(); clearTimeout(timer); }
@@ -116,4 +118,12 @@ export async function reconcileSavIntakeRuntime(options: { deadlineMs?: number }
     if (!("skipped" in result)) break;
   }
   return { mode: "observe", queued, result, budget: await readSavIntakeBudget(config) };
+}
+
+function attachmentFailureReason(reason:string|undefined,uncertain:boolean):import("../attachment-contract").SavAttachmentObservation["reason"] {
+  if(uncertain)return "outcome_uncertain";
+  if(reason?.includes("BUDGET"))return "budget_exhausted";
+  if(reason?.includes("TIMEOUT"))return "timeout";
+  if(reason?.includes("CONTEXT")||reason?.includes("REVALIDATION"))return "context_changed";
+  return reason?"provider_failed":"context_incomplete";
 }

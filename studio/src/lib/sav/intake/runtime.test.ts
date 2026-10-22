@@ -390,3 +390,22 @@ it.each([false,true])("publishes only a still-fresh authenticated Other qualific
     expect(await f.db.select().from(savActions)).toHaveLength(0);
   }finally{vi.useRealTimers();}
 });
+it.each(["pdf","image_limit","budget"]) ("finishes a non-dispatched image attempt with its precise reason (%s)",async(kind)=>{
+  const {syntheticImage,attachmentMetadata}=await import("../../../../test/sav-attachments"),{savAttachmentDisplayRead}=await import("../attachment-contract");
+  const bytes=await syntheticImage(),[m]=await f.db.select().from(savMessages).where(eq(savMessages.id,messageId)),[t]=await f.db.select().from(savThreads).where(eq(savThreads.id,threadId));
+  const attachments=Array.from({length:kind==="image_limit"?4:1},(_,index)=>{
+    const meta=attachmentMetadata(bytes.length);return {...meta,filename:kind==="pdf"?"synthetic.pdf":`synthetic-${index}.png`,mimeType:kind==="pdf"?"application/pdf":meta.mimeType,
+      reference:{...meta.reference!,mailboxEmail:"support@example.invalid",gmailMessageId:m.gmailMessageId!,gmailThreadId:t.gmailThreadId,partId:String(index+1)}};
+  });
+  await f.db.update(savMessages).set({bodyCiphertext:encryptSavPayload({text:"My application fails with an error.",headers:{},attachments,attachmentInventory:{complete:true,limits:[]}})}).where(eq(savMessages.id,messageId));
+  const id=(await enqueueSavIntakeMessage(messageId,config))!;
+  if(kind==="budget")await f.db.insert(savIntakeModelCalls).values(Array.from({length:3},(_,i)=>({runId:id,messageKey:intakeRuntimeHash(messageId),requestHash:`previous-${i}`,state:"settled",reservedNanoUsd:817152000,chargedNanoUsd:262500,payloadCiphertext:encryptSavPayload({metadata:usage})})));
+  const network=vi.fn(async()=>{throw Error("NETWORK_FORBIDDEN");});
+  await analyseSavIntakeRuntime(id,config,{env:()=>environment,network,downloadAttachments:async()=>bytes});
+  const current=(await readSavIntakeCurrent(threadId,config))!,read=current.payload.attachments!.read,display=savAttachmentDisplayRead(read)!;
+  expect(read.state).toBe("complete");expect(read.completedAt).toBeTruthy();expect(current.state).toBe("waiting");
+  expect(display.observations.at(-1)?.reason).toBe(kind==="pdf"?"unsupported_type":kind==="image_limit"?"image_limit":"budget_exhausted");
+  expect(display.observations.every(o=>!["in_progress","outcome_uncertain"].includes(o.reason))).toBe(true);
+  if(kind==="image_limit")expect(display.observations.slice(0,3).every(o=>o.reason==="context_incomplete")).toBe(true);
+  expect(network).not.toHaveBeenCalled();expect(await f.db.select().from(savActions)).toHaveLength(0);
+});

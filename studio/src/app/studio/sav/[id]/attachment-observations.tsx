@@ -12,6 +12,7 @@ const reason: Record<SavAttachmentObservation["reason"], string> = {
   timeout: "La lecture a dépassé le temps disponible.", download_failed: "Le téléchargement n’a pas abouti.", provider_failed: "L’analyse visuelle n’a pas produit d’observation exploitable.",
   budget_exhausted: "La lecture n’a pas pu être réalisée dans les limites de cette analyse. Les informations du mail restent disponibles.", model_unsupported: "Le modèle configuré n’est pas qualifié pour ce lecteur.",
   in_progress: "Une lecture a été engagée, sans résultat acquis. Si elle a été interrompue, son issue reste à vérifier.", outcome_uncertain: "Une lecture précédente a été interrompue ; aucun nouvel appel automatique n’est lancé.",
+  context_incomplete: "La sélection ou le contexte est incomplet ; cette pièce n’a pas été envoyée au modèle.",
   context_changed: "Le dossier ou son contenu a changé pendant la lecture ; ces observations ne sont pas utilisées.", reader_disabled: "La lecture visuelle n’est pas disponible pour cette analyse.",
 };
 
