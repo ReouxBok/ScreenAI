@@ -29,8 +29,9 @@ test("ouverture et retour Autre sans filing Gmail ni refresh CRM", async ({ page
   const path = `/studio/sav/${SAV_OTHER_THREAD(1)}`;
   const audit = page.waitForResponse(response => response.request().method() === "POST" && new URL(response.url()).pathname === path);
   await page.locator(`[id="dossier-${SAV_OTHER_THREAD(1)}"]`).click();
-  // The first client navigation compiles this dossier route in the dev server.
-  await expect(page).toHaveURL(new RegExp(path), { timeout: 30_000 });
+  // The first client navigation compiles this dossier route in the dev server,
+  // which takes longer with Next.js 16.4 on CI runners.
+  await expect(page).toHaveURL(new RegExp(path), { timeout: 60_000 });
   await expect(page).not.toHaveURL(/filing=|context=|refreshId=/);
   expect((await audit).ok()).toBe(true);
   expect(posts.every(url => new URL(url).pathname === path)).toBe(true);
