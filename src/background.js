@@ -3439,7 +3439,9 @@ async function persistVoiceTranscript(role, content, generation = sessionGenerat
 }
 
 async function getLiveToken(context) {
-  const operation = captureVoiceOperation();
+  // Not bound to the locked tab: starting voice moves Charly to the tab in
+  // front. A stop or a reset still cancels it.
+  const operation = { generation: sessionGeneration, voiceGeneration: voiceSessionGeneration };
   const controller = new AbortController();
   voiceTokenControllers.add(controller);
   try {
