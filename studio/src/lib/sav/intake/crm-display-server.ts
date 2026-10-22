@@ -20,7 +20,8 @@ export async function readIntakeCrmDisplay(contactIds:string[],ticketIds:string[
         const row=value as {id?:unknown;archived?:unknown;properties?:Record<string,unknown>};
         if(typeof row.id!=="string"||!records[row.id]||row.archived===true||!row.properties)continue;
         const clean=(key:string)=>typeof row.properties![key]==="string"?(row.properties![key] as string).trim().slice(0,300):"";
-        const label=kind==="contact"?[clean("firstname"),clean("lastname")].filter(Boolean).join(" ")||clean("email"):clean("subject");
+        const name=[clean("firstname"),clean("lastname")].filter(Boolean).join(" "),email=clean("email");
+        const label=kind==="contact"?(name&&email?`${name} — ${email}`:name||email):clean("subject");
         if(label)records[row.id]={...records[row.id],label,available:true};
       }
     } catch { /* A display read cannot turn into an invented name or change the dossier. */ }
