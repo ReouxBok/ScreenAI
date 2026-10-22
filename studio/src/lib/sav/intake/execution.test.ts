@@ -890,3 +890,12 @@ it("operational daily admission limit survives another policy and refuses future
   await expect(admitIntakeExecution(runId,options)).rejects.toThrow("LEDGER_CLOCK_REJECTED");
   expect((await f.db.select().from(savIntakeExecutionBudget))[0].admitted).toBe(100);
 });
+
+it("a recovery no-send scope blocks even an already admitted identification execution",async()=>{
+ p.setContacts([]);const row=await admission();
+ const payload=decryptSavPayload<import("./execution-types").ExecutionPayload>(row.payloadCiphertext);
+ payload.input={...(payload.input as object),humanResolution:{suppressOutbound:true}};
+ await f.db.update(savIntakeExecutions).set({payloadCiphertext:encryptSavPayload(payload)}).where(eq(savIntakeExecutions.id,row.id));
+ expect(await executeIntakePass(row.id,options)).toMatchObject({state:"waiting",reason:"SAV_INTAKE_EXECUTION_OUTBOUND_SUPERVISED"});
+ expect(p.calls.filter(c=>c.path==="gmail/messages/send")).toHaveLength(0);expect(await getExecutionEffects(row.id)).toHaveLength(0);
+});

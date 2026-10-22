@@ -33,3 +33,11 @@ it.each(["parent","references","recipient","sender","old","late","body","cc","du
     else m.payload.headers.find(h=>h.name===({parent:"In-Reply-To",references:"References",recipient:"To",sender:"From"}[kind]))!.value="wrong@example.test";
   });expect(await f.adapter.verify(intent,{id:"sent"},at,AbortSignal.timeout(1000))).toMatchObject({confirmed:false,attributed:false});expect(f.sends()).toBe(0);
 });
+it("does not attribute two equally matching sends when the ACK is missing",async()=>{
+ const gmail:GmailRequest=async<T>(_box:string,path:string)=>{
+  if(path.startsWith("messages?"))return {messages:[]} as T;
+  if(path.startsWith("threads/"))return {id:"thread",messages:[{id:"first",labelIds:["SENT"]},{id:"second",labelIds:["SENT"]}]} as T;
+  return {...message(),id:path.includes("first")?"first":"second"} as T;
+ };
+ expect(await createIntakeExecutorAdapters({gmailRequest:gmail}).verify(intent,null,at,AbortSignal.timeout(1000))).toMatchObject({confirmed:false,attributed:false});
+});

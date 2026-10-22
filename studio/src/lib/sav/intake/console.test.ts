@@ -739,3 +739,28 @@ it.each(["paused","newer","refused","nonadmin","historical"])("administrator rec
  await expect(requestIntakeReinvestigation({threadId,messageId,reason:"Synthetic bounded operator recovery request."})).rejects.toThrow();
  expect((await db.db.select().from(savIntakeRuns))).toHaveLength(1);expect(mutationsSent()).toHaveLength(0);
 });
+
+it("recovery runs a fresh budgeted analysis and retains no-send across the next operator choice",async()=>{
+ await observed();for(const [key,value]of Object.entries(environment))if(value!==undefined)vi.stubEnv(key,value);
+ await db.db.update(savIntakeRuns).set({attempts:2,state:"waiting"}).where(eq(savIntakeRuns.id,runId));
+ vi.stubGlobal("fetch",vi.fn(async(url,init)=>{
+  expect(String(url)).toBe("https://generativelanguage.googleapis.com/v1beta/models/gemini-3.6-flash:generateContent");
+  const data=JSON.parse(JSON.parse(String(init?.body)).contents[0].parts[0].text);
+  const answer=data.tickets?{investigationComplete:true,tickets:data.tickets.map((t:{ticket:{id:string}})=>({ticketId:t.ticket.id,relation:"same",requestIds:["r1"],evidenceIds:["current",`ticket-${t.ticket.id}`,`history-${t.ticket.id}`],grounding:data.citationCatalogue.map((c:{id:string})=>({quoteId:c.id})),rationale:"Synthetic exact coverage"}))}
+   :{messageId,requests:[{id:"r1",kind:"support",currentMessageId:messageId,quoteId:data.citationCatalogue.find((c:{sourceId:string})=>c.sourceId==="current").id}],ticketSummary:{title:"Synthetic connection failure",description:"The synthetic connection fails.",requestIds:["r1"]}};
+  return Response.json({candidates:[{finishReason:"STOP",content:{parts:[{text:JSON.stringify(answer)}]}}],usageMetadata:{promptTokenCount:100,candidatesTokenCount:50,thoughtsTokenCount:0,totalTokenCount:150}});
+ }));
+ const requested=await requestIntakeReinvestigation({threadId,messageId,reason:"Synthetic post-correction explicit operator investigation."});
+ expect(await consumeIntakeHumanEvent(requested.eventId,options.runtime,createSavIntakeHubspotReaders({network:p.network}))).toHaveProperty("state","observed");
+ let current=(await readSavIntakeCurrent(threadId,options.runtime))!;
+ expect((current.payload.input as {humanResolution:{suppressOutbound:boolean}}).humanResolution.suppressOutbound).toBe(true);
+ expect(await intakeRunConfigurationBound(current,options.runtime)).toBe(true);
+ const calls=await db.db.select().from(savIntakeModelCalls);expect(calls.length).toBeGreaterThan(0);expect(calls.every(c=>c.state==="settled")).toBe(true);
+ const followup=await recordIntakeHumanCommand({...await command("classify"),classification:"support"});
+ expect(await consumeIntakeHumanEvent(followup.eventId,options.runtime,createSavIntakeHubspotReaders({network:p.network}))).toHaveProperty("state","observed");
+ current=(await readSavIntakeCurrent(threadId,options.runtime))!;
+ expect((current.payload.input as {humanResolution:{suppressOutbound:boolean}}).humanResolution.suppressOutbound).toBe(true);
+ expect(await intakeRunConfigurationBound(current,options.runtime)).toBe(true);
+ expect((await db.db.select().from(savIntakeModelCalls))).toHaveLength(calls.length);
+ expect((await db.db.select().from(savIntakeRuns)).reduce((n,r)=>n+r.attempts,0)).toBe(2);expect(mutationsSent()).toHaveLength(0);
+});
