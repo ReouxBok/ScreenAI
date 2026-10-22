@@ -1,7 +1,18 @@
 "use server";
 import { revalidatePath } from "next/cache";
 import { recordIntakeHumanCommand } from "@/lib/sav/intake/human-commands";
+import {requestIntakeReinvestigation,reconcileThreadIdentification} from "@/lib/sav/intake/operator-recovery";
 export type IntakeChoiceFormState = { ok: boolean; message: string };
+export async function requestRecoveryAction(_previous:IntakeChoiceFormState,form:FormData):Promise<IntakeChoiceFormState>{
+ try{await requestIntakeReinvestigation({threadId:form.get("threadId"),messageId:form.get("messageId"),reason:form.get("reason")});
+  revalidatePath(`/studio/sav/intake/${String(form.get("threadId"))}`);return {ok:true,message:"Réinvestigation enregistrée, sans remise à zéro des tentatives ni envoi de mail."};
+ }catch{return {ok:false,message:"Reprise non enregistrée : sources modifiées, pause, effet existant ou reprise déjà demandée. Rechargez le dossier."};}
+}
+export async function reconcileIdentificationAction(_previous:IntakeChoiceFormState,form:FormData):Promise<IntakeChoiceFormState>{
+ try{const result=await reconcileThreadIdentification(String(form.get("threadId")));revalidatePath(`/studio/sav/intake/${String(form.get("threadId"))}`);
+  return {ok:true,message:`${result.confirmed} envoi(s) existant(s) rapproché(s). Aucun mail renvoyé.`};
+ }catch{return {ok:false,message:"Les preuves ne permettent pas encore de confirmer cet envoi. Aucun mail renvoyé."};}
+}
 export async function saveIntakeChoice(_previous: IntakeChoiceFormState, form: FormData): Promise<IntakeChoiceFormState> {
   const text = (key: string) => typeof form.get(key) === "string" ? String(form.get(key)) : "";
   const kind = text("kind");

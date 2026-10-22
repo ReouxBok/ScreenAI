@@ -50,9 +50,14 @@ export async function projectIntakeThread(threadId: string, beforePublish?: () =
           : { view: null, status: "followup_pending", reason: observation?.sourceErrors.length ? "Collecte du suivi incomplète" : "Actions confirmées, premier suivi en attente" };
       }
     } else if (plan?.progress.kind === "qualified_other" && progress?.state === "refused" && progress.effects.length === 0) result = { view: "other", status: "qualified_other", reason: payload.other ? `${payload.other.label} · règle ${payload.other.ruleId}` : "Classement confirmé par un opérateur" };
+    else if (plan?.decision.disposition.kind === "request_identification"
+      && (payload.input as {humanResolution?:{suppressOutbound?:boolean}} | undefined)?.humanResolution?.suppressOutbound)
+      result = {view:"to_validate",status:"identity_pending_approval",reason:"Demande analysée. Le mail d’identification attend votre accord ; aucun envoi par la reprise."};
     else if (progress) result = { view: null, status: progress.state, reason: progress.reason };
     else if (plan?.progress.view === "to_validate") result = { view: "to_validate", status: "human_choice", reason: payload.reason ?? null };
     else if (plan?.progress.kind === "qualified_other") result = { view: "other", status: "qualified_other", reason: payload.other ? `${payload.other.label} · règle ${payload.other.ruleId}` : "Classement confirmé par un opérateur" };
+    else if (plan?.decision.disposition.kind === "no_ticket" && plan.decision.disposition.reason === "acknowledgement_only")
+      result = {view:"completed",status:"acknowledgement_only",reason:"Accusé de réception sans nouvelle demande ; aucun ticket fermé par ce classement."};
     else result = { view: null, status: run.state, reason: payload.reason ?? null };
   }
   await beforePublish?.();

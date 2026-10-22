@@ -7,7 +7,7 @@ import { intakeRunConfigurationBound, intakeHumanRefused, intakeHasHumanDecision
 import { randomUUID } from "node:crypto";
 import { and, desc, eq, gt, inArray, lt, lte, or, sql } from "drizzle-orm";
 import { requireDb } from "@/db";
-import { savMessages, savThreads, savIntakeRuns, savIntakeJournal, savIntakeModelCalls, savIntakeHumanEvents } from "@/db/schema";
+import { savMessages, savThreads, savIntakeRuns, savIntakeJournal, savIntakeModelCalls, savIntakeHumanEvents, savIntakeIdentityEpisodes, savIntakeEffects, savIntakeExecutions } from "@/db/schema";
 import { decryptSavPayload, encryptSavPayload } from "../crypto";
 import { savAttachmentInventorySchema } from "../attachment-contract";
 import { prepareSavIntakeMessage } from "./message";
@@ -48,10 +48,29 @@ export async function savIntakeSourceSnapshot(tx: Pick<Tx, "select">, message: t
       bodyComplete: typeof body.text === "string" && body.text.length < 100_000, unresolvedAttachments: Boolean(body.attachments?.length) || body.attachmentInventory !== undefined && !savAttachmentInventorySchema.safeParse(body.attachmentInventory).data?.complete }) };
   });
   const current = prepared.find(p => p.message.id === message.id); if (!current) return fail();
+  let previousIdentification: EngineInput["previousIdentification"], identificationContinuation: EngineInput["identificationContinuation"];
+  const [episode] = await tx.select().from(savIntakeIdentityEpisodes).where(eq(savIntakeIdentityEpisodes.threadId, message.threadId));
+  if (episode && episode.initialMessageId !== message.id && episode.initialEffectId) {
+    const [effect] = await tx.select().from(savIntakeEffects).where(eq(savIntakeEffects.id, episode.initialEffectId));
+    const [execution] = effect ? await tx.select().from(savIntakeExecutions).where(eq(savIntakeExecutions.id, effect.executionId)) : [];
+    const recipient = decryptSavPayload<{email:string;mailbox?:string;gmailThread?:string}>(episode.recipientCiphertext);
+    const initial = prepared.find(p => p.message.id === episode.initialMessageId)?.message;
+    const initialRow = rows.find(r => r.id === episode.initialMessageId);
+    if (effect?.kind === "identity_send" && effect.state === "confirmed" && effect.ackCiphertext && effect.verificationCiphertext
+      && execution?.threadId === message.threadId && execution.messageId === episode.initialMessageId
+      && initial && initialRow?.mailboxId === message.mailboxId && initial.direction === "inbound" && initial.contentComplete
+      && initial.fromEmail.toLowerCase() === message.fromEmail.toLowerCase() && recipient.email.toLowerCase() === message.fromEmail.toLowerCase()
+      && initial.receivedAt < current.message.receivedAt) {
+      previousIdentification = {messageId:initial.id,address:recipient.email,state:"confirmed"};
+      identificationContinuation = {initialMessageId:initial.id,confirmedEffectId:effect.id};
+    }
+  }
   return { sourceHash: intakeRuntimeHash({ rows: rows.map(row => ({ id: row.id, threadId: row.threadId, mailboxId: row.mailboxId,
       fromEmail: row.fromEmail, toEmails: row.toEmails, subject: row.subject, direction: row.direction, bodyCiphertext: row.bodyCiphertext, receivedAt: row.receivedAt })),
+      ...(identificationContinuation ? {identificationContinuation} : {}),
       thread: (await tx.select({ updatedAt: savThreads.updatedAt, aiPaused: savThreads.aiPaused, humanRequestedAt: savThreads.humanRequestedAt, ticketId: savThreads.hubspotTicketId }).from(savThreads).where(eq(savThreads.id, message.threadId)))[0] }), body: current.body, provenance: new Map(prepared.map(p => [p.message.id, p.provenance])),
     input: { message: current.message, latestInboundMessageId: message.id, mode: "current", now: now.toISOString(), identificationAttemptId: message.id,
+      ...(identificationContinuation ? {previousIdentification,identificationContinuation} : {}),
       conversation: { data: prepared.map(p => p.message).reverse(), status: rows.length > 50 ? "partial" : "complete", observedAt: now.toISOString() } } satisfies EngineInput };
 }
 
@@ -232,7 +251,7 @@ async function assertHumanAnalysis(tx:Tx, authority:IntakeHumanAnalysisAuthority
   const body=decryptSavPayload<import("./human-binding").HumanEventPayload>(event.payloadCiphertext);
   const [message]=await tx.select().from(savMessages).where(eq(savMessages.id,run.messageId));
   if(!message||body.parentPayloadHash!==intakeRuntimeHash(decryptSavPayload(run.payloadCiphertext))||body.policyHash!==config.policyHash||body.resourcesHash!==config.resourcesHash
-    ||body.classification===undefined||body.classification==="other"||(await latest(tx,run.threadId))?.id!==run.messageId
+    ||!body.reinvestigate&&(body.classification===undefined||body.classification==="other")||(await latest(tx,run.threadId))?.id!==run.messageId
     ||(await savIntakeSourceSnapshot(tx,message,now)).sourceHash!==run.sourceHash)return fail();
   return run;
 }

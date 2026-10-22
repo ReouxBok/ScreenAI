@@ -77,6 +77,8 @@ async function nextIntent(lease: ExecutionLease, effects: Effect[], options: Exe
     if (existing)
         return effectIntent(existing);
     if (d.kind === "request_identification") {
+        if ((lease.payload.input as {humanResolution?:{suppressOutbound?:boolean}} | undefined)?.humanResolution?.suppressOutbound)
+            return fault("OUTBOUND_SUPERVISED");
         if (confirmed("identity_send"))
             return null;
         const s = await source(lease), recipient = plan.originalRecipientEmails[0];

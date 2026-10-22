@@ -72,10 +72,14 @@ export function intakeEvidenceCatalogue(sources: ReadonlyMap<string, string>) {
     });
   };
   return { entries, quoteIds,
-    decodeAnalysis(raw: unknown, messageId: string) {
+    decodeAnalysis(raw: unknown, messageId: string, initialMessageId?: string) {
       if (!record(raw)) return raw;
       const requests = Array.isArray(raw.requests) && raw.requests.length <= 15
-        ? raw.requests.map((r, i) => resolve(r, `requests.${i}.quote`, "current")) : raw.requests;
+        ? raw.requests.map((r, i) => {
+          if (record(r) && r.originMessageId !== undefined && r.originMessageId !== initialMessageId)
+            rejectIntakeEvidence("wrong_anchor_source", `requests.${i}.originMessageId`);
+          return resolve(r, `requests.${i}.quote`, record(r) && r.originMessageId ? `message-${String(r.originMessageId)}` : "current");
+        }) : raw.requests;
       let registration = raw.registration;
       if (record(registration)) registration = resolve(registration, "registration.quote",
         registration.sourceMessageId === messageId ? "current" : `message-${String(registration.sourceMessageId)}`);
