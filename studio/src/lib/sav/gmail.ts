@@ -1,4 +1,6 @@
 import { buildSavInboundContext } from "./message-context";
+import { collectSavAttachmentInventory, fetchSavAttachmentBytes, readSavAttachmentJson } from "./attachment-gmail";
+import { savAttachmentReferenceSchema, type SavAttachmentReference } from "./attachment-contract";
 import "server-only";
 import {historicalMessageForIdSql,historicalThreadSql} from "./intake/launch-boundary";
 import { withLegacyOccupationAction, markLegacyIntakeDispatch, releaseLegacyIntakeIfConfirmed } from "./intake/legacy-occupation";
@@ -46,6 +48,7 @@ const gmailNotificationSchema = z.object({
 
 type GmailHeader = { name?: string; value?: string };
 type GmailPart = {
+  partId?: string;
   mimeType?: string;
   filename?: string;
   headers?: GmailHeader[];
@@ -184,11 +187,37 @@ async function gmailFetch<T>(mailboxEmail: string, path: string, init?: RequestI
     error.status = response.status;
     throw error;
   }
+  if (/(?:\?|&)format=full(?:&|$)/.test(path)) {
+    try { return await readSavAttachmentJson(response, 96 * 1024 * 1024) as T; }
+    catch (error) { throw new Error(error instanceof Error && error.message === "byte_limit" ? "GMAIL_MESSAGE_RESPONSE_TOO_LARGE" : "GMAIL_MESSAGE_INVALID_RESPONSE"); }
+  }
   return response.json() as Promise<T>;
 }
 
 /** Internal transport only; intake supplies its own capability and durable effect guard. */
 export const requestSavGmail = gmailFetch;
+/** Read-only bytes for a server-owned, message-bound MIME reference. No modify or URL fetching. */
+export async function readSavGmailAttachment(reference: SavAttachmentReference, size: number, signal: AbortSignal, mimeType?: string) {
+  return createSavGmailAttachmentDownloader()(reference, size, signal, mimeType);
+}
+export function createSavGmailAttachmentDownloader() {
+  const inlineResponses = new Map<string, Promise<unknown>>();
+  return async (reference: SavAttachmentReference, size: number, signal: AbortSignal, mimeType?: string) => {
+    const ref = savAttachmentReferenceSchema.parse(reference);
+    return fetchSavAttachmentBytes(ref, size, async (path, maximum, readSignal) => {
+      const key = `${ref.mailboxEmail}:${path}`;
+      if (path.includes("?format=full") && inlineResponses.has(key)) return inlineResponses.get(key)!;
+      const request = (async () => {
+        const response = await fetch(`https://gmail.googleapis.com/gmail/v1/users/${encodeURIComponent(ref.mailboxEmail)}/${path}`, {
+          method: "GET", headers: { Authorization: `Bearer ${await gmailAccessToken()}` }, signal: readSignal,
+        });
+        return readSavAttachmentJson(response, maximum);
+      })();
+      if (path.includes("?format=full")) inlineResponses.set(key, request);
+      return request;
+    }, signal, mimeType);
+  };
+}
 
 export const SAV_STUDIO_GMAIL_LABEL_NAME = "MAIL STUDIO SAV";
 
@@ -261,18 +290,11 @@ function headerValue(headers: GmailHeader[] | undefined, name: string) {
 function collectMimeBodies(part: GmailPart | undefined, result = { text: [] as string[], html: [] as string[] }) {
   if (!part) return result;
   if (part.filename || part.body?.attachmentId) return result;
-  const data = part.body?.data ? decodeBase64Url(part.body.data) : "";
+  const data = ["text/plain", "text/html"].includes(part.mimeType ?? "") && part.body?.data ? decodeBase64Url(part.body.data) : "";
   if (data && part.mimeType === "text/plain") result.text.push(data);
   if (data && part.mimeType === "text/html") result.html.push(data);
   for (const child of part.parts ?? []) collectMimeBodies(child, result);
   return result;
-}
-
-function collectAttachmentMetadata(part: GmailPart | undefined, result: Array<{ filename: string; mimeType: string; size: number }> = []) {
-  if (!part) return result;
-  if (part.filename || part.body?.attachmentId) result.push({ filename: boundedHeader(part.filename || "Pièce jointe", 500), mimeType: (part.mimeType || "application/octet-stream").slice(0, 200), size: Math.max(0, part.body?.size ?? 0) });
-  for (const child of part.parts ?? []) collectAttachmentMetadata(child, result);
-  return result.slice(0, 100);
 }
 
 function htmlToText(html: string) {
@@ -340,7 +362,7 @@ export function parseGmailMessage(mailboxEmail: string, message: GmailMessage) {
     to,
     subject,
     bodyText: bodyText.slice(0, 100_000),
-    attachments: collectAttachmentMetadata(message.payload),
+    ...collectSavAttachmentInventory(message.payload, { mailboxEmail, gmailMessageId: message.id, gmailThreadId: message.threadId }),
     ...(bodies.html.length ? { bodyHtml: bodies.html.join("\n\n").slice(0, 300_000) } : {}),
     autoSubmitted: boundedHeader(headerValue(headers, "Auto-Submitted"), 200) || undefined,
     headers: {

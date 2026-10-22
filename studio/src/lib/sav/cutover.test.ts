@@ -5,7 +5,7 @@ import { auditLogs, savActions, savAgentRuns, savDecisions, savMailboxes, savMes
 import { activateSavV0Cutover, getSavV0Cutover, isSavMessageEligible, SAV_V0_CUTOVER_KEY } from "./cutover";
 import { correctSavDecision, ingestInboundMessage, listSavPilotCandidates, processPendingSavMessages, processStoredSavMessage, recordWebhookReceipt, updateMailboxWatch, updateMailboxCursor } from "./service";
 import { decryptSavPayload, encryptSavPayload } from "./crypto";
-import { processGmailReceipt } from "./gmail";
+import { parseGmailMessage, processGmailReceipt } from "./gmail";
 
 import { understandingFixture } from "../../../test/sav-understanding-fixtures";
 
@@ -160,6 +160,23 @@ describe("immutable post-deployment SAV V0 cutover", () => {
     expect(decision).toMatchObject({ kind: "human_review_required", reasonCode: "understanding_unavailable" });
     expect((await fixture.db.select().from(savActions)).every(action => action.status === "pending")).toBe(true);
   });
+  it("keeps the cursor and receipt retryable when a full MIME response exceeds its wire envelope", async () => {
+    await activateSavV0Cutover(boundary);
+    await updateMailboxCursor(mailboxId, "100");
+    for (const name of ["GMAIL_CLIENT_ID", "GMAIL_CLIENT_SECRET", "GMAIL_REFRESH_TOKEN"]) vi.stubEnv(name, "fixture");
+    vi.stubGlobal("fetch", vi.fn(async (input: string | URL | Request) => {
+      const url = new URL(String(input));
+      if (url.hostname === "oauth2.googleapis.com") return Response.json({ access_token: "fixture", expires_in: 3600 });
+      if (url.pathname.endsWith("/history")) return Response.json({ historyId: "200", history: [{ id: "200", messagesAdded: [{ message: { id: "oversize-fixture" } }] }] });
+      if (url.pathname.endsWith("/messages/oversize-fixture")) return new Response("{}", { headers: { "content-length": String(96 * 1024 * 1024 + 1) } });
+      throw new Error("Unexpected network call");
+    }));
+    const { receipt } = await recordWebhookReceipt("gmail", "bounded-full-fixture", { emailAddress: boundary.mailboxEmail, historyId: "200" });
+    await expect(processGmailReceipt(receipt.id)).rejects.toThrow("GMAIL_MESSAGE_RESPONSE_TOO_LARGE");
+    const [mailbox] = await fixture.db.select().from(savMailboxes).where(eq(savMailboxes.id, mailboxId)); expect(mailbox.historyId).toBe("100");
+    const [failed] = await fixture.db.select().from(savWebhookReceipts).where(eq(savWebhookReceipts.id, receipt.id)); expect(failed).toMatchObject({ status: "failed", errorCode: "GMAIL_MESSAGE_RESPONSE_TOO_LARGE" });
+    expect(await fixture.db.select().from(savMessages)).toHaveLength(0);
+  });
   it("persists recovery pagination and only advances history after the complete scan", async () => {
     await activateSavV0Cutover(boundary);
     for (const name of ["GMAIL_CLIENT_ID", "GMAIL_CLIENT_SECRET", "GMAIL_REFRESH_TOKEN"]) vi.stubEnv(name, "fixture");
@@ -184,4 +201,14 @@ describe("immutable post-deployment SAV V0 cutover", () => {
     expect(pages[1].searchParams.get("pageToken")).toBe("page-2");
     expect(pages[1].searchParams.get("q")).toBe(pages[0].searchParams.get("q"));
   });
+});
+
+it("preserves a truncated Gmail inventory in the encrypted inbound body without scheduling old mail", async () => {
+  const parsed = parseGmailMessage(boundary.mailboxEmail, { id: "synthetic-inventory", threadId: "synthetic-inventory-thread", internalDate: "1750000000000", payload: { mimeType: "multipart/mixed", headers: [{ name: "From", value: "fixture@example.invalid" }], parts: Array.from({ length: 101 }, (_, index) => ({ partId: String(index), filename: `capture-${index}.png`, mimeType: "image/png", body: { size: 10, attachmentId: `synthetic-${index}` } })) } });
+  const result = await ingestInboundMessage(parsed);
+  const saved = decryptSavPayload<import("./service").SavMessageBody>(result.message.bodyCiphertext);
+  expect(saved.attachments).toHaveLength(100);
+  expect(saved.attachmentInventory).toEqual({ complete: false, limits: ["reference_limit"] });
+  expect(result.message.bodyCiphertext).not.toContain("capture-0.png");
+  expect(await fixture.db.select().from(savAgentRuns)).toHaveLength(0);
 });

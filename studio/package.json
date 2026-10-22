@@ -54,7 +54,8 @@
     "server-only": "^0.0.1",
     "workflow": "^4.8.5",
     "zod": "^4.4.3",
-    "braces": "file:vendor/braces-3.0.3-screenai.1.tgz"
+    "braces": "file:vendor/braces-3.0.3-screenai.1.tgz",
+    "sharp": "0.35.5"
   },
   "devDependencies": {
     "@electric-sql/pglite": "^0.5.4",
