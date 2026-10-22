@@ -287,7 +287,7 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
   if (!sessionState.isActive && !trainingState.active && !evaluationState.active) return;
   if (sessionState.lockedTabId && tabId !== sessionState.lockedTabId) return;
   if (changeInfo.status !== 'complete') return;
-  if (!isLimovaUrl(tab.url)) return;
+  if (!isFollowedPageUrl(tabId, tab.url)) return;
 
   if (urlChangeTimeout) clearTimeout(urlChangeTimeout);
   urlChangeTimeout = setTimeout(() => handleUrlChange(tabId, tab.url), URL_CHANGE_DEBOUNCE);
@@ -298,11 +298,16 @@ chrome.webNavigation.onHistoryStateUpdated.addListener((details) => {
   if (!sessionState.isActive && !trainingState.active) return;
   if (details.frameId !== 0) return; // main frame only
   if (sessionState.lockedTabId && details.tabId !== sessionState.lockedTabId) return;
-  if (!isLimovaUrl(details.url)) return;
+  if (!isFollowedPageUrl(details.tabId, details.url)) return;
 
   if (urlChangeTimeout) clearTimeout(urlChangeTimeout);
   urlChangeTimeout = setTimeout(() => handleUrlChange(details.tabId, details.url), URL_CHANGE_DEBOUNCE);
-}, { url: [{ schemes: ['https'], hostEquals: 'new.limova.ai' }] });
+}, { url: [{ schemes: ['https', 'http'] }] });
+
+// Limova pages are always followed; another site only once Charly works in that tab.
+function isFollowedPageUrl(tabId, url) {
+  return isLimovaUrl(url) || (tabId === sessionState.lockedTabId && isAssistedUrl(url));
+}
 
 chrome.tabs.onCreated.addListener((tab) => {
   trackExternalPopup(tab).catch(error => Logger.warn('popup', 'External popup tracking failed', error));
@@ -2233,7 +2238,7 @@ async function getPageContext(tabId, operation = { generation: sessionGeneration
   try {
     const results = await chrome.scripting.executeScript({
       target: { tabId },
-      func: (contextVersion) => {
+      func: (contextVersion, limovaOrigin) => {
         document.documentElement.dataset.limovaContextVersion = String(contextVersion);
         // Clean up previous IDs
         document.querySelectorAll('[data-lid]').forEach(el => el.removeAttribute('data-lid'));
@@ -2279,6 +2284,15 @@ async function getPageContext(tabId, operation = { generation: sessionGeneration
           return true;
         }
 
+        function isLayeredAbovePage(element) {
+          for (let current = element; current && current !== document.body; current = current.parentElement) {
+            const style = window.getComputedStyle(current);
+            if (style.position === 'fixed') return true;
+            if (style.position === 'absolute' && (Number.parseInt(style.zIndex, 10) || 0) >= 10) return true;
+          }
+          return false;
+        }
+
         function isModalSurfaceCandidate(element) {
           if (!(element instanceof HTMLElement)) return false;
           const rect = element.getBoundingClientRect();
@@ -2287,7 +2301,12 @@ async function getPageContext(tabId, operation = { generation: sessionGeneration
           const role = element.getAttribute('role');
           if (role === 'dialog' || role === 'alertdialog' || element.getAttribute('aria-modal') === 'true') return true;
           if (element.tagName === 'DIALOG' && element.hasAttribute('open')) return true;
-          if (/(modal|dialog|overlay|popup|lightbox|drawer)/i.test(String(element.className || '')) && rect.width > 100 && rect.height > 100) return true;
+          // A class name alone is not enough (Le Monde's live form is "--overlay"):
+          // the surface must also sit above the page and be on screen.
+          if (/(modal|dialog|overlay|popup|lightbox|drawer)/i.test(String(element.className || ''))
+            && rect.width > 100 && rect.height > 100
+            && rect.bottom > 0 && rect.top < window.innerHeight
+            && isLayeredAbovePage(element)) return true;
           const zIndex = Number.parseInt(style.zIndex, 10) || 0;
           const coversViewportCenter = rect.left <= window.innerWidth / 2
             && rect.right >= window.innerWidth / 2
@@ -2773,16 +2792,49 @@ async function getPageContext(tabId, operation = { generation: sessionGeneration
           }
         }).filter(Boolean);
 
+        // 10. On other sites the controls say little: Charly also needs the text
+        // the user reads (article, post, message), on screen first, then below.
+        function getReadableText(maxLength = 4000) {
+          const root = activeModalSurface || document.querySelector('main, [role="main"], article') || document.body;
+          const onScreen = [];
+          const below = [];
+          const seen = new Set();
+          for (const block of root.querySelectorAll('h1, h2, h3, h4, p, li, blockquote, figcaption, dd, td, pre')) {
+            if (block.closest('nav, footer, [aria-hidden="true"], [contenteditable="true"]')) continue;
+            if (block.parentElement?.closest('p, li, blockquote, dd, td, pre')) continue;
+            const rect = block.getBoundingClientRect();
+            if (rect.width === 0 || rect.height === 0 || rect.bottom < 0) continue;
+            const text = sanitizeVisibleText(block.innerText || block.textContent, 600);
+            if (text.length < 2 || seen.has(text)) continue;
+            seen.add(text);
+            const line = /^H\d$/.test(block.tagName) ? `${block.tagName.toLowerCase()}: ${text}` : text;
+            (rect.top < window.innerHeight ? onScreen : below).push(line);
+          }
+          const take = (lines, budget) => {
+            const kept = [];
+            for (const line of lines) {
+              if (budget - line.length - 1 < 0) break;
+              kept.push(line);
+              budget -= line.length + 1;
+            }
+            return kept;
+          };
+          const visible = take(onScreen, maxLength);
+          const rest = take(below, maxLength - visible.join('\n').length);
+          return { visible, below: rest };
+        }
+
         return {
           title: sanitizeVisibleText(document.title, 120),
           url: `${window.location.origin}${generalizedPath(window.location.pathname)}`,
           viewport: `${window.innerWidth}x${window.innerHeight}`,
           surface: activeModalSurface ? 'modal' : 'page',
           elements: elementMap.slice(0, 150),
+          readable: window.location.origin === limovaOrigin ? null : getReadableText(),
           network
         };
       },
-      args: [pageContextVersion + 1]
+      args: [pageContextVersion + 1, LIMOVA_DOMAIN]
     });
 
     if (!isCurrentOperation(operation)) return '';
@@ -2798,9 +2850,19 @@ async function getPageContext(tabId, operation = { generation: sessionGeneration
       parts.push(`Page: ${pc.title || '(no title)'} — ${pc.url}`);
       parts.push(`Viewport: ${pc.viewport}`);
       parts.push(`Surface active: ${pc.surface === 'modal' ? 'fenêtre au premier plan uniquement' : 'page entière'}`);
+      if (pc.readable?.visible?.length) {
+        parts.push('\n[contenu à l’écran]');
+        parts.push(pc.readable.visible.map(line => `  ${line}`).join('\n'));
+      }
+      if (pc.readable?.below?.length) {
+        parts.push('\n[suite de la page, plus bas]');
+        parts.push(pc.readable.below.map(line => `  ${line}`).join('\n'));
+      }
       if (pc.network?.length) {
+        // Other sites load dozens of third-party resources: keep the page text in budget.
+        const network = pc.readable ? pc.network.slice(-10) : pc.network;
         parts.push('\n[network]');
-        parts.push(pc.network.map(item => {
+        parts.push(network.map(item => {
           const status = item.status ? ` status:${item.status}` : '';
           return `  ${item.type} ${item.target}${status} ${item.durationMs}ms`;
         }).join('\n'));
@@ -3368,20 +3430,21 @@ async function getFreshVoiceContext(parentOperationId = null, { capture = false,
   const startedAt = Date.now();
   Logger.event('voice', 'VOICE_CONTEXT_REFRESH_STARTED', null, operationId);
 
-  const tab = await getLimovaTabForAuthentication();
+  const tab = await getVoiceContextTab();
   if (!isCurrentOperation(operation)) return cancelledOperation();
   if (!tab?.id) {
-    const error = codedError('VOICE_CONTEXT_TAB_MISSING', 'Ouvre un onglet new.limova.ai pour que Charly puisse analyser et piloter la page.');
+    const error = codedError('VOICE_CONTEXT_TAB_MISSING', 'Ouvre une page web pour que Charly puisse l’analyser et la piloter.');
     Logger.error('voice', 'Voice context tab missing', error, error.code, operationId);
     throw error;
   }
 
+  if (isExternalSiteUrl(tab.url)) await ensureContentScript(tab.id).catch(() => {});
   if (sessionState.lockedTabId !== tab.id) lockTab(tab.id);
   const pageOperation = { ...operation, tabId: tab.id };
   const pageContext = await getPageContext(tab.id, pageOperation);
   if (!isCurrentOperation(pageOperation)) return cancelledOperation();
   if (!pageContext) {
-    const error = codedError('VOICE_CONTEXT_UNAVAILABLE', 'Charly ne peut pas lire la page Limova. Actualise l’onglet puis réessaie.');
+    const error = codedError('VOICE_CONTEXT_UNAVAILABLE', 'Charly ne peut pas lire la page. Actualise l’onglet puis réessaie.');
     Logger.error('voice', 'Voice page context extraction failed', error, error.code, operationId);
     throw error;
   }
@@ -4939,6 +5002,14 @@ async function getActiveAssistedTab() {
   const [active] = await chrome.tabs.query({ active: true, lastFocusedWindow: true }).catch(() => []);
   if (active?.id && isExternalSiteUrl(active.url)) return active;
   return getActiveLimovaTab();
+}
+
+// Voice follows the page in front, Limova or any other site; on a browser
+// page it falls back to the signed-in Limova tab.
+async function getVoiceContextTab() {
+  const [active] = await chrome.tabs.query({ active: true, lastFocusedWindow: true }).catch(() => []);
+  if (active?.id && isAssistedUrl(active.url)) return active;
+  return getLimovaTabForAuthentication();
 }
 
 // Named exports keep critical privacy and policy boundaries directly testable.

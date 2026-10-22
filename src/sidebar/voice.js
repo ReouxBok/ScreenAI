@@ -200,6 +200,9 @@ class LimovaVoiceSession {
       await this.startCapture(lifecycleId);
       if (lifecycleId !== this.lifecycleId) return;
       this.markBackgroundVoiceState(true);
+      // Activating the session cancels earlier background requests, so the
+      // fallback screenshot is only asked for once the session is marked active.
+      if (!tokenData.visualCapture) this.primeVisualContext();
     } catch (error) {
       if (lifecycleId !== this.lifecycleId) return;
       const diagnosticCode = error.voiceDiagnosticCode || (error.voiceErrorKey
@@ -419,7 +422,6 @@ class LimovaVoiceSession {
           this.emit('limova-voice-status', { status: 'listening' });
           this.flushPageContextUpdate();
           this.flushVisualCapture();
-          this.primeVisualContext();
           resolve();
         }
         this.handleServerMessage(message);

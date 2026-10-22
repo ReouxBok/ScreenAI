@@ -88,6 +88,17 @@ describe('background privacy boundaries', () => {
     expect(chromeMock.tabs.sendMessage).toHaveBeenCalledWith(7, { type: 'SESSION_STATE', active: true });
   });
 
+  it('reads the site in front for voice, not the Limova tab behind it', async () => {
+    chromeMock.tabs.query.mockResolvedValueOnce([{ id: 8, active: true, url: 'https://www.lemonde.fr/societe/live/' }]);
+
+    const result = await background.getFreshVoiceContext();
+
+    expect(result).toMatchObject({ ok: true });
+    expect(chromeMock.tabs.query).toHaveBeenLastCalledWith({ active: true, lastFocusedWindow: true });
+    expect(chromeMock.scripting.executeScript).toHaveBeenCalledWith(expect.objectContaining({ target: { tabId: 8 } }));
+    expect(chromeMock.tabs.sendMessage).toHaveBeenCalledWith(8, { type: 'SESSION_STATE', active: true });
+  });
+
   it('captures only a prepared Limova viewport and always removes privacy overlays', async () => {
     chromeMock.tabs.get.mockResolvedValueOnce({ id: 7, windowId: 3, active: true, url: 'https://new.limova.ai/home' });
     chromeMock.tabs.sendMessage.mockImplementation(async (_tabId, message) => {
@@ -103,6 +114,38 @@ describe('background privacy boundaries', () => {
     expect(chromeMock.tabs.captureVisibleTab).toHaveBeenCalledWith(3, { format: 'jpeg', quality: 55 });
     expect(chromeMock.tabs.sendMessage).toHaveBeenCalledWith(7, { type: 'CLEAR_VISUAL_CAPTURE' });
     chromeMock.tabs.sendMessage.mockResolvedValue(undefined);
+  });
+
+  it('reads the article on another site, masks identifiers and ignores a form styled as an overlay', async () => {
+    const defaultRect = HTMLElement.prototype.getBoundingClientRect;
+    // Like Le Monde's live comment form: "--overlay" in its class, laid out in the page, below the fold.
+    HTMLElement.prototype.getBoundingClientRect = function getBoundingClientRect() {
+      if (!this.dataset.rect) return defaultRect.call(this);
+      const [left, top, width, height] = this.dataset.rect.split(',').map(Number);
+      return { left, top, width, height, right: left + width, bottom: top + height, x: left, y: top };
+    };
+    document.body.innerHTML = `
+      <main>
+        <h1>En direct, manifestations du 17 octobre</h1>
+        <p>La justice suspend l’interdiction. Contact presse : john.doe@example.com</p>
+        <p data-rect="10,2000,600,40">Un cortège validé de Bastille à Nation samedi.</p>
+        <div class="form__container-live--overlay" data-rect="230,1600,560,130">
+          <textarea placeholder="Ecrivez votre message ici"></textarea>
+        </div>
+      </main>
+    `;
+
+    try {
+      const context = await background.getPageContext(7);
+
+      expect(context).toContain('Surface active: page entière');
+      expect(context).toContain('[contenu à l’écran]\n  h1: En direct, manifestations du 17 octobre');
+      expect(context).toContain('La justice suspend l’interdiction. Contact presse : [email]');
+      expect(context).toContain('[suite de la page, plus bas]\n  Un cortège validé de Bastille à Nation samedi.');
+      expect(context).not.toContain('john.doe@example.com');
+    } finally {
+      HTMLElement.prototype.getBoundingClientRect = defaultRect;
+    }
   });
 
   it('returns useful DOM and network structure without secrets or direct identifiers', async () => {
