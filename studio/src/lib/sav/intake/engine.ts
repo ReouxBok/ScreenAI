@@ -22,6 +22,8 @@ function canonical(value: unknown): string {
   if (value && typeof value === "object") return `{${Object.entries(value).sort(([a], [b]) => a.localeCompare(b)).map(([k, v]) => `${JSON.stringify(k)}:${canonical(v)}`).join(",")}}`;
   return JSON.stringify(value) ?? "null";
 }
+export const savIntakeCanonicalEvidence = canonical;
+export const savIntakeEvidenceContentHash = (value: unknown) => sha(canonical(value));
 const unique = <T>(values: T[]) => [...new Set(values)];
 const observationTimeSchema = z.iso.datetime({ offset: true });
 const DAY = 86_400_000;
@@ -79,6 +81,8 @@ export async function planSavIntake(
   let noteText: string | null = null;
   let newTicket: IntakePlan["newTicket"];
   let candidateContactIds: string[] | undefined;
+  let selectedEquivalent: string[] | undefined;
+  const humanProof = input.humanResolution ? addEvidence("human-choice", "human_override", input.humanResolution.choiceId, input.humanResolution, input.humanResolution.at) : undefined;
   const finalize = (disposition: SavIntakeDecision["disposition"], progress: SavIntakeProgress = { kind: "processing", phase: "context", view: null }, supervisedResource?: PrivateResource): IntakePlan => {
     const decision = savIntakeDecisionSchema.parse({
       revision: SAV_INTAKE_CONTRACT_REVISION, messageId: message.id, latestInboundMessageId: input.latestInboundMessageId,
@@ -95,7 +99,7 @@ export async function planSavIntake(
       revision: "sav-intake-engine-2026-10-20.v1", fingerprint, decision,
       steps: mutations.map(mutation => ({ id: `${message.id}:${mutation}:${fingerprint}`, mutation, requiresPermission: mutation, ticketId, status: "not_dispatched" as const })),
       progress: savIntakeProgressSchema.parse(progress), noteText: finalNote, ...(supervisedResource ? { supervisedResource } : {}),
-      ...(finalCreation ? { newTicket: finalCreation } : {}), ...(candidateContactIds ? { candidateContactIds } : {}),
+      ...(finalCreation ? { newTicket: finalCreation } : {}), ...((candidateContactIds ?? selectedEquivalent) ? { candidateContactIds:candidateContactIds ?? selectedEquivalent } : {}),
       originalThreadId: message.threadId, originalRecipientEmails: [message.fromEmail], referenceMode: input.mode,
       readCalls: calls, effects: "not_connected",
     };
@@ -165,10 +169,13 @@ export async function planSavIntake(
     const parsedAnalysis = messageAnalysisSchema.safeParse(await bounded(signal => adapters.analyseMessage({ message, conversation }, signal), "classification_incomplete"));
     if (!parsedAnalysis.success) return context("classification_incomplete");
     const analysis = parsedAnalysis.data;
+    if (input.humanResolution?.classification) {
+      analysis.requests = analysis.requests.map(r => ({ ...r, kind: input.humanResolution!.classification! }));
+    }
     if (analysis.messageId !== message.id || analysis.requests.some(r => r.currentMessageId !== message.id)
       || new Set(analysis.requests.map(r => r.id)).size !== analysis.requests.length) return context("classification_incomplete");
     analysis.requests.sort((a, b) => a.id.localeCompare(b.id));
-    requests = analysis.requests.map(({ id, kind }) => ({ id, kind, evidenceIds: [current] }));
+    requests = analysis.requests.map(({ id, kind }) => ({ id, kind, evidenceIds: humanProof ? [current, humanProof] : [current] }));
     const kinds = unique(requests.map(r => r.kind));
     classification = kinds.includes("cancellation") ? "cancellation" : kinds.includes("finance") ? "finance"
       : kinds.includes("unknown") || !kinds.length ? "unknown" : kinds.includes("support") ? "support"
@@ -222,6 +229,8 @@ export async function planSavIntake(
     contacts = [...distinctContacts.values()].sort((a, b) => a.id.localeCompare(b.id));
     identityEvidenceIds.push(addEvidence("email-lookup", "crm_contact", `lookup-${sha(address)}`,
       { address, status: lookup.status, contacts, reconstructedAsOf: lookup.reconstructedAsOf }, lookup.observedAt));
+    const expectedHumanCandidates = input.humanResolution?.equivalentContactIds;
+    if (expectedHumanCandidates?.some(id => !contacts.some(contact => contact.id === id))) return context("contact_ambiguous");
     if (!contacts.length) {
       if (input.previousIdentification?.messageId === message.id && normalizeEmail(input.previousIdentification.address) === address) return context("history_incomplete");
       const resource = addressOrigin === "sender" ? policy.resources.identification : policy.resources.registrationNotFound;
@@ -264,15 +273,22 @@ export async function planSavIntake(
       if (resolution.kind === "equivalent") {
         if (resolution.contactIds.length < 2) return context("contact_ambiguous");
         candidateContactIds = [...resolution.contactIds].sort();
-        return context("contact_ambiguous", "equivalent_contact_choice");
+        const choice = input.humanResolution;
+        if (!choice?.contactId || !humanProof || !choice.equivalentContactIds
+          || canonical([...choice.equivalentContactIds].sort()) !== canonical(candidateContactIds)
+          || !candidateContactIds.includes(choice.contactId)) return context("contact_ambiguous", "equivalent_contact_choice");
+        selectedEquivalent = [...candidateContactIds];
+        contacts = contacts.filter(c => c.id === choice.contactId);
+      } else {
+        if (resolution.contactIds.length !== 1) return context("contact_ambiguous");
+        contacts = contacts.filter(c => c.id === resolution.contactIds[0]);
       }
-      if (resolution.contactIds.length !== 1) return context("contact_ambiguous");
-      contacts = contacts.filter(c => c.id === resolution.contactIds[0]);
       candidateContactIds = undefined;
     }
     const primary = contacts[0];
     const scopeContacts: Extract<SavIntakeDecision["disposition"], { kind: "ticket" }>["contactScope"]["contacts"] = [];
     const primaryProof = contactEvidence(primary, lookup.observedAt); identityEvidenceIds.push(primaryProof);
+    if (humanProof) identityEvidenceIds.push(humanProof);
     scopeContacts.push({ origin: "email_lookup", addressOrigin, contactId: primary.id, evidenceIds: [primaryProof] });
     const edgeResult = await bounded(signal => adapters.directAssociations(primary.id, signal), "association_incomplete");
     const edges = complete(edgeResult, z.array(intakeAssociationSchema).max(100), "association_incomplete", true);
@@ -317,6 +333,16 @@ export async function planSavIntake(
     const parsedAssessment = issueAssessmentSchema.safeParse(await bounded(signal => adapters.assessIssues({ message, requests: analysis.requests, tickets: collected, evidence: [...evidence] }, signal), "same_issue_unresolved"));
     if (!parsedAssessment.success) return context("same_issue_unresolved");
     const assessment = parsedAssessment.data;
+    const humanTicketId = input.humanResolution?.ticketId;
+    if (humanTicketId && humanProof && assessment.investigationComplete) {
+      const selected = assessment.tickets.find(t => t.ticketId === humanTicketId);
+      if (!selected || !tickets.has(humanTicketId)) return context("same_issue_unresolved", "equivalent_ticket_choice");
+      // Explicit human correction of the semantic relation, while all real CRM
+      // membership/ticket/history snapshots and other assessments stay intact.
+      selected.relation = "same";
+      selected.requestIds = requests.map(r => r.id);
+      selected.evidenceIds = unique([...selected.evidenceIds, humanProof]);
+    }
     if (assessment.tickets.length !== candidateTickets.length || new Set(assessment.tickets.map(t => t.ticketId)).size !== assessment.tickets.length) return context("same_issue_unresolved");
     for (const match of assessment.tickets) {
       const currentProof = match.evidenceIds.includes(current);
@@ -331,13 +357,15 @@ export async function planSavIntake(
     const same = candidateTickets.filter(t => assessment.tickets.some(m => m.ticketId === t.id && m.relation === "same"));
     if (candidateTickets.some(t => t.stage === "unknown")) return context("ticket_stage_unknown");
     const opened = same.filter(t => t.stage !== "closed").sort((a, b) => Date.parse(b.createdAt!) - Date.parse(a.createdAt!) || a.id.localeCompare(b.id));
-    if (opened.length > 1 && Date.parse(opened[0].createdAt!) === Date.parse(opened[1].createdAt!)) return context("same_issue_unresolved", "equivalent_ticket_choice");
+    if (!input.humanResolution?.ticketId && opened.length > 1 && Date.parse(opened[0].createdAt!) === Date.parse(opened[1].createdAt!)) return context("same_issue_unresolved", "equivalent_ticket_choice");
     const closed = same.filter(t => t.stage === "closed");
     if (!opened.length && closed.some(t => !t.closedAt || Date.parse(t.closedAt) > Date.parse(message.receivedAt)
       || Date.parse(t.closedAt) < Date.parse(t.createdAt!))) return context("ticket_closure_date_unknown");
     const recent = closed.filter(t => Date.parse(message.receivedAt) - Date.parse(t.closedAt!) <= 15 * DAY);
-    if (!opened.length && (recent.length > 1 || !recent.length && closed.length > 1)) return context("same_issue_unresolved", "equivalent_ticket_choice");
-    const selected = opened[0] ?? recent[0];
+    if (!input.humanResolution?.ticketId && !opened.length && (recent.length > 1 || !recent.length && closed.length > 1)) return context("same_issue_unresolved", "equivalent_ticket_choice");
+    const chosenTicket = input.humanResolution?.ticketId;
+    if (chosenTicket && ![...opened, ...recent].some(t => t.id === chosenTicket)) return context("same_issue_unresolved", "equivalent_ticket_choice");
+    const selected = chosenTicket ? [...opened, ...recent].find(t => t.id === chosenTicket) : opened[0] ?? recent[0];
     if (selected?.stage === "closed" && selected.ownerId === undefined) return context("ticket_owner_unknown");
     const targetContactId = selected ? selected.contactIds.includes(primary.id) ? primary.id : selected.contactIds.filter(id => scopeContacts.some(c => c.contactId === id)).sort()[0] : primary.id;
     const binding = (ticket: IntakeTicket, contactId: string) => ({ ticketId: ticket.id, contactId, ticketEvidenceId: `ticket-${ticket.id}`, contactAssociationEvidenceId: `membership-${ticket.id}-${contactId}` });
@@ -345,7 +373,7 @@ export async function planSavIntake(
     const target: Extract<SavIntakeDecision["disposition"], { kind: "ticket" }>["target"] = selected
       ? selected.stage === "closed" ? { operation: "reopen", ...binding(selected, targetContactId), preserveOwnerId: selected.ownerId! }
         : { operation: "link", ...binding(selected, targetContactId), alreadyNew: selected.stage === "new" }
-      : { operation: "create", contactId: primary.id, predecessor, selection: { kind: "retained_email_match" } };
+      : { operation: "create", contactId: primary.id, predecessor, selection: selectedEquivalent && humanProof ? { kind: "human_equivalent_contacts", equivalentContactIds: selectedEquivalent, choiceEvidenceId: humanProof } : { kind: "retained_email_match" } };
     if (target.operation === "create") {
       const summary = analysis.ticketSummary;
       if (!summary || summary.title.split(/\s+/).length > 6 || summary.requestIds.length !== requests.length
@@ -366,7 +394,7 @@ export async function planSavIntake(
     if (note) permissions.push("append_ticket_note");
     if (returns) permissions.push("set_ticket_new");
     return finalize({ kind: "ticket", target, requestIds: requests.map(r => r.id), contactScope: { primaryContactId: primary.id, contacts: scopeContacts, complete: true },
-      search: "complete", history: "complete", identity: { kind: "unique_crm_match_for_intake", addressOrigin, scope: "intake_only", evidenceIds: identityEvidenceIds },
+      search: "complete", history: "complete", identity: { kind: selectedEquivalent ? "human_equivalent_contacts" : "unique_crm_match_for_intake", ...(selectedEquivalent ? { choiceEvidenceId: humanProof } : {}), addressOrigin, scope: "intake_only", evidenceIds: identityEvidenceIds },
       sameIssueEvidenceIds: unique([current, ...assessment.tickets.filter(m => m.relation === "same").flatMap(m => m.evidenceIds)]).sort(), requiredPermissions: permissions,
       multiTicketNote: { openTicketIdsOnTargetContact: openIds }, note, learning: classification === "support" ? "eligible_after_confirmed_effect" : "excluded", evidenceIds: [current, primaryProof] },
     { kind: "processing", phase: "dispatch", view: null });

@@ -1,4 +1,5 @@
 import "server-only";
+import { readIntakeLearningQualification } from "./intake/observation-binding";
 import {and,desc,eq} from "drizzle-orm";
 import {requireDb} from "@/db";
 import {savMessages,savThreads} from "@/db/schema";
@@ -8,8 +9,9 @@ import {savContentHash} from "./crypto";
 /** Baselines stay immutable; current human qualification owns sensitive gates. */
 export async function readSavCaseLearningQualification(threadId:string,db:Pick<ReturnType<typeof requireDb>,"select">=requireDb()) {
  const [thread]=await db.select({paused:savThreads.aiPaused}).from(savThreads).where(eq(savThreads.id,threadId));
- const [message]=await db.select({id:savMessages.id}).from(savMessages).where(and(eq(savMessages.threadId,threadId),eq(savMessages.direction,"inbound"))).orderBy(desc(savMessages.receivedAt),desc(savMessages.createdAt),desc(savMessages.id)).limit(1);
+ const [message]=await db.select({id:savMessages.id,analysisStatus:savMessages.analysisStatus}).from(savMessages).where(and(eq(savMessages.threadId,threadId),eq(savMessages.direction,"inbound"))).orderBy(desc(savMessages.receivedAt),desc(savMessages.createdAt),desc(savMessages.id)).limit(1);
  if(!thread||thread.paused||!message)return {allowed:false,fingerprint:null};
+ if(message.analysisStatus.startsWith("intake_")) return await readIntakeLearningQualification(threadId,db) ?? {allowed:false,fingerprint:null};
  try {
   const context=await loadSavDossierReviewContext(message.id,db),proposal=context.proposal;
   if(context.review && context.review.status!=="approved")return {allowed:false,fingerprint:null};

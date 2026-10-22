@@ -1,3 +1,4 @@
+import { readIntakeObservationBinding, attributeIntakeObservationEvents, intakeDossierSensitive } from "./intake/observation-binding";
 import { isSavDerivedBudgetDeferred } from "./derived-budget";
 import { readSavCaseLearningQualification } from "./case-qualification";
 import { isSavCaseLearningFrozen } from "./config";
@@ -80,7 +81,10 @@ export async function reconcileSavObservations(limit = 5, now = new Date(), opti
     return { processed: results,comparisons,deferred:ready.length>comparisons.length };
 }
 export async function syncSavObservation(id: string, collect: (id: string) => Promise<ObservationSnapshot> = collectSavObservationSources, now = new Date()) {
-    if(isSavCaseLearningFrozen())return {id,status:"frozen"};
+    if(isSavCaseLearningFrozen()) {
+      const [origin] = await requireDb().select({ origin: savResolutionObservations.trackingOrigin }).from(savResolutionObservations).where(eq(savResolutionObservations.id, id));
+      if (origin?.origin !== "intake") return {id,status:"frozen"};
+    }
     const db = requireDb();
     const token = randomUUID();
     const claim = await db.transaction(async (tx) => {
@@ -124,7 +128,7 @@ export async function syncSavObservation(id: string, collect: (id: string) => Pr
         const messages = await tx.select().from(savMessages).where(eq(savMessages.threadId, row.threadId)).orderBy(desc(savMessages.receivedAt)).limit(200);
         if (messages.length === 200)
             snapshot.errors.push("gmail:message_limit_200");
-        const events: ObservationEvent[] = [...snapshot.events];
+        let events: ObservationEvent[] = [...snapshot.events];
         for (const message of messages) {
             const storedBody=decryptSavPayload<{text:string;headers?:Record<string,string>}>(message.bodyCiphertext);
             const body=storedBody.text;
@@ -144,6 +148,10 @@ export async function syncSavObservation(id: string, collect: (id: string) => Pr
         const confirmedActions=await tx.select().from(savActions).where(and(eq(savActions.threadId,row.threadId),eq(savActions.actorType,"human"),eq(savActions.status,"succeeded"))).orderBy(asc(savActions.executedAt)).limit(201);
         if(confirmedActions.length>200)snapshot.errors.push("studio:action_limit_200");
         for(const action of confirmedActions.slice(0,200))events.push({sourceRef:`studio:action:${action.id}`,kind:"action_confirmed",occurredAt:(action.executedAt??action.updatedAt).toISOString(),text:JSON.stringify({kind:action.kind,messageId:action.messageId,decisionId:action.decisionId,ticketId:action.payload.hubspotTicketId??null,ticketReturnCompletedAt:action.payload.ticketReturnCompletedAt??null}),author:action.actorEmail,provenance:"Studio / résultat fournisseur confirmé dans le journal d’action",associationTicketId:snapshot.ticketId,remoteUpdatedAt:null});
+        const intakeBinding = row.trackingOrigin === "intake" ? await readIntakeObservationBinding(row.id, tx) : null;
+        if (row.trackingOrigin === "intake" && !intakeBinding) snapshot.errors.push("intake:baseline_missing");
+        if (intakeBinding) events = attributeIntakeObservationEvents(events, intakeBinding.baseline);
+        const intakeSensitive = Boolean(intakeBinding && (intakeBinding.sensitive || await intakeDossierSensitive(row.threadId, row.hubspotTicketId, tx)));
         const identities=new Map<string,ObservationEvent>();
         for(let index=events.length-1;index>=0;index--){const event=events[index];if(!event.messageIdentity)continue;const previous=identities.get(event.messageIdentity);if(previous){previous.sourceAliases=[...(previous.sourceAliases??[]),event.sourceRef];events.splice(index,1);}else identities.set(event.messageIdentity,event);}
         events.sort((a, b) => `${a.occurredAt}:${a.sourceRef}`.localeCompare(`${b.occurredAt}:${b.sourceRef}`));
@@ -170,7 +178,7 @@ export async function syncSavObservation(id: string, collect: (id: string) => Pr
         const customerConfirmation = lastCustomer&&explicitCustomerConfirmation(lastCustomer.text)&&human.some(h=>h.occurredAt<lastCustomer.occurredAt)?[lastCustomer]:[];
         const refusalReasons=verdict?savStoredReviewReasons(decryptSavPayload<{reasons?:unknown}>(verdict.reasonCiphertext).reasons):[];
         const measurements=measureSavCase(rejected.proposal,relevant,{ticketId:row.hubspotTicketId,closed:snapshot.status==="closed",errors:snapshot.errors,baselineAt:baselinePayload?.analysisCreatedAt??row.createdAt.toISOString(),cycle});
-        const summary = { subject: snapshot.subject, draftRefused: rejected.body, ...(refusalReasons.length ? { refusalReasons } : {}), refusalReason: verdict?decryptSavPayload<{text:string}>(verdict.reasonCiphertext).text:"", category: rejected.proposal?.category??"unknown", reasonCode: rejected.proposal?.decision.reasonCode??"unknown", measurements:{revision:measurements.revision,axes:measurements.axes,coverage:measurements.coverage}, baselineProposal:rejected.proposal, baselineAt:baselinePayload?.analysisCreatedAt??row.createdAt.toISOString(),
+        const summary = { ...(intakeBinding ? { origin: "intake", intakeBaseline: intakeBinding.baseline } : {}), subject: snapshot.subject, draftRefused: rejected.body, ...(refusalReasons.length ? { refusalReasons } : {}), refusalReason: verdict?decryptSavPayload<{text:string}>(verdict.reasonCiphertext).text:"", category: intakeSensitive ? "billing" : rejected.proposal?.category??"unknown", reasonCode: intakeSensitive ? "intake_sensitive_excluded" : rejected.proposal?.decision.reasonCode??"unknown", measurements:{revision:measurements.revision,axes:measurements.axes,coverage:measurements.coverage}, baselineProposal:rejected.proposal, baselineAt:intakeBinding?.baseline.confirmedAt??baselinePayload?.analysisCreatedAt??row.createdAt.toISOString(),
             events: relevant, humanEvidence: human.map(e => ({ sourceRef: e.sourceRef, contentHash: savContentHash(e), kind: e.kind, occurredAt: e.occurredAt })), customerConfirmation: customerConfirmation.map(e => e.sourceRef), sourceErrors: snapshot.errors, coverage: "Emails HubSpot associés et fil Gmail synchronisé uniquement. Boîtes externes non enregistrées, appels et opérations hors CRM non observables. Une tâche terminée n’atteste pas une opération exécutée.", outcome: snapshot.errors.length || snapshot.status === "unknown" ? "insufficient_sources" : human.length ? "human_evidence_to_qualify" : "closed_without_human_evidence" };
         const hash = savContentHash(summary);
         const changed = existing?.sourceHash !== hash;
@@ -183,7 +191,7 @@ export async function syncSavObservation(id: string, collect: (id: string) => Pr
         const closed = snapshot.status === "closed";
         const status = snapshot.status === "unknown" ? "unknown" : closed ? "closed" : "open";
         const humanQualificationRevision = !changed && existing?.qualification ? decryptSavPayload<{humanQualificationRevision?:string}>(existing.summaryCiphertext).humanQualificationRevision : undefined;
-        const values = { status, summaryCiphertext: encryptSavPayload({...summary,...(humanQualificationRevision?{humanQualificationRevision}:{})}), sourceHash: hash, closedAt: closed ? (existing?.closedAt ?? new Date(snapshot.updatedAt)) : null, updatedAt: now, ...(changed ? { qualification: null, qualifiedBy: null, qualifiedAt: null, candidateId: null, learningDisposition: null } : {}) };
+        const values = { status, summaryCiphertext: encryptSavPayload({...summary,...(humanQualificationRevision?{humanQualificationRevision}:{})}), sourceHash: hash, closedAt: closed ? (existing?.closedAt ?? new Date(snapshot.updatedAt)) : null, updatedAt: now, ...(changed ? { qualification: null, qualifiedBy: null, qualifiedAt: null, candidateId: null, learningDisposition: null } : {}), ...(intakeSensitive ? { qualification: "not_applicable_sensitive", learningDisposition: "not_applicable_sensitive" } : {}) };
         const [savedCycle] = existing ? await tx.update(savObservationCycles).set(values).where(eq(savObservationCycles.id, existing.id)).returning() : await tx.insert(savObservationCycles).values({ ...values, observationId: id, cycle, ...(cycle > 1 ? { createdAt: new Date(snapshot.updatedAt) } : {}) }).returning();
         const closedCatchupUntil = snapshot.status === "open" ? null : closed ? (row.closedCatchupUntil ?? new Date(now.getTime() + DAY)) : row.closedCatchupUntil;
         release.nextSyncAt = nextDue(now);
@@ -209,6 +217,8 @@ export async function qualifySavObservation(raw: unknown, actorEmail: string) {
             subject: string;
             category: string;
             reasonCode: string;
+            origin?: "intake"; intakeBaseline?: import("./intake/observation-binding").IntakeObservationBaseline;
+            baselineAt?: string; baselineProposal?: SavStructuredProposal | null; events?: ObservationEvent[];
             humanEvidence: Array<{
                 sourceRef: string;
                 contentHash: string;
@@ -220,9 +230,10 @@ export async function qualifySavObservation(raw: unknown, actorEmail: string) {
         }>(cycle.summaryCiphertext);
         const humanQualificationRevision=randomUUID();
         let candidateId = cycle.candidateId;
-        let pipeline: null | { ticketId: string; threadId: string; observationId: string; cycleId: string; evidenceOccurredAt: string; sourceRef: string; cycleStartedAt: Date; subject: string; resolution: string; evidenceRef: string; sourceHash: string; cycleSourceHash: string; customerConfirmed: boolean } = null;
+        let pipeline: null | { ticketId: string; threadId: string; observationId: string; cycleId: string; evidenceOccurredAt: string; sourceRef: string; cycleStartedAt: Date; subject: string; resolution: string; evidenceRef: string; sourceHash: string; cycleSourceHash: string; customerConfirmed: boolean; caseContext?: import("./learning-comparator").SavLearningComparisonInput["caseContext"] } = null;
         if (input.outcome === "resolved") {
-            if(!(await readSavCaseLearningQualification(observation.threadId,tx)).allowed)throw new Error("SAV_OBSERVATION_QUALIFICATION_REQUIRED");
+            const currentQualification=await readSavCaseLearningQualification(observation.threadId,tx);
+            if(!currentQualification.allowed)throw new Error("SAV_OBSERVATION_QUALIFICATION_REQUIRED");
             const proof = summary.humanEvidence.find(e => e.sourceRef === input.evidenceRef && e.contentHash === input.evidenceHash);
             if (observation.sourceErrors.length || summary.sourceErrors.length || !proof || input.resolution.length < 20 || (input.customerConfirmationRef ? !summary.customerConfirmation.includes(input.customerConfirmationRef) : !input.unconfirmedAcknowledged) || summary.category === "billing" || summary.reasonCode === "cancellation_human_only")
                 throw new Error("SAV_OBSERVATION_QUALIFICATION_REQUIRED");
@@ -242,7 +253,7 @@ export async function qualifySavObservation(raw: unknown, actorEmail: string) {
                 candidateId = null;
                 pipeline = { ticketId: observation.hubspotTicketId!, threadId: observation.threadId, observationId: observation.id, cycleId: cycle.id, evidenceOccurredAt: proof.occurredAt ?? "invalid", sourceRef: `sav-observation:${cycle.id}`, cycleStartedAt: cycle.createdAt,
                     subject: summary.subject, resolution, evidenceRef: input.evidenceRef, sourceHash: contentHash, cycleSourceHash: cycle.sourceHash,
-                    customerConfirmed: Boolean(input.customerConfirmationRef) };
+                    customerConfirmed: Boolean(input.customerConfirmationRef), ...(summary.origin === "intake" ? {caseContext:{origin:"intake" as const,intakeBaseline:summary.intakeBaseline,baseline:null,baselineAt:summary.baselineAt??observation.createdAt.toISOString(),events:summary.events??[],currentQualificationHash:currentQualification.fingerprint!}} : {}) };
             }
         }
         else
@@ -262,7 +273,7 @@ export async function qualifySavObservation(raw: unknown, actorEmail: string) {
         snapshotHash: result.pipeline.sourceHash, subject: result.pipeline.subject, resolution: result.pipeline.resolution,
         provenance: "human_resolution", sourceMessageId: result.pipeline.evidenceRef, evidenceRef: result.pipeline.evidenceRef,
         evidenceExcerpt: result.pipeline.resolution.slice(0, 240), customerConfirmed: result.pipeline.customerConfirmed,
-        cycleSourceHash: result.pipeline.cycleSourceHash, humanQualificationRevision:result.humanQualificationRevision,
+        cycleSourceHash: result.pipeline.cycleSourceHash, humanQualificationRevision:result.humanQualificationRevision, caseContext:result.pipeline.caseContext,
     });
     const candidateId = evaluated && typeof evaluated === "object" && "candidateId" in evaluated && typeof evaluated.candidateId === "string" ? evaluated.candidateId : null;
     await db.transaction(async (tx) => {
@@ -320,7 +331,7 @@ export async function prepareSavObservationLearning(id:string,now=new Date(),opt
   if(!qualification.allowed){const [cycle]=await tx.select().from(savObservationCycles).where(and(eq(savObservationCycles.observationId,id),eq(savObservationCycles.cycle,row.cycle)));if(cycle)await tx.update(savObservationCycles).set({learningDisposition:"current_qualification_requires_review"}).where(eq(savObservationCycles.id,cycle.id));return null;}
   const [cycle]=await tx.select().from(savObservationCycles).where(and(eq(savObservationCycles.observationId,id),eq(savObservationCycles.cycle,row.cycle)));
   if(!cycle||cycle.candidateId||cycle.qualification&&cycle.qualification!=="evidence_observed"||cycle.learningDisposition&&!["open_limit","weekly_limit"].includes(cycle.learningDisposition))return null;
-  const summary=decryptSavPayload<{subject:string;category:string;reasonCode:string;events:ObservationEvent[];baselineProposal:SavStructuredProposal|null;baselineAt:string;sourceErrors:string[]}>(cycle.summaryCiphertext);
+  const summary=decryptSavPayload<{subject:string;category:string;reasonCode:string;events:ObservationEvent[];baselineProposal:SavStructuredProposal|null;baselineAt:string;sourceErrors:string[];origin?:"intake";intakeBaseline?:import("./intake/observation-binding").IntakeObservationBaseline}>(cycle.summaryCiphertext);
   if(summary.sourceErrors.length||summary.category==="billing"||/cancellation|refund|legal|security/.test(summary.reasonCode)){
     await tx.update(savObservationCycles).set({learningDisposition:summary.sourceErrors.length?"source_coverage_incomplete":"sensitive_review_required"}).where(eq(savObservationCycles.id,cycle.id));return null;
   }
@@ -332,7 +343,7 @@ export async function prepareSavObservationLearning(id:string,now=new Date(),opt
  if(!prepared)return {disposition:"not_evaluable"};
  const {row,cycle,summary,proof,qualificationHash}=prepared;
  let result:Awaited<ReturnType<typeof processSavLearningResolution>>;
- try { result=await processSavLearningResolution({ticketId:row.hubspotTicketId??undefined,threadId:row.threadId,sourceRef:`sav-observation:${cycle.id}`,origin:"observation",cycleStartedAt:cycle.createdAt,snapshotId:cycle.id,snapshotHash:cycle.sourceHash,subject:summary.subject,resolution:proof.text,provenance:"observed_treatment",sourceMessageId:proof.sourceRef,evidenceRef:proof.sourceRef,evidenceExcerpt:proof.text.slice(0,240),evidenceOccurredAt:proof.occurredAt,customerConfirmed:explicitCustomerConfirmation(summary.events.filter(e=>e.kind==="customer_reply"&&e.occurredAt>proof.occurredAt).at(-1)?.text??""),cycleSourceHash:cycle.sourceHash,observationId:row.id,cycleId:cycle.id,caseContext:{baseline:summary.baselineProposal,baselineAt:summary.baselineAt,events:summary.events,currentQualificationHash:qualificationHash}},{...options,now});
+ try { result=await processSavLearningResolution({ticketId:row.hubspotTicketId??undefined,threadId:row.threadId,sourceRef:`sav-observation:${cycle.id}`,origin:"observation",cycleStartedAt:cycle.createdAt,snapshotId:cycle.id,snapshotHash:cycle.sourceHash,subject:summary.subject,resolution:proof.text,provenance:"observed_treatment",sourceMessageId:proof.sourceRef,evidenceRef:proof.sourceRef,evidenceExcerpt:proof.text.slice(0,240),evidenceOccurredAt:proof.occurredAt,customerConfirmed:explicitCustomerConfirmation(summary.events.filter(e=>e.kind==="customer_reply"&&e.occurredAt>proof.occurredAt).at(-1)?.text??""),cycleSourceHash:cycle.sourceHash,observationId:row.id,cycleId:cycle.id,caseContext:{...(summary.origin === "intake" ? {origin:"intake" as const,intakeBaseline:summary.intakeBaseline} : {}),baseline:summary.baselineProposal,baselineAt:summary.baselineAt,events:summary.events,currentQualificationHash:qualificationHash}},{...options,now});
  } catch(error) {if(isSavDerivedBudgetDeferred(error)) {await db.update(savResolutionObservations).set({state:"waiting_budget"}).where(eq(savResolutionObservations.id,id));return {disposition:"deferred",reasonCode:"daily_budget"};}throw error;}
  if(result.disposition==="deferred"){await db.update(savResolutionObservations).set({state:"waiting_budget"}).where(eq(savResolutionObservations.id,id));return result;}
  if(result.disposition==="duplicate" && !result.candidateId && result.reasonCode==="comparison_started") return result;

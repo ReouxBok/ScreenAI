@@ -9,7 +9,7 @@ export default defineConfig({
   reporter:"list",
   use:{baseURL:"http://127.0.0.1:3100",trace:"retain-on-failure",screenshot:"only-on-failure"},
   webServer:{
-    command:"tsx scripts/prepare-e2e.ts && next dev -p 3100",
+    command:"tsx scripts/prepare-e2e.ts && NODE_OPTIONS=\"--max-old-space-size=3072\" next dev --webpack -p 3100",
     url:"http://127.0.0.1:3100/connexion",
     timeout:120_000,
     reuseExistingServer:false,

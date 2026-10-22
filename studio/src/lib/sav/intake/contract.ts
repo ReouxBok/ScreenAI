@@ -142,7 +142,8 @@ const ticket = z.object({
   contactScope: savIntakeContactScopeSchema,
   search: z.literal("complete"), history: z.literal("complete"),
   identity: z.object({
-    kind: z.literal("unique_crm_match_for_intake"),
+    kind: z.enum(["unique_crm_match_for_intake", "human_equivalent_contacts"]),
+    choiceEvidenceId: ref.optional(),
     addressOrigin: z.enum(["sender", "customer_declared_registration"]),
     scope: z.literal("intake_only"), evidenceIds: refs,
   }).strict(),
@@ -211,6 +212,8 @@ export const savIntakeDecisionSchema = z.object({
     if (!primary || primary.addressOrigin !== disposition.identity.addressOrigin) reject("SAV_INTAKE_IDENTITY_ORIGIN_MISMATCH");
     if (!decision.evidence.some(evidence => evidence.source === "crm_contact"
       && evidence.sourceId === disposition.contactScope.primaryContactId && disposition.identity.evidenceIds.includes(evidence.id))) reject("SAV_INTAKE_UNIQUE_CONTACT_EVIDENCE_REQUIRED");
+    if (disposition.identity.kind === "human_equivalent_contacts" && !decision.evidence.some(e =>
+      e.id === disposition.identity.choiceEvidenceId && e.source === "human_override")) reject("SAV_INTAKE_HUMAN_CONTACT_CHOICE_REQUIRED");
     if (disposition.identity.addressOrigin === "customer_declared_registration"
       && !decision.evidence.some(evidence => ["current_message", "customer_history"].includes(evidence.source)
         && disposition.identity.evidenceIds.includes(evidence.id))) reject("SAV_INTAKE_CUSTOMER_DECLARATION_REQUIRED");
@@ -240,7 +243,7 @@ export const savIntakeDecisionSchema = z.object({
         const selection = target.selection;
         referenced.push(selection.choiceEvidenceId);
         if (!selection.equivalentContactIds.includes(target.contactId)
-          || selection.equivalentContactIds.some(id => !disposition.contactScope.contacts.some(contact => contact.contactId === id))) reject("SAV_INTAKE_EQUIVALENT_CONTACT_SCOPE_INVALID");
+          || selection.equivalentContactIds.some(id => !decision.evidence.some(e => e.source === "crm_contact" && e.sourceId === id))) reject("SAV_INTAKE_EQUIVALENT_CONTACT_SCOPE_INVALID");
         if (!decision.evidence.some(evidence => evidence.id === selection.choiceEvidenceId && evidence.source === "human_override")) reject("SAV_INTAKE_HUMAN_CONTACT_CHOICE_REQUIRED");
       }
     }

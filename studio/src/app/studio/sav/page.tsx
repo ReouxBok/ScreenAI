@@ -1,3 +1,5 @@
+import { redirect } from "next/navigation";
+import { hasIntakeLaunch } from "@/lib/sav/intake/launch-boundary";
 import { formatParisDateTime } from "@/lib/paris-date";
 import Link from "next/link";
 import { AlertTriangle, ArrowUpRight, Bot, CheckCircle2, Clock3, FlaskConical, Inbox, TicketCheck, UserRoundCheck } from "lucide-react";
@@ -39,8 +41,9 @@ const feedbackLabels: Record<string, string> = {
   good_without_change: "Bonne réponse sans changement",
 };
 
-export default async function SavDashboardPage({ searchParams }: { searchParams: Promise<{ view?: string; q?: string; page?: string; sort?: string; batch?: string; batchCancelled?: string; launch?: string }> }) {
+export default async function SavDashboardPage({ searchParams }: { searchParams: Promise<{ legacy?:string; view?: string; q?: string; page?: string; sort?: string; batch?: string; batchCancelled?: string; launch?: string }> }) {
   await requireStaff("admin");
+  if(isDatabaseConfigured() && (await searchParams).legacy!=="1" && await hasIntakeLaunch()) redirect("/studio/sav/intake");
   if (savReleaseStage() === "v0") return <SavV0Inbox searchParams={searchParams}/>;
   const configured = isDatabaseConfigured();
   const [{ view = "all", q = "", batch = "", batchCancelled = "", launch = "" }, dashboard, inbox, incidents, actionIncidents, pilotBatches, agentPerformance, improvementSignals, autonomyGate, hubspotBackfill] = await Promise.all([

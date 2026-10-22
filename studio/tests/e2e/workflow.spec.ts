@@ -83,6 +83,8 @@ test("une base publiée vide retourne immédiatement kb_empty", async ({ request
 });
 
 test("workflow complet, recherche Charly, rollback et archivage",async({page,request})=>{
+  // A fresh process compiles each page before this full publication/rollback journey.
+  test.setTimeout(60_000);
   await login(page);
   await createArticle(page);
   await expect(page.getByText("Brouillon",{exact:true}).first()).toBeVisible();
@@ -182,82 +184,95 @@ test("la V0 SAV expose la frontière, les vues et le laboratoire isolé", async 
 });
 
 test("une démonstration extension devient un parcours Charly éditable",async({page,request})=>{
-  await login(page);
-  await page.goto("/studio/entrainements");
-  await page.getByLabel("Nom du parcours").fill("Créer une campagne sociale E2E");
-  await page.getByLabel("Ce que Charly doit apprendre").fill("Guider le membre jusqu’à son premier brouillon de campagne.");
-  await page.getByLabel("Agent").selectOption("charly");
-  await page.getByLabel("Page de départ").fill("/super-powers");
-  await page.getByRole("button",{name:"Créer la démonstration"}).click();
+  // This serial journey covers capture, conversion, evaluation and publication.
+  // CI cold training routes alone take 16.5s; the former 30s global deadline
+  // expired during evaluation. Assertion timeouts remain unchanged.
+  test.setTimeout(60_000);
+  await test.step("Capturer et vérifier la démonstration extension",async()=>{
+    await login(page);
+    await page.goto("/studio/entrainements");
+    await page.getByLabel("Nom du parcours").fill("Créer une campagne sociale E2E");
+    await page.getByLabel("Ce que Charly doit apprendre").fill("Guider le membre jusqu’à son premier brouillon de campagne.");
+    await page.getByLabel("Agent").selectOption("charly");
+    await page.getByLabel("Page de départ").fill("/super-powers");
+    await page.getByRole("button",{name:"Créer la démonstration"}).click();
 
-  const token = (await page.locator(".training-code code").textContent())?.trim();
-  expect(token).toBeTruthy();
-  const connected = await request.post("/api/training/sessions/connect",{data:{token}});
-  expect(connected.ok()).toBe(true);
-  const headers = {Authorization:`Bearer ${token}`};
-  const trainingEvents = [
-    {
-      kind: "navigation", path: "/super-powers", label: "Super-pouvoirs",
-    },
-    {
-      kind: "click", path: "/super-powers", label: "Créer une campagne de posts pour réseaux sociaux",
-      payload: { gestureId: "gesture-e2e", controlName: "Créer une campagne de posts pour réseaux sociaux", controlType: "bouton", tag: "button", role: "button", elementId: "create-social-campaign", testId: "social-campaign", section: "Réseaux sociaux", zone: "main", occurrence: 1 },
-    },
-    {
-      kind: "page_context", path: "/campaigns/new", label: "Résultat après clic · Créer une campagne de posts pour réseaux sociaux",
-      payload: { phase: "after_click", gestureId: "gesture-e2e", context: '[main]\n  h1: "Nouvelle campagne"', networkSummary: "POST /api/campaigns status:200 120ms" },
-    },
-    {
-      kind: "input", path: "/campaigns/new", label: "Objectif de campagne", payload: { fieldType: "text" },
-    },
-    {
-      kind: "page_context", path: "/integrations", label: "Fenêtre d’autorisation externe ouverte", payload: { phase: "opened", contentAccessible: false },
-    },
-    {
-      kind: "voice_note", path: "/campaigns/new", label: "Demander au membre quel résultat il veut obtenir.",
-    },
-  ];
-  const eventResponses = [];
-  for (const event of trainingEvents) {
-    eventResponses.push(await request.post("/api/training/sessions/events", { headers, data: event }));
-  }
-  expect(eventResponses.every(response => response.ok())).toBe(true);
-  expect((await request.post("/api/training/sessions/complete",{headers})).ok()).toBe(true);
+    const token = (await page.locator(".training-code code").textContent())?.trim();
+    expect(token).toBeTruthy();
+    const connected = await request.post("/api/training/sessions/connect",{data:{token}});
+    expect(connected.ok()).toBe(true);
+    const headers = {Authorization:`Bearer ${token}`};
+    const trainingEvents = [
+      {
+        kind: "navigation", path: "/super-powers", label: "Super-pouvoirs",
+      },
+      {
+        kind: "click", path: "/super-powers", label: "Créer une campagne de posts pour réseaux sociaux",
+        payload: { gestureId: "gesture-e2e", controlName: "Créer une campagne de posts pour réseaux sociaux", controlType: "bouton", tag: "button", role: "button", elementId: "create-social-campaign", testId: "social-campaign", section: "Réseaux sociaux", zone: "main", occurrence: 1 },
+      },
+      {
+        kind: "page_context", path: "/campaigns/new", label: "Résultat après clic · Créer une campagne de posts pour réseaux sociaux",
+        payload: { phase: "after_click", gestureId: "gesture-e2e", context: '[main]\n  h1: "Nouvelle campagne"', networkSummary: "POST /api/campaigns status:200 120ms" },
+      },
+      {
+        kind: "input", path: "/campaigns/new", label: "Objectif de campagne", payload: { fieldType: "text" },
+      },
+      {
+        kind: "page_context", path: "/integrations", label: "Fenêtre d’autorisation externe ouverte", payload: { phase: "opened", contentAccessible: false },
+      },
+      {
+        kind: "voice_note", path: "/campaigns/new", label: "Demander au membre quel résultat il veut obtenir.",
+      },
+    ];
+    const eventResponses = [];
+    for (const event of trainingEvents) {
+      eventResponses.push(await request.post("/api/training/sessions/events", { headers, data: event }));
+    }
+    expect(eventResponses.every(response => response.ok())).toBe(true);
+    expect((await request.post("/api/training/sessions/complete",{headers})).ok()).toBe(true);
 
-  // The detail page stays open while the extension posts events. They must
-  // appear without a manual reload so the trainer can validate the flow live.
-  await expect(page.getByText("6 événements utiles")).toBeVisible();
-  await expect(page.getByRole("heading",{name:"Vidéo complète requise"})).toBeVisible();
-  await expect(page.getByText("Contexte de page").first()).toBeVisible();
-  const clickEvent = page.getByRole("listitem")
-    .filter({hasText:"Cible exacte : bouton"})
-    .filter({hasText:"Créer une campagne de posts pour réseaux sociaux"});
-  await expect(clickEvent).toHaveCount(1);
-  await expect(clickEvent).toContainText("Cible exacte : bouton");
-  await expect(clickEvent).toContainText("test-id social-campaign");
-  await expect(clickEvent).toContainText("#create-social-campaign");
-  await expect(page.getByText("Objectif de campagne")).toBeVisible();
-  const liveSnapshot = await page.request.get(`/api/studio/trainings/${page.url().match(/entrainements\/([0-9a-f-]+)/)?.[1]}`);
-  expect(liveSnapshot.ok()).toBe(true);
-  const livePayload = await liveSnapshot.json();
-  expect(JSON.stringify(livePayload)).not.toContain("[main]");
-  expect(JSON.stringify(livePayload)).not.toContain("POST /api/campaigns");
-  await page.getByRole("button",{name:"Transformer en parcours"}).click();
-  await page.waitForURL(/\/studio\/contenus\/[0-9a-f-]+$/);
-  await expect(page.getByRole("textbox",{name:"Titre",exact:true})).toHaveValue("Créer une campagne sociale E2E");
-  await expect(page.getByLabel("Agent concerné")).toHaveValue("charly");
-  await expect(page.locator('input[name="bodyMarkdown"]')).toHaveValue(/Fenêtre d’autorisation externe ouverte/);
-  await expect(page.locator('input[name="bodyMarkdown"]')).toHaveValue(/Cliquez sur « Créer une campagne de posts pour réseaux sociaux » \(bouton\)/);
-  await expect(page.locator('input[name="bodyMarkdown"]')).toHaveValue(/Repères techniques appris/);
-  await expect(page.locator('input[name="bodyMarkdown"]')).toHaveValue(/test-id=social-campaign/);
-  await expect(page.locator('input[name="bodyMarkdown"]')).toHaveValue(/POST \/api\/campaigns status:200/);
-  await expect(page.locator('input[name="actionSteps"]')).toHaveValue(/"testId":"social-campaign"/);
-  await passRealEvaluation(page, request);
-  await page.getByRole("button",{name:"Demander la validation"}).click();
-  await page.getByRole("button",{name:"Valider et publier"}).click();
-  await page.goto("/studio/entrainements");
-  const publishedTraining = page.locator(".training-row").filter({hasText:"Créer une campagne sociale E2E"}).first();
-  await expect(publishedTraining.getByText("Nouveau",{exact:true})).toHaveCount(0);
+    // The detail page stays open while the extension posts events. They must
+    // appear without a manual reload so the trainer can validate the flow live.
+    await expect(page.getByText("6 événements utiles")).toBeVisible();
+    await expect(page.getByRole("heading",{name:"Vidéo complète requise"})).toBeVisible();
+    await expect(page.getByText("Contexte de page").first()).toBeVisible();
+    const clickEvent = page.getByRole("listitem")
+      .filter({hasText:"Cible exacte : bouton"})
+      .filter({hasText:"Créer une campagne de posts pour réseaux sociaux"});
+    await expect(clickEvent).toHaveCount(1);
+    await expect(clickEvent).toContainText("Cible exacte : bouton");
+    await expect(clickEvent).toContainText("test-id social-campaign");
+    await expect(clickEvent).toContainText("#create-social-campaign");
+    await expect(page.getByText("Objectif de campagne")).toBeVisible();
+    const liveSnapshot = await page.request.get(`/api/studio/trainings/${page.url().match(/entrainements\/([0-9a-f-]+)/)?.[1]}`);
+    expect(liveSnapshot.ok()).toBe(true);
+    const livePayload = await liveSnapshot.json();
+    expect(JSON.stringify(livePayload)).not.toContain("[main]");
+    expect(JSON.stringify(livePayload)).not.toContain("POST /api/campaigns");
+  });
+  await test.step("Transformer et vérifier le parcours éditable",async()=>{
+    await page.getByRole("button",{name:"Transformer en parcours"}).click();
+    await page.waitForURL(/\/studio\/contenus\/[0-9a-f-]+$/);
+    await expect(page.getByRole("textbox",{name:"Titre",exact:true})).toHaveValue("Créer une campagne sociale E2E");
+    await expect(page.getByLabel("Agent concerné")).toHaveValue("charly");
+    await expect(page.locator('input[name="bodyMarkdown"]')).toHaveValue(/Fenêtre d’autorisation externe ouverte/);
+    await expect(page.locator('input[name="bodyMarkdown"]')).toHaveValue(/Cliquez sur « Créer une campagne de posts pour réseaux sociaux » \(bouton\)/);
+    await expect(page.locator('input[name="bodyMarkdown"]')).toHaveValue(/Repères techniques appris/);
+    await expect(page.locator('input[name="bodyMarkdown"]')).toHaveValue(/test-id=social-campaign/);
+    await expect(page.locator('input[name="bodyMarkdown"]')).toHaveValue(/POST \/api\/campaigns status:200/);
+    await expect(page.locator('input[name="actionSteps"]')).toHaveValue(/"testId":"social-campaign"/);
+  });
+  await test.step("Exécuter et vérifier le flow complet",async()=>{
+    await passRealEvaluation(page, request);
+  });
+  await test.step("Soumettre, publier et vérifier le parcours",async()=>{
+    await page.getByRole("button",{name:"Demander la validation"}).click();
+    await expect(page.getByRole("button",{name:"Valider et publier"})).toBeVisible();
+    await page.getByRole("button",{name:"Valider et publier"}).click();
+    await page.goto("/studio/entrainements");
+    const publishedTraining = page.locator(".training-row").filter({hasText:"Créer une campagne sociale E2E"}).first();
+    await expect(publishedTraining.getByText("Nouveau",{exact:true})).toHaveCount(0);
+  });
 });
 
 test("une démonstration peut être recommencée puis supprimée sans perdre l’essai précédent",async({page})=>{

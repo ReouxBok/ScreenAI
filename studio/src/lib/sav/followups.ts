@@ -1,6 +1,7 @@
 import "server-only";
+import {historicalThreadSql} from "./intake/launch-boundary";
 
-import { and, asc, eq, lte } from "drizzle-orm";
+import { and, asc, eq, lte, sql } from "drizzle-orm";
 import { requireDb } from "@/db";
 import { savActions, savFollowups, savThreads } from "@/db/schema";
 import { encryptSavPayload } from "./crypto";
@@ -15,7 +16,7 @@ export async function processDueFollowups(limit = 50, now = new Date()) {
   const db = requireDb();
   const due = await db.select({ followup: savFollowups, thread: savThreads }).from(savFollowups)
     .innerJoin(savThreads, eq(savThreads.id, savFollowups.threadId))
-    .where(and(eq(savFollowups.status, "scheduled"), lte(savFollowups.dueAt, now)))
+    .where(and(eq(savFollowups.status, "scheduled"), lte(savFollowups.dueAt, now), sql`not (${historicalThreadSql(savFollowups.threadId)})`))
     .orderBy(asc(savFollowups.dueAt)).limit(Math.min(100, Math.max(1, limit)));
   const results = [];
   for (const { followup, thread } of due) {
