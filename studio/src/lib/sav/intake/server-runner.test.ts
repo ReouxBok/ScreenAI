@@ -2,15 +2,24 @@ import { beforeEach, afterEach, it, expect, vi } from "vitest";
 import type { planSavIntake } from "./engine";
 import { evaluationBatch, evaluationEnvironment } from "../../../../test/sav-intake-evaluation";
 import { evaluationConfig, evaluationHash } from "./server-contract";
+import type { IntakeGeminiCall } from "./model-readers";
+import { savGeminiWireBody } from "../gemini-transport";
+import { SAV_INTAKE_MODEL_LIMITS } from "./model-limits";
 const s = vi.hoisted(() => ({ claim: vi.fn(), reserve: vi.fn(), settle: vi.fn(), save: vi.fn(), read: vi.fn(), engine: vi.fn(), realEngine: null as unknown,
-  saved: [] as { state: string; value: unknown }[] }));
+  rawInput: null as Parameters<IntakeGeminiCall>[0] | null, saved: [] as { state: string; value: unknown }[] }));
 vi.mock("./server-ledger", () => ({ claimServerEvaluation: s.claim, reserveServerEvaluationCall: s.reserve, settleServerEvaluationCall: s.settle, saveServerEvaluationResult: s.save, readServerEvaluation: s.read }));
 vi.mock("./engine", async original => { const m = await original<typeof import("./engine")>(); s.realEngine = m.planSavIntake; return { ...m, planSavIntake: s.engine }; });
+vi.mock("./model-readers", async original => {
+  const m = await original<typeof import("./model-readers")>();
+  return { ...m, createSavIntakeSemanticReaders: (options: Parameters<typeof m.createSavIntakeSemanticReaders>[0]) => s.rawInput
+    ? { analyseMessage: () => options.call(s.rawInput!) } : m.createSavIntakeSemanticReaders(options) };
+});
 import { runServerEvaluation, snapshotEvaluationReaders, evaluationProviderResponse } from "./server-runner";
 const analysis = (id: string) => ({ messageId: id, requests: [{ id: "request", kind: "support", currentMessageId: id, quote: "My product displays an error." }] });
 const provider = (value: unknown) => Response.json({ candidates: [{ finishReason: "STOP", content: { parts: [{ text: JSON.stringify(value) }] } }], usageMetadata: { promptTokenCount: 100, candidatesTokenCount: 50, thoughtsTokenCount: 0, totalTokenCount: 150 } });
 let network: ReturnType<typeof vi.fn<typeof fetch>>;
 beforeEach(() => {
+  s.rawInput = null;
   s.claim.mockReset().mockResolvedValue({ id: "synthetic-run", claimed: true }); s.reserve.mockReset().mockResolvedValue("synthetic-reservation"); s.settle.mockReset().mockResolvedValue(true);
   s.saved = []; s.save.mockReset().mockImplementation(async (_id, value, state) => { s.saved.push({ state, value: structuredClone(value) }); });
   s.read.mockReset().mockImplementation(async () => s.saved.at(-1) ?? { state: "running" });
@@ -18,6 +27,31 @@ beforeEach(() => {
   network = vi.fn<typeof fetch>(async (_url, init) => { const body = JSON.parse(String(init?.body)); const data = JSON.parse(body.contents[0].parts[0].text); return provider(analysis(data.message.id)); });
 });
 afterEach(() => vi.restoreAllMocks());
+it.each([-1, 0, 1])("keeps the evaluation wire boundary at 128 KiB %+d before reservation or network", async delta => {
+  const input: Parameters<IntakeGeminiCall>[0] = { model: "gemini-3.6-flash", phase: "ticket_matching", promptRevision: "fixture",
+    signal: new AbortController().signal, allowRetry: false,
+    body: { systemInstruction: { parts: [{ text: "Lire tout." }] }, contents: [{ role: "user", parts: [{ text: 'é😀 "citation" \\ chemin\n' }] }],
+      generationConfig: { maxOutputTokens: 8192 } } };
+  input.body.contents[0].parts[0].text += "x".repeat(SAV_INTAKE_MODEL_LIMITS.wireTextBytes + delta - savGeminiWireBody(input).textBytes);
+  expect(savGeminiWireBody(input).textBytes).toBe(SAV_INTAKE_MODEL_LIMITS.wireTextBytes + delta);
+  s.rawInput = input;
+  s.engine.mockImplementation(async (caseInput, adapters) => {
+    await adapters.analyseMessage({ message: caseInput.message, conversation: [] }, new AbortController().signal);
+    return { effects: "not_connected", steps: [] };
+  });
+  network.mockImplementation(async (_url, init) => {
+    expect(init?.body).toBe(savGeminiWireBody(input).body); return provider({ fixture: true });
+  });
+  const batch = evaluationBatch(), env = evaluationEnvironment(batch);
+  await runServerEvaluation(batch, evaluationConfig(env), "ugo@limova.ai", new AbortController().signal, { env: () => env, network });
+  if (delta <= 0) {
+    expect(network).toHaveBeenCalledTimes(3); expect(s.reserve).toHaveBeenCalledTimes(3);
+    expect(s.saved.at(-1)?.state).toBe("complete");
+  } else {
+    expect(network).not.toHaveBeenCalled(); expect(s.reserve).not.toHaveBeenCalled(); expect(s.settle).not.toHaveBeenCalled();
+    expect(s.saved.at(-1)?.value).toMatchObject({ stopReason: "SAV_EVAL_REQUEST_REJECTED" });
+  }
+});
 it("runs exactly three synthetic cases through the actual engine/model readers, with no CRM network", async () => {
   const batch = evaluationBatch(), env = evaluationEnvironment(batch);
   await runServerEvaluation(batch, evaluationConfig(env), "ugo@limova.ai", new AbortController().signal, { env: () => env, network });

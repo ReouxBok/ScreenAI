@@ -6,6 +6,7 @@ import { requestSavGeminiJson, savAiErrorMetadata, savGeminiWireBody } from "../
 import { evaluationProviderResponse } from "./server-runner";
 import { intakeRuntimeHash, type IntakeRuntimeConfig } from "./runtime-contract";
 import { settleSavIntakeCall, type reserveSavIntakeCall } from "./runtime-store";
+import { SAV_INTAKE_MODEL_LIMITS } from "./model-limits";
 
 /** Fixed model endpoint and exact-body reservation, shared by automatic work
  * and authenticated human continuations. No CRM/Gmail write capability. */
@@ -21,7 +22,7 @@ export function createIntakeModelDispatcher(options: { config: IntakeRuntimeConf
       const key = env().SAV_GEMINI_API_KEY!;
       const wire = savGeminiWireBody(input);
       const expectedBody = wire.body;
-      if (wire.textBytes > 65_536 || input.body.generationConfig.maxOutputTokens !== 8192) throw Error("SAV_INTAKE_RUNTIME_REQUEST_REJECTED");
+      if (wire.textBytes > SAV_INTAKE_MODEL_LIMITS.wireTextBytes || input.body.generationConfig.maxOutputTokens !== 8192) throw Error("SAV_INTAKE_RUNTIME_REQUEST_REJECTED");
       let sent = false;
       const reserved = await options.reserve(intakeRuntimeHash(expectedBody));
       if (reserved.cached) return reserved.cached;

@@ -135,6 +135,19 @@ it("monetary exhaustion is explicit technical waiting and never uses other ledge
   expect(response.state).toBe("waiting"); expect(network).not.toHaveBeenCalled();
   expect((await readSavIntakeCurrent(threadId, constrained))?.payload.reason).toBe("SAV_INTAKE_RUNTIME_BUDGET_EXHAUSTED"); expect(await f.db.select().from(auditLogs)).toHaveLength(0);
 });
+it("persists catalogue failures as a technical reason before any model reservation or network", async () => {
+  const m = await message({ receivedAt: new Date(Date.now() + 1), body: "private".repeat(300) });
+  const id = await enqueueSavIntakeMessage(m.id, config);
+  const network = vi.fn(async () => { throw Error("NETWORK_FORBIDDEN"); });
+  expect((await analyseSavIntakeRuntime(id!, config, { env: () => environment, network })).state).toBe("waiting");
+  expect(network).not.toHaveBeenCalled(); expect((await readSavIntakeBudget(config)).callCount).toBe(0);
+  const current = await readSavIntakeCurrent(threadId, config);
+  expect(current?.payload.reason).toBe("SAV_INTAKE_MODEL_CONTEXT_LIMIT");
+  expect(current?.payload.traces).toEqual(expect.arrayContaining([expect.objectContaining({ accepted: false,
+    errorCode: "SAV_INTAKE_MODEL_CONTEXT_LIMIT", contextLimit: expect.objectContaining({ stage: "catalogue" }) })]));
+  expect(JSON.stringify(current?.payload.traces)).not.toContain("private");
+  expect(await f.db.select().from(savActions)).toHaveLength(0);
+});
 it("connects the real stored mail to semantic readers/CRM and keeps effect steps undispatched", async () => {
   const id = await enqueueSavIntakeMessage(messageId, config);
   const network = vi.fn(async (url: Parameters<typeof fetch>[0], init?: RequestInit) => {
@@ -185,7 +198,7 @@ it("rejects corrupt budget history rather than silently refunding it", async () 
   await f.db.update(savIntakeModelCalls).set({ chargedNanoUsd: 0 }).where(eq(savIntakeModelCalls.id, r.id));
   await expect(readSavIntakeBudget(config)).rejects.toThrow("LEDGER_REJECTED");
 });
-it.each(["create", "link", "reopen"])("persists a grounded %s plan from stored mail with no writer", async operation => {
+it.each(["create", "link", "reopen", "incomplete_evidence"])("persists the %s outcome from stored mail with no writer", async operation => {
   const id = await enqueueSavIntakeMessage(messageId, config);
   const edge = (id: string) => ({ toObjectId: id, associationTypes: [{ typeId: 1, category: "HUBSPOT_DEFINED" }] });
   const network = vi.fn(async (url: Parameters<typeof fetch>[0], init?: RequestInit) => {
@@ -194,7 +207,7 @@ it.each(["create", "link", "reopen"])("persists a grounded %s plan from stored m
       const body = JSON.parse(String(init?.body)), data = JSON.parse(body.contents[0].parts[0].text), catalogue = data.citationCatalogue as {id:string;sourceId:string}[];
       const answer = !data.tickets ? { messageId, requests: [{ id: "r1", kind: "support", currentMessageId: messageId, quoteId: catalogue.find(x => x.sourceId === "current")!.id }],
         ticketSummary: { title: "Connexion fictive en panne", description: "La connexion fictive ne marche plus.", requestIds: ["r1"] } }
-        : { investigationComplete: true, tickets: [{ ticketId: "201", relation: "same", requestIds: ["r1"], evidenceIds: ["current", "ticket-201", "history-201"],
+        : { investigationComplete: true, tickets: [{ ticketId: "201", relation: "same", requestIds: ["r1"], evidenceIds: operation === "incomplete_evidence" ? ["current"] : ["current", "ticket-201", "history-201"],
           rationale: "Même panne fictive", grounding: ["current", "ticket-201", "history-201"].map(sourceId => ({ quoteId: catalogue.find(x => x.sourceId === sourceId)!.id })) }] };
       return Response.json({ candidates: [{ finishReason: "STOP", content: { parts: [{ text: JSON.stringify(answer) }] } }], usageMetadata: { promptTokenCount: 100, candidatesTokenCount: 50, thoughtsTokenCount: 0, totalTokenCount: 150 } });
     }
@@ -208,8 +221,20 @@ it.each(["create", "link", "reopen"])("persists a grounded %s plan from stored m
     return Response.json({ results: [] });
   });
   const result = await analyseSavIntakeRuntime(id!, config, { env: () => environment, network });
-  const current = await readSavIntakeCurrent(threadId, config); expect({result, payload:current?.payload}).toMatchObject({ result: { state: "observed" }});
-  expect(current?.payload.plan?.decision.disposition).toMatchObject({ kind: "ticket", target: { operation } });
+  const current = await readSavIntakeCurrent(threadId, config);
+  if (operation === "incomplete_evidence") {
+    expect(result).toMatchObject({ state: "waiting" });
+    expect(current?.payload.reason).toBe("SAV_INTAKE_SEMANTIC_COVERAGE_REJECTED");
+    expect(current?.payload.traces).toEqual(expect.arrayContaining([
+      expect.objectContaining({ phase: "ticket_matching", accepted: true }),
+      expect.objectContaining({ phase: "accepted_semantics", method: "assessIssues", accepted: false, errorCode: "SAV_INTAKE_SEMANTIC_COVERAGE_REJECTED" }),
+    ]));
+    expect(current?.payload.semantics?.records.map(r => r.method)).toEqual(["analyseMessage"]);
+    expect(current?.payload.plan?.decision.disposition.kind).toBe("collect_context");
+  } else {
+    expect({result, payload:current?.payload}).toMatchObject({ result: { state: "observed" }});
+    expect(current?.payload.plan?.decision.disposition).toMatchObject({ kind: "ticket", target: { operation } });
+  }
   expect(current?.payload.plan?.effects).toBe("not_connected"); expect(current?.payload.plan?.steps.every(step => step.status === "not_dispatched")).toBe(true);
   expect((await readSavIntakeBudget(config)).callCount).toBe(operation === "create" ? 1 : 2);
   expect(await f.db.select().from(savActions)).toHaveLength(0); expect(await f.db.select().from(savDecisions)).toHaveLength(0);

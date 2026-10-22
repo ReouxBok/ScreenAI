@@ -33,6 +33,7 @@ async function analyseSavIntakeRuntimeWithinBudget(runId: string, config: Intake
   const lease = await claimSavIntakeRun(runId, config); if (!lease) return { skipped: "not_claimed" };
   const controller = new AbortController(), timer = setTimeout(() => controller.abort(), 45_000);
   const traces: unknown[] = [];
+  let semanticFailureReason: string | undefined;
   let dispatcher: ReturnType<typeof createIntakeModelDispatcher> | undefined;
   const payload: IntakeRuntimePayload = {configuration: { configHash: config.configHash, resourcesHash: config.resourcesHash, policyHash: config.policyHash, codeRevision: config.codeRevision, model: config.model }, semantics:{revision:SAV_INTAKE_SEMANTIC_RECORD_REVISION,validatorRevision:SAV_INTAKE_MODEL_REVISION,records:[]},provenance:[...lease.provenance], revision: SAV_INTAKE_RUNTIME_REVISION, input: lease.input, traces, effects: "not_connected" };
   const live = async () => {
@@ -73,8 +74,14 @@ async function analyseSavIntakeRuntimeWithinBudget(runId: string, config: Intake
       attachments.state.read = { ...attachments.state.read, observations, state: "complete", completedAt: new Date().toISOString() };
       payload.attachments = attachments.state;
       checkpoint();
-    } } } : {}), model: config.model, call, provenance: lease.provenance, onTrace: trace => { traces.push(trace); checkpoint(); } });
-    const semantic=recordAcceptedIntakeSemantics(semanticReader,payload.semantics!,checkpoint);
+    } } } : {}), model: config.model, call, provenance: lease.provenance, onTrace: trace => {
+      semanticFailureReason = trace.errorCode ?? undefined;
+      traces.push(trace); checkpoint();
+    } });
+    const semantic=recordAcceptedIntakeSemantics(semanticReader,payload.semantics!,checkpoint, failure => {
+      semanticFailureReason = failure.errorCode;
+      traces.push({ ...failure, phase: "accepted_semantics", accepted: false }); checkpoint();
+    });
     const crm = createSavIntakeHubspotReaders({ onRead: trace => { traces.push(trace); checkpoint(); }, network: async (url, init) => {
       await live();
       const signal = AbortSignal.any([controller.signal, ...(init?.signal ? [init.signal] : [])]);
@@ -89,7 +96,7 @@ async function analyseSavIntakeRuntimeWithinBudget(runId: string, config: Intake
     await checkpoints;
     if (dispatcher.uncertain) throw Error("SAV_INTAKE_RUNTIME_USAGE_UNCERTAIN");
     await live();
-    payload.reason = dispatcher.failureReason;
+    payload.reason = dispatcher.failureReason ?? semanticFailureReason;
     finishIntakeAttachmentRead(payload.attachments,attachmentFailureReason(payload.reason,dispatcher.uncertain));
     await saveSavIntakeResult(lease, config, payload, payload.plan.decision.disposition.kind === "collect_context" ? "waiting" : "observed");
     return { runId, state: payload.plan.decision.disposition.kind === "collect_context" ? "waiting" : "observed" };
