@@ -26,6 +26,10 @@
     {
       "path": "/api/cron/sav-reconcile",
       "schedule": "*/5 * * * *"
+    },
+    {
+      "path": "/api/cron/sav-monitor",
+      "schedule": "2-59/5 * * * *"
     }
   ]
 }
