@@ -8,6 +8,7 @@ import { intakeRuntimeHash } from "@/lib/sav/intake/runtime-contract";
 import { formatParisDateTime } from "@/lib/paris-date";
 import { MailConversation } from "../../[id]/mail-conversation";
 import { IntakeChoiceForm } from "../choice-form";
+import {IntakeRecoveryForm} from "../recovery-form";
 import { intakeStatusLabel, intakeReasonLabel, intakeContextReasonLabels } from "@/lib/sav/intake/console-presentation";
 import styles from "../intake.module.css";
 export const dynamic = "force-dynamic";
@@ -16,7 +17,7 @@ const effectLabels: Record<string, string> = { ticket_create: "Création du tick
 const stateLabels: Record<string, string> = { planned: "Prévu, sans départ", dispatched: "Départ enregistré, résultat à vérifier", acked: "Réponse fournisseur reçue, vérification en attente",
   confirmed: "Résultat vérifié", uncertain: "Résultat incertain, rapprochement requis" };
 export default async function IntakeDetailPage({ params }: { params: Promise<{ id: string }> }) {
-  await requireIntakeConsoleStaff();
+  const staff=await requireIntakeConsoleStaff();
   const { id } = await params;
   if (!z.uuid().safeParse(id).success) notFound();
   const data = await readIntakeConsoleDetail(id);
@@ -74,6 +75,7 @@ export default async function IntakeDetailPage({ params }: { params: Promise<{ i
         <strong>{event.kind === "refuse" ? "Refus humain" : "Choix conditionnel"} · version {event.parentVersion}</strong><p>{event.reason}</p>
         <small>{event.actor} · {formatParisDateTime(event.at)} · {event.state === "consumed" ? "choix consommé" : event.state === "refused" ? "refus conservé" : event.state === "waiting" ? "preuves à compléter" : "vérification en attente"}</small></li>)}</ol> : <p>Aucun choix humain enregistré.</p>}</section>
       <details className={styles.history}><summary>Diagnostic technique</summary><p>{data.current?.payload.reason ?? data.progress?.reason ?? (blocked ? "Tentatives épuisées — consulter les versions précédentes." : "Aucun motif technique enregistré sur la version actuelle.")}</p>
+        {["admin","owner"].includes(staff?.role??"")&&data.latestMessageId&&<IntakeRecoveryForm threadId={id} messageId={data.latestMessageId}/>}
         <p>{data.diagnostics?.totalAttempts ?? 0} tentative(s) cumulée(s) pour le dernier message. Les versions remplacées ne sont pas des décisions applicables.</p>
         {data.diagnostics?.runs.map(run => <details key={run.runId}><summary>Version {run.version} · {intakeStatusLabel(run.state)} · {run.attempts} tentative(s)</summary>
           <p>{run.diagnostic.readable ? run.diagnostic.reason ? intakeReasonLabel(run.diagnostic.reason) : "Aucun code technique enregistré dans cette version." : "Diagnostic historique illisible ou hors limite ; cause non évaluable."}</p>

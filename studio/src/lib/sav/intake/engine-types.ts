@@ -38,6 +38,7 @@ export const messageAnalysisSchema = z.object({
     id: ref, kind: z.enum(["support", "finance", "cancellation", "partnership", "commercial", "investor", "other", "acknowledgement", "unknown"]),
     // All intentions must be supported by the CURRENT authored message.
     currentMessageId: z.uuid(),
+    originMessageId: z.uuid().optional(),
   }).strict()).max(15),
   attachmentObservations: z.array(savAttachmentObservationSchema).max(3).optional(),
   registration: z.object({ address: z.email(), sourceMessageId: z.uuid(), quote: z.string().min(1).max(2000) }).strict().optional(),
@@ -72,7 +73,7 @@ export type EnginePolicy = {
   manualSupportOverride?: PrivateResource;
 };
 export type IntakeAdapters = {
-  analyseMessage(input: { message: IntakeMessage; conversation: readonly IntakeMessage[] }, signal: AbortSignal): Promise<MessageAnalysis>;
+  analyseMessage(input: { message: IntakeMessage; conversation: readonly IntakeMessage[]; identificationContinuation?: EngineInput["identificationContinuation"] }, signal: AbortSignal): Promise<MessageAnalysis>;
   findContactsByEmail(email: string, signal: AbortSignal): Promise<ReadResult<IntakeContact[]>>;
   directAssociations(contactId: string, signal: AbortSignal): Promise<ReadResult<IntakeAssociation[]>>;
   getContact(contactId: string, signal: AbortSignal): Promise<ReadResult<IntakeContact>>;
@@ -80,21 +81,23 @@ export type IntakeAdapters = {
   ticketHistory(ticketId: string, signal: AbortSignal): Promise<ReadResult<IntakeHistory>>;
   assessIdentity?(input: { message: IntakeMessage; address: string;
     candidates: readonly { contact: IntakeContact; tickets: { ticket: IntakeTicket; history: IntakeHistory }[] }[];
-    evidence: readonly IntakeEvidence[] }, signal: AbortSignal): Promise<IdentityAssessment>;
+    evidence: readonly IntakeEvidence[]; requestContext?: IntakeMessage }, signal: AbortSignal): Promise<IdentityAssessment>;
   assessIssues(input: {
     message: IntakeMessage; requests: MessageAnalysis["requests"];
-    tickets: readonly { ticket: IntakeTicket; history: IntakeHistory }[]; evidence: readonly IntakeEvidence[];
+    tickets: readonly { ticket: IntakeTicket; history: IntakeHistory }[]; evidence: readonly IntakeEvidence[]; requestContext?: IntakeMessage;
   }, signal: AbortSignal): Promise<IssueAssessment>;
 };
 export type EngineInput = {
   message: IntakeMessage; latestInboundMessageId: string; conversation: ReadResult<IntakeMessage[]>;
   now: string; mode: "at_receipt" | "current"; identificationAttemptId: string;
   humanResolution?: {
+    suppressOutbound?: true;
     choiceId: string; at: string; contactId?: string; equivalentContactIds?: string[];
     inheritedChoiceIds?:string[]; fieldSources?:Partial<Record<"contactId"|"ticketId"|"classification",string>>;
     ticketId?: string; classification?: MessageAnalysis["requests"][number]["kind"];
   };
   previousIdentification?: { messageId: string; address: string; state: "dispatched" | "uncertain" | "confirmed" };
+  identificationContinuation?: { initialMessageId: string; confirmedEffectId: string };
 };
 export type IntakePlanStep = {
   id: string; mutation: SavIntakeMutation; ticketId: string | null;

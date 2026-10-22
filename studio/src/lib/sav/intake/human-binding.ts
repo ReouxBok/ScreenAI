@@ -12,6 +12,7 @@ export type HumanEventPayload = {
   candidateContactIds: string[]; contactId?: string; ticketId?: string;
   classification?: import("./engine-types").MessageAnalysis["requests"][number]["kind"];
   reason: string; parentPayloadHash: string;
+  reinvestigate?: true;
 };
 export const humanRevisionConfigHash = (baseConfigHash: string, choiceId: string) =>
   intakeRuntimeHash({ revision: "sav-intake-human-binding.v1", baseConfigHash, choiceId });

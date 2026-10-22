@@ -141,17 +141,20 @@ export function createSavIntakeSemanticReaders(options: {
     }
   }
   return {
-    analyseMessage: async ({ message, conversation }, signal) => {
+    analyseMessage: async ({ message, conversation, identificationContinuation }, signal) => {
       const sources = new Map([["current", message.currentText], ...conversation.map(m => [`message-${m.id}`, m.currentText] as [string, string])]);
       const catalogue = catalogueFor("understanding", sources);
       const data = { message: messageMetadata(message, "current"), conversation: conversation.map(m => messageMetadata(m, `message-${m.id}`)),
-        provenance: [message, ...conversation].map(m => options.provenance?.get(m.id)).filter(Boolean), citationCatalogue: catalogue.entries };
+        provenance: [message, ...conversation].map(m => options.provenance?.get(m.id)).filter(Boolean), citationCatalogue: catalogue.entries,
+        ...(identificationContinuation ? { identificationContinuation, continuationInstructions: "The server verified that an identification template was sent for initialMessageId in this same thread to this sender. If the CURRENT inbound provides the requested registration email, preserve the original unresolved requests as explicit continuations: set originMessageId to initialMessageId and cite message-initialMessageId, never pretend the request was written in current. Extract the registration declaration from current separately. Preserve new current requests, especially finance/cancellation. Supply a summary of the original problem and the new information. Acknowledgement without a declaration is not permission to inherit requests." } : {}) };
       const registration = messageAnalysisSchema.shape.registration.unwrap().omit({ quote: true }).extend({
         sourceMessageId: referenceIds([message, ...conversation].filter(m => m.direction === "inbound" && m.fromEmail.toLowerCase() === message.fromEmail.toLowerCase()).map(m => m.id)),
         quoteId: catalogue.quoteIds(),
       });
       const baseWireSchema = analysisSchema.omit({ attachmentObservations: true }).extend({ messageId: referenceIds([message.id]),
-        requests: z.array(analysisSchema.shape.requests.element.omit({ quote: true }).extend({ currentMessageId: referenceIds([message.id]), quoteId: catalogue.quoteIds("current") })).max(15),
+        requests: z.array(analysisSchema.shape.requests.element.omit({ quote: true, originMessageId: true }).extend({ currentMessageId: referenceIds([message.id]),
+          ...(identificationContinuation ? { originMessageId: referenceIds([identificationContinuation.initialMessageId]).optional() } : {}),
+          quoteId: identificationContinuation ? catalogue.quoteIds() : catalogue.quoteIds("current") })).max(15),
         registration: registration.optional() });
       if(options.humanClassification) Object.assign(data,{operatorCorrection:options.humanClassification,operatorInstructions:"An authenticated operator returned this message from Other. Re-read ALL actual requests and supply a factual ticketSummary covering them. Do not invent a customer request; no customer/account actions are authorized by this classification."});
       const visual = options.attachments;
@@ -162,7 +165,11 @@ export function createSavIntakeSemanticReaders(options: {
         if (value.messageId !== message.id) rejectIntakeEvidence("message_id_mismatch", "messageId");
         for (const [index, request] of value.requests.entries()) {
           if (request.currentMessageId !== message.id) rejectIntakeEvidence("message_id_mismatch", `requests.${index}.currentMessageId`);
-          if (!savEvidenceContains(message.currentText, request.quote)) rejectIntakeEvidence("excerpt_not_in_source", `requests.${index}.quote`, request.quote);
+          const origin = request.originMessageId ? conversation.find(m => m.id === request.originMessageId) : message;
+          if (request.originMessageId && (request.originMessageId !== identificationContinuation?.initialMessageId || !value.registration
+            || value.registration.sourceMessageId !== message.id)) rejectIntakeEvidence("wrong_anchor_source", `requests.${index}.originMessageId`);
+          if (!origin || origin.direction !== "inbound" || !origin.contentComplete || origin.fromEmail.toLowerCase() !== message.fromEmail.toLowerCase()
+            || !savEvidenceContains(origin.currentText, request.quote)) rejectIntakeEvidence("excerpt_not_in_source", `requests.${index}.quote`, request.quote);
         }
         if (value.registration) {
           const source = [message, ...conversation].find(m => m.id === value.registration!.sourceMessageId);
@@ -172,17 +179,18 @@ export function createSavIntakeSemanticReaders(options: {
       }, { schema: wireSchema, decode: raw => {
         if (!raw || typeof raw !== "object" || Array.isArray(raw)) return raw;
         if (Object.hasOwn(raw, "attachmentObservations")) rejectIntakeEvidence("unknown_source", "attachmentObservations");
-        if (!visual) return catalogue.decodeAnalysis(raw, message.id);
+        if (!visual) return catalogue.decodeAnalysis(raw, message.id, identificationContinuation?.initialMessageId);
         const { images, ...analysis } = raw as Record<string, unknown>;
         visualObservations = applySavAttachmentVisualResult(visual.prepared, { images });
         visual.onRead(visualObservations);
-        return { ...catalogue.decodeAnalysis(analysis, message.id) as object, attachmentObservations: visualObservations };
+        return { ...catalogue.decodeAnalysis(analysis, message.id, identificationContinuation?.initialMessageId) as object, attachmentObservations: visualObservations };
       } }, visual?.prepared.uniqueImages);
       return messageAnalysisSchema.parse({ ...result, requests: result.requests.map(({ quote: excerpt, ...request }) => { void excerpt; return request; }) });
     },
     assessIssues: async (input, signal) => {
       if (!input.tickets.length) return { investigationComplete: true, tickets: [] };
       const sources = new Map<string, string>([["current", input.message.currentText]]);
+      if (input.requestContext) sources.set("initial-request", input.requestContext.currentText);
       for (const observation of visualObservations) if (observation.fileHash && ["analyzed", "partial"].includes(observation.status))
         sources.set(observation.sourceId, `[Derived image observation; not customer words or identity proof] ${observation.text}\n${observation.regions.map(r => r.text).join("\n")}\nUncertainties: ${observation.uncertainties.join("; ")}`);
       for (const row of input.tickets) { sources.set(`ticket-${row.ticket.id}`, `${row.ticket.subject}\n${row.ticket.content}`); sources.set(`history-${row.ticket.id}`, historyText(row.history)); }
@@ -193,19 +201,21 @@ export function createSavIntakeSemanticReaders(options: {
         grounding: z.array(z.object({ quoteId: catalogue.quoteIds() }).strict()).min(1).max(51),
       })).max(20) });
       const data = { message: messageMetadata(input.message, "current"), requests: input.requests,
+        ...(input.requestContext ? { requestContext: messageMetadata(input.requestContext, "initial-request"), continuationInstructions: "The initial-request is an explicitly verified continuation. Read and cite it as well as current, without attributing its words to current. Include initial-request in evidenceIds for each ticket assessment." } : {}),
         tickets: input.tickets.map(t => ({ ticket: ticketMetadata(t.ticket), historyEntries: t.history.length })), evidence: input.evidence, citationCatalogue: catalogue.entries };
       const result = await generate("ticket_matching", "Assess EVERY ticket against ALL current requests, reading its notes/exchanges. same means this single ticket covers every request; partial/unknown must remain explicit. A shared name, generic topic or keyword is insufficient. Cite current, ticket and nonempty history with exact excerpts for same/different. For each ticket, evidenceIds must include current, ticket-<ticketId>, history-<ticketId> from the supplied evidence list (including the aggregate history proof when history is empty). For same/different, grounding must select quoteIds from current, that ticket, and its history when nonempty. Never substitute individual note/email IDs or quoteIds for these aggregate evidenceIds. Do not select or create a destination here.", data, issueSchema, signal, value => {
         if (value.tickets.length !== input.tickets.length || new Set(value.tickets.map(t => t.ticketId)).size !== input.tickets.length) throw Error("SAV_INTAKE_MODEL_COVERAGE_REJECTED");
         for (const verdict of value.tickets) {
           const row = input.tickets.find(t => t.ticket.id === verdict.ticketId); if (!row) throw Error("SAV_INTAKE_MODEL_COVERAGE_REJECTED");
           checkGrounding(verdict.grounding, sources, verdict.relation === "same" || verdict.relation === "different"
-            ? ["current", `ticket-${verdict.ticketId}`, ...(row.history.length ? [`history-${verdict.ticketId}`] : [])] : ["current"]);
+            ? ["current", ...(input.requestContext ? ["initial-request"] : []), `ticket-${verdict.ticketId}`, ...(row.history.length ? [`history-${verdict.ticketId}`] : [])] : ["current"]);
         }
       }, { schema: wireSchema, decode: catalogue.decodeIssues });
       return issueAssessmentSchema.parse({ ...result, tickets: result.tickets.map(({ grounding: cited, rationale, ...ticket }) => { void cited; void rationale; return ticket; }) });
     },
     assessIdentity: async (input, signal) => {
       const sources = new Map<string, string>([["current", input.message.currentText]]);
+      if (input.requestContext) sources.set("initial-request", input.requestContext.currentText);
       for (const row of input.candidates) {
         sources.set(`contact-${row.contact.id}`, JSON.stringify(row.contact));
         for (const item of row.tickets) { sources.set(`identity-ticket-${item.ticket.id}`, `${item.ticket.subject}\n${item.ticket.content}`); sources.set(`identity-history-${item.ticket.id}`, historyText(item.history)); }

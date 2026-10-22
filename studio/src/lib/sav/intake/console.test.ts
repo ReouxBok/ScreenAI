@@ -23,7 +23,7 @@ import { admitIntakeExecution, claimExecution, ensureExecutionEffect, markEffect
 import { executeIntakePass, readIntakeExecutionProgress, reconcileIntakeEffectsReadOnly } from "./executor";
 import { recordIntakeHumanCommand, type IntakeHumanCommand } from "./human-commands";
 import { consumeIntakeHumanEvent } from "./human-worker";
-import { intakeRunConfigurationBound, intakeRunCandidateContactIds, humanRevisionConfigHash } from "./human-binding";
+import { intakeRunConfigurationBound, intakeRunCandidateContactIds, humanRevisionConfigHash, type HumanEventPayload } from "./human-binding";
 import { listIntakeConsole, projectIntakeThread, refreshIntakeConsole } from "./console-store";
 import { readIntakeConsoleDetail } from "./console-detail";
 import { ensureIntakeObservations, readIntakeObservationBinding, readIntakeLearningQualification, attributeIntakeObservationEvents } from "./observation-binding";
@@ -47,6 +47,7 @@ import { POST as adminPost } from "@/app/api/sav/intake-admin/route";
 import { getSavThreadDetail, processStoredSavMessage, processPendingSavMessages } from "../service";
 import { enqueueConfiguredSavIntake, reconcileSavIntakeRuntime } from "./runtime";
 import { saveIntakeChoice } from "@/app/studio/sav/intake/actions";
+import {requestIntakeReinvestigation} from "./operator-recovery";
 import type { ExecutionOptions } from "./execution-types";
 let db: Awaited<ReturnType<typeof createSavTestDb>>, p: ReturnType<typeof executionProvider>, mailboxId: string, threadId: string, messageId: string,
   options: ExecutionOptions, environment: Record<string, string | undefined>, runId: string;
@@ -708,4 +709,33 @@ it("excludes more than a batch of historical console rows before LIMIT and admit
   expect(reopened.messageId).toBe(newInOld.id);expect(reopened.projectedEpoch).toBe(reopened.epoch);
   expect((await listIntakeConsole({view:"completed"})).total).toBe(25);
   expect(fetch).not.toHaveBeenCalled();expect(mutationsSent()).toHaveLength(0);
+});
+
+it("administrator recovery preserves automatic attempts and is once per current message without external writes",async()=>{
+ await observed();for(const [key,value]of Object.entries(environment))if(value!==undefined)vi.stubEnv(key,value);
+ await db.db.update(savIntakeRuns).set({attempts:2,state:"waiting"}).where(eq(savIntakeRuns.id,runId));
+ const before=(await db.db.select().from(savIntakeRuns).where(eq(savIntakeRuns.id,runId)))[0];
+ const request={threadId,messageId,reason:"Synthetic explicit re-investigation after a verified software correction."};
+ const result=await requestIntakeReinvestigation(request);
+ expect(result.eventId).toBeTruthy();expect(mutationsSent()).toHaveLength(0);
+ const old=(await db.db.select().from(savIntakeRuns).where(eq(savIntakeRuns.id,runId)))[0];
+ expect(old.attempts).toBe(2);expect(old.payloadCiphertext).toBe(before.payloadCiphertext);expect(old.isCurrent).toBe(false);
+ const current=(await readSavIntakeCurrent(threadId,options.runtime))!;
+ expect(current.id).toBe(result.runId);expect(current.attempts).toBe(0);
+ expect(current.payload.plan?.decision.disposition.kind).toBe("collect_context");
+ expect(current.payload.semantics).toBeUndefined();
+ const [event]=await db.db.select().from(savIntakeHumanEvents).where(eq(savIntakeHumanEvents.id,result.eventId));
+ expect(decryptSavPayload<HumanEventPayload>(event.payloadCiphertext)).toMatchObject({reinvestigate:true});
+ expect((await db.db.select().from(savIntakeModelCalls))).toHaveLength(0);
+ await expect(requestIntakeReinvestigation(request)).rejects.toThrow("RECOVERY_CONFLICT");
+});
+it.each(["paused","newer","refused","nonadmin","historical"])("administrator recovery refuses %s without resetting anything",async kind=>{
+ await observed();for(const [key,value]of Object.entries(environment))if(value!==undefined)vi.stubEnv(key,value);
+ if(kind==="paused")await db.db.update(savThreads).set({aiPaused:true}).where(eq(savThreads.id,threadId));
+ if(kind==="newer")await message();
+ if(kind==="refused")await recordIntakeHumanCommand(await command("refuse"));
+ if(kind==="nonadmin")await db.db.update(staffUsers).set({role:"member"});
+ if(kind==="historical")await db.db.update(savMessages).set({receivedAt:new Date(0)}).where(eq(savMessages.id,messageId));
+ await expect(requestIntakeReinvestigation({threadId,messageId,reason:"Synthetic bounded operator recovery request."})).rejects.toThrow();
+ expect((await db.db.select().from(savIntakeRuns))).toHaveLength(1);expect(mutationsSent()).toHaveLength(0);
 });

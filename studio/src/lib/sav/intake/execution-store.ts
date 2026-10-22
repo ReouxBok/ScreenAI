@@ -99,6 +99,8 @@ export async function admitIntakeExecution(runId: string, options: ExecutionOpti
     const plan = current.payload.plan;
     if (!plan || !["ticket", "request_identification"].includes(plan.decision.disposition.kind))
         return null;
+    if (plan.decision.disposition.kind === "request_identification"
+        && (current.payload.input as {humanResolution?:{suppressOutbound?:boolean}} | undefined)?.humanResolution?.suppressOutbound) return null;
     assertSavIntakeObservation(plan);
     savIntakeDecisionSchema.parse(plan.decision);
     if (plan.fingerprint !== savIntakePlanFingerprint(plan) || plan.decision.messageId !== run.messageId)
