@@ -687,3 +687,25 @@ it.each(["single","equivalent","other"]) ("Other -> support reanalysis preserves
   expect(mutationsSent()).toHaveLength(0);await projectIntakeThread(threadId);
   expect((await listIntakeConsole({view:"other"})).total).toBe(0);
 });
+
+it("excludes more than a batch of historical console rows before LIMIT and admits new mail in an old thread", async () => {
+  const launch = {mailboxId, receivedAfter:new Date(Date.now()-1000).toISOString(), createdAfter:new Date(Date.now()-1000).toISOString()};
+  await db.db.update(savMessages).set({receivedAt:new Date(Date.now()-3600000)}).where(eq(savMessages.id,messageId));
+  for (let i=0;i<25;i++) {
+    const [thread]=await db.db.insert(savThreads).values({mailboxId,gmailThreadId:randomUUID(),customerEmail:"customer@example.invalid"}).returning();
+    await message(thread.id,new Date(Date.now()-3600000),"Synthetic old mail");
+  }
+  await recordIntakeLaunch(launch);
+  const [freshThread]=await db.db.insert(savThreads).values({mailboxId,gmailThreadId:randomUUID(),customerEmail:"customer@example.invalid"}).returning();
+  const fresh=await message(freshThread.id);
+  expect(await refreshIntakeConsole(1)).toEqual({refreshed:1});
+  const [projected]=await db.db.select().from(savIntakeConsole).where(eq(savIntakeConsole.threadId,freshThread.id));
+  expect(projected.messageId).toBe(fresh.id); expect(projected.projectedEpoch).toBe(projected.epoch);
+  expect(await refreshIntakeConsole(1)).toEqual({refreshed:0});
+  const newInOld=await message(threadId,new Date(Date.now()+1));
+  expect(await refreshIntakeConsole(1)).toEqual({refreshed:1});
+  const [reopened]=await db.db.select().from(savIntakeConsole).where(eq(savIntakeConsole.threadId,threadId));
+  expect(reopened.messageId).toBe(newInOld.id);expect(reopened.projectedEpoch).toBe(reopened.epoch);
+  expect((await listIntakeConsole({view:"completed"})).total).toBe(25);
+  expect(fetch).not.toHaveBeenCalled();expect(mutationsSent()).toHaveLength(0);
+});

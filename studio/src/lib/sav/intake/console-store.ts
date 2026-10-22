@@ -4,7 +4,7 @@ import { requireDb } from "@/db";
 import { savIntakeConsole, savIntakeRuns, savIntakeHumanEvents, savMessages, savThreads,
   savIntakeObservationBindings, savResolutionObservations, savObservationCycles } from "@/db/schema";
 import { decryptSavPayload } from "../crypto";
-import { historicalMessageSql, intakeMessageHistorical } from "./launch-boundary";
+import { historicalMessageSql, historicalThreadSql, intakeMessageHistorical } from "./launch-boundary";
 import type { IntakeRuntimePayload } from "./runtime-contract";
 import { savIntakeViewSchema, type SavIntakeView } from "./contract";
 import { intakeConsoleInstalled } from "./console-capability";
@@ -64,7 +64,7 @@ export async function projectIntakeThread(threadId: string, beforePublish?: () =
 export async function refreshIntakeConsole(limit = 20) {
   if (!await intakeConsoleInstalled()) return { skipped: "migration_absent" };
   const rows = await requireDb().select({ id: savIntakeConsole.threadId }).from(savIntakeConsole)
-    .where(sql`${savIntakeConsole.epoch} <> ${savIntakeConsole.projectedEpoch}`).orderBy(savIntakeConsole.updatedAt, savIntakeConsole.threadId).limit(Math.min(50, Math.max(1, limit)));
+    .where(and(sql`${savIntakeConsole.epoch} <> ${savIntakeConsole.projectedEpoch}`, sql`not ${historicalThreadSql(savIntakeConsole.threadId)}`)).orderBy(savIntakeConsole.updatedAt, savIntakeConsole.threadId).limit(Math.min(50, Math.max(1, limit)));
   for (const row of rows) await projectIntakeThread(row.id);
   return { refreshed: rows.length };
 }

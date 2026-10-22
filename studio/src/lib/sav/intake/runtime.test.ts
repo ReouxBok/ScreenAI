@@ -247,7 +247,7 @@ it("a pause during provider completion settles usage and preserves a partial pla
   expect(current?.journal.some(event => event.kind === "obsolete_partial_result")).toBe(true);
   expect((await readSavIntakeBudget(config)).chargedNanoUsd).toBe(262_500); expect(network).toHaveBeenCalledTimes(1); expect(await f.db.select().from(savActions)).toHaveLength(0);
 });
-it.each(["promptTokenCount", "candidatesTokenCount", "thoughtsTokenCount", "totalTokenCount"].flatMap(counter => ["valid_json", "invalid_json"].map(output => ({ counter, output }))))("keeps missing $counter uncertain through provider $output", async ({ counter, output }) => {
+it.each(["promptTokenCount", "candidatesTokenCount", "totalTokenCount"].flatMap(counter => ["valid_json", "invalid_json"].map(output => ({ counter, output }))))("keeps missing $counter uncertain through provider $output", async ({ counter, output }) => {
   const id = await enqueueSavIntakeMessage(messageId, config);
   const providerUsage: Record<string, number> = { promptTokenCount: 100, candidatesTokenCount: 50, thoughtsTokenCount: 0, totalTokenCount: 150 };
   delete providerUsage[counter];
@@ -408,4 +408,36 @@ it.each(["pdf","image_limit","budget"]) ("finishes a non-dispatched image attemp
   expect(display.observations.every(o=>!["in_progress","outcome_uncertain"].includes(o.reason))).toBe(true);
   if(kind==="image_limit")expect(display.observations.slice(0,3).every(o=>o.reason==="context_incomplete")).toBe(true);
   expect(network).not.toHaveBeenCalled();expect(await f.db.select().from(savActions)).toHaveLength(0);
+});
+
+it.each(["valid_json", "invalid_json"])("reconciles only proven omitted zero thoughts through %s", async output => {
+  const id = await enqueueSavIntakeMessage(messageId, config);
+  const network = vi.fn(async () => Response.json({ candidates: [{ finishReason: "STOP", content: { parts: [{ text: output === "valid_json" ? JSON.stringify({ messageId, requests: [] }) : "{invalid-json" }] } }], usageMetadata: { promptTokenCount: 100, candidatesTokenCount: 50, totalTokenCount: 150 } }));
+  await analyseSavIntakeRuntime(id!, config, { env: () => environment, network });
+  expect(await readSavIntakeBudget(config)).toMatchObject({ callCount: 1, chargedNanoUsd: 262_500, uncertain: false });
+  const [call] = await f.db.select().from(savIntakeModelCalls);
+  expect(call.state).toBe("settled");
+  expect(decryptSavPayload(call.payloadCiphertext)).toMatchObject({ metadata: { thoughtTokens: 0, usageReconciliation: "gemini_omitted_zero_thoughts.v1" } });
+  if (output === "invalid_json") expect((await readSavIntakeCurrent(threadId, config))?.state).toBe("waiting");
+  expect(network).toHaveBeenCalledTimes(1); expect(await f.db.select().from(savActions)).toHaveLength(0);
+});
+it.each([149, 151])("does not infer omitted thoughts from an unbalanced total %s", async totalTokenCount => {
+  const id = await enqueueSavIntakeMessage(messageId, config);
+  const network = vi.fn(async () => Response.json({ candidates: [{ finishReason: "STOP", content: { parts: [{ text: JSON.stringify({ messageId, requests: [] }) }] } }], usageMetadata: { promptTokenCount: 100, candidatesTokenCount: 50, totalTokenCount } }));
+  await analyseSavIntakeRuntime(id!, config, { env: () => environment, network });
+  expect(await readSavIntakeBudget(config)).toMatchObject({ callCount: 1, chargedNanoUsd: 817_152_000, uncertain: true });
+  expect((await readSavIntakeCurrent(threadId, config))?.state).toBe("uncertain");
+  const [call] = await f.db.select().from(savIntakeModelCalls);
+  expect(decryptSavPayload<{metadata: unknown}>(call.payloadCiphertext).metadata).not.toHaveProperty("usageReconciliation");
+  expect(network).toHaveBeenCalledTimes(1); expect(await f.db.select().from(savActions)).toHaveLength(0);
+});
+it("preserves explicit positive thought counters without a reconciliation marker", async () => {
+  const id = await enqueueSavIntakeMessage(messageId, config);
+  const network = vi.fn(async () => Response.json({ candidates: [{ finishReason: "STOP", content: { parts: [{ text: JSON.stringify({ messageId, requests: [] }) }] } }], usageMetadata: { promptTokenCount: 100, candidatesTokenCount: 50, thoughtsTokenCount: 10, totalTokenCount: 160 } }));
+  await analyseSavIntakeRuntime(id!, config, { env: () => environment, network });
+  expect(await readSavIntakeBudget(config)).toMatchObject({ callCount: 1, chargedNanoUsd: 300_000, uncertain: false });
+  const [call] = await f.db.select().from(savIntakeModelCalls);
+  expect(decryptSavPayload(call.payloadCiphertext)).toMatchObject({metadata:{thoughtTokens:10}});
+  expect(decryptSavPayload<{metadata: unknown}>(call.payloadCiphertext).metadata).not.toHaveProperty("usageReconciliation");
+  expect(network).toHaveBeenCalledTimes(1);
 });
