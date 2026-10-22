@@ -1031,6 +1031,30 @@ describe('Gemini Live voice protocol', () => {
     });
   });
 
+  it('hands a spoken content request to Limova in one step and tells Gemini not to resend it', async () => {
+    const session = new VoiceSession();
+    const socket = new FakeWebSocket('wss://test');
+    socket.readyState = FakeWebSocket.OPEN;
+    session.socket = socket;
+    chromeMock.runtime.sendMessage.mockImplementation(async request => (
+      request?.type === 'VOICE_CREATE_IN_LIMOVA'
+        ? { ok: true, sent: true, pageContext: 'Page: Limova — https://new.limova.ai/chat', contextVersion: 12, elementCount: 20 }
+        : { ok: true }
+    ));
+
+    await session.handleToolCalls([{
+      id: 'handoff-1', name: 'create_in_limova',
+      args: { request: 'Rédige un post LinkedIn sur cet article' }
+    }]);
+
+    expect(chromeMock.runtime.sendMessage).toHaveBeenCalledWith({
+      type: 'VOICE_CREATE_IN_LIMOVA', request: 'Rédige un post LinkedIn sur cet article'
+    });
+    const { response } = socket.sent[0].toolResponse.functionResponses[0];
+    expect(response).toMatchObject({ status: 'ok', contextVersion: 12 });
+    expect(response.nextStep).toContain('Ne la renvoie pas');
+  });
+
   it('lets Gemini refresh the private DOM map through the packaged inspection tool', async () => {
     const session = new VoiceSession();
     const socket = new FakeWebSocket('wss://test');

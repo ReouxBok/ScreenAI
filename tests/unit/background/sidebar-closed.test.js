@@ -148,5 +148,50 @@ describe('closed side panel keeps the assistant silent', () => {
       expect(port.messages.map(message => message.type)).toContain('WRONG_TAB');
       expect(chromeMock.tabs.sendMessage).not.toHaveBeenCalledWith(FIGARO_TAB, { type: 'SESSION_STATE', active: true });
     });
+
+    it('does not warn about a wrong tab when Charly opens a site from Limova', async () => {
+      const OPENED_TAB = 40;
+      chromeMock.tabs.query.mockResolvedValueOnce([{ id: LIMOVA_TAB, index: 1, url: 'https://new.limova.ai/home' }]);
+      // Chrome activates the new tab before its address is committed.
+      chromeMock.tabs.get.mockImplementation(async id => ({ id, windowId: 1, active: id === OPENED_TAB, status: 'complete', url: id === OPENED_TAB ? '' : 'https://new.limova.ai/home' }));
+      chromeMock.tabs.create = vi.fn(async () => {
+        chromeMock._listeners.tabs.onActivated[0]({ tabId: OPENED_TAB });
+        return { id: OPENED_TAB };
+      });
+
+      await background.openPageForUser('lefigaro.fr');
+      await new Promise(resolve => setTimeout(resolve, 400));
+
+      const types = port.messages.map(message => message.type);
+      expect(types).toContain('CORRECT_TAB');
+      expect(types).not.toContain('WRONG_TAB');
+      expect(chromeMock.tabs.sendMessage).toHaveBeenCalledWith(LIMOVA_TAB, { type: 'SESSION_STATE', active: false });
+    });
+
+    it('moves Charly to the Limova conversation after a spoken content request', async () => {
+      const HANDOFF_TAB = 41;
+      const article = 'https://www.lefigaro.fr/actualite-france/article-20261022';
+      background.lockTab(FIGARO_TAB);
+      chromeMock.tabs.query.mockResolvedValue([{ id: FIGARO_TAB, index: 1, active: true, url: article }]);
+      chromeMock.tabs.create = vi.fn(async () => ({ id: HANDOFF_TAB }));
+      chromeMock.tabs.get.mockImplementation(async id => ({ id, windowId: 1, active: true, status: 'complete', url: id === HANDOFF_TAB ? 'https://new.limova.ai/' : article }));
+      chromeMock.tabs.sendMessage.mockImplementation(async (tabId, message) => (
+        message.type === 'GET_READABLE_CONTENT'
+          ? { ok: true, title: 'Manifestation à Paris', url: article, text: 'Le cortège partira de Bastille.' }
+          : message.type === 'LIMOVA_COMPOSE_AND_SEND' ? { ok: true, sent: true } : { ok: true }
+      ));
+      port.messages.length = 0;
+
+      const result = await background.createInLimovaByVoice('Rédige un post LinkedIn sur cet article');
+
+      expect(result).toMatchObject({ ok: true, sent: true });
+      expect(chromeMock.tabs.sendMessage).toHaveBeenCalledWith(HANDOFF_TAB, expect.objectContaining({
+        type: 'LIMOVA_COMPOSE_AND_SEND',
+        prompt: expect.stringContaining('Rédige un post LinkedIn sur cet article')
+      }));
+      expect(chromeMock.tabs.sendMessage).toHaveBeenCalledWith(FIGARO_TAB, { type: 'SESSION_STATE', active: false });
+      expect(port.messages.map(message => message.type)).toContain('CORRECT_TAB');
+      chromeMock.tabs.query.mockResolvedValue([]);
+    });
   });
 });

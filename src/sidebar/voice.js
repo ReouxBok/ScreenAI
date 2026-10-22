@@ -7,6 +7,7 @@
 const VOICE_PAGE_ACTION_TOOLS = new Set([
   'click_element', 'navigate_internal', 'request_page_action', 'fill_field', 'type_text_into_page', 'scroll_page', 'open_page'
 ]);
+const VOICE_HANDOFF_DONE_HINT = 'La demande est envoyée dans le chat Limova, avec le contenu de la page. Ne la renvoie pas et ne retape rien : dis brièvement que Limova prépare le contenu dans l’onglet ouvert, puis commente la réponse quand elle apparaît si l’utilisateur le souhaite.';
 const VOICE_CONTINUATION_HINT = 'Action réussie. Si l’objectif de la dernière demande de l’utilisateur demande encore des étapes, enchaîne tout de suite l’action suivante avec la carte DOM ci-jointe, sans attendre de nouvelle consigne ni lui demander de relancer. Ne t’arrête que lorsque l’objectif est atteint, qu’une information indispensable manque ou que l’étape suivante est sensible (paiement, suppression, données personnelles). Si l’utilisateur a demandé d’écrire puis d’envoyer, l’envoi fait partie de sa demande.';
 
 class LimovaVoiceSession {
@@ -794,6 +795,17 @@ class LimovaVoiceSession {
           contextVersion: Number(result?.contextVersion || 0),
           elementCount: Number(result?.elementCount || 0)
         });
+      } else if (call.name === 'create_in_limova' && typeof call.args?.request === 'string') {
+        // The background reads the page, opens Limova and sends the request in
+        // its chat, then returns the map of the new conversation.
+        result = await chrome.runtime.sendMessage({
+          type: 'VOICE_CREATE_IN_LIMOVA',
+          request: call.args.request
+        }).catch(() => ({ ok: false, error: 'Extension indisponible.' }));
+        this.diagnostic(result?.ok ? 'VOICE_LIMOVA_HANDOFF_SENT' : 'VOICE_LIMOVA_HANDOFF_FAILED', {
+          contextVersion: Number(result?.contextVersion || 0),
+          requestLength: call.args.request.length
+        });
       } else if (['click_element', 'navigate_internal', 'request_page_action'].includes(call.name) && Number.isInteger(call.args?.elementId)) {
         result = await chrome.runtime.sendMessage({
           type: 'VOICE_ACTION_REQUEST',
@@ -851,7 +863,9 @@ class LimovaVoiceSession {
       } else if (result?.knowledge) {
         response.knowledgeBase = String(result.knowledge).slice(0, 6_000);
       }
-      if (response.status === 'ok' && VOICE_PAGE_ACTION_TOOLS.has(call.name)) {
+      if (response.status === 'ok' && call.name === 'create_in_limova') {
+        response.nextStep = VOICE_HANDOFF_DONE_HINT;
+      } else if (response.status === 'ok' && VOICE_PAGE_ACTION_TOOLS.has(call.name)) {
         response.nextStep = VOICE_CONTINUATION_HINT;
       }
         functionResponses.push({

@@ -478,6 +478,7 @@ async function handleTabActivated(tabId) {
     await trackExternalPopup(tab);
     if (externalPopupTabs.has(tabId)) return;
   }
+  if (tabId === sessionState.lockedTabId) return;
   if (await followActivatedTab(tabId)) return;
   broadcastToSidebar({ type: 'WRONG_TAB' });
 }
@@ -487,9 +488,9 @@ async function handleTabActivated(tabId) {
 // Training and flow tests stay bound to their Limova tab.
 async function followActivatedTab(tabId) {
   if (trainingState.active || evaluationState.active) return false;
-  // The Limova tab opened by a handoff is driven by the handoff itself; an
+  // A tab opened by a handoff or open_page is driven by that operation; an
   // automatic page analysis there would talk over the chat being sent.
-  if (handoffsInProgress > 0) return true;
+  if (tabOpeningsInProgress > 0) return true;
   const tab = await chrome.tabs.get(tabId).catch(() => null);
   if (!tab?.id || !tab.active || !isAssistedUrl(tab.url)) return false;
   if (!(await isSidebarOpen())) return false;
@@ -735,6 +736,9 @@ async function handleMessage(request, sender) {
       return runEvaluatedVoiceTool('open_page', request.url, () =>
         openPageForUser(request.url, { newTab: request.newTab === true })
       );
+
+    case 'VOICE_CREATE_IN_LIMOVA':
+      return runEvaluatedVoiceTool('create_in_limova', '', () => createInLimovaByVoice(request.request));
 
     case 'VOICE_KB_SEARCH':
       return runEvaluatedVoiceTool('search_knowledge_base', '', () => searchVoiceKnowledge(request.query));
@@ -3435,8 +3439,9 @@ async function getLiveToken(context) {
       body: JSON.stringify({
         lang: currentLang,
         trainingMode,
-        // Tells the proxy this extension follows every site and handles open_page.
-        capabilities: ['any_site'],
+        // Tells the proxy this extension follows every site and handles
+        // open_page and create_in_limova.
+        capabilities: ['any_site', 'limova_handoff'],
         ...(sessionState.resetContext ? { resetContext: true } : {}),
         ...(evaluationMode ? { evaluationCode: evaluationState.token } : {}),
         ...(sessionId ? { sessionId } : {}),
@@ -4900,7 +4905,9 @@ const HANDOFF_PAGE_TEXT_LIMIT = 6000;
 const HANDOFF_PROMPT_LIMIT = 8000;
 const presenceTabs = new Set();
 let handoffSequence = 0;
-let handoffsInProgress = 0;
+// Tabs the extension is opening itself (handoff, open_page): their activation
+// is not a user tab switch.
+let tabOpeningsInProgress = 0;
 
 async function showAgentPresence(tabId) {
   if (!tabId) return;
@@ -4955,6 +4962,17 @@ function waitForTabLoaded(tabId, timeout = 30_000, { afterNavigation = false } =
   });
 }
 
+// The tab the extension just brought to the front becomes Charly's tab, and
+// the side panel stops warning about a wrong tab.
+function moveAssistantToTab(tabId, previousTabId) {
+  if (previousTabId && previousTabId !== tabId) {
+    hideAgentPresence(previousTabId);
+    chrome.tabs.sendMessage(previousTabId, { type: 'SESSION_STATE', active: false }).catch(() => {});
+  }
+  lockTab(tabId);
+  broadcastToSidebar({ type: 'CORRECT_TAB' });
+}
+
 // Voice "open_page": the user names a site or an address. Only web pages are
 // opened; Limova stays in its tab and the site opens next to it.
 function normalizeRequestedPageUrl(rawUrl) {
@@ -4978,21 +4996,25 @@ async function openPageForUser(rawUrl, { newTab = false } = {}) {
   const [current] = await chrome.tabs.query({ active: true, lastFocusedWindow: true }).catch(() => []);
   const keepCurrent = newTab || !current?.id || isLimovaUrl(current.url);
   let tab;
-  if (keepCurrent) {
-    tab = await chrome.tabs.create({
-      url,
-      active: true,
-      ...(Number.isInteger(current?.index) ? { index: current.index + 1 } : {}),
-      ...(current?.id ? { openerTabId: current.id } : {})
-    });
-  } else {
-    tab = await chrome.tabs.update(current.id, { url });
+  tabOpeningsInProgress += 1;
+  try {
+    if (keepCurrent) {
+      tab = await chrome.tabs.create({
+        url,
+        active: true,
+        ...(Number.isInteger(current?.index) ? { index: current.index + 1 } : {}),
+        ...(current?.id ? { openerTabId: current.id } : {})
+      });
+    } else {
+      tab = await chrome.tabs.update(current.id, { url });
+    }
+    if (!tab?.id) return { ok: false, error: 'Impossible d’ouvrir cette page.' };
+    moveAssistantToTab(tab.id, current?.id);
+    Logger.event('navigation', 'PAGE_OPENED_FOR_USER', { origin: new URL(url).origin, newTab: keepCurrent });
+    await waitForTabLoaded(tab.id, 12_000, { afterNavigation: !keepCurrent });
+  } finally {
+    tabOpeningsInProgress -= 1;
   }
-  if (!tab?.id) return { ok: false, error: 'Impossible d’ouvrir cette page.' };
-  if (current?.id && current.id !== tab.id) hideAgentPresence(current.id);
-  lockTab(tab.id);
-  Logger.event('navigation', 'PAGE_OPENED_FOR_USER', { origin: new URL(url).origin, newTab: keepCurrent });
-  await waitForTabLoaded(tab.id, 12_000, { afterNavigation: !keepCurrent });
   if (!isCurrentOperation(operation)) return cancelledOperation();
   await ensureContentScript(tab.id).catch(() => {});
   try {
@@ -5018,14 +5040,16 @@ async function sendComposeRequest(tabId, message, operation) {
 
 // Everything happens in the extension: read the page the user is on, open
 // Limova, then write and send the request in its chat like the user would.
-async function handoffToLimova(rawRequest) {
+async function handoffToLimova(rawRequest, { voice = false } = {}) {
   const request = String(rawRequest || '').trim().slice(0, 1500);
   if (!request) return { ok: false, error: 'Demande vide.' };
   if (!(await hasAIProcessingConsent())) {
     broadcastToSidebar({ type: 'CONSENT_REQUIRED' });
     return { ok: false, consentRequired: true };
   }
-  const operation = { generation: sessionGeneration };
+  const operation = voice
+    ? { generation: sessionGeneration, voiceGeneration: voiceSessionGeneration }
+    : { generation: sessionGeneration };
   const [source] = await chrome.tabs.query({ active: true, lastFocusedWindow: true }).catch(() => []);
   if (!source?.id || !isExternalSiteUrl(source.url)) {
     return { ok: false, error: 'Ouvre la page à utiliser avant de demander un contenu.' };
@@ -5044,7 +5068,7 @@ async function handoffToLimova(rawRequest) {
   if (!page?.ok) return { ok: false, error: 'Je n’arrive pas à lire cette page.' };
 
   const prompt = buildLimovaHandoffPrompt(request, page);
-  handoffsInProgress += 1;
+  tabOpeningsInProgress += 1;
   let limovaTab;
   let result;
   try {
@@ -5060,8 +5084,10 @@ async function handoffToLimova(rawRequest) {
     result = await sendComposeRequest(limovaTab.id, { type: 'LIMOVA_COMPOSE_AND_SEND', handoffId, prompt }, operation);
     presenceTabs.delete(limovaTab.id);
   } finally {
-    handoffsInProgress -= 1;
+    tabOpeningsInProgress -= 1;
   }
+  // The user now looks at the Limova conversation: Charly follows it there.
+  if (result?.ok && isCurrentOperation(operation)) moveAssistantToTab(limovaTab.id, source.id);
   Logger.event('handoff', result?.ok ? 'LIMOVA_HANDOFF_SENT' : 'LIMOVA_HANDOFF_FAILED', {
     handoffId,
     code: result?.code || null,
@@ -5069,6 +5095,20 @@ async function handoffToLimova(rawRequest) {
     truncated: Boolean(page.truncated)
   });
   return { ...result, limovaTabId: limovaTab.id, pageTitle: page.title || '' };
+}
+
+// Voice "create_in_limova": same handoff as the side panel, then Charly gets
+// the Limova conversation it just started so it can comment on the answer.
+async function createInLimovaByVoice(rawRequest) {
+  if (trainingState.active || evaluationState.active) return { ok: false, error: 'Indisponible pendant un test ou une formation.' };
+  const result = await handoffToLimova(rawRequest, { voice: true });
+  if (!result?.ok) return result;
+  try {
+    const context = await getFreshVoiceContext(null, { capture: true, operation: captureVoiceOperation() });
+    return { ...context, ok: true, sent: true, pageTitle: result.pageTitle };
+  } catch {
+    return { ok: true, sent: true, pageTitle: result.pageTitle };
+  }
 }
 
 function resumeAfterSidebarOpened() {
@@ -5140,6 +5180,7 @@ export {
   handleResetSession,
   handleTakeScreenshot,
   handoffToLimova,
+  createInLimovaByVoice,
   buildLimovaHandoffPrompt,
   isAssistedUrl,
   normalizeRequestedPageUrl,

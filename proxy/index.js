@@ -955,7 +955,10 @@ app.post('/api/live-token', verifyAssistantAuth, assistantLimiter, async (req, r
   const evaluationMode = Boolean(evaluationContext);
   // Extensions from 2.2.47 follow the user on every site and can open pages;
   // older ones keep the Limova-only wording and tools.
-  const anySite = Array.isArray(req.body?.capabilities) && req.body.capabilities.includes('any_site');
+  const capabilities = Array.isArray(req.body?.capabilities) ? req.body.capabilities : [];
+  const anySite = capabilities.includes('any_site');
+  // From 2.2.48 the extension can send a request to the Limova chat in one step.
+  const limovaHandoff = anySite && capabilities.includes('limova_handoff');
   const pageContext = trainingMode ? '' : String(req.body?.pageContext || '').slice(0, 12_000);
   const history = trainingMode || evaluationMode ? '' : formatConversationHistory(req.body?.history);
   const onboardingTemplate = trainingMode || evaluationMode ? null : await fetchPublishedOnboardingTemplate(requestId);
@@ -980,6 +983,14 @@ app.post('/api/live-token', verifyAssistantAuth, assistantLimiter, async (req, r
       ? ''
       : onboardingTemplateText || 'Trame de secours : pour démarrer, vérifie si l’utilisateur a déjà exprimé un objectif précis. Si oui, aide-le directement. Sinon, demande uniquement : « Est-ce qu’il y a un sujet en particulier que tu veux traiter aujourd’hui ? ». S’il n’a pas d’idée, propose la prospection LinkedIn ou la création de posts pour réseaux sociaux, puis adapte la suite à son métier. Pose une seule question par tour.',
     anySite ? 'L’utilisateur peut travailler sur Limova ou sur n’importe quel autre site : la carte DOM la plus récente (URL et titre) indique toujours la page réellement affichée, et l’extension t’envoie une nouvelle carte dès qu’il change d’onglet ou de site. Ne réponds jamais à partir d’une page précédente. Sur un autre site, la section « contenu à l’écran » donne le texte que l’utilisateur lit. Pour aller sur un site ou une adresse qu’il nomme, appelle open_page avec l’adresse (par exemple lemonde.fr) ; pour suivre un lien visible, utilise son identifiant dans la carte DOM.' : '',
+    anySite ? [
+      'HORS DE LIMOVA. Sur un autre site, tu es une copilote de lecture : tu lis, résumes, expliques et réponds à partir du « contenu à l’écran » et de la « suite de la page », sans quitter la page. Tu n’y cliques que sur demande explicite (suivre un lien, ouvrir un onglet, défiler).',
+      limovaHandoff
+        ? 'Dès que l’utilisateur veut produire quelque chose à partir de ce qu’il regarde — post LinkedIn ou réseaux sociaux, e-mail, article, résumé à garder, script, visuel, analyse détaillée — annonce en une phrase que tu le prépares dans Limova, puis appelle create_in_limova avec sa demande reformulée en une consigne claire (format, ton, longueur, public si précisés). L’extension lit la page, ouvre Limova dans un nouvel onglet, écrit et envoie la demande pour toi : n’ouvre jamais Limova toi-même et n’essaie jamais de l’atteindre en cliquant sur un lien de la page.'
+        : 'Dès que l’utilisateur veut produire quelque chose à partir de ce qu’il regarde (post, e-mail, article, visuel), résume d’abord l’essentiel de la page à voix haute, puis appelle open_page avec new.limova.ai et suis la règle CHAT LIMOVA pour y écrire une seule demande qui reprend ce résumé. N’essaie jamais d’atteindre Limova en cliquant sur un lien de la page.',
+      'Choix de l’outil : lien ou bouton visible sur la page → son identifiant DOM ; site ou adresse nommé → open_page ;' + (limovaHandoff ? ' création de contenu → create_in_limova ;' : '') + ' n’utilise jamais open_page pour revenir sur une page Limova que l’utilisateur a déjà ouverte.'
+    ].join(' ') : '',
+    'CHAT LIMOVA. Pour écrire dans le chat de Limova, la seule cible est la zone de rédaction du chat (libellée par exemple « Écrire un message… », en bas de la conversation ou au centre d’un nouveau chat) : jamais un champ de recherche, de filtre ou de titre. Saisis le message en une fois, puis clique « Envoyer le message » une seule fois. Dès que l’envoi a réussi (nouvelle conversation, champ vidé ou message affiché), ne retape jamais ce message et ne le renvoie pas : relis la page et annonce que Limova prépare la réponse. Si la zone de rédaction disparaît après un clic, la conversation est probablement en cours de création : relis la page avant toute nouvelle saisie.',
     `Tu peux inspecter et piloter ${anySite ? 'la page affichée' : 'la page Limova'} grâce à une carte DOM structurée : URL, titres, éléments visibles et cliquables avec identifiants, états, modales, erreurs et métadonnées réseau récentes filtrées. Tu peux aussi recevoir une capture visuelle temporaire de la zone visible : les pastilles #N sont des repères strictement internes ; elles servent uniquement à retrouver une cible et ne doivent jamais être prononcées ni mentionnées à l’utilisateur. Les valeurs de formulaires sont masquées. Utilise l’image pour comprendre la disposition et les contrôles graphiques, jamais pour deviner une valeur ou cliquer par coordonnées. Toute action doit utiliser un identifiant de la carte DOM actuelle ; ne dis jamais que tu ne vois pas l’écran ou que tu ne peux pas naviguer.`,
     'Appelle inspect_current_page avant de répondre à toute question sur ce qui est affiché, après une navigation ou dès que le contexte peut avoir changé. Utilise exclusivement les identifiants de la carte DOM la plus récente. Une MISE À JOUR TECHNIQUE SILENCIEUSE remplace l’ancien contexte de page : assimile-la sans y répondre seule et considère sa version DOM comme la nouvelle référence. Une source user_click, user_input ou user_scroll signifie que l’utilisateur a déjà agi : ne répète pas son action. Utilise scroll_page pour découvrir les contrôles hors écran, puis inspecte de nouveau la page.',
     evaluationMode
@@ -1123,7 +1134,7 @@ app.post('/api/live-token', verifyAssistantAuth, assistantLimiter, async (req, r
               }
             }, ...(anySite ? [{
               name: 'open_page',
-              description: 'Ouvre un site ou une adresse web que l’utilisateur demande (par exemple « va sur lemonde.fr »), attend son chargement et renvoie sa carte DOM. Remplace la page d’un autre site dans l’onglet actif ; depuis Limova, ouvre un nouvel onglet.',
+              description: 'Ouvre un site ou une adresse web que l’utilisateur demande (par exemple « va sur lemonde.fr »), attend son chargement et renvoie sa carte DOM. Remplace la page d’un autre site dans l’onglet actif ; depuis Limova, ouvre un nouvel onglet.' + (limovaHandoff ? ' Pour créer un contenu dans Limova, utiliser create_in_limova et non cet outil.' : ''),
               parameters: {
                 type: 'OBJECT',
                 properties: {
@@ -1131,6 +1142,16 @@ app.post('/api/live-token', verifyAssistantAuth, assistantLimiter, async (req, r
                   newTab: { type: 'BOOLEAN', description: 'Vrai si l’utilisateur demande un nouvel onglet.' }
                 },
                 required: ['url']
+              }
+            }] : []), ...(limovaHandoff ? [{
+              name: 'create_in_limova',
+              description: 'Crée un contenu dans Limova à partir de la page que l’utilisateur regarde sur un autre site : lit la page (texte, titre, adresse, passage sélectionné), ouvre Limova dans un nouvel onglet, écrit la demande accompagnée de ce contenu dans le chat et l’envoie. Renvoie ensuite la carte DOM de la conversation Limova. Une seule fois par demande ; jamais depuis une page Limova.',
+              parameters: {
+                type: 'OBJECT',
+                properties: {
+                  request: { type: 'STRING', description: 'Consigne claire pour Limova, en français, 1500 caractères maximum, par exemple « Rédige un post LinkedIn à partir de cet article, ton professionnel, 150 mots ». Ne recopie pas la page : elle est jointe automatiquement.' }
+                },
+                required: ['request']
               }
             }] : []), {
               name: 'verify_expected_result',
