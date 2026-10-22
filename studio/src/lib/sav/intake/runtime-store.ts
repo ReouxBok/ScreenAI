@@ -1,4 +1,5 @@
 import "server-only";
+import { reconcileIntakeZeroThoughtUsage } from "./model-usage";
 import { SAV_INTAKE_OPERATIONAL_PROFILE, intakeBudgetUsage } from "./budget-profile";
 import { intakeLaunchMatches } from "./launch-boundary";
 import { intakeConsoleInstalled } from "./console-capability";
@@ -253,6 +254,41 @@ export async function settleSavIntakeCall(id: string, metadata?: SavGeminiMetada
     await tx.update(savIntakeModelCalls).set({ state: valid ? "settled" : "uncertain", chargedNanoUsd: cost,
       payloadCiphertext: encryptSavPayload({ metadata: metadata ?? {} }), resultCiphertext: valid && result && row.runId ? encryptSavPayload(result) : null, settledAt: new Date() }).where(eq(savIntakeModelCalls.id, id));
     return valid;
+  });
+}
+/** Bounded accounting repair for the previous deployment's omitted-zero bug.
+ * Only confined, non-executable runs are eligible. This settles cost from the
+ * original encrypted counters; it never restores output, retries or a plan. */
+export async function reconcileConfinedIntakeUsage(config:IntakeRuntimeConfig) {
+  if(config.budgetProfile!==SAV_INTAKE_OPERATIONAL_PROFILE)return {reconciled:0};
+  return requireDb().transaction(async tx=>{
+    await tx.execute(sql`select pg_advisory_xact_lock(hashtext('sav-intake-runtime-model-budget-v1'))`);
+    const rows=await tx.select().from(savIntakeModelCalls).where(eq(savIntakeModelCalls.state,"uncertain"))
+      .orderBy(savIntakeModelCalls.createdAt,savIntakeModelCalls.id).limit(3).for("update");
+    let reconciled=0;
+    for(const row of rows) {
+      if(!row.runId||row.resultCiphertext!==null||row.reservedNanoUsd!==817_152_000||row.chargedNanoUsd!==817_152_000)continue;
+      const [run]=await tx.select().from(savIntakeRuns).where(eq(savIntakeRuns.id,row.runId));
+      const [thread]=run?await tx.select().from(savThreads).where(eq(savThreads.id,run.threadId)):[];
+      const [message]=run?await tx.select().from(savMessages).where(eq(savMessages.id,run.messageId)):[];
+      if(!run||!thread?.aiPaused||!message||message.mailboxId!==config.mailboxId||!eligible(message,config)
+        ||!['uncertain','superseded'].includes(run.state)||run.policyHash!==config.policyHash||row.messageKey!==intakeRuntimeHash(run.messageId))continue;
+      const source=decryptSavPayload<IntakeRuntimePayload>(run.payloadCiphertext).configuration;
+      if(source?.codeRevision!=="2483091f858fd3e4c31490c8446278f493f663ba"||source.model!==config.model||source.configHash!==run.configHash
+        ||source.policyHash!==config.policyHash||source.resourcesHash!==config.resourcesHash)continue;
+      const original=decryptSavPayload<{metadata?:SavGeminiMetadata}>(row.payloadCiphertext),raw=original.metadata;
+      if(raw?.thoughtTokens!==undefined||raw?.finishReason!=="STOP"||raw.blockReason&&raw.blockReason!=="BLOCK_REASON_UNSPECIFIED"
+        ||raw.transport?.attempts!==1||raw.transport.retries!==0||raw.transport.errorCode!==null||raw.transport.model!==config.model)continue;
+      const metadata=reconcileIntakeZeroThoughtUsage(raw);
+      if(metadata.usageReconciliation!=="gemini_omitted_zero_thoughts.v1")continue;
+      const cost=Number(metadata.inputTokens)*750+Number(metadata.outputTokens)*3750;
+      await journal(tx,run.id,"verified_zero_thought_usage_reconciled",{callId:row.id,originalPayloadCiphertext:row.payloadCiphertext,
+        originalState:row.state,originalChargedNanoUsd:row.chargedNanoUsd,originalSettledAt:row.settledAt,chargedNanoUsd:cost,metadata});
+      await tx.update(savIntakeModelCalls).set({state:"settled",chargedNanoUsd:cost,payloadCiphertext:encryptSavPayload({...original,metadata}),settledAt:new Date()})
+        .where(and(eq(savIntakeModelCalls.id,row.id),eq(savIntakeModelCalls.state,"uncertain")));
+      reconciled++;
+    }
+    return {reconciled};
   });
 }
 /** Read-only contract for later worker/UI lots. Observation never means treatment. */
