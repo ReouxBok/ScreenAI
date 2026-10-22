@@ -5,8 +5,8 @@ import {crmRecordUrl} from "./crm-display";
 import {readIntakeCrmDisplay} from "./crm-display-server";
 afterEach(()=>{vi.unstubAllEnvs();vi.resetAllMocks();});
 it("constructs only contact/ticket links for a numeric configured portal and record",()=>{
- expect(crmRecordUrl("123","contact","456")).toBe("https://app.hubspot.com/contacts/123/contact/456");
- expect(crmRecordUrl("123","ticket","456")).toContain("/ticket/456");
+ expect(crmRecordUrl("123","contact","456")).toBe("https://app.hubspot.com/contacts/123/record/0-1/456");
+ expect(crmRecordUrl("123","ticket","456")).toContain("/record/0-5/456");
  for(const p of [undefined,"123/evil","https://other.invalid"])expect(crmRecordUrl(p,"contact","456")).toBeNull();
  expect(crmRecordUrl("123","contact","../other")).toBeNull();
 });
@@ -20,7 +20,7 @@ it("batches only authorized record IDs, keeps display separate and tolerates mis
 it("does not invent data on failed, partial or archived results and keeps valid fallback links",async()=>{
  vi.stubEnv("HUBSPOT_PORTAL_ID","123");vi.stubEnv("HUBSPOT_ACCESS_TOKEN","synthetic");
  for(const response of [{status:"PENDING",results:[]},{status:"COMPLETE",errors:[{}],results:[]},{status:"COMPLETE",results:[{id:"10",archived:true,properties:{firstname:"Archived"}}]}]){
-  request.mockResolvedValue(response);const v=await readIntakeCrmDisplay(["10"],[]);expect(v.contacts["10"]).toMatchObject({available:false,label:"Fiche client — nom indisponible",url:"https://app.hubspot.com/contacts/123/contact/10"});
+  request.mockResolvedValue(response);const v=await readIntakeCrmDisplay(["10"],[]);expect(v.contacts["10"]).toMatchObject({available:false,label:"Fiche client — nom indisponible",url:"https://app.hubspot.com/contacts/123/record/0-1/10"});
  }
  request.mockRejectedValue(Error("synthetic"));expect((await readIntakeCrmDisplay(["10"],[])).contacts["10"].available).toBe(false);
 });
