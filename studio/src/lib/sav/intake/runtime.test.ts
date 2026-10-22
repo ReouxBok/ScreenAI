@@ -2,12 +2,12 @@ import { createHash, randomUUID } from "node:crypto";
 import { afterAll, afterEach, beforeAll, beforeEach, expect, it, vi } from "vitest";
 import { eq } from "drizzle-orm";
 import { createSavTestDb } from "../../../../test/sav-db";
-import { savSyncState, savMailboxes, savMessages, savThreads, savIntakeRuns, savIntakeModelCalls, savIntakeJournal, savActions, savDecisions, auditLogs } from "@/db/schema";
+import { savSyncState, savMailboxes, savMessages, savThreads, savIntakeRuns, savIntakeModelCalls, savIntakeJournal, savActions, savDecisions, savIntakeExecutions, savIntakeEffects, auditLogs } from "@/db/schema";
 const state = vi.hoisted(() => ({ db: null as unknown }));
 vi.mock("@/db", () => ({ requireDb: () => { if (!state.db) throw Error("NO_DATABASE_ALLOWED"); return state.db; } }));
 import { encryptSavPayload, decryptSavPayload } from "../crypto";
 import { intakeRuntimeHash, savIntakeRuntimeConfig, SAV_INTAKE_RUNTIME_REVISION, type IntakeRuntimeConfig, type IntakeRuntimePayload } from "./runtime-contract";
-import { assertSavIntakeLease, catchupSavIntake, claimSavIntakeRun, enqueueSavIntakeMessage, failSavIntakeRun, readSavIntakeBudget, readSavIntakeCurrent, reserveSavIntakeCall, saveSavIntakeResult, settleSavIntakeCall } from "./runtime-store";
+import { assertSavIntakeLease, catchupSavIntake, claimSavIntakeRun, enqueueSavIntakeMessage, failSavIntakeRun, readSavIntakeBudget, readSavIntakeCurrent, reconcileConfinedIntakeUsage, reserveSavIntakeCall, saveSavIntakeResult, settleSavIntakeCall } from "./runtime-store";
 import { analyseSavIntakeRuntime, enqueueConfiguredSavIntake, reconcileSavIntakeRuntime } from "./runtime";
 
 let f: Awaited<ReturnType<typeof createSavTestDb>>, mailboxId: string, threadId: string, messageId: string;
@@ -440,4 +440,109 @@ it("preserves explicit positive thought counters without a reconciliation marker
   expect(decryptSavPayload(call.payloadCiphertext)).toMatchObject({metadata:{thoughtTokens:10}});
   expect(decryptSavPayload<{metadata: unknown}>(call.payloadCiphertext).metadata).not.toHaveProperty("usageReconciliation");
   expect(network).toHaveBeenCalledTimes(1);
+});
+
+
+const previousUsageCode = "2483091f858fd3e4c31490c8446278f493f663ba";
+async function confinedUsageFixture() {
+  operational();
+  const l=await lease(), call=await reserveSavIntakeCall(l,config,"confined-original-request");
+  const metadata={inputTokens:100,outputTokens:50,totalTokens:150,finishReason:"STOP" as const,
+    transport:{model:config.model,attempts:1,retries:0,errorCode:null}};
+  await f.db.update(savIntakeModelCalls).set({state:"uncertain",payloadCiphertext:encryptSavPayload({metadata}),settledAt:new Date()}).where(eq(savIntakeModelCalls.id,call.id));
+  await f.db.update(savIntakeRuns).set({state:"uncertain",leaseToken:null,leaseUntil:null,freshUntil:null,payloadCiphertext:encryptSavPayload({...payload(),configuration:{configHash:config.configHash,policyHash:config.policyHash,resourcesHash:config.resourcesHash,codeRevision:previousUsageCode,model:config.model}})}).where(eq(savIntakeRuns.id,l.run.id));
+  await f.db.update(savThreads).set({aiPaused:true}).where(eq(savThreads.id,threadId));
+  return {l,call,metadata,original:(await f.db.select().from(savIntakeModelCalls).where(eq(savIntakeModelCalls.id,call.id)))[0]};
+}
+it("confined usage repairs accounting once, retains original encrypted evidence and never revives output",async()=>{
+  const {call,original}=await confinedUsageFixture();
+  const beforeRun=(await f.db.select().from(savIntakeRuns))[0],beforeMessage=(await f.db.select().from(savMessages))[0];
+  expect(await reconcileConfinedIntakeUsage(config)).toEqual({reconciled:1});
+  expect(await reconcileConfinedIntakeUsage(config)).toEqual({reconciled:0});
+  const current=(await f.db.select().from(savIntakeModelCalls).where(eq(savIntakeModelCalls.id,call.id)))[0];
+  expect(current).toMatchObject({state:"settled",chargedNanoUsd:262500,resultCiphertext:null,runId:original.runId,messageKey:original.messageKey,requestHash:original.requestHash,reservedNanoUsd:original.reservedNanoUsd,createdAt:original.createdAt});
+  expect(decryptSavPayload(current.payloadCiphertext)).toMatchObject({metadata:{thoughtTokens:0,usageReconciliation:"gemini_omitted_zero_thoughts.v1"}});
+  const events=await f.db.select().from(savIntakeJournal);
+  const repair=events.filter(e=>e.kind==="verified_zero_thought_usage_reconciled");expect(repair).toHaveLength(1);
+  expect(decryptSavPayload(repair[0].payloadCiphertext)).toMatchObject({callId:call.id,originalPayloadCiphertext:original.payloadCiphertext,originalChargedNanoUsd:817152000});
+  expect((await f.db.select().from(savIntakeRuns))[0]).toEqual(beforeRun);
+  expect((await f.db.select().from(savMessages))[0]).toEqual(beforeMessage);
+  expect((await readSavIntakeBudget(config))).toMatchObject({chargedNanoUsd:262500,lifetimeCallCount:1,uncertain:false});
+  expect(await f.db.select().from(savActions)).toHaveLength(0);expect(await f.db.select().from(savDecisions)).toHaveLength(0);expect(await f.db.select().from(auditLogs)).toHaveLength(0);
+  expect(await f.db.select().from(savIntakeExecutions)).toHaveLength(0);expect(await f.db.select().from(savIntakeEffects)).toHaveLength(0);
+});
+it("confined usage concurrent reconciliation records one accounting transition",async()=>{
+  await confinedUsageFixture();
+  const results=await Promise.all([reconcileConfinedIntakeUsage(config),reconcileConfinedIntakeUsage(config)]);
+  expect(results.reduce((n,r)=>n+r.reconciled,0)).toBe(1);
+  expect((await f.db.select().from(savIntakeJournal)).filter(e=>e.kind==="verified_zero_thought_usage_reconciled")).toHaveLength(1);
+});
+it.each(["input_missing","output_missing","total_missing","positive_residual","negative_residual","thoughts_explicit","input_negative","input_too_large","output_too_large","fractional","finish","block","attempts","retries","error","model","forged_marker_residual","forged_marker_thoughts"])("confined usage refuses unproven provider metadata: %s",async(kind)=>{
+  const fixture=await confinedUsageFixture(),metadata:Record<string,unknown>={...fixture.metadata,transport:{...fixture.metadata.transport}};
+  if(kind==="input_missing")delete metadata.inputTokens;
+  if(kind==="output_missing")delete metadata.outputTokens;
+  if(kind==="total_missing")delete metadata.totalTokens;
+  if(kind==="positive_residual")metadata.totalTokens=151;
+  if(kind==="negative_residual")metadata.totalTokens=149;
+  if(kind==="thoughts_explicit")metadata.thoughtTokens=0;
+  if(kind==="input_negative")Object.assign(metadata,{inputTokens:-1,totalTokens:49});
+  if(kind==="input_too_large")Object.assign(metadata,{inputTokens:1048577,totalTokens:1048627});
+  if(kind==="output_too_large")Object.assign(metadata,{outputTokens:8193,totalTokens:8293});
+  if(kind==="fractional")Object.assign(metadata,{inputTokens:100.5,totalTokens:150.5});
+  if(kind==="forged_marker_residual")Object.assign(metadata,{totalTokens:151,usageReconciliation:"gemini_omitted_zero_thoughts.v1"});
+  if(kind==="forged_marker_thoughts")Object.assign(metadata,{thoughtTokens:1,totalTokens:151,usageReconciliation:"gemini_omitted_zero_thoughts.v1"});
+  if(kind==="finish")metadata.finishReason="MAX_TOKENS";
+  if(kind==="block")metadata.blockReason="SAFETY";
+  const transport=metadata.transport as Record<string,unknown>;
+  if(kind==="attempts")transport.attempts=2;
+  if(kind==="retries")transport.retries=1;
+  if(kind==="error")transport.errorCode="SAV_AI_PROVIDER_TIMEOUT";
+  if(kind==="model")transport.model="other";
+  await f.db.update(savIntakeModelCalls).set({payloadCiphertext:encryptSavPayload({metadata})}).where(eq(savIntakeModelCalls.id,fixture.call.id));
+  const before=(await f.db.select().from(savIntakeModelCalls))[0];
+  expect(await reconcileConfinedIntakeUsage(config)).toEqual({reconciled:0});
+  expect((await f.db.select().from(savIntakeModelCalls))[0]).toEqual(before);
+});
+it.each(["not_paused","executable_run","wrong_code","wrong_config","wrong_policy","wrong_resources","wrong_message_key","partial_charge","cached_result","no_run","source_model","before_frontier","outbound","source_absent"])("confined usage refuses ineligible provenance or authority: %s",async(kind)=>{
+  const {l,call}=await confinedUsageFixture();
+  const run=(await f.db.select().from(savIntakeRuns))[0],body=decryptSavPayload<IntakeRuntimePayload>(run.payloadCiphertext);
+  if(kind==="not_paused")await f.db.update(savThreads).set({aiPaused:false}).where(eq(savThreads.id,threadId));
+  if(kind==="executable_run")await f.db.update(savIntakeRuns).set({state:"observed",freshUntil:new Date(Date.now()+60000)}).where(eq(savIntakeRuns.id,l.run.id));
+  if(kind==="wrong_code")body.configuration!.codeRevision="b".repeat(40);
+  if(kind==="wrong_config")body.configuration!.configHash="b".repeat(64);
+  if(kind==="wrong_policy")body.configuration!.policyHash="b".repeat(64);
+  if(kind==="wrong_resources")body.configuration!.resourcesHash="b".repeat(64);
+  if(kind==="source_model")body.configuration!.model="other";
+  if(kind==="source_absent")delete body.configuration;
+  if(kind==="before_frontier")await f.db.update(savMessages).set({receivedAt:new Date(Date.parse(config.receivedAfter)-1)}).where(eq(savMessages.id,messageId));
+  if(kind==="outbound")await f.db.update(savMessages).set({direction:"outbound"}).where(eq(savMessages.id,messageId));
+  await f.db.update(savIntakeRuns).set({payloadCiphertext:encryptSavPayload(body)}).where(eq(savIntakeRuns.id,l.run.id));
+  if(kind==="wrong_message_key")await f.db.update(savIntakeModelCalls).set({messageKey:"b".repeat(64)}).where(eq(savIntakeModelCalls.id,call.id));
+  if(kind==="partial_charge")await f.db.update(savIntakeModelCalls).set({chargedNanoUsd:1}).where(eq(savIntakeModelCalls.id,call.id));
+  if(kind==="cached_result")await f.db.update(savIntakeModelCalls).set({resultCiphertext:encryptSavPayload({json:{synthetic:true}})}).where(eq(savIntakeModelCalls.id,call.id));
+  if(kind==="no_run")await f.db.update(savIntakeModelCalls).set({runId:null}).where(eq(savIntakeModelCalls.id,call.id));
+  expect(await reconcileConfinedIntakeUsage(config)).toEqual({reconciled:0});
+  expect((await f.db.select().from(savIntakeModelCalls))[0].state).toBe("uncertain");
+});
+it("confined usage preserves spent-request replay barrier and frees only verified budget for another message",async()=>{
+  const {call}=await confinedUsageFixture();await reconcileConfinedIntakeUsage(config);
+  await f.db.update(savThreads).set({aiPaused:false}).where(eq(savThreads.id,threadId));
+  await f.db.update(savIntakeRuns).set({state:"waiting"});
+  const next=(await claimSavIntakeRun((await f.db.select().from(savIntakeRuns))[0].id,config))!;
+  await expect(reserveSavIntakeCall(next,config,"confined-original-request")).rejects.toThrow("CALL_ALREADY_CONSUMED");
+  expect((await f.db.select().from(savIntakeModelCalls)).filter(r=>r.id===call.id)).toHaveLength(1);
+  threadId=(await f.db.insert(savThreads).values({mailboxId,gmailThreadId:randomUUID(),customerEmail:"other@example.invalid"}).returning())[0].id;messageId=(await message()).id;
+  config={...config,maxNanoUsd:817500000};
+  const fresh=await lease();expect((await reserveSavIntakeCall(fresh,config,"other-request")).cached).toBeNull();
+  expect((await readSavIntakeBudget(config))).toMatchObject({chargedNanoUsd:817414500,lifetimeCallCount:2});
+  expect(await f.db.select().from(savActions)).toHaveLength(0);
+});
+
+it("confined usage permits superseded non-executable evidence but never qualification budgets",async()=>{
+  const {l}=await confinedUsageFixture();
+  await f.db.update(savIntakeRuns).set({state:"superseded",isCurrent:false}).where(eq(savIntakeRuns.id,l.run.id));
+  const qualification={...config,budgetProfile:undefined,maxRollingNanoUsd:undefined,maxCalls:30};
+  expect(await reconcileConfinedIntakeUsage(qualification)).toEqual({reconciled:0});
+  expect(await reconcileConfinedIntakeUsage(config)).toEqual({reconciled:1});
+  expect((await f.db.select().from(savIntakeRuns))[0]).toMatchObject({state:"superseded",isCurrent:false,leaseToken:null,freshUntil:null});
 });
