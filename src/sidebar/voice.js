@@ -7,6 +7,12 @@
 const VOICE_PAGE_ACTION_TOOLS = new Set([
   'click_element', 'navigate_internal', 'request_page_action', 'fill_field', 'type_text_into_page', 'scroll_page', 'open_page'
 ]);
+// create_in_limova opens a tab and sends a message: it only runs when the
+// sentence the user is saying right now asks for it or says yes to it, never
+// from an older request found in the conversation history.
+const VOICE_HANDOFF_GO_AHEAD = /\b(oui|ouais|ok|okay|d['’]accord|vas[- ]y|go|lance|lancer|envoie|envoyer|c['’]est bon|parfait|valide|yes|sure|do it|send it|vale|adelante)\b/i;
+const VOICE_HANDOFF_REQUEST = /\b(cr[ée]+e?r?|r[ée]dige[rz]?|[ée]cri[st]|[ée]crire|g[ée]n[èe]re[rz]?|pr[ée]pare[rz]?|fais[- ]moi|post|publication|mail|e-mail|article|newsletter|script|visuel|create|write|draft|crea|escribe|redacta)\b/i;
+const VOICE_HANDOFF_CONFIRM_HINT = 'Aucune demande de création ni aucun accord dans ce que l’utilisateur vient de dire : rien n’a été envoyé. Dis-lui en une phrase ce que tu proposes de créer dans Limova, à partir de quelle page, puis demande « Je lance ? » et attends sa réponse. N’appelle create_in_limova qu’après son oui.';
 const VOICE_HANDOFF_DONE_HINT = 'La demande est envoyée dans le chat Limova, avec le contenu de la page. Ne la renvoie pas et ne retape rien : dis brièvement que Limova prépare le contenu dans l’onglet ouvert, puis commente la réponse quand elle apparaît si l’utilisateur le souhaite.';
 const VOICE_CONTINUATION_HINT = 'Action réussie. Si l’objectif de la dernière demande de l’utilisateur demande encore des étapes, enchaîne tout de suite l’action suivante avec la carte DOM ci-jointe, sans attendre de nouvelle consigne ni lui demander de relancer. Ne t’arrête que lorsque l’objectif est atteint, qu’une information indispensable manque ou que l’étape suivante est sensible (paiement, suppression, données personnelles). Si l’utilisateur a demandé d’écrire puis d’envoyer, l’envoi fait partie de sa demande.';
 
@@ -39,6 +45,7 @@ class LimovaVoiceSession {
     this.pendingVisualCapture = null;
     this.currentTurnHasUserTranscript = false;
     this.currentTurnHasAssistantOutput = false;
+    this.currentUserTurnText = '';
     this.lastUserTranscriptAt = 0;
     this.lastAssistantOutputAt = 0;
     this.replyRecoveryTimer = null;
@@ -567,7 +574,9 @@ class LimovaVoiceSession {
         this.currentTurnHasAssistantOutput = false;
         this.replyRecoveryCount = 0;
         this.replyFallbackTurnAt = 0;
+        this.currentUserTurnText = '';
       }
+      this.currentUserTurnText = `${this.currentUserTurnText}${inputText}`.slice(-1_000);
       this.currentTurnHasUserTranscript = true;
       this.lastUserTranscriptAt = Date.now();
       clearTimeout(this.replyRecoveryTimer);
@@ -602,6 +611,7 @@ class LimovaVoiceSession {
         : 0;
       this.currentTurnHasUserTranscript = false;
       this.currentTurnHasAssistantOutput = false;
+      this.currentUserTurnText = '';
       clearTimeout(this.transcriptFlushTimer);
       this.transcriptFlushTimer = setTimeout(() => {
         this.emit('limova-voice-transcript', { role: 'user', text: '', final: true });
@@ -795,6 +805,10 @@ class LimovaVoiceSession {
           contextVersion: Number(result?.contextVersion || 0),
           elementCount: Number(result?.elementCount || 0)
         });
+      } else if (call.name === 'create_in_limova' && typeof call.args?.request === 'string'
+        && !VOICE_HANDOFF_GO_AHEAD.test(this.currentUserTurnText) && !VOICE_HANDOFF_REQUEST.test(this.currentUserTurnText)) {
+        result = { ok: false, confirmationRequired: true };
+        this.diagnostic('VOICE_LIMOVA_HANDOFF_HELD', { heardCharacters: this.currentUserTurnText.length });
       } else if (call.name === 'create_in_limova' && typeof call.args?.request === 'string') {
         // The background reads the page, opens Limova and sends the request in
         // its chat, then returns the map of the new conversation.
@@ -857,6 +871,9 @@ class LimovaVoiceSession {
           if (result.verificationRequired) response.verificationRequired = true;
           if (result.clarificationRequired) response.clarificationRequired = true;
         }
+      } else if (result?.confirmationRequired) {
+        response.status = 'needs_confirmation';
+        response.nextStep = VOICE_HANDOFF_CONFIRM_HINT;
       } else if (!result?.ok && result?.error) {
         response.reason = String(result.error).slice(0, 240);
         if (result.clarificationRequired) response.clarificationRequired = true;
@@ -984,6 +1001,7 @@ class LimovaVoiceSession {
     this.replyRecoveryTimer = null;
     this.currentTurnHasUserTranscript = false;
     this.currentTurnHasAssistantOutput = false;
+    this.currentUserTurnText = '';
     this.replyRecoveryCount = 0;
     this.replyFallbackTurnAt = 0;
     this.localSpeechFrames = 0;

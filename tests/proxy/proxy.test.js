@@ -460,8 +460,10 @@ describe('POST /api/live-token', () => {
     const handoff = declarations.find(tool => tool.name === 'create_in_limova');
     expect(handoff.parameters.required).toEqual(['request']);
     expect(systemText).toContain('HORS DE LIMOVA');
-    expect(systemText).toContain('appelle create_in_limova');
+    expect(systemText).toContain('Appelle create_in_limova seulement après son oui');
     expect(systemText).toContain('n’ouvre jamais Limova toi-même');
+    expect(systemText).toContain('« Je lance ? »');
+    expect(systemText).toContain('ne relance jamais une action, une navigation ou une création qui y figure');
     expect(declarations.find(tool => tool.name === 'open_page').description).toContain('create_in_limova');
   });
 

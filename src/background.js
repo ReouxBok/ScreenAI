@@ -748,6 +748,10 @@ async function handleMessage(request, sender) {
         voiceSessionGeneration += 1;
         for (const controller of voiceTokenControllers) controller.abort();
       }
+      // Ending the conversation also stops a Limova message Charly is still writing.
+      if (request.active !== true && voiceSessionActive) {
+        for (const tabId of [...presenceTabs]) hideAgentPresence(tabId, { stop: true });
+      }
       voiceSessionActive = request.active === true;
       if (voiceSessionActive && activeAbortController) activeAbortController.abort();
       if (sessionState.lockedTabId) {
@@ -4915,10 +4919,11 @@ async function showAgentPresence(tabId) {
   await chrome.tabs.sendMessage(tabId, { type: 'AGENT_PRESENCE', active: true }).catch(() => {});
 }
 
-function hideAgentPresence(tabId) {
+// With stop, the page also abandons what Charly is typing or about to send.
+function hideAgentPresence(tabId, { stop = false } = {}) {
   if (!tabId) return;
   presenceTabs.delete(tabId);
-  chrome.tabs.sendMessage(tabId, { type: 'AGENT_PRESENCE', active: false }).catch(() => {});
+  chrome.tabs.sendMessage(tabId, { type: 'AGENT_PRESENCE', active: false, ...(stop ? { stop: true } : {}) }).catch(() => {});
 }
 
 function stopAgent() {
@@ -4926,7 +4931,7 @@ function stopAgent() {
   activeAbortController?.abort();
   activeAbortController = null;
   pendingActions.clear();
-  for (const tabId of [...presenceTabs]) hideAgentPresence(tabId);
+  for (const tabId of [...presenceTabs]) hideAgentPresence(tabId, { stop: true });
   broadcastToSidebar({ type: 'AGENT_STOPPED' });
   broadcastToSidebar({ type: 'STATUS_UPDATE', status: 'ready' });
   Logger.event('agent', 'AGENT_STOPPED_BY_USER');
@@ -5186,6 +5191,7 @@ export {
   normalizeRequestedPageUrl,
   openPageForUser,
   stopAgent,
+  showAgentPresence,
   lockTab,
   privacySafeUrl,
   proposeOrExecuteAction,

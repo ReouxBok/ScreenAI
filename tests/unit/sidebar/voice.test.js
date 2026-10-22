@@ -1041,6 +1041,7 @@ describe('Gemini Live voice protocol', () => {
         ? { ok: true, sent: true, pageContext: 'Page: Limova — https://new.limova.ai/chat', contextVersion: 12, elementCount: 20 }
         : { ok: true }
     ));
+    session.handleServerMessage({ serverContent: { inputTranscription: { text: 'Oui, vas-y' } } });
 
     await session.handleToolCalls([{
       id: 'handoff-1', name: 'create_in_limova',
@@ -1053,6 +1054,26 @@ describe('Gemini Live voice protocol', () => {
     const { response } = socket.sent[0].toolResponse.functionResponses[0];
     expect(response).toMatchObject({ status: 'ok', contextVersion: 12 });
     expect(response.nextStep).toContain('Ne la renvoie pas');
+  });
+
+  it('holds a Limova creation the user has not asked for in what they just said', async () => {
+    const session = new VoiceSession();
+    const socket = new FakeWebSocket('wss://test');
+    socket.readyState = FakeWebSocket.OPEN;
+    session.socket = socket;
+    chromeMock.runtime.sendMessage.mockImplementation(async () => ({ ok: true }));
+    // The session just started: the only request is an old one in the history.
+    session.handleServerMessage({ serverContent: { inputTranscription: { text: 'Salut Charly' } } });
+
+    await session.handleToolCalls([{
+      id: 'handoff-2', name: 'create_in_limova',
+      args: { request: 'Rédige un post LinkedIn sur cet article' }
+    }]);
+
+    expect(chromeMock.runtime.sendMessage).not.toHaveBeenCalledWith(expect.objectContaining({ type: 'VOICE_CREATE_IN_LIMOVA' }));
+    const { response } = socket.sent.at(-1).toolResponse.functionResponses[0];
+    expect(response.status).toBe('needs_confirmation');
+    expect(response.nextStep).toContain('Je lance ?');
   });
 
   it('lets Gemini refresh the private DOM map through the packaged inspection tool', async () => {

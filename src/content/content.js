@@ -160,6 +160,7 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
   }
 
   if (request.type === 'AGENT_PRESENCE') {
+    if (request.stop === true) agentStopRequested = true;
     sendResponse(setAgentPresence(request.active === true, request.label || undefined));
   }
 
@@ -432,11 +433,13 @@ async function composeAndSendInChat(handoffId, rawPrompt) {
   if (/\/(auth|login|sign-?in)\b/i.test(window.location.pathname)) {
     return { ok: false, code: 'not_signed_in', error: 'Connecte-toi à Limova puis réessaie.' };
   }
-  const composer = await waitForCondition(findChatComposer, 25_000);
+  // A stop received while Limova is still loading also cancels this send.
+  agentStopRequested = false;
+  const composer = await waitForCondition(() => agentStopRequested || findChatComposer(), 25_000);
+  if (agentStopRequested) return STOPPED_BY_USER;
   if (!composer) return { ok: false, code: 'composer_not_found', error: 'Je ne trouve pas la zone de discussion de Limova.' };
   lastHandoff = { id: handoffId, result: { ok: false, code: 'in_progress' } };
 
-  agentStopRequested = false;
   setAgentPresence(true);
   try {
     composer.scrollIntoView({ behavior: 'smooth', block: 'center' });

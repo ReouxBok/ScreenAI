@@ -193,5 +193,14 @@ describe('closed side panel keeps the assistant silent', () => {
       expect(port.messages.map(message => message.type)).toContain('CORRECT_TAB');
       chromeMock.tabs.query.mockResolvedValue([]);
     });
+
+    it('stops a Limova message being written when the voice conversation ends', async () => {
+      await background.handleMessage({ type: 'VOICE_SESSION_STATE', active: true }, {});
+      await background.showAgentPresence(42);
+
+      await background.handleMessage({ type: 'VOICE_SESSION_STATE', active: false }, {});
+
+      expect(chromeMock.tabs.sendMessage).toHaveBeenCalledWith(42, { type: 'AGENT_PRESENCE', active: false, stop: true });
+    });
   });
 });
