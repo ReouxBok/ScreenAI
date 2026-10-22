@@ -1,5 +1,5 @@
 import {createHash} from "node:crypto";
-import {expect,it} from "vitest";
+import {expect,it,vi} from "vitest";
 import {readSavOtherAuthentication} from "../other-auth";
 import {savOtherFamilies,type SavOtherRegistry} from "../other-observation";
 import {qualifyIntakeOther,readIntakeOtherRules,intakeOtherQualificationFresh} from "./other-routing";
@@ -54,8 +54,11 @@ it("rejects duplicate headers, forwarded chain failures, a different Gmail respo
 });
 
 it("revalidates catalogue expiration after qualification before publication",async()=>{
- const now=new Date(),raw=JSON.parse(configuration());raw.expiresAt=new Date(now.getTime()+1000).toISOString();
- const catalogue=readIntakeOtherRules(JSON.stringify(raw),now),qualified=qualifyIntakeOther(input,registry,catalogue,await proof(),new Date());
- expect(qualified).not.toBeNull();expect(intakeOtherQualificationFresh(qualified!,JSON.stringify(raw),now)).toBe(true);
- expect(intakeOtherQualificationFresh(qualified!,JSON.stringify(raw),new Date(now.getTime()+1001))).toBe(false);
+ vi.useFakeTimers({toFake:["Date"]});vi.setSystemTime(new Date("2026-10-22T08:00:00.000Z"));
+ try {
+  const now=new Date(),raw=JSON.parse(configuration());raw.expiresAt=new Date(now.getTime()+1000).toISOString();
+  const catalogue=readIntakeOtherRules(JSON.stringify(raw),now),qualified=qualifyIntakeOther(input,registry,catalogue,await proof(),new Date());
+  expect(qualified).not.toBeNull();expect(intakeOtherQualificationFresh(qualified!,JSON.stringify(raw),now)).toBe(true);
+  expect(intakeOtherQualificationFresh(qualified!,JSON.stringify(raw),new Date(now.getTime()+1001))).toBe(false);
+ } finally {vi.useRealTimers();}
 });
