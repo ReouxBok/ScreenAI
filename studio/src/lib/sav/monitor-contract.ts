@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import { z } from "zod";
 
-export const monitorCodes = ["worker_missing", "worker_stalled", "worker_failed", "watch_unavailable", "ingestion_failed", "quarantine", "schema_missing", "configuration_invalid", "automation_off", "authority_expiring", "other_rules_expiring", "analysis_delayed", "analysis_uncertain", "execution_delayed", "effect_uncertain", "effect_failed", "daily_budget_low", "rolling_budget_low", "collection_failed"] as const;
+export const monitorCodes = ["worker_missing", "worker_stalled", "worker_failed", "watch_unavailable", "ingestion_failed", "ingestion_delayed", "quarantine", "schema_missing", "configuration_invalid", "automation_off", "authority_expiring", "other_rules_expiring", "analysis_delayed", "analysis_waiting", "analysis_uncertain", "execution_delayed", "effect_uncertain", "effect_failed", "daily_budget_low", "rolling_budget_low", "collection_failed"] as const;
 export type MonitorCode = typeof monitorCodes[number];
 const issue = z.object({ code: z.enum(monitorCodes), count: z.number().int().nonnegative().max(2_147_483_647), severity: z.enum(["warning", "critical"]) }).strict();
 const event = issue.extend({ change: z.enum(["opened", "worsened", "recovered"]), at: z.iso.datetime() });

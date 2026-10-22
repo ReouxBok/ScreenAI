@@ -2,7 +2,8 @@ import { randomUUID } from "node:crypto";
 import { beforeAll, beforeEach, afterAll, afterEach, expect, it, vi } from "vitest";
 import { eq } from "drizzle-orm";
 import { createSavTestDb } from "../../../test/sav-db";
-import { savMailboxes, savMessages, savThreads, savSyncState, auditLogs } from "@/db/schema";
+import { savMailboxes, savMessages, savThreads, savSyncState, auditLogs, savIntakeRuns, savGmailQuarantine } from "@/db/schema";
+import { encryptSavPayload } from "./crypto";
 const state = vi.hoisted(() => ({ db: null as unknown }));
 vi.mock("@/db", () => ({ requireDb: () => state.db }));
 import { collectSavMonitorSnapshot, recordSavWorkerPulse, runSavServerMonitor } from "./monitor";
@@ -15,6 +16,7 @@ beforeEach(async () => {
   await f.db.insert(savSyncState).values(markerValues);
   mailboxId = (await f.db.insert(savMailboxes).values({ email: "support@example.invalid", watchStatus: "active", watchExpiration: new Date(Date.now()+86400000) }).returning())[0].id;
   for (const [key, value] of Object.entries({ SAV_INTAKE_RUNTIME_MODE: "off", SAV_INTAKE_EXECUTION_MODE: "off", SAV_MONITOR_SLACK_WEBHOOK_URL: "", SAV_INTAKE_OTHER_RULES_JSON: "" })) vi.stubEnv(key, value);
+  vi.stubEnv("SAV_ENCRYPTION_KEY_V1","synthetic-monitor-encryption-key-123456789");
   vi.stubGlobal("fetch", vi.fn(() => { throw Error("NO_REAL_NETWORK"); }));
 });
 afterEach(() => { vi.unstubAllGlobals(); vi.unstubAllEnvs(); });
@@ -94,4 +96,46 @@ it("converts SQL exceptions into an explicit partial collection", async () => {
   const actual = state.db; state.db = { transaction: async () => { throw Error("SYNTHETIC_SQL_FAILED"); } };
   try { expect(await collectSavMonitorSnapshot()).toMatchObject({ complete: false, issues: [{ code: "collection_failed", count: 1, severity: "critical" }] }); }
   finally { state.db = actual; }
+});
+it("detects repeated worker starts without completion instead of hiding killed workers", async () => {
+  const now=Date.now();
+  for(const age of [1200,900,600,300,0])await recordSavWorkerPulse(randomUUID(),new Date(now-age*1000).toISOString());
+  const snapshot=await collectSavMonitorSnapshot();
+  expect(snapshot.metrics.workerAgeSeconds).toBeLessThan(5);
+  expect(snapshot.issues).toContainEqual({code:"worker_stalled",count:1,severity:"critical"});
+});
+it("keeps an unresolved old quarantine visible after its timestamps age",async()=>{
+  await f.db.insert(savGmailQuarantine).values({mailboxId,gmailMessageId:randomUUID(),cause:"synthetic",lastFailedAt:new Date(Date.now()-2*86400000)});
+  expect((await collectSavMonitorSnapshot()).issues).toContainEqual({code:"quarantine",count:1,severity:"warning"});
+});
+it("distinguishes exhausted technical analysis from a normal human context question",async()=>{
+  await launch();
+  const old=new Date(Date.now()-1200000);
+  for(const payload of [{reason:"SAV_INTAKE_RUNTIME_SOURCES_STALE"},{plan:{decision:{disposition:{kind:"collect_context"}}}}]) {
+    const thread=(await f.db.insert(savThreads).values({mailboxId,gmailThreadId:randomUUID(),customerEmail:"client@example.invalid"}).returning())[0];
+    const message=(await f.db.insert(savMessages).values({mailboxId,threadId:thread.id,direction:"inbound",fromEmail:"client@example.invalid",receivedAt:old,createdAt:old,bodyCiphertext:"not-read",analysisStatus:"intake_waiting"}).returning())[0];
+    await f.db.insert(savIntakeRuns).values({threadId:thread.id,messageId:message.id,version:1,state:"waiting",attempts:2,configHash:"a".repeat(64),policyHash:"b".repeat(64),payloadCiphertext:encryptSavPayload(payload),createdAt:old,updatedAt:old});
+  }
+  const snapshot=await collectSavMonitorSnapshot();expect(snapshot.complete).toBe(true);
+  expect(snapshot.issues).toContainEqual({code:"analysis_waiting",count:1,severity:"critical"});
+});
+it("isolates an uncertain delivery but still sends a new distinct incident",async()=>{
+  vi.stubEnv("SAV_MONITOR_SLACK_WEBHOOK_URL","https://hooks.slack.com/services/T123/B456/synthetic");
+  vi.mocked(fetch).mockRejectedValue(new Error("timeout"));
+  expect(await runSavServerMonitor()).toMatchObject({delivery:"uncertain"});
+  await f.db.update(savMailboxes).set({watchExpiration:new Date(0)});
+  vi.mocked(fetch).mockResolvedValue(new Response("ok"));
+  expect(await runSavServerMonitor()).toMatchObject({delivery:"sent"});
+  expect(fetch).toHaveBeenCalledTimes(2);
+  await runSavServerMonitor();expect(fetch).toHaveBeenCalledTimes(2);
+  expect((await f.db.select().from(savSyncState)).filter(r=>r.status==='delivery_uncertain')).toHaveLength(1);
+});
+it("bounds retries to a failed batch while allowing a later incident its own attempts",async()=>{
+  vi.stubEnv("SAV_MONITOR_SLACK_WEBHOOK_URL","https://hooks.slack.com/services/T123/B456/synthetic");
+  vi.mocked(fetch).mockImplementation(async()=>new Response("rejected",{status:400}));
+  for(let i=0;i<4;i++)await runSavServerMonitor();
+  expect(fetch).toHaveBeenCalledTimes(3);
+  await f.db.update(savMailboxes).set({watchExpiration:new Date(0)});
+  vi.mocked(fetch).mockResolvedValue(new Response("ok"));
+  expect(await runSavServerMonitor()).toMatchObject({delivery:"sent"});expect(fetch).toHaveBeenCalledTimes(4);
 });

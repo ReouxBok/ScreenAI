@@ -6,6 +6,7 @@ import { savSyncState, auditLogs } from "@/db/schema";
 import { savIntakeRuntimeConfig } from "./intake/runtime-contract";
 import { intakeExecutionConfig, readIntakeExecutionAuthority } from "./intake/execution-policy";
 import { readIntakeOtherRules } from "./intake/other-routing";
+import { decryptSavPayload } from "./crypto";
 import { monitorStateSchema, monitorCodes, nextMonitorState, monitorWebhook, monitorSlackText, monitorDeliveryHash, type MonitorState, type MonitorSnapshot, type MonitorIssue, type MonitorCode } from "./monitor-contract";
 
 const WORKER = "sav-monitor:v1:worker", STATE = "sav-monitor:v1:state", SNAPSHOT = "sav-monitor:v1:snapshot";
@@ -16,17 +17,18 @@ async function queryRows<T extends Record<string, unknown>>(tx: Pick<Tx, "execut
   if (!Array.isArray(rows) || rows.length > 100) throw Error("SAV_MONITOR_RESULT_INVALID");
   return rows as T[];
 }
-type Pulse = { id: string; startedAt: string; finishedAt?: string; failed?: boolean };
+type Pulse = { id: string; startedAt: string; finishedAt?: string; lastFinishedAt?: string; lastSucceededAt?: string; monitoringSince?: string; failed?: boolean };
 export async function recordSavWorkerPulse(id: string, startedAt: string, failed?: boolean) {
   try {
     await requireDb().transaction(async tx => {
       await tx.execute(sql`select set_config('statement_timeout','3s',true),set_config('lock_timeout','1s',true)`);
-      const value: Pulse = failed === undefined ? { id, startedAt } : { id, startedAt, finishedAt: new Date().toISOString(), failed };
+      const finishedAt = new Date().toISOString();
+      const value: Pulse = failed === undefined ? { id, startedAt } : { id, startedAt, finishedAt, lastFinishedAt: finishedAt, ...(!failed ? { lastSucceededAt: finishedAt } : {}), failed };
       const encoded = JSON.stringify(value);
-      if (failed === undefined) await tx.execute(sql`insert into sav.sync_state(key,status,cursor) values(${WORKER},'running',${encoded})
-        on conflict(key) do update set status='running',cursor=excluded.cursor
+      if (failed === undefined) await tx.execute(sql`insert into sav.sync_state(key,status,cursor) values(${WORKER},'running',${JSON.stringify({...value,monitoringSince:startedAt})})
+        on conflict(key) do update set status='running',cursor=(sav.sync_state.cursor::jsonb || ${encoded}::jsonb)::text
         where (sav.sync_state.cursor::jsonb->>'startedAt')::timestamptz <= ${startedAt}::timestamptz`);
-      else await tx.execute(sql`update sav.sync_state set status=${failed ? "failed" : "finished"},cursor=${encoded}
+      else await tx.execute(sql`update sav.sync_state set status=${failed ? "failed" : "finished"},cursor=(cursor::jsonb || ${encoded}::jsonb)::text
         where key=${WORKER} and cursor::jsonb->>'id'=${id}`);
     });
     return true;
@@ -52,18 +54,21 @@ export async function collectSavMonitorSnapshot(): Promise<MonitorSnapshot> {
       else {
         const p = JSON.parse(worker.cursor ?? "null") as Pulse;
         const age = now.getTime() - Date.parse(p.startedAt);
-        if (!Number.isFinite(age) || age < 0) throw Error("MONITOR_WORKER_CLOCK");
+        const completionAge = now.getTime()-Date.parse(p.lastFinishedAt ?? p.monitoringSince ?? p.startedAt);
+        if (!Number.isFinite(age) || age < 0 || !Number.isFinite(completionAge) || completionAge < 0) throw Error("MONITOR_WORKER_CLOCK");
         metrics.workerAgeSeconds = Math.floor(age / 1000);
-        add("worker_stalled", age > 15 * 60000 ? 1 : 0, "critical"); add("worker_failed", worker.status === "failed" ? 1 : 0, "critical");
+        metrics.workerCompletionAgeSeconds=Math.floor(completionAge/1000);
+        add("worker_stalled", age > 15 * 60000 || completionAge > 15*60000 ? 1 : 0, "critical"); add("worker_failed", worker.status === "failed" ? 1 : 0, "critical");
       }
       const launches = rows.filter(r => r.status === "intake_launch_v1" && r.key.startsWith("sav-intake-launch:"));
       metrics.launchedMailboxes = launches.length;
       const watches = await queryRows<{ count: number }>(tx,sql`select count(*)::int as count from sav.mailboxes where active and (watch_status <> 'watching' and watch_status <> 'active' or watch_expiration is null or watch_expiration < ${new Date(now.getTime() + 3600000)})`);
       add("watch_unavailable", watches[0]?.count ?? 0, "critical");
-      const from = new Date(now.getTime() - 86400000);
-      const receipts = await queryRows<{ count: number }>(tx,sql`select count(*)::int as count from sav.webhook_receipts where received_at >= ${from} and status in ('failed','uncertain')`);
+      const receipts = await queryRows<{ count: number; delayed: number }>(tx,sql`select count(*) filter(where status in ('failed','uncertain'))::int as count,
+        count(*) filter(where status in ('pending','processing') and received_at < ${new Date(now.getTime()-600000)})::int as delayed from sav.webhook_receipts`);
       add("ingestion_failed", receipts[0]?.count ?? 0, "critical");
-      const quarantine = await queryRows<{ count: number }>(tx,sql`select count(*)::int as count from sav.gmail_quarantine where status='quarantined' and last_failed_at >= ${from}`);
+      add("ingestion_delayed", receipts[0]?.delayed ?? 0, "critical");
+      const quarantine = await queryRows<{ count: number }>(tx,sql`select count(*)::int as count from sav.gmail_quarantine where status='quarantined'`);
       add("quarantine", quarantine[0]?.count ?? 0);
       if (!launches.length) return;
       if (!rows.some(r => r.key === "sav-intake-console-schema-v1" && r.status === "installed") || !rows.some(r => r.key === "sav-intake-execution-schema-v1" && r.status === "installed")) {
@@ -82,8 +87,21 @@ export async function collectSavMonitorSnapshot(): Promise<MonitorSnapshot> {
       metrics.pending = messages[0]?.pending ?? 0; metrics.oldestPendingSeconds = Math.max(0, messages[0]?.oldest ?? 0);
       add("analysis_delayed", metrics.oldestPendingSeconds > 600 ? metrics.pending : 0, metrics.oldestPendingSeconds > 1800 ? "critical" : "warning");
       add("analysis_uncertain", messages[0]?.uncertain ?? 0, "critical");
+      const waiting = await queryRows<{payload_ciphertext:string;attempts:number}>(tx,sql`select r.payload_ciphertext,r.attempts from sav.intake_runs r
+        join sav.messages m on m.id=r.message_id join sav.threads t on t.id=r.thread_id
+        join sav.sync_state l on l.key='sav-intake-launch:'||m.mailbox_id::text and l.status='intake_launch_v1'
+        where r.is_current and r.state='waiting' and not t.ai_paused and r.updated_at < ${new Date(now.getTime()-600000)}
+        and m.received_at>(l.cursor::jsonb->>'receivedAfter')::timestamptz and m.created_at>(l.cursor::jsonb->>'createdAfter')::timestamptz
+        order by r.updated_at limit 100`);
+      let technicalWaiting=0;
+      for(const row of waiting) {
+        const value=decryptSavPayload<{reason?:unknown;plan?:{decision?:{disposition?:{kind?:string}}}}>(row.payload_ciphertext);
+        if(typeof value.reason==='string' && /^SAV_[A-Z_]+$/.test(value.reason) || !value.plan && row.attempts>=2) technicalWaiting++;
+      }
+      add("analysis_waiting",technicalWaiting,"critical");
+      if(waiting.length===100) {snapshot.complete=false;add("collection_failed",1,"critical");}
       const executions = await queryRows<{ count: number }>(tx,sql`select count(*)::int as count from sav.intake_executions e join sav.intake_runs r on r.id=e.run_id
-        join sav.threads t on t.id=e.thread_id where r.is_current and not t.ai_paused and e.state in ('pending','running','uncertain') and e.updated_at < ${new Date(now.getTime()-600000)}`);
+        join sav.threads t on t.id=e.thread_id where r.is_current and not t.ai_paused and e.state in ('pending','running','uncertain','waiting') and e.updated_at < ${new Date(now.getTime()-600000)}`);
       add("execution_delayed", executions[0]?.count ?? 0, "critical");
       const effects = await queryRows<{ uncertain: number; failed: number }>(tx,sql`select count(*) filter(where state in ('uncertain','dispatched','acked') and confirmed_at is null)::int as uncertain,
         count(*) filter(where state='failed')::int as failed from sav.intake_effects`);
@@ -118,6 +136,10 @@ export async function runSavServerMonitor() {
     const [row] = await tx.select().from(savSyncState).where(eq(savSyncState.key, STATE));
     const previous = row ? monitorStateSchema.parse(JSON.parse(row.cursor ?? "null")) : null;
     if (previous && Date.parse(previous.leaseUntil) > now.getTime()) return null;
+    if(previous && (previous.delivery.state==='dispatched'||previous.delivery.state==='uncertain') && previous.delivery.hash && previous.events.length) {
+      await tx.insert(savSyncState).values({key:`sav-monitor:v1:delivery:${previous.delivery.hash}`,status:'delivery_uncertain',cursor:JSON.stringify({delivery:{...previous.delivery,state:'uncertain'},events:previous.events})}).onConflictDoNothing();
+      previous.events=[];
+    }
     const next: MonitorState = previous ? { ...previous, owner, leaseUntil: new Date(now.getTime()+90000).toISOString(), delivery: previous.delivery.state === "dispatched" ? { ...previous.delivery, state: "uncertain" } : previous.delivery }
       : { revision: 1, owner, leaseUntil: new Date(now.getTime()+90000).toISOString(), observedAt: null, issues: [], events: [], delivery: { state: "idle", hash: null, attempts: 0, at: null } };
     await tx.insert(savSyncState).values({ key: STATE, status: "running", cursor: JSON.stringify(next) }).onConflictDoUpdate({ target: savSyncState.key, set: { status: "running", cursor: JSON.stringify(next) } });
@@ -126,25 +148,31 @@ export async function runSavServerMonitor() {
   if (!initial) return { skipped: "already_running" };
   const snapshot = await collectSavMonitorSnapshot();
   const state = nextMonitorState(initial, snapshot);
-  const persist = async () => requireDb().transaction(async tx => {
+  const persist = async (receipt?: { hash:string; status:string; events:MonitorState['events'] }) => requireDb().transaction(async tx => {
     await tx.execute(sql`select set_config('statement_timeout','5s',true),set_config('lock_timeout','1s',true)`);
     const changed = await tx.update(savSyncState).set({ status: "observed", cursor: JSON.stringify(state) }).where(sql`${savSyncState.key}=${STATE} and ${savSyncState.cursor}::jsonb->>'owner'=${owner}`).returning({ key: savSyncState.key });
     if (!changed.length) throw Error("SAV_MONITOR_LEASE_LOST");
+    if(receipt)await tx.insert(savSyncState).values({key:`sav-monitor:v1:delivery:${receipt.hash}`,status:receipt.status,cursor:JSON.stringify({delivery:state.delivery,events:receipt.events})}).onConflictDoUpdate({target:savSyncState.key,set:{status:receipt.status,cursor:JSON.stringify({delivery:state.delivery,events:receipt.events})}});
     await tx.insert(savSyncState).values({ key: SNAPSHOT, status: snapshot.complete ? "complete" : "partial", cursor: JSON.stringify(snapshot) }).onConflictDoUpdate({ target: savSyncState.key, set: { status: snapshot.complete ? "complete" : "partial", cursor: JSON.stringify(snapshot) } });
   });
   const webhook = monitorWebhook(process.env.SAV_MONITOR_SLACK_WEBHOOK_URL);
   if (!webhook && state.delivery.state !== "uncertain") state.delivery = { ...state.delivery, state: "unconfigured" };
   await persist();
-  if (webhook && state.events.length && state.delivery.state !== "uncertain" && state.delivery.attempts < 3) {
-    const text = monitorSlackText(snapshot, state.events), hash = monitorDeliveryHash(text);
-    state.delivery = { state: "dispatched", hash, attempts: state.delivery.attempts+1, at: new Date().toISOString() }; await persist();
+  if (webhook && state.events.length) {
+    const batch=state.events, text = monitorSlackText(snapshot, batch), hash = monitorDeliveryHash(JSON.stringify(batch));
+    const attempts=state.delivery.hash===hash?state.delivery.attempts:0;
+    if(attempts>=3||state.delivery.hash===hash&&state.delivery.state==='uncertain') {state.events=[];await persist({hash,status:state.delivery.state==='uncertain'?'delivery_uncertain':'delivery_failed',events:batch});}
+    else {
+    state.delivery = { state: "dispatched", hash, attempts: attempts+1, at: new Date().toISOString() }; await persist({hash,status:'delivery_dispatched',events:batch});
     try {
       const response = await fetch(webhook, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ text, unfurl_links: false, unfurl_media: false }), redirect: "error", signal: AbortSignal.timeout(5000) });
       if (response.ok && (await response.text()).trim() === "ok") {
         state.delivery = { ...state.delivery, state: "sent", attempts: 0 }; state.events = [];
       } else state.delivery = { ...state.delivery, state: response.status >= 400 && response.status < 500 ? "failed" : "uncertain" };
     } catch { state.delivery = { ...state.delivery, state: "uncertain" }; }
-    await persist();
+    if(state.delivery.state==='uncertain'||state.delivery.attempts>=3)state.events=[];
+    await persist({hash,status:`delivery_${state.delivery.state}`,events:batch});
+    }
   }
   state.leaseUntil = new Date().toISOString(); await persist();
   await requireDb().insert(auditLogs).values({ actorEmail: "system", action: "sav_monitor_observed", entityType: "sav_monitor", entityId: owner,
