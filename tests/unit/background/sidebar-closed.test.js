@@ -1,0 +1,117 @@
+// @vitest-environment jsdom
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
+import { installFullChromeMock, uninstallFullChromeMock } from '../../helpers/chrome-mock-full.js';
+
+const LIMOVA_TAB = 17;
+const MODAL = { title: 'Connecter Google Drive', role: 'dialog', controls: ['Autoriser'] };
+
+function createSidebarPort() {
+  const disconnectListeners = [];
+  return {
+    name: 'sidebar',
+    messages: [],
+    postMessage: vi.fn(function postMessage(message) { this.messages.push(message); }),
+    onDisconnect: { addListener: vi.fn(listener => disconnectListeners.push(listener)) },
+    disconnect() {
+      disconnectListeners.splice(0).forEach(listener => listener());
+    }
+  };
+}
+
+function analysisStatuses(port, chromeMock) {
+  return [
+    ...port.messages,
+    ...chromeMock.runtime.sendMessage.mock.calls.map(([message]) => message)
+  ].filter(message => message?.type === 'STATUS_UPDATE' && message.status === 'analyzing');
+}
+
+describe('closed side panel keeps the assistant silent', () => {
+  let background;
+  let chromeMock;
+  let port;
+
+  beforeAll(async () => {
+    chromeMock = installFullChromeMock();
+    globalThis.fetch = vi.fn(async () => ({ ok: true, status: 200, json: async () => ({}) }));
+    vi.resetModules();
+    background = await import('../../../src/background.js');
+    await new Promise(resolve => setTimeout(resolve, 0));
+  });
+
+  afterAll(() => {
+    uninstallFullChromeMock();
+    delete globalThis.fetch;
+  });
+
+  beforeEach(async () => {
+    port = createSidebarPort();
+    chromeMock._listeners.runtime.onConnect[0](port);
+    background.handleResetSession();
+    await chromeMock.storage.local.set({ limova_ai_processing_consent_v1: true });
+    chromeMock.scripting.executeScript.mockResolvedValue([{ result: '' }]);
+    background.lockTab(LIMOVA_TAB);
+    chromeMock.tabs.sendMessage.mockReset();
+    chromeMock.tabs.sendMessage.mockResolvedValue({ ok: true });
+    chromeMock.runtime.sendMessage.mockClear();
+    delete chromeMock.runtime.getContexts;
+    port.messages.length = 0;
+  });
+
+  afterEach(() => port.disconnect());
+
+  it('analyzes a detected modal while the panel is open', async () => {
+    await background.handleMessage({ type: 'MODAL_DETECTED', modal: MODAL }, { tab: { id: LIMOVA_TAB } });
+
+    expect(analysisStatuses(port, chromeMock)).toHaveLength(1);
+  });
+
+  it('stops page observation and ignores modals once the panel is closed', async () => {
+    port.disconnect();
+
+    expect(chromeMock.tabs.sendMessage).toHaveBeenCalledWith(LIMOVA_TAB, { type: 'SESSION_STATE', active: false });
+    const result = await background.handleMessage({ type: 'MODAL_DETECTED', modal: MODAL }, { tab: { id: LIMOVA_TAB } });
+
+    expect(result).toEqual({ ok: true, ignored: true });
+    expect(analysisStatuses(port, chromeMock)).toHaveLength(0);
+  });
+
+  it('does not analyze a new page after the panel is closed', async () => {
+    port.disconnect();
+    chromeMock._listeners.tabs.onUpdated[0](LIMOVA_TAB, { status: 'complete' }, { url: 'https://new.limova.ai/documents' });
+    await new Promise(resolve => setTimeout(resolve, 600));
+
+    expect(analysisStatuses(port, chromeMock)).toHaveLength(0);
+    expect(chromeMock.tabs.sendMessage).not.toHaveBeenCalledWith(LIMOVA_TAB, expect.objectContaining({ type: 'HIGHLIGHT_ELEMENT' }));
+  });
+
+  it('ignores manual page interactions after the panel is closed', async () => {
+    port.disconnect();
+    const result = await background.handleMessage(
+      { type: 'USER_PAGE_INTERACTION', interaction: { kind: 'click', label: 'Documents' } },
+      { tab: { id: LIMOVA_TAB, url: 'https://new.limova.ai/' } }
+    );
+
+    expect(result).toEqual({ ok: true, ignored: true });
+  });
+
+  it('resumes page observation when the panel reopens', async () => {
+    port.disconnect();
+    chromeMock.tabs.sendMessage.mockClear();
+    port = createSidebarPort();
+    chromeMock._listeners.runtime.onConnect[0](port);
+
+    expect(chromeMock.tabs.sendMessage).toHaveBeenCalledWith(LIMOVA_TAB, { type: 'SESSION_STATE', active: true });
+    await background.handleMessage({ type: 'MODAL_DETECTED', modal: MODAL }, { tab: { id: LIMOVA_TAB } });
+    expect(analysisStatuses(port, chromeMock)).toHaveLength(1);
+  });
+
+  it('keeps working when a restarted worker has not received the open panel port yet', async () => {
+    port.disconnect();
+    chromeMock.runtime.getContexts = vi.fn(async () => [{ contextType: 'SIDE_PANEL' }]);
+
+    const result = await background.handleMessage({ type: 'MODAL_DETECTED', modal: MODAL }, { tab: { id: LIMOVA_TAB } });
+
+    expect(result).not.toEqual({ ok: true, ignored: true });
+    expect(chromeMock.runtime.getContexts).toHaveBeenCalledWith({ contextTypes: ['SIDE_PANEL'] });
+  });
+});

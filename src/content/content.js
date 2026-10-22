@@ -118,6 +118,7 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
 
   if (request.type === 'SESSION_STATE') {
     assistantSessionActive = request.active === true;
+    if (!assistantSessionActive) clearHighlights();
     refreshModalObserver();
     refreshAssistantInteractionCapture();
   }

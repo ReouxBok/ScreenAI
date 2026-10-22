@@ -353,6 +353,7 @@ async function handleUrlChange(tabId, url, { force = false } = {}) {
     await recordTrainingContext(context, url);
   }
   if (!sessionState.isActive) return;
+  if (!(await isSidebarOpen())) return;
   if (!(await hasAIProcessingConsent())) return;
   if (generation !== sessionGeneration) return;
   url = privacySafeUrl(url);
@@ -1435,6 +1436,7 @@ async function handleModalDetected(sender, modal = {}) {
     });
   }
   if (!sessionState.isActive) return { ok: true };
+  if (!(await isSidebarOpen())) return { ok: true, ignored: true };
   if (!(await hasAIProcessingConsent())) return { ok: false };
   if (generation !== sessionGeneration) return { ok: true };
 
@@ -3353,6 +3355,7 @@ async function handleUserPageInteraction(rawInteraction, sender) {
     });
   }
   if ((!sessionState.isActive && !voiceSessionActive) || trainingState.active) return { ok: true, ignored: true };
+  if (!(await isSidebarOpen())) return { ok: true, ignored: true };
   const tabId = sender?.tab?.id;
   if (!tabId || (sessionState.lockedTabId && tabId !== sessionState.lockedTabId)) {
     return { ok: true, ignored: true };
@@ -4669,13 +4672,52 @@ function cancelPendingAction(actionId) {
 
 // Port-based communication with sidebar (reliable for large payloads)
 let sidebarPort = null;
+const sidebarPorts = new Set();
 
 chrome.runtime.onConnect.addListener((port) => {
   if (port.name === 'sidebar') {
+    const wasClosed = sidebarPorts.size === 0;
+    sidebarPorts.add(port);
     sidebarPort = port;
-    port.onDisconnect.addListener(() => { sidebarPort = null; });
+    if (wasClosed) resumeAfterSidebarOpened();
+    port.onDisconnect.addListener(() => {
+      sidebarPorts.delete(port);
+      if (sidebarPort === port) sidebarPort = [...sidebarPorts].at(-1) || null;
+      if (sidebarPorts.size === 0) pauseWhileSidebarClosed();
+    });
   }
 });
+
+async function isSidebarOpen() {
+  if (sidebarPorts.size > 0) return true;
+  // A restarted service worker can receive a navigation event a few
+  // milliseconds before the still-open panel reconnects its port.
+  const contexts = await chrome.runtime.getContexts?.({ contextTypes: ['SIDE_PANEL'] }).catch(() => null);
+  return Array.isArray(contexts) && contexts.length > 0;
+}
+
+// A closed panel must leave the page alone: no analysis, highlight or action
+// keeps running behind the user's back. The conversation is kept for reopening.
+function pauseWhileSidebarClosed() {
+  sessionGeneration += 1;
+  activeAbortController?.abort();
+  activeAbortController = null;
+  if (urlChangeTimeout) clearTimeout(urlChangeTimeout);
+  urlChangeTimeout = null;
+  pendingActions.clear();
+  for (const controller of voiceTokenControllers) controller.abort();
+  voiceSessionActive = false;
+  voiceSessionGeneration += 1;
+  if (sessionState.lockedTabId) {
+    chrome.tabs.sendMessage(sessionState.lockedTabId, { type: 'SESSION_STATE', active: false }).catch(() => {});
+  }
+  Logger.event('sidebar', 'SIDEBAR_CLOSED_ASSISTANT_PAUSED', { hadLockedTab: Boolean(sessionState.lockedTabId) });
+}
+
+function resumeAfterSidebarOpened() {
+  if (!sessionState.lockedTabId || !sessionState.isActive) return;
+  chrome.tabs.sendMessage(sessionState.lockedTabId, { type: 'SESSION_STATE', active: true }).catch(() => {});
+}
 
 function broadcastToSidebar(message) {
   if (sidebarPort) {
