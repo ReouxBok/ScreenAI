@@ -5,6 +5,7 @@ import { withSavAiBudget, requestSavGeminiJson, savGeminiGenerationConfig, savAi
 import { evaluationHash, evaluationConfig, evaluationContinuationProof, type EvaluationBatch, type ServerEvaluationConfig } from "./server-contract";
 import { claimServerEvaluation, reserveServerEvaluationCall, settleServerEvaluationCall, saveServerEvaluationResult, readServerEvaluation } from "./server-ledger";
 import type { IntakeAdapters, ReadResult } from "./engine-types";
+import { SAV_INTAKE_MODEL_LIMITS } from "./model-limits";
 
 /** Deliberately has no HubSpot/Gmail/network reader or operational service. */
 export function snapshotEvaluationReaders(item: EvaluationBatch["cases"][number]): Pick<IntakeAdapters, "findContactsByEmail" | "getContact" | "directAssociations" | "ticketsForContact" | "ticketHistory"> {
@@ -70,7 +71,7 @@ export async function runServerEvaluation(batch: EvaluationBatch, config: Server
           || !["understanding", "ticket_matching"].includes(input.phase)) throw Error("SAV_EVAL_DISPATCH_REJECTED");
         const key = env().SAV_GEMINI_API_KEY!;
         const expectedBody = JSON.stringify({ ...input.body, generationConfig: savGeminiGenerationConfig(config.model, input.body.generationConfig) });
-        if (Buffer.byteLength(expectedBody, "utf8") > 65_536 || input.body.generationConfig.maxOutputTokens !== 8192) throw Error("SAV_EVAL_REQUEST_REJECTED");
+        if (Buffer.byteLength(expectedBody, "utf8") > SAV_INTAKE_MODEL_LIMITS.wireTextBytes || input.body.generationConfig.maxOutputTokens !== 8192) throw Error("SAV_EVAL_REQUEST_REJECTED");
         let reservation: string | null = null, sent = false;
         const guardedNetwork: typeof fetch = async (url, init) => {
           assertLive();
