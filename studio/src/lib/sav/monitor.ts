@@ -62,10 +62,10 @@ export async function collectSavMonitorSnapshot(): Promise<MonitorSnapshot> {
       }
       const launches = rows.filter(r => r.status === "intake_launch_v1" && r.key.startsWith("sav-intake-launch:"));
       metrics.launchedMailboxes = launches.length;
-      const watches = await queryRows<{ count: number }>(tx,sql`select count(*)::int as count from sav.mailboxes where active and (watch_status <> 'watching' and watch_status <> 'active' or watch_expiration is null or watch_expiration < ${new Date(now.getTime() + 3600000)})`);
+      const watches = await queryRows<{ count: number }>(tx,sql`select count(*)::int as count from sav.mailboxes where active and (watch_status <> 'watching' and watch_status <> 'active' or watch_expiration is null or watch_expiration < ${new Date(now.getTime() + 3600000).toISOString()})`);
       add("watch_unavailable", watches[0]?.count ?? 0, "critical");
       const receipts = await queryRows<{ count: number; delayed: number }>(tx,sql`select count(*) filter(where status in ('failed','uncertain'))::int as count,
-        count(*) filter(where status in ('pending','processing') and received_at < ${new Date(now.getTime()-600000)})::int as delayed from sav.webhook_receipts`);
+        count(*) filter(where status in ('pending','processing') and received_at < ${new Date(now.getTime()-600000).toISOString()})::int as delayed from sav.webhook_receipts`);
       add("ingestion_failed", receipts[0]?.count ?? 0, "critical");
       add("ingestion_delayed", receipts[0]?.delayed ?? 0, "critical");
       const quarantine = await queryRows<{ count: number }>(tx,sql`select count(*)::int as count from sav.gmail_quarantine where status='quarantined'`);
@@ -77,7 +77,7 @@ export async function collectSavMonitorSnapshot(): Promise<MonitorSnapshot> {
       add("automation_off", snapshot.runtimeMode !== "observe" || snapshot.executionMode !== "execute" ? 1 : 0);
       const messages = await queryRows<{ pending: number; oldest: number | null; uncertain: number }>(tx,sql`select
         count(*) filter(where m.analysis_status in ('pending','intake_pending','intake_analysing'))::int as pending,
-        extract(epoch from (${now}::timestamptz-min(m.created_at) filter(where m.analysis_status in ('pending','intake_pending','intake_analysing'))))::int as oldest,
+        extract(epoch from (${now.toISOString()}::timestamptz-min(m.created_at) filter(where m.analysis_status in ('pending','intake_pending','intake_analysing'))))::int as oldest,
         count(*) filter(where m.analysis_status='intake_uncertain')::int as uncertain
         from sav.messages m join sav.threads t on t.id=m.thread_id
         join sav.sync_state l on l.key='sav-intake-launch:'||m.mailbox_id::text and l.status='intake_launch_v1'
@@ -90,7 +90,7 @@ export async function collectSavMonitorSnapshot(): Promise<MonitorSnapshot> {
       const waiting = await queryRows<{payload_ciphertext:string;attempts:number}>(tx,sql`select r.payload_ciphertext,r.attempts from sav.intake_runs r
         join sav.messages m on m.id=r.message_id join sav.threads t on t.id=r.thread_id
         join sav.sync_state l on l.key='sav-intake-launch:'||m.mailbox_id::text and l.status='intake_launch_v1'
-        where r.is_current and r.state='waiting' and not t.ai_paused and r.updated_at < ${new Date(now.getTime()-600000)}
+        where r.is_current and r.state='waiting' and not t.ai_paused and r.updated_at < ${new Date(now.getTime()-600000).toISOString()}
         and m.received_at>(l.cursor::jsonb->>'receivedAfter')::timestamptz and m.created_at>(l.cursor::jsonb->>'createdAfter')::timestamptz
         order by r.updated_at limit 100`);
       let technicalWaiting=0;
@@ -101,14 +101,14 @@ export async function collectSavMonitorSnapshot(): Promise<MonitorSnapshot> {
       add("analysis_waiting",technicalWaiting,"critical");
       if(waiting.length===100) {snapshot.complete=false;add("collection_failed",1,"critical");}
       const executions = await queryRows<{ count: number }>(tx,sql`select count(*)::int as count from sav.intake_executions e join sav.intake_runs r on r.id=e.run_id
-        join sav.threads t on t.id=e.thread_id where r.is_current and not t.ai_paused and e.state in ('pending','running','uncertain','waiting') and e.updated_at < ${new Date(now.getTime()-600000)}`);
+        join sav.threads t on t.id=e.thread_id where r.is_current and not t.ai_paused and e.state in ('pending','running','uncertain','waiting') and e.updated_at < ${new Date(now.getTime()-600000).toISOString()}`);
       add("execution_delayed", executions[0]?.count ?? 0, "critical");
       const effects = await queryRows<{ uncertain: number; failed: number }>(tx,sql`select count(*) filter(where state in ('uncertain','dispatched','acked') and confirmed_at is null)::int as uncertain,
         count(*) filter(where state='failed')::int as failed from sav.intake_effects`);
       add("effect_uncertain", effects[0]?.uncertain ?? 0, "critical"); add("effect_failed", effects[0]?.failed ?? 0, "critical");
       const budget = await queryRows<{ daily: string; rolling: string }>(tx,sql`select
-        coalesce(sum(charged_nano_usd) filter(where state<>'settled' or created_at >= date_trunc('day',${now}::timestamptz at time zone 'UTC') at time zone 'UTC'),0)::text as daily,
-        coalesce(sum(charged_nano_usd) filter(where state<>'settled' or created_at >= ${new Date(now.getTime()-30*86400000)}),0)::text as rolling from sav.intake_model_calls`);
+        coalesce(sum(charged_nano_usd) filter(where state<>'settled' or created_at >= date_trunc('day',${now.toISOString()}::timestamptz at time zone 'UTC') at time zone 'UTC'),0)::text as daily,
+        coalesce(sum(charged_nano_usd) filter(where state<>'settled' or created_at >= ${new Date(now.getTime()-30*86400000).toISOString()}),0)::text as rolling from sav.intake_model_calls`);
       metrics.dailyNanoUsd = Number(budget[0]?.daily ?? 0); metrics.rollingNanoUsd = Number(budget[0]?.rolling ?? 0);
       add("daily_budget_low", metrics.dailyNanoUsd >= 2400000000 ? 1 : 0); add("rolling_budget_low", metrics.rollingNanoUsd >= 72000000000 ? 1 : 0);
     });
@@ -123,7 +123,16 @@ export async function collectSavMonitorSnapshot(): Promise<MonitorSnapshot> {
       const other = readIntakeOtherRules();
       add("other_rules_expiring", other && Date.parse(other.expiresAt)-now.getTime()<86400000 ? 1 : 0);
     } catch { add("configuration_invalid", 1, "critical"); snapshot.complete = false; }
-  } catch { add("collection_failed", 1, "critical"); snapshot.complete = false; }
+  } catch (error) {
+    let current: unknown=error, errorCode="COLLECTION_FAILED";
+    for(let depth=0;depth<4 && current && typeof current==='object';depth++) {
+      const value=current as {code?:unknown;cause?:unknown};
+      if(typeof value.code==='string'&&/^[A-Z0-9_]{2,50}$/.test(value.code)){errorCode=value.code;break;}
+      current=value.cause;
+    }
+    console.error("sav_monitor_collection_failed",{errorCode});
+    add("collection_failed", 1, "critical"); snapshot.complete = false;
+  }
   return snapshot;
 }
 

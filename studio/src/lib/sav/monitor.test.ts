@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { beforeAll, beforeEach, afterAll, afterEach, expect, it, vi } from "vitest";
-import { eq } from "drizzle-orm";
+import { eq, sql } from "drizzle-orm";
+import { PgDialect } from "drizzle-orm/pg-core";
 import { createSavTestDb } from "../../../test/sav-db";
 import { savMailboxes, savMessages, savThreads, savSyncState, auditLogs, savIntakeRuns, savGmailQuarantine } from "@/db/schema";
 import { encryptSavPayload } from "./crypto";
@@ -43,6 +44,22 @@ it("collects watch/worker problems without reading absent intake state before la
   const snapshot = await collectSavMonitorSnapshot();
   expect(snapshot.complete).toBe(true); expect(snapshot.metrics.launchedMailboxes).toBe(0);
   expect(snapshot.issues.map(i => i.code)).toEqual(["worker_missing", "watch_unavailable"]);
+});
+it("serializes all raw SQL timestamps as strings for the native PostgreSQL adapter",async()=>{
+  await launch();
+  const actual=state.db;
+  state.db={transaction:(work:(tx:unknown)=>Promise<unknown>)=>f.db.transaction(tx=>work(new Proxy(tx,{
+    get(target,key){
+      if(key==='execute')return(statement:Parameters<typeof tx.execute>[0])=>{
+        const compiled=new PgDialect().sqlToQuery(typeof statement==='string'?sql.raw(statement):statement.getSQL());
+        expect(compiled.params.some(p=>p instanceof Date)).toBe(false);
+        return target.execute(statement);
+      };
+      const value=Reflect.get(target,key);return typeof value==='function'?value.bind(target):value;
+    }
+  })))};
+  try {expect((await collectSavMonitorSnapshot()).complete).toBe(true);}
+  finally{state.db=actual;}
 });
 it("counts only new latest unpaused pending messages and excludes historical mail", async () => {
   await launch();
