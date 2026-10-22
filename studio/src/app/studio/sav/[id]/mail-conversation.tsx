@@ -6,9 +6,11 @@ import { savMailDisplay } from "@/lib/sav/mail-display";
 import type { getSavThreadDetail } from "@/lib/sav/service";
 import type { SavTranslationView } from "@/lib/sav/translations";
 import styles from "./thread.module.css";
+import { AttachmentObservations } from "./attachment-observations";
 
 type Message = NonNullable<Awaited<ReturnType<typeof getSavThreadDetail>>>["messages"][number];
-type Messages = Array<Pick<Message, "id" | "receivedAt" | "createdAt" | "direction" | "fromEmail"> & { translation?:SavTranslationView; body: Pick<Message["body"], "text" | "attachments"> }>;
+type AttachmentView = Pick<NonNullable<Message["body"]["attachmentRead"]>, "readerRevision" | "observations">;
+type Messages = Array<Pick<Message, "id" | "receivedAt" | "createdAt" | "direction" | "fromEmail"> & { translation?: SavTranslationView; body: Pick<Message["body"], "text" | "attachments" | "attachmentInventory"> & { attachmentRead?: AttachmentView | null } }>;
 const dateFormat = { format: (value: Date) => formatParisDateTime(value, { dateStyle: "medium", timeStyle: "short" }) };
 
 function EmailMessage({ message, text = message.body.text }: { message: Messages[number]; text?: string }) {
@@ -19,7 +21,7 @@ function EmailMessage({ message, text = message.body.text }: { message: Messages
     {translated&&<p role="status">Ce mail a été traduit de {languages[translation!.language]??"sa langue d’origine"}. <button type="button" className="secondary" onClick={()=>setShowOriginal(value=>!value)}>{showOriginal?"Voir la traduction":"Voir l’original"}</button></p>}
     {translation&&!translated&&translation.status!=="not_required"&&<p role="status">Original affiché · {({pending:translation.errorCode?.startsWith("SAV_DERIVED_")?"traduction en attente du budget · reprise automatique":"traduction en préparation",partial:"traduction partielle non affichée",unsupported:"langue mixte, incertaine ou non prise en charge",unavailable:"traduction indisponible",not_prepared:"traduction non préparée"} as Record<string,string>)[translation.status]??"traduction non disponible"}.</p>}
     <pre>{translated?(showOriginal?message.body.text:translation!.text):text}</pre>
-    {Boolean(message.body.attachments?.length) && <details className={styles.attachments}><summary>{message.body.attachments?.length} pièce(s) jointe(s) — non analysée(s)</summary><p>{message.body.attachments?.map((attachment) => `${attachment.filename} (${attachment.mimeType})`).join(" · ")}. Vérification humaine nécessaire.</p></details>}
+    <AttachmentObservations attachments={message.body.attachments} inventory={message.body.attachmentInventory} read={message.body.attachmentRead}/>
   </article>;
 }
 

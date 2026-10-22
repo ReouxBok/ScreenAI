@@ -1,4 +1,5 @@
 import "server-only";
+import { intakeAttachmentBody } from "./attachment-display";
 import { and, desc, eq } from "drizzle-orm";
 import { requireDb } from "@/db";
 import { savThreads, savMessages, savIntakeHumanEvents, savIntakeConsole } from "@/db/schema";
@@ -17,14 +18,15 @@ export async function readIntakeConsoleDetail(threadId: string) {
   const rows = await db.select().from(savMessages).where(eq(savMessages.threadId, threadId))
     .orderBy(desc(savMessages.receivedAt), desc(savMessages.createdAt), desc(savMessages.id)).limit(201);
   const displayed = rows.slice(0, 200), translations = await getSavTranslations(displayed.map(row => row.id));
-  const messages = displayed.map(row => ({ id: row.id, direction: row.direction, fromEmail: row.fromEmail,
-    receivedAt: row.receivedAt, createdAt: row.createdAt,
-    body: decryptSavPayload<{ text: string; attachments?: Array<{ filename: string; mimeType: string; size: number }> }>(row.bodyCiphertext),
-    translation: translations[row.id] }));
   const [latest] = await db.select().from(savMessages).where(and(eq(savMessages.threadId, threadId), eq(savMessages.direction, "inbound")))
     .orderBy(desc(savMessages.receivedAt), desc(savMessages.createdAt), desc(savMessages.id)).limit(1);
   const historical = latest ? await intakeMessageHistorical(latest.id) : false;
   const current = await readSavIntakeCurrent(threadId);
+  const messages = displayed.map(row => {
+    const derived=current?.sourceMatches && current.payload.attachments?.sourceHash===current.currentSourceHash && current.payload.attachments.read.messageId===row.id ? current.payload.attachments.read:undefined;
+    return {id:row.id,direction:row.direction,fromEmail:row.fromEmail,receivedAt:row.receivedAt,createdAt:row.createdAt,
+      body:intakeAttachmentBody(decryptSavPayload<{text:string;attachments?:unknown[];attachmentInventory?:unknown;attachmentRead?:unknown}>(row.bodyCiphertext),derived),translation:translations[row.id]};
+  });
   if (historical) Object.assign(projection, { view: "completed", status: "historical_outside_automation", reason: "Historique — hors automatisation. Aucun ticket HubSpot fermé et aucun apprentissage déclaré terminé.", projectedEpoch: projection.epoch });
   const events = await db.select().from(savIntakeHumanEvents).where(eq(savIntakeHumanEvents.threadId, threadId))
     .orderBy(desc(savIntakeHumanEvents.createdAt), desc(savIntakeHumanEvents.id)).limit(50);

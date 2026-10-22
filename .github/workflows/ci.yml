@@ -55,6 +55,7 @@ jobs:
       - run: env -i PATH="$PATH" HOME="$HOME" CI=1 npm run test:e2e --prefix studio -- --config playwright.sav-journey.config.ts
       - run: env -i PATH="$PATH" HOME="$HOME" CI=1 npm run test:e2e --prefix studio -- --config playwright.sav-other.config.ts
       - run: env -i PATH="$PATH" HOME="$HOME" CI=1 npm run test:e2e --prefix studio -- --config playwright.sav73.config.ts
+      - run: env -i PATH="$PATH" HOME="$HOME" CI=1 npm run test:e2e --prefix studio -- --config playwright.sav83.config.ts
       - run: npm run test:e2e
       - run: npm run validate:package
       - uses: actions/upload-artifact@v4

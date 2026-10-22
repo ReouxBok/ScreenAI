@@ -1,7 +1,9 @@
 import type { SavDossierContext } from "./dossier-context";
 import type { SavUnderstandingV1 } from "./understanding";
+import type { SavAttachmentInventory, SavAttachmentRead } from "./attachment-contract";
+import { savAttachmentContext } from "./attachment-context";
 
-export const SAV_COMPACT_CONTEXT_REVISION = "sav-compact-context-2026-10-15.v1";
+export const SAV_COMPACT_CONTEXT_REVISION = "sav-compact-context-2026-10-19.v2";
 export const SAV_COMPACT_CONTEXT_LIMITS = Object.freeze({ bytes: 24_000, currentBytes: 10_000, criticalBytes: 16_000, historyMessages: 6, historyMessageBytes: 1_500, tickets: 6, ticketDescriptionBytes: 700 });
 const size = (value: unknown) => new TextEncoder().encode(JSON.stringify(value)).length;
 function clipped(text: string, maximum: number) {
@@ -20,6 +22,7 @@ export function compactSavModelContext(input: {
   expectedCustomerEmail: string;
   understanding: SavUnderstandingV1;
   dossier?: SavDossierContext | null;
+  attachmentRead?: SavAttachmentRead | null; attachmentInventory?: SavAttachmentInventory | null;
 }) {
   const limits = SAV_COMPACT_CONTEXT_LIMITS, u = input.understanding, dossier = input.dossier;
   const limitations: string[] = [];
@@ -42,7 +45,10 @@ export function compactSavModelContext(input: {
   const understanding = { status: u.status, language: u.language, primaryRequestId: u.primaryRequestId,
     customerRelationship: u.customerRelationship, requests: u.requests, knownFacts: u.knownFacts,
     attemptedSteps: u.attemptedSteps, missingInformation: u.missingInformation, uncertainties: u.uncertainties, evidence };
-  const critical = { current: { messageId: input.current.messageId, sourceId: input.current.sourceId, receivedAt: input.current.receivedAt, subject: input.current.subject, text: input.current.text }, understanding };
+  const attachments = savAttachmentContext(input.attachmentRead, input.current.messageId, input.attachmentInventory);
+  if (evidence.some(e => e.source === "current_attachment" && !attachments.sources.some(s => s.sourceId === e.sourceId))) return fail("attachment_source_unavailable");
+  const critical = { current: { messageId: input.current.messageId, sourceId: input.current.sourceId, receivedAt: input.current.receivedAt, subject: input.current.subject, text: input.current.text }, understanding,
+    ...(attachments.states.length || attachments.inventory ? { attachments: { states: attachments.states.slice(0, 10), additionalStates: Math.max(0, attachments.states.length - 10), inventory: attachments.inventory, notice: attachments.notice } } : {}) };
   if (size(critical) > limits.criticalBytes) return fail("critical_facts_or_evidence_over_budget");
   if (evidence.length < u.evidence.length) limitations.push("unreferenced_evidence_omitted");
   type Ticket = { sourceId: string; id: string; subject: string; status: string; createdAt?: string | null; closedAt?: string | null; updatedAt?: string | null; description: ReturnType<typeof clipped> };

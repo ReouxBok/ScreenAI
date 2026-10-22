@@ -52,3 +52,4 @@ next-env.d.ts
 
 /.e2e-sav73-db
 /.e2e-sav-performance-*-db
+/.e2e-sav83-*

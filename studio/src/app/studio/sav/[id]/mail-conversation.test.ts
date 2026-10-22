@@ -76,7 +76,8 @@ describe("Customer mail before SAV proposal", () => {
     const html = render([item]);
     expect(html).not.toContain("<script>");
     expect(html).toContain("&lt;script&gt;");
-    expect(html).toContain("non analysée(s)");
+    expect(html).toContain("Non lue");
+    expect(html).toContain("Aucune observation visuelle acquise");
     expect(html).toContain("capture.png");
   });
 

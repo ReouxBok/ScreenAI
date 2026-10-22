@@ -336,3 +336,36 @@ describe("counter-review regressions C1-C4", () => {
     reason(await f.run(), "ticket_creation_date_unknown");
   });
 });
+
+it("keeps three grouped images, ambiguous identity and full ticket comparison within three model calls",async()=>{
+  const {syntheticImage,attachmentMetadata}=await import("../../../../test/sav-attachments");
+  const {prepareSavAttachmentSelection}=await import("../attachment-reader");
+  const {createSavIntakeSemanticReaders}=await import("./model-readers");
+  const bytes=await Promise.all([syntheticImage("png"),syntheticImage("jpeg"),syntheticImage("webp")]);
+  const items=bytes.map((b,i)=>({...attachmentMetadata(b.length,String(i+1)),mimeType:["image/png","image/jpeg","image/webp"][i]}));
+  const prepared=await prepareSavAttachmentSelection({metadata:items,expected:{mailboxEmail:items[0].reference!.mailboxEmail,gmailMessageId:items[0].reference!.gmailMessageId,gmailThreadId:items[0].reference!.gmailThreadId}},
+    {download:async(ref)=>bytes[Number(ref.partId)-1]});
+  const f=fixture();f.contacts["102"].emails=[f.input.message.fromEmail];
+  f.tickets.push(ticket("201"),ticket("202",{contactIds:["102"]}));
+  f.input.message.attachmentInputs=prepared.observations.map(o=>({sourceId:o.sourceId,fileHash:o.fileHash!}));
+  const calls:Parameters<import("./model-readers").IntakeGeminiCall>[0][]=[],stored:unknown[]=[];
+  const readers=createSavIntakeSemanticReaders({model:"gemini-3.6-flash",attachments:{prepared,onRead:observations=>stored.push(structuredClone(observations))},call:async arg=>{
+    calls.push(arg);const data=JSON.parse(arg.body.contents[0].parts[0].text),grounding=data.citationCatalogue.map((entry:{id:string})=>({quoteId:entry.id}));
+    let json:unknown;
+    if(arg.phase==="understanding"){
+      expect(arg.media).toHaveLength(3);
+      json={messageId:mid,requests:[{id:"r1",kind:"support",currentMessageId:mid,quoteId:data.citationCatalogue.find((e:{sourceId:string})=>e.sourceId==="current").id}],ticketSummary:{title:"Synthetic application failure",description:"Synthetic current authored request",requestIds:["r1"]},images:bytes.map((_,index)=>({index,readability:"readable",text:`Error E${index}`,uncertainties:[],regions:[]}))};
+    }else if(data.candidates){
+      json={kind:"unique",investigationComplete:true,contactIds:["101"],evidenceIds:data.evidence.map((e:{id:string})=>e.id),grounding,rationale:"Synthetic complete comparison"};
+    }else{
+      expect(data.citationCatalogue.some((e:{sourceId:string})=>e.sourceId.startsWith("attachment:"))).toBe(true);
+      json={investigationComplete:true,tickets:data.tickets.map((t:{ticket:{id:string}})=>({ticketId:t.ticket.id,relation:"different",requestIds:["r1"],evidenceIds:["current",`ticket-${t.ticket.id}`,`history-${t.ticket.id}`],grounding,rationale:"Synthetic distinct request"}))};
+    }
+    return {json:arg.sanitizeResponse?arg.sanitizeResponse(json):json,metadata:{inputTokens:100,outputTokens:100,thoughtTokens:0,totalTokens:200}};
+  }});
+  const result=await planSavIntake(f.input,{...f.adapters,...readers},f.policy);
+  expect(result.decision.disposition).toMatchObject({kind:"ticket",target:{operation:"create",contactId:"101"}});
+  expect(calls.map(c=>c.phase)).toEqual(["understanding","ticket_matching","ticket_matching"]);
+  expect(result.decision.evidence.filter(e=>e.source==="current_attachment")).toHaveLength(3);
+  expect(stored).toHaveLength(1);expect(result.steps.every(step=>step.status==="not_dispatched")).toBe(true);
+});

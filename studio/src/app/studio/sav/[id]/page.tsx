@@ -26,6 +26,7 @@ import { UnderstandingReview } from "./understanding-review";
 import layout from "./dossier.module.css";
 import { SavContextProgress } from "../context-progress";
 import { MailConversation } from "./mail-conversation";
+import { savAttachmentDisplayRead } from "@/lib/sav/attachment-contract";
 import { ProposalReview, IdentityCheck, IdentityCandidates } from "./proposal-review";
 import { ManualTicketStatus } from "./manual-ticket-status";
 import { savManualTicketError } from "@/lib/sav/manual-ticket-status";
@@ -171,7 +172,7 @@ export default async function SavThreadPage({ params, searchParams }: { params: 
     <section className={layout.layout}>
       <div className={layout.flow}>
         <DossierSection id="sav-conversation" number={1} title="Conversation" subtitle={`${detail.messages.length} message${detail.messages.length > 1 ? "s" : ""}`}>
-          <MailConversation embedded key={`mail:${latestInbound?.id ?? id}`} messages={detail.messages.map(message => ({ translation:translations[message.id], id: message.id, receivedAt: message.receivedAt, createdAt: message.createdAt, direction: message.direction, fromEmail: message.fromEmail, body: { text: message.body.text, attachments: message.body.attachments } }))}/>
+          <MailConversation embedded key={`mail:${latestInbound?.id ?? id}`} messages={detail.messages.map(message => ({ translation: translations[message.id], id: message.id, receivedAt: message.receivedAt, createdAt: message.createdAt, direction: message.direction, fromEmail: message.fromEmail, body: { text: message.body.text, attachments: message.body.attachments?.map(({ filename, mimeType, size }) => ({ filename, mimeType, size })), attachmentInventory: message.body.attachmentInventory, attachmentRead: savAttachmentDisplayRead(message.body.attachmentRead) } }))}/>
         </DossierSection>
 
         <DossierSection id="sav-findings" number={2} title="Ce que l’agent a trouvé">

@@ -1,0 +1,13 @@
+.observations {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.observations summary {
+  cursor: pointer;
+}
+
+.observations pre {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}

@@ -174,6 +174,14 @@ export async function planSavIntake(
     }
     if (analysis.messageId !== message.id || analysis.requests.some(r => r.currentMessageId !== message.id)
       || new Set(analysis.requests.map(r => r.id)).size !== analysis.requests.length) return context("classification_incomplete");
+    if (message.attachmentInputs?.length) {
+      const observations = analysis.attachmentObservations;
+      if (!observations || observations.length !== message.attachmentInputs.length
+        || new Set(observations.map(o => o.sourceId)).size !== observations.length
+        || observations.some(o => !message.attachmentInputs!.some(i => i.sourceId === o.sourceId && i.fileHash === o.fileHash)
+          || o.status !== "analyzed")) return context("classification_incomplete");
+      for (const observation of observations) addEvidence(observation.sourceId, "current_attachment", message.id, observation);
+    } else if (analysis.attachmentObservations?.length) return context("classification_incomplete");
     analysis.requests.sort((a, b) => a.id.localeCompare(b.id));
     requests = analysis.requests.map(({ id, kind }) => ({ id, kind, evidenceIds: humanProof ? [current, humanProof] : [current] }));
     const kinds = unique(requests.map(r => r.kind));

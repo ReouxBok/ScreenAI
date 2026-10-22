@@ -6,8 +6,9 @@ import { intakeRunConfigurationBound, intakeHumanRefused, intakeHasHumanDecision
 import { randomUUID } from "node:crypto";
 import { and, desc, eq, gt, inArray, lt, lte, or, sql } from "drizzle-orm";
 import { requireDb } from "@/db";
-import { savMessages, savThreads, savIntakeRuns, savIntakeJournal, savIntakeModelCalls } from "@/db/schema";
+import { savMessages, savThreads, savIntakeRuns, savIntakeJournal, savIntakeModelCalls, savIntakeHumanEvents } from "@/db/schema";
 import { decryptSavPayload, encryptSavPayload } from "../crypto";
+import { savAttachmentInventorySchema } from "../attachment-contract";
 import { prepareSavIntakeMessage } from "./message";
 import { savDerivedCostQuote } from "../derived-budget";
 import type { SavGeminiMetadata } from "../gemini-response";
@@ -16,7 +17,7 @@ import type { EngineInput } from "./engine-types";
 
 type Tx = Parameters<Parameters<ReturnType<typeof requireDb>["transaction"]>[0]>[0];
 type Run = typeof savIntakeRuns.$inferSelect;
-type Body = { text: string; headers?: Record<string, string>; attachments?: unknown[] };
+type Body = { text: string; headers?: Record<string, string>; attachments?: unknown[]; attachmentInventory?: unknown };
 export type IntakeLease = { run: Run; token: string; input: EngineInput; provenance: Map<string, ReturnType<typeof prepareSavIntakeMessage>["provenance"]>; body: Body; sourceHash: string };
 const fail = (): never => { throw Error("SAV_INTAKE_RUNTIME_CONTEXT_CHANGED"); };
 const budgetColumns={id:savIntakeModelCalls.id,messageKey:savIntakeModelCalls.messageKey,requestHash:savIntakeModelCalls.requestHash,state:savIntakeModelCalls.state,reservedNanoUsd:savIntakeModelCalls.reservedNanoUsd,chargedNanoUsd:savIntakeModelCalls.chargedNanoUsd,payloadCiphertext:savIntakeModelCalls.payloadCiphertext,createdAt:savIntakeModelCalls.createdAt};
@@ -43,7 +44,7 @@ export async function savIntakeSourceSnapshot(tx: Pick<Tx, "select">, message: t
     const body = decryptSavPayload<Body>(row.bodyCiphertext);
     return { body, ...prepareSavIntakeMessage({ id: row.id, threadId: row.threadId, fromEmail: row.fromEmail, toEmails: row.toEmails,
       direction: row.direction, receivedAt: row.receivedAt.toISOString(), subject: row.subject, body: body.text,
-      bodyComplete: typeof body.text === "string" && body.text.length < 100_000, unresolvedAttachments: Boolean(body.attachments?.length) }) };
+      bodyComplete: typeof body.text === "string" && body.text.length < 100_000, unresolvedAttachments: Boolean(body.attachments?.length) || body.attachmentInventory !== undefined && !savAttachmentInventorySchema.safeParse(body.attachmentInventory).data?.complete }) };
   });
   const current = prepared.find(p => p.message.id === message.id); if (!current) return fail();
   return { sourceHash: intakeRuntimeHash({ rows: rows.map(row => ({ id: row.id, threadId: row.threadId, mailboxId: row.mailboxId,
@@ -192,11 +193,9 @@ export async function pendingSavIntakeRuns(config: IntakeRuntimeConfig, now = ne
     or(inArray(savIntakeRuns.state, ["pending", "waiting"]), and(eq(savIntakeRuns.state, "analysing"), lt(savIntakeRuns.leaseUntil, now)))))
     .orderBy(savIntakeRuns.createdAt).limit(4);
 }
-export async function reserveSavIntakeCall(lease: IntakeLease, config: IntakeRuntimeConfig, requestHash: string, now = new Date()) {
-  return requireDb().transaction(async tx => {
-    await assertLease(tx, lease, config, now);
+async function reserveIntakeCall(tx: Tx, run: Run, config: IntakeRuntimeConfig, requestHash: string, now: Date) {
     await tx.execute(sql`select pg_advisory_xact_lock(hashtext('sav-intake-runtime-model-budget-v1'))`);
-    const rows = await tx.select(budgetColumns).from(savIntakeModelCalls), messageKey = intakeRuntimeHash(lease.run.messageId);
+    const rows = await tx.select(budgetColumns).from(savIntakeModelCalls), messageKey = intakeRuntimeHash(run.messageId);
     budgetRowsValid(rows);
     const prior = rows.find(row => row.messageKey === messageKey && row.requestHash === requestHash);
     if (prior) {
@@ -213,10 +212,34 @@ export async function reserveSavIntakeCall(lease: IntakeLease, config: IntakeRun
     const usage = intakeBudgetUsage(rows,config,budgetNow);
     if (usage.remainingCalls < 1 || rows.filter(row => row.messageKey === messageKey).length >= 3
       || price.reservedNanoUsd > usage.remainingNanoUsd || price.reservedNanoUsd > usage.remainingRollingNanoUsd) throw Error("SAV_INTAKE_RUNTIME_BUDGET_EXHAUSTED");
-    const [row] = await tx.insert(savIntakeModelCalls).values({ runId: lease.run.id, messageKey, requestHash, state: "dispatched", reservedNanoUsd: price.reservedNanoUsd,
+    const [row] = await tx.insert(savIntakeModelCalls).values({ runId: run.id, messageKey, requestHash, state: "dispatched", reservedNanoUsd: price.reservedNanoUsd,
       chargedNanoUsd: price.reservedNanoUsd, createdAt:budgetNow, payloadCiphertext: encryptSavPayload({ model: config.model, configHash: config.configHash }) }).returning();
     return { id: row.id, cached: null };
-  });
+}
+export async function reserveSavIntakeCall(lease: IntakeLease, config: IntakeRuntimeConfig, requestHash: string, now = new Date()) {
+  return requireDb().transaction(async tx => { await assertLease(tx,lease,config,now); return reserveIntakeCall(tx,lease.run,config,requestHash,now); });
+}
+export type IntakeHumanAnalysisAuthority={eventId:string;parentRunId:string;token:string};
+async function assertHumanAnalysis(tx:Tx, authority:IntakeHumanAnalysisAuthority,config:IntakeRuntimeConfig,now:Date) {
+  const [anchor]=await tx.select().from(savIntakeRuns).where(eq(savIntakeRuns.id,authority.parentRunId)); if(!anchor)return fail();
+  const [thread]=await tx.select().from(savThreads).where(eq(savThreads.id,anchor.threadId)).for("update");
+  const [run]=await tx.select().from(savIntakeRuns).where(eq(savIntakeRuns.id,anchor.id)).for("update");
+  const [event]=await tx.select().from(savIntakeHumanEvents).where(eq(savIntakeHumanEvents.id,authority.eventId)).for("update");
+  if(!run?.isCurrent||!thread||thread.aiPaused||!event||event.kind!=="classify"||event.state!=="reading"||event.leaseToken!==authority.token
+    ||!event.leaseUntil||event.leaseUntil<=now||event.parentRunId!==run.id||event.threadId!==run.threadId||event.messageId!==run.messageId||event.sourceHash!==run.sourceHash
+    ||event.baseConfigHash!==config.configHash||!await intakeRunConfigurationBound(run,config,tx,event.id))return fail();
+  const body=decryptSavPayload<import("./human-binding").HumanEventPayload>(event.payloadCiphertext);
+  const [message]=await tx.select().from(savMessages).where(eq(savMessages.id,run.messageId));
+  if(!message||body.parentPayloadHash!==intakeRuntimeHash(decryptSavPayload(run.payloadCiphertext))||body.policyHash!==config.policyHash||body.resourcesHash!==config.resourcesHash
+    ||body.classification===undefined||body.classification==="other"||(await latest(tx,run.threadId))?.id!==run.messageId
+    ||(await savIntakeSourceSnapshot(tx,message,now)).sourceHash!==run.sourceHash)return fail();
+  return run;
+}
+export async function assertIntakeHumanAnalysis(authority:IntakeHumanAnalysisAuthority,config:IntakeRuntimeConfig) {
+  await requireDb().transaction(tx=>assertHumanAnalysis(tx,authority,config,new Date()));
+}
+export async function reserveIntakeHumanCall(authority:IntakeHumanAnalysisAuthority,config:IntakeRuntimeConfig,requestHash:string) {
+  return requireDb().transaction(async tx=>{const now=new Date(),run=await assertHumanAnalysis(tx,authority,config,now);return reserveIntakeCall(tx,run,config,requestHash,now);});
 }
 export async function settleSavIntakeCall(id: string, metadata?: SavGeminiMetadata, result?: { json: unknown; metadata: SavGeminiMetadata }) {
   return requireDb().transaction(async tx => {

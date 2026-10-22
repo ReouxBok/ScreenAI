@@ -3,8 +3,8 @@ import { normalizeSavEvidenceText, savEvidenceContains } from "./evidence-text";
 import { cleanSavModelDraft } from "./reply-format";
 import { SavContractValidationError, savValidationDiagnosticSchema } from "./validation-diagnostics";
 
-export const SAV_UNDERSTANDING_REVISION = "sav-understanding-2026-10-19.v10";
-export const SAV_UNDERSTANDING_PROMPT_REVISION = "sav-understanding-prompt-2026-10-19.v10";
+export const SAV_UNDERSTANDING_REVISION = "sav-understanding-2026-10-19.v11";
+export const SAV_UNDERSTANDING_PROMPT_REVISION = "sav-understanding-prompt-2026-10-19.v11";
 const id = z.string().trim().min(1).max(100);
 const ids = z.array(id).max(30);
 export const savRequestNatureSchema = z.enum(["technical", "account", "integration", "how_to", "financial_operation", "financial_data", "cancellation", "commercial", "partnership", "callback", "human_request", "security", "privacy", "data_deletion", "legal", "acknowledgement", "non_support", "unknown"]);
@@ -26,10 +26,10 @@ export const savUnderstandingContentSchema = z.object({
   knownFacts: z.array(fact).max(30),
   attemptedSteps: z.array(fact).max(30),
   missingInformation: z.array(z.object({ id, key: id, text: z.string().trim().min(3).max(500), requestIds: ids.min(1) }).strict()).max(15),
-  evidence: z.array(z.object({ id, source: z.enum(["current_message", "history", "crm"]), sourceId: id, excerpt: z.string().trim().min(2).max(1500) }).strict()).max(60),
+  evidence: z.array(z.object({ id, source: z.enum(["current_message", "history", "crm", "current_attachment"]), sourceId: id, excerpt: z.string().trim().min(2).max(1500) }).strict()).max(60),
   uncertainties: z.array(z.object({ code: z.enum(["ambiguous_intent", "missing_context", "unread_attachment", "truncated_context", "conflicting_evidence", "provider_unavailable", "invalid_output"]), requestIds: ids }).strict()).max(20),
 }).strict();
-export const savAiTransportTraceSchema = z.object({ transportRevision: z.string(), correlationId: z.string(), model: z.string(), promptRevision: z.string(), phase: z.enum(["understanding", "composition", "coherence", "ticket_matching", "repair", "learning_comparison", "translation"]), attempts: z.number().int().nonnegative(), retries: z.number().int().nonnegative(), durationMs: z.number().nonnegative(), errorCode: z.string().nullable(), failureCategory: z.enum(["authentication", "billing", "rate_limited", "provider_unavailable", "invalid_output", "blocked_output", "budget_exhausted"]).nullable() }).strict();
+export const savAiTransportTraceSchema = z.object({ transportRevision: z.string(), correlationId: z.string(), model: z.string(), promptRevision: z.string(), phase: z.enum(["understanding", "composition", "coherence", "ticket_matching", "repair", "learning_comparison", "translation", "attachment_reading"]), attempts: z.number().int().nonnegative(), retries: z.number().int().nonnegative(), durationMs: z.number().nonnegative(), errorCode: z.string().nullable(), failureCategory: z.enum(["authentication", "billing", "rate_limited", "provider_unavailable", "invalid_output", "blocked_output", "budget_exhausted"]).nullable() }).strict();
 export const savUnderstandingSchema = savUnderstandingContentSchema.extend({
   trace: z.object({
     contractRevision: z.string(), promptRevision: z.string(), model: z.string().nullable(), inputHash: z.string(), codeRevision: z.string().nullable(),
@@ -55,7 +55,7 @@ export const savUnderstandingSummarySchema = z.object({
   uncertainties: z.array(savUnderstandingContentSchema.shape.uncertainties.element.shape.code).max(20),
 }).strict();
 export type SavUnderstandingV1 = z.infer<typeof savUnderstandingSchema>;
-export type SavUnderstandingSource = { source: "current_message" | "history" | "crm"; sourceId: string; text: string };
+export type SavUnderstandingSource = { source: "current_message" | "history" | "crm" | "current_attachment"; sourceId: string; text: string };
 
 const normalize = normalizeSavEvidenceText;
 function unique(values: string[]) { return new Set(values).size === values.length; }
@@ -86,12 +86,17 @@ export function validateSavUnderstanding(raw: unknown, sources: SavUnderstanding
     if (item.evidenceIds.every(e => evidence.get(e)?.sourceId === "diagnostic_checks")) fail("diagnostic_is_not_customer_evidence", "evidenceIds");
   }
   if (u.customerRelationship && (u.customerRelationship.evidenceIds.some(e => !evidence.has(e)) || (u.customerRelationship.kind !== "unknown" && !u.customerRelationship.evidenceIds.length))) fail("relationship_evidence_required", "customerRelationship");
+  if (u.customerRelationship?.kind !== "unknown" && u.customerRelationship?.evidenceIds.length && u.customerRelationship.evidenceIds.every(id => evidence.get(id)?.source === "current_attachment")) fail("attachment_is_not_customer_identity", "customerRelationship");
   for (const r of u.requests) {
     // An old demand, CRM record or signature cannot introduce a current request.
     if (!r.evidenceIds.some(e => evidence.get(e)?.source === "current_message")) fail("current_request_evidence_required", "requests.evidenceIds");
     const financial = ["financial_operation", "financial_data"].includes(r.nature);
     if (financial !== (r.financialScope === "support_account")) fail("financial_scope_mismatch", "requests.financialScope");
   }
+  // A visible control or error is a fact about the screen, not evidence that
+  // the customer performed an action, including natural attempts with unknown outcome.
+  for (const attempt of u.attemptedSteps) if (attempt.evidenceIds.every(id => evidence.get(id)?.source === "current_attachment"))
+    fail("attempt_customer_evidence_required", "attemptedSteps.evidenceIds");
   for (const attempt of u.attemptedSteps) if (attempt.checkId || attempt.checkCardId || attempt.checkVersionId || attempt.outcome === "expected" || attempt.outcome === "not_expected") {
     if (!attempt.checkId) fail("attempt_check_required", "attemptedSteps.checkId");
     const reference = sources.find(source => source.sourceId === "diagnostic_checks" && source.source === "history");

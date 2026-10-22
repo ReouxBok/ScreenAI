@@ -30,7 +30,7 @@ const evidenceOrigin = {
 };
 export const savIntakeEvidenceSchema = z.discriminatedUnion("source", [
   z.object({ ...evidenceOrigin,
-    source: z.enum(["current_message", "customer_history", "crm_contact", "contact_association", "crm_ticket", "crm_event", "private_rule", "human_override"]),
+    source: z.enum(["current_message", "current_attachment", "customer_history", "crm_contact", "contact_association", "crm_ticket", "crm_event", "private_rule", "human_override"]),
   }).strict(),
   z.object({ ...evidenceOrigin, source: z.literal("ticket_contact_association"),
     ticketId: crmId, contactId: crmId, direction: z.literal("ticket_to_contact"),
