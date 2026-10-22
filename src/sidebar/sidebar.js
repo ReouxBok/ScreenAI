@@ -58,6 +58,10 @@ const elements = {
   memoryToggleBtn: document.getElementById('memoryToggleBtn'),
   exportDataBtn: document.getElementById('exportDataBtn'),
   deleteDataBtn: document.getElementById('deleteDataBtn'),
+  siteAccess: document.getElementById('siteAccess'),
+  siteAccessText: document.getElementById('siteAccessText'),
+  siteAccessGrant: document.getElementById('siteAccessGrant'),
+  siteAccessRevoke: document.getElementById('siteAccessRevoke'),
 };
 
 // ============================================================================
@@ -99,6 +103,12 @@ function initEventListeners() {
   elements.userInput.addEventListener('input', handleInputChange);
   elements.userInput.addEventListener('keydown', handleInputKeydown);
   elements.sendBtn.addEventListener('click', sendMessage);
+  elements.siteAccessGrant?.addEventListener('click', grantSiteAccess);
+  elements.siteAccessRevoke?.addEventListener('click', revokeSiteAccess);
+  chrome.tabs?.onActivated?.addListener(() => { refreshSiteAccess(); });
+  chrome.tabs?.onUpdated?.addListener((_tabId, changeInfo, tab) => {
+    if (tab?.active && (changeInfo.url || changeInfo.status === 'complete')) refreshSiteAccess();
+  });
   elements.screenshotBtn.addEventListener('click', analyzePage);
   elements.voiceBtn.addEventListener('click', toggleVoice);
   elements.voiceMuteBtn?.addEventListener('click', toggleVoiceMute);
@@ -310,6 +320,7 @@ async function loadInitialState() {
 
   // Check if user is on Limova — show link if not
   checkIfOnLimova();
+  refreshSiteAccess();
 
 }
 
@@ -658,6 +669,74 @@ function handleTrainingRecordingLimit() {
   elements.trainingFeedback.textContent = 'La limite d’une heure est atteinte. Cette tentative n’est pas validable : crée un flow plus court.';
 }
 
+// ============================================================================
+// Sites opened to Charly and handoff to Limova
+// ============================================================================
+
+let siteAccessState = { status: 'none', origin: null, tabId: null };
+
+async function refreshSiteAccess() {
+  if (!elements.siteAccess) return;
+  const [tab] = await chrome.tabs.query({ active: true, currentWindow: true }).catch(() => []);
+  // Without the broad "tabs" permission Chrome hides the URL of sites not yet
+  // allowed; the main frame reported by webNavigation still carries it.
+  const frame = tab?.id && !tab.url
+    ? await chrome.webNavigation?.getFrame?.({ tabId: tab.id, frameId: 0 }).catch(() => null)
+    : null;
+  const origin = siteOriginOf(tab?.url || frame?.url);
+  if (!origin) {
+    siteAccessState = { status: 'none', origin: null, tabId: null };
+    elements.siteAccess.hidden = true;
+    return;
+  }
+  const granted = await chrome.permissions.contains({ origins: [`${origin}/*`] }).catch(() => false);
+  siteAccessState = { status: granted ? 'granted' : 'missing', origin, tabId: tab.id };
+  const site = siteLabelOf(origin);
+  elements.siteAccessText.textContent = granted
+    ? t('siteAccessGranted').replace('{site}', site)
+    : t('siteAccessMissing').replace('{site}', site);
+  elements.siteAccessGrant.textContent = t('siteAccessGrant');
+  elements.siteAccessGrant.hidden = granted;
+  elements.siteAccessRevoke.hidden = !granted;
+  elements.siteAccess.hidden = false;
+  elements.siteAccess.classList.toggle('granted', granted);
+}
+
+function grantSiteAccess() {
+  const { origin, tabId } = siteAccessState;
+  if (!origin) return;
+  // Chrome only shows its permission prompt from the click itself, before any await.
+  chrome.permissions.request({ origins: [`${origin}/*`] })
+    .then(async granted => {
+      if (granted) await chrome.runtime.sendMessage({ type: 'SITE_ACCESS_GRANTED', tabId }).catch(() => null);
+      await refreshSiteAccess();
+    })
+    .catch(() => addMessage('error', t('siteAccessError')));
+}
+
+async function revokeSiteAccess() {
+  const { origin } = siteAccessState;
+  if (!origin) return;
+  await chrome.permissions.remove({ origins: [`${origin}/*`] }).catch(() => false);
+  await refreshSiteAccess();
+}
+
+async function handOffToLimova(text) {
+  if (!(await ensureAIConsent())) return;
+  showPondering(t('handoffWorking'));
+  updateStatus('analyzing');
+  const result = await chrome.runtime.sendMessage({ type: 'HANDOFF_TO_LIMOVA', text }).catch(() => null);
+  hidePondering();
+  updateStatus('ready');
+  if (result?.ok) {
+    addMessage('assistant', t('handoffSent'));
+  } else if (result?.cancelled || result?.code === 'stopped') {
+    return;
+  } else {
+    addMessage('error', result?.error || t('handoffFailed'));
+  }
+}
+
 async function checkIfOnLimova() {
   const goBtn = document.getElementById('goToLimova');
   if (!goBtn) return;
@@ -753,6 +832,12 @@ function handleBackgroundMessage(message) {
       hidePondering();
       isLoading = false;
       showAIConsent();
+      break;
+
+    case 'AGENT_STOPPED':
+      hidePondering();
+      isLoading = false;
+      addMessage('system', t('agentStopped'));
       break;
 
     case 'ACTION_PROPOSAL':
@@ -1043,6 +1128,13 @@ async function sendMessage() {
   addMessage('user', text);
   elements.userInput.value = '';
   autoResizeTextarea();
+
+  if (siteAccessState.status === 'granted' && isLimovaOutputRequest(text)) {
+    await handOffToLimova(text);
+    isLoading = false;
+    return;
+  }
+
   showPondering();
   updateStatus('analyzing');
 

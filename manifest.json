@@ -18,6 +18,11 @@
     "webNavigation"
   ],
 
+  "optional_host_permissions": [
+    "https://*/*",
+    "http://*/*"
+  ],
+
   "host_permissions": [
     "https://new.limova.ai/*",
     "https://studio.limova.ai/*",

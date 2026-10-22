@@ -59,6 +59,62 @@ function isLimovaUrl(value) {
   }
 }
 
+// Sites the user opened to Charly through Chrome's optional permission prompt.
+// Hosts the manifest always requires (Limova, Studio, proxy, storage) are not "sites".
+const GRANTED_SITES_SCRIPT_ID = 'limova-granted-sites';
+let grantedSiteOrigins = new Set();
+
+function siteOriginFromPattern(pattern) {
+  const match = /^(https?):\/\/([^/*]+)\/\*$/.exec(String(pattern || ''));
+  return match ? `${match[1]}://${match[2]}` : null;
+}
+
+function isGrantedSiteUrl(value) {
+  try {
+    return grantedSiteOrigins.has(new URL(value).origin);
+  } catch {
+    return false;
+  }
+}
+
+function isAssistedUrl(value) {
+  return isLimovaUrl(value) || isGrantedSiteUrl(value);
+}
+
+async function refreshGrantedSites() {
+  const required = new Set((chrome.runtime.getManifest().host_permissions || []).map(siteOriginFromPattern));
+  const granted = await chrome.permissions?.getAll?.().catch(() => null);
+  grantedSiteOrigins = new Set((granted?.origins || [])
+    .map(siteOriginFromPattern)
+    .filter(origin => origin && !required.has(origin) && origin !== LIMOVA_DOMAIN));
+  const matches = [...grantedSiteOrigins].map(origin => `${origin}/*`);
+  await chrome.scripting?.unregisterContentScripts?.({ ids: [GRANTED_SITES_SCRIPT_ID] }).catch(() => {});
+  if (matches.length) {
+    await chrome.scripting?.registerContentScripts?.([{
+      id: GRANTED_SITES_SCRIPT_ID,
+      matches,
+      js: ['src/content/content.js'],
+      runAt: 'document_idle'
+    }]).catch(error => Logger.warn('sites', 'Granted site content script registration failed', error));
+  }
+  return [...grantedSiteOrigins];
+}
+
+const grantedSitesReady = refreshGrantedSites().catch(() => []);
+chrome.permissions?.onAdded?.addListener(() => { refreshGrantedSites().catch(() => {}); });
+chrome.permissions?.onRemoved?.addListener(() => { refreshGrantedSites().catch(() => {}); });
+
+async function prepareGrantedSiteTab(tabId) {
+  await refreshGrantedSites();
+  const tab = await chrome.tabs.get(tabId).catch(() => null);
+  if (!tab?.id || !isGrantedSiteUrl(tab.url)) return { ok: false, error: 'Ce site n’est pas autorisé.' };
+  // The registered script only reaches pages loaded after the grant.
+  const reachable = await chrome.tabs.sendMessage(tab.id, { type: 'DIAGNOSTIC_PING' }).catch(() => null);
+  if (!reachable) await chrome.scripting.executeScript({ target: { tabId: tab.id }, files: ['src/content/content.js'] });
+  Logger.event('sites', 'SITE_ACCESS_READY', { origin: new URL(tab.url).origin });
+  return { ok: true, origin: new URL(tab.url).origin };
+}
+
 // ============================================================================
 // Session State
 // ============================================================================
@@ -480,7 +536,7 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
 });
 
 const CONTENT_SCRIPT_MESSAGE_TYPES = new Set([
-  'GET_SESSION_STATE', 'MODAL_DETECTED', 'TRAINING_EVENT', 'LIMOVA_PROFILE', 'USER_PAGE_INTERACTION'
+  'GET_SESSION_STATE', 'MODAL_DETECTED', 'TRAINING_EVENT', 'LIMOVA_PROFILE', 'USER_PAGE_INTERACTION', 'STOP_AGENT'
 ]);
 
 function isTrustedMessageSource(request, sender) {
@@ -491,7 +547,7 @@ function isTrustedMessageSource(request, sender) {
   if (typeof sender.url === 'string' && sender.url.startsWith(extensionRoot)) return true;
 
   const pageUrl = sender.tab?.url || sender.url;
-  return CONTENT_SCRIPT_MESSAGE_TYPES.has(request.type) && isLimovaUrl(pageUrl);
+  return CONTENT_SCRIPT_MESSAGE_TYPES.has(request.type) && isAssistedUrl(pageUrl);
 }
 
 async function handleMessage(request, sender) {
@@ -568,6 +624,19 @@ async function handleMessage(request, sender) {
 
     case 'RESET_SESSION':
       return handleResetSession();
+
+    case 'STOP_AGENT':
+      return stopAgent();
+
+    case 'GET_SITE_ACCESS':
+      await grantedSitesReady;
+      return { origins: await refreshGrantedSites() };
+
+    case 'SITE_ACCESS_GRANTED':
+      return prepareGrantedSiteTab(request.tabId);
+
+    case 'HANDOFF_TO_LIMOVA':
+      return handoffToLimova(request.text);
 
     case 'SWITCH_TO_LOCKED_TAB':
       if (sessionState.lockedTabId) {
@@ -1214,9 +1283,9 @@ async function handleUserMessage(text) {
     broadcastToSidebar({ type: 'CONSENT_REQUIRED' });
     return { ok: false, consentRequired: true };
   }
-  const tab = await getActiveLimovaTab();
+  const tab = await getActiveAssistedTab();
   if (generation !== sessionGeneration) return { ok: true };
-  if (tab && !sessionState.lockedTabId) lockTab(tab.id);
+  if (tab && tab.id !== sessionState.lockedTabId) lockTab(tab.id);
   const operationId = Logger.createOperationId('chat');
 
   Logger.logTurnStart('user_message', {
@@ -1304,10 +1373,10 @@ async function handleTakeScreenshot() {
     broadcastToSidebar({ type: 'CONSENT_REQUIRED' });
     return { ok: false, consentRequired: true };
   }
-  const tab = await getActiveLimovaTab();
+  const tab = await getActiveAssistedTab();
   if (generation !== sessionGeneration) return { ok: true };
   if (!tab) {
-    broadcastToSidebar({ type: 'ERROR', content: 'Ouvre new.limova.ai pour analyser une page.' });
+    broadcastToSidebar({ type: 'ERROR', content: 'Ouvre new.limova.ai ou autorise ce site pour analyser une page.' });
     return { ok: false };
   }
 
@@ -1669,29 +1738,35 @@ async function sendToCopilotV2({ tab, userMessage, pageContext, operationId, _se
   if (generation !== sessionGeneration) return;
   if (!response.ok) throw codedError('COPILOT_ADK_FAILED', data.error || 'Charly est temporairement indisponible.');
   let actionCount = 0;
-  while (data.type === 'tool_call') {
-    actionCount += 1;
-    if (actionCount > 6) throw codedError('COPILOT_ACTION_LIMIT', 'Charly s’est arrêtée pour éviter une boucle d’actions.');
-    const result = await executeCopilotTool(data.call, userMessage, operationId);
-    if (generation !== sessionGeneration) return;
-    if (evaluationState.active) await recordEvaluationEvent({
-      kind: 'tool_result',
-      toolName: data.call?.name,
-      status: result.status,
-      path: result.page?.url,
-      targetLabel: data.call?.args?.targetLabel,
-      contextVersion: result.contextVersion
-    });
-    if (generation !== sessionGeneration) return;
-    response = await authorizedProxyFetch(`/api/copilot/v2/runs/${encodeURIComponent(data.runId)}/result`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(result),
-      signal: controller.signal
-    });
-    data = await response.json().catch(() => ({}));
-    if (generation !== sessionGeneration) return;
-    if (!response.ok) throw codedError(response.status === 410 ? 'COPILOT_RUN_EXPIRED' : 'COPILOT_RUN_FAILED', data.error || 'L’action de Charly a expiré. Réessaie.');
+  const presenceTabId = tab?.id || sessionState.lockedTabId;
+  try {
+    while (data.type === 'tool_call') {
+      actionCount += 1;
+      if (actionCount > 6) throw codedError('COPILOT_ACTION_LIMIT', 'Charly s’est arrêtée pour éviter une boucle d’actions.');
+      if (PAGE_ACTION_TOOLS.has(data.call?.name)) await showAgentPresence(presenceTabId);
+      const result = await executeCopilotTool(data.call, userMessage, operationId);
+      if (generation !== sessionGeneration) return;
+      if (evaluationState.active) await recordEvaluationEvent({
+        kind: 'tool_result',
+        toolName: data.call?.name,
+        status: result.status,
+        path: result.page?.url,
+        targetLabel: data.call?.args?.targetLabel,
+        contextVersion: result.contextVersion
+      });
+      if (generation !== sessionGeneration) return;
+      response = await authorizedProxyFetch(`/api/copilot/v2/runs/${encodeURIComponent(data.runId)}/result`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(result),
+        signal: controller.signal
+      });
+      data = await response.json().catch(() => ({}));
+      if (generation !== sessionGeneration) return;
+      if (!response.ok) throw codedError(response.status === 410 ? 'COPILOT_RUN_EXPIRED' : 'COPILOT_RUN_FAILED', data.error || 'L’action de Charly a expiré. Réessaie.');
+    }
+  } finally {
+    hideAgentPresence(presenceTabId);
   }
   if (data.type !== 'message' || typeof data.content !== 'string') throw codedError('COPILOT_INVALID_RESPONSE', 'Réponse Charly invalide.');
   const content = data.content.trim();
@@ -2119,7 +2194,7 @@ async function capturePageAnalysis(tabId = sessionState.lockedTabId, operationId
   let prepared = false;
   try {
     const tab = await chrome.tabs.get(tabId);
-    if (!tab?.active || !isLimovaUrl(tab.url)) {
+    if (!tab?.active || !isAssistedUrl(tab.url)) {
       Logger.event('visual', 'VISUAL_CAPTURE_SKIPPED_INACTIVE_TAB', null, operationId);
       return null;
     }
@@ -4708,10 +4783,134 @@ function pauseWhileSidebarClosed() {
   for (const controller of voiceTokenControllers) controller.abort();
   voiceSessionActive = false;
   voiceSessionGeneration += 1;
+  for (const tabId of [...presenceTabs]) hideAgentPresence(tabId);
   if (sessionState.lockedTabId) {
     chrome.tabs.sendMessage(sessionState.lockedTabId, { type: 'SESSION_STATE', active: false }).catch(() => {});
   }
   Logger.event('sidebar', 'SIDEBAR_CLOSED_ASSISTANT_PAUSED', { hadLockedTab: Boolean(sessionState.lockedTabId) });
+}
+
+// ============================================================================
+// Agent presence, stop and Limova handoff
+// ============================================================================
+
+const PAGE_ACTION_TOOLS = new Set(['click_element', 'navigate_internal', 'fill_field', 'scroll_page']);
+const HANDOFF_PAGE_TEXT_LIMIT = 6000;
+const HANDOFF_PROMPT_LIMIT = 8000;
+const presenceTabs = new Set();
+let handoffSequence = 0;
+
+async function showAgentPresence(tabId) {
+  if (!tabId) return;
+  presenceTabs.add(tabId);
+  await chrome.tabs.sendMessage(tabId, { type: 'AGENT_PRESENCE', active: true }).catch(() => {});
+}
+
+function hideAgentPresence(tabId) {
+  if (!tabId) return;
+  presenceTabs.delete(tabId);
+  chrome.tabs.sendMessage(tabId, { type: 'AGENT_PRESENCE', active: false }).catch(() => {});
+}
+
+function stopAgent() {
+  sessionGeneration += 1;
+  activeAbortController?.abort();
+  activeAbortController = null;
+  pendingActions.clear();
+  for (const tabId of [...presenceTabs]) hideAgentPresence(tabId);
+  broadcastToSidebar({ type: 'AGENT_STOPPED' });
+  broadcastToSidebar({ type: 'STATUS_UPDATE', status: 'ready' });
+  Logger.event('agent', 'AGENT_STOPPED_BY_USER');
+  return { ok: true };
+}
+
+function buildLimovaHandoffPrompt(request, page) {
+  const lines = [request, '', 'Contexte : voici le contenu de la page que je regarde.'];
+  if (page.title) lines.push(`Page : ${page.title}`);
+  if (page.url) lines.push(`Adresse : ${page.url}`);
+  if (page.selection) lines.push('', 'Passage que j’ai sélectionné :', '"""', page.selection, '"""');
+  const header = lines.join('\n');
+  const room = Math.max(0, Math.min(HANDOFF_PAGE_TEXT_LIMIT, HANDOFF_PROMPT_LIMIT - header.length - 40));
+  const text = String(page.text || '').slice(0, room);
+  return text ? `${header}\n\nContenu de la page :\n"""\n${text}\n"""` : header;
+}
+
+function waitForTabLoaded(tabId, timeout = 30_000) {
+  return new Promise(resolve => {
+    const done = value => {
+      clearTimeout(timer);
+      chrome.tabs.onUpdated.removeListener(listener);
+      resolve(value);
+    };
+    const listener = (updatedId, changeInfo) => {
+      if (updatedId === tabId && changeInfo.status === 'complete') done(true);
+    };
+    const timer = setTimeout(() => done(false), timeout);
+    chrome.tabs.onUpdated.addListener(listener);
+    chrome.tabs.get(tabId).then(tab => { if (tab?.status === 'complete') done(true); }).catch(() => done(false));
+  });
+}
+
+async function sendComposeRequest(tabId, message, operation) {
+  // Limova may still be redirecting (workspace, new chat) when the tab first
+  // reports complete; retry while its content script is not reachable yet.
+  for (let attempt = 0; attempt < 12; attempt += 1) {
+    if (!isCurrentOperation(operation)) return cancelledOperation();
+    const response = await chrome.tabs.sendMessage(tabId, message).catch(() => null);
+    if (response) return response;
+    await new Promise(resolve => setTimeout(resolve, 750));
+    await waitForTabLoaded(tabId, 10_000);
+  }
+  return { ok: false, code: 'limova_unreachable', error: 'Limova ne répond pas dans l’onglet ouvert.' };
+}
+
+// Everything happens in the extension: read the page the user is on, open
+// Limova, then write and send the request in its chat like the user would.
+async function handoffToLimova(rawRequest) {
+  await grantedSitesReady;
+  const request = String(rawRequest || '').trim().slice(0, 1500);
+  if (!request) return { ok: false, error: 'Demande vide.' };
+  if (!(await hasAIProcessingConsent())) {
+    broadcastToSidebar({ type: 'CONSENT_REQUIRED' });
+    return { ok: false, consentRequired: true };
+  }
+  const operation = { generation: sessionGeneration };
+  const [source] = await chrome.tabs.query({ active: true, lastFocusedWindow: true }).catch(() => []);
+  if (!source?.id || !isGrantedSiteUrl(source.url)) {
+    return { ok: false, error: 'Autorise d’abord Charly sur ce site.' };
+  }
+  const handoffId = `handoff-${Date.now()}-${++handoffSequence}`;
+  Logger.event('handoff', 'LIMOVA_HANDOFF_STARTED', { origin: new URL(source.url).origin, handoffId });
+
+  await showAgentPresence(source.id);
+  let page;
+  try {
+    page = await sendContentMessage(source.id, { type: 'GET_READABLE_CONTENT' }, true, operation);
+  } finally {
+    hideAgentPresence(source.id);
+  }
+  if (!isCurrentOperation(operation)) return cancelledOperation();
+  if (!page?.ok) return { ok: false, error: 'Je n’arrive pas à lire cette page.' };
+
+  const prompt = buildLimovaHandoffPrompt(request, page);
+  const limovaTab = await chrome.tabs.create({
+    url: `${LIMOVA_DOMAIN}/`,
+    index: Number.isInteger(source.index) ? source.index + 1 : undefined,
+    openerTabId: source.id,
+    active: true
+  });
+  await waitForTabLoaded(limovaTab.id);
+  if (!isCurrentOperation(operation)) return cancelledOperation();
+  presenceTabs.add(limovaTab.id);
+  const result = await sendComposeRequest(limovaTab.id, { type: 'LIMOVA_COMPOSE_AND_SEND', handoffId, prompt }, operation);
+  presenceTabs.delete(limovaTab.id);
+  Logger.event('handoff', result?.ok ? 'LIMOVA_HANDOFF_SENT' : 'LIMOVA_HANDOFF_FAILED', {
+    handoffId,
+    code: result?.code || null,
+    promptLength: prompt.length,
+    truncated: Boolean(page.truncated)
+  });
+  return { ...result, limovaTabId: limovaTab.id, pageTitle: page.title || '' };
 }
 
 function resumeAfterSidebarOpened() {
@@ -4747,6 +4946,15 @@ async function getActiveLimovaTab() {
   return tabs.find(t => isLimovaUrl(t.url)) || null;
 }
 
+// A site the user explicitly allowed wins while it is in front; otherwise
+// Limova keeps its usual locked-tab behaviour.
+async function getActiveAssistedTab() {
+  await grantedSitesReady;
+  const [active] = await chrome.tabs.query({ active: true, lastFocusedWindow: true }).catch(() => []);
+  if (active?.id && isGrantedSiteUrl(active.url)) return active;
+  return getActiveLimovaTab();
+}
+
 // Named exports keep critical privacy and policy boundaries directly testable.
 export {
   analyticsSafePath,
@@ -4766,6 +4974,11 @@ export {
   handleMessage,
   handleResetSession,
   handleTakeScreenshot,
+  handoffToLimova,
+  buildLimovaHandoffPrompt,
+  isAssistedUrl,
+  refreshGrantedSites,
+  stopAgent,
   lockTab,
   privacySafeUrl,
   proposeOrExecuteAction,
