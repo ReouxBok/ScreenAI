@@ -28,7 +28,7 @@ export async function prepareIntakeAttachments(lease: IntakeLease, model: string
   await live();
   const read: SavAttachmentRead = { version: 1, readerRevision: SAV_ATTACHMENT_READER_REVISION, model, messageId: message.id, mailboxId: message.mailboxId,
     gmailMessageId: message.gmailMessageId, selectionHash: savContentHash({ metadata, inventory }), claimId: randomUUID(), state: "reading", startedAt: new Date().toISOString(), completedAt: null, observations: prepared.observations };
-  const state: IntakeAttachmentState = { textComplete: typeof lease.body.text === "string" && lease.body.text.length < 100_000 && lease.provenance.get(message.id)?.truncated === false, sourceHash: lease.sourceHash, read, inventory };
+  const state: IntakeAttachmentState = { textComplete: lease.provenance.get(message.id)?.textComplete === true, sourceHash: lease.sourceHash, read, inventory };
   const complete=inventory?.complete === true && metadata.length > 0 && prepared.selected.length === metadata.length;
   if(!complete) finishIntakeAttachmentRead(state,"context_incomplete");
   return { state, prepared, complete };
