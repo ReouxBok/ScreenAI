@@ -25,32 +25,32 @@ beforeEach(() => {
 });
 
 describe('reset memory isolation in the proxy', () => {
-  it('keeps ordinary voice memory but excludes it after an explicit reset', async () => {
+  it('keeps voice memory after an explicit reset and marks the new conversation', async () => {
     for (const resetContext of [false, true]) {
       fetch.mockClear();
       const result = await supertest(app).post('/api/live-token').send({ lang: 'fr', resetContext });
       expect(result.status).toBe(200);
       const provider = fetch.mock.calls.find(([url]) => String(url).includes('/auth_tokens'));
       const prompt = JSON.parse(provider[1].body).bidiGenerateContentSetup.systemInstruction.parts[0].text;
-      expect(prompt.includes(OLD_CONTEXT)).toBe(!resetContext);
-      if (resetContext) expect(fetch.mock.calls.some(([url]) => String(url).includes('/memory/bootstrap'))).toBe(false);
+      expect(prompt).toContain(OLD_CONTEXT);
+      expect(prompt.includes('NOUVELLE CONVERSATION')).toBe(resetContext);
     }
   });
 
-  it('excludes prior memory from legacy text without losing the new message', async () => {
+  it('keeps memory in legacy text after reset without losing the new message', async () => {
     const result = await supertest(app).post('/api/gemini').send({
       resetContext: true,
       systemInstruction: { parts: [{ text: 'Charly' }] },
       contents: [{ role: 'user', parts: [{ text: 'Créer une image' }] }]
     });
     expect(result.status).toBe(200);
-    expect(fetch).toHaveBeenCalledTimes(1);
-    const body = JSON.parse(fetch.mock.calls[0][1].body);
-    expect(JSON.stringify(body.systemInstruction)).not.toContain(OLD_CONTEXT);
+    const body = JSON.parse(fetch.mock.calls.find(([url]) => String(url).includes(':generateContent'))[1].body);
+    expect(JSON.stringify(body.systemInstruction)).toContain(OLD_CONTEXT);
+    expect(JSON.stringify(body.systemInstruction)).toContain('NOUVELLE CONVERSATION');
     expect(body.contents[0].parts[0].text).toBe('Créer une image');
   });
 
-  it('excludes personal context from ADK turns after reset while persisting new messages', async () => {
+  it('keeps personal context in ADK turns after reset while persisting new messages', async () => {
     const { CharlyAdkOrchestrator } = requireProxy('./copilot/orchestrator.js');
     const instance = Object.create(CharlyAdkOrchestrator.prototype);
     instance.memoryRequest = vi.fn(async () => null);
@@ -63,8 +63,10 @@ describe('reset memory isolation in the proxy', () => {
       sessionId: '550e8400-e29b-41d4-a716-446655440001', resetContext: true,
       message: 'Créer une image', idempotencyKey: 'fresh-turn', page: {}, locale: 'fr-FR'
     }, 'reset-request');
-    expect(instance.personalContext).not.toHaveBeenCalled();
-    expect(instance.consumeEvents.mock.calls[0][0].stateDelta['temp:personalContext']).toBe('');
+    expect(instance.personalContext).toHaveBeenCalledTimes(1);
+    const supplied = instance.consumeEvents.mock.calls[0][0].stateDelta['temp:personalContext'];
+    expect(supplied.startsWith('NOUVELLE CONVERSATION')).toBe(true);
+    expect(supplied).toContain(OLD_CONTEXT);
     expect(instance.persistMessage).toHaveBeenCalledTimes(2);
   });
 });
