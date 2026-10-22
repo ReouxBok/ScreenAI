@@ -1,6 +1,8 @@
 vi.mock("@/lib/sav/intake/executor",()=>({reconcileIntakeExecutor:d.intakeExec}));
 vi.mock("@/lib/sav/intake/runtime",()=>({reconcileSavIntakeRuntime:d.intakeRuntime}));
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
+const monitor=vi.hoisted(()=>({pulse:vi.fn()}));
+vi.mock("@/lib/sav/monitor",()=>({recordSavWorkerPulse:monitor.pulse}));
 const d=vi.hoisted(()=>({gmail:vi.fn(),hubspot:vi.fn(),send:vi.fn(),ticket:vi.fn(),pilotActions:vi.fn(),pilot:vi.fn(),messages:vi.fn(),followups:vi.fn(),observations:vi.fn(),retention:vi.fn(),trainings:vi.fn(),evaluations:vi.fn(),openings:vi.fn(),context:vi.fn(),projection:vi.fn(),enabled:vi.fn(),intakeExec:vi.fn(),intakeRuntime:vi.fn(),intakeChoices:vi.fn(),intakeTracking:vi.fn(),intakeConsole:vi.fn(),translations:vi.fn()}));
 vi.mock("@/lib/sav/gmail",()=>({processPendingGmailReceipts:d.gmail,processPendingGmailSendActions:d.send}));
 vi.mock("@/lib/sav/hubspot",()=>({processPendingHubspotReceipts:d.hubspot,processPendingHubspotActions:d.ticket,processPendingPilotHubspotActionsAcrossBatches:d.pilotActions,getHubspotBackfillState:vi.fn(async()=>null),shouldAttemptHubspotBackfill:vi.fn(()=>false),continueHubspotBackfill:vi.fn()}));
@@ -19,6 +21,7 @@ vi.mock("@/lib/sav/intake/console-store",()=>({refreshIntakeConsole:d.intakeCons
 import {GET} from "./route";
 beforeEach(()=>{
   vi.resetAllMocks();vi.stubEnv("CRON_SECRET","synthetic-local-cron-token");vi.stubEnv("SAV_HUBSPOT_BACKFILL_ENABLED","false");
+  monitor.pulse.mockResolvedValue(true);
   for(const fn of Object.values(d))fn.mockResolvedValue({processed:0});d.enabled.mockReturnValue(false);
 });
 afterEach(()=>vi.unstubAllEnvs());
@@ -26,6 +29,7 @@ const request=()=>new Request("http://localhost/api/cron/sav-reconcile",{headers
 it("authenticates before all shared work",async()=>{
   expect((await GET(new Request("http://localhost/api/cron/sav-reconcile"))).status).toBe(401);
   expect(d.gmail).not.toHaveBeenCalled();expect(d.openings).not.toHaveBeenCalled();expect(d.projection).not.toHaveBeenCalled();
+  expect(monitor.pulse).not.toHaveBeenCalled();
 });
 it("keeps training/evaluation and ordered ticket/reply reconciliation, with SQL disabled by default",async()=>{
   const response=await GET(request());expect(response.status).toBe(200);
@@ -34,12 +38,15 @@ it("keeps training/evaluation and ordered ticket/reply reconciliation, with SQL 
   expect(d.ticket.mock.invocationCallOrder[0]).toBeLessThan(d.send.mock.invocationCallOrder[0]);
   expect(d.ticket.mock.invocationCallOrder[1]).toBeGreaterThan(d.send.mock.invocationCallOrder[0]);
   expect(await response.json()).toMatchObject({dashboardProjection:{status:"skipped",data:{reason:"disabled"}}});
+  expect(monitor.pulse).toHaveBeenCalledTimes(2);
+  expect(monitor.pulse.mock.calls[1]).toEqual([...monitor.pulse.mock.calls[0],false]);
 });
 it("continues shared recovery after a dispatch failure and reports that failure",async()=>{
   d.openings.mockRejectedValue(new Error("SYNTHETIC_DISPATCH_UNAVAILABLE"));
   const response=await GET(request());expect(response.status).toBe(500);
   expect(d.context).toHaveBeenCalled();expect(d.trainings).toHaveBeenCalled();expect(d.send).toHaveBeenCalled();
   expect(await response.json()).toMatchObject({emailOpenings:{status:"error",errorCode:"SYNTHETIC_DISPATCH_UNAVAILABLE"}});
+  expect(monitor.pulse.mock.calls.at(-1)?.at(-1)).toBe(true);
 });
 it("only repairs a bounded projection batch when explicitly enabled",async()=>{
   d.enabled.mockReturnValue(true);expect((await GET(request())).status).toBe(200);expect(d.projection).toHaveBeenCalledWith(25,undefined,{deadlineMs:expect.any(Number)});
