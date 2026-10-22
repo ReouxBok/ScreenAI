@@ -61,7 +61,7 @@ export async function GET(request: Request) {
   const ticketActions = await runStep("hubspot_ticket_actions", () => processPendingHubspotActions(50));
   const intakeObservation = await runStep("intake_observation", () => reconcileSavIntakeRuntime({ deadlineMs: derivedDeadline }));
   const intakeChoices = await runStep("intake_choices", () => Date.now()+45_000>derivedDeadline?Promise.resolve({skipped:"deadline"}):reconcileIntakeHumanChoices());
-  const intakeExecution = await runStep("intake_execution",()=>Date.now()+60_000>derivedDeadline?Promise.resolve({skipped:"deadline"}):reconcileIntakeExecutor({deadlineMs:derivedDeadline}));
+  const intakeExecution = await runStep<Awaited<ReturnType<typeof reconcileIntakeExecutor>> | { skipped: string }>("intake_execution",()=>Date.now()+60_000>derivedDeadline?Promise.resolve({skipped:"deadline"}):reconcileIntakeExecutor({deadlineMs:derivedDeadline}));
   const intakeTracking = await runStep("intake_tracking", () => ensureIntakeObservations(4));
   const intakeConsole = await runStep("intake_console", () => refreshIntakeConsole(20));
   // Four model runs leave enough headroom for the 45 s grounded-agent budget,
