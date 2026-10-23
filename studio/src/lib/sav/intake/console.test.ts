@@ -5,7 +5,7 @@ import { createSavTestDb } from "../../../../test/sav-db";
 import { executionProvider } from "../../../../test/sav-intake-execution-provider";
 import { savMailboxes, savThreads, savMessages, staffUsers, savSyncState, savIntakeRuns, savIntakeModelCalls,
   savIntakeHumanEvents, savIntakeJournal, savIntakeConsole, savIntakeExecutions, savIntakeEffects, savIntakeExecutionBudget,
-  savIntakeObservationBindings, savResolutionObservations, savAgentRuns, savDecisions, savActions, savFollowups, savLearningCandidates, savKnowledgeActivations, categories } from "@/db/schema";
+  savIntakeExecutionPolicies, savIntakeObservationBindings, savResolutionObservations, savAgentRuns, savDecisions, savActions, savFollowups, savLearningCandidates, savKnowledgeActivations, categories } from "@/db/schema";
 const state = vi.hoisted(() => ({ db: null as unknown, user: null as unknown }));
 vi.mock("@/db", () => ({ requireDb: () => { if (!state.db) throw Error("DB_FORBIDDEN"); return state.db; } }));
 vi.mock("@clerk/nextjs/server", () => ({ currentUser: async () => state.user }));
@@ -20,7 +20,7 @@ import { enqueueSavIntakeMessage, claimSavIntakeRun, saveSavIntakeResult, readSa
 import { approveIntakeExecutionPolicy, intakeExecutionConfig, type ExecutionPolicy } from "./execution-policy";
 import { createIntakeExecutorAdapters } from "./execution-adapters";
 import { admitIntakeExecution, claimExecution, ensureExecutionEffect, markEffectDispatched, getExecutionEffects, recordEffectAck } from "./execution-store";
-import { executeIntakePass, readIntakeExecutionProgress, reconcileIntakeEffectsReadOnly } from "./executor";
+import { executeIntakePass, reconcileIntakeExecutor, readIntakeExecutionProgress, reconcileIntakeEffectsReadOnly } from "./executor";
 import { recordIntakeHumanCommand, type IntakeHumanCommand } from "./human-commands";
 import { consumeIntakeHumanEvent } from "./human-worker";
 import { intakeRunConfigurationBound, intakeRunCandidateContactIds, humanRevisionConfigHash, type HumanEventPayload } from "./human-binding";
@@ -743,13 +743,7 @@ it.each(["paused","newer","refused","nonadmin","historical"])("administrator rec
 it("recovery runs a fresh budgeted analysis and retains no-send across the next operator choice",async()=>{
  await observed();for(const [key,value]of Object.entries(environment))if(value!==undefined)vi.stubEnv(key,value);
  await db.db.update(savIntakeRuns).set({attempts:2,state:"waiting"}).where(eq(savIntakeRuns.id,runId));
- vi.stubGlobal("fetch",vi.fn(async(url,init)=>{
-  expect(String(url)).toBe("https://generativelanguage.googleapis.com/v1beta/models/gemini-3.6-flash:generateContent");
-  const data=JSON.parse(JSON.parse(String(init?.body)).contents[0].parts[0].text);
-  const answer=data.tickets?{investigationComplete:true,tickets:data.tickets.map((t:{ticket:{id:string}})=>({ticketId:t.ticket.id,relation:"same",requestIds:["r1"],evidenceIds:["current",`ticket-${t.ticket.id}`,`history-${t.ticket.id}`],grounding:data.citationCatalogue.map((c:{id:string})=>({quoteId:c.id})),rationale:"Synthetic exact coverage"}))}
-   :{messageId,requests:[{id:"r1",kind:"support",currentMessageId:messageId,quoteId:data.citationCatalogue.find((c:{sourceId:string})=>c.sourceId==="current").id}],ticketSummary:{title:"Synthetic connection failure",description:"The synthetic connection fails.",requestIds:["r1"]}};
-  return Response.json({candidates:[{finishReason:"STOP",content:{parts:[{text:JSON.stringify(answer)}]}}],usageMetadata:{promptTokenCount:100,candidatesTokenCount:50,thoughtsTokenCount:0,totalTokenCount:150}});
- }));
+ stubRecoveryModel();
  const requested=await requestIntakeReinvestigation({threadId,messageId,reason:"Synthetic post-correction explicit operator investigation."});
  expect(await consumeIntakeHumanEvent(requested.eventId,options.runtime,createSavIntakeHubspotReaders({network:p.network}))).toHaveProperty("state","observed");
  let current=(await readSavIntakeCurrent(threadId,options.runtime))!;
@@ -763,4 +757,43 @@ it("recovery runs a fresh budgeted analysis and retains no-send across the next 
  expect(await intakeRunConfigurationBound(current,options.runtime)).toBe(true);
  expect((await db.db.select().from(savIntakeModelCalls))).toHaveLength(calls.length);
  expect((await db.db.select().from(savIntakeRuns)).reduce((n,r)=>n+r.attempts,0)).toBe(2);expect(mutationsSent()).toHaveLength(0);
+});
+
+function stubRecoveryModel(){
+ vi.stubGlobal("fetch",vi.fn(async(url,init)=>{
+  expect(String(url)).toBe("https://generativelanguage.googleapis.com/v1beta/models/gemini-3.6-flash:generateContent");
+  const data=JSON.parse(JSON.parse(String(init?.body)).contents[0].parts[0].text);
+  const answer=data.tickets?{investigationComplete:true,tickets:data.tickets.map((t:{ticket:{id:string}})=>({ticketId:t.ticket.id,relation:"same",requestIds:["r1"],evidenceIds:["current",`ticket-${t.ticket.id}`,`history-${t.ticket.id}`],grounding:data.citationCatalogue.map((c:{id:string})=>({quoteId:c.id})),rationale:"Synthetic exact coverage"}))}
+   :{messageId,requests:[{id:"r1",kind:"support",currentMessageId:messageId,quoteId:data.citationCatalogue.find((c:{sourceId:string})=>c.sourceId==="current").id}],ticketSummary:{title:"Synthetic connection failure",description:"The synthetic connection fails.",requestIds:["r1"]}};
+  return Response.json({candidates:[{finishReason:"STOP",content:{parts:[{text:JSON.stringify(answer)}]}}],usageMetadata:{promptTokenCount:100,candidatesTokenCount:50,thoughtsTokenCount:0,totalTokenCount:150}});
+ }));
+}
+
+it.each(["valid","old_authority_active","departed","leased","new_admin_inactive"])("recovered unsent execution authority rebinding: %s",async mode=>{
+ await observed();const execution=(await admitIntakeExecution(runId,options))!;
+ const oldPayload=decryptSavPayload<Record<string,unknown>>(execution.payloadCiphertext);
+ await db.db.update(savIntakeExecutions).set({payloadCiphertext:encryptSavPayload({...oldPayload,runtimeConfigHash:"f".repeat(64)})}).where(eq(savIntakeExecutions.id,execution.id));
+ for(const [key,value]of Object.entries(environment))if(value!==undefined)vi.stubEnv(key,value);
+ stubRecoveryModel();const requested=await requestIntakeReinvestigation({threadId,messageId,reason:"Synthetic explicit post-release recovery without outbound permission."});
+ expect(await consumeIntakeHumanEvent(requested.eventId,options.runtime,createSavIntakeHubspotReaders({network:p.network}))).toHaveProperty("state","observed");
+ const current=(await readSavIntakeCurrent(threadId,options.runtime))!;
+ const beforeBudget=await db.db.select().from(savIntakeExecutionBudget),calls=await db.db.select().from(savIntakeModelCalls);
+ const next=await approveIntakeExecutionPolicy(options.policy);
+ if(mode!=="old_authority_active")await db.db.update(savIntakeExecutionPolicies).set({state:"revoked"}).where(eq(savIntakeExecutionPolicies.id,execution.policyId));
+ environment={...environment,SAV_INTAKE_EXECUTION_POLICY_ID:next.id,SAV_INTAKE_EXECUTION_POLICY_SHA256:next.policyHash};
+ options={...options,config:intakeExecutionConfig(environment)!};
+ if(mode==="departed")await db.db.insert(savIntakeEffects).values({id:randomUUID(),executionId:execution.id,businessKey:"synthetic-departure",kind:"ticket_create",permission:"create_ticket",state:"uncertain",intentHash:"a".repeat(64),intentCiphertext:encryptSavPayload({}),dispatchedAt:new Date()});
+ if(mode==="leased")await db.db.update(savIntakeExecutions).set({leaseUntil:new Date(Date.now()+60000)}).where(eq(savIntakeExecutions.id,execution.id));
+ if(mode==="new_admin_inactive")await db.db.update(staffUsers).set({active:false});
+ if(mode!=="valid"){
+  await expect(admitIntakeExecution(current.id,options)).rejects.toThrow("RECOVERY_AUTHORITY_REBIND_REFUSED");
+  expect((await db.db.select().from(savIntakeExecutions))[0].policyId).toBe(execution.policyId);expect(mutationsSent()).toHaveLength(0);
+ }else{
+  expect((await reconcileIntakeExecutor({env:()=>environment,adapters:options.adapters}))).toHaveProperty("state","confirmed");
+  const rebound=(await db.db.select().from(savIntakeExecutions).where(eq(savIntakeExecutions.id,execution.id)))[0];expect(rebound.id).toBe(execution.id);expect(rebound.policyId).toBe(next.id);
+  expect(decryptSavPayload<{runtimeConfigHash:string}>(rebound.payloadCiphertext).runtimeConfigHash).toBe(options.runtime.configHash);
+  expect(rebound.state).toBe("confirmed");
+  expect(p.calls.filter(c=>c.path==="/crm/v3/objects/tickets"&&c.method==="POST")).toHaveLength(1);expect(p.calls.filter(c=>c.path==="gmail/messages/send")).toHaveLength(0);
+ }
+ expect(await db.db.select().from(savIntakeExecutionBudget)).toEqual(beforeBudget);expect(await db.db.select().from(savIntakeModelCalls)).toEqual(calls);
 });
