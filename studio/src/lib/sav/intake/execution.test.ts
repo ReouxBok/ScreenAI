@@ -961,7 +961,7 @@ it.each(["confirmed","departed","dispatch-marker"])("configuration catchup prese
 
 // Historical persisted intent and provider normalization, using synthetic data only.
 it.each(["stored-ack", "missing-ack", "changed-text"] as const)("historical note reconciliation preserves %s attribution and never sends a second note", async scenario => {
-    p.seedTicket({ stage: "new" });
+    p.seedTicket({ stage: "open" });
     const row = await admission();
     expect(await executeIntakePass(row.id, options, {
         afterAck: async effect => {
