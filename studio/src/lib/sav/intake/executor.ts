@@ -1,4 +1,6 @@
 import "server-only";
+import { listSavExternalCompletionMessageIds } from "../external-completion";
+import { releaseNeverDispatchedIntakeScopes } from "./execution-store";
 import { intakeRunConfigurationBound } from "./human-binding";
 import { createHash } from "node:crypto";
 import { and, eq, inArray, lte, or, sql } from "drizzle-orm";
@@ -315,8 +317,11 @@ export async function pendingIntakeEffectRecoveries(now = new Date()) {
     }).from(savIntakeExecutions).innerJoin(savIntakeEffects, eq(savIntakeEffects.executionId, savIntakeExecutions.id)).where(and(inArray(savIntakeEffects.state, ["dispatched", "acked", "uncertain"]), sql `${savIntakeEffects.reconcileAttempts}<5`, or(sql `${savIntakeEffects.nextReconcileAt} is null`, lte(savIntakeEffects.nextReconcileAt, now)))).orderBy(savIntakeExecutions.updatedAt, savIntakeExecutions.id).limit(2);
 }
 export async function scanIntakeExecutionCandidates(options: ExecutionOptions) {
+    await releaseNeverDispatchedIntakeScopes(options.runtime.mailboxId);
     const key = "sav-intake-execution-scan-v1", db = requireDb(), [cursor] = await db.select().from(savSyncState).where(eq(savSyncState.key, key));
-    const base = and(eq(savIntakeRuns.isCurrent, true), eq(savIntakeRuns.state, "observed"), sql `(not exists(select 1 from sav.intake_executions e where e.message_id=${savIntakeRuns.messageId})
+    const handledIds = await listSavExternalCompletionMessageIds(db, false, options.runtime.mailboxId);
+    const notHandled = handledIds.length ? sql`${savIntakeRuns.messageId} not in (${sql.join(handledIds.map(id => sql`${id}::uuid`), sql`, `)})` : undefined;
+    const base = and(notHandled, eq(savIntakeRuns.isCurrent, true), eq(savIntakeRuns.state, "observed"), sql `(not exists(select 1 from sav.intake_executions e where e.message_id=${savIntakeRuns.messageId})
         or exists(select 1 from sav.intake_executions e join sav.intake_execution_policies p on p.id=e.policy_id
           where e.message_id=${savIntakeRuns.messageId} and e.run_id=${savIntakeRuns.id} and e.run_version=${savIntakeRuns.version}
           and ${savIntakeRuns.humanChoiceCiphertext} is not null and e.state in ('pending','waiting')
@@ -400,7 +405,9 @@ export async function reconcileIntakeExecutor(overrides: {
         config, runtime, policy, adapters, signal, env: environment
     };
     await scanIntakeExecutionCandidates(options);
-    const [execution] = await requireDb().select().from(savIntakeExecutions).where(and(eq(savIntakeExecutions.policyId, config.policyId), or(eq(savIntakeExecutions.state, "pending"), and(eq(savIntakeExecutions.state, "waiting"), lte(savIntakeExecutions.updatedAt, new Date(Date.now() - 60000))), and(eq(savIntakeExecutions.state, "running"), lte(savIntakeExecutions.leaseUntil, new Date())), and(eq(savIntakeExecutions.state, "uncertain"), sql `(exists(select 1 from sav.intake_effects f where f.execution_id=${savIntakeExecutions.id} and f.state in ('dispatched','acked','uncertain') and f.reconcile_attempts<5 and (f.next_reconcile_at is null or f.next_reconcile_at<=now())) or not exists(select 1 from sav.intake_effects f where f.execution_id=${savIntakeExecutions.id} and f.state in ('dispatched','acked','uncertain')))`)), sql `exists(select 1 from sav.threads t where t.id=${savIntakeExecutions.threadId} and not t.ai_paused)`, sql `not exists(select 1 from sav.messages m where m.thread_id=${savIntakeExecutions.threadId} and m.direction='inbound' and m.id<>${savIntakeExecutions.messageId} and (m.received_at,m.created_at,m.id)>(select s.received_at,s.created_at,s.id from sav.messages s where s.id=${savIntakeExecutions.messageId}))`)).orderBy(savIntakeExecutions.updatedAt, savIntakeExecutions.id).limit(1);
+    const handledIds = await listSavExternalCompletionMessageIds(requireDb(), false, runtime.mailboxId);
+    const notHandled = handledIds.length ? sql`${savIntakeExecutions.messageId} not in (${sql.join(handledIds.map(id => sql`${id}::uuid`), sql`, `)})` : undefined;
+    const [execution] = await requireDb().select().from(savIntakeExecutions).where(and(notHandled, eq(savIntakeExecutions.policyId, config.policyId), or(eq(savIntakeExecutions.state, "pending"), and(eq(savIntakeExecutions.state, "waiting"), lte(savIntakeExecutions.updatedAt, new Date(Date.now() - 60000))), and(eq(savIntakeExecutions.state, "running"), lte(savIntakeExecutions.leaseUntil, new Date())), and(eq(savIntakeExecutions.state, "uncertain"), sql `(exists(select 1 from sav.intake_effects f where f.execution_id=${savIntakeExecutions.id} and f.state in ('dispatched','acked','uncertain') and f.reconcile_attempts<5 and (f.next_reconcile_at is null or f.next_reconcile_at<=now())) or not exists(select 1 from sav.intake_effects f where f.execution_id=${savIntakeExecutions.id} and f.state in ('dispatched','acked','uncertain')))`)), sql `exists(select 1 from sav.threads t where t.id=${savIntakeExecutions.threadId} and not t.ai_paused)`, sql `not exists(select 1 from sav.messages m where m.thread_id=${savIntakeExecutions.threadId} and m.direction='inbound' and m.id<>${savIntakeExecutions.messageId} and (m.received_at,m.created_at,m.id)>(select s.received_at,s.created_at,s.id from sav.messages s where s.id=${savIntakeExecutions.messageId}))`)).orderBy(savIntakeExecutions.updatedAt, savIntakeExecutions.id).limit(1);
     return execution ? executeIntakePass(execution.id, options) : {
         skipped: "no_execution"
     };

@@ -59,7 +59,14 @@ export async function readSavExternalCompletion(message: Message, db: Reader = r
   return latest?.id === message.id ? marker : null;
 }
 
-const unsettledIntakeEffect = sql`${savIntakeEffects.state} <> 'confirmed' and (${savIntakeEffects.state} <> 'planned' or ${savIntakeEffects.dispatchedAt} is not null or ${savIntakeEffects.dispatchToken} is not null or ${savIntakeEffects.ackCiphertext} is not null or ${savIntakeEffects.confirmedAt} is not null)`;
+// A confirmed partial result is not a completed execution. While its intake
+// scope is held, an administrative marker must not hide the remaining work.
+// Both the operation guard and the paginated display use this same predicate.
+const unsettledIntakeEffect = sql`(
+  (${savIntakeEffects.state} <> 'confirmed' and (${savIntakeEffects.state} <> 'planned' or ${savIntakeEffects.dispatchedAt} is not null or ${savIntakeEffects.dispatchToken} is not null or ${savIntakeEffects.ackCiphertext} is not null or ${savIntakeEffects.verificationCiphertext} is not null or ${savIntakeEffects.confirmedAt} is not null))
+  or (${savIntakeEffects.state}='confirmed' and ${savIntakeExecutions.state} not in ('confirmed','refused')
+    and exists(select 1 from sav.intake_occupations o where o.owner_kind='intake' and o.owner_id=${savIntakeExecutions.id}))
+)`;
 
 /** Include intake commands and dispatched effects: the administrative marker
  * cannot certify an outcome for work whose result still needs reconciliation. */

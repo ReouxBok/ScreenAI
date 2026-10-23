@@ -3,7 +3,7 @@ import { afterAll, afterEach, beforeAll, beforeEach, expect, it, vi } from "vite
 import { eq } from "drizzle-orm";
 import { createSavTestDb } from "../../../../test/sav-db";
 import { executionProvider } from "../../../../test/sav-intake-execution-provider";
-import { savMailboxes, savThreads, savMessages, staffUsers, savIntakeExecutionPolicies, savIntakeExecutionBudget, savIntakeExecutions, savIntakeEffects, savIntakeOccupations, savIntakeRuns, savActions, savSyncState } from "@/db/schema";
+import { savMailboxes, savThreads, savMessages, staffUsers, savIntakeExecutionPolicies, savIntakeExecutionBudget, savIntakeExecutions, savIntakeEffects, savIntakeOccupations, savIntakeRuns, savActions, savSyncState, auditLogs, savIntakeHumanEvents, savIntakeEffectJournal } from "@/db/schema";
 const state = vi.hoisted(() => ({
     db: null as unknown, user: null as unknown
 }));
@@ -24,7 +24,7 @@ import { savIntakeRuntimeConfig, intakeRuntimeHash, SAV_INTAKE_RUNTIME_REVISION 
 import { executionPolicySchema, executionAdministrator, intakeExecutionConfig, approveIntakeExecutionPolicy, revokeIntakeExecutionPolicy, readIntakeExecutionAuthority, type ExecutionPolicy } from "./execution-policy";
 import { enqueueSavIntakeMessage, claimSavIntakeRun, saveSavIntakeResult, catchupSavIntake } from "./runtime-store";
 import { createIntakeExecutorAdapters } from "./execution-adapters";
-import { admitIntakeExecution, getExecutionEffects, occupationSchemaInstalled, assertNoLegacyConflict, claimExecution, endExecutionPass, occupyKeys, finishVerifiedIdentityRecovery } from "./execution-store";
+import { admitIntakeExecution, getExecutionEffects, occupationSchemaInstalled, releaseNeverDispatchedIntakeScopes, assertNoLegacyConflict, claimExecution, endExecutionPass, occupyKeys, finishVerifiedIdentityRecovery } from "./execution-store";
 import { executeIntakePass, readIntakeExecutionProgress, reconcileIntakeEffectsReadOnly, reconcileIntakeExecutor, reconcileIntakeEffectCandidate, scanIntakeExecutionCandidates, pendingIntakeEffectRecoveries } from "./executor";
 import { guardLegacyIntakeOccupation, withLegacyOccupationAction, markLegacyIntakeDispatch, releaseLegacyIntakeIfConfirmed } from "./legacy-occupation";
 import type { ExecutionOptions, EffectIntent, EffectAck } from "./execution-types";
@@ -997,4 +997,55 @@ it.each(["stored-ack", "missing-ack", "changed-text"] as const)("historical note
         expect(decryptSavPayload<EffectIntent>(association.intentCiphertext).confirmedNoteCreate).toEqual({ effectId: noteEffect.id, objectId: noteId });
         expect(association.state).toBe("confirmed");
     }
+}, 20000);
+
+async function localFence(row: { id: string }, external = false) {
+    if (external) await f.db.insert(auditLogs).values({ actorEmail: "ugo@limova.ai", action: "sav_dossier_completed_externally", entityType: "sav_message", entityId: messageId,
+        technicalMetadata: { version: 1, threadId, batchId: randomUUID(), receivedBefore: new Date().toISOString(), reason: "processed_outside_studio" } });
+    else await f.db.update(savThreads).set({ aiPaused: true, humanRequestedAt: new Date() }).where(eq(savThreads.id, threadId));
+    expect((await f.db.select().from(savIntakeOccupations)).some(key => key.ownerId === row.id)).toBe(true);
+}
+it.each(["pause", "external"])("releases admitted but never-dispatched %s scope so the next same-contact dossier can be admitted", async fence => {
+    const owner = await admission();
+    await localFence(owner, fence === "external");
+    expect(await releaseNeverDispatchedIntakeScopes(mailboxId)).toEqual({ released: 1 });
+    expect(await releaseNeverDispatchedIntakeScopes(mailboxId)).toEqual({ released: 0 });
+    expect((await f.db.select().from(savIntakeOccupations)).some(key => key.ownerId === owner.id)).toBe(false);
+    expect(await getExecutionEffects(owner.id)).toEqual([]);
+    const [nextThread] = await f.db.insert(savThreads).values({ mailboxId, gmailThreadId: randomUUID(), customerEmail: "customer@example.invalid" }).returning();
+    threadId = nextThread.id; messageId = (await storedMessage()).id;
+    const next = await admission();
+    expect((await f.db.select().from(savIntakeOccupations)).find(key => key.key === "contact:101")?.ownerId).toBe(next.id);
+    const journal = await f.db.select().from(savIntakeEffectJournal).where(eq(savIntakeEffectJournal.executionId, owner.id));
+    expect(journal.filter(event => event.kind === "never_dispatched_scope_released")).toHaveLength(1);
+    expect(p.calls.filter(call => call.method === "POST" && !call.path.endsWith("/search") && !call.path.endsWith("/read"))).toHaveLength(0);
+}, 20000);
+it.each(["planned", "dispatched", "acked", "confirmed", "uncertain", "planned-token", "planned-date", "planned-ack", "planned-verification", "planned-confirmed-date", "empty-ack", "empty-verification", "execution-lease", "analysis-lease", "command-lease", "legacy-owner", "unknown-key", "new-inbound", "revoked-marker"])("never-dispatched scope recovery preserves the %s barrier", async barrier => {
+    const owner = await admission();
+    const external = ["new-inbound", "revoked-marker"].includes(barrier);
+    await localFence(owner, external);
+    if (["planned", "dispatched", "acked", "confirmed", "uncertain"].includes(barrier) || barrier.startsWith("planned-") || barrier.startsWith("empty-")) {
+        const intent: EffectIntent = { kind: "ticket_create", permission: "create_ticket", key: `synthetic-unused-${owner.id}`, sourceMessageId: messageId };
+        await f.db.insert(savIntakeEffects).values({ executionId: owner.id, businessKey: intent.key, kind: intent.kind, permission: intent.permission,
+            state: ["planned", "dispatched", "acked", "confirmed", "uncertain"].includes(barrier) ? barrier : "planned", intentHash: intakeRuntimeHash(intent), intentCiphertext: encryptSavPayload(intent),
+            ...(barrier === "planned-token" ? { dispatchToken: randomUUID() } : {}), ...(barrier === "planned-date" ? { dispatchedAt: new Date() } : {}),
+            ...(barrier === "planned-ack" ? { ackCiphertext: encryptSavPayload({ id: "901" }) } : {}), ...(barrier === "planned-verification" ? { verificationCiphertext: encryptSavPayload({ confirmed: true }) } : {}),
+            ...(barrier === "planned-confirmed-date" ? { confirmedAt: new Date() } : {}), ...(barrier === "empty-ack" ? { ackCiphertext: "" } : {}), ...(barrier === "empty-verification" ? { verificationCiphertext: "" } : {}) });
+    }
+    if (barrier === "execution-lease") await f.db.update(savIntakeExecutions).set({ leaseToken: randomUUID(), leaseUntil: new Date(Date.now() + 60000) }).where(eq(savIntakeExecutions.id, owner.id));
+    if (barrier === "analysis-lease") await f.db.update(savIntakeRuns).set({ leaseToken: randomUUID(), leaseUntil: new Date(Date.now() + 60000) }).where(eq(savIntakeRuns.id, runId));
+    if (barrier === "command-lease") await f.db.insert(savIntakeHumanEvents).values({ threadId, messageId, parentRunId: runId, parentVersion: 1, baseConfigHash: options.runtime.configHash,
+        sourceHash: "synthetic", kind: "refuse", state: "reading", commandKey: randomUUID(), leaseToken: randomUUID(), leaseUntil: new Date(Date.now() + 60000), payloadCiphertext: encryptSavPayload({}) });
+    if (barrier === "legacy-owner") await f.db.update(savIntakeOccupations).set({ ownerKind: "legacy" }).where(eq(savIntakeOccupations.ownerId, owner.id));
+    if (barrier === "unknown-key") await f.db.insert(savIntakeOccupations).values({ key: "contact:999", ownerId: owner.id, ownerKind: "intake" });
+    if (barrier === "new-inbound") await storedMessage(threadId, new Date(Date.now() + 1000));
+    if (barrier === "revoked-marker") {
+        const [audit] = await f.db.select().from(auditLogs).where(eq(auditLogs.entityId, messageId));
+        await f.db.insert(auditLogs).values({ actorEmail: "ugo@limova.ai", action: "sav_dossier_external_completion_reverted", entityType: "sav_message", entityId: messageId,
+            technicalMetadata: { version: 1, batchId: audit.technicalMetadata.batchId, completionId: audit.id }, createdAt: new Date(audit.createdAt.getTime() + 1) });
+    }
+    const keys = await f.db.select().from(savIntakeOccupations), effects = await getExecutionEffects(owner.id);
+    expect(await releaseNeverDispatchedIntakeScopes(mailboxId)).toEqual({ released: barrier === "planned" ? 1 : 0 });
+    expect(await getExecutionEffects(owner.id)).toEqual(effects);
+    if (barrier !== "planned") expect(await f.db.select().from(savIntakeOccupations)).toEqual(keys);
 }, 20000);
