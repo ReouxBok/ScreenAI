@@ -42,6 +42,7 @@ import { ensureSavCaseObservationTx } from "../case-learning";
 import { readSavCaseLearningQualification } from "../case-qualification";
 import { reviewSavProposal } from "../review";
 import { previewIntakeLaunch, commitIntakeLaunch } from "./launch-admin";
+import { SAV_INTAKE_COMPATIBILITY } from "./compatibility";
 import { previewLaunchAction, commitLaunchAction, revokeLaunchAction } from "@/app/studio/sav/intake/launch/actions";
 import { POST as adminPost } from "@/app/api/sav/intake-admin/route";
 import { getSavThreadDetail, processStoredSavMessage, processPendingSavMessages } from "../service";
@@ -530,6 +531,17 @@ it("new approved V0 message after intake keeps a separate baseline and can quali
   expect(id).not.toBe(observation.id);expect((await readIntakeObservationBinding(observation.id))?.baselineHash).toBe(baseline);
   await db.db.update(savMessages).set({analysisStatus:"intake_pending"}).where(eq(savMessages.id,m.id));
   expect(await readSavCaseLearningQualification(threadId)).toHaveProperty("allowed",false);
+});
+it.each(["compatible", "mixed", "mismatch"])("administrator preview binds the authority mode: %s", async mode => {
+  const runtime = { ...JSON.parse(environment.SAV_INTAKE_RUNTIME_CONFIG!), compatibility: SAV_INTAKE_COMPATIBILITY };
+  environment.SAV_INTAKE_RUNTIME_CONFIG = JSON.stringify(runtime);
+  const policy = { ...options.policy, compatibility: mode === "mixed" ? undefined : mode === "mismatch" ? "f".repeat(64) : SAV_INTAKE_COMPATIBILITY };
+  if (mode === "compatible") { policy.codeRevision = "b".repeat(40); environment.VERCEL_GIT_COMMIT_SHA = "b".repeat(40); }
+  for (const [key, value] of Object.entries(environment)) if (value !== undefined) vi.stubEnv(key, value);
+  const preview = previewIntakeLaunch(randomUUID(), { runtime, policy });
+  if (mode === "compatible") expect(await preview).toHaveProperty("hash");
+  else await expect(preview).rejects.toThrow("LAUNCH_PIN_MISMATCH");
+  expect(mutationsSent()).toHaveLength(0);
 });
 it("administrator preview is inert, immutable and commit is exact/idempotent while OFF",async()=>{
   for(const [key,value] of Object.entries(environment))if(value!==undefined)vi.stubEnv(key,value);

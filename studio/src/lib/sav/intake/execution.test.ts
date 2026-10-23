@@ -28,6 +28,7 @@ import { admitIntakeExecution, getExecutionEffects, occupationSchemaInstalled, a
 import { executeIntakePass, readIntakeExecutionProgress, reconcileIntakeEffectsReadOnly, reconcileIntakeExecutor, reconcileIntakeEffectCandidate, scanIntakeExecutionCandidates, pendingIntakeEffectRecoveries } from "./executor";
 import { guardLegacyIntakeOccupation, withLegacyOccupationAction, markLegacyIntakeDispatch, releaseLegacyIntakeIfConfirmed } from "./legacy-occupation";
 import type { ExecutionOptions, EffectIntent, EffectAck } from "./execution-types";
+import { SAV_INTAKE_COMPATIBILITY } from "./compatibility";
 let f: Awaited<ReturnType<typeof createSavTestDb>>, p: ReturnType<typeof executionProvider>, options: ExecutionOptions, environment: Record<string, string | undefined>, messageId: string, threadId: string, mailboxId: string, runId: string, adminId: string;
 const mutations: ExecutionPolicy["mutations"] = ["create_ticket", "link_ticket", "set_ticket_new", "append_ticket_note", "associate_email", "send_identity_template"];
 const template = "SYNTHETIC exact template.\nSignature kept exactly.";
@@ -144,6 +145,27 @@ beforeEach(async () => {
     };
 });
 afterEach(() => { vi.unstubAllEnvs(); vi.unstubAllGlobals(); vi.restoreAllMocks(); });
+it("continues one approved execution across compatible deployments without repeating a write", async () => {
+    environment.SAV_INTAKE_RUNTIME_CONFIG = JSON.stringify({ ...JSON.parse(environment.SAV_INTAKE_RUNTIME_CONFIG!), compatibility: SAV_INTAKE_COMPATIBILITY });
+    options.runtime = savIntakeRuntimeConfig(environment)!;
+    options.policy = { ...options.policy, compatibility: SAV_INTAKE_COMPATIBILITY }; await writePolicy();
+    const row = await admission(), configHash = options.runtime.configHash;
+    environment.VERCEL_GIT_COMMIT_SHA = "b".repeat(40);
+    options.config = intakeExecutionConfig(environment)!; options.runtime = savIntakeRuntimeConfig(environment)!;
+    expect(options.runtime.configHash).toBe(configHash); expect(options.runtime.codeRevision).toBe("a".repeat(40));
+    expect((await readIntakeExecutionAuthority(options.config)).policy.codeRevision).toBe("a".repeat(40));
+    expect(await executeIntakePass(row.id, options)).toMatchObject({ state: "confirmed" });
+    await executeIntakePass(row.id, options);
+    expect(p.calls.filter(c => c.method === "POST" && c.path.endsWith("/tickets"))).toHaveLength(1);
+});
+it("does not resurrect a compatible approval revoked after a deployment change", async () => {
+    options.policy = { ...options.policy, compatibility: SAV_INTAKE_COMPATIBILITY }; await writePolicy();
+    environment.VERCEL_GIT_COMMIT_SHA = "b".repeat(40); options.config = intakeExecutionConfig(environment)!;
+    await revokeIntakeExecutionPolicy(options.config.policyId, "Synthetic explicit revocation");
+    const before = p.calls.length;
+    await expect(readIntakeExecutionAuthority(options.config)).rejects.toThrow("PERMISSION_REVOKED");
+    expect(p.calls.length).toBe(before);
+});
 it("OFF returns before DB/tables and does not consume malformed pins", async () => {
     const saved = state.db;
     state.db = null;
