@@ -1,4 +1,6 @@
 "use server";
+import { redirect } from "next/navigation";
+import { releaseIntakeHumanHold } from "@/lib/sav/intake/human-hold-release";
 import { revalidatePath } from "next/cache";
 import { recordIntakeHumanCommand } from "@/lib/sav/intake/human-commands";
 import {requestIntakeReinvestigation,reconcileThreadIdentification} from "@/lib/sav/intake/operator-recovery";
@@ -35,4 +37,12 @@ export async function saveIntakeChoice(_previous: IntakeChoiceFormState, form: F
       ? "Cette analyse ne conserve pas les résultats validés nécessaires à une reprise. Une réinvestigation est requise."
       : "Le choix n’a pas été enregistré. Vérifiez votre accès, le motif et la version courante." };
   }
+}
+
+export async function releaseIntakeHumanHoldAction(form: FormData): Promise<void> {
+ const threadId=String(form.get("threadId")??"");let status="blocked";
+ try { await releaseIntakeHumanHold({requestKey:form.get("requestKey"),threadId,messageId:form.get("messageId"),expectedEpoch:Number(form.get("expectedEpoch")),reason:form.get("reason")});status="released"; }
+ catch { /* Keep the pause and the dossier when any safety condition changed. */ }
+ revalidatePath(`/studio/sav/intake/${threadId}`);revalidatePath("/studio/sav/intake");
+ redirect(`/studio/sav/intake/${encodeURIComponent(threadId)}?holdRelease=${status}`);
 }

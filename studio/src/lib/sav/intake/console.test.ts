@@ -24,6 +24,7 @@ import { executeIntakePass, reconcileIntakeExecutor, readIntakeExecutionProgress
 import { recordIntakeHumanCommand, type IntakeHumanCommand } from "./human-commands";
 import { consumeIntakeHumanEvent } from "./human-worker";
 import { intakeRunConfigurationBound, intakeRunCandidateContactIds, humanRevisionConfigHash, type HumanEventPayload } from "./human-binding";
+import { releaseIntakeHumanHold } from "./human-hold-release";
 import { releaseLegacyAiPauses } from "./legacy-pause";
 import { SAV_EXTERNAL_COMPLETION, SAV_EXTERNAL_COMPLETION_REVERTED, getSavExternalCompletion, revertSavExternalCompletionBatch, markSavDossiersHandledExternally } from "../external-completion";
 import { listIntakeConsole, projectIntakeThread, refreshIntakeConsole } from "./console-store";
@@ -976,4 +977,62 @@ it("a cancelled earlier human hold stays in validation across inbound and reject
   expect((await listIntakeConsole({view:"to_validate"})).rows[0]).toMatchObject({messageId:next.id,status:"human_hold"});
   expect((await listIntakeConsole({view:"completed"})).total).toBe(0);
   expect(await releaseLegacyAiPauses(options.runtime)).toEqual({released:0});expect(mutationsSent()).toHaveLength(0);
+});
+
+async function heldReleaseCommand(beforeHold?:()=>Promise<void>,ambiguous=false) {
+  await recordIntakeLaunch({mailboxId,receivedAfter:options.runtime.receivedAfter,createdAfter:options.runtime.createdAfter});
+  await observed(ambiguous);await beforeHold?.();
+  await requestHumanIntervention(threadId,"ugo@limova.ai","Synthetic explicit team hold");
+  const [projection]=await db.db.select().from(savIntakeConsole).where(eq(savIntakeConsole.threadId,threadId));
+  return {requestKey:randomUUID(),threadId,messageId,expectedEpoch:projection.epoch,reason:"Synthetic administrator reviewed this dossier."};
+}
+it("explicit hold release is local, audited and idempotent without analysis, effects or reset",async()=>{
+  const raw=await heldReleaseCommand(),before=(await db.db.select().from(savIntakeRuns))[0];
+  expect(await releaseIntakeHumanHold(raw)).toEqual({released:true,replayed:false});
+  expect(await releaseIntakeHumanHold(raw)).toEqual({released:false,replayed:true});
+  const [thread]=await db.db.select().from(savThreads).where(eq(savThreads.id,threadId));expect(thread.aiPaused).toBe(false);
+  const after=(await db.db.select().from(savIntakeRuns))[0];expect(after.attempts).toBe(before.attempts);expect(after.payloadCiphertext).toBe(before.payloadCiphertext);
+  expect(await db.db.select().from(savIntakeExecutions)).toHaveLength(0);expect(await db.db.select().from(savIntakeModelCalls)).toHaveLength(0);
+  expect(await db.db.select().from(auditLogs).where(eq(auditLogs.action,"sav_intake_human_hold_released"))).toHaveLength(1);
+  expect(mutationsSent()).toHaveLength(0);expect(fetch).not.toHaveBeenCalled();
+  await expect(releaseIntakeHumanHold({...raw,reason:"Changed replay reason is not the same command."})).rejects.toThrow("CONFLICT");
+  await requestHumanIntervention(threadId,"ugo@limova.ai","A fresh synthetic team hold");
+  await expect(releaseIntakeHumanHold(raw)).rejects.toThrow("CONFLICT");
+  expect((await db.db.select().from(savThreads).where(eq(savThreads.id,threadId)))[0].aiPaused).toBe(true);
+});
+it.each(["new_inbound","marker","stale_epoch","short_reason","no_launch","no_human_hold"])("hold release refuses %s and preserves the pause",async scenario=>{
+  const raw=await heldReleaseCommand();
+  if(scenario==="new_inbound")await message(threadId,new Date(Date.now()+10));
+  if(scenario==="marker")await externalMarker();
+  if(scenario==="stale_epoch")raw.expectedEpoch++;
+  if(scenario==="short_reason")raw.reason="no";
+  if(scenario==="no_launch")await db.client.exec("DELETE FROM sav.sync_state WHERE key LIKE 'sav-intake-launch:%'");
+  if(scenario==="no_human_hold")await db.db.delete(savActions).where(eq(savActions.threadId,threadId));
+  await expect(releaseIntakeHumanHold(raw)).rejects.toThrow();
+  expect((await db.db.select().from(savThreads).where(eq(savThreads.id,threadId)))[0].aiPaused).toBe(true);
+  expect(await db.db.select().from(auditLogs).where(eq(auditLogs.action,"sav_intake_human_hold_released"))).toHaveLength(0);
+  expect(mutationsSent()).toHaveLength(0);
+});
+it.each(["member","inactive","unverified"])("hold release refuses an %s administrator identity",async scenario=>{
+  const raw=await heldReleaseCommand();
+  if(scenario==="unverified") { const [admin]=await db.db.select().from(staffUsers);state.user={id:admin.clerkId,primaryEmailAddress:{emailAddress:admin.email,verification:{status:"unverified"}}}; }
+  else await db.db.update(staffUsers).set(scenario==="member"?{role:"member"}:{active:false});
+  await expect(releaseIntakeHumanHold(raw)).rejects.toThrow("UNAUTHORIZED");
+  expect((await db.db.select().from(savThreads).where(eq(savThreads.id,threadId)))[0].aiPaused).toBe(true);
+});
+it.each(["run_lease","execution_lease","pending_human","uncertain_effect","legacy_intent"])("hold release refuses %s without clearing or replaying it",async scenario=>{
+  const raw=await heldReleaseCommand(async()=>{
+    if(scenario==="pending_human")await recordIntakeHumanCommand(await command());
+    if(scenario==="execution_lease"||scenario==="uncertain_effect") {
+      const execution=(await admitIntakeExecution(runId,options))!;
+      if(scenario==="uncertain_effect")await executeIntakePass(execution.id,options,{afterMarker:async()=>{throw Error("synthetic dispatch result still uncertain");}});
+    }
+    if(scenario==="legacy_intent")await db.db.insert(savActions).values({threadId,messageId,kind:"create_note",actorType:"human",status:"pending",idempotencyKey:randomUUID(),payload:{}});
+  },scenario==="pending_human");
+  if(scenario==="run_lease")await db.db.update(savIntakeRuns).set({leaseToken:randomUUID(),leaseUntil:new Date(Date.now()+60000)}).where(eq(savIntakeRuns.id,runId));
+  if(scenario==="execution_lease")await db.db.update(savIntakeExecutions).set({leaseToken:randomUUID(),leaseUntil:new Date(Date.now()+60000)}).where(eq(savIntakeExecutions.threadId,threadId));
+  raw.expectedEpoch=(await db.db.select().from(savIntakeConsole).where(eq(savIntakeConsole.threadId,threadId)))[0].epoch;
+  await expect(releaseIntakeHumanHold(raw)).rejects.toThrow("CONFLICT");
+  expect((await db.db.select().from(savThreads).where(eq(savThreads.id,threadId)))[0].aiPaused).toBe(true);
+  expect(mutationsSent()).toHaveLength(0);
 });

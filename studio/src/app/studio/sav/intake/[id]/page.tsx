@@ -10,6 +10,7 @@ import { MailConversation } from "../../[id]/mail-conversation";
 import { IntakeChoiceForm } from "../choice-form";
 import {readIntakeCrmDisplay} from "@/lib/sav/intake/crm-display-server";
 import {crmDisplayFallback,type CrmDisplayRecord} from "@/lib/sav/intake/crm-display";
+import { releaseIntakeHumanHoldAction } from "../actions";
 import {IntakeRecoveryForm} from "../recovery-form";
 import { intakeStatusLabel, intakeReasonLabel, intakeContextReasonLabels } from "@/lib/sav/intake/console-presentation";
 import styles from "../intake.module.css";
@@ -21,12 +22,13 @@ const stateLabels: Record<string, string> = { planned: "Prévu, sans départ", d
 function RecordLink({record}:{record:CrmDisplayRecord}) {
   return record.url?<a href={record.url} target="_blank" rel="noopener noreferrer">{record.label}</a>:<span>{record.label}</span>;
 }
-export default async function IntakeDetailPage({ params }: { params: Promise<{ id: string }> }) {
+export default async function IntakeDetailPage({ params, searchParams }: { params: Promise<{ id: string }>; searchParams?: Promise<{holdRelease?:string}> }) {
   const staff=await requireIntakeConsoleStaff();
   const { id } = await params;
   if (!z.uuid().safeParse(id).success) notFound();
   const data = await readIntakeConsoleDetail(id);
   if (!data) notFound();
+  const releaseNotice=(await searchParams)?.holdRelease;
   const current = data.current;
   const blocked = !data.handledExternally && !data.humanHeld && data.diagnostics?.messageId === data.latestMessageId && data.diagnostics.attemptsExhausted
     && current && ["pending", "waiting"].includes(current.state) && !data.confirmedCurrent;
@@ -50,6 +52,7 @@ export default async function IntakeDetailPage({ params }: { params: Promise<{ i
     <Link className={styles.back} href="/studio/sav/intake">← Nouveaux dossiers</Link>
     <header className={styles.heading}><div><span className="eyebrow">Dossier · version {current?.version ?? "en attente"}</span><h1>{data.thread.subject || "Nouvelle demande"}</h1>
       <p>{dirty ? "Mise à jour du traitement en cours" : intakeReasonLabel(data.projection.reason) ?? intakeStatusLabel(data.projection.status)}</p></div></header>
+    {releaseNotice && <p role="status">{releaseNotice === "released" && !data.thread.paused && !data.humanHeld && !data.handledExternally ? "La pause est levée pour ce dossier. Le moteur pourra poursuivre si les preuves et la politique existante le permettent. Si une nouvelle qualification est nécessaire, utilisez « Réinvestiguer avec les correctifs » dans le diagnostic technique." : "La pause est conservée : le dossier a changé, une opération reste en cours ou votre accès ne permet pas cette reprise. Rechargez le dossier et vérifiez ses preuves."}</p>}
     <div className={styles.detailGrid}><div>
       <section className={styles.decision}><h2>{data.humanHeld && !data.handledExternally ? "Prise en charge par l’équipe" : data.handledExternally ? "Disposition administrative" : data.confirmedCurrent ? "Résultat confirmé pour cette demande" : "Décision actuelle"}</h2>
         {blocked && <p role="status">Analyse bloquée : les deux tentatives de ce message sont épuisées, y compris dans ses versions précédentes. Aucune relance automatique n’est autorisée par ce diagnostic.</p>}
@@ -76,6 +79,14 @@ export default async function IntakeDetailPage({ params }: { params: Promise<{ i
       <MailConversation messages={data.messages}/>
       {data.historyTruncated && <p role="status">Les 200 messages les plus récents sont affichés. L’historique est incomplet.</p>}
     </div><aside className={styles.side}>
+      {data.humanHeld && !data.handledExternally && data.latestMessageId && ["admin","owner"].includes(staff.role) && <section className={styles.notice}><h2>Reprendre ce dossier</h2>
+        <p>Cette action lève uniquement sa pause humaine. Le moteur automatique pourra poursuivre si les preuves et la politique existante le permettent. Les tentatives et les preuves sont conservées. Si une nouvelle qualification est nécessaire, utilisez ensuite « Réinvestiguer avec les correctifs » dans le diagnostic technique.</p>
+        <form action={releaseIntakeHumanHoldAction}>
+          <input type="hidden" name="requestKey" value={randomUUID()}/><input type="hidden" name="threadId" value={id}/>
+          <input type="hidden" name="messageId" value={data.latestMessageId}/><input type="hidden" name="expectedEpoch" value={data.projection.epoch}/>
+          <label>Motif de la reprise<textarea name="reason" required minLength={10} maxLength={2000}/></label>
+          <button type="submit">Lever la pause</button>
+        </form></section>}
       {canCorrect && current?.sourceHash && plan ? <IntakeChoiceForm expected={{ commandKey: randomUUID(), threadId: id,
         messageId: current.messageId, runId: current.id, version: current.version, sourceHash: current.sourceHash,
         candidatesHash: intakeRuntimeHash(contacts) }} contacts={contacts} tickets={tickets} display={display} classification={plan.decision.classification}/> :
