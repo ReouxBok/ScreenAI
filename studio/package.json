@@ -55,7 +55,7 @@
     "server-only": "^0.0.1",
     "sharp": "0.35.5",
     "workflow": "^4.8.5",
-    "zod": "^4.4.3"
+    "zod": "4.6.6"
   },
   "devDependencies": {
     "@electric-sql/pglite": "^0.5.4",
@@ -90,6 +90,7 @@
     "mysql2": "3.24.3",
     "tar": "7.5.22",
     "braces": "$braces",
-    "vite": "8.2.4"
+    "vite": "8.2.4",
+    "zod": "4.6.6"
   }
 }
