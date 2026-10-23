@@ -245,12 +245,12 @@ export async function failSavIntakeRun(lease: IntakeLease, payload: IntakeRuntim
     }
   });
 }
-export async function pendingSavIntakeRuns(config: IntakeRuntimeConfig, now = new Date()) {
+export async function pendingSavIntakeRuns(config: IntakeRuntimeConfig, now = new Date(), schedulingFilter?: ReturnType<typeof sql>) {
   const completedIds = await listSavExternalCompletionMessageIds(requireDb(), false, config.mailboxId);
   const notCompleted = completedIds.length ? sql`${savIntakeRuns.messageId} not in (${sql.join(completedIds.map(id => sql`${id}::uuid`), sql`, `)})` : undefined;
   const noHuman = await intakeConsoleInstalled() ? sql`not exists(select 1 from sav.intake_human_events h where h.message_id=${savIntakeRuns.messageId})` : undefined;
   return requireDb().select({ id: savIntakeRuns.id }).from(savIntakeRuns).where(and(eq(savIntakeRuns.isCurrent, true), eq(savIntakeRuns.configHash, config.configHash),
-    lt(savIntakeRuns.attempts, 2), noHuman, notCompleted, noCommittedExecutionFor(sql`${savIntakeRuns.messageId}`),
+    lt(savIntakeRuns.attempts, 2), noHuman, notCompleted, schedulingFilter, noCommittedExecutionFor(sql`${savIntakeRuns.messageId}`),
     sql`(select coalesce(sum(s.attempts),0) from sav.intake_runs s where s.message_id = ${savIntakeRuns.messageId}) < 2`,
     sql`exists (select 1 from sav.threads t where t.id = ${savIntakeRuns.threadId} and not t.ai_paused)`,
     or(inArray(savIntakeRuns.state, ["pending", "waiting"]), and(eq(savIntakeRuns.state, "analysing"), lt(savIntakeRuns.leaseUntil, now)))))

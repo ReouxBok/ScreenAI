@@ -26,6 +26,8 @@ export async function enqueueConfiguredSavIntake(messageId: string) {
   if (await intakeMessageHistorical(messageId)) return { archived: true as const };
   if (!await intakeLaunchMatches(config)) throw Error("SAV_INTAKE_LAUNCH_MISMATCH");
   const runId=await enqueueSavIntakeMessage(messageId, config);
+  // The run is committed; the wake is a non-throwing hint, cron stays the fallback.
+  if (runId) await (await import("./event-dispatch")).requestSavIntakeWake(runId);
   return !runId && launch ? launch : {runId};
 }
 async function analyseSavIntakeRuntimeWithinBudget(runId: string, config: IntakeRuntimeConfig,

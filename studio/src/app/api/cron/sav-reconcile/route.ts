@@ -3,6 +3,7 @@ import { ensureIntakeObservations } from "@/lib/sav/intake/observation-binding";
 import { reconcileIntakeHumanChoices } from "@/lib/sav/intake/human-worker";
 import { reconcileIntakeExecutor } from "@/lib/sav/intake/executor";
 import { reconcileSavIntakeRuntime } from "@/lib/sav/intake/runtime";
+import { dispatchPendingSavIntakeWakes } from "@/lib/sav/intake/event-dispatch";
 import { reconcileSavTranslations } from "@/lib/sav/translations";
 import { processPendingGmailReceipts, processPendingGmailSendActions } from "@/lib/sav/gmail";
 import { continueHubspotBackfill, getHubspotBackfillState, processPendingHubspotActions, processPendingHubspotReceipts, processPendingPilotHubspotActionsAcrossBatches, shouldAttemptHubspotBackfill } from "@/lib/sav/hubspot";
@@ -60,6 +61,8 @@ export async function GET(request: Request) {
   // Gmail action. Keeping these steps ordered prevents orphaned conversations.
   const ticketActions = await runStep("hubspot_ticket_actions", () => processPendingHubspotActions(50));
   const intakeObservation = await runStep("intake_observation", () => reconcileSavIntakeRuntime({ deadlineMs: derivedDeadline }));
+  // Redispatches wakes lost after commit; the inline analysis above stays the fallback.
+  const intakeWakes = await runStep("intake_wakes", () => dispatchPendingSavIntakeWakes());
   const intakeChoices = await runStep("intake_choices", () => Date.now()+45_000>derivedDeadline?Promise.resolve({skipped:"deadline"}):reconcileIntakeHumanChoices());
   const intakeExecution = await runStep<Awaited<ReturnType<typeof reconcileIntakeExecutor>> | { skipped: string }>("intake_execution",()=>Date.now()+60_000>derivedDeadline?Promise.resolve({skipped:"deadline"}):reconcileIntakeExecutor({deadlineMs:derivedDeadline}));
   const intakeTracking = await runStep("intake_tracking", () => ensureIntakeObservations(4));
@@ -85,7 +88,7 @@ export async function GET(request: Request) {
   const dashboardProjection = savSqlDashboardEnabled()
     ? await runStep("dashboard_projection", () => refreshSavDashboardProjection(25, undefined, { deadlineMs: derivedDeadline }))
     : { status: "skipped" as const, durationMs: 0, data: { reason: "disabled" } };
-  const payload = { intakeTracking, intakeChoices, intakeConsole, intakeExecution, intakeObservation, gmail, hubspot, emailOpenings, contextRefreshes, trainings, evaluations, ticketActions, pilotItems, pendingMessages, pilotActions, followups, replies, statusActions, learningBackfill, observations, translations, retention, dashboardProjection };
+  const payload = { intakeWakes, intakeTracking, intakeChoices, intakeConsole, intakeExecution, intakeObservation, gmail, hubspot, emailOpenings, contextRefreshes, trainings, evaluations, ticketActions, pilotItems, pendingMessages, pilotActions, followups, replies, statusActions, learningBackfill, observations, translations, retention, dashboardProjection };
   const hasStepFailure = Object.values(payload).some((step) => step.status === "error");
   await recordSavWorkerPulse(pulseId, pulseStartedAt, hasStepFailure);
   return Response.json(payload, { status: hasStepFailure ? 500 : 200 });
