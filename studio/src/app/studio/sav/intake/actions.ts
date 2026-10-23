@@ -5,6 +5,7 @@ import { releaseIntakeHumanHold } from "@/lib/sav/intake/human-hold-release";
 import { revalidatePath } from "next/cache";
 import { recordIntakeHumanCommand } from "@/lib/sav/intake/human-commands";
 import {requestIntakeReinvestigation,reconcileThreadIdentification} from "@/lib/sav/intake/operator-recovery";
+import { reconcileIntakeNoteForClosure } from "@/lib/sav/intake/note-recovery";
 export type IntakeChoiceFormState = { ok: boolean; message: string };
 export async function completeIntakeDossierAction(_previous: IntakeChoiceFormState, form: FormData): Promise<IntakeChoiceFormState> {
  try {
@@ -30,6 +31,15 @@ export async function reconcileIdentificationAction(_previous:IntakeChoiceFormSt
  try{const result=await reconcileThreadIdentification(String(form.get("threadId")));revalidatePath(`/studio/sav/intake/${String(form.get("threadId"))}`);
   return {ok:true,message:`${result.confirmed} envoi(s) existant(s) rapproché(s). Aucun mail renvoyé.`};
  }catch{return {ok:false,message:"Les preuves ne permettent pas encore de confirmer cet envoi. Aucun mail renvoyé."};}
+}
+export async function reconcileNoteAction(_previous:IntakeChoiceFormState,form:FormData):Promise<IntakeChoiceFormState>{
+ try {
+  await reconcileIntakeNoteForClosure({threadId:form.get("threadId"),messageId:form.get("messageId")});
+  revalidatePath(`/studio/sav/intake/${String(form.get("threadId"))}`);revalidatePath("/studio/sav/intake");
+  return {ok:true,message:"Note existante et rattachement vérifiés. Vous pouvez passer le dossier en Terminés. Aucune note créée ni aucun mail envoyé."};
+ } catch {
+  return {ok:false,message:"La note et son rattachement ne sont pas entièrement confirmés, ou le dossier a changé. Le dossier reste protégé ; aucune action externe relancée."};
+ }
 }
 export async function saveIntakeChoice(_previous: IntakeChoiceFormState, form: FormData): Promise<IntakeChoiceFormState> {
   const text = (key: string) => typeof form.get(key) === "string" ? String(form.get(key)) : "";
