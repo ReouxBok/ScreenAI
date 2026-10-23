@@ -75,6 +75,8 @@ const Logger = {
   metadata: {},
   bootId: randomId('boot'),
   bootStartedAt: new Date().toISOString(),
+  // Optional listener, called with every sanitized entry (usage analytics).
+  onRecord: null,
   _persistPromise: Promise.resolve(),
 
   async initialize({ storageArea = null, metadata = {} } = {}) {
@@ -116,6 +118,11 @@ const Logger = {
     this.logs.push(entry);
     this._trim();
     this._persist();
+    try {
+      this.onRecord?.(entry);
+    } catch (_) {
+      // A listener must never break logging.
+    }
     if (this.DEBUG) console[level === 'ERROR' ? 'error' : level === 'WARN' ? 'warn' : 'log'](`[${entry.component}] ${entry.code}: ${entry.message}`, entry.data || '');
     return entry;
   },

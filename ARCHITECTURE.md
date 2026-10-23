@@ -36,6 +36,10 @@ Chaque conversation visible possède un `sessionId` distant. « Nouveau chat » 
 
 Le schéma privé `charly_memory` stocke les profils, sessions, messages, résumés, souvenirs, objectifs et métadonnées de runs chiffrés. Les captures, DOM, contenus réseau, valeurs de champs et arguments sensibles ne sont jamais persistés. L’état d’onboarding conserve sa révision et son étape ; les preuves de complétion restent validées localement avec l’URL et le DOM.
 
+## Statistiques d’utilisation
+
+`src/utils/analytics.js` met en file les événements d’usage du service worker (persistés dans `chrome.storage.session`, envoyés par lots au proxy sur `/api/events`). Le proxy (`proxy/analytics.js`) applique une liste blanche, rattache le compte OTP vérifié (`$identify` de l’identifiant d’installation) et transmet à PostHog UE. Il émet aussi des événements serveur (`server_*`) sur les routes copilote, voix, connaissances et OTP. `chrome.runtime.setUninstallURL` pointe vers `/api/uninstalled`. L’opt-out du menu coupe les deux sources. Détails : `docs/PRIVACY.md`.
+
 ## Sécurité et confidentialité
 
 - Consentement IA affirmatif et distinct.
