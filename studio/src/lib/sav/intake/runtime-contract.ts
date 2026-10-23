@@ -5,6 +5,7 @@ import { SAV_INTAKE_MODEL_REVISION } from "./model-readers";
 import { SAV_INTAKE_READERS_REVISION } from "./hubspot-readers";
 import { SAV_MESSAGE_CONTEXT_REVISION } from "../message-context";
 import type { EnginePolicy, IntakePlan } from "./engine-types";
+import { intakeArtifactAuthorized } from "./compatibility";
 
 export const SAV_INTAKE_RUNTIME_REVISION = "sav-intake-runtime-2026-10-21.v1";
 export const intakeRuntimeHash = (value: unknown) => createHash("sha256").update(JSON.stringify(value)).digest("hex");
@@ -17,6 +18,7 @@ const policySchema = z.object({
     partnership: resource.optional(), commercial: resource.optional(), investor: resource.optional() }).strict(),
 }).strict();
 export const savIntakeRuntimePins = z.object({ mailboxId: z.uuid(), createdAfter: z.iso.datetime(), receivedAfter: z.iso.datetime(), expiresAt: z.iso.datetime(), codeRevision: z.string().regex(/^[a-f0-9]{40}$/),
+  compatibility: z.string().regex(/^[a-f0-9]{64}$/).optional(),
   resourcesHash: z.string().regex(/^[a-f0-9]{64}$/), policyHash: z.string().regex(/^[a-f0-9]{64}$/), maxNanoUsd: z.number().int().min(1).max(3_000_000_000), maxCalls: z.number().int().min(1).max(300),
   budgetProfile: z.literal(SAV_INTAKE_OPERATIONAL_PROFILE).optional(), maxRollingNanoUsd: z.number().int().min(1).max(90_000_000_000).optional() }).strict().refine(p =>
     p.budgetProfile === SAV_INTAKE_OPERATIONAL_PROFILE ? p.maxRollingNanoUsd !== undefined : p.maxCalls <= 30 && p.maxRollingNanoUsd === undefined);
@@ -36,7 +38,7 @@ export function savIntakeRuntimeConfig(env: Record<string, string | undefined> =
       const approved = catalogue.find(entry => JSON.stringify(entry.resource) === JSON.stringify({resourceId:reference.resourceId,revisionId:reference.revisionId,sha256:reference.sha256}));
       if (!approved || kind === "multiTicketWarning" && approved.text !== policy.resources.multiTicketWarning?.text) throw Error();
     }
-    if (intakeRuntimeHash(rawPolicy) !== p.policyHash || (env.VERCEL_GIT_COMMIT_SHA ?? env.SAV_CODE_REVISION) !== p.codeRevision || env.SAV_AI_MODEL !== "gemini-3.6-flash"
+    if (intakeRuntimeHash(rawPolicy) !== p.policyHash || !intakeArtifactAuthorized(p, env.VERCEL_GIT_COMMIT_SHA ?? env.SAV_CODE_REVISION) || env.SAV_AI_MODEL !== "gemini-3.6-flash"
       || !Number.isFinite(now.getTime()) || Date.parse(p.createdAfter) > now.getTime() || (p.budgetProfile !== SAV_INTAKE_OPERATIONAL_PROFILE && now.getTime() - Date.parse(p.createdAfter) > 86_400_000) || Date.parse(p.receivedAfter) >= Date.parse(p.expiresAt) || now.getTime() >= Date.parse(p.expiresAt)
       || (p.budgetProfile === SAV_INTAKE_OPERATIONAL_PROFILE ? !intakeOperationalTermValid(p.expiresAt,now) : Date.parse(p.expiresAt) - now.getTime() > 86_400_000) || !env.SAV_GEMINI_API_KEY || !env.HUBSPOT_ACCESS_TOKEN
       || (env.SAV_ENCRYPTION_KEY_V1?.length ?? 0) < 32) throw Error();

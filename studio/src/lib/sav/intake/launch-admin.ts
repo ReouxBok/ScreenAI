@@ -8,6 +8,7 @@ import { intakeRuntimeHash, savIntakeRuntimeConfig, savIntakeRuntimePins } from 
 import { executionAdministrator, executionPolicySchema, approveIntakeExecutionPolicy, revokeIntakeExecutionPolicy } from "./execution-policy";
 import { recordIntakeLaunch, readIntakeLaunch } from "./launch-boundary";
 import { intakeConsoleInstalled } from "./console-capability";
+import { intakeSamePin } from "./compatibility";
 const inputSchema=z.object({runtime:savIntakeRuntimePins,policy:executionPolicySchema}).strict();
 const key=(id:string)=>`sav-intake-launch-preview:${id}`;
 type Preview={revision:"sav-intake-launch-preview.v1"; actorId:string; input:z.infer<typeof inputSchema>; hash:string; createdAt:string; expiresAt:string; leaseUntil?:string;
@@ -16,7 +17,7 @@ function validateInput(raw:unknown) {
   const input=inputSchema.parse(raw);
   const runtime=savIntakeRuntimeConfig({...process.env,SAV_INTAKE_RUNTIME_MODE:"observe",SAV_INTAKE_RUNTIME_CONFIG:JSON.stringify(input.runtime)})!;
   const p=input.policy;
-  if(p.codeRevision!==runtime.codeRevision||p.mailboxId!==runtime.mailboxId||p.receivedAfter!==runtime.receivedAfter||p.createdAfter!==runtime.createdAfter
+  if(!intakeSamePin(p,runtime)||p.mailboxId!==runtime.mailboxId||p.receivedAfter!==runtime.receivedAfter||p.createdAfter!==runtime.createdAfter
     ||p.enginePolicyHash!==runtime.policyHash||p.resourcesHash!==runtime.resourcesHash||p.budgetProfile!==runtime.budgetProfile||p.expiresAt!==runtime.expiresAt
     ||intakeRuntimeHash(savIntakeRuntimePins.parse(JSON.parse(process.env.SAV_INTAKE_RUNTIME_CONFIG??"null")))!==intakeRuntimeHash(input.runtime)) throw Error("SAV_INTAKE_LAUNCH_PIN_MISMATCH");
   return input;

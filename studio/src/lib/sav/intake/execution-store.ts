@@ -5,6 +5,7 @@ import { intakeRunConfigurationBound, intakeHumanRefused } from "./human-binding
 import { createHash, randomUUID } from "node:crypto";
 import {canAccessSav} from "../access";
 import {executionPolicySchema} from "./execution-policy";
+import { intakeArtifactAuthorized, intakeSamePin } from "./compatibility";
 import { and, desc, eq, inArray, sql } from "drizzle-orm";
 import { requireDb } from "@/db";
 import { staffUsers,savMailboxes,savIntakeHumanEvents,savIntakeExecutionPolicies,savActions, savThreads, savMessages, savIntakeRuns, savSyncState, savIntakeExecutions, savIntakeEffects, savIntakeEffectJournal, savIntakeOccupations, savIntakeExecutionBudget, savIntakeIdentityEpisodes, savIntakeEffectRevisions } from "@/db/schema";
@@ -135,7 +136,7 @@ export async function admitIntakeExecution(runId: string, options: ExecutionOpti
             if(old?.state!=="revoked"||old.policyHash!==existing.policyHash||next?.state!=="approved"||next.policyHash!==options.config.policyHash
                 ||intakeRuntimeHash(decryptSavPayload(next.payloadCiphertext))!==options.config.policyHash
                 ||intakeRuntimeHash(executionPolicySchema.parse(p))!==options.config.policyHash
-                ||p.codeRevision!==options.config.codeRevision||p.codeRevision!==options.runtime.codeRevision||Date.parse(p.expiresAt)<=Date.now())return reject();
+                ||!intakeArtifactAuthorized(p,options.config.codeRevision)||!intakeSamePin(p,options.runtime)||Date.parse(p.expiresAt)<=Date.now())return reject();
             const [administrator]=await tx.select().from(staffUsers).where(eq(staffUsers.id,next.administratorId)).for("update");
             if(!administrator?.active||!["admin","owner"].includes(administrator.role)||!canAccessSav(administrator.email,administrator.role))return reject();
             payload.runtimeConfigHash=options.runtime.configHash;

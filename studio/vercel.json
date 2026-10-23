@@ -1,5 +1,6 @@
 {
   "$schema": "https://openapi.vercel.sh/vercel.json",
+  "installCommand": "npm ci",
   "git": {
     "deploymentEnabled": {
       "codex/sav-bug-62-external-completion": false,

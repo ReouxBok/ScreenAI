@@ -42,6 +42,7 @@ import { ensureSavCaseObservationTx } from "../case-learning";
 import { readSavCaseLearningQualification } from "../case-qualification";
 import { reviewSavProposal } from "../review";
 import { previewIntakeLaunch, commitIntakeLaunch } from "./launch-admin";
+import { SAV_INTAKE_COMPATIBILITY } from "./compatibility";
 import { previewLaunchAction, commitLaunchAction, revokeLaunchAction } from "@/app/studio/sav/intake/launch/actions";
 import { POST as adminPost } from "@/app/api/sav/intake-admin/route";
 import { getSavThreadDetail, processStoredSavMessage, processPendingSavMessages } from "../service";
@@ -531,6 +532,17 @@ it("new approved V0 message after intake keeps a separate baseline and can quali
   await db.db.update(savMessages).set({analysisStatus:"intake_pending"}).where(eq(savMessages.id,m.id));
   expect(await readSavCaseLearningQualification(threadId)).toHaveProperty("allowed",false);
 });
+it.each(["compatible", "mixed", "mismatch"])("administrator preview binds the authority mode: %s", async mode => {
+  const runtime = { ...JSON.parse(environment.SAV_INTAKE_RUNTIME_CONFIG!), compatibility: SAV_INTAKE_COMPATIBILITY };
+  environment.SAV_INTAKE_RUNTIME_CONFIG = JSON.stringify(runtime);
+  const policy = { ...options.policy, compatibility: mode === "mixed" ? undefined : mode === "mismatch" ? "f".repeat(64) : SAV_INTAKE_COMPATIBILITY };
+  if (mode === "compatible") { policy.codeRevision = "b".repeat(40); environment.VERCEL_GIT_COMMIT_SHA = "b".repeat(40); }
+  for (const [key, value] of Object.entries(environment)) if (value !== undefined) vi.stubEnv(key, value);
+  const preview = previewIntakeLaunch(randomUUID(), { runtime, policy });
+  if (mode === "compatible") expect(await preview).toHaveProperty("hash");
+  else await expect(preview).rejects.toThrow("LAUNCH_PIN_MISMATCH");
+  expect(mutationsSent()).toHaveLength(0);
+});
 it("administrator preview is inert, immutable and commit is exact/idempotent while OFF",async()=>{
   for(const [key,value] of Object.entries(environment))if(value!==undefined)vi.stubEnv(key,value);
   vi.stubEnv("SAV_INTAKE_RUNTIME_MODE","off");
@@ -769,7 +781,14 @@ function stubRecoveryModel(){
  }));
 }
 
-it.each(["valid","old_authority_active","departed","leased","new_admin_inactive"])("recovered unsent execution authority rebinding: %s",async mode=>{
+it.each(["valid","compatible","mixed","old_authority_active","departed","leased","new_admin_inactive"])("recovered unsent execution authority rebinding: %s",async mode=>{
+  if(mode==="compatible"||mode==="mixed"){
+   environment.SAV_INTAKE_RUNTIME_CONFIG=JSON.stringify({...JSON.parse(environment.SAV_INTAKE_RUNTIME_CONFIG!),compatibility:SAV_INTAKE_COMPATIBILITY});
+   options.runtime=savIntakeRuntimeConfig(environment)!; options.policy={...options.policy,compatibility:SAV_INTAKE_COMPATIBILITY};
+   const initial=await approveIntakeExecutionPolicy(options.policy);
+   environment={...environment,SAV_INTAKE_EXECUTION_POLICY_ID:initial.id,SAV_INTAKE_EXECUTION_POLICY_SHA256:initial.policyHash};
+   options.config=intakeExecutionConfig(environment)!;
+  }
  await observed();const execution=(await admitIntakeExecution(runId,options))!;
  const oldPayload=decryptSavPayload<Record<string,unknown>>(execution.payloadCiphertext);
  await db.db.update(savIntakeExecutions).set({payloadCiphertext:encryptSavPayload({...oldPayload,runtimeConfigHash:"f".repeat(64)})}).where(eq(savIntakeExecutions.id,execution.id));
@@ -778,14 +797,18 @@ it.each(["valid","old_authority_active","departed","leased","new_admin_inactive"
  expect(await consumeIntakeHumanEvent(requested.eventId,options.runtime,createSavIntakeHubspotReaders({network:p.network}))).toHaveProperty("state","observed");
  const current=(await readSavIntakeCurrent(threadId,options.runtime))!;
  const beforeBudget=await db.db.select().from(savIntakeExecutionBudget),calls=await db.db.select().from(savIntakeModelCalls);
- const next=await approveIntakeExecutionPolicy(options.policy);
+  if(mode==="compatible"){
+   options.policy={...options.policy,codeRevision:"b".repeat(40)}; environment.VERCEL_GIT_COMMIT_SHA="b".repeat(40);
+  }
+  if(mode==="mixed")options.policy={...options.policy,compatibility:undefined};
+  const next=await approveIntakeExecutionPolicy(options.policy);
  if(mode!=="old_authority_active")await db.db.update(savIntakeExecutionPolicies).set({state:"revoked"}).where(eq(savIntakeExecutionPolicies.id,execution.policyId));
  environment={...environment,SAV_INTAKE_EXECUTION_POLICY_ID:next.id,SAV_INTAKE_EXECUTION_POLICY_SHA256:next.policyHash};
  options={...options,config:intakeExecutionConfig(environment)!};
  if(mode==="departed")await db.db.insert(savIntakeEffects).values({id:randomUUID(),executionId:execution.id,businessKey:"synthetic-departure",kind:"ticket_create",permission:"create_ticket",state:"uncertain",intentHash:"a".repeat(64),intentCiphertext:encryptSavPayload({}),dispatchedAt:new Date()});
  if(mode==="leased")await db.db.update(savIntakeExecutions).set({leaseUntil:new Date(Date.now()+60000)}).where(eq(savIntakeExecutions.id,execution.id));
  if(mode==="new_admin_inactive")await db.db.update(staffUsers).set({active:false});
- if(mode!=="valid"){
+  if(mode!=="valid"&&mode!=="compatible"){
   await expect(admitIntakeExecution(current.id,options)).rejects.toThrow("RECOVERY_AUTHORITY_REBIND_REFUSED");
   expect((await db.db.select().from(savIntakeExecutions))[0].policyId).toBe(execution.policyId);expect(mutationsSent()).toHaveLength(0);
  }else{

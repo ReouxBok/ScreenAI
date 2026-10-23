@@ -9,8 +9,10 @@ import { canAccessSav } from "../access";
 import { encryptSavPayload, decryptSavPayload } from "../crypto";
 import { intakeRuntimeHash } from "./runtime-contract";
 import { savIntakeMutationSchema } from "./contract";
+import { intakeArtifactAuthorized } from "./compatibility";
 export const executionPolicySchema = z.object({
     revision: z.literal("sav-intake-execution-2026-10-21.v1"), mailboxId: z.uuid(), codeRevision: z.string().regex(/^[a-f0-9]{40}$/),
+    compatibility: z.string().regex(/^[a-f0-9]{64}$/).optional(),
     enginePolicyHash: z.string().regex(/^[a-f0-9]{64}$/), resourcesHash: z.string().regex(/^[a-f0-9]{64}$/),
     receivedAfter: z.iso.datetime(), createdAfter: z.iso.datetime(), expiresAt: z.iso.datetime(), budgetProfile:z.literal(SAV_INTAKE_OPERATIONAL_PROFILE).optional(), maxDossiers: z.number().int().min(1).max(100),
     mutations: z.array(savIntakeMutationSchema).min(1).max(6).refine(a => new Set(a).size === a.length),
@@ -87,7 +89,7 @@ export async function readIntakeExecutionAuthority(config: ExecutionConfig, now 
     if (!row || row.state !== "approved" || row.policyHash !== config.policyHash || !staff?.active || !["admin", "owner"].includes(staff.role) || !canAccessSav(staff.email, staff.role))
         throw Error("SAV_INTAKE_EXECUTION_PERMISSION_REVOKED");
     const policy = executionPolicySchema.parse(decryptSavPayload(row.payloadCiphertext));
-    if (intakeRuntimeHash(policy) !== row.policyHash || policy.codeRevision !== config.codeRevision || Date.parse(policy.expiresAt) <= now.getTime()
+    if (intakeRuntimeHash(policy) !== row.policyHash || !intakeArtifactAuthorized(policy, config.codeRevision) || Date.parse(policy.expiresAt) <= now.getTime()
         || policy.budgetProfile===SAV_INTAKE_OPERATIONAL_PROFILE && !intakeOperationalTermValid(policy.expiresAt,now))
         throw Error("SAV_INTAKE_EXECUTION_POLICY_EXPIRED");
     return {
