@@ -926,7 +926,7 @@ it("finalizes a verified identity receipt after revoked authority without dispat
     expect(p.calls).toHaveLength(before);
     expect(p.calls.filter(c=>c.path==="gmail/messages/send")).toHaveLength(1);
 });
-it.each(["new-inbound","changed-source","superseded-run","active-lease","missing-proof","changed-intent","paused"])("identity receipt finalization preserves the %s barrier", async scenario => {
+it.each(["new-inbound","changed-source","superseded-run","active-lease","missing-proof","changed-intent","paused","missing-run"])("identity receipt finalization preserves the %s barrier", async scenario => {
     const row = await verifiedIdentityAfterRevocation(), before = p.calls.length;
     if(scenario==="new-inbound") await storedMessage(threadId,new Date(Date.now()+1));
     if(scenario==="changed-source") await f.db.update(savMessages).set({bodyCiphertext:encryptSavPayload({text:"Changed source"})}).where(eq(savMessages.id,messageId));
@@ -934,6 +934,7 @@ it.each(["new-inbound","changed-source","superseded-run","active-lease","missing
     if(scenario==="active-lease") await f.db.update(savIntakeExecutions).set({leaseUntil:new Date(Date.now()+60000)}).where(eq(savIntakeExecutions.id,row.id));
     if(scenario==="missing-proof") await f.db.update(savIntakeEffects).set({verificationCiphertext:null}).where(eq(savIntakeEffects.executionId,row.id));
     if(scenario==="changed-intent") await f.db.update(savIntakeEffects).set({intentHash:"0".repeat(64)}).where(eq(savIntakeEffects.executionId,row.id));
+    if(scenario==="missing-run") await f.db.update(savIntakeExecutions).set({runId:null}).where(eq(savIntakeExecutions.id,row.id));
     if(scenario==="paused") await f.db.update(savThreads).set({aiPaused:true}).where(eq(savThreads.id,threadId));
     expect(await finishVerifiedIdentityRecovery(row.id)).toBe(false);
     expect((await f.db.select().from(savIntakeExecutions).where(eq(savIntakeExecutions.id,row.id)))[0].state).toBe("uncertain");

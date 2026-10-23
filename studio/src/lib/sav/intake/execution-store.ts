@@ -330,7 +330,7 @@ export async function finishVerifiedIdentityRecovery(executionId: string) {
     return requireDb().transaction(async tx => {
         await admissionLock(tx);
         const [row] = await tx.select().from(savIntakeExecutions).where(eq(savIntakeExecutions.id, executionId)).for("no key update");
-        if (!row || ["confirmed", "refused"].includes(row.state) || row.leaseUntil && row.leaseUntil > new Date()) return false;
+        if (!row || !row.runId || ["confirmed", "refused"].includes(row.state) || row.leaseUntil && row.leaseUntil > new Date()) return false;
         const [thread] = await tx.select().from(savThreads).where(eq(savThreads.id, row.threadId)).for("update");
         const [message] = await tx.select().from(savMessages).where(eq(savMessages.id, row.messageId));
         const [latest] = await tx.select({id:savMessages.id}).from(savMessages).where(and(eq(savMessages.threadId,row.threadId),eq(savMessages.direction,"inbound")))
