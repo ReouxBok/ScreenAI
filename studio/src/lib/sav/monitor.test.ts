@@ -3,7 +3,7 @@ import { beforeAll, beforeEach, afterAll, afterEach, expect, it, vi } from "vite
 import { eq, sql } from "drizzle-orm";
 import { PgDialect } from "drizzle-orm/pg-core";
 import { createSavTestDb } from "../../../test/sav-db";
-import { savMailboxes, savMessages, savThreads, savSyncState, auditLogs, savIntakeRuns, savGmailQuarantine } from "@/db/schema";
+import { savMailboxes, savMessages, savThreads, savSyncState, auditLogs, savIntakeRuns, savGmailQuarantine, savIntakeConsole } from "@/db/schema";
 import { encryptSavPayload } from "./crypto";
 const state = vi.hoisted(() => ({ db: null as unknown }));
 vi.mock("@/db", () => ({ requireDb: () => state.db }));
@@ -162,4 +162,19 @@ it("bounds retries to a failed batch while allowing a later incident its own att
   await f.db.update(savMailboxes).set({watchExpiration:new Date(0)});
   vi.mocked(fetch).mockResolvedValue(new Response("ok"));
   expect(await runSavServerMonitor()).toMatchObject({delivery:"sent"});expect(fetch).toHaveBeenCalledTimes(4);
+});
+it("surfaces launched mail that cannot move without a person: held thread, sources to re-investigate, waiting dossier",async()=>{
+  await launch();
+  const old=new Date(Date.now()-2400000), recent=new Date(Date.now()-300000);
+  const thread=async(paused=false)=>(await f.db.insert(savThreads).values({mailboxId,gmailThreadId:randomUUID(),customerEmail:"client@example.invalid",aiPaused:paused}).returning())[0];
+  const inbound=async(threadId:string,at:Date)=>f.db.insert(savMessages).values({mailboxId,threadId,direction:"inbound",fromEmail:"client@example.invalid",receivedAt:at,createdAt:at,bodyCiphertext:"not-read",analysisStatus:"intake_waiting"});
+  const held=await thread(true); await inbound(held.id,old);
+  const fresh=await thread(true); await inbound(fresh.id,recent);
+  const statuses=[["context_changed",old],["waiting",old],["waiting",recent],["followup_started",old]] as const;
+  for(const [status,at] of statuses){const t=await thread();await inbound(t.id,at);
+    await f.db.insert(savIntakeConsole).values({threadId:t.id,mailboxId,status}).onConflictDoUpdate({target:savIntakeConsole.threadId,set:{status}});
+    await f.db.update(savIntakeConsole).set({updatedAt:at}).where(eq(savIntakeConsole.threadId,t.id));}
+  const snapshot=await collectSavMonitorSnapshot();expect(snapshot.complete).toBe(true);
+  expect(snapshot.issues).toEqual(expect.arrayContaining([{code:"intake_held",count:1,severity:"warning"},
+    {code:"sources_changed_waiting",count:1,severity:"warning"},{code:"dossier_waiting",count:1,severity:"warning"}]));
 });
