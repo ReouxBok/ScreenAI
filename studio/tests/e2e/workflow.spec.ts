@@ -186,9 +186,10 @@ test("la V0 SAV expose la frontière, les vues et le laboratoire isolé", async 
 
 test("une démonstration extension devient un parcours Charly éditable",async({page,request})=>{
   // This serial journey covers capture, conversion, evaluation and publication.
-  // CI cold training routes alone take 16.5s; the former 30s global deadline
-  // expired during evaluation. Assertion timeouts remain unchanged.
-  test.setTimeout(60_000);
+  // This isolated CI partition cold-compiles training and evaluation routes.
+  // The trace reaches the verified flow after 63s, beyond the old 60s budget.
+  // Keep every assertion and its timeout; allow the complete serial journey.
+  test.setTimeout(120_000);
   await test.step("Capturer et vérifier la démonstration extension",async()=>{
     await login(page);
     await page.goto("/studio/entrainements");
