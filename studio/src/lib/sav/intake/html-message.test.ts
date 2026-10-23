@@ -17,9 +17,11 @@ it("keeps literal HTML advice complete while rejecting a clearly incomplete HTML
   expect(prepareSavIntakeMessage({...input,body:"Dans l’éditeur utilisez <blockquote> pour citer du texte."}).message.contentComplete).toBe(true);
   expect(prepareSavIntakeMessage({...input,body:"<html><body>Unclosed"}).message.contentComplete).toBe(false);
 });
-it("does not erase truncation or unread attachments to declare a message complete",()=>{
+it("keeps the full HTML authored text beyond the display cap and refuses incomplete sources or unread attachments",()=>{
   const long='<html><body>'+"x".repeat(12001)+'</body></html>';
-  expect(prepareSavIntakeMessage({...input,body:long}).message.contentComplete).toBe(false);
+  const prepared=prepareSavIntakeMessage({...input,body:long});
+  expect(prepared.message.contentComplete).toBe(true);
+  expect(prepared.message.currentText).toBe("Information\n\n"+"x".repeat(12001));
   const small='<html><body>Hello</body></html>';
   expect(prepareSavIntakeMessage({...input,body:small,bodyComplete:false}).message.contentComplete).toBe(false);
   expect(prepareSavIntakeMessage({...input,body:small,unresolvedAttachments:true}).message.contentComplete).toBe(false);
