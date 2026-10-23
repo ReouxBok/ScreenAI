@@ -9,7 +9,7 @@ permissions:
   contents: read
 
 jobs:
-  verify:
+  verify-core:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
@@ -38,24 +38,59 @@ jobs:
       - run: npm run sav:replay --prefix studio -- --technical-preflight
       - run: npm test --prefix proxy
       - run: npm run build --prefix studio
-      - run: npx playwright install --with-deps chromium
+
+  studio-browser:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        suite: [isolated, semantic, journey, other, sav73, sav83]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: studio/package-lock.json
+      - run: npm ci --prefix studio
+      - run: npm exec --prefix studio -- playwright install --with-deps chromium
       - name: Studio browser tests in isolated processes
+        if: matrix.suite == 'isolated'
         run: |
           node --test studio/scripts/run-e2e-ci.node-test.mjs
           node studio/scripts/run-e2e-ci.mjs
+      - if: matrix.suite == 'semantic'
+        run: env -i PATH="$PATH" HOME="$HOME" CI=1 npm run test:e2e --prefix studio -- --config playwright.sav-semantic.config.ts
+      - if: matrix.suite == 'journey'
+        run: env -i PATH="$PATH" HOME="$HOME" CI=1 npm run test:e2e --prefix studio -- --config playwright.sav-journey.config.ts
+      - if: matrix.suite == 'other'
+        run: env -i PATH="$PATH" HOME="$HOME" CI=1 npm run test:e2e --prefix studio -- --config playwright.sav-other.config.ts
+      - if: matrix.suite == 'sav73'
+        run: env -i PATH="$PATH" HOME="$HOME" CI=1 npm run test:e2e --prefix studio -- --config playwright.sav73.config.ts
+      - if: matrix.suite == 'sav83'
+        run: env -i PATH="$PATH" HOME="$HOME" CI=1 npm run test:e2e --prefix studio -- --config playwright.sav83.config.ts
       - name: Preserve Studio browser diagnostics
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: studio-browser-diagnostics
+          name: studio-browser-diagnostics-${{ matrix.suite }}
           path: studio/test-results
           if-no-files-found: warn
           retention-days: 7
-      - run: env -i PATH="$PATH" HOME="$HOME" CI=1 npm run test:e2e --prefix studio -- --config playwright.sav-semantic.config.ts
-      - run: env -i PATH="$PATH" HOME="$HOME" CI=1 npm run test:e2e --prefix studio -- --config playwright.sav-journey.config.ts
-      - run: env -i PATH="$PATH" HOME="$HOME" CI=1 npm run test:e2e --prefix studio -- --config playwright.sav-other.config.ts
-      - run: env -i PATH="$PATH" HOME="$HOME" CI=1 npm run test:e2e --prefix studio -- --config playwright.sav73.config.ts
-      - run: env -i PATH="$PATH" HOME="$HOME" CI=1 npm run test:e2e --prefix studio -- --config playwright.sav83.config.ts
+
+  extension-browser:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: package-lock.json
+      - run: npm ci
+      - run: npx playwright install --with-deps chromium
       - run: npm run test:e2e
       - run: npm run validate:package
       - uses: actions/upload-artifact@v4
@@ -65,6 +100,28 @@ jobs:
             dist/limova-ai-extension-2.2.46.zip
             dist/limova-ai-extension-2.2.46.zip.sha256
           if-no-files-found: error
+
+  # Retain the required check name. A missing, cancelled or skipped job must
+  # never produce a green release gate, even when its siblings succeeded.
+  verify:
+    if: always()
+    needs: [verify-core, studio-browser, extension-browser, sav-native]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Require every validation job to succeed
+        env:
+          JOB_RESULTS: ${{ toJSON(needs) }}
+        run: |
+          node --input-type=module <<'NODE'
+          import assert from 'node:assert/strict';
+          const results = JSON.parse(process.env.JOB_RESULTS);
+          const required = ['verify-core', 'studio-browser', 'extension-browser', 'sav-native'];
+          assert.deepEqual(Object.keys(results).sort(), [...required].sort());
+          for (const name of required) {
+            assert.equal(results[name].result, 'success', `${name}: ${results[name].result}`);
+          }
+          NODE
 
   sav-native:
     runs-on: ubuntu-latest
