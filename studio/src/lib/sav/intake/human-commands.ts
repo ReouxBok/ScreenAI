@@ -11,7 +11,7 @@ import { intakeRuntimeHash, type IntakeRuntimePayload } from "./runtime-contract
 import { intakeConsoleInstalled } from "./console-capability";
 import { intakeHumanRefused, intakeRunCandidateContactIds, type HumanEventPayload } from "./human-binding";
 import { requireIntakeConsoleStaff } from "./console-auth";
-import { savIntakeSourceSnapshot } from "./runtime-store";
+import { savIntakeSourceSnapshot, intakeSourceMatches } from "./runtime-store";
 export const intakeHumanCommandSchema = z.object({
   commandKey: z.uuid(), threadId: z.uuid(), messageId: z.uuid(), runId: z.uuid(), version: z.number().int().positive(),
   sourceHash: z.string().regex(/^[a-f0-9]{64}$/), candidatesHash: z.string().regex(/^[a-f0-9]{64}$/),
@@ -45,7 +45,7 @@ export async function recordIntakeHumanCommand(raw: unknown) {
     const pending = await tx.select().from(savIntakeHumanEvents).where(and(eq(savIntakeHumanEvents.parentRunId, command.runId), inArray(savIntakeHumanEvents.state, ["pending", "reading"])));
     if (!thread || thread.aiPaused || !run?.isCurrent || run.threadId !== thread.id || run.messageId !== command.messageId
       || message?.id !== command.messageId || run.version !== command.version || run.sourceHash !== command.sourceHash || pending.length
-      || (await savIntakeSourceSnapshot(tx, message, new Date())).sourceHash !== run.sourceHash || await intakeHumanRefused(command.messageId, tx)) throw Error("SAV_INTAKE_HUMAN_CONFLICT");
+      || !intakeSourceMatches(await savIntakeSourceSnapshot(tx, message, new Date()), run.sourceHash) || await intakeHumanRefused(command.messageId, tx)) throw Error("SAV_INTAKE_HUMAN_CONFLICT");
     const payload = decryptSavPayload<IntakeRuntimePayload>(run.payloadCiphertext), candidates = await intakeRunCandidateContactIds(run,payload,tx);
     if(!candidates)throw Error("SAV_INTAKE_HUMAN_CONFLICT");
     const receipts = execution ? await tx.select().from(savIntakeEffects).where(and(eq(savIntakeEffects.executionId,execution.id),eq(savIntakeEffects.kind,"ticket_create"),eq(savIntakeEffects.state,"confirmed"))) : [];

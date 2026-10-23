@@ -1,4 +1,5 @@
 import "server-only";
+import { releaseLegacyAiPauses } from "./legacy-pause";
 import { intakeOtherQualificationFresh } from "./other-routing";
 import { qualifyRuntimeOther } from "./other-routing-runtime";
 import { createIntakeModelDispatcher } from "./model-dispatch";
@@ -119,13 +120,15 @@ export async function reconcileSavIntakeRuntime(options: { deadlineMs?: number }
   const config = savIntakeRuntimeConfig(); if (!config) return { skipped: "off" as const };
   if (options.deadlineMs && options.deadlineMs - Date.now() < 65_000) return { skipped: "deadline" as const };
   await reconcileConfinedIntakeUsage(config);
+  // Before catch-up, so a customer reply on a legacy-paused thread is analysed in this pass.
+  const legacyPauses = await releaseLegacyAiPauses(config);
   const queued = await catchupSavIntake(config), runs = await pendingSavIntakeRuns(config);
   let result: Awaited<ReturnType<typeof analyseSavIntakeRuntime>> | null = null;
   for (const run of runs) {
     result = await analyseSavIntakeRuntime(run.id, config);
     if (!("skipped" in result)) break;
   }
-  return { mode: "observe", queued, result, budget: await readSavIntakeBudget(config) };
+  return { mode: "observe", queued, legacyPauses, result, budget: await readSavIntakeBudget(config) };
 }
 
 function attachmentFailureReason(reason:string|undefined,uncertain:boolean):import("../attachment-contract").SavAttachmentObservation["reason"] {
