@@ -31,7 +31,9 @@ beforeAll(async () => { f = await createSavTestDb(); state.db = f.db; }, 30_000)
 afterAll(async () => { await f?.client.close(); });
 beforeEach(async () => {
   vi.stubEnv("SAV_ENCRYPTION_KEY_V1", "synthetic-intake-runtime-encryption-key");
-  await f.client.exec("TRUNCATE sav.intake_model_calls, sav.mailboxes CASCADE; TRUNCATE public.audit_logs");
+  // Native suites share one isolated database: mailbox deletion does not own
+  // the durable execution ledger, so remove those synthetic fixtures explicitly.
+  await f.client.exec("TRUNCATE sav.intake_effect_journal, sav.intake_effects, sav.intake_occupations, sav.intake_executions, sav.intake_execution_policies, sav.intake_model_calls, sav.mailboxes CASCADE; TRUNCATE public.audit_logs");
   const [mailbox] = await f.db.insert(savMailboxes).values({ email: "support@example.invalid" }).returning(); mailboxId = mailbox.id;
   const [thread] = await f.db.insert(savThreads).values({ mailboxId, gmailThreadId: randomUUID(), customerEmail: "synthetic@example.invalid" }).returning(); threadId = thread.id;
   messageId = (await message()).id; environment = env(mailboxId); config = savIntakeRuntimeConfig(environment)!;
