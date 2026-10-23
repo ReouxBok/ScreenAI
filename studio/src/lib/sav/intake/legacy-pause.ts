@@ -13,10 +13,17 @@ export const SAV_INTAKE_LEGACY_PAUSE_REVISION = "sav-intake-legacy-pause.v1";
  * humain" (request_human by a human) or a human correction to review_required.
  * The pre-intake V0 pipeline also paused every review_required AI decision; that
  * automatic pause must not freeze customer replies that intake now owns. */
-const humanHold = (threadId: ReturnType<typeof sql>) => sql`(
+export const intakeHumanHoldSql = (threadId: ReturnType<typeof sql>) => sql`(
   exists(select 1 from sav.actions a where a.thread_id = ${threadId} and a.kind = 'request_human' and a.actor_type = 'human')
   or exists(select 1 from sav.decisions d join sav.messages dm on dm.id = d.message_id
     where dm.thread_id = ${threadId} and d.actor_type = 'human' and d.kind = 'human_review_required' and d.is_current))`;
+
+/** Read the existing explicit human-hold proof without changing the pause. */
+export async function intakeThreadHumanHeld(threadId: string, db: Pick<ReturnType<typeof requireDb>, "select"> = requireDb()) {
+  const [row] = await db.select({ id: savThreads.id }).from(savThreads)
+    .where(and(eq(savThreads.id, threadId), eq(savThreads.aiPaused, true), intakeHumanHoldSql(sql`${savThreads.id}`))).limit(1);
+  return Boolean(row);
+}
 
 /** Latest inbound of the thread lies inside the launched intake scope. */
 const latestInboundInScope = (threadId: ReturnType<typeof sql>, scope: Scope) => sql`exists(select 1 from sav.messages m
@@ -35,7 +42,7 @@ export async function listLegacyAiPausedIntakeThreads(scope: Scope, limit = 20, 
   const notCompleted = completedIds.length ? sql`not exists(select 1 from sav.messages cm where cm.thread_id=t.id and cm.id in (${sql.join(completedIds.map(id => sql`${id}::uuid`), sql`, `)}))` : sql`true`;
   const t = sql`t.id`;
   const result = await db.execute(sql`select t.id from sav.threads t
-    where t.ai_paused and t.mailbox_id = ${scope.mailboxId}::uuid and ${latestInboundInScope(t, scope)} and not ${humanHold(t)} and ${notCompleted}
+    where t.ai_paused and t.mailbox_id = ${scope.mailboxId}::uuid and ${latestInboundInScope(t, scope)} and not ${intakeHumanHoldSql(t)} and ${notCompleted}
     order by t.updated_at asc, t.id asc limit ${Math.min(50, Math.max(1, limit))}`);
   return rows<{ id: string }>(result).map(row => row.id);
 }
@@ -53,7 +60,7 @@ export async function releaseLegacyAiPauses(scope: Scope, limit = 20) {
       const [message] = await tx.select().from(savMessages).where(and(eq(savMessages.threadId, threadId), eq(savMessages.direction, "inbound"))).orderBy(desc(savMessages.receivedAt), desc(savMessages.createdAt), desc(savMessages.id)).limit(1);
       if (message && await readSavExternalCompletion(message, tx)) return false;
       const id = sql`${threadId}::uuid`;
-      const eligible = rows<{ ok: boolean }>(await tx.execute(sql`select (${latestInboundInScope(id, scope)} and not ${humanHold(id)}) as ok`))[0]?.ok;
+      const eligible = rows<{ ok: boolean }>(await tx.execute(sql`select (${latestInboundInScope(id, scope)} and not ${intakeHumanHoldSql(id)}) as ok`))[0]?.ok;
       if (!eligible) return false;
       const now = new Date();
       const [updated] = await tx.update(savThreads).set({ aiPaused: false, updatedAt: now })

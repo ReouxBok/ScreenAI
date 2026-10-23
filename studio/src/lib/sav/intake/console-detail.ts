@@ -1,3 +1,4 @@
+import { intakeThreadHumanHeld } from "./legacy-pause";
 import { getSavExternalCompletion, readSavExternalCompletion } from "../external-completion";
 import "server-only";
 import { intakeAttachmentBody } from "./attachment-display";
@@ -25,6 +26,7 @@ export async function readIntakeConsoleDetail(threadId: string) {
   const historical = latest ? await intakeMessageHistorical(latest.id) : false;
   const marker = latest ? await readSavExternalCompletion(latest) : null;
   const completed = marker && latest ? await getSavExternalCompletion(latest) : null;
+  const humanHeld = await intakeThreadHumanHeld(threadId);
   const current = await readSavIntakeCurrent(threadId);
   const messages = displayed.map(row => {
     const derived=current?.sourceMatches && current.payload.attachments?.sourceHash===current.currentSourceHash && current.payload.attachments.read.messageId===row.id ? current.payload.attachments.read:undefined;
@@ -34,6 +36,7 @@ export async function readIntakeConsoleDetail(threadId: string) {
   if (historical) Object.assign(projection, { view: "completed", status: "historical_outside_automation", reason: "Historique — hors automatisation. Aucun ticket HubSpot fermé et aucun apprentissage déclaré terminé.", projectedEpoch: projection.epoch });
   if (completed) Object.assign(projection, { view: "completed", status: "handled_externally", reason: "Traité hors Studio — clôture administrative de ce message. Aucun verdict IA, fermeture HubSpot ou apprentissage terminé ne sont déclarés.", projectedEpoch: projection.epoch });
   else if (marker) Object.assign(projection, { view: null, status: "external_completion_pending", reason: "Traitement externe enregistré ; commande humaine ou résultat externe à rapprocher.", projectedEpoch: projection.epoch });
+  else if (humanHeld) Object.assign(projection, { view: "to_validate", status: "human_hold", reason: "L’équipe garde la main sur ce dossier. L’automatisation reste en pause ; une décision humaine est attendue.", projectedEpoch: projection.epoch });
   else if (projection.status === "external_completion_pending") Object.assign(projection, { view: null, status: "processing", reason: "Disposition administrative révoquée ou nouveau message en attente d’analyse." });
   const events = await db.select().from(savIntakeHumanEvents).where(eq(savIntakeHumanEvents.threadId, threadId))
     .orderBy(desc(savIntakeHumanEvents.createdAt), desc(savIntakeHumanEvents.id)).limit(50);
@@ -45,7 +48,7 @@ export async function readIntakeConsoleDetail(threadId: string) {
   const progress=latest ? await readIntakeExecutionProgress(latest.id) : null;
   const diagnostics=await readIntakeRunDiagnostics(threadId);
   const confirmedCurrent=Boolean(!marker && current && current.messageId===latest?.id && progress?.confirmed && progress.runId===current.id && progress.completionSourceHash && progress.completionSourceHash===current.currentSourceHash);
-  return { confirmedCurrent, thread: { id: thread.id, subject: latest?.subject ?? thread.subject, paused: thread.aiPaused, ticketId: thread.hubspotTicketId },
+  return { confirmedCurrent, humanHeld, thread: { id: thread.id, subject: latest?.subject ?? thread.subject, paused: thread.aiPaused, ticketId: thread.hubspotTicketId },
     projection, handledExternally: Boolean(marker), latestMessageId: latest?.id ?? null, current, messages, historyTruncated: rows.length > 200,
     progress, choices, diagnostics };
 }

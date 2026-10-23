@@ -25,7 +25,7 @@ import { recordIntakeHumanCommand, type IntakeHumanCommand } from "./human-comma
 import { consumeIntakeHumanEvent } from "./human-worker";
 import { intakeRunConfigurationBound, intakeRunCandidateContactIds, humanRevisionConfigHash, type HumanEventPayload } from "./human-binding";
 import { releaseLegacyAiPauses } from "./legacy-pause";
-import { SAV_EXTERNAL_COMPLETION, SAV_EXTERNAL_COMPLETION_REVERTED, getSavExternalCompletion } from "../external-completion";
+import { SAV_EXTERNAL_COMPLETION, SAV_EXTERNAL_COMPLETION_REVERTED, getSavExternalCompletion, revertSavExternalCompletionBatch, markSavDossiersHandledExternally } from "../external-completion";
 import { listIntakeConsole, projectIntakeThread, refreshIntakeConsole } from "./console-store";
 import { readIntakeConsoleDetail } from "./console-detail";
 import { ensureIntakeObservations, readIntakeObservationBinding, readIntakeLearningQualification, attributeIntakeObservationEvents } from "./observation-binding";
@@ -815,7 +815,9 @@ it("a launched human hold is effective locally and never occupies another dossie
   expect((await db.db.select().from(savThreads).where(eq(savThreads.id,threadId)))[0].aiPaused).toBe(true);
   expect(await releaseLegacyAiPauses(options.runtime)).toEqual({released:0});
   await projectIntakeThread(threadId);
-  expect((await listIntakeConsole()).rows[0].status).toBe("paused");
+  expect((await listIntakeConsole({view:"to_validate"})).rows[0]).toMatchObject({status:"human_hold",view:"to_validate"});
+  const detail=await readIntakeConsoleDetail(threadId);expect(detail?.projection).toMatchObject({status:"human_hold",view:"to_validate"});expect(detail?.thread.paused).toBe(true);expect(detail?.humanHeld).toBe(true);
+  expect((await listIntakeConsole()).total).toBe(0);expect((await listIntakeConsole({view:"completed"})).total).toBe(0);
   await db.db.transaction(tx => assertNoLegacyConflict(tx,["thread:another-synthetic-dossier"]));
   expect(mutationsSent()).toHaveLength(0);
 });
@@ -854,6 +856,8 @@ it("the next real inbound drops the old marker, keeps the human hold, and can re
   expect((await listIntakeConsole({view:"completed"})).total).toBe(1);
   const incoming=await message(threadId,new Date(Date.now()+10));
   expect((await listIntakeConsole({view:"completed"})).total).toBe(0);
+  expect((await listIntakeConsole({view:"to_validate"})).rows[0]).toMatchObject({messageId:incoming.id,status:"human_hold"});
+  expect((await readIntakeConsoleDetail(threadId))?.thread.paused).toBe(true);
   const queued=await enqueueSavIntakeMessage(incoming.id,options.runtime);expect(queued).not.toBeNull();
   expect(await claimSavIntakeRun(queued!,options.runtime)).toBeNull();
   // Simulate the separately authorised administrative release; production code never does this.
@@ -931,4 +935,45 @@ it("an initial zero-attempt pending or waiting run has no obsolete source; a rea
   await db.db.update(savMessages).set({bodyCiphertext:encryptSavPayload({...decryptSavPayload<{text:string}>(m.bodyCiphertext),text:"A genuinely different synthetic request."})}).where(eq(savMessages.id,messageId));
   await projectIntakeThread(threadId);
   expect((await listIntakeConsole()).rows[0].status).toBe("context_changed");
+});
+
+it.each(["other_message","earlier_audit"])("a %s fake reversal cannot suppress the actual administrative rollback",async scenario=>{
+  vi.stubEnv("SAV_RELEASE_STAGE","v0");vi.stubEnv("SAV_PILOT_MODE","false");
+  await observed();const marker=await externalMarker(),batchId=String(marker.technicalMetadata.batchId);
+  await db.db.insert(auditLogs).values({actorEmail:"ugo@limova.ai",action:SAV_EXTERNAL_COMPLETION_REVERTED,entityType:"sav_message",entityId:scenario==="other_message"?randomUUID():messageId,
+    createdAt:scenario==="earlier_audit"?new Date(marker.createdAt.getTime()-1000):new Date(),technicalMetadata:{version:1,batchId,completionId:marker.id}});
+  expect((await listIntakeConsole({view:"completed"})).total).toBe(1);
+  expect(await revertSavExternalCompletionBatch(batchId,"ugo@limova.ai")).toEqual({reverted:1});
+  expect((await listIntakeConsole({view:"completed"})).total).toBe(0);
+  expect(await revertSavExternalCompletionBatch(batchId,"ugo@limova.ai")).toEqual({reverted:0});
+});
+
+it("mark and rollback dirty the cached projection and restore the actual human choice",async()=>{
+  vi.stubEnv("SAV_RELEASE_STAGE","v0");vi.stubEnv("SAV_PILOT_MODE","false");
+  await activateSavV0Cutover({receivedAfter:new Date(Date.now()-3600000).toISOString(),mailboxEmail:"support@example.invalid",intakeRecipient:"contact@limova.ai",deploymentSha:"a".repeat(40),activatedBy:"ugo@limova.ai"});
+  await observed(true);await projectIntakeThread(threadId);
+  expect((await listIntakeConsole({view:"to_validate"})).total).toBe(1);
+  const before=(await db.db.select().from(savIntakeConsole))[0],batchId=randomUUID();
+  expect(await markSavDossiersHandledExternally({batchId,receivedBefore:new Date().toISOString(),messages:[{threadId,messageId}]},"ugo@limova.ai")).toMatchObject({marked:1});
+  const marked=(await db.db.select().from(savIntakeConsole))[0];expect(marked.epoch).toBeGreaterThan(before.epoch);
+  await projectIntakeThread(threadId);expect((await listIntakeConsole({view:"completed"})).total).toBe(1);
+  const projected=(await db.db.select().from(savIntakeConsole))[0];expect(projected.projectedEpoch).toBe(projected.epoch);
+  expect(await revertSavExternalCompletionBatch(batchId,"ugo@limova.ai")).toEqual({reverted:1});
+  const reverted=(await db.db.select().from(savIntakeConsole))[0];expect(reverted.epoch).toBeGreaterThan(projected.epoch);
+  expect(await refreshIntakeConsole()).toMatchObject({refreshed:1});
+  expect((await listIntakeConsole({view:"to_validate"})).rows[0].status).toBe("human_choice");
+  expect((await readIntakeConsoleDetail(threadId))?.projection).toMatchObject({view:"to_validate",status:"human_choice"});
+  expect((await listIntakeConsole({view:"completed"})).total).toBe(0);
+});
+it("a cancelled earlier human hold stays in validation across inbound and rejects action choices while paused",async()=>{
+  await observed(true);const raw=await command();
+  await db.db.insert(savActions).values({threadId,kind:"request_human",actorType:"human",status:"cancelled",idempotencyKey:randomUUID(),payload:{reason:"Synthetic explicit team hold"}});
+  await db.db.update(savThreads).set({aiPaused:true}).where(eq(savThreads.id,threadId));
+  expect((await listIntakeConsole({view:"to_validate"})).counts).toMatchObject({to_validate:1});
+  const detail=await readIntakeConsoleDetail(threadId);expect(detail?.humanHeld).toBe(true);expect(detail?.thread.paused).toBe(true);
+  await expect(recordIntakeHumanCommand(raw)).rejects.toThrow("CONFLICT");
+  const next=await message(threadId,new Date(Date.now()+10));
+  expect((await listIntakeConsole({view:"to_validate"})).rows[0]).toMatchObject({messageId:next.id,status:"human_hold"});
+  expect((await listIntakeConsole({view:"completed"})).total).toBe(0);
+  expect(await releaseLegacyAiPauses(options.runtime)).toEqual({released:0});expect(mutationsSent()).toHaveLength(0);
 });

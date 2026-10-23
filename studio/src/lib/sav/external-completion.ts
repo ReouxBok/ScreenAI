@@ -16,17 +16,24 @@ type Action = Pick<typeof savActions.$inferSelect, "kind" | "actorType" | "statu
 const reversalSchema = z.object({ version: z.literal(1), batchId: z.uuid(), completionId: z.uuid() });
 const markerSchema = z.object({ version: z.literal(1), threadId: z.uuid(), batchId: z.uuid(), receivedBefore: z.iso.datetime({ offset: true }), reason: z.literal("processed_outside_studio") });
 
+/** The same exact-proof predicate governs reads and rollback idempotence. */
+function completionReverted(original: Audit, events: Audit[]) {
+  const marker = markerSchema.safeParse(original.technicalMetadata);
+  if (!marker.success) return false;
+  return events.some(reversal => {
+    if (reversal.action !== SAV_EXTERNAL_COMPLETION_REVERTED || reversal.actorEmail.toLowerCase() !== "ugo@limova.ai" || reversal.entityType !== "sav_message" || reversal.entityId !== original.entityId) return false;
+    const value = reversalSchema.safeParse(reversal.technicalMetadata);
+    return value.success && value.data.completionId === original.id && value.data.batchId === marker.data.batchId && reversal.createdAt >= original.createdAt;
+  });
+}
+
 /** A Studio disposition, never a model verdict, provider result or learning proof. */
 export function findSavExternalCompletion(message: { id: string; threadId: string; receivedAt: Date }, events: Audit[]) {
   return events.filter(event => {
     if (event.action !== SAV_EXTERNAL_COMPLETION || event.actorEmail.toLowerCase() !== "ugo@limova.ai" || event.entityType !== "sav_message" || event.entityId !== message.id) return false;
     const marker = markerSchema.safeParse(event.technicalMetadata);
     if (!marker.success || marker.data.threadId !== message.threadId || message.receivedAt.getTime() >= Date.parse(marker.data.receivedBefore)) return false;
-    return !events.some(reversal => {
-      if (reversal.action !== SAV_EXTERNAL_COMPLETION_REVERTED || reversal.actorEmail.toLowerCase() !== "ugo@limova.ai" || reversal.entityType !== "sav_message" || reversal.entityId !== message.id) return false;
-      const value = reversalSchema.safeParse(reversal.technicalMetadata);
-      return value.success && value.data.completionId === event.id && value.data.batchId === marker.data.batchId && reversal.createdAt >= event.createdAt;
-    });
+    return !completionReverted(event, events);
   }).sort((a, b) => b.createdAt.getTime() - a.createdAt.getTime() || b.id.localeCompare(a.id))[0] ?? null;
 }
 
@@ -100,6 +107,15 @@ export async function listSavExternalCompletionMessageIds(db: Reader = requireDb
   return marked.filter(message => !blocked.has(message.threadId)).map(message => message.id);
 }
 
+/** Audit changes are not covered by the console row triggers. Dirty its cache
+ * in the same transaction; recomputation still owns the state and CAS. */
+async function invalidateCompletionProjection(db: Pick<ReturnType<typeof requireDb>, "select" | "execute">, messageIds: string[]) {
+  const ids = [...new Set(messageIds)].filter(id => z.uuid().safeParse(id).success);
+  if (!ids.length || !await intakeConsoleInstalled(db)) return;
+  await db.execute(sql`select sav.dirty_intake_console(m.thread_id) from sav.messages m
+    where m.id in (${sql.join(ids.map(id => sql`${id}::uuid`), sql`, `)})`);
+}
+
 const batchSchema = z.object({ batchId: z.uuid(), receivedBefore: z.iso.datetime({ offset: true }), messages: z.array(z.object({ threadId: z.uuid(), messageId: z.uuid() })).min(1).max(1_000) });
 function assertOperator(actorEmail: string) {
   if (actorEmail.toLowerCase() !== "ugo@limova.ai") throw new Error("SAV_EXTERNAL_COMPLETION_FORBIDDEN");
@@ -149,7 +165,10 @@ export async function markSavDossiersHandledExternally(raw: unknown, actorEmail:
       rows.push({ actorEmail: actorEmail.toLowerCase(), action: SAV_EXTERNAL_COMPLETION, entityType: "sav_message", entityId: message!.id,
         technicalMetadata: { version: 1, threadId: message!.threadId, batchId: input.batchId, receivedBefore: input.receivedBefore, reason: "processed_outside_studio" } });
     }
-    if (rows.length) await tx.insert(auditLogs).values(rows);
+    if (rows.length) {
+      await tx.insert(auditLogs).values(rows);
+      await invalidateCompletionProjection(tx, rows.map(row => row.entityId!));
+    }
     return { batchId: input.batchId, requested: input.messages.length, marked: rows.length, alreadyCompleted, skipped };
   });
 }
@@ -159,12 +178,14 @@ export async function revertSavExternalCompletionBatch(batchId: string, actorEma
   assertOperator(actorEmail); z.uuid().parse(batchId);
   return requireDb().transaction(async tx => {
     await tx.execute(sql`select pg_advisory_xact_lock(hashtext(${batchId}))`);
-    const originals = await tx.select().from(auditLogs).where(and(eq(auditLogs.action, SAV_EXTERNAL_COMPLETION), eq(auditLogs.actorEmail, "ugo@limova.ai"), sql`${auditLogs.technicalMetadata}->>'batchId' = ${batchId}`));
+    const originals = await tx.select().from(auditLogs).where(and(eq(auditLogs.action, SAV_EXTERNAL_COMPLETION), sql`lower(${auditLogs.actorEmail}) = 'ugo@limova.ai'`, eq(auditLogs.entityType, "sav_message"), sql`${auditLogs.technicalMetadata}->>'batchId' = ${batchId}`));
     if (!originals.length) return { reverted: 0 };
-    const reversals = await tx.select().from(auditLogs).where(and(eq(auditLogs.action, SAV_EXTERNAL_COMPLETION_REVERTED), eq(auditLogs.actorEmail, "ugo@limova.ai"), eq(auditLogs.entityType, "sav_message"), sql`${auditLogs.technicalMetadata}->>'batchId' = ${batchId}`));
-    const revoked = new Set(reversals.filter(event => reversalSchema.safeParse(event.technicalMetadata).success).map(event => event.technicalMetadata.completionId));
-    const rows = originals.filter(event => !revoked.has(event.id)).map(event => ({ actorEmail: actorEmail.toLowerCase(), action: SAV_EXTERNAL_COMPLETION_REVERTED, entityType: "sav_message", entityId: event.entityId, technicalMetadata: { version: 1, batchId, completionId: event.id } }));
-    if (rows.length) await tx.insert(auditLogs).values(rows);
+    const reversals = await tx.select().from(auditLogs).where(and(eq(auditLogs.action, SAV_EXTERNAL_COMPLETION_REVERTED), sql`lower(${auditLogs.actorEmail}) = 'ugo@limova.ai'`, eq(auditLogs.entityType, "sav_message"), sql`${auditLogs.technicalMetadata}->>'batchId' = ${batchId}`));
+    const rows = originals.filter(event => markerSchema.safeParse(event.technicalMetadata).success && !completionReverted(event, reversals)).map(event => ({ actorEmail: actorEmail.toLowerCase(), action: SAV_EXTERNAL_COMPLETION_REVERTED, entityType: "sav_message", entityId: event.entityId, technicalMetadata: { version: 1, batchId, completionId: event.id } }));
+    if (rows.length) {
+      await tx.insert(auditLogs).values(rows);
+      await invalidateCompletionProjection(tx, rows.map(row => row.entityId!));
+    }
     return { reverted: rows.length };
   });
 }
