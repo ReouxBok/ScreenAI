@@ -75,7 +75,7 @@ async function createPublishedOnboarding(page: import("@playwright/test").Page, 
 }
 
 test("une base publiée vide retourne immédiatement kb_empty", async ({ request }) => {
-  const response = await request.post("/api/internal/knowledge/search", {
+  const response = await request.post("/api/internal/knowledge/search", { maxRetries: 1,
     headers: { Authorization: "Bearer e2e-service-token-that-is-at-least-32-characters" },
     data: { query: "Question sans contenu publié", path: "/", locale: "fr-FR", limit: 5 },
   });
@@ -95,7 +95,7 @@ test("workflow complet, recherche Charly, rollback et archivage",async({page,req
   await expect(page.getByText("Publié",{exact:true}).first()).toBeVisible();
   await enableAiForTitle(page,"Connecter Gmail E2E");
 
-  const search=await request.post("/api/internal/knowledge/search",{headers:{Authorization:"Bearer e2e-service-token-that-is-at-least-32-characters"},data:{query:"Comment connecter Gmail ?",path:"/integrations",locale:"fr-FR",contentTypes:["article"],limit:5}});
+  const search=await request.post("/api/internal/knowledge/search",{maxRetries:1,headers:{Authorization:"Bearer e2e-service-token-that-is-at-least-32-characters"},data:{query:"Comment connecter Gmail ?",path:"/integrations",locale:"fr-FR",contentTypes:["article"],limit:5}});
   expect(search.ok()).toBe(true);
   const payload=await search.json();
   expect(payload.revision).toMatch(/^kb_/);
