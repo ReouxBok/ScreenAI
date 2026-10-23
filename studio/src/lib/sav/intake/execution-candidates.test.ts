@@ -53,6 +53,9 @@ beforeEach(async () => {
     environment.SAV_INTAKE_EXECUTION_POLICY_ID = grant.id; environment.SAV_INTAKE_EXECUTION_POLICY_SHA256 = grant.policyHash;
     state.policy = authority;
     await f.db.insert(savSyncState).values({ key: "sav-intake-execution-schema-v1", status: "installed" }).onConflictDoNothing();
+    // Native suites share a database; preceding migration scenarios may remove
+    // the console marker. This fixture exercises installed-console semantics.
+    await f.db.insert(savSyncState).values({ key: "sav-intake-console-schema-v1", status: "installed" }).onConflictDoUpdate({ target: savSyncState.key, set: { status: "installed" } });
     options = { runtime, policy: authority, config: intakeExecutionConfig(environment)!, env: () => environment, signal: AbortSignal.timeout(30000), adapters: {
         readCrm: async () => { throw Error("READ_CRM_FORBIDDEN"); }, scope: () => [], dispatch: vi.fn(async () => { throw Error("DISPATCH_FORBIDDEN"); }),
         verify: vi.fn(async () => ({ confirmed: false, attributed: false })), gmailCurrent: async () => {}, gmailPermissions: async () => {} } };
