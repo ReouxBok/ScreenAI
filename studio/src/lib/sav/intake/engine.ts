@@ -166,9 +166,22 @@ export async function planSavIntake(
     const conversation = complete(input.conversation, z.array(intakeMessageSchema).max(50), "history_incomplete");
     if (new Set(conversation.map(m => m.id)).size !== conversation.length || conversation.some(m => m.threadId !== message.threadId
       || Date.parse(m.receivedAt) > Date.parse(message.receivedAt))) return context("history_incomplete");
-    const parsedAnalysis = messageAnalysisSchema.safeParse(await bounded(signal => adapters.analyseMessage({ message, conversation }, signal), "classification_incomplete"));
+    const continuation = input.identificationContinuation;
+    const initial = continuation ? conversation.find(m => m.id === continuation.initialMessageId) : undefined;
+    if (continuation && (!initial || !initial.contentComplete || initial.direction !== "inbound" || initial.threadId !== message.threadId
+      || normalizeEmail(initial.fromEmail) !== normalizeEmail(message.fromEmail) || Date.parse(initial.receivedAt) >= Date.parse(message.receivedAt)
+      || input.previousIdentification?.state !== "confirmed" || input.previousIdentification.messageId !== initial.id
+      || normalizeEmail(input.previousIdentification.address) !== normalizeEmail(message.fromEmail))) return context("history_incomplete");
+    const parsedAnalysis = messageAnalysisSchema.safeParse(await bounded(signal => adapters.analyseMessage({ message, conversation,
+      ...(continuation ? { identificationContinuation: continuation } : {}) }, signal), "classification_incomplete"));
     if (!parsedAnalysis.success) return context("classification_incomplete");
     const analysis = parsedAnalysis.data;
+    const inherited = analysis.requests.filter(r => r.originMessageId !== undefined);
+    if (inherited.length && (!continuation || !initial || inherited.some(r => r.originMessageId !== initial.id)
+      || !analysis.registration || analysis.registration.sourceMessageId !== message.id
+      || !message.currentText.includes(analysis.registration.quote)
+      || !analysis.registration.quote.toLowerCase().includes(analysis.registration.address.toLowerCase()))) return context("history_incomplete");
+    const initialProof = inherited.length && initial ? addEvidence("initial-request", "customer_history", initial.id, initial, input.conversation.observedAt) : undefined;
     if (input.humanResolution?.classification) {
       analysis.requests = analysis.requests.map(r => ({ ...r, kind: input.humanResolution!.classification! }));
     }
@@ -183,7 +196,8 @@ export async function planSavIntake(
       for (const observation of observations) addEvidence(observation.sourceId, "current_attachment", message.id, observation);
     } else if (analysis.attachmentObservations?.length) return context("classification_incomplete");
     analysis.requests.sort((a, b) => a.id.localeCompare(b.id));
-    requests = analysis.requests.map(({ id, kind }) => ({ id, kind, evidenceIds: humanProof ? [current, humanProof] : [current] }));
+    requests = analysis.requests.map(({ id, kind, originMessageId }) => ({ id, kind,
+      evidenceIds: unique([current, ...(humanProof ? [humanProof] : []), ...(originMessageId && initialProof ? [initialProof] : [])]) }));
     const kinds = unique(requests.map(r => r.kind));
     classification = kinds.includes("cancellation") ? "cancellation" : kinds.includes("finance") ? "finance"
       : kinds.includes("unknown") || !kinds.length ? "unknown" : kinds.includes("support") ? "support"
@@ -271,7 +285,7 @@ export async function planSavIntake(
         }
         candidateContexts.push({ contact: c, tickets: rows });
       }
-      const parsed = identityAssessmentSchema.safeParse(await bounded(signal => adapters.assessIdentity!({ message, address, candidates: candidateContexts, evidence: [...evidence] }, signal), "contact_ambiguous"));
+      const parsed = identityAssessmentSchema.safeParse(await bounded(signal => adapters.assessIdentity!({ message, address, candidates: candidateContexts, evidence: [...evidence], ...(initialProof ? { requestContext: initial } : {}) }, signal), "contact_ambiguous"));
       if (!parsed.success) return context("contact_ambiguous");
       const resolution = parsed.data;
       const required = [current, ...contacts.flatMap(c => [`contact-${c.id}`, `identity-search-${c.id}`]), ...[...seenTickets.keys()].flatMap(id => [`identity-ticket-${id}`, `identity-history-${id}`])];
@@ -338,7 +352,7 @@ export async function planSavIntake(
       }
     }
     if (evidence.length > 95) return context("history_incomplete");
-    const parsedAssessment = issueAssessmentSchema.safeParse(await bounded(signal => adapters.assessIssues({ message, requests: analysis.requests, tickets: collected, evidence: [...evidence] }, signal), "same_issue_unresolved"));
+    const parsedAssessment = issueAssessmentSchema.safeParse(await bounded(signal => adapters.assessIssues({ message, requests: analysis.requests, tickets: collected, evidence: [...evidence], ...(initialProof ? { requestContext: initial } : {}) }, signal), "same_issue_unresolved"));
     if (!parsedAssessment.success) return context("same_issue_unresolved");
     const assessment = parsedAssessment.data;
     const humanTicketId = input.humanResolution?.ticketId;
@@ -356,7 +370,7 @@ export async function planSavIntake(
       const currentProof = match.evidenceIds.includes(current);
       const ticketProof = match.evidenceIds.includes(`ticket-${match.ticketId}`);
       const historyProof = match.evidenceIds.includes(`history-${match.ticketId}`);
-      if (!tickets.has(match.ticketId) || !currentProof || !ticketProof || !historyProof
+      if (!tickets.has(match.ticketId) || !currentProof || !ticketProof || !historyProof || initialProof && !match.evidenceIds.includes(initialProof)
         || match.evidenceIds.some(id => !evidence.some(e => e.id === id))
         || match.requestIds.some(id => !requests.some(r => r.id === id))
         || match.relation === "same" && (requests.length !== unique(match.requestIds).length || requests.some(r => !match.requestIds.includes(r.id)))) return context("same_issue_unresolved");

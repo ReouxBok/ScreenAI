@@ -34,7 +34,7 @@ test("contact validates a SAV candidate without gaining publication or global ad
   await expect(page).toHaveURL(/\/studio\/contenus\/[0-9a-f-]+$/, { timeout: 30_000 });
   await expect(page.getByRole("region", { name: "Gestion du contenu", exact: true }).getByText("À valider", { exact: true })).toBeVisible();
   await expect(page.getByRole("button", { name: "Valider et publier", exact: true })).toHaveCount(0);
-  const result = await request.post("/api/internal/knowledge/search", {
+  const result = await request.post("/api/internal/knowledge/search", { maxRetries: 1,
     headers: { Authorization: "Bearer e2e-service-token-that-is-at-least-32-characters" },
     data: { query: title, scope: "sav", contentTypes: ["article"] },
   });

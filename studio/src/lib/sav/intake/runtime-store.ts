@@ -7,7 +7,7 @@ import { intakeRunConfigurationBound, intakeHumanRefused, intakeHasHumanDecision
 import { randomUUID } from "node:crypto";
 import { and, desc, eq, gt, inArray, lt, lte, or, sql } from "drizzle-orm";
 import { requireDb } from "@/db";
-import { savMessages, savThreads, savIntakeRuns, savIntakeJournal, savIntakeModelCalls, savIntakeHumanEvents } from "@/db/schema";
+import { savMessages, savThreads, savIntakeRuns, savIntakeJournal, savIntakeModelCalls, savIntakeHumanEvents, savIntakeIdentityEpisodes, savIntakeEffects, savIntakeExecutions } from "@/db/schema";
 import { decryptSavPayload, encryptSavPayload } from "../crypto";
 import { savAttachmentInventorySchema } from "../attachment-contract";
 import { prepareSavIntakeMessage } from "./message";
@@ -48,10 +48,29 @@ export async function savIntakeSourceSnapshot(tx: Pick<Tx, "select">, message: t
       bodyComplete: typeof body.text === "string" && body.text.length < 100_000, unresolvedAttachments: Boolean(body.attachments?.length) || body.attachmentInventory !== undefined && !savAttachmentInventorySchema.safeParse(body.attachmentInventory).data?.complete }) };
   });
   const current = prepared.find(p => p.message.id === message.id); if (!current) return fail();
+  let previousIdentification: EngineInput["previousIdentification"], identificationContinuation: EngineInput["identificationContinuation"];
+  const [episode] = await tx.select().from(savIntakeIdentityEpisodes).where(eq(savIntakeIdentityEpisodes.threadId, message.threadId));
+  if (episode && episode.initialMessageId !== message.id && episode.initialEffectId) {
+    const [effect] = await tx.select().from(savIntakeEffects).where(eq(savIntakeEffects.id, episode.initialEffectId));
+    const [execution] = effect ? await tx.select().from(savIntakeExecutions).where(eq(savIntakeExecutions.id, effect.executionId)) : [];
+    const recipient = decryptSavPayload<{email:string;mailbox?:string;gmailThread?:string}>(episode.recipientCiphertext);
+    const initial = prepared.find(p => p.message.id === episode.initialMessageId)?.message;
+    const initialRow = rows.find(r => r.id === episode.initialMessageId);
+    if (effect?.kind === "identity_send" && effect.state === "confirmed" && effect.ackCiphertext && effect.verificationCiphertext
+      && execution?.threadId === message.threadId && execution.messageId === episode.initialMessageId
+      && initial && initialRow?.mailboxId === message.mailboxId && initial.direction === "inbound" && initial.contentComplete
+      && initial.fromEmail.toLowerCase() === message.fromEmail.toLowerCase() && recipient.email.toLowerCase() === message.fromEmail.toLowerCase()
+      && initial.receivedAt < current.message.receivedAt) {
+      previousIdentification = {messageId:initial.id,address:recipient.email,state:"confirmed"};
+      identificationContinuation = {initialMessageId:initial.id,confirmedEffectId:effect.id};
+    }
+  }
   return { sourceHash: intakeRuntimeHash({ rows: rows.map(row => ({ id: row.id, threadId: row.threadId, mailboxId: row.mailboxId,
       fromEmail: row.fromEmail, toEmails: row.toEmails, subject: row.subject, direction: row.direction, bodyCiphertext: row.bodyCiphertext, receivedAt: row.receivedAt })),
+      ...(identificationContinuation ? {identificationContinuation} : {}),
       thread: (await tx.select({ updatedAt: savThreads.updatedAt, aiPaused: savThreads.aiPaused, humanRequestedAt: savThreads.humanRequestedAt, ticketId: savThreads.hubspotTicketId }).from(savThreads).where(eq(savThreads.id, message.threadId)))[0] }), body: current.body, provenance: new Map(prepared.map(p => [p.message.id, p.provenance])),
     input: { message: current.message, latestInboundMessageId: message.id, mode: "current", now: now.toISOString(), identificationAttemptId: message.id,
+      ...(identificationContinuation ? {previousIdentification,identificationContinuation} : {}),
       conversation: { data: prepared.map(p => p.message).reverse(), status: rows.length > 50 ? "partial" : "complete", observedAt: now.toISOString() } } satisfies EngineInput };
 }
 
@@ -61,6 +80,11 @@ const unclaimedMessage = sql`(${savMessages.analysisStatus} = 'pending' and ${sa
   and not exists (select 1 from sav.pilot_items p where p.message_id = ${savMessages.id})
   and not exists (select 1 from sav.actions a where a.message_id = ${savMessages.id})
   and not exists (select 1 from sav.proposal_reviews r where r.message_id = ${savMessages.id}))`;
+// A configuration rotation cannot replace evidence for an action that has
+// already left the system. A genuinely new inbound has a different message ID.
+const noCommittedExecution = sql`not exists(select 1 from sav.intake_executions e where e.message_id=${savMessages.id}
+  and (e.state in ('confirmed','refused') or exists(select 1 from sav.intake_effects f where f.execution_id=e.id
+    and (f.state<>'planned' or f.dispatched_at is not null or f.dispatch_token is not null or f.ack_ciphertext is not null or f.confirmed_at is not null))))`;
 const eligible = (message: typeof savMessages.$inferSelect, config: IntakeRuntimeConfig) => message.direction === "inbound" && message.mailboxId === config.mailboxId
   && message.receivedAt.getTime() > Date.parse(config.receivedAfter) && message.createdAt.getTime() > Date.parse(config.createdAfter);
 /** Called after durable mail insertion. Recovery finds an interrupted enqueue. */
@@ -70,6 +94,8 @@ export async function enqueueSavIntakeMessage(messageId: string, config: IntakeR
     if (!await intakeLaunchMatches(config, tx) || !message || !eligible(message, config) || await intakeHumanRefused(messageId, tx)) return null;
     await tx.select().from(savThreads).where(eq(savThreads.id, message.threadId)).for("update");
     if ((await latest(tx, message.threadId))?.id !== message.id) return null;
+    const [uncommitted] = await tx.select({id:savMessages.id}).from(savMessages).where(and(eq(savMessages.id,message.id),noCommittedExecution));
+    if (!uncommitted) return null;
     const [same] = await tx.select().from(savIntakeRuns).where(and(eq(savIntakeRuns.messageId, message.id), eq(savIntakeRuns.configHash, config.configHash)));
     if (same) return same.id;
     if (await intakeHasHumanDecision(messageId, tx)) return null;
@@ -92,7 +118,7 @@ export async function catchupSavIntake(config: IntakeRuntimeConfig, limit = 4) {
   const noHuman = await intakeConsoleInstalled() ? sql`not exists(select 1 from sav.intake_human_events h where h.message_id=${savMessages.id})` : undefined;
   const messages = await requireDb().select({ id: savMessages.id }).from(savMessages).where(and(eq(savMessages.mailboxId, config.mailboxId), eq(savMessages.direction, "inbound"),
     gt(savMessages.receivedAt, new Date(config.receivedAfter)), gt(savMessages.createdAt, new Date(config.createdAfter)),
-    or(unclaimedMessage, sql`${savMessages.analysisStatus} like 'intake_%'`), noHuman,
+    or(unclaimedMessage, sql`${savMessages.analysisStatus} like 'intake_%'`), noHuman, noCommittedExecution,
     sql`not exists (select 1 from sav.intake_runs r where r.message_id = ${savMessages.id} and r.config_hash = ${config.configHash})`,
     sql`not exists (select 1 from sav.messages m where m.thread_id = ${savMessages.threadId} and m.direction = 'inbound' and (m.received_at,m.created_at,m.id) > (${savMessages.receivedAt},${savMessages.createdAt},${savMessages.id}))`))
     .orderBy(savMessages.createdAt).limit(Math.min(4, Math.max(1, limit)));
@@ -232,7 +258,7 @@ async function assertHumanAnalysis(tx:Tx, authority:IntakeHumanAnalysisAuthority
   const body=decryptSavPayload<import("./human-binding").HumanEventPayload>(event.payloadCiphertext);
   const [message]=await tx.select().from(savMessages).where(eq(savMessages.id,run.messageId));
   if(!message||body.parentPayloadHash!==intakeRuntimeHash(decryptSavPayload(run.payloadCiphertext))||body.policyHash!==config.policyHash||body.resourcesHash!==config.resourcesHash
-    ||body.classification===undefined||body.classification==="other"||(await latest(tx,run.threadId))?.id!==run.messageId
+    ||!body.reinvestigate&&(body.classification===undefined||body.classification==="other")||(await latest(tx,run.threadId))?.id!==run.messageId
     ||(await savIntakeSourceSnapshot(tx,message,now)).sourceHash!==run.sourceHash)return fail();
   return run;
 }

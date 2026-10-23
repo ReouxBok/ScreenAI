@@ -87,37 +87,49 @@ export function createIntakeExecutorAdapters(options: {
         }
         return false;
     }
-    async function sent(intent: EffectIntent, ack: EffectAck | null, signal: AbortSignal) {
-        if (!intent.mailbox || !intent.rfcMessageId || !intent.threadId || !intent.recipient || !intent.text)
+    async function sent(intent: EffectIntent, ack: EffectAck | null, dispatchedAt: Date, signal: AbortSignal) {
+        if (!intent.mailbox || !intent.rfcMessageId || !intent.threadId || !intent.recipient || !intent.text || !intent.raw)
             return null;
+        const rawHeaders = intent.raw.split("\r\n\r\n", 1)[0].split("\r\n");
+        const expectedParent = rawHeaders.find(h => /^In-Reply-To: /i.test(h))?.slice(13).trim();
+        const expectedReferences = rawHeaders.find(h => /^References: /i.test(h))?.slice(12).trim();
+        if (!expectedParent || !expectedReferences || !Number.isFinite(dispatchedAt.getTime())
+            || ack?.threadId && ack.threadId !== intent.threadId) return null;
         let ids = ack?.id ? [ack.id] : [];
         if (!ids.length) {
-            const result = await gmail<{
-                messages?: {
-                    id: string;
-                    threadId: string;
-                }[];
-                nextPageToken?: string;
-            }>(intent.mailbox, `messages?${new URLSearchParams({
-                q: `in:sent rfc822msgid:${intent.rfcMessageId}`, maxResults: "2"
-            })}`, {
-                signal
-            });
-            if (result.nextPageToken || result.messages?.length !== 1)
-                return null;
-            ids = result.messages.map(m => m.id);
+            const result = await gmail<{ messages?: { id: string; threadId: string }[]; nextPageToken?: string }>(intent.mailbox,
+                `messages?${new URLSearchParams({ q: `in:sent rfc822msgid:${intent.rfcMessageId}`, maxResults: "2" })}`, { signal });
+            if (result.nextPageToken || (result.messages?.length ?? 0) > 1) return null;
+            ids = (result.messages ?? []).map(m => m.id);
+            if (!ids.length) {
+                // A rewritten Message-ID can also lose its ACK. Read only this
+                // original thread and require a unique, fully attributed send.
+                const thread = await gmail<{ id: string; messages?: { id: string; labelIds?: string[] }[] }>(intent.mailbox,
+                    `threads/${encodeURIComponent(intent.threadId)}?format=metadata`, { signal });
+                if (thread.id !== intent.threadId || !thread.messages || thread.messages.length > 100) return null;
+                ids = thread.messages.filter(m => m.labelIds?.includes("SENT")).map(m => m.id);
+                if (ids.length > 20) return null;
+            }
         }
-        const message = await gmail<Parameters<typeof parseGmailMessage>[1] & {
-            labelIds?: string[];
-        }>(intent.mailbox, `messages/${encodeURIComponent(ids[0])}?format=full`, {
-            signal
-        });
-        const parsed = parseGmailMessage(intent.mailbox, message);
-        if (!message.labelIds?.includes("SENT") || parsed.gmailThreadId !== intent.threadId || parsed.to.length !== 1 || oneAddress(message.payload?.headers?.find(h => h.name?.toLowerCase() === "to")?.value ?? "") !== intent.recipient.toLowerCase() || oneAddress(parsed.from) !== intent.mailbox.toLowerCase() || parsed.headers["message-id"] !== intent.rfcMessageId || exactMimeText(message.payload) !== intent.text || message.payload?.headers?.some(h => ["cc", "bcc"].includes(h.name?.toLowerCase() ?? "") && Boolean(h.value?.trim())))
-            return null;
-        return {
-            id: parsed.gmailMessageId, threadId: parsed.gmailThreadId
-        };
+        const matches: EffectAck[] = [];
+        for (const candidate of ids) {
+            const message = await gmail<Parameters<typeof parseGmailMessage>[1] & { labelIds?: string[] }>(intent.mailbox,
+                `messages/${encodeURIComponent(candidate)}?format=full`, { signal });
+            const parsed = parseGmailMessage(intent.mailbox, message);
+            const sentAt = Number(message.internalDate);
+            const headers = message.payload?.headers ?? [];
+            const singletonHeaders = ["from", "to", "message-id", "in-reply-to", "references"];
+            if (singletonHeaders.some(name => headers.filter(h => h.name?.toLowerCase() === name).length !== 1)
+                || parsed.gmailMessageId !== candidate || !message.labelIds?.includes("SENT") || parsed.gmailThreadId !== intent.threadId
+                || !Number.isFinite(sentAt) || sentAt < dispatchedAt.getTime() - 60_000 || sentAt > dispatchedAt.getTime() + 600_000
+                || parsed.to.length !== 1 || oneAddress(headers.find(h => h.name?.toLowerCase() === "to")?.value ?? "") !== intent.recipient.toLowerCase()
+                || oneAddress(parsed.from) !== intent.mailbox.toLowerCase()
+                || parsed.headers["in-reply-to"] !== expectedParent || parsed.headers.references !== expectedReferences
+                || !parsed.headers["message-id"] || exactMimeText(message.payload) !== intent.text
+                || headers.some(h => ["cc", "bcc"].includes(h.name?.toLowerCase() ?? "") && Boolean(h.value?.trim()))) continue;
+            matches.push({ id: parsed.gmailMessageId, threadId: parsed.gmailThreadId });
+        }
+        return matches.length === 1 ? matches[0] : null;
     }
     const adapters: ExecutorAdapters = {
         readCrm: (plan, input, config, signal) => collectExecutionCrm(plan, input, config, createSavIntakeHubspotReaders({
@@ -197,7 +209,7 @@ export function createIntakeExecutorAdapters(options: {
         },
         verify: async (intent, ack, dispatchedAt, signal) => {
             if (intent.kind === "identity_send") {
-                const a = await sent(intent, ack, signal);
+                const a = await sent(intent, ack, dispatchedAt, signal);
                 return {
                     confirmed: Boolean(a), attributed: Boolean(a), ...(a ? {
                         ack: a

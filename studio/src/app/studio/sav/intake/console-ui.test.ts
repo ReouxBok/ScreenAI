@@ -6,7 +6,7 @@ const mocks = vi.hoisted(() => ({ staff: vi.fn(), list: vi.fn(), detail: vi.fn()
 vi.mock("@/lib/sav/intake/console-auth",()=>({requireIntakeConsoleStaff:mocks.staff}));
 vi.mock("@/lib/sav/intake/console-store",()=>({listIntakeConsole:mocks.list}));
 vi.mock("@/lib/sav/intake/console-detail",()=>({readIntakeConsoleDetail:mocks.detail}));
-vi.mock("./actions",()=>({saveIntakeChoice:mocks.action}));
+vi.mock("./actions",()=>({saveIntakeChoice:mocks.action,requestRecoveryAction:mocks.action,reconcileIdentificationAction:mocks.action}));
 vi.mock("next/link",()=>({default:(props:ComponentProps<"a">)=>createElement("a",props)}));
 vi.mock("next/navigation",()=>({notFound:()=>{throw Error("NOT_FOUND");}}));
 import IntakeConsolePage from "./page";
@@ -71,4 +71,12 @@ it("confirmed own deltas render a current verified result, never a new correctio
   mocks.detail.mockResolvedValue({...detail,confirmedCurrent:true,current:{...detail.current,sourceMatches:false},progress:{...detail.progress,confirmed:true}});
   const html=await renderDetail();expect(html).toContain("Résultat confirmé pour cette demande");expect(html).toContain("Actions réellement accomplies");
   expect(html).not.toContain("Dernière analyse historique");expect(html).not.toContain('name="sourceHash"');
+});
+it("shows exhausted previous attempts on a pending new version without inheriting an applicable plan",async()=>{
+  mocks.detail.mockResolvedValue({...detail,current:{...detail.current,state:"pending",sourceMatches:false,payload:{}},progress:null,
+    diagnostics:{messageId,totalAttempts:2,attemptsExhausted:true,runs:[{runId:"old",version:6,state:"superseded",attempts:2,
+      diagnostic:{readable:true,reason:"SAV_INTAKE_MODEL_CONTEXT_LIMIT",contextReasons:["classification_incomplete"],traces:[]},events:[]}]}});
+  const html=await renderDetail();expect(html).toContain("Analyse bloquée");expect(html).toContain("deux tentatives");
+  expect(html).toContain("Version 6");expect(html).toContain("qualification de la demande");
+  expect(html).not.toContain("Aucun incident enregistré");expect(html).not.toContain('name="sourceHash"');expect(mocks.action).not.toHaveBeenCalled();
 });

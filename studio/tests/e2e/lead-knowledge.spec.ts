@@ -32,7 +32,7 @@ test("SAV-40 : Ugo prépare et réédite un modèle lead privé sans l’activer
   await expect(page.getByLabel("Modèle de réponse pour un lead")).toHaveValue(template);
   await page.getByRole("button", { name: "Demander la validation" }).click();
   await expect(page.getByText("À valider", { exact: true }).first()).toBeVisible();
-  const response = await request.post("/api/internal/knowledge/search", { headers: { Authorization: "Bearer e2e-service-token-that-is-at-least-32-characters" },
+  const response = await request.post("/api/internal/knowledge/search", { maxRetries: 1, headers: { Authorization: "Bearer e2e-service-token-that-is-at-least-32-characters" },
     data: { query: "Informations produit avant achat", scope: "sav", savAudience: "lead", contentTypes: ["article"] } });
   expect(response.ok()).toBe(true); expect((await response.json()).results).toEqual([]);
   await page.screenshot({ path: "test-results/sav40-lead-private.jpg", fullPage: true });

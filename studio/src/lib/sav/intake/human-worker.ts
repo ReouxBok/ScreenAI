@@ -1,5 +1,5 @@
 import "server-only";
-import { intakeInputWithAttachments } from "./attachments";
+import { intakeInputWithAttachments, prepareIntakeAttachments, finishIntakeAttachmentRead } from "./attachments";
 import { randomUUID } from "node:crypto";
 import { and, desc, eq, inArray, lt, or, sql } from "drizzle-orm";
 import { requireDb } from "@/db";
@@ -26,7 +26,9 @@ import type { ExecutionPayload, EffectAck } from "./execution-types";
  * bound by intakeRunConfigurationBound and is checked again while traversing. */
 async function mergedHumanResolution(event:typeof savIntakeHumanEvents.$inferSelect,parent:typeof savIntakeRuns.$inferSelect,value:HumanEventPayload,config:IntakeRuntimeConfig) {
   const resolution:NonNullable<EngineInput["humanResolution"]>={choiceId:event.id,at:event.createdAt.toISOString(),equivalentContactIds:value.candidateContactIds,inheritedChoiceIds:[],fieldSources:{}};
+  if(value.reinvestigate) resolution.suppressOutbound=true;
   const apply=(source:typeof event,body:HumanEventPayload)=>{
+    if(body.reinvestigate)resolution.suppressOutbound=true;
     if(body.policyHash!==config.policyHash||body.resourcesHash!==config.resourcesHash||source.sourceHash!==event.sourceHash) return conflict();
     if(body.candidatesHash!==value.candidatesHash) {
       // A fresh server reanalysis can introduce candidates after an automatic
@@ -165,7 +167,7 @@ export async function consumeIntakeHumanEvent(id: string, config: IntakeRuntimeC
     const original = decryptSavPayload<IntakeRuntimePayload>(parent.payloadCiphertext);
     if (value.parentPayloadHash !== intakeRuntimeHash(original) || original.configuration?.configHash !== config.configHash
       || value.mailboxId !== config.mailboxId || value.policyHash !== config.policyHash || value.resourcesHash !== config.resourcesHash) return conflict();
-    const input: EngineInput = { ...intakeInputWithAttachments(snapshot.input, event.sourceHash, original.attachments), humanResolution: await mergedHumanResolution(event,parent,value,config) };
+    let input: EngineInput = { ...intakeInputWithAttachments(snapshot.input, event.sourceHash, original.attachments), humanResolution: await mergedHumanResolution(event,parent,value,config) };
     let reason: string | undefined;
     const accepted = <T>(method: "analyseMessage" | "assessIdentity" | "assessIssues", data: unknown): T => {
       try { return acceptedIntakeResult<T>(original.semantics, method, data); }
@@ -174,13 +176,19 @@ export async function consumeIntakeHumanEvent(id: string, config: IntakeRuntimeC
     const deadline = AbortSignal.timeout(45000);
     let reusableAnalysis: import("./engine-types").MessageAnalysis | null = null;
     try { reusableAnalysis=acceptedIntakeResult(original.semantics,"analyseMessage",{message:input.message,conversation:input.conversation.data}); } catch { /* Missing accepted semantics require a real continuation below. */ }
-    const needsAnalysis=original.plan?.progress.kind==="qualified_other" && input.humanResolution?.classification!==undefined && input.humanResolution.classification!=="other"
-      && (!reusableAnalysis?.ticketSummary || reusableAnalysis.requests.some(r=>r.kind==="other"||r.kind==="unknown"));
+    const needsAnalysis=Boolean(value.reinvestigate || original.plan?.progress.kind==="qualified_other" && input.humanResolution?.classification!==undefined && input.humanResolution.classification!=="other"
+      && (!reusableAnalysis?.ticketSummary || reusableAnalysis.requests.some(r=>r.kind==="other"||r.kind==="unknown")));
     const authority={eventId:id,parentRunId:parent.id,token};
     const live=async()=>{if(savIntakeRuntimeConfig()?.configHash!==config.configHash||deadline.aborted)return conflict();await assertIntakeHumanAnalysis(authority,config);};
     const dispatcher=needsAnalysis?createIntakeModelDispatcher({config,signal:deadline,live,reserve:hash=>reserveIntakeHumanCall(authority,config,hash)}):null;
     const semantics: IntakeRuntimePayload["semantics"]=needsAnalysis?{revision:SAV_INTAKE_SEMANTIC_RECORD_REVISION,validatorRevision:SAV_INTAKE_MODEL_REVISION,records:[]}:original.semantics;
-    const fresh=dispatcher&&semantics?recordAcceptedIntakeSemantics(createSavIntakeSemanticReaders({model:config.model,call:dispatcher.call,humanClassification:input.humanResolution?.classification}),semantics,()=>{}):null;
+    const attachments=value.reinvestigate ? await prepareIntakeAttachments({run:parent,token,...snapshot},config.model,live) : null;
+    if(attachments?.complete) input={...intakeInputWithAttachments(input,event.sourceHash,attachments.state,attachments.prepared),humanResolution:input.humanResolution};
+    const fresh=dispatcher&&semantics?recordAcceptedIntakeSemantics(createSavIntakeSemanticReaders({model:config.model,call:dispatcher.call,
+      ...(attachments?.complete ? {attachments:{prepared:attachments.prepared,onRead:observations=>{
+        attachments.state.read={...attachments.state.read,observations,state:"complete",completedAt:new Date().toISOString()};
+      }}} : {}),
+      provenance:snapshot.provenance,humanClassification:input.humanResolution?.classification}),semantics,()=>{}):null;
     const boundedReaders = Object.fromEntries(Object.entries(readers).map(([name, fn]) => [name, async (argument: string, signal: AbortSignal) => {
       if (deadline.aborted) throw Error("SAV_INTAKE_HUMAN_REVALIDATION_REQUIRED");
       return fn(argument, AbortSignal.any([signal, deadline]));
@@ -191,7 +199,8 @@ export async function consumeIntakeHumanEvent(id: string, config: IntakeRuntimeC
       assessIdentity: async (data:Parameters<NonNullable<IntakeAdapters["assessIdentity"]>>[0]) => accepted<Awaited<ReturnType<NonNullable<IntakeAdapters["assessIdentity"]>>>>("assessIdentity", data),
       assessIssues: async (data:Parameters<IntakeAdapters["assessIssues"]>[0]) => data.tickets.length ? accepted<Awaited<ReturnType<IntakeAdapters["assessIssues"]>>>("assessIssues", data) : { investigationComplete: true, tickets: [] }}),
     }, input.humanResolution?.classification === "other" ? { ...config.policy, qualifiedOther: { evidenceSource: "human_override",
-      resource: { resourceId: id, revisionId: "sav-intake-human.v1", sha256: intakeRuntimeHash(input.humanResolution) } } } : config.policy, {}, () => new Date()));
+      resource: { resourceId: id, revisionId: "sav-intake-human.v1", sha256: intakeRuntimeHash(input.humanResolution) } } } : config.policy, { timeoutMs: 10_000 }, () => new Date()));
+    finishIntakeAttachmentRead(attachments?.state,"context_incomplete");
     if(dispatcher){
       let timer:ReturnType<typeof setTimeout>|undefined;
       try{await Promise.race([Promise.allSettled(dispatcher.pending),new Promise<never>((_,reject)=>{timer=setTimeout(()=>reject(Error("SAV_INTAKE_RUNTIME_SETTLEMENT_UNCERTAIN")),15000);})]);}finally{if(timer)clearTimeout(timer);}
@@ -211,7 +220,7 @@ export async function consumeIntakeHumanEvent(id: string, config: IntakeRuntimeC
         || !await intakeRunConfigurationBound(current, config, tx, event.id)) return conflict();
       const [last] = await tx.select({ version: savIntakeRuns.version }).from(savIntakeRuns).where(eq(savIntakeRuns.threadId, event.threadId)).orderBy(desc(savIntakeRuns.version)).limit(1);
       await tx.update(savIntakeRuns).set({ isCurrent: false, state: "superseded", freshUntil: null, leaseToken: null, leaseUntil: null }).where(eq(savIntakeRuns.id, parent.id));
-      const payload: IntakeRuntimePayload = { ...original, input, plan, reason, semantics, other:undefined, traces: [...(original.traces ?? []), { humanEventId: id,
+      const payload: IntakeRuntimePayload = { ...original, input, plan, reason, semantics, ...(attachments ? {attachments:attachments.state}:{}), other:undefined, traces: [...(original.traces ?? []), { humanEventId: id,
         semanticReuse: needsAnalysis?"new_budgeted_analysis":"accepted_results_exact_inputs", modelCalled: needsAnalysis, automaticAttemptsUnchanged: true }] };
       const [run] = await tx.insert(savIntakeRuns).values({ threadId: event.threadId, messageId: event.messageId, version: last.version + 1,
         configHash: humanRevisionConfigHash(config.configHash, id), policyHash: config.policyHash, sourceHash: event.sourceHash,

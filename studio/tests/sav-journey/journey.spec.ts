@@ -57,7 +57,9 @@ for (const key of JOURNEY_CASES) {
     await submitServerAction(page, preview.getByRole("button", { name: /^Confirmer :/ }), /^\["v1\./); clicks++;
     if (key === "retry") {
       await expect(execution).toContainText("HubSpot refuse l’accès");
-      await expect(prepare).toBeEnabled(); // No full document reload needed after a definite rejection.
+      // Cold CI renders the refresh response in14.7s after the definite403.
+      // Still require recovery without a document reload and every action/send assertion.
+      await expect(prepare).toBeEnabled({ timeout: 30_000 });
       const state = remote(); state.cases.retry.fault = null; writeFileSync(statePath, JSON.stringify(state));
       await submitServerAction(page, prepare, /"distinctIssueReason":/); clicks++;
       await expect(preview).toBeVisible();

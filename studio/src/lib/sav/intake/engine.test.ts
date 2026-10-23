@@ -369,3 +369,27 @@ it("keeps three grouped images, ambiguous identity and full ticket comparison wi
   expect(result.decision.evidence.filter(e=>e.source==="current_attachment")).toHaveLength(3);
   expect(stored).toHaveLength(1);expect(result.steps.every(step=>step.status==="not_dispatched")).toBe(true);
 });
+
+it("registration continuation preserves the initial request as a separate source and the original recipient",async()=>{
+ const f=fixture();const initial={...f.input.message,id:otherMid,receivedAt:"2026-10-19T10:00:00.000Z",currentText:"My connection is failing."};
+ f.input.message.currentText="My registration email is linked@example.test";
+ f.input.conversation=read([initial,f.input.message]);
+ f.input.previousIdentification={messageId:otherMid,address:f.input.message.fromEmail,state:"confirmed"};
+ f.input.identificationContinuation={initialMessageId:otherMid,confirmedEffectId:"30000000-0000-4000-8000-000000000001"};
+ f.analysis.registration={address:"linked@example.test",sourceMessageId:mid,quote:"My registration email is linked@example.test"};
+ f.analysis.requests[0].originMessageId=otherMid;
+ const plan=await f.run();expect(target(plan).target.contactId).toBe("102");
+ expect(plan.decision.evidence.find(e=>e.id==="initial-request")).toMatchObject({source:"customer_history",sourceId:otherMid});
+ expect(plan.originalRecipientEmails).toEqual(["sender@example.test"]);
+ expect(f.calls).toContain("lookup:linked@example.test");
+});
+it.each(["no-episode","unconfirmed","different-sender","no-declaration","wrong-source"])("rejects unsupported registration continuation: %s",async kind=>{
+ const f=fixture();const initial={...f.input.message,id:otherMid,receivedAt:"2026-10-19T10:00:00.000Z"};
+ f.input.conversation=read([initial,f.input.message]);f.input.message.currentText="Use linked@example.test";
+ f.input.previousIdentification={messageId:otherMid,address:f.input.message.fromEmail,state:kind==="unconfirmed"?"uncertain":"confirmed"};
+ if(kind!=="no-episode")f.input.identificationContinuation={initialMessageId:otherMid,confirmedEffectId:"30000000-0000-4000-8000-000000000001"};
+ if(kind==="different-sender")initial.fromEmail="different@example.test";
+ f.analysis.requests[0].originMessageId=kind==="wrong-source"?mid:otherMid;
+ if(kind!=="no-declaration")f.analysis.registration={address:"linked@example.test",sourceMessageId:mid,quote:"Use linked@example.test"};
+ reason(await f.run(),"history_incomplete");expect(f.calls.some(c=>c.startsWith("lookup:"))).toBe(false);
+});

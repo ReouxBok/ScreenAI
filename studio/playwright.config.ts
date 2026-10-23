@@ -6,6 +6,11 @@ export default defineConfig({
   fullyParallel:false,
   workers:1,
   retries:0,
+  // CI starts a fresh Next process and database for every discovered test.
+  // Cold action responses can take five seconds before their redirect is applied.
+  // These are functional assertions, not production latency measurements.
+  timeout:60_000,
+  expect:{timeout:15_000},
   reporter:"list",
   use:{baseURL:"http://127.0.0.1:3100",trace:"retain-on-failure",screenshot:"only-on-failure"},
   webServer:{
