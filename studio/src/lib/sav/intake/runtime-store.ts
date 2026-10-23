@@ -109,9 +109,10 @@ const unclaimedMessage = sql`(${savMessages.analysisStatus} = 'pending' and ${sa
   and not exists (select 1 from sav.proposal_reviews r where r.message_id = ${savMessages.id}))`;
 // A configuration rotation cannot replace evidence for an action that has
 // already left the system. A genuinely new inbound has a different message ID.
-const noCommittedExecution = sql`not exists(select 1 from sav.intake_executions e where e.message_id=${savMessages.id}
+const noCommittedExecutionFor = (messageId: ReturnType<typeof sql>) => sql`not exists(select 1 from sav.intake_executions e where e.message_id=${messageId}
   and (e.state in ('confirmed','refused') or exists(select 1 from sav.intake_effects f where f.execution_id=e.id
-    and (f.state<>'planned' or f.dispatched_at is not null or f.dispatch_token is not null or f.ack_ciphertext is not null or f.confirmed_at is not null))))`;
+    and (f.state<>'planned' or f.dispatched_at is not null or f.dispatch_token is not null or f.ack_ciphertext is not null or f.verification_ciphertext is not null or f.confirmed_at is not null))))`;
+const noCommittedExecution = noCommittedExecutionFor(sql`${savMessages.id}`);
 const eligible = (message: typeof savMessages.$inferSelect, config: IntakeRuntimeConfig) => message.direction === "inbound" && message.mailboxId === config.mailboxId
   && message.receivedAt.getTime() > Date.parse(config.receivedAfter) && message.createdAt.getTime() > Date.parse(config.createdAfter);
 /** Called after durable mail insertion. Recovery finds an interrupted enqueue. */
@@ -166,6 +167,8 @@ export async function claimSavIntakeRun(id: string, config: IntakeRuntimeConfig,
       await tx.update(savIntakeRuns).set({ state: "superseded", isCurrent: false, leaseToken: null, leaseUntil: null, freshUntil: null }).where(eq(savIntakeRuns.id, id)); return null;
     }
     if (await readSavExternalCompletion(message, tx)) return null;
+    const [uncommitted] = await tx.select({ id: savMessages.id }).from(savMessages).where(and(eq(savMessages.id, message.id), noCommittedExecution));
+    if (!uncommitted) return null;
     const siblings = await tx.select({ attempts: savIntakeRuns.attempts }).from(savIntakeRuns).where(eq(savIntakeRuns.messageId, run.messageId));
     const totalAttempts = siblings.reduce((sum, sibling) => sum + sibling.attempts, 0);
     const pending = await tx.select({id:savIntakeModelCalls.id}).from(savIntakeModelCalls).where(and(eq(savIntakeModelCalls.runId, id), inArray(savIntakeModelCalls.state, ["dispatched", "uncertain"])));
@@ -208,7 +211,8 @@ async function assertLease(tx: Tx, lease: IntakeLease, config: IntakeRuntimeConf
   const message = await latest(tx, lease.run.threadId);
   if (!thread || thread.aiPaused || !run?.isCurrent || run.state !== "analysing" || run.leaseToken !== lease.token || !run.leaseUntil || run.leaseUntil <= now
     || run.humanChoiceCiphertext !== lease.run.humanChoiceCiphertext || !await intakeRunConfigurationBound(run, config, tx) || Date.parse(config.expiresAt) <= now.getTime() || message?.id !== run.messageId) return fail();
-  if (await readSavExternalCompletion(message, tx) || !intakeSourceMatches(await savIntakeSourceSnapshot(tx, message, now), lease.sourceHash)) return fail();
+  const [uncommitted] = await tx.select({ id: savMessages.id }).from(savMessages).where(and(eq(savMessages.id, message.id), noCommittedExecution));
+  if (!uncommitted || await readSavExternalCompletion(message, tx) || !intakeSourceMatches(await savIntakeSourceSnapshot(tx, message, now), lease.sourceHash)) return fail();
   return run;
 }
 export async function assertSavIntakeLease(lease: IntakeLease, config: IntakeRuntimeConfig, now = new Date()) {
@@ -246,7 +250,7 @@ export async function pendingSavIntakeRuns(config: IntakeRuntimeConfig, now = ne
   const notCompleted = completedIds.length ? sql`${savIntakeRuns.messageId} not in (${sql.join(completedIds.map(id => sql`${id}::uuid`), sql`, `)})` : undefined;
   const noHuman = await intakeConsoleInstalled() ? sql`not exists(select 1 from sav.intake_human_events h where h.message_id=${savIntakeRuns.messageId})` : undefined;
   return requireDb().select({ id: savIntakeRuns.id }).from(savIntakeRuns).where(and(eq(savIntakeRuns.isCurrent, true), eq(savIntakeRuns.configHash, config.configHash),
-    lt(savIntakeRuns.attempts, 2), noHuman, notCompleted,
+    lt(savIntakeRuns.attempts, 2), noHuman, notCompleted, noCommittedExecutionFor(sql`${savIntakeRuns.messageId}`),
     sql`(select coalesce(sum(s.attempts),0) from sav.intake_runs s where s.message_id = ${savIntakeRuns.messageId}) < 2`,
     sql`exists (select 1 from sav.threads t where t.id = ${savIntakeRuns.threadId} and not t.ai_paused)`,
     or(inArray(savIntakeRuns.state, ["pending", "waiting"]), and(eq(savIntakeRuns.state, "analysing"), lt(savIntakeRuns.leaseUntil, now)))))

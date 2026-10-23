@@ -2,12 +2,12 @@ import { createHash, randomUUID } from "node:crypto";
 import { afterAll, afterEach, beforeAll, beforeEach, expect, it, vi } from "vitest";
 import { eq } from "drizzle-orm";
 import { createSavTestDb } from "../../../../test/sav-db";
-import { savSyncState, savMailboxes, savMessages, savThreads, savIntakeRuns, savIntakeModelCalls, savIntakeJournal, savActions, savDecisions, savIntakeExecutions, savIntakeEffects, auditLogs } from "@/db/schema";
+import { savSyncState, savMailboxes, savMessages, savThreads, savIntakeRuns, savIntakeModelCalls, savIntakeJournal, savActions, savDecisions, savIntakeExecutions, savIntakeEffects, savIntakeExecutionPolicies, staffUsers, auditLogs } from "@/db/schema";
 const state = vi.hoisted(() => ({ db: null as unknown }));
 vi.mock("@/db", () => ({ requireDb: () => { if (!state.db) throw Error("NO_DATABASE_ALLOWED"); return state.db; } }));
 import { encryptSavPayload, decryptSavPayload } from "../crypto";
 import { intakeRuntimeHash, savIntakeRuntimeConfig, SAV_INTAKE_RUNTIME_REVISION, type IntakeRuntimeConfig, type IntakeRuntimePayload } from "./runtime-contract";
-import { assertSavIntakeLease, catchupSavIntake, claimSavIntakeRun, enqueueSavIntakeMessage, failSavIntakeRun, readSavIntakeBudget, readSavIntakeCurrent, reconcileConfinedIntakeUsage, reserveSavIntakeCall, saveSavIntakeResult, settleSavIntakeCall } from "./runtime-store";
+import { assertSavIntakeLease, catchupSavIntake, claimSavIntakeRun, enqueueSavIntakeMessage, failSavIntakeRun, pendingSavIntakeRuns, readSavIntakeBudget, readSavIntakeCurrent, reconcileConfinedIntakeUsage, reserveSavIntakeCall, saveSavIntakeResult, settleSavIntakeCall } from "./runtime-store";
 import { analyseSavIntakeRuntime, enqueueConfiguredSavIntake, reconcileSavIntakeRuntime } from "./runtime";
 
 let f: Awaited<ReturnType<typeof createSavTestDb>>, mailboxId: string, threadId: string, messageId: string;
@@ -580,4 +580,53 @@ it("confined usage permits superseded non-executable evidence but never qualific
   expect(await reconcileConfinedIntakeUsage(qualification)).toEqual({reconciled:0});
   expect(await reconcileConfinedIntakeUsage(config)).toEqual({reconciled:1});
   expect((await f.db.select().from(savIntakeRuns))[0]).toMatchObject({state:"superseded",isCurrent:false,leaseToken:null,freshUntil:null});
+});
+
+async function commonGuardExecution(runId: string, kind: string) {
+  const [staff] = await f.db.insert(staffUsers).values({ clerkId: randomUUID(), email: `runtime-guard-${randomUUID()}@example.invalid`, name: "Synthetic Runtime Guard", role: "admin", active: true }).returning();
+  const [policy] = await f.db.insert(savIntakeExecutionPolicies).values({ revision: "synthetic-guard", state: "approved", administratorId: staff.id, policyHash: config.policyHash, payloadCiphertext: encryptSavPayload({}) }).returning();
+  const [execution] = await f.db.insert(savIntakeExecutions).values({ messageId, threadId, runId, runVersion: 1, policyId: policy.id, policyHash: config.policyHash,
+    state: kind === "confirmed" ? "confirmed" : "waiting", payloadCiphertext: encryptSavPayload({}) }).returning();
+  if (kind !== "confirmed") await f.db.insert(savIntakeEffects).values({ executionId: execution.id, businessKey: `synthetic-runtime-${execution.id}`, kind: "ticket_create", permission: "create_ticket",
+    state: kind === "partial-confirmed" ? "confirmed" : kind === "dispatched" ? "dispatched" : "planned", intentHash: config.policyHash, intentCiphertext: encryptSavPayload({}),
+    ...(kind === "dispatched" ? { dispatchedAt: new Date() } : {}), ...(kind === "verification" ? { verificationCiphertext: encryptSavPayload({ confirmed: true }) } : {}) });
+  return async () => {
+    await f.db.delete(savIntakeEffects).where(eq(savIntakeEffects.executionId, execution.id));
+    await f.db.delete(savIntakeExecutions).where(eq(savIntakeExecutions.id, execution.id));
+    await f.db.delete(savIntakeExecutionPolicies).where(eq(savIntakeExecutionPolicies.id, policy.id));
+    await f.db.delete(staffUsers).where(eq(staffUsers.id, staff.id));
+  };
+}
+it.each(["confirmed", "partial-confirmed", "dispatched", "planned", "verification"])("common guard runtime revalidates %s execution after run selection", async kind => {
+  const id = (await enqueueSavIntakeMessage(messageId, config))!;
+  expect((await pendingSavIntakeRuns(config)).map(run => run.id)).toContain(id);
+  const remove = await commonGuardExecution(id, kind);
+  try {
+    const allowed = kind === "planned";
+    expect((await pendingSavIntakeRuns(config)).some(run => run.id === id)).toBe(allowed);
+    const claimed = await claimSavIntakeRun(id, config);
+    expect(Boolean(claimed)).toBe(allowed);
+    expect((await f.db.select().from(savIntakeRuns).where(eq(savIntakeRuns.id, id)))[0].attempts).toBe(allowed ? 1 : 0);
+    expect(await f.db.select().from(savIntakeModelCalls)).toEqual([]);
+  } finally { await remove(); }
+});
+it("common guard runtime fences a leased analysis before model reservation when an effect commits", async () => {
+  const current = await lease(), remove = await commonGuardExecution(current.run.id, "dispatched");
+  try {
+    await expect(assertSavIntakeLease(current, config)).rejects.toThrow("CONTEXT_CHANGED");
+    await expect(reserveSavIntakeCall(current, config, "a".repeat(64))).rejects.toThrow("CONTEXT_CHANGED");
+    await expect(saveSavIntakeResult(current, config, payload(), "observed")).rejects.toThrow("CONTEXT_CHANGED");
+    expect(await f.db.select().from(savIntakeModelCalls)).toEqual([]);
+    expect((await f.db.select().from(savIntakeRuns).where(eq(savIntakeRuns.id, current.run.id)))[0].attempts).toBe(1);
+  } finally { await remove(); }
+});
+it("common guard runtime still accepts a genuinely new message after the old execution completed", async () => {
+  const id = (await enqueueSavIntakeMessage(messageId, config))!, remove = await commonGuardExecution(id, "confirmed");
+  try {
+    const next = await message({ receivedAt: new Date(Date.now() + 1) });
+    const nextRun = (await enqueueSavIntakeMessage(next.id, config))!;
+    expect(nextRun).toBeTruthy();
+    expect((await pendingSavIntakeRuns(config)).map(run => run.id)).toContain(nextRun);
+    expect((await claimSavIntakeRun(nextRun, config))?.run.messageId).toBe(next.id);
+  } finally { await remove(); }
 });

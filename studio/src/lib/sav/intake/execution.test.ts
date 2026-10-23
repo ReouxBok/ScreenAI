@@ -22,8 +22,9 @@ import { planSavIntake } from "./engine";
 import { createSavIntakeHubspotReaders } from "./hubspot-readers";
 import { savIntakeRuntimeConfig, intakeRuntimeHash, SAV_INTAKE_RUNTIME_REVISION } from "./runtime-contract";
 import { executionPolicySchema, executionAdministrator, intakeExecutionConfig, approveIntakeExecutionPolicy, revokeIntakeExecutionPolicy, readIntakeExecutionAuthority, type ExecutionPolicy } from "./execution-policy";
-import { enqueueSavIntakeMessage, claimSavIntakeRun, saveSavIntakeResult, catchupSavIntake } from "./runtime-store";
+import { enqueueSavIntakeMessage, claimSavIntakeRun, saveSavIntakeResult, catchupSavIntake, pendingSavIntakeRuns } from "./runtime-store";
 import { createIntakeExecutorAdapters } from "./execution-adapters";
+import { analyseSavIntakeRuntime } from "./runtime";
 import { admitIntakeExecution, getExecutionEffects, occupationSchemaInstalled, releaseNeverDispatchedIntakeScopes, assertNoLegacyConflict, claimExecution, endExecutionPass, occupyKeys, finishVerifiedIdentityRecovery } from "./execution-store";
 import { executeIntakePass, readIntakeExecutionProgress, reconcileIntakeEffectsReadOnly, reconcileIntakeExecutor, reconcileIntakeEffectCandidate, scanIntakeExecutionCandidates, pendingIntakeEffectRecoveries } from "./executor";
 import { guardLegacyIntakeOccupation, withLegacyOccupationAction, markLegacyIntakeDispatch, releaseLegacyIntakeIfConfirmed } from "./legacy-occupation";
@@ -1048,4 +1049,88 @@ it.each(["planned", "dispatched", "acked", "confirmed", "uncertain", "planned-to
     expect(await releaseNeverDispatchedIntakeScopes(mailboxId)).toEqual({ released: barrier === "planned" ? 1 : 0 });
     expect(await getExecutionEffects(owner.id)).toEqual(effects);
     if (barrier !== "planned") expect(await f.db.select().from(savIntakeOccupations)).toEqual(keys);
+}, 20000);
+
+async function commonGuardRecoveryFixture() {
+    const row = await admission();
+    await executeIntakePass(row.id, options, { afterAck: async () => { throw Error("SYNTHETIC_CRASH_AFTER_ACK"); } });
+    const [effect] = await getExecutionEffects(row.id);
+    await f.db.update(savIntakeEffects).set({ nextReconcileAt: null }).where(eq(savIntakeEffects.id, effect.id));
+    return { row, effect: (await getExecutionEffects(row.id))[0] };
+}
+it.each(["marker", "ack"])("common guard skips both recovery paths during an active worker lease after %s", async stage => {
+    const row = await admission(), original = options.adapters.verify, verify = vi.fn(original);
+    options.adapters.verify = verify;
+    const check = async () => {
+        const effects = await getExecutionEffects(row.id); if (effects.length !== 1) return;
+        const [effect] = effects, before = structuredClone(effect);
+        expect(await pendingIntakeEffectRecoveries()).toEqual([]);
+        expect((await reconcileIntakeEffectsReadOnly(row.id, options.adapters)).checked).toBe(0);
+        await expect(reconcileIntakeEffectCandidate(effect.id, "901", "Synthetic operator must wait for worker", options.adapters)).rejects.toThrow("RECOVERY_BUSY");
+        expect(verify).not.toHaveBeenCalled();
+        expect((await getExecutionEffects(row.id))[0]).toEqual(before);
+    };
+    expect(await executeIntakePass(row.id, options, stage === "marker" ? { afterMarker: check } : { afterAck: check })).toMatchObject({ state: "confirmed" });
+    expect(p.calls.filter(call => call.method === "POST" && call.path.endsWith("/tickets"))).toHaveLength(1);
+    expect((await getExecutionEffects(row.id)).every(effect => effect.reconcileAttempts === 0)).toBe(true);
+}, 20000);
+it("common guard revalidates a worker claim after recovery selection and resumes a recovered running/null execution", async () => {
+    const { row, effect } = await commonGuardRecoveryFixture();
+    expect((await pendingIntakeEffectRecoveries()).map(candidate => candidate.id)).toContain(row.id);
+    const worker = (await claimExecution(row.id))!, verify = vi.spyOn(options.adapters, "verify");
+    expect((await reconcileIntakeEffectsReadOnly(row.id, options.adapters)).checked).toBe(0);
+    expect(verify).not.toHaveBeenCalled(); expect((await getExecutionEffects(row.id))[0]).toEqual(effect);
+    expect((await f.db.select().from(savIntakeExecutions).where(eq(savIntakeExecutions.id, row.id)))[0].leaseToken).toBe(worker.token);
+    await f.db.update(savIntakeExecutions).set({ leaseUntil: new Date(Date.now() - 1) }).where(eq(savIntakeExecutions.id, row.id));
+    expect(await reconcileIntakeExecutor({ env: () => environment, adapters: options.adapters })).toMatchObject({ state: "confirmed" });
+    expect(p.calls.filter(call => call.method === "POST" && call.path.endsWith("/tickets"))).toHaveLength(1);
+}, 20000);
+it("common guard recovery owns a lease through verify and excludes another worker or recovery", async () => {
+    const { row } = await commonGuardRecoveryFixture(), verify = options.adapters.verify;
+    options.adapters.verify = async (...args) => {
+        expect(await claimExecution(row.id)).toBeNull();
+        expect((await pendingIntakeEffectRecoveries()).some(candidate => candidate.id === row.id)).toBe(false);
+        expect((await reconcileIntakeEffectsReadOnly(row.id, options.adapters)).checked).toBe(0);
+        return verify(...args);
+    };
+    expect((await reconcileIntakeEffectsReadOnly(row.id, options.adapters)).checked).toBe(1);
+    expect((await getExecutionEffects(row.id))[0].state).toBe("confirmed");
+}, 20000);
+it.each(["confirmed", "unknown", "throw"])("common guard discards a %s provider read after another worker reclaims the lease", async result => {
+    const { row, effect } = await commonGuardRecoveryFixture(); let token: string | undefined;
+    options.adapters.verify = async () => {
+        await f.db.update(savIntakeExecutions).set({ leaseUntil: new Date(Date.now() - 1) }).where(eq(savIntakeExecutions.id, row.id));
+        token = (await claimExecution(row.id))!.token;
+        if (result === "throw") throw Error("SYNTHETIC_PROVIDER_UNAVAILABLE");
+        return { confirmed: result === "confirmed", attributed: result === "confirmed", ack: { id: "901" } };
+    };
+    expect((await reconcileIntakeEffectsReadOnly(row.id, options.adapters)).checked).toBe(1);
+    expect((await getExecutionEffects(row.id))[0]).toEqual(effect);
+    expect((await f.db.select().from(savIntakeExecutions).where(eq(savIntakeExecutions.id, row.id)))[0].leaseToken).toBe(token);
+    expect(p.calls.filter(call => call.method === "POST" && call.path.endsWith("/tickets"))).toHaveLength(1);
+}, 20000);
+it.each([true, false])("common guard operator cannot persist an accepted=%s read after losing the lease", async accepted => {
+    const { row, effect } = await commonGuardRecoveryFixture(); let token: string | undefined;
+    options.adapters.verify = async () => {
+        await f.db.update(savIntakeExecutions).set({ leaseUntil: new Date(Date.now() - 1) }).where(eq(savIntakeExecutions.id, row.id));
+        token = (await claimExecution(row.id))!.token;
+        return { confirmed: accepted, attributed: accepted, ack: { id: "901" } };
+    };
+    await expect(reconcileIntakeEffectCandidate(effect.id, "901", "Synthetic explicit recovery candidate", options.adapters)).rejects.toThrow("RECOVERY_BUSY");
+    expect((await getExecutionEffects(row.id))[0]).toEqual(effect);
+    expect((await f.db.select().from(savIntakeExecutions).where(eq(savIntakeExecutions.id, row.id)))[0].leaseToken).toBe(token);
+    const journal = await f.db.select().from(savIntakeEffectJournal).where(eq(savIntakeEffectJournal.executionId, row.id));
+    expect(journal.some(event => event.kind === "operator_candidate_checked")).toBe(false);
+}, 20000);
+it("common guard completed ticket-trigger invalidation cannot select or claim another model analysis", async () => {
+    const row = await admission();
+    expect(await executeIntakePass(row.id, options)).toMatchObject({ state: "confirmed" });
+    const [run] = await f.db.select().from(savIntakeRuns).where(eq(savIntakeRuns.id, runId));
+    expect(run.state).toBe("waiting");
+    expect((await pendingSavIntakeRuns(options.runtime)).some(candidate => candidate.id === runId)).toBe(false);
+    expect(await claimSavIntakeRun(runId, options.runtime)).toBeNull();
+    const network = vi.fn(async () => { throw Error("MODEL_FORBIDDEN"); });
+    expect(await analyseSavIntakeRuntime(runId, options.runtime, { env: () => environment, network })).toEqual({ skipped: "not_claimed" });
+    expect(network).not.toHaveBeenCalled();
+    expect((await f.db.select().from(savIntakeRuns).where(eq(savIntakeRuns.id, runId)))[0].attempts).toBe(run.attempts);
 }, 20000);

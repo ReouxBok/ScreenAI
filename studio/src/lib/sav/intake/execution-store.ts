@@ -255,6 +255,36 @@ export async function claimExecution(id: string, now = new Date()) {
     });
 }
 export type ExecutionLease = NonNullable<Awaited<ReturnType<typeof claimExecution>>>;
+export type EffectRecoveryLease = { executionId: string; token: string };
+/** Reserve the existing execution lease without changing its business state.
+ * No admission lock is held across a provider read. The same token is checked
+ * again under lock before any recovered result or retry can be persisted. */
+export async function claimEffectRecovery(executionId: string, now = new Date()): Promise<EffectRecoveryLease | null> {
+    return requireDb().transaction(async tx => {
+        await admissionLock(tx);
+        const [row] = await tx.select().from(savIntakeExecutions).where(eq(savIntakeExecutions.id, executionId)).for("no key update");
+        if (!row || row.leaseUntil && row.leaseUntil > now) return null;
+        const token = randomUUID();
+        await tx.update(savIntakeExecutions).set({ leaseToken: token, leaseUntil: new Date(now.getTime() + 80000) }).where(eq(savIntakeExecutions.id, row.id));
+        return { executionId, token };
+    });
+}
+export async function withEffectRecoveryLease<T>(lease: EffectRecoveryLease, work: (tx: ExecutionTx) => Promise<T>): Promise<{ owned: false } | { owned: true; value: T }> {
+    return requireDb().transaction(async tx => {
+        await admissionLock(tx);
+        const [row] = await tx.select().from(savIntakeExecutions).where(eq(savIntakeExecutions.id, lease.executionId)).for("no key update");
+        if (!row || row.leaseToken !== lease.token || !row.leaseUntil || row.leaseUntil <= new Date()) return { owned: false };
+        return { owned: true, value: await work(tx) };
+    });
+}
+export async function releaseEffectRecovery(lease: EffectRecoveryLease) {
+    return requireDb().transaction(async tx => {
+        await admissionLock(tx);
+        const rows = await tx.update(savIntakeExecutions).set({ leaseToken: null, leaseUntil: null })
+            .where(and(eq(savIntakeExecutions.id, lease.executionId), eq(savIntakeExecutions.leaseToken, lease.token))).returning({ id: savIntakeExecutions.id });
+        return rows.length === 1;
+    });
+}
 export async function assertExecutionLocal(tx: ExecutionTx, lease: ExecutionLease, now = new Date()) {
     await admissionLock(tx);
     const [row] = await tx.select().from(savIntakeExecutions).where(eq(savIntakeExecutions.id, lease.row.id)).for("update");
@@ -367,8 +397,8 @@ export async function recordEffectAck(effect: Effect, ack: EffectAck) {
         }, old.id);
     });
 }
-export async function confirmExecutionEffect(effect: Effect, proof: unknown, ack?: EffectAck) {
-    await requireDb().transaction(async (tx) => {
+export async function confirmExecutionEffect(effect: Effect, proof: unknown, ack?: EffectAck, transaction?: ExecutionTx) {
+    const write = async (tx: ExecutionTx) => {
         const [row] = await tx.select().from(savIntakeEffects).where(eq(savIntakeEffects.id, effect.id)).for("update");
         if (!row || row.state === "planned")
             return fault("CONFIRMATION_REJECTED");
@@ -378,7 +408,8 @@ export async function confirmExecutionEffect(effect: Effect, proof: unknown, ack
             } : {})
         }).where(eq(savIntakeEffects.id, effect.id));
         await executionJournal(tx, row.executionId, "confirmed", proof, row.id);
-    });
+    };
+    if (transaction) await write(transaction); else await requireDb().transaction(write);
 }
 /** Complete only the local record of an already verified identification send.
  * No authority is resurrected and this operation has no dispatch capability. */
@@ -425,8 +456,8 @@ export async function finishVerifiedIdentityRecovery(executionId: string) {
         return true;
     });
 }
-export async function deferExecutionEffect(effect: Effect, reason: string) {
-    await requireDb().transaction(async (tx) => {
+export async function deferExecutionEffect(effect: Effect, reason: string, transaction?: ExecutionTx) {
+    const write = async (tx: ExecutionTx) => {
         const [row] = await tx.select().from(savIntakeEffects).where(eq(savIntakeEffects.id, effect.id)).for("update");
         if (row?.state !== "confirmed") {
             await tx.update(savIntakeEffects).set({
@@ -436,7 +467,8 @@ export async function deferExecutionEffect(effect: Effect, reason: string) {
                 reason
             }, effect.id);
         }
-    });
+    };
+    if (transaction) await write(transaction); else await requireDb().transaction(write);
 }
 export async function endExecutionPass(lease: ExecutionLease, state: "waiting" | "uncertain", reason: string) {
     await requireDb().transaction(async (tx) => {
@@ -640,7 +672,7 @@ export async function releaseRecoveredExecutionScope(executionId: string) {
     await requireDb().transaction(async (tx) => {
         await admissionLock(tx);
         const [row] = await tx.select().from(savIntakeExecutions).where(eq(savIntakeExecutions.id, executionId)).for("update");
-        if (!row || row.state === "confirmed" || row.state === "refused")
+        if (!row || row.state === "confirmed" || row.state === "refused" || row.leaseUntil && row.leaseUntil > new Date())
             return;
         const [thread] = await tx.select().from(savThreads).where(eq(savThreads.id, row.threadId)).for("update");
         const [latest] = await tx.select({
