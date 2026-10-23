@@ -8,6 +8,7 @@ import { intakeRuntimeHash } from "@/lib/sav/intake/runtime-contract";
 import { formatParisDateTime } from "@/lib/paris-date";
 import { MailConversation } from "../../[id]/mail-conversation";
 import { IntakeChoiceForm } from "../choice-form";
+import {IntakeRecoveryForm} from "../recovery-form";
 import { intakeStatusLabel, intakeReasonLabel, intakeContextReasonLabels } from "@/lib/sav/intake/console-presentation";
 import styles from "../intake.module.css";
 export const dynamic = "force-dynamic";
@@ -16,12 +17,14 @@ const effectLabels: Record<string, string> = { ticket_create: "Création du tick
 const stateLabels: Record<string, string> = { planned: "Prévu, sans départ", dispatched: "Départ enregistré, résultat à vérifier", acked: "Réponse fournisseur reçue, vérification en attente",
   confirmed: "Résultat vérifié", uncertain: "Résultat incertain, rapprochement requis" };
 export default async function IntakeDetailPage({ params }: { params: Promise<{ id: string }> }) {
-  await requireIntakeConsoleStaff();
+  const staff=await requireIntakeConsoleStaff();
   const { id } = await params;
   if (!z.uuid().safeParse(id).success) notFound();
   const data = await readIntakeConsoleDetail(id);
   if (!data) notFound();
   const current = data.current;
+  const blocked = data.diagnostics?.messageId === data.latestMessageId && data.diagnostics.attemptsExhausted
+    && current && ["pending", "waiting"].includes(current.state) && !data.confirmedCurrent;
   const applicable = Boolean(data.confirmedCurrent || current && current.messageId === data.latestMessageId && current.sourceMatches);
   const plan = applicable ? current?.payload.plan : undefined, disposition = plan?.decision.disposition;
   const historicalPlan = !applicable ? current?.payload.plan : undefined;
@@ -40,7 +43,8 @@ export default async function IntakeDetailPage({ params }: { params: Promise<{ i
       <p>{dirty ? "Mise à jour du traitement en cours" : intakeReasonLabel(data.projection.reason) ?? intakeStatusLabel(data.projection.status)}</p></div></header>
     <div className={styles.detailGrid}><div>
       <section className={styles.decision}><h2>{data.confirmedCurrent ? "Résultat confirmé pour cette demande" : "Décision actuelle"}</h2>
-        {data.projection.status === "historical_outside_automation" ? <p>Historique conservé, hors automatisation. Un nouvel entrant après le lancement reprendra normalement avec cet historique.</p> : !plan ? <p>Analyse en cours ou attente technique. Aucune action n’est présentée comme accomplie.</p> : <>
+        {blocked && <p role="status">Analyse bloquée : les deux tentatives de ce message sont épuisées, y compris dans ses versions précédentes. Aucune relance automatique n’est autorisée par ce diagnostic.</p>}
+        {data.projection.status === "historical_outside_automation" ? <p>Historique conservé, hors automatisation. Un nouvel entrant après le lancement reprendra normalement avec cet historique.</p> : !plan ? <p>{blocked ? "Les diagnostics des tentatives précédentes sont conservés ci-dessous." : "Analyse en cours ou attente technique."} Aucune action n’est présentée comme accomplie.</p> : <>
           <dl><div><dt>Classification</dt><dd>{plan.decision.classification}</dd></div><div><dt>Parcours</dt><dd>{disposition?.kind === "ticket" ? target?.operation === "create" ? "Créer une fiche ticket" : target?.operation === "reopen" ? "Rouvrir le ticket" : "Rattacher au ticket"
             : disposition?.kind === "request_identification" ? "Demander l’adresse d’inscription" : disposition?.kind === "collect_context" ? "Compléter les preuves" : "Sans ticket"}</dd></div>
             {target && <div><dt>Fiche proposée</dt><dd>Contact HubSpot {target.contactId}</dd></div>}
@@ -70,7 +74,19 @@ export default async function IntakeDetailPage({ params }: { params: Promise<{ i
       <section className={styles.history}><h2>Choix humains conservés</h2>{data.choices.length ? <ol>{data.choices.map(event => <li key={event.id}>
         <strong>{event.kind === "refuse" ? "Refus humain" : "Choix conditionnel"} · version {event.parentVersion}</strong><p>{event.reason}</p>
         <small>{event.actor} · {formatParisDateTime(event.at)} · {event.state === "consumed" ? "choix consommé" : event.state === "refused" ? "refus conservé" : event.state === "waiting" ? "preuves à compléter" : "vérification en attente"}</small></li>)}</ol> : <p>Aucun choix humain enregistré.</p>}</section>
-      <details className={styles.history}><summary>Diagnostic technique</summary><p>{data.current?.payload.reason ?? data.progress?.reason ?? "Aucun incident enregistré"}</p></details>
+      <details className={styles.history}><summary>Diagnostic technique</summary><p>{data.current?.payload.reason ?? data.progress?.reason ?? (blocked ? "Tentatives épuisées — consulter les versions précédentes." : "Aucun motif technique enregistré sur la version actuelle.")}</p>
+        {["admin","owner"].includes(staff?.role??"")&&data.latestMessageId&&<IntakeRecoveryForm threadId={id} messageId={data.latestMessageId}/>}
+        <p>{data.diagnostics?.totalAttempts ?? 0} tentative(s) cumulée(s) pour le dernier message. Les versions remplacées ne sont pas des décisions applicables.</p>
+        {data.diagnostics?.runs.map(run => <details key={run.runId}><summary>Version {run.version} · {intakeStatusLabel(run.state)} · {run.attempts} tentative(s)</summary>
+          <p>{run.diagnostic.readable ? run.diagnostic.reason ? intakeReasonLabel(run.diagnostic.reason) : "Aucun code technique enregistré dans cette version." : "Diagnostic historique illisible ou hors limite ; cause non évaluable."}</p>
+          {run.diagnostic.contextReasons.length > 0 && <p>Preuves à compléter : {run.diagnostic.contextReasons.map(reason => intakeContextReasonLabels[reason]).join(", ")}.</p>}
+          <ul>{run.diagnostic.traces.filter(trace => trace.errorCode || trace.reason).map((trace, index) => <li key={index}>{trace.operation ?? trace.method ?? trace.phase ?? "Vérification"} : {trace.errorCode ?? trace.reason}</li>)}</ul>
+          <details><summary>Événements conservés ({run.events.length})</summary><ul>{run.events.map(event => <li key={event.id}>{formatParisDateTime(event.createdAt)} · {event.kind ?? "événement"} : {event.diagnostic.readable
+            ? [event.diagnostic.reason, ...event.diagnostic.contextReasons, ...event.diagnostic.traces.flatMap(t => [t.errorCode, t.reason].filter(Boolean))].filter(Boolean).join(", ") || "aucun code technique conservé"
+            : "détail illisible ou hors limite"}</li>)}</ul></details>
+        </details>)}
+        {(data.diagnostics?.versionsTruncated || data.diagnostics?.eventsTruncated) && <p>Historique affiché partiellement : limites de lecture atteintes.</p>}
+      </details>
     </aside></div>
   </div>;
 }

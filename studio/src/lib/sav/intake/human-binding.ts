@@ -12,9 +12,12 @@ export type HumanEventPayload = {
   candidateContactIds: string[]; contactId?: string; ticketId?: string;
   classification?: import("./engine-types").MessageAnalysis["requests"][number]["kind"];
   reason: string; parentPayloadHash: string;
+  reinvestigate?: true;
 };
 export const humanRevisionConfigHash = (baseConfigHash: string, choiceId: string) =>
   intakeRuntimeHash({ revision: "sav-intake-human-binding.v1", baseConfigHash, choiceId });
+export const operatorRecoveryConfigHash = (baseConfigHash:string,eventId:string) =>
+  intakeRuntimeHash({revision:"sav-intake-operator-recovery-parent.v1",baseConfigHash,eventId});
 export async function intakeHumanRefused(messageId: string, db: Pick<ReturnType<typeof requireDb>, "select"> = requireDb()) {
   if (!await intakeConsoleInstalled(db)) return false;
   return Boolean((await db.select({ id: savIntakeHumanEvents.id }).from(savIntakeHumanEvents)
@@ -35,6 +38,17 @@ export async function intakeRunConfigurationBound(run: typeof savIntakeRuns.$inf
     const [pending] = await db.select({ id: savIntakeHumanEvents.id }).from(savIntakeHumanEvents)
       .where(and(eq(savIntakeHumanEvents.parentRunId, run.id), inArray(savIntakeHumanEvents.state, ["pending", "reading"]))).limit(1);
     if (pending && pending.id !== pendingEventId) return false;
+  }
+  if(pendingEventId&&run.configHash===operatorRecoveryConfigHash(config.configHash,pendingEventId)&&run.humanChoiceCiphertext===null){
+    const [event]=await db.select().from(savIntakeHumanEvents).where(eq(savIntakeHumanEvents.id,pendingEventId));
+    if(!event||event.parentRunId!==run.id||event.parentVersion!==run.version||event.messageId!==run.messageId||event.threadId!==run.threadId
+      ||event.baseConfigHash!==config.configHash||event.sourceHash!==run.sourceHash||event.kind!=="classify"||!["pending","reading","consumed"].includes(event.state))return false;
+    const value=decryptSavPayload<HumanEventPayload>(event.payloadCiphertext),payload=decryptSavPayload<import("./runtime-contract").IntakeRuntimePayload>(run.payloadCiphertext);
+    return value.reinvestigate===true&&value.revision==="sav-intake-human.v1"&&value.mailboxId===config.mailboxId
+      &&run.policyHash===config.policyHash&&value.policyHash===config.policyHash&&value.resourcesHash===config.resourcesHash
+      &&payload.configuration?.configHash===config.configHash&&payload.configuration.resourcesHash===config.resourcesHash
+      &&payload.configuration.codeRevision===config.codeRevision&&value.parentPayloadHash===intakeRuntimeHash(payload)
+      &&value.candidatesHash===intakeRuntimeHash(value.candidateContactIds)&&value.candidateContactIds.length===0&&!value.contactId&&!value.ticketId;
   }
   if (run.configHash === config.configHash) {
     if (run.humanChoiceCiphertext !== null) return false;

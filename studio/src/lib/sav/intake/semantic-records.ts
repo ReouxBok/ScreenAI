@@ -25,6 +25,13 @@ function validateAccepted(method: keyof SavIntakeSemanticReaders, input: unknown
     if (r.attachmentObservations?.some(o => !i.message.attachmentInputs?.some(a => a.sourceId === o.sourceId && a.fileHash === o.fileHash))) reject();
     if (r.messageId !== i.message.id || r.requests.some(q => q.currentMessageId !== i.message.id)
       || new Set(r.requests.map(q => q.id)).size !== r.requests.length) reject();
+    for (const request of r.requests.filter(q => q.originMessageId)) {
+      const initial = i.conversation.find(m => m.id === request.originMessageId);
+      if (request.originMessageId !== i.identificationContinuation?.initialMessageId || !initial || !initial.contentComplete
+        || initial.direction !== "inbound" || initial.threadId !== i.message.threadId || initial.fromEmail.toLowerCase() !== i.message.fromEmail.toLowerCase()
+        || !r.registration || r.registration.sourceMessageId !== i.message.id || !i.message.currentText.includes(r.registration.quote)
+        || !r.registration.quote.toLowerCase().includes(r.registration.address.toLowerCase())) reject();
+    }
   } else if (method === "assessIdentity") {
     const i = input as Parameters<NonNullable<SavIntakeSemanticReaders["assessIdentity"]>>[0], r = identityAssessmentSchema.parse(result);
     if (r.contactIds.some(id => !i.candidates.some(c => c.contact.id === id)) || new Set(r.contactIds).size !== r.contactIds.length
@@ -39,7 +46,7 @@ function validateAccepted(method: keyof SavIntakeSemanticReaders, input: unknown
     const i = input as Parameters<SavIntakeSemanticReaders["assessIssues"]>[0], r = issueAssessmentSchema.parse(result);
     if (r.tickets.length !== i.tickets.length || new Set(r.tickets.map(t => t.ticketId)).size !== r.tickets.length) reject();
     for (const t of r.tickets) {
-      if (!i.tickets.some(row => row.ticket.id === t.ticketId) || ["current", `ticket-${t.ticketId}`, `history-${t.ticketId}`].some(id => !t.evidenceIds.includes(id))
+      if (!i.tickets.some(row => row.ticket.id === t.ticketId) || ["current", ...(i.requestContext ? ["initial-request"] : []), `ticket-${t.ticketId}`, `history-${t.ticketId}`].some(id => !t.evidenceIds.includes(id))
         || t.evidenceIds.some(id => !i.evidence.some(e => e.id === id)) || t.requestIds.some(id => !i.requests.some(q => q.id === id))
         || t.relation === "same" && (new Set(t.requestIds).size !== i.requests.length || i.requests.some(q => !t.requestIds.includes(q.id)))) reject();
     }

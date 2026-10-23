@@ -61,17 +61,22 @@ const manifestPartFields = Array.from({ length: 20 }).reduce<string>(fields => `
 function associatedPart(message: { id?: string; threadId?: string; payload?: SavGmailMimePart }, ref: SavAttachmentReference, expectedSize: number, mimeType?: string) {
   if (message.id !== ref.gmailMessageId || message.threadId !== ref.gmailThreadId) throw new Error("association_mismatch");
   let nodes = 0;
+  let incomplete = false;
   const matches: SavGmailMimePart[] = [];
   function find(part: SavGmailMimePart | undefined, depth: number) {
-    if (!part || ++nodes > 500 || depth > 20) return;
+    if (!part) return;
+    if (++nodes > 500 || depth > 20) { incomplete = true; return; }
     if (part.partId === ref.partId) matches.push(part);
     for (const child of part.parts ?? []) find(child, depth + 1);
   }
   find(message.payload, 0);
   const part = matches[0];
-  if (matches.length !== 1 || !part || (header(part, "content-id").replace(/^<|>$/g, "") || null) !== ref.contentId
-    || (part.body?.attachmentId ?? null) !== ref.attachmentId || mimeType && part.mimeType?.toLowerCase() !== mimeType.toLowerCase()) throw new Error("association_mismatch");
+  if (incomplete || matches.length !== 1 || !part || (header(part, "content-id").replace(/^<|>$/g, "") || null) !== ref.contentId
+    || mimeType && part.mimeType?.toLowerCase() !== mimeType.toLowerCase()) throw new Error("association_mismatch");
   if (part.body?.size !== expectedSize) throw new Error("byte_limit");
+  const disposition = header(part, "content-disposition").split(";")[0].trim().toLowerCase();
+  const actualDisposition = disposition === "inline" || ref.contentId ? "inline" : disposition === "attachment" ? "attachment" : "unknown";
+  if (actualDisposition !== "unknown" && ref.disposition !== "unknown" && ref.disposition !== actualDisposition) throw new Error("association_mismatch");
   return part;
 }
 export async function fetchSavAttachmentBytes(reference: SavAttachmentReference, expectedSize: number, read: (path: string, maximum: number, signal: AbortSignal) => Promise<unknown>, signal: AbortSignal, mimeType?: string) {
@@ -81,8 +86,10 @@ export async function fetchSavAttachmentBytes(reference: SavAttachmentReference,
   // Revalidate the actual message/part/attachment binding before fetching any media.
   // Excluding body.data makes this manifest independently bounded and reusable for CID parts.
   const manifest = await read(`${base}?format=full&fields=id,threadId,payload(${manifestPartFields})`, 1024 * 1024, signal) as { id?: string; threadId?: string; payload?: SavGmailMimePart };
-  associatedPart(manifest, ref, expectedSize, mimeType);
-  if (ref.attachmentId) return decodeSavAttachmentData(await read(`${base}/attachments/${encodeURIComponent(ref.attachmentId)}`, Math.ceil(expectedSize / 3) * 4 + 2048, signal) as { data?: string; size?: number }, expectedSize);
+  const freshPart = associatedPart(manifest, ref, expectedSize, mimeType);
+  // Gmail download tokens are transport references, not stable part identities.
+  // Resolve the token only from the newly verified message/part/CID/type/size.
+  if (freshPart.body?.attachmentId) return decodeSavAttachmentData(await read(`${base}/attachments/${encodeURIComponent(freshPart.body.attachmentId)}`, Math.ceil(expectedSize / 3) * 4 + 2048, signal) as { data?: string; size?: number }, expectedSize);
   const message = await read(`${base}?format=full&fields=id,threadId,payload`, Math.ceil(SAV_ATTACHMENT_LIMITS.totalBytes / 3) * 4 + 1024 * 1024, signal) as { id?: string; threadId?: string; payload?: SavGmailMimePart };
   const part = associatedPart(message, ref, expectedSize, mimeType);
   return decodeSavAttachmentData(part.body ?? {}, expectedSize);

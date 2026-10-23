@@ -42,7 +42,7 @@ it.each([403, 404, 429])("returns a safe HTTP %s reason without reading the exte
   await expect(readSavAttachmentJson(response, 100)).rejects.toThrow(); expect(spy).not.toHaveBeenCalled();
 });
 it("binds inline content to the actual Gmail message, part and CID", async () => {
-  const reference = { ...attachmentMetadata(3).reference!, attachmentId: null, contentId: "cid-fixture" };
+  const reference = { ...attachmentMetadata(3).reference!, attachmentId: null, contentId: "cid-fixture", disposition:"inline" as const };
   const read = vi.fn(async () => ({ id: owner.gmailMessageId, threadId: owner.gmailThreadId, payload: { parts: [{ partId: "1", mimeType: "image/png", headers: [{ name: "Content-ID", value: "<cid-fixture>" }], body: { size: 3, data: "YWJj" } }] } }));
   expect((await fetchSavAttachmentBytes(reference, 3, read, AbortSignal.timeout(1000))).toString()).toBe("abc");
   await expect(fetchSavAttachmentBytes({ ...reference, gmailMessageId: "wrong" }, 3, read, AbortSignal.timeout(1000))).rejects.toThrow("association_mismatch");
@@ -56,11 +56,20 @@ it("checks the manifest binding before downloading an attachment ID", async () =
   expect(read.mock.calls[0][0]).toContain("body(attachmentId,size)");
   expect(read.mock.calls[0][0]).not.toContain("data");
   read.mockClear();
-  for (const patch of [{ partId: "9" }, { attachmentId: "other-file" }, { gmailThreadId: "other-thread" }, { contentId: "invented-cid" }]) {
+  for (const patch of [{ partId: "9" }, { gmailThreadId: "other-thread" }, { contentId: "invented-cid" }]) {
     await expect(fetchSavAttachmentBytes({ ...reference, ...patch }, 3, read, AbortSignal.timeout(1000), "image/png")).rejects.toThrow("association_mismatch");
   }
   await expect(fetchSavAttachmentBytes(reference, 3, read, AbortSignal.timeout(1000), "image/jpeg")).rejects.toThrow("association_mismatch");
   expect(read.mock.calls.every(([path]) => !path.includes("/attachments/"))).toBe(true);
+});
+
+it("resolves a rotating download token only from the newly verified part", async () => {
+  const reference = attachmentMetadata(3).reference!;
+  const read = vi.fn(async (path: string) => path.includes("/attachments/") ? { size: 3, data: "YWJj" }
+    : { id: owner.gmailMessageId, threadId: owner.gmailThreadId, payload: { partId: reference.partId, mimeType: "image/png", body: { attachmentId: "fresh-token", size: 3 } } });
+  expect((await fetchSavAttachmentBytes(reference, 3, read, AbortSignal.timeout(1000), "image/png")).toString()).toBe("abc");
+  expect(read.mock.calls[1][0]).toContain("/attachments/fresh-token");
+  expect(read.mock.calls[1][0]).not.toContain(reference.attachmentId!);
 });
 
 it("certifies exactly 100 references but marks the 101st as omitted without an invented total", () => {

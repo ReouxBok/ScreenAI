@@ -5,7 +5,7 @@ import { createSavTestDb } from "../../../../test/sav-db";
 import { executionProvider } from "../../../../test/sav-intake-execution-provider";
 import { savMailboxes, savThreads, savMessages, staffUsers, savSyncState, savIntakeRuns, savIntakeModelCalls,
   savIntakeHumanEvents, savIntakeJournal, savIntakeConsole, savIntakeExecutions, savIntakeEffects, savIntakeExecutionBudget,
-  savIntakeObservationBindings, savResolutionObservations, savAgentRuns, savDecisions, savActions, savFollowups, savLearningCandidates, savKnowledgeActivations, categories } from "@/db/schema";
+  savIntakeExecutionPolicies, savIntakeObservationBindings, savResolutionObservations, savAgentRuns, savDecisions, savActions, savFollowups, savLearningCandidates, savKnowledgeActivations, categories } from "@/db/schema";
 const state = vi.hoisted(() => ({ db: null as unknown, user: null as unknown }));
 vi.mock("@/db", () => ({ requireDb: () => { if (!state.db) throw Error("DB_FORBIDDEN"); return state.db; } }));
 vi.mock("@clerk/nextjs/server", () => ({ currentUser: async () => state.user }));
@@ -20,10 +20,10 @@ import { enqueueSavIntakeMessage, claimSavIntakeRun, saveSavIntakeResult, readSa
 import { approveIntakeExecutionPolicy, intakeExecutionConfig, type ExecutionPolicy } from "./execution-policy";
 import { createIntakeExecutorAdapters } from "./execution-adapters";
 import { admitIntakeExecution, claimExecution, ensureExecutionEffect, markEffectDispatched, getExecutionEffects, recordEffectAck } from "./execution-store";
-import { executeIntakePass, readIntakeExecutionProgress, reconcileIntakeEffectsReadOnly } from "./executor";
+import { executeIntakePass, reconcileIntakeExecutor, readIntakeExecutionProgress, reconcileIntakeEffectsReadOnly } from "./executor";
 import { recordIntakeHumanCommand, type IntakeHumanCommand } from "./human-commands";
 import { consumeIntakeHumanEvent } from "./human-worker";
-import { intakeRunConfigurationBound, intakeRunCandidateContactIds, humanRevisionConfigHash } from "./human-binding";
+import { intakeRunConfigurationBound, intakeRunCandidateContactIds, humanRevisionConfigHash, type HumanEventPayload } from "./human-binding";
 import { listIntakeConsole, projectIntakeThread, refreshIntakeConsole } from "./console-store";
 import { readIntakeConsoleDetail } from "./console-detail";
 import { ensureIntakeObservations, readIntakeObservationBinding, readIntakeLearningQualification, attributeIntakeObservationEvents } from "./observation-binding";
@@ -47,6 +47,7 @@ import { POST as adminPost } from "@/app/api/sav/intake-admin/route";
 import { getSavThreadDetail, processStoredSavMessage, processPendingSavMessages } from "../service";
 import { enqueueConfiguredSavIntake, reconcileSavIntakeRuntime } from "./runtime";
 import { saveIntakeChoice } from "@/app/studio/sav/intake/actions";
+import {requestIntakeReinvestigation} from "./operator-recovery";
 import type { ExecutionOptions } from "./execution-types";
 let db: Awaited<ReturnType<typeof createSavTestDb>>, p: ReturnType<typeof executionProvider>, mailboxId: string, threadId: string, messageId: string,
   options: ExecutionOptions, environment: Record<string, string | undefined>, runId: string;
@@ -708,4 +709,91 @@ it("excludes more than a batch of historical console rows before LIMIT and admit
   expect(reopened.messageId).toBe(newInOld.id);expect(reopened.projectedEpoch).toBe(reopened.epoch);
   expect((await listIntakeConsole({view:"completed"})).total).toBe(25);
   expect(fetch).not.toHaveBeenCalled();expect(mutationsSent()).toHaveLength(0);
+});
+
+it("administrator recovery preserves automatic attempts and is once per current message without external writes",async()=>{
+ await observed();for(const [key,value]of Object.entries(environment))if(value!==undefined)vi.stubEnv(key,value);
+ await db.db.update(savIntakeRuns).set({attempts:2,state:"waiting"}).where(eq(savIntakeRuns.id,runId));
+ const before=(await db.db.select().from(savIntakeRuns).where(eq(savIntakeRuns.id,runId)))[0];
+ const request={threadId,messageId,reason:"Synthetic explicit re-investigation after a verified software correction."};
+ const result=await requestIntakeReinvestigation(request);
+ expect(result.eventId).toBeTruthy();expect(mutationsSent()).toHaveLength(0);
+ const old=(await db.db.select().from(savIntakeRuns).where(eq(savIntakeRuns.id,runId)))[0];
+ expect(old.attempts).toBe(2);expect(old.payloadCiphertext).toBe(before.payloadCiphertext);expect(old.isCurrent).toBe(false);
+ const current=(await readSavIntakeCurrent(threadId,options.runtime))!;
+ expect(current.id).toBe(result.runId);expect(current.attempts).toBe(0);
+ expect(current.payload.plan?.decision.disposition.kind).toBe("collect_context");
+ expect(current.payload.semantics).toBeUndefined();
+ const [event]=await db.db.select().from(savIntakeHumanEvents).where(eq(savIntakeHumanEvents.id,result.eventId));
+ expect(decryptSavPayload<HumanEventPayload>(event.payloadCiphertext)).toMatchObject({reinvestigate:true});
+ expect((await db.db.select().from(savIntakeModelCalls))).toHaveLength(0);
+ await expect(requestIntakeReinvestigation(request)).rejects.toThrow("RECOVERY_CONFLICT");
+});
+it.each(["paused","newer","refused","nonadmin","historical"])("administrator recovery refuses %s without resetting anything",async kind=>{
+ await observed();for(const [key,value]of Object.entries(environment))if(value!==undefined)vi.stubEnv(key,value);
+ if(kind==="paused")await db.db.update(savThreads).set({aiPaused:true}).where(eq(savThreads.id,threadId));
+ if(kind==="newer")await message();
+ if(kind==="refused")await recordIntakeHumanCommand(await command("refuse"));
+ if(kind==="nonadmin")await db.db.update(staffUsers).set({role:"member"});
+ if(kind==="historical")await db.db.update(savMessages).set({receivedAt:new Date(0)}).where(eq(savMessages.id,messageId));
+ await expect(requestIntakeReinvestigation({threadId,messageId,reason:"Synthetic bounded operator recovery request."})).rejects.toThrow();
+ expect((await db.db.select().from(savIntakeRuns))).toHaveLength(1);expect(mutationsSent()).toHaveLength(0);
+});
+
+it("recovery runs a fresh budgeted analysis and retains no-send across the next operator choice",async()=>{
+ await observed();for(const [key,value]of Object.entries(environment))if(value!==undefined)vi.stubEnv(key,value);
+ await db.db.update(savIntakeRuns).set({attempts:2,state:"waiting"}).where(eq(savIntakeRuns.id,runId));
+ stubRecoveryModel();
+ const requested=await requestIntakeReinvestigation({threadId,messageId,reason:"Synthetic post-correction explicit operator investigation."});
+ expect(await consumeIntakeHumanEvent(requested.eventId,options.runtime,createSavIntakeHubspotReaders({network:p.network}))).toHaveProperty("state","observed");
+ let current=(await readSavIntakeCurrent(threadId,options.runtime))!;
+ expect((current.payload.input as {humanResolution:{suppressOutbound:boolean}}).humanResolution.suppressOutbound).toBe(true);
+ expect(await intakeRunConfigurationBound(current,options.runtime)).toBe(true);
+ const calls=await db.db.select().from(savIntakeModelCalls);expect(calls.length).toBeGreaterThan(0);expect(calls.every(c=>c.state==="settled")).toBe(true);
+ const followup=await recordIntakeHumanCommand({...await command("classify"),classification:"support"});
+ expect(await consumeIntakeHumanEvent(followup.eventId,options.runtime,createSavIntakeHubspotReaders({network:p.network}))).toHaveProperty("state","observed");
+ current=(await readSavIntakeCurrent(threadId,options.runtime))!;
+ expect((current.payload.input as {humanResolution:{suppressOutbound:boolean}}).humanResolution.suppressOutbound).toBe(true);
+ expect(await intakeRunConfigurationBound(current,options.runtime)).toBe(true);
+ expect((await db.db.select().from(savIntakeModelCalls))).toHaveLength(calls.length);
+ expect((await db.db.select().from(savIntakeRuns)).reduce((n,r)=>n+r.attempts,0)).toBe(2);expect(mutationsSent()).toHaveLength(0);
+});
+
+function stubRecoveryModel(){
+ vi.stubGlobal("fetch",vi.fn(async(url,init)=>{
+  expect(String(url)).toBe("https://generativelanguage.googleapis.com/v1beta/models/gemini-3.6-flash:generateContent");
+  const data=JSON.parse(JSON.parse(String(init?.body)).contents[0].parts[0].text);
+  const answer=data.tickets?{investigationComplete:true,tickets:data.tickets.map((t:{ticket:{id:string}})=>({ticketId:t.ticket.id,relation:"same",requestIds:["r1"],evidenceIds:["current",`ticket-${t.ticket.id}`,`history-${t.ticket.id}`],grounding:data.citationCatalogue.map((c:{id:string})=>({quoteId:c.id})),rationale:"Synthetic exact coverage"}))}
+   :{messageId,requests:[{id:"r1",kind:"support",currentMessageId:messageId,quoteId:data.citationCatalogue.find((c:{sourceId:string})=>c.sourceId==="current").id}],ticketSummary:{title:"Synthetic connection failure",description:"The synthetic connection fails.",requestIds:["r1"]}};
+  return Response.json({candidates:[{finishReason:"STOP",content:{parts:[{text:JSON.stringify(answer)}]}}],usageMetadata:{promptTokenCount:100,candidatesTokenCount:50,thoughtsTokenCount:0,totalTokenCount:150}});
+ }));
+}
+
+it.each(["valid","old_authority_active","departed","leased","new_admin_inactive"])("recovered unsent execution authority rebinding: %s",async mode=>{
+ await observed();const execution=(await admitIntakeExecution(runId,options))!;
+ const oldPayload=decryptSavPayload<Record<string,unknown>>(execution.payloadCiphertext);
+ await db.db.update(savIntakeExecutions).set({payloadCiphertext:encryptSavPayload({...oldPayload,runtimeConfigHash:"f".repeat(64)})}).where(eq(savIntakeExecutions.id,execution.id));
+ for(const [key,value]of Object.entries(environment))if(value!==undefined)vi.stubEnv(key,value);
+ stubRecoveryModel();const requested=await requestIntakeReinvestigation({threadId,messageId,reason:"Synthetic explicit post-release recovery without outbound permission."});
+ expect(await consumeIntakeHumanEvent(requested.eventId,options.runtime,createSavIntakeHubspotReaders({network:p.network}))).toHaveProperty("state","observed");
+ const current=(await readSavIntakeCurrent(threadId,options.runtime))!;
+ const beforeBudget=await db.db.select().from(savIntakeExecutionBudget),calls=await db.db.select().from(savIntakeModelCalls);
+ const next=await approveIntakeExecutionPolicy(options.policy);
+ if(mode!=="old_authority_active")await db.db.update(savIntakeExecutionPolicies).set({state:"revoked"}).where(eq(savIntakeExecutionPolicies.id,execution.policyId));
+ environment={...environment,SAV_INTAKE_EXECUTION_POLICY_ID:next.id,SAV_INTAKE_EXECUTION_POLICY_SHA256:next.policyHash};
+ options={...options,config:intakeExecutionConfig(environment)!};
+ if(mode==="departed")await db.db.insert(savIntakeEffects).values({id:randomUUID(),executionId:execution.id,businessKey:"synthetic-departure",kind:"ticket_create",permission:"create_ticket",state:"uncertain",intentHash:"a".repeat(64),intentCiphertext:encryptSavPayload({}),dispatchedAt:new Date()});
+ if(mode==="leased")await db.db.update(savIntakeExecutions).set({leaseUntil:new Date(Date.now()+60000)}).where(eq(savIntakeExecutions.id,execution.id));
+ if(mode==="new_admin_inactive")await db.db.update(staffUsers).set({active:false});
+ if(mode!=="valid"){
+  await expect(admitIntakeExecution(current.id,options)).rejects.toThrow("RECOVERY_AUTHORITY_REBIND_REFUSED");
+  expect((await db.db.select().from(savIntakeExecutions))[0].policyId).toBe(execution.policyId);expect(mutationsSent()).toHaveLength(0);
+ }else{
+  expect((await reconcileIntakeExecutor({env:()=>environment,adapters:options.adapters}))).toHaveProperty("state","confirmed");
+  const rebound=(await db.db.select().from(savIntakeExecutions).where(eq(savIntakeExecutions.id,execution.id)))[0];expect(rebound.id).toBe(execution.id);expect(rebound.policyId).toBe(next.id);
+  expect(decryptSavPayload<{runtimeConfigHash:string}>(rebound.payloadCiphertext).runtimeConfigHash).toBe(options.runtime.configHash);
+  expect(rebound.state).toBe("confirmed");
+  expect(p.calls.filter(c=>c.path==="/crm/v3/objects/tickets"&&c.method==="POST")).toHaveLength(1);expect(p.calls.filter(c=>c.path==="gmail/messages/send")).toHaveLength(0);
+ }
+ expect(await db.db.select().from(savIntakeExecutionBudget)).toEqual(beforeBudget);expect(await db.db.select().from(savIntakeModelCalls)).toEqual(calls);
 });

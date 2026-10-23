@@ -1,4 +1,5 @@
 import { expect, test } from "@playwright/test";
+import { submitServerAction } from "../helpers/server-action";
 
 async function login(page: import("@playwright/test").Page) {
   await page.goto("/studio");
@@ -74,7 +75,7 @@ async function createPublishedOnboarding(page: import("@playwright/test").Page, 
 }
 
 test("une base publiée vide retourne immédiatement kb_empty", async ({ request }) => {
-  const response = await request.post("/api/internal/knowledge/search", {
+  const response = await request.post("/api/internal/knowledge/search", { maxRetries: 1,
     headers: { Authorization: "Bearer e2e-service-token-that-is-at-least-32-characters" },
     data: { query: "Question sans contenu publié", path: "/", locale: "fr-FR", limit: 5 },
   });
@@ -94,7 +95,7 @@ test("workflow complet, recherche Charly, rollback et archivage",async({page,req
   await expect(page.getByText("Publié",{exact:true}).first()).toBeVisible();
   await enableAiForTitle(page,"Connecter Gmail E2E");
 
-  const search=await request.post("/api/internal/knowledge/search",{headers:{Authorization:"Bearer e2e-service-token-that-is-at-least-32-characters"},data:{query:"Comment connecter Gmail ?",path:"/integrations",locale:"fr-FR",contentTypes:["article"],limit:5}});
+  const search=await request.post("/api/internal/knowledge/search",{maxRetries:1,headers:{Authorization:"Bearer e2e-service-token-that-is-at-least-32-characters"},data:{query:"Comment connecter Gmail ?",path:"/integrations",locale:"fr-FR",contentTypes:["article"],limit:5}});
   expect(search.ok()).toBe(true);
   const payload=await search.json();
   expect(payload.revision).toMatch(/^kb_/);
@@ -185,9 +186,10 @@ test("la V0 SAV expose la frontière, les vues et le laboratoire isolé", async 
 
 test("une démonstration extension devient un parcours Charly éditable",async({page,request})=>{
   // This serial journey covers capture, conversion, evaluation and publication.
-  // CI cold training routes alone take 16.5s; the former 30s global deadline
-  // expired during evaluation. Assertion timeouts remain unchanged.
-  test.setTimeout(60_000);
+  // This isolated CI partition cold-compiles training and evaluation routes.
+  // The trace reaches the verified flow after 63s, beyond the old 60s budget.
+  // Keep every assertion and its timeout; allow the complete serial journey.
+  test.setTimeout(120_000);
   await test.step("Capturer et vérifier la démonstration extension",async()=>{
     await login(page);
     await page.goto("/studio/entrainements");
@@ -268,7 +270,8 @@ test("une démonstration extension devient un parcours Charly éditable",async({
   await test.step("Soumettre, publier et vérifier le parcours",async()=>{
     await page.getByRole("button",{name:"Demander la validation"}).click();
     await expect(page.getByRole("button",{name:"Valider et publier"})).toBeVisible();
-    await page.getByRole("button",{name:"Valider et publier"}).click();
+    // Let the publication finish before leaving the page, which would cancel it.
+    await submitServerAction(page, page.getByRole("button",{name:"Valider et publier"}), /name="(?:_?\d+_)?decision"\r?\n\r?\npublish/);
     await page.goto("/studio/entrainements");
     const publishedTraining = page.locator(".training-row").filter({hasText:"Créer une campagne sociale E2E"}).first();
     await expect(publishedTraining.getByText("Nouveau",{exact:true})).toHaveCount(0);
