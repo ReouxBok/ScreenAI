@@ -67,8 +67,8 @@ export async function releaseNeverDispatchedIntakeScopes(mailboxId: string, now 
         .innerJoin(savThreads, eq(savThreads.id, savIntakeExecutions.threadId)).where(and(
             eq(savThreads.mailboxId, mailboxId), inArray(savIntakeExecutions.state, ["pending", "waiting", "running", "uncertain"]),
             or(sql`${savIntakeExecutions.leaseUntil} is null`, lte(savIntakeExecutions.leaseUntil, now)),
-            sql`not exists(select 1 from sav.intake_runs r where r.thread_id=${savIntakeExecutions.threadId} and r.lease_until>${now})`,
-            consoleInstalled ? sql`not exists(select 1 from sav.intake_human_events h where h.thread_id=${savIntakeExecutions.threadId} and h.lease_until>${now})` : undefined,
+            sql`not exists(select 1 from sav.intake_runs r where r.thread_id=${savIntakeExecutions.threadId} and r.lease_until>${now.toISOString()}::timestamptz)`,
+            consoleInstalled ? sql`not exists(select 1 from sav.intake_human_events h where h.thread_id=${savIntakeExecutions.threadId} and h.lease_until>${now.toISOString()}::timestamptz)` : undefined,
             sql`exists(select 1 from sav.intake_occupations o where o.owner_kind='intake' and o.owner_id=${savIntakeExecutions.id})`,
             sql`not exists(select 1 from sav.intake_effects f where f.execution_id=${savIntakeExecutions.id} and ${unsafeEffect})`,
             or(eq(savThreads.aiPaused, true), handledIds.length ? inArray(savIntakeExecutions.messageId, handledIds) : undefined,
@@ -84,9 +84,9 @@ export async function releaseNeverDispatchedIntakeScopes(mailboxId: string, now 
             const [message] = await tx.select().from(savMessages).where(eq(savMessages.id, row.messageId));
             if (!thread || thread.mailboxId !== mailboxId || !message || message.threadId !== row.threadId || message.mailboxId !== mailboxId) return false;
             const [activeRun] = await tx.select({ id: savIntakeRuns.id }).from(savIntakeRuns)
-                .where(and(eq(savIntakeRuns.threadId, row.threadId), sql`${savIntakeRuns.leaseUntil}>${now}`)).limit(1);
+                .where(and(eq(savIntakeRuns.threadId, row.threadId), sql`${savIntakeRuns.leaseUntil}>${now.toISOString()}::timestamptz`)).limit(1);
             const [activeCommand] = consoleInstalled ? await tx.select({ id: savIntakeHumanEvents.id }).from(savIntakeHumanEvents)
-                .where(and(eq(savIntakeHumanEvents.threadId, row.threadId), sql`${savIntakeHumanEvents.leaseUntil}>${now}`)).limit(1) : [];
+                .where(and(eq(savIntakeHumanEvents.threadId, row.threadId), sql`${savIntakeHumanEvents.leaseUntil}>${now.toISOString()}::timestamptz`)).limit(1) : [];
             if (activeRun || activeCommand) return false;
             const external = Boolean(await readSavExternalCompletion(message, tx));
             const refused = await intakeHumanRefused(message.id, tx);
