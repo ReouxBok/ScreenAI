@@ -3,9 +3,11 @@ import { SAV_INTAKE_OPERATIONAL_PROFILE, intakeAdmissionUsage } from "./budget-p
 import { intakeConsoleInstalled } from "./console-capability";
 import { intakeRunConfigurationBound, intakeHumanRefused } from "./human-binding";
 import { randomUUID } from "node:crypto";
+import {canAccessSav} from "../access";
+import {executionPolicySchema} from "./execution-policy";
 import { and, desc, eq, inArray, sql } from "drizzle-orm";
 import { requireDb } from "@/db";
-import { savActions, savThreads, savMessages, savIntakeRuns, savSyncState, savIntakeExecutions, savIntakeEffects, savIntakeEffectJournal, savIntakeOccupations, savIntakeExecutionBudget, savIntakeIdentityEpisodes, savIntakeEffectRevisions } from "@/db/schema";
+import { staffUsers,savIntakeExecutionPolicies,savActions, savThreads, savMessages, savIntakeRuns, savSyncState, savIntakeExecutions, savIntakeEffects, savIntakeEffectJournal, savIntakeOccupations, savIntakeExecutionBudget, savIntakeIdentityEpisodes, savIntakeEffectRevisions } from "@/db/schema";
 import { encryptSavPayload, decryptSavPayload } from "../crypto";
 import { intakeRuntimeHash, assertSavIntakeObservation } from "./runtime-contract";
 import { readSavIntakeCurrent, savIntakeSourceSnapshot } from "./runtime-store";
@@ -112,9 +114,35 @@ export async function admitIntakeExecution(runId: string, options: ExecutionOpti
         await admissionLock(tx);
         const [thread] = await tx.select().from(savThreads).where(eq(savThreads.id, run.threadId)).for("update");
         const [m] = await tx.select().from(savMessages).where(eq(savMessages.id, run.messageId));
-        const [existing] = await tx.select().from(savIntakeExecutions).where(eq(savIntakeExecutions.messageId, run.messageId));
-        if (existing)
-            return existing;
+        const [existing] = await tx.select().from(savIntakeExecutions).where(eq(savIntakeExecutions.messageId, run.messageId)).for("update");
+        if (existing) {
+            if(existing.policyId===options.config.policyId&&existing.policyHash===options.config.policyHash)return existing;
+            const input=current.payload.input as {humanResolution?:{suppressOutbound?:boolean}}|undefined;
+            if(!input?.humanResolution?.suppressOutbound||!run.humanChoiceCiphertext||["confirmed","refused"].includes(existing.state))return existing;
+            const reject=()=>fault("RECOVERY_AUTHORITY_REBIND_REFUSED"),payload=decryptSavPayload<ExecutionPayload>(existing.payloadCiphertext);
+            const [actual]=await tx.select().from(savIntakeRuns).where(eq(savIntakeRuns.id,run.id)).for("update");
+            if(!thread||!m||thread.aiPaused||m.mailboxId!==p.mailboxId||m.createdAt<=new Date(p.createdAfter)||m.receivedAt<=new Date(p.receivedAfter)
+                ||existing.leaseUntil&&existing.leaseUntil>new Date()||!["waiting","pending"].includes(existing.state)
+                ||!actual?.isCurrent||actual.state!=="observed"||actual.payloadCiphertext!==run.payloadCiphertext||actual.sourceHash!==run.sourceHash
+                ||actual.configHash!==run.configHash||actual.humanChoiceCiphertext!==run.humanChoiceCiphertext
+                ||existing.runId!==run.id||existing.runVersion!==run.version||payload.lastRunId!==run.id||payload.acceptedFingerprint!==plan.fingerprint
+                ||payload.local.sourceHash!==run.sourceHash||intakeRuntimeHash(payload.plan)!==intakeRuntimeHash(plan)
+                ||payload.local.humanChoice!==run.humanChoiceCiphertext||intakeRuntimeHash(payload.input)!==intakeRuntimeHash(current.payload.input))return reject();
+            const effects=await tx.select().from(savIntakeEffects).where(eq(savIntakeEffects.executionId,existing.id)).for("update");
+            if(effects.some(e=>e.state!=="planned"||e.dispatchedAt||e.dispatchToken||e.ackCiphertext||e.confirmedAt))return reject();
+            const authorities=await tx.select().from(savIntakeExecutionPolicies).where(inArray(savIntakeExecutionPolicies.id,[existing.policyId,options.config.policyId])).for("update");
+            const old=authorities.find(a=>a.id===existing.policyId),next=authorities.find(a=>a.id===options.config.policyId);
+            if(old?.state!=="revoked"||old.policyHash!==existing.policyHash||next?.state!=="approved"||next.policyHash!==options.config.policyHash
+                ||intakeRuntimeHash(decryptSavPayload(next.payloadCiphertext))!==options.config.policyHash
+                ||intakeRuntimeHash(executionPolicySchema.parse(p))!==options.config.policyHash
+                ||p.codeRevision!==options.config.codeRevision||p.codeRevision!==options.runtime.codeRevision||Date.parse(p.expiresAt)<=Date.now())return reject();
+            const [administrator]=await tx.select().from(staffUsers).where(eq(staffUsers.id,next.administratorId)).for("update");
+            if(!administrator?.active||!["admin","owner"].includes(administrator.role)||!canAccessSav(administrator.email,administrator.role))return reject();
+            payload.runtimeConfigHash=options.runtime.configHash;
+            const [updated]=await tx.update(savIntakeExecutions).set({policyId:next.id,policyHash:next.policyHash,payloadCiphertext:encryptSavPayload(payload),updatedAt:new Date()}).where(eq(savIntakeExecutions.id,existing.id)).returning();
+            await executionJournal(tx,existing.id,"operator_recovery_authority_rebound",{previousPolicyId:existing.policyId,policyId:next.id,runId:run.id,neverDispatched:true,admissionCountUnchanged:true,outboundSuppressed:true});
+            return updated;
+        }
         if (!m || m.mailboxId !== p.mailboxId || m.createdAt <= new Date(p.createdAfter) || m.receivedAt <= new Date(p.receivedAfter) || thread.aiPaused)
             return fault("NOT_ADMITTED");
         const [budget] = await tx.select().from(savIntakeExecutionBudget).where(eq(savIntakeExecutionBudget.id, "global")).for("update");

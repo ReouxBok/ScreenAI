@@ -316,7 +316,13 @@ export async function pendingIntakeEffectRecoveries(now = new Date()) {
 }
 export async function scanIntakeExecutionCandidates(options: ExecutionOptions) {
     const key = "sav-intake-execution-scan-v1", db = requireDb(), [cursor] = await db.select().from(savSyncState).where(eq(savSyncState.key, key));
-    const base = and(eq(savIntakeRuns.isCurrent, true), eq(savIntakeRuns.state, "observed"), sql `not exists(select 1 from sav.intake_executions e where e.message_id=${savIntakeRuns.messageId})`, sql `exists(select 1 from sav.threads t where t.id=${savIntakeRuns.threadId} and not t.ai_paused)`);
+    const base = and(eq(savIntakeRuns.isCurrent, true), eq(savIntakeRuns.state, "observed"), sql `(not exists(select 1 from sav.intake_executions e where e.message_id=${savIntakeRuns.messageId})
+        or exists(select 1 from sav.intake_executions e join sav.intake_execution_policies p on p.id=e.policy_id
+          where e.message_id=${savIntakeRuns.messageId} and e.run_id=${savIntakeRuns.id} and e.run_version=${savIntakeRuns.version}
+          and ${savIntakeRuns.humanChoiceCiphertext} is not null and e.state in ('pending','waiting')
+          and (e.lease_until is null or e.lease_until<=now()) and e.policy_id<>${options.config.policyId} and p.state='revoked'
+          and not exists(select 1 from sav.intake_effects f where f.execution_id=e.id and
+            (f.state<>'planned' or f.dispatched_at is not null or f.dispatch_token is not null or f.ack_ciphertext is not null or f.confirmed_at is not null))))`, sql `exists(select 1 from sav.threads t where t.id=${savIntakeRuns.threadId} and not t.ai_paused)`);
     const scanCursor = cursor?.cursor ? JSON.parse(cursor.cursor) as {
         at: string;
         id: string;
