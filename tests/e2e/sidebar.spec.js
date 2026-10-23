@@ -94,7 +94,8 @@ test.describe('Sidebar UI', () => {
     expect(count).toBe(2);
     await expect(page.locator('#quickLinks')).not.toContainText('Nouveautés');
     await expect(page.locator('#quickLinks button')).toHaveCount(0);
-    await expect(page.locator('#quickLinks a[href="https://bienvenue.limova.ai/"]')).toHaveCount(1);
+    await expect(page.locator('#quickLinks a[href^="https://bienvenue.limova.ai/?utm_source=charly&utm_medium=extension"]')).toHaveCount(1);
+    await expect(page.locator('#quickLinks a[data-link-id="academy"]')).toHaveCount(1);
     await page.close();
   });
 
@@ -105,6 +106,25 @@ test.describe('Sidebar UI', () => {
     await expect(page.locator('#consentBanner')).toHaveCount(0);
     await expect(page.locator('text=/cookie/i')).toHaveCount(0);
     await expect(page.locator('#voiceBtn')).toBeVisible();
+    await page.close();
+  });
+
+  test('usage statistics are on by default and can be turned off from the menu', async ({ context, extensionId, serviceWorker }) => {
+    await serviceWorker.evaluate(() => chrome.storage.local.set({ limova_lang: 'fr' }));
+    const page = await context.newPage();
+    await page.goto(`chrome-extension://${extensionId}/src/sidebar/sidebar.html`);
+    await page.waitForFunction(() => document.documentElement.dataset.sidebarReady === 'true');
+    const toggle = page.locator('#usageAnalyticsToggleBtn');
+    await expect(toggle).toHaveAttribute('aria-checked', 'true');
+    await expect(toggle).toHaveAttribute('role', 'switch');
+
+    await page.evaluate(() => document.getElementById('usageAnalyticsToggleBtn').click());
+    await expect(toggle).toHaveAttribute('aria-checked', 'false');
+    await expect(toggle).toContainText('désactivées');
+    const privacy = await page.evaluate(() => chrome.runtime.sendMessage({ type: 'GET_PRIVACY_STATE' }));
+    expect(privacy.usageAnalytics).toBe(false);
+    expect(await serviceWorker.evaluate(() => chrome.storage.local.get('charly_usage_analytics_v1')))
+      .toEqual({ charly_usage_analytics_v1: false });
     await page.close();
   });
 

@@ -61,6 +61,20 @@ describe('sidebar/announcements.js', () => {
       });
     });
 
+    it('tags each link with its id and Charly UTM parameters for the placement', () => {
+      const dom = mod.buildQuickLinksDOM('menu');
+      const webinar = dom.querySelector('a[data-link-id="webinar"]');
+      const url = new URL(webinar.href);
+      expect(url.origin).toBe('https://bienvenue.limova.ai');
+      expect(Object.fromEntries(url.searchParams)).toEqual({
+        utm_source: 'charly',
+        utm_medium: 'extension',
+        utm_campaign: 'quick_link',
+        utm_content: 'menu'
+      });
+      expect(dom.querySelector('a[data-link-id="academy"]').href).toContain('https://academy.limova.ai/');
+    });
+
     it('each item has an icon, label and arrow SVG', () => {
       const dom = mod.buildQuickLinksDOM();
       dom.querySelectorAll('.quick-link-item').forEach(item => {

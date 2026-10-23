@@ -7,6 +7,7 @@ const { NEW_CONVERSATION_NOTE, sessionSchema, turnSchema, toolResultSchema } = r
 const { CharlyAdkOrchestrator } = require('./copilot/orchestrator');
 const { loadPromptBundle } = require('./copilot/prompt');
 const { sanitizeKnowledgeResponse } = require('./copilot/knowledge');
+const { createAnalytics, identityFromAuth, trackedRoute } = require('./analytics');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -43,6 +44,12 @@ const CHARLY_SESSION_SECRET = process.env.CHARLY_SESSION_SECRET;
 const OTP_TTL_MS = 10 * 60_000;
 const SESSION_TTL_MS = 30 * 24 * 60 * 60_000;
 const ACTIVE_USER_CACHE_MS = 5 * 60_000;
+const POSTHOG_API_KEY = process.env.POSTHOG_API_KEY;
+const POSTHOG_HOST = process.env.POSTHOG_HOST || 'https://eu.i.posthog.com';
+// Comma-separated emails or user ids whose usage must not be tracked
+// (opt-out requests handled by support for extensions without the toggle).
+const POSTHOG_BLOCKED_SUBS = process.env.POSTHOG_BLOCKED_SUBS || '';
+const UNINSTALL_REDIRECT_URL = 'https://www.limova.ai/';
 let onboardingTemplateCache = null;
 let onboardingTemplateCacheExpiresAt = 0;
 const memoryContextCache = new Map();
@@ -60,6 +67,13 @@ if (!AUTH_DISABLED && (!RESEND_API_KEY || !RESEND_FROM_EMAIL || !CHARLY_SESSION_
 
 app.disable('x-powered-by');
 app.set('trust proxy', 1);
+app.locals.analytics = createAnalytics({
+  apiKey: POSTHOG_API_KEY,
+  host: POSTHOG_HOST,
+  blocked: POSTHOG_BLOCKED_SUBS,
+  libVersion: require('./package.json').version
+});
+const track = (event, properties) => trackedRoute(() => app.locals.analytics, event, properties);
 app.get('/healthz', (_req, res) => res.json({
   status: 'ok',
   service: 'limova-proxy',
@@ -78,7 +92,7 @@ app.use(cors({
     return callback(Object.assign(new Error('CORS not allowed'), { status: 403 }));
   },
   methods: ['GET', 'POST', 'DELETE', 'OPTIONS'],
-  allowedHeaders: ['Authorization', 'Content-Type']
+  allowedHeaders: ['Authorization', 'Content-Type', 'X-Charly-Analytics']
 }));
 app.use(express.json({ limit: '3mb' }));
 
@@ -92,7 +106,7 @@ const assistantLimiter = rateLimit({
 });
 const eventsLimiter = rateLimit({
   windowMs: 60_000,
-  max: 20,
+  max: 60,
   standardHeaders: true,
   legacyHeaders: false,
   message: { error: 'Too many analytics requests.' }
@@ -334,7 +348,7 @@ async function verifyLegacyLimovaJwt(req) {
 
 async function verifyAssistantAuth(req, res, next) {
   if (AUTH_DISABLED) {
-    req.auth = { sub: 'development-user', memoryUserKey: stableMemoryUserId('development@limova.ai') };
+    req.auth = { sub: 'development-user', email: 'development@limova.ai', memoryUserKey: stableMemoryUserId('development@limova.ai') };
     return next();
   }
   try {
@@ -353,6 +367,7 @@ async function verifyAssistantAuth(req, res, next) {
       }
       req.auth = {
         sub: charlySession.sub,
+        email: normalizeEmail(charlySession.email),
         provider: 'charly-otp',
         memoryUserKey: stableMemoryUserId(charlySession.email)
       };
@@ -390,7 +405,7 @@ app.post('/api/auth/request-otp', otpRequestLimiter, async (req, res) => {
   }
 });
 
-app.post('/api/auth/verify-otp', otpVerifyLimiter, async (req, res) => {
+app.post('/api/auth/verify-otp', otpVerifyLimiter, track('server_signed_in'), async (req, res) => {
   res.set('Cache-Control', 'no-store');
   const payload = verifyOtpChallenge(req.body?.challenge, String(req.body?.code || '').trim());
   if (!payload) return res.status(401).json({ error: 'Code incorrect ou expiré.' });
@@ -399,6 +414,7 @@ app.post('/api/auth/verify-otp', otpVerifyLimiter, async (req, res) => {
     if (!user?.id) return res.status(401).json({ error: 'Code incorrect ou expiré.' });
     const token = issueSessionToken(user);
     activeUserCache.set(String(user.id), { expiresAt: Date.now() + ACTIVE_USER_CACHE_MS });
+    res.locals.analyticsIdentity = identityFromAuth({ sub: String(user.id), email: user.email, provider: 'charly-otp' });
     console.info(JSON.stringify({ type: 'otp_verified', userId: String(user.id) }));
     return res.json({ ok: true, token, expiresIn: Math.floor(SESSION_TTL_MS / 1000) });
   } catch (error) {
@@ -599,7 +615,7 @@ function validateGeminiPayload(body) {
 
 app.get('/', (_req, res) => res.json({ status: 'ok', service: 'limova-proxy' }));
 
-app.get('/api/copilot/bootstrap', verifyAssistantAuth, assistantLimiter, async (req, res) => {
+app.get('/api/copilot/bootstrap', verifyAssistantAuth, track('server_sidebar_bootstrap'), assistantLimiter, async (req, res) => {
   const requestId = crypto.randomUUID();
   const serverOrchestration = Boolean(req.auth.memoryUserKey && memoryAvailable() && app.locals.adkOrchestrator.serverOrchestrationFor(req.auth.memoryUserKey));
   if (!req.auth.memoryUserKey || !memoryAvailable()) {
@@ -640,7 +656,7 @@ app.get('/api/copilot/bootstrap', verifyAssistantAuth, assistantLimiter, async (
   }
 });
 
-app.post('/api/copilot/v2/sessions', verifyAssistantAuth, assistantLimiter, async (req, res) => {
+app.post('/api/copilot/v2/sessions', verifyAssistantAuth, track('server_conversation_started'), assistantLimiter, async (req, res) => {
   const parsed = sessionSchema.safeParse(req.body || {});
   if (!parsed.success) return res.status(400).json({ error: 'Invalid session payload' });
   if (!req.auth.memoryUserKey || !memoryAvailable()) return res.status(503).json({ error: 'Session service unavailable' });
@@ -660,7 +676,7 @@ app.post('/api/copilot/v2/sessions', verifyAssistantAuth, assistantLimiter, asyn
   }
 });
 
-app.post('/api/copilot/v2/turn', verifyAssistantAuth, assistantLimiter, async (req, res) => {
+app.post('/api/copilot/v2/turn', verifyAssistantAuth, track('server_copilot_turn', () => ({ engine: 'adk', channel: 'text' })), assistantLimiter, async (req, res) => {
   const parsed = turnSchema.safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ error: 'Invalid copilot turn' });
   if (!req.auth.memoryUserKey || !memoryAvailable()) return res.status(503).json({ error: 'Server orchestration unavailable' });
@@ -676,6 +692,7 @@ app.post('/api/copilot/v2/turn', verifyAssistantAuth, assistantLimiter, async (r
     delete input.evaluationCode;
     const response = await app.locals.adkOrchestrator.turn(req.auth.memoryUserKey, input, requestId);
     invalidateMemoryContext(req.auth.memoryUserKey);
+    res.locals.analytics = { response_type: response.type, ...(response.call?.name ? { tool: response.call.name } : {}), evaluation: Boolean(evaluationContext) };
     console.info(JSON.stringify({
       type: 'adk_turn', requestId, responseType: response.type, promptRevision: PROMPT_BUNDLE.revision,
       latencyMs: Date.now() - startedAt
@@ -688,15 +705,17 @@ app.post('/api/copilot/v2/turn', verifyAssistantAuth, assistantLimiter, async (r
   }
 });
 
-app.post('/api/copilot/v2/runs/:runId/result', verifyAssistantAuth, assistantLimiter, async (req, res) => {
+app.post('/api/copilot/v2/runs/:runId/result', verifyAssistantAuth, track('server_copilot_tool_result', req => ({ tool_status: String(req.body?.status || 'invalid').slice(0, 20) })), assistantLimiter, async (req, res) => {
   const parsed = toolResultSchema.safeParse(req.body);
   if (!parsed.success || parsed.data.callId.length < 1) return res.status(400).json({ error: 'Invalid tool result' });
   if (!req.auth.memoryUserKey || !memoryAvailable()) return res.status(503).json({ error: 'Server orchestration unavailable' });
   const requestId = crypto.randomUUID();
   const startedAt = Date.now();
   try {
+    const completedTool = app.locals.adkOrchestrator.runs?.get?.(req.params.runId)?.callName;
     const response = await app.locals.adkOrchestrator.resume(req.auth.memoryUserKey, req.params.runId, parsed.data, requestId);
     invalidateMemoryContext(req.auth.memoryUserKey);
+    res.locals.analytics = { response_type: response.type, ...(completedTool ? { tool: completedTool } : {}), ...(response.call?.name ? { next_tool: response.call.name } : {}) };
     console.info(JSON.stringify({
       type: 'adk_run_result', requestId, runId: req.params.runId, responseType: response.type,
       latencyMs: Date.now() - startedAt
@@ -726,13 +745,14 @@ app.post('/api/copilot/profile', verifyAssistantAuth, assistantLimiter, async (r
   try {
     const result = await memoryServiceRequest('/api/internal/memory/profile', { body: { userKey: req.auth.memoryUserKey, profile } });
     if (result?.response.ok) invalidateMemoryContext(req.auth.memoryUserKey);
+    app.locals.analytics.setPerson(req, { first_name: profile.firstName, last_name: profile.lastName });
     return res.status(result?.response.status || 503).json(result?.data || { error: 'Memory unavailable' });
   } catch {
     return res.status(503).json({ error: 'Memory unavailable' });
   }
 });
 
-app.post('/api/copilot/preferences/memory', verifyAssistantAuth, assistantLimiter, async (req, res) => {
+app.post('/api/copilot/preferences/memory', verifyAssistantAuth, track('server_memory_preference_changed', req => ({ enabled: req.body?.enabled === true })), assistantLimiter, async (req, res) => {
   if (!req.auth.memoryUserKey || typeof req.body?.enabled !== 'boolean') return res.status(400).json({ error: 'Invalid preference' });
   try {
     const result = await memoryServiceRequest('/api/internal/memory/preferences', { body: { userKey: req.auth.memoryUserKey, enabled: req.body.enabled } });
@@ -743,7 +763,7 @@ app.post('/api/copilot/preferences/memory', verifyAssistantAuth, assistantLimite
   }
 });
 
-app.post('/api/copilot/forget', verifyAssistantAuth, assistantLimiter, async (req, res) => {
+app.post('/api/copilot/forget', verifyAssistantAuth, track('server_privacy_action', () => ({ action: 'forget' })), assistantLimiter, async (req, res) => {
   const query = String(req.body?.query || '').trim().slice(0, 1_000);
   if (!req.auth.memoryUserKey || query.length < 3) return res.status(400).json({ error: 'Invalid forget request' });
   try {
@@ -755,7 +775,7 @@ app.post('/api/copilot/forget', verifyAssistantAuth, assistantLimiter, async (re
   }
 });
 
-app.get('/api/copilot/export', verifyAssistantAuth, assistantLimiter, async (req, res) => {
+app.get('/api/copilot/export', verifyAssistantAuth, track('server_privacy_action', () => ({ action: 'export' })), assistantLimiter, async (req, res) => {
   if (!req.auth.memoryUserKey) return res.status(503).json({ error: 'Memory unavailable' });
   try {
     const result = await memoryServiceRequest('/api/internal/memory/export', { body: { userKey: req.auth.memoryUserKey }, timeoutMs: 15_000 });
@@ -768,7 +788,7 @@ app.get('/api/copilot/export', verifyAssistantAuth, assistantLimiter, async (req
   }
 });
 
-app.delete('/api/copilot/data', verifyAssistantAuth, assistantLimiter, async (req, res) => {
+app.delete('/api/copilot/data', verifyAssistantAuth, track('server_privacy_action', () => ({ action: 'delete' })), assistantLimiter, async (req, res) => {
   if (!req.auth.memoryUserKey) return res.status(503).json({ error: 'Memory unavailable' });
   try {
     const result = await memoryServiceRequest('/api/internal/memory/data', { method: 'DELETE', body: { userKey: req.auth.memoryUserKey }, timeoutMs: 15_000 });
@@ -779,7 +799,10 @@ app.delete('/api/copilot/data', verifyAssistantAuth, assistantLimiter, async (re
   }
 });
 
-app.post('/api/copilot/voice-turn', verifyAssistantAuth, assistantLimiter, async (req, res) => {
+app.post('/api/copilot/voice-turn', verifyAssistantAuth, track('server_voice_turn', req => ({
+  role: req.body?.role === 'assistant' ? 'assistant' : 'user',
+  ...(typeof req.body?.sessionId === 'string' && /^[0-9a-f-]{36}$/i.test(req.body.sessionId) ? { charly_session_id: req.body.sessionId } : {})
+})), assistantLimiter, async (req, res) => {
   if (!req.auth.memoryUserKey) return res.json({ ok: true, stored: 0, available: false });
   const role = req.body?.role === 'assistant' ? 'assistant' : 'user';
   const text = String(req.body?.text || '').trim().slice(0, 8_000);
@@ -797,7 +820,7 @@ app.post('/api/copilot/voice-turn', verifyAssistantAuth, assistantLimiter, async
   }
 });
 
-app.post('/api/knowledge/search', verifyAssistantAuth, assistantLimiter, async (req, res) => {
+app.post('/api/knowledge/search', verifyAssistantAuth, track('server_knowledge_search'), assistantLimiter, async (req, res) => {
   const requestId = crypto.randomUUID();
   if (!KNOWLEDGE_API_URL || !KNOWLEDGE_SERVICE_TOKEN) {
     return res.status(503).json({ error: 'Knowledge service unavailable', requestId });
@@ -834,6 +857,7 @@ app.post('/api/knowledge/search', verifyAssistantAuth, assistantLimiter, async (
         verifiedAt: null
       }];
     }
+    res.locals.analytics = { result_count: Array.isArray(data?.results) ? data.results.length : 0 };
     console.info(JSON.stringify({ type: 'knowledge_search', requestId, status: response.status, revision: data?.revision || null, articleIds: Array.isArray(data?.results) ? data.results.map(result => result.id) : [], latencyMs: Date.now() - startedAt }));
     res.set('X-Request-Id', requestId);
     return res.status(response.status).json(data);
@@ -901,8 +925,8 @@ async function handleCopilotTurn(req, res) {
   }
 }
 
-app.post('/api/gemini', verifyAssistantAuth, assistantLimiter, handleCopilotTurn);
-app.post('/api/copilot/turn', verifyAssistantAuth, assistantLimiter, handleCopilotTurn);
+app.post('/api/gemini', verifyAssistantAuth, track('server_copilot_turn', () => ({ engine: 'legacy', channel: 'text' })), assistantLimiter, handleCopilotTurn);
+app.post('/api/copilot/turn', verifyAssistantAuth, track('server_copilot_turn', () => ({ engine: 'legacy', channel: 'text' })), assistantLimiter, handleCopilotTurn);
 
 function openAiLiveTools(evaluationMode) {
   const tool = (name, description, properties = {}, required = []) => ({
@@ -951,7 +975,7 @@ function openAiLiveTools(evaluationMode) {
   ];
 }
 
-app.post('/api/live-token', verifyAssistantAuth, assistantLimiter, async (req, res) => {
+app.post('/api/live-token', verifyAssistantAuth, track('server_voice_session_issued', req => ({ transport: 'gemini_live', training_mode: req.body?.trainingMode === true })), assistantLimiter, async (req, res) => {
   res.set('Cache-Control', 'no-store');
   const requestId = crypto.randomUUID();
   const lang = ['fr', 'en', 'es'].includes(req.body?.lang) ? req.body.lang : 'fr';
@@ -1188,7 +1212,7 @@ app.post('/api/live-token', verifyAssistantAuth, assistantLimiter, async (req, r
   }
 });
 
-app.post('/api/live-session', verifyAssistantAuth, assistantLimiter, async (req, res) => {
+app.post('/api/live-session', verifyAssistantAuth, track('server_voice_session_issued', req => ({ transport: 'openai_realtime', training_mode: req.body?.trainingMode === true })), assistantLimiter, async (req, res) => {
   res.set('Cache-Control', 'no-store');
   const requestId = crypto.randomUUID();
   if (!OPENAI_API_KEY) return res.status(503).json({ error: 'OpenAI voice is not configured', requestId });
@@ -1344,47 +1368,48 @@ app.post('/api/live-session', verifyAssistantAuth, assistantLimiter, async (req,
   }
 });
 
-const ALLOWED_EVENTS = new Set([
+// Extensions up to 2.2.52 posted `{ sid, events }` batches that were only
+// logged. They are still accepted so those clients keep a 200 response.
+const LEGACY_EVENTS = new Set([
   'analytics_consent', 'extension_installed', 'session_start', 'session_reset',
   'user_message', 'api_response', 'api_error', 'step_completed',
   'onboarding_complete', 'onboarding_step', 'page_view', 'dom_action', 'voice_session'
 ]);
-const ALLOWED_EVENT_PROPERTIES = {
-  extension_installed: ['reason'],
-  page_view: ['path'],
-  user_message: ['historyLength'],
-  api_response: ['trigger', 'responseTime'],
-  api_error: ['trigger', 'error'],
-  step_completed: ['step', 'index'],
-  dom_action: ['ok', 'risk'],
-  voice_session: ['state']
-};
 
-function sanitizeEventProperties(event, properties) {
-  const result = {};
-  for (const key of ALLOWED_EVENT_PROPERTIES[event] || []) {
-    const value = properties?.[key];
-    if (typeof value === 'boolean' || (typeof value === 'number' && Number.isFinite(value))) result[key] = value;
-    else if (typeof value === 'string') result[key] = value.replace(/[\r\n]/g, ' ').slice(0, 100);
-  }
-  return result;
+// Analytics may identify the user, but must never reject a request because
+// the session is missing or expired: the event is then kept anonymous.
+function optionalAnalyticsIdentity(req) {
+  const match = /^Bearer\s+(.+)$/i.exec(req.get('authorization') || '');
+  const session = match ? verifySignedToken(match[1], 'session', 'charly-session') : null;
+  return session?.sub ? identityFromAuth({ sub: session.sub, email: session.email, provider: 'charly-otp' }) : null;
 }
 
 app.post('/api/events', eventsLimiter, (req, res) => {
-  const { sid, v, lang, events } = req.body || {};
-  if (typeof sid !== 'string' || sid.length > 100 || !Array.isArray(events) || events.length === 0) {
-    return res.status(400).json({ error: 'Invalid payload' });
+  const { installId, sid, events } = req.body || {};
+  if (!Array.isArray(events) || events.length === 0) return res.status(400).json({ error: 'Invalid payload' });
+  if (typeof installId === 'string') {
+    if (installId.length > 100) return res.status(400).json({ error: 'Invalid payload' });
+    const count = app.locals.analytics.captureClientBatch(req, { installId, events }, optionalAnalyticsIdentity(req));
+    return res.status(202).json({ ok: true, count });
   }
-  const batch = events.slice(0, 50).filter(evt => evt && ALLOWED_EVENTS.has(evt.event));
-  for (const evt of batch) {
-    console.log(JSON.stringify({
-      type: 'analytics', sid, v: String(v || 'unknown').slice(0, 20),
-      lang: String(lang || 'unknown').slice(0, 10), event: evt.event,
-      props: sanitizeEventProperties(evt.event, evt.props),
-      ts: Number(evt.ts) || Date.now(), received: Date.now()
-    }));
-  }
-  return res.json({ ok: true, count: batch.length });
+  if (typeof sid !== 'string' || sid.length > 100) return res.status(400).json({ error: 'Invalid payload' });
+  const count = events.slice(0, 50).filter(evt => evt && LEGACY_EVENTS.has(evt.event)).length;
+  return res.json({ ok: true, count });
+});
+
+// Target of chrome.runtime.setUninstallURL: Chrome opens it in a new tab once
+// the extension is removed, so it must always end on a public page.
+app.get('/api/uninstalled', eventsLimiter, (req, res) => {
+  const installId = String(req.query?.iid || '');
+  const version = String(req.query?.v || '');
+  app.locals.analytics.captureClientBatch(req, {
+    installId,
+    events: [{
+      event: 'extension_uninstalled',
+      properties: /^\d+(?:\.\d+){1,3}$/.test(version) ? { extension_version: version } : {}
+    }]
+  }, null);
+  return res.redirect(302, UNINSTALL_REDIRECT_URL);
 });
 
 app.use((error, _req, res, _next) => {

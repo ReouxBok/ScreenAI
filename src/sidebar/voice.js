@@ -82,8 +82,12 @@ class LimovaVoiceSession {
     }).catch(() => {});
   }
 
-  markBackgroundVoiceState(active) {
-    chrome.runtime.sendMessage({ type: 'VOICE_SESSION_STATE', active, trainingMode: this.trainingMode }).catch(() => {});
+  markBackgroundVoiceState(active, reason = '') {
+    chrome.runtime.sendMessage({ type: 'VOICE_SESSION_STATE', active, reason, trainingMode: this.trainingMode }).catch(() => {});
+  }
+
+  trackEvent(event, properties = {}) {
+    chrome.runtime.sendMessage({ type: 'TRACK_EVENT', event, properties }).catch(() => {});
   }
 
   updatePageContext(pageContext, contextVersion, source = 'navigation', visualCapture = null) {
@@ -217,7 +221,8 @@ class LimovaVoiceSession {
         ? String(error.voiceErrorKey).replace(/([a-z])([A-Z])/g, '$1_$2').toUpperCase()
         : 'VOICE_SESSION_FAILED');
       this.diagnostic(diagnosticCode, { name: error.name, message: error.message });
-      this.stop(false);
+      this.trackEvent('voice_session_failed', { code: diagnosticCode });
+      this.stop(false, 'error');
       this.emit('limova-voice-status', {
         status: 'error',
         error: error.message,
@@ -457,7 +462,7 @@ class LimovaVoiceSession {
           }, 500);
           return;
         }
-        this.stop(false);
+        this.stop(false, event.wasClean ? 'other' : 'error');
         if (wasActive) this.emit('limova-voice-status', { status: event.wasClean ? 'stopped' : 'error' });
       });
     });
@@ -1042,6 +1047,7 @@ class LimovaVoiceSession {
       epoch: this.captureEpoch
     });
     this.diagnostic(nextMuted ? 'VOICE_MICROPHONE_MUTED' : 'VOICE_MICROPHONE_UNMUTED');
+    this.trackEvent('voice_mic_muted', { muted: nextMuted });
     return true;
   }
 
@@ -1059,17 +1065,18 @@ class LimovaVoiceSession {
       await connection;
       if (lifecycleId !== this.lifecycleId) return;
       this.diagnostic('LIVE_WS_RECONNECT_SUCCEEDED');
+      this.trackEvent('voice_reconnected');
     } catch (error) {
       if (lifecycleId !== this.lifecycleId) return;
       this.diagnostic('LIVE_WS_RECONNECT_FAILED', { name: error.name, message: error.message });
-      this.stop(false);
+      this.stop(false, 'reconnect_failed');
       this.emit('limova-voice-status', { status: 'error', error: error.message });
     } finally {
       if (lifecycleId === this.lifecycleId) this.reconnecting = false;
     }
   }
 
-  stop(notify = true) {
+  stop(notify = true, reason = 'user_stop') {
     this.lifecycleId += 1;
     this.starting = false;
     this.cancelSocketSetup?.();
@@ -1081,7 +1088,7 @@ class LimovaVoiceSession {
     this.reconnectAttempts = 0;
     this.tokenData = null;
     this.resumptionHandle = null;
-    this.markBackgroundVoiceState(false);
+    this.markBackgroundVoiceState(false, reason);
     if (socket?.readyState === WebSocket.OPEN) {
       try { socket.send(JSON.stringify({ realtimeInput: { audioStreamEnd: true } })); } catch (_) {}
       socket.close(1000, 'user-stop');

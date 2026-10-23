@@ -4,6 +4,7 @@
 // SECURITY: API keys are stored on the proxy server, never in the extension.
 
 import Logger from './utils/logger.js';
+import { createAnalytics } from './utils/analytics.js';
 import { buildSystemPrompt } from './prompts/system-prompt.js';
 import { searchKB } from './knowledge-base/kb-search.js';
 import { createOnboardingPlan, advanceStep } from './prompts/onboarding-plan.js';
@@ -33,6 +34,23 @@ const VISUAL_CAPTURE_MAX_BASE64_CHARACTERS = 1_500_000;
 const VISUAL_CAPTURE_JPEG_QUALITY = 55;
 const DEFAULT_LANG = (chrome.i18n.getUILanguage() || 'en').split('-')[0].toLowerCase();
 let currentLang = DEFAULT_LANG;
+
+const analytics = createAnalytics({
+  endpoint: `${PROXY_URL}/api/events`,
+  localStorage: chrome.storage.local,
+  sessionStorage: chrome.storage.session,
+  getAccessToken: () => peekProxyAccessToken(),
+  getCommonProperties: () => ({
+    extension_version: chrome.runtime.getManifest().version,
+    lang: currentLang,
+    chrome_version: Number(/Chrome\/(\d+)/.exec(globalThis.navigator?.userAgent || '')?.[1]) || undefined
+  })
+});
+const SIDEBAR_OPENED_AT_KEY = 'charly_analytics_sidebar_opened_at';
+// Messages extension pages may turn into analytics events; every other event
+// is emitted by the service worker itself.
+const SIDEBAR_ANALYTICS_EVENTS = new Set(['sidebar_opened', 'ui_clicked', 'link_clicked', 'voice_session_failed', 'voice_mic_muted', 'voice_reconnected']);
+const UI_CLICK_TARGETS = new Set(['quick_links', 'copy_code', 'logs_download', 'diagnostics', 'language', 'tab_warning', 'next_step_link']);
 
 function codedError(code, message, cause = null) {
   const error = new Error(message);
@@ -260,8 +278,9 @@ const loggerInitializationPromise = Logger.initialize({
 const initializationPromise = loggerInitializationPromise.then(() => Promise.all([
   restoreSession(),
   restoreTrainingState(),
-  // Product analytics was removed. Clear the legacy opt-in flag so an update
-  // cannot silently preserve a data-collection preference that no longer exists.
+  analytics.initialize().then(syncUninstallUrl).catch(() => {}),
+  // The pre-2.2 opt-in flag belonged to a removed analytics implementation;
+  // usage analytics now uses its own opt-out preference.
   chrome.storage.local.remove('limova_analytics_consent').catch(() => {}),
   chrome.storage.local.get('limova_lang').then(result => {
     if (result.limova_lang) currentLang = result.limova_lang;
@@ -271,6 +290,10 @@ const initializationPromise = loggerInitializationPromise.then(() => Promise.all
     if (stored?.token && stored?.run) evaluationState = { active: true, token: stored.token, run: stored.run, testCase: stored.testCase || null, content: stored.content || null };
   }).catch(() => {})
 ]));
+
+Logger.onRecord = entry => {
+  if (entry.level === 'ERROR') analytics.trackError(entry.component, entry.code);
+};
 
 globalThis.addEventListener?.('unhandledrejection', event => {
   Logger.error('service_worker', 'Unhandled promise rejection', event.reason, 'UNHANDLED_REJECTION');
@@ -284,7 +307,108 @@ chrome.runtime.onInstalled.addListener((details) => {
     reason: details?.reason || 'unknown',
     previousVersion: details?.previousVersion || null
   });
+  initializationPromise.then(() => {
+    if (details?.reason === 'install') analytics.track('extension_installed');
+    else if (details?.reason === 'update' && details.previousVersion !== chrome.runtime.getManifest().version) {
+      analytics.track('extension_updated', { previous_version: details.previousVersion || 'unknown' });
+    }
+  });
 });
+
+function syncUninstallUrl() {
+  // Chrome opens this page after removal; an empty URL disables it (opt-out).
+  return Promise.resolve(chrome.runtime.setUninstallURL?.(
+    analytics.uninstallUrl(PROXY_URL, chrome.runtime.getManifest().version)
+  )).catch(() => {});
+}
+
+function classifyLink(value) {
+  let url;
+  try {
+    url = new URL(value);
+  } catch {
+    return null;
+  }
+  if (!/^https?:$/.test(url.protocol)) return null;
+  const host = url.hostname.toLowerCase();
+  const linkId = host === 'bienvenue.limova.ai' ? 'webinar'
+    : host === 'academy.limova.ai' ? 'academy'
+      : host === 'new.limova.ai' ? 'limova_app'
+        : host === 'limova.ai' || host.endsWith('.limova.ai') ? 'limova_other'
+          : 'external';
+  return { link_id: linkId, domain: host.slice(0, 100) };
+}
+
+function trackSidebarEvent(event, properties = {}) {
+  if (!SIDEBAR_ANALYTICS_EVENTS.has(event)) return { ok: false };
+  if (event === 'sidebar_opened') {
+    chrome.storage.session.set({ [SIDEBAR_OPENED_AT_KEY]: Date.now() }).catch(() => {});
+    analytics.track(event, { authenticated: properties.authenticated === true, has_history: properties.has_history === true });
+  } else if (event === 'ui_clicked') {
+    if (UI_CLICK_TARGETS.has(properties.target)) analytics.track(event, { target: properties.target });
+  } else if (event === 'link_clicked') {
+    const link = classifyLink(properties.url);
+    const placement = ['welcome', 'menu', 'chat'].includes(properties.placement) ? properties.placement : 'other';
+    if (link) analytics.track(event, { ...link, placement });
+  } else if (event === 'voice_session_failed') {
+    analytics.track(event, { code: String(properties.code || 'VOICE_SESSION_FAILED').toUpperCase().replace(/[^A-Z0-9_]/g, '_').slice(0, 80) });
+  } else if (event === 'voice_mic_muted') {
+    analytics.track(event, { muted: properties.muted === true });
+  } else if (event === 'voice_reconnected') {
+    countVoiceAnalytics('reconnects');
+  }
+  return { ok: true };
+}
+
+async function trackSidebarClosed() {
+  // The voice socket lives in the panel: closing it always ends the session.
+  trackVoiceSessionState(false, 'panel_closed');
+  const stored = await chrome.storage.session.get(SIDEBAR_OPENED_AT_KEY).catch(() => ({}));
+  const openedAt = Number(stored?.[SIDEBAR_OPENED_AT_KEY]);
+  if (!openedAt) return;
+  await chrome.storage.session.remove(SIDEBAR_OPENED_AT_KEY).catch(() => {});
+  analytics.track('sidebar_closed', { duration_ms: Math.max(0, Date.now() - openedAt) });
+}
+
+// Voice session bookkeeping for the duration and turn counts of
+// voice_session_ended. Kept in session storage across worker restarts.
+const VOICE_ANALYTICS_KEY = 'charly_analytics_voice_session';
+let voiceAnalytics = null;
+
+async function trackVoiceSessionState(active, reason) {
+  if (active) {
+    if (voiceAnalytics) return;
+    voiceAnalytics = { startedAt: Date.now(), userTurns: 0, assistantTurns: 0, toolsUsed: 0, reconnects: 0 };
+    chrome.storage.session.set({ [VOICE_ANALYTICS_KEY]: voiceAnalytics }).catch(() => {});
+    analytics.track('voice_session_started', {
+      training_mode: trainingState.active,
+      page_path: analyticsSafePath(sessionState.lastUrl || '')
+    });
+    return;
+  }
+  if (!voiceAnalytics) {
+    const stored = await chrome.storage.session.get(VOICE_ANALYTICS_KEY).catch(() => ({}));
+    voiceAnalytics = stored?.[VOICE_ANALYTICS_KEY] || null;
+  }
+  if (!voiceAnalytics) return;
+  const session = voiceAnalytics;
+  voiceAnalytics = null;
+  chrome.storage.session.remove(VOICE_ANALYTICS_KEY).catch(() => {});
+  analytics.track('voice_session_ended', {
+    duration_ms: Math.max(0, Date.now() - session.startedAt),
+    end_reason: ['user_stop', 'switched_to_text', 'panel_closed', 'error', 'reconnect_failed', 'reset'].includes(reason) ? reason : 'other',
+    user_turns: session.userTurns,
+    assistant_turns: session.assistantTurns,
+    tools_used: session.toolsUsed,
+    reconnects: session.reconnects
+  });
+}
+
+function countVoiceAnalytics(field) {
+  if (!voiceAnalytics) return;
+  voiceAnalytics[field] += 1;
+  chrome.storage.session.set({ [VOICE_ANALYTICS_KEY]: voiceAnalytics }).catch(() => {});
+}
 
 // ============================================================================
 // URL Change Detection (automatic DOM analysis)
@@ -609,6 +733,7 @@ async function handleMessage(request, sender) {
         extensionVersion: chrome.runtime.getManifest().version,
         auth: await getCharlyAuthState(false),
         copilot: await getCopilotBootstrap(false).catch(() => ({ available: false, enabled: false })),
+        usageAnalytics: analytics.isEnabled(),
         capabilities: { training: true, realEvaluation: true, longTrainingRecording: true, domPopups: true, externalPopupLifecycle: true, charlyOtp: true }
       };
 
@@ -622,9 +747,12 @@ async function handleMessage(request, sender) {
       return verifyCharlyOtp(request.challenge, request.code);
 
     case 'AUTH_LOGOUT':
+      analytics.track('signed_out');
       await clearCharlyAuthSession(false);
       await chrome.storage.local.remove(USER_FIRST_NAME_KEY).catch(() => {});
       handleResetSession();
+      await analytics.reset();
+      syncUninstallUrl();
       return { ok: true, authenticated: false };
 
     case 'LIMOVA_PROFILE':
@@ -647,12 +775,14 @@ async function handleMessage(request, sender) {
       return recordClientDiagnostic(request);
 
     case 'RESET_SESSION':
+      analytics.track('conversation_reset', { history_length: sessionState.conversationHistory.length });
       return handleResetSession();
 
     case 'STOP_AGENT':
       return stopAgent();
 
     case 'HANDOFF_TO_LIMOVA':
+      analytics.track('handoff_to_limova', { channel: 'text' });
       return handoffToLimova(request.text);
 
     case 'SWITCH_TO_LOCKED_TAB':
@@ -662,6 +792,12 @@ async function handleMessage(request, sender) {
       return { ok: true };
 
     case 'DISMISS_ONBOARDING':
+      if (sessionState.onboardingPlan) {
+        analytics.track('onboarding_dismissed', {
+          step_index: sessionState.onboardingPlan.activeIndex,
+          total_steps: sessionState.onboardingPlan.steps.length
+        });
+      }
       sessionState.onboardingPlan = null;
       await chrome.storage.local.set({ limova_onboarding_dismissed: true });
       scheduleSave();
@@ -677,6 +813,7 @@ async function handleMessage(request, sender) {
 
     case 'AI_PROCESSING_CONSENT':
       await chrome.storage.local.set({ [AI_CONSENT_KEY]: !!request.granted });
+      analytics.track('ai_consent_decided', { granted: !!request.granted });
       return { ok: true };
 
     case 'GET_PRIVACY_STATE': {
@@ -686,23 +823,35 @@ async function handleMessage(request, sender) {
         aiProcessing: state[AI_CONSENT_KEY] === true,
         aiProcessingDecided: state[AI_CONSENT_KEY] !== undefined,
         memoryEnabled: memory?.enabled !== false,
-        memoryAvailable: memory?.available === true
+        memoryAvailable: memory?.available === true,
+        usageAnalytics: analytics.isEnabled()
       };
     }
 
+    case 'SET_USAGE_ANALYTICS': {
+      const enabled = await analytics.setEnabled(request.enabled === true);
+      await syncUninstallUrl();
+      return { ok: true, enabled };
+    }
+
+    case 'TRACK_EVENT':
+      return trackSidebarEvent(String(request.event || ''), request.properties || {});
+
     case 'SET_MEMORY_PREFERENCE':
-      return setCopilotMemoryPreference(request.enabled === true);
+      return trackedResult(setCopilotMemoryPreference(request.enabled === true), 'memory_preference_changed', { enabled: request.enabled === true });
 
     case 'EXPORT_COPILOT_DATA':
-      return exportCopilotData();
+      return trackedResult(exportCopilotData(), 'copilot_data_exported');
 
     case 'DELETE_COPILOT_DATA':
-      return deleteCopilotData();
+      return trackedResult(deleteCopilotData(), 'copilot_data_deleted');
 
     case 'CONFIRM_ACTION':
+      analytics.track('action_confirmation', { decision: 'confirmed', risk: pendingActions.get(request.actionId)?.risk });
       return confirmPendingAction(request.actionId);
 
     case 'CANCEL_ACTION':
+      analytics.track('action_confirmation', { decision: 'cancelled', risk: pendingActions.get(request.actionId)?.risk });
       return cancelPendingAction(request.actionId);
 
     case 'GET_LIVE_TOKEN':
@@ -717,8 +866,12 @@ async function handleMessage(request, sender) {
         () => getFreshVoiceContext(null, { capture: request.capture === true, operation: captureVoiceOperation() })
       );
 
-    case 'VOICE_TRANSCRIPT':
+    case 'VOICE_TRANSCRIPT': {
+      const role = request.role === 'assistant' ? 'assistant' : 'user';
+      countVoiceAnalytics(role === 'assistant' ? 'assistantTurns' : 'userTurns');
+      analytics.track('voice_turn', { role });
       return storeVoiceTranscript(request.role, request.text);
+    }
 
     case 'VOICE_ACTION_REQUEST':
       return runEvaluatedVoiceTool(
@@ -741,12 +894,16 @@ async function handleMessage(request, sender) {
         scrollVoicePage(request.direction, request.amount, request.elementId, request.contextVersion)
       );
 
-    case 'VOICE_OPEN_PAGE':
+    case 'VOICE_OPEN_PAGE': {
+      const link = classifyLink(request.url);
+      if (link) analytics.track('link_clicked', { ...link, placement: 'voice' });
       return runEvaluatedVoiceTool('open_page', request.url, () =>
         openPageForUser(request.url, { newTab: request.newTab === true })
       );
+    }
 
     case 'VOICE_CREATE_IN_LIMOVA':
+      analytics.track('handoff_to_limova', { channel: 'voice' });
       return runEvaluatedVoiceTool('create_in_limova', '', () => createInLimovaByVoice(request.request));
 
     case 'VOICE_KB_SEARCH':
@@ -761,6 +918,7 @@ async function handleMessage(request, sender) {
       if (request.active !== true && voiceSessionActive) {
         for (const tabId of [...presenceTabs]) hideAgentPresence(tabId, { stop: true });
       }
+      trackVoiceSessionState(request.active === true, String(request.reason || ''));
       voiceSessionActive = request.active === true;
       if (voiceSessionActive && activeAbortController) activeAbortController.abort();
       if (sessionState.lockedTabId) {
@@ -773,10 +931,10 @@ async function handleMessage(request, sender) {
       return { ok: true };
 
     case 'START_TRAINING':
-      return startTraining(request.token);
+      return trackedResult(startTraining(request.token), 'training_started', { internal_tool: true });
 
     case 'STOP_TRAINING':
-      return stopTraining(request.token);
+      return trackedResult(stopTraining(request.token), 'training_stopped', { internal_tool: true });
 
     case 'CANCEL_TRAINING':
       return cancelTraining();
@@ -788,6 +946,7 @@ async function handleMessage(request, sender) {
       return startEvaluation(request.token);
 
     case 'COMPLETE_EVALUATION':
+      analytics.track('evaluation_completed', { internal_tool: true, verdict: request.verdict === 'correct' ? 'correct' : 'problem' });
       return completeEvaluationRun(request.verdict);
 
     case 'CANCEL_EVALUATION':
@@ -796,6 +955,13 @@ async function handleMessage(request, sender) {
     default:
       return { error: 'Unknown message type' };
   }
+}
+
+// Tracks `event` only when the wrapped operation reports success.
+async function trackedResult(operation, event, properties = {}) {
+  const result = await operation;
+  if (result?.ok) analytics.track(event, properties);
+  return result;
 }
 
 function recordClientDiagnostic(request) {
@@ -1057,19 +1223,22 @@ async function recordEvaluationEvent(event) {
 
 async function runEvaluatedVoiceTool(toolName, targetLabel, operation) {
   const result = await operation();
+  const status = result?.retryWithFreshContext === true
+    ? 'not_found'
+    : result?.status === 'unexpected'
+      ? 'unexpected'
+      : result?.ok
+        ? 'ok'
+        : result?.clarificationRequired
+          ? 'ambiguous'
+          : 'blocked';
+  countVoiceAnalytics('toolsUsed');
+  analytics.track('tool_executed', { tool: toolName, status, channel: 'voice' });
   if (evaluationState.active) {
     await recordEvaluationEvent({
       kind: 'tool_result',
       toolName,
-      status: result?.retryWithFreshContext === true
-        ? 'not_found'
-        : result?.status === 'unexpected'
-        ? 'unexpected'
-        : result?.ok
-          ? 'ok'
-          : result?.clarificationRequired
-            ? 'ambiguous'
-            : 'blocked',
+      status,
       path: sessionState.lastUrl || '',
       targetLabel: String(targetLabel || '').slice(0, 300),
       contextVersion: Number(result?.contextVersion || pageContextVersion || 0)
@@ -1314,6 +1483,12 @@ async function handleUserMessage(text) {
   }
   const tab = await getActiveAssistedTab();
   if (generation !== sessionGeneration) return { ok: true };
+  analytics.track('message_sent', {
+    channel: 'text',
+    history_length: sessionState.conversationHistory.length,
+    page_path: tab?.url ? analyticsSafePath(tab.url) : '',
+    is_limova_page: isLimovaUrl(tab?.url)
+  });
   if (tab && isExternalSiteUrl(tab.url)) await ensureContentScript(tab.id).catch(() => false);
   if (tab && tab.id !== sessionState.lockedTabId) lockTab(tab.id);
   const operationId = Logger.createOperationId('chat');
@@ -1337,6 +1512,7 @@ async function handleUserMessage(text) {
       const publishedTemplate = await getPublishedOnboardingTemplate();
       if (generation !== sessionGeneration) return { ok: true };
       sessionState.onboardingPlan = createOnboardingPlan(publishedTemplate);
+      analytics.track('onboarding_started', onboardingAnalytics(sessionState.onboardingPlan));
       const current = sessionState.onboardingPlan.steps[0];
       broadcastToSidebar({ type: 'STEP_UPDATE', step: current.name, progress: `1 / ${sessionState.onboardingPlan.steps.length}` });
       Logger.log('background', 'Onboarding plan initialized');
@@ -1386,6 +1562,7 @@ async function handleUserMessage(text) {
   } catch (error) {
     if (generation !== sessionGeneration) return { ok: true };
     const code = errorCodeOf(error);
+    analytics.track('assistant_failed', { trigger: 'user_message', error_code: code });
     Logger.error('background', 'User message handling failed', error, code, operationId);
     broadcastToSidebar({ type: 'ERROR', content: `Erreur : ${error.message}`, code });
   }
@@ -1412,6 +1589,7 @@ async function handleTakeScreenshot() {
 
   if (!sessionState.lockedTabId) lockTab(tab.id);
   const operationId = Logger.createOperationId('analysis');
+  analytics.track('page_analysis_requested', { voice_active: voiceSessionActive });
 
   // The camera button is also useful during a Live conversation, but it must
   // never start the legacy text orchestrator in parallel with Gemini Live.
@@ -1465,6 +1643,7 @@ async function handleTakeScreenshot() {
   } catch (error) {
     if (generation !== sessionGeneration) return { ok: true };
     const code = errorCodeOf(error, 'PAGE_ANALYSIS_FAILED');
+    analytics.track('assistant_failed', { trigger: 'page_analysis_button', error_code: code });
     Logger.error('background', 'Page analysis failed', error, code, operationId);
     broadcastToSidebar({ type: 'ERROR', content: `Erreur d’analyse : ${error.message}`, code });
   }
@@ -1483,6 +1662,7 @@ async function handleNextStep() {
   if (!tab) return { ok: false };
 
   const operationId = Logger.createOperationId('next-step');
+  analytics.track('next_step_requested');
   Logger.logTurnStart('next_step', { url: privacySafeUrl(tab.url), hasPageContext: true, operationId });
   broadcastToSidebar({ type: 'STATUS_UPDATE', status: 'analyzing', text: 'Étape suivante...' });
 
@@ -1506,6 +1686,7 @@ async function handleNextStep() {
   } catch (error) {
     if (generation !== sessionGeneration) return { ok: true };
     const code = errorCodeOf(error, 'NEXT_STEP_FAILED');
+    analytics.track('assistant_failed', { trigger: 'next_step', error_code: code });
     Logger.error('background', 'Next step failed', error, code, operationId);
     broadcastToSidebar({ type: 'ERROR', content: error.message, code });
   }
@@ -1711,6 +1892,7 @@ async function executeCopilotTool(call, userMessage, operationId) {
 
 async function sendToCopilotV2({ tab, userMessage, pageContext, operationId, _sessionGeneration: generation = sessionGeneration }) {
   if (generation !== sessionGeneration) return;
+  const startedAt = Date.now();
   if (activeAbortController) activeAbortController.abort();
   const controller = new AbortController();
   activeAbortController = controller;
@@ -1777,6 +1959,7 @@ async function sendToCopilotV2({ tab, userMessage, pageContext, operationId, _se
       if (PAGE_ACTION_TOOLS.has(data.call?.name)) await showAgentPresence(presenceTabId);
       const result = await executeCopilotTool(data.call, userMessage, operationId);
       if (generation !== sessionGeneration) return;
+      analytics.track('tool_executed', { tool: String(data.call?.name || 'unknown'), status: result.status, channel: 'text' });
       if (evaluationState.active) await recordEvaluationEvent({
         kind: 'tool_result',
         toolName: data.call?.name,
@@ -1814,6 +1997,7 @@ async function sendToCopilotV2({ tab, userMessage, pageContext, operationId, _se
   broadcastToSidebar({ type: 'GEMINI_RESPONSE', content, hasPageAnalysis: Boolean(pageContext) });
   broadcastToSidebar({ type: 'STATUS_UPDATE', status: 'ready' });
   Logger.logGeminiResponse(content, { adk: true, actionCount }, operationId);
+  analytics.track('assistant_replied', { engine: 'adk', trigger: 'user_message', duration_ms: Date.now() - startedAt, action_count: actionCount });
   return { ok: true };
 }
 
@@ -2043,6 +2227,12 @@ async function sendToGemini({
     if (cleanResponse.includes('{{STEP_COMPLETE}}')) {
       cleanResponse = cleanResponse.replace(/\{\{STEP_COMPLETE\}\}/g, '').trim();
       if (sessionState.onboardingPlan && validateStepCompletion(sessionState.onboardingPlan, url, pageContext, userMessage)) {
+        const completedPlan = sessionState.onboardingPlan;
+        analytics.track('onboarding_step_completed', {
+          ...onboardingAnalytics(completedPlan),
+          step_id: String(completedPlan.steps[completedPlan.activeIndex]?.id || ''),
+          step_index: completedPlan.activeIndex
+        });
         const result = advanceStep(sessionState.onboardingPlan);
         if (result) {
           sessionState.onboardingPlan = result;
@@ -2051,6 +2241,7 @@ async function sendToGemini({
           broadcastToSidebar({ type: 'STEP_UPDATE', step: current.name, progress: `${result.activeIndex + 1} / ${result.steps.length}` });
         } else {
           Logger.log('background', 'Onboarding: all steps completed');
+          analytics.track('onboarding_completed', onboardingAnalytics(completedPlan));
           sessionState.onboardingPlan = null;
           broadcastToSidebar({ type: 'ONBOARDING_COMPLETE' });
         }
@@ -2095,6 +2286,12 @@ async function sendToGemini({
       highlightCount: highlightCommands.length,
       actionCount: actionCommands.length
     }, operationId);
+    analytics.track('assistant_replied', {
+      engine: 'legacy',
+      trigger,
+      duration_ms: Date.now() - startTime,
+      action_count: actionCommands.length
+    });
 
     broadcastToSidebar({ type: 'GEMINI_RESPONSE', content: cleanResponse, hasPageAnalysis: Boolean(pageContext) });
 
@@ -3215,6 +3412,26 @@ async function getProxyAccessToken(forceRefresh = false) {
   return proxyAccessToken;
 }
 
+// Token for analytics only: never clears or renews the session.
+async function peekProxyAccessToken() {
+  if (proxyAccessToken && Date.now() < proxyAccessTokenExpiresAt) return proxyAccessToken;
+  const stored = await chrome.storage.local.get(CHARLY_AUTH_STORAGE_KEY).catch(() => ({}));
+  const session = stored?.[CHARLY_AUTH_STORAGE_KEY];
+  return typeof session?.token === 'string' && Number(session.expiresAt) > Date.now() ? session.token : null;
+}
+
+// Tells the proxy not to record server-side usage for this user either.
+function analyticsOptOutHeader() {
+  return analytics.isEnabled() ? {} : { 'X-Charly-Analytics': 'off' };
+}
+
+function onboardingAnalytics(plan) {
+  return {
+    total_steps: plan?.steps?.length || 0,
+    revision: String(plan?.revision || plan?.version || 'embedded').slice(0, 100)
+  };
+}
+
 async function clearCharlyAuthSession(notify = true) {
   proxyAccessToken = null;
   proxyAccessTokenExpiresAt = 0;
@@ -3232,18 +3449,23 @@ async function requestCharlyOtp(email) {
     body: JSON.stringify({ email: String(email || '').trim() })
   });
   const data = await response.json().catch(() => ({}));
-  if (!response.ok) throw codedError('AUTH_OTP_REQUEST_FAILED', data.error || 'Impossible d’envoyer le code.');
+  if (!response.ok) {
+    analytics.track('otp_failed', { error_code: 'AUTH_OTP_REQUEST_FAILED' });
+    throw codedError('AUTH_OTP_REQUEST_FAILED', data.error || 'Impossible d’envoyer le code.');
+  }
+  analytics.track('otp_requested');
   return data;
 }
 
 async function verifyCharlyOtp(challenge, code) {
   const response = await fetch(`${PROXY_URL}/api/auth/verify-otp`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: { 'Content-Type': 'application/json', ...analyticsOptOutHeader() },
     body: JSON.stringify({ challenge, code: String(code || '').trim() })
   });
   const data = await response.json().catch(() => ({}));
   if (!response.ok || typeof data.token !== 'string') {
+    analytics.track('otp_failed', { error_code: 'AUTH_OTP_INVALID' });
     throw codedError('AUTH_OTP_INVALID', data.error || 'Code incorrect ou expiré.');
   }
   const expiresAt = Date.now() + Math.max(60, Number(data.expiresIn) || 0) * 1000;
@@ -3251,6 +3473,8 @@ async function verifyCharlyOtp(challenge, code) {
   proxyAccessToken = data.token;
   proxyAccessTokenExpiresAt = expiresAt;
   Logger.event('auth', 'AUTH_OTP_VERIFIED', { expiresInMs: expiresAt - Date.now() });
+  // Sent with the new token: the proxy links this install to the account.
+  analytics.track('signed_in');
   copilotBootstrapCache = null;
   copilotBootstrapCacheExpiresAt = 0;
   return { ok: true, authenticated: true };
@@ -3310,7 +3534,7 @@ async function authorizedProxyFetch(path, options = {}, retry = true) {
   try {
     response = await fetch(`${PROXY_URL}${path}`, {
       ...options,
-      headers: { ...(options.headers || {}), Authorization: `Bearer ${token}` },
+      headers: { ...(options.headers || {}), ...analyticsOptOutHeader(), Authorization: `Bearer ${token}` },
       signal: controller.signal
     });
   } catch (cause) {
@@ -4627,6 +4851,7 @@ async function proposeOrExecuteAction(elementId, userMessage, options = {}) {
       elementId,
       contextVersion: pageContextVersion,
       label: risk.label,
+      risk: risk.level,
       targetDescriptor: element,
       operationId,
       userTurnId: intent.turnId,
@@ -4641,6 +4866,7 @@ async function proposeOrExecuteAction(elementId, userMessage, options = {}) {
       label: risk.label,
       error: 'Cette action sensible ne peut pas être exécutée automatiquement.'
     };
+    analytics.track('action_executed', { result: 'blocked', risk: risk.level });
     Logger.warn('action', 'Sensitive autonomous action blocked', {
       elementId,
       risk: risk.level
@@ -4663,6 +4889,7 @@ async function proposeOrExecuteAction(elementId, userMessage, options = {}) {
   };
   pendingActions.set(actionId, action);
   Logger.event('action', 'ACTION_CONFIRMATION_REQUESTED', { actionId, elementId, risk: risk.level }, operationId);
+  analytics.track('action_confirmation', { decision: 'requested', risk: risk.level });
   broadcastToSidebar({ type: 'ACTION_PROPOSAL', ...action });
   return { ok: true, status: 'confirmation_requested', actionId };
 }
@@ -4799,6 +5026,11 @@ async function executeElementAction(action) {
     : payload.verificationRequired
       ? 'ACTION_EFFECT_UNVERIFIED'
       : 'ACTION_EXECUTED';
+  analytics.track('action_executed', {
+    result: actionResultCode === 'ACTION_EXECUTED' ? 'executed' : actionResultCode === 'ACTION_EFFECT_UNVERIFIED' ? 'unverified' : 'failed',
+    interaction_mode: result?.interactionMode || '',
+    risk: activeAction.risk || ''
+  });
   Logger.event('action', actionResultCode, {
     elementId: activeAction.elementId,
     requestedElementId: action.elementId,
@@ -4907,7 +5139,10 @@ chrome.runtime.onConnect.addListener((port) => {
     port.onDisconnect.addListener(() => {
       sidebarPorts.delete(port);
       if (sidebarPort === port) sidebarPort = [...sidebarPorts].at(-1) || null;
-      if (sidebarPorts.size === 0) pauseWhileSidebarClosed();
+      if (sidebarPorts.size === 0) {
+        pauseWhileSidebarClosed();
+        trackSidebarClosed();
+      }
     });
   }
 });
@@ -5206,7 +5441,9 @@ async function getVoiceContextTab() {
 
 // Named exports keep critical privacy and policy boundaries directly testable.
 export {
+  analytics,
   analyticsSafePath,
+  classifyLink,
   boundedConversationHistory,
   capturePageAnalysis,
   classifyActionRisk,
