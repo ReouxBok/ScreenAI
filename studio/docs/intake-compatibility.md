@@ -20,7 +20,9 @@ replace its artifact equality checks with `intakeArtifactAuthorized` and
 
 The manifest covers non-test intake sources, their static local dependencies,
 the verifier itself, Next build wiring, dependency locks, resolution settings,
-vendored packages, application SQL migrations and their journal. New intake
+vendored packages, application SQL migrations and their journal. Vercel install
+and source filtering configuration are covered too; `npm ci` preserves the
+committed lockfile during the platform build. New intake
 sources and imports participate automatically. Unresolved imports, unknown
 external packages, unsupported resolution aliases and non-literal dynamic
 imports fail verification. The generated manifest excludes itself to avoid a

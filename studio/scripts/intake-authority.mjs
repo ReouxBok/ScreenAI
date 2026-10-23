@@ -37,6 +37,7 @@ export function collectIntakeAuthoritySources(root = studioRoot) {
   };
   inventory(directory);
   for (const filename of ["scripts/intake-authority.mjs", "next.config.ts", "tsconfig.json", "package.json", "package-lock.json"]) enqueue(filename);
+  for (const filename of ["vercel.json", ".vercelignore"]) if (existsSync(path.join(root, filename))) enqueue(filename);
   // SQL can change uniqueness/receipt guarantees without changing a TS import.
   if (existsSync(path.join(root, "drizzle"))) {
     for (const name of readdirSync(path.join(root, "drizzle"))) if (name.endsWith(".sql")) enqueue(`drizzle/${name}`);

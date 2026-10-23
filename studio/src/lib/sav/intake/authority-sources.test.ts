@@ -12,6 +12,7 @@ function fixture() {
   put("src/permissions.ts", "export const allowed = false;");
   put("scripts/intake-authority.mjs", "// synthetic verifier"); put("next.config.ts", "// synthetic build check");
   for (const file of ["package.json", "package-lock.json", "tsconfig.json"]) put(file, "{}");
+  put("vercel.json", JSON.stringify({ installCommand: "npm ci" })); put(".vercelignore", "test-results/\n");
   put("src/lib/sav/intake/authority-manifest.json", JSON.stringify({ authorityRevision: "sav-intake-authority-fixture.v1", ...collectIntakeAuthoritySources(root) }));
   return put;
 }
@@ -21,9 +22,11 @@ it("verifies the actual covered sources, including verifier and build wiring", (
     expect(actual.sources).toHaveProperty(`src/lib/sav/intake/${name}`);
   expect(Object.hasOwn(actual.sources, "scripts/intake-authority.mjs")).toBe(true);
   expect(Object.hasOwn(actual.sources, "next.config.ts")).toBe(true);
+  expect(Object.hasOwn(actual.sources, "vercel.json")).toBe(true);
+  expect(Object.hasOwn(actual.sources, ".vercelignore")).toBe(true);
   expect(Object.hasOwn(actual.sources, "src/lib/sav/intake/authority-manifest.json")).toBe(false);
 });
-it.each(["src/lib/sav/intake/entry.ts", "src/permissions.ts", "scripts/intake-authority.mjs", "next.config.ts", "package-lock.json", "tsconfig.json"])("detects changed authority source %s", filename => {
+it.each(["src/lib/sav/intake/entry.ts", "src/permissions.ts", "scripts/intake-authority.mjs", "next.config.ts", "package-lock.json", "tsconfig.json", "vercel.json", ".vercelignore"])("detects changed authority source %s", filename => {
   const put = fixture(); expect(() => verifyIntakeAuthoritySources(root)).not.toThrow();
   put(filename, readFileSync(path.join(root!, filename), "utf8") + "\n ");
   expect(() => verifyIntakeAuthoritySources(root)).toThrow(/relever SAV_INTAKE_AUTHORITY_REVISION/);

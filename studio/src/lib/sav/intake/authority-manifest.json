@@ -1,6 +1,7 @@
 {
-  "authorityRevision": "sav-intake-authority-2026-10-23.v8",
+  "authorityRevision": "sav-intake-authority-2026-10-23.v9",
   "sources": {
+    ".vercelignore": "723df9eba002a930981097278a2f6c8e8a0017b5ce64be2a6590d78250b68e2a",
     "drizzle/0000_fancy_jasper_sitwell.sql": "be833e35a613133cef6e4548c9397428ad238a3bcec157ced5bd6663c67d7df3",
     "drizzle/0001_exotic_kabuki.sql": "3a2be31dcd8d81ca331d98b6fc2612887ecbe9dec64f889d8878ba9cd65f6c88",
     "drizzle/0002_supreme_callisto.sql": "211bd0ecf06083fd310700e0c159defda85ecee7408a8dea4ee13c0fa7e68f6c",
@@ -43,7 +44,7 @@
     "next.config.ts": "d11c5d093d10f969fb23a89d8ee2ef38c4e6131cb2b84cb8fec548ef3b03ad6e",
     "package-lock.json": "70aefaa775ea024d899b4e376e57e6ecac9d76ff9973c13622c73eb64738c1ec",
     "package.json": "30d003e1c22a7f57b72952a8d778e9b076130858f09138979e8ba172fb71d014",
-    "scripts/intake-authority.mjs": "8c7761910f0599e9fb1371e2ace75fd12c2c1506a0483632e1eb9dfedbc4a45c",
+    "scripts/intake-authority.mjs": "e83f1313b4ee8c9f6136459ae7b23efe2eb1bbdccb1c7c6978e398761035c640",
     "src/db/client.ts": "7f40d6371ffea100ace3267aff2521efd6941322a780b83ea3ea6b3745338b88",
     "src/db/index.ts": "31b1d1f02badcc657d382c28a068b360f0ca8045ca1bc2c6d6d834eac1cfb482",
     "src/db/schema.ts": "8ee13bc52f982e58071e62972adeb19d34ac33b5f8a20898c484dd80533b13cf",
@@ -203,7 +204,8 @@
     "src/lib/search.ts": "390072b4978e1f0ede867f35ab983dfd2f2da8997891ce81c42a5fdc44c87863",
     "src/lib/training-events.ts": "ba9926cffcc27cd34ccf78941dd95783507fb0687ca05bf69e9b0a05cdeda788",
     "tsconfig.json": "5c51df4c59f4510d8c7dadf07a5c32132228826a3b331da5e286207b4df7ef9c",
-    "vendor/braces-3.0.3-screenai.1.tgz": "facf4eeac83a3c32b971a3bb0a1d5e1707b140f2b4c1f24a12d643072891226c"
+    "vendor/braces-3.0.3-screenai.1.tgz": "facf4eeac83a3c32b971a3bb0a1d5e1707b140f2b4c1f24a12d643072891226c",
+    "vercel.json": "65330d53acd2f699a0314ed7172a9688cccb30d3f410c87ea45da9910b655280"
   },
   "externalModules": [
     "@clerk/nextjs/server",
