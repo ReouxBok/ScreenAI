@@ -3,7 +3,7 @@ import { beforeAll, beforeEach, afterAll, afterEach, it, expect, vi } from "vite
 import { eq, sql } from "drizzle-orm";
 import { createSavTestDb } from "../../../../test/sav-db";
 import { executionProvider } from "../../../../test/sav-intake-execution-provider";
-import { savMailboxes, savThreads, savMessages, staffUsers, savSyncState, savIntakeRuns, savIntakeModelCalls,
+import { auditLogs, savMailboxes, savThreads, savMessages, staffUsers, savSyncState, savIntakeRuns, savIntakeModelCalls,
   savIntakeHumanEvents, savIntakeJournal, savIntakeConsole, savIntakeExecutions, savIntakeEffects, savIntakeExecutionBudget,
   savIntakeExecutionPolicies, savIntakeObservationBindings, savResolutionObservations, savAgentRuns, savDecisions, savActions, savFollowups, savLearningCandidates, savKnowledgeActivations, categories } from "@/db/schema";
 const state = vi.hoisted(() => ({ db: null as unknown, user: null as unknown }));
@@ -16,14 +16,16 @@ import { planSavIntake } from "./engine";
 import { recordAcceptedIntakeSemantics, SAV_INTAKE_SEMANTIC_RECORD_REVISION, type AcceptedIntakeSemantics } from "./semantic-records";
 import { SAV_INTAKE_MODEL_REVISION } from "./model-readers";
 import { createSavIntakeHubspotReaders } from "./hubspot-readers";
-import { enqueueSavIntakeMessage, claimSavIntakeRun, saveSavIntakeResult, readSavIntakeCurrent, catchupSavIntake } from "./runtime-store";
+import { enqueueSavIntakeMessage, claimSavIntakeRun, saveSavIntakeResult, readSavIntakeCurrent, catchupSavIntake, pendingSavIntakeRuns, assertSavIntakeLease } from "./runtime-store";
 import { approveIntakeExecutionPolicy, intakeExecutionConfig, type ExecutionPolicy } from "./execution-policy";
 import { createIntakeExecutorAdapters } from "./execution-adapters";
-import { admitIntakeExecution, claimExecution, ensureExecutionEffect, markEffectDispatched, getExecutionEffects, recordEffectAck } from "./execution-store";
+import { admitIntakeExecution, assertNoLegacyConflict, claimExecution, ensureExecutionEffect, markEffectDispatched, getExecutionEffects, recordEffectAck } from "./execution-store";
 import { executeIntakePass, reconcileIntakeExecutor, readIntakeExecutionProgress, reconcileIntakeEffectsReadOnly } from "./executor";
 import { recordIntakeHumanCommand, type IntakeHumanCommand } from "./human-commands";
 import { consumeIntakeHumanEvent } from "./human-worker";
 import { intakeRunConfigurationBound, intakeRunCandidateContactIds, humanRevisionConfigHash, type HumanEventPayload } from "./human-binding";
+import { releaseLegacyAiPauses } from "./legacy-pause";
+import { SAV_EXTERNAL_COMPLETION, SAV_EXTERNAL_COMPLETION_REVERTED, getSavExternalCompletion } from "../external-completion";
 import { listIntakeConsole, projectIntakeThread, refreshIntakeConsole } from "./console-store";
 import { readIntakeConsoleDetail } from "./console-detail";
 import { ensureIntakeObservations, readIntakeObservationBinding, readIntakeLearningQualification, attributeIntakeObservationEvents } from "./observation-binding";
@@ -44,7 +46,7 @@ import { reviewSavProposal } from "../review";
 import { previewIntakeLaunch, commitIntakeLaunch } from "./launch-admin";
 import { previewLaunchAction, commitLaunchAction, revokeLaunchAction } from "@/app/studio/sav/intake/launch/actions";
 import { POST as adminPost } from "@/app/api/sav/intake-admin/route";
-import { getSavThreadDetail, processStoredSavMessage, processPendingSavMessages } from "../service";
+import { getSavThreadDetail, processStoredSavMessage, processPendingSavMessages, requestHumanIntervention } from "../service";
 import { enqueueConfiguredSavIntake, reconcileSavIntakeRuntime } from "./runtime";
 import { saveIntakeChoice } from "@/app/studio/sav/intake/actions";
 import {requestIntakeReinvestigation} from "./operator-recovery";
@@ -796,4 +798,137 @@ it.each(["valid","old_authority_active","departed","leased","new_admin_inactive"
   expect(p.calls.filter(c=>c.path==="/crm/v3/objects/tickets"&&c.method==="POST")).toHaveLength(1);expect(p.calls.filter(c=>c.path==="gmail/messages/send")).toHaveLength(0);
  }
  expect(await db.db.select().from(savIntakeExecutionBudget)).toEqual(beforeBudget);expect(await db.db.select().from(savIntakeModelCalls)).toEqual(calls);
+});
+
+// Human dispositions are local administrative evidence, never an AI outcome.
+async function externalMarker(overrides: Record<string, unknown> = {}, actorEmail = "ugo@limova.ai") {
+  const [m] = await db.db.select().from(savMessages).where(eq(savMessages.id, messageId));
+  return (await db.db.insert(auditLogs).values({ actorEmail, action: SAV_EXTERNAL_COMPLETION, entityType: "sav_message", entityId: m.id,
+    technicalMetadata: { version: 1, threadId, batchId: randomUUID(), receivedBefore: new Date().toISOString(), reason: "processed_outside_studio", ...overrides } }).returning())[0];
+}
+it("a launched human hold is effective locally and never occupies another dossier through legacy work", async () => {
+  await recordIntakeLaunch({ mailboxId, receivedAfter: options.runtime.receivedAfter, createdAfter: options.runtime.createdAfter });
+  await observed();
+  await requestHumanIntervention(threadId, "ugo@limova.ai", "Synthetic local human hold");
+  const [hold] = await db.db.select().from(savActions);
+  expect(hold).toMatchObject({kind:"request_human",actorType:"human",status:"succeeded",payload:{localHold:true}});
+  expect((await db.db.select().from(savThreads).where(eq(savThreads.id,threadId)))[0].aiPaused).toBe(true);
+  expect(await releaseLegacyAiPauses(options.runtime)).toEqual({released:0});
+  await projectIntakeThread(threadId);
+  expect((await listIntakeConsole()).rows[0].status).toBe("paused");
+  await db.db.transaction(tx => assertNoLegacyConflict(tx,["thread:another-synthetic-dossier"]));
+  expect(mutationsSent()).toHaveLength(0);
+});
+it("an unlaunched mailbox keeps the legacy pending human intervention", async () => {
+  await requestHumanIntervention(threadId,"ugo@limova.ai","Synthetic legacy human request");
+  expect((await db.db.select().from(savActions))[0]).toMatchObject({kind:"request_human",status:"pending"});
+});
+it("an exact administrative marker gives one completed list/detail row without AI approval or CRM closure", async () => {
+  await observed(); await externalMarker(); await externalMarker();
+  expect(await getSavExternalCompletion((await db.db.select().from(savMessages))[0])).not.toBeNull();
+  const listed=await listIntakeConsole({view:"completed"}),detail=await readIntakeConsoleDetail(threadId);
+  expect(listed.counts).toMatchObject({completed:1});expect(listed.rows).toHaveLength(1);
+  expect(listed.rows[0]).toMatchObject({messageId,status:"handled_externally",view:"completed"});
+  expect(detail?.projection).toMatchObject({status:"handled_externally",view:"completed"});
+  expect(detail?.confirmedCurrent).toBe(false);
+  expect(await listIntakeConsole()).toMatchObject({total:0});
+  expect(await admitIntakeExecution(runId,options)).toBeNull();
+  expect(await enqueueSavIntakeMessage(messageId,options.runtime)).toBeNull();
+  expect(await catchupSavIntake(options.runtime)).toBe(0);
+  expect(await claimSavIntakeRun(runId,options.runtime)).toBeNull();
+  expect(await pendingSavIntakeRuns(options.runtime)).toHaveLength(0);
+  expect(mutationsSent()).toHaveLength(0);
+});
+it.each(["wrong_actor","wrong_thread","malformed","boundary","revoked"])("rejects %s administrative evidence in both list and detail",async scenario=>{
+  await observed();
+  const overrides=scenario==="wrong_thread"?{threadId:randomUUID()}:scenario==="malformed"?{receivedBefore:"not-a-date"}:scenario==="boundary"?{receivedBefore:"2000-01-01T00:00:00Z"}:{};
+  const event=await externalMarker(overrides,scenario==="wrong_actor"?"other@example.invalid":"ugo@limova.ai");
+  if(scenario==="revoked")await db.db.insert(auditLogs).values({actorEmail:"ugo@limova.ai",action:SAV_EXTERNAL_COMPLETION_REVERTED,entityType:"sav_message",entityId:messageId,technicalMetadata:{version:1,batchId:event.technicalMetadata.batchId,completionId:event.id}});
+  expect((await listIntakeConsole({view:"completed"})).total).toBe(0);
+  expect((await readIntakeConsoleDetail(threadId))?.handledExternally).toBe(false);
+  expect(await admitIntakeExecution(runId,options)).not.toBeNull();
+});
+it("the next real inbound drops the old marker, keeps the human hold, and can resume after a separate release",async()=>{
+  await recordIntakeLaunch({mailboxId,receivedAfter:options.runtime.receivedAfter,createdAfter:options.runtime.createdAfter});
+  await observed();await requestHumanIntervention(threadId,"ugo@limova.ai","Synthetic retained team hold");await externalMarker();
+  expect((await listIntakeConsole({view:"completed"})).total).toBe(1);
+  const incoming=await message(threadId,new Date(Date.now()+10));
+  expect((await listIntakeConsole({view:"completed"})).total).toBe(0);
+  const queued=await enqueueSavIntakeMessage(incoming.id,options.runtime);expect(queued).not.toBeNull();
+  expect(await claimSavIntakeRun(queued!,options.runtime)).toBeNull();
+  // Simulate the separately authorised administrative release; production code never does this.
+  await db.db.update(savThreads).set({aiPaused:false}).where(eq(savThreads.id,threadId));
+  expect(await claimSavIntakeRun(queued!,options.runtime)).not.toBeNull();
+  expect((await db.db.select().from(savActions))[0].payload.localHold).toBe(true);
+});
+it("a marker arriving before the final dispatch fences every provider mutation",async()=>{
+  await observed();const execution=(await admitIntakeExecution(runId,options))!;
+  const result=await executeIntakePass(execution.id,options,{beforeMarker:async()=>{await externalMarker();}});
+  expect(result.state).not.toBe("confirmed");expect(mutationsSent()).toHaveLength(0);
+  expect((await db.db.select().from(savIntakeEffects)).every(effect=>effect.state==="planned"&&!effect.dispatchedAt)).toBe(true);
+  expect((await listIntakeConsole({view:"completed"})).total).toBe(1);
+});
+it("a marker after dispatch intent keeps uncertainty visible and never dispatches after the last live check",async()=>{
+  await observed();const execution=(await admitIntakeExecution(runId,options))!;
+  await executeIntakePass(execution.id,options,{afterMarker:async()=>{await externalMarker();}});
+  expect(mutationsSent()).toHaveLength(0);
+  expect((await db.db.select().from(savIntakeEffects))[0].dispatchedAt).not.toBeNull();
+  expect((await listIntakeConsole({view:"completed"})).total).toBe(0);
+  const detail=await readIntakeConsoleDetail(threadId);
+  expect(detail?.projection.status).toBe("external_completion_pending");expect(detail?.progress?.confirmed).toBe(false);
+});
+it("a genuine pending human command is never hidden by an administrative marker",async()=>{
+  await observed(true);await recordIntakeHumanCommand(await command());await externalMarker();
+  expect((await listIntakeConsole({view:"completed"})).total).toBe(0);
+  expect((await readIntakeConsoleDetail(threadId))?.projection.status).toBe("external_completion_pending");
+  expect(await consumeIntakeHumanEvent((await db.db.select().from(savIntakeHumanEvents))[0].id,options.runtime,createSavIntakeHubspotReaders({network:p.network}))).toMatchObject({skipped:"not_claimed"});
+  expect(mutationsSent()).toHaveLength(0);
+});
+it("a new inbound during administrative projection cannot clear its source epoch",async()=>{
+  await observed();await externalMarker();
+  expect(await projectIntakeThread(threadId,async()=>{await message(threadId,new Date(Date.now()+10));})).toBe(false);
+  expect((await listIntakeConsole({view:"completed"})).total).toBe(0);
+  expect((await listIntakeConsole()).total).toBe(1);
+});
+
+it("a marker fences a queued analysis and one arriving after claim fences its lease",async()=>{
+  const queued=(await enqueueSavIntakeMessage(messageId,options.runtime))!;
+  const marker=await externalMarker();
+  expect(await pendingSavIntakeRuns(options.runtime)).toHaveLength(0);
+  expect(await claimSavIntakeRun(queued,options.runtime)).toBeNull();
+  expect((await db.db.select().from(savIntakeRuns))[0].attempts).toBe(0);
+  await db.db.insert(auditLogs).values({actorEmail:"ugo@limova.ai",action:SAV_EXTERNAL_COMPLETION_REVERTED,entityType:"sav_message",entityId:messageId,technicalMetadata:{version:1,batchId:marker.technicalMetadata.batchId,completionId:marker.id}});
+  const lease=(await claimSavIntakeRun(queued,options.runtime))!;expect(lease).not.toBeNull();
+  await externalMarker();
+  await expect(assertSavIntakeLease(lease,options.runtime)).rejects.toThrow("CONTEXT_CHANGED");
+  expect(mutationsSent()).toHaveLength(0);expect(fetch).not.toHaveBeenCalled();
+});
+
+it.each(["wrong_batch","wrong_actor","malformed"])("an invalid %s revocation cannot resume the marked message",async scenario=>{
+  await observed();const marker=await externalMarker();
+  await db.db.insert(auditLogs).values({actorEmail:scenario==="wrong_actor"?"other@example.invalid":"ugo@limova.ai",action:SAV_EXTERNAL_COMPLETION_REVERTED,entityType:"sav_message",entityId:messageId,
+    technicalMetadata:{version:scenario==="malformed"?9:1,batchId:scenario==="wrong_batch"?randomUUID():marker.technicalMetadata.batchId,completionId:marker.id}});
+  expect((await listIntakeConsole({view:"completed"})).total).toBe(1);
+  expect(await admitIntakeExecution(runId,options)).toBeNull();
+});
+
+it("an unresolved legacy human dispatch stays visible after marking",async()=>{
+  await observed();await externalMarker();
+  await db.db.insert(savActions).values({threadId,messageId,kind:"create_note",actorType:"human",status:"failed",idempotencyKey:randomUUID(),payload:{intakeOccupationDispatchedAt:new Date().toISOString()}});
+  expect((await listIntakeConsole({view:"completed"})).total).toBe(0);
+  expect((await readIntakeConsoleDetail(threadId))?.projection.status).toBe("external_completion_pending");
+});
+
+it("an initial zero-attempt pending or waiting run has no obsolete source; a real changed source stays fenced",async()=>{
+  const queued=(await enqueueSavIntakeMessage(messageId,options.runtime))!;
+  await projectIntakeThread(threadId);
+  expect((await listIntakeConsole()).rows[0].status).toBe("pending");
+  await db.db.update(savIntakeRuns).set({state:"waiting"}).where(eq(savIntakeRuns.id,queued));
+  await projectIntakeThread(threadId);
+  expect((await listIntakeConsole()).rows[0].status).toBe("waiting");
+  await observed();
+  const [m]=await db.db.select().from(savMessages).where(eq(savMessages.id,messageId));
+  await db.db.update(savMessages).set({bodyCiphertext:encryptSavPayload({...decryptSavPayload<{text:string}>(m.bodyCiphertext),text:"A genuinely different synthetic request."})}).where(eq(savMessages.id,messageId));
+  await projectIntakeThread(threadId);
+  expect((await listIntakeConsole()).rows[0].status).toBe("context_changed");
 });

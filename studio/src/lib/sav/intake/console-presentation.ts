@@ -1,4 +1,5 @@
 const statuses: Record<string, string> = {
+  handled_externally: "Traité hors Studio", external_completion_pending: "Traitement externe à vérifier",
   historical_outside_automation: "Historique — hors automatisation",
   processing: "Traitement en cours", pending: "Analyse en attente", analysing: "Analyse en cours", observed: "Analyse prête, actions en attente",
   waiting: "Vérification technique en attente", uncertain: "Résultat externe à rapprocher", running: "Vérification des actions en cours",

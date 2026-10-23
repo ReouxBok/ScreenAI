@@ -1,3 +1,4 @@
+import { readSavExternalCompletion, listSavExternalCompletionMessageIds } from "../external-completion";
 import "server-only";
 import { and, desc, eq, ilike, or, sql } from "drizzle-orm";
 import { requireDb } from "@/db";
@@ -24,6 +25,7 @@ export async function projectIntakeThread(threadId: string, beforePublish?: () =
   const [run] = await db.select().from(savIntakeRuns).where(and(eq(savIntakeRuns.threadId, threadId), eq(savIntakeRuns.isCurrent, true)));
   let result: ConsoleProjection = { view: null, status: "processing", reason: null };
   if (message && await intakeMessageHistorical(message.id)) result = { view: "completed", status: "historical_outside_automation", reason: "Historique — hors automatisation. Le statut HubSpot et les preuves sont conservés." };
+  else if (message && await readSavExternalCompletion(message)) result = { view: null, status: "external_completion_pending", reason: "Traitement externe enregistré ; les commandes et résultats restent à rapprocher avant clôture administrative." };
   else if (thread?.aiPaused) result = { view: null, status: "paused", reason: "Reprise suspendue par l’équipe" };
   else if (!run || run.messageId !== message?.id) result.reason = "Nouvelle entrée en attente d’analyse";
   else {
@@ -34,6 +36,10 @@ export async function projectIntakeThread(threadId: string, beforePublish?: () =
     const local = await db.transaction(async tx => savIntakeSourceSnapshot(tx, message, new Date()));
     if (refused) result = { view: "to_validate", status: "human_refused", reason: "Proposition refusée par un opérateur" };
     else if (pending) result = { view: null, status: "human_revalidation", reason: "Choix enregistré, revalidation en cours" };
+    // An initial queued run has no recorded source to compare yet. Preserve
+    // waiting/pending; a stored source or any plan/result still uses the guards below.
+    else if (!run.sourceHash && run.attempts === 0 && !plan && !progress && ["pending", "waiting"].includes(run.state))
+      result = { view: null, status: run.state, reason: payload.reason ?? "Nouvelle entrée en attente d’analyse" };
     else if (progress?.confirmed && !intakeSourceMatches(local, progress.completionSourceHash)) result = {view:null,status:"context_changed",reason:"Les sources locales ont changé depuis le résultat confirmé"};
     else if (!progress?.confirmed && !intakeSourceMatches(local, run.sourceHash)) result = {view:null,status:"context_changed",reason:"Les sources locales doivent être réinvestiguées"};
     else if (progress?.confirmed && progress.runId === run.id) {
@@ -74,26 +80,35 @@ export async function refreshIntakeConsole(limit = 20) {
   return { refreshed: rows.length };
 }
 const latestMessageJoin = eq(savMessages.id, sql`(select m.id from sav.messages m where m.thread_id=${savIntakeConsole.threadId} and m.direction='inbound' order by m.received_at desc,m.created_at desc,m.id desc limit 1)`);
-const effectiveView = sql<string | null>`case when ${historicalMessageSql()} then 'completed' when ${savIntakeConsole.epoch}=${savIntakeConsole.projectedEpoch} then ${savIntakeConsole.view} else null end`;
+
 export async function listIntakeConsole(options: { mailboxId?: string; view?: SavIntakeView | "processing"; search?: string; page?: number } = {}) {
   if (!await intakeConsoleInstalled()) return { installed: false, counts: {}, rows: [], page: 1, pages: 1, total: 0 };
   const search = (options.search ?? "").trim().slice(0, 120), page = Math.min(10000, Math.max(1, Math.floor(options.page ?? 1)));
   const escaped = search.replace(/[\\%_]/g, value => `\\${value}`);
   const common = and(options.mailboxId ? eq(savIntakeConsole.mailboxId, options.mailboxId) : undefined,
     search ? or(ilike(savMessages.subject, `%${escaped}%`), ilike(savMessages.fromEmail, `%${escaped}%`)) : undefined);
-  const selected = options.view && options.view !== "processing" ? eq(effectiveView, savIntakeViewSchema.parse(options.view)) : sql`${effectiveView} is null`;
+
   // Both statements share one immutable PostgreSQL snapshot and exactly the
   // same mailbox/search cohort. No arbitrary 250-row application filtering.
   return requireDb().transaction(async tx => {
-    const counts = await tx.select({ view: effectiveView, count: sql<number>`count(*)::int` }).from(savIntakeConsole)
-      .leftJoin(savMessages, latestMessageJoin).where(common).groupBy(effectiveView);
+    const completedIds = await listSavExternalCompletionMessageIds(tx, true, options.mailboxId);
+    const markedIds = await listSavExternalCompletionMessageIds(tx, false, options.mailboxId);
+    const completed = completedIds.length ? sql`${savMessages.id} in (${sql.join(completedIds.map(id => sql`${id}::uuid`), sql`, `)})` : sql`false`;
+    const marked = markedIds.length ? sql`${savMessages.id} in (${sql.join(markedIds.map(id => sql`${id}::uuid`), sql`, `)})` : sql`false`;
+    const effectiveView = sql<string | null>`case when ${completed} then 'completed' when ${marked} then null when ${historicalMessageSql()} then 'completed' when ${savIntakeConsole.status}='external_completion_pending' then null when ${savIntakeConsole.epoch}=${savIntakeConsole.projectedEpoch} then ${savIntakeConsole.view} else null end`;
+    const selected = options.view && options.view !== "processing" ? eq(effectiveView, savIntakeViewSchema.parse(options.view)) : sql`${effectiveView} is null`;
+    // Group the derived column, not a repeated parameterised expression: SQL
+    // placeholders in SELECT/GROUP BY otherwise have distinct identities.
+    const cohort = tx.select({ view: effectiveView.as("effective_view") }).from(savIntakeConsole)
+      .leftJoin(savMessages, latestMessageJoin).where(common).as("intake_cohort");
+    const counts = await tx.select({ view: cohort.view, count: sql<number>`count(*)::int` }).from(cohort).groupBy(cohort.view);
     const countMap = Object.fromEntries(counts.map(row => [row.view ?? "processing", row.count]));
     const total = countMap[options.view ?? "processing"] ?? 0, pages = Math.max(1, Math.ceil(total / 25)), currentPage = Math.min(page, pages);
     const rows = await tx.select({ threadId: savIntakeConsole.threadId, mailboxId: savIntakeConsole.mailboxId,
       messageId: savMessages.id, version: savIntakeConsole.version, subject: savMessages.subject,
       fromEmail: savMessages.fromEmail, receivedAt: savMessages.receivedAt, updatedAt: savIntakeConsole.updatedAt,
-      view: effectiveView, status: sql<string>`case when ${historicalMessageSql()} then 'historical_outside_automation' when ${savIntakeConsole.epoch}<>${savIntakeConsole.projectedEpoch} then 'processing' else ${savIntakeConsole.status} end`,
-      reason: sql<string | null>`case when ${historicalMessageSql()} then 'Historique — hors automatisation. Aucun ticket HubSpot fermé par ce classement.' when ${savIntakeConsole.epoch}=${savIntakeConsole.projectedEpoch} then ${savIntakeConsole.reason} else null end`,
+      view: effectiveView, status: sql<string>`case when ${completed} then 'handled_externally' when ${marked} then 'external_completion_pending' when ${savIntakeConsole.status}='external_completion_pending' then 'processing' when ${historicalMessageSql()} then 'historical_outside_automation' when ${savIntakeConsole.epoch}<>${savIntakeConsole.projectedEpoch} then 'processing' else ${savIntakeConsole.status} end`,
+      reason: sql<string | null>`case when ${completed} then 'Traité hors Studio — clôture administrative de ce message. Aucun verdict IA, fermeture HubSpot ou apprentissage terminé ne sont déclarés.' when ${marked} then 'Traitement externe enregistré ; commande humaine ou résultat externe à rapprocher.' when ${savIntakeConsole.status}='external_completion_pending' then null when ${historicalMessageSql()} then 'Historique — hors automatisation. Aucun ticket HubSpot fermé par ce classement.' when ${savIntakeConsole.epoch}=${savIntakeConsole.projectedEpoch} then ${savIntakeConsole.reason} else null end`,
     }).from(savIntakeConsole).leftJoin(savMessages, latestMessageJoin).where(and(common, selected))
       .orderBy(desc(savIntakeConsole.updatedAt), desc(savIntakeConsole.threadId)).limit(25).offset((currentPage - 1) * 25);
     return { installed: true, counts: countMap, rows, page: currentPage, pages, total };

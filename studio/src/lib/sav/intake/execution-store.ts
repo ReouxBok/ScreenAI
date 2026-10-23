@@ -1,3 +1,4 @@
+import { readSavExternalCompletion } from "../external-completion";
 import "server-only";
 import { SAV_INTAKE_OPERATIONAL_PROFILE, intakeAdmissionUsage } from "./budget-profile";
 import { intakeConsoleInstalled } from "./console-capability";
@@ -114,6 +115,7 @@ export async function admitIntakeExecution(runId: string, options: ExecutionOpti
         await admissionLock(tx);
         const [thread] = await tx.select().from(savThreads).where(eq(savThreads.id, run.threadId)).for("update");
         const [m] = await tx.select().from(savMessages).where(eq(savMessages.id, run.messageId));
+        if (m && await readSavExternalCompletion(m, tx)) return null;
         const [existing] = await tx.select().from(savIntakeExecutions).where(eq(savIntakeExecutions.messageId, run.messageId)).for("update");
         if (existing) {
             if(existing.policyId===options.config.policyId&&existing.policyHash===options.config.policyHash)return existing;
@@ -217,6 +219,7 @@ export async function assertExecutionLocal(tx: ExecutionTx, lease: ExecutionLeas
         mailbox: thread.mailboxId, gmail: thread.gmailThreadId, customer: thread.customerEmail
     }) !== lease.payload.local.threadIdentityHash)
         return fault();
+    if (await readSavExternalCompletion(m, tx)) return fault("HANDLED_EXTERNALLY");
     const keys = await tx.select().from(savIntakeOccupations).where(eq(savIntakeOccupations.ownerId, row.id));
     if (lease.payload.keys.some(k => !keys.some(o => o.key === k)))
         return fault("OCCUPATION_LOST");

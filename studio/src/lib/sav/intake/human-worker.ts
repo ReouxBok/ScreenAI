@@ -1,3 +1,4 @@
+import { readSavExternalCompletion } from "../external-completion";
 import "server-only";
 import { intakeInputWithAttachments, prepareIntakeAttachments, finishIntakeAttachmentRead } from "./attachments";
 import { randomUUID } from "node:crypto";
@@ -152,7 +153,7 @@ export async function consumeIntakeHumanEvent(id: string, config: IntakeRuntimeC
     const [parent] = await tx.select().from(savIntakeRuns).where(eq(savIntakeRuns.id, event.parentRunId));
     const [thread] = await tx.select().from(savThreads).where(eq(savThreads.id, event.threadId)).for("update");
     const [message] = await tx.select().from(savMessages).where(eq(savMessages.id, event.messageId));
-    if (!parent?.isCurrent || thread?.aiPaused || !message || !await intakeRunConfigurationBound(parent, config, tx, event.id)
+    if (!parent?.isCurrent || thread?.aiPaused || !message || await readSavExternalCompletion(message, tx) || !await intakeRunConfigurationBound(parent, config, tx, event.id)
       || parent.sourceHash !== event.sourceHash || !intakeSourceMatches(await savIntakeSourceSnapshot(tx, message, now), event.sourceHash)) {
       await tx.update(savIntakeHumanEvents).set({state:"waiting",leaseToken:null,leaseUntil:null}).where(eq(savIntakeHumanEvents.id,id));
       return null;
@@ -216,7 +217,7 @@ export async function consumeIntakeHumanEvent(id: string, config: IntakeRuntimeC
       const [latest] = await tx.select().from(savMessages).where(and(eq(savMessages.threadId, event.threadId), eq(savMessages.direction, "inbound")))
         .orderBy(desc(savMessages.receivedAt), desc(savMessages.createdAt), desc(savMessages.id)).limit(1);
       if (!guard || guard.leaseToken !== token || !guard.leaseUntil || guard.leaseUntil <= new Date() || !current?.isCurrent || thread?.aiPaused
-        || latest?.id !== event.messageId || !intakeSourceMatches(await savIntakeSourceSnapshot(tx, latest, new Date()), event.sourceHash)
+        || latest?.id !== event.messageId || await readSavExternalCompletion(latest, tx) || !intakeSourceMatches(await savIntakeSourceSnapshot(tx, latest, new Date()), event.sourceHash)
         || !await intakeRunConfigurationBound(current, config, tx, event.id)) return conflict();
       const [last] = await tx.select({ version: savIntakeRuns.version }).from(savIntakeRuns).where(eq(savIntakeRuns.threadId, event.threadId)).orderBy(desc(savIntakeRuns.version)).limit(1);
       await tx.update(savIntakeRuns).set({ isCurrent: false, state: "superseded", freshUntil: null, leaseToken: null, leaseUntil: null }).where(eq(savIntakeRuns.id, parent.id));
