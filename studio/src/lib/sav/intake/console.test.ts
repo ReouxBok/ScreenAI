@@ -3,7 +3,7 @@ import { beforeAll, beforeEach, afterAll, afterEach, it, expect, vi } from "vite
 import { eq, sql } from "drizzle-orm";
 import { createSavTestDb } from "../../../../test/sav-db";
 import { executionProvider } from "../../../../test/sav-intake-execution-provider";
-import { savMailboxes, savThreads, savMessages, staffUsers, savSyncState, savIntakeRuns, savIntakeModelCalls,
+import { auditLogs, savMailboxes, savThreads, savMessages, staffUsers, savSyncState, savIntakeRuns, savIntakeModelCalls,
   savIntakeHumanEvents, savIntakeJournal, savIntakeConsole, savIntakeExecutions, savIntakeEffects, savIntakeExecutionBudget,
   savIntakeExecutionPolicies, savIntakeObservationBindings, savResolutionObservations, savAgentRuns, savDecisions, savActions, savFollowups, savLearningCandidates, savKnowledgeActivations, categories } from "@/db/schema";
 const state = vi.hoisted(() => ({ db: null as unknown, user: null as unknown }));
@@ -16,14 +16,17 @@ import { planSavIntake } from "./engine";
 import { recordAcceptedIntakeSemantics, SAV_INTAKE_SEMANTIC_RECORD_REVISION, type AcceptedIntakeSemantics } from "./semantic-records";
 import { SAV_INTAKE_MODEL_REVISION } from "./model-readers";
 import { createSavIntakeHubspotReaders } from "./hubspot-readers";
-import { enqueueSavIntakeMessage, claimSavIntakeRun, saveSavIntakeResult, readSavIntakeCurrent, catchupSavIntake } from "./runtime-store";
+import { enqueueSavIntakeMessage, claimSavIntakeRun, saveSavIntakeResult, readSavIntakeCurrent, catchupSavIntake, pendingSavIntakeRuns, assertSavIntakeLease } from "./runtime-store";
 import { approveIntakeExecutionPolicy, intakeExecutionConfig, type ExecutionPolicy } from "./execution-policy";
 import { createIntakeExecutorAdapters } from "./execution-adapters";
-import { admitIntakeExecution, claimExecution, ensureExecutionEffect, markEffectDispatched, getExecutionEffects, recordEffectAck } from "./execution-store";
+import { admitIntakeExecution, assertNoLegacyConflict, claimExecution, ensureExecutionEffect, markEffectDispatched, getExecutionEffects, recordEffectAck } from "./execution-store";
 import { executeIntakePass, reconcileIntakeExecutor, readIntakeExecutionProgress, reconcileIntakeEffectsReadOnly } from "./executor";
 import { recordIntakeHumanCommand, type IntakeHumanCommand } from "./human-commands";
 import { consumeIntakeHumanEvent } from "./human-worker";
 import { intakeRunConfigurationBound, intakeRunCandidateContactIds, humanRevisionConfigHash, type HumanEventPayload } from "./human-binding";
+import { releaseIntakeHumanHold } from "./human-hold-release";
+import { releaseLegacyAiPauses } from "./legacy-pause";
+import { SAV_EXTERNAL_COMPLETION, SAV_EXTERNAL_COMPLETION_REVERTED, getSavExternalCompletion, revertSavExternalCompletionBatch, markSavDossiersHandledExternally } from "../external-completion";
 import { listIntakeConsole, projectIntakeThread, refreshIntakeConsole } from "./console-store";
 import { readIntakeConsoleDetail } from "./console-detail";
 import { ensureIntakeObservations, readIntakeObservationBinding, readIntakeLearningQualification, attributeIntakeObservationEvents } from "./observation-binding";
@@ -44,7 +47,7 @@ import { reviewSavProposal } from "../review";
 import { previewIntakeLaunch, commitIntakeLaunch } from "./launch-admin";
 import { previewLaunchAction, commitLaunchAction, revokeLaunchAction } from "@/app/studio/sav/intake/launch/actions";
 import { POST as adminPost } from "@/app/api/sav/intake-admin/route";
-import { getSavThreadDetail, processStoredSavMessage, processPendingSavMessages } from "../service";
+import { getSavThreadDetail, processStoredSavMessage, processPendingSavMessages, requestHumanIntervention } from "../service";
 import { enqueueConfiguredSavIntake, reconcileSavIntakeRuntime } from "./runtime";
 import { saveIntakeChoice } from "@/app/studio/sav/intake/actions";
 import {requestIntakeReinvestigation} from "./operator-recovery";
@@ -796,4 +799,240 @@ it.each(["valid","old_authority_active","departed","leased","new_admin_inactive"
   expect(p.calls.filter(c=>c.path==="/crm/v3/objects/tickets"&&c.method==="POST")).toHaveLength(1);expect(p.calls.filter(c=>c.path==="gmail/messages/send")).toHaveLength(0);
  }
  expect(await db.db.select().from(savIntakeExecutionBudget)).toEqual(beforeBudget);expect(await db.db.select().from(savIntakeModelCalls)).toEqual(calls);
+});
+
+// Human dispositions are local administrative evidence, never an AI outcome.
+async function externalMarker(overrides: Record<string, unknown> = {}, actorEmail = "ugo@limova.ai") {
+  const [m] = await db.db.select().from(savMessages).where(eq(savMessages.id, messageId));
+  return (await db.db.insert(auditLogs).values({ actorEmail, action: SAV_EXTERNAL_COMPLETION, entityType: "sav_message", entityId: m.id,
+    technicalMetadata: { version: 1, threadId, batchId: randomUUID(), receivedBefore: new Date().toISOString(), reason: "processed_outside_studio", ...overrides } }).returning())[0];
+}
+it("a launched human hold is effective locally and never occupies another dossier through legacy work", async () => {
+  await recordIntakeLaunch({ mailboxId, receivedAfter: options.runtime.receivedAfter, createdAfter: options.runtime.createdAfter });
+  await observed();
+  await requestHumanIntervention(threadId, "ugo@limova.ai", "Synthetic local human hold");
+  const [hold] = await db.db.select().from(savActions);
+  expect(hold).toMatchObject({kind:"request_human",actorType:"human",status:"succeeded",payload:{localHold:true}});
+  expect((await db.db.select().from(savThreads).where(eq(savThreads.id,threadId)))[0].aiPaused).toBe(true);
+  expect(await releaseLegacyAiPauses(options.runtime)).toEqual({released:0});
+  await projectIntakeThread(threadId);
+  expect((await listIntakeConsole({view:"to_validate"})).rows[0]).toMatchObject({status:"human_hold",view:"to_validate"});
+  const detail=await readIntakeConsoleDetail(threadId);expect(detail?.projection).toMatchObject({status:"human_hold",view:"to_validate"});expect(detail?.thread.paused).toBe(true);expect(detail?.humanHeld).toBe(true);
+  expect((await listIntakeConsole()).total).toBe(0);expect((await listIntakeConsole({view:"completed"})).total).toBe(0);
+  await db.db.transaction(tx => assertNoLegacyConflict(tx,["thread:another-synthetic-dossier"]));
+  expect(mutationsSent()).toHaveLength(0);
+});
+it("an unlaunched mailbox keeps the legacy pending human intervention", async () => {
+  await requestHumanIntervention(threadId,"ugo@limova.ai","Synthetic legacy human request");
+  expect((await db.db.select().from(savActions))[0]).toMatchObject({kind:"request_human",status:"pending"});
+});
+it("an exact administrative marker gives one completed list/detail row without AI approval or CRM closure", async () => {
+  await observed(); await externalMarker(); await externalMarker();
+  expect(await getSavExternalCompletion((await db.db.select().from(savMessages))[0])).not.toBeNull();
+  const listed=await listIntakeConsole({view:"completed"}),detail=await readIntakeConsoleDetail(threadId);
+  expect(listed.counts).toMatchObject({completed:1});expect(listed.rows).toHaveLength(1);
+  expect(listed.rows[0]).toMatchObject({messageId,status:"handled_externally",view:"completed"});
+  expect(detail?.projection).toMatchObject({status:"handled_externally",view:"completed"});
+  expect(detail?.confirmedCurrent).toBe(false);
+  expect(await listIntakeConsole()).toMatchObject({total:0});
+  expect(await admitIntakeExecution(runId,options)).toBeNull();
+  expect(await enqueueSavIntakeMessage(messageId,options.runtime)).toBeNull();
+  expect(await catchupSavIntake(options.runtime)).toBe(0);
+  expect(await claimSavIntakeRun(runId,options.runtime)).toBeNull();
+  expect(await pendingSavIntakeRuns(options.runtime)).toHaveLength(0);
+  expect(mutationsSent()).toHaveLength(0);
+});
+it.each(["wrong_actor","wrong_thread","malformed","boundary","revoked"])("rejects %s administrative evidence in both list and detail",async scenario=>{
+  await observed();
+  const overrides=scenario==="wrong_thread"?{threadId:randomUUID()}:scenario==="malformed"?{receivedBefore:"not-a-date"}:scenario==="boundary"?{receivedBefore:"2000-01-01T00:00:00Z"}:{};
+  const event=await externalMarker(overrides,scenario==="wrong_actor"?"other@example.invalid":"ugo@limova.ai");
+  if(scenario==="revoked")await db.db.insert(auditLogs).values({actorEmail:"ugo@limova.ai",action:SAV_EXTERNAL_COMPLETION_REVERTED,entityType:"sav_message",entityId:messageId,technicalMetadata:{version:1,batchId:event.technicalMetadata.batchId,completionId:event.id}});
+  expect((await listIntakeConsole({view:"completed"})).total).toBe(0);
+  expect((await readIntakeConsoleDetail(threadId))?.handledExternally).toBe(false);
+  expect(await admitIntakeExecution(runId,options)).not.toBeNull();
+});
+it("the next real inbound drops the old marker, keeps the human hold, and can resume after a separate release",async()=>{
+  await recordIntakeLaunch({mailboxId,receivedAfter:options.runtime.receivedAfter,createdAfter:options.runtime.createdAfter});
+  await observed();await requestHumanIntervention(threadId,"ugo@limova.ai","Synthetic retained team hold");await externalMarker();
+  expect((await listIntakeConsole({view:"completed"})).total).toBe(1);
+  const incoming=await message(threadId,new Date(Date.now()+10));
+  expect((await listIntakeConsole({view:"completed"})).total).toBe(0);
+  expect((await listIntakeConsole({view:"to_validate"})).rows[0]).toMatchObject({messageId:incoming.id,status:"human_hold"});
+  expect((await readIntakeConsoleDetail(threadId))?.thread.paused).toBe(true);
+  const queued=await enqueueSavIntakeMessage(incoming.id,options.runtime);expect(queued).not.toBeNull();
+  expect(await claimSavIntakeRun(queued!,options.runtime)).toBeNull();
+  // Simulate the separately authorised administrative release; production code never does this.
+  await db.db.update(savThreads).set({aiPaused:false}).where(eq(savThreads.id,threadId));
+  expect(await claimSavIntakeRun(queued!,options.runtime)).not.toBeNull();
+  expect((await db.db.select().from(savActions))[0].payload.localHold).toBe(true);
+});
+it("a marker arriving before the final dispatch fences every provider mutation",async()=>{
+  await observed();const execution=(await admitIntakeExecution(runId,options))!;
+  const result=await executeIntakePass(execution.id,options,{beforeMarker:async()=>{await externalMarker();}});
+  expect(result.state).not.toBe("confirmed");expect(mutationsSent()).toHaveLength(0);
+  expect((await db.db.select().from(savIntakeEffects)).every(effect=>effect.state==="planned"&&!effect.dispatchedAt)).toBe(true);
+  expect((await listIntakeConsole({view:"completed"})).total).toBe(1);
+});
+it("a marker after dispatch intent keeps uncertainty visible and never dispatches after the last live check",async()=>{
+  await observed();const execution=(await admitIntakeExecution(runId,options))!;
+  await executeIntakePass(execution.id,options,{afterMarker:async()=>{await externalMarker();}});
+  expect(mutationsSent()).toHaveLength(0);
+  expect((await db.db.select().from(savIntakeEffects))[0].dispatchedAt).not.toBeNull();
+  expect((await listIntakeConsole({view:"completed"})).total).toBe(0);
+  const detail=await readIntakeConsoleDetail(threadId);
+  expect(detail?.projection.status).toBe("external_completion_pending");expect(detail?.progress?.confirmed).toBe(false);
+});
+it("a genuine pending human command is never hidden by an administrative marker",async()=>{
+  await observed(true);await recordIntakeHumanCommand(await command());await externalMarker();
+  expect((await listIntakeConsole({view:"completed"})).total).toBe(0);
+  expect((await readIntakeConsoleDetail(threadId))?.projection.status).toBe("external_completion_pending");
+  expect(await consumeIntakeHumanEvent((await db.db.select().from(savIntakeHumanEvents))[0].id,options.runtime,createSavIntakeHubspotReaders({network:p.network}))).toMatchObject({skipped:"not_claimed"});
+  expect(mutationsSent()).toHaveLength(0);
+});
+it("a new inbound during administrative projection cannot clear its source epoch",async()=>{
+  await observed();await externalMarker();
+  expect(await projectIntakeThread(threadId,async()=>{await message(threadId,new Date(Date.now()+10));})).toBe(false);
+  expect((await listIntakeConsole({view:"completed"})).total).toBe(0);
+  expect((await listIntakeConsole()).total).toBe(1);
+});
+
+it("a marker fences a queued analysis and one arriving after claim fences its lease",async()=>{
+  const queued=(await enqueueSavIntakeMessage(messageId,options.runtime))!;
+  const marker=await externalMarker();
+  expect(await pendingSavIntakeRuns(options.runtime)).toHaveLength(0);
+  expect(await claimSavIntakeRun(queued,options.runtime)).toBeNull();
+  expect((await db.db.select().from(savIntakeRuns))[0].attempts).toBe(0);
+  await db.db.insert(auditLogs).values({actorEmail:"ugo@limova.ai",action:SAV_EXTERNAL_COMPLETION_REVERTED,entityType:"sav_message",entityId:messageId,technicalMetadata:{version:1,batchId:marker.technicalMetadata.batchId,completionId:marker.id}});
+  const lease=(await claimSavIntakeRun(queued,options.runtime))!;expect(lease).not.toBeNull();
+  await externalMarker();
+  await expect(assertSavIntakeLease(lease,options.runtime)).rejects.toThrow("CONTEXT_CHANGED");
+  expect(mutationsSent()).toHaveLength(0);expect(fetch).not.toHaveBeenCalled();
+});
+
+it.each(["wrong_batch","wrong_actor","malformed"])("an invalid %s revocation cannot resume the marked message",async scenario=>{
+  await observed();const marker=await externalMarker();
+  await db.db.insert(auditLogs).values({actorEmail:scenario==="wrong_actor"?"other@example.invalid":"ugo@limova.ai",action:SAV_EXTERNAL_COMPLETION_REVERTED,entityType:"sav_message",entityId:messageId,
+    technicalMetadata:{version:scenario==="malformed"?9:1,batchId:scenario==="wrong_batch"?randomUUID():marker.technicalMetadata.batchId,completionId:marker.id}});
+  expect((await listIntakeConsole({view:"completed"})).total).toBe(1);
+  expect(await admitIntakeExecution(runId,options)).toBeNull();
+});
+
+it("an unresolved legacy human dispatch stays visible after marking",async()=>{
+  await observed();await externalMarker();
+  await db.db.insert(savActions).values({threadId,messageId,kind:"create_note",actorType:"human",status:"failed",idempotencyKey:randomUUID(),payload:{intakeOccupationDispatchedAt:new Date().toISOString()}});
+  expect((await listIntakeConsole({view:"completed"})).total).toBe(0);
+  expect((await readIntakeConsoleDetail(threadId))?.projection.status).toBe("external_completion_pending");
+});
+
+it("an initial zero-attempt pending or waiting run has no obsolete source; a real changed source stays fenced",async()=>{
+  const queued=(await enqueueSavIntakeMessage(messageId,options.runtime))!;
+  await projectIntakeThread(threadId);
+  expect((await listIntakeConsole()).rows[0].status).toBe("pending");
+  await db.db.update(savIntakeRuns).set({state:"waiting"}).where(eq(savIntakeRuns.id,queued));
+  await projectIntakeThread(threadId);
+  expect((await listIntakeConsole()).rows[0].status).toBe("waiting");
+  await observed();
+  const [m]=await db.db.select().from(savMessages).where(eq(savMessages.id,messageId));
+  await db.db.update(savMessages).set({bodyCiphertext:encryptSavPayload({...decryptSavPayload<{text:string}>(m.bodyCiphertext),text:"A genuinely different synthetic request."})}).where(eq(savMessages.id,messageId));
+  await projectIntakeThread(threadId);
+  expect((await listIntakeConsole()).rows[0].status).toBe("context_changed");
+});
+
+it.each(["other_message","earlier_audit"])("a %s fake reversal cannot suppress the actual administrative rollback",async scenario=>{
+  vi.stubEnv("SAV_RELEASE_STAGE","v0");vi.stubEnv("SAV_PILOT_MODE","false");
+  await observed();const marker=await externalMarker(),batchId=String(marker.technicalMetadata.batchId);
+  await db.db.insert(auditLogs).values({actorEmail:"ugo@limova.ai",action:SAV_EXTERNAL_COMPLETION_REVERTED,entityType:"sav_message",entityId:scenario==="other_message"?randomUUID():messageId,
+    createdAt:scenario==="earlier_audit"?new Date(marker.createdAt.getTime()-1000):new Date(),technicalMetadata:{version:1,batchId,completionId:marker.id}});
+  expect((await listIntakeConsole({view:"completed"})).total).toBe(1);
+  expect(await revertSavExternalCompletionBatch(batchId,"ugo@limova.ai")).toEqual({reverted:1});
+  expect((await listIntakeConsole({view:"completed"})).total).toBe(0);
+  expect(await revertSavExternalCompletionBatch(batchId,"ugo@limova.ai")).toEqual({reverted:0});
+});
+
+it("mark and rollback dirty the cached projection and restore the actual human choice",async()=>{
+  vi.stubEnv("SAV_RELEASE_STAGE","v0");vi.stubEnv("SAV_PILOT_MODE","false");
+  await activateSavV0Cutover({receivedAfter:new Date(Date.now()-3600000).toISOString(),mailboxEmail:"support@example.invalid",intakeRecipient:"contact@limova.ai",deploymentSha:"a".repeat(40),activatedBy:"ugo@limova.ai"});
+  await observed(true);await projectIntakeThread(threadId);
+  expect((await listIntakeConsole({view:"to_validate"})).total).toBe(1);
+  const before=(await db.db.select().from(savIntakeConsole))[0],batchId=randomUUID();
+  expect(await markSavDossiersHandledExternally({batchId,receivedBefore:new Date().toISOString(),messages:[{threadId,messageId}]},"ugo@limova.ai")).toMatchObject({marked:1});
+  const marked=(await db.db.select().from(savIntakeConsole))[0];expect(marked.epoch).toBeGreaterThan(before.epoch);
+  await projectIntakeThread(threadId);expect((await listIntakeConsole({view:"completed"})).total).toBe(1);
+  const projected=(await db.db.select().from(savIntakeConsole))[0];expect(projected.projectedEpoch).toBe(projected.epoch);
+  expect(await revertSavExternalCompletionBatch(batchId,"ugo@limova.ai")).toEqual({reverted:1});
+  const reverted=(await db.db.select().from(savIntakeConsole))[0];expect(reverted.epoch).toBeGreaterThan(projected.epoch);
+  expect(await refreshIntakeConsole()).toMatchObject({refreshed:1});
+  expect((await listIntakeConsole({view:"to_validate"})).rows[0].status).toBe("human_choice");
+  expect((await readIntakeConsoleDetail(threadId))?.projection).toMatchObject({view:"to_validate",status:"human_choice"});
+  expect((await listIntakeConsole({view:"completed"})).total).toBe(0);
+});
+it("a cancelled earlier human hold stays in validation across inbound and rejects action choices while paused",async()=>{
+  await observed(true);const raw=await command();
+  await db.db.insert(savActions).values({threadId,kind:"request_human",actorType:"human",status:"cancelled",idempotencyKey:randomUUID(),payload:{reason:"Synthetic explicit team hold"}});
+  await db.db.update(savThreads).set({aiPaused:true}).where(eq(savThreads.id,threadId));
+  expect((await listIntakeConsole({view:"to_validate"})).counts).toMatchObject({to_validate:1});
+  const detail=await readIntakeConsoleDetail(threadId);expect(detail?.humanHeld).toBe(true);expect(detail?.thread.paused).toBe(true);
+  await expect(recordIntakeHumanCommand(raw)).rejects.toThrow("CONFLICT");
+  const next=await message(threadId,new Date(Date.now()+10));
+  expect((await listIntakeConsole({view:"to_validate"})).rows[0]).toMatchObject({messageId:next.id,status:"human_hold"});
+  expect((await listIntakeConsole({view:"completed"})).total).toBe(0);
+  expect(await releaseLegacyAiPauses(options.runtime)).toEqual({released:0});expect(mutationsSent()).toHaveLength(0);
+});
+
+async function heldReleaseCommand(beforeHold?:()=>Promise<void>,ambiguous=false) {
+  await recordIntakeLaunch({mailboxId,receivedAfter:options.runtime.receivedAfter,createdAfter:options.runtime.createdAfter});
+  await observed(ambiguous);await beforeHold?.();
+  await requestHumanIntervention(threadId,"ugo@limova.ai","Synthetic explicit team hold");
+  const [projection]=await db.db.select().from(savIntakeConsole).where(eq(savIntakeConsole.threadId,threadId));
+  return {requestKey:randomUUID(),threadId,messageId,expectedEpoch:projection.epoch,reason:"Synthetic administrator reviewed this dossier."};
+}
+it("explicit hold release is local, audited and idempotent without analysis, effects or reset",async()=>{
+  const raw=await heldReleaseCommand(),before=(await db.db.select().from(savIntakeRuns))[0];
+  expect(await releaseIntakeHumanHold(raw)).toEqual({released:true,replayed:false});
+  expect(await releaseIntakeHumanHold(raw)).toEqual({released:false,replayed:true});
+  const [thread]=await db.db.select().from(savThreads).where(eq(savThreads.id,threadId));expect(thread.aiPaused).toBe(false);
+  const after=(await db.db.select().from(savIntakeRuns))[0];expect(after.attempts).toBe(before.attempts);expect(after.payloadCiphertext).toBe(before.payloadCiphertext);
+  expect(await db.db.select().from(savIntakeExecutions)).toHaveLength(0);expect(await db.db.select().from(savIntakeModelCalls)).toHaveLength(0);
+  expect(await db.db.select().from(auditLogs).where(eq(auditLogs.action,"sav_intake_human_hold_released"))).toHaveLength(1);
+  expect(mutationsSent()).toHaveLength(0);expect(fetch).not.toHaveBeenCalled();
+  await expect(releaseIntakeHumanHold({...raw,reason:"Changed replay reason is not the same command."})).rejects.toThrow("CONFLICT");
+  await requestHumanIntervention(threadId,"ugo@limova.ai","A fresh synthetic team hold");
+  await expect(releaseIntakeHumanHold(raw)).rejects.toThrow("CONFLICT");
+  expect((await db.db.select().from(savThreads).where(eq(savThreads.id,threadId)))[0].aiPaused).toBe(true);
+});
+it.each(["new_inbound","marker","stale_epoch","short_reason","no_launch","no_human_hold"])("hold release refuses %s and preserves the pause",async scenario=>{
+  const raw=await heldReleaseCommand();
+  if(scenario==="new_inbound")await message(threadId,new Date(Date.now()+10));
+  if(scenario==="marker")await externalMarker();
+  if(scenario==="stale_epoch")raw.expectedEpoch++;
+  if(scenario==="short_reason")raw.reason="no";
+  if(scenario==="no_launch")await db.client.exec("DELETE FROM sav.sync_state WHERE key LIKE 'sav-intake-launch:%'");
+  if(scenario==="no_human_hold")await db.db.delete(savActions).where(eq(savActions.threadId,threadId));
+  await expect(releaseIntakeHumanHold(raw)).rejects.toThrow();
+  expect((await db.db.select().from(savThreads).where(eq(savThreads.id,threadId)))[0].aiPaused).toBe(true);
+  expect(await db.db.select().from(auditLogs).where(eq(auditLogs.action,"sav_intake_human_hold_released"))).toHaveLength(0);
+  expect(mutationsSent()).toHaveLength(0);
+});
+it.each(["member","inactive","unverified"])("hold release refuses an %s administrator identity",async scenario=>{
+  const raw=await heldReleaseCommand();
+  if(scenario==="unverified") { const [admin]=await db.db.select().from(staffUsers);state.user={id:admin.clerkId,primaryEmailAddress:{emailAddress:admin.email,verification:{status:"unverified"}}}; }
+  else await db.db.update(staffUsers).set(scenario==="member"?{role:"member"}:{active:false});
+  await expect(releaseIntakeHumanHold(raw)).rejects.toThrow("UNAUTHORIZED");
+  expect((await db.db.select().from(savThreads).where(eq(savThreads.id,threadId)))[0].aiPaused).toBe(true);
+});
+it.each(["run_lease","execution_lease","pending_human","uncertain_effect","legacy_intent"])("hold release refuses %s without clearing or replaying it",async scenario=>{
+  const raw=await heldReleaseCommand(async()=>{
+    if(scenario==="pending_human")await recordIntakeHumanCommand(await command());
+    if(scenario==="execution_lease"||scenario==="uncertain_effect") {
+      const execution=(await admitIntakeExecution(runId,options))!;
+      if(scenario==="uncertain_effect")await executeIntakePass(execution.id,options,{afterMarker:async()=>{throw Error("synthetic dispatch result still uncertain");}});
+    }
+    if(scenario==="legacy_intent")await db.db.insert(savActions).values({threadId,messageId,kind:"create_note",actorType:"human",status:"pending",idempotencyKey:randomUUID(),payload:{}});
+  },scenario==="pending_human");
+  if(scenario==="run_lease")await db.db.update(savIntakeRuns).set({leaseToken:randomUUID(),leaseUntil:new Date(Date.now()+60000)}).where(eq(savIntakeRuns.id,runId));
+  if(scenario==="execution_lease")await db.db.update(savIntakeExecutions).set({leaseToken:randomUUID(),leaseUntil:new Date(Date.now()+60000)}).where(eq(savIntakeExecutions.threadId,threadId));
+  raw.expectedEpoch=(await db.db.select().from(savIntakeConsole).where(eq(savIntakeConsole.threadId,threadId)))[0].epoch;
+  await expect(releaseIntakeHumanHold(raw)).rejects.toThrow("CONFLICT");
+  expect((await db.db.select().from(savThreads).where(eq(savThreads.id,threadId)))[0].aiPaused).toBe(true);
+  expect(mutationsSent()).toHaveLength(0);
 });

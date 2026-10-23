@@ -1,3 +1,4 @@
+import { readSavExternalCompletion } from "../external-completion";
 import "server-only";
 import { randomUUID } from "node:crypto";
 import { and, desc, eq, inArray } from "drizzle-orm";
@@ -44,7 +45,7 @@ export async function recordIntakeHumanCommand(raw: unknown) {
       .orderBy(desc(savMessages.receivedAt), desc(savMessages.createdAt), desc(savMessages.id)).limit(1);
     const pending = await tx.select().from(savIntakeHumanEvents).where(and(eq(savIntakeHumanEvents.parentRunId, command.runId), inArray(savIntakeHumanEvents.state, ["pending", "reading"])));
     if (!thread || thread.aiPaused || !run?.isCurrent || run.threadId !== thread.id || run.messageId !== command.messageId
-      || message?.id !== command.messageId || run.version !== command.version || run.sourceHash !== command.sourceHash || pending.length
+      || message?.id !== command.messageId || await readSavExternalCompletion(message, tx) || run.version !== command.version || run.sourceHash !== command.sourceHash || pending.length
       || !intakeSourceMatches(await savIntakeSourceSnapshot(tx, message, new Date()), run.sourceHash) || await intakeHumanRefused(command.messageId, tx)) throw Error("SAV_INTAKE_HUMAN_CONFLICT");
     const payload = decryptSavPayload<IntakeRuntimePayload>(run.payloadCiphertext), candidates = await intakeRunCandidateContactIds(run,payload,tx);
     if(!candidates)throw Error("SAV_INTAKE_HUMAN_CONFLICT");

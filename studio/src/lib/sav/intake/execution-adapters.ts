@@ -11,8 +11,20 @@ const object = (v: unknown) => z.object({
     id: z.string(), properties: z.record(z.string(), z.string().nullable())
 }).parse(v);
 const plain = (s: string) => s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&#39;");
-export const renderIntakeNote = (text: string, marker: string) => `<p>${plain(text).replace(/\n/g, "<br>")}</p><!-- sav-intake:${marker} -->`;
+export const renderIntakeNote = (text: string, marker: string) => `<p>${plain(text).replace(/\n/g, "<br>")}</p><p>[Studio intake: ${plain(marker)}]</p>`;
 const sameProperties = (actual: Record<string, string | null>, expected: Record<string, string>) => Object.entries(expected).every(([k, v]) => k === "hs_timestamp" ? Date.parse(actual[k] ?? "") === Date.parse(v) : actual[k] === v);
+// HubSpot removes this exact historical comment and may append one LF. Do
+// not strip arbitrary HTML or infer ownership from matching business text.
+function sameNoteProperties(actual: Record<string, string | null>, expected: Record<string, string>, allowRemovedMarker: boolean) {
+    const body = expected.hs_note_body, timestamp = expected.hs_timestamp;
+    if (!body || !timestamp || !Number.isFinite(Date.parse(timestamp)) || !Number.isFinite(Date.parse(actual.hs_timestamp ?? "")))
+        return false;
+    const legacy = body.match(/^<p>(?:[^<>&"']|&(?:amp|lt|gt|quot|#39);|<br>)*<\/p>(<!-- sav-intake:[a-f0-9]{64} -->)$/);
+    const stripped = allowRemovedMarker && legacy ? body.slice(0, -legacy[1].length) : null;
+    const observed = actual.hs_note_body;
+    return (observed === body || observed === `${body}\n` || stripped !== null && (observed === stripped || observed === `${stripped}\n`))
+        && sameProperties({ ...actual, hs_note_body: body }, expected);
+}
 // Gmail headers are strings, and inbound bodyText intentionally strips signatures.
 // Verify the single decoded MIME part byte-for-byte instead of that inbound view.
 function oneAddress(header: string) {
@@ -218,7 +230,12 @@ export function createIntakeExecutorAdapters(options: {
             }
             if (intent.kind === "note_associate" || intent.kind === "email_associate") {
                 const type = intent.kind === "note_associate" ? "notes" : "emails", row = await read(type, id(intent.objectId), signal);
-                const ok = sameProperties(row.properties, intent.expectedProperties ?? {}) && await association(type, id(intent.objectId), "tickets", id(intent.ticketId), signal);
+                // The executor binds historical normalization to the confirmed
+                // create effect, never to arbitrary association properties.
+                const confirmedCreate = Boolean(intent.confirmedNoteCreate?.effectId && intent.confirmedNoteCreate.objectId === intent.objectId);
+                const ok = row.id === intent.objectId && (type !== "notes" || !ack?.id || ack.id === intent.objectId) && (type === "notes"
+                    ? sameNoteProperties(row.properties, intent.expectedProperties ?? {}, confirmedCreate)
+                    : sameProperties(row.properties, intent.expectedProperties ?? {})) && await association(type, id(intent.objectId), "tickets", id(intent.ticketId), signal);
                 const p = row.properties, text = type === "notes" ? p.hs_note_body : JSON.stringify({
                     from: p.hs_email_from_email, to: p.hs_email_to_email, direction: p.hs_email_direction, subject: p.hs_email_subject, body: p.hs_email_text
                 });
@@ -265,7 +282,12 @@ export function createIntakeExecutorAdapters(options: {
                 candidate = found.results[0].id;
             }
             const row = await read(type, id(candidate), signal);
-            let ok = row.id === candidate && sameProperties(row.properties, intent.properties ?? {});
+            const noteBody = intent.properties?.hs_note_body;
+            const validNoteIntent = intent.kind !== "note_create" || typeof intent.text === "string" && Boolean(intent.marker?.match(/^[a-f0-9]{64}$/))
+                && (noteBody === renderIntakeNote(intent.text, intent.marker!) || noteBody === `<p>${plain(intent.text).replace(/\n/g, "<br>")}</p><!-- sav-intake:${intent.marker} -->`);
+            let ok = row.id === candidate && validNoteIntent && (type === "notes"
+                ? sameNoteProperties(row.properties, intent.properties ?? {}, Boolean(ack?.id === candidate && ack.operatorCandidate !== true))
+                : sameProperties(row.properties, intent.properties ?? {}));
             if (!ack && !intent.objectId && (!intent.marker || !Object.values(row.properties).some(v => v?.includes(intent.marker!))))
                 ok = false;
             if (type === "tickets")

@@ -1,4 +1,5 @@
-import { historicalMessageSql, intakeMessageHistorical } from "./intake/launch-boundary";
+import { intakeConsoleInstalled } from "./intake/console-capability";
+import { historicalMessageSql, intakeMessageHistorical, readIntakeLaunch } from "./intake/launch-boundary";
 import { enqueueConfiguredSavIntake } from "./intake/runtime";
 import { enqueueSavTranslation } from "./translations";
 import { savResolutionObservations } from "@/db/schema";
@@ -1244,11 +1245,11 @@ export async function requestHumanIntervention(threadId: string, actorEmail: str
   const cleanReason = reason.trim().slice(0, 1_000);
   if (cleanReason.length < 3) throw new Error("HUMAN_REQUEST_REASON_REQUIRED");
   const db = requireDb();
-  const [thread] = await db.select().from(savThreads).where(eq(savThreads.id, threadId)).limit(1);
-  if (!thread) throw new Error("SAV_THREAD_NOT_FOUND");
-  const now = new Date();
-  const dueAt = thread.humanDueAt ?? humanDueAt(now);
   return db.transaction(async (tx) => {
+    const [thread] = await tx.select().from(savThreads).where(eq(savThreads.id, threadId)).for("update");
+    if (!thread) throw new Error("SAV_THREAD_NOT_FOUND");
+    const localHold = await intakeConsoleInstalled(tx) && Boolean(await readIntakeLaunch(thread.mailboxId, tx));
+    const now = new Date(), dueAt = thread.humanDueAt ?? humanDueAt(now);
     await invalidateSavReplies(tx, threadId, "SAV_THREAD_PAUSED", now);
     const [updated] = await tx.update(savThreads).set({
       status: "human_requested",
@@ -1260,9 +1261,10 @@ export async function requestHumanIntervention(threadId: string, actorEmail: str
     await tx.insert(savActions).values({
       threadId,
       kind: "request_human",
-      status: "pending",
-      idempotencyKey: `human:admin-request:${threadId}`,
-      payload: { reason: cleanReason, dueAt: dueAt.toISOString() },
+      // The hold is already effective locally. Intake must never queue a legacy send.
+      status: localHold ? "succeeded" : "pending",
+      idempotencyKey: localHold ? `human:intake-hold:${threadId}` : `human:admin-request:${threadId}`,
+      payload: { reason: cleanReason, dueAt: dueAt.toISOString(), ...(localHold ? { localHold: true } : {}) },
       actorType: "human",
       actorEmail,
     }).onConflictDoNothing();
@@ -1271,7 +1273,7 @@ export async function requestHumanIntervention(threadId: string, actorEmail: str
       action: "sav_human_requested",
       entityType: "sav_thread",
       entityId: threadId,
-      technicalMetadata: { dueAt: dueAt.toISOString() },
+      technicalMetadata: { dueAt: dueAt.toISOString(), localHold },
     });
     return updated;
   });
