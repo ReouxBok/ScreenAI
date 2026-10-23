@@ -56,6 +56,7 @@ const elements = {
   authBack: document.getElementById('authBack'),
   authFeedback: document.getElementById('authFeedback'),
   memoryToggleBtn: document.getElementById('memoryToggleBtn'),
+  usageAnalyticsToggleBtn: document.getElementById('usageAnalyticsToggleBtn'),
   exportDataBtn: document.getElementById('exportDataBtn'),
   deleteDataBtn: document.getElementById('deleteDataBtn'),
 };
@@ -109,6 +110,7 @@ function initEventListeners() {
   elements.resetBtn.addEventListener('click', () => { document.getElementById('headerMenu').hidden = true; resetSession(); });
   document.getElementById('logoutBtn')?.addEventListener('click', logoutCharly);
   elements.memoryToggleBtn?.addEventListener('click', toggleCopilotMemory);
+  elements.usageAnalyticsToggleBtn?.addEventListener('click', toggleUsageAnalytics);
   elements.exportDataBtn?.addEventListener('click', exportCopilotData);
   elements.deleteDataBtn?.addEventListener('click', deleteCopilotData);
 
@@ -127,9 +129,21 @@ function initEventListeners() {
     }
   });
 
-  elements.downloadLogsBtn.addEventListener('click', downloadLogs);
-  elements.diagnoseBtn.addEventListener('click', () => runDiagnostics(false));
-  elements.tabWarning.addEventListener('click', handleTabWarningClick);
+  elements.downloadLogsBtn.addEventListener('click', () => { trackUiClick('logs_download'); downloadLogs(); });
+  elements.diagnoseBtn.addEventListener('click', () => { trackUiClick('diagnostics'); runDiagnostics(false); });
+  elements.tabWarning.addEventListener('click', () => { trackUiClick('tab_warning'); handleTabWarningClick(); });
+
+  // Links opened from the welcome quick links, the menu modal or Charly's
+  // answers (webinar, Academy, Limova pages...). Navigation is not blocked.
+  document.addEventListener('click', (e) => {
+    const link = e.target.closest?.('a[href]');
+    if (!link || !/^https?:/i.test(link.href)) return;
+    const placement = link.closest('#quickLinks') ? 'welcome'
+      : link.closest('#newsModalBody') ? 'menu'
+        : link.closest('#chatContainer') ? 'chat'
+          : null;
+    if (placement) trackEvent('link_clicked', { url: link.href, placement });
+  });
 
   // Dismiss onboarding
   elements.stepClose.addEventListener('click', () => {
@@ -141,6 +155,7 @@ function initEventListeners() {
   document.getElementById('langSwitcher')?.addEventListener('click', (e) => {
     const btn = e.target.closest('.lang-option');
     if (btn?.dataset.lang) {
+      trackUiClick('language');
       setLang(btn.dataset.lang).then(updateVoiceMuteControl);
     }
   });
@@ -176,12 +191,14 @@ function initEventListeners() {
       if (pre) {
         const code = pre.querySelector('code');
         navigator.clipboard.writeText(code?.textContent || pre.textContent);
+        trackUiClick('copy_code');
         copyBtn.textContent = '✓';
         setTimeout(() => { copyBtn.textContent = t('copyBtn'); }, 2000);
       }
     }
     if (e.target.classList.contains('next-step-link')) {
       e.preventDefault();
+      trackUiClick('next_step_link');
       sendNextStepRequest();
     }
     const actionButton = e.target.closest('[data-action-id]');
@@ -203,7 +220,7 @@ function initEventListeners() {
   window.addEventListener('limova-training-screen-ended', handleTrainingScreenEnded);
   window.addEventListener('limova-training-recording-limit', handleTrainingRecordingLimit);
   window.addEventListener('pagehide', () => {
-    stopVoiceSession();
+    stopVoiceSession('panel_closed');
     if (trainingCaptureActive) {
       trainingScreenRecorder?.abort();
       chrome.runtime.sendMessage({ type: 'CANCEL_TRAINING' }).catch(() => {});
@@ -288,6 +305,8 @@ async function loadInitialState() {
       addMessage('assistant', response.copilot.greeting, { skipScroll: true });
     }
     updateMemoryControls(response?.copilot);
+    updateUsageAnalyticsControls(response?.usageAnalytics);
+    trackEvent('sidebar_opened', { authenticated: response?.auth?.authenticated === true, has_history: visibleHistory.length > 0 });
     // Restore onboarding step progress
     if (response?.onboardingPlan) {
       const plan = response.onboardingPlan;
@@ -317,7 +336,7 @@ function setAuthenticationVisible(required) {
   elements.authPanel.hidden = !required;
   document.documentElement.dataset.authState = required ? 'required' : 'authenticated';
   if (required) {
-    stopVoiceSession();
+    stopVoiceSession('reset');
     setTimeout(() => elements.authEmail?.focus(), 0);
   }
 }
@@ -415,6 +434,28 @@ async function toggleCopilotMemory() {
   updateMemoryControls({ available: true, enabled: response.enabled });
 }
 
+function updateUsageAnalyticsControls(enabled) {
+  if (!elements.usageAnalyticsToggleBtn || typeof enabled !== 'boolean') return;
+  elements.usageAnalyticsToggleBtn.setAttribute('aria-checked', String(enabled));
+  const label = elements.usageAnalyticsToggleBtn.querySelector('span');
+  if (label) label.textContent = enabled ? t('usageAnalyticsEnabled') : t('usageAnalyticsDisabled');
+}
+
+async function toggleUsageAnalytics() {
+  const enabled = elements.usageAnalyticsToggleBtn?.getAttribute('aria-checked') !== 'true';
+  const response = await chrome.runtime.sendMessage({ type: 'SET_USAGE_ANALYTICS', enabled }).catch(error => ({ error: error.message }));
+  if (!response?.ok) return addMessage('error', response?.error || t('errorGeneric'));
+  updateUsageAnalyticsControls(response.enabled);
+}
+
+function trackEvent(event, properties = {}) {
+  chrome.runtime.sendMessage({ type: 'TRACK_EVENT', event, properties }).catch(() => {});
+}
+
+function trackUiClick(target) {
+  trackEvent('ui_clicked', { target });
+}
+
 async function exportCopilotData() {
   document.getElementById('headerMenu').hidden = true;
   const response = await chrome.runtime.sendMessage({ type: 'EXPORT_COPILOT_DATA' }).catch(error => ({ error: error.message }));
@@ -445,7 +486,7 @@ async function startTrainingCapture() {
   }
   elements.trainingFeedback.textContent = 'Dans Chrome, sélectionne « Écran entier ». La démonstration démarrera ensuite.';
   elements.trainingStart.disabled = true;
-  stopVoiceSession();
+  stopVoiceSession('reset');
   const RecorderClass = window.LimovaTrainingScreenRecorder;
   trainingScreenRecorder = RecorderClass ? new RecorderClass() : null;
   try {
@@ -573,7 +614,7 @@ function showTrainingActive(session) {
 
 async function stopTrainingCapture() {
   elements.trainingStop.disabled = true;
-  stopVoiceSession();
+  stopVoiceSession('reset');
   if (!trainingScreenRecorder || !activeTrainingSession || !activeTrainingToken) {
     elements.trainingStop.disabled = false;
     elements.trainingFeedback.textContent = 'La vidéo complète est absente. Recommence cette démonstration depuis le Studio.';
@@ -642,7 +683,7 @@ async function handleTrainingScreenEnded() {
   trainingScreenRecorder = null;
   activeTrainingSession = null;
   activeTrainingToken = '';
-  stopVoiceSession();
+  stopVoiceSession('reset');
   await chrome.runtime.sendMessage({ type: 'CANCEL_TRAINING' }).catch(() => {});
   elements.trainingMic.hidden = true;
   elements.trainingStop.hidden = true;
@@ -1066,7 +1107,7 @@ async function sendMessage() {
   // Text and Live voice must never own the same user turn. Closing the voice
   // session first prevents a late Live tool call from racing the text runner.
   if (voiceSession?.active || voiceSession?.starting) {
-    stopVoiceSession();
+    stopVoiceSession('switched_to_text');
     await chrome.runtime.sendMessage({ type: 'VOICE_SESSION_STATE', active: false }).catch(() => {});
   }
 
@@ -1124,16 +1165,16 @@ function sendNextStepRequest() {
   });
 }
 
-function stopVoiceSession() {
+function stopVoiceSession(reason = 'user_stop') {
   const session = voiceSession;
   voiceSession = null;
-  session?.stop(false);
+  session?.stop(false, reason);
   updateVoiceStatus({ status: 'stopped' });
 }
 
 async function toggleVoice() {
   if (voiceSession?.active || voiceSession?.starting) {
-    stopVoiceSession();
+    stopVoiceSession('user_stop');
     return;
   }
   if (!(await ensureAIConsent())) return;

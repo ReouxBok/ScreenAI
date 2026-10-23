@@ -29,6 +29,7 @@ export function installFullChromeMock({ lang = 'en-US', version = '2.1.0' } = {}
       getManifest: vi.fn(() => ({ version })),
       getURL: vi.fn((p) => `chrome-extension://test/${p}`),
       sendMessage: vi.fn(() => Promise.resolve()),
+      setUninstallURL: vi.fn(() => Promise.resolve()),
       onInstalled: makeEvent(listeners.runtime.onInstalled),
       onMessage: makeEvent(listeners.runtime.onMessage),
       onConnect: makeEvent(listeners.runtime.onConnect),

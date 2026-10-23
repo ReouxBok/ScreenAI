@@ -3,11 +3,13 @@
 const ANNOUNCEMENTS_DATA = {
   quickLinks: [
     {
+      id: 'webinar',
       label: 'Inscription Webinaire',
       url: 'https://bienvenue.limova.ai/',
       icon: '\u{1F393}'
     },
     {
+      id: 'academy',
       label: 'Academy Limova',
       url: 'https://academy.limova.ai',
       icon: '\u{1F4DA}'
@@ -20,7 +22,7 @@ function renderAnnouncements() {
   const linksContainer = document.getElementById('quickLinks');
   if (linksContainer) {
     linksContainer.textContent = '';
-    linksContainer.appendChild(buildQuickLinksDOM());
+    linksContainer.appendChild(buildQuickLinksDOM('welcome'));
   }
 
   // Header menu button
@@ -29,7 +31,8 @@ function renderAnnouncements() {
 
   if (linksBtn) linksBtn.addEventListener('click', () => {
     if (headerMenu) headerMenu.hidden = true;
-    openModal('Liens rapides', buildQuickLinksDOM());
+    chrome.runtime.sendMessage({ type: 'TRACK_EVENT', event: 'ui_clicked', properties: { target: 'quick_links' } }).catch(() => {});
+    openModal('Liens rapides', buildQuickLinksDOM('menu'));
   });
 
   // Modal close
@@ -58,7 +61,17 @@ function closeModal() {
   if (backdrop) backdrop.hidden = true;
 }
 
-function buildQuickLinksDOM() {
+// UTM parameters let the webinar and Academy sites attribute sign-ups to Charly.
+function quickLinkUrl(link, placement) {
+  const url = new URL(link.url);
+  url.searchParams.set('utm_source', 'charly');
+  url.searchParams.set('utm_medium', 'extension');
+  url.searchParams.set('utm_campaign', 'quick_link');
+  url.searchParams.set('utm_content', placement);
+  return url.toString();
+}
+
+function buildQuickLinksDOM(placement = 'welcome') {
   const container = document.createElement('div');
   if (!ANNOUNCEMENTS_DATA.quickLinks.length) return container;
 
@@ -66,7 +79,8 @@ function buildQuickLinksDOM() {
   for (const link of ANNOUNCEMENTS_DATA.quickLinks) {
     const a = document.createElement(link.url ? 'a' : 'button');
     if (link.url) {
-      a.href = link.url;
+      a.href = quickLinkUrl(link, placement);
+      a.dataset.linkId = link.id;
       a.target = '_blank';
       a.rel = 'noopener noreferrer';
     }

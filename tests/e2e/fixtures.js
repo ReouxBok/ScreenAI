@@ -7,6 +7,15 @@ const extensionPath = process.env.EXTENSION_PATH
   ? path.resolve(process.env.EXTENSION_PATH)
   : path.resolve(here, '..', '..', 'build');
 
+// Test runs must never reach the production usage analytics.
+async function blockUsageAnalytics(context) {
+  await context.route('https://limova-proxy-479c7fb78ccf.herokuapp.com/api/events', route => route.fulfill({
+    status: 202,
+    contentType: 'application/json',
+    body: JSON.stringify({ ok: true, count: 0 })
+  }));
+}
+
 /**
  * Playwright fixture that launches a persistent Chromium with the Limova
  * extension loaded in --disable-extensions-except mode. Exposes:
@@ -27,6 +36,7 @@ export const test = base.extend({
         '--no-sandbox'
       ]
     });
+    await blockUsageAnalytics(context);
     await use(context);
     await context.close();
   },
@@ -55,6 +65,7 @@ export const test = base.extend({
         '--no-sandbox'
       ]
     });
+    await blockUsageAnalytics(context);
     await use(context);
     await context.close();
   },

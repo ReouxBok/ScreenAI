@@ -23,15 +23,25 @@ L’extension n’envoie jamais de mot de passe, clé API, valeur de formulaire 
 
 Gemini ne peut fournir que l’identifiant numérique d’un élément cartographié localement. Aucun sélecteur, script, clic par coordonnées ni URL distant n’est exécuté. Les navigations internes à faible risque nécessitent une commande explicite. L’envoi d’un message nécessite une demande explicite associée au bouton exact. Les suppressions, publications, paiements, autorisations OAuth et autres actions sensibles sont refusés localement ; une cible ambiguë entraîne une nouvelle observation puis une clarification.
 
-## Cookies et analytics
+## Cookies et statistiques d’utilisation
 
-L’extension ne lit, n’écrit et ne demande aucun cookie. Elle ne collecte aucun analytics produit et n’affiche donc pas de bannière cookies ou analytics. Les journaux techniques restent locaux dans `chrome.storage.session` jusqu’à la fermeture de la session Chrome. Ils excluent les conversations, réponses Gemini, transcriptions, audio, valeurs de formulaire, corps réseau et identifiants. Ils ne quittent l’appareil que si l’utilisateur choisit explicitement de les télécharger puis de les transmettre au support.
+L’extension ne lit, n’écrit et ne demande aucun cookie.
+
+Charly mesure l’utilisation du produit avec PostHog (hébergement UE, projet « Chrome Extension », adresses IP anonymisées). Les événements transitent par le proxy Limova, qui applique une liste blanche de noms et de propriétés avant l’envoi ; la clé PostHog reste côté serveur et aucune librairie tierce n’est chargée dans l’extension.
+
+- **Collecté** : nom de l’événement (ouverture du panneau, message envoyé, réponse reçue, session vocale démarrée/terminée, action exécutée, étape d’onboarding, clic sur un lien Webinaire/Academy, installation/désinstallation…), compteurs, durées, codes d’erreur techniques, chemin de page généralisé (sans identifiants, query string ni fragment), domaine d’un lien cliqué, version de l’extension et de Chrome, langue, pays déduit de l’IP.
+- **Identité** : un identifiant d’installation aléatoire avant connexion. Après la connexion OTP, les événements sont rattachés au compte Limova (identifiant opaque) et l’email, son domaine, le prénom et le nom figurent sur le profil PostHog. L’identifiant d’installation est renouvelé à la déconnexion.
+- **Jamais collecté** : texte des messages, réponses de Charly, transcriptions, audio, contenu ou DOM des pages, valeurs de formulaire, URL complètes, captures.
+- **Opposition** : le menu « Statistiques d’utilisation » désactive immédiatement l’envoi côté extension et ajoute l’en-tête `X-Charly-Analytics: off` aux requêtes du proxy, qui cesse aussi les événements serveur. Pour les versions antérieures à 2.2.53, le support ajoute l’email à `POSTHOG_BLOCKED_SUBS`.
+
+Les journaux techniques restent locaux dans `chrome.storage.session` jusqu’à la fermeture de la session Chrome. Ils excluent les conversations, réponses Gemini, transcriptions, audio, valeurs de formulaire, corps réseau et identifiants. Ils ne quittent l’appareil que si l’utilisateur choisit explicitement de les télécharger puis de les transmettre au support.
 
 Le bouton « Vérifier Charly » contacte uniquement le endpoint public `/healthz` du proxy, sans authentification ni donnée utilisateur, afin de confirmer sa disponibilité.
 
 ## Checklist Chrome Web Store
 
-- Déclarer « website content » et « user activity » uniquement selon les catégories exactes du formulaire CWS.
+- Déclarer « website content », « user activity » et « personally identifiable information » (email rattaché aux statistiques d’utilisation) selon les catégories exactes du formulaire CWS.
+- Mentionner PostHog (UE) comme sous-traitant des statistiques d’utilisation dans la politique publique.
 - Décrire Google Gemini comme prestataire de traitement et aligner la politique publique sur les flux ci-dessus.
 - Cocher l’engagement Limited Use et ne pas utiliser les données pour la publicité ou le scoring.
 - Fournir une justification distincte pour `storage`, `scripting`, `webNavigation`, `sidePanel` et les deux hôtes déclarés (application Limova et proxy IA). L’extension ne demande pas la permission sensible `tabs` ; l’authentification est appelée dans le contexte isolé de la page Limova.

@@ -26,7 +26,7 @@ Charly est une extension Chrome (Manifest V3) qui guide les nouveaux utilisateur
 - **Base de connaissances** — recherche locale TF-IDF dans 106 articles Limova (refresh via `npm run kb:refresh`).
 - **Plan d'onboarding** — 6 étapes structurées pour les nouveaux utilisateurs.
 - **Multilingue** — FR / EN / ES, détection auto + override persisté.
-- **Confidentialité minimale** — aucun cookie ni analytics produit ; accord IA demandé seulement à la première action.
+- **Confidentialité minimale** — aucun cookie ; statistiques d'utilisation PostHog via le proxy, sans contenu ni texte, désactivables depuis le menu ; accord IA demandé seulement à la première action.
 
 ## Architecture
 
