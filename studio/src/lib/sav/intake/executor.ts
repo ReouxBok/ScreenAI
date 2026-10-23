@@ -1,4 +1,6 @@
 import "server-only";
+import { listSavExternalCompletionMessageIds } from "../external-completion";
+import { releaseNeverDispatchedIntakeScopes } from "./execution-store";
 import { intakeRunConfigurationBound } from "./human-binding";
 import { createHash } from "node:crypto";
 import { and, eq, inArray, lte, or, sql } from "drizzle-orm";
@@ -11,7 +13,7 @@ import { intakeExecutionConfig, readIntakeExecutionAuthority } from "./execution
 import { savIntakeRuntimeConfig, intakeRuntimeHash, type IntakeRuntimeConfig } from "./runtime-contract";
 import { createIntakeExecutorAdapters, renderIntakeNote } from "./execution-adapters";
 import { assertOriginalExecutionCrm, assertExecutionCrmUnchanged } from "./execution-context";
-import { admitIntakeExecution, claimExecution, adoptCurrentExecutionVersion, assertExecutionLocal, saveExecutionPayload, expandExecutionScope, getExecutionEffects, ensureExecutionEffect, markEffectDispatched, recordEffectAck, confirmExecutionEffect, deferExecutionEffect, endExecutionPass, identityEpisodeEffect, finishExecution, executionJournal, releaseRecoveredExecutionScope, occupationSchemaInstalled, type ExecutionLease } from "./execution-store";
+import { admitIntakeExecution, claimExecution, claimEffectRecovery, withEffectRecoveryLease, releaseEffectRecovery, activeExecutionEffects, adoptCurrentExecutionVersion, assertExecutionLocal, saveExecutionPayload, expandExecutionScope, getExecutionEffects, ensureExecutionEffect, markEffectDispatched, recordEffectAck, confirmExecutionEffect, deferExecutionEffect, endExecutionPass, identityEpisodeEffect, finishExecution, executionJournal, releaseRecoveredExecutionScope, occupationSchemaInstalled, type ExecutionLease, type ExecutionTx } from "./execution-store";
 import type { Effect, EffectIntent, EffectAck, ExecutorAdapters, ExecutionOptions, ExecutionPayload, EffectKind } from "./execution-types";
 const fault = (code: string): never => { throw Error(`SAV_INTAKE_EXECUTION_${code}`); };
 const code = (e: unknown) => e instanceof Error && /^SAV_[A-Z_]+$/.test(e.message) ? e.message : "SAV_INTAKE_EXECUTION_INTERRUPTED";
@@ -121,11 +123,11 @@ async function nextIntent(lease: ExecutionLease, effects: Effect[], options: Exe
         };
     }
     if (plan.noteText && !confirmed("note_associate")) {
-        const id = ack(confirmed("note_create")!)?.id;
+        const creation = confirmed("note_create")!, id = ack(creation)?.id;
         if (!id)
             return fault("NOTE_ACK_MISSING");
         return {
-            kind: "note_associate", permission: "append_ticket_note", key: `note-association:${messageId}:${ticketId}`, ticketId, objectId: id, sourceMessageId: messageId, expectedProperties: effectIntent(confirmed("note_create")!).properties
+            kind: "note_associate", permission: "append_ticket_note", key: `note-association:${messageId}:${ticketId}`, ticketId, objectId: id, sourceMessageId: messageId, expectedProperties: effectIntent(creation).properties, confirmedNoteCreate: { effectId: creation.id, objectId: id }
         };
     }
     if (!confirmed("email_create")) {
@@ -284,39 +286,58 @@ export async function executeIntakePass(executionId: string, options: ExecutionO
         };
     }
 }
+const effectDueForRecovery = (effect: Effect) => ["dispatched", "acked", "uncertain"].includes(effect.state) && effect.reconcileAttempts < 5
+    && (!effect.nextReconcileAt || effect.nextReconcileAt <= new Date());
+async function lockedRecoveryEffect(tx: ExecutionTx, executionId: string, effectId: string) {
+    if (!(await activeExecutionEffects(executionId, tx)).some(effect => effect.id === effectId)) return null;
+    const [effect] = await tx.select().from(savIntakeEffects).where(and(eq(savIntakeEffects.id, effectId), eq(savIntakeEffects.executionId, executionId))).for("update");
+    return effect && effectDueForRecovery(effect) ? effect : null;
+}
 /** Recovery has no dispatch capability and never consults a grant to accept ACKs. */
 export async function reconcileIntakeEffectsReadOnly(executionId: string, adapters: Pick<ExecutorAdapters, "verify">, deadlineMs = Date.now() + 30000) {
-    const effects = await getExecutionEffects(executionId);
+    const lease = await claimEffectRecovery(executionId);
+    if (!lease) return { checked: 0, effects: await getExecutionEffects(executionId) };
     let checked = 0;
-    for (const effect of effects) {
-        if (!["dispatched", "acked", "uncertain"].includes(effect.state) || effect.reconcileAttempts >= 5 || effect.nextReconcileAt && effect.nextReconcileAt > new Date())
-            continue;
-        if (checked++ >= 2 || Date.now() >= deadlineMs)
-            break;
-        try {
-            const proof = await adapters.verify(effectIntent(effect), ack(effect), effect.dispatchedAt!, AbortSignal.timeout(Math.max(1, Math.min(15000, deadlineMs - Date.now()))));
-            if (proof.confirmed && proof.attributed)
-                await confirmExecutionEffect(effect, proof, proof.ack);
-            else
-                await deferExecutionEffect(effect, "SAV_INTAKE_EXECUTION_RECONCILIATION_REQUIRED");
+    try {
+        for (const candidate of await getExecutionEffects(executionId)) {
+            if (checked >= 2 || Date.now() >= deadlineMs) break;
+            const selected = await withEffectRecoveryLease(lease, tx => lockedRecoveryEffect(tx, executionId, candidate.id));
+            if (!selected.owned) break;
+            const effect = selected.value;
+            if (!effect) continue;
+            checked++;
+            let proof: Awaited<ReturnType<ExecutorAdapters["verify"]>> | undefined;
+            let reason = "SAV_INTAKE_EXECUTION_RECONCILIATION_REQUIRED";
+            try {
+                proof = await adapters.verify(effectIntent(effect), ack(effect), effect.dispatchedAt!, AbortSignal.timeout(Math.max(1, Math.min(15000, deadlineMs - Date.now()))));
+            } catch { reason = "SAV_INTAKE_EXECUTION_RECONCILIATION_UNAVAILABLE"; }
+            // The provider read may outlive its lease or another owner may win.
+            // Such a stale read cannot confirm, defer, or consume a retry.
+            await withEffectRecoveryLease(lease, async tx => {
+                const current = await lockedRecoveryEffect(tx, executionId, effect.id);
+                if (!current || current.attemptId !== effect.attemptId || current.reconcileAttempts !== effect.reconcileAttempts) return;
+                if (proof?.confirmed && proof.attributed) await confirmExecutionEffect(current, proof, proof.ack, tx);
+                else await deferExecutionEffect(current, reason, tx);
+            });
         }
-        catch {
-            await deferExecutionEffect(effect, "SAV_INTAKE_EXECUTION_RECONCILIATION_UNAVAILABLE");
-        }
+    } finally {
+        if (await releaseEffectRecovery(lease)) await releaseRecoveredExecutionScope(executionId);
     }
-    await releaseRecoveredExecutionScope(executionId);
-    return {
-        checked, effects: await getExecutionEffects(executionId)
-    };
+    return { checked, effects: await getExecutionEffects(executionId) };
 }
 export async function pendingIntakeEffectRecoveries(now = new Date()) {
     return requireDb().selectDistinct({
         id: savIntakeExecutions.id, updatedAt: savIntakeExecutions.updatedAt
-    }).from(savIntakeExecutions).innerJoin(savIntakeEffects, eq(savIntakeEffects.executionId, savIntakeExecutions.id)).where(and(inArray(savIntakeEffects.state, ["dispatched", "acked", "uncertain"]), sql `${savIntakeEffects.reconcileAttempts}<5`, or(sql `${savIntakeEffects.nextReconcileAt} is null`, lte(savIntakeEffects.nextReconcileAt, now)))).orderBy(savIntakeExecutions.updatedAt, savIntakeExecutions.id).limit(2);
+    }).from(savIntakeExecutions).innerJoin(savIntakeEffects, eq(savIntakeEffects.executionId, savIntakeExecutions.id)).where(and(
+        or(sql`${savIntakeExecutions.leaseUntil} is null`, lte(savIntakeExecutions.leaseUntil, now)),
+        inArray(savIntakeEffects.state, ["dispatched", "acked", "uncertain"]), sql `${savIntakeEffects.reconcileAttempts}<5`, or(sql `${savIntakeEffects.nextReconcileAt} is null`, lte(savIntakeEffects.nextReconcileAt, now)))).orderBy(savIntakeExecutions.updatedAt, savIntakeExecutions.id).limit(2);
 }
 export async function scanIntakeExecutionCandidates(options: ExecutionOptions) {
+    await releaseNeverDispatchedIntakeScopes(options.runtime.mailboxId);
     const key = "sav-intake-execution-scan-v1", db = requireDb(), [cursor] = await db.select().from(savSyncState).where(eq(savSyncState.key, key));
-    const base = and(eq(savIntakeRuns.isCurrent, true), eq(savIntakeRuns.state, "observed"), sql `(not exists(select 1 from sav.intake_executions e where e.message_id=${savIntakeRuns.messageId})
+    const handledIds = await listSavExternalCompletionMessageIds(db, false, options.runtime.mailboxId);
+    const notHandled = handledIds.length ? sql`${savIntakeRuns.messageId} not in (${sql.join(handledIds.map(id => sql`${id}::uuid`), sql`, `)})` : undefined;
+    const base = and(notHandled, eq(savIntakeRuns.isCurrent, true), eq(savIntakeRuns.state, "observed"), sql `(not exists(select 1 from sav.intake_executions e where e.message_id=${savIntakeRuns.messageId})
         or exists(select 1 from sav.intake_executions e join sav.intake_execution_policies p on p.id=e.policy_id
           where e.message_id=${savIntakeRuns.messageId} and e.run_id=${savIntakeRuns.id} and e.run_version=${savIntakeRuns.version}
           and ${savIntakeRuns.humanChoiceCiphertext} is not null and e.state in ('pending','waiting')
@@ -400,7 +421,9 @@ export async function reconcileIntakeExecutor(overrides: {
         config, runtime, policy, adapters, signal, env: environment
     };
     await scanIntakeExecutionCandidates(options);
-    const [execution] = await requireDb().select().from(savIntakeExecutions).where(and(eq(savIntakeExecutions.policyId, config.policyId), or(eq(savIntakeExecutions.state, "pending"), and(eq(savIntakeExecutions.state, "waiting"), lte(savIntakeExecutions.updatedAt, new Date(Date.now() - 60000))), and(eq(savIntakeExecutions.state, "running"), lte(savIntakeExecutions.leaseUntil, new Date())), and(eq(savIntakeExecutions.state, "uncertain"), sql `(exists(select 1 from sav.intake_effects f where f.execution_id=${savIntakeExecutions.id} and f.state in ('dispatched','acked','uncertain') and f.reconcile_attempts<5 and (f.next_reconcile_at is null or f.next_reconcile_at<=now())) or not exists(select 1 from sav.intake_effects f where f.execution_id=${savIntakeExecutions.id} and f.state in ('dispatched','acked','uncertain')))`)), sql `exists(select 1 from sav.threads t where t.id=${savIntakeExecutions.threadId} and not t.ai_paused)`, sql `not exists(select 1 from sav.messages m where m.thread_id=${savIntakeExecutions.threadId} and m.direction='inbound' and m.id<>${savIntakeExecutions.messageId} and (m.received_at,m.created_at,m.id)>(select s.received_at,s.created_at,s.id from sav.messages s where s.id=${savIntakeExecutions.messageId}))`)).orderBy(savIntakeExecutions.updatedAt, savIntakeExecutions.id).limit(1);
+    const handledIds = await listSavExternalCompletionMessageIds(requireDb(), false, runtime.mailboxId);
+    const notHandled = handledIds.length ? sql`${savIntakeExecutions.messageId} not in (${sql.join(handledIds.map(id => sql`${id}::uuid`), sql`, `)})` : undefined;
+    const [execution] = await requireDb().select().from(savIntakeExecutions).where(and(notHandled, eq(savIntakeExecutions.policyId, config.policyId), or(eq(savIntakeExecutions.state, "pending"), and(eq(savIntakeExecutions.state, "waiting"), lte(savIntakeExecutions.updatedAt, new Date(Date.now() - 60000))), and(eq(savIntakeExecutions.state, "running"), or(sql`${savIntakeExecutions.leaseUntil} is null`, lte(savIntakeExecutions.leaseUntil, new Date()))), and(eq(savIntakeExecutions.state, "uncertain"), sql `(exists(select 1 from sav.intake_effects f where f.execution_id=${savIntakeExecutions.id} and f.state in ('dispatched','acked','uncertain') and f.reconcile_attempts<5 and (f.next_reconcile_at is null or f.next_reconcile_at<=now())) or not exists(select 1 from sav.intake_effects f where f.execution_id=${savIntakeExecutions.id} and f.state in ('dispatched','acked','uncertain')))`)), sql `exists(select 1 from sav.threads t where t.id=${savIntakeExecutions.threadId} and not t.ai_paused)`, sql `not exists(select 1 from sav.messages m where m.thread_id=${savIntakeExecutions.threadId} and m.direction='inbound' and m.id<>${savIntakeExecutions.messageId} and (m.received_at,m.created_at,m.id)>(select s.received_at,s.created_at,s.id from sav.messages s where s.id=${savIntakeExecutions.messageId}))`)).orderBy(savIntakeExecutions.updatedAt, savIntakeExecutions.id).limit(1);
     return execution ? executeIntakePass(execution.id, options) : {
         skipped: "no_execution"
     };
@@ -426,22 +449,33 @@ export async function reconcileIntakeEffectCandidate(effectId: string, candidate
     const [effect] = await requireDb().select().from(savIntakeEffects).where(eq(savIntakeEffects.id, effectId));
     if (!effect || !["dispatched", "acked", "uncertain"].includes(effect.state) || !effect.dispatchedAt)
         throw Error("SAV_INTAKE_EXECUTION_RECONCILIATION_REQUIRED");
-    const original = ack(effect);
-    if (original?.id && original.id !== candidateId)
-        throw Error("SAV_INTAKE_EXECUTION_ACK_CONFLICT");
-    const intent = effectIntent(effect);
-    if (intent.objectId && intent.objectId !== candidateId || intent.kind === "stage_new" && intent.ticketId !== candidateId)
-        throw Error("SAV_INTAKE_EXECUTION_ACK_CONFLICT");
-    const proof = await adapters.verify(intent, {
-        ...original, id: candidateId
-    }, effect.dispatchedAt, AbortSignal.timeout(15000));
-    await requireDb().transaction(tx => executionJournal(tx, effect.executionId, "operator_candidate_checked", {
-        administratorId: administrator.id, candidateId, reason: reason.trim(), confirmed: proof.confirmed, attributed: proof.attributed
-    }, effect.id));
-    if (!proof.confirmed || !proof.attributed)
-        throw Error("SAV_INTAKE_EXECUTION_RECONCILIATION_REQUIRED");
-    await confirmExecutionEffect(effect, proof, proof.ack);
-    return {
-        confirmed: true, effectId: effect.id
-    };
+    const lease = await claimEffectRecovery(effect.executionId);
+    if (!lease) throw Error("SAV_INTAKE_EXECUTION_RECOVERY_BUSY");
+    try {
+        const selected = await withEffectRecoveryLease(lease, async tx => {
+            const [current] = await tx.select().from(savIntakeEffects).where(eq(savIntakeEffects.id, effect.id)).for("update");
+            return current && ["dispatched", "acked", "uncertain"].includes(current.state) && current.dispatchedAt ? current : null;
+        });
+        if (!selected.owned) throw Error("SAV_INTAKE_EXECUTION_RECOVERY_BUSY");
+        const current = selected.value;
+        if (!current) throw Error("SAV_INTAKE_EXECUTION_RECONCILIATION_REQUIRED");
+        const original = ack(current), intent = effectIntent(current);
+        if (original?.id && original.id !== candidateId || intent.objectId && intent.objectId !== candidateId || intent.kind === "stage_new" && intent.ticketId !== candidateId)
+            throw Error("SAV_INTAKE_EXECUTION_ACK_CONFLICT");
+        const proof = await adapters.verify(intent, { ...original, id: candidateId, ...(!original?.id ? { operatorCandidate: true } : {}) }, current.dispatchedAt!, AbortSignal.timeout(15000));
+        const persisted = await withEffectRecoveryLease(lease, async tx => {
+            const [latest] = await tx.select().from(savIntakeEffects).where(eq(savIntakeEffects.id, current.id)).for("update");
+            if (!latest || latest.attemptId !== current.attemptId || !["dispatched", "acked", "uncertain"].includes(latest.state)) return false;
+            if (ack(latest)?.id && ack(latest)!.id !== candidateId) throw Error("SAV_INTAKE_EXECUTION_ACK_CONFLICT");
+            await executionJournal(tx, latest.executionId, "operator_candidate_checked", {
+                administratorId: administrator.id, candidateId, reason: reason.trim(), confirmed: proof.confirmed, attributed: proof.attributed
+            }, latest.id);
+            if (!proof.confirmed || !proof.attributed) return false;
+            await confirmExecutionEffect(latest, proof, proof.ack, tx);
+            return true;
+        });
+        if (!persisted.owned) throw Error("SAV_INTAKE_EXECUTION_RECOVERY_BUSY");
+        if (!persisted.value) throw Error("SAV_INTAKE_EXECUTION_RECONCILIATION_REQUIRED");
+        return { confirmed: true, effectId: effect.id };
+    } finally { await releaseEffectRecovery(lease); }
 }

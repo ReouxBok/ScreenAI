@@ -7,7 +7,7 @@ vi.mock("@/lib/sav/intake/crm-display-server",()=>({readIntakeCrmDisplay:mocks.c
 vi.mock("@/lib/sav/intake/console-auth",()=>({requireIntakeConsoleStaff:mocks.staff}));
 vi.mock("@/lib/sav/intake/console-store",()=>({listIntakeConsole:mocks.list}));
 vi.mock("@/lib/sav/intake/console-detail",()=>({readIntakeConsoleDetail:mocks.detail}));
-vi.mock("./actions",()=>({saveIntakeChoice:mocks.action,requestRecoveryAction:mocks.action,reconcileIdentificationAction:mocks.action}));
+vi.mock("./actions",()=>({saveIntakeChoice:mocks.action,requestRecoveryAction:mocks.action,reconcileIdentificationAction:mocks.action,completeIntakeDossierAction:mocks.action}));
 vi.mock("next/link",()=>({default:(props:ComponentProps<"a">)=>createElement("a",props)}));
 vi.mock("next/navigation",()=>({notFound:()=>{throw Error("NOT_FOUND");}}));
 import IntakeConsolePage from "./page";
@@ -26,6 +26,13 @@ const detail={thread:{id:threadId,subject:fixture.rows[0].subject,paused:false,t
 beforeEach(()=>{vi.clearAllMocks();mocks.crmDisplay.mockResolvedValue({contacts:{"101":{label:"Alice Test",url:"https://app.hubspot.com/contacts/123/record/0-1/101",available:true}},tickets:{"201":{label:"Connexion interrompue",url:"https://app.hubspot.com/contacts/123/record/0-5/201",available:true}}});mocks.staff.mockResolvedValue({id:"synthetic",email:"ugo@limova.ai",role:"admin"});mocks.list.mockResolvedValue(fixture);mocks.detail.mockResolvedValue(detail);});
 const renderList=async(query:{view?:string;q?:string;page?:string}={})=>renderToStaticMarkup(createElement(Fragment,null,await IntakeConsolePage({searchParams:Promise.resolve(query)})));
 const renderDetail=async()=>renderToStaticMarkup(createElement(Fragment,null,await IntakeDetailPage({params:Promise.resolve({id:threadId})})));
+it("offers explicit manual completion on the latest message only for the existing authorized operator, without acting on GET",async()=>{
+  const html=await renderDetail();expect(html).toContain("Passer en Terminés");expect(html).toContain("J’ai déjà traité cette demande");
+  expect(html).toMatch(/<input(?=[^>]*name="confirmed")(?=[^>]*required="")[^>]*>/);expect(html).toContain(`name="messageId" value="${messageId}"`);expect(mocks.action).not.toHaveBeenCalled();
+  mocks.detail.mockResolvedValue({...detail,handledExternally:true});expect(await renderDetail()).not.toContain("Passer en Terminés");
+  mocks.detail.mockResolvedValue(detail);mocks.staff.mockResolvedValue({email:"reouven@limova.ai",role:"admin"});expect(await renderDetail()).not.toContain("Passer en Terminés");
+  mocks.staff.mockResolvedValue({email:"ugo@limova.ai",role:"member"});expect(await renderDetail()).not.toContain("Passer en Terminés");
+});
 it("six business views and distinct technical area use supplied counts and French states, without actions on GET",async()=>{
   const html=await renderList();for(const label of ["Traités — en apprentissage","Pas de fiche HubSpot","À valider","Résiliation / Facturation","Terminés","Autres","En cours et attentes techniques","Plafond de qualification atteint"] )expect(html).toContain(label);
   expect(html).not.toContain("SAV_INTAKE_RUNTIME_BUDGET_EXHAUSTED");expect(mocks.action).not.toHaveBeenCalled();

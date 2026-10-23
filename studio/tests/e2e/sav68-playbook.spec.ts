@@ -29,8 +29,9 @@ test("contact manages only the SAV master prompt and can explicitly roll back a 
   await expect(page.getByRole("button", { name: "Enregistrer le brouillon", exact: true })).toBeDisabled();
 });
 test("knowledge, enrichment and learning remain separate from the master prompt", async ({ page }) => {
-  // This journey compiles three distinct pages on a fresh development server.
-  test.setTimeout(60_000);
+  // Allow three cold page compilations plus the enrichment action within this
+  // journey; individual navigation/response deadlines and assertions stay strict.
+  test.setTimeout(120_000);
   await page.setExtraHTTPHeaders({ "x-studio-test-user": "contact@limova.ai" });
   await page.goto("/studio/sav/connaissances");
   await expect(page.getByRole("link", { name: "Master prompt SAV", exact: true })).toBeVisible();

@@ -1,8 +1,26 @@
 "use server";
+import { redirect } from "next/navigation";
+import { completeSavDossierManually } from "@/lib/sav/external-completion";
+import { releaseIntakeHumanHold } from "@/lib/sav/intake/human-hold-release";
 import { revalidatePath } from "next/cache";
 import { recordIntakeHumanCommand } from "@/lib/sav/intake/human-commands";
 import {requestIntakeReinvestigation,reconcileThreadIdentification} from "@/lib/sav/intake/operator-recovery";
 export type IntakeChoiceFormState = { ok: boolean; message: string };
+export async function completeIntakeDossierAction(_previous: IntakeChoiceFormState, form: FormData): Promise<IntakeChoiceFormState> {
+ try {
+  const result = await completeSavDossierManually({requestKey:form.get("requestKey"),threadId:form.get("threadId"),messageId:form.get("messageId"),confirmed:form.get("confirmed")==="on"});
+  if (!result.marked && !result.alreadyCompleted) {
+   const message = result.skipped.active_worker ? "Un traitement est encore en cours. Réessayez après sa fin."
+    : result.skipped.unsettled_action ? "Une action ou un résultat externe reste à vérifier. Le dossier est conservé en attente."
+    : "Le dossier a changé ou ne peut pas être clôturé ainsi. Rechargez-le avant de réessayer.";
+   return {ok:false,message};
+  }
+  revalidatePath(`/studio/sav/intake/${String(form.get("threadId"))}`);
+  revalidatePath(`/studio/sav/${String(form.get("threadId"))}`);
+  revalidatePath("/studio/sav/intake");revalidatePath("/studio/sav");
+  return {ok:true,message:"Dossier passé en Terminés : déjà traité. Aucun mail envoyé ni ticket HubSpot fermé. Un nouvel email reviendra dans le flux."};
+ } catch { return {ok:false,message:"Clôture non enregistrée. Vérifiez votre accès et rechargez le dossier ; aucune action externe n’a été déclenchée."}; }
+}
 export async function requestRecoveryAction(_previous:IntakeChoiceFormState,form:FormData):Promise<IntakeChoiceFormState>{
  try{await requestIntakeReinvestigation({threadId:form.get("threadId"),messageId:form.get("messageId"),reason:form.get("reason")});
   revalidatePath(`/studio/sav/intake/${String(form.get("threadId"))}`);return {ok:true,message:"Réinvestigation enregistrée, sans remise à zéro des tentatives ni envoi de mail."};
@@ -35,4 +53,12 @@ export async function saveIntakeChoice(_previous: IntakeChoiceFormState, form: F
       ? "Cette analyse ne conserve pas les résultats validés nécessaires à une reprise. Une réinvestigation est requise."
       : "Le choix n’a pas été enregistré. Vérifiez votre accès, le motif et la version courante." };
   }
+}
+
+export async function releaseIntakeHumanHoldAction(form: FormData): Promise<void> {
+ const threadId=String(form.get("threadId")??"");let status="blocked";
+ try { await releaseIntakeHumanHold({requestKey:form.get("requestKey"),threadId,messageId:form.get("messageId"),expectedEpoch:Number(form.get("expectedEpoch")),reason:form.get("reason")});status="released"; }
+ catch { /* Keep the pause and the dossier when any safety condition changed. */ }
+ revalidatePath(`/studio/sav/intake/${threadId}`);revalidatePath("/studio/sav/intake");
+ redirect(`/studio/sav/intake/${encodeURIComponent(threadId)}?holdRelease=${status}`);
 }

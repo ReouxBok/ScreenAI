@@ -1,3 +1,4 @@
+import { readSavExternalCompletion, listSavExternalCompletionMessageIds } from "../external-completion";
 import "server-only";
 import { SAV_INTAKE_OPERATIONAL_PROFILE, intakeAdmissionUsage } from "./budget-profile";
 import { intakeConsoleInstalled } from "./console-capability";
@@ -5,7 +6,7 @@ import { intakeRunConfigurationBound, intakeHumanRefused } from "./human-binding
 import { createHash, randomUUID } from "node:crypto";
 import {canAccessSav} from "../access";
 import {executionPolicySchema} from "./execution-policy";
-import { and, desc, eq, inArray, sql } from "drizzle-orm";
+import { and, desc, eq, inArray, lte, or, sql } from "drizzle-orm";
 import { requireDb } from "@/db";
 import { staffUsers,savMailboxes,savIntakeHumanEvents,savIntakeExecutionPolicies,savActions, savThreads, savMessages, savIntakeRuns, savSyncState, savIntakeExecutions, savIntakeEffects, savIntakeEffectJournal, savIntakeOccupations, savIntakeExecutionBudget, savIntakeIdentityEpisodes, savIntakeEffectRevisions } from "@/db/schema";
 import { encryptSavPayload, decryptSavPayload } from "../crypto";
@@ -55,6 +56,59 @@ export async function occupyKeys(tx: ExecutionTx, ownerId: string, ownerKind: "i
         }).onConflictDoNothing();
 }
 export async function releaseKeys(tx: ExecutionTx, ownerId: string) { await admissionLock(tx); await tx.delete(savIntakeOccupations).where(eq(savIntakeOccupations.ownerId, ownerId)); }
+/** A local hold can arrive after admission but before a worker ever dispatches.
+ * Fence that abandoned lease and release only provably unused intake scope.
+ * Provider receipts, including confirmed partial effects, are never handled here. */
+export async function releaseNeverDispatchedIntakeScopes(mailboxId: string, now = new Date()) {
+    const db = requireDb(), handledIds = await listSavExternalCompletionMessageIds(db, false, mailboxId);
+    const consoleInstalled = await intakeConsoleInstalled(db);
+    const unsafeEffect = sql`(f.state <> 'planned' or f.dispatched_at is not null or f.dispatch_token is not null or f.ack_ciphertext is not null or f.verification_ciphertext is not null or f.confirmed_at is not null)`;
+    const candidates = await db.select({ id: savIntakeExecutions.id }).from(savIntakeExecutions)
+        .innerJoin(savThreads, eq(savThreads.id, savIntakeExecutions.threadId)).where(and(
+            eq(savThreads.mailboxId, mailboxId), inArray(savIntakeExecutions.state, ["pending", "waiting", "running", "uncertain"]),
+            or(sql`${savIntakeExecutions.leaseUntil} is null`, lte(savIntakeExecutions.leaseUntil, now)),
+            sql`not exists(select 1 from sav.intake_runs r where r.thread_id=${savIntakeExecutions.threadId} and r.lease_until>${now.toISOString()}::timestamptz)`,
+            consoleInstalled ? sql`not exists(select 1 from sav.intake_human_events h where h.thread_id=${savIntakeExecutions.threadId} and h.lease_until>${now.toISOString()}::timestamptz)` : undefined,
+            sql`exists(select 1 from sav.intake_occupations o where o.owner_kind='intake' and o.owner_id=${savIntakeExecutions.id})`,
+            sql`not exists(select 1 from sav.intake_effects f where f.execution_id=${savIntakeExecutions.id} and ${unsafeEffect})`,
+            or(eq(savThreads.aiPaused, true), handledIds.length ? inArray(savIntakeExecutions.messageId, handledIds) : undefined,
+                consoleInstalled ? sql`exists(select 1 from sav.intake_human_events h where h.message_id=${savIntakeExecutions.messageId} and h.kind='refuse')` : undefined)
+        )).orderBy(savIntakeExecutions.updatedAt, savIntakeExecutions.id).limit(10);
+    let released = 0;
+    for (const candidate of candidates) {
+        const done = await db.transaction(async tx => {
+            await admissionLock(tx);
+            const [row] = await tx.select().from(savIntakeExecutions).where(eq(savIntakeExecutions.id, candidate.id)).for("update");
+            if (!row || ["confirmed", "refused"].includes(row.state) || row.leaseUntil && row.leaseUntil > now) return false;
+            const [thread] = await tx.select().from(savThreads).where(eq(savThreads.id, row.threadId)).for("update");
+            const [message] = await tx.select().from(savMessages).where(eq(savMessages.id, row.messageId));
+            if (!thread || thread.mailboxId !== mailboxId || !message || message.threadId !== row.threadId || message.mailboxId !== mailboxId) return false;
+            const [activeRun] = await tx.select({ id: savIntakeRuns.id }).from(savIntakeRuns)
+                .where(and(eq(savIntakeRuns.threadId, row.threadId), sql`${savIntakeRuns.leaseUntil}>${now.toISOString()}::timestamptz`)).limit(1);
+            const [activeCommand] = consoleInstalled ? await tx.select({ id: savIntakeHumanEvents.id }).from(savIntakeHumanEvents)
+                .where(and(eq(savIntakeHumanEvents.threadId, row.threadId), sql`${savIntakeHumanEvents.leaseUntil}>${now.toISOString()}::timestamptz`)).limit(1) : [];
+            if (activeRun || activeCommand) return false;
+            const external = Boolean(await readSavExternalCompletion(message, tx));
+            const refused = await intakeHumanRefused(message.id, tx);
+            if (!thread.aiPaused && !external && !refused) return false;
+            const effects = await tx.select().from(savIntakeEffects).where(eq(savIntakeEffects.executionId, row.id)).for("update");
+            if (effects.some(effect => effect.state !== "planned" || effect.dispatchedAt !== null || effect.dispatchToken !== null || effect.ackCiphertext !== null || effect.verificationCiphertext !== null || effect.confirmedAt !== null)) return false;
+            const payload = decryptSavPayload<ExecutionPayload>(row.payloadCiphertext);
+            const owned = await tx.select().from(savIntakeOccupations).where(and(eq(savIntakeOccupations.ownerId, row.id), eq(savIntakeOccupations.ownerKind, "intake"))).for("update");
+            if (!owned.length || !Array.isArray(payload.keys) || owned.some(key => !payload.keys.includes(key.key))) return false;
+            await tx.update(savIntakeExecutions).set({ state: "waiting", leaseToken: null, leaseUntil: null,
+                payloadCiphertext: encryptSavPayload({ ...payload, reason: "SAV_INTAKE_EXECUTION_LOCAL_FENCE_BEFORE_DISPATCH" }), updatedAt: now
+            }).where(eq(savIntakeExecutions.id, row.id));
+            // owner kind is checked explicitly: a malformed legacy owner is not ours.
+            const deleted = await tx.delete(savIntakeOccupations).where(and(eq(savIntakeOccupations.ownerId, row.id), eq(savIntakeOccupations.ownerKind, "intake"), inArray(savIntakeOccupations.key, owned.map(key => key.key)))).returning({ key: savIntakeOccupations.key });
+            if (deleted.length !== owned.length) return fault("OCCUPATION_LOST");
+            await executionJournal(tx, row.id, "never_dispatched_scope_released", { messageId: message.id, paused: thread.aiPaused, external, refused, effectIds: effects.map(effect => effect.id), dispatch: false });
+            return true;
+        });
+        if (done) released++;
+    }
+    return { released };
+}
 export async function assertNoLegacyConflict(tx: ExecutionTx, keys: string[]) {
     const actions = await tx.select().from(savActions).where(and(inArray(savActions.kind, ["create_ticket", "link_ticket", "create_note", "log_email", "update_ticket_status", "send_reply", "request_human"]), sql `${savActions.status} <> 'succeeded' and (${savActions.status} in ('pending','running') or ${savActions.payload}->>'ticketCreateDispatchedAt' is not null or ${savActions.payload}->>'ticketReturnDispatchedAt' is not null or ${savActions.payload}->>'replySendDispatchedAt' is not null or ${savActions.payload}->>'forwardDispatchedAt' is not null or ${savActions.payload}->>'intakeOccupationDispatchedAt' is not null)`)).limit(201);
     if (actions.length > 200)
@@ -114,6 +168,7 @@ export async function admitIntakeExecution(runId: string, options: ExecutionOpti
         await admissionLock(tx);
         const [thread] = await tx.select().from(savThreads).where(eq(savThreads.id, run.threadId)).for("update");
         const [m] = await tx.select().from(savMessages).where(eq(savMessages.id, run.messageId));
+        if (m && await readSavExternalCompletion(m, tx)) return null;
         const [existing] = await tx.select().from(savIntakeExecutions).where(eq(savIntakeExecutions.messageId, run.messageId)).for("update");
         if (existing) {
             if(existing.policyId===options.config.policyId&&existing.policyHash===options.config.policyHash)return existing;
@@ -200,6 +255,36 @@ export async function claimExecution(id: string, now = new Date()) {
     });
 }
 export type ExecutionLease = NonNullable<Awaited<ReturnType<typeof claimExecution>>>;
+export type EffectRecoveryLease = { executionId: string; token: string };
+/** Reserve the existing execution lease without changing its business state.
+ * No admission lock is held across a provider read. The same token is checked
+ * again under lock before any recovered result or retry can be persisted. */
+export async function claimEffectRecovery(executionId: string, now = new Date()): Promise<EffectRecoveryLease | null> {
+    return requireDb().transaction(async tx => {
+        await admissionLock(tx);
+        const [row] = await tx.select().from(savIntakeExecutions).where(eq(savIntakeExecutions.id, executionId)).for("no key update");
+        if (!row || row.leaseUntil && row.leaseUntil > now) return null;
+        const token = randomUUID();
+        await tx.update(savIntakeExecutions).set({ leaseToken: token, leaseUntil: new Date(now.getTime() + 80000) }).where(eq(savIntakeExecutions.id, row.id));
+        return { executionId, token };
+    });
+}
+export async function withEffectRecoveryLease<T>(lease: EffectRecoveryLease, work: (tx: ExecutionTx) => Promise<T>): Promise<{ owned: false } | { owned: true; value: T }> {
+    return requireDb().transaction(async tx => {
+        await admissionLock(tx);
+        const [row] = await tx.select().from(savIntakeExecutions).where(eq(savIntakeExecutions.id, lease.executionId)).for("no key update");
+        if (!row || row.leaseToken !== lease.token || !row.leaseUntil || row.leaseUntil <= new Date()) return { owned: false };
+        return { owned: true, value: await work(tx) };
+    });
+}
+export async function releaseEffectRecovery(lease: EffectRecoveryLease) {
+    return requireDb().transaction(async tx => {
+        await admissionLock(tx);
+        const rows = await tx.update(savIntakeExecutions).set({ leaseToken: null, leaseUntil: null })
+            .where(and(eq(savIntakeExecutions.id, lease.executionId), eq(savIntakeExecutions.leaseToken, lease.token))).returning({ id: savIntakeExecutions.id });
+        return rows.length === 1;
+    });
+}
 export async function assertExecutionLocal(tx: ExecutionTx, lease: ExecutionLease, now = new Date()) {
     await admissionLock(tx);
     const [row] = await tx.select().from(savIntakeExecutions).where(eq(savIntakeExecutions.id, lease.row.id)).for("update");
@@ -217,6 +302,7 @@ export async function assertExecutionLocal(tx: ExecutionTx, lease: ExecutionLeas
         mailbox: thread.mailboxId, gmail: thread.gmailThreadId, customer: thread.customerEmail
     }) !== lease.payload.local.threadIdentityHash)
         return fault();
+    if (await readSavExternalCompletion(m, tx)) return fault("HANDLED_EXTERNALLY");
     const keys = await tx.select().from(savIntakeOccupations).where(eq(savIntakeOccupations.ownerId, row.id));
     if (lease.payload.keys.some(k => !keys.some(o => o.key === k)))
         return fault("OCCUPATION_LOST");
@@ -311,8 +397,8 @@ export async function recordEffectAck(effect: Effect, ack: EffectAck) {
         }, old.id);
     });
 }
-export async function confirmExecutionEffect(effect: Effect, proof: unknown, ack?: EffectAck) {
-    await requireDb().transaction(async (tx) => {
+export async function confirmExecutionEffect(effect: Effect, proof: unknown, ack?: EffectAck, transaction?: ExecutionTx) {
+    const write = async (tx: ExecutionTx) => {
         const [row] = await tx.select().from(savIntakeEffects).where(eq(savIntakeEffects.id, effect.id)).for("update");
         if (!row || row.state === "planned")
             return fault("CONFIRMATION_REJECTED");
@@ -322,7 +408,8 @@ export async function confirmExecutionEffect(effect: Effect, proof: unknown, ack
             } : {})
         }).where(eq(savIntakeEffects.id, effect.id));
         await executionJournal(tx, row.executionId, "confirmed", proof, row.id);
-    });
+    };
+    if (transaction) await write(transaction); else await requireDb().transaction(write);
 }
 /** Complete only the local record of an already verified identification send.
  * No authority is resurrected and this operation has no dispatch capability. */
@@ -369,8 +456,8 @@ export async function finishVerifiedIdentityRecovery(executionId: string) {
         return true;
     });
 }
-export async function deferExecutionEffect(effect: Effect, reason: string) {
-    await requireDb().transaction(async (tx) => {
+export async function deferExecutionEffect(effect: Effect, reason: string, transaction?: ExecutionTx) {
+    const write = async (tx: ExecutionTx) => {
         const [row] = await tx.select().from(savIntakeEffects).where(eq(savIntakeEffects.id, effect.id)).for("update");
         if (row?.state !== "confirmed") {
             await tx.update(savIntakeEffects).set({
@@ -380,7 +467,8 @@ export async function deferExecutionEffect(effect: Effect, reason: string) {
                 reason
             }, effect.id);
         }
-    });
+    };
+    if (transaction) await write(transaction); else await requireDb().transaction(write);
 }
 export async function endExecutionPass(lease: ExecutionLease, state: "waiting" | "uncertain", reason: string) {
     await requireDb().transaction(async (tx) => {
@@ -584,7 +672,7 @@ export async function releaseRecoveredExecutionScope(executionId: string) {
     await requireDb().transaction(async (tx) => {
         await admissionLock(tx);
         const [row] = await tx.select().from(savIntakeExecutions).where(eq(savIntakeExecutions.id, executionId)).for("update");
-        if (!row || row.state === "confirmed" || row.state === "refused")
+        if (!row || row.state === "confirmed" || row.state === "refused" || row.leaseUntil && row.leaseUntil > new Date())
             return;
         const [thread] = await tx.select().from(savThreads).where(eq(savThreads.id, row.threadId)).for("update");
         const [latest] = await tx.select({
