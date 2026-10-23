@@ -10,7 +10,7 @@ import { requireDb } from "@/db";
 import { staffUsers,savMailboxes,savIntakeHumanEvents,savIntakeExecutionPolicies,savActions, savThreads, savMessages, savIntakeRuns, savSyncState, savIntakeExecutions, savIntakeEffects, savIntakeEffectJournal, savIntakeOccupations, savIntakeExecutionBudget, savIntakeIdentityEpisodes, savIntakeEffectRevisions } from "@/db/schema";
 import { encryptSavPayload, decryptSavPayload } from "../crypto";
 import { intakeRuntimeHash, assertSavIntakeObservation } from "./runtime-contract";
-import { readSavIntakeCurrent, savIntakeSourceSnapshot } from "./runtime-store";
+import { readSavIntakeCurrent, savIntakeSourceSnapshot, intakeSourceMatches, intakeRecordedSourceHash } from "./runtime-store";
 import { savIntakeDecisionSchema } from "./contract";
 import { savIntakePlanFingerprint } from "./engine";
 import type { ExecutionPayload, Effect, EffectIntent, EffectAck, ExecutionOptions } from "./execution-types";
@@ -213,7 +213,7 @@ export async function assertExecutionLocal(tx: ExecutionTx, lease: ExecutionLeas
         plan?: {
             fingerprint?: string;
         };
-    }>(run.payloadCiphertext).plan?.fingerprint !== lease.payload.acceptedFingerprint) || run.humanChoiceCiphertext !== lease.payload.local.humanChoice || last?.id !== row.messageId || !m || executionMessageHash(m) !== lease.payload.local.messageHash || (await savIntakeSourceSnapshot(tx, m, now)).sourceHash !== lease.payload.local.sourceHash || thread.humanRequestedAt?.toISOString() !== (lease.payload.local.humanRequestedAt ?? undefined) || thread.status !== lease.payload.local.status || thread.hubspotTicketId !== lease.payload.local.ticketId || intakeRuntimeHash({
+    }>(run.payloadCiphertext).plan?.fingerprint !== lease.payload.acceptedFingerprint) || run.humanChoiceCiphertext !== lease.payload.local.humanChoice || last?.id !== row.messageId || !m || executionMessageHash(m) !== lease.payload.local.messageHash || !intakeSourceMatches(await savIntakeSourceSnapshot(tx, m, now), lease.payload.local.sourceHash) || thread.humanRequestedAt?.toISOString() !== (lease.payload.local.humanRequestedAt ?? undefined) || thread.status !== lease.payload.local.status || thread.hubspotTicketId !== lease.payload.local.ticketId || intakeRuntimeHash({
         mailbox: thread.mailboxId, gmail: thread.gmailThreadId, customer: thread.customerEmail
     }) !== lease.payload.local.threadIdentityHash)
         return fault();
@@ -358,8 +358,9 @@ export async function finishVerifiedIdentityRecovery(executionId: string) {
             || !ack.id || proof.confirmed!==true || proof.attributed!==true || proof.ack?.id!==ack.id || !intent.text || !intent.resource
             || createHash("sha256").update(intent.text).digest("hex")!==intent.resource.sha256
             || intakeRuntimeHash(intent.resource)!==intakeRuntimeHash({resourceId:d.template.resourceId,revisionId:d.template.revisionId,sha256:d.template.sha256})) return false;
-        const completion = {sourceHash:(await savIntakeSourceSnapshot(tx,message,new Date())).sourceHash,messageHash:executionMessageHash(message)};
-        if (completion.sourceHash!==payload.local.sourceHash) return false;
+        const snapshot = await savIntakeSourceSnapshot(tx,message,new Date());
+        if (!intakeSourceMatches(snapshot,payload.local.sourceHash)) return false;
+        const completion = {sourceHash:payload.local.sourceHash!,messageHash:executionMessageHash(message)};
         await tx.update(savIntakeExecutions).set({state:"confirmed",leaseToken:null,leaseUntil:null,payloadCiphertext:encryptSavPayload({...payload,reason:undefined,effectsConfirmed:true,completion}),updatedAt:new Date()})
             .where(eq(savIntakeExecutions.id,row.id));
         await tx.update(savMessages).set({analysisStatus:"intake_execution_identity_wait"}).where(eq(savMessages.id,message.id));
@@ -508,7 +509,7 @@ export async function finishExecution(lease: ExecutionLease, ticketId: string | 
             } : {})
         }).where(eq(savMessages.id, lease.row.messageId));
         const [completedMessage] = await tx.select().from(savMessages).where(eq(savMessages.id, lease.row.messageId));
-        const completion = { sourceHash: (await savIntakeSourceSnapshot(tx, completedMessage, new Date())).sourceHash,
+        const completion = { sourceHash: intakeRecordedSourceHash(await savIntakeSourceSnapshot(tx, completedMessage, new Date()), lease.payload.local.sourceHash),
             messageHash: executionMessageHash(completedMessage) };
         await tx.update(savIntakeExecutions).set({ payloadCiphertext: encryptSavPayload({ ...lease.payload, effectsConfirmed: true, completion }) })
             .where(eq(savIntakeExecutions.id, lease.row.id));
@@ -563,7 +564,7 @@ export async function adoptCurrentExecutionVersion(lease: ExecutionLease, option
         const [thread] = await tx.select().from(savThreads).where(eq(savThreads.id, lease.row.threadId)).for("update");
         const [m] = await tx.select().from(savMessages).where(eq(savMessages.id, lease.row.messageId));
         const [run] = await tx.select().from(savIntakeRuns).where(eq(savIntakeRuns.id, current.id));
-        if (row?.leaseToken !== lease.token || thread?.aiPaused || !m || executionMessageHash(m) !== lease.payload.local.messageHash || !run?.isCurrent || (await savIntakeSourceSnapshot(tx, m, new Date())).sourceHash !== run.sourceHash || run.humanChoiceCiphertext !== lease.payload.local.humanChoice)
+        if (row?.leaseToken !== lease.token || thread?.aiPaused || !m || executionMessageHash(m) !== lease.payload.local.messageHash || !run?.isCurrent || !intakeSourceMatches(await savIntakeSourceSnapshot(tx, m, new Date()), run.sourceHash) || run.humanChoiceCiphertext !== lease.payload.local.humanChoice)
             return fault("VERSION_INCOMPATIBLE");
         const prior = lease.payload.lastRunId;
         lease.payload.lastRunId = run.id;

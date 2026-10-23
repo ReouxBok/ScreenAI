@@ -8,7 +8,7 @@ import { intakeConsoleInstalled } from "./console-capability";
 import { activeExecutionEffects, admissionLock, executionMessageHash } from "./execution-store";
 import { requiredExecutionKinds } from "./executor";
 import { intakeRuntimeHash, type IntakeRuntimePayload } from "./runtime-contract";
-import { savIntakeSourceSnapshot } from "./runtime-store";
+import { savIntakeSourceSnapshot, intakeSourceMatches } from "./runtime-store";
 import type { ExecutionPayload, EffectIntent, EffectAck } from "./execution-types";
 import type { IntakePlan } from "./engine-types";
 import type { ObservationEvent } from "../observation-source";
@@ -67,13 +67,13 @@ export async function ensureIntakeObservations(limit = 4) {
       || plan.decision.disposition.kind !== "ticket" || !required.length || required.some(kind => !effects.some(e => e.kind === kind && e.state === "confirmed"))
       || effects.some(e => e.state !== "confirmed")) return;
     if (!payload.completion || payload.completion.messageHash !== executionMessageHash(latest)
-      || payload.completion.sourceHash !== (await savIntakeSourceSnapshot(tx, latest, new Date())).sourceHash) return;
+      || !intakeSourceMatches(await savIntakeSourceSnapshot(tx, latest, new Date()), payload.completion.sourceHash)) return;
     const [existing] = await tx.select().from(savIntakeObservationBindings).where(eq(savIntakeObservationBindings.executionId, execution.id));
     if (existing) return;
     const baseline: IntakeObservationBaseline = { revision: "sav-intake-observation.v1", origin: "intake", executionId: execution.id,
       runId: run.id, version: run.version, messageId: execution.messageId, threadId: execution.threadId, ticketId: execution.ticketId,
       plan, acceptedFingerprint: payload.acceptedFingerprint, confirmedAt: execution.updatedAt.toISOString(), resolutionDraft: null,
-      localSourceHash: (await savIntakeSourceSnapshot(tx, latest, new Date())).sourceHash,
+      localSourceHash: payload.completion.sourceHash,
       effects: effects.map(e => ({ id: e.id, kind: e.kind, intent: decryptSavPayload<EffectIntent>(e.intentCiphertext),
         ack: e.ackCiphertext ? decryptSavPayload<EffectAck>(e.ackCiphertext) : null, proof: e.verificationCiphertext ? decryptSavPayload(e.verificationCiphertext) : null })) };
     const sensitive = await intakeDossierSensitive(execution.threadId, execution.ticketId, tx);
@@ -109,12 +109,12 @@ export async function readIntakeLearningQualification(threadId: string, db: Db =
   const [run] = await db.select().from(savIntakeRuns).where(eq(savIntakeRuns.id, binding.runId));
   const [execution] = await db.select().from(savIntakeExecutions).where(eq(savIntakeExecutions.id, binding.executionId));
   const source = await savIntakeSourceSnapshot(db, latest, new Date());
-  if (!run?.isCurrent || execution?.state !== "confirmed" || execution.runId !== run.id || source.sourceHash !== binding.baseline.localSourceHash
+  if (!run?.isCurrent || execution?.state !== "confirmed" || execution.runId !== run.id || !intakeSourceMatches(source, binding.baseline.localSourceHash)
     || decryptSavPayload<IntakeRuntimePayload>(run.payloadCiphertext).plan?.fingerprint !== binding.baseline.acceptedFingerprint
     || decryptSavPayload<ExecutionPayload>(execution.payloadCiphertext).acceptedFingerprint !== binding.baseline.acceptedFingerprint)
     return { allowed: false, fingerprint: null };
   return { allowed: true, fingerprint: savContentHash({ origin: "intake", bindingHash: binding.baselineHash,
-    messageId: latest.id, runId: run.id, version: run.version, sourceHash: source.sourceHash, cycle: observation.cycle }) };
+    messageId: latest.id, runId: run.id, version: run.version, sourceHash: binding.baseline.localSourceHash, cycle: observation.cycle }) };
 }
 /** Attribute receipts by provider IDs AND exact content fingerprints. A copied
  * intake note/template is still AI evidence, never an independent human fix. */
