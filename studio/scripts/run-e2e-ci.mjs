@@ -84,7 +84,8 @@ async function main() {
     const jsonFile = path.join(directory, `${index + 1}.json`);
     console.log(`\nStudio browser partition ${index + 1}/${cases.length}: ${item.selector} — ${item.title}`);
     // Each CLI invocation owns a new Next process and a freshly seeded DB.
-    // The existing config retains workers=1/retries=0/auth/heap/webpack/timeouts.
+    // The config retains workers=1/retries=0/auth/heap/webpack and its reviewed
+    // cold-process functional assertion budgets. Coverage is still exact.
     const startedAt = Date.now();
     const result = await run(["test", item.selector, "--reporter=list,json", `--output=${output}`], {
       env: { ...process.env, PLAYWRIGHT_JSON_OUTPUT_FILE: jsonFile },

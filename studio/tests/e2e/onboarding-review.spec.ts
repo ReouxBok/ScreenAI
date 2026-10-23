@@ -106,7 +106,7 @@ test("SAV-51 : qualifier un tutoriel incomplet depuis le lot sans publier ni act
   await expect(page.getByText(/non destiné à l’agent IA/)).toBeVisible();
   await expect(page.getByRole("button", { name: "Valider et publier", exact: true })).toBeVisible();
   await expect(page.getByText("v1 · active", { exact: true })).toHaveCount(0);
-  const result = await request.post("/api/internal/knowledge/search", {
+  const result = await request.post("/api/internal/knowledge/search", { maxRetries: 1,
     headers: { Authorization: "Bearer e2e-service-token-that-is-at-least-32-characters" },
     data: { query: "Renommer un espace de démonstration", scope: "sav", contentTypes: ["article"] },
   });
@@ -208,7 +208,7 @@ test("SAV-51 : qualifier chaque section inconnue avant de préparer un brouillon
   await expect(page.locator(".tiptap")).not.toContainText(editorialSection);
   await expect(page.getByRole("button", { name: "Valider et publier", exact: true })).toBeVisible();
   await expect(page.getByText("v1 · active", { exact: true })).toHaveCount(0);
-  const result = await request.post("/api/internal/knowledge/search", {
+  const result = await request.post("/api/internal/knowledge/search", { maxRetries: 1,
     headers: { Authorization: "Bearer e2e-service-token-that-is-at-least-32-characters" },
     data: { query: "Renommer une maquette avec le badge Bac à sable", scope: "sav", contentTypes: ["article"] },
   });
