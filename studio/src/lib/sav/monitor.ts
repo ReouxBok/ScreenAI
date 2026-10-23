@@ -2,9 +2,10 @@ import "server-only";
 import { randomUUID } from "node:crypto";
 import { eq, sql, type SQL } from "drizzle-orm";
 import { requireDb } from "@/db";
-import { savSyncState, auditLogs } from "@/db/schema";
+import { savSyncState, auditLogs, savIntakeExecutions } from "@/db/schema";
 import { savIntakeRuntimeConfig } from "./intake/runtime-contract";
 import { intakeExecutionConfig, readIntakeExecutionAuthority } from "./intake/execution-policy";
+import { SAV_INTAKE_OPERATIONAL_PROFILE, intakeAdmissionUsage } from "./intake/budget-profile";
 import { readIntakeOtherRules } from "./intake/other-routing";
 import { decryptSavPayload } from "./crypto";
 import { monitorStateSchema, monitorCodes, nextMonitorState, monitorWebhook, monitorSlackText, monitorDeliveryHash, type MonitorState, type MonitorSnapshot, type MonitorIssue, type MonitorCode } from "./monitor-contract";
@@ -103,6 +104,21 @@ export async function collectSavMonitorSnapshot(): Promise<MonitorSnapshot> {
       const executions = await queryRows<{ count: number }>(tx,sql`select count(*)::int as count from sav.intake_executions e join sav.intake_runs r on r.id=e.run_id
         join sav.threads t on t.id=e.thread_id where r.is_current and not t.ai_paused and e.state in ('pending','running','uncertain','waiting') and e.updated_at < ${new Date(now.getTime()-600000).toISOString()}`);
       add("execution_delayed", executions[0]?.count ?? 0, "critical");
+      // Mail that intake owns but cannot move without a person: a human hold on
+      // the thread, sources to re-investigate, or a dossier waiting for qualification.
+      const held = await queryRows<{ count: number }>(tx,sql`select count(*)::int as count from sav.messages m join sav.threads t on t.id=m.thread_id
+        join sav.sync_state l on l.key='sav-intake-launch:'||m.mailbox_id::text and l.status='intake_launch_v1'
+        where m.direction='inbound' and t.ai_paused and m.created_at < ${new Date(now.getTime()-1800000).toISOString()}
+        and m.received_at>(l.cursor::jsonb->>'receivedAfter')::timestamptz and m.created_at>(l.cursor::jsonb->>'createdAfter')::timestamptz
+        and not exists(select 1 from sav.messages n where n.thread_id=m.thread_id and n.direction='inbound' and (n.received_at,n.created_at,n.id)>(m.received_at,m.created_at,m.id))`);
+      add("intake_held", held[0]?.count ?? 0);
+      const stalled = await queryRows<{ changed: number; waiting: number }>(tx,sql`select
+        count(*) filter(where c.status='context_changed')::int as changed,
+        count(*) filter(where c.status='waiting')::int as waiting
+        from sav.intake_console c join sav.sync_state l on l.key='sav-intake-launch:'||c.mailbox_id::text and l.status='intake_launch_v1'
+        where c.updated_at < ${new Date(now.getTime()-1800000).toISOString()}`);
+      add("sources_changed_waiting", stalled[0]?.changed ?? 0);
+      add("dossier_waiting", stalled[0]?.waiting ?? 0);
       const effects = await queryRows<{ uncertain: number; failed: number }>(tx,sql`select count(*) filter(where state in ('uncertain','dispatched','acked') and confirmed_at is null)::int as uncertain,
         count(*) filter(where state='failed')::int as failed from sav.intake_effects`);
       add("effect_uncertain", effects[0]?.uncertain ?? 0, "critical"); add("effect_failed", effects[0]?.failed ?? 0, "critical");
@@ -118,7 +134,19 @@ export async function collectSavMonitorSnapshot(): Promise<MonitorSnapshot> {
       if (execution) {
         if (!config) throw Error();
         const authority = await readIntakeExecutionAuthority(execution, now);
-        add("authority_expiring", Date.parse(authority.policy.expiresAt) - now.getTime() < 86400000 ? 1 : 0);
+        const remaining = Date.parse(authority.policy.expiresAt) - now.getTime();
+        metrics.authorityRemainingHours = Math.max(0, Math.floor(remaining / 3600000));
+        add("authority_expiring", remaining < 3 * 86400000 ? 1 : 0, remaining < 86400000 ? "critical" : "warning");
+        // Same admission count as the executor: all executions, or today's (UTC) for the operational profile.
+        const admitted = intakeAdmissionUsage(await requireDb().select({ createdAt: savIntakeExecutions.createdAt }).from(savIntakeExecutions),
+          authority.policy.budgetProfile === SAV_INTAKE_OPERATIONAL_PROFILE, now);
+        metrics.admittedDossiers = admitted; metrics.maxDossiers = authority.policy.maxDossiers;
+        add("authority_admission_limit", admitted >= authority.policy.maxDossiers * 0.8 ? 1 : 0, admitted >= authority.policy.maxDossiers ? "critical" : "warning");
+      }
+      if (config) {
+        const remaining = Date.parse(config.expiresAt) - now.getTime();
+        metrics.runtimeRemainingHours = Math.max(0, Math.floor(remaining / 3600000));
+        add("runtime_expiring", remaining < 3 * 86400000 ? 1 : 0, remaining < 86400000 ? "critical" : "warning");
       }
       const other = readIntakeOtherRules();
       add("other_rules_expiring", other && Date.parse(other.expiresAt)-now.getTime()<86400000 ? 1 : 0);
