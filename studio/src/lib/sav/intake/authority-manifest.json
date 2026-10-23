@@ -1,5 +1,5 @@
 {
-  "authorityRevision": "sav-intake-authority-2026-10-23.v7",
+  "authorityRevision": "sav-intake-authority-2026-10-23.v8",
   "sources": {
     "drizzle/0000_fancy_jasper_sitwell.sql": "be833e35a613133cef6e4548c9397428ad238a3bcec157ced5bd6663c67d7df3",
     "drizzle/0001_exotic_kabuki.sql": "3a2be31dcd8d81ca331d98b6fc2612887ecbe9dec64f889d8878ba9cd65f6c88",
@@ -43,7 +43,7 @@
     "next.config.ts": "d11c5d093d10f969fb23a89d8ee2ef38c4e6131cb2b84cb8fec548ef3b03ad6e",
     "package-lock.json": "70aefaa775ea024d899b4e376e57e6ecac9d76ff9973c13622c73eb64738c1ec",
     "package.json": "30d003e1c22a7f57b72952a8d778e9b076130858f09138979e8ba172fb71d014",
-    "scripts/intake-authority.mjs": "2743b0ac23d49b05d61513320b1842d203b82bab01d4246e571080d498f9faef",
+    "scripts/intake-authority.mjs": "8c7761910f0599e9fb1371e2ace75fd12c2c1506a0483632e1eb9dfedbc4a45c",
     "src/db/client.ts": "7f40d6371ffea100ace3267aff2521efd6941322a780b83ea3ea6b3745338b88",
     "src/db/index.ts": "31b1d1f02badcc657d382c28a068b360f0ca8045ca1bc2c6d6d834eac1cfb482",
     "src/db/schema.ts": "8ee13bc52f982e58071e62972adeb19d34ac33b5f8a20898c484dd80533b13cf",

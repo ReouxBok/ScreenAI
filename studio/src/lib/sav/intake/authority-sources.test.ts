@@ -27,6 +27,7 @@ it.each(["src/lib/sav/intake/entry.ts", "src/permissions.ts", "scripts/intake-au
   const put = fixture(); expect(() => verifyIntakeAuthoritySources(root)).not.toThrow();
   put(filename, readFileSync(path.join(root!, filename), "utf8") + "\n ");
   expect(() => verifyIntakeAuthoritySources(root)).toThrow(/relever SAV_INTAKE_AUTHORITY_REVISION/);
+  expect(() => verifyIntakeAuthoritySources(root)).toThrow(`changed sources: ${filename}`);
 });
 it("detects newly added intake sources and transitive imports", () => {
   const put = fixture(); put("src/lib/sav/intake/new-permission.ts", "export const allow = true;");

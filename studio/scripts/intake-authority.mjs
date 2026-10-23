@@ -81,8 +81,13 @@ export function collectIntakeAuthoritySources(root = studioRoot) {
 export function verifyIntakeAuthoritySources(root = studioRoot) {
   const manifest = JSON.parse(readFileSync(path.join(root, manifestPath), "utf8"));
   const actual = collectIntakeAuthoritySources(root);
+  const changed = [...new Set([...Object.keys(manifest.sources ?? {}), ...Object.keys(actual.sources)])]
+    .filter(filename => manifest.sources?.[filename] !== actual.sources[filename]).sort();
   if (!/^sav-intake-authority-[a-z0-9.-]+$/.test(manifest.authorityRevision ?? "")
-    || stable(actual.sources) !== stable(manifest.sources) || stable(actual.externalModules) !== stable(manifest.externalModules)) throw Error(message);
+    || stable(actual.sources) !== stable(manifest.sources) || stable(actual.externalModules) !== stable(manifest.externalModules)) {
+    // Paths only: diagnose build-time mutations without logging source contents.
+    throw Error(`${message}; changed sources: ${changed.join(", ") || "none"}; external modules changed: ${stable(actual.externalModules) !== stable(manifest.externalModules)}`);
+  }
   return actual;
 }
 
