@@ -8,13 +8,10 @@ Without this digest, exact commit matching remains required. With it, the digest
 must match `SAV_INTAKE_COMPATIBILITY`; a mismatch never falls back to legacy mode.
 Both modes require a valid 40 character lowercase deployment SHA. The existing
 `VERCEL_GIT_COMMIT_SHA ?? SAV_CODE_REVISION` resolution remains unchanged.
-Mixed legacy/compatible pins do not match at launch.
-
-This PR targets the current `codex/ugo` baseline. That baseline does not yet
-include the separate operator recovery / authority reattachment implementation.
-No recovery code is imported here. Before composing with that implementation,
-replace its artifact equality checks with `intakeArtifactAuthorized` and
-`intakeSamePin`, qualify both modes and regenerate the authority manifest.
+Mixed legacy/compatible pins do not match at launch or authority reattachment.
+The operator recovery path on the current `codex/ugo` baseline uses these same
+helpers, preserving its independent never-dispatched, revoked-old-policy and
+approved-new-policy conditions.
 
 ## What is covered
 
