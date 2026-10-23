@@ -80,6 +80,11 @@ const unclaimedMessage = sql`(${savMessages.analysisStatus} = 'pending' and ${sa
   and not exists (select 1 from sav.pilot_items p where p.message_id = ${savMessages.id})
   and not exists (select 1 from sav.actions a where a.message_id = ${savMessages.id})
   and not exists (select 1 from sav.proposal_reviews r where r.message_id = ${savMessages.id}))`;
+// A configuration rotation cannot replace evidence for an action that has
+// already left the system. A genuinely new inbound has a different message ID.
+const noCommittedExecution = sql`not exists(select 1 from sav.intake_executions e where e.message_id=${savMessages.id}
+  and (e.state in ('confirmed','refused') or exists(select 1 from sav.intake_effects f where f.execution_id=e.id
+    and (f.state<>'planned' or f.dispatched_at is not null or f.dispatch_token is not null or f.ack_ciphertext is not null or f.confirmed_at is not null))))`;
 const eligible = (message: typeof savMessages.$inferSelect, config: IntakeRuntimeConfig) => message.direction === "inbound" && message.mailboxId === config.mailboxId
   && message.receivedAt.getTime() > Date.parse(config.receivedAfter) && message.createdAt.getTime() > Date.parse(config.createdAfter);
 /** Called after durable mail insertion. Recovery finds an interrupted enqueue. */
@@ -89,6 +94,8 @@ export async function enqueueSavIntakeMessage(messageId: string, config: IntakeR
     if (!await intakeLaunchMatches(config, tx) || !message || !eligible(message, config) || await intakeHumanRefused(messageId, tx)) return null;
     await tx.select().from(savThreads).where(eq(savThreads.id, message.threadId)).for("update");
     if ((await latest(tx, message.threadId))?.id !== message.id) return null;
+    const [uncommitted] = await tx.select({id:savMessages.id}).from(savMessages).where(and(eq(savMessages.id,message.id),noCommittedExecution));
+    if (!uncommitted) return null;
     const [same] = await tx.select().from(savIntakeRuns).where(and(eq(savIntakeRuns.messageId, message.id), eq(savIntakeRuns.configHash, config.configHash)));
     if (same) return same.id;
     if (await intakeHasHumanDecision(messageId, tx)) return null;
@@ -111,7 +118,7 @@ export async function catchupSavIntake(config: IntakeRuntimeConfig, limit = 4) {
   const noHuman = await intakeConsoleInstalled() ? sql`not exists(select 1 from sav.intake_human_events h where h.message_id=${savMessages.id})` : undefined;
   const messages = await requireDb().select({ id: savMessages.id }).from(savMessages).where(and(eq(savMessages.mailboxId, config.mailboxId), eq(savMessages.direction, "inbound"),
     gt(savMessages.receivedAt, new Date(config.receivedAfter)), gt(savMessages.createdAt, new Date(config.createdAfter)),
-    or(unclaimedMessage, sql`${savMessages.analysisStatus} like 'intake_%'`), noHuman,
+    or(unclaimedMessage, sql`${savMessages.analysisStatus} like 'intake_%'`), noHuman, noCommittedExecution,
     sql`not exists (select 1 from sav.intake_runs r where r.message_id = ${savMessages.id} and r.config_hash = ${config.configHash})`,
     sql`not exists (select 1 from sav.messages m where m.thread_id = ${savMessages.threadId} and m.direction = 'inbound' and (m.received_at,m.created_at,m.id) > (${savMessages.receivedAt},${savMessages.createdAt},${savMessages.id}))`))
     .orderBy(savMessages.createdAt).limit(Math.min(4, Math.max(1, limit)));
