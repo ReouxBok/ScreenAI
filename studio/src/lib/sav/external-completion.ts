@@ -2,9 +2,11 @@ import "server-only";
 import { and, asc, desc, eq, inArray, sql } from "drizzle-orm";
 import { z } from "zod";
 import { requireDb } from "@/db";
-import { auditLogs, savActions, savDecisions, savMessages, savPilotItems, savThreads, savIntakeHumanEvents, savIntakeExecutions, savIntakeEffects } from "@/db/schema";
+import { auditLogs, savActions, savDecisions, savMessages, savPilotItems, savThreads, savIntakeHumanEvents, savIntakeExecutions, savIntakeEffects, savIntakeRuns, staffUsers } from "@/db/schema";
 import { intakeConsoleInstalled } from "./intake/console-capability";
 import { savV0EligibleMessageFilter } from "./cutover";
+import { executionAdministrator } from "./intake/execution-policy";
+import { canAccessSav } from "./access";
 
 export const SAV_EXTERNAL_COMPLETION = "sav_dossier_completed_externally";
 export const SAV_EXTERNAL_COMPLETION_REVERTED = "sav_dossier_external_completion_reverted";
@@ -129,10 +131,26 @@ function assertOperator(actorEmail: string) {
   if (process.env.SAV_RELEASE_STAGE !== "v0" || process.env.SAV_PILOT_MODE === "true") throw new Error("SAV_EXTERNAL_COMPLETION_V0_ONLY");
 }
 
-/** Explicit operations entry point only. No cron, server action or model calls it.
+type CompletionActor = Pick<typeof staffUsers.$inferSelect, "id" | "email" | "clerkId">;
+const manualSchema = z.object({ requestKey: z.uuid(), threadId: z.uuid(), messageId: z.uuid(), confirmed: z.literal(true) }).strict();
+
+/** Authenticated single-message UI entry point. The boundary is server-owned;
+ * a submitted stale dossier can never close a newly received inbound. */
+export async function completeSavDossierManually(raw: unknown) {
+  const actor = await executionAdministrator();
+  assertOperator(actor.email);
+  const input = manualSchema.parse(raw);
+  return applyExternalCompletion({ batchId: input.requestKey, receivedBefore: new Date().toISOString(),
+    messages: [{ threadId: input.threadId, messageId: input.messageId }] }, actor.email, actor);
+}
+
+/** Explicit operations entry point. No cron or model calls it.
  * The caller supplies a frozen preview; we recheck under thread row locks.
  * Only append-only audit rows are written. Snapshots/verdicts/actions are untouched. */
 export async function markSavDossiersHandledExternally(raw: unknown, actorEmail: string) {
+  return applyExternalCompletion(raw, actorEmail);
+}
+async function applyExternalCompletion(raw: unknown, actorEmail: string, actor?: CompletionActor) {
   assertOperator(actorEmail);
   const input = batchSchema.parse(raw);
   if (Date.parse(input.receivedBefore) > Date.now()) throw new Error("SAV_EXTERNAL_COMPLETION_FUTURE_BOUNDARY");
@@ -142,7 +160,14 @@ export async function markSavDossiersHandledExternally(raw: unknown, actorEmail:
   return requireDb().transaction(async tx => {
     await tx.execute(sql`set local lock_timeout = '5s'`);
     await tx.execute(sql`set local statement_timeout = '30s'`);
+    // Same lock and order as intake admission/dispatch, before thread locks.
+    await tx.execute(sql`select pg_advisory_xact_lock(hashtext('sav-intake-common-admission-v1'))`);
     await tx.execute(sql`select pg_advisory_xact_lock(hashtext(${input.batchId}))`);
+    if (actor) {
+      const [staff] = await tx.select().from(staffUsers).where(eq(staffUsers.id, actor.id)).for("update");
+      if (!staff?.active || !["admin", "owner"].includes(staff.role) || !canAccessSav(staff.email, staff.role)
+        || staff.email !== actor.email || staff.clerkId !== actor.clerkId) throw Error("SAV_EXTERNAL_COMPLETION_FORBIDDEN");
+    }
     const threads = await tx.select({ id: savThreads.id, hubspotTicketId: savThreads.hubspotTicketId }).from(savThreads).where(inArray(savThreads.id, threadIds)).orderBy(asc(savThreads.id)).for("update");
     if (threads.length !== threadIds.length) throw new Error("SAV_EXTERNAL_COMPLETION_THREAD_MISSING");
     const latest = await tx.selectDistinctOn([savMessages.threadId]).from(savMessages).where(and(inArray(savMessages.threadId, threadIds), eq(savMessages.direction, "inbound")))
@@ -165,6 +190,11 @@ export async function markSavDossiersHandledExternally(raw: unknown, actorEmail:
       else if (!eligible.has(message.id) || pilots.has(message.id)) reason = "not_live_eligible";
       else if (technicalMessages.has(message.id)) reason = "technical_exclusion";
       else if (hasUnsettledSavHumanAction(actions.filter(action => action.threadId === message.threadId)) || await hasUnsettledSavIntakeWork(message.threadId, tx)) reason = "unsettled_action";
+      if (!reason && await intakeConsoleInstalled(tx)) {
+        const runs = await tx.select({ leaseUntil: savIntakeRuns.leaseUntil }).from(savIntakeRuns).where(eq(savIntakeRuns.threadId, requested.threadId));
+        const executions = await tx.select({ leaseUntil: savIntakeExecutions.leaseUntil }).from(savIntakeExecutions).where(eq(savIntakeExecutions.threadId, requested.threadId));
+        if ([...runs, ...executions].some(row => row.leaseUntil && row.leaseUntil > new Date())) reason = "active_worker";
+      }
       if (reason) { skipped[reason] = (skipped[reason] ?? 0) + 1; continue; }
       if (findSavExternalCompletion(message!, events)) { alreadyCompleted++; continue; }
       // A reverted batch is never silently re-applied on retry.

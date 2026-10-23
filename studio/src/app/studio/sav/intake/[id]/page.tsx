@@ -12,6 +12,7 @@ import {readIntakeCrmDisplay} from "@/lib/sav/intake/crm-display-server";
 import {crmDisplayFallback,type CrmDisplayRecord} from "@/lib/sav/intake/crm-display";
 import { releaseIntakeHumanHoldAction } from "../actions";
 import {IntakeRecoveryForm} from "../recovery-form";
+import { IntakeCompletionForm } from "../completion-form";
 import { intakeStatusLabel, intakeReasonLabel, intakeContextReasonLabels } from "@/lib/sav/intake/console-presentation";
 import styles from "../intake.module.css";
 export const dynamic = "force-dynamic";
@@ -79,6 +80,7 @@ export default async function IntakeDetailPage({ params, searchParams }: { param
       <MailConversation messages={data.messages}/>
       {data.historyTruncated && <p role="status">Les 200 messages les plus récents sont affichés. L’historique est incomplet.</p>}
     </div><aside className={styles.side}>
+      {!data.handledExternally && data.latestMessageId && staff.email === "ugo@limova.ai" && ["admin", "owner"].includes(staff.role) && <IntakeCompletionForm key={data.latestMessageId} threadId={id} messageId={data.latestMessageId} requestKey={randomUUID()}/>}
       {data.humanHeld && !data.handledExternally && data.latestMessageId && ["admin","owner"].includes(staff.role) && <section className={styles.notice}><h2>Reprendre ce dossier</h2>
         <p>Cette action lève uniquement sa pause humaine. Le moteur automatique pourra poursuivre si les preuves et la politique existante le permettent. Les tentatives et les preuves sont conservées. Si une nouvelle qualification est nécessaire, utilisez ensuite « Réinvestiguer avec les correctifs » dans le diagnostic technique.</p>
         <form action={releaseIntakeHumanHoldAction}>

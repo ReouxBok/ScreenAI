@@ -18,6 +18,7 @@ import { SAV_INTAKE_MODEL_REVISION } from "./model-readers";
 import { createSavIntakeHubspotReaders } from "./hubspot-readers";
 import { enqueueSavIntakeMessage, claimSavIntakeRun, saveSavIntakeResult, readSavIntakeCurrent, catchupSavIntake, pendingSavIntakeRuns, assertSavIntakeLease } from "./runtime-store";
 import { approveIntakeExecutionPolicy, intakeExecutionConfig, type ExecutionPolicy } from "./execution-policy";
+import * as executionPolicyModule from "./execution-policy";
 import { createIntakeExecutorAdapters } from "./execution-adapters";
 import { admitIntakeExecution, assertNoLegacyConflict, claimExecution, ensureExecutionEffect, markEffectDispatched, getExecutionEffects, recordEffectAck } from "./execution-store";
 import { executeIntakePass, reconcileIntakeExecutor, readIntakeExecutionProgress, reconcileIntakeEffectsReadOnly } from "./executor";
@@ -26,7 +27,7 @@ import { consumeIntakeHumanEvent } from "./human-worker";
 import { intakeRunConfigurationBound, intakeRunCandidateContactIds, humanRevisionConfigHash, type HumanEventPayload } from "./human-binding";
 import { releaseIntakeHumanHold } from "./human-hold-release";
 import { releaseLegacyAiPauses } from "./legacy-pause";
-import { SAV_EXTERNAL_COMPLETION, SAV_EXTERNAL_COMPLETION_REVERTED, getSavExternalCompletion, revertSavExternalCompletionBatch, markSavDossiersHandledExternally } from "../external-completion";
+import { SAV_EXTERNAL_COMPLETION, SAV_EXTERNAL_COMPLETION_REVERTED, getSavExternalCompletion, revertSavExternalCompletionBatch, markSavDossiersHandledExternally, completeSavDossierManually } from "../external-completion";
 import { listIntakeConsole, projectIntakeThread, refreshIntakeConsole } from "./console-store";
 import { readIntakeConsoleDetail } from "./console-detail";
 import { ensureIntakeObservations, readIntakeObservationBinding, readIntakeLearningQualification, attributeIntakeObservationEvents } from "./observation-binding";
@@ -117,6 +118,78 @@ beforeEach(async () => {
     adapters: createIntakeExecutorAdapters({ network: p.network, gmailRequest: p.gmail, gmailPermissions: async () => {}, env: () => environment }) };
 });
 afterEach(() => { vi.unstubAllEnvs(); vi.unstubAllGlobals(); vi.restoreAllMocks(); });
+async function prepareManualCompletion(multiple = true) {
+  vi.stubEnv("SAV_RELEASE_STAGE", "v0"); vi.stubEnv("SAV_PILOT_MODE", "false");
+  await activateSavV0Cutover({receivedAfter:new Date(Date.now()-3600000).toISOString(),mailboxEmail:"support@example.invalid",intakeRecipient:"contact@limova.ai",deploymentSha:"a".repeat(40),activatedBy:"ugo@limova.ai"});
+  await observed(multiple);
+  return {requestKey:randomUUID(),threadId,messageId,confirmed:true as const};
+}
+it("manual completion moves only the displayed message into completed, is idempotent and fences automation without provider calls", async () => {
+  const input = await prepareManualCompletion();
+  const before = (await db.db.select().from(savIntakeRuns))[0];
+  expect(await completeSavDossierManually(input)).toMatchObject({marked:1,alreadyCompleted:0});
+  expect(await completeSavDossierManually(input)).toMatchObject({marked:0,alreadyCompleted:1});
+  expect((await listIntakeConsole({view:"completed"})).rows.map(row=>row.threadId)).toEqual([threadId]);
+  expect((await listIntakeConsole({view:"to_validate"})).total).toBe(0);
+  expect(await admitIntakeExecution(runId,options)).toBeNull();
+  expect((await db.db.select().from(savIntakeRuns))[0]).toMatchObject({attempts:before.attempts,payloadCiphertext:before.payloadCiphertext});
+  expect((await db.db.select().from(auditLogs)).filter(row=>row.action===SAV_EXTERNAL_COMPLETION)).toHaveLength(1);
+  expect(await db.db.select().from(savLearningCandidates)).toHaveLength(0);
+  expect(await db.db.select().from(savActions)).toHaveLength(0);
+  expect(fetch).not.toHaveBeenCalled();expect(mutationsSent()).toHaveLength(0);
+});
+it("manual completion rejects a stale page and leaves a new inbound eligible after an earlier completion", async () => {
+  const input=await prepareManualCompletion();await completeSavDossierManually(input);
+  const inbound=await message(threadId,new Date(Date.now()+1000));
+  expect(await completeSavDossierManually({...input,requestKey:randomUUID()})).toMatchObject({marked:0,skipped:{new_inbound:1}});
+  expect(await getSavExternalCompletion(inbound)).toBeNull();
+  expect((await listIntakeConsole({view:"completed"})).total).toBe(0);
+  expect((await db.db.select().from(auditLogs)).filter(row=>row.action===SAV_EXTERNAL_COMPLETION)).toHaveLength(1);
+});
+it.each(["unverified","inactive","member","different_operator"])("manual completion refuses %s without an administrative marker",async scenario=>{
+  const input=await prepareManualCompletion();
+  if(scenario==="unverified")state.user=null;
+  else if(scenario==="different_operator") {
+    await db.db.update(staffUsers).set({email:"reouven@limova.ai"});
+    state.user={id:"synthetic-console-admin",primaryEmailAddress:{emailAddress:"reouven@limova.ai",verification:{status:"verified"}}};
+  } else await db.db.update(staffUsers).set(scenario==="inactive"?{active:false}:{role:"member"});
+  await expect(completeSavDossierManually(input)).rejects.toThrow();
+  expect((await db.db.select().from(auditLogs)).filter(row=>row.action===SAV_EXTERNAL_COMPLETION)).toHaveLength(0);
+  expect(fetch).not.toHaveBeenCalled();
+});
+it.each(["confirmation","message","server_boundary"])("manual completion refuses a forged %s",async scenario=>{
+  const input=await prepareManualCompletion();
+  const forged=scenario==="confirmation"?{...input,confirmed:false}:scenario==="message"?{...input,messageId:"invalid"}:{...input,receivedBefore:new Date(Date.now()+86400000).toISOString()};
+  await expect(completeSavDossierManually(forged)).rejects.toThrow();
+  expect((await db.db.select().from(auditLogs)).filter(row=>row.action===SAV_EXTERNAL_COMPLETION)).toHaveLength(0);
+});
+it.each(["analysis","execution"])("manual completion keeps an active %s worker visible",async kind=>{
+  const input=await prepareManualCompletion(false);
+  if(kind==="analysis")await db.db.update(savIntakeRuns).set({leaseUntil:new Date(Date.now()+60000)}).where(eq(savIntakeRuns.id,runId));
+  else {
+    const execution=(await admitIntakeExecution(runId,options))!;expect(execution).not.toBeNull();
+    await db.db.update(savIntakeExecutions).set({leaseUntil:new Date(Date.now()+60000)}).where(eq(savIntakeExecutions.id,execution.id));
+  }
+  expect(await completeSavDossierManually(input)).toMatchObject({marked:0,skipped:{active_worker:1}});
+  expect((await listIntakeConsole({view:"completed"})).total).toBe(0);
+});
+it("manual completion rechecks a staff revocation between authentication and transaction",async()=>{
+  const input=await prepareManualCompletion();
+  const original=executionPolicyModule.executionAdministrator;
+  vi.spyOn(executionPolicyModule,"executionAdministrator").mockImplementationOnce(async()=>{
+    const actor=await original();await db.db.update(staffUsers).set({active:false});return actor;
+  });
+  await expect(completeSavDossierManually(input)).rejects.toThrow("FORBIDDEN");
+  expect((await db.db.select().from(auditLogs)).filter(row=>row.action===SAV_EXTERNAL_COMPLETION)).toHaveLength(0);
+});
+it("manual completion preserves a pending human choice and an uncertain legacy send",async()=>{
+  const input=await prepareManualCompletion();await recordIntakeHumanCommand(await command());
+  expect(await completeSavDossierManually(input)).toMatchObject({marked:0,skipped:{unsettled_action:1}});
+  await db.db.update(savIntakeHumanEvents).set({state:"refused"});
+  await db.db.insert(savActions).values({threadId,messageId,kind:"send_reply",actorType:"human",status:"failed",idempotencyKey:randomUUID(),payload:{replySendDispatchedAt:new Date().toISOString()}});
+  expect(await completeSavDossierManually(input)).toMatchObject({marked:0,skipped:{unsettled_action:1}});
+  expect(fetch).not.toHaveBeenCalled();expect(mutationsSent()).toHaveLength(0);
+});
 it("form -> authenticated CAS -> accepted semantics -> derived run -> real HTTP fake execution; exhausted quotas stay exhausted", async () => {
   await observed(true);
   await db.db.update(savIntakeRuns).set({ attempts: 2 }).where(eq(savIntakeRuns.id, runId));
