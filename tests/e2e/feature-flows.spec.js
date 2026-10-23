@@ -958,9 +958,11 @@ test.describe('Packaged extension — complete user flows', () => {
     await expect(sidebar.locator('#statusBadge')).toContainText(/Listening|écoute|escucho/i);
     expect(socketMessages[0].setup.model).toBe('models/gemini-3.1-flash-live-preview');
     expect(socketMessages[0].setup.generationConfig.responseModalities).toEqual(['AUDIO']);
-    const voiceDiagnostics = await sidebar.evaluate(() => chrome.runtime.sendMessage({ type: 'GET_LOGS' }));
-    expect(voiceDiagnostics.logs).not.toContain('VISUAL_CAPTURE_READY');
-    expect(socketMessages.some(message => message.realtimeInput?.video)).toBe(false);
+    // Charly may look at the page when the session starts: only a masked still
+    // image of the Limova tab is sent, never a stream of other content.
+    const videoFrames = socketMessages.filter(message => message.realtimeInput?.video);
+    expect(videoFrames.length).toBeLessThanOrEqual(1);
+    for (const frame of videoFrames) expect(frame.realtimeInput.video.mimeType).toBe('image/jpeg');
     await expect.poll(() => socketMessages.some(message =>
       message.realtimeInput?.audio?.mimeType === 'audio/pcm;rate=16000'
       && message.realtimeInput.audio.data.length > 0
@@ -1346,13 +1348,29 @@ test.describe('Packaged extension — complete user flows', () => {
     expect(state.isActive).toBe(false);
   });
 
-  test('tab locking warns on another tab and returns the user to the Limova session', async ({ context, extensionId }) => {
+  test('tab locking warns on a page Charly cannot read and returns the user to the Limova session', async ({ context, extensionId }) => {
+    const { limova, sidebar } = await openExtensionHarness(context, extensionId);
+    await grantAIConsent(sidebar);
+    await sidebar.locator('#userInput').fill('Verrouille cette session');
+    await sidebar.locator('#sendBtn').click();
+    await expect(sidebar.locator('.message.assistant .message-content')).toBeVisible();
+
+    const blank = await context.newPage();
+    await blank.bringToFront();
+    await expect(sidebar.locator('#tabWarning')).toBeVisible();
+
+    await sidebar.locator('#tabWarning').click();
+    await expect.poll(() => limova.evaluate(() => document.hasFocus())).toBe(true);
+    await expect(sidebar.locator('#tabWarning')).toBeHidden();
+  });
+
+  test('follows the user to another website instead of warning about a wrong tab', async ({ context, extensionId }) => {
     await context.route('https://outside.example/**', route => route.fulfill({
       status: 200,
       contentType: 'text/html',
-      body: '<h1>Autre onglet</h1>'
+      body: '<h1>Autre site</h1><p>Un article lu par l’utilisateur.</p>'
     }));
-    const { limova, sidebar } = await openExtensionHarness(context, extensionId);
+    const { sidebar } = await openExtensionHarness(context, extensionId);
     await grantAIConsent(sidebar);
     await sidebar.locator('#userInput').fill('Verrouille cette session');
     await sidebar.locator('#sendBtn').click();
@@ -1361,10 +1379,9 @@ test.describe('Packaged extension — complete user flows', () => {
     const outside = await context.newPage();
     await outside.goto('https://outside.example/');
     await outside.bringToFront();
-    await expect(sidebar.locator('#tabWarning')).toBeVisible();
 
-    await sidebar.locator('#tabWarning').click();
-    await expect.poll(() => limova.evaluate(() => document.hasFocus())).toBe(true);
+    await expect.poll(async () => (await sidebar.evaluate(() => chrome.runtime.sendMessage({ type: 'GET_LOGS' }))).logs)
+      .toContain('ASSISTANT_FOLLOWED_ACTIVE_TAB');
     await expect(sidebar.locator('#tabWarning')).toBeHidden();
   });
 });

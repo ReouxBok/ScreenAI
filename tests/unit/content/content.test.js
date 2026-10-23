@@ -400,6 +400,24 @@ describe('content.js — DOM helpers', () => {
       vi.useRealTimers();
     });
 
+    it('confirms a value the site briefly locks while it looks it up', async () => {
+      vi.useFakeTimers();
+      window.requestAnimationFrame = callback => setTimeout(callback, 0);
+      document.documentElement.dataset.limovaContextVersion = '16';
+      // Banque de France: the postal code field is disabled during its search request.
+      document.body.innerHTML = '<input data-lid="11" maxlength="5" aria-label="Renseigner votre code postal">';
+      const field = document.querySelector('input');
+      field.getBoundingClientRect = () => ({ left: 80, top: 60, width: 206, height: 50 });
+      field.addEventListener('change', () => { field.disabled = true; });
+
+      const action = content.executeElementTextInputWithCursor(11, 16, '75001');
+      await vi.advanceTimersByTimeAsync(1_100);
+
+      await expect(action).resolves.toMatchObject({ ok: true, inputVerified: true });
+      expect(field.value).toBe('75001');
+      vi.useRealTimers();
+    });
+
     it('scrolls an offscreen field into view before validating and filling it', async () => {
       vi.useFakeTimers();
       window.requestAnimationFrame = callback => setTimeout(callback, 0);

@@ -64,6 +64,25 @@ describe('reset conversation boundaries', () => {
     expect((await message({ type: 'GET_STATE' })).conversationHistory[0].content).toBe('Bonjour, nouvelle conversation');
   });
 
+  it.each([true, false])('still sends the user first name after a reset (ADK=%s)', async serverOrchestration => {
+    await prepareUserTurn(serverOrchestration);
+    await message({ type: 'LIMOVA_PROFILE', profile: { firstName: 'Camille', lastName: 'Martin' } });
+    await background.handleResetSession();
+
+    await message({ type: 'USER_MESSAGE', text: 'Comment je m’appelle ?' });
+
+    const turns = fetch.mock.calls.filter(([url]) => /\/(v2\/turn|api\/gemini)$/.test(String(url)));
+    expect(JSON.parse(turns.at(-1)[1].body)).toMatchObject({ resetContext: true, userFirstName: 'Camille' });
+  });
+
+  it('forgets the first name on logout', async () => {
+    await prepareUserTurn();
+    await message({ type: 'LIMOVA_PROFILE', profile: { firstName: 'Camille' } });
+    await message({ type: 'AUTH_LOGOUT' });
+
+    expect(chromeMock._storage.has('limova_user_first_name_v1')).toBe(false);
+  });
+
   it.each([503, 429])('cancels a pending retry after reset (HTTP %s)', async status => {
     await prepareUserTurn();
     vi.useFakeTimers();

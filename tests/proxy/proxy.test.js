@@ -410,6 +410,11 @@ describe('POST /api/live-token', () => {
     expect(body.bidiGenerateContentSetup.tools[0].functionDeclarations[5].description).toContain('Ne soumet jamais');
     expect(body.bidiGenerateContentSetup.tools[0].functionDeclarations[6].name).toBe('navigate_internal');
     expect(body.bidiGenerateContentSetup.tools[0].functionDeclarations[7].name).toBe('verify_expected_result');
+    // Extensions that do not announce any_site keep the Limova-only wording and tools.
+    expect(body.bidiGenerateContentSetup.tools[0].functionDeclarations.map(tool => tool.name)).not.toContain('open_page');
+    expect(body.bidiGenerateContentSetup.tools[0].functionDeclarations.map(tool => tool.name)).not.toContain('create_in_limova');
+    expect(body.bidiGenerateContentSetup.systemInstruction.parts[0].text).not.toContain('HORS DE LIMOVA');
+    expect(body.bidiGenerateContentSetup.systemInstruction.parts[0].text).toContain('piloter la page Limova');
     expect(body.fieldMask.split(',')).toEqual(expect.arrayContaining([
       'model',
       'generationConfig.responseModalities',
@@ -418,6 +423,50 @@ describe('POST /api/live-token', () => {
       'systemInstruction',
       'tools'
     ]));
+  });
+
+  it('lets an extension that follows every site open pages and read the page in front', async () => {
+    fetch.mockResolvedValueOnce({ ok: true, status: 200, json: async () => ({ revision: 'onboarding_v7', name: 'Trame', steps: [] }) })
+      .mockResolvedValueOnce({ ok: true, status: 200, json: async () => ({ name: 'authTokens/any-site' }) });
+
+    const res = await req().post('/api/live-token').send({ lang: 'fr', pageContext: 'Page: Le Monde', capabilities: ['any_site'] });
+
+    expect(res.status).toBe(200);
+    const body = JSON.parse(fetch.mock.calls.at(-1)[1].body);
+    const systemText = body.bidiGenerateContentSetup.systemInstruction.parts[0].text;
+    const declarations = body.bidiGenerateContentSetup.tools[0].functionDeclarations;
+    expect(systemText).toContain('n’importe quel autre site');
+    expect(systemText).toContain('Ne réponds jamais à partir d’une page précédente');
+    expect(systemText).toContain('piloter la page affichée');
+    expect(declarations.map(tool => tool.name)).toContain('open_page');
+    expect(declarations.find(tool => tool.name === 'open_page').parameters.required).toEqual(['url']);
+    expect(declarations.find(tool => tool.name === 'inspect_current_page').description).toContain('Limova ou autre site');
+    // 2.2.47 has no one-step handoff: it is told to write the request once in the chat.
+    expect(declarations.map(tool => tool.name)).not.toContain('create_in_limova');
+    expect(systemText).not.toContain('create_in_limova');
+    expect(systemText).toContain('CHAT LIMOVA');
+  });
+
+  it('hands content requests to Limova in one step for an extension that supports it', async () => {
+    fetch.mockResolvedValueOnce({ ok: true, status: 200, json: async () => ({ revision: 'onboarding_v7', name: 'Trame', steps: [] }) })
+      .mockResolvedValueOnce({ ok: true, status: 200, json: async () => ({ name: 'authTokens/handoff' }) });
+
+    const res = await req().post('/api/live-token').send({ lang: 'fr', pageContext: 'Page: Le Figaro', capabilities: ['any_site', 'limova_handoff'] });
+
+    expect(res.status).toBe(200);
+    const body = JSON.parse(fetch.mock.calls.at(-1)[1].body);
+    const systemText = body.bidiGenerateContentSetup.systemInstruction.parts[0].text;
+    const declarations = body.bidiGenerateContentSetup.tools[0].functionDeclarations;
+    const handoff = declarations.find(tool => tool.name === 'create_in_limova');
+    expect(handoff.parameters.required).toEqual(['request']);
+    expect(systemText).toContain('HORS DE LIMOVA');
+    expect(systemText).toContain('n’appelle pas search_knowledge_base pour une question sur ce site');
+    expect(declarations.find(tool => tool.name === 'search_knowledge_base').description).toContain('jamais pour un autre site');
+    expect(systemText).toContain('Appelle create_in_limova seulement après son oui');
+    expect(systemText).toContain('n’ouvre jamais Limova toi-même');
+    expect(systemText).toContain('« Je lance ? »');
+    expect(systemText).toContain('ne relance jamais une action, une navigation ou une création qui y figure');
+    expect(declarations.find(tool => tool.name === 'open_page').description).toContain('create_in_limova');
   });
 
   it('creates a tool-free passive token for a trainer demonstration', async () => {

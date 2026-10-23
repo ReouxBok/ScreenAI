@@ -658,6 +658,32 @@ function handleTrainingRecordingLimit() {
   elements.trainingFeedback.textContent = 'La limite d’une heure est atteinte. Cette tentative n’est pas validable : crée un flow plus court.';
 }
 
+// ============================================================================
+// Sites opened to Charly and handoff to Limova
+// ============================================================================
+
+// Any web page outside Limova can feed a request that Charly creates in Limova.
+async function activeTabSiteOrigin() {
+  const [tab] = await chrome.tabs.query({ active: true, currentWindow: true }).catch(() => []);
+  return siteOriginOf(tab?.url);
+}
+
+async function handOffToLimova(text) {
+  if (!(await ensureAIConsent())) return;
+  showPondering(t('handoffWorking'));
+  updateStatus('analyzing');
+  const result = await chrome.runtime.sendMessage({ type: 'HANDOFF_TO_LIMOVA', text }).catch(() => null);
+  hidePondering();
+  updateStatus('ready');
+  if (result?.ok) {
+    addMessage('assistant', t('handoffSent'));
+  } else if (result?.cancelled || result?.code === 'stopped') {
+    return;
+  } else {
+    addMessage('error', result?.error || t('handoffFailed'));
+  }
+}
+
 async function checkIfOnLimova() {
   const goBtn = document.getElementById('goToLimova');
   if (!goBtn) return;
@@ -753,6 +779,12 @@ function handleBackgroundMessage(message) {
       hidePondering();
       isLoading = false;
       showAIConsent();
+      break;
+
+    case 'AGENT_STOPPED':
+      hidePondering();
+      isLoading = false;
+      addMessage('system', t('agentStopped'));
       break;
 
     case 'ACTION_PROPOSAL':
@@ -1043,6 +1075,13 @@ async function sendMessage() {
   addMessage('user', text);
   elements.userInput.value = '';
   autoResizeTextarea();
+
+  if (isLimovaOutputRequest(text) && await activeTabSiteOrigin()) {
+    await handOffToLimova(text);
+    isLoading = false;
+    return;
+  }
+
   showPondering();
   updateStatus('analyzing');
 
