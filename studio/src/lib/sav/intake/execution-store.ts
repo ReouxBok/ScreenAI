@@ -2,12 +2,12 @@ import "server-only";
 import { SAV_INTAKE_OPERATIONAL_PROFILE, intakeAdmissionUsage } from "./budget-profile";
 import { intakeConsoleInstalled } from "./console-capability";
 import { intakeRunConfigurationBound, intakeHumanRefused } from "./human-binding";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import {canAccessSav} from "../access";
 import {executionPolicySchema} from "./execution-policy";
 import { and, desc, eq, inArray, sql } from "drizzle-orm";
 import { requireDb } from "@/db";
-import { staffUsers,savIntakeExecutionPolicies,savActions, savThreads, savMessages, savIntakeRuns, savSyncState, savIntakeExecutions, savIntakeEffects, savIntakeEffectJournal, savIntakeOccupations, savIntakeExecutionBudget, savIntakeIdentityEpisodes, savIntakeEffectRevisions } from "@/db/schema";
+import { staffUsers,savMailboxes,savIntakeHumanEvents,savIntakeExecutionPolicies,savActions, savThreads, savMessages, savIntakeRuns, savSyncState, savIntakeExecutions, savIntakeEffects, savIntakeEffectJournal, savIntakeOccupations, savIntakeExecutionBudget, savIntakeIdentityEpisodes, savIntakeEffectRevisions } from "@/db/schema";
 import { encryptSavPayload, decryptSavPayload } from "../crypto";
 import { intakeRuntimeHash, assertSavIntakeObservation } from "./runtime-contract";
 import { readSavIntakeCurrent, savIntakeSourceSnapshot } from "./runtime-store";
@@ -322,6 +322,50 @@ export async function confirmExecutionEffect(effect: Effect, proof: unknown, ack
             } : {})
         }).where(eq(savIntakeEffects.id, effect.id));
         await executionJournal(tx, row.executionId, "confirmed", proof, row.id);
+    });
+}
+/** Complete only the local record of an already verified identification send.
+ * No authority is resurrected and this operation has no dispatch capability. */
+export async function finishVerifiedIdentityRecovery(executionId: string) {
+    return requireDb().transaction(async tx => {
+        await admissionLock(tx);
+        const [row] = await tx.select().from(savIntakeExecutions).where(eq(savIntakeExecutions.id, executionId)).for("no key update");
+        if (!row || ["confirmed", "refused"].includes(row.state) || row.leaseUntil && row.leaseUntil > new Date()) return false;
+        const [thread] = await tx.select().from(savThreads).where(eq(savThreads.id, row.threadId)).for("update");
+        const [message] = await tx.select().from(savMessages).where(eq(savMessages.id, row.messageId));
+        const [latest] = await tx.select({id:savMessages.id}).from(savMessages).where(and(eq(savMessages.threadId,row.threadId),eq(savMessages.direction,"inbound")))
+            .orderBy(desc(savMessages.receivedAt),desc(savMessages.createdAt),desc(savMessages.id)).limit(1);
+        const [run] = await tx.select().from(savIntakeRuns).where(eq(savIntakeRuns.id,row.runId)).for("update");
+        const [pending] = await tx.select({id:savIntakeHumanEvents.id}).from(savIntakeHumanEvents)
+            .where(and(eq(savIntakeHumanEvents.messageId,row.messageId),inArray(savIntakeHumanEvents.state,["pending","reading"]))).limit(1);
+        const effects = await tx.select().from(savIntakeEffects).where(eq(savIntakeEffects.executionId,row.id)).for("update");
+        const effect = effects[0], payload = decryptSavPayload<ExecutionPayload>(row.payloadCiphertext), d = payload.plan.decision.disposition;
+        if (!thread || thread.aiPaused || !message || message.direction!=="inbound" || message.mailboxId!==thread.mailboxId || latest?.id!==message.id
+            || !run?.isCurrent || run.messageId!==message.id || run.threadId!==thread.id || run.version!==row.runVersion || payload.lastRunId!==run.id
+            || run.leaseUntil && run.leaseUntil>new Date() || run.humanChoiceCiphertext!==payload.local.humanChoice
+            || pending || await intakeHumanRefused(message.id,tx) || row.ticketId!==null || d.kind!=="request_identification" || payload.plan.decision.messageId!==message.id
+            || intakeRuntimeHash({mailbox:thread.mailboxId,gmail:thread.gmailThreadId,customer:thread.customerEmail})!==payload.local.threadIdentityHash
+            || effects.length!==1 || effect.kind!=="identity_send" || effect.state!=="confirmed" || !effect.dispatchedAt || !effect.confirmedAt
+            || !effect.ackCiphertext || !effect.verificationCiphertext || payload.acceptedFingerprint!==savIntakePlanFingerprint(payload.plan)
+            || run.sourceHash!==payload.local.sourceHash || executionMessageHash(message)!==payload.local.messageHash) return false;
+        const plan = decryptSavPayload<{plan?:unknown}>(run.payloadCiphertext).plan;
+        const intent = decryptSavPayload<EffectIntent>(effect.intentCiphertext), ack = decryptSavPayload<EffectAck>(effect.ackCiphertext);
+        const proof = decryptSavPayload<{confirmed?:boolean;attributed?:boolean;ack?:EffectAck}>(effect.verificationCiphertext);
+        const [mailbox] = await tx.select().from(savMailboxes).where(eq(savMailboxes.id,thread.mailboxId));
+        if (intakeRuntimeHash(plan)!==intakeRuntimeHash(payload.plan) || intent.kind!=="identity_send" || intent.permission!=="send_identity_template"
+            || effect.intentHash!==intakeRuntimeHash(intent) || intent.sourceMessageId!==message.id || intent.mailbox!==mailbox?.email || intent.threadId!==thread.gmailThreadId
+            || intent.recipient!==message.fromEmail || payload.plan.originalRecipientEmails.length!==1 || payload.plan.originalRecipientEmails[0]!==intent.recipient
+            || !ack.id || proof.confirmed!==true || proof.attributed!==true || proof.ack?.id!==ack.id || !intent.text || !intent.resource
+            || createHash("sha256").update(intent.text).digest("hex")!==intent.resource.sha256
+            || intakeRuntimeHash(intent.resource)!==intakeRuntimeHash({resourceId:d.template.resourceId,revisionId:d.template.revisionId,sha256:d.template.sha256})) return false;
+        const completion = {sourceHash:(await savIntakeSourceSnapshot(tx,message,new Date())).sourceHash,messageHash:executionMessageHash(message)};
+        if (completion.sourceHash!==payload.local.sourceHash) return false;
+        await tx.update(savIntakeExecutions).set({state:"confirmed",leaseToken:null,leaseUntil:null,payloadCiphertext:encryptSavPayload({...payload,reason:undefined,effectsConfirmed:true,completion}),updatedAt:new Date()})
+            .where(eq(savIntakeExecutions.id,row.id));
+        await tx.update(savMessages).set({analysisStatus:"intake_execution_identity_wait"}).where(eq(savMessages.id,message.id));
+        await releaseKeys(tx,row.id);
+        await executionJournal(tx,row.id,"verified_identity_recovery_finished",{messageId:message.id,effectId:effect.id,dispatch:false});
+        return true;
     });
 }
 export async function deferExecutionEffect(effect: Effect, reason: string) {

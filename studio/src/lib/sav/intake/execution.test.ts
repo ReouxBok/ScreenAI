@@ -22,9 +22,9 @@ import { planSavIntake } from "./engine";
 import { createSavIntakeHubspotReaders } from "./hubspot-readers";
 import { savIntakeRuntimeConfig, intakeRuntimeHash, SAV_INTAKE_RUNTIME_REVISION } from "./runtime-contract";
 import { executionPolicySchema, executionAdministrator, intakeExecutionConfig, approveIntakeExecutionPolicy, revokeIntakeExecutionPolicy, readIntakeExecutionAuthority, type ExecutionPolicy } from "./execution-policy";
-import { enqueueSavIntakeMessage, claimSavIntakeRun, saveSavIntakeResult } from "./runtime-store";
+import { enqueueSavIntakeMessage, claimSavIntakeRun, saveSavIntakeResult, catchupSavIntake } from "./runtime-store";
 import { createIntakeExecutorAdapters } from "./execution-adapters";
-import { admitIntakeExecution, getExecutionEffects, occupationSchemaInstalled, assertNoLegacyConflict, claimExecution, endExecutionPass, occupyKeys } from "./execution-store";
+import { admitIntakeExecution, getExecutionEffects, occupationSchemaInstalled, assertNoLegacyConflict, claimExecution, endExecutionPass, occupyKeys, finishVerifiedIdentityRecovery } from "./execution-store";
 import { executeIntakePass, readIntakeExecutionProgress, reconcileIntakeEffectsReadOnly, reconcileIntakeExecutor, reconcileIntakeEffectCandidate, scanIntakeExecutionCandidates, pendingIntakeEffectRecoveries } from "./executor";
 import { guardLegacyIntakeOccupation, withLegacyOccupationAction, markLegacyIntakeDispatch, releaseLegacyIntakeIfConfirmed } from "./legacy-occupation";
 import type { ExecutionOptions, EffectIntent, EffectAck } from "./execution-types";
@@ -898,4 +898,62 @@ it("a recovery no-send scope blocks even an already admitted identification exec
  await f.db.update(savIntakeExecutions).set({payloadCiphertext:encryptSavPayload(payload)}).where(eq(savIntakeExecutions.id,row.id));
  expect(await executeIntakePass(row.id,options)).toMatchObject({state:"waiting",reason:"SAV_INTAKE_EXECUTION_OUTBOUND_SUPERVISED"});
  expect(p.calls.filter(c=>c.path==="gmail/messages/send")).toHaveLength(0);expect(await getExecutionEffects(row.id)).toHaveLength(0);
+});
+
+async function verifiedIdentityAfterRevocation() {
+    p.setContacts([]);
+    const row = await admission(), verify = options.adapters.verify;
+    options.adapters.verify = async () => ({confirmed:false,attributed:false});
+    expect(await executeIntakePass(row.id,options)).toMatchObject({state:"uncertain"});
+    const effect = (await getExecutionEffects(row.id))[0];
+    await f.db.update(savIntakeEffects).set({reconcileAttempts:5}).where(eq(savIntakeEffects.id,effect.id));
+    await revokeIntakeExecutionPolicy(options.config.policyId,"Synthetic rotation after a real verified send");
+    options.adapters.verify = verify;
+    const ack = decryptSavPayload<EffectAck>(effect.ackCiphertext!);
+    await reconcileIntakeEffectCandidate(effect.id,ack.id!,"Synthetic existing sent receipt, never resend",options.adapters);
+    return row;
+}
+it("finalizes a verified identity receipt after revoked authority without dispatch, reset or readmission", async () => {
+    const row = await verifiedIdentityAfterRevocation();
+    const before = p.calls.length, budget = await f.db.select().from(savIntakeExecutionBudget);
+    expect(await finishVerifiedIdentityRecovery(row.id)).toBe(true);
+    expect(await finishVerifiedIdentityRecovery(row.id)).toBe(false);
+    expect(await readIntakeExecutionProgress(messageId)).toMatchObject({confirmed:true,ticketId:null,reason:null});
+    expect((await f.db.select().from(savMessages).where(eq(savMessages.id,messageId)))[0].analysisStatus).toBe("intake_execution_identity_wait");
+    expect(await f.db.select().from(savIntakeOccupations)).toHaveLength(0);
+    expect(await f.db.select().from(savIntakeExecutionBudget)).toEqual(budget);
+    expect((await getExecutionEffects(row.id))[0].reconcileAttempts).toBe(5);
+    expect(p.calls).toHaveLength(before);
+    expect(p.calls.filter(c=>c.path==="gmail/messages/send")).toHaveLength(1);
+});
+it.each(["new-inbound","changed-source","superseded-run","active-lease","missing-proof","changed-intent","paused"])("identity receipt finalization preserves the %s barrier", async scenario => {
+    const row = await verifiedIdentityAfterRevocation(), before = p.calls.length;
+    if(scenario==="new-inbound") await storedMessage(threadId,new Date(Date.now()+1));
+    if(scenario==="changed-source") await f.db.update(savMessages).set({bodyCiphertext:encryptSavPayload({text:"Changed source"})}).where(eq(savMessages.id,messageId));
+    if(scenario==="superseded-run") await f.db.update(savIntakeRuns).set({isCurrent:false}).where(eq(savIntakeRuns.id,runId));
+    if(scenario==="active-lease") await f.db.update(savIntakeExecutions).set({leaseUntil:new Date(Date.now()+60000)}).where(eq(savIntakeExecutions.id,row.id));
+    if(scenario==="missing-proof") await f.db.update(savIntakeEffects).set({verificationCiphertext:null}).where(eq(savIntakeEffects.executionId,row.id));
+    if(scenario==="changed-intent") await f.db.update(savIntakeEffects).set({intentHash:"0".repeat(64)}).where(eq(savIntakeEffects.executionId,row.id));
+    if(scenario==="paused") await f.db.update(savThreads).set({aiPaused:true}).where(eq(savThreads.id,threadId));
+    expect(await finishVerifiedIdentityRecovery(row.id)).toBe(false);
+    expect((await f.db.select().from(savIntakeExecutions).where(eq(savIntakeExecutions.id,row.id)))[0].state).toBe("uncertain");
+    expect(p.calls).toHaveLength(before);
+});
+it.each(["confirmed","departed","dispatch-marker"])("configuration catchup preserves %s receipts and still accepts new inbound", async scenario => {
+    p.setContacts([]);
+    const row = await admission();
+    if(scenario==="confirmed") await executeIntakePass(row.id,options);
+    else {
+        options.adapters.verify=async()=>({confirmed:false,attributed:false});
+        await executeIntakePass(row.id,options);
+        if(scenario==="dispatch-marker") await f.db.update(savIntakeEffects).set({state:"planned"}).where(eq(savIntakeEffects.executionId,row.id));
+    }
+    const runs = await f.db.select().from(savIntakeRuns), rotated = {...options.runtime,codeRevision:"b".repeat(40),configHash:intakeRuntimeHash("rotated")};
+    expect(await catchupSavIntake(rotated)).toBe(0);
+    expect(await enqueueSavIntakeMessage(messageId,rotated)).toBeNull();
+    expect(await f.db.select().from(savIntakeRuns)).toEqual(runs);
+    const newer = await storedMessage(threadId,new Date(Date.now()+1));
+    expect(await enqueueSavIntakeMessage(newer.id,rotated)).toBeTruthy();
+    expect((await f.db.select().from(savIntakeRuns).where(eq(savIntakeRuns.isCurrent,true)))[0].messageId).toBe(newer.id);
+    expect(p.calls.filter(c=>c.path==="gmail/messages/send")).toHaveLength(1);
 });

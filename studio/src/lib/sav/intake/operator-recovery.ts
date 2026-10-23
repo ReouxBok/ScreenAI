@@ -7,7 +7,7 @@ import {staffUsers,savThreads,savMessages,savIntakeRuns,savIntakeJournal,savInta
 import {canAccessSav} from "../access";
 import {decryptSavPayload,encryptSavPayload} from "../crypto";
 import {executionAdministrator} from "./execution-policy";
-import {admissionLock} from "./execution-store";
+import {admissionLock,finishVerifiedIdentityRecovery} from "./execution-store";
 import {intakeHumanRefused,operatorRecoveryConfigHash,type HumanEventPayload} from "./human-binding";
 import {intakeLaunchMatches} from "./launch-boundary";
 import {savIntakeSourceSnapshot} from "./runtime-store";
@@ -79,5 +79,6 @@ export async function reconcileThreadIdentification(threadId:string){
  const {verify}=createIntakeExecutorAdapters();
  for(const e of effects){const ack=e.ackCiphertext?decryptSavPayload<{id?:string}>(e.ackCiphertext):null;if(!ack?.id)return conflict();
   await reconcileIntakeEffectCandidate(e.id,ack.id,"Rapprochement du reçu Gmail existant après correction de l’identifiant de transport ; aucun renvoi.",{verify});confirmed++;}
+ for(const execution of executions)await finishVerifiedIdentityRecovery(execution.id);
  return {confirmed};
 }
