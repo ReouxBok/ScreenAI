@@ -8,7 +8,7 @@ import { historicalMessageSql, historicalThreadSql, intakeMessageHistorical } fr
 import type { IntakeRuntimePayload } from "./runtime-contract";
 import { savIntakeViewSchema, type SavIntakeView } from "./contract";
 import { intakeConsoleInstalled } from "./console-capability";
-import { savIntakeSourceSnapshot } from "./runtime-store";
+import { savIntakeSourceSnapshot, intakeSourceMatches } from "./runtime-store";
 import { intakeDossierSensitive } from "./observation-binding";
 import { readIntakeExecutionProgress } from "./executor";
 export type ConsoleProjection = { view: SavIntakeView | null; status: string; reason: string | null };
@@ -31,11 +31,11 @@ export async function projectIntakeThread(threadId: string, beforePublish?: () =
     const [refused] = await db.select().from(savIntakeHumanEvents).where(and(eq(savIntakeHumanEvents.messageId, run.messageId), eq(savIntakeHumanEvents.kind, "refuse"))).limit(1);
     const [pending] = await db.select().from(savIntakeHumanEvents).where(and(eq(savIntakeHumanEvents.parentRunId, run.id), sql`${savIntakeHumanEvents.state} in ('pending','reading','waiting')`)).limit(1);
     const progress = await readIntakeExecutionProgress(run.messageId);
-    const localHash = await db.transaction(async tx => (await savIntakeSourceSnapshot(tx, message, new Date())).sourceHash);
+    const local = await db.transaction(async tx => savIntakeSourceSnapshot(tx, message, new Date()));
     if (refused) result = { view: "to_validate", status: "human_refused", reason: "Proposition refusée par un opérateur" };
     else if (pending) result = { view: null, status: "human_revalidation", reason: "Choix enregistré, revalidation en cours" };
-    else if (progress?.confirmed && progress.completionSourceHash !== localHash) result = {view:null,status:"context_changed",reason:"Les sources locales ont changé depuis le résultat confirmé"};
-    else if (!progress?.confirmed && run.sourceHash !== localHash) result = {view:null,status:"context_changed",reason:"Les sources locales doivent être réinvestiguées"};
+    else if (progress?.confirmed && !intakeSourceMatches(local, progress.completionSourceHash)) result = {view:null,status:"context_changed",reason:"Les sources locales ont changé depuis le résultat confirmé"};
+    else if (!progress?.confirmed && !intakeSourceMatches(local, run.sourceHash)) result = {view:null,status:"context_changed",reason:"Les sources locales doivent être réinvestiguées"};
     else if (progress?.confirmed && progress.runId === run.id) {
       if (!progress.ticketId) result = { view: "missing_contact", status: "identity_sent", reason: null };
       else {

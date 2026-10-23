@@ -8,7 +8,7 @@ import { randomUUID } from "node:crypto";
 import { and, desc, eq, gt, inArray, lt, lte, or, sql } from "drizzle-orm";
 import { requireDb } from "@/db";
 import { savMessages, savThreads, savIntakeRuns, savIntakeJournal, savIntakeModelCalls, savIntakeHumanEvents, savIntakeIdentityEpisodes, savIntakeEffects, savIntakeExecutions } from "@/db/schema";
-import { decryptSavPayload, encryptSavPayload } from "../crypto";
+import { decryptSavPayload, encryptSavPayload, savContentHash } from "../crypto";
 import { savAttachmentInventorySchema } from "../attachment-contract";
 import { prepareSavIntakeMessage } from "./message";
 import { savDerivedCostQuote } from "../derived-budget";
@@ -38,6 +38,23 @@ const latest = async (tx: Tx, threadId: string) => (await tx.select().from(savMe
 const journal = async (tx: Tx, runId: string, kind: string, value: unknown) => {
   await tx.insert(savIntakeJournal).values({ runId, kind, payloadCiphertext: encryptSavPayload(value) });
 };
+export const SAV_INTAKE_SOURCE_REVISION = "sav-intake-source.v2";
+/** Exchanged content only: supportContext, attachmentRead and other derived fields are excluded. */
+function intakeSourceContentHash(bodyCiphertext: string) {
+  const body = decryptSavPayload<Body & { html?: string }>(bodyCiphertext);
+  return savContentHash({ text: body.text, html: body.html ?? null, headers: body.headers ?? null,
+    attachments: body.attachments ?? null, attachmentInventory: body.attachmentInventory ?? null });
+}
+/** A recorded hash still describes the current sources if it matches v2, or the
+ * v1 value of a run recorded before the upgrade. Never compare snapshots with !==. */
+export function intakeSourceMatches(snapshot: { sourceHash: string; legacySourceHash: string }, recorded: string | null | undefined) {
+  return typeof recorded === "string" && recorded.length > 0 && (recorded === snapshot.sourceHash || recorded === snapshot.legacySourceHash);
+}
+/** Keep the recorded value while the sources still match, so equality between
+ * recorded hashes (run, completion, binding) survives the v2 upgrade. */
+export function intakeRecordedSourceHash(snapshot: { sourceHash: string; legacySourceHash: string }, recorded: string | null | undefined) {
+  return intakeSourceMatches(snapshot, recorded) ? recorded! : snapshot.sourceHash;
+}
 export async function savIntakeSourceSnapshot(tx: Pick<Tx, "select">, message: typeof savMessages.$inferSelect, now: Date) {
   const rows = await tx.select().from(savMessages).where(and(eq(savMessages.threadId, message.threadId), lte(savMessages.receivedAt, message.receivedAt)))
     .orderBy(desc(savMessages.receivedAt), desc(savMessages.createdAt), desc(savMessages.id)).limit(51);
@@ -65,10 +82,19 @@ export async function savIntakeSourceSnapshot(tx: Pick<Tx, "select">, message: t
       identificationContinuation = {initialMessageId:initial.id,confirmedEffectId:effect.id};
     }
   }
-  return { sourceHash: intakeRuntimeHash({ rows: rows.map(row => ({ id: row.id, threadId: row.threadId, mailboxId: row.mailboxId,
-      fromEmail: row.fromEmail, toEmails: row.toEmails, subject: row.subject, direction: row.direction, bodyCiphertext: row.bodyCiphertext, receivedAt: row.receivedAt })),
-      ...(identificationContinuation ? {identificationContinuation} : {}),
-      thread: (await tx.select({ updatedAt: savThreads.updatedAt, aiPaused: savThreads.aiPaused, humanRequestedAt: savThreads.humanRequestedAt, ticketId: savThreads.hubspotTicketId }).from(savThreads).where(eq(savThreads.id, message.threadId)))[0] }), body: current.body, provenance: new Map(prepared.map(p => [p.message.id, p.provenance])),
+  const [thread] = await tx.select({ updatedAt: savThreads.updatedAt, aiPaused: savThreads.aiPaused, humanRequestedAt: savThreads.humanRequestedAt, ticketId: savThreads.hubspotTicketId }).from(savThreads).where(eq(savThreads.id, message.threadId));
+  const identity = (row: typeof rows[number]) => ({ id: row.id, threadId: row.threadId, mailboxId: row.mailboxId,
+    fromEmail: row.fromEmail, toEmails: row.toEmails, subject: row.subject, direction: row.direction, receivedAt: row.receivedAt });
+  // v2 hashes what the customer and the team actually exchanged. Ciphertext is
+  // re-encrypted with a fresh IV whenever derived data (CRM context, attachment
+  // reads) is stored, and thread timestamps/pause flags move without new
+  // evidence: neither may invalidate an analysis on its own.
+  const sourceHash = intakeRuntimeHash({ revision: SAV_INTAKE_SOURCE_REVISION, rows: rows.map(row => ({ ...identity(row), content: intakeSourceContentHash(row.bodyCiphertext) })),
+    ...(identificationContinuation ? {identificationContinuation} : {}), thread: { ticketId: thread?.ticketId ?? null } });
+  // v1, kept only to recognize runs recorded before the v2 upgrade.
+  const legacySourceHash = intakeRuntimeHash({ rows: rows.map(row => ({ ...identity(row), bodyCiphertext: row.bodyCiphertext })),
+    ...(identificationContinuation ? {identificationContinuation} : {}), thread });
+  return { sourceHash, legacySourceHash, body: current.body, provenance: new Map(prepared.map(p => [p.message.id, p.provenance])),
     input: { message: current.message, latestInboundMessageId: message.id, mode: "current", now: now.toISOString(), identificationAttemptId: message.id,
       ...(identificationContinuation ? {previousIdentification,identificationContinuation} : {}),
       conversation: { data: prepared.map(p => p.message).reverse(), status: rows.length > 50 ? "partial" : "complete", observedAt: now.toISOString() } } satisfies EngineInput };
@@ -178,7 +204,7 @@ async function assertLease(tx: Tx, lease: IntakeLease, config: IntakeRuntimeConf
   const message = await latest(tx, lease.run.threadId);
   if (!thread || thread.aiPaused || !run?.isCurrent || run.state !== "analysing" || run.leaseToken !== lease.token || !run.leaseUntil || run.leaseUntil <= now
     || run.humanChoiceCiphertext !== lease.run.humanChoiceCiphertext || !await intakeRunConfigurationBound(run, config, tx) || Date.parse(config.expiresAt) <= now.getTime() || message?.id !== run.messageId) return fail();
-  if ((await savIntakeSourceSnapshot(tx, message, now)).sourceHash !== lease.sourceHash) return fail();
+  if (!intakeSourceMatches(await savIntakeSourceSnapshot(tx, message, now), lease.sourceHash)) return fail();
   return run;
 }
 export async function assertSavIntakeLease(lease: IntakeLease, config: IntakeRuntimeConfig, now = new Date()) {
@@ -259,7 +285,7 @@ async function assertHumanAnalysis(tx:Tx, authority:IntakeHumanAnalysisAuthority
   const [message]=await tx.select().from(savMessages).where(eq(savMessages.id,run.messageId));
   if(!message||body.parentPayloadHash!==intakeRuntimeHash(decryptSavPayload(run.payloadCiphertext))||body.policyHash!==config.policyHash||body.resourcesHash!==config.resourcesHash
     ||!body.reinvestigate&&(body.classification===undefined||body.classification==="other")||(await latest(tx,run.threadId))?.id!==run.messageId
-    ||(await savIntakeSourceSnapshot(tx,message,now)).sourceHash!==run.sourceHash)return fail();
+    ||!intakeSourceMatches(await savIntakeSourceSnapshot(tx,message,now),run.sourceHash))return fail();
   return run;
 }
 export async function assertIntakeHumanAnalysis(authority:IntakeHumanAnalysisAuthority,config:IntakeRuntimeConfig) {
@@ -324,8 +350,10 @@ export async function readSavIntakeCurrent(threadId: string, config?: IntakeRunt
   const [thread] = await db.select().from(savThreads).where(eq(savThreads.id, threadId));
   const [message] = await db.select().from(savMessages).where(and(eq(savMessages.threadId, threadId), eq(savMessages.direction, "inbound")))
     .orderBy(desc(savMessages.receivedAt), desc(savMessages.createdAt), desc(savMessages.id)).limit(1);
-  const currentSourceHash = message?.id === run.messageId ? await db.transaction(async tx => (await savIntakeSourceSnapshot(tx, message, now)).sourceHash) : null;
-  const sourceMatches = currentSourceHash !== null && currentSourceHash === run.sourceHash;
+  const snapshot = message?.id === run.messageId ? await db.transaction(async tx => savIntakeSourceSnapshot(tx, message, now)) : null;
+  const sourceMatches = snapshot !== null && intakeSourceMatches(snapshot, run.sourceHash);
+  // Downstream bindings compare against the recorded run hash; expose it when the sources still match.
+  const currentSourceHash = snapshot === null ? null : sourceMatches ? run.sourceHash : snapshot.sourceHash;
   const payload=decryptSavPayload<IntakeRuntimePayload>(run.payloadCiphertext);
   const candidateContactIds=await intakeRunCandidateContactIds(run,payload);
   const events = await db.select().from(savIntakeJournal).where(eq(savIntakeJournal.runId, run.id)).orderBy(savIntakeJournal.createdAt, savIntakeJournal.id);
