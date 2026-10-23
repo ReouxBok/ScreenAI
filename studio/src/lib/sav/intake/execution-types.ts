@@ -43,6 +43,7 @@ export type EffectIntent = {
     objectId?: string;
     properties?: Record<string, string>;
     expectedProperties?: Record<string, string>;
+    confirmedNoteCreate?: { effectId: string; objectId: string };
     text?: string;
     marker?: string;
     mailbox?: string;

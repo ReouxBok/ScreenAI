@@ -958,3 +958,43 @@ it.each(["confirmed","departed","dispatch-marker"])("configuration catchup prese
     expect((await f.db.select().from(savIntakeRuns).where(eq(savIntakeRuns.isCurrent,true)))[0].messageId).toBe(newer.id);
     expect(p.calls.filter(c=>c.path==="gmail/messages/send")).toHaveLength(1);
 });
+
+// Historical persisted intent and provider normalization, using synthetic data only.
+it.each(["stored-ack", "missing-ack", "changed-text"] as const)("historical note reconciliation preserves %s attribution and never sends a second note", async scenario => {
+    p.seedTicket({ stage: "new" });
+    const row = await admission();
+    expect(await executeIntakePass(row.id, options, {
+        afterAck: async effect => {
+            if (effect.kind !== "note_create") return;
+            const intent = decryptSavPayload<EffectIntent>(effect.intentCiphertext);
+            const currentBody = intent.properties!.hs_note_body;
+            const markerParagraph = `<p>[Studio intake: ${intent.marker}]</p>`;
+            const body = currentBody.slice(0, -markerParagraph.length);
+            intent.properties!.hs_note_body = `${body}<!-- sav-intake:${intent.marker} -->`;
+            const [stored] = (await getExecutionEffects(row.id)).filter(e => e.id === effect.id);
+            const noteId = decryptSavPayload<EffectAck>(stored.ackCiphertext!).id!;
+            p.objects.notes[noteId].properties.hs_note_body = body + (scenario === "changed-text" ? "Edited" : "\n");
+            await f.db.update(savIntakeEffects).set({ intentCiphertext: encryptSavPayload(intent), ...(scenario === "missing-ack" ? { ackCiphertext: null } : {}) }).where(eq(savIntakeEffects.id, effect.id));
+            throw Error("SYNTHETIC_CRASH_AFTER_NOTE_ACK");
+        }
+    })).toMatchObject({ state: "uncertain" });
+    const noteEffect = (await getExecutionEffects(row.id)).find(e => e.kind === "note_create")!;
+    expect(noteEffect.state).toBe("uncertain");
+    const noteId = Object.keys(p.objects.notes)[0];
+    if (scenario === "missing-ack") {
+        await expect(reconcileIntakeEffectCandidate(noteEffect.id, noteId, "Synthetic operator ID is not a provider receipt", options.adapters)).rejects.toThrow("RECONCILIATION_REQUIRED");
+        expect((await getExecutionEffects(row.id)).find(e => e.id === noteEffect.id)?.ackCiphertext).toBeNull();
+    }
+    await f.db.update(savIntakeEffects).set({ nextReconcileAt: null }).where(eq(savIntakeEffects.id, noteEffect.id));
+    await reconcileIntakeEffectsReadOnly(row.id, options.adapters);
+    const recovered = (await getExecutionEffects(row.id)).find(e => e.id === noteEffect.id)!;
+    expect(recovered.state).toBe(scenario === "stored-ack" ? "confirmed" : "uncertain");
+    expect(await executeIntakePass(row.id, options)).toMatchObject({ state: scenario === "stored-ack" ? "confirmed" : "uncertain" });
+    expect(p.calls.filter(c => c.method === "POST" && c.path.endsWith("/notes"))).toHaveLength(1);
+    expect(p.links.get(`notes:${noteId}:tickets`) ?? []).toEqual(scenario === "stored-ack" ? ["201"] : []);
+    if (scenario === "stored-ack") {
+        const association = (await getExecutionEffects(row.id)).find(e => e.kind === "note_associate")!;
+        expect(decryptSavPayload<EffectIntent>(association.intentCiphertext).confirmedNoteCreate).toEqual({ effectId: noteEffect.id, objectId: noteId });
+        expect(association.state).toBe("confirmed");
+    }
+}, 20000);

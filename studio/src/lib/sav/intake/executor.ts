@@ -121,11 +121,11 @@ async function nextIntent(lease: ExecutionLease, effects: Effect[], options: Exe
         };
     }
     if (plan.noteText && !confirmed("note_associate")) {
-        const id = ack(confirmed("note_create")!)?.id;
+        const creation = confirmed("note_create")!, id = ack(creation)?.id;
         if (!id)
             return fault("NOTE_ACK_MISSING");
         return {
-            kind: "note_associate", permission: "append_ticket_note", key: `note-association:${messageId}:${ticketId}`, ticketId, objectId: id, sourceMessageId: messageId, expectedProperties: effectIntent(confirmed("note_create")!).properties
+            kind: "note_associate", permission: "append_ticket_note", key: `note-association:${messageId}:${ticketId}`, ticketId, objectId: id, sourceMessageId: messageId, expectedProperties: effectIntent(creation).properties, confirmedNoteCreate: { effectId: creation.id, objectId: id }
         };
     }
     if (!confirmed("email_create")) {
@@ -433,7 +433,7 @@ export async function reconcileIntakeEffectCandidate(effectId: string, candidate
     if (intent.objectId && intent.objectId !== candidateId || intent.kind === "stage_new" && intent.ticketId !== candidateId)
         throw Error("SAV_INTAKE_EXECUTION_ACK_CONFLICT");
     const proof = await adapters.verify(intent, {
-        ...original, id: candidateId
+        ...original, id: candidateId, ...(!original?.id ? { operatorCandidate: true } : {})
     }, effect.dispatchedAt, AbortSignal.timeout(15000));
     await requireDb().transaction(tx => executionJournal(tx, effect.executionId, "operator_candidate_checked", {
         administratorId: administrator.id, candidateId, reason: reason.trim(), confirmed: proof.confirmed, attributed: proof.attributed
