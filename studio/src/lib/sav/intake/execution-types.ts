@@ -15,6 +15,7 @@ export type CrmSnapshot = {
 };
 export type ExecutionPayload = {
     runtimeConfigHash: string;
+    authorityContinuityId?: string;
     plan: IntakePlan;
     input: unknown;
     local: {
@@ -32,6 +33,7 @@ export type ExecutionPayload = {
     lastRunId: string;
     acceptedFingerprint: string;
     effectsConfirmed?: boolean;
+    concurrentHistoryHash?: string;
     completion?: { sourceHash: string; messageHash: string };
 };
 export type EffectIntent = {

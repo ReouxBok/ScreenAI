@@ -2,6 +2,7 @@ import "server-only";
 import { listSavExternalCompletionMessageIds } from "../external-completion";
 import { releaseNeverDispatchedIntakeScopes } from "./execution-store";
 import { intakeRunConfigurationBound } from "./human-binding";
+import { intakeExecutionConfigurationBound } from "./execution-continuity";
 import { createHash } from "node:crypto";
 import { and, eq, inArray, lte, or, sql } from "drizzle-orm";
 import { requireDb } from "@/db";
@@ -16,7 +17,7 @@ import { assertOriginalExecutionCrm, assertExecutionCrmUnchanged } from "./execu
 import { admitIntakeExecution, claimExecution, claimEffectRecovery, withEffectRecoveryLease, releaseEffectRecovery, activeExecutionEffects, adoptCurrentExecutionVersion, assertExecutionLocal, saveExecutionPayload, expandExecutionScope, getExecutionEffects, ensureExecutionEffect, markEffectDispatched, recordEffectAck, confirmExecutionEffect, deferExecutionEffect, endExecutionPass, identityEpisodeEffect, finishExecution, executionJournal, releaseRecoveredExecutionScope, occupationSchemaInstalled, type ExecutionLease, type ExecutionTx } from "./execution-store";
 import type { Effect, EffectIntent, EffectAck, ExecutorAdapters, ExecutionOptions, ExecutionPayload, EffectKind } from "./execution-types";
 const fault = (code: string): never => { throw Error(`SAV_INTAKE_EXECUTION_${code}`); };
-const code = (e: unknown) => e instanceof Error && /^SAV_[A-Z_]+$/.test(e.message) ? e.message : "SAV_INTAKE_EXECUTION_INTERRUPTED";
+const code = (e: unknown) => e instanceof Error && /^SAV_[A-Z0-9_]+$/.test(e.message) ? e.message : "SAV_INTAKE_EXECUTION_INTERRUPTED";
 const ack = (e: Effect) => e.ackCiphertext ? decryptSavPayload<EffectAck>(e.ackCiphertext) : null;
 const effectIntent = (e: Effect) => decryptSavPayload<EffectIntent>(e.intentCiphertext);
 export function requiredExecutionKinds(payload: ExecutionPayload): EffectKind[] {
@@ -171,7 +172,7 @@ async function live(lease: ExecutionLease, options: ExecutionOptions, permission
     if (!config || !runtime || lease.row.policyId !== options.config.policyId || lease.row.policyHash !== options.config.policyHash || lease.payload.runtimeConfigHash !== options.runtime.configHash || options.signal.aborted || config.policyId !== options.config.policyId || config.policyHash !== options.config.policyHash || runtime.configHash !== options.runtime.configHash)
         return fault("DISABLED");
     const [boundRun] = await requireDb().select().from(savIntakeRuns).where(eq(savIntakeRuns.id, lease.payload.lastRunId));
-    if (!boundRun || !await intakeRunConfigurationBound(boundRun, runtime)) return fault("VERSION_INCOMPATIBLE");
+    if (!boundRun || !await intakeExecutionConfigurationBound(lease.row, lease.payload, runtime)) return fault("VERSION_INCOMPATIBLE");
     const { policy } = await readIntakeExecutionAuthority(config);
     if (permission && !policy.mutations.includes(permission as typeof policy.mutations[number]))
         return fault("MUTATION_NOT_GRANTED");
@@ -184,6 +185,7 @@ async function live(lease: ExecutionLease, options: ExecutionOptions, permission
 async function preflight(lease: ExecutionLease, options: ExecutionOptions, intent?: EffectIntent) {
     const d = lease.payload.plan.decision.disposition;
     const authority = await live(lease, options, intent?.permission);
+    const s = await source(lease);
     if (d.kind === "ticket" && !authority.mutations.includes(d.target.operation === "create" ? "create_ticket" : "link_ticket"))
         return fault("MUTATION_NOT_GRANTED");
     const snapshot = await options.adapters.readCrm(lease.payload.plan, lease.payload.input, options.runtime, options.signal);
@@ -193,9 +195,16 @@ async function preflight(lease: ExecutionLease, options: ExecutionOptions, inten
         lease.payload.baseline = snapshot;
         await saveExecutionPayload(lease);
     }
-    else
-        assertExecutionCrmUnchanged(lease.payload.baseline, snapshot, await getExecutionEffects(lease.row.id));
-    const s = await source(lease);
+    else {
+        const concurrent = assertExecutionCrmUnchanged(lease.payload.baseline, snapshot, await getExecutionEffects(lease.row.id), { finalizing: !intent, nextKind: intent?.kind,
+            sourceEmail: { from: s.message.fromEmail, to: s.message.toEmails, subject: s.message.subject, body: s.body.text } });
+        const receipt = intakeRuntimeHash(concurrent);
+        if (concurrent.length && lease.payload.concurrentHistoryHash !== receipt) {
+            lease.payload.concurrentHistoryHash = receipt;
+            await requireDb().transaction(tx => executionJournal(tx, lease.row.id, "concurrent_history_observed", { phase: intent ? "continue_committed_effects" : "finalization_only", events: concurrent }));
+            await saveExecutionPayload(lease);
+        }
+    }
     if (typeof options.adapters.gmailCurrent !== "function")
         return fault("GMAIL_CONTROL_REQUIRED");
     await options.adapters.gmailCurrent(s.mailbox.email, s.thread.gmailThreadId, s.message.gmailMessageId!, options.signal);

@@ -1,5 +1,6 @@
 const statuses: Record<string, string> = {
   human_hold: "À valider par l’équipe",
+  human_other: "Autres · classement humain", human_review: "Décision confiée à l’équipe",
   handled_externally: "Traité hors Studio", external_completion_pending: "Traitement externe à vérifier",
   historical_outside_automation: "Historique — hors automatisation",
   processing: "Traitement en cours", pending: "Analyse en attente", analysing: "Analyse en cours", observed: "Analyse prête, actions en attente",
@@ -11,6 +12,8 @@ const statuses: Record<string, string> = {
   confirmed: "Actions confirmées", refused: "Poursuite arrêtée", superseded: "Version remplacée",
 };
 const reasons: Array<[RegExp, string]> = [
+  [/CRM_READ_/, "La lecture HubSpot est incomplète ou indisponible. Les actions déjà confirmées sont conservées ; la reprise vérifie le contexte sans les recréer."],
+  [/MESSAGE_METADATA_INVALID/, "L’adresse de l’expéditeur ou la liste des destinataires est invalide ou dépasse les limites. Ce mail reste à vérifier ; les autres dossiers peuvent continuer."],
   [/BUDGET_EXHAUSTED|ADMISSION_LIMIT|CALLS_EXHAUSTED/, "Plafond de qualification atteint. Une reprise technique est nécessaire."],
   [/USAGE_UNCERTAIN|SETTLEMENT_UNCERTAIN/, "Le coût du dernier appel reste à confirmer. Aucun nouvel appel ne peut partir."],
   [/ATTEMPTS|attempts_exhausted/, "Les tentatives bornées sont épuisées. Les éléments vérifiés sont conservés."],

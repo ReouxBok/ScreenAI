@@ -91,8 +91,31 @@ export function assertOriginalExecutionCrm(plan: IntakePlan, s: CrmSnapshot) {
 }
 /** Only previously attributed, confirmed effects are removed for comparison.
  * All other contact/ticket/history changes require reinvestigation. */
-export function assertExecutionCrmUnchanged(baseline: CrmSnapshot, current: CrmSnapshot, effects: Effect[]) {
+export type ExecutionContinuation = { finalizing?: boolean; nextKind?: EffectIntent["kind"]; sourceEmail?: { from: string; to: string[]; subject: string; body: string } };
+/** Compare the entire envelope and body. Unknown incoming/outgoing mail must not
+ * authorize a semantic status transition merely because it is an email. */
+function sameKnownEmail(text: string, baseline: CrmSnapshot, ticketId: string, source?: ExecutionContinuation["sourceEmail"]) {
+    const parse = (value: string) => {
+        try { return z.object({ from: z.email(), to: z.string().min(1), direction: z.string(), subject: z.string(), body: z.string() }).parse(JSON.parse(value)); }
+        catch { return null; }
+    };
+    const incoming = parse(text);
+    if (!incoming) return false;
+    const addresses = (s: string) => s.split(/[;,]/).map(v => v.trim().toLowerCase()).sort();
+    const body = (s: string) => s.replace(/\r\n/g, "\n");
+    if (source && incoming.direction === "INCOMING_EMAIL" && incoming.from.toLowerCase() === source.from.toLowerCase()
+        && JSON.stringify(addresses(incoming.to)) === JSON.stringify(source.to.map(v => v.toLowerCase()).sort())
+        && incoming.subject === source.subject && body(incoming.body) === body(source.body)) return true;
+    return (baseline.histories[ticketId] ?? []).some(e => {
+        const prior = e.kind === "email" ? parse(e.text) : null;
+        return prior && incoming.from.toLowerCase() === prior.from.toLowerCase() && incoming.direction === prior.direction
+            && JSON.stringify(addresses(incoming.to)) === JSON.stringify(addresses(prior.to))
+            && incoming.subject === prior.subject && body(incoming.body) === body(prior.body);
+    });
+}
+export function assertExecutionCrmUnchanged(baseline: CrmSnapshot, current: CrmSnapshot, effects: Effect[], continuation: ExecutionContinuation = {}) {
     const clean = JSON.parse(JSON.stringify(current)) as CrmSnapshot;
+    const concurrent: { ticketId: string; eventId: string; contentHash: string }[] = [];
     const ack = (e: Effect) => e.ackCiphertext ? decryptSavPayload<EffectAck>(e.ackCiphertext) : null;
     const intent = (e: Effect) => decryptSavPayload<EffectIntent>(e.intentCiphertext);
     // Remove an owned history delta only when its current bytes still match the
@@ -111,7 +134,10 @@ export function assertExecutionCrmUnchanged(baseline: CrmSnapshot, current: CrmS
             const observed = history?.find(e => e.id === proof.observedHistory!.id);
             if (savIntakeCanonicalEvidence(observed) !== savIntakeCanonicalEvidence(proof.observedHistory))
                 return fault();
-            clean.histories[i.ticketId!] = history.filter(e => e.id !== proof.observedHistory!.id);
+            // Associating an already associated object is a no-op. Never remove
+            // an event which was part of the original investigation.
+            if (!baseline.histories[i.ticketId!]?.some(e => e.id === proof.observedHistory!.id))
+                clean.histories[i.ticketId!] = history.filter(e => e.id !== proof.observedHistory!.id);
         }
         if (effect.kind === "stage_new" && i.ticketId) {
             const old = Object.values(baseline.tickets).flat().find(t => t.id === i.ticketId);
@@ -127,7 +153,33 @@ export function assertExecutionCrmUnchanged(baseline: CrmSnapshot, current: CrmS
             }
         }
     }
-    for (const effect of effects.filter(e => e.state === "confirmed" && e.kind === "ticket_create")) {
+    const created = effects.filter(e => e.state === "confirmed" && e.kind === "ticket_create");
+    // A newly logged email cannot undo an already committed ticket creation.
+    // Its remaining association uses that exact ticket; set-New is allowed only
+    // while the creation receipt still proves it is already New. For an existing
+    // ticket, planned logging may continue, but a later set-New requires that
+    // every added email is already known exactly. Notes/edits/removals, membership, owner, stage, identity
+    // and the latest Gmail inbound still use their unchanged authoritative guards.
+    const createdIds = new Set(created.map(e => ack(e)?.id).filter((id): id is string => Boolean(id)));
+    const finalIds = new Set(effects.filter(e => e.state === "confirmed" && ["email_associate", "stage_new"].includes(e.kind)).map(e => intent(e).ticketId));
+    const committedTargets = new Set(effects.filter(e => e.state === "confirmed" && ["note_create", "note_associate", "email_associate", "stage_new"].includes(e.kind)).map(e => intent(e).ticketId));
+    for (const ticketId of Object.keys(clean.histories)) {
+        const mayFinish = continuation.finalizing && finalIds.has(ticketId);
+        const mayContinueCreated = createdIds.has(ticketId) && Boolean(continuation.nextKind) && continuation.nextKind !== "ticket_create";
+        const mayContinueExisting = committedTargets.has(ticketId) && Boolean(continuation.nextKind) && continuation.nextKind !== "ticket_create";
+        if (!mayFinish && !mayContinueCreated && !mayContinueExisting && !(continuation.finalizing && createdIds.has(ticketId))) continue;
+        const known = new Set((baseline.histories[ticketId] ?? []).map(e => e.id));
+        // Owned associated events have already been checked and removed above.
+        const additions = clean.histories[ticketId].filter(e => !known.has(e.id));
+        if (additions.some(e => e.kind !== "email")) return fault();
+        // Completing already planned logging/associations does not decide a new
+        // destination. Reopening an existing ticket DOES require known content.
+        if (!createdIds.has(ticketId) && continuation.nextKind === "stage_new"
+            && additions.some(e => !sameKnownEmail(e.text, baseline, ticketId, continuation.sourceEmail))) return fault();
+        for (const e of additions) concurrent.push({ ticketId, eventId: e.id, contentHash: savIntakeEvidenceContentHash(e) });
+        clean.histories[ticketId] = clean.histories[ticketId].filter(e => known.has(e.id));
+    }
+    for (const effect of created) {
         const a = ack(effect), proof = effect.verificationCiphertext ? decryptSavPayload<{
             observedTicket?: unknown;
         }>(effect.verificationCiphertext) : {};
@@ -142,4 +194,5 @@ export function assertExecutionCrmUnchanged(baseline: CrmSnapshot, current: CrmS
     }
     if (savIntakeCanonicalEvidence(clean) !== savIntakeCanonicalEvidence(JSON.parse(JSON.stringify(baseline))))
         return fault();
+    return concurrent;
 }

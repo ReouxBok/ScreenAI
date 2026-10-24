@@ -18,6 +18,36 @@ const request = (arg: Parameters<IntakeGeminiCall>[0], kind = "support") => ({ m
   requests: [{ id: "r0", kind, currentMessageId: mid, quoteId: anchor(arg) }],
   ticketSummary: { title: "Synchronisation interrompue", description: data(arg).citationCatalogue.filter(a => a.sourceId === "current").map(a => a.text).join(" "), requestIds: ["r0"] } });
 const ticket = { id: "201", contactIds: ["101"], stage: "new" as const, createdAt: at, ownerId: null, subject: "Synchronisation", content: "Une erreur bloque la synchronisation." };
+it("repairs a malformed contract once with a distinct request and unchanged citations", async () => {
+  const traces: IntakeModelTrace[] = [], bodies: string[] = [];
+  const call = vi.fn<IntakeGeminiCall>(async arg => {
+    bodies.push(JSON.stringify(arg.body));
+    return result(bodies.length === 1 ? { messageId: mid, requests: null } : request(arg));
+  });
+  const reader = createSavIntakeSemanticReaders({ model: "gemini-fixture", call, onTrace: t => traces.push(t) });
+  expect((await reader.analyseMessage({ message, conversation: [] }, signal())).requests[0].kind).toBe("support");
+  expect(call).toHaveBeenCalledTimes(2); expect(bodies[0]).not.toBe(bodies[1]);
+  expect(JSON.parse(bodies[0]).contents).toEqual(JSON.parse(bodies[1]).contents);
+  expect(traces.map(t => t.accepted)).toEqual([false, true]);
+});
+it("can continue a known settled missing result without reposting its exact consumed request", async () => {
+  const call = vi.fn<IntakeGeminiCall>(async arg => {
+    if (!arg.body.systemInstruction.parts[0].text.includes("FORMAT REPAIR v1")) throw Error("SAV_INTAKE_RUNTIME_CALL_ALREADY_CONSUMED");
+    return result(request(arg));
+  });
+  expect((await createSavIntakeSemanticReaders({ model: "gemini-fixture", call }).analyseMessage({ message, conversation: [] }, signal())).requests).toHaveLength(1);
+  expect(call).toHaveBeenCalledTimes(2);
+});
+it.each(["SAV_INTAKE_RUNTIME_USAGE_UNCERTAIN", "SAV_INTAKE_RUNTIME_BUDGET_EXHAUSTED", "SAV_AI_HTTP_503"])("does not retry %s through format repair", async code => {
+  const call = vi.fn<IntakeGeminiCall>(async () => { throw Error(code); });
+  await expect(createSavIntakeSemanticReaders({ model: "gemini-fixture", call }).analyseMessage({ message, conversation: [] }, signal())).rejects.toThrow(code);
+  expect(call).toHaveBeenCalledTimes(1);
+});
+it("stops after one malformed repair and never accepts its unchecked output", async () => {
+  const call = vi.fn<IntakeGeminiCall>(async () => result({ requests: null }));
+  await expect(createSavIntakeSemanticReaders({ model: "gemini-fixture", call }).analyseMessage({ message, conversation: [] }, signal())).rejects.toThrow("OUTPUT_REJECTED");
+  expect(call).toHaveBeenCalledTimes(2);
+});
 const history = [{ id: "note-301", kind: "note" as const, at, text: "La configuration a été vérifiée." }];
 const issueInput = { message, requests: [{ id: "r0", kind: "support" as const, currentMessageId: mid }], tickets: [{ ticket, history }],
   evidence: ["current", "ticket-201", "history-201"].map(id => ({ id, sourceId: id, observedAt: at, contentHash: "a".repeat(43), source: "crm_ticket" as const })) };
@@ -142,7 +172,9 @@ describe("complete long histories within the bounded intake envelope", () => {
   function atSize(target: number) {
     let size = 90_000;
     for (let i = 0; i < 10; i++) {
-      const text = prefix + "x ".repeat(Math.floor((size - 2) / 2)) + (size % 2 ? "xxx" : "xx");
+      let seed = 4723;
+      const unique = Array.from({length:size},(_,n)=> {seed=(Math.imul(seed,1664525)+1013904223)>>>0;return n%12===11?" ":String.fromCharCode(97+seed%26);}).join("");
+      const text = prefix + unique + "FIN";
       const delta = target - bytesFor(text);
       if (!delta) return text;
       size += delta;
@@ -160,7 +192,8 @@ describe("complete long histories within the bounded intake envelope", () => {
     } else {
       await expect(model.assessIssues(withHistory(text), signal())).rejects.toThrow("CONTEXT_LIMIT");
       expect(call).not.toHaveBeenCalled();
-      expect(traces[0].contextLimit).toEqual({ stage: "data", bytes: SAV_INTAKE_MODEL_LIMITS.dataBytes + 1, limitBytes: SAV_INTAKE_MODEL_LIMITS.dataBytes });
+      expect(traces[0].contextLimit).toMatchObject({ stage: "data", bytes: SAV_INTAKE_MODEL_LIMITS.dataBytes + 1, limitBytes: SAV_INTAKE_MODEL_LIMITS.dataBytes,
+        breakdown: { catalogue: { bySource: { history: expect.any(Number) } }, history: { events: 1 } } });
       expect(JSON.stringify(traces)).not.toContain("citation");
     }
   });

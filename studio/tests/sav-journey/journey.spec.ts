@@ -77,19 +77,15 @@ for (const key of JOURNEY_CASES) {
       // Reproduce the CI race: a real completed context response arrives while
       // the send action is pending. Do not fake provider or freshness results.
       let releaseContext: (() => void) | undefined;
+      let contextReleasedDuringSend = false;
       if (key === "successor") {
         const sendStarted = new Promise<void>(resolve => { releaseContext = resolve; });
         await page.route("**/status?refreshId=*", async route => {
-          const response = await route.fetch();
+          // Only this read-only poll may retry ECONNRESET from the local dev
+          // server. The send POST is fetched exactly once by the action helper.
+          const response = await route.fetch({ maxRetries: 2 });
           if ((await response.json()).context === "completed") await sendStarted;
-          await route.fulfill({ response });
-        });
-        await page.route("**/studio/sav/*", async route => {
-          if (route.request().method() !== "POST" || !route.request().postData()?.includes("Pouvez-vous nous transmettre")) return route.fallback();
-          const response = await route.fetch();
-          releaseContext?.();
-          await expect(page.getByText("Contexte client actualisé.", { exact: true })).toBeVisible();
-          await route.fulfill({ response });
+          await route.fulfill({ response, body: await response.body() });
         });
       }
       await page.reload();
@@ -107,7 +103,13 @@ for (const key of JOURNEY_CASES) {
       await expect(draft.getByRole("button", { name: "Accepter cette version", exact: true })).toHaveCount(0);
       // No save/accept step: one confirmation binds the edited preview and recipient.
       await expect(draft).toContainText(`journey-${key}@example.invalid`);
-      await submitServerAction(page, draft.getByRole("button", { name: "Confirmer l’envoi de cette réponse", exact: true })); clicks++;
+      await submitServerAction(page, draft.getByRole("button", { name: "Confirmer l’envoi de cette réponse", exact: true }), undefined,
+        key === "successor" ? async () => {
+          releaseContext?.();
+          await expect(page.getByText("Contexte client actualisé.", { exact: true })).toBeVisible();
+          contextReleasedDuringSend = true;
+        } : undefined); clicks++;
+      if (key === "successor") expect(contextReleasedDuringSend).toBe(true);
       await page.waitForURL(/review=reply_sent/);
       await expect(draft).toContainText("Réponse déjà envoyée");
       const sends = remote().events.filter((e: {kind:string;threadId?:string}) => e.kind === "send" && e.threadId === `journey-${key}`);

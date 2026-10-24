@@ -10,6 +10,7 @@ import { decryptSavPayload, encryptSavPayload } from "../crypto";
 import { intakeRuntimeHash, savIntakeRuntimeConfig, type IntakeRuntimeConfig, type IntakeRuntimePayload } from "./runtime-contract";
 import { intakeConsoleInstalled } from "./console-capability";
 import { humanRevisionConfigHash, intakeRunConfigurationBound, type HumanEventPayload } from "./human-binding";
+import { assertSavIntakeCallPlan } from "./runtime-store";
 import { createIntakeModelDispatcher } from "./model-dispatch";
 import { createSavIntakeSemanticReaders, SAV_INTAKE_MODEL_REVISION } from "./model-readers";
 import { withSavAiBudget } from "../gemini-transport";
@@ -181,11 +182,11 @@ export async function consumeIntakeHumanEvent(id: string, config: IntakeRuntimeC
       && (!reusableAnalysis?.ticketSummary || reusableAnalysis.requests.some(r=>r.kind==="other"||r.kind==="unknown")));
     const authority={eventId:id,parentRunId:parent.id,token};
     const live=async()=>{if(savIntakeRuntimeConfig()?.configHash!==config.configHash||deadline.aborted)return conflict();await assertIntakeHumanAnalysis(authority,config);};
-    const dispatcher=needsAnalysis?createIntakeModelDispatcher({config,signal:deadline,live,reserve:hash=>reserveIntakeHumanCall(authority,config,hash)}):null;
+    const dispatcher=needsAnalysis?createIntakeModelDispatcher({config,signal:deadline,live,reserve:hash=>reserveIntakeHumanCall(authority,config,hash),preflight:hashes=>assertSavIntakeCallPlan(parent.messageId,config,hashes)}):null;
     const semantics: IntakeRuntimePayload["semantics"]=needsAnalysis?{revision:SAV_INTAKE_SEMANTIC_RECORD_REVISION,validatorRevision:SAV_INTAKE_MODEL_REVISION,records:[]}:original.semantics;
     const attachments=value.reinvestigate ? await prepareIntakeAttachments({run:parent,token,...snapshot},config.model,live) : null;
     if(attachments?.complete) input={...intakeInputWithAttachments(input,event.sourceHash,attachments.state,attachments.prepared),humanResolution:input.humanResolution};
-    const fresh=dispatcher&&semantics?recordAcceptedIntakeSemantics(createSavIntakeSemanticReaders({model:config.model,call:dispatcher.call,
+    const fresh=dispatcher&&semantics?recordAcceptedIntakeSemantics(createSavIntakeSemanticReaders({model:config.model,call:dispatcher.call,planCalls:dispatcher.plan,
       ...(attachments?.complete ? {attachments:{prepared:attachments.prepared,onRead:observations=>{
         attachments.state.read={...attachments.state.read,observations,state:"complete",completedAt:new Date().toISOString()};
       }}} : {}),

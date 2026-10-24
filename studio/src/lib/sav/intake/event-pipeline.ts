@@ -1,5 +1,8 @@
 import "server-only";
 import { eq } from "drizzle-orm";
+import { decryptSavPayload } from "../crypto";
+import { intakeExecutionConfigurationBound } from "./execution-continuity";
+import type { ExecutionPayload } from "./execution-types";
 import { readSavExternalCompletion } from "../external-completion";
 import { requireDb } from "@/db";
 import { savIntakeExecutions, savIntakeRuns, savMessages } from "@/db/schema";
@@ -31,7 +34,10 @@ function runtimeConfig(env: Env): IntakeRuntimeConfig | string {
 }
 async function currentRun(runId: string, config: IntakeRuntimeConfig) {
   const [run] = await requireDb().select().from(savIntakeRuns).where(eq(savIntakeRuns.id, runId));
-  return run?.isCurrent && run.configHash === config.configHash ? run : null;
+  if (!run?.isCurrent) return null;
+  if (run.configHash === config.configHash) return run;
+  const [execution] = await requireDb().select().from(savIntakeExecutions).where(eq(savIntakeExecutions.messageId, run.messageId));
+  return execution && await intakeExecutionConfigurationBound(execution, decryptSavPayload<ExecutionPayload>(execution.payloadCiphertext), config) ? run : null;
 }
 
 async function externalFence(messageId: string, deps: SavIntakeWakeDeps) {
@@ -122,6 +128,10 @@ export async function finishSavIntakeWake(runId: string) {
   const [run] = await requireDb().select().from(savIntakeRuns).where(eq(savIntakeRuns.id, runId));
   if (!run) return { projected: false, timings: null };
   const projected = await projectIntakeThread(run.threadId).catch(() => false);
+  // Read receipt failure never replays a confirmed CRM action.
+  await (await import("./gmail-read")).syncHandledIntakeGmailRead(run.messageId).catch(() => {
+    console.error("sav_intake_gmail_read", { runId, errorCode: "SAV_INTAKE_GMAIL_READ_RETRY_REQUIRED" });
+  });
   const [message] = await requireDb().select({ receivedAt: savMessages.receivedAt, createdAt: savMessages.createdAt }).from(savMessages).where(eq(savMessages.id, run.messageId));
   const progress = await readIntakeExecutionProgress(run.messageId);
   const confirmedAt = progress?.confirmed ? Math.max(...(await getExecutionEffects(progress.executionId)).map(e => e.confirmedAt?.getTime() ?? 0)) : null;

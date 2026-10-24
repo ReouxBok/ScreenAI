@@ -1,4 +1,5 @@
 import "server-only";
+import { z } from "zod";
 import { reconcileIntakeZeroThoughtUsage } from "./model-usage";
 import type { IntakeGeminiCall } from "./model-readers";
 import { readSavGeminiResponse, type SavGeminiMetadata } from "../gemini-response";
@@ -12,6 +13,7 @@ import { SAV_INTAKE_MODEL_LIMITS } from "./model-limits";
  * and authenticated human continuations. No CRM/Gmail write capability. */
 export function createIntakeModelDispatcher(options: { config: IntakeRuntimeConfig; live: () => Promise<void>;
   reserve: (hash: string) => ReturnType<typeof reserveSavIntakeCall>; signal: AbortSignal;
+  preflight?: (hashes: string[]) => Promise<void>;
   env?: () => Record<string,string|undefined>; network?: typeof fetch }) {
   const {config,live}=options, env=options.env??(()=>process.env), network=options.network??fetch;
   let uncertain=false, failureReason:string|undefined;
@@ -25,7 +27,7 @@ export function createIntakeModelDispatcher(options: { config: IntakeRuntimeConf
       if (wire.textBytes > SAV_INTAKE_MODEL_LIMITS.wireTextBytes || input.body.generationConfig.maxOutputTokens !== 8192) throw Error("SAV_INTAKE_RUNTIME_REQUEST_REJECTED");
       let sent = false;
       const reserved = await options.reserve(intakeRuntimeHash(expectedBody));
-      if (reserved.cached) return reserved.cached;
+      if (reserved.cached) { failureReason = undefined; return reserved.cached; }
       const reservation = reserved.id;
       let providerUsage: SavGeminiMetadata | undefined;
       // Gemini may omit a zero thoughts counter. Recognize only that zero when
@@ -52,24 +54,42 @@ export function createIntakeModelDispatcher(options: { config: IntakeRuntimeConf
       try {
         const generated = await requestSavGeminiJson({ ...input, apiKey: key, fetch: guardedNetwork, allowRetry: false });
         const metadata = exactUsage(generated.metadata);
-        let json: unknown;
-        try { json = input.media ? input.sanitizeResponse?.(generated.json) : generated.json;
-          if (input.media && !input.sanitizeResponse) throw Error("SAV_INTAKE_VISUAL_VALIDATOR_REQUIRED");
-        } catch (error) { uncertain = !await settleSavIntakeCall(reservation!, metadata); throw error; }
+        if (input.media && !input.sanitizeResponse) throw Error("SAV_INTAKE_VISUAL_VALIDATOR_REQUIRED");
+        const json = input.media ? input.sanitizeResponse!(generated.json) : generated.json;
         const result = { json, metadata };
         if (!reservation) throw Error("SAV_INTAKE_RUNTIME_DISPATCH_REJECTED");
         uncertain = !await settleSavIntakeCall(reservation, result.metadata, result);
+        failureReason = undefined;
         return result;
       } catch (error) {
         if (reservation) uncertain = !await settleSavIntakeCall(reservation, exactUsage(savAiErrorMetadata(error)));
-        failureReason = error instanceof Error && /^SAV_[A-Z_]+$/.test(error.message) ? error.message : "SAV_INTAKE_RUNTIME_PROVIDER_UNAVAILABLE";
+        failureReason = error instanceof z.ZodError ? "SAV_INTAKE_MODEL_OUTPUT_REJECTED"
+          : error instanceof Error && /^SAV_[A-Z0-9_]+$/.test(error.message) ? error.message : "SAV_INTAKE_RUNTIME_PROVIDER_UNAVAILABLE";
         throw error;
       }
     };
     const call: IntakeGeminiCall = input => { const work = execute(input).catch(error => {
-      failureReason = error instanceof Error && /^SAV_[A-Z_]+$/.test(error.message) ? error.message : "SAV_INTAKE_RUNTIME_PROVIDER_UNAVAILABLE";
+      failureReason = error instanceof z.ZodError ? "SAV_INTAKE_MODEL_OUTPUT_REJECTED"
+        : error instanceof Error && /^SAV_[A-Z0-9_]+$/.test(error.message) ? error.message : "SAV_INTAKE_RUNTIME_PROVIDER_UNAVAILABLE";
       throw error;
     }); pending.push(work); return work; };
 
-  return { call, pending, get uncertain() { return uncertain; }, get failureReason() { return failureReason; } };
+  const plan = async (inputs: Parameters<IntakeGeminiCall>[0][]) => {
+    try {
+      await live();
+      if (!options.preflight || options.signal.aborted || uncertain || !inputs.length || inputs.length > 3) throw Error("SAV_INTAKE_RUNTIME_BATCH_PLANNING_REQUIRED");
+      const hashes = inputs.map(input => {
+        const wire = savGeminiWireBody(input);
+        if (input.model !== config.model || input.phase !== "ticket_matching" || input.media || input.allowRetry !== false || input.signal.aborted
+          || wire.textBytes > SAV_INTAKE_MODEL_LIMITS.wireTextBytes || input.body.generationConfig.maxOutputTokens !== 8192) throw Error("SAV_INTAKE_RUNTIME_REQUEST_REJECTED");
+        return intakeRuntimeHash(wire.body);
+      });
+      await options.preflight(hashes);
+      await live();
+    } catch (error) {
+      failureReason = error instanceof Error && /^SAV_[A-Z0-9_]+$/.test(error.message) ? error.message : "SAV_INTAKE_RUNTIME_BATCH_PLANNING_FAILED";
+      throw error;
+    }
+  };
+  return { call, plan, pending, get uncertain() { return uncertain; }, get failureReason() { return failureReason; } };
 }

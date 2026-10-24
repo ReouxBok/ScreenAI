@@ -6,7 +6,7 @@ import { ArrowLeft, Bot, CheckCircle2, CircleAlert, Clock3, ExternalLink, LockKe
 import { notFound } from "next/navigation";
 import { requireSavStaff as requireStaff } from "@/lib/sav/auth";
 import { getSavThreadDetail } from "@/lib/sav/service";
-import { getSavExternalCompletion } from "@/lib/sav/external-completion";
+import { getSavExternalCompletion, savExternalDisposition } from "@/lib/sav/external-completion";
 import { getSavProposalReview } from "@/lib/sav/review";
 import { savAutomationMode, savReleaseStage } from "@/lib/sav/config";
 import { isSavMessageEligible } from "@/lib/sav/cutover";
@@ -158,7 +158,7 @@ export default async function SavThreadPage({ params, searchParams }: { params: 
   ];
 
   return <DossierViewport key={id}>
-    {externalCompletion && <p className="login-notice" role="status"><strong>Traité hors Studio.</strong> Ce message a été classé administrativement le {formatParisDateTime(externalCompletion.createdAt)}. Cela ne valide ni la proposition IA ni le brouillon et ne crée aucun apprentissage. Un nouvel email revient dans le flux normal.</p>}
+    {externalCompletion && <p className="login-notice" role="status"><strong>{savExternalDisposition(externalCompletion).view === "completed" ? "Traité hors Studio." : savExternalDisposition(externalCompletion).view === "other" ? "Autres · classement humain." : "À valider par l’équipe."}</strong> Ce message a été classé administrativement le {formatParisDateTime(externalCompletion.createdAt)}. Cela ne valide ni la proposition IA ni le brouillon et ne crée aucun apprentissage. Un nouvel email revient dans le flux normal.</p>}
     {v0 && !detail.pilotItem && eligible && latestInbound && !latestInbound.studioOpenedAt && <SavDossierOpened threadId={id} messageId={latestInbound.id}/>}
     {filing === "pending" && /^[a-f0-9-]{36}$/i.test(filingId) && <SavFilingProgress threadId={id} commandId={filingId}/> }
     {filing && (filing !== "pending" || !/^[a-f0-9-]{36}$/i.test(filingId)) && <p className={`login-notice ${["filed", "already_filed", "SAV_GMAIL_FILING_DISABLED", "SAV_GMAIL_FILING_PILOT_BLOCKED"].includes(filing) ? "" : "error"}`} role="status">{filingNotices[filing] ?? filingNotices.SAV_GMAIL_FILING_FAILED}</p>}
