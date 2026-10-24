@@ -104,9 +104,9 @@ export async function planSavIntake(
       readCalls: calls, effects: "not_connected",
     };
   };
-  const context = (reason: ContextReason, choice?: "equivalent_contact_choice" | "equivalent_ticket_choice" | "same_issue_uncertain") => finalize(
+  const context = (reason: ContextReason, choice?: "equivalent_contact_choice" | "equivalent_ticket_choice" | "same_issue_uncertain" | "request_scope_uncertain") => finalize(
     { kind: "collect_context", reasons: unique([reason, ...(!requests.length || requests.some(r => r.kind === "unknown") || classification === "mixed" ? ["classification_incomplete" as const] : [])]), evidenceIds: evidence.map(e => e.id).sort() },
-    choice ? { kind: "human_choice", messageId: message.id, classification: classification === "cancellation" || classification === "finance" ? classification : "support", questionCode: choice, investigation: "bounded_investigation_complete", evidenceIds: evidence.map(e => e.id).sort(), view: "to_validate" }
+    choice ? { kind: "human_choice", messageId: message.id, classification: classification === "cancellation" || classification === "finance" || classification === "support" ? classification : "unknown", questionCode: choice, investigation: "bounded_investigation_complete", evidenceIds: evidence.map(e => e.id).sort(), view: "to_validate" }
       : { kind: "processing", phase: reason.startsWith("classification") ? "classification" : "context", view: null },
   );
   async function bounded<T>(fn: (signal: AbortSignal) => Promise<T>, reason: ContextReason): Promise<T> {
@@ -212,7 +212,10 @@ export async function planSavIntake(
       const outside = classification as "other" | "acknowledgement" | "partnership" | "commercial" | "investor";
       let ruleId: string | undefined;
       if (outside === "other") {
-        if (!policy.qualifiedOther) return context("classification_incomplete");
+        // Accepted semantic classification is not authority to hide a mail.
+        // This is an explicit rule decision, not a transient model failure to
+        // retry with the exact same cached output until attempts are exhausted.
+        if (!policy.qualifiedOther) return context("private_resource_unavailable", "request_scope_uncertain");
         const resource = savIntakePrivateResourceSchema.parse(policy.qualifiedOther.resource);
         ruleId = addEvidence("classification-rule", policy.qualifiedOther.evidenceSource, resource.resourceId, resource);
       }

@@ -7,6 +7,8 @@ import type { IntakeGeminiCall } from "./model-readers";
 import type { IntakeRuntimeConfig } from "./runtime-contract";
 import { settleSavIntakeCall } from "./runtime-store";
 import { savDerivedCostQuote } from "../derived-budget";
+import { admitSavAttachmentImage } from "../attachment-image";
+import { syntheticImage } from "../../../../test/sav-attachments";
 
 const config = { model: "gemini-3.6-flash" } as IntakeRuntimeConfig;
 function inputAtSize(bytes: number): Parameters<IntakeGeminiCall>[0] {
@@ -45,4 +47,32 @@ it.each([-1, 0, 1])("enforces the full 128 KiB wire boundary %+d before reservat
     expect(reserve).not.toHaveBeenCalled(); expect(network).not.toHaveBeenCalled(); expect(settleSavIntakeCall).not.toHaveBeenCalled();
     expect(dispatcher.failureReason).toBe("SAV_INTAKE_RUNTIME_REQUEST_REJECTED");
   }
+});
+
+it("settles a malformed visual response once without caching raw output and preserves its real reason", async () => {
+  const { z } = await import("zod");
+  const input = inputAtSize(1000);
+  input.phase = "understanding";
+  input.media = [await admitSavAttachmentImage(await syntheticImage(), "image/png")];
+  input.sanitizeResponse = raw => z.object({ requiredField: z.string() }).parse(raw);
+  const network = vi.fn<typeof fetch>(async () => Response.json({ candidates: [{ finishReason: "STOP", content: { parts: [{ text: '{"privateRaw":"must not be cached"}' }] } }], usageMetadata: { promptTokenCount: 100, candidatesTokenCount: 50, thoughtsTokenCount: 0, totalTokenCount: 150 } }));
+  const dispatcher = createIntakeModelDispatcher({ config, live: async () => {}, reserve: async () => ({ id: "synthetic-reservation", cached: null }), network,
+    signal: new AbortController().signal, env: () => ({ SAV_GEMINI_API_KEY: "synthetic-key" }) });
+  await expect(dispatcher.call(input)).rejects.toBeInstanceOf(z.ZodError);
+  expect(dispatcher.failureReason).toBe("SAV_INTAKE_MODEL_OUTPUT_REJECTED");
+  expect(settleSavIntakeCall).toHaveBeenCalledExactlyOnceWith("synthetic-reservation", expect.objectContaining({ inputTokens: 100, outputTokens: 50, thoughtTokens: 0, totalTokens: 150 }));
+  expect(JSON.stringify(vi.mocked(settleSavIntakeCall).mock.calls)).not.toContain("privateRaw");
+});
+it("clears an obsolete failure after a successful, separately reserved repair", async () => {
+  const input = inputAtSize(1000), network = vi.fn<typeof fetch>(async () => Response.json({ candidates: [{ finishReason: "STOP", content: { parts: [{ text: '{"fixture":true}' }] } }], usageMetadata: { promptTokenCount: 100, candidatesTokenCount: 50, thoughtsTokenCount: 0, totalTokenCount: 150 } }));
+  let calls = 0;
+  const dispatcher = createIntakeModelDispatcher({ config, live: async () => {}, reserve: async () => {
+    if (++calls === 1) throw Error("SAV_INTAKE_RUNTIME_CALL_ALREADY_CONSUMED");
+    return { id: "synthetic-repair", cached: null };
+  }, network, signal: new AbortController().signal, env: () => ({ SAV_GEMINI_API_KEY: "synthetic-key" }) });
+  await expect(dispatcher.call(input)).rejects.toThrow("CALL_ALREADY_CONSUMED");
+  const repair = { ...input, body: structuredClone(input.body) };
+  repair.body.systemInstruction.parts[0].text += " Repair format v1.";
+  await expect(dispatcher.call(repair)).resolves.toMatchObject({ json: { fixture: true } });
+  expect(network).toHaveBeenCalledTimes(1); expect(dispatcher.failureReason).toBeUndefined();
 });

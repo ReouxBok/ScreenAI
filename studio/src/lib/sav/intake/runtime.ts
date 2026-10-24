@@ -1,4 +1,5 @@
 import "server-only";
+import { decryptSavPayload } from "../crypto";
 import { releaseLegacyAiPauses } from "./legacy-pause";
 import { intakeOtherQualificationFresh } from "./other-routing";
 import { qualifyRuntimeOther } from "./other-routing-runtime";
@@ -31,9 +32,11 @@ export async function enqueueConfiguredSavIntake(messageId: string) {
   return !runId && launch ? launch : {runId};
 }
 async function analyseSavIntakeRuntimeWithinBudget(runId: string, config: IntakeRuntimeConfig,
-  deps: { env?: () => Record<string, string | undefined>; network?: typeof fetch; downloadAttachments?: Parameters<typeof prepareIntakeAttachments>[3]; authenticateOther?: Parameters<typeof qualifyRuntimeOther>[3] } = {}) {
+  deps: { env?: () => Record<string, string | undefined>; network?: typeof fetch; downloadAttachments?: Parameters<typeof prepareIntakeAttachments>[3]; authenticateOther?: Parameters<typeof qualifyRuntimeOther>[3]; deadlineMs?: number } = {}) {
   const env = deps.env ?? (() => process.env), network = deps.network ?? fetch;
   const lease = await claimSavIntakeRun(runId, config); if (!lease) return { skipped: "not_claimed" };
+  const previous = decryptSavPayload<IntakeRuntimePayload>(lease.run.payloadCiphertext);
+  const repairMalformedOutput = lease.run.attempts > 1 && ["SAV_INTAKE_MODEL_OUTPUT_REJECTED", "SAV_INTAKE_RUNTIME_CALL_ALREADY_CONSUMED"].includes(previous.reason ?? "");
   const controller = new AbortController(), timer = setTimeout(() => controller.abort(), 45_000);
   const traces: unknown[] = [];
   let semanticFailureReason: string | undefined;
@@ -73,7 +76,7 @@ async function analyseSavIntakeRuntimeWithinBudget(runId: string, config: Intake
       }
       await checkpointSavIntakeRun(lease, payload);
     }
-    const semanticReader = createSavIntakeSemanticReaders({ ...(attachments?.complete ? { attachments: { prepared: attachments.prepared, onRead: observations => {
+    const semanticReader = createSavIntakeSemanticReaders({ repairMalformedOutput, ...(attachments?.complete ? { attachments: { prepared: attachments.prepared, onRead: observations => {
       attachments.state.read = { ...attachments.state.read, observations, state: "complete", completedAt: new Date().toISOString() };
       payload.attachments = attachments.state;
       checkpoint();
@@ -101,20 +104,30 @@ async function analyseSavIntakeRuntimeWithinBudget(runId: string, config: Intake
     await live();
     payload.reason = dispatcher.failureReason ?? semanticFailureReason;
     finishIntakeAttachmentRead(payload.attachments,attachmentFailureReason(payload.reason,dispatcher.uncertain));
-    await saveSavIntakeResult(lease, config, payload, payload.plan.decision.disposition.kind === "collect_context" ? "waiting" : "observed");
-    return { runId, state: payload.plan.decision.disposition.kind === "collect_context" ? "waiting" : "observed" };
+    const state = payload.plan.decision.disposition.kind === "collect_context" && payload.plan.progress.kind !== "human_choice" ? "waiting" : "observed";
+    await saveSavIntakeResult(lease, config, payload, state);
+    const retryFormat = state === "waiting" && lease.run.attempts === 1 && attachments?.complete
+      && attachments.prepared.uniqueImages.length > 0 && payload.reason === "SAV_INTAKE_MODEL_OUTPUT_REJECTED";
+    return { runId, state, ...(retryFormat ? { retryFormat: true as const } : {}) };
   } catch (error) {
     controller.abort();
     // An expired routing authority must never leave a publishable Other plan.
     if(payload.other&&!intakeOtherQualificationFresh(payload.other,env().SAV_INTAKE_OTHER_RULES_JSON)){delete payload.plan;delete payload.other;}
-    payload.reason = error instanceof Error && /^SAV_[A-Z_]+$/.test(error.message) ? error.message : "SAV_INTAKE_RUNTIME_INTERRUPTED";
+    payload.reason = error instanceof Error && /^SAV_[A-Z0-9_]+$/.test(error.message) ? error.message : "SAV_INTAKE_RUNTIME_INTERRUPTED";
     finishIntakeAttachmentRead(payload.attachments,attachmentFailureReason(payload.reason,Boolean(dispatcher?.uncertain)));
     await failSavIntakeRun(lease, payload, Boolean(dispatcher?.uncertain) || payload.reason === "SAV_INTAKE_RUNTIME_SETTLEMENT_UNCERTAIN");
     return { runId, state: dispatcher?.uncertain ? "uncertain" : "waiting", reason: payload.reason };
   } finally { controller.abort(); clearTimeout(timer); }
 }
-export function analyseSavIntakeRuntime(...args: Parameters<typeof analyseSavIntakeRuntimeWithinBudget>) {
-  return withSavAiBudget(() => analyseSavIntakeRuntimeWithinBudget(...args));
+export async function analyseSavIntakeRuntime(...args: Parameters<typeof analyseSavIntakeRuntimeWithinBudget>) {
+  const first = await withSavAiBudget(() => analyseSavIntakeRuntimeWithinBudget(...args));
+  if (!("retryFormat" in first) || !first.retryFormat) return first;
+  const deadline = args[2]?.deadlineMs;
+  if (deadline !== undefined && (!Number.isFinite(deadline) || deadline - Date.now() < 65_000)) return first;
+  // A new lease increments the unchanged two-attempt bound, rechecks pause,
+  // latest message and uncertain usage, and retains the same durable ledger.
+  const second = await withSavAiBudget(() => analyseSavIntakeRuntimeWithinBudget(...args));
+  return "skipped" in second ? first : second;
 }
 /** Cron reconciliation is bounded to four queued messages and one analysis/pass.
  * It runs alongside V0 observation and never acquires action/send capabilities. */
@@ -127,7 +140,7 @@ export async function reconcileSavIntakeRuntime(options: { deadlineMs?: number }
   const queued = await catchupSavIntake(config), runs = await pendingSavIntakeRuns(config);
   let result: Awaited<ReturnType<typeof analyseSavIntakeRuntime>> | null = null;
   for (const run of runs) {
-    result = await analyseSavIntakeRuntime(run.id, config);
+    result = await analyseSavIntakeRuntime(run.id, config, { deadlineMs: options.deadlineMs });
     if (!("skipped" in result)) break;
   }
   return { mode: "observe", queued, legacyPauses, result, budget: await readSavIntakeBudget(config) };

@@ -9,7 +9,7 @@ import { savStructuredProposalSchema, mergeSavReviewedProposal, type SavStructur
 import { savDraftNotApplicable, savReviewMatchesProposal } from "./review-contract";
 import { classifySavDossier, savDashboardNextAction, type SavDossierState, type SavLearningProgress, type SavOpeningState, type SavTicketProgress } from "./dashboard-state";
 import type { SavDossierContext } from "./dossier-context";
-import { findSavExternalCompletion, hasUnsettledSavHumanAction, savExternalCompletionEvents } from "./external-completion";
+import { findSavExternalCompletion, hasUnsettledSavHumanAction, savExternalCompletionEvents, savExternalDisposition } from "./external-completion";
 import { savDashboardLearningProgress } from "./learning-progress";
 import { observeSavOther, readSavOtherConfiguration, type SavOtherObservation } from "./other-observation";
 import type { SavMessageBody } from "./service";
@@ -134,7 +134,8 @@ export async function listSavDossierDashboardReference(options: SavDashboardOpti
         const opening: SavOpeningState = message.studioOpenedAt || openedIds.has(message.id) ? "opened" : message.studioOpeningTracked ? "unopened" : "unknown";
         const ticketProgress = proposal?.humanProcess?.action === "partnership" && partnershipTransferStatus !== "succeeded" ? partnershipTransferStatus === "uncertain" ? "uncertain" : partnershipTransferStatus === "failed" ? "failed" : partnershipTransferStatus === "pending" ? "pending" : "required" : savDashboardTicketProgress(threadActions, message.id, proposal?.decision.kind, thread.hubspotTicketId);
         const learning = savDashboardLearningProgress(observations.filter(o => o.threadId === thread.id), cycles, candidates.filter(c => c.threadId === thread.id || cycles.some(cycle => cycle.candidateId === c.id && observations.some(observation => observation.id === cycle.observationId && observation.threadId === thread.id))));
-        const handledExternally = !hasUnsettledSavHumanAction(threadActions) && Boolean(findSavExternalCompletion(message, completionProofs));
+        const administrative = findSavExternalCompletion(message, completionProofs);
+        const handledExternally = !hasUnsettledSavHumanAction(threadActions) && Boolean(administrative && savExternalDisposition(administrative).view === "completed");
         const state = handledExternally ? "completed" : classifySavDossier({ opening, reviewStatus, ticket: ticketProgress, learning });
         const linkedTicket = context?.crm.data?.tickets.find(t => t.id === thread.hubspotTicketId);
         const incident = Boolean(analysisErrorCode || ["failed", "uncertain"].includes(ticketProgress) || partnershipTransferStatus && ["failed", "uncertain"].includes(partnershipTransferStatus));

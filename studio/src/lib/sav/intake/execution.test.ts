@@ -1134,3 +1134,62 @@ it("common guard completed ticket-trigger invalidation cannot select or claim an
     expect(network).not.toHaveBeenCalled();
     expect((await f.db.select().from(savIntakeRuns).where(eq(savIntakeRuns.id, runId)))[0].attempts).toBe(run.attempts);
 }, 20000);
+
+function appendConcurrentEmail(ticketId: string, id: string) {
+    p.objects.emails[id] = { id, properties: { hs_timestamp: new Date().toISOString(), hs_email_direction: "INCOMING_EMAIL", hs_email_subject: "Synthetic concurrently logged email", hs_email_text: "Synthetic CRM logging." } };
+    const key = `tickets:${ticketId}:emails`;
+    p.links.set(key, [...(p.links.get(key) ?? []), id]);
+}
+it("continues an already created ticket when CRM logs the inbound and auto-ack during email conservation", async () => {
+    const row = await admission(), verify = options.adapters.verify;
+    options.adapters.verify = async (...args) => {
+        const proof = await verify(...args);
+        if (args[0].kind === "email_create" && proof.confirmed) {
+            const ticketId = Object.keys(p.objects.tickets)[0];
+            appendConcurrentEmail(ticketId, "8801"); appendConcurrentEmail(ticketId, "8802");
+        }
+        return proof;
+    };
+    expect(await executeIntakePass(row.id, options)).toMatchObject({ state: "confirmed" });
+    expect(p.calls.filter(c => c.method === "POST" && c.path.endsWith("/tickets"))).toHaveLength(1);
+    expect(p.calls.filter(c => c.method === "POST" && c.path.endsWith("/emails"))).toHaveLength(1);
+    expect(p.calls.filter(c => c.path === "gmail/messages/send")).toHaveLength(0);
+    const writes = p.calls.filter(c => ["POST", "PUT", "PATCH"].includes(c.method)).length;
+    await executeIntakePass(row.id, options);
+    expect(p.calls.filter(c => ["POST", "PUT", "PATCH"].includes(c.method))).toHaveLength(writes);
+});
+it("finalizes all confirmed existing-ticket effects after native CRM emails arrive, without another mutation", async () => {
+    p.seedTicket({ stage: "open" });
+    const row = await admission(), verify = options.adapters.verify;
+    options.adapters.verify = async (...args) => {
+        const proof = await verify(...args);
+        if (args[0].kind === "stage_new" && proof.confirmed) {
+            appendConcurrentEmail("201", "8801"); appendConcurrentEmail("201", "8802");
+        }
+        return proof;
+    };
+    expect(await executeIntakePass(row.id, options)).toMatchObject({ state: "confirmed" });
+    expect((await getExecutionEffects(row.id)).every(e => e.state === "confirmed")).toBe(true);
+    expect(p.calls.filter(c => c.method === "POST" && c.path.endsWith("/notes"))).toHaveLength(1);
+    expect(p.calls.filter(c => c.method === "PATCH")).toHaveLength(1);
+    expect(p.calls.filter(c => c.path === "gmail/messages/send")).toHaveLength(0);
+});
+it("does not finalize concurrent CRM logging if Gmail has a newer customer reply", async () => {
+    p.seedTicket({ stage: "open" });
+    const row = await admission(), verify = options.adapters.verify;
+    options.adapters.verify = async (...args) => {
+        const proof = await verify(...args);
+        if (args[0].kind === "stage_new" && proof.confirmed) {
+            appendConcurrentEmail("201", "8801");
+            options.adapters.gmailCurrent = async () => { throw Error("SAV_INTAKE_EXECUTION_GMAIL_CHANGED"); };
+        }
+        return proof;
+    };
+    expect(await executeIntakePass(row.id, options)).toMatchObject({ state: "waiting", reason: "SAV_INTAKE_EXECUTION_GMAIL_CHANGED" });
+});
+it("distinguishes an incomplete CRM read from an actual changed snapshot", async () => {
+    const row = await admission();
+    options.adapters = createIntakeExecutorAdapters({ network: async () => new Response(null, { status: 503 }), gmailRequest: p.gmail, env: () => environment });
+    expect(await executeIntakePass(row.id, options)).toMatchObject({ state: "waiting", reason: "SAV_INTAKE_EXECUTION_CRM_READ_HUBSPOT_HTTP_503" });
+    expect(await getExecutionEffects(row.id)).toHaveLength(0);
+});

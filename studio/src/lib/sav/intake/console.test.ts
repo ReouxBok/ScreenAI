@@ -29,6 +29,8 @@ import { releaseIntakeHumanHold } from "./human-hold-release";
 import { releaseLegacyAiPauses } from "./legacy-pause";
 import { SAV_EXTERNAL_COMPLETION, SAV_EXTERNAL_COMPLETION_REVERTED, getSavExternalCompletion, revertSavExternalCompletionBatch, markSavDossiersHandledExternally, completeSavDossierManually } from "../external-completion";
 import { listIntakeConsole, projectIntakeThread, refreshIntakeConsole } from "./console-store";
+import { syncHandledIntakeGmailRead, reconcileHandledIntakeGmailRead, SAV_INTAKE_GMAIL_READ } from "./gmail-read";
+import type { GmailRequest } from "./execution-adapters";
 import { readIntakeConsoleDetail } from "./console-detail";
 import { ensureIntakeObservations, readIntakeObservationBinding, readIntakeLearningQualification, attributeIntakeObservationEvents } from "./observation-binding";
 import { isSavMessageEligible } from "../cutover";
@@ -892,6 +894,94 @@ async function externalMarker(overrides: Record<string, unknown> = {}, actorEmai
   return (await db.db.insert(auditLogs).values({ actorEmail, action: SAV_EXTERNAL_COMPLETION, entityType: "sav_message", entityId: m.id,
     technicalMetadata: { version: 1, threadId, batchId: randomUUID(), receivedBefore: new Date().toISOString(), reason: "processed_outside_studio", ...overrides } }).returning())[0];
 }
+it.each(["other", "to_validate"] as const)("administrative %s routing is immediate without model provenance and never shown as completed", async disposition => {
+  vi.stubEnv("SAV_RELEASE_STAGE", "v0"); vi.stubEnv("SAV_PILOT_MODE", "false");
+  await activateSavV0Cutover({receivedAfter:new Date(Date.now()-3600000).toISOString(),mailboxEmail:"support@example.invalid",intakeRecipient:"contact@limova.ai",deploymentSha:"a".repeat(40),activatedBy:"ugo@limova.ai"});
+  const beforeCalls = await db.db.select().from(savIntakeModelCalls);
+  await db.db.insert(savIntakeConsole).values({threadId,mailboxId}).onConflictDoNothing();
+  const result = await markSavDossiersHandledExternally({batchId:randomUUID(),receivedBefore:new Date().toISOString(),disposition,messages:[{threadId,messageId}]},"ugo@limova.ai");
+  expect(result.marked).toBe(1);
+  const list=await listIntakeConsole({view:disposition}),detail=await readIntakeConsoleDetail(threadId);
+  expect(list.total).toBe(1);expect(list.rows[0].view).toBe(disposition);expect(list.rows[0].status).toBe(disposition==="other"?"human_other":"human_review");
+  expect(detail?.projection.view).toBe(disposition);expect(detail?.confirmedCurrent).toBe(false);
+  expect((await listIntakeConsole({view:"completed"})).total).toBe(0);expect((await listIntakeConsole()).total).toBe(0);
+  expect(await pendingSavIntakeRuns(options.runtime)).toHaveLength(0);expect(await catchupSavIntake(options.runtime)).toBe(0);
+  expect(await db.db.select().from(savIntakeModelCalls)).toEqual(beforeCalls);expect(mutationsSent()).toHaveLength(0);
+});
+it("administrative review can later be completed; an older routing does not capture a new inbound",async()=>{
+  vi.stubEnv("SAV_RELEASE_STAGE", "v0"); vi.stubEnv("SAV_PILOT_MODE", "false");
+  await activateSavV0Cutover({receivedAfter:new Date(Date.now()-3600000).toISOString(),mailboxEmail:"support@example.invalid",intakeRecipient:"contact@limova.ai",deploymentSha:"a".repeat(40),activatedBy:"ugo@limova.ai"});
+  await db.db.insert(savIntakeConsole).values({threadId,mailboxId}).onConflictDoNothing();
+  await markSavDossiersHandledExternally({batchId:randomUUID(),receivedBefore:new Date().toISOString(),disposition:"to_validate",messages:[{threadId,messageId}]},"ugo@limova.ai");
+  const result=await completeSavDossierManually({requestKey:randomUUID(),threadId,messageId,confirmed:true});expect(result.marked).toBe(1);
+  expect((await listIntakeConsole({view:"completed"})).total).toBe(1);expect((await listIntakeConsole({view:"to_validate"})).total).toBe(0);
+  await message();expect((await listIntakeConsole({view:"completed"})).total).toBe(0);
+  expect((await listIntakeConsole()).total).toBe(1);
+});
+it("invalid manual dispositions are refused rather than silently treated as completed",async()=>{
+  await expect(markSavDossiersHandledExternally({batchId:randomUUID(),receivedBefore:new Date().toISOString(),disposition:"resolved_by_ai",messages:[{threadId,messageId}]},"ugo@limova.ai")).rejects.toThrow();
+  await externalMarker({disposition:"resolved_by_ai"});expect((await listIntakeConsole({view:"completed"})).total).toBe(0);
+});
+it("read receipt is durable and independently retried without any CRM action",async()=>{
+  const command=await prepareManualCompletion(false);
+  expect((await completeSavDossierManually(command)).marked).toBe(1);
+  await db.db.update(savMailboxes).set({email:"contact@limova.ai"}).where(eq(savMailboxes.id,mailboxId));
+  await db.db.update(savMessages).set({gmailMessageId:"1a123"}).where(eq(savMessages.id,messageId));
+  await db.db.update(savThreads).set({gmailThreadId:"1a000"}).where(eq(savThreads.id,threadId));
+  let unread=true,writes=0,fail=true;
+  const gmail: GmailRequest=async<T>(_mailbox:string,path:string,init?:RequestInit)=>{
+    if(path==="profile")return {emailAddress:"contact@limova.ai"} as T;
+    if(init?.method==="POST"){writes++;unread=false;if(fail)throw Error("TIMEOUT");return {} as T;}
+    return {id:"1a123",threadId:"1a000",labelIds:["INBOX",...unread?["UNREAD"]:[]]} as T;
+  };
+  const deps={env:()=>({...environment,SAV_INTAKE_GMAIL_MARK_READ:"on"}),gmail};
+  expect(await syncHandledIntakeGmailRead(messageId,deps)).toMatchObject({confirmed:false});
+  fail=false;expect(await syncHandledIntakeGmailRead(messageId,deps)).toEqual({confirmed:true});
+  expect(await syncHandledIntakeGmailRead(messageId,deps)).toEqual({skipped:"already_confirmed"});expect(writes).toBe(1);
+  expect((await db.db.select().from(auditLogs).where(eq(auditLogs.action,SAV_INTAKE_GMAIL_READ)))).toHaveLength(1);
+  expect(mutationsSent()).toHaveLength(0);
+});
+it("a merely analysed dossier is never marked read",async()=>{
+  await observed();const gmail=vi.fn();
+  expect(await syncHandledIntakeGmailRead(messageId,{env:()=>({...environment,SAV_INTAKE_GMAIL_MARK_READ:"on"}),gmail})).toEqual({skipped:"not_handled"});
+  expect(gmail).not.toHaveBeenCalled();expect(mutationsSent()).toHaveLength(0);
+});
+it("a formerly confirmed execution with changed local context stays unread",async()=>{
+  await observed();const execution=(await admitIntakeExecution(runId,options))!;expect((await executeIntakePass(execution.id,options))).toMatchObject({state:"confirmed"});
+  await db.db.update(savMessages).set({bodyCiphertext:encryptSavPayload({text:"Updated customer evidence changes the understood request.",attachments:[],headers:{}})}).where(eq(savMessages.id,messageId));
+  const gmail=vi.fn();expect(await syncHandledIntakeGmailRead(messageId,{env:()=>({...environment,SAV_INTAKE_GMAIL_MARK_READ:"on"}),gmail})).toEqual({skipped:"not_handled"});expect(gmail).not.toHaveBeenCalled();
+});
+it("a fully confirmed current execution is marked read using its completion source, including its own new ticket",async()=>{
+  await observed();const execution=(await admitIntakeExecution(runId,options))!;expect(await executeIntakePass(execution.id,options)).toMatchObject({state:"confirmed"});
+  await db.db.update(savMailboxes).set({email:"contact@limova.ai"}).where(eq(savMailboxes.id,mailboxId));
+  await db.db.update(savMessages).set({gmailMessageId:"1a123"}).where(eq(savMessages.id,messageId));
+  await db.db.update(savThreads).set({gmailThreadId:"1a000"}).where(eq(savThreads.id,threadId));
+  let unread=true;const gmail:GmailRequest=async<T>(_mailbox:string,path:string,init?:RequestInit)=>{
+    if(path==="profile")return {emailAddress:"contact@limova.ai"} as T;
+    if(init?.method==="POST"){unread=false;return {} as T;}
+    return {id:"1a123",threadId:"1a000",labelIds:["INBOX",...unread?["UNREAD"]:[]]} as T;
+  };
+  expect(await syncHandledIntakeGmailRead(messageId,{env:()=>({...environment,SAV_INTAKE_GMAIL_MARK_READ:"on"}),gmail})).toEqual({confirmed:true});
+  expect(unread).toBe(false);
+});
+it("revoked administrative markers cannot starve the next valid Gmail receipt",async()=>{
+  vi.stubEnv("SAV_RELEASE_STAGE","v0");vi.stubEnv("SAV_PILOT_MODE","false");
+  await activateSavV0Cutover({receivedAfter:new Date(Date.now()-3600000).toISOString(),mailboxEmail:"support@example.invalid",intakeRecipient:"contact@limova.ai",deploymentSha:"a".repeat(40),activatedBy:"ugo@limova.ai"});
+  await db.db.update(savMailboxes).set({email:"contact@limova.ai"}).where(eq(savMailboxes.id,mailboxId));
+  for(let n=0;n<3;n++){
+    const t=(await db.db.insert(savThreads).values({mailboxId,gmailThreadId:`poison-${n}`,customerEmail:"customer@example.invalid"}).returning())[0];
+    const m=await message(t.id,new Date(Date.now()-60000+n));
+    const b=randomUUID();const a=(await db.db.insert(auditLogs).values({actorEmail:"ugo@limova.ai",action:SAV_EXTERNAL_COMPLETION,entityType:"sav_message",entityId:m.id,technicalMetadata:{version:1,threadId:t.id,batchId:b,receivedBefore:new Date().toISOString(),reason:"processed_outside_studio"}}).returning())[0];
+    await db.db.insert(auditLogs).values({actorEmail:"ugo@limova.ai",action:SAV_EXTERNAL_COMPLETION_REVERTED,entityType:"sav_message",entityId:m.id,technicalMetadata:{version:1,batchId:b,completionId:a.id}});
+  }
+  await externalMarker();
+  for(const [key,value] of Object.entries({...environment,SAV_INTAKE_GMAIL_MARK_READ:"on"}))vi.stubEnv(key,value);
+  // A nonexistent/invalid Gmail id produces no provider call but must be the
+  // candidate reached after the three revoked poisons, not hidden by LIMIT.
+  expect(await reconcileHandledIntakeGmailRead(1)).toMatchObject({checked:1});
+  const failures=await db.db.select().from(auditLogs).where(eq(auditLogs.action,"sav_intake_gmail_read_failed"));
+  expect(failures).toHaveLength(1);expect(failures[0].entityId).toBe(messageId);
+});
 it("a launched human hold is effective locally and never occupies another dossier through legacy work", async () => {
   await recordIntakeLaunch({ mailboxId, receivedAfter: options.runtime.receivedAfter, createdAfter: options.runtime.createdAfter });
   await observed();
@@ -1119,5 +1209,21 @@ it.each(["run_lease","execution_lease","pending_human","uncertain_effect","legac
   raw.expectedEpoch=(await db.db.select().from(savIntakeConsole).where(eq(savIntakeConsole.threadId,threadId)))[0].epoch;
   await expect(releaseIntakeHumanHold(raw)).rejects.toThrow("CONFLICT");
   expect((await db.db.select().from(savThreads).where(eq(savThreads.id,threadId)))[0].aiPaused).toBe(true);
+  expect(mutationsSent()).toHaveLength(0);
+});
+
+it.each(["sender", "recipients"])("refreshes other projections when one dossier has invalid address metadata (%s)", async variant => {
+  await observed();
+  await db.db.update(savMessages).set(variant === "sender" ? {fromEmail:"invalid-address"} : {toEmails:Array.from({length:31},(_,i)=>`recipient${i}@example.invalid`)}).where(eq(savMessages.id,messageId));
+  const [thread] = await db.db.insert(savThreads).values({mailboxId,gmailThreadId:randomUUID(),customerEmail:"other@example.invalid"}).returning();
+  const next = await message(thread.id);
+  await enqueueSavIntakeMessage(next.id,options.runtime);
+  const result=await refreshIntakeConsole(20);
+  expect(result.refreshed).toBeGreaterThanOrEqual(2);
+  const [blocked]=await db.db.select().from(savIntakeConsole).where(eq(savIntakeConsole.threadId,threadId));
+  expect(blocked).toMatchObject({status:"waiting",reason:"SAV_INTAKE_MESSAGE_METADATA_INVALID"});
+  expect(blocked.epoch).toBe(blocked.projectedEpoch);
+  const [following]=await db.db.select().from(savIntakeConsole).where(eq(savIntakeConsole.threadId,thread.id));
+  expect(following.epoch).toBe(following.projectedEpoch);
   expect(mutationsSent()).toHaveLength(0);
 });

@@ -16,7 +16,15 @@ type Message = { id: string; threadId: string; receivedAt: Date };
 type Audit = Pick<typeof auditLogs.$inferSelect, "id" | "actorEmail" | "action" | "entityType" | "entityId" | "technicalMetadata" | "createdAt">;
 type Action = Pick<typeof savActions.$inferSelect, "kind" | "actorType" | "status" | "payload">;
 const reversalSchema = z.object({ version: z.literal(1), batchId: z.uuid(), completionId: z.uuid() });
-const markerSchema = z.object({ version: z.literal(1), threadId: z.uuid(), batchId: z.uuid(), receivedBefore: z.iso.datetime({ offset: true }), reason: z.literal("processed_outside_studio") });
+export const externalDispositionSchema = z.enum(["completed", "other", "to_validate"]);
+const markerSchema = z.object({ version: z.literal(1), threadId: z.uuid(), batchId: z.uuid(), receivedBefore: z.iso.datetime({ offset: true }), reason: z.literal("processed_outside_studio"), disposition: externalDispositionSchema.optional() });
+export function savExternalDisposition(event: Pick<Audit, "technicalMetadata">) {
+  const marker = markerSchema.parse(event.technicalMetadata);
+  const view = marker.disposition ?? "completed";
+  return view === "other" ? { view, status: "human_other", reason: "Autres — classement humain de ce message. Aucun verdict IA ni action client déclarés." }
+    : view === "to_validate" ? { view, status: "human_review", reason: "Décision confiée à l’équipe pour ce message. Aucun traitement automatique ne sera exécuté sur cet entrant." }
+    : { view, status: "handled_externally", reason: "Traité hors Studio — clôture administrative de ce message. Aucun verdict IA, fermeture HubSpot ou apprentissage terminé ne sont déclarés." };
+}
 
 /** The same exact-proof predicate governs reads and rollback idempotence. */
 function completionReverted(original: Audit, events: Audit[]) {
@@ -95,14 +103,17 @@ export async function getSavExternalCompletion(message: Message, db?: Reader) {
 /** Validate only marker candidates with the canonical parser, before callers
  * apply pagination/LIMIT. No timestamp cast of arbitrary audit JSON, and no
  * arbitrary row cap that could hide a valid administrative disposition. */
-export async function listSavExternalCompletionMessageIds(db: Reader = requireDb(), forDisplay = false, mailboxId?: string) {
+export async function listSavExternalCompletionMessageIds(db: Reader = requireDb(), forDisplay = false, mailboxId?: string, disposition?: z.infer<typeof externalDispositionSchema>) {
   const candidates = await db.select({ id: savMessages.id, threadId: savMessages.threadId, receivedAt: savMessages.receivedAt }).from(savMessages)
     .where(and(mailboxId ? eq(savMessages.mailboxId, mailboxId) : undefined, eq(savMessages.direction, "inbound"),
       sql`exists(select 1 from public.audit_logs a where a.entity_type='sav_message' and a.entity_id=${savMessages.id}::text and a.action=${SAV_EXTERNAL_COMPLETION} and lower(a.actor_email)='ugo@limova.ai')`,
       sql`${savMessages.id}=(select latest.id from sav.messages latest where latest.thread_id=${savMessages.threadId} and latest.direction='inbound' order by latest.received_at desc,latest.created_at desc,latest.id desc limit 1)`));
   if (!candidates.length) return [];
   const events = await db.select().from(auditLogs).where(and(eq(auditLogs.entityType, "sav_message"), inArray(auditLogs.entityId, candidates.map(message => message.id)), inArray(auditLogs.action, savExternalCompletionEvents)));
-  const marked = candidates.filter(message => findSavExternalCompletion(message, events));
+  const marked = candidates.filter(message => {
+    const event = findSavExternalCompletion(message, events);
+    return event && (!disposition || savExternalDisposition(event).view === disposition);
+  });
   if (!forDisplay || !marked.length) return marked.map(message => message.id);
   const threadIds = marked.map(message => message.threadId);
   const actions = await db.select().from(savActions).where(inArray(savActions.threadId, threadIds));
@@ -125,7 +136,7 @@ async function invalidateCompletionProjection(db: Pick<ReturnType<typeof require
     where m.id in (${sql.join(ids.map(id => sql`${id}::uuid`), sql`, `)})`);
 }
 
-const batchSchema = z.object({ batchId: z.uuid(), receivedBefore: z.iso.datetime({ offset: true }), messages: z.array(z.object({ threadId: z.uuid(), messageId: z.uuid() })).min(1).max(1_000) });
+const batchSchema = z.object({ batchId: z.uuid(), receivedBefore: z.iso.datetime({ offset: true }), disposition: externalDispositionSchema.default("completed"), messages: z.array(z.object({ threadId: z.uuid(), messageId: z.uuid() })).min(1).max(1_000) });
 function assertOperator(actorEmail: string) {
   if (actorEmail.toLowerCase() !== "ugo@limova.ai") throw new Error("SAV_EXTERNAL_COMPLETION_FORBIDDEN");
   if (process.env.SAV_RELEASE_STAGE !== "v0" || process.env.SAV_PILOT_MODE === "true") throw new Error("SAV_EXTERNAL_COMPLETION_V0_ONLY");
@@ -188,7 +199,7 @@ async function applyExternalCompletion(raw: unknown, actorEmail: string, actor?:
       if (!message || message.id !== requested.messageId) reason = "new_inbound";
       else if (message.receivedAt.getTime() >= Date.parse(input.receivedBefore)) reason = "after_boundary";
       else if (!eligible.has(message.id) || pilots.has(message.id)) reason = "not_live_eligible";
-      else if (technicalMessages.has(message.id)) reason = "technical_exclusion";
+      else if (technicalMessages.has(message.id) && input.disposition === "completed") reason = "technical_exclusion";
       else if (hasUnsettledSavHumanAction(actions.filter(action => action.threadId === message.threadId)) || await hasUnsettledSavIntakeWork(message.threadId, tx)) reason = "unsettled_action";
       if (!reason && await intakeConsoleInstalled(tx)) {
         const runs = await tx.select({ leaseUntil: savIntakeRuns.leaseUntil }).from(savIntakeRuns).where(eq(savIntakeRuns.threadId, requested.threadId));
@@ -196,11 +207,12 @@ async function applyExternalCompletion(raw: unknown, actorEmail: string, actor?:
         if ([...runs, ...executions].some(row => row.leaseUntil && row.leaseUntil > new Date())) reason = "active_worker";
       }
       if (reason) { skipped[reason] = (skipped[reason] ?? 0) + 1; continue; }
-      if (findSavExternalCompletion(message!, events)) { alreadyCompleted++; continue; }
+      const previous = findSavExternalCompletion(message!, events);
+      if (previous && savExternalDisposition(previous).view === input.disposition) { alreadyCompleted++; continue; }
       // A reverted batch is never silently re-applied on retry.
       if (events.some(event => event.entityId === requested.messageId && event.technicalMetadata.batchId === input.batchId)) { skipped.previously_applied_batch = (skipped.previously_applied_batch ?? 0) + 1; continue; }
       rows.push({ actorEmail: actorEmail.toLowerCase(), action: SAV_EXTERNAL_COMPLETION, entityType: "sav_message", entityId: message!.id,
-        technicalMetadata: { version: 1, threadId: message!.threadId, batchId: input.batchId, receivedBefore: input.receivedBefore, reason: "processed_outside_studio" } });
+        technicalMetadata: { version: 1, threadId: message!.threadId, batchId: input.batchId, receivedBefore: input.receivedBefore, reason: "processed_outside_studio", disposition: input.disposition } });
     }
     if (rows.length) {
       await tx.insert(auditLogs).values(rows);
