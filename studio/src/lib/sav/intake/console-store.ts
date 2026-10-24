@@ -113,7 +113,9 @@ export async function listIntakeConsole(options: { mailboxId?: string; view?: Sa
       view: effectiveView, status: sql<string>`case when ${completed} then 'handled_externally' when ${marked} then 'external_completion_pending' when ${held} then 'human_hold' when ${savIntakeConsole.status}='external_completion_pending' then 'processing' when ${historicalMessageSql()} then 'historical_outside_automation' when ${savIntakeConsole.epoch}<>${savIntakeConsole.projectedEpoch} then 'processing' else ${savIntakeConsole.status} end`,
       reason: sql<string | null>`case when ${completed} then 'Traité hors Studio — clôture administrative de ce message. Aucun verdict IA, fermeture HubSpot ou apprentissage terminé ne sont déclarés.' when ${marked} then 'Traitement externe enregistré ; commande humaine ou résultat externe à rapprocher.' when ${held} then 'L’équipe garde la main sur ce dossier. L’automatisation reste en pause ; une décision humaine est attendue.' when ${savIntakeConsole.status}='external_completion_pending' then null when ${historicalMessageSql()} then 'Historique — hors automatisation. Aucun ticket HubSpot fermé par ce classement.' when ${savIntakeConsole.epoch}=${savIntakeConsole.projectedEpoch} then ${savIntakeConsole.reason} else null end`,
     }).from(savIntakeConsole).leftJoin(savMessages, latestMessageJoin).where(and(common, selected))
-      .orderBy(desc(savIntakeConsole.updatedAt), desc(savIntakeConsole.threadId)).limit(25).offset((currentPage - 1) * 25);
+      // Chronological by the latest customer email, newest first: projection
+      // refreshes move updatedAt and must not reshuffle the operator's list.
+      .orderBy(sql`${savMessages.receivedAt} desc nulls last`, desc(savMessages.createdAt), desc(savIntakeConsole.threadId)).limit(25).offset((currentPage - 1) * 25);
     return { installed: true, counts: countMap, rows, page: currentPage, pages, total };
   }, { isolationLevel: "repeatable read", accessMode: "read only" });
 }
