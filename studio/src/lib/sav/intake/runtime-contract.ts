@@ -21,6 +21,15 @@ export const savIntakeRuntimePins = z.object({ mailboxId: z.uuid(), createdAfter
   budgetProfile: z.literal(SAV_INTAKE_OPERATIONAL_PROFILE).optional(), maxRollingNanoUsd: z.number().int().min(1).max(90_000_000_000).optional() }).strict().refine(p =>
     p.budgetProfile === SAV_INTAKE_OPERATIONAL_PROFILE ? p.maxRollingNanoUsd !== undefined : p.maxCalls <= 30 && p.maxRollingNanoUsd === undefined);
 export type IntakeRuntimeConfig = z.infer<typeof savIntakeRuntimePins> & { mode: "observe"; policy: EnginePolicy; configHash: string; model: "gemini-3.6-flash" };
+/** Pure, explicit binding used also to verify a previous deployment receipt.
+ * A historical hash never grants permission to run a model under a new build. */
+export function intakeRuntimeConfigurationHash(p: z.infer<typeof savIntakeRuntimePins>, env: Record<string, string | undefined>, prompts = SAV_INTAKE_MODEL_REVISION) {
+  p = savIntakeRuntimePins.parse(p);
+  return intakeRuntimeHash({ ...p, revision: SAV_INTAKE_RUNTIME_REVISION, prompts, readers: SAV_INTAKE_READERS_REVISION, context: SAV_MESSAGE_CONTEXT_REVISION,
+    otherRulesHash: intakeRuntimeHash(env.SAV_OTHER_OBSERVATION_RULES_JSON ?? null),
+    otherRoutingHash: intakeRuntimeHash(env.SAV_INTAKE_OTHER_RULES_JSON ?? null),
+    accessBinding: intakeRuntimeHash({ model: env.SAV_GEMINI_API_KEY, crm: env.HUBSPOT_ACCESS_TOKEN }) });
+}
 /** No permissive defaults, campaign resets or hidden reuse of another budget. */
 export function savIntakeRuntimeConfig(env: Record<string, string | undefined> = process.env, now = new Date()): IntakeRuntimeConfig | null {
   if (env.SAV_INTAKE_RUNTIME_MODE !== "observe") return null;
@@ -42,10 +51,7 @@ export function savIntakeRuntimeConfig(env: Record<string, string | undefined> =
       || (env.SAV_ENCRYPTION_KEY_V1?.length ?? 0) < 32) throw Error();
     const warning = policy.resources.multiTicketWarning;
     if (warning && createHash("sha256").update(warning.text).digest("hex") !== warning.sha256) throw Error();
-    return { ...p, mode: "observe", policy, model: "gemini-3.6-flash", configHash: intakeRuntimeHash({ ...p, revision: SAV_INTAKE_RUNTIME_REVISION, prompts: SAV_INTAKE_MODEL_REVISION, readers: SAV_INTAKE_READERS_REVISION, context: SAV_MESSAGE_CONTEXT_REVISION,
-      otherRulesHash: intakeRuntimeHash(env.SAV_OTHER_OBSERVATION_RULES_JSON ?? null),
-      otherRoutingHash: intakeRuntimeHash(env.SAV_INTAKE_OTHER_RULES_JSON ?? null),
-      accessBinding: intakeRuntimeHash({ model: env.SAV_GEMINI_API_KEY, crm: env.HUBSPOT_ACCESS_TOKEN }) }) };
+    return { ...p, mode: "observe", policy, model: "gemini-3.6-flash", configHash: intakeRuntimeConfigurationHash(p, env) };
   } catch { throw Error("SAV_INTAKE_RUNTIME_CONFIGURATION_REQUIRED"); }
 }
 export type IntakeRuntimeState = "pending" | "analysing" | "observed" | "waiting" | "uncertain" | "superseded";
