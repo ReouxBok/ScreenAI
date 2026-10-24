@@ -78,6 +78,22 @@ export async function reserveServerEvaluationCall(runId: string, requestHash: st
     return row.id;
   });
 }
+/** Read-only preflight for a complete semantic matching plan. The individual
+ * reservation still repeats every check immediately before dispatch. */
+export async function assertServerEvaluationCallPlan(runId: string, actorEmail: string, requestedCalls: number) {
+  if (!Number.isInteger(requestedCalls) || requestedCalls < 1 || requestedCalls > 3) return bad();
+  return requireDb().transaction(async tx => {
+    await lock(tx);
+    const [run] = await tx.select().from(auditLogs).where(and(eq(auditLogs.id, runId), eq(auditLogs.action, EVALUATION_ACTION))).for("update");
+    if (!run || run.actorEmail !== actorEmail || run.technicalMetadata.state !== "running") return bad();
+    const calls = await tx.select().from(auditLogs).where(eq(auditLogs.action, EVALUATION_CALL));
+    if (calls.some(call => call.technicalMetadata.state !== "settled")) throw Error("SAV_EVAL_USAGE_UNCERTAIN");
+    const used = calls.reduce((total, call) => total + charge(call.technicalMetadata), 0), price = quote();
+    if (calls.length + requestedCalls > EVALUATION_MAX_CALLS || used + requestedCalls * price.reservedNanoUsd > EVALUATION_CAP) {
+      throw Error("SAV_EVAL_BUDGET_EXHAUSTED");
+    }
+  });
+}
 export async function settleServerEvaluationCall(id: string, metadata?: SavGeminiMetadata) {
   return requireDb().transaction(async tx => {
     await lock(tx);

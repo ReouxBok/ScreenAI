@@ -3,7 +3,7 @@ import { planSavIntake } from "./engine";
 import { createSavIntakeSemanticReaders, type IntakeGeminiCall, type IntakeModelTrace } from "./model-readers";
 import { withSavAiBudget, requestSavGeminiJson, savGeminiGenerationConfig, savAiErrorMetadata } from "../gemini-transport";
 import { evaluationHash, evaluationConfig, evaluationContinuationProof, type EvaluationBatch, type ServerEvaluationConfig } from "./server-contract";
-import { claimServerEvaluation, reserveServerEvaluationCall, settleServerEvaluationCall, saveServerEvaluationResult, readServerEvaluation } from "./server-ledger";
+import { claimServerEvaluation, assertServerEvaluationCallPlan, reserveServerEvaluationCall, settleServerEvaluationCall, saveServerEvaluationResult, readServerEvaluation } from "./server-ledger";
 import type { IntakeAdapters, ReadResult } from "./engine-types";
 import { SAV_INTAKE_MODEL_LIMITS } from "./model-limits";
 
@@ -96,7 +96,17 @@ export async function runServerEvaluation(batch: EvaluationBatch, config: Server
         }
       };
       const call: IntakeGeminiCall = input => { const work = execute(input); pending.push(work); return work; };
-      const semantics = createSavIntakeSemanticReaders({ model: config.model, call, onTrace: trace => traces.push(trace) });
+      const semantics = createSavIntakeSemanticReaders({ model: config.model, call, onTrace: trace => traces.push(trace),
+        planCalls: async requests => {
+          assertLive();
+          if (requests.length < 1 || requests.length > 3 || calls + requests.length > 3 || evidence.modelCalls + requests.length > 9
+            || uncertain || requests.some(input => input.signal.aborted || input.model !== config.model || input.phase !== "ticket_matching"
+              || input.allowRetry !== false || input.media?.length || input.body.generationConfig.maxOutputTokens !== 8192
+              || Buffer.byteLength(JSON.stringify({ ...input.body, generationConfig: savGeminiGenerationConfig(config.model, input.body.generationConfig) }), "utf8")
+                > SAV_INTAKE_MODEL_LIMITS.wireTextBytes)) throw Error("SAV_EVAL_DISPATCH_REJECTED");
+          await assertServerEvaluationCallPlan(claim.id, actorEmail, requests.length);
+          assertLive();
+        } });
       const plan = await withSavAiBudget(() => planSavIntake(item.input, { ...snapshotEvaluationReaders(item), ...semantics }, item.policy, { timeoutMs: 10_000 }, () => new Date()));
       if (plan.effects !== "not_connected" || plan.steps.some(step => step.status !== "not_dispatched")) throw Error("SAV_EVAL_EFFECT_REJECTED");
       // The engine may return after its own deadline while provider cancellation

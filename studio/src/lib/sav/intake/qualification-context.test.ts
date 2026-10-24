@@ -264,7 +264,7 @@ describe("runtime (stored mail → readers → plan)", () => {
     const current = await readSavIntakeCurrent(threadId, config);
     expect(counts.model).toBe(0);
     expect(current?.payload.reason).toBe("SAV_INTAKE_MODEL_CONTEXT_LIMIT");
-    expect(current?.payload.traces).toEqual(expect.arrayContaining([expect.objectContaining({ contextLimit: expect.objectContaining({ stage: expect.stringMatching(/^(data|catalogue)$/) }) })]));
+    expect(current?.payload.traces).toEqual(expect.arrayContaining([expect.objectContaining({ contextLimit: expect.objectContaining({ stage: expect.stringMatching(/^(data|catalogue|wire)$/) }) })]));
     expect(JSON.stringify(current?.payload.traces)).not.toContain("synchronisation échouée");
   });
 

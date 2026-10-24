@@ -7,7 +7,7 @@ const state = vi.hoisted(() => ({ db: null as unknown }));
 vi.mock("@/db", () => ({ requireDb: () => { if (!state.db) throw Error("NO_DATABASE_ALLOWED"); return state.db; } }));
 import { encryptSavPayload, decryptSavPayload } from "../crypto";
 import { intakeRuntimeHash, savIntakeRuntimeConfig, SAV_INTAKE_RUNTIME_REVISION, type IntakeRuntimeConfig, type IntakeRuntimePayload } from "./runtime-contract";
-import { assertSavIntakeLease, catchupSavIntake, claimSavIntakeRun, enqueueSavIntakeMessage, failSavIntakeRun, pendingSavIntakeRuns, readSavIntakeBudget, readSavIntakeCurrent, reconcileConfinedIntakeUsage, reserveSavIntakeCall, saveSavIntakeResult, settleSavIntakeCall } from "./runtime-store";
+import { assertSavIntakeCallPlan, assertSavIntakeLease, catchupSavIntake, claimSavIntakeRun, enqueueSavIntakeMessage, failSavIntakeRun, pendingSavIntakeRuns, readSavIntakeBudget, readSavIntakeCurrent, reconcileConfinedIntakeUsage, reserveSavIntakeCall, saveSavIntakeResult, settleSavIntakeCall } from "./runtime-store";
 import { analyseSavIntakeRuntime, enqueueConfiguredSavIntake, reconcileSavIntakeRuntime } from "./runtime";
 
 let f: Awaited<ReturnType<typeof createSavTestDb>>, mailboxId: string, threadId: string, messageId: string;
@@ -113,6 +113,34 @@ it("same model request is durably cached and does not reserve twice after a resu
   const l = await lease(), r = await reserveSavIntakeCall(l, config, "a".repeat(64));
   await settleSavIntakeCall(r.id, usage, { json: { synthetic: true }, metadata: usage });
   expect((await reserveSavIntakeCall(l, config, "a".repeat(64))).cached?.json).toEqual({ synthetic: true }); expect((await readSavIntakeBudget(config)).callCount).toBe(1);
+});
+it("preflights complete grouped requests read-only, allowing valid cache and rejecting an over-cap plan", async () => {
+  const l = await lease(), first = await reserveSavIntakeCall(l, config, "a".repeat(64));
+  await settleSavIntakeCall(first.id, usage, { json: { cached: true }, metadata: usage });
+  const before = await f.db.select().from(savIntakeModelCalls);
+  await expect(assertSavIntakeCallPlan(messageId, config, ["a".repeat(64), "b".repeat(64), "c".repeat(64)])).resolves.toBeUndefined();
+  expect(await f.db.select().from(savIntakeModelCalls)).toEqual(before);
+  await expect(assertSavIntakeCallPlan(messageId, config, ["a".repeat(64), "b".repeat(64), "c".repeat(64), "d".repeat(64)])).rejects.toThrow("DISPATCH_REJECTED");
+  const second = await reserveSavIntakeCall(l, config, "b".repeat(64)); await settleSavIntakeCall(second.id, usage, { json: { cached: true }, metadata: usage });
+  const third = await reserveSavIntakeCall(l, config, "c".repeat(64)); await settleSavIntakeCall(third.id, usage, { json: { cached: true }, metadata: usage });
+  const snapshot = await f.db.select().from(savIntakeModelCalls);
+  await expect(assertSavIntakeCallPlan(messageId, config, ["a".repeat(64), "b".repeat(64), "c".repeat(64)])).resolves.toBeUndefined();
+  await expect(assertSavIntakeCallPlan(messageId, config, ["d".repeat(64)])).rejects.toThrow("BUDGET_EXHAUSTED");
+  expect(await f.db.select().from(savIntakeModelCalls)).toEqual(snapshot);
+});
+it("preflights complete grouped requests read-only, allowing valid cache and refusing over-cap batches", async () => {
+  const l = await lease(), first = await reserveSavIntakeCall(l, config, "a".repeat(64));
+  await settleSavIntakeCall(first.id, usage, { json: { cached: true }, metadata: usage });
+  const before = await f.db.select().from(savIntakeModelCalls);
+  await expect(assertSavIntakeCallPlan(messageId, config, ["a".repeat(64), "b".repeat(64), "c".repeat(64)])).resolves.toBeUndefined();
+  expect(await f.db.select().from(savIntakeModelCalls)).toEqual(before);
+  await expect(assertSavIntakeCallPlan(messageId, config, ["a".repeat(64), "b".repeat(64), "c".repeat(64), "d".repeat(64)])).rejects.toThrow("DISPATCH_REJECTED");
+  const second = await reserveSavIntakeCall(l, config, "b".repeat(64)); await settleSavIntakeCall(second.id, usage, { json: { cached: true }, metadata: usage });
+  const third = await reserveSavIntakeCall(l, config, "c".repeat(64)); await settleSavIntakeCall(third.id, usage, { json: { cached: true }, metadata: usage });
+  const snapshot = await f.db.select().from(savIntakeModelCalls);
+  await expect(assertSavIntakeCallPlan(messageId, config, ["a".repeat(64), "b".repeat(64), "c".repeat(64)])).resolves.toBeUndefined();
+  await expect(assertSavIntakeCallPlan(messageId, config, ["d".repeat(64)])).rejects.toThrow("BUDGET_EXHAUSTED");
+  expect(await f.db.select().from(savIntakeModelCalls)).toEqual(snapshot);
 });
 it("retains unknown usage, refuses refunds/replay and settles a late response without publishing", async () => {
   const l = await lease(), r = await reserveSavIntakeCall(l, config, "a".repeat(64));
@@ -706,4 +734,30 @@ it.each(["valid_repair", "invalid_repair", "unknown_usage", "short_deadline"])("
   expect(network).toHaveBeenCalledTimes(count);
   expect(await f.db.select().from(savActions)).toHaveLength(0);
   expect((await f.db.select().from(savMessages).where(eq(savMessages.id, messageId)))[0].bodyCiphertext).toBe(ciphertext);
+});
+
+it("preflights the whole matching plan against durable per-message capacity without reserving",async()=>{
+  const l=await lease();
+  for(const key of ["a","b"]){const r=await reserveSavIntakeCall(l,config,key.repeat(64));await settleSavIntakeCall(r.id,usage,{json:{fixture:true},metadata:usage});}
+  const before=await readSavIntakeBudget(config);
+  await expect(assertSavIntakeCallPlan(messageId,config,["c".repeat(64),"d".repeat(64)])).rejects.toThrow("BUDGET_EXHAUSTED");
+  await expect(assertSavIntakeCallPlan(messageId,config,["a".repeat(64),"c".repeat(64)])).resolves.toBeUndefined();
+  expect(await readSavIntakeBudget(config)).toEqual(before);
+  const r=await reserveSavIntakeCall(l,config,"c".repeat(64));await settleSavIntakeCall(r.id,usage,{json:{fixture:true},metadata:usage});
+  await expect(assertSavIntakeCallPlan(messageId,config,["a".repeat(64),"b".repeat(64),"c".repeat(64)])).resolves.toBeUndefined();
+  await expect(assertSavIntakeCallPlan(messageId,config,["d".repeat(64)])).rejects.toThrow("BUDGET_EXHAUSTED");
+  expect((await readSavIntakeBudget(config)).callCount).toBe(3);
+});
+it("preflight never treats a consumed result or uncertain usage as a reusable cached comparison",async()=>{
+  const l=await lease(),r=await reserveSavIntakeCall(l,config,"a".repeat(64));
+  await expect(assertSavIntakeCallPlan(messageId,config,["a".repeat(64)])).rejects.toThrow("USAGE_UNCERTAIN");
+  await settleSavIntakeCall(r.id,usage);
+  await expect(assertSavIntakeCallPlan(messageId,config,["a".repeat(64)])).rejects.toThrow("CALL_ALREADY_CONSUMED");
+  expect((await readSavIntakeBudget(config)).callCount).toBe(1);
+});
+it("preflights daily money/call limits and rejects duplicate or malformed plans",async()=>{
+  await expect(assertSavIntakeCallPlan(messageId,{...config,maxNanoUsd:1_000_000_000},["a".repeat(64),"b".repeat(64)])).rejects.toThrow("BUDGET_EXHAUSTED");
+  await expect(assertSavIntakeCallPlan(messageId,{...config,maxCalls:1},["a".repeat(64),"b".repeat(64)])).rejects.toThrow("BUDGET_EXHAUSTED");
+  for(const hashes of [[],["a".repeat(64),"a".repeat(64)],["not-a-hash"],["a","b","c","d"].map(c=>c.repeat(64))])await expect(assertSavIntakeCallPlan(messageId,config,hashes)).rejects.toThrow("DISPATCH_REJECTED");
+  expect((await readSavIntakeBudget(config)).callCount).toBe(0);
 });

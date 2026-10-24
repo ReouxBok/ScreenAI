@@ -39,7 +39,7 @@ const receipt = (e: typeof savIntakeEffects.$inferSelect) => e.state === "confir
 function sourceRuntime(runtime: IntakeRuntimeConfig, codeRevision: string, oldHash: string, env: ReturnType<ExecutionOptions["env"]>) {
   const { mode, policy, configHash, model, ...rest } = runtime; void mode; void policy; void configHash; void model;
   const pins = savIntakeRuntimePins.parse({ ...rest, codeRevision });
-  const matches = [undefined, "sav-intake-semantic-2026-10-23.v5"].some(prompts => intakeRuntimeConfigurationHash(pins, env, prompts) === oldHash);
+  const matches = [undefined, "sav-intake-semantic-2026-10-23.v5", "sav-intake-semantic-2026-10-24.v6"].some(prompts => intakeRuntimeConfigurationHash(pins, env, prompts) === oldHash);
   if (!matches) return fault();
   return { ...runtime, codeRevision, configHash: oldHash };
 }

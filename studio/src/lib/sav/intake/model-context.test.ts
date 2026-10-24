@@ -1,5 +1,8 @@
 import { describe, expect, it, vi } from "vitest";
 import { createSavIntakeSemanticReaders, type IntakeGeminiCall, type IntakeModelTrace } from "./model-readers";
+import { intakeEvidenceCatalogue } from "./model-evidence";
+import { intakeContextBreakdown } from "./model-context";
+import { expandIntakeContextView, type CompactIntakeAnchor } from "./model-context-view";
 import { SAV_INTAKE_MODEL_LIMITS } from "./model-limits";
 import { intakeDiagnosticPayload } from "./run-diagnostics";
 import { encryptSavPayload } from "../crypto";
@@ -11,7 +14,7 @@ const message = { id: mid, threadId: tid, receivedAt: at, fromEmail: "client@exa
   direction: "inbound" as const, currentText: "Ma routine ne se lance toujours pas.", contentComplete: true };
 const signal = () => new AbortController().signal;
 const result = (json: unknown) => ({ json, metadata: { inputTokens: 10, outputTokens: 10, thoughtTokens: 0, totalTokens: 20 } });
-type Data = { requests: unknown[]; citationCatalogue: { id: string; sourceId: string; text: string }[] };
+type Data = { contextBlocks?: {id:string;text:string}[]; requests: unknown[]; citationCatalogue: { id: string; sourceId: string; text: string }[] };
 const data = (arg: Parameters<IntakeGeminiCall>[0]) => JSON.parse(arg.body.contents[0].parts[0].text) as Data;
 const anchor = (arg: Parameters<IntakeGeminiCall>[0], source: string) => data(arg).citationCatalogue.find(a => a.sourceId === source)!.id;
 
@@ -41,23 +44,31 @@ const sameVerdict = (arg: Parameters<IntakeGeminiCall>[0], sources: string[], re
   tickets: [{ ticketId: "201", relation: "same", requestIds, evidenceIds: ["current", "ticket-201", "history-201"], rationale: "Même routine", grounding: sources.map(s => ({ quoteId: anchor(arg, s) })) }] });
 
 describe("ticket_matching context budget", () => {
-  it("reproduces the limit from duplicated, quoted reply chains and explains it with counts only", async () => {
-    const traces: IntakeModelTrace[] = [], call = vi.fn<IntakeGeminiCall>();
-    const reader = createSavIntakeSemanticReaders({ model: "gemini-fixture", call, onTrace: t => traces.push(t) });
-    await expect(reader.assessIssues(issueInput(threadHistory(8)), signal())).rejects.toThrow("SAV_INTAKE_MODEL_CONTEXT_LIMIT");
-    expect(call).not.toHaveBeenCalled(); // refused before any provider request, nothing truncated
-    const limit = traces[0].contextLimit!;
-    expect(limit).toMatchObject({ stage: "data", limitBytes: SAV_INTAKE_MODEL_LIMITS.dataBytes });
-    expect(limit.bytes).toBeGreaterThan(SAV_INTAKE_MODEL_LIMITS.dataBytes);
-    const b = limit.breakdown!;
-    // The catalogue (full verbatim sources) is the request; the history dominates it.
-    expect(b.sections.catalogue / limit.bytes).toBeGreaterThan(0.9);
-    expect(b.catalogue.bySource.history / b.sections.catalogue).toBeGreaterThan(0.9);
-    expect(b.history).toMatchObject({ tickets: 1, events: 16, emails: 16, duplicateEvents: 8 });
-    expect(b.history!.quotedBytes).toBeGreaterThan(b.history!.duplicateBytes / 2);
-    expect(JSON.stringify(traces)).not.toContain(marker);
-    expect(JSON.stringify(traces)).not.toContain(message.fromEmail);
-    expect(JSON.stringify(traces)).not.toContain("citation");
+  it("reproduces the original excess and sends a lossless compact view within the same limit", async () => {
+    const traces: IntakeModelTrace[] = [], history=threadHistory(8), input=issueInput(history);
+    const original=intakeEvidenceCatalogue(new Map([["current",message.currentText],["ticket-201",`${input.tickets[0].ticket.subject}\n${input.tickets[0].ticket.content}`],["history-201",history.map(e=>`[${e.id} ${e.at} ${e.kind}] ${e.text}`).join("\n")]])).entries;
+    const raw={citationCatalogue:original},rawBytes=Buffer.byteLength(JSON.stringify(raw)),b=intakeContextBreakdown(raw,[history]);
+    expect(rawBytes).toBeGreaterThan(SAV_INTAKE_MODEL_LIMITS.dataBytes);
+    expect(b.sections.catalogue/rawBytes).toBeGreaterThan(0.9);
+    expect(b.catalogue.bySource.history/b.sections.catalogue).toBeGreaterThan(0.9);
+    expect(b.history).toMatchObject({tickets:1,events:16,emails:16,duplicateEvents:8});
+    expect(b.history!.quotedBytes).toBeGreaterThan(b.history!.duplicateBytes/2);
+    const call=vi.fn<IntakeGeminiCall>(async arg=>{
+      const sent=data(arg);
+      expect(Buffer.byteLength(arg.body.contents[0].parts[0].text)).toBeLessThanOrEqual(SAV_INTAKE_MODEL_LIMITS.dataBytes);
+      expect(expandIntakeContextView({entries:sent.citationCatalogue as CompactIntakeAnchor[],blocks:sent.contextBlocks??[]})).toEqual(original);
+      return sameVerdict(arg,["current","ticket-201","history-201"]);
+    });
+    const reader=createSavIntakeSemanticReaders({model:"gemini-fixture",call,onTrace:t=>traces.push(t)});
+    await expect(reader.assessIssues(input,signal())).resolves.toMatchObject({investigationComplete:true,tickets:[{relation:"same"}]});
+    expect(call).toHaveBeenCalledTimes(1);expect(traces.every(t=>t.accepted)).toBe(true);
+    expect(JSON.stringify(traces)).not.toContain(marker);expect(JSON.stringify(traces)).not.toContain(message.fromEmail);expect(JSON.stringify(traces)).not.toContain("citation");
+  });
+  it("bounds diagnostic nested-history comparisons and reports incomplete metrics without truncating source data", () => {
+    const history=Array.from({length:30},(_,i)=>({id:`event-${i}`,kind:"email" as const,at:`2026-10-${String(i+1).padStart(2,"0")}T10:00:00.000Z`,text:"x".repeat(300+i)}));
+    const result=intakeContextBreakdown({},[history]);
+    expect(result.history).toMatchObject({nestedComparisons:250,nestedScanComplete:0});
+    expect(result.history!.nestedComparisonsSkipped).toBeGreaterThan(0);
   });
   it("shows the growth is quadratic in replies and disappears without quoting and copies", async () => {
     const size = async (history: IntakeHistory) => {
@@ -105,11 +116,11 @@ it("admin diagnostics expose the breakdown as allow-listed numbers only", () => 
   vi.stubEnv("SAV_ENCRYPTION_KEY_V1", "synthetic-context-limit-encryption-key-32chars");
   const payload = intakeDiagnosticPayload(encryptSavPayload({ traces: [{ phase: "ticket_matching", accepted: false, errorCode: "SAV_INTAKE_MODEL_CONTEXT_LIMIT",
     contextLimit: { stage: "data", bytes: 140000, limitBytes: 98304, breakdown: {
-      sections: { catalogue: 130000, evidence: 900, PRIVATE_KEY: 5 },
+      sections: { catalogue: 130000, evidence: 900, contextBlocks: 2000, PRIVATE_KEY: 5 },
       catalogue: { entries: 80, bySource: { history: 125000, current: 200, "PRIVATE SOURCE": 1 } },
       history: { events: 16, duplicateEvents: 8, quotedBytes: "PRIVATE TEXT", leaked: "PRIVATE" } } } }] }));
   expect(payload.traces[0].contextLimit).toEqual({ stage: "data", bytes: 140000, limitBytes: 98304, breakdown: {
-    sections: { catalogue: 130000, evidence: 900 }, catalogue: { entries: 80, bySource: { history: 125000, current: 200 } },
+    sections: { catalogue: 130000, evidence: 900, contextBlocks: 2000 }, catalogue: { entries: 80, bySource: { history: 125000, current: 200 } },
     history: { events: 16, duplicateEvents: 8, quotedBytes: null } } });
   expect(JSON.stringify(payload)).not.toContain("PRIVATE");
 });

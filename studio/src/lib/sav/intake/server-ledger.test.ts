@@ -6,7 +6,7 @@ import { auditLogs, staffUsers, savMessages, savActions } from "@/db/schema";
 const state = vi.hoisted(() => ({ db: null as unknown }));
 vi.mock("@/db", () => ({ requireDb: () => state.db }));
 import { evaluationConfig, EVALUATION_ACTION, EVALUATION_CALL, type ServerEvaluationConfig } from "./server-contract";
-import { claimServerEvaluation, reserveServerEvaluationCall, settleServerEvaluationCall, saveServerEvaluationResult, readServerEvaluation } from "./server-ledger";
+import { claimServerEvaluation, assertServerEvaluationCallPlan, reserveServerEvaluationCall, settleServerEvaluationCall, saveServerEvaluationResult, readServerEvaluation } from "./server-ledger";
 let fixture: Awaited<ReturnType<typeof createSavTestDb>>;
 const admin = "ugo@limova.ai", usage = { inputTokens: 100, outputTokens: 50, thoughtTokens: 0, totalTokens: 150 };
 const config = () => evaluationConfig(evaluationEnvironment());
@@ -34,6 +34,17 @@ it("admits only three full-window uncertain reservations under3USD", async () =>
   const attempts = await Promise.allSettled([1, 2, 3, 4].map(n => reserveServerEvaluationCall(run.id, String(n).repeat(64), admin)));
   expect(attempts.filter(x => x.status === "fulfilled")).toHaveLength(3);
   const result = await readServerEvaluation(config()); expect(result?.chargedNanoUsd).toBe(2_451_456_000);
+});
+it("preflights a complete grouped call plan read-only against the durable campaign cap", async () => {
+  const run = await claimServerEvaluation(config(), admin);
+  await expect(assertServerEvaluationCallPlan(run.id, admin, 3)).resolves.toBeUndefined();
+  expect(await fixture.db.select().from(auditLogs).where(eq(auditLogs.action, EVALUATION_CALL))).toHaveLength(0);
+  for (let n = 0; n < 7; n++) await settleServerEvaluationCall(await reserveServerEvaluationCall(run.id, String(n).repeat(64), admin), usage);
+  await expect(assertServerEvaluationCallPlan(run.id, admin, 3)).rejects.toThrow("SAV_EVAL_BUDGET_EXHAUSTED");
+  await expect(assertServerEvaluationCallPlan(run.id, "other@example.invalid", 1)).rejects.toThrow("LEDGER_REJECTED");
+  await expect(assertServerEvaluationCallPlan(run.id, admin, 4)).rejects.toThrow("LEDGER_REJECTED");
+  const rows = await fixture.db.select().from(auditLogs).where(eq(auditLogs.action, EVALUATION_CALL));
+  expect(rows).toHaveLength(7); expect(rows.every(row => row.technicalMetadata.state === "settled")).toBe(true);
 });
 it("settles proven usage idempotently and keeps unknown usage fully reserved", async () => {
   const run = await claimServerEvaluation(config(), admin), id = await reserveServerEvaluationCall(run.id, "a".repeat(64), admin);

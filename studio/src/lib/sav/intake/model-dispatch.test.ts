@@ -4,7 +4,7 @@ import { createIntakeModelDispatcher } from "./model-dispatch";
 import { SAV_INTAKE_MODEL_LIMITS } from "./model-limits";
 import { savGeminiWireBody } from "../gemini-transport";
 import type { IntakeGeminiCall } from "./model-readers";
-import type { IntakeRuntimeConfig } from "./runtime-contract";
+import { intakeRuntimeHash, type IntakeRuntimeConfig } from "./runtime-contract";
 import { settleSavIntakeCall } from "./runtime-store";
 import { savDerivedCostQuote } from "../derived-budget";
 import { admitSavAttachmentImage } from "../attachment-image";
@@ -75,4 +75,20 @@ it("clears an obsolete failure after a successful, separately reserved repair", 
   repair.body.systemInstruction.parts[0].text += " Repair format v1.";
   await expect(dispatcher.call(repair)).resolves.toMatchObject({ json: { fixture: true } });
   expect(network).toHaveBeenCalledTimes(1); expect(dispatcher.failureReason).toBeUndefined();
+});
+it("preflights the exact complete request bodies without reserving or sending them", async () => {
+  const input = inputAtSize(1000), preflight = vi.fn(async () => {}), network = vi.fn<typeof fetch>(), reserve = vi.fn(async () => ({ id: "synthetic", cached: null }));
+  const dispatcher = createIntakeModelDispatcher({ config, live: async () => {}, preflight, reserve, network,
+    signal: new AbortController().signal, env: () => ({ SAV_GEMINI_API_KEY: "synthetic-key" }) });
+  await dispatcher.plan([input]);
+  expect(preflight).toHaveBeenCalledExactlyOnceWith([intakeRuntimeHash(savGeminiWireBody(input).body)]);
+  expect(reserve).not.toHaveBeenCalled(); expect(network).not.toHaveBeenCalled(); expect(settleSavIntakeCall).not.toHaveBeenCalled();
+});
+it("rejects a batch outside the dispatcher capability before durable preflight", async () => {
+  const input = inputAtSize(1000), preflight = vi.fn(async () => {}), dispatcher = createIntakeModelDispatcher({ config, live: async () => {}, preflight,
+    reserve: async () => ({ id: "synthetic", cached: null }), signal: new AbortController().signal, env: () => ({ SAV_GEMINI_API_KEY: "synthetic-key" }) });
+  await expect(dispatcher.plan([input, input, input, input])).rejects.toThrow("BATCH_PLANNING_REQUIRED");
+  const invalid = { ...input, phase: "understanding" as const };
+  await expect(dispatcher.plan([invalid])).rejects.toThrow("REQUEST_REJECTED"); expect(dispatcher.failureReason).toBe("SAV_INTAKE_RUNTIME_REQUEST_REJECTED");
+  expect(preflight).not.toHaveBeenCalled();
 });

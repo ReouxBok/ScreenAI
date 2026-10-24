@@ -73,7 +73,16 @@ export async function evaluateSavIntakeReadOnly(options: {
       reservedNanoUsd += grant.maxReservedNanoUsdPerCall; calls++; modelCalls++;
       return options.call!(request);
     };
-    const semantics = createSavIntakeSemanticReaders({ model: grant.model, call: guardedCall, onTrace: trace => traces.push(trace) });
+    const semantics = createSavIntakeSemanticReaders({ model: grant.model, call: guardedCall, onTrace: trace => traces.push(trace),
+      planCalls: async requests => {
+        const maxCalls = Math.min(3, grant.maxCallsPerCase);
+        if (requests.length < 1 || requests.length > maxCalls || calls + requests.length > maxCalls
+          || reservedNanoUsd + requests.length * grant.maxReservedNanoUsdPerCall > grant.remainingNanoUsd
+          || requests.some(request => request.signal.aborted || request.model !== grant.model || request.phase !== "ticket_matching"
+            || request.allowRetry !== false || request.media?.length || request.body.generationConfig.maxOutputTokens !== 8192)) {
+          throw Error("SAV_INTAKE_EVALUATION_BUDGET_EXHAUSTED");
+        }
+      } });
     const readers = createSavIntakeHubspotReaders({ network: options.network, now: options.now, onRead: trace => reads.push(trace) });
     const plan = await options.withExistingAiBudget(() => planSavIntake(item.input, { ...readers, ...semantics }, item.policy, { timeoutMs: 10_000 }, options.now ?? (() => new Date())));
     records.push({ caseId: item.caseId, clientGroup: item.clientGroup, plan, traces, reads, dimensions: scoreSavIntakePlan(plan, item.reference), calls });

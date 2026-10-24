@@ -6,7 +6,8 @@ export type IntakeContextBreakdown = {
   sections: Record<string, number>;
   catalogue: { entries: number; bySource: Record<string, number> };
   history?: { tickets: number; events: number; notes: number; emails: number; htmlEmails: number;
-    duplicateEvents: number; duplicateBytes: number; nestedEvents: number; nestedBytes: number; quotedBytes: number; maxTicketHistoryBytes: number };
+    duplicateEvents: number; duplicateBytes: number; nestedEvents: number; nestedBytes: number; nestedComparisons: number; nestedComparisonsSkipped: number;
+    nestedScanComplete: number; quotedBytes: number; maxTicketHistoryBytes: number };
 };
 const bytes = (value: unknown) => Buffer.byteLength(typeof value === "string" ? value : JSON.stringify(value) ?? "", "utf8");
 // Source ids are `<kind>-<id>`; only the kind is kept.
@@ -35,13 +36,20 @@ export function intakeContextBreakdown(data: Record<string, unknown>, histories?
   if (!histories) return result;
   const events = histories.flat(), bodies = events.map(e => e.kind === "email" ? emailBody(e.text) : e.text);
   const seen = new Set<string>(); let duplicateEvents = 0, duplicateBytes = 0, nestedEvents = 0, nestedBytes = 0, offset = 0;
+  let nestedComparisons = 0, nestedComparisonsSkipped = 0;
   for (const history of histories) {
     const own = bodies.slice(offset, offset + history.length);
     for (const [index, body] of own.entries()) {
       if (seen.has(body)) { duplicateEvents++; duplicateBytes += bytes(history[index].text); continue; }
       seen.add(body);
       // Largest earlier body of the same ticket repeated verbatim inside this one (bounded: 100 events/ticket).
-      const nested = own.slice(0, index).filter(other => other.length >= 200 && other !== body && body.includes(other)).reduce((max, other) => Math.max(max, bytes(other)), 0);
+      let nested = 0;
+      for (const other of own.slice(0, index)) {
+        if (other.length < 200 || other === body) continue;
+        if (nestedComparisons >= 250) { nestedComparisonsSkipped++; continue; }
+        nestedComparisons++;
+        if (body.includes(other)) nested = Math.max(nested, bytes(other));
+      }
       if (nested) { nestedEvents++; nestedBytes += nested; }
     }
     offset += history.length;
@@ -49,7 +57,8 @@ export function intakeContextBreakdown(data: Record<string, unknown>, histories?
   result.history = { tickets: histories.length, events: events.length,
     notes: events.filter(e => e.kind === "note").length, emails: events.filter(e => e.kind === "email").length,
     htmlEmails: events.filter((e, i) => e.kind === "email" && /<(?:html|body|div|table|p)\b/i.test(bodies[i])).length,
-    duplicateEvents, duplicateBytes, nestedEvents, nestedBytes,
+    duplicateEvents, duplicateBytes, nestedEvents, nestedBytes, nestedComparisons, nestedComparisonsSkipped,
+    nestedScanComplete: nestedComparisonsSkipped === 0 ? 1 : 0,
     quotedBytes: bodies.reduce((sum, body, i) => sum + (events[i].kind === "email" ? quotedBytes(body) : 0), 0),
     maxTicketHistoryBytes: histories.reduce((max, h) => Math.max(max, h.reduce((sum, e) => sum + bytes(e.text), 0)), 0) };
   return result;

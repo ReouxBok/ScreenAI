@@ -254,10 +254,10 @@ it.each(["revoked", "paused", "new_message", "active_lease", "changed_intent", "
     expect(posts("/tickets")).toBe(1);expect(posts("/emails")).toBe(0);
 });
 
-it("recognizes an explicit v5 observation without rewriting the historical run or charging AI",async()=>{
+it.each(["sav-intake-semantic-2026-10-23.v5","sav-intake-semantic-2026-10-24.v6"])("recognizes historical %s without rewriting the run or charging AI",async revision=>{
     const {row,next}=await rotateAfterCut();
     const pins=JSON.parse(environment.SAV_INTAKE_RUNTIME_CONFIG!);pins.codeRevision=options.policy.codeRevision;
-    const oldHash=intakeRuntimeConfigurationHash(pins,environment,"sav-intake-semantic-2026-10-23.v5");
+    const oldHash=intakeRuntimeConfigurationHash(pins,environment,revision);
     const [run]=await f.db.select().from(savIntakeRuns).where(eq(savIntakeRuns.id,runId));
     const [execution]=await f.db.select().from(savIntakeExecutions).where(eq(savIntakeExecutions.id,row.id));
     await f.db.update(savIntakeRuns).set({configHash:oldHash}).where(eq(savIntakeRuns.id,runId));

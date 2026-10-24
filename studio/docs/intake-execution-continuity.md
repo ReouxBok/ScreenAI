@@ -48,7 +48,7 @@ rewritten. An encrypted audit witness binds the old observation, plan, input,
 effect intents and existing confirmed receipts to the target policy and runtime.
 The old configuration hash is recomputed from the reviewed runtime descriptor;
 an unrecognised hash is refused. This release recognises the current prompt
-revision and the explicitly reviewed previous v5 revision, not arbitrary builds.
+revision and the explicitly reviewed previous v5 and v6 revisions, not arbitrary builds.
 
 Any new source message, human refusal/pause, changed identity, edited intent or
 receipt, changed resource/access/budget binding, revoked policy or disabled

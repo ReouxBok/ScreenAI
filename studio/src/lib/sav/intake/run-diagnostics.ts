@@ -19,9 +19,9 @@ const count = (v: unknown) => typeof v === "number" && Number.isSafeInteger(v) &
 const methods = new Set(["analyseMessage", "assessIdentity", "assessIssues"]);
 const operations = new Set(["email_lookup", "contact", "direct_associations", "contact_tickets", "ticket_history"]);
 
-const contextSections = ["message", "conversation", "provenance", "requests", "requestContext", "tickets", "candidates", "address", "evidence", "catalogue", "imageInputs"];
+const contextSections = ["message", "conversation", "provenance", "requests", "requestContext", "tickets", "candidates", "address", "evidence", "catalogue", "contextView", "contextBlocks", "imageInputs"];
 const contextSources = ["current", "initial-request", "ticket", "history", "identity-ticket", "identity-history", "contact", "message", "image", "other"];
-const historyCounts = ["tickets", "events", "notes", "emails", "htmlEmails", "duplicateEvents", "duplicateBytes", "nestedEvents", "nestedBytes", "quotedBytes", "maxTicketHistoryBytes"];
+const historyCounts = ["tickets", "events", "notes", "emails", "htmlEmails", "duplicateEvents", "duplicateBytes", "nestedEvents", "nestedBytes", "nestedComparisons", "nestedComparisonsSkipped", "nestedScanComplete", "quotedBytes", "maxTicketHistoryBytes"];
 /** Allow-listed keys with numeric values only; anything else is dropped. */
 function contextBreakdown(raw: unknown) {
   const b = object(raw), sections = object(b.sections), catalogue = object(b.catalogue), bySource = object(catalogue.bySource), history = object(b.history);
@@ -48,7 +48,7 @@ export function intakeDiagnosticPayload(ciphertext: string) {
         status: ["complete", "partial", "failed"].includes(String(t.status)) ? String(t.status) : null,
         accepted: typeof t.accepted === "boolean" ? t.accepted : null,
         errorCode: code(t.errorCode), reason: code(t.reason), validationReason: code(validation.reason),
-        contextLimit: ["catalogue", "data"].includes(String(limit.stage)) ? { stage: String(limit.stage), bytes: count(limit.bytes), limitBytes: count(limit.limitBytes), breakdown: contextBreakdown(limit.breakdown) } : null };
+        contextLimit: ["catalogue", "data", "wire"].includes(String(limit.stage)) ? { stage: String(limit.stage), bytes: count(limit.bytes), limitBytes: count(limit.limitBytes), breakdown: contextBreakdown(limit.breakdown) } : null };
     });
     return { readable: true, reason: code(payload.reason),
       codeRevision: typeof configuration.codeRevision === "string" && /^[a-f0-9]{40}$/.test(configuration.codeRevision) ? configuration.codeRevision : null,

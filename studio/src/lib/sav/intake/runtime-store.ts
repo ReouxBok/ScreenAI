@@ -269,6 +269,26 @@ export async function pendingSavIntakeRuns(config: IntakeRuntimeConfig, now = ne
     or(inArray(savIntakeRuns.state, ["pending", "waiting"]), and(eq(savIntakeRuns.state, "analysing"), lt(savIntakeRuns.leaseUntil, now)))))
     .orderBy(savIntakeRuns.createdAt).limit(4);
 }
+/** Read-only preflight for a complete comparison batch. This is not a reservation:
+ * each dispatch still acquires its normal lock and enforces the same limits. */
+export async function assertSavIntakeCallPlan(messageId: string, config: IntakeRuntimeConfig, hashes: readonly string[]) {
+  if (!hashes.length || hashes.length > 3 || new Set(hashes).size !== hashes.length || hashes.some(h => !/^[a-f0-9]{64}$/.test(h))) throw Error("SAV_INTAKE_RUNTIME_DISPATCH_REJECTED");
+  await requireDb().transaction(async tx => {
+    await tx.execute(sql`select pg_advisory_xact_lock(hashtext('sav-intake-runtime-model-budget-v1'))`);
+    const rows = await tx.select(budgetColumns).from(savIntakeModelCalls), messageKey = intakeRuntimeHash(messageId);
+    budgetRowsValid(rows);
+    if (rows.some(row => row.state !== "settled" && (config.budgetProfile !== SAV_INTAKE_OPERATIONAL_PROFILE || row.messageKey === messageKey))) throw Error("SAV_INTAKE_RUNTIME_USAGE_UNCERTAIN");
+    const own = rows.filter(row => row.messageKey === messageKey), prior = own.filter(row => hashes.includes(row.requestHash));
+    if (prior.length) {
+      const cached = await tx.select({ id: savIntakeModelCalls.id, result: savIntakeModelCalls.resultCiphertext }).from(savIntakeModelCalls).where(inArray(savIntakeModelCalls.id, prior.map(r => r.id)));
+      if (cached.some(row => !row.result)) throw Error("SAV_INTAKE_RUNTIME_CALL_ALREADY_CONSUMED");
+    }
+    const needed = hashes.filter(h => !prior.some(row => row.requestHash === h)).length, now = new Date();
+    const usage = intakeBudgetUsage(rows, config, now), quote = savDerivedCostQuote(config.model, 8192, now);
+    if (own.length + needed > 3 || needed > usage.remainingCalls || needed * quote.reservedNanoUsd > usage.remainingNanoUsd
+      || needed * quote.reservedNanoUsd > usage.remainingRollingNanoUsd) throw Error("SAV_INTAKE_RUNTIME_BUDGET_EXHAUSTED");
+  });
+}
 async function reserveIntakeCall(tx: Tx, run: Run, config: IntakeRuntimeConfig, requestHash: string, now: Date) {
     await tx.execute(sql`select pg_advisory_xact_lock(hashtext('sav-intake-runtime-model-budget-v1'))`);
     const rows = await tx.select(budgetColumns).from(savIntakeModelCalls), messageKey = intakeRuntimeHash(run.messageId);

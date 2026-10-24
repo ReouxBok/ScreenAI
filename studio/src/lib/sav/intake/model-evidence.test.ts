@@ -172,7 +172,9 @@ describe("complete long histories within the bounded intake envelope", () => {
   function atSize(target: number) {
     let size = 90_000;
     for (let i = 0; i < 10; i++) {
-      const text = prefix + "x ".repeat(Math.floor((size - 2) / 2)) + (size % 2 ? "xxx" : "xx");
+      let seed = 4723;
+      const unique = Array.from({length:size},(_,n)=> {seed=(Math.imul(seed,1664525)+1013904223)>>>0;return n%12===11?" ":String.fromCharCode(97+seed%26);}).join("");
+      const text = prefix + unique + "FIN";
       const delta = target - bytesFor(text);
       if (!delta) return text;
       size += delta;

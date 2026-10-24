@@ -13,6 +13,7 @@ import { SAV_INTAKE_MODEL_LIMITS } from "./model-limits";
  * and authenticated human continuations. No CRM/Gmail write capability. */
 export function createIntakeModelDispatcher(options: { config: IntakeRuntimeConfig; live: () => Promise<void>;
   reserve: (hash: string) => ReturnType<typeof reserveSavIntakeCall>; signal: AbortSignal;
+  preflight?: (hashes: string[]) => Promise<void>;
   env?: () => Record<string,string|undefined>; network?: typeof fetch }) {
   const {config,live}=options, env=options.env??(()=>process.env), network=options.network??fetch;
   let uncertain=false, failureReason:string|undefined;
@@ -73,5 +74,22 @@ export function createIntakeModelDispatcher(options: { config: IntakeRuntimeConf
       throw error;
     }); pending.push(work); return work; };
 
-  return { call, pending, get uncertain() { return uncertain; }, get failureReason() { return failureReason; } };
+  const plan = async (inputs: Parameters<IntakeGeminiCall>[0][]) => {
+    try {
+      await live();
+      if (!options.preflight || options.signal.aborted || uncertain || !inputs.length || inputs.length > 3) throw Error("SAV_INTAKE_RUNTIME_BATCH_PLANNING_REQUIRED");
+      const hashes = inputs.map(input => {
+        const wire = savGeminiWireBody(input);
+        if (input.model !== config.model || input.phase !== "ticket_matching" || input.media || input.allowRetry !== false || input.signal.aborted
+          || wire.textBytes > SAV_INTAKE_MODEL_LIMITS.wireTextBytes || input.body.generationConfig.maxOutputTokens !== 8192) throw Error("SAV_INTAKE_RUNTIME_REQUEST_REJECTED");
+        return intakeRuntimeHash(wire.body);
+      });
+      await options.preflight(hashes);
+      await live();
+    } catch (error) {
+      failureReason = error instanceof Error && /^SAV_[A-Z0-9_]+$/.test(error.message) ? error.message : "SAV_INTAKE_RUNTIME_BATCH_PLANNING_FAILED";
+      throw error;
+    }
+  };
+  return { call, plan, pending, get uncertain() { return uncertain; }, get failureReason() { return failureReason; } };
 }
