@@ -109,3 +109,10 @@ it("compacts repeated evidence when only the exact provider wire limit is exceed
   expect(savGeminiWireBody({model:"gemini-fixture",phase:"ticket_matching",body:originalBody}).textBytes).toBeGreaterThan(SAV_INTAKE_MODEL_LIMITS.wireTextBytes);
   expect(planned).toHaveLength(0);
 });
+it("keeps an insufficient first compaction idempotent and reports the wire bound",async()=>{
+  const currentText=Array.from({length:440},(_,i)=>'"'.repeat(100)+i.toString(36).padStart(3,"0")+" ").join("")+"COMMON VERIFIED EVENT ".repeat(40);
+  const msg={...message,currentText},prior={...message,id:"10000000-0000-4000-8000-000000000002",direction:"outbound" as const,currentText:"COMMON VERIFIED EVENT ".repeat(40)};
+  const traces:{contextLimit?:{stage:string;bytes:number;limitBytes?:number}}[]=[],call=vi.fn<IntakeGeminiCall>(answer);
+  await expect(createSavIntakeSemanticReaders({model:"gemini-fixture",call,onTrace:t=>traces.push(t)}).analyseMessage({message:msg,conversation:[prior]},new AbortController().signal)).rejects.toThrow("CONTEXT_LIMIT");
+  expect(call).not.toHaveBeenCalled();expect(traces.at(-1)?.contextLimit).toMatchObject({stage:"wire",limitBytes:SAV_INTAKE_MODEL_LIMITS.wireTextBytes});
+});

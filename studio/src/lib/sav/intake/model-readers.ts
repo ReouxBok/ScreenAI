@@ -108,6 +108,7 @@ export function createSavIntakeSemanticReaders(options: {
     return { ...catalogue, quoteIds: (sourceId?: string) => prepare(() => catalogue.quoteIds(sourceId)) };
   }
   function contextView(phase: "understanding" | "ticket_matching", instruction: string, data: Record<string, unknown>, schema: z.ZodType, repair = false) {
+    if (data.contextView === INTAKE_CONTEXT_VIEW_INSTRUCTION && Array.isArray(data.contextBlocks)) return data;
     const sourceBytes = Buffer.byteLength(JSON.stringify(data), "utf8");
     const sourceWireBytes = savGeminiWireBody({ model: options.model, phase, body: requestBody(instruction, data, schema, repair) }).textBytes;
     if ((sourceBytes <= SAV_INTAKE_MODEL_LIMITS.dataBytes && sourceWireBytes <= SAV_INTAKE_MODEL_LIMITS.wireTextBytes) || !Array.isArray(data.citationCatalogue)) return data;
