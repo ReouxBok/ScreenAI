@@ -91,8 +91,9 @@ export function assertOriginalExecutionCrm(plan: IntakePlan, s: CrmSnapshot) {
 }
 /** Only previously attributed, confirmed effects are removed for comparison.
  * All other contact/ticket/history changes require reinvestigation. */
-export function assertExecutionCrmUnchanged(baseline: CrmSnapshot, current: CrmSnapshot, effects: Effect[]) {
+export function assertExecutionCrmUnchanged(baseline: CrmSnapshot, current: CrmSnapshot, effects: Effect[], continuation: { finalizing?: boolean; nextKind?: EffectIntent["kind"] } = {}) {
     const clean = JSON.parse(JSON.stringify(current)) as CrmSnapshot;
+    const concurrent: { ticketId: string; eventId: string; contentHash: string }[] = [];
     const ack = (e: Effect) => e.ackCiphertext ? decryptSavPayload<EffectAck>(e.ackCiphertext) : null;
     const intent = (e: Effect) => decryptSavPayload<EffectIntent>(e.intentCiphertext);
     // Remove an owned history delta only when its current bytes still match the
@@ -111,7 +112,10 @@ export function assertExecutionCrmUnchanged(baseline: CrmSnapshot, current: CrmS
             const observed = history?.find(e => e.id === proof.observedHistory!.id);
             if (savIntakeCanonicalEvidence(observed) !== savIntakeCanonicalEvidence(proof.observedHistory))
                 return fault();
-            clean.histories[i.ticketId!] = history.filter(e => e.id !== proof.observedHistory!.id);
+            // Associating an already associated object is a no-op. Never remove
+            // an event which was part of the original investigation.
+            if (!baseline.histories[i.ticketId!]?.some(e => e.id === proof.observedHistory!.id))
+                clean.histories[i.ticketId!] = history.filter(e => e.id !== proof.observedHistory!.id);
         }
         if (effect.kind === "stage_new" && i.ticketId) {
             const old = Object.values(baseline.tickets).flat().find(t => t.id === i.ticketId);
@@ -127,7 +131,27 @@ export function assertExecutionCrmUnchanged(baseline: CrmSnapshot, current: CrmS
             }
         }
     }
-    for (const effect of effects.filter(e => e.state === "confirmed" && e.kind === "ticket_create")) {
+    const created = effects.filter(e => e.state === "confirmed" && e.kind === "ticket_create");
+    // A newly logged email cannot undo an already committed ticket creation.
+    // Its remaining association uses that exact ticket; set-New is allowed only
+    // while the creation receipt still proves it is already New. For an existing
+    // ticket, append-only email arrivals are accepted only at finalization, when
+    // no mutation remains. Notes/edits/removals, membership, owner, stage, identity
+    // and the latest Gmail inbound still use their unchanged authoritative guards.
+    const createdIds = new Set(created.map(e => ack(e)?.id).filter((id): id is string => Boolean(id)));
+    const finalIds = new Set(effects.filter(e => e.state === "confirmed" && ["email_associate", "stage_new"].includes(e.kind)).map(e => intent(e).ticketId));
+    for (const ticketId of Object.keys(clean.histories)) {
+        const mayFinish = continuation.finalizing && finalIds.has(ticketId);
+        const mayContinueCreated = createdIds.has(ticketId) && ["email_associate", "stage_new"].includes(continuation.nextKind ?? "");
+        if (!mayFinish && !mayContinueCreated && !(continuation.finalizing && createdIds.has(ticketId))) continue;
+        const known = new Set((baseline.histories[ticketId] ?? []).map(e => e.id));
+        // Owned associated events have already been checked and removed above.
+        const additions = clean.histories[ticketId].filter(e => !known.has(e.id));
+        if (additions.some(e => e.kind !== "email")) return fault();
+        for (const e of additions) concurrent.push({ ticketId, eventId: e.id, contentHash: savIntakeEvidenceContentHash(e) });
+        clean.histories[ticketId] = clean.histories[ticketId].filter(e => known.has(e.id));
+    }
+    for (const effect of created) {
         const a = ack(effect), proof = effect.verificationCiphertext ? decryptSavPayload<{
             observedTicket?: unknown;
         }>(effect.verificationCiphertext) : {};
@@ -142,4 +166,5 @@ export function assertExecutionCrmUnchanged(baseline: CrmSnapshot, current: CrmS
     }
     if (savIntakeCanonicalEvidence(clean) !== savIntakeCanonicalEvidence(JSON.parse(JSON.stringify(baseline))))
         return fault();
+    return concurrent;
 }

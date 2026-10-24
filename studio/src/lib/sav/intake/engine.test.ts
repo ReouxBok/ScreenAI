@@ -393,3 +393,13 @@ it.each(["no-episode","unconfirmed","different-sender","no-declaration","wrong-s
  if(kind!=="no-declaration")f.analysis.registration={address:"linked@example.test",sourceMessageId:mid,quote:"Use linked@example.test"};
  reason(await f.run(),"history_incomplete");expect(f.calls.some(c=>c.startsWith("lookup:"))).toBe(false);
 });
+
+it("routes an accepted Other without an approved rule to an explicit rule decision, never a technical retry", async () => {
+  const f = fixture(["other"]);
+  delete f.policy.qualifiedOther;
+  const plan = await f.run();
+  expect(plan.decision.classification).toBe("other");
+  expect(plan.decision.disposition).toMatchObject({ kind: "collect_context", reasons: ["private_resource_unavailable"] });
+  expect(plan.progress).toMatchObject({ kind: "human_choice", classification: "unknown", questionCode: "request_scope_uncertain", view: "to_validate" });
+  expect(plan.steps).toHaveLength(0);
+});

@@ -16,7 +16,7 @@ import { assertOriginalExecutionCrm, assertExecutionCrmUnchanged } from "./execu
 import { admitIntakeExecution, claimExecution, claimEffectRecovery, withEffectRecoveryLease, releaseEffectRecovery, activeExecutionEffects, adoptCurrentExecutionVersion, assertExecutionLocal, saveExecutionPayload, expandExecutionScope, getExecutionEffects, ensureExecutionEffect, markEffectDispatched, recordEffectAck, confirmExecutionEffect, deferExecutionEffect, endExecutionPass, identityEpisodeEffect, finishExecution, executionJournal, releaseRecoveredExecutionScope, occupationSchemaInstalled, type ExecutionLease, type ExecutionTx } from "./execution-store";
 import type { Effect, EffectIntent, EffectAck, ExecutorAdapters, ExecutionOptions, ExecutionPayload, EffectKind } from "./execution-types";
 const fault = (code: string): never => { throw Error(`SAV_INTAKE_EXECUTION_${code}`); };
-const code = (e: unknown) => e instanceof Error && /^SAV_[A-Z_]+$/.test(e.message) ? e.message : "SAV_INTAKE_EXECUTION_INTERRUPTED";
+const code = (e: unknown) => e instanceof Error && /^SAV_[A-Z0-9_]+$/.test(e.message) ? e.message : "SAV_INTAKE_EXECUTION_INTERRUPTED";
 const ack = (e: Effect) => e.ackCiphertext ? decryptSavPayload<EffectAck>(e.ackCiphertext) : null;
 const effectIntent = (e: Effect) => decryptSavPayload<EffectIntent>(e.intentCiphertext);
 export function requiredExecutionKinds(payload: ExecutionPayload): EffectKind[] {
@@ -193,8 +193,15 @@ async function preflight(lease: ExecutionLease, options: ExecutionOptions, inten
         lease.payload.baseline = snapshot;
         await saveExecutionPayload(lease);
     }
-    else
-        assertExecutionCrmUnchanged(lease.payload.baseline, snapshot, await getExecutionEffects(lease.row.id));
+    else {
+        const concurrent = assertExecutionCrmUnchanged(lease.payload.baseline, snapshot, await getExecutionEffects(lease.row.id), { finalizing: !intent, nextKind: intent?.kind });
+        const receipt = intakeRuntimeHash(concurrent);
+        if (concurrent.length && lease.payload.concurrentHistoryHash !== receipt) {
+            lease.payload.concurrentHistoryHash = receipt;
+            await requireDb().transaction(tx => executionJournal(tx, lease.row.id, "concurrent_history_observed", { phase: intent ? "continue_committed_creation" : "finalization_only", events: concurrent }));
+            await saveExecutionPayload(lease);
+        }
+    }
     const s = await source(lease);
     if (typeof options.adapters.gmailCurrent !== "function")
         return fault("GMAIL_CONTROL_REQUIRED");

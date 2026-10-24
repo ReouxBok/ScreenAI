@@ -1,4 +1,5 @@
 vi.mock("@/lib/sav/intake/executor",()=>({reconcileIntakeExecutor:d.intakeExec}));
+vi.mock("@/lib/sav/intake/gmail-read",()=>({reconcileHandledIntakeGmailRead:vi.fn(async()=>({skipped:"off"}))}));
 vi.mock("@/lib/sav/intake/runtime",()=>({reconcileSavIntakeRuntime:d.intakeRuntime}));
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 const monitor=vi.hoisted(()=>({pulse:vi.fn()}));

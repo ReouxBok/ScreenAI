@@ -14,7 +14,7 @@ const publicCodes = new Set<string>([...Object.keys(intakeContextReasonLabels), 
   "request_limit", "operation_forbidden", "partial_response", "total_mismatch", "pagination_cycle", "page_limit", "archived_contact",
   "aliases_unavailable", "batch_limit", "partial_batch", "conflicting_contact", "contact_limit", "cancelled", "read_unavailable",
   "ticket_limit", "ticket_membership_conflict", "ticket_content_unavailable", "history_limit", "history_date_unknown"]);
-const code = (v: unknown) => typeof v === "string" && (/^(?:SAV_[A-Z_]{1,90}|HUBSPOT_HTTP_\d{3})$/.test(v) || publicCodes.has(v)) ? v : null;
+const code = (v: unknown) => typeof v === "string" && (/^(?:SAV_[A-Z0-9_]{1,90}|HUBSPOT_HTTP_\d{3})$/.test(v) || publicCodes.has(v)) ? v : null;
 const count = (v: unknown) => typeof v === "number" && Number.isSafeInteger(v) && v >= 0 ? v : null;
 const methods = new Set(["analyseMessage", "assessIdentity", "assessIssues"]);
 const operations = new Set(["email_lookup", "contact", "direct_associations", "contact_tickets", "ticket_history"]);
