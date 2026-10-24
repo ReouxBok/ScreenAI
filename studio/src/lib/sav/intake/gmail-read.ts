@@ -59,10 +59,11 @@ export async function syncHandledIntakeGmailRead(messageId: string, deps: { env?
     const actions = await db.select().from(savActions).where(eq(savActions.threadId, message.threadId));
     if (hasUnsettledSavHumanAction(actions)) return null;
     const current = await readSavIntakeCurrent(message.threadId);
-    if (!current || current.messageId !== message.id || !current.sourceMatches) return null;
+    if (!current || current.messageId !== message.id) return null;
     const progress = await readIntakeExecutionProgress(message.id);
-    if (progress?.confirmed && progress.runId === current.id && progress.completionSourceHash
-      && progress.completionSourceHash === current.currentSourceHash) return { executionId: progress.executionId };
+    if (progress?.confirmed) return progress.runId === current.id && progress.completionSourceHash
+      && progress.completionSourceHash === current.currentSourceHash ? { executionId: progress.executionId } : null;
+    if (!current.sourceMatches) return null;
     const [projection] = await db.select().from(savIntakeConsole).where(eq(savIntakeConsole.threadId, message.threadId));
     if (projection?.messageId === message.id && projection.epoch === projection.projectedEpoch
       && ["qualified_other", "human_choice"].includes(projection.status) && ["other", "to_validate"].includes(projection.view ?? "")) {

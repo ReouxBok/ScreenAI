@@ -948,8 +948,21 @@ it("a merely analysed dossier is never marked read",async()=>{
 });
 it("a formerly confirmed execution with changed local context stays unread",async()=>{
   await observed();const execution=(await admitIntakeExecution(runId,options))!;expect((await executeIntakePass(execution.id,options))).toMatchObject({state:"confirmed"});
-  await db.db.update(savThreads).set({customerEmail:"new-context@example.invalid"}).where(eq(savThreads.id,threadId));
+  await db.db.update(savMessages).set({bodyCiphertext:encryptSavPayload({text:"Updated customer evidence changes the understood request.",attachments:[],headers:{}})}).where(eq(savMessages.id,messageId));
   const gmail=vi.fn();expect(await syncHandledIntakeGmailRead(messageId,{env:()=>({...environment,SAV_INTAKE_GMAIL_MARK_READ:"on"}),gmail})).toEqual({skipped:"not_handled"});expect(gmail).not.toHaveBeenCalled();
+});
+it("a fully confirmed current execution is marked read using its completion source, including its own new ticket",async()=>{
+  await observed();const execution=(await admitIntakeExecution(runId,options))!;expect(await executeIntakePass(execution.id,options)).toMatchObject({state:"confirmed"});
+  await db.db.update(savMailboxes).set({email:"contact@limova.ai"}).where(eq(savMailboxes.id,mailboxId));
+  await db.db.update(savMessages).set({gmailMessageId:"1a123"}).where(eq(savMessages.id,messageId));
+  await db.db.update(savThreads).set({gmailThreadId:"1a000"}).where(eq(savThreads.id,threadId));
+  let unread=true;const gmail:GmailRequest=async<T>(_mailbox:string,path:string,init?:RequestInit)=>{
+    if(path==="profile")return {emailAddress:"contact@limova.ai"} as T;
+    if(init?.method==="POST"){unread=false;return {} as T;}
+    return {id:"1a123",threadId:"1a000",labelIds:["INBOX",...unread?["UNREAD"]:[]]} as T;
+  };
+  expect(await syncHandledIntakeGmailRead(messageId,{env:()=>({...environment,SAV_INTAKE_GMAIL_MARK_READ:"on"}),gmail})).toEqual({confirmed:true});
+  expect(unread).toBe(false);
 });
 it("revoked administrative markers cannot starve the next valid Gmail receipt",async()=>{
   vi.stubEnv("SAV_RELEASE_STAGE","v0");vi.stubEnv("SAV_PILOT_MODE","false");
