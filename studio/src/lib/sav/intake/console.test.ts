@@ -289,6 +289,18 @@ it("more than 250 dossiers share list/count/search predicate, stable equal-date 
   expect((await listIntakeConsole({view:"processing",mailboxId:randomUUID()})).total).toBe(0);
   expect((await listIntakeConsole({view:"processing",search:"absent",page:999}))).toMatchObject({total:0,rows:[],page:1,pages:1});
 });
+it("lists dossiers chronologically by latest email, newest first, regardless of projection refreshes", async () => {
+  const threads=await db.db.insert(savThreads).values(["old","middle","new"].map(name=>({mailboxId,gmailThreadId:`chrono-${name}`,customerEmail:`${name}@example.invalid`}))).returning();
+  const day=(d:number)=>new Date(`2026-10-${d}T09:00:00Z`);
+  await db.db.insert(savMessages).values(threads.map((t,i)=>({threadId:t.id,mailboxId,direction:"inbound" as const,fromEmail:`chrono-${i}@example.invalid`,toEmails:["support@example.invalid"],subject:`Chrono ${i}`,bodyCiphertext:encryptSavPayload({text:"Synthetic"}),receivedAt:day(20+i),analysisStatus:"intake_waiting"})));
+  // The oldest dossier was refreshed last: it must still stay at the bottom.
+  for(const [i,t] of threads.entries()) await db.db.update(savIntakeConsole).set({updatedAt:day(23-i)}).where(eq(savIntakeConsole.threadId,t.id));
+  // A newer reply on the old thread moves it to the top, by its latest email.
+  const list=await listIntakeConsole({view:"processing",search:"Chrono"});
+  expect(list.rows.map(row=>row.subject)).toEqual(["Chrono 2","Chrono 1","Chrono 0"]);
+  await db.db.insert(savMessages).values({threadId:threads[0].id,mailboxId,direction:"inbound",fromEmail:"chrono-0@example.invalid",toEmails:["support@example.invalid"],subject:"Chrono 0 reply",bodyCiphertext:encryptSavPayload({text:"Synthetic"}),receivedAt:day(25),analysisStatus:"intake_waiting"});
+  expect((await listIntakeConsole({view:"processing",search:"Chrono"})).rows.map(row=>row.subject)).toEqual(["Chrono 0 reply","Chrono 2","Chrono 1"]);
+});
 it("OFF consultation makes no provider calls; projection absent never queries 0040/41 tables", async () => {
   await observed(); await projectIntakeThread(threadId); p.calls.length=0;
   vi.stubEnv("SAV_INTAKE_RUNTIME_MODE","off");vi.stubEnv("SAV_INTAKE_EXECUTION_MODE","off");
