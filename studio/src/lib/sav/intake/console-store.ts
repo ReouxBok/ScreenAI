@@ -99,12 +99,16 @@ export async function listIntakeConsole(options: { mailboxId?: string; view?: Sa
   // Both statements share one immutable PostgreSQL snapshot and exactly the
   // same mailbox/search cohort. No arbitrary 250-row application filtering.
   return requireDb().transaction(async tx => {
-    const completedIds = await listSavExternalCompletionMessageIds(tx, true, options.mailboxId);
+    const completedIds = await listSavExternalCompletionMessageIds(tx, true, options.mailboxId, "completed");
+    const otherIds = await listSavExternalCompletionMessageIds(tx, true, options.mailboxId, "other");
+    const reviewIds = await listSavExternalCompletionMessageIds(tx, true, options.mailboxId, "to_validate");
     const markedIds = await listSavExternalCompletionMessageIds(tx, false, options.mailboxId);
     const completed = completedIds.length ? sql`${savMessages.id} in (${sql.join(completedIds.map(id => sql`${id}::uuid`), sql`, `)})` : sql`false`;
     const marked = markedIds.length ? sql`${savMessages.id} in (${sql.join(markedIds.map(id => sql`${id}::uuid`), sql`, `)})` : sql`false`;
+    const other = otherIds.length ? sql`${savMessages.id} in (${sql.join(otherIds.map(id => sql`${id}::uuid`), sql`, `)})` : sql`false`;
+    const review = reviewIds.length ? sql`${savMessages.id} in (${sql.join(reviewIds.map(id => sql`${id}::uuid`), sql`, `)})` : sql`false`;
     const held = sql`exists(select 1 from sav.threads ht where ht.id=${savIntakeConsole.threadId} and ht.ai_paused and ${intakeHumanHoldSql(sql`ht.id`)})`;
-    const effectiveView = sql<string | null>`case when ${completed} then 'completed' when ${marked} then null when ${held} then 'to_validate' when ${historicalMessageSql()} then 'completed' when ${savIntakeConsole.status}='external_completion_pending' then null when ${savIntakeConsole.epoch}=${savIntakeConsole.projectedEpoch} then ${savIntakeConsole.view} else null end`;
+    const effectiveView = sql<string | null>`case when ${completed} then 'completed' when ${other} then 'other' when ${review} then 'to_validate' when ${marked} then null when ${held} then 'to_validate' when ${historicalMessageSql()} then 'completed' when ${savIntakeConsole.status}='external_completion_pending' then null when ${savIntakeConsole.epoch}=${savIntakeConsole.projectedEpoch} then ${savIntakeConsole.view} else null end`;
     const selected = options.view && options.view !== "processing" ? eq(effectiveView, savIntakeViewSchema.parse(options.view)) : sql`${effectiveView} is null`;
     // Group the derived column, not a repeated parameterised expression: SQL
     // placeholders in SELECT/GROUP BY otherwise have distinct identities.
@@ -116,8 +120,8 @@ export async function listIntakeConsole(options: { mailboxId?: string; view?: Sa
     const rows = await tx.select({ threadId: savIntakeConsole.threadId, mailboxId: savIntakeConsole.mailboxId,
       messageId: savMessages.id, version: savIntakeConsole.version, subject: savMessages.subject,
       fromEmail: savMessages.fromEmail, receivedAt: savMessages.receivedAt, updatedAt: savIntakeConsole.updatedAt,
-      view: effectiveView, status: sql<string>`case when ${completed} then 'handled_externally' when ${marked} then 'external_completion_pending' when ${held} then 'human_hold' when ${savIntakeConsole.status}='external_completion_pending' then 'processing' when ${historicalMessageSql()} then 'historical_outside_automation' when ${savIntakeConsole.epoch}<>${savIntakeConsole.projectedEpoch} then 'processing' else ${savIntakeConsole.status} end`,
-      reason: sql<string | null>`case when ${completed} then 'Traité hors Studio — clôture administrative de ce message. Aucun verdict IA, fermeture HubSpot ou apprentissage terminé ne sont déclarés.' when ${marked} then 'Traitement externe enregistré ; commande humaine ou résultat externe à rapprocher.' when ${held} then 'L’équipe garde la main sur ce dossier. L’automatisation reste en pause ; une décision humaine est attendue.' when ${savIntakeConsole.status}='external_completion_pending' then null when ${historicalMessageSql()} then 'Historique — hors automatisation. Aucun ticket HubSpot fermé par ce classement.' when ${savIntakeConsole.epoch}=${savIntakeConsole.projectedEpoch} then ${savIntakeConsole.reason} else null end`,
+      view: effectiveView, status: sql<string>`case when ${completed} then 'handled_externally' when ${other} then 'human_other' when ${review} then 'human_review' when ${marked} then 'external_completion_pending' when ${held} then 'human_hold' when ${savIntakeConsole.status}='external_completion_pending' then 'processing' when ${historicalMessageSql()} then 'historical_outside_automation' when ${savIntakeConsole.epoch}<>${savIntakeConsole.projectedEpoch} then 'processing' else ${savIntakeConsole.status} end`,
+      reason: sql<string | null>`case when ${completed} then 'Traité hors Studio — clôture administrative de ce message. Aucun verdict IA, fermeture HubSpot ou apprentissage terminé ne sont déclarés.' when ${other} then 'Autres — classement humain de ce message.' when ${review} then 'Décision confiée à l’équipe pour ce message.' when ${marked} then 'Traitement externe enregistré ; commande humaine ou résultat externe à rapprocher.' when ${held} then 'L’équipe garde la main sur ce dossier. L’automatisation reste en pause ; une décision humaine est attendue.' when ${savIntakeConsole.status}='external_completion_pending' then null when ${historicalMessageSql()} then 'Historique — hors automatisation. Aucun ticket HubSpot fermé par ce classement.' when ${savIntakeConsole.epoch}=${savIntakeConsole.projectedEpoch} then ${savIntakeConsole.reason} else null end`,
     }).from(savIntakeConsole).leftJoin(savMessages, latestMessageJoin).where(and(common, selected))
       .orderBy(desc(savIntakeConsole.updatedAt), desc(savIntakeConsole.threadId)).limit(25).offset((currentPage - 1) * 25);
     return { installed: true, counts: countMap, rows, page: currentPage, pages, total };

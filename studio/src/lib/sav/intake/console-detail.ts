@@ -1,5 +1,5 @@
 import { intakeThreadHumanHeld } from "./legacy-pause";
-import { getSavExternalCompletion, readSavExternalCompletion } from "../external-completion";
+import { getSavExternalCompletion, readSavExternalCompletion, savExternalDisposition } from "../external-completion";
 import "server-only";
 import { intakeAttachmentBody } from "./attachment-display";
 import { and, desc, eq } from "drizzle-orm";
@@ -34,7 +34,7 @@ export async function readIntakeConsoleDetail(threadId: string) {
       body:intakeAttachmentBody(decryptSavPayload<{text:string;attachments?:unknown[];attachmentInventory?:unknown;attachmentRead?:unknown}>(row.bodyCiphertext),derived),translation:translations[row.id]};
   });
   if (historical) Object.assign(projection, { view: "completed", status: "historical_outside_automation", reason: "Historique — hors automatisation. Aucun ticket HubSpot fermé et aucun apprentissage déclaré terminé.", projectedEpoch: projection.epoch });
-  if (completed) Object.assign(projection, { view: "completed", status: "handled_externally", reason: "Traité hors Studio — clôture administrative de ce message. Aucun verdict IA, fermeture HubSpot ou apprentissage terminé ne sont déclarés.", projectedEpoch: projection.epoch });
+  if (completed) Object.assign(projection, { ...savExternalDisposition(completed), projectedEpoch: projection.epoch });
   else if (marker) Object.assign(projection, { view: null, status: "external_completion_pending", reason: "Traitement externe enregistré ; commande humaine ou résultat externe à rapprocher.", projectedEpoch: projection.epoch });
   else if (humanHeld) Object.assign(projection, { view: "to_validate", status: "human_hold", reason: "L’équipe garde la main sur ce dossier. L’automatisation reste en pause ; une décision humaine est attendue.", projectedEpoch: projection.epoch });
   else if (projection.status === "external_completion_pending") Object.assign(projection, { view: null, status: "processing", reason: "Disposition administrative révoquée ou nouveau message en attente d’analyse." });

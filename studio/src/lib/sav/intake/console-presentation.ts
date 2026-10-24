@@ -1,5 +1,6 @@
 const statuses: Record<string, string> = {
   human_hold: "À valider par l’équipe",
+  human_other: "Autres · classement humain", human_review: "Décision confiée à l’équipe",
   handled_externally: "Traité hors Studio", external_completion_pending: "Traitement externe à vérifier",
   historical_outside_automation: "Historique — hors automatisation",
   processing: "Traitement en cours", pending: "Analyse en attente", analysing: "Analyse en cours", observed: "Analyse prête, actions en attente",

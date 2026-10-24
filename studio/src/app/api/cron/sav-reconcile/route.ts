@@ -1,4 +1,5 @@
 import { refreshIntakeConsole } from "@/lib/sav/intake/console-store";
+import { reconcileHandledIntakeGmailRead } from "@/lib/sav/intake/gmail-read";
 import { ensureIntakeObservations } from "@/lib/sav/intake/observation-binding";
 import { reconcileIntakeHumanChoices } from "@/lib/sav/intake/human-worker";
 import { reconcileIntakeExecutor } from "@/lib/sav/intake/executor";
@@ -67,6 +68,7 @@ export async function GET(request: Request) {
   const intakeExecution = await runStep<Awaited<ReturnType<typeof reconcileIntakeExecutor>> | { skipped: string }>("intake_execution",()=>Date.now()+60_000>derivedDeadline?Promise.resolve({skipped:"deadline"}):reconcileIntakeExecutor({deadlineMs:derivedDeadline}));
   const intakeTracking = await runStep("intake_tracking", () => ensureIntakeObservations(4));
   const intakeConsole = await runStep("intake_console", () => refreshIntakeConsole(20));
+  const intakeRead = await runStep("intake_gmail_read", () => Date.now()+1000>=derivedDeadline ? Promise.resolve({skipped:"deadline"}) : reconcileHandledIntakeGmailRead(3,Math.min(derivedDeadline,Date.now()+30000)));
   // Four model runs leave enough headroom for the 45 s grounded-agent budget,
   // a guarded legacy fallback and the remaining integrations inside the 300 s
   // function deadline. A 10-mail batch advances over at most three passages.
@@ -88,7 +90,7 @@ export async function GET(request: Request) {
   const dashboardProjection = savSqlDashboardEnabled()
     ? await runStep("dashboard_projection", () => refreshSavDashboardProjection(25, undefined, { deadlineMs: derivedDeadline }))
     : { status: "skipped" as const, durationMs: 0, data: { reason: "disabled" } };
-  const payload = { intakeWakes, intakeTracking, intakeChoices, intakeConsole, intakeExecution, intakeObservation, gmail, hubspot, emailOpenings, contextRefreshes, trainings, evaluations, ticketActions, pilotItems, pendingMessages, pilotActions, followups, replies, statusActions, learningBackfill, observations, translations, retention, dashboardProjection };
+  const payload = { intakeRead, intakeWakes, intakeTracking, intakeChoices, intakeConsole, intakeExecution, intakeObservation, gmail, hubspot, emailOpenings, contextRefreshes, trainings, evaluations, ticketActions, pilotItems, pendingMessages, pilotActions, followups, replies, statusActions, learningBackfill, observations, translations, retention, dashboardProjection };
   const hasStepFailure = Object.values(payload).some((step) => step.status === "error");
   await recordSavWorkerPulse(pulseId, pulseStartedAt, hasStepFailure);
   return Response.json(payload, { status: hasStepFailure ? 500 : 200 });

@@ -122,6 +122,10 @@ export async function finishSavIntakeWake(runId: string) {
   const [run] = await requireDb().select().from(savIntakeRuns).where(eq(savIntakeRuns.id, runId));
   if (!run) return { projected: false, timings: null };
   const projected = await projectIntakeThread(run.threadId).catch(() => false);
+  // Read receipt failure never replays a confirmed CRM action.
+  await (await import("./gmail-read")).syncHandledIntakeGmailRead(run.messageId).catch(() => {
+    console.error("sav_intake_gmail_read", { runId, errorCode: "SAV_INTAKE_GMAIL_READ_RETRY_REQUIRED" });
+  });
   const [message] = await requireDb().select({ receivedAt: savMessages.receivedAt, createdAt: savMessages.createdAt }).from(savMessages).where(eq(savMessages.id, run.messageId));
   const progress = await readIntakeExecutionProgress(run.messageId);
   const confirmedAt = progress?.confirmed ? Math.max(...(await getExecutionEffects(progress.executionId)).map(e => e.confirmedAt?.getTime() ?? 0)) : null;
