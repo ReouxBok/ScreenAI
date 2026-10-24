@@ -8,7 +8,7 @@ import type { Locator, Page, Request, Route } from "@playwright/test";
 // With Next.js 16.4 and `withWorkflow`, the development server ends the action
 // stream but Chromium never reports the response as finished. The action is
 // therefore fetched in full by Playwright, then handed to the page at once.
-export async function submitServerAction(page: Page, button: Locator, matchBody?: RegExp) {
+export async function submitServerAction(page: Page, button: Locator, matchBody?: RegExp, beforeFulfill?: () => Promise<void>) {
   const origin = new URL(page.url()).origin;
   // Bound forms expose their server action ID in the SSR transport field.
   // The dossier-open side effect also posts next-action; it must not satisfy this wait.
@@ -25,7 +25,7 @@ export async function submitServerAction(page: Page, button: Locator, matchBody?
     && Boolean(request.headers()["next-action"])
     && (!actionId || request.headers()["next-action"] === actionId)
     && (!matchBody || matchBody.test(request.postData() ?? ""));
-  const action = await fetchServerActionInFull(page, matches);
+  const action = await fetchServerActionInFull(page, matches, beforeFulfill);
   try {
     await Promise.all([action.settled(), button.click()]);
   } finally {
@@ -35,7 +35,7 @@ export async function submitServerAction(page: Page, button: Locator, matchBody?
 
 // Fetches the next matching server action in full before the page receives it,
 // so `settled()` resolves once the action has really returned.
-export async function fetchServerActionInFull(page: Page, matches: (request: Request) => boolean) {
+export async function fetchServerActionInFull(page: Page, matches: (request: Request) => boolean, beforeFulfill?: () => Promise<void>) {
   let settle!: () => void;
   let fail!: (error: unknown) => void;
   const settled = new Promise<void>((resolve, reject) => { settle = resolve; fail = reject; });
@@ -44,11 +44,13 @@ export async function fetchServerActionInFull(page: Page, matches: (request: Req
     if (handled || !matches(route.request())) return route.fallback();
     handled = true;
     try {
-      const response = await route.fetch({ maxRedirects: 0, timeout: 90_000 });
+      const response = await route.fetch({ maxRedirects: 0, maxRetries: 0, timeout: 90_000 });
       // Pass the bytes explicitly. The RSC content type has no charset and the
       // response shortcut can recode UTF-8 as latin1, corrupting length-prefixed
       // Flight chunks (the import succeeds but React never receives its result).
-      await route.fulfill({ response, body: await response.body() });
+      const body = await response.body();
+      await beforeFulfill?.();
+      await route.fulfill({ response, body });
       settle();
     } catch (error) {
       fail(error);
