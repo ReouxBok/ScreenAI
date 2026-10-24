@@ -6,13 +6,17 @@ import type { IntakeGeminiCall } from "./model-readers";
 import { savGeminiWireBody } from "../gemini-transport";
 import { SAV_INTAKE_MODEL_LIMITS } from "./model-limits";
 const s = vi.hoisted(() => ({ claim: vi.fn(), reserve: vi.fn(), settle: vi.fn(), save: vi.fn(), read: vi.fn(), engine: vi.fn(), realEngine: null as unknown,
-  rawInput: null as Parameters<IntakeGeminiCall>[0] | null, saved: [] as { state: string; value: unknown }[] }));
-vi.mock("./server-ledger", () => ({ claimServerEvaluation: s.claim, reserveServerEvaluationCall: s.reserve, settleServerEvaluationCall: s.settle, saveServerEvaluationResult: s.save, readServerEvaluation: s.read }));
+  plan: null as ((requests: Parameters<IntakeGeminiCall>[0][]) => Promise<void>) | null, assertPlan: vi.fn(), rawInput: null as Parameters<IntakeGeminiCall>[0] | null,
+  saved: [] as { state: string; value: unknown }[] }));
+vi.mock("./server-ledger", () => ({ claimServerEvaluation: s.claim, assertServerEvaluationCallPlan: s.assertPlan, reserveServerEvaluationCall: s.reserve,
+  settleServerEvaluationCall: s.settle, saveServerEvaluationResult: s.save, readServerEvaluation: s.read }));
 vi.mock("./engine", async original => { const m = await original<typeof import("./engine")>(); s.realEngine = m.planSavIntake; return { ...m, planSavIntake: s.engine }; });
 vi.mock("./model-readers", async original => {
   const m = await original<typeof import("./model-readers")>();
-  return { ...m, createSavIntakeSemanticReaders: (options: Parameters<typeof m.createSavIntakeSemanticReaders>[0]) => s.rawInput
-    ? { analyseMessage: () => options.call(s.rawInput!) } : m.createSavIntakeSemanticReaders(options) };
+  return { ...m, createSavIntakeSemanticReaders: (options: Parameters<typeof m.createSavIntakeSemanticReaders>[0]) => {
+    s.plan = options.planCalls ?? null;
+    return s.rawInput ? { analyseMessage: () => options.call(s.rawInput!) } : m.createSavIntakeSemanticReaders(options);
+  } };
 });
 import { runServerEvaluation, snapshotEvaluationReaders, evaluationProviderResponse } from "./server-runner";
 const analysis = (id: string) => ({ messageId: id, requests: [{ id: "request", kind: "support", currentMessageId: id, quote: "My product displays an error." }] });
@@ -20,6 +24,7 @@ const provider = (value: unknown) => Response.json({ candidates: [{ finishReason
 let network: ReturnType<typeof vi.fn<typeof fetch>>;
 beforeEach(() => {
   s.rawInput = null;
+  s.plan = null; s.assertPlan.mockReset().mockResolvedValue(undefined);
   s.claim.mockReset().mockResolvedValue({ id: "synthetic-run", claimed: true }); s.reserve.mockReset().mockResolvedValue("synthetic-reservation"); s.settle.mockReset().mockResolvedValue(true);
   s.saved = []; s.save.mockReset().mockImplementation(async (_id, value, state) => { s.saved.push({ state, value: structuredClone(value) }); });
   s.read.mockReset().mockImplementation(async () => s.saved.at(-1) ?? { state: "running" });
@@ -58,6 +63,20 @@ it("runs exactly three synthetic cases through the actual engine/model readers, 
   expect(network).toHaveBeenCalledTimes(3); expect(s.reserve).toHaveBeenCalledTimes(3); expect(s.saved.at(-1)?.state).toBe("complete");
   for (const [url, init] of network.mock.calls) { expect(String(url)).toBe("https://generativelanguage.googleapis.com/v1beta/models/gemini-3.6-flash:generateContent"); expect(init?.redirect).toBe("error"); }
   expect(JSON.stringify(s.saved)).not.toContain("synthetic-only-not-a-key");
+});
+it("wires grouped matching through a read-only durable budget preflight before model dispatch", async () => {
+  const batch = evaluationBatch(), env = evaluationEnvironment(batch), signal = new AbortController().signal;
+  s.rawInput = { model: "gemini-3.6-flash", phase: "ticket_matching", promptRevision: "fixture", signal, allowRetry: false,
+    body: { systemInstruction: { parts: [{ text: "Lire tout." }] }, contents: [{ role: "user", parts: [{ text: "synthetic matching request" }] }], generationConfig: { maxOutputTokens: 8192 } } };
+  s.engine.mockImplementation(async () => {
+    expect(s.plan).toBeTypeOf("function");
+    await s.plan!([s.rawInput!, { ...s.rawInput!, body: structuredClone(s.rawInput!.body) }]);
+    return { effects: "not_connected", steps: [] };
+  });
+  await runServerEvaluation(batch, evaluationConfig(env), "ugo@limova.ai", signal, { env: () => env, network });
+  expect(s.assertPlan).toHaveBeenCalledTimes(3);
+  expect(s.assertPlan.mock.calls.map(call => call[2])).toEqual([2, 2, 2]);
+  expect(s.reserve).not.toHaveBeenCalled(); expect(network).not.toHaveBeenCalled();
 });
 it("returns the prior claim without any further provider dispatch", async () => {
   s.claim.mockResolvedValue({ id: "existing", claimed: false });

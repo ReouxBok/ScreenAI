@@ -3,6 +3,7 @@ import { decryptSavPayload } from "../crypto";
 import { releaseLegacyAiPauses } from "./legacy-pause";
 import { intakeOtherQualificationFresh } from "./other-routing";
 import { qualifyRuntimeOther } from "./other-routing-runtime";
+import { assertSavIntakeCallPlan } from "./runtime-store";
 import { createIntakeModelDispatcher } from "./model-dispatch";
 import { prepareIntakeAttachments, intakeInputWithAttachments, finishIntakeAttachmentRead } from "./attachments";
 import { intakeMessageHistorical, intakeLaunchMatches, parkLaunchedIntakeMessage } from "./launch-boundary";
@@ -65,7 +66,7 @@ async function analyseSavIntakeRuntimeWithinBudget(runId: string, config: Intake
     }
     if(qualifiedOther) payload.other=qualifiedOther;
     await checkpointSavIntakeRun(lease, payload);
-    dispatcher = createIntakeModelDispatcher({ config, live, reserve: hash => reserveSavIntakeCall(lease, config, hash), signal: controller.signal, env, network });
+    dispatcher = createIntakeModelDispatcher({ config, live, reserve: hash => reserveSavIntakeCall(lease, config, hash), preflight: hashes => assertSavIntakeCallPlan(lease.run.messageId, config, hashes), signal: controller.signal, env, network });
     const { call, pending } = dispatcher;
     const attachments = await prepareIntakeAttachments(lease, config.model, live, deps.downloadAttachments);
     if (attachments) {
@@ -76,7 +77,7 @@ async function analyseSavIntakeRuntimeWithinBudget(runId: string, config: Intake
       }
       await checkpointSavIntakeRun(lease, payload);
     }
-    const semanticReader = createSavIntakeSemanticReaders({ repairMalformedOutput, ...(attachments?.complete ? { attachments: { prepared: attachments.prepared, onRead: observations => {
+    const semanticReader = createSavIntakeSemanticReaders({ planCalls: dispatcher.plan, repairMalformedOutput, ...(attachments?.complete ? { attachments: { prepared: attachments.prepared, onRead: observations => {
       attachments.state.read = { ...attachments.state.read, observations, state: "complete", completedAt: new Date().toISOString() };
       payload.attachments = attachments.state;
       checkpoint();

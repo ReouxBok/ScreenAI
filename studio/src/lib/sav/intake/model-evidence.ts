@@ -20,7 +20,8 @@ export function rejectIntakeEvidence(reason: IntakeEvidenceFailure["reason"], pa
     ...(excerpt === undefined ? {} : { excerptHash: createHash("sha256").update(excerpt).digest("hex"), excerptLength: excerpt.length }) });
 }
 
-type Anchor = { id: string; sourceId: string; text: string };
+export type IntakeEvidenceAnchor = { id: string; sourceId: string; text: string };
+type Anchor = IntakeEvidenceAnchor;
 const record = (value: unknown): value is Record<string, unknown> => !!value && typeof value === "object" && !Array.isArray(value);
 
 /** Split into contiguous verbatim spans, never a summary or fuzzy match. Full

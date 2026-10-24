@@ -15,6 +15,7 @@ export type CrmSnapshot = {
 };
 export type ExecutionPayload = {
     runtimeConfigHash: string;
+    authorityContinuityId?: string;
     plan: IntakePlan;
     input: unknown;
     local: {

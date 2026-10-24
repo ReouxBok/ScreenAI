@@ -172,7 +172,9 @@ describe("complete long histories within the bounded intake envelope", () => {
   function atSize(target: number) {
     let size = 90_000;
     for (let i = 0; i < 10; i++) {
-      const text = prefix + "x ".repeat(Math.floor((size - 2) / 2)) + (size % 2 ? "xxx" : "xx");
+      let seed = 4723;
+      const unique = Array.from({length:size},(_,n)=> {seed=(Math.imul(seed,1664525)+1013904223)>>>0;return n%12===11?" ":String.fromCharCode(97+seed%26);}).join("");
+      const text = prefix + unique + "FIN";
       const delta = target - bytesFor(text);
       if (!delta) return text;
       size += delta;
@@ -190,7 +192,8 @@ describe("complete long histories within the bounded intake envelope", () => {
     } else {
       await expect(model.assessIssues(withHistory(text), signal())).rejects.toThrow("CONTEXT_LIMIT");
       expect(call).not.toHaveBeenCalled();
-      expect(traces[0].contextLimit).toEqual({ stage: "data", bytes: SAV_INTAKE_MODEL_LIMITS.dataBytes + 1, limitBytes: SAV_INTAKE_MODEL_LIMITS.dataBytes });
+      expect(traces[0].contextLimit).toMatchObject({ stage: "data", bytes: SAV_INTAKE_MODEL_LIMITS.dataBytes + 1, limitBytes: SAV_INTAKE_MODEL_LIMITS.dataBytes,
+        breakdown: { catalogue: { bySource: { history: expect.any(Number) } }, history: { events: 1 } } });
       expect(JSON.stringify(traces)).not.toContain("citation");
     }
   });

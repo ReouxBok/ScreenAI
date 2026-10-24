@@ -62,9 +62,11 @@ it("projects only bounded diagnostic facts from historical traces",()=>{
     configuration:{codeRevision:"a".repeat(40)},attachments:{textComplete:true,inventory:{complete:false},read:{observations:[{filename:"PRIVATE FILENAME",text:"PRIVATE OCR",status:"not_read",reason:"image_limit"}]}},
     traces:[{operation:"email_lookup",status:"failed",reason:"HUBSPOT_HTTP_403",raw:"PRIVATE RESPONSE"},
       {phase:"ticket_matching",accepted:false,errorCode:"SAV_INTAKE_MODEL_CONTEXT_LIMIT",contextLimit:{stage:"data",bytes:50000,limitBytes:40000},validationFailure:{reason:"wrong_anchor_source",path:"PRIVATE PATH"}},
+      {phase:"ticket_matching",accepted:false,errorCode:"SAV_INTAKE_MODEL_CONTEXT_LIMIT",contextLimit:{stage:"wire",bytes:140000,limitBytes:131072,breakdown:{sections:{contextBlocks:1000},history:{nestedComparisons:250,nestedComparisonsSkipped:40,nestedScanComplete:0}}}},
       {method:"assessIssues",errorCode:"SAV_INTAKE_SEMANTIC_COVERAGE_REJECTED",input:"PRIVATE SOURCE"}]}));
   expect(result).toMatchObject({readable:true,reason:null,input:{contentComplete:false,currentTextLength:12},attachments:{textComplete:true,inventoryComplete:false,observations:[{reason:"image_limit"}]} });
   expect(result.traces[1]).toMatchObject({contextLimit:{stage:"data",bytes:50000,limitBytes:40000},validationReason:"wrong_anchor_source"});
+  expect(result.traces[2].contextLimit).toMatchObject({stage:"wire",bytes:140000,breakdown:{sections:{contextBlocks:1000},history:{nestedComparisons:250,nestedComparisonsSkipped:40,nestedScanComplete:0}}});
   expect(JSON.stringify(result)).not.toContain("PRIVATE");
   expect(intakeDiagnosticPayload("corrupt").readable).toBe(false);
   expect(intakeDiagnosticPayload("x".repeat(262145)).readable).toBe(false);
