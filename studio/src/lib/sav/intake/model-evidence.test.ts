@@ -190,7 +190,8 @@ describe("complete long histories within the bounded intake envelope", () => {
     } else {
       await expect(model.assessIssues(withHistory(text), signal())).rejects.toThrow("CONTEXT_LIMIT");
       expect(call).not.toHaveBeenCalled();
-      expect(traces[0].contextLimit).toEqual({ stage: "data", bytes: SAV_INTAKE_MODEL_LIMITS.dataBytes + 1, limitBytes: SAV_INTAKE_MODEL_LIMITS.dataBytes });
+      expect(traces[0].contextLimit).toMatchObject({ stage: "data", bytes: SAV_INTAKE_MODEL_LIMITS.dataBytes + 1, limitBytes: SAV_INTAKE_MODEL_LIMITS.dataBytes,
+        breakdown: { catalogue: { bySource: { history: expect.any(Number) } }, history: { events: 1 } } });
       expect(JSON.stringify(traces)).not.toContain("citation");
     }
   });

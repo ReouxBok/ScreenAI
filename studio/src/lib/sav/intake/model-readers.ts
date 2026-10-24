@@ -12,6 +12,7 @@ import {
 } from "./engine-types";
 import type { prepareSavIntakeMessage } from "./message";
 import { SAV_INTAKE_MODEL_LIMITS } from "./model-limits";
+import { intakeContextBreakdown, type IntakeContextBreakdown } from "./model-context";
 
 export const SAV_INTAKE_MODEL_REVISION = "sav-intake-semantic-2026-10-24.v6";
 const quote = z.string().trim().min(1).max(2000);
@@ -27,7 +28,7 @@ export type IntakeGeminiCall = (input: {
 }) => Promise<{ json: unknown; metadata: SavGeminiMetadata }>;
 export type IntakeModelTrace = { phase: string; model: string; promptRevision: string; inputHash: string; outputHash?: string;
   durationMs: number; accepted: boolean; errorCode: string | null; metadata?: SavGeminiMetadata; validationFailure?: IntakeEvidenceFailure;
-  contextLimit?: { stage: "catalogue" | "data"; bytes: number; limitBytes?: number } };
+  contextLimit?: { stage: "catalogue" | "data"; bytes: number; limitBytes?: number; breakdown?: IntakeContextBreakdown } };
 export type SavIntakeSemanticReaders = Pick<IntakeAdapters, "analyseMessage" | "assessIssues" | "assessIdentity">;
 const hash = (data: unknown) => createHash("sha256").update(JSON.stringify(data)).digest("hex");
 
@@ -87,21 +88,22 @@ export function createSavIntakeSemanticReaders(options: {
   let visualObservations: SavAttachmentObservation[] = [];
   // Catalogue creation and source-specific enums happen before generate().
   // Keep their failures visible without persisting any source text in a trace.
-  function catalogueFor(phase: "understanding" | "ticket_matching", sources: ReadonlyMap<string, string>) {
+  function catalogueFor(phase: "understanding" | "ticket_matching", sources: ReadonlyMap<string, string>, histories?: IntakeHistory[]) {
     const started = Date.now();
     const prepare = <T>(work: () => T): T => {
       try { return work(); }
       catch (error) {
         options.onTrace?.({ phase, model: options.model, promptRevision: SAV_INTAKE_MODEL_REVISION,
           inputHash: hash([...sources]), durationMs: Date.now() - started, accepted: false,
-          errorCode: "SAV_INTAKE_MODEL_CONTEXT_LIMIT", contextLimit: { stage: "catalogue", bytes: Buffer.byteLength(JSON.stringify([...sources]), "utf8") } });
+          errorCode: "SAV_INTAKE_MODEL_CONTEXT_LIMIT", contextLimit: { stage: "catalogue", bytes: Buffer.byteLength(JSON.stringify([...sources]), "utf8"),
+            breakdown: intakeContextBreakdown({ citationCatalogue: [...sources].map(([sourceId, text]) => ({ sourceId, text })) }, histories) } });
         throw error;
       }
     };
     const catalogue = prepare(() => intakeEvidenceCatalogue(sources));
     return { ...catalogue, quoteIds: (sourceId?: string) => prepare(() => catalogue.quoteIds(sourceId)) };
   }
-  async function generate<T>(phase: "understanding" | "ticket_matching", instruction: string, data: unknown, schema: z.ZodType<T>, signal: AbortSignal, validate: (value: T) => void, wire?: { schema: z.ZodType; decode: (raw: unknown) => unknown }, media?: readonly SavAdmittedImage[], repair = false): Promise<T> {
+  async function generate<T>(phase: "understanding" | "ticket_matching", instruction: string, data: Record<string, unknown>, schema: z.ZodType<T>, signal: AbortSignal, validate: (value: T) => void, wire?: { schema: z.ZodType; decode: (raw: unknown) => unknown }, media?: readonly SavAdmittedImage[], repair = false, histories?: IntakeHistory[]): Promise<T> {
     repair ||= phase === "understanding" && options.repairMalformedOutput === true;
     const text = JSON.stringify(data), inputHash = hash(data), started = Date.now();
     let metadata: SavGeminiMetadata | undefined, outputHash: string | undefined, validationFailure: IntakeEvidenceFailure | undefined;
@@ -114,7 +116,7 @@ export function createSavIntakeSemanticReaders(options: {
       if (calls >= 3) throw Error("SAV_INTAKE_MODEL_CONTEXT_LIMIT");
       const bytes = Buffer.byteLength(text, "utf8");
       if (bytes > SAV_INTAKE_MODEL_LIMITS.dataBytes) {
-        contextLimit = { stage: "data", bytes, limitBytes: SAV_INTAKE_MODEL_LIMITS.dataBytes };
+        contextLimit = { stage: "data", bytes, limitBytes: SAV_INTAKE_MODEL_LIMITS.dataBytes, breakdown: intakeContextBreakdown(data, histories) };
         throw Error("SAV_INTAKE_MODEL_CONTEXT_LIMIT");
       }
       calls++;
@@ -150,7 +152,7 @@ export function createSavIntakeSemanticReaders(options: {
       // malformed visual response resumes in a fresh, fenced second attempt;
       // it must never bypass that budget by making another image call here.
       if (!media && !repair && malformed && !signal.aborted && calls < 3)
-        return generate(phase, instruction, data, schema, signal, validate, wire, media, true);
+        return generate(phase, instruction, data, schema, signal, validate, wire, media, true, histories);
       throw Error(code);
     }
   }
@@ -208,7 +210,8 @@ export function createSavIntakeSemanticReaders(options: {
       for (const observation of visualObservations) if (observation.fileHash && ["analyzed", "partial"].includes(observation.status))
         sources.set(observation.sourceId, `[Derived image observation; not customer words or identity proof] ${observation.text}\n${observation.regions.map(r => r.text).join("\n")}\nUncertainties: ${observation.uncertainties.join("; ")}`);
       for (const row of input.tickets) { sources.set(`ticket-${row.ticket.id}`, `${row.ticket.subject}\n${row.ticket.content}`); sources.set(`history-${row.ticket.id}`, historyText(row.history)); }
-      const catalogue = catalogueFor("ticket_matching", sources);
+      const histories = input.tickets.map(t => t.history);
+      const catalogue = catalogueFor("ticket_matching", sources, histories);
       const wireSchema = issueSchema.extend({ tickets: z.array(issueSchema.shape.tickets.element.extend({
         ticketId: referenceIds(input.tickets.map(t => t.ticket.id)), requestIds: z.array(referenceIds(input.requests.map(r => r.id))).max(15),
         evidenceIds: z.array(referenceIds(input.evidence.map(e => e.id))).min(1).max(100),
@@ -224,7 +227,7 @@ export function createSavIntakeSemanticReaders(options: {
           checkGrounding(verdict.grounding, sources, verdict.relation === "same" || verdict.relation === "different"
             ? ["current", ...(input.requestContext ? ["initial-request"] : []), `ticket-${verdict.ticketId}`, ...(row.history.length ? [`history-${verdict.ticketId}`] : [])] : ["current"]);
         }
-      }, { schema: wireSchema, decode: catalogue.decodeIssues });
+      }, { schema: wireSchema, decode: catalogue.decodeIssues }, undefined, false, histories);
       return issueAssessmentSchema.parse({ ...result, tickets: result.tickets.map(({ grounding: cited, rationale, ...ticket }) => { void cited; void rationale; return ticket; }) });
     },
     assessIdentity: async (input, signal) => {
@@ -234,7 +237,8 @@ export function createSavIntakeSemanticReaders(options: {
         sources.set(`contact-${row.contact.id}`, JSON.stringify(row.contact));
         for (const item of row.tickets) { sources.set(`identity-ticket-${item.ticket.id}`, `${item.ticket.subject}\n${item.ticket.content}`); sources.set(`identity-history-${item.ticket.id}`, historyText(item.history)); }
       }
-      const catalogue = catalogueFor("ticket_matching", sources);
+      const histories = input.candidates.flatMap(c => c.tickets.map(t => t.history));
+      const catalogue = catalogueFor("ticket_matching", sources, histories);
       const wireSchema = identitySchema.extend({ contactIds: z.array(referenceIds(input.candidates.map(c => c.contact.id))).max(10),
         evidenceIds: z.array(referenceIds(input.evidence.map(e => e.id))).min(1).max(95),
         grounding: z.array(z.object({ quoteId: catalogue.quoteIds() }).strict()).min(1).max(51) });
@@ -246,7 +250,7 @@ export function createSavIntakeSemanticReaders(options: {
         const required = value.investigationComplete && value.kind !== "unknown" ? [...sources.keys()].filter(id => sources.get(id)!.trim()) : ["current"];
         checkGrounding(value.grounding, sources, required);
         if (value.contactIds.some(id => !input.candidates.some(c => c.contact.id === id))) throw Error("SAV_INTAKE_MODEL_COVERAGE_REJECTED");
-      }, { schema: wireSchema, decode: catalogue.decodeIdentity });
+      }, { schema: wireSchema, decode: catalogue.decodeIdentity }, undefined, false, histories);
       const { grounding: cited, rationale, ...assessment } = result; void cited; void rationale;
       return identityAssessmentSchema.parse(assessment);
     },
