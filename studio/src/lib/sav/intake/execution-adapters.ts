@@ -145,7 +145,13 @@ export function createIntakeExecutorAdapters(options: {
     }
     const adapters: ExecutorAdapters = {
         readCrm: (plan, input, config, signal) => collectExecutionCrm(plan, input, config, createSavIntakeHubspotReaders({
-            network: authNetwork
+            network: authNetwork,
+            onRead: trace => {
+                if (trace.status !== "complete") {
+                    const reason = trace.reason && /^[a-z0-9_]+$/i.test(trace.reason) ? trace.reason.toUpperCase() : "UNAVAILABLE";
+                    throw Error(`SAV_INTAKE_EXECUTION_CRM_READ_${reason}`);
+                }
+            },
         }), signal), scope: executionScopeKeys,
         gmailPermissions: options.gmailPermissions ?? (async (mailbox) => {
             const p = await readSavGmailPermissions();

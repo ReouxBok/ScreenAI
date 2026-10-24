@@ -45,7 +45,10 @@ export async function fetchServerActionInFull(page: Page, matches: (request: Req
     handled = true;
     try {
       const response = await route.fetch({ maxRedirects: 0, timeout: 90_000 });
-      await route.fulfill({ response });
+      // Pass the bytes explicitly. The RSC content type has no charset and the
+      // response shortcut can recode UTF-8 as latin1, corrupting length-prefixed
+      // Flight chunks (the import succeeds but React never receives its result).
+      await route.fulfill({ response, body: await response.body() });
       settle();
     } catch (error) {
       fail(error);

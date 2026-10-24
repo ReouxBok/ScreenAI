@@ -21,7 +21,10 @@ vi.mock("../partnership-transfer", () => ({ PartnershipTransfer: () => null }));
 vi.mock("@/lib/sav/cutover", () => ({ isSavMessageEligible: dependencies.eligible }));
 vi.mock("@/lib/sav/auth", () => ({ requireSavStaff: dependencies.auth }));
 vi.mock("@/lib/sav/service", () => ({ getSavThreadDetail: dependencies.detail }));
-vi.mock("@/lib/sav/external-completion", () => ({ getSavExternalCompletion: dependencies.externalCompletion }));
+vi.mock("@/lib/sav/external-completion", async importOriginal => ({
+  ...await importOriginal<typeof import("@/lib/sav/external-completion")>(),
+  getSavExternalCompletion: dependencies.externalCompletion,
+}));
 vi.mock("@/lib/sav/review", () => ({ getSavProposalReview: dependencies.review }));
 vi.mock("@/lib/sav/observations", () => ({getSavObservations:dependencies.observations}));
 vi.mock("@/lib/sav/drafts", () => ({ getSavReplyDrafts: dependencies.drafts }));
@@ -143,7 +146,10 @@ afterEach(() => vi.unstubAllEnvs());
 
 describe("SAV dossier SSR and human-review guardrails", () => {
   it("explains administrative completion without treating it as an AI approval", async () => {
-    dependencies.externalCompletion.mockResolvedValue({ createdAt: now });
+    dependencies.externalCompletion.mockResolvedValue({ createdAt: now, technicalMetadata: {
+      version: 1, threadId, batchId: "10000000-0000-4000-8000-000000000006",
+      receivedBefore: "2026-10-03T00:00:00Z", reason: "processed_outside_studio",
+    } });
     const html = await renderPage();
     expect(html).toContain("Traité hors Studio.");
     expect(html).toContain("Cela ne valide ni la proposition IA ni le brouillon et ne crée aucun apprentissage");
