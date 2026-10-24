@@ -49,8 +49,18 @@ export async function fetchServerActionInFull(page: Page, matches: (request: Req
       // response shortcut can recode UTF-8 as latin1, corrupting length-prefixed
       // Flight chunks (the import succeeds but React never receives its result).
       const body = await response.body();
+      // APIResponse.body() is already decompressed. Its wire headers must not
+      // describe gzip/chunked bytes that we no longer send. Explicit UTF-8 also
+      // prevents Chromium interception from recoding Flight's byte-length chunks.
+      const headers = { ...response.headers() };
+      delete headers["content-encoding"];
+      delete headers["content-length"];
+      delete headers["transfer-encoding"];
+      if (/^text\/x-component(?:;|$)/i.test(headers["content-type"] ?? "")) {
+        headers["content-type"] = "text/x-component; charset=utf-8";
+      }
       await beforeFulfill?.();
-      await route.fulfill({ response, body });
+      await route.fulfill({ response, headers, body });
       settle();
     } catch (error) {
       fail(error);
