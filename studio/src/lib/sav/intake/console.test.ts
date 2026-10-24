@@ -1109,3 +1109,19 @@ it.each(["run_lease","execution_lease","pending_human","uncertain_effect","legac
   expect((await db.db.select().from(savThreads).where(eq(savThreads.id,threadId)))[0].aiPaused).toBe(true);
   expect(mutationsSent()).toHaveLength(0);
 });
+
+it.each(["sender", "recipients"])("refreshes other projections when one dossier has invalid address metadata (%s)", async variant => {
+  await observed();
+  await db.db.update(savMessages).set(variant === "sender" ? {fromEmail:"invalid-address"} : {toEmails:Array.from({length:31},(_,i)=>`recipient${i}@example.invalid`)}).where(eq(savMessages.id,messageId));
+  const [thread] = await db.db.insert(savThreads).values({mailboxId,gmailThreadId:randomUUID(),customerEmail:"other@example.invalid"}).returning();
+  const next = await message(thread.id);
+  await enqueueSavIntakeMessage(next.id,options.runtime);
+  const result=await refreshIntakeConsole(20);
+  expect(result.refreshed).toBeGreaterThanOrEqual(2);
+  const [blocked]=await db.db.select().from(savIntakeConsole).where(eq(savIntakeConsole.threadId,threadId));
+  expect(blocked).toMatchObject({status:"waiting",reason:"SAV_INTAKE_MESSAGE_METADATA_INVALID"});
+  expect(blocked.epoch).toBe(blocked.projectedEpoch);
+  const [following]=await db.db.select().from(savIntakeConsole).where(eq(savIntakeConsole.threadId,thread.id));
+  expect(following.epoch).toBe(following.projectedEpoch);
+  expect(mutationsSent()).toHaveLength(0);
+});

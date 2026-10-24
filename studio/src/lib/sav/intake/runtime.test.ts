@@ -632,3 +632,19 @@ it("common guard runtime still accepts a genuinely new message after the old exe
     expect((await claimSavIntakeRun(nextRun, config))?.run.messageId).toBe(next.id);
   } finally { await remove(); }
 });
+
+it.each(["sender", "recipients"])("isolates invalid address metadata (%s) before a provider claim without blocking the next dossier", async variant => {
+  await f.db.update(savMessages).set(variant === "sender" ? {fromEmail:"invalid-address"} : {toEmails:Array.from({length:31},(_,i)=>`recipient${i}@example.invalid`)}).where(eq(savMessages.id,messageId));
+  const invalid = (await enqueueSavIntakeMessage(messageId, config))!;
+  const [thread] = await f.db.insert(savThreads).values({mailboxId,gmailThreadId:randomUUID(),customerEmail:"second@example.invalid"}).returning();
+  const [next] = await f.db.insert(savMessages).values({mailboxId,threadId:thread.id,direction:"inbound",fromEmail:"second@example.invalid",toEmails:["support@example.invalid"],subject:"Second synthetic request",gmailMessageId:randomUUID(),receivedAt:now(),bodyCiphertext:encryptSavPayload({text:"Help with a synthetic setting",headers:{},attachments:[]})}).returning();
+  const valid = (await enqueueSavIntakeMessage(next.id, config))!;
+  expect(await claimSavIntakeRun(invalid,config)).toBeNull();
+  const [blocked] = await f.db.select().from(savIntakeRuns).where(eq(savIntakeRuns.id,invalid));
+  expect(blocked).toMatchObject({state:"waiting",attempts:0,leaseToken:null,leaseUntil:null});
+  expect(decryptSavPayload<IntakeRuntimePayload>(blocked.payloadCiphertext).reason).toBe("SAV_INTAKE_MESSAGE_METADATA_INVALID");
+  expect(await pendingSavIntakeRuns(config)).toEqual([{id:valid}]);
+  expect((await claimSavIntakeRun(valid,config))?.run.id).toBe(valid);
+  expect(await f.db.select().from(savIntakeModelCalls)).toHaveLength(0);
+  expect(await f.db.select().from(savIntakeEffects)).toHaveLength(0);
+});

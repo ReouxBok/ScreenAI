@@ -13,6 +13,7 @@ import { intakeConsoleInstalled } from "./console-capability";
 import { savIntakeSourceSnapshot, intakeSourceMatches } from "./runtime-store";
 import { intakeDossierSensitive } from "./observation-binding";
 import { readIntakeExecutionProgress } from "./executor";
+import { invalidIntakeAddressMetadata, SAV_INTAKE_INVALID_SOURCE } from "./source-validation";
 export type ConsoleProjection = { view: SavIntakeView | null; status: string; reason: string | null };
 /** Runs only in the worker. CAS against the monotone source epoch means a new
  * inbound arriving during computation can never be cleared by an old result. */
@@ -31,6 +32,7 @@ export async function projectIntakeThread(threadId: string, beforePublish?: () =
   else if (thread?.aiPaused) result = { view: null, status: "paused", reason: "Reprise suspendue par l’équipe" };
   else if (!run || run.messageId !== message?.id) result.reason = "Nouvelle entrée en attente d’analyse";
   else {
+    try {
     const payload = decryptSavPayload<IntakeRuntimePayload>(run.payloadCiphertext), plan = payload.plan;
     const [refused] = await db.select().from(savIntakeHumanEvents).where(and(eq(savIntakeHumanEvents.messageId, run.messageId), eq(savIntakeHumanEvents.kind, "refuse"))).limit(1);
     const [pending] = await db.select().from(savIntakeHumanEvents).where(and(eq(savIntakeHumanEvents.parentRunId, run.id), sql`${savIntakeHumanEvents.state} in ('pending','reading','waiting')`)).limit(1);
@@ -67,6 +69,10 @@ export async function projectIntakeThread(threadId: string, beforePublish?: () =
     else if (plan?.decision.disposition.kind === "no_ticket" && plan.decision.disposition.reason === "acknowledgement_only")
       result = {view:"completed",status:"acknowledgement_only",reason:"Accusé de réception sans nouvelle demande ; aucun ticket fermé par ce classement."};
     else result = { view: null, status: run.state, reason: payload.reason ?? null };
+    } catch (error) {
+      if (!invalidIntakeAddressMetadata(error)) throw error;
+      result = { view: null, status: "waiting", reason: SAV_INTAKE_INVALID_SOURCE };
+    }
   }
   await beforePublish?.();
   const published = await db.update(savIntakeConsole).set({ ...result, projectedEpoch: projection.epoch,
