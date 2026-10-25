@@ -378,3 +378,40 @@ it("a reviewed new configuration can requalify an already investigated old messa
  expect((await db.db.select().from(savIntakeModelCalls)).length).toBeGreaterThanOrEqual(before.length);expect((await db.db.select().from(savIntakeModelCalls)).length).toBeLessThanOrEqual(3);
  expect((await db.db.select().from(savIntakeRuns)).reduce((sum,r)=>sum+r.attempts,0)).toBe(1);
 });
+
+it("an exact current automatic binding can reanalyse omitted optional metadata through the immutable bridge",async()=>{
+ const payload=await observed();delete payload.configuration;
+ await db.db.update(savIntakeRuns).set({payloadCiphertext:encryptSavPayload(payload)}).where(eq(savIntakeRuns.id,runId));
+ const [prior]=await db.db.select().from(savIntakeRuns).where(eq(savIntakeRuns.id,runId));
+ const input=await command("reanalyse");expect((await readOperatorPanel(input)).allowReanalysis).toBe(true);
+ await recordOperatorCommand(input);const data=fakeModel();
+ const [event]=await db.db.select().from(savIntakeHumanEvents).where(eq(savIntakeHumanEvents.commandKey,input.requestKey));
+ expect(await consumeIntakeHumanEvent(event.id,options.runtime,createSavIntakeHubspotReaders({network:p.network}))).toHaveProperty("state","observed");
+ expect(data.length).toBeGreaterThan(0);
+ const current=(await readSavIntakeCurrent(threadId,options.runtime))!;
+ expect(current.payload.configuration?.configHash).toBe(options.runtime.configHash);
+ expect(await intakeRunConfigurationBound(current,options.runtime)).toBe(true);
+ expect((await db.db.select().from(savIntakeRuns).where(eq(savIntakeRuns.id,runId)))[0].payloadCiphertext).toBe(prior.payloadCiphertext);
+ expect((await db.db.select().from(savIntakeRuns)).reduce((sum,r)=>sum+r.attempts,0)).toBe(1);
+ expect(await db.db.select().from(savIntakeEffects)).toHaveLength(0);
+});
+
+it.each(["old","null","corrupt","derived"] as const)("missing metadata compatibility refuses %s provenance without recording or resetting",async kind=>{
+ await observed();
+ if(kind==="derived"){
+  const current=(await readSavIntakeCurrent(threadId,options.runtime))!;
+  const choice=await recordIntakeHumanCommand({commandKey:randomUUID(),threadId,messageId,runId:current.id,version:current.version,sourceHash:current.sourceHash!,candidatesHash:intakeRuntimeHash(current.candidateContactIds),kind:"classify",classification:"finance",reason:"Synthetic current immutable human decision."});
+  await consumeIntakeHumanEvent(choice.eventId,options.runtime,createSavIntakeHubspotReaders({network:p.network}));
+ }
+ const current=(await readSavIntakeCurrent(threadId,options.runtime))!;
+ if(kind==="derived")expect(current.humanChoiceCiphertext).not.toBeNull();
+ const payload:Record<string,unknown>={...current.payload};delete payload.configuration;
+ if(kind==="null")payload.configuration=null;
+ if(kind==="corrupt")payload.configuration={...current.payload.configuration!,resourcesHash:"f".repeat(64)};
+ await db.db.update(savIntakeRuns).set({payloadCiphertext:encryptSavPayload(payload)}).where(eq(savIntakeRuns.id,current.id));
+ if(kind==="old")await rotateRuntime();
+ const prior=await db.db.select().from(savIntakeRuns),calls=await db.db.select().from(savIntakeModelCalls);
+ await expect(recordOperatorCommand(await command("reanalyse"))).rejects.toThrow();
+ expect(await rows()).toHaveLength(0);expect(await db.db.select().from(savIntakeRuns)).toEqual(prior);
+ expect(await db.db.select().from(savIntakeModelCalls)).toEqual(calls);expect(fetch).not.toHaveBeenCalled();
+});

@@ -110,8 +110,11 @@ export async function intakeRunCandidateContactIds(run:typeof savIntakeRuns.$inf
 
 /** Historical configuration is evidence provenance only. It cannot claim a
  * worker, reuse accepted semantics or grant an old plan current authority. */
-function reanalysisEvidenceConfiguration(payload:import("./runtime-contract").IntakeRuntimePayload,config:IntakeRuntimeConfig){
+function reanalysisEvidenceConfiguration(payload:import("./runtime-contract").IntakeRuntimePayload,config:IntakeRuntimeConfig,run:Pick<typeof savIntakeRuns.$inferSelect,"configHash"|"policyHash"|"humanChoiceCiphertext">){
  const old=payload.configuration;
+ // The persisted contract permits omitted metadata. Only an exact current
+ // automatic binding can supply it; absence never proves an older revision.
+ if(old===undefined&&run.configHash===config.configHash&&run.policyHash===config.policyHash&&run.humanChoiceCiphertext===null)return config;
  if(!old||old.policyHash!==config.policyHash||old.resourcesHash!==config.resourcesHash||old.model!==config.model
    ||!/^[a-f0-9]{64}$/.test(old.configHash)||!/^[a-f0-9]{40}$/.test(old.codeRevision))return null;
  return {...config,configHash:old.configHash,codeRevision:old.codeRevision};
@@ -119,7 +122,7 @@ function reanalysisEvidenceConfiguration(payload:import("./runtime-contract").In
 export async function intakeRunReanalysisConfiguration(run:typeof savIntakeRuns.$inferSelect,config:IntakeRuntimeConfig,
  db:Pick<ReturnType<typeof requireDb>,"select">=requireDb()){
  if(run.policyHash!==config.policyHash)return null;
- const historical=reanalysisEvidenceConfiguration(decryptSavPayload(run.payloadCiphertext),config);
+ const historical=reanalysisEvidenceConfiguration(decryptSavPayload(run.payloadCiphertext),config,run);
  return historical&&await intakeRunConfigurationBound(run,historical,db)?historical:null;
 }
 
@@ -133,7 +136,7 @@ export async function intakeReanalysisParent(run:typeof savIntakeRuns.$inferSele
  if(!parent||parent.version>=run.version||parent.threadId!==run.threadId||parent.messageId!==run.messageId||parent.sourceHash!==bridge.sourceHash
    ||intakeRuntimeHash(decryptSavPayload(parent.payloadCiphertext))!==bridge.payloadHash||parent.policyHash!==config.policyHash)throw Error("SAV_INTAKE_HUMAN_REVALIDATION_REQUIRED");
  const original=decryptSavPayload<import("./runtime-contract").IntakeRuntimePayload>(parent.payloadCiphertext);
- const historical=reanalysisEvidenceConfiguration(original,config);
+ const historical=reanalysisEvidenceConfiguration(original,config,parent);
  if(!historical)throw Error("SAV_INTAKE_HUMAN_REVALIDATION_REQUIRED");
  if(parent.configHash===historical.configHash&&!parent.humanChoiceCiphertext){
   // The recording transaction validated this base before the new event existed.

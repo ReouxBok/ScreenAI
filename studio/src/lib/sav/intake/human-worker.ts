@@ -53,7 +53,9 @@ async function mergedHumanResolution(event:typeof savIntakeHumanEvents.$inferSel
       const payload=decryptSavPayload<IntakeRuntimePayload>(run.payloadCiphertext);
       const ancestor=await intakeReanalysisParent(run,payload,config);
       if(!ancestor)break;
-      expectedSourceHash=ancestor.sourceHash!;expectedBaseConfigHash=decryptSavPayload<IntakeRuntimePayload>(ancestor.payloadCiphertext).configuration!.configHash;run=ancestor;continue;
+      // The bridge validator permits absent metadata only for an exact current
+      // automatic ancestor; its row hash is then the validated configuration.
+      expectedSourceHash=ancestor.sourceHash!;expectedBaseConfigHash=decryptSavPayload<IntakeRuntimePayload>(ancestor.payloadCiphertext).configuration?.configHash??ancestor.configHash;run=ancestor;continue;
     }
     const choice=decryptSavPayload<{eventId:string}>(run.humanChoiceCiphertext);
     const [ancestor]=await requireDb().select().from(savIntakeHumanEvents).where(eq(savIntakeHumanEvents.id,choice.eventId));
