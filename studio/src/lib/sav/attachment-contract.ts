@@ -1,6 +1,8 @@
 import { z } from "zod";
 
 export const SAV_ATTACHMENT_READER_REVISION = "sav-attachments-2026-10-19.v1";
+/** Bounds of one model visual observation; the schema and the prompt share them. */
+export const SAV_VISUAL_OBSERVATION_LIMITS = Object.freeze({ images: 3, text: 4000, uncertainties: 8, uncertainty: 300, regions: 8, regionText: 1000, coordinate: 1000 });
 export const SAV_ATTACHMENT_LIMITS = Object.freeze({ images: 3, imageBytes: 4 * 1024 * 1024, totalBytes: 8 * 1024 * 1024, pixels: 16_000_000, references: 100, downloadMs: 12_000, readMs: 15_000 });
 const gmailId = z.string().regex(/^[A-Za-z0-9_-]{1,1024}$/);
 export const savAttachmentReferenceSchema = z.object({
