@@ -122,7 +122,7 @@ afterEach(() => { vi.unstubAllEnvs(); vi.unstubAllGlobals(); vi.restoreAllMocks(
 // ── Audit: native CRM email logging outside the PR168 tolerance windows ──
 function nativeEmail(ticketId: string, id: string) {
     // A native copy of the exact incoming message, not an arbitrary new email.
-    p.objects.emails[id] = { id, properties: { hs_timestamp: new Date().toISOString(), hs_email_direction: "INCOMING_EMAIL", hs_email_subject: "Synthetic connection failure", hs_email_text: "The synthetic connection fails.", hs_email_from_email: "customer@example.invalid", hs_email_to_email: "support@example.invalid" } };
+    p.objects.emails[id] = { id, properties: { hs_timestamp: new Date().toISOString(), hs_email_direction: "INCOMING_EMAIL", hs_email_subject: "Synthetic connection failure", hs_email_text: "The synthetic connection fails.", hs_email_from_email: "customer@example.invalid", hs_email_to_email: "support@example.invalid", hs_email_headers: JSON.stringify({messageId:"<incoming@example.invalid>"}) } };
     const key = `tickets:${ticketId}:emails`;
     p.links.set(key, [...(p.links.get(key) ?? []), id]);
 }

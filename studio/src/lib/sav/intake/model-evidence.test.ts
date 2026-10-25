@@ -225,3 +225,12 @@ describe("commercial/support prompt contract and inert routing with a synthetic 
     expect(instruction).toContain("language of the current authored message");
   });
 });
+it("reports a known rejected field without retaining its private value", async () => {
+  const traces: IntakeModelTrace[] = [];
+  const call = vi.fn<IntakeGeminiCall>(async arg => result({ ...request(arg), ticketSummary: { title: "x".repeat(121), description: "PRIVATE_REJECTED_VALUE", requestIds: ["r0"] } }));
+  await expect(createSavIntakeSemanticReaders({ model: "gemini-fixture", call, onTrace: t => traces.push(t) })
+    .analyseMessage({ message, conversation: [] }, signal())).rejects.toThrow("OUTPUT_REJECTED");
+  expect(traces[0].validationFailure).toMatchObject({ reason: "output_schema_invalid", path: "ticketSummary.title" });
+  expect(JSON.stringify(traces)).not.toContain("PRIVATE_REJECTED_VALUE");
+  expect(call).toHaveBeenCalledTimes(2);
+});

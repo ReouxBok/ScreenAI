@@ -5,6 +5,7 @@ import { SAV_INTAKE_MODEL_REVISION } from "./model-readers";
 import { SAV_INTAKE_READERS_REVISION } from "./hubspot-readers";
 import { SAV_MESSAGE_CONTEXT_REVISION } from "../message-context";
 import type { EnginePolicy, IntakePlan } from "./engine-types";
+import { intakeReadRecoveryPolicySchema } from "./read-recovery";
 
 export const SAV_INTAKE_RUNTIME_REVISION = "sav-intake-runtime-2026-10-21.v1";
 export const intakeRuntimeHash = (value: unknown) => createHash("sha256").update(JSON.stringify(value)).digest("hex");
@@ -18,6 +19,7 @@ const policySchema = z.object({
 }).strict();
 export const savIntakeRuntimePins = z.object({ mailboxId: z.uuid(), createdAfter: z.iso.datetime(), receivedAfter: z.iso.datetime(), expiresAt: z.iso.datetime(), codeRevision: z.string().regex(/^[a-f0-9]{40}$/),
   resourcesHash: z.string().regex(/^[a-f0-9]{64}$/), policyHash: z.string().regex(/^[a-f0-9]{64}$/), maxNanoUsd: z.number().int().min(1).max(3_000_000_000), maxCalls: z.number().int().min(1).max(300),
+  readRecovery: intakeReadRecoveryPolicySchema.optional(),
   budgetProfile: z.literal(SAV_INTAKE_OPERATIONAL_PROFILE).optional(), maxRollingNanoUsd: z.number().int().min(1).max(90_000_000_000).optional() }).strict().refine(p =>
     p.budgetProfile === SAV_INTAKE_OPERATIONAL_PROFILE ? p.maxRollingNanoUsd !== undefined : p.maxCalls <= 30 && p.maxRollingNanoUsd === undefined);
 export type IntakeRuntimeConfig = z.infer<typeof savIntakeRuntimePins> & { mode: "observe"; policy: EnginePolicy; configHash: string; model: "gemini-3.6-flash" };
@@ -28,6 +30,7 @@ export function intakeRuntimeConfigurationHash(p: z.infer<typeof savIntakeRuntim
   return intakeRuntimeHash({ ...p, revision: SAV_INTAKE_RUNTIME_REVISION, prompts, readers: SAV_INTAKE_READERS_REVISION, context: SAV_MESSAGE_CONTEXT_REVISION,
     otherRulesHash: intakeRuntimeHash(env.SAV_OTHER_OBSERVATION_RULES_JSON ?? null),
     otherRoutingHash: intakeRuntimeHash(env.SAV_INTAKE_OTHER_RULES_JSON ?? null),
+    ...(env.SAV_INTAKE_CRM_ACK_TEMPLATES_JSON ? {crmAcknowledgementsHash:intakeRuntimeHash(env.SAV_INTAKE_CRM_ACK_TEMPLATES_JSON)} : {}),
     accessBinding: intakeRuntimeHash({ model: env.SAV_GEMINI_API_KEY, crm: env.HUBSPOT_ACCESS_TOKEN }) });
 }
 /** No permissive defaults, campaign resets or hidden reuse of another budget. */
@@ -62,6 +65,7 @@ export type IntakeRuntimePayload = {
   attachments?: import("./attachments").IntakeAttachmentState;
   configuration?: { configHash: string; resourcesHash: string; policyHash: string; codeRevision: string; model: string };
   semantics?:import("./semantic-records").AcceptedIntakeSemantics;
+  readRecovery?: import("./read-recovery").IntakeReadRecovery;
   provenance?:unknown; traces?: unknown[]; reason?: string;
   effects: "not_connected";
 };

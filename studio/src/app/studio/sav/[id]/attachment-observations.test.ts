@@ -28,3 +28,9 @@ it("shows the incomplete inventory even when no reference was found before the t
   expect(markup).toContain("Inventaire des pièces jointes incomplet");
   expect(markup).not.toContain("0 pièce(s)");
 });
+
+it("explains a rejected visual contract without claiming a provider outage or a completed read",()=>{
+ const read=observedAttachment();read.observations[0].status="not_read";read.observations[0].reason="validation_failed";read.observations[0].text="";read.observations[0].regions=[];
+ const html=renderToStaticMarkup(createElement(AttachmentObservations,{attachments:[attachmentMetadata()],read}));
+ expect(html).toContain("Non lue");expect(html).toContain("La réponse structurée a été rejetée");expect(html).not.toContain("fournisseur a échoué");
+});

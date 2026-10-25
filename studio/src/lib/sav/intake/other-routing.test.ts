@@ -62,3 +62,14 @@ it("revalidates catalogue expiration after qualification before publication",asy
   expect(intakeOtherQualificationFresh(qualified!,JSON.stringify(raw),new Date(now.getTime()+1001))).toBe(false);
  } finally {vi.useRealTimers();}
 });
+it("qualifies only a complete exact approved newsletter with independent bulk/authentication proofs",async()=>{
+ const newsSubject="Newsletter synthétique — édition de la semaine",newsBody="Actualités synthétiques de notre lettre d’information. Se désinscrire de cette newsletter.";
+ const news={...input,subject:newsSubject,body:{...input.body,text:newsBody}};
+ const rules=[{id:"synthetic-newsletter",family:"authenticated_newsletter",mailboxId,subjectSha256:hash(newsSubject),bodySha256:hash(newsBody)}];
+ const headers=[...response().payload.headers,{name:"List-Id",value:"Synthetic news <list.synthetic.invalid>"},{name:"List-Unsubscribe",value:"<https://synthetic.invalid/unsubscribe>"}];
+ const auth=await readSavOtherAuthentication(proofInput,async()=>Response.json(response(headers)));
+ expect(qualifyIntakeOther(news,null,readIntakeOtherRules(configuration(rules)),auth)?.family).toBe("authenticated_newsletter");
+ expect(qualifyIntakeOther(news,null,readIntakeOtherRules(configuration(rules)),await proof())).toBeNull();
+ for(const patch of [{subject:"ça ne fonctionne pas"},{subject:"Re: "+newsSubject},{body:{...news.body,text:newsBody+" Pouvez-vous m’aider ?"}},{body:{...news.body,attachments:[{}]}}])
+  expect(qualifyIntakeOther({...news,...patch},null,readIntakeOtherRules(configuration(rules)),auth)).toBeNull();
+});

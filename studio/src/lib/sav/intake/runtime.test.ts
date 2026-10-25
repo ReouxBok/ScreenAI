@@ -3,6 +3,11 @@ import { afterAll, afterEach, beforeAll, beforeEach, expect, it, vi } from "vite
 import { eq } from "drizzle-orm";
 import { createSavTestDb } from "../../../../test/sav-db";
 import { savSyncState, savMailboxes, savMessages, savThreads, savIntakeRuns, savIntakeModelCalls, savIntakeJournal, savActions, savDecisions, savIntakeExecutions, savIntakeEffects, savIntakeExecutionPolicies, staffUsers, auditLogs } from "@/db/schema";
+import { executionProvider } from "../../../../test/sav-intake-execution-provider";
+import { readReadRecoveryWake, requestReadRecoveryWake } from "./read-recovery-wake";
+import { expireIntakeReadRecoveries } from "./read-recovery-store";
+import { newReadRecovery } from "./read-recovery";
+import { checkpointSavIntakeRun } from "./runtime-store";
 const state = vi.hoisted(() => ({ db: null as unknown }));
 vi.mock("@/db", () => ({ requireDb: () => { if (!state.db) throw Error("NO_DATABASE_ALLOWED"); return state.db; } }));
 import { encryptSavPayload, decryptSavPayload } from "../crypto";
@@ -693,7 +698,7 @@ it("finishes an accepted Other investigation as an explicit rule choice instead 
   expect(await f.db.select().from(savActions)).toHaveLength(0);
 });
 
-it.each(["valid_repair", "invalid_repair", "unknown_usage", "short_deadline"])("resumes malformed vision with a new fenced attempt while preserving visual and ledger guards (%s)", async scenario => {
+it.each(["valid_repair", "invalid_repair", "invalid_box", "unknown_usage", "short_deadline"])("resumes malformed vision with a new fenced attempt while preserving visual and ledger guards (%s)", async scenario => {
   const { syntheticImage, attachmentMetadata } = await import("../../../../test/sav-attachments");
   const bytes = await syntheticImage(), [source] = await f.db.select().from(savMessages).where(eq(savMessages.id, messageId)), [thread] = await f.db.select().from(savThreads).where(eq(savThreads.id, threadId));
   const metadata = attachmentMetadata(bytes.length);
@@ -707,7 +712,7 @@ it.each(["valid_repair", "invalid_repair", "unknown_usage", "short_deadline"])("
     wireBodies.push(wire);
     const answer = wireBodies.length === 2 && ["valid_repair", "short_deadline"].includes(scenario)
       ? { messageId, requests: [{ id: "r1", kind: "acknowledgement", currentMessageId: messageId, quoteId: data.citationCatalogue[0].id }], images: [{ index: 0, readability: "readable", text: "Error E42", uncertainties: [], regions: [] }] }
-      : { privateRejectedValue: "SYNTHETIC_REJECTED_CANARY", requests: null };
+      : scenario === "invalid_box" ? {messageId,requests:[{id:"r1",kind:"acknowledgement",currentMessageId:messageId,quoteId:data.citationCatalogue[0].id}],images:[{index:0,readability:"readable",text:"Synthetic",uncertainties:[],regions:[{text:"Synthetic",box:[0,0,0,0,0]}]}]} : { privateRejectedValue: "SYNTHETIC_REJECTED_CANARY", requests: null };
     return Response.json({ candidates: [{ finishReason: "STOP", content: { parts: [{ text: JSON.stringify(answer) }] } }], usageMetadata: scenario === "unknown_usage" ? { promptTokenCount: 1220 } : { promptTokenCount: 1220, candidatesTokenCount: 200, thoughtsTokenCount: 0, totalTokenCount: 1420 } });
   });
   const deps = { env: () => environment, network, downloadAttachments: async () => bytes, ...(scenario === "short_deadline" ? { deadlineMs: Date.now() + 65_000 } : {}) };
@@ -720,6 +725,11 @@ it.each(["valid_repair", "invalid_repair", "unknown_usage", "short_deadline"])("
   }
   const current = await readSavIntakeCurrent(threadId, config);
   expect(current?.attempts).toBe(["unknown_usage", "short_deadline"].includes(scenario) ? 1 : 2);
+  if(scenario==="invalid_box"){
+    expect(current?.payload.attachments?.read.observations[0]).toMatchObject({status:"not_read",reason:"validation_failed"});
+    expect(JSON.stringify(current?.payload.traces)).toContain("images.0.regions.0.box");
+    expect(JSON.parse(wireBodies[1]).systemInstruction.parts[0].text).toContain("images.0.regions.0.box");
+  }
   expect(JSON.stringify(current?.payload)).not.toContain("SYNTHETIC_REJECTED_CANARY");
   const calls = await f.db.select().from(savIntakeModelCalls);
   expect(calls).toHaveLength(wireBodies.length); expect(calls[0].resultCiphertext).toBeNull();
@@ -760,4 +770,109 @@ it("preflights daily money/call limits and rejects duplicate or malformed plans"
   await expect(assertSavIntakeCallPlan(messageId,{...config,maxCalls:1},["a".repeat(64),"b".repeat(64)])).rejects.toThrow("BUDGET_EXHAUSTED");
   for(const hashes of [[],["a".repeat(64),"a".repeat(64)],["not-a-hash"],["a","b","c","d"].map(c=>c.repeat(64))])await expect(assertSavIntakeCallPlan(messageId,config,hashes)).rejects.toThrow("DISPATCH_REJECTED");
   expect((await readSavIntakeBudget(config)).callCount).toBe(0);
+});
+
+function recoveryProvider(){
+ const provider=executionProvider("synthetic@example.invalid");provider.seedTicket({ownerId:"301"});
+ provider.objects.notes["401"]={id:"401",properties:{hs_note_body:"Synthetic complete investigation",hs_timestamp:new Date(Date.now()-86400000).toISOString()}};
+ provider.links.set("tickets:201:notes",["401"]);
+ let failures=true,understandings=0,matching=0,historyAttempts=0;
+ const network:typeof fetch=async(url,init)=>{
+  const path=new URL(String(url)).pathname;
+  if(String(url).startsWith("https://generativelanguage.googleapis.com/")){
+   const data=JSON.parse(JSON.parse(String(init?.body)).contents[0].parts[0].text),catalogue=data.citationCatalogue as {id:string;sourceId:string}[];
+   let answer:unknown;
+   if(!data.tickets){understandings++;answer={messageId,requests:[{id:"r1",kind:"support",currentMessageId:messageId,quoteId:catalogue.find(c=>c.sourceId==="current")!.id}],ticketSummary:{title:"Connexion synthétique",description:"La connexion ne marche plus.",requestIds:["r1"]}};}
+   else{matching++;answer={investigationComplete:true,tickets:[{ticketId:"201",relation:"same",requestIds:["r1"],evidenceIds:["current","ticket-201","history-201"],rationale:"Synthetic matching evidence",grounding:["current","ticket-201","history-201"].map(sourceId=>({quoteId:catalogue.find(c=>c.sourceId===sourceId)!.id}))}]};}
+   return Response.json({candidates:[{finishReason:"STOP",content:{parts:[{text:JSON.stringify(answer)}]}}],usageMetadata:{promptTokenCount:100,candidatesTokenCount:50,thoughtsTokenCount:0,totalTokenCount:150}});
+  }
+  if(path.endsWith("/notes/batch/read")){historyAttempts++;if(failures)throw TypeError("Synthetic transient connection failure");}
+  return provider.network(url,init);
+ };
+ return {provider,network,enable:()=>{failures=false;},get understandings(){return understandings;},get matching(){return matching;},get historyAttempts(){return historyAttempts;}};
+}
+async function scheduledReadFailure(){
+ await f.db.insert(savSyncState).values({key:"sav-intake-console-schema-v1",status:"installed"}).onConflictDoUpdate({target:savSyncState.key,set:{status:"installed"}});
+ environment.SAV_INTAKE_EVENT_DISPATCH="on";
+ const p=recoveryProvider(),start=vi.fn(async()=>({runId:"synthetic-workflow"})),id=(await enqueueSavIntakeMessage(messageId,config))!;
+ expect(await analyseSavIntakeRuntime(id,config,{env:()=>environment,network:p.network,startReadRecovery:start})).toHaveProperty("state","waiting");
+ const [run]=await f.db.select().from(savIntakeRuns).where(eq(savIntakeRuns.id,id));
+ const saved=decryptSavPayload<IntakeRuntimePayload>(run.payloadCiphertext);
+ expect(saved.readRecovery).toMatchObject({state:"scheduled",attempts:0,operation:"ticket_history",code:"SAV_HUBSPOT_READ_UNAVAILABLE"});
+ expect(saved.readRecovery?.cache.map(c=>c.method)).toContain("findContactsByEmail");expect(run.attempts).toBe(1);expect(p.historyAttempts).toBe(2);expect(start).toHaveBeenCalledTimes(1);
+ return {p,start,id,run,saved};
+}
+it("durably resumes only the missing read after restart, retaining one understanding and the same run",async()=>{
+ const {p,start,id}=await scheduledReadFailure();expect(await pendingSavIntakeRuns(config)).toEqual([]);expect(await claimSavIntakeRun(id,config)).toBeNull();
+ const status=await readReadRecoveryWake(id,environment);expect(status.state).toBe("scheduled");
+ vi.useFakeTimers({toFake:["Date"]});try{
+  vi.setSystemTime(Date.now()+31000);p.enable();
+  const [a,b]=await Promise.all([analyseSavIntakeRuntime(id,config,{env:()=>environment,network:p.network,startReadRecovery:start}),analyseSavIntakeRuntime(id,config,{env:()=>environment,network:p.network,startReadRecovery:start})]);
+  expect([a,b].some(r=>"state" in r&&r.state==="observed")).toBe(true);expect([a,b].some(r=>"skipped" in r&&r.skipped==="not_claimed")).toBe(true);
+  const [run]=await f.db.select().from(savIntakeRuns).where(eq(savIntakeRuns.id,id));expect(run.attempts).toBe(1);expect(run.version).toBe(1);
+  expect(decryptSavPayload<IntakeRuntimePayload>(run.payloadCiphertext).readRecovery).toMatchObject({state:"complete",attempts:1});
+  expect(p.understandings).toBe(1);expect(p.matching).toBe(1);expect((await f.db.select().from(savIntakeModelCalls))).toHaveLength(2);
+  expect(p.provider.calls.filter(c=>c.path.endsWith("/contacts/search"))).toHaveLength(2);expect(await f.db.select().from(savActions)).toHaveLength(0);
+ }finally{vi.useRealTimers();}
+});
+it.each(["pause","source","new_message","human"])("a %s during the durable delay cannot resume or consume another understanding",async change=>{
+ const {id,p}=await scheduledReadFailure();
+ if(change==="pause")await f.db.update(savThreads).set({aiPaused:true}).where(eq(savThreads.id,threadId));
+ if(change==="human")await f.db.update(savThreads).set({humanRequestedAt:new Date()}).where(eq(savThreads.id,threadId));
+ if(change==="source")await f.db.update(savMessages).set({bodyCiphertext:encryptSavPayload({text:"Changed synthetic source",headers:{},attachments:[]})}).where(eq(savMessages.id,messageId));
+ if(change==="new_message")await message({receivedAt:new Date(Date.now()+1)});
+ vi.useFakeTimers({toFake:["Date"]});try{
+  vi.setSystemTime(Date.now()+31000);
+  if(change==="human")expect(await claimSavIntakeRun(id,config)).toBeNull();else expect((await readReadRecoveryWake(id,environment)).state).toBe("stopped");
+  expect(p.understandings).toBe(1);const [r]=await f.db.select().from(savIntakeRuns).where(eq(savIntakeRuns.id,id));expect(r.attempts).toBe(1);
+ }finally{vi.useRealTimers();}
+});
+it("does not reset exhausted technical counters or create another semantic version",async()=>{
+ const {id,p,start}=await scheduledReadFailure();vi.useFakeTimers({toFake:["Date"]});try{
+  for(const delay of [31000,61000,121000]){vi.setSystemTime(Date.now()+delay);await analyseSavIntakeRuntime(id,config,{env:()=>environment,network:p.network,startReadRecovery:start});}
+  const [run]=await f.db.select().from(savIntakeRuns).where(eq(savIntakeRuns.id,id));expect(run.attempts).toBe(1);expect(run.version).toBe(1);
+  expect(decryptSavPayload<IntakeRuntimePayload>(run.payloadCiphertext).readRecovery).toMatchObject({state:"exhausted",attempts:3});
+  expect(await claimSavIntakeRun(id,config)).toBeNull();expect(await pendingSavIntakeRuns(config)).toEqual([]);expect(p.understandings).toBe(1);
+ }finally{vi.useRealTimers();}
+});
+it("twenty-one expired recoveries cannot occupy the SQL page of a new message",async()=>{
+ const {saved}=await scheduledReadFailure();
+ for(let n=0;n<21;n++){
+  const [t]=await f.db.insert(savThreads).values({mailboxId,gmailThreadId:randomUUID(),customerEmail:"synthetic@example.invalid"}).returning();
+  const [m]=await f.db.insert(savMessages).values({mailboxId,threadId:t.id,direction:"inbound",fromEmail:"synthetic@example.invalid",toEmails:["support@example.invalid"],gmailMessageId:randomUUID(),subject:"Synthetic",bodyCiphertext:encryptSavPayload({text:"Synthetic old fixture",attachments:[]}),receivedAt:new Date()}).returning();
+  const recovery={...saved.readRecovery!,expiresAt:new Date(Date.now()-1).toISOString()};
+  const [r]=await f.db.insert(savIntakeRuns).values({threadId:t.id,messageId:m.id,configHash:config.configHash,policyHash:config.policyHash,sourceHash:"synthetic",version:1,isCurrent:true,state:"waiting",attempts:2,payloadCiphertext:encryptSavPayload({...saved,readRecovery:recovery})}).returning();
+  await f.db.insert(auditLogs).values({actorEmail:"system",action:"sav_intake_read_recovery",entityType:"sav_intake_read_recovery",entityId:r.id,technicalMetadata:{state:"scheduled",retryAt:new Date(0).toISOString(),expiresAt:recovery.expiresAt,configHash:config.configHash,technicalAttempts:0}});
+ }
+ const [t]=await f.db.insert(savThreads).values({mailboxId,gmailThreadId:randomUUID(),customerEmail:"synthetic@example.invalid"}).returning();
+ const [m]=await f.db.insert(savMessages).values({mailboxId,threadId:t.id,direction:"inbound",fromEmail:"synthetic@example.invalid",toEmails:["support@example.invalid"],gmailMessageId:randomUUID(),subject:"Synthetic new",bodyCiphertext:encryptSavPayload({text:"New synthetic failure",attachments:[]}),receivedAt:new Date()}).returning();
+ const fresh=(await enqueueSavIntakeMessage(m.id,config))!;expect(await pendingSavIntakeRuns(config)).toContainEqual({id:fresh});
+ expect(await expireIntakeReadRecoveries(config)).toBe(20);expect(await pendingSavIntakeRuns(config)).toContainEqual({id:fresh});
+});
+it("does not persist an unqualified technical recovery at the initial checkpoint",async()=>{
+ const l=await lease(),p={...payload(),readRecovery:newReadRecovery(config,l.sourceHash)};
+ await checkpointSavIntakeRun(l,p);const [stored]=await f.db.select().from(savIntakeRuns).where(eq(savIntakeRuns.id,l.run.id));
+ expect(decryptSavPayload<IntakeRuntimePayload>(stored.payloadCiphertext).readRecovery).toBeUndefined();
+ vi.useFakeTimers({toFake:["Date"]});try{vi.setSystemTime(Date.now()+301000);expect(await pendingSavIntakeRuns(config)).toContainEqual({id:l.run.id});const resumed=await claimSavIntakeRun(l.run.id,config);expect(resumed?.run.attempts).toBe(2);await failSavIntakeRun(resumed!,payload());expect(await pendingSavIntakeRuns(config)).toEqual([]);}finally{vi.useRealTimers();}
+});
+it("bounds duplicate workflow starts and leaves a failed start durable",async()=>{
+ const {id}=await scheduledReadFailure();
+ vi.useFakeTimers({toFake:["Date"]});try{
+  vi.setSystemTime(Date.now()+121000);const fail=vi.fn(async()=>{throw Error("Synthetic start failure");});
+  const result=await requestReadRecoveryWake(id,{env:environment,start:fail});expect(result.reason).toBe("start_deferred");
+  expect((await readSavIntakeCurrent(threadId,config))?.payload.readRecovery?.state).toBe("scheduled");
+  const duplicate=vi.fn(async()=>({}));await Promise.all([requestReadRecoveryWake(id,{env:environment,start:duplicate}),requestReadRecoveryWake(id,{env:environment,start:duplicate})]);expect(duplicate).not.toHaveBeenCalled();
+ }finally{vi.useRealTimers();}
+});
+
+it.each([false,true])("permits read-only recovery at the daily cap but refuses any new model dispatch (matching=%s)",async matching=>{
+ operational();const {id,p,start}=await scheduledReadFailure();
+ await f.db.insert(savIntakeModelCalls).values(Array.from({length:299},(_,i)=>({messageKey:intakeRuntimeHash(`other-cap-${i}`),requestHash:intakeRuntimeHash(`other-request-${i}`),state:"settled",reservedNanoUsd:817152000,chargedNanoUsd:262500,payloadCiphertext:encryptSavPayload({metadata:{inputTokens:100,outputTokens:50,thoughtTokens:0,totalTokens:150}}),createdAt:new Date()})));
+ if(!matching)p.provider.setContacts([]);p.enable();vi.useFakeTimers({toFake:["Date"]});try{
+  vi.setSystemTime(Date.now()+61000);await analyseSavIntakeRuntime(id,config,{env:()=>environment,network:p.network,startReadRecovery:start});
+  const [r]=await f.db.select().from(savIntakeRuns).where(eq(savIntakeRuns.id,id));expect(r.attempts).toBe(1);
+  const saved=decryptSavPayload<IntakeRuntimePayload>(r.payloadCiphertext);expect(saved.readRecovery?.attempts).toBe(1);
+  expect(p.understandings).toBe(1);expect(p.matching).toBe(0);expect(await f.db.select().from(savIntakeModelCalls)).toHaveLength(300);
+  if(matching)expect(saved.reason).toBe("SAV_INTAKE_RUNTIME_BUDGET_EXHAUSTED");else expect(saved.plan?.decision.evidence.some(e=>e.id==="email-lookup")).toBe(true);
+ }finally{vi.useRealTimers();}
 });
