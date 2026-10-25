@@ -85,3 +85,22 @@ export function acceptedIntakeResult<T>(envelope: AcceptedIntakeSemantics | unde
   validateAccepted(method, input, rows[0].result);
   return structuredClone(rows[0].result) as T;
 }
+
+/** Resuming a read never buys a third understanding attempt. Reuse requires an
+ * accepted current-validator record with the same complete input and bounded age. */
+export function reuseAcceptedIntakeSemantics(readers: SavIntakeSemanticReaders, envelope: AcceptedIntakeSemantics,
+  onHit: (method: keyof SavIntakeSemanticReaders) => void, now = () => new Date()): SavIntakeSemanticReaders {
+  const wrap = (method: keyof SavIntakeSemanticReaders) => async (input: unknown, signal: AbortSignal) => {
+    const rows = envelope.records.filter(r => r.method === method && r.inputHash === intakeSemanticInputHash(input));
+    if (rows.length) {
+      const age = now().getTime() - Date.parse(rows[0].acceptedAt);
+      if (!Number.isFinite(age) || age < 0 || age >= 300_000) throw Error("SAV_INTAKE_SEMANTIC_CONTEXT_CHANGED");
+      const result = acceptedIntakeResult(envelope,method,input); onHit(method); return result;
+    }
+    if (method === "analyseMessage") throw Error("SAV_INTAKE_SEMANTIC_PROVENANCE_MISSING");
+    const fn=readers[method];if(!fn)throw Error("SAV_INTAKE_SEMANTIC_RESULT_MISSING");
+    return (fn as (i:unknown,s:AbortSignal)=>Promise<unknown>)(input,signal);
+  };
+  return { analyseMessage:wrap("analyseMessage") as SavIntakeSemanticReaders["analyseMessage"],
+    assessIssues:wrap("assessIssues") as SavIntakeSemanticReaders["assessIssues"],assessIdentity:wrap("assessIdentity") as SavIntakeSemanticReaders["assessIdentity"] };
+}

@@ -5,6 +5,7 @@ import type { CrmSnapshot, Effect, EffectIntent, EffectAck } from "./execution-t
 import type { IntakePlan, IntakeAdapters, ReadResult } from "./engine-types";
 import type { IntakeRuntimeConfig } from "./runtime-contract";
 import { decryptSavPayload } from "../crypto";
+import { isQualifiedCrmEmail, type QualifiedCrmEmail, type ContinuationSourceEmail } from "./crm-continuation";
 const fault = (): never => { throw Error("SAV_INTAKE_EXECUTION_CRM_CHANGED"); };
 const value = <T>(r: ReadResult<T>): T => {
     if (r.status !== "complete")
@@ -91,10 +92,12 @@ export function assertOriginalExecutionCrm(plan: IntakePlan, s: CrmSnapshot) {
 }
 /** Only previously attributed, confirmed effects are removed for comparison.
  * All other contact/ticket/history changes require reinvestigation. */
-export type ExecutionContinuation = { finalizing?: boolean; nextKind?: EffectIntent["kind"]; sourceEmail?: { from: string; to: string[]; subject: string; body: string } };
+export type ExecutionContinuation = { finalizing?: boolean; nextKind?: EffectIntent["kind"]; sourceEmail?: ContinuationSourceEmail; qualifiedEmails?: QualifiedCrmEmail[] };
+export type CrmDeltaDiagnostic = { stage: string; reason: "unrecognized_added_email"|"snapshot_changed"; ticketIds:string[];eventIds:string[];baselineHash:string;currentHash:string; fields?:string[] };
+export class IntakeCrmDeltaError extends Error { constructor(readonly diagnostic:CrmDeltaDiagnostic){super("SAV_INTAKE_EXECUTION_CRM_CHANGED");} }
 /** Compare the entire envelope and body. Unknown incoming/outgoing mail must not
  * authorize a semantic status transition merely because it is an email. */
-function sameKnownEmail(text: string, baseline: CrmSnapshot, ticketId: string, source?: ExecutionContinuation["sourceEmail"]) {
+function sameKnownEmail(text: string, baseline: CrmSnapshot, ticketId: string) {
     const parse = (value: string) => {
         try { return z.object({ from: z.email(), to: z.string().min(1), direction: z.string(), subject: z.string(), body: z.string() }).parse(JSON.parse(value)); }
         catch { return null; }
@@ -103,9 +106,6 @@ function sameKnownEmail(text: string, baseline: CrmSnapshot, ticketId: string, s
     if (!incoming) return false;
     const addresses = (s: string) => s.split(/[;,]/).map(v => v.trim().toLowerCase()).sort();
     const body = (s: string) => s.replace(/\r\n/g, "\n");
-    if (source && incoming.direction === "INCOMING_EMAIL" && incoming.from.toLowerCase() === source.from.toLowerCase()
-        && JSON.stringify(addresses(incoming.to)) === JSON.stringify(source.to.map(v => v.toLowerCase()).sort())
-        && incoming.subject === source.subject && body(incoming.body) === body(source.body)) return true;
     return (baseline.histories[ticketId] ?? []).some(e => {
         const prior = e.kind === "email" ? parse(e.text) : null;
         return prior && incoming.from.toLowerCase() === prior.from.toLowerCase() && incoming.direction === prior.direction
@@ -113,7 +113,7 @@ function sameKnownEmail(text: string, baseline: CrmSnapshot, ticketId: string, s
             && incoming.subject === prior.subject && body(incoming.body) === body(prior.body);
     });
 }
-export function assertExecutionCrmUnchanged(baseline: CrmSnapshot, current: CrmSnapshot, effects: Effect[], continuation: ExecutionContinuation = {}) {
+function assertExecutionCrmUnchangedCore(baseline: CrmSnapshot, current: CrmSnapshot, effects: Effect[], continuation: ExecutionContinuation = {}) {
     const clean = JSON.parse(JSON.stringify(current)) as CrmSnapshot;
     const concurrent: { ticketId: string; eventId: string; contentHash: string }[] = [];
     const ack = (e: Effect) => e.ackCiphertext ? decryptSavPayload<EffectAck>(e.ackCiphertext) : null;
@@ -175,7 +175,9 @@ export function assertExecutionCrmUnchanged(baseline: CrmSnapshot, current: CrmS
         // Completing already planned logging/associations does not decide a new
         // destination. Reopening an existing ticket DOES require known content.
         if (!createdIds.has(ticketId) && continuation.nextKind === "stage_new"
-            && additions.some(e => !sameKnownEmail(e.text, baseline, ticketId, continuation.sourceEmail))) return fault();
+            && additions.some(e => !sameKnownEmail(e.text, baseline, ticketId)
+              && !continuation.qualifiedEmails?.some(p=>isQualifiedCrmEmail(p)&&p.ticketId===ticketId&&p.eventId===e.id&&p.contentHash===savIntakeEvidenceContentHash(e))))
+          throw new IntakeCrmDeltaError({stage:"stage_new",reason:"unrecognized_added_email",ticketIds:[ticketId],eventIds:additions.map(e=>e.id).filter(id=>/^emails:\d{1,30}$/.test(id)).slice(0,20),baselineHash:savIntakeEvidenceContentHash(baseline),currentHash:savIntakeEvidenceContentHash(current)});
         for (const e of additions) concurrent.push({ ticketId, eventId: e.id, contentHash: savIntakeEvidenceContentHash(e) });
         clean.histories[ticketId] = clean.histories[ticketId].filter(e => known.has(e.id));
     }
@@ -193,6 +195,34 @@ export function assertExecutionCrmUnchanged(baseline: CrmSnapshot, current: CrmS
         delete clean.histories[a.id];
     }
     if (savIntakeCanonicalEvidence(clean) !== savIntakeCanonicalEvidence(JSON.parse(JSON.stringify(baseline))))
-        return fault();
+        throw new IntakeCrmDeltaError({stage:continuation.nextKind??"finalizing",reason:"snapshot_changed",ticketIds:[],eventIds:[],baselineHash:savIntakeEvidenceContentHash(baseline),currentHash:savIntakeEvidenceContentHash(current)});
     return concurrent;
+}
+
+const deltaFields = (baseline:CrmSnapshot,current:CrmSnapshot) => {
+ const fields:string[]=[];
+ for(const key of ["address","lookup","contacts","associations","tickets","histories"] as const)
+  if(savIntakeCanonicalEvidence(baseline[key])!==savIntakeCanonicalEvidence(current[key]))fields.push(key);
+ const old=Object.values(baseline.tickets).flat(),next=Object.values(current.tickets).flat();
+ for(const key of ["ownerId","stage","contactIds","subject","content","createdAt","closedAt"] as const)
+  if(old.some(t=>next.some(n=>n.id===t.id&&savIntakeCanonicalEvidence(n[key])!==savIntakeCanonicalEvidence(t[key]))))fields.push(`ticket.${key}`);
+ return fields;
+};
+export function assertExecutionCrmUnchanged(baseline:CrmSnapshot,current:CrmSnapshot,effects:Effect[],continuation:ExecutionContinuation={}) {
+ try{return assertExecutionCrmUnchangedCore(baseline,current,effects,continuation);}
+ catch(error){
+  if(error instanceof IntakeCrmDeltaError){error.diagnostic.fields=deltaFields(baseline,current);throw error;}
+  if(error instanceof Error&&error.message==="SAV_INTAKE_EXECUTION_CRM_CHANGED")throw new IntakeCrmDeltaError({stage:continuation.nextKind??"finalizing",reason:"snapshot_changed",ticketIds:[],eventIds:[],baselineHash:savIntakeEvidenceContentHash(baseline),currentHash:savIntakeEvidenceContentHash(current),fields:deltaFields(baseline,current)});
+  throw error;
+ }
+}
+export function publicIntakeCrmDelta(raw:unknown){
+ if(!raw||typeof raw!=="object")return null;
+ const d=raw as Record<string,unknown>,stages=["stage_new","ticket_create","note_create","note_associate","email_create","email_associate","identity_send","finalizing"];
+ if(!stages.includes(String(d.stage))||!["unrecognized_added_email","snapshot_changed"].includes(String(d.reason)))return null;
+ const ids=(raw:unknown,pattern:RegExp)=>Array.isArray(raw)?raw.filter((s):s is string=>typeof s==="string"&&pattern.test(s)).slice(0,20):[];
+ return {stage:String(d.stage),reason:String(d.reason),ticketIds:ids(d.ticketIds,/^\d{1,30}$/),eventIds:ids(d.eventIds,/^(?:emails|notes):\d{1,30}$/),
+  fields:ids(d.fields,/^(?:address|lookup|contacts|associations|tickets|histories|ticket\.(?:ownerId|stage|contactIds|subject|content|createdAt|closedAt))$/),
+  baselineHash:typeof d.baselineHash==="string"&&/^[A-Za-z0-9_-]{43}$/.test(d.baselineHash)?d.baselineHash:null,
+  currentHash:typeof d.currentHash==="string"&&/^[A-Za-z0-9_-]{43}$/.test(d.currentHash)?d.currentHash:null};
 }

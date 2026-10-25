@@ -7,7 +7,11 @@ import { assertSavIntakeCallPlan } from "./runtime-store";
 import { createIntakeModelDispatcher } from "./model-dispatch";
 import { prepareIntakeAttachments, intakeInputWithAttachments, finishIntakeAttachmentRead } from "./attachments";
 import { intakeMessageHistorical, intakeLaunchMatches, parkLaunchedIntakeMessage } from "./launch-boundary";
-import { recordAcceptedIntakeSemantics,SAV_INTAKE_SEMANTIC_RECORD_REVISION } from "./semantic-records";
+import { recordAcceptedIntakeSemantics,reuseAcceptedIntakeSemantics,SAV_INTAKE_SEMANTIC_RECORD_REVISION } from "./semantic-records";
+import { newReadRecovery, recoverableIntakeReads, intakeReadRetryable, DEFAULT_INTAKE_READ_RECOVERY } from "./read-recovery";
+import { publicIntakeSchemaIssues } from "./schema-diagnostics";
+import type { EngineInput, MessageAnalysis } from "./engine-types";
+import type { IntakeReadTrace } from "./hubspot-readers";
 import { SAV_INTAKE_MODEL_REVISION } from "./model-readers";
 import { planSavIntake } from "./engine";
 import { createSavIntakeHubspotReaders } from "./hubspot-readers";
@@ -33,16 +37,20 @@ export async function enqueueConfiguredSavIntake(messageId: string) {
   return !runId && launch ? launch : {runId};
 }
 async function analyseSavIntakeRuntimeWithinBudget(runId: string, config: IntakeRuntimeConfig,
-  deps: { env?: () => Record<string, string | undefined>; network?: typeof fetch; downloadAttachments?: Parameters<typeof prepareIntakeAttachments>[3]; authenticateOther?: Parameters<typeof qualifyRuntimeOther>[3]; deadlineMs?: number } = {}) {
+  deps: { env?: () => Record<string, string | undefined>; network?: typeof fetch; downloadAttachments?: Parameters<typeof prepareIntakeAttachments>[3]; authenticateOther?: Parameters<typeof qualifyRuntimeOther>[3]; startReadRecovery?: (runId:string)=>Promise<unknown>; deadlineMs?: number } = {}) {
   const env = deps.env ?? (() => process.env), network = deps.network ?? fetch;
   const lease = await claimSavIntakeRun(runId, config); if (!lease) return { skipped: "not_claimed" };
   const previous = decryptSavPayload<IntakeRuntimePayload>(lease.run.payloadCiphertext);
+  if (lease.recoveringRead && previous.input) lease.input = structuredClone(previous.input) as EngineInput;
   const repairMalformedOutput = lease.run.attempts > 1 && ["SAV_INTAKE_MODEL_OUTPUT_REJECTED", "SAV_INTAKE_RUNTIME_CALL_ALREADY_CONSUMED"].includes(previous.reason ?? "");
   const controller = new AbortController(), timer = setTimeout(() => controller.abort(), 45_000);
   const traces: unknown[] = [];
   let semanticFailureReason: string | undefined;
+  let readFailure: IntakeReadTrace | undefined;
   let dispatcher: ReturnType<typeof createIntakeModelDispatcher> | undefined;
   const payload: IntakeRuntimePayload = {configuration: { configHash: config.configHash, resourcesHash: config.resourcesHash, policyHash: config.policyHash, codeRevision: config.codeRevision, model: config.model }, semantics:{revision:SAV_INTAKE_SEMANTIC_RECORD_REVISION,validatorRevision:SAV_INTAKE_MODEL_REVISION,records:[]},provenance:[...lease.provenance], revision: SAV_INTAKE_RUNTIME_REVISION, input: lease.input, traces, effects: "not_connected" };
+  payload.readRecovery = lease.recoveringRead ? structuredClone(previous.readRecovery!) : newReadRecovery(config,lease.sourceHash);
+  if (lease.recoveringRead) { payload.semantics=structuredClone(previous.semantics!);payload.attachments=structuredClone(previous.attachments); }
   const live = async () => {
     const current = savIntakeRuntimeConfig(env());
     if (!current || current.configHash !== config.configHash || controller.signal.aborted) throw Error("SAV_INTAKE_RUNTIME_CONTEXT_CHANGED");
@@ -51,7 +59,8 @@ async function analyseSavIntakeRuntimeWithinBudget(runId: string, config: Intake
   };
   // Callback checkpoints are serialized and drained before terminal persistence.
   let checkpoints = Promise.resolve();
-  const checkpoint = () => { checkpoints = checkpoints.then(() => checkpointSavIntakeRun(lease, payload)); checkpoints.catch(() => {}); };
+  const writeCheckpoint = () => { const snapshot=structuredClone(payload);if(!lease.recoveringRead)delete snapshot.readRecovery;return checkpointSavIntakeRun(lease,snapshot); };
+  const checkpoint = () => { checkpoints = checkpoints.then(writeCheckpoint); checkpoints.catch(() => {}); };
   try {
     await live();
     const other = observeSavOther({ mailboxId: config.mailboxId, fromEmail: lease.input.message.fromEmail,
@@ -60,24 +69,27 @@ async function analyseSavIntakeRuntimeWithinBudget(runId: string, config: Intake
     // This is a candidate only. It grants no routing permission or qualifiedOther.
     if (other) traces.push({ otherCandidate: other, qualified: false });
     let qualifiedOther: Awaited<ReturnType<typeof qualifyRuntimeOther>> = null;
-    if(other) {
+    if(other || env().SAV_INTAKE_OTHER_RULES_JSON) {
       try { qualifiedOther=await qualifyRuntimeOther(lease,live,env(),deps.authenticateOther); }
       catch { traces.push({otherQualification:"unavailable",qualified:false}); await live(); }
     }
     if(qualifiedOther) payload.other=qualifiedOther;
-    await checkpointSavIntakeRun(lease, payload);
+    await writeCheckpoint();
     dispatcher = createIntakeModelDispatcher({ config, live, reserve: hash => reserveSavIntakeCall(lease, config, hash), preflight: hashes => assertSavIntakeCallPlan(lease.run.messageId, config, hashes), signal: controller.signal, env, network });
     const { call, pending } = dispatcher;
-    const attachments = await prepareIntakeAttachments(lease, config.model, live, deps.downloadAttachments);
+    const attachments = lease.recoveringRead ? null : await prepareIntakeAttachments(lease, config.model, live, deps.downloadAttachments);
     if (attachments) {
       payload.attachments = attachments.state;
       if (attachments.complete) {
         lease.input = intakeInputWithAttachments(lease.input, lease.sourceHash, attachments.state, attachments.prepared);
         payload.input = lease.input;
       }
-      await checkpointSavIntakeRun(lease, payload);
+      await writeCheckpoint();
     }
-    const semanticReader = createSavIntakeSemanticReaders({ planCalls: dispatcher.plan, repairMalformedOutput, ...(attachments?.complete ? { attachments: { prepared: attachments.prepared, onRead: observations => {
+    const priorAnalysis=lease.recoveringRead?payload.semantics!.records.find(r=>r.method==="analyseMessage")?.result as MessageAnalysis|undefined:undefined;
+    const semanticReader = createSavIntakeSemanticReaders({ planCalls: dispatcher.plan, repairMalformedOutput,
+      repairIssues:publicIntakeSchemaIssues((previous.traces?.findLast(t=>(t as {validationFailure?:unknown})?.validationFailure) as {validationFailure?:{issues?:unknown}}|undefined)?.validationFailure?.issues),
+      ...(priorAnalysis?.attachmentObservations?{acceptedImages:priorAnalysis.attachmentObservations}:{}), ...(attachments?.complete ? { attachments: { prepared: attachments.prepared, onRead: observations => {
       attachments.state.read = { ...attachments.state.read, observations, state: "complete", completedAt: new Date().toISOString() };
       payload.attachments = attachments.state;
       checkpoint();
@@ -85,28 +97,39 @@ async function analyseSavIntakeRuntimeWithinBudget(runId: string, config: Intake
       semanticFailureReason = trace.errorCode ?? undefined;
       traces.push(trace); checkpoint();
     } });
-    const semantic=recordAcceptedIntakeSemantics(semanticReader,payload.semantics!,checkpoint, failure => {
+    const reuse=lease.recoveringRead?reuseAcceptedIntakeSemantics(semanticReader,payload.semantics!,method=>{traces.push({method,phase:"accepted_semantics",accepted:true,cached:true});checkpoint();}):semanticReader;
+    const semantic=recordAcceptedIntakeSemantics(reuse,payload.semantics!,checkpoint, failure => {
       semanticFailureReason = failure.errorCode;
       traces.push({ ...failure, phase: "accepted_semantics", accepted: false }); checkpoint();
     });
-    const crm = createSavIntakeHubspotReaders({ onRead: trace => { traces.push(trace); checkpoint(); }, network: async (url, init) => {
+    const crm = createSavIntakeHubspotReaders({ onRead: trace => { if(trace.status!=="complete")readFailure=trace;traces.push(trace); checkpoint(); }, network: async (url, init) => {
       await live();
       const signal = AbortSignal.any([controller.signal, ...(init?.signal ? [init.signal] : [])]);
       return network(url, { ...init, signal, redirect: "error", headers: { ...Object.fromEntries(new Headers(init?.headers)), Authorization: `Bearer ${env().HUBSPOT_ACCESS_TOKEN}` } });
     } });
-    payload.plan = await withSavAiBudget(() => planSavIntake(lease.input, { ...crm, ...semantic }, qualifiedOther ? {...config.policy,qualifiedOther:{resource:qualifiedOther.resource,evidenceSource:"private_rule"}} : config.policy, { timeoutMs: 10_000 }, () => new Date()));
+    const readPending:Promise<unknown>[]=[];
+    const reads=recoverableIntakeReads(crm,payload.readRecovery!,{reuse:Boolean(lease.recoveringRead),checkpoint,pending:readPending});
+    payload.plan = await withSavAiBudget(() => planSavIntake(lease.input, { ...reads, ...semantic }, qualifiedOther ? {...config.policy,qualifiedOther:{...(qualifiedOther.family==="authenticated_newsletter"?{family:"authenticated_newsletter" as const}:{}),resource:qualifiedOther.resource,evidenceSource:"private_rule"}} : config.policy, { timeoutMs: 10_000 }, () => new Date()));
     assertSavIntakeObservation(payload.plan);
     // Cancellation may finish after the pure planner's per-call timeout.
     let drainTimer: ReturnType<typeof setTimeout> | undefined;
-    try { await Promise.race([Promise.allSettled(pending), new Promise<never>((_, reject) => { drainTimer = setTimeout(() => reject(Error("SAV_INTAKE_RUNTIME_SETTLEMENT_UNCERTAIN")), 15_000); })]); }
+    try { await Promise.race([Promise.allSettled([...pending,...readPending]), new Promise<never>((_, reject) => { drainTimer = setTimeout(() => reject(Error("SAV_INTAKE_RUNTIME_SETTLEMENT_UNCERTAIN")), 15_000); })]); }
     finally { if (drainTimer) clearTimeout(drainTimer); }
     await checkpoints;
     if (dispatcher.uncertain) throw Error("SAV_INTAKE_RUNTIME_USAGE_UNCERTAIN");
     await live();
-    payload.reason = dispatcher.failureReason ?? semanticFailureReason;
+    payload.reason = readFailure?.reason ?? dispatcher.failureReason ?? semanticFailureReason;
     finishIntakeAttachmentRead(payload.attachments,attachmentFailureReason(payload.reason,dispatcher.uncertain));
     const state = payload.plan.decision.disposition.kind === "collect_context" && payload.plan.progress.kind !== "human_choice" ? "waiting" : "observed";
+    if (state==="waiting" && readFailure && intakeReadRetryable(readFailure.reason) && payload.semantics?.records.some(r=>r.method==="analyseMessage")) {
+      const recovery=payload.readRecovery!, limits=config.readRecovery??DEFAULT_INTAKE_READ_RECOVERY;
+      recovery.operation=readFailure.operation;recovery.code=readFailure.reason!;
+      recovery.retryAt=new Date(Date.now()+limits.delayMs*2**recovery.attempts).toISOString();
+      recovery.state=recovery.attempts<limits.maxAttempts&&Date.parse(recovery.retryAt)<Date.parse(recovery.expiresAt)?"scheduled":"exhausted";
+    } else if(lease.recoveringRead) {payload.readRecovery!.state=state==="waiting"?"invalidated":"complete";payload.readRecovery!.cache=[];}
+    else delete payload.readRecovery;
     await saveSavIntakeResult(lease, config, payload, state);
+    if(payload.readRecovery?.state==="scheduled")await (await import("./read-recovery-wake")).requestReadRecoveryWake(runId,{env:env(),start:deps.startReadRecovery});
     const retryFormat = state === "waiting" && lease.run.attempts === 1 && attachments?.complete
       && attachments.prepared.uniqueImages.length > 0 && payload.reason === "SAV_INTAKE_MODEL_OUTPUT_REJECTED";
     return { runId, state, ...(retryFormat ? { retryFormat: true as const } : {}) };
@@ -115,6 +138,7 @@ async function analyseSavIntakeRuntimeWithinBudget(runId: string, config: Intake
     // An expired routing authority must never leave a publishable Other plan.
     if(payload.other&&!intakeOtherQualificationFresh(payload.other,env().SAV_INTAKE_OTHER_RULES_JSON)){delete payload.plan;delete payload.other;}
     payload.reason = error instanceof Error && /^SAV_[A-Z0-9_]+$/.test(error.message) ? error.message : "SAV_INTAKE_RUNTIME_INTERRUPTED";
+    if(lease.recoveringRead)payload.readRecovery!.state="invalidated";else delete payload.readRecovery;
     finishIntakeAttachmentRead(payload.attachments,attachmentFailureReason(payload.reason,Boolean(dispatcher?.uncertain)));
     await failSavIntakeRun(lease, payload, Boolean(dispatcher?.uncertain) || payload.reason === "SAV_INTAKE_RUNTIME_SETTLEMENT_UNCERTAIN");
     return { runId, state: dispatcher?.uncertain ? "uncertain" : "waiting", reason: payload.reason };
@@ -134,6 +158,8 @@ export async function analyseSavIntakeRuntime(...args: Parameters<typeof analyse
  * It runs alongside V0 observation and never acquires action/send capabilities. */
 export async function reconcileSavIntakeRuntime(options: { deadlineMs?: number } = {}) {
   const config = savIntakeRuntimeConfig(); if (!config) return { skipped: "off" as const };
+  await (await import("./read-recovery-store")).expireIntakeReadRecoveries(config);
+  await (await import("./read-recovery-wake")).dispatchPendingReadRecoveryWakes({env:process.env});
   if (options.deadlineMs && options.deadlineMs - Date.now() < 65_000) return { skipped: "deadline" as const };
   await reconcileConfinedIntakeUsage(config);
   // Before catch-up, so a customer reply on a legacy-paused thread is analysed in this pass.
@@ -149,6 +175,7 @@ export async function reconcileSavIntakeRuntime(options: { deadlineMs?: number }
 
 function attachmentFailureReason(reason:string|undefined,uncertain:boolean):import("../attachment-contract").SavAttachmentObservation["reason"] {
   if(uncertain)return "outcome_uncertain";
+  if(reason==="SAV_INTAKE_MODEL_OUTPUT_REJECTED")return "validation_failed";
   if(reason?.includes("BUDGET"))return "budget_exhausted";
   if(reason?.includes("TIMEOUT"))return "timeout";
   if(reason?.includes("CONTEXT")||reason?.includes("REVALIDATION"))return "context_changed";

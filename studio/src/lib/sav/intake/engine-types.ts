@@ -34,6 +34,7 @@ export type IntakeHistory = z.infer<typeof intakeHistorySchema>;
 export type ReadResult<T> = { status: "complete" | "partial" | "failed"; data: T; observedAt: string; reconstructedAsOf?: string };
 export const messageAnalysisSchema = z.object({
   messageId: z.uuid(),
+  nature: z.enum(["request", "newsletter", "information", "indeterminate"]).optional(),
   requests: z.array(z.object({
     id: ref, kind: z.enum(["support", "finance", "cancellation", "partnership", "commercial", "investor", "other", "acknowledgement", "unknown"]),
     // All intentions must be supported by the CURRENT authored message.
@@ -41,6 +42,8 @@ export const messageAnalysisSchema = z.object({
     originMessageId: z.uuid().optional(),
   }).strict()).max(15),
   attachmentObservations: z.array(savAttachmentObservationSchema).max(3).optional(),
+  imageRequirements: z.array(z.object({ sourceId: ref, fileHash: z.string().regex(/^[a-f0-9]{64}$/),
+    role: z.enum(["accessory", "required", "unknown"]), textQuote: z.string().min(1).max(2000).optional() }).strict()).max(3).optional(),
   registration: z.object({ address: z.email(), sourceMessageId: z.uuid(), quote: z.string().min(1).max(2000) }).strict().optional(),
   ticketSummary: z.object({ title: z.string().trim().min(1).max(120), description: z.string().trim().min(1).max(100_000), requestIds: z.array(ref).min(1).max(15) }).strict().optional(),
 }).strict();
@@ -69,7 +72,7 @@ export type EnginePolicy = {
     partnership?: PrivateResource; commercial?: PrivateResource; investor?: PrivateResource;
   };
   // Server-qualified rules and operator overrides are inputs, never inferred from a brand keyword.
-  qualifiedOther?: { resource: PrivateResource; evidenceSource: "private_rule" | "human_override" };
+  qualifiedOther?: { family?: "authenticated_newsletter"; resource: PrivateResource; evidenceSource: "private_rule" | "human_override" };
   manualSupportOverride?: PrivateResource;
 };
 export type IntakeAdapters = {

@@ -7,6 +7,7 @@ import { savEvidenceContains } from "../evidence-text";
 export type IntakeEvidenceFailure = {
   reason: "unknown_anchor" | "wrong_anchor_source" | "ambiguous_quote_format" | "unknown_source" | "excerpt_not_in_source" | "required_source_missing" | "message_id_mismatch" | "registration_source_invalid" | "output_schema_invalid";
   path: string;
+  issues?: import("./schema-diagnostics").IntakeSchemaIssue[];
   excerptHash?: string;
   excerptLength?: number;
 };
