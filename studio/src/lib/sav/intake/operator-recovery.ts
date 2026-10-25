@@ -8,7 +8,7 @@ import {canAccessSav} from "../access";
 import {decryptSavPayload,encryptSavPayload} from "../crypto";
 import {executionAdministrator} from "./execution-policy";
 import {admissionLock,finishVerifiedIdentityRecovery} from "./execution-store";
-import {intakeHumanRefused,intakeRunConfigurationBound,intakeRunCandidateContactIds,operatorRecoveryConfigHash,type HumanEventPayload} from "./human-binding";
+import {intakeHumanRefused,intakeRunReanalysisConfiguration,intakeRunCandidateContactIds,operatorRecoveryConfigHash,type HumanEventPayload} from "./human-binding";
 import {intakeLaunchMatches} from "./launch-boundary";
 import {savIntakeSourceSnapshot,intakeSourceMatches} from "./runtime-store";
 import {savIntakeRuntimeConfig,intakeRuntimeHash,SAV_INTAKE_RUNTIME_REVISION,type IntakeRuntimePayload} from "./runtime-contract";
@@ -20,7 +20,7 @@ const request=z.object({threadId:z.uuid(),messageId:z.uuid(),reason:z.string().t
 type RecoveryTx=Parameters<typeof admissionLock>[0];
 type RecoverySnapshot=Awaited<ReturnType<typeof savIntakeSourceSnapshot>>;
 const conflict=():never=>{throw Error("SAV_INTAKE_RECOVERY_CONFLICT");};
-/** Explicit administrator continuation, once per message. It neither resets
+/** Explicit administrator continuation, once per message/context/configuration revision. It neither resets
  * automatic attempts nor admits more than the existing three model calls.
  * No credential, model or external write is used while recording the request. */
 export async function requestIntakeReinvestigation(raw:unknown){
@@ -45,12 +45,12 @@ export async function recordIntakeReinvestigation(tx:RecoveryTx,actor:Awaited<Re
   const bodies=events.map(e=>decryptSavPayload<HumanEventPayload>(e.payloadCiphertext));
   const previous=runs.find(r=>r.isCurrent);
   const priorSnapshot=beforeInformation??await savIntakeSourceSnapshot(tx,message,new Date());
-  if(previous?.sourceHash&&(!intakeSourceMatches(priorSnapshot,previous.sourceHash)||!await intakeRunConfigurationBound(previous,config,tx)))return conflict();
+  if(previous?.sourceHash&&(!intakeSourceMatches(priorSnapshot,previous.sourceHash)||!await intakeRunReanalysisConfiguration(previous,config,tx)))return conflict();
   const informationId=(await savIntakeSourceSnapshot(tx,message,new Date())).input.message.operatorInformation?.id??null;
   for(let i=0;i<events.length;i++)if(bodies[i].reinvestigate){
    const parent=runs.find(r=>r.id===events[i].parentRunId);
    const input=parent?decryptSavPayload<IntakeRuntimePayload>(parent.payloadCiphertext).input as {message?:{operatorInformation?:{id:string}}}|undefined:undefined;
-   if((input?.message?.operatorInformation?.id??null)===informationId)return conflict();
+   if((input?.message?.operatorInformation?.id??null)===informationId&&events[i].baseConfigHash===config.configHash)return conflict();
   }
   const [execution]=await tx.select().from(savIntakeExecutions).where(eq(savIntakeExecutions.messageId,message.id)).for("update");
   if(execution?.state==="confirmed"||execution?.leaseUntil&&execution.leaseUntil>new Date())return conflict();

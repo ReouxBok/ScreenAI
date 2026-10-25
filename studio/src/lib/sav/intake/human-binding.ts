@@ -108,6 +108,21 @@ export async function intakeRunCandidateContactIds(run:typeof savIntakeRuns.$inf
   return [...value.candidateContactIds].sort();
 }
 
+/** Historical configuration is evidence provenance only. It cannot claim a
+ * worker, reuse accepted semantics or grant an old plan current authority. */
+function reanalysisEvidenceConfiguration(payload:import("./runtime-contract").IntakeRuntimePayload,config:IntakeRuntimeConfig){
+ const old=payload.configuration;
+ if(!old||old.policyHash!==config.policyHash||old.resourcesHash!==config.resourcesHash||old.model!==config.model
+   ||!/^[a-f0-9]{64}$/.test(old.configHash)||!/^[a-f0-9]{40}$/.test(old.codeRevision))return null;
+ return {...config,configHash:old.configHash,codeRevision:old.codeRevision};
+}
+export async function intakeRunReanalysisConfiguration(run:typeof savIntakeRuns.$inferSelect,config:IntakeRuntimeConfig,
+ db:Pick<ReturnType<typeof requireDb>,"select">=requireDb()){
+ if(run.policyHash!==config.policyHash)return null;
+ const historical=reanalysisEvidenceConfiguration(decryptSavPayload(run.payloadCiphertext),config);
+ return historical&&await intakeRunConfigurationBound(run,historical,db)?historical:null;
+}
+
 /** A server-created bridge is immutable in the new parent payload. It keeps
  * an old choice chain applicable only across an operator-context revision of
  * the same exchanged message; the recording transaction checks raw sources. */
@@ -118,9 +133,11 @@ export async function intakeReanalysisParent(run:typeof savIntakeRuns.$inferSele
  if(!parent||parent.version>=run.version||parent.threadId!==run.threadId||parent.messageId!==run.messageId||parent.sourceHash!==bridge.sourceHash
    ||intakeRuntimeHash(decryptSavPayload(parent.payloadCiphertext))!==bridge.payloadHash||parent.policyHash!==config.policyHash)throw Error("SAV_INTAKE_HUMAN_REVALIDATION_REQUIRED");
  const original=decryptSavPayload<import("./runtime-contract").IntakeRuntimePayload>(parent.payloadCiphertext);
- if(parent.configHash===config.configHash&&!parent.humanChoiceCiphertext){
-  if(original.configuration?.configHash!==config.configHash||original.configuration.resourcesHash!==config.resourcesHash
-    ||original.configuration.policyHash!==config.policyHash||original.configuration.codeRevision!==config.codeRevision)throw Error("SAV_INTAKE_HUMAN_REVALIDATION_REQUIRED");
- }else if(!await intakeRunConfigurationBound(parent,config,db))throw Error("SAV_INTAKE_HUMAN_REVALIDATION_REQUIRED");
+ const historical=reanalysisEvidenceConfiguration(original,config);
+ if(!historical)throw Error("SAV_INTAKE_HUMAN_REVALIDATION_REQUIRED");
+ if(parent.configHash===historical.configHash&&!parent.humanChoiceCiphertext){
+  // The recording transaction validated this base before the new event existed.
+  // Its immutable bridge cannot make the old run current or executable again.
+ }else if(!await intakeRunConfigurationBound(parent,historical,db))throw Error("SAV_INTAKE_HUMAN_REVALIDATION_REQUIRED");
  return parent;
 }

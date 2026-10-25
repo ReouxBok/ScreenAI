@@ -29,7 +29,7 @@ import type { ExecutionPayload, EffectAck } from "./execution-types";
 async function mergedHumanResolution(event:typeof savIntakeHumanEvents.$inferSelect,parent:typeof savIntakeRuns.$inferSelect,value:HumanEventPayload,config:IntakeRuntimeConfig) {
   const resolution:NonNullable<EngineInput["humanResolution"]>={choiceId:event.id,at:event.createdAt.toISOString(),equivalentContactIds:value.candidateContactIds,inheritedChoiceIds:[],fieldSources:{}};
   if(value.reinvestigate) resolution.suppressOutbound=true;
-  let expectedSourceHash=event.sourceHash;
+  let expectedSourceHash=event.sourceHash,expectedBaseConfigHash=config.configHash;
   const apply=(source:typeof event,body:HumanEventPayload)=>{
     if(body.reinvestigate)resolution.suppressOutbound=true;
     if(body.policyHash!==config.policyHash||body.resourcesHash!==config.resourcesHash||source.sourceHash!==expectedSourceHash) return conflict();
@@ -53,11 +53,11 @@ async function mergedHumanResolution(event:typeof savIntakeHumanEvents.$inferSel
       const payload=decryptSavPayload<IntakeRuntimePayload>(run.payloadCiphertext);
       const ancestor=await intakeReanalysisParent(run,payload,config);
       if(!ancestor)break;
-      expectedSourceHash=ancestor.sourceHash!;run=ancestor;continue;
+      expectedSourceHash=ancestor.sourceHash!;expectedBaseConfigHash=decryptSavPayload<IntakeRuntimePayload>(ancestor.payloadCiphertext).configuration!.configHash;run=ancestor;continue;
     }
     const choice=decryptSavPayload<{eventId:string}>(run.humanChoiceCiphertext);
     const [ancestor]=await requireDb().select().from(savIntakeHumanEvents).where(eq(savIntakeHumanEvents.id,choice.eventId));
-    if(!ancestor||ancestor.state!=="consumed"||ancestor.kind==="refuse"||ancestor.revisionRunId!==run.id||ancestor.baseConfigHash!==config.configHash||ancestor.messageId!==event.messageId||ancestor.threadId!==event.threadId)return conflict();
+    if(!ancestor||ancestor.state!=="consumed"||ancestor.kind==="refuse"||ancestor.revisionRunId!==run.id||ancestor.baseConfigHash!==expectedBaseConfigHash||ancestor.messageId!==event.messageId||ancestor.threadId!==event.threadId)return conflict();
     const body=decryptSavPayload<HumanEventPayload>(ancestor.payloadCiphertext);
     apply(ancestor,body);resolution.inheritedChoiceIds!.push(ancestor.id);
     const [previous]=await requireDb().select().from(savIntakeRuns).where(eq(savIntakeRuns.id,ancestor.parentRunId));

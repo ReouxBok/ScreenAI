@@ -5,9 +5,11 @@ import { auditLogs, staffUsers, savThreads, savMessages, savIntakeRuns, savIntak
 import { encryptSavPayload, decryptSavPayload } from "../crypto";
 import { canAccessSav } from "../access";
 import { readSavExternalCompletion } from "../external-completion";
+import { intakeExecutionConfigurationBound } from "../intake/execution-continuity";
+import type { ExecutionPayload } from "../intake/execution-types";
 import { executionAdministrator } from "../intake/execution-policy";
 import { admissionLock } from "../intake/execution-store";
-import { intakeHumanRefused, intakeRunConfigurationBound } from "../intake/human-binding";
+import { intakeHumanRefused, intakeRunConfigurationBound, intakeRunReanalysisConfiguration } from "../intake/human-binding";
 import { savIntakeRuntimeConfig, intakeRuntimeHash, type IntakeRuntimePayload, type IntakeRuntimeConfig } from "../intake/runtime-contract";
 import { savIntakeSourceSnapshot, intakeSourceMatches } from "../intake/runtime-store";
 import { readRecoveryDue } from "../intake/read-recovery";
@@ -28,7 +30,7 @@ export const operatorBody = (row: typeof auditLogs.$inferSelect): Body => {
   return body;
 };
 /** Shared recording/worker guard: the client never selects a CRM operation. */
-export async function guardOperatorCommand(tx: Tx, command: OperatorCommand, actorId: string, config: IntakeRuntimeConfig, now = new Date()) {
+async function readOperatorCommandFacts(tx: Tx, command: OperatorCommand, actorId: string, config: IntakeRuntimeConfig, now = new Date()) {
   const [actor] = await tx.select().from(staffUsers).where(eq(staffUsers.id, actorId)).for("update");
   const [thread] = await tx.select().from(savThreads).where(eq(savThreads.id, command.threadId)).for("update");
   const [run] = await tx.select().from(savIntakeRuns).where(eq(savIntakeRuns.id, command.runId)).for("update");
@@ -39,7 +41,7 @@ export async function guardOperatorCommand(tx: Tx, command: OperatorCommand, act
     || message?.id !== command.messageId || run.messageId !== message.id || run.version !== command.version || run.sourceHash !== command.sourceHash
     || message.receivedAt <= new Date(config.receivedAfter) || message.createdAt <= new Date(config.createdAfter)
     || run.leaseUntil && run.leaseUntil > now || await intakeHumanRefused(message.id, tx) || await readSavExternalCompletion(message, tx)
-    || !await intakeRunConfigurationBound(run, config, tx)) return conflict();
+   ) return conflict();
   const snapshot = await savIntakeSourceSnapshot(tx, message, now);
   if (!intakeSourceMatches(snapshot, run.sourceHash)) return conflict();
   const pending = await tx.select({ id: savIntakeHumanEvents.id }).from(savIntakeHumanEvents).where(and(eq(savIntakeHumanEvents.messageId, message.id), sql`${savIntakeHumanEvents.state} in ('pending','reading')`)).limit(1);
@@ -47,7 +49,16 @@ export async function guardOperatorCommand(tx: Tx, command: OperatorCommand, act
   const [execution] = await tx.select().from(savIntakeExecutions).where(eq(savIntakeExecutions.messageId, message.id)).for("update");
   if (pending.length || calls.some(c=>c.state!=="settled") || execution?.leaseUntil && execution.leaseUntil > now || execution && ["confirmed", "refused"].includes(execution.state)) return conflict();
   const effects = execution ? await tx.select().from(savIntakeEffects).where(eq(savIntakeEffects.executionId, execution.id)).for("update") : [];
-  return { actor, run, message, snapshot, execution, effects, callCount:calls.length, payload: decryptSavPayload<IntakeRuntimePayload>(run.payloadCiphertext) };
+  const exact=await intakeRunConfigurationBound(run,config,tx);
+  const resumeBound=exact||Boolean(execution&&execution.runId===run.id&&execution.runVersion===run.version
+    &&await intakeExecutionConfigurationBound(execution,decryptSavPayload<ExecutionPayload>(execution.payloadCiphertext),config,tx));
+  const reanalysisCompatible=Boolean(await intakeRunReanalysisConfiguration(run,config,tx));
+  return { actor, run, message, snapshot, execution, effects, callCount:calls.length, resumeBound,reanalysisCompatible,payload: decryptSavPayload<IntakeRuntimePayload>(run.payloadCiphertext) };
+}
+export async function guardOperatorCommand(tx:Tx,command:OperatorCommand,actorId:string,config:IntakeRuntimeConfig,now=new Date()){
+  const facts=await readOperatorCommandFacts(tx,command,actorId,config,now);
+  if(command.kind==="resume"?!facts.resumeBound:!facts.reanalysisCompatible)return conflict();
+  return facts;
 }
 export async function operatorResumeStep(guard: Awaited<ReturnType<typeof guardOperatorCommand>>, config: IntakeRuntimeConfig, now = new Date(), db: Pick<ReturnType<typeof requireDb>, "select"> = requireDb()): Promise<{ step: OperatorStep; nextAt?: string }> {
   const { run, execution, effects, payload } = guard;
@@ -150,9 +161,9 @@ export async function readOperatorPanel(binding: Pick<OperatorCommand, "threadId
     await requireDb().transaction(async tx => {
       await admissionLock(tx);
       const command: OperatorCommand = { ...binding, requestKey: binding.runId, kind: "resume", reason: "Lecture des possibilités de reprise." };
-      const guard = await guardOperatorCommand(tx, command, actor.id, config);
+      const guard = await readOperatorCommandFacts(tx, command, actor.id, config);
       modelCallsExhausted=guard.callCount>=3;
-      allowInformation = guard.callCount<3&&!guard.effects.some(e => e.state !== "planned" || e.dispatchedAt || e.dispatchToken || e.ackCiphertext || e.verificationCiphertext || e.confirmedAt);
+      allowInformation = guard.reanalysisCompatible&&guard.callCount<3&&!guard.effects.some(e => e.state !== "planned" || e.dispatchedAt || e.dispatchToken || e.ackCiphertext || e.verificationCiphertext || e.confirmedAt);
       allowReanalysis = allowInformation;
       const events = await tx.select().from(savIntakeHumanEvents).where(eq(savIntakeHumanEvents.messageId, binding.messageId));
       for (const event of events) {
@@ -160,9 +171,9 @@ export async function readOperatorPanel(binding: Pick<OperatorCommand, "threadId
         if (!body.reinvestigate) continue;
         const [parent] = await tx.select().from(savIntakeRuns).where(eq(savIntakeRuns.id, event.parentRunId));
         const input = parent ? decryptSavPayload<IntakeRuntimePayload>(parent.payloadCiphertext).input as { message?: { operatorInformation?: { id: string } } } | undefined : undefined;
-        if ((input?.message?.operatorInformation?.id ?? null) === (information?.id ?? null)) allowReanalysis = false;
+        if ((input?.message?.operatorInformation?.id ?? null) === (information?.id ?? null)&&event.baseConfigHash===config.configHash) allowReanalysis = false;
       }
-      try { resume = await operatorResumeStep(guard, config, new Date(), tx); allowResume = true; } catch { /* Unavailable is explicit. */ }
+      try { if(!guard.resumeBound)throw Error();resume = await operatorResumeStep(guard, config, new Date(), tx); allowResume = true; } catch { /* Unavailable is explicit. */ }
     });
   } catch { /* No permission or eligibility is inferred from a display. */ }
   return { information, requests, allowResume, allowInformation, allowReanalysis, resume, unavailableReason:modelCallsExhausted?"Les trois appels autorisés pour ce message ont déjà été utilisés. Aucune nouvelle analyse ne peut être lancée ; les reprises sans IA restent évaluées séparément.":unavailableReason };

@@ -118,3 +118,9 @@ it("submits and preserves the actual server sort with search, view and page",asy
  expect(mocks.list).toHaveBeenCalledWith({view:"to_validate",mailboxId:undefined,search:"connexion",page:2,sort:"oldest"});
  expect(html).toContain('name="sort"');expect(html).toContain('value="oldest" selected=""');expect(html).toContain('sort=oldest');
 });
+
+it("a zero-check receipt explains the occupied verifier without claiming a successful check",async()=>{
+ const command={requestKey:"10000000-0000-4000-8000-000000000041",threadId,messageId,runId,version:7,sourceHash:"a".repeat(64),kind:"resume",reason:"Verify this synthetic existing receipt."};
+ mocks.operator.mockResolvedValue({information:null,allowResume:false,allowReanalysis:false,allowInformation:false,unavailableReason:"Protected state",resume:null,requests:{resume:{command,receipt:{id:command.requestKey,step:"verify_only",state:"finished",outcome:"waiting",checked:0,reason:"SAV_INTAKE_OPERATOR_VERIFICATION_BUSY",at:at.toISOString()}}}});
+ const html=await renderDetail();expect(html).toContain("Un autre traitement occupe la vérification");expect(html).toContain("Aucun contrôle n’a été effectué");expect(html).not.toContain("Vérification effectuée");expect(html).not.toContain("SAV_INTAKE_OPERATOR_VERIFICATION_BUSY");
+});

@@ -8,12 +8,13 @@ const fixture = vi.hoisted(() => ({ db: null as unknown, user: null as unknown }
 vi.mock("@/db", () => ({ requireDb: () => fixture.db }));
 vi.mock("@clerk/nextjs/server", () => ({ currentUser: async () => fixture.user }));
 import { encryptSavPayload, decryptSavPayload } from "../crypto";
-import { savIntakeRuntimeConfig, intakeRuntimeHash, SAV_INTAKE_RUNTIME_REVISION, type IntakeRuntimePayload } from "../intake/runtime-contract";
+import { savIntakeRuntimeConfig, intakeRuntimeConfigurationHash, intakeRuntimeHash, SAV_INTAKE_RUNTIME_REVISION, type IntakeRuntimePayload } from "../intake/runtime-contract";
 import { claimSavIntakeRun, enqueueSavIntakeMessage, saveSavIntakeResult, readSavIntakeCurrent, savIntakeSourceSnapshot, intakeSourceMatches } from "../intake/runtime-store";
 import { recordAcceptedIntakeSemantics, SAV_INTAKE_SEMANTIC_RECORD_REVISION, acceptedIntakeResult, type AcceptedIntakeSemantics } from "../intake/semantic-records";
 import { createSavIntakeSemanticReaders, SAV_INTAKE_MODEL_REVISION } from "../intake/model-readers";
 import { planSavIntake } from "../intake/engine";
 import { createSavIntakeHubspotReaders } from "../intake/hubspot-readers";
+import { previewIntakeExecutionContinuity,approveIntakeExecutionContinuity } from "../intake/execution-continuity";
 import { approveIntakeExecutionPolicy, intakeExecutionConfig, type ExecutionPolicy } from "../intake/execution-policy";
 import { createIntakeExecutorAdapters } from "../intake/execution-adapters";
 import { admitIntakeExecution, getExecutionEffects, claimEffectRecovery, releaseEffectRecovery } from "../intake/execution-store";
@@ -300,4 +301,80 @@ it("a competing canonical execution lease cannot become a false checked receipt"
     expect(result).toMatchObject({state:"waiting",checked:0,reason:"SAV_INTAKE_OPERATOR_VERIFICATION_BUSY"});
     expect(verify).not.toHaveBeenCalled();expect(await readOperatorReceipt(input)).toMatchObject({outcome:"waiting",checked:0});
   }finally{if(competing)await releaseEffectRecovery(competing);}
+});
+
+async function rotateRuntime(){
+ const oldPolicyId=options.config.policyId;
+ const pins={...JSON.parse(environment.SAV_INTAKE_RUNTIME_CONFIG!),codeRevision:"b".repeat(40)};
+ environment={...environment,SAV_CODE_REVISION:pins.codeRevision,SAV_INTAKE_RUNTIME_CONFIG:JSON.stringify(pins)};
+ const runtime=savIntakeRuntimeConfig(environment)!,policy={...options.policy,codeRevision:runtime.codeRevision};
+ const grant=await approveIntakeExecutionPolicy(policy);
+ environment={...environment,SAV_INTAKE_EXECUTION_POLICY_ID:grant.id,SAV_INTAKE_EXECUTION_POLICY_SHA256:grant.policyHash};stubs();
+ options={...options,runtime,policy,config:intakeExecutionConfig(environment)!};return oldPolicyId;
+}
+it.each(["reanalyse","information"] as const)("a deployment permits explicit %s of an uncommitted compatible old run, without reusing its semantics",async kind=>{
+ const old=await observed(),prior=(await db.db.select().from(savIntakeRuns).where(eq(savIntakeRuns.id,runId)))[0];await rotateRuntime();
+ const input=await command(kind),panel=await readOperatorPanel(input);
+ expect(panel.allowResume).toBe(false);expect(panel.allowReanalysis).toBe(true);expect(panel.allowInformation).toBe(true);
+ await expect(recordOperatorCommand({...input,kind:"resume",information:undefined,expectedInformationId:undefined})).rejects.toThrow();
+ const receipt=await recordOperatorCommand(input),data=fakeModel();
+ const [event]=await db.db.select().from(savIntakeHumanEvents).where(eq(savIntakeHumanEvents.commandKey,input.requestKey));
+ expect(await consumeIntakeHumanEvent(event.id,options.runtime,createSavIntakeHubspotReaders({network:p.network}))).toHaveProperty("state","observed");
+ const current=(await readSavIntakeCurrent(threadId,options.runtime))!;
+ expect(data.length).toBeGreaterThan(0);expect(current.payload.configuration?.configHash).toBe(options.runtime.configHash);
+ expect(current.payload.semantics).not.toEqual(old.semantics);expect((await db.db.select().from(savIntakeRuns).where(eq(savIntakeRuns.id,runId)))[0].payloadCiphertext).toBe(prior.payloadCiphertext);
+ expect(await readOperatorReceipt({...input,requestKey:receipt.id})).toMatchObject({state:"consumed"});
+ expect((await db.db.select().from(savIntakeRuns)).reduce((sum,r)=>sum+r.attempts,0)).toBe(1);
+});
+it("an old config's immutable human selection survives a fresh compatible deployment analysis",async()=>{
+ p.seedTicket({stage:"new",contactIds:["101","102"]});await observed(true);
+ const current=(await readSavIntakeCurrent(threadId,options.runtime))!;
+ const choice=await recordIntakeHumanCommand({commandKey:randomUUID(),threadId,messageId,runId:current.id,version:current.version,sourceHash:current.sourceHash!,candidatesHash:intakeRuntimeHash(["101","102"]),kind:"classify",classification:"finance",contactId:"102",ticketId:"201",reason:"Verified immutable operator selection before deployment."});
+ expect(await consumeIntakeHumanEvent(choice.eventId,options.runtime,createSavIntakeHubspotReaders({network:p.network}))).toHaveProperty("state");
+ const [recordedChoice]=await db.db.select().from(savIntakeHumanEvents).where(eq(savIntakeHumanEvents.id,choice.eventId));expect(recordedChoice.state).toBe("consumed");
+ expect(((await readSavIntakeCurrent(threadId,options.runtime))!.payload.input as {humanResolution:unknown}).humanResolution).toMatchObject({contactId:"102",ticketId:"201",classification:"finance"});
+ await rotateRuntime();const input=await command("information");await recordOperatorCommand(input);fakeModel();
+ const [event]=await db.db.select().from(savIntakeHumanEvents).where(eq(savIntakeHumanEvents.commandKey,input.requestKey));
+ expect(await consumeIntakeHumanEvent(event.id,options.runtime,createSavIntakeHubspotReaders({network:p.network}))).toHaveProperty("state","observed");
+ const result=(await readSavIntakeCurrent(threadId,options.runtime))!;
+ expect(result.payload.plan?.decision).toMatchObject({classification:"finance",disposition:{kind:"ticket",target:{contactId:"102",ticketId:"201"},learning:"excluded"}});
+ expect((result.payload.input as {humanResolution:unknown}).humanResolution).toMatchObject({inheritedChoiceIds:expect.arrayContaining([choice.eventId])});
+ expect(await intakeRunConfigurationBound(result,options.runtime)).toBe(true);
+});
+it("a changed business policy cannot acquire old human authority through reanalysis",async()=>{
+ await observed();await rotateRuntime();
+ const policy={...options.runtime.policy,relationRevision:"new-unapproved-business-relation"};
+ const pins={...JSON.parse(environment.SAV_INTAKE_RUNTIME_CONFIG!),policyHash:intakeRuntimeHash(policy)};
+ environment={...environment,SAV_INTAKE_RUNTIME_POLICY:JSON.stringify(policy),SAV_INTAKE_RUNTIME_CONFIG:JSON.stringify(pins)};stubs();options={...options,runtime:savIntakeRuntimeConfig(environment)!};
+ await expect(recordOperatorCommand(await command("reanalyse"))).rejects.toThrow();
+ expect(await rows()).toHaveLength(0);expect((await db.db.select().from(savIntakeRuns))[0].isCurrent).toBe(true);expect(fetch).not.toHaveBeenCalled();
+});
+it("a changed code cannot resume an old execution without its explicit canonical continuity grant",async()=>{
+ await observed();await admitIntakeExecution(runId,options);await rotateRuntime();
+ await expect(recordOperatorCommand(await command())).rejects.toThrow();expect(await rows()).toHaveLength(0);expect(fetch).not.toHaveBeenCalled();
+});
+it("the explicit PR176-v8 continuity witness can resume its unchanged execution without another admission or model call",async()=>{
+ const payload=await observed(),oldHash=intakeRuntimeConfigurationHash(JSON.parse(environment.SAV_INTAKE_RUNTIME_CONFIG!),environment,"sav-intake-semantic-2026-10-25.v8");
+ await db.db.update(savIntakeRuns).set({configHash:oldHash,payloadCiphertext:encryptSavPayload({...payload,configuration:{...payload.configuration!,configHash:oldHash}})}).where(eq(savIntakeRuns.id,runId));
+ options={...options,runtime:{...options.runtime,configHash:oldHash}};
+ const execution=(await admitIntakeExecution(runId,options))!;expect(execution).not.toBeNull();
+ const budget=await db.db.select().from(savIntakeExecutionBudget),oldPolicy=await rotateRuntime();
+ const preview=await previewIntakeExecutionContinuity(oldPolicy,options,[execution.id]);
+ await approveIntakeExecutionContinuity(oldPolicy,preview.hash,options,[execution.id]);
+ const input=await command(),receipt=await recordOperatorCommand(input);expect(receipt.step).toBe("execution");
+ expect(await consumeOperatorResume(receipt.id,{env:()=>environment,adapters:options.adapters})).toMatchObject({state:"confirmed"});
+ expect((await db.db.select().from(savIntakeExecutions)).map(e=>e.id)).toEqual([execution.id]);expect(await db.db.select().from(savIntakeExecutionBudget)).toEqual(budget);expect(fetch).not.toHaveBeenCalled();
+});
+
+it("a reviewed new configuration can requalify an already investigated old message without resetting prior attempts or calls",async()=>{
+ await observed();const first=await command("reanalyse");await recordOperatorCommand(first);fakeModel();
+ const [event]=await db.db.select().from(savIntakeHumanEvents).where(eq(savIntakeHumanEvents.commandKey,first.requestKey));
+ expect(await consumeIntakeHumanEvent(event.id,options.runtime,createSavIntakeHubspotReaders({network:p.network}))).toHaveProperty("state","observed");
+ const before=await db.db.select().from(savIntakeModelCalls);await rotateRuntime();
+ const input=await command("reanalyse");expect((await readOperatorPanel(input)).allowReanalysis).toBe(true);
+ await recordOperatorCommand(input);
+ const [next]=await db.db.select().from(savIntakeHumanEvents).where(eq(savIntakeHumanEvents.commandKey,input.requestKey));
+ expect(await consumeIntakeHumanEvent(next.id,options.runtime,createSavIntakeHubspotReaders({network:p.network}))).toHaveProperty("state","observed");
+ expect((await db.db.select().from(savIntakeModelCalls)).length).toBeGreaterThanOrEqual(before.length);expect((await db.db.select().from(savIntakeModelCalls)).length).toBeLessThanOrEqual(3);
+ expect((await db.db.select().from(savIntakeRuns)).reduce((sum,r)=>sum+r.attempts,0)).toBe(1);
 });

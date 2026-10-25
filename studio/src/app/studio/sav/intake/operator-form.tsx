@@ -10,6 +10,19 @@ const read = (key: string) => { try { return sessionStorage.getItem(key) ?? memo
 function subscribe(fn: () => void) { window.addEventListener(eventName, fn); return () => window.removeEventListener(eventName, fn); }
 type Draft = { requestKey: string; text: string; submission: OperatorFormState["status"]; expectedInformationId: string | null; binding:Binding };
 const labels: Record<OperatorStep, string> = { reads: "Reprendre les lectures manquantes", analysis: "Poursuivre l’analyse nécessaire", admission: "Vérifier l’admission du plan existant", execution: "Poursuivre l’exécution existante", verify_only: "Vérifier uniquement les résultats incertains", reanalysis: "Nouvelle analyse demandée" };
+function receiptReason(reason:string){
+ const labels:Record<string,string>={
+  off:"Le traitement automatique est désactivé.",execution_off:"L’exécution automatique est désactivée.",event_dispatch_off:"Le déclenchement de cette reprise est désactivé.",
+  SAV_INTAKE_EXECUTION_DISABLED:"Les écritures sont désactivées par la configuration existante.",
+  SAV_INTAKE_OPERATOR_VERIFICATION_BUSY:"Un autre traitement occupe la vérification. Aucun contrôle n’a été effectué par cette demande.",
+  SAV_INTAKE_EXECUTION_RECONCILIATION_REQUIRED:"Un résultat externe reste incertain ; il doit être vérifié avant toute poursuite.",
+  SAV_INTAKE_OPERATOR_REVALIDATION_REQUIRED:"La version, les sources ou l’autorisation ont changé ; une nouvelle vérification du dossier est nécessaire.",
+  SAV_INTAKE_RUNTIME_USAGE_UNCERTAIN:"La consommation d’un appel reste à confirmer ; aucun nouvel appel n’est autorisé.",
+  SAV_INTAKE_RUNTIME_BUDGET_EXHAUSTED:"Le budget existant ne permet pas de nouvel appel pour cette étape.",
+  SAV_INTAKE_OPERATOR_INTERRUPTED:"La reprise a été interrompue. Ses preuves et sa référence restent conservées.",
+ };
+ return labels[reason]??"Une preuve, une autorisation ou une étape reste à vérifier. Le dossier et la demande sont conservés.";
+}
 function receiptText(r: OperatorReceipt) {
   return r.consumedAt ? "Ces informations ont été lues par une étape d’analyse validée. Consultez sa décision et les effets séparément."
     : r.state === "consumed" ? "Nouvelle analyse enregistrée dans l’historique. Consultez la décision et les effets séparément."
@@ -71,7 +84,7 @@ function OperatorRequestForm({ binding, actorId, kind, requestKey, enabled, unav
     {pending && <p role="status">Enregistrement en cours…</p>}
     {state.message && draft.submission!=="idle" && !lookup.receipt && !serverReceipt && <p role={state.status === "recorded" ? "status" : "alert"}>{state.message}</p>}
     <p><small>Référence : {draft.requestKey}</small></p>
-    {receipt && <p role="status">{receiptText(receipt)}</p>}
+    {receipt && <><p role="status">{receiptText(receipt)}</p>{receipt.reason&&<p role="status">Motif : {receiptReason(receipt.reason)}</p>}<p>Suite : {["pending","queued","reading","running"].includes(receipt.state)?"le moteur existant reprendra après ses contrôles ; aucun horaire supplémentaire n’est promis.":"consulter la décision et les résultats ; les attentes restantes sont à examiner par un opérateur autorisé."}</p></>}
     {(recorded || unknown) && <button type="button" className="secondary" disabled={checking} onClick={inspect} aria-busy={checking}>Vérifier cette demande</button>}
     {lookup.text && <p role="status">{lookup.text}</p>}
     {enabled&&!pending&&!unknown&&(staleDraft&&!recorded||receipt&&["consumed","finished","waiting"].includes(receipt.state))&&<button type="button" className="secondary" onClick={()=>{persist({requestKey:crypto.randomUUID(),submission:"idle",binding,expectedInformationId:information?.id??null});setLookup({text:""});}}>Préparer une nouvelle demande sur la version actuelle</button>}
