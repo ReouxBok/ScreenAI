@@ -100,7 +100,7 @@ describe("source-bound citation producer; existing containment stays authoritati
     const model = createSavIntakeSemanticReaders({ model: "gemini-fixture", onTrace: t => traces.push(t),
       call: async arg => result({ ...request(arg), messageId: tid }) });
     await expect(model.analyseMessage({ message, conversation: [] }, signal())).rejects.toThrow("CITATION_REJECTED");
-    expect(traces[0].validationFailure).toEqual({ reason: "message_id_mismatch", path: "messageId" });
+    expect(traces[0].validationFailure).toEqual({ reason: "message_id_mismatch", path: "messageId", stage: "evidence" });
   });
   it("keeps legacy literal validation and rejects paraphrases without echoing client text", async () => {
     const traces: IntakeModelTrace[] = [];

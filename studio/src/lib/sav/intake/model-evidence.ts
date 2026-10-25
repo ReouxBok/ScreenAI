@@ -5,7 +5,7 @@ import { savEvidenceContains } from "../evidence-text";
 /** No raw provider value or client text belongs in diagnostic messages. These
  * bounded facts travel only with the existing private evaluation trace. */
 export type IntakeEvidenceFailure = {
-  reason: "unknown_anchor" | "wrong_anchor_source" | "ambiguous_quote_format" | "unknown_source" | "excerpt_not_in_source" | "required_source_missing" | "message_id_mismatch" | "registration_source_invalid" | "output_schema_invalid";
+  reason: "unknown_anchor" | "wrong_anchor_source" | "ambiguous_quote_format" | "unknown_source" | "excerpt_not_in_source" | "required_source_missing" | "message_id_mismatch" | "registration_source_invalid" | "output_schema_invalid" | "visual_structure_invalid";
   path: string;
   issues?: import("./schema-diagnostics").IntakeSchemaIssue[];
   excerptHash?: string;
