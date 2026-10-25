@@ -25,6 +25,10 @@ uncertain effects still go through the executor's read-only verification.
    explicit selection** with `GET /api/internal/sav/intake/continuity`, query
    parameters `sourcePolicyId` and comma-separated `executionIds`. At most 100 IDs
    are allowed; use small batches to stay inside the 30-second route deadline.
+   The launch administration page `/studio/sav/intake/launch` also exposes this
+   exact preview/confirmation flow. Enter the source policy and explicit execution
+   IDs, inspect the returned source/target/hash/IDs, then attest the independently
+   verified producer fence and drain. The page does not establish that drain.
 6. Review the selection and exact returned `preview.hash`. Send a same-origin
    JSON `POST` to the same endpoint with `sourcePolicyId`, `executionIds`,
    `expectedHash`, and `oldDeploymentFencedAndDrained: true`. The last field is an
@@ -32,6 +36,9 @@ uncertain effects still go through the executor's read-only verification.
 7. Save the returned receipt ID and execution IDs. If the HTTP outcome is unknown,
    inspect the execution policy IDs and encrypted audit receipt before retrying.
    The endpoint is not an idempotent dispatch API; a repeated approval is refused.
+   The panel sends at most one POST per mounted instance and locks after that
+   attempt. A 409 can wrap a database error after an unknown commit outcome; it
+   therefore also requires receipt inspection, rather than an automatic retry.
 8. Allow the existing current-policy executor to resume. The cron executor can
    select transferred executions; the wake catch-up still selects observations
    using their original configuration hash, so immediate resumption is not
