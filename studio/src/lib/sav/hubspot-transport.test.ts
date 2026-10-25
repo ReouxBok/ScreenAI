@@ -117,3 +117,9 @@ it.each([true,false])("distinguishes planner deadline from explicit cancellation
  const assertion=expect(promise).rejects.toMatchObject({diagnostic:{origin:deadline?"deadline":"transport",attempts:1,status:0,code:deadline?"SAV_HUBSPOT_READ_TIMEOUT":"SAV_HUBSPOT_READ_CANCELLED"}});
  await vi.advanceTimersByTimeAsync(10000);controller.abort(Error(deadline?"SAV_INTAKE_STEP_DEADLINE":"synthetic cancel"));await assertion;expect(network).toHaveBeenCalledTimes(1);expect(vi.getTimerCount()).toBe(0);
 });
+
+it.each([403,429])("preserves sanitized HTTP suffixes needed by legacy rejection handling (%s)",async status=>{
+ const network=vi.fn(async()=>Response.json({category:"SYNTHETIC_REJECTION"},{status}));
+ let error:unknown;try{await createSavHubspotTransport(network)("/crm/v3/objects/notes",{method:"POST"},s=>`HUBSPOT_HTTP_${s}:SYNTHETIC_REJECTION`);}catch(e){error=e;}
+ expect(error).toMatchObject({message:`HUBSPOT_HTTP_${status}:SYNTHETIC_REJECTION`,diagnostic:{code:`HUBSPOT_HTTP_${status}`,origin:"http",attempts:1,status}});expect(network).toHaveBeenCalledTimes(1);
+});

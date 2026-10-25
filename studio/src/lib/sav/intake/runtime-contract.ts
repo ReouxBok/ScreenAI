@@ -30,7 +30,7 @@ export function intakeRuntimeConfigurationHash(p: z.infer<typeof savIntakeRuntim
   return intakeRuntimeHash({ ...p, revision: SAV_INTAKE_RUNTIME_REVISION, prompts, readers: SAV_INTAKE_READERS_REVISION, context: SAV_MESSAGE_CONTEXT_REVISION,
     otherRulesHash: intakeRuntimeHash(env.SAV_OTHER_OBSERVATION_RULES_JSON ?? null),
     otherRoutingHash: intakeRuntimeHash(env.SAV_INTAKE_OTHER_RULES_JSON ?? null),
-    crmAcknowledgementsHash: intakeRuntimeHash(env.SAV_INTAKE_CRM_ACK_TEMPLATES_JSON ?? null),
+    ...(env.SAV_INTAKE_CRM_ACK_TEMPLATES_JSON ? {crmAcknowledgementsHash:intakeRuntimeHash(env.SAV_INTAKE_CRM_ACK_TEMPLATES_JSON)} : {}),
     accessBinding: intakeRuntimeHash({ model: env.SAV_GEMINI_API_KEY, crm: env.HUBSPOT_ACCESS_TOKEN }) });
 }
 /** No permissive defaults, campaign resets or hidden reuse of another budget. */

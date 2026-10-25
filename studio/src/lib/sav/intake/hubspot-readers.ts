@@ -77,7 +77,7 @@ export function createSavIntakeHubspotReaders(options: {
       return { status: "complete", data, observedAt };
     } catch (error) {
       const status = error instanceof ReadFault ? error.status : "failed";
-      const reason = error instanceof ReadFault ? error.code : error instanceof SavCrmReadError ? error.message : error instanceof Error && /^HUBSPOT_HTTP_\d{3}$/.test(error.message) ? error.message : "read_unavailable";
+      const reason = error instanceof ReadFault ? error.code : error instanceof SavCrmReadError ? error.diagnostic.code : error instanceof Error && /^HUBSPOT_HTTP_\d{3}$/.test(error.message) ? error.message : "read_unavailable";
       options.onRead?.({ operation, status, reason, observedAt, requests: requests - before, ...(error instanceof SavCrmReadError ? { transport: error.diagnostic } : {}) });
       // An incomplete response never becomes an empty successful search.
       return { status, data: empty, observedAt };
