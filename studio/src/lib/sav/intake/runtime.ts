@@ -161,6 +161,8 @@ export async function reconcileSavIntakeRuntime(options: { deadlineMs?: number }
   await (await import("./read-recovery-store")).expireIntakeReadRecoveries(config);
   await (await import("./read-recovery-wake")).dispatchPendingReadRecoveryWakes({env:process.env});
   if (options.deadlineMs && options.deadlineMs - Date.now() < 65_000) return { skipped: "deadline" as const };
+  const operatorResume = await (await import("./operator-resume")).reconcileOperatorResumes();
+  if (operatorResume) return { mode: "observe", operatorResume };
   await reconcileConfinedIntakeUsage(config);
   // Before catch-up, so a customer reply on a legacy-paused thread is analysed in this pass.
   const legacyPauses = await releaseLegacyAiPauses(config);

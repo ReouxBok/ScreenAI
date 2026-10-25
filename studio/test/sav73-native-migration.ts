@@ -22,8 +22,8 @@ try {
   const journal=JSON.parse(await readFile(new URL("meta/_journal.json",directory),"utf8"));
   for(let i=1;i<journal.entries.length;i++)assert.ok(journal.entries[i].when>journal.entries[i-1].when,"Migration timestamps must increase");
   const tags=journal.entries.map((entry:{tag:string})=>entry.tag);
-  for(const required of ["0037_sav_case_learning","0039_sav_dashboard_projection","0040_sav_intake_runtime","0041_sav_intake_execution","0042_sav_intake_console","0043_sav_intake_launch_guards"])assert.ok(tags.includes(required),`Missing migration ${required}`);
-  assert.equal(journal.entries.at(-1).tag,"0043_sav_intake_launch_guards");
+  for(const required of ["0037_sav_case_learning","0039_sav_dashboard_projection","0040_sav_intake_runtime","0041_sav_intake_execution","0042_sav_intake_console","0043_sav_intake_launch_guards","0044_sav_operator_command_indexes"])assert.ok(tags.includes(required),`Missing migration ${required}`);
+  assert.equal(journal.entries.at(-1).tag,"0044_sav_operator_command_indexes");
   assert.ok(tags.indexOf("0037_sav_case_learning")<tags.indexOf("0039_sav_dashboard_projection"));
   const entries=journal.entries.filter((entry:{tag:string})=>entry.tag<"0039_sav_dashboard_projection");
   await mkdir(path.join(folder,"meta"));
@@ -49,6 +49,8 @@ try {
   assert.equal(journalCount.migrations,journal.entries.length,"Every journal migration must be recorded exactly once");
   const [intake]=await client`select (select count(*)::int from sav.intake_console) as projections,(select count(*)::int from sav.intake_runs) as runs,(select count(*)::int from sav.intake_effects) as effects,(select admitted from sav.intake_execution_budget where id='global') as admitted`;
   assert.deepEqual({...intake},{projections:0,runs:0,effects:0,admitted:0},"Migrating V0 data must not admit or execute an intake");
+  const [operatorIndexes]=await client`select count(*)::int as indexes from pg_indexes where schemaname='public' and indexname in ('sav_operator_message_idx','sav_operator_pending_idx')`;
+  assert.equal(operatorIndexes.indexes,2,"Both operator journal indexes must be present");
   const [triggers]=await client`select count(*)::int as triggers from pg_trigger where not tgisinternal and tgname like 'sav_dashboard_%'`;
-  console.log(JSON.stringify({status:"pass",upgrade:"populated0037-to0043",intake,migratorRunTwice:true,sourceSnapshotSha256:createHash("sha256").update(before).digest("hex"),humanCiphertextUnchanged:true,pauseUnchanged:true,projection,journalCount,triggers}));
+  console.log(JSON.stringify({status:"pass",upgrade:"populated0037-to0044",intake,migratorRunTwice:true,sourceSnapshotSha256:createHash("sha256").update(before).digest("hex"),humanCiphertextUnchanged:true,pauseUnchanged:true,projection,journalCount,triggers}));
 } finally {await client.end();await rm(folder,{recursive:true,force:true});}
