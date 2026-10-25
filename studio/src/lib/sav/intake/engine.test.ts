@@ -403,3 +403,30 @@ it("routes an accepted Other without an approved rule to an explicit rule decisi
   expect(plan.progress).toMatchObject({ kind: "human_choice", classification: "unknown", questionCode: "request_scope_uncertain", view: "to_validate" });
   expect(plan.steps).toHaveLength(0);
 });
+
+// Synthetic regressions from the five-waiting recovery brief; no real message data.
+it("preserves an original subject-only malfunction even if the producer emits Other", async () => {
+  const f=fixture(["other"]); f.input.message.currentText="ça ne fonctionne pas";
+  const p=await f.run(); expect(p.decision.classification).toBe("support");expect(p.decision.requests[0].kind).toBe("support");expect(p.progress.kind).toBe("human_choice");expect(p.progress.view).toBe("to_validate");
+});
+it("asks a precise question on an empty reply while retaining conversation evidence",async()=>{
+ const f=fixture([]);f.input.message.currentText="";f.input.conversation=read([{...f.input.message,id:otherMid,currentText:"Ancien problème synthétique",receivedAt:"2026-10-19T10:00:00.000Z"}]);
+ const p=await f.run();expect(p.progress.kind).toBe("human_choice");expect(p.decision.evidence.some(e=>e.source==="customer_history")).toBe(true);expect(f.calls).not.toContain("analyse");
+});
+it("distinguishes a qualified newsletter from an empty or uncertain customer request",async()=>{
+ const f=fixture([]);delete f.analysis.ticketSummary;f.analysis.nature="newsletter";expect((await f.run()).progress.view).toBe("other");
+ delete f.policy.qualifiedOther;expect((await f.run()).progress.kind).toBe("human_choice");
+ f.analysis.nature="indeterminate";expect((await f.run()).progress.view).not.toBe("other");
+});
+it("never lets newsletter nature override a real financial request",async()=>{
+ const f=fixture(["support","finance"]);f.analysis.nature="newsletter";const p=await f.run();expect(p.decision.classification).toBe("finance");expect(target(p).learning).toBe("excluded");
+});
+it.each(["accessory","required","multiple","explicit_dependency"])("keeps unreadable image status while qualifying its %s role",async mode=>{
+ const f=fixture();f.input.message.currentText=mode==="explicit_dependency"?"Voir la capture pour le problème.":"La connexion échoue à chaque ouverture.";
+ const image=(n:number)=>({sourceId:`image-${n}`,fileHash:String(n).repeat(64)});
+ f.input.message.attachmentInputs=mode==="multiple"?[image(1),image(2)]:[image(1)];
+ f.analysis.attachmentObservations=f.input.message.attachmentInputs.map(i=>({...i,filename:"synthetic.png",mimeType:"image/png",referenceHash:"r",width:1,height:1,status:"unreadable",reason:"unreadable_content",text:"",uncertainties:[],regions:[]}));
+ f.analysis.imageRequirements=f.input.message.attachmentInputs.map((i,n)=>({...i,role:mode==="required"||mode==="multiple"&&n===1?"required":"accessory",textQuote:f.input.message.currentText}));
+ const p=await f.run();if(mode==="accessory")expect(p.decision.disposition.kind).toBe("ticket");else reason(p,"classification_incomplete");
+ expect(f.analysis.attachmentObservations.every(o=>o.status==="unreadable")).toBe(true);expect(p.decision.evidence.filter(e=>e.source==="current_attachment")).toHaveLength(mode==="accessory"?f.input.message.attachmentInputs.length:0);
+});

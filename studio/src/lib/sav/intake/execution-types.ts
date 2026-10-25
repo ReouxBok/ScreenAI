@@ -30,6 +30,7 @@ export type ExecutionPayload = {
     baseline?: CrmSnapshot;
     keys: string[];
     reason?: string;
+    crmDelta?: import("./execution-context").CrmDeltaDiagnostic;
     lastRunId: string;
     acceptedFingerprint: string;
     effectsConfirmed?: boolean;
@@ -67,6 +68,7 @@ export type EffectAck = {
     [key: string]: unknown;
 };
 export type ExecutorAdapters = {
+    qualifyAddedEmails?(baseline:CrmSnapshot,current:CrmSnapshot,source:import("./crm-continuation").ContinuationSourceEmail,signal:AbortSignal):Promise<import("./crm-continuation").QualifiedCrmEmail[]>;
     readCrm(plan: IntakePlan, input: unknown, config: IntakeRuntimeConfig, signal: AbortSignal): Promise<CrmSnapshot>;
     scope(snapshot: CrmSnapshot, threadId: string, ticketId?: string | null): string[];
     dispatch(intent: EffectIntent, signal: AbortSignal): Promise<EffectAck>;

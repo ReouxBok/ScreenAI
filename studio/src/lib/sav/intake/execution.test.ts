@@ -1193,3 +1193,39 @@ it("distinguishes an incomplete CRM read from an actual changed snapshot", async
     expect(await executeIntakePass(row.id, options)).toMatchObject({ state: "waiting", reason: "SAV_INTAKE_EXECUTION_CRM_READ_HUBSPOT_HTTP_503" });
     expect(await getExecutionEffects(row.id)).toHaveLength(0);
 });
+it.each(["automatic_ack","source_copy","expired_ack"] as const)("resumes the same execution after four confirmed effects with a strongly proven %s",async kind=>{
+ const sha=(s:string)=>createHash("sha256").update(s).digest("hex"),ackBody="Synthetic approved receipt.",ackSubject="Synthetic receipt";
+ const templates=[{id:"synthetic",mailbox:"support@example.invalid",subjectSha256:sha(ackSubject),bodySha256:sha(ackBody)}];
+ environment.SAV_INTAKE_CRM_ACK_TEMPLATES_JSON=JSON.stringify({version:1,resource:{resourceId:"synthetic",revisionId:"v1",sha256:sha(JSON.stringify(templates))},templates,approvedBy:"synthetic-admin",approvedAt:new Date(Date.now()-1000).toISOString(),expiresAt:new Date(Date.now()+600000).toISOString()});
+ options.runtime=savIntakeRuntimeConfig(environment)!;
+ p.seedTicket({stage:"closed",closedAt:new Date(Date.now()-1000).toISOString()});
+ const row=await admission(),verify=options.adapters.verify;let inserted=false,at="";
+ options.adapters.verify=async(...args)=>{const proof=await verify(...args);if(args[0].kind==="email_associate"&&proof.confirmed&&!inserted){
+  inserted=true;at=new Date().toISOString();const native=kind==="source_copy";
+  p.objects.emails["8801"]={id:"8801",properties:{hs_timestamp:at,hs_email_direction:native?"INCOMING_EMAIL":"EMAIL",hs_email_from_email:native?"customer@example.invalid":"support@example.invalid",hs_email_to_email:native?"support@example.invalid":"customer@example.invalid",hs_email_subject:native?"Synthetic connection failure":ackSubject,hs_email_text:native?"The synthetic connection fails.":ackBody,hs_email_headers:JSON.stringify({messageId:"<unknown@example.invalid>"})}};
+  p.links.set("tickets:201:emails",[...(p.links.get("tickets:201:emails")??[]),"8801"]);
+ }return proof;};
+ expect(await executeIntakePass(row.id,options)).toMatchObject({state:"waiting",reason:"SAV_INTAKE_EXECUTION_CRM_CHANGED"});
+ const before=await getExecutionEffects(row.id);expect(before).toHaveLength(4);expect(before.every(e=>e.state==="confirmed")).toBe(true);
+ expect(await readIntakeExecutionProgress(messageId)).toMatchObject({crmDelta:{reason:"unrecognized_added_email",eventIds:["emails:8801"]}});
+ const native=kind==="source_copy";p.objects.emails["8801"].properties.hs_email_headers=JSON.stringify({messageId:native?"<incoming@example.invalid>":"<synthetic-ack@example.invalid>"});
+ if(!native)p.sent["synthetic-auto"]={id:"synthetic-auto",threadId:"gmail-thread",internalDate:String(Date.parse(at)),labelIds:["SENT"],payload:{mimeType:"text/plain",headers:Object.entries({from:"support@example.invalid",to:"customer@example.invalid",subject:ackSubject,"message-id":"<synthetic-ack@example.invalid>","in-reply-to":"<incoming@example.invalid>","auto-submitted":"auto-replied"}).map(([name,value])=>({name,value})),body:{data:Buffer.from(ackBody).toString("base64url")}}};
+ if(kind==="expired_ack"){
+  const gmailCurrent=options.adapters.gmailCurrent!;
+  options.adapters.gmailCurrent=async(...args)=>{await gmailCurrent(...args);vi.setSystemTime(Date.now()+61000);};
+  vi.useFakeTimers({toFake:["Date"]});try{
+   expect(await executeIntakePass(row.id,options)).toMatchObject({state:"waiting",reason:"SAV_INTAKE_EXECUTION_CRM_ACK_PROOF_EXPIRED"});
+   expect((await getExecutionEffects(row.id)).filter(e=>e.state==="confirmed")).toHaveLength(4);
+   expect(p.calls.filter(c=>c.method==="PATCH")).toHaveLength(0);
+  }finally{vi.useRealTimers();}return;
+ }
+ expect(await executeIntakePass(row.id,options)).toMatchObject({state:"confirmed"});
+ const after=await getExecutionEffects(row.id);expect(after).toHaveLength(5);
+ for(const previous of before)expect(after.find(e=>e.id===previous.id)).toEqual(previous);
+ expect(after.find(e=>e.kind==="stage_new")?.state).toBe("confirmed");
+ expect(p.calls.filter(c=>c.method==="POST"&&c.path.endsWith("/notes"))).toHaveLength(1);
+ expect(p.calls.filter(c=>c.method==="POST"&&c.path.endsWith("/emails"))).toHaveLength(1);
+ expect(p.calls.filter(c=>c.method==="POST"&&c.path.endsWith("/tickets"))).toHaveLength(0);
+ expect(p.calls.filter(c=>c.method==="PATCH")).toHaveLength(1);expect(p.calls.filter(c=>c.path==="gmail/messages/send")).toHaveLength(0);
+ const count=p.calls.filter(c=>["POST","PUT","PATCH"].includes(c.method)).length;await executeIntakePass(row.id,options);expect(p.calls.filter(c=>["POST","PUT","PATCH"].includes(c.method))).toHaveLength(count);
+},20000);

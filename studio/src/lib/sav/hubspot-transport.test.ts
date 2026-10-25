@@ -95,3 +95,25 @@ describe("classified CRM reads", () => {
     expect(JSON.stringify(vi.mocked(console.info).mock.calls)).not.toMatch(/private|customer@/);
   });
 });
+it("preserves a local authority failure without retrying it as a network outage", async () => {
+  const network = vi.fn(async () => { throw Error("SAV_INTAKE_RUNTIME_REVALIDATION_FAILED"); });
+  const request = createSavHubspotTransport(network);
+  await expect(request("/crm/v3/objects/tickets/batch/read", { method: "POST" }, status => `HUBSPOT_HTTP_${status}`))
+    .rejects.toThrow("SAV_INTAKE_RUNTIME_REVALIDATION_FAILED");
+  expect(network).toHaveBeenCalledTimes(1);
+});
+
+it("distinguishes a successful HTTP response with invalid JSON",async()=>{
+ const network=vi.fn(async()=>new Response("invalid",{status:200}));
+ await expect(createSavHubspotTransport(network)("/read",{},summarize)).rejects.toMatchObject({diagnostic:{origin:"response",status:200,attempts:1,code:"SAV_HUBSPOT_INVALID_RESPONSE"}});expect(network).toHaveBeenCalledTimes(1);
+});
+it("does not retain the HTTP status of an earlier attempt after a network failure",async()=>{
+ const network=vi.fn<typeof fetch>().mockResolvedValueOnce(new Response(null,{status:502})).mockRejectedValueOnce(new TypeError("synthetic connection failure"));
+ await expect(createSavHubspotTransport(network)("/read",{},summarize)).rejects.toMatchObject({diagnostic:{origin:"transport",status:0,attempts:2,code:"SAV_HUBSPOT_READ_UNAVAILABLE"}});
+});
+it.each([true,false])("distinguishes planner deadline from explicit cancellation (%s)",async deadline=>{
+ vi.useFakeTimers();const controller=new AbortController(),network=vi.fn<typeof fetch>(async(_url,init)=>new Promise((_resolve,reject)=>init!.signal!.addEventListener("abort",()=>reject(init!.signal!.reason),{once:true})));
+ const promise=createSavHubspotTransport(network)("/read",{signal:controller.signal},summarize);
+ const assertion=expect(promise).rejects.toMatchObject({diagnostic:{origin:deadline?"deadline":"transport",attempts:1,status:0,code:deadline?"SAV_HUBSPOT_READ_TIMEOUT":"SAV_HUBSPOT_READ_CANCELLED"}});
+ await vi.advanceTimersByTimeAsync(10000);controller.abort(Error(deadline?"SAV_INTAKE_STEP_DEADLINE":"synthetic cancel"));await assertion;expect(network).toHaveBeenCalledTimes(1);expect(vi.getTimerCount()).toBe(0);
+});

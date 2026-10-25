@@ -13,7 +13,8 @@ import { assertSavOutboundRecipientAllowed } from "../policy";
 import { intakeExecutionConfig, readIntakeExecutionAuthority } from "./execution-policy";
 import { savIntakeRuntimeConfig, intakeRuntimeHash, type IntakeRuntimeConfig } from "./runtime-contract";
 import { createIntakeExecutorAdapters, renderIntakeNote } from "./execution-adapters";
-import { assertOriginalExecutionCrm, assertExecutionCrmUnchanged } from "./execution-context";
+import { assertOriginalExecutionCrm, assertExecutionCrmUnchanged, IntakeCrmDeltaError, publicIntakeCrmDelta } from "./execution-context";
+import { exactRfcMessageId, isQualifiedCrmEmail, type QualifiedCrmEmail } from "./crm-continuation";
 import { admitIntakeExecution, claimExecution, claimEffectRecovery, withEffectRecoveryLease, releaseEffectRecovery, activeExecutionEffects, adoptCurrentExecutionVersion, assertExecutionLocal, saveExecutionPayload, expandExecutionScope, getExecutionEffects, ensureExecutionEffect, markEffectDispatched, recordEffectAck, confirmExecutionEffect, deferExecutionEffect, endExecutionPass, identityEpisodeEffect, finishExecution, executionJournal, releaseRecoveredExecutionScope, occupationSchemaInstalled, type ExecutionLease, type ExecutionTx } from "./execution-store";
 import type { Effect, EffectIntent, EffectAck, ExecutorAdapters, ExecutionOptions, ExecutionPayload, EffectKind } from "./execution-types";
 const fault = (code: string): never => { throw Error(`SAV_INTAKE_EXECUTION_${code}`); };
@@ -188,6 +189,8 @@ async function preflight(lease: ExecutionLease, options: ExecutionOptions, inten
     const s = await source(lease);
     if (d.kind === "ticket" && !authority.mutations.includes(d.target.operation === "create" ? "create_ticket" : "link_ticket"))
         return fault("MUTATION_NOT_GRANTED");
+    let qualifiedEmails: QualifiedCrmEmail[] = [];
+    const assertContinuationFresh = () => { if(qualifiedEmails.some(proof=>!isQualifiedCrmEmail(proof)))return fault("CRM_ACK_PROOF_EXPIRED"); };
     const snapshot = await options.adapters.readCrm(lease.payload.plan, lease.payload.input, options.runtime, options.signal);
     await expandExecutionScope(lease, options.adapters.scope(snapshot, lease.row.threadId, finalTicket(lease, await getExecutionEffects(lease.row.id))));
     if (!lease.payload.baseline) {
@@ -196,8 +199,14 @@ async function preflight(lease: ExecutionLease, options: ExecutionOptions, inten
         await saveExecutionPayload(lease);
     }
     else {
+        const sourceEmail={from:s.message.fromEmail,to:s.message.toEmails,subject:s.message.subject,body:s.body.text,
+          rfcMessageId:exactRfcMessageId(s.body.headers?.["message-id"])??undefined,mailbox:s.mailbox.email,gmailThreadId:s.thread.gmailThreadId};
+        qualifiedEmails=intent?.kind==="stage_new"&&options.adapters.qualifyAddedEmails
+          ?await options.adapters.qualifyAddedEmails(lease.payload.baseline,snapshot,sourceEmail,options.signal):[];
+        await live(lease,options,intent?.permission);
         const concurrent = assertExecutionCrmUnchanged(lease.payload.baseline, snapshot, await getExecutionEffects(lease.row.id), { finalizing: !intent, nextKind: intent?.kind,
-            sourceEmail: { from: s.message.fromEmail, to: s.message.toEmails, subject: s.message.subject, body: s.body.text } });
+            sourceEmail,qualifiedEmails });
+        if(lease.payload.crmDelta){delete lease.payload.crmDelta;await saveExecutionPayload(lease);}
         const receipt = intakeRuntimeHash(concurrent);
         if (concurrent.length && lease.payload.concurrentHistoryHash !== receipt) {
             lease.payload.concurrentHistoryHash = receipt;
@@ -217,6 +226,8 @@ async function preflight(lease: ExecutionLease, options: ExecutionOptions, inten
     const finalAuthority = await live(lease, options, intent?.permission);
     if (d.kind === "ticket" && !finalAuthority.mutations.includes(d.target.operation === "create" ? "create_ticket" : "link_ticket"))
         return fault("MUTATION_NOT_GRANTED");
+    assertContinuationFresh();
+    return assertContinuationFresh;
 }
 export async function executeIntakePass(executionId: string, options: ExecutionOptions, hooks: {
     beforeMarker?: (effect: Effect) => Promise<void>;
@@ -247,10 +258,11 @@ export async function executeIntakePass(executionId: string, options: ExecutionO
             }
             if (current.state === "planned") {
                 await hooks.beforeMarker?.(current);
-                await preflight(lease, options, intent);
+                const assertContinuationFresh = await preflight(lease, options, intent);
                 current = await markEffectDispatched(lease, current);
                 await hooks.afterMarker?.(current);
                 await live(lease, options, intent.permission);
+                assertContinuationFresh();
                 const result = await options.adapters.dispatch(effectIntent(current), options.signal);
                 await recordEffectAck(current, result);
                 await hooks.afterAck?.(current);
@@ -283,6 +295,7 @@ export async function executeIntakePass(executionId: string, options: ExecutionO
     }
     catch (error) {
         const reason = code(error);
+        if(error instanceof IntakeCrmDeltaError){lease.payload.crmDelta=error.diagnostic;await saveExecutionPayload(lease);}
         if (current && current.state !== "planned") {
             const [row] = (await getExecutionEffects(executionId)).filter(e => e.id === current!.id);
             if (row?.state !== "confirmed")
@@ -444,7 +457,7 @@ export async function readIntakeExecutionProgress(messageId: string) {
     const payload = decryptSavPayload<ExecutionPayload>(row.payloadCiphertext), effects = await getExecutionEffects(row.id), required = requiredExecutionKinds(payload);
     const confirmed = row.state === "confirmed" && required.length > 0 && required.every(k => effects.some(e => e.kind === k && e.state === "confirmed"));
     return {
-        executionId: row.id, runId: row.runId, version: row.runVersion, actorType: "ai", completionSourceHash: payload.completion?.sourceHash ?? null, state: row.state, ticketId: row.ticketId, confirmed, reason: payload.reason ?? null, effects: effects.map(e => ({
+        executionId: row.id, runId: row.runId, version: row.runVersion, actorType: "ai", completionSourceHash: payload.completion?.sourceHash ?? null, state: row.state, ticketId: row.ticketId, confirmed, reason: payload.reason ?? null, ...(payload.crmDelta?{crmDelta:publicIntakeCrmDelta(payload.crmDelta)}:{}), effects: effects.map(e => ({
             id: e.id, kind: e.kind, state: e.state, attemptId: e.attemptId, ack: ack(e), dispatchedAt: e.dispatchedAt, confirmedAt: e.confirmedAt
         })), learning: payload.plan.decision.classification === "finance" || payload.plan.decision.classification === "cancellation" ? "excluded" : "not_started", followupStarted: false
     };

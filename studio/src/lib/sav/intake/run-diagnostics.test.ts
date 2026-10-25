@@ -85,3 +85,9 @@ it("validates UUID and reads through the authenticated endpoint without a model/
   expect(await result.json()).toMatchObject({diagnostics:{totalAttempts:2}});
   expect((await GET(new Request("https://example.invalid"),{params:Promise.resolve({id:randomUUID()})})).status).toBe(404);
 });
+it("exposes retry/origin/schema facts without their cached results or rejected values",()=>{
+ const result=intakeDiagnosticPayload(encryptSavPayload({semantics:{records:[{method:"analyseMessage",result:{nature:"newsletter",requests:[],ticketSummary:{description:"PRIVATE"}}}]},readRecovery:{state:"scheduled",attempts:2,operation:"ticket_history",code:"SAV_HUBSPOT_READ_UNAVAILABLE",expiresAt:new Date(Date.now()+30000).toISOString(),cache:[{result:{data:"PRIVATE"}}]},traces:[{operation:"ticket_history",status:"failed",reason:"SAV_HUBSPOT_READ_UNAVAILABLE",transport:{origin:"transport",code:"SAV_HUBSPOT_READ_UNAVAILABLE",attempts:2,status:0,durationMs:216,raw:"PRIVATE"}},{phase:"understanding",validationFailure:{reason:"output_schema_invalid",path:"images.0.regions.0.box",issues:[{path:"images.0.regions.0.box",code:"too_big",maximum:4,rejectedValue:"PRIVATE"},{path:"PRIVATE",code:"invalid_type"}]}}]}));
+ expect(result).toMatchObject({qualification:{nature:"newsletter",requestCount:0},readRecovery:{state:"scheduled",technicalAttempts:2,operation:"ticket_history",expired:false}});
+ expect(result.traces[0]).toMatchObject({transport:{origin:"transport",attempts:2,status:0,durationMs:216}});expect(result.traces[1]).toHaveProperty("schemaIssues",[{path:"images.0.regions.0.box",code:"too_big",maximum:4},{path:"output",code:"invalid_type"}]);
+ expect(JSON.stringify(result)).not.toContain("PRIVATE");
+});

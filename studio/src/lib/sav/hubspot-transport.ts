@@ -1,6 +1,12 @@
 import "server-only";
 
-export const SAV_CRM_TRANSPORT_REVISION = "sav-crm-read-2026-10-20.v3";
+export const SAV_CRM_TRANSPORT_REVISION = "sav-crm-read-2026-10-25.v4";
+const localFailures = new Set(["SAV_INTAKE_RUNTIME_CONTEXT_CHANGED", "SAV_INTAKE_RUNTIME_REVALIDATION_FAILED", "SAV_INTAKE_RUNTIME_CONFIGURATION_REQUIRED", "SAV_INTAKE_OTHER_AUTHORITY_EXPIRED", "SAV_INTAKE_MUTATION_FORBIDDEN", "SAV_INTAKE_EXECUTION_DISABLED", "SAV_INTAKE_EXECUTION_PERMISSION_REVOKED", "SAV_INTAKE_EXECUTION_VERSION_INCOMPATIBLE"]);
+export class SavCrmLocalReadError extends Error { constructor(readonly status:"partial"|"failed",readonly code:string){super(code);} }
+export type SavCrmReadDiagnostic = { origin: "local_guard" | "transport" | "http" | "response" | "deadline"; code: string; attempts: number; status: number; durationMs: number };
+export class SavCrmReadError extends Error {
+  constructor(readonly diagnostic: SavCrmReadDiagnostic) { super(diagnostic.code); }
+}
 /** All scheduling waits must release their timer/listener when the caller expires. */
 async function waitForRead(delay: number, signal?: AbortSignal | null) {
   if (signal?.aborted) throw new Error("SAV_HUBSPOT_READ_CANCELLED");
@@ -56,6 +62,7 @@ export function createSavHubspotTransport(network: typeof fetch = fetch) {
         const timer = setTimeout(() => controller.abort(), Math.min(remaining, read ? 12_000 : 20_000));
         const signal = init.signal ? AbortSignal.any([init.signal, controller.signal]) : controller.signal;
         attempts++;
+        status = 0;
         let retryAfter = 0;
         try {
           const response = await network(`https://api.hubapi.com${path}`, { ...init, signal });
@@ -71,10 +78,13 @@ export function createSavHubspotTransport(network: typeof fetch = fetch) {
           try { return await response.json() as T; }
           catch { throw new Error("SAV_HUBSPOT_INVALID_RESPONSE"); }
         } catch (error) {
-          const code = init.signal?.aborted ? "SAV_HUBSPOT_READ_CANCELLED" : controller.signal.aborted ? "SAV_HUBSPOT_READ_TIMEOUT" : error instanceof Error && /^(HUBSPOT_HTTP_\d{3}|SAV_HUBSPOT_INVALID_RESPONSE)/.test(error.message) ? error.message : "SAV_HUBSPOT_READ_UNAVAILABLE";
+          if(error instanceof SavCrmLocalReadError)throw error;
+          const local = error instanceof Error && localFailures.has(error.message);
+          const stepDeadline = controller.signal.aborted || init.signal?.aborted && init.signal.reason instanceof Error && init.signal.reason.message === "SAV_INTAKE_STEP_DEADLINE";
+          const code = local ? error.message : stepDeadline ? "SAV_HUBSPOT_READ_TIMEOUT" : init.signal?.aborted ? "SAV_HUBSPOT_READ_CANCELLED" : error instanceof Error && /^(HUBSPOT_HTTP_\d{3}|SAV_HUBSPOT_INVALID_RESPONSE)$/.test(error.message) ? error.message : "SAV_HUBSPOT_READ_UNAVAILABLE";
           const transient = /^(HUBSPOT_HTTP_(429|502|503|504)|SAV_HUBSPOT_READ_(TIMEOUT|UNAVAILABLE))/.test(code);
           const delay = Math.max(200, retryAfter) + Math.floor(Math.random() * 100);
-          if (!read || !transient || attempts >= 2 || init.signal?.aborted || deadline - Date.now() <= delay + 100) throw new Error(code);
+          if (!read || !transient || attempts >= 2 || init.signal?.aborted || deadline - Date.now() <= delay + 100) throw new SavCrmReadError({ code, origin: local ? "local_guard" : stepDeadline ? "deadline" : code === "SAV_HUBSPOT_INVALID_RESPONSE" ? "response" : status ? "http" : "transport", attempts, status, durationMs: Date.now() - started });
           clearTimeout(timer);
           await waitForRead(delay, init.signal);
         } finally { clearTimeout(timer); }

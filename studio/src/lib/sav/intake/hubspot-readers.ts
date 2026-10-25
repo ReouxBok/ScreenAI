@@ -1,12 +1,12 @@
 import { z } from "zod";
-import { createSavHubspotTransport } from "../hubspot-transport";
+import { createSavHubspotTransport, SavCrmReadError, SavCrmLocalReadError, type SavCrmReadDiagnostic } from "../hubspot-transport";
 import { assertSavSupportPipeline, SAV_HUBSPOT_SUPPORT } from "../hubspot-mapping";
 import {
   intakeContactSchema, intakeHistorySchema, intakeTicketSchema,
   type IntakeAdapters, type IntakeAssociation, type IntakeContact, type IntakeHistory, type IntakeTicket, type ReadResult,
 } from "./engine-types";
 
-export const SAV_INTAKE_READERS_REVISION = "sav-intake-hubspot-2026-10-20.v1";
+export const SAV_INTAKE_READERS_REVISION = "sav-intake-hubspot-2026-10-25.v2";
 const id = z.union([z.string().regex(/^\d{1,30}$/), z.number().int().nonnegative().safe()]).transform(String);
 const recordSchema = z.object({ id, archived: z.boolean().optional(), createdAt: z.string().optional(),
   properties: z.record(z.string(), z.string().nullable()) });
@@ -30,8 +30,8 @@ const iso = (value: string | undefined | null): string | undefined => {
   const date = /^\d{10,}$/.test(value) ? new Date(Number(value)) : z.iso.datetime({ offset: true }).safeParse(value).success ? new Date(value) : null;
   return date && Number.isFinite(date.getTime()) ? date.toISOString() : undefined;
 };
-class ReadFault extends Error { constructor(readonly status: "partial" | "failed", readonly code: string) { super(code); } }
-export type IntakeReadTrace = { operation: string; status: "complete" | "partial" | "failed"; reason: string | null; observedAt: string; requests: number };
+class ReadFault extends SavCrmLocalReadError {}
+export type IntakeReadTrace = { operation: string; status: "complete" | "partial" | "failed"; reason: string | null; observedAt: string; requests: number; transport?: SavCrmReadDiagnostic };
 export type SavIntakeCrmReaders = Pick<IntakeAdapters, "findContactsByEmail" | "directAssociations" | "getContact" | "ticketsForContact" | "ticketHistory">;
 
 /** An allowlist before the existing transport: no mutation, redirect, arbitrary
@@ -77,8 +77,8 @@ export function createSavIntakeHubspotReaders(options: {
       return { status: "complete", data, observedAt };
     } catch (error) {
       const status = error instanceof ReadFault ? error.status : "failed";
-      const reason = error instanceof ReadFault ? error.code : error instanceof Error && /^HUBSPOT_HTTP_\d{3}$/.test(error.message) ? error.message : "read_unavailable";
-      options.onRead?.({ operation, status, reason, observedAt, requests: requests - before });
+      const reason = error instanceof ReadFault ? error.code : error instanceof SavCrmReadError ? error.message : error instanceof Error && /^HUBSPOT_HTTP_\d{3}$/.test(error.message) ? error.message : "read_unavailable";
+      options.onRead?.({ operation, status, reason, observedAt, requests: requests - before, ...(error instanceof SavCrmReadError ? { transport: error.diagnostic } : {}) });
       // An incomplete response never becomes an empty successful search.
       return { status, data: empty, observedAt };
     }
