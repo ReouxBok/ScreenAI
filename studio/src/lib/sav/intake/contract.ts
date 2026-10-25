@@ -77,6 +77,7 @@ export type SavIntakeMutation = z.infer<typeof savIntakeMutationSchema>;
 const noTicket = z.object({
   kind: z.literal("no_ticket"),
   reason: z.enum(["qualified_other", "acknowledgement_only", "outside_support"]),
+  qualifiedInformation: z.literal("authenticated_newsletter").optional(),
   nextAction: z.enum(["none", "supervised_partnership", "supervised_commercial", "supervised_investor"]),
   learning: z.literal("excluded"), evidenceIds: refs,
 }).strict();
@@ -187,9 +188,12 @@ export const savIntakeDecisionSchema = z.object({
   const sensitiveKinds = (["finance", "cancellation"] as const).filter(kind => kinds.has(kind));
   const outsideKinds = (["partnership", "commercial", "investor"] as const).filter(kind => kinds.has(kind));
   const neutralKinds = (["other", "acknowledgement"] as const).filter(kind => kinds.has(kind));
-  const unresolved = !kinds.size || kinds.has("unknown");
+  const qualifiedInformation = !kinds.size && decision.classification === "other" && disposition.kind === "no_ticket"
+    && disposition.reason === "qualified_other" && disposition.qualifiedInformation === "authenticated_newsletter" && decision.evidence.some(e => e.source === "private_rule" && disposition.evidenceIds.includes(e.id));
+  const unresolved = !qualifiedInformation && (!kinds.size || kinds.has("unknown"));
   let compatible: SavIntakeClassification[];
-  if (sensitiveKinds.length) compatible = sensitiveKinds;
+  if (qualifiedInformation) compatible = ["other"];
+  else if (sensitiveKinds.length) compatible = sensitiveKinds;
   else if (unresolved) compatible = ["unknown"];
   else if (kinds.has("support")) compatible = ["support"];
   else if (outsideKinds.length === 1) compatible = outsideKinds;

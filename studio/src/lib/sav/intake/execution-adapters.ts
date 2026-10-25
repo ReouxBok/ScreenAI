@@ -5,6 +5,7 @@ import { createSavIntakeHubspotReaders } from "./hubspot-readers";
 import { requestSavGmail, parseGmailMessage } from "../gmail";
 import { readSavGmailPermissions } from "../gmail-permissions";
 import { collectExecutionCrm, executionScopeKeys } from "./execution-context";
+import { qualifyCrmHistoryAdditions } from "./crm-continuation";
 import type { ExecutorAdapters, EffectAck, EffectIntent } from "./execution-types";
 const id = (s: string | undefined) => z.string().regex(/^\d{1,30}$/).parse(s);
 const object = (v: unknown) => z.object({
@@ -144,6 +145,23 @@ export function createIntakeExecutorAdapters(options: {
         return matches.length === 1 ? matches[0] : null;
     }
     const adapters: ExecutorAdapters = {
+        qualifyAddedEmails: (baseline,current,source,signal) => qualifyCrmHistoryAdditions(baseline,current,source,{authority:env().SAV_INTAKE_CRM_ACK_TEMPLATES_JSON,
+          readEmail: objectId => read("emails",objectId,signal),
+          verifyAckOrigin: async expected => {
+            const list=await gmail<{messages?:{id:string;threadId:string}[];nextPageToken?:string}>(expected.mailbox,
+              `messages?${new URLSearchParams({q:`in:sent rfc822msgid:${expected.rfcMessageId}`,maxResults:"2"})}`,{signal});
+            if(list.nextPageToken||list.messages?.length!==1||list.messages[0].threadId!==expected.gmailThreadId)return false;
+            const raw=await gmail<Parameters<typeof parseGmailMessage>[1]&{labelIds?:string[]}>(expected.mailbox,`messages/${encodeURIComponent(list.messages[0].id)}?format=full`,{signal});
+            const headers=raw.payload?.headers??[], values=(name:string)=>headers.filter(h=>h.name?.toLowerCase()===name).map(h=>h.value);
+            if(["from","to","message-id","in-reply-to","auto-submitted"].some(k=>values(k).length!==1)
+              ||["cc","bcc"].some(k=>values(k).some(v=>v?.trim()))||values("references").length>1)return false;
+            const at=Number(raw.internalDate);
+            return raw.id===list.messages[0].id&&raw.threadId===expected.gmailThreadId&&Boolean(raw.labelIds?.includes("SENT"))
+              &&values("message-id")[0]===expected.rfcMessageId&&values("in-reply-to")[0]===expected.parentId
+              &&values("auto-submitted")[0]?.trim().toLowerCase()==="auto-replied"&&oneAddress(values("from")[0]??"")===expected.mailbox.toLowerCase()
+              &&oneAddress(values("to")[0]??"")===expected.recipient.toLowerCase()&&values("subject").length===1&&values("subject")[0]===expected.subject
+              &&exactMimeText(raw.payload)===expected.body&&Number.isFinite(at)&&Math.abs(at-Date.parse(expected.at))<=60_000&&at<=Date.now();
+          }}),
         readCrm: (plan, input, config, signal) => collectExecutionCrm(plan, input, config, createSavIntakeHubspotReaders({
             network: authNetwork,
             onRead: trace => {

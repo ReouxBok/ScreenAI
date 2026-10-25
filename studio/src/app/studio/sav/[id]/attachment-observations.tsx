@@ -10,6 +10,7 @@ const reason: Record<SavAttachmentObservation["reason"], string> = {
   type_mismatch: "Le type réel de l’image ne correspond pas au type déclaré.", association_mismatch: "Le fichier ne correspond pas à la boîte, au message ou à la partie attendus.",
   permission_denied: "Gmail refuse l’accès à cette pièce.", not_found: "Le fichier n’est plus accessible dans Gmail.", rate_limited: "Gmail limite temporairement les lectures.",
   timeout: "La lecture a dépassé le temps disponible.", download_failed: "Le téléchargement n’a pas abouti.", provider_failed: "L’analyse visuelle n’a pas produit d’observation exploitable.",
+  validation_failed: "La réponse structurée a été rejetée ; aucune panne de vision n’est déduite de ce seul rejet.",
   budget_exhausted: "La lecture n’a pas pu être réalisée dans les limites de cette analyse. Les informations du mail restent disponibles.", model_unsupported: "Le modèle configuré n’est pas qualifié pour ce lecteur.",
   in_progress: "Une lecture a été engagée, sans résultat acquis. Si elle a été interrompue, son issue reste à vérifier.", outcome_uncertain: "Une lecture précédente a été interrompue ; aucun nouvel appel automatique n’est lancé.",
   context_incomplete: "La sélection ou le contexte est incomplet ; cette pièce n’a pas été envoyée au modèle.",

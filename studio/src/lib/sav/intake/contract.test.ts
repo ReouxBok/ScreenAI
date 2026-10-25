@@ -471,3 +471,11 @@ describe("autonomous intake design contract, without providers or activation", (
     expect(savIntakeProgressSchema.safeParse({ kind: "policy_pending", questions: ["outside_support_view"], view: null }).success).toBe(false);
   });
 });
+
+it("requires an explicit authenticated newsletter qualification for a no-request Other",()=>{
+ const decision=ticketDecision();decision.requests=[];decision.classification="other";
+ decision.evidence.push({...evidence("rule","current_message",messageId),source:"private_rule"});
+ decision.disposition={kind:"no_ticket",reason:"qualified_other",qualifiedInformation:"authenticated_newsletter",nextAction:"none",learning:"excluded",evidenceIds:["current","rule"]};
+ expect(savIntakeDecisionSchema.safeParse(decision).success).toBe(true);
+ decision.evidence=decision.evidence.filter(e=>e.id!=="rule");expect(savIntakeDecisionSchema.safeParse(decision).success).toBe(false);
+});

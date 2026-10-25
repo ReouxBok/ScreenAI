@@ -5,6 +5,7 @@ import { savIntakeJournal, savIntakeRuns, savMessages } from "@/db/schema";
 import { decryptSavPayload } from "../crypto";
 import { savAttachmentReasonSchema, savAttachmentStatusSchema } from "../attachment-contract";
 import { intakeContextReasonLabels } from "./console-presentation";
+import { publicIntakeSchemaIssues } from "./schema-diagnostics";
 
 const object = (v: unknown): Record<string, unknown> => v !== null && typeof v === "object" && !Array.isArray(v) ? v as Record<string, unknown> : {};
 const publicCodes = new Set<string>([...Object.keys(intakeContextReasonLabels), ...savAttachmentReasonSchema.options, ...savAttachmentStatusSchema.options,
@@ -13,7 +14,7 @@ const publicCodes = new Set<string>([...Object.keys(intakeContextReasonLabels), 
   "excerpt_not_in_source", "required_source_missing", "message_id_mismatch", "registration_source_invalid", "output_schema_invalid",
   "request_limit", "operation_forbidden", "partial_response", "total_mismatch", "pagination_cycle", "page_limit", "archived_contact",
   "aliases_unavailable", "batch_limit", "partial_batch", "conflicting_contact", "contact_limit", "cancelled", "read_unavailable",
-  "ticket_limit", "ticket_membership_conflict", "ticket_content_unavailable", "history_limit", "history_date_unknown"]);
+  "ticket_limit", "ticket_membership_conflict", "ticket_content_unavailable", "history_limit", "history_date_unknown", "read_retry_scheduled", "read_retry_stopped", "read_retry_claimed"]);
 const code = (v: unknown) => typeof v === "string" && (/^(?:SAV_[A-Z0-9_]{1,90}|HUBSPOT_HTTP_\d{3})$/.test(v) || publicCodes.has(v)) ? v : null;
 const count = (v: unknown) => typeof v === "number" && Number.isSafeInteger(v) && v >= 0 ? v : null;
 const methods = new Set(["analyseMessage", "assessIdentity", "assessIssues"]);
@@ -41,16 +42,22 @@ export function intakeDiagnosticPayload(ciphertext: string) {
     const input = object(payload.input), message = object(input.message), attachments = object(payload.attachments);
     const read = object(attachments.read), configuration = object(payload.configuration);
     const traces = (Array.isArray(payload.traces) ? payload.traces : []).slice(-40).map(raw => {
-      const t = object(raw), limit = object(t.contextLimit), validation = object(t.validationFailure);
+      const t = object(raw), limit = object(t.contextLimit), validation = object(t.validationFailure),transport=object(t.transport);
       return { method: methods.has(String(t.method)) ? String(t.method) : null,
         phase: ["understanding", "ticket_matching", "accepted_semantics"].includes(String(t.phase)) ? String(t.phase) : null,
         operation: operations.has(String(t.operation)) ? String(t.operation) : null,
         status: ["complete", "partial", "failed"].includes(String(t.status)) ? String(t.status) : null,
         accepted: typeof t.accepted === "boolean" ? t.accepted : null,
         errorCode: code(t.errorCode), reason: code(t.reason), validationReason: code(validation.reason),
+        schemaIssues: publicIntakeSchemaIssues(validation.issues),
+        transport:["local_guard","transport","http","response","deadline"].includes(String(transport.origin))?{origin:String(transport.origin),code:code(transport.code),attempts:count(transport.attempts),status:count(transport.status),durationMs:count(transport.durationMs)}:null,
         contextLimit: ["catalogue", "data", "wire"].includes(String(limit.stage)) ? { stage: String(limit.stage), bytes: count(limit.bytes), limitBytes: count(limit.limitBytes), breakdown: contextBreakdown(limit.breakdown) } : null };
     });
+    const recovery=object(payload.readRecovery),records=object(payload.semantics).records;
+    const analysis=object(Array.isArray(records)?object(records.find(r=>object(r).method==="analyseMessage")).result:null);
     return { readable: true, reason: code(payload.reason),
+      qualification:{nature:["request","newsletter","information","indeterminate"].includes(String(analysis.nature))?String(analysis.nature):null,requestCount:Array.isArray(analysis.requests)?count(analysis.requests.length):null},
+      readRecovery:Object.keys(recovery).length?{state:["scheduled","claimed","exhausted","invalidated","complete"].includes(String(recovery.state))?String(recovery.state):null,technicalAttempts:count(recovery.attempts),operation:operations.has(String(recovery.operation))?String(recovery.operation):null,code:code(recovery.code),expired:typeof recovery.expiresAt==="string"&&Number.isFinite(Date.parse(recovery.expiresAt))?Date.parse(recovery.expiresAt)<=Date.now():null}:null,
       codeRevision: typeof configuration.codeRevision === "string" && /^[a-f0-9]{40}$/.test(configuration.codeRevision) ? configuration.codeRevision : null,
       contextReasons: disposition.kind === "collect_context" && Array.isArray(disposition.reasons)
         ? disposition.reasons.filter((r): r is string => typeof r === "string" && Object.hasOwn(intakeContextReasonLabels, r)).slice(0, 15) : [],

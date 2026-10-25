@@ -5,6 +5,7 @@ import {
   type SavIntakeDecision, type SavIntakeProgress,
 } from "./contract";
 import { SAV_TICKET_RETURN_NOTE_VERSION, savTicketReturnNote } from "../ticket-return-note";
+import { savEvidenceContains } from "../evidence-text";
 import {
   intakeMessageSchema, intakeContactSchema, intakeAssociationSchema, intakeTicketSchema, intakeHistorySchema,
   messageAnalysisSchema, issueAssessmentSchema, identityAssessmentSchema,
@@ -116,7 +117,7 @@ export async function planSavIntake(
     let timer: ReturnType<typeof setTimeout> | undefined;
     try {
       return await Promise.race([Promise.resolve().then(() => fn(controller.signal)), new Promise<never>((_, reject) => {
-        timer = setTimeout(() => { controller.abort(); reject(new ContextFault(reason)); }, limits.timeoutMs);
+        timer = setTimeout(() => { controller.abort(Error("SAV_INTAKE_STEP_DEADLINE")); reject(new ContextFault(reason)); }, limits.timeoutMs);
       })]);
     } catch { return fail(reason); }
     finally { if (timer) clearTimeout(timer); }
@@ -162,10 +163,14 @@ export async function planSavIntake(
   }
   try {
     if (message.id !== input.latestInboundMessageId || message.direction !== "inbound") return context("history_incomplete");
-    if (!message.contentComplete || !message.currentText.trim()) return context("classification_incomplete");
+    if (!message.contentComplete) return context("classification_incomplete");
     const conversation = complete(input.conversation, z.array(intakeMessageSchema).max(50), "history_incomplete");
     if (new Set(conversation.map(m => m.id)).size !== conversation.length || conversation.some(m => m.threadId !== message.threadId
       || Date.parse(m.receivedAt) > Date.parse(message.receivedAt))) return context("history_incomplete");
+    if (!message.currentText.trim()) {
+      for (const prior of conversation) addEvidence(`context-${prior.id}`, "customer_history", prior.id, prior, input.conversation.observedAt);
+      return context("classification_incomplete", "request_scope_uncertain");
+    }
     const continuation = input.identificationContinuation;
     const initial = continuation ? conversation.find(m => m.id === continuation.initialMessageId) : undefined;
     if (continuation && (!initial || !initial.contentComplete || initial.direction !== "inbound" || initial.threadId !== message.threadId
@@ -187,14 +192,13 @@ export async function planSavIntake(
     }
     if (analysis.messageId !== message.id || analysis.requests.some(r => r.currentMessageId !== message.id)
       || new Set(analysis.requests.map(r => r.id)).size !== analysis.requests.length) return context("classification_incomplete");
-    if (message.attachmentInputs?.length) {
-      const observations = analysis.attachmentObservations;
-      if (!observations || observations.length !== message.attachmentInputs.length
-        || new Set(observations.map(o => o.sourceId)).size !== observations.length
-        || observations.some(o => !message.attachmentInputs!.some(i => i.sourceId === o.sourceId && i.fileHash === o.fileHash)
-          || o.status !== "analyzed")) return context("classification_incomplete");
-      for (const observation of observations) addEvidence(observation.sourceId, "current_attachment", message.id, observation);
-    } else if (analysis.attachmentObservations?.length) return context("classification_incomplete");
+    // A literal authored malfunction is never authority for Other/acknowledgement.
+    // Preserve it for a targeted operator question if the producer omitted it.
+    if (/^(?:ça|ca|cela)\s+ne\s+(?:fonctionne|marche)\s+(?:pas|plus)[.!\s]*$/iu.test(message.currentText.trim().split("\n")[0])
+      && !analysis.requests.some(r => ["support", "finance", "cancellation"].includes(r.kind))) {
+      classification = "support"; requests = [{ id: "written-support", kind: "support", evidenceIds: [current] }];
+      return context("classification_incomplete", "request_scope_uncertain");
+    }
     analysis.requests.sort((a, b) => a.id.localeCompare(b.id));
     requests = analysis.requests.map(({ id, kind, originMessageId }) => ({ id, kind,
       evidenceIds: unique([current, ...(humanProof ? [humanProof] : []), ...(originMessageId && initialProof ? [initialProof] : [])]) }));
@@ -203,7 +207,21 @@ export async function planSavIntake(
       : kinds.includes("unknown") || !kinds.length ? "unknown" : kinds.includes("support") ? "support"
       : kinds.filter(k => ["commercial", "investor", "partnership"].includes(k)).length > 1 ? "mixed"
       : kinds.find(k => ["commercial", "investor", "partnership"].includes(k)) ?? (kinds.includes("other") ? "other" : "acknowledgement");
-    if (!requests.length || kinds.includes("unknown") || classification === "mixed") return context("classification_incomplete");
+    if (message.attachmentInputs?.length) {
+      const observations = analysis.attachmentObservations;
+      if (!observations || observations.length !== message.attachmentInputs.length
+        || new Set(observations.map(o => o.sourceId)).size !== observations.length
+        || observations.some(o => !message.attachmentInputs!.some(i => i.sourceId === o.sourceId && i.fileHash === o.fileHash))) return context("classification_incomplete");
+      const requirements = analysis.imageRequirements ?? [];
+      const explicitDependency = /(?:voir|regardez|cf\.?|see)\s+(?:la\s+|les\s+|the\s+)?(?:capture|image|screenshot|pi[eè]ce)/iu.test(message.currentText);
+      const accessory = (o: typeof observations[number]) => !explicitDependency && requirements.filter(r => r.sourceId === o.sourceId).length === 1
+        && requirements.some(r => r.sourceId === o.sourceId && r.fileHash === o.fileHash && r.role === "accessory"
+          && r.textQuote && savEvidenceContains(message.currentText, r.textQuote));
+      if (observations.some(o => o.status !== "analyzed" && !accessory(o))) return context("classification_incomplete");
+      for (const observation of observations) addEvidence(observation.sourceId, "current_attachment", message.id, observation);
+    } else if (analysis.attachmentObservations?.length) return context("classification_incomplete");
+    if (!requests.length && analysis.nature === "newsletter" && policy.qualifiedOther?.family === "authenticated_newsletter" && !policy.manualSupportOverride) classification = "other";
+    else if (!requests.length || kinds.includes("unknown") || classification === "mixed") return context("classification_incomplete", "request_scope_uncertain");
     if (policy.manualSupportOverride && classification === "other") {
       // Recompute from the current message. An override is not a fabricated support request.
       return context("classification_incomplete");
@@ -227,7 +245,7 @@ export async function planSavIntake(
       const progress: SavIntakeProgress = outside === "other" ? { kind: "qualified_other", classification: "other", classificationRule: policy.qualifiedOther!.resource, evidenceIds: ids, view: "other" }
         : outside === "acknowledgement" ? { kind: "processing", phase: "decision", view: null }
         : { kind: "supervised_action", messageId: message.id, classification: outside, action: action as "supervised_partnership" | "supervised_commercial" | "supervised_investor", approval: "human_confirmation_required", evidenceIds: ids, view: "to_validate" };
-      return finalize({ kind: "no_ticket", reason: outside === "other" ? "qualified_other" : outside === "acknowledgement" ? "acknowledgement_only" : "outside_support", nextAction: action, learning: "excluded", evidenceIds: ids }, progress, resource);
+      return finalize({ kind: "no_ticket", ...(!requests.length && outside === "other" ? {qualifiedInformation: "authenticated_newsletter" as const} : {}), reason: outside === "other" ? "qualified_other" : outside === "acknowledgement" ? "acknowledgement_only" : "outside_support", nextAction: action, learning: "excluded", evidenceIds: ids }, progress, resource);
     }
     let addressOrigin: "sender" | "customer_declared_registration" = "sender";
     let address = normalizeEmail(message.fromEmail);

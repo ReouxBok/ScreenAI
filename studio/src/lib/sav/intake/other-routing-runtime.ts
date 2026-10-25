@@ -12,7 +12,7 @@ import type { IntakeLease } from "./runtime-store";
  * a global qualifiedOther permission to the decision engine. */
 export async function qualifyRuntimeOther(lease:IntakeLease,live:()=>Promise<void>,env:Record<string,string|undefined>,authenticate?:typeof import("../gmail").readSavGmailOtherAuthentication) {
   const catalogue=readIntakeOtherRules(env.SAV_INTAKE_OTHER_RULES_JSON);if(!catalogue)return null;
-  const registry=readSavOtherConfiguration(env.SAV_OTHER_OBSERVATION_RULES_JSON).registry;if(!registry)return null;
+  const registry=readSavOtherConfiguration(env.SAV_OTHER_OBSERVATION_RULES_JSON).registry;
   await live();const db=requireDb();
   const [message]=await db.select().from(savMessages).where(eq(savMessages.id,lease.run.messageId));
   const [thread]=await db.select().from(savThreads).where(eq(savThreads.id,lease.run.threadId));
