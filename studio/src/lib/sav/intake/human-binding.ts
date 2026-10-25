@@ -44,11 +44,13 @@ export async function intakeRunConfigurationBound(run: typeof savIntakeRuns.$inf
     if(!event||event.parentRunId!==run.id||event.parentVersion!==run.version||event.messageId!==run.messageId||event.threadId!==run.threadId
       ||event.baseConfigHash!==config.configHash||event.sourceHash!==run.sourceHash||event.kind!=="classify"||!["pending","reading","consumed"].includes(event.state))return false;
     const value=decryptSavPayload<HumanEventPayload>(event.payloadCiphertext),payload=decryptSavPayload<import("./runtime-contract").IntakeRuntimePayload>(run.payloadCiphertext);
-    return value.reinvestigate===true&&value.revision==="sav-intake-human.v1"&&value.mailboxId===config.mailboxId
+    const ancestor=await intakeReanalysisParent(run,payload,config,db);
+    const candidates=ancestor?await intakeRunCandidateContactIds(ancestor,decryptSavPayload(ancestor.payloadCiphertext),db):[];
+    return candidates!==null&&value.reinvestigate===true&&value.revision==="sav-intake-human.v1"&&value.mailboxId===config.mailboxId
       &&run.policyHash===config.policyHash&&value.policyHash===config.policyHash&&value.resourcesHash===config.resourcesHash
       &&payload.configuration?.configHash===config.configHash&&payload.configuration.resourcesHash===config.resourcesHash
       &&payload.configuration.codeRevision===config.codeRevision&&value.parentPayloadHash===intakeRuntimeHash(payload)
-      &&value.candidatesHash===intakeRuntimeHash(value.candidateContactIds)&&value.candidateContactIds.length===0&&!value.contactId&&!value.ticketId;
+      &&value.candidatesHash===intakeRuntimeHash(value.candidateContactIds)&&intakeRuntimeHash(candidates)===value.candidatesHash&&!value.contactId&&!value.ticketId;
   }
   if (run.configHash === config.configHash) {
     if (run.humanChoiceCiphertext !== null) return false;
@@ -104,4 +106,21 @@ export async function intakeRunCandidateContactIds(run:typeof savIntakeRuns.$inf
     return candidates;
   }
   return [...value.candidateContactIds].sort();
+}
+
+/** A server-created bridge is immutable in the new parent payload. It keeps
+ * an old choice chain applicable only across an operator-context revision of
+ * the same exchanged message; the recording transaction checks raw sources. */
+export async function intakeReanalysisParent(run:typeof savIntakeRuns.$inferSelect,payload:import("./runtime-contract").IntakeRuntimePayload,
+ config:IntakeRuntimeConfig,db:Pick<ReturnType<typeof requireDb>,"select">=requireDb()) {
+ const bridge=payload.reanalysisParent;if(!bridge)return null;
+ const [parent]=await db.select().from(savIntakeRuns).where(eq(savIntakeRuns.id,bridge.runId));
+ if(!parent||parent.version>=run.version||parent.threadId!==run.threadId||parent.messageId!==run.messageId||parent.sourceHash!==bridge.sourceHash
+   ||intakeRuntimeHash(decryptSavPayload(parent.payloadCiphertext))!==bridge.payloadHash||parent.policyHash!==config.policyHash)throw Error("SAV_INTAKE_HUMAN_REVALIDATION_REQUIRED");
+ const original=decryptSavPayload<import("./runtime-contract").IntakeRuntimePayload>(parent.payloadCiphertext);
+ if(parent.configHash===config.configHash&&!parent.humanChoiceCiphertext){
+  if(original.configuration?.configHash!==config.configHash||original.configuration.resourcesHash!==config.resourcesHash
+    ||original.configuration.policyHash!==config.policyHash||original.configuration.codeRevision!==config.codeRevision)throw Error("SAV_INTAKE_HUMAN_REVALIDATION_REQUIRED");
+ }else if(!await intakeRunConfigurationBound(parent,config,db))throw Error("SAV_INTAKE_HUMAN_REVALIDATION_REQUIRED");
+ return parent;
 }

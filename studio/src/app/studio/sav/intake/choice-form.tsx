@@ -102,6 +102,6 @@ export function IntakeChoiceForm(props: IntakeChoiceFormProps) {
     {eventId && <p role="status">Commande enregistrée : {eventId}. Consultez ses effets confirmés dans le dossier.</p>}
     {(unknown || recorded) && <button type="button" className="secondary" onClick={inspect} disabled={checking} aria-busy={checking}>Vérifier la commande enregistrée</button>}
     {inspection.message && <p role="status">{inspection.message}</p>}
-    <p><small>Le motif est conservé avec la correction. Il n’ajoute pas de contexte libre à l’analyse de l’agent ; cette fonction n’est pas encore disponible.</small></p>
+    <p><small>Le motif est conservé avec la correction. Il n’ajoute pas de contexte libre à l’analyse de l’agent ; utilisez le champ distinct « Informations pour l’agent » lorsqu’il est disponible.</small></p>
   </form>;
 }

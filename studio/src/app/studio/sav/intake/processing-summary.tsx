@@ -13,7 +13,6 @@ export function IntakeProcessingSummary({ status, cause, question, lastActivity,
     {cause && <p>{cause}</p>}
     {lastActivity && <p>Dernière trace enregistrée : {lastActivity}</p>}
     <p>{next}</p>
-    <button type="button" className="secondary" disabled aria-describedby="intake-resume-reason">Reprendre le traitement</button>
-    <p id="intake-resume-reason">La reprise manuelle par étape n’est pas encore disponible dans ce parcours. L’administration peut consulter le diagnostic et les vérifications existantes, sans répéter un effet confirmé.</p>
+    <p>Les reprises disponibles sont proposées aux opérateurs autorisés dans le panneau de poursuite. Le diagnostic conserve les causes et les résultats déjà confirmés.</p>
   </section>;
 }

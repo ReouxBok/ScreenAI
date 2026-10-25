@@ -70,6 +70,9 @@ jobs:
         run: env -i PATH="$PATH" HOME="$HOME" CI=1 npm run test:e2e --prefix studio -- --config playwright.sav73.config.ts
       - if: matrix.suite == 'sav83'
         run: env -i PATH="$PATH" HOME="$HOME" CI=1 npm run test:e2e --prefix studio -- --config playwright.sav83.config.ts
+      - name: SAV intake UX command and navigation qualification
+        if: matrix.suite == 'isolated'
+        run: env -i PATH="$PATH" HOME="$HOME" CI=1 SAV_UX_ARTIFACT_DIR="$GITHUB_WORKSPACE/studio/test-results/sav-intake-ux" node studio/scripts/verify-sav-intake-ux.mjs
       - name: Preserve Studio browser diagnostics
         if: always()
         uses: actions/upload-artifact@v4
@@ -160,6 +163,8 @@ jobs:
         working-directory: studio
         run: >-
           node node_modules/vitest/vitest.mjs run --maxWorkers=1 --no-file-parallelism
+          src/lib/sav/intake-ux/operator-commands.test.ts
+          src/lib/sav/intake-ux/orientation-store.test.ts
           src/lib/sav/intake/runtime.test.ts
           src/lib/sav/intake/execution.test.ts src/lib/sav/intake/console.test.ts
           src/lib/sav/intake/audit-history.test.ts
