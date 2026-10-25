@@ -5,10 +5,11 @@ import { savContentHash } from "./crypto";
 import { redactSavLearningText } from "./learning-extraction";
 import { admitSavAttachmentImage, type SavAdmittedImage } from "./attachment-image";
 import { requestSavGeminiJson, withSavAttachmentReadBudget, withSavAiBudget } from "./gemini-transport";
-import { SAV_ATTACHMENT_LIMITS, SAV_ATTACHMENT_READER_REVISION, savAttachmentReasonSchema, type SavAttachmentMetadata, type SavAttachmentObservation, type SavAttachmentRead, type SavAttachmentReference } from "./attachment-contract";
+import { SAV_ATTACHMENT_LIMITS, SAV_ATTACHMENT_READER_REVISION, SAV_VISUAL_OBSERVATION_LIMITS, savAttachmentReasonSchema, type SavAttachmentMetadata, type SavAttachmentObservation, type SavAttachmentRead, type SavAttachmentReference } from "./attachment-contract";
 
-export const savVisualResultSchema = z.object({ images: z.array(z.object({ index: z.number().int().min(0).max(2), readability: z.enum(["readable", "partial", "unreadable"]), text: z.string().max(4000),
-  uncertainties: z.array(z.string().max(300)).max(8), regions: z.array(z.object({ text: z.string().max(1000), box: z.tuple([z.number().min(0).max(1000), z.number().min(0).max(1000), z.number().min(0).max(1000), z.number().min(0).max(1000)]).nullable() }).strict()).max(8) }).strict()).max(3) }).strict();
+const V = SAV_VISUAL_OBSERVATION_LIMITS, coordinate = z.number().min(0).max(V.coordinate);
+export const savVisualResultSchema = z.object({ images: z.array(z.object({ index: z.number().int().min(0).max(V.images - 1), readability: z.enum(["readable", "partial", "unreadable"]), text: z.string().max(V.text),
+  uncertainties: z.array(z.string().max(V.uncertainty)).max(V.uncertainties), regions: z.array(z.object({ text: z.string().max(V.regionText), box: z.tuple([coordinate, coordinate, coordinate, coordinate]).nullable() }).strict()).max(V.regions) }).strict()).max(V.images) }).strict();
 const visualResponseSchema = { type: "OBJECT", properties: { images: { type: "ARRAY", items: { type: "OBJECT", properties: {
   index: { type: "INTEGER" }, readability: { type: "STRING", enum: ["readable", "partial", "unreadable"] }, text: { type: "STRING" },
   uncertainties: { type: "ARRAY", items: { type: "STRING" } }, regions: { type: "ARRAY", items: { type: "OBJECT", properties: { text: { type: "STRING" }, box: { type: "ARRAY", items: { type: "NUMBER" }, nullable: true } }, required: ["text", "box"] } },

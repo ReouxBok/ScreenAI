@@ -9,7 +9,7 @@ import { savThreads, savMessages, savIntakeRuns, savIntakeJournal, savIntakeHuma
 import { decryptSavPayload, encryptSavPayload } from "../crypto";
 import { intakeRuntimeHash, savIntakeRuntimeConfig, type IntakeRuntimeConfig, type IntakeRuntimePayload } from "./runtime-contract";
 import { intakeConsoleInstalled } from "./console-capability";
-import { humanRevisionConfigHash, intakeRunConfigurationBound, type HumanEventPayload } from "./human-binding";
+import { humanRevisionConfigHash, intakeRunConfigurationBound, intakeReanalysisParent, type HumanEventPayload } from "./human-binding";
 import { assertSavIntakeCallPlan } from "./runtime-store";
 import { createIntakeModelDispatcher } from "./model-dispatch";
 import { createSavIntakeSemanticReaders, SAV_INTAKE_MODEL_REVISION } from "./model-readers";
@@ -29,9 +29,10 @@ import type { ExecutionPayload, EffectAck } from "./execution-types";
 async function mergedHumanResolution(event:typeof savIntakeHumanEvents.$inferSelect,parent:typeof savIntakeRuns.$inferSelect,value:HumanEventPayload,config:IntakeRuntimeConfig) {
   const resolution:NonNullable<EngineInput["humanResolution"]>={choiceId:event.id,at:event.createdAt.toISOString(),equivalentContactIds:value.candidateContactIds,inheritedChoiceIds:[],fieldSources:{}};
   if(value.reinvestigate) resolution.suppressOutbound=true;
+  let expectedSourceHash=event.sourceHash,expectedBaseConfigHash=config.configHash;
   const apply=(source:typeof event,body:HumanEventPayload)=>{
     if(body.reinvestigate)resolution.suppressOutbound=true;
-    if(body.policyHash!==config.policyHash||body.resourcesHash!==config.resourcesHash||source.sourceHash!==event.sourceHash) return conflict();
+    if(body.policyHash!==config.policyHash||body.resourcesHash!==config.resourcesHash||source.sourceHash!==expectedSourceHash) return conflict();
     if(body.candidatesHash!==value.candidatesHash) {
       // A fresh server reanalysis can introduce candidates after an automatic
       // Other decision. Never carry a contact/ticket choice across that scope.
@@ -46,11 +47,19 @@ async function mergedHumanResolution(event:typeof savIntakeHumanEvents.$inferSel
   };
   apply(event,value);
   let run=parent;
-  for(let depth=0;run.humanChoiceCiphertext;depth++) {
+  for(let depth=0;;depth++) {
     if(depth>=200)return conflict();
+    if(!run.humanChoiceCiphertext){
+      const payload=decryptSavPayload<IntakeRuntimePayload>(run.payloadCiphertext);
+      const ancestor=await intakeReanalysisParent(run,payload,config);
+      if(!ancestor)break;
+      // The bridge validator permits absent metadata only for an exact current
+      // automatic ancestor; its row hash is then the validated configuration.
+      expectedSourceHash=ancestor.sourceHash!;expectedBaseConfigHash=decryptSavPayload<IntakeRuntimePayload>(ancestor.payloadCiphertext).configuration?.configHash??ancestor.configHash;run=ancestor;continue;
+    }
     const choice=decryptSavPayload<{eventId:string}>(run.humanChoiceCiphertext);
     const [ancestor]=await requireDb().select().from(savIntakeHumanEvents).where(eq(savIntakeHumanEvents.id,choice.eventId));
-    if(!ancestor||ancestor.state!=="consumed"||ancestor.kind==="refuse"||ancestor.revisionRunId!==run.id||ancestor.baseConfigHash!==config.configHash||ancestor.messageId!==event.messageId||ancestor.threadId!==event.threadId)return conflict();
+    if(!ancestor||ancestor.state!=="consumed"||ancestor.kind==="refuse"||ancestor.revisionRunId!==run.id||ancestor.baseConfigHash!==expectedBaseConfigHash||ancestor.messageId!==event.messageId||ancestor.threadId!==event.threadId)return conflict();
     const body=decryptSavPayload<HumanEventPayload>(ancestor.payloadCiphertext);
     apply(ancestor,body);resolution.inheritedChoiceIds!.push(ancestor.id);
     const [previous]=await requireDb().select().from(savIntakeRuns).where(eq(savIntakeRuns.id,ancestor.parentRunId));
@@ -222,7 +231,7 @@ export async function consumeIntakeHumanEvent(id: string, config: IntakeRuntimeC
         || !await intakeRunConfigurationBound(current, config, tx, event.id)) return conflict();
       const [last] = await tx.select({ version: savIntakeRuns.version }).from(savIntakeRuns).where(eq(savIntakeRuns.threadId, event.threadId)).orderBy(desc(savIntakeRuns.version)).limit(1);
       await tx.update(savIntakeRuns).set({ isCurrent: false, state: "superseded", freshUntil: null, leaseToken: null, leaseUntil: null }).where(eq(savIntakeRuns.id, parent.id));
-      const payload: IntakeRuntimePayload = { ...original, input, plan, reason, semantics, ...(attachments ? {attachments:attachments.state}:{}), other:undefined, traces: [...(original.traces ?? []), { humanEventId: id,
+      const payload: IntakeRuntimePayload = { ...original, input, plan, reason, semantics, ...(attachments ? {attachments:attachments.state}:{}), other:undefined, readRecovery:undefined, reanalysisParent:undefined, traces: [...(original.traces ?? []), { humanEventId: id,
         semanticReuse: needsAnalysis?"new_budgeted_analysis":"accepted_results_exact_inputs", modelCalled: needsAnalysis, automaticAttemptsUnchanged: true }] };
       const [run] = await tx.insert(savIntakeRuns).values({ threadId: event.threadId, messageId: event.messageId, version: last.version + 1,
         configHash: humanRevisionConfigHash(config.configHash, id), policyHash: config.policyHash, sourceHash: event.sourceHash,

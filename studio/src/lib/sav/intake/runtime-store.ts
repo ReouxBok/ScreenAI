@@ -1,4 +1,5 @@
 import { readRecoveryDue, DEFAULT_INTAKE_READ_RECOVERY } from "./read-recovery";
+import { readIntakeOperatorInformation } from "./operator-information";
 import { writeReadRecoveryMarker,readRecoverySql,noReadRecoverySql } from "./read-recovery-store";
 import { readSavExternalCompletion, listSavExternalCompletionMessageIds } from "../external-completion";
 import "server-only";
@@ -69,6 +70,8 @@ export async function savIntakeSourceSnapshot(tx: Pick<Tx, "select">, message: t
       bodyComplete: typeof body.text === "string" && body.text.length < 100_000, unresolvedAttachments: Boolean(body.attachments?.length) || body.attachmentInventory !== undefined && !savAttachmentInventorySchema.safeParse(body.attachmentInventory).data?.complete }) };
   });
   const current = prepared.find(p => p.message.id === message.id); if (!current) return fail();
+  const information = await readIntakeOperatorInformation(message.threadId, message.id, tx);
+  if (information) current.message = { ...current.message, operatorInformation: information };
   let previousIdentification: EngineInput["previousIdentification"], identificationContinuation: EngineInput["identificationContinuation"];
   const [episode] = await tx.select().from(savIntakeIdentityEpisodes).where(eq(savIntakeIdentityEpisodes.threadId, message.threadId));
   if (episode && episode.initialMessageId !== message.id && episode.initialEffectId) {
@@ -93,12 +96,14 @@ export async function savIntakeSourceSnapshot(tx: Pick<Tx, "select">, message: t
   // re-encrypted with a fresh IV whenever derived data (CRM context, attachment
   // reads) is stored, and thread timestamps/pause flags move without new
   // evidence: neither may invalidate an analysis on its own.
-  const sourceHash = intakeRuntimeHash({ revision: SAV_INTAKE_SOURCE_REVISION, rows: rows.map(row => ({ ...identity(row), content: intakeSourceContentHash(row.bodyCiphertext) })),
+  const messageSourceHash = intakeRuntimeHash({ revision: SAV_INTAKE_SOURCE_REVISION, rows: rows.map(row => ({ ...identity(row), content: intakeSourceContentHash(row.bodyCiphertext) })),
     ...(identificationContinuation ? {identificationContinuation} : {}), thread: { ticketId: thread?.ticketId ?? null } });
   // v1, kept only to recognize runs recorded before the v2 upgrade.
-  const legacySourceHash = intakeRuntimeHash({ rows: rows.map(row => ({ ...identity(row), bodyCiphertext: row.bodyCiphertext })),
+  const legacyMessageHash = intakeRuntimeHash({ rows: rows.map(row => ({ ...identity(row), bodyCiphertext: row.bodyCiphertext })),
     ...(identificationContinuation ? {identificationContinuation} : {}), thread });
-  return { sourceHash, legacySourceHash, body: current.body, provenance: new Map(prepared.map(p => [p.message.id, p.provenance])),
+  const bind = (hash: string) => information ? intakeRuntimeHash({ exchangedSources: hash, operatorInformation: information }) : hash;
+  const sourceHash = bind(messageSourceHash), legacySourceHash = bind(legacyMessageHash);
+  return { sourceHash, legacySourceHash, messageSourceHash, body: current.body, provenance: new Map(prepared.map(p => [p.message.id, p.provenance])),
     input: { message: current.message, latestInboundMessageId: message.id, mode: "current", now: now.toISOString(), identificationAttemptId: message.id,
       ...(identificationContinuation ? {previousIdentification,identificationContinuation} : {}),
       conversation: { data: prepared.map(p => p.message).reverse(), status: rows.length > 50 ? "partial" : "complete", observedAt: now.toISOString() } } satisfies EngineInput };

@@ -267,6 +267,13 @@
       "when": 1792609200000,
       "tag": "0043_sav_intake_launch_guards",
       "breakpoints": true
+    },
+    {
+      "idx": 38,
+      "version": "7",
+      "when": 1792958400000,
+      "tag": "0044_sav_operator_command_indexes",
+      "breakpoints": true
     }
   ]
 }

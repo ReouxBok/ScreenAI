@@ -407,7 +407,12 @@ export const auditLogs = pgTable("audit_logs", {
   entityId: text("entity_id").notNull(),
   technicalMetadata: jsonb("technical_metadata").$type<Record<string, string | number | boolean | null>>().notNull().default({}),
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
-});
+}, t => [
+  index("sav_operator_message_idx").on(t.entityId, sql`(${t.technicalMetadata}->>'messageId')`, sql`(${t.technicalMetadata}->>'kind')`, t.createdAt.desc(), t.id.desc())
+    .where(sql`${t.action}='sav_intake_operator_command' and ${t.entityType}='sav_intake_operator_command'`),
+  index("sav_operator_pending_idx").on(sql`(${t.technicalMetadata}->>'state')`, t.createdAt, t.id)
+    .where(sql`${t.action}='sav_intake_operator_command' and ${t.entityType}='sav_intake_operator_command' and ${t.technicalMetadata}->>'kind'='resume'`),
+]);
 
 // The support inbox contains customer communications and therefore lives in
 // its own PostgreSQL namespace. Message bodies are encrypted by the service;

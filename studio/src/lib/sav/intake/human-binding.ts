@@ -44,11 +44,13 @@ export async function intakeRunConfigurationBound(run: typeof savIntakeRuns.$inf
     if(!event||event.parentRunId!==run.id||event.parentVersion!==run.version||event.messageId!==run.messageId||event.threadId!==run.threadId
       ||event.baseConfigHash!==config.configHash||event.sourceHash!==run.sourceHash||event.kind!=="classify"||!["pending","reading","consumed"].includes(event.state))return false;
     const value=decryptSavPayload<HumanEventPayload>(event.payloadCiphertext),payload=decryptSavPayload<import("./runtime-contract").IntakeRuntimePayload>(run.payloadCiphertext);
-    return value.reinvestigate===true&&value.revision==="sav-intake-human.v1"&&value.mailboxId===config.mailboxId
+    const ancestor=await intakeReanalysisParent(run,payload,config,db);
+    const candidates=ancestor?await intakeRunCandidateContactIds(ancestor,decryptSavPayload(ancestor.payloadCiphertext),db):[];
+    return candidates!==null&&value.reinvestigate===true&&value.revision==="sav-intake-human.v1"&&value.mailboxId===config.mailboxId
       &&run.policyHash===config.policyHash&&value.policyHash===config.policyHash&&value.resourcesHash===config.resourcesHash
       &&payload.configuration?.configHash===config.configHash&&payload.configuration.resourcesHash===config.resourcesHash
       &&payload.configuration.codeRevision===config.codeRevision&&value.parentPayloadHash===intakeRuntimeHash(payload)
-      &&value.candidatesHash===intakeRuntimeHash(value.candidateContactIds)&&value.candidateContactIds.length===0&&!value.contactId&&!value.ticketId;
+      &&value.candidatesHash===intakeRuntimeHash(value.candidateContactIds)&&intakeRuntimeHash(candidates)===value.candidatesHash&&!value.contactId&&!value.ticketId;
   }
   if (run.configHash === config.configHash) {
     if (run.humanChoiceCiphertext !== null) return false;
@@ -104,4 +106,41 @@ export async function intakeRunCandidateContactIds(run:typeof savIntakeRuns.$inf
     return candidates;
   }
   return [...value.candidateContactIds].sort();
+}
+
+/** Historical configuration is evidence provenance only. It cannot claim a
+ * worker, reuse accepted semantics or grant an old plan current authority. */
+function reanalysisEvidenceConfiguration(payload:import("./runtime-contract").IntakeRuntimePayload,config:IntakeRuntimeConfig,run:Pick<typeof savIntakeRuns.$inferSelect,"configHash"|"policyHash"|"humanChoiceCiphertext">){
+ const old=payload.configuration;
+ // The persisted contract permits omitted metadata. Only an exact current
+ // automatic binding can supply it; absence never proves an older revision.
+ if(old===undefined&&run.configHash===config.configHash&&run.policyHash===config.policyHash&&run.humanChoiceCiphertext===null)return config;
+ if(!old||old.policyHash!==config.policyHash||old.resourcesHash!==config.resourcesHash||old.model!==config.model
+   ||!/^[a-f0-9]{64}$/.test(old.configHash)||!/^[a-f0-9]{40}$/.test(old.codeRevision))return null;
+ return {...config,configHash:old.configHash,codeRevision:old.codeRevision};
+}
+export async function intakeRunReanalysisConfiguration(run:typeof savIntakeRuns.$inferSelect,config:IntakeRuntimeConfig,
+ db:Pick<ReturnType<typeof requireDb>,"select">=requireDb()){
+ if(run.policyHash!==config.policyHash)return null;
+ const historical=reanalysisEvidenceConfiguration(decryptSavPayload(run.payloadCiphertext),config,run);
+ return historical&&await intakeRunConfigurationBound(run,historical,db)?historical:null;
+}
+
+/** A server-created bridge is immutable in the new parent payload. It keeps
+ * an old choice chain applicable only across an operator-context revision of
+ * the same exchanged message; the recording transaction checks raw sources. */
+export async function intakeReanalysisParent(run:typeof savIntakeRuns.$inferSelect,payload:import("./runtime-contract").IntakeRuntimePayload,
+ config:IntakeRuntimeConfig,db:Pick<ReturnType<typeof requireDb>,"select">=requireDb()) {
+ const bridge=payload.reanalysisParent;if(!bridge)return null;
+ const [parent]=await db.select().from(savIntakeRuns).where(eq(savIntakeRuns.id,bridge.runId));
+ if(!parent||parent.version>=run.version||parent.threadId!==run.threadId||parent.messageId!==run.messageId||parent.sourceHash!==bridge.sourceHash
+   ||intakeRuntimeHash(decryptSavPayload(parent.payloadCiphertext))!==bridge.payloadHash||parent.policyHash!==config.policyHash)throw Error("SAV_INTAKE_HUMAN_REVALIDATION_REQUIRED");
+ const original=decryptSavPayload<import("./runtime-contract").IntakeRuntimePayload>(parent.payloadCiphertext);
+ const historical=reanalysisEvidenceConfiguration(original,config,parent);
+ if(!historical)throw Error("SAV_INTAKE_HUMAN_REVALIDATION_REQUIRED");
+ if(parent.configHash===historical.configHash&&!parent.humanChoiceCiphertext){
+  // The recording transaction validated this base before the new event existed.
+  // Its immutable bridge cannot make the old run current or executable again.
+ }else if(!await intakeRunConfigurationBound(parent,historical,db))throw Error("SAV_INTAKE_HUMAN_REVALIDATION_REQUIRED");
+ return parent;
 }

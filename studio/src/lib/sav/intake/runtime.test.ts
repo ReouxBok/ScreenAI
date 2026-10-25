@@ -712,7 +712,7 @@ it.each(["valid_repair", "invalid_repair", "invalid_box", "unknown_usage", "shor
     wireBodies.push(wire);
     const answer = wireBodies.length === 2 && ["valid_repair", "short_deadline"].includes(scenario)
       ? { messageId, requests: [{ id: "r1", kind: "acknowledgement", currentMessageId: messageId, quoteId: data.citationCatalogue[0].id }], images: [{ index: 0, readability: "readable", text: "Error E42", uncertainties: [], regions: [] }] }
-      : scenario === "invalid_box" ? {messageId,requests:[{id:"r1",kind:"acknowledgement",currentMessageId:messageId,quoteId:data.citationCatalogue[0].id}],images:[{index:0,readability:"readable",text:"Synthetic",uncertainties:[],regions:[{text:"Synthetic",box:[0,0,0,0,0]}]}]} : { privateRejectedValue: "SYNTHETIC_REJECTED_CANARY", requests: null };
+      : scenario === "invalid_box" ? {messageId,requests:[{id:"r1",kind:"acknowledgement",currentMessageId:messageId,quoteId:data.citationCatalogue[0].id}],images:[{index:0,readability:"readable",text:"Synthetic",uncertainties:[],regions:[{text:"Synthetic",box:["0","0","0","0"]}]}]} : { privateRejectedValue: "SYNTHETIC_REJECTED_CANARY", requests: null };
     return Response.json({ candidates: [{ finishReason: "STOP", content: { parts: [{ text: JSON.stringify(answer) }] } }], usageMetadata: scenario === "unknown_usage" ? { promptTokenCount: 1220 } : { promptTokenCount: 1220, candidatesTokenCount: 200, thoughtsTokenCount: 0, totalTokenCount: 1420 } });
   });
   const deps = { env: () => environment, network, downloadAttachments: async () => bytes, ...(scenario === "short_deadline" ? { deadlineMs: Date.now() + 65_000 } : {}) };
@@ -725,6 +725,7 @@ it.each(["valid_repair", "invalid_repair", "invalid_box", "unknown_usage", "shor
   }
   const current = await readSavIntakeCurrent(threadId, config);
   expect(current?.attempts).toBe(["unknown_usage", "short_deadline"].includes(scenario) ? 1 : 2);
+  // A non-numeric box stays structurally invalid; a numeric box of the wrong shape is normalized (output-contract-runtime.test).
   if(scenario==="invalid_box"){
     expect(current?.payload.attachments?.read.observations[0]).toMatchObject({status:"not_read",reason:"validation_failed"});
     expect(JSON.stringify(current?.payload.traces)).toContain("images.0.regions.0.box");

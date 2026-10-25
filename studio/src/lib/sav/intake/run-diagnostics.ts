@@ -11,10 +11,18 @@ const object = (v: unknown): Record<string, unknown> => v !== null && typeof v =
 const publicCodes = new Set<string>([...Object.keys(intakeContextReasonLabels), ...savAttachmentReasonSchema.options, ...savAttachmentStatusSchema.options,
   "queued", "claimed", "waiting", "observed", "superseded", "interrupted", "obsolete_partial_result", "budget_deferred_before_attempt",
   "attempts_exhausted", "paused", "usage_uncertain", "unknown_anchor", "wrong_anchor_source", "ambiguous_quote_format", "unknown_source",
-  "excerpt_not_in_source", "required_source_missing", "message_id_mismatch", "registration_source_invalid", "output_schema_invalid",
+  "excerpt_not_in_source", "required_source_missing", "message_id_mismatch", "registration_source_invalid", "output_schema_invalid", "visual_structure_invalid",
   "request_limit", "operation_forbidden", "partial_response", "total_mismatch", "pagination_cycle", "page_limit", "archived_contact",
   "aliases_unavailable", "batch_limit", "partial_batch", "conflicting_contact", "contact_limit", "cancelled", "read_unavailable",
   "ticket_limit", "ticket_membership_conflict", "ticket_content_unavailable", "history_limit", "history_date_unknown", "read_retry_scheduled", "read_retry_stopped", "read_retry_claimed"]);
+const outputStages = new Set(["sanitize_wire", "visual_normalize", "decode", "final_schema", "evidence"]);
+const normalizationCounts = ["nullOptionalKeys", "partialImages", "truncatedImageTexts", "truncatedUncertainties", "droppedUncertainties", "droppedRegions", "truncatedRegionTexts", "invalidBoxes", "omittedChars"];
+/** Allow-listed integer counters only; values and texts are never projected. */
+function outputNormalization(raw: unknown) {
+  const n = raw !== null && typeof raw === "object" && !Array.isArray(raw) ? raw as Record<string, unknown> : null;
+  if (!n) return null;
+  return Object.fromEntries(normalizationCounts.map(k => [k, typeof n[k] === "number" && Number.isSafeInteger(n[k]) && (n[k] as number) >= 0 ? n[k] : null]));
+}
 const code = (v: unknown) => typeof v === "string" && (/^(?:SAV_[A-Z0-9_]{1,90}|HUBSPOT_HTTP_\d{3})$/.test(v) || publicCodes.has(v)) ? v : null;
 const count = (v: unknown) => typeof v === "number" && Number.isSafeInteger(v) && v >= 0 ? v : null;
 const methods = new Set(["analyseMessage", "assessIdentity", "assessIssues"]);
@@ -50,6 +58,8 @@ export function intakeDiagnosticPayload(ciphertext: string) {
         accepted: typeof t.accepted === "boolean" ? t.accepted : null,
         errorCode: code(t.errorCode), reason: code(t.reason), validationReason: code(validation.reason),
         schemaIssues: publicIntakeSchemaIssues(validation.issues),
+        validationStage: outputStages.has(String(validation.stage)) ? String(validation.stage) : null,
+        normalization: outputNormalization(t.normalization),
         transport:["local_guard","transport","http","response","deadline"].includes(String(transport.origin))?{origin:String(transport.origin),code:code(transport.code),attempts:count(transport.attempts),status:count(transport.status),durationMs:count(transport.durationMs)}:null,
         contextLimit: ["catalogue", "data", "wire"].includes(String(limit.stage)) ? { stage: String(limit.stage), bytes: count(limit.bytes), limitBytes: count(limit.limitBytes), breakdown: contextBreakdown(limit.breakdown) } : null };
     });
