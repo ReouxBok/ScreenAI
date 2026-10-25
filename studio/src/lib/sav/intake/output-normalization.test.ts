@@ -52,6 +52,20 @@ describe("visual observations are bounded explicitly, never silently", () => {
     const four = { images: [0, 1, 2, 2].map(index => image({ index })) };
     expect((visual(four).value as { images: unknown[] }).images).toHaveLength(4);
   });
+  it.each([
+    ["unknown key in a discarded region", { regions: [...Array.from({ length: 8 }, () => ({ text: "zone", box: null })), { text: "zone", box: null, extra: true }] }],
+    ["invalid text type in a discarded region", { regions: [...Array.from({ length: 8 }, () => ({ text: "zone", box: null })), { text: 42, box: null }] }],
+    ["non-numeric box in a discarded region", { regions: [...Array.from({ length: 8 }, () => ({ text: "zone", box: null })), { text: "zone", box: ["a", "b", "c", "d"] }] }],
+    ["invalid type in a discarded uncertainty", { uncertainties: [...Array.from({ length: 8 }, () => "incertain"), 42] }],
+    ["invalid uncertainty displaced by a normalization note", { uncertainties: [...Array.from({ length: 7 }, () => "incertain"), 42], regions: Array.from({ length: 9 }, () => ({ text: "zone", box: null })) }],
+  ])("keeps structural errors visible before any truncation: %s", (_name, over) => {
+    const raw = { images: [image(over)] }, before = structuredClone(raw);
+    const { value, counts } = visual(raw);
+    expect(() => savVisualResultSchema.parse(value)).toThrow();
+    expect(raw).toEqual(before);
+    expect(value).toEqual(raw);
+    expect(Object.values(counts).every(v => v === 0)).toBe(true);
+  });
   it("masks secrets before cutting so a prefix never ends inside a secret", () => {
     const token = "A".repeat(30), text = "x ".repeat((V.text - 10) / 2) + `jeton ${token} fin`;
     const img = first(visual({ images: [image({ text })] }).value);

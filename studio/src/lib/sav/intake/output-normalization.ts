@@ -1,3 +1,4 @@
+import { z } from "zod";
 import { SAV_VISUAL_OBSERVATION_LIMITS as V } from "../attachment-contract";
 import { redactSavAttachmentText } from "../attachment-reader";
 
@@ -19,6 +20,13 @@ export function addIntakeOutputNormalization(into: IntakeOutputNormalization, fr
   for (const key of Object.keys(into) as (keyof IntakeOutputNormalization)[]) into[key] += from[key];
 }
 
+// Inspect every entry before taking a bounded prefix. Only size constraints and
+// finite numeric box shape/scale may be normalized; type/key errors must survive
+// unchanged so the strict wire validator can report them, including in the tail.
+const visualDetailsStructure = z.object({
+  regions: z.array(z.object({ text: z.string(), box: z.array(z.number()).nullable() }).strict()),
+  uncertainties: z.array(z.string()),
+}).strict();
 const record = (value: unknown): value is Record<string, unknown> => !!value && typeof value === "object" && !Array.isArray(value);
 /** Mask before cutting: a prefix never ends inside a secret the masker would miss. */
 function bounded(value: string, limit: number, n: IntakeOutputNormalization) {
@@ -36,6 +44,7 @@ const numericBox = (box: unknown) => Array.isArray(box) && box.every(v => typeof
  * types, unknown keys and source links are left untouched so they still fail. */
 function normalizeImage(raw: unknown, n: IntakeOutputNormalization) {
   if (!record(raw)) return raw;
+  if (!visualDetailsStructure.safeParse({ regions: raw.regions, uncertainties: raw.uncertainties }).success) return raw;
   const image = { ...raw };
   let cut = false, invalidBox = false;
   if (typeof image.text === "string") {

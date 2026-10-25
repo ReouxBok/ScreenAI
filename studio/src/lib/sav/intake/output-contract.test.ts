@@ -93,6 +93,17 @@ describe("visual contract: bounded overflows become partial, structure stays str
     expect(r.outcome).not.toHaveProperty(key);
     expect(r.traces.at(-1)?.normalization).toMatchObject({ nullOptionalKeys: 1 });
   });
+  it.each([
+    ["invalid region discarded by the prefix", (v: Raw) => { v.images[0].regions = [...Array.from({ length: 8 }, () => ({ text: "zone", box: null })), { text: "zone", box: ["a", "b", "c", "d"] }]; }],
+    ["invalid uncertainty discarded by the prefix", (v: Raw) => { Object.assign(v.images[0], { uncertainties: [...Array.from({ length: 8 }, () => "incertain"), 42] }); }],
+    ["invalid uncertainty displaced by a warning", (v: Raw) => { Object.assign(v.images[0], { uncertainties: [...Array.from({ length: 7 }, () => "incertain"), 42] }); v.images[0].regions = Array.from({ length: 9 }, () => ({ text: "zone", box: null })); }],
+  ])("%s: strict wire validation rejects the entire malformed observation", async (_name, mutate) => {
+    const r = await run(mutate);
+    expect(r.outcome).toBe("SAV_INTAKE_MODEL_OUTPUT_REJECTED");
+    expect(r.bodies).toHaveLength(1);
+    expect(r.traces.at(-1)?.validationFailure).toMatchObject({ reason: "output_schema_invalid", stage: "sanitize_wire" });
+    expect(r.observations).toHaveLength(0);
+  });
   it("prompt carries the validator limits", async () => {
     const r = await run(() => {});
     const data = JSON.parse(r.bodies[0].body.contents[0].parts[0].text) as { visualInstructions: string };
