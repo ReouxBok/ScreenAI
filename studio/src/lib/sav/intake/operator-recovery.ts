@@ -8,23 +8,28 @@ import {canAccessSav} from "../access";
 import {decryptSavPayload,encryptSavPayload} from "../crypto";
 import {executionAdministrator} from "./execution-policy";
 import {admissionLock,finishVerifiedIdentityRecovery} from "./execution-store";
-import {intakeHumanRefused,operatorRecoveryConfigHash,type HumanEventPayload} from "./human-binding";
+import {intakeHumanRefused,intakeRunReanalysisConfiguration,intakeRunCandidateContactIds,operatorRecoveryConfigHash,type HumanEventPayload} from "./human-binding";
 import {intakeLaunchMatches} from "./launch-boundary";
-import {savIntakeSourceSnapshot} from "./runtime-store";
+import {savIntakeSourceSnapshot,intakeSourceMatches} from "./runtime-store";
 import {savIntakeRuntimeConfig,intakeRuntimeHash,SAV_INTAKE_RUNTIME_REVISION,type IntakeRuntimePayload} from "./runtime-contract";
 import {planSavIntake} from "./engine";
 import type {IntakeAdapters} from "./engine-types";
 import {reconcileIntakeEffectCandidate} from "./executor";
 import {createIntakeExecutorAdapters} from "./execution-adapters";
-const request=z.object({threadId:z.uuid(),messageId:z.uuid(),reason:z.string().trim().min(10).max(2000)}).strict();
+const request=z.object({threadId:z.uuid(),messageId:z.uuid(),reason:z.string().trim().min(10).max(2000),commandKey:z.uuid().optional()}).strict();
+type RecoveryTx=Parameters<typeof admissionLock>[0];
+type RecoverySnapshot=Awaited<ReturnType<typeof savIntakeSourceSnapshot>>;
 const conflict=():never=>{throw Error("SAV_INTAKE_RECOVERY_CONFLICT");};
-/** Explicit administrator continuation, once per message. It neither resets
+/** Explicit administrator continuation, once per message/context/configuration revision. It neither resets
  * automatic attempts nor admits more than the existing three model calls.
  * No credential, model or external write is used while recording the request. */
 export async function requestIntakeReinvestigation(raw:unknown){
  const actor=await executionAdministrator(),command=request.parse(raw),config=savIntakeRuntimeConfig();
  if(!config)return conflict();
- return requireDb().transaction(async tx=>{
+ return requireDb().transaction(tx=>recordIntakeReinvestigation(tx,actor,command,config));
+}
+/** Shared atomic recording seam; callers hold the same admission transaction. */
+export async function recordIntakeReinvestigation(tx:RecoveryTx,actor:Awaited<ReturnType<typeof executionAdministrator>>,command:z.infer<typeof request>,config:NonNullable<ReturnType<typeof savIntakeRuntimeConfig>>,beforeInformation?:RecoverySnapshot){
   await admissionLock(tx);if(!await intakeLaunchMatches(config,tx))return conflict();
   const [active]=await tx.select().from(staffUsers).where(eq(staffUsers.id,actor.id)).for("update");
   if(!active?.active||!["admin","owner"].includes(active.role)||!canAccessSav(active.email,active.role))return conflict();
@@ -38,28 +43,39 @@ export async function requestIntakeReinvestigation(raw:unknown){
   const events=await tx.select().from(savIntakeHumanEvents).where(eq(savIntakeHumanEvents.messageId,message.id));
   if(events.some(e=>["pending","reading"].includes(e.state)))return conflict();
   const bodies=events.map(e=>decryptSavPayload<HumanEventPayload>(e.payloadCiphertext));
-  if(bodies.some(b=>b.reinvestigate||b.contactId||b.ticketId))return conflict();
-  const choices=[...new Set(bodies.map(b=>b.classification).filter(Boolean))];if(choices.length>1)return conflict();
+  const previous=runs.find(r=>r.isCurrent);
+  const priorSnapshot=beforeInformation??await savIntakeSourceSnapshot(tx,message,new Date());
+  if(previous?.sourceHash&&(!intakeSourceMatches(priorSnapshot,previous.sourceHash)||!await intakeRunReanalysisConfiguration(previous,config,tx)))return conflict();
+  const informationId=(await savIntakeSourceSnapshot(tx,message,new Date())).input.message.operatorInformation?.id??null;
+  for(let i=0;i<events.length;i++)if(bodies[i].reinvestigate){
+   const parent=runs.find(r=>r.id===events[i].parentRunId);
+   const input=parent?decryptSavPayload<IntakeRuntimePayload>(parent.payloadCiphertext).input as {message?:{operatorInformation?:{id:string}}}|undefined:undefined;
+   if((input?.message?.operatorInformation?.id??null)===informationId&&events[i].baseConfigHash===config.configHash)return conflict();
+  }
   const [execution]=await tx.select().from(savIntakeExecutions).where(eq(savIntakeExecutions.messageId,message.id)).for("update");
   if(execution?.state==="confirmed"||execution?.leaseUntil&&execution.leaseUntil>new Date())return conflict();
   if(execution){const effects=await tx.select().from(savIntakeEffects).where(eq(savIntakeEffects.executionId,execution.id)).for("update");
    if(effects.some(e=>e.state!=="planned"||e.dispatchedAt||e.dispatchToken||e.ackCiphertext||e.confirmedAt))return conflict();}
   const snapshot=await savIntakeSourceSnapshot(tx,message,new Date());
+  if(snapshot.messageSourceHash!==priorSnapshot.messageSourceHash)return conflict();
+  const previousPayload=previous?decryptSavPayload<IntakeRuntimePayload>(previous.payloadCiphertext):null;
+  const candidates=previous&&previousPayload?await intakeRunCandidateContactIds(previous,previousPayload,tx):[];
+  if(!candidates)return conflict();
   const forbidden=async():Promise<never>=>{throw Error("RECOVERY_RECORDING_HAS_NO_EXTERNAL_CAPABILITY");};
   const scaffold=await planSavIntake(snapshot.input,{analyseMessage:async()=>({messageId:message.id,requests:[]}),
    findContactsByEmail:forbidden,directAssociations:forbidden,getContact:forbidden,ticketsForContact:forbidden,ticketHistory:forbidden,assessIssues:forbidden} satisfies IntakeAdapters,config.policy);
   const [last]=await tx.select({version:savIntakeRuns.version}).from(savIntakeRuns).where(eq(savIntakeRuns.threadId,thread.id)).orderBy(desc(savIntakeRuns.version)).limit(1);
   const payload:IntakeRuntimePayload={revision:SAV_INTAKE_RUNTIME_REVISION,effects:"not_connected",input:snapshot.input,plan:scaffold,
-   configuration:{configHash:config.configHash,resourcesHash:config.resourcesHash,policyHash:config.policyHash,codeRevision:config.codeRevision,model:config.model}};
+   configuration:{configHash:config.configHash,resourcesHash:config.resourcesHash,policyHash:config.policyHash,codeRevision:config.codeRevision,model:config.model},
+   ...(previous?.sourceHash&&previousPayload?{reanalysisParent:{runId:previous.id,payloadHash:intakeRuntimeHash(previousPayload),sourceHash:previous.sourceHash,messageSourceHash:snapshot.messageSourceHash}}:{})};
   await tx.update(savIntakeRuns).set({isCurrent:false,state:"superseded",leaseToken:null,leaseUntil:null,freshUntil:null})
    .where(and(eq(savIntakeRuns.threadId,thread.id),eq(savIntakeRuns.isCurrent,true)));
   const eventId=randomUUID();
   const [parent]=await tx.insert(savIntakeRuns).values({threadId:thread.id,messageId:message.id,version:(last?.version??0)+1,
    configHash:operatorRecoveryConfigHash(config.configHash,eventId),policyHash:config.policyHash,state:"waiting",sourceHash:snapshot.sourceHash,payloadCiphertext:encryptSavPayload(payload)}).returning();
   const value:HumanEventPayload={revision:"sav-intake-human.v1",actor:{id:actor.id,email:actor.email},mailboxId:config.mailboxId,
-   policyHash:config.policyHash,resourcesHash:config.resourcesHash,candidatesHash:intakeRuntimeHash([]),candidateContactIds:[],
-   ...(choices[0]?{classification:choices[0]}:{}),reason:command.reason,parentPayloadHash:intakeRuntimeHash(payload),reinvestigate:true};
-  await tx.insert(savIntakeHumanEvents).values({id:eventId,commandKey:eventId,threadId:thread.id,messageId:message.id,parentRunId:parent.id,parentVersion:parent.version,
+   policyHash:config.policyHash,resourcesHash:config.resourcesHash,candidatesHash:intakeRuntimeHash(candidates),candidateContactIds:candidates,reason:command.reason,parentPayloadHash:intakeRuntimeHash(payload),reinvestigate:true};
+  await tx.insert(savIntakeHumanEvents).values({id:eventId,commandKey:command.commandKey??eventId,threadId:thread.id,messageId:message.id,parentRunId:parent.id,parentVersion:parent.version,
    baseConfigHash:config.configHash,sourceHash:snapshot.sourceHash,kind:"classify",state:"pending",payloadCiphertext:encryptSavPayload(value)});
   await tx.insert(savIntakeJournal).values({runId:parent.id,kind:"operator_reinvestigation_requested",payloadCiphertext:encryptSavPayload({eventId,priorRunIds:runs.map(r=>r.id),automaticAttemptsPreserved:runs.reduce((s,r)=>s+r.attempts,0),outboundSuppressed:true})});
   await tx.update(savMessages).set({analysisStatus:"intake_human_pending"}).where(eq(savMessages.id,message.id));
@@ -67,7 +83,6 @@ export async function requestIntakeReinvestigation(raw:unknown){
   await tx.insert(auditLogs).values({actorEmail:actor.email,action:"sav_intake_operator_reinvestigation",entityType:"sav_thread",entityId:thread.id,
    technicalMetadata:{messageId:message.id,eventId,runId:parent.id,priorRunCount:runs.length,outboundSuppressed:true}});
   return {eventId,runId:parent.id};
- });
 }
 /** Existing receipt only: the selected adapter exposes verify, never dispatch. */
 export async function reconcileThreadIdentification(threadId:string){

@@ -12,7 +12,8 @@ export function IntakeCompletionForm({ threadId, messageId, requestKey }: { thre
       <input type="hidden" name="messageId" value={messageId}/>
       <input type="hidden" name="requestKey" value={requestKey}/>
       <label><input type="checkbox" name="confirmed" required disabled={pending || state.ok}/> J’ai déjà traité cette demande.</label>
-      <button type="submit" disabled={pending || state.ok}>{pending ? "Classement en cours…" : "Passer en Terminés"}</button>
+      <button type="submit" disabled={pending || state.ok} aria-busy={pending}>Marquer traité hors Studio</button>
+      {pending && <p role="status">Classement administratif en cours…</p>}
       {state.message && <p role={state.ok ? "status" : "alert"}>{state.message}</p>}
     </form>
   </section>;

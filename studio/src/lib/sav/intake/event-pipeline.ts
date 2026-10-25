@@ -1,6 +1,7 @@
 import "server-only";
 import { eq } from "drizzle-orm";
 import { decryptSavPayload } from "../crypto";
+import { intakeRunConfigurationBound } from "./human-binding";
 import { intakeExecutionConfigurationBound } from "./execution-continuity";
 import type { ExecutionPayload } from "./execution-types";
 import { readSavExternalCompletion } from "../external-completion";
@@ -35,7 +36,7 @@ function runtimeConfig(env: Env): IntakeRuntimeConfig | string {
 async function currentRun(runId: string, config: IntakeRuntimeConfig) {
   const [run] = await requireDb().select().from(savIntakeRuns).where(eq(savIntakeRuns.id, runId));
   if (!run?.isCurrent) return null;
-  if (run.configHash === config.configHash) return run;
+  if (run.configHash === config.configHash || await intakeRunConfigurationBound(run,config)) return run;
   const [execution] = await requireDb().select().from(savIntakeExecutions).where(eq(savIntakeExecutions.messageId, run.messageId));
   return execution && await intakeExecutionConfigurationBound(execution, decryptSavPayload<ExecutionPayload>(execution.payloadCiphertext), config) ? run : null;
 }

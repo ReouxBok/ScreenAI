@@ -1227,3 +1227,11 @@ it.each(["sender", "recipients"])("refreshes other projections when one dossier 
   expect(following.epoch).toBe(following.projectedEpoch);
   expect(mutationsSent()).toHaveLength(0);
 });
+
+it("oldest and newest pagination retain chronological order and the exact filtered cohort",async()=>{
+ const threads=await db.db.insert(savThreads).values(Array.from({length:27},(_,i)=>({mailboxId,gmailThreadId:`ux-sort-${i}`,customerEmail:`sort${i}@example.invalid`}))).returning();
+ await db.db.insert(savMessages).values(threads.map((t,i)=>({mailboxId,threadId:t.id,direction:"inbound" as const,fromEmail:`sort${i}@example.invalid`,toEmails:["support@example.invalid"],subject:`UXSort ${i}`,receivedAt:new Date(Date.now()-86400000+i*1000),bodyCiphertext:encryptSavPayload({text:"Synthetic sort fixture"}),analysisStatus:"intake_waiting"})));
+ const oldest=await listIntakeConsole({view:"processing",search:"UXSort",sort:"oldest",page:2});
+ expect(oldest).toMatchObject({total:27,page:2,pages:2});expect(oldest.rows.map(r=>r.subject)).toEqual(["UXSort 25","UXSort 26"]);
+ const newest=await listIntakeConsole({view:"processing",search:"UXSort",sort:"newest",page:2});expect(newest.rows.map(r=>r.subject)).toEqual(["UXSort 1","UXSort 0"]);
+});

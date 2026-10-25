@@ -66,6 +66,7 @@ export type IntakeRuntimePayload = {
   configuration?: { configHash: string; resourcesHash: string; policyHash: string; codeRevision: string; model: string };
   semantics?:import("./semantic-records").AcceptedIntakeSemantics;
   readRecovery?: import("./read-recovery").IntakeReadRecovery;
+  reanalysisParent?: { runId: string; payloadHash: string; sourceHash: string; messageSourceHash: string };
   provenance?:unknown; traces?: unknown[]; reason?: string;
   effects: "not_connected";
 };

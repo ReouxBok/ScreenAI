@@ -1,5 +1,6 @@
 import { z } from "zod";
 import { savAttachmentObservationSchema } from "../attachment-contract";
+import { intakeOperatorInformationSchema } from "./operator-information-contract";
 import type { SavIntakeDecision, SavIntakeMutation } from "./contract";
 
 const id = z.string().regex(/^\d{1,30}$/);
@@ -10,6 +11,7 @@ export const intakeMessageSchema = z.object({
   // Transport must provide the current authored part, not quoted history/signatures.
   currentText: z.string().max(100_000), contentComplete: z.boolean(),
   direction: z.enum(["inbound", "outbound"]),
+  operatorInformation: intakeOperatorInformationSchema.optional(),
   attachmentInputs: z.array(z.object({ sourceId: ref, fileHash: z.string().regex(/^[a-f0-9]{64}$/) }).strict()).max(3).optional(),
 }).strict();
 export type IntakeMessage = z.infer<typeof intakeMessageSchema>;
