@@ -43,11 +43,11 @@ export async function guardOperatorCommand(tx: Tx, command: OperatorCommand, act
   const snapshot = await savIntakeSourceSnapshot(tx, message, now);
   if (!intakeSourceMatches(snapshot, run.sourceHash)) return conflict();
   const pending = await tx.select({ id: savIntakeHumanEvents.id }).from(savIntakeHumanEvents).where(and(eq(savIntakeHumanEvents.messageId, message.id), sql`${savIntakeHumanEvents.state} in ('pending','reading')`)).limit(1);
-  const calls = await tx.select({ id: savIntakeModelCalls.id }).from(savIntakeModelCalls).where(and(eq(savIntakeModelCalls.messageKey, intakeRuntimeHash(message.id)), sql`${savIntakeModelCalls.state} in ('dispatched','uncertain')`)).limit(1);
+  const calls = await tx.select({ id: savIntakeModelCalls.id,state:savIntakeModelCalls.state }).from(savIntakeModelCalls).where(eq(savIntakeModelCalls.messageKey, intakeRuntimeHash(message.id))).limit(4);
   const [execution] = await tx.select().from(savIntakeExecutions).where(eq(savIntakeExecutions.messageId, message.id)).for("update");
-  if (pending.length || calls.length || execution?.leaseUntil && execution.leaseUntil > now || execution && ["confirmed", "refused"].includes(execution.state)) return conflict();
+  if (pending.length || calls.some(c=>c.state!=="settled") || execution?.leaseUntil && execution.leaseUntil > now || execution && ["confirmed", "refused"].includes(execution.state)) return conflict();
   const effects = execution ? await tx.select().from(savIntakeEffects).where(eq(savIntakeEffects.executionId, execution.id)).for("update") : [];
-  return { actor, run, message, snapshot, execution, effects, payload: decryptSavPayload<IntakeRuntimePayload>(run.payloadCiphertext) };
+  return { actor, run, message, snapshot, execution, effects, callCount:calls.length, payload: decryptSavPayload<IntakeRuntimePayload>(run.payloadCiphertext) };
 }
 export async function operatorResumeStep(guard: Awaited<ReturnType<typeof guardOperatorCommand>>, config: IntakeRuntimeConfig, now = new Date(), db: Pick<ReturnType<typeof requireDb>, "select"> = requireDb()): Promise<{ step: OperatorStep; nextAt?: string }> {
   const { run, execution, effects, payload } = guard;
@@ -88,6 +88,7 @@ export async function recordOperatorCommand(raw: unknown): Promise<OperatorRecei
     let selected: { step: OperatorStep; nextAt?: string } = { step: "reanalysis" };
     if (command.kind === "resume") selected = await operatorResumeStep(guarded, config, now, tx);
     else {
+      if(guarded.callCount>=3)throw Error("SAV_INTAKE_OPERATOR_CALLS_EXHAUSTED");
       if (guarded.effects.some(e => e.state !== "planned" || e.dispatchedAt || e.dispatchToken || e.ackCiphertext || e.confirmedAt || e.verificationCiphertext)) return conflict();
       if (command.kind === "information") {
         const prior = await readIntakeOperatorInformation(command.threadId, command.messageId, tx);
@@ -116,6 +117,7 @@ export async function readOperatorReceipt(raw: { requestKey: string; threadId: s
   if (body.actorId !== actor.id || body.command.threadId !== raw.threadId || body.command.messageId !== raw.messageId) return null;
   const receipt: OperatorReceipt = { id: row.id, step: meta.step as OperatorStep, state: String(meta.state), at: row.createdAt.toISOString(),
     ...(typeof meta.outcome === "string" ? { outcome: meta.outcome } : {}),
+    ...(typeof meta.checked === "number" ? {checked:meta.checked}:{}),
     ...(typeof meta.reason === "string" ? { reason: meta.reason } : {}), ...(typeof meta.nextAt === "string" ? { nextAt: meta.nextAt } : {}),
     ...(body.information ? { informationId: body.information.id } : {}) };
   if (typeof meta.humanEventId === "string") {
@@ -140,7 +142,7 @@ export async function readOperatorPanel(binding: Pick<OperatorCommand, "threadId
       sql`${auditLogs.technicalMetadata}->>'messageId'=${binding.messageId} and ${auditLogs.technicalMetadata}->>'kind'=${kind}`)).orderBy(desc(auditLogs.createdAt),desc(auditLogs.id)).limit(1);
     if(row){const body=operatorBody(row);const receipt=await readOperatorReceipt({requestKey:row.id,threadId:binding.threadId,messageId:binding.messageId});if(receipt)requests[kind]={command:body.command,receipt};}
   }
-  let allowResume = false, allowInformation = false, allowReanalysis = false;
+  let allowResume = false, allowInformation = false, allowReanalysis = false, modelCallsExhausted=false;
   let resume: { step: OperatorStep; nextAt?: string } | null = null;
   const unavailableReason = "Le dossier est protégé par sa version, une pause, un traitement en cours, des tentatives épuisées ou un résultat à vérifier. Rechargez ses preuves avant de poursuivre.";
   try {
@@ -149,7 +151,8 @@ export async function readOperatorPanel(binding: Pick<OperatorCommand, "threadId
       await admissionLock(tx);
       const command: OperatorCommand = { ...binding, requestKey: binding.runId, kind: "resume", reason: "Lecture des possibilités de reprise." };
       const guard = await guardOperatorCommand(tx, command, actor.id, config);
-      allowInformation = !guard.effects.some(e => e.state !== "planned" || e.dispatchedAt || e.dispatchToken || e.ackCiphertext || e.verificationCiphertext || e.confirmedAt);
+      modelCallsExhausted=guard.callCount>=3;
+      allowInformation = guard.callCount<3&&!guard.effects.some(e => e.state !== "planned" || e.dispatchedAt || e.dispatchToken || e.ackCiphertext || e.verificationCiphertext || e.confirmedAt);
       allowReanalysis = allowInformation;
       const events = await tx.select().from(savIntakeHumanEvents).where(eq(savIntakeHumanEvents.messageId, binding.messageId));
       for (const event of events) {
@@ -162,5 +165,5 @@ export async function readOperatorPanel(binding: Pick<OperatorCommand, "threadId
       try { resume = await operatorResumeStep(guard, config, new Date(), tx); allowResume = true; } catch { /* Unavailable is explicit. */ }
     });
   } catch { /* No permission or eligibility is inferred from a display. */ }
-  return { information, requests, allowResume, allowInformation, allowReanalysis, resume, unavailableReason };
+  return { information, requests, allowResume, allowInformation, allowReanalysis, resume, unavailableReason:modelCallsExhausted?"Les trois appels autorisés pour ce message ont déjà été utilisés. Aucune nouvelle analyse ne peut être lancée ; les reprises sans IA restent évaluées séparément.":unavailableReason };
 }

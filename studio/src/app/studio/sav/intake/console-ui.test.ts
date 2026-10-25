@@ -26,7 +26,7 @@ const detail={thread:{id:threadId,subject:fixture.rows[0].subject,paused:false,t
   messages:[{id:messageId,direction:"inbound",fromEmail:"fiction@example.invalid",receivedAt:at,createdAt:at,body:{text:"My synthetic connection no longer works. Please inspect this complete test request.",attachments:[]},translation:{status:"complete",language:"en",text:"Ma connexion synthétique ne fonctionne plus. Merci de vérifier cette demande de test complète.",revision:"synthetic",sourceHash:"synthetic",errorCode:null}}],historyTruncated:false,
   progress:{runId,confirmed:false,state:"uncertain",ticketId:"201",reason:"SAV_INTAKE_EXECUTION_RECONCILIATION_REQUIRED",effects:[{id:"effect-1",kind:"ticket_create",state:"confirmed",confirmedAt:at},{id:"effect-2",kind:"email_associate",state:"uncertain",confirmedAt:null}]},choices:[]};
 beforeEach(()=>{vi.clearAllMocks();mocks.operator.mockResolvedValue({information:null,allowResume:false,allowReanalysis:true,allowInformation:true,unavailableReason:"Synthetic protected state",resume:null});mocks.controls.mockResolvedValue({blocked:false});mocks.crmDisplay.mockResolvedValue({contacts:{"101":{label:"Alice Test",url:"https://app.hubspot.com/contacts/123/record/0-1/101",available:true}},tickets:{"201":{label:"Connexion interrompue",url:"https://app.hubspot.com/contacts/123/record/0-5/201",available:true}}});mocks.staff.mockResolvedValue({id:"synthetic",email:"ugo@limova.ai",role:"admin"});mocks.list.mockResolvedValue(fixture);mocks.detail.mockResolvedValue(detail);});
-const renderList=async(query:{view?:string;q?:string;page?:string}={})=>renderToStaticMarkup(createElement(Fragment,null,await IntakeConsolePage({searchParams:Promise.resolve(query)})));
+const renderList=async(query:{view?:string;q?:string;page?:string;sort?:string}={})=>renderToStaticMarkup(createElement(Fragment,null,await IntakeConsolePage({searchParams:Promise.resolve(query)})));
 const renderDetail=async()=>renderToStaticMarkup(createElement(Fragment,null,await IntakeDetailPage({params:Promise.resolve({id:threadId})})));
 it("offers explicit manual completion on the latest message only for the existing authorized operator, without acting on GET",async()=>{
   const html=await renderDetail();expect(html).toContain("Marquer traité hors Studio");expect(html).toContain("J’ai déjà traité cette demande");
@@ -111,4 +111,10 @@ it("reads recovery eligibility for the latest message and exposes persisted info
  expect(mocks.operator).toHaveBeenCalledWith({threadId,messageId,runId,version:7,sourceHash:"a".repeat(64)});
  expect(html).toContain("Aucune étape disponible");expect(html).toContain("Informations pour l’agent");expect(html).toContain("Enregistrer et refaire l’analyse");
  expect(html).not.toContain("Informations pour l’agent enregistrées");
+});
+
+it("submits and preserves the actual server sort with search, view and page",async()=>{
+ const html=await renderList({view:"to_validate",q:"connexion",page:"2",sort:"oldest"});
+ expect(mocks.list).toHaveBeenCalledWith({view:"to_validate",mailboxId:undefined,search:"connexion",page:2,sort:"oldest"});
+ expect(html).toContain('name="sort"');expect(html).toContain('value="oldest" selected=""');expect(html).toContain('sort=oldest');
 });

@@ -10,4 +10,4 @@ export const operatorCommandSchema = z.object({
 });
 export type OperatorCommand = z.infer<typeof operatorCommandSchema>;
 export type OperatorStep = "reads" | "analysis" | "admission" | "execution" | "verify_only" | "reanalysis";
-export type OperatorReceipt = { id: string; step: OperatorStep; state: string; at: string; outcome?: string; reason?: string; nextAt?: string; informationId?: string; consumedAt?: string };
+export type OperatorReceipt = { id: string; step: OperatorStep; state: string; at: string; outcome?: string; checked?:number; reason?: string; nextAt?: string; informationId?: string; consumedAt?: string };

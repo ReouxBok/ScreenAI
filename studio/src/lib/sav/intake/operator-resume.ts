@@ -13,7 +13,7 @@ import { createIntakeExecutorAdapters } from "./execution-adapters";
 
 /** A command dispatcher in the existing cron, not a second execution engine.
  * Durable source/actor/lease guards precede the canonical targeted paths. */
-export async function consumeOperatorResume(id: string, deps: SavIntakeWakeDeps = {}) {
+export async function consumeOperatorResume(id: string, deps: SavIntakeWakeDeps & { beforeCanonicalResume?: () => Promise<void> } = {}) {
   const env = deps.env ?? (() => process.env), config = savIntakeRuntimeConfig(env());
   if (!config) return { state: "waiting", reason: "off" };
   const token = randomUUID(), db = requireDb();
@@ -37,13 +37,14 @@ export async function consumeOperatorResume(id: string, deps: SavIntakeWakeDeps 
     }
   });
   if (!claim) return { state: "waiting", reason: "not_claimed" };
-  let outcome: { state: string; reason?: string };
+  let outcome: { state: string; reason?: string; checked?:number };
   try {
+    await deps.beforeCanonicalResume?.(); // Test seam at the race boundary, never a client field.
     if (claim.step === "verify_only") {
       if (!claim.executionId) throw Error("SAV_INTAKE_OPERATOR_REVALIDATION_REQUIRED");
       const adapters = deps.adapters ?? createIntakeExecutorAdapters({ env });
       const result = await reconcileIntakeEffectsReadOnly(claim.executionId, { verify: adapters.verify }, Date.now() + 40_000);
-      outcome = { state: "checked", ...(result.effects.some(e => ["dispatched", "acked", "uncertain"].includes(e.state)) ? { reason: "SAV_INTAKE_EXECUTION_RECONCILIATION_REQUIRED" } : {}) };
+      outcome = result.checked===0?{state:"waiting",reason:"SAV_INTAKE_OPERATOR_VERIFICATION_BUSY",checked:0}:{ state: "checked", checked:result.checked, ...(result.effects.some(e => ["dispatched", "acked", "uncertain"].includes(e.state)) ? { reason: "SAV_INTAKE_EXECUTION_RECONCILIATION_REQUIRED" } : {}) };
     } else if (claim.step === "execution" || claim.step === "admission") {
       outcome = await executeSavIntakeWake(claim.body.command.runId, deps);
     } else {
@@ -58,7 +59,7 @@ export async function consumeOperatorResume(id: string, deps: SavIntakeWakeDeps 
     const [row] = await tx.select().from(auditLogs).where(operatorCommandRow(id)).for("update");
     if (row?.technicalMetadata.leaseToken !== token) return;
     await tx.update(auditLogs).set({ technicalMetadata: { ...row.technicalMetadata, state: "finished", outcome: outcome.state, reason: outcome.reason ?? null,
-      finishedAt: new Date().toISOString(), leaseUntil: null, leaseToken: null } }).where(eq(auditLogs.id, id));
+      checked:outcome.checked??null, finishedAt: new Date().toISOString(), leaseUntil: null, leaseToken: null } }).where(eq(auditLogs.id, id));
   });
   return outcome;
 }

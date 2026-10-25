@@ -16,7 +16,7 @@ import { planSavIntake } from "../intake/engine";
 import { createSavIntakeHubspotReaders } from "../intake/hubspot-readers";
 import { approveIntakeExecutionPolicy, intakeExecutionConfig, type ExecutionPolicy } from "../intake/execution-policy";
 import { createIntakeExecutorAdapters } from "../intake/execution-adapters";
-import { admitIntakeExecution, getExecutionEffects } from "../intake/execution-store";
+import { admitIntakeExecution, getExecutionEffects, claimEffectRecovery, releaseEffectRecovery } from "../intake/execution-store";
 import { executeIntakePass } from "../intake/executor";
 import { recordIntakeHumanCommand } from "../intake/human-commands";
 import { consumeIntakeHumanEvent } from "../intake/human-worker";
@@ -277,14 +277,27 @@ it("information can requalify a never-dispatched execution without replacing its
 it("new information revisions cannot reset the existing three-call message budget",async()=>{
   await observed();fakeModel();let previous:string|null=null;
   for(let revision=1;revision<=4;revision++){
-    const input={...await command("information"),expectedInformationId:previous,information:`Synthetic verified contextual revision ${revision}.`};
+    const input:OperatorCommand={...await command("information"),expectedInformationId:previous,information:`Synthetic verified contextual revision ${revision}.`};
+    if(revision===4){await expect(recordOperatorCommand(input)).rejects.toThrow("SAV_INTAKE_OPERATOR_CALLS_EXHAUSTED");expect((await readIntakeOperatorInformation(threadId,messageId))?.id).toBe(previous);continue;}
     await recordOperatorCommand(input);
     const [event]=await db.db.select().from(savIntakeHumanEvents).where(eq(savIntakeHumanEvents.commandKey,input.requestKey));
     const result=await consumeIntakeHumanEvent(event.id,options.runtime,createSavIntakeHubspotReaders({network:p.network}));
-    if(revision<=3){expect(result).toHaveProperty("state","observed");expect((await readOperatorReceipt(input))?.consumedAt).toBeTruthy();}
-    else{expect(result).toHaveProperty("waiting");expect((await readOperatorReceipt(input))?.consumedAt).toBeUndefined();}
+    expect(result).toHaveProperty("state","observed");expect((await readOperatorReceipt(input))?.consumedAt).toBeTruthy();
     previous=input.requestKey;
   }
   const calls=await db.db.select().from(savIntakeModelCalls);expect(calls).toHaveLength(3);expect(calls.every(c=>c.state==="settled")).toBe(true);
   expect((await db.db.select().from(savIntakeRuns)).reduce((n,r)=>n+r.attempts,0)).toBe(1);
+});
+
+it("a competing canonical execution lease cannot become a false checked receipt",async()=>{
+  await observed();const execution=(await admitIntakeExecution(runId,options))!;
+  await executeIntakePass(execution.id,options,{afterAck:async effect=>{if(effect.kind==="email_create")throw Error("synthetic lost receipt");}});
+  vi.useFakeTimers({toFake:["Date"]});vi.setSystemTime(Date.now()+61_000);
+  const input=await command(),receipt=await recordOperatorCommand(input),verify=vi.fn(options.adapters.verify);
+  let competing:Awaited<ReturnType<typeof claimEffectRecovery>>=null;
+  try{
+    const result=await consumeOperatorResume(receipt.id,{env:()=>environment,adapters:{...options.adapters,verify},beforeCanonicalResume:async()=>{competing=await claimEffectRecovery(execution.id);expect(competing).not.toBeNull();}});
+    expect(result).toMatchObject({state:"waiting",checked:0,reason:"SAV_INTAKE_OPERATOR_VERIFICATION_BUSY"});
+    expect(verify).not.toHaveBeenCalled();expect(await readOperatorReceipt(input)).toMatchObject({outcome:"waiting",checked:0});
+  }finally{if(competing)await releaseEffectRecovery(competing);}
 });

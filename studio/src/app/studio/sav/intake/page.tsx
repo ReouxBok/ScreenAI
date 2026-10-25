@@ -13,7 +13,7 @@ export default async function IntakeConsolePage({ searchParams }: { searchParams
   const staff=await requireIntakeConsoleStaff();
   const query = await searchParams, selected = savIntakeViewSchema.safeParse(query.view);
   const view = selected.success ? selected.data : "processing", mailbox = z.uuid().safeParse(query.mailbox);
-  const data = await listIntakeConsole({ view, mailboxId: mailbox.success ? mailbox.data : undefined, search: query.q, page: Number(query.page) || 1 });
+  const data = await listIntakeConsole({ view, mailboxId: mailbox.success ? mailbox.data : undefined, search: query.q, page: Number(query.page) || 1, ...(query.sort==="oldest"?{sort:"oldest" as const}:{}) });
   const href = (nextView: string, page = 1, search = query.q ?? "") => `/studio/sav/intake?${new URLSearchParams({ view: nextView, q: search.slice(0, 120),
     ...(mailbox.success ? { mailbox: mailbox.data } : {}), ...(["newest","oldest"].includes(query.sort??"")?{sort:query.sort!}:{}), page: String(page) })}`;
   const origin = href(view, data.page);
@@ -31,6 +31,7 @@ export default async function IntakeConsolePage({ searchParams }: { searchParams
         <form method="get" className={styles.search}><input type="hidden" name="view" value={view}/>{mailbox.success && <input type="hidden" name="mailbox" value={mailbox.data}/>}
           <label className={styles.srOnly} htmlFor="intake-search">Rechercher un expéditeur ou un objet</label>
           <input id="intake-search" type="search" name="q" maxLength={120} defaultValue={query.q ?? ""} placeholder="Expéditeur ou objet"/>
+          <label className={styles.srOnly} htmlFor="intake-sort">Trier les dossiers</label><select id="intake-sort" name="sort" defaultValue={query.sort==="oldest"?"oldest":"newest"}><option value="newest">Plus récents d’abord</option><option value="oldest">Plus anciens d’abord</option></select>
           <button type="submit" className="secondary">Rechercher</button></form></div>
       <section aria-label={view === "processing" ? "Traitements en cours" : savIntakeViewLabels[view]} className={styles.list}>
         {data.rows.length ? data.rows.map(row => <IntakeDossierLink key={row.threadId} id={row.threadId} origin={origin} href={intakeDossierHref(row.threadId, origin)} className={styles.row}>

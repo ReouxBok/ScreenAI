@@ -125,10 +125,12 @@ try {
     await info.getByRole('button',{name:'Enregistrer et refaire l’analyse'}).click();await info.getByRole('alert').waitFor();await page.reload();
     assert.ok(await info.getByRole('button',{name:'Enregistrer et refaire l’analyse'}).isDisabled());assert.ok(await info.getByRole('textbox').isDisabled());
     await info.getByRole('button',{name:'Vérifier cette demande'}).click();await info.getByText('Demande enregistrée, en attente du traitement existant.').first().waitFor();
-    assert.equal(await info.getByText('Ces informations ont été lues par une analyse validée.',{exact:false}).count(),0);
+    assert.equal(await info.getByText('Ces informations ont été lues par une étape d’analyse validée.',{exact:false}).count(),0);
     const infoCommand=await page.evaluate(()=>JSON.parse(sessionStorage.getItem(Object.keys(sessionStorage).find(k=>k.startsWith('sav:intake:operator:v1:')&&k.endsWith(':information')))));
     await page.evaluate(id=>{const key='ux-operator-receipt:'+id,receipt=JSON.parse(sessionStorage.getItem(key));receipt.state='consumed';receipt.consumedAt='2026-10-25T18:01:00Z';sessionStorage.setItem(key,JSON.stringify(receipt));},infoCommand.requestKey);
-    await info.getByRole('button',{name:'Vérifier cette demande'}).click();await info.getByText('Ces informations ont été lues par une analyse validée.',{exact:false}).first().waitFor();
+    await info.getByRole('button',{name:'Vérifier cette demande'}).click();await info.getByText('Ces informations ont été lues par une étape d’analyse validée.',{exact:false}).first().waitFor();
+    await info.getByRole('button',{name:'Préparer une nouvelle demande sur la version actuelle'}).click();
+    assert.ok(await info.getByRole('textbox').isEnabled());assert.ok(await info.getByRole('button',{name:'Enregistrer et refaire l’analyse'}).isEnabled());
     await page.evaluate(()=>{for(const key of Object.keys(sessionStorage))if(key.startsWith('sav:intake:operator:'))sessionStorage.removeItem(key);});await page.reload();
     assert.ok(await info.getByRole('button',{name:'Enregistrer et refaire l’analyse'}).isDisabled());assert.ok((await info.textContent()).includes(infoCommand.requestKey));
     assert.ok((await info.getByRole('textbox').inputValue()).includes('perte de réponse'));
@@ -141,7 +143,7 @@ try {
     await page.screenshot({path:path.join(output,`${name}-uncertain.png`),fullPage:true});
     await page.goto(`https://sav-ux.invalid/studio/sav/intake/${id}?returnTo=${encodeURIComponent("https://bad.invalid/")}`);
     const back=await page.getByRole("link",{name:"Retour à la liste SAV",exact:false}).getAttribute("href");assert.ok(back.startsWith("/studio/sav"));assert.ok(!back.includes("bad.invalid"));
-    assert.deepEqual(errors,[]);checks.push({viewport:name,singleCombinedSubmit:true,draftAfterRefresh:true,receiptAfterRefresh:true,uncertainFrozenAndReadOnlyLookup:true,listPageSearchSortAndPosition:true,browserBack:true,safeCrmLinks:true,noHorizontalOverflow:true,noTicketTargetsCleared:true,refreshDuringSubmitFrozen:true,operatorDoubleClick:true,operatorDraftAndLostResponseRestored:true,informationSavedVsConsumedDistinct:true,keyboard:true,receiptAcrossNewRun:true,serverReceiptRehydration:true,explicitNextRequestAfterTerminalReceipt:true});await context.close();
+    assert.deepEqual(errors,[]);checks.push({viewport:name,singleCombinedSubmit:true,draftAfterRefresh:true,receiptAfterRefresh:true,uncertainFrozenAndReadOnlyLookup:true,listPageSearchSortAndPosition:true,browserBack:true,safeCrmLinks:true,noHorizontalOverflow:true,noTicketTargetsCleared:true,refreshDuringSubmitFrozen:true,operatorDoubleClick:true,operatorDraftAndLostResponseRestored:true,informationSavedVsConsumedDistinct:true,keyboard:true,receiptAcrossNewRun:true,serverReceiptRehydration:true,explicitNextRequestAfterTerminalReceipt:true,nextRequestAfterUnknownReconciled:true});await context.close();
   }
   assert.deepEqual(external,[]);await writeFile(path.join(output,"ux-browser-proof.json"),JSON.stringify({status:"pass",checks,externalRequests:external,nextRouterIntegration:false,clerkIntegration:false,providers:"synthetic",fonts:"theme variables preserved; local fallback fonts in fixture"},null,2));console.log(JSON.stringify({status:"pass",checks}));
 } finally { await browser?.close();await rm(temporary,{recursive:true,force:true}); }

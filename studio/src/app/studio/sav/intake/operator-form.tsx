@@ -11,7 +11,7 @@ function subscribe(fn: () => void) { window.addEventListener(eventName, fn); ret
 type Draft = { requestKey: string; text: string; submission: OperatorFormState["status"]; expectedInformationId: string | null; binding:Binding };
 const labels: Record<OperatorStep, string> = { reads: "Reprendre les lectures manquantes", analysis: "Poursuivre l’analyse nécessaire", admission: "Vérifier l’admission du plan existant", execution: "Poursuivre l’exécution existante", verify_only: "Vérifier uniquement les résultats incertains", reanalysis: "Nouvelle analyse demandée" };
 function receiptText(r: OperatorReceipt) {
-  return r.consumedAt ? "Ces informations ont été lues par une analyse validée. Consultez sa décision et les effets séparément."
+  return r.consumedAt ? "Ces informations ont été lues par une étape d’analyse validée. Consultez sa décision et les effets séparément."
     : r.state === "consumed" ? "Nouvelle analyse enregistrée dans l’historique. Consultez la décision et les effets séparément."
       : r.state === "finished" ? r.outcome === "confirmed" ? "Exécution confirmée par le moteur. Consultez les effets vérifiés dans le dossier." : r.outcome === "checked" ? "Vérification effectuée ; consultez les résultats et les éventuelles incertitudes restantes." : r.outcome === "observed" ? "Analyse enregistrée. Les effets restent à vérifier séparément." : "La reprise s’est arrêtée ou reste en attente. Consultez sa cause dans le diagnostic."
         : r.state === "waiting" ? "La demande reste en attente : consultez le diagnostic."
@@ -38,8 +38,9 @@ function OperatorRequestForm({ binding, actorId, kind, requestKey, enabled, unav
     catch { persist({ submission: "unknown" }); return { status: "unknown" as const, message: "Réponse perdue. Vérifiez la référence conservée avant toute nouvelle soumission." }; }
     finally { active.current = false; }
   }, { status: "idle", message: "" } as OperatorFormState);
-  const recorded = draft.submission === "recorded" || Boolean(lookup.receipt);
-  const unknown = draft.submission === "unknown", staleDraft = draft.binding.runId!==binding.runId || draft.binding.sourceHash!==binding.sourceHash, frozen = pending || recorded || unknown;
+  const serverReceipt=serverRequest?.receipt.id===draft.requestKey?serverRequest.receipt:undefined;
+  const recorded = draft.submission === "recorded" || Boolean(lookup.receipt||serverReceipt);
+  const unknown = draft.submission === "unknown"&&!lookup.receipt&&!serverReceipt, staleDraft = draft.binding.runId!==binding.runId || draft.binding.sourceHash!==binding.sourceHash, frozen = pending || recorded || unknown;
   const title = kind === "resume" ? "Reprendre le traitement" : kind === "reanalyse" ? "Refaire l’analyse" : "Informations pour l’agent";
   const receipt = lookup.receipt ?? (state.receipt?.id===draft.requestKey?state.receipt:undefined) ?? (serverRequest?.receipt.id===draft.requestKey?serverRequest.receipt:undefined);
   async function inspect() {
@@ -48,6 +49,7 @@ function OperatorRequestForm({ binding, actorId, kind, requestKey, enabled, unav
       setLookup(!result.readable ? { text: "Lecture impossible. Conservez la référence ; aucun renvoi automatique." }
         : result.receipt ? { text: receiptText(result.receipt), receipt: result.receipt }
           : { text: "Aucune demande retrouvée. Vous pouvez renvoyer exactement la même demande, sans modifier les champs.", retry: true });
+      if(result.readable&&result.receipt)persist({submission:"recorded"});
     } catch { setLookup({ text: "Vérification indisponible. Conservez la référence ; aucun renvoi automatique." }); }
     finally { setChecking(false); }
   }
@@ -67,7 +69,7 @@ function OperatorRequestForm({ binding, actorId, kind, requestKey, enabled, unav
     {unknown && <p role="status">Demande figée jusqu’au rapprochement de sa référence.</p>}
     <button type="submit" className={kind==="resume"?undefined:"secondary"} disabled={!enabled || staleDraft && !recorded && !unknown || pending || recorded || unknown && !lookup.retry} aria-busy={pending}>{lookup.retry ? "Renvoyer la même demande" : kind === "information" ? "Enregistrer et refaire l’analyse" : title}</button>
     {pending && <p role="status">Enregistrement en cours…</p>}
-    {state.message && draft.submission!=="idle" && <p role={state.status === "recorded" ? "status" : "alert"}>{state.message}</p>}
+    {state.message && draft.submission!=="idle" && !lookup.receipt && !serverReceipt && <p role={state.status === "recorded" ? "status" : "alert"}>{state.message}</p>}
     <p><small>Référence : {draft.requestKey}</small></p>
     {receipt && <p role="status">{receiptText(receipt)}</p>}
     {(recorded || unknown) && <button type="button" className="secondary" disabled={checking} onClick={inspect} aria-busy={checking}>Vérifier cette demande</button>}

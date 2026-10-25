@@ -9,9 +9,10 @@
 .views b, .processing b { font-variant-numeric: tabular-nums; font-weight: 600; }
 .controls { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 16px; }
 .processing { display: flex; gap: 14px; padding: 10px 12px; border-radius: 8px; border: 1px solid var(--line); font-size: 12px; }
-.search { display: flex; gap: 8px; margin: 0; }
-.search input, .choice select, .choice textarea, .choice input:not([type=radio]):not([type=hidden]) { border: 1px solid var(--line); background: var(--paper); border-radius: 8px; padding: 9px 10px; font: inherit; color: var(--ink); min-width: 0; }
-.search input { width: min(260px, 45vw); font-size: 13px; }
+.search { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin: 0; max-width: 100%; }
+.search input, .search select, .choice select, .choice textarea, .choice input:not([type=radio]):not([type=hidden]) { border: 1px solid var(--line); background: var(--paper); border-radius: 8px; padding: 9px 10px; font: inherit; color: var(--ink); min-width: 0; }
+.search input { width: min(260px, 45vw); flex: 1 1 160px; font-size: 13px; }
+.search select { max-width: 100%; font-size: 13px; }
 .search button, .actions button { padding: 8px 12px; min-height: 36px; font-size: 12px; line-height: 20px; }
 .list { border-top: 1px solid var(--line); border-bottom: 1px solid var(--line); }
 .row { display: grid; grid-template-columns: minmax(0, 1.4fr) minmax(0, 1fr) auto; gap: 20px; padding: 18px 8px; border-bottom: 1px solid var(--line); }
@@ -63,7 +64,7 @@
   .views { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .views a { padding: 12px; min-height: 56px; }
   .controls, .search { width: 100%; }
-  .search input { flex: 1; width: 0; font-size: 16px; }
+  .search input { flex: 1 0 100%; width: 100%; font-size: 16px; }
   .row { grid-template-columns: minmax(0, 1fr); gap: 12px; }
   .row > div:last-child { display: flex; justify-content: space-between; }
   .choice select, .choice textarea { font-size: 16px; }
