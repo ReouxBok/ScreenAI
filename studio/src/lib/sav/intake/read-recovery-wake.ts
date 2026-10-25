@@ -62,7 +62,7 @@ export async function dispatchPendingReadRecoveryWakes(options:Options={}){
  const config=savIntakeRuntimeConfig(env);if(!config)return {started:0};
  const rows=await requireDb().select({runId:auditLogs.entityId}).from(auditLogs).where(and(eq(auditLogs.entityType,"sav_intake_read_recovery"),eq(auditLogs.action,"sav_intake_read_recovery"),
   sql`${auditLogs.technicalMetadata}->>'state' in ('scheduled','claimed') and ${auditLogs.technicalMetadata}->>'configHash'=${config.configHash} and ${auditLogs.technicalMetadata}->>'expiresAt'>${now.toISOString()}
-    and coalesce((${auditLogs.technicalMetadata}->>'workflowStarts')::integer,0)<3
+    and (case when jsonb_typeof(${auditLogs.technicalMetadata}->'workflowStarts')='number' then (${auditLogs.technicalMetadata}->>'workflowStarts')::numeric<3 else true end)
     and (${auditLogs.technicalMetadata}->>'wakeUntil' is null or ${auditLogs.technicalMetadata}->>'wakeUntil'<=${now.toISOString()})`)).limit(4);
  let started=0;for(const row of rows)if(row.runId&&(await requestReadRecoveryWake(row.runId,options)).started)started++;return {started};
 }

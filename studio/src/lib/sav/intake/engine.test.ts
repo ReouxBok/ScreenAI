@@ -414,7 +414,7 @@ it("asks a precise question on an empty reply while retaining conversation evide
  const p=await f.run();expect(p.progress.kind).toBe("human_choice");expect(p.decision.evidence.some(e=>e.source==="customer_history")).toBe(true);expect(f.calls).not.toContain("analyse");
 });
 it("distinguishes a qualified newsletter from an empty or uncertain customer request",async()=>{
- const f=fixture([]);delete f.analysis.ticketSummary;f.analysis.nature="newsletter";expect((await f.run()).progress.view).toBe("other");
+ const f=fixture([]);delete f.analysis.ticketSummary;f.analysis.nature="newsletter";expect((await f.run()).progress.kind).toBe("human_choice");f.policy.qualifiedOther!.family="authenticated_newsletter";expect((await f.run()).progress.view).toBe("other");
  delete f.policy.qualifiedOther;expect((await f.run()).progress.kind).toBe("human_choice");
  f.analysis.nature="indeterminate";expect((await f.run()).progress.view).not.toBe("other");
 });

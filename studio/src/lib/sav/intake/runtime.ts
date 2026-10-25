@@ -109,7 +109,7 @@ async function analyseSavIntakeRuntimeWithinBudget(runId: string, config: Intake
     } });
     const readPending:Promise<unknown>[]=[];
     const reads=recoverableIntakeReads(crm,payload.readRecovery!,{reuse:Boolean(lease.recoveringRead),checkpoint,pending:readPending});
-    payload.plan = await withSavAiBudget(() => planSavIntake(lease.input, { ...reads, ...semantic }, qualifiedOther ? {...config.policy,qualifiedOther:{resource:qualifiedOther.resource,evidenceSource:"private_rule"}} : config.policy, { timeoutMs: 10_000 }, () => new Date()));
+    payload.plan = await withSavAiBudget(() => planSavIntake(lease.input, { ...reads, ...semantic }, qualifiedOther ? {...config.policy,qualifiedOther:{...(qualifiedOther.family==="authenticated_newsletter"?{family:"authenticated_newsletter" as const}:{}),resource:qualifiedOther.resource,evidenceSource:"private_rule"}} : config.policy, { timeoutMs: 10_000 }, () => new Date()));
     assertSavIntakeObservation(payload.plan);
     // Cancellation may finish after the pure planner's per-call timeout.
     let drainTimer: ReturnType<typeof setTimeout> | undefined;

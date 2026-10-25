@@ -220,7 +220,7 @@ export async function planSavIntake(
       if (observations.some(o => o.status !== "analyzed" && !accessory(o))) return context("classification_incomplete");
       for (const observation of observations) addEvidence(observation.sourceId, "current_attachment", message.id, observation);
     } else if (analysis.attachmentObservations?.length) return context("classification_incomplete");
-    if (!requests.length && analysis.nature === "newsletter" && policy.qualifiedOther && !policy.manualSupportOverride) classification = "other";
+    if (!requests.length && analysis.nature === "newsletter" && policy.qualifiedOther?.family === "authenticated_newsletter" && !policy.manualSupportOverride) classification = "other";
     else if (!requests.length || kinds.includes("unknown") || classification === "mixed") return context("classification_incomplete", "request_scope_uncertain");
     if (policy.manualSupportOverride && classification === "other") {
       // Recompute from the current message. An override is not a fabricated support request.
@@ -245,7 +245,7 @@ export async function planSavIntake(
       const progress: SavIntakeProgress = outside === "other" ? { kind: "qualified_other", classification: "other", classificationRule: policy.qualifiedOther!.resource, evidenceIds: ids, view: "other" }
         : outside === "acknowledgement" ? { kind: "processing", phase: "decision", view: null }
         : { kind: "supervised_action", messageId: message.id, classification: outside, action: action as "supervised_partnership" | "supervised_commercial" | "supervised_investor", approval: "human_confirmation_required", evidenceIds: ids, view: "to_validate" };
-      return finalize({ kind: "no_ticket", reason: outside === "other" ? "qualified_other" : outside === "acknowledgement" ? "acknowledgement_only" : "outside_support", nextAction: action, learning: "excluded", evidenceIds: ids }, progress, resource);
+      return finalize({ kind: "no_ticket", ...(!requests.length && outside === "other" ? {qualifiedInformation: "authenticated_newsletter" as const} : {}), reason: outside === "other" ? "qualified_other" : outside === "acknowledgement" ? "acknowledgement_only" : "outside_support", nextAction: action, learning: "excluded", evidenceIds: ids }, progress, resource);
     }
     let addressOrigin: "sender" | "customer_declared_registration" = "sender";
     let address = normalizeEmail(message.fromEmail);

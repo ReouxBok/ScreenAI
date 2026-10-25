@@ -72,7 +72,7 @@ export type EnginePolicy = {
     partnership?: PrivateResource; commercial?: PrivateResource; investor?: PrivateResource;
   };
   // Server-qualified rules and operator overrides are inputs, never inferred from a brand keyword.
-  qualifiedOther?: { resource: PrivateResource; evidenceSource: "private_rule" | "human_override" };
+  qualifiedOther?: { family?: "authenticated_newsletter"; resource: PrivateResource; evidenceSource: "private_rule" | "human_override" };
   manualSupportOverride?: PrivateResource;
 };
 export type IntakeAdapters = {
