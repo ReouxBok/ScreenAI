@@ -1,5 +1,4 @@
 import { randomUUID } from "node:crypto";
-import Link from "next/link";
 import { notFound } from "next/navigation";
 import { z } from "zod";
 import { requireIntakeConsoleStaff } from "@/lib/sav/intake/console-auth";
@@ -15,6 +14,10 @@ import {IntakeRecoveryForm} from "../recovery-form";
 import { IntakeCompletionForm } from "../completion-form";
 import { intakeStatusLabel, intakeReasonLabel, intakeContextReasonLabels } from "@/lib/sav/intake/console-presentation";
 import styles from "../intake.module.css";
+import { IntakeBackLink } from "../navigation";
+import { IntakeCrmContext } from "../crm-context";
+import { IntakeProcessingSummary } from "../processing-summary";
+import { readUxMessageControls } from "@/lib/sav/intake-ux/message-controls";
 export const dynamic = "force-dynamic";
 const effectLabels: Record<string, string> = { ticket_create: "Création du ticket", note_create: "Note de contexte", note_associate: "Rattachement de la note",
   email_create: "Conservation de l’email CRM", email_associate: "Rattachement de l’email", stage_new: "Statut Nouveau", identity_send: "Demande d’identification" };
@@ -23,13 +26,14 @@ const stateLabels: Record<string, string> = { planned: "Prévu, sans départ", d
 function RecordLink({record}:{record:CrmDisplayRecord}) {
   return record.url?<a href={record.url} target="_blank" rel="noopener noreferrer">{record.label}</a>:<span>{record.label}</span>;
 }
-export default async function IntakeDetailPage({ params, searchParams }: { params: Promise<{ id: string }>; searchParams?: Promise<{holdRelease?:string}> }) {
+export default async function IntakeDetailPage({ params, searchParams }: { params: Promise<{ id: string }>; searchParams?: Promise<{holdRelease?:string;returnTo?:string}> }) {
   const staff=await requireIntakeConsoleStaff();
   const { id } = await params;
   if (!z.uuid().safeParse(id).success) notFound();
   const data = await readIntakeConsoleDetail(id);
   if (!data) notFound();
-  const releaseNotice=(await searchParams)?.holdRelease;
+  const query = await searchParams;
+  const releaseNotice=query?.holdRelease;
   const current = data.current;
   const blocked = !data.handledExternally && !data.humanHeld && data.diagnostics?.messageId === data.latestMessageId && data.diagnostics.attemptsExhausted
     && current && ["pending", "waiting"].includes(current.state) && !data.confirmedCurrent;
@@ -49,12 +53,27 @@ export default async function IntakeDetailPage({ params, searchParams }: { param
   const canCorrect = !data.handledExternally && !data.humanHeld && data.projection.status !== "historical_outside_automation" && Boolean(current && current.messageId === data.latestMessageId && current.sourceMatches && current.candidateContactIds !== null && !data.progress?.confirmed && current.sourceHash && plan && !data.thread.paused
     && !data.choices.some(event => event.kind === "refuse" && event.parentVersion === current.version)
     && !data.choices.some(event => ["pending", "reading"].includes(event.state)));
+  const controls = data.latestMessageId ? await readUxMessageControls(id, data.latestMessageId) : { blocked: true, reason: "Aucun message courant disponible." };
+  const allowReanalysis = !data.handledExternally && !data.humanHeld && !data.thread.paused && data.projection.status !== "historical_outside_automation"
+    && !data.progress?.effects.some(e=>e.state!=="planned"||e.dispatchedAt||e.ack||e.confirmedAt) && !controls.blocked;
+  const currentEffects = Boolean(data.confirmedCurrent || applicable && data.progress?.runId === current?.id);
+  const question = data.projection.view === "to_validate" || ["human_choice", "human_hold", "human_review"].includes(data.projection.status)
+    ? plan?.progress?.kind === "human_choice" ? "Choisir la bonne fiche ou le ticket qui recevra ce mail"
+      : disposition?.kind === "no_ticket" && disposition.nextAction === "supervised_investor" ? "Prendre en charge cette demande d’investissement"
+        : disposition?.kind === "no_ticket" && disposition.nextAction === "supervised_partnership" ? "Prendre en charge cette demande de partenariat"
+          : disposition?.kind === "no_ticket" && disposition.nextAction === "supervised_commercial" ? "Prendre en charge cette demande commerciale" : "Quelle suite l’équipe doit-elle donner à cette demande ?" : null;
   return <div className={styles.console}>
-    <Link className={styles.back} href="/studio/sav/intake">← Nouveaux dossiers</Link>
+    <IntakeBackLink className={styles.back} returnTo={query?.returnTo}/>
     <header className={styles.heading}><div><span className="eyebrow">Dossier · version {current?.version ?? "en attente"}</span><h1>{data.thread.subject || "Nouvelle demande"}</h1>
       <p>{dirty ? "Mise à jour du traitement en cours" : intakeReasonLabel(data.projection.reason) ?? intakeStatusLabel(data.projection.status)}</p></div></header>
     {releaseNotice && <p role="status">{releaseNotice === "released" && !data.thread.paused && !data.humanHeld && !data.handledExternally ? "La pause est levée pour ce dossier. Le moteur pourra poursuivre si les preuves et la politique existante le permettent. Si une nouvelle qualification est nécessaire, utilisez « Réinvestiguer avec les correctifs » dans le diagnostic technique." : "La pause est conservée : le dossier a changé, une opération reste en cours ou votre accès ne permet pas cette reprise. Rechargez le dossier et vérifiez ses preuves."}</p>}
+    <IntakeCrmContext contact={target ? contactRecord(target.contactId) : undefined}
+      ticket={data.confirmedCurrent && data.progress?.ticketId ? ticketRecord(data.progress.ticketId) : target && target.operation !== "create" ? ticketRecord(target.ticketId) : undefined}
+      confirmed={Boolean(data.confirmedCurrent)} creationPlanned={target?.operation === "create" && !data.confirmedCurrent}
+      verifiedAt={data.confirmedCurrent ? data.progress?.effects.filter(e => e.state === "confirmed" && e.confirmedAt).map(e => e.confirmedAt!).sort((a,b)=>b.getTime()-a.getTime())[0]?.toISOString() : undefined}/>
     <div className={styles.detailGrid}><div>
+      <MailConversation messages={data.messages}/>
+      {data.historyTruncated && <p role="status">Les 200 messages les plus récents sont affichés. L’historique est incomplet.</p>}
       <section className={styles.decision}><h2>{data.humanHeld && !data.handledExternally ? "Prise en charge par l’équipe" : data.handledExternally ? "Disposition administrative" : data.confirmedCurrent ? "Résultat confirmé pour cette demande" : "Décision actuelle"}</h2>
         {blocked && <p role="status">Analyse bloquée : les deux tentatives de ce message sont épuisées, y compris dans ses versions précédentes. Aucune relance automatique n’est autorisée par ce diagnostic.</p>}
         {data.handledExternally ? <p>{["handled_externally", "human_other", "human_review"].includes(data.projection.status) ? data.projection.reason : "Le traitement externe est enregistré. Une commande humaine ou un résultat externe reste à rapprocher ; le dossier conserve ses preuves et son attente."}</p> : data.humanHeld ? <p>À valider par l’équipe. La pause humaine est conservée ; aucune action automatique ne peut reprendre sans levée explicite de cette pause.</p> : data.projection.status === "historical_outside_automation" ? <p>Historique conservé, hors automatisation. Un nouvel entrant après le lancement reprendra normalement avec cet historique.</p> : !plan ? <p>{blocked ? "Les diagnostics des tentatives précédentes sont conservés ci-dessous." : "Analyse en cours ou attente technique."} Aucune action n’est présentée comme accomplie.</p> : <>
@@ -69,36 +88,42 @@ export default async function IntakeDetailPage({ params, searchParams }: { param
         </>}
       </section>
       {historicalPlan && <section className={styles.history}><h2>Dernière analyse historique — non applicable à la demande actuelle</h2><p>Version {current?.version}. Les sources ou le dernier entrant ont changé ; ses anciennes propositions ne sont pas la décision actuelle.</p><details><summary>Consulter la proposition historique</summary><p>Classification historique : {historicalPlan.decision.classification}.</p>{historicalPlan.decision.disposition.kind === "ticket" && <p>Ancienne cible : <RecordLink record={contactRecord(historicalPlan.decision.disposition.target.contactId)}/>{historicalPlan.decision.disposition.target.operation !== "create" ? <> · <RecordLink record={ticketRecord(historicalPlan.decision.disposition.target.ticketId)}/></> : " · création proposée"}.</p>}</details></section>}
-      <section className={styles.decision}><h2>{applicable ? "Actions réellement accomplies" : "Actions historiques conservées"}</h2>
-        {data.progress ? <ol className={styles.effects}>{data.progress.effects.map(effect => <li key={effect.id}>
+      <section className={styles.decision}><h2>{currentEffects ? "Actions réellement accomplies" : "Actions historiques conservées"}</h2>
+        {data.progress ? <ol className={styles.effects}>{data.progress.effects.map(effect => <li key={effect.id} data-state={effect.state}>
           <span>{effectLabels[effect.kind] ?? effect.kind}</span><strong>{stateLabels[effect.state] ?? effect.state}</strong>
           {effect.confirmedAt && <time>{formatParisDateTime(effect.confirmedAt)}</time>}</li>)}</ol> : <p>Aucun effet n’a été engagé.</p>}
         {data.progress?.reason && <p>Attente : {intakeReasonLabel(data.progress.reason)}</p>}
-        {data.progress?.confirmed && data.progress.ticketId && <p>Ticket confirmé : <RecordLink record={ticketRecord(data.progress.ticketId)}/>. {data.projection.status === "followup_pending" ? "Premier suivi encore en attente." : "L’avancement du suivi reste fondé sur ses sources collectées."}</p>}
+        {data.confirmedCurrent && data.progress?.ticketId && <p>Ticket confirmé : <RecordLink record={ticketRecord(data.progress.ticketId)}/>. {data.projection.status === "followup_pending" ? "Premier suivi encore en attente." : "L’avancement du suivi reste fondé sur ses sources collectées."}</p>}
         <p>Aucun brouillon de réponse de résolution n’a été produit par ce parcours. Les réponses supervisées existantes restent dans la file supervisée.</p>
       </section>
-      <MailConversation messages={data.messages}/>
-      {data.historyTruncated && <p role="status">Les 200 messages les plus récents sont affichés. L’historique est incomplet.</p>}
     </div><aside className={styles.side}>
+      <IntakeProcessingSummary status={intakeStatusLabel(data.projection.status)} cause={intakeReasonLabel(data.progress?.reason ?? data.projection.reason)} question={question}
+        confirmedEffects={data.progress?.effects.filter(e=>e.state==="confirmed").length??0} uncertain={data.progress?.state==="uncertain"||Boolean(data.progress?.effects.some(e=>["dispatched","acked","uncertain"].includes(e.state)))}
+        paused={data.thread.paused||data.humanHeld} exhausted={Boolean(blocked)}
+        lastActivity={data.diagnostics?.runs.flatMap(r=>r.events.map(e=>e.createdAt)).sort((a,b)=>b.getTime()-a.getTime())[0] ? formatParisDateTime(data.diagnostics.runs.flatMap(r=>r.events.map(e=>e.createdAt)).sort((a,b)=>b.getTime()-a.getTime())[0]) : undefined}/>
       {(!data.handledExternally || data.projection.status === "human_review") && data.latestMessageId && staff.email === "ugo@limova.ai" && ["admin", "owner"].includes(staff.role) && <IntakeCompletionForm key={data.latestMessageId} threadId={id} messageId={data.latestMessageId} requestKey={randomUUID()}/>}
       {data.humanHeld && !data.handledExternally && data.latestMessageId && ["admin","owner"].includes(staff.role) && <section className={styles.notice}><h2>Reprendre ce dossier</h2>
         <p>Cette action lève uniquement sa pause humaine. Le moteur automatique pourra poursuivre si les preuves et la politique existante le permettent. Les tentatives et les preuves sont conservées. Si une nouvelle qualification est nécessaire, utilisez ensuite « Réinvestiguer avec les correctifs » dans le diagnostic technique.</p>
         <form action={releaseIntakeHumanHoldAction}>
           <input type="hidden" name="requestKey" value={randomUUID()}/><input type="hidden" name="threadId" value={id}/>
           <input type="hidden" name="messageId" value={data.latestMessageId}/><input type="hidden" name="expectedEpoch" value={data.projection.epoch}/>
+          <input type="hidden" name="returnTo" value={query?.returnTo ?? ""}/>
           <label>Motif de la reprise<textarea name="reason" required minLength={10} maxLength={2000}/></label>
           <button type="submit">Lever la pause</button>
         </form></section>}
       {canCorrect && current?.sourceHash && plan ? <IntakeChoiceForm expected={{ commandKey: randomUUID(), threadId: id,
         messageId: current.messageId, runId: current.id, version: current.version, sourceHash: current.sourceHash,
-        candidatesHash: intakeRuntimeHash(contacts) }} contacts={contacts} tickets={tickets} display={display} classification={plan.decision.classification}/> :
+        candidatesHash: intakeRuntimeHash(contacts) }} contacts={contacts} tickets={tickets} display={display} classification={plan.decision.classification}
+        actorId={staff.id} selectedContactId={target?.contactId} selectedTicketId={target && target.operation !== "create" ? target.ticketId : undefined}/> :
         <section className={styles.notice}><h2>Correction indisponible</h2><p>{data.thread.paused ? "Le dossier est en pause." : "La version doit être courante, ses sources inchangées et aucun choix déjà en attente."}</p></section>}
+      {question && data.latestMessageId && ["admin","owner"].includes(staff.role) && <section className={styles.history}><IntakeRecoveryForm mode="analysis" threadId={id} messageId={data.latestMessageId} allowReanalysis={allowReanalysis} unavailableReason={controls.reason}/></section>}
       <section className={styles.history}><h2>Choix humains conservés</h2>{data.choices.length ? <ol>{data.choices.map(event => <li key={event.id}>
         <strong>{event.kind === "refuse" ? "Refus humain" : "Choix conditionnel"} · version {event.parentVersion}</strong><p>{event.reason}</p>
         <small>{event.actor} · {formatParisDateTime(event.at)} · {event.state === "consumed" ? "choix consommé" : event.state === "refused" ? "refus conservé" : event.state === "waiting" ? "preuves à compléter" : "vérification en attente"}</small></li>)}</ol> : <p>Aucun choix humain enregistré.</p>}</section>
       <details className={styles.history}><summary>Diagnostic technique</summary><p>{data.current?.payload.reason ?? data.progress?.reason ?? (blocked ? "Tentatives épuisées — consulter les versions précédentes." : "Aucun motif technique enregistré sur la version actuelle.")}</p>
         {["admin","owner"].includes(staff?.role??"")&&data.latestMessageId&&<IntakeRecoveryForm threadId={id} messageId={data.latestMessageId}
-          hasNoteReceipt={Boolean(data.progress?.effects.some(effect=>effect.kind==="note_create"&&effect.ack?.id))}/>}
+          hasNoteReceipt={Boolean(data.progress?.effects.some(effect=>effect.kind==="note_create"&&effect.ack?.id))} allowReanalysis={allowReanalysis && !question}
+          unavailableReason={question?"La nouvelle analyse se demande depuis le panneau À valider. Les effets déjà engagés et les pauses restent protégés.":controls.reason}/>}
         <p>{data.diagnostics?.totalAttempts ?? 0} tentative(s) cumulée(s) pour le dernier message. Les versions remplacées ne sont pas des décisions applicables.</p>
         {data.diagnostics?.runs.map(run => <details key={run.runId}><summary>Version {run.version} · {intakeStatusLabel(run.state)} · {run.attempts} tentative(s)</summary>
           <p>{run.diagnostic.readable ? run.diagnostic.reason ? intakeReasonLabel(run.diagnostic.reason) : "Aucun code technique enregistré dans cette version." : "Diagnostic historique illisible ou hors limite ; cause non évaluable."}</p>

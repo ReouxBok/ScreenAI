@@ -37,8 +37,10 @@
 .evidence li { font-size: 11px; }
 .evidence time, .effects time { display: block; color: var(--muted); font-size: 10px; margin-top: 4px; }
 .effects li { display: grid; gap: 5px; border-left: 2px solid var(--line); padding-left: 12px; font-size: 12px; }
-.effects strong { font-weight: 500; color: var(--moss-dark); }
-.choice fieldset { border: 0; padding: 0; margin: 18px 0 0; display: grid; gap: 16px; }
+.effects strong { font-weight: 500; color: var(--ink); }
+.effects li[data-state=confirmed] strong { color: var(--moss-dark); }
+.effects li[data-state=uncertain], .effects li[data-state=dispatched], .effects li[data-state=acked] { border-left-color: var(--ochre); }
+.choice fieldset { border: 0; padding: 0; margin: 18px 0 0; display: grid; gap: 16px; min-width: 0; }
 .choice legend, .choice label { font-size: 12px; }
 .choice label { display: grid; gap: 7px; }
 .choice textarea { resize: vertical; width: 100%; }
@@ -70,3 +72,14 @@
 }
 
 .adminForms { display: grid; gap: 18px; max-width: 920px; }
+.crmContext { display: grid; grid-template-columns: repeat(2,minmax(0,1fr)); gap: 24px; padding: 22px; border: 1px solid var(--line); border-radius: var(--radius); background: var(--paper); }
+.crmContext > div { min-width: 0; display: grid; align-content: start; gap: 8px; overflow-wrap: anywhere; }
+.crmContext h2 { font-size: 17px; margin: 0; }
+.crmContext p { margin: 0; font-size: 14px; line-height: 1.6; }
+.crmContext a { text-decoration: underline; text-underline-offset: 3px; color: var(--moss-dark); padding-block: 8px; }
+.crmContext small { color: var(--muted); font-size: 12px; line-height: 1.5; }
+.consequence { border-left: 2px solid var(--line); padding-left: 12px; }
+@media(max-width:650px) { .crmContext { grid-template-columns: minmax(0,1fr); padding:18px; } }
+/* Restore the Studio's narrow layout only for this console; later global shell
+   rules otherwise override the existing mobile breakpoint. */
+@media(max-width:900px) { :global(.shell):has(.console) { grid-template-columns:minmax(0,1fr); } }

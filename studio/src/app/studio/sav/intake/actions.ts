@@ -6,6 +6,7 @@ import { revalidatePath } from "next/cache";
 import { recordIntakeHumanCommand } from "@/lib/sav/intake/human-commands";
 import {requestIntakeReinvestigation,reconcileThreadIdentification} from "@/lib/sav/intake/operator-recovery";
 import { reconcileIntakeNoteForClosure } from "@/lib/sav/intake/note-recovery";
+import { intakeListDestination } from "@/lib/sav/intake-ux/navigation";
 export type IntakeChoiceFormState = { ok: boolean; message: string };
 export async function completeIntakeDossierAction(_previous: IntakeChoiceFormState, form: FormData): Promise<IntakeChoiceFormState> {
  try {
@@ -70,5 +71,6 @@ export async function releaseIntakeHumanHoldAction(form: FormData): Promise<void
  try { await releaseIntakeHumanHold({requestKey:form.get("requestKey"),threadId,messageId:form.get("messageId"),expectedEpoch:Number(form.get("expectedEpoch")),reason:form.get("reason")});status="released"; }
  catch { /* Keep the pause and the dossier when any safety condition changed. */ }
  revalidatePath(`/studio/sav/intake/${threadId}`);revalidatePath("/studio/sav/intake");
- redirect(`/studio/sav/intake/${encodeURIComponent(threadId)}?holdRelease=${status}`);
+ const destination = intakeListDestination(form.get("returnTo"));
+ redirect(`/studio/sav/intake/${encodeURIComponent(threadId)}?${new URLSearchParams({holdRelease:status,...(destination?{returnTo:destination}:{})})}`);
 }

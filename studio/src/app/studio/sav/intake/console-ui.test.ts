@@ -2,7 +2,8 @@ import { createElement, Fragment, type ComponentProps } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import { readFile, writeFile, mkdir } from "node:fs/promises";
 import { beforeEach, it, expect, vi } from "vitest";
-const mocks = vi.hoisted(() => ({ staff: vi.fn(), list: vi.fn(), detail: vi.fn(), action: vi.fn(), crmDisplay: vi.fn() }));
+const mocks = vi.hoisted(() => ({ staff: vi.fn(), list: vi.fn(), detail: vi.fn(), action: vi.fn(), crmDisplay: vi.fn(), controls: vi.fn() }));
+vi.mock("@/lib/sav/intake-ux/message-controls",()=>({readUxMessageControls:mocks.controls}));
 vi.mock("@/lib/sav/intake/crm-display-server",()=>({readIntakeCrmDisplay:mocks.crmDisplay}));
 vi.mock("@/lib/sav/intake/console-auth",()=>({requireIntakeConsoleStaff:mocks.staff}));
 vi.mock("@/lib/sav/intake/console-store",()=>({listIntakeConsole:mocks.list}));
@@ -22,16 +23,16 @@ const fixture={installed:true,counts:{learning:1,missing_contact:1,to_validate:2
 const detail={thread:{id:threadId,subject:fixture.rows[0].subject,paused:false,ticketId:null},projection:{epoch:1,projectedEpoch:1,status:"human_choice",reason:null},latestMessageId:messageId,
   current:{id:runId,messageId,candidateContactIds:["101","102"],sourceHash:"a".repeat(64),version:7,sourceMatches:true,payload:{reason:"SAV_INTAKE_RUNTIME_USAGE_UNCERTAIN",plan:{candidateContactIds:["101","102"],decision:{classification:"support",disposition:{kind:"collect_context",reasons:["contact_ambiguous"]},evidence:[{id:"current",source:"current_message",sourceId:messageId,observedAt:at.toISOString()}]}}}},
   messages:[{id:messageId,direction:"inbound",fromEmail:"fiction@example.invalid",receivedAt:at,createdAt:at,body:{text:"My synthetic connection no longer works. Please inspect this complete test request.",attachments:[]},translation:{status:"complete",language:"en",text:"Ma connexion synthétique ne fonctionne plus. Merci de vérifier cette demande de test complète.",revision:"synthetic",sourceHash:"synthetic",errorCode:null}}],historyTruncated:false,
-  progress:{confirmed:false,state:"uncertain",ticketId:"201",reason:"SAV_INTAKE_EXECUTION_RECONCILIATION_REQUIRED",effects:[{id:"effect-1",kind:"ticket_create",state:"confirmed",confirmedAt:at},{id:"effect-2",kind:"email_associate",state:"uncertain",confirmedAt:null}]},choices:[]};
-beforeEach(()=>{vi.clearAllMocks();mocks.crmDisplay.mockResolvedValue({contacts:{"101":{label:"Alice Test",url:"https://app.hubspot.com/contacts/123/record/0-1/101",available:true}},tickets:{"201":{label:"Connexion interrompue",url:"https://app.hubspot.com/contacts/123/record/0-5/201",available:true}}});mocks.staff.mockResolvedValue({id:"synthetic",email:"ugo@limova.ai",role:"admin"});mocks.list.mockResolvedValue(fixture);mocks.detail.mockResolvedValue(detail);});
+  progress:{runId,confirmed:false,state:"uncertain",ticketId:"201",reason:"SAV_INTAKE_EXECUTION_RECONCILIATION_REQUIRED",effects:[{id:"effect-1",kind:"ticket_create",state:"confirmed",confirmedAt:at},{id:"effect-2",kind:"email_associate",state:"uncertain",confirmedAt:null}]},choices:[]};
+beforeEach(()=>{vi.clearAllMocks();mocks.controls.mockResolvedValue({blocked:false});mocks.crmDisplay.mockResolvedValue({contacts:{"101":{label:"Alice Test",url:"https://app.hubspot.com/contacts/123/record/0-1/101",available:true}},tickets:{"201":{label:"Connexion interrompue",url:"https://app.hubspot.com/contacts/123/record/0-5/201",available:true}}});mocks.staff.mockResolvedValue({id:"synthetic",email:"ugo@limova.ai",role:"admin"});mocks.list.mockResolvedValue(fixture);mocks.detail.mockResolvedValue(detail);});
 const renderList=async(query:{view?:string;q?:string;page?:string}={})=>renderToStaticMarkup(createElement(Fragment,null,await IntakeConsolePage({searchParams:Promise.resolve(query)})));
 const renderDetail=async()=>renderToStaticMarkup(createElement(Fragment,null,await IntakeDetailPage({params:Promise.resolve({id:threadId})})));
 it("offers explicit manual completion on the latest message only for the existing authorized operator, without acting on GET",async()=>{
-  const html=await renderDetail();expect(html).toContain("Passer en Terminés");expect(html).toContain("J’ai déjà traité cette demande");
+  const html=await renderDetail();expect(html).toContain("Marquer traité hors Studio");expect(html).toContain("J’ai déjà traité cette demande");
   expect(html).toMatch(/<input(?=[^>]*name="confirmed")(?=[^>]*required="")[^>]*>/);expect(html).toContain(`name="messageId" value="${messageId}"`);expect(mocks.action).not.toHaveBeenCalled();
-  mocks.detail.mockResolvedValue({...detail,handledExternally:true});expect(await renderDetail()).not.toContain("Passer en Terminés");
-  mocks.detail.mockResolvedValue(detail);mocks.staff.mockResolvedValue({email:"reouven@limova.ai",role:"admin"});expect(await renderDetail()).not.toContain("Passer en Terminés");
-  mocks.staff.mockResolvedValue({email:"ugo@limova.ai",role:"member"});expect(await renderDetail()).not.toContain("Passer en Terminés");
+  mocks.detail.mockResolvedValue({...detail,handledExternally:true});expect(await renderDetail()).not.toContain("Marquer traité hors Studio");
+  mocks.detail.mockResolvedValue(detail);mocks.staff.mockResolvedValue({email:"reouven@limova.ai",role:"admin"});expect(await renderDetail()).not.toContain("Marquer traité hors Studio");
+  mocks.staff.mockResolvedValue({email:"ugo@limova.ai",role:"member"});expect(await renderDetail()).not.toContain("Marquer traité hors Studio");
 });
 it("six business views and distinct technical area use supplied counts and French states, without actions on GET",async()=>{
   const html=await renderList();for(const label of ["Traités — en apprentissage","Pas de fiche HubSpot","À valider","Résiliation / Facturation","Terminés","Autres","En cours et attentes techniques","Plafond de qualification atteint"] )expect(html).toContain(label);
@@ -92,4 +93,20 @@ it("shows exhausted previous attempts on a pending new version without inheritin
 it("shows named clickable proposed contacts/tickets without turning the proposal into a confirmed result",async()=>{
  mocks.detail.mockResolvedValue({...detail,current:{...detail.current,payload:{...detail.current.payload,plan:{...detail.current.payload.plan,decision:{...detail.current.payload.plan.decision,disposition:{kind:"ticket",target:{operation:"link",contactId:"101",ticketId:"201"}}}}}}});
  const html=await renderDetail();expect(html).toContain("Alice Test");expect(html).toContain("Connexion interrompue");expect(html).toContain('href="https://app.hubspot.com/contacts/123/record/0-1/101"');expect(html).toContain('href="https://app.hubspot.com/contacts/123/record/0-5/201"');expect(html).toContain('rel="noopener noreferrer"');expect(html).not.toContain("Contact HubSpot 101");expect(html).not.toContain("Ticket confirmé :");expect(mocks.action).not.toHaveBeenCalled();
+});
+it("does not label a different run's confirmed CRM effects as the current decision",async()=>{
+ mocks.detail.mockResolvedValue({...detail,confirmedCurrent:false,progress:{...detail.progress,runId:"10000000-0000-4000-8000-000000000099",confirmed:true}});
+ const html=await renderDetail();expect(html).toContain("Actions historiques conservées");expect(html).not.toContain("Fiche du ticket confirmé");expect(html).not.toContain("Ticket confirmé :");
+});
+it("clearing an empty search actually clears q and keeps the current view",async()=>{
+ mocks.list.mockResolvedValue({...fixture,rows:[],total:0,page:1,pages:1});
+ const html=await renderList({view:"to_validate",q:"aucun-resultat",page:"2"});
+ const href=html.match(/href="([^"]+)"[^>]*>Effacer la recherche/)?.[1].replaceAll("&amp;","&");
+ expect(href).toBeTruthy();const url=new URL(href!,"https://studio.invalid");expect(url.searchParams.get("q")).toBe("");expect(url.searchParams.get("view")).toBe("to_validate");
+});
+it("reads reanalysis controls for the latest message only and explains unavailable stage resume",async()=>{
+ mocks.detail.mockResolvedValue({...detail,choices:[{id:"old-event",kind:"refuse",parentVersion:1,reason:"Old synthetic refusal",actor:"synthetic",at,state:"refused"}],progress:null});
+ const html=await renderDetail();expect(mocks.controls).toHaveBeenCalledWith(threadId,messageId);
+ expect(html).toContain("La reprise manuelle par étape n’est pas encore disponible");
+ expect(html).not.toContain("Informations pour l’agent enregistrées");
 });
