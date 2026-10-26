@@ -1247,7 +1247,9 @@ async function observedSimple(answer: (data: SimpleData) => Record<string, unkno
         metadata: { inputTokens: 100, outputTokens: 20, thoughtTokens: 0, totalTokens: 120 } });
     const semantic = createSavIntakeSimpleReaders({ model: "gemini-3.6-flash", call, crm, policy: runtime.policy, provenance: lease.provenance });
     const plan = await planSavIntake(lease.input, { ...crm, ...semantic }, runtime.policy, {}, () => new Date());
-    await saveSavIntakeResult(lease, runtime, { revision: SAV_INTAKE_RUNTIME_REVISION, effects: "not_connected", plan, input: lease.input },
+    // As the runtime does: the pipeline fixed at the run's creation stays in its payload.
+    const pipeline = decryptSavPayload<{ pipeline?: "simple" }>(lease.run.payloadCiphertext).pipeline;
+    await saveSavIntakeResult(lease, runtime, { revision: SAV_INTAKE_RUNTIME_REVISION, effects: "not_connected", plan, input: lease.input, ...(pipeline ? { pipeline } : {}) },
         plan.decision.disposition.kind === "collect_context" ? "waiting" : "observed");
     return { id, plan };
 }
@@ -1292,12 +1294,26 @@ it("simple reader → executor: missing indispensable evidence is never admitted
     expect(await admitIntakeExecution(id, options)).toBeNull();
     expect(writes()).toHaveLength(0);
 });
-it("simple reader → executor: flipping the pipeline switch during an execution changes nothing and never replays", async () => {
+it("simple reader → executor: a run created on simple keeps its execution after the switch really flips to current, without replay", async () => {
+    // The run is created while the switch says simple.
+    environment = { ...environment, SAV_INTAKE_PIPELINE: "simple" };
+    options.runtime = savIntakeRuntimeConfig(environment)!;
     const { id } = await observedSimple(d => simpleAnswer(d));
+    const [created] = await f.db.select().from(savIntakeRuns).where(eq(savIntakeRuns.id, id));
+    expect(decryptSavPayload<{ pipeline?: string }>(created.payloadCiphertext).pipeline).toBe("simple");
     const row = (await admitIntakeExecution(id, options))!;
-    // The switch is outside configHash: the admitted execution keeps its authority and effect keys.
-    options.runtime = savIntakeRuntimeConfig({ ...environment, SAV_INTAKE_PIPELINE: "current" })!;
+    // After admission the environment really flips back to current.
+    const before = options.runtime.configHash;
+    environment = { ...environment, SAV_INTAKE_PIPELINE: "current" };
+    options.runtime = savIntakeRuntimeConfig(environment)!;
+    expect(options.runtime.pipeline).toBe("current");
+    expect(options.runtime.configHash).toBe(before);
     expect(await executeIntakePass(row.id, options)).toMatchObject({ state: "confirmed" });
-    expect(await executeIntakePass(row.id, options)).not.toMatchObject({ state: "failed" });
+    const confirmed = (await getExecutionEffects(row.id)).filter(e => e.state === "confirmed").map(e => e.id).sort();
+    const writesAfterFirst = writes().length;
+    // Running the same execution again never re-dispatches a confirmed effect.
+    await executeIntakePass(row.id, options);
     expect(p.calls.filter(c => c.method === "POST" && c.path.endsWith("/tickets"))).toHaveLength(1);
+    expect(writes()).toHaveLength(writesAfterFirst);
+    expect((await getExecutionEffects(row.id)).filter(e => e.state === "confirmed").map(e => e.id).sort()).toEqual(confirmed);
 });

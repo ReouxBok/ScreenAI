@@ -29,13 +29,35 @@ type Body = { text: string; headers?: Record<string, string>; attachments?: unkn
 export type IntakeLease = { run: Run; token: string; input: EngineInput; provenance: Map<string, ReturnType<typeof prepareSavIntakeMessage>["provenance"]>; body: Body; sourceHash: string; recoveringRead?: true };
 const fail = (): never => { throw Error("SAV_INTAKE_RUNTIME_CONTEXT_CHANGED"); };
 const budgetColumns={id:savIntakeModelCalls.id,messageKey:savIntakeModelCalls.messageKey,requestHash:savIntakeModelCalls.requestHash,state:savIntakeModelCalls.state,reservedNanoUsd:savIntakeModelCalls.reservedNanoUsd,chargedNanoUsd:savIntakeModelCalls.chargedNanoUsd,payloadCiphertext:savIntakeModelCalls.payloadCiphertext,createdAt:savIntakeModelCalls.createdAt,runId:savIntakeModelCalls.runId};
+/** A received 429/5xx settled at zero with its explicit marker (see settleSavIntakeCall). */
+function unbilledProviderRow(row: Pick<typeof savIntakeModelCalls.$inferSelect, "state" | "chargedNanoUsd" | "payloadCiphertext">) {
+  if (row.state !== "settled" || row.chargedNanoUsd !== 0) return false;
+  const data = decryptSavPayload<{ usageReconciliation?: string; providerStatus?: number }>(row.payloadCiphertext);
+  return data.usageReconciliation === "provider_http_error_unbilled.v1" && Number.isSafeInteger(data.providerStatus)
+    && (data.providerStatus === 429 || Number(data.providerStatus) >= 500 && Number(data.providerStatus) <= 599);
+}
+/** The ledger row a dispatch of this exact body maps to, shared by preflight and reservation:
+ * a cached result is reused; an explicitly unbilled provider rejection is followed by a new,
+ * separately reserved retry row (chain transientRetry:k); any other consumed row is refused,
+ * and unsettled usage blocks everything. */
+async function resolveIntakeDispatch(tx: Pick<Tx, "select">, rows: readonly { id: string; messageKey: string; requestHash: string; state: string; chargedNanoUsd: number; payloadCiphertext: string }[], messageKey: string, base: string) {
+  let hash = base;
+  for (let k = 1; k <= SAV_INTAKE_CALL_POLICY.perMessage; k++) {
+    const prior = rows.find(row => row.messageKey === messageKey && row.requestHash === hash);
+    if (!prior) return { kind: "new" as const, hash };
+    if (prior.state !== "settled") throw Error("SAV_INTAKE_RUNTIME_USAGE_UNCERTAIN");
+    const [row] = await tx.select({ resultCiphertext: savIntakeModelCalls.resultCiphertext }).from(savIntakeModelCalls).where(eq(savIntakeModelCalls.id, prior.id));
+    if (row?.resultCiphertext) return { kind: "cached" as const, id: prior.id, resultCiphertext: row.resultCiphertext };
+    if (!unbilledProviderRow(prior)) throw Error("SAV_INTAKE_RUNTIME_CALL_ALREADY_CONSUMED");
+    hash = intakeRuntimeHash({ transientRetry: k, body: base });
+  }
+  throw Error("SAV_INTAKE_RUNTIME_CALL_ALREADY_CONSUMED");
+}
 function budgetRowsValid(rows: Pick<typeof savIntakeModelCalls.$inferSelect,"reservedNanoUsd"|"chargedNanoUsd"|"payloadCiphertext"|"state">[]) {
   for (const row of rows) {
-    const data = decryptSavPayload<{ metadata?: SavGeminiMetadata; usageReconciliation?: string; providerStatus?: number }>(row.payloadCiphertext), m = data.metadata ?? {};
+    const data = decryptSavPayload<{ metadata?: SavGeminiMetadata }>(row.payloadCiphertext), m = data.metadata ?? {};
     // A received 429/5xx rejection is settled at zero with its explicit marker (see settleSavIntakeCall).
-    const unbilled = row.state === "settled" && data.usageReconciliation === "provider_http_error_unbilled.v1" && row.chargedNanoUsd === 0
-      && Number.isSafeInteger(data.providerStatus) && (data.providerStatus === 429 || Number(data.providerStatus) >= 500 && Number(data.providerStatus) <= 599);
-    if (unbilled && row.reservedNanoUsd === 817_152_000) continue;
+    if (unbilledProviderRow(row) && row.reservedNanoUsd === 817_152_000) continue;
     const { inputTokens: i, outputTokens: o, thoughtTokens: t, totalTokens: total } = m;
     const known = [i, o, t, total].every(n => Number.isSafeInteger(n) && Number(n) >= 0) && Number(i) > 0 && Number(i) <= 1_048_576
       && Number(o) + Number(t) <= 8192 && Number(i) + Number(o) + Number(t) === total;
@@ -353,14 +375,15 @@ export async function assertSavIntakeCallPlan(messageId: string, config: IntakeR
     const rows = await tx.select(budgetColumns).from(savIntakeModelCalls), messageKey = intakeRuntimeHash(messageId);
     budgetRowsValid(rows);
     if (rows.some(row => row.state !== "settled" && (config.budgetProfile !== SAV_INTAKE_OPERATIONAL_PROFILE || row.messageKey === messageKey))) throw Error("SAV_INTAKE_RUNTIME_USAGE_UNCERTAIN");
-    const own = rows.filter(row => row.messageKey === messageKey), prior = own.filter(row => hashes.includes(row.requestHash));
-    if (prior.length) {
-      const cached = await tx.select({ id: savIntakeModelCalls.id, result: savIntakeModelCalls.resultCiphertext }).from(savIntakeModelCalls).where(inArray(savIntakeModelCalls.id, prior.map(r => r.id)));
-      if (cached.some(row => !row.result)) throw Error("SAV_INTAKE_RUNTIME_CALL_ALREADY_CONSUMED");
-    }
-    const needed = hashes.filter(h => !prior.some(row => row.requestHash === h)).length, now = new Date();
+    const own = rows.filter(row => row.messageKey === messageKey);
+    // The exact rows the next dispatches will use: cache, unbilled-rejection retry or new.
+    const resolved = await Promise.all(hashes.map(h => resolveIntakeDispatch(tx, rows, messageKey, h)));
+    const needed = resolved.filter(r => r.kind === "new").length, now = new Date();
+    // The same per-version bound as the reservation, for the current version of this message.
+    const [current] = await tx.select({ id: savIntakeRuns.id }).from(savIntakeRuns).where(and(eq(savIntakeRuns.messageId, messageId), eq(savIntakeRuns.isCurrent, true))).limit(1);
+    const version = current ? rows.filter(row => row.runId === current.id).length : 0;
     const usage = intakeBudgetUsage(rows, config, now), quote = savDerivedCostQuote(config.model, 8192, now);
-    if (own.length + needed > SAV_INTAKE_CALL_POLICY.perMessage || needed > usage.remainingCalls || needed * quote.reservedNanoUsd > usage.remainingNanoUsd
+    if (own.length + needed > SAV_INTAKE_CALL_POLICY.perMessage || version + needed > SAV_INTAKE_CALL_POLICY.perVersion || needed > usage.remainingCalls || needed * quote.reservedNanoUsd > usage.remainingNanoUsd
       || needed * quote.reservedNanoUsd > usage.remainingRollingNanoUsd) throw Error("SAV_INTAKE_RUNTIME_BUDGET_EXHAUSTED");
   });
 }
@@ -368,14 +391,9 @@ async function reserveIntakeCall(tx: Tx, run: Run, config: IntakeRuntimeConfig, 
     await tx.execute(sql`select pg_advisory_xact_lock(hashtext('sav-intake-runtime-model-budget-v1'))`);
     const rows = await tx.select(budgetColumns).from(savIntakeModelCalls), messageKey = intakeRuntimeHash(run.messageId);
     budgetRowsValid(rows);
-    const prior = rows.find(row => row.messageKey === messageKey && row.requestHash === requestHash);
-    if (prior) {
-      if (prior.state !== "settled") throw Error("SAV_INTAKE_RUNTIME_USAGE_UNCERTAIN");
-      const [cache]=await tx.select({resultCiphertext:savIntakeModelCalls.resultCiphertext}).from(savIntakeModelCalls).where(eq(savIntakeModelCalls.id,prior.id));
-      if (!cache?.resultCiphertext) throw Error("SAV_INTAKE_RUNTIME_CALL_ALREADY_CONSUMED");
-      const saved = decryptSavPayload<{ json: unknown; metadata: SavGeminiMetadata }>(cache.resultCiphertext);
-      return { id: prior.id, cached: saved };
-    }
+    const resolved = await resolveIntakeDispatch(tx, rows, messageKey, requestHash);
+    if (resolved.kind === "cached") return { id: resolved.id, cached: decryptSavPayload<{ json: unknown; metadata: SavGeminiMetadata }>(resolved.resultCiphertext) };
+    requestHash = resolved.hash;
     if (rows.some(row => row.state !== "settled" && (config.budgetProfile !== SAV_INTAKE_OPERATIONAL_PROFILE || row.messageKey === messageKey))) throw Error("SAV_INTAKE_RUNTIME_USAGE_UNCERTAIN");
     const budgetNow=config.budgetProfile===SAV_INTAKE_OPERATIONAL_PROFILE ? new Date() : now;
     if(!Number.isFinite(now.getTime())||now>budgetNow)throw Error("SAV_INTAKE_RUNTIME_LEDGER_CLOCK_REJECTED");
@@ -513,11 +531,17 @@ export async function scheduleSavIntakeTransientRetry(runId: string, reason: str
     if (!run?.isCurrent || run.state !== "waiting" || run.leaseToken) return null;
     const done = await retriesOfMessage(tx, run.messageId);
     const delays = SAV_INTAKE_TRANSIENT_RETRY.delaysMinutes;
-    if (done >= delays.length) { await journal(tx, runId, "retry_exhausted", { reason, retries: done }); return null; }
+    // Terminal exit: no more automatic dispatch; the dossier is visibly blocked for the team.
+    const block = async (cause: string, detail: Record<string, unknown>) => {
+      await journal(tx, runId, cause === "transient_retries_exhausted" ? "retry_exhausted" : "retry_ineligible", { reason, ...detail });
+      await journal(tx, runId, "attempts_exhausted", { cause, reason, ...detail });
+      return null;
+    };
+    if (done >= delays.length) return block("transient_retries_exhausted", { retries: done });
     // Never announce a retry the dispatch budget already forbids: same policy as the reservation.
     const calls = await tx.select({ runId: savIntakeModelCalls.runId }).from(savIntakeModelCalls).where(eq(savIntakeModelCalls.messageKey, intakeRuntimeHash(run.messageId)));
     if (calls.length >= SAV_INTAKE_CALL_POLICY.perMessage || calls.filter(c => c.runId === runId).length >= SAV_INTAKE_CALL_POLICY.perVersion) {
-      await journal(tx, runId, "retry_ineligible", { reason, cause: "call_budget", calls: calls.length, policy: SAV_INTAKE_CALL_POLICY }); return null;
+      return block("call_budget", { calls: calls.length, policy: SAV_INTAKE_CALL_POLICY });
     }
     const retryAt = new Date(now.getTime() + delays[done] * 60_000);
     await tx.update(savIntakeRuns).set({ attempts: sql`greatest(${savIntakeRuns.attempts} - 1, 0)`, leaseUntil: retryAt, updatedAt: now }).where(eq(savIntakeRuns.id, runId));

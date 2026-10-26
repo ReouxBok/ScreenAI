@@ -150,6 +150,9 @@ describe("transient provider failures (lot 2)", () => {
     const retries = Math.min(SAV_INTAKE_TRANSIENT_RETRY.delaysMinutes.length, SAV_INTAKE_CALL_POLICY.perVersion - 1, SAV_INTAKE_CALL_POLICY.perMessage - 1);
     expect(journal.filter(k => k === "retry_scheduled")).toHaveLength(retries);
     expect(journal.some(k => k === "retry_exhausted" || k === "retry_ineligible")).toBe(true);
+    // Terminal exit: visibly blocked, never claimed or dispatched again.
+    expect(journal).toContain("attempts_exhausted");
+    expect(await claimSavIntakeRun(id, config)).toBeNull();
     expect(p.calls()).toBe(retries + 1);
     expect((await run(id)).attempts).toBeGreaterThan(0);
     expect((await f.db.select().from(savIntakeModelCalls)).every(r => r.state === "settled" && r.chargedNanoUsd === 0)).toBe(true);

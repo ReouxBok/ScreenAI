@@ -15,7 +15,7 @@ export function createIntakeModelDispatcher(options: { config: IntakeRuntimeConf
   reserve: (hash: string) => ReturnType<typeof reserveSavIntakeCall>; signal: AbortSignal;
   preflight?: (hashes: string[]) => Promise<void>;
   env?: () => Record<string,string|undefined>; network?: typeof fetch;
-  /** Ordinal of a scheduled transient retry of this run (0: none). */
+  /** Informational: the ledger, not this ordinal, decides whether a body may be dispatched again. */
   retryOrdinal?: number }) {
   const {config,live}=options, env=options.env??(()=>process.env), network=options.network??fetch;
   let uncertain=false, failureReason:string|undefined;
@@ -28,12 +28,9 @@ export function createIntakeModelDispatcher(options: { config: IntakeRuntimeConf
       const expectedBody = wire.body;
       if (wire.textBytes > SAV_INTAKE_MODEL_LIMITS.wireTextBytes || input.body.generationConfig.maxOutputTokens !== 8192) throw Error("SAV_INTAKE_RUNTIME_REQUEST_REJECTED");
       let sent = false;
-      // A body that failed transiently has no cached result: a scheduled retry is a NEW
-      // dispatch with its own reservation, never a re-use of the consumed one.
-      const reserved = await options.reserve(intakeRuntimeHash(expectedBody)).catch(error => {
-        if (!(error instanceof Error) || error.message !== "SAV_INTAKE_RUNTIME_CALL_ALREADY_CONSUMED" || !options.retryOrdinal) throw error;
-        return options.reserve(intakeRuntimeHash({ transientRetry: options.retryOrdinal, body: intakeRuntimeHash(expectedBody) }));
-      });
+      // The store resolves the exact ledger row (cache, retry of an unbilled rejection, or new),
+      // with the same rule as the preflight of a grouped plan.
+      const reserved = await options.reserve(intakeRuntimeHash(expectedBody));
       if (reserved.cached) { failureReason = undefined; return reserved.cached; }
       const reservation = reserved.id;
       let providerUsage: SavGeminiMetadata | undefined, providerStatus: number | undefined;

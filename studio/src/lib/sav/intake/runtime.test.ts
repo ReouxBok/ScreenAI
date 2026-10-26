@@ -928,3 +928,72 @@ it("simple pipeline: a resumed read reuses the accepted analysis and gives the f
   expect(await f.db.select().from(savActions)).toHaveLength(0);
  }finally{vi.useRealTimers();}
 });
+
+// Independent review: a batch preflight must admit the exact scheduled retry envelope.
+import { createIntakeModelDispatcher } from "./model-dispatch";
+import { savGeminiWireBody } from "../gemini-transport";
+it("REVIEW scheduled grouped matching retry is admitted by the same preflight", async () => {
+  const l = await lease();
+  const input: Parameters<import("./model-readers").IntakeGeminiCall>[0] = { model: config.model, phase: "ticket_matching" as const, promptRevision: "synthetic", signal: AbortSignal.timeout(10000), allowRetry: false as const,
+    body: { systemInstruction: {parts:[{text:"Synthetic review only"}]}, contents: [{ role: "user", parts: [{ text: "synthetic matching group" }] }], generationConfig: { maxOutputTokens: 8192, responseMimeType: "application/json" } } };
+  const first = await reserveSavIntakeCall(l, config, intakeRuntimeHash(savGeminiWireBody(input).body));
+  expect(await settleSavIntakeCall(first.id, undefined, undefined, 503)).toBe(true);
+  const d = createIntakeModelDispatcher({ config, retryOrdinal: 1, live: async () => {}, signal: input.signal,
+    reserve: h => reserveSavIntakeCall(l, config, h), preflight: hashes => assertSavIntakeCallPlan(messageId,config,hashes),
+    env: () => environment, network: async () => { throw Error("NETWORK_FORBIDDEN"); } });
+  await expect(d.plan([input, { ...input, body: { ...input.body, contents: [{ role: "user", parts: [{ text: "second matching group" }] }] } }])).resolves.toBeUndefined();
+});
+
+it("REVIEW grouped preflight rejects two new calls when the current version has only one left", async () => {
+  const l = await lease();
+  for(let n=0;n<SAV_INTAKE_CALL_POLICY.perVersion-1;n++) {
+    const r=await reserveSavIntakeCall(l,config,intakeRuntimeHash(`used-${n}`));
+    await settleSavIntakeCall(r.id,usage,{json:{cached:true},metadata:usage});
+  }
+  await expect(assertSavIntakeCallPlan(messageId,config,[intakeRuntimeHash("next-1"),intakeRuntimeHash("next-2")])).rejects.toThrow("BUDGET_EXHAUSTED");
+});
+
+// Current reader, grouped ticket comparison: one group succeeds, the other gets a received 503.
+// The retry reuses the successful group from cache and dispatches only the refused one.
+import { createSavIntakeSemanticReaders } from "./model-readers";
+function uniqueText(seed: number, size: number) { return Array.from({ length: size }, (_, i) => { seed = (Math.imul(seed, 1664525) + 1013904223) >>> 0; return i % 12 === 11 ? " " : String.fromCharCode(97 + (seed >>> 8) % 26); }).join("") + " FIN"; }
+it.each([["without", false], ["with", true]] as const)("current reader: a grouped comparison retried after one group's 503 (%s deployment) keeps the cached group and redispatches only the refused one", async (_, redeploy) => {
+  const at = new Date(Date.now() - 3600_000).toISOString(), mid = messageId;
+  const message = { id: mid, threadId, receivedAt: at, fromEmail: "client@example.invalid", toEmails: ["support@example.invalid"], direction: "inbound" as const, currentText: "La synchronisation échoue encore.", contentComplete: true };
+  // Two tickets whose citation catalogues together exceed one call: the reader plans two groups.
+  const tickets = ["201", "202"].map((id, i) => ({ ticket: { id, contactIds: ["101"], stage: "open" as const, createdAt: at, ownerId: null, subject: `Ticket ${id}`, content: "Synchronisation" },
+    history: [{ id: `note-${id}`, kind: "note" as const, at, text: uniqueText(500 + i, 270_000) }] }));
+  const input = { message, requests: [{ id: "r1", kind: "support" as const, currentMessageId: mid }], tickets,
+    evidence: ["current", ...tickets.flatMap(t => [`ticket-${t.ticket.id}`, `history-${t.ticket.id}`])].map(id => ({ id, sourceId: id, observedAt: at, contentHash: "a".repeat(43), source: "crm_ticket" as const })) } as never;
+  let gemini = 0; const refuse = new Set<number>([2]);
+  const network = vi.fn(async (url: Parameters<typeof fetch>[0], init?: RequestInit) => {
+    gemini++;
+    if (refuse.has(gemini)) return new Response("{}", { status: 503 });
+    const d = JSON.parse(JSON.parse(String(init?.body)).contents[0].parts[0].text) as { tickets: { ticket: { id: string } }[]; citationCatalogue: { id: string; sourceId: string }[] };
+    const answer = { investigationComplete: true, tickets: d.tickets.map(({ ticket }) => ({ ticketId: ticket.id, relation: "same", requestIds: ["r1"], evidenceIds: ["current", `ticket-${ticket.id}`, `history-${ticket.id}`], rationale: "Même problème.",
+      grounding: ["current", `ticket-${ticket.id}`, `history-${ticket.id}`].map(source => ({ quoteId: d.citationCatalogue.find(e => e.sourceId === source)!.id })) })) };
+    return Response.json({ candidates: [{ finishReason: "STOP", content: { parts: [{ text: JSON.stringify(answer) }] } }], usageMetadata: { promptTokenCount: 1000, candidatesTokenCount: 50, thoughtsTokenCount: 0, totalTokenCount: 1050 } });
+  });
+  const pass = async (cfg: IntakeRuntimeConfig, env: Record<string, string | undefined>) => {
+    const id = (await enqueueSavIntakeMessage(mid, cfg))!, l = (await claimSavIntakeRun(id, cfg))!;
+    const d = createIntakeModelDispatcher({ config: cfg, live: async () => {}, signal: AbortSignal.timeout(30_000), reserve: h => reserveSavIntakeCall(l, cfg, h),
+      preflight: hashes => assertSavIntakeCallPlan(mid, cfg, hashes), env: () => env, network });
+    const reader = createSavIntakeSemanticReaders({ model: cfg.model, call: d.call, planCalls: d.plan });
+    try { return await reader.assessIssues(input, AbortSignal.timeout(30_000)); }
+    catch (error) { await Promise.allSettled(d.pending); return error as Error; }
+    finally { await f.db.update(savIntakeRuns).set({ leaseToken: null, leaseUntil: null, state: "waiting" }).where(eq(savIntakeRuns.id, l.run.id)); }
+  };
+  const first = await pass(config, environment);
+  expect(first).toBeInstanceOf(Error);
+  expect(gemini).toBe(2);
+  let ledger = await f.db.select().from(savIntakeModelCalls);
+  expect(ledger.map(r => [r.state, r.chargedNanoUsd > 0, Boolean(r.resultCiphertext)]).sort()).toEqual([["settled", false, false], ["settled", true, true]].sort());
+  const nextEnv = redeploy ? { ...environment, SAV_CODE_REVISION: "b".repeat(40), SAV_INTAKE_RUNTIME_CONFIG: JSON.stringify({ ...JSON.parse(environment.SAV_INTAKE_RUNTIME_CONFIG!), codeRevision: "b".repeat(40) }) } : environment;
+  const second = await pass(savIntakeRuntimeConfig(nextEnv)!, nextEnv);
+  expect(second).toMatchObject({ investigationComplete: true, tickets: [{ ticketId: "201", relation: "same" }, { ticketId: "202", relation: "same" }] });
+  // Only the refused group is dispatched again, under a new, separately reserved row.
+  expect(gemini).toBe(3);
+  ledger = await f.db.select().from(savIntakeModelCalls);
+  expect(ledger).toHaveLength(3); expect(new Set(ledger.map(r => r.requestHash)).size).toBe(3);
+  expect(ledger.filter(r => r.resultCiphertext)).toHaveLength(2); expect(ledger.filter(r => r.chargedNanoUsd === 0)).toHaveLength(1);
+}, 60_000);
