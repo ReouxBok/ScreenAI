@@ -14,6 +14,7 @@ import { savReplyLanguage } from "./reply-language";
 import { renderSavOutboundReply, SAV_REPLY_FORMAT_REVISION, savManualReplyMode } from "./reply-format";
 
 import { normalizeSavConfirmationText, SAV_REPLY_CONFIRMATION_TEXT_REVISION } from "./reply-confirmation-text";
+import { savEffectiveReceivedAt } from "@/lib/sav/message-order";
 
 const requestSchema = z.object({ threadId: z.uuid(), draftId: z.uuid() }).strict();
 
@@ -105,7 +106,7 @@ export async function assertSavCurrentManualReply(action: typeof savActions.$inf
   const [draft] = await db.select().from(savReplyDrafts).where(and(eq(savReplyDrafts.id, action.payload.studioDraftId), eq(savReplyDrafts.isCurrent, true))).limit(1);
   if (!draft || draft.status === "abandoned" || draft.threadId !== action.threadId || draft.messageId !== action.messageId || draft.createdBy !== action.actorEmail || draft.bodyCiphertext !== action.payload.bodyCiphertext) throw new Error("SAV_REPLY_MANUAL_DRAFT_CHANGED");
   const context = await assertSavAcceptedDraft(draft, db);
-  const [message] = await db.select().from(savMessages).where(and(eq(savMessages.threadId, action.threadId), eq(savMessages.direction, "inbound"), savV0EligibleMessageFilter())).orderBy(desc(savMessages.receivedAt), desc(savMessages.createdAt), desc(savMessages.id)).limit(1);
+  const [message] = await db.select().from(savMessages).where(and(eq(savMessages.threadId, action.threadId), eq(savMessages.direction, "inbound"), savV0EligibleMessageFilter())).orderBy(desc(savEffectiveReceivedAt), desc(savMessages.createdAt), desc(savMessages.id)).limit(1);
   const [decision] = await db.select().from(savDecisions).where(and(eq(savDecisions.id, context.decision.id), eq(savDecisions.isCurrent, true))).limit(1);
   const [run] = await db.select().from(savAgentRuns).where(eq(savAgentRuns.id, context.run.id)).limit(1);
   const [review] = await db.select().from(savProposalReviews).where(and(eq(savProposalReviews.messageId, draft.messageId), eq(savProposalReviews.isCurrent, true))).limit(1);

@@ -69,7 +69,7 @@ describe("bounded read/generation transport", () => {
   });
   it("refuses oversized input before the provider and respects strict no-retry callers", async () => {
     const network = vi.fn<typeof fetch>().mockResolvedValue(new Response("", { status: 503 }));
-    await expect(requestSavGeminiJson({ ...request, body: { ...request.body, contents: "x".repeat(262144) }, fetch: network })).rejects.toMatchObject({ message: "SAV_AI_BUDGET_EXCEEDED" });
+    await expect(requestSavGeminiJson({ ...request, body: { ...request.body, contents: "x".repeat(SAV_AI_BUDGET.tokenAllowance) }, fetch: network })).rejects.toMatchObject({ message: "SAV_AI_BUDGET_EXCEEDED" });
     expect(network).not.toHaveBeenCalled();
     await expect(requestSavGeminiJson({ ...request, fetch: network, allowRetry: false })).rejects.toMatchObject({ message: "SAV_AI_HTTP_503" });
     expect(network).toHaveBeenCalledOnce();

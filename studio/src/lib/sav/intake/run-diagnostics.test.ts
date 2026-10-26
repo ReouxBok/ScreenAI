@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { eq } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, beforeEach, expect, it, vi } from "vitest";
 import { createSavTestDb } from "../../../../test/sav-db";
 import { savIntakeJournal, savIntakeRuns, savMessages, savMailboxes, savThreads } from "@/db/schema";
@@ -32,7 +33,8 @@ it("retains exhausted older versions and attempt-level failures without inheriti
   const current=await run(2,0,true);
   const before=await fixture.client.query("select row_to_json(m) as row from sav.messages m");
   const result=(await readIntakeRunDiagnostics(threadId))!;
-  expect(result).toMatchObject({messageId,totalAttempts:2,attemptsExhausted:true,versionsTruncated:false,eventsTruncated:false});
+  // An earlier version that produced an analysis does not exhaust the new one (defect B).
+  expect(result).toMatchObject({messageId,totalAttempts:2,attemptsExhausted:false,attemptBudget:{runAttempts:0,failed:0,total:2,exhausted:null},versionsTruncated:false,eventsTruncated:false});
   expect(result.runs[0]).toMatchObject({runId:current.id,state:"pending",attempts:0,diagnostic:{reason:null}});
   expect(result.runs[1]).toMatchObject({isCurrent:false,diagnostic:{reason:"SAV_INTAKE_MODEL_CONTEXT_LIMIT",contextReasons:["classification_incomplete"]},events:[{diagnostic:{reason:"SAV_INTAKE_MODEL_CITATION_REJECTED"}}]});
   expect(JSON.stringify(result)).not.toMatch(/PRIVATE BODY|private@|mutation|create_ticket|steps|plan/);
@@ -90,4 +92,53 @@ it("exposes retry/origin/schema facts without their cached results or rejected v
  expect(result).toMatchObject({qualification:{nature:"newsletter",requestCount:0},readRecovery:{state:"scheduled",technicalAttempts:2,operation:"ticket_history",expired:false}});
  expect(result.traces[0]).toMatchObject({transport:{origin:"transport",attempts:2,status:0,durationMs:216}});expect(result.traces[1]).toHaveProperty("schemaIssues",[{path:"images.0.regions.0.box",code:"too_big",maximum:4},{path:"output",code:"invalid_type"}]);
  expect(JSON.stringify(result)).not.toContain("PRIVATE");
+});
+
+it("reports a durable blocking marker on the current run as exhausted, with its attempt budget",async()=>{
+  await run(1,2,false,{reason:"SAV_INTAKE_MODEL_CONTEXT_LIMIT"});
+  const current=await run(2,2,true,{reason:"SAV_INTAKE_MODEL_CONTEXT_LIMIT"});
+  await fixture.db.insert(savIntakeJournal).values({runId:current.id,kind:"attempts_exhausted",payloadCiphertext:encryptSavPayload({cause:"failed_per_message"})});
+  expect(await readIntakeRunDiagnostics(threadId)).toMatchObject({attemptsExhausted:true,attemptBudget:{runAttempts:2,failed:4,total:4,exhausted:"per_version"}});
+});
+
+it("a large analysed payload is never read as a failure: no false exhaustion from the censored display (review P2)",async()=>{
+  const bulky={plan:{decision:{disposition:{kind:"collect_context",reasons:["classification_incomplete"]}}},padding:"x".repeat(300_000)};
+  await run(1,2,false,bulky); await run(2,2,false,bulky);
+  await run(3,0,true);
+  const result=(await readIntakeRunDiagnostics(threadId))!;
+  expect(result.attemptsExhausted).toBe(false);
+  expect(result.attemptBudget).toMatchObject({runAttempts:0,failed:0,unknown:0,total:4,exhausted:null});
+  // The displayed page stays censored: no payload text is exposed.
+  expect(JSON.stringify(result)).not.toContain("xxxxxxxx");
+});
+it("counts every version for the budget even when the displayed list is truncated, and an unreadable payload stays unknown",async()=>{
+  const failedPayload={reason:"SAV_INTAKE_MODEL_CONTEXT_LIMIT"};
+  for(let v=1;v<=21;v++) await run(v,0,false,{});
+  await run(22,2,false,failedPayload); await run(23,1,false,"not-a-valid-ciphertext");
+  await fixture.db.update(savIntakeRuns).set({payloadCiphertext:"not-a-valid-ciphertext"}).where(eq(savIntakeRuns.version,23));
+  await run(24,0,true);
+  const result=(await readIntakeRunDiagnostics(threadId))!;
+  expect(result.versionsTruncated).toBe(true);
+  // One unreadable attempt plus two failed ones cannot reach the failed cap of 4: verdict stays decidable.
+  expect(result.attemptBudget).toMatchObject({failed:2,unknown:1,total:3,exhausted:null});
+  expect(result.attemptsExhausted).toBe(false);
+});
+
+it("beyond the row bound the exact total still decides: 202 versions reaching the lifetime cap are exhausted (review P2)",async()=>{
+  for(let v=1;v<=201;v++) await run(v,v<=4?2:0,false,{plan:{synthetic:true}});
+  const current=await run(202,0,true);
+  const result=(await readIntakeRunDiagnostics(threadId))!;
+  expect(result.totalAttempts).toBe(8);
+  expect(result.attemptBudget).toMatchObject({runAttempts:0,failed:0,unknown:0,total:8,exhausted:"total_per_message"});
+  expect(result.attemptsExhausted).toBe(true);
+  expect(result.runs[0].runId).toBe(current.id);
+});
+it("attempts the bounded reader cannot classify never turn into attempts remaining",async()=>{
+  await run(1,2,false,{reason:"SAV_INTAKE_MODEL_CONTEXT_LIMIT"});
+  await run(2,2,false,{});
+  await fixture.db.update(savIntakeRuns).set({payloadCiphertext:"not-a-valid-ciphertext"}).where(eq(savIntakeRuns.version,2));
+  await run(3,0,true);
+  const result=(await readIntakeRunDiagnostics(threadId))!;
+  expect(result.attemptBudget).toMatchObject({failed:2,unknown:2,total:4,exhausted:"undetermined"});
+  expect(result.attemptsExhausted).toBeNull();
 });

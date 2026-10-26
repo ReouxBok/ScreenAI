@@ -3,7 +3,7 @@ import { beforeAll, beforeEach, afterAll, afterEach, expect, it, vi } from "vite
 import { eq, sql } from "drizzle-orm";
 import { PgDialect } from "drizzle-orm/pg-core";
 import { createSavTestDb } from "../../../test/sav-db";
-import { savMailboxes, savMessages, savThreads, savSyncState, auditLogs, savIntakeRuns, savGmailQuarantine, savIntakeConsole } from "@/db/schema";
+import { savMailboxes, savMessages, savThreads, savSyncState, auditLogs, savIntakeRuns, savGmailQuarantine, savIntakeConsole, savIntakeJournal } from "@/db/schema";
 import { encryptSavPayload } from "./crypto";
 const state = vi.hoisted(() => ({ db: null as unknown }));
 vi.mock("@/db", () => ({ requireDb: () => state.db }));
@@ -177,4 +177,20 @@ it("surfaces launched mail that cannot move without a person: held thread, sourc
   const snapshot=await collectSavMonitorSnapshot();expect(snapshot.complete).toBe(true);
   expect(snapshot.issues).toEqual(expect.arrayContaining([{code:"intake_held",count:1,severity:"warning"},
     {code:"sources_changed_waiting",count:1,severity:"warning"},{code:"dossier_waiting",count:1,severity:"warning"}]));
+});
+
+it("alerts on dossiers blocked in processing with the console's own predicate, never on finished ones",async()=>{
+  await launch();
+  const old=new Date(Date.now()-1200000), recent=new Date(Date.now()-60000);
+  const dossier=async(updatedAt:Date,marker?:string,finished=false)=>{
+    const t=(await f.db.insert(savThreads).values({mailboxId,gmailThreadId:randomUUID(),customerEmail:"client@example.invalid"}).returning())[0];
+    const m=(await f.db.insert(savMessages).values({mailboxId,threadId:t.id,direction:"inbound",fromEmail:"client@example.invalid",receivedAt:recent,createdAt:recent,bodyCiphertext:"not-read",analysisStatus:"intake_waiting"}).returning())[0];
+    const [r]=await f.db.insert(savIntakeRuns).values({threadId:t.id,messageId:m.id,version:1,state:"waiting",attempts:0,configHash:"a".repeat(64),policyHash:"b".repeat(64),payloadCiphertext:encryptSavPayload({}),createdAt:updatedAt,updatedAt}).returning();
+    if(marker)await f.db.insert(savIntakeJournal).values({runId:r.id,kind:marker,payloadCiphertext:encryptSavPayload({})});
+    const set={status:finished?"completed":"waiting",...(finished?{view:"completed",epoch:1,projectedEpoch:1}:{view:null})};
+    await f.db.insert(savIntakeConsole).values({threadId:t.id,mailboxId,...set}).onConflictDoUpdate({target:savIntakeConsole.threadId,set});
+  };
+  await dossier(recent,"attempts_exhausted"); await dossier(old); await dossier(recent); await dossier(recent,"attempts_exhausted",true);
+  const snapshot=await collectSavMonitorSnapshot();expect(snapshot.complete).toBe(true);
+  expect(snapshot.issues).toContainEqual({code:"intake_blocked",count:2,severity:"critical"});
 });

@@ -47,6 +47,7 @@ import {
   sanitizeInboundText,
   type DecisionProposal,
 } from "./policy";
+import { savEffectiveReceivedAt } from "@/lib/sav/message-order";
 
 export type SavMessageBody = { text: string; html?: string; headers?: Record<string, string>; attachments?: SavAttachmentMetadata[]; attachmentInventory?: SavAttachmentInventory; attachmentRead?: SavAttachmentRead; supportContext?: SavDossierContext };
 
@@ -406,7 +407,7 @@ export async function processPendingSavMessages(limit = 4) {
   const candidates = await db.select({ id: savMessages.id }).from(savMessages).leftJoin(savPilotItems, eq(savPilotItems.messageId, savMessages.id)).where(and(
     eq(savMessages.direction, "inbound"), isNull(savMessages.processedAt), isNull(savPilotItems.id), lt(savMessages.analysisAttempts, 3), savV0EligibleMessageFilter(), sql`not (${historicalMessageSql()})`,
     or(eq(savMessages.analysisStatus, "pending"), and(eq(savMessages.analysisStatus, "processing"), or(isNull(savMessages.analysisStartedAt), lt(savMessages.analysisStartedAt, staleBefore)))),
-  )).orderBy(asc(savMessages.receivedAt)).limit(Math.min(20, Math.max(1, limit)));
+  )).orderBy(asc(savEffectiveReceivedAt)).limit(Math.min(20, Math.max(1, limit)));
   const processed = [];
   for (const candidate of candidates) {
     try { processed.push({ messageId: candidate.id, status: (await processStoredSavMessage(candidate.id)) ? "processed" : "skipped" }); }
@@ -493,7 +494,7 @@ export async function listSavPilotCandidates(limit = 80) {
       isNull(savPilotItems.id),
       savV0EligibleMessageFilter(),
     ))
-    .orderBy(asc(savMessages.receivedAt))
+    .orderBy(asc(savEffectiveReceivedAt))
     .limit(Math.min(100, Math.max(10, limit)));
 }
 
@@ -517,7 +518,7 @@ export async function startSavPilotBatch(actorEmail: string, selection: number |
         selectedMessageIds ? inArray(savMessages.id, selectedMessageIds) : undefined,
         savV0EligibleMessageFilter(),
       ))
-      .orderBy(asc(savMessages.receivedAt)).limit(targetSize);
+      .orderBy(asc(savEffectiveReceivedAt)).limit(targetSize);
     if (candidates.length < targetSize) throw new Error(selectedMessageIds ? "SAV_PILOT_SELECTION_STALE" : `SAV_PILOT_NEEDS_${targetSize}_MAILS`);
     const [created] = await tx.insert(savPilotBatches).values({ targetSize, createdBy: actorEmail }).returning();
     await tx.insert(savPilotItems).values(candidates.map((message) => ({ batchId: created.id, messageId: message.id })))
@@ -562,7 +563,7 @@ export async function listSavPilotBatchItems(batchId: string) {
     .innerJoin(savMessages, eq(savMessages.id, savPilotItems.messageId))
     .leftJoin(savDecisions, eq(savDecisions.id, savPilotItems.decisionId))
     .where(eq(savPilotItems.batchId, batchId))
-    .orderBy(asc(savMessages.receivedAt));
+    .orderBy(asc(savEffectiveReceivedAt));
   if (!items.length) return [];
   const actions = await db.select({
     messageId: savActions.messageId,
@@ -720,7 +721,7 @@ export async function listSavInbox(limit = 100, options: { offset?: number; quer
     .where(and(eq(savMessages.direction, "inbound"), savV0EligibleMessageFilter(), viewFilter,
       options.view === "technical" ? undefined : or(isNull(savDecisions.kind), notInArray(savDecisions.kind, [...technical])),
       query ? or(ilike(savMessages.fromEmail, `%${query}%`), ilike(savMessages.subject, `%${query}%`), ilike(savMessages.preview, `%${query}%`)) : undefined))
-    .orderBy(desc(savMessages.receivedAt), desc(savMessages.id))
+    .orderBy(desc(savEffectiveReceivedAt), desc(savMessages.id))
     .limit(250).offset(offset);
   const normalize = (row: Awaited<ReturnType<typeof readBatch>>[number]) => {
     const { _review: review, _proposal: ciphertext, _body: bodyCiphertext, _runId: runId, _partnershipStatus: partnershipTransferStatus, ...entry } = row;
@@ -798,7 +799,7 @@ export async function repairSavProposal(messageId: string, actorEmail: string) {
   await db.transaction(async (tx) => {
     await tx.select().from(savThreads).where(eq(savThreads.id, message.threadId)).for("update");
     const [locked] = await tx.select().from(savMessages).where(eq(savMessages.id, messageId)).for("update");
-    const [latest] = await tx.select({ id: savMessages.id }).from(savMessages).where(and(eq(savMessages.threadId, message.threadId), eq(savMessages.direction, "inbound"))).orderBy(desc(savMessages.receivedAt), desc(savMessages.createdAt), desc(savMessages.id)).limit(1);
+    const [latest] = await tx.select({ id: savMessages.id }).from(savMessages).where(and(eq(savMessages.threadId, message.threadId), eq(savMessages.direction, "inbound"))).orderBy(desc(savEffectiveReceivedAt), desc(savMessages.createdAt), desc(savMessages.id)).limit(1);
     const [current] = await tx.select().from(savDecisions).where(and(eq(savDecisions.messageId, messageId), eq(savDecisions.isCurrent, true))).limit(1);
     const [review] = await tx.select({ id: savProposalReviews.id }).from(savProposalReviews).where(eq(savProposalReviews.messageId, messageId)).limit(1);
     const [humanAction] = await tx.select({ id: savActions.id }).from(savActions).where(and(eq(savActions.messageId, messageId), eq(savActions.actorType, "human"))).limit(1);
@@ -1334,7 +1335,7 @@ export async function approveSavDraft(draftActionId: string, actorEmail: string)
   if (!thread || thread.aiPaused) throw new Error("SAV_THREAD_PAUSED");
   const [latest] = await db.select({ id: savMessages.id }).from(savMessages)
     .where(and(eq(savMessages.threadId, draft.threadId), eq(savMessages.direction, "inbound")))
-    .orderBy(desc(savMessages.receivedAt), desc(savMessages.createdAt), desc(savMessages.id)).limit(1);
+    .orderBy(desc(savEffectiveReceivedAt), desc(savMessages.createdAt), desc(savMessages.id)).limit(1);
   if (!draft.messageId || draft.messageId !== latest?.id) throw new Error("SAV_REPLY_OBSOLETE");
   const [action] = await db.insert(savActions).values({
     threadId: draft.threadId,
@@ -1364,7 +1365,7 @@ export async function queueSavTicketCreation(threadId: string, actorEmail: strin
   if (thread.hubspotTicketId) return null;
   const [message] = await db.select().from(savMessages)
     .where(and(eq(savMessages.threadId, threadId), eq(savMessages.direction, "inbound")))
-    .orderBy(desc(savMessages.receivedAt)).limit(1);
+    .orderBy(desc(savEffectiveReceivedAt)).limit(1);
   if (!message) throw new Error("SAV_MESSAGE_NOT_FOUND");
   const [action] = await db.insert(savActions).values({
     threadId,

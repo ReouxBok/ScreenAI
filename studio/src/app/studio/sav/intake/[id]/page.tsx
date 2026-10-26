@@ -37,7 +37,7 @@ export default async function IntakeDetailPage({ params, searchParams }: { param
   const query = await searchParams;
   const releaseNotice=query?.holdRelease;
   const current = data.current;
-  const blocked = !data.handledExternally && !data.humanHeld && data.diagnostics?.messageId === data.latestMessageId && data.diagnostics.attemptsExhausted
+  const blocked = !data.handledExternally && !data.humanHeld && data.diagnostics?.messageId === data.latestMessageId && data.diagnostics.attemptsExhausted !== false
     && current && ["pending", "waiting"].includes(current.state) && !data.confirmedCurrent;
   const applicable = !data.handledExternally && !data.humanHeld && Boolean(data.confirmedCurrent || current && current.messageId === data.latestMessageId && current.sourceMatches);
   const plan = applicable ? current?.payload.plan : undefined, disposition = plan?.decision.disposition;

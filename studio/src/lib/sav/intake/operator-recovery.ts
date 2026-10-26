@@ -16,6 +16,7 @@ import {planSavIntake} from "./engine";
 import type {IntakeAdapters} from "./engine-types";
 import {reconcileIntakeEffectCandidate} from "./executor";
 import {createIntakeExecutorAdapters} from "./execution-adapters";
+import { savEffectiveReceivedAt } from "@/lib/sav/message-order";
 const request=z.object({threadId:z.uuid(),messageId:z.uuid(),reason:z.string().trim().min(10).max(2000),commandKey:z.uuid().optional()}).strict();
 type RecoveryTx=Parameters<typeof admissionLock>[0];
 type RecoverySnapshot=Awaited<ReturnType<typeof savIntakeSourceSnapshot>>;
@@ -35,7 +36,7 @@ export async function recordIntakeReinvestigation(tx:RecoveryTx,actor:Awaited<Re
   if(!active?.active||!["admin","owner"].includes(active.role)||!canAccessSav(active.email,active.role))return conflict();
   const [thread]=await tx.select().from(savThreads).where(eq(savThreads.id,command.threadId)).for("update");
   const [message]=await tx.select().from(savMessages).where(and(eq(savMessages.threadId,command.threadId),eq(savMessages.direction,"inbound")))
-   .orderBy(desc(savMessages.receivedAt),desc(savMessages.createdAt),desc(savMessages.id)).limit(1);
+   .orderBy(desc(savEffectiveReceivedAt),desc(savMessages.createdAt),desc(savMessages.id)).limit(1);
   if(!thread||thread.aiPaused||thread.mailboxId!==config.mailboxId||message?.id!==command.messageId
    ||message.receivedAt<=new Date(config.receivedAfter)||message.createdAt<=new Date(config.createdAfter)||await intakeHumanRefused(message.id,tx))return conflict();
   const runs=await tx.select().from(savIntakeRuns).where(eq(savIntakeRuns.messageId,message.id)).for("update");

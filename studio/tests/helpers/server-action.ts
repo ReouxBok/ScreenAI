@@ -44,7 +44,10 @@ export async function fetchServerActionInFull(page: Page, matches: (request: Req
     if (handled || !matches(route.request())) return route.fallback();
     handled = true;
     try {
-      const response = await route.fetch({ maxRedirects: 0, maxRetries: 0, timeout: 90_000 });
+      // Do not pool mutating requests onto a dev-server keep-alive socket that
+      // can close between actions. A reset remains uncertain: never retry POST.
+      const response = await route.fetch({ maxRedirects: 0, maxRetries: 0, timeout: 90_000,
+        headers: { ...route.request().headers(), connection: "close" } });
       // Pass the bytes explicitly. The RSC content type has no charset and the
       // response shortcut can recode UTF-8 as latin1, corrupting length-prefixed
       // Flight chunks (the import succeeds but React never receives its result).
@@ -66,9 +69,14 @@ export async function fetchServerActionInFull(page: Page, matches: (request: Req
       fail(error);
     }
   };
-  await page.route("**/*", handler);
+  // Server Actions POST to the invoking page. Leave rendering assets outside
+  // this short-lived interception: they can still be loading at disposal.
+  const url = new URL(page.url());
+  const actionPath = `${url.origin}${url.pathname}`.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const actionUrl = new RegExp(`^${actionPath}(?:\\?.*)?$`);
+  await page.route(actionUrl, handler);
   return {
     settled: () => settled,
-    dispose: () => page.unroute("**/*", handler),
+    dispose: () => page.unroute(actionUrl, handler),
   };
 }

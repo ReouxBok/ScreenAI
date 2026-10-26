@@ -23,6 +23,7 @@ import { admissionLock, executionJournal, occupyKeys, releaseKeys, assertNoLegac
 import { createSavIntakeHubspotReaders } from "./hubspot-readers";
 import type { EngineInput, IntakeAdapters, IntakePlan } from "./engine-types";
 import type { ExecutionPayload, EffectAck } from "./execution-types";
+import { savEffectiveReceivedAt } from "@/lib/sav/message-order";
 /** Reconstruct compatible overrides from authenticated immutable events, never
  * from client fields or an arbitrary input snapshot. Every ancestor is already
  * bound by intakeRunConfigurationBound and is checked again while traversing. */
@@ -225,7 +226,7 @@ export async function consumeIntakeHumanEvent(id: string, config: IntakeRuntimeC
       const [current] = await tx.select().from(savIntakeRuns).where(eq(savIntakeRuns.id, parent.id)).for("update");
       const [guard] = await tx.select().from(savIntakeHumanEvents).where(eq(savIntakeHumanEvents.id, id)).for("update");
       const [latest] = await tx.select().from(savMessages).where(and(eq(savMessages.threadId, event.threadId), eq(savMessages.direction, "inbound")))
-        .orderBy(desc(savMessages.receivedAt), desc(savMessages.createdAt), desc(savMessages.id)).limit(1);
+        .orderBy(desc(savEffectiveReceivedAt), desc(savMessages.createdAt), desc(savMessages.id)).limit(1);
       if (!guard || guard.leaseToken !== token || !guard.leaseUntil || guard.leaseUntil <= new Date() || !current?.isCurrent || thread?.aiPaused
         || latest?.id !== event.messageId || await readSavExternalCompletion(latest, tx) || !intakeSourceMatches(await savIntakeSourceSnapshot(tx, latest, new Date()), event.sourceHash)
         || !await intakeRunConfigurationBound(current, config, tx, event.id)) return conflict();

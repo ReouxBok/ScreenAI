@@ -94,7 +94,7 @@ export function historicalMessageForIdSql(messageId:SQLWrapper) {
   return sql`exists(select 1 from sav.messages where ${savMessages.id}=${messageId} and ${historicalMessageSql()})`;
 }
 export function historicalThreadSql(threadId:SQLWrapper) {
-  return sql`exists(select 1 from sav.messages where ${savMessages.id}=(select latest.id from sav.messages latest where latest.thread_id=${threadId} and latest.direction='inbound' order by latest.received_at desc,latest.created_at desc,latest.id desc limit 1) and ${historicalMessageSql()})`;
+  return sql`exists(select 1 from sav.messages where ${savMessages.id}=(select latest.id from sav.messages latest where latest.thread_id=${threadId} and latest.direction='inbound' order by least(latest.received_at,latest.created_at) desc,latest.created_at desc,latest.id desc limit 1) and ${historicalMessageSql()})`;
 }
 
 export async function hasIntakeLaunch() {

@@ -38,3 +38,12 @@ export const intakeContextReasonLabels: Record<string, string> = {
   ticket_creation_date_unknown: "date de création du ticket", ticket_closure_date_unknown: "date de fermeture du ticket", ticket_stage_unknown: "statut actuel du ticket",
   ticket_owner_unknown: "responsable du ticket", private_resource_unavailable: "ressource approuvée indisponible",
 };
+
+/** Team-facing cause of a blocked dossier; the incident stays counted until resolved. */
+const blockedCauses: Record<string, string> = {
+  attempts_exhausted: "Bloqué — tentatives d’analyse épuisées. À traiter par l’équipe.",
+  input_invalid: "Bloqué — entrée invalide (date ou contenu). À traiter par l’équipe.",
+  source_invalid: "Bloqué — source du mail invalide. À traiter par l’équipe.",
+  technical_wait: "Bloqué — attente technique de plus de 15 minutes. À traiter par l’équipe.",
+};
+export function intakeBlockedCauseLabel(cause: string | null | undefined) { return cause ? blockedCauses[cause] ?? "Bloqué — à traiter par l’équipe." : null; }

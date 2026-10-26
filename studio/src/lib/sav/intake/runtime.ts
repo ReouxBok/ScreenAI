@@ -14,6 +14,7 @@ import type { EngineInput, MessageAnalysis } from "./engine-types";
 import type { IntakeReadTrace } from "./hubspot-readers";
 import { SAV_INTAKE_MODEL_REVISION } from "./model-readers";
 import { planSavIntake } from "./engine";
+import { SAV_INTAKE_DETERMINISTIC_ERRORS } from "./attempt-policy";
 import { createSavIntakeHubspotReaders } from "./hubspot-readers";
 import { createSavIntakeSemanticReaders } from "./model-readers";
 import { withSavAiBudget } from "../gemini-transport";
@@ -140,7 +141,8 @@ async function analyseSavIntakeRuntimeWithinBudget(runId: string, config: Intake
     payload.reason = error instanceof Error && /^SAV_[A-Z0-9_]+$/.test(error.message) ? error.message : "SAV_INTAKE_RUNTIME_INTERRUPTED";
     if(lease.recoveringRead)payload.readRecovery!.state="invalidated";else delete payload.readRecovery;
     finishIntakeAttachmentRead(payload.attachments,attachmentFailureReason(payload.reason,Boolean(dispatcher?.uncertain)));
-    await failSavIntakeRun(lease, payload, Boolean(dispatcher?.uncertain) || payload.reason === "SAV_INTAKE_RUNTIME_SETTLEMENT_UNCERTAIN");
+    await failSavIntakeRun(lease, payload, Boolean(dispatcher?.uncertain) || payload.reason === "SAV_INTAKE_RUNTIME_SETTLEMENT_UNCERTAIN",
+      { deterministic: SAV_INTAKE_DETERMINISTIC_ERRORS.has(payload.reason ?? "") });
     return { runId, state: dispatcher?.uncertain ? "uncertain" : "waiting", reason: payload.reason };
   } finally { controller.abort(); clearTimeout(timer); }
 }

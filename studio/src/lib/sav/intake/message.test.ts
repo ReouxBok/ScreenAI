@@ -88,14 +88,21 @@ it("rejects a historical quotation as a current request after retaining its comp
         json: { messageId: input.id, requests: [{ id: "request", kind: "finance", currentMessageId: input.id, quote: "Historical billing request." }] }, metadata: {} }) });
     await expect(readers.analyseMessage({ message: prepared.message, conversation: [] }, signal())).rejects.toThrow("CITATION_REJECTED");
 });
-it("still refuses an oversized complete model payload before any call instead of slicing provenance", async () => {
+it("reads a long complete mail in one call with its full provenance, never slicing it", async () => {
     const body = "Current question.\nOn Tuesday, Synthetic Support wrote:\n" + "quoted ".repeat(14130);
     expect(body.length).toBeLessThan(100000);
     const prepared = prepareSavIntakeMessage({ ...input, body });
     expect(prepared.message.contentComplete).toBe(true);
     expect(prepared.provenance.quotedText).toBe(splitSavMessageText(body).quotedText);
-    const call = vi.fn<IntakeGeminiCall>();
+    const call = vi.fn<IntakeGeminiCall>(async arg => {
+      const data = JSON.parse(arg.body.contents[0].parts[0].text), quoteId = data.citationCatalogue.find((e: { sourceId: string }) => e.sourceId === "current").id;
+      return { json: { messageId: input.id, requests: [{ id: "request", kind: "support", currentMessageId: input.id, quoteId }],
+        ticketSummary: { title: "Question", description: "Question du client.", requestIds: ["request"] } }, metadata: { inputTokens: 1, outputTokens: 1, thoughtTokens: 0, totalTokens: 2 } };
+    });
     const readers = createSavIntakeSemanticReaders({ model: "gemini-synthetic", call, provenance: new Map([[input.id, prepared.provenance]]) });
-    await expect(readers.analyseMessage({ message: prepared.message, conversation: [] }, signal())).rejects.toThrow("CONTEXT_LIMIT");
-    expect(call).not.toHaveBeenCalled();
+    await expect(readers.analyseMessage({ message: prepared.message, conversation: [] }, signal())).resolves.toMatchObject({ requests: [{ id: "request" }] });
+    expect(call).toHaveBeenCalledTimes(1);
+    // The whole quoted history travels to the model: provenance was not sliced to fit.
+    const sent = call.mock.calls[0][0].body.contents[0].parts[0].text;
+    expect(sent.split("quoted").length - 1).toBeGreaterThanOrEqual(14130);
 });

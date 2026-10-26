@@ -7,6 +7,7 @@ import { assertSavActor } from "./access";
 import { savAutomationMode, savReleaseStage } from "./config";
 import { isSavMessageEligible } from "./cutover";
 import { fileOpenedGmailMessage, SAV_STUDIO_GMAIL_LABEL_NAME } from "./gmail";
+import { savEffectiveReceivedAt } from "@/lib/sav/message-order";
 
 const openedEmailSchema = z.object({ threadId: z.uuid(), messageId: z.uuid() });
 
@@ -95,7 +96,7 @@ export async function recordSavDossierOpened(rawInput: unknown, actorEmail: stri
     const [thread] = await tx.select({ id: savThreads.id }).from(savThreads).where(eq(savThreads.id, input.threadId)).for("update");
     if (!thread) throw new Error("SAV_THREAD_NOT_FOUND");
     const [latest] = await tx.select().from(savMessages).where(and(eq(savMessages.threadId, input.threadId), eq(savMessages.direction, "inbound")))
-      .orderBy(desc(savMessages.receivedAt), desc(savMessages.createdAt), desc(savMessages.id)).limit(1);
+      .orderBy(desc(savEffectiveReceivedAt), desc(savMessages.createdAt), desc(savMessages.id)).limit(1);
     const [pilot] = await tx.select({ id: savPilotItems.id }).from(savPilotItems).where(eq(savPilotItems.messageId, input.messageId)).limit(1);
     if (!latest || latest.id !== input.messageId || pilot) throw new Error("SAV_OPENING_CONTEXT_CHANGED");
     if (latest.studioOpenedAt) return { opened: true, changed: false };

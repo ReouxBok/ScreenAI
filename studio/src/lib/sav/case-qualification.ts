@@ -6,10 +6,11 @@ import {savMessages,savThreads} from "@/db/schema";
 import {loadSavDossierReviewContext} from "./draft-verdicts";
 import {savReplyForbidden} from "./review-contract";
 import {savContentHash} from "./crypto";
+import { savEffectiveReceivedAt } from "@/lib/sav/message-order";
 /** Baselines stay immutable; current human qualification owns sensitive gates. */
 export async function readSavCaseLearningQualification(threadId:string,db:Pick<ReturnType<typeof requireDb>,"select">=requireDb()) {
  const [thread]=await db.select({paused:savThreads.aiPaused}).from(savThreads).where(eq(savThreads.id,threadId));
- const [message]=await db.select({id:savMessages.id,analysisStatus:savMessages.analysisStatus}).from(savMessages).where(and(eq(savMessages.threadId,threadId),eq(savMessages.direction,"inbound"))).orderBy(desc(savMessages.receivedAt),desc(savMessages.createdAt),desc(savMessages.id)).limit(1);
+ const [message]=await db.select({id:savMessages.id,analysisStatus:savMessages.analysisStatus}).from(savMessages).where(and(eq(savMessages.threadId,threadId),eq(savMessages.direction,"inbound"))).orderBy(desc(savEffectiveReceivedAt),desc(savMessages.createdAt),desc(savMessages.id)).limit(1);
  if(!thread||thread.paused||!message)return {allowed:false,fingerprint:null};
  if(message.analysisStatus.startsWith("intake_")) return await readIntakeLearningQualification(threadId,db) ?? {allowed:false,fingerprint:null};
  try {

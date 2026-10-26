@@ -1,6 +1,7 @@
 import { readRecoveryDue, DEFAULT_INTAKE_READ_RECOVERY } from "./read-recovery";
 import { readIntakeOperatorInformation } from "./operator-information";
 import { writeReadRecoveryMarker,readRecoverySql,noReadRecoverySql } from "./read-recovery-store";
+import { intakeAttemptBudget, SAV_INTAKE_ATTEMPT_POLICY, SAV_INTAKE_BLOCKING_JOURNAL_KINDS } from "./attempt-policy";
 import { readSavExternalCompletion, listSavExternalCompletionMessageIds } from "../external-completion";
 import "server-only";
 import { reconcileIntakeZeroThoughtUsage } from "./model-usage";
@@ -9,7 +10,7 @@ import { intakeLaunchMatches } from "./launch-boundary";
 import { intakeConsoleInstalled } from "./console-capability";
 import { intakeRunConfigurationBound, intakeHumanRefused, intakeHasHumanDecision, intakeRunCandidateContactIds } from "./human-binding";
 import { randomUUID } from "node:crypto";
-import { and, desc, eq, gt, inArray, lt, lte, or, sql } from "drizzle-orm";
+import { and, desc, eq, gt, inArray, lt, or, sql } from "drizzle-orm";
 import { requireDb } from "@/db";
 import { savMessages, savThreads, savIntakeRuns, savIntakeJournal, savIntakeModelCalls, savIntakeHumanEvents, savIntakeIdentityEpisodes, savIntakeEffects, savIntakeExecutions } from "@/db/schema";
 import { decryptSavPayload, encryptSavPayload, savContentHash } from "../crypto";
@@ -20,6 +21,7 @@ import { savDerivedCostQuote } from "../derived-budget";
 import type { SavGeminiMetadata } from "../gemini-response";
 import { intakeRuntimeHash, SAV_INTAKE_RUNTIME_REVISION, type IntakeRuntimeConfig, type IntakeRuntimePayload } from "./runtime-contract";
 import type { EngineInput } from "./engine-types";
+import { savEffectiveReceivedAt, savNotAfterAnchor, savEffectiveReceivedAtOfRow } from "@/lib/sav/message-order";
 
 type Tx = Parameters<Parameters<ReturnType<typeof requireDb>["transaction"]>[0]>[0];
 type Run = typeof savIntakeRuns.$inferSelect;
@@ -39,10 +41,15 @@ function budgetRowsValid(rows: Pick<typeof savIntakeModelCalls.$inferSelect,"res
 }
 
 const latest = async (tx: Tx, threadId: string) => (await tx.select().from(savMessages).where(and(eq(savMessages.threadId, threadId), eq(savMessages.direction, "inbound")))
-  .orderBy(desc(savMessages.receivedAt), desc(savMessages.createdAt), desc(savMessages.id)).limit(1))[0];
+  .orderBy(desc(savEffectiveReceivedAt), desc(savMessages.createdAt), desc(savMessages.id)).limit(1))[0];
 const journal = async (tx: Tx, runId: string, kind: string, value: unknown) => {
   await tx.insert(savIntakeJournal).values({ runId, kind, payloadCiphertext: encryptSavPayload(value) });
 };
+/** A blocking marker is final for its run: only a new version (or a person) can move the dossier. */
+const blockedRun = async (tx: Tx, runId: string) => (await tx.select({ id: savIntakeJournal.id }).from(savIntakeJournal)
+  .where(and(eq(savIntakeJournal.runId, runId), inArray(savIntakeJournal.kind, [...SAV_INTAKE_BLOCKING_JOURNAL_KINDS]))).limit(1)).length > 0;
+const attemptRows = (tx: Tx, messageId: string) => tx.select({ id: savIntakeRuns.id, attempts: savIntakeRuns.attempts, payloadCiphertext: savIntakeRuns.payloadCiphertext })
+  .from(savIntakeRuns).where(eq(savIntakeRuns.messageId, messageId));
 export const SAV_INTAKE_SOURCE_REVISION = "sav-intake-source.v2";
 /** Exchanged content only: supportContext, attachmentRead and other derived fields are excluded. */
 function intakeSourceContentHash(bodyCiphertext: string) {
@@ -57,16 +64,19 @@ export function intakeSourceMatches(snapshot: { sourceHash: string; legacySource
 }
 /** Keep the recorded value while the sources still match, so equality between
  * recorded hashes (run, completion, binding) survives the v2 upgrade. */
+/** Storage time bounds a provider date that lies in the future (clock skew, imported mail). */
+export const intakeEffectiveReceivedAt = savEffectiveReceivedAtOfRow;
 export function intakeRecordedSourceHash(snapshot: { sourceHash: string; legacySourceHash: string }, recorded: string | null | undefined) {
   return intakeSourceMatches(snapshot, recorded) ? recorded! : snapshot.sourceHash;
 }
 export async function savIntakeSourceSnapshot(tx: Pick<Tx, "select">, message: typeof savMessages.$inferSelect, now: Date) {
-  const rows = await tx.select().from(savMessages).where(and(eq(savMessages.threadId, message.threadId), lte(savMessages.receivedAt, message.receivedAt)))
-    .orderBy(desc(savMessages.receivedAt), desc(savMessages.createdAt), desc(savMessages.id)).limit(51);
+  const rows = await tx.select().from(savMessages).where(and(eq(savMessages.threadId, message.threadId), savNotAfterAnchor(message.id)))
+    .orderBy(desc(savEffectiveReceivedAt), desc(savMessages.createdAt), desc(savMessages.id)).limit(51);
   const prepared = rows.slice(0, 50).map(row => {
     const body = decryptSavPayload<Body>(row.bodyCiphertext);
     return { body, ...prepareSavIntakeMessage({ id: row.id, threadId: row.threadId, fromEmail: row.fromEmail, toEmails: row.toEmails,
-      direction: row.direction, receivedAt: row.receivedAt.toISOString(), subject: row.subject, body: body.text,
+      // A provider date later than local storage is not trusted for analysis; the raw value stays on the row.
+      direction: row.direction, receivedAt: intakeEffectiveReceivedAt(row).toISOString(), subject: row.subject, body: body.text,
       bodyComplete: typeof body.text === "string" && body.text.length < 100_000, unresolvedAttachments: Boolean(body.attachments?.length) || body.attachmentInventory !== undefined && !savAttachmentInventorySchema.safeParse(body.attachmentInventory).data?.complete }) };
   });
   const current = prepared.find(p => p.message.id === message.id); if (!current) return fail();
@@ -158,7 +168,7 @@ export async function catchupSavIntake(config: IntakeRuntimeConfig, limit = 4) {
     gt(savMessages.receivedAt, new Date(config.receivedAfter)), gt(savMessages.createdAt, new Date(config.createdAfter)),
     or(unclaimedMessage, sql`${savMessages.analysisStatus} like 'intake_%'`), noHuman, noCommittedExecution, notCompleted,
     sql`not exists (select 1 from sav.intake_runs r where r.message_id = ${savMessages.id} and r.config_hash = ${config.configHash})`,
-    sql`not exists (select 1 from sav.messages m where m.thread_id = ${savMessages.threadId} and m.direction = 'inbound' and (m.received_at,m.created_at,m.id) > (${savMessages.receivedAt},${savMessages.createdAt},${savMessages.id}))`))
+    sql`not exists (select 1 from sav.messages m where m.thread_id = ${savMessages.threadId} and m.direction = 'inbound' and (least(m.received_at,m.created_at),m.created_at,m.id) > (${savEffectiveReceivedAt},${savMessages.createdAt},${savMessages.id}))`))
     .orderBy(savMessages.createdAt).limit(Math.min(4, Math.max(1, limit)));
   for (const message of messages) await enqueueSavIntakeMessage(message.id, config);
   return messages.length;
@@ -177,8 +187,8 @@ export async function claimSavIntakeRun(id: string, config: IntakeRuntimeConfig,
     if (await readSavExternalCompletion(message, tx)) return null;
     const [uncommitted] = await tx.select({ id: savMessages.id }).from(savMessages).where(and(eq(savMessages.id, message.id), noCommittedExecution));
     if (!uncommitted) return null;
-    const siblings = await tx.select({ attempts: savIntakeRuns.attempts }).from(savIntakeRuns).where(eq(savIntakeRuns.messageId, run.messageId));
-    const totalAttempts = siblings.reduce((sum, sibling) => sum + sibling.attempts, 0);
+    if (await blockedRun(tx, run.id)) return null;
+    const budget = intakeAttemptBudget(run.id, await attemptRows(tx, run.messageId));
     const priorPayload = decryptSavPayload<IntakeRuntimePayload>(run.payloadCiphertext);
     const retry = readRecoveryDue(priorPayload.readRecovery, config, now);
     const recoveringRead = Boolean(retry && priorPayload.input && priorPayload.semantics?.records.some(r => r.method === "analyseMessage"));
@@ -190,8 +200,10 @@ export async function claimSavIntakeRun(id: string, config: IntakeRuntimeConfig,
         await tx.update(savIntakeRuns).set({payloadCiphertext:encryptSavPayload(priorPayload)}).where(eq(savIntakeRuns.id,run.id));await writeReadRecoveryMarker(tx,run.id,retry);return null;}
     }
     const pending = await tx.select({id:savIntakeModelCalls.id}).from(savIntakeModelCalls).where(and(eq(savIntakeModelCalls.runId, id), inArray(savIntakeModelCalls.state, ["dispatched", "uncertain"])));
-    const reason = pending.length ? "usage_uncertain" : thread.aiPaused ? "paused" : totalAttempts >= 2 && !recoveringRead ? "attempts_exhausted" : null;
+    const reason = pending.length ? "usage_uncertain" : thread.aiPaused ? "paused" : budget.exhausted && !recoveringRead ? "attempts_exhausted" : null;
     if (reason) {
+      // A durable marker: the run leaves scheduling but stays visible as blocked.
+      if (reason === "attempts_exhausted" && !await blockedRun(tx, id)) await journal(tx, id, "attempts_exhausted", { cause: budget.exhausted, failed: budget.failed, total: budget.total, policy: SAV_INTAKE_ATTEMPT_POLICY });
       await tx.update(savIntakeRuns).set({ state: pending.length ? "uncertain" : "waiting", leaseToken: null, leaseUntil: null, freshUntil: null, updatedAt: now }).where(eq(savIntakeRuns.id, id));
       await tx.update(savMessages).set({ analysisStatus: pending.length ? "intake_uncertain" : "intake_waiting" }).where(eq(savMessages.id, run.messageId));
       await journal(tx, id, "waiting", { reason }); return null;
@@ -277,11 +289,21 @@ export async function saveSavIntakeResult(lease: IntakeLease, config: IntakeRunt
   });
 }
 /** Fenced failure storage preserves a partial result without reviving an old lease. */
-export async function failSavIntakeRun(lease: IntakeLease, payload: IntakeRuntimePayload, uncertain = false) {
+export async function failSavIntakeRun(lease: IntakeLease, payload: IntakeRuntimePayload, uncertain = false, options: { deterministic?: boolean } = {}) {
   await requireDb().transaction(async tx => {
     await tx.select().from(savThreads).where(eq(savThreads.id, lease.run.threadId)).for("update");
+    // A deterministic local input error gives back the attempt taken by the claim and blocks the run explicitly.
+    const deterministic = Boolean(options.deterministic && !uncertain);
     const rows = await tx.update(savIntakeRuns).set({ state: uncertain ? "uncertain" : "waiting", payloadCiphertext: encryptSavPayload(payload),
+      ...(deterministic ? { attempts: sql`greatest(${savIntakeRuns.attempts} - 1, 0)` } : {}),
       freshUntil: null, leaseToken: null, leaseUntil: null, updatedAt: new Date() }).where(and(eq(savIntakeRuns.id, lease.run.id), eq(savIntakeRuns.leaseToken, lease.token), eq(savIntakeRuns.isCurrent, true))).returning();
+    if (rows.length && deterministic) await journal(tx, lease.run.id, "deterministic_block", { reason: payload.reason, attemptRefunded: true });
+    else if (rows.length && !uncertain && !payload.readRecovery) {
+      // The last allowed attempt failed: mark it now so the console shows the cause instead of a silent wait.
+      const budget = intakeAttemptBudget(lease.run.id, await attemptRows(tx, lease.run.messageId));
+      if (budget.exhausted && !await blockedRun(tx, lease.run.id)) await journal(tx, lease.run.id, "attempts_exhausted",
+        { cause: budget.exhausted, failed: budget.failed, total: budget.total, policy: SAV_INTAKE_ATTEMPT_POLICY });
+    }
     if (rows.length) {
       if(payload.readRecovery)await writeReadRecoveryMarker(tx,lease.run.id,payload.readRecovery);
       await tx.update(savMessages).set({ analysisStatus: uncertain ? "intake_uncertain" : "intake_waiting" }).where(eq(savMessages.id, lease.run.messageId));
@@ -299,9 +321,10 @@ export async function pendingSavIntakeRuns(config: IntakeRuntimeConfig, now = ne
   const recovery = readRecoverySql(sql`${savIntakeRuns.id}`,config,now);
   const legacy = noReadRecoverySql(sql`${savIntakeRuns.id}`);
   const rows = await requireDb().select({ id: savIntakeRuns.id, attempts: savIntakeRuns.attempts, payloadCiphertext: savIntakeRuns.payloadCiphertext }).from(savIntakeRuns).where(and(eq(savIntakeRuns.isCurrent, true), eq(savIntakeRuns.configHash, config.configHash),
-    sql`not exists(select 1 from sav.intake_journal invalid_source where invalid_source.run_id=${savIntakeRuns.id} and invalid_source.kind='source_invalid')`,
+    sql`not exists(select 1 from sav.intake_journal blocked where blocked.run_id=${savIntakeRuns.id} and blocked.kind in (${sql.join(SAV_INTAKE_BLOCKING_JOURNAL_KINDS.map(k => sql`${k}`), sql`, `)}))`,
     or(and(lt(savIntakeRuns.attempts, 2),legacy), recovery), noHuman, notCompleted, schedulingFilter, noCommittedExecutionFor(sql`${savIntakeRuns.messageId}`),
-    or(sql`(select coalesce(sum(s.attempts),0) from sav.intake_runs s where s.message_id = ${savIntakeRuns.messageId}) < 2`, recovery),
+    // Coarse lifetime bound in SQL; the claim applies the full per-version/failed/total policy.
+    or(sql`(select coalesce(sum(s.attempts),0) from sav.intake_runs s where s.message_id = ${savIntakeRuns.messageId}) < ${SAV_INTAKE_ATTEMPT_POLICY.totalPerMessage}`, recovery),
     sql`exists (select 1 from sav.threads t where t.id = ${savIntakeRuns.threadId} and not t.ai_paused)`,
     or(inArray(savIntakeRuns.state, ["pending", "waiting"]), and(eq(savIntakeRuns.state, "analysing"), lt(savIntakeRuns.leaseUntil, now)))))
     .orderBy(savIntakeRuns.createdAt).limit(4);
@@ -434,7 +457,7 @@ export async function readSavIntakeCurrent(threadId: string, config?: IntakeRunt
   const [run] = await db.select().from(savIntakeRuns).where(and(eq(savIntakeRuns.threadId, threadId), eq(savIntakeRuns.isCurrent, true))); if (!run) return null;
   const [thread] = await db.select().from(savThreads).where(eq(savThreads.id, threadId));
   const [message] = await db.select().from(savMessages).where(and(eq(savMessages.threadId, threadId), eq(savMessages.direction, "inbound")))
-    .orderBy(desc(savMessages.receivedAt), desc(savMessages.createdAt), desc(savMessages.id)).limit(1);
+    .orderBy(desc(savEffectiveReceivedAt), desc(savMessages.createdAt), desc(savMessages.id)).limit(1);
   const snapshot = message?.id === run.messageId ? await db.transaction(async tx => savIntakeSourceSnapshot(tx, message, now)) : null;
   const sourceMatches = snapshot !== null && intakeSourceMatches(snapshot, run.sourceHash);
   // Downstream bindings compare against the recorded run hash; expose it when the sources still match.

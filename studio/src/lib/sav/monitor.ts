@@ -8,6 +8,7 @@ import { intakeExecutionConfig, readIntakeExecutionAuthority } from "./intake/ex
 import { SAV_INTAKE_OPERATIONAL_PROFILE, intakeAdmissionUsage } from "./intake/budget-profile";
 import { readIntakeOtherRules } from "./intake/other-routing";
 import { decryptSavPayload } from "./crypto";
+import { intakeBlockedRunSql } from "./intake/console-store";
 import { monitorStateSchema, monitorCodes, nextMonitorState, monitorWebhook, monitorSlackText, monitorDeliveryHash, type MonitorState, type MonitorSnapshot, type MonitorIssue, type MonitorCode } from "./monitor-contract";
 
 const WORKER = "sav-monitor:v1:worker", STATE = "sav-monitor:v1:state", SNAPSHOT = "sav-monitor:v1:snapshot";
@@ -84,7 +85,7 @@ export async function collectSavMonitorSnapshot(): Promise<MonitorSnapshot> {
         join sav.sync_state l on l.key='sav-intake-launch:'||m.mailbox_id::text and l.status='intake_launch_v1'
         where m.direction='inbound' and not t.ai_paused and m.received_at>(l.cursor::jsonb->>'receivedAfter')::timestamptz
         and m.created_at>(l.cursor::jsonb->>'createdAfter')::timestamptz
-        and not exists(select 1 from sav.messages n where n.thread_id=m.thread_id and n.direction='inbound' and (n.received_at,n.created_at,n.id)>(m.received_at,m.created_at,m.id))`);
+        and not exists(select 1 from sav.messages n where n.thread_id=m.thread_id and n.direction='inbound' and (least(n.received_at,n.created_at),n.created_at,n.id)>(least(m.received_at,m.created_at),m.created_at,m.id))`);
       metrics.pending = messages[0]?.pending ?? 0; metrics.oldestPendingSeconds = Math.max(0, messages[0]?.oldest ?? 0);
       add("analysis_delayed", metrics.oldestPendingSeconds > 600 ? metrics.pending : 0, metrics.oldestPendingSeconds > 1800 ? "critical" : "warning");
       add("analysis_uncertain", messages[0]?.uncertain ?? 0, "critical");
@@ -110,7 +111,7 @@ export async function collectSavMonitorSnapshot(): Promise<MonitorSnapshot> {
         join sav.sync_state l on l.key='sav-intake-launch:'||m.mailbox_id::text and l.status='intake_launch_v1'
         where m.direction='inbound' and t.ai_paused and m.created_at < ${new Date(now.getTime()-1800000).toISOString()}
         and m.received_at>(l.cursor::jsonb->>'receivedAfter')::timestamptz and m.created_at>(l.cursor::jsonb->>'createdAfter')::timestamptz
-        and not exists(select 1 from sav.messages n where n.thread_id=m.thread_id and n.direction='inbound' and (n.received_at,n.created_at,n.id)>(m.received_at,m.created_at,m.id))`);
+        and not exists(select 1 from sav.messages n where n.thread_id=m.thread_id and n.direction='inbound' and (least(n.received_at,n.created_at),n.created_at,n.id)>(least(m.received_at,m.created_at),m.created_at,m.id))`);
       add("intake_held", held[0]?.count ?? 0);
       const stalled = await queryRows<{ changed: number; waiting: number }>(tx,sql`select
         count(*) filter(where c.status='context_changed')::int as changed,
@@ -119,6 +120,12 @@ export async function collectSavMonitorSnapshot(): Promise<MonitorSnapshot> {
         where c.updated_at < ${new Date(now.getTime()-1800000).toISOString()}`);
       add("sources_changed_waiting", stalled[0]?.changed ?? 0);
       add("dossier_waiting", stalled[0]?.waiting ?? 0);
+      // Same predicate as the console counter: exhausted, deterministically blocked or waiting > 15 min.
+      const blocked = await queryRows<{ count: number }>(tx,sql`select count(*)::int as count from sav.intake_console c
+        join sav.sync_state l on l.key='sav-intake-launch:'||c.mailbox_id::text and l.status='intake_launch_v1'
+        join sav.threads t on t.id=c.thread_id
+        where not t.ai_paused and (c.epoch<>c.projected_epoch or c.view is null) and ${intakeBlockedRunSql(sql`c.thread_id`)}`);
+      add("intake_blocked", blocked[0]?.count ?? 0, "critical");
       const effects = await queryRows<{ uncertain: number; failed: number }>(tx,sql`select count(*) filter(where state in ('uncertain','dispatched','acked') and confirmed_at is null)::int as uncertain,
         count(*) filter(where state='failed')::int as failed from sav.intake_effects`);
       add("effect_uncertain", effects[0]?.uncertain ?? 0, "critical"); add("effect_failed", effects[0]?.failed ?? 0, "critical");

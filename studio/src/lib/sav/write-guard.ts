@@ -11,6 +11,7 @@ import { isSavMessageEligible } from "./cutover";
 import { assertSavCurrentTicketReview } from "./manual-tickets";
 import { assertSavCurrentManualReply } from "./manual-replies";
 import { assertSavCurrentPartnershipForward, isSavPartnershipForward } from "./partnership-forward";
+import { savEffectiveReceivedAt } from "@/lib/sav/message-order";
 
 /** Load current state as close as possible to the external mutation. */
 async function loadSavWriteAuthority(actionId: string) {
@@ -21,7 +22,7 @@ async function loadSavWriteAuthority(actionId: string) {
   if (!thread) throw new Error("SAV_THREAD_NOT_FOUND");
   const [latest] = await db.select().from(savMessages).where(and(
     eq(savMessages.threadId, thread.id), eq(savMessages.direction, "inbound"),
-  )).orderBy(desc(savMessages.receivedAt), desc(savMessages.createdAt), desc(savMessages.id)).limit(1);
+  )).orderBy(desc(savEffectiveReceivedAt), desc(savMessages.createdAt), desc(savMessages.id)).limit(1);
   const denial = savWriteDenial({
     releaseStage: savReleaseStage(),
     mode: savAutomationMode(), writesDisabled: process.env.SAV_WRITES_DISABLED === "true",
