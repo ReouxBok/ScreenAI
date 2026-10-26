@@ -29,7 +29,8 @@ export async function qualifyRuntimeOther(lease:IntakeLease,live:()=>Promise<voi
   const proof=await reader({mailboxEmail:mailbox.email,messageId:message.gmailMessageId,threadId:thread.gmailThreadId,sender:message.fromEmail,signal:AbortSignal.timeout(10000)});
   await live();return qualifyIntakeOther(input,registry,catalogue,proof);
 }
-function qualifyRuntimeCandidate(input:{mailboxId:string;subject:string;body:{text:string}},catalogue:NonNullable<ReturnType<typeof readIntakeOtherRules>>) {
+/** Exact approved mailbox+subject+body match: the only dossiers an Other rule could qualify. */
+export function qualifyRuntimeCandidate(input:{mailboxId:string;subject:string;body:{text:string}},catalogue:NonNullable<ReturnType<typeof readIntakeOtherRules>>) {
   // These digests only restrict the GET; the full qualified predicate still runs.
   const hash=(text:string)=>requireHash(text);
   return catalogue.rules.some(r=>r.mailboxId===input.mailboxId&&r.subjectSha256===hash(input.subject)&&r.bodySha256===hash(input.body.text));

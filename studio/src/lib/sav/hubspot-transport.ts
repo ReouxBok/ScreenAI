@@ -23,7 +23,12 @@ export function isSavHubspotRead(path: string, method = "GET") {
   return method.toUpperCase() === "POST" && (/^\/crm\/v3\/objects\/(contacts|tickets|emails)\/(search|batch\/read)$/.test(path) || path === "/crm/v3/objects/notes/batch/read");
 }
 
-export function createSavHubspotTransport(network: typeof fetch = fetch) {
+/** Tests may virtualize transport waits without changing the application clock or guards. */
+export function createSavHubspotTransport(network: typeof fetch = fetch, timing: {
+  now?: () => number;
+  wait?: (delay: number, signal?: AbortSignal | null) => Promise<void>;
+} = {}) {
+  const now = timing.now ?? (() => Date.now()), wait = timing.wait ?? waitForRead;
   let active = 0, nextSearchAt = 0;
   const queue: Array<{ resolve: () => void }> = [];
   async function acquire(signal?: AbortSignal | null) {
@@ -45,18 +50,18 @@ export function createSavHubspotTransport(network: typeof fetch = fetch) {
   }
   function release() { const entry = queue.shift(); if (entry) entry.resolve(); else active--; }
   return async function request<T>(path: string, init: RequestInit, summarize: (status: number, payload: unknown) => string): Promise<T> {
-    const read = isSavHubspotRead(path, init.method), started = Date.now(), deadline = started + 20_000;
+    const read = isSavHubspotRead(path, init.method), started = now(), deadline = started + 20_000;
     if (read) await acquire(init.signal);
     let attempts = 0, status = 0;
     try {
       for (;;) {
         if (init.signal?.aborted) throw new Error("SAV_HUBSPOT_READ_CANCELLED");
         if (path.endsWith("/search") && read) {
-          const scheduled = Math.max(Date.now(), nextSearchAt); nextSearchAt = scheduled + 250;
+          const scheduled = Math.max(now(), nextSearchAt); nextSearchAt = scheduled + 250;
           if (scheduled >= deadline) throw new Error("SAV_HUBSPOT_READ_QUEUE_TIMEOUT");
-          if (scheduled > Date.now()) await waitForRead(scheduled - Date.now(), init.signal);
+          if (scheduled > now()) await wait(scheduled - now(), init.signal);
         }
-        const remaining = deadline - Date.now();
+        const remaining = deadline - now();
         if (remaining <= 0) throw new Error("SAV_HUBSPOT_READ_TIMEOUT");
         const controller = new AbortController();
         const timer = setTimeout(() => controller.abort(), Math.min(remaining, read ? 12_000 : 20_000));
@@ -69,7 +74,7 @@ export function createSavHubspotTransport(network: typeof fetch = fetch) {
           status = response.status;
           if (!response.ok) {
             const header = response.headers?.get("retry-after");
-            if (header) retryAfter = /^\d+(?:\.\d+)?$/.test(header) ? Number(header) * 1000 : Math.max(0, Date.parse(header) - Date.now());
+            if (header) retryAfter = /^\d+(?:\.\d+)?$/.test(header) ? Number(header) * 1000 : Math.max(0, Date.parse(header) - now());
             if (!Number.isFinite(retryAfter)) retryAfter = 0;
             const payload = await response.json().catch(() => null);
             throw new Error(summarize(status, payload));
@@ -84,14 +89,14 @@ export function createSavHubspotTransport(network: typeof fetch = fetch) {
           const code = local ? error.message : stepDeadline ? "SAV_HUBSPOT_READ_TIMEOUT" : init.signal?.aborted ? "SAV_HUBSPOT_READ_CANCELLED" : error instanceof Error && /^(?:HUBSPOT_HTTP_\d{3}(?::|$)|SAV_HUBSPOT_INVALID_RESPONSE$)/.test(error.message) ? error.message : "SAV_HUBSPOT_READ_UNAVAILABLE";
           const transient = /^(HUBSPOT_HTTP_(429|502|503|504)|SAV_HUBSPOT_READ_(TIMEOUT|UNAVAILABLE))/.test(code);
           const delay = Math.max(200, retryAfter) + Math.floor(Math.random() * 100);
-          if (!read || !transient || attempts >= 2 || init.signal?.aborted || deadline - Date.now() <= delay + 100) throw new SavCrmReadError({ code: code.match(/^HUBSPOT_HTTP_\d{3}/)?.[0] ?? code, origin: local ? "local_guard" : stepDeadline ? "deadline" : code === "SAV_HUBSPOT_INVALID_RESPONSE" ? "response" : status ? "http" : "transport", attempts, status, durationMs: Date.now() - started }, code);
+          if (!read || !transient || attempts >= 2 || init.signal?.aborted || deadline - now() <= delay + 100) throw new SavCrmReadError({ code: code.match(/^HUBSPOT_HTTP_\d{3}/)?.[0] ?? code, origin: local ? "local_guard" : stepDeadline ? "deadline" : code === "SAV_HUBSPOT_INVALID_RESPONSE" ? "response" : status ? "http" : "transport", attempts, status, durationMs: now() - started }, code);
           clearTimeout(timer);
-          await waitForRead(delay, init.signal);
+          await wait(delay, init.signal);
         } finally { clearTimeout(timer); }
       }
     } finally {
       if (read) release();
-      console.info("sav_hubspot_transport", { revision: SAV_CRM_TRANSPORT_REVISION, operation: read ? path.endsWith("/search") ? "search" : path.endsWith("/batch/read") ? "batch_read" : "get" : "mutation", attempts, status, durationMs: Date.now() - started });
+      console.info("sav_hubspot_transport", { revision: SAV_CRM_TRANSPORT_REVISION, operation: read ? path.endsWith("/search") ? "search" : path.endsWith("/batch/read") ? "batch_read" : "get" : "mutation", attempts, status, durationMs: now() - started });
     }
   };
 }
