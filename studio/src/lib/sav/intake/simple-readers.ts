@@ -123,6 +123,8 @@ export function createSavIntakeSimpleReaders(options: {
   model: string; call: IntakeGeminiCall; crm: Crm; policy: EnginePolicy;
   attachments?: { prepared: SavPreparedAttachments; onRead: (observations: SavAttachmentObservation[]) => void };
   provenance?: Provenance; onTrace?: (trace: IntakeModelTrace) => void;
+  /** Accepted judgement summary for the team handoff (rationale, missing, per-ticket reasons). */
+  onJudgement?: (judgement: { rationale: string; missing: SimpleOutput["missing"]; identity: SimpleOutput["identity"]; tickets: SimpleOutput["tickets"] }) => void;
 }): SavIntakeSemanticReaders {
   if (!/^gemini-[A-Za-z0-9._-]{1,100}$/.test(options.model)) throw Error("SAV_INTAKE_CONFIGURED_MODEL_REQUIRED");
   let calls = 0;
@@ -168,6 +170,7 @@ export function createSavIntakeSimpleReaders(options: {
         const output = schema.parse(result.json) as SimpleOutput;
         validate(output, message, conversation, context, sources, requestsDecided);
         trace(true, null, { metadata, outputHash: hash(result.json) });
+        options.onJudgement?.({ rationale: output.rationale, missing: output.missing, identity: output.identity, tickets: output.tickets });
         return output;
       } catch (error) {
         const malformed = error instanceof z.ZodError || error instanceof SimpleValidationError;

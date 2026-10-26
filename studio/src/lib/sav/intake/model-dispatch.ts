@@ -14,7 +14,9 @@ import { SAV_INTAKE_MODEL_LIMITS } from "./model-limits";
 export function createIntakeModelDispatcher(options: { config: IntakeRuntimeConfig; live: () => Promise<void>;
   reserve: (hash: string) => ReturnType<typeof reserveSavIntakeCall>; signal: AbortSignal;
   preflight?: (hashes: string[]) => Promise<void>;
-  env?: () => Record<string,string|undefined>; network?: typeof fetch }) {
+  env?: () => Record<string,string|undefined>; network?: typeof fetch;
+  /** Ordinal of a scheduled transient retry of this run (0: none). */
+  retryOrdinal?: number }) {
   const {config,live}=options, env=options.env??(()=>process.env), network=options.network??fetch;
   let uncertain=false, failureReason:string|undefined;
   const pending:Promise<unknown>[]=[];
@@ -26,10 +28,15 @@ export function createIntakeModelDispatcher(options: { config: IntakeRuntimeConf
       const expectedBody = wire.body;
       if (wire.textBytes > SAV_INTAKE_MODEL_LIMITS.wireTextBytes || input.body.generationConfig.maxOutputTokens !== 8192) throw Error("SAV_INTAKE_RUNTIME_REQUEST_REJECTED");
       let sent = false;
-      const reserved = await options.reserve(intakeRuntimeHash(expectedBody));
+      // A body that failed transiently has no cached result: a scheduled retry is a NEW
+      // dispatch with its own reservation, never a re-use of the consumed one.
+      const reserved = await options.reserve(intakeRuntimeHash(expectedBody)).catch(error => {
+        if (!(error instanceof Error) || error.message !== "SAV_INTAKE_RUNTIME_CALL_ALREADY_CONSUMED" || !options.retryOrdinal) throw error;
+        return options.reserve(intakeRuntimeHash({ transientRetry: options.retryOrdinal, body: intakeRuntimeHash(expectedBody) }));
+      });
       if (reserved.cached) { failureReason = undefined; return reserved.cached; }
       const reservation = reserved.id;
-      let providerUsage: SavGeminiMetadata | undefined;
+      let providerUsage: SavGeminiMetadata | undefined, providerStatus: number | undefined;
       // Gemini may omit a zero thoughts counter. Recognize only that zero when
       // the three explicit counters prove the accounting equation; never infer
       // other missing counters or a positive remainder. Settlement stays strict.
@@ -45,6 +52,7 @@ export function createIntakeModelDispatcher(options: { config: IntakeRuntimeConf
         const signal = AbortSignal.any([options.signal, input.signal, ...(init.signal ? [init.signal] : [])]);
         if (signal.aborted) throw Error("SAV_INTAKE_RUNTIME_CONTEXT_CHANGED");
         const response = await evaluationProviderResponse(await network(url, { ...init, signal, redirect: "error" }), signal);
+        providerStatus = response.status;
         if (response.ok) {
           try { providerUsage = readSavGeminiResponse(await response.clone().json()).metadata; }
           catch { providerUsage = undefined; }
@@ -62,7 +70,12 @@ export function createIntakeModelDispatcher(options: { config: IntakeRuntimeConf
         failureReason = undefined;
         return result;
       } catch (error) {
-        if (reservation) uncertain = !await settleSavIntakeCall(reservation, exactUsage(savAiErrorMetadata(error)));
+        // A complete 429/5xx answer from the provider means the request was not processed:
+        // settled at zero, explicitly marked. A timeout or lost answer stays uncertain.
+        const unbilled = providerStatus !== undefined && (providerStatus === 429 || providerStatus >= 500 && providerStatus <= 599)
+          && error instanceof Error && error.message === `SAV_AI_HTTP_${providerStatus}` ? providerStatus : undefined;
+        if (reservation) uncertain = !await (unbilled === undefined ? settleSavIntakeCall(reservation, exactUsage(savAiErrorMetadata(error)))
+          : settleSavIntakeCall(reservation, exactUsage(savAiErrorMetadata(error)), undefined, unbilled));
         failureReason = error instanceof z.ZodError ? "SAV_INTAKE_MODEL_OUTPUT_REJECTED"
           : error instanceof Error && /^SAV_[A-Z0-9_]+$/.test(error.message) ? error.message : "SAV_INTAKE_RUNTIME_PROVIDER_UNAVAILABLE";
         throw error;

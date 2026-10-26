@@ -47,3 +47,43 @@ const blockedCauses: Record<string, string> = {
   technical_wait: "Bloqué — attente technique de plus de 15 minutes. À traiter par l’équipe.",
 };
 export function intakeBlockedCauseLabel(cause: string | null | undefined) { return cause ? blockedCauses[cause] ?? "Bloqué — à traiter par l’équipe." : null; }
+
+/** Paris time of the next automatic retry, for the processing list. */
+export function intakeRetryLabel(retryAt: string | Date) {
+  const time = new Date(retryAt).toLocaleTimeString("fr-FR", { hour: "2-digit", minute: "2-digit", timeZone: "Europe/Paris" });
+  return `Reprise automatique prévue à ${time} — incident fournisseur temporaire.`;
+}
+
+/** The exact intervention expected from the team, per cause: never just "to validate". */
+export const intakeExpectedActions: Record<string, string> = {
+  classification_incomplete: "Lire le mail et indiquer la catégorie de la demande (support, finance, résiliation, autre).",
+  contact_lookup_failed: "Rechercher la fiche HubSpot de l’expéditeur ; la recherche automatique a échoué.",
+  contact_lookup_incomplete: "Vérifier la fiche HubSpot de l’expéditeur ; la recherche était incomplète.",
+  contact_ambiguous: "Choisir la bonne fiche parmi les fiches proposées.",
+  association_incomplete: "Vérifier les fiches liées à ce contact dans HubSpot.",
+  ticket_search_incomplete: "Vérifier les tickets du contact dans HubSpot ; la liste était incomplète.",
+  history_incomplete: "Vérifier l’historique du ticket ou la pièce jointe indispensable, puis indiquer le ticket ou la création.",
+  same_issue_unresolved: "Choisir le ticket qui reçoit ce mail, ou demander une création si aucun ne correspond.",
+  ticket_creation_date_unknown: "Vérifier la date de création du ticket candidat dans HubSpot.",
+  ticket_closure_date_unknown: "Vérifier la date de fermeture du ticket : réouverture (15 jours ou moins) ou nouveau ticket.",
+  ticket_stage_unknown: "Vérifier le statut actuel du ticket dans HubSpot.",
+  ticket_owner_unknown: "Vérifier le responsable du ticket fermé avant sa réouverture.",
+  private_resource_unavailable: "Une ressource approuvée manque (modèle de réponse, règle) : la configurer ou traiter manuellement.",
+  attempts_exhausted: "Traiter le dossier manuellement ou relancer une analyse après correction de la cause.",
+  SAV_INTAKE_RUNTIME_BUDGET_EXHAUSTED: "Le budget d’appels IA de ce message est atteint : traiter manuellement.",
+};
+export type IntakeHandoffInput = {
+  reasons: readonly string[]; blockedCause?: string | null;
+  assessments?: readonly { ticketId: string; relation: string }[];
+  judgement?: { rationale?: string; missing?: { kind: string; why: string }[]; tickets?: { ticketId: string; relation: string; why: string }[] };
+};
+/** What a person needs to act without re-investigating: cause, exact action, tickets examined and what was missing. */
+export function intakeHandoff(input: IntakeHandoffInput) {
+  const causes = [...new Set([...(input.blockedCause ? [input.blockedCause] : []), ...input.reasons])];
+  const actions = [...new Set(causes.map(c => intakeExpectedActions[c]).filter((a): a is string => Boolean(a)))];
+  const relation: Record<string, string> = { same: "même problème", different: "autre problème", unclear: "incertain", unknown: "incertain", partial: "partiel" };
+  const tickets = (input.judgement?.tickets ?? input.assessments ?? []).map(t => ({ ticketId: t.ticketId, relation: relation[t.relation] ?? t.relation,
+    why: "why" in t ? (t as { why: string }).why : undefined }));
+  return { causes: causes.map(c => intakeContextReasonLabels[c] ?? intakeBlockedCauseLabel(c) ?? c), actions, tickets,
+    missing: input.judgement?.missing ?? [], rationale: input.judgement?.rationale };
+}

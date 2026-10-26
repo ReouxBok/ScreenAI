@@ -14,7 +14,7 @@ import type { EngineInput, MessageAnalysis } from "./engine-types";
 import type { IntakeReadTrace } from "./hubspot-readers";
 import { SAV_INTAKE_MODEL_REVISION } from "./model-readers";
 import { planSavIntake } from "./engine";
-import { SAV_INTAKE_DETERMINISTIC_ERRORS } from "./attempt-policy";
+import { intakeTransientFailure, SAV_INTAKE_DETERMINISTIC_ERRORS } from "./attempt-policy";
 import { createSavIntakeHubspotReaders } from "./hubspot-readers";
 import { createSavIntakeSemanticReaders } from "./model-readers";
 import { createSavIntakeSimpleReaders, memoizeIntakeCrmReaders, SAV_INTAKE_SIMPLE_REVISION } from "./simple-readers";
@@ -23,7 +23,7 @@ import { observeSavOther, readSavOtherConfiguration } from "../other-observation
 import { assertSavIntakeObservation, savIntakeRuntimeConfig, SAV_INTAKE_RUNTIME_REVISION,
   type IntakeRuntimeConfig, type IntakeRuntimePayload } from "./runtime-contract";
 import { assertSavIntakeLease, catchupSavIntake, checkpointSavIntakeRun, claimSavIntakeRun, enqueueSavIntakeMessage, failSavIntakeRun,
-  pendingSavIntakeRuns, readSavIntakeBudget, reconcileConfinedIntakeUsage, reserveSavIntakeCall, saveSavIntakeResult } from "./runtime-store";
+  pendingSavIntakeRuns, readSavIntakeBudget, reconcileConfinedIntakeUsage, reserveSavIntakeCall, saveSavIntakeResult, intakeTransientRetries, scheduleSavIntakeTransientRetry } from "./runtime-store";
 
 /** Enqueue only: ingestion never invokes CRM/model or marks a mail processed. */
 export async function enqueueConfiguredSavIntake(messageId: string) {
@@ -81,7 +81,8 @@ async function analyseSavIntakeRuntimeWithinBudget(runId: string, config: Intake
     }
     if(qualifiedOther) payload.other=qualifiedOther;
     await writeCheckpoint();
-    dispatcher = createIntakeModelDispatcher({ config, live, reserve: hash => reserveSavIntakeCall(lease, config, hash), preflight: hashes => assertSavIntakeCallPlan(lease.run.messageId, config, hashes), signal: controller.signal, env, network });
+    const retryOrdinal = await intakeTransientRetries(lease.run.id);
+    dispatcher = createIntakeModelDispatcher({ config, live, retryOrdinal, reserve: hash => reserveSavIntakeCall(lease, config, hash), preflight: hashes => assertSavIntakeCallPlan(lease.run.messageId, config, hashes), signal: controller.signal, env, network });
     const { call, pending } = dispatcher;
     const attachments = lease.recoveringRead ? null : await prepareIntakeAttachments(lease, config.model, live, deps.downloadAttachments);
     if (attachments) {
@@ -107,7 +108,8 @@ async function analyseSavIntakeRuntimeWithinBudget(runId: string, config: Intake
         attachments.state.read = { ...attachments.state.read, observations, state: "complete", completedAt: new Date().toISOString() };
         payload.attachments = attachments.state; checkpoint();
       } } } : {}),
-      onTrace: trace => { semanticFailureReason = trace.errorCode ?? undefined; traces.push(trace); checkpoint(); } })
+      onTrace: trace => { semanticFailureReason = trace.errorCode ?? undefined; traces.push(trace); checkpoint(); },
+      onJudgement: judgement => { traces.push({ phase: "simple_judgement", ...judgement }); checkpoint(); } })
       : createSavIntakeSemanticReaders({ planCalls: dispatcher.plan, repairMalformedOutput,
       repairIssues:publicIntakeSchemaIssues((previous.traces?.findLast(t=>(t as {validationFailure?:unknown})?.validationFailure) as {validationFailure?:{issues?:unknown}}|undefined)?.validationFailure?.issues),
       ...(priorAnalysis?.attachmentObservations?{acceptedImages:priorAnalysis.attachmentObservations}:{}), ...(attachments?.complete ? { attachments: { prepared: attachments.prepared, onRead: observations => {
@@ -143,10 +145,13 @@ async function analyseSavIntakeRuntimeWithinBudget(runId: string, config: Intake
     } else if(lease.recoveringRead) {payload.readRecovery!.state=state==="waiting"?"invalidated":"complete";payload.readRecovery!.cache=[];}
     else delete payload.readRecovery;
     await saveSavIntakeResult(lease, config, payload, state);
+    // A provider outage is retried automatically at a durable due time, not left to wait.
+    const transientRetry = state === "waiting" && !dispatcher.uncertain && payload.readRecovery?.state !== "scheduled" && intakeTransientFailure(payload.reason)
+      ? await scheduleSavIntakeTransientRetry(runId, payload.reason!) : null;
     if(payload.readRecovery?.state==="scheduled")await (await import("./read-recovery-wake")).requestReadRecoveryWake(runId,{env:env(),start:deps.startReadRecovery});
     const retryFormat = state === "waiting" && lease.run.attempts === 1 && attachments?.complete
       && attachments.prepared.uniqueImages.length > 0 && payload.reason === "SAV_INTAKE_MODEL_OUTPUT_REJECTED";
-    return { runId, state, ...(retryFormat ? { retryFormat: true as const } : {}) };
+    return { runId, state, ...(retryFormat ? { retryFormat: true as const } : {}), retryAt: transientRetry?.retryAt.toISOString() };
   } catch (error) {
     controller.abort();
     // An expired routing authority must never leave a publishable Other plan.
@@ -156,7 +161,9 @@ async function analyseSavIntakeRuntimeWithinBudget(runId: string, config: Intake
     finishIntakeAttachmentRead(payload.attachments,attachmentFailureReason(payload.reason,Boolean(dispatcher?.uncertain)));
     await failSavIntakeRun(lease, payload, Boolean(dispatcher?.uncertain) || payload.reason === "SAV_INTAKE_RUNTIME_SETTLEMENT_UNCERTAIN",
       { deterministic: SAV_INTAKE_DETERMINISTIC_ERRORS.has(payload.reason ?? "") });
-    return { runId, state: dispatcher?.uncertain ? "uncertain" : "waiting", reason: payload.reason };
+    const uncertain = Boolean(dispatcher?.uncertain) || payload.reason === "SAV_INTAKE_RUNTIME_SETTLEMENT_UNCERTAIN";
+    const transientRetry = !uncertain && intakeTransientFailure(payload.reason) ? await scheduleSavIntakeTransientRetry(runId, payload.reason!).catch(() => null) : null;
+    return { runId, state: dispatcher?.uncertain ? "uncertain" : "waiting", reason: payload.reason, retryAt: transientRetry?.retryAt.toISOString() };
   } finally { controller.abort(); clearTimeout(timer); }
 }
 export async function analyseSavIntakeRuntime(...args: Parameters<typeof analyseSavIntakeRuntimeWithinBudget>) {

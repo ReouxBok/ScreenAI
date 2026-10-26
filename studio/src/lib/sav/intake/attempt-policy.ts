@@ -19,6 +19,12 @@ export const SAV_INTAKE_DETERMINISTIC_ERRORS = new Set(["SAV_INTAKE_INPUT_INVALI
 
 /** `payloadCiphertext: null` means the payload is unavailable to this reader:
  * its analysis status is unknown, never inferred as a failure. */
+/** Provider-side transient failures: the same input can succeed later. Each retry is a
+ * distinct, separately reserved dispatch at a durable due time; bounded per run. */
+export const SAV_INTAKE_TRANSIENT_RETRY = Object.freeze({ delaysMinutes: [2, 10, 30] as readonly number[] });
+export function intakeTransientFailure(reason: string | undefined) {
+  return typeof reason === "string" && (/^SAV_AI_HTTP_(?:429|5\d\d)$/.test(reason) || ["SAV_AI_TIMEOUT", "SAV_INTAKE_RUNTIME_PROVIDER_UNAVAILABLE"].includes(reason));
+}
 export type IntakeAttemptRow = { id: string; attempts: number; payloadCiphertext: string | null };
 export type IntakeAttemptBudget = { runAttempts: number; failed: number; unknown: number; total: number;
   exhausted: false | "per_version" | "failed_per_message" | "total_per_message" };

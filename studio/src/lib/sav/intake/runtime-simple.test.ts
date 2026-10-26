@@ -9,7 +9,10 @@ const state = vi.hoisted(() => ({ db: null as unknown }));
 vi.mock("@/db", () => ({ requireDb: () => { if (!state.db) throw Error("NO_DATABASE_ALLOWED"); return state.db; } }));
 import { encryptSavPayload, decryptSavPayload } from "../crypto";
 import { intakeRuntimeHash, savIntakeRuntimeConfig, type IntakeRuntimePayload } from "./runtime-contract";
-import { catchupSavIntake, enqueueSavIntakeMessage, readSavIntakeCurrent } from "./runtime-store";
+import { catchupSavIntake, claimSavIntakeRun, enqueueSavIntakeMessage, pendingSavIntakeRuns, readSavIntakeCurrent } from "./runtime-store";
+import { intakeBlockedRunSql, intakeRetryAtSql } from "./console-store";
+import { savIntakeJournal } from "@/db/schema";
+import { sql } from "drizzle-orm";
 import { analyseSavIntakeRuntime } from "./runtime";
 import { SAV_INTAKE_MODEL_REVISION } from "./model-readers";
 import { SAV_INTAKE_SIMPLE_REVISION } from "./simple-readers";
@@ -30,10 +33,13 @@ async function stored() {
   return m;
 }
 /** Synthetic Gemini answering both reader formats, and an empty CRM. */
-function provider(messageId: string) {
+function provider(messageId: string, failures: number[] = []) {
   const revisions: string[] = [];
+  let gemini = 0;
   const network = vi.fn(async (url: Parameters<typeof fetch>[0], init?: RequestInit) => {
     if (String(url).startsWith("https://generativelanguage.googleapis.com/")) {
+      const status = failures[gemini++];
+      if (status) return new Response("{}", { status });
       const body = JSON.parse(String(init?.body)), data = JSON.parse(body.contents[0].parts[0].text);
       const simple = typeof data.current === "string";
       revisions.push(simple ? SAV_INTAKE_SIMPLE_REVISION : SAV_INTAKE_MODEL_REVISION);
@@ -48,7 +54,7 @@ function provider(messageId: string) {
     if (String(url).startsWith("https://api.hubapi.com/")) return Response.json({ total: 0, results: [] });
     throw Error("EXTERNAL_NETWORK_FORBIDDEN");
   });
-  return { network, revisions };
+  return { network, revisions, calls: () => gemini };
 }
 const payloadOf = async (runId: string) => decryptSavPayload<IntakeRuntimePayload>((await f.db.select().from(savIntakeRuns).where(eq(savIntakeRuns.id, runId)))[0].payloadCiphertext);
 
@@ -81,6 +87,8 @@ describe("pipeline switch", () => {
     expect(current?.payload.pipeline).toBe("simple");
     expect(current?.payload.semantics?.validatorRevision).toBe(SAV_INTAKE_SIMPLE_REVISION);
     expect(current?.payload.plan?.decision.classification).toBe("support");
+    // The accepted judgement summary is kept for the team handoff.
+    expect(current?.payload.traces).toEqual(expect.arrayContaining([expect.objectContaining({ phase: "simple_judgement", rationale: "Demande support." })]));
     // Observe mode: a plan, never an effect.
     expect(await f.db.select().from(savActions)).toHaveLength(0); expect(await f.db.select().from(savIntakeExecutions)).toHaveLength(0);
   });
@@ -98,5 +106,72 @@ describe("pipeline switch", () => {
       await analyseSavIntakeRuntime(id, config, { env: () => after, network: p.network });
       expect(p.revisions[0]).toBe(revision);
     }
+  });
+});
+
+describe("transient provider failures (lot 2)", () => {
+  const due = (runId: string) => f.db.update(savIntakeRuns).set({ leaseUntil: new Date(Date.now() - 1000) }).where(eq(savIntakeRuns.id, runId));
+  const kinds = async (runId: string) => (await f.db.select().from(savIntakeJournal).where(eq(savIntakeJournal.runId, runId))).map(j => j.kind);
+  const run = async (runId: string) => (await f.db.select().from(savIntakeRuns).where(eq(savIntakeRuns.id, runId)))[0];
+  for (const pipeline of ["simple", undefined] as const) it(`429 then success: retried automatically at a durable due time, as a new reserved dispatch (${pipeline ?? "current"})`, async () => {
+    const environment = env(mailboxId, pipeline), config = savIntakeRuntimeConfig(environment)!;
+    const m = await stored(), id = (await enqueueSavIntakeMessage(m.id, config))!, p = provider(m.id, [429]);
+    const first = await analyseSavIntakeRuntime(id, config, { env: () => environment, network: p.network });
+    expect(first).toMatchObject({ state: "waiting", retryAt: expect.any(String) });
+    expect(Date.parse((first as { retryAt: string }).retryAt)).toBeGreaterThan(Date.now() + 60_000);
+    expect((await run(id)).attempts).toBe(0);
+    expect(await kinds(id)).toContain("retry_scheduled");
+    // Not before its due time: neither listed nor claimable.
+    expect(await pendingSavIntakeRuns(config)).toEqual([]);
+    expect(await claimSavIntakeRun(id, config)).toBeNull();
+    // The console shows a next action, not an incident.
+    const [{ blocked, retry }] = ((await f.db.execute(sql`select ${intakeBlockedRunSql(sql`${threadId}::uuid`)} as blocked, ${intakeRetryAtSql(sql`${threadId}::uuid`)} as retry`)) as unknown as { rows: { blocked: boolean; retry: unknown }[] }).rows;
+    expect(blocked).toBe(false); expect(retry).toBeTruthy();
+    await due(id);
+    expect((await pendingSavIntakeRuns(config)).map(r => r.id)).toContain(id);
+    await analyseSavIntakeRuntime(id, config, { env: () => environment, network: p.network });
+    const current = await readSavIntakeCurrent(threadId, config);
+    expect(current?.payload.plan?.decision.classification).toBe("support");
+    expect(current?.payload.reason).toBeUndefined();
+    // Every dispatch has its own settled reservation; no reuse of the consumed one.
+    const ledger = await f.db.select().from(savIntakeModelCalls);
+    expect(ledger.every(r => r.state === "settled")).toBe(true);
+    expect(new Set(ledger.map(r => r.requestHash)).size).toBe(ledger.length);
+    expect(await f.db.select().from(savActions)).toHaveLength(0);
+  });
+  it("repeated 503 stop at the per-message call budget: three retries, no fourth dispatch, a visible cause, no loop", async () => {
+    const environment = env(mailboxId, "simple"), config = savIntakeRuntimeConfig(environment)!;
+    const m = await stored(), id = (await enqueueSavIntakeMessage(m.id, config))!, p = provider(m.id, [503, 503, 503, 503, 503, 503]);
+    for (let n = 0; n < 5; n++) { await analyseSavIntakeRuntime(id, config, { env: () => environment, network: p.network }); await due(id); }
+    expect((await kinds(id)).filter(k => k === "retry_scheduled")).toHaveLength(3);
+    // The existing lifetime budget of three model calls per message is what stops the dossier.
+    expect(p.calls()).toBe(3);
+    expect((await readSavIntakeCurrent(threadId, config))?.payload.reason).toBe("SAV_INTAKE_RUNTIME_BUDGET_EXHAUSTED");
+    expect((await run(id)).attempts).toBeGreaterThan(0);
+    const ledger = await f.db.select().from(savIntakeModelCalls);
+    expect(ledger.every(r => r.state === "settled" && r.chargedNanoUsd === 0)).toBe(true);
+  });
+  it("a lost answer after dispatch stays uncertain: no retry, no zero settlement, until reconciliation", async () => {
+    const environment = env(mailboxId, "simple"), config = savIntakeRuntimeConfig(environment)!;
+    const m = await stored(), id = (await enqueueSavIntakeMessage(m.id, config))!;
+    const network = vi.fn(async (url: Parameters<typeof fetch>[0]) => {
+      if (String(url).startsWith("https://generativelanguage.googleapis.com/")) throw Error("socket hang up");
+      return Response.json({ total: 0, results: [] });
+    });
+    const result = await analyseSavIntakeRuntime(id, config, { env: () => environment, network });
+    expect(result).toMatchObject({ state: "uncertain" });
+    expect(await kinds(id)).not.toContain("retry_scheduled");
+    const [row] = await f.db.select().from(savIntakeModelCalls);
+    expect(row.state).toBe("uncertain"); expect(row.chargedNanoUsd).toBe(row.reservedNanoUsd);
+  });
+  it("a deployment during the wait never loses the retry: the new version analyses at once", async () => {
+    const base = env(mailboxId, "simple"), config = savIntakeRuntimeConfig(base)!;
+    const m = await stored(), id = (await enqueueSavIntakeMessage(m.id, config))!, p = provider(m.id, [429]);
+    await analyseSavIntakeRuntime(id, config, { env: () => base, network: p.network });
+    const deployed = { ...base, SAV_CODE_REVISION: "b".repeat(40), SAV_INTAKE_RUNTIME_CONFIG: JSON.stringify({ ...JSON.parse(base.SAV_INTAKE_RUNTIME_CONFIG), codeRevision: "b".repeat(40) }) };
+    const next = savIntakeRuntimeConfig(deployed)!;
+    const version = (await enqueueSavIntakeMessage(m.id, next))!;
+    expect(version).not.toBe(id);
+    expect((await pendingSavIntakeRuns(next)).map(r => r.id)).toContain(version);
   });
 });

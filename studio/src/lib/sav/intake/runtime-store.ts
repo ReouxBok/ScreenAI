@@ -1,7 +1,7 @@
 import { readRecoveryDue, DEFAULT_INTAKE_READ_RECOVERY } from "./read-recovery";
 import { readIntakeOperatorInformation } from "./operator-information";
 import { writeReadRecoveryMarker,readRecoverySql,noReadRecoverySql } from "./read-recovery-store";
-import { intakeAttemptBudget, SAV_INTAKE_ATTEMPT_POLICY, SAV_INTAKE_BLOCKING_JOURNAL_KINDS } from "./attempt-policy";
+import { intakeAttemptBudget, SAV_INTAKE_ATTEMPT_POLICY, SAV_INTAKE_BLOCKING_JOURNAL_KINDS, SAV_INTAKE_TRANSIENT_RETRY } from "./attempt-policy";
 import { readSavExternalCompletion, listSavExternalCompletionMessageIds } from "../external-completion";
 import "server-only";
 import { reconcileIntakeZeroThoughtUsage } from "./model-usage";
@@ -10,7 +10,7 @@ import { intakeLaunchMatches } from "./launch-boundary";
 import { intakeConsoleInstalled } from "./console-capability";
 import { intakeRunConfigurationBound, intakeHumanRefused, intakeHasHumanDecision, intakeRunCandidateContactIds } from "./human-binding";
 import { randomUUID } from "node:crypto";
-import { and, desc, eq, gt, inArray, lt, or, sql } from "drizzle-orm";
+import { and, desc, eq, gt, inArray, isNull, lt, lte, or, sql } from "drizzle-orm";
 import { requireDb } from "@/db";
 import { savMessages, savThreads, savIntakeRuns, savIntakeJournal, savIntakeModelCalls, savIntakeHumanEvents, savIntakeIdentityEpisodes, savIntakeEffects, savIntakeExecutions } from "@/db/schema";
 import { decryptSavPayload, encryptSavPayload, savContentHash } from "../crypto";
@@ -31,7 +31,11 @@ const fail = (): never => { throw Error("SAV_INTAKE_RUNTIME_CONTEXT_CHANGED"); }
 const budgetColumns={id:savIntakeModelCalls.id,messageKey:savIntakeModelCalls.messageKey,requestHash:savIntakeModelCalls.requestHash,state:savIntakeModelCalls.state,reservedNanoUsd:savIntakeModelCalls.reservedNanoUsd,chargedNanoUsd:savIntakeModelCalls.chargedNanoUsd,payloadCiphertext:savIntakeModelCalls.payloadCiphertext,createdAt:savIntakeModelCalls.createdAt};
 function budgetRowsValid(rows: Pick<typeof savIntakeModelCalls.$inferSelect,"reservedNanoUsd"|"chargedNanoUsd"|"payloadCiphertext"|"state">[]) {
   for (const row of rows) {
-    const data = decryptSavPayload<{ metadata?: SavGeminiMetadata }>(row.payloadCiphertext), m = data.metadata ?? {};
+    const data = decryptSavPayload<{ metadata?: SavGeminiMetadata; usageReconciliation?: string; providerStatus?: number }>(row.payloadCiphertext), m = data.metadata ?? {};
+    // A received 429/5xx rejection is settled at zero with its explicit marker (see settleSavIntakeCall).
+    const unbilled = row.state === "settled" && data.usageReconciliation === "provider_http_error_unbilled.v1" && row.chargedNanoUsd === 0
+      && Number.isSafeInteger(data.providerStatus) && (data.providerStatus === 429 || Number(data.providerStatus) >= 500 && Number(data.providerStatus) <= 599);
+    if (unbilled && row.reservedNanoUsd === 817_152_000) continue;
     const { inputTokens: i, outputTokens: o, thoughtTokens: t, totalTokens: total } = m;
     const known = [i, o, t, total].every(n => Number.isSafeInteger(n) && Number(n) >= 0) && Number(i) > 0 && Number(i) <= 1_048_576
       && Number(o) + Number(t) <= 8192 && Number(i) + Number(o) + Number(t) === total;
@@ -327,7 +331,9 @@ export async function pendingSavIntakeRuns(config: IntakeRuntimeConfig, now = ne
     // Coarse lifetime bound in SQL; the claim applies the full per-version/failed/total policy.
     or(sql`(select coalesce(sum(s.attempts),0) from sav.intake_runs s where s.message_id = ${savIntakeRuns.messageId}) < ${SAV_INTAKE_ATTEMPT_POLICY.totalPerMessage}`, recovery),
     sql`exists (select 1 from sav.threads t where t.id = ${savIntakeRuns.threadId} and not t.ai_paused)`,
-    or(inArray(savIntakeRuns.state, ["pending", "waiting"]), and(eq(savIntakeRuns.state, "analysing"), lt(savIntakeRuns.leaseUntil, now)))))
+    // A scheduled transient retry carries its due time in leaseUntil (no lease token): not before then.
+    or(and(inArray(savIntakeRuns.state, ["pending", "waiting"]), or(isNull(savIntakeRuns.leaseUntil), lte(savIntakeRuns.leaseUntil, now))),
+      and(eq(savIntakeRuns.state, "analysing"), lt(savIntakeRuns.leaseUntil, now)))))
     .orderBy(savIntakeRuns.createdAt).limit(4);
   return rows.filter(row => {
     try { const payload=decryptSavPayload<IntakeRuntimePayload>(row.payloadCiphertext);
@@ -403,7 +409,7 @@ export async function assertIntakeHumanAnalysis(authority:IntakeHumanAnalysisAut
 export async function reserveIntakeHumanCall(authority:IntakeHumanAnalysisAuthority,config:IntakeRuntimeConfig,requestHash:string) {
   return requireDb().transaction(async tx=>{const now=new Date(),run=await assertHumanAnalysis(tx,authority,config,now);return reserveIntakeCall(tx,run,config,requestHash,now);});
 }
-export async function settleSavIntakeCall(id: string, metadata?: SavGeminiMetadata, result?: { json: unknown; metadata: SavGeminiMetadata }) {
+export async function settleSavIntakeCall(id: string, metadata?: SavGeminiMetadata, result?: { json: unknown; metadata: SavGeminiMetadata }, unbilledProviderStatus?: number) {
   return requireDb().transaction(async tx => {
     await tx.execute(sql`select pg_advisory_xact_lock(hashtext('sav-intake-runtime-model-budget-v1'))`);
     const [row] = await tx.select().from(savIntakeModelCalls).where(eq(savIntakeModelCalls.id, id)).for("update"); if (!row) return fail();
@@ -411,10 +417,12 @@ export async function settleSavIntakeCall(id: string, metadata?: SavGeminiMetada
     const { inputTokens: i, outputTokens: o, thoughtTokens: t, totalTokens: total } = metadata ?? {};
     const valid = [i, o, t, total].every(n => Number.isSafeInteger(n) && Number(n) >= 0) && Number(i) >= 1 && Number(i) <= 1_048_576
       && Number(o) + Number(t) <= 8192 && Number(i) + Number(o) + Number(t) === total;
-    const cost = valid ? Number(i) * 750 + (Number(o) + Number(t)) * 3750 : row.reservedNanoUsd;
-    await tx.update(savIntakeModelCalls).set({ state: valid ? "settled" : "uncertain", chargedNanoUsd: cost,
-      payloadCiphertext: encryptSavPayload({ metadata: metadata ?? {} }), resultCiphertext: valid && result && row.runId ? encryptSavPayload(result) : null, settledAt: new Date() }).where(eq(savIntakeModelCalls.id, id));
-    return valid;
+    // Only a received provider rejection (429/5xx) is known to be unprocessed; it is recorded as such.
+    const unbilled = !valid && unbilledProviderStatus !== undefined && (unbilledProviderStatus === 429 || unbilledProviderStatus >= 500 && unbilledProviderStatus <= 599) && !result;
+    const cost = valid ? Number(i) * 750 + (Number(o) + Number(t)) * 3750 : unbilled ? 0 : row.reservedNanoUsd;
+    await tx.update(savIntakeModelCalls).set({ state: valid || unbilled ? "settled" : "uncertain", chargedNanoUsd: cost,
+      payloadCiphertext: encryptSavPayload({ metadata: metadata ?? {}, ...(unbilled ? { usageReconciliation: "provider_http_error_unbilled.v1", providerStatus: unbilledProviderStatus } : {}) }), resultCiphertext: valid && result && row.runId ? encryptSavPayload(result) : null, settledAt: new Date() }).where(eq(savIntakeModelCalls.id, id));
+    return valid || unbilled;
   });
 }
 /** Bounded accounting repair for the previous deployment's omitted-zero bug.
@@ -481,4 +489,28 @@ export async function readSavIntakeBudget(config: IntakeRuntimeConfig, now = new
   const rows = await requireDb().select(budgetColumns).from(savIntakeModelCalls);
   budgetRowsValid(rows);
   return intakeBudgetUsage(rows,config,now);
+}
+
+/** Transient retries already scheduled for this run: also the dispatch ordinal of the next one. */
+export async function intakeTransientRetries(runId: string) {
+  const rows = await requireDb().select({ id: savIntakeJournal.id }).from(savIntakeJournal)
+    .where(and(eq(savIntakeJournal.runId, runId), eq(savIntakeJournal.kind, "retry_scheduled")));
+  return rows.length;
+}
+/** After a transient provider failure: give the attempt back and record a durable due
+ * time (leaseUntil without a lease token), the cause and the retries left. Survives
+ * interruptions and deployments; a superseding version simply analyses at once. */
+export async function scheduleSavIntakeTransientRetry(runId: string, reason: string, now = new Date()) {
+  return requireDb().transaction(async tx => {
+    const [run] = await tx.select().from(savIntakeRuns).where(eq(savIntakeRuns.id, runId)).for("update");
+    if (!run?.isCurrent || run.state !== "waiting" || run.leaseToken) return null;
+    const done = (await tx.select({ id: savIntakeJournal.id }).from(savIntakeJournal)
+      .where(and(eq(savIntakeJournal.runId, runId), eq(savIntakeJournal.kind, "retry_scheduled")))).length;
+    const delays = SAV_INTAKE_TRANSIENT_RETRY.delaysMinutes;
+    if (done >= delays.length) { await journal(tx, runId, "retry_exhausted", { reason, retries: done }); return null; }
+    const retryAt = new Date(now.getTime() + delays[done] * 60_000);
+    await tx.update(savIntakeRuns).set({ attempts: sql`greatest(${savIntakeRuns.attempts} - 1, 0)`, leaseUntil: retryAt, updatedAt: now }).where(eq(savIntakeRuns.id, runId));
+    await journal(tx, runId, "retry_scheduled", { reason, retry: done + 1, retryAt: retryAt.toISOString(), remaining: delays.length - done - 1 });
+    return { retryAt, retry: done + 1, remaining: delays.length - done - 1 };
+  });
 }

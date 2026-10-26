@@ -12,7 +12,7 @@ import {crmDisplayFallback,type CrmDisplayRecord} from "@/lib/sav/intake/crm-dis
 import { releaseIntakeHumanHoldAction } from "../actions";
 import {IntakeRecoveryForm} from "../recovery-form";
 import { IntakeCompletionForm } from "../completion-form";
-import { intakeStatusLabel, intakeReasonLabel, intakeContextReasonLabels } from "@/lib/sav/intake/console-presentation";
+import { intakeStatusLabel, intakeReasonLabel, intakeContextReasonLabels, intakeHandoff } from "@/lib/sav/intake/console-presentation";
 import styles from "../intake.module.css";
 import { IntakeBackLink } from "../navigation";
 import { IntakeCrmContext } from "../crm-context";
@@ -64,6 +64,11 @@ export default async function IntakeDetailPage({ params, searchParams }: { param
       : disposition?.kind === "no_ticket" && disposition.nextAction === "supervised_investor" ? "Prendre en charge cette demande d’investissement"
         : disposition?.kind === "no_ticket" && disposition.nextAction === "supervised_partnership" ? "Prendre en charge cette demande de partenariat"
           : disposition?.kind === "no_ticket" && disposition.nextAction === "supervised_commercial" ? "Prendre en charge cette demande commerciale" : "Quelle suite l’équipe doit-elle donner à cette demande ?" : null;
+  const judgement = (current?.payload.traces as { phase?: string }[] | undefined)?.findLast(t => t?.phase === "simple_judgement") as Parameters<typeof intakeHandoff>[0]["judgement"];
+  const assessed = (current?.payload.semantics?.records.find(r => r.method === "assessIssues")?.result as { tickets?: { ticketId: string; relation: string }[] } | undefined)?.tickets;
+  const handoffReasons = [...(disposition?.kind === "collect_context" ? disposition.reasons : []), ...(current?.payload.reason === "SAV_INTAKE_RUNTIME_BUDGET_EXHAUSTED" ? [current.payload.reason] : [])];
+  const handoff = !data.handledExternally && !data.confirmedCurrent && (blocked || handoffReasons.length > 0 || question)
+    ? intakeHandoff({ reasons: handoffReasons, blockedCause: blocked ? "attempts_exhausted" : null, assessments: assessed, judgement }) : null;
   return <div className={styles.console}>
     <IntakeBackLink className={styles.back} returnTo={query?.returnTo}/>
     <header className={styles.heading}><div><span className="eyebrow">Dossier · version {current?.version ?? "en attente"}</span><h1>{data.thread.subject || "Nouvelle demande"}</h1>
@@ -77,7 +82,7 @@ export default async function IntakeDetailPage({ params, searchParams }: { param
       <MailConversation messages={data.messages}/>
       {data.historyTruncated && <p role="status">Les 200 messages les plus récents sont affichés. L’historique est incomplet.</p>}
       <section className={styles.decision}><h2>{data.humanHeld && !data.handledExternally ? "Prise en charge par l’équipe" : data.handledExternally ? "Disposition administrative" : data.confirmedCurrent ? "Résultat confirmé pour cette demande" : "Décision actuelle"}</h2>
-        {blocked && <p role="status">Analyse bloquée : les deux tentatives de ce message sont épuisées, y compris dans ses versions précédentes. Aucune relance automatique n’est autorisée par ce diagnostic.</p>}
+        {blocked && <p role="status">Analyse bloquée : le plafond de tentatives de ce message est atteint ou indéterminé, toutes versions confondues{data.diagnostics?.attemptBudget ? ` (${data.diagnostics.attemptBudget.failed} échec(s), ${data.diagnostics.attemptBudget.total} tentative(s) au total)` : ""}. Aucune relance automatique : voir la prise en charge ci-dessous.</p>}
         {data.handledExternally ? <p>{["handled_externally", "human_other", "human_review"].includes(data.projection.status) ? data.projection.reason : "Le traitement externe est enregistré. Une commande humaine ou un résultat externe reste à rapprocher ; le dossier conserve ses preuves et son attente."}</p> : data.humanHeld ? <p>À valider par l’équipe. La pause humaine est conservée ; aucune action automatique ne peut reprendre sans levée explicite de cette pause.</p> : data.projection.status === "historical_outside_automation" ? <p>Historique conservé, hors automatisation. Un nouvel entrant après le lancement reprendra normalement avec cet historique.</p> : !plan ? <p>{blocked ? "Les diagnostics des tentatives précédentes sont conservés ci-dessous." : "Analyse en cours ou attente technique."} Aucune action n’est présentée comme accomplie.</p> : <>
           <dl><div><dt>Classification</dt><dd>{plan.decision.classification}</dd></div><div><dt>Parcours</dt><dd>{disposition?.kind === "ticket" ? target?.operation === "create" ? "Créer une fiche ticket" : target?.operation === "reopen" ? "Rouvrir le ticket" : "Rattacher au ticket"
             : disposition?.kind === "request_identification" ? "Demander l’adresse d’inscription" : disposition?.kind === "collect_context" ? "Compléter les preuves" : "Sans ticket"}</dd></div>
@@ -89,6 +94,14 @@ export default async function IntakeDetailPage({ params, searchParams }: { param
           </ul></details>
         </>}
       </section>
+      {handoff && <section className={styles.decision} aria-label="Prise en charge par l’équipe"><h2>Prise en charge par l’équipe</h2>
+        {handoff.causes.length > 0 && <p>Cause : {handoff.causes.map(c => c.replace(/\.$/u, "")).join(", ")}.</p>}
+        {handoff.actions.length > 0 && <><h3>Intervention attendue</h3><ul>{handoff.actions.map(action => <li key={action}>{action}</li>)}</ul></>}
+        {handoff.tickets.length > 0 && <><h3>Tickets examinés</h3><ul>{handoff.tickets.map(t => <li key={t.ticketId}><RecordLink record={ticketRecord(t.ticketId)}/> · {t.relation}{t.why ? ` — ${t.why}` : ""}</li>)}</ul></>}
+        {handoff.missing.length > 0 && <><h3>Éléments manquants</h3><ul>{handoff.missing.map((m, i) => <li key={i}>{m.why}</li>)}</ul></>}
+        {handoff.rationale && <p>Analyse : {handoff.rationale}</p>}
+        <p>{data.progress?.effects.some(e => e.state === "confirmed") ? `Actions déjà confirmées conservées : ${data.progress.effects.filter(e => e.state === "confirmed").length}.` : "Aucune action n’a encore été faite dans HubSpot ou Gmail."}</p>
+      </section>}
       {historicalPlan && <section className={styles.history}><h2>Dernière analyse historique — non applicable à la demande actuelle</h2><p>Version {current?.version}. Les sources ou le dernier entrant ont changé ; ses anciennes propositions ne sont pas la décision actuelle.</p><details><summary>Consulter la proposition historique</summary><p>Classification historique : {historicalPlan.decision.classification}.</p>{historicalPlan.decision.disposition.kind === "ticket" && <p>Ancienne cible : <RecordLink record={contactRecord(historicalPlan.decision.disposition.target.contactId)}/>{historicalPlan.decision.disposition.target.operation !== "create" ? <> · <RecordLink record={ticketRecord(historicalPlan.decision.disposition.target.ticketId)}/></> : " · création proposée"}.</p>}</details></section>}
       <section className={styles.decision}><h2>{currentEffects ? "Actions réellement accomplies" : "Actions historiques conservées"}</h2>
         {data.progress ? <ol className={styles.effects}>{data.progress.effects.map(effect => <li key={effect.id} data-state={effect.state}>
