@@ -14,6 +14,24 @@ vi.mock("@/db", () => ({
         return state.db;
     }
 }));
+// Keep the real transport and its guards. Virtualize only its scheduled waits:
+// repeated CRM searches must not consume the business scenario's 5s timeout.
+vi.mock("../hubspot-transport", async importOriginal => {
+    const actual = await importOriginal<typeof import("../hubspot-transport")>();
+    return {
+        ...actual,
+        createSavHubspotTransport: (network?: typeof fetch) => {
+            let offset = 0;
+            return actual.createSavHubspotTransport(network, {
+                now: () => Date.now() + offset,
+                wait: async (delay, signal) => {
+                    if (signal?.aborted) throw new Error("SAV_HUBSPOT_READ_CANCELLED");
+                    offset += delay;
+                }
+            });
+        }
+    };
+});
 vi.mock("@clerk/nextjs/server", () => ({
     currentUser: async () => state.user
 }));

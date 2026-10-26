@@ -123,3 +123,43 @@ it.each([403,429])("preserves sanitized HTTP suffixes needed by legacy rejection
  let error:unknown;try{await createSavHubspotTransport(network)("/crm/v3/objects/notes",{method:"POST"},s=>`HUBSPOT_HTTP_${s}:SYNTHETIC_REJECTION`);}catch(e){error=e;}
  expect(error).toMatchObject({message:`HUBSPOT_HTTP_${status}:SYNTHETIC_REJECTION`,diagnostic:{code:`HUBSPOT_HTTP_${status}`,origin:"http",attempts:1,status}});expect(network).toHaveBeenCalledTimes(1);
 });
+
+it("keeps search spacing and Retry-After with an injected transport clock", async () => {
+  let offset = 0;
+  const waits: number[] = [], starts: number[] = [];
+  vi.spyOn(Math, "random").mockReturnValue(0);
+  const network = vi.fn<typeof fetch>(async () => {
+    starts.push(offset);
+    return starts.length === 1
+      ? new Response("", { status: 429, headers: { "Retry-After": "2" } })
+      : Response.json({ results: [] });
+  });
+  const request = createSavHubspotTransport(network, {
+    now: () => 1_000_000 + offset,
+    wait: async delay => { waits.push(delay); offset += delay; }
+  });
+  await request("/crm/v3/objects/contacts/search", { method: "POST" }, summarize);
+  await request("/crm/v3/objects/tickets/search", { method: "POST" }, summarize);
+  expect(starts).toEqual([0, 2000, 2250]);
+  expect(waits).toEqual([2000, 250]);
+  expect(network).toHaveBeenCalledTimes(3);
+});
+
+it("propagates cancellation from an injected wait without dispatching or retaining a read slot", async () => {
+  const controller = new AbortController();
+  const network = vi.fn<typeof fetch>(async () => Response.json({ results: [] }));
+  const request = createSavHubspotTransport(network, {
+    now: () => 1_000_000,
+    wait: async (_delay, signal) => {
+      controller.abort();
+      expect(signal?.aborted).toBe(true);
+      throw new Error("SAV_HUBSPOT_READ_CANCELLED");
+    }
+  });
+  await request("/crm/v3/objects/contacts/search", { method: "POST" }, summarize);
+  await expect(request("/crm/v3/objects/tickets/search", { method: "POST", signal: controller.signal }, summarize))
+    .rejects.toThrow("SAV_HUBSPOT_READ_CANCELLED");
+  expect(network).toHaveBeenCalledTimes(1);
+  await Promise.all(Array.from({ length: 3 }, () => request("/crm/v3/pipelines/tickets", {}, summarize)));
+  expect(network).toHaveBeenCalledTimes(4);
+});
