@@ -877,3 +877,41 @@ it.each([false,true])("permits read-only recovery at the daily cap but refuses a
   if(matching)expect(saved.reason).toBe("SAV_INTAKE_RUNTIME_BUDGET_EXHAUSTED");else expect(saved.plan?.decision.evidence.some(e=>e.id==="email-lookup")).toBe(true);
  }finally{vi.useRealTimers();}
 });
+it("simple pipeline: a resumed read reuses the accepted analysis and gives the focused call the accepted requests (review P2)",async()=>{
+ await f.db.insert(savSyncState).values({key:"sav-intake-console-schema-v1",status:"installed"}).onConflictDoUpdate({target:savSyncState.key,set:{status:"installed"}});
+ environment={...environment,SAV_INTAKE_EVENT_DISPATCH:"on",SAV_INTAKE_PIPELINE:"simple"};config=savIntakeRuntimeConfig(environment)!;
+ const provider=executionProvider("synthetic@example.invalid");provider.seedTicket({ownerId:"301"});
+ provider.objects.notes["401"]={id:"401",properties:{hs_note_body:"Synthetic complete investigation",hs_timestamp:new Date(Date.now()-86400000).toISOString()}};
+ provider.links.set("tickets:201:notes",["401"]);
+ let failures=true;const bodies:{phase:string;decided?:unknown[]}[]=[];
+ const network:typeof fetch=async(url,init)=>{
+  if(String(url).startsWith("https://generativelanguage.googleapis.com/")){
+   const data=JSON.parse(JSON.parse(String(init?.body)).contents[0].parts[0].text);
+   bodies.push({phase:data.decidedRequests?"focused":"understanding",decided:data.decidedRequests});
+   const tickets=(data.tickets as {ticketId:string}[]).map(t=>({ticketId:t.ticketId,relation:"same",why:"Même connexion.",sourceIds:["current",`ticket-${t.ticketId}`]}));
+   const contacts=data.contacts as {contactId:string}[];
+   const answer={messageId,nature:"request",requests:data.decidedRequests?[]:[{id:"r1",kind:"support",summary:"La connexion ne marche plus.",sourceIds:["current"]}],
+    ticketTitle:"Connexion synthétique interrompue",ticketDescription:"La connexion ne marche plus.",
+    identity:contacts.length===1?{kind:"unique",contactIds:[contacts[0].contactId],why:"Expéditeur."}:{kind:"unknown",contactIds:[],why:"Aucune."},tickets,missing:[],rationale:"Même problème."};
+   return Response.json({candidates:[{finishReason:"STOP",content:{parts:[{text:JSON.stringify(answer)}]}}],usageMetadata:{promptTokenCount:100,candidatesTokenCount:50,thoughtsTokenCount:0,totalTokenCount:150}});
+  }
+  if(new URL(String(url)).pathname.endsWith("/notes/batch/read")&&failures)throw TypeError("Synthetic transient connection failure");
+  return provider.network(url,init);
+ };
+ const start=vi.fn(async()=>({runId:"synthetic-workflow"})),id=(await enqueueSavIntakeMessage(messageId,config))!;
+ expect(await analyseSavIntakeRuntime(id,config,{env:()=>environment,network,startReadRecovery:start})).toHaveProperty("state","waiting");
+ const saved=decryptSavPayload<IntakeRuntimePayload>((await f.db.select().from(savIntakeRuns).where(eq(savIntakeRuns.id,id)))[0].payloadCiphertext);
+ expect(saved.pipeline).toBe("simple");expect(saved.readRecovery).toMatchObject({state:"scheduled"});
+ vi.useFakeTimers({toFake:["Date"]});try{
+  vi.setSystemTime(Date.now()+31000);failures=false;
+  const resumed=await analyseSavIntakeRuntime(id,config,{env:()=>environment,network,startReadRecovery:start});
+  expect(resumed).toHaveProperty("state","observed");
+  // One understanding only; the resumed reader's focused call carries the accepted requests.
+  expect(bodies.filter(b=>b.phase==="understanding")).toHaveLength(1);
+  expect(bodies.at(-1)).toMatchObject({phase:"focused",decided:[{id:"r1",kind:"support"}]});
+  const plan=(await readSavIntakeCurrent(threadId,config))?.payload.plan;
+  expect(plan?.decision.disposition).toMatchObject({kind:"ticket",target:{operation:"link",ticketId:"201"}});
+  expect((await f.db.select().from(savIntakeModelCalls)).every(r=>r.state==="settled")).toBe(true);
+  expect(await f.db.select().from(savActions)).toHaveLength(0);
+ }finally{vi.useRealTimers();}
+});

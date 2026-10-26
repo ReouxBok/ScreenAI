@@ -132,7 +132,7 @@ export function createSavIntakeSimpleReaders(options: {
   let observations: SavAttachmentObservation[] | undefined;
 
   async function judge(phase: "understanding" | "ticket_matching", message: IntakeMessage, conversation: readonly IntakeMessage[], context: Context,
-    signal: AbortSignal, extra: Record<string, unknown> = {}, visual?: SavPreparedAttachments, requestsDecided = false): Promise<SimpleOutput> {
+    signal: AbortSignal, extra: Record<string, unknown> = {}, visual?: SavPreparedAttachments, requestsDecided = false, continuationInitialId?: string): Promise<SimpleOutput> {
     const { schema, sources } = outputSchema(message, conversation, context, visual);
     const subject = options.provenance?.get(message.id)?.subject;
     const data = { message: { id: message.id, from: message.fromEmail, to: message.toEmails, receivedAt: message.receivedAt, ...(subject ? { subject } : {}),
@@ -168,7 +168,7 @@ export function createSavIntakeSimpleReaders(options: {
         metadata = result.metadata;
         if (signal.aborted) throw Error("SAV_INTAKE_MODEL_CANCELLED");
         const output = schema.parse(result.json) as SimpleOutput;
-        validate(output, message, conversation, context, sources, requestsDecided);
+        validate(output, message, context, sources, requestsDecided, continuationInitialId);
         trace(true, null, { metadata, outputHash: hash(result.json) });
         options.onJudgement?.({ rationale: output.rationale, missing: output.missing, identity: output.identity, tickets: output.tickets });
         return output;
@@ -206,19 +206,23 @@ export function createSavIntakeSimpleReaders(options: {
   }
 
   const covered = (ticketIds: string[]) => first && ticketIds.every(id => first!.output.tickets.some(t => t.ticketId === id));
-  async function focused(message: IntakeMessage, context: Context, signal: AbortSignal, requestContext?: IntakeMessage) {
-    // Records the first judgement did not see (e.g. a declared registration address):
-    // one explicit call over exactly the engine's records, requests kept as decided.
+  async function focused(message: IntakeMessage, context: Context, signal: AbortSignal, requests: readonly unknown[], requestContext?: IntakeMessage) {
+    // Records the first judgement did not see (a declared registration address, or a read
+    // resumed with a reused analysis): one explicit call over exactly the engine's records,
+    // with the engine's canonical accepted requests, never re-deciding them.
     return judge("ticket_matching", message, requestContext ? [requestContext] : [], context, signal,
-      { decidedRequests: first?.output.requests ?? [], instructions: "Requests are already decided; judge identity and every supplied ticket against them." }, undefined, true);
+      { decidedRequests: requests, instructions: "Requests are already decided; judge identity and every supplied ticket against them." }, undefined, true);
   }
+  /** Something indispensable could not be read: no executable decision, the cause stays for the team. */
+  const missingIndispensable = (output: SimpleOutput) => output.missing.length > 0;
 
   return {
     analyseMessage: async ({ message, conversation, identificationContinuation }, signal) => {
       const context = await readContext(options.crm, message.fromEmail, options.policy, signal);
       const visual = options.attachments?.prepared;
       const output = await judge("understanding", message, conversation, context, signal,
-        identificationContinuation ? { identificationContinuation, continuationInstructions: "The server verified that an identification template was sent for initialMessageId to this sender. If the CURRENT message provides the requested registration email, keep the original unresolved requests (cite message-<initialMessageId>) and return registration." } : {}, visual);
+        identificationContinuation ? { identificationContinuation, continuationInstructions: "The server verified that an identification template was sent for initialMessageId to this sender. If the CURRENT message provides the requested registration email, keep the original unresolved requests (cite message-<initialMessageId>) and return registration." } : {}, visual,
+        false, identificationContinuation?.initialMessageId);
       if (visual && options.attachments) { observations = applySavAttachmentVisualResult(visual, { images: output.images }); options.attachments.onRead(observations); }
       first = { message, context, output };
       return messageAnalysis(message, output, identificationContinuation);
@@ -226,13 +230,16 @@ export function createSavIntakeSimpleReaders(options: {
     assessIssues: async (input, signal): Promise<IssueAssessment> => {
       const ticketIds = input.tickets.map(t => t.ticket.id);
       const output = covered(ticketIds) ? first!.output
-        : await focused(input.message, { contacts: first?.context.contacts ?? [], linked: first?.context.linked ?? [], tickets: [...input.tickets] }, signal, input.requestContext);
+        : await focused(input.message, { contacts: first?.context.contacts ?? [], linked: first?.context.linked ?? [], tickets: [...input.tickets] }, signal, input.requests, input.requestContext);
       const present = new Set(input.evidence.map(e => e.id));
+      const blocked = missingIndispensable(output) || Boolean(first && missingIndispensable(first.output));
       const proof = (ticketId: string) => ["current", `ticket-${ticketId}`, `history-${ticketId}`, ...(input.requestContext ? ["initial-request"] : [])].filter(id => present.has(id));
-      return { investigationComplete: ticketIds.every(id => output.tickets.some(t => t.ticketId === id)),
+      // Missing indispensable evidence: with candidates, every relation stays unknown (a question
+      // to the team, no write); without any, the investigation is incomplete (no creation).
+      return { investigationComplete: !(blocked && !ticketIds.length) && ticketIds.every(id => output.tickets.some(t => t.ticketId === id)),
         tickets: ticketIds.map(ticketId => {
           const judged = output.tickets.find(t => t.ticketId === ticketId);
-          const relation = judged?.relation === "same" ? "same" as const : judged?.relation === "different" ? "different" as const : "unknown" as const;
+          const relation = blocked ? "unknown" as const : judged?.relation === "same" ? "same" as const : judged?.relation === "different" ? "different" as const : "unknown" as const;
           return { ticketId, relation, requestIds: relation === "same" ? input.requests.map(r => r.id) : [], evidenceIds: proof(ticketId) };
         }) };
     },
@@ -241,9 +248,10 @@ export function createSavIntakeSimpleReaders(options: {
       const known = first && candidateIds.every(id => first!.context.contacts.some(c => c.id === id))
         && input.candidates.every(c => c.tickets.every(t => first!.context.tickets.some(row => row.ticket.id === t.ticket.id)));
       const output = known ? first!.output : await focused(input.message, { contacts: input.candidates.map(c => c.contact), linked: [],
-        tickets: [...new Map(input.candidates.flatMap(c => c.tickets).map(t => [t.ticket.id, t])).values()] }, signal, input.requestContext);
+        tickets: [...new Map(input.candidates.flatMap(c => c.tickets).map(t => [t.ticket.id, t])).values()] }, signal, first?.output.requests ?? [], input.requestContext);
       const contactIds = output.identity.contactIds.filter(id => candidateIds.includes(id));
-      return { kind: output.identity.kind, investigationComplete: output.identity.kind !== "unknown", contactIds,
+      const unresolved = output.missing.some(m => m.kind === "contact");
+      return { kind: unresolved ? "unknown" : output.identity.kind, investigationComplete: !unresolved && output.identity.kind !== "unknown", contactIds,
         // Every record the engine supplied was given to the model; the engine checks the list is complete.
         evidenceIds: input.evidence.map(e => e.id) };
     },
@@ -254,12 +262,14 @@ class SimpleValidationError extends Error {
   constructor(readonly reason: string, readonly path: string) { super("SAV_INTAKE_MODEL_OUTPUT_REJECTED"); }
 }
 /** Server checks of the judgement against what was actually supplied. */
-function validate(output: SimpleOutput, message: IntakeMessage, conversation: readonly IntakeMessage[], context: Context, sources: string[], requestsDecided: boolean) {
+function validate(output: SimpleOutput, message: IntakeMessage, context: Context, sources: string[], requestsDecided: boolean, continuationInitialId?: string) {
   if (output.messageId !== message.id) throw new SimpleValidationError("message_id_mismatch", "messageId");
   if (new Set(output.requests.map(r => r.id)).size !== output.requests.length) throw new SimpleValidationError("duplicate_request", "requests");
   for (const [index, request] of output.requests.entries()) {
     if (request.sourceIds.some(id => !sources.includes(id))) throw new SimpleValidationError("unknown_source", `requests.${index}.sourceIds`);
-    if (!request.sourceIds.includes("current") && !request.sourceIds.some(id => id.startsWith("message-") && conversation.some(m => `message-${m.id}` === id && m.direction === "inbound")))
+    // A request is the CURRENT message's, or the initial request of a verified identification
+    // continuation; never any other historical message (decided requests are not re-checked).
+    if (!requestsDecided && !request.sourceIds.includes("current") && !(continuationInitialId && request.sourceIds.includes(`message-${continuationInitialId}`)))
       throw new SimpleValidationError("wrong_anchor_source", `requests.${index}.sourceIds`);
   }
   if (!requestsDecided && !output.requests.length && output.nature === "request") throw new SimpleValidationError("request_missing", "requests");

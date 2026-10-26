@@ -103,7 +103,13 @@ async function analyseSavIntakeRuntimeWithinBudget(runId: string, config: Intake
     // The simple reader reads the CRM before its single call; the engine then sees the very same answers.
     const reads = pipeline === "simple" ? memoizeIntakeCrmReaders(recoverable) : recoverable;
     const priorAnalysis=lease.recoveringRead?payload.semantics!.records.find(r=>r.method==="analyseMessage")?.result as MessageAnalysis|undefined:undefined;
-    const semanticReader = pipeline === "simple" ? createSavIntakeSimpleReaders({ model: config.model, call, crm: reads, policy: config.policy, provenance: lease.provenance,
+    // The single-call reader may show the model CRM context later than receipt: never used for at_receipt analyses.
+    const simple = pipeline === "simple" && lease.input.mode !== "at_receipt";
+    if (pipeline === "simple" && !simple) {
+      traces.push({ pipeline: "simple", reader: "current", cause: "at_receipt_not_supported" });
+      if (!lease.recoveringRead) payload.semantics!.validatorRevision = SAV_INTAKE_MODEL_REVISION;
+    }
+    const semanticReader = simple ? createSavIntakeSimpleReaders({ model: config.model, call, crm: reads, policy: config.policy, provenance: lease.provenance,
       ...(attachments?.complete ? { attachments: { prepared: attachments.prepared, onRead: observations => {
         attachments.state.read = { ...attachments.state.read, observations, state: "complete", completedAt: new Date().toISOString() };
         payload.attachments = attachments.state; checkpoint();

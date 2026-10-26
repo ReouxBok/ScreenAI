@@ -51,7 +51,11 @@ function bench(options: { text?: string; subject?: string; contacts?: IntakeCont
   const provenance = new Map([[mid, { subject: options.subject ?? "Synchronisation agenda" } as never]]);
   const semantic = createSavIntakeSimpleReaders({ model: "gemini-fixture", call, crm: shared, policy, provenance, onTrace: t => traces.push(t) });
   const run = (answer: (data: Data, n: number) => Answer) => { script = answer; return planSavIntake(input, { ...shared, ...semantic }, policy); };
-  return { run, seen, phases, systems, traces, crmCalls };
+  const resumeIssues = async () => {
+    script = d => judgement(d);
+    return semantic.assessIssues!({message:input.message,requests:[{id:"r1",kind:"support",currentMessageId:mid}],tickets:[{ticket:ticket("201"),history:[]}],evidence:[{id:"current"},{id:"ticket-201"},{id:"history-201"}]} as never,new AbortController().signal);
+  };
+  return { run, seen, phases, systems, traces, crmCalls, resumeIssues };
 }
 /** A complete, valid judgement; tests override only what they exercise. */
 const judgement = (data: Data, over: Answer = {}): Answer => ({
@@ -202,5 +206,58 @@ describe("identity", () => {
     expect(b.phases).toEqual(["understanding", "ticket_matching"]);
     expect(b.seen[1].decidedRequests).toHaveLength(1);
     expect(disposition(plan).target).toMatchObject({ operation: "link", ticketId: "501" });
+  });
+});
+
+
+describe("independent review counterexamples", () => {
+  it("does not act when the model reports indispensable missing history", async () => {
+    const b = bench({ tickets: [ticket("201")] });
+    const plan = await b.run(d => judgement(d, { missing: [{kind:"history",why:"Historique indispensable absent pour déterminer si ce ticket concerne la même panne."}], tickets: same(d,["201"]) }));
+    expect(plan.steps).toEqual([]);
+    expect(plan.decision.disposition.kind).toBe("collect_context");
+  });
+  it("does not promote a historical request into a new cancellation without identification continuation", async () => {
+    const prior = {id:initialMid,threadId:"20000000-0000-4000-8000-000000000001",fromEmail:"sender@example.test",toEmails:["support@example.test"],currentText:"Je souhaite résilier.",contentComplete:true,direction:"inbound" as const,receivedAt:days(1)};
+    const b = bench({text:"Merci, bonne journée.",conversation:[prior]});
+    const plan = await b.run(d => judgement(d, {requests:[{id:"r1",kind:"cancellation",summary:"Ancienne demande de résiliation.",sourceIds:[`message-${initialMid}`]}]}));
+    expect(plan.steps).toEqual([]);
+    expect(plan.decision.classification).not.toBe("cancellation");
+  });
+});
+
+it("independent: read continuation passes the already accepted requests to a fresh reader", async () => {
+  const b=bench();
+  await b.resumeIssues();
+  expect(b.seen[0].decidedRequests).toMatchObject([{id:"r1",kind:"support"}]);
+});
+
+describe("indispensable evidence and request anchoring (review P1)", () => {
+  it.each(["image", "history", "contact", "other"] as const)("a missing indispensable %s never produces a write; the cause is kept for the team", async kind => {
+    const b = bench({ tickets: [ticket("201")] });
+    const plan = await b.run(d => judgement(d, { missing: [{ kind, why: `Élément ${kind} indispensable absent.` }], tickets: same(d, ["201"]) }));
+    expect(plan.steps).toEqual([]);
+    expect(plan.decision.disposition.kind).toBe("collect_context");
+  });
+  it("without any candidate ticket, a missing indispensable element never creates a ticket", async () => {
+    const b = bench();
+    const plan = await b.run(d => judgement(d, { missing: [{ kind: "image", why: "La capture citée est illisible." }] }));
+    expect(plan.steps).toEqual([]);
+    expect(plan.newTicket).toBeUndefined();
+  });
+  it("nothing reported missing: the same dossier proceeds (accessory elements never block)", async () => {
+    const b = bench({ tickets: [ticket("201")] });
+    expect(disposition(await b.run(d => judgement(d, { missing: [], tickets: same(d, ["201"]) }))).target).toMatchObject({ operation: "link", ticketId: "201" });
+  });
+  it("during an identification continuation, a request anchored on another old message is still refused", async () => {
+    const initial = { id: initialMid, threadId: "20000000-0000-4000-8000-000000000001", fromEmail: "sender@example.test", toEmails: ["support@example.test"],
+      currentText: "Mon agenda ne se synchronise plus.", contentComplete: true, direction: "inbound" as const, receivedAt: days(2) };
+    const other = { ...initial, id: "10000000-0000-4000-8000-000000000008", currentText: "Je souhaite résilier.", receivedAt: days(3) };
+    const b = bench({ text: "Mon compte est sender@example.test", conversation: [other, initial], continuation: { initialMessageId: initialMid, confirmedEffectId: "effect-1" } });
+    const plan = await b.run(d => judgement(d, { requests: [{ id: "r1", kind: "cancellation", summary: "Résiliation.", sourceIds: [`message-${other.id}`] }],
+      registration: { address: "sender@example.test", quote: "Mon compte est sender@example.test" } }));
+    expect(plan.steps).toEqual([]);
+    expect(plan.decision.classification).not.toBe("cancellation");
+    expect(b.traces.some(t => t.validationFailure?.reason === "wrong_anchor_source")).toBe(true);
   });
 });
