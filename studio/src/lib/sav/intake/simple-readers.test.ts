@@ -261,3 +261,31 @@ describe("indispensable evidence and request anchoring (review P1)", () => {
     expect(b.traces.some(t => t.validationFailure?.reason === "wrong_anchor_source")).toBe(true);
   });
 });
+
+describe("non-regression of the existing routes (lot 3)", () => {
+  it.each([["partnership", "supervised_partnership"], ["commercial", "supervised_commercial"], ["investor", "supervised_investor"]] as const)(
+    "%s requests stay supervised, never a ticket", async (kind, action) => {
+      const b = bench({ text: "Nous souhaitons discuter d'une collaboration." });
+      const plan = await b.run(d => judgement(d, { requests: [{ id: "r1", kind, summary: "Demande hors support.", sourceIds: ["current"] }] }));
+      expect(plan.decision.disposition).toMatchObject({ kind: "no_ticket" });
+      expect(plan.progress).toMatchObject({ kind: "supervised_action", action });
+      expect(plan.steps).toEqual([]);
+    });
+  it("a pure acknowledgement creates nothing", async () => {
+    const b = bench({ text: "Merci beaucoup, tout fonctionne maintenant.", subject: "Re: Merci" });
+    const plan = await b.run(d => judgement(d, { requests: [{ id: "r1", kind: "acknowledgement", summary: "Remerciement.", sourceIds: ["current"] }] }));
+    expect(plan.decision.disposition).toMatchObject({ kind: "no_ticket" });
+    expect(plan.steps).toEqual([]);
+  });
+  it("Other with requests is never hidden without the qualified rule", async () => {
+    const b = bench({ text: "Information générale." });
+    const plan = await b.run(d => judgement(d, { requests: [{ id: "r1", kind: "other", summary: "Information.", sourceIds: ["current"] }] }));
+    expect(plan.decision.disposition).toMatchObject({ kind: "collect_context", reasons: expect.arrayContaining(["private_resource_unavailable"]) });
+  });
+  it("a mixed support and finance message keeps both requests in one ticket decision", async () => {
+    const b = bench({ text: "Ma synchronisation échoue et je veux aussi ma facture." });
+    const plan = await b.run(d => judgement(d, { requests: [{ id: "r1", kind: "support", summary: "Synchronisation.", sourceIds: ["current"] }, { id: "r2", kind: "finance", summary: "Facture.", sourceIds: ["current"] }] }));
+    expect(plan.decision.classification).toBe("finance");
+    expect(plan.newTicket?.requestIds).toEqual(["r1", "r2"]);
+  });
+});

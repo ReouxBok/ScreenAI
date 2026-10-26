@@ -175,3 +175,31 @@ describe("transient provider failures (lot 2)", () => {
     expect((await pendingSavIntakeRuns(next)).map(r => r.id)).toContain(version);
   });
 });
+
+describe("simple pipeline with dates and deployments (lot 3)", () => {
+  it("a provider date in the future is analysed normally on the simple pipeline", async () => {
+    const environment = env(mailboxId, "simple"), config = savIntakeRuntimeConfig(environment)!;
+    const [m] = await f.db.insert(savMessages).values({ mailboxId, threadId, direction: "inbound", fromEmail: "client@example.invalid", toEmails: ["support@example.invalid"],
+      subject: "Synchronisation agenda", gmailMessageId: randomUUID(), bodyCiphertext: encryptSavPayload({ text: "Bonjour, la synchronisation de mon agenda échoue avec une erreur 500.", attachments: [], headers: {} }),
+      receivedAt: new Date(Date.now() + 21 * 3600_000), createdAt: new Date(), analysisStatus: "pending" }).returning();
+    const id = (await enqueueSavIntakeMessage(m.id, config))!, p = provider(m.id);
+    await analyseSavIntakeRuntime(id, config, { env: () => environment, network: p.network });
+    const current = await readSavIntakeCurrent(threadId, config);
+    expect(current?.payload.reason).not.toBe("SAV_INTAKE_INPUT_INVALID");
+    expect(current?.payload.plan?.decision.classification).toBe("support");
+  });
+  it("after a deployment the new version keeps the simple pipeline; an unchanged dossier reuses its settled judgement at no cost", async () => {
+    const base = env(mailboxId, "simple"), config = savIntakeRuntimeConfig(base)!;
+    const m = await stored(), id = (await enqueueSavIntakeMessage(m.id, config))!, p = provider(m.id);
+    await analyseSavIntakeRuntime(id, config, { env: () => base, network: p.network });
+    const deployed = { ...base, SAV_CODE_REVISION: "b".repeat(40), SAV_INTAKE_RUNTIME_CONFIG: JSON.stringify({ ...JSON.parse(base.SAV_INTAKE_RUNTIME_CONFIG), codeRevision: "b".repeat(40) }) };
+    const next = savIntakeRuntimeConfig(deployed)!, version = (await enqueueSavIntakeMessage(m.id, next))!;
+    expect(version).not.toBe(id);
+    expect((await payloadOf(version)).pipeline).toBe("simple");
+    await analyseSavIntakeRuntime(version, next, { env: () => deployed, network: p.network });
+    // Same sources, same request body: the ledger serves the settled result; no new dispatch, no budget consumed.
+    expect(p.revisions).toEqual([SAV_INTAKE_SIMPLE_REVISION]);
+    expect(await f.db.select().from(savIntakeModelCalls)).toHaveLength(1);
+    expect((await readSavIntakeCurrent(threadId, next))?.payload.plan?.decision.classification).toBe("support");
+  });
+});
