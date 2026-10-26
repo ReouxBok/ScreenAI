@@ -119,5 +119,26 @@ it("counts every version for the budget even when the displayed list is truncate
   await run(24,0,true);
   const result=(await readIntakeRunDiagnostics(threadId))!;
   expect(result.versionsTruncated).toBe(true);
+  // One unreadable attempt plus two failed ones cannot reach the failed cap of 4: verdict stays decidable.
   expect(result.attemptBudget).toMatchObject({failed:2,unknown:1,total:3,exhausted:null});
+  expect(result.attemptsExhausted).toBe(false);
+});
+
+it("beyond the row bound the exact total still decides: 202 versions reaching the lifetime cap are exhausted (review P2)",async()=>{
+  for(let v=1;v<=201;v++) await run(v,v<=4?2:0,false,{plan:{synthetic:true}});
+  const current=await run(202,0,true);
+  const result=(await readIntakeRunDiagnostics(threadId))!;
+  expect(result.totalAttempts).toBe(8);
+  expect(result.attemptBudget).toMatchObject({runAttempts:0,failed:0,unknown:0,total:8,exhausted:"total_per_message"});
+  expect(result.attemptsExhausted).toBe(true);
+  expect(result.runs[0].runId).toBe(current.id);
+});
+it("attempts the bounded reader cannot classify never turn into attempts remaining",async()=>{
+  await run(1,2,false,{reason:"SAV_INTAKE_MODEL_CONTEXT_LIMIT"});
+  await run(2,2,false,{});
+  await fixture.db.update(savIntakeRuns).set({payloadCiphertext:"not-a-valid-ciphertext"}).where(eq(savIntakeRuns.version,2));
+  await run(3,0,true);
+  const result=(await readIntakeRunDiagnostics(threadId))!;
+  expect(result.attemptBudget).toMatchObject({failed:2,unknown:2,total:4,exhausted:"undetermined"});
+  expect(result.attemptsExhausted).toBeNull();
 });

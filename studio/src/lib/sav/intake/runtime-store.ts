@@ -10,7 +10,7 @@ import { intakeLaunchMatches } from "./launch-boundary";
 import { intakeConsoleInstalled } from "./console-capability";
 import { intakeRunConfigurationBound, intakeHumanRefused, intakeHasHumanDecision, intakeRunCandidateContactIds } from "./human-binding";
 import { randomUUID } from "node:crypto";
-import { and, desc, eq, gt, inArray, lt, lte, or, sql } from "drizzle-orm";
+import { and, desc, eq, gt, inArray, lt, or, sql } from "drizzle-orm";
 import { requireDb } from "@/db";
 import { savMessages, savThreads, savIntakeRuns, savIntakeJournal, savIntakeModelCalls, savIntakeHumanEvents, savIntakeIdentityEpisodes, savIntakeEffects, savIntakeExecutions } from "@/db/schema";
 import { decryptSavPayload, encryptSavPayload, savContentHash } from "../crypto";
@@ -21,7 +21,7 @@ import { savDerivedCostQuote } from "../derived-budget";
 import type { SavGeminiMetadata } from "../gemini-response";
 import { intakeRuntimeHash, SAV_INTAKE_RUNTIME_REVISION, type IntakeRuntimeConfig, type IntakeRuntimePayload } from "./runtime-contract";
 import type { EngineInput } from "./engine-types";
-import { savEffectiveReceivedAt, savEffectiveReceivedAtOfRow } from "@/lib/sav/message-order";
+import { savEffectiveReceivedAt, savNotAfterAnchor, savEffectiveReceivedAtOfRow } from "@/lib/sav/message-order";
 
 type Tx = Parameters<Parameters<ReturnType<typeof requireDb>["transaction"]>[0]>[0];
 type Run = typeof savIntakeRuns.$inferSelect;
@@ -70,7 +70,7 @@ export function intakeRecordedSourceHash(snapshot: { sourceHash: string; legacyS
   return intakeSourceMatches(snapshot, recorded) ? recorded! : snapshot.sourceHash;
 }
 export async function savIntakeSourceSnapshot(tx: Pick<Tx, "select">, message: typeof savMessages.$inferSelect, now: Date) {
-  const rows = await tx.select().from(savMessages).where(and(eq(savMessages.threadId, message.threadId), lte(savMessages.receivedAt, message.receivedAt)))
+  const rows = await tx.select().from(savMessages).where(and(eq(savMessages.threadId, message.threadId), savNotAfterAnchor(message.id)))
     .orderBy(desc(savEffectiveReceivedAt), desc(savMessages.createdAt), desc(savMessages.id)).limit(51);
   const prepared = rows.slice(0, 50).map(row => {
     const body = decryptSavPayload<Body>(row.bodyCiphertext);

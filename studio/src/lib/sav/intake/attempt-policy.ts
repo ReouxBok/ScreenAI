@@ -29,7 +29,7 @@ export function intakeRunAnalysed(ciphertext: string | null): boolean | null {
   try { return Boolean(decryptSavPayload<{ plan?: unknown }>(ciphertext).plan); } catch { return null; }
 }
 export function intakeAttemptBudget(runId: string, siblings: IntakeAttemptRow[]): IntakeAttemptBudget {
-  const run = siblings.find(s => s.id === runId), P = SAV_INTAKE_ATTEMPT_POLICY;
+  const run = siblings.find(s => s.id === runId);
   const runAttempts = run?.attempts ?? 0, total = siblings.reduce((sum, s) => sum + s.attempts, 0);
   let failed = 0, unknown = 0;
   for (const s of siblings) {
@@ -37,8 +37,11 @@ export function intakeAttemptBudget(runId: string, siblings: IntakeAttemptRow[])
     const analysed = intakeRunAnalysed(s.payloadCiphertext);
     if (analysed === false) failed += s.attempts; else if (analysed === null) unknown += s.attempts;
   }
-  // Unknown attempts still count in the lifetime total, which alone bounds relaunches.
-  const exhausted = runAttempts >= P.perVersion ? "per_version" : failed >= P.failedPerMessage ? "failed_per_message"
-    : total >= P.totalPerMessage ? "total_per_message" : false;
-  return { runAttempts, failed, unknown, total, exhausted };
+  return { runAttempts, failed, unknown, total, exhausted: intakeAttemptExhaustion({ runAttempts, failed, total }) };
+}
+/** Decided from known counts only. Unknown attempts still count in the lifetime total, which alone bounds relaunches. */
+export function intakeAttemptExhaustion(c: { runAttempts: number; failed: number; total: number }): IntakeAttemptBudget["exhausted"] {
+  const P = SAV_INTAKE_ATTEMPT_POLICY;
+  return c.runAttempts >= P.perVersion ? "per_version" : c.failed >= P.failedPerMessage ? "failed_per_message"
+    : c.total >= P.totalPerMessage ? "total_per_message" : false;
 }

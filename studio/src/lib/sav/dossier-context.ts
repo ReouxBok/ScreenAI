@@ -1,5 +1,5 @@
 import "server-only";
-import { and, desc, eq, lte, ne } from "drizzle-orm";
+import { and, desc, eq, ne } from "drizzle-orm";
 import { requireDb } from "@/db";
 import { savMessages, savThreads } from "@/db/schema";
 import { decryptSavPayload, encryptSavPayload } from "./crypto";
@@ -10,7 +10,7 @@ import { resolveSavCustomerMessage, resolveSavCustomerIdentity } from "./forward
 import { splitSavMessageText } from "./message-context";
 import { getSavRelatedThreads } from "./thread-context";
 import { applySavHumanTicketRouting, savEffectiveCustomerEmail, savHumanTicketAction } from "./human-process";
-import { savEffectiveReceivedAt } from "@/lib/sav/message-order";
+import { savEffectiveReceivedAt, savNotAfterAnchor } from "@/lib/sav/message-order";
 
 export type SavDossierContext = {
   version: 1; messageId: string; collectedAt: string;
@@ -37,7 +37,7 @@ async function otherConversations(message: typeof savMessages.$inferSelect, cust
     .from(savMessages).innerJoin(savThreads, eq(savThreads.id, savMessages.threadId)).where(and(
       eq(savMessages.mailboxId, message.mailboxId), ne(savMessages.threadId, message.threadId),
       eq(savMessages.direction, "inbound"), eq(savMessages.fromEmail, customerEmail),
-      lte(savMessages.receivedAt, message.receivedAt),
+      savNotAfterAnchor(message.id),
     )).orderBy(desc(savEffectiveReceivedAt)).limit(40);
   const candidates: SavDossierContext["otherConversations"] = [];
   for (const row of rows) {
@@ -49,7 +49,7 @@ async function otherConversations(message: typeof savMessages.$inferSelect, cust
   }
   await Promise.all(candidates.map(async candidate => {
     const history = await db.select().from(savMessages).where(and(eq(savMessages.threadId, candidate.id),
-      eq(savMessages.mailboxId, message.mailboxId), lte(savMessages.receivedAt, message.receivedAt)))
+      eq(savMessages.mailboxId, message.mailboxId), savNotAfterAnchor(message.id)))
       .orderBy(desc(savEffectiveReceivedAt)).limit(6);
     // Do not expose another participant's messages as this customer's history.
     candidate.messages = history.filter((row) => row.direction === "inbound" ? row.fromEmail.toLowerCase() === customerEmail.toLowerCase()

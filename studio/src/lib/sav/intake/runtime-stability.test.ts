@@ -9,8 +9,9 @@ const state = vi.hoisted(() => ({ db: null as unknown }));
 vi.mock("@/db", () => ({ requireDb: () => { if (!state.db) throw Error("NO_DATABASE_ALLOWED"); return state.db; } }));
 import { encryptSavPayload, decryptSavPayload } from "../crypto";
 import { intakeRuntimeHash, savIntakeRuntimeConfig, type IntakeRuntimeConfig, type IntakeRuntimePayload } from "./runtime-contract";
-import { catchupSavIntake, claimSavIntakeRun, enqueueSavIntakeMessage, failSavIntakeRun, pendingSavIntakeRuns, readSavIntakeCurrent } from "./runtime-store";
+import { catchupSavIntake, savIntakeSourceSnapshot, claimSavIntakeRun, enqueueSavIntakeMessage, failSavIntakeRun, pendingSavIntakeRuns, readSavIntakeCurrent } from "./runtime-store";
 import { listIntakeConsole } from "./console-store";
+import { loadSavConversation } from "../conversation";
 import { analyseSavIntakeRuntime } from "./runtime";
 import { intakeAttemptBudget, SAV_INTAKE_ATTEMPT_POLICY } from "./attempt-policy";
 
@@ -40,9 +41,10 @@ async function observe(runId: string) {
 const markers = async (runId: string) => (await f.db.select().from(savIntakeJournal).where(eq(savIntakeJournal.runId, runId))).map(j => j.kind);
 function provider(messageId: string) {
   let model = 0;
+  const sent: string[] = [];
   const network = vi.fn(async (url: Parameters<typeof fetch>[0], init?: RequestInit) => {
     if (String(url).startsWith("https://generativelanguage.googleapis.com/")) {
-      model++;
+      model++; sent.push(String(init?.body));
       const data = JSON.parse(JSON.parse(String(init?.body)).contents[0].parts[0].text);
       const quoteId = data.citationCatalogue.find((x: { sourceId: string }) => x.sourceId === "current").id;
       const answer = { messageId, requests: [{ id: "r1", kind: "support", currentMessageId: messageId, quoteId }],
@@ -52,7 +54,7 @@ function provider(messageId: string) {
     if (String(url).startsWith("https://api.hubapi.com/")) return Response.json({ total: 0, results: [] });
     throw Error("EXTERNAL_NETWORK_FORBIDDEN");
   });
-  return { network, calls: () => model };
+  return { network, calls: () => model, sent };
 }
 
 beforeAll(async () => { f = await createSavTestDb(); state.db = f.db; }, 30_000);
@@ -149,6 +151,13 @@ describe("an older message stored with a future provider date (review P1)", () =
     expect(current?.messageId).toBe(reply.id);
     expect(current?.payload.plan?.decision.classification).toBe("support");
     expect(p.calls()).toBe(1);
+    // The whole thread reaches the model: the earlier message keeps its subject and facts.
+    expect(p.sent.some(body => body.includes("Premier message, daté dans le futur"))).toBe(true);
+    const snapshot = await savIntakeSourceSnapshot(f.db as never, reply, new Date());
+    expect(JSON.stringify(snapshot)).toContain(old.id);
+    // Seen from the old message, the newer reply is not part of its history.
+    expect(JSON.stringify(await savIntakeSourceSnapshot(f.db as never, old, new Date()))).not.toContain(reply.id);
+    expect((await loadSavConversation(reply.id)).messages.map(m => m.id)).toEqual(expect.arrayContaining([old.id, reply.id]));
     const console = await listIntakeConsole({ search: "Synchronisation" });
     if (console.installed) expect(console.rows.map(r => r.messageId)).toEqual([reply.id]);
     // The raw provider date is never rewritten.
