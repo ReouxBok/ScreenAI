@@ -16,7 +16,7 @@ import { sql } from "drizzle-orm";
 import { analyseSavIntakeRuntime } from "./runtime";
 import { SAV_INTAKE_MODEL_REVISION } from "./model-readers";
 import { SAV_INTAKE_SIMPLE_REVISION } from "./simple-readers";
-import { SAV_INTAKE_CALL_POLICY } from "./attempt-policy";
+import { SAV_INTAKE_CALL_POLICY, SAV_INTAKE_TRANSIENT_RETRY } from "./attempt-policy";
 
 const KEY = "synthetic-intake-runtime-encryption-key";
 let f: Awaited<ReturnType<typeof createSavTestDb>>, mailboxId: string, threadId: string;
@@ -145,10 +145,12 @@ describe("transient provider failures (lot 2)", () => {
     const m = await stored(), id = (await enqueueSavIntakeMessage(m.id, config))!, p = provider(m.id, [503, 503, 503, 503, 503, 503]);
     for (let n = 0; n < 5; n++) { await analyseSavIntakeRuntime(id, config, { env: () => environment, network: p.network }); await due(id); }
     const journal = await kinds(id);
-    // Three dispatches fit the per-message budget: two retries are announced, a third would be ineligible.
-    expect(journal.filter(k => k === "retry_scheduled")).toHaveLength(SAV_INTAKE_CALL_POLICY.perMessage - 1);
-    expect(journal).toContain("retry_ineligible");
-    expect(p.calls()).toBe(SAV_INTAKE_CALL_POLICY.perMessage);
+    // Retries are bounded by the smaller of the retry schedule and the remaining dispatch budget;
+    // no retry is ever announced beyond it.
+    const retries = Math.min(SAV_INTAKE_TRANSIENT_RETRY.delaysMinutes.length, SAV_INTAKE_CALL_POLICY.perVersion - 1, SAV_INTAKE_CALL_POLICY.perMessage - 1);
+    expect(journal.filter(k => k === "retry_scheduled")).toHaveLength(retries);
+    expect(journal.some(k => k === "retry_exhausted" || k === "retry_ineligible")).toBe(true);
+    expect(p.calls()).toBe(retries + 1);
     expect((await run(id)).attempts).toBeGreaterThan(0);
     expect((await f.db.select().from(savIntakeModelCalls)).every(r => r.state === "settled" && r.chargedNanoUsd === 0)).toBe(true);
   });

@@ -26,8 +26,10 @@ export function intakeTransientFailure(reason: string | undefined) {
   return typeof reason === "string" && (/^SAV_AI_HTTP_(?:429|5\d\d)$/.test(reason) || ["SAV_AI_TIMEOUT", "SAV_INTAKE_RUNTIME_PROVIDER_UNAVAILABLE"].includes(reason));
 }
 /** Model dispatches (new ledger rows; cache hits are free) allowed per run version and per
- * message for its whole life. Shared by preflight, reservation and the retry scheduler. */
-export const SAV_INTAKE_CALL_POLICY = Object.freeze({ perVersion: 3, perMessage: 3 });
+ * message for its whole life. Shared by preflight, reservation and the retry scheduler.
+ * Approved by Ugo on 26/10 (Codex recommendation): room for the nominal calls, one format
+ * repair and three transient retries; daily and rolling money caps are unchanged. */
+export const SAV_INTAKE_CALL_POLICY = Object.freeze({ perVersion: 6, perMessage: 9 });
 export type IntakeAttemptRow = { id: string; attempts: number; payloadCiphertext: string | null };
 export type IntakeAttemptBudget = { runAttempts: number; failed: number; unknown: number; total: number;
   exhausted: false | "per_version" | "failed_per_message" | "total_per_message" };

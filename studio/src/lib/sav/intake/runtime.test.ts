@@ -14,6 +14,7 @@ import { encryptSavPayload, decryptSavPayload } from "../crypto";
 import { intakeRuntimeHash, savIntakeRuntimeConfig, SAV_INTAKE_RUNTIME_REVISION, type IntakeRuntimeConfig, type IntakeRuntimePayload } from "./runtime-contract";
 import { assertSavIntakeCallPlan, assertSavIntakeLease, catchupSavIntake, claimSavIntakeRun, enqueueSavIntakeMessage, failSavIntakeRun, pendingSavIntakeRuns, readSavIntakeBudget, readSavIntakeCurrent, reconcileConfinedIntakeUsage, reserveSavIntakeCall, saveSavIntakeResult, settleSavIntakeCall } from "./runtime-store";
 import { analyseSavIntakeRuntime, enqueueConfiguredSavIntake, reconcileSavIntakeRuntime } from "./runtime";
+import { SAV_INTAKE_CALL_POLICY } from "./attempt-policy";
 
 let f: Awaited<ReturnType<typeof createSavTestDb>>, mailboxId: string, threadId: string, messageId: string;
 let config: IntakeRuntimeConfig, environment: Record<string, string | undefined>;
@@ -119,6 +120,11 @@ it("same model request is durably cached and does not reserve twice after a resu
   await settleSavIntakeCall(r.id, usage, { json: { synthetic: true }, metadata: usage });
   expect((await reserveSavIntakeCall(l, config, "a".repeat(64))).cached?.json).toEqual({ synthetic: true }); expect((await readSavIntakeBudget(config)).callCount).toBe(1);
 });
+/** Settled, cached ledger rows of this message, as if dispatched by earlier versions (run deleted). */
+async function priorCalls(count: number, prefix = "prior") {
+  if (count > 0) await f.db.insert(savIntakeModelCalls).values(Array.from({ length: count }, (_, i) => ({ messageKey: intakeRuntimeHash(messageId), requestHash: `${prefix}-${i}`,
+    state: "settled" as const, reservedNanoUsd: 817152000, chargedNanoUsd: 262500, payloadCiphertext: encryptSavPayload({ metadata: usage }), resultCiphertext: encryptSavPayload({ json: { cached: true }, metadata: usage }) })));
+}
 it("preflights complete grouped requests read-only, allowing valid cache and rejecting an over-cap plan", async () => {
   const l = await lease(), first = await reserveSavIntakeCall(l, config, "a".repeat(64));
   await settleSavIntakeCall(first.id, usage, { json: { cached: true }, metadata: usage });
@@ -128,6 +134,7 @@ it("preflights complete grouped requests read-only, allowing valid cache and rej
   await expect(assertSavIntakeCallPlan(messageId, config, ["a".repeat(64), "b".repeat(64), "c".repeat(64), "d".repeat(64)])).rejects.toThrow("DISPATCH_REJECTED");
   const second = await reserveSavIntakeCall(l, config, "b".repeat(64)); await settleSavIntakeCall(second.id, usage, { json: { cached: true }, metadata: usage });
   const third = await reserveSavIntakeCall(l, config, "c".repeat(64)); await settleSavIntakeCall(third.id, usage, { json: { cached: true }, metadata: usage });
+  await priorCalls(SAV_INTAKE_CALL_POLICY.perMessage - 3);
   const snapshot = await f.db.select().from(savIntakeModelCalls);
   await expect(assertSavIntakeCallPlan(messageId, config, ["a".repeat(64), "b".repeat(64), "c".repeat(64)])).resolves.toBeUndefined();
   await expect(assertSavIntakeCallPlan(messageId, config, ["d".repeat(64)])).rejects.toThrow("BUDGET_EXHAUSTED");
@@ -142,6 +149,7 @@ it("preflights complete grouped requests read-only, allowing valid cache and ref
   await expect(assertSavIntakeCallPlan(messageId, config, ["a".repeat(64), "b".repeat(64), "c".repeat(64), "d".repeat(64)])).rejects.toThrow("DISPATCH_REJECTED");
   const second = await reserveSavIntakeCall(l, config, "b".repeat(64)); await settleSavIntakeCall(second.id, usage, { json: { cached: true }, metadata: usage });
   const third = await reserveSavIntakeCall(l, config, "c".repeat(64)); await settleSavIntakeCall(third.id, usage, { json: { cached: true }, metadata: usage });
+  await priorCalls(SAV_INTAKE_CALL_POLICY.perMessage - 3);
   const snapshot = await f.db.select().from(savIntakeModelCalls);
   await expect(assertSavIntakeCallPlan(messageId, config, ["a".repeat(64), "b".repeat(64), "c".repeat(64)])).resolves.toBeUndefined();
   await expect(assertSavIntakeCallPlan(messageId, config, ["d".repeat(64)])).rejects.toThrow("BUDGET_EXHAUSTED");
@@ -154,13 +162,16 @@ it("retains unknown usage, refuses refunds/replay and settles a late response wi
   expect(await settleSavIntakeCall(u.id, { ...usage, thoughtTokens: undefined })).toBe(false); expect(await settleSavIntakeCall(u.id, usage)).toBe(false);
   await expect(reserveSavIntakeCall(second, config, "c".repeat(64))).rejects.toThrow("USAGE_UNCERTAIN"); expect((await readSavIntakeBudget(config)).chargedNanoUsd).toBe(817_414_500);
 });
-it("global cap and three-per-message bound survive config changes and run deletion", async () => {
+it("per-version and lifetime per-message bounds survive config changes and run deletion", async () => {
   const l = await lease();
-  for (let n = 0; n < 3; n++) { const r = await reserveSavIntakeCall(l, config, String(n).repeat(64)); await settleSavIntakeCall(r.id, usage, { json: { syntheticPrivate: true }, metadata: usage }); }
+  for (let n = 0; n < SAV_INTAKE_CALL_POLICY.perVersion; n++) { const r = await reserveSavIntakeCall(l, config, String(n % 10).repeat(63) + "a"); await settleSavIntakeCall(r.id, usage, { json: { syntheticPrivate: true }, metadata: usage }); }
+  // The version bound stops this run.
   await expect(reserveSavIntakeCall(l, config, "f".repeat(64))).rejects.toThrow("BUDGET_EXHAUSTED");
   await f.db.delete(savIntakeRuns).where(eq(savIntakeRuns.id, l.run.id));
-  expect((await readSavIntakeBudget(config)).callCount).toBe(3); expect((await f.db.select().from(savIntakeModelCalls)).every(r => r.runId === null && r.resultCiphertext === null)).toBe(true);
+  expect((await readSavIntakeBudget(config)).callCount).toBe(SAV_INTAKE_CALL_POLICY.perVersion); expect((await f.db.select().from(savIntakeModelCalls)).every(r => r.runId === null && r.resultCiphertext === null)).toBe(true);
+  // A new version only gets what remains of the lifetime bound, never a reset.
   const id = await enqueueSavIntakeMessage(messageId, config), next = (await claimSavIntakeRun(id!, config))!;
+  for (let n = 0; n < SAV_INTAKE_CALL_POLICY.perMessage - SAV_INTAKE_CALL_POLICY.perVersion; n++) { const r = await reserveSavIntakeCall(next, config, String(n).repeat(63) + "e"); await settleSavIntakeCall(r.id, usage, { json: { syntheticPrivate: true }, metadata: usage }); }
   await expect(reserveSavIntakeCall(next, config, "e".repeat(64))).rejects.toThrow("BUDGET_EXHAUSTED");
 });
 it("monetary exhaustion is explicit technical waiting and never uses other ledgers", async () => {
@@ -366,10 +377,10 @@ it("one provider timeout reserves its full cost beyond30days, blocks its message
   await expect(reserveSavIntakeCall(first,config,"retry-a")).rejects.toThrow("USAGE_UNCERTAIN");
   expect((await readSavIntakeBudget({...config,maxCalls:299}))).toHaveProperty("lifetimeCallCount",2);
 });
-it("operational profile still enforces three durable calls per message and rejects a future ledger timestamp",async()=>{
+it("operational profile still enforces the durable per-version call bound and rejects a future ledger timestamp",async()=>{
   operational();const l=await lease();
-  for(let n=0;n<3;n++) {const call=await reserveSavIntakeCall(l,config,`call-${n}`);expect(await settleSavIntakeCall(call.id,{inputTokens:100,outputTokens:50,thoughtTokens:0,totalTokens:150})).toBe(true);}
-  await expect(reserveSavIntakeCall(l,config,"fourth")).rejects.toThrow("BUDGET_EXHAUSTED");
+  for(let n=0;n<SAV_INTAKE_CALL_POLICY.perVersion;n++) {const call=await reserveSavIntakeCall(l,config,`call-${n}`);expect(await settleSavIntakeCall(call.id,{inputTokens:100,outputTokens:50,thoughtTokens:0,totalTokens:150})).toBe(true);}
+  await expect(reserveSavIntakeCall(l,config,"over-bound")).rejects.toThrow("BUDGET_EXHAUSTED");
   await f.db.update(savIntakeModelCalls).set({createdAt:new Date(Date.now()+60000)});
   await expect(readSavIntakeBudget(config)).rejects.toThrow("CLOCK_REJECTED");
 });
@@ -469,7 +480,7 @@ it.each(["pdf","image_limit","budget"]) ("finishes a non-dispatched image attemp
   });
   await f.db.update(savMessages).set({bodyCiphertext:encryptSavPayload({text:"My application fails with an error.",headers:{},attachments,attachmentInventory:{complete:true,limits:[]}})}).where(eq(savMessages.id,messageId));
   const id=(await enqueueSavIntakeMessage(messageId,config))!;
-  if(kind==="budget")await f.db.insert(savIntakeModelCalls).values(Array.from({length:3},(_,i)=>({runId:id,messageKey:intakeRuntimeHash(messageId),requestHash:`previous-${i}`,state:"settled",reservedNanoUsd:817152000,chargedNanoUsd:262500,payloadCiphertext:encryptSavPayload({metadata:usage})})));
+  if(kind==="budget")await f.db.insert(savIntakeModelCalls).values(Array.from({length:SAV_INTAKE_CALL_POLICY.perMessage},(_,i)=>({runId:id,messageKey:intakeRuntimeHash(messageId),requestHash:`previous-${i}`,state:"settled",reservedNanoUsd:817152000,chargedNanoUsd:262500,payloadCiphertext:encryptSavPayload({metadata:usage})})));
   const network=vi.fn(async()=>{throw Error("NETWORK_FORBIDDEN");});
   await analyseSavIntakeRuntime(id,config,{env:()=>environment,network,downloadAttachments:async()=>bytes});
   const current=(await readSavIntakeCurrent(threadId,config))!,read=current.payload.attachments!.read,display=savAttachmentDisplayRead(read)!;
@@ -750,6 +761,8 @@ it.each(["valid_repair", "invalid_repair", "invalid_box", "unknown_usage", "shor
 it("preflights the whole matching plan against durable per-message capacity without reserving",async()=>{
   const l=await lease();
   for(const key of ["a","b"]){const r=await reserveSavIntakeCall(l,config,key.repeat(64));await settleSavIntakeCall(r.id,usage,{json:{fixture:true},metadata:usage});}
+  // Earlier versions already used all but three of the message's lifetime dispatches.
+  await priorCalls(SAV_INTAKE_CALL_POLICY.perMessage-3);
   const before=await readSavIntakeBudget(config);
   await expect(assertSavIntakeCallPlan(messageId,config,["c".repeat(64),"d".repeat(64)])).rejects.toThrow("BUDGET_EXHAUSTED");
   await expect(assertSavIntakeCallPlan(messageId,config,["a".repeat(64),"c".repeat(64)])).resolves.toBeUndefined();
@@ -757,7 +770,7 @@ it("preflights the whole matching plan against durable per-message capacity with
   const r=await reserveSavIntakeCall(l,config,"c".repeat(64));await settleSavIntakeCall(r.id,usage,{json:{fixture:true},metadata:usage});
   await expect(assertSavIntakeCallPlan(messageId,config,["a".repeat(64),"b".repeat(64),"c".repeat(64)])).resolves.toBeUndefined();
   await expect(assertSavIntakeCallPlan(messageId,config,["d".repeat(64)])).rejects.toThrow("BUDGET_EXHAUSTED");
-  expect((await readSavIntakeBudget(config)).callCount).toBe(3);
+  expect((await readSavIntakeBudget(config)).callCount).toBe(SAV_INTAKE_CALL_POLICY.perMessage);
 });
 it("preflight never treats a consumed result or uncertain usage as a reusable cached comparison",async()=>{
   const l=await lease(),r=await reserveSavIntakeCall(l,config,"a".repeat(64));
