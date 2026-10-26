@@ -289,26 +289,3 @@ describe("non-regression of the existing routes (lot 3)", () => {
     expect(plan.newTicket?.requestIds).toEqual(["r1", "r2"]);
   });
 });
-
-describe("comparison CRM isolation (lot 4)", () => {
-  it("the comparison reuses the live snapshot; its own misses go elsewhere and never enter the live cache", async () => {
-    const liveCalls: string[] = [], otherCalls: string[] = [];
-    const reader = (log: string[]) => ({
-      findContactsByEmail: async (e: string) => { log.push(`lookup:${e}`); return read([{ id: "101", emails: [e] }]); },
-      directAssociations: async (id: string) => { log.push(`associations:${id}`); return read([]); },
-      getContact: async (id: string) => { log.push(`contact:${id}`); return read({ id, emails: ["x@example.test"] }); },
-      ticketsForContact: async (id: string) => { log.push(`tickets:${id}`); return read([]); },
-      ticketHistory: async (id: string) => { log.push(`history:${id}`); return read([]); },
-    });
-    const live = memoizeIntakeCrmReaders(reader(liveCalls));
-    await live.findContactsByEmail("sender@example.test", new AbortController().signal);
-    const beside = live.beside(reader(otherCalls));
-    await beside.findContactsByEmail("sender@example.test", new AbortController().signal);
-    await beside.directAssociations("101", new AbortController().signal);
-    expect(liveCalls).toEqual(["lookup:sender@example.test"]);
-    expect(otherCalls).toEqual(["associations:101"]);
-    // The live path later reads associations itself: the comparison's miss was never added to its cache.
-    await live.directAssociations("101", new AbortController().signal);
-    expect(liveCalls).toEqual(["lookup:sender@example.test", "associations:101"]);
-  });
-});

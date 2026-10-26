@@ -36,28 +36,22 @@ const historyText = (history: IntakeHistory) => history.map(e => `[${e.id} ${e.a
 const ids = (values: string[]) => values.length ? z.enum(values as [string, ...string[]]) : z.string().max(0);
 const SUPPORT_ONLY = /^(?:ça|ca|cela)\s+ne\s+(?:fonctionne|marche)\s+(?:pas|plus)[.!\s]*$/iu;
 
-/** One snapshot per run: the simple reader and the engine see the same CRM answers.
- * `beside(other)` gives a reader of the SAME cached answers whose misses go to `other` and are
- * kept apart: the comparison can never add reads, traces or checkpoints to the live run. */
-export function memoizeIntakeCrmReaders(crm: Crm): Crm & { beside(other: Crm): Crm } {
+/** One snapshot per run: the simple reader and the engine see the same CRM answers. */
+export function memoizeIntakeCrmReaders(crm: Crm): Crm {
   const cache = new Map<string, Promise<unknown>>();
-  const build = (source: Crm, store: Map<string, Promise<unknown>>, shared?: Map<string, Promise<unknown>>) => {
-    const memo = <A extends unknown[], R>(name: string, fn: (...args: A) => Promise<R>) => (...args: A): Promise<R> => {
-      const key = `${name}:${String(args[0])}`;
-      if (shared?.has(key)) return shared.get(key) as Promise<R>;
-      if (!store.has(key)) store.set(key, fn(...args).catch(error => { store.delete(key); throw error; }));
-      return store.get(key) as Promise<R>;
-    };
-    return { findContactsByEmail: memo("contacts", source.findContactsByEmail), directAssociations: memo("associations", source.directAssociations),
-      getContact: memo("contact", source.getContact), ticketsForContact: memo("tickets", source.ticketsForContact), ticketHistory: memo("history", source.ticketHistory) };
+  const memo = <A extends unknown[], R>(name: string, fn: (...args: A) => Promise<R>) => (...args: A): Promise<R> => {
+    const key = `${name}:${String(args[0])}`;
+    if (!cache.has(key)) cache.set(key, fn(...args).catch(error => { cache.delete(key); throw error; }));
+    return cache.get(key) as Promise<R>;
   };
-  return { ...build(crm, cache), beside: (other: Crm) => build(other, new Map(), cache) };
+  return { findContactsByEmail: memo("contacts", crm.findContactsByEmail), directAssociations: memo("associations", crm.directAssociations),
+    getContact: memo("contact", crm.getContact), ticketsForContact: memo("tickets", crm.ticketsForContact), ticketHistory: memo("history", crm.ticketHistory) };
 }
 
 /** Same CRM scope as the engine (contacts of the address, admitted direct links,
  * their tickets and histories), read once. Partial reads leave the record out: the
  * engine's own identical (memoized) read then stops the dossier with its cause. */
-async function readContext(crm: Crm, address: string, policy: EnginePolicy, signal: AbortSignal): Promise<Context> {
+export async function readIntakeSimpleContext(crm: Crm, address: string, policy: EnginePolicy, signal: AbortSignal): Promise<Context> {
   const context: Context = { contacts: [], linked: [], tickets: [] };
   const lookup = await crm.findContactsByEmail(address, signal);
   if (lookup.status !== "complete") return context;
@@ -224,7 +218,7 @@ export function createSavIntakeSimpleReaders(options: {
 
   return {
     analyseMessage: async ({ message, conversation, identificationContinuation }, signal) => {
-      const context = await readContext(options.crm, message.fromEmail, options.policy, signal);
+      const context = await readIntakeSimpleContext(options.crm, message.fromEmail, options.policy, signal);
       const visual = options.attachments?.prepared;
       const output = await judge("understanding", message, conversation, context, signal,
         identificationContinuation ? { identificationContinuation, continuationInstructions: "The server verified that an identification template was sent for initialMessageId to this sender. If the CURRENT message provides the requested registration email, keep the original unresolved requests (cite message-<initialMessageId>) and return registration." } : {}, visual,

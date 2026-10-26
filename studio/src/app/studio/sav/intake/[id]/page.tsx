@@ -66,7 +66,7 @@ export default async function IntakeDetailPage({ params, searchParams }: { param
           : disposition?.kind === "no_ticket" && disposition.nextAction === "supervised_commercial" ? "Prendre en charge cette demande commerciale" : "Quelle suite l’équipe doit-elle donner à cette demande ?" : null;
   const judgement = (current?.payload.traces as { phase?: string }[] | undefined)?.findLast(t => t?.phase === "simple_judgement") as Parameters<typeof intakeHandoff>[0]["judgement"];
   const assessed = (current?.payload.semantics?.records.find(r => r.method === "assessIssues")?.result as { tickets?: { ticketId: string; relation: string }[] } | undefined)?.tickets;
-  const handoffReasons = [...(disposition?.kind === "collect_context" ? disposition.reasons : []), ...(current?.payload.reason === "SAV_INTAKE_RUNTIME_BUDGET_EXHAUSTED" ? [current.payload.reason] : [])];
+  const handoffReasons = [...(disposition?.kind === "collect_context" ? disposition.reasons : []), ...(current?.payload.reason === "SAV_INTAKE_RUNTIME_BUDGET_EXHAUSTED" || current?.payload.reason === "SAV_INTAKE_RUNTIME_DAILY_BUDGET_DEFERRED" ? [current.payload.reason] : [])];
   const handoff = !data.handledExternally && !data.confirmedCurrent && (blocked || handoffReasons.length > 0 || question)
     ? intakeHandoff({ reasons: handoffReasons, blockedCause: blocked ? "attempts_exhausted" : null, assessments: assessed, judgement }) : null;
   return <div className={styles.console}>

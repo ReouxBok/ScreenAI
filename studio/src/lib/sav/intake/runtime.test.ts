@@ -390,7 +390,8 @@ it("daily quota deferral consumes no attempt and a fresh UTC day can claim the s
   await f.db.insert(savIntakeModelCalls).values(Array.from({length:300},(_,i)=>({messageKey:intakeRuntimeHash(`prior-${i}`),requestHash:intakeRuntimeHash(`request-${i}`),state:"settled",reservedNanoUsd:817152000,chargedNanoUsd:262500,payloadCiphertext:encryptSavPayload({metadata:{inputTokens:100,outputTokens:50,thoughtTokens:0,totalTokens:150}}),createdAt:new Date()})));
   expect(await claimSavIntakeRun(id,config)).toBeNull();expect(await claimSavIntakeRun(id,config)).toBeNull();
   expect((await readSavIntakeCurrent(threadId,config))?.attempts).toBe(0);
-  expect((await readSavIntakeCurrent(threadId,config))?.payload.reason).toBe("SAV_INTAKE_RUNTIME_BUDGET_EXHAUSTED");
+  // The shared daily margin is a deferral with its own reason, never this dossier's call budget.
+  expect((await readSavIntakeCurrent(threadId,config))?.payload.reason).toBe("SAV_INTAKE_RUNTIME_DAILY_BUDGET_DEFERRED");
   vi.useFakeTimers({toFake:["Date"]});vi.setSystemTime(new Date(Date.parse(new Date().toISOString().slice(0,10)+"T00:00:00Z")+86400000));
   try {expect((await claimSavIntakeRun(id,config))?.run.attempts).toBe(1);}finally{vi.useRealTimers();}
 });

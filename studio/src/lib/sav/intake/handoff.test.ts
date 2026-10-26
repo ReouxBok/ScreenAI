@@ -20,3 +20,9 @@ describe("team handoff", () => {
     expect(handoff.tickets).toEqual([{ ticketId: "301", relation: "même problème", why: undefined }]);
   });
 });
+
+it("the shared daily cap tells the team nothing is needed: automatic resume next day", () => {
+  const handoff = intakeHandoff({ reasons: ["SAV_INTAKE_RUNTIME_DAILY_BUDGET_DEFERRED"] });
+  expect(handoff.actions).toEqual([intakeExpectedActions.SAV_INTAKE_RUNTIME_DAILY_BUDGET_DEFERRED]);
+  expect(handoff.actions[0]).toContain("reprise automatique");
+});
