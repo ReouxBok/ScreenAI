@@ -216,7 +216,7 @@ it("pause, revocation, newer message and external handling are refused", async (
   await setup();
   const old = (await enqueueSavIntakeMessage(messageId, runtime))!;
   expect((await analyseSavIntakeWake(old, deps())).state).toBe("observed");
-  const newer = await storedMessage(threadId, { at: later(1000) });
+  const newer = await storedMessage(threadId, { at: later(1000), createdAt: later(1000) });
   expect((await executeSavIntakeWake(old, deps())).state).not.toBe("confirmed");
   await enqueueSavIntakeMessage(newer.id, runtime);
   expect(await requestSavIntakeWake(old, { env: environment, start: state.start })).toMatchObject({ reason: "no_durable_work" });
@@ -310,7 +310,9 @@ it.each(["pending", "observed", "admitted"] as const)("recovery skips more than 
         ...(kind === "lease" ? { leaseToken: randomUUID(), leaseUntil: later(600_000) } : {}) });
       if (kind === "external") await f.db.insert(auditLogs).values({ actorEmail: "ugo@limova.ai", action: SAV_EXTERNAL_COMPLETION, entityType: "sav_message", entityId: message.id,
         technicalMetadata: { version: 1, threadId: thread.id, batchId: randomUUID(), receivedBefore: later(60_000).toISOString(), reason: "processed_outside_studio" } });
-      if (kind === "stale") await storedMessage(thread.id, { at: later(1000) });
+      // A genuinely newer mail: received AND stored later. A provider date alone in the future is
+      // bounded by storage time (étape 1), which made this fixture tie with the older mail.
+      if (kind === "stale") await storedMessage(thread.id, { at: later(1000), createdAt: later(1000) });
       if (kind === "exhausted" || kind === "recent") await f.db.insert(auditLogs).values({ actorEmail: "system", action: "sav_intake_wake_requested", entityType: "sav_intake_wake", entityId: copy.id,
         technicalMetadata: { state: kind === "exhausted" ? "abandoned" : "running", dispatches: kind === "exhausted" ? SAV_INTAKE_WAKE_MAX_DISPATCHES : 1,
           lastDispatchedAt: kind === "exhausted" ? old.toISOString() : now.toISOString() } });
