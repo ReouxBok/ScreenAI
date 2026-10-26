@@ -5,6 +5,12 @@ import { createSavTestDb } from "../../../../test/sav-db";
 import { executionProvider } from "../../../../test/sav-intake-execution-provider";
 import { auditLogs, savMailboxes, savThreads, savMessages, staffUsers, savIntakeExecutions, savIntakeExecutionBudget, savIntakeModelCalls, savIntakeRuns, savSyncState } from "@/db/schema";
 const state = vi.hoisted(() => ({ db: null as unknown, user: null as unknown, start: vi.fn() }));
+// Scheduling is covered by hubspot-transport.test.ts; keep business scenarios
+// independent of real rate-limit waits without replacing readers or guards.
+vi.mock("../hubspot-transport", async importOriginal => {
+  const { virtualSavHubspotTransportModule } = await import("../../../../test/sav-virtual-hubspot-transport");
+  return virtualSavHubspotTransportModule(await importOriginal<typeof import("../hubspot-transport")>());
+});
 vi.mock("@/db", () => ({ requireDb: () => { if (!state.db) throw Error("NO_DB_ALLOWED"); return state.db; } }));
 vi.mock("@clerk/nextjs/server", () => ({ currentUser: async () => state.user }));
 vi.mock("workflow/api", () => ({ start: state.start }));
