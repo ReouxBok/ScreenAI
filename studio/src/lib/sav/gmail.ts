@@ -348,10 +348,14 @@ export function normalizeReferencesHeader(value: string, maxLength = 2_000) {
   return kept.join(" ");
 }
 
-export function parseGmailMessage(mailboxEmail: string, message: GmailMessage) {
+export function parseGmailMessage(mailboxEmail: string, message: GmailMessage, now = new Date()) {
   if (!message.id || !message.threadId) throw new Error("GMAIL_MESSAGE_INVALID");
-  const receivedAt = new Date(Number(message.internalDate));
-  if (!message.internalDate || !Number.isFinite(receivedAt.getTime())) throw new Error("GMAIL_MESSAGE_INVALID_INTERNAL_DATE");
+  const providerReceivedAt = new Date(Number(message.internalDate));
+  if (!message.internalDate || !Number.isFinite(providerReceivedAt.getTime())) throw new Error("GMAIL_MESSAGE_INVALID_INTERNAL_DATE");
+  // A provider date in the future (clock skew, imported mail) is bounded by the
+  // observation time for ordering, display and analysis; the raw value is kept.
+  const futureDate = providerReceivedAt.getTime() > now.getTime();
+  const receivedAt = futureDate ? new Date(now.getTime()) : providerReceivedAt;
   const headers = message.payload?.headers;
   const from = boundedHeader(headerValue(headers, "From"), 500);
   const intakeRecipients = String(process.env.GMAIL_INTAKE_RECIPIENTS || mailboxEmail).split(",");
@@ -379,6 +383,7 @@ export function parseGmailMessage(mailboxEmail: string, message: GmailMessage) {
       "in-reply-to": boundedHeader(headerValue(headers, "In-Reply-To"), 2_000, true),
       "delivered-to": boundedHeader(headerValue(headers, "Delivered-To"), 2_000),
       "x-original-to": boundedHeader(headerValue(headers, "X-Original-To"), 2_000),
+      ...(futureDate ? { "x-studio-gmail-internal-date": providerReceivedAt.toISOString() } : {}),
     },
     receivedAt,
   };

@@ -4,6 +4,9 @@ import { intakeEvidenceCatalogue } from "./model-evidence";
 import { createSavIntakeSemanticReaders, type IntakeGeminiCall } from "./model-readers";
 import { SAV_INTAKE_MODEL_LIMITS } from "./model-limits";
 import { savGeminiWireBody } from "../gemini-transport";
+// Boundary mechanics (grouping, compaction, exact traces) are exercised at the former
+// compact caps so fixtures stay small; production capacity: model-limits-capacity.test.ts.
+vi.mock("./model-limits", () => ({ SAV_INTAKE_MODEL_LIMITS: { dataBytes: 96 * 1024, wireTextBytes: 128 * 1024 } }));
 
 const repeated = Array.from({length:70},(_,i)=>`Fait ${i} é😀 : valeur vérifiée. `).join("").slice(0,1700);
 it("shares exact text without merging sources, envelope differences, notes or final new facts",()=>{

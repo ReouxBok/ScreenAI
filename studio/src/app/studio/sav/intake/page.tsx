@@ -4,7 +4,7 @@ import { formatParisDateTime } from "@/lib/paris-date";
 import { requireIntakeConsoleStaff } from "@/lib/sav/intake/console-auth";
 import { listIntakeConsole } from "@/lib/sav/intake/console-store";
 import { savIntakeViewLabels, savIntakeViewSchema } from "@/lib/sav/intake/contract";
-import { intakeStatusLabel, intakeReasonLabel } from "@/lib/sav/intake/console-presentation";
+import { intakeStatusLabel, intakeReasonLabel, intakeBlockedCauseLabel } from "@/lib/sav/intake/console-presentation";
 import styles from "./intake.module.css";
 import { intakeDossierHref } from "@/lib/sav/intake-ux/navigation";
 import { IntakeDossierLink, IntakeListPosition } from "./navigation";
@@ -27,16 +27,17 @@ export default async function IntakeConsolePage({ searchParams }: { searchParams
           <span>{label}</span><b>{data.counts[key] ?? 0}</b></Link>)}
       </nav>
       <div className={styles.controls}><Link className={styles.processing} href={href("processing")} aria-current={view === "processing" ? "page" : undefined}>
-        En cours et attentes techniques <b>{data.counts.processing ?? 0}</b></Link>
+        En cours et attentes techniques <b>{data.counts.processing ?? 0}</b>{(data.counts.blocked ?? 0) > 0 && <em className={styles.blockedCount}>{data.counts.blocked} bloqué{data.counts.blocked > 1 ? "s" : ""}</em>}</Link>
         <form method="get" className={styles.search}><input type="hidden" name="view" value={view}/>{mailbox.success && <input type="hidden" name="mailbox" value={mailbox.data}/>}
           <label className={styles.srOnly} htmlFor="intake-search">Rechercher un expéditeur ou un objet</label>
           <input id="intake-search" type="search" name="q" maxLength={120} defaultValue={query.q ?? ""} placeholder="Expéditeur ou objet"/>
           <label className={styles.srOnly} htmlFor="intake-sort">Trier les dossiers</label><select id="intake-sort" name="sort" defaultValue={query.sort==="oldest"?"oldest":"newest"}><option value="newest">Plus récents d’abord</option><option value="oldest">Plus anciens d’abord</option></select>
           <button type="submit" className="secondary">Rechercher</button></form></div>
+      {(data.counts.blocked ?? 0) > 0 && <p role="alert" className={styles.blockedAlert}>{data.counts.blocked} dossier{data.counts.blocked > 1 ? "s" : ""} bloqué{data.counts.blocked > 1 ? "s" : ""} — à traiter par l’équipe. Chaque ligne indique la cause ; ils restent comptés jusqu’à leur résolution.</p>}
       <section aria-label={view === "processing" ? "Traitements en cours" : savIntakeViewLabels[view]} className={styles.list}>
         {data.rows.length ? data.rows.map(row => <IntakeDossierLink key={row.threadId} id={row.threadId} origin={origin} href={intakeDossierHref(row.threadId, origin)} className={styles.row}>
           <div><strong>{row.subject || "Nouvelle demande"}</strong><span>{row.fromEmail ?? "Expéditeur en cours de préparation"}</span></div>
-          <div><span className={styles.status}>{intakeStatusLabel(row.status)}</span>{row.reason && <small>{intakeReasonLabel(row.reason)}</small>}</div>
+          <div>{row.blockedCause ? <span className={styles.blocked}>{intakeBlockedCauseLabel(row.blockedCause)}</span> : <span className={styles.status}>{intakeStatusLabel(row.status)}</span>}{row.reason && <small>{intakeReasonLabel(row.reason)}</small>}</div>
           <div><span>Version {row.version ?? "en attente"}</span><time dateTime={row.receivedAt?.toISOString()}>{row.receivedAt ? formatParisDateTime(row.receivedAt) : "Nouvelle entrée"}</time></div>
         </IntakeDossierLink>) : <div className={styles.empty}><h2>Aucun dossier dans cette vue</h2><p>{query.q ? "Aucun objet ou expéditeur ne correspond à la recherche." : "Les prochains dossiers apparaîtront ici selon leur avancement confirmé."}</p>{query.q && <Link href={href(view,1,"")}>Effacer la recherche</Link>}</div>}
       </section>

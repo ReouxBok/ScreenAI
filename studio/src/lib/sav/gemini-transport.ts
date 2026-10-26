@@ -18,9 +18,10 @@ export type SavAiTransportTrace = {
 };
 type Budget = { id: string; elapsedMs: number; reservedMs: number; calls: number; retries: number; reservedTokens: number; outputTokens: number; repairs: number; visualCalls: number };
 const budgets = new AsyncLocalStorage<Budget>();
-export const SAV_AI_BUDGET = { durationMs: 60_000, calls: 6, retries: 1, tokenAllowance: 262_144, outputTokens: 49_152, repairs: 1 } as const;
+export const SAV_AI_BUDGET = { durationMs: 60_000, calls: 6, retries: 1, tokenAllowance: 2_500_000, outputTokens: 49_152, repairs: 1 } as const;
 const ATTEMPT_MS = 18_000;
 const PHASE_MS = 37_000;
+const LARGE_TEXT_BYTES = 128 * 1024;
 const remainingTime = (budget: Budget) => SAV_AI_BUDGET.durationMs - budget.elapsedMs - budget.reservedMs;
 
 /** One correlation and shared allowances, including CRM matching. Provider attempts,
@@ -151,7 +152,8 @@ export async function requestSavGeminiJson(input: {
     budget.calls++; budget.reservedTokens += allowance; budget.outputTokens += output; attempts++;
     const controller = new AbortController();
     // Reserve time before awaiting so concurrent phases cannot spend it twice.
-    const attemptMs = Math.min(remaining, visual ? SAV_ATTACHMENT_LIMITS.readMs : ATTEMPT_MS), attemptStarted = Date.now();
+    // A large text has no room for a retry anyway: give its single attempt the whole phase.
+    const attemptMs = Math.min(remaining, visual ? SAV_ATTACHMENT_LIMITS.readMs : textBytes > LARGE_TEXT_BYTES ? PHASE_MS : ATTEMPT_MS), attemptStarted = Date.now();
     budget.reservedMs += attemptMs;
     const timer = setTimeout(() => controller.abort(), attemptMs);
     let code = "SAV_AI_GENERATION_FAILED", retryAfter = 0;

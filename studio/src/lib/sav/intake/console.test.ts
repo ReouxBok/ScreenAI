@@ -303,6 +303,30 @@ it("lists dossiers chronologically by latest email, newest first, regardless of 
   await db.db.insert(savMessages).values({threadId:threads[0].id,mailboxId,direction:"inbound",fromEmail:"chrono-0@example.invalid",toEmails:["support@example.invalid"],subject:"Chrono 0 reply",bodyCiphertext:encryptSavPayload({text:"Synthetic"}),receivedAt:day(25),analysisStatus:"intake_waiting"});
   expect((await listIntakeConsole({view:"processing",search:"Chrono"})).rows.map(row=>row.subject)).toEqual(["Chrono 0 reply","Chrono 2","Chrono 1"]);
 });
+it("a provider date in the future is displayed and sorted at its storage time, the raw date kept", async () => {
+  const threads=await db.db.insert(savThreads).values(["future","today"].map(name=>({mailboxId,gmailThreadId:`skew-${name}`,customerEmail:`${name}@example.invalid`}))).returning();
+  const stored=new Date(Date.now()-3600_000), raw=new Date(Date.now()+21*3600_000);
+  await db.db.insert(savMessages).values([{threadId:threads[0].id,mailboxId,direction:"inbound" as const,fromEmail:"skew-0@example.invalid",toEmails:["support@example.invalid"],subject:"Skew future",bodyCiphertext:encryptSavPayload({text:"Synthetic"}),receivedAt:raw,createdAt:stored,analysisStatus:"intake_waiting"},
+    {threadId:threads[1].id,mailboxId,direction:"inbound" as const,fromEmail:"skew-1@example.invalid",toEmails:["support@example.invalid"],subject:"Skew today",bodyCiphertext:encryptSavPayload({text:"Synthetic"}),receivedAt:new Date(),analysisStatus:"intake_waiting"}]);
+  const list=await listIntakeConsole({view:"processing",search:"Skew"});
+  expect(list.rows.map(row=>row.subject)).toEqual(["Skew today","Skew future"]);
+  expect(new Date(list.rows[1].receivedAt!).getTime()).toBe(stored.getTime());
+  expect((await db.db.select().from(savMessages).where(eq(savMessages.subject,"Skew future")))[0].receivedAt.getTime()).toBe(raw.getTime());
+});
+it("blocked dossiers stay in processing, are counted and carry their cause", async () => {
+  const old=new Date(Date.now()-1200000);
+  const dossier=async(name:string,marker?:string,updatedAt=new Date())=>{
+    const [t]=await db.db.insert(savThreads).values({mailboxId,gmailThreadId:`blocked-${name}`,customerEmail:`${name}@example.invalid`}).returning();
+    const [m]=await db.db.insert(savMessages).values({threadId:t.id,mailboxId,direction:"inbound",fromEmail:`${name}@example.invalid`,toEmails:["support@example.invalid"],subject:`Blocked ${name}`,bodyCiphertext:encryptSavPayload({text:"Synthetic"}),receivedAt:new Date(),analysisStatus:"intake_waiting"}).returning();
+    const [r]=await db.db.insert(savIntakeRuns).values({threadId:t.id,messageId:m.id,version:1,state:"waiting",attempts:0,configHash:"a".repeat(64),policyHash:"b".repeat(64),payloadCiphertext:encryptSavPayload({}),createdAt:updatedAt,updatedAt}).returning();
+    if(marker)await db.db.insert(savIntakeJournal).values({runId:r.id,kind:marker,payloadCiphertext:encryptSavPayload({})});
+  };
+  await dossier("exhausted","attempts_exhausted"); await dossier("input","deterministic_block"); await dossier("stale",undefined,old); await dossier("fresh");
+  const list=await listIntakeConsole({view:"processing",search:"Blocked"});
+  expect(list.total).toBe(4);
+  expect(list.counts.blocked).toBe(3);
+  expect(Object.fromEntries(list.rows.map(row=>[row.subject,row.blockedCause]))).toEqual({"Blocked exhausted":"attempts_exhausted","Blocked input":"input_invalid","Blocked stale":"technical_wait","Blocked fresh":null});
+});
 it("OFF consultation makes no provider calls; projection absent never queries 0040/41 tables", async () => {
   await observed(); await projectIntakeThread(threadId); p.calls.length=0;
   vi.stubEnv("SAV_INTAKE_RUNTIME_MODE","off");vi.stubEnv("SAV_INTAKE_EXECUTION_MODE","off");

@@ -1,4 +1,5 @@
 import "server-only";
+import { intakeAttemptBudget, SAV_INTAKE_ATTEMPT_POLICY, SAV_INTAKE_BLOCKING_JOURNAL_KINDS } from "./attempt-policy";
 import { and, desc, eq, inArray, sql } from "drizzle-orm";
 import { requireDb } from "@/db";
 import { savIntakeJournal, savIntakeRuns, savMessages } from "@/db/schema";
@@ -100,7 +101,10 @@ export async function readIntakeRunDiagnostics(threadId: string) {
     const events = ids.length ? await tx.select({ id: savIntakeJournal.id, runId: savIntakeJournal.runId, kind: savIntakeJournal.kind, createdAt: savIntakeJournal.createdAt,
       payloadCiphertext: sql<string>`case when octet_length(${savIntakeJournal.payloadCiphertext}) <= 262144 then ${savIntakeJournal.payloadCiphertext} else '' end` }).from(savIntakeJournal).where(inArray(savIntakeJournal.runId, ids))
       .orderBy(desc(savIntakeJournal.createdAt), desc(savIntakeJournal.id)).limit(121) : [];
-    return { messageId: message.id, totalAttempts: Number(total.attempts), attemptsExhausted: Number(total.attempts) >= 2,
+    const current = rows.find(r => r.isCurrent), budget = current ? intakeAttemptBudget(current.id, rows) : null;
+    const blocked = current ? events.some(e => e.runId === current.id && (SAV_INTAKE_BLOCKING_JOURNAL_KINDS as readonly string[]).includes(e.kind)) : false;
+    return { messageId: message.id, totalAttempts: Number(total.attempts), attemptsExhausted: Boolean(budget?.exhausted) || blocked,
+      attemptBudget: budget ? { runAttempts: budget.runAttempts, failed: budget.failed, total: budget.total, exhausted: budget.exhausted || null, policy: SAV_INTAKE_ATTEMPT_POLICY } : null,
       versionsTruncated: rows.length > 20, eventsTruncated: events.length > 120,
       runs: displayed.map(r => ({ runId: r.id, version: r.version, isCurrent: r.isCurrent, state: r.state,
         attempts: r.attempts, createdAt: r.createdAt, updatedAt: r.updatedAt, diagnostic: intakeDiagnosticPayload(r.payloadCiphertext),
