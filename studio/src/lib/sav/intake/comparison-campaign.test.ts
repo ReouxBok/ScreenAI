@@ -1,6 +1,7 @@
 /** Lot 4: the separate comparison campaign on a frozen list of stored dossiers, through the real
  * readers, engine, dispatcher and both ledgers. Never on the live path, no write, own budget. */
 import { createHash, randomUUID } from "node:crypto";
+import { readIntakeOtherRules } from "./other-routing";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { and, eq } from "drizzle-orm";
 import { createSavTestDb } from "../../../../test/sav-db";
@@ -128,13 +129,6 @@ describe("comparison campaign (lot 4)", () => {
   });
 });
 
-it("REVIEW a configured Other catalogue does not exclude an unrelated support request", async()=>{
- const m=await stored(),p=provider();
- const e:Record<string,string|undefined>={...env(mailboxId,[m.id]),SAV_INTAKE_OTHER_RULES_JSON:"[]"};
- await runSavIntakeComparisonBatch({env:()=>e,network:p.network});
- const report=await readSavIntakeComparisonReport(()=>e);
- expect(report.configured && report.rows[0].verdict).toBe("identical");
-});
 it("REVIEW an incomplete CRM capture is not counted as comparable judgement",async()=>{
  const m=await stored(),e=env(mailboxId,[m.id]),p=provider();
  const network:typeof fetch=async(url,init)=>String(url).startsWith("https://api.hubapi.com/")?new Response("{}",{status:503}):p.network(url,init);
@@ -180,4 +174,29 @@ it("a dossier an approved Other rule matches is not comparable here, never a jud
   expect(await runSavIntakeComparisonBatch({ env: () => e, network: p.network })).toMatchObject({ compared: [{ verdict: "non_comparable" }] });
   const report = await readSavIntakeComparisonReport(() => e);
   expect(report.configured && report.rows[0].detail).toMatchObject({ differences: ["qualified_other_candidate"] });
+});
+
+function reviewCatalogue(subject:string,text:string,box:string,expired=false){
+ const sha=(s:string)=>createHash("sha256").update(s).digest("hex");
+ const rules=[{id:"r1",family:"own_campaign_copy",mailboxId:box,subjectSha256:sha(subject),bodySha256:sha(text)}];
+ return {version:1,resource:{resourceId:"synthetic",revisionId:"1",sha256:sha(JSON.stringify(rules))},approvedBy:"synthetic-admin",approvedAt:new Date(Date.now()-10000).toISOString(),expiresAt:new Date(Date.now()+(expired?-1000:3600000)).toISOString(),rules};
+}
+it("REVIEW a valid nonmatching Other catalogue still allows the support comparison",async()=>{
+ const m=await stored(),p=provider();
+ const e={...env(mailboxId,[m.id]),SAV_INTAKE_OTHER_RULES_JSON:JSON.stringify(reviewCatalogue("different subject","different body",mailboxId))};
+ expect(readIntakeOtherRules(e.SAV_INTAKE_OTHER_RULES_JSON)).not.toBeNull();
+ await runSavIntakeComparisonBatch({env:()=>e,network:p.network});
+ const report=await readSavIntakeComparisonReport(()=>e);
+ expect(report.configured && report.rows[0].verdict).toBe("identical");
+});
+it.each(["malformed","expired"])("REVIEW an %s Other catalogue cannot silently yield a production-equivalent judgement",async(kind)=>{
+ const m=await stored(),p=provider();
+ const raw=kind==="malformed"?"[]":JSON.stringify(reviewCatalogue("Synchronisation agenda","Bonjour, la synchronisation de mon agenda échoue avec une erreur 500.",mailboxId,true));
+ expect(()=>readIntakeOtherRules(raw)).toThrow("SAV_INTAKE_OTHER_CONFIGURATION_REQUIRED");
+ const e={...env(mailboxId,[m.id]),SAV_INTAKE_OTHER_RULES_JSON:raw};
+ await runSavIntakeComparisonBatch({env:()=>e,network:p.network});
+ const report=await readSavIntakeComparisonReport(()=>e);
+ expect(["non_comparable","incomplete"]).toContain(report.configured && report.rows[0].verdict);
+ expect(report.configured && report.rows[0].detail).toMatchObject({ differences: ["SAV_INTAKE_OTHER_CONFIGURATION_REQUIRED"] });
+ expect(p.seen).toEqual([]);
 });

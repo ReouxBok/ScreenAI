@@ -166,8 +166,14 @@ async function compareOne(messageId: string, claimId: string, campaign: SavIntak
   if ((snapshot.body.attachments?.length ?? 0) > 0) coverage.push("attachments_not_loaded");
   // Only a dossier an approved Other rule could match depends on the Gmail-authenticated qualification
   // this runner does not perform; every other dossier is compared exactly as the live path would.
-  // An unreadable or expired catalogue approves no rule, so it cannot make a dossier depend on one.
-  const catalogue = (() => { try { return readIntakeOtherRules(env().SAV_INTAKE_OTHER_RULES_JSON); } catch { return null; } })();
+  // An unreadable or expired catalogue stops the live path before planning: no judgement here would be
+  // production-equivalent, so the cause is kept and no paid call is made.
+  let catalogue: ReturnType<typeof readIntakeOtherRules>;
+  try { catalogue = readIntakeOtherRules(env().SAV_INTAKE_OTHER_RULES_JSON); }
+  catch (error) {
+    const cause = [error instanceof Error && /^SAV_[A-Z0-9_]+$/.test(error.message) ? error.message : "SAV_INTAKE_OTHER_CONFIGURATION_REQUIRED"];
+    return { coverage: cause, snapshotHash: null, current: null, simple: null, ...compareIntakeSides(empty, empty, cause) };
+  }
   if (catalogue && qualifyRuntimeCandidate({ mailboxId: message.mailboxId, subject: message.subject, body: { text: snapshot.body.text ?? "" } }, catalogue)) coverage.push("qualified_other_candidate");
   const policy: EnginePolicy = runtime.policy;
   const crm = frozenCrm(createSavIntakeHubspotReaders({ network: async (url, init) => network(url, { ...init, redirect: "error",
