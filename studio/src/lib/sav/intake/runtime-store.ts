@@ -1,7 +1,7 @@
 import { readRecoveryDue, DEFAULT_INTAKE_READ_RECOVERY } from "./read-recovery";
 import { readIntakeOperatorInformation } from "./operator-information";
 import { writeReadRecoveryMarker,readRecoverySql,noReadRecoverySql } from "./read-recovery-store";
-import { intakeAttemptBudget, SAV_INTAKE_ATTEMPT_POLICY, SAV_INTAKE_BLOCKING_JOURNAL_KINDS, SAV_INTAKE_TRANSIENT_RETRY } from "./attempt-policy";
+import { intakeAttemptBudget, SAV_INTAKE_ATTEMPT_POLICY, SAV_INTAKE_BLOCKING_JOURNAL_KINDS, SAV_INTAKE_CALL_POLICY, SAV_INTAKE_TRANSIENT_RETRY } from "./attempt-policy";
 import { readSavExternalCompletion, listSavExternalCompletionMessageIds } from "../external-completion";
 import "server-only";
 import { reconcileIntakeZeroThoughtUsage } from "./model-usage";
@@ -28,7 +28,7 @@ type Run = typeof savIntakeRuns.$inferSelect;
 type Body = { text: string; headers?: Record<string, string>; attachments?: unknown[]; attachmentInventory?: unknown };
 export type IntakeLease = { run: Run; token: string; input: EngineInput; provenance: Map<string, ReturnType<typeof prepareSavIntakeMessage>["provenance"]>; body: Body; sourceHash: string; recoveringRead?: true };
 const fail = (): never => { throw Error("SAV_INTAKE_RUNTIME_CONTEXT_CHANGED"); };
-const budgetColumns={id:savIntakeModelCalls.id,messageKey:savIntakeModelCalls.messageKey,requestHash:savIntakeModelCalls.requestHash,state:savIntakeModelCalls.state,reservedNanoUsd:savIntakeModelCalls.reservedNanoUsd,chargedNanoUsd:savIntakeModelCalls.chargedNanoUsd,payloadCiphertext:savIntakeModelCalls.payloadCiphertext,createdAt:savIntakeModelCalls.createdAt};
+const budgetColumns={id:savIntakeModelCalls.id,messageKey:savIntakeModelCalls.messageKey,requestHash:savIntakeModelCalls.requestHash,state:savIntakeModelCalls.state,reservedNanoUsd:savIntakeModelCalls.reservedNanoUsd,chargedNanoUsd:savIntakeModelCalls.chargedNanoUsd,payloadCiphertext:savIntakeModelCalls.payloadCiphertext,createdAt:savIntakeModelCalls.createdAt,runId:savIntakeModelCalls.runId};
 function budgetRowsValid(rows: Pick<typeof savIntakeModelCalls.$inferSelect,"reservedNanoUsd"|"chargedNanoUsd"|"payloadCiphertext"|"state">[]) {
   for (const row of rows) {
     const data = decryptSavPayload<{ metadata?: SavGeminiMetadata; usageReconciliation?: string; providerStatus?: number }>(row.payloadCiphertext), m = data.metadata ?? {};
@@ -154,11 +154,14 @@ export async function enqueueSavIntakeMessage(messageId: string, config: IntakeR
       or(unclaimedMessage, sql`${savMessages.analysisStatus} like 'intake_%'`))).returning({ id: savMessages.id });
     if (!owned.length) return null;
     const [last] = await tx.select().from(savIntakeRuns).where(eq(savIntakeRuns.threadId, message.threadId)).orderBy(desc(savIntakeRuns.version)).limit(1);
+    // A pending automatic retry of this same message keeps its due time across versions.
+    const [due] = await tx.select({ leaseUntil: savIntakeRuns.leaseUntil }).from(savIntakeRuns).where(and(eq(savIntakeRuns.messageId, message.id), eq(savIntakeRuns.isCurrent, true),
+      eq(savIntakeRuns.state, "waiting"), isNull(savIntakeRuns.leaseToken), gt(savIntakeRuns.leaseUntil, new Date())));
     await tx.update(savIntakeRuns).set({ isCurrent: false, state: "superseded", leaseToken: null, leaseUntil: null, freshUntil: null, updatedAt: new Date() })
       .where(and(eq(savIntakeRuns.threadId, message.threadId), eq(savIntakeRuns.isCurrent, true)));
     if (last) await journal(tx, last.id, "superseded", { nextMessageId: message.id });
     const [run] = await tx.insert(savIntakeRuns).values({ threadId: message.threadId, messageId: message.id, version: (last?.version ?? 0) + 1,
-      configHash: config.configHash, policyHash: config.policyHash, payloadCiphertext: encryptSavPayload({ revision: SAV_INTAKE_RUNTIME_REVISION, effects: "not_connected",
+      configHash: config.configHash, policyHash: config.policyHash, ...(due?.leaseUntil ? { leaseUntil: due.leaseUntil } : {}), payloadCiphertext: encryptSavPayload({ revision: SAV_INTAKE_RUNTIME_REVISION, effects: "not_connected",
         ...(config.pipeline === "simple" ? { pipeline: "simple" } : {}) }) }).returning();
     await journal(tx, run.id, "queued", { messageId: message.id, version: run.version, configHash: config.configHash, pipeline: config.pipeline ?? "current" });
     return run.id;
@@ -357,7 +360,7 @@ export async function assertSavIntakeCallPlan(messageId: string, config: IntakeR
     }
     const needed = hashes.filter(h => !prior.some(row => row.requestHash === h)).length, now = new Date();
     const usage = intakeBudgetUsage(rows, config, now), quote = savDerivedCostQuote(config.model, 8192, now);
-    if (own.length + needed > 3 || needed > usage.remainingCalls || needed * quote.reservedNanoUsd > usage.remainingNanoUsd
+    if (own.length + needed > SAV_INTAKE_CALL_POLICY.perMessage || needed > usage.remainingCalls || needed * quote.reservedNanoUsd > usage.remainingNanoUsd
       || needed * quote.reservedNanoUsd > usage.remainingRollingNanoUsd) throw Error("SAV_INTAKE_RUNTIME_BUDGET_EXHAUSTED");
   });
 }
@@ -378,7 +381,8 @@ async function reserveIntakeCall(tx: Tx, run: Run, config: IntakeRuntimeConfig, 
     if(!Number.isFinite(now.getTime())||now>budgetNow)throw Error("SAV_INTAKE_RUNTIME_LEDGER_CLOCK_REJECTED");
     const price = savDerivedCostQuote(config.model, 8192, budgetNow);
     const usage = intakeBudgetUsage(rows,config,budgetNow);
-    if (usage.remainingCalls < 1 || rows.filter(row => row.messageKey === messageKey).length >= 3
+    if (usage.remainingCalls < 1 || rows.filter(row => row.messageKey === messageKey).length >= SAV_INTAKE_CALL_POLICY.perMessage
+      || rows.filter(row => row.runId === run.id).length >= SAV_INTAKE_CALL_POLICY.perVersion
       || price.reservedNanoUsd > usage.remainingNanoUsd || price.reservedNanoUsd > usage.remainingRollingNanoUsd) throw Error("SAV_INTAKE_RUNTIME_BUDGET_EXHAUSTED");
     const [row] = await tx.insert(savIntakeModelCalls).values({ runId: run.id, messageKey, requestHash, state: "dispatched", reservedNanoUsd: price.reservedNanoUsd,
       chargedNanoUsd: price.reservedNanoUsd, createdAt:budgetNow, payloadCiphertext: encryptSavPayload({ model: config.model, configHash: config.configHash }) }).returning();
@@ -417,7 +421,10 @@ export async function settleSavIntakeCall(id: string, metadata?: SavGeminiMetada
     const { inputTokens: i, outputTokens: o, thoughtTokens: t, totalTokens: total } = metadata ?? {};
     const valid = [i, o, t, total].every(n => Number.isSafeInteger(n) && Number(n) >= 0) && Number(i) >= 1 && Number(i) <= 1_048_576
       && Number(o) + Number(t) <= 8192 && Number(i) + Number(o) + Number(t) === total;
-    // Only a received provider rejection (429/5xx) is known to be unprocessed; it is recorded as such.
+    // Gemini billing contract: failed 400/500-class requests are not charged in tokens but still
+    // count against quota (ai.google.dev/gemini-api/docs/billing, "Am I charged for failed requests?").
+    // Only a RECEIVED 429/5xx is settled at zero, with its status kept for reconciliation; it still
+    // counts as a dispatch. Timeouts and lost answers stay uncertain.
     const unbilled = !valid && unbilledProviderStatus !== undefined && (unbilledProviderStatus === 429 || unbilledProviderStatus >= 500 && unbilledProviderStatus <= 599) && !result;
     const cost = valid ? Number(i) * 750 + (Number(o) + Number(t)) * 3750 : unbilled ? 0 : row.reservedNanoUsd;
     await tx.update(savIntakeModelCalls).set({ state: valid || unbilled ? "settled" : "uncertain", chargedNanoUsd: cost,
@@ -491,12 +498,12 @@ export async function readSavIntakeBudget(config: IntakeRuntimeConfig, now = new
   return intakeBudgetUsage(rows,config,now);
 }
 
-/** Transient retries already scheduled for this run: also the dispatch ordinal of the next one. */
-export async function intakeTransientRetries(runId: string) {
-  const rows = await requireDb().select({ id: savIntakeJournal.id }).from(savIntakeJournal)
-    .where(and(eq(savIntakeJournal.runId, runId), eq(savIntakeJournal.kind, "retry_scheduled")));
-  return rows.length;
-}
+/** Transient retries scheduled for this MESSAGE across all its versions: the dispatch ordinal
+ * of the next retry. A deployment creating a new version keeps this lineage. */
+const retriesOfMessage = async (tx: Pick<Tx, "select">, messageId: string) => (await tx.select({ id: savIntakeJournal.id }).from(savIntakeJournal)
+  .innerJoin(savIntakeRuns, eq(savIntakeRuns.id, savIntakeJournal.runId))
+  .where(and(eq(savIntakeRuns.messageId, messageId), eq(savIntakeJournal.kind, "retry_scheduled")))).length;
+export async function intakeTransientRetries(messageId: string) { return retriesOfMessage(requireDb(), messageId); }
 /** After a transient provider failure: give the attempt back and record a durable due
  * time (leaseUntil without a lease token), the cause and the retries left. Survives
  * interruptions and deployments; a superseding version simply analyses at once. */
@@ -504,10 +511,14 @@ export async function scheduleSavIntakeTransientRetry(runId: string, reason: str
   return requireDb().transaction(async tx => {
     const [run] = await tx.select().from(savIntakeRuns).where(eq(savIntakeRuns.id, runId)).for("update");
     if (!run?.isCurrent || run.state !== "waiting" || run.leaseToken) return null;
-    const done = (await tx.select({ id: savIntakeJournal.id }).from(savIntakeJournal)
-      .where(and(eq(savIntakeJournal.runId, runId), eq(savIntakeJournal.kind, "retry_scheduled")))).length;
+    const done = await retriesOfMessage(tx, run.messageId);
     const delays = SAV_INTAKE_TRANSIENT_RETRY.delaysMinutes;
     if (done >= delays.length) { await journal(tx, runId, "retry_exhausted", { reason, retries: done }); return null; }
+    // Never announce a retry the dispatch budget already forbids: same policy as the reservation.
+    const calls = await tx.select({ runId: savIntakeModelCalls.runId }).from(savIntakeModelCalls).where(eq(savIntakeModelCalls.messageKey, intakeRuntimeHash(run.messageId)));
+    if (calls.length >= SAV_INTAKE_CALL_POLICY.perMessage || calls.filter(c => c.runId === runId).length >= SAV_INTAKE_CALL_POLICY.perVersion) {
+      await journal(tx, runId, "retry_ineligible", { reason, cause: "call_budget", calls: calls.length, policy: SAV_INTAKE_CALL_POLICY }); return null;
+    }
     const retryAt = new Date(now.getTime() + delays[done] * 60_000);
     await tx.update(savIntakeRuns).set({ attempts: sql`greatest(${savIntakeRuns.attempts} - 1, 0)`, leaseUntil: retryAt, updatedAt: now }).where(eq(savIntakeRuns.id, runId));
     await journal(tx, runId, "retry_scheduled", { reason, retry: done + 1, retryAt: retryAt.toISOString(), remaining: delays.length - done - 1 });

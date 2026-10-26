@@ -16,6 +16,7 @@ import { sql } from "drizzle-orm";
 import { analyseSavIntakeRuntime } from "./runtime";
 import { SAV_INTAKE_MODEL_REVISION } from "./model-readers";
 import { SAV_INTAKE_SIMPLE_REVISION } from "./simple-readers";
+import { SAV_INTAKE_CALL_POLICY } from "./attempt-policy";
 
 const KEY = "synthetic-intake-runtime-encryption-key";
 let f: Awaited<ReturnType<typeof createSavTestDb>>, mailboxId: string, threadId: string;
@@ -139,17 +140,17 @@ describe("transient provider failures (lot 2)", () => {
     expect(new Set(ledger.map(r => r.requestHash)).size).toBe(ledger.length);
     expect(await f.db.select().from(savActions)).toHaveLength(0);
   });
-  it("repeated 503 stop at the per-message call budget: three retries, no fourth dispatch, a visible cause, no loop", async () => {
+  it("repeated 503 never announce a retry the call budget forbids: retries stop, with a visible terminal cause", async () => {
     const environment = env(mailboxId, "simple"), config = savIntakeRuntimeConfig(environment)!;
     const m = await stored(), id = (await enqueueSavIntakeMessage(m.id, config))!, p = provider(m.id, [503, 503, 503, 503, 503, 503]);
     for (let n = 0; n < 5; n++) { await analyseSavIntakeRuntime(id, config, { env: () => environment, network: p.network }); await due(id); }
-    expect((await kinds(id)).filter(k => k === "retry_scheduled")).toHaveLength(3);
-    // The existing lifetime budget of three model calls per message is what stops the dossier.
-    expect(p.calls()).toBe(3);
-    expect((await readSavIntakeCurrent(threadId, config))?.payload.reason).toBe("SAV_INTAKE_RUNTIME_BUDGET_EXHAUSTED");
+    const journal = await kinds(id);
+    // Three dispatches fit the per-message budget: two retries are announced, a third would be ineligible.
+    expect(journal.filter(k => k === "retry_scheduled")).toHaveLength(SAV_INTAKE_CALL_POLICY.perMessage - 1);
+    expect(journal).toContain("retry_ineligible");
+    expect(p.calls()).toBe(SAV_INTAKE_CALL_POLICY.perMessage);
     expect((await run(id)).attempts).toBeGreaterThan(0);
-    const ledger = await f.db.select().from(savIntakeModelCalls);
-    expect(ledger.every(r => r.state === "settled" && r.chargedNanoUsd === 0)).toBe(true);
+    expect((await f.db.select().from(savIntakeModelCalls)).every(r => r.state === "settled" && r.chargedNanoUsd === 0)).toBe(true);
   });
   it("a lost answer after dispatch stays uncertain: no retry, no zero settlement, until reconciliation", async () => {
     const environment = env(mailboxId, "simple"), config = savIntakeRuntimeConfig(environment)!;
@@ -164,15 +165,33 @@ describe("transient provider failures (lot 2)", () => {
     const [row] = await f.db.select().from(savIntakeModelCalls);
     expect(row.state).toBe("uncertain"); expect(row.chargedNanoUsd).toBe(row.reservedNanoUsd);
   });
-  it("a deployment during the wait never loses the retry: the new version analyses at once", async () => {
+  it.each([["modified", true], ["unchanged", false]] as const)("429, then a deployment (%s config) during the wait: the retry keeps its due time and lineage, then really succeeds", async (_, redeploy) => {
     const base = env(mailboxId, "simple"), config = savIntakeRuntimeConfig(base)!;
     const m = await stored(), id = (await enqueueSavIntakeMessage(m.id, config))!, p = provider(m.id, [429]);
     await analyseSavIntakeRuntime(id, config, { env: () => base, network: p.network });
-    const deployed = { ...base, SAV_CODE_REVISION: "b".repeat(40), SAV_INTAKE_RUNTIME_CONFIG: JSON.stringify({ ...JSON.parse(base.SAV_INTAKE_RUNTIME_CONFIG), codeRevision: "b".repeat(40) }) };
-    const next = savIntakeRuntimeConfig(deployed)!;
-    const version = (await enqueueSavIntakeMessage(m.id, next))!;
-    expect(version).not.toBe(id);
-    expect((await pendingSavIntakeRuns(next)).map(r => r.id)).toContain(version);
+    const deployed = redeploy ? { ...base, SAV_CODE_REVISION: "b".repeat(40), SAV_INTAKE_RUNTIME_CONFIG: JSON.stringify({ ...JSON.parse(base.SAV_INTAKE_RUNTIME_CONFIG), codeRevision: "b".repeat(40) }) } : base;
+    const next = savIntakeRuntimeConfig(deployed)!, version = (await enqueueSavIntakeMessage(m.id, next))!;
+    expect(version === id).toBe(!redeploy);
+    // Not before the inherited due time.
+    expect(await pendingSavIntakeRuns(next)).toEqual([]);
+    await due(version);
+    await analyseSavIntakeRuntime(version, next, { env: () => deployed, network: p.network });
+    const after = await readSavIntakeCurrent(threadId, next);
+    expect(after?.payload.reason).toBeUndefined();
+    expect(after?.payload.plan?.decision.classification).toBe("support");
+    const ledger = await f.db.select().from(savIntakeModelCalls);
+    expect(ledger).toHaveLength(2); expect(new Set(ledger.map(r => r.requestHash)).size).toBe(2);
+  });
+  it.each(["pause", "new_mail"] as const)("a %s during the wait forbids the old dispatch", async change => {
+    const environment = env(mailboxId, "simple"), config = savIntakeRuntimeConfig(environment)!;
+    const m = await stored(), id = (await enqueueSavIntakeMessage(m.id, config))!, p = provider(m.id, [429]);
+    await analyseSavIntakeRuntime(id, config, { env: () => environment, network: p.network });
+    if (change === "pause") await f.db.update(savThreads).set({ aiPaused: true }).where(eq(savThreads.id, threadId));
+    else await stored();
+    await due(id);
+    expect(await claimSavIntakeRun(id, config)).toBeNull();
+    expect((await pendingSavIntakeRuns(config)).map(r => r.id)).not.toContain(id);
+    expect(p.calls()).toBe(1);
   });
 });
 
