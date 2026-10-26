@@ -154,8 +154,9 @@ export async function enqueueSavIntakeMessage(messageId: string, config: IntakeR
       .where(and(eq(savIntakeRuns.threadId, message.threadId), eq(savIntakeRuns.isCurrent, true)));
     if (last) await journal(tx, last.id, "superseded", { nextMessageId: message.id });
     const [run] = await tx.insert(savIntakeRuns).values({ threadId: message.threadId, messageId: message.id, version: (last?.version ?? 0) + 1,
-      configHash: config.configHash, policyHash: config.policyHash, payloadCiphertext: encryptSavPayload({ revision: SAV_INTAKE_RUNTIME_REVISION, effects: "not_connected" }) }).returning();
-    await journal(tx, run.id, "queued", { messageId: message.id, version: run.version, configHash: config.configHash });
+      configHash: config.configHash, policyHash: config.policyHash, payloadCiphertext: encryptSavPayload({ revision: SAV_INTAKE_RUNTIME_REVISION, effects: "not_connected",
+        ...(config.pipeline === "simple" ? { pipeline: "simple" } : {}) }) }).returning();
+    await journal(tx, run.id, "queued", { messageId: message.id, version: run.version, configHash: config.configHash, pipeline: config.pipeline ?? "current" });
     return run.id;
   });
 }

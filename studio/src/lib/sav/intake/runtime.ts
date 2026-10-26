@@ -17,6 +17,7 @@ import { planSavIntake } from "./engine";
 import { SAV_INTAKE_DETERMINISTIC_ERRORS } from "./attempt-policy";
 import { createSavIntakeHubspotReaders } from "./hubspot-readers";
 import { createSavIntakeSemanticReaders } from "./model-readers";
+import { createSavIntakeSimpleReaders, memoizeIntakeCrmReaders, SAV_INTAKE_SIMPLE_REVISION } from "./simple-readers";
 import { withSavAiBudget } from "../gemini-transport";
 import { observeSavOther, readSavOtherConfiguration } from "../other-observation";
 import { assertSavIntakeObservation, savIntakeRuntimeConfig, SAV_INTAKE_RUNTIME_REVISION,
@@ -50,6 +51,10 @@ async function analyseSavIntakeRuntimeWithinBudget(runId: string, config: Intake
   let readFailure: IntakeReadTrace | undefined;
   let dispatcher: ReturnType<typeof createIntakeModelDispatcher> | undefined;
   const payload: IntakeRuntimePayload = {configuration: { configHash: config.configHash, resourcesHash: config.resourcesHash, policyHash: config.policyHash, codeRevision: config.codeRevision, model: config.model }, semantics:{revision:SAV_INTAKE_SEMANTIC_RECORD_REVISION,validatorRevision:SAV_INTAKE_MODEL_REVISION,records:[]},provenance:[...lease.provenance], revision: SAV_INTAKE_RUNTIME_REVISION, input: lease.input, traces, effects: "not_connected" };
+  // Fixed at run creation: a switch flip never changes an analysis, repair or resume in flight.
+  const pipeline = previous.pipeline === "simple" ? "simple" as const : "current" as const;
+  if (pipeline === "simple") payload.pipeline = "simple";
+  if (pipeline === "simple") payload.semantics!.validatorRevision = SAV_INTAKE_SIMPLE_REVISION;
   payload.readRecovery = lease.recoveringRead ? structuredClone(previous.readRecovery!) : newReadRecovery(config,lease.sourceHash);
   if (lease.recoveringRead) { payload.semantics=structuredClone(previous.semantics!);payload.attachments=structuredClone(previous.attachments); }
   const live = async () => {
@@ -87,8 +92,23 @@ async function analyseSavIntakeRuntimeWithinBudget(runId: string, config: Intake
       }
       await writeCheckpoint();
     }
+    const crm = createSavIntakeHubspotReaders({ onRead: trace => { if(trace.status!=="complete")readFailure=trace;traces.push(trace); checkpoint(); }, network: async (url, init) => {
+      await live();
+      const signal = AbortSignal.any([controller.signal, ...(init?.signal ? [init.signal] : [])]);
+      return network(url, { ...init, signal, redirect: "error", headers: { ...Object.fromEntries(new Headers(init?.headers)), Authorization: `Bearer ${env().HUBSPOT_ACCESS_TOKEN}` } });
+    } });
+    const readPending:Promise<unknown>[]=[];
+    const recoverable=recoverableIntakeReads(crm,payload.readRecovery!,{reuse:Boolean(lease.recoveringRead),checkpoint,pending:readPending});
+    // The simple reader reads the CRM before its single call; the engine then sees the very same answers.
+    const reads = pipeline === "simple" ? memoizeIntakeCrmReaders(recoverable) : recoverable;
     const priorAnalysis=lease.recoveringRead?payload.semantics!.records.find(r=>r.method==="analyseMessage")?.result as MessageAnalysis|undefined:undefined;
-    const semanticReader = createSavIntakeSemanticReaders({ planCalls: dispatcher.plan, repairMalformedOutput,
+    const semanticReader = pipeline === "simple" ? createSavIntakeSimpleReaders({ model: config.model, call, crm: reads, policy: config.policy, provenance: lease.provenance,
+      ...(attachments?.complete ? { attachments: { prepared: attachments.prepared, onRead: observations => {
+        attachments.state.read = { ...attachments.state.read, observations, state: "complete", completedAt: new Date().toISOString() };
+        payload.attachments = attachments.state; checkpoint();
+      } } } : {}),
+      onTrace: trace => { semanticFailureReason = trace.errorCode ?? undefined; traces.push(trace); checkpoint(); } })
+      : createSavIntakeSemanticReaders({ planCalls: dispatcher.plan, repairMalformedOutput,
       repairIssues:publicIntakeSchemaIssues((previous.traces?.findLast(t=>(t as {validationFailure?:unknown})?.validationFailure) as {validationFailure?:{issues?:unknown}}|undefined)?.validationFailure?.issues),
       ...(priorAnalysis?.attachmentObservations?{acceptedImages:priorAnalysis.attachmentObservations}:{}), ...(attachments?.complete ? { attachments: { prepared: attachments.prepared, onRead: observations => {
       attachments.state.read = { ...attachments.state.read, observations, state: "complete", completedAt: new Date().toISOString() };
@@ -103,13 +123,6 @@ async function analyseSavIntakeRuntimeWithinBudget(runId: string, config: Intake
       semanticFailureReason = failure.errorCode;
       traces.push({ ...failure, phase: "accepted_semantics", accepted: false }); checkpoint();
     });
-    const crm = createSavIntakeHubspotReaders({ onRead: trace => { if(trace.status!=="complete")readFailure=trace;traces.push(trace); checkpoint(); }, network: async (url, init) => {
-      await live();
-      const signal = AbortSignal.any([controller.signal, ...(init?.signal ? [init.signal] : [])]);
-      return network(url, { ...init, signal, redirect: "error", headers: { ...Object.fromEntries(new Headers(init?.headers)), Authorization: `Bearer ${env().HUBSPOT_ACCESS_TOKEN}` } });
-    } });
-    const readPending:Promise<unknown>[]=[];
-    const reads=recoverableIntakeReads(crm,payload.readRecovery!,{reuse:Boolean(lease.recoveringRead),checkpoint,pending:readPending});
     payload.plan = await withSavAiBudget(() => planSavIntake(lease.input, { ...reads, ...semantic }, qualifiedOther ? {...config.policy,qualifiedOther:{...(qualifiedOther.family==="authenticated_newsletter"?{family:"authenticated_newsletter" as const}:{}),resource:qualifiedOther.resource,evidenceSource:"private_rule"}} : config.policy, { timeoutMs: 10_000 }, () => new Date()));
     assertSavIntakeObservation(payload.plan);
     // Cancellation may finish after the pure planner's per-call timeout.
