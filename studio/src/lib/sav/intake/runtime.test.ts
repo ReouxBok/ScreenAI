@@ -998,3 +998,15 @@ it.each([["without", false], ["with", true]] as const)("current reader: a groupe
   expect(ledger).toHaveLength(3); expect(new Set(ledger.map(r => r.requestHash)).size).toBe(3);
   expect(ledger.filter(r => r.resultCiphertext)).toHaveLength(2); expect(ledger.filter(r => r.chargedNanoUsd === 0)).toHaveLength(1);
 }, 60_000);
+
+it("REVIEW a rolling budget deferral must not promise tomorrow's daily reset",async()=>{
+ operational();
+ environment={...environment,SAV_INTAKE_RUNTIME_CONFIG:JSON.stringify({...JSON.parse(environment.SAV_INTAKE_RUNTIME_CONFIG!),maxRollingNanoUsd:1000000000})};
+ config=savIntakeRuntimeConfig(environment)!;
+ const u={inputTokens:400000,outputTokens:50,thoughtTokens:0,totalTokens:400050};
+ await f.db.insert(savIntakeModelCalls).values({messageKey:intakeRuntimeHash("older"),requestHash:intakeRuntimeHash("older-body"),state:"settled",reservedNanoUsd:817152000,chargedNanoUsd:300187500,payloadCiphertext:encryptSavPayload({metadata:u}),createdAt:new Date(Date.now()-86400000)});
+ const id=(await enqueueSavIntakeMessage(messageId,config))!;
+ expect(await claimSavIntakeRun(id,config)).toBeNull();
+ vi.useFakeTimers({toFake:["Date"]});vi.setSystemTime(new Date(Date.parse(new Date().toISOString().slice(0,10)+"T00:00:00Z")+86400000));
+ try{expect(await claimSavIntakeRun(id,config)).toBeNull();expect((await readSavIntakeCurrent(threadId,config))?.payload.reason).not.toBe("SAV_INTAKE_RUNTIME_DAILY_BUDGET_DEFERRED");}finally{vi.useRealTimers();}
+});

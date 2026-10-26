@@ -20,6 +20,7 @@ function receiptReason(reason:string){
   SAV_INTAKE_RUNTIME_USAGE_UNCERTAIN:"La consommation d’un appel reste à confirmer ; aucun nouvel appel n’est autorisé.",
   SAV_INTAKE_RUNTIME_BUDGET_EXHAUSTED:"Le budget existant ne permet pas de nouvel appel pour cette étape.",
   SAV_INTAKE_RUNTIME_DAILY_BUDGET_DEFERRED:"Plafond quotidien atteint : reprise automatique au prochain jour.",
+  SAV_INTAKE_RUNTIME_ROLLING_BUDGET_DEFERRED:"Plafond sur 30 jours atteint : en attente de budget disponible.",
   SAV_INTAKE_OPERATOR_INTERRUPTED:"La reprise a été interrompue. Ses preuves et sa référence restent conservées.",
  };
  return labels[reason]??"Une preuve, une autorisation ou une étape reste à vérifier. Le dossier et la demande sont conservés.";

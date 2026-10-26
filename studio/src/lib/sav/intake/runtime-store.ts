@@ -252,8 +252,10 @@ export async function claimSavIntakeRun(id: string, config: IntakeRuntimeConfig,
       const quote=savDerivedCostQuote(config.model,8192,budgetNow);
       if(unknown||!recoveringRead&&(usage.remainingCalls<1||usage.remainingNanoUsd<quote.reservedNanoUsd||usage.remainingRollingNanoUsd<quote.reservedNanoUsd)) {
         const payload=decryptSavPayload<IntakeRuntimePayload>(run.payloadCiphertext);
-        // The shared daily/rolling margin, not this dossier: it resumes by itself when the margin frees (next UTC day).
-        const reason=unknown?"SAV_INTAKE_RUNTIME_USAGE_UNCERTAIN":"SAV_INTAKE_RUNTIME_DAILY_BUDGET_DEFERRED";
+        // The shared margin, not this dossier. Only the daily margin frees at the next UTC day; the
+        // rolling 30-day margin frees when older spend leaves the window, so no date is promised.
+        const rolling=usage.remainingRollingNanoUsd<quote.reservedNanoUsd;
+        const reason=unknown?"SAV_INTAKE_RUNTIME_USAGE_UNCERTAIN":rolling?"SAV_INTAKE_RUNTIME_ROLLING_BUDGET_DEFERRED":"SAV_INTAKE_RUNTIME_DAILY_BUDGET_DEFERRED";
         await tx.update(savIntakeRuns).set({state:unknown?"uncertain":"waiting",payloadCiphertext:encryptSavPayload({...payload,reason}),leaseToken:null,leaseUntil:null,freshUntil:null,updatedAt:budgetNow}).where(eq(savIntakeRuns.id,id));
         await tx.update(savMessages).set({analysisStatus:unknown?"intake_uncertain":"intake_waiting"}).where(eq(savMessages.id,run.messageId));
         await journal(tx,id,"budget_deferred_before_attempt",{reason,attemptsUnchanged:true});

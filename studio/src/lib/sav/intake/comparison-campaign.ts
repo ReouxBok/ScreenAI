@@ -15,6 +15,8 @@ import { createIntakeModelDispatcher } from "./model-dispatch";
 import { createSavIntakeSemanticReaders, type IntakeModelTrace } from "./model-readers";
 import { savIntakeRuntimeConfig, type IntakeRuntimeConfig } from "./runtime-contract";
 import { savIntakeSourceSnapshot } from "./runtime-store";
+import { readIntakeOtherRules } from "./other-routing";
+import { qualifyRuntimeCandidate } from "./other-routing-runtime";
 import { createSavIntakeSimpleReaders, readIntakeSimpleContext } from "./simple-readers";
 
 /** Separate comparison campaign of the current and the single-call reader on a frozen list of
@@ -76,6 +78,17 @@ export async function reserveSavIntakeComparisonCall(env: () => Record<string, s
     return { id: callId, cached: null };
   });
 }
+/** Grouped plan check on the campaign's own ledger and caps (never the live ledger): every group of
+ * the plan must fit before the first one is dispatched. Read-only; reservations re-check each call. */
+export async function assertSavIntakeComparisonPlan(env: () => Record<string, string | undefined>, campaignId: string, messageId: string, hashes: readonly string[], model: string) {
+  if (!hashes.length || hashes.length > 3 || new Set(hashes).size !== hashes.length) throw Error("SAV_INTAKE_RUNTIME_DISPATCH_REJECTED");
+  await requireDb().transaction(async tx => {
+    await tx.execute(LOCK);
+    const config = savIntakeComparisonConfig(env());
+    if (!config || config.campaignId !== campaignId || !config.messageIds.includes(messageId)) throw Error("SAV_INTAKE_COMPARISON_EXPIRED");
+    if (savIntakeComparisonSpend(await events(tx, campaignId)) + hashes.length * savDerivedCostQuote(model, 8192).reservedNanoUsd > config.maxNanoUsd) throw Error("SAV_INTAKE_COMPARISON_BUDGET_EXHAUSTED");
+  });
+}
 /** Same validity rule as the live ledger; a reservation stays reconcilable after the campaign ends. */
 export function settleSavIntakeComparisonCall(campaignId: string) {
   return async (callId: string, metadata?: SavGeminiMetadata, result?: unknown, unbilledProviderStatus?: number) => {
@@ -92,9 +105,10 @@ export function settleSavIntakeComparisonCall(campaignId: string) {
 /** One frozen CRM view shared by both readers: captured once, then served only from the capture.
  * Anything a reader needs that was not captured is a recorded coverage miss, never a fresh read. */
 function frozenCrm(live: SavIntakeCrmReaders) {
-  const captured = new Map<string, Promise<unknown>>(), misses = new Set<string>();
+  const captured = new Map<string, Promise<unknown>>(), misses = new Set<string>(), served = new Set<string>();
   const wrap = <A extends unknown[], R>(name: string, fn: (...args: A) => Promise<R>, frozen: () => boolean) => async (...args: A): Promise<R> => {
     const key = `${name}:${String(args[0])}`;
+    if (frozen()) served.add(key);
     if (captured.has(key)) return captured.get(key) as Promise<R>;
     if (frozen()) { misses.add(key); return { status: "failed", data: null, observedAt: new Date().toISOString() } as R; }
     const value = fn(...args); captured.set(key, value); return value;
@@ -107,7 +121,17 @@ function frozenCrm(live: SavIntakeCrmReaders) {
     isFrozen = true;
     const answers = await Promise.all([...captured].sort(([a], [b]) => a.localeCompare(b)).map(async ([key, value]) => [key, await value.catch(() => null)] as const));
     return createHash("sha256").update(JSON.stringify(answers.map(([key, value]) => [key, (value as ReadResult<unknown> | null)?.status ?? "error", (value as ReadResult<unknown> | null)?.data ?? null]))).digest("hex");
-  }, misses };
+  }, misses,
+  /** Captured reads a reader actually used that were not complete: a missing record is not a real
+   * absence. A complete answer with zero record (customer unknown) stays comparable. */
+  failedUsed: async () => {
+    const out: string[] = [];
+    for (const key of served) {
+      const value = await (captured.get(key) ?? Promise.resolve(null)).catch(() => null) as ReadResult<unknown> | null;
+      if (captured.has(key) && value?.status !== "complete") out.push(`crm_${value?.status ?? "error"}:${key.split(":")[0]}`);
+    }
+    return out;
+  } };
 }
 
 export function intakePlanSummary(plan?: IntakePlan) {
@@ -140,7 +164,11 @@ async function compareOne(messageId: string, claimId: string, campaign: SavIntak
   const coverage: string[] = [];
   // Images are not downloaded by this runner: a dossier with attachments is not comparable here.
   if ((snapshot.body.attachments?.length ?? 0) > 0) coverage.push("attachments_not_loaded");
-  if (env().SAV_INTAKE_OTHER_RULES_JSON) coverage.push("qualified_other_not_applied");
+  // Only a dossier an approved Other rule could match depends on the Gmail-authenticated qualification
+  // this runner does not perform; every other dossier is compared exactly as the live path would.
+  // An unreadable or expired catalogue approves no rule, so it cannot make a dossier depend on one.
+  const catalogue = (() => { try { return readIntakeOtherRules(env().SAV_INTAKE_OTHER_RULES_JSON); } catch { return null; } })();
+  if (catalogue && qualifyRuntimeCandidate({ mailboxId: message.mailboxId, subject: message.subject, body: { text: snapshot.body.text ?? "" } }, catalogue)) coverage.push("qualified_other_candidate");
   const policy: EnginePolicy = runtime.policy;
   const crm = frozenCrm(createSavIntakeHubspotReaders({ network: async (url, init) => network(url, { ...init, redirect: "error",
     headers: { ...Object.fromEntries(new Headers(init?.headers)), Authorization: `Bearer ${env().HUBSPOT_ACCESS_TOKEN}` } }) }));
@@ -153,7 +181,8 @@ async function compareOne(messageId: string, claimId: string, campaign: SavIntak
     const traces: IntakeModelTrace[] = [], controller = new AbortController(), timer = setTimeout(() => controller.abort(), 60_000);
     const dispatcher = createIntakeModelDispatcher({ config: runtime, signal: controller.signal, env, network,
       live: async () => { if (!savIntakeComparisonConfig(env())) throw Error("SAV_INTAKE_COMPARISON_EXPIRED"); },
-      reserve: hash => reserveSavIntakeComparisonCall(env, campaign.campaignId, messageId, claimId, hash, runtime.model), settle: settleSavIntakeComparisonCall(campaign.campaignId) });
+      reserve: hash => reserveSavIntakeComparisonCall(env, campaign.campaignId, messageId, claimId, hash, runtime.model), settle: settleSavIntakeComparisonCall(campaign.campaignId),
+      preflight: hashes => assertSavIntakeComparisonPlan(env, campaign.campaignId, messageId, hashes, runtime.model) });
     const semantic = kind === "simple"
       ? createSavIntakeSimpleReaders({ model: runtime.model, call: dispatcher.call, crm: crm.frozen, policy, provenance: snapshot.provenance, onTrace: t => traces.push(t) })
       : createSavIntakeSemanticReaders({ model: runtime.model, call: dispatcher.call, planCalls: dispatcher.plan, provenance: snapshot.provenance, onTrace: t => traces.push(t) });
@@ -165,7 +194,7 @@ async function compareOne(messageId: string, claimId: string, campaign: SavIntak
     return { summary: technical ? null : intakePlanSummary(plan), technical, uncertain: dispatcher.uncertain, calls: traces.filter(t => t.metadata).length };
   };
   const current = await side("current"), simple = await side("simple");
-  coverage.push(...[...crm.misses].map(key => `crm_not_captured:${key.split(":")[0]}`));
+  coverage.push(...[...crm.misses].map(key => `crm_not_captured:${key.split(":")[0]}`), ...await crm.failedUsed());
   const snapshotHash = createHash("sha256").update(JSON.stringify([snapshot.sourceHash, crmHash])).digest("hex");
   return { coverage: [...new Set(coverage)], snapshotHash, current, simple, ...compareIntakeSides(current, simple, [...new Set(coverage)]) };
 }

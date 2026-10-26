@@ -14,7 +14,8 @@ const statuses: Record<string, string> = {
 const reasons: Array<[RegExp, string]> = [
   [/CRM_READ_/, "La lecture HubSpot est incomplète ou indisponible. Les actions déjà confirmées sont conservées ; la reprise vérifie le contexte sans les recréer."],
   [/MESSAGE_METADATA_INVALID/, "L’adresse de l’expéditeur ou la liste des destinataires est invalide ou dépasse les limites. Ce mail reste à vérifier ; les autres dossiers peuvent continuer."],
-  [/DAILY_BUDGET_DEFERRED/, "Plafond quotidien d’analyse IA atteint : reprise automatique au prochain jour (1 h, heure de Paris), aucune tentative consommée."],
+  [/DAILY_BUDGET_DEFERRED/, "Plafond quotidien d’analyse IA atteint : reprise automatique au prochain jour (minuit UTC), aucune tentative consommée."],
+  [/ROLLING_BUDGET_DEFERRED/, "Plafond d’analyse IA sur 30 jours atteint : en attente de budget disponible, aucune tentative consommée."],
   [/BUDGET_EXHAUSTED|ADMISSION_LIMIT|CALLS_EXHAUSTED/, "Plafond de qualification atteint. Une reprise technique est nécessaire."],
   [/USAGE_UNCERTAIN|SETTLEMENT_UNCERTAIN/, "Le coût du dernier appel reste à confirmer. Aucun nouvel appel ne peut partir."],
   [/ATTEMPTS|attempts_exhausted/, "Les tentatives bornées sont épuisées. Les éléments vérifiés sont conservés."],
@@ -72,7 +73,8 @@ export const intakeExpectedActions: Record<string, string> = {
   private_resource_unavailable: "Une ressource approuvée manque (modèle de réponse, règle) : la configurer ou traiter manuellement.",
   attempts_exhausted: "Traiter le dossier manuellement ou relancer une analyse après correction de la cause.",
   SAV_INTAKE_RUNTIME_BUDGET_EXHAUSTED: "Le budget d’appels IA de ce message est atteint : traiter manuellement.",
-  SAV_INTAKE_RUNTIME_DAILY_BUDGET_DEFERRED: "Aucune action requise : reprise automatique au prochain jour. Relever le plafond quotidien si l’attente gêne.",
+  SAV_INTAKE_RUNTIME_DAILY_BUDGET_DEFERRED: "Aucune action requise : reprise automatique au prochain jour (minuit UTC). Relever le plafond quotidien si l’attente gêne.",
+  SAV_INTAKE_RUNTIME_ROLLING_BUDGET_DEFERRED: "En attente de budget disponible sur 30 jours : relever le plafond glissant ou traiter manuellement si l’attente gêne.",
 };
 export type IntakeHandoffInput = {
   reasons: readonly string[]; blockedCause?: string | null;

@@ -1,6 +1,6 @@
 /** Lot 4: the separate comparison campaign on a frozen list of stored dossiers, through the real
  * readers, engine, dispatcher and both ledgers. Never on the live path, no write, own budget. */
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { and, eq } from "drizzle-orm";
 import { createSavTestDb } from "../../../../test/sav-db";
@@ -126,4 +126,58 @@ describe("comparison campaign (lot 4)", () => {
     const report = await readSavIntakeComparisonReport(() => e);
     expect(report).toMatchObject({ denominators: { listed: 2, done: 1, interrupted: 1, pending: 0 } });
   });
+});
+
+it("REVIEW a configured Other catalogue does not exclude an unrelated support request", async()=>{
+ const m=await stored(),p=provider();
+ const e:Record<string,string|undefined>={...env(mailboxId,[m.id]),SAV_INTAKE_OTHER_RULES_JSON:"[]"};
+ await runSavIntakeComparisonBatch({env:()=>e,network:p.network});
+ const report=await readSavIntakeComparisonReport(()=>e);
+ expect(report.configured && report.rows[0].verdict).toBe("identical");
+});
+it("REVIEW an incomplete CRM capture is not counted as comparable judgement",async()=>{
+ const m=await stored(),e=env(mailboxId,[m.id]),p=provider();
+ const network:typeof fetch=async(url,init)=>String(url).startsWith("https://api.hubapi.com/")?new Response("{}",{status:503}):p.network(url,init);
+ await runSavIntakeComparisonBatch({env:()=>e,network});
+ const report=await readSavIntakeComparisonReport(()=>e);
+ expect(["non_comparable","incomplete"]).toContain(report.configured && report.rows[0].verdict);
+});
+
+import * as hubspotReaders from "./hubspot-readers";
+function reviewText(seed:number,size:number){return Array.from({length:size},(_,i)=>{seed=(Math.imul(seed,1664525)+1013904223)>>>0;return i%12===11?" ":String.fromCharCode(97+(seed>>>8)%26);}).join("")+" FIN";}
+it("REVIEW the campaign gives current grouped matching a working preflight",async()=>{
+ const m=await stored(),e=env(mailboxId,[m.id]),base=provider(),at=new Date(Date.now()-2*86400000).toISOString();
+ const tickets=["201","202"].map(id=>({id,contactIds:["101"],stage:"open" as const,createdAt:at,ownerId:null,subject:"Synchronisation",content:"Erreur"}));
+ const complete=<T>(data:T)=>({status:"complete" as const,data,observedAt:new Date().toISOString()});
+ const spy=vi.spyOn(hubspotReaders,"createSavIntakeHubspotReaders").mockReturnValue({
+  findContactsByEmail:async()=>complete([{id:"101",emails:["client@example.invalid"]}]),directAssociations:async()=>complete([]),getContact:async()=>complete({id:"101",emails:["client@example.invalid"]}),
+  ticketsForContact:async()=>complete(tickets),ticketHistory:async(id)=>complete([0,1,2].map(i=>({id:`note-${id}-${i}`,kind:"note" as const,at,text:reviewText(Number(id)*10+i,90000)})))
+ });
+ const network:typeof fetch=async(url,init)=>{
+  if(String(url).startsWith("https://generativelanguage.googleapis.com/")){
+   const d=JSON.parse(JSON.parse(String(init?.body)).contents[0].parts[0].text);
+   if(d.tickets && typeof d.current!=="string"){
+    const ans={investigationComplete:true,tickets:d.tickets.map(({ticket}:{ticket:{id:string}})=>({ticketId:ticket.id,relation:"same",requestIds:["r1"],evidenceIds:["current",`ticket-${ticket.id}`,`history-${ticket.id}`],rationale:"Same issue",grounding:["current",`ticket-${ticket.id}`,`history-${ticket.id}`].map(src=>({quoteId:d.citationCatalogue.find((x:{sourceId:string})=>x.sourceId===src).id}))}))};
+    return Response.json({candidates:[{finishReason:"STOP",content:{parts:[{text:JSON.stringify(ans)}]}}],usageMetadata:{promptTokenCount:300,candidatesTokenCount:60,thoughtsTokenCount:0,totalTokenCount:360}});
+   }
+  }
+  return base.network(url,init);
+ };
+ try{
+  await runSavIntakeComparisonBatch({env:()=>e,network});
+  const report=await readSavIntakeComparisonReport(()=>e);
+  const detail=report.configured && report.rows[0].detail as {current:{technical:string|null}};
+  expect(detail && detail.current.technical).toBeNull();
+ }finally{spy.mockRestore();}
+},30000);
+it("a dossier an approved Other rule matches is not comparable here, never a judgement", async () => {
+  const text = "Bonjour, la synchronisation de mon agenda échoue avec une erreur 500.", m = await stored(text), p = provider();
+  const sha = (value: string) => createHash("sha256").update(value).digest("hex");
+  const rules = [{ id: "r1", family: "own_campaign_copy", mailboxId, subjectSha256: sha("Synchronisation agenda"), bodySha256: sha(text) }];
+  const catalogue = { version: 1, resource: { resourceId: "synthetic", revisionId: "1", sha256: sha(JSON.stringify(rules)) }, approvedBy: "synthetic-admin",
+    approvedAt: new Date(Date.now() - 1000).toISOString(), expiresAt: new Date(Date.now() + 3600_000).toISOString(), rules };
+  const e: Record<string, string | undefined> = { ...env(mailboxId, [m.id]), SAV_INTAKE_OTHER_RULES_JSON: JSON.stringify(catalogue) };
+  expect(await runSavIntakeComparisonBatch({ env: () => e, network: p.network })).toMatchObject({ compared: [{ verdict: "non_comparable" }] });
+  const report = await readSavIntakeComparisonReport(() => e);
+  expect(report.configured && report.rows[0].detail).toMatchObject({ differences: ["qualified_other_candidate"] });
 });
