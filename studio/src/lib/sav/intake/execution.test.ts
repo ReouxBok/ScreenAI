@@ -1229,3 +1229,91 @@ it.each(["automatic_ack","source_copy","expired_ack"] as const)("resumes the sam
  expect(p.calls.filter(c=>c.method==="PATCH")).toHaveLength(1);expect(p.calls.filter(c=>c.path==="gmail/messages/send")).toHaveLength(0);
  const count=p.calls.filter(c=>["POST","PUT","PATCH"].includes(c.method)).length;await executeIntakePass(row.id,options);expect(p.calls.filter(c=>["POST","PUT","PATCH"].includes(c.method))).toHaveLength(count);
 },20000);
+
+// ---- Étape 2, lot 3: the single-call reader's plan through the unchanged executor and real HTTP adapters.
+import { createSavIntakeSimpleReaders, memoizeIntakeCrmReaders } from "./simple-readers";
+import type { IntakeGeminiCall } from "./model-readers";
+type SimpleData = { tickets: { ticketId: string }[]; contacts: { contactId: string }[] };
+const simpleAnswer = (data: SimpleData, over: Record<string, unknown> = {}) => ({
+    messageId, nature: "request", requests: [{ id: "r1", kind: "support", summary: "La connexion échoue.", sourceIds: ["current"] }],
+    ticketTitle: "Échec de connexion du client", ticketDescription: "Le client signale que sa connexion échoue.",
+    identity: { kind: "unique", contactIds: [data.contacts[0]?.contactId].filter(Boolean), why: "Expéditeur." },
+    tickets: data.tickets.map(t => ({ ticketId: t.ticketId, relation: "same", why: "Même panne de connexion.", sourceIds: ["current", `ticket-${t.ticketId}`] })),
+    missing: [], rationale: "Panne de connexion.", ...over });
+async function observedSimple(answer: (data: SimpleData) => Record<string, unknown>) {
+    const runtime = options.runtime, id = (await enqueueSavIntakeMessage(messageId, runtime))!, lease = (await claimSavIntakeRun(id, runtime))!;
+    const crm = memoizeIntakeCrmReaders(createSavIntakeHubspotReaders({ network: p.network }));
+    const call: IntakeGeminiCall = async request => ({ json: answer(JSON.parse(request.body.contents[0].parts[0].text) as SimpleData),
+        metadata: { inputTokens: 100, outputTokens: 20, thoughtTokens: 0, totalTokens: 120 } });
+    const semantic = createSavIntakeSimpleReaders({ model: "gemini-3.6-flash", call, crm, policy: runtime.policy, provenance: lease.provenance });
+    const plan = await planSavIntake(lease.input, { ...crm, ...semantic }, runtime.policy, {}, () => new Date());
+    // As the runtime does: the pipeline fixed at the run's creation stays in its payload.
+    const pipeline = decryptSavPayload<{ pipeline?: "simple" }>(lease.run.payloadCiphertext).pipeline;
+    await saveSavIntakeResult(lease, runtime, { revision: SAV_INTAKE_RUNTIME_REVISION, effects: "not_connected", plan, input: lease.input, ...(pipeline ? { pipeline } : {}) },
+        plan.decision.disposition.kind === "collect_context" ? "waiting" : "observed");
+    return { id, plan };
+}
+const writes = () => p.calls.filter(c => ["PUT", "PATCH", "DELETE"].includes(c.method) || c.method === "POST" && !c.path.endsWith("/search") && !c.path.endsWith("/read"));
+it("simple reader → executor: creates the ticket with the simple title, no owner, from email", async () => {
+    const { id, plan } = await observedSimple(d => simpleAnswer(d));
+    expect(plan.newTicket).toMatchObject({ title: "Échec de connexion du client", owner: "leave_unassigned" });
+    const row = (await admitIntakeExecution(id, options))!;
+    expect(await executeIntakePass(row.id, options)).toMatchObject({ state: "confirmed" });
+    const create = p.calls.filter(c => c.method === "POST" && c.path.endsWith("/tickets"));
+    expect(create).toHaveLength(1);
+    const properties = (create[0].body as { properties: Record<string, string> }).properties;
+    expect(properties.subject).toBe("Échec de connexion du client");
+    expect(properties.source_type).toBe("EMAIL");
+    expect(properties).not.toHaveProperty("hubspot_owner_id");
+});
+it.each([["open", undefined], ["closed", 3]] as const)("simple reader → executor: a relevant %s ticket goes back to New and keeps its owner", async (stage, closedDays) => {
+    p.seedTicket({ stage, ownerId: "777", createdAt: new Date(Date.now() - 40 * 86_400_000).toISOString(), ...(closedDays ? { closedAt: new Date(Date.now() - closedDays * 86_400_000).toISOString() } : {}) });
+    const { id, plan } = await observedSimple(d => simpleAnswer(d));
+    expect(plan.decision.disposition).toMatchObject({ kind: "ticket", target: { operation: stage === "closed" ? "reopen" : "link", ticketId: "201" } });
+    const row = (await admitIntakeExecution(id, options))!;
+    expect(await executeIntakePass(row.id, options)).toMatchObject({ state: "confirmed" });
+    const patches = p.calls.filter(c => c.method === "PATCH");
+    expect(patches).toHaveLength(1);
+    expect(patches[0].body).toEqual({ properties: { hs_pipeline_stage: "1" } });
+    expect(p.objects.tickets["201"].properties.hubspot_owner_id).toBe("777");
+    expect(p.calls.filter(c => c.method === "POST" && c.path.endsWith("/tickets"))).toHaveLength(0);
+});
+it("simple reader → executor: a same-issue ticket closed 16 days ago gives a new ticket, the old one untouched", async () => {
+    p.seedTicket({ stage: "closed", ownerId: "777", createdAt: new Date(Date.now() - 40 * 86_400_000).toISOString(), closedAt: new Date(Date.now() - 16 * 86_400_000).toISOString() });
+    const { id, plan } = await observedSimple(d => simpleAnswer(d));
+    expect(plan.decision.disposition).toMatchObject({ kind: "ticket", target: { operation: "create", predecessor: { ticketId: "201" } } });
+    const row = (await admitIntakeExecution(id, options))!;
+    expect(await executeIntakePass(row.id, options)).toMatchObject({ state: "confirmed" });
+    expect(p.calls.filter(c => c.method === "POST" && c.path.endsWith("/tickets"))).toHaveLength(1);
+    expect(p.calls.filter(c => c.method === "PATCH" && c.path.includes("/tickets/201"))).toHaveLength(0);
+});
+it("simple reader → executor: missing indispensable evidence is never admitted and nothing is written", async () => {
+    p.seedTicket({ stage: "open" });
+    const { id, plan } = await observedSimple(d => simpleAnswer(d, { missing: [{ kind: "image", why: "La capture citée par le client est illisible." }] }));
+    expect(plan.steps).toEqual([]);
+    expect(await admitIntakeExecution(id, options)).toBeNull();
+    expect(writes()).toHaveLength(0);
+});
+it("simple reader → executor: a run created on simple keeps its execution after the switch really flips to current, without replay", async () => {
+    // The run is created while the switch says simple.
+    environment = { ...environment, SAV_INTAKE_PIPELINE: "simple" };
+    options.runtime = savIntakeRuntimeConfig(environment)!;
+    const { id } = await observedSimple(d => simpleAnswer(d));
+    const [created] = await f.db.select().from(savIntakeRuns).where(eq(savIntakeRuns.id, id));
+    expect(decryptSavPayload<{ pipeline?: string }>(created.payloadCiphertext).pipeline).toBe("simple");
+    const row = (await admitIntakeExecution(id, options))!;
+    // After admission the environment really flips back to current.
+    const before = options.runtime.configHash;
+    environment = { ...environment, SAV_INTAKE_PIPELINE: "current" };
+    options.runtime = savIntakeRuntimeConfig(environment)!;
+    expect(options.runtime.pipeline).toBe("current");
+    expect(options.runtime.configHash).toBe(before);
+    expect(await executeIntakePass(row.id, options)).toMatchObject({ state: "confirmed" });
+    const confirmed = (await getExecutionEffects(row.id)).filter(e => e.state === "confirmed").map(e => e.id).sort();
+    const writesAfterFirst = writes().length;
+    // Running the same execution again never re-dispatches a confirmed effect.
+    await executeIntakePass(row.id, options);
+    expect(p.calls.filter(c => c.method === "POST" && c.path.endsWith("/tickets"))).toHaveLength(1);
+    expect(writes()).toHaveLength(writesAfterFirst);
+    expect((await getExecutionEffects(row.id)).filter(e => e.state === "confirmed").map(e => e.id).sort()).toEqual(confirmed);
+});

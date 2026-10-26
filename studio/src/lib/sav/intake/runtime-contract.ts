@@ -22,7 +22,17 @@ export const savIntakeRuntimePins = z.object({ mailboxId: z.uuid(), createdAfter
   readRecovery: intakeReadRecoveryPolicySchema.optional(),
   budgetProfile: z.literal(SAV_INTAKE_OPERATIONAL_PROFILE).optional(), maxRollingNanoUsd: z.number().int().min(1).max(90_000_000_000).optional() }).strict().refine(p =>
     p.budgetProfile === SAV_INTAKE_OPERATIONAL_PROFILE ? p.maxRollingNanoUsd !== undefined : p.maxCalls <= 30 && p.maxRollingNanoUsd === undefined);
-export type IntakeRuntimeConfig = z.infer<typeof savIntakeRuntimePins> & { mode: "observe"; policy: EnginePolicy; configHash: string; model: "gemini-3.6-flash" };
+export type IntakeRuntimeConfig = z.infer<typeof savIntakeRuntimePins> & { mode: "observe"; policy: EnginePolicy; configHash: string; model: "gemini-3.6-flash";
+  /** Reader pipeline for NEW runs only; frozen in each run at creation and deliberately outside configHash. */
+  pipeline?: SavIntakePipeline };
+export const SAV_INTAKE_PIPELINES = ["current", "simple"] as const;
+export type SavIntakePipeline = typeof SAV_INTAKE_PIPELINES[number];
+/** Absent means the current multi-call readers; any other value is a configuration error, never a silent default. */
+export function savIntakePipeline(env: Record<string, string | undefined>): SavIntakePipeline {
+  const value = env.SAV_INTAKE_PIPELINE ?? "current";
+  if (!(SAV_INTAKE_PIPELINES as readonly string[]).includes(value)) throw Error("SAV_INTAKE_RUNTIME_CONFIGURATION_REQUIRED");
+  return value as SavIntakePipeline;
+}
 /** Pure, explicit binding used also to verify a previous deployment receipt.
  * A historical hash never grants permission to run a model under a new build. */
 export function intakeRuntimeConfigurationHash(p: z.infer<typeof savIntakeRuntimePins>, env: Record<string, string | undefined>, prompts = SAV_INTAKE_MODEL_REVISION) {
@@ -54,7 +64,7 @@ export function savIntakeRuntimeConfig(env: Record<string, string | undefined> =
       || (env.SAV_ENCRYPTION_KEY_V1?.length ?? 0) < 32) throw Error();
     const warning = policy.resources.multiTicketWarning;
     if (warning && createHash("sha256").update(warning.text).digest("hex") !== warning.sha256) throw Error();
-    return { ...p, mode: "observe", policy, model: "gemini-3.6-flash", configHash: intakeRuntimeConfigurationHash(p, env) };
+    return { ...p, mode: "observe", policy, model: "gemini-3.6-flash", configHash: intakeRuntimeConfigurationHash(p, env), pipeline: savIntakePipeline(env) };
   } catch { throw Error("SAV_INTAKE_RUNTIME_CONFIGURATION_REQUIRED"); }
 }
 export type IntakeRuntimeState = "pending" | "analysing" | "observed" | "waiting" | "uncertain" | "superseded";
@@ -68,6 +78,8 @@ export type IntakeRuntimePayload = {
   readRecovery?: import("./read-recovery").IntakeReadRecovery;
   reanalysisParent?: { runId: string; payloadHash: string; sourceHash: string; messageSourceHash: string };
   provenance?:unknown; traces?: unknown[]; reason?: string;
+  /** Fixed when the run is created; analysis, repairs and resumes keep it. Absent: current. */
+  pipeline?: SavIntakePipeline;
   effects: "not_connected";
 };
 export function assertSavIntakeObservation(plan: IntakePlan) {

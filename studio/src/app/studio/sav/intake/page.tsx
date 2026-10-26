@@ -4,7 +4,7 @@ import { formatParisDateTime } from "@/lib/paris-date";
 import { requireIntakeConsoleStaff } from "@/lib/sav/intake/console-auth";
 import { listIntakeConsole } from "@/lib/sav/intake/console-store";
 import { savIntakeViewLabels, savIntakeViewSchema } from "@/lib/sav/intake/contract";
-import { intakeStatusLabel, intakeReasonLabel, intakeBlockedCauseLabel } from "@/lib/sav/intake/console-presentation";
+import { intakeStatusLabel, intakeReasonLabel, intakeBlockedCauseLabel, intakeRetryLabel } from "@/lib/sav/intake/console-presentation";
 import styles from "./intake.module.css";
 import { intakeDossierHref } from "@/lib/sav/intake-ux/navigation";
 import { IntakeDossierLink, IntakeListPosition } from "./navigation";
@@ -37,7 +37,7 @@ export default async function IntakeConsolePage({ searchParams }: { searchParams
       <section aria-label={view === "processing" ? "Traitements en cours" : savIntakeViewLabels[view]} className={styles.list}>
         {data.rows.length ? data.rows.map(row => <IntakeDossierLink key={row.threadId} id={row.threadId} origin={origin} href={intakeDossierHref(row.threadId, origin)} className={styles.row}>
           <div><strong>{row.subject || "Nouvelle demande"}</strong><span>{row.fromEmail ?? "Expéditeur en cours de préparation"}</span></div>
-          <div>{row.blockedCause ? <span className={styles.blocked}>{intakeBlockedCauseLabel(row.blockedCause)}</span> : <span className={styles.status}>{intakeStatusLabel(row.status)}</span>}{row.reason && <small>{intakeReasonLabel(row.reason)}</small>}</div>
+          <div>{row.blockedCause ? <span className={styles.blocked}>{intakeBlockedCauseLabel(row.blockedCause)}</span> : row.retryAt ? <span className={styles.status}>{intakeRetryLabel(row.retryAt)}</span> : <span className={styles.status}>{intakeStatusLabel(row.status)}</span>}{row.reason && <small>{intakeReasonLabel(row.reason)}</small>}</div>
           <div><span>Version {row.version ?? "en attente"}</span><time dateTime={row.receivedAt?.toISOString()}>{row.receivedAt ? formatParisDateTime(row.receivedAt) : "Nouvelle entrée"}</time></div>
         </IntakeDossierLink>) : <div className={styles.empty}><h2>Aucun dossier dans cette vue</h2><p>{query.q ? "Aucun objet ou expéditeur ne correspond à la recherche." : "Les prochains dossiers apparaîtront ici selon leur avancement confirmé."}</p>{query.q && <Link href={href(view,1,"")}>Effacer la recherche</Link>}</div>}
       </section>

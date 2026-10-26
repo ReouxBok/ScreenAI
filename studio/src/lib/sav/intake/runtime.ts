@@ -14,15 +14,16 @@ import type { EngineInput, MessageAnalysis } from "./engine-types";
 import type { IntakeReadTrace } from "./hubspot-readers";
 import { SAV_INTAKE_MODEL_REVISION } from "./model-readers";
 import { planSavIntake } from "./engine";
-import { SAV_INTAKE_DETERMINISTIC_ERRORS } from "./attempt-policy";
+import { intakeTransientFailure, SAV_INTAKE_DETERMINISTIC_ERRORS } from "./attempt-policy";
 import { createSavIntakeHubspotReaders } from "./hubspot-readers";
 import { createSavIntakeSemanticReaders } from "./model-readers";
+import { createSavIntakeSimpleReaders, memoizeIntakeCrmReaders, SAV_INTAKE_SIMPLE_REVISION } from "./simple-readers";
 import { withSavAiBudget } from "../gemini-transport";
 import { observeSavOther, readSavOtherConfiguration } from "../other-observation";
 import { assertSavIntakeObservation, savIntakeRuntimeConfig, SAV_INTAKE_RUNTIME_REVISION,
   type IntakeRuntimeConfig, type IntakeRuntimePayload } from "./runtime-contract";
 import { assertSavIntakeLease, catchupSavIntake, checkpointSavIntakeRun, claimSavIntakeRun, enqueueSavIntakeMessage, failSavIntakeRun,
-  pendingSavIntakeRuns, readSavIntakeBudget, reconcileConfinedIntakeUsage, reserveSavIntakeCall, saveSavIntakeResult } from "./runtime-store";
+  pendingSavIntakeRuns, readSavIntakeBudget, reconcileConfinedIntakeUsage, reserveSavIntakeCall, saveSavIntakeResult, intakeTransientRetries, scheduleSavIntakeTransientRetry } from "./runtime-store";
 
 /** Enqueue only: ingestion never invokes CRM/model or marks a mail processed. */
 export async function enqueueConfiguredSavIntake(messageId: string) {
@@ -50,6 +51,10 @@ async function analyseSavIntakeRuntimeWithinBudget(runId: string, config: Intake
   let readFailure: IntakeReadTrace | undefined;
   let dispatcher: ReturnType<typeof createIntakeModelDispatcher> | undefined;
   const payload: IntakeRuntimePayload = {configuration: { configHash: config.configHash, resourcesHash: config.resourcesHash, policyHash: config.policyHash, codeRevision: config.codeRevision, model: config.model }, semantics:{revision:SAV_INTAKE_SEMANTIC_RECORD_REVISION,validatorRevision:SAV_INTAKE_MODEL_REVISION,records:[]},provenance:[...lease.provenance], revision: SAV_INTAKE_RUNTIME_REVISION, input: lease.input, traces, effects: "not_connected" };
+  // Fixed at run creation: a switch flip never changes an analysis, repair or resume in flight.
+  const pipeline = previous.pipeline === "simple" ? "simple" as const : "current" as const;
+  if (pipeline === "simple") payload.pipeline = "simple";
+  if (pipeline === "simple") payload.semantics!.validatorRevision = SAV_INTAKE_SIMPLE_REVISION;
   payload.readRecovery = lease.recoveringRead ? structuredClone(previous.readRecovery!) : newReadRecovery(config,lease.sourceHash);
   if (lease.recoveringRead) { payload.semantics=structuredClone(previous.semantics!);payload.attachments=structuredClone(previous.attachments); }
   const live = async () => {
@@ -76,7 +81,8 @@ async function analyseSavIntakeRuntimeWithinBudget(runId: string, config: Intake
     }
     if(qualifiedOther) payload.other=qualifiedOther;
     await writeCheckpoint();
-    dispatcher = createIntakeModelDispatcher({ config, live, reserve: hash => reserveSavIntakeCall(lease, config, hash), preflight: hashes => assertSavIntakeCallPlan(lease.run.messageId, config, hashes), signal: controller.signal, env, network });
+    const retryOrdinal = await intakeTransientRetries(lease.run.messageId);
+    dispatcher = createIntakeModelDispatcher({ config, live, retryOrdinal, reserve: hash => reserveSavIntakeCall(lease, config, hash), preflight: hashes => assertSavIntakeCallPlan(lease.run.messageId, config, hashes), signal: controller.signal, env, network });
     const { call, pending } = dispatcher;
     const attachments = lease.recoveringRead ? null : await prepareIntakeAttachments(lease, config.model, live, deps.downloadAttachments);
     if (attachments) {
@@ -87,8 +93,30 @@ async function analyseSavIntakeRuntimeWithinBudget(runId: string, config: Intake
       }
       await writeCheckpoint();
     }
+    const crm = createSavIntakeHubspotReaders({ onRead: trace => { if(trace.status!=="complete")readFailure=trace;traces.push(trace); checkpoint(); }, network: async (url, init) => {
+      await live();
+      const signal = AbortSignal.any([controller.signal, ...(init?.signal ? [init.signal] : [])]);
+      return network(url, { ...init, signal, redirect: "error", headers: { ...Object.fromEntries(new Headers(init?.headers)), Authorization: `Bearer ${env().HUBSPOT_ACCESS_TOKEN}` } });
+    } });
+    const readPending:Promise<unknown>[]=[];
+    const recoverable=recoverableIntakeReads(crm,payload.readRecovery!,{reuse:Boolean(lease.recoveringRead),checkpoint,pending:readPending});
+    // The simple reader reads the CRM before its single call; the engine then sees the very same answers.
+    const reads = pipeline === "simple" ? memoizeIntakeCrmReaders(recoverable) : recoverable;
     const priorAnalysis=lease.recoveringRead?payload.semantics!.records.find(r=>r.method==="analyseMessage")?.result as MessageAnalysis|undefined:undefined;
-    const semanticReader = createSavIntakeSemanticReaders({ planCalls: dispatcher.plan, repairMalformedOutput,
+    // The single-call reader may show the model CRM context later than receipt: never used for at_receipt analyses.
+    const simple = pipeline === "simple" && lease.input.mode !== "at_receipt";
+    if (pipeline === "simple" && !simple) {
+      traces.push({ pipeline: "simple", reader: "current", cause: "at_receipt_not_supported" });
+      if (!lease.recoveringRead) payload.semantics!.validatorRevision = SAV_INTAKE_MODEL_REVISION;
+    }
+    const semanticReader = simple ? createSavIntakeSimpleReaders({ model: config.model, call, crm: reads, policy: config.policy, provenance: lease.provenance,
+      ...(attachments?.complete ? { attachments: { prepared: attachments.prepared, onRead: observations => {
+        attachments.state.read = { ...attachments.state.read, observations, state: "complete", completedAt: new Date().toISOString() };
+        payload.attachments = attachments.state; checkpoint();
+      } } } : {}),
+      onTrace: trace => { semanticFailureReason = trace.errorCode ?? undefined; traces.push(trace); checkpoint(); },
+      onJudgement: judgement => { traces.push({ phase: "simple_judgement", ...judgement }); checkpoint(); } })
+      : createSavIntakeSemanticReaders({ planCalls: dispatcher.plan, repairMalformedOutput,
       repairIssues:publicIntakeSchemaIssues((previous.traces?.findLast(t=>(t as {validationFailure?:unknown})?.validationFailure) as {validationFailure?:{issues?:unknown}}|undefined)?.validationFailure?.issues),
       ...(priorAnalysis?.attachmentObservations?{acceptedImages:priorAnalysis.attachmentObservations}:{}), ...(attachments?.complete ? { attachments: { prepared: attachments.prepared, onRead: observations => {
       attachments.state.read = { ...attachments.state.read, observations, state: "complete", completedAt: new Date().toISOString() };
@@ -103,13 +131,6 @@ async function analyseSavIntakeRuntimeWithinBudget(runId: string, config: Intake
       semanticFailureReason = failure.errorCode;
       traces.push({ ...failure, phase: "accepted_semantics", accepted: false }); checkpoint();
     });
-    const crm = createSavIntakeHubspotReaders({ onRead: trace => { if(trace.status!=="complete")readFailure=trace;traces.push(trace); checkpoint(); }, network: async (url, init) => {
-      await live();
-      const signal = AbortSignal.any([controller.signal, ...(init?.signal ? [init.signal] : [])]);
-      return network(url, { ...init, signal, redirect: "error", headers: { ...Object.fromEntries(new Headers(init?.headers)), Authorization: `Bearer ${env().HUBSPOT_ACCESS_TOKEN}` } });
-    } });
-    const readPending:Promise<unknown>[]=[];
-    const reads=recoverableIntakeReads(crm,payload.readRecovery!,{reuse:Boolean(lease.recoveringRead),checkpoint,pending:readPending});
     payload.plan = await withSavAiBudget(() => planSavIntake(lease.input, { ...reads, ...semantic }, qualifiedOther ? {...config.policy,qualifiedOther:{...(qualifiedOther.family==="authenticated_newsletter"?{family:"authenticated_newsletter" as const}:{}),resource:qualifiedOther.resource,evidenceSource:"private_rule"}} : config.policy, { timeoutMs: 10_000 }, () => new Date()));
     assertSavIntakeObservation(payload.plan);
     // Cancellation may finish after the pure planner's per-call timeout.
@@ -130,10 +151,13 @@ async function analyseSavIntakeRuntimeWithinBudget(runId: string, config: Intake
     } else if(lease.recoveringRead) {payload.readRecovery!.state=state==="waiting"?"invalidated":"complete";payload.readRecovery!.cache=[];}
     else delete payload.readRecovery;
     await saveSavIntakeResult(lease, config, payload, state);
+    // A provider outage is retried automatically at a durable due time, not left to wait.
+    const transientRetry = state === "waiting" && !dispatcher.uncertain && payload.readRecovery?.state !== "scheduled" && intakeTransientFailure(payload.reason)
+      ? await scheduleSavIntakeTransientRetry(runId, payload.reason!) : null;
     if(payload.readRecovery?.state==="scheduled")await (await import("./read-recovery-wake")).requestReadRecoveryWake(runId,{env:env(),start:deps.startReadRecovery});
     const retryFormat = state === "waiting" && lease.run.attempts === 1 && attachments?.complete
       && attachments.prepared.uniqueImages.length > 0 && payload.reason === "SAV_INTAKE_MODEL_OUTPUT_REJECTED";
-    return { runId, state, ...(retryFormat ? { retryFormat: true as const } : {}) };
+    return { runId, state, ...(retryFormat ? { retryFormat: true as const } : {}), retryAt: transientRetry?.retryAt.toISOString() };
   } catch (error) {
     controller.abort();
     // An expired routing authority must never leave a publishable Other plan.
@@ -143,7 +167,9 @@ async function analyseSavIntakeRuntimeWithinBudget(runId: string, config: Intake
     finishIntakeAttachmentRead(payload.attachments,attachmentFailureReason(payload.reason,Boolean(dispatcher?.uncertain)));
     await failSavIntakeRun(lease, payload, Boolean(dispatcher?.uncertain) || payload.reason === "SAV_INTAKE_RUNTIME_SETTLEMENT_UNCERTAIN",
       { deterministic: SAV_INTAKE_DETERMINISTIC_ERRORS.has(payload.reason ?? "") });
-    return { runId, state: dispatcher?.uncertain ? "uncertain" : "waiting", reason: payload.reason };
+    const uncertain = Boolean(dispatcher?.uncertain) || payload.reason === "SAV_INTAKE_RUNTIME_SETTLEMENT_UNCERTAIN";
+    const transientRetry = !uncertain && intakeTransientFailure(payload.reason) ? await scheduleSavIntakeTransientRetry(runId, payload.reason!).catch(() => null) : null;
+    return { runId, state: dispatcher?.uncertain ? "uncertain" : "waiting", reason: payload.reason, retryAt: transientRetry?.retryAt.toISOString() };
   } finally { controller.abort(); clearTimeout(timer); }
 }
 export async function analyseSavIntakeRuntime(...args: Parameters<typeof analyseSavIntakeRuntimeWithinBudget>) {
