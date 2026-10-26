@@ -50,7 +50,7 @@ const stageOf = (error: unknown) => (error && typeof error === "object" ? (error
 
 // Use the existing REST responseSchema representation; limits and strictness
 // remain enforced by Zod after generation, not by a promise from the provider.
-function responseSchema(schema: z.ZodType): Record<string, unknown> {
+export function intakeResponseSchema(schema: z.ZodType): Record<string, unknown> {
   const convert = (input: unknown): Record<string, unknown> => {
     const s = input as Record<string, unknown>, result: Record<string, unknown> = {};
     if (Array.isArray(s.anyOf)) {
@@ -136,7 +136,7 @@ export function createSavIntakeSemanticReaders(options: {
   }
   function requestBody(instruction: string, data: Record<string, unknown>, schema: z.ZodType, repair = false): Parameters<IntakeGeminiCall>[0]["body"] {
     return { systemInstruction: { parts: [{ text: `${common}\n${instruction}${repair ? "\nFORMAT REPAIR v1: the previous response could not be decoded with the required output schema. Read the SAME evidence again and return a new complete JSON object conforming exactly to responseSchema: required keys and enum values, no extra keys. Omit optional keys rather than returning null. All quotation, identity and financial rules remain mandatory. Do not infer missing facts or claim any action happened. Known rejected fields: " + JSON.stringify(repairIssues) : ""}` }] },
-      contents: [{ role: "user", parts: [{ text: JSON.stringify(data) }] }], generationConfig: { maxOutputTokens: 8192, responseMimeType: "application/json", responseSchema: responseSchema(schema) } };
+      contents: [{ role: "user", parts: [{ text: JSON.stringify(data) }] }], generationConfig: { maxOutputTokens: 8192, responseMimeType: "application/json", responseSchema: intakeResponseSchema(schema) } };
   }
   function boundedBody(phase: "understanding" | "ticket_matching", instruction: string, data: Record<string, unknown>, schema: z.ZodType,
     signal: AbortSignal, histories?: IntakeHistory[], repair = false) {

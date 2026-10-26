@@ -1,6 +1,7 @@
 import { savIntakeEvidenceContentHash } from "./engine";
 import { identityAssessmentSchema, issueAssessmentSchema, messageAnalysisSchema } from "./engine-types";
 import { SAV_INTAKE_MODEL_REVISION, type SavIntakeSemanticReaders } from "./model-readers";
+import { SAV_INTAKE_SIMPLE_REVISION } from "./simple-revision";
 /** Stored only after strict reader parsing, citations and coverage validation. */
 export const SAV_INTAKE_SEMANTIC_RECORD_REVISION = "sav-intake-accepted-results.v1";
 export type AcceptedIntakeSemantics = {
@@ -77,7 +78,8 @@ export function recordAcceptedIntakeSemantics(readers: SavIntakeSemanticReaders,
     assessIssues: wrap("assessIssues") as SavIntakeSemanticReaders["assessIssues"] };
 }
 export function acceptedIntakeResult<T>(envelope: AcceptedIntakeSemantics | undefined, method: keyof SavIntakeSemanticReaders, input: unknown): T {
-  if (envelope?.revision !== SAV_INTAKE_SEMANTIC_RECORD_REVISION || envelope.validatorRevision !== SAV_INTAKE_MODEL_REVISION)
+  // Both readers produce the engine's own result shapes; the record names which validator accepted it.
+  if (envelope?.revision !== SAV_INTAKE_SEMANTIC_RECORD_REVISION || ![SAV_INTAKE_MODEL_REVISION, SAV_INTAKE_SIMPLE_REVISION].includes(envelope.validatorRevision))
     throw Error("SAV_INTAKE_SEMANTIC_PROVENANCE_MISSING");
   const rows = envelope.records.filter(row => row.method === method && row.inputHash === intakeSemanticInputHash(input)
     && row.inputHash === intakeSemanticInputHash(row.input) && row.resultHash === savIntakeEvidenceContentHash(row.result));

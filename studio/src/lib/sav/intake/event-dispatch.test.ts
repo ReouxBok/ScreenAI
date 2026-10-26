@@ -5,12 +5,18 @@ import { createSavTestDb } from "../../../../test/sav-db";
 import { executionProvider } from "../../../../test/sav-intake-execution-provider";
 import { auditLogs, savMailboxes, savThreads, savMessages, staffUsers, savIntakeExecutions, savIntakeExecutionBudget, savIntakeModelCalls, savIntakeRuns, savSyncState } from "@/db/schema";
 const state = vi.hoisted(() => ({ db: null as unknown, user: null as unknown, start: vi.fn() }));
+// Scheduling is covered by hubspot-transport.test.ts; keep business scenarios
+// independent of real rate-limit waits without replacing readers or guards.
+vi.mock("../hubspot-transport", async importOriginal => {
+  const { virtualSavHubspotTransportModule } = await import("../../../../test/sav-virtual-hubspot-transport");
+  return virtualSavHubspotTransportModule(await importOriginal<typeof import("../hubspot-transport")>());
+});
 vi.mock("@/db", () => ({ requireDb: () => { if (!state.db) throw Error("NO_DB_ALLOWED"); return state.db; } }));
 vi.mock("@clerk/nextjs/server", () => ({ currentUser: async () => state.user }));
 vi.mock("workflow/api", () => ({ start: state.start }));
 vi.mock("@/workflows/sav-intake", () => ({ processSavIntakeWakeWorkflow: vi.fn() }));
 import { encryptSavPayload } from "../crypto";
-import { SAV_EXTERNAL_COMPLETION } from "../external-completion";
+import { SAV_EXTERNAL_COMPLETION, readSavExternalCompletion } from "../external-completion";
 import { savIntakeRuntimeConfig, intakeRuntimeHash, type IntakeRuntimeConfig } from "./runtime-contract";
 import { SAV_INTAKE_OPERATIONAL_PROFILE } from "./budget-profile";
 import { approveIntakeExecutionPolicy, intakeExecutionConfig, readIntakeExecutionAuthority, revokeIntakeExecutionPolicy, type ExecutionPolicy } from "./execution-policy";
@@ -216,7 +222,7 @@ it("pause, revocation, newer message and external handling are refused", async (
   await setup();
   const old = (await enqueueSavIntakeMessage(messageId, runtime))!;
   expect((await analyseSavIntakeWake(old, deps())).state).toBe("observed");
-  const newer = await storedMessage(threadId, { at: later(1000) });
+  const newer = await storedMessage(threadId, { at: later(1000), createdAt: later(1000) });
   expect((await executeSavIntakeWake(old, deps())).state).not.toBe("confirmed");
   await enqueueSavIntakeMessage(newer.id, runtime);
   expect(await requestSavIntakeWake(old, { env: environment, start: state.start })).toMatchObject({ reason: "no_durable_work" });
@@ -263,8 +269,27 @@ it("operational_utc_v1: distinct messages processed concurrently keep budget and
   const otherThread = (await f.db.insert(savThreads).values({ mailboxId, gmailThreadId: "gmail-thread-b", customerEmail: customer }).returning())[0].id;
   const other = await storedMessage(otherThread);
   const ids = [(await enqueueSavIntakeMessage(messageId, runtime))!, (await enqueueSavIntakeMessage(other.id, runtime))!];
-  const results = await Promise.all(ids.map(id => processSavIntakeWake(id, deps())));
-  expect(results.map(r => r.analysis.state)).toEqual(["observed", "observed"]);
+  // This accounting scenario compares two analyses of the initial CRM snapshot.
+  // Synchronize their execution fences explicitly instead of relying on search
+  // rate-limit sleeps to keep the first write behind the second analysis.
+  const executionArrivals = new Set<string>();
+  const fenceCalls = new Map<string, number>();
+  let release!: () => void;
+  const bothAnalysed = new Promise<void>(resolve => { release = resolve; });
+  const concurrentDeps = deps({ readExternalCompletion: async message => {
+    const calls = (fenceCalls.get(message.id) ?? 0) + 1;
+    fenceCalls.set(message.id, calls);
+    if (calls === 2) {
+      executionArrivals.add(message.id);
+      if (executionArrivals.size === ids.length) release();
+      await bothAnalysed;
+    }
+    // Re-read the real fence after waiting; no completion or pause is bypassed.
+    return readSavExternalCompletion(message);
+  } });
+  const results = await Promise.all(ids.map(id => processSavIntakeWake(id, concurrentDeps)));
+  expect(executionArrivals).toEqual(new Set([messageId, other.id]));
+  expect(results.map(r => r.analysis.state), JSON.stringify(results)).toEqual(["observed", "observed"]);
   expect(modelHits).toBe(2);
   const rows = await ledger();
   expect(rows.map(r => r.state)).toEqual(["settled", "settled"]);
@@ -310,7 +335,9 @@ it.each(["pending", "observed", "admitted"] as const)("recovery skips more than 
         ...(kind === "lease" ? { leaseToken: randomUUID(), leaseUntil: later(600_000) } : {}) });
       if (kind === "external") await f.db.insert(auditLogs).values({ actorEmail: "ugo@limova.ai", action: SAV_EXTERNAL_COMPLETION, entityType: "sav_message", entityId: message.id,
         technicalMetadata: { version: 1, threadId: thread.id, batchId: randomUUID(), receivedBefore: later(60_000).toISOString(), reason: "processed_outside_studio" } });
-      if (kind === "stale") await storedMessage(thread.id, { at: later(1000) });
+      // A genuinely newer mail: received AND stored later. A provider date alone in the future is
+      // bounded by storage time (étape 1), which made this fixture tie with the older mail.
+      if (kind === "stale") await storedMessage(thread.id, { at: later(1000), createdAt: later(1000) });
       if (kind === "exhausted" || kind === "recent") await f.db.insert(auditLogs).values({ actorEmail: "system", action: "sav_intake_wake_requested", entityType: "sav_intake_wake", entityId: copy.id,
         technicalMetadata: { state: kind === "exhausted" ? "abandoned" : "running", dispatches: kind === "exhausted" ? SAV_INTAKE_WAKE_MAX_DISPATCHES : 1,
           lastDispatchedAt: kind === "exhausted" ? old.toISOString() : now.toISOString() } });
