@@ -16,7 +16,7 @@ vi.mock("@clerk/nextjs/server", () => ({ currentUser: async () => state.user }))
 vi.mock("workflow/api", () => ({ start: state.start }));
 vi.mock("@/workflows/sav-intake", () => ({ processSavIntakeWakeWorkflow: vi.fn() }));
 import { encryptSavPayload } from "../crypto";
-import { SAV_EXTERNAL_COMPLETION } from "../external-completion";
+import { SAV_EXTERNAL_COMPLETION, readSavExternalCompletion } from "../external-completion";
 import { savIntakeRuntimeConfig, intakeRuntimeHash, type IntakeRuntimeConfig } from "./runtime-contract";
 import { SAV_INTAKE_OPERATIONAL_PROFILE } from "./budget-profile";
 import { approveIntakeExecutionPolicy, intakeExecutionConfig, readIntakeExecutionAuthority, revokeIntakeExecutionPolicy, type ExecutionPolicy } from "./execution-policy";
@@ -269,8 +269,27 @@ it("operational_utc_v1: distinct messages processed concurrently keep budget and
   const otherThread = (await f.db.insert(savThreads).values({ mailboxId, gmailThreadId: "gmail-thread-b", customerEmail: customer }).returning())[0].id;
   const other = await storedMessage(otherThread);
   const ids = [(await enqueueSavIntakeMessage(messageId, runtime))!, (await enqueueSavIntakeMessage(other.id, runtime))!];
-  const results = await Promise.all(ids.map(id => processSavIntakeWake(id, deps())));
-  expect(results.map(r => r.analysis.state)).toEqual(["observed", "observed"]);
+  // This accounting scenario compares two analyses of the initial CRM snapshot.
+  // Synchronize their execution fences explicitly instead of relying on search
+  // rate-limit sleeps to keep the first write behind the second analysis.
+  const executionArrivals = new Set<string>();
+  const fenceCalls = new Map<string, number>();
+  let release!: () => void;
+  const bothAnalysed = new Promise<void>(resolve => { release = resolve; });
+  const concurrentDeps = deps({ readExternalCompletion: async message => {
+    const calls = (fenceCalls.get(message.id) ?? 0) + 1;
+    fenceCalls.set(message.id, calls);
+    if (calls === 2) {
+      executionArrivals.add(message.id);
+      if (executionArrivals.size === ids.length) release();
+      await bothAnalysed;
+    }
+    // Re-read the real fence after waiting; no completion or pause is bypassed.
+    return readSavExternalCompletion(message);
+  } });
+  const results = await Promise.all(ids.map(id => processSavIntakeWake(id, concurrentDeps)));
+  expect(executionArrivals).toEqual(new Set([messageId, other.id]));
+  expect(results.map(r => r.analysis.state), JSON.stringify(results)).toEqual(["observed", "observed"]);
   expect(modelHits).toBe(2);
   const rows = await ledger();
   expect(rows.map(r => r.state)).toEqual(["settled", "settled"]);
