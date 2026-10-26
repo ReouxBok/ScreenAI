@@ -367,6 +367,50 @@ it("operational profile separates an old initial frontier from bounded30day auth
   expect(savIntakeRuntimeConfig({...environment,SAV_INTAKE_RUNTIME_CONFIG:JSON.stringify(pins)})).toHaveProperty("budgetProfile","operational_utc_v1");
   for(const change of [{maxRollingNanoUsd:undefined},{maxCalls:301},{maxRollingNanoUsd:90000000001},{expiresAt:new Date(Date.now()+31*86400000).toISOString()}]) expect(()=>savIntakeRuntimeConfig({...environment,SAV_INTAKE_RUNTIME_CONFIG:JSON.stringify({...pins,...change})})).toThrow();
 });
+it("operational profile accepts the approved5 USD daily cap while every other bound stays strict",()=>{
+  const pins={...JSON.parse(environment.SAV_INTAKE_RUNTIME_CONFIG!),budgetProfile:"operational_utc_v1",maxRollingNanoUsd:90000000000,maxCalls:300,maxNanoUsd:5000000000,expiresAt:new Date(Date.now()+29*86400000).toISOString()};
+  const parse=(change:Record<string,unknown>)=>savIntakeRuntimeConfig({...environment,SAV_INTAKE_RUNTIME_CONFIG:JSON.stringify({...pins,...change})});
+  expect(parse({})).toMatchObject({budgetProfile:"operational_utc_v1",maxNanoUsd:5000000000,maxRollingNanoUsd:90000000000,maxCalls:300});
+  expect(parse({maxNanoUsd:3000000000})).toHaveProperty("maxNanoUsd",3000000000);
+  expect(parse({})!.configHash).not.toBe(parse({maxNanoUsd:3000000000})!.configHash);
+  for(const maxNanoUsd of [5000000001,0,-1,1.5,Number.NaN,Number.POSITIVE_INFINITY,"5000000000",null]) expect(()=>parse({maxNanoUsd})).toThrow("SAV_INTAKE_RUNTIME_CONFIGURATION_REQUIRED");
+  for(const change of [{maxRollingNanoUsd:90000000001},{maxCalls:301}]) expect(()=>parse(change)).toThrow("SAV_INTAKE_RUNTIME_CONFIGURATION_REQUIRED");
+  // Qualification (no profile) keeps its historical lifetime cap and30 calls.
+  const legacy=JSON.parse(environment.SAV_INTAKE_RUNTIME_CONFIG!);
+  expect(()=>savIntakeRuntimeConfig({...environment,SAV_INTAKE_RUNTIME_CONFIG:JSON.stringify({...legacy,maxNanoUsd:5000000000})})).toThrow("SAV_INTAKE_RUNTIME_CONFIGURATION_REQUIRED");
+  expect(()=>savIntakeRuntimeConfig({...environment,SAV_INTAKE_RUNTIME_CONFIG:JSON.stringify({...legacy,maxNanoUsd:3000000001})})).toThrow("SAV_INTAKE_RUNTIME_CONFIGURATION_REQUIRED");
+  expect(savIntakeRuntimeConfig({...environment,SAV_INTAKE_RUNTIME_CONFIG:JSON.stringify({...legacy,maxNanoUsd:3000000000})})).toHaveProperty("maxNanoUsd",3000000000);
+});
+it("5 USD deducts settled and uncertain usage, never resets the ledger, and the30day cap still defers with daily margin",async()=>{
+  operational();
+  const atThree={...config};environment={...environment,SAV_INTAKE_RUNTIME_CONFIG:JSON.stringify({...JSON.parse(environment.SAV_INTAKE_RUNTIME_CONFIG!),maxNanoUsd:5000000000})};
+  const raised=savIntakeRuntimeConfig(environment)!;expect(raised.maxNanoUsd).toBe(5000000000);expect(atThree.maxNanoUsd).toBe(3000000000);
+  const id=(await enqueueSavIntakeMessage(messageId,raised))!;
+  // Each row costs one full reservation (0.817152 USD): the maximum a single settled call can charge.
+  const fill=(n:number,state:string,createdAt=new Date())=>Array.from({length:n},(_,i)=>({messageKey:intakeRuntimeHash(`fill-${state}-${createdAt.getTime()}-${i}`),requestHash:intakeRuntimeHash(`req-${state}-${createdAt.getTime()}-${i}`),state,reservedNanoUsd:817152000,chargedNanoUsd:817152000,
+    payloadCiphertext:encryptSavPayload({metadata:{inputTokens:1048576,outputTokens:8192,thoughtTokens:0,totalTokens:1056768}}),createdAt}));
+  // 4.09 USD settled today + one old uncertain reservation of another message: above 3 USD, within 5 USD.
+  await f.db.insert(savIntakeModelCalls).values([...fill(5,"settled"),...fill(1,"uncertain",new Date(Date.now()-40*86400000))]);
+  expect(await readSavIntakeBudget(atThree)).toMatchObject({chargedNanoUsd:4902912000,remainingNanoUsd:0,uncertain:true});
+  expect(await readSavIntakeBudget(raised)).toMatchObject({chargedNanoUsd:4902912000,remainingNanoUsd:97088000,lifetimeCallCount:6});
+  // Remaining 0.097 USD < one 0.817 USD reservation: deferred, no attempt consumed, no reset of history.
+  expect(await claimSavIntakeRun(id,raised)).toBeNull();
+  expect((await readSavIntakeCurrent(threadId,raised))?.attempts).toBe(0);
+  expect((await readSavIntakeCurrent(threadId,raised))?.payload.reason).toBe("SAV_INTAKE_RUNTIME_DAILY_BUDGET_DEFERRED");
+  expect(await readSavIntakeBudget(raised)).toHaveProperty("lifetimeCallCount",6);
+  // A rolling cap exhausted by earlier days defers even with the whole daily 5 USD free.
+  await f.db.delete(savIntakeModelCalls);
+  await f.db.insert(savIntakeModelCalls).values(fill(111,"settled",new Date(Date.now()-2*86400000)));
+  expect(await readSavIntakeBudget(raised)).toMatchObject({remainingNanoUsd:5000000000,remainingRollingNanoUsd:0});
+  expect(await claimSavIntakeRun(id,raised)).toBeNull();
+  expect((await readSavIntakeCurrent(threadId,raised))?.payload.reason).toBe("SAV_INTAKE_RUNTIME_ROLLING_BUDGET_DEFERRED");
+  expect((await readSavIntakeCurrent(threadId,raised))?.attempts).toBe(0);
+  // 3.27 USD settled today: no margin at the old 3 USD cap, claimable at 5 USD.
+  await f.db.delete(savIntakeModelCalls);
+  await f.db.insert(savIntakeModelCalls).values(fill(4,"settled"));
+  expect(await readSavIntakeBudget(atThree)).toHaveProperty("remainingNanoUsd",0);
+  expect((await claimSavIntakeRun(id,raised))?.run.attempts).toBe(1);
+});
 it("one provider timeout reserves its full cost beyond30days, blocks its message, and permits a second dossier within both margins",async()=>{
   operational();const first=await lease();
   const a=await reserveSavIntakeCall(first,config,"timeout-a");

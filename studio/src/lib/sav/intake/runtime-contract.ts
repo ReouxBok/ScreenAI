@@ -1,4 +1,4 @@
-import { SAV_INTAKE_OPERATIONAL_PROFILE, intakeOperationalTermValid } from "./budget-profile";
+import { SAV_INTAKE_BUDGET_BOUNDS, SAV_INTAKE_OPERATIONAL_PROFILE, intakeOperationalTermValid } from "./budget-profile";
 import { createHash } from "node:crypto";
 import { z } from "zod";
 import { SAV_INTAKE_MODEL_REVISION } from "./model-readers";
@@ -18,10 +18,11 @@ const policySchema = z.object({
     partnership: resource.optional(), commercial: resource.optional(), investor: resource.optional() }).strict(),
 }).strict();
 export const savIntakeRuntimePins = z.object({ mailboxId: z.uuid(), createdAfter: z.iso.datetime(), receivedAfter: z.iso.datetime(), expiresAt: z.iso.datetime(), codeRevision: z.string().regex(/^[a-f0-9]{40}$/),
-  resourcesHash: z.string().regex(/^[a-f0-9]{64}$/), policyHash: z.string().regex(/^[a-f0-9]{64}$/), maxNanoUsd: z.number().int().min(1).max(3_000_000_000), maxCalls: z.number().int().min(1).max(300),
+  resourcesHash: z.string().regex(/^[a-f0-9]{64}$/), policyHash: z.string().regex(/^[a-f0-9]{64}$/), maxNanoUsd: z.number().int().min(1).max(SAV_INTAKE_BUDGET_BOUNDS.operational.maxNanoUsd), maxCalls: z.number().int().min(1).max(SAV_INTAKE_BUDGET_BOUNDS.operational.maxCalls),
   readRecovery: intakeReadRecoveryPolicySchema.optional(),
-  budgetProfile: z.literal(SAV_INTAKE_OPERATIONAL_PROFILE).optional(), maxRollingNanoUsd: z.number().int().min(1).max(90_000_000_000).optional() }).strict().refine(p =>
-    p.budgetProfile === SAV_INTAKE_OPERATIONAL_PROFILE ? p.maxRollingNanoUsd !== undefined : p.maxCalls <= 30 && p.maxRollingNanoUsd === undefined);
+  budgetProfile: z.literal(SAV_INTAKE_OPERATIONAL_PROFILE).optional(), maxRollingNanoUsd: z.number().int().min(1).max(SAV_INTAKE_BUDGET_BOUNDS.operational.maxRollingNanoUsd).optional() }).strict().refine(p =>
+    p.budgetProfile === SAV_INTAKE_OPERATIONAL_PROFILE ? p.maxRollingNanoUsd !== undefined
+      : p.maxCalls <= SAV_INTAKE_BUDGET_BOUNDS.qualification.maxCalls && p.maxNanoUsd <= SAV_INTAKE_BUDGET_BOUNDS.qualification.maxNanoUsd && p.maxRollingNanoUsd === undefined);
 export type IntakeRuntimeConfig = z.infer<typeof savIntakeRuntimePins> & { mode: "observe"; policy: EnginePolicy; configHash: string; model: "gemini-3.6-flash";
   /** Reader pipeline for NEW runs only; frozen in each run at creation and deliberately outside configHash. */
   pipeline?: SavIntakePipeline };
