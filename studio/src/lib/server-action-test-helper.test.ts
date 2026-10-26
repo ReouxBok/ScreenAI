@@ -6,7 +6,7 @@ it("passes UTF-8 Flight bytes to Chromium without charset guessing or replaying 
   const response = { headers: () => ({ "content-type": "text/x-component", "content-encoding": "gzip", "content-length": "17", "transfer-encoding": "chunked", "x-action-redirect": "/done;push" }), body: vi.fn(async () => bytes) };
   const route = { request: () => ({}), fetch: vi.fn(async () => response), fulfill: vi.fn(async (options: { response: unknown; headers: Record<string, string>; body: Buffer }) => { expect(options.body).toEqual(bytes); }), fallback: vi.fn() };
   let handler!: (route: Route) => Promise<void>;
-  const page = { route: vi.fn(async (_pattern: string, callback: (route: Route) => Promise<void>) => { handler = callback; }), unroute: vi.fn(async () => {}) };
+  const page = { url: () => "http://127.0.0.1:3100/studio/review?result=old", route: vi.fn(async (_pattern: string, callback: (route: Route) => Promise<void>) => { handler = callback; }), unroute: vi.fn(async () => {}) };
   const action = await fetchServerActionInFull(page as unknown as Page, () => true);
   await handler(route as unknown as Route); await action.settled();
   expect(route.fetch).toHaveBeenCalledTimes(1);
@@ -21,7 +21,7 @@ it("runs the race barrier after the single POST response and before Chromium rec
   const response = { headers: () => ({ "content-type": "text/x-component", "content-encoding": "gzip", "content-length": "17", "transfer-encoding": "chunked", "x-action-redirect": "/done;push" }), body: vi.fn(async () => { events.push("body"); return bytes; }) };
   const route = { request: () => ({}), fetch: vi.fn(async () => { events.push("fetch"); return response; }), fulfill: vi.fn(async () => { events.push("fulfill"); }), fallback: vi.fn(async () => {}) };
   let handler!: (route: Route) => Promise<void>;
-  const page = { route: vi.fn(async (_pattern: string, callback: typeof handler) => { handler = callback; }), unroute: vi.fn(async () => {}) };
+  const page = { url: () => "http://127.0.0.1:3100/studio/review?result=old", route: vi.fn(async (_pattern: string, callback: typeof handler) => { handler = callback; }), unroute: vi.fn(async () => {}) };
   const action = await fetchServerActionInFull(page as unknown as Page, () => true, async () => { events.push("context"); });
   await handler(route as unknown as Route); await action.settled();
   await handler(route as unknown as Route);
@@ -35,7 +35,7 @@ it("surfaces a failed race barrier without retrying the POST or delivering a fal
   const failure = new Error("CONTEXT_NOT_OBSERVED");
   const route = { request: () => ({}), fetch: vi.fn(async () => ({ headers: () => ({}), body: async () => Buffer.from("response") })), fulfill: vi.fn(), fallback: vi.fn() };
   let handler!: (route: Route) => Promise<void>;
-  const page = { route: vi.fn(async (_pattern: string, callback: typeof handler) => { handler = callback; }), unroute: vi.fn(async () => {}) };
+  const page = { url: () => "http://127.0.0.1:3100/studio/review?result=old", route: vi.fn(async (_pattern: string, callback: typeof handler) => { handler = callback; }), unroute: vi.fn(async () => {}) };
   const action = await fetchServerActionInFull(page as unknown as Page, () => true, async () => { throw failure; });
   const rejected = expect(action.settled()).rejects.toBe(failure);
   await handler(route as unknown as Route); await rejected;
@@ -50,10 +50,29 @@ it("keeps non-Flight response metadata while removing stale wire encoding", asyn
   const response = { headers: () => ({ "content-type": "text/plain; charset=utf-8", "content-encoding": "br", "content-length": "99", "x-action-revalidated": "1" }), body: async () => bytes };
   const route = { request: () => ({}), fetch: vi.fn(async () => response), fulfill: vi.fn(async () => {}), fallback: vi.fn() };
   let handler!: (route: Route) => Promise<void>;
-  const page = { route: vi.fn(async (_pattern: string, callback: typeof handler) => { handler = callback; }), unroute: vi.fn(async () => {}) };
+  const page = { url: () => "http://127.0.0.1:3100/studio/review?result=old", route: vi.fn(async (_pattern: string, callback: typeof handler) => { handler = callback; }), unroute: vi.fn(async () => {}) };
   const action = await fetchServerActionInFull(page as unknown as Page, () => true);
   await handler(route as unknown as Route); await action.settled();
   expect(route.fulfill).toHaveBeenCalledExactlyOnceWith({ response, headers: { "content-type": "text/plain; charset=utf-8", "x-action-revalidated": "1" }, body: bytes });
   expect(route.fetch).toHaveBeenCalledTimes(1);
   await action.dispose();
+});
+
+
+it("scopes interception and disposal to the invoking page, never its rendering assets", async () => {
+  const page = {
+    url: () => "http://127.0.0.1:3100/studio/review?result=old",
+    route: vi.fn(async () => {}), unroute: vi.fn(async () => {}),
+  };
+  const action = await fetchServerActionInFull(page as unknown as Page, () => true);
+  const [pattern, handler] = page.route.mock.calls[0] as unknown as [RegExp, unknown];
+  expect(pattern).toBeInstanceOf(RegExp);
+  for (const url of ["http://127.0.0.1:3100/studio/review", "http://127.0.0.1:3100/studio/review?result=new&returnTo=/studio"]) {
+    expect(pattern.test(url), url).toBe(true);
+  }
+  for (const url of ["http://127.0.0.1:3100/_next/static/css/app/layout.css?v=1", "http://127.0.0.1:3100/_next/static/chunks/app.js", "http://127.0.0.1:3100/studio/review-other", "http://127.0.0.2:3100/studio/review"]) {
+    expect(pattern.test(url), url).toBe(false);
+  }
+  await action.dispose();
+  expect(page.unroute).toHaveBeenCalledExactlyOnceWith(pattern, handler);
 });

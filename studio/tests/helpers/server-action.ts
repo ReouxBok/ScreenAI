@@ -66,9 +66,14 @@ export async function fetchServerActionInFull(page: Page, matches: (request: Req
       fail(error);
     }
   };
-  await page.route("**/*", handler);
+  // Server Actions POST to the invoking page. Leave rendering assets outside
+  // this short-lived interception: they can still be loading at disposal.
+  const url = new URL(page.url());
+  const actionPath = `${url.origin}${url.pathname}`.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const actionUrl = new RegExp(`^${actionPath}(?:\\?.*)?$`);
+  await page.route(actionUrl, handler);
   return {
     settled: () => settled,
-    dispose: () => page.unroute("**/*", handler),
+    dispose: () => page.unroute(actionUrl, handler),
   };
 }
