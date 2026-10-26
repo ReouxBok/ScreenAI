@@ -411,6 +411,40 @@ it("5 USD deducts settled and uncertain usage, never resets the ledger, and the3
   expect(await readSavIntakeBudget(atThree)).toHaveProperty("remainingNanoUsd",0);
   expect((await claimSavIntakeRun(id,raised))?.run.attempts).toBe(1);
 });
+it("Studio daily cap overrides the pinned operational cap under the budget lock, outside configHash, without resetting the ledger",async()=>{
+  operational();const hash=config.configHash,id=(await enqueueSavIntakeMessage(messageId,config))!;
+  const fill=(n:number)=>Array.from({length:n},(_,i)=>({messageKey:intakeRuntimeHash(`studio-${i}`),requestHash:intakeRuntimeHash(`studio-req-${i}`),state:"settled",reservedNanoUsd:817152000,chargedNanoUsd:817152000,
+    payloadCiphertext:encryptSavPayload({metadata:{inputTokens:1048576,outputTokens:8192,thoughtTokens:0,totalTokens:1056768}}),createdAt:new Date()}));
+  const setOverride=async(maxNanoUsd:number|null,cursor?:string)=>{const values={key:"sav-intake-daily-budget-override.v1",status:"active",updatedAt:new Date(),
+    cursor:cursor??encryptSavPayload({revision:"sav-intake-daily-budget-override.v1",maxNanoUsd,setBy:"ugo@limova.ai",setAt:new Date().toISOString(),reason:"synthetic"})};
+    await f.db.insert(savSyncState).values(values).onConflictDoUpdate({target:savSyncState.key,set:values});};
+  await f.db.insert(savIntakeModelCalls).values(fill(4)); // 3.27 USD counted today: no margin at the pinned 3 USD.
+  expect(await readSavIntakeBudget(config)).toMatchObject({maxNanoUsd:3000000000,remainingNanoUsd:0});
+  expect(await claimSavIntakeRun(id,config)).toBeNull();
+  expect((await readSavIntakeCurrent(threadId,config))?.payload.reason).toBe("SAV_INTAKE_RUNTIME_DAILY_BUDGET_DEFERRED");
+  await setOverride(10000000000);
+  expect(await readSavIntakeBudget(config)).toMatchObject({maxNanoUsd:10000000000,chargedNanoUsd:3268608000,remainingNanoUsd:6731392000,lifetimeCallCount:4,maxRollingNanoUsd:90000000000,maxCalls:300});
+  expect(config.configHash).toBe(hash);expect(config.maxNanoUsd).toBe(3000000000);
+  const lease=(await claimSavIntakeRun(id,config))!;expect(lease.run.attempts).toBe(1);
+  await expect(assertSavIntakeCallPlan(lease.run.messageId,config,[intakeRuntimeHash("studio-plan")])).resolves.toBeUndefined();
+  const call=await reserveSavIntakeCall(lease,config,"studio-call");expect(call.cached).toBeNull();
+  expect(await settleSavIntakeCall(call.id,{inputTokens:100,outputTokens:50,thoughtTokens:0,totalTokens:150})).toBe(true);
+  // Back to the configuration: the same ledger is again over the pinned cap.
+  await setOverride(null);
+  expect(await readSavIntakeBudget(config)).toMatchObject({maxNanoUsd:3000000000,remainingNanoUsd:0,lifetimeCallCount:5});
+  await expect(reserveSavIntakeCall(lease,config,"studio-call-2")).rejects.toThrow("BUDGET_EXHAUSTED");
+  // Qualification profile ignores the Studio cap.
+  await setOverride(10000000000);
+  const qualification={...config,budgetProfile:undefined,maxRollingNanoUsd:undefined,maxCalls:30};
+  expect(await readSavIntakeBudget(qualification)).toHaveProperty("maxNanoUsd",3000000000);
+  // A tampered or unreadable stored cap fails closed instead of falling back.
+  await setOverride(null,"not-a-valid-ciphertext");
+  await expect(readSavIntakeBudget(config)).rejects.toThrow("SAV_INTAKE_BUDGET_OVERRIDE_INVALID");
+  await expect(reserveSavIntakeCall(lease,config,"studio-call-3")).rejects.toThrow("SAV_INTAKE_BUDGET_OVERRIDE_INVALID");
+  await setOverride(null,encryptSavPayload({revision:"sav-intake-daily-budget-override.v1",maxNanoUsd:20000000001,setBy:"ugo@limova.ai",setAt:new Date().toISOString(),reason:"synthetic"}));
+  await expect(readSavIntakeBudget(config)).rejects.toThrow("SAV_INTAKE_BUDGET_OVERRIDE_INVALID");
+  await f.db.delete(savSyncState).where(eq(savSyncState.key,"sav-intake-daily-budget-override.v1"));
+});
 it("one provider timeout reserves its full cost beyond30days, blocks its message, and permits a second dossier within both margins",async()=>{
   operational();const first=await lease();
   const a=await reserveSavIntakeCall(first,config,"timeout-a");

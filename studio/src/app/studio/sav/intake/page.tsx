@@ -2,6 +2,7 @@ import Link from "next/link";
 import { z } from "zod";
 import { formatParisDateTime } from "@/lib/paris-date";
 import { requireIntakeConsoleStaff } from "@/lib/sav/intake/console-auth";
+import { SAV_INTAKE_BUDGET_OWNER_EMAIL } from "@/lib/sav/intake/budget-amount";
 import { listIntakeConsole } from "@/lib/sav/intake/console-store";
 import { savIntakeViewLabels, savIntakeViewSchema } from "@/lib/sav/intake/contract";
 import { intakeStatusLabel, intakeReasonLabel, intakeBlockedCauseLabel, intakeRetryLabel } from "@/lib/sav/intake/console-presentation";
@@ -20,7 +21,7 @@ export default async function IntakeConsolePage({ searchParams }: { searchParams
   return <div className={styles.console}>
     <IntakeListPosition origin={origin}/>
     <header className={styles.heading}><div><span className="eyebrow">SAV · nouveaux dossiers</span><h1>Suivre le traitement</h1>
-      <p>Les actions confirmées et le suivi réel déterminent l’avancement.</p></div><div className={styles.actions}>{["admin","owner"].includes(staff.role)&&<Link className="button secondary" href="/studio/sav/intake/launch">Administration du lancement</Link>}<Link className="button secondary" href="/studio/sav?legacy=1">Archives supervisées</Link></div></header>
+      <p>Les actions confirmées et le suivi réel déterminent l’avancement.</p></div><div className={styles.actions}>{["admin","owner"].includes(staff.role)&&<Link className="button secondary" href="/studio/sav/intake/launch">Administration du lancement</Link>}{staff.email===SAV_INTAKE_BUDGET_OWNER_EMAIL&&<Link className="button secondary" href="/studio/sav/intake/budget">Budget IA</Link>}<Link className="button secondary" href="/studio/sav?legacy=1">Archives supervisées</Link></div></header>
     {!data.installed ? <section className={styles.notice}><h2>Console non préparée</h2><p>Les données de ce parcours ne sont pas encore disponibles. La file supervisée reste accessible.</p></section> : <>
       <nav aria-label="Vues des nouveaux dossiers" className={styles.views}>
         {Object.entries(savIntakeViewLabels).map(([key, label]) => <Link key={key} href={href(key)} aria-current={view === key ? "page" : undefined}>
