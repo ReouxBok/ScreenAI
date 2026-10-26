@@ -313,6 +313,12 @@ it("a provider date in the future is displayed and sorted at its storage time, t
   expect(new Date(list.rows[1].receivedAt!).getTime()).toBe(stored.getTime());
   expect((await db.db.select().from(savMessages).where(eq(savMessages.subject,"Skew future")))[0].receivedAt.getTime()).toBe(raw.getTime());
 });
+it("an older message with a future provider date never hides the newer reply in the console", async () => {
+  const [t]=await db.db.insert(savThreads).values({mailboxId,gmailThreadId:"skew-reply",customerEmail:"skew@example.invalid"}).returning();
+  await db.db.insert(savMessages).values({threadId:t.id,mailboxId,direction:"inbound",fromEmail:"skew@example.invalid",toEmails:["support@example.invalid"],subject:"SkewReply first",bodyCiphertext:encryptSavPayload({text:"Synthetic"}),receivedAt:new Date(Date.now()+21*3600_000),createdAt:new Date(Date.now()-3600_000),analysisStatus:"intake_waiting"});
+  await db.db.insert(savMessages).values({threadId:t.id,mailboxId,direction:"inbound",fromEmail:"skew@example.invalid",toEmails:["support@example.invalid"],subject:"SkewReply second",bodyCiphertext:encryptSavPayload({text:"Synthetic"}),receivedAt:new Date(),analysisStatus:"intake_waiting"});
+  expect((await listIntakeConsole({view:"processing",search:"SkewReply"})).rows.map(row=>row.subject)).toEqual(["SkewReply second"]);
+});
 it("blocked dossiers stay in processing, are counted and carry their cause", async () => {
   const old=new Date(Date.now()-1200000);
   const dossier=async(name:string,marker?:string,updatedAt=new Date())=>{

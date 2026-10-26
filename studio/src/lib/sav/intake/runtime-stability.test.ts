@@ -9,7 +9,8 @@ const state = vi.hoisted(() => ({ db: null as unknown }));
 vi.mock("@/db", () => ({ requireDb: () => { if (!state.db) throw Error("NO_DATABASE_ALLOWED"); return state.db; } }));
 import { encryptSavPayload, decryptSavPayload } from "../crypto";
 import { intakeRuntimeHash, savIntakeRuntimeConfig, type IntakeRuntimeConfig, type IntakeRuntimePayload } from "./runtime-contract";
-import { claimSavIntakeRun, enqueueSavIntakeMessage, failSavIntakeRun, pendingSavIntakeRuns, readSavIntakeCurrent } from "./runtime-store";
+import { catchupSavIntake, claimSavIntakeRun, enqueueSavIntakeMessage, failSavIntakeRun, pendingSavIntakeRuns, readSavIntakeCurrent } from "./runtime-store";
+import { listIntakeConsole } from "./console-store";
 import { analyseSavIntakeRuntime } from "./runtime";
 import { intakeAttemptBudget, SAV_INTAKE_ATTEMPT_POLICY } from "./attempt-policy";
 
@@ -23,10 +24,10 @@ function env(mailbox: string, codeRevision = "a".repeat(40)) {
       expiresAt: new Date(Date.now() + 3600_000).toISOString(), codeRevision, policyHash: intakeRuntimeHash(policy), resourcesHash: intakeRuntimeHash([]), maxNanoUsd: 3_000_000_000, maxCalls: 30 }) };
 }
 const deploy = (n: number) => savIntakeRuntimeConfig(env(mailboxId, String(n % 10).repeat(40)))!;
-async function stored(receivedAt = new Date()) {
+async function stored(receivedAt = new Date(), createdAt = new Date(), text = "Bonjour, la synchronisation de mon agenda échoue avec une erreur 500.") {
   const [m] = await f.db.insert(savMessages).values({ mailboxId, threadId, direction: "inbound", fromEmail: "client@example.invalid", toEmails: ["support@example.invalid"],
-    subject: "Synchronisation agenda", gmailMessageId: randomUUID(), bodyCiphertext: encryptSavPayload({ text: "Bonjour, la synchronisation de mon agenda échoue avec une erreur 500.", attachments: [], headers: {} }),
-    receivedAt, createdAt: new Date(), analysisStatus: "pending" }).returning();
+    subject: "Synchronisation agenda", gmailMessageId: randomUUID(), bodyCiphertext: encryptSavPayload({ text, attachments: [], headers: {} }),
+    receivedAt, createdAt, analysisStatus: "pending" }).returning();
   return m;
 }
 /** Records an attempt that ended with an analysis, as a healthy observed run does. */
@@ -69,7 +70,7 @@ describe("attempt policy", () => {
   it("separates per-version, failed and lifetime attempts", () => {
     const analysed = encryptSavPayload({ plan: {} }), failed = encryptSavPayload({ reason: "SAV_INTAKE_MODEL_CONTEXT_LIMIT" });
     expect(intakeAttemptBudget("v3", [{ id: "v1", attempts: 1, payloadCiphertext: analysed }, { id: "v2", attempts: 1, payloadCiphertext: analysed }, { id: "v3", attempts: 0, payloadCiphertext: failed }]))
-      .toEqual({ runAttempts: 0, failed: 0, total: 2, exhausted: false });
+      .toEqual({ runAttempts: 0, failed: 0, unknown: 0, total: 2, exhausted: false });
     expect(intakeAttemptBudget("v2", [{ id: "v1", attempts: 2, payloadCiphertext: failed }, { id: "v2", attempts: 2, payloadCiphertext: failed }]).exhausted).toBe("per_version");
     expect(intakeAttemptBudget("v3", [{ id: "v1", attempts: 2, payloadCiphertext: failed }, { id: "v2", attempts: 2, payloadCiphertext: failed }, { id: "v3", attempts: 0, payloadCiphertext: failed }]).exhausted).toBe("failed_per_message");
     expect(intakeAttemptBudget("v9", Array.from({ length: 9 }, (_, i) => ({ id: `v${i + 1}`, attempts: i < 8 ? 1 : 0, payloadCiphertext: analysed }))).exhausted).toBe("total_per_message");
@@ -128,5 +129,29 @@ describe("provider date in the future (defect A)", () => {
     expect(current?.payload.plan?.decision.classification).toBe("support");
     const [row] = await f.db.select().from(savMessages).where(eq(savMessages.id, m.id));
     expect(row.receivedAt.getTime()).toBe(future.getTime());
+  });
+});
+
+describe("an older message stored with a future provider date (review P1)", () => {
+  it("never masks a newer reply: enqueue, catch-up, analysis and console all follow the new message", async () => {
+    const before = new Date(Date.now() - 500);
+    const old = await stored(new Date(Date.now() + 21 * 3600_000), before, "Premier message, daté dans le futur par le fournisseur.");
+    const reply = await stored(new Date(), new Date(), "Bonjour, toujours la même erreur 500 sur la synchronisation de mon agenda.");
+    const id = await enqueueSavIntakeMessage(reply.id, config);
+    expect(id).toBeTruthy();
+    expect(await enqueueSavIntakeMessage(old.id, config)).toBeNull();
+    await catchupSavIntake(config);
+    const runs = await f.db.select().from(savIntakeRuns).where(eq(savIntakeRuns.isCurrent, true));
+    expect(runs.map(r => r.messageId)).toEqual([reply.id]);
+    const p = provider(reply.id);
+    await analyseSavIntakeRuntime(id!, config, { env: () => environment, network: p.network });
+    const current = await readSavIntakeCurrent(threadId, config);
+    expect(current?.messageId).toBe(reply.id);
+    expect(current?.payload.plan?.decision.classification).toBe("support");
+    expect(p.calls()).toBe(1);
+    const console = await listIntakeConsole({ search: "Synchronisation" });
+    if (console.installed) expect(console.rows.map(r => r.messageId)).toEqual([reply.id]);
+    // The raw provider date is never rewritten.
+    expect((await f.db.select().from(savMessages).where(eq(savMessages.id, old.id)))[0].receivedAt.getTime()).toBeGreaterThan(Date.now());
   });
 });

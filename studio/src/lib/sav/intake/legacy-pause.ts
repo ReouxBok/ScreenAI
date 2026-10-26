@@ -4,6 +4,7 @@ import { and, desc, eq, sql } from "drizzle-orm";
 import { requireDb } from "@/db";
 import { auditLogs, savThreads, savMessages } from "@/db/schema";
 import type { IntakeRuntimeConfig } from "./runtime-contract";
+import { savEffectiveReceivedAt } from "@/lib/sav/message-order";
 
 type Reader = Pick<ReturnType<typeof requireDb>, "execute" | "select">;
 type Scope = Pick<IntakeRuntimeConfig, "mailboxId" | "receivedAfter" | "createdAfter">;
@@ -28,7 +29,7 @@ export async function intakeThreadHumanHeld(threadId: string, db: Pick<ReturnTyp
 /** Latest inbound of the thread lies inside the launched intake scope. */
 const latestInboundInScope = (threadId: ReturnType<typeof sql>, scope: Scope) => sql`exists(select 1 from sav.messages m
   where m.id = (select latest.id from sav.messages latest where latest.thread_id = ${threadId} and latest.direction = 'inbound'
-    order by latest.received_at desc, latest.created_at desc, latest.id desc limit 1)
+    order by least(latest.received_at,latest.created_at) desc, latest.created_at desc, latest.id desc limit 1)
   and m.mailbox_id = ${scope.mailboxId}::uuid and m.received_at > ${scope.receivedAfter}::timestamptz and m.created_at > ${scope.createdAfter}::timestamptz)`;
 
 function rows<T>(result: unknown): T[] {
@@ -57,7 +58,7 @@ export async function releaseLegacyAiPauses(scope: Scope, limit = 20) {
       const [thread] = await tx.select({ id: savThreads.id, aiPaused: savThreads.aiPaused, status: savThreads.status })
         .from(savThreads).where(eq(savThreads.id, threadId)).for("update");
       if (!thread?.aiPaused) return false;
-      const [message] = await tx.select().from(savMessages).where(and(eq(savMessages.threadId, threadId), eq(savMessages.direction, "inbound"))).orderBy(desc(savMessages.receivedAt), desc(savMessages.createdAt), desc(savMessages.id)).limit(1);
+      const [message] = await tx.select().from(savMessages).where(and(eq(savMessages.threadId, threadId), eq(savMessages.direction, "inbound"))).orderBy(desc(savEffectiveReceivedAt), desc(savMessages.createdAt), desc(savMessages.id)).limit(1);
       if (message && await readSavExternalCompletion(message, tx)) return false;
       const id = sql`${threadId}::uuid`;
       const eligible = rows<{ ok: boolean }>(await tx.execute(sql`select (${latestInboundInScope(id, scope)} and not ${intakeHumanHoldSql(id)}) as ok`))[0]?.ok;

@@ -12,6 +12,7 @@ import { savIntakeSourceSnapshot, intakeSourceMatches } from "./runtime-store";
 import type { ExecutionPayload, EffectIntent, EffectAck } from "./execution-types";
 import type { IntakePlan } from "./engine-types";
 import type { ObservationEvent } from "../observation-source";
+import { savEffectiveReceivedAt } from "@/lib/sav/message-order";
 export type IntakeObservationBaseline = {
   revision: "sav-intake-observation.v1"; origin: "intake"; executionId: string; runId: string; version: number;
   messageId: string; threadId: string; ticketId: string; plan: IntakePlan; acceptedFingerprint: string;
@@ -58,7 +59,7 @@ export async function ensureIntakeObservations(limit = 4) {
     const [thread] = await tx.select().from(savThreads).where(eq(savThreads.id, execution.threadId)).for("update");
     const [run] = execution.runId ? await tx.select().from(savIntakeRuns).where(eq(savIntakeRuns.id, execution.runId)) : [];
     const [latest] = await tx.select().from(savMessages).where(and(eq(savMessages.threadId, execution.threadId), eq(savMessages.direction, "inbound")))
-      .orderBy(desc(savMessages.receivedAt), desc(savMessages.createdAt), desc(savMessages.id)).limit(1);
+      .orderBy(desc(savEffectiveReceivedAt), desc(savMessages.createdAt), desc(savMessages.id)).limit(1);
     const payload = decryptSavPayload<ExecutionPayload>(execution.payloadCiphertext), plan = payload.plan;
     const effects = await activeExecutionEffects(execution.id, tx), required = requiredExecutionKinds(payload);
     if (execution.state !== "confirmed" || !execution.ticketId || thread?.hubspotTicketId !== execution.ticketId || !run?.isCurrent
@@ -103,7 +104,7 @@ export async function readIntakeLearningQualification(threadId: string, db: Db =
   const binding = await readIntakeObservationBinding(observation.id, db);
   const [thread] = await db.select().from(savThreads).where(eq(savThreads.id, threadId));
   const [latest] = await db.select().from(savMessages).where(and(eq(savMessages.threadId, threadId), eq(savMessages.direction, "inbound")))
-    .orderBy(desc(savMessages.receivedAt), desc(savMessages.createdAt), desc(savMessages.id)).limit(1);
+    .orderBy(desc(savEffectiveReceivedAt), desc(savMessages.createdAt), desc(savMessages.id)).limit(1);
   if (!binding || !thread || thread.aiPaused || latest?.id !== binding.messageId || thread.hubspotTicketId !== binding.baseline.ticketId
     || binding.sensitive || await intakeDossierSensitive(threadId, thread.hubspotTicketId, db)) return { allowed: false, fingerprint: null };
   const [run] = await db.select().from(savIntakeRuns).where(eq(savIntakeRuns.id, binding.runId));

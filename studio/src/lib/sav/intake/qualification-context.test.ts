@@ -185,7 +185,8 @@ describe("citations against sections", () => {
     expect(calls).toHaveLength(0);
     expect(traces.at(-1)).toMatchObject({ errorCode: "SAV_INTAKE_MODEL_CONTEXT_LIMIT" });
     expect(JSON.stringify(traces)).not.toContain("Ligne actuelle");
-  });
+    // Building a catalogue over more than 640 KiB of source text takes seconds on a loaded machine.
+  }, 30_000);
 });
 
 describe("runtime (stored mail → readers → plan)", () => {

@@ -28,6 +28,7 @@ import { savActionFailurePlan } from "./retry-policy";
 import { redactSavLearningText } from "./learning-extraction";
 import { getSavV0Cutover } from "./cutover";
 import { assertSavCurrentPartnershipForward, isSavPartnershipForward, SAV_PARTNERSHIP_RECIPIENT } from "./partnership-forward";
+import { savEffectiveReceivedAt } from "@/lib/sav/message-order";
 
 const pubSubEnvelopeSchema = z.object({
   message: z.object({
@@ -636,7 +637,7 @@ async function sendReplyAction(action: typeof savActions.$inferSelect, text: str
   if (!mailbox) throw new Error("SAV_ACTION_MAILBOX_NOT_FOUND");
   const [inbound] = await db.select().from(savMessages)
     .where(and(eq(savMessages.threadId, thread.id), eq(savMessages.direction, "inbound"), manualV0 ? eq(savMessages.id, action.messageId!) : undefined))
-    .orderBy(desc(savMessages.receivedAt)).limit(1);
+    .orderBy(desc(savEffectiveReceivedAt)).limit(1);
   if (!inbound) throw new Error("SAV_ACTION_INBOUND_NOT_FOUND");
   assertSavOutboundRecipientAllowed(thread.customerEmail);
   const inboundBody = decryptSavPayload<{ text: string; headers?: Record<string, string> }>(inbound.bodyCiphertext);

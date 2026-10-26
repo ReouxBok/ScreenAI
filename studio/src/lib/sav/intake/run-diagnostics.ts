@@ -1,5 +1,5 @@
 import "server-only";
-import { intakeAttemptBudget, SAV_INTAKE_ATTEMPT_POLICY, SAV_INTAKE_BLOCKING_JOURNAL_KINDS } from "./attempt-policy";
+import { intakeAttemptBudget, SAV_INTAKE_ATTEMPT_POLICY, SAV_INTAKE_BLOCKING_JOURNAL_KINDS, type IntakeAttemptRow } from "./attempt-policy";
 import { and, desc, eq, inArray, sql } from "drizzle-orm";
 import { requireDb } from "@/db";
 import { savIntakeJournal, savIntakeRuns, savMessages } from "@/db/schema";
@@ -7,6 +7,7 @@ import { decryptSavPayload } from "../crypto";
 import { savAttachmentReasonSchema, savAttachmentStatusSchema } from "../attachment-contract";
 import { intakeContextReasonLabels } from "./console-presentation";
 import { publicIntakeSchemaIssues } from "./schema-diagnostics";
+import { savEffectiveReceivedAt } from "@/lib/sav/message-order";
 
 const object = (v: unknown): Record<string, unknown> => v !== null && typeof v === "object" && !Array.isArray(v) ? v as Record<string, unknown> : {};
 const publicCodes = new Set<string>([...Object.keys(intakeContextReasonLabels), ...savAttachmentReasonSchema.options, ...savAttachmentStatusSchema.options,
@@ -86,11 +87,12 @@ export function intakeDiagnosticPayload(ciphertext: string) {
 
 /** Latest inbound message only, all attempts counted across versions. No lease,
  * source refresh, model/CRM call, projection update or operational write. */
+const DIAGNOSTIC_BUDGET_PAYLOAD_BYTES = 4 * 1024 * 1024, DIAGNOSTIC_BUDGET_ROWS = 200;
 export async function readIntakeRunDiagnostics(threadId: string) {
   return requireDb().transaction(async tx => {
     const [message] = await tx.select({ id: savMessages.id }).from(savMessages)
       .where(and(eq(savMessages.threadId, threadId), eq(savMessages.direction, "inbound")))
-      .orderBy(desc(savMessages.receivedAt), desc(savMessages.createdAt), desc(savMessages.id)).limit(1);
+      .orderBy(desc(savEffectiveReceivedAt), desc(savMessages.createdAt), desc(savMessages.id)).limit(1);
     if (!message) return null;
     const [total] = await tx.select({ attempts: sql<number>`coalesce(sum(${savIntakeRuns.attempts}),0)::int` }).from(savIntakeRuns).where(eq(savIntakeRuns.messageId, message.id));
     const rows = await tx.select({ id: savIntakeRuns.id, version: savIntakeRuns.version, isCurrent: savIntakeRuns.isCurrent, state: savIntakeRuns.state,
@@ -101,10 +103,24 @@ export async function readIntakeRunDiagnostics(threadId: string) {
     const events = ids.length ? await tx.select({ id: savIntakeJournal.id, runId: savIntakeJournal.runId, kind: savIntakeJournal.kind, createdAt: savIntakeJournal.createdAt,
       payloadCiphertext: sql<string>`case when octet_length(${savIntakeJournal.payloadCiphertext}) <= 262144 then ${savIntakeJournal.payloadCiphertext} else '' end` }).from(savIntakeJournal).where(inArray(savIntakeJournal.runId, ids))
       .orderBy(desc(savIntakeJournal.createdAt), desc(savIntakeJournal.id)).limit(121) : [];
-    const current = rows.find(r => r.isCurrent), budget = current ? intakeAttemptBudget(current.id, rows) : null;
-    const blocked = current ? events.some(e => e.runId === current.id && (SAV_INTAKE_BLOCKING_JOURNAL_KINDS as readonly string[]).includes(e.kind)) : false;
+    // The attempt budget reads every version of the message, not the displayed page,
+    // and payloads only to derive "analysis recorded"; their text never leaves the server.
+    // A payload too large for this bounded read is unknown, never a failure.
+    const budgetMeta = await tx.select({ id: savIntakeRuns.id, attempts: savIntakeRuns.attempts, isCurrent: savIntakeRuns.isCurrent,
+      bytes: sql<number>`octet_length(${savIntakeRuns.payloadCiphertext})::int` }).from(savIntakeRuns).where(eq(savIntakeRuns.messageId, message.id)).limit(DIAGNOSTIC_BUDGET_ROWS + 1);
+    const budgetRows: (IntakeAttemptRow & { isCurrent: boolean })[] = [];
+    // One payload at a time: memory stays bounded by a single payload.
+    for (const r of budgetMeta) {
+      const readable = r.attempts > 0 && r.bytes <= DIAGNOSTIC_BUDGET_PAYLOAD_BYTES;
+      const [row] = readable ? await tx.select({ payloadCiphertext: savIntakeRuns.payloadCiphertext }).from(savIntakeRuns).where(eq(savIntakeRuns.id, r.id)) : [];
+      budgetRows.push({ id: r.id, attempts: r.attempts, isCurrent: r.isCurrent, payloadCiphertext: row?.payloadCiphertext ?? (r.attempts ? null : "") });
+    }
+    const current = budgetRows.find(r => r.isCurrent);
+    const budget = current && budgetMeta.length <= DIAGNOSTIC_BUDGET_ROWS ? intakeAttemptBudget(current.id, budgetRows) : null;
+    const blocked = current ? (await tx.select({ id: savIntakeJournal.id }).from(savIntakeJournal)
+      .where(and(eq(savIntakeJournal.runId, current.id), inArray(savIntakeJournal.kind, [...SAV_INTAKE_BLOCKING_JOURNAL_KINDS]))).limit(1)).length > 0 : false;
     return { messageId: message.id, totalAttempts: Number(total.attempts), attemptsExhausted: Boolean(budget?.exhausted) || blocked,
-      attemptBudget: budget ? { runAttempts: budget.runAttempts, failed: budget.failed, total: budget.total, exhausted: budget.exhausted || null, policy: SAV_INTAKE_ATTEMPT_POLICY } : null,
+      attemptBudget: budget ? { runAttempts: budget.runAttempts, failed: budget.failed, unknown: budget.unknown, total: budget.total, exhausted: budget.exhausted || null, policy: SAV_INTAKE_ATTEMPT_POLICY } : null,
       versionsTruncated: rows.length > 20, eventsTruncated: events.length > 120,
       runs: displayed.map(r => ({ runId: r.id, version: r.version, isCurrent: r.isCurrent, state: r.state,
         attempts: r.attempts, createdAt: r.createdAt, updatedAt: r.updatedAt, diagnostic: intakeDiagnosticPayload(r.payloadCiphertext),

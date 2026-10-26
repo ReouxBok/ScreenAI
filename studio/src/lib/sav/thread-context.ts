@@ -6,6 +6,7 @@ import { requireDb } from "@/db";
 import { savMailboxes, savMessages, savThreads } from "@/db/schema";
 import { decryptSavPayload } from "./crypto";
 import { normalizeEmailAddress } from "./policy";
+import { savEffectiveReceivedAt } from "@/lib/sav/message-order";
 
 const MAX_SOURCE_MESSAGES = 50;
 const MAX_CANDIDATE_THREADS = 40;
@@ -108,7 +109,7 @@ export async function getSavRelatedThreads(threadId: string): Promise<SavRelated
       threadId: savMessages.threadId, direction: savMessages.direction, fromEmail: savMessages.fromEmail,
       toEmails: savMessages.toEmails, bodyCiphertext: savMessages.bodyCiphertext,
     }).from(savMessages).where(and(eq(savMessages.threadId, threadId), eq(savMessages.mailboxId, source.mailboxId)))
-      .orderBy(desc(savMessages.receivedAt), desc(savMessages.id)).limit(MAX_SOURCE_MESSAGES),
+      .orderBy(desc(savEffectiveReceivedAt), desc(savMessages.id)).limit(MAX_SOURCE_MESSAGES),
     db.select({ id: savThreads.id, subject: savThreads.subject, lastMessageAt: savThreads.lastMessageAt })
       .from(savThreads).where(and(
         eq(savThreads.mailboxId, source.mailboxId), ne(savThreads.id, threadId),
@@ -123,7 +124,7 @@ export async function getSavRelatedThreads(threadId: string): Promise<SavRelated
     toEmails: savMessages.toEmails, bodyCiphertext: savMessages.bodyCiphertext,
   }).from(savMessages).where(and(
     eq(savMessages.mailboxId, source.mailboxId), inArray(savMessages.threadId, candidateThreads.map((thread) => thread.id)),
-  )).orderBy(desc(savMessages.receivedAt), desc(savMessages.id)).limit(MAX_CANDIDATE_MESSAGES);
+  )).orderBy(desc(savEffectiveReceivedAt), desc(savMessages.id)).limit(MAX_CANDIDATE_MESSAGES);
   const messagesByThread = new Map<string, ContextMessage[]>();
   for (const message of candidateMessages) {
     const messages = messagesByThread.get(message.threadId) ?? [];

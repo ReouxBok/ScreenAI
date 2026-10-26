@@ -21,6 +21,7 @@ import { savDerivedCostQuote } from "../derived-budget";
 import type { SavGeminiMetadata } from "../gemini-response";
 import { intakeRuntimeHash, SAV_INTAKE_RUNTIME_REVISION, type IntakeRuntimeConfig, type IntakeRuntimePayload } from "./runtime-contract";
 import type { EngineInput } from "./engine-types";
+import { savEffectiveReceivedAt, savEffectiveReceivedAtOfRow } from "@/lib/sav/message-order";
 
 type Tx = Parameters<Parameters<ReturnType<typeof requireDb>["transaction"]>[0]>[0];
 type Run = typeof savIntakeRuns.$inferSelect;
@@ -40,7 +41,7 @@ function budgetRowsValid(rows: Pick<typeof savIntakeModelCalls.$inferSelect,"res
 }
 
 const latest = async (tx: Tx, threadId: string) => (await tx.select().from(savMessages).where(and(eq(savMessages.threadId, threadId), eq(savMessages.direction, "inbound")))
-  .orderBy(desc(savMessages.receivedAt), desc(savMessages.createdAt), desc(savMessages.id)).limit(1))[0];
+  .orderBy(desc(savEffectiveReceivedAt), desc(savMessages.createdAt), desc(savMessages.id)).limit(1))[0];
 const journal = async (tx: Tx, runId: string, kind: string, value: unknown) => {
   await tx.insert(savIntakeJournal).values({ runId, kind, payloadCiphertext: encryptSavPayload(value) });
 };
@@ -64,15 +65,13 @@ export function intakeSourceMatches(snapshot: { sourceHash: string; legacySource
 /** Keep the recorded value while the sources still match, so equality between
  * recorded hashes (run, completion, binding) survives the v2 upgrade. */
 /** Storage time bounds a provider date that lies in the future (clock skew, imported mail). */
-export function intakeEffectiveReceivedAt(row: { receivedAt: Date; createdAt: Date }) {
-  return row.receivedAt.getTime() > row.createdAt.getTime() ? row.createdAt : row.receivedAt;
-}
+export const intakeEffectiveReceivedAt = savEffectiveReceivedAtOfRow;
 export function intakeRecordedSourceHash(snapshot: { sourceHash: string; legacySourceHash: string }, recorded: string | null | undefined) {
   return intakeSourceMatches(snapshot, recorded) ? recorded! : snapshot.sourceHash;
 }
 export async function savIntakeSourceSnapshot(tx: Pick<Tx, "select">, message: typeof savMessages.$inferSelect, now: Date) {
   const rows = await tx.select().from(savMessages).where(and(eq(savMessages.threadId, message.threadId), lte(savMessages.receivedAt, message.receivedAt)))
-    .orderBy(desc(savMessages.receivedAt), desc(savMessages.createdAt), desc(savMessages.id)).limit(51);
+    .orderBy(desc(savEffectiveReceivedAt), desc(savMessages.createdAt), desc(savMessages.id)).limit(51);
   const prepared = rows.slice(0, 50).map(row => {
     const body = decryptSavPayload<Body>(row.bodyCiphertext);
     return { body, ...prepareSavIntakeMessage({ id: row.id, threadId: row.threadId, fromEmail: row.fromEmail, toEmails: row.toEmails,
@@ -169,7 +168,7 @@ export async function catchupSavIntake(config: IntakeRuntimeConfig, limit = 4) {
     gt(savMessages.receivedAt, new Date(config.receivedAfter)), gt(savMessages.createdAt, new Date(config.createdAfter)),
     or(unclaimedMessage, sql`${savMessages.analysisStatus} like 'intake_%'`), noHuman, noCommittedExecution, notCompleted,
     sql`not exists (select 1 from sav.intake_runs r where r.message_id = ${savMessages.id} and r.config_hash = ${config.configHash})`,
-    sql`not exists (select 1 from sav.messages m where m.thread_id = ${savMessages.threadId} and m.direction = 'inbound' and (m.received_at,m.created_at,m.id) > (${savMessages.receivedAt},${savMessages.createdAt},${savMessages.id}))`))
+    sql`not exists (select 1 from sav.messages m where m.thread_id = ${savMessages.threadId} and m.direction = 'inbound' and (least(m.received_at,m.created_at),m.created_at,m.id) > (${savEffectiveReceivedAt},${savMessages.createdAt},${savMessages.id}))`))
     .orderBy(savMessages.createdAt).limit(Math.min(4, Math.max(1, limit)));
   for (const message of messages) await enqueueSavIntakeMessage(message.id, config);
   return messages.length;
@@ -458,7 +457,7 @@ export async function readSavIntakeCurrent(threadId: string, config?: IntakeRunt
   const [run] = await db.select().from(savIntakeRuns).where(and(eq(savIntakeRuns.threadId, threadId), eq(savIntakeRuns.isCurrent, true))); if (!run) return null;
   const [thread] = await db.select().from(savThreads).where(eq(savThreads.id, threadId));
   const [message] = await db.select().from(savMessages).where(and(eq(savMessages.threadId, threadId), eq(savMessages.direction, "inbound")))
-    .orderBy(desc(savMessages.receivedAt), desc(savMessages.createdAt), desc(savMessages.id)).limit(1);
+    .orderBy(desc(savEffectiveReceivedAt), desc(savMessages.createdAt), desc(savMessages.id)).limit(1);
   const snapshot = message?.id === run.messageId ? await db.transaction(async tx => savIntakeSourceSnapshot(tx, message, now)) : null;
   const sourceMatches = snapshot !== null && intakeSourceMatches(snapshot, run.sourceHash);
   // Downstream bindings compare against the recorded run hash; expose it when the sources still match.

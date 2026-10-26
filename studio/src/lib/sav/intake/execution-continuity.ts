@@ -14,6 +14,7 @@ import { admissionLock, executionMessageHash, executionJournal, assertNoLegacyCo
 import { savIntakeSourceSnapshot, intakeSourceMatches } from "./runtime-store";
 import { savIntakePlanFingerprint } from "./engine";
 import type { Execution, ExecutionPayload, ExecutionOptions } from "./execution-types";
+import { savEffectiveReceivedAt } from "@/lib/sav/message-order";
 
 const action = "sav_intake_execution_continuity_approved";
 const entity = "sav_intake_execution_continuity";
@@ -50,7 +51,7 @@ async function localBinding(db: Db, execution: Execution, payload: ExecutionPayl
   const [thread] = await db.select().from(savThreads).where(eq(savThreads.id, execution.threadId));
   const [message] = await db.select().from(savMessages).where(eq(savMessages.id, execution.messageId));
   const [latest] = await db.select({ id: savMessages.id }).from(savMessages).where(and(eq(savMessages.threadId, execution.threadId), eq(savMessages.direction, "inbound")))
-    .orderBy(desc(savMessages.receivedAt), desc(savMessages.createdAt), desc(savMessages.id)).limit(1);
+    .orderBy(desc(savEffectiveReceivedAt), desc(savMessages.createdAt), desc(savMessages.id)).limit(1);
   if (!run?.isCurrent || !["observed", "waiting"].includes(run.state) || run.id !== payload.lastRunId || run.messageId !== execution.messageId || run.version !== execution.runVersion
     || run.humanChoiceCiphertext !== payload.local.humanChoice || !thread || thread.aiPaused || !message || latest?.id !== message.id
     || message.mailboxId !== runtime.mailboxId || executionMessageHash(message) !== payload.local.messageHash

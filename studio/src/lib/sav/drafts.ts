@@ -9,6 +9,7 @@ import { decryptSavPayload, encryptSavPayload, savContentHash } from "./crypto";
 import { loadSavDossierReviewContext } from "./draft-verdicts";
 import { savDraftSourceHash, savReplyForbidden } from "./review-contract";
 import { savReleaseStage } from "./config";
+import { savEffectiveReceivedAt } from "@/lib/sav/message-order";
 
 const humanDraftSchema = z.object({ threadId:z.uuid(),messageId:z.uuid(),expectedDraftId:z.uuid().nullable(),text:z.string().trim().min(1).max(10000) }).strict();
 export async function saveSavHumanReplyDraft(raw: unknown, actorEmail: string) {
@@ -55,7 +56,7 @@ export async function saveSavReplyDraft(raw: unknown, actorEmail: string) {
   return requireDb().transaction(async (tx) => {
     const [thread] = await tx.select().from(savThreads).where(eq(savThreads.id, input.threadId)).for("update");
     if (!thread) throw new Error("SAV_THREAD_NOT_FOUND");
-    const [message] = await tx.select().from(savMessages).where(and(eq(savMessages.threadId, thread.id), eq(savMessages.direction, "inbound"), savV0EligibleMessageFilter())).orderBy(desc(savMessages.receivedAt), desc(savMessages.createdAt), desc(savMessages.id)).limit(1);
+    const [message] = await tx.select().from(savMessages).where(and(eq(savMessages.threadId, thread.id), eq(savMessages.direction, "inbound"), savV0EligibleMessageFilter())).orderBy(desc(savEffectiveReceivedAt), desc(savMessages.createdAt), desc(savMessages.id)).limit(1);
     const [decision] = await tx.select().from(savDecisions).where(and(eq(savDecisions.id, input.decisionId), eq(savDecisions.isCurrent, true))).limit(1);
     const [run] = await tx.select().from(savAgentRuns).where(eq(savAgentRuns.id, input.agentRunId)).limit(1);
     const [review] = message ? await tx.select().from(savProposalReviews).where(and(eq(savProposalReviews.messageId, message.id), eq(savProposalReviews.decisionId, input.decisionId), eq(savProposalReviews.isCurrent, true))).limit(1) : [];
@@ -82,7 +83,7 @@ export async function getSavReplyDrafts(threadId: string) {
   const db = requireDb();
   const [rows, messages, decisions, reviews, knowledge] = await Promise.all([
     db.select().from(savReplyDrafts).where(eq(savReplyDrafts.threadId, threadId)).orderBy(desc(savReplyDrafts.revision)).limit(50),
-    db.select({ id: savMessages.id }).from(savMessages).where(and(eq(savMessages.threadId, threadId), eq(savMessages.direction, "inbound"))).orderBy(desc(savMessages.receivedAt), desc(savMessages.createdAt), desc(savMessages.id)).limit(1),
+    db.select({ id: savMessages.id }).from(savMessages).where(and(eq(savMessages.threadId, threadId), eq(savMessages.direction, "inbound"))).orderBy(desc(savEffectiveReceivedAt), desc(savMessages.createdAt), desc(savMessages.id)).limit(1),
     db.select({ id: savDecisions.id }).from(savDecisions).innerJoin(savMessages, eq(savMessages.id, savDecisions.messageId)).where(and(eq(savMessages.threadId, threadId), eq(savDecisions.isCurrent, true))),
     db.select({ id: savProposalReviews.id }).from(savProposalReviews).innerJoin(savMessages, eq(savMessages.id, savProposalReviews.messageId)).where(and(eq(savMessages.threadId, threadId), eq(savProposalReviews.isCurrent, true))),
     db.select({ revisionId: activeKnowledge.revisionId }).from(activeKnowledge).limit(1),

@@ -12,6 +12,7 @@ import { normalizeEmailAddress } from "./policy";
 import { savStructuredProposalSchema } from "./proposal";
 import { savReplyFooter } from "./reply-format";
 import { savReviewMatchesProposal } from "./review-contract";
+import { savEffectiveReceivedAt } from "@/lib/sav/message-order";
 
 export const SAV_PARTNERSHIP_RECIPIENT = "nathan@limova.ai";
 export const SAV_PARTNERSHIP_FORWARD_PURPOSE = "partnership_forward";
@@ -40,7 +41,7 @@ async function loadContext(threadId: string, db: Reader = requireDb()) {
   const [thread] = await db.select().from(savThreads).where(eq(savThreads.id, threadId)).limit(1);
   if (!thread) throw new Error("SAV_THREAD_NOT_FOUND");
   const [message] = await db.select().from(savMessages).where(and(eq(savMessages.threadId, threadId), eq(savMessages.direction, "inbound")))
-    .orderBy(desc(savMessages.receivedAt), desc(savMessages.createdAt), desc(savMessages.id)).limit(1);
+    .orderBy(desc(savEffectiveReceivedAt), desc(savMessages.createdAt), desc(savMessages.id)).limit(1);
   const [eligible] = message ? await db.select({ id: savMessages.id }).from(savMessages).where(and(eq(savMessages.id, message.id), savV0EligibleMessageFilter())).limit(1) : [];
   if (!message || !eligible || !message.gmailMessageId || !thread.gmailThreadId) throw new Error("SAV_PARTNERSHIP_CONTEXT_CHANGED");
   const [mailbox] = await db.select().from(savMailboxes).where(eq(savMailboxes.id, thread.mailboxId)).limit(1);

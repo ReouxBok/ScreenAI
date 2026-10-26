@@ -85,7 +85,7 @@ export async function collectSavMonitorSnapshot(): Promise<MonitorSnapshot> {
         join sav.sync_state l on l.key='sav-intake-launch:'||m.mailbox_id::text and l.status='intake_launch_v1'
         where m.direction='inbound' and not t.ai_paused and m.received_at>(l.cursor::jsonb->>'receivedAfter')::timestamptz
         and m.created_at>(l.cursor::jsonb->>'createdAfter')::timestamptz
-        and not exists(select 1 from sav.messages n where n.thread_id=m.thread_id and n.direction='inbound' and (n.received_at,n.created_at,n.id)>(m.received_at,m.created_at,m.id))`);
+        and not exists(select 1 from sav.messages n where n.thread_id=m.thread_id and n.direction='inbound' and (least(n.received_at,n.created_at),n.created_at,n.id)>(least(m.received_at,m.created_at),m.created_at,m.id))`);
       metrics.pending = messages[0]?.pending ?? 0; metrics.oldestPendingSeconds = Math.max(0, messages[0]?.oldest ?? 0);
       add("analysis_delayed", metrics.oldestPendingSeconds > 600 ? metrics.pending : 0, metrics.oldestPendingSeconds > 1800 ? "critical" : "warning");
       add("analysis_uncertain", messages[0]?.uncertain ?? 0, "critical");
@@ -111,7 +111,7 @@ export async function collectSavMonitorSnapshot(): Promise<MonitorSnapshot> {
         join sav.sync_state l on l.key='sav-intake-launch:'||m.mailbox_id::text and l.status='intake_launch_v1'
         where m.direction='inbound' and t.ai_paused and m.created_at < ${new Date(now.getTime()-1800000).toISOString()}
         and m.received_at>(l.cursor::jsonb->>'receivedAfter')::timestamptz and m.created_at>(l.cursor::jsonb->>'createdAfter')::timestamptz
-        and not exists(select 1 from sav.messages n where n.thread_id=m.thread_id and n.direction='inbound' and (n.received_at,n.created_at,n.id)>(m.received_at,m.created_at,m.id))`);
+        and not exists(select 1 from sav.messages n where n.thread_id=m.thread_id and n.direction='inbound' and (least(n.received_at,n.created_at),n.created_at,n.id)>(least(m.received_at,m.created_at),m.created_at,m.id))`);
       add("intake_held", held[0]?.count ?? 0);
       const stalled = await queryRows<{ changed: number; waiting: number }>(tx,sql`select
         count(*) filter(where c.status='context_changed')::int as changed,

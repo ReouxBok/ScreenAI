@@ -11,6 +11,7 @@ import { admissionLock } from "./execution-store";
 import { intakeConsoleInstalled } from "./console-capability";
 import { intakeThreadHumanHeld } from "./legacy-pause";
 import { readIntakeLaunch } from "./launch-boundary";
+import { savEffectiveReceivedAt } from "@/lib/sav/message-order";
 
 const request = z.object({ requestKey: z.uuid(), threadId: z.uuid(), messageId: z.uuid(),
   expectedEpoch: z.number().int().positive(), reason: z.string().trim().min(10).max(2000) }).strict();
@@ -29,7 +30,7 @@ export async function releaseIntakeHumanHold(raw: unknown) {
       || active.clerkId !== actor.clerkId || active.email !== actor.email) return conflict();
     const [thread] = await tx.select().from(savThreads).where(eq(savThreads.id, command.threadId)).for("update");
     const [message] = await tx.select().from(savMessages).where(and(eq(savMessages.threadId, command.threadId), eq(savMessages.direction, "inbound")))
-      .orderBy(desc(savMessages.receivedAt), desc(savMessages.createdAt), desc(savMessages.id)).limit(1);
+      .orderBy(desc(savEffectiveReceivedAt), desc(savMessages.createdAt), desc(savMessages.id)).limit(1);
     if (!thread || !message || message.id !== command.messageId || message.mailboxId !== thread.mailboxId) return conflict();
     const launch = await readIntakeLaunch(thread.mailboxId, tx);
     if (!launch || message.receivedAt <= new Date(launch.receivedAfter) || message.createdAt <= new Date(launch.createdAfter)

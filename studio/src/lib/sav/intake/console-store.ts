@@ -15,6 +15,7 @@ import { savIntakeSourceSnapshot, intakeSourceMatches } from "./runtime-store";
 import { intakeDossierSensitive } from "./observation-binding";
 import { readIntakeExecutionProgress } from "./executor";
 import { invalidIntakeAddressMetadata, SAV_INTAKE_INVALID_SOURCE } from "./source-validation";
+import { savEffectiveReceivedAt } from "@/lib/sav/message-order";
 export type ConsoleProjection = { view: SavIntakeView | null; status: string; reason: string | null };
 /** Runs only in the worker. CAS against the monotone source epoch means a new
  * inbound arriving during computation can never be cleared by an old result. */
@@ -24,7 +25,7 @@ export async function projectIntakeThread(threadId: string, beforePublish?: () =
   if (!projection) return false;
   const [thread] = await db.select().from(savThreads).where(eq(savThreads.id, threadId));
   const [message] = await db.select().from(savMessages).where(and(eq(savMessages.threadId, threadId), eq(savMessages.direction, "inbound")))
-    .orderBy(desc(savMessages.receivedAt), desc(savMessages.createdAt), desc(savMessages.id)).limit(1);
+    .orderBy(desc(savEffectiveReceivedAt), desc(savMessages.createdAt), desc(savMessages.id)).limit(1);
   const [run] = await db.select().from(savIntakeRuns).where(and(eq(savIntakeRuns.threadId, threadId), eq(savIntakeRuns.isCurrent, true)));
   let result: ConsoleProjection = { view: null, status: "processing", reason: null };
   if (message && await readSavExternalCompletion(message)) result = { view: null, status: "external_completion_pending", reason: "Traitement externe enregistré ; les commandes et résultats restent à rapprocher avant clôture administrative." };
@@ -101,7 +102,7 @@ export function intakeBlockedCauseSql(threadId: ReturnType<typeof sql>) {
   return sql<string | null>`case when ${marker("attempts_exhausted")} then 'attempts_exhausted' when ${marker("deterministic_block")} then 'input_invalid'
     when ${marker("source_invalid")} then 'source_invalid' when ${intakeBlockedRunSql(threadId)} then 'technical_wait' else null end`;
 }
-const latestMessageJoin = eq(savMessages.id, sql`(select m.id from sav.messages m where m.thread_id=${savIntakeConsole.threadId} and m.direction='inbound' order by m.received_at desc,m.created_at desc,m.id desc limit 1)`);
+const latestMessageJoin = eq(savMessages.id, sql`(select m.id from sav.messages m where m.thread_id=${savIntakeConsole.threadId} and m.direction='inbound' order by least(m.received_at,m.created_at) desc,m.created_at desc,m.id desc limit 1)`);
 
 export async function listIntakeConsole(options: { mailboxId?: string; view?: SavIntakeView | "processing"; search?: string; page?: number; sort?: "newest" | "oldest" } = {}) {
   if (!await intakeConsoleInstalled()) return { installed: false, counts: {}, rows: [], page: 1, pages: 1, total: 0 };
@@ -122,7 +123,7 @@ export async function listIntakeConsole(options: { mailboxId?: string; view?: Sa
     const other = otherIds.length ? sql`${savMessages.id} in (${sql.join(otherIds.map(id => sql`${id}::uuid`), sql`, `)})` : sql`false`;
     const review = reviewIds.length ? sql`${savMessages.id} in (${sql.join(reviewIds.map(id => sql`${id}::uuid`), sql`, `)})` : sql`false`;
     // A provider date later than storage is bounded for display and chronological order.
-    const effectiveReceivedAt = sql`least(${savMessages.receivedAt}, ${savMessages.createdAt})`.mapWith(savMessages.receivedAt);
+    const effectiveReceivedAt = savEffectiveReceivedAt;
     const held = sql`exists(select 1 from sav.threads ht where ht.id=${savIntakeConsole.threadId} and ht.ai_paused and ${intakeHumanHoldSql(sql`ht.id`)})`;
     const effectiveView = sql<string | null>`case when ${completed} then 'completed' when ${other} then 'other' when ${review} then 'to_validate' when ${marked} then null when ${held} then 'to_validate' when ${historicalMessageSql()} then 'completed' when ${savIntakeConsole.status}='external_completion_pending' then null when ${savIntakeConsole.epoch}=${savIntakeConsole.projectedEpoch} then ${savIntakeConsole.view} else null end`;
     const selected = options.view && options.view !== "processing" ? eq(effectiveView, savIntakeViewSchema.parse(options.view)) : sql`${effectiveView} is null`;

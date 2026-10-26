@@ -7,12 +7,13 @@ import { intakeConsoleInstalled } from "./intake/console-capability";
 import { savV0EligibleMessageFilter } from "./cutover";
 import { executionAdministrator } from "./intake/execution-policy";
 import { canAccessSav } from "./access";
+import { savEffectiveReceivedAt, savEffectiveReceivedAtOfRow } from "@/lib/sav/message-order";
 
 export const SAV_EXTERNAL_COMPLETION = "sav_dossier_completed_externally";
 export const SAV_EXTERNAL_COMPLETION_REVERTED = "sav_dossier_external_completion_reverted";
 export const savExternalCompletionEvents = [SAV_EXTERNAL_COMPLETION, SAV_EXTERNAL_COMPLETION_REVERTED];
 type Reader = Pick<ReturnType<typeof requireDb>, "select">;
-type Message = { id: string; threadId: string; receivedAt: Date };
+type Message = { id: string; threadId: string; receivedAt: Date; createdAt?: Date };
 type Audit = Pick<typeof auditLogs.$inferSelect, "id" | "actorEmail" | "action" | "entityType" | "entityId" | "technicalMetadata" | "createdAt">;
 type Action = Pick<typeof savActions.$inferSelect, "kind" | "actorType" | "status" | "payload">;
 const reversalSchema = z.object({ version: z.literal(1), batchId: z.uuid(), completionId: z.uuid() });
@@ -38,11 +39,11 @@ function completionReverted(original: Audit, events: Audit[]) {
 }
 
 /** A Studio disposition, never a model verdict, provider result or learning proof. */
-export function findSavExternalCompletion(message: { id: string; threadId: string; receivedAt: Date }, events: Audit[]) {
+export function findSavExternalCompletion(message: Message, events: Audit[]) {
   return events.filter(event => {
     if (event.action !== SAV_EXTERNAL_COMPLETION || event.actorEmail.toLowerCase() !== "ugo@limova.ai" || event.entityType !== "sav_message" || event.entityId !== message.id) return false;
     const marker = markerSchema.safeParse(event.technicalMetadata);
-    if (!marker.success || marker.data.threadId !== message.threadId || message.receivedAt.getTime() >= Date.parse(marker.data.receivedBefore)) return false;
+    if (!marker.success || marker.data.threadId !== message.threadId || savEffectiveReceivedAtOfRow(message).getTime() >= Date.parse(marker.data.receivedBefore)) return false;
     return !completionReverted(event, events);
   }).sort((a, b) => b.createdAt.getTime() - a.createdAt.getTime() || b.id.localeCompare(a.id))[0] ?? null;
 }
@@ -65,7 +66,7 @@ export async function readSavExternalCompletion(message: Message, db: Reader = r
   const events = await db.select().from(auditLogs).where(and(eq(auditLogs.entityType, "sav_message"), eq(auditLogs.entityId, message.id), inArray(auditLogs.action, savExternalCompletionEvents)));
   const marker = findSavExternalCompletion(message, events);
   if (!marker) return null;
-  const [latest] = await db.select({ id: savMessages.id }).from(savMessages).where(and(eq(savMessages.threadId, message.threadId), eq(savMessages.direction, "inbound"))).orderBy(desc(savMessages.receivedAt), desc(savMessages.createdAt), desc(savMessages.id)).limit(1);
+  const [latest] = await db.select({ id: savMessages.id }).from(savMessages).where(and(eq(savMessages.threadId, message.threadId), eq(savMessages.direction, "inbound"))).orderBy(desc(savEffectiveReceivedAt), desc(savMessages.createdAt), desc(savMessages.id)).limit(1);
   return latest?.id === message.id ? marker : null;
 }
 
@@ -104,10 +105,10 @@ export async function getSavExternalCompletion(message: Message, db?: Reader) {
  * apply pagination/LIMIT. No timestamp cast of arbitrary audit JSON, and no
  * arbitrary row cap that could hide a valid administrative disposition. */
 export async function listSavExternalCompletionMessageIds(db: Reader = requireDb(), forDisplay = false, mailboxId?: string, disposition?: z.infer<typeof externalDispositionSchema>) {
-  const candidates = await db.select({ id: savMessages.id, threadId: savMessages.threadId, receivedAt: savMessages.receivedAt }).from(savMessages)
+  const candidates = await db.select({ id: savMessages.id, threadId: savMessages.threadId, receivedAt: savMessages.receivedAt, createdAt: savMessages.createdAt }).from(savMessages)
     .where(and(mailboxId ? eq(savMessages.mailboxId, mailboxId) : undefined, eq(savMessages.direction, "inbound"),
       sql`exists(select 1 from public.audit_logs a where a.entity_type='sav_message' and a.entity_id=${savMessages.id}::text and a.action=${SAV_EXTERNAL_COMPLETION} and lower(a.actor_email)='ugo@limova.ai')`,
-      sql`${savMessages.id}=(select latest.id from sav.messages latest where latest.thread_id=${savMessages.threadId} and latest.direction='inbound' order by latest.received_at desc,latest.created_at desc,latest.id desc limit 1)`));
+      sql`${savMessages.id}=(select latest.id from sav.messages latest where latest.thread_id=${savMessages.threadId} and latest.direction='inbound' order by least(latest.received_at,latest.created_at) desc,latest.created_at desc,latest.id desc limit 1)`));
   if (!candidates.length) return [];
   const events = await db.select().from(auditLogs).where(and(eq(auditLogs.entityType, "sav_message"), inArray(auditLogs.entityId, candidates.map(message => message.id)), inArray(auditLogs.action, savExternalCompletionEvents)));
   const marked = candidates.filter(message => {
@@ -182,7 +183,7 @@ async function applyExternalCompletion(raw: unknown, actorEmail: string, actor?:
     const threads = await tx.select({ id: savThreads.id, hubspotTicketId: savThreads.hubspotTicketId }).from(savThreads).where(inArray(savThreads.id, threadIds)).orderBy(asc(savThreads.id)).for("update");
     if (threads.length !== threadIds.length) throw new Error("SAV_EXTERNAL_COMPLETION_THREAD_MISSING");
     const latest = await tx.selectDistinctOn([savMessages.threadId]).from(savMessages).where(and(inArray(savMessages.threadId, threadIds), eq(savMessages.direction, "inbound")))
-      .orderBy(asc(savMessages.threadId), desc(savMessages.receivedAt), desc(savMessages.createdAt), desc(savMessages.id));
+      .orderBy(asc(savMessages.threadId), desc(savEffectiveReceivedAt), desc(savMessages.createdAt), desc(savMessages.id));
     const eligible = new Set((await tx.select({ id: savMessages.id }).from(savMessages).where(and(inArray(savMessages.id, ids), savV0EligibleMessageFilter()))).map(message => message.id));
     const pilots = new Set((await tx.select({ messageId: savPilotItems.messageId }).from(savPilotItems).where(inArray(savPilotItems.messageId, ids))).map(item => item.messageId));
     const actions = await tx.select().from(savActions).where(inArray(savActions.threadId, threadIds));
@@ -197,7 +198,7 @@ async function applyExternalCompletion(raw: unknown, actorEmail: string, actor?:
       const message = latest.find(row => row.threadId === requested.threadId);
       let reason: string | null = null;
       if (!message || message.id !== requested.messageId) reason = "new_inbound";
-      else if (message.receivedAt.getTime() >= Date.parse(input.receivedBefore)) reason = "after_boundary";
+      else if (savEffectiveReceivedAtOfRow(message).getTime() >= Date.parse(input.receivedBefore)) reason = "after_boundary";
       else if (!eligible.has(message.id) || pilots.has(message.id)) reason = "not_live_eligible";
       else if (technicalMessages.has(message.id) && input.disposition === "completed") reason = "technical_exclusion";
       else if (hasUnsettledSavHumanAction(actions.filter(action => action.threadId === message.threadId)) || await hasUnsettledSavIntakeWork(message.threadId, tx)) reason = "unsettled_action";
