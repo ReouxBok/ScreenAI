@@ -12,6 +12,7 @@ import { admissionLock, releaseKeys } from "./execution-store";
 import { reconcileIntakeEffectCandidate } from "./executor";
 import { createIntakeExecutorAdapters } from "./execution-adapters";
 import type { EffectAck, EffectIntent } from "./execution-types";
+import { savEffectiveReceivedAt } from "@/lib/sav/message-order";
 
 const request = z.object({ threadId: z.uuid(), messageId: z.uuid() }).strict();
 const conflict = (): never => { throw Error("SAV_INTAKE_NOTE_RECONCILIATION_REQUIRED"); };
@@ -53,7 +54,7 @@ export async function reconcileIntakeNoteForClosure(raw: unknown) {
     const [staff] = await tx.select().from(staffUsers).where(eq(staffUsers.id, actor.id)).for("update");
     const [latest] = await tx.select({ id: savMessages.id }).from(savMessages).where(and(
       eq(savMessages.threadId, input.threadId), eq(savMessages.direction, "inbound")))
-      .orderBy(desc(savMessages.receivedAt), desc(savMessages.createdAt), desc(savMessages.id)).limit(1);
+      .orderBy(desc(savEffectiveReceivedAt), desc(savMessages.createdAt), desc(savMessages.id)).limit(1);
     const runs = await tx.select().from(savIntakeRuns).where(eq(savIntakeRuns.threadId, input.threadId)).for("update");
     const run = runs.find(row => row.id === execution.runId);
     const [authority] = await tx.select().from(savIntakeExecutionPolicies).where(eq(savIntakeExecutionPolicies.id, execution.policyId)).for("update");

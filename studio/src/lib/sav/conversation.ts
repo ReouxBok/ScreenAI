@@ -6,6 +6,7 @@ import { decryptSavPayload, savContentHash } from "./crypto";
 import { savStructuredProposalSchema } from "./proposal";
 import { savEvidenceContains } from "./evidence-text";
 import { splitSavMessageText } from "./message-context";
+import { savEffectiveReceivedAt, savNotAfterAnchor } from "@/lib/sav/message-order";
 
 export type SavConversation = {
   threadId: string;
@@ -36,9 +37,9 @@ export async function loadSavConversation(messageId: string): Promise<SavConvers
     eq(savMessages.threadId, thread.id), eq(savMessages.mailboxId, current.mailboxId),
     // Compare timestamps inside PostgreSQL: JS Date truncates microseconds and
     // could exclude the current message (or a tied historical message).
-    lte(savMessages.receivedAt, sql`(select anchor.received_at from sav.messages anchor where anchor.id = ${current.id}::uuid)`),
+    savNotAfterAnchor(current.id),
     lte(savMessages.createdAt, sql`(select anchor.created_at from sav.messages anchor where anchor.id = ${current.id}::uuid)`),
-  )).orderBy(desc(savMessages.receivedAt), desc(savMessages.createdAt), desc(savMessages.id)).limit(33);
+  )).orderBy(desc(savEffectiveReceivedAt), desc(savMessages.createdAt), desc(savMessages.id)).limit(33);
   const outboundProofs = new Map<string, { hash: string; messageId: string | null }>();
   let remaining = 15_000;
   const messages = rows.slice(0, 12).map((row) => {

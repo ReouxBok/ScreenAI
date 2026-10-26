@@ -17,6 +17,7 @@ import { recordIntakeReinvestigation } from "../intake/operator-recovery";
 import { readIntakeOperatorInformation } from "../intake/operator-information";
 import { OPERATOR_COMMAND_ACTION, operatorInformationHash, type IntakeOperatorInformation } from "../intake/operator-information-contract";
 import { operatorCommandSchema, type OperatorCommand, type OperatorReceipt, type OperatorStep } from "./operator-contract";
+import { savEffectiveReceivedAt } from "@/lib/sav/message-order";
 type Tx = Parameters<typeof admissionLock>[0];
 type Body = { command: OperatorCommand; actorId: string; information?: IntakeOperatorInformation };
 export const operatorCommandRow = (id: string) => and(eq(auditLogs.id, id), eq(auditLogs.action, OPERATOR_COMMAND_ACTION), eq(auditLogs.entityType, "sav_intake_operator_command"));
@@ -35,7 +36,7 @@ async function readOperatorCommandFacts(tx: Tx, command: OperatorCommand, actorI
   const [thread] = await tx.select().from(savThreads).where(eq(savThreads.id, command.threadId)).for("update");
   const [run] = await tx.select().from(savIntakeRuns).where(eq(savIntakeRuns.id, command.runId)).for("update");
   const [message] = await tx.select().from(savMessages).where(and(eq(savMessages.threadId, command.threadId), eq(savMessages.direction, "inbound")))
-    .orderBy(desc(savMessages.receivedAt), desc(savMessages.createdAt), desc(savMessages.id)).limit(1);
+    .orderBy(desc(savEffectiveReceivedAt), desc(savMessages.createdAt), desc(savMessages.id)).limit(1);
   if (!actor?.active || !["admin", "owner"].includes(actor.role) || !canAccessSav(actor.email, actor.role)
     || !thread || thread.aiPaused || thread.mailboxId !== config.mailboxId || !run?.isCurrent || run.threadId !== thread.id
     || message?.id !== command.messageId || run.messageId !== message.id || run.version !== command.version || run.sourceHash !== command.sourceHash

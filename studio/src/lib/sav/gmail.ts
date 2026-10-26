@@ -28,6 +28,7 @@ import { savActionFailurePlan } from "./retry-policy";
 import { redactSavLearningText } from "./learning-extraction";
 import { getSavV0Cutover } from "./cutover";
 import { assertSavCurrentPartnershipForward, isSavPartnershipForward, SAV_PARTNERSHIP_RECIPIENT } from "./partnership-forward";
+import { savEffectiveReceivedAt } from "@/lib/sav/message-order";
 
 const pubSubEnvelopeSchema = z.object({
   message: z.object({
@@ -348,10 +349,14 @@ export function normalizeReferencesHeader(value: string, maxLength = 2_000) {
   return kept.join(" ");
 }
 
-export function parseGmailMessage(mailboxEmail: string, message: GmailMessage) {
+export function parseGmailMessage(mailboxEmail: string, message: GmailMessage, now = new Date()) {
   if (!message.id || !message.threadId) throw new Error("GMAIL_MESSAGE_INVALID");
-  const receivedAt = new Date(Number(message.internalDate));
-  if (!message.internalDate || !Number.isFinite(receivedAt.getTime())) throw new Error("GMAIL_MESSAGE_INVALID_INTERNAL_DATE");
+  const providerReceivedAt = new Date(Number(message.internalDate));
+  if (!message.internalDate || !Number.isFinite(providerReceivedAt.getTime())) throw new Error("GMAIL_MESSAGE_INVALID_INTERNAL_DATE");
+  // A provider date in the future (clock skew, imported mail) is bounded by the
+  // observation time for ordering, display and analysis; the raw value is kept.
+  const futureDate = providerReceivedAt.getTime() > now.getTime();
+  const receivedAt = futureDate ? new Date(now.getTime()) : providerReceivedAt;
   const headers = message.payload?.headers;
   const from = boundedHeader(headerValue(headers, "From"), 500);
   const intakeRecipients = String(process.env.GMAIL_INTAKE_RECIPIENTS || mailboxEmail).split(",");
@@ -379,6 +384,7 @@ export function parseGmailMessage(mailboxEmail: string, message: GmailMessage) {
       "in-reply-to": boundedHeader(headerValue(headers, "In-Reply-To"), 2_000, true),
       "delivered-to": boundedHeader(headerValue(headers, "Delivered-To"), 2_000),
       "x-original-to": boundedHeader(headerValue(headers, "X-Original-To"), 2_000),
+      ...(futureDate ? { "x-studio-gmail-internal-date": providerReceivedAt.toISOString() } : {}),
     },
     receivedAt,
   };
@@ -631,7 +637,7 @@ async function sendReplyAction(action: typeof savActions.$inferSelect, text: str
   if (!mailbox) throw new Error("SAV_ACTION_MAILBOX_NOT_FOUND");
   const [inbound] = await db.select().from(savMessages)
     .where(and(eq(savMessages.threadId, thread.id), eq(savMessages.direction, "inbound"), manualV0 ? eq(savMessages.id, action.messageId!) : undefined))
-    .orderBy(desc(savMessages.receivedAt)).limit(1);
+    .orderBy(desc(savEffectiveReceivedAt)).limit(1);
   if (!inbound) throw new Error("SAV_ACTION_INBOUND_NOT_FOUND");
   assertSavOutboundRecipientAllowed(thread.customerEmail);
   const inboundBody = decryptSavPayload<{ text: string; headers?: Record<string, string> }>(inbound.bodyCiphertext);

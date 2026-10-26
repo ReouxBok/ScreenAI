@@ -14,6 +14,7 @@ import { decisionKindSchema } from "./policy";
 import { savHumanProcessSchema } from "./human-process";
 import { searchKnowledge } from "@/lib/search";
 import { selectSavLeadTemplate } from "./lead-template";
+import { savEffectiveReceivedAt } from "@/lib/sav/message-order";
 
 const verdict = z.enum(["correct", "partial", "incorrect", "critical"]);
 export const proposalReviewSchema = z.object({
@@ -103,7 +104,7 @@ export async function reviewSavProposal(raw: unknown, actorEmail: string) {
       || a.payload.forwardDispatchedAt && a.status!=="succeeded"))) throw new Error("SAV_PROCESS_ACTION_IN_PROGRESS");
     const [message] = await tx.select().from(savMessages).where(eq(savMessages.id, input.messageId)).for("update");
     if (!message) throw new Error("SAV_MESSAGE_NOT_FOUND");
-    const [latest] = await tx.select().from(savMessages).where(and(eq(savMessages.threadId, message.threadId), eq(savMessages.direction, "inbound"))).orderBy(desc(savMessages.receivedAt), desc(savMessages.createdAt), desc(savMessages.id)).limit(1);
+    const [latest] = await tx.select().from(savMessages).where(and(eq(savMessages.threadId, message.threadId), eq(savMessages.direction, "inbound"))).orderBy(desc(savEffectiveReceivedAt), desc(savMessages.createdAt), desc(savMessages.id)).limit(1);
     const [decision] = await tx.select().from(savDecisions).where(and(eq(savDecisions.id, input.decisionId), eq(savDecisions.messageId, message.id), eq(savDecisions.isCurrent, true))).limit(1);
     const [run] = await tx.select().from(savAgentRuns).where(and(eq(savAgentRuns.id, input.agentRunId), eq(savAgentRuns.messageId, message.id))).limit(1);
     if (latest?.id !== message.id || !decision || decision.agentRunId !== run?.id || !run?.proposalCiphertext) throw new Error("SAV_PROPOSAL_STALE");

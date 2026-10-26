@@ -84,3 +84,7 @@
 /* Restore the Studio's narrow layout only for this console; later global shell
    rules otherwise override the existing mobile breakpoint. */
 @media(max-width:900px) { :global(.shell):has(.console) { grid-template-columns:minmax(0,1fr); } }
+
+.blockedCount { margin-left: 8px; font-style: normal; font-weight: 600; color: var(--red); }
+.blockedAlert { margin: 0; padding: 10px 14px; border: 1px solid var(--red); border-radius: 10px; font-size: 13px; color: var(--red); background: var(--paper); }
+.blocked { font-weight: 600; color: var(--red); }

@@ -17,6 +17,7 @@ import { savTicketActionPresentation } from "./ticket-action-presentation";
 import { savTicketReturnPlan } from "./ticket-lifecycle";
 import { savTicketReturnNote } from "./ticket-return-note";
 import { applySavHumanTicketRouting, savEffectiveCustomerEmail, savHumanTicketAction } from "./human-process";
+import { savEffectiveReceivedAt } from "@/lib/sav/message-order";
 
 const selectionSchema = z.object({ threadId: z.uuid(), reviewId: z.uuid(), ticketId: z.string().regex(/^\d{1,30}$/).optional(), distinctIssueReason: z.string().trim().max(2000).default("") });
 const commandSchema = selectionSchema.extend({ kind: z.enum(["create_ticket", "link_ticket"]), returnOperation: z.enum(["keep", "reactivate", "create"]).optional() });
@@ -72,7 +73,7 @@ export function assertSavTicketPreview(token: string, actorEmail: string, input:
 export async function readSavManualTicketPreviewContext(threadId: string): Promise<SavDossierContext> {
   const db = requireDb();
   const [thread] = await db.select().from(savThreads).where(eq(savThreads.id, threadId));
-  const [message] = await db.select().from(savMessages).where(and(eq(savMessages.threadId, threadId), eq(savMessages.direction, "inbound"))).orderBy(desc(savMessages.receivedAt), desc(savMessages.createdAt), desc(savMessages.id)).limit(1);
+  const [message] = await db.select().from(savMessages).where(and(eq(savMessages.threadId, threadId), eq(savMessages.direction, "inbound"))).orderBy(desc(savEffectiveReceivedAt), desc(savMessages.createdAt), desc(savMessages.id)).limit(1);
   if (!thread || !message) throw new Error("SAV_THREAD_NOT_FOUND");
   if (!await isSavMessageEligible(message.id)) throw new Error("SAV_MESSAGE_BEFORE_CUTOVER");
   const body = decryptSavPayload<{ text: string; supportContext?: SavDossierContext }>(message.bodyCiphertext);
@@ -93,7 +94,7 @@ export async function prepareSavManualTicketPreview(raw: unknown, actorEmail: st
   if (savReleaseStage() !== "v0") throw new Error("SAV_MANUAL_TICKET_INVALID");
   const input = selectionSchema.parse(raw), db = requireDb();
   const [thread] = await db.select().from(savThreads).where(eq(savThreads.id, input.threadId));
-  const [message] = await db.select().from(savMessages).where(and(eq(savMessages.threadId, input.threadId), eq(savMessages.direction, "inbound"))).orderBy(desc(savMessages.receivedAt), desc(savMessages.createdAt), desc(savMessages.id)).limit(1);
+  const [message] = await db.select().from(savMessages).where(and(eq(savMessages.threadId, input.threadId), eq(savMessages.direction, "inbound"))).orderBy(desc(savEffectiveReceivedAt), desc(savMessages.createdAt), desc(savMessages.id)).limit(1);
   if (!thread || !message) throw new Error("SAV_THREAD_NOT_FOUND");
   const c = await loadSavDossierReviewContext(message.id);
   if (c.review?.id !== input.reviewId || c.review.status !== "approved" || c.review.reviewScope !== "dossier") throw new Error("SAV_VALIDATED_CURRENT_PROPOSAL_REQUIRED");

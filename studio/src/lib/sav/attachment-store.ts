@@ -8,6 +8,7 @@ import { isSavMessageEligible } from "./cutover";
 import { savGeminiApiKey } from "./config";
 import { attachmentSkeleton, readSavAttachmentSelection } from "./attachment-reader";
 import { savAttachmentMetadataSchema, savAttachmentReadSchema, savAttachmentClaimReason, SAV_ATTACHMENT_READER_REVISION, type SavAttachmentRead } from "./attachment-contract";
+import { savEffectiveReceivedAt } from "@/lib/sav/message-order";
 
 type Body = { text?: string; html?: string; attachments?: unknown[]; attachmentRead?: unknown; [key: string]: unknown };
 const selectionHash = (body: Body) => savContentHash({ text: body.text, html: body.html, attachments: body.attachments, attachmentInventory: body.attachmentInventory });
@@ -28,7 +29,7 @@ async function lockSource(tx: Tx, messageId: string) {
 }
 async function isLatest(tx: Tx, message: typeof savMessages.$inferSelect) {
   const [latest] = await tx.select({ id: savMessages.id }).from(savMessages).where(and(eq(savMessages.threadId, message.threadId), eq(savMessages.direction, "inbound")))
-    .orderBy(desc(savMessages.receivedAt), desc(savMessages.createdAt), desc(savMessages.id)).limit(1);
+    .orderBy(desc(savEffectiveReceivedAt), desc(savMessages.createdAt), desc(savMessages.id)).limit(1);
   return latest?.id === message.id;
 }
 

@@ -6,7 +6,8 @@ import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } 
 import { eq } from "drizzle-orm";
 import { createSavTestDb } from "../../../../test/sav-db";
 import { targetIt } from "../../../../test/sav-qualification";
-import { savMailboxes, savMessages, savThreads, savIntakeRuns, savIntakeModelCalls, savActions } from "@/db/schema";
+import { savMailboxes, savMessages, savThreads, savIntakeRuns, savIntakeModelCalls, savActions, savIntakeJournal } from "@/db/schema";
+import { SAV_INTAKE_ATTEMPT_POLICY } from "./attempt-policy";
 const state = vi.hoisted(() => ({ db: null as unknown }));
 vi.mock("@/db", () => ({ requireDb: () => { if (!state.db) throw Error("NO_DATABASE_ALLOWED"); return state.db; } }));
 import { encryptSavPayload } from "../crypto";
@@ -14,7 +15,7 @@ import { prepareSavIntakeMessage } from "./message";
 import { createSavIntakeSemanticReaders, type IntakeGeminiCall } from "./model-readers";
 import { SAV_INTAKE_MODEL_LIMITS } from "./model-limits";
 import { intakeRuntimeHash, savIntakeRuntimeConfig, type IntakeRuntimeConfig } from "./runtime-contract";
-import { claimSavIntakeRun, enqueueSavIntakeMessage, failSavIntakeRun, readSavIntakeBudget, readSavIntakeCurrent } from "./runtime-store";
+import { claimSavIntakeRun, enqueueSavIntakeMessage, failSavIntakeRun, pendingSavIntakeRuns, readSavIntakeCurrent } from "./runtime-store";
 import { analyseSavIntakeRuntime } from "./runtime";
 
 const CURRENT = "Bonjour, depuis ce matin la synchronisation de mon agenda échoue avec une erreur 500.";
@@ -166,16 +167,26 @@ describe("citations against sections", () => {
     expect(calls).toHaveLength(1);
   });
 
+  it("[INV] C9b a request several times above the former 96 KiB cap is read in one call, complete", async () => {
+    const { reader, calls } = readers(d => analysis(d.citationCatalogue.find(e => e.sourceId === "current")!.id));
+    const long = Array.from({ length: 4_000 }, (_, i) => `Ligne actuelle ${i} sur la synchronisation.`).join("\n");
+    expect(Buffer.byteLength(long)).toBeGreaterThan(160 * 1024);
+    const result = await reader.analyseMessage({ message: { ...msg, currentText: long }, conversation: [prior] } as never, AbortSignal.timeout(5000));
+    expect(result.requests).toHaveLength(1);
+    expect(calls).toHaveLength(1);
+  });
+
   it("[INV] C9 payload above the data bound is refused before any provider call, with a bounded trace", async () => {
     const traces: { errorCode: string | null; contextLimit?: { stage: string; limitBytes?: number } }[] = [], calls: unknown[] = [];
     const reader = createSavIntakeSemanticReaders({ model: "gemini-3.6-flash", call: async () => { calls.push(1); throw Error("MUST_NOT_CALL"); }, onTrace: t => traces.push(t) });
-    const big = Array.from({ length: 6_000 }, (_, i) => `Ligne actuelle ${i} sur la synchronisation.`).join("\n");
+    const big = Array.from({ length: Math.ceil(SAV_INTAKE_MODEL_LIMITS.dataBytes / 30) }, (_, i) => `Ligne actuelle ${i} sur la synchronisation.`).join("\n");
     expect(Buffer.byteLength(big)).toBeGreaterThan(SAV_INTAKE_MODEL_LIMITS.dataBytes);
     await expect(reader.analyseMessage({ message: { ...msg, currentText: big }, conversation: [] } as never, AbortSignal.timeout(5000))).rejects.toThrow("SAV_INTAKE_MODEL_CONTEXT_LIMIT");
     expect(calls).toHaveLength(0);
     expect(traces.at(-1)).toMatchObject({ errorCode: "SAV_INTAKE_MODEL_CONTEXT_LIMIT" });
     expect(JSON.stringify(traces)).not.toContain("Ligne actuelle");
-  });
+    // Building a catalogue over more than 640 KiB of source text takes seconds on a loaded machine.
+  }, 30_000);
 });
 
 describe("runtime (stored mail → readers → plan)", () => {
@@ -241,48 +252,54 @@ describe("runtime (stored mail → readers → plan)", () => {
     expect(await f.db.select().from(savActions)).toHaveLength(0);
   });
 
-  // ~60k characters (below the 100k storage bound) but well above 96 KiB of model data
-  // once the verbatim citation catalogue duplicates the current section.
+  // ~60k characters, below the 100k storage bound: a request the model can read in one call.
   const oversized = () => Array.from({ length: 1_000 }, (_, i) => `Ligne ${i} : l'été dernier, la synchronisation échouée a été réessayée.`).join("\n");
-  it("[INV] C11 an oversized current request is refused explicitly before reservation and network, never truncated", async () => {
+  it("[INV] C11 a long current request reaches the model complete, never refused on size nor truncated", async () => {
     const body = oversized();
     expect(body.length).toBeLessThan(100_000);
     const m = await stored(body), id = await enqueueSavIntakeMessage(m.id, config), { counts, network } = provider(m.id);
-    const result = await analyseSavIntakeRuntime(id!, config, { env: () => environment, network });
-    expect(counts.model).toBe(0);
-    expect((await readSavIntakeBudget(config)).callCount).toBe(0);
-    expect(result.state).toBe("waiting");
-    const current = await readSavIntakeCurrent(threadId, config), disposition = current?.payload.plan?.decision.disposition;
-    const explicit = current?.payload.reason === "SAV_INTAKE_MODEL_CONTEXT_LIMIT"
-      || disposition?.kind === "collect_context" && (disposition as { reasons: string[] }).reasons.includes("classification_incomplete");
-    expect(explicit).toBe(true);
-  });
-
-  targetIt("[CIBLE] C11b with full sections, the oversized request fails on the data bound with a bounded trace", async () => {
-    const m = await stored(oversized()), id = await enqueueSavIntakeMessage(m.id, config), { counts, network } = provider(m.id);
-    await analyseSavIntakeRuntime(id!, config, { env: () => environment, network });
+    const sent: string[] = [];
+    const observed = vi.fn(async (url: Parameters<typeof fetch>[0], init?: RequestInit) => {
+      if (String(url).startsWith("https://generativelanguage.googleapis.com/")) sent.push(String(init?.body));
+      return network(url, init);
+    });
+    await analyseSavIntakeRuntime(id!, config, { env: () => environment, network: observed });
     const current = await readSavIntakeCurrent(threadId, config);
-    expect(counts.model).toBe(0);
-    expect(current?.payload.reason).toBe("SAV_INTAKE_MODEL_CONTEXT_LIMIT");
-    expect(current?.payload.traces).toEqual(expect.arrayContaining([expect.objectContaining({ contextLimit: expect.objectContaining({ stage: expect.stringMatching(/^(data|catalogue|wire)$/) }) })]));
-    expect(JSON.stringify(current?.payload.traces)).not.toContain("synchronisation échouée");
+    expect(counts.model).toBeGreaterThanOrEqual(1);
+    expect(current?.payload.reason).not.toBe("SAV_INTAKE_MODEL_CONTEXT_LIMIT");
+    expect(JSON.stringify(current?.payload.traces ?? [])).not.toContain("contextLimit");
+    // The last line travels to the model: nothing was cut to fit.
+    expect(sent.some(text => text.includes("Ligne 999 "))).toBe(true);
+    expect(current?.payload.plan?.decision.classification).toBe("support");
   });
 
-  it("[INV] C12 a code/config correction does not reset the two durable attempts of a message", async () => {
-    const m = await stored(CURRENT), first = await enqueueSavIntakeMessage(m.id, config);
-    for (let n = 0; n < 2; n++) {
-      await f.db.update(savIntakeRuns).set({ leaseUntil: null, state: "waiting" }).where(eq(savIntakeRuns.id, first!));
-      const lease = (await claimSavIntakeRun(first!, config))!;
-      await failSavIntakeRun(lease, { revision: lease.run.payloadCiphertext ? "x" : "x", effects: "not_connected", reason: "SAV_INTAKE_MODEL_CONTEXT_LIMIT" } as never);
-    }
+  it("[INV] C12 a code/config correction never resets attempts: one more bounded try, then a visible block", async () => {
+    const m = await stored(CURRENT);
+    const failTwice = async (runId: string, c: IntakeRuntimeConfig) => {
+      for (let n = 0; n < 2; n++) {
+        await f.db.update(savIntakeRuns).set({ leaseUntil: null, state: "waiting" }).where(eq(savIntakeRuns.id, runId));
+        const lease = (await claimSavIntakeRun(runId, c))!;
+        expect(lease).toBeTruthy();
+        await failSavIntakeRun(lease, { revision: "x", effects: "not_connected", reason: "SAV_INTAKE_MODEL_CONTEXT_LIMIT" } as never);
+      }
+    };
+    const first = (await enqueueSavIntakeMessage(m.id, config))!;
+    await failTwice(first, config);
+    // A correction deployment may retry a failing dossier once (failed 2 < 4)...
     const corrected = savIntakeRuntimeConfig(env(mailboxId, "b".repeat(40)))!;
     expect(corrected.configHash).not.toBe(config.configHash);
-    const next = await enqueueSavIntakeMessage(m.id, corrected);
-    expect(next).toBeTruthy();
-    expect(next).not.toBe(first);
-    expect(await claimSavIntakeRun(next!, corrected)).toBeNull();
+    const second = (await enqueueSavIntakeMessage(m.id, corrected))!;
+    expect(second).not.toBe(first);
+    await failTwice(second, corrected);
+    // ...but never beyond the lifetime cap of failed attempts, whatever the deployment.
+    const again = savIntakeRuntimeConfig(env(mailboxId, "c".repeat(40)))!;
+    const third = (await enqueueSavIntakeMessage(m.id, again))!;
+    expect(await claimSavIntakeRun(third, again)).toBeNull();
+    expect(await pendingSavIntakeRuns(again)).toEqual([]);
     const runs = await f.db.select().from(savIntakeRuns).where(eq(savIntakeRuns.messageId, m.id));
-    expect(runs.reduce((sum, run) => sum + run.attempts, 0)).toBe(2);
+    expect(runs.reduce((sum, run) => sum + run.attempts, 0)).toBe(SAV_INTAKE_ATTEMPT_POLICY.failedPerMessage);
+    const markers = await f.db.select().from(savIntakeJournal).where(eq(savIntakeJournal.runId, third));
+    expect(markers.filter(j => j.kind === "attempts_exhausted")).toHaveLength(1);
     expect(await f.db.select().from(savIntakeModelCalls)).toHaveLength(0);
   });
 });

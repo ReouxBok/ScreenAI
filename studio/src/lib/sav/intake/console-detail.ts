@@ -13,16 +13,17 @@ import { readSavIntakeCurrent } from "./runtime-store";
 import { readIntakeRunDiagnostics } from "./run-diagnostics";
 import { readIntakeExecutionProgress } from "./executor";
 import type { HumanEventPayload } from "./human-binding";
+import { savEffectiveReceivedAt } from "@/lib/sav/message-order";
 export async function readIntakeConsoleDetail(threadId: string) {
   if (!await intakeConsoleInstalled()) return null;
   const db = requireDb(), [projection] = await db.select().from(savIntakeConsole).where(eq(savIntakeConsole.threadId, threadId));
   const [thread] = projection ? await db.select().from(savThreads).where(eq(savThreads.id, threadId)) : [];
   if (!thread) return null;
   const rows = await db.select().from(savMessages).where(eq(savMessages.threadId, threadId))
-    .orderBy(desc(savMessages.receivedAt), desc(savMessages.createdAt), desc(savMessages.id)).limit(201);
+    .orderBy(desc(savEffectiveReceivedAt), desc(savMessages.createdAt), desc(savMessages.id)).limit(201);
   const displayed = rows.slice(0, 200), translations = await getSavTranslations(displayed.map(row => row.id));
   const [latest] = await db.select().from(savMessages).where(and(eq(savMessages.threadId, threadId), eq(savMessages.direction, "inbound")))
-    .orderBy(desc(savMessages.receivedAt), desc(savMessages.createdAt), desc(savMessages.id)).limit(1);
+    .orderBy(desc(savEffectiveReceivedAt), desc(savMessages.createdAt), desc(savMessages.id)).limit(1);
   const historical = latest ? await intakeMessageHistorical(latest.id) : false;
   const marker = latest ? await readSavExternalCompletion(latest) : null;
   const completed = marker && latest ? await getSavExternalCompletion(latest) : null;

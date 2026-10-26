@@ -8,6 +8,7 @@ import { savIntakeRuntimeConfig,type IntakeRuntimePayload } from "./runtime-cont
 import { readRecoveryDue } from "./read-recovery";
 import { readRecoveryMarker,writeReadRecoveryMarker } from "./read-recovery-store";
 import { processSavIntakeReadRecoveryWorkflow } from "@/workflows/sav-intake-read-recovery";
+import { savEffectiveReceivedAt } from "@/lib/sav/message-order";
 type Env=Record<string,string|undefined>;
 type Options={env?:Env;start?:(runId:string)=>Promise<unknown>;now?:Date};
 /** No source, model output or credential leaves the server-side step. */
@@ -26,7 +27,7 @@ export async function readReadRecoveryWake(runId:string,env:Env=process.env,now=
   const [message]=await tx.select().from(savMessages).where(eq(savMessages.id,run.messageId));
   if(!message)return {state:"stopped" as const};
   const [newer]=await tx.select({id:savMessages.id}).from(savMessages).where(and(eq(savMessages.threadId,run.threadId),eq(savMessages.direction,"inbound"),
-    sql`(${savMessages.receivedAt},${savMessages.createdAt},${savMessages.id})>(select original.received_at,original.created_at,original.id from sav.messages original where original.id=${run.messageId}::uuid)`)).limit(1);
+    sql`(${savEffectiveReceivedAt},${savMessages.createdAt},${savMessages.id})>(select least(original.received_at,original.created_at),original.created_at,original.id from sav.messages original where original.id=${run.messageId}::uuid)`)).limit(1);
   let compatible=Boolean(message&&message.mailboxId===config.mailboxId&&message.createdAt>new Date(config.createdAfter)&&message.receivedAt>new Date(config.receivedAfter)&&!newer);
   if(compatible&&message){const snapshot=await (await import("./runtime-store")).savIntakeSourceSnapshot(tx,message,now);compatible=snapshot.sourceHash===r.sourceHash;}
   if(!thread||thread.aiPaused||thread.humanRequestedAt||human||!compatible){

@@ -126,7 +126,7 @@ export async function dispatchPendingSavIntakeWakes(options: { env?: Env; start?
     sql`exists(select 1 from sav.threads t where t.id=${savIntakeRuns.threadId} and not t.ai_paused)`,
     sql`exists(select 1 from sav.messages m where m.id=${savIntakeRuns.messageId} and m.thread_id=${savIntakeRuns.threadId}
       and m.mailbox_id=${config.mailboxId}::uuid and m.direction='inbound' and m.created_at>${config.createdAfter}::timestamptz and m.received_at>${config.receivedAfter}::timestamptz
-      and not exists(select 1 from sav.messages newer where newer.thread_id=m.thread_id and newer.direction='inbound' and (newer.received_at,newer.created_at,newer.id)>(m.received_at,m.created_at,m.id)))`,
+      and not exists(select 1 from sav.messages newer where newer.thread_id=m.thread_id and newer.direction='inbound' and (least(newer.received_at,newer.created_at),newer.created_at,newer.id)>(least(m.received_at,m.created_at),m.created_at,m.id)))`,
     sql`not exists(select 1 from public.audit_logs w where w.entity_type='sav_intake_wake' and w.entity_id=${savIntakeRuns.id}::text and w.action='sav_intake_wake_requested'
       and (case when jsonb_typeof(w.technical_metadata->'dispatches')='number' then (w.technical_metadata->>'dispatches')::numeric>=${SAV_INTAKE_WAKE_MAX_DISPATCHES} else false end
         or w.technical_metadata->>'lastDispatchedAt'>${new Date(now.getTime() - REDISPATCH_AFTER_MS).toISOString()}))`);

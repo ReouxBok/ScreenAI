@@ -142,3 +142,21 @@ describe("Gmail SAV ingestion", () => {
     expect(parsed.headers["from-display-name"]).toBe("Jeanne Martin");
   });
 });
+
+describe("provider date in the future", () => {
+  const message = (internalDate: number) => ({ id: "synthetic-future", threadId: "synthetic-future-thread", internalDate: String(internalDate),
+    payload: { mimeType: "text/plain", headers: [{ name: "From", value: "client@example.invalid" }, { name: "To", value: "sav@limova.ai" }, { name: "Subject", value: "Publications" }],
+      body: { data: Buffer.from("Bonjour").toString("base64url") } } });
+  it("is bounded by the observation time and keeps the raw Gmail date in a header", () => {
+    const now = new Date("2026-10-26T08:19:44.000Z"), raw = new Date("2026-10-27T05:30:00.000Z");
+    const parsed = parseGmailMessage("sav@limova.ai", message(raw.getTime()), now);
+    expect(parsed.receivedAt.toISOString()).toBe(now.toISOString());
+    expect(parsed.headers["x-studio-gmail-internal-date"]).toBe(raw.toISOString());
+  });
+  it("leaves an ordinary past date untouched", () => {
+    const now = new Date("2026-10-26T08:19:44.000Z"), raw = new Date("2026-10-26T08:00:00.000Z");
+    const parsed = parseGmailMessage("sav@limova.ai", message(raw.getTime()), now);
+    expect(parsed.receivedAt.toISOString()).toBe(raw.toISOString());
+    expect(parsed.headers).not.toHaveProperty("x-studio-gmail-internal-date");
+  });
+});

@@ -15,6 +15,7 @@ import { readSavIntakeCurrent, savIntakeSourceSnapshot, intakeSourceMatches, int
 import { savIntakeDecisionSchema } from "./contract";
 import { savIntakePlanFingerprint } from "./engine";
 import type { ExecutionPayload, Effect, EffectIntent, EffectAck, ExecutionOptions } from "./execution-types";
+import { savEffectiveReceivedAt } from "@/lib/sav/message-order";
 export type ExecutionTx = Parameters<Parameters<ReturnType<typeof requireDb>["transaction"]>[0]>[0];
 export const admissionLock = async (tx: ExecutionTx) => { await tx.execute(sql `select pg_advisory_xact_lock(hashtext('sav-intake-common-admission-v1'))`); };
 export const executionJournal = async (tx: ExecutionTx, id: string, kind: string, payload: unknown, effectId?: string) => {
@@ -293,7 +294,7 @@ export async function assertExecutionLocal(tx: ExecutionTx, lease: ExecutionLeas
     const [m] = await tx.select().from(savMessages).where(eq(savMessages.id, lease.row.messageId));
     const [last] = await tx.select({
         id: savMessages.id
-    }).from(savMessages).where(and(eq(savMessages.threadId, lease.row.threadId), eq(savMessages.direction, "inbound"))).orderBy(desc(savMessages.receivedAt), desc(savMessages.createdAt), desc(savMessages.id)).limit(1);
+    }).from(savMessages).where(and(eq(savMessages.threadId, lease.row.threadId), eq(savMessages.direction, "inbound"))).orderBy(desc(savEffectiveReceivedAt), desc(savMessages.createdAt), desc(savMessages.id)).limit(1);
     if (!row || row.leaseToken !== lease.token || !row.leaseUntil || row.leaseUntil <= now || row.state !== "running" || !thread || thread.aiPaused || !run?.isCurrent || run.id !== lease.payload.lastRunId || (decryptSavPayload<{
         plan?: {
             fingerprint?: string;
@@ -421,7 +422,7 @@ export async function finishVerifiedIdentityRecovery(executionId: string) {
         const [thread] = await tx.select().from(savThreads).where(eq(savThreads.id, row.threadId)).for("update");
         const [message] = await tx.select().from(savMessages).where(eq(savMessages.id, row.messageId));
         const [latest] = await tx.select({id:savMessages.id}).from(savMessages).where(and(eq(savMessages.threadId,row.threadId),eq(savMessages.direction,"inbound")))
-            .orderBy(desc(savMessages.receivedAt),desc(savMessages.createdAt),desc(savMessages.id)).limit(1);
+            .orderBy(desc(savEffectiveReceivedAt),desc(savMessages.createdAt),desc(savMessages.id)).limit(1);
         const [run] = await tx.select().from(savIntakeRuns).where(eq(savIntakeRuns.id,row.runId)).for("update");
         const [pending] = await tx.select({id:savIntakeHumanEvents.id}).from(savIntakeHumanEvents)
             .where(and(eq(savIntakeHumanEvents.messageId,row.messageId),inArray(savIntakeHumanEvents.state,["pending","reading"]))).limit(1);
@@ -677,7 +678,7 @@ export async function releaseRecoveredExecutionScope(executionId: string) {
         const [thread] = await tx.select().from(savThreads).where(eq(savThreads.id, row.threadId)).for("update");
         const [latest] = await tx.select({
             id: savMessages.id
-        }).from(savMessages).where(and(eq(savMessages.threadId, row.threadId), eq(savMessages.direction, "inbound"))).orderBy(desc(savMessages.receivedAt), desc(savMessages.createdAt), desc(savMessages.id)).limit(1);
+        }).from(savMessages).where(and(eq(savMessages.threadId, row.threadId), eq(savMessages.direction, "inbound"))).orderBy(desc(savEffectiveReceivedAt), desc(savMessages.createdAt), desc(savMessages.id)).limit(1);
         if (thread && !thread.aiPaused && latest?.id === row.messageId && !await intakeHumanRefused(row.messageId, tx))
             return;
         const effects = await tx.select().from(savIntakeEffects).where(eq(savIntakeEffects.executionId, row.id));

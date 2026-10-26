@@ -19,6 +19,7 @@ import { collectSavObservationSources, type ObservationEvent, type ObservationSn
 import { savStoredReviewReasons, type SavReviewReason } from "./review-contract";
 import { reconcileSavDeferredComparisons, processSavLearningResolution, savLearningMaterialText } from "./learning-pipeline";
 import { closeSavLearningReservationTx } from "./learning-admission";
+import { savEffectiveReceivedAt } from "@/lib/sav/message-order";
 const DAY = 24 * 60 * 60 * 1000;
 // Keep closed cases observable for late evidence and reopenings until normal
 // terminal-dossier retention removes them. Closing alone is not resolution.
@@ -125,7 +126,7 @@ export async function syncSavObservation(id: string, collect: (id: string) => Pr
             await tx.update(savResolutionObservations).set(release).where(eq(savResolutionObservations.id, id));
             return { id, status: "stale_source" };
         }
-        const messages = await tx.select().from(savMessages).where(eq(savMessages.threadId, row.threadId)).orderBy(desc(savMessages.receivedAt)).limit(200);
+        const messages = await tx.select().from(savMessages).where(eq(savMessages.threadId, row.threadId)).orderBy(desc(savEffectiveReceivedAt)).limit(200);
         if (messages.length === 200)
             snapshot.errors.push("gmail:message_limit_200");
         let events: ObservationEvent[] = [...snapshot.events];

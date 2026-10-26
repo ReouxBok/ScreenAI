@@ -14,6 +14,7 @@ import { decryptSavPayload, encryptSavPayload } from "./crypto";
 import { assertSavTicketPreview } from "./manual-ticket-preview";
 import { SAV_TICKET_RETURN_NOTE_VERSION } from "./ticket-return-note";
 import { resolveSavCustomerIdentity } from "./forwarded-identity";
+import { savEffectiveReceivedAt } from "@/lib/sav/message-order";
 
 const requestSchema = z.object({ threadId: z.uuid(), reviewId: z.uuid(), kind: z.enum(["create_ticket", "link_ticket"]), ticketId: z.string().regex(/^\d{1,30}$/).optional(), returnOperation: z.enum(["keep", "reactivate", "create"]).optional(), previewToken: z.string().max(40_000).optional(), distinctIssueReason: z.string().trim().max(2_000).default("") });
 export async function queueSavManualTicket(raw: unknown, actorEmail: string, verifiedContext?: SavDossierContext) {
@@ -23,7 +24,7 @@ export async function queueSavManualTicket(raw: unknown, actorEmail: string, ver
   return requireDb().transaction(async (tx) => {
     const [thread] = await tx.select().from(savThreads).where(eq(savThreads.id, input.threadId)).for("update");
     if (!thread) throw new Error("SAV_THREAD_NOT_FOUND");
-    const [message] = await tx.select().from(savMessages).where(and(eq(savMessages.threadId, thread.id), eq(savMessages.direction, "inbound"), savV0EligibleMessageFilter())).orderBy(desc(savMessages.receivedAt), desc(savMessages.createdAt), desc(savMessages.id)).limit(1);
+    const [message] = await tx.select().from(savMessages).where(and(eq(savMessages.threadId, thread.id), eq(savMessages.direction, "inbound"), savV0EligibleMessageFilter())).orderBy(desc(savEffectiveReceivedAt), desc(savMessages.createdAt), desc(savMessages.id)).limit(1);
     if (!message) throw new Error("SAV_MESSAGE_BEFORE_CUTOVER");
     const messageBody = decryptSavPayload<{ text: string }>(message.bodyCiphertext);
     const customerIdentity = resolveSavCustomerIdentity({ fromEmail: message.fromEmail, body: messageBody.text });
@@ -93,7 +94,7 @@ export async function assertSavCurrentTicketReview(action: typeof savActions.$in
   const db = requireDb();
   const [review] = await db.select().from(savProposalReviews).where(and(eq(savProposalReviews.id, action.payload.savReviewId), eq(savProposalReviews.messageId, action.messageId), eq(savProposalReviews.isCurrent, true), eq(savProposalReviews.status, "approved"))).limit(1);
   const [decision] = await db.select().from(savDecisions).where(and(eq(savDecisions.id, action.decisionId), eq(savDecisions.isCurrent, true))).limit(1);
-  const [latest] = await db.select({ id: savMessages.id }).from(savMessages).where(and(eq(savMessages.threadId, action.threadId), eq(savMessages.direction, "inbound"))).orderBy(desc(savMessages.receivedAt), desc(savMessages.createdAt), desc(savMessages.id)).limit(1);
+  const [latest] = await db.select({ id: savMessages.id }).from(savMessages).where(and(eq(savMessages.threadId, action.threadId), eq(savMessages.direction, "inbound"))).orderBy(desc(savEffectiveReceivedAt), desc(savMessages.createdAt), desc(savMessages.id)).limit(1);
   const c = review?.reviewScope === "dossier" ? await loadSavDossierReviewContext(action.messageId) : null;
   if (c?.proposal.humanProcess && action.payload.ticketPreviewConfirmed !== true) throw new Error("SAV_TICKET_PREVIEW_EXPIRED");
   if (!review || !decision || (c ? c.review?.id !== review.id : review.decisionId !== decision.id) || latest?.id !== action.messageId) throw new Error("SAV_PROPOSAL_STALE");

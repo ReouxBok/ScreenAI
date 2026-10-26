@@ -8,6 +8,7 @@ import { auditLogs, savMessages, savThreads } from "@/db/schema";
 import { assertSavActor } from "./access";
 import { savV0EligibleMessageFilter } from "./cutover";
 import { executeSavTicketCommandWorkflow, refreshSavContextWorkflow, executeSavEmailOpeningWorkflow } from "@/workflows/sav-commands";
+import { savEffectiveReceivedAt } from "@/lib/sav/message-order";
 
 export async function dispatchSavTicketCommand(actionId: string) {
   try { await start(executeSavTicketCommandWorkflow, [actionId]); }
@@ -45,7 +46,7 @@ export async function enqueueSavContextRefresh(threadId: string, actorEmail: str
   z.uuid().parse(threadId);
   const [message] = await requireDb().select({ id: savMessages.id }).from(savMessages)
     .where(and(eq(savMessages.threadId, threadId), eq(savMessages.direction, "inbound"), savV0EligibleMessageFilter()))
-    .orderBy(desc(savMessages.receivedAt), desc(savMessages.createdAt), desc(savMessages.id)).limit(1);
+    .orderBy(desc(savEffectiveReceivedAt), desc(savMessages.createdAt), desc(savMessages.id)).limit(1);
   if (!message) throw new Error("SAV_MESSAGE_BEFORE_CUTOVER");
   const requested = await requireDb().transaction(async tx => {
     await tx.select({ id: savThreads.id }).from(savThreads).where(eq(savThreads.id, threadId)).for("update");

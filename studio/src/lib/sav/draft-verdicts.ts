@@ -11,6 +11,7 @@ import { savStructuredProposalSchema, mergeSavReviewedProposal } from "./proposa
 import { savReviewMatchesProposal, savDossierSourceHash, savDraftSourceHash, savDraftNotApplicable, savReplyForbidden, savReviewReasonsSchema, savStoredReviewReasons } from "./review-contract";
 import { savReleaseStage } from "./config";
 import { normalizeSavConfirmationText, SAV_REPLY_CONFIRMATION_TEXT_REVISION } from "./reply-confirmation-text";
+import { savEffectiveReceivedAt } from "@/lib/sav/message-order";
 type Reader = Pick<ReturnType<typeof requireDb>, "select">;
 /** Called under the thread lock for mutations; exact IDs prevent stale forms,
  * content hashes allow only unchanged verdicts to survive a new generation. */
@@ -18,7 +19,7 @@ export async function loadSavDossierReviewContext(messageId: string, db: Reader 
     const [message] = await db.select().from(savMessages).where(eq(savMessages.id, messageId));
     if (!message)
         throw new Error("SAV_MESSAGE_NOT_FOUND");
-    const [latest] = await db.select().from(savMessages).where(and(eq(savMessages.threadId, message.threadId), eq(savMessages.direction, "inbound"))).orderBy(desc(savMessages.receivedAt), desc(savMessages.createdAt), desc(savMessages.id)).limit(1);
+    const [latest] = await db.select().from(savMessages).where(and(eq(savMessages.threadId, message.threadId), eq(savMessages.direction, "inbound"))).orderBy(desc(savEffectiveReceivedAt), desc(savMessages.createdAt), desc(savMessages.id)).limit(1);
     const [decision] = await db.select().from(savDecisions).where(and(eq(savDecisions.messageId, message.id), eq(savDecisions.isCurrent, true))).limit(1);
     const [run] = decision?.agentRunId ? await db.select().from(savAgentRuns).where(eq(savAgentRuns.id, decision.agentRunId)) : [];
     if (latest?.id !== messageId || !decision || run?.messageId !== messageId || run.pilotBatchId || !run.proposalCiphertext)

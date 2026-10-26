@@ -14,6 +14,7 @@ import { savDashboardLearningProgress } from "./learning-progress";
 import { observeSavOther, readSavOtherConfiguration, type SavOtherObservation } from "./other-observation";
 import type { SavMessageBody } from "./service";
 import { countSavRead } from "./read-metrics";
+import { savEffectiveReceivedAt } from "@/lib/sav/message-order";
 
 const technicalKinds = new Set(["spam", "automatic_reply", "bounce", "internal_notification", "duplicate"]);
 type Action = typeof savActions.$inferSelect;
@@ -75,8 +76,8 @@ export async function listSavDossierDashboardReference(options: SavDashboardOpti
         .leftJoin(savPilotItems, eq(savPilotItems.messageId, savMessages.id))
         .where(and(eq(savMessages.direction, "inbound"), savV0EligibleMessageFilter(), isNull(savPilotItems.id), options.threadId ? eq(savThreads.id, options.threadId) : undefined,
           options.threadIds ? options.threadIds.length ? inArray(savThreads.id, options.threadIds) : sql`false` : undefined,
-          sql`${savMessages.id} = (select latest.id from sav.messages latest where latest.thread_id = ${savThreads.id} and latest.direction = 'inbound' order by latest.received_at desc, latest.created_at desc, latest.id desc limit 1)`))
-        .orderBy(options.sort === "oldest" ? asc(savMessages.receivedAt) : desc(savMessages.receivedAt), options.sort === "oldest" ? asc(savMessages.id) : desc(savMessages.id)).limit(250).offset(offset);
+          sql`${savMessages.id} = (select latest.id from sav.messages latest where latest.thread_id = ${savThreads.id} and latest.direction = 'inbound' order by least(latest.received_at,latest.created_at) desc, latest.created_at desc, latest.id desc limit 1)`))
+        .orderBy(options.sort === "oldest" ? asc(savEffectiveReceivedAt) : desc(savEffectiveReceivedAt), options.sort === "oldest" ? asc(savMessages.id) : desc(savMessages.id)).limit(250).offset(offset);
       if (!batch.length) break;
       countSavRead("sourceRows", batch.length);
       const ids = batch.map(r => r.message.id), threads = batch.map(r => r.thread.id);
