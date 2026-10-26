@@ -549,3 +549,19 @@ export async function scheduleSavIntakeTransientRetry(runId: string, reason: str
     return { retryAt, retry: done + 1, remaining: delays.length - done - 1 };
   });
 }
+/** Comparison results live in the run's append-only journal, never in its payload, state or attempts. */
+export type SavIntakeShadowRecord = { messageId: string; sourceHash: string; at: string; verdict: "identical" | "divergent" | "incomplete"; differences: string[];
+  live: unknown; shadow: unknown; error?: string; uncertain: boolean; [key: string]: unknown };
+export async function recordSavIntakeShadow(runId: string, value: SavIntakeShadowRecord) {
+  await requireDb().insert(savIntakeJournal).values({ runId, kind: "shadow_plan", payloadCiphertext: encryptSavPayload(value) });
+}
+export async function savIntakeShadowRecorded(messageId: string, sourceHash: string) {
+  const rows = await requireDb().select({ payloadCiphertext: savIntakeJournal.payloadCiphertext }).from(savIntakeJournal)
+    .innerJoin(savIntakeRuns, eq(savIntakeRuns.id, savIntakeJournal.runId)).where(and(eq(savIntakeRuns.messageId, messageId), eq(savIntakeJournal.kind, "shadow_plan")));
+  return rows.some(r => decryptSavPayload<SavIntakeShadowRecord>(r.payloadCiphertext).sourceHash === sourceHash);
+}
+export async function readSavIntakeShadowRecords(limit = 200) {
+  const rows = await requireDb().select({ runId: savIntakeJournal.runId, payloadCiphertext: savIntakeJournal.payloadCiphertext }).from(savIntakeJournal)
+    .where(eq(savIntakeJournal.kind, "shadow_plan")).orderBy(desc(savIntakeJournal.createdAt), desc(savIntakeJournal.id)).limit(Math.min(500, Math.max(1, limit)));
+  return rows.map(r => ({ runId: r.runId, value: decryptSavPayload<SavIntakeShadowRecord>(r.payloadCiphertext) }));
+}

@@ -16,8 +16,10 @@ export function createIntakeModelDispatcher(options: { config: IntakeRuntimeConf
   preflight?: (hashes: string[]) => Promise<void>;
   env?: () => Record<string,string|undefined>; network?: typeof fetch;
   /** Informational: the ledger, not this ordinal, decides whether a body may be dispatched again. */
-  retryOrdinal?: number }) {
-  const {config,live}=options, env=options.env??(()=>process.env), network=options.network??fetch;
+  retryOrdinal?: number;
+  /** Settlement of a reservation; the live ledger by default, a separate one for the comparison. */
+  settle?: typeof settleSavIntakeCall }) {
+  const {config,live}=options, env=options.env??(()=>process.env), network=options.network??fetch, settle=options.settle??settleSavIntakeCall;
   let uncertain=false, failureReason:string|undefined;
   const pending:Promise<unknown>[]=[];
   const execute: IntakeGeminiCall = async input => {
@@ -63,7 +65,7 @@ export function createIntakeModelDispatcher(options: { config: IntakeRuntimeConf
         const json = input.media ? input.sanitizeResponse!(generated.json) : generated.json;
         const result = { json, metadata };
         if (!reservation) throw Error("SAV_INTAKE_RUNTIME_DISPATCH_REJECTED");
-        uncertain = !await settleSavIntakeCall(reservation, result.metadata, result);
+        uncertain = !await settle(reservation, result.metadata, result);
         failureReason = undefined;
         return result;
       } catch (error) {
@@ -71,8 +73,8 @@ export function createIntakeModelDispatcher(options: { config: IntakeRuntimeConf
         // settled at zero, explicitly marked. A timeout or lost answer stays uncertain.
         const unbilled = providerStatus !== undefined && (providerStatus === 429 || providerStatus >= 500 && providerStatus <= 599)
           && error instanceof Error && error.message === `SAV_AI_HTTP_${providerStatus}` ? providerStatus : undefined;
-        if (reservation) uncertain = !await (unbilled === undefined ? settleSavIntakeCall(reservation, exactUsage(savAiErrorMetadata(error)))
-          : settleSavIntakeCall(reservation, exactUsage(savAiErrorMetadata(error)), undefined, unbilled));
+        if (reservation) uncertain = !await (unbilled === undefined ? settle(reservation, exactUsage(savAiErrorMetadata(error)))
+          : settle(reservation, exactUsage(savAiErrorMetadata(error)), undefined, unbilled));
         failureReason = error instanceof z.ZodError ? "SAV_INTAKE_MODEL_OUTPUT_REJECTED"
           : error instanceof Error && /^SAV_[A-Z0-9_]+$/.test(error.message) ? error.message : "SAV_INTAKE_RUNTIME_PROVIDER_UNAVAILABLE";
         throw error;

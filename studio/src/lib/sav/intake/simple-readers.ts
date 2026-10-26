@@ -36,16 +36,22 @@ const historyText = (history: IntakeHistory) => history.map(e => `[${e.id} ${e.a
 const ids = (values: string[]) => values.length ? z.enum(values as [string, ...string[]]) : z.string().max(0);
 const SUPPORT_ONLY = /^(?:ça|ca|cela)\s+ne\s+(?:fonctionne|marche)\s+(?:pas|plus)[.!\s]*$/iu;
 
-/** One snapshot per run: the simple reader and the engine see the same CRM answers. */
-export function memoizeIntakeCrmReaders(crm: Crm): Crm {
+/** One snapshot per run: the simple reader and the engine see the same CRM answers.
+ * `beside(other)` gives a reader of the SAME cached answers whose misses go to `other` and are
+ * kept apart: the comparison can never add reads, traces or checkpoints to the live run. */
+export function memoizeIntakeCrmReaders(crm: Crm): Crm & { beside(other: Crm): Crm } {
   const cache = new Map<string, Promise<unknown>>();
-  const memo = <A extends unknown[], R>(name: string, fn: (...args: A) => Promise<R>) => (...args: A): Promise<R> => {
-    const key = `${name}:${String(args[0])}`;
-    if (!cache.has(key)) cache.set(key, fn(...args).catch(error => { cache.delete(key); throw error; }));
-    return cache.get(key) as Promise<R>;
+  const build = (source: Crm, store: Map<string, Promise<unknown>>, shared?: Map<string, Promise<unknown>>) => {
+    const memo = <A extends unknown[], R>(name: string, fn: (...args: A) => Promise<R>) => (...args: A): Promise<R> => {
+      const key = `${name}:${String(args[0])}`;
+      if (shared?.has(key)) return shared.get(key) as Promise<R>;
+      if (!store.has(key)) store.set(key, fn(...args).catch(error => { store.delete(key); throw error; }));
+      return store.get(key) as Promise<R>;
+    };
+    return { findContactsByEmail: memo("contacts", source.findContactsByEmail), directAssociations: memo("associations", source.directAssociations),
+      getContact: memo("contact", source.getContact), ticketsForContact: memo("tickets", source.ticketsForContact), ticketHistory: memo("history", source.ticketHistory) };
   };
-  return { findContactsByEmail: memo("contacts", crm.findContactsByEmail), directAssociations: memo("associations", crm.directAssociations),
-    getContact: memo("contact", crm.getContact), ticketsForContact: memo("tickets", crm.ticketsForContact), ticketHistory: memo("history", crm.ticketHistory) };
+  return { ...build(crm, cache), beside: (other: Crm) => build(other, new Map(), cache) };
 }
 
 /** Same CRM scope as the engine (contacts of the address, admitted direct links,

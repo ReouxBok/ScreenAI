@@ -10,7 +10,9 @@ import { intakeMessageHistorical, intakeLaunchMatches, parkLaunchedIntakeMessage
 import { recordAcceptedIntakeSemantics,reuseAcceptedIntakeSemantics,SAV_INTAKE_SEMANTIC_RECORD_REVISION } from "./semantic-records";
 import { newReadRecovery, recoverableIntakeReads, intakeReadRetryable, DEFAULT_INTAKE_READ_RECOVERY } from "./read-recovery";
 import { publicIntakeSchemaIssues } from "./schema-diagnostics";
-import type { EngineInput, MessageAnalysis } from "./engine-types";
+import type { EngineInput, EnginePolicy, MessageAnalysis } from "./engine-types";
+import { runSavIntakeShadow, type SavIntakeShadowJob } from "./shadow";
+import { savIntakeShadowConfig } from "./shadow-ledger";
 import type { IntakeReadTrace } from "./hubspot-readers";
 import { SAV_INTAKE_MODEL_REVISION } from "./model-readers";
 import { planSavIntake } from "./engine";
@@ -39,7 +41,9 @@ export async function enqueueConfiguredSavIntake(messageId: string) {
   return !runId && launch ? launch : {runId};
 }
 async function analyseSavIntakeRuntimeWithinBudget(runId: string, config: IntakeRuntimeConfig,
-  deps: { env?: () => Record<string, string | undefined>; network?: typeof fetch; downloadAttachments?: Parameters<typeof prepareIntakeAttachments>[3]; authenticateOther?: Parameters<typeof qualifyRuntimeOther>[3]; startReadRecovery?: (runId:string)=>Promise<unknown>; deadlineMs?: number } = {}) {
+  deps: { env?: () => Record<string, string | undefined>; network?: typeof fetch; downloadAttachments?: Parameters<typeof prepareIntakeAttachments>[3]; authenticateOther?: Parameters<typeof qualifyRuntimeOther>[3]; startReadRecovery?: (runId:string)=>Promise<unknown>; deadlineMs?: number;
+    /** Receives the comparison job of this analysis (current pipeline only); run after the live budget. */
+    shadowJob?: (job: SavIntakeShadowJob) => void } = {}) {
   const env = deps.env ?? (() => process.env), network = deps.network ?? fetch;
   const lease = await claimSavIntakeRun(runId, config); if (!lease) return { skipped: "not_claimed" };
   const previous = decryptSavPayload<IntakeRuntimePayload>(lease.run.payloadCiphertext);
@@ -101,7 +105,9 @@ async function analyseSavIntakeRuntimeWithinBudget(runId: string, config: Intake
     const readPending:Promise<unknown>[]=[];
     const recoverable=recoverableIntakeReads(crm,payload.readRecovery!,{reuse:Boolean(lease.recoveringRead),checkpoint,pending:readPending});
     // The simple reader reads the CRM before its single call; the engine then sees the very same answers.
-    const reads = pipeline === "simple" ? memoizeIntakeCrmReaders(recoverable) : recoverable;
+    // The comparison must see the very CRM answers of this analysis: one memoized snapshot.
+    const shadowing = pipeline === "current" && Boolean(deps.shadowJob) && Boolean(savIntakeShadowConfig(env())) && !lease.recoveringRead;
+    const reads = pipeline === "simple" || shadowing ? memoizeIntakeCrmReaders(recoverable) : recoverable;
     const priorAnalysis=lease.recoveringRead?payload.semantics!.records.find(r=>r.method==="analyseMessage")?.result as MessageAnalysis|undefined:undefined;
     // The single-call reader may show the model CRM context later than receipt: never used for at_receipt analyses.
     const simple = pipeline === "simple" && lease.input.mode !== "at_receipt";
@@ -131,7 +137,9 @@ async function analyseSavIntakeRuntimeWithinBudget(runId: string, config: Intake
       semanticFailureReason = failure.errorCode;
       traces.push({ ...failure, phase: "accepted_semantics", accepted: false }); checkpoint();
     });
-    payload.plan = await withSavAiBudget(() => planSavIntake(lease.input, { ...reads, ...semantic }, qualifiedOther ? {...config.policy,qualifiedOther:{...(qualifiedOther.family==="authenticated_newsletter"?{family:"authenticated_newsletter" as const}:{}),resource:qualifiedOther.resource,evidenceSource:"private_rule"}} : config.policy, { timeoutMs: 10_000 }, () => new Date()));
+    const enginePolicy: EnginePolicy = qualifiedOther ? {...config.policy,qualifiedOther:{...(qualifiedOther.family==="authenticated_newsletter"?{family:"authenticated_newsletter" as const}:{}),resource:qualifiedOther.resource,evidenceSource:"private_rule"}} : config.policy;
+    const shadowInput = structuredClone(lease.input);
+    payload.plan = await withSavAiBudget(() => planSavIntake(lease.input, { ...reads, ...semantic }, enginePolicy, { timeoutMs: 10_000 }, () => new Date()));
     assertSavIntakeObservation(payload.plan);
     // Cancellation may finish after the pure planner's per-call timeout.
     let drainTimer: ReturnType<typeof setTimeout> | undefined;
@@ -151,6 +159,12 @@ async function analyseSavIntakeRuntimeWithinBudget(runId: string, config: Intake
     } else if(lease.recoveringRead) {payload.readRecovery!.state=state==="waiting"?"invalidated":"complete";payload.readRecovery!.cache=[];}
     else delete payload.readRecovery;
     await saveSavIntakeResult(lease, config, payload, state);
+    // The comparison reads the same cached CRM answers; anything else it needs goes to a separate,
+    // trace-free reader that can never checkpoint or otherwise touch this run.
+    const shadowReads = shadowing ? (reads as ReturnType<typeof memoizeIntakeCrmReaders>).beside(createSavIntakeHubspotReaders({ network: async (url, init) => network(url, { ...init, redirect: "error",
+      headers: { ...Object.fromEntries(new Headers(init?.headers)), Authorization: `Bearer ${env().HUBSPOT_ACCESS_TOKEN}` } }) })) : reads;
+    if (shadowing && !dispatcher.uncertain) deps.shadowJob!({ runId, messageId: lease.run.messageId, sourceHash: lease.sourceHash, input: shadowInput, reads: shadowReads, policy: enginePolicy,
+      provenance: lease.provenance, ...(attachments?.complete ? { attachments: attachments.prepared } : {}), livePlan: payload.plan, config, env, network });
     // A provider outage is retried automatically at a durable due time, not left to wait.
     const transientRetry = state === "waiting" && !dispatcher.uncertain && payload.readRecovery?.state !== "scheduled" && intakeTransientFailure(payload.reason)
       ? await scheduleSavIntakeTransientRetry(runId, payload.reason!) : null;
@@ -173,6 +187,17 @@ async function analyseSavIntakeRuntimeWithinBudget(runId: string, config: Intake
   } finally { controller.abort(); clearTimeout(timer); }
 }
 export async function analyseSavIntakeRuntime(...args: Parameters<typeof analyseSavIntakeRuntimeWithinBudget>) {
+  let job: SavIntakeShadowJob | undefined;
+  const withShadow: Parameters<typeof analyseSavIntakeRuntimeWithinBudget> = [args[0], args[1], { ...args[2], shadowJob: value => { job = value; } }];
+  const result = await analyseSavIntakeRuntimeAttempts(...withShadow);
+  // The comparison runs after, outside the live AI budget; it can never change the live result.
+  const shadow = job && savIntakeShadowConfig((args[2]?.env ?? (() => process.env))());
+  const deadline = args[2]?.deadlineMs;
+  if (job && shadow && (deadline === undefined || deadline - Date.now() >= 65_000))
+    await runSavIntakeShadow(job, shadow).catch(error => console.warn("sav_intake_shadow", { error: error instanceof Error ? error.message : "unknown" }));
+  return result;
+}
+async function analyseSavIntakeRuntimeAttempts(...args: Parameters<typeof analyseSavIntakeRuntimeWithinBudget>) {
   const first = await withSavAiBudget(() => analyseSavIntakeRuntimeWithinBudget(...args));
   if (!("retryFormat" in first) || !first.retryFormat) return first;
   const deadline = args[2]?.deadlineMs;
