@@ -292,7 +292,22 @@ export function createSavIntakeSemanticReaders(options: {
             delete value.registration; note("discardedRegistrations");
           }
         }
-      }, { schema: wireSchema, normalize: raw => normalizeIntakeAnalysisOutput(raw, { visual: Boolean(visual) }), decode: raw => {
+      }, { schema: wireSchema, normalize: raw => {
+        const normalized = normalizeIntakeAnalysisOutput(raw, { visual: Boolean(visual) });
+        // Before any wire schema (the visual sanitizer parses it first): an optional registration
+        // whose anchor does not resolve to its own source is dropped under the discard rule.
+        // Every other field, including request quoteIds, keeps its strict enum validation.
+        const value = normalized.value as Record<string, unknown> | null;
+        const registration = value && typeof value === "object" && !Array.isArray(value) ? value.registration as Record<string, unknown> | undefined : undefined;
+        if (!registration || typeof registration !== "object") return normalized;
+        const sourceId = registration.sourceMessageId === message.id ? "current" : `message-${String(registration.sourceMessageId)}`;
+        const allowed = [message, ...conversation].some(m => m.id === registration.sourceMessageId && m.direction === "inbound" && m.fromEmail.toLowerCase() === message.fromEmail.toLowerCase());
+        const anchored = allowed && catalogue.entries.some(e => e.id === registration.quoteId && e.sourceId === sourceId);
+        const inherited = Array.isArray(value!.requests) && value!.requests.some(r => !!r && typeof r === "object" && (r as { originMessageId?: unknown }).originMessageId !== undefined);
+        if (anchored || !intakeRegistrationDiscardable(message.currentText, message.fromEmail, inherited)) return normalized;
+        const { registration: dropped, ...rest } = value!; void dropped;
+        return { value: rest, counts: { ...normalized.counts, discardedRegistrations: normalized.counts.discardedRegistrations + 1 } };
+      }, decode: raw => {
         if (!raw || typeof raw !== "object" || Array.isArray(raw)) return raw;
         if (Object.hasOwn(raw, "attachmentObservations")) rejectIntakeEvidence("unknown_source", "attachmentObservations");
         const { unreadAttachmentRequirements, ...withoutUnread } = raw as Record<string, unknown>;

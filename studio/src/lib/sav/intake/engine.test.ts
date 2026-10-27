@@ -546,3 +546,50 @@ describe("SAV-42 B: mixed readable image and unread PDF", () => {
     reason(await mixed("required").run(), "history_incomplete");
   });
 });
+
+it.each(["Connexion impossible.","Ça bug."])("REVIEW201 an autonomous short request with an accessory file is handled: %s",async text=>{
+ const f=fixture();f.input.message.currentText=text;expect((await f.run()).decision.disposition.kind).toBe("ticket");f.input.message.unreadAttachments=[{sourceId:"attachment:pdf",reason:"unsupported_type"}];
+ f.analysis.unreadAttachmentRequirements=[{sourceId:"attachment:pdf",role:"accessory",textQuote:text}];
+ expect((await f.run()).decision.disposition.kind).toBe("ticket");
+});
+it("REVIEW201 an explicit accessory pointer does not override a complete written request",async()=>{
+ const f=fixture(["cancellation"]);const text="Je souhaite résilier mon abonnement à la fin du mois.";
+ f.input.message.currentText=text+" Voir PJ pour information uniquement : ancienne facture accessoire.";
+ f.input.message.unreadAttachments=[{sourceId:"attachment:pdf",reason:"unsupported_type"}];
+ f.analysis.unreadAttachmentRequirements=[{sourceId:"attachment:pdf",role:"accessory",textQuote:text}];
+ expect((await f.run()).decision.disposition.kind).toBe("ticket");
+});
+
+it("REVIEW201 a substantive-looking pointer still requires the unread file",async()=>{
+ const f=fixture();const text="Le problème est détaillé dans le PDF joint.";
+ f.input.message.currentText=text;f.input.message.unreadAttachments=[{sourceId:"attachment:pdf",reason:"unsupported_type"}];
+ f.analysis.unreadAttachmentRequirements=[{sourceId:"attachment:pdf",role:"accessory",textQuote:text}];
+ expect((await f.run()).decision.disposition.kind).toBe("collect_context");
+});
+
+describe("SAV-42 B (review 201): the cited sentence decides, in both directions", () => {
+  const run = async (text: string, quote: string) => {
+    const f = fixture(); f.input.message.currentText = text;
+    f.input.message.unreadAttachments = [{ sourceId: "attachment:pdf", reason: "unsupported_type" }];
+    f.analysis.unreadAttachmentRequirements = [{ sourceId: "attachment:pdf", role: "accessory", textQuote: quote }];
+    return (await f.run()).decision.disposition.kind;
+  };
+  it.each([
+    ["Connexion impossible.", "Connexion impossible."],
+    ["Ça bug. Voir PJ.", "Ça bug."],
+    ["Bonjour, l'export CSV échoue depuis hier. La capture d'écran est jointe.", "l'export CSV échoue depuis hier."],
+    ["Mon agenda ne se synchronise plus.\nCi-joint une capture.", "Mon agenda ne se synchronise plus."],
+  ])("a request stated in the cited sentence is handled: %j", async (text, quote) => {
+    expect(await run(text, quote)).toBe("ticket");
+  });
+  it.each([
+    "Tout est dans le fichier joint.",
+    "Voir le document.",
+    "Je vous envoie la capture d'écran.",
+    "Ci-joint le détail du problème.",
+    "Merci de regarder la PJ.",
+    "Bonjour, merci.",
+  ])("a need that only the unread file carries stays with the team: %j", async text => {
+    expect(await run(text, text)).toBe("collect_context");
+  });
+});

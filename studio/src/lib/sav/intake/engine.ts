@@ -36,15 +36,18 @@ export function savIntakePlanFingerprint(plan: Pick<IntakePlan, "decision" | "no
 }
 
 /** Read and plan only. There is deliberately no write, model client, DB or dispatch dependency. */
-/** A customer pointing to a file as the content ("Voir PJ", "cf. pièce jointe", "voir la
- * capture") makes that file indispensable, whatever the reader concluded. */
-export function intakeAttachmentDependency(text: string) {
-  return /(?<!\p{L})(?:voir|regardez|consultez|cf\.?|see)\s+(?:la\s+|les\s+|le\s+|l['’]\s*|the\s+|en\s+)?(?:p\.?\s?j(?!\p{L})|capture|image|screenshot|pi[eè]ces?|document|fichier|pdf)/iu.test(text);
-}
-const ATTACHMENT_POINTER = /(?<!\p{L})(?:p\.?\s?j\.?|pi[eè]ces?\s+jointes?|ci-joint[es]*|captures?|screenshots?|images?|documents?|fichiers?|pdf|voir|regardez|consultez|cf|see|la|le|les|en|the|merci|bonjour|cordialement)(?!\p{L})/giu;
-/** An "accessory" citation must carry the written request itself, not only a pointer to the file. */
-export function intakeQuoteSubstantive(quote: string) {
-  return (quote.replace(ATTACHMENT_POINTER, " ").match(/\p{L}{2,}/gu) ?? []).length >= 3;
+/** A sentence that sends the reader to a file ("Voir PJ", "détaillé dans le PDF joint",
+ * "cf. la capture") does not express the need itself. */
+const ATTACHMENT_REFERENCE = /(?<!\p{L})(?:p\.?\s?j(?!\p{L})|pi[eè]ces?\s+jointes?|ci-?joint\p{L}*|en\s+annexe|captures?\s+d['’]\s*[ée]cran|screenshots?|attachments?|attached|(?:pdf|fichiers?|documents?|captures?|images?|photos?|factures?|scans?)\s+joint\p{L}*|(?:voir|regardez|consultez|cf\.?|see)\s+(?:la\s+|les\s+|le\s+|l['’]\s*|the\s+|en\s+)?(?:pdf|fichiers?|documents?|captures?|images?|pi[eè]ces?))/iu;
+const COURTESY = new Set(["bonjour", "bonsoir", "salut", "hello", "merci", "thanks", "cordialement", "regards", "bonne", "journée", "soirée", "svp", "stp", "madame", "monsieur", "à", "vous", "s'il", "plaît", "plait", "et", "de", "le", "la", "les",
+  // A bare pointer verb ("Cf.", "Voir") is cut from its object by the sentence split.
+  "cf", "voir", "see", "regardez", "consultez", "ci"]);
+/** An "accessory" file needs a cited current sentence that states the request on its own:
+ * sentences pointing to a file are set aside, and courtesy alone states nothing. Length is
+ * not a criterion: "Ça bug." states a request, "Le problème est dans le PDF joint." does not. */
+export function intakeQuoteStatesRequest(quote: string) {
+  return quote.split(/(?<=[.!?…])\s+|\n+/u).filter(sentence => !ATTACHMENT_REFERENCE.test(sentence))
+    .some(sentence => (sentence.toLowerCase().match(/[\p{L}'’]+/gu) ?? []).some(word => !COURTESY.has(word.replace(/’/g, "'"))));
 }
 
 export async function planSavIntake(
@@ -224,10 +227,9 @@ export async function planSavIntake(
         || new Set(observations.map(o => o.sourceId)).size !== observations.length
         || observations.some(o => !message.attachmentInputs!.some(i => i.sourceId === o.sourceId && i.fileHash === o.fileHash))) return context("classification_incomplete");
       const requirements = analysis.imageRequirements ?? [];
-      const explicitDependency = intakeAttachmentDependency(message.currentText);
-      const accessory = (o: typeof observations[number]) => !explicitDependency && requirements.filter(r => r.sourceId === o.sourceId).length === 1
+      const accessory = (o: typeof observations[number]) => requirements.filter(r => r.sourceId === o.sourceId).length === 1
         && requirements.some(r => r.sourceId === o.sourceId && r.fileHash === o.fileHash && r.role === "accessory"
-          && r.textQuote && savEvidenceContains(message.currentText, r.textQuote) && intakeQuoteSubstantive(r.textQuote));
+          && r.textQuote && savEvidenceContains(message.currentText, r.textQuote) && intakeQuoteStatesRequest(r.textQuote));
       if (observations.some(o => o.status !== "analyzed" && !accessory(o))) return context("classification_incomplete");
       for (const observation of observations) addEvidence(observation.sourceId, "current_attachment", message.id, observation);
     } else if (analysis.attachmentObservations?.length) return context("classification_incomplete");
@@ -235,10 +237,9 @@ export async function planSavIntake(
       // Text analysable, files not read: proceed only when the reader cites the current text
       // showing each file is accessory. A required/unknown file keeps the dossier for the team.
       const requirements = analysis.unreadAttachmentRequirements ?? [];
-      const explicitDependency = intakeAttachmentDependency(message.currentText);
-      const accessory = (u: { sourceId: string }) => !explicitDependency && requirements.filter(r => r.sourceId === u.sourceId).length === 1
+      const accessory = (u: { sourceId: string }) => requirements.filter(r => r.sourceId === u.sourceId).length === 1
         && requirements.some(r => r.sourceId === u.sourceId && r.role === "accessory" && r.textQuote && savEvidenceContains(message.currentText, r.textQuote)
-          && intakeQuoteSubstantive(r.textQuote));
+          && intakeQuoteStatesRequest(r.textQuote));
       if (requirements.some(r => !message.unreadAttachments!.some(u => u.sourceId === r.sourceId))) return context("classification_incomplete");
       if (message.unreadAttachments.some(u => !accessory(u))) return context("history_incomplete");
       for (const unread of message.unreadAttachments) addEvidence(unread.sourceId, "current_attachment", message.id, { ...unread, read: false });

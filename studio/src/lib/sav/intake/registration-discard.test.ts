@@ -78,3 +78,53 @@ it("REVIEW an invalid optional registration anchor does not discard the otherwis
   expect(out.registration).toBeUndefined();
   expect(r.traces.at(-1)?.normalization?.discardedRegistrations).toBe(1);
 });
+
+it.each([false,true])("REVIEW201 an optional registration anchor does not reject the visual path (unknown=%s)",async invalid=>{
+ const {admitSavAttachmentImage}=await import("../attachment-image");
+ const sharp=(await import("sharp")).default;
+ const image=await admitSavAttachmentImage(await sharp({create:{width:1,height:1,channels:3,background:{r:0,g:0,b:0}}}).png().toBuffer(),"image/png");
+ const observation={sourceId:"image-1",filename:"synthetic.png",mimeType:"image/png",referenceHash:"synthetic",fileHash:image.hash,width:1,height:1,status:"not_read" as const,reason:"in_progress" as const,text:"",uncertainties:[],regions:[]};
+ const prepared={observations:[observation],selected:[{observation,image,imageIndex:0}],uniqueImages:[image]};
+ const traces:IntakeModelTrace[]=[];
+ const call=vi.fn<IntakeGeminiCall>(async arg=>{
+  const raw=analysis(arg,{registration:{address:"sender@example.test",sourceMessageId:mid,quoteId:invalid?"unknown-optional-anchor":anchor(arg)},images:[{index:0,readability:"readable",text:"Synthetic error",uncertainties:[],regions:[]}],imageRequirements:[{sourceId:observation.sourceId,fileHash:image.hash,role:"accessory",textQuoteId:anchor(arg)}]});
+  return result(arg.sanitizeResponse?arg.sanitizeResponse(raw):raw);
+ });
+ const r=createSavIntakeSemanticReaders({model:"gemini-fixture",call,onTrace:t=>traces.push(t),attachments:{prepared,onRead:()=>{}}});
+ const out=await r.analyseMessage({message,conversation:[]},signal());
+ expect(out.requests.map(q=>q.kind)).toEqual(["cancellation"]);expect(out.registration).toBeUndefined();expect(call).toHaveBeenCalledTimes(1);
+});
+
+describe("SAV-42 A (review 201): visual path keeps every other field strict", () => {
+  const visualReader = async (request: (arg: Parameters<IntakeGeminiCall>[0]) => Record<string, unknown>) => {
+    const { admitSavAttachmentImage } = await import("../attachment-image");
+    const sharp = (await import("sharp")).default;
+    const image = await admitSavAttachmentImage(await sharp({ create: { width: 1, height: 1, channels: 3, background: { r: 0, g: 0, b: 0 } } }).png().toBuffer(), "image/png");
+    const observation = { sourceId: "image-1", filename: "synthetic.png", mimeType: "image/png", referenceHash: "synthetic", fileHash: image.hash, width: 1, height: 1,
+      status: "not_read" as const, reason: "in_progress" as const, text: "", uncertainties: [], regions: [] };
+    const prepared = { observations: [observation], selected: [{ observation, image, imageIndex: 0 }], uniqueImages: [image] };
+    const traces: IntakeModelTrace[] = [];
+    const call = vi.fn<IntakeGeminiCall>(async arg => {
+      const raw = { ...request(arg), images: [{ index: 0, readability: "readable", text: "Synthetic error", uncertainties: [], regions: [] }],
+        imageRequirements: [{ sourceId: observation.sourceId, fileHash: image.hash, role: "accessory", textQuoteId: anchor(arg) }] };
+      return result(arg.sanitizeResponse ? arg.sanitizeResponse(raw) : raw);
+    });
+    return { traces, call, model: createSavIntakeSemanticReaders({ model: "gemini-fixture", call, onTrace: t => traces.push(t), attachments: { prepared, onRead: () => {} } }) };
+  };
+  it("counts a dropped unanchored registration exactly once, with a single image call", async () => {
+    const r = await visualReader(arg => analysis(arg, { registration: { address: "sender@example.test", sourceMessageId: mid, quoteId: "unknown-optional-anchor" } }));
+    const out = await r.model.analyseMessage({ message, conversation: [] }, signal());
+    expect(out.registration).toBeUndefined();
+    expect(r.call).toHaveBeenCalledTimes(1);
+    expect(r.traces.at(-1)).toMatchObject({ accepted: true, normalization: { discardedRegistrations: 1 } });
+  });
+  it("still rejects an unknown request anchor on the visual path, without a second image call", async () => {
+    const r = await visualReader(arg => analysis(arg, { requests: [{ id: "r0", kind: "cancellation", currentMessageId: mid, quoteId: "unknown-request-anchor" }] }));
+    await expect(r.model.analyseMessage({ message, conversation: [] }, signal())).rejects.toThrow();
+    expect(r.call).toHaveBeenCalledTimes(1);
+  });
+  it("still rejects an unanchored registration when the text names another address", async () => {
+    const r = await visualReader(arg => analysis(arg, { registration: { address: "autre@entreprise.test", sourceMessageId: mid, quoteId: "unknown-optional-anchor" } }));
+    await expect(r.model.analyseMessage({ message: { ...message, currentText: "Je souhaite annuler. Mon compte est client@entreprise.test" }, conversation: [] }, signal())).rejects.toThrow();
+  });
+});
