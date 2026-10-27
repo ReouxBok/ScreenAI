@@ -6,6 +6,7 @@ import { auditLogs, savIntakeExecutions, savIntakeRuns } from "@/db/schema";
 import { savIntakeRuntimeConfig } from "./runtime-contract";
 import { intakeExecutionConfig } from "./execution-policy";
 import { pendingSavIntakeRuns } from "./runtime-store";
+import { readSavAgentPause, savAgentPauseCode } from "./agent-pause";
 import { listSavExternalCompletionMessageIds } from "../external-completion";
 import { processSavIntakeWakeWorkflow } from "@/workflows/sav-intake";
 
@@ -59,6 +60,9 @@ export async function requestSavIntakeWake(runId: string, options: { env?: Env; 
       await tx.execute(sql`select pg_advisory_xact_lock(hashtext(${`sav-intake-wake:${runId}`}))`);
       const stage = await savIntakeWakeStage(runId, tx);
       if (!stage) return { dispatched: false as const, reason: "no_durable_work" };
+      // Before the marker: a paused agent never burns the dispatch cap. Actions pause keeps analysis wakes.
+      const pause = await readSavAgentPause(tx);
+      if (pause.level === "fully_paused" || pause.level === "actions_paused" && stage !== "analysis") return { dispatched: false as const, reason: savAgentPauseCode(pause)! };
       const [run] = await tx.select({ messageId: savIntakeRuns.messageId, threadId: savIntakeRuns.threadId }).from(savIntakeRuns).where(eq(savIntakeRuns.id, runId));
       const now = options.now ?? new Date();
       const [marker] = await tx.select().from(auditLogs).where(wakeRow(runId)).for("update");
@@ -113,6 +117,8 @@ export async function dispatchPendingSavIntakeWakes(options: { env?: Env; start?
   try { config = savIntakeRuntimeConfig(env); } catch { return { skipped: "configuration_invalid" as const }; }
   if (!config) return { skipped: "off" as const };
   const limit = Math.max(1, Math.min(8, options.limit ?? 4)), db = requireDb();
+  const pause = await readSavAgentPause(db);
+  if (pause.level === "fully_paused") return { skipped: savAgentPauseCode(pause)! };
   let execution: ReturnType<typeof intakeExecutionConfig> = null;
   try { execution = intakeExecutionConfig(env); } catch { execution = null; }
   const now = options.now ?? new Date();

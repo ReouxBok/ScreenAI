@@ -8,6 +8,8 @@ vi.mock("@/lib/sav/intake-ux/message-controls",()=>({readUxMessageControls:mocks
 vi.mock("@/lib/sav/intake/crm-display-server",()=>({readIntakeCrmDisplay:mocks.crmDisplay}));
 vi.mock("@/lib/sav/intake/console-auth",()=>({requireIntakeConsoleStaff:mocks.staff}));
 vi.mock("@/lib/sav/intake/console-store",()=>({listIntakeConsole:mocks.list}));
+// The async pause banner has its own test (agent-pause-ui.test.ts).
+vi.mock("./agent-pause-banner",()=>({AgentPauseBanner:()=>null}));
 vi.mock("@/lib/sav/intake/console-detail",()=>({readIntakeConsoleDetail:mocks.detail}));
 vi.mock("./actions",()=>({saveIntakeChoice:mocks.action,requestRecoveryAction:mocks.action,reconcileIdentificationAction:mocks.action,reconcileNoteAction:mocks.action,completeIntakeDossierAction:mocks.action}));
 vi.mock("next/link",()=>({default:(props:ComponentProps<"a">)=>createElement("a",props)}));

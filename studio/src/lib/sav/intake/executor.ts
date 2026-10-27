@@ -11,6 +11,7 @@ import { decryptSavPayload } from "../crypto";
 import { savSupportTicketProperties } from "../hubspot-mapping";
 import { assertSavOutboundRecipientAllowed } from "../policy";
 import { intakeExecutionConfig, readIntakeExecutionAuthority } from "./execution-policy";
+import { assertSavAgentActionsAllowed, readSavAgentPause, savAgentPauseCode } from "./agent-pause";
 import { savIntakeRuntimeConfig, intakeRuntimeHash, type IntakeRuntimeConfig } from "./runtime-contract";
 import { createIntakeExecutorAdapters, renderIntakeNote } from "./execution-adapters";
 import { assertOriginalExecutionCrm, assertExecutionCrmUnchanged, IntakeCrmDeltaError, publicIntakeCrmDelta } from "./execution-context";
@@ -172,6 +173,8 @@ async function live(lease: ExecutionLease, options: ExecutionOptions, permission
     const config = intakeExecutionConfig(options.env()), runtime = savIntakeRuntimeConfig(options.env());
     if (!config || !runtime || lease.row.policyId !== options.config.policyId || lease.row.policyHash !== options.config.policyHash || lease.payload.runtimeConfigHash !== options.runtime.configHash || options.signal.aborted || config.policyId !== options.config.policyId || config.policyHash !== options.config.policyHash || runtime.configHash !== options.runtime.configHash)
         return fault("DISABLED");
+    // Checked before every marker and every provider dispatch, like the authority below.
+    await assertSavAgentActionsAllowed(requireDb());
     const [boundRun] = await requireDb().select().from(savIntakeRuns).where(eq(savIntakeRuns.id, lease.payload.lastRunId));
     if (!boundRun || !await intakeExecutionConfigurationBound(lease.row, lease.payload, runtime)) return fault("VERSION_INCOMPATIBLE");
     const { policy } = await readIntakeExecutionAuthority(config);
@@ -234,6 +237,12 @@ export async function executeIntakePass(executionId: string, options: ExecutionO
     afterMarker?: (effect: Effect) => Promise<void>;
     afterAck?: (effect: Effect) => Promise<void>;
 } = {}) {
+    // Any agent pause: no lease, no state change; the execution resumes as it was left.
+    const paused = savAgentPauseCode(await readSavAgentPause(requireDb()));
+    if (paused)
+        return {
+            skipped: paused
+        };
     const lease = await claimExecution(executionId);
     if (!lease)
         return {
@@ -434,6 +443,12 @@ export async function reconcileIntakeExecutor(overrides: {
     if (!config)
         return {
             skipped: "off", recovered: recoveries.length
+        };
+    // Read-only recovery above continues during a pause; admission and dispatch do not.
+    const paused = savAgentPauseCode(await readSavAgentPause(requireDb()));
+    if (paused)
+        return {
+            skipped: paused, recovered: recoveries.length
         };
     const runtime = savIntakeRuntimeConfig(env);
     if (!runtime)

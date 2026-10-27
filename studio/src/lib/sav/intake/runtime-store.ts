@@ -7,6 +7,7 @@ import "server-only";
 import { reconcileIntakeZeroThoughtUsage } from "./model-usage";
 import { SAV_INTAKE_OPERATIONAL_PROFILE, intakeBudgetUsage } from "./budget-profile";
 import { effectiveIntakeBudgetPins } from "./budget-override";
+import { assertSavAgentAnalysisAllowed, readSavAgentPause, SAV_AGENT_ANALYSIS_PAUSE_CODES } from "./agent-pause";
 import { intakeLaunchMatches } from "./launch-boundary";
 import { intakeConsoleInstalled } from "./console-capability";
 import { intakeRunConfigurationBound, intakeHumanRefused, intakeHasHumanDecision, intakeRunCandidateContactIds } from "./human-binding";
@@ -209,6 +210,9 @@ export async function claimSavIntakeRun(id: string, config: IntakeRuntimeConfig,
     const [initial] = await tx.select().from(savIntakeRuns).where(eq(savIntakeRuns.id, id)); if (!initial) return null;
     const [thread] = await tx.select().from(savThreads).where(eq(savThreads.id, initial.threadId)).for("update");
     const [run] = await tx.select().from(savIntakeRuns).where(eq(savIntakeRuns.id, id)).for("update");
+    // Full agent pause: no claim and no write, so the run resumes exactly as it was left
+    // (state, reason, attempts). Callers apply their env checks first; this only restricts.
+    if ((await readSavAgentPause(tx)).level === "fully_paused") return null;
     if (!run.isCurrent || !await intakeRunConfigurationBound(run, config, tx) || ["observed", "uncertain", "superseded"].includes(run.state)
       || run.leaseUntil && run.leaseUntil > now) return null;
     const message = await latest(tx, run.threadId);
@@ -302,6 +306,8 @@ async function assertLease(tx: Tx, lease: IntakeLease, config: IntakeRuntimeConf
     || run.humanChoiceCiphertext !== lease.run.humanChoiceCiphertext || !await intakeRunConfigurationBound(run, config, tx) || Date.parse(config.expiresAt) <= now.getTime() || message?.id !== run.messageId) return fail();
   const [uncommitted] = await tx.select({ id: savMessages.id }).from(savMessages).where(and(eq(savMessages.id, message.id), noCommittedExecution));
   if (!uncommitted || await readSavExternalCompletion(message, tx) || !intakeSourceMatches(await savIntakeSourceSnapshot(tx, message, now), lease.sourceHash)) return fail();
+  // A full pause during an analysis stops it before any further reservation or publication.
+  await assertSavAgentAnalysisAllowed(tx);
   return run;
 }
 export async function assertSavIntakeLease(lease: IntakeLease, config: IntakeRuntimeConfig, now = new Date()) {
@@ -328,10 +334,13 @@ export async function failSavIntakeRun(lease: IntakeLease, payload: IntakeRuntim
     await tx.select().from(savThreads).where(eq(savThreads.id, lease.run.threadId)).for("update");
     // A deterministic local input error gives back the attempt taken by the claim and blocks the run explicitly.
     const deterministic = Boolean(options.deterministic && !uncertain);
+    // An analysis stopped by the agent pause gives its attempt back without any blocking marker.
+    const paused = !uncertain && !deterministic && SAV_AGENT_ANALYSIS_PAUSE_CODES.has(payload.reason ?? "");
     const rows = await tx.update(savIntakeRuns).set({ state: uncertain ? "uncertain" : "waiting", payloadCiphertext: encryptSavPayload(payload),
-      ...(deterministic ? { attempts: sql`greatest(${savIntakeRuns.attempts} - 1, 0)` } : {}),
+      ...(deterministic || paused && !lease.recoveringRead ? { attempts: sql`greatest(${savIntakeRuns.attempts} - 1, 0)` } : {}),
       freshUntil: null, leaseToken: null, leaseUntil: null, updatedAt: new Date() }).where(and(eq(savIntakeRuns.id, lease.run.id), eq(savIntakeRuns.leaseToken, lease.token), eq(savIntakeRuns.isCurrent, true))).returning();
     if (rows.length && deterministic) await journal(tx, lease.run.id, "deterministic_block", { reason: payload.reason, attemptRefunded: true });
+    else if (rows.length && paused) await journal(tx, lease.run.id, "agent_paused", { reason: payload.reason, attemptRefunded: !lease.recoveringRead });
     else if (rows.length && !uncertain && !payload.readRecovery) {
       // The last allowed attempt failed: mark it now so the console shows the cause instead of a silent wait.
       const budget = intakeAttemptBudget(lease.run.id, await attemptRows(tx, lease.run.messageId));
@@ -376,6 +385,7 @@ export async function assertSavIntakeCallPlan(messageId: string, config: IntakeR
   if (!hashes.length || hashes.length > 3 || new Set(hashes).size !== hashes.length || hashes.some(h => !/^[a-f0-9]{64}$/.test(h))) throw Error("SAV_INTAKE_RUNTIME_DISPATCH_REJECTED");
   await requireDb().transaction(async tx => {
     await tx.execute(sql`select pg_advisory_xact_lock(hashtext('sav-intake-runtime-model-budget-v1'))`);
+    await assertSavAgentAnalysisAllowed(tx);
     const rows = await tx.select(budgetColumns).from(savIntakeModelCalls), messageKey = intakeRuntimeHash(messageId);
     budgetRowsValid(rows);
     if (rows.some(row => row.state !== "settled" && (config.budgetProfile !== SAV_INTAKE_OPERATIONAL_PROFILE || row.messageKey === messageKey))) throw Error("SAV_INTAKE_RUNTIME_USAGE_UNCERTAIN");
@@ -393,6 +403,8 @@ export async function assertSavIntakeCallPlan(messageId: string, config: IntakeR
 }
 async function reserveIntakeCall(tx: Tx, run: Run, config: IntakeRuntimeConfig, requestHash: string, now: Date) {
     await tx.execute(sql`select pg_advisory_xact_lock(hashtext('sav-intake-runtime-model-budget-v1'))`);
+    // Under the budget lock, like the Studio pause write: no reservation once a full pause is committed.
+    await assertSavAgentAnalysisAllowed(tx);
     const rows = await tx.select(budgetColumns).from(savIntakeModelCalls), messageKey = intakeRuntimeHash(run.messageId);
     budgetRowsValid(rows);
     const resolved = await resolveIntakeDispatch(tx, rows, messageKey, requestHash);
