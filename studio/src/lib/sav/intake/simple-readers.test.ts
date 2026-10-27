@@ -289,3 +289,41 @@ describe("non-regression of the existing routes (lot 3)", () => {
     expect(plan.newTicket?.requestIds).toEqual(["r1", "r2"]);
   });
 });
+
+describe("SAV-42 A: optional registration declaration through the real engine", () => {
+  const text = "Je souhaite annuler mon essai gratuit. Mon compte est associé à l'adresse e-mail depuis laquelle je vous écris.";
+  const cancel = { requests: [{ id: "r1", kind: "cancellation", summary: "Annulation de l'essai.", sourceIds: ["current"] }], ticketTitle: "Annulation de l'essai gratuit" };
+  it("the sender's unique record is used when the sending address is not written literally", async () => {
+    const b = bench({ text });
+    const plan = await b.run(d => judgement(d, { ...cancel, registration: { address: "sender@example.test", quote: "Mon compte est associé à l'adresse e-mail depuis laquelle je vous écris." } }));
+    expect(plan.decision.classification).toBe("cancellation");
+    expect(disposition(plan).target.operation).toBe("create");
+    expect(plan.newTicket).toMatchObject({ contactId: "101", owner: "leave_unassigned" });
+    expect(b.crmCalls).toContain("lookup:sender@example.test");
+    expect(b.traces.at(-1)).toMatchObject({ accepted: true, normalization: { discardedRegistrations: 1 } });
+  });
+  it("an invented alternative address is never looked up nor adopted", async () => {
+    const b = bench({ text, contacts: [{ id: "101", emails: ["sender@example.test"] }, { id: "401", emails: ["invented@example.test"] }] });
+    const plan = await b.run(d => judgement(d, { ...cancel, registration: { address: "invented@example.test", quote: "Mon compte est associé à l'adresse e-mail" } }));
+    expect(b.crmCalls).not.toContain("lookup:invented@example.test");
+    expect(plan.newTicket?.contactId).toBe("101");
+  });
+  it("no record for the sender keeps the existing identification template path, without contact creation", async () => {
+    const b = bench({ text, contacts: [] });
+    const plan = await b.run(d => judgement(d, { ...cancel, registration: { address: "sender@example.test", quote: "depuis laquelle je vous écris" } }));
+    expect(plan.decision.disposition).toMatchObject({ kind: "request_identification", reason: "sender_contact_absent" });
+    expect(plan.steps.map(s => s.mutation)).not.toContain("create_contact");
+  });
+  it("an explicit other address in the current text keeps the strict check: no write on an unproven declaration", async () => {
+    const b = bench({ text: "Je souhaite annuler. Mon compte est client@entreprise.test merci." , contacts: [{ id: "101", emails: ["sender@example.test"] }, { id: "401", emails: ["client@entreprise.test"] }] });
+    const plan = await b.run(d => judgement(d, { ...cancel, registration: { address: "autre@entreprise.test", quote: "Mon compte est" } }));
+    expect(plan.steps).toEqual([]);
+    expect(b.traces.some(t => t.validationFailure?.reason === "registration_source_invalid")).toBe(true);
+  });
+  it("several records for the sender still ask a person to choose", async () => {
+    const b = bench({ text, contacts: [{ id: "101", emails: ["sender@example.test"] }, { id: "102", emails: ["sender@example.test"] }] });
+    const plan = await b.run(d => judgement(d, { ...cancel, identity: { kind: "equivalent", contactIds: ["101", "102"], why: "Deux fiches." },
+      registration: { address: "sender@example.test", quote: "depuis laquelle je vous écris" } }));
+    expect(plan.progress).toMatchObject({ kind: "human_choice", questionCode: "equivalent_contact_choice" });
+  });
+});

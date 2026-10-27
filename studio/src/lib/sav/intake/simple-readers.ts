@@ -3,6 +3,8 @@ import { z } from "zod";
 import { applySavAttachmentVisualResult, savVisualResultSchema, redactSavAttachmentText, type SavPreparedAttachments } from "../attachment-reader";
 import type { SavAttachmentObservation } from "../attachment-contract";
 import { savEvidenceContains } from "../evidence-text";
+import { intakeRegistrationDiscardable } from "./model-evidence";
+import { emptyIntakeOutputNormalization } from "./output-normalization";
 import { savGeminiWireBody } from "../gemini-transport";
 import type { SavGeminiMetadata } from "../gemini-response";
 import { savTicketTitle, validSavTicketTitle } from "../ticket-title";
@@ -168,8 +170,8 @@ export function createSavIntakeSimpleReaders(options: {
         metadata = result.metadata;
         if (signal.aborted) throw Error("SAV_INTAKE_MODEL_CANCELLED");
         const output = schema.parse(result.json) as SimpleOutput;
-        validate(output, message, context, sources, requestsDecided, continuationInitialId);
-        trace(true, null, { metadata, outputHash: hash(result.json) });
+        const discarded = validate(output, message, context, sources, requestsDecided, continuationInitialId);
+        trace(true, null, { metadata, outputHash: hash(result.json), ...(discarded ? { normalization: { ...emptyIntakeOutputNormalization(), discardedRegistrations: 1 } } : {}) });
         options.onJudgement?.({ rationale: output.rationale, missing: output.missing, identity: output.identity, tickets: output.tickets });
         return output;
       } catch (error) {
@@ -273,14 +275,21 @@ function validate(output: SimpleOutput, message: IntakeMessage, context: Context
       throw new SimpleValidationError("wrong_anchor_source", `requests.${index}.sourceIds`);
   }
   if (!requestsDecided && !output.requests.length && output.nature === "request") throw new SimpleValidationError("request_missing", "requests");
+  let discarded = false;
   if (output.registration && (!savEvidenceContains(message.currentText, output.registration.quote)
-    || !output.registration.quote.toLowerCase().includes(output.registration.address.toLowerCase()))) throw new SimpleValidationError("registration_source_invalid", "registration");
+    || !output.registration.quote.toLowerCase().includes(output.registration.address.toLowerCase()))) {
+    // Same rule as the current reader: drop an unproven optional declaration, never adopt it.
+    const inherited = Boolean(continuationInitialId) && output.requests.some(r => r.sourceIds.includes(`message-${continuationInitialId}`) && !r.sourceIds.includes("current"));
+    if (!intakeRegistrationDiscardable(message.currentText, message.fromEmail, inherited)) throw new SimpleValidationError("registration_source_invalid", "registration");
+    delete output.registration; discarded = true;
+  }
   const judged = output.tickets.map(t => t.ticketId);
   if (new Set(judged).size !== judged.length || context.tickets.some(t => !judged.includes(t.ticket.id))) throw new SimpleValidationError("ticket_not_judged", "tickets");
   for (const [index, ticket] of output.tickets.entries()) if (ticket.sourceIds.some(id => !sources.includes(id))) throw new SimpleValidationError("unknown_source", `tickets.${index}.sourceIds`);
   if (new Set(output.identity.contactIds).size !== output.identity.contactIds.length
     || output.identity.kind === "unique" && output.identity.contactIds.length !== 1
     || output.identity.kind === "equivalent" && output.identity.contactIds.length < 2) throw new SimpleValidationError("identity_inconsistent", "identity");
+  return discarded;
 }
 
 /** Derived image text is bounded and masked before it reaches the ledger, as in the current reader. */
