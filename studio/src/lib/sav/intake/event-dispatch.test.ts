@@ -3,7 +3,7 @@ import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } 
 import { eq } from "drizzle-orm";
 import { createSavTestDb } from "../../../../test/sav-db";
 import { executionProvider } from "../../../../test/sav-intake-execution-provider";
-import { auditLogs, savMailboxes, savThreads, savMessages, staffUsers, savIntakeExecutions, savIntakeExecutionBudget, savIntakeModelCalls, savIntakeRuns, savSyncState, savIntakeEffects, savIntakeJournal } from "@/db/schema";
+import { auditLogs, savMailboxes, savThreads, savMessages, staffUsers, savIntakeExecutions, savIntakeExecutionBudget, savIntakeModelCalls, savIntakeRuns, savSyncState, savIntakeEffects, savIntakeEffectJournal, savIntakeJournal } from "@/db/schema";
 const state = vi.hoisted(() => ({ db: null as unknown, user: null as unknown, start: vi.fn() }));
 // Scheduling is covered by hubspot-transport.test.ts; keep business scenarios
 // independent of real rate-limit waits without replacing readers or guards.
@@ -28,7 +28,7 @@ import { dispatchPendingSavIntakeWakes, readSavIntakeWake, requestSavIntakeWake,
 import { analyseSavIntakeWake, executeSavIntakeWake, processSavIntakeWake, type SavIntakeWakeDeps } from "./event-pipeline";
 import type { ExecutorAdapters } from "./execution-types";
 import { reconcileIntakeExecutor } from "./executor";
-import { readSavAgentPause } from "./agent-pause";
+import { readSavAgentPause, SAV_AGENT_PAUSE_CODES } from "./agent-pause";
 
 let f: Awaited<ReturnType<typeof createSavTestDb>>, p: ReturnType<typeof executionProvider>, environment: Record<string, string | undefined>;
 let runtime: IntakeRuntimeConfig, adapters: ExecutorAdapters, mailboxId: string, threadId: string, messageId: string, policyId: string;
@@ -406,6 +406,90 @@ describe("SAV-33 agent pause", () => {
   const journalKinds = async (id: string) => (await f.db.select({ kind: savIntakeJournal.kind }).from(savIntakeJournal).where(eq(savIntakeJournal.runId, id))).map(r => r.kind);
   const writes = () => p.calls.filter(c => c.method !== "GET" && !c.path.endsWith("/search") && !c.path.endsWith("/read")).length;
   afterEach(async () => { vi.useRealTimers(); await f.db.delete(savSyncState).where(eq(savSyncState.key, PAUSE_KEY)); });
+
+  it("REVIEW pause after dispatch marker remains resumable without a phantom uncertain action", async () => {
+    const id = (await enqueueSavIntakeMessage(messageId, runtime))!;
+    await analyseSavIntakeWake(id, deps());
+    const config = intakeExecutionConfig(environment)!, { policy } = await readIntakeExecutionAuthority(config);
+    const options = { runtime, policy, config, env: () => environment, adapters, signal: AbortSignal.timeout(30000) };
+    const execution = (await admitIntakeExecution(id, options))!;
+    const { executeIntakePass } = await import("./executor");
+    await executeIntakePass(execution.id, options, { afterMarker: async () => setPause("fully_paused") });
+    expect(ticketPosts()).toBe(0);
+    await setPause("running");
+    await f.db.update(savIntakeEffects).set({ nextReconcileAt: null }).where(eq(savIntakeEffects.executionId, execution.id));
+    await executeIntakePass(execution.id, options);
+    expect(ticketPosts()).toBe(1);
+  });
+
+  describe.each(["actions_paused", "fully_paused"] as const)("dispatch boundary under %s", level => {
+    async function admitted() {
+      const id = (await enqueueSavIntakeMessage(messageId, runtime))!;
+      await analyseSavIntakeWake(id, deps());
+      const config = intakeExecutionConfig(environment)!, { policy } = await readIntakeExecutionAuthority(config);
+      const options = { runtime, policy, config, env: () => environment, adapters, signal: AbortSignal.timeout(30000) };
+      const { executeIntakePass } = await import("./executor");
+      return { options, execution: (await admitIntakeExecution(id, options))!, executeIntakePass };
+    }
+    const effectKinds = async (executionId: string) => (await f.db.select({ kind: savIntakeEffectJournal.kind }).from(savIntakeEffectJournal)
+      .where(eq(savIntakeEffectJournal.executionId, executionId))).map(r => r.kind);
+    const states = async (executionId: string) => (await getExecutionEffects(executionId)).map(e => [e.kind, e.state, e.reconcileAttempts]);
+
+    it("before the marker: nothing marked, nothing sent, the pass waits and resumes once", async () => {
+      const { options, execution, executeIntakePass } = await admitted();
+      expect(await executeIntakePass(execution.id, options, { beforeMarker: async () => setPause(level) })).toMatchObject({ state: "waiting", reason: SAV_AGENT_PAUSE_CODES[level] });
+      expect(await states(execution.id)).toEqual([["ticket_create", "planned", 0]]);
+      expect(await effectKinds(execution.id)).not.toContain("dispatched");
+      expect(ticketPosts()).toBe(0);
+      await setPause("running");
+      expect(await executeIntakePass(execution.id, options)).toMatchObject({ state: "confirmed" });
+      expect(ticketPosts()).toBe(1);
+    });
+
+    it("after the marker, before the provider call: the marker is withdrawn, never uncertain, and a second pass sends exactly once", async () => {
+      const { options, execution, executeIntakePass } = await admitted();
+      expect(await executeIntakePass(execution.id, options, { afterMarker: async () => setPause(level) })).toMatchObject({ state: "waiting", reason: SAV_AGENT_PAUSE_CODES[level] });
+      expect(await states(execution.id)).toEqual([["ticket_create", "planned", 0]]);
+      expect(await effectKinds(execution.id)).toEqual(expect.arrayContaining(["dispatched", "dispatch_withdrawn"]));
+      expect(await effectKinds(execution.id)).not.toContain("uncertain");
+      expect((await f.db.select().from(savIntakeExecutions).where(eq(savIntakeExecutions.id, execution.id)))[0]).toMatchObject({ state: "waiting", leaseToken: null });
+      // Still paused: two more passes and the cron change nothing.
+      expect(await executeIntakePass(execution.id, options)).toMatchObject({ skipped: SAV_AGENT_PAUSE_CODES[level] });
+      expect(await reconcileIntakeExecutor({ env: () => environment, adapters })).toMatchObject({ skipped: SAV_AGENT_PAUSE_CODES[level], recovered: 0 });
+      expect(ticketPosts()).toBe(0);
+      await setPause("running");
+      expect(await executeIntakePass(execution.id, options)).toMatchObject({ state: "confirmed" });
+      expect(await executeIntakePass(execution.id, options)).toMatchObject({ skipped: "occupied" });
+      expect(ticketPosts()).toBe(1);
+    });
+
+    it("after the send with its acknowledgement: the admitted action finishes and is verified, never sent again", async () => {
+      const { options, execution, executeIntakePass } = await admitted();
+      expect(await executeIntakePass(execution.id, options, { afterAck: async () => setPause(level) })).toMatchObject({ state: "waiting", reason: SAV_AGENT_PAUSE_CODES[level] });
+      expect(await states(execution.id)).toEqual([["ticket_create", "confirmed", 0]]);
+      expect(await effectKinds(execution.id)).not.toContain("dispatch_withdrawn");
+      await setPause("running");
+      expect(await executeIntakePass(execution.id, options)).toMatchObject({ state: "confirmed" });
+      expect(ticketPosts()).toBe(1);
+    });
+
+    it("after the send with a lost acknowledgement: the action stays verify-only, is never withdrawn nor sent again", async () => {
+      const { options, execution, executeIntakePass } = await admitted();
+      const lost: ExecutorAdapters = { ...adapters, dispatch: async (intent, signal) => {
+        await adapters.dispatch(intent, signal); await setPause(level); throw Error("SAV_SYNTHETIC_RESPONSE_LOST");
+      } };
+      expect(await executeIntakePass(execution.id, { ...options, adapters: lost })).toMatchObject({ state: "uncertain", reason: "SAV_SYNTHETIC_RESPONSE_LOST" });
+      expect(await states(execution.id)).toEqual([["ticket_create", "uncertain", 1]]);
+      expect(await effectKinds(execution.id)).not.toContain("dispatch_withdrawn");
+      await f.db.update(savIntakeEffects).set({ nextReconcileAt: null }).where(eq(savIntakeEffects.executionId, execution.id));
+      // Read-only recovery runs during the pause and confirms the ticket that was really created.
+      expect(await reconcileIntakeExecutor({ env: () => environment, adapters })).toMatchObject({ skipped: SAV_AGENT_PAUSE_CODES[level], recovered: 1 });
+      expect((await states(execution.id))[0].slice(0, 2)).toEqual(["ticket_create", "confirmed"]);
+      await setPause("running");
+      expect(await executeIntakePass(execution.id, options)).toMatchObject({ state: "confirmed" });
+      expect(ticketPosts()).toBe(1);
+    });
+  });
 
   it("fully_paused: no claim, no model reservation, no wake; incoming mail is stored and waits", async () => {
     const id = (await enqueueSavIntakeMessage(messageId, runtime))!;

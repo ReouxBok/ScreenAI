@@ -31,8 +31,10 @@ it("pause page shows the current state, the three levels with a mandatory reason
   mocks.panel.mockResolvedValue({ state: { level: "fully_paused", setting, invalid: false },
     history: [{ at: "2026-10-27T08:00:00.000Z", actor: "reouven@limova.ai", previousLevel: "running", nextLevel: "fully_paused", reason: "Incident CRM" }] });
   const html = renderToStaticMarkup(await PausePage());
-  for (const text of ["Pause de l’agent", "pause complète (ni analyse", "27/10/2026 09:00 par reouven@limova.ai", "Incident CRM", "Agent actif", "Suspendre les actions", "Pause complète (actuel)",
+  for (const text of ["Pause de l’agent", "pause complète (ni analyse", "27/10/2026 09:00 par reouven@limova.ai", "Incident CRM", "Agent actif", "Suspendre les actions", "Pause complète (actuel)", "appels IA sont facturés normalement", "aucune nouvelle analyse ni aucun appel IA",
+    "campagne de comparaison",
     "required", "agent actif → pause complète"]) expect(html).toContain(text);
+  expect(html).not.toContain("aucun budget n’est consommé");
   expect(mocks.set).not.toHaveBeenCalled();
 });
 it("pause page warns about an unreadable setting; a non-administrator is refused", async () => {

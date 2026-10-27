@@ -11,7 +11,12 @@ export default async function IntakePausePage() {
   return <div className={styles.console}>
     <Link className={styles.back} href="/studio/sav/intake">← Nouveaux dossiers</Link>
     <header className={styles.heading}><div><span className="eyebrow">Administration SAV</span><h1>Pause de l’agent</h1>
-      <p>Une pause n’efface rien : aucune tentative ni aucun budget n’est consommé, et les dossiers en attente reprennent automatiquement à la relance. Les actions déjà parties restent vérifiées en lecture seule.</p></div></header>
+      <p>Pause de l’agent d’accueil (intake) uniquement : la campagne de comparaison et l’ancien circuit V0 n’en dépendent pas. Une pause n’efface rien et les dossiers en attente reprennent à la relance.</p>
+      <ul>
+        <li>Suspendre les actions : l’analyse continue et ses appels IA sont facturés normalement ; aucune nouvelle action HubSpot ou Gmail ne part.</li>
+        <li>Pause complète : aucune nouvelle analyse ni aucun appel IA n’est lancé ; une analyse interrompue ne consomme ni tentative automatique ni essai de reprise humaine.</li>
+        <li>Dans les deux cas, un appel IA déjà lancé garde son coût, une action déjà envoyée va au bout et reste vérifiée en lecture seule.</li>
+      </ul></div></header>
     {state.invalid && <p role="alert">Le réglage enregistré est illisible : l’agent est en pause complète par sécurité (<code>SAV_INTAKE_AGENT_PAUSE_INVALID</code>) jusqu’à un nouvel enregistrement.</p>}
     <section className={styles.choice}>
       <h2>État actuel</h2>

@@ -29,7 +29,7 @@ import { createIntakeExecutorAdapters } from "./execution-adapters";
 import { admitIntakeExecution, assertNoLegacyConflict, claimExecution, ensureExecutionEffect, markEffectDispatched, getExecutionEffects, recordEffectAck } from "./execution-store";
 import { executeIntakePass, reconcileIntakeExecutor, readIntakeExecutionProgress, reconcileIntakeEffectsReadOnly } from "./executor";
 import { recordIntakeHumanCommand, type IntakeHumanCommand } from "./human-commands";
-import { consumeIntakeHumanEvent } from "./human-worker";
+import { consumeIntakeHumanEvent, reconcileIntakeHumanChoices } from "./human-worker";
 import { intakeRunConfigurationBound, intakeRunCandidateContactIds, humanRevisionConfigHash, type HumanEventPayload } from "./human-binding";
 import { releaseIntakeHumanHold } from "./human-hold-release";
 import { releaseLegacyAiPauses } from "./legacy-pause";
@@ -1302,4 +1302,75 @@ it("oldest and newest pagination retain chronological order and the exact filter
  const oldest=await listIntakeConsole({view:"processing",search:"UXSort",sort:"oldest",page:2});
  expect(oldest).toMatchObject({total:27,page:2,pages:2});expect(oldest.rows.map(r=>r.subject)).toEqual(["UXSort 25","UXSort 26"]);
  const newest=await listIntakeConsole({view:"processing",search:"UXSort",sort:"newest",page:2});expect(newest.rows.map(r=>r.subject)).toEqual(["UXSort 1","UXSort 0"]);
+});
+
+afterEach(async()=>{await db.db.delete(savSyncState).where(eq(savSyncState.key,"sav-agent-pause.v1:intake"));});
+async function reviewSetFullPause() {
+ const value={key:"sav-agent-pause.v1:intake",status:"active",cursor:encryptSavPayload({revision:"sav-agent-pause.v1",agent:"intake",level:"fully_paused",setBy:"ugo@limova.ai",setAt:new Date().toISOString(),reason:"Synthetic independent review"})};
+ await db.db.insert(savSyncState).values(value).onConflictDoUpdate({target:savSyncState.key,set:value});
+}
+it("REVIEW full pause preserves human reanalysis attempts",async()=>{
+ await observed();for(const [key,value]of Object.entries(environment))if(value!==undefined)vi.stubEnv(key,value);
+ await db.db.update(savIntakeRuns).set({attempts:2,state:"waiting"}).where(eq(savIntakeRuns.id,runId));
+ stubRecoveryModel();
+ const requested=await requestIntakeReinvestigation({threadId,messageId,reason:"Synthetic bounded independent review."});
+ await reviewSetFullPause();
+ await consumeIntakeHumanEvent(requested.eventId,options.runtime,createSavIntakeHubspotReaders({network:p.network}));
+ const [event]=await db.db.select().from(savIntakeHumanEvents).where(eq(savIntakeHumanEvents.id,requested.eventId));
+ expect(event.readAttempts).toBe(0);
+});
+it("REVIEW full pause blocks cached human continuation",async()=>{
+ await observed(true);
+ const saved=await recordIntakeHumanCommand(await command());
+ await reviewSetFullPause();
+ const result=await consumeIntakeHumanEvent(saved.eventId,options.runtime,createSavIntakeHubspotReaders({network:p.network}));
+ expect(result).not.toHaveProperty("state","observed");
+});
+async function setAgentPause(level:"running"|"actions_paused"|"fully_paused") {
+ const value={key:"sav-agent-pause.v1:intake",status:"active",cursor:encryptSavPayload({revision:"sav-agent-pause.v1",agent:"intake",level,setBy:"ugo@limova.ai",setAt:new Date().toISOString(),reason:"Synthetic pause"})};
+ await db.db.insert(savSyncState).values(value).onConflictDoUpdate({target:savSyncState.key,set:value});
+}
+const humanEvent=async(id:string)=>(await db.db.select().from(savIntakeHumanEvents).where(eq(savIntakeHumanEvents.id,id)))[0];
+it("full pause: two reconciler passes claim nothing, then the cached human choice is published once after the resume",async()=>{
+ await observed(true);for(const [key,value]of Object.entries(environment))if(value!==undefined)vi.stubEnv(key,value);
+ const saved=await recordIntakeHumanCommand(await command()),runs=(await db.db.select().from(savIntakeRuns)).length;
+ await setAgentPause("fully_paused");
+ for(let i=0;i<2;i++)expect(await reconcileIntakeHumanChoices()).toEqual({skipped:"SAV_INTAKE_AGENT_FULLY_PAUSED"});
+ expect(await consumeIntakeHumanEvent(saved.eventId,options.runtime,createSavIntakeHubspotReaders({network:p.network}))).toEqual({skipped:"SAV_INTAKE_AGENT_FULLY_PAUSED"});
+ expect(await humanEvent(saved.eventId)).toMatchObject({state:"pending",readAttempts:0,leaseToken:null});
+ expect((await db.db.select().from(savIntakeRuns)).length).toBe(runs);
+ await setAgentPause("running");
+ expect(await consumeIntakeHumanEvent(saved.eventId,options.runtime,createSavIntakeHubspotReaders({network:p.network}))).toHaveProperty("state","observed");
+ expect(await humanEvent(saved.eventId)).toMatchObject({state:"consumed",readAttempts:1});
+ expect(mutationsSent()).toHaveLength(0);
+});
+it("a full pause landing during the CRM read publishes nothing and gives the human read back",async()=>{
+ await observed(true);const saved=await recordIntakeHumanCommand(await command()),runs=(await db.db.select().from(savIntakeRuns)).length;
+ let paused=false;
+ const pausing:typeof p.network=async(url,init)=>{if(!paused){paused=true;await setAgentPause("fully_paused");}return p.network(url,init);};
+ expect(await consumeIntakeHumanEvent(saved.eventId,options.runtime,createSavIntakeHubspotReaders({network:pausing}))).toEqual({waiting:"SAV_INTAKE_AGENT_FULLY_PAUSED"});
+ expect(paused).toBe(true);
+ expect(await humanEvent(saved.eventId)).toMatchObject({state:"pending",readAttempts:0,leaseToken:null});
+ expect((await db.db.select().from(savIntakeRuns)).length).toBe(runs);
+ await setAgentPause("running");
+ expect(await consumeIntakeHumanEvent(saved.eventId,options.runtime,createSavIntakeHubspotReaders({network:p.network}))).toHaveProperty("state","observed");
+});
+it("a reinvestigation requested before a full pause keeps both reads and runs its analysis after the resume",async()=>{
+ await observed();for(const [key,value]of Object.entries(environment))if(value!==undefined)vi.stubEnv(key,value);
+ await db.db.update(savIntakeRuns).set({attempts:2,state:"waiting"}).where(eq(savIntakeRuns.id,runId));
+ stubRecoveryModel();
+ const requested=await requestIntakeReinvestigation({threadId,messageId,reason:"Synthetic bounded reinvestigation across a pause."});
+ await setAgentPause("fully_paused");
+ for(let i=0;i<2;i++)expect(await consumeIntakeHumanEvent(requested.eventId,options.runtime,createSavIntakeHubspotReaders({network:p.network}))).toEqual({skipped:"SAV_INTAKE_AGENT_FULLY_PAUSED"});
+ expect(await db.db.select().from(savIntakeModelCalls)).toHaveLength(0);
+ await setAgentPause("running");
+ expect(await consumeIntakeHumanEvent(requested.eventId,options.runtime,createSavIntakeHubspotReaders({network:p.network}))).toHaveProperty("state","observed");
+ expect(await humanEvent(requested.eventId)).toMatchObject({state:"consumed",readAttempts:1});
+ expect((await db.db.select().from(savIntakeModelCalls)).length).toBeGreaterThan(0);
+});
+it("actions_paused keeps human analysis: the choice is published, nothing is sent",async()=>{
+ await observed(true);const saved=await recordIntakeHumanCommand(await command());
+ await setAgentPause("actions_paused");
+ expect(await consumeIntakeHumanEvent(saved.eventId,options.runtime,createSavIntakeHubspotReaders({network:p.network}))).toHaveProperty("state","observed");
+ expect(mutationsSent()).toHaveLength(0);
 });

@@ -5,7 +5,7 @@ import styles from "../intake.module.css";
 const initial: PauseAdminState = { ok: false, message: "" };
 const LEVELS = [
   ["running", "Agent actif", "Analyse et actions selon la configuration."],
-  ["actions_paused", "Suspendre les actions", "L’analyse continue ; aucune action HubSpot ou Gmail ne part."],
+  ["actions_paused", "Suspendre les actions", "L’analyse continue, appels IA facturés ; aucune nouvelle action HubSpot ou Gmail ne part."],
   ["fully_paused", "Pause complète", "Ni analyse, ni appel IA, ni action. Les emails reçus attendent la reprise."],
 ] as const;
 export function PauseForm({ current }: { current: string }) {
