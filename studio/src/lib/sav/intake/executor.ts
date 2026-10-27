@@ -11,13 +11,15 @@ import { decryptSavPayload } from "../crypto";
 import { savSupportTicketProperties } from "../hubspot-mapping";
 import { assertSavOutboundRecipientAllowed } from "../policy";
 import { intakeExecutionConfig, readIntakeExecutionAuthority } from "./execution-policy";
+import { assertSavAgentActionsAllowed, readSavAgentPause, savAgentPauseCode, SAV_AGENT_PAUSE_CODES } from "./agent-pause";
 import { savIntakeRuntimeConfig, intakeRuntimeHash, type IntakeRuntimeConfig } from "./runtime-contract";
 import { createIntakeExecutorAdapters, renderIntakeNote } from "./execution-adapters";
 import { assertOriginalExecutionCrm, assertExecutionCrmUnchanged, IntakeCrmDeltaError, publicIntakeCrmDelta } from "./execution-context";
 import { exactRfcMessageId, isQualifiedCrmEmail, type QualifiedCrmEmail } from "./crm-continuation";
-import { admitIntakeExecution, claimExecution, claimEffectRecovery, withEffectRecoveryLease, releaseEffectRecovery, activeExecutionEffects, adoptCurrentExecutionVersion, assertExecutionLocal, saveExecutionPayload, expandExecutionScope, getExecutionEffects, ensureExecutionEffect, markEffectDispatched, recordEffectAck, confirmExecutionEffect, deferExecutionEffect, endExecutionPass, identityEpisodeEffect, finishExecution, executionJournal, releaseRecoveredExecutionScope, occupationSchemaInstalled, type ExecutionLease, type ExecutionTx } from "./execution-store";
+import { admitIntakeExecution, claimExecution, claimEffectRecovery, withEffectRecoveryLease, releaseEffectRecovery, activeExecutionEffects, adoptCurrentExecutionVersion, assertExecutionLocal, saveExecutionPayload, expandExecutionScope, getExecutionEffects, ensureExecutionEffect, markEffectDispatched, withdrawUndispatchedEffect, recordEffectAck, confirmExecutionEffect, deferExecutionEffect, endExecutionPass, identityEpisodeEffect, finishExecution, executionJournal, releaseRecoveredExecutionScope, occupationSchemaInstalled, type ExecutionLease, type ExecutionTx } from "./execution-store";
 import type { Effect, EffectIntent, EffectAck, ExecutorAdapters, ExecutionOptions, ExecutionPayload, EffectKind } from "./execution-types";
 const fault = (code: string): never => { throw Error(`SAV_INTAKE_EXECUTION_${code}`); };
+const pauseCodes: ReadonlySet<string> = new Set(Object.values(SAV_AGENT_PAUSE_CODES));
 const code = (e: unknown) => e instanceof Error && /^SAV_[A-Z0-9_]+$/.test(e.message) ? e.message : "SAV_INTAKE_EXECUTION_INTERRUPTED";
 const ack = (e: Effect) => e.ackCiphertext ? decryptSavPayload<EffectAck>(e.ackCiphertext) : null;
 const effectIntent = (e: Effect) => decryptSavPayload<EffectIntent>(e.intentCiphertext);
@@ -172,6 +174,8 @@ async function live(lease: ExecutionLease, options: ExecutionOptions, permission
     const config = intakeExecutionConfig(options.env()), runtime = savIntakeRuntimeConfig(options.env());
     if (!config || !runtime || lease.row.policyId !== options.config.policyId || lease.row.policyHash !== options.config.policyHash || lease.payload.runtimeConfigHash !== options.runtime.configHash || options.signal.aborted || config.policyId !== options.config.policyId || config.policyHash !== options.config.policyHash || runtime.configHash !== options.runtime.configHash)
         return fault("DISABLED");
+    // Checked before every marker and every provider dispatch, like the authority below.
+    await assertSavAgentActionsAllowed(requireDb());
     const [boundRun] = await requireDb().select().from(savIntakeRuns).where(eq(savIntakeRuns.id, lease.payload.lastRunId));
     if (!boundRun || !await intakeExecutionConfigurationBound(lease.row, lease.payload, runtime)) return fault("VERSION_INCOMPATIBLE");
     const { policy } = await readIntakeExecutionAuthority(config);
@@ -234,6 +238,12 @@ export async function executeIntakePass(executionId: string, options: ExecutionO
     afterMarker?: (effect: Effect) => Promise<void>;
     afterAck?: (effect: Effect) => Promise<void>;
 } = {}) {
+    // Any agent pause: no lease, no state change; the execution resumes as it was left.
+    const paused = savAgentPauseCode(await readSavAgentPause(requireDb()));
+    if (paused)
+        return {
+            skipped: paused
+        };
     const lease = await claimExecution(executionId);
     if (!lease)
         return {
@@ -261,7 +271,13 @@ export async function executeIntakePass(executionId: string, options: ExecutionO
                 const assertContinuationFresh = await preflight(lease, options, intent);
                 current = await markEffectDispatched(lease, current);
                 await hooks.afterMarker?.(current);
-                await live(lease, options, intent.permission);
+                // Last pause check before the provider call. A pause seen here proves nothing
+                // left: the action returns to planned. Past this line an admitted action finishes.
+                try { await live(lease, options, intent.permission); }
+                catch (error) {
+                    if (pauseCodes.has(code(error)) && await withdrawUndispatchedEffect(lease, current, code(error))) current = undefined;
+                    throw error;
+                }
                 assertContinuationFresh();
                 const result = await options.adapters.dispatch(effectIntent(current), options.signal);
                 await recordEffectAck(current, result);
@@ -434,6 +450,12 @@ export async function reconcileIntakeExecutor(overrides: {
     if (!config)
         return {
             skipped: "off", recovered: recoveries.length
+        };
+    // Read-only recovery above continues during a pause; admission and dispatch do not.
+    const paused = savAgentPauseCode(await readSavAgentPause(requireDb()));
+    if (paused)
+        return {
+            skipped: paused, recovered: recoveries.length
         };
     const runtime = savIntakeRuntimeConfig(env);
     if (!runtime)

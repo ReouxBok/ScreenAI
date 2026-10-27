@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { planSavIntake } from "./engine";
 import { projectSavIntakeProgress } from "./progress";
 import type { EngineInput, EnginePolicy, IntakeAdapters, IntakeContact, IntakePlan, IntakeTicket, MessageAnalysis, ReadResult } from "./engine-types";
@@ -429,6 +429,36 @@ it.each(["accessory","required","multiple","explicit_dependency"])("keeps unread
  f.analysis.imageRequirements=f.input.message.attachmentInputs.map((i,n)=>({...i,role:mode==="required"||mode==="multiple"&&n===1?"required":"accessory",textQuote:f.input.message.currentText}));
  const p=await f.run();if(mode==="accessory")expect(p.decision.disposition.kind).toBe("ticket");else reason(p,"classification_incomplete");
  expect(f.analysis.attachmentObservations.every(o=>o.status==="unreadable")).toBe(true);expect(p.decision.evidence.filter(e=>e.source==="current_attachment")).toHaveLength(mode==="accessory"?f.input.message.attachmentInputs.length:0);
+});
+
+
+it("keeps CRM deadlines separate from the comparison semantic allowance", async () => {
+  const f = fixture(["acknowledgement"]);
+  f.adapters.analyseMessage = async () => { await new Promise(resolve => setTimeout(resolve, 12_000)); return f.analysis; };
+  vi.useFakeTimers();
+  try {
+    const work = planSavIntake(f.input, f.adapters, f.policy, { timeoutMs: 10_000, modelTimeoutMs: 60_000 });
+    await vi.advanceTimersByTimeAsync(12_000);
+    expect((await work).decision.disposition).toMatchObject({ kind: "no_ticket", reason: "acknowledgement_only" });
+    // Existing callers retain the previous deadline; only the comparison opts in.
+    const unchanged = planSavIntake(f.input, f.adapters, f.policy, { timeoutMs: 10_000 });
+    await vi.advanceTimersByTimeAsync(10_000); reason(await unchanged, "classification_incomplete");
+  } finally { vi.useRealTimers(); }
+});
+it("does not extend CRM reads when a comparison allows longer model work", async () => {
+  const f = fixture(); let lookupSignal: AbortSignal | undefined;
+  f.adapters.findContactsByEmail = async (_email, signal) => { lookupSignal = signal; await new Promise(resolve => setTimeout(resolve, 12_000)); return read([]); };
+  vi.useFakeTimers();
+  try {
+    const work = planSavIntake(f.input, f.adapters, f.policy, { timeoutMs: 10_000, modelTimeoutMs: 60_000 });
+    await vi.advanceTimersByTimeAsync(10_000); reason(await work, "contact_lookup_failed");
+    expect(lookupSignal?.aborted).toBe(true);
+  } finally { vi.useRealTimers(); }
+});
+it.each([0, -1, 60_001, NaN, Infinity])("rejects an invalid semantic deadline %s", async modelTimeoutMs => {
+  const f = fixture();
+  await expect(planSavIntake(f.input, f.adapters, f.policy, { modelTimeoutMs })).rejects.toThrow("SAV_INTAKE_LIMITS_INVALID");
+  expect(f.calls).toEqual([]);
 });
 
 describe("SAV-42 B: complete text with unread attachments", () => {

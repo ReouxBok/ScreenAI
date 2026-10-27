@@ -3,7 +3,7 @@ import { z } from "zod";
 import { reconcileIntakeZeroThoughtUsage } from "./model-usage";
 import type { IntakeGeminiCall } from "./model-readers";
 import { readSavGeminiResponse, type SavGeminiMetadata } from "../gemini-response";
-import { requestSavGeminiJson, savAiErrorMetadata, savGeminiWireBody } from "../gemini-transport";
+import { requestSavGeminiJson, savAiCancellationCode, savAiErrorMetadata, savGeminiWireBody } from "../gemini-transport";
 import { evaluationProviderResponse } from "./server-runner";
 import { intakeRuntimeHash, type IntakeRuntimeConfig } from "./runtime-contract";
 import { settleSavIntakeCall, type reserveSavIntakeCall } from "./runtime-store";
@@ -23,7 +23,11 @@ export function createIntakeModelDispatcher(options: { config: IntakeRuntimeConf
   let uncertain=false, failureReason:string|undefined;
   const pending:Promise<unknown>[]=[];
   const execute: IntakeGeminiCall = async input => {
+      const signal = AbortSignal.any([options.signal, input.signal]);
+      const active = () => { const code = savAiCancellationCode(signal); if (code) throw Error(code); };
+      active();
       await live();
+      active();
       if (input.model !== config.model || input.allowRetry !== false || input.signal.aborted || uncertain) throw Error("SAV_INTAKE_RUNTIME_DISPATCH_REJECTED");
       const key = env().SAV_GEMINI_API_KEY!;
       const wire = savGeminiWireBody(input);
@@ -33,7 +37,7 @@ export function createIntakeModelDispatcher(options: { config: IntakeRuntimeConf
       // The store resolves the exact ledger row (cache, retry of an unbilled rejection, or new),
       // with the same rule as the preflight of a grouped plan.
       const reserved = await options.reserve(intakeRuntimeHash(expectedBody));
-      if (reserved.cached) { failureReason = undefined; return reserved.cached; }
+      if (reserved.cached) { active(); failureReason = undefined; return reserved.cached; }
       const reservation = reserved.id;
       let providerUsage: SavGeminiMetadata | undefined, providerStatus: number | undefined;
       // Gemini may omit a zero thoughts counter. Recognize only that zero when
@@ -46,8 +50,10 @@ export function createIntakeModelDispatcher(options: { config: IntakeRuntimeConf
         await live();
         if (sent || input.signal.aborted || String(url) !== `https://generativelanguage.googleapis.com/v1beta/models/${config.model}:generateContent`
           || init?.method !== "POST" || init.body !== expectedBody || new Headers(init.headers).get("x-goog-api-key") !== key) throw Error("SAV_INTAKE_RUNTIME_NETWORK_REJECTED");
-        sent = true;
+        active();
         await live();
+        active();
+        sent = true;
         const signal = AbortSignal.any([options.signal, input.signal, ...(init.signal ? [init.signal] : [])]);
         if (signal.aborted) throw Error("SAV_INTAKE_RUNTIME_CONTEXT_CHANGED");
         const response = await evaluationProviderResponse(await network(url, { ...init, signal, redirect: "error" }), signal);
@@ -59,7 +65,8 @@ export function createIntakeModelDispatcher(options: { config: IntakeRuntimeConf
         return response;
       };
       try {
-        const generated = await requestSavGeminiJson({ ...input, apiKey: key, fetch: guardedNetwork, allowRetry: false });
+        active();
+        const generated = await requestSavGeminiJson({ ...input, signal, apiKey: key, fetch: guardedNetwork, allowRetry: false });
         const metadata = exactUsage(generated.metadata);
         if (input.media && !input.sanitizeResponse) throw Error("SAV_INTAKE_VISUAL_VALIDATOR_REQUIRED");
         const json = input.media ? input.sanitizeResponse!(generated.json) : generated.json;
@@ -88,6 +95,7 @@ export function createIntakeModelDispatcher(options: { config: IntakeRuntimeConf
 
   const plan = async (inputs: Parameters<IntakeGeminiCall>[0][]) => {
     try {
+      const code = savAiCancellationCode(options.signal); if (code) throw Error(code);
       await live();
       if (!options.preflight || options.signal.aborted || uncertain || !inputs.length || inputs.length > 3) throw Error("SAV_INTAKE_RUNTIME_BATCH_PLANNING_REQUIRED");
       const hashes = inputs.map(input => {

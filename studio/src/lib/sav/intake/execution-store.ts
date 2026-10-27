@@ -6,7 +6,7 @@ import { intakeRunConfigurationBound, intakeHumanRefused } from "./human-binding
 import { createHash, randomUUID } from "node:crypto";
 import {canAccessSav} from "../access";
 import {executionPolicySchema} from "./execution-policy";
-import { and, desc, eq, inArray, lte, or, sql } from "drizzle-orm";
+import { and, desc, eq, inArray, isNull, lte, or, sql } from "drizzle-orm";
 import { requireDb } from "@/db";
 import { staffUsers,savMailboxes,savIntakeHumanEvents,savIntakeExecutionPolicies,savActions, savThreads, savMessages, savIntakeRuns, savSyncState, savIntakeExecutions, savIntakeEffects, savIntakeEffectJournal, savIntakeOccupations, savIntakeExecutionBudget, savIntakeIdentityEpisodes, savIntakeEffectRevisions } from "@/db/schema";
 import { encryptSavPayload, decryptSavPayload } from "../crypto";
@@ -379,6 +379,20 @@ export async function markEffectDispatched(lease: ExecutionLease, effect: Effect
             attemptId: row.attemptId, token: lease.token
         }, row.id);
         return row;
+    });
+}
+/** Only for a pause seen after the marker and before any provider call by this lease:
+ * nothing left, so the action returns to planned. Any other state stays verify-only. */
+export async function withdrawUndispatchedEffect(lease: ExecutionLease, effect: Effect, reason: string) {
+    return requireDb().transaction(async (tx) => {
+        await admissionLock(tx);
+        const [execution] = await tx.select().from(savIntakeExecutions).where(eq(savIntakeExecutions.id, lease.row.id)).for("update");
+        if (execution?.leaseToken !== lease.token || !execution.leaseUntil || execution.leaseUntil <= new Date()) return false;
+        const [row] = await tx.update(savIntakeEffects).set({ state: "planned", dispatchToken: null, dispatchedAt: null })
+            .where(and(eq(savIntakeEffects.id, effect.id), eq(savIntakeEffects.state, "dispatched"), eq(savIntakeEffects.dispatchToken, lease.token),
+                eq(savIntakeEffects.attemptId, effect.attemptId), isNull(savIntakeEffects.ackCiphertext))).returning();
+        if (row) await executionJournal(tx, lease.row.id, "dispatch_withdrawn", { attemptId: row.attemptId, reason, dispatch: false }, row.id);
+        return Boolean(row);
     });
 }
 /** These receipt functions deliberately do not depend on live authority/lease. */

@@ -9,6 +9,7 @@ import { requireDb } from "@/db";
 import { savIntakeExecutions, savIntakeRuns, savMessages } from "@/db/schema";
 import { savIntakeRuntimeConfig, type IntakeRuntimeConfig } from "./runtime-contract";
 import { intakeExecutionConfig, readIntakeExecutionAuthority } from "./execution-policy";
+import { readSavAgentPause, savAgentPauseCode } from "./agent-pause";
 import { createIntakeExecutorAdapters } from "./execution-adapters";
 import { admitIntakeExecution, getExecutionEffects, occupationSchemaInstalled } from "./execution-store";
 import { executeIntakePass, readIntakeExecutionProgress } from "./executor";
@@ -74,6 +75,9 @@ async function executionOptions(deps: SavIntakeWakeDeps, runtime: IntakeRuntimeC
   let config: ReturnType<typeof intakeExecutionConfig>;
   try { config = intakeExecutionConfig(env); } catch (error) { return code(error); }
   if (!config) return "execution_off";
+  // Any agent pause behaves like observe: no admission, no executor pass.
+  const paused = savAgentPauseCode(await readSavAgentPause(requireDb()));
+  if (paused) return paused;
   if (!await occupationSchemaInstalled()) return "schema_absent";
   const { policy } = await readIntakeExecutionAuthority(config);
   const adapters = deps.adapters ?? createIntakeExecutorAdapters({ env: environment });
