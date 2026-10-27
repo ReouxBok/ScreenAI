@@ -635,3 +635,48 @@ describe("SAV-42 B (review ca1c4db): a file mention is not a file pointer", () =
     expect(await run("Impossible d'ajouter une pièce jointe à un message depuis hier.")).toBe("ticket");
   });
 });
+
+it.each(["Je vous adresse ma demande de résiliation.","Je vous transmets ma demande de résiliation."])("REVIEW641 a request sent to support is not a file pointer: %s",async text=>{
+ const f=fixture(["cancellation"]);f.input.message.currentText=text;
+ expect((await f.run()).decision.disposition.kind).toBe("ticket");
+ f.input.message.unreadAttachments=[{sourceId:"attachment:pdf",reason:"unsupported_type"}];
+ f.analysis.unreadAttachmentRequirements=[{sourceId:"attachment:pdf",role:"accessory",textQuote:text}];
+ expect((await f.run()).decision.disposition.kind).toBe("ticket");
+});
+it.each(["Veuillez trouver ci-joint les détails.","Veuillez trouver ci-joint le document."])("REVIEW641 a courtesy-only file delivery has no autonomous request: %s",async text=>{
+ const f=fixture();f.input.message.currentText=text;f.input.message.unreadAttachments=[{sourceId:"attachment:pdf",reason:"unsupported_type"}];
+ f.analysis.unreadAttachmentRequirements=[{sourceId:"attachment:pdf",role:"accessory",textQuote:text}];
+ expect((await f.run()).decision.disposition.kind).toBe("collect_context");
+});
+
+describe("SAV-42 B (review 6416af0): handing over a request vs handing over a file", () => {
+  const run = async (text: string, kind: MessageAnalysis["requests"][number]["kind"] = "support") => {
+    const f = fixture([kind]); f.input.message.currentText = text;
+    f.input.message.unreadAttachments = [{ sourceId: "attachment:pdf", reason: "unsupported_type" }];
+    f.analysis.unreadAttachmentRequirements = [{ sourceId: "attachment:pdf", role: "accessory", textQuote: text }];
+    return (await f.run()).decision.disposition.kind;
+  };
+  it.each([
+    ["Je vous fais parvenir ma demande de remboursement.", "finance"],
+    ["Je vous transmets ma réclamation sur la facturation de septembre.", "finance"],
+    ["Je vous envoie ce message car la synchronisation échoue.", "support"],
+    ["Les détails de ma facture sont faux.", "finance"],
+    ["Les documents exportés sont vides.", "support"],
+    ["L'image de profil ne s'affiche plus.", "support"],
+    ["Impossible de joindre un fichier à un message.", "support"],
+    ["Connexion impossible.", "support"],
+  ] as const)("a request written in the sentence is handled: %j", async (text, kind) => {
+    expect(await run(text, kind)).toBe("ticket");
+  });
+  it.each([
+    "Vous trouverez ci-joint les éléments demandés.",
+    "Merci de trouver en pièce jointe les explications.",
+    "Ci-joint les informations nécessaires.",
+    "Je vous joins ma facture.",
+    "Je vous envoie le document.",
+    "Je vous transmets la capture d'écran.",
+    "Veuillez trouver le détail dans le fichier joint.",
+  ])("handing over a file without a written need stays with the team: %j", async text => {
+    expect(await run(text)).toBe("collect_context");
+  });
+});

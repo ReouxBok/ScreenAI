@@ -42,15 +42,22 @@ const FILE = "(?:p\\.?\\s?j(?!\\p{L})|pi[eè]ces?\\s+jointes?|ci-?joint\\p{L}*|a
  * "Ci-joint le détail". A mere mention ("…, facture en PJ pour information") is not one. */
 const FILE_POINTER = new RegExp([
   `(?<!\\p{L})(?:voir|cf\\.?|regarde[rz]?|consulte[rz]?|ouvre[rz]?|see|check)\\s+(?:\\p{L}+['’]?\\s+){0,2}${FILE}`,
-  `(?<!\\p{L})(?:d[ée]taill\\p{L}*|d[ée]cri\\p{L}*|expliqu\\p{L}*|pr[ée]cis[ée]\\p{L}*|indiqu\\p{L}*|visible|figure|trouverez|trouvez|tout\\s+est)(?!\\p{L})[^.!?]{0,40}(?<!\\p{L})(?:dans|en|sur|ci)(?!\\p{L})[^.!?]{0,30}${FILE}`,
-  `(?<!\\p{L})je\\s+vous\\s+(?:envoie|transmets|joins|adresse|fais\\s+parvenir)(?!\\p{L})`,
+  `(?<!\\p{L})(?:d[ée]taill\\p{L}*|d[ée]cri\\p{L}*|expliqu\\p{L}*|pr[ée]cis[ée]\\p{L}*|indiqu\\p{L}*|visible|figure|trouver|trouverez|trouvez|tout\\s+est)(?!\\p{L})[^.!?]{0,40}(?<!\\p{L})(?:dans|en|sur|ci)(?!\\p{L})[^.!?]{0,30}${FILE}`,
+  // "Je vous joins…" always hands over a file; "envoie/transmets/adresse/fais parvenir" only when
+  // what is handed over is a file ("Je vous adresse ma demande de résiliation" is a request).
+  `(?<!\\p{L})je\\s+vous\\s+joins(?!\\p{L})`,
+  `(?<!\\p{L})je\\s+vous\\s+(?:envoie|transmets|adresse|fais\\s+parvenir)(?!\\p{L})\\s+(?:\\p{L}+['’]?\\s+){0,3}${FILE}`,
   `^\\s*ci-?joint`,
 ].join("|"), "iu");
 /** The file mention itself, with the noun it qualifies ("facture en PJ", "le PDF joint"). */
 const FILE_MENTION = new RegExp(`(?:\\p{L}+\\s+(?:en\\s+)?)?${FILE}`, "giu");
 const NOT_A_REQUEST = new Set(["bonjour", "bonsoir", "salut", "hello", "merci", "thanks", "cordialement", "regards", "bonne", "journée", "soirée", "svp", "stp",
   "madame", "monsieur", "s'il", "vous", "plaît", "plait", "pour", "information", "info", "référence", "reference", "et", "de", "du", "des", "le", "la", "les",
-  "l'", "un", "une", "en", "à", "au", "aux", "ma", "mon", "mes", "votre", "vos", "ce", "cette", "ci", "cf", "voir", "see", "regardez", "consultez"]);
+  "l'", "un", "une", "en", "à", "au", "aux", "ma", "mon", "mes", "votre", "vos", "ce", "cette", "ci", "cf", "voir", "see", "regardez", "consultez",
+  // File-delivery courtesy ("Veuillez trouver ci-joint les détails"): the verbs and the generic
+  // nouns that only name the file's content state no need once the file mention is removed.
+  "veuillez", "pouvez", "trouver", "trouverez", "joindre", "détail", "détails", "élément", "éléments", "explication", "explications",
+  "informations", "demandées", "demandés", "demandé", "demandée", "nécessaires", "utiles"]);
 /** An "accessory" file needs a cited current sentence that states the request on its own:
  * pointer sentences are set aside, file mentions are removed from the others, and what
  * remains must say more than courtesy. Length is not a criterion. */
