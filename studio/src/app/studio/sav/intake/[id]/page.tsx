@@ -105,6 +105,8 @@ export default async function IntakeDetailPage({ params, searchParams }: { param
         {data.progress?.reason && <p>Attente : {intakeReasonLabel(data.progress.reason)}</p>}
         {data.progress?.crmDelta && <p>{intakeCrmDeltaLabel(data.progress.crmDelta)}</p>}
         {data.diagnostics?.execution && data.diagnostics.execution.state !== "confirmed" && <p>Prochaine étape : {intakeNextStepLabel(data.diagnostics.execution.nextStep)}</p>}
+        {data.progress?.crmRecheck && <p>{data.progress.crmRecheck.humanRequired ? `Contrôles automatiques arrêtés (${data.progress.crmRecheck.attempts}/${data.progress.crmRecheck.max}) : décision humaine attendue.`
+          : `Contrôle automatique ${data.progress.crmRecheck.attempts}/${data.progress.crmRecheck.max}${data.progress.crmRecheck.nextAt ? `, prochain au plus tôt ${formatParisDateTime(new Date(data.progress.crmRecheck.nextAt))}` : ""}. Les actions confirmées ne sont pas rejouées.`}</p>}
         {data.confirmedCurrent && data.progress?.ticketId && <p>Ticket confirmé : <CrmRecord display={display} portal={portal} kind="ticket" id={data.progress.ticketId}/>. {data.projection.status === "followup_pending" ? "Premier suivi encore en attente." : "L’avancement du suivi reste fondé sur ses sources collectées."}</p>}
         <p>Aucun brouillon de réponse de résolution n’a été produit par ce parcours. Les réponses supervisées existantes restent dans la file supervisée.</p>
       </section>

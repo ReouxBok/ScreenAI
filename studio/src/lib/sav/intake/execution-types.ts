@@ -33,6 +33,8 @@ export type ExecutionPayload = {
     keys: string[];
     reason?: string;
     crmDelta?: import("./execution-context").CrmDeltaDiagnostic;
+    /** CRM wait schedule of the current episode (SAV-45); the journal is the durable source. */
+    crmRecheck?: import("./crm-recheck").CrmRecheckState;
     lastRunId: string;
     acceptedFingerprint: string;
     effectsConfirmed?: boolean;

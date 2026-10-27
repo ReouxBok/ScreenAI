@@ -1396,3 +1396,129 @@ it("SAV-45 A: the admin diagnostic exposes the execution, its passes, delta and 
         crmDelta: { reason: "original_evidence_changed", classification: "business_change" }, effects: [] });
     expect(JSON.stringify(diagnostics?.execution)).not.toMatch(/customer@example\.invalid|Synthetic full request|synthetic connection fails/i);
 });
+
+// ---- SAV-45 B: bounded, durable CRM rechecks that keep every confirmed effect.
+type Shape = { name: string; seed?: "open"; cut: (confirmed: string[], planned: string[]) => boolean };
+const shapes: Shape[] = [
+    { name: "note created, association planned", seed: "open", cut: (c, p) => c.join() === "note_create" && p.includes("note_associate") },
+    { name: "nothing sent yet", cut: (c, p) => !c.length && !p.length },
+    { name: "note associated, email not created", seed: "open", cut: (c, p) => c.join() === "note_associate,note_create" && !p.length },
+    { name: "note created only", seed: "open", cut: (c, p) => c.join() === "note_create" && !p.length },
+    { name: "ticket, email and association confirmed, finalization blocked", cut: (c, p) => ["email_associate", "email_create", "ticket_create"].every(k => c.includes(k)) && !p.length },
+    { name: "ticket created only", cut: (c, p) => c.join() === "ticket_create" && !p.length },
+];
+/** One transient CRM read failure at the chosen point of the execution. */
+function cutReadOnce(rowId: string, when: Shape["cut"]) {
+    const readCrm = options.adapters.readCrm;
+    let cut = false;
+    options.adapters.readCrm = async (...args) => {
+        const effects = await getExecutionEffects(rowId);
+        if (!cut && when(effects.filter(e => e.state === "confirmed").map(e => e.kind).sort(), effects.filter(e => e.state === "planned").map(e => e.kind))) {
+            cut = true; throw Error("SAV_INTAKE_EXECUTION_CRM_READ_UNAVAILABLE");
+        }
+        return readCrm(...args);
+    };
+    return () => cut;
+}
+// HubSpot reads also use POST (search, batch/read): only mutations are counted.
+const providerWrites = () => p.calls.filter(c => ["POST", "PUT", "PATCH", "DELETE"].includes(c.method) && !/\/(?:search|batch\/read)$/.test(c.path)).map(c => `${c.method} ${c.path}`);
+it.each(shapes)("SAV-45 B: $name — the same execution resumes without replaying any confirmed effect", async shape => {
+    if (shape.seed) p.seedTicket({ stage: shape.seed });
+    const row = await admission(), cut = cutReadOnce(row.id, shape.cut);
+    expect(await executeIntakePass(row.id, options)).toMatchObject({ state: "waiting", reason: "SAV_INTAKE_EXECUTION_CRM_READ_UNAVAILABLE" });
+    expect(cut()).toBe(true);
+    const before = await getExecutionEffects(row.id), progress = await readIntakeExecutionProgress(messageId);
+    expect(progress?.crmRecheck).toMatchObject({ attempts: 1, humanRequired: false, cause: "read_incomplete" });
+    expect(before.every(e => ["planned", "confirmed"].includes(e.state))).toBe(true);
+    expect(await executeIntakePass(row.id, options)).toMatchObject({ state: "confirmed" });
+    const after = await getExecutionEffects(row.id);
+    for (const old of before.filter(e => e.state === "confirmed")) expect(after.find(e => e.id === old.id)).toEqual(old);
+    expect(after.every(e => e.state === "confirmed")).toBe(true);
+    // Each provider write happened once: no POST/PUT/PATCH of a confirmed effect is replayed.
+    expect(new Set(providerWrites()).size).toBe(providerWrites().length);
+    expect(p.calls.filter(c => c.path === "gmail/messages/send")).toHaveLength(0);
+    expect((await readIntakeExecutionProgress(messageId))?.crmRecheck).toBeUndefined();
+});
+/** Ages the execution and its CRM schedule as if minutes had passed, without a clock fake. */
+async function age(rowId: string, ms: number) {
+    await f.client.exec(`UPDATE sav.intake_executions SET updated_at = updated_at - interval '${ms} milliseconds' WHERE id='${rowId}';
+        UPDATE sav.intake_effect_journal SET created_at = created_at - interval '${ms} milliseconds' WHERE execution_id='${rowId}';
+        UPDATE sav.intake_effects SET confirmed_at = confirmed_at - interval '${ms} milliseconds', created_at = created_at - interval '${ms} milliseconds' WHERE execution_id='${rowId}';
+        UPDATE sav.intake_runs SET created_at = created_at - interval '${ms} milliseconds' WHERE message_id=(SELECT message_id FROM sav.intake_executions WHERE id='${rowId}')`);
+}
+const selected = async () => {
+    const result = await reconcileIntakeExecutor({ env: () => environment, adapters: options.adapters });
+    return "executionId" in result ? result.executionId : null;
+};
+it("SAV-45 B: a persistent read failure is rechecked with growing delays, five times at most, then left to a person", async () => {
+    const row = await admission();
+    options.adapters.readCrm = async () => { throw Error("SAV_INTAKE_EXECUTION_CRM_READ_UNAVAILABLE"); };
+    expect(await executeIntakePass(row.id, options)).toMatchObject({ state: "waiting" });
+    for (let attempt = 1; attempt < 5; attempt++) {
+        const delay = 60_000 * 2 ** (attempt - 1);
+        await age(row.id, delay - 5_000);
+        expect(await selected()).toBeNull();
+        await age(row.id, 6_000);
+        expect(await selected()).toBe(row.id);
+        expect((await readIntakeExecutionProgress(messageId))?.crmRecheck).toMatchObject({ attempts: attempt + 1, humanRequired: attempt + 1 >= 5 });
+    }
+    // Bound reached: the schedule is durable in the journal, it is never selected again on its own.
+    await age(row.id, 24 * 3_600_000);
+    expect(await selected()).toBeNull();
+    const diagnostics = await readIntakeRunDiagnostics(threadId);
+    expect(diagnostics?.execution).toMatchObject({ nextStep: "human_decision", crmRecheck: { attempts: 5, max: 5, humanRequired: true, nextAt: null } });
+    expect(await getExecutionEffects(row.id)).toHaveLength(0);
+});
+it("SAV-45 B: a real business change goes to a person at once and does not hold back another dossier", async () => {
+    p.seedTicket({ stage: "open" });
+    runId = await observedRecorded();
+    const row = (await admitIntakeExecution(runId, options))!;
+    p.objects.tickets["201"].properties.hubspot_owner_id = "999";
+    expect(await executeIntakePass(row.id, options)).toMatchObject({ state: "waiting", reason: "SAV_INTAKE_EXECUTION_CRM_CHANGED" });
+    expect((await readIntakeExecutionProgress(messageId))?.crmRecheck).toMatchObject({ attempts: 0, humanRequired: true, cause: "business_change" });
+    await age(row.id, 3_600_000);
+    expect(await selected()).toBeNull();
+    const journal = await f.db.select().from(savIntakeEffectJournal).where(eq(savIntakeEffectJournal.executionId, row.id));
+    expect(journal.filter(j => j.kind === "crm_review_required")).toHaveLength(1);
+    expect(journal.filter(j => j.kind === "pass_waiting")).toHaveLength(1);
+    // Another dossier of another customer is still selected and processed.
+    const otherThread = (await f.db.insert(savThreads).values({ mailboxId, gmailThreadId: "gmail-thread-2", customerEmail: "customer@example.invalid" }).returning())[0].id;
+    const other = await storedMessage(otherThread);
+    p.setGmail(other.gmailMessageId!, "gmail-thread-2");
+    const before = providerWrites().length;
+    expect(before).toBe(0);
+    const otherRun = await observed(other.id), otherRow = await admitIntakeExecution(otherRun, options);
+    expect(otherRow).not.toBeNull();
+    await age(otherRow!.id, 120_000);
+    expect(await selected()).toBe(otherRow!.id);
+    expect((await f.db.select().from(savIntakeExecutions).where(eq(savIntakeExecutions.id, otherRow!.id)))[0].state).toBe("confirmed");
+    // The dossier left to a person received no write; only the other one was processed.
+    expect(await getExecutionEffects(row.id)).toHaveLength(0);
+});
+it("SAV-45 B: progress opens a new episode — the recheck count restarts after a confirmed effect", async () => {
+    p.seedTicket({ stage: "open" });
+    const row = await admission();
+    cutReadOnce(row.id, (c, p) => !c.length && !p.length);
+    await executeIntakePass(row.id, options);
+    expect((await readIntakeExecutionProgress(messageId))?.crmRecheck).toMatchObject({ attempts: 1 });
+    cutReadOnce(row.id, c => c.join() === "note_create");
+    await executeIntakePass(row.id, options);
+    expect((await getExecutionEffects(row.id)).filter(e => e.state === "confirmed").map(e => e.kind)).toEqual(["note_create"]);
+    expect((await readIntakeExecutionProgress(messageId))?.crmRecheck).toMatchObject({ attempts: 1, humanRequired: false });
+});
+it("SAV-45 B: a newer analysis run reopens a dossier left to a person, without resetting the ledger", async () => {
+    p.seedTicket({ stage: "open" });
+    runId = await observedRecorded();
+    const row = (await admitIntakeExecution(runId, options))!;
+    p.objects.tickets["201"].properties.hubspot_owner_id = "999";
+    await executeIntakePass(row.id, options);
+    await age(row.id, 3_600_000);
+    expect(await selected()).toBeNull();
+    // A person asks for a new analysis: a newer current run of the same message exists.
+    await f.client.exec(`UPDATE sav.intake_runs SET is_current=false WHERE id='${runId}'`);
+    await f.db.insert(savIntakeRuns).values({ threadId, messageId, version: 2, attempts: 0, isCurrent: true, state: "pending", configHash: "c".repeat(64), policyHash: options.runtime.policyHash, payloadCiphertext: encryptSavPayload({ revision: SAV_INTAKE_RUNTIME_REVISION, effects: "not_connected" }) });
+    expect(await selected()).toBe(row.id);
+    const journal = await f.db.select().from(savIntakeEffectJournal).where(eq(savIntakeEffectJournal.executionId, row.id));
+    expect(journal.filter(j => j.kind === "admitted")).toHaveLength(1);
+    expect(providerWrites()).toHaveLength(0);
+});

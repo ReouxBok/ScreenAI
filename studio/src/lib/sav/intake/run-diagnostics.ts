@@ -4,7 +4,7 @@ import { and, desc, eq, gt, inArray, sql } from "drizzle-orm";
 import { requireDb } from "@/db";
 import { savIntakeEffectJournal, savIntakeEffects, savIntakeExecutions, savIntakeJournal, savIntakeRuns, savMessages } from "@/db/schema";
 import { publicIntakeCrmDelta } from "./execution-context";
-import { intakeExecutionNextStep, publicExecutionEffects } from "./execution-diagnostic";
+import { intakeExecutionNextStep, publicCrmRecheck, publicExecutionEffects } from "./execution-diagnostic";
 import { decryptSavPayload } from "../crypto";
 import { savAttachmentReasonSchema, savAttachmentStatusSchema } from "../attachment-contract";
 import { intakeContextReasonLabels } from "./console-presentation";
@@ -103,11 +103,11 @@ async function readExecutionDiagnostic(tx: ReadTx, messageId: string) {
     .orderBy(savIntakeEffects.createdAt, savIntakeEffects.id).limit(21);
   const [passes] = await tx.select({ count: sql<number>`count(*)::int`, last: sql<Date | null>`max(${savIntakeEffectJournal.createdAt})` }).from(savIntakeEffectJournal)
     .where(and(eq(savIntakeEffectJournal.executionId, row.id), eq(savIntakeEffectJournal.kind, "pass_waiting")));
-  const reason = readable ? code(payload.reason) : null, crmDelta = readable ? publicIntakeCrmDelta(payload.crmDelta) : null;
+  const reason = readable ? code(payload.reason) : null, crmDelta = readable ? publicIntakeCrmDelta(payload.crmDelta) : null, crmRecheck = readable ? publicCrmRecheck(payload.crmRecheck) : null;
   return { readable, state: ["pending", "running", "waiting", "uncertain", "confirmed", "refused"].includes(row.state) ? row.state : null, runVersion: row.runVersion, updatedAt: row.updatedAt,
-    reason, crmDelta, originalCrmRecorded: readable ? Boolean(object(payload.originalCrm).entries) : null, effects: publicExecutionEffects(effects), effectsTruncated: effects.length > 20,
+    reason, crmDelta, crmRecheck, originalCrmRecorded: readable ? Boolean(object(payload.originalCrm).entries) : null, effects: publicExecutionEffects(effects), effectsTruncated: effects.length > 20,
     waitingPasses: count(Number(passes?.count ?? 0)), lastPassAt: passes?.last ?? null,
-    nextStep: readable ? intakeExecutionNextStep({ state: row.state, reason, crmDelta, effectStates: effects.map(e => e.state) }) : "unknown" as const };
+    nextStep: readable ? intakeExecutionNextStep({ state: row.state, reason, crmDelta, crmRecheck, effectStates: effects.map(e => e.state) }) : "unknown" as const };
 }
 
 /** Latest inbound message only, all attempts counted across versions. No lease,
