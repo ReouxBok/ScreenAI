@@ -45,9 +45,16 @@ test("same-dossier actions preserve reading position, including repeated redirec
   await submitWithoutJump(page, validate); // Revalidate the same dossier.
 
   const draft = page.getByRole("region", { name: "Suggestion de réponse", exact: true });
+  const savedDraftId = draft.locator('form').filter({ has: page.getByRole("button", { name: "Enregistrer ma version", exact: true }) }).locator('input[name="expectedDraftId"]');
+  const previousDraftId = await savedDraftId.inputValue();
   await draft.getByRole("textbox", { name: "Suggestion de réponse", exact: true }).fill("Bonjour, voici une réponse humaine synthétique pour cette demande.");
   await submitWithoutJump(page, draft.getByRole("button", { name: "Enregistrer ma version", exact: true }));
   await expect(draft.getByRole("textbox", { name: "Suggestion de réponse", exact: true })).toHaveValue("Bonjour, voici une réponse humaine synthétique pour cette demande.");
+  // The controlled textarea already has this value before saving. Wait for the
+  // persisted version to reach React before interacting with its feedback form.
+  await expect(page).toHaveURL(/review=draft_saved/);
+  await expect(savedDraftId).toHaveValue(/^[0-9a-f-]{36}$/);
+  await expect(savedDraftId).not.toHaveValue(previousDraftId);
   await draft.getByText("Feedback facultatif sur la suggestion", { exact: true }).click();
   await draft.getByLabel("Commentaire", { exact: true }).fill("Vérification synthétique du parcours de refus.");
   await submitWithoutJump(page, draft.getByRole("button", { name: "Signaler un problème dans la suggestion initiale", exact: true }));
