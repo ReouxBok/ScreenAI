@@ -48,6 +48,8 @@ export async function planSavIntake(
   const limits = { readCalls: 50, timeoutMs: 2000, contacts: 10, tickets: 20, ...overrides };
   if (Object.values(limits).some(n => !Number.isSafeInteger(n) || n < 1)
     || limits.contacts > 10 || limits.tickets > 20 || limits.readCalls > 100 || limits.timeoutMs > 10_000) throw new Error("SAV_INTAKE_LIMITS_INVALID");
+  const modelTimeoutMs = limits.modelTimeoutMs ?? limits.timeoutMs;
+  if (modelTimeoutMs > 60_000) throw new Error("SAV_INTAKE_LIMITS_INVALID");
   let calls = 0;
   const readTime = () => {
     const value = readClock ? readClock().getTime() : Date.parse(input.now);
@@ -110,14 +112,14 @@ export async function planSavIntake(
     choice ? { kind: "human_choice", messageId: message.id, classification: classification === "cancellation" || classification === "finance" || classification === "support" ? classification : "unknown", questionCode: choice, investigation: "bounded_investigation_complete", evidenceIds: evidence.map(e => e.id).sort(), view: "to_validate" }
       : { kind: "processing", phase: reason.startsWith("classification") ? "classification" : "context", view: null },
   );
-  async function bounded<T>(fn: (signal: AbortSignal) => Promise<T>, reason: ContextReason): Promise<T> {
+  async function bounded<T>(fn: (signal: AbortSignal) => Promise<T>, reason: ContextReason, timeoutMs = limits.timeoutMs): Promise<T> {
     if (calls >= limits.readCalls) fail(reason);
     calls++;
     const controller = new AbortController();
     let timer: ReturnType<typeof setTimeout> | undefined;
     try {
       return await Promise.race([Promise.resolve().then(() => fn(controller.signal)), new Promise<never>((_, reject) => {
-        timer = setTimeout(() => { controller.abort(Error("SAV_INTAKE_STEP_DEADLINE")); reject(new ContextFault(reason)); }, limits.timeoutMs);
+        timer = setTimeout(() => { controller.abort(Error("SAV_INTAKE_STEP_DEADLINE")); reject(new ContextFault(reason)); }, timeoutMs);
       })]);
     } catch { return fail(reason); }
     finally { if (timer) clearTimeout(timer); }
@@ -178,7 +180,7 @@ export async function planSavIntake(
       || input.previousIdentification?.state !== "confirmed" || input.previousIdentification.messageId !== initial.id
       || normalizeEmail(input.previousIdentification.address) !== normalizeEmail(message.fromEmail))) return context("history_incomplete");
     const parsedAnalysis = messageAnalysisSchema.safeParse(await bounded(signal => adapters.analyseMessage({ message, conversation,
-      ...(continuation ? { identificationContinuation: continuation } : {}) }, signal), "classification_incomplete"));
+      ...(continuation ? { identificationContinuation: continuation } : {}) }, signal), "classification_incomplete", modelTimeoutMs));
     if (!parsedAnalysis.success) return context("classification_incomplete");
     const analysis = parsedAnalysis.data;
     const inherited = analysis.requests.filter(r => r.originMessageId !== undefined);
@@ -306,7 +308,7 @@ export async function planSavIntake(
         }
         candidateContexts.push({ contact: c, tickets: rows });
       }
-      const parsed = identityAssessmentSchema.safeParse(await bounded(signal => adapters.assessIdentity!({ message, address, candidates: candidateContexts, evidence: [...evidence], ...(initialProof ? { requestContext: initial } : {}) }, signal), "contact_ambiguous"));
+      const parsed = identityAssessmentSchema.safeParse(await bounded(signal => adapters.assessIdentity!({ message, address, candidates: candidateContexts, evidence: [...evidence], ...(initialProof ? { requestContext: initial } : {}) }, signal), "contact_ambiguous", modelTimeoutMs));
       if (!parsed.success) return context("contact_ambiguous");
       const resolution = parsed.data;
       const required = [current, ...contacts.flatMap(c => [`contact-${c.id}`, `identity-search-${c.id}`]), ...[...seenTickets.keys()].flatMap(id => [`identity-ticket-${id}`, `identity-history-${id}`])];
@@ -373,7 +375,7 @@ export async function planSavIntake(
       }
     }
     if (evidence.length > 95) return context("history_incomplete");
-    const parsedAssessment = issueAssessmentSchema.safeParse(await bounded(signal => adapters.assessIssues({ message, requests: analysis.requests, tickets: collected, evidence: [...evidence], ...(initialProof ? { requestContext: initial } : {}) }, signal), "same_issue_unresolved"));
+    const parsedAssessment = issueAssessmentSchema.safeParse(await bounded(signal => adapters.assessIssues({ message, requests: analysis.requests, tickets: collected, evidence: [...evidence], ...(initialProof ? { requestContext: initial } : {}) }, signal), "same_issue_unresolved", modelTimeoutMs));
     if (!parsedAssessment.success) return context("same_issue_unresolved");
     const assessment = parsedAssessment.data;
     const humanTicketId = input.humanResolution?.ticketId;

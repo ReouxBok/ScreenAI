@@ -200,3 +200,99 @@ it.each(["malformed","expired"])("REVIEW an %s Other catalogue cannot silently y
  expect(report.configured && report.rows[0].detail).toMatchObject({ differences: ["SAV_INTAKE_OTHER_CONFIGURATION_REQUIRED"] });
  expect(p.seen).toEqual([]);
 });
+
+it("allows a model answer beyond the CRM deadline within the existing AI transport allowance", async () => {
+  const m = await stored(), e = env(mailboxId, [m.id]), p = provider();
+  let currentStarted = false, simpleStarted = false;
+  const network: typeof fetch = async (url, init) => {
+    if (!String(url).startsWith("https://generativelanguage.googleapis.com/")) return p.network(url, init);
+    const data = JSON.parse(JSON.parse(String(init?.body)).contents[0].parts[0].text);
+    const simple = typeof data.current === "string";
+    const answer = new Promise<Response>((resolve, reject) => {
+      const timer = setTimeout(() => { void p.network(url, init).then(resolve, reject); }, 12_000);
+      init!.signal!.addEventListener("abort", () => { clearTimeout(timer); reject(init!.signal!.reason); }, { once: true });
+    });
+    if (simple) simpleStarted = true; else currentStarted = true;
+    return answer;
+  };
+  vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+  try {
+    const work = runSavIntakeComparisonBatch({ env: () => e, network, limit: 1 });
+    let finished = false; const completed = work.finally(() => { finished = true; });
+    await vi.waitFor(() => expect(currentStarted).toBe(true)); await vi.advanceTimersByTimeAsync(12_000);
+    await vi.waitFor(() => expect(simpleStarted).toBe(true)); await vi.advanceTimersByTimeAsync(12_000);
+    await vi.waitFor(() => expect(finished).toBe(true)); await completed;
+    const report = await readSavIntakeComparisonReport(() => e);
+    expect(report.configured && report.rows[0]).toMatchObject({ verdict: "identical", detail: {
+      current: { technical: null, uncertain: false }, simple: { technical: null, uncertain: false }, coverage: [] } });
+    expect((await ledger()).filter(x => x.technicalMetadata.event === "reserved")).toHaveLength(2);
+    expect(await f.db.select().from(savIntakeModelCalls)).toEqual([]);
+    expect(await f.db.select().from(savIntakeRuns)).toEqual([]);
+  } finally { vi.useRealTimers(); }
+}, 30_000);
+
+it.each([429, 503])("a received provider HTTP %s settles at zero without retrying or touching the operational ledger", async status => {
+  const m = await stored(), e = env(mailboxId, [m.id]), p = provider({ currentStatus: status });
+  await runSavIntakeComparisonBatch({ env: () => e, network: p.network, limit: 1 });
+  const rows = await ledger(), reserved = rows.filter(x => x.technicalMetadata.event === "reserved");
+  expect(reserved).toHaveLength(2);
+  expect(rows.find(x => x.technicalMetadata.event === "settled" && x.technicalMetadata.callId === reserved[0].technicalMetadata.callId)?.technicalMetadata).toMatchObject({ state: "settled", chargedNanoUsd: 0 });
+  expect(p.seen).toEqual(["current", "simple"]);
+  expect(await f.db.select().from(savIntakeModelCalls)).toEqual([]);
+});
+it("a lost provider response remains uncertain and is never resent by the campaign", async () => {
+  const m = await stored(), e = env(mailboxId, [m.id]), p = provider(); let sent = 0;
+  const network: typeof fetch = async (url, init) => {
+    if (String(url).startsWith("https://generativelanguage.googleapis.com/") && sent++ === 0) throw Error("SYNTHETIC_RESPONSE_LOST");
+    return p.network(url, init);
+  };
+  await runSavIntakeComparisonBatch({ env: () => e, network, limit: 1 });
+  const report = await readSavIntakeComparisonReport(() => e);
+  expect(report.configured && report.rows[0]).toMatchObject({ verdict: "incomplete", detail: { current: { uncertain: true, technical: "SAV_AI_GENERATION_FAILED" } } });
+  expect(report.configured && report.spend.nanoUsd).toBeGreaterThanOrEqual(817_152_000);
+  expect(await runSavIntakeComparisonBatch({ env: () => e, network, limit: 1 })).toMatchObject({ compared: [] });
+  expect(sent).toBe(2);
+});
+it("a reservation waiting beyond the side deadline cannot reserve or dispatch after the lock is obtained", async () => {
+  const m = await stored(), e = env(mailboxId, [m.id]), p = provider();
+  const transaction = f.db.transaction.bind(f.db); let count = 0, waiting = false;
+  const spy = vi.spyOn(f.db, "transaction").mockImplementation(async (...args: Parameters<typeof transaction>) => {
+    if (++count === 2) { waiting = true; await new Promise(resolve => setTimeout(resolve, 61_000)); }
+    return transaction(...args);
+  });
+  vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+  try {
+    let finished = false; const work = runSavIntakeComparisonBatch({ env: () => e, network: p.network, limit: 1 }).finally(() => { finished = true; });
+    await vi.waitFor(() => expect(waiting).toBe(true));
+    await vi.advanceTimersByTimeAsync(61_000);
+    await vi.waitFor(() => expect(finished).toBe(true)); await work;
+    const report = await readSavIntakeComparisonReport(() => e);
+    expect(report.configured && report.rows[0]).toMatchObject({ verdict: "incomplete", detail: { current: { technical: "SAV_INTAKE_COMPARISON_DEADLINE", uncertain: false }, simple: { technical: null, uncertain: false } } });
+    expect(p.seen).toEqual(["simple"]);
+    expect((await ledger()).filter(x => x.technicalMetadata.event === "reserved")).toHaveLength(1);
+    expect(await f.db.select().from(savIntakeModelCalls)).toEqual([]);
+  } finally { spy.mockRestore(); vi.useRealTimers(); }
+}, 30_000);
+
+it("a verified cost settled after the deadline never turns an expired side into a comparable judgement", async () => {
+  const m = await stored(), e = env(mailboxId, [m.id]), p = provider();
+  const query = f.client.query.bind(f.client); let delaying = false;
+  const spy = vi.spyOn(f.client, "query").mockImplementation(async (...args: Parameters<typeof query>) => {
+    const result = await query(...args);
+    if (!delaying && String(args[0]).startsWith('insert into "audit_logs"') && JSON.stringify(args[1]).includes('\\"event\\":\\"settled\\"')) {
+      delaying = true; await new Promise(resolve => setTimeout(resolve, 61_000));
+    }
+    return result;
+  });
+  vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+  try {
+    let finished = false; const work = runSavIntakeComparisonBatch({ env: () => e, network: p.network, limit: 1 }).finally(() => { finished = true; });
+    await vi.waitFor(() => expect(delaying).toBe(true)); await vi.advanceTimersByTimeAsync(61_000);
+    await vi.waitFor(() => expect(finished).toBe(true)); await work;
+    const report = await readSavIntakeComparisonReport(() => e);
+    expect(report.configured && report.rows[0]).toMatchObject({ verdict: "incomplete", detail: { current: { summary: null, technical: "SAV_INTAKE_COMPARISON_DEADLINE", uncertain: false } } });
+    const rows = await ledger();
+    expect(rows.filter(x => x.technicalMetadata.event === "settled").every(x => x.technicalMetadata.state === "settled")).toBe(true);
+    expect(report.configured && report.spend.nanoUsd).toBeGreaterThan(0);
+  } finally { spy.mockRestore(); vi.useRealTimers(); }
+}, 30_000);

@@ -79,3 +79,26 @@ describe("bounded read/generation transport", () => {
     expect(savGeminiGenerationConfig("gemini-2.5-flash", { temperature: 0 })).toEqual({ temperature: 0 });
   });
 });
+
+it("keeps an explicit parent cancellation in the persisted trace contract", async () => {
+  const { savAiTransportTraceSchema } = await import("./understanding");
+  const parent = new AbortController();
+  const network = vi.fn<typeof fetch>(async (_url, init) => {
+    parent.abort(Error("SAV_INTAKE_COMPARISON_DEADLINE")); throw init!.signal!.reason;
+  });
+  const error = await requestSavGeminiJson({ ...request, signal: parent.signal, fetch: network, allowRetry: false }).catch(error => error);
+  expect(error).toMatchObject({ message: "SAV_INTAKE_COMPARISON_DEADLINE", metadata: { transport: { failureCategory: "cancelled", attempts: 1 } } });
+  expect(savAiTransportTraceSchema.parse(error.metadata.transport).failureCategory).toBe("cancelled");
+  expect(network).toHaveBeenCalledTimes(1); expect(vi.getTimerCount()).toBe(0);
+});
+it("does not retry or mislabel a cancelled response body", async () => {
+  const parent = new AbortController();
+  const network = vi.fn<typeof fetch>(async (_url, init) => new Response(new ReadableStream({ start(controller) {
+    init!.signal!.addEventListener("abort", () => controller.error(init!.signal!.reason), { once: true });
+    setTimeout(() => parent.abort(Error("SAV_INTAKE_COMPARISON_DEADLINE")), 1000);
+  } })));
+  const work = requestSavGeminiJson({ ...request, signal: parent.signal, fetch: network, allowRetry: false });
+  const assertion = expect(work).rejects.toMatchObject({ message: "SAV_INTAKE_COMPARISON_DEADLINE", metadata: { transport: { failureCategory: "cancelled" } } });
+  await vi.advanceTimersByTimeAsync(1000); await assertion;
+  expect(network).toHaveBeenCalledTimes(1); expect(vi.getTimerCount()).toBe(0);
+});
