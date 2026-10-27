@@ -571,7 +571,7 @@ it.each(["pdf","image_limit","budget"]) ("finishes a non-dispatched image attemp
   if(kind==="image_limit")expect(display.observations.slice(0,3).every(o=>o.reason==="context_incomplete")).toBe(true);
   // SAV-42: a PDF of a complete text no longer blocks before the reader; it is sent as an
   // explicit unread file (never content) and the run still produces no action here.
-  if(kind==="pdf"){expect(network).toHaveBeenCalled();expect(bodies.join()).toContain("unreadAttachments");expect(current.payload.input?.message.unreadAttachments).toEqual([{sourceId:display.observations[0].sourceId,reason:"unsupported_type"}]);}
+  if(kind==="pdf"){expect(network).toHaveBeenCalled();expect(bodies.join()).toContain("unreadAttachments");expect((current.payload.input as {message?:{unreadAttachments?:unknown}}|undefined)?.message?.unreadAttachments).toEqual([{sourceId:display.observations[0].sourceId,reason:"unsupported_type"}]);}
   else expect(network).not.toHaveBeenCalled();
   expect(await f.db.select().from(savActions)).toHaveLength(0);
 });
