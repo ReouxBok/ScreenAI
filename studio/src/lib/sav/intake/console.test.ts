@@ -1018,16 +1018,16 @@ it("SAV-33 an agent pause keeps a confirmed dossier unread until resume, without
   await db.db.update(savThreads).set({gmailThreadId:"1a000"}).where(eq(savThreads.id,threadId));
   const pause=async(level:string)=>{const values={key:"sav-agent-pause.v1:intake",status:"active",updatedAt:new Date(),cursor:encryptSavPayload({revision:"sav-agent-pause.v1",agent:"intake",level,setBy:"ugo@limova.ai",setAt:new Date().toISOString(),reason:"synthetic"})};
     await db.db.insert(savSyncState).values(values).onConflictDoUpdate({target:savSyncState.key,set:values});};
-  let unread=true;const gmail=vi.fn<GmailRequest>(async<T>(_mailbox:string,path:string,init?:RequestInit)=>{
-    if(path==="profile")return {emailAddress:"contact@limova.ai"} as T;
+  let unread=true,calls=0;const gmail:GmailRequest=async<T>(_mailbox:string,path:string,init?:RequestInit)=>{
+    calls++;if(path==="profile")return {emailAddress:"contact@limova.ai"} as T;
     if(init?.method==="POST"){unread=false;return {} as T;}
     return {id:"1a123",threadId:"1a000",labelIds:["INBOX",...unread?["UNREAD"]:[]]} as T;
-  });
+  };
   const deps={env:()=>({...environment,SAV_INTAKE_GMAIL_MARK_READ:"on"}),gmail};
   try{
     await pause("actions_paused");
     expect(await syncHandledIntakeGmailRead(messageId,deps)).toEqual({skipped:"SAV_INTAKE_AGENT_ACTIONS_PAUSED"});
-    expect(gmail).not.toHaveBeenCalled();expect(await db.db.select().from(auditLogs).where(eq(auditLogs.action,"sav_intake_gmail_read_failed"))).toHaveLength(0);
+    expect(calls).toBe(0);expect(await db.db.select().from(auditLogs).where(eq(auditLogs.action,"sav_intake_gmail_read_failed"))).toHaveLength(0);
     await pause("running");
     expect(await syncHandledIntakeGmailRead(messageId,deps)).toEqual({confirmed:true});expect(unread).toBe(false);
   }finally{await db.db.delete(savSyncState).where(eq(savSyncState.key,"sav-agent-pause.v1:intake"));}
