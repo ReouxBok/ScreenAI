@@ -55,7 +55,8 @@
     "server-only": "^0.0.1",
     "sharp": "0.35.5",
     "workflow": "^4.8.5",
-    "zod": "4.6.6"
+    "zod": "4.6.6",
+    "@vercel/speed-insights": "2.0.0"
   },
   "devDependencies": {
     "@electric-sql/pglite": "^0.5.4",
