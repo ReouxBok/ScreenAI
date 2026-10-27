@@ -126,4 +126,6 @@ export type IntakePlan = {
   readCalls: number;
   effects: "not_connected";
 };
-export type EngineLimits = { readCalls: number; timeoutMs: number; contacts: number; tickets: number };
+export type EngineLimits = { readCalls: number; timeoutMs: number; contacts: number; tickets: number;
+  /** Separate semantic allowance for offline comparison; omitted keeps the existing CRM deadline. */
+  modelTimeoutMs?: number };
