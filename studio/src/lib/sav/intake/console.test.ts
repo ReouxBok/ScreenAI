@@ -35,6 +35,7 @@ import { releaseIntakeHumanHold } from "./human-hold-release";
 import { releaseLegacyAiPauses } from "./legacy-pause";
 import { SAV_EXTERNAL_COMPLETION, SAV_EXTERNAL_COMPLETION_REVERTED, getSavExternalCompletion, revertSavExternalCompletionBatch, markSavDossiersHandledExternally, completeSavDossierManually } from "../external-completion";
 import { listIntakeConsole, projectIntakeThread, refreshIntakeConsole } from "./console-store";
+import { classifyInvalidSourceAsOther } from "./invalid-source-classification";
 import { syncHandledIntakeGmailRead, reconcileHandledIntakeGmailRead, SAV_INTAKE_GMAIL_READ } from "./gmail-read";
 import type { GmailRequest } from "./execution-adapters";
 import { readIntakeConsoleDetail } from "./console-detail";
@@ -1349,5 +1350,52 @@ describe("SAV-42 C: a confirmed current acknowledgement is marked read once", ()
     const g = provider();
     expect(await syncHandledIntakeGmailRead(messageId, deps(g.gmail))).toEqual({ skipped: "not_handled" });
     expect(g.state.writes).toBe(0);
+  });
+});
+
+describe("SAV-42 D: an invalid-source dossier stays readable and can be classified Other by the operator", () => {
+  const invalidSource = async () => {
+    vi.stubEnv("SAV_RELEASE_STAGE", "v0"); vi.stubEnv("SAV_PILOT_MODE", "false");
+    await activateSavV0Cutover({receivedAfter:new Date(Date.now()-3600000).toISOString(),mailboxEmail:"support@example.invalid",intakeRecipient:"contact@limova.ai",deploymentSha:"a".repeat(40),activatedBy:"ugo@limova.ai"});
+    // Over the 30-recipient transport limit: the analysis source is refused, never truncated.
+    await db.db.update(savMessages).set({ toEmails: Array.from({ length: 31 }, (_, n) => `r${n}@example.invalid`) }).where(eq(savMessages.id, messageId));
+    const id = (await enqueueSavIntakeMessage(messageId, options.runtime))!;
+    expect(await claimSavIntakeRun(id, options.runtime)).toBeNull();
+    await projectIntakeThread(threadId);
+    return { requestKey: randomUUID(), threadId, messageId, confirmed: true as const };
+  };
+  it("the dossier detail loads and exposes the invalid source instead of failing", async () => {
+    await invalidSource();
+    const detail = await readIntakeConsoleDetail(threadId);
+    expect(detail?.current?.sourceInvalid).toBe(true);
+    expect(detail?.current?.sourceMatches).toBe(false);
+  });
+  it("is classified Other once, audited, idempotent, without model, email or CRM effect", async () => {
+    const input = await invalidSource();
+    expect(await classifyInvalidSourceAsOther(input)).toMatchObject({ marked: 1, alreadyCompleted: 0 });
+    expect(await classifyInvalidSourceAsOther(input)).toMatchObject({ marked: 0, alreadyCompleted: 1 });
+    expect((await listIntakeConsole({ view: "other" })).rows.map(r => r.threadId)).toEqual([threadId]);
+    const markers = await db.db.select().from(auditLogs).where(eq(auditLogs.action, SAV_EXTERNAL_COMPLETION));
+    expect(markers).toHaveLength(1); expect(markers[0].technicalMetadata).toMatchObject({ disposition: "other" });
+    expect(mutationsSent()).toHaveLength(0);
+    expect(await db.db.select().from(savIntakeModelCalls)).toHaveLength(0);
+  });
+  it("refuses a dossier whose source is valid", async () => {
+    vi.stubEnv("SAV_RELEASE_STAGE", "v0"); vi.stubEnv("SAV_PILOT_MODE", "false");
+    await observed();
+    await expect(classifyInvalidSourceAsOther({ requestKey: randomUUID(), threadId, messageId, confirmed: true })).rejects.toThrow("SAV_INTAKE_SOURCE_NOT_INVALID");
+  });
+  it("refuses a stale message once a newer inbound exists", async () => {
+    const input = await invalidSource();
+    await message(threadId, new Date(Date.now() + 1000));
+    await expect(classifyInvalidSourceAsOther(input)).rejects.toThrow();
+    expect(await db.db.select().from(auditLogs).where(eq(auditLogs.action, SAV_EXTERNAL_COMPLETION))).toHaveLength(0);
+  });
+  it("refuses an operator who is not the authorised owner", async () => {
+    const input = await invalidSource();
+    const [other] = await db.db.insert(staffUsers).values({ clerkId: "synthetic-other-admin", email: "other@limova.ai", name: "Other", role: "admin", active: true }).returning();
+    state.user = { id: other.clerkId, primaryEmailAddress: { emailAddress: other.email, verification: { status: "verified" } } };
+    await expect(classifyInvalidSourceAsOther(input)).rejects.toThrow();
+    expect(await db.db.select().from(auditLogs).where(eq(auditLogs.action, SAV_EXTERNAL_COMPLETION))).toHaveLength(0);
   });
 });

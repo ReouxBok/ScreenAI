@@ -496,14 +496,19 @@ export async function readSavIntakeCurrent(threadId: string, config?: IntakeRunt
   const [thread] = await db.select().from(savThreads).where(eq(savThreads.id, threadId));
   const [message] = await db.select().from(savMessages).where(and(eq(savMessages.threadId, threadId), eq(savMessages.direction, "inbound")))
     .orderBy(desc(savEffectiveReceivedAt), desc(savMessages.createdAt), desc(savMessages.id)).limit(1);
-  const snapshot = message?.id === run.messageId ? await db.transaction(async tx => savIntakeSourceSnapshot(tx, message, now)) : null;
+  // Invalid transport addresses refuse the analysis source; the dossier must stay readable.
+  let sourceInvalid = false;
+  const snapshot = message?.id === run.messageId ? await db.transaction(async tx => savIntakeSourceSnapshot(tx, message, now)).catch(error => {
+    if (!invalidIntakeAddressMetadata(error)) throw error;
+    sourceInvalid = true; return null;
+  }) : null;
   const sourceMatches = snapshot !== null && intakeSourceMatches(snapshot, run.sourceHash);
   // Downstream bindings compare against the recorded run hash; expose it when the sources still match.
   const currentSourceHash = snapshot === null ? null : sourceMatches ? run.sourceHash : snapshot.sourceHash;
   const payload=decryptSavPayload<IntakeRuntimePayload>(run.payloadCiphertext);
   const candidateContactIds=await intakeRunCandidateContactIds(run,payload);
   const events = await db.select().from(savIntakeJournal).where(eq(savIntakeJournal.runId, run.id)).orderBy(savIntakeJournal.createdAt, savIntakeJournal.id);
-  return { ...run, sourceMatches, currentSourceHash, candidateContactIds, fresh: Boolean(config && Date.parse(config.expiresAt) > now.getTime() && await intakeRunConfigurationBound(run, config) && run.state === "observed" && run.freshUntil && run.freshUntil > now && !thread?.aiPaused && sourceMatches),
+  return { ...run, sourceMatches, sourceInvalid, currentSourceHash, candidateContactIds, fresh: Boolean(config && Date.parse(config.expiresAt) > now.getTime() && await intakeRunConfigurationBound(run, config) && run.state === "observed" && run.freshUntil && run.freshUntil > now && !thread?.aiPaused && sourceMatches),
     payload,
     humanChoice: run.humanChoiceCiphertext ? decryptSavPayload<unknown>(run.humanChoiceCiphertext) : null,
     journal: events.map(event => ({ id: event.id, kind: event.kind, createdAt: event.createdAt, payload: decryptSavPayload<unknown>(event.payloadCiphertext) })) };

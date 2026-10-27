@@ -156,6 +156,16 @@ export async function completeSavDossierManually(raw: unknown) {
     messages: [{ threadId: input.threadId, messageId: input.messageId }] }, actor.email, actor);
 }
 
+/** Authenticated single-message "Autres" classification. Same owner, boundary,
+ * unsettled-work and active-worker guards as the Terminés entry point. */
+export async function classifySavDossierOtherManually(raw: unknown) {
+  const actor = await executionAdministrator();
+  assertOperator(actor.email);
+  const input = manualSchema.parse(raw);
+  return applyExternalCompletion({ batchId: input.requestKey, receivedBefore: new Date().toISOString(), disposition: "other",
+    messages: [{ threadId: input.threadId, messageId: input.messageId }] }, actor.email, actor);
+}
+
 /** Explicit operations entry point. No cron or model calls it.
  * The caller supplies a frozen preview; we recheck under thread row locks.
  * Only append-only audit rows are written. Snapshots/verdicts/actions are untouched. */
