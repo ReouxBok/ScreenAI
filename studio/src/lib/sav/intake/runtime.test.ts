@@ -280,6 +280,10 @@ it.each(["create", "link", "reopen", "incomplete_evidence"])("persists the %s ou
   } else {
     expect({result, payload:current?.payload}).toMatchObject({ result: { state: "observed" }});
     expect(current?.payload.plan?.decision.disposition).toMatchObject({ kind: "ticket", target: { operation } });
+    // SAV-45: the observed plan carries a digest-only fingerprint of its CRM evidence, no text or address.
+    const fingerprint = current?.payload.crmEvidence;
+    expect(Object.keys(fingerprint?.entries ?? {})).toEqual(expect.arrayContaining(["email-lookup", "contact-101", ...(operation === "create" ? [] : ["ticket-201", "history-201"])]));
+    expect(JSON.stringify(fingerprint)).not.toMatch(/@|Connexion fictive|Panne de connexion/);
   }
   expect(current?.payload.plan?.effects).toBe("not_connected"); expect(current?.payload.plan?.steps.every(step => step.status === "not_dispatched")).toBe(true);
   expect((await readSavIntakeBudget(config)).callCount).toBe(operation === "create" ? 1 : 2);

@@ -78,6 +78,9 @@ export type IntakeRuntimePayload = {
   semantics?:import("./semantic-records").AcceptedIntakeSemantics;
   readRecovery?: import("./read-recovery").IntakeReadRecovery;
   reanalysisParent?: { runId: string; payloadHash: string; sourceHash: string; messageSourceHash: string };
+  /** Digest-only projection of the CRM evidence this analysis saw (SAV-45): names the
+   * fields of a later CRM_CHANGED. Outside the plan fingerprint and configHash. */
+  crmEvidence?: import("./crm-evidence-fingerprint").CrmEvidenceFingerprint;
   provenance?:unknown; traces?: unknown[]; reason?: string;
   /** Fixed when the run is created; analysis, repairs and resumes keep it. Absent: current. */
   pipeline?: SavIntakePipeline;

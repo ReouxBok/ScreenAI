@@ -2,7 +2,9 @@ import "server-only";
 import { intakeAttemptExhaustion, intakeRunAnalysed, SAV_INTAKE_ATTEMPT_POLICY, SAV_INTAKE_BLOCKING_JOURNAL_KINDS } from "./attempt-policy";
 import { and, desc, eq, gt, inArray, sql } from "drizzle-orm";
 import { requireDb } from "@/db";
-import { savIntakeJournal, savIntakeRuns, savMessages } from "@/db/schema";
+import { savIntakeEffectJournal, savIntakeEffects, savIntakeExecutions, savIntakeJournal, savIntakeRuns, savMessages } from "@/db/schema";
+import { publicIntakeCrmDelta } from "./execution-context";
+import { intakeExecutionNextStep, publicExecutionEffects } from "./execution-diagnostic";
 import { decryptSavPayload } from "../crypto";
 import { savAttachmentReasonSchema, savAttachmentStatusSchema } from "../attachment-contract";
 import { intakeContextReasonLabels } from "./console-presentation";
@@ -85,6 +87,29 @@ export function intakeDiagnosticPayload(ciphertext: string) {
   }
 }
 
+/** Execution of the message (SAV-45): state, precise reason, CRM delta, effects and
+ * counted waiting passes. Read only, bounded, no payload value beyond allow-lists. */
+type ReadTx = Parameters<Parameters<ReturnType<typeof requireDb>["transaction"]>[0]>[0];
+const EXECUTION_PAYLOAD_BYTES = 1024 * 1024;
+async function readExecutionDiagnostic(tx: ReadTx, messageId: string) {
+  const [row] = await tx.select({ id: savIntakeExecutions.id, state: savIntakeExecutions.state, runVersion: savIntakeExecutions.runVersion, updatedAt: savIntakeExecutions.updatedAt,
+    payloadCiphertext: sql<string>`case when octet_length(${savIntakeExecutions.payloadCiphertext}) <= ${EXECUTION_PAYLOAD_BYTES} then ${savIntakeExecutions.payloadCiphertext} else '' end` })
+    .from(savIntakeExecutions).where(eq(savIntakeExecutions.messageId, messageId)).limit(1);
+  if (!row) return null;
+  let payload: Record<string, unknown> = {}, readable = true;
+  try { payload = object(decryptSavPayload<unknown>(row.payloadCiphertext)); } catch { readable = false; }
+  const effects = await tx.select({ kind: savIntakeEffects.kind, state: savIntakeEffects.state, reconcileAttempts: savIntakeEffects.reconcileAttempts,
+    nextReconcileAt: savIntakeEffects.nextReconcileAt, confirmedAt: savIntakeEffects.confirmedAt }).from(savIntakeEffects).where(eq(savIntakeEffects.executionId, row.id))
+    .orderBy(savIntakeEffects.createdAt, savIntakeEffects.id).limit(21);
+  const [passes] = await tx.select({ count: sql<number>`count(*)::int`, last: sql<Date | null>`max(${savIntakeEffectJournal.createdAt})` }).from(savIntakeEffectJournal)
+    .where(and(eq(savIntakeEffectJournal.executionId, row.id), eq(savIntakeEffectJournal.kind, "pass_waiting")));
+  const reason = readable ? code(payload.reason) : null, crmDelta = readable ? publicIntakeCrmDelta(payload.crmDelta) : null;
+  return { readable, state: ["pending", "running", "waiting", "uncertain", "confirmed", "refused"].includes(row.state) ? row.state : null, runVersion: row.runVersion, updatedAt: row.updatedAt,
+    reason, crmDelta, originalCrmRecorded: readable ? Boolean(object(payload.originalCrm).entries) : null, effects: publicExecutionEffects(effects), effectsTruncated: effects.length > 20,
+    waitingPasses: count(Number(passes?.count ?? 0)), lastPassAt: passes?.last ?? null,
+    nextStep: readable ? intakeExecutionNextStep({ state: row.state, reason, crmDelta, effectStates: effects.map(e => e.state) }) : "unknown" as const };
+}
+
 /** Latest inbound message only, all attempts counted across versions. No lease,
  * source refresh, model/CRM call, projection update or operational write. */
 const DIAGNOSTIC_BUDGET_PAYLOAD_BYTES = 4 * 1024 * 1024, DIAGNOSTIC_BUDGET_TOTAL_BYTES = 32 * 1024 * 1024, DIAGNOSTIC_BUDGET_ROWS = 200;
@@ -131,7 +156,8 @@ export async function readIntakeRunDiagnostics(threadId: string) {
       policy: SAV_INTAKE_ATTEMPT_POLICY } : null;
     const blocked = current ? (await tx.select({ id: savIntakeJournal.id }).from(savIntakeJournal)
       .where(and(eq(savIntakeJournal.runId, current.id), inArray(savIntakeJournal.kind, [...SAV_INTAKE_BLOCKING_JOURNAL_KINDS]))).limit(1)).length > 0 : false;
-    return { messageId: message.id, totalAttempts: exactTotal,
+    const execution = await readExecutionDiagnostic(tx, message.id);
+    return { messageId: message.id, totalAttempts: exactTotal, execution,
       // null: the bounded reader cannot tell; callers must not read it as "attempts remain".
       attemptsExhausted: blocked || Boolean(known) ? true : undetermined ? null : false,
       attemptBudget: budget,

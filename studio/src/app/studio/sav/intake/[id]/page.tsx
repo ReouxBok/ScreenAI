@@ -11,7 +11,7 @@ import { releaseIntakeHumanHoldAction } from "../actions";
 import {IntakeRecoveryForm} from "../recovery-form";
 import { IntakeCompletionForm } from "../completion-form";
 import { IntakeInvalidSourceForm } from "../invalid-source-form";
-import { intakeStatusLabel, intakeReasonLabel, intakeContextReasonLabels, intakeHandoff } from "@/lib/sav/intake/console-presentation";
+import { intakeStatusLabel, intakeReasonLabel, intakeContextReasonLabels, intakeHandoff, intakeCrmDeltaLabel, intakeNextStepLabel } from "@/lib/sav/intake/console-presentation";
 import styles from "../intake.module.css";
 import { IntakeBackLink } from "../navigation";
 import { CrmRecord, StreamedChoiceForm, StreamedCrmContext } from "../crm-streamed";
@@ -103,6 +103,8 @@ export default async function IntakeDetailPage({ params, searchParams }: { param
           <span>{effectLabels[effect.kind] ?? effect.kind}</span><strong>{stateLabels[effect.state] ?? effect.state}</strong>
           {effect.confirmedAt && <time>{formatParisDateTime(effect.confirmedAt)}</time>}</li>)}</ol> : <p>Aucun effet n’a été engagé.</p>}
         {data.progress?.reason && <p>Attente : {intakeReasonLabel(data.progress.reason)}</p>}
+        {data.progress?.crmDelta && <p>{intakeCrmDeltaLabel(data.progress.crmDelta)}</p>}
+        {data.diagnostics?.execution && data.diagnostics.execution.state !== "confirmed" && <p>Prochaine étape : {intakeNextStepLabel(data.diagnostics.execution.nextStep)}</p>}
         {data.confirmedCurrent && data.progress?.ticketId && <p>Ticket confirmé : <CrmRecord display={display} portal={portal} kind="ticket" id={data.progress.ticketId}/>. {data.projection.status === "followup_pending" ? "Premier suivi encore en attente." : "L’avancement du suivi reste fondé sur ses sources collectées."}</p>}
         <p>Aucun brouillon de réponse de résolution n’a été produit par ce parcours. Les réponses supervisées existantes restent dans la file supervisée.</p>
       </section>
@@ -136,6 +138,9 @@ export default async function IntakeDetailPage({ params, searchParams }: { param
           hasNoteReceipt={Boolean(data.progress?.effects.some(effect=>effect.kind==="note_create"&&effect.ack?.id))} allowReanalysis={false} showReanalysis={false}
           unavailableReason={controls.reason}/>}
         <p>{data.diagnostics?.totalAttempts ?? 0} tentative(s) cumulée(s) pour le dernier message. Les versions remplacées ne sont pas des décisions applicables.</p>
+        {data.diagnostics?.execution && <p>Exécution : {intakeStatusLabel(data.diagnostics.execution.state ?? "waiting")} · {data.diagnostics.execution.waitingPasses ?? 0} passage(s) en attente
+          {data.diagnostics.execution.lastPassAt ? ` · dernier ${formatParisDateTime(data.diagnostics.execution.lastPassAt)}` : ""} · {data.diagnostics.execution.reason ?? "aucun code"}
+          {data.diagnostics.execution.originalCrmRecorded === false ? " · empreinte HubSpot d’origine absente (analyse antérieure)" : ""}.</p>}
         {data.diagnostics?.runs.map(run => <details key={run.runId}><summary>Version {run.version} · {intakeStatusLabel(run.state)} · {run.attempts} tentative(s)</summary>
           <p>{run.diagnostic.readable ? run.diagnostic.reason ? intakeReasonLabel(run.diagnostic.reason) : "Aucun code technique enregistré dans cette version." : "Diagnostic historique illisible ou hors limite ; cause non évaluable."}</p>
           {run.diagnostic.contextReasons.length > 0 && <p>Preuves à compléter : {run.diagnostic.contextReasons.map(reason => intakeContextReasonLabels[reason]).join(", ")}.</p>}

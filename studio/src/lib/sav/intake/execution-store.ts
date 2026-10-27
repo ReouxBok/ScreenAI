@@ -216,7 +216,7 @@ export async function admitIntakeExecution(runId: string, options: ExecutionOpti
         await occupyKeys(tx, id, "intake", keys);
         const payload: ExecutionPayload = {
             runtimeConfigHash: options.runtime.configHash,
-            plan, input: current.payload.input, keys, lastRunId: runId, acceptedFingerprint: plan.fingerprint, local: {
+            plan, input: current.payload.input, keys, lastRunId: runId, acceptedFingerprint: plan.fingerprint, ...(current.payload.crmEvidence ? { originalCrm: current.payload.crmEvidence } : {}), local: {
                 threadIdentityHash: intakeRuntimeHash({
                     mailbox: thread.mailboxId, gmail: thread.gmailThreadId, customer: thread.customerEmail
                 }), messageHash: executionMessageHash(m), sourceHash: run.sourceHash, humanChoice: run.humanChoiceCiphertext, humanRequestedAt: thread.humanRequestedAt?.toISOString() ?? null, status: thread.status, ticketId: thread.hubspotTicketId
@@ -660,6 +660,7 @@ export async function adoptCurrentExecutionVersion(lease: ExecutionLease, option
         lease.payload.plan = next;
         lease.payload.input = current.payload.input;
         delete lease.payload.baseline;
+        if (current.payload.crmEvidence) lease.payload.originalCrm = current.payload.crmEvidence; else delete lease.payload.originalCrm;
     }
     await requireDb().transaction(async (tx) => {
         await admissionLock(tx);

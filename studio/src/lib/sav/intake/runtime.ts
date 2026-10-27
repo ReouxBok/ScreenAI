@@ -14,6 +14,7 @@ import type { EngineInput, MessageAnalysis } from "./engine-types";
 import type { IntakeReadTrace } from "./hubspot-readers";
 import { SAV_INTAKE_MODEL_REVISION } from "./model-readers";
 import { planSavIntake } from "./engine";
+import { intakeCrmEvidenceFingerprint, recordIntakeCrmReads } from "./crm-evidence-fingerprint";
 import { intakeTransientFailure, SAV_INTAKE_DETERMINISTIC_ERRORS } from "./attempt-policy";
 import { createSavIntakeHubspotReaders } from "./hubspot-readers";
 import { createSavIntakeSemanticReaders } from "./model-readers";
@@ -99,7 +100,7 @@ async function analyseSavIntakeRuntimeWithinBudget(runId: string, config: Intake
       return network(url, { ...init, signal, redirect: "error", headers: { ...Object.fromEntries(new Headers(init?.headers)), Authorization: `Bearer ${env().HUBSPOT_ACCESS_TOKEN}` } });
     } });
     const readPending:Promise<unknown>[]=[];
-    const recoverable=recoverableIntakeReads(crm,payload.readRecovery!,{reuse:Boolean(lease.recoveringRead),checkpoint,pending:readPending});
+    const recorded=recordIntakeCrmReads(recoverableIntakeReads(crm,payload.readRecovery!,{reuse:Boolean(lease.recoveringRead),checkpoint,pending:readPending})),recoverable=recorded.readers;
     // The simple reader reads the CRM before its single call; the engine then sees the very same answers.
     const reads = pipeline === "simple" ? memoizeIntakeCrmReaders(recoverable) : recoverable;
     const priorAnalysis=lease.recoveringRead?payload.semantics!.records.find(r=>r.method==="analyseMessage")?.result as MessageAnalysis|undefined:undefined;
@@ -133,6 +134,7 @@ async function analyseSavIntakeRuntimeWithinBudget(runId: string, config: Intake
     });
     payload.plan = await withSavAiBudget(() => planSavIntake(lease.input, { ...reads, ...semantic }, qualifiedOther ? {...config.policy,qualifiedOther:{...(qualifiedOther.family==="authenticated_newsletter"?{family:"authenticated_newsletter" as const}:{}),resource:qualifiedOther.resource,evidenceSource:"private_rule"}} : config.policy, { timeoutMs: 10_000 }, () => new Date()));
     assertSavIntakeObservation(payload.plan);
+    payload.crmEvidence = intakeCrmEvidenceFingerprint(payload.plan, recorded.snapshots());
     // Cancellation may finish after the pure planner's per-call timeout.
     let drainTimer: ReturnType<typeof setTimeout> | undefined;
     try { await Promise.race([Promise.allSettled([...pending,...readPending]), new Promise<never>((_, reject) => { drainTimer = setTimeout(() => reject(Error("SAV_INTAKE_RUNTIME_SETTLEMENT_UNCERTAIN")), 15_000); })]); }

@@ -28,6 +28,8 @@ export type ExecutionPayload = {
         ticketId: string | null;
     };
     baseline?: CrmSnapshot;
+    /** Digest-only CRM evidence of the analysis, when it was recorded (SAV-45). */
+    originalCrm?: import("./crm-evidence-fingerprint").CrmEvidenceFingerprint;
     keys: string[];
     reason?: string;
     crmDelta?: import("./execution-context").CrmDeltaDiagnostic;

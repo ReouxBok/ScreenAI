@@ -198,7 +198,7 @@ async function preflight(lease: ExecutionLease, options: ExecutionOptions, inten
     const snapshot = await options.adapters.readCrm(lease.payload.plan, lease.payload.input, options.runtime, options.signal);
     await expandExecutionScope(lease, options.adapters.scope(snapshot, lease.row.threadId, finalTicket(lease, await getExecutionEffects(lease.row.id))));
     if (!lease.payload.baseline) {
-        assertOriginalExecutionCrm(lease.payload.plan, snapshot);
+        assertOriginalExecutionCrm(lease.payload.plan, snapshot, lease.payload.originalCrm);
         lease.payload.baseline = snapshot;
         await saveExecutionPayload(lease);
     }
