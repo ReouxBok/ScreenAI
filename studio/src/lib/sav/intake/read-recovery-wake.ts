@@ -7,6 +7,7 @@ import { decryptSavPayload,encryptSavPayload } from "../crypto";
 import { savIntakeRuntimeConfig,type IntakeRuntimePayload } from "./runtime-contract";
 import { readRecoveryDue } from "./read-recovery";
 import { readRecoveryMarker,writeReadRecoveryMarker } from "./read-recovery-store";
+import { readSavAgentPause,savAgentPauseCode } from "./agent-pause";
 import { processSavIntakeReadRecoveryWorkflow } from "@/workflows/sav-intake-read-recovery";
 import { savEffectiveReceivedAt } from "@/lib/sav/message-order";
 type Env=Record<string,string|undefined>;
@@ -43,6 +44,8 @@ export async function requestReadRecoveryWake(runId:string,options:Options={}){
  const env=options.env??process.env,now=options.now??new Date();
  if(env.SAV_INTAKE_EVENT_DISPATCH!=="on")return {started:false,reason:"event_dispatch_off"};
  try{
+  // A full pause never spends one of the three bounded workflow starts.
+  const pause=await readSavAgentPause(requireDb());if(pause.level==="fully_paused")return {started:false,reason:savAgentPauseCode(pause)!};
   const state=await readReadRecoveryWake(runId,env,now);if(state.state!=="scheduled")return {started:false,reason:state.state};
   const permitted=await requireDb().transaction(async tx=>{
    await tx.execute(sql`select pg_advisory_xact_lock(hashtext(${`intake-read-wake:${runId}`}))`);

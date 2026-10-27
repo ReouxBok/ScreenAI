@@ -5,6 +5,7 @@ import { auditLogs, savActions, savMailboxes, savMessages, savThreads, savIntake
 import { requestSavGmail } from "../gmail";
 import { getSavExternalCompletion, hasUnsettledSavHumanAction, hasUnsettledSavIntakeWork, listSavExternalCompletionMessageIds } from "../external-completion";
 import { intakeExecutionConfig, readIntakeExecutionAuthority } from "./execution-policy";
+import { assertSavAgentActionsAllowed, readSavAgentPause, savAgentPauseCode } from "./agent-pause";
 import { readIntakeExecutionProgress } from "./executor";
 import { intakeConsoleInstalled } from "./console-capability";
 import { readSavIntakeCurrent } from "./runtime-store";
@@ -45,7 +46,12 @@ export async function syncHandledIntakeGmailRead(messageId: string, deps: { env?
     const current = env(), config = intakeExecutionConfig(current);
     if (!config || current.SAV_INTAKE_GMAIL_MARK_READ !== "on") throw Error("SAV_INTAKE_GMAIL_READ_DISABLED");
     await readIntakeExecutionAuthority(config);
+    // A Gmail write like any other effect: also rechecked just before the modify.
+    await assertSavAgentActionsAllowed(requireDb());
   };
+  // Paused: no Gmail call and no failure marker; the receipt is retried after resume.
+  const paused = savAgentPauseCode(await readSavAgentPause(requireDb()));
+  if (paused) return { skipped: paused };
   await authority();
   const db = requireDb();
   if (!await intakeConsoleInstalled(db)) return { skipped: "schema_absent" };
