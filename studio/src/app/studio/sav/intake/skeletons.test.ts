@@ -1,7 +1,7 @@
 import { createElement, type ComponentType } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import { expect, it } from "vitest";
-import StudioLoading from "../../loading";
+import StudioLoading from "../../(home)/loading";
 import SavLoading from "../loading";
 import SavKnowledgeLoading from "../connaissances/loading";
 import SavEvaluationLoading from "../evaluation/loading";

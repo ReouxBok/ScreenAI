@@ -443,6 +443,14 @@ test("un membre crée, finalise et transforme son tutoriel sans accéder à celu
 
     const forbiddenResponse = await otherMemberPage.goto(`/studio/entrainements/${trainingId}`);
     expect(forbiddenResponse?.status()).toBe(404);
+    // Inspect the complete document too: a streamed shell must never expose
+    // another member's private training, goal or recording token.
+    const forbiddenHtml = await forbiddenResponse!.text();
+    expect(forbiddenHtml).not.toContain(title);
+    expect(forbiddenHtml).not.toContain("Vérifier tout le parcours de création d’un tutoriel membre.");
+    expect(forbiddenHtml).not.toContain(token!);
+    await expect(otherMemberPage.getByRole("heading", { name: "404", exact: true })).toBeVisible();
+    await expect(otherMemberPage.getByRole("button", { name: "Transformer en parcours" })).toHaveCount(0);
     await otherMemberPage.goto("/studio/entrainements");
     await expect(otherMemberPage.getByText(title, { exact: true })).toHaveCount(0);
 
