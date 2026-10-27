@@ -6,6 +6,7 @@ import { readSavExternalCompletion, listSavExternalCompletionMessageIds } from "
 import "server-only";
 import { reconcileIntakeZeroThoughtUsage } from "./model-usage";
 import { SAV_INTAKE_OPERATIONAL_PROFILE, intakeBudgetUsage } from "./budget-profile";
+import { effectiveIntakeBudgetPins } from "./budget-override";
 import { intakeLaunchMatches } from "./launch-boundary";
 import { intakeConsoleInstalled } from "./console-capability";
 import { intakeRunConfigurationBound, intakeHumanRefused, intakeHasHumanDecision, intakeRunCandidateContactIds } from "./human-binding";
@@ -246,7 +247,7 @@ export async function claimSavIntakeRun(id: string, config: IntakeRuntimeConfig,
       await tx.execute(sql`select pg_advisory_xact_lock(hashtext('sav-intake-runtime-model-budget-v1'))`);
       const rows=await tx.select(budgetColumns).from(savIntakeModelCalls);
       budgetRowsValid(rows);
-      const budgetNow=new Date(),usage=intakeBudgetUsage(rows,config,budgetNow);
+      const budgetNow=new Date(),usage=intakeBudgetUsage(rows,await effectiveIntakeBudgetPins(tx,config),budgetNow);
       const messageKey=intakeRuntimeHash(run.messageId);
       const unknown=rows.some(row=>row.messageKey===messageKey&&row.state!=="settled");
       const quote=savDerivedCostQuote(config.model,8192,budgetNow);
@@ -385,7 +386,7 @@ export async function assertSavIntakeCallPlan(messageId: string, config: IntakeR
     // The same per-version bound as the reservation, for the current version of this message.
     const [current] = await tx.select({ id: savIntakeRuns.id }).from(savIntakeRuns).where(and(eq(savIntakeRuns.messageId, messageId), eq(savIntakeRuns.isCurrent, true))).limit(1);
     const version = current ? rows.filter(row => row.runId === current.id).length : 0;
-    const usage = intakeBudgetUsage(rows, config, now), quote = savDerivedCostQuote(config.model, 8192, now);
+    const usage = intakeBudgetUsage(rows, await effectiveIntakeBudgetPins(tx, config), now), quote = savDerivedCostQuote(config.model, 8192, now);
     if (own.length + needed > SAV_INTAKE_CALL_POLICY.perMessage || version + needed > SAV_INTAKE_CALL_POLICY.perVersion || needed > usage.remainingCalls || needed * quote.reservedNanoUsd > usage.remainingNanoUsd
       || needed * quote.reservedNanoUsd > usage.remainingRollingNanoUsd) throw Error("SAV_INTAKE_RUNTIME_BUDGET_EXHAUSTED");
   });
@@ -401,7 +402,7 @@ async function reserveIntakeCall(tx: Tx, run: Run, config: IntakeRuntimeConfig, 
     const budgetNow=config.budgetProfile===SAV_INTAKE_OPERATIONAL_PROFILE ? new Date() : now;
     if(!Number.isFinite(now.getTime())||now>budgetNow)throw Error("SAV_INTAKE_RUNTIME_LEDGER_CLOCK_REJECTED");
     const price = savDerivedCostQuote(config.model, 8192, budgetNow);
-    const usage = intakeBudgetUsage(rows,config,budgetNow);
+    const usage = intakeBudgetUsage(rows,await effectiveIntakeBudgetPins(tx,config),budgetNow);
     if (usage.remainingCalls < 1 || rows.filter(row => row.messageKey === messageKey).length >= SAV_INTAKE_CALL_POLICY.perMessage
       || rows.filter(row => row.runId === run.id).length >= SAV_INTAKE_CALL_POLICY.perVersion
       || price.reservedNanoUsd > usage.remainingNanoUsd || price.reservedNanoUsd > usage.remainingRollingNanoUsd) throw Error("SAV_INTAKE_RUNTIME_BUDGET_EXHAUSTED");
@@ -514,9 +515,9 @@ export async function checkpointSavIntakeRun(lease: IntakeLease, payload: Intake
   if (!rows.length) return fail();
 }
 export async function readSavIntakeBudget(config: IntakeRuntimeConfig, now = new Date()) {
-  const rows = await requireDb().select(budgetColumns).from(savIntakeModelCalls);
+  const db = requireDb(), rows = await db.select(budgetColumns).from(savIntakeModelCalls);
   budgetRowsValid(rows);
-  return intakeBudgetUsage(rows,config,now);
+  return intakeBudgetUsage(rows,await effectiveIntakeBudgetPins(db,config),now);
 }
 
 /** Transient retries scheduled for this MESSAGE across all its versions: the dispatch ordinal

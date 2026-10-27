@@ -657,6 +657,17 @@ it("new approved V0 message after intake keeps a separate baseline and can quali
   await db.db.update(savMessages).set({analysisStatus:"intake_pending"}).where(eq(savMessages.id,m.id));
   expect(await readSavCaseLearningQualification(threadId)).toHaveProperty("allowed",false);
 });
+it("administrator preview accepts the approved operational 5 USD pins and still refuses one nanoUSD more",async()=>{
+  const runtime={...JSON.parse(environment.SAV_INTAKE_RUNTIME_CONFIG!),budgetProfile:"operational_utc_v1",maxRollingNanoUsd:90000000000,maxCalls:300,maxNanoUsd:5000000000,expiresAt:new Date(Date.now()+29*86400000).toISOString()};
+  for(const [key,value] of Object.entries(environment))if(value!==undefined)vi.stubEnv(key,value);
+  vi.stubEnv("SAV_INTAKE_RUNTIME_MODE","off");vi.stubEnv("SAV_INTAKE_RUNTIME_CONFIG",JSON.stringify(runtime));
+  const policy={...options.policy,budgetProfile:"operational_utc_v1" as const,expiresAt:runtime.expiresAt},commandId=randomUUID();
+  const preview=await previewIntakeLaunch(commandId,{runtime,policy});
+  expect(preview.input.runtime).toMatchObject({maxNanoUsd:5000000000,maxRollingNanoUsd:90000000000,maxCalls:300});
+  expect(await readIntakeLaunch(mailboxId)).toBeNull();
+  const over={...runtime,maxNanoUsd:5000000001};vi.stubEnv("SAV_INTAKE_RUNTIME_CONFIG",JSON.stringify(over));
+  await expect(previewIntakeLaunch(randomUUID(),{runtime:over,policy})).rejects.toThrow();
+});
 it("administrator preview is inert, immutable and commit is exact/idempotent while OFF",async()=>{
   for(const [key,value] of Object.entries(environment))if(value!==undefined)vi.stubEnv(key,value);
   vi.stubEnv("SAV_INTAKE_RUNTIME_MODE","off");

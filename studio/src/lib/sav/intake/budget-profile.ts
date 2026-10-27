@@ -1,6 +1,14 @@
 import { savDerivedCostQuote } from "../derived-budget";
 export const SAV_INTAKE_OPERATIONAL_PROFILE = "operational_utc_v1" as const;
 export const SAV_INTAKE_DAY_MS = 86_400_000;
+/** Hard ceilings accepted by the runtime pins, per profile. Raising a ceiling never resets
+ * the shared ledger: spent and uncertain reservations keep counting against the new cap. */
+export const SAV_INTAKE_BUDGET_BOUNDS = {
+  operational: { maxNanoUsd: 5_000_000_000, maxRollingNanoUsd: 90_000_000_000, maxCalls: 300 },
+  qualification: { maxNanoUsd: 3_000_000_000, maxCalls: 30 },
+  /** Ceiling of the daily cap the budget owner may set from the Studio, without a deployment. */
+  studio: { maxNanoUsd: 20_000_000_000 },
+} as const;
 export type IntakeBudgetPins = { budgetProfile?: typeof SAV_INTAKE_OPERATIONAL_PROFILE; maxNanoUsd: number; maxCalls: number; maxRollingNanoUsd?: number };
 export type IntakeBudgetRow = { state: string; chargedNanoUsd: number; createdAt: Date };
 /** All ledger rows participate, regardless of configuration, policy or mailbox.
