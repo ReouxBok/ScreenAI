@@ -1522,3 +1522,28 @@ it("SAV-45 B: a newer analysis run reopens a dossier left to a person, without r
     expect(journal.filter(j => j.kind === "admitted")).toHaveLength(1);
     expect(providerWrites()).toHaveLength(0);
 });
+
+// ---- SAV-45 C: a confirmed execution whose follow-up is not bound says why.
+import { ensureIntakeObservations } from "./observation-binding";
+it("SAV-45 C: the follow-up of confirmed effects is bound, or held by a named condition, without any new CRM write", async () => {
+    await f.db.insert(savSyncState).values({ key: "sav-intake-console-schema-v1", status: "installed" }).onConflictDoUpdate({ target: savSyncState.key, set: { status: "installed" } });
+    const row = await admission();
+    expect(await executeIntakePass(row.id, options)).toMatchObject({ state: "confirmed" });
+    const writesBefore = p.calls.filter(c => ["PUT", "PATCH"].includes(c.method) || c.method === "POST" && !/\/(?:search|batch\/read)$/.test(c.path)).length;
+    // A newer customer message arrives: the follow-up of the older execution is held, with its reason.
+    await storedMessage(threadId, new Date(Date.now() + 1000));
+    expect(await ensureIntakeObservations()).toMatchObject({ created: 0 });
+    expect((await readIntakeRunDiagnostics(threadId))?.execution).toBeNull();
+    const [execution] = await f.db.select().from(savIntakeExecutions).where(eq(savIntakeExecutions.id, row.id));
+    const { intakeObservationBlocker } = await import("./observation-binding");
+    expect((await f.db.transaction(tx => intakeObservationBlocker(tx, execution.id))).blocker).toBe("newer_inbound");
+    expect(p.calls.filter(c => ["PUT", "PATCH"].includes(c.method) || c.method === "POST" && !/\/(?:search|batch\/read)$/.test(c.path))).toHaveLength(writesBefore);
+});
+it("SAV-45 C: with nothing holding it, the same scan binds the follow-up and the diagnostic shows it", async () => {
+    await f.db.insert(savSyncState).values({ key: "sav-intake-console-schema-v1", status: "installed" }).onConflictDoUpdate({ target: savSyncState.key, set: { status: "installed" } });
+    const row = await admission();
+    await executeIntakePass(row.id, options);
+    expect((await readIntakeRunDiagnostics(threadId))?.execution?.followup).toMatchObject({ bound: false, blocker: "scan_pending" });
+    expect(await ensureIntakeObservations()).toMatchObject({ created: 1 });
+    expect((await readIntakeRunDiagnostics(threadId))?.execution?.followup).toMatchObject({ bound: true, observationState: "pending_first_sync" });
+});

@@ -81,6 +81,8 @@ export type IntakeRuntimePayload = {
   /** Digest-only projection of the CRM evidence this analysis saw (SAV-45): names the
    * fields of a later CRM_CHANGED. Outside the plan fingerprint and configHash. */
   crmEvidence?: import("./crm-evidence-fingerprint").CrmEvidenceFingerprint;
+  /** SAV-45: the sub-limit behind SAV_INTAKE_RUNTIME_BUDGET_EXHAUSTED, when one stopped this run. */
+  budgetLimit?: import("./budget-limit").IntakeBudgetLimit;
   provenance?:unknown; traces?: unknown[]; reason?: string;
   /** Fixed when the run is created; analysis, repairs and resumes keep it. Absent: current. */
   pipeline?: SavIntakePipeline;

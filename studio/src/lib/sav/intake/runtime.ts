@@ -15,6 +15,7 @@ import type { IntakeReadTrace } from "./hubspot-readers";
 import { SAV_INTAKE_MODEL_REVISION } from "./model-readers";
 import { planSavIntake } from "./engine";
 import { intakeCrmEvidenceFingerprint, recordIntakeCrmReads } from "./crm-evidence-fingerprint";
+import type { IntakeBudgetLimit } from "./budget-limit";
 import { intakeTransientFailure, SAV_INTAKE_DETERMINISTIC_ERRORS } from "./attempt-policy";
 import { createSavIntakeHubspotReaders } from "./hubspot-readers";
 import { createSavIntakeSemanticReaders } from "./model-readers";
@@ -48,7 +49,10 @@ async function analyseSavIntakeRuntimeWithinBudget(runId: string, config: Intake
   const repairMalformedOutput = lease.run.attempts > 1 && ["SAV_INTAKE_MODEL_OUTPUT_REJECTED", "SAV_INTAKE_RUNTIME_CALL_ALREADY_CONSUMED"].includes(previous.reason ?? "");
   const controller = new AbortController(), timer = setTimeout(() => controller.abort(), 45_000);
   const traces: unknown[] = [];
-  let semanticFailureReason: string | undefined;
+  let semanticFailureReason: string | undefined, readerBudgetLimit: IntakeBudgetLimit | undefined;
+  // The sub-limit is kept only beside the very code it explains.
+  const budgetLimit = () => { const limit = dispatcher?.budgetLimit ?? readerBudgetLimit;
+    if (payload.reason === "SAV_INTAKE_RUNTIME_BUDGET_EXHAUSTED" && limit) payload.budgetLimit = limit; else delete payload.budgetLimit; };
   let readFailure: IntakeReadTrace | undefined;
   let dispatcher: ReturnType<typeof createIntakeModelDispatcher> | undefined;
   const payload: IntakeRuntimePayload = {configuration: { configHash: config.configHash, resourcesHash: config.resourcesHash, policyHash: config.policyHash, codeRevision: config.codeRevision, model: config.model }, semantics:{revision:SAV_INTAKE_SEMANTIC_RECORD_REVISION,validatorRevision:SAV_INTAKE_MODEL_REVISION,records:[]},provenance:[...lease.provenance], revision: SAV_INTAKE_RUNTIME_REVISION, input: lease.input, traces, effects: "not_connected" };
@@ -115,7 +119,7 @@ async function analyseSavIntakeRuntimeWithinBudget(runId: string, config: Intake
         attachments.state.read = { ...attachments.state.read, observations, state: "complete", completedAt: new Date().toISOString() };
         payload.attachments = attachments.state; checkpoint();
       } } } : {}),
-      onTrace: trace => { semanticFailureReason = trace.errorCode ?? undefined; traces.push(trace); checkpoint(); },
+      onTrace: trace => { semanticFailureReason = trace.errorCode ?? undefined; if (trace.budgetLimit) readerBudgetLimit = trace.budgetLimit; traces.push(trace); checkpoint(); },
       onJudgement: judgement => { traces.push({ phase: "simple_judgement", ...judgement }); checkpoint(); } })
       : createSavIntakeSemanticReaders({ planCalls: dispatcher.plan, repairMalformedOutput,
       repairIssues:publicIntakeSchemaIssues((previous.traces?.findLast(t=>(t as {validationFailure?:unknown})?.validationFailure) as {validationFailure?:{issues?:unknown}}|undefined)?.validationFailure?.issues),
@@ -125,6 +129,7 @@ async function analyseSavIntakeRuntimeWithinBudget(runId: string, config: Intake
       checkpoint();
     } } } : {}), model: config.model, call, provenance: lease.provenance, onTrace: trace => {
       semanticFailureReason = trace.errorCode ?? undefined;
+      if (trace.budgetLimit) readerBudgetLimit = trace.budgetLimit;
       traces.push(trace); checkpoint();
     } });
     const reuse=lease.recoveringRead?reuseAcceptedIntakeSemantics(semanticReader,payload.semantics!,method=>{traces.push({method,phase:"accepted_semantics",accepted:true,cached:true});checkpoint();}):semanticReader;
@@ -143,6 +148,7 @@ async function analyseSavIntakeRuntimeWithinBudget(runId: string, config: Intake
     if (dispatcher.uncertain) throw Error("SAV_INTAKE_RUNTIME_USAGE_UNCERTAIN");
     await live();
     payload.reason = readFailure?.reason ?? dispatcher.failureReason ?? semanticFailureReason;
+    budgetLimit();
     finishIntakeAttachmentRead(payload.attachments,attachmentFailureReason(payload.reason,dispatcher.uncertain));
     const state = payload.plan.decision.disposition.kind === "collect_context" && payload.plan.progress.kind !== "human_choice" ? "waiting" : "observed";
     if (state==="waiting" && readFailure && intakeReadRetryable(readFailure.reason) && payload.semantics?.records.some(r=>r.method==="analyseMessage")) {
@@ -165,6 +171,7 @@ async function analyseSavIntakeRuntimeWithinBudget(runId: string, config: Intake
     // An expired routing authority must never leave a publishable Other plan.
     if(payload.other&&!intakeOtherQualificationFresh(payload.other,env().SAV_INTAKE_OTHER_RULES_JSON)){delete payload.plan;delete payload.other;}
     payload.reason = error instanceof Error && /^SAV_[A-Z0-9_]+$/.test(error.message) ? error.message : "SAV_INTAKE_RUNTIME_INTERRUPTED";
+    budgetLimit();
     if(lease.recoveringRead)payload.readRecovery!.state="invalidated";else delete payload.readRecovery;
     finishIntakeAttachmentRead(payload.attachments,attachmentFailureReason(payload.reason,Boolean(dispatcher?.uncertain)));
     await failSavIntakeRun(lease, payload, Boolean(dispatcher?.uncertain) || payload.reason === "SAV_INTAKE_RUNTIME_SETTLEMENT_UNCERTAIN",

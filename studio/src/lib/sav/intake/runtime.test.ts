@@ -14,6 +14,7 @@ import { encryptSavPayload, decryptSavPayload } from "../crypto";
 import { intakeRuntimeHash, savIntakeRuntimeConfig, SAV_INTAKE_RUNTIME_REVISION, type IntakeRuntimeConfig, type IntakeRuntimePayload } from "./runtime-contract";
 import { assertSavIntakeCallPlan, assertSavIntakeLease, catchupSavIntake, claimSavIntakeRun, enqueueSavIntakeMessage, failSavIntakeRun, pendingSavIntakeRuns, readSavIntakeBudget, readSavIntakeCurrent, reconcileConfinedIntakeUsage, reserveSavIntakeCall, saveSavIntakeResult, settleSavIntakeCall } from "./runtime-store";
 import { analyseSavIntakeRuntime, enqueueConfiguredSavIntake, reconcileSavIntakeRuntime } from "./runtime";
+import { readIntakeRunDiagnostics } from "./run-diagnostics";
 import { SAV_INTAKE_CALL_POLICY } from "./attempt-policy";
 
 let f: Awaited<ReturnType<typeof createSavTestDb>>, mailboxId: string, threadId: string, messageId: string;
@@ -165,14 +166,14 @@ it("retains unknown usage, refuses refunds/replay and settles a late response wi
 it("per-version and lifetime per-message bounds survive config changes and run deletion", async () => {
   const l = await lease();
   for (let n = 0; n < SAV_INTAKE_CALL_POLICY.perVersion; n++) { const r = await reserveSavIntakeCall(l, config, String(n % 10).repeat(63) + "a"); await settleSavIntakeCall(r.id, usage, { json: { syntheticPrivate: true }, metadata: usage }); }
-  // The version bound stops this run.
-  await expect(reserveSavIntakeCall(l, config, "f".repeat(64))).rejects.toThrow("BUDGET_EXHAUSTED");
+  // The version bound stops this run; the error names it (SAV-45 C), same code as before.
+  await expect(reserveSavIntakeCall(l, config, "f".repeat(64))).rejects.toMatchObject({ message: "SAV_INTAKE_RUNTIME_BUDGET_EXHAUSTED", limit: "per_version" });
   await f.db.delete(savIntakeRuns).where(eq(savIntakeRuns.id, l.run.id));
   expect((await readSavIntakeBudget(config)).callCount).toBe(SAV_INTAKE_CALL_POLICY.perVersion); expect((await f.db.select().from(savIntakeModelCalls)).every(r => r.runId === null && r.resultCiphertext === null)).toBe(true);
   // A new version only gets what remains of the lifetime bound, never a reset.
   const id = await enqueueSavIntakeMessage(messageId, config), next = (await claimSavIntakeRun(id!, config))!;
   for (let n = 0; n < SAV_INTAKE_CALL_POLICY.perMessage - SAV_INTAKE_CALL_POLICY.perVersion; n++) { const r = await reserveSavIntakeCall(next, config, String(n).repeat(63) + "e"); await settleSavIntakeCall(r.id, usage, { json: { syntheticPrivate: true }, metadata: usage }); }
-  await expect(reserveSavIntakeCall(next, config, "e".repeat(64))).rejects.toThrow("BUDGET_EXHAUSTED");
+  await expect(reserveSavIntakeCall(next, config, "e".repeat(64))).rejects.toMatchObject({ message: "SAV_INTAKE_RUNTIME_BUDGET_EXHAUSTED", limit: "per_message" });
 });
 it("monetary exhaustion is explicit technical waiting and never uses other ledgers", async () => {
   const constrained = { ...config, maxNanoUsd: 1 }, id = await enqueueSavIntakeMessage(messageId, constrained);
@@ -180,6 +181,10 @@ it("monetary exhaustion is explicit technical waiting and never uses other ledge
   const response = await analyseSavIntakeRuntime(id!, constrained, { env: () => environment, network });
   expect(response.state).toBe("waiting"); expect(network).not.toHaveBeenCalled();
   expect((await readSavIntakeCurrent(threadId, constrained))?.payload.reason).toBe("SAV_INTAKE_RUNTIME_BUDGET_EXHAUSTED"); expect(await f.db.select().from(auditLogs)).toHaveLength(0);
+  // SAV-45 C: the run records which sub-limit stopped it, and the limit is not raised.
+  expect((await readSavIntakeCurrent(threadId, constrained))?.payload.budgetLimit).toBe(constrained.budgetProfile ? "daily_nano_usd" : "campaign_nano_usd");
+  expect((await readIntakeRunDiagnostics(threadId))?.runs[0].diagnostic).toMatchObject({ reason: "SAV_INTAKE_RUNTIME_BUDGET_EXHAUSTED", budgetLimit: constrained.budgetProfile ? "daily_nano_usd" : "campaign_nano_usd" });
+  expect((await readSavIntakeBudget(constrained)).maxNanoUsd).toBe(1);
 });
 it("persists catalogue failures as a technical reason before any model reservation or network", async () => {
   const m = await message({ receivedAt: new Date(Date.now() + 1), body: "private".repeat(300) });

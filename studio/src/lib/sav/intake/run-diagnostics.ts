@@ -2,7 +2,10 @@ import "server-only";
 import { intakeAttemptExhaustion, intakeRunAnalysed, SAV_INTAKE_ATTEMPT_POLICY, SAV_INTAKE_BLOCKING_JOURNAL_KINDS } from "./attempt-policy";
 import { and, desc, eq, gt, inArray, sql } from "drizzle-orm";
 import { requireDb } from "@/db";
-import { savIntakeEffectJournal, savIntakeEffects, savIntakeExecutions, savIntakeJournal, savIntakeRuns, savMessages } from "@/db/schema";
+import { savIntakeEffectJournal, savIntakeEffects, savIntakeExecutions, savIntakeJournal, savIntakeModelCalls, savIntakeObservationBindings, savIntakeRuns, savMessages, savResolutionObservations } from "@/db/schema";
+import { publicIntakeBudgetLimit } from "./budget-limit";
+import { intakeRuntimeHash } from "./runtime-contract";
+import { intakeObservationBlocker } from "./observation-binding";
 import { publicIntakeCrmDelta } from "./execution-context";
 import { intakeExecutionNextStep, publicCrmRecheck, publicExecutionEffects } from "./execution-diagnostic";
 import { decryptSavPayload } from "../crypto";
@@ -63,18 +66,22 @@ export function intakeDiagnosticPayload(ciphertext: string) {
         errorCode: code(t.errorCode), reason: code(t.reason), validationReason: code(validation.reason),
         schemaIssues: publicIntakeSchemaIssues(validation.issues),
         validationStage: outputStages.has(String(validation.stage)) ? String(validation.stage) : null,
-        normalization: outputNormalization(t.normalization),
+        normalization: outputNormalization(t.normalization), budgetLimit: publicIntakeBudgetLimit(t.budgetLimit),
         transport:["local_guard","transport","http","response","deadline"].includes(String(transport.origin))?{origin:String(transport.origin),code:code(transport.code),attempts:count(transport.attempts),status:count(transport.status),durationMs:count(transport.durationMs)}:null,
         contextLimit: ["catalogue", "data", "wire"].includes(String(limit.stage)) ? { stage: String(limit.stage), bytes: count(limit.bytes), limitBytes: count(limit.limitBytes), breakdown: contextBreakdown(limit.breakdown) } : null };
     });
     const recovery=object(payload.readRecovery),records=object(payload.semantics).records;
     const analysis=object(Array.isArray(records)?object(records.find(r=>object(r).method==="analyseMessage")).result:null);
-    return { readable: true, reason: code(payload.reason),
+    const contextReasons = disposition.kind === "collect_context" && Array.isArray(disposition.reasons)
+      ? disposition.reasons.filter((r): r is string => typeof r === "string" && Object.hasOwn(intakeContextReasonLabels, r)).slice(0, 15) : [];
+    // A wait without technical code still has a cause: the engine's missing proofs, a human choice,
+    // or an explicitly unknown one. Never an invented code (SAV-45 C).
+    const waitingCause = code(payload.reason) ? null : contextReasons.length ? "context_required" : object(plan.progress).kind === "human_choice" ? "human_choice" : plan.decision ? "plan_without_code" : "unknown";
+    return { readable: true, reason: code(payload.reason), waitingCause, budgetLimit: publicIntakeBudgetLimit(payload.budgetLimit),
       qualification:{nature:["request","newsletter","information","indeterminate"].includes(String(analysis.nature))?String(analysis.nature):null,requestCount:Array.isArray(analysis.requests)?count(analysis.requests.length):null},
       readRecovery:Object.keys(recovery).length?{state:["scheduled","claimed","exhausted","invalidated","complete"].includes(String(recovery.state))?String(recovery.state):null,technicalAttempts:count(recovery.attempts),operation:operations.has(String(recovery.operation))?String(recovery.operation):null,code:code(recovery.code),expired:typeof recovery.expiresAt==="string"&&Number.isFinite(Date.parse(recovery.expiresAt))?Date.parse(recovery.expiresAt)<=Date.now():null}:null,
       codeRevision: typeof configuration.codeRevision === "string" && /^[a-f0-9]{40}$/.test(configuration.codeRevision) ? configuration.codeRevision : null,
-      contextReasons: disposition.kind === "collect_context" && Array.isArray(disposition.reasons)
-        ? disposition.reasons.filter((r): r is string => typeof r === "string" && Object.hasOwn(intakeContextReasonLabels, r)).slice(0, 15) : [],
+      contextReasons,
       input: { contentComplete: typeof message.contentComplete === "boolean" ? message.contentComplete : null,
         currentTextLength: typeof message.currentText === "string" ? message.currentText.length : null },
       attachments: { textComplete: typeof attachments.textComplete === "boolean" ? attachments.textComplete : null,
@@ -83,7 +90,7 @@ export function intakeDiagnosticPayload(ciphertext: string) {
           const o = object(raw); return { status: code(o.status), reason: code(o.reason) };
         }) }, traces, tracesTruncated: Array.isArray(payload.traces) && payload.traces.length > 40 };
   } catch {
-    return { readable: false, reason: null, codeRevision: null, contextReasons: [], input: null, attachments: null, traces: [], tracesTruncated: false };
+    return { readable: false, reason: null, waitingCause: "unknown" as const, budgetLimit: null, codeRevision: null, contextReasons: [], input: null, attachments: null, traces: [], tracesTruncated: false };
   }
 }
 
@@ -103,11 +110,34 @@ async function readExecutionDiagnostic(tx: ReadTx, messageId: string) {
     .orderBy(savIntakeEffects.createdAt, savIntakeEffects.id).limit(21);
   const [passes] = await tx.select({ count: sql<number>`count(*)::int`, last: sql<Date | null>`max(${savIntakeEffectJournal.createdAt})` }).from(savIntakeEffectJournal)
     .where(and(eq(savIntakeEffectJournal.executionId, row.id), eq(savIntakeEffectJournal.kind, "pass_waiting")));
+  // Follow-up of a confirmed execution: bound, or the named condition that holds it (SAV-45 C).
+  const [binding] = row.state === "confirmed" ? await tx.select({ observationId: savIntakeObservationBindings.observationId }).from(savIntakeObservationBindings).where(eq(savIntakeObservationBindings.executionId, row.id)).limit(1) : [];
+  const [observation] = binding ? await tx.select({ state: savResolutionObservations.state, sourceErrors: savResolutionObservations.sourceErrors }).from(savResolutionObservations).where(eq(savResolutionObservations.id, binding.observationId)) : [];
+  const followup = row.state !== "confirmed" ? null : binding ? { bound: true, blocker: null, observationState: observation?.state ?? null, sourceErrors: Array.isArray(observation?.sourceErrors) ? observation.sourceErrors.length : null }
+    : { bound: false, blocker: readable ? (await intakeObservationBlocker(tx, row.id).catch(() => ({ blocker: "unknown" as const }))).blocker ?? "scan_pending" : "unknown", observationState: null, sourceErrors: null };
   const reason = readable ? code(payload.reason) : null, crmDelta = readable ? publicIntakeCrmDelta(payload.crmDelta) : null, crmRecheck = readable ? publicCrmRecheck(payload.crmRecheck) : null;
   return { readable, state: ["pending", "running", "waiting", "uncertain", "confirmed", "refused"].includes(row.state) ? row.state : null, runVersion: row.runVersion, updatedAt: row.updatedAt,
-    reason, crmDelta, crmRecheck, originalCrmRecorded: readable ? Boolean(object(payload.originalCrm).entries) : null, effects: publicExecutionEffects(effects), effectsTruncated: effects.length > 20,
+    reason, crmDelta, crmRecheck, followup, originalCrmRecorded: readable ? Boolean(object(payload.originalCrm).entries) : null, effects: publicExecutionEffects(effects), effectsTruncated: effects.length > 20,
     waitingPasses: count(Number(passes?.count ?? 0)), lastPassAt: passes?.last ?? null,
     nextStep: readable ? intakeExecutionNextStep({ state: row.state, reason, crmDelta, crmRecheck, effectStates: effects.map(e => e.state) }) : "unknown" as const };
+}
+
+/** Model calls of the message in the ledger, read only: what is known of each usage. An
+ * uncertain call stays uncertain here; it is never settled, retried or zeroed (SAV-45 C). */
+async function readModelCallDiagnostic(tx: ReadTx, messageId: string) {
+  const rows = await tx.select({ state: savIntakeModelCalls.state, createdAt: savIntakeModelCalls.createdAt, settledAt: savIntakeModelCalls.settledAt,
+    reservedNanoUsd: savIntakeModelCalls.reservedNanoUsd, chargedNanoUsd: savIntakeModelCalls.chargedNanoUsd,
+    payloadCiphertext: sql<string>`case when octet_length(${savIntakeModelCalls.payloadCiphertext}) <= 65536 then ${savIntakeModelCalls.payloadCiphertext} else '' end` })
+    .from(savIntakeModelCalls).where(eq(savIntakeModelCalls.messageKey, intakeRuntimeHash(messageId))).orderBy(desc(savIntakeModelCalls.createdAt), desc(savIntakeModelCalls.id)).limit(21);
+  return rows.map(row => {
+    let p: Record<string, unknown> = {};
+    try { p = object(decryptSavPayload<unknown>(row.payloadCiphertext)); } catch { /* unreadable stays unknown */ }
+    const metadata = object(p.metadata), counters = ["inputTokens", "outputTokens", "thoughtTokens", "totalTokens"].filter(k => Number.isSafeInteger(metadata[k])).length;
+    const usage = !Object.keys(p).length ? "unknown" : p.usageReconciliation === "provider_http_error_unbilled.v1" ? "provider_http_unbilled"
+      : row.state === "settled" ? "complete" : row.state === "dispatched" ? "in_flight_or_lost" : counters === 0 ? "no_usage_received" : "counters_incomplete";
+    return { state: ["dispatched", "uncertain", "settled"].includes(row.state) ? row.state : null, usage, providerStatus: count(p.providerStatus),
+      createdAt: row.createdAt, settledAt: row.settledAt, reservedNanoUsd: count(row.reservedNanoUsd), chargedNanoUsd: count(row.chargedNanoUsd) };
+  });
 }
 
 /** Latest inbound message only, all attempts counted across versions. No lease,
@@ -157,7 +187,8 @@ export async function readIntakeRunDiagnostics(threadId: string) {
     const blocked = current ? (await tx.select({ id: savIntakeJournal.id }).from(savIntakeJournal)
       .where(and(eq(savIntakeJournal.runId, current.id), inArray(savIntakeJournal.kind, [...SAV_INTAKE_BLOCKING_JOURNAL_KINDS]))).limit(1)).length > 0 : false;
     const execution = await readExecutionDiagnostic(tx, message.id);
-    return { messageId: message.id, totalAttempts: exactTotal, execution,
+    const modelCalls = await readModelCallDiagnostic(tx, message.id);
+    return { messageId: message.id, totalAttempts: exactTotal, execution, modelCalls: modelCalls.slice(0, 20), modelCallsTruncated: modelCalls.length > 20,
       // null: the bounded reader cannot tell; callers must not read it as "attempts remain".
       attemptsExhausted: blocked || Boolean(known) ? true : undetermined ? null : false,
       attemptBudget: budget,

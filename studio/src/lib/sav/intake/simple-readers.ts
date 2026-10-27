@@ -168,7 +168,7 @@ export function createSavIntakeSimpleReaders(options: {
           : { stage: "wire" as const, bytes: wireBytes, limitBytes: SAV_INTAKE_MODEL_LIMITS.wireTextBytes };
         trace(false, "SAV_INTAKE_MODEL_CONTEXT_LIMIT", { contextLimit }); throw Error("SAV_INTAKE_MODEL_CONTEXT_LIMIT");
       }
-      if (calls >= 3) { trace(false, "SAV_INTAKE_RUNTIME_BUDGET_EXHAUSTED"); throw Error("SAV_INTAKE_RUNTIME_BUDGET_EXHAUSTED"); }
+      if (calls >= 3) { trace(false, "SAV_INTAKE_RUNTIME_BUDGET_EXHAUSTED", { budgetLimit: "analysis_calls" }); throw Error("SAV_INTAKE_RUNTIME_BUDGET_EXHAUSTED"); }
       calls++;
       let metadata: SavGeminiMetadata | undefined;
       try {
