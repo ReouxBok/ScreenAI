@@ -220,6 +220,17 @@ export async function planSavIntake(
       if (observations.some(o => o.status !== "analyzed" && !accessory(o))) return context("classification_incomplete");
       for (const observation of observations) addEvidence(observation.sourceId, "current_attachment", message.id, observation);
     } else if (analysis.attachmentObservations?.length) return context("classification_incomplete");
+    if (message.unreadAttachments?.length) {
+      // Text analysable, files not read: proceed only when the reader cites the current text
+      // showing each file is accessory. A required/unknown file keeps the dossier for the team.
+      const requirements = analysis.unreadAttachmentRequirements ?? [];
+      const explicitDependency = /(?:voir|regardez|cf\.?|see|ci-joint|en\s+pi[eè]ce\s+jointe)\s+(?:la\s+|les\s+|le\s+|the\s+)?(?:capture|image|screenshot|pi[eè]ce|document|fichier|pdf)/iu.test(message.currentText);
+      const accessory = (u: { sourceId: string }) => !explicitDependency && requirements.filter(r => r.sourceId === u.sourceId).length === 1
+        && requirements.some(r => r.sourceId === u.sourceId && r.role === "accessory" && r.textQuote && savEvidenceContains(message.currentText, r.textQuote));
+      if (requirements.some(r => !message.unreadAttachments!.some(u => u.sourceId === r.sourceId))) return context("classification_incomplete");
+      if (message.unreadAttachments.some(u => !accessory(u))) return context("history_incomplete");
+      for (const unread of message.unreadAttachments) addEvidence(unread.sourceId, "current_attachment", message.id, { ...unread, read: false });
+    } else if (analysis.unreadAttachmentRequirements?.length) return context("classification_incomplete");
     if (!requests.length && analysis.nature === "newsletter" && policy.qualifiedOther?.family === "authenticated_newsletter" && !policy.manualSupportOverride) classification = "other";
     else if (!requests.length || kinds.includes("unknown") || classification === "mixed") return context("classification_incomplete", "request_scope_uncertain");
     if (policy.manualSupportOverride && classification === "other") {

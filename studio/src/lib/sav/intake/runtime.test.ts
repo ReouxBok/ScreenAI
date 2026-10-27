@@ -560,14 +560,20 @@ it.each(["pdf","image_limit","budget"]) ("finishes a non-dispatched image attemp
   await f.db.update(savMessages).set({bodyCiphertext:encryptSavPayload({text:"My application fails with an error.",headers:{},attachments,attachmentInventory:{complete:true,limits:[]}})}).where(eq(savMessages.id,messageId));
   const id=(await enqueueSavIntakeMessage(messageId,config))!;
   if(kind==="budget")await f.db.insert(savIntakeModelCalls).values(Array.from({length:SAV_INTAKE_CALL_POLICY.perMessage},(_,i)=>({runId:id,messageKey:intakeRuntimeHash(messageId),requestHash:`previous-${i}`,state:"settled",reservedNanoUsd:817152000,chargedNanoUsd:262500,payloadCiphertext:encryptSavPayload({metadata:usage})})));
-  const network=vi.fn(async()=>{throw Error("NETWORK_FORBIDDEN");});
+  const bodies:string[]=[],network=vi.fn(async(_url:unknown,init?:RequestInit)=>{bodies.push(String(init?.body));throw Error("NETWORK_FORBIDDEN");});
   await analyseSavIntakeRuntime(id,config,{env:()=>environment,network,downloadAttachments:async()=>bytes});
   const current=(await readSavIntakeCurrent(threadId,config))!,read=current.payload.attachments!.read,display=savAttachmentDisplayRead(read)!;
-  expect(read.state).toBe("complete");expect(read.completedAt).toBeTruthy();expect(current.state).toBe("waiting");
+  expect(read.state).toBe("complete");expect(read.completedAt).toBeTruthy();
+  // The PDF case now dispatches the reader call; the fixture network fails after dispatch, so its usage stays uncertain.
+  expect(current.state).toBe(kind==="pdf"?"uncertain":"waiting");
   expect(display.observations.at(-1)?.reason).toBe(kind==="pdf"?"unsupported_type":kind==="image_limit"?"image_limit":"budget_exhausted");
   expect(display.observations.every(o=>!["in_progress","outcome_uncertain"].includes(o.reason))).toBe(true);
   if(kind==="image_limit")expect(display.observations.slice(0,3).every(o=>o.reason==="context_incomplete")).toBe(true);
-  expect(network).not.toHaveBeenCalled();expect(await f.db.select().from(savActions)).toHaveLength(0);
+  // SAV-42: a PDF of a complete text no longer blocks before the reader; it is sent as an
+  // explicit unread file (never content) and the run still produces no action here.
+  if(kind==="pdf"){expect(network).toHaveBeenCalled();expect(bodies.join()).toContain("unreadAttachments");expect(current.payload.input?.message.unreadAttachments).toEqual([{sourceId:display.observations[0].sourceId,reason:"unsupported_type"}]);}
+  else expect(network).not.toHaveBeenCalled();
+  expect(await f.db.select().from(savActions)).toHaveLength(0);
 });
 
 it.each(["valid_json", "invalid_json"])("reconciles only proven omitted zero thoughts through %s", async output => {

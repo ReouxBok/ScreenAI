@@ -195,7 +195,7 @@ export async function consumeIntakeHumanEvent(id: string, config: IntakeRuntimeC
     const dispatcher=needsAnalysis?createIntakeModelDispatcher({config,signal:deadline,live,reserve:hash=>reserveIntakeHumanCall(authority,config,hash),preflight:hashes=>assertSavIntakeCallPlan(parent.messageId,config,hashes)}):null;
     const semantics: IntakeRuntimePayload["semantics"]=needsAnalysis?{revision:SAV_INTAKE_SEMANTIC_RECORD_REVISION,validatorRevision:SAV_INTAKE_MODEL_REVISION,records:[]}:original.semantics;
     const attachments=value.reinvestigate ? await prepareIntakeAttachments({run:parent,token,...snapshot},config.model,live) : null;
-    if(attachments?.complete) input={...intakeInputWithAttachments(input,event.sourceHash,attachments.state,attachments.prepared),humanResolution:input.humanResolution};
+    if(attachments) input={...intakeInputWithAttachments(input,event.sourceHash,attachments.state,attachments.prepared),humanResolution:input.humanResolution};
     const fresh=dispatcher&&semantics?recordAcceptedIntakeSemantics(createSavIntakeSemanticReaders({model:config.model,call:dispatcher.call,planCalls:dispatcher.plan,
       ...(attachments?.complete ? {attachments:{prepared:attachments.prepared,onRead:observations=>{
         attachments.state.read={...attachments.state.read,observations,state:"complete",completedAt:new Date().toISOString()};

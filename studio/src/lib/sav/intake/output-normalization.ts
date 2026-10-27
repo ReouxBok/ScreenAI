@@ -11,7 +11,7 @@ export type IntakeOutputNormalization = {
   /** Unproven optional registration declarations discarded (identity falls back to the sender). */
   discardedRegistrations: number;
 };
-export const INTAKE_NULLABLE_OPTIONAL_KEYS = ["nature", "registration", "ticketSummary", "imageRequirements"] as const;
+export const INTAKE_NULLABLE_OPTIONAL_KEYS = ["nature", "registration", "ticketSummary", "imageRequirements", "unreadAttachmentRequirements"] as const;
 export const SAV_VISUAL_TRUNCATED_NOTE = "Observation abrégée : contenu visuel tronqué à la limite autorisée.";
 export const SAV_VISUAL_INVALID_BOX_NOTE = "Coordonnées de zone invalides ignorées.";
 

@@ -18,7 +18,7 @@ type Data = { current: string; contacts: { contactId: string }[]; tickets: { tic
 type Answer = Record<string, unknown>;
 
 function bench(options: { text?: string; subject?: string; contacts?: IntakeContact[]; tickets?: IntakeTicket[]; edges?: IntakeAssociation[];
-  newsletterRule?: boolean; conversation?: EngineInput["message"][]; continuation?: EngineInput["identificationContinuation"] } = {}) {
+  newsletterRule?: boolean; conversation?: EngineInput["message"][]; continuation?: EngineInput["identificationContinuation"]; unread?: EngineInput["message"]["unreadAttachments"] } = {}) {
   const contacts = options.contacts ?? [{ id: "101", emails: ["sender@example.test"] }];
   const tickets = options.tickets ?? [];
   const crmCalls: string[] = [];
@@ -31,7 +31,7 @@ function bench(options: { text?: string; subject?: string; contacts?: IntakeCont
   } satisfies Pick<IntakeAdapters, "findContactsByEmail" | "directAssociations" | "getContact" | "ticketsForContact" | "ticketHistory">;
   const input: EngineInput = {
     message: { id: mid, threadId: "20000000-0000-4000-8000-000000000001", fromEmail: "sender@example.test", toEmails: ["support@example.test"],
-      currentText: options.text ?? "Bonjour, la synchronisation de mon agenda échoue avec une erreur 500.", contentComplete: true, direction: "inbound", receivedAt: at },
+      currentText: options.text ?? "Bonjour, la synchronisation de mon agenda échoue avec une erreur 500.", contentComplete: true, direction: "inbound", receivedAt: at, ...(options.unread ? { unreadAttachments: options.unread } : {}) },
     conversation: read(options.conversation ?? []), latestInboundMessageId: mid, now: at, mode: "current", identificationAttemptId: "fixture-attempt",
     ...(options.continuation ? { identificationContinuation: options.continuation, previousIdentification: { messageId: options.continuation.initialMessageId, address: "sender@example.test", state: "confirmed" as const } } : {}),
   };
@@ -325,5 +325,24 @@ describe("SAV-42 A: optional registration declaration through the real engine", 
     const plan = await b.run(d => judgement(d, { ...cancel, identity: { kind: "equivalent", contactIds: ["101", "102"], why: "Deux fiches." },
       registration: { address: "sender@example.test", quote: "depuis laquelle je vous écris" } }));
     expect(plan.progress).toMatchObject({ kind: "human_choice", questionCode: "equivalent_contact_choice" });
+  });
+});
+
+describe("SAV-42 B: unread attachments through the single-call reader and the real engine", () => {
+  const unread = [{ sourceId: "attachment:pdf-1", reason: "unsupported_type" as const }];
+  const text = "Je souhaite mettre fin au contrat et ne pas le renouveler.";
+  const cancel = { requests: [{ id: "r1", kind: "cancellation", summary: "Fin de contrat.", sourceIds: ["current"] }], ticketTitle: "Fin de contrat sans renouvellement" };
+  it("an accessory unread file lets the written request be handled; the file is listed, never read", async () => {
+    const b = bench({ text, unread });
+    const plan = await b.run(d => judgement(d, { ...cancel, unreadAttachmentRequirements: [{ sourceId: "attachment:pdf-1", role: "accessory", textQuote: text }] }));
+    expect(JSON.stringify(b.seen[0])).toContain("unreadAttachments");
+    expect(plan.decision.classification).toBe("cancellation");
+    expect(disposition(plan).target.operation).toBe("create");
+  });
+  it("a required unread file produces no write", async () => {
+    const b = bench({ text, unread });
+    const plan = await b.run(d => judgement(d, { ...cancel, unreadAttachmentRequirements: [{ sourceId: "attachment:pdf-1", role: "required" }] }));
+    expect(plan.steps).toEqual([]);
+    expect(reasons(plan)).toContain("history_incomplete");
   });
 });

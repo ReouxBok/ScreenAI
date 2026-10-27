@@ -41,8 +41,19 @@ export function intakeInputWithAttachments(input: EngineInput, sourceHash: strin
   const observations = read.observations;
   const ready = state.textComplete && state.inventory?.complete === true && observations.length > 0 && observations.length <= 3
     && observations.every(o => o.fileHash && (prepared ? prepared.selected.some(s => s.observation.sourceId === o.sourceId) : o.status === "analyzed"));
-  if (!ready) return input;
+  if (!ready) return intakeInputWithUnreadAttachments(input, state, observations);
   const message = { ...input.message, contentComplete: true, attachmentInputs: observations.map(o => ({ sourceId: o.sourceId, fileHash: o.fileHash! })) };
+  return { ...input, message, conversation: { ...input.conversation, data: input.conversation.data.map(m => m.id === message.id ? message : m) } };
+}
+/** Durable per-file outcomes that a retry cannot change: the file stays unread, the
+ * complete written text may still be analysed. Transport, permission, budget and
+ * association failures are excluded and keep the dossier incomplete. */
+const SAV_INTAKE_UNREAD_TEXT_ONLY_REASONS = new Set(["unsupported_type", "byte_limit", "pixel_limit", "invalid_image", "type_mismatch"]);
+function intakeInputWithUnreadAttachments(input: EngineInput, state: IntakeAttachmentState, observations: SavAttachmentRead["observations"]): EngineInput {
+  const textOnly = state.textComplete && state.inventory?.complete === true && observations.length > 0 && observations.length <= 20
+    && observations.every(o => o.status !== "analyzed" && SAV_INTAKE_UNREAD_TEXT_ONLY_REASONS.has(o.reason));
+  if (!textOnly) return input;
+  const message = { ...input.message, contentComplete: true, unreadAttachments: observations.map(o => ({ sourceId: o.sourceId, reason: o.reason })) };
   return { ...input, message, conversation: { ...input.conversation, data: input.conversation.data.map(m => m.id === message.id ? message : m) } };
 }
 

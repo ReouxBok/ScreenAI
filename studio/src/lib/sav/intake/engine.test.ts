@@ -430,3 +430,53 @@ it.each(["accessory","required","multiple","explicit_dependency"])("keeps unread
  const p=await f.run();if(mode==="accessory")expect(p.decision.disposition.kind).toBe("ticket");else reason(p,"classification_incomplete");
  expect(f.analysis.attachmentObservations.every(o=>o.status==="unreadable")).toBe(true);expect(p.decision.evidence.filter(e=>e.source==="current_attachment")).toHaveLength(mode==="accessory"?f.input.message.attachmentInputs.length:0);
 });
+
+describe("SAV-42 B: complete text with unread attachments", () => {
+  const pdf = { sourceId: "attachment:pdf-1", reason: "unsupported_type" as const };
+  const text = "Je souhaite mettre fin au contrat et ne pas le renouveler. Vous trouverez la facture en pièce jointe pour référence.";
+  const setup = (kinds: MessageAnalysis["requests"][number]["kind"][] = ["cancellation"]) => {
+    const f = fixture(kinds); f.input.message.currentText = text; f.input.message.unreadAttachments = [pdf]; return f;
+  };
+  it("qualifies and handles the written request when the unread file is cited as accessory", async () => {
+    const f = setup();
+    f.analysis.unreadAttachmentRequirements = [{ sourceId: pdf.sourceId, role: "accessory", textQuote: "Je souhaite mettre fin au contrat et ne pas le renouveler." }];
+    const p = await f.run();
+    expect(p.decision.classification).toBe("cancellation");
+    expect(target(p).target.operation).toBe("create");
+    expect(p.decision.evidence.filter(e => e.source === "current_attachment").map(e => e.id)).toEqual([pdf.sourceId]);
+  });
+  it.each(["required", "unknown"] as const)("a %s unread file keeps the dossier for the team, with its classification", async role => {
+    const f = setup();
+    f.analysis.unreadAttachmentRequirements = [{ sourceId: pdf.sourceId, role, textQuote: "Je souhaite mettre fin au contrat et ne pas le renouveler." }];
+    const p = await f.run();
+    reason(p, "history_incomplete");
+    expect(p.decision.classification).toBe("cancellation");
+  });
+  it("no requirement for the unread file is never treated as accessory", async () => {
+    const p = await setup().run();
+    reason(p, "history_incomplete");
+  });
+  it("an accessory claim without a quote from the current text is refused", async () => {
+    const f = setup();
+    f.analysis.unreadAttachmentRequirements = [{ sourceId: pdf.sourceId, role: "accessory", textQuote: "Texte absent du message." }];
+    reason(await f.run(), "history_incomplete");
+  });
+  it("a text pointing to the document as the need is never accessory", async () => {
+    const f = setup(["support"]); f.input.message.currentText = "Voir le document joint pour comprendre le problème.";
+    f.analysis.unreadAttachmentRequirements = [{ sourceId: pdf.sourceId, role: "accessory", textQuote: "Voir le document joint pour comprendre le problème." }];
+    reason(await f.run(), "history_incomplete");
+  });
+  it("requirements for an unknown file, or without unread files, are rejected", async () => {
+    const f = setup();
+    f.analysis.unreadAttachmentRequirements = [{ sourceId: "attachment:other", role: "accessory", textQuote: "Je souhaite mettre fin au contrat et ne pas le renouveler." }];
+    reason(await f.run(), "classification_incomplete");
+    const g = fixture();
+    g.analysis.unreadAttachmentRequirements = [{ sourceId: pdf.sourceId, role: "accessory", textQuote: "Synthetic current authored request" }];
+    reason(await g.run(), "classification_incomplete");
+  });
+  it("an acknowledgement with a required unread file is not silently completed", async () => {
+    const f = setup(["acknowledgement"]);
+    f.analysis.unreadAttachmentRequirements = [{ sourceId: pdf.sourceId, role: "required" }];
+    reason(await f.run(), "history_incomplete");
+  });
+});
