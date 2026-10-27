@@ -1,5 +1,6 @@
 import { createElement, Fragment, type ComponentProps } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
+import { prerender } from "react-dom/static";
 import { readFile, writeFile, mkdir } from "node:fs/promises";
 import { beforeEach, it, expect, vi } from "vitest";
 const mocks = vi.hoisted(() => ({ staff: vi.fn(), list: vi.fn(), detail: vi.fn(), action: vi.fn(), crmDisplay: vi.fn(), controls: vi.fn(), operator:vi.fn() }));
@@ -25,9 +26,15 @@ const detail={thread:{id:threadId,subject:fixture.rows[0].subject,paused:false,t
   current:{id:runId,messageId,candidateContactIds:["101","102"],sourceHash:"a".repeat(64),version:7,sourceMatches:true,payload:{reason:"SAV_INTAKE_RUNTIME_USAGE_UNCERTAIN",plan:{candidateContactIds:["101","102"],decision:{classification:"support",disposition:{kind:"collect_context",reasons:["contact_ambiguous"]},evidence:[{id:"current",source:"current_message",sourceId:messageId,observedAt:at.toISOString()}]}}}},
   messages:[{id:messageId,direction:"inbound",fromEmail:"fiction@example.invalid",receivedAt:at,createdAt:at,body:{text:"My synthetic connection no longer works. Please inspect this complete test request.",attachments:[]},translation:{status:"complete",language:"en",text:"Ma connexion synthétique ne fonctionne plus. Merci de vérifier cette demande de test complète.",revision:"synthetic",sourceHash:"synthetic",errorCode:null}}],historyTruncated:false,
   progress:{runId,confirmed:false,state:"uncertain",ticketId:"201",reason:"SAV_INTAKE_EXECUTION_RECONCILIATION_REQUIRED",effects:[{id:"effect-1",kind:"ticket_create",state:"confirmed",confirmedAt:at},{id:"effect-2",kind:"email_associate",state:"uncertain",confirmedAt:null}]},choices:[]};
-beforeEach(()=>{vi.clearAllMocks();mocks.operator.mockResolvedValue({information:null,allowResume:false,allowReanalysis:true,allowInformation:true,unavailableReason:"Synthetic protected state",resume:null});mocks.controls.mockResolvedValue({blocked:false});mocks.crmDisplay.mockResolvedValue({contacts:{"101":{label:"Alice Test",url:"https://app.hubspot.com/contacts/123/record/0-1/101",available:true}},tickets:{"201":{label:"Connexion interrompue",url:"https://app.hubspot.com/contacts/123/record/0-5/201",available:true}}});mocks.staff.mockResolvedValue({id:"synthetic",email:"ugo@limova.ai",role:"admin"});mocks.list.mockResolvedValue(fixture);mocks.detail.mockResolvedValue(detail);});
+beforeEach(()=>{vi.clearAllMocks();vi.unstubAllEnvs();mocks.operator.mockResolvedValue({information:null,allowResume:false,allowReanalysis:true,allowInformation:true,unavailableReason:"Synthetic protected state",resume:null});mocks.controls.mockResolvedValue({blocked:false});mocks.crmDisplay.mockResolvedValue({contacts:{"101":{label:"Alice Test",url:"https://app.hubspot.com/contacts/123/record/0-1/101",available:true}},tickets:{"201":{label:"Connexion interrompue",url:"https://app.hubspot.com/contacts/123/record/0-5/201",available:true}}});mocks.staff.mockResolvedValue({id:"synthetic",email:"ugo@limova.ai",role:"admin"});mocks.list.mockResolvedValue(fixture);mocks.detail.mockResolvedValue(detail);});
 const renderList=async(query:{view?:string;q?:string;page?:string;sort?:string}={})=>renderToStaticMarkup(createElement(Fragment,null,await IntakeConsolePage({searchParams:Promise.resolve(query)})));
-const renderDetail=async()=>renderToStaticMarkup(createElement(Fragment,null,await IntakeDetailPage({params:Promise.resolve({id:threadId})})));
+// The detail page streams HubSpot names under Suspense: wait for every boundary,
+// as the browser does once the stream ends. The shell alone is the first flush.
+const detailElement=async()=>createElement(Fragment,null,await IntakeDetailPage({params:Promise.resolve({id:threadId})}));
+// Hydration-only text separators and boundary markers are dropped, as static markup does.
+const renderDetail=async()=>{const {prelude}=await prerender(await detailElement());
+  return (await new Response(prelude).text()).replace(/<!--(?: |\$|\/\$)-->/g,"");};
+const renderDetailShell=async()=>renderToStaticMarkup(await detailElement());
 it("offers explicit manual completion on the latest message only for the existing authorized operator, without acting on GET",async()=>{
   const html=await renderDetail();expect(html).toContain("Marquer traité hors Studio");expect(html).toContain("J’ai déjà traité cette demande");
   expect(html).toMatch(/<input(?=[^>]*name="confirmed")(?=[^>]*required="")[^>]*>/);expect(html).toContain(`name="messageId" value="${messageId}"`);expect(mocks.action).not.toHaveBeenCalled();
@@ -94,6 +101,15 @@ it("shows exhausted previous attempts on a pending new version without inheritin
 it("shows named clickable proposed contacts/tickets without turning the proposal into a confirmed result",async()=>{
  mocks.detail.mockResolvedValue({...detail,current:{...detail.current,payload:{...detail.current.payload,plan:{...detail.current.payload.plan,decision:{...detail.current.payload.plan.decision,disposition:{kind:"ticket",target:{operation:"link",contactId:"101",ticketId:"201"}}}}}}});
  const html=await renderDetail();expect(html).toContain("Alice Test");expect(html).toContain("Connexion interrompue");expect(html).toContain('href="https://app.hubspot.com/contacts/123/record/0-1/101"');expect(html).toContain('href="https://app.hubspot.com/contacts/123/record/0-5/201"');expect(html).toContain('rel="noopener noreferrer"');expect(html).not.toContain("Contact HubSpot 101");expect(html).not.toContain("Ticket confirmé :");expect(mocks.action).not.toHaveBeenCalled();
+});
+it("streams HubSpot names after the dossier without claiming a name, a confirmation or an unavailable record",async()=>{
+ mocks.detail.mockResolvedValue({...detail,current:{...detail.current,payload:{...detail.current.payload,plan:{...detail.current.payload.plan,decision:{...detail.current.payload.plan.decision,disposition:{kind:"ticket",target:{operation:"link",contactId:"101",ticketId:"201"}}}}}}});
+ mocks.crmDisplay.mockReturnValue(new Promise(()=>{}));vi.stubEnv("HUBSPOT_PORTAL_ID","123");
+ const html=await renderDetailShell();
+ expect(html).toContain("Décision actuelle");expect(html).toContain("Actions réellement accomplies");expect(html).toContain("Nom HubSpot en cours de lecture");
+ expect(html).toContain('href="https://app.hubspot.com/contacts/123/record/0-1/101"');
+ expect(html).not.toContain("Alice Test");expect(html).not.toContain("nom indisponible");expect(html).not.toContain("Nom indisponible");expect(html).not.toContain("sujet indisponible");expect(html).not.toContain("Fiche du ticket confirmé");
+ expect(html).not.toContain('name="sourceHash"');expect(mocks.controls).toHaveBeenCalledWith(threadId,messageId);expect(mocks.action).not.toHaveBeenCalled();
 });
 it("does not label a different run's confirmed CRM effects as the current decision",async()=>{
  mocks.detail.mockResolvedValue({...detail,confirmedCurrent:false,progress:{...detail.progress,runId:"10000000-0000-4000-8000-000000000099",confirmed:true}});
