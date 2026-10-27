@@ -742,3 +742,59 @@ describe("SAV-42 B (review dba2738): delivery proposition vs written need, at cl
     expect(await run(text)).toBe("collect_context");
   });
 });
+
+describe("REVIEWCFA clause boundaries preserve the written request", () => {
+ const run=async(text:string)=>{
+  const f=fixture([text.includes("résilier") ? "cancellation" : "support"]);f.input.message.currentText=text;
+  f.input.message.unreadAttachments=[{sourceId:"attachment:pdf",reason:"unsupported_type"}];
+  f.analysis.unreadAttachmentRequirements=[{sourceId:"attachment:pdf",role:"accessory",textQuote:text}];
+  return f.run();
+ };
+ it.each([
+  "La connexion échoue, erreur décrite dans la capture jointe.",
+  "Je souhaite résilier mon abonnement, demande expliquée dans le document joint.",
+ ])("a location clause cannot erase a preceding explicit request: %s",async text=>{
+  const without=fixture([text.includes("résilier") ? "cancellation" : "support"]);without.input.message.currentText=text;
+  expect((await without.run()).decision.disposition.kind).toBe("ticket");
+  expect((await run(text)).decision.disposition.kind).toBe("ticket");
+ });
+ it.each([
+  "Je vous joins la facture et le relevé.",
+  "Je vous envoie le document et ma facture.",
+ ])("a coordination of delivered objects is not a second request: %s",async text=>{
+  const p=await run(text);expect(p.decision.disposition.kind).toBe("collect_context");expect(p.steps).toEqual([]);
+ });
+ it.each([
+  ["La connexion échoue. Erreur décrite dans la capture jointe.","ticket"],
+  ["Je vous joins la facture et je ne peux plus accéder à mon compte.","ticket"],
+  ["Le problème est décrit dans la capture jointe.","collect_context"],
+ ])("control %s",async(text,expected)=>expect((await run(text)).decision.disposition.kind).toBe(expected));
+});
+
+describe("SAV-42 B (review cfa34a9): location bounded to its proposition, nominal coordination", () => {
+  const run = async (text: string) => {
+    const f = fixture(); f.input.message.currentText = text;
+    f.input.message.unreadAttachments = [{ sourceId: "attachment:pdf", reason: "unsupported_type" }];
+    f.analysis.unreadAttachmentRequirements = [{ sourceId: "attachment:pdf", role: "accessory", textQuote: text }];
+    return (await f.run()).decision.disposition.kind;
+  };
+  it.each([
+    "Impossible d'exporter, détail expliqué dans le PDF joint.",
+    "La synchronisation plante ; erreur visible sur la capture jointe.",
+    "Le paiement est refusé : message indiqué dans la capture jointe.",
+    "Je vous envoie le document et je n'arrive plus à me connecter.",
+    "Je vous joins la facture et le relevé car le montant diffère.",
+    "Je vous envoie la capture, la page reste blanche.",
+  ])("a request outside the file proposition is kept: %j", async text => {
+    expect(await run(text)).toBe("ticket");
+  });
+  it.each([
+    "Erreur décrite dans la capture jointe.",
+    "Tout le problème est expliqué dans le document joint.",
+    "Je vous joins la facture, le devis et le relevé.",
+    "Je vous transmets la capture et le fichier de log.",
+    "Je vous envoie le document et la capture d'écran.",
+  ])("only a file proposition or a list of delivered objects stays with the team: %j", async text => {
+    expect(await run(text)).toBe("collect_context");
+  });
+});

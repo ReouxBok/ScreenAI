@@ -43,20 +43,32 @@ const FILE_ADVERB = String.raw`(?:ci-?joint\p{L}*|en\s+(?:p\.?\s?j(?!\p{L})|pi[e
 /** Inside one proposition: any character except a sentence or clause boundary. Commas and
  * incidental complements ("comme convenu", "comme vous me l'avez demandé") stay inside;
  * a connector or a comma followed by a subject pronoun starts another proposition. */
-const IN_CLAUSE = String.raw`(?:(?![.!?;:]|(?<!\p{L})(?:car|parce|mais|donc|puisque|lorsque|quand|et)(?!\p{L})|,\s*(?:je|j['’]|nous|on|il|elle|ils|elles|ça|cela)(?!\p{L}))[\s\S])`;
+const SUBJECT = String.raw`(?:je|j['’]|nous|on|il|elle|ils|elles|ça|cela)(?!\p{L})`;
+// "et" coordinates nouns inside one proposition ("la facture et le relevé"); it opens a new
+// proposition only when a subject pronoun or a negation follows ("et je ne peux plus…").
+const OPENS_CLAUSE = String.raw`(?:(?<!\p{L})(?:car|parce|mais|donc|puisque|lorsque|quand)(?!\p{L})|(?<!\p{L})et\s+(?:${SUBJECT}|ne(?!\p{L})|n['’]|c['’]est(?!\p{L}))|,\s*${SUBJECT})`;
+const IN_CLAUSE = String.raw`(?:(?![.!?;:]|${OPENS_CLAUSE})[\s\S])`;
+/** Where a proposition may start: the sentence start, after a comma, semicolon or colon, or at
+ * a clause connector. A location proposition never reaches back over that start. */
+const CLAUSE_START = String.raw`(?:^|(?<=[,;:])|(?=${OPENS_CLAUSE}))`;
+const NO_PUNCTUATION = String.raw`(?:(?![.!?,;:]|${OPENS_CLAUSE})[\s\S])`;
+/** Further delivered objects coordinated with the file ("le document et ma facture"), up to
+ * the next punctuation; "et/ou" followed by a subject opens a request and is not consumed. */
+const COORDINATED_OBJECTS = String.raw`(?:\s+(?:et|ou)\s+(?!${SUBJECT}|ne(?!\p{L})|n['’]|c['’]est(?!\p{L}))${NO_PUNCTUATION}*)?`;
 const DELIVERY = String.raw`(?:je\s+vous\s+(?:envoie|transmets|adresse|fais\s+parvenir|fais\s+suivre)|veuillez\s+trouver|vous\s+trouverez|merci\s+de\s+trouver|vous\s+pouvez\s+trouver|trouvez)`;
 /** Propositions that only hand over or point to the file. Each regex removes the proposition
  * itself, never the rest of the sentence, so a need written after it is kept:
  * "Je vous envoie une capture car la connexion échoue" keeps "car la connexion échoue". */
 const FILE_POINTERS = [
-  // "Le problème est détaillé dans le PDF joint", "Tout est dans le fichier joint": the subject
-  // names the need and the predicate places it in the file; up to the file reference.
-  new RegExp(String.raw`^${IN_CLAUSE}*?(?<!\p{L})(?:d[ée]taill\p{L}*|d[ée]cri\p{L}*|expliqu\p{L}*|pr[ée]cis[ée]\p{L}*|indiqu\p{L}*|visible|figure|tout\s+est)(?!\p{L})${IN_CLAUSE}*?(?<!\p{L})(?:dans|en|sur)(?!\p{L})${IN_CLAUSE}*?${FILE}`, "iu"),
+  // "Le problème est détaillé dans le PDF joint", "…, erreur décrite dans la capture jointe": the
+  // subject of THIS proposition names the need and the predicate places it in the file. It starts
+  // at the proposition start, so a request written before a comma is kept.
+  new RegExp(String.raw`${CLAUSE_START}${NO_PUNCTUATION}*?(?<!\p{L})(?:d[ée]taill\p{L}*|d[ée]cri\p{L}*|expliqu\p{L}*|pr[ée]cis[ée]\p{L}*|indiqu\p{L}*|visible|figure|tout\s+est)(?!\p{L})${IN_CLAUSE}*?(?<!\p{L})(?:dans|en|sur)(?!\p{L})${IN_CLAUSE}*?${FILE}`, "iu"),
   // "Je vous joins …": joining is handing over a file; its object runs to the clause end.
   new RegExp(String.raw`(?<!\p{L})je\s+vous\s+joins(?!\p{L})${IN_CLAUSE}*`, "iu"),
   // "Je vous envoie/transmets … <fichier>", "Veuillez trouver ci-joint …": handing over a file,
   // whatever incidental complement sits in between; an adverb ("ci-joint") takes its object.
-  new RegExp(String.raw`(?<!\p{L})${DELIVERY}(?!\p{L})${IN_CLAUSE}*?(?:${FILE_ADVERB}${IN_CLAUSE}*|${FILE})`, "iu"),
+  new RegExp(String.raw`(?<!\p{L})${DELIVERY}(?!\p{L})${IN_CLAUSE}*?(?:${FILE_ADVERB}${IN_CLAUSE}*|${FILE}${COORDINATED_OBJECTS})`, "iu"),
   // "Ci-joint la facture", at the start of the proposition.
   new RegExp(String.raw`^\s*ci-?joint\p{L}*${IN_CLAUSE}*`, "iu"),
   // "Voir PJ", "Regardez le fichier joint", "Cf. la capture".
