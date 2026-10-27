@@ -6,6 +6,8 @@ export const SAV_INTAKE_DAY_MS = 86_400_000;
 export const SAV_INTAKE_BUDGET_BOUNDS = {
   operational: { maxNanoUsd: 5_000_000_000, maxRollingNanoUsd: 90_000_000_000, maxCalls: 300 },
   qualification: { maxNanoUsd: 3_000_000_000, maxCalls: 30 },
+  /** Ceiling of the daily cap the budget owner may set from the Studio, without a deployment. */
+  studio: { maxNanoUsd: 20_000_000_000 },
 } as const;
 export type IntakeBudgetPins = { budgetProfile?: typeof SAV_INTAKE_OPERATIONAL_PROFILE; maxNanoUsd: number; maxCalls: number; maxRollingNanoUsd?: number };
 export type IntakeBudgetRow = { state: string; chargedNanoUsd: number; createdAt: Date };
