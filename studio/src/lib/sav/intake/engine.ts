@@ -35,64 +35,12 @@ export function savIntakePlanFingerprint(plan: Pick<IntakePlan, "decision" | "no
     originalThreadId: plan.originalThreadId, originalRecipientEmails: plan.originalRecipientEmails, referenceMode: plan.referenceMode }));
 }
 
-/** Read and plan only. There is deliberately no write, model client, DB or dispatch dependency. */
-// A file reference, with its "joint / ci-joint / en annexe" qualifier when present.
-const FILE = String.raw`(?:(?:p\.?\s?j(?!\p{L})|pi[eè]ces?\s+jointes?|ci-?joint\p{L}*|annexes?|captures?(?:\s+d['’]\s*[ée]cran)?|screenshots?|attachments?|pdf|fichiers?|documents?|images?|photos?|scans?|\p{L}+\s+(?=joint))(?:\s+(?:joint\p{L}*|ci-?joint\p{L}*|en\s+annexe))?)`;
-/** "Ci-joint", "en PJ", "en pièce jointe", "en annexe": the delivered object follows them. */
-const FILE_ADVERB = String.raw`(?:ci-?joint\p{L}*|en\s+(?:p\.?\s?j(?!\p{L})|pi[eè]ces?\s+jointes?|annexe))`;
-/** Inside one proposition: any character except a sentence or clause boundary. Commas and
- * incidental complements ("comme convenu", "comme vous me l'avez demandé") stay inside;
- * a connector or a comma followed by a subject pronoun starts another proposition. */
-const SUBJECT = String.raw`(?:je|j['’]|nous|on|il|elle|ils|elles|ça|cela)(?!\p{L})`;
-// "et" coordinates nouns inside one proposition ("la facture et le relevé"); it opens a new
-// proposition only when a subject pronoun or a negation follows ("et je ne peux plus…").
-const OPENS_CLAUSE = String.raw`(?:(?<!\p{L})(?:car|parce|mais|donc|puisque|lorsque|quand)(?!\p{L})|(?<!\p{L})et\s+(?:${SUBJECT}|ne(?!\p{L})|n['’]|c['’]est(?!\p{L}))|,\s*${SUBJECT})`;
-const IN_CLAUSE = String.raw`(?:(?![.!?;:]|${OPENS_CLAUSE})[\s\S])`;
-/** Where a proposition may start: the sentence start, after a comma, semicolon or colon, or at
- * a clause connector. A location proposition never reaches back over that start. */
-const CLAUSE_START = String.raw`(?:^|(?<=[,;:])|(?=${OPENS_CLAUSE}))`;
-const NO_PUNCTUATION = String.raw`(?:(?![.!?,;:]|${OPENS_CLAUSE})[\s\S])`;
-/** Further delivered objects coordinated with the file ("le document et ma facture"), up to
- * the next punctuation; "et/ou" followed by a subject opens a request and is not consumed. */
-const COORDINATED_OBJECTS = String.raw`(?:\s+(?:et|ou)\s+(?!${SUBJECT}|ne(?!\p{L})|n['’]|c['’]est(?!\p{L}))${NO_PUNCTUATION}*)?`;
-const DELIVERY = String.raw`(?:je\s+vous\s+(?:envoie|transmets|adresse|fais\s+parvenir|fais\s+suivre)|veuillez\s+trouver|vous\s+trouverez|merci\s+de\s+trouver|vous\s+pouvez\s+trouver|trouvez)`;
-/** Propositions that only hand over or point to the file. Each regex removes the proposition
- * itself, never the rest of the sentence, so a need written after it is kept:
- * "Je vous envoie une capture car la connexion échoue" keeps "car la connexion échoue". */
-const FILE_POINTERS = [
-  // "Le problème est détaillé dans le PDF joint", "…, erreur décrite dans la capture jointe": the
-  // subject of THIS proposition names the need and the predicate places it in the file. It starts
-  // at the proposition start, so a request written before a comma is kept.
-  new RegExp(String.raw`${CLAUSE_START}${NO_PUNCTUATION}*?(?<!\p{L})(?:d[ée]taill\p{L}*|d[ée]cri\p{L}*|expliqu\p{L}*|pr[ée]cis[ée]\p{L}*|indiqu\p{L}*|visible|figure|tout\s+est)(?!\p{L})${IN_CLAUSE}*?(?<!\p{L})(?:dans|en|sur)(?!\p{L})${IN_CLAUSE}*?${FILE}`, "iu"),
-  // "Je vous joins …": joining is handing over a file; its object runs to the clause end.
-  new RegExp(String.raw`(?<!\p{L})je\s+vous\s+joins(?!\p{L})${IN_CLAUSE}*`, "iu"),
-  // "Je vous envoie/transmets … <fichier>", "Veuillez trouver ci-joint …": handing over a file,
-  // whatever incidental complement sits in between; an adverb ("ci-joint") takes its object.
-  new RegExp(String.raw`(?<!\p{L})${DELIVERY}(?!\p{L})${IN_CLAUSE}*?(?:${FILE_ADVERB}${IN_CLAUSE}*|${FILE}${COORDINATED_OBJECTS})`, "iu"),
-  // "Ci-joint la facture", at the start of the proposition.
-  new RegExp(String.raw`^\s*ci-?joint\p{L}*${IN_CLAUSE}*`, "iu"),
-  // "Voir PJ", "Regardez le fichier joint", "Cf. la capture".
-  // "Voir PJ", "Regardez le fichier joint", "Cf. la capture"; a purpose complement ("pour
-  // comprendre le problème") describes what the file holds and belongs to the pointer.
-  new RegExp(String.raw`(?<!\p{L})(?:voir|cf\.?|regarde[rz]?|consulte[rz]?|ouvre[rz]?|see|check)\s+(?:\p{L}+['’]?\s+){0,2}${FILE}(?:\s*,?\s*(?:pour|afin\s+de)(?!\p{L})${IN_CLAUSE}*)?`, "iu"),
-];
-/** The file mention itself, with the noun it qualifies ("facture en PJ", "le PDF joint"). */
-const FILE_MENTION = new RegExp(String.raw`(?:\p{L}+\s+(?:en\s+)?)?${FILE}`, "giu");
-const NOT_A_REQUEST = new Set(["bonjour", "bonsoir", "salut", "hello", "merci", "thanks", "cordialement", "regards", "bonne", "journée", "soirée", "svp", "stp",
-  "madame", "monsieur", "s'il", "vous", "plaît", "plait", "pour", "information", "info", "référence", "reference", "et", "de", "du", "des", "le", "la", "les",
-  "l'", "un", "une", "en", "à", "au", "aux", "ma", "mon", "mes", "votre", "vos", "ce", "cette", "ci", "cf", "voir", "see", "regardez", "consultez"]);
-/** An "accessory" file needs a cited current sentence that states the request on its own.
- * In each sentence the propositions that only hand over or point to the file are removed,
- * then the remaining file mentions; what is left must say more than courtesy. Length is not
- * a criterion, and a request written next to a delivery proposition is kept. */
-export function intakeQuoteStatesRequest(quote: string) {
-  return quote.split(/(?<=[.!?…])\s+|\n+/u).some(sentence => {
-    let rest = sentence;
-    for (const pointer of FILE_POINTERS) rest = rest.replace(pointer, " ");
-    return (rest.replace(FILE_MENTION, " ").toLowerCase().match(/[\p{L}'’]+/gu) ?? []).some(word => !NOT_A_REQUEST.has(word.replace(/’/g, "'")));
-  });
+/** Appended to a created ticket whose email carries files the agent did not read. */
+export function savIntakeUnreadAttachmentNotice(count: number) {
+  return count === 1 ? "1 pièce jointe non lue par l'agent, à vérifier." : `${count} pièces jointes non lues par l'agent, à vérifier.`;
 }
 
+/** Read and plan only. There is deliberately no write, model client, DB or dispatch dependency. */
 export async function planSavIntake(
   input: EngineInput, adapters: IntakeAdapters, policy: EnginePolicy, overrides: Partial<EngineLimits> = {},
   readClock?: () => Date,
@@ -270,19 +218,20 @@ export async function planSavIntake(
         || new Set(observations.map(o => o.sourceId)).size !== observations.length
         || observations.some(o => !message.attachmentInputs!.some(i => i.sourceId === o.sourceId && i.fileHash === o.fileHash))) return context("classification_incomplete");
       const requirements = analysis.imageRequirements ?? [];
-      const accessory = (o: typeof observations[number]) => requirements.filter(r => r.sourceId === o.sourceId).length === 1
+      const explicitDependency = /(?:voir|regardez|cf\.?|see)\s+(?:la\s+|les\s+|the\s+)?(?:capture|image|screenshot|pi[eè]ce)/iu.test(message.currentText);
+      const accessory = (o: typeof observations[number]) => !explicitDependency && requirements.filter(r => r.sourceId === o.sourceId).length === 1
         && requirements.some(r => r.sourceId === o.sourceId && r.fileHash === o.fileHash && r.role === "accessory"
-          && r.textQuote && savEvidenceContains(message.currentText, r.textQuote) && intakeQuoteStatesRequest(r.textQuote));
+          && r.textQuote && savEvidenceContains(message.currentText, r.textQuote));
       if (observations.some(o => o.status !== "analyzed" && !accessory(o))) return context("classification_incomplete");
       for (const observation of observations) addEvidence(observation.sourceId, "current_attachment", message.id, observation);
     } else if (analysis.attachmentObservations?.length) return context("classification_incomplete");
     if (message.unreadAttachments?.length) {
-      // Text analysable, files not read: proceed only when the reader cites the current text
-      // showing each file is accessory. A required/unknown file keeps the dossier for the team.
+      // Text analysable, files not read: the reader judges each file's role. The engine only checks
+      // what it can verify: one requirement per file, role accessory, quote present in the current
+      // text. A required/unknown file keeps the dossier for the team; the wording is not parsed here.
       const requirements = analysis.unreadAttachmentRequirements ?? [];
       const accessory = (u: { sourceId: string }) => requirements.filter(r => r.sourceId === u.sourceId).length === 1
-        && requirements.some(r => r.sourceId === u.sourceId && r.role === "accessory" && r.textQuote && savEvidenceContains(message.currentText, r.textQuote)
-          && intakeQuoteStatesRequest(r.textQuote));
+        && requirements.some(r => r.sourceId === u.sourceId && r.role === "accessory" && r.textQuote && savEvidenceContains(message.currentText, r.textQuote));
       if (requirements.some(r => !message.unreadAttachments!.some(u => u.sourceId === r.sourceId))) return context("classification_incomplete");
       if (message.unreadAttachments.some(u => !accessory(u))) return context("history_incomplete");
       for (const unread of message.unreadAttachments) addEvidence(unread.sourceId, "current_attachment", message.id, { ...unread, read: false });
@@ -488,7 +437,10 @@ export async function planSavIntake(
       const summary = analysis.ticketSummary;
       if (!summary || summary.title.split(/\s+/).length > 6 || summary.requestIds.length !== requests.length
         || unique(summary.requestIds).length !== requests.length || requests.some(r => !summary.requestIds.includes(r.id))) return context("classification_incomplete");
-      newTicket = { ...summary, requestIds: [...summary.requestIds].sort(), contactId: primary.id, pipeline: "support", stage: "new", source: "email", owner: "leave_unassigned" };
+      // Unread files ride with the associated email; the team is told they were not read.
+      const unread = message.unreadAttachments?.length ?? 0;
+      const description = unread ? `${summary.description}\n\n${savIntakeUnreadAttachmentNotice(unread)}` : summary.description;
+      newTicket = { ...summary, description, requestIds: [...summary.requestIds].sort(), contactId: primary.id, pipeline: "support", stage: "new", source: "email", owner: "leave_unassigned" };
     }
     const openIds = candidateTickets.filter(t => t.stage !== "closed" && t.contactIds.includes(targetContactId)).map(t => t.id).sort();
     const multiple = openIds.length + (target.operation === "link" ? 0 : 1) > 1;

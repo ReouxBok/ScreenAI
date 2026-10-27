@@ -461,9 +461,10 @@ describe("SAV-42 B: complete text with unread attachments", () => {
     f.analysis.unreadAttachmentRequirements = [{ sourceId: pdf.sourceId, role: "accessory", textQuote: "Texte absent du message." }];
     reason(await f.run(), "history_incomplete");
   });
-  it("a text pointing to the document as the need is never accessory", async () => {
-    const f = setup(["support"]); f.input.message.currentText = "Voir le document joint pour comprendre le problème.";
-    f.analysis.unreadAttachmentRequirements = [{ sourceId: pdf.sourceId, role: "accessory", textQuote: "Voir le document joint pour comprendre le problème." }];
+  it("two requirements for the same unread file are never accessory", async () => {
+    const f = setup();
+    const quote = "Je souhaite mettre fin au contrat et ne pas le renouveler.";
+    f.analysis.unreadAttachmentRequirements = [{ sourceId: pdf.sourceId, role: "accessory", textQuote: quote }, { sourceId: pdf.sourceId, role: "accessory", textQuote: quote }];
     reason(await f.run(), "history_incomplete");
   });
   it("requirements for an unknown file, or without unread files, are rejected", async () => {
@@ -478,52 +479,6 @@ describe("SAV-42 B: complete text with unread attachments", () => {
     const f = setup(["acknowledgement"]);
     f.analysis.unreadAttachmentRequirements = [{ sourceId: pdf.sourceId, role: "required" }];
     reason(await f.run(), "history_incomplete");
-  });
-});
-
-it.each(["Voir PJ.", "Cf. PJ.", "Voir la pièce jointe."])("REVIEW an explicit unread-file dependency stays blocked: %s", async suffix => {
-  const f = fixture();
-  f.input.message.currentText = suffix;
-  f.input.message.unreadAttachments = [{ sourceId: "attachment:required-pdf", reason: "unsupported_type" }];
-  // A mistaken model labels the file accessory despite the explicit customer reference.
-  f.analysis.unreadAttachmentRequirements = [{ sourceId: "attachment:required-pdf", role: "accessory", textQuote: f.input.message.currentText }];
-  const plan = await f.run();
-  expect(plan.decision.disposition.kind).toBe("collect_context");
-  expect(plan.steps).toEqual([]);
-});
-
-describe("SAV-42 B (review P2-B): pointer to a file vs autonomous text", () => {
-  const pdf = { sourceId: "attachment:pdf-1", reason: "unsupported_type" as const };
-  const run = async (text: string, quote: string, kinds: MessageAnalysis["requests"][number]["kind"][] = ["cancellation"]) => {
-    const f = fixture(kinds); f.input.message.currentText = text; f.input.message.unreadAttachments = [pdf];
-    f.analysis.unreadAttachmentRequirements = [{ sourceId: pdf.sourceId, role: "accessory", textQuote: quote }];
-    return f.run();
-  };
-  it.each([
-    ["Je souhaite résilier mon abonnement à la fin du mois. La facture est en PJ.", "Je souhaite résilier mon abonnement à la fin du mois."],
-    ["Bonjour, je souhaite résilier mon abonnement. Ci-joint ma dernière facture.", "je souhaite résilier mon abonnement."],
-  ])("an autonomous request mentioning an accessory file is still handled: %s", async (text, quote) => {
-    expect(target(await run(text, quote)).target.operation).toBe("create");
-  });
-  it.each([
-    ["Bonjour, voir PJ, merci", "voir PJ, merci"],
-    ["Cf. pièce jointe.", "Cf. pièce jointe."],
-    ["Regardez le fichier joint svp", "Regardez le fichier joint svp"],
-  ])("a text that only points to the unread file is never accessory: %s", async (text, quote) => {
-    const plan = await run(text, quote, ["support"]);
-    expect(plan.decision.disposition.kind).toBe("collect_context"); expect(plan.steps).toEqual([]);
-  });
-  it("an accessory claim citing only the pointer part of an otherwise clear text is refused", async () => {
-    const plan = await run("Je souhaite résilier mon abonnement. Facture en PJ.", "Facture en PJ.");
-    expect(plan.decision.disposition.kind).toBe("collect_context"); expect(plan.steps).toEqual([]);
-  });
-  it("the same rule protects unreadable images that the customer points to", async () => {
-    const f = fixture(); f.input.message.currentText = "Voir PJ.";
-    const image = { sourceId: "image-1", fileHash: "1".repeat(64) };
-    f.input.message.attachmentInputs = [image];
-    f.analysis.attachmentObservations = [{ ...image, filename: "synthetic.png", mimeType: "image/png", referenceHash: "r", width: 1, height: 1, status: "unreadable", reason: "unreadable_content", text: "", uncertainties: [], regions: [] }];
-    f.analysis.imageRequirements = [{ ...image, role: "accessory", textQuote: "Voir PJ." }];
-    expect((await f.run()).decision.disposition.kind).toBe("collect_context");
   });
 });
 
@@ -547,254 +502,55 @@ describe("SAV-42 B: mixed readable image and unread PDF", () => {
   });
 });
 
-it.each(["Connexion impossible.","Ça bug."])("REVIEW201 an autonomous short request with an accessory file is handled: %s",async text=>{
- const f=fixture();f.input.message.currentText=text;expect((await f.run()).decision.disposition.kind).toBe("ticket");f.input.message.unreadAttachments=[{sourceId:"attachment:pdf",reason:"unsupported_type"}];
- f.analysis.unreadAttachmentRequirements=[{sourceId:"attachment:pdf",role:"accessory",textQuote:text}];
- expect((await f.run()).decision.disposition.kind).toBe("ticket");
-});
-it("REVIEW201 an explicit accessory pointer does not override a complete written request",async()=>{
- const f=fixture(["cancellation"]);const text="Je souhaite résilier mon abonnement à la fin du mois.";
- f.input.message.currentText=text+" Voir PJ pour information uniquement : ancienne facture accessoire.";
- f.input.message.unreadAttachments=[{sourceId:"attachment:pdf",reason:"unsupported_type"}];
- f.analysis.unreadAttachmentRequirements=[{sourceId:"attachment:pdf",role:"accessory",textQuote:text}];
- expect((await f.run()).decision.disposition.kind).toBe("ticket");
-});
-
-it("REVIEW201 a substantive-looking pointer still requires the unread file",async()=>{
- const f=fixture();const text="Le problème est détaillé dans le PDF joint.";
- f.input.message.currentText=text;f.input.message.unreadAttachments=[{sourceId:"attachment:pdf",reason:"unsupported_type"}];
- f.analysis.unreadAttachmentRequirements=[{sourceId:"attachment:pdf",role:"accessory",textQuote:text}];
- expect((await f.run()).decision.disposition.kind).toBe("collect_context");
-});
-
-describe("SAV-42 B (review 201): the cited sentence decides, in both directions", () => {
-  const run = async (text: string, quote: string) => {
+describe("SAV-42 B contract: the reader judges the role, the engine checks only what it can verify", () => {
+  // The wording is not parsed by the engine: the same sentences, including the ones earlier
+  // reviews used against the grammar guard, follow the reader's role in both directions.
+  const sentences = [
+    "Voir PJ.",
+    "Le problème est décrit dans le PDF joint.",
+    "Le problème, comme dit, est décrit dans le PDF joint.",
+    "Je vous envoie la capture et la page reste blanche.",
+    "Je vous transmets le document et mon compte ne fonctionne plus.",
+    "Je vous joins la facture et le relevé.",
+    "Je souhaite résilier mon abonnement, facture en PJ pour information.",
+    "Connexion impossible.",
+  ];
+  const run = async (text: string, role: "accessory" | "required" | "unknown", count = 1) => {
     const f = fixture(); f.input.message.currentText = text;
-    f.input.message.unreadAttachments = [{ sourceId: "attachment:pdf", reason: "unsupported_type" }];
-    f.analysis.unreadAttachmentRequirements = [{ sourceId: "attachment:pdf", role: "accessory", textQuote: quote }];
-    return (await f.run()).decision.disposition.kind;
+    const files = Array.from({ length: count }, (_, n) => ({ sourceId: `attachment:pdf-${n}`, reason: "unsupported_type" as const }));
+    f.input.message.unreadAttachments = files;
+    f.analysis.unreadAttachmentRequirements = files.map(u => ({ sourceId: u.sourceId, role, textQuote: text }));
+    return f.run();
   };
-  it.each([
-    ["Connexion impossible.", "Connexion impossible."],
-    ["Ça bug. Voir PJ.", "Ça bug."],
-    ["Bonjour, l'export CSV échoue depuis hier. La capture d'écran est jointe.", "l'export CSV échoue depuis hier."],
-    ["Mon agenda ne se synchronise plus.\nCi-joint une capture.", "Mon agenda ne se synchronise plus."],
-  ])("a request stated in the cited sentence is handled: %j", async (text, quote) => {
-    expect(await run(text, quote)).toBe("ticket");
+  it.each(sentences)("an accessory file with an exact quote is handled and flagged on the ticket: %j", async text => {
+    const p = await run(text, "accessory");
+    expect(target(p).target.operation).toBe("create");
+    expect(p.newTicket?.description).toBe("Synthetic description covering all declared requests\n\n1 pièce jointe non lue par l'agent, à vérifier.");
+    expect(p.decision.evidence.filter(e => e.source === "current_attachment").map(e => e.id)).toEqual(["attachment:pdf-0"]);
   });
-  it.each([
-    "Tout est dans le fichier joint.",
-    "Voir le document.",
-    "Je vous envoie la capture d'écran.",
-    "Ci-joint le détail du problème.",
-    "Merci de regarder la PJ.",
-    "Bonjour, merci.",
-  ])("a need that only the unread file carries stays with the team: %j", async text => {
-    expect(await run(text, text)).toBe("collect_context");
+  it.each(sentences.flatMap(text => (["required", "unknown"] as const).map(role => [text, role] as const)))("a %s file keeps the dossier for the team: %j", async (text, role) => {
+    const p = await run(text, role);
+    expect(p.decision.disposition.kind).toBe("collect_context"); expect(p.steps).toEqual([]);
   });
-});
-
-it.each([
- ["cancellation","Je souhaite résilier mon abonnement, facture en PJ pour information."],
- ["cancellation","Je souhaite résilier mon abonnement (facture en PJ)."],
- ["support","Je ne peux plus envoyer de pièces jointes depuis Limova."],
- ["support","Le téléchargement des pièces jointes ne fonctionne plus."],
-] as const)("REVIEWCA an explicit %s request stays autonomous despite file wording: %s",async(kind,text)=>{
- const f=fixture([kind]);f.input.message.currentText=text;
- expect((await f.run()).decision.disposition.kind).toBe("ticket");
- f.input.message.unreadAttachments=[{sourceId:"attachment:pdf",reason:"unsupported_type"}];
- f.analysis.unreadAttachmentRequirements=[{sourceId:"attachment:pdf",role:"accessory",textQuote:text}];
- expect((await f.run()).decision.disposition.kind).toBe("ticket");
-});
-it("REVIEWCA a correct current-reader quote cannot isolate the request from a same-sentence accessory mention",async()=>{
- const {createSavIntakeSemanticReaders}=await import("./model-readers");
- const text="Je souhaite résilier mon abonnement, facture en PJ pour information.";
- const f=fixture(["cancellation"]);f.input.message.currentText=text;f.input.message.unreadAttachments=[{sourceId:"attachment:pdf",reason:"unsupported_type"}];
- const traces:{accepted:boolean}[]=[];
- const reader=createSavIntakeSemanticReaders({model:"gemini-fixture",onTrace:t=>traces.push(t),call:async arg=>{
-  const data=JSON.parse(arg.body.contents[0].parts[0].text);const q=data.citationCatalogue.find((a:{sourceId:string})=>a.sourceId==="current").id;
-  return {json:{messageId:mid,requests:[{id:"r0",kind:"cancellation",currentMessageId:mid,quoteId:q}],ticketSummary:{title:"Résiliation de l’abonnement",description:"Le client demande la résiliation, avec une facture accessoire.",requestIds:["r0"]},unreadAttachmentRequirements:[{sourceId:"attachment:pdf",role:"accessory",textQuoteId:q}]},metadata:{inputTokens:10,outputTokens:10,thoughtTokens:0,totalTokens:20}};
- }});
- f.adapters.analyseMessage=reader.analyseMessage;
- const plan=await f.run();expect(traces.at(-1)?.accepted).toBe(true);
- expect(plan.decision.disposition.kind).toBe("ticket");
-});
-
-describe("SAV-42 B (review ca1c4db): a file mention is not a file pointer", () => {
-  const run = async (text: string, quote = text) => {
-    const f = fixture(); f.input.message.currentText = text;
-    f.input.message.unreadAttachments = [{ sourceId: "attachment:pdf", reason: "unsupported_type" }];
-    f.analysis.unreadAttachmentRequirements = [{ sourceId: "attachment:pdf", role: "accessory", textQuote: quote }];
-    return (await f.run()).decision.disposition.kind;
-  };
-  it.each(["Facture en PJ pour information.", "Le problème est expliqué en pièce jointe.", "Vous trouverez le détail dans le document joint."])(
-    "a sentence that only mentions or points to the file still states nothing: %j", async text => {
-      expect(await run(text)).toBe("collect_context");
-    });
-  it("the product's attachment feature named in a request is not a pointer", async () => {
-    expect(await run("Impossible d'ajouter une pièce jointe à un message depuis hier.")).toBe("ticket");
+  it("counts several unread files in the ticket notice", async () => {
+    expect((await run("Connexion impossible.", "accessory", 2)).newTicket?.description).toMatch(/\n\n2 pièces jointes non lues par l'agent, à vérifier\.$/u);
   });
-});
-
-it.each(["Je vous adresse ma demande de résiliation.","Je vous transmets ma demande de résiliation."])("REVIEW641 a request sent to support is not a file pointer: %s",async text=>{
- const f=fixture(["cancellation"]);f.input.message.currentText=text;
- expect((await f.run()).decision.disposition.kind).toBe("ticket");
- f.input.message.unreadAttachments=[{sourceId:"attachment:pdf",reason:"unsupported_type"}];
- f.analysis.unreadAttachmentRequirements=[{sourceId:"attachment:pdf",role:"accessory",textQuote:text}];
- expect((await f.run()).decision.disposition.kind).toBe("ticket");
-});
-it.each(["Veuillez trouver ci-joint les détails.","Veuillez trouver ci-joint le document."])("REVIEW641 a courtesy-only file delivery has no autonomous request: %s",async text=>{
- const f=fixture();f.input.message.currentText=text;f.input.message.unreadAttachments=[{sourceId:"attachment:pdf",reason:"unsupported_type"}];
- f.analysis.unreadAttachmentRequirements=[{sourceId:"attachment:pdf",role:"accessory",textQuote:text}];
- expect((await f.run()).decision.disposition.kind).toBe("collect_context");
-});
-
-describe("SAV-42 B (review 6416af0): handing over a request vs handing over a file", () => {
-  const run = async (text: string, kind: MessageAnalysis["requests"][number]["kind"] = "support") => {
-    const f = fixture([kind]); f.input.message.currentText = text;
-    f.input.message.unreadAttachments = [{ sourceId: "attachment:pdf", reason: "unsupported_type" }];
-    f.analysis.unreadAttachmentRequirements = [{ sourceId: "attachment:pdf", role: "accessory", textQuote: text }];
-    return (await f.run()).decision.disposition.kind;
-  };
-  it.each([
-    ["Je vous fais parvenir ma demande de remboursement.", "finance"],
-    ["Je vous transmets ma réclamation sur la facturation de septembre.", "finance"],
-    ["Je vous envoie ce message car la synchronisation échoue.", "support"],
-    ["Les détails de ma facture sont faux.", "finance"],
-    ["Les documents exportés sont vides.", "support"],
-    ["L'image de profil ne s'affiche plus.", "support"],
-    ["Impossible de joindre un fichier à un message.", "support"],
-    ["Connexion impossible.", "support"],
-  ] as const)("a request written in the sentence is handled: %j", async (text, kind) => {
-    expect(await run(text, kind)).toBe("ticket");
+  it("a ticket without unread files keeps the reader's description unchanged", async () => {
+    const f = fixture(); f.input.message.currentText = "Connexion impossible.";
+    expect((await f.run()).newTicket?.description).toBe("Synthetic description covering all declared requests");
   });
-  it.each([
-    "Vous trouverez ci-joint les éléments demandés.",
-    "Merci de trouver en pièce jointe les explications.",
-    "Ci-joint les informations nécessaires.",
-    "Je vous joins ma facture.",
-    "Je vous envoie le document.",
-    "Je vous transmets la capture d'écran.",
-    "Veuillez trouver le détail dans le fichier joint.",
-  ])("handing over a file without a written need stays with the team: %j", async text => {
-    expect(await run(text)).toBe("collect_context");
+  it("an existing ticket is linked without rewriting it; the email carries the file", async () => {
+    const f = fixture(); f.input.message.currentText = "Connexion impossible."; f.tickets.push(ticket());
+    f.input.message.unreadAttachments = [{ sourceId: "attachment:pdf-0", reason: "unsupported_type" }];
+    f.analysis.unreadAttachmentRequirements = [{ sourceId: "attachment:pdf-0", role: "accessory", textQuote: "Connexion impossible." }];
+    const p = await f.run();
+    expect(target(p).target.operation).toBe("link"); expect(p.newTicket).toBeUndefined();
+    expect(target(p).requiredPermissions).toContain("associate_email");
   });
-});
-
-// Independent review: a delivery clause must neither erase a written need
-// nor become a need merely because its modifier is longer than three words.
-describe("REVIEWDBA delivery clause and autonomous request", () => {
- const run = async(text: string) => {
-  const f=fixture(); f.input.message.currentText=text;
-  f.input.message.unreadAttachments=[{sourceId:"attachment:pdf",reason:"unsupported_type"}];
-  f.analysis.unreadAttachmentRequirements=[{sourceId:"attachment:pdf",role:"accessory",textQuote:text}];
-  return f.run();
- };
- it.each([
-  "Je vous envoie une capture car la connexion échoue.",
-  "Je vous transmets le document et je ne peux plus me connecter à mon compte.",
-  "Je vous adresse une capture : mon compte ne se connecte plus.",
- ])("keeps an explicit written need after a file-delivery clause: %s",async text=>{
-  const without=fixture(); without.input.message.currentText=text;
-  expect((await without.run()).decision.disposition.kind).toBe("ticket");
-  expect((await run(text)).decision.disposition.kind).toBe("ticket");
- });
- it.each([
-  "Je vous envoie, comme convenu, le document.",
-  "Je vous transmets comme vous me l’avez demandé la capture d’écran.",
- ])("a file delivery modifier cannot invent a written need: %s",async text=>{
-  const p=await run(text);expect(p.decision.disposition.kind).toBe("collect_context");expect(p.steps).toEqual([]);
- });
- it.each([
-  ["Connexion impossible.","ticket"],
-  ["Je vous envoie le document.","collect_context"],
-  ["La connexion échoue. Je vous envoie une capture.","ticket"],
-  ["Je vous adresse ma demande d’aide pour une connexion impossible.","ticket"],
- ])("control %s",async(text,expected)=>{
-  expect((await run(text)).decision.disposition.kind).toBe(expected);
- });
-});
-
-describe("SAV-42 B (review dba2738): delivery proposition vs written need, at clause level", () => {
-  const run = async (text: string) => {
-    const f = fixture(); f.input.message.currentText = text;
-    f.input.message.unreadAttachments = [{ sourceId: "attachment:pdf", reason: "unsupported_type" }];
-    f.analysis.unreadAttachmentRequirements = [{ sourceId: "attachment:pdf", role: "accessory", textQuote: text }];
-    return (await f.run()).decision.disposition.kind;
-  };
-  it.each([
-    "Je vous envoie le fichier parce que l'export ne fonctionne plus.",
-    "Je vous transmets la capture, mais la page reste blanche.",
-    "Je vous fais suivre le document ; la facture est en double.",
-    "Ci-joint la facture, je souhaite résilier mon abonnement.",
-    "Je vous joins ma facture car le montant est faux.",
-    "Veuillez trouver ci-joint la capture : le bouton ne répond plus.",
-  ])("a need written after a delivery proposition is kept: %j", async text => {
-    expect(await run(text)).toBe("ticket");
-  });
-  it.each([
-    "Veuillez trouver, comme convenu, le document ci-joint.",
-    "Je vous fais parvenir, suite à notre échange de ce matin, le fichier.",
-    "Je vous joins, à toutes fins utiles, ma facture.",
-    "Ci-joint la facture demandée.",
-    "Je vous transmets, comme demandé lors de notre appel, la capture d'écran en pièce jointe.",
-  ])("a delivery proposition with incidental complements states no need: %j", async text => {
-    expect(await run(text)).toBe("collect_context");
-  });
-});
-
-describe("REVIEWCFA clause boundaries preserve the written request", () => {
- const run=async(text:string)=>{
-  const f=fixture([text.includes("résilier") ? "cancellation" : "support"]);f.input.message.currentText=text;
-  f.input.message.unreadAttachments=[{sourceId:"attachment:pdf",reason:"unsupported_type"}];
-  f.analysis.unreadAttachmentRequirements=[{sourceId:"attachment:pdf",role:"accessory",textQuote:text}];
-  return f.run();
- };
- it.each([
-  "La connexion échoue, erreur décrite dans la capture jointe.",
-  "Je souhaite résilier mon abonnement, demande expliquée dans le document joint.",
- ])("a location clause cannot erase a preceding explicit request: %s",async text=>{
-  const without=fixture([text.includes("résilier") ? "cancellation" : "support"]);without.input.message.currentText=text;
-  expect((await without.run()).decision.disposition.kind).toBe("ticket");
-  expect((await run(text)).decision.disposition.kind).toBe("ticket");
- });
- it.each([
-  "Je vous joins la facture et le relevé.",
-  "Je vous envoie le document et ma facture.",
- ])("a coordination of delivered objects is not a second request: %s",async text=>{
-  const p=await run(text);expect(p.decision.disposition.kind).toBe("collect_context");expect(p.steps).toEqual([]);
- });
- it.each([
-  ["La connexion échoue. Erreur décrite dans la capture jointe.","ticket"],
-  ["Je vous joins la facture et je ne peux plus accéder à mon compte.","ticket"],
-  ["Le problème est décrit dans la capture jointe.","collect_context"],
- ])("control %s",async(text,expected)=>expect((await run(text)).decision.disposition.kind).toBe(expected));
-});
-
-describe("SAV-42 B (review cfa34a9): location bounded to its proposition, nominal coordination", () => {
-  const run = async (text: string) => {
-    const f = fixture(); f.input.message.currentText = text;
-    f.input.message.unreadAttachments = [{ sourceId: "attachment:pdf", reason: "unsupported_type" }];
-    f.analysis.unreadAttachmentRequirements = [{ sourceId: "attachment:pdf", role: "accessory", textQuote: text }];
-    return (await f.run()).decision.disposition.kind;
-  };
-  it.each([
-    "Impossible d'exporter, détail expliqué dans le PDF joint.",
-    "La synchronisation plante ; erreur visible sur la capture jointe.",
-    "Le paiement est refusé : message indiqué dans la capture jointe.",
-    "Je vous envoie le document et je n'arrive plus à me connecter.",
-    "Je vous joins la facture et le relevé car le montant diffère.",
-    "Je vous envoie la capture, la page reste blanche.",
-  ])("a request outside the file proposition is kept: %j", async text => {
-    expect(await run(text)).toBe("ticket");
-  });
-  it.each([
-    "Erreur décrite dans la capture jointe.",
-    "Tout le problème est expliqué dans le document joint.",
-    "Je vous joins la facture, le devis et le relevé.",
-    "Je vous transmets la capture et le fichier de log.",
-    "Je vous envoie le document et la capture d'écran.",
-  ])("only a file proposition or a list of delivered objects stays with the team: %j", async text => {
-    expect(await run(text)).toBe("collect_context");
+  it("an accessory quote absent from the current text is refused whatever its wording", async () => {
+    const f = fixture(); f.input.message.currentText = "Connexion impossible.";
+    f.input.message.unreadAttachments = [{ sourceId: "attachment:pdf-0", reason: "unsupported_type" }];
+    f.analysis.unreadAttachmentRequirements = [{ sourceId: "attachment:pdf-0", role: "accessory", textQuote: "La connexion échoue depuis hier." }];
+    reason(await f.run(), "history_incomplete");
   });
 });
