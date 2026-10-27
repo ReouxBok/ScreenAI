@@ -8,13 +8,15 @@ export type IntakeOutputStage = "sanitize_wire" | "visual_normalize" | "decode" 
 export type IntakeOutputNormalization = {
   nullOptionalKeys: number; partialImages: number; truncatedImageTexts: number; truncatedUncertainties: number;
   droppedUncertainties: number; droppedRegions: number; truncatedRegionTexts: number; invalidBoxes: number; omittedChars: number;
+  /** Unproven optional registration declarations discarded (identity falls back to the sender). */
+  discardedRegistrations: number;
 };
-export const INTAKE_NULLABLE_OPTIONAL_KEYS = ["nature", "registration", "ticketSummary", "imageRequirements"] as const;
+export const INTAKE_NULLABLE_OPTIONAL_KEYS = ["nature", "registration", "ticketSummary", "imageRequirements", "unreadAttachmentRequirements"] as const;
 export const SAV_VISUAL_TRUNCATED_NOTE = "Observation abrégée : contenu visuel tronqué à la limite autorisée.";
 export const SAV_VISUAL_INVALID_BOX_NOTE = "Coordonnées de zone invalides ignorées.";
 
 export const emptyIntakeOutputNormalization = (): IntakeOutputNormalization => ({ nullOptionalKeys: 0, partialImages: 0, truncatedImageTexts: 0,
-  truncatedUncertainties: 0, droppedUncertainties: 0, droppedRegions: 0, truncatedRegionTexts: 0, invalidBoxes: 0, omittedChars: 0 });
+  truncatedUncertainties: 0, droppedUncertainties: 0, droppedRegions: 0, truncatedRegionTexts: 0, invalidBoxes: 0, omittedChars: 0, discardedRegistrations: 0 });
 export const intakeOutputNormalized = (n: IntakeOutputNormalization) => Object.values(n).some(v => v > 0);
 export function addIntakeOutputNormalization(into: IntakeOutputNormalization, from: IntakeOutputNormalization) {
   for (const key of Object.keys(into) as (keyof IntakeOutputNormalization)[]) into[key] += from[key];

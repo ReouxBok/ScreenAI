@@ -7,7 +7,7 @@ import { auditLogs, savMessages } from "@/db/schema";
 import { decryptSavPayload, encryptSavPayload } from "../crypto";
 import { savDerivedCostQuote } from "../derived-budget";
 import type { SavGeminiMetadata } from "../gemini-response";
-import { withSavAiBudget } from "../gemini-transport";
+import { SAV_AI_BUDGET, savAiCancellationCode, withSavAiBudget } from "../gemini-transport";
 import { planSavIntake } from "./engine";
 import type { EnginePolicy, IntakePlan, ReadResult } from "./engine-types";
 import { createSavIntakeHubspotReaders, type SavIntakeCrmReaders } from "./hubspot-readers";
@@ -66,13 +66,17 @@ export async function claimSavIntakeComparison(campaignId: string, messageId: st
   });
 }
 /** Reserve one dispatch: the campaign is re-validated now (schema, list, `until`), then its money cap. */
-export async function reserveSavIntakeComparisonCall(env: () => Record<string, string | undefined>, campaignId: string, messageId: string, claimId: string, requestHash: string, model: string) {
+export async function reserveSavIntakeComparisonCall(env: () => Record<string, string | undefined>, campaignId: string, messageId: string, claimId: string, requestHash: string, model: string, signal?: AbortSignal) {
+  const active = () => { const code = savAiCancellationCode(signal); if (code) throw Error(code); };
+  active();
   return requireDb().transaction(async tx => {
     await tx.execute(LOCK);
+    active();
     const config = savIntakeComparisonConfig(env());
     if (!config || config.campaignId !== campaignId || !config.messageIds.includes(messageId)) throw Error("SAV_INTAKE_COMPARISON_EXPIRED");
     const price = savDerivedCostQuote(model, 8192);
     if (savIntakeComparisonSpend(await events(tx, campaignId)) + price.reservedNanoUsd > config.maxNanoUsd) throw Error("SAV_INTAKE_COMPARISON_BUDGET_EXHAUSTED");
+    active();
     const callId = randomUUID();
     await append(tx, { campaignId, messageId, claimId, callId, event: "reserved", requestHash, reservedNanoUsd: price.reservedNanoUsd });
     return { id: callId, cached: null };
@@ -80,10 +84,13 @@ export async function reserveSavIntakeComparisonCall(env: () => Record<string, s
 }
 /** Grouped plan check on the campaign's own ledger and caps (never the live ledger): every group of
  * the plan must fit before the first one is dispatched. Read-only; reservations re-check each call. */
-export async function assertSavIntakeComparisonPlan(env: () => Record<string, string | undefined>, campaignId: string, messageId: string, hashes: readonly string[], model: string) {
+export async function assertSavIntakeComparisonPlan(env: () => Record<string, string | undefined>, campaignId: string, messageId: string, hashes: readonly string[], model: string, signal?: AbortSignal) {
+  const active = () => { const code = savAiCancellationCode(signal); if (code) throw Error(code); };
+  active();
   if (!hashes.length || hashes.length > 3 || new Set(hashes).size !== hashes.length) throw Error("SAV_INTAKE_RUNTIME_DISPATCH_REJECTED");
   await requireDb().transaction(async tx => {
     await tx.execute(LOCK);
+    active();
     const config = savIntakeComparisonConfig(env());
     if (!config || config.campaignId !== campaignId || !config.messageIds.includes(messageId)) throw Error("SAV_INTAKE_COMPARISON_EXPIRED");
     if (savIntakeComparisonSpend(await events(tx, campaignId)) + hashes.length * savDerivedCostQuote(model, 8192).reservedNanoUsd > config.maxNanoUsd) throw Error("SAV_INTAKE_COMPARISON_BUDGET_EXHAUSTED");
@@ -184,18 +191,19 @@ async function compareOne(messageId: string, claimId: string, campaign: SavIntak
     await readIntakeSimpleContext(crm.capture, address, policy, AbortSignal.timeout(30_000));
   const crmHash = await crm.freeze();
   const side = async (kind: "current" | "simple"): Promise<Side> => {
-    const traces: IntakeModelTrace[] = [], controller = new AbortController(), timer = setTimeout(() => controller.abort(), 60_000);
+    const traces: IntakeModelTrace[] = [], controller = new AbortController(), timer = setTimeout(() => controller.abort(Error("SAV_INTAKE_COMPARISON_DEADLINE")), SAV_AI_BUDGET.durationMs);
     const dispatcher = createIntakeModelDispatcher({ config: runtime, signal: controller.signal, env, network,
-      live: async () => { if (!savIntakeComparisonConfig(env())) throw Error("SAV_INTAKE_COMPARISON_EXPIRED"); },
-      reserve: hash => reserveSavIntakeComparisonCall(env, campaign.campaignId, messageId, claimId, hash, runtime.model), settle: settleSavIntakeComparisonCall(campaign.campaignId),
-      preflight: hashes => assertSavIntakeComparisonPlan(env, campaign.campaignId, messageId, hashes, runtime.model) });
+      live: async () => { if (controller.signal.aborted) throw Error("SAV_INTAKE_COMPARISON_DEADLINE"); if (!savIntakeComparisonConfig(env())) throw Error("SAV_INTAKE_COMPARISON_EXPIRED"); },
+      reserve: hash => reserveSavIntakeComparisonCall(env, campaign.campaignId, messageId, claimId, hash, runtime.model, controller.signal), settle: settleSavIntakeComparisonCall(campaign.campaignId),
+      preflight: hashes => assertSavIntakeComparisonPlan(env, campaign.campaignId, messageId, hashes, runtime.model, controller.signal) });
     const semantic = kind === "simple"
       ? createSavIntakeSimpleReaders({ model: runtime.model, call: dispatcher.call, crm: crm.frozen, policy, provenance: snapshot.provenance, onTrace: t => traces.push(t) })
       : createSavIntakeSemanticReaders({ model: runtime.model, call: dispatcher.call, planCalls: dispatcher.plan, provenance: snapshot.provenance, onTrace: t => traces.push(t) });
     let plan: IntakePlan | undefined, technical: string | null = null;
-    try { plan = await withSavAiBudget(() => planSavIntake(structuredClone(snapshot.input), { ...crm.frozen, ...semantic }, policy, { timeoutMs: 10_000 }, () => new Date())); }
+    try { plan = await withSavAiBudget(() => planSavIntake(structuredClone(snapshot.input), { ...crm.frozen, ...semantic }, policy, { timeoutMs: 10_000, modelTimeoutMs: SAV_AI_BUDGET.durationMs }, () => new Date())); }
     catch (error) { technical = error instanceof Error && /^SAV_[A-Z0-9_]+$/.test(error.message) ? error.message : "SAV_INTAKE_COMPARISON_FAILED"; }
-    finally { clearTimeout(timer); await Promise.allSettled(dispatcher.pending); }
+    finally { try { await Promise.allSettled(dispatcher.pending); } finally { clearTimeout(timer); } }
+    technical ??= savAiCancellationCode(controller.signal);
     technical ??= dispatcher.failureReason ?? traces.find(t => !t.accepted && t.errorCode)?.errorCode ?? null;
     return { summary: technical ? null : intakePlanSummary(plan), technical, uncertain: dispatcher.uncertain, calls: traces.filter(t => t.metadata).length };
   };

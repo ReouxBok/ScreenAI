@@ -137,9 +137,14 @@ describe("source-bound citation producer; existing containment stays authoritati
   });
   it("keeps registration attributed to the current sender and the actual declared address", async () => {
     const other = { ...message, id: tid, direction: "outbound" as const, currentText: "L'adresse d'inscription est other@example.test." };
-    const model = createSavIntakeSemanticReaders({ model: "gemini-fixture", call: async arg => result({ ...request(arg),
+    const traces: IntakeModelTrace[] = [];
+    const model = createSavIntakeSemanticReaders({ model: "gemini-fixture", onTrace: t => traces.push(t), call: async arg => result({ ...request(arg),
       registration: { address: "other@example.test", sourceMessageId: other.id, quoteId: anchor(arg, `message-${other.id}`) } }) });
-    await expect(model.analyseMessage({ message, conversation: [other] }, signal())).rejects.toThrow("CITATION_REJECTED");
+    // SAV-42: an outbound declaration is never adopted; it is discarded and counted
+    // instead of rejecting the customer's otherwise usable request.
+    const analysis = await model.analyseMessage({ message, conversation: [other] }, signal());
+    expect(analysis.registration).toBeUndefined();
+    expect(traces.at(-1)).toMatchObject({ accepted: true, normalization: { discardedRegistrations: 1 } });
   });
   it("does not call or retry the provider after cancellation", async () => {
     const provider = vi.fn<IntakeGeminiCall>(async arg => result(request(arg)));

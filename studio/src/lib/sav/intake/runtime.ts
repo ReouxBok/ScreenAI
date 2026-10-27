@@ -87,10 +87,10 @@ async function analyseSavIntakeRuntimeWithinBudget(runId: string, config: Intake
     const attachments = lease.recoveringRead ? null : await prepareIntakeAttachments(lease, config.model, live, deps.downloadAttachments);
     if (attachments) {
       payload.attachments = attachments.state;
-      if (attachments.complete) {
-        lease.input = intakeInputWithAttachments(lease.input, lease.sourceHash, attachments.state, attachments.prepared);
-        payload.input = lease.input;
-      }
+      // Complete image selections become visual inputs; durable unread files of a complete
+      // text become explicit unread attachments. Anything else leaves the input unchanged.
+      const next = intakeInputWithAttachments(lease.input, lease.sourceHash, attachments.state, attachments.prepared);
+      if (next !== lease.input) { lease.input = next; payload.input = lease.input; }
       await writeCheckpoint();
     }
     const crm = createSavIntakeHubspotReaders({ onRead: trace => { if(trace.status!=="complete")readFailure=trace;traces.push(trace); checkpoint(); }, network: async (url, init) => {

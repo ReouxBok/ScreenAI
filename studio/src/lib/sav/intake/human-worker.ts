@@ -24,6 +24,7 @@ import { createSavIntakeHubspotReaders } from "./hubspot-readers";
 import type { EngineInput, IntakeAdapters, IntakePlan } from "./engine-types";
 import type { ExecutionPayload, EffectAck } from "./execution-types";
 import { savEffectiveReceivedAt } from "@/lib/sav/message-order";
+import { assertSavAgentAnalysisAllowed, readSavAgentPause, savAgentPauseCode, SAV_AGENT_ANALYSIS_PAUSE_CODES } from "./agent-pause";
 /** Reconstruct compatible overrides from authenticated immutable events, never
  * from client fields or an arbitrary input snapshot. Every ancestor is already
  * bound by intakeRunConfigurationBound and is checked again while traversing. */
@@ -161,6 +162,9 @@ export async function consumeIntakeHumanEvent(id: string, config: IntakeRuntimeC
     await admissionLock(tx);
     const [event] = await tx.select().from(savIntakeHumanEvents).where(eq(savIntakeHumanEvents.id, id)).for("update");
     if (!event || !["pending", "reading"].includes(event.state) || event.readAttempts >= 2 || event.leaseUntil && event.leaseUntil > now) return null;
+    // Full pause: nothing is written, the event keeps its two reads for the resume.
+    const pause = await readSavAgentPause(tx);
+    if (pause.level === "fully_paused") return { paused: savAgentPauseCode(pause)! };
     const [parent] = await tx.select().from(savIntakeRuns).where(eq(savIntakeRuns.id, event.parentRunId));
     const [thread] = await tx.select().from(savThreads).where(eq(savThreads.id, event.threadId)).for("update");
     const [message] = await tx.select().from(savMessages).where(eq(savMessages.id, event.messageId));
@@ -174,6 +178,7 @@ export async function consumeIntakeHumanEvent(id: string, config: IntakeRuntimeC
     return { event: updated, parent, snapshot: await savIntakeSourceSnapshot(tx, message, now) };
   });
   if (!claim) return { skipped: "not_claimed" };
+  if ("paused" in claim) return { skipped: claim.paused };
   try {
     const { event, parent, snapshot } = claim, value = decryptSavPayload<HumanEventPayload>(event.payloadCiphertext);
     const original = decryptSavPayload<IntakeRuntimePayload>(parent.payloadCiphertext);
@@ -191,11 +196,11 @@ export async function consumeIntakeHumanEvent(id: string, config: IntakeRuntimeC
     const needsAnalysis=Boolean(value.reinvestigate || original.plan?.progress.kind==="qualified_other" && input.humanResolution?.classification!==undefined && input.humanResolution.classification!=="other"
       && (!reusableAnalysis?.ticketSummary || reusableAnalysis.requests.some(r=>r.kind==="other"||r.kind==="unknown")));
     const authority={eventId:id,parentRunId:parent.id,token};
-    const live=async()=>{if(savIntakeRuntimeConfig()?.configHash!==config.configHash||deadline.aborted)return conflict();await assertIntakeHumanAnalysis(authority,config);};
+    const live=async()=>{if(savIntakeRuntimeConfig()?.configHash!==config.configHash||deadline.aborted)return conflict();await assertSavAgentAnalysisAllowed(db);await assertIntakeHumanAnalysis(authority,config);};
     const dispatcher=needsAnalysis?createIntakeModelDispatcher({config,signal:deadline,live,reserve:hash=>reserveIntakeHumanCall(authority,config,hash),preflight:hashes=>assertSavIntakeCallPlan(parent.messageId,config,hashes)}):null;
     const semantics: IntakeRuntimePayload["semantics"]=needsAnalysis?{revision:SAV_INTAKE_SEMANTIC_RECORD_REVISION,validatorRevision:SAV_INTAKE_MODEL_REVISION,records:[]}:original.semantics;
     const attachments=value.reinvestigate ? await prepareIntakeAttachments({run:parent,token,...snapshot},config.model,live) : null;
-    if(attachments?.complete) input={...intakeInputWithAttachments(input,event.sourceHash,attachments.state,attachments.prepared),humanResolution:input.humanResolution};
+    if(attachments) input={...intakeInputWithAttachments(input,event.sourceHash,attachments.state,attachments.prepared),humanResolution:input.humanResolution};
     const fresh=dispatcher&&semantics?recordAcceptedIntakeSemantics(createSavIntakeSemanticReaders({model:config.model,call:dispatcher.call,planCalls:dispatcher.plan,
       ...(attachments?.complete ? {attachments:{prepared:attachments.prepared,onRead:observations=>{
         attachments.state.read={...attachments.state.read,observations,state:"complete",completedAt:new Date().toISOString()};
@@ -203,6 +208,7 @@ export async function consumeIntakeHumanEvent(id: string, config: IntakeRuntimeC
       provenance:snapshot.provenance,humanClassification:input.humanResolution?.classification}),semantics,()=>{}):null;
     const boundedReaders = Object.fromEntries(Object.entries(readers).map(([name, fn]) => [name, async (argument: string, signal: AbortSignal) => {
       if (deadline.aborted) throw Error("SAV_INTAKE_HUMAN_REVALIDATION_REQUIRED");
+      await assertSavAgentAnalysisAllowed(db);
       return fn(argument, AbortSignal.any([signal, deadline]));
     }])) as typeof readers;
     const confirmedPlan=input.humanResolution?.ticketId ? await confirmedCreationRevision(original,input,input.humanResolution.ticketId,config,boundedReaders) : null;
@@ -221,6 +227,8 @@ export async function consumeIntakeHumanEvent(id: string, config: IntakeRuntimeC
     }
     const result = await db.transaction(async tx => {
       await admissionLock(tx);
+      // A validated human choice is no implicit permission to ignore a full pause.
+      await assertSavAgentAnalysisAllowed(tx);
       const [execution] = await tx.select().from(savIntakeExecutions).where(eq(savIntakeExecutions.messageId, event.messageId)).for("update");
       const [thread] = await tx.select().from(savThreads).where(eq(savThreads.id, event.threadId)).for("update");
       const [current] = await tx.select().from(savIntakeRuns).where(eq(savIntakeRuns.id, parent.id)).for("update");
@@ -252,7 +260,9 @@ export async function consumeIntakeHumanEvent(id: string, config: IntakeRuntimeC
     return result;
   } catch (error) {
     const reason = error instanceof Error && /^SAV_[A-Z_]+$/.test(error.message) ? error.message : "SAV_INTAKE_HUMAN_REVALIDATION_REQUIRED";
-    await db.update(savIntakeHumanEvents).set({ state: claim.event.readAttempts >= 2 ? "waiting" : "pending", leaseToken: null, leaseUntil: null })
+    // A read interrupted by a full pause is given back: the pause never exhausts the event.
+    const readAttempts = SAV_AGENT_ANALYSIS_PAUSE_CODES.has(reason) ? claim.event.readAttempts - 1 : claim.event.readAttempts;
+    await db.update(savIntakeHumanEvents).set({ state: readAttempts >= 2 ? "waiting" : "pending", readAttempts, leaseToken: null, leaseUntil: null })
       .where(and(eq(savIntakeHumanEvents.id, id), eq(savIntakeHumanEvents.leaseToken, token)));
     await db.insert(savIntakeJournal).values({ runId: claim.parent.id, kind: "human_revalidation_waiting", payloadCiphertext: encryptSavPayload({ eventId: id, reason }) });
     return { waiting: reason };
@@ -261,6 +271,8 @@ export async function consumeIntakeHumanEvent(id: string, config: IntakeRuntimeC
 export async function reconcileIntakeHumanChoices() {
   const config = savIntakeRuntimeConfig();
   if (!config || !await intakeConsoleInstalled()) return { skipped: "off" };
+  const pause = await readSavAgentPause(requireDb());
+  if (pause.level === "fully_paused") return { skipped: savAgentPauseCode(pause)! };
   const expired = await requireDb().select({id:savIntakeHumanEvents.id}).from(savIntakeHumanEvents).where(and(eq(savIntakeHumanEvents.state,"reading"),eq(savIntakeHumanEvents.readAttempts,2),lt(savIntakeHumanEvents.leaseUntil,new Date()))).limit(4);
   for (const row of expired) await requireDb().update(savIntakeHumanEvents).set({state:"waiting",leaseToken:null,leaseUntil:null}).where(and(eq(savIntakeHumanEvents.id,row.id),lt(savIntakeHumanEvents.leaseUntil,new Date())));
   const [event] = await requireDb().select().from(savIntakeHumanEvents).where(and(inArray(savIntakeHumanEvents.state, ["pending", "reading"]),

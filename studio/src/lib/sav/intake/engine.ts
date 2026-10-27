@@ -35,6 +35,11 @@ export function savIntakePlanFingerprint(plan: Pick<IntakePlan, "decision" | "no
     originalThreadId: plan.originalThreadId, originalRecipientEmails: plan.originalRecipientEmails, referenceMode: plan.referenceMode }));
 }
 
+/** Appended to a created ticket whose email carries files the agent did not read. */
+export function savIntakeUnreadAttachmentNotice(count: number) {
+  return count === 1 ? "1 pièce jointe non lue par l'agent, à vérifier." : `${count} pièces jointes non lues par l'agent, à vérifier.`;
+}
+
 /** Read and plan only. There is deliberately no write, model client, DB or dispatch dependency. */
 export async function planSavIntake(
   input: EngineInput, adapters: IntakeAdapters, policy: EnginePolicy, overrides: Partial<EngineLimits> = {},
@@ -48,6 +53,8 @@ export async function planSavIntake(
   const limits = { readCalls: 50, timeoutMs: 2000, contacts: 10, tickets: 20, ...overrides };
   if (Object.values(limits).some(n => !Number.isSafeInteger(n) || n < 1)
     || limits.contacts > 10 || limits.tickets > 20 || limits.readCalls > 100 || limits.timeoutMs > 10_000) throw new Error("SAV_INTAKE_LIMITS_INVALID");
+  const modelTimeoutMs = limits.modelTimeoutMs ?? limits.timeoutMs;
+  if (modelTimeoutMs > 60_000) throw new Error("SAV_INTAKE_LIMITS_INVALID");
   let calls = 0;
   const readTime = () => {
     const value = readClock ? readClock().getTime() : Date.parse(input.now);
@@ -110,14 +117,14 @@ export async function planSavIntake(
     choice ? { kind: "human_choice", messageId: message.id, classification: classification === "cancellation" || classification === "finance" || classification === "support" ? classification : "unknown", questionCode: choice, investigation: "bounded_investigation_complete", evidenceIds: evidence.map(e => e.id).sort(), view: "to_validate" }
       : { kind: "processing", phase: reason.startsWith("classification") ? "classification" : "context", view: null },
   );
-  async function bounded<T>(fn: (signal: AbortSignal) => Promise<T>, reason: ContextReason): Promise<T> {
+  async function bounded<T>(fn: (signal: AbortSignal) => Promise<T>, reason: ContextReason, timeoutMs = limits.timeoutMs): Promise<T> {
     if (calls >= limits.readCalls) fail(reason);
     calls++;
     const controller = new AbortController();
     let timer: ReturnType<typeof setTimeout> | undefined;
     try {
       return await Promise.race([Promise.resolve().then(() => fn(controller.signal)), new Promise<never>((_, reject) => {
-        timer = setTimeout(() => { controller.abort(Error("SAV_INTAKE_STEP_DEADLINE")); reject(new ContextFault(reason)); }, limits.timeoutMs);
+        timer = setTimeout(() => { controller.abort(Error("SAV_INTAKE_STEP_DEADLINE")); reject(new ContextFault(reason)); }, timeoutMs);
       })]);
     } catch { return fail(reason); }
     finally { if (timer) clearTimeout(timer); }
@@ -178,7 +185,7 @@ export async function planSavIntake(
       || input.previousIdentification?.state !== "confirmed" || input.previousIdentification.messageId !== initial.id
       || normalizeEmail(input.previousIdentification.address) !== normalizeEmail(message.fromEmail))) return context("history_incomplete");
     const parsedAnalysis = messageAnalysisSchema.safeParse(await bounded(signal => adapters.analyseMessage({ message, conversation,
-      ...(continuation ? { identificationContinuation: continuation } : {}) }, signal), "classification_incomplete"));
+      ...(continuation ? { identificationContinuation: continuation } : {}) }, signal), "classification_incomplete", modelTimeoutMs));
     if (!parsedAnalysis.success) return context("classification_incomplete");
     const analysis = parsedAnalysis.data;
     const inherited = analysis.requests.filter(r => r.originMessageId !== undefined);
@@ -220,6 +227,17 @@ export async function planSavIntake(
       if (observations.some(o => o.status !== "analyzed" && !accessory(o))) return context("classification_incomplete");
       for (const observation of observations) addEvidence(observation.sourceId, "current_attachment", message.id, observation);
     } else if (analysis.attachmentObservations?.length) return context("classification_incomplete");
+    if (message.unreadAttachments?.length) {
+      // Text analysable, files not read: the reader judges each file's role. The engine only checks
+      // what it can verify: one requirement per file, role accessory, quote present in the current
+      // text. A required/unknown file keeps the dossier for the team; the wording is not parsed here.
+      const requirements = analysis.unreadAttachmentRequirements ?? [];
+      const accessory = (u: { sourceId: string }) => requirements.filter(r => r.sourceId === u.sourceId).length === 1
+        && requirements.some(r => r.sourceId === u.sourceId && r.role === "accessory" && r.textQuote && savEvidenceContains(message.currentText, r.textQuote));
+      if (requirements.some(r => !message.unreadAttachments!.some(u => u.sourceId === r.sourceId))) return context("classification_incomplete");
+      if (message.unreadAttachments.some(u => !accessory(u))) return context("history_incomplete");
+      for (const unread of message.unreadAttachments) addEvidence(unread.sourceId, "current_attachment", message.id, { ...unread, read: false });
+    } else if (analysis.unreadAttachmentRequirements?.length) return context("classification_incomplete");
     if (!requests.length && analysis.nature === "newsletter" && policy.qualifiedOther?.family === "authenticated_newsletter" && !policy.manualSupportOverride) classification = "other";
     else if (!requests.length || kinds.includes("unknown") || classification === "mixed") return context("classification_incomplete", "request_scope_uncertain");
     if (policy.manualSupportOverride && classification === "other") {
@@ -306,7 +324,7 @@ export async function planSavIntake(
         }
         candidateContexts.push({ contact: c, tickets: rows });
       }
-      const parsed = identityAssessmentSchema.safeParse(await bounded(signal => adapters.assessIdentity!({ message, address, candidates: candidateContexts, evidence: [...evidence], ...(initialProof ? { requestContext: initial } : {}) }, signal), "contact_ambiguous"));
+      const parsed = identityAssessmentSchema.safeParse(await bounded(signal => adapters.assessIdentity!({ message, address, candidates: candidateContexts, evidence: [...evidence], ...(initialProof ? { requestContext: initial } : {}) }, signal), "contact_ambiguous", modelTimeoutMs));
       if (!parsed.success) return context("contact_ambiguous");
       const resolution = parsed.data;
       const required = [current, ...contacts.flatMap(c => [`contact-${c.id}`, `identity-search-${c.id}`]), ...[...seenTickets.keys()].flatMap(id => [`identity-ticket-${id}`, `identity-history-${id}`])];
@@ -373,7 +391,7 @@ export async function planSavIntake(
       }
     }
     if (evidence.length > 95) return context("history_incomplete");
-    const parsedAssessment = issueAssessmentSchema.safeParse(await bounded(signal => adapters.assessIssues({ message, requests: analysis.requests, tickets: collected, evidence: [...evidence], ...(initialProof ? { requestContext: initial } : {}) }, signal), "same_issue_unresolved"));
+    const parsedAssessment = issueAssessmentSchema.safeParse(await bounded(signal => adapters.assessIssues({ message, requests: analysis.requests, tickets: collected, evidence: [...evidence], ...(initialProof ? { requestContext: initial } : {}) }, signal), "same_issue_unresolved", modelTimeoutMs));
     if (!parsedAssessment.success) return context("same_issue_unresolved");
     const assessment = parsedAssessment.data;
     const humanTicketId = input.humanResolution?.ticketId;
@@ -421,7 +439,10 @@ export async function planSavIntake(
       const summary = analysis.ticketSummary;
       if (!summary || summary.title.split(/\s+/).length > 6 || summary.requestIds.length !== requests.length
         || unique(summary.requestIds).length !== requests.length || requests.some(r => !summary.requestIds.includes(r.id))) return context("classification_incomplete");
-      newTicket = { ...summary, requestIds: [...summary.requestIds].sort(), contactId: primary.id, pipeline: "support", stage: "new", source: "email", owner: "leave_unassigned" };
+      // Unread files ride with the associated email; the team is told they were not read.
+      const unread = message.unreadAttachments?.length ?? 0;
+      const description = unread ? `${summary.description}\n\n${savIntakeUnreadAttachmentNotice(unread)}` : summary.description;
+      newTicket = { ...summary, description, requestIds: [...summary.requestIds].sort(), contactId: primary.id, pipeline: "support", stage: "new", source: "email", owner: "leave_unassigned" };
     }
     const openIds = candidateTickets.filter(t => t.stage !== "closed" && t.contactIds.includes(targetContactId)).map(t => t.id).sort();
     const multiple = openIds.length + (target.operation === "link" ? 0 : 1) > 1;

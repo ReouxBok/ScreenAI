@@ -92,3 +92,47 @@ it("rejects a batch outside the dispatcher capability before durable preflight",
   await expect(dispatcher.plan([invalid])).rejects.toThrow("REQUEST_REJECTED"); expect(dispatcher.failureReason).toBe("SAV_INTAKE_RUNTIME_REQUEST_REJECTED");
   expect(preflight).not.toHaveBeenCalled();
 });
+
+it("preserves a local parent deadline instead of reporting a provider outage", async () => {
+  const parent = new AbortController(), input = inputAtSize(1000);
+  const network = vi.fn<typeof fetch>(async (_url, init) => {
+    parent.abort(Error("SAV_INTAKE_COMPARISON_DEADLINE"));
+    throw init!.signal!.reason;
+  });
+  const dispatcher = createIntakeModelDispatcher({ config, live: async () => {}, reserve: async () => ({ id: "deadline-call", cached: null }),
+    signal: parent.signal, network, env: () => ({ SAV_GEMINI_API_KEY: "synthetic-key" }) });
+  await expect(dispatcher.call(input)).rejects.toThrow("SAV_INTAKE_COMPARISON_DEADLINE");
+  expect(network).toHaveBeenCalledTimes(1);
+  expect(dispatcher.failureReason).toBe("SAV_INTAKE_COMPARISON_DEADLINE");
+  expect(settleSavIntakeCall).toHaveBeenCalledTimes(1);
+});
+it("does not reserve or send a call after its side has expired", async () => {
+  const parent = new AbortController(), input = inputAtSize(1000), reserve = vi.fn(async () => ({ id: "late-call", cached: null })), network = vi.fn<typeof fetch>();
+  parent.abort(Error("SAV_INTAKE_COMPARISON_DEADLINE"));
+  const dispatcher = createIntakeModelDispatcher({ config, live: async () => {}, reserve, network,
+    signal: parent.signal, env: () => ({ SAV_GEMINI_API_KEY: "synthetic-key" }) });
+  await expect(dispatcher.call(input)).rejects.toThrow("SAV_INTAKE_COMPARISON_DEADLINE");
+  expect(reserve).not.toHaveBeenCalled(); expect(network).not.toHaveBeenCalled(); expect(settleSavIntakeCall).not.toHaveBeenCalled();
+});
+
+it("does not send after the side expires while a durable reservation is pending", async () => {
+  const parent = new AbortController(), input = inputAtSize(1000), network = vi.fn<typeof fetch>();
+  const reserve = vi.fn(async () => { parent.abort(Error("SAV_INTAKE_COMPARISON_DEADLINE")); return { id: "expired-during-reserve", cached: null }; });
+  const dispatcher = createIntakeModelDispatcher({ config, live: async () => {}, reserve, network,
+    signal: parent.signal, env: () => ({ SAV_GEMINI_API_KEY: "synthetic-key" }) });
+  await expect(dispatcher.call(input)).rejects.toThrow("SAV_INTAKE_COMPARISON_DEADLINE");
+  expect(network).not.toHaveBeenCalled(); expect(settleSavIntakeCall).toHaveBeenCalledTimes(1);
+  expect(settleSavIntakeCall).toHaveBeenCalledWith("expired-during-reserve", expect.any(Object));
+});
+it("a reservation slower than the CRM deadline does not consume the provider attempt allowance", async () => {
+  const input = inputAtSize(1000), network = vi.fn<typeof fetch>(async () => Response.json({ candidates: [{ finishReason: "STOP", content: { parts: [{ text: '{"fixture":true}' }] } }], usageMetadata: { promptTokenCount: 100, candidatesTokenCount: 50, thoughtsTokenCount: 0, totalTokenCount: 150 } }));
+  const dispatcher = createIntakeModelDispatcher({ config, live: async () => {}, reserve: async () => {
+    await new Promise(resolve => setTimeout(resolve, 12_000)); return { id: "slow-reservation", cached: null };
+  }, network, signal: new AbortController().signal, env: () => ({ SAV_GEMINI_API_KEY: "synthetic-key" }) });
+  vi.useFakeTimers();
+  try {
+    const work = dispatcher.call(input); await vi.advanceTimersByTimeAsync(12_000);
+    await expect(work).resolves.toMatchObject({ json: { fixture: true } });
+    expect(network).toHaveBeenCalledTimes(1);
+  } finally { vi.useRealTimers(); }
+});

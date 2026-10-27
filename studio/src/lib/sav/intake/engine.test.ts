@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { planSavIntake } from "./engine";
 import { projectSavIntakeProgress } from "./progress";
 import type { EngineInput, EnginePolicy, IntakeAdapters, IntakeContact, IntakePlan, IntakeTicket, MessageAnalysis, ReadResult } from "./engine-types";
@@ -429,4 +429,158 @@ it.each(["accessory","required","multiple","explicit_dependency"])("keeps unread
  f.analysis.imageRequirements=f.input.message.attachmentInputs.map((i,n)=>({...i,role:mode==="required"||mode==="multiple"&&n===1?"required":"accessory",textQuote:f.input.message.currentText}));
  const p=await f.run();if(mode==="accessory")expect(p.decision.disposition.kind).toBe("ticket");else reason(p,"classification_incomplete");
  expect(f.analysis.attachmentObservations.every(o=>o.status==="unreadable")).toBe(true);expect(p.decision.evidence.filter(e=>e.source==="current_attachment")).toHaveLength(mode==="accessory"?f.input.message.attachmentInputs.length:0);
+});
+
+
+it("keeps CRM deadlines separate from the comparison semantic allowance", async () => {
+  const f = fixture(["acknowledgement"]);
+  f.adapters.analyseMessage = async () => { await new Promise(resolve => setTimeout(resolve, 12_000)); return f.analysis; };
+  vi.useFakeTimers();
+  try {
+    const work = planSavIntake(f.input, f.adapters, f.policy, { timeoutMs: 10_000, modelTimeoutMs: 60_000 });
+    await vi.advanceTimersByTimeAsync(12_000);
+    expect((await work).decision.disposition).toMatchObject({ kind: "no_ticket", reason: "acknowledgement_only" });
+    // Existing callers retain the previous deadline; only the comparison opts in.
+    const unchanged = planSavIntake(f.input, f.adapters, f.policy, { timeoutMs: 10_000 });
+    await vi.advanceTimersByTimeAsync(10_000); reason(await unchanged, "classification_incomplete");
+  } finally { vi.useRealTimers(); }
+});
+it("does not extend CRM reads when a comparison allows longer model work", async () => {
+  const f = fixture(); let lookupSignal: AbortSignal | undefined;
+  f.adapters.findContactsByEmail = async (_email, signal) => { lookupSignal = signal; await new Promise(resolve => setTimeout(resolve, 12_000)); return read([]); };
+  vi.useFakeTimers();
+  try {
+    const work = planSavIntake(f.input, f.adapters, f.policy, { timeoutMs: 10_000, modelTimeoutMs: 60_000 });
+    await vi.advanceTimersByTimeAsync(10_000); reason(await work, "contact_lookup_failed");
+    expect(lookupSignal?.aborted).toBe(true);
+  } finally { vi.useRealTimers(); }
+});
+it.each([0, -1, 60_001, NaN, Infinity])("rejects an invalid semantic deadline %s", async modelTimeoutMs => {
+  const f = fixture();
+  await expect(planSavIntake(f.input, f.adapters, f.policy, { modelTimeoutMs })).rejects.toThrow("SAV_INTAKE_LIMITS_INVALID");
+  expect(f.calls).toEqual([]);
+});
+
+describe("SAV-42 B: complete text with unread attachments", () => {
+  const pdf = { sourceId: "attachment:pdf-1", reason: "unsupported_type" as const };
+  const text = "Je souhaite mettre fin au contrat et ne pas le renouveler. Vous trouverez la facture en pièce jointe pour référence.";
+  const setup = (kinds: MessageAnalysis["requests"][number]["kind"][] = ["cancellation"]) => {
+    const f = fixture(kinds); f.input.message.currentText = text; f.input.message.unreadAttachments = [pdf]; return f;
+  };
+  it("qualifies and handles the written request when the unread file is cited as accessory", async () => {
+    const f = setup();
+    f.analysis.unreadAttachmentRequirements = [{ sourceId: pdf.sourceId, role: "accessory", textQuote: "Je souhaite mettre fin au contrat et ne pas le renouveler." }];
+    const p = await f.run();
+    expect(p.decision.classification).toBe("cancellation");
+    expect(target(p).target.operation).toBe("create");
+    expect(p.decision.evidence.filter(e => e.source === "current_attachment").map(e => e.id)).toEqual([pdf.sourceId]);
+  });
+  it.each(["required", "unknown"] as const)("a %s unread file keeps the dossier for the team, with its classification", async role => {
+    const f = setup();
+    f.analysis.unreadAttachmentRequirements = [{ sourceId: pdf.sourceId, role, textQuote: "Je souhaite mettre fin au contrat et ne pas le renouveler." }];
+    const p = await f.run();
+    reason(p, "history_incomplete");
+    expect(p.decision.classification).toBe("cancellation");
+  });
+  it("no requirement for the unread file is never treated as accessory", async () => {
+    const p = await setup().run();
+    reason(p, "history_incomplete");
+  });
+  it("an accessory claim without a quote from the current text is refused", async () => {
+    const f = setup();
+    f.analysis.unreadAttachmentRequirements = [{ sourceId: pdf.sourceId, role: "accessory", textQuote: "Texte absent du message." }];
+    reason(await f.run(), "history_incomplete");
+  });
+  it("two requirements for the same unread file are never accessory", async () => {
+    const f = setup();
+    const quote = "Je souhaite mettre fin au contrat et ne pas le renouveler.";
+    f.analysis.unreadAttachmentRequirements = [{ sourceId: pdf.sourceId, role: "accessory", textQuote: quote }, { sourceId: pdf.sourceId, role: "accessory", textQuote: quote }];
+    reason(await f.run(), "history_incomplete");
+  });
+  it("requirements for an unknown file, or without unread files, are rejected", async () => {
+    const f = setup();
+    f.analysis.unreadAttachmentRequirements = [{ sourceId: "attachment:other", role: "accessory", textQuote: "Je souhaite mettre fin au contrat et ne pas le renouveler." }];
+    reason(await f.run(), "classification_incomplete");
+    const g = fixture();
+    g.analysis.unreadAttachmentRequirements = [{ sourceId: pdf.sourceId, role: "accessory", textQuote: "Synthetic current authored request" }];
+    reason(await g.run(), "classification_incomplete");
+  });
+  it("an acknowledgement with a required unread file is not silently completed", async () => {
+    const f = setup(["acknowledgement"]);
+    f.analysis.unreadAttachmentRequirements = [{ sourceId: pdf.sourceId, role: "required" }];
+    reason(await f.run(), "history_incomplete");
+  });
+});
+
+describe("SAV-42 B: mixed readable image and unread PDF", () => {
+  const image = { sourceId: "image-1", fileHash: "1".repeat(64) }, pdf = { sourceId: "attachment:pdf-1", reason: "unsupported_type" as const };
+  const mixed = (pdfRole: "accessory" | "required") => {
+    const f = fixture(); f.input.message.currentText = "La connexion échoue à chaque ouverture de l’application depuis hier.";
+    f.input.message.attachmentInputs = [image]; f.input.message.unreadAttachments = [pdf];
+    f.analysis.attachmentObservations = [{ ...image, filename: "synthetic.png", mimeType: "image/png", referenceHash: "r", width: 1, height: 1, status: "analyzed", reason: "observed", text: "Erreur 500", uncertainties: [], regions: [] }];
+    f.analysis.imageRequirements = [{ ...image, role: "accessory", textQuote: f.input.message.currentText }];
+    f.analysis.unreadAttachmentRequirements = [{ sourceId: pdf.sourceId, role: pdfRole, textQuote: f.input.message.currentText }];
+    return f;
+  };
+  it("handles the request with the read image and an accessory unread PDF, keeping both distinct in the evidence", async () => {
+    const p = await mixed("accessory").run();
+    expect(target(p).target.operation).toBe("create");
+    expect(p.decision.evidence.filter(e => e.source === "current_attachment").map(e => e.id).sort()).toEqual([pdf.sourceId, image.sourceId].sort());
+  });
+  it("keeps the dossier for the team when the unread PDF is required", async () => {
+    reason(await mixed("required").run(), "history_incomplete");
+  });
+});
+
+describe("SAV-42 B contract: the reader judges the role, the engine checks only what it can verify", () => {
+  // The wording is not parsed by the engine: the same sentences, including the ones earlier
+  // reviews used against the grammar guard, follow the reader's role in both directions.
+  const sentences = [
+    "Voir PJ.",
+    "Le problème est décrit dans le PDF joint.",
+    "Le problème, comme dit, est décrit dans le PDF joint.",
+    "Je vous envoie la capture et la page reste blanche.",
+    "Je vous transmets le document et mon compte ne fonctionne plus.",
+    "Je vous joins la facture et le relevé.",
+    "Je souhaite résilier mon abonnement, facture en PJ pour information.",
+    "Connexion impossible.",
+  ];
+  const run = async (text: string, role: "accessory" | "required" | "unknown", count = 1) => {
+    const f = fixture(); f.input.message.currentText = text;
+    const files = Array.from({ length: count }, (_, n) => ({ sourceId: `attachment:pdf-${n}`, reason: "unsupported_type" as const }));
+    f.input.message.unreadAttachments = files;
+    f.analysis.unreadAttachmentRequirements = files.map(u => ({ sourceId: u.sourceId, role, textQuote: text }));
+    return f.run();
+  };
+  it.each(sentences)("an accessory file with an exact quote is handled and flagged on the ticket: %j", async text => {
+    const p = await run(text, "accessory");
+    expect(target(p).target.operation).toBe("create");
+    expect(p.newTicket?.description).toBe("Synthetic description covering all declared requests\n\n1 pièce jointe non lue par l'agent, à vérifier.");
+    expect(p.decision.evidence.filter(e => e.source === "current_attachment").map(e => e.id)).toEqual(["attachment:pdf-0"]);
+  });
+  it.each(sentences.flatMap(text => (["required", "unknown"] as const).map(role => [text, role] as const)))("a %s file keeps the dossier for the team: %j", async (text, role) => {
+    const p = await run(text, role);
+    expect(p.decision.disposition.kind).toBe("collect_context"); expect(p.steps).toEqual([]);
+  });
+  it("counts several unread files in the ticket notice", async () => {
+    expect((await run("Connexion impossible.", "accessory", 2)).newTicket?.description).toMatch(/\n\n2 pièces jointes non lues par l'agent, à vérifier\.$/u);
+  });
+  it("a ticket without unread files keeps the reader's description unchanged", async () => {
+    const f = fixture(); f.input.message.currentText = "Connexion impossible.";
+    expect((await f.run()).newTicket?.description).toBe("Synthetic description covering all declared requests");
+  });
+  it("an existing ticket is linked without rewriting it; the email carries the file", async () => {
+    const f = fixture(); f.input.message.currentText = "Connexion impossible."; f.tickets.push(ticket());
+    f.input.message.unreadAttachments = [{ sourceId: "attachment:pdf-0", reason: "unsupported_type" }];
+    f.analysis.unreadAttachmentRequirements = [{ sourceId: "attachment:pdf-0", role: "accessory", textQuote: "Connexion impossible." }];
+    const p = await f.run();
+    expect(target(p).target.operation).toBe("link"); expect(p.newTicket).toBeUndefined();
+    expect(target(p).requiredPermissions).toContain("associate_email");
+  });
+  it("an accessory quote absent from the current text is refused whatever its wording", async () => {
+    const f = fixture(); f.input.message.currentText = "Connexion impossible.";
+    f.input.message.unreadAttachments = [{ sourceId: "attachment:pdf-0", reason: "unsupported_type" }];
+    f.analysis.unreadAttachmentRequirements = [{ sourceId: "attachment:pdf-0", role: "accessory", textQuote: "La connexion échoue depuis hier." }];
+    reason(await f.run(), "history_incomplete");
+  });
 });

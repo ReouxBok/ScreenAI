@@ -10,7 +10,7 @@ import { SAV_ATTACHMENT_LIMITS } from "./attachment-contract";
 
 export const SAV_AI_TRANSPORT_REVISION = "sav-gemini-transport-2026-10-22.v6";
 export type SavAiPhase = "understanding" | "composition" | "coherence" | "ticket_matching" | "repair" | "learning_comparison" | "attachment_reading" | "translation";
-export type SavAiFailureCategory = "authentication" | "billing" | "rate_limited" | "provider_unavailable" | "invalid_output" | "blocked_output" | "budget_exhausted";
+export type SavAiFailureCategory = "authentication" | "billing" | "rate_limited" | "provider_unavailable" | "invalid_output" | "blocked_output" | "budget_exhausted" | "cancelled";
 export type SavAiTransportTrace = {
   transportRevision: string; correlationId: string; phase: SavAiPhase; model: string; promptRevision: string;
   attempts: number; retries: number; durationMs: number; errorCode: string | null;
@@ -53,7 +53,14 @@ function rejectUntypedMedia(value: unknown, depth = 0): void {
   }
 }
 
+/** An observed local cancellation is not evidence of provider unavailability. */
+export function savAiCancellationCode(signal?: AbortSignal): string | null {
+  if (!signal?.aborted) return null;
+  return signal.reason instanceof Error && /^SAV_[A-Z0-9_]{1,80}$/.test(signal.reason.message) ? signal.reason.message : "SAV_AI_CANCELLED";
+}
+
 function category(code: string): SavAiFailureCategory {
+  if (code === "SAV_AI_CANCELLED" || code === "SAV_EVAL_CANCELLED" || /SAV_INTAKE_(STEP|COMPARISON)_DEADLINE/.test(code)) return "cancelled";
   if (/HTTP_(401|403)$/.test(code)) return "authentication";
   if (code === "SAV_AI_HTTP_402") return "billing";
   if (code === "SAV_AI_HTTP_429") return "rate_limited";
@@ -109,7 +116,7 @@ export function savGeminiWireBody(input: { phase: SavAiPhase; model: string; bod
 
 export async function requestSavGeminiJson(input: {
   phase: SavAiPhase; apiKey: string; model: string; body: { generationConfig: Record<string, unknown>; [key: string]: unknown };
-  fetch?: typeof fetch; allowRetry?: boolean; promptRevision?: string; derivedReservationId?: string;
+  fetch?: typeof fetch; allowRetry?: boolean; promptRevision?: string; derivedReservationId?: string; signal?: AbortSignal;
   media?: readonly SavAdmittedImage[];
 }): Promise<{ json: unknown; metadata: SavGeminiMetadata }> {
   if (!budgets.getStore()) return withSavAiBudget(() => requestSavGeminiJson(input));
@@ -123,6 +130,8 @@ export async function requestSavGeminiJson(input: {
     console.warn("sav_ai_transport", { ...savRunProvenance(), ...metadata.transport, ...metadata, transport: undefined });
     throw new SavAiTransportError(code, metadata);
   };
+  const cancelled = savAiCancellationCode(input.signal);
+  if (cancelled) return fail(cancelled);
   if (input.phase === "repair") {
     if (budget.repairs >= SAV_AI_BUDGET.repairs) return fail("SAV_AI_BUDGET_EXCEEDED");
     budget.repairs++;
@@ -145,6 +154,8 @@ export async function requestSavGeminiJson(input: {
     budget.visualCalls++;
   }
   for (;;) {
+    const cancelled = savAiCancellationCode(input.signal);
+    if (cancelled) return fail(cancelled);
     const remaining = Math.min(deadline - Date.now(), remainingTime(budget));
     if (remaining <= 0 || budget.calls >= SAV_AI_BUDGET.calls || budget.reservedTokens + allowance > SAV_AI_BUDGET.tokenAllowance || budget.outputTokens + output > SAV_AI_BUDGET.outputTokens)
       return fail("SAV_AI_BUDGET_EXCEEDED");
@@ -160,7 +171,7 @@ export async function requestSavGeminiJson(input: {
     try {
       if (derivedStage) savDerivedCostQuote(input.model, output);
       const response = await (input.fetch ?? fetch)(`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(input.model)}:generateContent`, {
-        method: "POST", headers: { "Content-Type": "application/json", "x-goog-api-key": input.apiKey }, body, signal: controller.signal,
+        method: "POST", headers: { "Content-Type": "application/json", "x-goog-api-key": input.apiKey }, body, signal: input.signal ? AbortSignal.any([controller.signal, input.signal]) : controller.signal,
       });
       if (!response.ok) {
         code = `SAV_AI_HTTP_${response.status}`;
@@ -173,7 +184,7 @@ export async function requestSavGeminiJson(input: {
       }
       let payload: unknown;
       try { payload = await response.json(); } catch (error) {
-        if (controller.signal.aborted) throw error;
+        if (controller.signal.aborted || input.signal?.aborted) throw error;
         throw new Error("SAV_AI_INVALID_RESPONSE");
       }
       const generated = readSavGeminiResponse(payload);
@@ -186,6 +197,8 @@ export async function requestSavGeminiJson(input: {
         if (derivedStage && reservationId && !controller.signal.aborted && Date.now() <= deadline) await settleSavDerivedCall(reservationId, metadata);
         throw error;
       }
+      const cancelled = savAiCancellationCode(input.signal);
+      if (cancelled) return fail(cancelled);
       if (controller.signal.aborted || Date.now() > deadline) return fail("SAV_AI_TIMEOUT");
       if (derivedStage && reservationId) await settleSavDerivedCall(reservationId, metadata);
       metadata.transport = trace(null);
@@ -193,7 +206,9 @@ export async function requestSavGeminiJson(input: {
       return { json, metadata };
     } catch (error) {
       if (error instanceof SavAiTransportError || isSavDerivedBudgetDeferred(error)) throw error;
-      if (controller.signal.aborted || error instanceof Error && error.name === "AbortError") code = "SAV_AI_TIMEOUT";
+      const cancelled = savAiCancellationCode(input.signal);
+      if (cancelled) code = cancelled;
+      else if (controller.signal.aborted || error instanceof Error && error.name === "AbortError") code = "SAV_AI_TIMEOUT";
       else if (error instanceof Error && /^SAV_AI_(HTTP_[1-5]\d{2}|INVALID_RESPONSE|INVALID_JSON|OUTPUT_(BLOCKED|TRUNCATED|INCOMPLETE)|EMPTY_OUTPUT)$/.test(error.message)) code = error.message;
     } finally {
       clearTimeout(timer);
