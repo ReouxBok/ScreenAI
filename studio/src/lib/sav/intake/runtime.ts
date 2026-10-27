@@ -84,7 +84,7 @@ async function analyseSavIntakeRuntimeWithinBudget(runId: string, config: Intake
     const retryOrdinal = await intakeTransientRetries(lease.run.messageId);
     dispatcher = createIntakeModelDispatcher({ config, live, retryOrdinal, reserve: hash => reserveSavIntakeCall(lease, config, hash), preflight: hashes => assertSavIntakeCallPlan(lease.run.messageId, config, hashes), signal: controller.signal, env, network });
     const { call, pending } = dispatcher;
-    const attachments = lease.recoveringRead ? null : await prepareIntakeAttachments(lease, config.model, live, deps.downloadAttachments);
+    const attachments = lease.recoveringRead ? null : await prepareIntakeAttachments(lease, config.model, live, deps.downloadAttachments, { pdf: config.pdfReading === true });
     if (attachments) {
       payload.attachments = attachments.state;
       // Complete image selections become visual inputs; durable unread files of a complete
