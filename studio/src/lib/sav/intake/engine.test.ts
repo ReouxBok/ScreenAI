@@ -680,3 +680,65 @@ describe("SAV-42 B (review 6416af0): handing over a request vs handing over a fi
     expect(await run(text)).toBe("collect_context");
   });
 });
+
+// Independent review: a delivery clause must neither erase a written need
+// nor become a need merely because its modifier is longer than three words.
+describe("REVIEWDBA delivery clause and autonomous request", () => {
+ const run = async(text: string) => {
+  const f=fixture(); f.input.message.currentText=text;
+  f.input.message.unreadAttachments=[{sourceId:"attachment:pdf",reason:"unsupported_type"}];
+  f.analysis.unreadAttachmentRequirements=[{sourceId:"attachment:pdf",role:"accessory",textQuote:text}];
+  return f.run();
+ };
+ it.each([
+  "Je vous envoie une capture car la connexion échoue.",
+  "Je vous transmets le document et je ne peux plus me connecter à mon compte.",
+  "Je vous adresse une capture : mon compte ne se connecte plus.",
+ ])("keeps an explicit written need after a file-delivery clause: %s",async text=>{
+  const without=fixture(); without.input.message.currentText=text;
+  expect((await without.run()).decision.disposition.kind).toBe("ticket");
+  expect((await run(text)).decision.disposition.kind).toBe("ticket");
+ });
+ it.each([
+  "Je vous envoie, comme convenu, le document.",
+  "Je vous transmets comme vous me l’avez demandé la capture d’écran.",
+ ])("a file delivery modifier cannot invent a written need: %s",async text=>{
+  const p=await run(text);expect(p.decision.disposition.kind).toBe("collect_context");expect(p.steps).toEqual([]);
+ });
+ it.each([
+  ["Connexion impossible.","ticket"],
+  ["Je vous envoie le document.","collect_context"],
+  ["La connexion échoue. Je vous envoie une capture.","ticket"],
+  ["Je vous adresse ma demande d’aide pour une connexion impossible.","ticket"],
+ ])("control %s",async(text,expected)=>{
+  expect((await run(text)).decision.disposition.kind).toBe(expected);
+ });
+});
+
+describe("SAV-42 B (review dba2738): delivery proposition vs written need, at clause level", () => {
+  const run = async (text: string) => {
+    const f = fixture(); f.input.message.currentText = text;
+    f.input.message.unreadAttachments = [{ sourceId: "attachment:pdf", reason: "unsupported_type" }];
+    f.analysis.unreadAttachmentRequirements = [{ sourceId: "attachment:pdf", role: "accessory", textQuote: text }];
+    return (await f.run()).decision.disposition.kind;
+  };
+  it.each([
+    "Je vous envoie le fichier parce que l'export ne fonctionne plus.",
+    "Je vous transmets la capture, mais la page reste blanche.",
+    "Je vous fais suivre le document ; la facture est en double.",
+    "Ci-joint la facture, je souhaite résilier mon abonnement.",
+    "Je vous joins ma facture car le montant est faux.",
+    "Veuillez trouver ci-joint la capture : le bouton ne répond plus.",
+  ])("a need written after a delivery proposition is kept: %j", async text => {
+    expect(await run(text)).toBe("ticket");
+  });
+  it.each([
+    "Veuillez trouver, comme convenu, le document ci-joint.",
+    "Je vous fais parvenir, suite à notre échange de ce matin, le fichier.",
+    "Je vous joins, à toutes fins utiles, ma facture.",
+    "Ci-joint la facture demandée.",
+    "Je vous transmets, comme demandé lors de notre appel, la capture d'écran en pièce jointe.",
+  ])("a delivery proposition with incidental complements states no need: %j", async text => {
+    expect(await run(text)).toBe("collect_context");
+  });
+});

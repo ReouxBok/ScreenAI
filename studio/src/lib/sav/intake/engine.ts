@@ -36,35 +36,49 @@ export function savIntakePlanFingerprint(plan: Pick<IntakePlan, "decision" | "no
 }
 
 /** Read and plan only. There is deliberately no write, model client, DB or dispatch dependency. */
-const FILE = "(?:p\\.?\\s?j(?!\\p{L})|pi[eè]ces?\\s+jointes?|ci-?joint\\p{L}*|annexes?|captures?(?:\\s+d['’]\\s*[ée]cran)?|screenshots?|attachments?|pdf|fichiers?|documents?|images?|photos?|scans?|\\p{L}+\\s+joint\\p{L}*)";
-/** A sentence whose predicate sends the reader to the file carries no need of its own:
- * "Voir PJ", "Le problème est détaillé dans le PDF joint", "Je vous envoie la capture",
- * "Ci-joint le détail". A mere mention ("…, facture en PJ pour information") is not one. */
-const FILE_POINTER = new RegExp([
-  `(?<!\\p{L})(?:voir|cf\\.?|regarde[rz]?|consulte[rz]?|ouvre[rz]?|see|check)\\s+(?:\\p{L}+['’]?\\s+){0,2}${FILE}`,
-  `(?<!\\p{L})(?:d[ée]taill\\p{L}*|d[ée]cri\\p{L}*|expliqu\\p{L}*|pr[ée]cis[ée]\\p{L}*|indiqu\\p{L}*|visible|figure|trouver|trouverez|trouvez|tout\\s+est)(?!\\p{L})[^.!?]{0,40}(?<!\\p{L})(?:dans|en|sur|ci)(?!\\p{L})[^.!?]{0,30}${FILE}`,
-  // "Je vous joins…" always hands over a file; "envoie/transmets/adresse/fais parvenir" only when
-  // what is handed over is a file ("Je vous adresse ma demande de résiliation" is a request).
-  `(?<!\\p{L})je\\s+vous\\s+joins(?!\\p{L})`,
-  `(?<!\\p{L})je\\s+vous\\s+(?:envoie|transmets|adresse|fais\\s+parvenir)(?!\\p{L})\\s+(?:\\p{L}+['’]?\\s+){0,3}${FILE}`,
-  `^\\s*ci-?joint`,
-].join("|"), "iu");
+// A file reference, with its "joint / ci-joint / en annexe" qualifier when present.
+const FILE = String.raw`(?:(?:p\.?\s?j(?!\p{L})|pi[eè]ces?\s+jointes?|ci-?joint\p{L}*|annexes?|captures?(?:\s+d['’]\s*[ée]cran)?|screenshots?|attachments?|pdf|fichiers?|documents?|images?|photos?|scans?|\p{L}+\s+(?=joint))(?:\s+(?:joint\p{L}*|ci-?joint\p{L}*|en\s+annexe))?)`;
+/** "Ci-joint", "en PJ", "en pièce jointe", "en annexe": the delivered object follows them. */
+const FILE_ADVERB = String.raw`(?:ci-?joint\p{L}*|en\s+(?:p\.?\s?j(?!\p{L})|pi[eè]ces?\s+jointes?|annexe))`;
+/** Inside one proposition: any character except a sentence or clause boundary. Commas and
+ * incidental complements ("comme convenu", "comme vous me l'avez demandé") stay inside;
+ * a connector or a comma followed by a subject pronoun starts another proposition. */
+const IN_CLAUSE = String.raw`(?:(?![.!?;:]|(?<!\p{L})(?:car|parce|mais|donc|puisque|lorsque|quand|et)(?!\p{L})|,\s*(?:je|j['’]|nous|on|il|elle|ils|elles|ça|cela)(?!\p{L}))[\s\S])`;
+const DELIVERY = String.raw`(?:je\s+vous\s+(?:envoie|transmets|adresse|fais\s+parvenir|fais\s+suivre)|veuillez\s+trouver|vous\s+trouverez|merci\s+de\s+trouver|vous\s+pouvez\s+trouver|trouvez)`;
+/** Propositions that only hand over or point to the file. Each regex removes the proposition
+ * itself, never the rest of the sentence, so a need written after it is kept:
+ * "Je vous envoie une capture car la connexion échoue" keeps "car la connexion échoue". */
+const FILE_POINTERS = [
+  // "Le problème est détaillé dans le PDF joint", "Tout est dans le fichier joint": the subject
+  // names the need and the predicate places it in the file; up to the file reference.
+  new RegExp(String.raw`^${IN_CLAUSE}*?(?<!\p{L})(?:d[ée]taill\p{L}*|d[ée]cri\p{L}*|expliqu\p{L}*|pr[ée]cis[ée]\p{L}*|indiqu\p{L}*|visible|figure|tout\s+est)(?!\p{L})${IN_CLAUSE}*?(?<!\p{L})(?:dans|en|sur)(?!\p{L})${IN_CLAUSE}*?${FILE}`, "iu"),
+  // "Je vous joins …": joining is handing over a file; its object runs to the clause end.
+  new RegExp(String.raw`(?<!\p{L})je\s+vous\s+joins(?!\p{L})${IN_CLAUSE}*`, "iu"),
+  // "Je vous envoie/transmets … <fichier>", "Veuillez trouver ci-joint …": handing over a file,
+  // whatever incidental complement sits in between; an adverb ("ci-joint") takes its object.
+  new RegExp(String.raw`(?<!\p{L})${DELIVERY}(?!\p{L})${IN_CLAUSE}*?(?:${FILE_ADVERB}${IN_CLAUSE}*|${FILE})`, "iu"),
+  // "Ci-joint la facture", at the start of the proposition.
+  new RegExp(String.raw`^\s*ci-?joint\p{L}*${IN_CLAUSE}*`, "iu"),
+  // "Voir PJ", "Regardez le fichier joint", "Cf. la capture".
+  // "Voir PJ", "Regardez le fichier joint", "Cf. la capture"; a purpose complement ("pour
+  // comprendre le problème") describes what the file holds and belongs to the pointer.
+  new RegExp(String.raw`(?<!\p{L})(?:voir|cf\.?|regarde[rz]?|consulte[rz]?|ouvre[rz]?|see|check)\s+(?:\p{L}+['’]?\s+){0,2}${FILE}(?:\s*,?\s*(?:pour|afin\s+de)(?!\p{L})${IN_CLAUSE}*)?`, "iu"),
+];
 /** The file mention itself, with the noun it qualifies ("facture en PJ", "le PDF joint"). */
-const FILE_MENTION = new RegExp(`(?:\\p{L}+\\s+(?:en\\s+)?)?${FILE}`, "giu");
+const FILE_MENTION = new RegExp(String.raw`(?:\p{L}+\s+(?:en\s+)?)?${FILE}`, "giu");
 const NOT_A_REQUEST = new Set(["bonjour", "bonsoir", "salut", "hello", "merci", "thanks", "cordialement", "regards", "bonne", "journée", "soirée", "svp", "stp",
   "madame", "monsieur", "s'il", "vous", "plaît", "plait", "pour", "information", "info", "référence", "reference", "et", "de", "du", "des", "le", "la", "les",
-  "l'", "un", "une", "en", "à", "au", "aux", "ma", "mon", "mes", "votre", "vos", "ce", "cette", "ci", "cf", "voir", "see", "regardez", "consultez",
-  // File-delivery courtesy ("Veuillez trouver ci-joint les détails"): the verbs and the generic
-  // nouns that only name the file's content state no need once the file mention is removed.
-  "veuillez", "pouvez", "trouver", "trouverez", "joindre", "détail", "détails", "élément", "éléments", "explication", "explications",
-  "informations", "demandées", "demandés", "demandé", "demandée", "nécessaires", "utiles"]);
-/** An "accessory" file needs a cited current sentence that states the request on its own:
- * pointer sentences are set aside, file mentions are removed from the others, and what
- * remains must say more than courtesy. Length is not a criterion. */
+  "l'", "un", "une", "en", "à", "au", "aux", "ma", "mon", "mes", "votre", "vos", "ce", "cette", "ci", "cf", "voir", "see", "regardez", "consultez"]);
+/** An "accessory" file needs a cited current sentence that states the request on its own.
+ * In each sentence the propositions that only hand over or point to the file are removed,
+ * then the remaining file mentions; what is left must say more than courtesy. Length is not
+ * a criterion, and a request written next to a delivery proposition is kept. */
 export function intakeQuoteStatesRequest(quote: string) {
-  return quote.split(/(?<=[.!?…])\s+|\n+/u).filter(sentence => !FILE_POINTER.test(sentence))
-    .some(sentence => (sentence.replace(FILE_MENTION, " ").toLowerCase().match(/[\p{L}'’]+/gu) ?? [])
-      .some(word => !NOT_A_REQUEST.has(word.replace(/’/g, "'"))));
+  return quote.split(/(?<=[.!?…])\s+|\n+/u).some(sentence => {
+    let rest = sentence;
+    for (const pointer of FILE_POINTERS) rest = rest.replace(pointer, " ");
+    return (rest.replace(FILE_MENTION, " ").toLowerCase().match(/[\p{L}'’]+/gu) ?? []).some(word => !NOT_A_REQUEST.has(word.replace(/’/g, "'")));
+  });
 }
 
 export async function planSavIntake(
