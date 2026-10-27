@@ -36,18 +36,28 @@ export function savIntakePlanFingerprint(plan: Pick<IntakePlan, "decision" | "no
 }
 
 /** Read and plan only. There is deliberately no write, model client, DB or dispatch dependency. */
-/** A sentence that sends the reader to a file ("Voir PJ", "détaillé dans le PDF joint",
- * "cf. la capture") does not express the need itself. */
-const ATTACHMENT_REFERENCE = /(?<!\p{L})(?:p\.?\s?j(?!\p{L})|pi[eè]ces?\s+jointes?|ci-?joint\p{L}*|en\s+annexe|captures?\s+d['’]\s*[ée]cran|screenshots?|attachments?|attached|(?:pdf|fichiers?|documents?|captures?|images?|photos?|factures?|scans?)\s+joint\p{L}*|(?:voir|regardez|consultez|cf\.?|see)\s+(?:la\s+|les\s+|le\s+|l['’]\s*|the\s+|en\s+)?(?:pdf|fichiers?|documents?|captures?|images?|pi[eè]ces?))/iu;
-const COURTESY = new Set(["bonjour", "bonsoir", "salut", "hello", "merci", "thanks", "cordialement", "regards", "bonne", "journée", "soirée", "svp", "stp", "madame", "monsieur", "à", "vous", "s'il", "plaît", "plait", "et", "de", "le", "la", "les",
-  // A bare pointer verb ("Cf.", "Voir") is cut from its object by the sentence split.
-  "cf", "voir", "see", "regardez", "consultez", "ci"]);
+const FILE = "(?:p\\.?\\s?j(?!\\p{L})|pi[eè]ces?\\s+jointes?|ci-?joint\\p{L}*|annexes?|captures?(?:\\s+d['’]\\s*[ée]cran)?|screenshots?|attachments?|pdf|fichiers?|documents?|images?|photos?|scans?|\\p{L}+\\s+joint\\p{L}*)";
+/** A sentence whose predicate sends the reader to the file carries no need of its own:
+ * "Voir PJ", "Le problème est détaillé dans le PDF joint", "Je vous envoie la capture",
+ * "Ci-joint le détail". A mere mention ("…, facture en PJ pour information") is not one. */
+const FILE_POINTER = new RegExp([
+  `(?<!\\p{L})(?:voir|cf\\.?|regarde[rz]?|consulte[rz]?|ouvre[rz]?|see|check)\\s+(?:\\p{L}+['’]?\\s+){0,2}${FILE}`,
+  `(?<!\\p{L})(?:d[ée]taill\\p{L}*|d[ée]cri\\p{L}*|expliqu\\p{L}*|pr[ée]cis[ée]\\p{L}*|indiqu\\p{L}*|visible|figure|trouverez|trouvez|tout\\s+est)(?!\\p{L})[^.!?]{0,40}(?<!\\p{L})(?:dans|en|sur|ci)(?!\\p{L})[^.!?]{0,30}${FILE}`,
+  `(?<!\\p{L})je\\s+vous\\s+(?:envoie|transmets|joins|adresse|fais\\s+parvenir)(?!\\p{L})`,
+  `^\\s*ci-?joint`,
+].join("|"), "iu");
+/** The file mention itself, with the noun it qualifies ("facture en PJ", "le PDF joint"). */
+const FILE_MENTION = new RegExp(`(?:\\p{L}+\\s+(?:en\\s+)?)?${FILE}`, "giu");
+const NOT_A_REQUEST = new Set(["bonjour", "bonsoir", "salut", "hello", "merci", "thanks", "cordialement", "regards", "bonne", "journée", "soirée", "svp", "stp",
+  "madame", "monsieur", "s'il", "vous", "plaît", "plait", "pour", "information", "info", "référence", "reference", "et", "de", "du", "des", "le", "la", "les",
+  "l'", "un", "une", "en", "à", "au", "aux", "ma", "mon", "mes", "votre", "vos", "ce", "cette", "ci", "cf", "voir", "see", "regardez", "consultez"]);
 /** An "accessory" file needs a cited current sentence that states the request on its own:
- * sentences pointing to a file are set aside, and courtesy alone states nothing. Length is
- * not a criterion: "Ça bug." states a request, "Le problème est dans le PDF joint." does not. */
+ * pointer sentences are set aside, file mentions are removed from the others, and what
+ * remains must say more than courtesy. Length is not a criterion. */
 export function intakeQuoteStatesRequest(quote: string) {
-  return quote.split(/(?<=[.!?…])\s+|\n+/u).filter(sentence => !ATTACHMENT_REFERENCE.test(sentence))
-    .some(sentence => (sentence.toLowerCase().match(/[\p{L}'’]+/gu) ?? []).some(word => !COURTESY.has(word.replace(/’/g, "'"))));
+  return quote.split(/(?<=[.!?…])\s+|\n+/u).filter(sentence => !FILE_POINTER.test(sentence))
+    .some(sentence => (sentence.replace(FILE_MENTION, " ").toLowerCase().match(/[\p{L}'’]+/gu) ?? [])
+      .some(word => !NOT_A_REQUEST.has(word.replace(/’/g, "'"))));
 }
 
 export async function planSavIntake(

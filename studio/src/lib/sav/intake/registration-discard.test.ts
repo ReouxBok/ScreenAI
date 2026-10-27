@@ -111,6 +111,13 @@ describe("SAV-42 A (review 201): visual path keeps every other field strict", ()
     });
     return { traces, call, model: createSavIntakeSemanticReaders({ model: "gemini-fixture", call, onTrace: t => traces.push(t), attachments: { prepared, onRead: () => {} } }) };
   };
+  it("REVIEWCA a visual identification continuation keeps its required registration strict",async()=>{
+    const initial={...message,id:initialMid,receivedAt:"2026-10-20T10:00:00.000Z",currentText:"Mon agenda ne se synchronise plus."};
+    const r=await visualReader(arg=>analysis(arg,{requests:[{id:"r0",kind:"support",currentMessageId:mid,originMessageId:initialMid,quoteId:anchor(arg,`message-${initialMid}`)}],registration:{address:"sender@example.test",sourceMessageId:mid,quoteId:"unknown-registration-anchor"}}));
+    await expect(r.model.analyseMessage({message,conversation:[initial],identificationContinuation:{initialMessageId:initialMid,confirmedEffectId:"effect-1"}},signal())).rejects.toThrow();
+    expect(r.call).toHaveBeenCalledTimes(1);
+    expect(r.traces.at(-1)?.normalization?.discardedRegistrations??0).toBe(0);
+  });
   it("counts a dropped unanchored registration exactly once, with a single image call", async () => {
     const r = await visualReader(arg => analysis(arg, { registration: { address: "sender@example.test", sourceMessageId: mid, quoteId: "unknown-optional-anchor" } }));
     const out = await r.model.analyseMessage({ message, conversation: [] }, signal());

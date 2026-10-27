@@ -593,3 +593,45 @@ describe("SAV-42 B (review 201): the cited sentence decides, in both directions"
     expect(await run(text, text)).toBe("collect_context");
   });
 });
+
+it.each([
+ ["cancellation","Je souhaite résilier mon abonnement, facture en PJ pour information."],
+ ["cancellation","Je souhaite résilier mon abonnement (facture en PJ)."],
+ ["support","Je ne peux plus envoyer de pièces jointes depuis Limova."],
+ ["support","Le téléchargement des pièces jointes ne fonctionne plus."],
+] as const)("REVIEWCA an explicit %s request stays autonomous despite file wording: %s",async(kind,text)=>{
+ const f=fixture([kind]);f.input.message.currentText=text;
+ expect((await f.run()).decision.disposition.kind).toBe("ticket");
+ f.input.message.unreadAttachments=[{sourceId:"attachment:pdf",reason:"unsupported_type"}];
+ f.analysis.unreadAttachmentRequirements=[{sourceId:"attachment:pdf",role:"accessory",textQuote:text}];
+ expect((await f.run()).decision.disposition.kind).toBe("ticket");
+});
+it("REVIEWCA a correct current-reader quote cannot isolate the request from a same-sentence accessory mention",async()=>{
+ const {createSavIntakeSemanticReaders}=await import("./model-readers");
+ const text="Je souhaite résilier mon abonnement, facture en PJ pour information.";
+ const f=fixture(["cancellation"]);f.input.message.currentText=text;f.input.message.unreadAttachments=[{sourceId:"attachment:pdf",reason:"unsupported_type"}];
+ const traces:{accepted:boolean}[]=[];
+ const reader=createSavIntakeSemanticReaders({model:"gemini-fixture",onTrace:t=>traces.push(t),call:async arg=>{
+  const data=JSON.parse(arg.body.contents[0].parts[0].text);const q=data.citationCatalogue.find((a:{sourceId:string})=>a.sourceId==="current").id;
+  return {json:{messageId:mid,requests:[{id:"r0",kind:"cancellation",currentMessageId:mid,quoteId:q}],ticketSummary:{title:"Résiliation de l’abonnement",description:"Le client demande la résiliation, avec une facture accessoire.",requestIds:["r0"]},unreadAttachmentRequirements:[{sourceId:"attachment:pdf",role:"accessory",textQuoteId:q}]},metadata:{inputTokens:10,outputTokens:10,thoughtTokens:0,totalTokens:20}};
+ }});
+ f.adapters.analyseMessage=reader.analyseMessage;
+ const plan=await f.run();expect(traces.at(-1)?.accepted).toBe(true);
+ expect(plan.decision.disposition.kind).toBe("ticket");
+});
+
+describe("SAV-42 B (review ca1c4db): a file mention is not a file pointer", () => {
+  const run = async (text: string, quote = text) => {
+    const f = fixture(); f.input.message.currentText = text;
+    f.input.message.unreadAttachments = [{ sourceId: "attachment:pdf", reason: "unsupported_type" }];
+    f.analysis.unreadAttachmentRequirements = [{ sourceId: "attachment:pdf", role: "accessory", textQuote: quote }];
+    return (await f.run()).decision.disposition.kind;
+  };
+  it.each(["Facture en PJ pour information.", "Le problème est expliqué en pièce jointe.", "Vous trouverez le détail dans le document joint."])(
+    "a sentence that only mentions or points to the file still states nothing: %j", async text => {
+      expect(await run(text)).toBe("collect_context");
+    });
+  it("the product's attachment feature named in a request is not a pointer", async () => {
+    expect(await run("Impossible d'ajouter une pièce jointe à un message depuis hier.")).toBe("ticket");
+  });
+});
