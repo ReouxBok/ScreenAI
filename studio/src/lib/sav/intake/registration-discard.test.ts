@@ -70,3 +70,11 @@ describe("current reader: optional registration declaration", () => {
       .rejects.toThrow("CITATION_REJECTED");
   });
 });
+
+it("REVIEW an invalid optional registration anchor does not discard the otherwise proven request", async () => {
+  const r = reader(arg => analysis(arg, { registration: { address: "sender@example.test", sourceMessageId: mid, quoteId: "unknown-optional-anchor" } }));
+  const out = await r.model.analyseMessage({ message, conversation: [] }, signal());
+  expect(out.requests.map(q => q.kind)).toEqual(["cancellation"]);
+  expect(out.registration).toBeUndefined();
+  expect(r.traces.at(-1)?.normalization?.discardedRegistrations).toBe(1);
+});

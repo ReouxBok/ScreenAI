@@ -480,3 +480,69 @@ describe("SAV-42 B: complete text with unread attachments", () => {
     reason(await f.run(), "history_incomplete");
   });
 });
+
+it.each(["Voir PJ.", "Cf. PJ.", "Voir la pièce jointe."])("REVIEW an explicit unread-file dependency stays blocked: %s", async suffix => {
+  const f = fixture();
+  f.input.message.currentText = suffix;
+  f.input.message.unreadAttachments = [{ sourceId: "attachment:required-pdf", reason: "unsupported_type" }];
+  // A mistaken model labels the file accessory despite the explicit customer reference.
+  f.analysis.unreadAttachmentRequirements = [{ sourceId: "attachment:required-pdf", role: "accessory", textQuote: f.input.message.currentText }];
+  const plan = await f.run();
+  expect(plan.decision.disposition.kind).toBe("collect_context");
+  expect(plan.steps).toEqual([]);
+});
+
+describe("SAV-42 B (review P2-B): pointer to a file vs autonomous text", () => {
+  const pdf = { sourceId: "attachment:pdf-1", reason: "unsupported_type" as const };
+  const run = async (text: string, quote: string, kinds: MessageAnalysis["requests"][number]["kind"][] = ["cancellation"]) => {
+    const f = fixture(kinds); f.input.message.currentText = text; f.input.message.unreadAttachments = [pdf];
+    f.analysis.unreadAttachmentRequirements = [{ sourceId: pdf.sourceId, role: "accessory", textQuote: quote }];
+    return f.run();
+  };
+  it.each([
+    ["Je souhaite résilier mon abonnement à la fin du mois. La facture est en PJ.", "Je souhaite résilier mon abonnement à la fin du mois."],
+    ["Bonjour, je souhaite résilier mon abonnement. Ci-joint ma dernière facture.", "je souhaite résilier mon abonnement."],
+  ])("an autonomous request mentioning an accessory file is still handled: %s", async (text, quote) => {
+    expect(target(await run(text, quote)).target.operation).toBe("create");
+  });
+  it.each([
+    ["Bonjour, voir PJ, merci", "voir PJ, merci"],
+    ["Cf. pièce jointe.", "Cf. pièce jointe."],
+    ["Regardez le fichier joint svp", "Regardez le fichier joint svp"],
+  ])("a text that only points to the unread file is never accessory: %s", async (text, quote) => {
+    const plan = await run(text, quote, ["support"]);
+    expect(plan.decision.disposition.kind).toBe("collect_context"); expect(plan.steps).toEqual([]);
+  });
+  it("an accessory claim citing only the pointer part of an otherwise clear text is refused", async () => {
+    const plan = await run("Je souhaite résilier mon abonnement. Facture en PJ.", "Facture en PJ.");
+    expect(plan.decision.disposition.kind).toBe("collect_context"); expect(plan.steps).toEqual([]);
+  });
+  it("the same rule protects unreadable images that the customer points to", async () => {
+    const f = fixture(); f.input.message.currentText = "Voir PJ.";
+    const image = { sourceId: "image-1", fileHash: "1".repeat(64) };
+    f.input.message.attachmentInputs = [image];
+    f.analysis.attachmentObservations = [{ ...image, filename: "synthetic.png", mimeType: "image/png", referenceHash: "r", width: 1, height: 1, status: "unreadable", reason: "unreadable_content", text: "", uncertainties: [], regions: [] }];
+    f.analysis.imageRequirements = [{ ...image, role: "accessory", textQuote: "Voir PJ." }];
+    expect((await f.run()).decision.disposition.kind).toBe("collect_context");
+  });
+});
+
+describe("SAV-42 B: mixed readable image and unread PDF", () => {
+  const image = { sourceId: "image-1", fileHash: "1".repeat(64) }, pdf = { sourceId: "attachment:pdf-1", reason: "unsupported_type" as const };
+  const mixed = (pdfRole: "accessory" | "required") => {
+    const f = fixture(); f.input.message.currentText = "La connexion échoue à chaque ouverture de l’application depuis hier.";
+    f.input.message.attachmentInputs = [image]; f.input.message.unreadAttachments = [pdf];
+    f.analysis.attachmentObservations = [{ ...image, filename: "synthetic.png", mimeType: "image/png", referenceHash: "r", width: 1, height: 1, status: "analyzed", reason: "observed", text: "Erreur 500", uncertainties: [], regions: [] }];
+    f.analysis.imageRequirements = [{ ...image, role: "accessory", textQuote: f.input.message.currentText }];
+    f.analysis.unreadAttachmentRequirements = [{ sourceId: pdf.sourceId, role: pdfRole, textQuote: f.input.message.currentText }];
+    return f;
+  };
+  it("handles the request with the read image and an accessory unread PDF, keeping both distinct in the evidence", async () => {
+    const p = await mixed("accessory").run();
+    expect(target(p).target.operation).toBe("create");
+    expect(p.decision.evidence.filter(e => e.source === "current_attachment").map(e => e.id).sort()).toEqual([pdf.sourceId, image.sourceId].sort());
+  });
+  it("keeps the dossier for the team when the unread PDF is required", async () => {
+    reason(await mixed("required").run(), "history_incomplete");
+  });
+});

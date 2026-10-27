@@ -1399,3 +1399,25 @@ describe("SAV-42 D: an invalid-source dossier stays readable and can be classifi
     expect(await db.db.select().from(auditLogs).where(eq(auditLogs.action, SAV_EXTERNAL_COMPLETION))).toHaveLength(0);
   });
 });
+
+import * as reviewRuntimeStore from "./runtime-store";
+it("REVIEW invalid-source classification is refused when the same message becomes a valid support source before the guarded transaction", async () => {
+  vi.stubEnv("SAV_RELEASE_STAGE", "v0"); vi.stubEnv("SAV_PILOT_MODE", "false");
+  await activateSavV0Cutover({ receivedAfter: new Date(Date.now()-3600000).toISOString(), mailboxEmail: "support@example.invalid", intakeRecipient: "contact@limova.ai", deploymentSha: "a".repeat(40), activatedBy: "ugo@limova.ai" });
+  await db.db.update(savMessages).set({ toEmails: Array.from({ length: 31 }, (_, n) => `r${n}@example.invalid`) }).where(eq(savMessages.id, messageId));
+  const id = (await enqueueSavIntakeMessage(messageId, options.runtime))!;
+  expect(await claimSavIntakeRun(id, options.runtime)).toBeNull();
+  const original = reviewRuntimeStore.readSavIntakeCurrent;
+  const spy = vi.spyOn(reviewRuntimeStore, "readSavIntakeCurrent").mockImplementationOnce(async (...args) => {
+    const snapshot = await original(...args);
+    expect(snapshot?.sourceInvalid).toBe(true);
+    // Simulate source repair/reingestion after the initial check, before thread-row locks.
+    await db.db.update(savMessages).set({ toEmails: ["support@example.invalid"], bodyCiphertext: encryptSavPayload({ text: "Ma connexion échoue et nécessite une prise en charge SAV.", headers: {}, attachments: [] }) }).where(eq(savMessages.id, messageId));
+    return snapshot;
+  });
+  try {
+    await classifyInvalidSourceAsOther({ requestKey: randomUUID(), threadId, messageId, confirmed: true }).catch(() => null);
+    expect(await db.db.select().from(auditLogs).where(eq(auditLogs.action, SAV_EXTERNAL_COMPLETION))).toHaveLength(0);
+    expect(mutationsSent()).toHaveLength(0);
+  } finally { spy.mockRestore(); }
+});

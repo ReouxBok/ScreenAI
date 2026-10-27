@@ -576,6 +576,26 @@ it.each(["pdf","image_limit","budget"]) ("finishes a non-dispatched image attemp
   expect(await f.db.select().from(savActions)).toHaveLength(0);
 });
 
+it("SAV-42: a mixed image + PDF message sends only the image to the visual read and lists the PDF as unread",async()=>{
+  const {syntheticImage,attachmentMetadata}=await import("../../../../test/sav-attachments");
+  const bytes=await syntheticImage(),[m]=await f.db.select().from(savMessages).where(eq(savMessages.id,messageId)),[t]=await f.db.select().from(savThreads).where(eq(savThreads.id,threadId));
+  const attachments=["png","pdf"].map((kind,index)=>{const meta=attachmentMetadata(bytes.length);return {...meta,filename:kind==="pdf"?"synthetic.pdf":"synthetic.png",mimeType:kind==="pdf"?"application/pdf":meta.mimeType,
+    reference:{...meta.reference!,mailboxEmail:"support@example.invalid",gmailMessageId:m.gmailMessageId!,gmailThreadId:t.gmailThreadId,partId:String(index+1)}};});
+  await f.db.update(savMessages).set({bodyCiphertext:encryptSavPayload({text:"My application fails with an error.",headers:{},attachments,attachmentInventory:{complete:true,limits:[]}})}).where(eq(savMessages.id,messageId));
+  const id=(await enqueueSavIntakeMessage(messageId,config))!;
+  const bodies:string[]=[],network=vi.fn(async(_url:unknown,init?:RequestInit)=>{bodies.push(String(init?.body));throw Error("NETWORK_FORBIDDEN");});
+  const download=vi.fn(async()=>bytes);
+  await analyseSavIntakeRuntime(id,config,{env:()=>environment,network,downloadAttachments:download});
+  const current=(await readSavIntakeCurrent(threadId,config))!;
+  const message=(current.payload.input as {message?:{attachmentInputs?:unknown[];unreadAttachments?:{reason:string}[]}}|undefined)?.message;
+  expect(download).toHaveBeenCalledTimes(1);
+  expect(message?.attachmentInputs).toHaveLength(1);expect(message?.unreadAttachments?.map(u=>u.reason)).toEqual(["unsupported_type"]);
+  expect(network).toHaveBeenCalled();
+  const sent=JSON.parse(JSON.parse(bodies[0]).contents[0].parts[0].text);
+  expect(sent.imageSources).toHaveLength(1);expect(sent.unreadAttachments).toHaveLength(1);
+  expect(await f.db.select().from(savActions)).toHaveLength(0);
+});
+
 it.each(["valid_json", "invalid_json"])("reconciles only proven omitted zero thoughts through %s", async output => {
   const id = await enqueueSavIntakeMessage(messageId, config);
   const network = vi.fn(async () => Response.json({ candidates: [{ finishReason: "STOP", content: { parts: [{ text: output === "valid_json" ? JSON.stringify({ messageId, requests: [] }) : "{invalid-json" }] } }], usageMetadata: { promptTokenCount: 100, candidatesTokenCount: 50, totalTokenCount: 150 } }));
