@@ -1,3 +1,2 @@
-export default function SavPilotLoading() {
-  return <div className="sav-lab-loading" role="status"><span/><strong>Chargement du laboratoire SAV…</strong></div>;
-}
+import { StudioPageSkeleton } from "@/components/skeleton";
+export default function SavPilotLoading() { return <StudioPageSkeleton label="Chargement du laboratoire SAV"/>; }
