@@ -16,7 +16,6 @@ import { savIntakeRuntimeConfig, intakeRuntimeHash, type IntakeRuntimeConfig } f
 import { createIntakeExecutorAdapters, renderIntakeNote } from "./execution-adapters";
 import { assertOriginalExecutionCrm, assertExecutionCrmUnchanged, IntakeCrmDeltaError, publicIntakeCrmDelta } from "./execution-context";
 import { publicCrmRecheck } from "./execution-diagnostic";
-import { exactRfcMessageId, isQualifiedCrmEmail, type QualifiedCrmEmail } from "./crm-continuation";
 import { crmRecheckDecision } from "./crm-recheck";
 import { crmRecheckDueSql, admitIntakeExecution, claimExecution, claimEffectRecovery, withEffectRecoveryLease, releaseEffectRecovery, activeExecutionEffects, adoptCurrentExecutionVersion, assertExecutionLocal, saveExecutionPayload, expandExecutionScope, getExecutionEffects, ensureExecutionEffect, markEffectDispatched, withdrawUndispatchedEffect, recordEffectAck, confirmExecutionEffect, deferExecutionEffect, endExecutionPass, identityEpisodeEffect, finishExecution, executionJournal, releaseRecoveredExecutionScope, occupationSchemaInstalled, type ExecutionLease, type ExecutionTx } from "./execution-store";
 import type { Effect, EffectIntent, EffectAck, ExecutorAdapters, ExecutionOptions, ExecutionPayload, EffectKind } from "./execution-types";
@@ -161,13 +160,11 @@ async function nextIntent(lease: ExecutionLease, effects: Effect[], options: Exe
         };
     }
     if ((d.target.operation === "reopen" || d.target.operation === "link" && !d.target.alreadyNew) && !confirmed("stage_new")) {
+        // The PATCH sets the stage only, so whatever owner the ticket has is kept. An owner
+        // change by the team does not alter the choice (Ugo, 27/10): it no longer blocks.
         const t = Object.values(lease.payload.baseline?.tickets ?? {}).flat().find(t => t.id === ticketId);
-        if (!t || t.ownerId === undefined)
-            return fault("OWNER_UNKNOWN");
-        if (d.target.operation === "reopen" && t.ownerId !== d.target.preserveOwnerId)
-            return fault("OWNER_CHANGED");
         return {
-            kind: "stage_new", permission: "set_ticket_new", key: `stage-new:${messageId}:${ticketId}`, ticketId, sourceMessageId: messageId, expectedOwnerId: t.ownerId
+            kind: "stage_new", permission: "set_ticket_new", key: `stage-new:${messageId}:${ticketId}`, ticketId, sourceMessageId: messageId, expectedOwnerId: t?.ownerId ?? null
         };
     }
     return null;
@@ -195,29 +192,25 @@ async function preflight(lease: ExecutionLease, options: ExecutionOptions, inten
     const s = await source(lease);
     if (d.kind === "ticket" && !authority.mutations.includes(d.target.operation === "create" ? "create_ticket" : "link_ticket"))
         return fault("MUTATION_NOT_GRANTED");
-    let qualifiedEmails: QualifiedCrmEmail[] = [];
-    const assertContinuationFresh = () => { if(qualifiedEmails.some(proof=>!isQualifiedCrmEmail(proof)))return fault("CRM_ACK_PROOF_EXPIRED"); };
     const snapshot = await options.adapters.readCrm(lease.payload.plan, lease.payload.input, options.runtime, options.signal);
     await expandExecutionScope(lease, options.adapters.scope(snapshot, lease.row.threadId, finalTicket(lease, await getExecutionEffects(lease.row.id))));
     if (!lease.payload.baseline) {
-        assertOriginalExecutionCrm(lease.payload.plan, snapshot, lease.payload.originalCrm);
+        const ignored = assertOriginalExecutionCrm(lease.payload.plan, snapshot, lease.payload.originalCrm);
         lease.payload.baseline = snapshot;
         await saveExecutionPayload(lease);
+        if (ignored.length) await requireDb().transaction(tx => executionJournal(tx, lease.row.id, "crm_change_ignored", { phase: "original", changes: ignored }));
     }
     else {
-        const sourceEmail={from:s.message.fromEmail,to:s.message.toEmails,subject:s.message.subject,body:s.body.text,
-          rfcMessageId:exactRfcMessageId(s.body.headers?.["message-id"])??undefined,mailbox:s.mailbox.email,gmailThreadId:s.thread.gmailThreadId};
-        qualifiedEmails=intent?.kind==="stage_new"&&options.adapters.qualifyAddedEmails
-          ?await options.adapters.qualifyAddedEmails(lease.payload.baseline,snapshot,sourceEmail,options.signal):[];
         await live(lease,options,intent?.permission);
-        const concurrent = assertExecutionCrmUnchanged(lease.payload.baseline, snapshot, await getExecutionEffects(lease.row.id), { finalizing: !intent, nextKind: intent?.kind,
-            sourceEmail,qualifiedEmails });
+        const effects = await getExecutionEffects(lease.row.id);
+        // Choice rule: changes that cannot alter the choice are traced, not refused.
+        const concurrent = assertExecutionCrmUnchanged(lease.payload.baseline, snapshot, effects, { finalizing: !intent, nextKind: intent?.kind, targetTicketId: finalTicket(lease, effects) });
         // A clean comparison closes the earlier delta and its schedule; confirmed effects stay.
         if(lease.payload.crmDelta||lease.payload.crmRecheck){delete lease.payload.crmDelta;delete lease.payload.crmRecheck;await saveExecutionPayload(lease);}
         const receipt = intakeRuntimeHash(concurrent);
         if (concurrent.length && lease.payload.concurrentHistoryHash !== receipt) {
             lease.payload.concurrentHistoryHash = receipt;
-            await requireDb().transaction(tx => executionJournal(tx, lease.row.id, "concurrent_history_observed", { phase: intent ? "continue_committed_effects" : "finalization_only", events: concurrent }));
+            await requireDb().transaction(tx => executionJournal(tx, lease.row.id, "crm_change_ignored", { phase: intent ? "continue" : "finalization_only", changes: concurrent }));
             await saveExecutionPayload(lease);
         }
     }
@@ -233,8 +226,7 @@ async function preflight(lease: ExecutionLease, options: ExecutionOptions, inten
     const finalAuthority = await live(lease, options, intent?.permission);
     if (d.kind === "ticket" && !finalAuthority.mutations.includes(d.target.operation === "create" ? "create_ticket" : "link_ticket"))
         return fault("MUTATION_NOT_GRANTED");
-    assertContinuationFresh();
-    return assertContinuationFresh;
+    return finalAuthority;
 }
 export async function executeIntakePass(executionId: string, options: ExecutionOptions, hooks: {
     beforeMarker?: (effect: Effect) => Promise<void>;
@@ -271,7 +263,7 @@ export async function executeIntakePass(executionId: string, options: ExecutionO
             }
             if (current.state === "planned") {
                 await hooks.beforeMarker?.(current);
-                const assertContinuationFresh = await preflight(lease, options, intent);
+                await preflight(lease, options, intent);
                 current = await markEffectDispatched(lease, current);
                 await hooks.afterMarker?.(current);
                 // Last pause check before the provider call. A pause seen here proves nothing
@@ -281,7 +273,6 @@ export async function executeIntakePass(executionId: string, options: ExecutionO
                     if (pauseCodes.has(code(error)) && await withdrawUndispatchedEffect(lease, current, code(error))) current = undefined;
                     throw error;
                 }
-                assertContinuationFresh();
                 const result = await options.adapters.dispatch(effectIntent(current), options.signal);
                 await recordEffectAck(current, result);
                 await hooks.afterAck?.(current);

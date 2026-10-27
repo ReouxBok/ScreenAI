@@ -1,11 +1,9 @@
 import { createHash } from "node:crypto";
 import { z } from "zod";
 import { savIntakeCanonicalEvidence, savIntakeEvidenceContentHash } from "./engine";
-import type { CrmSnapshot, Effect, EffectIntent, EffectAck } from "./execution-types";
+import type { CrmSnapshot, Effect, EffectIntent } from "./execution-types";
 import type { IntakePlan, IntakeAdapters, ReadResult } from "./engine-types";
 import type { IntakeRuntimeConfig } from "./runtime-contract";
-import { decryptSavPayload } from "../crypto";
-import { isQualifiedCrmEmail, type QualifiedCrmEmail, type ContinuationSourceEmail } from "./crm-continuation";
 import { crmProjectionFields, executionEvidenceValue, projectCrmEvidence, type CrmEvidenceCategory, type CrmEvidenceFingerprint } from "./crm-evidence-fingerprint";
 // An incomplete read or an unproven address is not a CRM mutation: distinct codes.
 const value = <T>(r: ReadResult<T>): T => {
@@ -75,34 +73,39 @@ const historyIds = (before: unknown, after: unknown) => {
  * the detail stays explicitly unknown (fieldsKnown false), never reconstructed. */
 export function assertOriginalExecutionCrm(plan: IntakePlan, s: CrmSnapshot, original?: CrmEvidenceFingerprint) {
     const evidence: NonNullable<CrmDeltaDiagnostic["evidence"]> = [], fields = new Set<string>(), eventIds: string[] = [], ticketIds: string[] = [], current: unknown[] = [];
+    const ignored: { fields: string[]; ticketIds: string[]; eventIds: string[] }[] = [];
     let fieldsKnown = true;
     for (const e of plan.decision.evidence) {
         const read = executionEvidenceValue(e, s);
         if (!read || read.value !== undefined && savIntakeEvidenceContentHash(read.value) === e.contentHash)
             continue;
+        const known = original?.entries[e.id], now = projectCrmEvidence(read.category, read.value);
+        const named = known?.category === read.category ? crmProjectionFields(read.category, known.projection, now) : null;
+        const ids = ["ticket", "ticket_list", "history"].includes(read.category) && read.category !== "ticket_list" ? [e.sourceId] : [];
+        // Choice rule (Ugo, 27/10): history and owner never alter the choice; traced, not refused.
+        if (read.value !== undefined && (read.category === "history" || named && named.length && named.every(crmChoiceIrrelevant))) {
+            ignored.push({ fields: [categoryField[read.category], ...(named ?? [])], ticketIds: crmIds(ids, /^\d{1,30}$/), eventIds: read.category === "history" && known ? crmIds(historyIds(known.projection, now), /^(?:emails|notes):\d{1,30}$/) : [] });
+            continue;
+        }
         evidence.push({ id: e.id, category: read.category, state: read.value === undefined ? "missing" : "changed" });
         current.push(read.value ?? null);
         fields.add(categoryField[read.category]);
-        if (["ticket", "ticket_list", "history"].includes(read.category)) ticketIds.push(read.category === "ticket_list" ? "" : e.sourceId);
-        const known = original?.entries[e.id];
-        if (known?.category !== read.category) { fieldsKnown = false; continue; }
-        const now = projectCrmEvidence(read.category, read.value);
-        for (const field of crmProjectionFields(read.category, known.projection, now)) fields.add(field);
-        if (read.category === "history") eventIds.push(...historyIds(known.projection, now));
+        ticketIds.push(...ids);
+        if (!named) { fieldsKnown = false; continue; }
+        for (const field of named) fields.add(field);
     }
     if (!evidence.length)
-        return;
+        return ignored;
     throw new IntakeCrmDeltaError(withClass({ stage: "original", reason: "original_evidence_changed", ticketIds: crmIds(ticketIds, /^\d{1,30}$/), eventIds: crmIds(eventIds, /^(?:emails|notes):\d{1,30}$/),
         baselineHash: savIntakeEvidenceContentHash(evidence.map(e => plan.decision.evidence.find(x => x.id === e.id)!.contentHash)), currentHash: savIntakeEvidenceContentHash(current),
         fields: [...fields].sort().slice(0, 20), evidence: evidence.slice(0, 20), fieldsKnown, truncated: evidence.length > 20 || fields.size > 20 }));
 }
-/** Only previously attributed, confirmed effects are removed for comparison.
- * All other contact/ticket/history changes require reinvestigation. */
-export type ExecutionContinuation = { finalizing?: boolean; nextKind?: EffectIntent["kind"]; sourceEmail?: ContinuationSourceEmail; qualifiedEmails?: QualifiedCrmEmail[] };
-export const CRM_DELTA_REASONS = ["unrecognized_added_email", "snapshot_changed", "original_evidence_changed", "owned_effect_changed", "added_history_event"] as const;
-/** business_change: a fact the decision relied on moved (owner, stage, content, identity,
- * a note, a removal, one of our own receipts). unattributed_email: only emails were added,
- * not yet attributed. unknown: the detail is not available. */
+/** Choice rule (Ugo, 27/10): only a change that can alter the choice of customer or ticket
+ * matters. History (notes, emails, HubSpot's own logging) and the owner never do. */
+export type ExecutionContinuation = { finalizing?: boolean; nextKind?: EffectIntent["kind"]; targetTicketId?: string | null };
+export const CRM_DELTA_REASONS = ["unrecognized_added_email", "snapshot_changed", "original_evidence_changed", "owned_effect_changed", "added_history_event", "choice_changed", "target_missing"] as const;
+/** business_change: a fact the choice relies on moved. unattributed_email: only emails were
+ * added (stored diagnostics of earlier versions). unknown: the detail is not available. */
 export type CrmDeltaClass = "business_change" | "unattributed_email" | "unknown";
 export type CrmDeltaDiagnostic = { stage: string; reason: typeof CRM_DELTA_REASONS[number]; ticketIds:string[];eventIds:string[];baselineHash:string;currentHash:string; fields?:string[];
   evidence?: { id: string; category: CrmEvidenceCategory; state: "changed" | "missing" }[]; effect?: EffectIntent["kind"]; fieldsKnown?: boolean; truncated?: boolean; classification?: CrmDeltaClass };
@@ -114,121 +117,33 @@ export function classifyCrmDelta(d: Pick<CrmDeltaDiagnostic, "reason" | "fields"
     return detail.length && detail.every(f => f === "history.added_email") ? "unattributed_email" : "business_change";
 }
 const withClass = (d: CrmDeltaDiagnostic): CrmDeltaDiagnostic => ({ ...d, classification: classifyCrmDelta(d) });
-const ownedChange = (effect: Effect, fields: string[], extra: Partial<CrmDeltaDiagnostic>, baseline: CrmSnapshot, current: CrmSnapshot): never => {
-    throw new IntakeCrmDeltaError(withClass({ stage: effect.kind, reason: "owned_effect_changed", effect: effect.kind as EffectIntent["kind"], ticketIds: [], eventIds: [],
-        baselineHash: savIntakeEvidenceContentHash(baseline), currentHash: savIntakeEvidenceContentHash(current), fields, ...extra }));
-};
-/** Compare the entire envelope and body. Unknown incoming/outgoing mail must not
- * authorize a semantic status transition merely because it is an email. */
-function sameKnownEmail(text: string, baseline: CrmSnapshot, ticketId: string) {
-    const parse = (value: string) => {
-        try { return z.object({ from: z.email(), to: z.string().min(1), direction: z.string(), subject: z.string(), body: z.string() }).parse(JSON.parse(value)); }
-        catch { return null; }
-    };
-    const incoming = parse(text);
-    if (!incoming) return false;
-    const addresses = (s: string) => s.split(/[;,]/).map(v => v.trim().toLowerCase()).sort();
-    const body = (s: string) => s.replace(/\r\n/g, "\n");
-    return (baseline.histories[ticketId] ?? []).some(e => {
-        const prior = e.kind === "email" ? parse(e.text) : null;
-        return prior && incoming.from.toLowerCase() === prior.from.toLowerCase() && incoming.direction === prior.direction
-            && JSON.stringify(addresses(incoming.to)) === JSON.stringify(addresses(prior.to))
-            && incoming.subject === prior.subject && body(incoming.body) === body(prior.body);
-    });
+/** Changes that never alter the choice; they are traced, not refused. */
+export const crmChoiceIrrelevant = (field: string) => field === "histories" || field.startsWith("history.") || field === "ticket.ownerId";
+const ticketChoice = (t: Record<string, unknown>) => ({ ...(projectCrmEvidence("ticket", t) as Record<string, unknown>), ownerId: undefined, closedAt: t.stage === "closed" ? t.closedAt ?? null : null });
+/** What the choice depends on: identity, links, the customer's tickets and their membership,
+ * stage, closing date, subject and description. Digests only, no customer text. */
+export function crmChoiceView(s: CrmSnapshot) {
+    const tickets = [...new Map(Object.values(s.tickets).flat().map(t => [t.id, t])).values()].sort((a, b) => a.id.localeCompare(b.id));
+    return { address: s.address, lookup: s.lookup.map(c => c.id).sort(), contacts: Object.keys(s.contacts).sort().map(id => projectCrmEvidence("contact", s.contacts[id])),
+        associations: [...s.associations].map(a => savIntakeCanonicalEvidence(a)).sort(), membership: Object.keys(s.tickets).sort().map(id => [id, s.tickets[id].map(t => t.id).sort()]),
+        tickets: tickets.map(t => ticketChoice(t as unknown as Record<string, unknown>)) };
 }
-function assertExecutionCrmUnchangedCore(baseline: CrmSnapshot, current: CrmSnapshot, effects: Effect[], continuation: ExecutionContinuation = {}) {
-    const clean = JSON.parse(JSON.stringify(current)) as CrmSnapshot;
-    const concurrent: { ticketId: string; eventId: string; contentHash: string }[] = [];
-    const ack = (e: Effect) => e.ackCiphertext ? decryptSavPayload<EffectAck>(e.ackCiphertext) : null;
-    const intent = (e: Effect) => decryptSavPayload<EffectIntent>(e.intentCiphertext);
-    // Remove an owned history delta only when its current bytes still match the
-    // exact provider read kept in the receipt. A human edit never disappears.
-    for (const effect of effects.filter(e => e.state === "confirmed")) {
-        const i = intent(effect), proof = effect.verificationCiphertext ? decryptSavPayload<{
-            observedTicket?: unknown;
-            observedHistory?: {
-                id: string;
-            };
-        }>(effect.verificationCiphertext) : {};
-        if ((effect.kind === "note_associate" || effect.kind === "email_associate") && i.objectId) {
-            if (!proof.observedHistory)
-                return ownedChange(effect, ["history.receipt_missing"], { ticketIds: crmIds([i.ticketId ?? ""], /^\d{1,30}$/) }, baseline, current);
-            const history = clean.histories[i.ticketId ?? ""];
-            const observed = history?.find(e => e.id === proof.observedHistory!.id);
-            if (savIntakeCanonicalEvidence(observed) !== savIntakeCanonicalEvidence(proof.observedHistory))
-                return ownedChange(effect, observed ? crmProjectionFields("history", projectCrmEvidence("history", [proof.observedHistory]), projectCrmEvidence("history", [observed])) : ["history.removed"],
-                    { ticketIds: crmIds([i.ticketId ?? ""], /^\d{1,30}$/), eventIds: crmIds([proof.observedHistory.id], /^(?:emails|notes):\d{1,30}$/) }, baseline, current);
-            // Associating an already associated object is a no-op. Never remove
-            // an event which was part of the original investigation.
-            if (!baseline.histories[i.ticketId!]?.some(e => e.id === proof.observedHistory!.id))
-                clean.histories[i.ticketId!] = history.filter(e => e.id !== proof.observedHistory!.id);
-        }
-        if (effect.kind === "stage_new" && i.ticketId) {
-            const old = Object.values(baseline.tickets).flat().find(t => t.id === i.ticketId);
-            const present = Object.values(clean.tickets).flat().filter(t => t.id === i.ticketId);
-            if (!old || !present.length)
-                return ownedChange(effect, ["ticket.missing"], { ticketIds: crmIds([i.ticketId], /^\d{1,30}$/) }, baseline, current);
-            // A target may belong only to a directly linked contact. Empty
-            // lists on other contacts stay intact for the final full comparison.
-            for (const ticket of present) {
-                if (ticket.stage !== "new")
-                    return ownedChange(effect, ["ticket.stage"], { ticketIds: crmIds([i.ticketId], /^\d{1,30}$/) }, baseline, current);
-                ticket.stage = old.stage;
-            }
-        }
+export type CrmIgnoredChange = { fields: string[]; ticketIds: string[]; eventIds: string[] };
+/** After a confirmed effect the choice is executed: the remaining actions finish on the same
+ * target whatever else changed (Ugo, 27/10), unless the target itself is gone. Before, only
+ * a choice change refuses. Everything else is returned to be traced. */
+export function assertExecutionCrmUnchanged(baseline: CrmSnapshot, current: CrmSnapshot, effects: Effect[], continuation: ExecutionContinuation = {}): CrmIgnoredChange[] {
+    const delta = snapshotDelta(baseline, current), hashes = { baselineHash: savIntakeEvidenceContentHash(baseline), currentHash: savIntakeEvidenceContentHash(current) };
+    const stage = continuation.nextKind ?? "finalizing", committed = effects.some(e => e.state === "confirmed");
+    if (committed) {
+        const target = continuation.targetTicketId;
+        if (target && !Object.values(current.tickets).flat().some(t => t.id === target))
+            throw new IntakeCrmDeltaError(withClass({ stage, reason: "target_missing", ticketIds: crmIds([target], /^\d{1,30}$/), eventIds: [], fields: ["tickets", "ticket.missing"], ...hashes }));
+    } else if (savIntakeCanonicalEvidence(crmChoiceView(baseline)) !== savIntakeCanonicalEvidence(crmChoiceView(current))) {
+        const fields = delta.fields.filter(f => !crmChoiceIrrelevant(f));
+        throw new IntakeCrmDeltaError(withClass({ stage, reason: "choice_changed", ticketIds: delta.ticketIds, eventIds: [], fields: fields.length ? fields : ["tickets"], fieldsKnown: true, ...hashes }));
     }
-    const created = effects.filter(e => e.state === "confirmed" && e.kind === "ticket_create");
-    // A newly logged email cannot undo an already committed ticket creation.
-    // Its remaining association uses that exact ticket; set-New is allowed only
-    // while the creation receipt still proves it is already New. For an existing
-    // ticket, planned logging may continue, but a later set-New requires that
-    // every added email is already known exactly. Notes/edits/removals, membership, owner, stage, identity
-    // and the latest Gmail inbound still use their unchanged authoritative guards.
-    const createdIds = new Set(created.map(e => ack(e)?.id).filter((id): id is string => Boolean(id)));
-    const finalIds = new Set(effects.filter(e => e.state === "confirmed" && ["email_associate", "stage_new"].includes(e.kind)).map(e => intent(e).ticketId));
-    const committedTargets = new Set(effects.filter(e => e.state === "confirmed" && ["note_create", "note_associate", "email_associate", "stage_new"].includes(e.kind)).map(e => intent(e).ticketId));
-    for (const ticketId of Object.keys(clean.histories)) {
-        const mayFinish = continuation.finalizing && finalIds.has(ticketId);
-        const mayContinueCreated = createdIds.has(ticketId) && Boolean(continuation.nextKind) && continuation.nextKind !== "ticket_create";
-        const mayContinueExisting = committedTargets.has(ticketId) && Boolean(continuation.nextKind) && continuation.nextKind !== "ticket_create";
-        if (!mayFinish && !mayContinueCreated && !mayContinueExisting && !(continuation.finalizing && createdIds.has(ticketId))) continue;
-        const known = new Set((baseline.histories[ticketId] ?? []).map(e => e.id));
-        // Owned associated events have already been checked and removed above.
-        const additions = clean.histories[ticketId].filter(e => !known.has(e.id));
-        if (additions.some(e => e.kind !== "email"))
-            throw new IntakeCrmDeltaError(withClass({ stage: continuation.nextKind ?? "finalizing", reason: "added_history_event", ticketIds: crmIds([ticketId], /^\d{1,30}$/),
-                eventIds: crmIds(additions.map(e => e.id), /^(?:emails|notes):\d{1,30}$/), fields: ["histories", ...new Set(additions.map(e => `history.added_${e.kind === "note" ? "note" : "email"}`))].sort(),
-                baselineHash: savIntakeEvidenceContentHash(baseline), currentHash: savIntakeEvidenceContentHash(current) }));
-        // Completing already planned logging/associations does not decide a new
-        // destination. Reopening an existing ticket DOES require known content.
-        if (!createdIds.has(ticketId) && continuation.nextKind === "stage_new"
-            && additions.some(e => !sameKnownEmail(e.text, baseline, ticketId)
-              && !continuation.qualifiedEmails?.some(p=>isQualifiedCrmEmail(p)&&p.ticketId===ticketId&&p.eventId===e.id&&p.contentHash===savIntakeEvidenceContentHash(e))))
-          throw new IntakeCrmDeltaError(withClass({stage:"stage_new",reason:"unrecognized_added_email",ticketIds:[ticketId],eventIds:additions.map(e=>e.id).filter(id=>/^emails:\d{1,30}$/.test(id)).slice(0,20),fields:["histories","history.added_email"],baselineHash:savIntakeEvidenceContentHash(baseline),currentHash:savIntakeEvidenceContentHash(current)}));
-        for (const e of additions) concurrent.push({ ticketId, eventId: e.id, contentHash: savIntakeEvidenceContentHash(e) });
-        clean.histories[ticketId] = clean.histories[ticketId].filter(e => known.has(e.id));
-    }
-    for (const effect of created) {
-        const a = ack(effect), proof = effect.verificationCiphertext ? decryptSavPayload<{
-            observedTicket?: unknown;
-        }>(effect.verificationCiphertext) : {};
-        if (!a?.id || !proof.observedTicket)
-            return ownedChange(effect, ["ticket.receipt_missing"], {}, baseline, current);
-        const matches = Object.values(clean.tickets).flat().filter(t => t.id === a.id), ids = { ticketIds: crmIds([a.id], /^\d{1,30}$/) };
-        if (!matches.length) return ownedChange(effect, ["ticket.missing"], ids, baseline, current);
-        const altered = matches.find(t => savIntakeCanonicalEvidence(t) !== savIntakeCanonicalEvidence(proof.observedTicket));
-        if (altered) return ownedChange(effect, crmProjectionFields("ticket", projectCrmEvidence("ticket", proof.observedTicket), projectCrmEvidence("ticket", altered)), ids, baseline, current);
-        if (!clean.histories[a.id]) return ownedChange(effect, ["history.missing"], ids, baseline, current);
-        if (clean.histories[a.id].length)
-            throw new IntakeCrmDeltaError(withClass({ stage: continuation.nextKind ?? "finalizing", reason: "added_history_event", ...ids, eventIds: crmIds(clean.histories[a.id].map(e => e.id), /^(?:emails|notes):\d{1,30}$/),
-                fields: ["histories", ...new Set(clean.histories[a.id].map(e => `history.added_${e.kind === "note" ? "note" : "email"}`))].sort(), baselineHash: savIntakeEvidenceContentHash(baseline), currentHash: savIntakeEvidenceContentHash(current) }));
-        for (const id of Object.keys(clean.tickets))
-            clean.tickets[id] = clean.tickets[id].filter(t => t.id !== a.id);
-        delete clean.histories[a.id];
-    }
-    if (savIntakeCanonicalEvidence(clean) !== savIntakeCanonicalEvidence(JSON.parse(JSON.stringify(baseline))))
-        throw new IntakeCrmDeltaError(withClass({stage:continuation.nextKind??"finalizing",reason:"snapshot_changed",...snapshotDelta(baseline,clean),baselineHash:savIntakeEvidenceContentHash(baseline),currentHash:savIntakeEvidenceContentHash(current)}));
-    return concurrent;
+    return delta.fields.length ? [{ fields: delta.fields, ticketIds: delta.ticketIds, eventIds: delta.eventIds }] : [];
 }
 /** Named differences after our own confirmed effects were subtracted: what changed
  * that is not ours. Projections carry no customer text. */
@@ -247,7 +162,8 @@ function snapshotDelta(baseline: CrmSnapshot, clean: CrmSnapshot) {
     if (savIntakeCanonicalEvidence(Object.fromEntries(Object.entries(baseline.tickets).map(([k, v]) => [k, v.map(t => t.id)])))
         !== savIntakeCanonicalEvidence(Object.fromEntries(Object.entries(clean.tickets).map(([k, v]) => [k, v.map(t => t.id)])))) fields.add("tickets").add("ticket.membership");
     for (const id of new Set([...Object.keys(baseline.histories), ...Object.keys(clean.histories)])) {
-        const a = projectCrmEvidence("history", baseline.histories[id]), b = projectCrmEvidence("history", clean.histories[id]), changed = crmProjectionFields("history", a, b);
+        // A history absent on one side (a ticket created or gone) compares as an empty list.
+        const a = projectCrmEvidence("history", baseline.histories[id] ?? []), b = projectCrmEvidence("history", clean.histories[id] ?? []), changed = crmProjectionFields("history", a, b);
         if (!changed.length) continue;
         fields.add("histories"); ticketIds.push(id); eventIds.push(...historyIds(a, b));
         for (const field of changed) fields.add(field);
@@ -255,9 +171,6 @@ function snapshotDelta(baseline: CrmSnapshot, clean: CrmSnapshot) {
     return { fields: [...fields].sort().slice(0, 20), ticketIds: crmIds(ticketIds, /^\d{1,30}$/), eventIds: crmIds(eventIds, /^(?:emails|notes):\d{1,30}$/), fieldsKnown: true, truncated: fields.size > 20 };
 }
 
-export function assertExecutionCrmUnchanged(baseline:CrmSnapshot,current:CrmSnapshot,effects:Effect[],continuation:ExecutionContinuation={}) {
- return assertExecutionCrmUnchangedCore(baseline,current,effects,continuation);
-}
 const PUBLIC_DELTA_STAGES = ["original", "stage_new", "ticket_create", "note_create", "note_associate", "email_create", "email_associate", "identity_send", "finalizing"];
 const PUBLIC_DELTA_FIELD = /^(?:address|lookup|contacts|associations|tickets|histories|lookup\.(?:address|contacts)|contact\.(?:id|emails|missing)|ticket\.(?:id|ownerId|stage|contactIds|subject|content|createdAt|closedAt|added|removed|missing|membership|receipt_missing)|history\.(?:id|kind|at|text|added_email|added_note|removed|missing|receipt_missing)|(?:associations|association|tickets|ticket_list|histories|history|contacts|contact|lookup)\.missing)$/;
 const PUBLIC_EVIDENCE_ID = /^(?:email-lookup|association-search|(?:contact|ticket|history|identity-ticket|identity-history|ticket-search|identity-search|association)-\d{1,30})$/;

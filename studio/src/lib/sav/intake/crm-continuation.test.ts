@@ -23,7 +23,6 @@ it("requires exact private approval AND separately verified automatic origin",as
  const f=fixture(),verify=vi.fn(async()=>true),read=vi.fn(async()=>f.row);
  const proofs=await qualifyCrmHistoryAdditions(f.baseline,f.current,source,{authority:authority(),readEmail:read,verifyAckOrigin:verify});
  expect(proofs).toHaveLength(1);expect(isQualifiedCrmEmail(proofs[0])).toBe(true);expect(isQualifiedCrmEmail({...proofs[0]})).toBe(false);
- expect(()=>assertExecutionCrmUnchanged(f.baseline,f.current,[f.effect],{nextKind:"stage_new",qualifiedEmails:proofs})).not.toThrow();
  expect(await qualifyCrmHistoryAdditions(f.baseline,f.current,source,{authority:authority(),readEmail:read,verifyAckOrigin:async()=>false})).toEqual([]);
  expect(await qualifyCrmHistoryAdditions(f.baseline,f.current,source,{readEmail:read,verifyAckOrigin:verify})).toEqual([]);
 });
@@ -32,14 +31,20 @@ it("recognizes a native source copy by transport id AND full envelope/content",a
  expect(await qualifyCrmHistoryAdditions(f.baseline,f.current,source,options)).toHaveLength(1);
  f.row.properties.hs_email_headers=JSON.stringify({messageId:"<different@example.invalid>"});expect(await qualifyCrmHistoryAdditions(f.baseline,f.current,source,options)).toHaveLength(0);
 });
-it.each(["human_email","owner","stage","contact","existing_note"])("keeps the %s protection even with an approved acknowledgement",async kind=>{
- const f=fixture();const proofs=await qualifyCrmHistoryAdditions(f.baseline,f.current,source,{authority:authority(),readEmail:async()=>f.row,verifyAckOrigin:async()=>true});
+// Choice rule (Ugo, 27/10): once an effect is confirmed the remaining actions finish on the same
+// target whatever else changed; only a target that disappeared stops them.
+it.each(["human_email","owner","stage","contact","existing_note"])("after a confirmed effect, a %s change no longer stops the remaining actions",kind=>{
+ const f=fixture();
  if(kind==="human_email")f.current.histories["201"].push({...f.event,id:"emails:302",text:JSON.stringify({...JSON.parse(f.event.text),body:"New human question"})});
  if(kind==="owner")f.current.tickets["101"][0].ownerId="999";
  if(kind==="stage")f.current.tickets["101"][0].stage="closed";
  if(kind==="contact")f.current.contacts["101"].emails=["other@example.invalid"];
  if(kind==="existing_note")f.current.histories["201"].push({...f.event,id:"notes:901",kind:"note",text:"Human edit"});
- expect(()=>assertExecutionCrmUnchanged(f.baseline,f.current,[f.effect],{nextKind:"stage_new",qualifiedEmails:proofs})).toThrow("CRM_CHANGED");
+ expect(()=>assertExecutionCrmUnchanged(f.baseline,f.current,[f.effect],{nextKind:"stage_new",targetTicketId:"201"})).not.toThrow();
+});
+it("after a confirmed effect, a target that disappeared stops the remaining actions",()=>{
+ const f=fixture();f.current.tickets["101"]=[];
+ expect(()=>assertExecutionCrmUnchanged(f.baseline,f.current,[f.effect],{nextKind:"stage_new",targetTicketId:"201"})).toThrow("CRM_CHANGED");
 });
 it("rejects changed/expired authority and does not accept a subject/domain alone",()=>{
  const raw=JSON.parse(authority());raw.templates[0].bodySha256="a".repeat(64);expect(()=>readCrmAcknowledgementAuthority(JSON.stringify(raw))).toThrow();

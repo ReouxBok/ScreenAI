@@ -14,25 +14,31 @@ function plan(data: unknown, source: string, evidenceId: string) {
   return { decision: { evidence: [{ id: evidenceId, source, sourceId: "201", contentHash: savIntakeEvidenceContentHash(data) }] } } as unknown as IntakePlan;
 }
 
-it("CRMREVIEW initial owner drift supplies typed diagnostics while remaining blocked", () => {
+// SAV-45 choice rule (Ugo, 27/10): an owner or history change no longer blocks; the reviewed
+// cases keep their intent (typed diagnostic when refused) on a change that alters the choice.
+it("CRMREVIEW initial content drift supplies typed diagnostics while remaining blocked", () => {
   const baseline = snapshot(), current = snapshot();
-  current.tickets["101"][0].ownerId = "999";
+  current.tickets["101"][0].content = "Changed by a human";
   let error: unknown;
   // SAV-45: the analysis now records a digest-only fingerprint of what it saw.
   const analysed = plan(baseline.tickets["101"][0], "crm_ticket", "ticket-201");
   try { assertOriginalExecutionCrm(analysed, current, intakeCrmEvidenceFingerprint(analysed, [baseline])); } catch (e) { error = e; }
   expect(error).toBeInstanceOf(IntakeCrmDeltaError);
-  expect((error as IntakeCrmDeltaError).diagnostic.fields).toContain("ticket.ownerId");
+  expect((error as IntakeCrmDeltaError).diagnostic.fields).toContain("ticket.content");
+});
+it("CRMREVIEW initial owner drift is traced, not refused (choice rule)", () => {
+  const baseline = snapshot(), current = snapshot(); current.tickets["101"][0].ownerId = "999";
+  const analysed = plan(baseline.tickets["101"][0], "crm_ticket", "ticket-201");
+  expect(assertOriginalExecutionCrm(analysed, current, intakeCrmEvidenceFingerprint(analysed, [baseline]))).toEqual([{ fields: ["tickets", "ticket.ownerId"], ticketIds: ["201"], eventIds: [] }]);
 });
 
-it("CRMREVIEW initial history drift supplies typed diagnostics while remaining blocked", () => {
+it("CRMREVIEW initial history drift is traced with its event, not refused (choice rule)", () => {
   const baseline = snapshot(), current = snapshot();
   current.histories["201"] = [{ id: "notes:301", kind: "note", at: "2026-10-27T09:00:00.000Z", text: "Synthetic new information" }];
   let error: unknown;
   const analysed = plan(baseline.histories["201"], "crm_event", "history-201");
-  try { assertOriginalExecutionCrm(analysed, current, intakeCrmEvidenceFingerprint(analysed, [baseline])); } catch (e) { error = e; }
-  expect(error).toBeInstanceOf(IntakeCrmDeltaError);
-  expect((error as IntakeCrmDeltaError).diagnostic.fields).toContain("histories");
+  try { expect(assertOriginalExecutionCrm(analysed, current, intakeCrmEvidenceFingerprint(analysed, [baseline]))).toEqual([{ fields: ["histories", "history.added_note"], ticketIds: ["201"], eventIds: ["notes:301"] }]); } catch (e) { error = e; }
+  expect(error).toBeUndefined();
 });
 
 it("CRMREVIEW control: initial identity/ticket drift is still refused", () => {

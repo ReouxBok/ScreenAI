@@ -281,7 +281,9 @@ it("crash after marker before POST stays uncertain with zero-match RO, no blind 
     expect(p.calls.filter(c => c.method === "POST" && c.path.endsWith("/tickets"))).toHaveLength(0);
     expect(await f.db.select().from(savIntakeOccupations)).not.toHaveLength(0);
 });
-it("human ticket changes after create confirmation invalidate the continuation", async () => {
+// Choice rule (Ugo, 27/10): once an effect is confirmed, the remaining actions finish on the
+// same target whatever the team changed; nothing is replayed and the change is traced.
+it("human ticket changes after create confirmation no longer stop the continuation", async () => {
     const row = await admission(), verify = options.adapters.verify;
     options.adapters.verify = async (...args) => {
         const proof = await verify(...args);
@@ -289,12 +291,11 @@ it("human ticket changes after create confirmation invalidate the continuation",
             p.objects.tickets[proof.ack!.id!].properties.content = "Human changed content";
         return proof;
     };
-    expect(await executeIntakePass(row.id, options)).toMatchObject({
-        state: "waiting", reason: "SAV_INTAKE_EXECUTION_CRM_CHANGED"
-    });
-    expect((await getExecutionEffects(row.id))).toHaveLength(1);
+    expect(await executeIntakePass(row.id, options)).toMatchObject({ state: "confirmed" });
+    expect(p.calls.filter(c => c.method === "POST" && c.path.endsWith("/tickets"))).toHaveLength(1);
+    expect((await f.db.select().from(savIntakeEffectJournal).where(eq(savIntakeEffectJournal.executionId, row.id))).some(j => j.kind === "crm_change_ignored")).toBe(true);
 });
-it("human note edit and closure after PATCH are not subtracted as own deltas", async () => {
+it("a human closure after the set-New PATCH no longer stops finalization", async () => {
     p.seedTicket({
         stage: "open"
     });
@@ -305,10 +306,8 @@ it("human note edit and closure after PATCH are not subtracted as own deltas", a
             p.objects.tickets["201"].properties.hs_pipeline_stage = "4";
         return proof;
     };
-    expect(await executeIntakePass(row.id, options)).toMatchObject({
-        state: "waiting", reason: "SAV_INTAKE_EXECUTION_CRM_CHANGED"
-    });
-    expect((await getExecutionEffects(row.id)).find(e => e.kind === "stage_new")?.state).toBe("confirmed");
+    expect(await executeIntakePass(row.id, options)).toMatchObject({ state: "confirmed" });
+    expect(p.calls.filter(c => c.method === "PATCH")).toHaveLength(1);
 });
 it("required current Gmail callback cannot silently disappear", async () => {
     const row = await admission();
@@ -429,7 +428,7 @@ it.each(["finance", "cancellation"] as const)("strict provider confirms %s field
     });
     expect(Object.values(p.objects.tickets)[0].properties.hs_ticket_category).toBeTruthy();
 });
-it.each(["owner", "history"])("human %s change on created ticket blocks subsequent archive", async (change) => {
+it.each(["owner", "history"])("human %s change on created ticket no longer blocks the remaining actions", async (change) => {
     const row = await admission(), verify = options.adapters.verify;
     options.adapters.verify = async (...args) => {
         const proof = await verify(...args);
@@ -448,10 +447,8 @@ it.each(["owner", "history"])("human %s change on created ticket blocks subseque
         }
         return proof;
     };
-    expect(await executeIntakePass(row.id, options)).toMatchObject({
-        state: "waiting", reason: "SAV_INTAKE_EXECUTION_CRM_CHANGED"
-    });
-    expect((await getExecutionEffects(row.id))).toHaveLength(1);
+    expect(await executeIntakePass(row.id, options)).toMatchObject({ state: "confirmed" });
+    expect(p.calls.filter(c => c.method === "POST" && c.path.endsWith("/tickets"))).toHaveLength(1);
 });
 it("a changed historical body invalidates before first mutation", async () => {
     const older = await storedMessage(threadId, new Date(Date.now() - 1000)), row = await admission();
@@ -822,7 +819,7 @@ it.each([
     expect(p.calls.filter(c => c.method === "PATCH")).toHaveLength(1);
     expect(p.calls.filter(c => c.method === "POST" && c.path.endsWith("/tickets"))).toHaveLength(0);
 });
-it.each(["disappeared", "human_closed"] as const)("review735 linked ticket %s after PATCH still invalidates", async (change) => {
+it.each(["disappeared", "human_closed"] as const)("review735 linked ticket %s after PATCH: only a target that disappeared stops", async (change) => {
     linkedContactTicket("open");
     const row = await admission(), verify = options.adapters.verify;
     options.adapters.verify = async (...args) => {
@@ -835,11 +832,12 @@ it.each(["disappeared", "human_closed"] as const)("review735 linked ticket %s af
         }
         return proof;
     };
-    expect(await executeIntakePass(row.id, options)).toMatchObject({
-        state: "waiting", reason: "SAV_INTAKE_EXECUTION_CRM_CHANGED"
-    });
+    expect(await executeIntakePass(row.id, options)).toMatchObject(change === "disappeared" ? { state: "waiting", reason: "SAV_INTAKE_EXECUTION_CRM_CHANGED" } : { state: "confirmed" });
     expect((await getExecutionEffects(row.id)).find(e => e.kind === "stage_new")?.state).toBe("confirmed");
-    expect((await f.db.select().from(savThreads).where(eq(savThreads.id, threadId)))[0].hubspotTicketId).toBeNull();
+    if (change === "disappeared") {
+        expect((await f.db.select().from(savThreads).where(eq(savThreads.id, threadId)))[0].hubspotTicketId).toBeNull();
+        expect((await readIntakeExecutionProgress(messageId))?.crmDelta).toMatchObject({ reason: "target_missing", ticketIds: ["201"] });
+    }
 });
 it("review735 confirmed history stays confirmed when a new entrant is admitted", async () => {
     const first = await admission();
@@ -1199,36 +1197,18 @@ it("distinguishes an incomplete CRM read from an actual changed snapshot", async
     expect(await executeIntakePass(row.id, options)).toMatchObject({ state: "waiting", reason: "SAV_INTAKE_EXECUTION_CRM_READ_HUBSPOT_HTTP_503" });
     expect(await getExecutionEffects(row.id)).toHaveLength(0);
 });
-it.each(["automatic_ack","source_copy","expired_ack"] as const)("resumes the same execution after four confirmed effects with a strongly proven %s",async kind=>{
- const sha=(s:string)=>createHash("sha256").update(s).digest("hex"),ackBody="Synthetic approved receipt.",ackSubject="Synthetic receipt";
- const templates=[{id:"synthetic",mailbox:"support@example.invalid",subjectSha256:sha(ackSubject),bodySha256:sha(ackBody)}];
- environment.SAV_INTAKE_CRM_ACK_TEMPLATES_JSON=JSON.stringify({version:1,resource:{resourceId:"synthetic",revisionId:"v1",sha256:sha(JSON.stringify(templates))},templates,approvedBy:"synthetic-admin",approvedAt:new Date(Date.now()-1000).toISOString(),expiresAt:new Date(Date.now()+600000).toISOString()});
- options.runtime=savIntakeRuntimeConfig(environment)!;
+// Choice rule (Ugo, 27/10): an email HubSpot logs on the target before set-New (its own copy of
+// the customer mail, an acknowledgement or any other email) no longer stops the reopening.
+it.each(["automatic_ack","source_copy","unknown_email"] as const)("reopens after four confirmed effects even if a %s was logged meanwhile, without replay",async kind=>{
  p.seedTicket({stage:"closed",closedAt:new Date(Date.now()-1000).toISOString()});
- const row=await admission(),verify=options.adapters.verify;let inserted=false,at="";
+ const row=await admission(),verify=options.adapters.verify;let inserted=false;
  options.adapters.verify=async(...args)=>{const proof=await verify(...args);if(args[0].kind==="email_associate"&&proof.confirmed&&!inserted){
-  inserted=true;at=new Date().toISOString();const native=kind==="source_copy";
-  p.objects.emails["8801"]={id:"8801",properties:{hs_timestamp:at,hs_email_direction:native?"INCOMING_EMAIL":"EMAIL",hs_email_from_email:native?"customer@example.invalid":"support@example.invalid",hs_email_to_email:native?"support@example.invalid":"customer@example.invalid",hs_email_subject:native?"Synthetic connection failure":ackSubject,hs_email_text:native?"The synthetic connection fails.":ackBody,hs_email_headers:JSON.stringify({messageId:"<unknown@example.invalid>"})}};
+  inserted=true;const native=kind==="source_copy";
+  p.objects.emails["8801"]={id:"8801",properties:{hs_timestamp:new Date().toISOString(),hs_email_direction:native?"INCOMING_EMAIL":"EMAIL",hs_email_from_email:native?"customer@example.invalid":"support@example.invalid",hs_email_to_email:native?"support@example.invalid":"customer@example.invalid",hs_email_subject:kind==="unknown_email"?"Other":"Synthetic receipt",hs_email_text:"Synthetic logged email."}};
   p.links.set("tickets:201:emails",[...(p.links.get("tickets:201:emails")??[]),"8801"]);
  }return proof;};
- expect(await executeIntakePass(row.id,options)).toMatchObject({state:"waiting",reason:"SAV_INTAKE_EXECUTION_CRM_CHANGED"});
- const before=await getExecutionEffects(row.id);expect(before).toHaveLength(4);expect(before.every(e=>e.state==="confirmed")).toBe(true);
- expect(await readIntakeExecutionProgress(messageId)).toMatchObject({crmDelta:{reason:"unrecognized_added_email",eventIds:["emails:8801"]}});
- const native=kind==="source_copy";p.objects.emails["8801"].properties.hs_email_headers=JSON.stringify({messageId:native?"<incoming@example.invalid>":"<synthetic-ack@example.invalid>"});
- if(!native)p.sent["synthetic-auto"]={id:"synthetic-auto",threadId:"gmail-thread",internalDate:String(Date.parse(at)),labelIds:["SENT"],payload:{mimeType:"text/plain",headers:Object.entries({from:"support@example.invalid",to:"customer@example.invalid",subject:ackSubject,"message-id":"<synthetic-ack@example.invalid>","in-reply-to":"<incoming@example.invalid>","auto-submitted":"auto-replied"}).map(([name,value])=>({name,value})),body:{data:Buffer.from(ackBody).toString("base64url")}}};
- if(kind==="expired_ack"){
-  const gmailCurrent=options.adapters.gmailCurrent!;
-  options.adapters.gmailCurrent=async(...args)=>{await gmailCurrent(...args);vi.setSystemTime(Date.now()+61000);};
-  vi.useFakeTimers({toFake:["Date"]});try{
-   expect(await executeIntakePass(row.id,options)).toMatchObject({state:"waiting",reason:"SAV_INTAKE_EXECUTION_CRM_ACK_PROOF_EXPIRED"});
-   expect((await getExecutionEffects(row.id)).filter(e=>e.state==="confirmed")).toHaveLength(4);
-   expect(p.calls.filter(c=>c.method==="PATCH")).toHaveLength(0);
-  }finally{vi.useRealTimers();}return;
- }
  expect(await executeIntakePass(row.id,options)).toMatchObject({state:"confirmed"});
- const after=await getExecutionEffects(row.id);expect(after).toHaveLength(5);
- for(const previous of before)expect(after.find(e=>e.id===previous.id)).toEqual(previous);
- expect(after.find(e=>e.kind==="stage_new")?.state).toBe("confirmed");
+ const effects=await getExecutionEffects(row.id);expect(effects).toHaveLength(5);expect(effects.every(e=>e.state==="confirmed")).toBe(true);
  expect(p.calls.filter(c=>c.method==="POST"&&c.path.endsWith("/notes"))).toHaveLength(1);
  expect(p.calls.filter(c=>c.method==="POST"&&c.path.endsWith("/emails"))).toHaveLength(1);
  expect(p.calls.filter(c=>c.method==="POST"&&c.path.endsWith("/tickets"))).toHaveLength(0);
@@ -1339,7 +1319,7 @@ async function observedRecorded(mid = messageId) {
     return id;
 }
 const executionPayload = async (id: string) => decryptSavPayload<import("./execution-types").ExecutionPayload>((await f.db.select().from(savIntakeExecutions).where(eq(savIntakeExecutions.id, id)))[0].payloadCiphertext);
-it("SAV-45 A: a first-check owner change names ticket.ownerId from the analysis fingerprint and stays blocked", async () => {
+it("SAV-45 A: a first-check description change names ticket.content from the analysis fingerprint and stays blocked; an owner change alone is traced", async () => {
     p.seedTicket({ stage: "open" });
     runId = await observedRecorded();
     const row = (await admitIntakeExecution(runId, options))!;
@@ -1348,10 +1328,15 @@ it("SAV-45 A: a first-check owner change names ticket.ownerId from the analysis 
     // Digest-only: no customer text or address is kept in the fingerprint.
     expect(JSON.stringify(original)).not.toMatch(/Synthetic full request|Synthetic connection failure|customer@example\.invalid/);
     p.objects.tickets["201"].properties.hubspot_owner_id = "999";
+    p.objects.tickets["201"].properties.content = "Description changed by the team";
     expect(await executeIntakePass(row.id, options)).toMatchObject({ state: "waiting", reason: "SAV_INTAKE_EXECUTION_CRM_CHANGED" });
     expect(await getExecutionEffects(row.id)).toHaveLength(0);
     expect((await readIntakeExecutionProgress(messageId))?.crmDelta).toMatchObject({ stage: "original", reason: "original_evidence_changed", classification: "business_change", fieldsKnown: true,
-        ticketIds: ["201"], fields: expect.arrayContaining(["ticket.ownerId", "tickets"]), evidence: expect.arrayContaining([{ id: "ticket-201", category: "ticket", state: "changed" }]) });
+        ticketIds: ["201"], fields: expect.arrayContaining(["ticket.content", "tickets"]), evidence: expect.arrayContaining([{ id: "ticket-201", category: "ticket", state: "changed" }]) });
+    // The owner change alone does not alter the choice: with the description restored, the dossier proceeds.
+    p.objects.tickets["201"].properties.content = "Synthetic full request";
+    expect(await executeIntakePass(row.id, options)).toMatchObject({ state: "confirmed" });
+    expect((await f.db.select().from(savIntakeEffectJournal).where(eq(savIntakeEffectJournal.executionId, row.id))).some(j => j.kind === "crm_change_ignored")).toBe(true);
 });
 it("SAV-45 A: an analysis recorded before the fingerprint keeps the typed refusal with an explicitly unknown detail", async () => {
     p.seedTicket({ stage: "open" });
@@ -1361,18 +1346,18 @@ it("SAV-45 A: an analysis recorded before the fingerprint keeps the typed refusa
     expect(await executeIntakePass(row.id, options)).toMatchObject({ state: "waiting", reason: "SAV_INTAKE_EXECUTION_CRM_CHANGED" });
     expect((await readIntakeExecutionProgress(messageId))?.crmDelta).toMatchObject({ stage: "original", fieldsKnown: false, classification: "unknown", fields: ["tickets"] });
 });
-it("SAV-45 A: an automation owner set on the ticket Studio created is reported on that receipt, not as a vague snapshot change", async () => {
+it("SAV-45 A: an automation owner set on the ticket Studio created no longer stops the remaining actions; it is traced", async () => {
     const row = await admission(), verify = options.adapters.verify;
     options.adapters.verify = async (...args) => {
         const proof = await verify(...args);
         if (args[0].kind === "ticket_create" && proof.confirmed) p.objects.tickets[proof.ack!.id!].properties.hubspot_owner_id = "999";
         return proof;
     };
-    expect(await executeIntakePass(row.id, options)).toMatchObject({ state: "waiting", reason: "SAV_INTAKE_EXECUTION_CRM_CHANGED" });
-    expect((await readIntakeExecutionProgress(messageId))?.crmDelta).toMatchObject({ reason: "owned_effect_changed", effect: "ticket_create", fields: ["ticket.ownerId"], classification: "business_change" });
-    expect((await getExecutionEffects(row.id)).map(e => [e.kind, e.state])).toEqual([["ticket_create", "confirmed"]]);
+    expect(await executeIntakePass(row.id, options)).toMatchObject({ state: "confirmed" });
+    expect(p.calls.filter(c => c.method === "POST" && c.path.endsWith("/tickets"))).toHaveLength(1);
+    expect((await f.db.select().from(savIntakeEffectJournal).where(eq(savIntakeEffectJournal.executionId, row.id))).some(j => j.kind === "crm_change_ignored")).toBe(true);
 });
-it("SAV-45 A: a human note on the created ticket is named with its event id", async () => {
+it("SAV-45 A: a human note on the created ticket is traced with its event id, not refused", async () => {
     const row = await admission(), verify = options.adapters.verify;
     options.adapters.verify = async (...args) => {
         const proof = await verify(...args);
@@ -1382,14 +1367,15 @@ it("SAV-45 A: a human note on the created ticket is named with its event id", as
         }
         return proof;
     };
-    expect(await executeIntakePass(row.id, options)).toMatchObject({ state: "waiting", reason: "SAV_INTAKE_EXECUTION_CRM_CHANGED" });
-    expect((await readIntakeExecutionProgress(messageId))?.crmDelta).toMatchObject({ reason: "added_history_event", eventIds: ["notes:777"], fields: ["histories", "history.added_note"], classification: "business_change" });
+    expect(await executeIntakePass(row.id, options)).toMatchObject({ state: "confirmed" });
+    const ignored = (await f.db.select().from(savIntakeEffectJournal).where(eq(savIntakeEffectJournal.executionId, row.id))).filter(j => j.kind === "crm_change_ignored");
+    expect(ignored.map(j => decryptSavPayload<{ changes: { eventIds: string[]; fields: string[] }[] }>(j.payloadCiphertext).changes).flat()).toEqual(expect.arrayContaining([expect.objectContaining({ eventIds: ["notes:777"], fields: expect.arrayContaining(["history.added_note"]) })]));
 });
 it("SAV-45 A: the admin diagnostic exposes the execution, its passes, delta and next step without customer text", async () => {
     p.seedTicket({ stage: "open" });
     runId = await observedRecorded();
     const row = (await admitIntakeExecution(runId, options))!;
-    p.objects.tickets["201"].properties.hubspot_owner_id = "999";
+    p.objects.tickets["201"].properties.content = "Description changed by the team";
     await executeIntakePass(row.id, options);
     const diagnostics = await readIntakeRunDiagnostics(threadId);
     expect(diagnostics?.execution).toMatchObject({ readable: true, state: "waiting", reason: "SAV_INTAKE_EXECUTION_CRM_CHANGED", waitingPasses: 1, originalCrmRecorded: true, nextStep: "human_decision",
@@ -1473,7 +1459,7 @@ it("SAV-45 B: a real business change goes to a person at once and does not hold 
     p.seedTicket({ stage: "open" });
     runId = await observedRecorded();
     const row = (await admitIntakeExecution(runId, options))!;
-    p.objects.tickets["201"].properties.hubspot_owner_id = "999";
+    p.objects.tickets["201"].properties.content = "Description changed by the team";
     expect(await executeIntakePass(row.id, options)).toMatchObject({ state: "waiting", reason: "SAV_INTAKE_EXECUTION_CRM_CHANGED" });
     expect((await readIntakeExecutionProgress(messageId))?.crmRecheck).toMatchObject({ attempts: 0, humanRequired: true, cause: "business_change" });
     await age(row.id, 3_600_000);
@@ -1510,7 +1496,7 @@ it("SAV-45 B: a newer analysis run reopens a dossier left to a person, without r
     p.seedTicket({ stage: "open" });
     runId = await observedRecorded();
     const row = (await admitIntakeExecution(runId, options))!;
-    p.objects.tickets["201"].properties.hubspot_owner_id = "999";
+    p.objects.tickets["201"].properties.content = "Description changed by the team";
     await executeIntakePass(row.id, options);
     await age(row.id, 3_600_000);
     expect(await selected()).toBeNull();

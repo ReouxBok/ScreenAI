@@ -519,11 +519,13 @@ it("confirmed partial creation -> human selects the same verified ticket -> cont
   expect(p.calls.filter(c=>c.path==="/crm/v3/objects/tickets"&&c.method==="POST")).toHaveLength(1);
   expect((await readIntakeExecutionProgress(messageId))?.confirmed).toBe(true);expect(await db.db.select().from(savIntakeExecutions)).toHaveLength(1);
 });
-it("a human modification after confirmed creation is not subtracted as an own delta during revision",async()=>{
+// Choice rule (Ugo, 27/10): after a confirmed creation the remaining actions finish on the same
+// ticket; a human edit of its description is traced, never a reason to create it again.
+it("a human modification after confirmed creation no longer stops the revision, and never creates a second ticket",async()=>{
   const {execution,ticketId}=await partiallyConfirmedCreate();const raw=await command();delete raw.contactId;
   const saved=await recordIntakeHumanCommand({...raw,ticketId});p.objects.tickets[ticketId].properties.content+=" Human intervened.";
-  expect(await consumeIntakeHumanEvent(saved.eventId,options.runtime,createSavIntakeHubspotReaders({network:p.network}))).toHaveProperty("waiting","SAV_INTAKE_EXECUTION_CRM_CHANGED");
-  expect((await getExecutionEffects(execution.id))).toHaveLength(1);expect((await readIntakeExecutionProgress(messageId))?.confirmed).toBe(false);
+  expect(await consumeIntakeHumanEvent(saved.eventId,options.runtime,createSavIntakeHubspotReaders({network:p.network}))).not.toHaveProperty("waiting","SAV_INTAKE_EXECUTION_CRM_CHANGED");
+  expect((await getExecutionEffects(execution.id)).filter(e=>e.kind==="ticket_create")).toHaveLength(1);
   expect(p.calls.filter(c=>c.path==="/crm/v3/objects/tickets"&&c.method==="POST")).toHaveLength(1);
 });
 it("two simultaneous human commands CAS the same version exactly once",async()=>{
