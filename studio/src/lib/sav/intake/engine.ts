@@ -35,6 +35,11 @@ export function savIntakePlanFingerprint(plan: Pick<IntakePlan, "decision" | "no
     originalThreadId: plan.originalThreadId, originalRecipientEmails: plan.originalRecipientEmails, referenceMode: plan.referenceMode }));
 }
 
+/** Appended to a created ticket whose email carries files the agent did not read. */
+export function savIntakeUnreadAttachmentNotice(count: number) {
+  return count === 1 ? "1 pièce jointe non lue par l'agent, à vérifier." : `${count} pièces jointes non lues par l'agent, à vérifier.`;
+}
+
 /** Read and plan only. There is deliberately no write, model client, DB or dispatch dependency. */
 export async function planSavIntake(
   input: EngineInput, adapters: IntakeAdapters, policy: EnginePolicy, overrides: Partial<EngineLimits> = {},
@@ -222,6 +227,17 @@ export async function planSavIntake(
       if (observations.some(o => o.status !== "analyzed" && !accessory(o))) return context("classification_incomplete");
       for (const observation of observations) addEvidence(observation.sourceId, "current_attachment", message.id, observation);
     } else if (analysis.attachmentObservations?.length) return context("classification_incomplete");
+    if (message.unreadAttachments?.length) {
+      // Text analysable, files not read: the reader judges each file's role. The engine only checks
+      // what it can verify: one requirement per file, role accessory, quote present in the current
+      // text. A required/unknown file keeps the dossier for the team; the wording is not parsed here.
+      const requirements = analysis.unreadAttachmentRequirements ?? [];
+      const accessory = (u: { sourceId: string }) => requirements.filter(r => r.sourceId === u.sourceId).length === 1
+        && requirements.some(r => r.sourceId === u.sourceId && r.role === "accessory" && r.textQuote && savEvidenceContains(message.currentText, r.textQuote));
+      if (requirements.some(r => !message.unreadAttachments!.some(u => u.sourceId === r.sourceId))) return context("classification_incomplete");
+      if (message.unreadAttachments.some(u => !accessory(u))) return context("history_incomplete");
+      for (const unread of message.unreadAttachments) addEvidence(unread.sourceId, "current_attachment", message.id, { ...unread, read: false });
+    } else if (analysis.unreadAttachmentRequirements?.length) return context("classification_incomplete");
     if (!requests.length && analysis.nature === "newsletter" && policy.qualifiedOther?.family === "authenticated_newsletter" && !policy.manualSupportOverride) classification = "other";
     else if (!requests.length || kinds.includes("unknown") || classification === "mixed") return context("classification_incomplete", "request_scope_uncertain");
     if (policy.manualSupportOverride && classification === "other") {
@@ -423,7 +439,10 @@ export async function planSavIntake(
       const summary = analysis.ticketSummary;
       if (!summary || summary.title.split(/\s+/).length > 6 || summary.requestIds.length !== requests.length
         || unique(summary.requestIds).length !== requests.length || requests.some(r => !summary.requestIds.includes(r.id))) return context("classification_incomplete");
-      newTicket = { ...summary, requestIds: [...summary.requestIds].sort(), contactId: primary.id, pipeline: "support", stage: "new", source: "email", owner: "leave_unassigned" };
+      // Unread files ride with the associated email; the team is told they were not read.
+      const unread = message.unreadAttachments?.length ?? 0;
+      const description = unread ? `${summary.description}\n\n${savIntakeUnreadAttachmentNotice(unread)}` : summary.description;
+      newTicket = { ...summary, description, requestIds: [...summary.requestIds].sort(), contactId: primary.id, pipeline: "support", stage: "new", source: "email", owner: "leave_unassigned" };
     }
     const openIds = candidateTickets.filter(t => t.stage !== "closed" && t.contactIds.includes(targetContactId)).map(t => t.id).sort();
     const multiple = openIds.length + (target.operation === "link" ? 0 : 1) > 1;

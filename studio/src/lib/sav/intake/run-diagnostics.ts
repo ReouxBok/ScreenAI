@@ -18,7 +18,7 @@ const publicCodes = new Set<string>([...Object.keys(intakeContextReasonLabels), 
   "aliases_unavailable", "batch_limit", "partial_batch", "conflicting_contact", "contact_limit", "cancelled", "read_unavailable",
   "ticket_limit", "ticket_membership_conflict", "ticket_content_unavailable", "history_limit", "history_date_unknown", "read_retry_scheduled", "read_retry_stopped", "read_retry_claimed"]);
 const outputStages = new Set(["sanitize_wire", "visual_normalize", "decode", "final_schema", "evidence"]);
-const normalizationCounts = ["nullOptionalKeys", "partialImages", "truncatedImageTexts", "truncatedUncertainties", "droppedUncertainties", "droppedRegions", "truncatedRegionTexts", "invalidBoxes", "omittedChars"];
+const normalizationCounts = ["nullOptionalKeys", "partialImages", "truncatedImageTexts", "truncatedUncertainties", "droppedUncertainties", "droppedRegions", "truncatedRegionTexts", "invalidBoxes", "omittedChars", "discardedRegistrations"];
 /** Allow-listed integer counters only; values and texts are never projected. */
 function outputNormalization(raw: unknown) {
   const n = raw !== null && typeof raw === "object" && !Array.isArray(raw) ? raw as Record<string, unknown> : null;

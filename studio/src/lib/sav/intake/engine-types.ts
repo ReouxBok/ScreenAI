@@ -1,5 +1,5 @@
 import { z } from "zod";
-import { savAttachmentObservationSchema } from "../attachment-contract";
+import { savAttachmentObservationSchema, savAttachmentReasonSchema } from "../attachment-contract";
 import { intakeOperatorInformationSchema } from "./operator-information-contract";
 import type { SavIntakeDecision, SavIntakeMutation } from "./contract";
 
@@ -13,6 +13,9 @@ export const intakeMessageSchema = z.object({
   direction: z.enum(["inbound", "outbound"]),
   operatorInformation: intakeOperatorInformationSchema.optional(),
   attachmentInputs: z.array(z.object({ sourceId: ref, fileHash: z.string().regex(/^[a-f0-9]{64}$/) }).strict()).max(3).optional(),
+  // Files of a complete text that were NOT read (unsupported type, too large, invalid).
+  // Never content: the reader must judge whether the written request suffices without them.
+  unreadAttachments: z.array(z.object({ sourceId: ref, reason: savAttachmentReasonSchema }).strict()).min(1).max(20).optional(),
 }).strict();
 export type IntakeMessage = z.infer<typeof intakeMessageSchema>;
 export const intakeContactSchema = z.object({ id, emails: z.array(z.email()).min(1).max(50) }).strict();
@@ -46,6 +49,8 @@ export const messageAnalysisSchema = z.object({
   attachmentObservations: z.array(savAttachmentObservationSchema).max(3).optional(),
   imageRequirements: z.array(z.object({ sourceId: ref, fileHash: z.string().regex(/^[a-f0-9]{64}$/),
     role: z.enum(["accessory", "required", "unknown"]), textQuote: z.string().min(1).max(2000).optional() }).strict()).max(3).optional(),
+  unreadAttachmentRequirements: z.array(z.object({ sourceId: ref, role: z.enum(["accessory", "required", "unknown"]),
+    textQuote: z.string().min(1).max(2000).optional() }).strict()).max(20).optional(),
   registration: z.object({ address: z.email(), sourceMessageId: z.uuid(), quote: z.string().min(1).max(2000) }).strict().optional(),
   ticketSummary: z.object({ title: z.string().trim().min(1).max(120), description: z.string().trim().min(1).max(100_000), requestIds: z.array(ref).min(1).max(15) }).strict().optional(),
 }).strict();

@@ -29,7 +29,9 @@ export async function prepareIntakeAttachments(lease: IntakeLease, model: string
   const read: SavAttachmentRead = { version: 1, readerRevision: SAV_ATTACHMENT_READER_REVISION, model, messageId: message.id, mailboxId: message.mailboxId,
     gmailMessageId: message.gmailMessageId, selectionHash: savContentHash({ metadata, inventory }), claimId: randomUUID(), state: "reading", startedAt: new Date().toISOString(), completedAt: null, observations: prepared.observations };
   const state: IntakeAttachmentState = { textComplete: lease.provenance.get(message.id)?.textComplete === true, sourceHash: lease.sourceHash, read, inventory };
-  const complete=inventory?.complete === true && metadata.length > 0 && prepared.selected.length === metadata.length;
+  // Visual read when every file is either an admitted image or durably unread (mixed image + PDF).
+  const complete=inventory?.complete === true && metadata.length > 0 && prepared.selected.length > 0
+    && prepared.observations.every(o => prepared.selected.some(s => s.observation === o) || intakeAttachmentDurablyUnread(o));
   if(!complete) finishIntakeAttachmentRead(state,"context_incomplete");
   return { state, prepared, complete };
 }
@@ -39,10 +41,28 @@ export function intakeInputWithAttachments(input: EngineInput, sourceHash: strin
   if (!state || state.sourceHash !== sourceHash || state.read.messageId !== input.message.id) return input;
   const read = savAttachmentReadSchema.parse(state.read);
   const observations = read.observations;
-  const ready = state.textComplete && state.inventory?.complete === true && observations.length > 0 && observations.length <= 3
-    && observations.every(o => o.fileHash && (prepared ? prepared.selected.some(s => s.observation.sourceId === o.sourceId) : o.status === "analyzed"));
-  if (!ready) return input;
-  const message = { ...input.message, contentComplete: true, attachmentInputs: observations.map(o => ({ sourceId: o.sourceId, fileHash: o.fileHash! })) };
+  // Read images (selected now, or already analyzed) and durably unread files are kept distinct.
+  const visual = observations.filter(o => o.fileHash && (prepared ? prepared.selected.some(s => s.observation.sourceId === o.sourceId) : o.status === "analyzed"));
+  const unread = observations.filter(o => !visual.includes(o));
+  const ready = state.textComplete && state.inventory?.complete === true && visual.length > 0 && visual.length <= 3 && observations.length <= 20
+    && unread.every(intakeAttachmentDurablyUnread);
+  if (!ready) return intakeInputWithUnreadAttachments(input, state, observations);
+  const message = { ...input.message, contentComplete: true, attachmentInputs: visual.map(o => ({ sourceId: o.sourceId, fileHash: o.fileHash! })),
+    ...(unread.length ? { unreadAttachments: unread.map(o => ({ sourceId: o.sourceId, reason: o.reason })) } : {}) };
+  return { ...input, message, conversation: { ...input.conversation, data: input.conversation.data.map(m => m.id === message.id ? message : m) } };
+}
+/** Durable per-file outcomes that a retry cannot change: the file stays unread, the
+ * complete written text may still be analysed. Transport, permission, budget and
+ * association failures are excluded and keep the dossier incomplete. */
+const SAV_INTAKE_UNREAD_TEXT_ONLY_REASONS = new Set(["unsupported_type", "byte_limit", "pixel_limit", "invalid_image", "type_mismatch"]);
+function intakeAttachmentDurablyUnread(o: SavAttachmentRead["observations"][number]) {
+  return o.status !== "analyzed" && !o.fileHash && SAV_INTAKE_UNREAD_TEXT_ONLY_REASONS.has(o.reason);
+}
+function intakeInputWithUnreadAttachments(input: EngineInput, state: IntakeAttachmentState, observations: SavAttachmentRead["observations"]): EngineInput {
+  const textOnly = state.textComplete && state.inventory?.complete === true && observations.length > 0 && observations.length <= 20
+    && observations.every(intakeAttachmentDurablyUnread);
+  if (!textOnly) return input;
+  const message = { ...input.message, contentComplete: true, unreadAttachments: observations.map(o => ({ sourceId: o.sourceId, reason: o.reason })) };
   return { ...input, message, conversation: { ...input.conversation, data: input.conversation.data.map(m => m.id === message.id ? message : m) } };
 }
 

@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
-import { beforeAll, beforeEach, afterAll, afterEach, it, expect, vi } from "vitest";
+import { beforeAll, beforeEach, afterAll, afterEach, describe, it, expect, vi } from "vitest";
 import { eq, sql } from "drizzle-orm";
 import { createSavTestDb } from "../../../../test/sav-db";
 import { executionProvider } from "../../../../test/sav-intake-execution-provider";
@@ -35,6 +35,7 @@ import { releaseIntakeHumanHold } from "./human-hold-release";
 import { releaseLegacyAiPauses } from "./legacy-pause";
 import { SAV_EXTERNAL_COMPLETION, SAV_EXTERNAL_COMPLETION_REVERTED, getSavExternalCompletion, revertSavExternalCompletionBatch, markSavDossiersHandledExternally, completeSavDossierManually } from "../external-completion";
 import { listIntakeConsole, projectIntakeThread, refreshIntakeConsole } from "./console-store";
+import { classifyInvalidSourceAsOther } from "./invalid-source-classification";
 import { syncHandledIntakeGmailRead, reconcileHandledIntakeGmailRead, SAV_INTAKE_GMAIL_READ } from "./gmail-read";
 import type { GmailRequest } from "./execution-adapters";
 import { readIntakeConsoleDetail } from "./console-detail";
@@ -69,12 +70,12 @@ async function message(thread = threadId, receivedAt = new Date(), subject = "Sy
     fromEmail: "customer@example.invalid", toEmails: ["support@example.invalid"], subject, receivedAt,
     bodyCiphertext: encryptSavPayload({ text: "The synthetic connection fails.", headers: { "message-id": "<incoming@example.invalid>" }, attachments: [] }) }).returning())[0];
 }
-async function observed(multiple = false, sensitive = false, same = true, equivalentContactIds?: string[]) {
+async function observed(multiple = false, sensitive = false, same = true, equivalentContactIds?: string[], kind?: "acknowledgement") {
   if (multiple) p.setContacts([{ id: "101", emails: ["customer@example.invalid"] }, { id: "102", emails: ["customer@example.invalid"] }]);
   const id = (await enqueueSavIntakeMessage(messageId, options.runtime))!, lease = (await claimSavIntakeRun(id, options.runtime))!;
   const semantics: AcceptedIntakeSemantics = { revision: SAV_INTAKE_SEMANTIC_RECORD_REVISION, validatorRevision: SAV_INTAKE_MODEL_REVISION, records: [] };
   const semantic = recordAcceptedIntakeSemantics({
-    analyseMessage: async () => ({ messageId, requests: [{ id: "r1", kind: sensitive ? "finance" as const : "support" as const, currentMessageId: messageId }],
+    analyseMessage: async () => ({ messageId, requests: [{ id: "r1", kind: kind ?? (sensitive ? "finance" as const : "support" as const), currentMessageId: messageId }],
       ticketSummary: { title: "Synthetic connection failure", description: "The synthetic connection fails.", requestIds: ["r1"] } }),
     assessIdentity: async ({ candidates, evidence }) => ({ kind: "equivalent", investigationComplete: true,
       contactIds: equivalentContactIds ?? candidates.map(c => c.contact.id), evidenceIds: evidence.map(e => e.id) }),
@@ -1373,4 +1374,142 @@ it("actions_paused keeps human analysis: the choice is published, nothing is sen
  await setAgentPause("actions_paused");
  expect(await consumeIntakeHumanEvent(saved.eventId,options.runtime,createSavIntakeHubspotReaders({network:p.network}))).toHaveProperty("state","observed");
  expect(mutationsSent()).toHaveLength(0);
+});
+
+describe("SAV-42 C: a confirmed current acknowledgement is marked read once", () => {
+  const readable = async () => {
+    await db.db.update(savMailboxes).set({email:"contact@limova.ai"}).where(eq(savMailboxes.id,mailboxId));
+    await db.db.update(savMessages).set({gmailMessageId:"1a123"}).where(eq(savMessages.id,messageId));
+    await db.db.update(savThreads).set({gmailThreadId:"1a000"}).where(eq(savThreads.id,threadId));
+  };
+  const provider = () => {
+    const state = { unread: true, writes: 0, fail: false };
+    const gmail: GmailRequest = async<T>(_mailbox: string, path: string, init?: RequestInit) => {
+      if (path === "profile") return { emailAddress: "contact@limova.ai" } as T;
+      if (init?.method === "POST") { state.writes++; state.unread = false; if (state.fail) throw Error("TIMEOUT"); return {} as T; }
+      return { id: "1a123", threadId: "1a000", labelIds: ["INBOX", ...state.unread ? ["UNREAD"] : []] } as T;
+    };
+    return { state, gmail };
+  };
+  const deps = (gmail: GmailRequest) => ({ env: () => ({ ...environment, SAV_INTAKE_GMAIL_MARK_READ: "on" }), gmail });
+  const acknowledged = async () => {
+    const plan = await observed(false, false, true, undefined, "acknowledgement");
+    expect(plan.decision.disposition).toMatchObject({ kind: "no_ticket", reason: "acknowledgement_only" });
+    await projectIntakeThread(threadId);
+    expect((await listIntakeConsole({ view: "completed" })).rows.map(r => r.threadId)).toEqual([threadId]);
+  };
+  it("is marked read with a durable receipt, no ticket or email effect, and recovered after a Gmail failure", async () => {
+    await readable(); await acknowledged();
+    const g = provider(); g.state.fail = true;
+    expect(await syncHandledIntakeGmailRead(messageId, deps(g.gmail))).toMatchObject({ confirmed: false });
+    g.state.fail = false;
+    expect(await syncHandledIntakeGmailRead(messageId, deps(g.gmail))).toEqual({ confirmed: true });
+    expect(await syncHandledIntakeGmailRead(messageId, deps(g.gmail))).toEqual({ skipped: "already_confirmed" });
+    expect(g.state.writes).toBe(1); expect(g.state.unread).toBe(false);
+    const receipts = await db.db.select().from(auditLogs).where(eq(auditLogs.action, SAV_INTAKE_GMAIL_READ));
+    expect(receipts).toHaveLength(1); expect(receipts[0].technicalMetadata).toMatchObject({ acknowledgementRunId: runId });
+    expect(mutationsSent()).toHaveLength(0);
+  });
+  it("is selected by the read-receipt recovery", async () => {
+    await acknowledged();
+    for (const [key, value] of Object.entries({ ...environment, SAV_INTAKE_GMAIL_MARK_READ: "on" })) vi.stubEnv(key, value);
+    await db.db.update(savMailboxes).set({ email: "contact@limova.ai" }).where(eq(savMailboxes.id, mailboxId));
+    // Invalid synthetic Gmail id: selected and attempted, refused before any provider call.
+    expect(await reconcileHandledIntakeGmailRead(5)).toMatchObject({ checked: 1 });
+    const failures = await db.db.select().from(auditLogs).where(eq(auditLogs.action, "sav_intake_gmail_read_failed"));
+    expect(failures.map(f => f.entityId)).toEqual([messageId]);
+  });
+  it("is not marked read once a newer inbound message supersedes it", async () => {
+    await readable(); await acknowledged();
+    await message(threadId, new Date(Date.now() + 1000));
+    await projectIntakeThread(threadId); // fresh projection: refusal must not depend on staleness
+    const g = provider();
+    expect(await syncHandledIntakeGmailRead(messageId, deps(g.gmail))).toEqual({ skipped: "not_handled" });
+    expect(g.state.writes).toBe(0);
+  });
+  it("is not marked read when its local sources changed", async () => {
+    await readable(); await acknowledged();
+    await db.db.update(savMessages).set({ bodyCiphertext: encryptSavPayload({ text: "Finalement le problème revient.", attachments: [], headers: {} }) }).where(eq(savMessages.id, messageId));
+    await projectIntakeThread(threadId);
+    const g = provider();
+    expect(await syncHandledIntakeGmailRead(messageId, deps(g.gmail))).toEqual({ skipped: "not_handled" });
+    expect(g.state.writes).toBe(0);
+  });
+  it("is not marked read under a human hold", async () => {
+    await readable(); await acknowledged();
+    await requestHumanIntervention(threadId, "ugo@limova.ai", "Synthetic hold on an acknowledgement");
+    await projectIntakeThread(threadId);
+    const g = provider();
+    expect(await syncHandledIntakeGmailRead(messageId, deps(g.gmail))).toEqual({ skipped: "not_handled" });
+    expect(g.state.writes).toBe(0);
+  });
+});
+
+describe("SAV-42 D: an invalid-source dossier stays readable and can be classified Other by the operator", () => {
+  const invalidSource = async () => {
+    vi.stubEnv("SAV_RELEASE_STAGE", "v0"); vi.stubEnv("SAV_PILOT_MODE", "false");
+    await activateSavV0Cutover({receivedAfter:new Date(Date.now()-3600000).toISOString(),mailboxEmail:"support@example.invalid",intakeRecipient:"contact@limova.ai",deploymentSha:"a".repeat(40),activatedBy:"ugo@limova.ai"});
+    // Over the 30-recipient transport limit: the analysis source is refused, never truncated.
+    await db.db.update(savMessages).set({ toEmails: Array.from({ length: 31 }, (_, n) => `r${n}@example.invalid`) }).where(eq(savMessages.id, messageId));
+    const id = (await enqueueSavIntakeMessage(messageId, options.runtime))!;
+    expect(await claimSavIntakeRun(id, options.runtime)).toBeNull();
+    await projectIntakeThread(threadId);
+    return { requestKey: randomUUID(), threadId, messageId, confirmed: true as const };
+  };
+  it("the dossier detail loads and exposes the invalid source instead of failing", async () => {
+    await invalidSource();
+    const detail = await readIntakeConsoleDetail(threadId);
+    expect(detail?.current?.sourceInvalid).toBe(true);
+    expect(detail?.current?.sourceMatches).toBe(false);
+  });
+  it("is classified Other once, audited, idempotent, without model, email or CRM effect", async () => {
+    const input = await invalidSource();
+    expect(await classifyInvalidSourceAsOther(input)).toMatchObject({ marked: 1, alreadyCompleted: 0 });
+    expect(await classifyInvalidSourceAsOther(input)).toMatchObject({ marked: 0, alreadyCompleted: 1 });
+    expect((await listIntakeConsole({ view: "other" })).rows.map(r => r.threadId)).toEqual([threadId]);
+    const markers = await db.db.select().from(auditLogs).where(eq(auditLogs.action, SAV_EXTERNAL_COMPLETION));
+    expect(markers).toHaveLength(1); expect(markers[0].technicalMetadata).toMatchObject({ disposition: "other" });
+    expect(mutationsSent()).toHaveLength(0);
+    expect(await db.db.select().from(savIntakeModelCalls)).toHaveLength(0);
+  });
+  it("refuses a dossier whose source is valid", async () => {
+    vi.stubEnv("SAV_RELEASE_STAGE", "v0"); vi.stubEnv("SAV_PILOT_MODE", "false");
+    await observed();
+    await expect(classifyInvalidSourceAsOther({ requestKey: randomUUID(), threadId, messageId, confirmed: true })).rejects.toThrow("SAV_INTAKE_SOURCE_NOT_INVALID");
+  });
+  it("refuses a stale message once a newer inbound exists", async () => {
+    const input = await invalidSource();
+    await message(threadId, new Date(Date.now() + 1000));
+    await expect(classifyInvalidSourceAsOther(input)).rejects.toThrow();
+    expect(await db.db.select().from(auditLogs).where(eq(auditLogs.action, SAV_EXTERNAL_COMPLETION))).toHaveLength(0);
+  });
+  it("refuses an operator who is not the authorised owner", async () => {
+    const input = await invalidSource();
+    const [other] = await db.db.insert(staffUsers).values({ clerkId: "synthetic-other-admin", email: "other@limova.ai", name: "Other", role: "admin", active: true }).returning();
+    state.user = { id: other.clerkId, primaryEmailAddress: { emailAddress: other.email, verification: { status: "verified" } } };
+    await expect(classifyInvalidSourceAsOther(input)).rejects.toThrow();
+    expect(await db.db.select().from(auditLogs).where(eq(auditLogs.action, SAV_EXTERNAL_COMPLETION))).toHaveLength(0);
+  });
+});
+
+import * as reviewRuntimeStore from "./runtime-store";
+it("REVIEW invalid-source classification is refused when the same message becomes a valid support source before the guarded transaction", async () => {
+  vi.stubEnv("SAV_RELEASE_STAGE", "v0"); vi.stubEnv("SAV_PILOT_MODE", "false");
+  await activateSavV0Cutover({ receivedAfter: new Date(Date.now()-3600000).toISOString(), mailboxEmail: "support@example.invalid", intakeRecipient: "contact@limova.ai", deploymentSha: "a".repeat(40), activatedBy: "ugo@limova.ai" });
+  await db.db.update(savMessages).set({ toEmails: Array.from({ length: 31 }, (_, n) => `r${n}@example.invalid`) }).where(eq(savMessages.id, messageId));
+  const id = (await enqueueSavIntakeMessage(messageId, options.runtime))!;
+  expect(await claimSavIntakeRun(id, options.runtime)).toBeNull();
+  const original = reviewRuntimeStore.readSavIntakeCurrent;
+  const spy = vi.spyOn(reviewRuntimeStore, "readSavIntakeCurrent").mockImplementationOnce(async (...args) => {
+    const snapshot = await original(...args);
+    expect(snapshot?.sourceInvalid).toBe(true);
+    // Simulate source repair/reingestion after the initial check, before thread-row locks.
+    await db.db.update(savMessages).set({ toEmails: ["support@example.invalid"], bodyCiphertext: encryptSavPayload({ text: "Ma connexion échoue et nécessite une prise en charge SAV.", headers: {}, attachments: [] }) }).where(eq(savMessages.id, messageId));
+    return snapshot;
+  });
+  try {
+    await classifyInvalidSourceAsOther({ requestKey: randomUUID(), threadId, messageId, confirmed: true }).catch(() => null);
+    expect(await db.db.select().from(auditLogs).where(eq(auditLogs.action, SAV_EXTERNAL_COMPLETION))).toHaveLength(0);
+    expect(mutationsSent()).toHaveLength(0);
+  } finally { spy.mockRestore(); }
 });

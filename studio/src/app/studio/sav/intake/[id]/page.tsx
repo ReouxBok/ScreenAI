@@ -10,6 +10,7 @@ import {readIntakeCrmDisplay} from "@/lib/sav/intake/crm-display-server";
 import { releaseIntakeHumanHoldAction } from "../actions";
 import {IntakeRecoveryForm} from "../recovery-form";
 import { IntakeCompletionForm } from "../completion-form";
+import { IntakeInvalidSourceForm } from "../invalid-source-form";
 import { intakeStatusLabel, intakeReasonLabel, intakeContextReasonLabels, intakeHandoff } from "@/lib/sav/intake/console-presentation";
 import styles from "../intake.module.css";
 import { IntakeBackLink } from "../navigation";
@@ -110,6 +111,7 @@ export default async function IntakeDetailPage({ params, searchParams }: { param
         confirmedEffects={data.progress?.effects.filter(e=>e.state==="confirmed").length??0} uncertain={data.progress?.state==="uncertain"||Boolean(data.progress?.effects.some(e=>["dispatched","acked","uncertain"].includes(e.state)))}
         paused={data.thread.paused||data.humanHeld} exhausted={Boolean(blocked)}
         lastActivity={data.diagnostics?.runs.flatMap(r=>r.events.map(e=>e.createdAt)).sort((a,b)=>b.getTime()-a.getTime())[0] ? formatParisDateTime(data.diagnostics.runs.flatMap(r=>r.events.map(e=>e.createdAt)).sort((a,b)=>b.getTime()-a.getTime())[0]) : undefined}/>
+      {!data.handledExternally && current?.sourceInvalid && current.messageId === data.latestMessageId && staff.email === "ugo@limova.ai" && ["admin", "owner"].includes(staff.role) && <IntakeInvalidSourceForm key={`invalid-${current.messageId}`} threadId={id} messageId={current.messageId} requestKey={randomUUID()}/>}
       {(!data.handledExternally || data.projection.status === "human_review") && data.latestMessageId && staff.email === "ugo@limova.ai" && ["admin", "owner"].includes(staff.role) && <IntakeCompletionForm key={data.latestMessageId} threadId={id} messageId={data.latestMessageId} requestKey={randomUUID()}/>}
       {data.humanHeld && !data.handledExternally && data.latestMessageId && ["admin","owner"].includes(staff.role) && <section className={styles.notice}><h2>Reprendre ce dossier</h2>
         <p>Cette action lève uniquement sa pause humaine. Le moteur automatique pourra poursuivre si les preuves et la politique existante le permettent. Les tentatives et les preuves sont conservées. Si une nouvelle qualification est nécessaire, utilisez ensuite « Refaire l’analyse » dans le panneau de poursuite.</p>

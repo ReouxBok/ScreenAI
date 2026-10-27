@@ -144,6 +144,9 @@ function assertOperator(actorEmail: string) {
 }
 
 type CompletionActor = Pick<typeof staffUsers.$inferSelect, "id" | "email" | "clerkId">;
+type CompletionTx = Parameters<Parameters<ReturnType<typeof requireDb>["transaction"]>[0]>[0];
+/** Caller-specific precondition re-checked under the thread locks, before any append. */
+export type CompletionGuard = (tx: CompletionTx, message: typeof savMessages.$inferSelect) => Promise<boolean>;
 const manualSchema = z.object({ requestKey: z.uuid(), threadId: z.uuid(), messageId: z.uuid(), confirmed: z.literal(true) }).strict();
 
 /** Authenticated single-message UI entry point. The boundary is server-owned;
@@ -156,13 +159,23 @@ export async function completeSavDossierManually(raw: unknown) {
     messages: [{ threadId: input.threadId, messageId: input.messageId }] }, actor.email, actor);
 }
 
+/** Authenticated single-message "Autres" classification. Same owner, boundary,
+ * unsettled-work and active-worker guards as the Terminés entry point. */
+export async function classifySavDossierOtherManually(raw: unknown, underLock?: CompletionGuard) {
+  const actor = await executionAdministrator();
+  assertOperator(actor.email);
+  const input = manualSchema.parse(raw);
+  return applyExternalCompletion({ batchId: input.requestKey, receivedBefore: new Date().toISOString(), disposition: "other",
+    messages: [{ threadId: input.threadId, messageId: input.messageId }] }, actor.email, actor, underLock);
+}
+
 /** Explicit operations entry point. No cron or model calls it.
  * The caller supplies a frozen preview; we recheck under thread row locks.
  * Only append-only audit rows are written. Snapshots/verdicts/actions are untouched. */
 export async function markSavDossiersHandledExternally(raw: unknown, actorEmail: string) {
   return applyExternalCompletion(raw, actorEmail);
 }
-async function applyExternalCompletion(raw: unknown, actorEmail: string, actor?: CompletionActor) {
+async function applyExternalCompletion(raw: unknown, actorEmail: string, actor?: CompletionActor, underLock?: CompletionGuard) {
   assertOperator(actorEmail);
   const input = batchSchema.parse(raw);
   if (Date.parse(input.receivedBefore) > Date.now()) throw new Error("SAV_EXTERNAL_COMPLETION_FUTURE_BOUNDARY");
@@ -207,6 +220,7 @@ async function applyExternalCompletion(raw: unknown, actorEmail: string, actor?:
         const executions = await tx.select({ leaseUntil: savIntakeExecutions.leaseUntil }).from(savIntakeExecutions).where(eq(savIntakeExecutions.threadId, requested.threadId));
         if ([...runs, ...executions].some(row => row.leaseUntil && row.leaseUntil > new Date())) reason = "active_worker";
       }
+      if (!reason && underLock && !await underLock(tx, message!)) reason = "source_changed";
       if (reason) { skipped[reason] = (skipped[reason] ?? 0) + 1; continue; }
       const previous = findSavExternalCompletion(message!, events);
       if (previous && savExternalDisposition(previous).view === input.disposition) { alreadyCompleted++; continue; }
