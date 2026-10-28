@@ -216,7 +216,7 @@ it("BUDGET-RES a provider input above the reserved bound is charged in full and 
   expect(await settleSavIntakeCall(call.id, over, { json: {}, metadata: over })).toBe(true);
   const [row] = await f.db.select().from(savIntakeModelCalls);
   expect(row.chargedNanoUsd).toBe(over.inputTokens * 750 + 10 * 3750); expect(row.chargedNanoUsd).toBeGreaterThan(expected(1000) - OUTPUT);
-  expect(decryptSavPayload(row.payloadCiphertext)).toMatchObject({ reservationExceeded: true });
+  expect(decryptSavPayload(row.payloadCiphertext)).toMatchObject({ reservationExceeded: { originalReservedNanoUsd: expected(1000) }, reservation: { reservedNanoUsd: expected(1000) } });
   expect(await readSavIntakeBudget(config)).toMatchObject({ reservationBoundRevoked: true, requiredNanoUsd: FULL });
   const next = await reserveSavIntakeCall(l, config, "cd".repeat(32), new Date(), sized(1000));
   expect((await f.db.select().from(savIntakeModelCalls).where(eq(savIntakeModelCalls.id, next.id)))[0].reservedNanoUsd).toBe(FULL);
@@ -235,4 +235,61 @@ it("BUDGET-RES a forged descriptor or a dropped exceedance marker is refused, le
   await f.db.update(savIntakeModelCalls).set({ payloadCiphertext: encryptSavPayload(rest) }).where(eq(savIntakeModelCalls.id, call.id));
   await expect(readSavIntakeBudget(config)).rejects.toThrow("LEDGER_REJECTED");
   expect(await f.db.select().from(auditLogs)).toHaveLength(0);
+});
+
+// Independent reviewer reproductions: valid usage exceeds only the monetary reservation.
+it("REVIEW47 a one-token reservation overrun settles fully and revokes the estimate", async () => {
+  const l = await lease(), call = await reserveSavIntakeCall(l, config, "a1".repeat(32), new Date(), sized(1000));
+  const actual = { inputTokens: 1000 + FRAMING + 1, outputTokens: 8192, thoughtTokens: 0, totalTokens: 1000 + FRAMING + 1 + 8192 };
+  await expect(settleSavIntakeCall(call.id, actual, { json: {}, metadata: actual })).resolves.toBe(true);
+  const [row] = await f.db.select().from(savIntakeModelCalls).where(eq(savIntakeModelCalls.id, call.id));
+  expect(row.chargedNanoUsd).toBe(expected(1000) + 750);
+  expect(await readSavIntakeBudget(config)).toMatchObject({ reservationBoundRevoked: true, requiredNanoUsd: FULL });
+});
+it("REVIEW47 dispatcher retains accounted usage and revokes after a minimal actual overrun", async () => {
+  const { createIntakeModelDispatcher } = await import("./model-dispatch");
+  const { savGeminiWireBody } = await import("../gemini-transport");
+  const l = await lease(), signal = new AbortController().signal;
+  const input = { model: config.model, phase: "ticket_matching" as const, promptRevision: "review47", signal, allowRetry: false as const,
+    body: { contents: [{ role: "user", parts: [{ text: "Synthetic request" }] }], generationConfig: { maxOutputTokens: 8192 } } };
+  const size = savGeminiWireBody(input), inputTokens = size.textBytes + FRAMING + 1;
+  const network = vi.fn(async () => providerAnswer({ fixture: true }, { promptTokenCount: inputTokens, candidatesTokenCount: 8192, thoughtsTokenCount: 0, totalTokenCount: inputTokens + 8192 }));
+  const dispatcher = createIntakeModelDispatcher({ config, signal, live: async () => {}, env: () => environment, network,
+    reserve: (hash, measured) => reserveSavIntakeCall(l, config, hash, new Date(), measured) });
+  // Type-only cast (reviewer fixture has no systemInstruction); runtime behaviour unchanged.
+  const outcome = await dispatcher.call(input as unknown as Parameters<typeof dispatcher.call>[0]).then(() => "resolved", () => "rejected");
+  await Promise.allSettled(dispatcher.pending);
+  const [row] = await f.db.select().from(savIntakeModelCalls);
+  expect(network).toHaveBeenCalledTimes(1);
+  expect({ outcome, state: row.state, revoked: (await readSavIntakeBudget(config)).reservationBoundRevoked })
+    .toEqual({ outcome: "resolved", state: "settled", revoked: true });
+});
+it("BUDGET-RES an overrun keeps the original reservation, the real cost and its proof; none of them can be altered", async () => {
+  const l = await lease(), call = await reserveSavIntakeCall(l, config, "a2".repeat(32), new Date(), sized(1000));
+  const actual = { inputTokens: 1000 + FRAMING + 1, outputTokens: 8192, thoughtTokens: 0, totalTokens: 1000 + FRAMING + 1 + 8192 };
+  expect(await settleSavIntakeCall(call.id, actual, { json: {}, metadata: actual })).toBe(true);
+  const [row] = await f.db.select().from(savIntakeModelCalls).where(eq(savIntakeModelCalls.id, call.id));
+  // Same update: reservation raised to the exact real cost, never capped, original kept in the proof.
+  expect(row).toMatchObject({ state: "settled", chargedNanoUsd: expected(1000) + 750, reservedNanoUsd: expected(1000) + 750 });
+  expect(decryptSavPayload(row.payloadCiphertext)).toMatchObject({ reservation: { reservedNanoUsd: expected(1000) }, reservationExceeded: { originalReservedNanoUsd: expected(1000) } });
+  expect(await readSavIntakeBudget(config)).toMatchObject({ chargedNanoUsd: expected(1000) + 750, reservationBoundRevoked: true });
+  // A second settlement is idempotent and changes nothing.
+  expect(await settleSavIntakeCall(call.id, actual, { json: {}, metadata: actual })).toBe(true);
+  expect((await f.db.select().from(savIntakeModelCalls))[0]).toEqual(row);
+  const tamper = async (change: Partial<typeof row>, check = true) => {
+    await f.db.update(savIntakeModelCalls).set(change).where(eq(savIntakeModelCalls.id, call.id));
+    if (check) await expect(readSavIntakeBudget(config)).rejects.toThrow("LEDGER_REJECTED");
+    await f.db.update(savIntakeModelCalls).set({ reservedNanoUsd: row.reservedNanoUsd, chargedNanoUsd: row.chargedNanoUsd, payloadCiphertext: row.payloadCiphertext }).where(eq(savIntakeModelCalls.id, call.id));
+  };
+  await tamper({ reservedNanoUsd: FULL });
+  const proof = decryptSavPayload<Record<string, unknown>>(row.payloadCiphertext);
+  await tamper({ payloadCiphertext: encryptSavPayload({ ...proof, reservationExceeded: { originalReservedNanoUsd: expected(1000) + 1 } }) });
+  await tamper({ payloadCiphertext: encryptSavPayload({ ...proof, reservationExceeded: true }) });
+  expect(await readSavIntakeBudget(config)).toMatchObject({ reservationBoundRevoked: true });
+});
+it("BUDGET-RES without an overrun the stored reservation can never move", async () => {
+  const l = await lease(), call = await reserveSavIntakeCall(l, config, "a3".repeat(32), new Date(), sized(1000));
+  expect(await settleSavIntakeCall(call.id, usage, { json: {}, metadata: usage })).toBe(true);
+  await f.db.update(savIntakeModelCalls).set({ reservedNanoUsd: expected(1000) + 1 }).where(eq(savIntakeModelCalls.id, call.id));
+  await expect(readSavIntakeBudget(config)).rejects.toThrow("LEDGER_REJECTED");
 });

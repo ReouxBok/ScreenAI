@@ -57,13 +57,16 @@ async function resolveIntakeDispatch(tx: Pick<Tx, "select">, rows: readonly { id
   throw Error("SAV_INTAKE_RUNTIME_CALL_ALREADY_CONSUMED");
 }
 /** Validates every ledger row and returns whether the per-request input bound is revoked:
- * one settled call whose provider-reported input exceeded the bound it reserved. */
+ * one settled call whose provider-reported input exceeded the bound it reserved.
+ * The SQL check keeps charged <= reserved. A real cost above the original reservation is
+ * therefore settled by raising the row's reservation to that exact cost in the same update;
+ * the original amount stays in the descriptor and the overrun marker, both checked here. */
 function budgetRowsValid(rows: Pick<typeof savIntakeModelCalls.$inferSelect,"reservedNanoUsd"|"chargedNanoUsd"|"payloadCiphertext"|"state">[]) {
   let revoked = false;
   for (const row of rows) {
-    const data = decryptSavPayload<{ metadata?: SavGeminiMetadata; reservation?: unknown; reservationExceeded?: boolean }>(row.payloadCiphertext), m = data.metadata ?? {};
+    const data = decryptSavPayload<{ metadata?: SavGeminiMetadata; reservation?: { reservedNanoUsd?: unknown }; reservationExceeded?: { originalReservedNanoUsd?: unknown } }>(row.payloadCiphertext), m = data.metadata ?? {};
     // Rows reserved before per-request reservations carry the full quote and no descriptor.
-    const reservation = data.reservation === undefined ? null : storedIntakeReservation(data.reservation, row.reservedNanoUsd);
+    const reservation = data.reservation === undefined ? null : storedIntakeReservation(data.reservation, Number(data.reservation?.reservedNanoUsd));
     if (data.reservation === undefined ? row.reservedNanoUsd !== 817_152_000 : !reservation) throw Error("SAV_INTAKE_RUNTIME_LEDGER_REJECTED");
     // A received unbilled rejection is settled at zero with its explicit marker (see settleSavIntakeCall).
     if (unbilledProviderRow(row)) continue;
@@ -75,6 +78,11 @@ function budgetRowsValid(rows: Pick<typeof savIntakeModelCalls.$inferSelect,"res
     // The marker must match the counters: it can be neither forged nor dropped.
     const exceeded = row.state === "settled" && reservation !== null && Number(i) > reservation.inputTokenBound;
     if (Boolean(data.reservationExceeded) !== exceeded) throw Error("SAV_INTAKE_RUNTIME_LEDGER_REJECTED");
+    // Only an overrun may move the stored reservation, exactly to the real cost, never past the full quote.
+    if (reservation && (exceeded
+      ? data.reservationExceeded?.originalReservedNanoUsd !== reservation.reservedNanoUsd
+        || row.reservedNanoUsd !== Math.max(reservation.reservedNanoUsd, row.chargedNanoUsd) || row.reservedNanoUsd > 817_152_000
+      : row.reservedNanoUsd !== reservation.reservedNanoUsd)) throw Error("SAV_INTAKE_RUNTIME_LEDGER_REJECTED");
     revoked ||= exceeded;
   }
   return { revoked };
@@ -483,13 +491,19 @@ export async function settleSavIntakeCall(id: string, metadata?: SavGeminiMetada
     // it still counts as a dispatch. Timeouts, lost answers and other statuses stay uncertain.
     const unbilled = !valid && unbilledProviderStatus(providerStatus) && !result;
     const cost = valid ? Number(i) * 750 + (Number(o) + Number(t)) * 3750 : unbilled ? 0 : row.reservedNanoUsd;
-    // The descriptor survives settlement. A real cost above the reserved input bound is charged in
-    // full (never capped) and marked: it revokes the per-request bound for every later reservation.
+    // The descriptor survives settlement. A real input above the reserved bound is charged in full
+    // (never capped) and marked: it revokes the per-request bound for every later reservation.
     const prior = decryptSavPayload<{ reservation?: unknown }>(row.payloadCiphertext).reservation;
     const reservation = prior === undefined ? null : storedIntakeReservation(prior, row.reservedNanoUsd);
+    if (prior !== undefined && !reservation) throw Error("SAV_INTAKE_RUNTIME_LEDGER_REJECTED");
     const exceeded = valid && reservation !== null && Number(i) > reservation.inputTokenBound;
-    await tx.update(savIntakeModelCalls).set({ state: valid || unbilled ? "settled" : "uncertain", chargedNanoUsd: cost,
-      payloadCiphertext: encryptSavPayload({ metadata: metadata ?? {}, ...(prior === undefined ? {} : { reservation: prior }), ...(exceeded ? { reservationExceeded: true } : {}),
+    // Output and thinking are bounded by the request, so only an input overrun can cost more than
+    // the reservation. The same update raises the reservation to that exact cost (SQL charged <= reserved);
+    // it is never above the full quote, since valid counters stay within the model limits.
+    if (cost > row.reservedNanoUsd && !exceeded) throw Error("SAV_INTAKE_RUNTIME_LEDGER_REJECTED");
+    await tx.update(savIntakeModelCalls).set({ state: valid || unbilled ? "settled" : "uncertain", chargedNanoUsd: cost, reservedNanoUsd: Math.max(row.reservedNanoUsd, cost),
+      payloadCiphertext: encryptSavPayload({ metadata: metadata ?? {}, ...(prior === undefined ? {} : { reservation: prior }),
+        ...(exceeded ? { reservationExceeded: { originalReservedNanoUsd: row.reservedNanoUsd } } : {}),
         ...(unbilled ? { usageReconciliation: "provider_http_error_unbilled.v1", providerStatus } : {}) }), resultCiphertext: valid && result && row.runId ? encryptSavPayload(result) : null, settledAt: new Date() }).where(eq(savIntakeModelCalls.id, id));
     return valid || unbilled;
   });
