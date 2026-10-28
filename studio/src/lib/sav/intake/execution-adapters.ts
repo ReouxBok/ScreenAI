@@ -276,8 +276,9 @@ export function createIntakeExecutorAdapters(options: {
                 };
             }
             if (intent.kind === "stage_new") {
-                const row = await read("tickets", id(intent.ticketId), signal), known = Object.hasOwn(row.properties, "hubspot_owner_id"), owner = row.properties.hubspot_owner_id || null;
-                const ok = row.id === intent.ticketId && row.properties.hs_pipeline === "0" && row.properties.hs_pipeline_stage === "1" && known && owner === intent.expectedOwnerId;
+                // Stage only: the owner is whatever the team set, never ours to check (Ugo, 27/10).
+                const row = await read("tickets", id(intent.ticketId), signal);
+                const ok = row.id === intent.ticketId && row.properties.hs_pipeline === "0" && row.properties.hs_pipeline_stage === "1";
                 return {
                     confirmed: ok, attributed: ok && Boolean(ack?.id === intent.ticketId), ack: {
                         id: row.id

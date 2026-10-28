@@ -4,7 +4,7 @@ import { runIntakeComparisonOperator } from "@/lib/sav/intake/comparison-operato
 export type ComparisonActionState = { ok: boolean; message: string; code?: string };
 export async function runComparisonAction(_previous: ComparisonActionState, form: FormData): Promise<ComparisonActionState> {
   try {
-    const batch = await runIntakeComparisonOperator({ stage: String(form.get("stage") ?? ""), reviewed: form.get("reviewed") === "confirmed" });
+    const batch = await runIntakeComparisonOperator({ stage: String(form.get("stage") ?? ""), expectedMessageId: String(form.get("expectedMessageId") ?? ""), expectedCampaignId: String(form.get("expectedCampaignId") ?? ""), reviewed: form.get("reviewed") === "confirmed" });
     revalidatePath("/studio/sav/intake/comparison");
     return { ok: true, message: "Requête terminée. Vérifiez les résultats dans le rapport avant de poursuivre.", ...("skipped" in batch ? { code: "SAV_INTAKE_COMPARISON_OFF" } : {}) };
   } catch (error) {

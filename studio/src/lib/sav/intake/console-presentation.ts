@@ -12,6 +12,7 @@ const statuses: Record<string, string> = {
   confirmed: "Actions confirmées", refused: "Poursuite arrêtée", superseded: "Version remplacée",
 };
 const reasons: Array<[RegExp, string]> = [
+  [/ADDRESS_PROOF_UNRESOLVED/, "L’adresse retenue par l’analyse ne peut plus être prouvée à partir du mail. Aucune action n’est envoyée ; une décision humaine est nécessaire."],
   [/CRM_READ_/, "La lecture HubSpot est incomplète ou indisponible. Les actions déjà confirmées sont conservées ; la reprise vérifie le contexte sans les recréer."],
   [/MESSAGE_METADATA_INVALID/, "L’adresse de l’expéditeur ou la liste des destinataires est invalide ou dépasse les limites. Ce mail reste à vérifier ; les autres dossiers peuvent continuer."],
   [/DAILY_BUDGET_DEFERRED/, "Plafond quotidien d’analyse IA atteint : reprise automatique au prochain jour (minuit UTC), aucune tentative consommée."],
@@ -28,6 +29,30 @@ const reasons: Array<[RegExp, string]> = [
   [/RESOURCE/, "La ressource approuvée nécessaire à ce parcours est indisponible."],
 ];
 export const intakeStatusLabel = (status: string) => statuses[status] ?? "Vérification en attente";
+const crmClasses: Record<string, string> = {
+  business_change: "changement dans HubSpot sur un élément utilisé par la décision", unattributed_email: "email ajouté dans HubSpot, non encore attribué",
+  unknown: "écart dont le détail n’est pas disponible",
+};
+const crmReasons: Record<string, string> = {
+  original_evidence_changed: "au premier contrôle, avant toute action", owned_effect_changed: "sur une action déjà confirmée par Studio",
+  added_history_event: "nouvel événement dans l’historique du ticket", unrecognized_added_email: "avant la remise en Nouveau", snapshot_changed: "pendant la poursuite",
+  choice_changed: "avant toute action, sur un élément du choix (fiche, ticket, étape, sujet ou description)",
+  target_out_of_scope: "après une action confirmée : le ticket cible n’apparaît plus parmi les tickets des contacts relus (supprimé, fusionné ou rattaché à une autre fiche, non distingués)",
+};
+const nextSteps: Record<string, string> = {
+  none: "aucune", read_only_verification: "vérification en lecture seule du résultat déjà envoyé, sans nouvel envoi",
+  human_decision: "décision humaine : vérifier le dossier dans HubSpot, puis le reprendre en main ou le marquer traité ; aucune action automatique n’est relancée",
+  automatic_recheck: "nouveau contrôle automatique borné, sans rejouer les actions confirmées", wait_resume: "reprise à la fin de la pause",
+  unknown: "à déterminer : motif technique non classé",
+};
+export const intakeNextStepLabel = (step: string) => nextSteps[step] ?? nextSteps.unknown;
+/** Readable summary of an allow-listed CRM delta: kind, moment, fields; never values. */
+export function intakeCrmDeltaLabel(delta: { reason: string; classification: string; fields: string[]; fieldsKnown: boolean | null; ticketIds: string[] } | null | undefined) {
+  if (!delta) return null;
+  const fields = delta.fields.filter(f => f.includes(".")), where = delta.ticketIds.length ? ` (ticket${delta.ticketIds.length > 1 ? "s" : ""} ${delta.ticketIds.join(", ")})` : "";
+  return `Écart HubSpot : ${crmClasses[delta.classification] ?? crmClasses.unknown}, ${crmReasons[delta.reason] ?? "pendant la vérification"}${where}. `
+    + (fields.length ? `Champs : ${fields.join(", ")}.` : delta.fieldsKnown === false ? "Détail des champs inconnu pour cette analyse (empreinte d’origine absente)." : `Éléments : ${delta.fields.join(", ") || "non précisés"}.`);
+}
 export function intakeReasonLabel(reason: string | null | undefined) {
   if (!reason) return null;
   if (!/^[A-Z_:\d]+$/.test(reason) && /[ àéèêç]/.test(reason)) return reason;

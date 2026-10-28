@@ -136,3 +136,21 @@ it("a reservation slower than the CRM deadline does not consume the provider att
     expect(network).toHaveBeenCalledTimes(1);
   } finally { vi.useRealTimers(); }
 });
+
+it("SAV46 does not count a network send when the transport expires during the final live check", async () => {
+  const input = inputAtSize(1000), network = vi.fn<typeof fetch>(), settle = vi.fn(async () => false);
+  let checks = 0;
+  const dispatcher = createIntakeModelDispatcher({ config, captureDiagnostics: true,
+    live: async () => { if (++checks === 2) await new Promise(resolve => setTimeout(resolve, 19_000)); },
+    reserve: async () => ({ id: "late-live-check", cached: null }), settle, network,
+    signal: new AbortController().signal, env: () => ({ SAV_GEMINI_API_KEY: "synthetic-key" }) });
+  vi.useFakeTimers();
+  try {
+    const result = dispatcher.call(input).catch(error => error);
+    await vi.advanceTimersByTimeAsync(19_000);
+    expect(await result).toMatchObject({ message: "SAV_AI_TIMEOUT" });
+    expect(network).not.toHaveBeenCalled();
+    expect(dispatcher.diagnostics).toMatchObject([{ dispatched: false, httpStatus: null }]);
+    expect(settle).toHaveBeenCalledOnce(); expect(dispatcher.uncertain).toBe(true);
+  } finally { vi.useRealTimers(); }
+});

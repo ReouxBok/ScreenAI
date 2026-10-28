@@ -28,9 +28,13 @@ export type ExecutionPayload = {
         ticketId: string | null;
     };
     baseline?: CrmSnapshot;
+    /** Digest-only CRM evidence of the analysis, when it was recorded (SAV-45). */
+    originalCrm?: import("./crm-evidence-fingerprint").CrmEvidenceFingerprint;
     keys: string[];
     reason?: string;
     crmDelta?: import("./execution-context").CrmDeltaDiagnostic;
+    /** CRM wait schedule of the current episode (SAV-45); the journal is the durable source. */
+    crmRecheck?: import("./crm-recheck").CrmRecheckState;
     lastRunId: string;
     acceptedFingerprint: string;
     effectsConfirmed?: boolean;

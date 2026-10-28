@@ -584,3 +584,47 @@ describe("SAV-42 B contract: the reader judges the role, the engine checks only 
     reason(await f.run(), "history_incomplete");
   });
 });
+
+describe("SAV-43: a PDF sent to the reader follows the same role contract", () => {
+  const pdf = { sourceId: "attachment:pdf-read", fileHash: "f".repeat(64) };
+  const run = async (status: "analyzed" | "partial" | "unreadable", role: "accessory" | "required" | "unknown", kinds?: Parameters<typeof fixture>[0]) => {
+    const f = fixture(kinds); f.input.message.currentText = "La connexion échoue à chaque ouverture, facture jointe.";
+    f.input.message.attachmentInputs = [pdf];
+    f.analysis.attachmentObservations = [{ ...pdf, filename: "document-fictif.pdf", mimeType: "application/pdf", referenceHash: "r", width: null, height: null, status,
+      reason: status === "analyzed" ? "observed" : status === "partial" ? "partial_content" : "unreadable_content", text: status === "unreadable" ? "" : "Facture F-001. Erreur E42.", uncertainties: [], regions: [] }];
+    f.analysis.imageRequirements = [{ ...pdf, role, textQuote: f.input.message.currentText }];
+    return f.run();
+  };
+  it("a read PDF is cited as evidence and the ticket carries no unread notice", async () => {
+    const p = await run("analyzed", "required");
+    expect(target(p).target.operation).toBe("create");
+    expect(p.newTicket?.description).toBe("Synthetic description covering all declared requests");
+    expect(p.decision.evidence.filter(e => e.source === "current_attachment").map(e => e.id)).toEqual([pdf.sourceId]);
+  });
+  it("an unreadable accessory PDF is handled and flagged as not read on the created ticket", async () => {
+    const p = await run("unreadable", "accessory");
+    expect(target(p).target.operation).toBe("create");
+    expect(p.newTicket?.description).toMatch(/\n\n1 pièce jointe non lue par l'agent, à vérifier\.$/u);
+  });
+  it("a partial accessory PDF is handled without being called unread", async () => {
+    const p = await run("partial", "accessory");
+    expect(p.newTicket?.description).toBe("Synthetic description covering all declared requests");
+  });
+  it.each([["unreadable", "required"], ["unreadable", "unknown"], ["partial", "required"], ["partial", "unknown"]] as const)("a %s PDF whose role is %s stays with the team", async (status, role) => {
+    const p = await run(status, role);
+    expect(p.decision.disposition.kind).toBe("collect_context"); expect(p.steps).toEqual([]);
+  });
+  it("finance read from the request keeps its supervised, non-learning route with a read PDF", async () => {
+    const p = await run("analyzed", "required", ["finance"]);
+    expect(p.decision.classification).toBe("finance"); expect(target(p).learning).toBe("excluded");
+  });
+});
+
+// SAV-45 C: a short relapse judged an acknowledgement is a judgement defect of the reader,
+// kept in the bench as a synthetic case; no prompt or wording change in this lot.
+it.fails("SAV-45 C (known judgement defect): a short relapse after a ticket is not completed as a bare acknowledgement", async () => {
+  const f = fixture(["acknowledgement"]); f.input.message.currentText = "Ça recommence.";
+  const p = await f.run();
+  // Expected once the reader is qualified: a support request, not an acknowledgement-only dossier.
+  expect(p.decision.classification).toBe("support");
+});
