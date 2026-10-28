@@ -15,9 +15,9 @@ it("keeps a lost command response explicit and never retries it",async()=>{
 });
 it("shows a read-only full navigation and disables a new comparison after response loss",()=>{
  m.state={ok:false,code:COMPARISON_RESPONSE_LOST,message:"Consultez le rapport"};
- const html=renderToStaticMarkup(createElement(ComparisonForm,{stage:"sentinels",ready:true,complete:false}));
+ const html=renderToStaticMarkup(createElement(ComparisonForm,{stage:"sentinels",ready:true,complete:false,campaignId:"synthetic-60",expectedMessageId:"00000000-0000-4000-8000-000000000001"}));
  expect(html).toContain('<fieldset disabled=""');expect(html).toContain('type="button"');expect(html).toContain('Consulter le rapport sans relancer');
- expect(html).toContain('role="alert"');expect(html).not.toContain("Réessayer");
+ expect(html).toContain('name="expectedMessageId"');expect(html).toContain('value="00000000-0000-4000-8000-000000000001"');expect(html).toContain('role="alert"');expect(html).not.toContain("Réessayer");
 });
 it("preserves successful and explicit server error responses",async()=>{
  for(const result of [{ok:true,message:"Fini"},{ok:false,message:"Refus",code:"SAV_INTAKE_COMPARISON_BUDGET_EXHAUSTED"}]){

@@ -5,13 +5,15 @@ import styles from "../intake.module.css";
 import { comparisonActionResponse, COMPARISON_RESPONSE_LOST } from "./action-response";
 const guardedAction = (previous: ComparisonActionState, form: FormData) => comparisonActionResponse(runComparisonAction, previous, form);
 const initial: ComparisonActionState = { ok: false, message: "" };
-export function ComparisonForm({ stage, ready, complete }: { stage: "sentinels" | "remaining"; ready: boolean; complete: boolean }) {
+export function ComparisonForm({ stage, ready, complete, expectedMessageId, campaignId }: { campaignId: string; expectedMessageId: string | null; stage: "sentinels" | "remaining"; ready: boolean; complete: boolean }) {
   const [state, submit, pending] = useActionState(guardedAction, initial);
   const responseLost = state.code === COMPARISON_RESPONSE_LOST;
   return <form action={submit} className={styles.choice}>
     <h2>{stage === "sentinels" ? "Dix sentinelles — maximum 5 USD" : "Cinquante suivants — maximum 20 USD au total"}</h2>
     <input type="hidden" name="stage" value={stage}/>
-    <fieldset disabled={pending || !ready || complete || responseLost}>
+    <input type="hidden" name="expectedCampaignId" value={campaignId}/>
+    <input type="hidden" name="expectedMessageId" value={expectedMessageId ?? ""}/>
+    <fieldset disabled={pending || !ready || complete || responseLost || !expectedMessageId}>
       {stage === "remaining" && <label><input type="checkbox" name="reviewed" value="confirmed" required/>
         J’ai vérifié les dix résultats contre les décisions attendues et je confirme la poursuite.</label>}
       <button type="submit">{complete ? "Plus aucun dossier à lancer dans cette phase" : "Comparer le prochain dossier"}</button>

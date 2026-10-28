@@ -4,7 +4,7 @@ import { requireDb } from "@/db";
 import { auditLogs } from "@/db/schema";
 import { requireIntakeConsoleStaff } from "./console-auth";
 import { readSavIntakeComparisonReport, runSavIntakeComparisonBatch, savIntakeComparisonConfig } from "./comparison-campaign";
-const command = z.object({ stage: z.enum(["sentinels", "remaining"]), reviewed: z.boolean().default(false) }).strict();
+const command = z.object({ stage: z.enum(["sentinels", "remaining"]), reviewed: z.boolean().default(false), expectedMessageId: z.uuid(), expectedCampaignId: z.string().regex(/^[a-z0-9-]{1,64}$/) }).strict();
 type Environment = () => Record<string, string | undefined>;
 type Report = Awaited<ReturnType<typeof readSavIntakeComparisonReport>>;
 const detailSchema = z.object({ coverage: z.array(z.string()), simple: z.object({
@@ -41,10 +41,11 @@ export async function readIntakeComparisonPanel() {
   await administrator();
   return readSavIntakeComparisonReport();
 }
-/** Only the reviewed campaign list from the server is used. No client-supplied IDs,
- * model, transport, money limit or live pipeline setting can enter this action. */
+/** Only the reviewed campaign list from the server grants scope. Rendered campaign/dossier
+ * tokens detect stale commands; they cannot select another ID, model, transport or money limit. */
 export async function runIntakeComparisonOperator(raw: unknown, options: { env?: Environment; network?: typeof fetch } = {}) {
   const staff = await administrator(), input = command.parse(raw), env = options.env ?? (() => process.env), config = configured(env);
+  if (input.expectedCampaignId !== config.campaignId) throw Error("SAV_INTAKE_COMPARISON_STALE_COMMAND");
   const report = await readSavIntakeComparisonReport(env);
   if (input.stage === "remaining") {
     if (!input.reviewed || !comparisonSentinelsReady(report)) throw Error("SAV_INTAKE_COMPARISON_SENTINELS_REVIEW_REQUIRED");
@@ -56,6 +57,8 @@ export async function runIntakeComparisonOperator(raw: unknown, options: { env?:
   if (!next) return { campaignId: config.campaignId, compared: [] };
   const allowed = input.stage === "sentinels" ? config.messageIds.slice(0, 10) : config.messageIds.slice(10);
   if (!allowed.includes(next.messageId)) throw Error("SAV_INTAKE_COMPARISON_SCOPE_INVALID");
+  // A delayed replay of a previously rendered form must never select a later dossier.
+  if (next.messageId !== input.expectedMessageId) throw Error("SAV_INTAKE_COMPARISON_STALE_COMMAND");
   const signature = JSON.stringify(config), scoped = { ...config,
     // Concurrent submissions select the SAME next ID. The durable claim lets only
     // one run; the loser cannot silently pay for the following dossier.
