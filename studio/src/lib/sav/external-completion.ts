@@ -146,7 +146,18 @@ function assertOperator(actorEmail: string) {
 type CompletionActor = Pick<typeof staffUsers.$inferSelect, "id" | "email" | "clerkId">;
 type CompletionTx = Parameters<Parameters<ReturnType<typeof requireDb>["transaction"]>[0]>[0];
 /** Caller-specific precondition re-checked under the thread locks, before any append. */
-export type CompletionGuard = (tx: CompletionTx, message: typeof savMessages.$inferSelect) => Promise<boolean>;
+const manualOtherProof = z.object({ revision: z.literal("sav-intake-manual-other.v1"), commandHash: z.string().regex(/^[a-f0-9]{64}$/),
+  sourceHash: z.string().regex(/^[a-f0-9]{64}$/), runId: z.uuid().nullable(), runVersion: z.number().int().positive().nullable(),
+  reasonCiphertext: z.string().min(1).max(16_384) }).strict();
+/** Optional attestation is produced only by the caller's guard under these locks,
+ * and joins the canonical marker atomically. Old boolean guards are unchanged. */
+export type CompletionGuard = (tx: CompletionTx, message: typeof savMessages.$inferSelect) => Promise<boolean | { manualOther: z.infer<typeof manualOtherProof> }>;
+function manualOtherAudit(guarded: Awaited<ReturnType<CompletionGuard>>): Record<string, string | number | boolean | null> {
+  if (typeof guarded === "boolean") return {};
+  const proof = manualOtherProof.parse(guarded.manualOther);
+  return { manualOtherRevision: proof.revision, manualOtherCommandHash: proof.commandHash, manualOtherSourceHash: proof.sourceHash,
+    manualOtherRunId: proof.runId, manualOtherRunVersion: proof.runVersion, manualOtherReasonCiphertext: proof.reasonCiphertext };
+}
 const manualSchema = z.object({ requestKey: z.uuid(), threadId: z.uuid(), messageId: z.uuid(), confirmed: z.literal(true) }).strict();
 
 /** Authenticated single-message UI entry point. The boundary is server-owned;
@@ -220,14 +231,16 @@ async function applyExternalCompletion(raw: unknown, actorEmail: string, actor?:
         const executions = await tx.select({ leaseUntil: savIntakeExecutions.leaseUntil }).from(savIntakeExecutions).where(eq(savIntakeExecutions.threadId, requested.threadId));
         if ([...runs, ...executions].some(row => row.leaseUntil && row.leaseUntil > new Date())) reason = "active_worker";
       }
-      if (!reason && underLock && !await underLock(tx, message!)) reason = "source_changed";
+      const guarded = !reason && underLock ? await underLock(tx, message!) : true;
+      if (!reason && !guarded) reason = "source_changed";
       if (reason) { skipped[reason] = (skipped[reason] ?? 0) + 1; continue; }
       const previous = findSavExternalCompletion(message!, events);
       if (previous && savExternalDisposition(previous).view === input.disposition) { alreadyCompleted++; continue; }
       // A reverted batch is never silently re-applied on retry.
       if (events.some(event => event.entityId === requested.messageId && event.technicalMetadata.batchId === input.batchId)) { skipped.previously_applied_batch = (skipped.previously_applied_batch ?? 0) + 1; continue; }
       rows.push({ actorEmail: actorEmail.toLowerCase(), action: SAV_EXTERNAL_COMPLETION, entityType: "sav_message", entityId: message!.id,
-        technicalMetadata: { version: 1, threadId: message!.threadId, batchId: input.batchId, receivedBefore: input.receivedBefore, reason: "processed_outside_studio", disposition: input.disposition } });
+        technicalMetadata: { version: 1, threadId: message!.threadId, batchId: input.batchId, receivedBefore: input.receivedBefore, reason: "processed_outside_studio", disposition: input.disposition,
+          ...manualOtherAudit(guarded) } });
     }
     if (rows.length) {
       await tx.insert(auditLogs).values(rows);
