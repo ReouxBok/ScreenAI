@@ -440,7 +440,8 @@ export async function planSavIntake(
       if (!summary || summary.title.split(/\s+/).length > 6 || summary.requestIds.length !== requests.length
         || unique(summary.requestIds).length !== requests.length || requests.some(r => !summary.requestIds.includes(r.id))) return context("classification_incomplete");
       // Unread files ride with the associated email; the team is told they were not read.
-      const unread = message.unreadAttachments?.length ?? 0;
+      // SAV-43: a sent file the reader found unreadable (accessory) was not read either.
+      const unread = (message.unreadAttachments?.length ?? 0) + (message.attachmentInputs?.length ? analysis.attachmentObservations?.filter(o => o.status === "unreadable").length ?? 0 : 0);
       const description = unread ? `${summary.description}\n\n${savIntakeUnreadAttachmentNotice(unread)}` : summary.description;
       newTicket = { ...summary, description, requestIds: [...summary.requestIds].sort(), contactId: primary.id, pipeline: "support", stage: "new", source: "email", owner: "leave_unassigned" };
     }

@@ -6,6 +6,7 @@ import { SAV_INTAKE_READERS_REVISION } from "./hubspot-readers";
 import { SAV_MESSAGE_CONTEXT_REVISION } from "../message-context";
 import type { EnginePolicy, IntakePlan } from "./engine-types";
 import { intakeReadRecoveryPolicySchema } from "./read-recovery";
+import { SAV_ATTACHMENT_PDF_REVISION } from "../attachment-contract";
 
 export const SAV_INTAKE_RUNTIME_REVISION = "sav-intake-runtime-2026-10-21.v1";
 export const intakeRuntimeHash = (value: unknown) => createHash("sha256").update(JSON.stringify(value)).digest("hex");
@@ -25,7 +26,9 @@ export const savIntakeRuntimePins = z.object({ mailboxId: z.uuid(), createdAfter
       : p.maxCalls <= SAV_INTAKE_BUDGET_BOUNDS.qualification.maxCalls && p.maxNanoUsd <= SAV_INTAKE_BUDGET_BOUNDS.qualification.maxNanoUsd && p.maxRollingNanoUsd === undefined);
 export type IntakeRuntimeConfig = z.infer<typeof savIntakeRuntimePins> & { mode: "observe"; policy: EnginePolicy; configHash: string; model: "gemini-3.6-flash";
   /** Reader pipeline for NEW runs only; frozen in each run at creation and deliberately outside configHash. */
-  pipeline?: SavIntakePipeline };
+  pipeline?: SavIntakePipeline;
+  /** SAV-43: PDF attachments read by the visual call. Off by default and inside configHash. */
+  pdfReading?: boolean };
 export const SAV_INTAKE_PIPELINES = ["current", "simple"] as const;
 export type SavIntakePipeline = typeof SAV_INTAKE_PIPELINES[number];
 /** Absent means the current multi-call readers; any other value is a configuration error, never a silent default. */
@@ -33,6 +36,12 @@ export function savIntakePipeline(env: Record<string, string | undefined>): SavI
   const value = env.SAV_INTAKE_PIPELINE ?? "current";
   if (!(SAV_INTAKE_PIPELINES as readonly string[]).includes(value)) throw Error("SAV_INTAKE_RUNTIME_CONFIGURATION_REQUIRED");
   return value as SavIntakePipeline;
+}
+/** Absent or "off" keeps PDFs unread; only "on" enables them. Anything else is a configuration error. */
+export function savIntakePdfReading(env: Record<string, string | undefined>) {
+  const value = env.SAV_INTAKE_PDF_READING ?? "off";
+  if (value !== "on" && value !== "off") throw Error("SAV_INTAKE_RUNTIME_CONFIGURATION_REQUIRED");
+  return value === "on";
 }
 /** Pure, explicit binding used also to verify a previous deployment receipt.
  * A historical hash never grants permission to run a model under a new build. */
@@ -42,6 +51,8 @@ export function intakeRuntimeConfigurationHash(p: z.infer<typeof savIntakeRuntim
     otherRulesHash: intakeRuntimeHash(env.SAV_OTHER_OBSERVATION_RULES_JSON ?? null),
     otherRoutingHash: intakeRuntimeHash(env.SAV_INTAKE_OTHER_RULES_JSON ?? null),
     ...(env.SAV_INTAKE_CRM_ACK_TEMPLATES_JSON ? {crmAcknowledgementsHash:intakeRuntimeHash(env.SAV_INTAKE_CRM_ACK_TEMPLATES_JSON)} : {}),
+    // Switching PDF reading on or off is a new launch configuration; off keeps the previous hash.
+    ...(savIntakePdfReading(env) ? { pdfReading: SAV_ATTACHMENT_PDF_REVISION } : {}),
     accessBinding: intakeRuntimeHash({ model: env.SAV_GEMINI_API_KEY, crm: env.HUBSPOT_ACCESS_TOKEN }) });
 }
 /** No permissive defaults, campaign resets or hidden reuse of another budget. */
@@ -65,7 +76,8 @@ export function savIntakeRuntimeConfig(env: Record<string, string | undefined> =
       || (env.SAV_ENCRYPTION_KEY_V1?.length ?? 0) < 32) throw Error();
     const warning = policy.resources.multiTicketWarning;
     if (warning && createHash("sha256").update(warning.text).digest("hex") !== warning.sha256) throw Error();
-    return { ...p, mode: "observe", policy, model: "gemini-3.6-flash", configHash: intakeRuntimeConfigurationHash(p, env), pipeline: savIntakePipeline(env) };
+    return { ...p, mode: "observe", policy, model: "gemini-3.6-flash", configHash: intakeRuntimeConfigurationHash(p, env), pipeline: savIntakePipeline(env),
+      ...(savIntakePdfReading(env) ? { pdfReading: true } : {}) };
   } catch { throw Error("SAV_INTAKE_RUNTIME_CONFIGURATION_REQUIRED"); }
 }
 export type IntakeRuntimeState = "pending" | "analysing" | "observed" | "waiting" | "uncertain" | "superseded";
@@ -78,6 +90,11 @@ export type IntakeRuntimePayload = {
   semantics?:import("./semantic-records").AcceptedIntakeSemantics;
   readRecovery?: import("./read-recovery").IntakeReadRecovery;
   reanalysisParent?: { runId: string; payloadHash: string; sourceHash: string; messageSourceHash: string };
+  /** Digest-only projection of the CRM evidence this analysis saw (SAV-45): names the
+   * fields of a later CRM_CHANGED. Outside the plan fingerprint and configHash. */
+  crmEvidence?: import("./crm-evidence-fingerprint").CrmEvidenceFingerprint;
+  /** SAV-45: the sub-limit behind SAV_INTAKE_RUNTIME_BUDGET_EXHAUSTED, when one stopped this run. */
+  budgetLimit?: import("./budget-limit").IntakeBudgetLimit;
   provenance?:unknown; traces?: unknown[]; reason?: string;
   /** Fixed when the run is created; analysis, repairs and resumes keep it. Absent: current. */
   pipeline?: SavIntakePipeline;

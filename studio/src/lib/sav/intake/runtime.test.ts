@@ -14,6 +14,7 @@ import { encryptSavPayload, decryptSavPayload } from "../crypto";
 import { intakeRuntimeHash, savIntakeRuntimeConfig, SAV_INTAKE_RUNTIME_REVISION, type IntakeRuntimeConfig, type IntakeRuntimePayload } from "./runtime-contract";
 import { assertSavIntakeCallPlan, assertSavIntakeLease, catchupSavIntake, claimSavIntakeRun, enqueueSavIntakeMessage, failSavIntakeRun, pendingSavIntakeRuns, readSavIntakeBudget, readSavIntakeCurrent, reconcileConfinedIntakeUsage, reserveSavIntakeCall, saveSavIntakeResult, settleSavIntakeCall } from "./runtime-store";
 import { analyseSavIntakeRuntime, enqueueConfiguredSavIntake, reconcileSavIntakeRuntime } from "./runtime";
+import { readIntakeRunDiagnostics } from "./run-diagnostics";
 import { SAV_INTAKE_CALL_POLICY } from "./attempt-policy";
 
 let f: Awaited<ReturnType<typeof createSavTestDb>>, mailboxId: string, threadId: string, messageId: string;
@@ -165,14 +166,14 @@ it("retains unknown usage, refuses refunds/replay and settles a late response wi
 it("per-version and lifetime per-message bounds survive config changes and run deletion", async () => {
   const l = await lease();
   for (let n = 0; n < SAV_INTAKE_CALL_POLICY.perVersion; n++) { const r = await reserveSavIntakeCall(l, config, String(n % 10).repeat(63) + "a"); await settleSavIntakeCall(r.id, usage, { json: { syntheticPrivate: true }, metadata: usage }); }
-  // The version bound stops this run.
-  await expect(reserveSavIntakeCall(l, config, "f".repeat(64))).rejects.toThrow("BUDGET_EXHAUSTED");
+  // The version bound stops this run; the error names it (SAV-45 C), same code as before.
+  await expect(reserveSavIntakeCall(l, config, "f".repeat(64))).rejects.toMatchObject({ message: "SAV_INTAKE_RUNTIME_BUDGET_EXHAUSTED", limit: "per_version" });
   await f.db.delete(savIntakeRuns).where(eq(savIntakeRuns.id, l.run.id));
   expect((await readSavIntakeBudget(config)).callCount).toBe(SAV_INTAKE_CALL_POLICY.perVersion); expect((await f.db.select().from(savIntakeModelCalls)).every(r => r.runId === null && r.resultCiphertext === null)).toBe(true);
   // A new version only gets what remains of the lifetime bound, never a reset.
   const id = await enqueueSavIntakeMessage(messageId, config), next = (await claimSavIntakeRun(id!, config))!;
   for (let n = 0; n < SAV_INTAKE_CALL_POLICY.perMessage - SAV_INTAKE_CALL_POLICY.perVersion; n++) { const r = await reserveSavIntakeCall(next, config, String(n).repeat(63) + "e"); await settleSavIntakeCall(r.id, usage, { json: { syntheticPrivate: true }, metadata: usage }); }
-  await expect(reserveSavIntakeCall(next, config, "e".repeat(64))).rejects.toThrow("BUDGET_EXHAUSTED");
+  await expect(reserveSavIntakeCall(next, config, "e".repeat(64))).rejects.toMatchObject({ message: "SAV_INTAKE_RUNTIME_BUDGET_EXHAUSTED", limit: "per_message" });
 });
 it("monetary exhaustion is explicit technical waiting and never uses other ledgers", async () => {
   const constrained = { ...config, maxNanoUsd: 1 }, id = await enqueueSavIntakeMessage(messageId, constrained);
@@ -180,6 +181,10 @@ it("monetary exhaustion is explicit technical waiting and never uses other ledge
   const response = await analyseSavIntakeRuntime(id!, constrained, { env: () => environment, network });
   expect(response.state).toBe("waiting"); expect(network).not.toHaveBeenCalled();
   expect((await readSavIntakeCurrent(threadId, constrained))?.payload.reason).toBe("SAV_INTAKE_RUNTIME_BUDGET_EXHAUSTED"); expect(await f.db.select().from(auditLogs)).toHaveLength(0);
+  // SAV-45 C: the run records which sub-limit stopped it, and the limit is not raised.
+  expect((await readSavIntakeCurrent(threadId, constrained))?.payload.budgetLimit).toBe(constrained.budgetProfile ? "daily_nano_usd" : "campaign_nano_usd");
+  expect((await readIntakeRunDiagnostics(threadId))?.runs[0].diagnostic).toMatchObject({ reason: "SAV_INTAKE_RUNTIME_BUDGET_EXHAUSTED", budgetLimit: constrained.budgetProfile ? "daily_nano_usd" : "campaign_nano_usd" });
+  expect((await readSavIntakeBudget(constrained)).maxNanoUsd).toBe(1);
 });
 it("persists catalogue failures as a technical reason before any model reservation or network", async () => {
   const m = await message({ receivedAt: new Date(Date.now() + 1), body: "private".repeat(300) });
@@ -280,6 +285,10 @@ it.each(["create", "link", "reopen", "incomplete_evidence"])("persists the %s ou
   } else {
     expect({result, payload:current?.payload}).toMatchObject({ result: { state: "observed" }});
     expect(current?.payload.plan?.decision.disposition).toMatchObject({ kind: "ticket", target: { operation } });
+    // SAV-45: the observed plan carries a digest-only fingerprint of its CRM evidence, no text or address.
+    const fingerprint = current?.payload.crmEvidence;
+    expect(Object.keys(fingerprint?.entries ?? {})).toEqual(expect.arrayContaining(["email-lookup", "contact-101", ...(operation === "create" ? [] : ["ticket-201", "history-201"])]));
+    expect(JSON.stringify(fingerprint)).not.toMatch(/@|Connexion fictive|Panne de connexion/);
   }
   expect(current?.payload.plan?.effects).toBe("not_connected"); expect(current?.payload.plan?.steps.every(step => step.status === "not_dispatched")).toBe(true);
   expect((await readSavIntakeBudget(config)).callCount).toBe(operation === "create" ? 1 : 2);
@@ -594,6 +603,42 @@ it("SAV-42: a mixed image + PDF message sends only the image to the visual read 
   const sent=JSON.parse(JSON.parse(bodies[0]).contents[0].parts[0].text);
   expect(sent.imageSources).toHaveLength(1);expect(sent.unreadAttachments).toHaveLength(1);
   expect(await f.db.select().from(savActions)).toHaveLength(0);
+});
+
+it("SAV-43: PDF reading is off by default, inside configHash when on, refused when misspelt",()=>{
+  const base=savIntakeRuntimeConfig(environment)!,off=savIntakeRuntimeConfig({...environment,SAV_INTAKE_PDF_READING:"off"})!,on=savIntakeRuntimeConfig({...environment,SAV_INTAKE_PDF_READING:"on"})!;
+  expect(base.pdfReading).toBeUndefined();expect(off.configHash).toBe(base.configHash);
+  expect(on.pdfReading).toBe(true);expect(on.configHash).not.toBe(base.configHash);
+  expect(()=>savIntakeRuntimeConfig({...environment,SAV_INTAKE_PDF_READING:"true"})).toThrow("SAV_INTAKE_RUNTIME_CONFIGURATION_REQUIRED");
+});
+it.each(["text","scanned","encrypted","with_image"])("SAV-43: with PDF reading on, a %s PDF goes through the single visual call or stays explicitly unread",async kind=>{
+  const {syntheticImage,syntheticPdf,pdfMetadata,attachmentMetadata}=await import("../../../../test/sav-attachments"),{SAV_ATTACHMENT_PDF_REVISION}=await import("../attachment-contract");
+  const image=await syntheticImage(),pdf=kind==="encrypted"?syntheticPdf({encrypted:true}):kind==="scanned"?syntheticPdf({scanned:await syntheticImage("jpeg")}):syntheticPdf({pages:2});
+  const [m]=await f.db.select().from(savMessages).where(eq(savMessages.id,messageId)),[t]=await f.db.select().from(savThreads).where(eq(savThreads.id,threadId));
+  const ref=(partId:string,meta:ReturnType<typeof attachmentMetadata>)=>({...meta,reference:{...meta.reference!,mailboxEmail:"support@example.invalid",gmailMessageId:m.gmailMessageId!,gmailThreadId:t.gmailThreadId,partId}});
+  const attachments=[ref("1",pdfMetadata(pdf.length)),...(kind==="with_image"?[ref("2",attachmentMetadata(image.length))]:[])];
+  await f.db.update(savMessages).set({bodyCiphertext:encryptSavPayload({text:"My application fails with an error.",headers:{},attachments,attachmentInventory:{complete:true,limits:[]}})}).where(eq(savMessages.id,messageId));
+  const env={...environment,SAV_INTAKE_PDF_READING:"on"},cfg=savIntakeRuntimeConfig(env)!;
+  const id=(await enqueueSavIntakeMessage(messageId,cfg))!;
+  const bodies:string[]=[],network=vi.fn(async(_url:unknown,init?:RequestInit)=>{bodies.push(String(init?.body));throw Error("NETWORK_FORBIDDEN");});
+  const download=vi.fn(async(_r:unknown,_s:number,_a:AbortSignal,mime?:string)=>mime==="application/pdf"?pdf:image);
+  await analyseSavIntakeRuntime(id,cfg,{env:()=>env,network,downloadAttachments:download});
+  const current=(await readSavIntakeCurrent(threadId,cfg))!;
+  const message=(current.payload.input as {message?:{attachmentInputs?:unknown[];unreadAttachments?:{reason:string}[]}}|undefined)?.message;
+  expect(download).toHaveBeenCalledTimes(attachments.length);expect(network).toHaveBeenCalled();
+  expect(current.payload.attachments?.read.readerRevision).toContain(SAV_ATTACHMENT_PDF_REVISION);
+  const request=JSON.parse(bodies[0]),parts=request.contents[0].parts as {text?:string;inlineData?:{mimeType:string};mediaResolution?:{level:string}}[];
+  const sent=JSON.parse(parts[0].text!);
+  if(kind==="encrypted"){
+    expect(message?.attachmentInputs).toBeUndefined();expect(message?.unreadAttachments?.map(u=>u.reason)).toEqual(["pdf_encrypted"]);
+    expect(parts.some(p=>p.inlineData)).toBe(false);expect(sent.unreadAttachments).toHaveLength(1);
+  } else {
+    expect(message?.attachmentInputs).toHaveLength(attachments.length);expect(message?.unreadAttachments).toBeUndefined();
+    expect(parts.filter(p=>p.inlineData).map(p=>[p.inlineData!.mimeType,p.mediaResolution!.level])).toEqual([["application/pdf","MEDIA_RESOLUTION_MEDIUM"],...(kind==="with_image"?[["image/png","MEDIA_RESOLUTION_HIGH"]]:[])]);
+    expect(sent.pdfInstructions).toContain("PDF");expect((sent.imageInputs??[])[0]).toEqual({index:0,kind:"pdf",pages:kind==="scanned"?1:2});
+  }
+  // One model call at most for this attempt, as for images; no action is ever produced.
+  expect(bodies).toHaveLength(1);expect(await f.db.select().from(savActions)).toHaveLength(0);
 });
 
 it.each(["valid_json", "invalid_json"])("reconciles only proven omitted zero thoughts through %s", async output => {

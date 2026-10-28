@@ -5,9 +5,11 @@ const status: Record<SavAttachmentObservation["status"], string> = { analyzed: "
 const reason: Record<SavAttachmentObservation["reason"], string> = {
   observed: "Observations visuelles acquises.", partial_content: "Une partie seulement est lisible.", unreadable_content: "Aucun texte fiable n’a pu être retenu.",
   unsupported_type: "La lecture accepte les captures PNG, JPEG et WebP.", legacy_reference_missing: "Ce message ancien ne possède pas de référence de fichier récupérable.",
-  image_limit: "La limite de trois images par analyse est atteinte.", byte_limit: "La taille annoncée, reçue ou totale dépasse les limites admises, ou ne correspond pas au fichier.",
+  image_limit: "La limite de trois fichiers lus (images ou PDF) par analyse est atteinte.", byte_limit: "La taille annoncée, reçue ou totale dépasse les limites admises, ou ne correspond pas au fichier.",
   pixel_limit: "Les dimensions dépassent la limite de 16 mégapixels ou le fichier contient plusieurs images.", invalid_image: "Le fichier est vide, corrompu ou ne peut pas être décodé.",
-  type_mismatch: "Le type réel de l’image ne correspond pas au type déclaré.", association_mismatch: "Le fichier ne correspond pas à la boîte, au message ou à la partie attendus.",
+  type_mismatch: "Le type réel du fichier ne correspond pas au type déclaré.",
+  invalid_pdf: "Le PDF est vide, corrompu ou sa structure ne permet pas de compter ses pages.", pdf_encrypted: "Le PDF est chiffré ou protégé ; il n’est pas envoyé au modèle.",
+  page_limit: "Le PDF dépasse la limite de cinq pages par document.", association_mismatch: "Le fichier ne correspond pas à la boîte, au message ou à la partie attendus.",
   permission_denied: "Gmail refuse l’accès à cette pièce.", not_found: "Le fichier n’est plus accessible dans Gmail.", rate_limited: "Gmail limite temporairement les lectures.",
   timeout: "La lecture a dépassé le temps disponible.", download_failed: "Le téléchargement n’a pas abouti.", provider_failed: "L’analyse visuelle n’a pas produit d’observation exploitable.",
   validation_failed: "La réponse structurée a été rejetée ; aucune panne de vision n’est déduite de ce seul rejet.",

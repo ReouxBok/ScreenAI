@@ -6,6 +6,7 @@ import { readSavExternalCompletion, listSavExternalCompletionMessageIds } from "
 import "server-only";
 import { reconcileIntakeZeroThoughtUsage } from "./model-usage";
 import { SAV_INTAKE_OPERATIONAL_PROFILE, intakeBudgetUsage } from "./budget-profile";
+import { IntakeBudgetExhaustedError, intakeExhaustedLimit } from "./budget-limit";
 import { effectiveIntakeBudgetPins } from "./budget-override";
 import { assertSavAgentAnalysisAllowed, readSavAgentPause, SAV_AGENT_ANALYSIS_PAUSE_CODES } from "./agent-pause";
 import { intakeLaunchMatches } from "./launch-boundary";
@@ -397,8 +398,8 @@ export async function assertSavIntakeCallPlan(messageId: string, config: IntakeR
     const [current] = await tx.select({ id: savIntakeRuns.id }).from(savIntakeRuns).where(and(eq(savIntakeRuns.messageId, messageId), eq(savIntakeRuns.isCurrent, true))).limit(1);
     const version = current ? rows.filter(row => row.runId === current.id).length : 0;
     const usage = intakeBudgetUsage(rows, await effectiveIntakeBudgetPins(tx, config), now), quote = savDerivedCostQuote(config.model, 8192, now);
-    if (own.length + needed > SAV_INTAKE_CALL_POLICY.perMessage || version + needed > SAV_INTAKE_CALL_POLICY.perVersion || needed > usage.remainingCalls || needed * quote.reservedNanoUsd > usage.remainingNanoUsd
-      || needed * quote.reservedNanoUsd > usage.remainingRollingNanoUsd) throw Error("SAV_INTAKE_RUNTIME_BUDGET_EXHAUSTED");
+    const limit = intakeExhaustedLimit({ own: own.length, version, needed, perMessage: SAV_INTAKE_CALL_POLICY.perMessage, perVersion: SAV_INTAKE_CALL_POLICY.perVersion, priceNanoUsd: quote.reservedNanoUsd, usage });
+    if (limit) throw new IntakeBudgetExhaustedError(limit);
   });
 }
 async function reserveIntakeCall(tx: Tx, run: Run, config: IntakeRuntimeConfig, requestHash: string, now: Date) {
@@ -415,9 +416,9 @@ async function reserveIntakeCall(tx: Tx, run: Run, config: IntakeRuntimeConfig, 
     if(!Number.isFinite(now.getTime())||now>budgetNow)throw Error("SAV_INTAKE_RUNTIME_LEDGER_CLOCK_REJECTED");
     const price = savDerivedCostQuote(config.model, 8192, budgetNow);
     const usage = intakeBudgetUsage(rows,await effectiveIntakeBudgetPins(tx,config),budgetNow);
-    if (usage.remainingCalls < 1 || rows.filter(row => row.messageKey === messageKey).length >= SAV_INTAKE_CALL_POLICY.perMessage
-      || rows.filter(row => row.runId === run.id).length >= SAV_INTAKE_CALL_POLICY.perVersion
-      || price.reservedNanoUsd > usage.remainingNanoUsd || price.reservedNanoUsd > usage.remainingRollingNanoUsd) throw Error("SAV_INTAKE_RUNTIME_BUDGET_EXHAUSTED");
+    const limit = intakeExhaustedLimit({ own: rows.filter(row => row.messageKey === messageKey).length, version: rows.filter(row => row.runId === run.id).length, needed: 1,
+      perMessage: SAV_INTAKE_CALL_POLICY.perMessage, perVersion: SAV_INTAKE_CALL_POLICY.perVersion, priceNanoUsd: price.reservedNanoUsd, usage });
+    if (limit) throw new IntakeBudgetExhaustedError(limit);
     const [row] = await tx.insert(savIntakeModelCalls).values({ runId: run.id, messageKey, requestHash, state: "dispatched", reservedNanoUsd: price.reservedNanoUsd,
       chargedNanoUsd: price.reservedNanoUsd, createdAt:budgetNow, payloadCiphertext: encryptSavPayload({ model: config.model, configHash: config.configHash }) }).returning();
     return { id: row.id, cached: null };

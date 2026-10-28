@@ -8,6 +8,7 @@ import { evaluationProviderResponse } from "./server-runner";
 import { intakeRuntimeHash, type IntakeRuntimeConfig } from "./runtime-contract";
 import { settleSavIntakeCall, type reserveSavIntakeCall } from "./runtime-store";
 import { SAV_INTAKE_MODEL_LIMITS } from "./model-limits";
+import { IntakeBudgetExhaustedError, type IntakeBudgetLimit } from "./budget-limit";
 
 /** Counts reflect sends and received HTTP headers, including a lost/late body;
  * no provider body, credential, source text or model output is retained. */
@@ -35,7 +36,7 @@ export function createIntakeModelDispatcher(options: { config: IntakeRuntimeConf
   /** Comparison only: operational callers leave both options absent. */
   generationBudget?: "single_pass"; captureDiagnostics?: boolean }) {
   const {config,live}=options, env=options.env??(()=>process.env), network=options.network??fetch, settle=options.settle??settleSavIntakeCall;
-  let uncertain=false, failureReason:string|undefined;
+  let uncertain=false, failureReason:string|undefined, budgetLimit:IntakeBudgetLimit|undefined;
   const diagnostics: IntakeDispatchDiagnostic[] = [];
   const pending:Promise<unknown>[]=[];
   const execute: IntakeGeminiCall = async input => {
@@ -116,6 +117,7 @@ export function createIntakeModelDispatcher(options: { config: IntakeRuntimeConf
       }
     };
     const call: IntakeGeminiCall = input => { const work = execute(input).catch(error => {
+      if (error instanceof IntakeBudgetExhaustedError) budgetLimit = error.limit;
       failureReason = error instanceof z.ZodError ? "SAV_INTAKE_MODEL_OUTPUT_REJECTED"
         : error instanceof Error && /^SAV_[A-Z0-9_]+$/.test(error.message) ? error.message : "SAV_INTAKE_RUNTIME_PROVIDER_UNAVAILABLE";
       throw error;
@@ -135,9 +137,10 @@ export function createIntakeModelDispatcher(options: { config: IntakeRuntimeConf
       await options.preflight(hashes);
       await live();
     } catch (error) {
+      if (error instanceof IntakeBudgetExhaustedError) budgetLimit = error.limit;
       failureReason = error instanceof Error && /^SAV_[A-Z0-9_]+$/.test(error.message) ? error.message : "SAV_INTAKE_RUNTIME_BATCH_PLANNING_FAILED";
       throw error;
     }
   };
-  return { call, plan, pending, diagnostics, get uncertain() { return uncertain; }, get failureReason() { return failureReason; } };
+  return { call, plan, pending, diagnostics, get uncertain() { return uncertain; }, get failureReason() { return failureReason; }, get budgetLimit() { return budgetLimit; } };
 }

@@ -230,6 +230,16 @@ it("preserves the pre-extraction runtime hash, including canonical pin order",()
     expect(options.runtime.configHash).toBe(expected);
     expect(intakeRuntimeConfigurationHash(Object.fromEntries(Object.entries(pins).reverse()) as typeof pins,environment)).toBe(expected);
 });
+it("SAV-43: switching PDF reading on between deployments refuses continuity explicitly, never by a schema crash", async () => {
+    const { row } = await observedWith("same");
+    await executeIntakePass(row.id, options, { beforeMarker: async e => { if (e.kind === "email_create") throw Error("SYNTHETIC_DEPLOY_CUT"); } });
+    environment = { ...environment, SAV_INTAKE_PDF_READING: "on" };
+    const next = await newAuthorityOptions();
+    expect(next.runtime.pdfReading).toBe(true);
+    // The observation was made with PDFs unread: a different launch configuration, refused as such.
+    await expect(previewIntakeExecutionContinuity(options.config.policyId, next)).rejects.toThrow("SAV_INTAKE_EXECUTION_CONTINUITY_REFUSED");
+    expect(posts("/tickets")).toBe(1); expect(posts("/emails")).toBe(0);
+});
 async function newAuthorityOptions() {
     const cfg = JSON.parse(environment.SAV_INTAKE_RUNTIME_CONFIG!), rev = "b".repeat(40);
     environment = { ...environment, SAV_CODE_REVISION: rev, SAV_INTAKE_RUNTIME_CONFIG: JSON.stringify({ ...cfg, codeRevision: rev }) };
@@ -329,7 +339,10 @@ it.each(["source_revoked","target_revoked","actor_disabled","receipt_changed","s
     expect(posts("/tickets")).toBe(1);expect(posts("/emails")).toBe(0);
 });
 
-it.each(["unknown_incoming","human_outgoing","malformed"])("does not reopen after %s correspondence",async kind=>{
+// Choice rule (Ugo, 27/10, "finir quand même"): once Studio has acted on the ticket, an email
+// logged afterwards no longer stops the reopening. Accepted consequence: an operator reply
+// logged after the Studio note does not prevent set-New; the change is traced.
+it.each(["unknown_incoming","human_outgoing","malformed"])("reopens once Studio has acted, even after %s correspondence (traced)",async kind=>{
     p.seedTicket({stage:"closed",closedAt:new Date(Date.now()-1000).toISOString()});
     const {row}=await observedWith("same"),verify=options.adapters.verify;
     options.adapters.verify=async(...args)=>{const proof=await verify(...args);if(args[0].kind==="note_associate"&&proof.confirmed){nativeEmail("201","8801");
@@ -337,8 +350,9 @@ it.each(["unknown_incoming","human_outgoing","malformed"])("does not reopen afte
         if(kind==="human_outgoing"){p.objects.emails["8801"].properties.hs_email_direction="EMAIL";p.objects.emails["8801"].properties.hs_email_text="Resolved by the operator; do not reopen.";}
         if(kind==="malformed")delete p.objects.emails["8801"].properties.hs_email_from_email;
     }return proof;};
-    expect(await executeIntakePass(row.id,options)).toMatchObject({state:"waiting"});
-    expect(p.calls.filter(c=>c.method==="PATCH")).toHaveLength(0);
+    expect(await executeIntakePass(row.id,options)).toMatchObject({state:"confirmed"});
+    expect(p.calls.filter(c=>c.method==="PATCH")).toHaveLength(1);
+    expect((await f.db.select().from(savIntakeEffectJournal).where(eq(savIntakeEffectJournal.executionId,row.id))).some(j=>j.kind==="crm_change_ignored")).toBe(true);
 });
 it.each(["create", "reopen"] as const)("AUDIT-5 CRM read volume of one nominal %s execution", async op => {
     if (op === "reopen") p.seedTicket({ stage: "closed", closedAt: new Date(Date.now() - 1000).toISOString() });

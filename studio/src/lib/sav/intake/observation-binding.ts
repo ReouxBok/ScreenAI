@@ -5,7 +5,7 @@ import { savIntakeExecutions, savIntakeRuns, savIntakeObservationBindings, savRe
   savMessages, savThreads, savAgentRuns, savObservationCycles, savSyncState } from "@/db/schema";
 import { decryptSavPayload, encryptSavPayload, savContentHash } from "../crypto";
 import { intakeConsoleInstalled } from "./console-capability";
-import { activeExecutionEffects, admissionLock, executionMessageHash } from "./execution-store";
+import { activeExecutionEffects, admissionLock, executionMessageHash, type ExecutionTx } from "./execution-store";
 import { requiredExecutionKinds } from "./executor";
 import { intakeRuntimeHash, type IntakeRuntimePayload } from "./runtime-contract";
 import { savIntakeSourceSnapshot, intakeSourceMatches } from "./runtime-store";
@@ -39,6 +39,33 @@ export async function intakeDossierSensitive(threadId: string, ticketId: string 
     return proposal.category === "billing" || /cancellation|refund|legal|security/.test(proposal.decision.reasonCode);
   });
 }
+/** Why a confirmed execution does not (yet) get its follow-up, as a code. The scan
+ * below binds only when this returns no blocker; the diagnostic reads the same answer
+ * without writing. The conditions are unchanged, they are only named (SAV-45). */
+export type IntakeObservationBlocker = "execution_missing" | "execution_not_confirmed" | "ticket_missing" | "thread_ticket_mismatch" | "run_not_current" | "newer_inbound"
+  | "run_version_changed" | "plan_fingerprint_changed" | "not_ticket_disposition" | "effects_incomplete" | "completion_missing" | "completion_source_changed";
+export async function intakeObservationBlocker(tx: ExecutionTx, executionId: string, lock = false) {
+    const executionQuery = tx.select().from(savIntakeExecutions).where(eq(savIntakeExecutions.id, executionId));
+    const [execution] = await (lock ? executionQuery.for("update") : executionQuery);
+    if (!execution) return { blocker: "execution_missing" as const };
+    const threadQuery = tx.select().from(savThreads).where(eq(savThreads.id, execution.threadId));
+    const [thread] = await (lock ? threadQuery.for("update") : threadQuery);
+    const [run] = execution.runId ? await tx.select().from(savIntakeRuns).where(eq(savIntakeRuns.id, execution.runId)) : [];
+    const [latest] = await tx.select().from(savMessages).where(and(eq(savMessages.threadId, execution.threadId), eq(savMessages.direction, "inbound")))
+      .orderBy(desc(savEffectiveReceivedAt), desc(savMessages.createdAt), desc(savMessages.id)).limit(1);
+    const payload = decryptSavPayload<ExecutionPayload>(execution.payloadCiphertext), plan = payload.plan;
+    const effects = await activeExecutionEffects(execution.id, tx), required = requiredExecutionKinds(payload);
+    const blocker: IntakeObservationBlocker | null = execution.state !== "confirmed" ? "execution_not_confirmed" : !execution.ticketId ? "ticket_missing"
+      : thread?.hubspotTicketId !== execution.ticketId ? "thread_ticket_mismatch" : !run?.isCurrent ? "run_not_current" : latest?.id !== execution.messageId ? "newer_inbound"
+      : run.id !== payload.lastRunId || run.version !== execution.runVersion ? "run_version_changed"
+      : payload.acceptedFingerprint !== decryptSavPayload<IntakeRuntimePayload>(run.payloadCiphertext).plan?.fingerprint ? "plan_fingerprint_changed"
+      : plan.decision.disposition.kind !== "ticket" ? "not_ticket_disposition"
+      : !required.length || required.some(kind => !effects.some(e => e.kind === kind && e.state === "confirmed")) || effects.some(e => e.state !== "confirmed") ? "effects_incomplete"
+      : !payload.completion || payload.completion.messageHash !== executionMessageHash(latest) ? "completion_missing"
+      : !intakeSourceMatches(await savIntakeSourceSnapshot(tx, latest, new Date()), payload.completion.sourceHash) ? "completion_source_changed" : null;
+    // With no blocker, every fact the binding needs is proven present.
+    return { blocker, facts: blocker ? undefined : { execution: { ...execution, ticketId: execution.ticketId! }, run: run!, payload: { ...payload, completion: payload.completion! }, plan, effects } };
+}
 export async function ensureIntakeObservations(limit = 4) {
   if (!await intakeConsoleInstalled()) return { skipped: "migration_absent" };
   const db = requireDb(), key = "sav-intake-tracking-scan-v1";
@@ -55,20 +82,9 @@ export async function ensureIntakeObservations(limit = 4) {
   for (const candidate of rows) {
    await requireDb().transaction(async tx => {
     await admissionLock(tx);
-    const [execution] = await tx.select().from(savIntakeExecutions).where(eq(savIntakeExecutions.id, candidate.id)).for("update");
-    const [thread] = await tx.select().from(savThreads).where(eq(savThreads.id, execution.threadId)).for("update");
-    const [run] = execution.runId ? await tx.select().from(savIntakeRuns).where(eq(savIntakeRuns.id, execution.runId)) : [];
-    const [latest] = await tx.select().from(savMessages).where(and(eq(savMessages.threadId, execution.threadId), eq(savMessages.direction, "inbound")))
-      .orderBy(desc(savEffectiveReceivedAt), desc(savMessages.createdAt), desc(savMessages.id)).limit(1);
-    const payload = decryptSavPayload<ExecutionPayload>(execution.payloadCiphertext), plan = payload.plan;
-    const effects = await activeExecutionEffects(execution.id, tx), required = requiredExecutionKinds(payload);
-    if (execution.state !== "confirmed" || !execution.ticketId || thread?.hubspotTicketId !== execution.ticketId || !run?.isCurrent
-      || latest?.id !== execution.messageId || run.id !== payload.lastRunId || run.version !== execution.runVersion
-      || payload.acceptedFingerprint !== decryptSavPayload<IntakeRuntimePayload>(run.payloadCiphertext).plan?.fingerprint
-      || plan.decision.disposition.kind !== "ticket" || !required.length || required.some(kind => !effects.some(e => e.kind === kind && e.state === "confirmed"))
-      || effects.some(e => e.state !== "confirmed")) return;
-    if (!payload.completion || payload.completion.messageHash !== executionMessageHash(latest)
-      || !intakeSourceMatches(await savIntakeSourceSnapshot(tx, latest, new Date()), payload.completion.sourceHash)) return;
+    const checked = await intakeObservationBlocker(tx, candidate.id, true);
+    if (checked.blocker) return;
+    const { execution, run, payload, plan, effects } = checked.facts!;
     const [existing] = await tx.select().from(savIntakeObservationBindings).where(eq(savIntakeObservationBindings.executionId, execution.id));
     if (existing) return;
     const baseline: IntakeObservationBaseline = { revision: "sav-intake-observation.v1", origin: "intake", executionId: execution.id,
