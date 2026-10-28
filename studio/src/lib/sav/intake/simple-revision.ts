@@ -1,2 +1,2 @@
 /** Prompt and validator revision of the single-call reader (kept apart to avoid import cycles). */
-export const SAV_INTAKE_SIMPLE_REVISION = "sav-intake-simple-2026-10-26.v1";
+export const SAV_INTAKE_SIMPLE_REVISION = "sav-intake-simple-2026-10-28.v2";

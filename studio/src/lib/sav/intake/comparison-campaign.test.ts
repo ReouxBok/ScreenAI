@@ -365,7 +365,24 @@ it("SAV46 a timeout preserves the counted reservation and reports one send even 
  };
  await runSavIntakeComparisonBatch({env:()=>e,network,limit:1});
  const report=await readSavIntakeComparisonReport(()=>e);if(!report.configured)throw Error("TEST_CONFIG");
- expect(report.rows[0].detail).toMatchObject({simple:{uncertain:true,calls:0,diagnostics:{dispatches:1,httpResponses:0,requests:[{dispatched:true,httpStatus:null,transport:{attempts:1}}]}}});
+ expect(report.rows[0].detail).toMatchObject({simple:{uncertain:true,calls:1,diagnostics:{dispatches:1,httpResponses:0,requests:[{dispatched:true,httpStatus:null,transport:{attempts:1}}]}}});
  expect(report.spend.nanoUsd).toBeGreaterThanOrEqual(817152000);
  expect(await runSavIntakeComparisonBatch({env:()=>e,network,limit:1})).toMatchObject({compared:[]});
+});
+it("reports a truncated simple response as one dispatched call with settled safe metadata", async () => {
+ const m=await stored(),e=env(mailboxId,[m.id]),p=provider();
+ const network:typeof fetch=async(url,init)=>{
+  if(String(url).startsWith("https://generativelanguage.googleapis.com/")){
+   const data=JSON.parse(JSON.parse(String(init?.body)).contents[0].parts[0].text);
+   if(typeof data.current==="string")return Response.json({candidates:[{finishReason:"MAX_TOKENS",content:{parts:[{text:'{"syntheticPartial":'}]}}],
+    usageMetadata:{promptTokenCount:170106,candidatesTokenCount:8177,thoughtsTokenCount:0,totalTokenCount:178283}});
+  }return p.network(url,init);
+ };
+ await runSavIntakeComparisonBatch({env:()=>e,network,limit:1});
+ const report=await readSavIntakeComparisonReport(()=>e);if(!report.configured)throw Error("TEST_CONFIG");
+ expect(report.rows[0].detail).toMatchObject({simple:{technical:"SAV_AI_OUTPUT_TRUNCATED",uncertain:false,calls:1,
+  diagnostics:{dispatches:1,httpResponses:1,requests:[{dispatched:true,httpStatus:200,finishReason:"MAX_TOKENS",inputTokens:170106,outputTokens:8177,thoughtTokens:0,totalTokens:178283}]}}});
+ expect(JSON.stringify(report.rows[0].detail)).not.toContain("syntheticPartial");
+ expect(await f.db.select().from(savIntakeModelCalls)).toEqual([]);
+ expect(await f.db.select().from(savActions)).toEqual([]);
 });

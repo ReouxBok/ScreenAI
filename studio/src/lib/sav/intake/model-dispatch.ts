@@ -2,7 +2,7 @@ import "server-only";
 import { z } from "zod";
 import { reconcileIntakeZeroThoughtUsage, unbilledProviderStatus } from "./model-usage";
 import type { IntakeGeminiCall } from "./model-readers";
-import { readSavGeminiResponse, type SavGeminiMetadata } from "../gemini-response";
+import { readSavGeminiResponse, savGeminiDiagnosticMetadata, type SavGeminiDiagnosticMetadata, type SavGeminiMetadata } from "../gemini-response";
 import { requestSavGeminiJson, savAiCancellationCode, savAiErrorMetadata, savGeminiWireBody } from "../gemini-transport";
 import { evaluationProviderResponse } from "./server-runner";
 import { intakeRuntimeHash, type IntakeRuntimeConfig } from "./runtime-contract";
@@ -13,11 +13,16 @@ import { IntakeBudgetExhaustedError, type IntakeBudgetLimit } from "./budget-lim
 
 /** Counts reflect sends and received HTTP headers, including a lost/late body;
  * no provider body, credential, source text or model output is retained. */
-export type IntakeDispatchDiagnostic = {
+export type IntakeDispatchDiagnostic = SavGeminiDiagnosticMetadata & {
   phase: string; promptRevision: string; requestHash: string; textBytes: number; wireBytes: number;
   generationBudget: "standard" | "single_pass"; dispatched: boolean; httpStatus: number | null; cached: boolean;
   transport?: { phase: string; durationMs: number; attempts: number; retries: number; errorCode: string | null; failureCategory: string | null };
 };
+/** Actual network sends, independent of usable model output or trace metadata. */
+export function intakeDispatchCounts(requests: readonly IntakeDispatchDiagnostic[]) {
+  return { dispatches: requests.filter(request => request.dispatched).length,
+    httpResponses: requests.filter(request => request.httpStatus !== null).length };
+}
 function dispatchTransportDiagnostic(metadata?: SavGeminiMetadata): IntakeDispatchDiagnostic["transport"] {
   const t = metadata?.transport;
   return t ? { phase: t.phase, durationMs: t.durationMs, attempts: t.attempts, retries: t.retries,
@@ -96,7 +101,7 @@ export function createIntakeModelDispatcher(options: { config: IntakeRuntimeConf
         active();
         const generated = await requestSavGeminiJson({ ...input, signal, apiKey: key, fetch: guardedNetwork, allowRetry: false,
           ...(options.generationBudget ? { generationBudget: options.generationBudget } : {}) });
-        if (diagnostic) diagnostic.transport = dispatchTransportDiagnostic(generated.metadata);
+        if (diagnostic) Object.assign(diagnostic, savGeminiDiagnosticMetadata(generated.metadata), { transport: dispatchTransportDiagnostic(generated.metadata) });
         const metadata = exactUsage(generated.metadata);
         if (input.media && !input.sanitizeResponse) throw Error("SAV_INTAKE_VISUAL_VALIDATOR_REQUIRED");
         const json = input.media ? input.sanitizeResponse!(generated.json) : generated.json;
@@ -106,7 +111,8 @@ export function createIntakeModelDispatcher(options: { config: IntakeRuntimeConf
         failureReason = undefined;
         return result;
       } catch (error) {
-        if (diagnostic) diagnostic.transport = dispatchTransportDiagnostic(savAiErrorMetadata(error));
+        if (diagnostic) Object.assign(diagnostic, savGeminiDiagnosticMetadata({ ...savAiErrorMetadata(error), ...providerUsage }),
+          { transport: dispatchTransportDiagnostic(savAiErrorMetadata(error)) });
         // A complete answer with a status the provider documents as not charged (400, 429, 5xx):
         // settled at zero, explicitly marked. A timeout, a lost answer or another status stays uncertain.
         const unbilled = unbilledProviderStatus(providerStatus)
