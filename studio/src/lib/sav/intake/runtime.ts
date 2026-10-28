@@ -87,7 +87,7 @@ async function analyseSavIntakeRuntimeWithinBudget(runId: string, config: Intake
     if(qualifiedOther) payload.other=qualifiedOther;
     await writeCheckpoint();
     const retryOrdinal = await intakeTransientRetries(lease.run.messageId);
-    dispatcher = createIntakeModelDispatcher({ config, live, retryOrdinal, reserve: hash => reserveSavIntakeCall(lease, config, hash), preflight: hashes => assertSavIntakeCallPlan(lease.run.messageId, config, hashes), signal: controller.signal, env, network });
+    dispatcher = createIntakeModelDispatcher({ config, live, retryOrdinal, reserve: (hash, size) => reserveSavIntakeCall(lease, config, hash, new Date(), size), preflight: (hashes, sizes) => assertSavIntakeCallPlan(lease.run.messageId, config, hashes, sizes), signal: controller.signal, env, network });
     const { call, pending } = dispatcher;
     const attachments = lease.recoveringRead ? null : await prepareIntakeAttachments(lease, config.model, live, deps.downloadAttachments, { pdf: config.pdfReading === true });
     if (attachments) {

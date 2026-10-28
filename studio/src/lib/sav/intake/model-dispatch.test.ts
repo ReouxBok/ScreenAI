@@ -40,7 +40,8 @@ it.each([-1, 0, 1])("enforces the full 128 KiB wire boundary %+d before reservat
     signal: new AbortController().signal, env: () => ({ SAV_GEMINI_API_KEY: "synthetic-key" }) });
   if (delta <= 0) {
     await expect(dispatcher.call(input)).resolves.toMatchObject({ json: { fixture: true } });
-    expect(reserve).toHaveBeenCalledExactlyOnceWith(expect.stringMatching(/^[a-f0-9]{64}$/));
+    // The reservation is sized from the exact body that is sent.
+    expect(reserve).toHaveBeenCalledExactlyOnceWith(expect.stringMatching(/^[a-f0-9]{64}$/), { textBytes: SAV_INTAKE_MODEL_LIMITS.wireTextBytes + delta, mediaTokens: 0, maxOutputTokens: 8192 });
     expect(network).toHaveBeenCalledTimes(1); expect(settleSavIntakeCall).toHaveBeenCalledTimes(1);
   } else {
     await expect(dispatcher.call(input)).rejects.toThrow("SAV_INTAKE_RUNTIME_REQUEST_REJECTED");
@@ -81,7 +82,7 @@ it("preflights the exact complete request bodies without reserving or sending th
   const dispatcher = createIntakeModelDispatcher({ config, live: async () => {}, preflight, reserve, network,
     signal: new AbortController().signal, env: () => ({ SAV_GEMINI_API_KEY: "synthetic-key" }) });
   await dispatcher.plan([input]);
-  expect(preflight).toHaveBeenCalledExactlyOnceWith([intakeRuntimeHash(savGeminiWireBody(input).body)]);
+  expect(preflight).toHaveBeenCalledExactlyOnceWith([intakeRuntimeHash(savGeminiWireBody(input).body)], [{ textBytes: 1000, mediaTokens: 0, maxOutputTokens: 8192 }]);
   expect(reserve).not.toHaveBeenCalled(); expect(network).not.toHaveBeenCalled(); expect(settleSavIntakeCall).not.toHaveBeenCalled();
 });
 it("rejects a batch outside the dispatcher capability before durable preflight", async () => {
@@ -153,4 +154,15 @@ it("SAV46 does not count a network send when the transport expires during the fi
     expect(dispatcher.diagnostics).toMatchObject([{ dispatched: false, httpStatus: null }]);
     expect(settle).toHaveBeenCalledOnce(); expect(dispatcher.uncertain).toBe(true);
   } finally { vi.useRealTimers(); }
+});
+it("BUDGET-RES an admitted image is reserved with its media allowance next to the exact text size", async () => {
+  const input = inputAtSize(1000);
+  input.phase = "understanding";
+  input.media = [await admitSavAttachmentImage(await syntheticImage(), "image/png")];
+  input.sanitizeResponse = raw => raw;
+  const reserve = vi.fn(async () => ({ id: "synthetic-reservation", cached: null }));
+  const network = vi.fn<typeof fetch>(async () => Response.json({ candidates: [{ finishReason: "STOP", content: { parts: [{ text: '{"fixture":true}' }] } }], usageMetadata: { promptTokenCount: 100, candidatesTokenCount: 50, thoughtsTokenCount: 0, totalTokenCount: 150 } }));
+  const dispatcher = createIntakeModelDispatcher({ config, live: async () => {}, reserve, network, signal: new AbortController().signal, env: () => ({ SAV_GEMINI_API_KEY: "synthetic-key" }) });
+  await expect(dispatcher.call(input)).resolves.toMatchObject({ json: { fixture: true } });
+  expect(reserve).toHaveBeenCalledExactlyOnceWith(expect.stringMatching(/^[a-f0-9]{64}$/), { textBytes: savGeminiWireBody(input).textBytes, mediaTokens: 4096, maxOutputTokens: 8192 });
 });

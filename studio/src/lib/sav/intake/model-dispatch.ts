@@ -1,12 +1,13 @@
 import "server-only";
 import { z } from "zod";
-import { reconcileIntakeZeroThoughtUsage } from "./model-usage";
+import { reconcileIntakeZeroThoughtUsage, unbilledProviderStatus } from "./model-usage";
 import type { IntakeGeminiCall } from "./model-readers";
 import { readSavGeminiResponse, type SavGeminiMetadata } from "../gemini-response";
 import { requestSavGeminiJson, savAiCancellationCode, savAiErrorMetadata, savGeminiWireBody } from "../gemini-transport";
 import { evaluationProviderResponse } from "./server-runner";
 import { intakeRuntimeHash, type IntakeRuntimeConfig } from "./runtime-contract";
 import { settleSavIntakeCall, type reserveSavIntakeCall } from "./runtime-store";
+import type { IntakeRequestSize } from "./request-reservation";
 import { SAV_INTAKE_MODEL_LIMITS } from "./model-limits";
 import { IntakeBudgetExhaustedError, type IntakeBudgetLimit } from "./budget-limit";
 
@@ -26,8 +27,9 @@ function dispatchTransportDiagnostic(metadata?: SavGeminiMetadata): IntakeDispat
 /** Fixed model endpoint and exact-body reservation, shared by automatic work
  * and authenticated human continuations. No CRM/Gmail write capability. */
 export function createIntakeModelDispatcher(options: { config: IntakeRuntimeConfig; live: () => Promise<void>;
-  reserve: (hash: string) => ReturnType<typeof reserveSavIntakeCall>; signal: AbortSignal;
-  preflight?: (hashes: string[]) => Promise<void>;
+  /** The size describes the exact body, so the reservation is computed from what is sent. */
+  reserve: (hash: string, size: IntakeRequestSize) => ReturnType<typeof reserveSavIntakeCall>; signal: AbortSignal;
+  preflight?: (hashes: string[], sizes: IntakeRequestSize[]) => Promise<void>;
   env?: () => Record<string,string|undefined>; network?: typeof fetch;
   /** Informational: the ledger, not this ordinal, decides whether a body may be dispatched again. */
   retryOrdinal?: number;
@@ -59,7 +61,7 @@ export function createIntakeModelDispatcher(options: { config: IntakeRuntimeConf
       let sent = false;
       // The store resolves the exact ledger row (cache, retry of an unbilled rejection, or new),
       // with the same rule as the preflight of a grouped plan.
-      const reserved = await options.reserve(intakeRuntimeHash(expectedBody));
+      const reserved = await options.reserve(intakeRuntimeHash(expectedBody), { textBytes: wire.textBytes, mediaTokens: wire.mediaAllowance, maxOutputTokens: wire.output });
       if (reserved.cached) { active(); if (diagnostic) diagnostic.cached = true; failureReason = undefined; return reserved.cached; }
       const reservation = reserved.id;
       let providerUsage: SavGeminiMetadata | undefined, providerStatus: number | undefined;
@@ -105,9 +107,9 @@ export function createIntakeModelDispatcher(options: { config: IntakeRuntimeConf
         return result;
       } catch (error) {
         if (diagnostic) diagnostic.transport = dispatchTransportDiagnostic(savAiErrorMetadata(error));
-        // A complete 429/5xx answer from the provider means the request was not processed:
-        // settled at zero, explicitly marked. A timeout or lost answer stays uncertain.
-        const unbilled = providerStatus !== undefined && (providerStatus === 429 || providerStatus >= 500 && providerStatus <= 599)
+        // A complete answer with a status the provider documents as not charged (400, 429, 5xx):
+        // settled at zero, explicitly marked. A timeout, a lost answer or another status stays uncertain.
+        const unbilled = unbilledProviderStatus(providerStatus)
           && error instanceof Error && error.message === `SAV_AI_HTTP_${providerStatus}` ? providerStatus : undefined;
         if (reservation) uncertain = !await (unbilled === undefined ? settle(reservation, exactUsage(savAiErrorMetadata(error)))
           : settle(reservation, exactUsage(savAiErrorMetadata(error)), undefined, unbilled));
@@ -128,13 +130,15 @@ export function createIntakeModelDispatcher(options: { config: IntakeRuntimeConf
       const code = savAiCancellationCode(options.signal); if (code) throw Error(code);
       await live();
       if (!options.preflight || options.signal.aborted || uncertain || !inputs.length || inputs.length > 3) throw Error("SAV_INTAKE_RUNTIME_BATCH_PLANNING_REQUIRED");
+      const sizes: IntakeRequestSize[] = [];
       const hashes = inputs.map(input => {
         const wire = savGeminiWireBody(input);
+        sizes.push({ textBytes: wire.textBytes, mediaTokens: wire.mediaAllowance, maxOutputTokens: wire.output });
         if (input.model !== config.model || input.phase !== "ticket_matching" || input.media || input.allowRetry !== false || input.signal.aborted
           || wire.textBytes > SAV_INTAKE_MODEL_LIMITS.wireTextBytes || input.body.generationConfig.maxOutputTokens !== 8192) throw Error("SAV_INTAKE_RUNTIME_REQUEST_REJECTED");
         return intakeRuntimeHash(wire.body);
       });
-      await options.preflight(hashes);
+      await options.preflight(hashes, sizes);
       await live();
     } catch (error) {
       if (error instanceof IntakeBudgetExhaustedError) budgetLimit = error.limit;

@@ -9,13 +9,16 @@ export class IntakeBudgetExhaustedError extends Error {
 }
 /** The first exceeded bound, in the order the ledger checks them; null when none is. */
 export function intakeExhaustedLimit(input: { own: number; version: number; needed: number; perMessage: number; perVersion: number; priceNanoUsd: number;
+  /** Exact total of the needed calls when each is reserved at its own size; else needed × priceNanoUsd. */
+  nanoUsd?: number;
   usage: { profile: string; remainingCalls: number; remainingNanoUsd: number; remainingRollingNanoUsd: number } }): IntakeBudgetLimit | null {
+  const amount = input.nanoUsd ?? input.needed * input.priceNanoUsd;
   const scope = input.usage.profile === SAV_INTAKE_OPERATIONAL_PROFILE ? "daily" : "campaign";
   if (input.own + input.needed > input.perMessage) return "per_message";
   if (input.version + input.needed > input.perVersion) return "per_version";
   if (input.needed > input.usage.remainingCalls) return `${scope}_calls`;
-  if (input.needed * input.priceNanoUsd > input.usage.remainingNanoUsd) return `${scope}_nano_usd`;
-  if (input.needed * input.priceNanoUsd > input.usage.remainingRollingNanoUsd) return "rolling_nano_usd";
+  if (amount > input.usage.remainingNanoUsd) return `${scope}_nano_usd`;
+  if (amount > input.usage.remainingRollingNanoUsd) return "rolling_nano_usd";
   return null;
 }
 export const publicIntakeBudgetLimit = (value: unknown) => (INTAKE_BUDGET_LIMITS as readonly string[]).includes(String(value)) ? value as IntakeBudgetLimit : null;
