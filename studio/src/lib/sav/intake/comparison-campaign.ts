@@ -11,7 +11,7 @@ import { SAV_AI_BUDGET, savAiCancellationCode, withSavAiBudget } from "../gemini
 import { planSavIntake } from "./engine";
 import type { EnginePolicy, IntakePlan, ReadResult } from "./engine-types";
 import { createSavIntakeHubspotReaders, type SavIntakeCrmReaders } from "./hubspot-readers";
-import { createIntakeModelDispatcher, type IntakeDispatchDiagnostic } from "./model-dispatch";
+import { createIntakeModelDispatcher, intakeDispatchCounts, type IntakeDispatchDiagnostic } from "./model-dispatch";
 import { comparisonValidationDiagnostics } from "./comparison-diagnostics";
 import { createSavIntakeSemanticReaders, type IntakeModelTrace } from "./model-readers";
 import { savIntakeRuntimeConfig, type IntakeRuntimeConfig } from "./runtime-contract";
@@ -208,10 +208,11 @@ async function compareOne(messageId: string, claimId: string, campaign: SavIntak
     finally { try { await Promise.allSettled(dispatcher.pending); } finally { clearTimeout(timer); } }
     technical ??= savAiCancellationCode(controller.signal);
     technical ??= dispatcher.failureReason ?? traces.find(t => !t.accepted && t.errorCode)?.errorCode ?? null;
-    return { summary: technical ? null : intakePlanSummary(plan), technical, uncertain: dispatcher.uncertain, calls: traces.filter(t => t.metadata).length,
+    const { dispatches, httpResponses } = intakeDispatchCounts(dispatcher.diagnostics);
+    return { summary: technical ? null : intakePlanSummary(plan), technical, uncertain: dispatcher.uncertain, calls: dispatches,
       diagnostics: { requests: dispatcher.diagnostics, failures: comparisonValidationDiagnostics(traces),
-        dispatches: dispatcher.diagnostics.filter(d => d.dispatched).length,
-        httpResponses: dispatcher.diagnostics.filter(d => d.httpStatus !== null).length } };
+        dispatches,
+        httpResponses } };
   };
   const current = await side("current"), simple = await side("simple");
   coverage.push(...[...crm.misses].map(key => `crm_not_captured:${key.split(":")[0]}`), ...await crm.failedUsed());

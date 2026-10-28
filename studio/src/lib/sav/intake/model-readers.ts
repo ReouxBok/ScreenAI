@@ -52,7 +52,8 @@ const stageOf = (error: unknown) => (error && typeof error === "object" ? (error
 
 // Use the existing REST responseSchema representation; limits and strictness
 // remain enforced by Zod after generation, not by a promise from the provider.
-export function intakeResponseSchema(schema: z.ZodType): Record<string, unknown> {
+// Array bounds are opt-in so the existing reader keeps its exact wire schema.
+export function intakeResponseSchema(schema: z.ZodType, options: { arrayBounds?: boolean } = {}): Record<string, unknown> {
   const convert = (input: unknown): Record<string, unknown> => {
     const s = input as Record<string, unknown>, result: Record<string, unknown> = {};
     if (Array.isArray(s.anyOf)) {
@@ -67,6 +68,11 @@ export function intakeResponseSchema(schema: z.ZodType): Record<string, unknown>
     }
     if (typeof s.type === "string") result.type = s.type.toUpperCase();
     if (s.enum) result.enum = s.enum;
+    // REST Schema represents these int64 fields as decimal strings. String
+    // lengths remain server-only: Gemini does not guarantee their enforcement.
+    if (options.arrayBounds) for (const key of ["minItems", "maxItems"] as const) {
+      if (typeof s[key] === "number") result[key] = String(s[key]);
+    }
     if (s.required) result.required = s.required;
     if (s.items) result.items = convert(s.items);
     if (s.properties) result.properties = Object.fromEntries(Object.entries(s.properties as Record<string, unknown>).map(([key, value]) => [key, convert(value)]));

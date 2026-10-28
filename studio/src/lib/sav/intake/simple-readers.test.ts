@@ -1,10 +1,11 @@
 /** Bench of the single-call reader through the REAL engine: synthetic CRM and a
  * scripted model, asserting the final plan the unchanged executor would receive. */
+import { z } from "zod";
 import { createHash } from "node:crypto";
 import { describe, expect, it } from "vitest";
 import { planSavIntake } from "./engine";
 import type { EngineInput, EnginePolicy, IntakeAdapters, IntakeAssociation, IntakeContact, IntakePlan, IntakeTicket, ReadResult } from "./engine-types";
-import type { IntakeGeminiCall, IntakeModelTrace } from "./model-readers";
+import { intakeResponseSchema, type IntakeGeminiCall, type IntakeModelTrace } from "./model-readers";
 import { createSavIntakeSimpleReaders, memoizeIntakeCrmReaders, SAV_INTAKE_SIMPLE_REVISION } from "./simple-readers";
 
 const at = "2026-10-20T10:00:00.000Z";
@@ -40,6 +41,7 @@ function bench(options: { text?: string; subject?: string; contacts?: IntakeCont
       multiTicketWarning: { ...resource, text: warning, sha256: createHash("sha256").update(warning).digest("hex") } },
     ...(options.newsletterRule ? { qualifiedOther: { family: "authenticated_newsletter" as const, resource, evidenceSource: "private_rule" as const } } : {}) };
   const seen: Data[] = [], phases: string[] = [], systems: string[] = [], traces: IntakeModelTrace[] = [];
+  const judgements: { tickets: { ticketId: string }[] }[] = [];
   let script: (data: Data, n: number) => Answer = () => ({});
   const call: IntakeGeminiCall = async request => {
     const data = JSON.parse(request.body.contents[0].parts[0].text) as Data;
@@ -49,13 +51,13 @@ function bench(options: { text?: string; subject?: string; contacts?: IntakeCont
   };
   const shared = memoizeIntakeCrmReaders(crm);
   const provenance = new Map([[mid, { subject: options.subject ?? "Synchronisation agenda" } as never]]);
-  const semantic = createSavIntakeSimpleReaders({ model: "gemini-fixture", call, crm: shared, policy, provenance, onTrace: t => traces.push(t) });
+  const semantic = createSavIntakeSimpleReaders({ model: "gemini-fixture", call, crm: shared, policy, provenance, onTrace: t => traces.push(t), onJudgement: judgement => judgements.push(judgement) });
   const run = (answer: (data: Data, n: number) => Answer) => { script = answer; return planSavIntake(input, { ...shared, ...semantic }, policy); };
   const resumeIssues = async () => {
     script = d => judgement(d);
     return semantic.assessIssues!({message:input.message,requests:[{id:"r1",kind:"support",currentMessageId:mid}],tickets:[{ticket:ticket("201"),history:[]}],evidence:[{id:"current"},{id:"ticket-201"},{id:"history-201"}]} as never,new AbortController().signal);
   };
-  return { run, seen, phases, systems, traces, crmCalls, resumeIssues };
+  return { run, seen, phases, systems, traces, judgements, crmCalls, resumeIssues };
 }
 /** A complete, valid judgement; tests override only what they exercise. */
 const judgement = (data: Data, over: Answer = {}): Answer => ({
@@ -345,4 +347,23 @@ describe("SAV-42 B: unread attachments through the single-call reader and the re
     expect(plan.steps).toEqual([]);
     expect(reasons(plan)).toContain("history_incomplete");
   });
+});
+
+it("keeps the existing reader schema unchanged while simple opts into REST array bounds", () => {
+  const schema = z.object({ values: z.array(z.string().max(5)).min(1).max(20) });
+  expect(intakeResponseSchema(schema)).toEqual({type:"OBJECT",properties:{values:{type:"ARRAY",items:{type:"STRING"}}},required:["values"]});
+  expect(intakeResponseSchema(schema, {arrayBounds:true})).toEqual({type:"OBJECT",properties:{values:{type:"ARRAY",minItems:"1",maxItems:"20",items:{type:"STRING"}}},required:["values"]});
+});
+it("retains all twenty ticket verdicts and all current requests with concise instructions", async () => {
+  const tickets = Array.from({length:20}, (_, index) => ticket(String(201 + index)));
+  const b = bench({ tickets, text: "Mon agenda échoue et je souhaite ma facture." });
+  const plan = await b.run(d => judgement(d, { requests: [
+    {id:"r1",kind:"support",summary:"Agenda en panne.",sourceIds:["current"]},
+    {id:"r2",kind:"finance",summary:"Copie de facture.",sourceIds:["current"]},
+  ] }));
+  expect(b.seen).toHaveLength(1); expect(b.seen[0].tickets).toHaveLength(20);
+  expect(b.systems[0]).toContain("exactly one verdict for EVERY supplied ticket");
+  expect(b.systems[0]).toContain("without omitting any request");
+  expect(plan.newTicket?.requestIds).toEqual(["r1", "r2"]);
+  expect(b.judgements[0].tickets.map(ticket => ticket.ticketId)).toEqual(tickets.map(ticket => ticket.id));
 });
