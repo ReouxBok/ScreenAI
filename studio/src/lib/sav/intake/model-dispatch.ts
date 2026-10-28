@@ -10,6 +10,19 @@ import { settleSavIntakeCall, type reserveSavIntakeCall } from "./runtime-store"
 import { SAV_INTAKE_MODEL_LIMITS } from "./model-limits";
 import { IntakeBudgetExhaustedError, type IntakeBudgetLimit } from "./budget-limit";
 
+/** Counts reflect sends and received HTTP headers, including a lost/late body;
+ * no provider body, credential, source text or model output is retained. */
+export type IntakeDispatchDiagnostic = {
+  phase: string; promptRevision: string; requestHash: string; textBytes: number; wireBytes: number;
+  generationBudget: "standard" | "single_pass"; dispatched: boolean; httpStatus: number | null; cached: boolean;
+  transport?: { phase: string; durationMs: number; attempts: number; retries: number; errorCode: string | null; failureCategory: string | null };
+};
+function dispatchTransportDiagnostic(metadata?: SavGeminiMetadata): IntakeDispatchDiagnostic["transport"] {
+  const t = metadata?.transport;
+  return t ? { phase: t.phase, durationMs: t.durationMs, attempts: t.attempts, retries: t.retries,
+    errorCode: t.errorCode, failureCategory: t.failureCategory } : undefined;
+}
+
 /** Fixed model endpoint and exact-body reservation, shared by automatic work
  * and authenticated human continuations. No CRM/Gmail write capability. */
 export function createIntakeModelDispatcher(options: { config: IntakeRuntimeConfig; live: () => Promise<void>;
@@ -19,9 +32,12 @@ export function createIntakeModelDispatcher(options: { config: IntakeRuntimeConf
   /** Informational: the ledger, not this ordinal, decides whether a body may be dispatched again. */
   retryOrdinal?: number;
   /** Settlement of a reservation; the live ledger by default, a separate one for the comparison. */
-  settle?: typeof settleSavIntakeCall }) {
+  settle?: typeof settleSavIntakeCall;
+  /** Comparison only: operational callers leave both options absent. */
+  generationBudget?: "single_pass"; captureDiagnostics?: boolean }) {
   const {config,live}=options, env=options.env??(()=>process.env), network=options.network??fetch, settle=options.settle??settleSavIntakeCall;
   let uncertain=false, failureReason:string|undefined, budgetLimit:IntakeBudgetLimit|undefined;
+  const diagnostics: IntakeDispatchDiagnostic[] = [];
   const pending:Promise<unknown>[]=[];
   const execute: IntakeGeminiCall = async input => {
       const signal = AbortSignal.any([options.signal, input.signal]);
@@ -34,11 +50,17 @@ export function createIntakeModelDispatcher(options: { config: IntakeRuntimeConf
       const wire = savGeminiWireBody(input);
       const expectedBody = wire.body;
       if (wire.textBytes > SAV_INTAKE_MODEL_LIMITS.wireTextBytes || input.body.generationConfig.maxOutputTokens !== 8192) throw Error("SAV_INTAKE_RUNTIME_REQUEST_REJECTED");
+      const diagnostic: IntakeDispatchDiagnostic | undefined = options.captureDiagnostics ? {
+        phase: input.phase, promptRevision: input.promptRevision, requestHash: intakeRuntimeHash(expectedBody),
+        textBytes: wire.textBytes, wireBytes: Buffer.byteLength(expectedBody, "utf8"),
+        generationBudget: options.generationBudget ?? "standard", dispatched: false, httpStatus: null, cached: false,
+      } : undefined;
+      if (diagnostic) diagnostics.push(diagnostic);
       let sent = false;
       // The store resolves the exact ledger row (cache, retry of an unbilled rejection, or new),
       // with the same rule as the preflight of a grouped plan.
       const reserved = await options.reserve(intakeRuntimeHash(expectedBody));
-      if (reserved.cached) { active(); failureReason = undefined; return reserved.cached; }
+      if (reserved.cached) { active(); if (diagnostic) diagnostic.cached = true; failureReason = undefined; return reserved.cached; }
       const reservation = reserved.id;
       let providerUsage: SavGeminiMetadata | undefined, providerStatus: number | undefined;
       // Gemini may omit a zero thoughts counter. Recognize only that zero when
@@ -57,7 +79,10 @@ export function createIntakeModelDispatcher(options: { config: IntakeRuntimeConf
         sent = true;
         const signal = AbortSignal.any([options.signal, input.signal, ...(init.signal ? [init.signal] : [])]);
         if (signal.aborted) throw Error("SAV_INTAKE_RUNTIME_CONTEXT_CHANGED");
-        const response = await evaluationProviderResponse(await network(url, { ...init, signal, redirect: "error" }), signal);
+        if (diagnostic) diagnostic.dispatched = true;
+        const rawResponse = await network(url, { ...init, signal, redirect: "error" });
+        if (diagnostic) diagnostic.httpStatus = rawResponse.status;
+        const response = await evaluationProviderResponse(rawResponse, signal);
         providerStatus = response.status;
         if (response.ok) {
           try { providerUsage = readSavGeminiResponse(await response.clone().json()).metadata; }
@@ -67,7 +92,9 @@ export function createIntakeModelDispatcher(options: { config: IntakeRuntimeConf
       };
       try {
         active();
-        const generated = await requestSavGeminiJson({ ...input, signal, apiKey: key, fetch: guardedNetwork, allowRetry: false });
+        const generated = await requestSavGeminiJson({ ...input, signal, apiKey: key, fetch: guardedNetwork, allowRetry: false,
+          ...(options.generationBudget ? { generationBudget: options.generationBudget } : {}) });
+        if (diagnostic) diagnostic.transport = dispatchTransportDiagnostic(generated.metadata);
         const metadata = exactUsage(generated.metadata);
         if (input.media && !input.sanitizeResponse) throw Error("SAV_INTAKE_VISUAL_VALIDATOR_REQUIRED");
         const json = input.media ? input.sanitizeResponse!(generated.json) : generated.json;
@@ -77,6 +104,7 @@ export function createIntakeModelDispatcher(options: { config: IntakeRuntimeConf
         failureReason = undefined;
         return result;
       } catch (error) {
+        if (diagnostic) diagnostic.transport = dispatchTransportDiagnostic(savAiErrorMetadata(error));
         // A complete 429/5xx answer from the provider means the request was not processed:
         // settled at zero, explicitly marked. A timeout or lost answer stays uncertain.
         const unbilled = providerStatus !== undefined && (providerStatus === 429 || providerStatus >= 500 && providerStatus <= 599)
@@ -114,5 +142,5 @@ export function createIntakeModelDispatcher(options: { config: IntakeRuntimeConf
       throw error;
     }
   };
-  return { call, plan, pending, get uncertain() { return uncertain; }, get failureReason() { return failureReason; }, get budgetLimit() { return budgetLimit; } };
+  return { call, plan, pending, diagnostics, get uncertain() { return uncertain; }, get failureReason() { return failureReason; }, get budgetLimit() { return budgetLimit; } };
 }

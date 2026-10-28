@@ -102,3 +102,45 @@ it("does not retry or mislabel a cancelled response body", async () => {
   await vi.advanceTimersByTimeAsync(1000); await assertion;
   expect(network).toHaveBeenCalledTimes(1); expect(vi.getTimerCount()).toBe(0);
 });
+
+// Investigation only: no real network, fake-clock reproduction of the live37s cutoff.
+it.each([36_000,38_000])("INVESTIGATION single-pass large input, synthetic response at %sms",async(delay)=>{
+ const network=vi.fn<typeof fetch>((_,init)=>new Promise((resolve,reject)=>{
+  const timer=setTimeout(()=>resolve(geminiFixture({ok:true})),delay);
+  init!.signal!.addEventListener("abort",()=>{clearTimeout(timer);reject(new DOMException("synthetic abort","AbortError"));},{once:true});
+ }));
+ const big={...request,allowRetry:false,body:{...request.body,contents:[{parts:[{text:"synthetic context ".repeat(10000)}]}]}};
+ const work=requestSavGeminiJson({...big,fetch:network}).then(value=>({value}),error=>({error}));
+ await vi.advanceTimersByTimeAsync(38_000);
+ const result=await work;
+ expect(SAV_AI_BUDGET.durationMs).toBe(60_000);
+ expect(network).toHaveBeenCalledTimes(1);
+ if(delay===36_000)expect(result).toHaveProperty("value.json.ok",true);
+ else expect(result).toMatchObject({error:{message:"SAV_AI_TIMEOUT",metadata:{transport:{attempts:1,retries:0,durationMs:37_000}}}});
+ expect(vi.getTimerCount()).toBe(0);
+});
+
+it("SAV46 single-pass uses the existing60s allowance once, not the legacy37s phase",async()=>{
+ const network=vi.fn<typeof fetch>((_,init)=>new Promise((resolve,reject)=>{
+  const timer=setTimeout(()=>resolve(geminiFixture({ok:true})),38_000);
+  init!.signal!.addEventListener("abort",()=>{clearTimeout(timer);reject(init!.signal!.reason)},{once:true});
+ }));
+ const work=requestSavGeminiJson({...request,generationBudget:"single_pass",allowRetry:false,fetch:network});
+ await vi.advanceTimersByTimeAsync(38_000);expect(await work).toMatchObject({json:{ok:true}});
+ expect(network).toHaveBeenCalledOnce();expect(vi.getTimerCount()).toBe(0);
+});
+it.each(["parent","budget"])("SAV46 single-pass respects %s cancellation without retry",async(kind)=>{
+ const controller=new AbortController();
+ const network=vi.fn<typeof fetch>((_,init)=>new Promise((_,reject)=>init!.signal!.addEventListener("abort",()=>reject(init!.signal!.reason),{once:true})));
+ if(kind==="parent")setTimeout(()=>controller.abort(Error("SAV_INTAKE_COMPARISON_DEADLINE")),20_000);
+ const work=requestSavGeminiJson({...request,generationBudget:"single_pass",allowRetry:false,signal:controller.signal,fetch:network});
+ const assertion=expect(work).rejects.toMatchObject({message:kind==="parent"?"SAV_INTAKE_COMPARISON_DEADLINE":"SAV_AI_TIMEOUT"});
+ await vi.advanceTimersByTimeAsync(60_000);await assertion;
+ expect(network).toHaveBeenCalledOnce();expect(vi.getTimerCount()).toBe(0);
+});
+it("SAV46 single-pass cannot enable retries or derived work",async()=>{
+ const network=vi.fn<typeof fetch>();
+ await expect(requestSavGeminiJson({...request,generationBudget:"single_pass",fetch:network})).rejects.toThrow("SAV_AI_BUDGET_EXCEEDED");
+ await expect(requestSavGeminiJson({...request,phase:"translation",generationBudget:"single_pass",allowRetry:false,fetch:network})).rejects.toThrow("SAV_AI_BUDGET_EXCEEDED");
+ expect(network).not.toHaveBeenCalled();
+});

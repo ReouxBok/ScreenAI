@@ -296,3 +296,76 @@ it("a verified cost settled after the deadline never turns an expired side into 
     expect(report.configured && report.spend.nanoUsd).toBeGreaterThan(0);
   } finally { spy.mockRestore(); vi.useRealTimers(); }
 }, 30_000);
+
+import * as semanticReadersInvestigation from "./model-readers";
+it("INVESTIGATION matching citation detail exists in reader but is discarded by campaign",async()=>{
+ const message=await stored(),e=env(mailboxId,[message.id]),base=provider(),at=new Date(Date.now()-2*86400000).toISOString();
+ const complete=<T>(data:T)=>({status:"complete" as const,data,observedAt:new Date().toISOString()});
+ const ticket={id:"201",contactIds:["101"],stage:"open" as const,createdAt:at,ownerId:null,subject:"Agenda",content:"Synchronisation impossible"};
+ const crmSpy=vi.spyOn(hubspotReaders,"createSavIntakeHubspotReaders").mockReturnValue({
+  findContactsByEmail:async()=>complete([{id:"101",emails:["client@example.invalid"]}]),directAssociations:async()=>complete([]),
+  getContact:async()=>complete({id:"101",emails:["client@example.invalid"]}),ticketsForContact:async()=>complete([ticket]),
+  ticketHistory:async()=>complete([{id:"n1",at,kind:"note" as const,text:"Synchronisation de l'agenda en panne"}]),
+ });
+ const original=semanticReadersInvestigation.createSavIntakeSemanticReaders,traces: import("./model-readers").IntakeModelTrace[]=[];
+ const traceSpy=vi.spyOn(semanticReadersInvestigation,"createSavIntakeSemanticReaders").mockImplementation(options=>original({...options,onTrace:trace=>{traces.push(trace);options.onTrace?.(trace)}}));
+ const network:typeof fetch=async(url,init)=>{
+  if(!String(url).startsWith("https://generativelanguage.googleapis.com/"))return base.network(url,init);
+  const data=JSON.parse(JSON.parse(String(init?.body)).contents[0].parts[0].text);
+  if(data.current!==undefined){
+   const answer={messageId:data.message.id,nature:"request",requests:[{id:"r1",kind:"support",summary:"Agenda en panne",sourceIds:["current"]}],
+    identity:{kind:"unique",contactIds:["101"],why:"Sender record"},tickets:[{ticketId:"201",relation:"same",why:"Same problem",sourceIds:["current","ticket-201","history-201"]}],missing:[],rationale:"Support"};
+   return Response.json({candidates:[{finishReason:"STOP",content:{parts:[{text:JSON.stringify(answer)}]}}],usageMetadata:{promptTokenCount:300,candidatesTokenCount:60,thoughtsTokenCount:0,totalTokenCount:360}});
+  }
+  if(data.tickets){
+   // Valid quoteId, but current alone cannot ground a positive match against this ticket/history.
+   const answer={investigationComplete:true,tickets:[{ticketId:"201",relation:"same",requestIds:["r1"],evidenceIds:["current","ticket-201","history-201"],rationale:"Same problem",grounding:[{quoteId:data.citationCatalogue.find((x:{sourceId:string})=>x.sourceId==="current").id}]}]};
+   return Response.json({candidates:[{finishReason:"STOP",content:{parts:[{text:JSON.stringify(answer)}]}}],usageMetadata:{promptTokenCount:300,candidatesTokenCount:60,thoughtsTokenCount:0,totalTokenCount:360}});
+  }
+  return base.network(url,init);
+ };
+ try{
+  await runSavIntakeComparisonBatch({env:()=>e,network,limit:1});
+  expect(traces).toContainEqual(expect.objectContaining({phase:"ticket_matching",errorCode:"SAV_INTAKE_MODEL_CITATION_REJECTED",validationFailure:{reason:"required_source_missing",path:"grounding",stage:"evidence"}}));
+  const report=await readSavIntakeComparisonReport(()=>e);if(!report.configured)throw Error("TEST_CONFIG");
+  expect(report.rows[0].detail).toMatchObject({current:{technical:"SAV_INTAKE_MODEL_CITATION_REJECTED"}});
+  expect(report.rows[0].detail).toMatchObject({current:{diagnostics:{failures:[{phase:"ticket_matching",code:"SAV_INTAKE_MODEL_CITATION_REJECTED",validationFailure:{reason:"required_source_missing",path:"grounding",stage:"evidence"}}]}}});
+  expect(JSON.stringify(report.rows[0].detail)).not.toContain("client@example.invalid");
+  expect(await f.db.select().from(savIntakeModelCalls)).toEqual([]);
+  expect(await f.db.select().from(savActions)).toEqual([]);
+ }finally{traceSpy.mockRestore();crmSpy.mockRestore()}
+},30000);
+
+it("SAV46 the real simple campaign dispatcher admits a38s answer, leaving current standard",async()=>{
+ const m=await stored(),e=env(mailboxId,[m.id]),p=provider();let started=false;
+ const network:typeof fetch=async(url,init)=>{
+  if(!String(url).startsWith("https://generativelanguage.googleapis.com/"))return p.network(url,init);
+  const data=JSON.parse(JSON.parse(String(init?.body)).contents[0].parts[0].text);
+  if(typeof data.current!=="string")return p.network(url,init);
+  started=true;return new Promise((resolve,reject)=>{const timer=setTimeout(()=>{void p.network(url,init).then(resolve,reject)},38_000);
+   init!.signal!.addEventListener("abort",()=>{clearTimeout(timer);reject(init!.signal!.reason)},{once:true});});
+ };
+ vi.useFakeTimers({toFake:["setTimeout","clearTimeout"]});
+ try{
+  let finished=false;const work=runSavIntakeComparisonBatch({env:()=>e,network,limit:1}).finally(()=>{finished=true});
+  await vi.waitFor(()=>expect(started).toBe(true));await vi.advanceTimersByTimeAsync(38_000);await vi.waitFor(()=>expect(finished).toBe(true));await work;
+  const report=await readSavIntakeComparisonReport(()=>e);if(!report.configured)throw Error("TEST_CONFIG");
+  expect(report.rows[0].verdict).toBe("identical");
+  expect(report.rows[0].detail).toMatchObject({current:{diagnostics:{requests:[{generationBudget:"standard",dispatched:true,httpStatus:200}],dispatches:1,httpResponses:1}},simple:{diagnostics:{requests:[{generationBudget:"single_pass",dispatched:true,httpStatus:200}],dispatches:1,httpResponses:1}}});
+  expect(await f.db.select().from(savIntakeModelCalls)).toEqual([]);
+ }finally{vi.useRealTimers()}
+},30000);
+it("SAV46 a timeout preserves the counted reservation and reports one send even with zero trace responses",async()=>{
+ const m=await stored(),e=env(mailboxId,[m.id]),p=provider();
+ const network:typeof fetch=async(url,init)=>{
+  if(String(url).startsWith("https://generativelanguage.googleapis.com/")){
+   const data=JSON.parse(JSON.parse(String(init?.body)).contents[0].parts[0].text);
+   if(typeof data.current==="string")throw Error("SYNTHETIC_LOST_BODY");
+  }return p.network(url,init);
+ };
+ await runSavIntakeComparisonBatch({env:()=>e,network,limit:1});
+ const report=await readSavIntakeComparisonReport(()=>e);if(!report.configured)throw Error("TEST_CONFIG");
+ expect(report.rows[0].detail).toMatchObject({simple:{uncertain:true,calls:0,diagnostics:{dispatches:1,httpResponses:0,requests:[{dispatched:true,httpStatus:null,transport:{attempts:1}}]}}});
+ expect(report.spend.nanoUsd).toBeGreaterThanOrEqual(817152000);
+ expect(await runSavIntakeComparisonBatch({env:()=>e,network,limit:1})).toMatchObject({compared:[]});
+});
