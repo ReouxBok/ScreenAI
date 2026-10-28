@@ -5,8 +5,8 @@ import { dispatchSavDerivedCall, isSavDerivedBudgetDeferred, reserveSavDerivedCa
 import { savRunProvenance } from "./config";
 import { parseSavGeminiJson, readSavGeminiResponse, type SavGeminiMetadata } from "./gemini-response";
 import { createHash } from "node:crypto";
-import { isSavAdmittedImage, type SavAdmittedImage } from "./attachment-image";
-import { SAV_ATTACHMENT_LIMITS } from "./attachment-contract";
+import { isSavAdmittedMedia, isSavPdfMedia, type SavAdmittedMedia } from "./attachment-pdf";
+import { SAV_ATTACHMENT_LIMITS, SAV_ATTACHMENT_PDF_LIMITS } from "./attachment-contract";
 
 export const SAV_AI_TRANSPORT_REVISION = "sav-gemini-transport-2026-10-22.v6";
 export type SavAiPhase = "understanding" | "composition" | "coherence" | "ticket_matching" | "repair" | "learning_comparison" | "attachment_reading" | "translation";
@@ -87,7 +87,7 @@ export function savGeminiGenerationConfig(model: string, config: Record<string, 
 
 /** Build and validate the exact provider wire body before durable reservation.
  * Shared by transport and intake; callers cannot inject unadmitted inline data. */
-export function savGeminiWireBody(input: { phase: SavAiPhase; model: string; body: { generationConfig: Record<string, unknown>; [key: string]: unknown }; media?: readonly SavAdmittedImage[] }) {
+export function savGeminiWireBody(input: { phase: SavAiPhase; model: string; body: { generationConfig: Record<string, unknown>; [key: string]: unknown }; media?: readonly SavAdmittedMedia[] }) {
   const generationConfig = savGeminiGenerationConfig(input.model, input.body.generationConfig);
   const output = generationConfig.maxOutputTokens;
   if (typeof output !== "number" || !Number.isInteger(output) || output < 1 || output > 8192) throw new Error("SAV_AI_BUDGET_EXCEEDED");
@@ -98,17 +98,19 @@ export function savGeminiWireBody(input: { phase: SavAiPhase; model: string; bod
   const visual = input.phase === "attachment_reading" || input.phase === "understanding" && Boolean(input.media);
   if (input.media) {
     if (!visual || !/^gemini-3[.-]/.test(input.model)) throw new Error("SAV_AI_MEDIA_UNSUPPORTED_MODEL");
-    if (!input.media.length || input.media.length > SAV_ATTACHMENT_LIMITS.images || input.media.some(image => !isSavAdmittedImage(image)
-      || image.bytes.length > SAV_ATTACHMENT_LIMITS.imageBytes || image.width * image.height > SAV_ATTACHMENT_LIMITS.pixels
-      || createHash("sha256").update(image.bytes).digest("hex") !== image.hash)
+    if (!input.media.length || input.media.length > SAV_ATTACHMENT_LIMITS.images || input.media.some(media => !isSavAdmittedMedia(media)
+      || (isSavPdfMedia(media) ? media.bytes.length > SAV_ATTACHMENT_PDF_LIMITS.bytes || media.pages > SAV_ATTACHMENT_PDF_LIMITS.pages
+        : media.bytes.length > SAV_ATTACHMENT_LIMITS.imageBytes || media.width * media.height > SAV_ATTACHMENT_LIMITS.pixels)
+      || createHash("sha256").update(media.bytes).digest("hex") !== media.hash)
       || input.media.reduce((sum, image) => sum + image.bytes.length, 0) > SAV_ATTACHMENT_LIMITS.totalBytes) throw new Error("SAV_AI_MEDIA_ADMISSION_REQUIRED");
     const contents = input.body.contents as Array<{ role?: string; parts: unknown[] }>;
     if (!Array.isArray(contents) || contents.length !== 1 || !Array.isArray(contents[0].parts)) throw new Error("SAV_AI_MEDIA_ADMISSION_REQUIRED");
-    // Gemini 3 HIGH currently documents ~1120 tokens/image. Reserve 4096 each,
-    // separately from wire bytes; this is a conservative admission unit, not a price.
-    mediaAllowance = input.media.length * 4096;
+    // Gemini 3 HIGH currently documents ~1120 tokens/image and MEDIUM ~560 tokens/PDF page
+    // plus native text. Reserve 4096 per image and 2048 per page, separately from wire
+    // bytes; this is a conservative admission unit, not a price.
+    mediaAllowance = input.media.reduce((sum, media) => sum + (isSavPdfMedia(media) ? media.pages * 2048 : 4096), 0);
     body = JSON.stringify({ ...textBody, contents: [{ ...contents[0], parts: [...contents[0].parts,
-      ...input.media.map(image => ({ inlineData: { mimeType: image.mimeType, data: image.bytes.toString("base64") }, mediaResolution: { level: "MEDIA_RESOLUTION_HIGH" } }))] }] });
+      ...input.media.map(media => ({ inlineData: { mimeType: media.mimeType, data: media.bytes.toString("base64") }, mediaResolution: { level: isSavPdfMedia(media) ? "MEDIA_RESOLUTION_MEDIUM" : "MEDIA_RESOLUTION_HIGH" } }))] }] });
     if (Buffer.byteLength(body, "utf8") > Math.ceil(SAV_ATTACHMENT_LIMITS.totalBytes / 3) * 4 + 64_000) throw new Error("SAV_AI_BUDGET_EXCEEDED");
   } else if (visual) throw new Error("SAV_AI_MEDIA_ADMISSION_REQUIRED");
   return { generationConfig, output, textBody, textBytes, body, mediaAllowance, visual };
@@ -117,7 +119,7 @@ export function savGeminiWireBody(input: { phase: SavAiPhase; model: string; bod
 export async function requestSavGeminiJson(input: {
   phase: SavAiPhase; apiKey: string; model: string; body: { generationConfig: Record<string, unknown>; [key: string]: unknown };
   fetch?: typeof fetch; allowRetry?: boolean; promptRevision?: string; derivedReservationId?: string; signal?: AbortSignal;
-  media?: readonly SavAdmittedImage[];
+  media?: readonly SavAdmittedMedia[];
 }): Promise<{ json: unknown; metadata: SavGeminiMetadata }> {
   if (!budgets.getStore()) return withSavAiBudget(() => requestSavGeminiJson(input));
   const budget = budgets.getStore()!;

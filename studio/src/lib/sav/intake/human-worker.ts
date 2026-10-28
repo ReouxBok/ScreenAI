@@ -199,7 +199,7 @@ export async function consumeIntakeHumanEvent(id: string, config: IntakeRuntimeC
     const live=async()=>{if(savIntakeRuntimeConfig()?.configHash!==config.configHash||deadline.aborted)return conflict();await assertSavAgentAnalysisAllowed(db);await assertIntakeHumanAnalysis(authority,config);};
     const dispatcher=needsAnalysis?createIntakeModelDispatcher({config,signal:deadline,live,reserve:hash=>reserveIntakeHumanCall(authority,config,hash),preflight:hashes=>assertSavIntakeCallPlan(parent.messageId,config,hashes)}):null;
     const semantics: IntakeRuntimePayload["semantics"]=needsAnalysis?{revision:SAV_INTAKE_SEMANTIC_RECORD_REVISION,validatorRevision:SAV_INTAKE_MODEL_REVISION,records:[]}:original.semantics;
-    const attachments=value.reinvestigate ? await prepareIntakeAttachments({run:parent,token,...snapshot},config.model,live) : null;
+    const attachments=value.reinvestigate ? await prepareIntakeAttachments({run:parent,token,...snapshot},config.model,live,undefined,{pdf:config.pdfReading===true}) : null;
     if(attachments) input={...intakeInputWithAttachments(input,event.sourceHash,attachments.state,attachments.prepared),humanResolution:input.humanResolution};
     const fresh=dispatcher&&semantics?recordAcceptedIntakeSemantics(createSavIntakeSemanticReaders({model:config.model,call:dispatcher.call,planCalls:dispatcher.plan,
       ...(attachments?.complete ? {attachments:{prepared:attachments.prepared,onRead:observations=>{

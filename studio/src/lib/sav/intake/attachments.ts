@@ -5,12 +5,12 @@ import { requireDb } from "@/db";
 import { savMessages, savMailboxes, savThreads } from "@/db/schema";
 import { savContentHash } from "../crypto";
 import { prepareSavAttachmentSelection, type SavPreparedAttachments } from "../attachment-reader";
-import { savAttachmentInventorySchema, savAttachmentMetadataSchema, savAttachmentReadSchema, SAV_ATTACHMENT_READER_REVISION, type SavAttachmentInventory, type SavAttachmentRead } from "../attachment-contract";
+import { savAttachmentInventorySchema, savAttachmentMetadataSchema, savAttachmentReadSchema, SAV_ATTACHMENT_READER_REVISION, SAV_ATTACHMENT_PDF_REVISION, type SavAttachmentInventory, type SavAttachmentRead } from "../attachment-contract";
 import type { IntakeLease } from "./runtime-store";
 import type { EngineInput } from "./engine-types";
 
 export type IntakeAttachmentState = { textComplete: boolean; sourceHash: string; read: SavAttachmentRead; inventory: SavAttachmentInventory | null };
-export async function prepareIntakeAttachments(lease: IntakeLease, model: string, live: () => Promise<void>, download?: Parameters<typeof prepareSavAttachmentSelection>[1]["download"]) {
+export async function prepareIntakeAttachments(lease: IntakeLease, model: string, live: () => Promise<void>, download?: Parameters<typeof prepareSavAttachmentSelection>[1]["download"], options: { pdf?: boolean } = {}) {
   if (!lease.body.attachments?.length) return null;
   await live();
   const db = requireDb();
@@ -23,13 +23,13 @@ export async function prepareIntakeAttachments(lease: IntakeLease, model: string
   const inventoryResult = savAttachmentInventorySchema.safeParse(lease.body.attachmentInventory);
   const inventory = inventoryResult.success && parsed.every(a => a.success) && raw.length === lease.body.attachments.length ? inventoryResult.data : null;
   const downloader = download ?? (await import("../gmail")).createSavGmailAttachmentDownloader();
-  const prepared = await prepareSavAttachmentSelection({ metadata, expected: { mailboxEmail: actualMailbox.email, gmailMessageId: message.gmailMessageId, gmailThreadId: thread.gmailThreadId } },
+  const prepared = await prepareSavAttachmentSelection({ metadata, pdf: options.pdf === true, expected: { mailboxEmail: actualMailbox.email, gmailMessageId: message.gmailMessageId, gmailThreadId: thread.gmailThreadId } },
     { download: async (...args) => { await live(); const value = await downloader(...args); await live(); return value; } });
   await live();
-  const read: SavAttachmentRead = { version: 1, readerRevision: SAV_ATTACHMENT_READER_REVISION, model, messageId: message.id, mailboxId: message.mailboxId,
+  const read: SavAttachmentRead = { version: 1, readerRevision: options.pdf ? `${SAV_ATTACHMENT_READER_REVISION}+${SAV_ATTACHMENT_PDF_REVISION}` : SAV_ATTACHMENT_READER_REVISION, model, messageId: message.id, mailboxId: message.mailboxId,
     gmailMessageId: message.gmailMessageId, selectionHash: savContentHash({ metadata, inventory }), claimId: randomUUID(), state: "reading", startedAt: new Date().toISOString(), completedAt: null, observations: prepared.observations };
   const state: IntakeAttachmentState = { textComplete: lease.provenance.get(message.id)?.textComplete === true, sourceHash: lease.sourceHash, read, inventory };
-  // Visual read when every file is either an admitted image or durably unread (mixed image + PDF).
+  // Visual read when every file is either admitted (image, or PDF when enabled) or durably unread.
   const complete=inventory?.complete === true && metadata.length > 0 && prepared.selected.length > 0
     && prepared.observations.every(o => prepared.selected.some(s => s.observation === o) || intakeAttachmentDurablyUnread(o));
   if(!complete) finishIntakeAttachmentRead(state,"context_incomplete");
@@ -52,9 +52,10 @@ export function intakeInputWithAttachments(input: EngineInput, sourceHash: strin
   return { ...input, message, conversation: { ...input.conversation, data: input.conversation.data.map(m => m.id === message.id ? message : m) } };
 }
 /** Durable per-file outcomes that a retry cannot change: the file stays unread, the
- * complete written text may still be analysed. Transport, permission, budget and
+ * complete written text may still be analysed (SAV-43: encrypted, corrupt or too long
+ * PDFs included). Transport, permission, budget and
  * association failures are excluded and keep the dossier incomplete. */
-const SAV_INTAKE_UNREAD_TEXT_ONLY_REASONS = new Set(["unsupported_type", "byte_limit", "pixel_limit", "invalid_image", "type_mismatch"]);
+const SAV_INTAKE_UNREAD_TEXT_ONLY_REASONS = new Set(["unsupported_type", "byte_limit", "pixel_limit", "invalid_image", "type_mismatch", "invalid_pdf", "pdf_encrypted", "page_limit"]);
 function intakeAttachmentDurablyUnread(o: SavAttachmentRead["observations"][number]) {
   return o.status !== "analyzed" && !o.fileHash && SAV_INTAKE_UNREAD_TEXT_ONLY_REASONS.has(o.reason);
 }
