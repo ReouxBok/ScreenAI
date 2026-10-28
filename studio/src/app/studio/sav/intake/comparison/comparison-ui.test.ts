@@ -1,7 +1,7 @@
 import { renderToStaticMarkup } from "react-dom/server";
 import { beforeEach, expect, it, vi } from "vitest";
 const m = vi.hoisted(() => ({ panel: vi.fn(), run: vi.fn() }));
-vi.mock("@/lib/sav/intake/comparison-operator", () => ({ readIntakeComparisonPanel: m.panel, comparisonSentinelsReady: () => false }));
+vi.mock("@/lib/sav/intake/comparison-operator", () => ({ readIntakeComparisonPanel: m.panel, comparisonPhaseCanContinue: () => true, comparisonSentinelsReady: () => false }));
 vi.mock("./actions", () => ({ runComparisonAction: m.run }));
 import Page from "./page";
 beforeEach(() => vi.clearAllMocks());

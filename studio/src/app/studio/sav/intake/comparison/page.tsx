@@ -1,5 +1,5 @@
 import Link from "next/link";
-import { comparisonSentinelsReady, readIntakeComparisonPanel } from "@/lib/sav/intake/comparison-operator";
+import { comparisonPhaseCanContinue, comparisonSentinelsReady, readIntakeComparisonPanel } from "@/lib/sav/intake/comparison-operator";
 import { ComparisonForm } from "./comparison-form";
 import styles from "../intake.module.css";
 export const dynamic = "force-dynamic";
@@ -16,8 +16,8 @@ export default async function ComparisonPage() {
         <p>Compté : {(report.spend.nanoUsd / 1e9).toFixed(4)} USD. Plafond total : {(report.spend.maxNanoUsd / 1e9).toFixed(2)} USD. Expiration : {report.until}.</p>
         <p>Les réservations incertaines restent comptées. Un résultat identique ne prouve pas à lui seul une bonne décision.</p>
       </section>
-      <ComparisonForm stage="sentinels" ready={true} complete={report.rows.slice(0, 10).every(r => r.state !== "pending")}/>
-      <ComparisonForm stage="remaining" ready={comparisonSentinelsReady(report)} complete={report.rows.slice(10).every(r => r.state !== "pending")}/>
+      <ComparisonForm stage="sentinels" ready={comparisonPhaseCanContinue(report, "sentinels")} complete={report.rows.slice(0, 10).every(r => r.state !== "pending")}/>
+      <ComparisonForm stage="remaining" ready={comparisonSentinelsReady(report) && comparisonPhaseCanContinue(report, "remaining")} complete={report.rows.slice(10).every(r => r.state !== "pending")}/>
       <details className={styles.choice}><summary>Résultats détaillés — administrateur</summary><pre>{JSON.stringify(report, null, 2)}</pre></details>
     </>}
   </div>;

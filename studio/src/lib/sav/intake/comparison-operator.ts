@@ -29,6 +29,14 @@ export function comparisonSentinelsReady(report: Report) {
     && report.rows.slice(0, 10).every(row => row.state === "done" && detailSchema.safeParse(row.detail).success
       && detailSchema.parse(row.detail).coverage.length === 0);
 }
+/** A lost response/unfinished claim or unusable simple result must not advance
+ * to a second dossier merely because its claim is already taken. */
+export function comparisonPhaseCanContinue(report: Report, stage: "sentinels" | "remaining") {
+  if (!report.configured) return false;
+  const rows = stage === "sentinels" ? report.rows.slice(0, 10) : report.rows.slice(10);
+  return rows.every(row => row.state === "pending" || row.state === "done" && detailSchema.safeParse(row.detail).success
+    && detailSchema.parse(row.detail).coverage.length === 0);
+}
 export async function readIntakeComparisonPanel() {
   await administrator();
   return readSavIntakeComparisonReport();
@@ -37,12 +45,21 @@ export async function readIntakeComparisonPanel() {
  * model, transport, money limit or live pipeline setting can enter this action. */
 export async function runIntakeComparisonOperator(raw: unknown, options: { env?: Environment; network?: typeof fetch } = {}) {
   const staff = await administrator(), input = command.parse(raw), env = options.env ?? (() => process.env), config = configured(env);
+  const report = await readSavIntakeComparisonReport(env);
   if (input.stage === "remaining") {
-    const report = await readSavIntakeComparisonReport(env);
     if (!input.reviewed || !comparisonSentinelsReady(report)) throw Error("SAV_INTAKE_COMPARISON_SENTINELS_REVIEW_REQUIRED");
   }
+  if (!comparisonPhaseCanContinue(report, input.stage)) throw Error("SAV_INTAKE_COMPARISON_PREVIOUS_RESULT_REVIEW_REQUIRED");
+  if (!report.configured) throw Error("SAV_INTAKE_COMPARISON_CONFIGURATION_REQUIRED");
+  const rows = input.stage === "sentinels" ? report.rows.slice(0, 10) : report.rows.slice(10);
+  const next = rows.find(row => row.state === "pending");
+  if (!next) return { campaignId: config.campaignId, compared: [] };
+  const allowed = input.stage === "sentinels" ? config.messageIds.slice(0, 10) : config.messageIds.slice(10);
+  if (!allowed.includes(next.messageId)) throw Error("SAV_INTAKE_COMPARISON_SCOPE_INVALID");
   const signature = JSON.stringify(config), scoped = { ...config,
-    messageIds: input.stage === "sentinels" ? config.messageIds.slice(0, 10) : config.messageIds.slice(10),
+    // Concurrent submissions select the SAME next ID. The durable claim lets only
+    // one run; the loser cannot silently pay for the following dossier.
+    messageIds: [next.messageId],
     maxNanoUsd: Math.min(config.maxNanoUsd, input.stage === "sentinels" ? 5_000_000_000 : 20_000_000_000) };
   if (!scoped.messageIds.length) throw Error("SAV_INTAKE_COMPARISON_SCOPE_INVALID");
   const scopedEnvironment = () => {

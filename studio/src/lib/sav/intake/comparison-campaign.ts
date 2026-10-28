@@ -11,7 +11,8 @@ import { SAV_AI_BUDGET, savAiCancellationCode, withSavAiBudget } from "../gemini
 import { planSavIntake } from "./engine";
 import type { EnginePolicy, IntakePlan, ReadResult } from "./engine-types";
 import { createSavIntakeHubspotReaders, type SavIntakeCrmReaders } from "./hubspot-readers";
-import { createIntakeModelDispatcher } from "./model-dispatch";
+import { createIntakeModelDispatcher, type IntakeDispatchDiagnostic } from "./model-dispatch";
+import { comparisonValidationDiagnostics } from "./comparison-diagnostics";
 import { createSavIntakeSemanticReaders, type IntakeModelTrace } from "./model-readers";
 import { savIntakeRuntimeConfig, type IntakeRuntimeConfig } from "./runtime-contract";
 import { savIntakeSourceSnapshot } from "./runtime-store";
@@ -23,7 +24,7 @@ import { createSavIntakeSimpleReaders, readIntakeSimpleContext } from "./simple-
  * stored dossiers. It never runs on the live mail path: an administrator launches small batches.
  * Read-only CRM, no executor, no live ledger, attempts, runs or call policy. Its own caps and its
  * own append-only ledger (audit events). OFF unless SAV_INTAKE_COMPARISON_JSON is configured. */
-export const SAV_INTAKE_COMPARISON_REVISION = "sav-intake-comparison-2026-10-26.v2";
+export const SAV_INTAKE_COMPARISON_REVISION = "sav-intake-comparison-2026-10-28.v3";
 const campaignSchema = z.object({ campaignId: z.string().regex(/^[a-z0-9-]{1,64}$/), messageIds: z.array(z.uuid()).min(1).max(100),
   maxNanoUsd: z.number().int().min(1).max(50_000_000_000), until: z.iso.datetime() }).strict()
   .refine(c => new Set(c.messageIds).size === c.messageIds.length, "duplicate message");
@@ -150,7 +151,8 @@ export function intakePlanSummary(plan?: IntakePlan) {
     newTicketTitle: plan.newTicket?.title ?? null };
 }
 type Summary = NonNullable<ReturnType<typeof intakePlanSummary>>;
-type Side = { summary: Summary | null; technical: string | null; uncertain: boolean; calls: number };
+type Side = { summary: Summary | null; technical: string | null; uncertain: boolean; calls: number;
+  diagnostics?: { requests: IntakeDispatchDiagnostic[]; failures: ReturnType<typeof comparisonValidationDiagnostics>; dispatches: number; httpResponses: number } };
 /** Judgement is compared only when both sides worked on the same complete input; a technical
  * failure of either side is technical evidence, never a divergence of judgement. */
 export function compareIntakeSides(current: Side, simple: Side, coverage: readonly string[]) {
@@ -193,6 +195,7 @@ async function compareOne(messageId: string, claimId: string, campaign: SavIntak
   const side = async (kind: "current" | "simple"): Promise<Side> => {
     const traces: IntakeModelTrace[] = [], controller = new AbortController(), timer = setTimeout(() => controller.abort(Error("SAV_INTAKE_COMPARISON_DEADLINE")), SAV_AI_BUDGET.durationMs);
     const dispatcher = createIntakeModelDispatcher({ config: runtime, signal: controller.signal, env, network,
+      captureDiagnostics: true, ...(kind === "simple" ? { generationBudget: "single_pass" as const } : {}),
       live: async () => { if (controller.signal.aborted) throw Error("SAV_INTAKE_COMPARISON_DEADLINE"); if (!savIntakeComparisonConfig(env())) throw Error("SAV_INTAKE_COMPARISON_EXPIRED"); },
       reserve: hash => reserveSavIntakeComparisonCall(env, campaign.campaignId, messageId, claimId, hash, runtime.model, controller.signal), settle: settleSavIntakeComparisonCall(campaign.campaignId),
       preflight: hashes => assertSavIntakeComparisonPlan(env, campaign.campaignId, messageId, hashes, runtime.model, controller.signal) });
@@ -205,7 +208,10 @@ async function compareOne(messageId: string, claimId: string, campaign: SavIntak
     finally { try { await Promise.allSettled(dispatcher.pending); } finally { clearTimeout(timer); } }
     technical ??= savAiCancellationCode(controller.signal);
     technical ??= dispatcher.failureReason ?? traces.find(t => !t.accepted && t.errorCode)?.errorCode ?? null;
-    return { summary: technical ? null : intakePlanSummary(plan), technical, uncertain: dispatcher.uncertain, calls: traces.filter(t => t.metadata).length };
+    return { summary: technical ? null : intakePlanSummary(plan), technical, uncertain: dispatcher.uncertain, calls: traces.filter(t => t.metadata).length,
+      diagnostics: { requests: dispatcher.diagnostics, failures: comparisonValidationDiagnostics(traces),
+        dispatches: dispatcher.diagnostics.filter(d => d.dispatched).length,
+        httpResponses: dispatcher.diagnostics.filter(d => d.httpStatus !== null).length } };
   };
   const current = await side("current"), simple = await side("simple");
   coverage.push(...[...crm.misses].map(key => `crm_not_captured:${key.split(":")[0]}`), ...await crm.failedUsed());

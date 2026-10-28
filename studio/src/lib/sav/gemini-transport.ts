@@ -118,10 +118,14 @@ export async function requestSavGeminiJson(input: {
   phase: SavAiPhase; apiKey: string; model: string; body: { generationConfig: Record<string, unknown>; [key: string]: unknown };
   fetch?: typeof fetch; allowRetry?: boolean; promptRevision?: string; derivedReservationId?: string; signal?: AbortSignal;
   media?: readonly SavAdmittedImage[];
+  /** A single non-visual decision may use the existing shared AI allowance once.
+   * Opt-in by a trusted caller, no retry, never a new/global timeout allowance. */
+  generationBudget?: "single_pass";
 }): Promise<{ json: unknown; metadata: SavGeminiMetadata }> {
   if (!budgets.getStore()) return withSavAiBudget(() => requestSavGeminiJson(input));
   const budget = budgets.getStore()!;
-  const started = Date.now(), deadline = started + PHASE_MS;
+  const singlePass = input.generationBudget === "single_pass";
+  const started = Date.now(), deadline = started + (singlePass ? SAV_AI_BUDGET.durationMs : PHASE_MS);
   let attempts = 0, metadata: SavGeminiMetadata = {};
   const trace = (code: string | null): SavAiTransportTrace => ({ transportRevision: SAV_AI_TRANSPORT_REVISION, correlationId: budget.id, phase: input.phase, model: /^[a-zA-Z0-9._-]{1,120}$/.test(input.model) ? input.model : "invalid", promptRevision: input.promptRevision ?? SAV_AI_TRANSPORT_REVISION,
     attempts, retries: Math.max(0, attempts - 1), durationMs: Date.now() - started, errorCode: code, failureCategory: code ? category(code) : null });
@@ -130,6 +134,8 @@ export async function requestSavGeminiJson(input: {
     console.warn("sav_ai_transport", { ...savRunProvenance(), ...metadata.transport, ...metadata, transport: undefined });
     throw new SavAiTransportError(code, metadata);
   };
+  if (input.generationBudget !== undefined && (!singlePass || input.allowRetry !== false || input.media
+    || !["understanding", "ticket_matching"].includes(input.phase))) return fail("SAV_AI_BUDGET_EXCEEDED");
   const cancelled = savAiCancellationCode(input.signal);
   if (cancelled) return fail(cancelled);
   if (input.phase === "repair") {
@@ -164,7 +170,7 @@ export async function requestSavGeminiJson(input: {
     const controller = new AbortController();
     // Reserve time before awaiting so concurrent phases cannot spend it twice.
     // A large text has no room for a retry anyway: give its single attempt the whole phase.
-    const attemptMs = Math.min(remaining, visual ? SAV_ATTACHMENT_LIMITS.readMs : textBytes > LARGE_TEXT_BYTES ? PHASE_MS : ATTEMPT_MS), attemptStarted = Date.now();
+    const attemptMs = Math.min(remaining, singlePass ? remaining : visual ? SAV_ATTACHMENT_LIMITS.readMs : textBytes > LARGE_TEXT_BYTES ? PHASE_MS : ATTEMPT_MS), attemptStarted = Date.now();
     budget.reservedMs += attemptMs;
     const timer = setTimeout(() => controller.abort(), attemptMs);
     let code = "SAV_AI_GENERATION_FAILED", retryAfter = 0;
