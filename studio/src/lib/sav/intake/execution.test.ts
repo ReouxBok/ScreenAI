@@ -819,7 +819,7 @@ it.each([
     expect(p.calls.filter(c => c.method === "PATCH")).toHaveLength(1);
     expect(p.calls.filter(c => c.method === "POST" && c.path.endsWith("/tickets"))).toHaveLength(0);
 });
-it.each(["disappeared", "human_closed"] as const)("review735 linked ticket %s after PATCH: only a target that disappeared stops", async (change) => {
+it.each(["disappeared", "human_closed"] as const)("review735 linked ticket %s after PATCH: only a target out of the contacts' tickets stops", async (change) => {
     linkedContactTicket("open");
     const row = await admission(), verify = options.adapters.verify;
     options.adapters.verify = async (...args) => {
@@ -836,7 +836,7 @@ it.each(["disappeared", "human_closed"] as const)("review735 linked ticket %s af
     expect((await getExecutionEffects(row.id)).find(e => e.kind === "stage_new")?.state).toBe("confirmed");
     if (change === "disappeared") {
         expect((await f.db.select().from(savThreads).where(eq(savThreads.id, threadId)))[0].hubspotTicketId).toBeNull();
-        expect((await readIntakeExecutionProgress(messageId))?.crmDelta).toMatchObject({ reason: "target_missing", ticketIds: ["201"] });
+        expect((await readIntakeExecutionProgress(messageId))?.crmDelta).toMatchObject({ reason: "target_out_of_scope", ticketIds: ["201"], fields: ["tickets", "ticket.out_of_scope"] });
     }
 });
 it("review735 confirmed history stays confirmed when a new entrant is admitted", async () => {
@@ -1333,8 +1333,16 @@ it("SAV-45 A: a first-check description change names ticket.content from the ana
     expect(await getExecutionEffects(row.id)).toHaveLength(0);
     expect((await readIntakeExecutionProgress(messageId))?.crmDelta).toMatchObject({ stage: "original", reason: "original_evidence_changed", classification: "business_change", fieldsKnown: true,
         ticketIds: ["201"], fields: expect.arrayContaining(["ticket.content", "tickets"]), evidence: expect.arrayContaining([{ id: "ticket-201", category: "ticket", state: "changed" }]) });
-    // The owner change alone does not alter the choice: with the description restored, the dossier proceeds.
+    // The decision now belongs to a person: restoring the description does not lift it (review P1).
     p.objects.tickets["201"].properties.content = "Synthetic full request";
+    expect(await executeIntakePass(row.id, options)).toMatchObject({ skipped: "crm_review_required" });
+    expect(await getExecutionEffects(row.id)).toHaveLength(0);
+});
+it("SAV-45 D1: an owner change alone does not alter the choice; it is traced and the dossier proceeds", async () => {
+    p.seedTicket({ stage: "open" });
+    runId = await observedRecorded();
+    const row = (await admitIntakeExecution(runId, options))!;
+    p.objects.tickets["201"].properties.hubspot_owner_id = "999";
     expect(await executeIntakePass(row.id, options)).toMatchObject({ state: "confirmed" });
     expect((await f.db.select().from(savIntakeEffectJournal).where(eq(savIntakeEffectJournal.executionId, row.id))).some(j => j.kind === "crm_change_ignored")).toBe(true);
 });
@@ -1416,9 +1424,14 @@ it.each(shapes)("SAV-45 B: $name — the same execution resumes without replayin
     const before = await getExecutionEffects(row.id), progress = await readIntakeExecutionProgress(messageId);
     expect(progress?.crmRecheck).toMatchObject({ attempts: 1, humanRequired: false, cause: "read_incomplete" });
     expect(before.every(e => ["planned", "confirmed"].includes(e.state))).toBe(true);
+    // Before the due date, a direct pass (wake or cron alike) is refused at the claim.
+    expect(await executeIntakePass(row.id, options)).toMatchObject({ skipped: "crm_recheck_pending" });
+    expect(await getExecutionEffects(row.id)).toEqual(before);
+    await age(row.id, 61_000);
+    const aged = await getExecutionEffects(row.id);
     expect(await executeIntakePass(row.id, options)).toMatchObject({ state: "confirmed" });
     const after = await getExecutionEffects(row.id);
-    for (const old of before.filter(e => e.state === "confirmed")) expect(after.find(e => e.id === old.id)).toEqual(old);
+    for (const old of aged.filter(e => e.state === "confirmed")) expect(after.find(e => e.id === old.id)).toEqual(old);
     expect(after.every(e => e.state === "confirmed")).toBe(true);
     // Each provider write happened once: no POST/PUT/PATCH of a confirmed effect is replayed.
     expect(new Set(providerWrites()).size).toBe(providerWrites().length);
@@ -1488,6 +1501,7 @@ it("SAV-45 B: progress opens a new episode — the recheck count restarts after 
     await executeIntakePass(row.id, options);
     expect((await readIntakeExecutionProgress(messageId))?.crmRecheck).toMatchObject({ attempts: 1 });
     cutReadOnce(row.id, c => c.join() === "note_create");
+    await age(row.id, 61_000);
     await executeIntakePass(row.id, options);
     expect((await getExecutionEffects(row.id)).filter(e => e.state === "confirmed").map(e => e.kind)).toEqual(["note_create"]);
     expect((await readIntakeExecutionProgress(messageId))?.crmRecheck).toMatchObject({ attempts: 1, humanRequired: false });
@@ -1532,4 +1546,76 @@ it("SAV-45 C: with nothing holding it, the same scan binds the follow-up and the
     expect((await readIntakeRunDiagnostics(threadId))?.execution?.followup).toMatchObject({ bound: false, blocker: "scan_pending" });
     expect(await ensureIntakeObservations()).toMatchObject({ created: 1 });
     expect((await readIntakeRunDiagnostics(threadId))?.execution?.followup).toMatchObject({ bound: true, observationState: "pending_first_sync" });
+});
+
+// Independent review probes for SAV-45, synthetic database/provider only.
+import { executeSavIntakeWake as reviewExecuteWake } from "./event-pipeline";
+it("REVIEW45 wake honors a scheduled CRM recheck before acquiring the execution", async () => {
+    const row = await admission();
+    let reads = 0;
+    options.adapters.readCrm = async () => { reads++; throw Error("SAV_INTAKE_EXECUTION_CRM_READ_UNAVAILABLE"); };
+    expect(await executeIntakePass(row.id, options)).toMatchObject({state:"waiting"});
+    expect((await readIntakeExecutionProgress(messageId))?.crmRecheck).toMatchObject({attempts:1,humanRequired:false});
+    expect(reads).toBe(1);
+    environment.SAV_INTAKE_EVENT_DISPATCH = "on";
+    await reviewExecuteWake(runId, { env:()=>environment, adapters: options.adapters });
+    // A fresh wake is merely a hint; it cannot move a durable due date forward.
+    expect(reads).toBe(1);
+    expect((await readIntakeExecutionProgress(messageId))?.crmRecheck?.attempts).toBe(1);
+});
+it("REVIEW45 wake does not bypass an explicit CRM human-decision hold", async () => {
+    p.seedTicket({stage:"open"});
+    runId = await observedRecorded();
+    const row = (await admitIntakeExecution(runId, options))!;
+    const content = p.objects.tickets["201"].properties.content;
+    p.objects.tickets["201"].properties.content = "Synthetic different choice";
+    expect(await executeIntakePass(row.id, options)).toMatchObject({state:"waiting",reason:"SAV_INTAKE_EXECUTION_CRM_CHANGED"});
+    expect((await readIntakeExecutionProgress(messageId))?.crmRecheck).toMatchObject({humanRequired:true});
+    p.objects.tickets["201"].properties.content = content;
+    environment.SAV_INTAKE_EVENT_DISPATCH = "on";
+    await reviewExecuteWake(runId,{env:()=>environment,adapters:options.adapters});
+    // No new analysis or human approval occurred after the review-required marker.
+    expect(providerWrites()).toHaveLength(0);
+    expect((await readIntakeExecutionProgress(messageId))?.state).toBe("waiting");
+});
+
+// ---- SAV-45 E: witnesses of the claim gate (review P1). Same real engine, executor and provider.
+it("SAV-45 E: once the recheck is due, a wake rereads the CRM and the dossier proceeds", async () => {
+    const row = await admission();
+    let reads = 0;
+    const readCrm = options.adapters.readCrm;
+    options.adapters.readCrm = async (...args) => { if (++reads === 1) throw Error("SAV_INTAKE_EXECUTION_CRM_READ_UNAVAILABLE"); return readCrm(...args); };
+    expect(await executeIntakePass(row.id, options)).toMatchObject({ state: "waiting" });
+    await age(row.id, 61_000);
+    environment.SAV_INTAKE_EVENT_DISPATCH = "on";
+    await reviewExecuteWake(runId, { env: () => environment, adapters: options.adapters });
+    expect(reads).toBeGreaterThan(1);
+    expect((await readIntakeExecutionProgress(messageId))?.state).toBe("confirmed");
+});
+it("SAV-45 E: only a newer analysis lifts a human hold, through the wake as through the cron", async () => {
+    p.seedTicket({ stage: "open" });
+    runId = await observedRecorded();
+    const row = (await admitIntakeExecution(runId, options))!;
+    p.objects.tickets["201"].properties.content = "Description changed by the team";
+    expect(await executeIntakePass(row.id, options)).toMatchObject({ state: "waiting", reason: "SAV_INTAKE_EXECUTION_CRM_CHANGED" });
+    await age(row.id, 24 * 3_600_000);
+    expect(await executeIntakePass(row.id, options)).toMatchObject({ skipped: "crm_review_required" });
+    expect(providerWrites()).toHaveLength(0);
+    await f.client.exec(`UPDATE sav.intake_runs SET is_current=false WHERE id='${runId}'`);
+    await f.db.insert(savIntakeRuns).values({ threadId, messageId, version: 2, attempts: 0, isCurrent: true, state: "pending", configHash: "d".repeat(64), policyHash: options.runtime.policyHash, payloadCiphertext: encryptSavPayload({}) });
+    // The claim now passes; the executor's own version checks decide what follows, unchanged.
+    const pass = await executeIntakePass(row.id, options) as { skipped?: string };
+    expect(pass.skipped).toBeUndefined();
+    expect((await f.db.select().from(savIntakeEffectJournal).where(eq(savIntakeEffectJournal.executionId, row.id))).filter(j => j.kind === "admitted")).toHaveLength(1);
+});
+it("SAV-45 E: read-only recovery of an uncertain effect is not held by a CRM decision and never dispatches", async () => {
+    const row = await admission(), dispatch = options.adapters.dispatch;
+    options.adapters.dispatch = async (...args) => { await dispatch(...args); throw Error("LOST_ACK"); };
+    expect(await executeIntakePass(row.id, options)).toMatchObject({ state: "uncertain" });
+    await f.db.insert(savIntakeEffectJournal).values({ executionId: row.id, kind: "crm_review_required", payloadCiphertext: encryptSavPayload({ synthetic: true }) });
+    await f.db.update(savIntakeEffects).set({ nextReconcileAt: null }).where(eq(savIntakeEffects.executionId, row.id));
+    options.adapters.dispatch = async () => { throw Error("DISPATCH_FORBIDDEN_IN_RECOVERY"); };
+    await reconcileIntakeEffectsReadOnly(row.id, options.adapters);
+    expect((await getExecutionEffects(row.id))[0].state).toBe("confirmed");
+    expect(p.calls.filter(c => c.method === "POST" && c.path.endsWith("/tickets"))).toHaveLength(1);
 });

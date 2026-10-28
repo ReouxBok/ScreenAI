@@ -32,7 +32,7 @@ it("recognizes a native source copy by transport id AND full envelope/content",a
  f.row.properties.hs_email_headers=JSON.stringify({messageId:"<different@example.invalid>"});expect(await qualifyCrmHistoryAdditions(f.baseline,f.current,source,options)).toHaveLength(0);
 });
 // Choice rule (Ugo, 27/10): once an effect is confirmed the remaining actions finish on the same
-// target whatever else changed; only a target that disappeared stops them.
+// target whatever else changed; only a target no longer among the contacts' tickets stops them (deleted, merged or moved: not told apart).
 it.each(["human_email","owner","stage","contact","existing_note"])("after a confirmed effect, a %s change no longer stops the remaining actions",kind=>{
  const f=fixture();
  if(kind==="human_email")f.current.histories["201"].push({...f.event,id:"emails:302",text:JSON.stringify({...JSON.parse(f.event.text),body:"New human question"})});
@@ -42,7 +42,7 @@ it.each(["human_email","owner","stage","contact","existing_note"])("after a conf
  if(kind==="existing_note")f.current.histories["201"].push({...f.event,id:"notes:901",kind:"note",text:"Human edit"});
  expect(()=>assertExecutionCrmUnchanged(f.baseline,f.current,[f.effect],{nextKind:"stage_new",targetTicketId:"201"})).not.toThrow();
 });
-it("after a confirmed effect, a target that disappeared stops the remaining actions",()=>{
+it("after a confirmed effect, a target no longer among the contacts' tickets stops the remaining actions",()=>{
  const f=fixture();f.current.tickets["101"]=[];
  expect(()=>assertExecutionCrmUnchanged(f.baseline,f.current,[f.effect],{nextKind:"stage_new",targetTicketId:"201"})).toThrow("CRM_CHANGED");
 });

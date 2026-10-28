@@ -17,7 +17,7 @@ import { createIntakeExecutorAdapters, renderIntakeNote } from "./execution-adap
 import { assertOriginalExecutionCrm, assertExecutionCrmUnchanged, IntakeCrmDeltaError, publicIntakeCrmDelta } from "./execution-context";
 import { publicCrmRecheck } from "./execution-diagnostic";
 import { crmRecheckDecision } from "./crm-recheck";
-import { crmRecheckDueSql, admitIntakeExecution, claimExecution, claimEffectRecovery, withEffectRecoveryLease, releaseEffectRecovery, activeExecutionEffects, adoptCurrentExecutionVersion, assertExecutionLocal, saveExecutionPayload, expandExecutionScope, getExecutionEffects, ensureExecutionEffect, markEffectDispatched, withdrawUndispatchedEffect, recordEffectAck, confirmExecutionEffect, deferExecutionEffect, endExecutionPass, identityEpisodeEffect, finishExecution, executionJournal, releaseRecoveredExecutionScope, occupationSchemaInstalled, type ExecutionLease, type ExecutionTx } from "./execution-store";
+import { crmRecheckDueSql, admitIntakeExecution, claimExecutionOrBlock, claimEffectRecovery, withEffectRecoveryLease, releaseEffectRecovery, activeExecutionEffects, adoptCurrentExecutionVersion, assertExecutionLocal, saveExecutionPayload, expandExecutionScope, getExecutionEffects, ensureExecutionEffect, markEffectDispatched, withdrawUndispatchedEffect, recordEffectAck, confirmExecutionEffect, deferExecutionEffect, endExecutionPass, identityEpisodeEffect, finishExecution, executionJournal, releaseRecoveredExecutionScope, occupationSchemaInstalled, type ExecutionLease, type ExecutionTx } from "./execution-store";
 import type { Effect, EffectIntent, EffectAck, ExecutorAdapters, ExecutionOptions, ExecutionPayload, EffectKind } from "./execution-types";
 const fault = (code: string): never => { throw Error(`SAV_INTAKE_EXECUTION_${code}`); };
 const pauseCodes: ReadonlySet<string> = new Set(Object.values(SAV_AGENT_PAUSE_CODES));
@@ -239,11 +239,12 @@ export async function executeIntakePass(executionId: string, options: ExecutionO
         return {
             skipped: paused
         };
-    const lease = await claimExecution(executionId);
-    if (!lease)
+    const claim = await claimExecutionOrBlock(executionId);
+    if ("blocked" in claim)
         return {
-            skipped: "occupied"
+            skipped: claim.blocked
         };
+    const lease = claim.lease;
     let current: Effect | undefined;
     try {
         await adoptCurrentExecutionVersion(lease, options);

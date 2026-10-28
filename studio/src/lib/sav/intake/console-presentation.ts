@@ -36,6 +36,8 @@ const crmClasses: Record<string, string> = {
 const crmReasons: Record<string, string> = {
   original_evidence_changed: "au premier contrôle, avant toute action", owned_effect_changed: "sur une action déjà confirmée par Studio",
   added_history_event: "nouvel événement dans l’historique du ticket", unrecognized_added_email: "avant la remise en Nouveau", snapshot_changed: "pendant la poursuite",
+  choice_changed: "avant toute action, sur un élément du choix (fiche, ticket, étape, sujet ou description)",
+  target_out_of_scope: "après une action confirmée : le ticket cible n’apparaît plus parmi les tickets des contacts relus (supprimé, fusionné ou rattaché à une autre fiche, non distingués)",
 };
 const nextSteps: Record<string, string> = {
   none: "aucune", read_only_verification: "vérification en lecture seule du résultat déjà envoyé, sans nouvel envoi",

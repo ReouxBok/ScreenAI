@@ -103,7 +103,7 @@ export function assertOriginalExecutionCrm(plan: IntakePlan, s: CrmSnapshot, ori
 /** Choice rule (Ugo, 27/10): only a change that can alter the choice of customer or ticket
  * matters. History (notes, emails, HubSpot's own logging) and the owner never do. */
 export type ExecutionContinuation = { finalizing?: boolean; nextKind?: EffectIntent["kind"]; targetTicketId?: string | null };
-export const CRM_DELTA_REASONS = ["unrecognized_added_email", "snapshot_changed", "original_evidence_changed", "owned_effect_changed", "added_history_event", "choice_changed", "target_missing"] as const;
+export const CRM_DELTA_REASONS = ["unrecognized_added_email", "snapshot_changed", "original_evidence_changed", "owned_effect_changed", "added_history_event", "choice_changed", "target_out_of_scope"] as const;
 /** business_change: a fact the choice relies on moved. unattributed_email: only emails were
  * added (stored diagnostics of earlier versions). unknown: the detail is not available. */
 export type CrmDeltaClass = "business_change" | "unattributed_email" | "unknown";
@@ -130,15 +130,17 @@ export function crmChoiceView(s: CrmSnapshot) {
 }
 export type CrmIgnoredChange = { fields: string[]; ticketIds: string[]; eventIds: string[] };
 /** After a confirmed effect the choice is executed: the remaining actions finish on the same
- * target whatever else changed (Ugo, 27/10), unless the target itself is gone. Before, only
- * a choice change refuses. Everything else is returned to be traced. */
+ * target whatever else changed (Ugo, 27/10), unless the target is no longer among the
+ * tickets of the contacts read. That is all this read proves: deleted, merged or moved to
+ * another customer are not told apart, and none of them may receive this customer's mail.
+ * Before any confirmed effect, only a choice change refuses. Everything else is traced. */
 export function assertExecutionCrmUnchanged(baseline: CrmSnapshot, current: CrmSnapshot, effects: Effect[], continuation: ExecutionContinuation = {}): CrmIgnoredChange[] {
     const delta = snapshotDelta(baseline, current), hashes = { baselineHash: savIntakeEvidenceContentHash(baseline), currentHash: savIntakeEvidenceContentHash(current) };
     const stage = continuation.nextKind ?? "finalizing", committed = effects.some(e => e.state === "confirmed");
     if (committed) {
         const target = continuation.targetTicketId;
         if (target && !Object.values(current.tickets).flat().some(t => t.id === target))
-            throw new IntakeCrmDeltaError(withClass({ stage, reason: "target_missing", ticketIds: crmIds([target], /^\d{1,30}$/), eventIds: [], fields: ["tickets", "ticket.missing"], ...hashes }));
+            throw new IntakeCrmDeltaError(withClass({ stage, reason: "target_out_of_scope", ticketIds: crmIds([target], /^\d{1,30}$/), eventIds: [], fields: ["tickets", "ticket.out_of_scope"], ...hashes }));
     } else if (savIntakeCanonicalEvidence(crmChoiceView(baseline)) !== savIntakeCanonicalEvidence(crmChoiceView(current))) {
         const fields = delta.fields.filter(f => !crmChoiceIrrelevant(f));
         throw new IntakeCrmDeltaError(withClass({ stage, reason: "choice_changed", ticketIds: delta.ticketIds, eventIds: [], fields: fields.length ? fields : ["tickets"], fieldsKnown: true, ...hashes }));
@@ -172,7 +174,7 @@ function snapshotDelta(baseline: CrmSnapshot, clean: CrmSnapshot) {
 }
 
 const PUBLIC_DELTA_STAGES = ["original", "stage_new", "ticket_create", "note_create", "note_associate", "email_create", "email_associate", "identity_send", "finalizing"];
-const PUBLIC_DELTA_FIELD = /^(?:address|lookup|contacts|associations|tickets|histories|lookup\.(?:address|contacts)|contact\.(?:id|emails|missing)|ticket\.(?:id|ownerId|stage|contactIds|subject|content|createdAt|closedAt|added|removed|missing|membership|receipt_missing)|history\.(?:id|kind|at|text|added_email|added_note|removed|missing|receipt_missing)|(?:associations|association|tickets|ticket_list|histories|history|contacts|contact|lookup)\.missing)$/;
+const PUBLIC_DELTA_FIELD = /^(?:address|lookup|contacts|associations|tickets|histories|lookup\.(?:address|contacts)|contact\.(?:id|emails|missing)|ticket\.(?:id|ownerId|stage|contactIds|subject|content|createdAt|closedAt|added|removed|missing|out_of_scope|membership|receipt_missing)|history\.(?:id|kind|at|text|added_email|added_note|removed|missing|receipt_missing)|(?:associations|association|tickets|ticket_list|histories|history|contacts|contact|lookup)\.missing)$/;
 const PUBLIC_EVIDENCE_ID = /^(?:email-lookup|association-search|(?:contact|ticket|history|identity-ticket|identity-history|ticket-search|identity-search|association)-\d{1,30})$/;
 /** Allow-listed projection for admin DTOs: codes, numeric CRM ids, field names and
  * digests only. Older stored diagnostics (two reasons, no class) stay readable. */

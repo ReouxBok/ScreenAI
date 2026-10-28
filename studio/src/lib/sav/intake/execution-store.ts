@@ -238,25 +238,40 @@ export async function admitIntakeExecution(runId: string, options: ExecutionOpti
         return execution;
     });
 }
-export async function claimExecution(id: string, now = new Date()) {
-    return requireDb().transaction(async (tx) => {
+export type ExecutionClaimBlock = "occupied" | "crm_recheck_pending" | "crm_review_required";
+/** The one claim every continuation goes through (cron selector, Workflow wake, tests).
+ * A waiting execution under a CRM schedule is claimed only when the durable journal says
+ * it is due, checked under the admission lock with the selector's own SQL: a wake is a
+ * hint and cannot advance a recheck or lift a required human decision. Effect recovery
+ * keeps its own read-only lease (claimEffectRecovery) and is not gated here. */
+export async function claimExecutionOrBlock(id: string, now = new Date()) {
+    return requireDb().transaction(async (tx): Promise<{ lease: ExecutionLease } | { blocked: ExecutionClaimBlock }> => {
         await admissionLock(tx);
         const [row] = await tx.select().from(savIntakeExecutions).where(eq(savIntakeExecutions.id, id)).for("update");
         if (!row || row.state === "confirmed" || row.state === "refused" || row.leaseUntil && row.leaseUntil > now)
-            return null;
+            return { blocked: "occupied" };
         const payload = decryptSavPayload<ExecutionPayload>(row.payloadCiphertext);
+        if (row.state === "waiting") {
+            const [schedule] = await tx.select({ due: sql<boolean>`${crmRecheckDueSql(sql`${savIntakeExecutions.id}`, sql`${savIntakeExecutions.messageId}`)}` })
+                .from(savIntakeExecutions).where(eq(savIntakeExecutions.id, row.id));
+            if (!schedule?.due) return { blocked: payload.crmRecheck?.humanRequired === false ? "crm_recheck_pending" : "crm_review_required" };
+        }
         await assertNoLegacyConflict(tx, payload.keys);
         await occupyKeys(tx, row.id, "intake", payload.keys);
         const token = randomUUID();
         const [claimed] = await tx.update(savIntakeExecutions).set({
             leaseToken: token, leaseUntil: new Date(now.getTime() + 80000), state: "running", updatedAt: now
         }).where(eq(savIntakeExecutions.id, id)).returning();
-        return {
+        return { lease: {
             row: claimed, token, payload: decryptSavPayload<ExecutionPayload>(claimed.payloadCiphertext)
-        };
+        } };
     });
 }
-export type ExecutionLease = NonNullable<Awaited<ReturnType<typeof claimExecution>>>;
+export async function claimExecution(id: string, now = new Date()) {
+    const claim = await claimExecutionOrBlock(id, now);
+    return "lease" in claim ? claim.lease : null;
+}
+export type ExecutionLease = { row: typeof savIntakeExecutions.$inferSelect; token: string; payload: ExecutionPayload };
 export type EffectRecoveryLease = { executionId: string; token: string };
 /** Reserve the existing execution lease without changing its business state.
  * No admission lock is held across a provider read. The same token is checked

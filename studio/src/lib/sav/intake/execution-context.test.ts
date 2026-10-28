@@ -1,6 +1,7 @@
 import { beforeEach, expect, it, vi } from "vitest";
 import { encryptSavPayload } from "../crypto";
-import { assertExecutionCrmUnchanged } from "./execution-context";
+import { assertExecutionCrmUnchanged, publicIntakeCrmDelta, type IntakeCrmDeltaError } from "./execution-context";
+import { intakeCrmDeltaLabel } from "./console-presentation";
 import type { CrmSnapshot, Effect, EffectIntent } from "./execution-types";
 
 const ticket = { id: "201", contactIds: ["101"], stage: "new" as const, createdAt: "2026-10-24T10:00:00.000Z", ownerId: null, subject: "Synthetic issue", content: "Synthetic request." };
@@ -66,7 +67,14 @@ it.each(["owner", "stage", "contact", "content", "deleted_history", "concurrent_
   if (change === "concurrent_note") current.histories["201"].push({ ...email, id: "notes:9", kind: "note" });
   expect(assertExecutionCrmUnchanged(baseline, current, [effect("email_associate", { observedHistory: email })], { finalizing: true, targetTicketId: "201" })).toHaveLength(1);
 });
-it("after a confirmed effect, a target that disappeared stops the remaining actions", () => {
+it("after a confirmed effect, a target no longer among the contacts' tickets stops the remaining actions", () => {
   const baseline = snapshot(), current = copy(baseline); current.tickets["101"] = [];
-  expect(() => assertExecutionCrmUnchanged(baseline, current, [effect("email_associate", { observedHistory: email })], { finalizing: true, targetTicketId: "201" })).toThrow("CRM_CHANGED");
+  let diagnostic: unknown;
+  try { assertExecutionCrmUnchanged(baseline, current, [effect("email_associate", { observedHistory: email })], { finalizing: true, targetTicketId: "201" }); }
+  catch (error) { diagnostic = (error as IntakeCrmDeltaError).diagnostic; }
+  // Named for what the read proves: absent from the contacts' tickets, not a HubSpot deletion.
+  expect(diagnostic).toMatchObject({ reason: "target_out_of_scope", fields: ["tickets", "ticket.out_of_scope"], ticketIds: ["201"] });
+  const label = intakeCrmDeltaLabel(publicIntakeCrmDelta(diagnostic as IntakeCrmDeltaError["diagnostic"]));
+  expect(label).toMatch(/n’apparaît plus parmi les tickets des contacts relus/);
+  expect(label).not.toMatch(/supprimé dans HubSpot/);
 });
