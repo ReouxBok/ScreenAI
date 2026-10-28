@@ -1515,3 +1515,121 @@ it("REVIEW invalid-source classification is refused when the same message become
     expect(mutationsSent()).toHaveLength(0);
   } finally { spy.mockRestore(); }
 });
+
+import { classifyValidSourceAsOther, readManualOtherBinding } from "./manual-other-classification";
+describe("manual Other on a valid source without an AI verdict", () => {
+  async function pendingOther() {
+    vi.stubEnv("SAV_RELEASE_STAGE", "v0"); vi.stubEnv("SAV_PILOT_MODE", "false");
+    await activateSavV0Cutover({receivedAfter:new Date(Date.now()-3600000).toISOString(),mailboxEmail:"support@example.invalid",intakeRecipient:"contact@limova.ai",deploymentSha:"a".repeat(40),activatedBy:"ugo@limova.ai"});
+    await recordIntakeLaunch({mailboxId,receivedAfter:options.runtime.receivedAfter,createdAfter:options.runtime.createdAfter});
+    runId = (await enqueueSavIntakeMessage(messageId, options.runtime))!;
+    await projectIntakeThread(threadId);
+    const [projection] = await db.db.select().from(savIntakeConsole).where(eq(savIntakeConsole.threadId, threadId));
+    const binding = await readManualOtherBinding(threadId, messageId, projection.epoch);
+    expect(binding).not.toBeNull();
+    return {...binding!,requestKey:randomUUID(),confirmed:true as const,reason:"Réponse automatique synthétique sans demande client."};
+  }
+  const markers = () => db.db.select().from(auditLogs).where(eq(auditLogs.action, SAV_EXTERNAL_COMPLETION));
+  it("classifies a pending valid source once, audited, without AI, CRM, Gmail or changing its run", async () => {
+    const input = await pendingOther();
+    const before = (await db.db.select().from(savIntakeRuns))[0];
+    expect(before.sourceHash).toBeNull();
+    expect(await classifyValidSourceAsOther(input)).toMatchObject({marked:1,alreadyCompleted:0});
+    expect(await classifyValidSourceAsOther(input)).toMatchObject({marked:0,alreadyCompleted:1});
+    const audits = await markers(); expect(audits).toHaveLength(1);
+    expect(audits[0].technicalMetadata).toMatchObject({disposition:"other",manualOtherRevision:"sav-intake-manual-other.v1",manualOtherRunId:runId,manualOtherRunVersion:1,manualOtherSourceHash:input.sourceHash});
+    const proof = audits[0].technicalMetadata.manualOtherReasonCiphertext;
+    expect(decryptSavPayload(String(proof))).toEqual({reason:input.reason,confirmed:true});
+    expect(JSON.stringify(audits)).not.toContain(input.reason);
+    expect((await listIntakeConsole({view:"other"})).rows.map(row=>row.threadId)).toEqual([threadId]);
+    expect((await readIntakeConsoleDetail(threadId))?.projection.status).toBe("human_other");
+    expect((await listIntakeConsole({view:"to_validate"})).total).toBe(0);
+    expect((await db.db.select().from(savIntakeRuns))[0]).toEqual(before);
+    expect(await db.db.select().from(savIntakeModelCalls)).toHaveLength(0);
+    expect(mutationsSent()).toHaveLength(0); expect(fetch).not.toHaveBeenCalled();
+    expect((await db.db.select().from(savMessages))[0].analysisStatus).toBe("intake_pending");
+  });
+  it.each(["member","inactive","other_admin"])("refuses %s without writing a marker", async mode => {
+    const input = await pendingOther();
+    if(mode==="other_admin") state.user={id:"not-authorized",primaryEmailAddress:{emailAddress:"other@example.invalid",verification:{status:"verified"}}};
+    else await db.db.update(staffUsers).set(mode==="member"?{role:"member"}:{active:false});
+    await expect(classifyValidSourceAsOther(input)).rejects.toThrow(); expect(await markers()).toHaveLength(0);
+  });
+  it.each(["new_message","body","run_version","run_source","epoch"])("refuses changed %s instead of reusing the displayed binding", async changed => {
+    const input = await pendingOther();
+    if(changed==="new_message") await message(threadId, new Date(Date.now()+1000));
+    if(changed==="body") await db.db.update(savMessages).set({bodyCiphertext:encryptSavPayload({text:"A different synthetic client request.",attachments:[],headers:{}})}).where(eq(savMessages.id,messageId));
+    if(changed==="run_version") await db.db.update(savIntakeRuns).set({version:2}).where(eq(savIntakeRuns.id,runId));
+    if(changed==="run_source") await db.db.update(savIntakeRuns).set({sourceHash:"b".repeat(64)}).where(eq(savIntakeRuns.id,runId));
+    if(changed==="epoch") await db.db.execute(sql`select sav.dirty_intake_console(${threadId}::uuid)`);
+    const result=await classifyValidSourceAsOther(input);expect(result.marked).toBe(0);expect(await markers()).toHaveLength(0);
+  });
+  it("refuses a human pause and preserves it", async () => {
+    const input = await pendingOther(); await db.db.update(savThreads).set({aiPaused:true}).where(eq(savThreads.id,threadId));
+    expect((await classifyValidSourceAsOther(input)).marked).toBe(0);expect(await markers()).toHaveLength(0);
+    expect((await db.db.select().from(savThreads))[0].aiPaused).toBe(true);
+  });
+  it("refuses a known sensitive plan even when the human attests Other", async () => {
+    const input = await pendingOther(); await observed(false,true);
+    const current=(await readSavIntakeCurrent(threadId))!;
+    const [projection]=await db.db.select().from(savIntakeConsole).where(eq(savIntakeConsole.threadId,threadId));
+    Object.assign(input,{runId:current.id,version:current.version,runSourceHash:current.sourceHash,sourceHash:current.currentSourceHash,expectedEpoch:projection.epoch});
+    expect(await readManualOtherBinding(threadId,messageId,projection.epoch)).toBeNull();
+    expect((await classifyValidSourceAsOther(input)).marked).toBe(0);expect(await markers()).toHaveLength(0);
+  });
+  it("refuses a dispatched uncertain effect and preserves its evidence", async () => {
+    await prepareManualCompletion(false); await recordIntakeLaunch({mailboxId,receivedAfter:options.runtime.receivedAfter,createdAfter:options.runtime.createdAfter});
+    await projectIntakeThread(threadId);
+    const [projection]=await db.db.select().from(savIntakeConsole).where(eq(savIntakeConsole.threadId,threadId));
+    const binding=(await readManualOtherBinding(threadId,messageId,projection.epoch))!;
+    const execution=(await admitIntakeExecution(runId,options))!,lease=(await claimExecution(execution.id))!;
+    const effect=await ensureExecutionEffect(lease,{kind:"ticket_create",permission:"create_ticket",key:`create:${messageId}`,sourceMessageId:messageId,contactId:"101",properties:{subject:"Synthetic"}});
+    await markEffectDispatched(lease,effect);
+    await db.db.update(savIntakeExecutions).set({leaseUntil:null,leaseToken:null,state:"waiting"}).where(eq(savIntakeExecutions.id,execution.id));
+    await db.db.update(savIntakeEffects).set({state:"uncertain"}).where(eq(savIntakeEffects.id,effect.id));
+    expect((await classifyValidSourceAsOther({...binding,requestKey:randomUUID(),confirmed:true,reason:"Synthetic explicit Other reason."})).marked).toBe(0);
+    expect(await markers()).toHaveLength(0);expect((await getExecutionEffects(execution.id))[0].state).toBe("uncertain");
+  });
+  it("requires a current run and an explicit reason and attestation; GET stays inert", async () => {
+    const input=await pendingOther(); const before=(await db.db.select().from(auditLogs)).length;
+    await readManualOtherBinding(threadId,messageId,input.expectedEpoch);
+    expect((await db.db.select().from(auditLogs)).length).toBe(before);
+    for(const invalid of [{...input,confirmed:false},{...input,reason:""},{...input,revision:"unknown"},{...input,unexpected:true}]) await expect(classifyValidSourceAsOther(invalid)).rejects.toThrow();
+    await db.db.delete(savIntakeRuns).where(eq(savIntakeRuns.id,runId));
+    expect(await readManualOtherBinding(threadId,messageId,input.expectedEpoch)).toBeNull();
+    expect((await classifyValidSourceAsOther(input)).marked).toBe(0);expect(await markers()).toHaveLength(0);
+  });
+  it("rejects a changed request body on idempotent replay and leaves the original audit", async () => {
+    const input=await pendingOther();await classifyValidSourceAsOther(input);
+    expect((await classifyValidSourceAsOther({...input,reason:"A different explanation for the same key."})).alreadyCompleted).toBe(0);
+    expect(await markers()).toHaveLength(1);
+  });
+  it.each(["pending","waiting","consumed"])("keeps a %s human orientation separate from this explicit classification", async status => {
+    const input=await pendingOther();
+    await db.db.insert(savIntakeHumanEvents).values({commandKey:randomUUID(),threadId,messageId,parentRunId:runId,parentVersion:1,
+      baseConfigHash:options.runtime.configHash,sourceHash:input.sourceHash,kind:"classify",state:status,payloadCiphertext:encryptSavPayload({classification:"other"})});
+    input.expectedEpoch=(await db.db.select().from(savIntakeConsole).where(eq(savIntakeConsole.threadId,threadId)))[0].epoch;
+    const result=await classifyValidSourceAsOther(input);
+    expect(result.marked).toBe(status==="consumed"?1:0);expect(await markers()).toHaveLength(status==="consumed"?1:0);
+    expect(mutationsSent()).toHaveLength(0);
+  });
+  it("does not bypass a queued explicit operator continuation", async () => {
+    const input=await pendingOther();
+    await db.db.insert(auditLogs).values({actorEmail:"ugo@limova.ai",action:"sav_intake_operator_command",entityType:"sav_intake_operator_command",entityId:threadId,
+      technicalMetadata:{messageId,runId,kind:"resume",state:"queued"}});
+    expect((await classifyValidSourceAsOther(input)).marked).toBe(0);expect(await markers()).toHaveLength(0);
+  });
+  it("does not mask a sensitive consumed human classification", async () => {
+    const input=await pendingOther();
+    await db.db.insert(savIntakeHumanEvents).values({commandKey:randomUUID(),threadId,messageId,parentRunId:runId,parentVersion:1,
+      baseConfigHash:options.runtime.configHash,sourceHash:input.sourceHash,kind:"classify",state:"consumed",payloadCiphertext:encryptSavPayload({classification:"finance"})});
+    input.expectedEpoch=(await db.db.select().from(savIntakeConsole).where(eq(savIntakeConsole.threadId,threadId)))[0].epoch;
+    expect((await classifyValidSourceAsOther(input)).marked).toBe(0);expect(await markers()).toHaveLength(0);
+  });
+  it("does not classify while a worker lease is active", async () => {
+    const input=await pendingOther();
+    await db.db.update(savIntakeRuns).set({leaseToken:randomUUID(),leaseUntil:new Date(Date.now()+60000)}).where(eq(savIntakeRuns.id,runId));
+    expect(await classifyValidSourceAsOther(input)).toMatchObject({marked:0,skipped:{active_worker:1}});expect(await markers()).toHaveLength(0);
+  });
+
+});

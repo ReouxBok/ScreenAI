@@ -3,7 +3,9 @@ import { renderToStaticMarkup } from "react-dom/server";
 import { prerender } from "react-dom/static";
 import { readFile, writeFile, mkdir } from "node:fs/promises";
 import { beforeEach, it, expect, vi } from "vitest";
-const mocks = vi.hoisted(() => ({ staff: vi.fn(), list: vi.fn(), detail: vi.fn(), action: vi.fn(), crmDisplay: vi.fn(), controls: vi.fn(), operator:vi.fn() }));
+const mocks = vi.hoisted(() => ({ staff: vi.fn(), list: vi.fn(), detail: vi.fn(), action: vi.fn(), crmDisplay: vi.fn(), controls: vi.fn(), manualOther:vi.fn(), operator:vi.fn() }));
+vi.mock("@/lib/sav/intake/manual-other-classification",()=>({readManualOtherBinding:mocks.manualOther}));
+vi.mock("./manual-other-actions",()=>({classifyManualOtherAction:mocks.action}));
 vi.mock("@/lib/sav/intake-ux/operator-commands",()=>({readOperatorPanel:mocks.operator}));
 vi.mock("@/lib/sav/intake-ux/message-controls",()=>({readUxMessageControls:mocks.controls}));
 vi.mock("@/lib/sav/intake/crm-display-server",()=>({readIntakeCrmDisplay:mocks.crmDisplay}));
@@ -12,7 +14,7 @@ vi.mock("@/lib/sav/intake/console-store",()=>({listIntakeConsole:mocks.list}));
 // The async pause banner has its own test (agent-pause-ui.test.ts).
 vi.mock("./agent-pause-banner",()=>({AgentPauseBanner:()=>null}));
 vi.mock("@/lib/sav/intake/console-detail",()=>({readIntakeConsoleDetail:mocks.detail}));
-vi.mock("./actions",()=>({saveIntakeChoice:mocks.action,requestRecoveryAction:mocks.action,reconcileIdentificationAction:mocks.action,reconcileNoteAction:mocks.action,completeIntakeDossierAction:mocks.action}));
+vi.mock("./actions",()=>({saveIntakeChoice:mocks.action,requestRecoveryAction:mocks.action,reconcileIdentificationAction:mocks.action,reconcileNoteAction:mocks.action,completeIntakeDossierAction:mocks.action,releaseIntakeHumanHoldAction:mocks.action}));
 vi.mock("next/link",()=>({default:(props:ComponentProps<"a">)=>createElement("a",props)}));
 vi.mock("next/navigation",()=>({notFound:()=>{throw Error("NOT_FOUND");}}));
 import IntakeConsolePage from "./page";
@@ -28,7 +30,7 @@ const detail={thread:{id:threadId,subject:fixture.rows[0].subject,paused:false,t
   current:{id:runId,messageId,candidateContactIds:["101","102"],sourceHash:"a".repeat(64),version:7,sourceMatches:true,payload:{reason:"SAV_INTAKE_RUNTIME_USAGE_UNCERTAIN",plan:{candidateContactIds:["101","102"],decision:{classification:"support",disposition:{kind:"collect_context",reasons:["contact_ambiguous"]},evidence:[{id:"current",source:"current_message",sourceId:messageId,observedAt:at.toISOString()}]}}}},
   messages:[{id:messageId,direction:"inbound",fromEmail:"fiction@example.invalid",receivedAt:at,createdAt:at,body:{text:"My synthetic connection no longer works. Please inspect this complete test request.",attachments:[]},translation:{status:"complete",language:"en",text:"Ma connexion synthétique ne fonctionne plus. Merci de vérifier cette demande de test complète.",revision:"synthetic",sourceHash:"synthetic",errorCode:null}}],historyTruncated:false,
   progress:{runId,confirmed:false,state:"uncertain",ticketId:"201",reason:"SAV_INTAKE_EXECUTION_RECONCILIATION_REQUIRED",effects:[{id:"effect-1",kind:"ticket_create",state:"confirmed",confirmedAt:at},{id:"effect-2",kind:"email_associate",state:"uncertain",confirmedAt:null}]},choices:[]};
-beforeEach(()=>{vi.clearAllMocks();vi.unstubAllEnvs();mocks.operator.mockResolvedValue({information:null,allowResume:false,allowReanalysis:true,allowInformation:true,unavailableReason:"Synthetic protected state",resume:null});mocks.controls.mockResolvedValue({blocked:false});mocks.crmDisplay.mockResolvedValue({contacts:{"101":{label:"Alice Test",url:"https://app.hubspot.com/contacts/123/record/0-1/101",available:true}},tickets:{"201":{label:"Connexion interrompue",url:"https://app.hubspot.com/contacts/123/record/0-5/201",available:true}}});mocks.staff.mockResolvedValue({id:"synthetic",email:"ugo@limova.ai",role:"admin"});mocks.list.mockResolvedValue(fixture);mocks.detail.mockResolvedValue(detail);});
+beforeEach(()=>{vi.clearAllMocks();mocks.manualOther.mockResolvedValue(null);vi.unstubAllEnvs();mocks.operator.mockResolvedValue({information:null,allowResume:false,allowReanalysis:true,allowInformation:true,unavailableReason:"Synthetic protected state",resume:null});mocks.controls.mockResolvedValue({blocked:false});mocks.crmDisplay.mockResolvedValue({contacts:{"101":{label:"Alice Test",url:"https://app.hubspot.com/contacts/123/record/0-1/101",available:true}},tickets:{"201":{label:"Connexion interrompue",url:"https://app.hubspot.com/contacts/123/record/0-5/201",available:true}}});mocks.staff.mockResolvedValue({id:"synthetic",email:"ugo@limova.ai",role:"admin"});mocks.list.mockResolvedValue(fixture);mocks.detail.mockResolvedValue(detail);});
 const renderList=async(query:{view?:string;q?:string;page?:string;sort?:string}={})=>renderToStaticMarkup(createElement(Fragment,null,await IntakeConsolePage({searchParams:Promise.resolve(query)})));
 // The detail page streams HubSpot names under Suspense: wait for every boundary,
 // as the browser does once the stream ends. The shell alone is the first flush.
@@ -141,4 +143,24 @@ it("a zero-check receipt explains the occupied verifier without claiming a succe
  const command={requestKey:"10000000-0000-4000-8000-000000000041",threadId,messageId,runId,version:7,sourceHash:"a".repeat(64),kind:"resume",reason:"Verify this synthetic existing receipt."};
  mocks.operator.mockResolvedValue({information:null,allowResume:false,allowReanalysis:false,allowInformation:false,unavailableReason:"Protected state",resume:null,requests:{resume:{command,receipt:{id:command.requestKey,step:"verify_only",state:"finished",outcome:"waiting",checked:0,reason:"SAV_INTAKE_OPERATOR_VERIFICATION_BUSY",at:at.toISOString()}}}});
  const html=await renderDetail();expect(html).toContain("Un autre traitement occupe la vérification");expect(html).toContain("Aucun contrôle n’a été effectué");expect(html).not.toContain("Vérification effectuée");expect(html).not.toContain("SAV_INTAKE_OPERATOR_VERIFICATION_BUSY");
+});
+
+it("offers explicit manual Other for a bound valid pending message, with no action on GET", async () => {
+  const binding={revision:"sav-intake-manual-other.v1",threadId,messageId,runId,version:7,sourceHash:"a".repeat(64),runSourceHash:null,expectedEpoch:1};
+  mocks.manualOther.mockResolvedValue(binding);
+  mocks.detail.mockResolvedValue({...detail,projection:{...detail.projection,view:null,status:"waiting"},progress:null,current:{...detail.current,sourceHash:null}});
+  const html=await renderDetail();
+  expect(html).toContain("Classement humain dans Autres");expect(html).toContain("Classer dans Autres");
+  expect(html).toContain("Motif du classement");expect(html).toContain("sans verdict IA");
+  expect(html).toMatch(/<textarea(?=[^>]*name="reason")(?=[^>]*required="")[^>]*>/);
+  expect(html).toMatch(/<input(?=[^>]*name="confirmed")(?=[^>]*required="")[^>]*>/);
+  expect(html).toContain(`name="messageId" value="${messageId}"`);expect(mocks.action).not.toHaveBeenCalled();
+  mocks.staff.mockResolvedValue({email:"ugo@limova.ai",role:"member"});expect(await renderDetail()).not.toContain("Classement humain dans Autres");
+});
+it("never offers valid-source Other over a human pause, completion or engaged effect", async () => {
+  mocks.manualOther.mockResolvedValue({revision:"sav-intake-manual-other.v1",threadId,messageId,runId,version:7,sourceHash:"a".repeat(64),runSourceHash:null,expectedEpoch:1});
+  for(const state of [{...detail,humanHeld:true},{...detail,thread:{...detail.thread,paused:true}},{...detail,handledExternally:true},detail]) {
+    mocks.detail.mockResolvedValue(state);expect(await renderDetail()).not.toContain("Classement humain dans Autres");
+  }
+  expect(mocks.action).not.toHaveBeenCalled();
 });
