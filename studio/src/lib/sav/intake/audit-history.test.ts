@@ -230,6 +230,16 @@ it("preserves the pre-extraction runtime hash, including canonical pin order",()
     expect(options.runtime.configHash).toBe(expected);
     expect(intakeRuntimeConfigurationHash(Object.fromEntries(Object.entries(pins).reverse()) as typeof pins,environment)).toBe(expected);
 });
+it("SAV-43: switching PDF reading on between deployments refuses continuity explicitly, never by a schema crash", async () => {
+    const { row } = await observedWith("same");
+    await executeIntakePass(row.id, options, { beforeMarker: async e => { if (e.kind === "email_create") throw Error("SYNTHETIC_DEPLOY_CUT"); } });
+    environment = { ...environment, SAV_INTAKE_PDF_READING: "on" };
+    const next = await newAuthorityOptions();
+    expect(next.runtime.pdfReading).toBe(true);
+    // The observation was made with PDFs unread: a different launch configuration, refused as such.
+    await expect(previewIntakeExecutionContinuity(options.config.policyId, next)).rejects.toThrow("SAV_INTAKE_EXECUTION_CONTINUITY_REFUSED");
+    expect(posts("/tickets")).toBe(1); expect(posts("/emails")).toBe(0);
+});
 async function newAuthorityOptions() {
     const cfg = JSON.parse(environment.SAV_INTAKE_RUNTIME_CONFIG!), rev = "b".repeat(40);
     environment = { ...environment, SAV_CODE_REVISION: rev, SAV_INTAKE_RUNTIME_CONFIG: JSON.stringify({ ...cfg, codeRevision: rev }) };
