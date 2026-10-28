@@ -25,10 +25,11 @@ describe("SAV-43 PDF admission before any model call", () => {
     expect(() => admitSavAttachmentPdf(syntheticPdf({ pages: 6, objectStream: "flate", declaredCount: 1 }), "application/pdf")).toThrow("page_limit");
     expect(() => admitSavAttachmentPdf(syntheticPdf({ pages: 2, objectStream: "lzw", declaredCount: 1 }), "application/pdf")).toThrow("invalid_pdf");
   });
-  it("bounds the inflate of an object stream (decompression bomb)", () => {
+  it("bounds the inflate of a compressed stream (decompression bomb)", () => {
+    // The bomb is the cross-reference stream itself, so it is decoded before anything else.
     const bomb = zlib.deflateSync(Buffer.alloc(SAV_ATTACHMENT_PDF_LIMITS.inflatedBytes + 1, 32));
-    const body = Buffer.concat([Buffer.from(`%PDF-1.7\n1 0 obj\n<< /Type /ObjStm /N 1 /First 4 /Filter /FlateDecode /Length ${bomb.length} >>\nstream\n`, "latin1"), bomb,
-      Buffer.from("\nendstream\nendobj\n2 0 obj\n<< /Type /Page >>\nendobj\ntrailer\n<< /Root 1 0 R >>\n%%EOF\n", "latin1")]);
+    const body = Buffer.concat([Buffer.from(`%PDF-1.7\n1 0 obj\n<< /Type /XRef /Size 2 /W [1 4 2] /Root 1 0 R /Filter /FlateDecode /Length ${bomb.length} >>\nstream\n`, "latin1"), bomb,
+      Buffer.from("\nendstream\nendobj\nstartxref\n9\n%%EOF\n", "latin1")]);
     expect(body.length).toBeLessThan(SAV_ATTACHMENT_PDF_LIMITS.bytes);
     expect(() => admitSavAttachmentPdf(body, "application/pdf")).toThrow("invalid_pdf");
   });
@@ -88,8 +89,11 @@ describe("SAV-43 review: structure is read, document text is not", () => {
     const base = { 1: "<< /Type /Catalog /Pages 2 0 R >>", 2: tree([3]), 3: page, 4: "<< /Filter /Standard /V 2 /R 3 >>" };
     expect(() => admitSavAttachmentPdf(pdfFrom(base, "<< /Size 5 /Root 1 0 R /Encr#79pt 4 0 R >>"), "application/pdf")).toThrow("pdf_encrypted");
     expect(admitSavAttachmentPdf(pdfFrom({ ...base, 5: "<< /Encrypt 4 0 R >>" }, "<< /Size 6 /Root 1 0 R >>"), "application/pdf").pages).toBe(1);
-    const xrefStream = { ...base, 6: "<< /Type /XRef /Size 7 /Root 1 0 R /Encrypt 4 0 R /W [1 2 1] /Length 0 >>\nstream\n\nendstream" };
-    expect(() => admitSavAttachmentPdf(pdfFrom(xrefStream, "<< /Size 7 /Root 1 0 R >>"), "application/pdf")).toThrow("pdf_encrypted");
+    // The cross-reference stream is the trailer of its section: an Encrypt key there counts.
+    expect(() => admitSavAttachmentPdf(syntheticPdf({ pages: 2, objectStream: "flate", encrypted: true }), "application/pdf")).toThrow("pdf_encrypted");
+    // An XRef-typed object that no startxref or Prev designates is not a section.
+    const stray = { ...base, 6: "<< /Type /XRef /Size 7 /Root 1 0 R /Encrypt 4 0 R /W [1 2 1] /Length 0 >>\nstream\n\nendstream" };
+    expect(admitSavAttachmentPdf(pdfFrom(stray, "<< /Size 7 /Root 1 0 R >>"), "application/pdf").pages).toBe(1);
   });
   it("follows the latest incremental update of the page tree in both directions", () => {
     const one = { 1: "<< /Type /Catalog /Pages 2 0 R >>", 2: tree([3]), 3: page };
@@ -99,10 +103,12 @@ describe("SAV-43 review: structure is read, document text is not", () => {
     expect(admitSavAttachmentPdf(pdfFrom(back, "<< /Size 9 /Root 1 0 R >>", shrink), "application/pdf").pages).toBe(2);
   });
   it("stays bounded in time on a 4 MiB file of tokens or of nested arrays", () => {
-    const base = "%PDF-1.7\n1 0 obj\n[", tail = "]\nendobj\ntrailer\n<< /Root 1 0 R >>\n%%EOF\n", room = SAV_ATTACHMENT_PDF_LIMITS.bytes - base.length - tail.length;
+    // The catalog the xref designates is the oversized value, so the reader has to parse it.
+    const base = "%PDF-1.7\n1 0 obj\n[", room = SAV_ATTACHMENT_PDF_LIMITS.bytes - base.length - 200;
+    const tail = (xref: number) => `]\nendobj\nxref\n0 2\n0000000000 65535 f \n0000000009 00000 n \ntrailer\n<< /Size 2 /Root 1 0 R >>\nstartxref\n${xref}\n%%EOF\n`;
     for (const filler of ["0 ".repeat(room / 2), "[".repeat(room)]) {
-      const started = performance.now();
-      expect(() => admitSavAttachmentPdf(Buffer.from(base + filler + tail, "latin1"), "application/pdf")).toThrow("invalid_pdf");
+      const started = performance.now(), body = base + filler;
+      expect(() => admitSavAttachmentPdf(Buffer.from(body + tail(body.length + "]\nendobj\n".length), "latin1"), "application/pdf")).toThrow("invalid_pdf");
       expect(performance.now() - started).toBeLessThan(3000);
     }
   });
@@ -111,5 +117,30 @@ describe("SAV-43 review: structure is read, document text is not", () => {
     expect(() => admitSavAttachmentPdf(pdfFrom(cyclic, "<< /Size 4 /Root 1 0 R >>"), "application/pdf")).toThrow("invalid_pdf");
     expect(() => admitSavAttachmentPdf(pdfFrom({ 1: "<< /Type /Catalog /Pages 2 0 R >>", 2: tree([3]) }, "<< /Size 3 /Root 1 0 R >>"), "application/pdf")).toThrow("invalid_pdf");
     expect(() => admitSavAttachmentPdf(pdfFrom({ 1: "<< /Type /Catalog /Pages 2 0 R >>", 2: tree([3]), 3: page }, "<< /Size 4 >>"), "application/pdf")).toThrow("invalid_pdf");
+  });
+});
+
+describe("SAV-43 review c002a60: the cross-reference sections are the authority", () => {
+  const six = () => { const objects: Record<number, string> = { 1: "<< /Type /Catalog /Pages 2 0 R >>", 2: tree([3, 4, 5, 6, 7, 8]) }; for (let id = 3; id <= 8; id++) objects[id] = page; return objects; };
+  it("ends a stream exactly at its indirect Length; bytes inside it are never structure", () => {
+    const content = `endstream\nendobj\n2 0 obj\n${tree([3])}\nendobj\ntrailer\n<< /Root 1 0 R >>\n`;
+    const streamed = (length: number) => ({ ...six(), 3: `<< /Type /Page /Parent 2 0 R /Length 9 0 R >>\nstream\n${content}\nendstream`, 9: String(length) });
+    expect(() => admitSavAttachmentPdf(pdfFrom(streamed(content.length), "<< /Size 10 /Root 1 0 R >>"), "application/pdf")).toThrow("page_limit");
+    // A Length that does not land on endstream is refused, never repaired by a search.
+    expect(() => admitSavAttachmentPdf(pdfFrom(streamed(9), "<< /Size 10 /Root 1 0 R >>"), "application/pdf")).toThrow("invalid_pdf");
+  });
+  it("reads an entry's object only with the number and generation the xref and the reference give", () => {
+    const bytes = pdfFrom(six(), "<< /Size 9 /Root 1 0 R >>").toString("latin1");
+    const offset = (id: number) => String(bytes.indexOf(`\n${id} 0 obj\n`) + 1).padStart(10, "0");
+    // The entry of object 2 designates object 3: the xref is not qualifiable.
+    expect(() => admitSavAttachmentPdf(Buffer.from(bytes.replace(`2 1\n${offset(2)}`, `2 1\n${offset(3)}`), "latin1"), "application/pdf")).toThrow("invalid_pdf");
+    // A reference to another generation is the null object, not the live tree.
+    expect(() => admitSavAttachmentPdf(pdfFrom({ ...six(), 1: "<< /Type /Catalog /Pages 2 1 R >>" }, "<< /Size 9 /Root 1 0 R >>"), "application/pdf")).toThrow("invalid_pdf");
+  });
+  it("refuses a file whose startxref or Prev chain cannot be followed", () => {
+    const bytes = pdfFrom(six(), "<< /Size 9 /Root 1 0 R >>").toString("latin1");
+    expect(() => admitSavAttachmentPdf(Buffer.from(bytes.replace(/startxref\n\d+/, "startxref\n12"), "latin1"), "application/pdf")).toThrow("invalid_pdf");
+    const looped = pdfFrom(six(), "<< /Size 9 /Root 1 0 R >>").toString("latin1"), start = /startxref\n(\d+)/.exec(looped)![1];
+    expect(() => admitSavAttachmentPdf(Buffer.from(looped.replace("/Root 1 0 R", `/Root 1 0 R /Prev ${start}`), "latin1"), "application/pdf")).toThrow("invalid_pdf");
   });
 });

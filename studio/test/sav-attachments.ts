@@ -34,13 +34,14 @@ export function syntheticPdf(options: { pages?: number; text?: string; scanned?:
     objects[id + 1] = `<< /Length ${content.length} >>\nstream\n${content}\nendstream`;
   });
   if (options.scanned) objects[imageId] = Buffer.concat([Buffer.from(`<< /Type /XObject /Subtype /Image /Width 64 /Height 48 /ColorSpace /DeviceRGB /BitsPerComponent 8 /Filter /DCTDecode /Length ${options.scanned.length} >>\nstream\n`, "latin1"), options.scanned, Buffer.from("\nendstream", "latin1")]);
+  let objectStreamId = 0;
   if (options.objectStream) {
     // Page objects moved into one compressed object stream, as modern writers do.
     const inner = pageIds.map(id => objects[id] as string), header = pageIds.map((id, i) => `${id} ${inner.slice(0, i).reduce((n, o) => n + o.length + 1, 0)}`).join(" ") + "\n";
     const raw = Buffer.from(header + inner.join("\n"), "latin1"), data = options.objectStream === "flate" ? zlib.deflateSync(raw) : raw;
-    const id = objects.length;
+    const id = objectStreamId = objects.length;
     objects[id] = Buffer.concat([Buffer.from(`<< /Type /ObjStm /N ${pages} /First ${header.length} /Filter /${options.objectStream === "flate" ? "FlateDecode" : "LZWDecode"} /Length ${data.length} >>\nstream\n`, "latin1"), data, Buffer.from("\nendstream", "latin1")]);
-    for (const pageId of pageIds) objects[pageId] = "null";
+    for (const pageId of pageIds) delete objects[pageId];
   }
   const encryptId = objects.length;
   if (options.encrypted) objects[encryptId] = "<< /Filter /Standard /V 2 /R 3 /Length 128 /O <00> /U <00> /P -4 >>";
@@ -52,10 +53,24 @@ export function syntheticPdf(options: { pages?: number; text?: string; scanned?:
     const chunk = Buffer.concat([Buffer.from(`${id} 0 obj\n`, "latin1"), Buffer.isBuffer(objects[id]) ? objects[id] as Buffer : Buffer.from(objects[id] as string, "latin1"), Buffer.from("\nendobj\n", "latin1")]);
     parts.push(chunk); length += chunk.length;
   }
+  const keys = `/Root 1 0 R${options.encrypted ? ` /Encrypt ${encryptId} 0 R /ID [<00><00>]` : ""}`;
+  if (options.objectStream) {
+    // Modern writers index compressed objects in a cross-reference stream (type 2 entries),
+    // Flate-encoded with the PNG "Up" predictor.
+    const streamId = objects.length, size = streamId + 1, rows: number[][] = [];
+    for (let id = 0; id < size; id++) {
+      const inStream = pageIds.indexOf(id), at = id === streamId ? length : offsets[id];
+      rows.push(inStream >= 0 ? [2, ...be(objectStreamId, 4), ...be(inStream, 2)] : at === undefined ? [0, 0, 0, 0, 0, 0, 0] : [1, ...be(at, 4), 0, 0]);
+    }
+    const data = zlib.deflateSync(Buffer.from(rows.flatMap((row, r) => [2, ...row.map((byte, c) => (byte - (r ? rows[r - 1][c] : 0) + 256) & 255)])));
+    parts.push(Buffer.from(`${streamId} 0 obj\n<< /Type /XRef /Size ${size} /W [1 4 2] /Filter /FlateDecode /DecodeParms << /Predictor 12 /Columns 7 >> ${keys} /Length ${data.length} >>\nstream\n`, "latin1"), data, Buffer.from(`\nendstream\nendobj\nstartxref\n${length}\n%%EOF\n`, "latin1"));
+    return Buffer.concat(parts);
+  }
   const xref = [`xref\n0 ${objects.length}\n0000000000 65535 f \n`, ...Array.from({ length: objects.length - 1 }, (_, i) => offsets[i + 1] === undefined ? "0000000000 65535 f \n" : `${String(offsets[i + 1]).padStart(10, "0")} 00000 n \n`)].join("");
-  parts.push(Buffer.from(`${xref}trailer\n<< /Size ${objects.length} /Root 1 0 R${options.encrypted ? ` /Encrypt ${encryptId} 0 R /ID [<00><00>]` : ""} >>\nstartxref\n${length}\n%%EOF\n`, "latin1"));
+  parts.push(Buffer.from(`${xref}trailer\n<< /Size ${objects.length} ${keys} >>\nstartxref\n${length}\n%%EOF\n`, "latin1"));
   return Buffer.concat(parts);
 }
+const be = (value: number, bytes: number) => Array.from({ length: bytes }, (_, i) => Math.floor(value / 256 ** (bytes - 1 - i)) % 256);
 export function pdfMetadata(size: number, partId = "1"): SavAttachmentMetadata {
   return { ...attachmentMetadata(size, partId), filename: "document-fictif.pdf", mimeType: "application/pdf" };
 }
