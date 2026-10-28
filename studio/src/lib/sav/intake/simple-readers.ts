@@ -124,8 +124,9 @@ const INSTRUCTION = [
   "registration: only when the CURRENT message gives the email address of the customer's account; quote must be copied verbatim from the current message and contain that address.",
   "ticketTitle: French, 4 to 6 words, factual, no greeting, no 'Re:'. ticketDescription: factual French summary of all current requests.",
   "identity: which supplied contact is the sender (unique), several contacts that are truly the same person/account (equivalent), or unknown. Use aliases, linked contacts and tickets naming the contact.",
-  "tickets: judge EVERY supplied ticket. same = this ticket covers the same problem as ALL current requests; different = another problem; unclear = you cannot tell. Explain briefly why, with sourceIds. A shared name, generic topic or keyword is not enough for same.",
-  "missing: anything indispensable you could not read (an image the customer points to, an incomplete history, an ambiguous contact).",
+  "tickets: return exactly one verdict for EVERY supplied ticket. same = this ticket covers the same problem as ALL current requests; different = another problem; unclear = you cannot tell. Give one short factual sentence for why, with only unique relevant sourceIds. A shared name, generic topic or keyword is not enough for same.",
+  "missing: anything indispensable you could not read (an image the customer points to, an incomplete history, an ambiguous contact); keep unknowns explicit.",
+  "Be concise without omitting any request, ticket, indispensable missing evidence or identity uncertainty: each why and rationale is one short factual sentence. Do not copy or retell histories. Use only unique relevant sourceIds; the source content is already supplied. ticketDescription summarizes all current requests without repeating the conversation.",
 ].join("\n");
 
 export function createSavIntakeSimpleReaders(options: {
@@ -161,7 +162,7 @@ export function createSavIntakeSimpleReaders(options: {
     for (;;) {
       const body = { systemInstruction: { parts: [{ text: `${INSTRUCTION}${repair ? "\nFORMAT REPAIR v1: the previous response did not match the required JSON schema. Read the SAME sources again and return one complete JSON object conforming exactly to it." : ""}` }] },
         contents: [{ role: "user" as const, parts: [{ text: JSON.stringify(data) }] }],
-        generationConfig: { maxOutputTokens: 8192, responseMimeType: "application/json", responseSchema: intakeResponseSchema(schema) } };
+        generationConfig: { maxOutputTokens: 8192, responseMimeType: "application/json", responseSchema: intakeResponseSchema(schema, { arrayBounds: true }) } };
       const dataBytes = Buffer.byteLength(body.contents[0].parts[0].text, "utf8"), wireBytes = savGeminiWireBody({ model: options.model, phase, body }).textBytes;
       const trace = (accepted: boolean, errorCode: string | null, more: Partial<IntakeModelTrace> = {}) => options.onTrace?.({ phase, model: options.model,
         promptRevision: SAV_INTAKE_SIMPLE_REVISION, inputHash, durationMs: Date.now() - started, accepted, errorCode, ...more });

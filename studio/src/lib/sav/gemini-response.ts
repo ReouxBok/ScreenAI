@@ -32,6 +32,22 @@ export type SavGeminiMetadata = {
   totalTokens?: number;
 };
 
+export type SavGeminiDiagnosticMetadata = Pick<SavGeminiMetadata, "finishReason" | "blockReason" | "inputTokens" | "outputTokens" | "thoughtTokens" | "totalTokens">;
+
+/** Project only bounded provider facts into administrator diagnostics. Never
+ * retain arbitrary error properties, provider text or reasoning content. */
+export function savGeminiDiagnosticMetadata(metadata?: SavGeminiMetadata): SavGeminiDiagnosticMetadata {
+  if (!metadata) return {};
+  const result: SavGeminiDiagnosticMetadata = {};
+  if (metadata.finishReason !== undefined) result.finishReason = finishReasons.find(value => value === metadata.finishReason) ?? "UNKNOWN";
+  if (metadata.blockReason !== undefined) result.blockReason = blockReasons.find(value => value === metadata.blockReason) ?? "UNKNOWN";
+  for (const key of ["inputTokens", "outputTokens", "thoughtTokens", "totalTokens"] as const) {
+    const parsed = tokenCount.safeParse(metadata[key]);
+    if (parsed.success && parsed.data !== undefined) result[key] = parsed.data;
+  }
+  return result;
+}
+
 export function readSavGeminiResponse(payload: unknown) {
   const parsed = responseSchema.safeParse(payload);
   if (!parsed.success) throw new Error("SAV_AI_INVALID_RESPONSE");

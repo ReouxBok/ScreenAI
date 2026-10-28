@@ -1,6 +1,6 @@
 import { beforeEach, expect, it, vi } from "vitest";
 vi.mock("./runtime-store", () => ({ settleSavIntakeCall: vi.fn(async () => true) }));
-import { createIntakeModelDispatcher } from "./model-dispatch";
+import { createIntakeModelDispatcher, intakeDispatchCounts } from "./model-dispatch";
 import { SAV_INTAKE_MODEL_LIMITS } from "./model-limits";
 import { savGeminiWireBody } from "../gemini-transport";
 import type { IntakeGeminiCall } from "./model-readers";
@@ -152,6 +152,7 @@ it("SAV46 does not count a network send when the transport expires during the fi
     expect(await result).toMatchObject({ message: "SAV_AI_TIMEOUT" });
     expect(network).not.toHaveBeenCalled();
     expect(dispatcher.diagnostics).toMatchObject([{ dispatched: false, httpStatus: null }]);
+    expect(intakeDispatchCounts(dispatcher.diagnostics)).toEqual({ dispatches: 0, httpResponses: 0 });
     expect(settle).toHaveBeenCalledOnce(); expect(dispatcher.uncertain).toBe(true);
   } finally { vi.useRealTimers(); }
 });
@@ -165,4 +166,22 @@ it("BUDGET-RES an admitted image is reserved with its media allowance next to th
   const dispatcher = createIntakeModelDispatcher({ config, live: async () => {}, reserve, network, signal: new AbortController().signal, env: () => ({ SAV_GEMINI_API_KEY: "synthetic-key" }) });
   await expect(dispatcher.call(input)).resolves.toMatchObject({ json: { fixture: true } });
   expect(reserve).toHaveBeenCalledExactlyOnceWith(expect.stringMatching(/^[a-f0-9]{64}$/), { textBytes: savGeminiWireBody(input).textBytes, mediaTokens: 4096, maxOutputTokens: 8192 });
+});
+
+it("counts cached output and preflight rejection as zero sends, and an HTTP rejection as one", async () => {
+  const input = inputAtSize(1000), network = vi.fn<typeof fetch>(async () => new Response(null, { status: 400 }));
+  const common = { config, live: async () => {}, network, captureDiagnostics: true,
+    signal: new AbortController().signal, env: () => ({ SAV_GEMINI_API_KEY: "synthetic-key" }) };
+  const cached = createIntakeModelDispatcher({ ...common, reserve: async () => ({ id: "cached", cached: { json: { fixture: true }, metadata: {} } }) });
+  await cached.call(input);
+  expect(cached.diagnostics[0]).toMatchObject({ cached: true, dispatched: false });
+  expect(intakeDispatchCounts(cached.diagnostics)).toEqual({ dispatches: 0, httpResponses: 0 });
+  const blocked = createIntakeModelDispatcher({ ...common, reserve: async () => { throw Error("SAV_INTAKE_RUNTIME_CALL_ALREADY_CONSUMED"); } });
+  await expect(blocked.call(input)).rejects.toThrow("CALL_ALREADY_CONSUMED");
+  expect(intakeDispatchCounts(blocked.diagnostics)).toEqual({ dispatches: 0, httpResponses: 0 });
+  expect(network).not.toHaveBeenCalled();
+  const rejected = createIntakeModelDispatcher({ ...common, reserve: async () => ({ id: "rejected", cached: null }) });
+  await expect(rejected.call(input)).rejects.toThrow("SAV_AI_HTTP_400");
+  expect(intakeDispatchCounts(rejected.diagnostics)).toEqual({ dispatches: 1, httpResponses: 1 });
+  expect(network).toHaveBeenCalledTimes(1);
 });
