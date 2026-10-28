@@ -6,7 +6,7 @@ import { intakeRunConfigurationBound, intakeHumanRefused } from "./human-binding
 import { createHash, randomUUID } from "node:crypto";
 import {canAccessSav} from "../access";
 import {executionPolicySchema} from "./execution-policy";
-import { and, desc, eq, inArray, isNull, lte, or, sql } from "drizzle-orm";
+import { and, desc, eq, inArray, isNull, lte, or, sql, type SQL } from "drizzle-orm";
 import { requireDb } from "@/db";
 import { staffUsers,savMailboxes,savIntakeHumanEvents,savIntakeExecutionPolicies,savActions, savThreads, savMessages, savIntakeRuns, savSyncState, savIntakeExecutions, savIntakeEffects, savIntakeEffectJournal, savIntakeOccupations, savIntakeExecutionBudget, savIntakeIdentityEpisodes, savIntakeEffectRevisions } from "@/db/schema";
 import { encryptSavPayload, decryptSavPayload } from "../crypto";
@@ -16,6 +16,7 @@ import { savIntakeDecisionSchema } from "./contract";
 import { savIntakePlanFingerprint } from "./engine";
 import type { ExecutionPayload, Effect, EffectIntent, EffectAck, ExecutionOptions } from "./execution-types";
 import { savEffectiveReceivedAt } from "@/lib/sav/message-order";
+import { CRM_EPISODE_JOURNALS, CRM_RECHECK_JOURNAL, CRM_RECHECK_POLICY, CRM_REVIEW_JOURNAL, crmRecheckDelayMs, type CrmRecheckDecision } from "./crm-recheck";
 export type ExecutionTx = Parameters<Parameters<ReturnType<typeof requireDb>["transaction"]>[0]>[0];
 export const admissionLock = async (tx: ExecutionTx) => { await tx.execute(sql `select pg_advisory_xact_lock(hashtext('sav-intake-common-admission-v1'))`); };
 export const executionJournal = async (tx: ExecutionTx, id: string, kind: string, payload: unknown, effectId?: string) => {
@@ -216,7 +217,7 @@ export async function admitIntakeExecution(runId: string, options: ExecutionOpti
         await occupyKeys(tx, id, "intake", keys);
         const payload: ExecutionPayload = {
             runtimeConfigHash: options.runtime.configHash,
-            plan, input: current.payload.input, keys, lastRunId: runId, acceptedFingerprint: plan.fingerprint, local: {
+            plan, input: current.payload.input, keys, lastRunId: runId, acceptedFingerprint: plan.fingerprint, ...(current.payload.crmEvidence ? { originalCrm: current.payload.crmEvidence } : {}), local: {
                 threadIdentityHash: intakeRuntimeHash({
                     mailbox: thread.mailboxId, gmail: thread.gmailThreadId, customer: thread.customerEmail
                 }), messageHash: executionMessageHash(m), sourceHash: run.sourceHash, humanChoice: run.humanChoiceCiphertext, humanRequestedAt: thread.humanRequestedAt?.toISOString() ?? null, status: thread.status, ticketId: thread.hubspotTicketId
@@ -237,25 +238,40 @@ export async function admitIntakeExecution(runId: string, options: ExecutionOpti
         return execution;
     });
 }
-export async function claimExecution(id: string, now = new Date()) {
-    return requireDb().transaction(async (tx) => {
+export type ExecutionClaimBlock = "occupied" | "crm_recheck_pending" | "crm_review_required";
+/** The one claim every continuation goes through (cron selector, Workflow wake, tests).
+ * A waiting execution under a CRM schedule is claimed only when the durable journal says
+ * it is due, checked under the admission lock with the selector's own SQL: a wake is a
+ * hint and cannot advance a recheck or lift a required human decision. Effect recovery
+ * keeps its own read-only lease (claimEffectRecovery) and is not gated here. */
+export async function claimExecutionOrBlock(id: string, now = new Date()) {
+    return requireDb().transaction(async (tx): Promise<{ lease: ExecutionLease } | { blocked: ExecutionClaimBlock }> => {
         await admissionLock(tx);
         const [row] = await tx.select().from(savIntakeExecutions).where(eq(savIntakeExecutions.id, id)).for("update");
         if (!row || row.state === "confirmed" || row.state === "refused" || row.leaseUntil && row.leaseUntil > now)
-            return null;
+            return { blocked: "occupied" };
         const payload = decryptSavPayload<ExecutionPayload>(row.payloadCiphertext);
+        if (row.state === "waiting") {
+            const [schedule] = await tx.select({ due: sql<boolean>`${crmRecheckDueSql(sql`${savIntakeExecutions.id}`, sql`${savIntakeExecutions.messageId}`)}` })
+                .from(savIntakeExecutions).where(eq(savIntakeExecutions.id, row.id));
+            if (!schedule?.due) return { blocked: payload.crmRecheck?.humanRequired === false ? "crm_recheck_pending" : "crm_review_required" };
+        }
         await assertNoLegacyConflict(tx, payload.keys);
         await occupyKeys(tx, row.id, "intake", payload.keys);
         const token = randomUUID();
         const [claimed] = await tx.update(savIntakeExecutions).set({
             leaseToken: token, leaseUntil: new Date(now.getTime() + 80000), state: "running", updatedAt: now
         }).where(eq(savIntakeExecutions.id, id)).returning();
-        return {
+        return { lease: {
             row: claimed, token, payload: decryptSavPayload<ExecutionPayload>(claimed.payloadCiphertext)
-        };
+        } };
     });
 }
-export type ExecutionLease = NonNullable<Awaited<ReturnType<typeof claimExecution>>>;
+export async function claimExecution(id: string, now = new Date()) {
+    const claim = await claimExecutionOrBlock(id, now);
+    return "lease" in claim ? claim.lease : null;
+}
+export type ExecutionLease = { row: typeof savIntakeExecutions.$inferSelect; token: string; payload: ExecutionPayload };
 export type EffectRecoveryLease = { executionId: string; token: string };
 /** Reserve the existing execution lease without changing its business state.
  * No admission lock is held across a provider read. The same token is checked
@@ -485,13 +501,39 @@ export async function deferExecutionEffect(effect: Effect, reason: string, trans
     };
     if (transaction) await write(transaction); else await requireDb().transaction(write);
 }
-export async function endExecutionPass(lease: ExecutionLease, state: "waiting" | "uncertain", reason: string) {
+/** Start of the current CRM episode: admission, an adopted version or the latest confirmed
+ * effect. Progress always opens a new episode, so the bound counts consecutive waits. */
+const crmEpisodeStart = (executionId: SQL | string) => sql`greatest(
+    coalesce((select max(f.confirmed_at) from sav.intake_effects f where f.execution_id=${executionId}),'-infinity'::timestamptz),
+    coalesce((select max(j.created_at) from sav.intake_effect_journal j where j.execution_id=${executionId} and j.kind in (${sql.join(CRM_EPISODE_JOURNALS.map(k => sql`${k}`), sql`, `)})),'-infinity'::timestamptz))`;
+const crmRows = (executionId: SQL | string, kind: string) => sql`from sav.intake_effect_journal c where c.execution_id=${executionId} and c.kind=${kind} and c.created_at>${crmEpisodeStart(executionId)}`;
+/** SQL twin of the schedule written by endExecutionPass, read from the durable journal so
+ * it survives deployments: a waiting execution is due when no review is required, the
+ * recheck bound is not reached and its delay elapsed, or when a newer run exists. */
+export function crmRecheckDueSql(executionId: SQL, messageId: SQL) {
+    const count = sql`(select count(*) ${crmRows(executionId, CRM_RECHECK_JOURNAL)})`, last = sql`(select max(c.created_at) ${crmRows(executionId, CRM_RECHECK_JOURNAL)})`;
+    const lastCrm = sql`(select max(c.created_at) from sav.intake_effect_journal c where c.execution_id=${executionId} and c.kind in (${CRM_RECHECK_JOURNAL}, ${CRM_REVIEW_JOURNAL}))`;
+    return sql`((not exists(select 1 ${crmRows(executionId, CRM_REVIEW_JOURNAL)}) and (${count}=0 or (${count}<${CRM_RECHECK_POLICY.maxRechecks}
+        and ${last}<=now()-(interval '1 millisecond' * ${CRM_RECHECK_POLICY.baseDelayMs} * power(2, ${count}-1)))))
+        or exists(select 1 from sav.intake_runs r where r.message_id=${messageId} and r.is_current and r.created_at>${lastCrm}))`;
+}
+async function crmRecheckState(tx: ExecutionTx, lease: ExecutionLease, crm: CrmRecheckDecision, now: Date) {
+    const [row] = await tx.select({ count: sql<number>`count(*)::int` }).from(savIntakeEffectJournal).where(and(eq(savIntakeEffectJournal.executionId, lease.row.id),
+        eq(savIntakeEffectJournal.kind, CRM_RECHECK_JOURNAL), sql`${savIntakeEffectJournal.createdAt}>${crmEpisodeStart(lease.row.id)}`));
+    const attempts = Number(row?.count ?? 0) + (crm.decision === "recheck" ? 1 : 0);
+    const humanRequired = crm.decision === "human" || attempts >= CRM_RECHECK_POLICY.maxRechecks;
+    return { attempts, max: CRM_RECHECK_POLICY.maxRechecks, humanRequired, cause: crm.cause, nextAt: humanRequired ? null : new Date(now.getTime() + crmRecheckDelayMs(attempts)).toISOString() };
+}
+export async function endExecutionPass(lease: ExecutionLease, state: "waiting" | "uncertain", reason: string, crm?: CrmRecheckDecision) {
     await requireDb().transaction(async (tx) => {
         await admissionLock(tx);
+        const now = new Date();
+        // The schedule replaces any earlier one; a non-CRM wait leaves no stale schedule.
+        if (crm && state === "waiting") lease.payload.crmRecheck = await crmRecheckState(tx, lease, crm, now); else delete lease.payload.crmRecheck;
         const rows = await tx.update(savIntakeExecutions).set({
             state, leaseToken: null, leaseUntil: null, payloadCiphertext: encryptSavPayload({
                 ...lease.payload, reason
-            }), updatedAt: new Date()
+            }), updatedAt: now
         }).where(and(eq(savIntakeExecutions.id, lease.row.id), eq(savIntakeExecutions.leaseToken, lease.token))).returning();
         if (rows.length) {
             await tx.update(savMessages).set({
@@ -504,6 +546,10 @@ export async function endExecutionPass(lease: ExecutionLease, state: "waiting" |
                     reason, confirmedEffects: effects.filter(e => e.state === "confirmed").map(e => e.id)
                 });
             }
+            const schedule = lease.payload.crmRecheck;
+            if (schedule) await executionJournal(tx, lease.row.id, schedule.humanRequired ? CRM_REVIEW_JOURNAL : CRM_RECHECK_JOURNAL, {
+                reason, cause: schedule.cause, attempt: schedule.attempts, nextAt: schedule.nextAt, deltaHash: lease.payload.crmDelta?.currentHash ?? null
+            });
         }
         await executionJournal(tx, lease.row.id, rows.length ? "pass_waiting" : "obsolete_pass", {
             state, reason
@@ -660,6 +706,7 @@ export async function adoptCurrentExecutionVersion(lease: ExecutionLease, option
         lease.payload.plan = next;
         lease.payload.input = current.payload.input;
         delete lease.payload.baseline;
+        if (current.payload.crmEvidence) lease.payload.originalCrm = current.payload.crmEvidence; else delete lease.payload.originalCrm;
     }
     await requireDb().transaction(async (tx) => {
         await admissionLock(tx);

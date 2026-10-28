@@ -619,3 +619,12 @@ describe("SAV-43: a PDF sent to the reader follows the same role contract", () =
     expect(p.decision.classification).toBe("finance"); expect(target(p).learning).toBe("excluded");
   });
 });
+
+// SAV-45 C: a short relapse judged an acknowledgement is a judgement defect of the reader,
+// kept in the bench as a synthetic case; no prompt or wording change in this lot.
+it.fails("SAV-45 C (known judgement defect): a short relapse after a ticket is not completed as a bare acknowledgement", async () => {
+  const f = fixture(["acknowledgement"]); f.input.message.currentText = "Ça recommence.";
+  const p = await f.run();
+  // Expected once the reader is qualified: a support request, not an acknowledgement-only dossier.
+  expect(p.decision.classification).toBe("support");
+});

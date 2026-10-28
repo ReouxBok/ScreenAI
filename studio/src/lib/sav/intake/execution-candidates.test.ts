@@ -9,7 +9,7 @@ vi.mock("@/db", () => ({ requireDb: () => { if (!state.db) throw Error("NO_DB_AL
 // external-completion validation are real, including pagination and recovery.
 vi.mock("./execution-store", async importOriginal => ({ ...await importOriginal<typeof import("./execution-store")>(),
     admitIntakeExecution: async (id: string) => { state.admissions.push(id); return null; },
-    claimExecution: async (id: string) => { state.claims.push(id); return null; } }));
+    claimExecutionOrBlock: async (id: string) => { state.claims.push(id); return { blocked: "occupied" as const }; } }));
 vi.mock("./human-binding", async importOriginal => ({ ...await importOriginal<typeof import("./human-binding")>(), intakeRunConfigurationBound: async () => true }));
 vi.mock("./execution-policy", async importOriginal => ({ ...await importOriginal<typeof import("./execution-policy")>(), readIntakeExecutionAuthority: async () => ({ policy: state.policy }) }));
 import { encryptSavPayload } from "../crypto";

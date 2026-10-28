@@ -34,7 +34,9 @@ export type IntakeGeminiCall = (input: {
 export type IntakeModelTrace = { phase: string; model: string; promptRevision: string; inputHash: string; outputHash?: string;
   durationMs: number; accepted: boolean; errorCode: string | null; metadata?: SavGeminiMetadata; validationFailure?: IntakeEvidenceFailure & { stage?: IntakeOutputStage };
   normalization?: IntakeOutputNormalization;
-  contextLimit?: { stage: "catalogue" | "data" | "wire"; bytes: number; limitBytes?: number; breakdown?: IntakeContextBreakdown } };
+  contextLimit?: { stage: "catalogue" | "data" | "wire"; bytes: number; limitBytes?: number; breakdown?: IntakeContextBreakdown };
+  /** SAV-45: the sub-limit behind a BUDGET_EXHAUSTED decided by the reader itself. */
+  budgetLimit?: "analysis_calls" };
 export type SavIntakeSemanticReaders = Pick<IntakeAdapters, "analyseMessage" | "assessIssues" | "assessIdentity">;
 const hash = (data: unknown) => createHash("sha256").update(JSON.stringify(data)).digest("hex");
 type WireContract = { schema: z.ZodType; decode: (raw: unknown) => unknown; normalize?: (raw: unknown) => { value: unknown; counts: IntakeOutputNormalization } };
@@ -381,7 +383,8 @@ export function createSavIntakeSemanticReaders(options: {
       }
       const planningTrace = (errorCode: string) => options.onTrace?.({ phase: "ticket_matching", model: options.model, promptRevision: SAV_INTAKE_MODEL_REVISION,
         inputHash: hash(input.tickets), durationMs: 0, accepted: false, errorCode });
-      if (groups.length > 3 - calls) { planningTrace("SAV_INTAKE_RUNTIME_BUDGET_EXHAUSTED"); throw Error("SAV_INTAKE_RUNTIME_BUDGET_EXHAUSTED"); }
+      if (groups.length > 3 - calls) { options.onTrace?.({ phase: "ticket_matching", model: options.model, promptRevision: SAV_INTAKE_MODEL_REVISION, inputHash: hash(input.tickets), durationMs: 0, accepted: false,
+        errorCode: "SAV_INTAKE_RUNTIME_BUDGET_EXHAUSTED", budgetLimit: "analysis_calls" }); throw Error("SAV_INTAKE_RUNTIME_BUDGET_EXHAUSTED"); }
       if (groups.length > 1) {
         if (!options.planCalls) { planningTrace("SAV_INTAKE_MODEL_BATCH_PLANNING_REQUIRED"); throw Error("SAV_INTAKE_MODEL_BATCH_PLANNING_REQUIRED"); }
         try {

@@ -142,3 +142,29 @@ it("attempts the bounded reader cannot classify never turn into attempts remaini
   expect(result.attemptBudget).toMatchObject({failed:2,unknown:2,total:4,exhausted:"undetermined"});
   expect(result.attemptsExhausted).toBeNull();
 });
+
+// ---- SAV-45 C: causes without a public code, uncertain usages and budget sub-limits.
+import { savIntakeModelCalls } from "@/db/schema";
+import { intakeRuntimeHash } from "./runtime-contract";
+it("SAV-45 C: a wait without technical code keeps its engine cause or says it is unknown", async () => {
+  await run(1, 2, true, { plan: { decision: { disposition: { kind: "collect_context", reasons: ["history_incomplete", "same_issue_unresolved"] } }, progress: { kind: "collect_context" } } });
+  const [current] = (await readIntakeRunDiagnostics(threadId))!.runs;
+  expect(current.diagnostic).toMatchObject({ reason: null, waitingCause: "context_required", contextReasons: ["history_incomplete", "same_issue_unresolved"] });
+  expect(intakeDiagnosticPayload(encryptSavPayload({}))).toMatchObject({ reason: null, waitingCause: "unknown" });
+  expect(intakeDiagnosticPayload(encryptSavPayload({ reason: "SAV_INTAKE_RUNTIME_BUDGET_EXHAUSTED", budgetLimit: "per_message" }))).toMatchObject({ waitingCause: null, budgetLimit: "per_message" });
+  expect(intakeDiagnosticPayload(encryptSavPayload({ reason: "SAV_INTAKE_RUNTIME_BUDGET_EXHAUSTED", budgetLimit: "raise_me" }))).toMatchObject({ budgetLimit: null });
+});
+it("SAV-45 C: uncertain usages are described from the ledger, never settled, zeroed or retried", async () => {
+  const r = await run(1, 1, true, { reason: "SAV_INTAKE_RUNTIME_USAGE_UNCERTAIN" }), key = intakeRuntimeHash(messageId);
+  const row = (state: string, payload: unknown, hash: string) => ({ runId: r.id, messageKey: key, requestHash: hash, state, reservedNanoUsd: 817_152_000, chargedNanoUsd: state === "settled" ? 0 : 817_152_000, payloadCiphertext: encryptSavPayload(payload) });
+  await fixture.db.insert(savIntakeModelCalls).values([
+    row("uncertain", { metadata: {} }, "a".repeat(64)), row("uncertain", { metadata: { inputTokens: 100 } }, "b".repeat(64)),
+    row("settled", { metadata: {}, usageReconciliation: "provider_http_error_unbilled.v1", providerStatus: 503 }, "c".repeat(64)), row("dispatched", { model: "gemini-3.6-flash" }, "d".repeat(64))]);
+  const before = await fixture.db.select().from(savIntakeModelCalls);
+  const calls = (await readIntakeRunDiagnostics(threadId))!.modelCalls;
+  expect(calls.map(c => c.usage).sort()).toEqual(["counters_incomplete", "in_flight_or_lost", "no_usage_received", "provider_http_unbilled"]);
+  expect(calls.find(c => c.usage === "provider_http_unbilled")).toMatchObject({ providerStatus: 503, chargedNanoUsd: 0, state: "settled" });
+  expect(calls.filter(c => c.state === "uncertain").every(c => c.chargedNanoUsd === 817_152_000)).toBe(true);
+  expect(await fixture.db.select().from(savIntakeModelCalls)).toEqual(before);
+  expect(JSON.stringify(calls)).not.toMatch(/gemini|metadata|inputTokens/);
+});
