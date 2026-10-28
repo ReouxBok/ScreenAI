@@ -23,11 +23,23 @@ export function intakeBudgetUsage(rows: IntakeBudgetRow[], config: IntakeBudgetP
   const rollingRows = operational ? rows.filter(row => row.state !== "settled" || row.createdAt.getTime() >= rolling) : rows;
   const sum = (items: IntakeBudgetRow[]) => items.reduce((total,row) => total + row.chargedNanoUsd,0);
   const chargedNanoUsd = sum(dailyRows), rollingChargedNanoUsd = sum(rollingRows);
+  const unsettled = rows.filter(row => row.state !== "settled"), inFlight = unsettled.filter(row => row.state === "dispatched"), uncertain = unsettled.filter(row => row.state !== "dispatched");
   return { profile: operational ? SAV_INTAKE_OPERATIONAL_PROFILE : "qualification_lifetime", maxNanoUsd:config.maxNanoUsd, maxCalls:config.maxCalls,
     chargedNanoUsd, callCount:dailyRows.length, remainingNanoUsd:Math.max(0,config.maxNanoUsd-chargedNanoUsd), remainingCalls:Math.max(0,config.maxCalls-dailyRows.length),
     maxRollingNanoUsd:operational ? config.maxRollingNanoUsd! : config.maxNanoUsd, rollingChargedNanoUsd,
     remainingRollingNanoUsd:Math.max(0,(operational ? config.maxRollingNanoUsd! : config.maxNanoUsd)-rollingChargedNanoUsd),
-    lifetimeChargedNanoUsd:sum(rows), lifetimeCallCount:rows.length, uncertain:rows.some(row=>row.state!=="settled") };
+    lifetimeChargedNanoUsd:sum(rows), lifetimeCallCount:rows.length, uncertain:rows.some(row=>row.state!=="settled"),
+    // Breakdown for operators: confirmed cost, reservations of calls in flight, unknown costs kept.
+    settledNanoUsd:sum(dailyRows.filter(row=>row.state==="settled")), settledCallCount:dailyRows.filter(row=>row.state==="settled").length,
+    inFlightNanoUsd:sum(inFlight), inFlightCallCount:inFlight.length, uncertainNanoUsd:sum(uncertain), uncertainCallCount:uncertain.length,
+    oldestUnsettledAt:unsettled.length ? new Date(Math.min(...unsettled.map(row=>row.createdAt.getTime()))).toISOString() : null };
+}
+/** True when unsettled reservations alone stop the next call: without them both margins would admit it.
+ * Every unsettled row counts once in each margin, in both profiles. */
+export function intakeBlockedByUnsettled(usage: ReturnType<typeof intakeBudgetUsage>, requiredNanoUsd: number) {
+  const unsettled = usage.inFlightNanoUsd + usage.uncertainNanoUsd;
+  return unsettled > 0 && (usage.remainingNanoUsd < requiredNanoUsd || usage.remainingRollingNanoUsd < requiredNanoUsd)
+    && usage.maxNanoUsd - (usage.chargedNanoUsd - unsettled) >= requiredNanoUsd && usage.maxRollingNanoUsd - (usage.rollingChargedNanoUsd - unsettled) >= requiredNanoUsd;
 }
 /** Initial ingestion frontier is independent from this explicitly approved term.
  * Pricing validity can shorten the maximum30day authority; it cannot extend it. */

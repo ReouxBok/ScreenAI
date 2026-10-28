@@ -23,3 +23,12 @@ it("anyone but the budget owner is refused", async () => {
   mocks.panel.mockRejectedValue(Error("SAV_INTAKE_BUDGET_UNAUTHORIZED"));
   await expect(Page()).rejects.toThrow("SAV_INTAKE_BUDGET_UNAUTHORIZED");
 });
+it("BUDGET-RES breaks down confirmed spend, reservations in flight and unknown costs, and alerts when they block", async () => {
+  mocks.panel.mockResolvedValue({ ...panel, usage: { ...panel.usage, settledNanoUsd: 802_674_750, settledCallCount: 92, inFlightNanoUsd: 0, inFlightCallCount: 0,
+    uncertainNanoUsd: 8_988_672_000, uncertainCallCount: 11, oldestUnsettledAt: "2026-10-22T20:25:34.000Z", remainingNanoUsd: 208_653_250, requiredNanoUsd: 642_048_000,
+    blockedByUnsettled: true, reservationBoundRevoked: false } });
+  const html = renderToStaticMarkup(await Page());
+  for (const text of ["Dépense confirmée aujourd’hui", "0,80 USD (92 appel(s))", "Coûts incertains conservés", "8,99 USD (11 appel(s), le plus ancien depuis 2026-10-22T20:25:34.000Z)",
+    "Marge requise pour démarrer une analyse", "0,64 USD", "Les réservations au coût inconnu bloquent les analyses", "rien n’est libéré automatiquement"]) expect(html).toContain(text);
+  expect(html).not.toContain("817152");
+});
