@@ -76,9 +76,9 @@ export function createIntakeModelDispatcher(options: { config: IntakeRuntimeConf
         await live();
         active();
         sent = true;
-        if (diagnostic) diagnostic.dispatched = true;
         const signal = AbortSignal.any([options.signal, input.signal, ...(init.signal ? [init.signal] : [])]);
         if (signal.aborted) throw Error("SAV_INTAKE_RUNTIME_CONTEXT_CHANGED");
+        if (diagnostic) diagnostic.dispatched = true;
         const rawResponse = await network(url, { ...init, signal, redirect: "error" });
         if (diagnostic) diagnostic.httpStatus = rawResponse.status;
         const response = await evaluationProviderResponse(rawResponse, signal);
