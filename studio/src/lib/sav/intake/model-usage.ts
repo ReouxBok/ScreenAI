@@ -8,3 +8,7 @@ export function reconcileIntakeZeroThoughtUsage(metadata?: SavGeminiMetadata): S
   delete clean.usageReconciliation;
   return {...clean,...(zero?{thoughtTokens:0,usageReconciliation:"gemini_omitted_zero_thoughts.v1"}:{})};
 }
+/** Received statuses the provider documents as not charged: "If your request fails with a 400
+ * or 500 error, you won't be charged for the tokens used" (ai.google.dev/gemini-api/docs/billing),
+ * plus the 429 already admitted. Other received 4xx are not named there and stay uncertain. */
+export const unbilledProviderStatus = (status: number | undefined) => status === 400 || status === 429 || status !== undefined && status >= 500 && status <= 599;

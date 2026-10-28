@@ -197,7 +197,7 @@ export async function consumeIntakeHumanEvent(id: string, config: IntakeRuntimeC
       && (!reusableAnalysis?.ticketSummary || reusableAnalysis.requests.some(r=>r.kind==="other"||r.kind==="unknown")));
     const authority={eventId:id,parentRunId:parent.id,token};
     const live=async()=>{if(savIntakeRuntimeConfig()?.configHash!==config.configHash||deadline.aborted)return conflict();await assertSavAgentAnalysisAllowed(db);await assertIntakeHumanAnalysis(authority,config);};
-    const dispatcher=needsAnalysis?createIntakeModelDispatcher({config,signal:deadline,live,reserve:hash=>reserveIntakeHumanCall(authority,config,hash),preflight:hashes=>assertSavIntakeCallPlan(parent.messageId,config,hashes)}):null;
+    const dispatcher=needsAnalysis?createIntakeModelDispatcher({config,signal:deadline,live,reserve:(hash,size)=>reserveIntakeHumanCall(authority,config,hash,size),preflight:(hashes,sizes)=>assertSavIntakeCallPlan(parent.messageId,config,hashes,sizes)}):null;
     const semantics: IntakeRuntimePayload["semantics"]=needsAnalysis?{revision:SAV_INTAKE_SEMANTIC_RECORD_REVISION,validatorRevision:SAV_INTAKE_MODEL_REVISION,records:[]}:original.semantics;
     const attachments=value.reinvestigate ? await prepareIntakeAttachments({run:parent,token,...snapshot},config.model,live) : null;
     if(attachments) input={...intakeInputWithAttachments(input,event.sourceHash,attachments.state,attachments.prepared),humanResolution:input.humanResolution};

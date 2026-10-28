@@ -5,7 +5,7 @@ import { intakeAttemptBudget, SAV_INTAKE_ATTEMPT_POLICY, SAV_INTAKE_BLOCKING_JOU
 import { readSavExternalCompletion, listSavExternalCompletionMessageIds } from "../external-completion";
 import "server-only";
 import { reconcileIntakeZeroThoughtUsage } from "./model-usage";
-import { SAV_INTAKE_OPERATIONAL_PROFILE, intakeBudgetUsage } from "./budget-profile";
+import { SAV_INTAKE_OPERATIONAL_PROFILE, intakeBlockedByUnsettled, intakeBudgetUsage } from "./budget-profile";
 import { effectiveIntakeBudgetPins } from "./budget-override";
 import { assertSavAgentAnalysisAllowed, readSavAgentPause, SAV_AGENT_ANALYSIS_PAUSE_CODES } from "./agent-pause";
 import { intakeLaunchMatches } from "./launch-boundary";
@@ -19,7 +19,8 @@ import { decryptSavPayload, encryptSavPayload, savContentHash } from "../crypto"
 import { savAttachmentInventorySchema } from "../attachment-contract";
 import { prepareSavIntakeMessage } from "./message";
 import { invalidIntakeAddressMetadata, SAV_INTAKE_INVALID_SOURCE } from "./source-validation";
-import { savDerivedCostQuote } from "../derived-budget";
+import { unbilledProviderStatus } from "./model-usage";
+import { intakeMaxCallReservation, intakeRequestReservation, storedIntakeReservation, type IntakeRequestSize } from "./request-reservation";
 import type { SavGeminiMetadata } from "../gemini-response";
 import { intakeRuntimeHash, SAV_INTAKE_RUNTIME_REVISION, type IntakeRuntimeConfig, type IntakeRuntimePayload } from "./runtime-contract";
 import type { EngineInput } from "./engine-types";
@@ -31,12 +32,12 @@ type Body = { text: string; headers?: Record<string, string>; attachments?: unkn
 export type IntakeLease = { run: Run; token: string; input: EngineInput; provenance: Map<string, ReturnType<typeof prepareSavIntakeMessage>["provenance"]>; body: Body; sourceHash: string; recoveringRead?: true };
 const fail = (): never => { throw Error("SAV_INTAKE_RUNTIME_CONTEXT_CHANGED"); };
 const budgetColumns={id:savIntakeModelCalls.id,messageKey:savIntakeModelCalls.messageKey,requestHash:savIntakeModelCalls.requestHash,state:savIntakeModelCalls.state,reservedNanoUsd:savIntakeModelCalls.reservedNanoUsd,chargedNanoUsd:savIntakeModelCalls.chargedNanoUsd,payloadCiphertext:savIntakeModelCalls.payloadCiphertext,createdAt:savIntakeModelCalls.createdAt,runId:savIntakeModelCalls.runId};
-/** A received 429/5xx settled at zero with its explicit marker (see settleSavIntakeCall). */
+/** A received unbilled rejection settled at zero with its explicit marker (see settleSavIntakeCall). */
 function unbilledProviderRow(row: Pick<typeof savIntakeModelCalls.$inferSelect, "state" | "chargedNanoUsd" | "payloadCiphertext">) {
   if (row.state !== "settled" || row.chargedNanoUsd !== 0) return false;
   const data = decryptSavPayload<{ usageReconciliation?: string; providerStatus?: number }>(row.payloadCiphertext);
   return data.usageReconciliation === "provider_http_error_unbilled.v1" && Number.isSafeInteger(data.providerStatus)
-    && (data.providerStatus === 429 || Number(data.providerStatus) >= 500 && Number(data.providerStatus) <= 599);
+    && unbilledProviderStatus(data.providerStatus);
 }
 /** The ledger row a dispatch of this exact body maps to, shared by preflight and reservation:
  * a cached result is reused; an explicitly unbilled provider rejection is followed by a new,
@@ -55,17 +56,28 @@ async function resolveIntakeDispatch(tx: Pick<Tx, "select">, rows: readonly { id
   }
   throw Error("SAV_INTAKE_RUNTIME_CALL_ALREADY_CONSUMED");
 }
+/** Validates every ledger row and returns whether the per-request input bound is revoked:
+ * one settled call whose provider-reported input exceeded the bound it reserved. */
 function budgetRowsValid(rows: Pick<typeof savIntakeModelCalls.$inferSelect,"reservedNanoUsd"|"chargedNanoUsd"|"payloadCiphertext"|"state">[]) {
+  let revoked = false;
   for (const row of rows) {
-    const data = decryptSavPayload<{ metadata?: SavGeminiMetadata }>(row.payloadCiphertext), m = data.metadata ?? {};
-    // A received 429/5xx rejection is settled at zero with its explicit marker (see settleSavIntakeCall).
-    if (unbilledProviderRow(row) && row.reservedNanoUsd === 817_152_000) continue;
+    const data = decryptSavPayload<{ metadata?: SavGeminiMetadata; reservation?: unknown; reservationExceeded?: boolean }>(row.payloadCiphertext), m = data.metadata ?? {};
+    // Rows reserved before per-request reservations carry the full quote and no descriptor.
+    const reservation = data.reservation === undefined ? null : storedIntakeReservation(data.reservation, row.reservedNanoUsd);
+    if (data.reservation === undefined ? row.reservedNanoUsd !== 817_152_000 : !reservation) throw Error("SAV_INTAKE_RUNTIME_LEDGER_REJECTED");
+    // A received unbilled rejection is settled at zero with its explicit marker (see settleSavIntakeCall).
+    if (unbilledProviderRow(row)) continue;
     const { inputTokens: i, outputTokens: o, thoughtTokens: t, totalTokens: total } = m;
     const known = [i, o, t, total].every(n => Number.isSafeInteger(n) && Number(n) >= 0) && Number(i) > 0 && Number(i) <= 1_048_576
       && Number(o) + Number(t) <= 8192 && Number(i) + Number(o) + Number(t) === total;
-    if (row.reservedNanoUsd !== 817_152_000 || !Number.isSafeInteger(row.chargedNanoUsd) || row.chargedNanoUsd < 0
+    if (!Number.isSafeInteger(row.chargedNanoUsd) || row.chargedNanoUsd < 0
       || (row.state === "settled" ? !known || row.chargedNanoUsd !== Number(i) * 750 + (Number(o) + Number(t)) * 3750 : row.chargedNanoUsd !== row.reservedNanoUsd)) throw Error("SAV_INTAKE_RUNTIME_LEDGER_REJECTED");
+    // The marker must match the counters: it can be neither forged nor dropped.
+    const exceeded = row.state === "settled" && reservation !== null && Number(i) > reservation.inputTokenBound;
+    if (Boolean(data.reservationExceeded) !== exceeded) throw Error("SAV_INTAKE_RUNTIME_LEDGER_REJECTED");
+    revoked ||= exceeded;
   }
+  return { revoked };
 }
 
 const latest = async (tx: Tx, threadId: string) => (await tx.select().from(savMessages).where(and(eq(savMessages.threadId, threadId), eq(savMessages.direction, "inbound")))
@@ -250,11 +262,12 @@ export async function claimSavIntakeRun(id: string, config: IntakeRuntimeConfig,
       // still passes its unchanged plan/reservation budget guards.
       await tx.execute(sql`select pg_advisory_xact_lock(hashtext('sav-intake-runtime-model-budget-v1'))`);
       const rows=await tx.select(budgetColumns).from(savIntakeModelCalls);
-      budgetRowsValid(rows);
+      const {revoked}=budgetRowsValid(rows);
       const budgetNow=new Date(),usage=intakeBudgetUsage(rows,await effectiveIntakeBudgetPins(tx,config),budgetNow);
       const messageKey=intakeRuntimeHash(run.messageId);
       const unknown=rows.some(row=>row.messageKey===messageKey&&row.state!=="settled");
-      const quote=savDerivedCostQuote(config.model,8192,budgetNow);
+      // The largest single call this dossier may need, not the smaller amount it will reserve.
+      const quote=intakeMaxCallReservation(config.model,budgetNow,revoked);
       if(unknown||!recoveringRead&&(usage.remainingCalls<1||usage.remainingNanoUsd<quote.reservedNanoUsd||usage.remainingRollingNanoUsd<quote.reservedNanoUsd)) {
         const payload=decryptSavPayload<IntakeRuntimePayload>(run.payloadCiphertext);
         // The shared margin, not this dossier. Only the daily margin frees at the next UTC day; the
@@ -263,7 +276,10 @@ export async function claimSavIntakeRun(id: string, config: IntakeRuntimeConfig,
         const reason=unknown?"SAV_INTAKE_RUNTIME_USAGE_UNCERTAIN":rolling?"SAV_INTAKE_RUNTIME_ROLLING_BUDGET_DEFERRED":"SAV_INTAKE_RUNTIME_DAILY_BUDGET_DEFERRED";
         await tx.update(savIntakeRuns).set({state:unknown?"uncertain":"waiting",payloadCiphertext:encryptSavPayload({...payload,reason}),leaseToken:null,leaseUntil:null,freshUntil:null,updatedAt:budgetNow}).where(eq(savIntakeRuns.id,id));
         await tx.update(savMessages).set({analysisStatus:unknown?"intake_uncertain":"intake_waiting"}).where(eq(savMessages.id,run.messageId));
-        await journal(tx,id,"budget_deferred_before_attempt",{reason,attemptsUnchanged:true});
+        // Whether unsettled reservations alone block it: their release stays a separate, validated operation.
+        await journal(tx,id,"budget_deferred_before_attempt",{reason,attemptsUnchanged:true,requiredNanoUsd:quote.reservedNanoUsd,
+          unsettledCalls:usage.uncertainCallCount+usage.inFlightCallCount,unsettledNanoUsd:usage.uncertainNanoUsd+usage.inFlightNanoUsd,
+          blockedByUnsettled:!unknown&&intakeBlockedByUnsettled(usage,quote.reservedNanoUsd)});
         return null;
       }
     }
@@ -381,49 +397,55 @@ export async function pendingSavIntakeRuns(config: IntakeRuntimeConfig, now = ne
 }
 /** Read-only preflight for a complete comparison batch. This is not a reservation:
  * each dispatch still acquires its normal lock and enforces the same limits. */
-export async function assertSavIntakeCallPlan(messageId: string, config: IntakeRuntimeConfig, hashes: readonly string[]) {
-  if (!hashes.length || hashes.length > 3 || new Set(hashes).size !== hashes.length || hashes.some(h => !/^[a-f0-9]{64}$/.test(h))) throw Error("SAV_INTAKE_RUNTIME_DISPATCH_REJECTED");
+export async function assertSavIntakeCallPlan(messageId: string, config: IntakeRuntimeConfig, hashes: readonly string[], sizes?: readonly IntakeRequestSize[]) {
+  if (!hashes.length || hashes.length > 3 || new Set(hashes).size !== hashes.length || hashes.some(h => !/^[a-f0-9]{64}$/.test(h))
+    || sizes && sizes.length !== hashes.length) throw Error("SAV_INTAKE_RUNTIME_DISPATCH_REJECTED");
   await requireDb().transaction(async tx => {
     await tx.execute(sql`select pg_advisory_xact_lock(hashtext('sav-intake-runtime-model-budget-v1'))`);
     await assertSavAgentAnalysisAllowed(tx);
     const rows = await tx.select(budgetColumns).from(savIntakeModelCalls), messageKey = intakeRuntimeHash(messageId);
-    budgetRowsValid(rows);
+    const { revoked } = budgetRowsValid(rows);
     if (rows.some(row => row.state !== "settled" && (config.budgetProfile !== SAV_INTAKE_OPERATIONAL_PROFILE || row.messageKey === messageKey))) throw Error("SAV_INTAKE_RUNTIME_USAGE_UNCERTAIN");
     const own = rows.filter(row => row.messageKey === messageKey);
     // The exact rows the next dispatches will use: cache, unbilled-rejection retry or new.
     const resolved = await Promise.all(hashes.map(h => resolveIntakeDispatch(tx, rows, messageKey, h)));
     const needed = resolved.filter(r => r.kind === "new").length, now = new Date();
+    // The same amounts the dispatches will reserve: each new request at its own size.
+    const neededNanoUsd = resolved.reduce((sum, r, i) => r.kind === "new" ? sum + intakeRequestReservation(config.model, sizes?.[i], now, revoked).reservedNanoUsd : sum, 0);
     // The same per-version bound as the reservation, for the current version of this message.
     const [current] = await tx.select({ id: savIntakeRuns.id }).from(savIntakeRuns).where(and(eq(savIntakeRuns.messageId, messageId), eq(savIntakeRuns.isCurrent, true))).limit(1);
     const version = current ? rows.filter(row => row.runId === current.id).length : 0;
-    const usage = intakeBudgetUsage(rows, await effectiveIntakeBudgetPins(tx, config), now), quote = savDerivedCostQuote(config.model, 8192, now);
-    if (own.length + needed > SAV_INTAKE_CALL_POLICY.perMessage || version + needed > SAV_INTAKE_CALL_POLICY.perVersion || needed > usage.remainingCalls || needed * quote.reservedNanoUsd > usage.remainingNanoUsd
-      || needed * quote.reservedNanoUsd > usage.remainingRollingNanoUsd) throw Error("SAV_INTAKE_RUNTIME_BUDGET_EXHAUSTED");
+    const usage = intakeBudgetUsage(rows, await effectiveIntakeBudgetPins(tx, config), now);
+    if (own.length + needed > SAV_INTAKE_CALL_POLICY.perMessage || version + needed > SAV_INTAKE_CALL_POLICY.perVersion || needed > usage.remainingCalls || neededNanoUsd > usage.remainingNanoUsd
+      || neededNanoUsd > usage.remainingRollingNanoUsd) throw Error("SAV_INTAKE_RUNTIME_BUDGET_EXHAUSTED");
   });
 }
-async function reserveIntakeCall(tx: Tx, run: Run, config: IntakeRuntimeConfig, requestHash: string, now: Date) {
+async function reserveIntakeCall(tx: Tx, run: Run, config: IntakeRuntimeConfig, requestHash: string, now: Date, size?: IntakeRequestSize) {
+    // A malformed size is refused before the ledger is read or the lock is taken.
+    if (size) intakeRequestReservation(config.model, size, now);
     await tx.execute(sql`select pg_advisory_xact_lock(hashtext('sav-intake-runtime-model-budget-v1'))`);
     // Under the budget lock, like the Studio pause write: no reservation once a full pause is committed.
     await assertSavAgentAnalysisAllowed(tx);
     const rows = await tx.select(budgetColumns).from(savIntakeModelCalls), messageKey = intakeRuntimeHash(run.messageId);
-    budgetRowsValid(rows);
+    const { revoked } = budgetRowsValid(rows);
     const resolved = await resolveIntakeDispatch(tx, rows, messageKey, requestHash);
     if (resolved.kind === "cached") return { id: resolved.id, cached: decryptSavPayload<{ json: unknown; metadata: SavGeminiMetadata }>(resolved.resultCiphertext) };
     requestHash = resolved.hash;
     if (rows.some(row => row.state !== "settled" && (config.budgetProfile !== SAV_INTAKE_OPERATIONAL_PROFILE || row.messageKey === messageKey))) throw Error("SAV_INTAKE_RUNTIME_USAGE_UNCERTAIN");
     const budgetNow=config.budgetProfile===SAV_INTAKE_OPERATIONAL_PROFILE ? new Date() : now;
     if(!Number.isFinite(now.getTime())||now>budgetNow)throw Error("SAV_INTAKE_RUNTIME_LEDGER_CLOCK_REJECTED");
-    const price = savDerivedCostQuote(config.model, 8192, budgetNow);
+    // Sized from the exact body; a caller without a size, or a revoked bound, reserves the full window.
+    const price = intakeRequestReservation(config.model, size, budgetNow, revoked);
     const usage = intakeBudgetUsage(rows,await effectiveIntakeBudgetPins(tx,config),budgetNow);
     if (usage.remainingCalls < 1 || rows.filter(row => row.messageKey === messageKey).length >= SAV_INTAKE_CALL_POLICY.perMessage
       || rows.filter(row => row.runId === run.id).length >= SAV_INTAKE_CALL_POLICY.perVersion
       || price.reservedNanoUsd > usage.remainingNanoUsd || price.reservedNanoUsd > usage.remainingRollingNanoUsd) throw Error("SAV_INTAKE_RUNTIME_BUDGET_EXHAUSTED");
     const [row] = await tx.insert(savIntakeModelCalls).values({ runId: run.id, messageKey, requestHash, state: "dispatched", reservedNanoUsd: price.reservedNanoUsd,
-      chargedNanoUsd: price.reservedNanoUsd, createdAt:budgetNow, payloadCiphertext: encryptSavPayload({ model: config.model, configHash: config.configHash }) }).returning();
+      chargedNanoUsd: price.reservedNanoUsd, createdAt:budgetNow, payloadCiphertext: encryptSavPayload({ model: config.model, configHash: config.configHash, reservation: price }) }).returning();
     return { id: row.id, cached: null };
 }
-export async function reserveSavIntakeCall(lease: IntakeLease, config: IntakeRuntimeConfig, requestHash: string, now = new Date()) {
-  return requireDb().transaction(async tx => { await assertLease(tx,lease,config,now); return reserveIntakeCall(tx,lease.run,config,requestHash,now); });
+export async function reserveSavIntakeCall(lease: IntakeLease, config: IntakeRuntimeConfig, requestHash: string, now = new Date(), size?: IntakeRequestSize) {
+  return requireDb().transaction(async tx => { await assertLease(tx,lease,config,now); return reserveIntakeCall(tx,lease.run,config,requestHash,now,size); });
 }
 export type IntakeHumanAnalysisAuthority={eventId:string;parentRunId:string;token:string};
 async function assertHumanAnalysis(tx:Tx, authority:IntakeHumanAnalysisAuthority,config:IntakeRuntimeConfig,now:Date) {
@@ -444,10 +466,10 @@ async function assertHumanAnalysis(tx:Tx, authority:IntakeHumanAnalysisAuthority
 export async function assertIntakeHumanAnalysis(authority:IntakeHumanAnalysisAuthority,config:IntakeRuntimeConfig) {
   await requireDb().transaction(tx=>assertHumanAnalysis(tx,authority,config,new Date()));
 }
-export async function reserveIntakeHumanCall(authority:IntakeHumanAnalysisAuthority,config:IntakeRuntimeConfig,requestHash:string) {
-  return requireDb().transaction(async tx=>{const now=new Date(),run=await assertHumanAnalysis(tx,authority,config,now);return reserveIntakeCall(tx,run,config,requestHash,now);});
+export async function reserveIntakeHumanCall(authority:IntakeHumanAnalysisAuthority,config:IntakeRuntimeConfig,requestHash:string,size?:IntakeRequestSize) {
+  return requireDb().transaction(async tx=>{const now=new Date(),run=await assertHumanAnalysis(tx,authority,config,now);return reserveIntakeCall(tx,run,config,requestHash,now,size);});
 }
-export async function settleSavIntakeCall(id: string, metadata?: SavGeminiMetadata, result?: { json: unknown; metadata: SavGeminiMetadata }, unbilledProviderStatus?: number) {
+export async function settleSavIntakeCall(id: string, metadata?: SavGeminiMetadata, result?: { json: unknown; metadata: SavGeminiMetadata }, providerStatus?: number) {
   return requireDb().transaction(async tx => {
     await tx.execute(sql`select pg_advisory_xact_lock(hashtext('sav-intake-runtime-model-budget-v1'))`);
     const [row] = await tx.select().from(savIntakeModelCalls).where(eq(savIntakeModelCalls.id, id)).for("update"); if (!row) return fail();
@@ -455,14 +477,20 @@ export async function settleSavIntakeCall(id: string, metadata?: SavGeminiMetada
     const { inputTokens: i, outputTokens: o, thoughtTokens: t, totalTokens: total } = metadata ?? {};
     const valid = [i, o, t, total].every(n => Number.isSafeInteger(n) && Number(n) >= 0) && Number(i) >= 1 && Number(i) <= 1_048_576
       && Number(o) + Number(t) <= 8192 && Number(i) + Number(o) + Number(t) === total;
-    // Gemini billing contract: failed 400/500-class requests are not charged in tokens but still
-    // count against quota (ai.google.dev/gemini-api/docs/billing, "Am I charged for failed requests?").
-    // Only a RECEIVED 429/5xx is settled at zero, with its status kept for reconciliation; it still
-    // counts as a dispatch. Timeouts and lost answers stay uncertain.
-    const unbilled = !valid && unbilledProviderStatus !== undefined && (unbilledProviderStatus === 429 || unbilledProviderStatus >= 500 && unbilledProviderStatus <= 599) && !result;
+    // Gemini billing contract: a failed 400 or 500 request is not charged in tokens but still
+    // counts against quota (ai.google.dev/gemini-api/docs/billing, "Am I charged for failed requests?").
+    // Only a RECEIVED documented status is settled at zero, with its status kept for reconciliation;
+    // it still counts as a dispatch. Timeouts, lost answers and other statuses stay uncertain.
+    const unbilled = !valid && unbilledProviderStatus(providerStatus) && !result;
     const cost = valid ? Number(i) * 750 + (Number(o) + Number(t)) * 3750 : unbilled ? 0 : row.reservedNanoUsd;
+    // The descriptor survives settlement. A real cost above the reserved input bound is charged in
+    // full (never capped) and marked: it revokes the per-request bound for every later reservation.
+    const prior = decryptSavPayload<{ reservation?: unknown }>(row.payloadCiphertext).reservation;
+    const reservation = prior === undefined ? null : storedIntakeReservation(prior, row.reservedNanoUsd);
+    const exceeded = valid && reservation !== null && Number(i) > reservation.inputTokenBound;
     await tx.update(savIntakeModelCalls).set({ state: valid || unbilled ? "settled" : "uncertain", chargedNanoUsd: cost,
-      payloadCiphertext: encryptSavPayload({ metadata: metadata ?? {}, ...(unbilled ? { usageReconciliation: "provider_http_error_unbilled.v1", providerStatus: unbilledProviderStatus } : {}) }), resultCiphertext: valid && result && row.runId ? encryptSavPayload(result) : null, settledAt: new Date() }).where(eq(savIntakeModelCalls.id, id));
+      payloadCiphertext: encryptSavPayload({ metadata: metadata ?? {}, ...(prior === undefined ? {} : { reservation: prior }), ...(exceeded ? { reservationExceeded: true } : {}),
+        ...(unbilled ? { usageReconciliation: "provider_http_error_unbilled.v1", providerStatus } : {}) }), resultCiphertext: valid && result && row.runId ? encryptSavPayload(result) : null, settledAt: new Date() }).where(eq(savIntakeModelCalls.id, id));
     return valid || unbilled;
   });
 }
@@ -533,8 +561,9 @@ export async function checkpointSavIntakeRun(lease: IntakeLease, payload: Intake
 }
 export async function readSavIntakeBudget(config: IntakeRuntimeConfig, now = new Date()) {
   const db = requireDb(), rows = await db.select(budgetColumns).from(savIntakeModelCalls);
-  budgetRowsValid(rows);
-  return intakeBudgetUsage(rows,await effectiveIntakeBudgetPins(db,config),now);
+  const { revoked } = budgetRowsValid(rows), usage = intakeBudgetUsage(rows,await effectiveIntakeBudgetPins(db,config),now);
+  const requiredNanoUsd = intakeMaxCallReservation(config.model, now, revoked).reservedNanoUsd;
+  return { ...usage, requiredNanoUsd, reservationBoundRevoked: revoked, blockedByUnsettled: intakeBlockedByUnsettled(usage, requiredNanoUsd) };
 }
 
 /** Transient retries scheduled for this MESSAGE across all its versions: the dispatch ordinal

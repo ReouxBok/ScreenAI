@@ -325,7 +325,10 @@ it.each(["promptTokenCount", "candidatesTokenCount", "totalTokenCount"].flatMap(
   const network = vi.fn(async () => Response.json({ candidates: [{ finishReason: "STOP", content: { parts: [{ text: output === "valid_json" ? JSON.stringify({ messageId, requests: [] }) : "{invalid-json" }] } }], usageMetadata: providerUsage }));
   await analyseSavIntakeRuntime(id!, config, { env: () => environment, network });
   const budget = await readSavIntakeBudget(config), current = await readSavIntakeCurrent(threadId, config);
-  expect(budget).toMatchObject({ callCount: 1, chargedNanoUsd: 817_152_000, uncertain: true });
+  // The unknown cost keeps the whole reservation of this request (sized from its body, never zero).
+  const [reserved] = await f.db.select().from(savIntakeModelCalls);
+  expect(budget).toMatchObject({ callCount: 1, chargedNanoUsd: reserved.reservedNanoUsd, uncertainNanoUsd: reserved.reservedNanoUsd, uncertain: true });
+  expect(reserved.reservedNanoUsd).toBeGreaterThan(8192 * 3750); expect(reserved.reservedNanoUsd).toBeLessThan(817_152_000);
   expect(current?.state).toBe("uncertain"); expect(current?.fresh).toBe(false);
   const [call] = await f.db.select().from(savIntakeModelCalls); expect(call.state).toBe("uncertain"); expect(call.resultCiphertext).toBeNull();
   const tokenField = { promptTokenCount: "inputTokens", candidatesTokenCount: "outputTokens", thoughtsTokenCount: "thoughtTokens", totalTokenCount: "totalTokens" }[counter]!;
@@ -611,7 +614,9 @@ it.each([149, 151])("does not infer omitted thoughts from an unbalanced total %s
   const id = await enqueueSavIntakeMessage(messageId, config);
   const network = vi.fn(async () => Response.json({ candidates: [{ finishReason: "STOP", content: { parts: [{ text: JSON.stringify({ messageId, requests: [] }) }] } }], usageMetadata: { promptTokenCount: 100, candidatesTokenCount: 50, totalTokenCount } }));
   await analyseSavIntakeRuntime(id!, config, { env: () => environment, network });
-  expect(await readSavIntakeBudget(config)).toMatchObject({ callCount: 1, chargedNanoUsd: 817_152_000, uncertain: true });
+  const [reserved] = await f.db.select().from(savIntakeModelCalls);
+  expect(await readSavIntakeBudget(config)).toMatchObject({ callCount: 1, chargedNanoUsd: reserved.reservedNanoUsd, uncertainNanoUsd: reserved.reservedNanoUsd, uncertain: true });
+  expect(reserved.reservedNanoUsd).toBeGreaterThan(8192 * 3750);
   expect((await readSavIntakeCurrent(threadId, config))?.state).toBe("uncertain");
   const [call] = await f.db.select().from(savIntakeModelCalls);
   expect(decryptSavPayload<{metadata: unknown}>(call.payloadCiphertext).metadata).not.toHaveProperty("usageReconciliation");
@@ -1107,8 +1112,9 @@ it("REVIEW a rolling budget deferral must not promise tomorrow's daily reset",as
  operational();
  environment={...environment,SAV_INTAKE_RUNTIME_CONFIG:JSON.stringify({...JSON.parse(environment.SAV_INTAKE_RUNTIME_CONFIG!),maxRollingNanoUsd:1000000000})};
  config=savIntakeRuntimeConfig(environment)!;
- const u={inputTokens:400000,outputTokens:50,thoughtTokens:0,totalTokens:400050};
- await f.db.insert(savIntakeModelCalls).values({messageKey:intakeRuntimeHash("older"),requestHash:intakeRuntimeHash("older-body"),state:"settled",reservedNanoUsd:817152000,chargedNanoUsd:300187500,payloadCiphertext:encryptSavPayload({metadata:u}),createdAt:new Date(Date.now()-86400000)});
+ // Remaining rolling margin 0.55 USD: below the largest single call (0.642048 USD), daily margin intact.
+ const u={inputTokens:600000,outputTokens:50,thoughtTokens:0,totalTokens:600050};
+ await f.db.insert(savIntakeModelCalls).values({messageKey:intakeRuntimeHash("older"),requestHash:intakeRuntimeHash("older-body"),state:"settled",reservedNanoUsd:817152000,chargedNanoUsd:450187500,payloadCiphertext:encryptSavPayload({metadata:u}),createdAt:new Date(Date.now()-86400000)});
  const id=(await enqueueSavIntakeMessage(messageId,config))!;
  expect(await claimSavIntakeRun(id,config)).toBeNull();
  vi.useFakeTimers({toFake:["Date"]});vi.setSystemTime(new Date(Date.parse(new Date().toISOString().slice(0,10)+"T00:00:00Z")+86400000));
