@@ -7,7 +7,9 @@ import { readIntakeRunDiagnostics } from "@/lib/sav/intake/run-diagnostics";
 import { intakeBudgetOwnerFor, readIntakeBudgetPanel } from "@/lib/sav/intake/budget-admin";
 import { savIntakeViewLabels, savIntakeViewSchema } from "@/lib/sav/intake/contract";
 import { intakeStatusLabel, intakeReasonLabel, intakeBlockedCauseLabel, intakeRetryLabel } from "@/lib/sav/intake/console-presentation";
-import { intakeDossierView, intakeEffectLabels, intakeEffectStateLabels, intakeRouteLabel, intakeEffectsTitle, type IntakeConsoleDetail } from "@/lib/sav/intake/dossier-view";
+import { readOperatorPanel } from "@/lib/sav/intake-ux/operator-commands";
+import { readManualOtherBinding } from "@/lib/sav/intake/manual-other-classification";
+import { intakeDossierView, intakeDossierActions, intakeEffectLabels, intakeEffectStateLabels, intakeRouteLabel, intakeEffectsTitle, type IntakeConsoleDetail } from "@/lib/sav/intake/dossier-view";
 
 /** Uniform tool result. A refusal is an answer, not a transport error. */
 export type StudioMcpResult = { outcome: "done" | "already_done" | "refused"; code: string; message: string; data?: unknown };
@@ -62,6 +64,25 @@ export function intakeDossierSummary(data: IntakeConsoleDetail) {
   };
 }
 
+/** The write tools this staff member could use now, with the dossier page's own conditions and
+ * the same async readers (operator panel, manual Other binding). Advisory: each write re-checks. */
+export async function intakeAvailableActions(data: IntakeConsoleDetail, staff: Staff) {
+  const view = intakeDossierView(data), actions = intakeDossierActions(data, view, staff);
+  const panel = actions.administrator && actions.operatorBinding ? await readOperatorPanel(actions.operatorBinding).catch(() => null) : null;
+  const manualOther = actions.manualOtherCandidate && data.latestMessageId ? await readManualOtherBinding(data.thread.id, data.latestMessageId, data.projection.epoch).catch(() => null) : null;
+  return [
+    { tool: "close_handled_outside", available: actions.closeHandledOutside, requires: "attestHandled: true" },
+    { tool: "classify_invalid_source_other", available: actions.classifyInvalidSource, requires: "attest: true" },
+    { tool: "classify_other", available: Boolean(manualOther), requires: "attest: true, reason" },
+    { tool: "release_hold", available: actions.releaseHold, requires: "reason" },
+    { tool: "record_choice", available: actions.recordChoice, requires: "kind, reason ; contactId/ticketId parmi candidates pour select" },
+    { tool: "continue_dossier", available: Boolean(panel && (panel.allowResume || panel.allowReanalysis || panel.allowInformation)),
+      kinds: panel ? { resume: panel.allowResume, reanalyse: panel.allowReanalysis, information: panel.allowInformation } : null, unavailableReason: panel?.unavailableReason ?? null },
+    { tool: "request_reinvestigation", available: actions.administratorVerifications, requires: "reason" },
+    { tool: "reconcile_note", available: actions.administratorVerifications && actions.noteReceipt },
+    { tool: "reconcile_identification", available: actions.administratorVerifications },
+  ];
+}
 const listDossiers = { name: "list_dossiers", title: "Lister les dossiers SAV", write: false,
   description: "Liste les dossiers de la console des nouveaux dossiers SAV (25 par page), avec les compteurs de chaque vue. Mêmes données et libellés que la console.",
   input: z.object({ view: viewSchema.default("processing"), search: z.string().max(120).optional(), page: z.number().int().min(1).max(10000).default(1),
@@ -80,9 +101,10 @@ const listDossiers = { name: "list_dossiers", title: "Lister les dossiers SAV", 
 const getDossier = { name: "get_dossier", title: "Lire un dossier SAV", write: false,
   description: "Lit un dossier : état, verrous, décision courante, actions confirmées ou incertaines, dernier message (borné) et jeton de version à renvoyer avec toute écriture.",
   input: z.object({ threadId: z.uuid() }).strict(),
-  async run(_context: StudioMcpContext, input: { threadId: string }) {
+  async run(context: StudioMcpContext, input: { threadId: string }) {
     const data = await readIntakeConsoleDetail(input.threadId);
-    return data ? done(intakeDossierSummary(data)) : refused("SAV_INTAKE_DOSSIER_NOT_FOUND", "Dossier introuvable dans la console des nouveaux dossiers.");
+    if (!data) return refused("SAV_INTAKE_DOSSIER_NOT_FOUND", "Dossier introuvable dans la console des nouveaux dossiers.");
+    return done({ ...intakeDossierSummary(data), availableActions: await intakeAvailableActions(data, context.staff) });
   } };
 const getDiagnostics = { name: "get_diagnostics", title: "Diagnostic technique d’un dossier", write: false,
   description: "Historique des analyses, tentatives, réveils, effets et derniers codes de refus. Réservé aux administrateurs, comme l’API de diagnostic.",

@@ -47,3 +47,22 @@ export function intakeDossierView(data: IntakeConsoleDetail) {
     ? intakeHandoff({ reasons: handoffReasons, blockedCause: blocked ? "attempts_exhausted" : null, assessments: assessed, judgement }) : null;
   return { current, blocked, applicable, plan, disposition, historicalPlan, contacts, tickets, target, historicalTarget, dirty, canCorrect, currentEffects, question, handoff };
 }
+/** Which operator actions the dossier page offers to this staff member, with the page's own
+ * conditions. Async availability (operator panel, manual Other binding) is read by the caller. */
+export function intakeDossierActions(data: IntakeConsoleDetail, view: Pick<ReturnType<typeof intakeDossierView>, "current" | "canCorrect" | "plan">, staff: { email: string; role: string }) {
+  const { current } = view, administrator = ["admin", "owner"].includes(staff.role), owner = staff.email === "ugo@limova.ai" && administrator;
+  return {
+    administrator,
+    closeHandledOutside: Boolean((!data.handledExternally || data.projection.status === "human_review") && data.latestMessageId && owner),
+    classifyInvalidSource: Boolean(!data.handledExternally && current?.sourceInvalid && current.messageId === data.latestMessageId && owner),
+    releaseHold: Boolean(data.humanHeld && !data.handledExternally && data.latestMessageId && administrator),
+    recordChoice: Boolean(view.canCorrect && current?.sourceHash && view.plan),
+    manualOtherCandidate: Boolean(owner && !data.handledExternally && !data.humanHeld && !data.thread.paused && !data.confirmedCurrent && !current?.sourceInvalid
+      && data.latestMessageId && !data.progress?.effects.some(effect => effect.state !== "planned")
+      && (data.projection.view === "to_validate" || data.projection.view === null)),
+    operatorBinding: current?.sourceHash && current.messageId === data.latestMessageId
+      ? { threadId: data.thread.id, messageId: current.messageId, runId: current.id, version: current.version, sourceHash: current.sourceHash } : null,
+    administratorVerifications: Boolean(administrator && data.latestMessageId),
+    noteReceipt: Boolean(data.progress?.effects.some(effect => effect.kind === "note_create" && effect.ack?.id)),
+  };
+}

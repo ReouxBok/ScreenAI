@@ -1,10 +1,11 @@
 import "server-only";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { WebStandardStreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js";
-import { authorizeSavStaffUser } from "@/lib/sav/intake/console-auth";
+import { authorizeSavStaffUser, withSavRequestUser } from "@/lib/sav/intake/console-auth";
 import { studioMcpConfig } from "./config";
 import { resolveStudioMcpUser, StudioMcpAuthError } from "./identity";
 import { studioMcpTools, type StudioMcpContext, type StudioMcpResult, type StudioMcpTool } from "./tools";
+import { studioMcpPauseReadTool, studioMcpWriteTools } from "./writes";
 
 const json = { "Cache-Control": "private, no-store", "X-Content-Type-Options": "nosniff" };
 /** Per staff member and instance: enough for an agent, bounded against a loop. */
@@ -25,14 +26,15 @@ function failure(error: unknown): StudioMcpResult {
 }
 async function call(tool: StudioMcpTool, context: StudioMcpContext, input: unknown) {
   const started = Date.now();
-  const result = await tool.run(context, input as never).catch(failure);
+  // The console's own server functions authenticate this staff member, exactly as for a session.
+  const result = await withSavRequestUser(context.user, () => tool.run(context, input as never)).catch(failure);
   // No dossier content, no arguments: tool, outcome, code and duration only.
   console.info("studio_mcp", { tool: tool.name, actorId: context.staff.id, outcome: result.outcome, code: result.code, durationMs: Date.now() - started });
   return result;
 }
 export function createStudioMcpServer(context: StudioMcpContext, options: { writes: boolean }) {
   const server = new McpServer({ name: "studio-limova-sav", version: "1.0.0" });
-  for (const tool of studioMcpTools.filter(t => options.writes || !t.write)) {
+  for (const tool of [...studioMcpTools, studioMcpPauseReadTool, ...studioMcpWriteTools].filter(t => options.writes || !t.write)) {
     server.registerTool(tool.name, { title: tool.title, description: tool.description, inputSchema: tool.input,
       annotations: { readOnlyHint: !tool.write, destructiveHint: tool.write, idempotentHint: !tool.write, openWorldHint: false } },
     async (input: unknown) => {

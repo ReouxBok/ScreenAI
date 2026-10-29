@@ -3,7 +3,7 @@ import { notFound } from "next/navigation";
 import { z } from "zod";
 import { requireIntakeConsoleStaff } from "@/lib/sav/intake/console-auth";
 import { readIntakeConsoleDetail } from "@/lib/sav/intake/console-detail";
-import { intakeDossierView, intakeEffectLabels as effectLabels, intakeEffectStateLabels as stateLabels, intakeRouteLabel, intakeEffectsTitle } from "@/lib/sav/intake/dossier-view";
+import { intakeDossierView, intakeEffectLabels as effectLabels, intakeEffectStateLabels as stateLabels, intakeRouteLabel, intakeEffectsTitle, intakeDossierActions } from "@/lib/sav/intake/dossier-view";
 import { intakeRuntimeHash } from "@/lib/sav/intake/runtime-contract";
 import { formatParisDateTime } from "@/lib/paris-date";
 import { MailConversation } from "../../[id]/mail-conversation";
@@ -37,13 +37,9 @@ export default async function IntakeDetailPage({ params, searchParams }: { param
   const display=readIntakeCrmDisplay([...contacts,...(target?[target.contactId]:[]),...(historicalTarget?[historicalTarget.contactId]:[])],
     [...tickets,...(target&&target.operation!=="create"?[target.ticketId]:[]),...(historicalTarget&&historicalTarget.operation!=="create"?[historicalTarget.ticketId]:[]),...(data.progress?.ticketId?[data.progress.ticketId]:[])]);
   const controls = data.latestMessageId ? await readUxMessageControls(id, data.latestMessageId) : { blocked: true, reason: "Aucun message courant disponible." };
-  const operatorBinding = current?.sourceHash && current.messageId === data.latestMessageId ? {threadId:id,messageId:current.messageId,runId:current.id,version:current.version,sourceHash:current.sourceHash} : null;
-  const operatorPanel = operatorBinding && ["admin","owner"].includes(staff.role) ? await readOperatorPanel(operatorBinding) : null;
-  const manualOtherBinding = staff.email === "ugo@limova.ai" && ["admin", "owner"].includes(staff.role)
-    && !data.handledExternally && !data.humanHeld && !data.thread.paused && !data.confirmedCurrent && !current?.sourceInvalid
-    && data.latestMessageId && !data.progress?.effects.some(effect => effect.state !== "planned")
-    && (data.projection.view === "to_validate" || data.projection.view === null)
-    ? await readManualOtherBinding(id, data.latestMessageId, data.projection.epoch) : null;
+  const actions = intakeDossierActions(data, { current, canCorrect, plan }, staff), { operatorBinding } = actions;
+  const operatorPanel = operatorBinding && actions.administrator ? await readOperatorPanel(operatorBinding) : null;
+  const manualOtherBinding = actions.manualOtherCandidate && data.latestMessageId ? await readManualOtherBinding(id, data.latestMessageId, data.projection.epoch) : null;
   return <div className={styles.console}>
     <IntakeBackLink className={styles.back} returnTo={query?.returnTo}/>
     <header className={styles.heading}><div><span className="eyebrow">Dossier · version {current?.version ?? "en attente"}</span><h1>{data.thread.subject || "Nouvelle demande"}</h1>
@@ -95,9 +91,9 @@ export default async function IntakeDetailPage({ params, searchParams }: { param
         paused={data.thread.paused||data.humanHeld} exhausted={Boolean(blocked)}
         lastActivity={data.diagnostics?.runs.flatMap(r=>r.events.map(e=>e.createdAt)).sort((a,b)=>b.getTime()-a.getTime())[0] ? formatParisDateTime(data.diagnostics.runs.flatMap(r=>r.events.map(e=>e.createdAt)).sort((a,b)=>b.getTime()-a.getTime())[0]) : undefined}/>
       {manualOtherBinding && <IntakeManualOtherForm key={`manual-other-${manualOtherBinding.messageId}-${manualOtherBinding.version}-${manualOtherBinding.sourceHash}`} binding={manualOtherBinding} requestKey={randomUUID()}/>}
-      {!data.handledExternally && current?.sourceInvalid && current.messageId === data.latestMessageId && staff.email === "ugo@limova.ai" && ["admin", "owner"].includes(staff.role) && <IntakeInvalidSourceForm key={`invalid-${current.messageId}`} threadId={id} messageId={current.messageId} requestKey={randomUUID()}/>}
-      {(!data.handledExternally || data.projection.status === "human_review") && data.latestMessageId && staff.email === "ugo@limova.ai" && ["admin", "owner"].includes(staff.role) && <IntakeCompletionForm key={data.latestMessageId} threadId={id} messageId={data.latestMessageId} requestKey={randomUUID()}/>}
-      {data.humanHeld && !data.handledExternally && data.latestMessageId && ["admin","owner"].includes(staff.role) && <section className={styles.notice}><h2>Reprendre ce dossier</h2>
+      {actions.classifyInvalidSource && current && <IntakeInvalidSourceForm key={`invalid-${current.messageId}`} threadId={id} messageId={current.messageId} requestKey={randomUUID()}/>}
+      {actions.closeHandledOutside && data.latestMessageId && <IntakeCompletionForm key={data.latestMessageId} threadId={id} messageId={data.latestMessageId} requestKey={randomUUID()}/>}
+      {actions.releaseHold && data.latestMessageId && <section className={styles.notice}><h2>Reprendre ce dossier</h2>
         <p>Cette action lève uniquement sa pause humaine. Le moteur automatique pourra poursuivre si les preuves et la politique existante le permettent. Les tentatives et les preuves sont conservées. Si une nouvelle qualification est nécessaire, utilisez ensuite « Refaire l’analyse » dans le panneau de poursuite.</p>
         <form action={releaseIntakeHumanHoldAction}>
           <input type="hidden" name="requestKey" value={randomUUID()}/><input type="hidden" name="threadId" value={id}/>
@@ -106,7 +102,7 @@ export default async function IntakeDetailPage({ params, searchParams }: { param
           <label>Motif de la reprise<textarea name="reason" required minLength={10} maxLength={2000}/></label>
           <button type="submit">Lever la pause</button>
         </form></section>}
-      {canCorrect && current?.sourceHash && plan ? <StreamedChoiceForm expected={{ commandKey: randomUUID(), threadId: id,
+      {actions.recordChoice && current?.sourceHash && plan ? <StreamedChoiceForm expected={{ commandKey: randomUUID(), threadId: id,
         messageId: current.messageId, runId: current.id, version: current.version, sourceHash: current.sourceHash,
         candidatesHash: intakeRuntimeHash(contacts) }} contacts={contacts} tickets={tickets} display={display} classification={plan.decision.classification}
         actorId={staff.id} selectedContactId={target?.contactId} selectedTicketId={target && target.operation !== "create" ? target.ticketId : undefined}/> :
@@ -116,8 +112,8 @@ export default async function IntakeDetailPage({ params, searchParams }: { param
         <strong>{event.kind === "refuse" ? "Refus humain" : "Choix conditionnel"} · version {event.parentVersion}</strong><p>{event.reason}</p>
         <small>{event.actor} · {formatParisDateTime(event.at)} · {event.state === "consumed" ? "choix consommé" : event.state === "refused" ? "refus conservé" : event.state === "waiting" ? "preuves à compléter" : "vérification en attente"}</small></li>)}</ol> : <p>Aucun choix humain enregistré.</p>}</section>
       <details className={styles.history}><summary>Diagnostic technique</summary><p>{data.current?.payload.reason ?? data.progress?.reason ?? (blocked ? "Tentatives épuisées — consulter les versions précédentes." : "Aucun motif technique enregistré sur la version actuelle.")}</p>
-        {["admin","owner"].includes(staff?.role??"")&&data.latestMessageId&&<IntakeRecoveryForm threadId={id} messageId={data.latestMessageId}
-          hasNoteReceipt={Boolean(data.progress?.effects.some(effect=>effect.kind==="note_create"&&effect.ack?.id))} allowReanalysis={false} showReanalysis={false}
+        {actions.administratorVerifications&&data.latestMessageId&&<IntakeRecoveryForm threadId={id} messageId={data.latestMessageId}
+          hasNoteReceipt={actions.noteReceipt} allowReanalysis={false} showReanalysis={false}
           unavailableReason={controls.reason}/>}
         <p>{data.diagnostics?.totalAttempts ?? 0} tentative(s) cumulée(s) pour le dernier message. Les versions remplacées ne sont pas des décisions applicables.</p>
         {data.diagnostics?.execution && <p>Exécution : {intakeStatusLabel(data.diagnostics.execution.state ?? "waiting")} · {data.diagnostics.execution.waitingPasses ?? 0} passage(s) en attente
