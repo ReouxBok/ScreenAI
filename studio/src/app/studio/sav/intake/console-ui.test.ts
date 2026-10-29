@@ -4,7 +4,7 @@ import { prerender } from "react-dom/static";
 import { readFile, writeFile, mkdir } from "node:fs/promises";
 import { beforeEach, it, expect, vi } from "vitest";
 const mocks = vi.hoisted(() => ({ staff: vi.fn(), list: vi.fn(), detail: vi.fn(), action: vi.fn(), crmDisplay: vi.fn(), controls: vi.fn(), manualOther:vi.fn(), operator:vi.fn() }));
-vi.mock("@/lib/sav/intake/manual-other-classification",()=>({readManualOtherBinding:mocks.manualOther}));
+vi.mock("@/lib/sav/intake/manual-other-classification",()=>({readManualOtherEligibility:mocks.manualOther,manualOtherUnavailableLabels:{inventory_incomplete:"L’inventaire des pièces jointes est incomplet ou non certifié.",paused:"Une pause humaine protège ce dossier.",effects_engaged:"Une action engagée ou son résultat reste à vérifier."}}));
 vi.mock("./manual-other-actions",()=>({classifyManualOtherAction:mocks.action}));
 vi.mock("@/lib/sav/intake-ux/operator-commands",()=>({readOperatorPanel:mocks.operator}));
 vi.mock("@/lib/sav/intake-ux/message-controls",()=>({readUxMessageControls:mocks.controls}));
@@ -146,8 +146,8 @@ it("a zero-check receipt explains the occupied verifier without claiming a succe
 });
 
 it("offers explicit manual Other for a bound valid pending message, with no action on GET", async () => {
-  const binding={revision:"sav-intake-manual-other.v1",threadId,messageId,runId,version:7,sourceHash:"a".repeat(64),runSourceHash:null,expectedEpoch:1};
-  mocks.manualOther.mockResolvedValue(binding);
+  const binding={revision:"sav-intake-manual-other.v2",threadId,messageId,runId,version:7,sourceHash:"a".repeat(64),runSourceHash:null,expectedEpoch:1,attachmentCount:0};
+  mocks.manualOther.mockResolvedValue({binding,reason:null});
   mocks.detail.mockResolvedValue({...detail,projection:{...detail.projection,view:null,status:"waiting"},progress:null,current:{...detail.current,sourceHash:null}});
   const html=await renderDetail();
   expect(html).toContain("Classement humain dans Autres");expect(html).toContain("Classer dans Autres");
@@ -158,9 +158,25 @@ it("offers explicit manual Other for a bound valid pending message, with no acti
   mocks.staff.mockResolvedValue({email:"ugo@limova.ai",role:"member"});expect(await renderDetail()).not.toContain("Classement humain dans Autres");
 });
 it("never offers valid-source Other over a human pause, completion or engaged effect", async () => {
-  mocks.manualOther.mockResolvedValue({revision:"sav-intake-manual-other.v1",threadId,messageId,runId,version:7,sourceHash:"a".repeat(64),runSourceHash:null,expectedEpoch:1});
+  mocks.manualOther.mockResolvedValue({reason:null,binding:{revision:"sav-intake-manual-other.v2",threadId,messageId,runId,version:7,sourceHash:"a".repeat(64),runSourceHash:null,expectedEpoch:1,attachmentCount:0}});
   for(const state of [{...detail,humanHeld:true},{...detail,thread:{...detail.thread,paused:true}},{...detail,handledExternally:true},detail]) {
     mocks.detail.mockResolvedValue(state);expect(await renderDetail()).not.toContain("Classement humain dans Autres");
   }
   expect(mocks.action).not.toHaveBeenCalled();
+});
+it("offers human inventory review in processing without claiming that AI read the attachments", async()=>{
+  mocks.manualOther.mockResolvedValue({reason:null,binding:{revision:"sav-intake-manual-other.v2",threadId,messageId,runId,version:7,sourceHash:"a".repeat(64),runSourceHash:null,expectedEpoch:1,attachmentCount:2}});
+  mocks.detail.mockResolvedValue({...detail,projection:{...detail.projection,view:null,status:"waiting"},progress:null});
+  const html=await renderDetail();
+  expect(html).toContain("Classer dans Autres");expect(html).toContain("2 pièce(s) jointe(s)");
+  expect(html).toContain("texte intégral");expect(html).toContain("pièces jointes non analysées");
+  expect(html).toContain("ne les déclare pas lues par l’IA");
+  expect(html).toContain('name="attachmentCount" value="2"');expect(mocks.action).not.toHaveBeenCalled();
+});
+it("explains an incomplete inventory instead of silently hiding the direct Other form", async()=>{
+  mocks.manualOther.mockResolvedValue({binding:null,reason:"inventory_incomplete"});
+  mocks.detail.mockResolvedValue({...detail,progress:null});
+  const html=await renderDetail();expect(html).toContain("Classement dans Autres indisponible");
+  expect(html).toContain("inventaire des pièces jointes est incomplet ou non certifié");
+  expect(html).not.toContain("Classement humain dans Autres");expect(mocks.action).not.toHaveBeenCalled();
 });
