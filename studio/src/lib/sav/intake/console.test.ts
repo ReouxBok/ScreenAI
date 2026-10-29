@@ -1633,3 +1633,56 @@ describe("manual Other on a valid source without an AI verdict", () => {
   });
 
 });
+
+it("REVIEW776 close_handled_outside rejects a version changed after its MCP read under the real console locks", async () => {
+  await prepareManualCompletion();
+  const detailModule = await import("./console-detail");
+  const { intakeVersionToken } = await import("@/lib/mcp/tools");
+  const { handleStudioMcpRequest } = await import("@/lib/mcp/server");
+  const realRead = detailModule.readIntakeConsoleDetail;
+  const snapshot = (await realRead(threadId))!;
+  const versionToken = intakeVersionToken(snapshot);
+  vi.spyOn(detailModule, "readIntakeConsoleDetail").mockImplementationOnce(async id => {
+    const read = await realRead(id);
+    // A newer idle dossier version is committed after the read and before the action.
+    await db.db.update(savIntakeRuns).set({ version: sql`${savIntakeRuns.version} + 1` }).where(eq(savIntakeRuns.id, runId));
+    return read;
+  });
+  const response = await handleStudioMcpRequest(new Request("https://studio.example.invalid/api/mcp", { method: "POST",
+    body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "close_handled_outside", arguments: {
+      threadId, versionToken, idempotencyKey: randomUUID(), attestHandled: true } } }),
+    headers: { "content-type": "application/json", accept: "application/json, text/event-stream", authorization: "Bearer synthetic" } }),
+    { env: { STUDIO_MCP_ENABLED: "true", STUDIO_MCP_WRITES_ENABLED: "true" }, resolveUser: async () => state.user as never });
+  const body = await response.json();
+  const markers = (await db.db.select().from(auditLogs)).filter(row => row.action === SAV_EXTERNAL_COMPLETION);
+  expect({ result: body.result?.structuredContent, markers: markers.length }).toMatchObject({
+    result: { outcome: "refused", code: "SAV_MCP_DOSSIER_CHANGED" }, markers: 0 });
+  expect(mutationsSent()).toHaveLength(0); expect(fetch).not.toHaveBeenCalled();
+});
+it("REVIEW776 witness: the same MCP close on an unchanged version passes the under-lock check and writes one marker", async () => {
+  await prepareManualCompletion();
+  const { intakeVersionToken } = await import("@/lib/mcp/tools");
+  const { handleStudioMcpRequest } = await import("@/lib/mcp/server");
+  const versionToken = intakeVersionToken((await readIntakeConsoleDetail(threadId))!);
+  const response = await handleStudioMcpRequest(new Request("https://studio.example.invalid/api/mcp", { method: "POST",
+    body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "close_handled_outside", arguments: {
+      threadId, versionToken, idempotencyKey: randomUUID(), attestHandled: true } } }),
+    headers: { "content-type": "application/json", accept: "application/json, text/event-stream", authorization: "Bearer synthetic" } }),
+    { env: { STUDIO_MCP_ENABLED: "true", STUDIO_MCP_WRITES_ENABLED: "true" }, resolveUser: async () => state.user as never });
+  const body = await response.json();
+  const markers = (await db.db.select().from(auditLogs)).filter(row => row.action === SAV_EXTERNAL_COMPLETION);
+  expect({ result: body.result?.structuredContent, markers: markers.length }).toMatchObject({ result: { outcome: "done" }, markers: 1 });
+  expect(mutationsSent()).toHaveLength(0); expect(fetch).not.toHaveBeenCalled();
+});
+it("REVIEW776 witness: the version precondition compares the current run and the console epoch under row locks", async () => {
+  await prepareManualCompletion();
+  const { intakeVersionStillCurrent } = await import("./version-precondition");
+  const detail = (await readIntakeConsoleDetail(threadId))!;
+  const expected = { runId: detail.current?.id ?? null, version: detail.current?.version ?? null, sourceHash: detail.current?.sourceHash ?? null, epoch: detail.projection.epoch };
+  const check = (value: typeof expected) => db.db.transaction(tx => intakeVersionStillCurrent(tx, threadId, value));
+  expect(await check(expected)).toBe(true);
+  expect(await check({ ...expected, epoch: expected.epoch + 1 })).toBe(false);
+  expect(await check({ ...expected, sourceHash: "f".repeat(64) })).toBe(false);
+  await db.db.update(savIntakeRuns).set({ version: sql`${savIntakeRuns.version} + 1` }).where(eq(savIntakeRuns.id, runId));
+  expect(await check(expected)).toBe(false);
+});

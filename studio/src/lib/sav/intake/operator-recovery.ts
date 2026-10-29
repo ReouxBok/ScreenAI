@@ -17,6 +17,7 @@ import type {IntakeAdapters} from "./engine-types";
 import {reconcileIntakeEffectCandidate} from "./executor";
 import {createIntakeExecutorAdapters} from "./execution-adapters";
 import { savEffectiveReceivedAt } from "@/lib/sav/message-order";
+import {intakeVersionStillCurrent,type IntakeVersionPrecondition} from "./version-precondition";
 const request=z.object({threadId:z.uuid(),messageId:z.uuid(),reason:z.string().trim().min(10).max(2000),commandKey:z.uuid().optional()}).strict();
 type RecoveryTx=Parameters<typeof admissionLock>[0];
 type RecoverySnapshot=Awaited<ReturnType<typeof savIntakeSourceSnapshot>>;
@@ -24,13 +25,13 @@ const conflict=():never=>{throw Error("SAV_INTAKE_RECOVERY_CONFLICT");};
 /** Explicit administrator continuation, once per message/context/configuration revision. It neither resets
  * automatic attempts nor admits more than the existing three model calls.
  * No credential, model or external write is used while recording the request. */
-export async function requestIntakeReinvestigation(raw:unknown){
+export async function requestIntakeReinvestigation(raw:unknown,expected?:IntakeVersionPrecondition){
  const actor=await executionAdministrator(),command=request.parse(raw),config=savIntakeRuntimeConfig();
  if(!config)return conflict();
- return requireDb().transaction(tx=>recordIntakeReinvestigation(tx,actor,command,config));
+ return requireDb().transaction(tx=>recordIntakeReinvestigation(tx,actor,command,config,undefined,expected));
 }
 /** Shared atomic recording seam; callers hold the same admission transaction. */
-export async function recordIntakeReinvestigation(tx:RecoveryTx,actor:Awaited<ReturnType<typeof executionAdministrator>>,command:z.infer<typeof request>,config:NonNullable<ReturnType<typeof savIntakeRuntimeConfig>>,beforeInformation?:RecoverySnapshot){
+export async function recordIntakeReinvestigation(tx:RecoveryTx,actor:Awaited<ReturnType<typeof executionAdministrator>>,command:z.infer<typeof request>,config:NonNullable<ReturnType<typeof savIntakeRuntimeConfig>>,beforeInformation?:RecoverySnapshot,expected?:IntakeVersionPrecondition){
   await admissionLock(tx);if(!await intakeLaunchMatches(config,tx))return conflict();
   const [active]=await tx.select().from(staffUsers).where(eq(staffUsers.id,actor.id)).for("update");
   if(!active?.active||!["admin","owner"].includes(active.role)||!canAccessSav(active.email,active.role))return conflict();
@@ -41,6 +42,8 @@ export async function recordIntakeReinvestigation(tx:RecoveryTx,actor:Awaited<Re
    ||message.receivedAt<=new Date(config.receivedAfter)||message.createdAt<=new Date(config.createdAfter)||await intakeHumanRefused(message.id,tx))return conflict();
   const runs=await tx.select().from(savIntakeRuns).where(eq(savIntakeRuns.messageId,message.id)).for("update");
   if(runs.some(r=>r.leaseUntil&&r.leaseUntil>new Date()))return conflict();
+  // An agent's version is checked under the same locks, never replaced by this transaction's read.
+  if(expected&&!await intakeVersionStillCurrent(tx,thread.id,expected))throw Error("SAV_INTAKE_VERSION_CHANGED");
   const events=await tx.select().from(savIntakeHumanEvents).where(eq(savIntakeHumanEvents.messageId,message.id));
   if(events.some(e=>["pending","reading"].includes(e.state)))return conflict();
   const bodies=events.map(e=>decryptSavPayload<HumanEventPayload>(e.payloadCiphertext));

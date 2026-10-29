@@ -19,15 +19,17 @@ export function studioMcpRateLimited(actorId: string, now = Date.now()) {
 export function resetStudioMcpRateLimit() { windows.clear(); }
 
 /** Known business refusals keep their stable code; anything else is internal and never leaks. */
-function failure(error: unknown): StudioMcpResult {
+function failure(error: unknown, write: boolean): StudioMcpResult {
   const code = error instanceof Error && /^SAV_[A-Z0-9_]{1,90}$/.test(error.message) ? error.message : null;
+  // Write tools settle their own errors once an action may have run; never claim nothing happened here.
   return code ? { outcome: "refused", code, message: "Refusé par le contrôle serveur existant." }
-    : { outcome: "refused", code: "MCP_INTERNAL_ERROR", message: "Erreur interne ; aucune action n’a été tentée par cet outil de lecture." };
+    : write ? { outcome: "uncertain", code: "MCP_INTERNAL_ERROR", message: "Erreur interne ; résultat non établi : relire l’état avant toute nouvelle demande." }
+      : { outcome: "refused", code: "MCP_INTERNAL_ERROR", message: "Erreur interne ; aucune action n’a été tentée par cet outil de lecture." };
 }
 async function call(tool: StudioMcpTool, context: StudioMcpContext, input: unknown) {
   const started = Date.now();
   // The console's own server functions authenticate this staff member, exactly as for a session.
-  const result = await withSavRequestUser(context.user, () => tool.run(context, input as never)).catch(failure);
+  const result = await withSavRequestUser(context.user, () => tool.run(context, input as never)).catch(error => failure(error, Boolean(tool.write)));
   // No dossier content, no arguments: tool, outcome, code and duration only.
   console.info("studio_mcp", { tool: tool.name, actorId: context.staff.id, outcome: result.outcome, code: result.code, durationMs: Date.now() - started });
   return result;
@@ -41,7 +43,7 @@ export function createStudioMcpServer(context: StudioMcpContext, options: { writ
       const result = studioMcpRateLimited(context.staff.id)
         ? { outcome: "refused" as const, code: "MCP_RATE_LIMITED", message: `Plus de ${STUDIO_MCP_RATE.calls} appels par minute.` }
         : await call(tool, context, input);
-      return { content: [{ type: "text" as const, text: JSON.stringify(result) }], structuredContent: result, isError: result.outcome === "refused" && result.code.startsWith("MCP_") };
+      return { content: [{ type: "text" as const, text: JSON.stringify(result) }], structuredContent: result, isError: result.outcome !== "done" && result.outcome !== "already_done" && result.code.startsWith("MCP_") };
     });
   }
   return server;

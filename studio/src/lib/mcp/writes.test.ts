@@ -3,7 +3,7 @@ import { eq } from "drizzle-orm";
 import { createSavTestDb } from "../../../test/sav-db";
 import { auditLogs, staffUsers } from "@/db/schema";
 const state = vi.hoisted(() => ({ db: null as unknown, detail: vi.fn(), complete: vi.fn(), invalid: vi.fn(), manualBinding: vi.fn(), manual: vi.fn(), release: vi.fn(),
-  choice: vi.fn(), reinvestigate: vi.fn(), identification: vi.fn(), note: vi.fn(), panel: vi.fn(), operator: vi.fn(), seen: [] as unknown[] }));
+  choice: vi.fn(), reinvestigate: vi.fn(), identification: vi.fn(), note: vi.fn(), panel: vi.fn(), operator: vi.fn(), seen: [] as unknown[], gate: null as null | (() => Promise<void>) }));
 vi.mock("@/db", () => ({ requireDb: () => { if (!state.db) throw Error("NO_DATABASE_ALLOWED"); return state.db; } }));
 vi.mock("@clerk/nextjs/server", () => ({ currentUser: async () => { throw Error("NO_SESSION_ON_MCP"); }, clerkClient: async () => { throw Error("NO_REAL_CLERK"); } }));
 vi.mock("next/cache", () => ({ revalidatePath: vi.fn() }));
@@ -20,6 +20,14 @@ vi.mock("@/lib/sav/intake/human-commands", () => ({ recordIntakeHumanCommand: as
 vi.mock("@/lib/sav/intake/operator-recovery", () => ({ requestIntakeReinvestigation: as(state.reinvestigate), reconcileThreadIdentification: as(state.identification) }));
 vi.mock("@/lib/sav/intake/note-recovery", () => ({ reconcileIntakeNoteForClosure: as(state.note) }));
 vi.mock("@/lib/sav/intake-ux/operator-commands", () => ({ readOperatorPanel: as(state.panel), recordOperatorCommand: as(state.operator) }));
+vi.mock("@/lib/sav/intake/agent-pause", async (original) => {
+  const actual = await original<typeof import("@/lib/sav/intake/agent-pause")>();
+  return { ...actual, readSavAgentPause: async (...args: Parameters<typeof actual.readSavAgentPause>) => {
+    const result = await actual.readSavAgentPause(...args);
+    if (state.gate) await state.gate();
+    return result;
+  } };
+});
 import { handleStudioMcpRequest, resetStudioMcpRateLimit } from "./server";
 import { intakeVersionToken } from "./tools";
 import { intakeRuntimeHash } from "@/lib/sav/intake/runtime-contract";
@@ -60,7 +68,7 @@ beforeEach(async () => {
   await f.db.insert(staffUsers).values([{ clerkId: "user_ugo", email: "ugo@limova.ai", name: "Ugo", role: "admin" },
     { clerkId: "user_reouven", email: "reouven@limova.ai", name: "Reouven", role: "owner" }, { clerkId: "user_contact", email: "contact@limova.ai", name: "Contact", role: "member" }]);
   vi.stubEnv("SAV_ENCRYPTION_KEY_V1", "synthetic-mcp-writes-encryption-key");
-  current = ugo; detail = base(); state.seen = []; resetStudioMcpRateLimit();
+  current = ugo; detail = base(); state.seen = []; state.gate = null; resetStudioMcpRateLimit();
   for (const fn of [state.complete, state.invalid, state.manualBinding, state.manual, state.release, state.choice, state.reinvestigate, state.identification, state.note, state.panel, state.operator]) fn.mockReset();
   state.detail.mockImplementation(async () => structuredClone(detail));
   state.complete.mockResolvedValue({ batchId: "b", requested: 1, marked: 1, alreadyCompleted: 0, skipped: {} });
@@ -81,7 +89,7 @@ it("SAV-24 write tools are absent while STUDIO_MCP_WRITES_ENABLED is off, and re
 it("SAV-28 close_handled_outside runs the console function as the key's staff member, on the version read", async () => {
   const idem = key();
   expect(await call("close_handled_outside", { threadId, versionToken: token(), idempotencyKey: idem, attestHandled: true })).toMatchObject({ outcome: "done" });
-  expect(state.complete).toHaveBeenCalledExactlyOnceWith({ requestKey: idem, threadId, messageId, confirmed: true });
+  expect(state.complete).toHaveBeenCalledExactlyOnceWith({ requestKey: idem, threadId, messageId, confirmed: true }, expect.any(Function));
   expect(state.seen).toEqual(["user_ugo"]);
   expect(await writes()).toMatchObject([{ actorEmail: "ugo@limova.ai", entityId: idem, technicalMetadata: { channel: "mcp", tool: "close_handled_outside", outcome: "done", threadId } }]);
 });
@@ -148,7 +156,7 @@ it("SAV-29 reinvestigation, note and identification reconciliation go to the con
   state.reinvestigate.mockResolvedValue({ eventId: "e2", runId }); state.identification.mockResolvedValue({ confirmed: 1 }); state.note.mockResolvedValue({});
   const idem = key();
   expect(await call("request_reinvestigation", { threadId, versionToken: token(), idempotencyKey: idem, reason: "Nouvelle analyse synthétique." })).toMatchObject({ outcome: "done" });
-  expect(state.reinvestigate).toHaveBeenCalledWith({ threadId, messageId, reason: "Nouvelle analyse synthétique.", commandKey: idem });
+  expect(state.reinvestigate).toHaveBeenCalledWith({ threadId, messageId, reason: "Nouvelle analyse synthétique.", commandKey: idem }, { threadId, messageId, runId, version: 7, sourceHash, epoch: 4 });
   expect(await call("reconcile_identification", { threadId, versionToken: token() })).toMatchObject({ outcome: "done", data: { confirmed: 1 } });
   expect(state.identification).toHaveBeenCalledWith(threadId);
   expect(await call("reconcile_note", { threadId, versionToken: token() })).toMatchObject({ code: "SAV_MCP_ACTION_UNAVAILABLE" });
@@ -218,4 +226,116 @@ it("SAV-23 the request identity is scoped to one call: concurrent calls never se
   await expect(withSavRequestUser(contact as never, () => executionAdministrator())).rejects.toThrow("SAV_INTAKE_EXECUTION_UNAUTHORIZED");
   expect((await withSavRequestUser(ugo as never, () => executionAdministrator())).email).toBe("ugo@limova.ai");
   await expect(requireIntakeConsoleStaff()).rejects.toThrow("NO_SESSION_ON_MCP");
+});
+
+// REVIEW776: only the initial outside-transaction reads are synchronized. The actual
+// console setter, its real budget lock, writes and audits remain unmodified.
+function twoInitialPauseReads() {
+  let arrived = 0; let open!: () => void;
+  const barrier = new Promise<void>(r => { open = r; });
+  state.gate = async () => {
+    arrived++;
+    if (arrived === 2) { state.gate = null; open(); }
+    await barrier;
+  };
+}
+it("REVIEW776 expectedLevel must reject one of two writes decided on the same old level", async () => {
+  twoInitialPauseReads();
+  const results = await Promise.all([
+    call("set_agent_pause", { level: "actions_paused", expectedLevel: "running", reason: "Pause synthétique A", idempotencyKey: key() }),
+    call("set_agent_pause", { level: "fully_paused", expectedLevel: "running", reason: "Pause synthétique B", idempotencyKey: key() }),
+  ]);
+  expect(results.filter(r => r.outcome === "done")).toHaveLength(1);
+  expect(results.filter(r => r.code === "SAV_MCP_PAUSE_CHANGED")).toHaveLength(1);
+});
+it("REVIEW776 concurrent retries with the same key perform one real pause change", async () => {
+  twoInitialPauseReads();
+  const args = { level: "fully_paused", expectedLevel: "running", reason: "Pause synthétique unique", idempotencyKey: key() };
+  const results = await Promise.all([call("set_agent_pause", args), call("set_agent_pause", args)]);
+  const changes = (await f.db.select().from(auditLogs)).filter(a => a.action === "sav_agent_pause_set");
+  expect(changes).toHaveLength(1);
+  expect(results.map(r => r.outcome).sort()).toEqual(["already_done", "done"]);
+});
+it("REVIEW776 concurrent different payloads with the same key must conflict", async () => {
+  twoInitialPauseReads(); const idem = key();
+  const results = await Promise.all([
+    call("set_agent_pause", { level: "actions_paused", expectedLevel: "running", reason: "Pause synthétique A", idempotencyKey: idem }),
+    call("set_agent_pause", { level: "fully_paused", expectedLevel: "running", reason: "Pause synthétique B", idempotencyKey: idem }),
+  ]);
+  expect(results.filter(r => r.code === "SAV_MCP_IDEMPOTENCY_CONFLICT")).toHaveLength(1);
+  expect((await writes())).toHaveLength(1);
+});
+it("REVIEW776 no-op pause commands enforce the same administrator permission", async () => {
+  current = contact;
+  expect(await call("set_agent_pause", { level: "running", expectedLevel: "running", reason: "Contrôle synthétique", idempotencyKey: key() }))
+    .toMatchObject({ outcome: "refused", code: "SAV_AGENT_PAUSE_UNAUTHORIZED" });
+});
+it("REVIEW776 an audit failure after a committed pause must not assert no action was attempted", async () => {
+  await f.client.exec(`CREATE OR REPLACE FUNCTION public.review_reject_mcp_audit() RETURNS trigger AS $$
+    BEGIN IF NEW.action = 'studio_mcp_write' THEN RAISE EXCEPTION 'synthetic audit failure'; END IF; RETURN NEW; END;
+    $$ LANGUAGE plpgsql;
+    CREATE TRIGGER review_mcp_audit_failure BEFORE INSERT ON public.audit_logs FOR EACH ROW EXECUTE FUNCTION public.review_reject_mcp_audit();`);
+  try {
+    const result = await call("set_agent_pause", { level: "fully_paused", expectedLevel: "running", reason: "Pause synthétique audit", idempotencyKey: key() });
+    const changes = (await f.db.select().from(auditLogs)).filter(a => a.action === "sav_agent_pause_set");
+    expect(changes).toHaveLength(1);
+    expect(result).not.toMatchObject({ outcome: "refused", code: "MCP_INTERNAL_ERROR" });
+  } finally { await f.client.exec("DROP TRIGGER review_mcp_audit_failure ON public.audit_logs; DROP FUNCTION public.review_reject_mcp_audit()"); }
+});
+
+// REVIEW776 witnesses: the guarantees around the reproductions, on the real pause setter and audit.
+it("REVIEW776 witness: a sequential retry with the same key replays without a second change; a member cannot probe or replay", async () => {
+  const args = { level: "fully_paused", expectedLevel: "running", reason: "Pause synthétique unique", idempotencyKey: key() };
+  expect(await call("set_agent_pause", args)).toMatchObject({ outcome: "done" });
+  expect(await call("set_agent_pause", args)).toMatchObject({ outcome: "already_done" });
+  expect(await call("set_agent_pause", { ...args, level: "actions_paused" })).toMatchObject({ code: "SAV_MCP_IDEMPOTENCY_CONFLICT" });
+  current = contact;
+  for (const attempt of [args, { ...args, expectedLevel: "actions_paused", idempotencyKey: key() }, { ...args, level: "fully_paused", expectedLevel: "fully_paused", idempotencyKey: key() }])
+    expect(await call("set_agent_pause", attempt)).toMatchObject({ outcome: "refused", code: "SAV_AGENT_PAUSE_UNAUTHORIZED" });
+  expect((await f.db.select().from(auditLogs)).filter(a => a.action === "sav_agent_pause_set")).toHaveLength(1);
+  expect(await writes()).toHaveLength(1);
+});
+it("REVIEW776 witness: expectedSetAt refuses an intermediate change back to the same level (ABA)", async () => {
+  const first = await call("set_agent_pause", { level: "fully_paused", expectedLevel: "running", expectedSetAt: null, reason: "Pause synthétique", idempotencyKey: key() }) as { data: { setAt: string } };
+  const second = await call("set_agent_pause", { level: "running", expectedLevel: "fully_paused", expectedSetAt: first.data.setAt, reason: "Reprise synthétique", idempotencyKey: key() }) as { data: { setAt: string } };
+  await call("set_agent_pause", { level: "fully_paused", expectedLevel: "running", expectedSetAt: second.data.setAt, reason: "Pause synthétique", idempotencyKey: key() });
+  expect(await call("set_agent_pause", { level: "running", expectedLevel: "fully_paused", expectedSetAt: first.data.setAt, reason: "Reprise ancienne", idempotencyKey: key() }))
+    .toMatchObject({ outcome: "refused", code: "SAV_MCP_PAUSE_CHANGED" });
+  const { setSavAgentPause } = await import("@/lib/sav/intake/agent-pause-admin");
+  const { withSavRequestUser } = await import("@/lib/sav/intake/console-auth");
+  await expect(withSavRequestUser(ugo as never, () => setSavAgentPause({ agent: "intake", level: "running", reason: "Contrôle synthétique", expectedLevel: "running" }))).rejects.toThrow("SAV_AGENT_PAUSE_CHANGED");
+  // The console page passes no precondition: unchanged behaviour.
+  expect(await withSavRequestUser(ugo as never, () => setSavAgentPause({ agent: "intake", level: "running", reason: "Console synthétique" }))).toMatchObject({ level: "running" });
+});
+it("REVIEW776 witness: after a lost receipt the same key answers uncertain and never re-runs; an error after the claim is uncertain", async () => {
+  await f.client.exec(`CREATE OR REPLACE FUNCTION public.review_reject_mcp_audit() RETURNS trigger AS $$
+    BEGIN IF NEW.action = 'studio_mcp_write' THEN RAISE EXCEPTION 'synthetic audit failure'; END IF; RETURN NEW; END;
+    $$ LANGUAGE plpgsql;
+    CREATE TRIGGER review_mcp_audit_failure BEFORE INSERT ON public.audit_logs FOR EACH ROW EXECUTE FUNCTION public.review_reject_mcp_audit();`);
+  const args = { level: "fully_paused", expectedLevel: "running", reason: "Pause synthétique audit", idempotencyKey: key() };
+  const { STUDIO_MCP_CLAIM } = await import("./writes");
+  try {
+    expect(await call("set_agent_pause", args)).toMatchObject({ outcome: "done", data: { level: "fully_paused" } });
+  } finally { await f.client.exec("DROP TRIGGER review_mcp_audit_failure ON public.audit_logs; DROP FUNCTION public.review_reject_mcp_audit()"); }
+  vi.spyOn(Date, "now").mockReturnValue(Date.now() + STUDIO_MCP_CLAIM.staleMs + 1);
+  expect(await call("set_agent_pause", args)).toMatchObject({ outcome: "uncertain", code: "SAV_MCP_RESULT_UNCERTAIN" });
+  vi.mocked(Date.now).mockRestore();
+  expect((await f.db.select().from(auditLogs)).filter(a => a.action === "sav_agent_pause_set")).toHaveLength(1);
+  state.complete.mockRejectedValueOnce(Error("synthetic network failure after commit"));
+  const idem = key(), close = { threadId, versionToken: token(), idempotencyKey: idem, attestHandled: true };
+  expect(await call("close_handled_outside", close)).toMatchObject({ outcome: "uncertain", code: "SAV_MCP_RESULT_UNCERTAIN" });
+  expect(await call("close_handled_outside", close)).toMatchObject({ outcome: "uncertain" });
+  expect(state.complete).toHaveBeenCalledTimes(1);
+  expect(await writes()).toMatchObject([{ entityId: idem, technicalMetadata: { outcome: "uncertain" } }]);
+});
+it("REVIEW776 witness: refusals before any action claim nothing, and classify_other refuses a binding of another version", async () => {
+  const stale = token(); detail.projection.epoch = 5;
+  const idem = key();
+  expect(await call("close_handled_outside", { threadId, versionToken: stale, idempotencyKey: idem, attestHandled: true })).toMatchObject({ code: "SAV_MCP_DOSSIER_CHANGED" });
+  expect(await call("close_handled_outside", { threadId, versionToken: token(), idempotencyKey: idem, attestHandled: true })).toMatchObject({ outcome: "done" });
+  state.manualBinding.mockResolvedValue({ revision: "r", threadId, messageId, runId, version: 8, runSourceHash: sourceHash, sourceHash, expectedEpoch: 5 });
+  expect(await call("classify_other", { threadId, versionToken: token(), idempotencyKey: key(), reason: "Notification automatique synthétique.", attest: true })).toMatchObject({ code: "SAV_MCP_DOSSIER_CHANGED" });
+  expect(state.manual).not.toHaveBeenCalled();
+  state.detail.mockRejectedValueOnce(Error("synthetic read failure"));
+  expect(await call("close_handled_outside", { threadId, versionToken: token(), idempotencyKey: key(), attestHandled: true })).toMatchObject({ outcome: "refused", code: "MCP_INTERNAL_ERROR" });
 });

@@ -12,7 +12,8 @@ import { readManualOtherBinding } from "@/lib/sav/intake/manual-other-classifica
 import { intakeDossierView, intakeDossierActions, intakeEffectLabels, intakeEffectStateLabels, intakeRouteLabel, intakeEffectsTitle, type IntakeConsoleDetail } from "@/lib/sav/intake/dossier-view";
 
 /** Uniform tool result. A refusal is an answer, not a transport error. */
-export type StudioMcpResult = { outcome: "done" | "already_done" | "refused"; code: string; message: string; data?: unknown };
+/** uncertain: a write may have been applied but its result is not established; the agent re-reads, never retries blindly. */
+export type StudioMcpResult = { outcome: "done" | "already_done" | "refused" | "uncertain"; code: string; message: string; data?: unknown };
 type Staff = { id: string; email: string; role: string; name: string | null };
 export type StudioMcpContext = { user: NonNullable<SavClerkUser>; staff: Staff };
 export type StudioMcpTool = { name: string; title: string; description: string; write: boolean; input: z.ZodObject;
