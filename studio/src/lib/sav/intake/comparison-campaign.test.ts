@@ -30,13 +30,14 @@ async function stored(text = "Bonjour, la synchronisation de mon agenda échoue 
   return m;
 }
 /** Synthetic Gemini for both readers and an empty, read-only CRM; records every request. */
-function provider(options: { currentStatus?: number } = {}) {
+function provider(options: { currentStatus?: number; simpleStatus?: number } = {}) {
   const seen: string[] = [], crm: { method: string; url: string }[] = [];
   const network = vi.fn(async (url: Parameters<typeof fetch>[0], init?: RequestInit) => {
     if (String(url).startsWith("https://generativelanguage.googleapis.com/")) {
       const data = JSON.parse(JSON.parse(String(init?.body)).contents[0].parts[0].text), simple = typeof data.current === "string", messageId = data.message?.id ?? data.message?.messageId;
       seen.push(simple ? "simple" : "current");
       if (!simple && options.currentStatus) return new Response("{}", { status: options.currentStatus });
+      if (simple && options.simpleStatus) return Response.json({ error: { status: "INVALID_ARGUMENT", message: "Schema has too many states. private@example.test" } }, { status: options.simpleStatus });
       const id = simple ? data.message.id : data.message.id;
       const answer = simple
         ? { messageId: id, nature: "request", requests: [{ id: "r1", kind: "support", summary: "Synchronisation.", sourceIds: ["current"] }], ticketTitle: "Échec de synchronisation de l'agenda",
@@ -56,11 +57,12 @@ const ledger = () => f.db.select().from(auditLogs).where(and(eq(auditLogs.action
 beforeAll(async () => { f = await createSavTestDb(); state.db = f.db; }, 30_000);
 afterAll(async () => { await f?.client.close(); });
 beforeEach(async () => {
+  vi.spyOn(globalThis, "fetch").mockRejectedValue(Error("EXTERNAL_NETWORK_FORBIDDEN"));
   vi.stubEnv("SAV_ENCRYPTION_KEY_V1", KEY);
   await f.client.exec("TRUNCATE sav.intake_model_calls, sav.mailboxes CASCADE; TRUNCATE public.audit_logs");
   mailboxId = (await f.db.insert(savMailboxes).values({ email: "support@example.invalid" }).returning())[0].id;
 });
-afterEach(() => vi.unstubAllEnvs());
+afterEach(() => { vi.unstubAllEnvs(); vi.restoreAllMocks(); });
 
 describe("comparison campaign (lot 4)", () => {
   it("is off without its configuration", async () => {
@@ -231,7 +233,21 @@ it("allows a model answer beyond the CRM deadline within the existing AI transpo
   } finally { vi.useRealTimers(); }
 }, 30_000);
 
-it.each([429, 503])("a received provider HTTP %s settles at zero without retrying or touching the operational ledger", async status => {
+it("a simple HTTP400 uses the shared zero-charge settlement and persists only allowlisted rejection facts", async () => {
+  const m = await stored(), e = env(mailboxId, [m.id]), p = provider({ simpleStatus: 400 });
+  await runSavIntakeComparisonBatch({ env: () => e, network: p.network, limit: 1 });
+  const all = (await ledger()).map(x => x.technicalMetadata);
+  const settled = all.filter(x => x?.event === "settled");
+  expect(settled).toHaveLength(2);
+  expect(settled[1]).toMatchObject({ state: "settled", chargedNanoUsd: 0 });
+  const report = await readSavIntakeComparisonReport(() => e);
+  if (!report.configured) throw Error("FIXTURE_CAMPAIGN_REQUIRED");
+  expect(report.rows[0].detail).toMatchObject({ simple: { calls: 1, uncertain: false, diagnostics: { dispatches: 1, httpResponses: 1, requests: [expect.objectContaining({ httpStatus: 400, providerRejection: { status: "INVALID_ARGUMENT", reason: "schema_complexity", fields: [], bodyRead: "complete", bytesRead: expect.any(Number) }, schema: expect.objectContaining({ boundedArrays: 0 }) })] } } });
+  expect(JSON.stringify(report.rows[0].detail)).not.toContain("private@example.test");
+  expect(p.seen).toEqual(["current", "simple"]);
+  expect(await f.db.select().from(savIntakeModelCalls)).toEqual([]);
+});
+it.each([400, 429, 503])("a received provider HTTP %s settles at zero without retrying or touching the operational ledger", async status => {
   const m = await stored(), e = env(mailboxId, [m.id]), p = provider({ currentStatus: status });
   await runSavIntakeComparisonBatch({ env: () => e, network: p.network, limit: 1 });
   const rows = await ledger(), reserved = rows.filter(x => x.technicalMetadata.event === "reserved");

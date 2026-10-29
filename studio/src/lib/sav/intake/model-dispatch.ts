@@ -1,4 +1,5 @@
 import "server-only";
+import { readProviderRejection, providerSchemaDiagnostic, type ProviderRejectionDiagnostic } from "./provider-rejection";
 import { z } from "zod";
 import { reconcileIntakeZeroThoughtUsage, unbilledProviderStatus } from "./model-usage";
 import type { IntakeGeminiCall } from "./model-readers";
@@ -16,6 +17,8 @@ import { IntakeBudgetExhaustedError, type IntakeBudgetLimit } from "./budget-lim
 export type IntakeDispatchDiagnostic = SavGeminiDiagnosticMetadata & {
   phase: string; promptRevision: string; requestHash: string; textBytes: number; wireBytes: number;
   generationBudget: "standard" | "single_pass"; dispatched: boolean; httpStatus: number | null; cached: boolean;
+  providerRejection?: ProviderRejectionDiagnostic;
+  schema?: ReturnType<typeof providerSchemaDiagnostic>;
   transport?: { phase: string; durationMs: number; attempts: number; retries: number; errorCode: string | null; failureCategory: string | null };
 };
 /** Actual network sends, independent of usable model output or trace metadata. */
@@ -61,6 +64,7 @@ export function createIntakeModelDispatcher(options: { config: IntakeRuntimeConf
         phase: input.phase, promptRevision: input.promptRevision, requestHash: intakeRuntimeHash(expectedBody),
         textBytes: wire.textBytes, wireBytes: Buffer.byteLength(expectedBody, "utf8"),
         generationBudget: options.generationBudget ?? "standard", dispatched: false, httpStatus: null, cached: false,
+        schema: providerSchemaDiagnostic(input.body.generationConfig.responseSchema),
       } : undefined;
       if (diagnostic) diagnostics.push(diagnostic);
       let sent = false;
@@ -89,7 +93,19 @@ export function createIntakeModelDispatcher(options: { config: IntakeRuntimeConf
         if (diagnostic) diagnostic.dispatched = true;
         const rawResponse = await network(url, { ...init, signal, redirect: "error" });
         if (diagnostic) diagnostic.httpStatus = rawResponse.status;
-        const response = await evaluationProviderResponse(rawResponse, signal);
+        // The normal transport deliberately discards external error bodies. Only
+        // explicit comparison diagnostics may read a bounded body first; no raw
+        // text is retained and the original status/settlement policy is preserved.
+        let received = rawResponse;
+        if (diagnostic && rawResponse.status === 400) {
+          // Do not delay the received-status transport/settlement by a diagnostic
+          // body read: headers arriving just before the attempt deadline must
+          // remain the same HTTP400. The comparison already awaits pending.
+          pending.push(readProviderRejection(rawResponse, signal).then(value => { diagnostic.providerRejection = value; })
+            .catch(() => { diagnostic.providerRejection = { status: "UNKNOWN", reason: "unknown", fields: [], bodyRead: "unreadable", bytesRead: 0 }; }));
+          received = new Response(null, { status: rawResponse.status });
+        }
+        const response = await evaluationProviderResponse(received, signal);
         providerStatus = response.status;
         if (response.ok) {
           try { providerUsage = readSavGeminiResponse(await response.clone().json()).metadata; }
