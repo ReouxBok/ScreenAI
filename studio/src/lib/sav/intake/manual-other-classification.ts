@@ -50,7 +50,8 @@ type Snapshot = Awaited<ReturnType<typeof savIntakeSourceSnapshot>>;
  * independently of AI attachment reading. The unchanged source hash binds both. */
 function humanSourceReview(snapshot: Snapshot): { reason: "source_text_incomplete" | "inventory_incomplete" | null; attachmentCount: number } {
   const body = snapshot.body;
-  if (!snapshot.provenance.get(snapshot.input.message.id)?.textComplete || !intakeHtmlDocumentText(body.text).trim())
+  const provenance = snapshot.provenance.get(snapshot.input.message.id);
+  if (!provenance?.textComplete || !(provenance.subject.trim() || intakeHtmlDocumentText(body.text).trim()))
     return { reason: "source_text_incomplete", attachmentCount: 0 };
   const attachments = savAttachmentMetadataSchema.array().max(100).safeParse(body.attachments ?? []);
   const inventory = savAttachmentInventorySchema.safeParse(body.attachmentInventory);
