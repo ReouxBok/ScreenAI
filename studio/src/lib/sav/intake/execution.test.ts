@@ -5,8 +5,14 @@ import { createSavTestDb } from "../../../../test/sav-db";
 import { executionProvider } from "../../../../test/sav-intake-execution-provider";
 import { savMailboxes, savThreads, savMessages, staffUsers, savIntakeExecutionPolicies, savIntakeExecutionBudget, savIntakeExecutions, savIntakeEffects, savIntakeOccupations, savIntakeRuns, savActions, savSyncState, auditLogs, savIntakeHumanEvents, savIntakeEffectJournal } from "@/db/schema";
 const state = vi.hoisted(() => ({
-    db: null as unknown, user: null as unknown
+    db: null as unknown, user: null as unknown, adapterDefaults: null as unknown
 }));
+// SAV-31: native reconciliations build their own adapters; route only those default builds to the synthetic provider.
+vi.mock("./execution-adapters", async importOriginal => {
+    const actual = await importOriginal<typeof import("./execution-adapters")>();
+    return { ...actual, createIntakeExecutorAdapters: (deps?: Parameters<typeof actual.createIntakeExecutorAdapters>[0]) =>
+        actual.createIntakeExecutorAdapters(deps ?? (state.adapterDefaults as Parameters<typeof actual.createIntakeExecutorAdapters>[0]) ?? undefined) };
+});
 vi.mock("@/db", () => ({
     requireDb: () => {
         if (!state.db)
@@ -1618,4 +1624,73 @@ it("SAV-45 E: read-only recovery of an uncertain effect is not held by a CRM dec
     await reconcileIntakeEffectsReadOnly(row.id, options.adapters);
     expect((await getExecutionEffects(row.id))[0].state).toBe("confirmed");
     expect(p.calls.filter(c => c.method === "POST" && c.path.endsWith("/tickets"))).toHaveLength(1);
+});
+
+// SAV-31 qualification: MCP → native reconciliation → PGlite, synthetic provider, never a second send.
+async function sav31Mcp(name: string, extra: Record<string, unknown> = {}) {
+    await f.db.insert(savSyncState).values({ key: "sav-intake-console-schema-v1", status: "installed" }).onConflictDoNothing();
+    const { readIntakeConsoleDetail } = await import("./console-detail"), { intakeVersionToken } = await import("@/lib/mcp/tools"), { handleStudioMcpRequest } = await import("@/lib/mcp/server");
+    const versionToken = intakeVersionToken((await readIntakeConsoleDetail(threadId))!);
+    const response = await handleStudioMcpRequest(new Request("https://studio.example.invalid/api/mcp", { method: "POST",
+        body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name, arguments: { threadId, versionToken, ...extra } } }),
+        headers: { "content-type": "application/json", accept: "application/json, text/event-stream", authorization: "Bearer synthetic" } }),
+        { env: { STUDIO_MCP_ENABLED: "true", STUDIO_MCP_WRITES_ENABLED: "true" }, resolveUser: async () => state.user as never });
+    return (await response.json()).result?.structuredContent;
+}
+async function uncertainIdentityAfterRevocation() {
+    p.setContacts([]);
+    const row = await admission(), verify = options.adapters.verify;
+    options.adapters.verify = async () => ({ confirmed: false, attributed: false });
+    expect(await executeIntakePass(row.id, options)).toMatchObject({ state: "uncertain" });
+    await revokeIntakeExecutionPolicy(options.config.policyId, "Synthetic rotation after a real verified send");
+    options.adapters.verify = verify;
+    state.adapterDefaults = { network: p.network, gmailRequest: p.gmail, gmailPermissions: async () => {}, env: () => environment };
+    return row;
+}
+it("SAV-31 reconcile_identification through the MCP confirms the existing receipt and never resends", async () => {
+    try {
+        const row = await uncertainIdentityAfterRevocation(), sends = p.calls.filter(c => c.path === "gmail/messages/send").length;
+        expect(await sav31Mcp("reconcile_identification")).toMatchObject({ outcome: "done", data: { confirmed: 1 } });
+        expect((await getExecutionEffects(row.id))[0].state).toBe("confirmed");
+        expect(p.calls.filter(c => c.path === "gmail/messages/send")).toHaveLength(sends);
+        expect((await f.db.select().from(auditLogs)).filter(a => a.action === "studio_mcp_write")).toMatchObject([{ technicalMetadata: { tool: "reconcile_identification", outcome: "done" } }]);
+    } finally { state.adapterDefaults = null; }
+});
+it("SAV-31 reconcile_identification with a lost receipt stays uncertain and sends nothing", async () => {
+    try {
+        const row = await uncertainIdentityAfterRevocation(), before = p.calls.length;
+        await f.db.update(savIntakeEffects).set({ ackCiphertext: null }).where(eq(savIntakeEffects.executionId, row.id));
+        expect(await sav31Mcp("reconcile_identification")).toMatchObject({ outcome: "refused", code: "SAV_INTAKE_RECOVERY_CONFLICT" });
+        expect((await getExecutionEffects(row.id))[0].state).not.toBe("confirmed");
+        expect((await f.db.select().from(savIntakeExecutions).where(eq(savIntakeExecutions.id, row.id)))[0].state).toBe("uncertain");
+        expect(p.calls).toHaveLength(before);
+    } finally { state.adapterDefaults = null; }
+});
+async function historicalNoteAwaitingClosure(associated: boolean) {
+    p.seedTicket({ stage: "open" });
+    const row = await admission();
+    expect(await executeIntakePass(row.id, options, { afterAck: async effect => { if (effect.kind === "note_create") throw Error("SYNTHETIC_CRASH_AFTER_NOTE_ACK"); } })).toMatchObject({ state: "uncertain" });
+    const effects = await getExecutionEffects(row.id), note = effects.find(e => e.kind === "note_create")!;
+    const noteId = decryptSavPayload<EffectAck>(note.ackCiphertext!).id!;
+    // The single historical note creation this repair addresses: other planned steps of the revoked continuation are removed.
+    for (const other of effects.filter(e => e.id !== note.id)) {
+        await f.client.query("DELETE FROM sav.intake_effect_journal WHERE effect_id = $1", [other.id]);
+        await f.client.query("DELETE FROM sav.intake_effects WHERE id = $1", [other.id]);
+    }
+    if (associated) { p.links.set(`notes:${noteId}:tickets`, ["201"]); p.links.set(`tickets:201:notes`, [noteId]); }
+    await revokeIntakeExecutionPolicy(options.config.policyId, "Synthetic rotation after a historical note");
+    state.adapterDefaults = { network: p.network, gmailRequest: p.gmail, gmailPermissions: async () => {}, env: () => environment };
+    return { row, note, noteId };
+}
+it.each([true, false])("SAV-31 reconcile_note through the MCP verifies the existing note without creating one (associated: %s)", async associated => {
+    try {
+        const { row, note } = await historicalNoteAwaitingClosure(associated);
+        const posts = () => p.calls.filter(c => c.method === "POST" && c.path.endsWith("/notes")).length, before = posts();
+        const result = await sav31Mcp("reconcile_note");
+        expect(result).toMatchObject(associated ? { outcome: "done" } : { outcome: "refused", code: "SAV_INTAKE_NOTE_RECONCILIATION_REQUIRED" });
+        expect(posts()).toBe(before);
+        expect((await f.db.select().from(auditLogs)).filter(a => a.action === "sav_existing_note_reconciled_for_closure")).toHaveLength(associated ? 1 : 0);
+        expect((await f.db.select().from(savIntakeExecutions).where(eq(savIntakeExecutions.id, row.id)))[0].state).toBe("uncertain");
+        if (!associated) expect(p.links.get(`notes:${decryptSavPayload<EffectAck>(note.ackCiphertext!).id}:tickets`) ?? []).toEqual([]);
+    } finally { state.adapterDefaults = null; }
 });

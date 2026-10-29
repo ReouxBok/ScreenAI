@@ -120,7 +120,11 @@ export function studioMcpWrite<T extends z.ZodRawShape>(name: string, title: str
       await requireDb().insert(auditLogs).values({ actorEmail: context.staff.email, ...WRITE_AUDIT, entityId: key ?? randomUUID(),
         technicalMetadata: { channel: "mcp", tool: name, staffId: context.staff.id, payloadHash: hash, outcome: result.outcome, code: result.code, threadId: values.threadId ?? null } });
     } catch { console.error("studio_mcp_write_receipt_failed", { tool: name, outcome: result.outcome }); }
-    if (result.outcome !== "refused" && values.threadId) { revalidatePath(`/studio/sav/intake/${values.threadId}`); revalidatePath("/studio/sav/intake"); }
+    // Cache refresh only: once the action is settled it can never turn the result into a failure.
+    if (result.outcome !== "refused" && values.threadId) {
+      try { revalidatePath(`/studio/sav/intake/${values.threadId}`); revalidatePath("/studio/sav/intake"); }
+      catch { console.error("studio_mcp_revalidate_failed", { tool: name }); }
+    }
     return result;
   } };
 }
@@ -233,9 +237,11 @@ const reconcileIdentification = studioMcpWrite("reconcile_identification", "Rapp
     const result = await reconcileThreadIdentification(input.threadId);
     return done(`${result.confirmed} envoi(s) existant(s) rapproché(s). Aucun mail renvoyé.`, { confirmed: result.confirmed });
   }, { idempotent: false });
-const setAgentPause = studioMcpWrite("set_agent_pause", "Mettre l’agent en pause ou le relancer",
-  "Change le niveau de l’agent SAV : running, actions_paused (analyse sans actions HubSpot/Gmail) ou fully_paused. expectedLevel doit être le niveau lu par get_agent_pause ; expectedSetAt (state.setting.setAt lu, ou null) refuse aussi tout changement intermédiaire. Administrateurs, comme la page Pause.",
-  { level: z.enum(SAV_AGENT_PAUSE_LEVELS), expectedLevel: z.enum(SAV_AGENT_PAUSE_LEVELS), expectedSetAt: z.iso.datetime().nullable().optional(),
+/** Pausing only (SAV-34, Ugo 29/10): resuming to running stays on the Studio Pause page, where a human confirms. */
+export const SAV_MCP_PAUSE_LEVELS = ["actions_paused", "fully_paused"] as const;
+const setAgentPause = studioMcpWrite("set_agent_pause", "Mettre l’agent en pause",
+  "Met l’agent SAV en pause : actions_paused (analyse sans actions HubSpot/Gmail) ou fully_paused. La relance (running) n’est possible que depuis la page Pause du Studio. expectedLevel doit être le niveau lu par get_agent_pause ; expectedSetAt (state.setting.setAt lu, ou null) refuse aussi tout changement intermédiaire. Administrateurs, comme la page Pause.",
+  { level: z.enum(SAV_MCP_PAUSE_LEVELS), expectedLevel: z.enum(SAV_AGENT_PAUSE_LEVELS), expectedSetAt: z.iso.datetime().nullable().optional(),
     reason: z.string().trim().min(3).max(500), idempotencyKey: z.uuid() }, async (_context, input, claim) => {
     const changed = (level: string) => refused("SAV_MCP_PAUSE_CHANGED", `Le niveau actuel est ${level} : relire avec get_agent_pause.`);
     const current = await readSavAgentPause(requireDb(), "intake");

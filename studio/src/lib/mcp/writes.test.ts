@@ -204,7 +204,7 @@ it("SAV-34 pause runs the real console function and guard: administrators only, 
   expect(await call("get_agent_pause", {})).toMatchObject({ data: { state: { level: "actions_paused" }, history: [{ actor: "ugo@limova.ai", nextLevel: "actions_paused" }] } });
   expect(await call("set_agent_pause", { level: "actions_paused", expectedLevel: "actions_paused", reason: "Test synthétique", idempotencyKey: key() })).toMatchObject({ outcome: "already_done" });
   current = contact;
-  expect(await call("set_agent_pause", { level: "running", expectedLevel: "actions_paused", reason: "Test synthétique", idempotencyKey: key() })).toMatchObject({ outcome: "refused", code: "SAV_AGENT_PAUSE_UNAUTHORIZED" });
+  expect(await call("set_agent_pause", { level: "fully_paused", expectedLevel: "actions_paused", reason: "Test synthétique", idempotencyKey: key() })).toMatchObject({ outcome: "refused", code: "SAV_AGENT_PAUSE_UNAUTHORIZED" });
   expect(await call("get_agent_pause", {})).toMatchObject({ outcome: "refused", code: "SAV_AGENT_PAUSE_UNAUTHORIZED" });
   await f.db.update(staffUsers).set({ active: false }).where(eq(staffUsers.clerkId, "user_ugo")); current = ugo;
   expect((await handleStudioMcpRequest(new Request("https://studio.example.invalid/api/mcp", { method: "POST", body: "{}", headers: { "content-type": "application/json", accept: "application/json, text/event-stream", authorization: "Bearer x" } }),
@@ -269,8 +269,12 @@ it("REVIEW776 concurrent different payloads with the same key must conflict", as
   expect((await writes())).toHaveLength(1);
 });
 it("REVIEW776 no-op pause commands enforce the same administrator permission", async () => {
+  // Adapted after SAV-34 (running is UI-only): the same no-op, on a pausing level set by the console.
+  const { setSavAgentPause } = await import("@/lib/sav/intake/agent-pause-admin");
+  const { withSavRequestUser } = await import("@/lib/sav/intake/console-auth");
+  await withSavRequestUser(ugo as never, () => setSavAgentPause({ agent: "intake", level: "actions_paused", reason: "Fixture synthétique console" }));
   current = contact;
-  expect(await call("set_agent_pause", { level: "running", expectedLevel: "running", reason: "Contrôle synthétique", idempotencyKey: key() }))
+  expect(await call("set_agent_pause", { level: "actions_paused", expectedLevel: "actions_paused", reason: "Contrôle synthétique", idempotencyKey: key() }))
     .toMatchObject({ outcome: "refused", code: "SAV_AGENT_PAUSE_UNAUTHORIZED" });
 });
 it("REVIEW776 an audit failure after a committed pause must not assert no action was attempted", async () => {
@@ -299,13 +303,14 @@ it("REVIEW776 witness: a sequential retry with the same key replays without a se
   expect(await writes()).toHaveLength(1);
 });
 it("REVIEW776 witness: expectedSetAt refuses an intermediate change back to the same level (ABA)", async () => {
-  const first = await call("set_agent_pause", { level: "fully_paused", expectedLevel: "running", expectedSetAt: null, reason: "Pause synthétique", idempotencyKey: key() }) as { data: { setAt: string } };
-  const second = await call("set_agent_pause", { level: "running", expectedLevel: "fully_paused", expectedSetAt: first.data.setAt, reason: "Reprise synthétique", idempotencyKey: key() }) as { data: { setAt: string } };
-  await call("set_agent_pause", { level: "fully_paused", expectedLevel: "running", expectedSetAt: second.data.setAt, reason: "Pause synthétique", idempotencyKey: key() });
-  expect(await call("set_agent_pause", { level: "running", expectedLevel: "fully_paused", expectedSetAt: first.data.setAt, reason: "Reprise ancienne", idempotencyKey: key() }))
-    .toMatchObject({ outcome: "refused", code: "SAV_MCP_PAUSE_CHANGED" });
   const { setSavAgentPause } = await import("@/lib/sav/intake/agent-pause-admin");
   const { withSavRequestUser } = await import("@/lib/sav/intake/console-auth");
+  const first = await call("set_agent_pause", { level: "fully_paused", expectedLevel: "running", expectedSetAt: null, reason: "Pause synthétique", idempotencyKey: key() }) as { data: { setAt: string } };
+  // The resume in between happens on the console (running is UI-only since SAV-34).
+  const second = await withSavRequestUser(ugo as never, () => setSavAgentPause({ agent: "intake", level: "running", reason: "Reprise synthétique console" }));
+  expect(await call("set_agent_pause", { level: "fully_paused", expectedLevel: "running", expectedSetAt: second.setAt, reason: "Pause synthétique", idempotencyKey: key() })).toMatchObject({ outcome: "done" });
+  expect(await call("set_agent_pause", { level: "actions_paused", expectedLevel: "fully_paused", expectedSetAt: first.data.setAt, reason: "Décision ancienne", idempotencyKey: key() }))
+    .toMatchObject({ outcome: "refused", code: "SAV_MCP_PAUSE_CHANGED" });
   await expect(withSavRequestUser(ugo as never, () => setSavAgentPause({ agent: "intake", level: "running", reason: "Contrôle synthétique", expectedLevel: "running" }))).rejects.toThrow("SAV_AGENT_PAUSE_CHANGED");
   // The console page passes no precondition: unchanged behaviour.
   expect(await withSavRequestUser(ugo as never, () => setSavAgentPause({ agent: "intake", level: "running", reason: "Console synthétique" }))).toMatchObject({ level: "running" });
@@ -351,4 +356,48 @@ it("SAV-71 composition: get_dossier and classify_other give the page's manual-Ot
   detail.humanHeld = true; state.manualBinding.mockClear();
   expect(await other()).toMatchObject({ available: false, unavailableReason: "Une pause humaine protège ce dossier." });
   expect(state.manualBinding).not.toHaveBeenCalled(); expect(state.manual).not.toHaveBeenCalled();
+});
+
+it("REVIEW-AE running remains UI-only and cannot be activated through the MCP", async () => {
+  const { withSavRequestUser } = await import("@/lib/sav/intake/console-auth");
+  const { setSavAgentPause } = await import("@/lib/sav/intake/agent-pause-admin");
+  const { readSavAgentPause } = await import("@/lib/sav/intake/agent-pause");
+  await withSavRequestUser(ugo as never, () => setSavAgentPause({ agent: "intake", level: "fully_paused", reason: "Synthetic fixture via console authority" }));
+  const result = await call("set_agent_pause", { level: "running", expectedLevel: "fully_paused", reason: "Synthetic MCP resume must remain UI-only", idempotencyKey: key() });
+  const after = await readSavAgentPause(f.db);
+  expect({ applied: result.outcome === "done", level: after.level }).toEqual({ applied: false, level: "fully_paused" });
+});
+it.each(["close_handled_outside", "classify_invalid_source_other", "classify_other", "release_hold", "request_reinvestigation", "continue_dossier", "reconcile_note", "reconcile_identification"])("REVIEW-AE member cannot invoke restricted %s", async name => {
+  current = contact; detail.humanHeld = name === "release_hold";
+  state.panel.mockResolvedValue({ allowResume: true, allowReanalysis: true, allowInformation: true, information: null });
+  const args: Record<string, unknown> = { threadId, versionToken: token(), idempotencyKey: key(), reason: "Synthetic explicit reviewer reason" };
+  if (name === "close_handled_outside") { args.attestHandled = true; delete args.reason; }
+  if (name === "classify_invalid_source_other") { args.attest = true; delete args.reason; }
+  if (name === "classify_other") args.attest = true;
+  if (name === "continue_dossier") args.kind = "resume";
+  if (["reconcile_note", "reconcile_identification"].includes(name)) { delete args.idempotencyKey; delete args.reason; }
+  expect(await call(name, args)).toMatchObject({ outcome: "refused", code: "SAV_MCP_ACTION_UNAVAILABLE" });
+  for (const fn of [state.complete, state.invalid, state.manual, state.release, state.reinvestigate, state.operator, state.note, state.identification]) expect(fn).not.toHaveBeenCalled();
+  if (["reconcile_note", "reconcile_identification"].includes(name)) expect((await writes()).every(row => row.technicalMetadata.outcome === "refused")).toBe(true);
+  else expect(await writes()).toHaveLength(0);
+});
+it("REVIEW-AE read-only reconciliation keeps the member permission on a fresh request", async () => {
+  current = contact;
+  expect(await call("get_agent_pause", {})).toMatchObject({ outcome: "refused", code: "SAV_AGENT_PAUSE_UNAUTHORIZED" });
+  expect(await call("get_diagnostics", { threadId })).toMatchObject({ outcome: "refused", code: "SAV_INTAKE_DIAGNOSTICS_FORBIDDEN" });
+  expect(await writes()).toHaveLength(0);
+});
+it("SAV-34 witness: running is not offered by the MCP schema; pausing and reading every level remain", async () => {
+  const list = await (await handleStudioMcpRequest(new Request("https://studio.example.invalid/api/mcp", { method: "POST",
+    body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/list", params: {} }),
+    headers: { "content-type": "application/json", accept: "application/json, text/event-stream", authorization: "Bearer x-synthetic-key-0001" } }),
+  { env, resolveUser: async () => current as never })).json() as { result: { tools: { name: string; title: string; inputSchema: { properties: Record<string, { enum?: string[] }> } }[] } };
+  const tool = list.result.tools.find(t => t.name === "set_agent_pause")!;
+  expect(tool.inputSchema.properties.level.enum).toEqual(["actions_paused", "fully_paused"]);
+  expect(tool.inputSchema.properties.expectedLevel.enum).toContain("running");
+  expect(tool.title).not.toMatch(/relanc/i);
+  expect(await call("set_agent_pause", { level: "running", expectedLevel: "running", reason: "Reprise interdite", idempotencyKey: key() })).not.toMatchObject({ outcome: "done" });
+  expect(await call("set_agent_pause", { level: "actions_paused", expectedLevel: "running", reason: "Pause synthétique", idempotencyKey: key() })).toMatchObject({ outcome: "done" });
+  expect(await call("get_agent_pause", {})).toMatchObject({ data: { state: { level: "actions_paused" } } });
+  expect((await f.db.select().from(auditLogs)).filter(a => a.action === "sav_agent_pause_set")).toHaveLength(1);
 });
