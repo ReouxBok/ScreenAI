@@ -22,7 +22,7 @@ import { planSavIntake } from "./engine";
 import { recordAcceptedIntakeSemantics, SAV_INTAKE_SEMANTIC_RECORD_REVISION, type AcceptedIntakeSemantics } from "./semantic-records";
 import { SAV_INTAKE_MODEL_REVISION } from "./model-readers";
 import { createSavIntakeHubspotReaders } from "./hubspot-readers";
-import { enqueueSavIntakeMessage, claimSavIntakeRun, saveSavIntakeResult, readSavIntakeCurrent, catchupSavIntake, pendingSavIntakeRuns, assertSavIntakeLease } from "./runtime-store";
+import { enqueueSavIntakeMessage, claimSavIntakeRun, saveSavIntakeResult, readSavIntakeCurrent, catchupSavIntake, pendingSavIntakeRuns, assertSavIntakeLease, savIntakeSourceSnapshot } from "./runtime-store";
 import { approveIntakeExecutionPolicy, intakeExecutionConfig, type ExecutionPolicy } from "./execution-policy";
 import * as executionPolicyModule from "./execution-policy";
 import { createIntakeExecutorAdapters } from "./execution-adapters";
@@ -1516,9 +1516,10 @@ it("REVIEW invalid-source classification is refused when the same message become
   } finally { spy.mockRestore(); }
 });
 
-import { classifyValidSourceAsOther, readManualOtherBinding } from "./manual-other-classification";
+import { classifyValidSourceAsOther, readManualOtherBinding, readManualOtherEligibility } from "./manual-other-classification";
 describe("manual Other on a valid source without an AI verdict", () => {
-  async function pendingOther() {
+  async function pendingOther(body?: Record<string, unknown>) {
+    if (body) await db.db.update(savMessages).set({bodyCiphertext:encryptSavPayload(body)}).where(eq(savMessages.id,messageId));
     vi.stubEnv("SAV_RELEASE_STAGE", "v0"); vi.stubEnv("SAV_PILOT_MODE", "false");
     await activateSavV0Cutover({receivedAfter:new Date(Date.now()-3600000).toISOString(),mailboxEmail:"support@example.invalid",intakeRecipient:"contact@limova.ai",deploymentSha:"a".repeat(40),activatedBy:"ugo@limova.ai"});
     await recordIntakeLaunch({mailboxId,receivedAfter:options.runtime.receivedAfter,createdAfter:options.runtime.createdAfter});
@@ -1530,6 +1531,106 @@ describe("manual Other on a valid source without an AI verdict", () => {
     return {...binding!,requestKey:randomUUID(),confirmed:true as const,reason:"Réponse automatique synthétique sans demande client."};
   }
   const markers = () => db.db.select().from(auditLogs).where(eq(auditLogs.action, SAV_EXTERNAL_COMPLETION));
+  const attachmentBody = (mimeType = "image/png") => ({text:"Automatic delivery notification, no customer request.",headers:{},
+    attachments:[{filename:mimeType === "text/calendar" ? "invitation.ics" : "icon.png",mimeType,size:32}],attachmentInventory:{complete:true,limits:[]}});
+  it("REVIEW-SAV71 subject-only complete attachment inventory remains human-reviewable", async () => {
+    await pendingOther();
+    const body={...attachmentBody(),text:""};
+    await db.db.update(savMessages).set({subject:"Automatic delivery notification",bodyCiphertext:encryptSavPayload(body)}).where(eq(savMessages.id,messageId));
+    const m=(await db.db.select().from(savMessages).where(eq(savMessages.id,messageId)))[0];
+    const snapshot=await db.db.transaction(tx=>savIntakeSourceSnapshot(tx,m,new Date()));
+    expect(snapshot.provenance.get(messageId)?.textComplete).toBe(true);
+    expect(snapshot.input.message.currentText).toBe("Automatic delivery notification");
+    const epoch=(await db.db.select().from(savIntakeConsole).where(eq(savIntakeConsole.threadId,threadId)))[0].epoch;
+    expect((await readManualOtherEligibility(threadId,messageId,epoch)).binding).not.toBeNull();
+    expect(await markers()).toHaveLength(0); expect(fetch).not.toHaveBeenCalled();
+  });
+  it("REVIEW-SAV71 subject-only complete source remains eligible for human review", async () => {
+    await pendingOther();
+    await db.db.update(savMessages).set({subject:"Automatic delivery notification",bodyCiphertext:encryptSavPayload({text:"",headers:{},attachments:[],attachmentInventory:{complete:true,limits:[]}})}).where(eq(savMessages.id,messageId));
+    const m=(await db.db.select().from(savMessages).where(eq(savMessages.id,messageId)))[0];
+    const snapshot=await db.db.transaction(tx=>savIntakeSourceSnapshot(tx,m,new Date()));
+    expect(snapshot.input.message.contentComplete).toBe(true);
+    expect(snapshot.input.message.currentText).toBe("Automatic delivery notification");
+    const epoch=(await db.db.select().from(savIntakeConsole).where(eq(savIntakeConsole.threadId,threadId)))[0].epoch;
+    const result=await readManualOtherEligibility(threadId,messageId,epoch);
+    expect(result.reason).toBeNull();
+    expect(result.binding).not.toBeNull();
+    expect(await markers()).toHaveLength(0); expect(fetch).not.toHaveBeenCalled();
+  });
+  it.each(["", "\n\t", "<html><head></head><body><br></body></html>"])("human review: classifies a readable subject with an empty normalized body %j",async text=>{
+    await pendingOther();
+    await db.db.update(savMessages).set({subject:"Automatic notification",bodyCiphertext:encryptSavPayload({...attachmentBody(),text})}).where(eq(savMessages.id,messageId));
+    const epoch=(await db.db.select().from(savIntakeConsole).where(eq(savIntakeConsole.threadId,threadId)))[0].epoch;
+    const result=await readManualOtherEligibility(threadId,messageId,epoch);expect(result.binding).not.toBeNull();
+    expect(await classifyValidSourceAsOther({...result.binding!,requestKey:randomUUID(),confirmed:true,reason:"Human review of this subject-only automatic notification."})).toMatchObject({marked:1});
+    expect(await markers()).toHaveLength(1);expect(fetch).not.toHaveBeenCalled();expect(mutationsSent()).toHaveLength(0);
+  });
+  it.each(["\n\t", "<html><head></head><body><br></body></html>"])("human review: rejects an empty subject and empty normalized body %j",async text=>{
+    const input=await pendingOther();
+    await db.db.update(savMessages).set({subject:" \t",bodyCiphertext:encryptSavPayload({...attachmentBody(),text})}).where(eq(savMessages.id,messageId));
+    const epoch=(await db.db.select().from(savIntakeConsole).where(eq(savIntakeConsole.threadId,threadId)))[0].epoch;
+    expect(await readManualOtherEligibility(threadId,messageId,epoch)).toEqual({binding:null,reason:"source_text_incomplete"});
+    expect((await classifyValidSourceAsOther(input)).marked).toBe(0);expect(await markers()).toHaveLength(0);expect(fetch).not.toHaveBeenCalled();
+  });
+  it.each(["image/png","text/calendar"])("human review: classifies complete text and a complete %s inventory without an AI attachment read", async mimeType => {
+    const input = await pendingOther(attachmentBody(mimeType));
+    const before=(await db.db.select().from(savMessages).where(eq(savMessages.id,messageId)))[0];
+    const source=await db.db.transaction(tx=>savIntakeSourceSnapshot(tx,before,new Date()));
+    expect(source.input.message.contentComplete).toBe(false);
+    const runBefore=(await db.db.select().from(savIntakeRuns).where(eq(savIntakeRuns.id,runId)))[0];
+    expect(await classifyValidSourceAsOther(input)).toMatchObject({marked:1});
+    expect(await classifyValidSourceAsOther(input)).toMatchObject({alreadyCompleted:1,marked:0});
+    expect(await markers()).toHaveLength(1);
+    expect((await listIntakeConsole({view:"other"})).rows.map(row=>row.threadId)).toEqual([threadId]);
+    expect((await readIntakeConsoleDetail(threadId))?.projection.status).toBe("human_other");
+    expect((await pendingSavIntakeRuns(options.runtime)).map(run=>run.id)).not.toContain(runId);
+    expect(await claimSavIntakeRun(runId,options.runtime)).toBeNull();
+    expect(await db.db.select().from(savIntakeModelCalls)).toHaveLength(0);
+    expect((await db.db.select().from(savMessages).where(eq(savMessages.id,messageId)))[0].bodyCiphertext).toBe(before.bodyCiphertext);
+    expect((await db.db.select().from(savIntakeRuns).where(eq(savIntakeRuns.id,runId)))[0]).toEqual(runBefore);
+    const proof=decryptSavPayload<{sourceReview:unknown}>(String((await markers())[0].technicalMetadata.manualOtherReasonCiphertext));
+    expect(proof.sourceReview).toEqual({kind:"human_text_and_inventory",attachmentCount:1,attachmentAnalysisRequired:false});
+    expect(fetch).not.toHaveBeenCalled(); expect(mutationsSent()).toHaveLength(0);
+  });
+  it.each(["analysis_lease","analysing_without_live_lease","pause","human_command","missing_launch"])("human review: explains %s on GET and still refuses a previously valid command",async kind=>{
+    const input=await pendingOther(attachmentBody());
+    if(kind==="analysis_lease") await db.db.update(savIntakeRuns).set({leaseUntil:new Date(Date.now()+60000),leaseToken:randomUUID()}).where(eq(savIntakeRuns.id,runId));
+    if(kind==="analysing_without_live_lease") await db.db.update(savIntakeRuns).set({state:"analysing",leaseUntil:new Date(Date.now()-1000)}).where(eq(savIntakeRuns.id,runId));
+    if(kind==="pause") await db.db.update(savThreads).set({aiPaused:true}).where(eq(savThreads.id,threadId));
+    if(kind==="missing_launch") await db.client.exec("DELETE FROM sav.sync_state WHERE key like 'sav-intake-launch:%'");
+    if(kind==="human_command") await db.db.insert(savIntakeHumanEvents).values({commandKey:randomUUID(),threadId,messageId,parentRunId:runId,parentVersion:1,
+      baseConfigHash:options.runtime.configHash,sourceHash:input.sourceHash,kind:"classify",state:"waiting",payloadCiphertext:encryptSavPayload({classification:"other"})});
+    const epoch=(await db.db.select().from(savIntakeConsole).where(eq(savIntakeConsole.threadId,threadId)))[0].epoch;
+    const expected=kind==="pause"?"paused":kind==="human_command"?"pending_command":kind==="missing_launch"?"outside_launch":"active_worker";
+    expect(await readManualOtherEligibility(threadId,messageId,epoch)).toEqual({binding:null,reason:expected});
+    expect((await classifyValidSourceAsOther(input)).marked).toBe(0);expect(await markers()).toHaveLength(0);expect(fetch).not.toHaveBeenCalled();
+  });
+  it("human review: refuses a forged inventory count and a stale command revision",async()=>{
+    const input=await pendingOther(attachmentBody("text/calendar"));
+    expect((await classifyValidSourceAsOther({...input,attachmentCount:0})).marked).toBe(0);
+    await expect(classifyValidSourceAsOther({...input,revision:"sav-intake-manual-other.v1"})).rejects.toThrow();
+    expect(await markers()).toHaveLength(0);
+  });
+  it.each(["attachments","inventory"])("human review: refuses a changed %s under the original binding", async changed => {
+    const body=attachmentBody(),input=await pendingOther(body);
+    const next=changed==="attachments"?{...body,attachments:[{...body.attachments[0],filename:"changed.png"}]}:{...body,attachmentInventory:{complete:false,limits:["node_limit"]}};
+    await db.db.update(savMessages).set({bodyCiphertext:encryptSavPayload(next)}).where(eq(savMessages.id,messageId));
+    expect((await classifyValidSourceAsOther(input)).marked).toBe(0);expect(await markers()).toHaveLength(0);
+  });
+  it.each(["missing_inventory","incomplete_inventory","invalid_inventory","incomplete_text","all_empty"])("human review: keeps %s ineligible", async kind => {
+    const input=await pendingOther(); const body:Record<string,unknown>=attachmentBody();
+    if(kind==="missing_inventory") delete body.attachmentInventory;
+    if(kind==="incomplete_inventory") body.attachmentInventory={complete:false,limits:["depth_limit"]};
+    if(kind==="invalid_inventory") body.attachmentInventory={complete:true,limits:["node_limit"]};
+    if(kind==="incomplete_text") body.text="x".repeat(100000);
+    if(kind==="all_empty") { body.text=""; await db.db.update(savMessages).set({subject:""}).where(eq(savMessages.id,messageId)); }
+    await db.db.update(savMessages).set({bodyCiphertext:encryptSavPayload(body)}).where(eq(savMessages.id,messageId));
+    const epoch=(await db.db.select().from(savIntakeConsole).where(eq(savIntakeConsole.threadId,threadId)))[0].epoch;
+    expect(await readManualOtherBinding(threadId,messageId,epoch)).toBeNull();
+    expect((await readManualOtherEligibility(threadId,messageId,epoch)).reason).toBe(["incomplete_text","all_empty"].includes(kind)?"source_text_incomplete":"inventory_incomplete");
+    expect((await classifyValidSourceAsOther(input)).marked).toBe(0);expect(await markers()).toHaveLength(0);
+  });
   it("classifies a pending valid source once, audited, without AI, CRM, Gmail or changing its run", async () => {
     const input = await pendingOther();
     const before = (await db.db.select().from(savIntakeRuns))[0];
@@ -1537,9 +1638,9 @@ describe("manual Other on a valid source without an AI verdict", () => {
     expect(await classifyValidSourceAsOther(input)).toMatchObject({marked:1,alreadyCompleted:0});
     expect(await classifyValidSourceAsOther(input)).toMatchObject({marked:0,alreadyCompleted:1});
     const audits = await markers(); expect(audits).toHaveLength(1);
-    expect(audits[0].technicalMetadata).toMatchObject({disposition:"other",manualOtherRevision:"sav-intake-manual-other.v1",manualOtherRunId:runId,manualOtherRunVersion:1,manualOtherSourceHash:input.sourceHash});
+    expect(audits[0].technicalMetadata).toMatchObject({disposition:"other",manualOtherRevision:"sav-intake-manual-other.v2",manualOtherRunId:runId,manualOtherRunVersion:1,manualOtherSourceHash:input.sourceHash});
     const proof = audits[0].technicalMetadata.manualOtherReasonCiphertext;
-    expect(decryptSavPayload(String(proof))).toEqual({reason:input.reason,confirmed:true});
+    expect(decryptSavPayload(String(proof))).toEqual({reason:input.reason,confirmed:true,sourceReview:{kind:"human_text_and_inventory",attachmentCount:0,attachmentAnalysisRequired:false}});
     expect(JSON.stringify(audits)).not.toContain(input.reason);
     expect((await listIntakeConsole({view:"other"})).rows.map(row=>row.threadId)).toEqual([threadId]);
     expect((await readIntakeConsoleDetail(threadId))?.projection.status).toBe("human_other");

@@ -8,8 +8,8 @@ import { intakeBudgetOwnerFor, readIntakeBudgetPanel } from "@/lib/sav/intake/bu
 import { savIntakeViewLabels, savIntakeViewSchema } from "@/lib/sav/intake/contract";
 import { intakeStatusLabel, intakeReasonLabel, intakeBlockedCauseLabel, intakeRetryLabel } from "@/lib/sav/intake/console-presentation";
 import { readOperatorPanel } from "@/lib/sav/intake-ux/operator-commands";
-import { readManualOtherBinding } from "@/lib/sav/intake/manual-other-classification";
-import { intakeDossierView, intakeDossierActions, intakeEffectLabels, intakeEffectStateLabels, intakeRouteLabel, intakeEffectsTitle, type IntakeConsoleDetail } from "@/lib/sav/intake/dossier-view";
+import { manualOtherUnavailableLabels } from "@/lib/sav/intake/manual-other-classification";
+import { intakeDossierView, intakeDossierActions, intakeEffectLabels, intakeEffectStateLabels, intakeRouteLabel, intakeEffectsTitle, readIntakeManualOther, type IntakeConsoleDetail } from "@/lib/sav/intake/dossier-view";
 
 /** Uniform tool result. A refusal is an answer, not a transport error. */
 /** uncertain: a write may have been applied but its result is not established; the agent re-reads, never retries blindly. */
@@ -70,11 +70,12 @@ export function intakeDossierSummary(data: IntakeConsoleDetail) {
 export async function intakeAvailableActions(data: IntakeConsoleDetail, staff: Staff) {
   const view = intakeDossierView(data), actions = intakeDossierActions(data, view, staff);
   const panel = actions.administrator && actions.operatorBinding ? await readOperatorPanel(actions.operatorBinding).catch(() => null) : null;
-  const manualOther = actions.manualOtherCandidate && data.latestMessageId ? await readManualOtherBinding(data.thread.id, data.latestMessageId, data.projection.epoch).catch(() => null) : null;
+  const manualOther = await readIntakeManualOther(data, actions.manualOther).catch(() => null);
   return [
     { tool: "close_handled_outside", available: actions.closeHandledOutside, requires: "attestHandled: true" },
     { tool: "classify_invalid_source_other", available: actions.classifyInvalidSource, requires: "attest: true" },
-    { tool: "classify_other", available: Boolean(manualOther), requires: "attest: true, reason" },
+    { tool: "classify_other", available: Boolean(manualOther?.binding), requires: "attest: true, reason",
+      unavailableReason: manualOther?.reason ? manualOtherUnavailableLabels[manualOther.reason] : null },
     { tool: "release_hold", available: actions.releaseHold, requires: "reason" },
     { tool: "record_choice", available: actions.recordChoice, requires: "kind, reason ; contactId/ticketId parmi candidates pour select" },
     { tool: "continue_dossier", available: Boolean(panel && (panel.allowResume || panel.allowReanalysis || panel.allowInformation)),

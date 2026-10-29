@@ -3,7 +3,7 @@ import { notFound } from "next/navigation";
 import { z } from "zod";
 import { requireIntakeConsoleStaff } from "@/lib/sav/intake/console-auth";
 import { readIntakeConsoleDetail } from "@/lib/sav/intake/console-detail";
-import { intakeDossierView, intakeEffectLabels as effectLabels, intakeEffectStateLabels as stateLabels, intakeRouteLabel, intakeEffectsTitle, intakeDossierActions } from "@/lib/sav/intake/dossier-view";
+import { intakeDossierView, intakeEffectLabels as effectLabels, intakeEffectStateLabels as stateLabels, intakeRouteLabel, intakeEffectsTitle, intakeDossierActions, readIntakeManualOther } from "@/lib/sav/intake/dossier-view";
 import { intakeRuntimeHash } from "@/lib/sav/intake/runtime-contract";
 import { formatParisDateTime } from "@/lib/paris-date";
 import { MailConversation } from "../../[id]/mail-conversation";
@@ -11,7 +11,7 @@ import {readIntakeCrmDisplay} from "@/lib/sav/intake/crm-display-server";
 import { releaseIntakeHumanHoldAction } from "../actions";
 import {IntakeRecoveryForm} from "../recovery-form";
 import { IntakeCompletionForm } from "../completion-form";
-import { readManualOtherBinding } from "@/lib/sav/intake/manual-other-classification";
+import { manualOtherUnavailableLabels } from "@/lib/sav/intake/manual-other-classification";
 import { IntakeManualOtherForm } from "../manual-other-form";
 import { IntakeInvalidSourceForm } from "../invalid-source-form";
 import { intakeStatusLabel, intakeReasonLabel, intakeContextReasonLabels, intakeCrmDeltaLabel, intakeNextStepLabel } from "@/lib/sav/intake/console-presentation";
@@ -39,7 +39,9 @@ export default async function IntakeDetailPage({ params, searchParams }: { param
   const controls = data.latestMessageId ? await readUxMessageControls(id, data.latestMessageId) : { blocked: true, reason: "Aucun message courant disponible." };
   const actions = intakeDossierActions(data, { current, canCorrect, plan }, staff), { operatorBinding } = actions;
   const operatorPanel = operatorBinding && actions.administrator ? await readOperatorPanel(operatorBinding) : null;
-  const manualOtherBinding = actions.manualOtherCandidate && data.latestMessageId ? await readManualOtherBinding(id, data.latestMessageId, data.projection.epoch) : null;
+  // SAV-71: the same eligibility, with its bounded reason, as the MCP get_dossier and classify_other.
+  const manualOtherEligibility = await readIntakeManualOther(data, actions.manualOther);
+  const manualOtherBinding = manualOtherEligibility?.binding;
   return <div className={styles.console}>
     <IntakeBackLink className={styles.back} returnTo={query?.returnTo}/>
     <header className={styles.heading}><div><span className="eyebrow">Dossier · version {current?.version ?? "en attente"}</span><h1>{data.thread.subject || "Nouvelle demande"}</h1>
@@ -91,6 +93,8 @@ export default async function IntakeDetailPage({ params, searchParams }: { param
         paused={data.thread.paused||data.humanHeld} exhausted={Boolean(blocked)}
         lastActivity={data.diagnostics?.runs.flatMap(r=>r.events.map(e=>e.createdAt)).sort((a,b)=>b.getTime()-a.getTime())[0] ? formatParisDateTime(data.diagnostics.runs.flatMap(r=>r.events.map(e=>e.createdAt)).sort((a,b)=>b.getTime()-a.getTime())[0]) : undefined}/>
       {manualOtherBinding && <IntakeManualOtherForm key={`manual-other-${manualOtherBinding.messageId}-${manualOtherBinding.version}-${manualOtherBinding.sourceHash}`} binding={manualOtherBinding} requestKey={randomUUID()}/>}
+      {manualOtherEligibility?.reason && <section className={styles.notice} aria-label="Classement dans Autres indisponible"><h2>Classement dans Autres indisponible</h2>
+        <p>{manualOtherUnavailableLabels[manualOtherEligibility.reason]}</p></section>}
       {actions.classifyInvalidSource && current && <IntakeInvalidSourceForm key={`invalid-${current.messageId}`} threadId={id} messageId={current.messageId} requestKey={randomUUID()}/>}
       {actions.closeHandledOutside && data.latestMessageId && <IntakeCompletionForm key={data.latestMessageId} threadId={id} messageId={data.latestMessageId} requestKey={randomUUID()}/>}
       {actions.releaseHold && data.latestMessageId && <section className={styles.notice}><h2>Reprendre ce dossier</h2>

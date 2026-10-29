@@ -1,6 +1,7 @@
 import "server-only";
 import type { readIntakeConsoleDetail } from "./console-detail";
 import { intakeHandoff } from "./console-presentation";
+import { readManualOtherEligibility, type ManualOtherEligibility } from "./manual-other-classification";
 
 export const intakeEffectLabels: Record<string, string> = { ticket_create: "Création du ticket", note_create: "Note de contexte", note_associate: "Rattachement de la note",
   email_create: "Conservation de l’email CRM", email_associate: "Rattachement de l’email", stage_new: "Statut Nouveau", identity_send: "Demande d’identification" };
@@ -57,12 +58,18 @@ export function intakeDossierActions(data: IntakeConsoleDetail, view: Pick<Retur
     classifyInvalidSource: Boolean(!data.handledExternally && current?.sourceInvalid && current.messageId === data.latestMessageId && owner),
     releaseHold: Boolean(data.humanHeld && !data.handledExternally && data.latestMessageId && administrator),
     recordChoice: Boolean(view.canCorrect && current?.sourceHash && view.plan),
-    manualOtherCandidate: Boolean(owner && !data.handledExternally && !data.humanHeld && !data.thread.paused && !data.confirmedCurrent && !current?.sourceInvalid
-      && data.latestMessageId && !data.progress?.effects.some(effect => effect.state !== "planned")
-      && (data.projection.view === "to_validate" || data.projection.view === null)),
+    // SAV-71: not offered (null), a reason known from the dossier, or "read" for the eligibility reader.
+    manualOther: !(owner && data.latestMessageId && !data.handledExternally && !current?.sourceInvalid) ? null
+      : data.humanHeld || data.thread.paused ? "paused" as const
+        : data.confirmedCurrent || data.progress?.effects.some(effect => effect.state !== "planned") ? "effects_engaged" as const : "read" as const,
     operatorBinding: current?.sourceHash && current.messageId === data.latestMessageId
       ? { threadId: data.thread.id, messageId: current.messageId, runId: current.id, version: current.version, sourceHash: current.sourceHash } : null,
     administratorVerifications: Boolean(administrator && data.latestMessageId),
     noteReceipt: Boolean(data.progress?.effects.some(effect => effect.kind === "note_create" && effect.ack?.id)),
   };
+}
+/** Manual "Autres" eligibility shared by the dossier page and the MCP: binding, or a bounded reason. */
+export async function readIntakeManualOther(data: IntakeConsoleDetail, manualOther: ReturnType<typeof intakeDossierActions>["manualOther"]): Promise<ManualOtherEligibility | null> {
+  if (manualOther === null || !data.latestMessageId) return null;
+  return manualOther === "read" ? readManualOtherEligibility(data.thread.id, data.latestMessageId, data.projection.epoch) : { binding: null, reason: manualOther };
 }

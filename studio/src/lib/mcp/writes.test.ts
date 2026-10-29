@@ -14,7 +14,10 @@ const { as } = vi.hoisted(() => ({ as: (fn: (...args: unknown[]) => unknown) => 
   state.seen.push((await savRequestUser())?.id); return fn(...args); } }));
 vi.mock("@/lib/sav/external-completion", () => ({ completeSavDossierManually: as(state.complete) }));
 vi.mock("@/lib/sav/intake/invalid-source-classification", () => ({ classifyInvalidSourceAsOther: as(state.invalid) }));
-vi.mock("@/lib/sav/intake/manual-other-classification", () => ({ readManualOtherBinding: as(state.manualBinding), classifyValidSourceAsOther: as(state.manual) }));
+// SAV-71 eligibility: state.manualBinding gives the binding, or null for a bounded "not waiting" reason.
+vi.mock("@/lib/sav/intake/manual-other-classification", () => ({ classifyValidSourceAsOther: as(state.manual),
+  readManualOtherEligibility: as(async (...args: unknown[]) => { const binding = await state.manualBinding(...args); return binding ? { binding, reason: null } : { binding: null, reason: "not_waiting" }; }),
+  manualOtherUnavailableLabels: { not_waiting: "Ce dossier n’attend pas un classement humain.", paused: "Une pause humaine protège ce dossier.", effects_engaged: "Une action engagée ou son résultat reste à vérifier." } }));
 vi.mock("@/lib/sav/intake/human-hold-release", () => ({ releaseIntakeHumanHold: as(state.release) }));
 vi.mock("@/lib/sav/intake/human-commands", () => ({ recordIntakeHumanCommand: as(state.choice) }));
 vi.mock("@/lib/sav/intake/operator-recovery", () => ({ requestIntakeReinvestigation: as(state.reinvestigate), reconcileThreadIdentification: as(state.identification) }));
@@ -181,7 +184,7 @@ it("continue_dossier follows the operator panel's allowances and binding", async
   expect(state.operator).toHaveBeenCalledTimes(1);
 });
 it("classify_other uses the console's manual-Other binding, owner operator only; invalid sources have their own tool", async () => {
-  const binding = { revision: "r", threadId, messageId, runId, version: 7, runSourceHash: sourceHash, sourceHash, expectedEpoch: 4 };
+  const binding = { revision: "r", threadId, messageId, runId, version: 7, runSourceHash: sourceHash, sourceHash, expectedEpoch: 4, attachmentCount: 0 };
   state.manualBinding.mockResolvedValue(binding); state.manual.mockResolvedValue({ batchId: "b", requested: 1, marked: 1, alreadyCompleted: 0, skipped: {} });
   const idem = key();
   expect(await call("classify_other", { threadId, versionToken: token(), idempotencyKey: idem, reason: "Notification automatique synthétique.", attest: true })).toMatchObject({ outcome: "done" });
@@ -338,4 +341,14 @@ it("REVIEW776 witness: refusals before any action claim nothing, and classify_ot
   expect(state.manual).not.toHaveBeenCalled();
   state.detail.mockRejectedValueOnce(Error("synthetic read failure"));
   expect(await call("close_handled_outside", { threadId, versionToken: token(), idempotencyKey: key(), attestHandled: true })).toMatchObject({ outcome: "refused", code: "MCP_INTERNAL_ERROR" });
+});
+it("SAV-71 composition: get_dossier and classify_other give the page's manual-Other eligibility and its bounded reason", async () => {
+  state.manualBinding.mockResolvedValue(null); state.panel.mockResolvedValue({ allowResume: false, allowReanalysis: false, allowInformation: false, unavailableReason: "x", information: null });
+  const other = async () => (await call("get_dossier", { threadId }) as { data: { availableActions: { tool: string; available: boolean; unavailableReason?: string | null }[] } }).data.availableActions.find(a => a.tool === "classify_other");
+  expect(await other()).toMatchObject({ available: false, unavailableReason: "Ce dossier n’attend pas un classement humain." });
+  expect(await call("classify_other", { threadId, versionToken: token(), idempotencyKey: key(), reason: "Notification automatique synthétique.", attest: true }))
+    .toMatchObject({ outcome: "refused", code: "SAV_MCP_ACTION_UNAVAILABLE", message: "Ce dossier n’attend pas un classement humain." });
+  detail.humanHeld = true; state.manualBinding.mockClear();
+  expect(await other()).toMatchObject({ available: false, unavailableReason: "Une pause humaine protège ce dossier." });
+  expect(state.manualBinding).not.toHaveBeenCalled(); expect(state.manual).not.toHaveBeenCalled();
 });

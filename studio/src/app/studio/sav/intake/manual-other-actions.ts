@@ -8,7 +8,7 @@ export async function classifyManualOtherAction(_previous: IntakeChoiceFormState
     const result = await classifyValidSourceAsOther({ revision: form.get("revision"), requestKey: form.get("requestKey"),
       threadId: form.get("threadId"), messageId: form.get("messageId"), runId: form.get("runId"), version: Number(form.get("version")),
       runSourceHash: form.get("runSourceHash") || null, sourceHash: form.get("sourceHash"), expectedEpoch: Number(form.get("expectedEpoch")),
-      reason: form.get("reason"), confirmed: form.get("confirmed") === "on" });
+      attachmentCount: Number(form.get("attachmentCount")), reason: form.get("reason"), confirmed: form.get("confirmed") === "on" });
     if (!result.marked && !result.alreadyCompleted) return { ok: false, message: result.skipped.active_worker
       ? "Un traitement est encore en cours. Attendez sa fin et rechargez le dossier."
       : "Classement refusé : le dossier a changé, une pause ou une action reste à vérifier, ou une demande sensible est connue. Rechargez les sources." };

@@ -3,7 +3,7 @@ import { renderToStaticMarkup } from "react-dom/server";
 import { prerender } from "react-dom/static";
 import { beforeEach, it, expect, vi } from "vitest";
 const mocks = vi.hoisted(() => ({ staff: vi.fn(), list: vi.fn(), detail: vi.fn(), action: vi.fn(), crmDisplay: vi.fn(), controls: vi.fn(), manualOther: vi.fn(), operator: vi.fn() }));
-vi.mock("@/lib/sav/intake/manual-other-classification", () => ({ readManualOtherBinding: mocks.manualOther }));
+vi.mock("@/lib/sav/intake/manual-other-classification", () => ({ readManualOtherEligibility: mocks.manualOther, manualOtherUnavailableLabels: { not_waiting: "Ce dossier n’attend pas un classement humain." } }));
 vi.mock("./manual-other-actions", () => ({ classifyManualOtherAction: mocks.action }));
 vi.mock("@/lib/sav/intake-ux/operator-commands", () => ({ readOperatorPanel: mocks.operator }));
 vi.mock("@/lib/sav/intake-ux/message-controls", () => ({ readUxMessageControls: mocks.controls }));
@@ -52,7 +52,7 @@ const escape = (text: string) => text.replace(/&/g, "&amp;").replace(/</g, "&lt;
 const renderDetail = async () => { const { prelude } = await prerender(createElement(Fragment, null, await IntakeDetailPage({ params: Promise.resolve({ id: threadId }) })));
   return (await new Response(prelude).text()).replace(/<!--(?: |\$|\/\$)-->/g, ""); };
 beforeEach(() => {
-  vi.clearAllMocks(); mocks.manualOther.mockResolvedValue(null); mocks.controls.mockResolvedValue({ blocked: false });
+  vi.clearAllMocks(); mocks.manualOther.mockResolvedValue({ binding: null, reason: "not_waiting" }); mocks.controls.mockResolvedValue({ blocked: false });
   mocks.operator.mockResolvedValue({ information: null, allowResume: false, allowReanalysis: false, allowInformation: false, unavailableReason: "synthetic", resume: null });
   mocks.crmDisplay.mockResolvedValue({ contacts: {}, tickets: {} }); mocks.staff.mockResolvedValue({ id: "s", email: "ugo@limova.ai", role: "admin" }); mocks.list.mockResolvedValue(list);
 });

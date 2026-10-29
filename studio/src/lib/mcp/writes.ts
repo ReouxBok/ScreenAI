@@ -7,7 +7,7 @@ import { requireDb } from "@/db";
 import { auditLogs } from "@/db/schema";
 import { completeSavDossierManually } from "@/lib/sav/external-completion";
 import { classifyInvalidSourceAsOther } from "@/lib/sav/intake/invalid-source-classification";
-import { classifyValidSourceAsOther, readManualOtherBinding } from "@/lib/sav/intake/manual-other-classification";
+import { classifyValidSourceAsOther, manualOtherUnavailableLabels } from "@/lib/sav/intake/manual-other-classification";
 import { releaseIntakeHumanHold } from "@/lib/sav/intake/human-hold-release";
 import { recordIntakeHumanCommand } from "@/lib/sav/intake/human-commands";
 import { requestIntakeReinvestigation, reconcileThreadIdentification } from "@/lib/sav/intake/operator-recovery";
@@ -16,7 +16,7 @@ import { recordOperatorCommand, readOperatorPanel } from "@/lib/sav/intake-ux/op
 import { savAgentPauseAdministrator, setSavAgentPause, readSavAgentPausePanel } from "@/lib/sav/intake/agent-pause-admin";
 import { readSavAgentPause, SAV_AGENT_PAUSE_LEVELS } from "@/lib/sav/intake/agent-pause";
 import { readIntakeConsoleDetail } from "@/lib/sav/intake/console-detail";
-import { intakeDossierActions, intakeDossierView, type IntakeConsoleDetail } from "@/lib/sav/intake/dossier-view";
+import { intakeDossierActions, intakeDossierView, readIntakeManualOther, type IntakeConsoleDetail } from "@/lib/sav/intake/dossier-view";
 import { intakeRuntimeHash } from "@/lib/sav/intake/runtime-contract";
 import { intakeVersionStillCurrent } from "@/lib/sav/intake/version-precondition";
 import { intakeVersionToken, type StudioMcpContext, type StudioMcpResult, type StudioMcpTool } from "./tools";
@@ -156,8 +156,8 @@ const classifyOther = studioMcpWrite("classify_other", "Classer dans Autres (dé
   { ...dossierInput, reason, attest: z.literal(true) }, async (context, input, claim) => {
     const found = await currentDossier(input); if (!found.ok) return found.result;
     const actions = intakeDossierActions(found.data, intakeDossierView(found.data), context.staff);
-    const binding = actions.manualOtherCandidate && found.version.messageId ? await readManualOtherBinding(input.threadId, found.version.messageId, found.data.projection.epoch) : null;
-    if (!binding) return unavailable("Le classement dans Autres");
+    const eligibility = found.version.messageId ? await readIntakeManualOther(found.data, actions.manualOther) : null, binding = eligibility?.binding;
+    if (!binding) return eligibility?.reason ? refused("SAV_MCP_ACTION_UNAVAILABLE", manualOtherUnavailableLabels[eligibility.reason]) : unavailable("Le classement dans Autres");
     // The binding is read again: it must still be the version the agent decided on (its epoch is the token's).
     if (binding.runId !== found.version.runId || binding.version !== found.version.version || binding.runSourceHash !== found.version.sourceHash)
       return refused("SAV_MCP_DOSSIER_CHANGED", "Le dossier a changé depuis la lecture : relire avec get_dossier avant de décider.");
