@@ -10,7 +10,7 @@ import {readIntakeCrmDisplay} from "@/lib/sav/intake/crm-display-server";
 import { releaseIntakeHumanHoldAction } from "../actions";
 import {IntakeRecoveryForm} from "../recovery-form";
 import { IntakeCompletionForm } from "../completion-form";
-import { readManualOtherBinding } from "@/lib/sav/intake/manual-other-classification";
+import { readManualOtherEligibility, manualOtherUnavailableLabels } from "@/lib/sav/intake/manual-other-classification";
 import { IntakeManualOtherForm } from "../manual-other-form";
 import { IntakeInvalidSourceForm } from "../invalid-source-form";
 import { intakeStatusLabel, intakeReasonLabel, intakeContextReasonLabels, intakeHandoff, intakeCrmDeltaLabel, intakeNextStepLabel } from "@/lib/sav/intake/console-presentation";
@@ -55,11 +55,12 @@ export default async function IntakeDetailPage({ params, searchParams }: { param
   const controls = data.latestMessageId ? await readUxMessageControls(id, data.latestMessageId) : { blocked: true, reason: "Aucun message courant disponible." };
   const operatorBinding = current?.sourceHash && current.messageId === data.latestMessageId ? {threadId:id,messageId:current.messageId,runId:current.id,version:current.version,sourceHash:current.sourceHash} : null;
   const operatorPanel = operatorBinding && ["admin","owner"].includes(staff.role) ? await readOperatorPanel(operatorBinding) : null;
-  const manualOtherBinding = staff.email === "ugo@limova.ai" && ["admin", "owner"].includes(staff.role)
-    && !data.handledExternally && !data.humanHeld && !data.thread.paused && !data.confirmedCurrent && !current?.sourceInvalid
-    && data.latestMessageId && !data.progress?.effects.some(effect => effect.state !== "planned")
-    && (data.projection.view === "to_validate" || data.projection.view === null)
-    ? await readManualOtherBinding(id, data.latestMessageId, data.projection.epoch) : null;
+  const manualOtherEligibility = staff.email === "ugo@limova.ai" && ["admin", "owner"].includes(staff.role) && data.latestMessageId
+    && !data.handledExternally && !current?.sourceInvalid
+    ? data.humanHeld || data.thread.paused ? { binding: null, reason: "paused" as const }
+      : data.confirmedCurrent || data.progress?.effects.some(effect => effect.state !== "planned") ? { binding: null, reason: "effects_engaged" as const }
+        : await readManualOtherEligibility(id, data.latestMessageId, data.projection.epoch) : null;
+  const manualOtherBinding = manualOtherEligibility?.binding;
   const currentEffects = Boolean(data.confirmedCurrent || applicable && data.progress?.runId === current?.id);
   const question = data.projection.view === "to_validate" || ["human_choice", "human_hold", "human_review"].includes(data.projection.status)
     ? plan?.progress?.kind === "human_choice" ? "Choisir la bonne fiche ou le ticket qui recevra ce mail"
@@ -123,6 +124,8 @@ export default async function IntakeDetailPage({ params, searchParams }: { param
         paused={data.thread.paused||data.humanHeld} exhausted={Boolean(blocked)}
         lastActivity={data.diagnostics?.runs.flatMap(r=>r.events.map(e=>e.createdAt)).sort((a,b)=>b.getTime()-a.getTime())[0] ? formatParisDateTime(data.diagnostics.runs.flatMap(r=>r.events.map(e=>e.createdAt)).sort((a,b)=>b.getTime()-a.getTime())[0]) : undefined}/>
       {manualOtherBinding && <IntakeManualOtherForm key={`manual-other-${manualOtherBinding.messageId}-${manualOtherBinding.version}-${manualOtherBinding.sourceHash}`} binding={manualOtherBinding} requestKey={randomUUID()}/>}
+      {manualOtherEligibility?.reason && <section className={styles.notice} aria-label="Classement dans Autres indisponible"><h2>Classement dans Autres indisponible</h2>
+        <p>{manualOtherUnavailableLabels[manualOtherEligibility.reason]}</p></section>}
       {!data.handledExternally && current?.sourceInvalid && current.messageId === data.latestMessageId && staff.email === "ugo@limova.ai" && ["admin", "owner"].includes(staff.role) && <IntakeInvalidSourceForm key={`invalid-${current.messageId}`} threadId={id} messageId={current.messageId} requestKey={randomUUID()}/>}
       {(!data.handledExternally || data.projection.status === "human_review") && data.latestMessageId && staff.email === "ugo@limova.ai" && ["admin", "owner"].includes(staff.role) && <IntakeCompletionForm key={data.latestMessageId} threadId={id} messageId={data.latestMessageId} requestKey={randomUUID()}/>}
       {data.humanHeld && !data.handledExternally && data.latestMessageId && ["admin","owner"].includes(staff.role) && <section className={styles.notice}><h2>Reprendre ce dossier</h2>

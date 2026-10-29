@@ -146,7 +146,7 @@ function assertOperator(actorEmail: string) {
 type CompletionActor = Pick<typeof staffUsers.$inferSelect, "id" | "email" | "clerkId">;
 type CompletionTx = Parameters<Parameters<ReturnType<typeof requireDb>["transaction"]>[0]>[0];
 /** Caller-specific precondition re-checked under the thread locks, before any append. */
-const manualOtherProof = z.object({ revision: z.literal("sav-intake-manual-other.v1"), commandHash: z.string().regex(/^[a-f0-9]{64}$/),
+const manualOtherProof = z.object({ revision: z.enum(["sav-intake-manual-other.v1", "sav-intake-manual-other.v2"]), commandHash: z.string().regex(/^[a-f0-9]{64}$/),
   sourceHash: z.string().regex(/^[a-f0-9]{64}$/), runId: z.uuid().nullable(), runVersion: z.number().int().positive().nullable(),
   reasonCiphertext: z.string().min(1).max(16_384) }).strict();
 /** Optional attestation is produced only by the caller's guard under these locks,
