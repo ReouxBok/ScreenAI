@@ -6,6 +6,10 @@ export const intakeEffectLabels: Record<string, string> = { ticket_create: "Cré
   email_create: "Conservation de l’email CRM", email_associate: "Rattachement de l’email", stage_new: "Statut Nouveau", identity_send: "Demande d’identification" };
 export const intakeEffectStateLabels: Record<string, string> = { planned: "Prévu, sans départ", dispatched: "Départ enregistré, résultat à vérifier", acked: "Réponse fournisseur reçue, vérification en attente",
   confirmed: "Résultat vérifié", uncertain: "Résultat incertain, rapprochement requis" };
+/** Heading of the effects section: current effects or effects retained from another run. */
+export function intakeEffectsTitle(currentEffects: boolean) {
+  return currentEffects ? "Actions réellement accomplies" : "Actions historiques conservées";
+}
 /** The « Parcours » line of the current decision. */
 export function intakeRouteLabel(disposition: ReturnType<typeof intakeDossierView>["disposition"]) {
   const target = disposition?.kind === "ticket" ? disposition.target : null;

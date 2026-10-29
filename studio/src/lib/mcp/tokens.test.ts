@@ -112,3 +112,28 @@ it("MCP-KEY end to end: a real key reads as its staff member, and revocation sto
   await revokeStudioMcpToken(contact, id);
   expect((await call()).status).toBe(401);
 });
+
+
+it("REVIEW-bf05 every active key remains visible for revocation after historical key churn", async () => {
+  const start = new Date("2026-10-29T12:00:00Z");
+  const original = await createStudioMcpToken(ugo, { name: "Active original", days: 90 }, start);
+  for (let index = 1; index <= 50; index++) {
+    const at = new Date(start.getTime() + index * 1000);
+    const replacement = await createStudioMcpToken(ugo, { name: `Rotated synthetic ${index}`, days: 7 }, at);
+    await revokeStudioMcpToken(ugo, replacement.id, new Date(at.getTime() + 100));
+  }
+  const now = new Date(start.getTime() + 60_000);
+  expect(await resolveStudioMcpToken(original.secret, now)).toMatchObject({ clerkId: ugo.clerkId });
+  const listed = await listStudioMcpTokens(ugo, now);
+  expect(listed.some(key => key.id === original.id && key.state === "active")).toBe(true);
+});
+it("BF05 history is bounded separately and never hides an active key", async () => {
+  const start = new Date("2026-10-29T12:00:00Z"), keys = [];
+  for (let i = 0; i < 4; i++) keys.push(await createStudioMcpToken(ugo, { name: `active ${i}`, days: 90 }, new Date(start.getTime() + i)));
+  for (let i = 0; i < 60; i++) { const k = await createStudioMcpToken(ugo, { name: `old ${i}`, days: 7 }, new Date(start.getTime() + 1000 + i * 1000)); await revokeStudioMcpToken(ugo, k.id, new Date(start.getTime() + 1500 + i * 1000)); }
+  const listed = await listStudioMcpTokens(ugo, new Date(start.getTime() + 120_000));
+  expect(listed.filter(k => k.state === "active").map(k => k.id).sort()).toEqual(keys.map(k => k.id).sort());
+  expect(listed.filter(k => k.state !== "active")).toHaveLength(50);
+  expect(listed.slice(0, 4).every(k => k.state === "active")).toBe(true);
+  expect(JSON.stringify(listed)).not.toContain(keys[0].secret);
+});

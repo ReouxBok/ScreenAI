@@ -3,7 +3,7 @@ import { notFound } from "next/navigation";
 import { z } from "zod";
 import { requireIntakeConsoleStaff } from "@/lib/sav/intake/console-auth";
 import { readIntakeConsoleDetail } from "@/lib/sav/intake/console-detail";
-import { intakeDossierView, intakeEffectLabels as effectLabels, intakeEffectStateLabels as stateLabels, intakeRouteLabel } from "@/lib/sav/intake/dossier-view";
+import { intakeDossierView, intakeEffectLabels as effectLabels, intakeEffectStateLabels as stateLabels, intakeRouteLabel, intakeEffectsTitle } from "@/lib/sav/intake/dossier-view";
 import { intakeRuntimeHash } from "@/lib/sav/intake/runtime-contract";
 import { formatParisDateTime } from "@/lib/paris-date";
 import { MailConversation } from "../../[id]/mail-conversation";
@@ -77,7 +77,7 @@ export default async function IntakeDetailPage({ params, searchParams }: { param
         <p>{data.progress?.effects.some(e => e.state === "confirmed") ? `Actions déjà confirmées conservées : ${data.progress.effects.filter(e => e.state === "confirmed").length}.` : "Aucune action n’a encore été faite dans HubSpot ou Gmail."}</p>
       </section>}
       {historicalPlan && <section className={styles.history}><h2>Dernière analyse historique — non applicable à la demande actuelle</h2><p>Version {current?.version}. Les sources ou le dernier entrant ont changé ; ses anciennes propositions ne sont pas la décision actuelle.</p><details><summary>Consulter la proposition historique</summary><p>Classification historique : {historicalPlan.decision.classification}.</p>{historicalPlan.decision.disposition.kind === "ticket" && <p>Ancienne cible : <CrmRecord display={display} portal={portal} kind="contact" id={historicalPlan.decision.disposition.target.contactId}/>{historicalPlan.decision.disposition.target.operation !== "create" ? <> · <CrmRecord display={display} portal={portal} kind="ticket" id={historicalPlan.decision.disposition.target.ticketId}/></> : " · création proposée"}.</p>}</details></section>}
-      <section className={styles.decision}><h2>{currentEffects ? "Actions réellement accomplies" : "Actions historiques conservées"}</h2>
+      <section className={styles.decision}><h2>{intakeEffectsTitle(currentEffects)}</h2>
         {data.progress ? <ol className={styles.effects}>{data.progress.effects.map(effect => <li key={effect.id} data-state={effect.state}>
           <span>{effectLabels[effect.kind] ?? effect.kind}</span><strong>{stateLabels[effect.state] ?? effect.state}</strong>
           {effect.confirmedAt && <time>{formatParisDateTime(effect.confirmedAt)}</time>}</li>)}</ol> : <p>Aucun effet n’a été engagé.</p>}

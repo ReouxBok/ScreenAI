@@ -136,3 +136,45 @@ it("SAV-24 rate-limits one staff member per instance", async () => {
   current = contact;
   expect((await callTool("whoami")).result?.structuredContent).toMatchObject({ outcome: "done" });
 });
+
+
+it("REVIEW-bf05 stateless JSON MCP must not advertise a GET SSE that closes immediately", async () => {
+  const response = await handleStudioMcpRequest(new Request(url, {
+    method: "GET", headers: { accept: "text/event-stream", authorization: "Bearer synthetic-token-0123456789" },
+  }), { resolveUser, env });
+  expect(response.status).toBe(405);
+});
+it("BF05 the real SDK client works against the JSON transport and tries the GET stream at most once", async () => {
+  const { Client } = await import("@modelcontextprotocol/sdk/client/index.js");
+  const { StreamableHTTPClientTransport } = await import("@modelcontextprotocol/sdk/client/streamableHttp.js");
+  const methods: string[] = [], statuses: number[] = [];
+  const fetchInMemory = async (input: string | URL | Request, init?: RequestInit) => {
+    const request = new Request(input, init); methods.push(request.method);
+    const response = await handleStudioMcpRequest(request, { resolveUser, env }); statuses.push(response.status); return response;
+  };
+  const client = new Client({ name: "interop", version: "0" });
+  const transport = new StreamableHTTPClientTransport(new URL(url), { fetch: fetchInMemory, requestInit: { headers: { authorization: "Bearer synthetic-token-0123456789" } },
+    reconnectionOptions: { initialReconnectionDelay: 1, maxReconnectionDelay: 1, reconnectionDelayGrowFactor: 1, maxRetries: 50 } });
+  await client.connect(transport);
+  expect((await client.listTools()).tools.map(t => t.name)).toContain("get_dossier");
+  expect((await client.callTool({ name: "whoami", arguments: {} })).structuredContent).toMatchObject({ outcome: "done", data: { email: "ugo@limova.ai" } });
+  await new Promise(resolve => setTimeout(resolve, 50));
+  await client.close();
+  expect(methods.filter(m => m === "GET").length).toBeLessThanOrEqual(1);
+  expect(statuses.filter((s, i) => methods[i] === "GET").every(s => s === 405)).toBe(true);
+});
+it("BF05 GET and DELETE keep every guard before the 405, and replies are private", async () => {
+  const get = (headers: Record<string, string> = {}, flags: Record<string, string> = env, method = "GET") => handleStudioMcpRequest(new Request(url, { method,
+    headers: { accept: "text/event-stream", authorization: "Bearer synthetic-token-0123456789", ...headers } }), { resolveUser, env: flags });
+  expect((await get({}, {})).status).toBe(404);
+  expect((await get({ origin: "https://attacker.example" })).status).toBe(403);
+  current = new StudioMcpAuthError("MCP_TOKEN_INVALID"); expect((await get()).status).toBe(401);
+  current = user("user_arnaud", "arnaud@limova.ai"); expect((await get()).status).toBe(403);
+  current = ugo;
+  for (const method of ["GET", "DELETE"]) {
+    const response = await get({}, env, method);
+    expect(response.status).toBe(405); expect(response.headers.get("allow")).toBe("POST"); expect(response.headers.get("cache-control")).toBe("private, no-store");
+  }
+  const post = await rpc("tools/list");
+  expect(post.status).toBe(200); expect(post.headers.get("cache-control")).toBe("private, no-store"); expect(post.headers.get("x-content-type-options")).toBe("nosniff");
+});

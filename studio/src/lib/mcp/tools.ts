@@ -7,7 +7,7 @@ import { readIntakeRunDiagnostics } from "@/lib/sav/intake/run-diagnostics";
 import { intakeBudgetOwnerFor, readIntakeBudgetPanel } from "@/lib/sav/intake/budget-admin";
 import { savIntakeViewLabels, savIntakeViewSchema } from "@/lib/sav/intake/contract";
 import { intakeStatusLabel, intakeReasonLabel, intakeBlockedCauseLabel, intakeRetryLabel } from "@/lib/sav/intake/console-presentation";
-import { intakeDossierView, intakeEffectLabels, intakeEffectStateLabels, intakeRouteLabel, type IntakeConsoleDetail } from "@/lib/sav/intake/dossier-view";
+import { intakeDossierView, intakeEffectLabels, intakeEffectStateLabels, intakeRouteLabel, intakeEffectsTitle, type IntakeConsoleDetail } from "@/lib/sav/intake/dossier-view";
 
 /** Uniform tool result. A refusal is an answer, not a transport error. */
 export type StudioMcpResult = { outcome: "done" | "already_done" | "refused"; code: string; message: string; data?: unknown };
@@ -46,6 +46,10 @@ export function intakeDossierSummary(data: IntakeConsoleDetail) {
       contactId: target?.contactId ?? null, ticketId: target && target.operation !== "create" ? target.ticketId : null } : null,
     candidates: { contactIds: view.contacts, ticketIds: view.tickets },
     question: view.question, handoff: view.handoff,
+    // Provenance as the page states it: effects of the current run, or retained from another run/version.
+    execution: data.progress ? { executionId: data.progress.executionId, runId: data.progress.runId, version: data.progress.version, state: data.progress.state,
+      applicability: view.currentEffects ? "current" as const : "historical" as const, title: intakeEffectsTitle(view.currentEffects),
+      currentRunId: current?.id ?? null, currentVersion: current?.version ?? null } : null,
     effects: effects.map(effect => ({ kind: effect.kind, label: intakeEffectLabels[effect.kind] ?? effect.kind, state: effect.state,
       stateLabel: intakeEffectStateLabels[effect.state] ?? effect.state, confirmedAt: effect.confirmedAt?.toISOString() ?? null })),
     waitingReason: data.progress?.reason ? intakeReasonLabel(data.progress.reason) : null,

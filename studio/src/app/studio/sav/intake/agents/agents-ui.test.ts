@@ -3,7 +3,7 @@ import { renderToStaticMarkup } from "react-dom/server";
 import { beforeEach, it, expect, vi } from "vitest";
 const mocks = vi.hoisted(() => ({ staff: vi.fn(), list: vi.fn(), create: vi.fn(), revoke: vi.fn() }));
 vi.mock("@/lib/sav/intake/console-auth", () => ({ requireIntakeConsoleStaff: mocks.staff }));
-vi.mock("@/lib/mcp/tokens", () => ({ listStudioMcpTokens: mocks.list, createStudioMcpToken: mocks.create, revokeStudioMcpToken: mocks.revoke, STUDIO_MCP_TOKEN: { days: [7, 30, 90], defaultDays: 30 } }));
+vi.mock("@/lib/mcp/tokens", () => ({ listStudioMcpTokens: mocks.list, createStudioMcpToken: mocks.create, revokeStudioMcpToken: mocks.revoke, STUDIO_MCP_TOKEN: { days: [7, 30, 90], defaultDays: 30 }, STUDIO_MCP_TOKEN_HISTORY: 50 }));
 vi.mock("next/link", () => ({ default: (props: ComponentProps<"a">) => createElement("a", props) }));
 vi.mock("next/cache", () => ({ revalidatePath: vi.fn() }));
 import AgentKeysPage from "./page";
@@ -35,4 +35,12 @@ it("the creation action returns the secret once, for the authenticated staff mem
   expect(await createAgentKeyAction({ ok: false, message: "" }, form({ name: "Codex", days: "30" }))).toMatchObject({ ok: false, code: "SAV_INTAKE_CONSOLE_UNAUTHORIZED" });
   expect(await revokeAgentKeyAction({ ok: false, message: "" }, form({ id: "k1" }))).toMatchObject({ ok: false });
   expect(mocks.revoke).not.toHaveBeenCalled();
+});
+it("BF05 with more than 50 past keys, every active key keeps its revoke button and the history is separate", async () => {
+  const past = Array.from({ length: 50 }, (_, i) => ({ id: `h${i}`, name: `Ancienne ${i}`, prefix: `stm_hist${String(i).padStart(4, "0")}`, createdAt: at, expiresAt: at, revokedAt: at, lastUsedAt: null, state: "revoked" }));
+  mocks.list.mockResolvedValue([{ id: "a1", name: "Active originale", prefix: "stm_active01", createdAt: at, expiresAt: later, revokedAt: null, lastUsedAt: null, state: "active" }, ...past]);
+  const html = renderToStaticMarkup(createElement(Fragment, null, await AgentKeysPage()));
+  expect(html.match(/Révoquer/g)).toHaveLength(1); expect(html).toContain('name="id" value="a1"');
+  expect(html.indexOf("Clés actives")).toBeLessThan(html.indexOf("Active originale")); expect(html.indexOf("Active originale")).toBeLessThan(html.indexOf("Historique"));
+  expect(html).toContain("Ancienne 49");
 });

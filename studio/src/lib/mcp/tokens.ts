@@ -1,6 +1,6 @@
 import "server-only";
 import { createHash, randomBytes } from "node:crypto";
-import { and, desc, eq, gt, isNull } from "drizzle-orm";
+import { and, desc, eq, gt, isNull, not } from "drizzle-orm";
 import { z } from "zod";
 import { requireDb } from "@/db";
 import { auditLogs, staffUsers, studioMcpTokens } from "@/db/schema";
@@ -31,12 +31,20 @@ export async function createStudioMcpToken(owner: Owner, raw: unknown, now = new
     return { id: row.id, name: row.name, prefix: row.prefix, expiresAt: row.expiresAt, secret };
   });
 }
-/** The staff member's own keys with their state at `now`; never the hash or secret. */
+/** The staff member's own keys with their state at `now`; never the hash or secret. Every
+ * active key is always listed, whatever the history size, so each one stays revocable; only
+ * the inactive history (revoked or expired) is bounded to the 50 most recent. */
+export const STUDIO_MCP_TOKEN_HISTORY = 50;
 export async function listStudioMcpTokens(owner: Owner, now = new Date()) {
-  const rows = await requireDb().select({ id: studioMcpTokens.id, name: studioMcpTokens.name, prefix: studioMcpTokens.prefix, createdAt: studioMcpTokens.createdAt,
-    expiresAt: studioMcpTokens.expiresAt, revokedAt: studioMcpTokens.revokedAt, lastUsedAt: studioMcpTokens.lastUsedAt })
-    .from(studioMcpTokens).where(eq(studioMcpTokens.staffId, owner.id)).orderBy(desc(studioMcpTokens.createdAt)).limit(50);
-  return rows.map(row => ({ ...row, state: row.revokedAt ? "revoked" as const : row.expiresAt <= now ? "expired" as const : "active" as const }));
+  const columns = { id: studioMcpTokens.id, name: studioMcpTokens.name, prefix: studioMcpTokens.prefix, createdAt: studioMcpTokens.createdAt,
+    expiresAt: studioMcpTokens.expiresAt, revokedAt: studioMcpTokens.revokedAt, lastUsedAt: studioMcpTokens.lastUsedAt };
+  const active = and(isNull(studioMcpTokens.revokedAt), gt(studioMcpTokens.expiresAt, now));
+  const db = requireDb(), mine = eq(studioMcpTokens.staffId, owner.id);
+  const [current, history] = await Promise.all([
+    db.select(columns).from(studioMcpTokens).where(and(mine, active)).orderBy(desc(studioMcpTokens.createdAt)),
+    db.select(columns).from(studioMcpTokens).where(and(mine, not(active!))).orderBy(desc(studioMcpTokens.createdAt)).limit(STUDIO_MCP_TOKEN_HISTORY),
+  ]);
+  return [...current, ...history].map(row => ({ ...row, state: row.revokedAt ? "revoked" as const : row.expiresAt <= now ? "expired" as const : "active" as const }));
 }
 /** Revokes one of the staff member's own keys, immediately and for good. */
 export async function revokeStudioMcpToken(owner: Owner, id: string, now = new Date()) {

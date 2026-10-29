@@ -66,9 +66,16 @@ export async function handleStudioMcpRequest(request: Request, deps: { resolveUs
     if (error instanceof Error && error.message === "MCP_STAFF_UNAUTHORIZED") return unauthorized(error.message, 403);
     return Response.json({ error: "server_error" }, { status: 500, headers: json });
   }
+  // JSON responses without sessions: no standalone SSE stream (GET) and no session to close
+  // (DELETE). A 405 tells the SDK client not to open, then endlessly reopen, an empty stream.
+  if (request.method !== "POST") return Response.json({ error: "method_not_allowed" }, { status: 405, headers: { ...json, Allow: "POST" } });
   const server = createStudioMcpServer(context, { writes: config.writes });
   const transport = new WebStandardStreamableHTTPServerTransport({ sessionIdGenerator: undefined, enableJsonResponse: true });
   await server.connect(transport);
-  try { return await transport.handleRequest(request); }
+  try {
+    const response = await transport.handleRequest(request), headers = new Headers(response.headers);
+    for (const [name, value] of Object.entries(json)) headers.set(name, value);
+    return new Response(response.body, { status: response.status, statusText: response.statusText, headers });
+  }
   finally { await server.close().catch(() => undefined); }
 }

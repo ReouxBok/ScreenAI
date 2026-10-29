@@ -65,6 +65,7 @@ it.each(Object.keys(fixtures) as (keyof typeof fixtures)[])("SAV-25 get_dossier 
   if (summary.decision) expect(html).toContain(escape(summary.decision.route));
   if (summary.question) expect(html).toContain(escape(summary.question));
   for (const effect of summary.effects) { expect(html).toContain(escape(effect.label)); expect(html).toContain(escape(effect.stateLabel)); }
+  if (summary.execution) expect(html).toContain(escape(summary.execution.title));
   for (const cause of summary.handoff?.causes ?? []) expect(html).toContain(escape(cause.replace(/\.$/u, "")));
   expect(summary.locks.blocked).toBe(html.includes("Analyse bloquée"));
   expect(summary.locks.humanHeld).toBe(html.includes("Reprendre ce dossier"));
@@ -92,4 +93,31 @@ it("SAV-25 get_dossier bounds the message text and never returns the rest of the
   expect(JSON.stringify(summary)).not.toContain("historique synthétique privé");
   mocks.detail.mockResolvedValue(null);
   expect(await tool("get_dossier").run(context, { threadId } as never)).toMatchObject({ outcome: "refused", code: "SAV_INTAKE_DOSSIER_NOT_FOUND" });
+});
+
+
+it("REVIEW-bf05 MCP distinguishes current effects from the historical execution retained by the page", async () => {
+  const previousRun = { ...base, progress: { ...base.progress, runId: "10000000-0000-4000-8000-000000000098" } };
+  mocks.detail.mockResolvedValue(base);
+  const currentHtml = await renderDetail();
+  mocks.detail.mockResolvedValue(previousRun);
+  const previousHtml = await renderDetail();
+  expect(currentHtml).toContain("Actions réellement accomplies");
+  expect(previousHtml).toContain("Actions historiques conservées");
+  const summary = (data: unknown) => intakeDossierSummary(data as Parameters<typeof intakeDossierSummary>[0]);
+  expect(summary(previousRun)).not.toEqual(summary(base));
+});
+it("BF05 planned effects of an older version are historical; confirmed current effects are current, as on the page", async () => {
+  const olderRun = "10000000-0000-4000-8000-000000000097";
+  const older = { ...base, progress: { ...base.progress, executionId: "e-old", runId: olderRun, version: 6, state: "planned",
+    effects: [{ id: "p1", kind: "ticket_create", state: "planned", confirmedAt: null }] } };
+  const confirmed = { ...base, confirmedCurrent: true, progress: { ...base.progress, executionId: "e-cur", version: 7, state: "confirmed", confirmed: true, ticketId: "201", effects: [effects[0]] } };
+  for (const [data, applicability, title] of [[older, "historical", "Actions historiques conservées"], [confirmed, "current", "Actions réellement accomplies"]] as const) {
+    mocks.detail.mockResolvedValue(data);
+    const html = await renderDetail(), summary = intakeDossierSummary(data as unknown as Parameters<typeof intakeDossierSummary>[0]);
+    expect(html).toContain(title);
+    expect(summary.execution).toMatchObject({ applicability, title, runId: data.progress.runId, version: data.progress.version, executionId: data.progress.executionId, currentRunId: runId, currentVersion: 7 });
+  }
+  expect(intakeDossierSummary(confirmed as never).linkedTicketId).toBe("201");
+  expect(intakeDossierSummary(older as never).effects).toEqual([expect.objectContaining({ state: "planned" })]);
 });
