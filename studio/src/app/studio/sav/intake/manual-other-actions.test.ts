@@ -3,7 +3,7 @@ const mocks=vi.hoisted(()=>({classify:vi.fn(),revalidate:vi.fn()}));
 vi.mock("@/lib/sav/intake/manual-other-classification",()=>({classifyValidSourceAsOther:mocks.classify}));
 vi.mock("next/cache",()=>({revalidatePath:mocks.revalidate}));
 import {classifyManualOtherAction} from "./manual-other-actions";
-const command={revision:"sav-intake-manual-other.v1",requestKey:"request",threadId:"thread",messageId:"message",runId:"run",version:1,runSourceHash:null,sourceHash:"a".repeat(64),expectedEpoch:4,reason:"Explicit human reason.",confirmed:true};
+const command={revision:"sav-intake-manual-other.v2",requestKey:"request",threadId:"thread",messageId:"message",runId:"run",version:1,attachmentCount:0,runSourceHash:null,sourceHash:"a".repeat(64),expectedEpoch:4,reason:"Explicit human reason.",confirmed:true};
 function form(confirmed=true){const form=new FormData();for(const[key,value]of Object.entries(command))if(value!==null)form.set(key,String(value));form.set("runSourceHash","");if(confirmed)form.set("confirmed","on");else form.delete("confirmed");return form;}
 beforeEach(()=>{vi.clearAllMocks();mocks.classify.mockResolvedValue({marked:1,alreadyCompleted:0,skipped:{}});});
 it.each([false,true])("passes the exact binding and explicit confirmation %s",async confirmed=>{
