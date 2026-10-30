@@ -1,6 +1,7 @@
 /** Lot 4: the separate comparison campaign on a frozen list of stored dossiers, through the real
  * readers, engine, dispatcher and both ledgers. Never on the live path, no write, own budget. */
 import { createHash, randomUUID } from "node:crypto";
+import { encodeSimpleWireFixture } from "./simple-wire.fixture";
 import { readIntakeOtherRules } from "./other-routing";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { and, eq } from "drizzle-orm";
@@ -45,7 +46,7 @@ function provider(options: { currentStatus?: number; simpleStatus?: number } = {
         : { messageId: id, requests: [{ id: "r1", kind: "support", currentMessageId: id, quoteId: data.citationCatalogue.find((x: { sourceId: string }) => x.sourceId === "current").id }],
           ticketSummary: { title: "Échec de synchronisation de l'agenda", description: "Erreur 500.", requestIds: ["r1"] } };
       void messageId;
-      return Response.json({ candidates: [{ finishReason: "STOP", content: { parts: [{ text: JSON.stringify(answer) }] } }], usageMetadata: { promptTokenCount: 300, candidatesTokenCount: 60, thoughtsTokenCount: 0, totalTokenCount: 360 } });
+      return Response.json({ candidates: [{ finishReason: "STOP", content: { parts: [{ text: JSON.stringify(typeof data.current === "string" ? encodeSimpleWireFixture(answer, data.outputReferences) : answer) }] } }], usageMetadata: { promptTokenCount: 300, candidatesTokenCount: 60, thoughtsTokenCount: 0, totalTokenCount: 360 } });
     }
     if (String(url).startsWith("https://api.hubapi.com/")) { crm.push({ method: init?.method ?? "GET", url: String(url) }); return Response.json({ total: 0, results: [] }); }
     throw Error("EXTERNAL_NETWORK_FORBIDDEN");
@@ -331,7 +332,7 @@ it("INVESTIGATION matching citation detail exists in reader but is discarded by 
   if(data.current!==undefined){
    const answer={messageId:data.message.id,nature:"request",requests:[{id:"r1",kind:"support",summary:"Agenda en panne",sourceIds:["current"]}],
     identity:{kind:"unique",contactIds:["101"],why:"Sender record"},tickets:[{ticketId:"201",relation:"same",why:"Same problem",sourceIds:["current","ticket-201","history-201"]}],missing:[],rationale:"Support"};
-   return Response.json({candidates:[{finishReason:"STOP",content:{parts:[{text:JSON.stringify(answer)}]}}],usageMetadata:{promptTokenCount:300,candidatesTokenCount:60,thoughtsTokenCount:0,totalTokenCount:360}});
+   return Response.json({candidates:[{finishReason:"STOP",content:{parts:[{text:JSON.stringify(typeof data.current === "string" ? encodeSimpleWireFixture(answer, data.outputReferences) : answer)}]}}],usageMetadata:{promptTokenCount:300,candidatesTokenCount:60,thoughtsTokenCount:0,totalTokenCount:360}});
   }
   if(data.tickets){
    // Valid quoteId, but current alone cannot ground a positive match against this ticket/history.

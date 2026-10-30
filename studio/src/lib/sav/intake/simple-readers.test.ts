@@ -1,6 +1,8 @@
 /** Bench of the single-call reader through the REAL engine: synthetic CRM and a
  * scripted model, asserting the final plan the unchanged executor would receive. */
 import { z } from "zod";
+import { encodeSimpleWireFixture } from "./simple-wire.fixture";
+import type { SimpleWireReferences } from "./simple-wire";
 import { createHash } from "node:crypto";
 import { describe, expect, it } from "vitest";
 import { planSavIntake } from "./engine";
@@ -15,7 +17,7 @@ const resource = { resourceId: "synthetic-private-resource", revisionId: "fixtur
 const warning = "SYNTHETIC MULTIPLE OPEN TICKETS WARNING";
 const read = <T>(data: T): ReadResult<T> => ({ status: "complete", data, observedAt: at, reconstructedAsOf: at });
 const days = (n: number) => new Date(Date.parse(at) - n * 86_400_000).toISOString();
-type Data = { current: string; contacts: { contactId: string }[]; tickets: { ticketId: string }[]; decidedRequests?: unknown[]; identificationContinuation?: unknown };
+type Data = { outputReferences: SimpleWireReferences; current: string; contacts: { contactId: string }[]; tickets: { ticketId: string }[]; decidedRequests?: unknown[]; identificationContinuation?: unknown };
 type Answer = Record<string, unknown>;
 
 function bench(options: { text?: string; subject?: string; contacts?: IntakeContact[]; tickets?: IntakeTicket[]; edges?: IntakeAssociation[];
@@ -47,7 +49,7 @@ function bench(options: { text?: string; subject?: string; contacts?: IntakeCont
     const data = JSON.parse(request.body.contents[0].parts[0].text) as Data;
     seen.push(data); phases.push(request.phase); systems.push(request.body.systemInstruction.parts[0].text);
     expect(request.promptRevision).toBe(SAV_INTAKE_SIMPLE_REVISION);
-    return { json: script(data, seen.length), metadata: { inputTokens: 100, outputTokens: 20, thoughtTokens: 0, totalTokens: 120 } };
+    return { json: encodeSimpleWireFixture(script(data, seen.length), data.outputReferences), metadata: { inputTokens: 100, outputTokens: 20, thoughtTokens: 0, totalTokens: 120 } };
   };
   const shared = memoizeIntakeCrmReaders(crm);
   const provenance = new Map([[mid, { subject: options.subject ?? "Synchronisation agenda" } as never]]);
@@ -165,7 +167,7 @@ describe("no needless immobilisation", () => {
     expect(b.systems[0]).not.toContain("FORMAT REPAIR"); expect(b.systems[1]).toContain("FORMAT REPAIR");
     expect(disposition(plan).target).toMatchObject({ operation: "link", ticketId: "201" });
     expect(b.traces.map(t => t.accepted)).toEqual([false, true]);
-    expect(b.traces[0].validationFailure).toMatchObject({ reason: "ticket_not_judged" });
+    expect(b.traces[0].validationFailure).toMatchObject({ reason: "output_schema_invalid", path: "tickets", issues: [expect.objectContaining({ path: "tickets", code: "too_small", minimum: 1 })] });
   });
   it("a persistently malformed answer stops after the repair with an explicit cause and no write", async () => {
     const b = bench();

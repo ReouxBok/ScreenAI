@@ -1224,8 +1224,10 @@ it.each(["automatic_ack","source_copy","unknown_email"] as const)("reopens after
 
 // ---- Étape 2, lot 3: the single-call reader's plan through the unchanged executor and real HTTP adapters.
 import { createSavIntakeSimpleReaders, memoizeIntakeCrmReaders } from "./simple-readers";
+import { encodeSimpleWireFixture } from "./simple-wire.fixture";
+import type { SimpleWireReferences } from "./simple-wire";
 import type { IntakeGeminiCall } from "./model-readers";
-type SimpleData = { tickets: { ticketId: string }[]; contacts: { contactId: string }[] };
+type SimpleData = { outputReferences: SimpleWireReferences; tickets: { ticketId: string }[]; contacts: { contactId: string }[] };
 const simpleAnswer = (data: SimpleData, over: Record<string, unknown> = {}) => ({
     messageId, nature: "request", requests: [{ id: "r1", kind: "support", summary: "La connexion échoue.", sourceIds: ["current"] }],
     ticketTitle: "Échec de connexion du client", ticketDescription: "Le client signale que sa connexion échoue.",
@@ -1235,7 +1237,7 @@ const simpleAnswer = (data: SimpleData, over: Record<string, unknown> = {}) => (
 async function observedSimple(answer: (data: SimpleData) => Record<string, unknown>) {
     const runtime = options.runtime, id = (await enqueueSavIntakeMessage(messageId, runtime))!, lease = (await claimSavIntakeRun(id, runtime))!;
     const crm = memoizeIntakeCrmReaders(createSavIntakeHubspotReaders({ network: p.network }));
-    const call: IntakeGeminiCall = async request => ({ json: answer(JSON.parse(request.body.contents[0].parts[0].text) as SimpleData),
+    const call: IntakeGeminiCall = async request => ({ json: encodeSimpleWireFixture(answer(JSON.parse(request.body.contents[0].parts[0].text) as SimpleData), (JSON.parse(request.body.contents[0].parts[0].text) as SimpleData).outputReferences),
         metadata: { inputTokens: 100, outputTokens: 20, thoughtTokens: 0, totalTokens: 120 } });
     const semantic = createSavIntakeSimpleReaders({ model: "gemini-3.6-flash", call, crm, policy: runtime.policy, provenance: lease.provenance });
     const plan = await planSavIntake(lease.input, { ...crm, ...semantic }, runtime.policy, {}, () => new Date());
