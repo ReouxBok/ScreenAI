@@ -3,6 +3,7 @@ import { notFound } from "next/navigation";
 import { z } from "zod";
 import { requireIntakeConsoleStaff } from "@/lib/sav/intake/console-auth";
 import { readIntakeConsoleDetail } from "@/lib/sav/intake/console-detail";
+import { intakeDossierView, intakeEffectLabels as effectLabels, intakeEffectStateLabels as stateLabels, intakeRouteLabel, intakeEffectsTitle, intakeDossierActions, readIntakeManualOther } from "@/lib/sav/intake/dossier-view";
 import { intakeRuntimeHash } from "@/lib/sav/intake/runtime-contract";
 import { formatParisDateTime } from "@/lib/paris-date";
 import { MailConversation } from "../../[id]/mail-conversation";
@@ -10,10 +11,10 @@ import {readIntakeCrmDisplay} from "@/lib/sav/intake/crm-display-server";
 import { releaseIntakeHumanHoldAction } from "../actions";
 import {IntakeRecoveryForm} from "../recovery-form";
 import { IntakeCompletionForm } from "../completion-form";
-import { readManualOtherEligibility, manualOtherUnavailableLabels } from "@/lib/sav/intake/manual-other-classification";
+import { manualOtherUnavailableLabels } from "@/lib/sav/intake/manual-other-classification";
 import { IntakeManualOtherForm } from "../manual-other-form";
 import { IntakeInvalidSourceForm } from "../invalid-source-form";
-import { intakeStatusLabel, intakeReasonLabel, intakeContextReasonLabels, intakeHandoff, intakeCrmDeltaLabel, intakeNextStepLabel } from "@/lib/sav/intake/console-presentation";
+import { intakeStatusLabel, intakeReasonLabel, intakeContextReasonLabels, intakeCrmDeltaLabel, intakeNextStepLabel } from "@/lib/sav/intake/console-presentation";
 import styles from "../intake.module.css";
 import { IntakeBackLink } from "../navigation";
 import { CrmRecord, StreamedChoiceForm, StreamedCrmContext } from "../crm-streamed";
@@ -22,10 +23,6 @@ import { readUxMessageControls } from "@/lib/sav/intake-ux/message-controls";
 import { readOperatorPanel } from "@/lib/sav/intake-ux/operator-commands";
 import { IntakeOperatorActions } from "../operator-form";
 export const dynamic = "force-dynamic";
-const effectLabels: Record<string, string> = { ticket_create: "Création du ticket", note_create: "Note de contexte", note_associate: "Rattachement de la note",
-  email_create: "Conservation de l’email CRM", email_associate: "Rattachement de l’email", stage_new: "Statut Nouveau", identity_send: "Demande d’identification" };
-const stateLabels: Record<string, string> = { planned: "Prévu, sans départ", dispatched: "Départ enregistré, résultat à vérifier", acked: "Réponse fournisseur reçue, vérification en attente",
-  confirmed: "Résultat vérifié", uncertain: "Résultat incertain, rapprochement requis" };
 export default async function IntakeDetailPage({ params, searchParams }: { params: Promise<{ id: string }>; searchParams?: Promise<{holdRelease?:string;returnTo?:string}> }) {
   const staff=await requireIntakeConsoleStaff();
   const { id } = await params;
@@ -34,44 +31,17 @@ export default async function IntakeDetailPage({ params, searchParams }: { param
   if (!data) notFound();
   const query = await searchParams;
   const releaseNotice=query?.holdRelease;
-  const current = data.current;
-  const blocked = !data.handledExternally && !data.humanHeld && data.diagnostics?.messageId === data.latestMessageId && data.diagnostics.attemptsExhausted !== false
-    && current && ["pending", "waiting"].includes(current.state) && !data.confirmedCurrent;
-  const applicable = !data.handledExternally && !data.humanHeld && Boolean(data.confirmedCurrent || current && current.messageId === data.latestMessageId && current.sourceMatches);
-  const plan = applicable ? current?.payload.plan : undefined, disposition = plan?.decision.disposition;
-  const historicalPlan = !applicable ? current?.payload.plan : undefined;
-  const contacts = [...(current?.candidateContactIds ?? [])].sort();
-  const tickets = [...new Set([...(data.progress?.effects.filter(e=>e.kind==="ticket_create"&&e.state==="confirmed"&&e.ack?.id).map(e=>e.ack!.id!)??[]),...(plan?.decision.evidence.filter(e => e.source === "crm_ticket" && /^\d+$/.test(e.sourceId)).map(e => e.sourceId) ?? [])])];
-  const target = disposition?.kind === "ticket" ? disposition.target : null;
+  const { current, blocked, plan, disposition, historicalPlan, contacts, tickets, target, historicalTarget, dirty, canCorrect, currentEffects, question, handoff } = intakeDossierView(data);
   const portal = process.env.HUBSPOT_PORTAL_ID;
-  const historicalTarget=historicalPlan?.decision.disposition.kind==="ticket"?historicalPlan.decision.disposition.target:null;
   // Not awaited: names stream in under Suspense while the reads below proceed.
   const display=readIntakeCrmDisplay([...contacts,...(target?[target.contactId]:[]),...(historicalTarget?[historicalTarget.contactId]:[])],
     [...tickets,...(target&&target.operation!=="create"?[target.ticketId]:[]),...(historicalTarget&&historicalTarget.operation!=="create"?[historicalTarget.ticketId]:[]),...(data.progress?.ticketId?[data.progress.ticketId]:[])]);
-  const dirty = data.projection.epoch !== data.projection.projectedEpoch;
-  const canCorrect = !data.handledExternally && !data.humanHeld && data.projection.status !== "historical_outside_automation" && Boolean(current && current.messageId === data.latestMessageId && current.sourceMatches && current.candidateContactIds !== null && !data.progress?.confirmed && current.sourceHash && plan && !data.thread.paused
-    && !data.choices.some(event => event.kind === "refuse" && event.parentVersion === current.version)
-    && !data.choices.some(event => ["pending", "reading"].includes(event.state)));
   const controls = data.latestMessageId ? await readUxMessageControls(id, data.latestMessageId) : { blocked: true, reason: "Aucun message courant disponible." };
-  const operatorBinding = current?.sourceHash && current.messageId === data.latestMessageId ? {threadId:id,messageId:current.messageId,runId:current.id,version:current.version,sourceHash:current.sourceHash} : null;
-  const operatorPanel = operatorBinding && ["admin","owner"].includes(staff.role) ? await readOperatorPanel(operatorBinding) : null;
-  const manualOtherEligibility = staff.email === "ugo@limova.ai" && ["admin", "owner"].includes(staff.role) && data.latestMessageId
-    && !data.handledExternally && !current?.sourceInvalid
-    ? data.humanHeld || data.thread.paused ? { binding: null, reason: "paused" as const }
-      : data.confirmedCurrent || data.progress?.effects.some(effect => effect.state !== "planned") ? { binding: null, reason: "effects_engaged" as const }
-        : await readManualOtherEligibility(id, data.latestMessageId, data.projection.epoch) : null;
+  const actions = intakeDossierActions(data, { current, canCorrect, plan }, staff), { operatorBinding } = actions;
+  const operatorPanel = operatorBinding && actions.administrator ? await readOperatorPanel(operatorBinding) : null;
+  // SAV-71: the same eligibility, with its bounded reason, as the MCP get_dossier and classify_other.
+  const manualOtherEligibility = await readIntakeManualOther(data, actions.manualOther);
   const manualOtherBinding = manualOtherEligibility?.binding;
-  const currentEffects = Boolean(data.confirmedCurrent || applicable && data.progress?.runId === current?.id);
-  const question = data.projection.view === "to_validate" || ["human_choice", "human_hold", "human_review"].includes(data.projection.status)
-    ? plan?.progress?.kind === "human_choice" ? "Choisir la bonne fiche ou le ticket qui recevra ce mail"
-      : disposition?.kind === "no_ticket" && disposition.nextAction === "supervised_investor" ? "Prendre en charge cette demande d’investissement"
-        : disposition?.kind === "no_ticket" && disposition.nextAction === "supervised_partnership" ? "Prendre en charge cette demande de partenariat"
-          : disposition?.kind === "no_ticket" && disposition.nextAction === "supervised_commercial" ? "Prendre en charge cette demande commerciale" : "Quelle suite l’équipe doit-elle donner à cette demande ?" : null;
-  const judgement = (current?.payload.traces as { phase?: string }[] | undefined)?.findLast(t => t?.phase === "simple_judgement") as Parameters<typeof intakeHandoff>[0]["judgement"];
-  const assessed = (current?.payload.semantics?.records.find(r => r.method === "assessIssues")?.result as { tickets?: { ticketId: string; relation: string }[] } | undefined)?.tickets;
-  const handoffReasons = [...(disposition?.kind === "collect_context" ? disposition.reasons : []), ...(current?.payload.reason === "SAV_INTAKE_RUNTIME_BUDGET_EXHAUSTED" || current?.payload.reason === "SAV_INTAKE_RUNTIME_DAILY_BUDGET_DEFERRED" || current?.payload.reason === "SAV_INTAKE_RUNTIME_ROLLING_BUDGET_DEFERRED" ? [current.payload.reason] : [])];
-  const handoff = !data.handledExternally && !data.confirmedCurrent && (blocked || handoffReasons.length > 0 || question)
-    ? intakeHandoff({ reasons: handoffReasons, blockedCause: blocked ? "attempts_exhausted" : null, assessments: assessed, judgement }) : null;
   return <div className={styles.console}>
     <IntakeBackLink className={styles.back} returnTo={query?.returnTo}/>
     <header className={styles.heading}><div><span className="eyebrow">Dossier · version {current?.version ?? "en attente"}</span><h1>{data.thread.subject || "Nouvelle demande"}</h1>
@@ -87,8 +57,7 @@ export default async function IntakeDetailPage({ params, searchParams }: { param
       <section className={styles.decision}><h2>{data.humanHeld && !data.handledExternally ? "Prise en charge par l’équipe" : data.handledExternally ? "Disposition administrative" : data.confirmedCurrent ? "Résultat confirmé pour cette demande" : "Décision actuelle"}</h2>
         {blocked && <p role="status">Analyse bloquée : le plafond de tentatives de ce message est atteint ou indéterminé, toutes versions confondues{data.diagnostics?.attemptBudget ? ` (${data.diagnostics.attemptBudget.failed} échec(s), ${data.diagnostics.attemptBudget.total} tentative(s) au total)` : ""}. Aucune relance automatique : voir la prise en charge ci-dessous.</p>}
         {data.handledExternally ? <p>{["handled_externally", "human_other", "human_review"].includes(data.projection.status) ? data.projection.reason : "Le traitement externe est enregistré. Une commande humaine ou un résultat externe reste à rapprocher ; le dossier conserve ses preuves et son attente."}</p> : data.humanHeld ? <p>À valider par l’équipe. La pause humaine est conservée ; aucune action automatique ne peut reprendre sans levée explicite de cette pause.</p> : data.projection.status === "historical_outside_automation" ? <p>Historique conservé, hors automatisation. Un nouvel entrant après le lancement reprendra normalement avec cet historique.</p> : !plan ? <p>{blocked ? "Les diagnostics des tentatives précédentes sont conservés ci-dessous." : "Analyse en cours ou attente technique."} Aucune action n’est présentée comme accomplie.</p> : <>
-          <dl><div><dt>Classification</dt><dd>{plan.decision.classification}</dd></div><div><dt>Parcours</dt><dd>{disposition?.kind === "ticket" ? target?.operation === "create" ? "Créer une fiche ticket" : target?.operation === "reopen" ? "Rouvrir le ticket" : "Rattacher au ticket"
-            : disposition?.kind === "request_identification" ? "Demander l’adresse d’inscription" : disposition?.kind === "collect_context" ? "Compléter les preuves" : "Sans ticket"}</dd></div>
+          <dl><div><dt>Classification</dt><dd>{plan.decision.classification}</dd></div><div><dt>Parcours</dt><dd>{intakeRouteLabel(disposition)}</dd></div>
             {target && <div><dt>Fiche proposée</dt><dd><CrmRecord display={display} portal={portal} kind="contact" id={target.contactId}/></dd></div>}
             {target && target.operation !== "create" && <div><dt>Ticket proposé</dt><dd><CrmRecord display={display} portal={portal} kind="ticket" id={target.ticketId}/></dd></div>}</dl>
           {disposition?.kind === "collect_context" && <p>À vérifier : {disposition.reasons.map(reason => intakeContextReasonLabels[reason] ?? "preuve à compléter").join(", ")}.</p>}
@@ -106,7 +75,7 @@ export default async function IntakeDetailPage({ params, searchParams }: { param
         <p>{data.progress?.effects.some(e => e.state === "confirmed") ? `Actions déjà confirmées conservées : ${data.progress.effects.filter(e => e.state === "confirmed").length}.` : "Aucune action n’a encore été faite dans HubSpot ou Gmail."}</p>
       </section>}
       {historicalPlan && <section className={styles.history}><h2>Dernière analyse historique — non applicable à la demande actuelle</h2><p>Version {current?.version}. Les sources ou le dernier entrant ont changé ; ses anciennes propositions ne sont pas la décision actuelle.</p><details><summary>Consulter la proposition historique</summary><p>Classification historique : {historicalPlan.decision.classification}.</p>{historicalPlan.decision.disposition.kind === "ticket" && <p>Ancienne cible : <CrmRecord display={display} portal={portal} kind="contact" id={historicalPlan.decision.disposition.target.contactId}/>{historicalPlan.decision.disposition.target.operation !== "create" ? <> · <CrmRecord display={display} portal={portal} kind="ticket" id={historicalPlan.decision.disposition.target.ticketId}/></> : " · création proposée"}.</p>}</details></section>}
-      <section className={styles.decision}><h2>{currentEffects ? "Actions réellement accomplies" : "Actions historiques conservées"}</h2>
+      <section className={styles.decision}><h2>{intakeEffectsTitle(currentEffects)}</h2>
         {data.progress ? <ol className={styles.effects}>{data.progress.effects.map(effect => <li key={effect.id} data-state={effect.state}>
           <span>{effectLabels[effect.kind] ?? effect.kind}</span><strong>{stateLabels[effect.state] ?? effect.state}</strong>
           {effect.confirmedAt && <time>{formatParisDateTime(effect.confirmedAt)}</time>}</li>)}</ol> : <p>Aucun effet n’a été engagé.</p>}
@@ -126,9 +95,9 @@ export default async function IntakeDetailPage({ params, searchParams }: { param
       {manualOtherBinding && <IntakeManualOtherForm key={`manual-other-${manualOtherBinding.messageId}-${manualOtherBinding.version}-${manualOtherBinding.sourceHash}`} binding={manualOtherBinding} requestKey={randomUUID()}/>}
       {manualOtherEligibility?.reason && <section className={styles.notice} aria-label="Classement dans Autres indisponible"><h2>Classement dans Autres indisponible</h2>
         <p>{manualOtherUnavailableLabels[manualOtherEligibility.reason]}</p></section>}
-      {!data.handledExternally && current?.sourceInvalid && current.messageId === data.latestMessageId && staff.email === "ugo@limova.ai" && ["admin", "owner"].includes(staff.role) && <IntakeInvalidSourceForm key={`invalid-${current.messageId}`} threadId={id} messageId={current.messageId} requestKey={randomUUID()}/>}
-      {(!data.handledExternally || data.projection.status === "human_review") && data.latestMessageId && staff.email === "ugo@limova.ai" && ["admin", "owner"].includes(staff.role) && <IntakeCompletionForm key={data.latestMessageId} threadId={id} messageId={data.latestMessageId} requestKey={randomUUID()}/>}
-      {data.humanHeld && !data.handledExternally && data.latestMessageId && ["admin","owner"].includes(staff.role) && <section className={styles.notice}><h2>Reprendre ce dossier</h2>
+      {actions.classifyInvalidSource && current && <IntakeInvalidSourceForm key={`invalid-${current.messageId}`} threadId={id} messageId={current.messageId} requestKey={randomUUID()}/>}
+      {actions.closeHandledOutside && data.latestMessageId && <IntakeCompletionForm key={data.latestMessageId} threadId={id} messageId={data.latestMessageId} requestKey={randomUUID()}/>}
+      {actions.releaseHold && data.latestMessageId && <section className={styles.notice}><h2>Reprendre ce dossier</h2>
         <p>Cette action lève uniquement sa pause humaine. Le moteur automatique pourra poursuivre si les preuves et la politique existante le permettent. Les tentatives et les preuves sont conservées. Si une nouvelle qualification est nécessaire, utilisez ensuite « Refaire l’analyse » dans le panneau de poursuite.</p>
         <form action={releaseIntakeHumanHoldAction}>
           <input type="hidden" name="requestKey" value={randomUUID()}/><input type="hidden" name="threadId" value={id}/>
@@ -137,7 +106,7 @@ export default async function IntakeDetailPage({ params, searchParams }: { param
           <label>Motif de la reprise<textarea name="reason" required minLength={10} maxLength={2000}/></label>
           <button type="submit">Lever la pause</button>
         </form></section>}
-      {canCorrect && current?.sourceHash && plan ? <StreamedChoiceForm expected={{ commandKey: randomUUID(), threadId: id,
+      {actions.recordChoice && current?.sourceHash && plan ? <StreamedChoiceForm expected={{ commandKey: randomUUID(), threadId: id,
         messageId: current.messageId, runId: current.id, version: current.version, sourceHash: current.sourceHash,
         candidatesHash: intakeRuntimeHash(contacts) }} contacts={contacts} tickets={tickets} display={display} classification={plan.decision.classification}
         actorId={staff.id} selectedContactId={target?.contactId} selectedTicketId={target && target.operation !== "create" ? target.ticketId : undefined}/> :
@@ -147,8 +116,8 @@ export default async function IntakeDetailPage({ params, searchParams }: { param
         <strong>{event.kind === "refuse" ? "Refus humain" : "Choix conditionnel"} · version {event.parentVersion}</strong><p>{event.reason}</p>
         <small>{event.actor} · {formatParisDateTime(event.at)} · {event.state === "consumed" ? "choix consommé" : event.state === "refused" ? "refus conservé" : event.state === "waiting" ? "preuves à compléter" : "vérification en attente"}</small></li>)}</ol> : <p>Aucun choix humain enregistré.</p>}</section>
       <details className={styles.history}><summary>Diagnostic technique</summary><p>{data.current?.payload.reason ?? data.progress?.reason ?? (blocked ? "Tentatives épuisées — consulter les versions précédentes." : "Aucun motif technique enregistré sur la version actuelle.")}</p>
-        {["admin","owner"].includes(staff?.role??"")&&data.latestMessageId&&<IntakeRecoveryForm threadId={id} messageId={data.latestMessageId}
-          hasNoteReceipt={Boolean(data.progress?.effects.some(effect=>effect.kind==="note_create"&&effect.ack?.id))} allowReanalysis={false} showReanalysis={false}
+        {actions.administratorVerifications&&data.latestMessageId&&<IntakeRecoveryForm threadId={id} messageId={data.latestMessageId}
+          hasNoteReceipt={actions.noteReceipt} allowReanalysis={false} showReanalysis={false}
           unavailableReason={controls.reason}/>}
         <p>{data.diagnostics?.totalAttempts ?? 0} tentative(s) cumulée(s) pour le dernier message. Les versions remplacées ne sont pas des décisions applicables.</p>
         {data.diagnostics?.execution && <p>Exécution : {intakeStatusLabel(data.diagnostics.execution.state ?? "waiting")} · {data.diagnostics.execution.waitingPasses ?? 0} passage(s) en attente

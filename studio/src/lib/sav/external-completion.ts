@@ -162,12 +162,12 @@ const manualSchema = z.object({ requestKey: z.uuid(), threadId: z.uuid(), messag
 
 /** Authenticated single-message UI entry point. The boundary is server-owned;
  * a submitted stale dossier can never close a newly received inbound. */
-export async function completeSavDossierManually(raw: unknown) {
+export async function completeSavDossierManually(raw: unknown, underLock?: CompletionGuard) {
   const actor = await executionAdministrator();
   assertOperator(actor.email);
   const input = manualSchema.parse(raw);
   return applyExternalCompletion({ batchId: input.requestKey, receivedBefore: new Date().toISOString(),
-    messages: [{ threadId: input.threadId, messageId: input.messageId }] }, actor.email, actor);
+    messages: [{ threadId: input.threadId, messageId: input.messageId }] }, actor.email, actor, underLock);
 }
 
 /** Authenticated single-message "Autres" classification. Same owner, boundary,

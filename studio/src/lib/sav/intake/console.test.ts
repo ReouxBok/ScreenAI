@@ -1734,3 +1734,140 @@ describe("manual Other on a valid source without an AI verdict", () => {
   });
 
 });
+
+it("REVIEW776 close_handled_outside rejects a version changed after its MCP read under the real console locks", async () => {
+  await prepareManualCompletion();
+  const detailModule = await import("./console-detail");
+  const { intakeVersionToken } = await import("@/lib/mcp/tools");
+  const { handleStudioMcpRequest } = await import("@/lib/mcp/server");
+  const realRead = detailModule.readIntakeConsoleDetail;
+  const snapshot = (await realRead(threadId))!;
+  const versionToken = intakeVersionToken(snapshot);
+  vi.spyOn(detailModule, "readIntakeConsoleDetail").mockImplementationOnce(async id => {
+    const read = await realRead(id);
+    // A newer idle dossier version is committed after the read and before the action.
+    await db.db.update(savIntakeRuns).set({ version: sql`${savIntakeRuns.version} + 1` }).where(eq(savIntakeRuns.id, runId));
+    return read;
+  });
+  const response = await handleStudioMcpRequest(new Request("https://studio.example.invalid/api/mcp", { method: "POST",
+    body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "close_handled_outside", arguments: {
+      threadId, versionToken, idempotencyKey: randomUUID(), attestHandled: true } } }),
+    headers: { "content-type": "application/json", accept: "application/json, text/event-stream", authorization: "Bearer synthetic" } }),
+    { env: { STUDIO_MCP_ENABLED: "true", STUDIO_MCP_WRITES_ENABLED: "true" }, resolveUser: async () => state.user as never });
+  const body = await response.json();
+  const markers = (await db.db.select().from(auditLogs)).filter(row => row.action === SAV_EXTERNAL_COMPLETION);
+  expect({ result: body.result?.structuredContent, markers: markers.length }).toMatchObject({
+    result: { outcome: "refused", code: "SAV_MCP_DOSSIER_CHANGED" }, markers: 0 });
+  expect(mutationsSent()).toHaveLength(0); expect(fetch).not.toHaveBeenCalled();
+});
+it("REVIEW776 witness: the same MCP close on an unchanged version passes the under-lock check and writes one marker", async () => {
+  await prepareManualCompletion();
+  const { intakeVersionToken } = await import("@/lib/mcp/tools");
+  const { handleStudioMcpRequest } = await import("@/lib/mcp/server");
+  const versionToken = intakeVersionToken((await readIntakeConsoleDetail(threadId))!);
+  const response = await handleStudioMcpRequest(new Request("https://studio.example.invalid/api/mcp", { method: "POST",
+    body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "close_handled_outside", arguments: {
+      threadId, versionToken, idempotencyKey: randomUUID(), attestHandled: true } } }),
+    headers: { "content-type": "application/json", accept: "application/json, text/event-stream", authorization: "Bearer synthetic" } }),
+    { env: { STUDIO_MCP_ENABLED: "true", STUDIO_MCP_WRITES_ENABLED: "true" }, resolveUser: async () => state.user as never });
+  const body = await response.json();
+  const markers = (await db.db.select().from(auditLogs)).filter(row => row.action === SAV_EXTERNAL_COMPLETION);
+  expect({ result: body.result?.structuredContent, markers: markers.length }).toMatchObject({ result: { outcome: "done" }, markers: 1 });
+  expect(mutationsSent()).toHaveLength(0); expect(fetch).not.toHaveBeenCalled();
+});
+it("REVIEW776 witness: the version precondition compares the current run and the console epoch under row locks", async () => {
+  await prepareManualCompletion();
+  const { intakeVersionStillCurrent } = await import("./version-precondition");
+  const detail = (await readIntakeConsoleDetail(threadId))!;
+  const expected = { runId: detail.current?.id ?? null, version: detail.current?.version ?? null, sourceHash: detail.current?.sourceHash ?? null, epoch: detail.projection.epoch };
+  const check = (value: typeof expected) => db.db.transaction(tx => intakeVersionStillCurrent(tx, threadId, value));
+  expect(await check(expected)).toBe(true);
+  expect(await check({ ...expected, epoch: expected.epoch + 1 })).toBe(false);
+  expect(await check({ ...expected, sourceHash: "f".repeat(64) })).toBe(false);
+  await db.db.update(savIntakeRuns).set({ version: sql`${savIntakeRuns.version} + 1` }).where(eq(savIntakeRuns.id, runId));
+  expect(await check(expected)).toBe(false);
+});
+
+async function reviewAeMcpCall(name: string, versionToken: string, extra: Record<string, unknown> = {}) {
+  const { handleStudioMcpRequest } = await import("@/lib/mcp/server");
+  const r = await handleStudioMcpRequest(new Request("https://studio.example.invalid/api/mcp", { method: "POST",
+    body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name, arguments: { threadId, versionToken, idempotencyKey: randomUUID(), ...extra } } }),
+    headers: { "content-type": "application/json", accept: "application/json, text/event-stream", authorization: "Bearer synthetic" } }),
+    { env: { STUDIO_MCP_ENABLED: "true", STUDIO_MCP_WRITES_ENABLED: "true" }, resolveUser: async () => state.user as never });
+  return (await r.json()).result?.structuredContent;
+}
+it.each([false, true])("REVIEW-AE real invalid-source classifier refuses a version changed under its locks: %s", async moved => {
+  vi.stubEnv("SAV_RELEASE_STAGE", "v0"); vi.stubEnv("SAV_PILOT_MODE", "false");
+  await activateSavV0Cutover({receivedAfter:new Date(Date.now()-3600000).toISOString(),mailboxEmail:"support@example.invalid",intakeRecipient:"contact@limova.ai",deploymentSha:"a".repeat(40),activatedBy:"ugo@limova.ai"});
+  await db.db.update(savMessages).set({ toEmails: Array.from({length:31},(_,i)=>`invalid-${i}@example.invalid`) }).where(eq(savMessages.id,messageId));
+  const id=(await enqueueSavIntakeMessage(messageId,options.runtime))!; expect(await claimSavIntakeRun(id,options.runtime)).toBeNull();
+  const detailModule=await import("./console-detail"), {intakeVersionToken}=await import("@/lib/mcp/tools");
+  const real=detailModule.readIntakeConsoleDetail, before=(await real(threadId))!;
+  if(moved) vi.spyOn(detailModule,"readIntakeConsoleDetail").mockImplementationOnce(async tid=>{const data=await real(tid); await db.db.update(savIntakeRuns).set({version:sql`${savIntakeRuns.version}+1`}).where(eq(savIntakeRuns.id,id));return data;});
+  const result=await reviewAeMcpCall("classify_invalid_source_other",intakeVersionToken(before),{attest:true});
+  expect(result).toMatchObject(moved?{outcome:"refused",code:"SAV_MCP_DOSSIER_CHANGED"}:{outcome:"done"});
+  expect(await db.db.select().from(auditLogs).where(eq(auditLogs.action,SAV_EXTERNAL_COMPLETION))).toHaveLength(moved?0:1);
+  expect(mutationsSent()).toHaveLength(0);expect(fetch).not.toHaveBeenCalled();
+});
+it.each([false,true])("REVIEW-AE real reinvestigation refuses a version changed under its locks: %s",async moved=>{
+  await prepareManualCompletion();
+  for(const [name,value] of Object.entries(environment))if(value!==undefined)vi.stubEnv(name,value);
+  const detailModule=await import("./console-detail"), {intakeVersionToken}=await import("@/lib/mcp/tools");
+  const real=detailModule.readIntakeConsoleDetail,before=(await real(threadId))!;
+  if(moved) vi.spyOn(detailModule,"readIntakeConsoleDetail").mockImplementationOnce(async tid=>{const data=await real(tid);await db.db.update(savIntakeRuns).set({version:sql`${savIntakeRuns.version}+1`}).where(eq(savIntakeRuns.id,runId));return data;});
+  const result=await reviewAeMcpCall("request_reinvestigation",intakeVersionToken(before),{reason:"Synthetic verified reviewer reinvestigation"});
+  expect(result).toMatchObject(moved?{outcome:"refused",code:"SAV_INTAKE_VERSION_CHANGED"}:{outcome:"done"});
+  expect(await db.db.select().from(savIntakeHumanEvents)).toHaveLength(moved?0:1);
+  expect(mutationsSent()).toHaveLength(0);expect(fetch).not.toHaveBeenCalled();
+});
+it.each([false,true])("REVIEW-AE real manual Other binds the source read before committing: %s",async moved=>{
+  await prepareManualCompletion();
+  await recordIntakeLaunch({mailboxId,receivedAfter:options.runtime.receivedAfter,createdAfter:options.runtime.createdAfter});
+  const {intakeVersionToken}=await import("@/lib/mcp/tools");
+  const before=(await readIntakeConsoleDetail(threadId))!;
+  const manualModule=await import("./manual-other-classification"),real=manualModule.classifyValidSourceAsOther;
+  if(moved)vi.spyOn(manualModule,"classifyValidSourceAsOther").mockImplementationOnce(async input=>{
+    await db.db.update(savMessages).set({bodyCiphertext:encryptSavPayload({text:"New synthetic content after operator decision.",headers:{},attachments:[],attachmentInventory:{complete:true,limits:[]}})}).where(eq(savMessages.id,messageId));
+    return real(input);
+  });
+  const result=await reviewAeMcpCall("classify_other",intakeVersionToken(before),{attest:true,reason:"Human reviewed synthetic non-support notification"});
+  expect(result).toMatchObject(moved?{outcome:"refused",code:"SAV_MCP_DOSSIER_CHANGED"}:{outcome:"done"});
+  expect(await db.db.select().from(auditLogs).where(eq(auditLogs.action,SAV_EXTERNAL_COMPLETION))).toHaveLength(moved?0:1);
+  expect(mutationsSent()).toHaveLength(0);expect(fetch).not.toHaveBeenCalled();
+});
+it.each([false,true])("REVIEW-AE real record_choice refuses a newer run version: %s",async moved=>{
+  await prepareManualCompletion();
+  const detailModule=await import("./console-detail"),{intakeVersionToken}=await import("@/lib/mcp/tools"),real=detailModule.readIntakeConsoleDetail;
+  const before=(await real(threadId))!;
+  if(moved)vi.spyOn(detailModule,"readIntakeConsoleDetail").mockImplementationOnce(async tid=>{const data=await real(tid);await db.db.update(savIntakeRuns).set({version:sql`${savIntakeRuns.version}+1`}).where(eq(savIntakeRuns.id,runId));return data;});
+  const result=await reviewAeMcpCall("record_choice",intakeVersionToken(before),{kind:"select",contactId:"102",reason:"Verified synthetic reviewer choice"});
+  expect(result).toMatchObject(moved?{outcome:"refused",code:"SAV_INTAKE_HUMAN_CONFLICT"}:{outcome:"done"});
+  expect(await db.db.select().from(savIntakeHumanEvents)).toHaveLength(moved?0:1);
+  expect(mutationsSent()).toHaveLength(0);expect(fetch).not.toHaveBeenCalled();
+});
+it.each([false,true])("REVIEW-AE real release_hold refuses a changed console epoch: %s",async moved=>{
+  await heldReleaseCommand();
+  const detailModule=await import("./console-detail"),{intakeVersionToken}=await import("@/lib/mcp/tools"),real=detailModule.readIntakeConsoleDetail;
+  const before=(await real(threadId))!;
+  if(moved)vi.spyOn(detailModule,"readIntakeConsoleDetail").mockImplementationOnce(async tid=>{const data=await real(tid);await db.db.update(savIntakeConsole).set({epoch:sql`${savIntakeConsole.epoch}+1`}).where(eq(savIntakeConsole.threadId,threadId));return data;});
+  const result=await reviewAeMcpCall("release_hold",intakeVersionToken(before),{reason:"Verified synthetic human hold release"});
+  expect(result).toMatchObject(moved?{outcome:"refused",code:"SAV_INTAKE_HOLD_RELEASE_CONFLICT"}:{outcome:"done"});
+  expect((await db.db.select().from(savThreads).where(eq(savThreads.id,threadId)))[0].aiPaused).toBe(moved);
+  expect(mutationsSent()).toHaveLength(0);expect(fetch).not.toHaveBeenCalled();
+});
+it.each(["worker","uncertain_effect"])("REVIEW-AE real close refuses a protected %s",async blocked=>{
+  await prepareManualCompletion(false);
+  if(blocked==="worker")await db.db.update(savIntakeRuns).set({leaseToken:randomUUID(),leaseUntil:new Date(Date.now()+60000)}).where(eq(savIntakeRuns.id,runId));
+  else {
+    const execution=(await admitIntakeExecution(runId,options))!,lease=(await claimExecution(execution.id))!;
+    const effect=await ensureExecutionEffect(lease,{kind:"ticket_create",permission:"create_ticket",key:`review-create:${messageId}`,sourceMessageId:messageId,contactId:"101",properties:{subject:"Synthetic"}});
+    await markEffectDispatched(lease,effect);
+    await db.db.update(savIntakeExecutions).set({state:"waiting",leaseToken:null,leaseUntil:null}).where(eq(savIntakeExecutions.id,execution.id));
+    await db.db.update(savIntakeEffects).set({state:"uncertain"}).where(eq(savIntakeEffects.id,effect.id));
+  }
+  const {intakeVersionToken}=await import("@/lib/mcp/tools"),before=(await readIntakeConsoleDetail(threadId))!;
+  const result=await reviewAeMcpCall("close_handled_outside",intakeVersionToken(before),{attestHandled:true});
+  expect(result).toMatchObject({outcome:"refused",code:blocked==="worker"?"SAV_MCP_ACTIVE_WORKER":"SAV_MCP_UNSETTLED_ACTION"});
+  expect(await db.db.select().from(auditLogs).where(eq(auditLogs.action,SAV_EXTERNAL_COMPLETION))).toHaveLength(0);
+  expect(mutationsSent()).toHaveLength(0);expect(fetch).not.toHaveBeenCalled();
+});

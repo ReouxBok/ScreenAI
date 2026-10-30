@@ -39,6 +39,20 @@ export const staffUsers = pgTable("staff_users", {
   updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
 });
 
+/** Personal Studio MCP access keys. Only the SHA-256 of the secret is stored; the
+ * secret is shown once at creation. A key acts as its staff member, never alone. */
+export const studioMcpTokens = pgTable("studio_mcp_tokens", {
+  id: uuid("id").defaultRandom().primaryKey(),
+  staffId: uuid("staff_id").notNull().references(() => staffUsers.id, { onDelete: "cascade" }),
+  name: text("name").notNull(),
+  tokenHash: text("token_hash").notNull().unique(),
+  prefix: text("prefix").notNull(),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  expiresAt: timestamp("expires_at", { withTimezone: true }).notNull(),
+  revokedAt: timestamp("revoked_at", { withTimezone: true }),
+  lastUsedAt: timestamp("last_used_at", { withTimezone: true }),
+}, t => [index("studio_mcp_tokens_staff_idx").on(t.staffId, t.createdAt.desc())]);
+
 export const categories = pgTable("categories", {
   id: uuid("id").defaultRandom().primaryKey(),
   slug: text("slug").notNull().unique(),

@@ -13,7 +13,9 @@ export async function savAgentPauseAdministrator() {
   return executionAdministrator().catch(() => { throw Error("SAV_AGENT_PAUSE_UNAUTHORIZED"); });
 }
 // v2 is reserved in the stored key and reader; it becomes settable when an agent reads it.
-const inputSchema = z.object({ agent: z.literal("intake"), level: z.enum(SAV_AGENT_PAUSE_LEVELS), reason: z.string().trim().min(3).max(500) }).strict();
+// expectedLevel/expectedSetAt: optional precondition (MCP), compared under the lock before any write.
+const inputSchema = z.object({ agent: z.literal("intake"), level: z.enum(SAV_AGENT_PAUSE_LEVELS), reason: z.string().trim().min(3).max(500),
+  expectedLevel: z.enum(SAV_AGENT_PAUSE_LEVELS).optional(), expectedSetAt: z.iso.datetime().nullable().optional() }).strict();
 /** Serialized with every model reservation through the same budget lock, so a reservation
  * either committed before the change or sees it. Never touches the ledger, attempts or wakes. */
 export async function setSavAgentPause(raw: unknown): Promise<SavAgentPause> {
@@ -21,7 +23,9 @@ export async function setSavAgentPause(raw: unknown): Promise<SavAgentPause> {
   return requireDb().transaction(async tx => {
     await tx.execute(sql`select pg_advisory_xact_lock(hashtext('sav-intake-runtime-model-budget-v1'))`);
     // An unreadable previous row is replaced, never trusted; the audit keeps that fact.
-    const previous = await readSavAgentPause(tx, input.agent).then(s => s.invalid ? "invalid" : s.level);
+    const state = await readSavAgentPause(tx, input.agent), previous = state.invalid ? "invalid" : state.level;
+    if (input.expectedLevel !== undefined && state.level !== input.expectedLevel
+      || input.expectedSetAt !== undefined && (state.setting?.setAt ?? null) !== input.expectedSetAt) throw Error("SAV_AGENT_PAUSE_CHANGED");
     const next: SavAgentPause = { revision: SAV_AGENT_PAUSE_REVISION, agent: input.agent, level: input.level, setBy: staff.email, setAt: new Date().toISOString(), reason: input.reason };
     const values = { key: savAgentPauseKey(input.agent), cursor: encryptSavPayload(next), status: "active", updatedAt: new Date(next.setAt) };
     await tx.insert(savSyncState).values(values).onConflictDoUpdate({ target: savSyncState.key, set: values });
