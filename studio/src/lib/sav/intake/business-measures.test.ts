@@ -46,6 +46,22 @@ describe("SAV-77 business measures", () => {
     expect(m.pausedCohort).toMatchObject({ dossiers: 3, lastResumeAt: "2026-10-30T14:00:00.000Z", caughtUpAfterResume: 1 });
     expect(m.pausedCohort.outcomes).toMatchObject({ expected_wait: 1, autonomous_confirmed: 1, technical_failure: 1 });
   });
+  // Review F3/F4: only handled outcomes catch up, each against the resume of its own pause.
+  it("catch-up counts only handled outcomes, per pause, with a true denominator", () => {
+    const two = intakePauseIntervals([...pause, { at: "2026-10-30T16:00:00.000Z", previousLevel: "running", nextLevel: "fully_paused" },
+      { at: "2026-10-30T17:00:00.000Z", previousLevel: "fully_paused", nextLevel: "running" },
+      { at: "2026-10-30T20:00:00.000Z", previousLevel: "running", nextLevel: "actions_paused" }]);
+    const m = measureSavIntake({ period, pauses: two, dossiers: [
+      d("first-ok", "autonomous_confirmed", ["2026-10-30T12:00:00.000Z"], { outcomeAt: "2026-10-30T14:05:00.000Z" }),
+      d("first-team", "operator_catchup", ["2026-10-30T12:30:00.000Z"], { outcomeAt: "2026-10-30T15:00:00.000Z" }),
+      d("first-asked", "human_validation", ["2026-10-30T13:00:00.000Z"], { outcomeAt: "2026-10-30T14:10:00.000Z" }),
+      d("first-uncertain", "uncertain_effect", ["2026-10-30T13:30:00.000Z"], { outcomeAt: "2026-10-30T14:20:00.000Z" }),
+      d("second-ack", "acknowledgement_completed", ["2026-10-30T16:30:00.000Z"], { outcomeAt: "2026-10-30T17:01:00.000Z" }),
+      d("second-early", "autonomous_confirmed", ["2026-10-30T16:40:00.000Z"], { outcomeAt: "2026-10-30T16:50:00.000Z" }),
+      d("still-paused", "autonomous_confirmed", ["2026-10-30T21:00:00.000Z"], { outcomeAt: "2026-10-30T22:00:00.000Z" }),
+    ] });
+    expect(m.pausedCohort).toMatchObject({ dossiers: 7, resumedDossiers: 6, lastResumeAt: "2026-10-30T17:00:00.000Z", caughtUpAfterResume: 3 });
+  });
   it("expected waits and uncertain effects are never counted as success", () => {
     const m = measureSavIntake({ period, pauses: [], dossiers: [
       d("wait", "expected_wait", ["2026-10-30T08:00:00.000Z"]), d("uncertain", "uncertain_effect", ["2026-10-30T08:00:00.000Z"]),

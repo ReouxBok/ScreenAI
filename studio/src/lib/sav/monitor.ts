@@ -106,7 +106,11 @@ export async function collectSavMonitorSnapshot(): Promise<MonitorSnapshot> {
       let technicalWaiting=0;
       for(const row of waiting) {
         const value=decryptSavPayload<{reason?:unknown;plan?:{decision?:{disposition?:{kind?:string}}}}>(row.payload_ciphertext);
-        if(typeof value.reason==='string' && Object.values(SAV_AGENT_PAUSE_CODES).includes(value.reason as never)) { if(actionsPaused) { pausedHeld++; continue; } }
+        if(typeof value.reason==='string' && Object.values(SAV_AGENT_PAUSE_CODES).includes(value.reason as never)) {
+          if(actionsPaused) { pausedHeld++; continue; }
+          // A wait left by the pause itself counts from the resume, like analysis_delayed; real technical codes never do.
+          if(pause.resumedAt && now.getTime()-Date.parse(pause.resumedAt) < 600000) continue;
+        }
         if(typeof value.reason==='string' && /^SAV_[A-Z_]+$/.test(value.reason) || !value.plan && row.attempts>=2) technicalWaiting++;
       }
       add("analysis_waiting",technicalWaiting,"critical");

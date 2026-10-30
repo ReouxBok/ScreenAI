@@ -44,8 +44,19 @@ const activeRequestMarkers = [
   "recommence", "persiste", "still (?:not|broken|failing|down)",
   "pouvez[- ]vous", "pourriez[- ]vous", "est[- ]il possible", "j'aimerais", "je voudrais", "je souhaiterais?", "merci de (?:me|nous)", "could you", "can you", "please",
 ].map(source => new RegExp(`(?<![\\p{L}\\d])(?:${source})(?![\\p{L}\\d])`, "u"));
+/** A callback already received or explicitly declined is not a new callback request.
+ * Only these exact phrases are neutralized; any other marker in the text still counts. */
+const settledCallbackPhrases = [
+  "(?:merci|thanks?|thank you)(?: beaucoup| bien)? (?:pour|de|for) (?:votre|ton|le|ce|your|the) (?:rappel|appel|call(?: back)?)",
+  "suite à (?:votre|ton|le|ce) (?:rappel|appel)",
+  "(?:plus|pas) besoin de (?:me|nous) (?:rappeler|recontacter|joindre|appeler)",
+  "inutile de (?:me|nous) (?:rappeler|recontacter|joindre|appeler)",
+  "ne (?:me|nous) (?:rappelez|recontactez|appelez) (?:pas|plus)",
+  "no need to call (?:me|us)(?: back)?",
+].map(source => new RegExp(`(?<![\\p{L}\\d])(?:${source})(?![\\p{L}\\d])`, "gu"));
 export function savIntakeActiveRequestSignal(currentText: string) {
-  const text = currentText.normalize("NFC").toLowerCase().replace(/[’`]/g, "'").replace(/\b(?:https?:\/\/|www\.)\S+/g, " ");
+  const text = settledCallbackPhrases.reduce((rest, phrase) => rest.replace(phrase, " "),
+    currentText.normalize("NFC").toLowerCase().replace(/[’`]/g, "'").replace(/\b(?:https?:\/\/|www\.)\S+/g, " "));
   return text.includes("?") || activeRequestMarkers.some(marker => marker.test(text));
 }
 /** Appended to a created ticket whose email carries files the agent did not read. */

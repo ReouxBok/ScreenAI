@@ -237,3 +237,29 @@ it("SAV-75 after a resume the 15-minute threshold restarts from the resume, then
   snapshot=await collectSavMonitorSnapshot();
   expect(snapshot.issues).toContainEqual({code:"intake_blocked",count:1,severity:"critical"});
 });
+
+// Independent review probes: the payload the pause really leaves in a waiting run.
+it('Independent SAV-75 resume does not immediately turn the old pause code into a critical wait',async()=>{
+ await launch();
+ await heldDossier(new Date(Date.now()-2400000),{reason:'SAV_INTAKE_AGENT_FULLY_PAUSED'});
+ await pause('running',new Date(Date.now()-60000));
+ const snap=await collectSavMonitorSnapshot();
+ expect(snap.issues.map(i=>i.code)).not.toContain('analysis_waiting');
+ expect(snap.issues.map(i=>i.code)).not.toContain('intake_blocked');
+});
+it('Independent SAV-75 real technical wait is still critical after a resume',async()=>{
+ await launch();
+ await heldDossier(new Date(Date.now()-2400000),{reason:'SAV_INTAKE_RUNTIME_SOURCES_STALE'});
+ await pause('running',new Date(Date.now()-60000));
+ expect((await collectSavMonitorSnapshot()).issues).toContainEqual({code:'analysis_waiting',count:1,severity:'critical'});
+});
+
+it("SAV-75 review F2: a pause-coded wait is graced only for 10 minutes after its resume",async()=>{
+  await launch(); const old=new Date(Date.now()-2400000);
+  await heldDossier(old,{reason:"SAV_INTAKE_AGENT_FULLY_PAUSED"});
+  await pause("running", new Date(Date.now()-660000));
+  expect((await collectSavMonitorSnapshot()).issues).toContainEqual({code:"analysis_waiting",count:1,severity:"critical"});
+  await f.client.exec("DELETE FROM sav.sync_state WHERE key LIKE 'sav-agent-pause%'");
+  await pause("running", new Date(Date.now()-60000));
+  expect((await collectSavMonitorSnapshot()).issues.map(i=>i.code)).not.toContain("analysis_waiting");
+});

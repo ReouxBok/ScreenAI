@@ -47,16 +47,20 @@ export function intakePauseIntervals(changes: readonly IntakePauseChange[]): Int
   if (open) intervals.push(open);
   return intervals;
 }
+/** The known pause interval holding this instant, if any (a pause of unknown start is not known). */
+function intakePauseAt(intervals: readonly IntakePauseInterval[], at: string) {
+  const t = Date.parse(at);
+  return intervals.find(i => (i.from === null || t >= Date.parse(i.from)) && (i.to === null || t < Date.parse(i.to)));
+}
 /** null: the pause state at this instant cannot be established from the supplied changes. */
 export function intakePausedAt(intervals: readonly IntakePauseInterval[] | null, at: string): boolean | null {
   if (!intervals) return null;
-  const t = Date.parse(at);
-  for (const i of intervals) {
-    if (i.from === null && (i.to === null || t < Date.parse(i.to))) return null;
-    if (i.from !== null && t >= Date.parse(i.from) && (i.to === null || t < Date.parse(i.to))) return true;
-  }
-  return false;
+  const pause = intakePauseAt(intervals, at);
+  return pause ? (pause.from === null ? null : true) : false;
 }
+/** Outcomes that prove the dossier was actually handled. A person merely asked to decide, an
+ * unconfirmed external effect, a wait or a failure is not a catch-up. */
+const CAUGHT_UP_OUTCOMES: readonly IntakeMeasureOutcome[] = ["autonomous_confirmed", "acknowledgement_completed", "operator_catchup"];
 const rate = (numerator: number, denominator: number): IntakeMeasureRate => ({ numerator, denominator, value: denominator ? numerator / denominator : null });
 const counts = (rows: readonly IntakeMeasureDossier[]) => Object.fromEntries(INTAKE_MEASURE_OUTCOMES.map(o => [o, rows.filter(r => r.outcome === o).length])) as Record<IntakeMeasureOutcome, number>;
 
@@ -83,6 +87,9 @@ export function measureSavIntake(input: { period: { from: string; to: string }; 
   const decided = (rows: readonly IntakeMeasureDossier[]) => rows.filter(d => !["expected_wait", "not_started"].includes(d.outcome));
   const runningDecided = decided(running);
   const lastResume = input.pauses?.filter(i => i.to !== null).map(i => i.to!).sort().at(-1) ?? null;
+  // Each dossier is compared with the resume of its own pause, never a later pause's resume.
+  const ownResume = (d: IntakeMeasureDossier) => intakePauseAt(input.pauses ?? [], first(d))?.to ?? null;
+  const resumed = pausedCohort.filter(d => ownResume(d) !== null);
   return {
     period: input.period,
     denominators: { messages: messages.length, noiseMessages: noise.length, savMessages: messages.length - noise.length,
@@ -92,8 +99,11 @@ export function measureSavIntake(input: { period: { from: string; to: string }; 
       operatorCatchupRate: rate(running.filter(d => d.outcome === "operator_catchup").length, runningDecided.length),
       technicalFailureRate: rate(running.filter(d => d.outcome === "technical_failure").length, runningDecided.length) },
     pausedCohort: { dossiers: pausedCohort.length, outcomes: counts(pausedCohort), lastResumeAt: lastResume,
-      // Caught up = reached a business outcome after the explicit resume, by the agent or the team.
-      caughtUpAfterResume: lastResume ? pausedCohort.filter(d => d.outcomeAt && Date.parse(d.outcomeAt) >= Date.parse(lastResume) && !["expected_wait", "not_started", "technical_failure"].includes(d.outcome)).length : null },
+      /** Dossiers whose own pause has ended: the denominator of the catch-up. */
+      resumedDossiers: resumed.length,
+      // Caught up = handled after the explicit resume of its own pause, by the agent or the team.
+      caughtUpAfterResume: lastResume ? resumed.filter(d => d.outcomeAt && CAUGHT_UP_OUTCOMES.includes(d.outcome)
+        && Date.parse(d.outcomeAt) >= Date.parse(ownResume(d)!)).length : null },
     unknownCohort: { dossiers: unknown.length, outcomes: counts(unknown) },
     limits: [...new Set(limits)],
   };

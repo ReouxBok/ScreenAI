@@ -644,9 +644,24 @@ describe("SAV-73 an active request is never completed as a bare acknowledgement"
     ["merci ça fonctionne", "Merci, ça fonctionne parfaitement maintenant !"],
     ["merci pour un transfert", "Merci pour le transfert à l'équipe."],
     ["résolution avec lien", "Merci, c'est réglé. Le guide https://example.test/aide?id=1 m'a servi."],
+    ["rappel reçu, résolu", "Merci beaucoup pour votre rappel, c'est réglé."],
+    ["rappel refusé", "Inutile de me rappeler, tout est rentré dans l'ordre."],
   ])("%s stays a completed acknowledgement", async (_name, text) => {
     const f = fixture(["acknowledgement"]); f.input.message.currentText = text;
     ack(await f.run()); expect(f.calls).toEqual(["analyse"]);
+  });
+  // Review F1: a received or declined callback is neutralized, never the rest of the text.
+  it.each([
+    ["rappel reçu mais rechute", "Merci pour votre rappel, mais le problème persiste."],
+    ["rappel refusé mais question", "Pas besoin de me rappeler. Pouvez-vous m'envoyer la facture ?"],
+    ["rappel reçu puis nouveau rappel", "Merci pour votre appel. Merci de me rappeler demain pour la suite."],
+  ])("%s still goes to a person", async (_name, text) => {
+    const f = fixture(["acknowledgement"]); f.input.message.currentText = text;
+    humanQuestion(await f.run()); expect(f.calls).toEqual(["analyse"]);
+  });
+  it("a declined callback with nature 'request' still goes to a person", async () => {
+    const f = fixture(["acknowledgement"]); f.input.message.currentText = "Plus besoin de me rappeler."; f.analysis.nature = "request";
+    humanQuestion(await f.run());
   });
   it("the reader's own nature 'request' outweighs an acknowledgement label", async () => {
     const f = fixture(["acknowledgement"]); f.input.message.currentText = "Merci."; f.analysis.nature = "request";
@@ -666,4 +681,21 @@ describe("SAV-73 an active request is never completed as a bare acknowledgement"
     f.input.humanResolution = { choiceId: "synthetic-choice", at, classification: "acknowledgement" };
     ack(await f.run());
   });
+});
+
+// Independent review probes, synthetic only. No change to application code.
+describe('Independent SAV-73 resolved acknowledgements',()=>{
+ it.each([
+  ['Merci pour votre rappel, tout fonctionne maintenant.'],
+  ['Plus besoin de me rappeler, mon problème est résolu.'],
+ ])('keeps a resolved acknowledgement: %s',async text=>{
+  const f=fixture(['acknowledgement']);f.input.message.currentText=text;f.analysis.nature='information';
+  const p=await f.run();
+  expect(p.decision.disposition).toMatchObject({kind:'no_ticket',reason:'acknowledgement_only'});
+  expect(f.calls).toEqual(['analyse']);
+ });
+ it('still sends an active callback request to a person',async()=>{
+  const f=fixture(['acknowledgement']);f.input.message.currentText='Merci de me rappeler : mon problème persiste.';f.analysis.nature='information';
+  expect((await f.run()).decision.disposition).toMatchObject({kind:'collect_context'});expect(f.calls).toEqual(['analyse']);
+ });
 });
