@@ -4,7 +4,8 @@ import { z } from "zod";
 import { requireDb } from "@/db";
 import { auditLogs, savSyncState } from "@/db/schema";
 import { encryptSavPayload } from "../crypto";
-import { executionAdministrator } from "./execution-policy";
+import { executionAdministrator, executionAdministratorFor } from "./execution-policy";
+import type { SavClerkUser } from "./console-auth";
 import { SAV_INTAKE_BUDGET_BOUNDS, SAV_INTAKE_OPERATIONAL_PROFILE } from "./budget-profile";
 import { readIntakeBudgetOverride, SAV_INTAKE_BUDGET_OVERRIDE_KEY, type IntakeBudgetOverride } from "./budget-override";
 import { savIntakeRuntimeConfig } from "./runtime-contract";
@@ -13,7 +14,14 @@ import { readSavIntakeBudget } from "./runtime-store";
 
 const AUDIT = { action: "sav_intake_daily_budget_set", entityType: "sav_intake_budget", entityId: "daily" } as const;
 export async function intakeBudgetOwner() {
-  const staff = await executionAdministrator().catch(() => { throw Error("SAV_INTAKE_BUDGET_UNAUTHORIZED"); });
+  return budgetOwner(executionAdministrator());
+}
+/** The same owner checks for a user resolved from a verified MCP token. */
+export async function intakeBudgetOwnerFor(user: SavClerkUser) {
+  return budgetOwner(executionAdministratorFor(user));
+}
+async function budgetOwner(administrator: ReturnType<typeof executionAdministrator>) {
+  const staff = await administrator.catch(() => { throw Error("SAV_INTAKE_BUDGET_UNAUTHORIZED"); });
   if (staff.email !== SAV_INTAKE_BUDGET_OWNER_EMAIL) throw Error("SAV_INTAKE_BUDGET_UNAUTHORIZED");
   return staff;
 }
@@ -38,8 +46,9 @@ export type IntakeBudgetPanel = {
   usage: Awaited<ReturnType<typeof readSavIntakeBudget>> | null; configurationError: string | null; ceilingNanoUsd: number;
   history: Array<{ at: string; actor: string; previousNanoUsd: number | string | null; nextNanoUsd: number | null; reason: string }>;
 };
-export async function readIntakeBudgetPanel(): Promise<IntakeBudgetPanel> {
-  await intakeBudgetOwner();
+/** The owner check runs first; the MCP passes its token-based variant. */
+export async function readIntakeBudgetPanel(authorize: () => Promise<unknown> = intakeBudgetOwner): Promise<IntakeBudgetPanel> {
+  await authorize();
   const db = requireDb();
   let config: ReturnType<typeof savIntakeRuntimeConfig> = null, configurationError: string | null = null;
   try { config = savIntakeRuntimeConfig(process.env); } catch (error) { configurationError = error instanceof Error ? error.message : "SAV_INTAKE_RUNTIME_CONFIGURATION_REQUIRED"; }

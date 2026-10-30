@@ -421,3 +421,46 @@ it.each(["old","null","corrupt","derived"] as const)("missing metadata compatibi
  expect(await rows()).toHaveLength(0);expect(await db.db.select().from(savIntakeRuns)).toEqual(prior);
  expect(await db.db.select().from(savIntakeModelCalls)).toEqual(calls);expect(fetch).not.toHaveBeenCalled();
 });
+
+// SAV-31 qualification: MCP → native operator panel and durable command → PGlite. No model, CRM or mail call.
+async function sav31Continue(extra: Record<string, unknown>, mutateAfterRead?: () => Promise<void>) {
+  const detailModule = await import("../intake/console-detail"), { intakeVersionToken } = await import("@/lib/mcp/tools"), { handleStudioMcpRequest } = await import("@/lib/mcp/server");
+  const real = detailModule.readIntakeConsoleDetail, versionToken = intakeVersionToken((await real(threadId))!);
+  if (mutateAfterRead) vi.spyOn(detailModule, "readIntakeConsoleDetail").mockImplementationOnce(async id => { const read = await real(id); await mutateAfterRead(); return read; });
+  const call = async (args: Record<string, unknown>) => (await (await handleStudioMcpRequest(new Request("https://studio.example.invalid/api/mcp", { method: "POST",
+    body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "continue_dossier", arguments: args } }),
+    headers: { "content-type": "application/json", accept: "application/json, text/event-stream", authorization: "Bearer synthetic" } }),
+    { env: { STUDIO_MCP_ENABLED: "true", STUDIO_MCP_WRITES_ENABLED: "true" }, resolveUser: async () => fixture.user as never })).json()).result?.structuredContent;
+  const args = { threadId, versionToken, idempotencyKey: randomUUID(), ...extra };
+  return { first: await call(args), replay: () => call(args), other: () => call({ ...args, reason: "Another synthetic operator request." }) };
+}
+it("SAV-31 continue_dossier records one native durable command through the MCP; replay and key reuse never record twice", async () => {
+  await observed();
+  const { first, replay, other } = await sav31Continue({ kind: "resume", reason: "Synthetic verified operator request." });
+  expect(first).toMatchObject({ outcome: "done", data: { receipt: { step: "admission", state: "queued" } } });
+  expect(await replay()).toMatchObject({ outcome: "already_done" });
+  expect(await other()).toMatchObject({ outcome: "refused", code: "SAV_MCP_IDEMPOTENCY_CONFLICT" });
+  expect(await rows()).toHaveLength(1); expect(fetch).not.toHaveBeenCalled();
+});
+it("SAV-31 continue_dossier is refused under the native locks when the run version moves after the panel read", async () => {
+  await observed();
+  const commands = await import("./operator-commands"), real = commands.recordOperatorCommand;
+  vi.spyOn(commands, "recordOperatorCommand").mockImplementationOnce(async input => {
+    await db.db.update(savIntakeRuns).set({ version: 99 }).where(eq(savIntakeRuns.id, runId)); return real(input); });
+  const { first } = await sav31Continue({ kind: "resume", reason: "Synthetic verified operator request." });
+  expect(first).toMatchObject({ outcome: "refused", code: "SAV_INTAKE_OPERATOR_CONFLICT" });
+  expect(await rows()).toHaveLength(0); expect(fetch).not.toHaveBeenCalled();
+});
+it("SAV-31 continue_dossier on a version moved before the panel read is unavailable, with nothing recorded", async () => {
+  await observed();
+  const { first } = await sav31Continue({ kind: "resume", reason: "Synthetic verified operator request." },
+    async () => { await db.db.update(savIntakeRuns).set({ version: 99 }).where(eq(savIntakeRuns.id, runId)); });
+  expect(first).toMatchObject({ outcome: "refused" });
+  expect(await rows()).toHaveLength(0); expect(fetch).not.toHaveBeenCalled();
+});
+it("SAV-31 continue_dossier information goes through the panel's expected information as one native command", async () => {
+  await observed();
+  const { first } = await sav31Continue({ kind: "information", reason: "Synthetic verified operator request.", information: "The operator verified the same existing issue; this is context only." });
+  expect(first).toMatchObject({ outcome: "done" });
+  expect(await rows()).toHaveLength(1); expect(fetch).not.toHaveBeenCalled();
+});
