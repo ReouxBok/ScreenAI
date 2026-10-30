@@ -339,6 +339,21 @@ it("blocked dossiers stay in processing, are counted and carry their cause", asy
   expect(list.total).toBe(4);
   expect(list.counts.blocked).toBe(3);
   expect(Object.fromEntries(list.rows.map(row=>[row.subject,row.blockedCause]))).toEqual({"Blocked exhausted":"attempts_exhausted","Blocked input":"input_invalid","Blocked stale":"technical_wait","Blocked fresh":null});
+  // SAV-75: under a full pause the stale wait is expected, named, and leaves the incident counter;
+  // durable markers stay incidents. After a resume the threshold restarts from the resume.
+  const { savAgentPauseKey, SAV_AGENT_PAUSE_REVISION } = await import("./agent-pause");
+  const setPause = async (level: string, setAt: Date) => db.db.insert(savSyncState).values({ key: savAgentPauseKey("intake"), status: "active",
+    cursor: encryptSavPayload({ revision: SAV_AGENT_PAUSE_REVISION, agent: "intake", level, setBy: "ugo@limova.ai", setAt: setAt.toISOString(), reason: "Synthetic pause" }) })
+    .onConflictDoUpdate({ target: savSyncState.key, set: { cursor: encryptSavPayload({ revision: SAV_AGENT_PAUSE_REVISION, agent: "intake", level, setBy: "ugo@limova.ai", setAt: setAt.toISOString(), reason: "Synthetic pause" }) } });
+  try {
+    await setPause("fully_paused", new Date(Date.now()-3600000));
+    const paused=await listIntakeConsole({view:"processing",search:"Blocked"});
+    expect(paused.counts.blocked).toBe(2);
+    expect(Object.fromEntries(paused.rows.map(row=>[row.subject,row.blockedCause]))).toEqual({"Blocked exhausted":"attempts_exhausted","Blocked input":"input_invalid","Blocked stale":"agent_paused","Blocked fresh":"agent_paused"});
+    await setPause("running", new Date(Date.now()-60000));
+    const resumed=await listIntakeConsole({view:"processing",search:"Blocked"});
+    expect(resumed.counts.blocked).toBe(2); expect(resumed.rows.find(row=>row.subject==="Blocked stale")?.blockedCause).toBeNull();
+  } finally { await db.client.exec("DELETE FROM sav.sync_state WHERE key LIKE 'sav-agent-pause%'"); }
 });
 it("OFF consultation makes no provider calls; projection absent never queries 0040/41 tables", async () => {
   await observed(); await projectIntakeThread(threadId); p.calls.length=0;

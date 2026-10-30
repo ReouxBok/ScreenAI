@@ -209,6 +209,21 @@ it("creates, archives, associates and confirms with the real HTTP adapters, no o
     });
     expect(await f.db.select().from(savIntakeOccupations)).toHaveLength(0);
 });
+it("SAV-72 the created ticket description is the original incoming email, not the planner summary; marker kept", async () => {
+    const text = "Bonjour,\n\nL'export échoue toujours après la mise à jour.\nJ'ai déjà vidé le cache.\n\nMerci d'avance,\nClaire Exemple\n\nLe 2 oct. 2026 à 09:00, Support <support@example.invalid> a écrit :\n> Pouvez-vous vider le cache ?";
+    await f.db.update(savMessages).set({ bodyCiphertext: encryptSavPayload({ text, headers: { "message-id": "<incoming@example.invalid>" }, attachments: [] }) }).where(eq(savMessages.id, messageId));
+    const row = await admission();
+    expect(await executeIntakePass(row.id, options)).toMatchObject({ state: "confirmed" });
+    const creates = p.calls.filter(c => c.method === "POST" && c.path.endsWith("/tickets"));
+    expect(creates).toHaveLength(1);
+    const marker = intakeRuntimeHash(`create:${messageId}`), content = (creates[0].body as { properties: Record<string, string> }).properties.content;
+    expect(content).toBe(`Objet : Synthetic connection failure\n\nBonjour,\n\nL'export échoue toujours après la mise à jour.\nJ'ai déjà vidé le cache.\n\nMerci d'avance,\nClaire Exemple\n\n[Historique cité non recopié : il reste dans l'email associé au ticket.]\n\n[Studio intake: ${marker}]`);
+    expect(content).not.toContain("The synthetic connection fails.");
+    expect(content).not.toContain("Pouvez-vous vider le cache");
+    // The created object read back by the provider carries exactly the posted description.
+    expect(Object.values(p.objects.tickets).map(t => t.properties.content)).toContain(content);
+    expect((await getExecutionEffects(row.id)).every(e => e.state === "confirmed")).toBe(true);
+});
 it.each(["open", "closed"] as const)("links/reopens %s with verified dependencies then stage-only PATCH preserving NULL owner", async (stage) => {
     p.seedTicket({
         stage, closedAt: stage === "closed" ? new Date(Date.now() - 1000).toISOString() : undefined
@@ -1259,6 +1274,26 @@ it("simple reader → executor: creates the ticket with the simple title, no own
     expect(properties.subject).toBe("Échec de connexion du client");
     expect(properties.source_type).toBe("EMAIL");
     expect(properties).not.toHaveProperty("hubspot_owner_id");
+});
+// Composition SAV-72 × compact reader v4: the wire rebuilds a planner description from the
+// request summaries; the CRM description stays the original incoming email, never those summaries.
+it("SAV-72 compact reader → executor: the created description is the original email, not the rebuilt summaries", async () => {
+    const text = "Bonjour,\n\nLa connexion échoue depuis ce matin sur deux postes.\nL'export reste aussi bloqué.\n\nCordialement,\nClient Exemple\n\nLe 1 oct. 2026 à 09:00, Support <support@example.invalid> a écrit :\n> Ancienne réponse citée";
+    await f.db.update(savMessages).set({ bodyCiphertext: encryptSavPayload({ text, headers: { "message-id": "<incoming@example.invalid>" }, attachments: [] }) }).where(eq(savMessages.id, messageId));
+    const { id, plan } = await observedSimple(d => simpleAnswer(d, { requests: [
+        { id: "r1", kind: "support", summary: "Résumé modèle connexion.", sourceIds: ["current"] },
+        { id: "r2", kind: "support", summary: "Résumé modèle export.", sourceIds: ["current"] }] }));
+    // The compact wire did rebuild the planner description from every summary.
+    expect(plan.newTicket?.description).toContain("Résumé modèle connexion.\nRésumé modèle export.");
+    const row = (await admitIntakeExecution(id, options))!;
+    expect(await executeIntakePass(row.id, options)).toMatchObject({ state: "confirmed" });
+    const create = p.calls.filter(c => c.method === "POST" && c.path.endsWith("/tickets"));
+    expect(create).toHaveLength(1);
+    const content = (create[0].body as { properties: Record<string, string> }).properties.content;
+    expect(content).toBe(`Objet : Synthetic connection failure\n\nBonjour,\n\nLa connexion échoue depuis ce matin sur deux postes.\nL'export reste aussi bloqué.\n\nCordialement,\nClient Exemple\n\n[Historique cité non recopié : il reste dans l'email associé au ticket.]\n\n[Studio intake: ${intakeRuntimeHash(`create:${messageId}`)}]`);
+    expect(content).not.toContain("Résumé modèle");
+    expect(content).not.toContain("Ancienne réponse citée");
+    expect(Object.values(p.objects.tickets).map(t => t.properties.content)).toContain(content);
 });
 it.each([["open", undefined], ["closed", 3]] as const)("simple reader → executor: a relevant %s ticket goes back to New and keeps its owner", async (stage, closedDays) => {
     p.seedTicket({ stage, ownerId: "777", createdAt: new Date(Date.now() - 40 * 86_400_000).toISOString(), ...(closedDays ? { closedAt: new Date(Date.now() - closedDays * 86_400_000).toISOString() } : {}) });
