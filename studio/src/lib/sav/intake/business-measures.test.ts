@@ -62,6 +62,22 @@ describe("SAV-77 business measures", () => {
     ] });
     expect(m.pausedCohort).toMatchObject({ dossiers: 7, resumedDossiers: 6, lastResumeAt: "2026-10-30T17:00:00.000Z", caughtUpAfterResume: 3 });
   });
+  // Review F5: a change between pause levels is not a resume; only the return to running is.
+  it("a pause-level change is not a resume: catch-up counts from the actual return to running", () => {
+    const levels = [{ at: "2026-10-30T09:00:00.000Z", previousLevel: "running", nextLevel: "fully_paused" },
+      { at: "2026-10-30T09:45:00.000Z", previousLevel: "fully_paused", nextLevel: "actions_paused" },
+      { at: "2026-10-30T10:00:00.000Z", previousLevel: "actions_paused", nextLevel: "running" }];
+    const dossiers = [
+      d("between-levels", "operator_catchup", ["2026-10-30T09:30:00.000Z"], { outcomeAt: "2026-10-30T09:50:00.000Z" }),
+      d("after-running", "autonomous_confirmed", ["2026-10-30T09:50:00.000Z"], { outcomeAt: "2026-10-30T10:05:00.000Z" }),
+      d("uncertain", "uncertain_effect", ["2026-10-30T09:10:00.000Z"], { outcomeAt: "2026-10-30T10:10:00.000Z" }),
+    ];
+    const resumed = measureSavIntake({ period, pauses: intakePauseIntervals(levels), dossiers });
+    expect(resumed.pausedCohort).toMatchObject({ dossiers: 3, resumedDossiers: 3, lastResumeAt: "2026-10-30T10:00:00.000Z", caughtUpAfterResume: 1 });
+    // Still paused (no return to running): nobody resumed, no catch-up, no invented resume.
+    const open = measureSavIntake({ period, pauses: intakePauseIntervals(levels.slice(0, 2)), dossiers });
+    expect(open.pausedCohort).toMatchObject({ dossiers: 3, resumedDossiers: 0, lastResumeAt: null, caughtUpAfterResume: null });
+  });
   it("expected waits and uncertain effects are never counted as success", () => {
     const m = measureSavIntake({ period, pauses: [], dossiers: [
       d("wait", "expected_wait", ["2026-10-30T08:00:00.000Z"]), d("uncertain", "uncertain_effect", ["2026-10-30T08:00:00.000Z"]),

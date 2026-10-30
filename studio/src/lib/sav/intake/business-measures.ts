@@ -86,9 +86,21 @@ export function measureSavIntake(input: { period: { from: string; to: string }; 
   // A decided dossier ends in a business outcome; expected waits and not-started ones are not judged yet.
   const decided = (rows: readonly IntakeMeasureDossier[]) => rows.filter(d => !["expected_wait", "not_started"].includes(d.outcome));
   const runningDecided = decided(running);
-  const lastResume = input.pauses?.filter(i => i.to !== null).map(i => i.to!).sort().at(-1) ?? null;
+  // A change between two pause levels closes one interval and opens the next at the same
+  // instant: that is not a resume. A resume is the end of a chain of contiguous intervals.
+  const pauses = input.pauses ?? [];
+  const actualResume = (interval: IntakePauseInterval | undefined): string | null => {
+    let current = interval;
+    for (let guard = 0; current?.to != null && guard <= pauses.length; guard++) {
+      const end = current.to, next = pauses.find(i => i.from === end);
+      if (!next) return end;
+      current = next;
+    }
+    return null;
+  };
+  const lastResume = pauses.map(i => actualResume(i)).filter((at): at is string => at !== null).sort().at(-1) ?? null;
   // Each dossier is compared with the resume of its own pause, never a later pause's resume.
-  const ownResume = (d: IntakeMeasureDossier) => intakePauseAt(input.pauses ?? [], first(d))?.to ?? null;
+  const ownResume = (d: IntakeMeasureDossier) => actualResume(intakePauseAt(pauses, first(d)));
   const resumed = pausedCohort.filter(d => ownResume(d) !== null);
   return {
     period: input.period,
