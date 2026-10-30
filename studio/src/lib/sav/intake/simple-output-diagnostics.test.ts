@@ -1,4 +1,5 @@
 import { afterEach, expect, it, vi } from "vitest";
+import { encodeSimpleWireFixture } from "./simple-wire.fixture";
 vi.mock("./runtime-store", () => ({ settleSavIntakeCall: vi.fn(async () => true) }));
 import { parseSavGeminiJson, readSavGeminiResponse, savGeminiDiagnosticMetadata } from "../gemini-response";
 import { createIntakeModelDispatcher, intakeDispatchCounts } from "./model-dispatch";
@@ -47,13 +48,13 @@ it("provider schema omits optional nested array bounds while the server still re
   const call=vi.fn<IntakeGeminiCall>(async(input)=>{
     type Schema = { maxItems?: string; minItems?: string; properties: Record<string, Schema>; items: Schema };
     const schema=input.body.generationConfig.responseSchema as unknown as Schema;
-    expect(schema.properties.ticketDescription).not.toHaveProperty("maxLength");
-    expect(schema.properties.identity.properties.why).not.toHaveProperty("maxLength");
-    expect(schema.properties.tickets).not.toHaveProperty("maxItems");
-    expect(schema.properties.requests).not.toHaveProperty("maxItems");
-    expect(schema.properties.requests.items.properties.sourceIds).not.toHaveProperty("minItems");
-    expect(schema.properties.requests.items.properties.sourceIds).not.toHaveProperty("maxItems");
-    return {json:{messageId:mid,nature:"request",requests:[{id:"r1",kind:"support",summary:"Agenda en panne",sourceIds:["current"]}],identity:{kind:"unknown",contactIds:[],why:"x".repeat(501)},tickets:[],missing:[],rationale:"Aucun contact"},metadata:{inputTokens:10,outputTokens:10,thoughtTokens:0,totalTokens:20}};
+    expect(schema.properties.t).not.toHaveProperty("maxLength");
+    expect(schema.properties.i.properties.w).not.toHaveProperty("maxLength");
+    expect(schema.properties.j).not.toHaveProperty("maxItems");
+    expect(schema.properties.r).not.toHaveProperty("maxItems");
+    expect(schema.properties.r.items.properties.e).not.toHaveProperty("minItems");
+    expect(schema.properties.r.items.properties.e).not.toHaveProperty("maxItems");
+    return {json:encodeSimpleWireFixture({messageId:mid,nature:"request",requests:[{id:"r1",kind:"support",summary:"Agenda en panne",sourceIds:["current"]}],identity:{kind:"unknown",contactIds:[],why:"x".repeat(501)},tickets:[],missing:[],rationale:"Aucun contact"},JSON.parse(input.body.contents[0].parts[0].text).outputReferences),metadata:{inputTokens:10,outputTokens:10,thoughtTokens:0,totalTokens:20}};
   });
   const reader=createSavIntakeSimpleReaders({model:"gemini-3.6-flash",call:call as never,crm:crm as never,policy:{admittedRelations:[]} as unknown as EnginePolicy});
   await expect(reader.analyseMessage({message:{id:mid,threadId:"20000000-0000-4000-8000-000000000001",receivedAt:"2026-10-28T19:00:00Z",fromEmail:"sender@example.test",toEmails:["support@example.test"],direction:"inbound",currentText:"Mon agenda ne fonctionne plus.",contentComplete:true},conversation:[]},new AbortController().signal)).rejects.toThrow("SAV_INTAKE_MODEL_OUTPUT_REJECTED");
