@@ -209,6 +209,21 @@ it("creates, archives, associates and confirms with the real HTTP adapters, no o
     });
     expect(await f.db.select().from(savIntakeOccupations)).toHaveLength(0);
 });
+it("SAV-72 the created ticket description is the original incoming email, not the planner summary; marker kept", async () => {
+    const text = "Bonjour,\n\nL'export échoue toujours après la mise à jour.\nJ'ai déjà vidé le cache.\n\nMerci d'avance,\nClaire Exemple\n\nLe 2 oct. 2026 à 09:00, Support <support@example.invalid> a écrit :\n> Pouvez-vous vider le cache ?";
+    await f.db.update(savMessages).set({ bodyCiphertext: encryptSavPayload({ text, headers: { "message-id": "<incoming@example.invalid>" }, attachments: [] }) }).where(eq(savMessages.id, messageId));
+    const row = await admission();
+    expect(await executeIntakePass(row.id, options)).toMatchObject({ state: "confirmed" });
+    const creates = p.calls.filter(c => c.method === "POST" && c.path.endsWith("/tickets"));
+    expect(creates).toHaveLength(1);
+    const marker = intakeRuntimeHash(`create:${messageId}`), content = (creates[0].body as { properties: Record<string, string> }).properties.content;
+    expect(content).toBe(`Objet : Synthetic connection failure\n\nBonjour,\n\nL'export échoue toujours après la mise à jour.\nJ'ai déjà vidé le cache.\n\nMerci d'avance,\nClaire Exemple\n\n[Historique cité non recopié : il reste dans l'email associé au ticket.]\n\n[Studio intake: ${marker}]`);
+    expect(content).not.toContain("The synthetic connection fails.");
+    expect(content).not.toContain("Pouvez-vous vider le cache");
+    // The created object read back by the provider carries exactly the posted description.
+    expect(Object.values(p.objects.tickets).map(t => t.properties.content)).toContain(content);
+    expect((await getExecutionEffects(row.id)).every(e => e.state === "confirmed")).toBe(true);
+});
 it.each(["open", "closed"] as const)("links/reopens %s with verified dependencies then stage-only PATCH preserving NULL owner", async (stage) => {
     p.seedTicket({
         stage, closedAt: stage === "closed" ? new Date(Date.now() - 1000).toISOString() : undefined
