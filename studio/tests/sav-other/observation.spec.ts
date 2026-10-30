@@ -33,11 +33,20 @@ test("ouverture et retour Autre sans filing Gmail ni refresh CRM", async ({ page
   // which takes longer with Next.js 16.4 on CI runners.
   await expect(page).toHaveURL(new RegExp(path), { timeout: 60_000 });
   await expect(page).not.toHaveURL(/filing=|context=|refreshId=/);
-  expect((await audit).ok()).toBe(true);
+  const auditResponse = await audit;
+  expect(auditResponse.ok()).toBe(true);
+  // A streamed action can return HTTP200 before its invalidated list finishes.
+  // Complete the consultation response before navigating away from this dossier.
+  expect(await auditResponse.finished()).toBeNull();
   expect(posts.every(url => new URL(url).pathname === path)).toBe(true);
   const back = page.getByRole("link", { name: "← Retour aux dossiers", exact: true });
   await expect(back).toHaveAttribute("href", `/studio/sav?view=other&q=AUTRE88&page=1&sort=oldest#dossier-${SAV_OTHER_THREAD(1)}`);
   await back.click();
-  await expect(page).toHaveURL(/view=other.*sort=oldest/, { timeout: 30_000 });
+  // URL commitment may display loading.tsx before the real list is rendered.
+  // Keep the existing navigation budget; the row/status assertion stays at5s.
+  await Promise.all([
+    expect(page).toHaveURL(/view=other.*sort=oldest/, { timeout: 30_000 }),
+    page.getByRole("region", { name: "Dossiers SAV", exact: true }).waitFor({ state: "visible", timeout: 30_000 }),
+  ]);
   await expect(page.locator(`[id="dossier-${SAV_OTHER_THREAD(1)}"]`)).toContainText("Également dans À valider");
 });
