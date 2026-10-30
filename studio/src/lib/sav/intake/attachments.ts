@@ -54,8 +54,10 @@ export function intakeInputWithAttachments(input: EngineInput, sourceHash: strin
 /** Durable per-file outcomes that a retry cannot change: the file stays unread, the
  * complete written text may still be analysed (SAV-43: encrypted, corrupt or too long
  * PDFs included). Transport, permission, budget and
- * association failures are excluded and keep the dossier incomplete. */
-const SAV_INTAKE_UNREAD_TEXT_ONLY_REASONS = new Set(["unsupported_type", "byte_limit", "pixel_limit", "invalid_image", "type_mismatch", "invalid_pdf", "pdf_encrypted", "page_limit"]);
+ * association failures are excluded and keep the dossier incomplete.
+ * SAV-76: image_limit (a file past the per-call image slots) is decided by the same
+ * metadata on every attempt; it no longer leaves the admitted images unread. */
+const SAV_INTAKE_UNREAD_TEXT_ONLY_REASONS = new Set(["unsupported_type", "byte_limit", "image_limit", "pixel_limit", "invalid_image", "type_mismatch", "invalid_pdf", "pdf_encrypted", "page_limit"]);
 function intakeAttachmentDurablyUnread(o: SavAttachmentRead["observations"][number]) {
   return o.status !== "analyzed" && !o.fileHash && SAV_INTAKE_UNREAD_TEXT_ONLY_REASONS.has(o.reason);
 }

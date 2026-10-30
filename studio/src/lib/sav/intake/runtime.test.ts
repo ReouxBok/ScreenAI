@@ -562,7 +562,7 @@ it.each([false,true])("publishes only a still-fresh authenticated Other qualific
     expect(await f.db.select().from(savActions)).toHaveLength(0);
   }finally{vi.useRealTimers();}
 });
-it.each(["pdf","image_limit","budget"]) ("finishes a non-dispatched image attempt with its precise reason (%s)",async(kind)=>{
+it.each(["pdf","budget"]) ("finishes a non-dispatched image attempt with its precise reason (%s)",async(kind)=>{
   const {syntheticImage,attachmentMetadata}=await import("../../../../test/sav-attachments"),{savAttachmentDisplayRead}=await import("../attachment-contract");
   const bytes=await syntheticImage(),[m]=await f.db.select().from(savMessages).where(eq(savMessages.id,messageId)),[t]=await f.db.select().from(savThreads).where(eq(savThreads.id,threadId));
   const attachments=Array.from({length:kind==="image_limit"?4:1},(_,index)=>{
@@ -588,6 +588,28 @@ it.each(["pdf","image_limit","budget"]) ("finishes a non-dispatched image attemp
   expect(await f.db.select().from(savActions)).toHaveLength(0);
 });
 
+it("SAV-76: past the image slots, the admitted images are read in the one call and the extra file is listed unread, never blocking them",async()=>{
+  const {syntheticImage,attachmentMetadata}=await import("../../../../test/sav-attachments"),{savAttachmentDisplayRead}=await import("../attachment-contract");
+  const bytes=await syntheticImage(),[m]=await f.db.select().from(savMessages).where(eq(savMessages.id,messageId)),[t]=await f.db.select().from(savThreads).where(eq(savThreads.id,threadId));
+  const attachments=Array.from({length:4},(_,index)=>{const meta=attachmentMetadata(bytes.length);return {...meta,filename:`synthetic-${index}.png`,
+    reference:{...meta.reference!,mailboxEmail:"support@example.invalid",gmailMessageId:m.gmailMessageId!,gmailThreadId:t.gmailThreadId,partId:String(index+1)}};});
+  await f.db.update(savMessages).set({bodyCiphertext:encryptSavPayload({text:"My application fails with an error.",headers:{},attachments,attachmentInventory:{complete:true,limits:[]}})}).where(eq(savMessages.id,messageId));
+  const id=(await enqueueSavIntakeMessage(messageId,config))!;
+  const bodies:string[]=[],network=vi.fn(async(_url:unknown,init?:RequestInit)=>{bodies.push(String(init?.body));throw Error("NETWORK_FORBIDDEN");});
+  const download=vi.fn(async()=>bytes);
+  await analyseSavIntakeRuntime(id,config,{env:()=>environment,network,downloadAttachments:download});
+  const current=(await readSavIntakeCurrent(threadId,config))!,display=savAttachmentDisplayRead(current.payload.attachments!.read)!;
+  // Exactly one model call, carrying the three admitted images; the fourth is never downloaded.
+  expect(network).toHaveBeenCalledTimes(1); expect(download).toHaveBeenCalledTimes(3);
+  expect(display.observations[3].reason).toBe("image_limit");
+  expect(display.observations.slice(0,3).every(o=>o.reason!=="context_incomplete")).toBe(true);
+  const input=current.payload.input as {message?:{contentComplete?:boolean;unreadAttachments?:{sourceId:string;reason:string}[];attachmentInputs?:unknown[]}}|undefined;
+  expect(input?.message?.contentComplete).toBe(true);
+  expect(input?.message?.attachmentInputs).toHaveLength(3);
+  expect(input?.message?.unreadAttachments).toEqual([{sourceId:display.observations[3].sourceId,reason:"image_limit"}]);
+  expect(bodies.join()).toContain("unreadAttachments");
+  expect(await f.db.select().from(savActions)).toHaveLength(0);
+});
 it("SAV-42: a mixed image + PDF message sends only the image to the visual read and lists the PDF as unread",async()=>{
   const {syntheticImage,attachmentMetadata}=await import("../../../../test/sav-attachments");
   const bytes=await syntheticImage(),[m]=await f.db.select().from(savMessages).where(eq(savMessages.id,messageId)),[t]=await f.db.select().from(savThreads).where(eq(savThreads.id,threadId));
