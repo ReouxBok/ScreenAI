@@ -74,6 +74,8 @@ const blockedCauses: Record<string, string> = {
   input_invalid: "Bloqué — entrée invalide (date ou contenu). À traiter par l’équipe.",
   source_invalid: "Bloqué — source du mail invalide. À traiter par l’équipe.",
   technical_wait: "Bloqué — attente technique de plus de 15 minutes. À traiter par l’équipe.",
+  // SAV-75: expected wait, not an incident; the dossier resumes when the pause is lifted.
+  agent_paused: "En attente — agent SAV en pause complète. Reprise automatique à la levée de la pause ; pas un incident.",
 };
 export function intakeBlockedCauseLabel(cause: string | null | undefined) { return cause ? blockedCauses[cause] ?? "Bloqué — à traiter par l’équipe." : null; }
 
