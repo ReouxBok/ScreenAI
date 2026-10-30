@@ -1,4 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
+import { encodeSimpleWireFixture } from "./simple-wire.fixture";
 import { afterAll, afterEach, beforeAll, beforeEach, expect, it, vi } from "vitest";
 import { eq } from "drizzle-orm";
 import { createSavTestDb } from "../../../../test/sav-db";
@@ -1061,7 +1062,7 @@ it("simple pipeline: a resumed read reuses the accepted analysis and gives the f
    const answer={messageId,nature:"request",requests:data.decidedRequests?[]:[{id:"r1",kind:"support",summary:"La connexion ne marche plus.",sourceIds:["current"]}],
     ticketTitle:"Connexion synthétique interrompue",ticketDescription:"La connexion ne marche plus.",
     identity:contacts.length===1?{kind:"unique",contactIds:[contacts[0].contactId],why:"Expéditeur."}:{kind:"unknown",contactIds:[],why:"Aucune."},tickets,missing:[],rationale:"Même problème."};
-   return Response.json({candidates:[{finishReason:"STOP",content:{parts:[{text:JSON.stringify(answer)}]}}],usageMetadata:{promptTokenCount:100,candidatesTokenCount:50,thoughtsTokenCount:0,totalTokenCount:150}});
+   return Response.json({candidates:[{finishReason:"STOP",content:{parts:[{text:JSON.stringify(encodeSimpleWireFixture(answer, data.outputReferences))}]}}],usageMetadata:{promptTokenCount:100,candidatesTokenCount:50,thoughtsTokenCount:0,totalTokenCount:150}});
   }
   if(new URL(String(url)).pathname.endsWith("/notes/batch/read")&&failures)throw TypeError("Synthetic transient connection failure");
   return provider.network(url,init);
