@@ -35,6 +35,30 @@ export function savIntakePlanFingerprint(plan: Pick<IntakePlan, "decision" | "no
     originalThreadId: plan.originalThreadId, originalRecipientEmails: plan.originalRecipientEmails, referenceMode: plan.referenceMode }));
 }
 
+/** SAV-73: deterministic markers of a request still open in the current authored text
+ * (non-inherited subject included): a question, a callback, a persisting symptom or an
+ * explicit ask. A plain thanks, a resolution or a thanks for a transfer has none. */
+const activeRequestMarkers = [
+  "rappel(?:er|ez|le|lez)?", "recontact(?:er|ez)", "(?:me|nous) joindre", "m'appeler", "nous appeler", "appelez[- ](?:moi|nous)", "call (?:me|us)(?: back)?",
+  "ne\\s+(?:fonctionne|marche|fonctionnent|marchent)\\s+(?:toujours\\s+)?(?:pas|plus)", "toujours\\s+(?:pas|en panne|bloqu[ée]e?s?|le m[êe]me (?:probl[èe]me|souci))",
+  "recommence", "persiste", "still (?:not|broken|failing|down)",
+  "pouvez[- ]vous", "pourriez[- ]vous", "est[- ]il possible", "j'aimerais", "je voudrais", "je souhaiterais?", "merci de (?:me|nous)", "could you", "can you", "please",
+].map(source => new RegExp(`(?<![\\p{L}\\d])(?:${source})(?![\\p{L}\\d])`, "u"));
+/** A callback already received or explicitly declined is not a new callback request.
+ * Only these exact phrases are neutralized; any other marker in the text still counts. */
+const settledCallbackPhrases = [
+  "(?:merci|thanks?|thank you)(?: beaucoup| bien)? (?:pour|de|for) (?:votre|ton|le|ce|your|the) (?:rappel|appel|call(?: back)?)",
+  "suite à (?:votre|ton|le|ce) (?:rappel|appel)",
+  "(?:plus|pas) besoin de (?:me|nous) (?:rappeler|recontacter|joindre|appeler)",
+  "inutile de (?:me|nous) (?:rappeler|recontacter|joindre|appeler)",
+  "ne (?:me|nous) (?:rappelez|recontactez|appelez) (?:pas|plus)",
+  "no need to call (?:me|us)(?: back)?",
+].map(source => new RegExp(`(?<![\\p{L}\\d])(?:${source})(?![\\p{L}\\d])`, "gu"));
+export function savIntakeActiveRequestSignal(currentText: string) {
+  const text = settledCallbackPhrases.reduce((rest, phrase) => rest.replace(phrase, " "),
+    currentText.normalize("NFC").toLowerCase().replace(/[’`]/g, "'").replace(/\b(?:https?:\/\/|www\.)\S+/g, " "));
+  return text.includes("?") || activeRequestMarkers.some(marker => marker.test(text));
+}
 /** Appended to a created ticket whose email carries files the agent did not read. */
 export function savIntakeUnreadAttachmentNotice(count: number) {
   return count === 1 ? "1 pièce jointe non lue par l'agent, à vérifier." : `${count} pièces jointes non lues par l'agent, à vérifier.`;
@@ -214,6 +238,15 @@ export async function planSavIntake(
       : kinds.includes("unknown") || !kinds.length ? "unknown" : kinds.includes("support") ? "support"
       : kinds.filter(k => ["commercial", "investor", "partnership"].includes(k)).length > 1 ? "mixed"
       : kinds.find(k => ["commercial", "investor", "partnership"].includes(k)) ?? (kinds.includes("other") ? "other" : "acknowledgement");
+    // SAV-73: an acknowledgement is closed and marked read without anyone seeing it. A thanks
+    // that also carries an active request, or that the reader itself calls a request, goes to
+    // a person instead; nothing is forced to support and no other model call is made.
+    // A person who already chose the classification is not asked again.
+    if (classification === "acknowledgement" && !input.humanResolution?.classification
+      && (analysis.nature === "request" || savIntakeActiveRequestSignal(message.currentText))) {
+      classification = "unknown"; requests = requests.map(r => ({ ...r, kind: "unknown" as const }));
+      return context("classification_incomplete", "request_scope_uncertain");
+    }
     if (message.attachmentInputs?.length) {
       const observations = analysis.attachmentObservations;
       if (!observations || observations.length !== message.attachmentInputs.length

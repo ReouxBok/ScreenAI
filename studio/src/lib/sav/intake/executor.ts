@@ -14,6 +14,7 @@ import { intakeExecutionConfig, readIntakeExecutionAuthority } from "./execution
 import { assertSavAgentActionsAllowed, readSavAgentPause, savAgentPauseCode, SAV_AGENT_PAUSE_CODES } from "./agent-pause";
 import { savIntakeRuntimeConfig, intakeRuntimeHash, type IntakeRuntimeConfig } from "./runtime-contract";
 import { createIntakeExecutorAdapters, renderIntakeNote } from "./execution-adapters";
+import { intakeTicketDescription, intakeUnreadAttachmentNotice } from "./ticket-description";
 import { assertOriginalExecutionCrm, assertExecutionCrmUnchanged, IntakeCrmDeltaError, publicIntakeCrmDelta } from "./execution-context";
 import { publicCrmRecheck } from "./execution-diagnostic";
 import { crmRecheckDecision } from "./crm-recheck";
@@ -109,10 +110,12 @@ async function nextIntent(lease: ExecutionLease, effects: Effect[], options: Exe
     if (d.target.operation === "create" && !confirmed("ticket_create")) {
         if (!plan.newTicket)
             return fault("CREATION_INTENT_MISSING");
-        const key = `create:${messageId}`, marker = intakeRuntimeHash(key);
+        // SAV-72: the description is the stored incoming email, not the planner summary.
+        const s = await source(lease), key = `create:${messageId}`, marker = intakeRuntimeHash(key);
+        const description = intakeTicketDescription({ subject: s.message.subject, text: s.body.text, unreadAttachmentNotice: intakeUnreadAttachmentNotice(plan.newTicket.description) });
         return {
             kind: "ticket_create", permission: "create_ticket", key, sourceMessageId: messageId, contactId: d.target.contactId, marker, properties: savSupportTicketProperties({
-                title: plan.newTicket.title, description: `${plan.newTicket.description}\n\n[Studio intake: ${marker}]`, reviewedTitle: true, categories: plan.decision.classification === "finance" ? ["billing"] : plan.decision.classification === "cancellation" ? ["cancellation"] : undefined
+                title: plan.newTicket.title, description: `${description}\n\n[Studio intake: ${marker}]`, reviewedTitle: true, categories: plan.decision.classification === "finance" ? ["billing"] : plan.decision.classification === "cancellation" ? ["cancellation"] : undefined
             })
         };
     }

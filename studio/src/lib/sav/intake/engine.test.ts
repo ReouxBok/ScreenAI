@@ -620,11 +620,82 @@ describe("SAV-43: a PDF sent to the reader follows the same role contract", () =
   });
 });
 
-// SAV-45 C: a short relapse judged an acknowledgement is a judgement defect of the reader,
-// kept in the bench as a synthetic case; no prompt or wording change in this lot.
-it.fails("SAV-45 C (known judgement defect): a short relapse after a ticket is not completed as a bare acknowledgement", async () => {
-  const f = fixture(["acknowledgement"]); f.input.message.currentText = "Ça recommence.";
-  const p = await f.run();
-  // Expected once the reader is qualified: a support request, not an acknowledgement-only dossier.
-  expect(p.decision.classification).toBe("support");
+// SAV-45 C / SAV-73: a reader may still judge a relapse or a callback request an acknowledgement.
+// The engine no longer completes it silently: it goes to a person, without forcing support.
+describe("SAV-73 an active request is never completed as a bare acknowledgement", () => {
+  const humanQuestion = (p: IntakePlan) => {
+    expect(p.decision.disposition).toMatchObject({ kind: "collect_context", reasons: expect.arrayContaining(["classification_incomplete"]) });
+    expect(p.progress).toMatchObject({ kind: "human_choice", classification: "unknown", questionCode: "request_scope_uncertain", view: "to_validate" });
+    expect(p.decision.classification).not.toBe("acknowledgement"); expect(p.steps).toEqual([]);
+  };
+  const ack = (p: IntakePlan) => expect(p.decision.disposition).toMatchObject({ kind: "no_ticket", reason: "acknowledgement_only" });
+  it.each([
+    ["merci mais problème persistant", "Merci pour votre aide, mais ça ne fonctionne toujours pas."],
+    ["rappel demandé", "Merci de me rappeler cet après-midi, j'ai manqué votre appel."],
+    ["court message, demande dans l'objet", "Rappel svp\n\nMerci"],
+    ["relance courte", "Ça recommence."],
+    ["question", "Merci. Et pour les factures, comment faire ?"],
+    ["demande explicite", "Merci beaucoup ! Pourriez-vous aussi activer la seconde ligne"],
+  ])("%s goes to a person, one model call only", async (_name, text) => {
+    const f = fixture(["acknowledgement"]); f.input.message.currentText = text;
+    humanQuestion(await f.run()); expect(f.calls).toEqual(["analyse"]);
+  });
+  it.each([
+    ["merci ça fonctionne", "Merci, ça fonctionne parfaitement maintenant !"],
+    ["merci pour un transfert", "Merci pour le transfert à l'équipe."],
+    ["résolution avec lien", "Merci, c'est réglé. Le guide https://example.test/aide?id=1 m'a servi."],
+    ["rappel reçu, résolu", "Merci beaucoup pour votre rappel, c'est réglé."],
+    ["rappel refusé", "Inutile de me rappeler, tout est rentré dans l'ordre."],
+  ])("%s stays a completed acknowledgement", async (_name, text) => {
+    const f = fixture(["acknowledgement"]); f.input.message.currentText = text;
+    ack(await f.run()); expect(f.calls).toEqual(["analyse"]);
+  });
+  // Review F1: a received or declined callback is neutralized, never the rest of the text.
+  it.each([
+    ["rappel reçu mais rechute", "Merci pour votre rappel, mais le problème persiste."],
+    ["rappel refusé mais question", "Pas besoin de me rappeler. Pouvez-vous m'envoyer la facture ?"],
+    ["rappel reçu puis nouveau rappel", "Merci pour votre appel. Merci de me rappeler demain pour la suite."],
+  ])("%s still goes to a person", async (_name, text) => {
+    const f = fixture(["acknowledgement"]); f.input.message.currentText = text;
+    humanQuestion(await f.run()); expect(f.calls).toEqual(["analyse"]);
+  });
+  it("a declined callback with nature 'request' still goes to a person", async () => {
+    const f = fixture(["acknowledgement"]); f.input.message.currentText = "Plus besoin de me rappeler."; f.analysis.nature = "request";
+    humanQuestion(await f.run());
+  });
+  it("the reader's own nature 'request' outweighs an acknowledgement label", async () => {
+    const f = fixture(["acknowledgement"]); f.input.message.currentText = "Merci."; f.analysis.nature = "request";
+    humanQuestion(await f.run());
+  });
+  it("several subjects, one unresolved: the open request keeps its ticket path", async () => {
+    const f = fixture(["acknowledgement", "support"]); f.input.message.currentText = "Merci pour la facture. Par contre l'export échoue.";
+    const p = await f.run(); expect(p.decision.classification).toBe("support"); expect(target(p).target.operation).toBe("create");
+  });
+  it("replaying the same incoming message gives the same decision, without another call or step", async () => {
+    const f = fixture(["acknowledgement"]); f.input.message.currentText = "Merci de me rappeler.";
+    const a = await f.run(), b = await f.run();
+    expect(b).toEqual(a); expect(f.calls).toEqual(["analyse", "analyse"]);
+  });
+  it("a person who chose acknowledgement is not asked again", async () => {
+    const f = fixture(["support"]); f.input.message.currentText = "Merci de me rappeler.";
+    f.input.humanResolution = { choiceId: "synthetic-choice", at, classification: "acknowledgement" };
+    ack(await f.run());
+  });
+});
+
+// Independent review probes, synthetic only. No change to application code.
+describe('Independent SAV-73 resolved acknowledgements',()=>{
+ it.each([
+  ['Merci pour votre rappel, tout fonctionne maintenant.'],
+  ['Plus besoin de me rappeler, mon problème est résolu.'],
+ ])('keeps a resolved acknowledgement: %s',async text=>{
+  const f=fixture(['acknowledgement']);f.input.message.currentText=text;f.analysis.nature='information';
+  const p=await f.run();
+  expect(p.decision.disposition).toMatchObject({kind:'no_ticket',reason:'acknowledgement_only'});
+  expect(f.calls).toEqual(['analyse']);
+ });
+ it('still sends an active callback request to a person',async()=>{
+  const f=fixture(['acknowledgement']);f.input.message.currentText='Merci de me rappeler : mon problème persiste.';f.analysis.nature='information';
+  expect((await f.run()).decision.disposition).toMatchObject({kind:'collect_context'});expect(f.calls).toEqual(['analyse']);
+ });
 });

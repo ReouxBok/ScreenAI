@@ -11,6 +11,7 @@ import type { IntakeRuntimePayload } from "./runtime-contract";
 import { savIntakeViewSchema, type SavIntakeView } from "./contract";
 import { intakeConsoleInstalled } from "./console-capability";
 import { SAV_INTAKE_BLOCKED_AFTER_MINUTES, SAV_INTAKE_BLOCKING_JOURNAL_KINDS } from "./attempt-policy";
+import { readSavAgentPause, type SavAgentPauseState } from "./agent-pause";
 import { savIntakeSourceSnapshot, intakeSourceMatches } from "./runtime-store";
 import { intakeDossierSensitive } from "./observation-binding";
 import { readIntakeExecutionProgress } from "./executor";
@@ -89,20 +90,32 @@ export async function refreshIntakeConsole(limit = 20) {
   for (const row of rows) await projectIntakeThread(row.id);
   return { refreshed: rows.length };
 }
+/** SAV-75: the administrative pause seen by the blocked-run predicate. While analysis is fully
+ * paused nobody can claim a waiting run, so waiting is expected, never a technical incident;
+ * after a resume the 15-minute threshold restarts from the resume. */
+export type IntakeBlockedPause = { analysisPaused: boolean; resumedAt: string | null };
+export const INTAKE_NOT_PAUSED: IntakeBlockedPause = { analysisPaused: false, resumedAt: null };
+export function intakeBlockedPause(state: SavAgentPauseState): IntakeBlockedPause {
+  return { analysisPaused: state.level === "fully_paused", resumedAt: state.level !== "fully_paused" && state.setting ? state.setting.setAt : null };
+}
 /** Current run blocked: durable blocking marker, or a technical wait/analysis older than the threshold.
  * Shared by the console list, its counters and the monitor, so moving a dossier never hides the incident. */
 /** A scheduled automatic retry (waiting, no lease token, future leaseUntil) is a next action, not an incident, until its due time passes. */
-export function intakeBlockedRunSql(threadId: ReturnType<typeof sql>) {
+export function intakeBlockedRunSql(threadId: ReturnType<typeof sql>, pause: IntakeBlockedPause = INTAKE_NOT_PAUSED) {
   const kinds = sql.join(SAV_INTAKE_BLOCKING_JOURNAL_KINDS.map(k => sql`${k}`), sql`, `);
+  // An analysis stuck from before the pause stays an incident; waiting for a claim does not.
+  const states = pause.analysisPaused ? sql`('analysing')` : sql`('pending', 'waiting', 'analysing')`;
+  const since = pause.resumedAt ? sql`greatest(br.updated_at, ${pause.resumedAt}::timestamptz)` : sql`br.updated_at`;
   return sql`exists(select 1 from sav.intake_runs br where br.thread_id = ${threadId} and br.is_current and (
     exists(select 1 from sav.intake_journal bj where bj.run_id = br.id and bj.kind in (${kinds}))
-    or (br.state in ('pending', 'waiting', 'analysing') and br.updated_at < now() - make_interval(mins => ${SAV_INTAKE_BLOCKED_AFTER_MINUTES})
+    or (br.state in ${states} and ${since} < now() - make_interval(mins => ${SAV_INTAKE_BLOCKED_AFTER_MINUTES})
       and not coalesce(br.state = 'waiting' and br.lease_token is null and br.lease_until > now(), false))))`;
 }
-export function intakeBlockedCauseSql(threadId: ReturnType<typeof sql>) {
+export function intakeBlockedCauseSql(threadId: ReturnType<typeof sql>, pause: IntakeBlockedPause = INTAKE_NOT_PAUSED) {
   const marker = (kind: string) => sql`exists(select 1 from sav.intake_runs br join sav.intake_journal bj on bj.run_id = br.id where br.thread_id = ${threadId} and br.is_current and bj.kind = ${kind})`;
+  const paused = pause.analysisPaused ? sql`exists(select 1 from sav.intake_runs br where br.thread_id = ${threadId} and br.is_current and br.state in ('pending', 'waiting'))` : sql`false`;
   return sql<string | null>`case when ${marker("attempts_exhausted")} then 'attempts_exhausted' when ${marker("deterministic_block")} then 'input_invalid'
-    when ${marker("source_invalid")} then 'source_invalid' when ${intakeBlockedRunSql(threadId)} then 'technical_wait' else null end`;
+    when ${marker("source_invalid")} then 'source_invalid' when ${intakeBlockedRunSql(threadId, pause)} then 'technical_wait' when ${paused} then 'agent_paused' else null end`;
 }
 /** Due time of a scheduled automatic retry of the current run, if any. */
 export function intakeRetryAtSql(threadId: ReturnType<typeof sql>) {
@@ -121,6 +134,7 @@ export async function listIntakeConsole(options: { mailboxId?: string; view?: Sa
   // Both statements share one immutable PostgreSQL snapshot and exactly the
   // same mailbox/search cohort. No arbitrary 250-row application filtering.
   return requireDb().transaction(async tx => {
+    const pause = intakeBlockedPause(await readSavAgentPause(tx));
     const completedIds = await listSavExternalCompletionMessageIds(tx, true, options.mailboxId, "completed");
     const otherIds = await listSavExternalCompletionMessageIds(tx, true, options.mailboxId, "other");
     const reviewIds = await listSavExternalCompletionMessageIds(tx, true, options.mailboxId, "to_validate");
@@ -136,7 +150,7 @@ export async function listIntakeConsole(options: { mailboxId?: string; view?: Sa
     const selected = options.view && options.view !== "processing" ? eq(effectiveView, savIntakeViewSchema.parse(options.view)) : sql`${effectiveView} is null`;
     // Group the derived column, not a repeated parameterised expression: SQL
     // placeholders in SELECT/GROUP BY otherwise have distinct identities.
-    const blocked = intakeBlockedRunSql(sql`${savIntakeConsole.threadId}`);
+    const blocked = intakeBlockedRunSql(sql`${savIntakeConsole.threadId}`, pause);
     const cohort = tx.select({ view: effectiveView.as("effective_view"), blocked: sql<boolean>`${blocked}`.as("blocked") }).from(savIntakeConsole)
       .leftJoin(savMessages, latestMessageJoin).where(common).as("intake_cohort");
     const counts = await tx.select({ view: cohort.view, count: sql<number>`count(*)::int`, blocked: sql<number>`(count(*) filter (where ${cohort.blocked}))::int` }).from(cohort).groupBy(cohort.view);
@@ -147,7 +161,7 @@ export async function listIntakeConsole(options: { mailboxId?: string; view?: Sa
     const rows = await tx.select({ threadId: savIntakeConsole.threadId, mailboxId: savIntakeConsole.mailboxId,
       messageId: savMessages.id, version: savIntakeConsole.version, subject: savMessages.subject,
       fromEmail: savMessages.fromEmail, receivedAt: effectiveReceivedAt, updatedAt: savIntakeConsole.updatedAt,
-      blockedCause: sql<string | null>`case when ${effectiveView} is null then ${intakeBlockedCauseSql(sql`${savIntakeConsole.threadId}`)} else null end`,
+      blockedCause: sql<string | null>`case when ${effectiveView} is null then ${intakeBlockedCauseSql(sql`${savIntakeConsole.threadId}`, pause)} else null end`,
       retryAt: sql<string | null>`case when ${effectiveView} is null then ${intakeRetryAtSql(sql`${savIntakeConsole.threadId}`)} else null end`,
       view: effectiveView, status: sql<string>`case when ${completed} then 'handled_externally' when ${other} then 'human_other' when ${review} then 'human_review' when ${marked} then 'external_completion_pending' when ${held} then 'human_hold' when ${savIntakeConsole.status}='external_completion_pending' then 'processing' when ${historicalMessageSql()} then 'historical_outside_automation' when ${savIntakeConsole.epoch}<>${savIntakeConsole.projectedEpoch} then 'processing' else ${savIntakeConsole.status} end`,
       reason: sql<string | null>`case when ${completed} then 'Traité hors Studio — clôture administrative de ce message. Aucun verdict IA, fermeture HubSpot ou apprentissage terminé ne sont déclarés.' when ${other} then 'Autres — classement humain de ce message.' when ${review} then 'Décision confiée à l’équipe pour ce message.' when ${marked} then 'Traitement externe enregistré ; commande humaine ou résultat externe à rapprocher.' when ${held} then 'L’équipe garde la main sur ce dossier. L’automatisation reste en pause ; une décision humaine est attendue.' when ${savIntakeConsole.status}='external_completion_pending' then null when ${historicalMessageSql()} then 'Historique — hors automatisation. Aucun ticket HubSpot fermé par ce classement.' when ${savIntakeConsole.epoch}=${savIntakeConsole.projectedEpoch} then ${savIntakeConsole.reason} else null end`,
