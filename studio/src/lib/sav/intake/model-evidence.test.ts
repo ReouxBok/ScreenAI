@@ -113,6 +113,23 @@ describe("source-bound citation producer; existing containment stays authoritati
     expect(traces[0].validationFailure).toMatchObject({ reason: "excerpt_not_in_source", path: "requests.0.quote", excerptHash: expect.stringMatching(/^[a-f0-9]{64}$/) });
     expect(JSON.stringify(traces)).not.toContain("confidentiel"); expect(JSON.stringify(traces)).not.toContain(message.currentText);
   });
+  it("requests explicit source slots and decodes only selected anchors into the unchanged engine contract", async () => {
+    const call = vi.fn<IntakeGeminiCall>(async arg => {
+      const schema = arg.body.generationConfig.responseSchema as { properties: { tickets: { items: { properties: { grounding: { type: string; required: string[]; properties: Record<string, { enum: string[] }> } } } } } };
+      const grounding = schema.properties.tickets.items.properties.grounding;
+      expect(grounding.type).toBe("OBJECT");
+      expect(grounding.required).toEqual(expect.arrayContaining(["current", "ticket", "history"]));
+      expect(grounding.properties.current.enum).toEqual([anchor(arg)]);
+      expect(grounding.properties.ticket.enum).toEqual([anchor(arg, "ticket-201")]);
+      expect(grounding.properties.history.enum).toEqual([anchor(arg, "history-201")]);
+      return result({ investigationComplete: true, tickets: [{ ticketId: "201", relation: "same", requestIds: ["r0"],
+        evidenceIds: ["current", "ticket-201", "history-201"], rationale: "Sources concordantes",
+        grounding: { current: anchor(arg), ticket: anchor(arg, "ticket-201"), history: anchor(arg, "history-201") } }] });
+    });
+    const assessment = await createSavIntakeSemanticReaders({ model: "gemini-fixture", call }).assessIssues(issueInput, signal());
+    expect(assessment).toEqual({ investigationComplete: true, tickets: [{ ticketId: "201", relation: "same", requestIds: ["r0"], evidenceIds: ["current", "ticket-201", "history-201"] }] });
+    expect(call).toHaveBeenCalledTimes(1);
+  });
   it("requires all ticket and nonempty history sources even when anchor syntax is valid", async () => {
     const traces: IntakeModelTrace[] = [];
     const make = (includeHistory: boolean): IntakeGeminiCall => async arg => result({ investigationComplete: true, tickets: [{ ticketId: "201", relation: "same", requestIds: ["r0"],
@@ -121,6 +138,34 @@ describe("source-bound citation producer; existing containment stays authoritati
     await expect(model.assessIssues(issueInput, signal())).rejects.toThrow("CITATION_REJECTED");
     expect(traces[0].validationFailure?.reason).toBe("required_source_missing");
     await expect(createSavIntakeSemanticReaders({ model: "gemini-fixture", call: make(true) }).assessIssues(issueInput, signal())).resolves.toMatchObject({ investigationComplete: true, tickets: [{ ticketId: "201", relation: "same" }] });
+  });
+  it.each(["missing", "foreign", "unknown", "extra"]) ("rejects grouped grounding %s without inventing or substituting an anchor", async failure => {
+    const traces: IntakeModelTrace[] = [], call = vi.fn<IntakeGeminiCall>(async arg => {
+      const grounding: Record<string, unknown> = { current: anchor(arg), ticket: anchor(arg, "ticket-201"), history: anchor(arg, "history-201") };
+      if (failure === "missing") delete grounding.history;
+      if (failure === "foreign") grounding.history = anchor(arg, "ticket-201");
+      if (failure === "unknown") grounding.history = "q9999";
+      if (failure === "extra") grounding.secret = "not accepted";
+      return result({ investigationComplete: true, tickets: [{ ticketId: "201", relation: "same", requestIds: ["r0"], evidenceIds: ["current", "ticket-201", "history-201"], rationale: "Sources", grounding }] });
+    });
+    await expect(createSavIntakeSemanticReaders({ model: "gemini-fixture", call, onTrace: t => traces.push(t) }).assessIssues(issueInput, signal())).rejects.toThrow("CITATION_REJECTED");
+    expect(call).toHaveBeenCalledTimes(1);
+    expect(traces[0].validationFailure?.reason).toBe(({ missing: "required_source_missing", foreign: "wrong_anchor_source", unknown: "unknown_anchor", extra: "ambiguous_quote_format" } as const)[failure as "missing"]);
+  });
+  it("keeps an empty history explicit and preserves all tickets, including unknown judgements", async () => {
+    const call = vi.fn<IntakeGeminiCall>(async arg => result({ investigationComplete: false, tickets: [{ ticketId: "201", relation: "unknown", requestIds: ["r0"], evidenceIds: ["current", "ticket-201", "history-201"], rationale: "Information insuffisante", grounding: { current: anchor(arg), ticket: anchor(arg, "ticket-201"), history: null } }] }));
+    await expect(createSavIntakeSemanticReaders({ model: "gemini-fixture", call }).assessIssues({ ...issueInput, tickets: [{ ticket, history: [] }] }, signal())).resolves.toMatchObject({ investigationComplete: false, tickets: [{ ticketId: "201", relation: "unknown" }] });
+  });
+  it("does not block unknown when the captured ticket and its history are both empty", async () => {
+    const call = vi.fn<IntakeGeminiCall>(async arg => result({ investigationComplete: false, tickets: [{ ticketId: "201", relation: "unknown", requestIds: ["r0"], evidenceIds: ["current", "ticket-201", "history-201"], rationale: "Sources vides", grounding: { current: anchor(arg), ticket: null, history: null } }] }));
+    await expect(createSavIntakeSemanticReaders({ model: "gemini-fixture", call }).assessIssues({ ...issueInput, tickets: [{ ticket: { ...ticket, subject: "", content: "" }, history: [] }] }, signal())).resolves.toMatchObject({ investigationComplete: false, tickets: [{ ticketId: "201", relation: "unknown" }] });
+    expect(call).toHaveBeenCalledTimes(1);
+  });
+  it("requires the verified initial request and never borrows another ticket's history", async () => {
+    const extended = { ...issueInput, requestContext: { ...message, id: tid, currentText: "Demande initiale exacte." }, tickets: [...issueInput.tickets, { ticket: { ...ticket, id: "202" }, history }] };
+    const call = vi.fn<IntakeGeminiCall>(async arg => result({ investigationComplete: true, tickets: ["201", "202"].map(id => ({ ticketId: id, relation: "same", requestIds: ["r0"], evidenceIds: ["current", "initial-request", `ticket-${id}`, `history-${id}`], rationale: "Sources", grounding: { current: anchor(arg), ticket: anchor(arg, `ticket-${id}`), history: anchor(arg, "history-202"), initialRequest: anchor(arg, "initial-request") } })) }));
+    await expect(createSavIntakeSemanticReaders({ model: "gemini-fixture", call }).assessIssues(extended, signal())).rejects.toThrow("CITATION_REJECTED");
+    expect(call).toHaveBeenCalledTimes(1);
   });
   it("rejects a claimed source different from the anchor's own source", async () => {
     const traces: IntakeModelTrace[] = [];

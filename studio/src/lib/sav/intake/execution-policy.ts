@@ -1,7 +1,6 @@
 import "server-only";
 import { SAV_INTAKE_OPERATIONAL_PROFILE, intakeOperationalTermValid } from "./budget-profile";
-import { currentUser } from "@clerk/nextjs/server";
-import { and, eq } from "drizzle-orm";
+import { eq } from "drizzle-orm";
 import { z } from "zod";
 import { requireDb } from "@/db";
 import { staffUsers, savIntakeExecutionPolicies, auditLogs } from "@/db/schema";
@@ -9,6 +8,7 @@ import { canAccessSav } from "../access";
 import { encryptSavPayload, decryptSavPayload } from "../crypto";
 import { intakeRuntimeHash } from "./runtime-contract";
 import { savIntakeMutationSchema } from "./contract";
+import { authorizeSavStaffUser, savRequestUser, type SavClerkUser } from "./console-auth";
 export const executionPolicySchema = z.object({
     revision: z.literal("sav-intake-execution-2026-10-21.v1"), mailboxId: z.uuid(), codeRevision: z.string().regex(/^[a-f0-9]{40}$/),
     enginePolicyHash: z.string().regex(/^[a-f0-9]{64}$/), resourcesHash: z.string().regex(/^[a-f0-9]{64}$/),
@@ -42,11 +42,12 @@ export function intakeExecutionConfig(env: Record<string, string | undefined> = 
 }
 /** Verified session -> existing authoritative staff row. No provisioning/bypass. */
 export async function executionAdministrator() {
-    const user = await currentUser(), address = user?.primaryEmailAddress;
-    if (!user || address?.verification?.status !== "verified")
-        throw Error("SAV_INTAKE_EXECUTION_UNAUTHORIZED");
-    const [staff] = await requireDb().select().from(staffUsers).where(and(eq(staffUsers.clerkId, user.id), eq(staffUsers.email, address.emailAddress.trim().toLowerCase())));
-    if (!staff?.active || !["admin", "owner"].includes(staff.role) || !canAccessSav(staff.email, staff.role))
+    return executionAdministratorFor(await savRequestUser());
+}
+/** The same administrator checks for a user resolved from a verified MCP token. */
+export async function executionAdministratorFor(user: SavClerkUser) {
+    const staff = await authorizeSavStaffUser(user, "SAV_INTAKE_EXECUTION_UNAUTHORIZED");
+    if (!["admin", "owner"].includes(staff.role))
         throw Error("SAV_INTAKE_EXECUTION_UNAUTHORIZED");
     return staff;
 }

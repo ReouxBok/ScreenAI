@@ -28,16 +28,26 @@ test("ouverture et retour Autre sans filing Gmail ni refresh CRM", async ({ page
   await page.goto("/studio/sav?view=other&q=AUTRE88&sort=oldest");
   const path = `/studio/sav/${SAV_OTHER_THREAD(1)}`;
   const audit = page.waitForResponse(response => response.request().method() === "POST" && new URL(response.url()).pathname === path);
-  await page.locator(`[id="dossier-${SAV_OTHER_THREAD(1)}"]`).click();
+  const dossier = page.locator(`[id="dossier-${SAV_OTHER_THREAD(1)}"]`);
+  await expect(dossier).toContainText("Également dans À traiter");
+  await dossier.click();
   // The first client navigation compiles this dossier route in the dev server,
   // which takes longer with Next.js 16.4 on CI runners.
   await expect(page).toHaveURL(new RegExp(path), { timeout: 60_000 });
   await expect(page).not.toHaveURL(/filing=|context=|refreshId=/);
-  expect((await audit).ok()).toBe(true);
+  const auditResponse = await audit;
+  expect(auditResponse.ok()).toBe(true);
+  // HTTP headers are only a transport check. The same dossier must change from
+  // unopened to À valider after return; RSC end-of-stream is not a commit receipt.
   expect(posts.every(url => new URL(url).pathname === path)).toBe(true);
   const back = page.getByRole("link", { name: "← Retour aux dossiers", exact: true });
   await expect(back).toHaveAttribute("href", `/studio/sav?view=other&q=AUTRE88&page=1&sort=oldest#dossier-${SAV_OTHER_THREAD(1)}`);
   await back.click();
-  await expect(page).toHaveURL(/view=other.*sort=oldest/, { timeout: 30_000 });
-  await expect(page.locator(`[id="dossier-${SAV_OTHER_THREAD(1)}"]`)).toContainText("Également dans À valider");
+  // URL commitment may display loading.tsx before the real list is rendered.
+  // Keep the existing navigation budget; the row/status assertion stays at5s.
+  await Promise.all([
+    expect(page).toHaveURL(/view=other.*sort=oldest/, { timeout: 30_000 }),
+    page.getByRole("region", { name: "Dossiers SAV", exact: true }).waitFor({ state: "visible", timeout: 30_000 }),
+  ]);
+  await expect(dossier).toContainText("Également dans À valider");
 });

@@ -5,6 +5,7 @@ import { savIntakeRuns } from "@/db/schema";
 import { classifySavDossierOtherManually } from "../external-completion";
 import { readSavIntakeCurrent, savIntakeSourceSnapshot } from "./runtime-store";
 import { invalidIntakeAddressMetadata } from "./source-validation";
+import { intakeVersionStillCurrent, type IntakeVersionPrecondition } from "./version-precondition";
 
 const inputSchema = z.object({ requestKey: z.uuid(), threadId: z.uuid(), messageId: z.uuid(), confirmed: z.literal(true) }).strict();
 
@@ -12,7 +13,7 @@ const inputSchema = z.object({ requestKey: z.uuid(), threadId: z.uuid(), message
  * addresses refuse the analysis source. The verified run and the invalidity are
  * re-checked under the thread locks before any append: a repaired or reingested
  * source is refused without a marker. No model, email or CRM call. */
-export async function classifyInvalidSourceAsOther(raw: unknown) {
+export async function classifyInvalidSourceAsOther(raw: unknown, expected?: IntakeVersionPrecondition) {
   const input = inputSchema.parse(raw);
   const current = await readSavIntakeCurrent(input.threadId);
   if (!current?.sourceInvalid || current.messageId !== input.messageId) throw Error("SAV_INTAKE_SOURCE_NOT_INVALID");
@@ -21,6 +22,7 @@ export async function classifyInvalidSourceAsOther(raw: unknown) {
     const [run] = await tx.select({ id: savIntakeRuns.id, version: savIntakeRuns.version, messageId: savIntakeRuns.messageId }).from(savIntakeRuns)
       .where(and(eq(savIntakeRuns.threadId, message.threadId), eq(savIntakeRuns.isCurrent, true))).for("update");
     if (!run || run.id !== verified.runId || run.version !== verified.version || run.messageId !== message.id) return false;
+    if (expected && !await intakeVersionStillCurrent(tx, message.threadId, expected)) return false;
     try { await savIntakeSourceSnapshot(tx, message, new Date()); return false; }
     catch (error) { if (invalidIntakeAddressMetadata(error)) return true; throw error; }
   });
