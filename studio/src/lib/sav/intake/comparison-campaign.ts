@@ -8,6 +8,7 @@ import { decryptSavPayload, encryptSavPayload } from "../crypto";
 import { savDerivedCostQuote } from "../derived-budget";
 import type { SavGeminiMetadata } from "../gemini-response";
 import { SAV_AI_BUDGET, savAiCancellationCode, withSavAiBudget } from "../gemini-transport";
+import { unbilledProviderStatus as isUnbilledProviderStatus } from "./model-usage";
 import { planSavIntake } from "./engine";
 import type { EnginePolicy, IntakePlan, ReadResult } from "./engine-types";
 import { createSavIntakeHubspotReaders, type SavIntakeCrmReaders } from "./hubspot-readers";
@@ -104,7 +105,7 @@ export function settleSavIntakeComparisonCall(campaignId: string) {
     const { inputTokens: i, outputTokens: o, thoughtTokens: t, totalTokens: total } = metadata ?? {};
     const valid = [i, o, t, total].every(n => Number.isSafeInteger(n) && Number(n) >= 0) && Number(i) >= 1 && Number(i) <= 1_048_576
       && Number(o) + Number(t) <= 8192 && Number(i) + Number(o) + Number(t) === total;
-    const unbilled = !valid && unbilledProviderStatus !== undefined && (unbilledProviderStatus === 429 || unbilledProviderStatus >= 500 && unbilledProviderStatus <= 599);
+    const unbilled = !valid && isUnbilledProviderStatus(unbilledProviderStatus);
     await append(requireDb(), { campaignId, callId, event: "settled", state: valid || unbilled ? "settled" : "uncertain", chargedNanoUsd: valid ? Number(i) * 750 + (Number(o) + Number(t)) * 3750 : 0 });
     return valid || unbilled;
   };

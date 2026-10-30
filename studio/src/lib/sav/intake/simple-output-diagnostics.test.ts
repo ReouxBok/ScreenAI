@@ -40,7 +40,7 @@ it("a received HTTP200 MAX_TOKENS is settled from usage, not uncertain, with saf
   expect(traces[0].metadata).toBeUndefined(); expect(traces.filter(t=>t.metadata)).toHaveLength(0);
 });
 
-it("provider schema sends only supported array bounds while the server rejects an overlong why with only one format repair", async () => {
+it("provider schema omits optional nested array bounds while the server still rejects an overlong why with only one format repair", async () => {
   const complete=(data:unknown)=>({status:"complete" as const,data,observedAt:"2026-10-28T19:00:00Z"});
   const crm={findContactsByEmail:async()=>complete([]),directAssociations:async()=>complete([]),getContact:async()=>complete(null),ticketsForContact:async()=>complete([]),ticketHistory:async()=>complete([])};
   const mid="10000000-0000-4000-8000-000000000001";
@@ -49,9 +49,10 @@ it("provider schema sends only supported array bounds while the server rejects a
     const schema=input.body.generationConfig.responseSchema as unknown as Schema;
     expect(schema.properties.ticketDescription).not.toHaveProperty("maxLength");
     expect(schema.properties.identity.properties.why).not.toHaveProperty("maxLength");
-    expect(schema.properties.tickets.maxItems).toBe("20");
-    expect(schema.properties.requests.maxItems).toBe("15");
-    expect(schema.properties.requests.items.properties.sourceIds).toMatchObject({minItems:"1",maxItems:"20"});
+    expect(schema.properties.tickets).not.toHaveProperty("maxItems");
+    expect(schema.properties.requests).not.toHaveProperty("maxItems");
+    expect(schema.properties.requests.items.properties.sourceIds).not.toHaveProperty("minItems");
+    expect(schema.properties.requests.items.properties.sourceIds).not.toHaveProperty("maxItems");
     return {json:{messageId:mid,nature:"request",requests:[{id:"r1",kind:"support",summary:"Agenda en panne",sourceIds:["current"]}],identity:{kind:"unknown",contactIds:[],why:"x".repeat(501)},tickets:[],missing:[],rationale:"Aucun contact"},metadata:{inputTokens:10,outputTokens:10,thoughtTokens:0,totalTokens:20}};
   });
   const reader=createSavIntakeSimpleReaders({model:"gemini-3.6-flash",call:call as never,crm:crm as never,policy:{admittedRelations:[]} as unknown as EnginePolicy});

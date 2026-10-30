@@ -19,7 +19,7 @@ import { compactIntakeContextView, INTAKE_CONTEXT_VIEW_INSTRUCTION } from "./mod
 import type { IntakeEvidenceAnchor } from "./model-evidence";
 import { addIntakeOutputNormalization, emptyIntakeOutputNormalization, intakeOutputNormalized, normalizeIntakeAnalysisOutput, INTAKE_OUTPUT_LIMITS_INSTRUCTION, INTAKE_VISUAL_LIMITS_INSTRUCTION, type IntakeOutputNormalization, type IntakeOutputStage } from "./output-normalization";
 
-export const SAV_INTAKE_MODEL_REVISION = "sav-intake-semantic-2026-10-25.v9";
+export const SAV_INTAKE_MODEL_REVISION = "sav-intake-semantic-2026-10-29.v10";
 const quote = z.string().trim().min(1).max(2000);
 // One current message + ten candidate contacts + twenty tickets and histories.
 const grounding = z.array(z.object({ sourceId: z.string().min(1).max(200), quote }).strict()).min(1).max(1 + 10 + 2 * 20);
@@ -357,12 +357,23 @@ export function createSavIntakeSemanticReaders(options: {
       const wireSchema = issueSchema.extend({ tickets: z.array(issueSchema.shape.tickets.element.extend({
         ticketId: referenceIds(tickets.map(t => t.ticket.id)), requestIds: z.array(referenceIds(input.requests.map(r => r.id))).max(15),
         evidenceIds: z.array(referenceIds(input.evidence.map(e => e.id))).min(1).max(100),
-        grounding: z.array(z.object({ quoteId: catalogue.quoteIds() }).strict()).min(1).max(51),
+        // Separate source slots prevent an otherwise schema-valid single current anchor
+        // from standing in for the ticket and its history. Server containment and
+        // per-ticket coverage below remain authoritative, including legacy arrays.
+        grounding: z.object({ current: catalogue.quoteIds("current"),
+          ticket: tickets.every(t => sources.get(`ticket-${t.ticket.id}`)!.trim())
+            ? catalogue.quoteIdsFor(tickets.map(t => `ticket-${t.ticket.id}`))
+            : catalogue.quoteIdsFor(tickets.map(t => `ticket-${t.ticket.id}`), true).nullable(),
+          history: tickets.every(t => t.history.length) ? catalogue.quoteIdsFor(tickets.map(t => `history-${t.ticket.id}`))
+            : catalogue.quoteIdsFor(tickets.filter(t => t.history.length).map(t => `history-${t.ticket.id}`), true).nullable(),
+          ...(input.requestContext ? { initialRequest: catalogue.quoteIds("initial-request") } : {}),
+          additional: z.array(catalogue.quoteIds()).max(47).optional(),
+        }).strict(),
       })).max(20) });
       const data = { message: messageMetadata(input.message, "current"), requests: input.requests,
         ...(input.requestContext ? { requestContext: messageMetadata(input.requestContext, "initial-request"), continuationInstructions: "The initial-request is an explicitly verified continuation. Read and cite it as well as current, without attributing its words to current. Include initial-request in evidenceIds for each ticket assessment." } : {}),
         tickets: tickets.map(t => ({ ticket: ticketMetadata(t.ticket), historyEntries: t.history.length })), evidence: input.evidence, citationCatalogue: catalogue.entries };
-      const instruction = "Assess EVERY ticket against ALL current requests, reading its notes/exchanges. same means this single ticket covers every request; partial/unknown must remain explicit. A shared name, generic topic or keyword is insufficient. Cite current, ticket and nonempty history with exact excerpts for same/different. For each ticket, evidenceIds must include current, ticket-<ticketId>, history-<ticketId> from the supplied evidence list (including the aggregate history proof when history is empty). For same/different, grounding must select quoteIds from current, that ticket, and its history when nonempty. Never substitute individual note/email IDs or quoteIds for these aggregate evidenceIds. Do not select or create a destination here.";
+      const instruction = "Assess EVERY ticket against ALL current requests, reading its notes/exchanges. same means this single ticket covers every request; partial/unknown must remain explicit. A shared name, generic topic or keyword is insufficient. Cite current, ticket and nonempty history with exact excerpts for same/different. For each ticket, evidenceIds must include current, ticket-<ticketId>, history-<ticketId> from the supplied evidence list (including the aggregate history proof when history is empty). Fill grounding.current, grounding.ticket and grounding.history with quoteIds from the corresponding source for THIS ticket; history is null only when that ticket has no history. Cite initialRequest when supplied. Additional anchors are optional and never replace these source slots. Never substitute individual note/email IDs or quoteIds for these aggregate evidenceIds. Do not select or create a destination here.";
       boundedBody("ticket_matching", instruction, data, wireSchema, signal, histories);
       return { data, histories, wireSchema, catalogue, sources, instruction, tickets };
       };

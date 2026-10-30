@@ -63,6 +63,13 @@ export function intakeEvidenceCatalogue(sources: ReadonlyMap<string, string>) {
     if (!ids.length) throw Error("SAV_INTAKE_MODEL_CONTEXT_LIMIT");
     return z.enum(ids as [string, ...string[]]);
   };
+  const quoteIdsFor = (sourceIds: readonly string[], allowEmpty = false) => {
+    const ids = entries.filter(e => sourceIds.includes(e.sourceId)).map(e => e.id);
+    // Null is the only selection when all captured sources of this kind are empty.
+    if (!ids.length && allowEmpty) return z.null();
+    if (!ids.length) throw Error("SAV_INTAKE_MODEL_CONTEXT_LIMIT");
+    return z.enum(ids as [string, ...string[]]);
+  };
   /** Legacy verbatim outputs remain subject to all their original validators.
    * New quoteIds are exact, source-bound references, never inferred repairs. */
   const resolve = (value: unknown, path: string, expectedSource?: string): unknown => {
@@ -84,7 +91,7 @@ export function intakeEvidenceCatalogue(sources: ReadonlyMap<string, string>) {
       return { ...resolved, sourceId: byId.get(String(item.quoteId))!.sourceId };
     });
   };
-  return { entries, quoteIds,
+  return { entries, quoteIds, quoteIdsFor,
     decodeAnalysis(raw: unknown, messageId: string, initialMessageId?: string) {
       if (!record(raw)) return raw;
       const requests = Array.isArray(raw.requests) && raw.requests.length <= 15
@@ -100,7 +107,24 @@ export function intakeEvidenceCatalogue(sources: ReadonlyMap<string, string>) {
     },
     decodeIssues(raw: unknown) {
       if (!record(raw) || !Array.isArray(raw.tickets) || raw.tickets.length > 20) return raw;
-      return { ...raw, tickets: raw.tickets.map((t, i) => record(t) ? { ...t, grounding: grounding(t.grounding, `tickets.${i}.grounding`) } : t) };
+      return { ...raw, tickets: raw.tickets.map((t, i) => {
+        if (!record(t)) return t;
+        if (!record(t.grounding)) return { ...t, grounding: grounding(t.grounding, `tickets.${i}.grounding`) };
+        const slots = t.grounding, path = `tickets.${i}.grounding`;
+        if (Object.keys(slots).some(k => !["current", "ticket", "history", "initialRequest", "additional"].includes(k)))
+          rejectIntakeEvidence("ambiguous_quote_format", path);
+        const selected: unknown[] = [];
+        for (const [key, source] of [["current", "current"], ["ticket", `ticket-${t.ticketId}`], ["history", `history-${t.ticketId}`], ["initialRequest", "initial-request"]]) {
+          if (slots[key] === undefined || slots[key] === null) continue;
+          const value = { quoteId: slots[key] };
+          const resolved = resolve(value, `${path}.${key}`, source);
+          selected.push({ ...(resolved as object), sourceId: source });
+        }
+        const extra = slots.additional;
+        if (extra !== undefined && (!Array.isArray(extra) || extra.length > 47)) rejectIntakeEvidence("ambiguous_quote_format", path);
+        for (const id of (extra ?? []) as unknown[]) selected.push({ quoteId: id });
+        return { ...t, grounding: grounding(selected, path) };
+      }) };
     },
     decodeIdentity(raw: unknown) { return record(raw) ? { ...raw, grounding: grounding(raw.grounding, "grounding") } : raw; },
   };

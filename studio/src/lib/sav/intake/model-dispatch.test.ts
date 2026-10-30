@@ -20,7 +20,7 @@ function inputAtSize(bytes: number): Parameters<IntakeGeminiCall>[0] {
   expect(savGeminiWireBody(input).textBytes).toBe(bytes);
   return input;
 }
-beforeEach(() => vi.clearAllMocks());
+beforeEach(() => { vi.clearAllMocks(); vi.spyOn(globalThis, "fetch").mockRejectedValue(Error("EXTERNAL_NETWORK_FORBIDDEN")); });
 it("keeps the existing conservative price reservation above the expanded text envelope", () => {
   const quote = savDerivedCostQuote(config.model, 8192, new Date("2026-10-22T00:00:00Z"));
   expect(quote.reservedNanoUsd).toBe(817_152_000);
@@ -184,4 +184,47 @@ it("counts cached output and preflight rejection as zero sends, and an HTTP reje
   await expect(rejected.call(input)).rejects.toThrow("SAV_AI_HTTP_400");
   expect(intakeDispatchCounts(rejected.diagnostics)).toEqual({ dispatches: 1, httpResponses: 1 });
   expect(network).toHaveBeenCalledTimes(1);
+});
+
+it.each([false, true])("HTTP400 diagnostics capture=%s does not change dispatch, cancellation or zero-charge settlement", async captureDiagnostics => {
+  const input = inputAtSize(1000), parent = new AbortController(), settle = vi.fn(async () => false);
+  const network = vi.fn<typeof fetch>(async () => new Response(new ReadableStream({ start() { parent.abort(Error("SAV_INTAKE_COMPARISON_DEADLINE")); } }), { status: 400 }));
+  const dispatcher = createIntakeModelDispatcher({ config, captureDiagnostics, live: async () => {}, network, settle,
+    reserve: async () => ({ id: "cancelled-body", cached: null }), signal: parent.signal, env: () => ({ SAV_GEMINI_API_KEY: "synthetic-key" }) });
+  await expect(dispatcher.call(input)).rejects.toThrow("SAV_INTAKE_COMPARISON_DEADLINE");
+  expect(network).toHaveBeenCalledTimes(1); expect(settle).toHaveBeenCalledOnce();
+  expect(settle.mock.calls[0]).toHaveLength(2); // cancellation cannot use the unbilled-status settlement argument
+  expect(dispatcher.uncertain).toBe(true);
+});
+it("a diagnostic body deadline after received HTTP400 remains one unbilled rejection, without retry", async () => {
+  const settle = vi.fn(async () => true), network = vi.fn<typeof fetch>(async () => new Response(new ReadableStream(), { status: 400 }));
+  const dispatcher = createIntakeModelDispatcher({ config, captureDiagnostics: true, live: async () => {}, network, settle,
+    reserve: async () => ({ id: "bad-request", cached: null }), signal: new AbortController().signal, env: () => ({ SAV_GEMINI_API_KEY: "synthetic-key" }) });
+  vi.useFakeTimers();
+  try {
+    const pending = dispatcher.call(inputAtSize(1000)).catch(error => error);
+    await vi.advanceTimersByTimeAsync(100);
+    expect(await pending).toMatchObject({ message: "SAV_AI_HTTP_400" });
+    expect(network).toHaveBeenCalledTimes(1); expect(settle).toHaveBeenCalledWith("bad-request", expect.any(Object), undefined, 400);
+    expect(dispatcher.uncertain).toBe(false); expect(dispatcher.diagnostics[0]).toMatchObject({ providerRejection: { bodyRead: "timeout" }, transport: { attempts: 1, retries: 0 } });
+  } finally { vi.useRealTimers(); }
+});
+it("a late HTTP400 keeps its settlement even when optional diagnostics outlast the provider attempt allowance", async () => {
+  const settle = vi.fn(async () => true), network = vi.fn<typeof fetch>(async () => {
+    await new Promise(resolve => setTimeout(resolve, 17_950));
+    return new Response(new ReadableStream(), { status: 400 });
+  });
+  const dispatcher = createIntakeModelDispatcher({ config, captureDiagnostics: true, live: async () => {}, network, settle,
+    reserve: async () => ({ id: "late-400", cached: null }), signal: new AbortController().signal, env: () => ({ SAV_GEMINI_API_KEY: "synthetic-key" }) });
+  vi.useFakeTimers();
+  try {
+    const result = dispatcher.call(inputAtSize(1000)).catch(error => error);
+    await vi.advanceTimersByTimeAsync(18_100);
+    expect(await result).toMatchObject({ message: "SAV_AI_HTTP_400" });
+    await Promise.allSettled(dispatcher.pending);
+    expect(network).toHaveBeenCalledTimes(1);
+    expect(settle).toHaveBeenCalledWith("late-400", expect.any(Object), undefined, 400);
+    expect(dispatcher.uncertain).toBe(false);
+    expect(dispatcher.diagnostics[0]).toMatchObject({ providerRejection: { bodyRead: "timeout" } });
+  } finally { vi.useRealTimers(); }
 });

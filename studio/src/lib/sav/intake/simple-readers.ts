@@ -162,7 +162,10 @@ export function createSavIntakeSimpleReaders(options: {
     for (;;) {
       const body = { systemInstruction: { parts: [{ text: `${INSTRUCTION}${repair ? "\nFORMAT REPAIR v1: the previous response did not match the required JSON schema. Read the SAME sources again and return one complete JSON object conforming exactly to it." : ""}` }] },
         contents: [{ role: "user" as const, parts: [{ text: JSON.stringify(data) }] }],
-        generationConfig: { maxOutputTokens: 8192, responseMimeType: "application/json", responseSchema: intakeResponseSchema(schema, { arrayBounds: true }) } };
+        // Optional nested wire bounds can expand the provider's constrained decoder.
+        // Keep every server bound and the compact output instructions; omitting
+        // these wire hints is a mitigation, not proof of the historical HTTP400 cause.
+        generationConfig: { maxOutputTokens: 8192, responseMimeType: "application/json", responseSchema: intakeResponseSchema(schema) } };
       const dataBytes = Buffer.byteLength(body.contents[0].parts[0].text, "utf8"), wireBytes = savGeminiWireBody({ model: options.model, phase, body }).textBytes;
       const trace = (accepted: boolean, errorCode: string | null, more: Partial<IntakeModelTrace> = {}) => options.onTrace?.({ phase, model: options.model,
         promptRevision: SAV_INTAKE_SIMPLE_REVISION, inputHash, durationMs: Date.now() - started, accepted, errorCode, ...more });
