@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { intakeHandoff, intakeExpectedActions, intakeContextReasonLabels } from "./console-presentation";
+import { intakeHandoff, intakeExpectedActions, intakeContextReasonLabels, intakeRuntimeHandoffReasons } from "./console-presentation";
 
 describe("team handoff", () => {
   it("gives the cause, the exact action, the tickets examined with their reason and what was missing", () => {
@@ -25,4 +25,16 @@ it("the shared daily cap tells the team nothing is needed: automatic resume next
   const handoff = intakeHandoff({ reasons: ["SAV_INTAKE_RUNTIME_DAILY_BUDGET_DEFERRED"] });
   expect(handoff.actions).toEqual([intakeExpectedActions.SAV_INTAKE_RUNTIME_DAILY_BUDGET_DEFERRED]);
   expect(handoff.actions[0]).toContain("reprise automatique");
+});
+
+it("SAV-74 the analysis-call limit is named as such, with its own action, never as the money budget", () => {
+  expect(intakeRuntimeHandoffReasons({ reason: "SAV_INTAKE_RUNTIME_BUDGET_EXHAUSTED", budgetLimit: "analysis_calls" })).toEqual(["analysis_calls_limit"]);
+  for (const budgetLimit of ["per_message", "daily_nano_usd", undefined])
+    expect(intakeRuntimeHandoffReasons({ reason: "SAV_INTAKE_RUNTIME_BUDGET_EXHAUSTED", budgetLimit })).toEqual(["SAV_INTAKE_RUNTIME_BUDGET_EXHAUSTED"]);
+  expect(intakeRuntimeHandoffReasons({ reason: "SAV_INTAKE_RUNTIME_DAILY_BUDGET_DEFERRED" })).toEqual(["SAV_INTAKE_RUNTIME_DAILY_BUDGET_DEFERRED"]);
+  expect(intakeRuntimeHandoffReasons(undefined)).toEqual([]);
+  const handoff = intakeHandoff({ reasons: ["analysis_calls_limit"] });
+  expect(handoff.causes[0]).toContain("aucun plafond financier");
+  expect(handoff.actions).toEqual([intakeExpectedActions.analysis_calls_limit]);
+  expect(handoff.actions[0]).toContain("choisir le ticket");
 });

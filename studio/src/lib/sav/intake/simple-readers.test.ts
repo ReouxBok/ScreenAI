@@ -277,8 +277,16 @@ describe("non-regression of the existing routes (lot 3)", () => {
     });
   it("a pure acknowledgement creates nothing", async () => {
     const b = bench({ text: "Merci beaucoup, tout fonctionne maintenant.", subject: "Re: Merci" });
-    const plan = await b.run(d => judgement(d, { requests: [{ id: "r1", kind: "acknowledgement", summary: "Remerciement.", sourceIds: ["current"] }] }));
+    // The simple contract: nature request only when the current message asks something.
+    const plan = await b.run(d => judgement(d, { nature: "information", requests: [{ id: "r1", kind: "acknowledgement", summary: "Remerciement.", sourceIds: ["current"] }] }));
     expect(plan.decision.disposition).toMatchObject({ kind: "no_ticket" });
+    expect(plan.steps).toEqual([]);
+  });
+  it("SAV-73 an acknowledgement the reader itself calls a request goes to a person and creates nothing", async () => {
+    const b = bench({ text: "Merci beaucoup, tout fonctionne maintenant.", subject: "Re: Merci" });
+    const plan = await b.run(d => judgement(d, { nature: "request", requests: [{ id: "r1", kind: "acknowledgement", summary: "Remerciement.", sourceIds: ["current"] }] }));
+    expect(plan.decision.disposition).toMatchObject({ kind: "collect_context", reasons: expect.arrayContaining(["classification_incomplete"]) });
+    expect(plan.progress).toMatchObject({ kind: "human_choice", questionCode: "request_scope_uncertain" });
     expect(plan.steps).toEqual([]);
   });
   it("Other with requests is never hidden without the qualified rule", async () => {

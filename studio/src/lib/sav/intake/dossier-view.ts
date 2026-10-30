@@ -1,6 +1,6 @@
 import "server-only";
 import type { readIntakeConsoleDetail } from "./console-detail";
-import { intakeHandoff } from "./console-presentation";
+import { intakeHandoff, intakeRuntimeHandoffReasons } from "./console-presentation";
 import { readManualOtherEligibility, type ManualOtherEligibility } from "./manual-other-classification";
 
 export const intakeEffectLabels: Record<string, string> = { ticket_create: "Création du ticket", note_create: "Note de contexte", note_associate: "Rattachement de la note",
@@ -43,7 +43,7 @@ export function intakeDossierView(data: IntakeConsoleDetail) {
           : disposition?.kind === "no_ticket" && disposition.nextAction === "supervised_commercial" ? "Prendre en charge cette demande commerciale" : "Quelle suite l’équipe doit-elle donner à cette demande ?" : null;
   const judgement = (current?.payload.traces as { phase?: string }[] | undefined)?.findLast(t => t?.phase === "simple_judgement") as Parameters<typeof intakeHandoff>[0]["judgement"];
   const assessed = (current?.payload.semantics?.records.find(r => r.method === "assessIssues")?.result as { tickets?: { ticketId: string; relation: string }[] } | undefined)?.tickets;
-  const handoffReasons = [...(disposition?.kind === "collect_context" ? disposition.reasons : []), ...(current?.payload.reason === "SAV_INTAKE_RUNTIME_BUDGET_EXHAUSTED" || current?.payload.reason === "SAV_INTAKE_RUNTIME_DAILY_BUDGET_DEFERRED" || current?.payload.reason === "SAV_INTAKE_RUNTIME_ROLLING_BUDGET_DEFERRED" ? [current.payload.reason] : [])];
+  const handoffReasons = [...(disposition?.kind === "collect_context" ? disposition.reasons : []), ...intakeRuntimeHandoffReasons(current?.payload)];
   const handoff = !data.handledExternally && !data.confirmedCurrent && (blocked || handoffReasons.length > 0 || question)
     ? intakeHandoff({ reasons: handoffReasons, blockedCause: blocked ? "attempts_exhausted" : null, assessments: assessed, judgement }) : null;
   return { current, blocked, applicable, plan, disposition, historicalPlan, contacts, tickets, target, historicalTarget, dirty, canCorrect, currentEffects, question, handoff };

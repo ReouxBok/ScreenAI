@@ -8,7 +8,8 @@ import { intakeExecutionConfig, readIntakeExecutionAuthority } from "./intake/ex
 import { SAV_INTAKE_OPERATIONAL_PROFILE, intakeAdmissionUsage } from "./intake/budget-profile";
 import { readIntakeOtherRules } from "./intake/other-routing";
 import { decryptSavPayload } from "./crypto";
-import { intakeBlockedRunSql } from "./intake/console-store";
+import { intakeBlockedRunSql, intakeBlockedPause } from "./intake/console-store";
+import { readSavAgentPause, SAV_AGENT_PAUSE_CODES } from "./intake/agent-pause";
 import { monitorStateSchema, monitorCodes, nextMonitorState, monitorWebhook, monitorSlackText, monitorDeliveryHash, type MonitorState, type MonitorSnapshot, type MonitorIssue, type MonitorCode } from "./monitor-contract";
 
 const WORKER = "sav-monitor:v1:worker", STATE = "sav-monitor:v1:state", SNAPSHOT = "sav-monitor:v1:snapshot";
@@ -77,6 +78,10 @@ export async function collectSavMonitorSnapshot(): Promise<MonitorSnapshot> {
         add("schema_missing", 1, "critical"); snapshot.complete = false; return;
       }
       add("automation_off", snapshot.runtimeMode !== "observe" || snapshot.executionMode !== "execute" ? 1 : 0);
+      // SAV-75: an administrative pause is an expected wait. What it holds is reported once as
+      // agent_paused, never as analysis/execution delays or blocked dossiers; uncertain effects stay critical.
+      const pauseState = await readSavAgentPause(tx), pause = intakeBlockedPause(pauseState), actionsPaused = pauseState.level !== "running";
+      let pausedHeld = 0;
       const messages = await queryRows<{ pending: number; oldest: number | null; uncertain: number }>(tx,sql`select
         count(*) filter(where m.analysis_status in ('pending','intake_pending','intake_analysing'))::int as pending,
         extract(epoch from (${now.toISOString()}::timestamptz-min(m.created_at) filter(where m.analysis_status in ('pending','intake_pending','intake_analysing'))))::int as oldest,
@@ -87,7 +92,10 @@ export async function collectSavMonitorSnapshot(): Promise<MonitorSnapshot> {
         and m.created_at>(l.cursor::jsonb->>'createdAfter')::timestamptz
         and not exists(select 1 from sav.messages n where n.thread_id=m.thread_id and n.direction='inbound' and (least(n.received_at,n.created_at),n.created_at,n.id)>(least(m.received_at,m.created_at),m.created_at,m.id))`);
       metrics.pending = messages[0]?.pending ?? 0; metrics.oldestPendingSeconds = Math.max(0, messages[0]?.oldest ?? 0);
-      add("analysis_delayed", metrics.oldestPendingSeconds > 600 ? metrics.pending : 0, metrics.oldestPendingSeconds > 1800 ? "critical" : "warning");
+      // After a resume the delay counts from the resume, not from arrival during the pause.
+      const delaySeconds = pause.resumedAt ? Math.min(metrics.oldestPendingSeconds, Math.max(0, Math.floor((now.getTime() - Date.parse(pause.resumedAt)) / 1000))) : metrics.oldestPendingSeconds;
+      if (pause.analysisPaused) pausedHeld += metrics.pending;
+      else add("analysis_delayed", delaySeconds > 600 ? metrics.pending : 0, delaySeconds > 1800 ? "critical" : "warning");
       add("analysis_uncertain", messages[0]?.uncertain ?? 0, "critical");
       const waiting = await queryRows<{payload_ciphertext:string;attempts:number}>(tx,sql`select r.payload_ciphertext,r.attempts from sav.intake_runs r
         join sav.messages m on m.id=r.message_id join sav.threads t on t.id=r.thread_id
@@ -98,13 +106,19 @@ export async function collectSavMonitorSnapshot(): Promise<MonitorSnapshot> {
       let technicalWaiting=0;
       for(const row of waiting) {
         const value=decryptSavPayload<{reason?:unknown;plan?:{decision?:{disposition?:{kind?:string}}}}>(row.payload_ciphertext);
+        if(typeof value.reason==='string' && Object.values(SAV_AGENT_PAUSE_CODES).includes(value.reason as never)) {
+          if(actionsPaused) { pausedHeld++; continue; }
+          // A wait left by the pause itself counts from the resume, like analysis_delayed; real technical codes never do.
+          if(pause.resumedAt && now.getTime()-Date.parse(pause.resumedAt) < 600000) continue;
+        }
         if(typeof value.reason==='string' && /^SAV_[A-Z_]+$/.test(value.reason) || !value.plan && row.attempts>=2) technicalWaiting++;
       }
       add("analysis_waiting",technicalWaiting,"critical");
       if(waiting.length===100) {snapshot.complete=false;add("collection_failed",1,"critical");}
-      const executions = await queryRows<{ count: number }>(tx,sql`select count(*)::int as count from sav.intake_executions e join sav.intake_runs r on r.id=e.run_id
+      const executions = await queryRows<{ count: number; uncertain: number }>(tx,sql`select count(*)::int as count, count(*) filter(where e.state='uncertain')::int as uncertain from sav.intake_executions e join sav.intake_runs r on r.id=e.run_id
         join sav.threads t on t.id=e.thread_id where r.is_current and not t.ai_paused and e.state in ('pending','running','uncertain','waiting') and e.updated_at < ${new Date(now.getTime()-600000).toISOString()}`);
-      add("execution_delayed", executions[0]?.count ?? 0, "critical");
+      if (actionsPaused) { add("execution_delayed", executions[0]?.uncertain ?? 0, "critical"); pausedHeld += (executions[0]?.count ?? 0) - (executions[0]?.uncertain ?? 0); }
+      else add("execution_delayed", executions[0]?.count ?? 0, "critical");
       // Mail that intake owns but cannot move without a person: a human hold on
       // the thread, sources to re-investigate, or a dossier waiting for qualification.
       const held = await queryRows<{ count: number }>(tx,sql`select count(*)::int as count from sav.messages m join sav.threads t on t.id=m.thread_id
@@ -124,8 +138,9 @@ export async function collectSavMonitorSnapshot(): Promise<MonitorSnapshot> {
       const blocked = await queryRows<{ count: number }>(tx,sql`select count(*)::int as count from sav.intake_console c
         join sav.sync_state l on l.key='sav-intake-launch:'||c.mailbox_id::text and l.status='intake_launch_v1'
         join sav.threads t on t.id=c.thread_id
-        where not t.ai_paused and (c.epoch<>c.projected_epoch or c.view is null) and ${intakeBlockedRunSql(sql`c.thread_id`)}`);
+        where not t.ai_paused and (c.epoch<>c.projected_epoch or c.view is null) and ${intakeBlockedRunSql(sql`c.thread_id`, pause)}`);
       add("intake_blocked", blocked[0]?.count ?? 0, "critical");
+      add("agent_paused", actionsPaused ? Math.max(1, pausedHeld) : 0);
       const effects = await queryRows<{ uncertain: number; failed: number }>(tx,sql`select count(*) filter(where state in ('uncertain','dispatched','acked') and confirmed_at is null)::int as uncertain,
         count(*) filter(where state='failed')::int as failed from sav.intake_effects`);
       add("effect_uncertain", effects[0]?.uncertain ?? 0, "critical"); add("effect_failed", effects[0]?.failed ?? 0, "critical");
