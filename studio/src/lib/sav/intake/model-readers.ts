@@ -36,7 +36,9 @@ export type IntakeModelTrace = { phase: string; model: string; promptRevision: s
   normalization?: IntakeOutputNormalization;
   contextLimit?: { stage: "catalogue" | "data" | "wire"; bytes: number; limitBytes?: number; breakdown?: IntakeContextBreakdown };
   /** SAV-45: the sub-limit behind a BUDGET_EXHAUSTED decided by the reader itself. */
-  budgetLimit?: "analysis_calls" };
+  budgetLimit?: "analysis_calls";
+  /** SAV-74: why the analysis-call limit stopped matching: groups needed versus calls left. Counts only. */
+  callPlan?: { groups: number; available: number; tickets: number } };
 export type SavIntakeSemanticReaders = Pick<IntakeAdapters, "analyseMessage" | "assessIssues" | "assessIdentity">;
 const hash = (data: unknown) => createHash("sha256").update(JSON.stringify(data)).digest("hex");
 type WireContract = { schema: z.ZodType; decode: (raw: unknown) => unknown; normalize?: (raw: unknown) => { value: unknown; counts: IntakeOutputNormalization } };
@@ -383,15 +385,22 @@ export function createSavIntakeSemanticReaders(options: {
         try { groups.push(build(input.tickets)); }
         catch (error) {
           if (!(error instanceof Error) || error.message !== "SAV_INTAKE_MODEL_CONTEXT_LIMIT") throw error;
-          let pending: (typeof input.tickets)[number][] = [], last: Group | undefined;
-          for (const row of input.tickets) {
-            try { last = build([...pending, row]); pending.push(row); }
-            catch (failure) {
-              if (!(failure instanceof Error) || failure.message !== "SAV_INTAKE_MODEL_CONTEXT_LIMIT" || !last) throw failure;
-              groups.push(last); pending = [row]; last = build(pending);
+          // SAV-74: first-fit decreasing, deterministic. Every ticket is still read whole; packing
+          // the largest first needs fewer calls than filling groups in id order.
+          const size = (row: (typeof input.tickets)[number]) => Buffer.byteLength(JSON.stringify(row), "utf8");
+          const ordered = input.tickets.map((row, index) => ({ row, index, bytes: size(row) }))
+            .sort((a, b) => b.bytes - a.bytes || a.index - b.index);
+          const bins: { rows: (typeof input.tickets)[number][]; group: Group }[] = [];
+          for (const { row } of ordered) {
+            let placed = false;
+            for (const bin of bins) {
+              try { bin.group = build([...bin.rows, row]); bin.rows.push(row); placed = true; break; }
+              catch (failure) { if (!(failure instanceof Error) || failure.message !== "SAV_INTAKE_MODEL_CONTEXT_LIMIT") throw failure; }
             }
+            // A ticket too large on its own still throws the context limit, as before.
+            if (!placed) bins.push({ rows: [row], group: build([row]) });
           }
-          if (last) groups.push(last);
+          groups.push(...bins.map(bin => bin.group));
         }
       } catch (error) {
         options.onTrace?.({ phase: "ticket_matching", model: options.model, promptRevision: SAV_INTAKE_MODEL_REVISION, inputHash: hash(input.tickets), durationMs: 0, accepted: false, errorCode: "SAV_INTAKE_MODEL_CONTEXT_LIMIT",
@@ -401,7 +410,7 @@ export function createSavIntakeSemanticReaders(options: {
       const planningTrace = (errorCode: string) => options.onTrace?.({ phase: "ticket_matching", model: options.model, promptRevision: SAV_INTAKE_MODEL_REVISION,
         inputHash: hash(input.tickets), durationMs: 0, accepted: false, errorCode });
       if (groups.length > 3 - calls) { options.onTrace?.({ phase: "ticket_matching", model: options.model, promptRevision: SAV_INTAKE_MODEL_REVISION, inputHash: hash(input.tickets), durationMs: 0, accepted: false,
-        errorCode: "SAV_INTAKE_RUNTIME_BUDGET_EXHAUSTED", budgetLimit: "analysis_calls" }); throw Error("SAV_INTAKE_RUNTIME_BUDGET_EXHAUSTED"); }
+        errorCode: "SAV_INTAKE_RUNTIME_BUDGET_EXHAUSTED", budgetLimit: "analysis_calls", callPlan: { groups: groups.length, available: Math.max(0, 3 - calls), tickets: input.tickets.length } }); throw Error("SAV_INTAKE_RUNTIME_BUDGET_EXHAUSTED"); }
       if (groups.length > 1) {
         if (!options.planCalls) { planningTrace("SAV_INTAKE_MODEL_BATCH_PLANNING_REQUIRED"); throw Error("SAV_INTAKE_MODEL_BATCH_PLANNING_REQUIRED"); }
         try {

@@ -119,3 +119,34 @@ it("keeps an insufficient first compaction idempotent and reports the wire bound
   await expect(createSavIntakeSemanticReaders({model:"gemini-fixture",call,onTrace:t=>traces.push(t)}).analyseMessage({message:msg,conversation:[prior]},new AbortController().signal)).rejects.toThrow("CONTEXT_LIMIT");
   expect(call).not.toHaveBeenCalled();expect(traces.at(-1)?.contextLimit).toMatchObject({stage:"wire",limitBytes:SAV_INTAKE_MODEL_LIMITS.wireTextBytes});
 });
+
+// SAV-74: synthetic histories sized so that id-order filling needs three calls and
+// largest-first packing needs two. Counts only; no customer text.
+function sized(sizes:number[]){const data=input(sizes.length);sizes.forEach((n,i)=>{data.tickets[i].history[0].text=uniqueBody(800+i,n);});return data;}
+it("SAV-74 packs long histories largest-first: two calls where id-order filling needs three",async()=>{
+  const planned:Parameters<IntakeGeminiCall>[0][]=[],seen:Data[]=[];
+  const call=vi.fn<IntakeGeminiCall>(async arg=>{seen.push(JSON.parse(arg.body.contents[0].parts[0].text));return answer(arg);});
+  const reader=createSavIntakeSemanticReaders({model:"gemini-fixture",call,planCalls:async requests=>{planned.push(...requests);}});
+  const got=await reader.assessIssues(sized([40000,55000,40000,33000]),new AbortController().signal);
+  expect(planned).toHaveLength(2);expect(call).toHaveBeenCalledTimes(2);
+  // Every ticket is read whole exactly once, in one of the two calls.
+  expect(seen.flatMap(d=>d.tickets.map(t=>t.ticket.id)).sort()).toEqual(["201","202","203","204"]);
+  expect(got.tickets.map(t=>t.ticketId).sort()).toEqual(["201","202","203","204"]);
+  for(const d of seen)expect(Buffer.byteLength(JSON.stringify(d))).toBeLessThanOrEqual(SAV_INTAKE_MODEL_LIMITS.dataBytes);
+});
+it("SAV-74 a match held by the last group is kept, not sampled away",async()=>{
+  const call=vi.fn<IntakeGeminiCall>(async arg=>{const r=await answer(arg);const j=r.json as {tickets:{ticketId:string;relation:string}[]};for(const t of j.tickets)if(t.ticketId!=="203")t.relation="different";return r;});
+  const got=await createSavIntakeSemanticReaders({model:"gemini-fixture",call,planCalls:async()=>{}}).assessIssues(sized([40000,55000,40000,33000]),new AbortController().signal);
+  expect(got.tickets.find(t=>t.ticketId==="203")?.relation).toBe("same");expect(got.tickets.filter(t=>t.relation==="same")).toHaveLength(1);
+});
+it("SAV-74 beyond the call limit: no call, an explicit counts-only plan, never a money cap",async()=>{
+  const traces:{errorCode:string|null;budgetLimit?:string;callPlan?:unknown}[]=[],call=vi.fn<IntakeGeminiCall>(answer),planCalls=vi.fn(async()=>{});
+  await expect(createSavIntakeSemanticReaders({model:"gemini-fixture",call,planCalls,onTrace:t=>traces.push(t)}).assessIssues(sized([56000,56000,56000,56000]),new AbortController().signal)).rejects.toThrow("SAV_INTAKE_RUNTIME_BUDGET_EXHAUSTED");
+  expect(call).not.toHaveBeenCalled();expect(planCalls).not.toHaveBeenCalled();
+  expect(traces.at(-1)).toMatchObject({errorCode:"SAV_INTAKE_RUNTIME_BUDGET_EXHAUSTED",budgetLimit:"analysis_calls",callPlan:{groups:4,available:3,tickets:4}});
+});
+it("SAV-74 packing is deterministic for the same tickets in any input order",async()=>{
+  const bodies=async(data:ReturnType<typeof sized>)=>{const planned:string[]=[];await createSavIntakeSemanticReaders({model:"gemini-fixture",call:answer,planCalls:async r=>{planned.push(...r.map(x=>JSON.stringify((JSON.parse(x.body.contents[0].parts[0].text) as Data).tickets.map(t=>t.ticket.id))));}}).assessIssues(data,new AbortController().signal);return planned;};
+  const a=sized([40000,55000,40000,33000]),b=sized([40000,55000,40000,33000]);b.tickets.reverse();
+  expect((await bodies(a)).map(x=>JSON.parse(x).sort().join())).toEqual((await bodies(b)).map(x=>JSON.parse(x).sort().join()));
+});

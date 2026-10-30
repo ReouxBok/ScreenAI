@@ -67,6 +67,7 @@ export function intakeDiagnosticPayload(ciphertext: string) {
         schemaIssues: publicIntakeSchemaIssues(validation.issues),
         validationStage: outputStages.has(String(validation.stage)) ? String(validation.stage) : null,
         normalization: outputNormalization(t.normalization), budgetLimit: publicIntakeBudgetLimit(t.budgetLimit),
+        callPlan: t.callPlan && typeof t.callPlan === "object" ? { groups: count(object(t.callPlan).groups), available: count(object(t.callPlan).available), tickets: count(object(t.callPlan).tickets) } : null,
         transport:["local_guard","transport","http","response","deadline"].includes(String(transport.origin))?{origin:String(transport.origin),code:code(transport.code),attempts:count(transport.attempts),status:count(transport.status),durationMs:count(transport.durationMs)}:null,
         contextLimit: ["catalogue", "data", "wire"].includes(String(limit.stage)) ? { stage: String(limit.stage), bytes: count(limit.bytes), limitBytes: count(limit.limitBytes), breakdown: contextBreakdown(limit.breakdown) } : null };
     });

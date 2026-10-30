@@ -64,6 +64,8 @@ export const intakeContextReasonLabels: Record<string, string> = {
   history_incomplete: "historique et pièces non analysées", same_issue_unresolved: "correspondance du ticket avec toutes les demandes",
   ticket_creation_date_unknown: "date de création du ticket", ticket_closure_date_unknown: "date de fermeture du ticket", ticket_stage_unknown: "statut actuel du ticket",
   ticket_owner_unknown: "responsable du ticket", private_resource_unavailable: "ressource approuvée indisponible",
+  // SAV-74: a per-analysis call count, not money; the daily and 30-day caps are separate causes.
+  analysis_calls_limit: "historique trop long pour la limite d’appels d’analyse (aucun plafond financier atteint)",
 };
 
 /** Team-facing cause of a blocked dossier; the incident stays counted until resolved. */
@@ -98,9 +100,15 @@ export const intakeExpectedActions: Record<string, string> = {
   private_resource_unavailable: "Une ressource approuvée manque (modèle de réponse, règle) : la configurer ou traiter manuellement.",
   attempts_exhausted: "Traiter le dossier manuellement ou relancer une analyse après correction de la cause.",
   SAV_INTAKE_RUNTIME_BUDGET_EXHAUSTED: "Le budget d’appels IA de ce message est atteint : traiter manuellement.",
+  analysis_calls_limit: "Les tickets et historiques du contact demandent plus de lots d’analyse que la limite par analyse : choisir le ticket qui reçoit ce mail ou demander une création. Une nouvelle tentative identique échouerait de la même façon.",
   SAV_INTAKE_RUNTIME_DAILY_BUDGET_DEFERRED: "Aucune action requise : reprise automatique au prochain jour (minuit UTC). Relever le plafond quotidien si l’attente gêne.",
   SAV_INTAKE_RUNTIME_ROLLING_BUDGET_DEFERRED: "En attente de budget disponible sur 30 jours : relever le plafond glissant ou traiter manuellement si l’attente gêne.",
 };
+/** SAV-74: the analysis-call limit is named for what it is, never as the money budget. */
+export function intakeRuntimeHandoffReasons(payload: { reason?: string; budgetLimit?: string } | undefined) {
+  if (payload?.reason === "SAV_INTAKE_RUNTIME_BUDGET_EXHAUSTED" && payload.budgetLimit === "analysis_calls") return ["analysis_calls_limit"];
+  return payload?.reason === "SAV_INTAKE_RUNTIME_BUDGET_EXHAUSTED" || payload?.reason === "SAV_INTAKE_RUNTIME_DAILY_BUDGET_DEFERRED" || payload?.reason === "SAV_INTAKE_RUNTIME_ROLLING_BUDGET_DEFERRED" ? [payload.reason] : [];
+}
 export type IntakeHandoffInput = {
   reasons: readonly string[]; blockedCause?: string | null;
   assessments?: readonly { ticketId: string; relation: string }[];
