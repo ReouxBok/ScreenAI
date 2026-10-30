@@ -1,6 +1,7 @@
 /** The pipeline switch through the real runtime, dispatcher and ledger: fixed when a
  * run is created, outside configHash, and never changing an analysis in flight. */
 import { randomUUID } from "node:crypto";
+import { encodeSimpleWireFixture } from "./simple-wire.fixture";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { eq } from "drizzle-orm";
 import { createSavTestDb } from "../../../../test/sav-db";
@@ -50,7 +51,7 @@ function provider(messageId: string, failures: number[] = []) {
           identity: { kind: "unknown", contactIds: [], why: "Aucune fiche." }, tickets: [], missing: [], rationale: "Demande support." }
         : { messageId, requests: [{ id: "r1", kind: "support", currentMessageId: messageId, quoteId: data.citationCatalogue.find((x: { sourceId: string }) => x.sourceId === "current").id }],
           ticketSummary: { title: "Échec de synchronisation de l'agenda", description: "Erreur 500 à la synchronisation.", requestIds: ["r1"] } };
-      return Response.json({ candidates: [{ finishReason: "STOP", content: { parts: [{ text: JSON.stringify(answer) }] } }], usageMetadata: { promptTokenCount: 300, candidatesTokenCount: 60, thoughtsTokenCount: 0, totalTokenCount: 360 } });
+      return Response.json({ candidates: [{ finishReason: "STOP", content: { parts: [{ text: JSON.stringify(simple ? encodeSimpleWireFixture(answer, data.outputReferences) : answer) }] } }], usageMetadata: { promptTokenCount: 300, candidatesTokenCount: 60, thoughtsTokenCount: 0, totalTokenCount: 360 } });
     }
     if (String(url).startsWith("https://api.hubapi.com/")) return Response.json({ total: 0, results: [] });
     throw Error("EXTERNAL_NETWORK_FORBIDDEN");

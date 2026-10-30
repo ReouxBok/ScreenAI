@@ -1,6 +1,7 @@
 /** Images on the single-call reader through the real runtime, transport and ledger:
  * a reading or understanding defect never yields an automatic decision. */
 import { randomUUID } from "node:crypto";
+import { encodeSimpleWireFixture } from "./simple-wire.fixture";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { createSavTestDb } from "../../../../test/sav-db";
 import { savMailboxes, savMessages, savThreads, savActions, savIntakeExecutions } from "@/db/schema";
@@ -33,7 +34,7 @@ function provider(images: () => ImageAnswer[], requirement: "required" | "access
         ticketTitle: "Erreur E42 au démarrage", ticketDescription: "Le client signale une erreur visible sur sa capture.",
         identity: { kind: "unknown", contactIds: [], why: "Aucune fiche." }, tickets: [], missing: [], rationale: "Erreur applicative.",
         images: images(), imageRequirements: requirement ? [{ sourceId: data.images[0].sourceId, role: requirement }] : [] };
-      return Response.json({ candidates: [{ finishReason: "STOP", content: { parts: [{ text: JSON.stringify(answer) }] } }], usageMetadata: { promptTokenCount: 1220, candidatesTokenCount: 200, thoughtsTokenCount: 0, totalTokenCount: 1420 } });
+      return Response.json({ candidates: [{ finishReason: "STOP", content: { parts: [{ text: JSON.stringify(encodeSimpleWireFixture(answer, data.outputReferences)) }] } }], usageMetadata: { promptTokenCount: 1220, candidatesTokenCount: 200, thoughtsTokenCount: 0, totalTokenCount: 1420 } });
     }
     if (String(url).startsWith("https://api.hubapi.com/")) return Response.json({ total: 0, results: [] });
     throw Error("EXTERNAL_NETWORK_FORBIDDEN");
