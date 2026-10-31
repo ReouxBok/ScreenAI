@@ -441,15 +441,45 @@ function ticketNetwork(base: ReturnType<typeof provider>, onModel?: (simple: boo
   };
 }
 const resultRows = async () => (await ledger()).filter(x => x.technicalMetadata.event === "result");
+/** A stored receipt is the canonical AES-GCM envelope of exactly its receipt, and none of the
+ * receipt's readable content shows through. Only fragments holding a character outside the
+ * envelope alphabet (space, accent, "@", ":") are searched: those cannot occur in it by chance,
+ * whereas a short token such as "SYN" was observed inside random base64url ciphertext. */
+const ENVELOPE = /^v1\.[A-Za-z0-9_-]{16}\.[A-Za-z0-9_-]{22}\.[A-Za-z0-9_-]+$/;
+function expectSealedReceipt(stored: unknown) {
+  expect(typeof stored).toBe("string");
+  const text = String(stored);
+  expect(text).toMatch(ENVELOPE);
+  const receipt = cryptoModule.decryptSavPayload<unknown>(text), json = JSON.stringify(receipt);
+  expect(Buffer.from(text.split(".")[3], "base64url").length).toBe(Buffer.byteLength(json, "utf8"));
+  const readable: string[] = [];
+  const walk = (value: unknown): void => {
+    if (typeof value === "string") { if (/[^A-Za-z0-9_.-]/.test(value)) readable.push(value); }
+    else if (value && typeof value === "object") Object.values(value).forEach(walk);
+  };
+  walk(receipt);
+  expect(readable.length).toBeGreaterThan(0);
+  for (const fragment of [json, ...readable]) expect(text.includes(fragment)).toBe(false);
+  return receipt;
+}
 
 describe("SAV-46 qualification receipts", () => {
+  it("the receipt check refuses a plaintext receipt and accepts a real envelope, even when its random ciphertext contains \"SYN\"", () => {
+    const receipt = { summary: "SYN agenda en panne", note: "SYN erreur 500 ".repeat(150) };
+    expect(() => expectSealedReceipt(JSON.stringify(receipt))).toThrow();
+    const [version, iv, tag] = encryptSavPayload(receipt).split(".");
+    expect(() => expectSealedReceipt(`${version}.${iv}.${tag}.${Buffer.from(JSON.stringify(receipt)).toString("base64url")}`)).toThrow();
+    let sealed = encryptSavPayload(receipt);
+    for (let i = 0; i < 20_000 && !sealed.includes("SYN"); i++) sealed = encryptSavPayload(receipt);
+    expect(sealed).toContain("SYN");
+    expect(expectSealedReceipt(sealed)).toEqual(receipt);
+  });
   it("stores one encrypted v1 receipt with the result; the list decrypts no receipt and the detail verifies it", async () => {
     const m = await stored(), e = env(mailboxId, [m.id]), p = provider(), { spy, reads } = ticketDossier();
     try {
       await runSavIntakeComparisonBatch({ env: () => e, network: ticketNetwork(p), limit: 1 });
       const [row] = await resultRows();
-      expect(typeof row.technicalMetadata.evidence).toBe("string");
-      expect(String(row.technicalMetadata.evidence)).not.toContain("SYN");
+      const sealedReceipt = expectSealedReceipt(row.technicalMetadata.evidence);
       const decrypt = vi.spyOn(cryptoModule, "decryptSavPayload");
       const report = await readSavIntakeComparisonReport(() => e); if (!report.configured) throw Error("TEST_CONFIG");
       expect(decrypt.mock.calls.every(([payload]) => payload !== row.technicalMetadata.evidence)).toBe(true);
@@ -457,6 +487,7 @@ describe("SAV-46 qualification receipts", () => {
       expect(report.qualificationEvidence).toMatchObject({ complete: 1, legacy: 0, attested: 0 });
       const detail = await readSavIntakeComparisonEvidence(m.id, () => e);
       expect(detail).toMatchObject({ qualificationEvidence: "complete", verification: { ok: true, reason: null } });
+      expect(detail.receipt).toEqual(sealedReceipt);
       const receipt = detail.receipt as { sides: { simple: { plan: { noteText: string | null }; validated: { value: { requests: { summary: string }[] } }[]; mutationExpectations: { items: { mutation: string; ownerBaseline?: unknown }[] } } };
         common: { crm: { entries: { key: string }[] }; source: { engineInput: { message: { currentText: string } } } } };
       expect(receipt.sides.simple.validated[0].value.requests.map(r => r.summary)).toEqual(["SYN agenda en panne", "SYN erreur 500"]);
