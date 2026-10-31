@@ -83,6 +83,8 @@ describe.each<Reader>(["current", "simple"])("R1 %s reader: a written address is
     ["corrected to a colleague's account", "Mon compte Limova est resource@connector.test, non c'est le compte de mon collègue.", "resource@connector.test"],
     ["corrected to another address (FR)", "Mon compte Limova est resource@connector.test. Je me suis trompé, voici la bonne : account@customer.test.", "resource@connector.test"],
     ["corrected to another address (EN)", "My Limova account is resource@connector.test. My mistake, the correct one is account@customer.test.", "resource@connector.test"],
+    ["two accounts in one message, the first chosen", "Mon compte Limova est resource@connector.test. Mon compte Limova est account@customer.test.", "resource@connector.test"],
+    ["two accounts in one message, the second chosen", "My Limova account is resource@connector.test. My Limova account is account@customer.test.", "account@customer.test"],
     ["replaced by an explicit correction (FR)", "Mon compte Limova est resource@connector.test. Correction : account@customer.test est mon compte Limova.", "resource@connector.test"],
     ["replaced by another address (EN)", "My Limova account is resource@connector.test. Use account@customer.test instead.", "resource@connector.test"],
     ["the replacing address has no account statement of its own", "Mon compte Limova est resource@connector.test. Utilisez plutôt account@customer.test.", "account@customer.test"],
@@ -119,6 +121,14 @@ describe.each<Reader>(["current", "simple"])("R1 %s reader: a written address is
     expect(ticketOn(await b.run("account@customer.test"))).toBe("301");
     expect(b.crmCalls).toContain("lookup:account@customer.test");
   });
+  it("R7: a message admitting two accounts with no declaration from the reader is refused before any lookup, sender included", async () => {
+    const b = bench(reader, "Mon compte Limova est resource@connector.test. Mon compte Limova est account@customer.test.", [SENDER_CONTACT, RESOURCE_CONTACT, ACCOUNT_CONTACT]);
+    const plan = await b.run();
+    expect(plan.decision.disposition).toMatchObject({ kind: "collect_context", reasons: expect.arrayContaining(["contact_lookup_incomplete"]) });
+    // The simple reader reads the sender's context for its model before any decision (existing
+    // design); the engine then refuses the identity: neither declared address is ever looked up.
+    expect(b.crmCalls.filter(c => c.startsWith("lookup:"))).toEqual(reader === "simple" ? [`lookup:${SENDER}`] : []);
+  });
   it("an explicitly restated account after a correction is used; the superseded one is never looked up", async () => {
     const b = bench(reader, "Mon compte Limova est resource@connector.test. Je me suis trompé, mon compte Limova est account@customer.test.", [RESOURCE_CONTACT, ACCOUNT_CONTACT]);
     expect(ticketOn(await b.run("account@customer.test"))).toBe("301");
@@ -137,11 +147,11 @@ describe.each<Reader>(["current", "simple"])("R1 %s reader: a written address is
 
 /** Engine contract alone, whatever a reader (or an old cached analysis) returned. */
 describe("R1 engine: the declared address must carry its account role", () => {
-  function engine(text: string, registration: MessageAnalysis["registration"], contacts: IntakeContact[], options: { lookup?: ReadResult<IntakeContact[]>; continuation?: boolean } = {}) {
+  function engine(text: string, registration: MessageAnalysis["registration"], contacts: IntakeContact[], options: { lookup?: ReadResult<IntakeContact[]>; continuation?: boolean; history?: string } = {}) {
     const calls: string[] = [];
-    const initial = { id: initialMid, threadId: tid, fromEmail: SENDER, toEmails: ["support@example.test"], currentText: "Mon agenda ne se synchronise plus.", contentComplete: true, direction: "inbound" as const, receivedAt: "2026-10-30T10:00:00.000Z" };
+    const initial = { id: initialMid, threadId: tid, fromEmail: SENDER, toEmails: ["support@example.test"], currentText: options.history ?? "Mon agenda ne se synchronise plus.", contentComplete: true, direction: "inbound" as const, receivedAt: "2026-10-30T10:00:00.000Z" };
     const message = { id: mid, threadId: tid, fromEmail: SENDER, toEmails: ["support@example.test"], currentText: text, contentComplete: true, direction: "inbound" as const, receivedAt: at };
-    const input: EngineInput = { message, conversation: read(options.continuation ? [initial] : []), latestInboundMessageId: mid, now: at, mode: "current", identificationAttemptId: "fixture-attempt",
+    const input: EngineInput = { message, conversation: read(options.continuation || options.history ? [initial] : []), latestInboundMessageId: mid, now: at, mode: "current", identificationAttemptId: "fixture-attempt",
       ...(options.continuation ? { identificationContinuation: { initialMessageId: initialMid, confirmedEffectId: "effect-1" }, previousIdentification: { messageId: initialMid, address: SENDER, state: "confirmed" as const } } : {}) };
     const analysis: MessageAnalysis = { messageId: mid, requests: [{ id: "r1", kind: "support", currentMessageId: mid, ...(options.continuation ? { originMessageId: initialMid } : {}) }],
       ticketSummary: { title: "Synchronisation de l'agenda", description: "Synthetic description", requestIds: ["r1"] }, ...(registration ? { registration } : {}) };
@@ -192,6 +202,19 @@ describe("R1 engine: the declared address must carry its account role", () => {
     const r = engine(restated, { address: "account@customer.test", sourceMessageId: mid, quote: restated }, [RESOURCE_CONTACT, ACCOUNT_CONTACT]);
     expect(ticketOn(await r.run())).toBe("301");
     expect(r.calls).not.toContain("lookup:resource@connector.test");
+  });
+  it("R7: a message admitting two accounts fails closed before any lookup, whichever the reader declared, none, or an earlier one", async () => {
+    const text = "Mon compte Limova est resource@connector.test. Mon compte Limova est account@customer.test.", earlier = "Mon compte Limova est account@customer.test.";
+    const refused = async (e: ReturnType<typeof engine>) => {
+      expect((await e.run()).decision.disposition).toMatchObject({ kind: "collect_context", reasons: expect.arrayContaining(["contact_lookup_incomplete"]) });
+      expect(e.calls).toEqual([]);
+    };
+    for (const address of ["resource@connector.test", "account@customer.test"])
+      await refused(engine(text, { address, sourceMessageId: mid, quote: text }, [RESOURCE_CONTACT, ACCOUNT_CONTACT]));
+    await refused(engine(text, undefined, [SENDER_CONTACT, RESOURCE_CONTACT, ACCOUNT_CONTACT]));
+    await refused(engine(text, { address: "account@customer.test", sourceMessageId: initialMid, quote: earlier }, [ACCOUNT_CONTACT], { history: earlier }));
+    // Witness: the same earlier declaration with an unambiguous current message is used.
+    expect(ticketOn(await engine("Merci de votre aide.", { address: "account@customer.test", sourceMessageId: initialMid, quote: earlier }, [ACCOUNT_CONTACT], { history: earlier }).run())).toBe("301");
   });
   it("a negated continuation reply is not a current declaration", async () => {
     const text = "Ce n'est pas account@customer.test";

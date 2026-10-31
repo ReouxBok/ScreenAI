@@ -20,7 +20,7 @@ import { savIntakeSourceSnapshot } from "./runtime-store";
 import { readIntakeOtherRules } from "./other-routing";
 import { qualifyRuntimeCandidate } from "./other-routing-runtime";
 import { createSavIntakeSimpleReaders, readIntakeSimpleContext, SAV_INTAKE_SIMPLE_REVISION } from "./simple-readers";
-import { SAV_INTAKE_DECLARED_ADDRESS_CAP, savIntakeDeclaredAddressCandidates } from "./registration-declaration";
+import { SAV_INTAKE_DECLARED_ADDRESS_CAP, savIntakeDeclaredAddressCandidates, savIntakeDeclaredAddressConflict } from "./registration-declaration";
 import { intakeTicketDescription, intakeUnreadAttachmentNotice } from "./ticket-description";
 import { savAttachmentInventorySchema } from "../attachment-contract";
 import {
@@ -255,10 +255,13 @@ async function compareOne(messageId: string, claimId: string, campaign: SavIntak
   const policy: EnginePolicy = runtime.policy;
   // SAV-46 R2: every address the engine could accept as a declared registration is captured with
   // the sender's scope before any paid call. Capture is not identity: the engine still proves the
-  // account role. More than the cap is refused before dispatch, never truncated.
+  // account role. More than the cap is refused before dispatch, never truncated; so is a source
+  // that admits two distinct accounts (R7), whichever one a reader would pick.
   const declared = savIntakeDeclaredAddressCandidates(snapshot.input);
-  if (declared.length > SAV_INTAKE_DECLARED_ADDRESS_CAP) {
-    const refused = [...new Set([...coverage, "declared_address_cap_exceeded"])];
+  const refusal = savIntakeDeclaredAddressConflict(snapshot.input) ? "declared_address_ambiguous"
+    : declared.length > SAV_INTAKE_DECLARED_ADDRESS_CAP ? "declared_address_cap_exceeded" : null;
+  if (refusal) {
+    const refused = [...new Set([...coverage, refusal])];
     return { coverage: refused, snapshotHash: null, current: null, simple: null, ...compareIntakeSides(empty, empty, refused), evidence: unavailableReaderEvidence(binding, refused) };
   }
   const crm = frozenComparisonCrm(createSavIntakeHubspotReaders({ network: async (url, init) => network(url, { ...init, redirect: "error",

@@ -6,7 +6,7 @@ import {
 } from "./contract";
 import { SAV_TICKET_RETURN_NOTE_VERSION, savTicketReturnNote } from "../ticket-return-note";
 import { savEvidenceContains } from "../evidence-text";
-import { savIntakeDeclaredAccount } from "./registration-declaration";
+import { savIntakeAccountConflict, savIntakeDeclaredAccount } from "./registration-declaration";
 import {
   intakeMessageSchema, intakeContactSchema, intakeAssociationSchema, intakeTicketSchema, intakeHistorySchema,
   messageAnalysisSchema, issueAssessmentSchema, identityAssessmentSchema,
@@ -302,6 +302,9 @@ export async function planSavIntake(
     let addressOrigin: "sender" | "customer_declared_registration" = "sender";
     let address = normalizeEmail(message.fromEmail);
     const identityEvidenceIds = [current];
+    // SAV-46 R7: a current message that admits two distinct accounts is a conflict, whatever the
+    // reader declared (one of them, an earlier declaration, or none): no lookup, no sender fallback.
+    if (savIntakeAccountConflict(message.currentText, { continuation: Boolean(continuation) })) return context("contact_lookup_incomplete");
     if (analysis.registration) {
       const declaration = analysis.registration;
       const source = declaration.sourceMessageId === message.id ? message : conversation.find(m => m.id === declaration.sourceMessageId);

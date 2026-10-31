@@ -138,12 +138,27 @@ function occurrenceVerdict(text: string, occurrences: Occurrence[], target: Occu
   return { statement, account: !retracted && !NEGATION.test(clause) && !vetoed(clause) };
 }
 
-/** True only when the address is written in the source and every one of its occurrences either
- * proves the account role or says nothing about it, with at least one proof. */
+/** Every distinct address of one source that proves the account role on its own: written, every
+ * occurrence either proving it or saying nothing about it, with at least one proof (R1–R6). */
+function admittedAccounts(sourceText: string, continuation: boolean): string[] {
+  const occurrences = intakeWrittenAddresses(sourceText);
+  return [...new Set(occurrences.map(o => o.address))].filter(address => {
+    const verdicts = occurrences.filter(o => o.address === address).map(o => occurrenceVerdict(sourceText, occurrences, o, continuation));
+    return verdicts.some(v => v.account) && verdicts.every(v => v.account || !v.statement);
+  });
+}
+
+/** R7: one source that still admits two distinct accounts is a conflict, never a choice: neither
+ * proves the role, whichever the reader picked. A retraction that leaves one account (R3–R6), a
+ * resource, a third party or a denied address is no second account. */
+export function savIntakeAccountConflict(sourceText: string, options: { continuation: boolean }): boolean {
+  return admittedAccounts(sourceText, options.continuation).length > 1;
+}
+
+/** True only when the address is the single account its source admits. */
 export function savIntakeDeclaredAccount(sourceText: string, address: string, options: { continuation: boolean }): boolean {
-  const normalized = address.trim().toLowerCase(), occurrences = intakeWrittenAddresses(sourceText);
-  const verdicts = occurrences.filter(o => o.address === normalized).map(o => occurrenceVerdict(sourceText, occurrences, o, options.continuation));
-  return verdicts.some(v => v.account) && verdicts.every(v => v.account || !v.statement);
+  const admitted = admittedAccounts(sourceText, options.continuation);
+  return admitted.length === 1 && admitted[0] === address.trim().toLowerCase();
 }
 
 /** An unproven optional declaration may be discarded (identity then falls back to the sender)
@@ -164,12 +179,21 @@ export const SAV_INTAKE_DECLARED_ADDRESS_CAP = 2;
 /** Every address other than the sender's that the engine could accept as a declared registration
  * for this input: the current message (with the continuation rule when one is supplied) and the
  * sender's earlier complete inbound messages. A superset of what the engine may look up. */
-export function savIntakeDeclaredAddressCandidates(input: Pick<EngineInput, "message" | "conversation" | "identificationContinuation">): string[] {
-  const sender = input.message.fromEmail.trim().toLowerCase(), found = new Set<string>();
+type CandidateInput = Pick<EngineInput, "message" | "conversation" | "identificationContinuation">;
+function candidateSources(input: CandidateInput): [string, boolean][] {
+  const sender = input.message.fromEmail.trim().toLowerCase();
   const prior = input.conversation.status === "complete" ? input.conversation.data.filter(m => m.direction === "inbound" && m.contentComplete
     && m.fromEmail.trim().toLowerCase() === sender) : [];
-  const sources: [string, boolean][] = [[input.message.currentText, Boolean(input.identificationContinuation)], ...prior.map(m => [m.currentText, false] as [string, boolean])];
-  for (const [text, continuation] of sources) for (const { address } of intakeWrittenAddresses(text))
+  return [[input.message.currentText, Boolean(input.identificationContinuation)], ...prior.map(m => [m.currentText, false] as [string, boolean])];
+}
+/** R7: a source of this input admits two distinct accounts; the comparison refuses it before any
+ * paid call. Distinct sources (an earlier message and the current one) are not a conflict. */
+export function savIntakeDeclaredAddressConflict(input: CandidateInput): boolean {
+  return candidateSources(input).some(([text, continuation]) => savIntakeAccountConflict(text, { continuation }));
+}
+export function savIntakeDeclaredAddressCandidates(input: CandidateInput): string[] {
+  const sender = input.message.fromEmail.trim().toLowerCase(), found = new Set<string>();
+  for (const [text, continuation] of candidateSources(input)) for (const { address } of intakeWrittenAddresses(text))
     if (address !== sender && z.email().safeParse(address).success && savIntakeDeclaredAccount(text, address, { continuation })) found.add(address);
   return [...found].sort();
 }

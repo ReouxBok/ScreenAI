@@ -649,8 +649,16 @@ describe("SAV-46 R2 declared account capture", () => {
         ticketSummary: { title: "Connexion de la boîte Outlook", description: "SYN connexion.", requestIds: ["r1"] }, registration: { address, sourceMessageId: data.message.id, quoteId: quote } });
     };
   }
-  async function campaign(text: string, address: string, byEmail: Record<string, { id: string; emails: string[] }[]>) {
-    const m = await stored(text), e = env(mailboxId, [m.id]), p = provider(), { spy, reads } = declaredDossier(byEmail), first = { value: null as number | null };
+  /** The current message plus the same sender's earlier inbound messages in its thread. */
+  async function storedWithHistory(prior: string[], text: string) {
+    const m = await stored(text);
+    for (const [i, earlier] of prior.entries()) await f.db.insert(savMessages).values({ mailboxId, threadId: m.threadId, direction: "inbound", fromEmail: "client@example.invalid",
+      toEmails: ["support@example.invalid"], subject: "Synchronisation agenda", gmailMessageId: randomUUID(), bodyCiphertext: encryptSavPayload({ text: earlier, attachments: [], headers: {} }),
+      receivedAt: new Date(Date.now() - 2 * 86_400_000 + i * 1000), createdAt: new Date(Date.now() - 2 * 86_400_000 + i * 1000), analysisStatus: "intake_observed" });
+    return m;
+  }
+  async function campaign(text: string, address: string, byEmail: Record<string, { id: string; emails: string[] }[]>, prior: string[] = []) {
+    const m = prior.length ? await storedWithHistory(prior, text) : await stored(text), e = env(mailboxId, [m.id]), p = provider(), { spy, reads } = declaredDossier(byEmail), first = { value: null as number | null };
     try {
       await runSavIntakeComparisonBatch({ env: () => e, network: declaredNetwork(p, address, first, reads), limit: 1 });
       const report = await readSavIntakeComparisonReport(() => e); if (!report.configured) throw Error("TEST_CONFIG");
@@ -682,10 +690,17 @@ describe("SAV-46 R2 declared account capture", () => {
       expect(side).toMatchObject({ disposition: "collect_context", contactId: null, reasons: ["private_resource_unavailable"] });
     expect(r.reads.some(x => x.includes("resource@connector.test") || x.endsWith(":555"))).toBe(false);
   }, 30_000);
-  it("more admissible declared addresses than the cap are refused before any CRM read or paid call", async () => {
-    const r = await campaign("Mon compte Limova est a1@customer.test. Mon compte Limova est a2@customer.test. Mon compte Limova est a3@customer.test.", "a1@customer.test", {});
+  it("more admissible declared addresses than the cap, across distinct messages, are refused before any CRM read or paid call", async () => {
+    const r = await campaign("Mon compte Limova est a3@customer.test.", "a3@customer.test", {}, ["Mon compte Limova est a1@customer.test.", "Mon compte Limova est a2@customer.test."]);
     expect(r.row.verdict).toBe("non_comparable");
     expect(r.row.detail.coverage).toEqual(["declared_address_cap_exceeded"]);
+    expect(r.p.seen).toEqual([]); expect(r.reads).toEqual([]);
+    expect((await ledger()).filter(x => x.technicalMetadata.event === "reserved")).toEqual([]);
+  }, 30_000);
+  it("R7: two accounts declared in the current message are refused as ambiguous before any CRM read or paid call", async () => {
+    const r = await campaign("Mon compte Limova est a1@customer.test. Mon compte Limova est a2@customer.test.", "a1@customer.test", {});
+    expect(r.row.verdict).toBe("non_comparable");
+    expect(r.row.detail.coverage).toEqual(["declared_address_ambiguous"]);
     expect(r.p.seen).toEqual([]); expect(r.reads).toEqual([]);
     expect((await ledger()).filter(x => x.technicalMetadata.event === "reserved")).toEqual([]);
   }, 30_000);

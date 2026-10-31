@@ -2,7 +2,7 @@
  * comparison capture. Synthetic addresses only. */
 import { describe, expect, it } from "vitest";
 import type { EngineInput } from "./engine-types";
-import { intakeRegistrationDiscardable, SAV_INTAKE_DECLARED_ADDRESS_CAP, savIntakeDeclaredAccount, savIntakeDeclaredAddressCandidates } from "./registration-declaration";
+import { intakeRegistrationDiscardable, SAV_INTAKE_DECLARED_ADDRESS_CAP, savIntakeAccountConflict, savIntakeDeclaredAccount, savIntakeDeclaredAddressCandidates, savIntakeDeclaredAddressConflict } from "./registration-declaration";
 
 const account = (text: string, address: string, continuation = false) => savIntakeDeclaredAccount(text, address, { continuation });
 
@@ -78,6 +78,28 @@ describe("declared account role", () => {
     expect(account("Ce n'est pas account@customer.test", "account@customer.test", true)).toBe(false);
     expect(account("Connectez account@customer.test à Outlook", "account@customer.test", true)).toBe(false);
     expect(account("Voici l'adresse : account@customer.test, mais ce n'est pas mon compte.", "account@customer.test", true)).toBe(false);
+    expect(account("Voici l'adresse : account@customer.test ou resource@connector.test", "account@customer.test", true)).toBe(false);
+    expect(account("Voici l'adresse : account@customer.test ou resource@connector.test", "resource@connector.test", true)).toBe(false);
+  });
+  it.each([
+    ["Mon compte Limova est resource@connector.test. Mon compte Limova est account@customer.test.", false],
+    ["My Limova account is resource@connector.test. My Limova account is account@customer.test.", false],
+    ["Mon compte Limova est resource@connector.test. Correction, pour être précis, merci d'utiliser account@customer.test : c'est mon compte Limova.", false],
+  ])("R7: one source admitting two distinct accounts is a conflict; neither proves the role: %s", (text, continuation) => {
+    expect(savIntakeAccountConflict(text, { continuation })).toBe(true);
+    expect(account(text, "resource@connector.test", continuation)).toBe(false);
+    expect(account(text, "account@customer.test", continuation)).toBe(false);
+    expect(intakeRegistrationDiscardable(text, "sender@example.test", false)).toBe(false);
+  });
+  it.each([
+    "Mon compte Limova est account@customer.test et je veux connecter mailbox@connector.test à Outlook.",
+    "Mon compte Limova est account@customer.test et resource@connector.test n'est pas mon compte.",
+    "Mon compte Limova est resource@connector.test. Correction : account@customer.test est mon compte Limova.",
+    "Mon compte est resource@connector.test. Pardon, mon compte est account@customer.test.",
+    "Mon compte est account@customer.test. Mon compte est ACCOUNT@customer.test.",
+  ])("R7 witness: one admitted account is no conflict and keeps proving it: %s", text => {
+    expect(savIntakeAccountConflict(text, { continuation: false })).toBe(false);
+    expect(account(text, "account@customer.test")).toBe(true);
   });
   it("an unproven declaration is discardable only when no other written address carries an account statement", () => {
     expect(intakeRegistrationDiscardable("Comment connecter resource@connector.test à Outlook ?", "sender@example.test", false)).toBe(true);
@@ -95,8 +117,13 @@ describe("comparison capture candidates", () => {
       currentText: text, contentComplete: true, direction: "inbound", receivedAt: "2026-10-31T10:00:00.000Z" },
     conversation: { status: "complete", data: [], observedAt: "2026-10-31T10:00:00.000Z" }, ...over });
   it("keeps only admissible declared addresses, normalized, sorted, without the sender", () => {
-    expect(savIntakeDeclaredAddressCandidates(input("Mon compte Limova est Account@Customer.test et je veux connecter mailbox@connector.test à Outlook. Mon compte est sender@example.test")))
+    expect(savIntakeDeclaredAddressCandidates(input("Mon compte Limova est Account@Customer.test et je veux connecter mailbox@connector.test à Outlook.")))
       .toEqual(["account@customer.test"]);
+    expect(savIntakeDeclaredAddressCandidates(input("Mon compte est sender@example.test"))).toEqual([]);
+    // R7: the sender's own address stated as the account is a second account, hence a conflict.
+    const withSender = input("Mon compte Limova est Account@Customer.test et je veux connecter mailbox@connector.test à Outlook. Mon compte est sender@example.test");
+    expect(savIntakeDeclaredAddressConflict(withSender)).toBe(true);
+    expect(savIntakeDeclaredAddressCandidates(withSender)).toEqual([]);
     expect(savIntakeDeclaredAddressCandidates(input("Comment connecter resource@connector.test à Outlook ?"))).toEqual([]);
   });
   it("covers the sender's earlier inbound declaration and the continuation reply, never another author's", () => {
@@ -107,8 +134,22 @@ describe("comparison capture candidates", () => {
     expect(savIntakeDeclaredAddressCandidates(input("Voici : reply@customer.test", { identificationContinuation: { initialMessageId: "x", confirmedEffectId: "y" } }))).toEqual(["reply@customer.test"]);
     expect(savIntakeDeclaredAddressCandidates(input("Voici : reply@customer.test"))).toEqual([]);
   });
-  it("the cap is explicit and counted on distinct addresses", () => {
+  it("the cap is explicit and counted on distinct addresses across distinct sources", () => {
     expect(SAV_INTAKE_DECLARED_ADDRESS_CAP).toBe(2);
-    expect(savIntakeDeclaredAddressCandidates(input("Mon compte est a@customer.test. Mon compte est A@customer.test. Mon compte est b@customer.test. Mon compte est c@customer.test."))).toEqual(["a@customer.test", "b@customer.test", "c@customer.test"]);
+    const earlier = (id: string, text: string) => ({ ...input("").message, id, currentText: text });
+    const history = { conversation: { status: "complete" as const, data: [earlier("10000000-0000-4000-8000-000000000003", "Mon compte est b@customer.test"),
+      earlier("10000000-0000-4000-8000-000000000004", "Mon compte est c@customer.test")], observedAt: "x" } };
+    const many = input("Mon compte est a@customer.test. Mon compte est A@customer.test.", history);
+    expect(savIntakeDeclaredAddressCandidates(many)).toEqual(["a@customer.test", "b@customer.test", "c@customer.test"]);
+    expect(savIntakeDeclaredAddressConflict(many)).toBe(false);
+  });
+  it("R7: two accounts in the current message are a conflict for the capture and no candidate; distinct sources are not", () => {
+    const both = input("Mon compte Limova est a@customer.test. Mon compte Limova est b@customer.test.");
+    expect(savIntakeDeclaredAddressConflict(both)).toBe(true);
+    expect(savIntakeDeclaredAddressCandidates(both)).toEqual([]);
+    const prior = { ...input("").message, id: "10000000-0000-4000-8000-000000000002", currentText: "Mon compte Limova est a@customer.test" };
+    const split = input("Mon compte Limova est b@customer.test.", { conversation: { status: "complete", data: [prior], observedAt: "x" } });
+    expect(savIntakeDeclaredAddressConflict(split)).toBe(false);
+    expect(savIntakeDeclaredAddressCandidates(split)).toEqual(["a@customer.test", "b@customer.test"]);
   });
 });
