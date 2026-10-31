@@ -60,8 +60,16 @@ const MISTAKE = `je me suis tromp\\p{L}*|je me trompe|erreur de ma part|au(?:tan
 const MISTAKE_ON_ADDRESS = new RegExp(word(`(?:${MISTAKE})\\s*(?:d'|de |dans l'|dans le |sur l'|sur le |in the |on the |with the )(?:adresse|compte|e-?mail|mail|address|account|identifiant)`), "u");
 const MISTAKE_BEFORE_ADDRESS = new RegExp(word(MISTAKE), "u");
 const REPLACEMENT = new RegExp(word("voici la bonne|la bonne(?: adresse| e-?mail)?(?: est| c'est)|c'est plut[ôo]t|the (?:correct|right) (?:one|address|email|e-mail|account)(?: is)?|it should be|it's actually"), "u");
-const corrects = (part: { text: string; stopped: boolean }) =>
-  MISTAKE_ON_ADDRESS.test(part.text) || (part.stopped && (MISTAKE_BEFORE_ADDRESS.test(part.text) || REPLACEMENT.test(part.text)));
+/** R6: an explicit replacement written right before the next address ("Correction : Y …",
+ * "Utilisez plutôt Y", "…, ou plutôt Y", "Use Y instead"). "Correction : le calendrier B …" does
+ * not reach the address directly and replaces nothing. */
+const REPLACES_NEXT = new RegExp(`${word("correction|rectification|erratum|plut[ôo]t|rather|à la place|instead")}[\\s:,-]*$`, "u");
+const USE_NEXT = new RegExp(`${word("utilisez|utiliser|use|prenez|take")}\\s+$`, "u");
+const INSTEAD = new RegExp(`^\\s*${word("instead|à la place|plut[ôo]t|rather")}`, "u");
+type Part = { text: string; stopped: boolean; after: string };
+const corrects = (part: Part) =>
+  MISTAKE_ON_ADDRESS.test(part.text) || (part.stopped && (MISTAKE_BEFORE_ADDRESS.test(part.text) || REPLACEMENT.test(part.text)
+    || REPLACES_NEXT.test(part.text) || (USE_NEXT.test(part.text) && INSTEAD.test(part.after))));
 const WRONG_HERE = new RegExp(word("wrong (?:account|email|e-mail|address)|not the right (?:account|email|e-mail|address)|pas (?:le bon (?:compte|e-?mail|mail)|la bonne adresse)|mauvaise? (?:compte|adresse|e-?mail|mail)"), "u");
 const QUOTED_LINE = /^\s*>/u;
 const SIGNOFF = /^\s*(?:--|—|cordialement|bien cordialement|tr[eè]s cordialement|bien [àa] vous|salutations(?: distingu[ée]es)?|best regards|kind regards|regards|best|sincerely|cheers|merci d'avance|merci par avance|bonne journ[ée]e)[\s,.!]*$/u;
@@ -107,12 +115,14 @@ function occurrenceVerdict(text: string, occurrences: Occurrence[], target: Occu
   const vetoed = (clause: string) => CONTEXT_VETO.test(clause) || CONNECT.test(clause);
   // Retraction of this declaration (see REFERS_BACK), never past the next written address, so
   // another, unretracted account keeps its own statement.
-  const cut = (part: string) => part.includes("\u0001") ? { text: part.slice(0, part.indexOf("\u0001")), stopped: true } : { text: part, stopped: false };
+  const cut = (part: string): Part => part.includes("\u0001")
+    ? { text: part.slice(0, part.indexOf("\u0001")), stopped: true, after: part.slice(part.indexOf("\u0001")).replace(/^\u0001+/u, "") }
+    : { text: part, stopped: false, after: "" };
   const sentenceEnd = ends.length ? Math.min(...ends) : masked.length;
   const here = cut(fold(masked.slice(target.end, sentenceEnd)));
   const following = masked.slice(sentenceEnd).replace(/^[\s.!?;]+/u, "");
   const nextEnds = [".", "!", "?", ";", "\n"].map(b => following.indexOf(b)).filter(i => i >= 0);
-  const next = here.stopped ? { text: "", stopped: false } : cut(fold(following.slice(0, nextEnds.length ? Math.min(...nextEnds) : following.length)));
+  const next = here.stopped ? { text: "", stopped: false, after: "" } : cut(fold(following.slice(0, nextEnds.length ? Math.min(...nextEnds) : following.length)));
   const retracted = CORRECTION.test(here.text) || REFERS_BACK.test(here.text) || WRONG_HERE.test(here.text) || corrects(here)
     || CORRECTION.test(next.text) || REFERS_BACK.test(next.text) || corrects(next);
   for (const marker of markers) {

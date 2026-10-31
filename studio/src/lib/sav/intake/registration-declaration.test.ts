@@ -27,6 +27,9 @@ describe("declared account role", () => {
     ["Mon compte Limova est account@customer.test. Erreur 500 sur la page des factures.", "account@customer.test"],
     ["My Limova account is account@customer.test. My mistake was to share the calendar.", "account@customer.test"],
     ["Mon compte est resource@connector.test. Pardon, mon compte est account@customer.test.", "account@customer.test"],
+    ["Mon compte Limova est resource@connector.test. Correction : account@customer.test est mon compte Limova.", "account@customer.test"],
+    ["Mon compte Limova est account@customer.test. Correction : le calendrier calendar@resource.test doit être connecté.", "account@customer.test"],
+    ["My Limova account is account@customer.test. Use mailbox@connector.test for the calendar sync.", "account@customer.test"],
   ])("proves: %s", (text, address) => expect(account(text, address)).toBe(true));
   it.each([
     ["Bonjour, comment connecter resource@connector.test à Outlook pour retrouver mes factures ?", "resource@connector.test"],
@@ -60,6 +63,13 @@ describe("declared account role", () => {
     ["Mon compte Limova est resource@connector.test. La bonne adresse est account@customer.test.", "resource@connector.test"],
     ["My Limova account is resource@connector.test. I mistyped it: account@customer.test.", "resource@connector.test"],
     ["Mon compte Limova est resource@connector.test. Je me suis trompé, voici la bonne : account@customer.test.", "account@customer.test"],
+    ["Mon compte Limova est resource@connector.test. Correction : account@customer.test est mon compte Limova.", "resource@connector.test"],
+    ["My Limova account is resource@connector.test. Correction: account@customer.test is my Limova account.", "resource@connector.test"],
+    ["Mon compte Limova est resource@connector.test. Utilisez plutôt account@customer.test.", "resource@connector.test"],
+    ["My Limova account is resource@connector.test. Use account@customer.test instead.", "resource@connector.test"],
+    ["Mon compte Limova est resource@connector.test, ou plutôt account@customer.test.", "resource@connector.test"],
+    ["Mon compte Limova est account@customer.test. Correction : le calendrier calendar@resource.test doit être connecté.", "calendar@resource.test"],
+    ["Mon compte Limova est resource@connector.test. Utilisez plutôt account@customer.test.", "account@customer.test"],
   ])("does not prove: %s", (text, address) => expect(account(text, address)).toBe(false));
   it("a server-verified continuation reply proves the address without an account statement, never when negated or a resource", () => {
     expect(account("Voici l'adresse : account@customer.test", "account@customer.test", true)).toBe(true);

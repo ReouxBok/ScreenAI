@@ -83,6 +83,9 @@ describe.each<Reader>(["current", "simple"])("R1 %s reader: a written address is
     ["corrected to a colleague's account", "Mon compte Limova est resource@connector.test, non c'est le compte de mon collègue.", "resource@connector.test"],
     ["corrected to another address (FR)", "Mon compte Limova est resource@connector.test. Je me suis trompé, voici la bonne : account@customer.test.", "resource@connector.test"],
     ["corrected to another address (EN)", "My Limova account is resource@connector.test. My mistake, the correct one is account@customer.test.", "resource@connector.test"],
+    ["replaced by an explicit correction (FR)", "Mon compte Limova est resource@connector.test. Correction : account@customer.test est mon compte Limova.", "resource@connector.test"],
+    ["replaced by another address (EN)", "My Limova account is resource@connector.test. Use account@customer.test instead.", "resource@connector.test"],
+    ["the replacing address has no account statement of its own", "Mon compte Limova est resource@connector.test. Utilisez plutôt account@customer.test.", "account@customer.test"],
     ["the corrected address has no account statement of its own", "Mon compte Limova est resource@connector.test. Je me suis trompé, voici la bonne : account@customer.test.", "account@customer.test"],
   ])("%s: the address is never looked up as the account and no ticket lands on it", async (_, text, declared) => {
     const b = bench(reader, text, [RESOURCE_CONTACT, MAILBOX_CONTACT]);
@@ -110,6 +113,7 @@ describe.each<Reader>(["current", "simple"])("R1 %s reader: a written address is
     "Mon compte Limova est account@customer.test, je ne connais pas mon identifiant.",
     "Mon compte Limova est account@customer.test. Je me suis trompé dans la configuration du calendrier.",
     "Mon compte Limova est account@customer.test. Erreur 500 sur la page des factures.",
+    "Mon compte Limova est account@customer.test. Correction : le calendrier mailbox@connector.test doit être connecté.",
   ])("an independent later statement keeps the stated account: %s", async text => {
     const b = bench(reader, text, [ACCOUNT_CONTACT]);
     expect(ticketOn(await b.run("account@customer.test"))).toBe("301");
@@ -178,6 +182,16 @@ describe("R1 engine: the declared address must carry its account role", () => {
     expect(e.calls).toEqual([]);
     const unrelated = "Mon compte Limova est account@customer.test. Je me suis trompé dans la configuration du calendrier.";
     expect(ticketOn(await engine(unrelated, { address: "account@customer.test", sourceMessageId: mid, quote: unrelated }, [ACCOUNT_CONTACT]).run())).toBe("301");
+  });
+  it("an address explicitly replaced fails closed before any lookup; the replacing account with its own statement is used", async () => {
+    const replaced = "Mon compte Limova est resource@connector.test. Utilisez plutôt account@customer.test.";
+    const e = engine(replaced, { address: "resource@connector.test", sourceMessageId: mid, quote: replaced }, [RESOURCE_CONTACT, ACCOUNT_CONTACT]);
+    expect((await e.run()).decision.disposition).toMatchObject({ kind: "collect_context", reasons: expect.arrayContaining(["contact_lookup_incomplete"]) });
+    expect(e.calls).toEqual([]);
+    const restated = "Mon compte Limova est resource@connector.test. Correction : account@customer.test est mon compte Limova.";
+    const r = engine(restated, { address: "account@customer.test", sourceMessageId: mid, quote: restated }, [RESOURCE_CONTACT, ACCOUNT_CONTACT]);
+    expect(ticketOn(await r.run())).toBe("301");
+    expect(r.calls).not.toContain("lookup:resource@connector.test");
   });
   it("a negated continuation reply is not a current declaration", async () => {
     const text = "Ce n'est pas account@customer.test";
