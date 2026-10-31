@@ -19,11 +19,12 @@ const binding = { campaignId, messageId: mid, claimId };
 const sha = (text: string) => createHash("sha256").update(text).digest("hex");
 const ticketRead = (ownerId: string | null | undefined): FrozenCrmEntry => ({ key: "tickets:101", outcome: "resolved", status: "complete", observedAt: at,
   data: [{ id: "201", contactIds: ["101"], stage: "open", subject: "SYN agenda", content: "SYN", ...(ownerId === undefined ? {} : { ownerId }) }] });
-const crm = (ownerId: string | null | undefined = "777"): FrozenCrmEntry[] => [
+// No default parameter: crm(undefined) must mean "owner property absent", not "777".
+const crm = (...owner: [ownerId?: string | null]): FrozenCrmEntry[] => { const ownerId = owner.length ? owner[0] : "777"; return [
   { key: "contacts:syn@example.test", outcome: "resolved", status: "complete", observedAt: at, data: [{ id: "101", emails: ["syn@example.test"] }] },
   { key: "history:201", outcome: "resolved", status: "complete", observedAt: at, data: [{ id: "n1", kind: "note", text: "SYN historique", at }] },
   ticketRead(ownerId),
-];
+]; };
 const engineInput: EngineInput = { message: { id: mid, threadId: thread, receivedAt: at, fromEmail: "syn@example.test", toEmails: ["support@example.test"], direction: "inbound",
   currentText: "SYN agenda en panne. SYN export en échec.", contentComplete: true }, latestInboundMessageId: mid, now: at, mode: "current", identificationAttemptId: mid,
   conversation: { status: "complete", data: [], observedAt: at } };
@@ -77,9 +78,9 @@ describe("receipt keeps what the summary projection loses", () => {
   it("a created ticket's description is the stored original mail (SAV-72), kept apart from the planner intent", () => {
     const p: IntakePlan = { ...plan("SYN"), noteText: null, steps: [{ id: "c", mutation: "create_ticket", ticketId: null, requiresPermission: "create_ticket", status: "not_dispatched" }],
       newTicket: { contactId: "101", title: "SYN titre", description: "SYN résumé du planificateur", requestIds: ["r1"], pipeline: "support", stage: "new", source: "email", owner: "leave_unassigned" } };
-    const created = intakeMutationExpectations(p, crm(), planner => `Objet : SYN\n\nSYN mail original (${planner.length})`).items[0] as Record<string, { origin: string; text: string }>;
-    expect(created.description).toMatchObject({ origin: "stored_original_mail_sav72", text: expect.stringContaining("SYN mail original") });
-    expect(created.plannerDescription).toEqual({ origin: "plan_intent_not_sent", text: "SYN résumé du planificateur" });
+    const created = intakeMutationExpectations(p, crm(), planner => `Objet : SYN\n\nSYN mail original (${planner.length})`).items[0];
+    expect(created).toMatchObject({ description: { origin: "stored_original_mail_sav72", text: expect.stringContaining("SYN mail original") } });
+    expect(created).toHaveProperty("plannerDescription", { origin: "plan_intent_not_sent", text: "SYN résumé du planificateur" });
     expect(intakeMutationExpectations(p, crm(), fromMail).nature).toBe("derived_intentions_not_executed_payloads");
   });
   it("a semantic answer the engine consumed without its accepted pre-loss copy is incomplete, never complete", () => {

@@ -15,7 +15,9 @@ it("renders the receipt as escaped text, with no customer, ticket or mailbox act
   m.evidence.mockResolvedValue(detail());
   const html = await render();
   expect(m.evidence).toHaveBeenCalledWith(mid);
-  expect(html).not.toContain("<script>"); expect(html).toContain("&lt;script&gt;");
+  // React appends its own form-replay <script> to any action form; the mail's markup must stay text.
+  expect(html).not.toContain("<script>alert(1)"); expect(html).toContain("&lt;script&gt;alert(1)&lt;/script&gt;");
+  expect(html.match(/<script>/g) ?? []).toHaveLength(html.includes("$$reactFormReplay") ? 1 : 0);
   expect(html).not.toContain('href="https://example.invalid/x"');
   expect(html).toContain(sha); expect(html).toContain("ce n’est pas un jugement métier");
   // The only form records an attestation; nothing sends, replies, creates or assigns.
