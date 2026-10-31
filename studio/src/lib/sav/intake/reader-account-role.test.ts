@@ -101,6 +101,15 @@ describe.each<Reader>(["current", "simple"])("R1 %s reader: a written address is
     expect(ticketOn(plan)).toBe("301");
     expect(plan.decision.disposition).toMatchObject({ identity: { addressOrigin: "customer_declared_registration", scope: "intake_only" } });
   });
+  it.each([
+    "Mon compte Limova est account@customer.test. Je ne connais pas mon identifiant.",
+    "Mon compte Limova est account@customer.test. Mon collègue a un problème sur son compte.",
+    "Mon compte Limova est account@customer.test, je ne connais pas mon identifiant.",
+  ])("an independent later statement keeps the stated account: %s", async text => {
+    const b = bench(reader, text, [ACCOUNT_CONTACT]);
+    expect(ticketOn(await b.run("account@customer.test"))).toBe("301");
+    expect(b.crmCalls).toContain("lookup:account@customer.test");
+  });
   it("account and resource in the same sentence: the stated account is used, never the resource by neighbourhood", async () => {
     const text = "Mon compte Limova est account@customer.test et je veux connecter mailbox@connector.test à Outlook.";
     const good = bench(reader, text, [ACCOUNT_CONTACT, MAILBOX_CONTACT]);

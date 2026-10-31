@@ -40,14 +40,19 @@ const CONTEXT_VETO = new RegExp(word([
 ].join("|")), "u");
 /** Connecting something is a resource; logging oneself in ("me connecter") is not. */
 const CONNECT = /(?<![\p{L}\d])(?<!(?:me|se|nous|vous|m'|s')\s?)connect\p{L}*/u;
-/** A later correction bound to this address: an interjection right after it ("…, non pardon"),
- * a wrong/someone else's account, or a negated account statement ("mais ce n'est pas mon compte"). */
+/** R3/R4: a retraction of THIS declaration only, read in the rest of its sentence (up to the next
+ * written address) or in the sentence right after it: an interjection opening it ("…, non",
+ * "Sorry, …"), or a statement that refers back to the address ("ce n'est pas mon compte",
+ * "this is not my account", "c'est le compte de mon collègue"). An independent later statement
+ * ("Je ne connais pas mon identifiant", "mon collègue a un problème sur son compte") is not one. */
 const CORRECTION = /^[\s,;:.!?-]*(?:non|no|nope|pardon|oups|sorry)(?![\p{L}\d])/u;
-const OTHER_ACCOUNT = new RegExp(word([
-  "(?:le |un )?compte (?:de|d'un|d'une|du) \\p{L}+", "son compte", "leur compte", "someone else's account", "(?:his|her|their) account", "\\p{L}+'s account",
-  "wrong (?:account|email|e-mail|address)", "not the right (?:account|email|e-mail|address)",
-  "pas (?:le bon (?:compte|e-?mail|mail)|la bonne adresse)", "mauvaise? (?:compte|adresse|e-?mail|mail)",
+const OWNED = `(?:${MARKER.source}|le bon|la bonne|[àa] moi|(?:le |l')(?:compte|adresse|e-?mail|mail) (?:de|d'un|d'une|du) \\p{L}+|the right (?:account|email|e-mail|address)|mine|(?:my |his |her |their )?\\p{L}+'s (?:account|email|e-mail|address)|(?:his|her|their|someone else's) (?:account|email|e-mail|address))`;
+const REFERS_BACK = new RegExp(word([
+  `(?:ce|c'|cela|ça|ca|elle|cette adresse|cet e-?mail|ce mail)\\s*(?:n'|ne\\s+)?(?:est|était|sera)\\s+(?:(?:pas|plus|jamais)\\s+(?:\\S+\\s+){0,2}?${OWNED}|(?:le |l')(?:compte|adresse|e-?mail|mail) (?:de|d'un|d'une|du) \\p{L}+)`,
+  `(?:this|that|it|this address|this email|that address)\\s*(?:is|'s|was)\\s+(?:(?:not|no longer|never)\\s+(?:\\S+\\s+){0,2}?${OWNED}|(?:my |his |her |their )?\\p{L}+'s (?:account|email|e-mail|address)|(?:his|her|their|someone else's) (?:account|email|e-mail|address))`,
+  `(?:this|that|it)\\s*(?:isn't|wasn't)\\s+(?:\\S+\\s+){0,2}?${OWNED}`,
 ].join("|")), "u");
+const WRONG_HERE = new RegExp(word("wrong (?:account|email|e-mail|address)|not the right (?:account|email|e-mail|address)|pas (?:le bon (?:compte|e-?mail|mail)|la bonne adresse)|mauvaise? (?:compte|adresse|e-?mail|mail)"), "u");
 const QUOTED_LINE = /^\s*>/u;
 const SIGNOFF = /^\s*(?:--|—|cordialement|bien cordialement|tr[eè]s cordialement|bien [àa] vous|salutations(?: distingu[ée]es)?|best regards|kind regards|regards|best|sincerely|cheers|merci d'avance|merci par avance|bonne journ[ée]e)[\s,.!]*$/u;
 const REPLY_HEADER = /^\s*(?:le .{1,160}a [ée]crit\s*:|on .{1,160}wrote\s*:|-{2,}\s*(?:original message|message d'origine|message transf[ée]r[ée])|de\s*:|from\s*:|envoy[ée]\s*:|sent\s*:)/u;
@@ -90,11 +95,15 @@ function occurrenceVerdict(text: string, occurrences: Occurrence[], target: Occu
   // Vetoes bear on the clause that links the statement to this address, not on the whole
   // sentence: "mon compte Limova est A et je veux connecter B à Outlook" proves A, never B.
   const vetoed = (clause: string) => CONTEXT_VETO.test(clause) || CONNECT.test(clause);
-  // A retraction after the address, up to the next written address (so another, unretracted
-  // account keeps its own statement): "Mon compte Limova est A, mais ce n'est pas mon compte."
-  const rest = fold(masked.slice(target.end)), tail = rest.slice(0, rest.includes("\u0001") ? rest.indexOf("\u0001") : rest.length);
-  const retracted = CORRECTION.test(tail) || OTHER_ACCOUNT.test(tail)
-    || [...tail.matchAll(MARKER)].some(marker => NEGATED_STATEMENT.test(tail.slice(0, marker.index)));
+  // Retraction of this declaration (see REFERS_BACK), never past the next written address, so
+  // another, unretracted account keeps its own statement.
+  const cut = (part: string) => part.includes("\u0001") ? { text: part.slice(0, part.indexOf("\u0001")), stopped: true } : { text: part, stopped: false };
+  const sentenceEnd = ends.length ? Math.min(...ends) : masked.length;
+  const here = cut(fold(masked.slice(target.end, sentenceEnd)));
+  const following = masked.slice(sentenceEnd).replace(/^[\s.!?;]+/u, "");
+  const nextEnds = [".", "!", "?", ";", "\n"].map(b => following.indexOf(b)).filter(i => i >= 0);
+  const next = here.stopped ? "" : cut(fold(following.slice(0, nextEnds.length ? Math.min(...nextEnds) : following.length))).text;
+  const retracted = CORRECTION.test(here.text) || REFERS_BACK.test(here.text) || WRONG_HERE.test(here.text) || CORRECTION.test(next) || REFERS_BACK.test(next);
   for (const marker of markers) {
     const start = marker.index, end = start + marker[0].length;
     if (!(end <= at ? linked(sentence.slice(end, at)) : start >= after && linked(sentence.slice(after, start)))) continue;

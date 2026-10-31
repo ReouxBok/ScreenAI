@@ -20,6 +20,9 @@ describe("declared account role", () => {
     ["Mon compte Limova est account@customer.test et resource@connector.test n'est pas mon compte.", "account@customer.test"],
     ["Mon compte Limova est account@customer.test, je n'arrive pas à me connecter.", "account@customer.test"],
     ["My Limova account is account@customer.test. It is not working.", "account@customer.test"],
+    ["Mon compte Limova est account@customer.test, je ne connais pas mon identifiant.", "account@customer.test"],
+    ["Mon compte Limova est account@customer.test. Le problème ne vient pas de mon compte, mais de l'agent.", "account@customer.test"],
+    ["My Limova account is account@customer.test. I did not receive the wrong address warning.", "account@customer.test"],
   ])("proves: %s", (text, address) => expect(account(text, address)).toBe(true));
   it.each([
     ["Bonjour, comment connecter resource@connector.test à Outlook pour retrouver mes factures ?", "resource@connector.test"],
@@ -43,6 +46,10 @@ describe("declared account role", () => {
     ["My account is resource@connector.test, sorry, wrong address.", "resource@connector.test"],
     ["Mon compte est resource@connector.test, non pardon, account@customer.test.", "resource@connector.test"],
     ["Mon compte Limova est resource@connector.test et resource@connector.test n'est pas mon compte.", "resource@connector.test"],
+    ["Mon compte Limova est resource@connector.test. Ce n'est pas mon compte.", "resource@connector.test"],
+    ["My Limova account is resource@connector.test. Sorry, that is not my account.", "resource@connector.test"],
+    ["Mon compte Limova est resource@connector.test, c'est le compte de mon collègue.", "resource@connector.test"],
+    ["My Limova account is resource@connector.test, it's my colleague's account.", "resource@connector.test"],
   ])("does not prove: %s", (text, address) => expect(account(text, address)).toBe(false));
   it("a server-verified continuation reply proves the address without an account statement, never when negated or a resource", () => {
     expect(account("Voici l'adresse : account@customer.test", "account@customer.test", true)).toBe(true);
