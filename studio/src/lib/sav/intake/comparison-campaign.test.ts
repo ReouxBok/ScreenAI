@@ -403,3 +403,184 @@ it("reports a truncated simple response as one dispatched call with settled safe
  expect(await f.db.select().from(savIntakeModelCalls)).toEqual([]);
  expect(await f.db.select().from(savActions)).toEqual([]);
 });
+
+// ---------------------------------------------------------------------------------------------
+// SAV-46: private qualification receipts. Synthetic dossier: one contact, one open ticket owned by
+// "777", one note. Both readers link it; the receipt must keep what the summary projection loses.
+import * as cryptoModule from "../crypto";
+import { frozenComparisonCrm, readSavIntakeComparisonEvidence } from "./comparison-campaign";
+import { SAV_READER_EVIDENCE_LIMITS } from "./comparison-evidence";
+function ticketDossier(options: { historyText?: string; historyEntries?: number; tickets?: string[] } = {}) {
+  const at = new Date(Date.now() - 2 * 86400000).toISOString(), reads: string[] = [];
+  const complete = <T>(data: T) => ({ status: "complete" as const, data, observedAt: new Date().toISOString() });
+  const ids = options.tickets ?? ["201"];
+  const spy = vi.spyOn(hubspotReaders, "createSavIntakeHubspotReaders").mockReturnValue({
+    findContactsByEmail: async email => { reads.push(`contacts:${email}`); return complete([{ id: "101", emails: ["client@example.invalid"] }]); },
+    directAssociations: async id => { reads.push(`associations:${id}`); return complete([]); },
+    getContact: async id => { reads.push(`contact:${id}`); return complete({ id: "101", emails: ["client@example.invalid"] }); },
+    ticketsForContact: async id => { reads.push(`tickets:${id}`); return complete(ids.map(t => ({ id: t, contactIds: ["101"], stage: "open" as const, createdAt: at, ownerId: "777", subject: "Agenda", content: "Synchronisation impossible" }))); },
+    ticketHistory: async id => { reads.push(`history:${id}`); return complete(Array.from({ length: options.historyEntries ?? 1 }, (_, i) => ({ id: `n${id}-${i}`, at, kind: "note" as const, text: options.historyText ?? "Synchronisation de l'agenda en panne" }))); },
+  });
+  return { spy, reads };
+}
+function ticketNetwork(base: ReturnType<typeof provider>, onModel?: (simple: boolean) => void): typeof fetch {
+  return async (url, init) => {
+    if (!String(url).startsWith("https://generativelanguage.googleapis.com/")) return base.network(url, init);
+    const data = JSON.parse(JSON.parse(String(init?.body)).contents[0].parts[0].text), simple = typeof data.current === "string";
+    onModel?.(simple); base.seen.push(simple ? "simple" : "current");
+    const reply = (answer: unknown) => Response.json({ candidates: [{ finishReason: "STOP", content: { parts: [{ text: JSON.stringify(answer) }] } }], usageMetadata: { promptTokenCount: 300, candidatesTokenCount: 60, thoughtsTokenCount: 0, totalTokenCount: 360 } });
+    if (simple) return reply(encodeSimpleWireFixture({ messageId: data.message.id, nature: "request",
+      requests: [{ id: "r1", kind: "support", summary: "SYN agenda en panne", sourceIds: ["current"] }, { id: "r2", kind: "support", summary: "SYN erreur 500", sourceIds: ["current"] }],
+      identity: { kind: "unique", contactIds: ["101"], why: "SYN fiche" }, tickets: data.tickets.map((t: { ticketId: string }) => ({ ticketId: t.ticketId, relation: "same", why: "SYN même panne", sourceIds: ["current", `ticket-${t.ticketId}`, `history-${t.ticketId}`] })),
+      missing: [], rationale: "SYN support" }, data.outputReferences));
+    const quote = (sourceId: string) => data.citationCatalogue.find((x: { sourceId: string }) => x.sourceId === sourceId).id;
+    if (data.tickets) return reply({ investigationComplete: true, tickets: data.tickets.map(({ ticket }: { ticket: { id: string } }) => ({ ticketId: ticket.id, relation: "same", requestIds: ["r1"],
+      evidenceIds: ["current", `ticket-${ticket.id}`, `history-${ticket.id}`], rationale: "SYN même panne", grounding: ["current", `ticket-${ticket.id}`, `history-${ticket.id}`].map(src => ({ quoteId: quote(src) })) })) });
+    return reply({ messageId: data.message.id, requests: [{ id: "r1", kind: "support", currentMessageId: data.message.id, quoteId: quote("current") }],
+      ticketSummary: { title: "Échec de synchronisation de l'agenda", description: "Erreur 500.", requestIds: ["r1"] } });
+  };
+}
+const resultRows = async () => (await ledger()).filter(x => x.technicalMetadata.event === "result");
+
+describe("SAV-46 qualification receipts", () => {
+  it("stores one encrypted v1 receipt with the result; the list decrypts no receipt and the detail verifies it", async () => {
+    const m = await stored(), e = env(mailboxId, [m.id]), p = provider(), { spy, reads } = ticketDossier();
+    try {
+      await runSavIntakeComparisonBatch({ env: () => e, network: ticketNetwork(p), limit: 1 });
+      const [row] = await resultRows();
+      expect(typeof row.technicalMetadata.evidence).toBe("string");
+      expect(String(row.technicalMetadata.evidence)).not.toContain("SYN");
+      const decrypt = vi.spyOn(cryptoModule, "decryptSavPayload");
+      const report = await readSavIntakeComparisonReport(() => e); if (!report.configured) throw Error("TEST_CONFIG");
+      expect(decrypt.mock.calls.every(([payload]) => payload !== row.technicalMetadata.evidence)).toBe(true);
+      expect(report.rows[0]).toMatchObject({ verdict: "identical", qualificationEvidence: "complete", attestation: null, detail: { evidence: { status: "complete", stored: true, parts: { common: "complete", simple: "complete" } } } });
+      expect(report.qualificationEvidence).toMatchObject({ complete: 1, legacy: 0, attested: 0 });
+      const detail = await readSavIntakeComparisonEvidence(m.id, () => e);
+      expect(detail).toMatchObject({ qualificationEvidence: "complete", verification: { ok: true, reason: null } });
+      const receipt = detail.receipt as { sides: { simple: { plan: { noteText: string | null }; validated: { value: { requests: { summary: string }[] } }[]; mutationExpectations: { items: { mutation: string; ownerBaseline?: unknown }[] } } };
+        common: { crm: { entries: { key: string }[] }; source: { engineInput: { message: { currentText: string } } } } };
+      expect(receipt.sides.simple.validated[0].value.requests.map(r => r.summary)).toEqual(["SYN agenda en panne", "SYN erreur 500"]);
+      expect(receipt.sides.simple.mutationExpectations.items.find(i => i.mutation === "set_ticket_new")?.ownerBaseline).toMatchObject({ status: "observed", ownerId: "777" });
+      expect(receipt.common.source.engineInput.message.currentText).toContain("synchronisation de mon agenda");
+      // One capture serves both readers: every live CRM read happened once, during the capture.
+      expect(new Set(reads).size).toBe(reads.length);
+      expect(receipt.common.crm.entries.map(x => x.key)).toEqual(expect.arrayContaining(["tickets:101", "history:201"]));
+      expect(JSON.stringify(detail.receipt)).not.toMatch(/fake-model|fake-crm|Bearer|usageMetadata|thoughtsTokenCount/);
+      expect(await f.db.select().from(savActions)).toEqual([]); expect(await f.db.select().from(savIntakeExecutions)).toEqual([]); expect(await f.db.select().from(savIntakeModelCalls)).toEqual([]);
+    } finally { spy.mockRestore(); }
+  }, 30_000);
+  it("the ledger and the list never load a stored receipt, for later claims, reservations and settlements", async () => {
+    const a = await stored(), b = await stored(), e = env(mailboxId, [a.id, b.id]), p = provider(), { spy } = ticketDossier();
+    try {
+      await runSavIntakeComparisonBatch({ env: () => e, network: ticketNetwork(p), limit: 1 });
+      const sealed = String((await resultRows())[0].technicalMetadata.evidence), marker = sealed.slice(-64);
+      const query = f.client.query.bind(f.client), loaded: string[] = [];
+      const watch = vi.spyOn(f.client, "query").mockImplementation(async (...args: Parameters<typeof query>) => {
+        const result = await query(...args); if (JSON.stringify(result.rows).includes(marker)) loaded.push(String(args[0]).slice(0, 80)); return result;
+      });
+      try {
+        await runSavIntakeComparisonBatch({ env: () => e, network: ticketNetwork(p), limit: 1 });
+        await readSavIntakeComparisonReport(() => e);
+      } finally { watch.mockRestore(); }
+      expect(loaded).toEqual([]);
+      expect((await resultRows())).toHaveLength(2);
+    } finally { spy.mockRestore(); }
+  }, 30_000);
+  it("spend, uncertain reservations and claims are computed exactly as before from the projected ledger", async () => {
+    const a = await stored(), e = env(mailboxId, [a.id]), p = provider(); let sent = 0;
+    const network: typeof fetch = async (url, init) => { if (String(url).startsWith("https://generativelanguage.googleapis.com/") && sent++ === 0) throw Error("SYNTHETIC_RESPONSE_LOST"); return p.network(url, init); };
+    await runSavIntakeComparisonBatch({ env: () => e, network, limit: 1 });
+    const all = (await ledger()).map(x => x.technicalMetadata as Record<string, string | number | boolean | null>);
+    const report = await readSavIntakeComparisonReport(() => e); if (!report.configured) throw Error("TEST_CONFIG");
+    expect(report.spend.nanoUsd).toBe(savIntakeComparisonSpend(all));
+    expect(report.spend.nanoUsd).toBeGreaterThanOrEqual(817_152_000);
+    expect(await claimSavIntakeComparison("sample-60", a.id)).toBeNull();
+  });
+  it("a tampered receipt fails closed in the detail; a legacy result stays readable but not qualifiable", async () => {
+    const m = await stored(), e = env(mailboxId, [m.id]), p = provider(), { spy } = ticketDossier();
+    try {
+      await runSavIntakeComparisonBatch({ env: () => e, network: ticketNetwork(p), limit: 1 });
+      const [row] = await resultRows(), receipt = (await readSavIntakeComparisonEvidence(m.id, () => e)).receipt as { sides: { simple: { plan: { noteText: string } } } };
+      receipt.sides.simple.plan.noteText = "SYN note altérée";
+      await f.db.update(auditLogs).set({ technicalMetadata: { ...row.technicalMetadata, evidence: encryptSavPayload(receipt) } }).where(eq(auditLogs.id, row.id));
+      expect(await readSavIntakeComparisonEvidence(m.id, () => e)).toMatchObject({ qualificationEvidence: "invalid", receipt: null, verification: { ok: false } });
+      await f.db.update(auditLogs).set({ technicalMetadata: { ...row.technicalMetadata, evidence: "v1.x.y.z" } }).where(eq(auditLogs.id, row.id));
+      expect(await readSavIntakeComparisonEvidence(m.id, () => e)).toMatchObject({ qualificationEvidence: "invalid", verification: { ok: false } });
+    } finally { spy.mockRestore(); }
+    const legacy = await stored(), le = env(mailboxId, [legacy.id]), claimId = randomUUID();
+    await f.db.insert(auditLogs).values([{ actorEmail: "system", action: "sav_intake_comparison", entityType: "sav_intake_comparison", entityId: claimId, technicalMetadata: { campaignId: "sample-60", messageId: legacy.id, claimId, event: "claimed" } },
+      { actorEmail: "system", action: "sav_intake_comparison", entityType: "sav_intake_comparison", entityId: claimId, technicalMetadata: { campaignId: "sample-60", messageId: legacy.id, claimId, event: "result", verdict: "identical",
+        payload: encryptSavPayload({ revision: "sav-intake-comparison-2026-10-28.v3", coverage: [], simple: { summary: { classification: "support" }, technical: null, uncertain: false } }) } }]);
+    const report = await readSavIntakeComparisonReport(() => le); if (!report.configured) throw Error("TEST_CONFIG");
+    expect(report.rows[0]).toMatchObject({ state: "done", verdict: "identical", qualificationEvidence: "legacy", detail: { coverage: [] } });
+    expect(await readSavIntakeComparisonEvidence(legacy.id, () => le)).toMatchObject({ qualificationEvidence: "legacy", receipt: null });
+  }, 30_000);
+  it("an identifier outside the campaign list is refused before any lookup", async () => {
+    const m = await stored(), e = env(mailboxId, [m.id]), query = vi.spyOn(f.client, "query");
+    await expect(readSavIntakeComparisonEvidence(randomUUID(), () => e)).rejects.toThrow("SAV_INTAKE_COMPARISON_SCOPE_INVALID");
+    expect(query).not.toHaveBeenCalled();
+  });
+  it("a failed persistence keeps the claim consumed: interrupted, never paid for a second time", async () => {
+    const m = await stored(), e = env(mailboxId, [m.id]), p = provider();
+    const query = f.client.query.bind(f.client);
+    const fail = vi.spyOn(f.client, "query").mockImplementation(async (...args: Parameters<typeof query>) => {
+      if (String(args[0]).startsWith('insert into "audit_logs"') && JSON.stringify(args[1]).includes('\\"event\\":\\"result\\"')) throw Error("SYNTHETIC_PERSIST_FAILURE private@example.test");
+      return query(...args);
+    });
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try { await expect(runSavIntakeComparisonBatch({ env: () => e, network: p.network, limit: 1 })).rejects.toThrow("SAV_INTAKE_COMPARISON_PERSIST_FAILED"); }
+    finally { fail.mockRestore(); }
+    expect(JSON.stringify(warn.mock.calls)).not.toMatch(/private@example|SYN|Synchronisation/);
+    const seen = p.seen.length;
+    expect(await runSavIntakeComparisonBatch({ env: () => e, network: p.network, limit: 1 })).toMatchObject({ compared: [] });
+    expect(p.seen).toHaveLength(seen);
+    const report = await readSavIntakeComparisonReport(() => e);
+    expect(report).toMatchObject({ denominators: { done: 0, interrupted: 1 } });
+  });
+  it("an oversize common capture makes zero model call and is recorded, never truncated", async () => {
+    const m = await stored(), e = env(mailboxId, [m.id]), p = provider();
+    const entries = Math.ceil(SAV_READER_EVIDENCE_LIMITS.commonBytes / 90_000) + 2;
+    const { spy } = ticketDossier({ historyText: reviewText(7, 90_000), historyEntries: entries });
+    try {
+      expect(await runSavIntakeComparisonBatch({ env: () => e, network: ticketNetwork(p), limit: 1 })).toMatchObject({ compared: [{ verdict: "non_comparable", qualificationEvidence: "oversize" }] });
+      expect(p.seen).toEqual([]);
+      const [row] = await resultRows();
+      expect(row.technicalMetadata.evidence).toBeUndefined();
+      const report = await readSavIntakeComparisonReport(() => e); if (!report.configured) throw Error("TEST_CONFIG");
+      expect(report.rows[0]).toMatchObject({ qualificationEvidence: "oversize", detail: { coverage: ["evidence_common_oversize"], evidence: { status: "oversize", parts: { common: "oversize" } } } });
+      expect(report.spend.nanoUsd).toBe(0);
+    } finally { spy.mockRestore(); }
+  }, 30_000);
+  it("each side has its own wall clock (simple never counts current) and no model call is added", async () => {
+    const m = await stored(), e = env(mailboxId, [m.id]), p = provider(), { spy } = ticketDossier();
+    let now = 0;
+    try {
+      await runSavIntakeComparisonBatch({ env: () => e, network: ticketNetwork(p, simple => { now += simple ? 300 : 1000; }), limit: 1, clock: () => now });
+      const receipt = (await readSavIntakeComparisonEvidence(m.id, () => e)).receipt as { sides: Record<"current" | "simple", { timing: { wallMs: number; scope: string; requests: { productionAttemptMs: number }[] } }> };
+      expect(p.seen).toEqual(["current", "current", "simple"]);
+      expect(receipt.sides.current.timing.wallMs).toBe(2000);
+      expect(receipt.sides.simple.timing.wallMs).toBe(300);
+      expect(receipt.sides.simple.timing.scope).toBe("comparison_measurement_not_production_envelope");
+      expect(receipt.sides.simple.timing.requests.every(r => [18_000, 37_000].includes(r.productionAttemptMs))).toBe(true);
+    } finally { spy.mockRestore(); }
+  }, 30_000);
+});
+
+describe("SAV-46 one immutable CRM capture", () => {
+  it("a reader cannot alter what the other one sees; a record not captured is a miss, not a fresh read", async () => {
+    const live = { calls: 0 };
+    const complete = <T>(data: T) => ({ status: "complete" as const, data, observedAt: "2026-10-31T10:00:00.000Z" });
+    const crm = frozenComparisonCrm({ findContactsByEmail: async () => { live.calls++; return complete([{ id: "101", emails: ["syn@example.test"] }]); },
+      directAssociations: async () => complete([]), getContact: async () => complete({ id: "101", emails: ["syn@example.test"] }),
+      ticketsForContact: async () => { live.calls++; return complete([{ id: "201", contactIds: ["101"], stage: "open" as const, ownerId: "777", subject: "SYN", content: "SYN" }]); },
+      ticketHistory: async () => complete([]) });
+    const signal = new AbortController().signal;
+    await crm.capture.findContactsByEmail("syn@example.test", signal); await crm.capture.ticketsForContact("101", signal);
+    const frozen = await crm.freeze();
+    const first = await crm.frozen.ticketsForContact("101", signal); first.data[0].ownerId = "999";
+    expect((await crm.frozen.ticketsForContact("101", signal)).data[0].ownerId).toBe("777");
+    expect(crm.unchanged(frozen.hash)).toBe(true);
+    expect(await crm.frozen.ticketHistory("201", signal)).toMatchObject({ status: "failed" });
+    expect([...crm.misses]).toEqual(["history:201"]); expect(live.calls).toBe(2);
+  });
+});

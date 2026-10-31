@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import { createSavIntakeHubspotReaders, isSavIntakeHubspotRead } from "./hubspot-readers";
-import { createSavIntakeSemanticReaders, type IntakeGeminiCall } from "./model-readers";
+import { createSavIntakeSemanticReaders, type IntakeGeminiCall, type IntakeValidatedEvidence } from "./model-readers";
 import { prepareSavIntakeMessage } from "./message";
 import { evaluateSavIntakeReadOnly, type EvaluationCase, type EvaluationGrant } from "./evaluation";
 import { planSavIntake } from "./engine";
@@ -226,5 +226,45 @@ describe("independent review corrections", () => {
       if (known) expect(result).toMatchObject({ status: "complete", data: [{ content: "" }] });
       else expect(result.status).toBe("partial");
     }
+  });
+});
+
+describe("SAV-46 validated evidence of the current reader, before quotes and rationales are dropped", () => {
+  const text = "SYN agenda en panne. SYN export en échec.", message = { ...msg, currentText: text };
+  const two = () => ({ messageId: mid, requests: [{ id: "r0", kind: "support", currentMessageId: mid, quote: "SYN agenda en panne." }, { id: "r1", kind: "support", currentMessageId: mid, quote: "SYN export en échec." }],
+    ticketSummary: { title: "SYN agenda", description: text, requestIds: ["r0", "r1"] } });
+  it("RED on 238: the accepted analysis keeps each request quote, absent from what the engine receives", async () => {
+    const evidence: IntakeValidatedEvidence[] = [];
+    const returned = await createSavIntakeSemanticReaders({ model: "gemini-configured", call: call(two()), onValidatedEvidence: e => evidence.push(e) }).analyseMessage({ message, conversation: [] }, signal());
+    expect(returned.requests).toEqual([{ id: "r0", kind: "support", currentMessageId: mid }, { id: "r1", kind: "support", currentMessageId: mid }]);
+    expect(evidence).toEqual([expect.objectContaining({ reader: "current", phase: "understanding", kind: "analysis", callIndex: 1,
+      value: expect.objectContaining({ requests: [expect.objectContaining({ id: "r0", quote: "SYN agenda en panne." }), expect.objectContaining({ id: "r1", quote: "SYN export en échec." })] }) })]);
+  });
+  it("keeps grounded ticket verdicts with their quotes and rationale", async () => {
+    const evidence: IntakeValidatedEvidence[] = [];
+    const ticketRow = { ticket: { id: "201", contactIds: ["101"], stage: "new" as const, subject: "SYN agenda", content: "SYN agenda en panne depuis lundi" }, history: [{ id: "note", kind: "note" as const, at, text: "SYN déjà vu" }] };
+    const raw = { investigationComplete: true, tickets: [{ ticketId: "201", relation: "same", requestIds: ["r0"], evidenceIds: ["current", "ticket-201", "history-201"], rationale: "SYN même panne",
+      grounding: [{ sourceId: "current", quote: "SYN agenda en panne." }, { sourceId: "ticket-201", quote: "SYN agenda en panne depuis lundi" }, { sourceId: "history-201", quote: "SYN déjà vu" }] }] };
+    const out = await createSavIntakeSemanticReaders({ model: "gemini-configured", call: call(raw), onValidatedEvidence: e => evidence.push(e) })
+      .assessIssues({ message, requests: [{ id: "r0", kind: "support", currentMessageId: mid }], tickets: [ticketRow], evidence: [{ id: "current" }, { id: "ticket-201" }, { id: "history-201" }] as never }, signal());
+    expect(out.tickets[0]).not.toHaveProperty("rationale");
+    expect(evidence).toEqual([expect.objectContaining({ kind: "issues", group: 0, value: expect.objectContaining({ tickets: [expect.objectContaining({ rationale: "SYN même panne",
+      grounding: expect.arrayContaining([expect.objectContaining({ sourceId: "history-201", quote: "SYN déjà vu" })]) })] }) })]);
+  });
+  it("absent or failing, the callback changes neither the answer nor the provider calls", async () => {
+    const run = async (onValidatedEvidence?: (e: IntakeValidatedEvidence) => void) => {
+      const sent: unknown[] = [];
+      const answer = await createSavIntakeSemanticReaders({ model: "gemini-configured", call: async arg => { sent.push(arg); return call(two())(arg); }, ...(onValidatedEvidence ? { onValidatedEvidence } : {}) })
+        .analyseMessage({ message, conversation: [] }, signal());
+      return { answer, sent: JSON.stringify(sent) };
+    };
+    const plain = await run();
+    expect(await run(() => {})).toEqual(plain);
+    expect(await run(() => { throw Error("SYN_OBSERVER_FAILED"); })).toEqual(plain);
+  });
+  it("a rejected answer yields no validated evidence", async () => {
+    const evidence: IntakeValidatedEvidence[] = [], raw = two(); raw.requests[1].quote = "SYN jamais écrit";
+    await expect(createSavIntakeSemanticReaders({ model: "gemini-configured", call: call(raw), onValidatedEvidence: e => evidence.push(e) }).analyseMessage({ message, conversation: [] }, signal())).rejects.toThrow();
+    expect(evidence).toEqual([]);
   });
 });

@@ -40,6 +40,17 @@ export type IntakeModelTrace = { phase: string; model: string; promptRevision: s
   /** SAV-74: why the analysis-call limit stopped matching: groups needed versus calls left. Counts only. */
   callPlan?: { groups: number; available: number; tickets: number } };
 export type SavIntakeSemanticReaders = Pick<IntakeAdapters, "analyseMessage" | "assessIssues" | "assessIdentity">;
+/** Comparison only: a copy of a reader's answer at the moment it is accepted (decoded, grounded and
+ * validated), before the reader drops quotes, rationales and request-to-source mappings from what it
+ * returns to the engine. Never the wire body, the provider metadata or model thoughts. */
+export type IntakeValidatedEvidence = { reader: "current" | "simple"; phase: "understanding" | "ticket_matching";
+  kind: "analysis" | "issues" | "identity" | "judgement"; callIndex: number; group?: number; focused?: boolean; value: unknown };
+/** Passive by contract: absent, nothing is copied; present, it receives a copy and its failure is
+ * ignored, so it can neither alter, delay nor repeat the reader's work. */
+export function observeIntakeValidatedEvidence(observer: ((evidence: IntakeValidatedEvidence) => void) | undefined, evidence: IntakeValidatedEvidence) {
+  if (!observer) return;
+  try { observer(structuredClone(evidence)); } catch { /* evidence capture never changes the reader */ }
+}
 const hash = (data: unknown) => createHash("sha256").update(JSON.stringify(data)).digest("hex");
 type WireContract = { schema: z.ZodType; decode: (raw: unknown) => unknown; normalize?: (raw: unknown) => { value: unknown; counts: IntakeOutputNormalization } };
 /** Tags the first rejecting phase on the error object; the dispatcher rethrows the same object. */
@@ -111,6 +122,8 @@ export function createSavIntakeSemanticReaders(options: {
   attachments?: { prepared: SavPreparedAttachments; onRead: (observations: SavAttachmentObservation[]) => void };
   model: string; call: IntakeGeminiCall; onTrace?: (trace: IntakeModelTrace) => void;
   provenance?: ReadonlyMap<string, ReturnType<typeof prepareSavIntakeMessage>["provenance"]>;
+  /** Comparison only; operational callers leave it absent. */
+  onValidatedEvidence?: (evidence: IntakeValidatedEvidence) => void;
 }): SavIntakeSemanticReaders {
   if (!/^gemini-[A-Za-z0-9._-]{1,100}$/.test(options.model)) throw Error("SAV_INTAKE_CONFIGURED_MODEL_REQUIRED");
   let calls = 0;
@@ -344,6 +357,7 @@ export function createSavIntakeSemanticReaders(options: {
         const read = visualObservations.filter(o => visualSources.some(v => v.sourceId === o.sourceId));
         return { ...decodeAnalysis(analysis), ...unreadDecoded, attachmentObservations: read, ...(requirements === undefined ? {} : { imageRequirements: requirements }) };
       } }, visual?.prepared.uniqueImages);
+      observeIntakeValidatedEvidence(options.onValidatedEvidence, { reader: "current", phase: "understanding", kind: "analysis", callIndex: calls, value: result });
       return messageAnalysisSchema.parse({ ...result, requests: result.requests.map(({ quote: excerpt, ...request }) => { void excerpt; return request; }) });
     },
     assessIssues: async (input, signal) => {
@@ -431,6 +445,7 @@ export function createSavIntakeSemanticReaders(options: {
             ? ["current", ...(input.requestContext ? ["initial-request"] : []), `ticket-${verdict.ticketId}`, ...(row.history.length ? [`history-${verdict.ticketId}`] : [])] : ["current"]);
         }
       }, { schema: wireSchema, decode: catalogue.decodeIssues }, undefined, false, histories, groups.length - groupIndex - 1);
+      observeIntakeValidatedEvidence(options.onValidatedEvidence, { reader: "current", phase: "ticket_matching", kind: "issues", callIndex: calls, group: groupIndex, value: result });
       results.push(issueAssessmentSchema.parse({ ...result, tickets: result.tickets.map(({ grounding: cited, rationale, ...ticket }) => { void cited; void rationale; return ticket; }) }));
       }
       const tickets = results.flatMap(r => r.tickets);
@@ -458,6 +473,7 @@ export function createSavIntakeSemanticReaders(options: {
         checkGrounding(value.grounding, sources, required);
         if (value.contactIds.some(id => !input.candidates.some(c => c.contact.id === id))) throw Error("SAV_INTAKE_MODEL_COVERAGE_REJECTED");
       }, { schema: wireSchema, decode: catalogue.decodeIdentity }, undefined, false, histories);
+      observeIntakeValidatedEvidence(options.onValidatedEvidence, { reader: "current", phase: "ticket_matching", kind: "identity", callIndex: calls, value: result });
       const { grounding: cited, rationale, ...assessment } = result; void cited; void rationale;
       return identityAssessmentSchema.parse(assessment);
     },

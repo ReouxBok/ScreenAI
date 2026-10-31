@@ -18,6 +18,12 @@ export default async function ComparisonPage() {
       </section>
       <ComparisonForm campaignId={report.campaignId} expectedMessageId={report.rows.slice(0, 10).find(r => r.state === "pending")?.messageId ?? null} stage="sentinels" ready={comparisonPhaseCanContinue(report, "sentinels")} complete={report.rows.slice(0, 10).every(r => r.state !== "pending")}/>
       <ComparisonForm campaignId={report.campaignId} expectedMessageId={report.rows.slice(10).find(r => r.state === "pending")?.messageId ?? null} stage="remaining" ready={comparisonSentinelsReady(report) && comparisonPhaseCanContinue(report, "remaining")} complete={report.rows.slice(10).every(r => r.state !== "pending")}/>
+      <section className={styles.choice}><h2>Preuves privées par dossier</h2>
+        <p>« Identique » compare deux projections du plan : ce n’est ni un jugement métier ni une qualification. Seule une attestation humaine d’un reçu complet face à l’attendu figé compte.</p>
+        <ol>{report.rows.filter(row => row.state !== "pending").map(row => <li key={row.messageId}>
+          <Link href={`/studio/sav/intake/comparison/${row.messageId}`}>{row.verdict ?? row.state} · preuve {row.qualificationEvidence ?? "absente"} · {row.attestation === null ? "non attesté" : row.attestation === "invalid" ? "attestation invalide" : row.attestation.outcome === "matches_oracle" ? "attesté conforme" : "attesté non conforme"}</Link>
+        </li>)}</ol>
+      </section>
       <details className={styles.choice}><summary>Résultats détaillés — administrateur</summary><pre>{JSON.stringify(report, null, 2)}</pre></details>
     </>}
   </div>;

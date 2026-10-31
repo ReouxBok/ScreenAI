@@ -18,7 +18,7 @@ export function ComparisonForm({ stage, ready, complete, expectedMessageId, camp
         J’ai vérifié les dix résultats contre les décisions attendues et je confirme la poursuite.</label>}
       <button type="submit">{complete ? "Plus aucun dossier à lancer dans cette phase" : "Comparer le prochain dossier"}</button>
     </fieldset>
-    {!ready && <p>{stage === "sentinels" ? "Un résultat est incomplet, incertain ou encore en cours. Consultez le rapport avant de poursuivre." : "Les dix sentinelles doivent avoir un résultat exploitable avant cette phase, sans autre comparaison incomplète ou en cours."}</p>}
+    {!ready && <p>{stage === "sentinels" ? "Un résultat est incomplet, incertain, en cours, ou pas encore attesté conforme à son attendu. Ouvrez sa preuve et attestez-la avant de poursuivre." : "Les dix sentinelles doivent être attestées conformes à leur attendu, et chaque résultat de cette phase aussi, avant de payer le suivant."}</p>}
     {pending && <p role="status">Comparaison en cours…</p>}
     {state.message && <p role={state.ok ? "status" : "alert"}>{state.message}</p>}
     {state.code && <code>{state.code}</code>}
