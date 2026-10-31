@@ -283,6 +283,14 @@ async function compareOne(messageId: string, claimId: string, campaign: SavIntak
     return { coverage: refused, snapshotHash: savComparisonSnapshotHash(snapshot.sourceHash, crmHash), current: null, simple: null, ...compareIntakeSides(empty, empty, refused),
       evidence: commonOversizeReaderEvidence(binding, commonPreparationMs) };
   }
+  // SAV-46 R2: a common capture already incomplete (a CRM read failed, partial or rejected, or the
+  // conversation incomplete) can never yield a qualifiable receipt: refused with its original gaps
+  // before any side, reservation or provider call. A complete empty search is complete, not a gap.
+  if (common.status !== "complete") {
+    const refused = [...new Set([...coverage, "evidence_common_incomplete", ...common.criteriaMissing])];
+    return { coverage: refused, snapshotHash: savComparisonSnapshotHash(snapshot.sourceHash, crmHash), current: null, simple: null, ...compareIntakeSides(empty, empty, refused),
+      evidence: unavailableReaderEvidence(binding, refused) };
+  }
   // SAV-72: a created ticket's description is the stored original email, never the planner's text.
   const fromOriginalMail = (plannerDescription: string) => intakeTicketDescription({ subject: message.subject, text: String(snapshot.body.text ?? ""),
     unreadAttachmentNotice: intakeUnreadAttachmentNotice(plannerDescription) });

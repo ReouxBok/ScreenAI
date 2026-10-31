@@ -620,12 +620,17 @@ describe("SAV-46 one immutable CRM capture", () => {
 // SAV-46 R2: the frozen capture covers every address the engine may look up as a declared account,
 // before any paid call, for both readers. Synthetic CRM keyed by address; the sender is unknown.
 describe("SAV-46 R2 declared account capture", () => {
-  function declaredDossier(byEmail: Record<string, { id: string; emails: string[] }[]>) {
+  function declaredDossier(byEmail: Record<string, { id: string; emails: string[] }[]>, outcomes: Record<string, "failed" | "partial"> = {}) {
     const reads: string[] = [];
     const complete = <T>(data: T) => ({ status: "complete" as const, data, observedAt: new Date().toISOString() });
+    const resolved = (email: string) => {
+      const observedAt = new Date().toISOString();
+      return outcomes[email] === "failed" ? { status: "failed" as const, data: [], observedAt }
+        : outcomes[email] === "partial" ? { status: "partial" as const, data: byEmail[email] ?? [], observedAt, reconstructedAsOf: observedAt } : complete(byEmail[email] ?? []);
+    };
     const contacts = Object.values(byEmail).flat();
     const spy = vi.spyOn(hubspotReaders, "createSavIntakeHubspotReaders").mockReturnValue({
-      findContactsByEmail: async email => { reads.push(`contacts:${email}`); return complete(byEmail[email] ?? []); },
+      findContactsByEmail: async email => { reads.push(`contacts:${email}`); return resolved(email); },
       directAssociations: async id => { reads.push(`associations:${id}`); return complete([]); },
       getContact: async id => { reads.push(`contact:${id}`); return complete(contacts.find(c => c.id === id)!); },
       ticketsForContact: async id => { reads.push(`tickets:${id}`); return complete([]); },
@@ -657,8 +662,8 @@ describe("SAV-46 R2 declared account capture", () => {
       receivedAt: new Date(Date.now() - 2 * 86_400_000 + i * 1000), createdAt: new Date(Date.now() - 2 * 86_400_000 + i * 1000), analysisStatus: "intake_observed" });
     return m;
   }
-  async function campaign(text: string, address: string, byEmail: Record<string, { id: string; emails: string[] }[]>, prior: string[] = []) {
-    const m = prior.length ? await storedWithHistory(prior, text) : await stored(text), e = env(mailboxId, [m.id]), p = provider(), { spy, reads } = declaredDossier(byEmail), first = { value: null as number | null };
+  async function campaign(text: string, address: string, byEmail: Record<string, { id: string; emails: string[] }[]>, prior: string[] = [], outcomes: Record<string, "failed" | "partial"> = {}) {
+    const m = prior.length ? await storedWithHistory(prior, text) : await stored(text), e = env(mailboxId, [m.id]), p = provider(), { spy, reads } = declaredDossier(byEmail, outcomes), first = { value: null as number | null };
     try {
       await runSavIntakeComparisonBatch({ env: () => e, network: declaredNetwork(p, address, first, reads), limit: 1 });
       const report = await readSavIntakeComparisonReport(() => e); if (!report.configured) throw Error("TEST_CONFIG");
@@ -696,6 +701,20 @@ describe("SAV-46 R2 declared account capture", () => {
     expect(r.row.detail.coverage).toEqual(["declared_address_cap_exceeded"]);
     expect(r.p.seen).toEqual([]); expect(r.reads).toEqual([]);
     expect((await ledger()).filter(x => x.technicalMetadata.event === "reserved")).toEqual([]);
+  }, 30_000);
+  it.each(["failed", "partial"] as const)("R2: a declared-account capture already %s before dispatch is refused with its gap: no provider call, no reservation", async status => {
+    const r = await campaign("Bonjour, mon compte Limova est account@customer.test. Comment connecter Outlook ?", "account@customer.test",
+      { "account@customer.test": [{ id: "301", emails: ["account@customer.test"] }] }, [], { "account@customer.test": status });
+    expect(r.reads).toContain("contacts:account@customer.test");
+    expect(r.row.verdict).toBe("non_comparable");
+    expect(r.row.detail.coverage).toEqual(expect.arrayContaining(["evidence_common_incomplete", `crm_${status}:contacts`]));
+    expect(r.p.seen).toEqual([]); expect(r.readsAtFirstModel).toBeNull();
+    expect((await ledger()).filter(x => x.technicalMetadata.event === "reserved")).toEqual([]);
+  }, 30_000);
+  it("R2 witness: a complete empty search for the declared account is no gap; both readers run", async () => {
+    const r = await campaign("Bonjour, mon compte Limova est account@customer.test. Comment connecter Outlook ?", "account@customer.test", {});
+    expect(r.row.detail.coverage).toEqual([]);
+    expect(new Set(r.p.seen)).toEqual(new Set(["current", "simple"]));
   }, 30_000);
   it("R7: two accounts declared in the current message are refused as ambiguous before any CRM read or paid call", async () => {
     const r = await campaign("Mon compte Limova est a1@customer.test. Mon compte Limova est a2@customer.test.", "a1@customer.test", {});
