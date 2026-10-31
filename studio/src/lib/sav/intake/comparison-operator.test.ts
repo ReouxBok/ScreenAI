@@ -166,3 +166,28 @@ describe("SAV-46 one dossier's receipt and its attestation", () => {
     expect(m.attest).not.toHaveBeenCalled();
   });
 });
+it.each(["sentinels", "remaining"] as const)("SAV-46 ROOT gate: in the %s phase, a result not attested as matching stops the next paid dossier", async stage => {
+  for (const fault of ["missing", "invalid", "differs", "other_receipt", "other_claim"] as const) {
+    vi.clearAllMocks(); m.auth.mockResolvedValue({ role: "admin", email: "admin@example.invalid" });
+    const report = good(), index = stage === "sentinels" ? 0 : 10;
+    if (stage === "sentinels") for (let i = 1; i < 10; i++) Object.assign(report.rows[i], { state: "pending", detail: null, qualificationEvidence: null, attestation: null });
+    else Object.assign(report.rows[10], { claimId: claim(10), state: "done", qualificationEvidence: "complete", detail: { ...report.rows[0].detail!, evidence: { status: "complete", receiptSha256: receipt(10) } },
+      attestation: { claimId: claim(10), receiptSha256: receipt(10), oracleSha256: "a".repeat(64), outcome: "matches_oracle", at: "2026-10-31T10:00:00.000Z" } });
+    const row = report.rows[index], attestation = row.attestation as Exclude<Attested, "invalid" | null>;
+    if (fault === "missing") row.attestation = null;
+    if (fault === "invalid") row.attestation = "invalid";
+    if (fault === "differs") attestation.outcome = "differs_from_oracle";
+    if (fault === "other_receipt") attestation.receiptSha256 = "f".repeat(64);
+    if (fault === "other_claim") attestation.claimId = claim(42);
+    m.report.mockResolvedValue(report);
+    await expect(runIntakeComparisonOperator({ expectedCampaignId: config.campaignId, expectedMessageId: ids[index + 1], stage, reviewed: true }, { env: () => environment })).rejects.toThrow("PREVIOUS_RESULT_REVIEW_REQUIRED");
+    expect(m.run).not.toHaveBeenCalled(); expect(m.values).not.toHaveBeenCalled();
+  }
+});
+it("SAV-46 ROOT gate witness: an attested matching result lets the next dossier of the same phase run", async () => {
+  const report = good();
+  for (let i = 1; i < 10; i++) Object.assign(report.rows[i], { state: "pending", detail: null, qualificationEvidence: null, attestation: null });
+  m.report.mockResolvedValue(report);
+  await runIntakeComparisonOperator({ expectedCampaignId: config.campaignId, expectedMessageId: ids[1], stage: "sentinels" }, { env: () => environment });
+  expect(JSON.parse(m.run.mock.calls[0][0].env().SAV_INTAKE_COMPARISON_JSON).messageIds).toEqual([ids[1]]);
+});

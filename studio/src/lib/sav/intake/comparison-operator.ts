@@ -29,20 +29,23 @@ type Row = Extract<Report, { configured: true }>["rows"][number];
 const usable = (row: Row) => row.state === "done" && detailSchema.safeParse(row.detail).success
   && detailSchema.parse(row.detail).coverage.length === 0 && row.qualificationEvidence === "complete";
 const manifestSha = (row: Row) => (row.detail?.evidence as { receiptSha256?: unknown } | undefined)?.receiptSha256;
-/** Completion and projection equality are not semantic approval: each of the ten receipts must carry
- * an explicit human attestation naming that exact receipt and its pre-frozen oracle, and matching it.
- * Current-reader failures stay visible and do not decide this gate. */
+/** Completion and projection equality are not semantic approval: a usable receipt counts only with an
+ * explicit human attestation naming that exact claim and receipt and matching its pre-frozen oracle.
+ * Absent, invalid, differing or bound to another claim or receipt: it does not count. */
+const attestedMatching = (row: Row) => usable(row) && row.attestation !== null && row.attestation !== "invalid"
+  && row.attestation.outcome === "matches_oracle" && /^[0-9a-f]{64}$/.test(row.attestation.oracleSha256)
+  && row.attestation.claimId === row.claimId && typeof row.claimId === "string" && row.attestation.receiptSha256 === manifestSha(row);
+/** Current-reader failures stay visible and do not decide this gate. */
 export function comparisonSentinelsReady(report: Report) {
-  return report.configured && report.rows.slice(0, 10).length === 10
-    && report.rows.slice(0, 10).every(row => usable(row) && row.attestation !== null && row.attestation !== "invalid"
-      && row.attestation.outcome === "matches_oracle" && row.attestation.claimId === row.claimId && row.attestation.receiptSha256 === manifestSha(row));
+  return report.configured && report.rows.slice(0, 10).length === 10 && report.rows.slice(0, 10).every(attestedMatching);
 }
-/** A lost response/unfinished claim, an unusable simple result or a receipt that cannot be
- * qualified must not advance to a second dossier merely because its claim is already taken. */
+/** Every result, in the ten as in the fifty, must be attested as matching its oracle before the next
+ * dossier is paid for. A lost response, an unfinished claim, an unusable result, a receipt that cannot
+ * be qualified, or a missing or non-matching attestation stops the phase. */
 export function comparisonPhaseCanContinue(report: Report, stage: "sentinels" | "remaining") {
   if (!report.configured) return false;
   const rows = stage === "sentinels" ? report.rows.slice(0, 10) : report.rows.slice(10);
-  return rows.every(row => row.state === "pending" || usable(row));
+  return rows.every(row => row.state === "pending" || attestedMatching(row));
 }
 export async function readIntakeComparisonPanel() {
   await administrator();

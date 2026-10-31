@@ -159,14 +159,20 @@ function validatedGaps(side: Side, calls: readonly SemanticCallRecord[], validat
   const gaps: string[] = [];
   for (const call of calls) {
     if (call.status !== "returned") continue;
+    // A consumed grouped answer needs an accepted copy for EVERY ticket it was asked about (both
+    // readers reject an answer that does not cover each ticket, so a gap is a lost copy).
+    const ticketsOf = (kinds: readonly IntakeValidatedEvidence["kind"][]) =>
+      new Set(validated.filter(v => kinds.includes(v.kind)).flatMap(v => ((v.value as { tickets?: { ticketId?: unknown }[] } | null)?.tickets ?? []).map(t => t?.ticketId)));
+    const asked = (call.input.ticketIds as string[] | undefined) ?? [];
     if (side === "current") {
-      const kind = call.method === "analyseMessage" ? "analysis" : call.method === "assessIssues" ? "issues" : "identity";
-      const needed = call.method === "assessIssues" ? ((call.input.ticketIds as string[] | undefined)?.length ?? 0) > 0 : true;
-      if (needed && !validated.some(v => v.kind === kind)) gaps.push(`validated_evidence_missing:${call.method}`);
+      const judged = ticketsOf(["issues"]);
+      const ok = call.method === "analyseMessage" ? validated.some(v => v.kind === "analysis")
+        : call.method === "assessIssues" ? asked.every(id => judged.has(id)) : validated.some(v => v.kind === "identity");
+      if (!ok) gaps.push(`validated_evidence_missing:${call.method}`);
     } else {
-      const judged = new Set(validated.flatMap(v => ((v.value as { tickets?: { ticketId: string }[] } | null)?.tickets ?? []).map(t => t.ticketId)));
+      const judged = ticketsOf(["judgement"]);
       const ok = call.method === "analyseMessage" ? validated.some(v => v.phase === "understanding")
-        : call.method === "assessIssues" ? ((call.input.ticketIds as string[] | undefined) ?? []).every(id => judged.has(id)) : validated.length > 0;
+        : call.method === "assessIssues" ? asked.every(id => judged.has(id)) : validated.length > 0;
       if (!ok) gaps.push(`validated_evidence_missing:${call.method}`);
     }
   }

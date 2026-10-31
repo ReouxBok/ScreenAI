@@ -43,7 +43,7 @@ const calls = [{ order: 0, method: "analyseMessage" as const, input: { messageId
 const timing = comparisonSideTiming({ startedAt: at, wallMs: 10, requests: [] });
 const fromMail = () => "Objet : SYN\n\nSYN mail original";
 const side = (kind: "current" | "simple", p: IntakePlan | null, evidence: IntakeValidatedEvidence[], entries = crm()) => comparisonSideEvidence({ side: kind, readerRevision: `syn-${kind}`,
-  plan: p, technical: null, uncertain: false, semanticCalls: calls, validated: kind === "current" ? [{ ...evidence[0], reader: "current", kind: "analysis" }, { reader: "current", phase: "ticket_matching", kind: "issues", callIndex: 2, group: 0, value: {} }] : evidence,
+  plan: p, technical: null, uncertain: false, semanticCalls: calls, validated: kind === "current" ? [{ ...evidence[0], reader: "current", kind: "analysis" }, { reader: "current", phase: "ticket_matching", kind: "issues", callIndex: 2, group: 0, value: { tickets: [{ ticketId: "201", relation: "same" }] } }] : evidence,
   timing, expectations: p ? intakeMutationExpectations(p, entries, fromMail) : null });
 const identity: ReaderEvidenceIdentity = { ...binding, comparisonRevision: "syn", codeRevision: "a".repeat(40), readerRevisions: { current: "syn-current", simple: "syn-simple" },
   engineRevision: "sav-intake-engine-2026-10-20.v1", model: "gemini-syn", runtimeConfigHash: "b".repeat(64), enginePolicyHash: "c".repeat(64), resourcesHash: "d".repeat(64), otherCatalogue: null };
@@ -87,6 +87,12 @@ describe("receipt keeps what the summary projection loses", () => {
     const missing = comparisonSideEvidence({ side: "simple", readerRevision: "syn", plan: plan("SYN"), technical: null, uncertain: false, semanticCalls: calls, validated: [], timing, expectations: null });
     expect(missing.status).toBe("incomplete"); expect(missing.criteriaMissing).toEqual(expect.arrayContaining(["validated_evidence_missing:analyseMessage", "validated_evidence_missing:assessIssues"]));
     expect(missing.notProducedByReader).toContain("request_verbatim_quote");
+    // A grouped answer about two tickets whose accepted copy covers only one is a lost copy.
+    const twoTickets = [calls[0], { ...calls[1], input: { ticketIds: ["201", "202"] } }];
+    for (const kind of ["current", "simple"] as const)
+      expect(comparisonSideEvidence({ side: kind, readerRevision: "syn", plan: plan("SYN"), technical: null, uncertain: false, semanticCalls: twoTickets, timing, expectations: null,
+        validated: kind === "simple" ? [validated(["SYN"])] : [{ ...validated(["SYN"]), reader: "current", kind: "analysis" }, { reader: "current", phase: "ticket_matching", kind: "issues", callIndex: 2, group: 0, value: { tickets: [{ ticketId: "201" }] } }] }).criteriaMissing)
+        .toContain("validated_evidence_missing:assessIssues");
   });
 });
 
