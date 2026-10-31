@@ -81,6 +81,9 @@ describe.each<Reader>(["current", "simple"])("R1 %s reader: a written address is
     ["retracted after the address (FR)", "Mon compte Limova est resource@connector.test, mais ce n'est pas mon compte.", "resource@connector.test"],
     ["retracted after the address (EN)", "My Limova account is resource@connector.test, but this is not my account.", "resource@connector.test"],
     ["corrected to a colleague's account", "Mon compte Limova est resource@connector.test, non c'est le compte de mon collègue.", "resource@connector.test"],
+    ["corrected to another address (FR)", "Mon compte Limova est resource@connector.test. Je me suis trompé, voici la bonne : account@customer.test.", "resource@connector.test"],
+    ["corrected to another address (EN)", "My Limova account is resource@connector.test. My mistake, the correct one is account@customer.test.", "resource@connector.test"],
+    ["the corrected address has no account statement of its own", "Mon compte Limova est resource@connector.test. Je me suis trompé, voici la bonne : account@customer.test.", "account@customer.test"],
   ])("%s: the address is never looked up as the account and no ticket lands on it", async (_, text, declared) => {
     const b = bench(reader, text, [RESOURCE_CONTACT, MAILBOX_CONTACT]);
     const plan = await b.run(declared);
@@ -105,10 +108,17 @@ describe.each<Reader>(["current", "simple"])("R1 %s reader: a written address is
     "Mon compte Limova est account@customer.test. Je ne connais pas mon identifiant.",
     "Mon compte Limova est account@customer.test. Mon collègue a un problème sur son compte.",
     "Mon compte Limova est account@customer.test, je ne connais pas mon identifiant.",
+    "Mon compte Limova est account@customer.test. Je me suis trompé dans la configuration du calendrier.",
+    "Mon compte Limova est account@customer.test. Erreur 500 sur la page des factures.",
   ])("an independent later statement keeps the stated account: %s", async text => {
     const b = bench(reader, text, [ACCOUNT_CONTACT]);
     expect(ticketOn(await b.run("account@customer.test"))).toBe("301");
     expect(b.crmCalls).toContain("lookup:account@customer.test");
+  });
+  it("an explicitly restated account after a correction is used; the superseded one is never looked up", async () => {
+    const b = bench(reader, "Mon compte Limova est resource@connector.test. Je me suis trompé, mon compte Limova est account@customer.test.", [RESOURCE_CONTACT, ACCOUNT_CONTACT]);
+    expect(ticketOn(await b.run("account@customer.test"))).toBe("301");
+    expect(b.crmCalls).not.toContain("lookup:resource@connector.test");
   });
   it("account and resource in the same sentence: the stated account is used, never the resource by neighbourhood", async () => {
     const text = "Mon compte Limova est account@customer.test et je veux connecter mailbox@connector.test à Outlook.";
@@ -160,6 +170,14 @@ describe("R1 engine: the declared address must carry its account role", () => {
     expect(e.calls).toEqual([]);
     const both = "Mon compte Limova est account@customer.test et resource@connector.test n'est pas mon compte.";
     expect(ticketOn(await engine(both, { address: "account@customer.test", sourceMessageId: mid, quote: both }, [ACCOUNT_CONTACT, RESOURCE_CONTACT]).run())).toBe("301");
+  });
+  it("an address corrected right after it fails closed before any lookup; a mistake about something else keeps the account", async () => {
+    const corrected = "Mon compte Limova est resource@connector.test. Je me suis trompé, voici la bonne : account@customer.test.";
+    const e = engine(corrected, { address: "resource@connector.test", sourceMessageId: mid, quote: corrected }, [RESOURCE_CONTACT, ACCOUNT_CONTACT]);
+    expect((await e.run()).decision.disposition).toMatchObject({ kind: "collect_context", reasons: expect.arrayContaining(["contact_lookup_incomplete"]) });
+    expect(e.calls).toEqual([]);
+    const unrelated = "Mon compte Limova est account@customer.test. Je me suis trompé dans la configuration du calendrier.";
+    expect(ticketOn(await engine(unrelated, { address: "account@customer.test", sourceMessageId: mid, quote: unrelated }, [ACCOUNT_CONTACT]).run())).toBe("301");
   });
   it("a negated continuation reply is not a current declaration", async () => {
     const text = "Ce n'est pas account@customer.test";

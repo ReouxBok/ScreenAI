@@ -52,6 +52,16 @@ const REFERS_BACK = new RegExp(word([
   `(?:this|that|it|this address|this email|that address)\\s*(?:is|'s|was)\\s+(?:(?:not|no longer|never)\\s+(?:\\S+\\s+){0,2}?${OWNED}|(?:my |his |her |their )?\\p{L}+'s (?:account|email|e-mail|address)|(?:his|her|their|someone else's) (?:account|email|e-mail|address))`,
   `(?:this|that|it)\\s*(?:isn't|wasn't)\\s+(?:\\S+\\s+){0,2}?${OWNED}`,
 ].join("|")), "u");
+/** R5: an admitted mistake corrects this address only when it bears on an address/account
+ * ("je me suis trompé d'adresse") or leads straight to another written address ("Je me suis
+ * trompé, voici la bonne : Y", "My mistake, the correct one is Y"); a mistake about anything
+ * else ("je me suis trompé dans la configuration du calendrier") or an "Erreur 500" is not one. */
+const MISTAKE = `je me suis tromp\\p{L}*|je me trompe|erreur de ma part|au(?:tant| temps) pour moi|faute de frappe|my mistake|my bad|i was wrong|i made a (?:mistake|typo)|i mistyped(?: it)?|typo`;
+const MISTAKE_ON_ADDRESS = new RegExp(word(`(?:${MISTAKE})\\s*(?:d'|de |dans l'|dans le |sur l'|sur le |in the |on the |with the )(?:adresse|compte|e-?mail|mail|address|account|identifiant)`), "u");
+const MISTAKE_BEFORE_ADDRESS = new RegExp(word(MISTAKE), "u");
+const REPLACEMENT = new RegExp(word("voici la bonne|la bonne(?: adresse| e-?mail)?(?: est| c'est)|c'est plut[ôo]t|the (?:correct|right) (?:one|address|email|e-mail|account)(?: is)?|it should be|it's actually"), "u");
+const corrects = (part: { text: string; stopped: boolean }) =>
+  MISTAKE_ON_ADDRESS.test(part.text) || (part.stopped && (MISTAKE_BEFORE_ADDRESS.test(part.text) || REPLACEMENT.test(part.text)));
 const WRONG_HERE = new RegExp(word("wrong (?:account|email|e-mail|address)|not the right (?:account|email|e-mail|address)|pas (?:le bon (?:compte|e-?mail|mail)|la bonne adresse)|mauvaise? (?:compte|adresse|e-?mail|mail)"), "u");
 const QUOTED_LINE = /^\s*>/u;
 const SIGNOFF = /^\s*(?:--|—|cordialement|bien cordialement|tr[eè]s cordialement|bien [àa] vous|salutations(?: distingu[ée]es)?|best regards|kind regards|regards|best|sincerely|cheers|merci d'avance|merci par avance|bonne journ[ée]e)[\s,.!]*$/u;
@@ -102,8 +112,9 @@ function occurrenceVerdict(text: string, occurrences: Occurrence[], target: Occu
   const here = cut(fold(masked.slice(target.end, sentenceEnd)));
   const following = masked.slice(sentenceEnd).replace(/^[\s.!?;]+/u, "");
   const nextEnds = [".", "!", "?", ";", "\n"].map(b => following.indexOf(b)).filter(i => i >= 0);
-  const next = here.stopped ? "" : cut(fold(following.slice(0, nextEnds.length ? Math.min(...nextEnds) : following.length))).text;
-  const retracted = CORRECTION.test(here.text) || REFERS_BACK.test(here.text) || WRONG_HERE.test(here.text) || CORRECTION.test(next) || REFERS_BACK.test(next);
+  const next = here.stopped ? { text: "", stopped: false } : cut(fold(following.slice(0, nextEnds.length ? Math.min(...nextEnds) : following.length)));
+  const retracted = CORRECTION.test(here.text) || REFERS_BACK.test(here.text) || WRONG_HERE.test(here.text) || corrects(here)
+    || CORRECTION.test(next.text) || REFERS_BACK.test(next.text) || corrects(next);
   for (const marker of markers) {
     const start = marker.index, end = start + marker[0].length;
     if (!(end <= at ? linked(sentence.slice(end, at)) : start >= after && linked(sentence.slice(after, start)))) continue;
