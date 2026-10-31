@@ -584,3 +584,78 @@ describe("SAV-46 one immutable CRM capture", () => {
     expect([...crm.misses]).toEqual(["history:201"]); expect(live.calls).toBe(2);
   });
 });
+
+// ---------------------------------------------------------------------------------------------
+// SAV-46 R2: the frozen capture covers every address the engine may look up as a declared account,
+// before any paid call, for both readers. Synthetic CRM keyed by address; the sender is unknown.
+describe("SAV-46 R2 declared account capture", () => {
+  function declaredDossier(byEmail: Record<string, { id: string; emails: string[] }[]>) {
+    const reads: string[] = [];
+    const complete = <T>(data: T) => ({ status: "complete" as const, data, observedAt: new Date().toISOString() });
+    const contacts = Object.values(byEmail).flat();
+    const spy = vi.spyOn(hubspotReaders, "createSavIntakeHubspotReaders").mockReturnValue({
+      findContactsByEmail: async email => { reads.push(`contacts:${email}`); return complete(byEmail[email] ?? []); },
+      directAssociations: async id => { reads.push(`associations:${id}`); return complete([]); },
+      getContact: async id => { reads.push(`contact:${id}`); return complete(contacts.find(c => c.id === id)!); },
+      ticketsForContact: async id => { reads.push(`tickets:${id}`); return complete([]); },
+      ticketHistory: async id => { reads.push(`history:${id}`); return complete([]); },
+    });
+    return { spy, reads };
+  }
+  /** Both readers return the same support request and the given declared address. */
+  function declaredNetwork(base: ReturnType<typeof provider>, address: string, readsAtFirstModel: { value: number | null }, reads: string[]): typeof fetch {
+    return async (url, init) => {
+      if (!String(url).startsWith("https://generativelanguage.googleapis.com/")) return base.network(url, init);
+      readsAtFirstModel.value ??= reads.length;
+      const data = JSON.parse(JSON.parse(String(init?.body)).contents[0].parts[0].text), simple = typeof data.current === "string";
+      base.seen.push(simple ? "simple" : "current");
+      const reply = (answer: unknown) => Response.json({ candidates: [{ finishReason: "STOP", content: { parts: [{ text: JSON.stringify(answer) }] } }], usageMetadata: { promptTokenCount: 300, candidatesTokenCount: 60, thoughtsTokenCount: 0, totalTokenCount: 360 } });
+      if (simple) return reply(encodeSimpleWireFixture({ messageId: data.message.id, nature: "request", requests: [{ id: "r1", kind: "support", summary: "SYN connexion Outlook", sourceIds: ["current"] }],
+        ticketTitle: "Connexion de la boîte Outlook", identity: { kind: data.contacts.length === 1 ? "unique" : "unknown", contactIds: data.contacts.length === 1 ? [data.contacts[0].contactId] : [], why: "SYN" },
+        tickets: [], missing: [], rationale: "SYN support", registration: { address, quote: data.current } }, data.outputReferences));
+      const quote = data.citationCatalogue.find((x: { sourceId: string }) => x.sourceId === "current").id;
+      return reply({ messageId: data.message.id, requests: [{ id: "r1", kind: "support", currentMessageId: data.message.id, quoteId: quote }],
+        ticketSummary: { title: "Connexion de la boîte Outlook", description: "SYN connexion.", requestIds: ["r1"] }, registration: { address, sourceMessageId: data.message.id, quoteId: quote } });
+    };
+  }
+  async function campaign(text: string, address: string, byEmail: Record<string, { id: string; emails: string[] }[]>) {
+    const m = await stored(text), e = env(mailboxId, [m.id]), p = provider(), { spy, reads } = declaredDossier(byEmail), first = { value: null as number | null };
+    try {
+      await runSavIntakeComparisonBatch({ env: () => e, network: declaredNetwork(p, address, first, reads), limit: 1 });
+      const report = await readSavIntakeComparisonReport(() => e); if (!report.configured) throw Error("TEST_CONFIG");
+      return { m, e, p, reads, readsAtFirstModel: first.value, row: report.rows[0] as unknown as { verdict: string; detail: { coverage: string[]; current: { summary: { disposition: string; contactId: string | null; reasons: string[] } | null }; simple: { summary: { disposition: string; contactId: string | null; reasons: string[] } | null } } } };
+    } finally { spy.mockRestore(); }
+  }
+  it("an explicit account different from the sender is captured before both readers: comparable, same plan, no live read after the freeze", async () => {
+    const r = await campaign("Bonjour, mon compte Limova est account@customer.test. Comment connecter Outlook ?", "account@customer.test",
+      { "account@customer.test": [{ id: "301", emails: ["account@customer.test"] }] });
+    expect(r.row.detail.coverage).toEqual([]);
+    expect(r.row.verdict).toBe("identical");
+    expect(r.row.detail.current.summary).toMatchObject({ disposition: "ticket", contactId: "301" });
+    expect(r.row.detail.simple.summary).toMatchObject({ disposition: "ticket", contactId: "301" });
+    expect(r.reads).toContain("contacts:account@customer.test");
+    expect(r.readsAtFirstModel).toBe(r.reads.length);
+    expect(new Set(r.reads).size).toBe(r.reads.length);
+    const detail = await readSavIntakeComparisonEvidence(r.m.id, () => r.e);
+    expect(detail).toMatchObject({ qualificationEvidence: "complete", verification: { ok: true } });
+    const receipt = detail.receipt as { common: { crm: { entries: { key: string }[] } }; crmUse: { misses: string[]; failedUsed: string[]; immutable: boolean } };
+    expect(receipt.common.crm.entries.map(x => x.key)).toContain("contacts:account@customer.test");
+  }, 30_000);
+  it("a resource to connect is neither captured nor looked up: both sides take the unknown sender's identification path", async () => {
+    const r = await campaign("Bonjour, comment connecter resource@connector.test à Outlook pour retrouver mes factures ?", "resource@connector.test",
+      { "resource@connector.test": [{ id: "555", emails: ["resource@connector.test"] }] });
+    expect(r.row.detail.coverage).toEqual([]);
+    expect(r.row.verdict).toBe("identical");
+    // This campaign policy has no approved identification text: the sender path stops visibly there.
+    for (const side of [r.row.detail.current.summary, r.row.detail.simple.summary])
+      expect(side).toMatchObject({ disposition: "collect_context", contactId: null, reasons: ["private_resource_unavailable"] });
+    expect(r.reads.some(x => x.includes("resource@connector.test") || x.endsWith(":555"))).toBe(false);
+  }, 30_000);
+  it("more admissible declared addresses than the cap are refused before any CRM read or paid call", async () => {
+    const r = await campaign("Mon compte Limova est a1@customer.test. Mon compte Limova est a2@customer.test. Mon compte Limova est a3@customer.test.", "a1@customer.test", {});
+    expect(r.row.verdict).toBe("non_comparable");
+    expect(r.row.detail.coverage).toEqual(["declared_address_cap_exceeded"]);
+    expect(r.p.seen).toEqual([]); expect(r.reads).toEqual([]);
+    expect((await ledger()).filter(x => x.technicalMetadata.event === "reserved")).toEqual([]);
+  }, 30_000);
+});

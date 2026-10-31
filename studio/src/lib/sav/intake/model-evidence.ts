@@ -21,17 +21,6 @@ export function rejectIntakeEvidence(reason: IntakeEvidenceFailure["reason"], pa
     ...(excerpt === undefined ? {} : { excerptHash: createHash("sha256").update(excerpt).digest("hex"), excerptLength: excerpt.length }) });
 }
 
-/** An unproven optional registration declaration may be discarded (identity then
- * falls back to the sender) only when it carries no inherited continuation
- * request and the current authored text names no address other than the
- * sender's. An explicit alternative address keeps the strict citation check. */
-export function intakeRegistrationDiscardable(currentText: string, senderEmail: string, inherited: boolean) {
-  if (inherited) return false;
-  const sender = senderEmail.trim().toLowerCase();
-  const named = currentText.match(/[^\s<>()[\]"',;:]+@[^\s<>()[\]"',;:]+/g) ?? [];
-  return named.every(address => address.toLowerCase().replace(/[.!?]+$/, "") === sender);
-}
-
 export type IntakeEvidenceAnchor = { id: string; sourceId: string; text: string };
 type Anchor = IntakeEvidenceAnchor;
 const record = (value: unknown): value is Record<string, unknown> => !!value && typeof value === "object" && !Array.isArray(value);

@@ -6,6 +6,7 @@ import {
 } from "./contract";
 import { SAV_TICKET_RETURN_NOTE_VERSION, savTicketReturnNote } from "../ticket-return-note";
 import { savEvidenceContains } from "../evidence-text";
+import { savIntakeDeclaredAccount } from "./registration-declaration";
 import {
   intakeMessageSchema, intakeContactSchema, intakeAssociationSchema, intakeTicketSchema, intakeHistorySchema,
   messageAnalysisSchema, issueAssessmentSchema, identityAssessmentSchema,
@@ -306,6 +307,8 @@ export async function planSavIntake(
       const source = declaration.sourceMessageId === message.id ? message : conversation.find(m => m.id === declaration.sourceMessageId);
       if (!source || source.direction !== "inbound" || !source.contentComplete || normalizeEmail(source.fromEmail) !== address
         || !source.currentText.includes(declaration.quote) || !declaration.quote.toLowerCase().includes(declaration.address.toLowerCase())) return context("contact_lookup_incomplete");
+      // SAV-46 R1: a quoted, written address is located, not proven to be the customer's own account.
+      if (!savIntakeDeclaredAccount(source.currentText, declaration.address, { continuation: Boolean(continuation) && source.id === message.id })) return context("contact_lookup_incomplete");
       address = normalizeEmail(declaration.address); addressOrigin = "customer_declared_registration";
       if (source.id !== message.id) identityEvidenceIds.push(addEvidence("registration-declaration", "customer_history", source.id, source, input.conversation.observedAt));
     }
