@@ -17,6 +17,9 @@ describe("declared account role", () => {
     ["Je n'arrive pas à me connecter à mon compte account@customer.test.", "account@customer.test"],
     ["Mon compte Limova est ACCOUNT@customer.test et je veux connecter mailbox@connector.test à Outlook.", "account@customer.test"],
     ["Je veux connecter mailbox@connector.test à Outlook, mon compte Limova est account@customer.test.", "account@customer.test"],
+    ["Mon compte Limova est account@customer.test et resource@connector.test n'est pas mon compte.", "account@customer.test"],
+    ["Mon compte Limova est account@customer.test, je n'arrive pas à me connecter.", "account@customer.test"],
+    ["My Limova account is account@customer.test. It is not working.", "account@customer.test"],
   ])("proves: %s", (text, address) => expect(account(text, address)).toBe(true));
   it.each([
     ["Bonjour, comment connecter resource@connector.test à Outlook pour retrouver mes factures ?", "resource@connector.test"],
@@ -33,6 +36,13 @@ describe("declared account role", () => {
     ["Le 30 oct. Jean a écrit :\nMon compte est resource@connector.test", "resource@connector.test"],
     ["Mon compte est account@customer.test", "other@customer.test"],
     ["Mon compte est account@customer.test.extra", "account@customer.test"],
+    ["Mon compte Limova est resource@connector.test, mais ce n'est pas mon compte.", "resource@connector.test"],
+    ["My Limova account is resource@connector.test, but this is not my account.", "resource@connector.test"],
+    ["Mon compte Limova est resource@connector.test, non c'est le compte de mon collègue.", "resource@connector.test"],
+    ["Mon compte Limova est resource@connector.test. Non, ce n'est plus mon adresse d'inscription.", "resource@connector.test"],
+    ["My account is resource@connector.test, sorry, wrong address.", "resource@connector.test"],
+    ["Mon compte est resource@connector.test, non pardon, account@customer.test.", "resource@connector.test"],
+    ["Mon compte Limova est resource@connector.test et resource@connector.test n'est pas mon compte.", "resource@connector.test"],
   ])("does not prove: %s", (text, address) => expect(account(text, address)).toBe(false));
   it("a server-verified continuation reply proves the address without an account statement, never when negated or a resource", () => {
     expect(account("Voici l'adresse : account@customer.test", "account@customer.test", true)).toBe(true);
@@ -40,6 +50,7 @@ describe("declared account role", () => {
     expect(account("Voici l'adresse : account@customer.test", "account@customer.test", false)).toBe(false);
     expect(account("Ce n'est pas account@customer.test", "account@customer.test", true)).toBe(false);
     expect(account("Connectez account@customer.test à Outlook", "account@customer.test", true)).toBe(false);
+    expect(account("Voici l'adresse : account@customer.test, mais ce n'est pas mon compte.", "account@customer.test", true)).toBe(false);
   });
   it("an unproven declaration is discardable only when no other written address carries an account statement", () => {
     expect(intakeRegistrationDiscardable("Comment connecter resource@connector.test à Outlook ?", "sender@example.test", false)).toBe(true);

@@ -78,6 +78,9 @@ describe.each<Reader>(["current", "simple"])("R1 %s reader: a written address is
     ["third party", "Mon collègue resource@connector.test doit accéder à mon compte.", "resource@connector.test"],
     ["negation", "Ce n'est pas mon compte Limova : resource@connector.test, je veux le connecter.", "resource@connector.test"],
     ["residual signature", "Merci pour votre aide.\nCordialement\nJean\nresource@connector.test", "resource@connector.test"],
+    ["retracted after the address (FR)", "Mon compte Limova est resource@connector.test, mais ce n'est pas mon compte.", "resource@connector.test"],
+    ["retracted after the address (EN)", "My Limova account is resource@connector.test, but this is not my account.", "resource@connector.test"],
+    ["corrected to a colleague's account", "Mon compte Limova est resource@connector.test, non c'est le compte de mon collègue.", "resource@connector.test"],
   ])("%s: the address is never looked up as the account and no ticket lands on it", async (_, text, declared) => {
     const b = bench(reader, text, [RESOURCE_CONTACT, MAILBOX_CONTACT]);
     const plan = await b.run(declared);
@@ -140,6 +143,14 @@ describe("R1 engine: the declared address must carry its account role", () => {
     const plan = await e.run();
     expect(ticketOn(plan)).toBe("301");
     expect(plan.decision.requests[0].evidenceIds).toContain("initial-request");
+  });
+  it("a statement retracted after the address fails closed before any lookup; another unretracted account stays usable", async () => {
+    const retracted = "Mon compte Limova est resource@connector.test, mais ce n'est pas mon compte.";
+    const e = engine(retracted, { address: "resource@connector.test", sourceMessageId: mid, quote: retracted }, [RESOURCE_CONTACT]);
+    expect((await e.run()).decision.disposition).toMatchObject({ kind: "collect_context", reasons: expect.arrayContaining(["contact_lookup_incomplete"]) });
+    expect(e.calls).toEqual([]);
+    const both = "Mon compte Limova est account@customer.test et resource@connector.test n'est pas mon compte.";
+    expect(ticketOn(await engine(both, { address: "account@customer.test", sourceMessageId: mid, quote: both }, [ACCOUNT_CONTACT, RESOURCE_CONTACT]).run())).toBe("301");
   });
   it("a negated continuation reply is not a current declaration", async () => {
     const text = "Ce n'est pas account@customer.test";

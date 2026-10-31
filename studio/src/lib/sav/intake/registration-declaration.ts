@@ -40,6 +40,14 @@ const CONTEXT_VETO = new RegExp(word([
 ].join("|")), "u");
 /** Connecting something is a resource; logging oneself in ("me connecter") is not. */
 const CONNECT = /(?<![\p{L}\d])(?<!(?:me|se|nous|vous|m'|s')\s?)connect\p{L}*/u;
+/** A later correction bound to this address: an interjection right after it ("…, non pardon"),
+ * a wrong/someone else's account, or a negated account statement ("mais ce n'est pas mon compte"). */
+const CORRECTION = /^[\s,;:.!?-]*(?:non|no|nope|pardon|oups|sorry)(?![\p{L}\d])/u;
+const OTHER_ACCOUNT = new RegExp(word([
+  "(?:le |un )?compte (?:de|d'un|d'une|du) \\p{L}+", "son compte", "leur compte", "someone else's account", "(?:his|her|their) account", "\\p{L}+'s account",
+  "wrong (?:account|email|e-mail|address)", "not the right (?:account|email|e-mail|address)",
+  "pas (?:le bon (?:compte|e-?mail|mail)|la bonne adresse)", "mauvaise? (?:compte|adresse|e-?mail|mail)",
+].join("|")), "u");
 const QUOTED_LINE = /^\s*>/u;
 const SIGNOFF = /^\s*(?:--|—|cordialement|bien cordialement|tr[eè]s cordialement|bien [àa] vous|salutations(?: distingu[ée]es)?|best regards|kind regards|regards|best|sincerely|cheers|merci d'avance|merci par avance|bonne journ[ée]e)[\s,.!]*$/u;
 const REPLY_HEADER = /^\s*(?:le .{1,160}a [ée]crit\s*:|on .{1,160}wrote\s*:|-{2,}\s*(?:original message|message d'origine|message transf[ée]r[ée])|de\s*:|from\s*:|envoy[ée]\s*:|sent\s*:)/u;
@@ -82,16 +90,22 @@ function occurrenceVerdict(text: string, occurrences: Occurrence[], target: Occu
   // Vetoes bear on the clause that links the statement to this address, not on the whole
   // sentence: "mon compte Limova est A et je veux connecter B à Outlook" proves A, never B.
   const vetoed = (clause: string) => CONTEXT_VETO.test(clause) || CONNECT.test(clause);
+  // A retraction after the address, up to the next written address (so another, unretracted
+  // account keeps its own statement): "Mon compte Limova est A, mais ce n'est pas mon compte."
+  const rest = fold(masked.slice(target.end)), tail = rest.slice(0, rest.includes("\u0001") ? rest.indexOf("\u0001") : rest.length);
+  const retracted = CORRECTION.test(tail) || OTHER_ACCOUNT.test(tail)
+    || [...tail.matchAll(MARKER)].some(marker => NEGATED_STATEMENT.test(tail.slice(0, marker.index)));
   for (const marker of markers) {
     const start = marker.index, end = start + marker[0].length;
+    if (!(end <= at ? linked(sentence.slice(end, at)) : start >= after && linked(sentence.slice(after, start)))) continue;
+    // Only a statement linked to this address can deny it; another address's denial does not.
     if (NEGATED_STATEMENT.test(sentence.slice(0, start))) return { statement, account: false };
-    if (end <= at ? linked(sentence.slice(end, at)) : start >= after && linked(sentence.slice(after, start)))
-      return { statement, account: !vetoed(clauseAround(sentence, Math.min(start, at), Math.max(end, after))) };
+    return { statement, account: !retracted && !vetoed(clauseAround(sentence, Math.min(start, at), Math.max(end, after))) };
   }
   if (!continuation) return { statement, account: false };
   // The server verified that an identification template asked this sender for the address.
   const clause = clauseAround(sentence, at, after);
-  return { statement, account: !NEGATION.test(clause) && !vetoed(clause) };
+  return { statement, account: !retracted && !NEGATION.test(clause) && !vetoed(clause) };
 }
 
 /** True only when the address is written in the source and every one of its occurrences either
