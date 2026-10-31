@@ -7,7 +7,7 @@ import { createHash } from "node:crypto";
 import { describe, expect, it } from "vitest";
 import { planSavIntake } from "./engine";
 import type { EngineInput, EnginePolicy, IntakeAdapters, IntakeAssociation, IntakeContact, IntakePlan, IntakeTicket, ReadResult } from "./engine-types";
-import { intakeResponseSchema, type IntakeGeminiCall, type IntakeModelTrace } from "./model-readers";
+import { intakeResponseSchema, type IntakeGeminiCall, type IntakeModelTrace, type IntakeValidatedEvidence } from "./model-readers";
 import { createSavIntakeSimpleReaders, memoizeIntakeCrmReaders, SAV_INTAKE_SIMPLE_REVISION } from "./simple-readers";
 
 const at = "2026-10-20T10:00:00.000Z";
@@ -21,7 +21,8 @@ type Data = { outputReferences: SimpleWireReferences; current: string; contacts:
 type Answer = Record<string, unknown>;
 
 function bench(options: { text?: string; subject?: string; contacts?: IntakeContact[]; tickets?: IntakeTicket[]; edges?: IntakeAssociation[];
-  newsletterRule?: boolean; conversation?: EngineInput["message"][]; continuation?: EngineInput["identificationContinuation"]; unread?: EngineInput["message"]["unreadAttachments"] } = {}) {
+  newsletterRule?: boolean; conversation?: EngineInput["message"][]; continuation?: EngineInput["identificationContinuation"]; unread?: EngineInput["message"]["unreadAttachments"];
+  onValidatedEvidence?: (evidence: IntakeValidatedEvidence) => void } = {}) {
   const contacts = options.contacts ?? [{ id: "101", emails: ["sender@example.test"] }];
   const tickets = options.tickets ?? [];
   const crmCalls: string[] = [];
@@ -53,7 +54,8 @@ function bench(options: { text?: string; subject?: string; contacts?: IntakeCont
   };
   const shared = memoizeIntakeCrmReaders(crm);
   const provenance = new Map([[mid, { subject: options.subject ?? "Synchronisation agenda" } as never]]);
-  const semantic = createSavIntakeSimpleReaders({ model: "gemini-fixture", call, crm: shared, policy, provenance, onTrace: t => traces.push(t), onJudgement: judgement => judgements.push(judgement) });
+  const semantic = createSavIntakeSimpleReaders({ model: "gemini-fixture", call, crm: shared, policy, provenance, onTrace: t => traces.push(t), onJudgement: judgement => judgements.push(judgement),
+    ...(options.onValidatedEvidence ? { onValidatedEvidence: options.onValidatedEvidence } : {}) });
   const run = (answer: (data: Data, n: number) => Answer) => { script = answer; return planSavIntake(input, { ...shared, ...semantic }, policy); };
   const resumeIssues = async () => {
     script = d => judgement(d);
@@ -376,4 +378,32 @@ it("retains all twenty ticket verdicts and all current requests with concise ins
   expect(b.systems[0]).toContain("without omitting any request");
   expect(plan.newTicket?.requestIds).toEqual(["r1", "r2"]);
   expect(b.judgements[0].tickets.map(ticket => ticket.ticketId)).toEqual(tickets.map(ticket => ticket.id));
+});
+
+describe("SAV-46 validated evidence before the reader merges its requests", () => {
+  const two = (data: Data) => judgement(data, { requests: [{ id: "r1", kind: "support", summary: "SYN agenda en panne.", sourceIds: ["current"] },
+    { id: "r2", kind: "support", summary: "SYN export en échec.", sourceIds: ["current"] }], ticketDescription: undefined, tickets: same(data, ["201"]) });
+  const tickets = [ticket("201", { ownerId: "777" })];
+  it("RED on 238: the accepted judgement keeps each request's summary and sources, which the plan merges away", async () => {
+    const evidence: IntakeValidatedEvidence[] = [], b = bench({ tickets, onValidatedEvidence: e => evidence.push(e) });
+    const plan = await b.run(two);
+    expect(evidence).toHaveLength(1);
+    expect(evidence[0]).toMatchObject({ reader: "simple", phase: "understanding", kind: "judgement", focused: false, callIndex: 1,
+      value: { requests: [{ id: "r1", summary: "SYN agenda en panne.", sourceIds: ["current"] }, { id: "r2", summary: "SYN export en échec.", sourceIds: ["current"] }],
+        tickets: [{ ticketId: "201", relation: "same", why: "Même problème de synchronisation." }] } });
+    // What the engine decides from: request ids and kinds only, no per-request summary or sources.
+    expect(JSON.stringify(plan.decision.requests)).not.toContain("SYN export en échec.");
+    expect(JSON.stringify(evidence)).not.toMatch(/thought|usageMetadata|candidates|Authorization/);
+  });
+  it("absent or failing, the callback changes neither the plan, the calls nor the traces", async () => {
+    const plain = bench({ tickets }), observed = bench({ tickets, onValidatedEvidence: () => {} }), failing = bench({ tickets, onValidatedEvidence: () => { throw Error("SYN_OBSERVER_FAILED"); } });
+    const [a, b, c] = [await plain.run(two), await observed.run(two), await failing.run(two)];
+    expect(b).toEqual(a); expect(c).toEqual(a);
+    expect(observed.seen).toEqual(plain.seen); expect(failing.seen).toEqual(plain.seen);
+    expect(observed.traces.map(t => [t.phase, t.accepted, t.errorCode, t.inputHash])).toEqual(plain.traces.map(t => [t.phase, t.accepted, t.errorCode, t.inputHash]));
+  });
+  it("a copy: mutating the received evidence cannot alter the reader's answer", async () => {
+    const plain = bench({ tickets }), mutating = bench({ tickets, onValidatedEvidence: e => { (e.value as { requests: unknown[] }).requests.length = 0; } });
+    expect(await mutating.run(two)).toEqual(await plain.run(two));
+  });
 });

@@ -20,3 +20,11 @@ it("shows separate phase caps, progress and an explicit semantic review attestat
 it("denied operator session cannot expose the report", async () => {
   m.panel.mockRejectedValue(Error("NO_SESSION")); await expect(Page()).rejects.toThrow("NO_SESSION");
 });
+it("SAV-46 lists each done dossier with a link to its private receipt and says identical is only a projection", async () => {
+  m.panel.mockResolvedValue({ configured: true, campaignId: "synthetic-60", denominators: { done: 1, listed: 60, interrupted: 0 }, spend: { nanoUsd: 0, maxNanoUsd: 20e9 }, until: "synthetic",
+    rows: Array.from({ length: 60 }, (_, i) => i === 0 ? { messageId: "10000000-0000-4000-8000-000000000001", state: "done", verdict: "identical", qualificationEvidence: "legacy", attestation: null } : { messageId: String(i), state: "pending" }) });
+  const html = renderToStaticMarkup(await Page());
+  expect(html).toContain('href="/studio/sav/intake/comparison/10000000-0000-4000-8000-000000000001"');
+  expect(html).toContain("ce n’est ni un jugement métier ni une qualification");
+  expect(html).toContain("preuve legacy"); expect(html).toContain("non attesté");
+});

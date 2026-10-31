@@ -3,7 +3,8 @@ import { z } from "zod";
 import { requireDb } from "@/db";
 import { auditLogs } from "@/db/schema";
 import { requireIntakeConsoleStaff } from "./console-auth";
-import { readSavIntakeComparisonReport, runSavIntakeComparisonBatch, savIntakeComparisonConfig } from "./comparison-campaign";
+import { appendSavIntakeComparisonAttestation, readSavIntakeComparisonEvidence, readSavIntakeComparisonReport, runSavIntakeComparisonBatch, savIntakeComparisonConfig } from "./comparison-campaign";
+import { comparisonAttestationSchema } from "./comparison-evidence";
 const command = z.object({ stage: z.enum(["sentinels", "remaining"]), reviewed: z.boolean().default(false), expectedMessageId: z.uuid(), expectedCampaignId: z.string().regex(/^[a-z0-9-]{1,64}$/) }).strict();
 type Environment = () => Record<string, string | undefined>;
 type Report = Awaited<ReturnType<typeof readSavIntakeComparisonReport>>;
@@ -22,24 +23,49 @@ function configured(env: Environment) {
   if ((values.SAV_INTAKE_PIPELINE ?? "current") !== "current") throw Error("SAV_INTAKE_COMPARISON_LIVE_READER_CHANGED");
   return config;
 }
-/** Completion is not semantic approval: the administrator must additionally attest that
- * the ten independent references were checked. Current-reader failures stay visible. */
+type Row = Extract<Report, { configured: true }>["rows"][number];
+/** A done dossier is usable only with a complete v1 receipt: a legacy summary, an incomplete,
+ * oversize or invalid receipt never stands in for evidence (no backfill). */
+const usable = (row: Row) => row.state === "done" && detailSchema.safeParse(row.detail).success
+  && detailSchema.parse(row.detail).coverage.length === 0 && row.qualificationEvidence === "complete";
+const manifestSha = (row: Row) => (row.detail?.evidence as { receiptSha256?: unknown } | undefined)?.receiptSha256;
+/** Completion and projection equality are not semantic approval: each of the ten receipts must carry
+ * an explicit human attestation naming that exact receipt and its pre-frozen oracle, and matching it.
+ * Current-reader failures stay visible and do not decide this gate. */
 export function comparisonSentinelsReady(report: Report) {
   return report.configured && report.rows.slice(0, 10).length === 10
-    && report.rows.slice(0, 10).every(row => row.state === "done" && detailSchema.safeParse(row.detail).success
-      && detailSchema.parse(row.detail).coverage.length === 0);
+    && report.rows.slice(0, 10).every(row => usable(row) && row.attestation !== null && row.attestation !== "invalid"
+      && row.attestation.outcome === "matches_oracle" && row.attestation.claimId === row.claimId && row.attestation.receiptSha256 === manifestSha(row));
 }
-/** A lost response/unfinished claim or unusable simple result must not advance
- * to a second dossier merely because its claim is already taken. */
+/** A lost response/unfinished claim, an unusable simple result or a receipt that cannot be
+ * qualified must not advance to a second dossier merely because its claim is already taken. */
 export function comparisonPhaseCanContinue(report: Report, stage: "sentinels" | "remaining") {
   if (!report.configured) return false;
   const rows = stage === "sentinels" ? report.rows.slice(0, 10) : report.rows.slice(10);
-  return rows.every(row => row.state === "pending" || row.state === "done" && detailSchema.safeParse(row.detail).success
-    && detailSchema.parse(row.detail).coverage.length === 0);
+  return rows.every(row => row.state === "pending" || usable(row));
 }
 export async function readIntakeComparisonPanel() {
   await administrator();
   return readSavIntakeComparisonReport();
+}
+/** One dossier's private receipt: administrator first, then a well-formed listed identifier, then the
+ * single lookup and decryption. Nothing here can start a call or write. */
+export async function readIntakeComparisonEvidence(rawMessageId: unknown, options: { env?: Environment } = {}) {
+  await administrator();
+  const messageId = z.uuid().parse(rawMessageId);
+  return readSavIntakeComparisonEvidence(messageId, options.env);
+}
+/** Explicit human attestation of one receipt against its pre-frozen oracle. Only a verified, complete
+ * receipt whose exact hash the administrator saw can be attested; it never starts a comparison. */
+export async function attestIntakeComparison(raw: unknown, options: { env?: Environment } = {}) {
+  const staff = await administrator(), input = comparisonAttestationSchema.parse(raw), env = options.env ?? (() => process.env), config = configured(env);
+  if (input.expectedCampaignId !== config.campaignId) throw Error("SAV_INTAKE_COMPARISON_STALE_COMMAND");
+  const detail = await readSavIntakeComparisonEvidence(input.messageId, env);
+  if (detail.qualificationEvidence !== "complete" || !detail.verification?.ok || !detail.claimId) throw Error("SAV_INTAKE_COMPARISON_EVIDENCE_NOT_QUALIFIABLE");
+  if ((detail.detail?.evidence as { receiptSha256?: unknown } | undefined)?.receiptSha256 !== input.receiptSha256) throw Error("SAV_INTAKE_COMPARISON_STALE_COMMAND");
+  await appendSavIntakeComparisonAttestation({ campaignId: config.campaignId, messageId: input.messageId, claimId: detail.claimId,
+    receiptSha256: input.receiptSha256, oracleSha256: input.oracleSha256, outcome: input.outcome, at: new Date().toISOString() }, staff.email);
+  return { campaignId: config.campaignId, messageId: input.messageId, outcome: input.outcome };
 }
 /** Only the reviewed campaign list from the server grants scope. Rendered campaign/dossier
  * tokens detect stale commands; they cannot select another ID, model, transport or money limit. */

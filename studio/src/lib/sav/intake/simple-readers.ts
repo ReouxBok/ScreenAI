@@ -13,7 +13,7 @@ import { intakeSchemaIssues } from "./schema-diagnostics";
 import { SAV_INTAKE_SIMPLE_REVISION } from "./simple-revision";
 import { simpleWireContract, simpleWireReferences, simpleWireValidationError } from "./simple-wire";
 import { SAV_INTAKE_MODEL_LIMITS } from "./model-limits";
-import { intakeResponseSchema, type IntakeGeminiCall, type IntakeModelTrace, type SavIntakeSemanticReaders } from "./model-readers";
+import { intakeResponseSchema, observeIntakeValidatedEvidence, type IntakeGeminiCall, type IntakeModelTrace, type IntakeValidatedEvidence, type SavIntakeSemanticReaders } from "./model-readers";
 import type { SavIntakeCrmReaders } from "./hubspot-readers";
 import type { prepareSavIntakeMessage } from "./message";
 import {
@@ -138,6 +138,8 @@ export function createSavIntakeSimpleReaders(options: {
   provenance?: Provenance; onTrace?: (trace: IntakeModelTrace) => void;
   /** Accepted judgement summary for the team handoff (rationale, missing, per-ticket reasons). */
   onJudgement?: (judgement: { rationale: string; missing: SimpleOutput["missing"]; identity: SimpleOutput["identity"]; tickets: SimpleOutput["tickets"] }) => void;
+  /** Comparison only: the whole accepted judgement, before per-request summaries and sources are merged. */
+  onValidatedEvidence?: (evidence: IntakeValidatedEvidence) => void;
 }): SavIntakeSemanticReaders {
   if (!/^gemini-[A-Za-z0-9._-]{1,100}$/.test(options.model)) throw Error("SAV_INTAKE_CONFIGURED_MODEL_REQUIRED");
   let calls = 0;
@@ -199,6 +201,7 @@ export function createSavIntakeSimpleReaders(options: {
         const discarded = validate(output, message, context, sources, requestsDecided, continuationInitialId);
         trace(true, null, { metadata, outputHash: hash(result.json), ...(discarded ? { normalization: { ...emptyIntakeOutputNormalization(), discardedRegistrations: 1 } } : {}) });
         options.onJudgement?.({ rationale: output.rationale, missing: output.missing, identity: output.identity, tickets: output.tickets });
+        observeIntakeValidatedEvidence(options.onValidatedEvidence, { reader: "simple", phase, kind: "judgement", callIndex: calls, focused: requestsDecided, value: output });
         return output;
       } catch (error) {
         const malformed = error instanceof z.ZodError || error instanceof SimpleValidationError;
