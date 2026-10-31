@@ -4,7 +4,7 @@ import { applySavAttachmentVisualResult, savVisualResultSchema, redactSavAttachm
 import { isSavPdfMedia } from "../attachment-pdf";
 import type { SavAttachmentObservation } from "../attachment-contract";
 import { savEvidenceContains } from "../evidence-text";
-import { intakeRegistrationDiscardable } from "./model-evidence";
+import { intakeRegistrationDiscardable, savIntakeDeclaredAccount } from "./registration-declaration";
 import { emptyIntakeOutputNormalization } from "./output-normalization";
 import { savGeminiWireBody } from "../gemini-transport";
 import type { SavGeminiMetadata } from "../gemini-response";
@@ -122,7 +122,7 @@ const INSTRUCTION = [
   "nature: request when the CURRENT message asks something; newsletter/information for notifications, automatic replies or mailings (then requests may be empty).",
   "requests: every distinct request of the CURRENT authored message (quoted history is context, not a new request), with a short factual summary and the sourceIds that show it ('current' first).",
   "kinds: support (product/technical/account), finance (billing, invoice, payment, refund), cancellation, partnership, commercial, investor, other, acknowledgement (thanks/ok with nothing to do), unknown.",
-  "registration: only when the CURRENT message gives the email address of the customer's account; quote must be copied verbatim from the current message and contain that address.",
+  "registration: only when the CURRENT message explicitly states that the address is the email of the sender's own Limova account (registration or login), e.g. 'mon compte Limova est <address>'; quote must be copied verbatim from the current message and contain that address. An address to connect, synchronize, share or forward (Outlook, Gmail, calendar, mailbox), a colleague's or third party's, or a negated or quoted one is never a registration, even if it is the only address. Asking how to connect a mailbox to find invoices is support, not finance.",
   "ticketTitle: French, 4 to 6 words, factual, no greeting, no 'Re:'. The server builds the description from all request summaries; do not repeat a description.",
   "identity: which supplied contact is the sender (unique), several contacts that are truly the same person/account (equivalent), or unknown. Use aliases, linked contacts and tickets naming the contact.",
   "tickets: return exactly one verdict for EVERY supplied ticket. same = this ticket covers the same problem as ALL current requests; different = another problem; unclear = you cannot tell. Give one short factual sentence for why, with only unique relevant sourceIds. A shared name, generic topic or keyword is not enough for same.",
@@ -308,8 +308,10 @@ function validate(output: SimpleOutput, message: IntakeMessage, context: Context
   if (!requestsDecided && !output.requests.length && output.nature === "request") throw new SimpleValidationError("request_missing", "requests");
   let discarded = false;
   if (output.registration && (!savEvidenceContains(message.currentText, output.registration.quote)
-    || !output.registration.quote.toLowerCase().includes(output.registration.address.toLowerCase()))) {
-    // Same rule as the current reader: drop an unproven optional declaration, never adopt it.
+    || !output.registration.quote.toLowerCase().includes(output.registration.address.toLowerCase())
+    || !savIntakeDeclaredAccount(message.currentText, output.registration.address, { continuation: Boolean(continuationInitialId) }))) {
+    // Same rule as the current reader: drop an unproven optional declaration (citation or
+    // account role), never adopt it; a stated alternative account stays strict.
     const inherited = Boolean(continuationInitialId) && output.requests.some(r => r.sourceIds.includes(`message-${continuationInitialId}`) && !r.sourceIds.includes("current"));
     if (!intakeRegistrationDiscardable(message.currentText, message.fromEmail, inherited)) throw new SimpleValidationError("registration_source_invalid", "registration");
     delete output.registration; discarded = true;

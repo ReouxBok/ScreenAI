@@ -20,6 +20,7 @@ import { savIntakeSourceSnapshot } from "./runtime-store";
 import { readIntakeOtherRules } from "./other-routing";
 import { qualifyRuntimeCandidate } from "./other-routing-runtime";
 import { createSavIntakeSimpleReaders, readIntakeSimpleContext, SAV_INTAKE_SIMPLE_REVISION } from "./simple-readers";
+import { SAV_INTAKE_DECLARED_ADDRESS_CAP, savIntakeDeclaredAddressCandidates, savIntakeDeclaredAddressConflict } from "./registration-declaration";
 import { intakeTicketDescription, intakeUnreadAttachmentNotice } from "./ticket-description";
 import { savAttachmentInventorySchema } from "../attachment-contract";
 import {
@@ -33,7 +34,7 @@ import {
  * stored dossiers. It never runs on the live mail path: an administrator launches small batches.
  * Read-only CRM, no executor, no live ledger, attempts, runs or call policy. Its own caps and its
  * own append-only ledger (audit events). OFF unless SAV_INTAKE_COMPARISON_JSON is configured. */
-export const SAV_INTAKE_COMPARISON_REVISION = "sav-intake-comparison-2026-10-31.v4";
+export const SAV_INTAKE_COMPARISON_REVISION = "sav-intake-comparison-2026-10-31.v5";
 const campaignSchema = z.object({ campaignId: z.string().regex(/^[a-z0-9-]{1,64}$/), messageIds: z.array(z.uuid()).min(1).max(100),
   maxNanoUsd: z.number().int().min(1).max(50_000_000_000), until: z.iso.datetime() }).strict()
   .refine(c => new Set(c.messageIds).size === c.messageIds.length, "duplicate message");
@@ -252,11 +253,23 @@ async function compareOne(messageId: string, claimId: string, campaign: SavIntak
   }
   if (catalogue && qualifyRuntimeCandidate({ mailboxId: message.mailboxId, subject: message.subject, body: { text: snapshot.body.text ?? "" } }, catalogue)) coverage.push("qualified_other_candidate");
   const policy: EnginePolicy = runtime.policy;
+  // SAV-46 R2: every address the engine could accept as a declared registration is captured with
+  // the sender's scope before any paid call. Capture is not identity: the engine still proves the
+  // account role. More than the cap is refused before dispatch, never truncated; so is a source
+  // that admits two distinct accounts (R7), whichever one a reader would pick.
+  const declared = savIntakeDeclaredAddressCandidates(snapshot.input);
+  const refusal = savIntakeDeclaredAddressConflict(snapshot.input) ? "declared_address_ambiguous"
+    : declared.length > SAV_INTAKE_DECLARED_ADDRESS_CAP ? "declared_address_cap_exceeded" : null;
+  if (refusal) {
+    const refused = [...new Set([...coverage, refusal])];
+    return { coverage: refused, snapshotHash: null, current: null, simple: null, ...compareIntakeSides(empty, empty, refused), evidence: unavailableReaderEvidence(binding, refused) };
+  }
   const crm = frozenComparisonCrm(createSavIntakeHubspotReaders({ network: async (url, init) => network(url, { ...init, redirect: "error",
     headers: { ...Object.fromEntries(new Headers(init?.headers)), Authorization: `Bearer ${env().HUBSPOT_ACCESS_TOKEN}` } }) }));
-  // Capture the superset both readers use (sender contacts, admitted links, tickets, histories), then freeze.
-  // Both address spellings: the simple reader reads the raw sender, the engine its normalized form.
-  for (const address of new Set([snapshot.input.message.fromEmail, snapshot.input.message.fromEmail.trim().toLowerCase()]))
+  // Capture the superset both readers use (sender and admissible declared contacts, admitted links,
+  // tickets, histories), then freeze. Both sender spellings: the simple reader reads the raw sender,
+  // the engine its normalized form; a declared address is looked up normalized, in sorted order.
+  for (const address of new Set([snapshot.input.message.fromEmail, snapshot.input.message.fromEmail.trim().toLowerCase(), ...declared]))
     await readIntakeSimpleContext(crm.capture, address, policy, AbortSignal.timeout(30_000));
   const frozen = await crm.freeze(), crmHash = frozen.hash;
   const commonPreparationMs = Math.max(0, clock() - started);
@@ -269,6 +282,14 @@ async function compareOne(messageId: string, claimId: string, campaign: SavIntak
     const refused = [...new Set([...coverage, "evidence_common_oversize"])];
     return { coverage: refused, snapshotHash: savComparisonSnapshotHash(snapshot.sourceHash, crmHash), current: null, simple: null, ...compareIntakeSides(empty, empty, refused),
       evidence: commonOversizeReaderEvidence(binding, commonPreparationMs) };
+  }
+  // SAV-46 R2: a common capture already incomplete (a CRM read failed, partial or rejected, or the
+  // conversation incomplete) can never yield a qualifiable receipt: refused with its original gaps
+  // before any side, reservation or provider call. A complete empty search is complete, not a gap.
+  if (common.status !== "complete") {
+    const refused = [...new Set([...coverage, "evidence_common_incomplete", ...common.criteriaMissing])];
+    return { coverage: refused, snapshotHash: savComparisonSnapshotHash(snapshot.sourceHash, crmHash), current: null, simple: null, ...compareIntakeSides(empty, empty, refused),
+      evidence: unavailableReaderEvidence(binding, refused) };
   }
   // SAV-72: a created ticket's description is the stored original email, never the planner's text.
   const fromOriginalMail = (plannerDescription: string) => intakeTicketDescription({ subject: message.subject, text: String(snapshot.body.text ?? ""),
