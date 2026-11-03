@@ -209,6 +209,16 @@ export async function syncSavObservation(id: string, collect: (id: string) => Pr
         return { id, status: state, cycle };
     });
 }
+// A stored summary may predate the technical-event classification. If its proposed
+// confirmation came from Gmail, recheck the persisted original before using it.
+async function gmailConfirmationUnproven(tx:Pick<ReturnType<typeof requireDb>,"select">,threadId:string,ref:string) {
+    if (!ref.startsWith("gmail:")) return false;
+    const [message]=await tx.select({body:savMessages.bodyCiphertext,direction:savMessages.direction}).from(savMessages)
+      .where(and(eq(savMessages.threadId,threadId),eq(savMessages.gmailMessageId,ref.slice(6)))).limit(1);
+    if (!message || message.direction!=="inbound") return true;
+    return isDeliveryReportMime(decryptSavPayload<{headers?:Record<string,string>}>(message.body).headers?.["content-type"]);
+}
+
 const qualification = z.object({ observationId: z.uuid(), cycleId: z.uuid(), sourceHash: z.string().length(43), outcome: z.enum(["resolved", "closed_without_resolution", "abandoned", "duplicate", "finance", "cancellation", "insufficient_sources"]), evidenceRef: z.string().max(300).default(""), evidenceHash: z.string().max(43).default(""), resolution: z.string().trim().max(10000).default(""), justification: z.string().trim().min(20).max(2000), customerConfirmationRef:z.string().max(300).default(""), unconfirmedAcknowledged: z.boolean().default(false) }).strict();
 export async function qualifySavObservation(raw: unknown, actorEmail: string) {
     assertKnowledgeUgoApproval(actorEmail);
@@ -243,7 +253,7 @@ export async function qualifySavObservation(raw: unknown, actorEmail: string) {
             const currentQualification=await readSavCaseLearningQualification(observation.threadId,tx);
             if(!currentQualification.allowed)throw new Error("SAV_OBSERVATION_QUALIFICATION_REQUIRED");
             const proof = summary.humanEvidence.find(e => e.sourceRef === input.evidenceRef && e.contentHash === input.evidenceHash);
-            if (observation.sourceErrors.length || summary.sourceErrors.length || !proof || input.resolution.length < 20 || (input.customerConfirmationRef ? !summary.customerConfirmation.includes(input.customerConfirmationRef) : !input.unconfirmedAcknowledged) || summary.category === "billing" || summary.reasonCode === "cancellation_human_only")
+            if (observation.sourceErrors.length || summary.sourceErrors.length || !proof || input.resolution.length < 20 || (input.customerConfirmationRef ? (!summary.customerConfirmation.includes(input.customerConfirmationRef) || await gmailConfirmationUnproven(tx,observation.threadId,input.customerConfirmationRef)) : !input.unconfirmedAcknowledged) || summary.category === "billing" || summary.reasonCode === "cancellation_human_only")
                 throw new Error("SAV_OBSERVATION_QUALIFICATION_REQUIRED");
             const resolution = publicKnowledgeText(input.resolution);
             const justification = publicKnowledgeText(input.justification);
@@ -345,13 +355,20 @@ export async function prepareSavObservationLearning(id:string,now=new Date(),opt
   }
   const proof=observedResolutionEvidence(summary.events.filter(e=>e.occurredAt>=(summary.baselineAt??row.createdAt.toISOString())),summary.baselineProposal??null);
   if(!proof){await tx.update(savObservationCycles).set({learningDisposition:"insufficient_independent_evidence"}).where(eq(savObservationCycles.id,cycle.id));return null;}
+  const lastCustomer=summary.events.filter(e=>e.kind==="customer_reply"&&e.occurredAt>proof.occurredAt).at(-1);
+  const customerConfirmed=Boolean(lastCustomer && explicitCustomerConfirmation(lastCustomer.text));
+  if (customerConfirmed && lastCustomer && await gmailConfirmationUnproven(tx,row.threadId,lastCustomer.sourceRef)) {
+    // A fresh sync will replace the stale summary. Preserve the original for audit until then.
+    await tx.update(savResolutionObservations).set({nextSyncAt:now}).where(eq(savResolutionObservations.id,id));
+    return null;
+  }
   await tx.update(savObservationCycles).set({qualification:"evidence_observed",qualifiedBy:null,qualifiedAt:null}).where(eq(savObservationCycles.id,cycle.id));
-  return {row,cycle,summary,proof,qualificationHash:qualification.fingerprint!};
+  return {row,cycle,summary,proof,customerConfirmed,qualificationHash:qualification.fingerprint!};
  });
  if(!prepared)return {disposition:"not_evaluable"};
- const {row,cycle,summary,proof,qualificationHash}=prepared;
+ const {row,cycle,summary,proof,customerConfirmed,qualificationHash}=prepared;
  let result:Awaited<ReturnType<typeof processSavLearningResolution>>;
- try { result=await processSavLearningResolution({ticketId:row.hubspotTicketId??undefined,threadId:row.threadId,sourceRef:`sav-observation:${cycle.id}`,origin:"observation",cycleStartedAt:cycle.createdAt,snapshotId:cycle.id,snapshotHash:cycle.sourceHash,subject:summary.subject,resolution:proof.text,provenance:"observed_treatment",sourceMessageId:proof.sourceRef,evidenceRef:proof.sourceRef,evidenceExcerpt:proof.text.slice(0,240),evidenceOccurredAt:proof.occurredAt,customerConfirmed:explicitCustomerConfirmation(summary.events.filter(e=>e.kind==="customer_reply"&&e.occurredAt>proof.occurredAt).at(-1)?.text??""),cycleSourceHash:cycle.sourceHash,observationId:row.id,cycleId:cycle.id,caseContext:{...(summary.origin === "intake" ? {origin:"intake" as const,intakeBaseline:summary.intakeBaseline} : {}),baseline:summary.baselineProposal,baselineAt:summary.baselineAt,events:summary.events,currentQualificationHash:qualificationHash}},{...options,now});
+ try { result=await processSavLearningResolution({ticketId:row.hubspotTicketId??undefined,threadId:row.threadId,sourceRef:`sav-observation:${cycle.id}`,origin:"observation",cycleStartedAt:cycle.createdAt,snapshotId:cycle.id,snapshotHash:cycle.sourceHash,subject:summary.subject,resolution:proof.text,provenance:"observed_treatment",sourceMessageId:proof.sourceRef,evidenceRef:proof.sourceRef,evidenceExcerpt:proof.text.slice(0,240),evidenceOccurredAt:proof.occurredAt,customerConfirmed,cycleSourceHash:cycle.sourceHash,observationId:row.id,cycleId:cycle.id,caseContext:{...(summary.origin === "intake" ? {origin:"intake" as const,intakeBaseline:summary.intakeBaseline} : {}),baseline:summary.baselineProposal,baselineAt:summary.baselineAt,events:summary.events,currentQualificationHash:qualificationHash}},{...options,now});
  } catch(error) {if(isSavDerivedBudgetDeferred(error)) {await db.update(savResolutionObservations).set({state:"waiting_budget"}).where(eq(savResolutionObservations.id,id));return {disposition:"deferred",reasonCode:"daily_budget"};}throw error;}
  if(result.disposition==="deferred"){await db.update(savResolutionObservations).set({state:"waiting_budget"}).where(eq(savResolutionObservations.id,id));return result;}
  if(result.disposition==="duplicate" && !result.candidateId && result.reasonCode==="comparison_started") return result;

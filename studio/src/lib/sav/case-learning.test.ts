@@ -64,6 +64,23 @@ describe("SAV86 immutable reference and independent tracking",()=>{
    expect(summary.customerConfirmation).toEqual([]);
    expect(summary.events.find(e=>e.sourceRef==="gmail:dsn")).toMatchObject({kind:"delivery_notice",text,sourceAliases:["hubspot:emails:2"]});
  });
+ it("refuses an old saved confirmation when its original Gmail message is a delivery report",async()=>{
+   const id=await observation();
+   const [baseline]=await f.db.select().from(savMessages).where(eq(savMessages.id,messageId));
+   const [mail]=await f.db.insert(savMessages).values({threadId,mailboxId:baseline.mailboxId,direction:"inbound",
+     gmailMessageId:"legacy-dsn",fromEmail:"dsn@example.invalid",receivedAt:new Date("2026-10-19T15:00:00Z"),
+     bodyCiphertext:encryptSavPayload({text:"Ça marche.",headers:{}})}).returning();
+   await syncSavObservation(id,async()=>snapshot(),now);
+   const [view]=await getSavObservations(threadId),cycle=view.cycles[0];
+   expect(cycle.summary.customerConfirmation).toContain("gmail:legacy-dsn");
+   await f.db.update(savMessages).set({bodyCiphertext:encryptSavPayload({text:"Ça marche.",headers:{"content-type":"multipart/report; report-type=delivery-status"}})}).where(eq(savMessages.id,mail.id));
+   const proof=cycle.summary.humanEvidence[0];
+   await expect(qualifySavObservation({observationId:id,cycleId:cycle.id,sourceHash:cycle.sourceHash,outcome:"resolved",
+     evidenceRef:proof.sourceRef,evidenceHash:proof.contentHash,customerConfirmationRef:"gmail:legacy-dsn",
+     resolution:"Procédure synthétique à vérifier puis appliquer.",justification:"Preuve synthétique vérifiée en test isolé."},actor)).rejects.toThrow("SAV_OBSERVATION_QUALIFICATION_REQUIRED");
+   expect(await prepareSavObservationLearning(id,now)).toMatchObject({disposition:"not_evaluable"});
+   expect(state.calls).toBe(0);
+ });
  it("rejects a different associated ticket and retains incomplete coverage",async()=>{const id=await observation();expect((await syncSavObservation(id,async()=>({...snapshot(),ticketId:"456"}),now)).status).toBe("sources_incomplete");});
  it("deduplicates one Gmail/CRM exchange by its actual message identity",async()=>{const id=await observation();await syncSavObservation(id,async()=>snapshot([{...event("customer_reply","Bonjour, ma connexion échoue."),messageIdentity:"<synthetic@example.invalid>"}]),now);const [row]=await getSavObservations(threadId);expect(row.cycles[0].summary.events.filter(e=>e.messageIdentity)).toHaveLength(1);});
 });
