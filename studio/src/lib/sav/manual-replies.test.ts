@@ -92,6 +92,8 @@ describe("V0 human-only reply in the original Gmail thread", () => {
     expect(email.split("\r\n\r\n")[1]).toBe(renderSavOutboundReply(input.text));
     expect(decryptSavPayload<{ text: string }>((await fixture.db.select().from(savReplyDrafts))[0].bodyCiphertext).text).toBe(input.text);
     const sentMessage = (await fixture.db.select().from(savMessages)).find(message => message.direction === "outbound")!;
+    expect(decryptSavPayload<{ headers: Record<string, string> }>(sentMessage.bodyCiphertext).headers).toMatchObject({
+      "message-id": `<sav-${action.id}@studio.limova.ai>`, "x-studio-automation-headers": "singleton-v1" });
     expect(decryptSavPayload<{ text: string }>(sentMessage.bodyCiphertext).text).toBe(renderSavOutboundReply(input.text));
     expect(network.mock.calls.some(([url]) => new URL(String(url)).searchParams.get("q")?.startsWith("in:sent rfc822msgid:"))).toBe(true);
     expect(await fixture.db.select().from(savFollowups)).toHaveLength(0);

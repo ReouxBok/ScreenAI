@@ -718,7 +718,10 @@ async function sendReplyAction(action: typeof savActions.$inferSelect, text: str
       toEmails: [thread.customerEmail],
       subject: replySubject,
       preview: redactSavLearningText(transparentText.replace(/\s+/g, " ")).slice(0, 280),
-      bodyCiphertext: encryptSavPayload({ text: transparentText, headers: { "message-id": rfcMessageId } }),
+      // This composer generated exactly one Message-ID. A search-only recovery
+      // has no equivalent proof of the raw headers until Gmail is read back.
+      bodyCiphertext: encryptSavPayload({ text: transparentText, headers: { "message-id": rfcMessageId,
+        ...(!existing && sent.id && sent.threadId === thread.gmailThreadId ? { "x-studio-automation-headers": "singleton-v1" } : {}) } }),
       receivedAt: now,
       processedAt: now,
       analysisStatus: "done",

@@ -1742,7 +1742,7 @@ it("V1 integrated: absence, real reply, partial history, then observation outage
     // Gmail stored a verifiable out-of-office response. The next inbound has the same subject.
     const { parseGmailMessage } = await import("../gmail");
     const parsed = parseGmailMessage("support@example.invalid", { id: "vacation", threadId: "gmail-thread",
-        internalDate: String(Date.now()), payload: { mimeType: "text/plain", body: { size: 14, data: Buffer.from("Je suis absent.").toString("base64url") }, headers: [
+        internalDate: String(Date.now()), payload: { mimeType: "text/plain", body: { size: Buffer.byteLength("Je suis absent."), data: Buffer.from("Je suis absent.").toString("base64url") }, headers: [
             { name: "Subject", value: "Re: Synthetic connection failure" },
             { name: "From", value: "customer@example.invalid" }, { name: "To", value: "support@example.invalid" },
             { name: "Auto-Submitted", value: "auto-replied" }, { name: "In-Reply-To", value: "<campaign@example.invalid>" }] } });
