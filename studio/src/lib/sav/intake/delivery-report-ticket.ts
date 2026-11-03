@@ -23,12 +23,13 @@ function header(mail:Mail, name:string) {
 export async function resolveDeliveryReportTicket(messages:Mail[], currentId:string,
   read:(path:string,body?:unknown)=>Promise<unknown>):Promise<Target> {
   const current = messages.find(m => m.id === currentId);
-  if (!current || current.direction !== "inbound" ||
+  if (!current || current.direction !== "inbound" || header(current,"x-studio-automation-headers") !== "singleton-v1" ||
       !/^multipart\/report\s*;(?:[^;]*;)*\s*report-type\s*=\s*(?:"delivery-status"|delivery-status)\s*(?:;|$)/i.test(header(current,"content-type")))
     return unresolved("Le message courant ne prouve pas un avis de distribution.");
   const parent = header(current,"in-reply-to");
   const matches = messages.filter(m => header(m,"message-id") === parent);
-  if (!rfcId.test(parent) || matches.length !== 1 || matches[0].direction !== "outbound")
+  if (!rfcId.test(parent) || matches.length !== 1 || matches[0].direction !== "outbound" ||
+      header(matches[0],"x-studio-automation-headers") !== "singleton-v1")
     return unresolved("Aucun message sortant unique de ce fil n’est identifié comme parent direct.");
   try {
     const search = await read("/crm/v3/objects/emails/search", { filterGroups:[{filters:[{propertyName:"hs_email_message_id",operator:"EQ",value:parent}]}],
