@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { describe, expect, it, vi } from "vitest";
-import { planSavIntake } from "./engine";
+import { intakeSelectableTicketIds, planSavIntake } from "./engine";
 import { projectSavIntakeProgress } from "./progress";
 import type { EngineInput, EnginePolicy, IntakeAdapters, IntakeContact, IntakePlan, IntakeTicket, MessageAnalysis, ReadResult } from "./engine-types";
 import type { SavIntakeStepReceipt } from "./contract";
@@ -714,9 +714,22 @@ describe("choosing between plausible tickets after a complete CRM read", () => {
     const f = setup(), undecided = await f.run();
     reason(undecided, "same_issue_unresolved");
     expect(undecided.progress).toMatchObject({ kind: "human_choice", questionCode: "equivalent_ticket_choice", view: "to_validate" });
-    expect(undecided.decision.evidence.filter(e => e.source === "crm_ticket" && e.id.startsWith("ticket-")).map(e => e.sourceId).sort()).toEqual(["201", "202"]);
+    expect(intakeSelectableTicketIds(undecided, [])).toEqual(["201", "202"]);
     f.input.humanResolution = { choiceId: "operator-ticket", at, ticketId: "202" };
     expect(target(await f.run()).target).toMatchObject({ operation: "link", ticketId: "202" });
+  });
+  it("retains a different ticket as evidence but excludes it from the operator’s choices and from a direct override", async () => {
+    const f = setup();
+    f.tickets.push(ticket("203", { stage: "closed", closedAt: "2026-10-02T00:00:00.000Z" }));
+    f.matches["203"] = "different";
+    const undecided = await f.run();
+    expect(undecided.candidateTicketIds).toEqual(["201", "202"]);
+    expect(intakeSelectableTicketIds(undecided, ["203"])).toEqual(["201", "202"]);
+    expect(intakeSelectableTicketIds({ ...undecided, candidateTicketIds: ["201", "203"] }, [])).toEqual([]);
+    f.input.humanResolution = { choiceId: "wrong-destination", at, ticketId: "203" };
+    const rejected = await f.run();
+    reason(rejected, "same_issue_unresolved");
+    expect(rejected.candidateTicketIds).toEqual(["201", "202"]);
   });
   it("keeps an incomplete history out of the choice list", async () => {
     const f = setup();

@@ -124,6 +124,8 @@ export type IntakePlan = {
   noteText: string | null;
   supervisedResource?: PrivateResource;
   candidateContactIds?: string[];
+  /** When present, only these examined tickets are offered to the operator. */
+  candidateTicketIds?: string[];
   // Provider-independent creation intent. The future writer must reuse the existing
   // savSupportTicketProperties mapper; this is not a HubSpot POST payload.
   newTicket?: { contactId: string; title: string; description: string; requestIds: string[];

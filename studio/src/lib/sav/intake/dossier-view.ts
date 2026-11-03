@@ -1,5 +1,6 @@
 import "server-only";
 import type { readIntakeConsoleDetail } from "./console-detail";
+import { intakeSelectableTicketIds } from "./engine";
 import { intakeHandoff, intakeRuntimeHandoffReasons } from "./console-presentation";
 import { readManualOtherEligibility, type ManualOtherEligibility } from "./manual-other-classification";
 
@@ -28,7 +29,8 @@ export function intakeDossierView(data: IntakeConsoleDetail) {
   const plan = applicable ? current?.payload.plan : undefined, disposition = plan?.decision.disposition;
   const historicalPlan = !applicable ? current?.payload.plan : undefined;
   const contacts = [...(current?.candidateContactIds ?? [])].sort();
-  const tickets = [...new Set([...(data.progress?.effects.filter(e=>e.kind==="ticket_create"&&e.state==="confirmed"&&e.ack?.id).map(e=>e.ack!.id!)??[]),...(plan?.decision.evidence.filter(e => e.source === "crm_ticket" && /^\d+$/.test(e.sourceId)).map(e => e.sourceId) ?? [])])];
+  const confirmedIds = data.progress?.effects.filter(e => e.kind === "ticket_create" && e.state === "confirmed" && e.ack?.id).map(e => e.ack!.id!) ?? [];
+  const tickets = intakeSelectableTicketIds(plan, confirmedIds);
   const target = disposition?.kind === "ticket" ? disposition.target : null;
   const historicalTarget=historicalPlan?.decision.disposition.kind==="ticket"?historicalPlan.decision.disposition.target:null;
   const dirty = data.projection.epoch !== data.projection.projectedEpoch;

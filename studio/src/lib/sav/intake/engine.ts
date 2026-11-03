@@ -31,9 +31,26 @@ const observationTimeSchema = z.iso.datetime({ offset: true });
 const DAY = 86_400_000;
 
 /** Content binding, not a signature, dispatch authorization or idempotency store. */
-export function savIntakePlanFingerprint(plan: Pick<IntakePlan, "decision" | "noteText" | "newTicket" | "supervisedResource" | "originalThreadId" | "originalRecipientEmails" | "referenceMode">): string {
+export function savIntakePlanFingerprint(plan: Pick<IntakePlan, "decision" | "noteText" | "newTicket" | "supervisedResource" | "candidateTicketIds" | "originalThreadId" | "originalRecipientEmails" | "referenceMode">): string {
   return sha(canonical({ decision: plan.decision, noteText: plan.noteText, newTicket: plan.newTicket ?? null, supervisedResource: plan.supervisedResource ?? null,
+    ...(plan.candidateTicketIds !== undefined ? { candidateTicketIds: plan.candidateTicketIds } : {}),
     originalThreadId: plan.originalThreadId, originalRecipientEmails: plan.originalRecipientEmails, referenceMode: plan.referenceMode }));
+}
+
+/** Used by both the dossier and its write command. A restricted choice
+ * excludes unrelated evidence and previous creation receipts. Older plans
+ * retain their existing choices and their original fingerprint. */
+export function intakeSelectableTicketIds(plan: IntakePlan | undefined, confirmedIds: string[]): string[] {
+  const examined = plan?.decision.evidence.filter(e => e.source === "crm_ticket" && /^\d+$/.test(e.sourceId)).map(e => e.sourceId) ?? [];
+  if (plan?.candidateTicketIds !== undefined || plan?.progress.kind === "human_choice" && plan.progress.questionCode === "equivalent_ticket_choice") {
+    if (!plan || savIntakePlanFingerprint(plan) !== plan.fingerprint) return [];
+    if (plan.candidateTicketIds !== undefined) {
+      const ids = plan.candidateTicketIds;
+      return plan.progress.kind === "human_choice" && plan.progress.questionCode === "equivalent_ticket_choice"
+        && Array.isArray(ids) && ids.length >= 2 && new Set(ids).size === ids.length && ids.every(id => examined.includes(id)) ? [...ids] : [];
+    }
+  }
+  return unique([...confirmedIds, ...examined]);
 }
 
 /** SAV-73: deterministic markers of a request still open in the current authored text
@@ -114,6 +131,7 @@ export async function planSavIntake(
   let noteText: string | null = null;
   let newTicket: IntakePlan["newTicket"];
   let candidateContactIds: string[] | undefined;
+  let candidateTicketIds: string[] | undefined;
   let selectedEquivalent: string[] | undefined;
   const humanProof = input.humanResolution ? addEvidence("human-choice", "human_override", input.humanResolution.choiceId, input.humanResolution, input.humanResolution.at) : undefined;
   const finalize = (disposition: SavIntakeDecision["disposition"], progress: SavIntakeProgress = { kind: "processing", phase: "context", view: null }, supervisedResource?: PrivateResource): IntakePlan => {
@@ -126,11 +144,12 @@ export async function planSavIntake(
     const ticketId = disposition.kind === "ticket" && disposition.target.operation !== "create" ? disposition.target.ticketId : null;
     const finalNote = disposition.kind === "ticket" ? noteText : null;
     const finalCreation = disposition.kind === "ticket" && disposition.target.operation === "create" ? newTicket : undefined;
-    const fingerprint = savIntakePlanFingerprint({ decision, noteText: finalNote, newTicket: finalCreation, supervisedResource,
+    const fingerprint = savIntakePlanFingerprint({ candidateTicketIds, decision, noteText: finalNote, newTicket: finalCreation, supervisedResource,
       originalThreadId: message.threadId, originalRecipientEmails: [message.fromEmail], referenceMode: input.mode });
     return {
       revision: "sav-intake-engine-2026-10-20.v1", fingerprint, decision,
       steps: mutations.map(mutation => ({ id: `${message.id}:${mutation}:${fingerprint}`, mutation, requiresPermission: mutation, ticketId, status: "not_dispatched" as const })),
+      ...(candidateTicketIds ? { candidateTicketIds } : {}),
       progress: savIntakeProgressSchema.parse(progress), noteText: finalNote, ...(supervisedResource ? { supervisedResource } : {}),
       ...(finalCreation ? { newTicket: finalCreation } : {}), ...((candidateContactIds ?? selectedEquivalent) ? { candidateContactIds:candidateContactIds ?? selectedEquivalent } : {}),
       originalThreadId: message.threadId, originalRecipientEmails: [message.fromEmail], referenceMode: input.mode,
@@ -454,11 +473,15 @@ export async function planSavIntake(
     // A comparison can be undecided even though every source was read. Offer a
     // choice only when every destination is an open, evidenced candidate for
     // every request. An invalid assessment or a failed read never reaches here.
-    const plausibleChoices = !assessment.investigationComplete && candidateTickets.length >= 2
-      && candidateTickets.every(t => t.stage === "open" || t.stage === "new")
-      && assessment.tickets.every(t => (t.relation === "same" || t.relation === "partial")
-        && requests.every(request => t.requestIds.includes(request.id)));
-    if (plausibleChoices && !humanTicketId) return context("same_issue_unresolved", "equivalent_ticket_choice");
+    const plausible = assessment.tickets.filter(t => t.relation !== "different");
+    const plausibleChoices = !assessment.investigationComplete && plausible.length >= 2
+      && plausible.every(t => (t.relation === "same" || t.relation === "partial")
+        && requests.every(request => t.requestIds.includes(request.id))
+        && ["open", "new"].includes(tickets.get(t.ticketId)!.stage));
+    if (plausibleChoices && (!humanTicketId || !plausible.some(t => t.ticketId === humanTicketId))) {
+      candidateTicketIds = plausible.map(t => t.ticketId).sort();
+      return context("same_issue_unresolved", "equivalent_ticket_choice");
+    }
     if (humanTicketId && humanProof && (assessment.investigationComplete || plausibleChoices)) {
       const selected = assessment.tickets.find(t => t.ticketId === humanTicketId);
       if (!selected || !tickets.has(humanTicketId)) return context("same_issue_unresolved", "equivalent_ticket_choice");

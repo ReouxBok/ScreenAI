@@ -70,7 +70,7 @@ async function message(thread = threadId, receivedAt = new Date(), subject = "Sy
     fromEmail: "customer@example.invalid", toEmails: ["support@example.invalid"], subject, receivedAt,
     bodyCiphertext: encryptSavPayload({ text: "The synthetic connection fails.", headers: { "message-id": "<incoming@example.invalid>" }, attachments: [] }) }).returning())[0];
 }
-async function observed(multiple = false, sensitive = false, same = true, equivalentContactIds?: string[], kind?: "acknowledgement") {
+async function observed(multiple = false, sensitive = false, same = true, equivalentContactIds?: string[], kind?: "acknowledgement", undecided?: Record<string, "partial" | "different">) {
   if (multiple) p.setContacts([{ id: "101", emails: ["customer@example.invalid"] }, { id: "102", emails: ["customer@example.invalid"] }]);
   const id = (await enqueueSavIntakeMessage(messageId, options.runtime))!, lease = (await claimSavIntakeRun(id, options.runtime))!;
   const semantics: AcceptedIntakeSemantics = { revision: SAV_INTAKE_SEMANTIC_RECORD_REVISION, validatorRevision: SAV_INTAKE_MODEL_REVISION, records: [] };
@@ -79,8 +79,8 @@ async function observed(multiple = false, sensitive = false, same = true, equiva
       ticketSummary: { title: "Synthetic connection failure", description: "The synthetic connection fails.", requestIds: ["r1"] } }),
     assessIdentity: async ({ candidates, evidence }) => ({ kind: "equivalent", investigationComplete: true,
       contactIds: equivalentContactIds ?? candidates.map(c => c.contact.id), evidenceIds: evidence.map(e => e.id) }),
-    assessIssues: async ({ tickets, requests }) => ({ investigationComplete: true, tickets: tickets.map(({ ticket }) => ({ ticketId: ticket.id,
-      relation: same ? "same" as const : "different" as const, requestIds: requests.map(r => r.id), evidenceIds: ["current", `ticket-${ticket.id}`, `history-${ticket.id}`] })) }),
+    assessIssues: async ({ tickets, requests }) => ({ investigationComplete: !undecided, tickets: tickets.map(({ ticket }) => ({ ticketId: ticket.id,
+      relation: undecided?.[ticket.id] ?? (same ? "same" as const : "different" as const), requestIds: requests.map(r => r.id), evidenceIds: ["current", `ticket-${ticket.id}`, `history-${ticket.id}`] })) }),
   }, semantics, () => {});
   const plan = await planSavIntake(lease.input, { ...createSavIntakeHubspotReaders({ network: p.network }), ...semantic }, options.runtime.policy, {}, () => new Date());
   const payload: IntakeRuntimePayload = { revision: SAV_INTAKE_RUNTIME_REVISION, input: lease.input, plan, semantics, effects: "not_connected",
@@ -224,6 +224,22 @@ it("form -> authenticated CAS -> accepted semantics -> derived run -> real HTTP 
   expect((await db.db.select().from(savIntakeModelCalls))).toHaveLength(3);
   expect((await db.db.select().from(savIntakeRuns)).reduce((n,r)=>n+r.attempts,0)).toBe(2);
   expect(fetch).not.toHaveBeenCalled();
+});
+it("offers only the two plausible tickets in Studio and rejects a direct choice of the unrelated third", async () => {
+  const ids = ["201", "202", "203"];
+  for (const id of ids) p.seedTicket({ id, stage: id === "203" ? "closed" : "open" });
+  p.links.set("contacts:101:tickets", ids);
+  const plan = await observed(false, false, true, undefined, undefined, { "201": "partial", "202": "partial", "203": "different" });
+  expect(plan.candidateTicketIds).toEqual(["201", "202"]);
+  await projectIntakeThread(threadId);
+  const detail = (await readIntakeConsoleDetail(threadId))!;
+  const { intakeDossierView } = await import("./dossier-view");
+  expect(intakeDossierView(detail).tickets).toEqual(["201", "202"]);
+  const raw = { ...await command(), contactId: undefined };
+  await expect(recordIntakeHumanCommand({ ...raw, ticketId: "203" })).rejects.toThrow("HUMAN_CONFLICT");
+  expect(await db.db.select().from(savIntakeHumanEvents)).toHaveLength(0);
+  expect((await recordIntakeHumanCommand({ ...raw, ticketId: "202" })).eventId).toBeTruthy();
+  expect(mutationsSent()).toHaveLength(0);
 });
 it("two operators and replay: one event wins, changed command is rejected", async () => {
   await observed(true); const raw = await command();
