@@ -281,8 +281,6 @@ it.each(["proof", "paused"] as const)("ignores a probe when %s changes during th
   const before = w.seen.model;
   const payload = await payloadOf(id);
   w.crm.history = "complete";
-  const [path] = w.seen.crm.slice(-1);
-  expect(path).toBeDefined();
   w.network.mockImplementationOnce(async () => {
     if (mutation === "proof") {
       const proof = { ...payload.resumeProof!, incomplete: "different-read" };

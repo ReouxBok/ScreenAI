@@ -93,7 +93,7 @@ function budgetRowsValid(rows: Pick<typeof savIntakeModelCalls.$inferSelect,"res
   return { revoked };
 }
 
-const latest = async (tx: Tx, threadId: string) => (await tx.select().from(savMessages).where(and(eq(savMessages.threadId, threadId), eq(savMessages.direction, "inbound")))
+const latest = async (tx: Pick<Tx, "select">, threadId: string) => (await tx.select().from(savMessages).where(and(eq(savMessages.threadId, threadId), eq(savMessages.direction, "inbound")))
   .orderBy(desc(savEffectiveReceivedAt), desc(savMessages.createdAt), desc(savMessages.id)).limit(1))[0];
 const journal = async (tx: Tx, runId: string, kind: string, value: unknown) => {
   await tx.insert(savIntakeJournal).values({ runId, kind, payloadCiphertext: encryptSavPayload(value) });
@@ -251,7 +251,8 @@ export async function claimSavIntakeRun(id: string, config: IntakeRuntimeConfig,
       if (!thread || thread.aiPaused || thread.humanRequestedAt || pause.level === "fully_paused" || (pause.setting?.setAt ?? null) !== first.pauseSetAt ||
         !message || await readSavExternalCompletion(message, db) || await intakeHasHumanDecision(row.messageId, db)) throw Error("SAV_INTAKE_RUNTIME_CONTEXT_CHANGED");
       const proof = parseIntakeResumeProof(decryptSavPayload<IntakeRuntimePayload>(row.payloadCiphertext).resumeProof);
-      if (!proof || intakeResumeProofKey(proof) !== intakeResumeProofKey(first.proof)) throw Error("SAV_INTAKE_RUNTIME_CONTEXT_CHANGED");
+      if (!proof || intakeResumeProofKey(proof) !== intakeResumeProofKey(first.proof) || (await latest(db, row.threadId))?.id !== message.id
+        || (await savIntakeSourceSnapshot(db, message, new Date())).sourceHash !== proof.sourceHash) throw Error("SAV_INTAKE_RUNTIME_CONTEXT_CHANGED");
     };
     const probe = await options.probe!(first.proof, check);
     const claimed = await claimOrReserve(id, config, new Date(), options, { ...first, result: probe });
