@@ -15,7 +15,7 @@ import { assertKnowledgeUgoApproval } from "@/lib/knowledge/contracts";
 import { publicKnowledgeText } from "@/lib/knowledge/conversion";
 import { decryptSavPayload, encryptSavPayload, savContentHash } from "./crypto";
 import { isSavAiAuthoredReply } from "./reply-format";
-import { collectSavObservationSources, type ObservationEvent, type ObservationSnapshot } from "./observation-source";
+import { collectSavObservationSources, isDeliveryReportMime, type ObservationEvent, type ObservationSnapshot } from "./observation-source";
 import { savStoredReviewReasons, type SavReviewReason } from "./review-contract";
 import { reconcileSavDeferredComparisons, processSavLearningResolution, savLearningMaterialText } from "./learning-pipeline";
 import { closeSavLearningReservationTx } from "./learning-admission";
@@ -141,7 +141,7 @@ export async function syncSavObservation(id: string, collect: (id: string) => Pr
             const storedBody=decryptSavPayload<{text:string;headers?:Record<string,string>}>(message.bodyCiphertext);
             const body=storedBody.text;
             if (body.length > 8000) snapshot.errors.push(`gmail:${message.gmailMessageId}:truncated_8000`);
-            events.push({ ...(storedBody.headers?.["message-id"]?{messageIdentity:storedBody.headers["message-id"].trim().toLowerCase()}:{}), fullContentHash: savContentHash(body), truncated: body.length > 8000, sourceRef: `gmail:${message.gmailMessageId}`, kind: message.direction === "inbound" ? "customer_reply" : isSavAiAuthoredReply(body) ? "ai_reply" : "human_reply", occurredAt: message.receivedAt.toISOString(), text: body.slice(0, 8000), author: message.fromEmail, provenance: "Gmail / fil lié synchronisé", associationTicketId: snapshot.ticketId, remoteUpdatedAt: null });
+            events.push({ ...(storedBody.headers?.["message-id"]?{messageIdentity:storedBody.headers["message-id"].trim().toLowerCase()}:{}), fullContentHash: savContentHash(body), truncated: body.length > 8000, sourceRef: `gmail:${message.gmailMessageId}`, kind: message.direction === "inbound" ? (isDeliveryReportMime(storedBody.headers?.["content-type"]) ? "delivery_notice" : "customer_reply") : isSavAiAuthoredReply(body) ? "ai_reply" : "human_reply", occurredAt: message.receivedAt.toISOString(), text: body.slice(0, 8000), author: message.fromEmail, provenance: "Gmail / fil lié synchronisé", associationTicketId: snapshot.ticketId, remoteUpdatedAt: null });
         }
         const reviewRows=messages.length?await tx.select().from(savProposalReviews).where(inArray(savProposalReviews.messageId,messages.map(m=>m.id))).orderBy(asc(savProposalReviews.reviewedAt)).limit(201):[];
         if(reviewRows.length>200)snapshot.errors.push("studio:review_limit_200");

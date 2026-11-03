@@ -50,6 +50,20 @@ describe("SAV86 immutable reference and independent tracking",()=>{
  it("freezes the original once, preserves unknown legacy context and prevents SQL overwrite",async()=>{await f.db.transaction(tx=>captureSavAnalysisSnapshot(tx,runId));const [first]=await f.db.select().from(savAnalysisSnapshots);await f.db.update(savAgentRuns).set({proposalCiphertext:encryptSavPayload({...proposal,replyDraft:"Changed later"})}).where(eq(savAgentRuns.id,runId));await f.db.transaction(tx=>captureSavAnalysisSnapshot(tx,runId));const [current]=await f.db.select().from(savAnalysisSnapshots);expect(current.payloadCiphertext).toBe(first.payloadCiphertext);expect(decryptSavPayload<{contextCoverage:string}>(current.payloadCiphertext).contextCoverage).toBe("legacy_run_only");await expect(f.db.update(savAnalysisSnapshots).set({contentHash:"changed"}).where(eq(savAnalysisSnapshots.id,first.id))).rejects.toThrow();});
  it("starts one logical case without a verdict and preserves it after repeated requests",async()=>{const first=await observation();expect(await observation()).toBe(first);expect(await f.db.select().from(savDraftVerdicts)).toHaveLength(0);expect(await f.db.select().from(savResolutionObservations)).toHaveLength(1);expect(noNetwork).not.toHaveBeenCalled();});
  it("tracks only the authorized local Gmail thread without a ticket or CRM read",async()=>{await f.db.update(savThreads).set({hubspotTicketId:null}).where(eq(savThreads.id,threadId));const id=await observation(),collect=vi.fn();await syncSavObservation(id,collect,now);const [row]=await getSavObservations(threadId);expect(row.state).toBe("gmail_only");expect(row.sourceErrors).toContain("gmail:outbound_coverage_unverified");expect(row.cycles[0].summary.events).toHaveLength(1);expect(collect).not.toHaveBeenCalled();});
+ it("keeps a delivery report and its CRM alias as technical evidence when it quotes customer confirmation",async()=>{
+   const id=await observation();
+   const [baseline]=await f.db.select().from(savMessages).where(eq(savMessages.id,messageId));
+   const at="2026-10-19T15:00:00Z",text="Ça marche.";
+   const identity="<returned@example.invalid>";
+   await f.db.insert(savMessages).values({threadId,mailboxId:baseline.mailboxId,direction:"inbound",
+     gmailMessageId:"dsn",fromEmail:"dsn@example.invalid",receivedAt:new Date(at),
+     bodyCiphertext:encryptSavPayload({text,headers:{"content-type":"multipart/report; report-type=delivery-status","message-id":identity}})});
+   await syncSavObservation(id,async()=>snapshot([event(),{...event("customer_reply",text,"hubspot:emails:2",at),messageIdentity:identity}]),now);
+   const [view]=await getSavObservations(threadId);
+   const summary=view.cycles[0].summary;
+   expect(summary.customerConfirmation).toEqual([]);
+   expect(summary.events.find(e=>e.sourceRef==="gmail:dsn")).toMatchObject({kind:"delivery_notice",text,sourceAliases:["hubspot:emails:2"]});
+ });
  it("rejects a different associated ticket and retains incomplete coverage",async()=>{const id=await observation();expect((await syncSavObservation(id,async()=>({...snapshot(),ticketId:"456"}),now)).status).toBe("sources_incomplete");});
  it("deduplicates one Gmail/CRM exchange by its actual message identity",async()=>{const id=await observation();await syncSavObservation(id,async()=>snapshot([{...event("customer_reply","Bonjour, ma connexion échoue."),messageIdentity:"<synthetic@example.invalid>"}]),now);const [row]=await getSavObservations(threadId);expect(row.cycles[0].summary.events.filter(e=>e.messageIdentity)).toHaveLength(1);});
 });

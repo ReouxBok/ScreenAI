@@ -25,7 +25,7 @@ import { readDeliveryReportTicket } from "@/lib/sav/intake/delivery-report-ticke
 import { crmRecordUrl } from "@/lib/sav/intake/crm-display";
 import { IntakeOperatorActions } from "../operator-form";
 export const dynamic = "force-dynamic";
-export default async function IntakeDetailPage({ params, searchParams }: { params: Promise<{ id: string }>; searchParams?: Promise<{holdRelease?:string;returnTo?:string;verifyDelivery?:string}> }) {
+export default async function IntakeDetailPage({ params, searchParams }: { params: Promise<{ id: string }>; searchParams?: Promise<{holdRelease?:string;returnTo?:string}> }) {
   const staff=await requireIntakeConsoleStaff();
   const { id } = await params;
   if (!z.uuid().safeParse(id).success) notFound();
@@ -37,7 +37,7 @@ export default async function IntakeDetailPage({ params, searchParams }: { param
   const deliveryReport = !dirty && !data.handledExternally && !data.humanHeld && !data.thread.paused &&
     current?.messageId === data.latestMessageId && current?.sourceMatches &&
     current.payload.reason === "SAV_INTAKE_SUPPORT_DELIVERY_FAILURE";
-  const deliveryTarget = deliveryReport && query?.verifyDelivery === data.latestMessageId && data.latestMessageId
+  const deliveryTarget = deliveryReport && data.latestMessageId
     ? await readDeliveryReportTicket(id,data.latestMessageId) : null;
   const portal = process.env.HUBSPOT_PORTAL_ID;
   // Not awaited: names stream in under Suspense while the reads below proceed.
@@ -59,11 +59,10 @@ export default async function IntakeDetailPage({ params, searchParams }: { param
       <p>Vérifiez si le message initial a été livré et consignez l’avis sur son ticket.</p>
       {deliveryTarget?.ok ? <p>Ticket proposé <strong>#{deliveryTarget.ticketId}</strong> — le message HubSpot #{deliveryTarget.emailId} correspond au parent direct de cet avis et est associé uniquement à ce ticket.
         {crmRecordUrl(portal,"ticket",deliveryTarget.ticketId) && <> <a href={crmRecordUrl(portal,"ticket",deliveryTarget.ticketId)!}>Ouvrir le ticket dans HubSpot</a></>}
-        {" "}Le rattachement de cet avis reste à faire.</p>
-        : <>{deliveryTarget && <p role="status">{deliveryTarget.reason}</p>}
-          <form method="get">{query?.returnTo && <input type="hidden" name="returnTo" value={query.returnTo}/>}
-            <button name="verifyDelivery" value={data.latestMessageId ?? ""}>Vérifier le ticket dans HubSpot</button>
-          </form></>}
+        <br/>{deliveryTarget.receipt.state === "associated" ? `Avis entrant HubSpot #${deliveryTarget.receipt.emailId} déjà rattaché à ce ticket.`
+          : deliveryTarget.receipt.state === "unassociated" ? `Avis entrant HubSpot #${deliveryTarget.receipt.emailId} retrouvé sans ticket. Rattachement manuel à vérifier.`
+          : deliveryTarget.receipt.reason}</p>
+        : deliveryTarget && <p role="status">{deliveryTarget.reason}</p>}
     </section>}
     <StreamedCrmContext display={display} portal={portal} contactId={target?.contactId}
       ticketId={data.confirmedCurrent && data.progress?.ticketId ? data.progress.ticketId : target && target.operation !== "create" ? target.ticketId : undefined}
