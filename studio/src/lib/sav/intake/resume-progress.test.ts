@@ -112,7 +112,9 @@ describe("what a bounded re-read proves", () => {
 
   it("an incomplete read that is still incomplete, or now failed, is not progress", async () => {
     const proof = await proofOf();
-    expect(await probeIntakeResume(proof, readers({ ...base, ticketHistory: () => failed([]) }), signal)).toEqual({ state: "same", checked: 4 });
+    expect(await probeIntakeResume(proof, readers({ ...base, ticketHistory: () => failed([]) }), signal)).toEqual({ state: "unavailable", checked: 4 });
+    const failedProof = { ...proof, reads: proof.reads.map(read => read.method === "ticketHistory" ? { ...read, status: "failed" as const } : read) };
+    expect(await probeIntakeResume(failedProof, readers(base), signal)).toEqual({ state: "unavailable", checked: 4 });
   });
 
   it("a reader that throws, or an aborted probe, is unavailable", async () => {

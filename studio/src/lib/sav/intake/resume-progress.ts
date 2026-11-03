@@ -119,7 +119,7 @@ export async function probeIntakeResume(proof: IntakeResumeProof, readers: Intak
     if (result.status === "complete") {
       if (before.status !== "complete") return { state: "progress", method: before.method, change: "completed", checked };
       if (readDigest(before.method, result) !== before.digest) return { state: "progress", method: before.method, change: "changed", checked };
-    } else if (before.status === "complete") regressed = true;
+    } else if (before.status !== "partial" || result.status === "failed") regressed = true;
   }
   return signal.aborted || regressed ? { state: "unavailable", checked } : { state: "same", checked };
 }

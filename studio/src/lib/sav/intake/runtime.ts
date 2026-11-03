@@ -82,7 +82,7 @@ async function analyseSavIntakeRuntimeWithinBudget(runId: string, config: Intake
   try {
     await live();
     // V1 cost filter, replay and resume included: an automation proven by the stored Gmail headers
-    // never reaches a reservation, a CRM or Gmail read, or a model call. The mail stays for a person.
+    // never reaches a reservation, a CRM or Gmail read, or a model call. The disposition depends on the notice kind.
     const automation = lease.automation;
     if (automation) {
       traces.push({ phase: "automation_gate", ...automation, modelCalled: false });
