@@ -186,3 +186,41 @@ it("four older capped runs leave a scheduling slot for the next model-free notic
   for (const run of batch) expect(await claimSavIntakeRun(run.id, config)).toBeNull();
   expect((await pendingSavIntakeRuns(config))[0].id).toBe(ids[4]);
 });
+
+it.each(["absence", "delivery"] as const)("keeps an earlier unhandled request visible when a %s becomes the newest inbound", async kind => {
+  minimalBudget();
+  const request = await mail({ text: "Mon accès est bloqué.", receivedAt: new Date(Date.now() - 2000) });
+  const oldId = (await enqueueSavIntakeMessage(request.id, config))!;
+  expect(await claimSavIntakeRun(oldId, config)).toBeNull();
+  await mail({ direction: "outbound", from: "support@example.invalid", text: "Message du support.",
+    headers: { "x-studio-automation-headers": "singleton-v1", "message-id": supportId }, receivedAt: new Date(Date.now() - 1000) });
+  const headers = kind === "absence" ? { ...absence, "in-reply-to": supportId, references: supportId } :
+    { "x-studio-automation-headers": "singleton-v1", "content-type": "multipart/report; report-type=delivery-status", "in-reply-to": supportId };
+  const notice = await mail({ text: kind === "absence" ? "Je suis absent." : "Avis de distribution.", headers });
+  const id = (await enqueueSavIntakeMessage(notice.id, config))!, network = forbidden();
+  await analyseSavIntakeRuntime(id, config, { env: () => environment, network });
+  expect(await readSavIntakeCurrent(threadId, config)).toMatchObject({ id, state: "waiting", attempts: 0,
+    payload: { reason: "SAV_INTAKE_RUNTIME_DAILY_BUDGET_DEFERRED" } });
+  expect(network).not.toHaveBeenCalled();
+});
+
+it("four released threads with an old human timestamp can finish, leaving a slot for the human mail", async () => {
+  const ids: string[] = [];
+  for (let index = 0; index < 5; index++) {
+    const [thread] = await f.db.insert(savThreads).values({ mailboxId, gmailThreadId: randomUUID(), customerEmail: "synthetic@example.invalid",
+      aiPaused: false, humanRequestedAt: new Date("2025-01-01T00:00:00Z") }).returning();
+    threadId = thread.id;
+    const m = index === 4 ? await mail({ text: "Mon accès est bloqué." }) : await mail({ headers: absence, text: "Je suis absent." });
+    const id = (await enqueueSavIntakeMessage(m.id, config))!;
+    ids.push(id);
+    await f.db.update(savIntakeRuns).set({ updatedAt: new Date(Date.now() - (5 - index) * 1000) }).where(eq(savIntakeRuns.id, id));
+  }
+  const batch = await pendingSavIntakeRuns(config);
+  expect(batch.map(r => r.id)).toEqual(ids.slice(0, 4));
+  for (const run of batch) {
+    const network = forbidden();
+    expect(await analyseSavIntakeRuntime(run.id, config, { env: () => environment, network })).toMatchObject({ state: "observed" });
+    expect(network).not.toHaveBeenCalled();
+  }
+  expect((await pendingSavIntakeRuns(config)).map(r => r.id)).toEqual([ids[4]]);
+});

@@ -1,12 +1,11 @@
 import { intakeAutomatedMessage, type IntakeAutomation } from "./automated-message";
-import { intakeThreadHumanHeld } from "./legacy-pause";
 import { readRecoveryDue, DEFAULT_INTAKE_READ_RECOVERY } from "./read-recovery";
 import { readIntakeOperatorInformation } from "./operator-information";
 import { writeReadRecoveryMarker,readRecoverySql,noReadRecoverySql } from "./read-recovery-store";
 import { holdIntakeResume, noResumeHoldSql, recordIntakeResumeProgress } from "./resume-progress-store";
 import { intakeResumeDecision, parseIntakeResumeProof, withoutIntakeResumeProof, intakeResumeProofKey, type IntakeResumeDecision, type IntakeResumeProof, type IntakeResumeProbe } from "./resume-progress";
 import { intakeAttemptBudget, SAV_INTAKE_ATTEMPT_POLICY, SAV_INTAKE_BLOCKING_JOURNAL_KINDS, SAV_INTAKE_CALL_POLICY, SAV_INTAKE_TRANSIENT_RETRY } from "./attempt-policy";
-import { readSavExternalCompletion, listSavExternalCompletionMessageIds } from "../external-completion";
+import { findSavExternalCompletion, hasUnsettledSavHumanAction, hasUnsettledSavIntakeWork, readSavExternalCompletion, listSavExternalCompletionMessageIds, savExternalCompletionEvents, savExternalDisposition } from "../external-completion";
 import "server-only";
 import { reconcileIntakeZeroThoughtUsage } from "./model-usage";
 import { SAV_INTAKE_OPERATIONAL_PROFILE, intakeBlockedByUnsettled, intakeBudgetUsage } from "./budget-profile";
@@ -19,7 +18,7 @@ import { intakeRunConfigurationBound, intakeHumanRefused, intakeHasHumanDecision
 import { randomUUID } from "node:crypto";
 import { and, desc, eq, gt, inArray, isNull, lt, lte, or, sql } from "drizzle-orm";
 import { requireDb } from "@/db";
-import { savMessages, savThreads, savIntakeRuns, savIntakeJournal, savIntakeModelCalls, savIntakeHumanEvents, savIntakeIdentityEpisodes, savIntakeEffects, savIntakeExecutions } from "@/db/schema";
+import { auditLogs, savActions, savMessages, savThreads, savIntakeRuns, savIntakeJournal, savIntakeModelCalls, savIntakeHumanEvents, savIntakeIdentityEpisodes, savIntakeEffects, savIntakeExecutions } from "@/db/schema";
 import { decryptSavPayload, encryptSavPayload, savContentHash } from "../crypto";
 import { savAttachmentInventorySchema } from "../attachment-contract";
 import { prepareSavIntakeMessage } from "./message";
@@ -175,6 +174,31 @@ export async function savIntakeSourceSnapshot(tx: Pick<Tx, "select">, message: t
       conversation: { data: prepared.map(p => p.message).reverse(), status: rows.length > 50 ? "partial" : "complete", observedAt: now.toISOString() } } satisfies EngineInput };
 }
 
+/** The console projects only the latest inbound. A receipt may shortcut that whole thread only
+ * if all older inbound messages have positive terminal evidence. Unknown or truncated history
+ * keeps ordinary analysis; a receipt, a read label or a superseded run alone proves nothing. */
+async function priorIntakeCompleteForAutomation(tx: Pick<Tx, "select">, data: Awaited<ReturnType<typeof savIntakeSourceSnapshot>>) {
+  if (data.input.conversation.status !== "complete") return false;
+  const ids = data.input.conversation.data.filter(m => m.direction === "inbound" && m.id !== data.input.message.id).map(m => m.id);
+  if (!ids.length) return true;
+  const threadId = data.input.message.threadId;
+  if (await hasUnsettledSavIntakeWork(threadId, tx) ||
+      hasUnsettledSavHumanAction(await tx.select().from(savActions).where(eq(savActions.threadId, threadId)))) return false;
+  const messages = await tx.select({ id: savMessages.id, threadId: savMessages.threadId, receivedAt: savMessages.receivedAt, createdAt: savMessages.createdAt })
+    .from(savMessages).where(and(eq(savMessages.threadId, threadId), inArray(savMessages.id, ids)));
+  const events = await tx.select().from(auditLogs).where(and(eq(auditLogs.entityType, "sav_message"), inArray(auditLogs.entityId, ids), inArray(auditLogs.action, savExternalCompletionEvents)));
+  const receipts = await tx.select({ messageId: savIntakeExecutions.messageId }).from(savIntakeExecutions)
+    .innerJoin(savIntakeEffects, eq(savIntakeEffects.executionId, savIntakeExecutions.id))
+    .where(and(eq(savIntakeExecutions.threadId, threadId), inArray(savIntakeExecutions.messageId, ids), eq(savIntakeExecutions.state, "confirmed"),
+      sql`${savIntakeExecutions.ticketId} is not null`, eq(savIntakeEffects.kind, "email_associate"), eq(savIntakeEffects.state, "confirmed"),
+      sql`${savIntakeEffects.confirmedAt} is not null and ${savIntakeEffects.verificationCiphertext} is not null`));
+  const verified = new Set(receipts.map(r => r.messageId));
+  return messages.length === ids.length && messages.every(m => {
+    const mark = findSavExternalCompletion(m, events);
+    return mark ? savExternalDisposition(mark).view !== "to_validate" : verified.has(m.id);
+  });
+}
+
 const unclaimedMessage = sql`(${savMessages.analysisStatus} = 'pending' and ${savMessages.analysisAttempts} = 0 and ${savMessages.analysisStartedAt} is null and ${savMessages.processedAt} is null
   and not exists (select 1 from sav.decisions d where d.message_id = ${savMessages.id})
   and not exists (select 1 from sav.agent_runs a where a.message_id = ${savMessages.id})
@@ -250,7 +274,7 @@ export async function claimSavIntakeRun(id: string, config: IntakeRuntimeConfig,
       const [thread] = await db.select().from(savThreads).where(eq(savThreads.id, row.threadId));
       const pause = await readSavAgentPause(db);
       const [message] = await db.select().from(savMessages).where(and(eq(savMessages.id, row.messageId), noCommittedExecution));
-      if (!thread || thread.aiPaused || thread.humanRequestedAt || pause.level === "fully_paused" || (pause.setting?.setAt ?? null) !== first.pauseSetAt ||
+      if (!thread || thread.aiPaused || pause.level === "fully_paused" || (pause.setting?.setAt ?? null) !== first.pauseSetAt ||
         !message || await readSavExternalCompletion(message, db) || await intakeHasHumanDecision(row.messageId, db)) throw Error("SAV_INTAKE_RUNTIME_CONTEXT_CHANGED");
       const proof = parseIntakeResumeProof(decryptSavPayload<IntakeRuntimePayload>(row.payloadCiphertext).resumeProof);
       if (!proof || intakeResumeProofKey(proof) !== intakeResumeProofKey(first.proof) || (await latest(db, row.threadId))?.id !== message.id
@@ -296,7 +320,7 @@ async function claimOrReserve(id: string, config: IntakeRuntimeConfig, now: Date
     if(recoveringRead&&retry){
       if(!await intakeConsoleInstalled(tx))return null;
       const [human]=await tx.select({id:savIntakeHumanEvents.id}).from(savIntakeHumanEvents).where(eq(savIntakeHumanEvents.messageId,run.messageId)).limit(1);
-      if(human||thread.humanRequestedAt){retry.state="invalidated";priorPayload.readRecovery=retry;priorPayload.reason="SAV_INTAKE_READ_HUMAN_PRIORITY";
+      if(human||thread.aiPaused||thread.humanRequestedAt && thread.humanRequestedAt >= message.createdAt){retry.state="invalidated";priorPayload.readRecovery=retry;priorPayload.reason="SAV_INTAKE_READ_HUMAN_PRIORITY";
         await tx.update(savIntakeRuns).set({payloadCiphertext:encryptSavPayload(priorPayload)}).where(eq(savIntakeRuns.id,run.id));await writeReadRecoveryMarker(tx,run.id,retry);return null;}
     }
     const pending = await tx.select({id:savIntakeModelCalls.id}).from(savIntakeModelCalls).where(and(eq(savIntakeModelCalls.runId, id), inArray(savIntakeModelCalls.state, ["dispatched", "uncertain"])));
@@ -319,11 +343,11 @@ async function claimOrReserve(id: string, config: IntakeRuntimeConfig, now: Date
       await journal(tx, id, "source_invalid", { reason: SAV_INTAKE_INVALID_SOURCE, attemptsUnchanged: true });
       return null;
     }
-    const automation = intakeAutomatedMessage({ message: data.input.message, headers: data.body.headers, bodyText: data.body.text,
+    const candidate = intakeAutomatedMessage({ message: data.input.message, headers: data.body.headers, bodyText: data.body.text,
       subject: data.provenance.get(message.id)?.subject,
       attachments: data.body.attachments, supportMessageIds: data.supportMessageIds });
-    if (automation && (thread.humanRequestedAt || run.humanChoiceCiphertext || await intakeThreadHumanHeld(run.threadId, tx)
-      || await intakeHasHumanDecision(run.messageId, tx))) return null;
+    const automation = candidate && await priorIntakeCompleteForAutomation(tx, data) ? candidate : null;
+    if (automation && (run.humanChoiceCiphertext || await intakeHasHumanDecision(run.messageId, tx))) return null;
     if(config.budgetProfile===SAV_INTAKE_OPERATIONAL_PROFILE) {
       // Budget deferral is not an analysis attempt. Never burn the two durable
       // attempts merely because another dossier used today's shared margin.
@@ -364,7 +388,7 @@ async function claimOrReserve(id: string, config: IntakeRuntimeConfig, now: Date
       if (finished && (!proof || intakeResumeProofKey(proof) !== intakeResumeProofKey(finished.proof) ||
         config.configHash !== proof.configHash || data.sourceHash !== proof.sourceHash)) return null;
       const resume = intakeResumeDecision(proof, { configHash: config.configHash, sourceHash: data.sourceHash }, finished?.result ?? null);
-      if (proof && (thread.humanRequestedAt || run.humanChoiceCiphertext || await intakeHasHumanDecision(run.messageId, tx))) return null;
+      if (proof && (run.humanChoiceCiphertext || await intakeHasHumanDecision(run.messageId, tx))) return null;
       if (proof && resume.kind === "hold" && resume.cause === "unchecked" && options.probe) {
         // Commit this short reservation before network I/O. The second pass takes all the same locks and revalidates the same proof.
         const token = randomUUID();
@@ -395,8 +419,9 @@ async function assertLease(tx: Tx, lease: IntakeLease, config: IntakeRuntimeConf
   if (!thread || thread.aiPaused || !run?.isCurrent || run.state !== "analysing" || run.leaseToken !== lease.token || !run.leaseUntil || run.leaseUntil <= now
     || run.humanChoiceCiphertext !== lease.run.humanChoiceCiphertext || !await intakeRunConfigurationBound(run, config, tx) || Date.parse(config.expiresAt) <= now.getTime() || message?.id !== run.messageId) return fail();
   const [uncommitted] = await tx.select({ id: savMessages.id }).from(savMessages).where(and(eq(savMessages.id, message.id), noCommittedExecution));
-  if (lease.automation && (thread.humanRequestedAt || run.humanChoiceCiphertext || await intakeHasHumanDecision(run.messageId, tx))) return fail();
-  if (!uncommitted || await readSavExternalCompletion(message, tx) || !intakeSourceMatches(await savIntakeSourceSnapshot(tx, message, now), lease.sourceHash)) return fail();
+  const snapshot = await savIntakeSourceSnapshot(tx, message, now);
+  if (lease.automation && (run.humanChoiceCiphertext || await intakeHasHumanDecision(run.messageId, tx) || !await priorIntakeCompleteForAutomation(tx, snapshot))) return fail();
+  if (!uncommitted || await readSavExternalCompletion(message, tx) || !intakeSourceMatches(snapshot, lease.sourceHash)) return fail();
   // A full pause during an analysis stops it before any further reservation or publication.
   await assertSavAgentAnalysisAllowed(tx);
   return run;

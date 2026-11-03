@@ -295,3 +295,12 @@ it.each(["proof", "paused"] as const)("ignores a probe when %s changes during th
   expect(w.seen.model).toBe(before);
   expect(await kinds(id)).not.toContain("resume_progress");
 });
+
+it("a released thread with an old human request resumes when the missing CRM history becomes complete", async () => {
+  await f.db.update(savThreads).set({ aiPaused: false, humanRequestedAt: new Date("2025-01-01T00:00:00Z") }).where(eq(savThreads.id, threadId));
+  const w = world(), { id } = await firstAttempt(w);
+  expect(await analyse(id, w)).toEqual({ skipped: SAV_INTAKE_RESUME_NO_PROGRESS });
+  w.crm.history = "complete";
+  expect(await analyse(id, w)).toMatchObject({ state: "observed" });
+  expect((await run(id)).attempts).toBe(2);
+});
