@@ -2,9 +2,10 @@ import { randomUUID } from "node:crypto";
 import { afterAll, afterEach, beforeAll, beforeEach, expect, it, vi } from "vitest";
 import { eq } from "drizzle-orm";
 import { createSavTestDb } from "../../../../test/sav-db";
-import { savMailboxes, savMessages, savThreads, savIntakeRuns, savIntakeModelCalls, savSyncState, savActions } from "@/db/schema";
+import { auditLogs, savMailboxes, savMessages, savThreads, savIntakeRuns, savIntakeModelCalls, savSyncState, savActions } from "@/db/schema";
 const state = vi.hoisted(() => ({ db: null as unknown }));
 vi.mock("@/db", () => ({ requireDb: () => { if (!state.db) throw Error("NO_DATABASE_ALLOWED"); return state.db; } }));
+import { SAV_EXTERNAL_COMPLETION, SAV_EXTERNAL_COMPLETION_REVERTED } from "../external-completion";
 import { encryptSavPayload } from "../crypto";
 import { intakeRuntimeHash, savIntakeRuntimeConfig, type IntakeRuntimeConfig } from "./runtime-contract";
 import { claimSavIntakeRun, pendingSavIntakeRuns, enqueueSavIntakeMessage, readSavIntakeBudget, readSavIntakeCurrent } from "./runtime-store";
@@ -223,4 +224,25 @@ it("four released threads with an old human timestamp can finish, leaving a slot
     expect(network).not.toHaveBeenCalled();
   }
   expect((await pendingSavIntakeRuns(config)).map(r => r.id)).toEqual([ids[4]]);
+});
+
+it.each(["completed", "to_validate", "reverted"] as const)("only a terminal, unreversed prior administrative decision (%s) allows the shortcut", async disposition => {
+  minimalBudget();
+  const old = await mail({ text: "Demande antérieure.", receivedAt: new Date(Date.now() - 2000) });
+  const batchId = randomUUID();
+  const [mark] = await f.db.insert(auditLogs).values({ actorEmail: "ugo@limova.ai", entityType: "sav_message", entityId: old.id, action: SAV_EXTERNAL_COMPLETION,
+    technicalMetadata: { version: 1, threadId, batchId, receivedBefore: new Date().toISOString(), reason: "processed_outside_studio",
+      disposition: disposition === "to_validate" ? "to_validate" : "completed" } }).returning();
+  if (disposition === "reverted") await f.db.insert(auditLogs).values({ actorEmail: "ugo@limova.ai", entityType: "sav_message", entityId: old.id,
+    action: SAV_EXTERNAL_COMPLETION_REVERTED, technicalMetadata: { version: 1, batchId, completionId: mark.id } });
+  const notice = await mail({ text: "Je suis absent.", headers: absence });
+  const run = (await enqueueSavIntakeMessage(notice.id, config))!, network = forbidden();
+  await analyseSavIntakeRuntime(run, config, { env: () => environment, network });
+  const result = await readSavIntakeCurrent(threadId, config);
+  if (disposition === "completed") {
+    expect(result).toMatchObject({ state: "observed", payload: { reason: "SAV_INTAKE_AUTOMATED_REPLY" } });
+  } else {
+    expect(result).toMatchObject({ state: "waiting", attempts: 0, payload: { reason: "SAV_INTAKE_RUNTIME_DAILY_BUDGET_DEFERRED" } });
+  }
+  expect(network).not.toHaveBeenCalled();
 });
