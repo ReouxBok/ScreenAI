@@ -21,7 +21,7 @@ import { CrmRecord, StreamedChoiceForm, StreamedCrmContext } from "../crm-stream
 import { IntakeProcessingSummary } from "../processing-summary";
 import { readUxMessageControls } from "@/lib/sav/intake-ux/message-controls";
 import { readOperatorPanel } from "@/lib/sav/intake-ux/operator-commands";
-import { readDeliveryReportTicket } from "@/lib/sav/intake/delivery-report-ticket";
+import { deliveryEmailUrl, readDeliveryReportTicket } from "@/lib/sav/intake/delivery-report-ticket";
 import { crmRecordUrl } from "@/lib/sav/intake/crm-display";
 import { IntakeOperatorActions } from "../operator-form";
 export const dynamic = "force-dynamic";
@@ -40,6 +40,8 @@ export default async function IntakeDetailPage({ params, searchParams }: { param
   const deliveryTarget = deliveryReport && data.latestMessageId
     ? await readDeliveryReportTicket(id,data.latestMessageId) : null;
   const portal = process.env.HUBSPOT_PORTAL_ID;
+  const noticeLink = deliveryTarget?.ok ? deliveryEmailUrl(deliveryTarget.receipt, portal) : null;
+  const noticeText = deliveryReport ? data.messages.find(message => message.id === data.latestMessageId)?.body.text : undefined;
   // Not awaited: names stream in under Suspense while the reads below proceed.
   const display=readIntakeCrmDisplay([...contacts,...(target?[target.contactId]:[]),...(historicalTarget?[historicalTarget.contactId]:[])],
     [...tickets,...(target&&target.operation!=="create"?[target.ticketId]:[]),...(historicalTarget&&historicalTarget.operation!=="create"?[historicalTarget.ticketId]:[]),...(data.progress?.ticketId?[data.progress.ticketId]:[])]);
@@ -61,8 +63,19 @@ export default async function IntakeDetailPage({ params, searchParams }: { param
         {crmRecordUrl(portal,"ticket",deliveryTarget.ticketId) && <> <a href={crmRecordUrl(portal,"ticket",deliveryTarget.ticketId)!}>Ouvrir le ticket dans HubSpot</a></>}
         <br/>{deliveryTarget.receipt.state === "associated" ? `Avis entrant HubSpot #${deliveryTarget.receipt.emailId} déjà rattaché à ce ticket.`
           : deliveryTarget.receipt.state === "unassociated" ? `Avis entrant HubSpot #${deliveryTarget.receipt.emailId} retrouvé sans ticket. Rattachement manuel à vérifier.`
-          : deliveryTarget.receipt.reason}</p>
+          : deliveryTarget.receipt.reason}
+        {noticeLink && <> <a href={noticeLink}>Ouvrir l’activité de l’avis entrant</a></>}</p>
         : deliveryTarget && <p role="status">{deliveryTarget.reason}</p>}
+      {deliveryTarget?.ok && deliveryTarget.receipt.state !== "associated" && <>
+        {deliveryTarget.receipt.state === "unassociated" && <p>Dans HubSpot, associez l’activité entrante #{deliveryTarget.receipt.emailId} au ticket #{deliveryTarget.ticketId}, puis vérifiez le reçu ci-dessous.</p>}
+        {noticeText && <details><summary>Texte de l’avis dans Studio</summary>
+          <textarea aria-label="Texte original de l’avis à copier" readOnly value={noticeText} rows={6}/>
+        </details>}
+        <form method="get">
+          {query?.returnTo && <input type="hidden" name="returnTo" value={query.returnTo}/>}
+          <button type="submit">Relire le rattachement dans HubSpot</button>
+        </form>
+      </>}
     </section>}
     <StreamedCrmContext display={display} portal={portal} contactId={target?.contactId}
       ticketId={data.confirmedCurrent && data.progress?.ticketId ? data.progress.ticketId : target && target.operation !== "create" ? target.ticketId : undefined}

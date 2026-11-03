@@ -10,8 +10,8 @@ import { isHubspotOutboundDirection } from "../learning-extraction";
 
 type Mail = { id:string; direction:string; fromEmail:string; headers:unknown };
 export type DeliveryNoticeReceipt =
-  | { state:"associated"; emailId:string }
-  | { state:"unassociated"; emailId:string }
+  | { state:"associated"; emailId:string; providerUrl?:string }
+  | { state:"unassociated"; emailId:string; providerUrl?:string }
   | { state:"unverified"; reason:string };
 type Target = { ok:true; ticketId:string; emailId:string; receipt:DeliveryNoticeReceipt } | { ok:false; reason:string };
 const unresolved = (reason:string): Target => ({ok:false,reason});
@@ -23,8 +23,19 @@ function header(mail:Mail, name:string) {
   return typeof value === "string" ? value.trim() : "";
 }
 
+/** Use a provider-supplied link only for the exact verified email in this portal. */
+export function deliveryEmailUrl(receipt: DeliveryNoticeReceipt, portal: string | undefined): string | null {
+  if (receipt.state === "unverified" || !receipt.providerUrl || !numericId(portal) || !numericId(receipt.emailId)) return null;
+  try {
+    const url = new URL(receipt.providerUrl);
+    if (url.origin !== "https://app.hubspot.com" || url.username || url.password ||
+        url.pathname !== `/contacts/${portal}/record/0-49/${receipt.emailId}`) return null;
+    return url.origin + url.pathname;
+  } catch { return null; }
+}
+
 type Read = (path:string,body?:unknown)=>Promise<unknown>;
-type EmailHit = {id:string;archived?:boolean;properties?:Record<string,string>};
+type EmailHit = {id:string;url?:unknown;archived?:boolean;properties?:Record<string,string>};
 async function findEmail(read:Read, identity:string) {
   return await read("/crm/v3/objects/emails/search", {
     filterGroups:[{filters:[{propertyName:"hs_email_message_id",operator:"EQ",value:identity}]}],
@@ -44,10 +55,11 @@ async function deliveryNoticeReceipt(read:Read,notice:Mail,parent:string,ticketI
       return {state:"unverified",reason:"Aucune activité entrante unique et vérifiée pour l’avis lui-même."};
     const links=await read(`/crm/v4/objects/emails/${hit.id}/associations/tickets?limit=2`) as {results?:Array<{toObjectId?:unknown}>;paging?:{next?:unknown}};
     if (!Array.isArray(links?.results) || links.paging?.next) return {state:"unverified",reason:"La liste des tickets de l’avis est incomplète."};
-    if (!links.results.length) return {state:"unassociated",emailId:hit.id};
+    const record = {emailId:hit.id, ...(typeof hit.url === "string" ? {providerUrl:hit.url} : {})};
+    if (!links.results.length) return {state:"unassociated",...record};
     const linked=links.results[0]?.toObjectId;
     if (links.results.length===1 && (typeof linked==="string" || typeof linked==="number" && Number.isSafeInteger(linked)) && String(linked)===ticketId)
-      return {state:"associated",emailId:hit.id};
+      return {state:"associated",...record};
     return {state:"unverified",reason:"L’avis est associé à un autre ticket ou à plusieurs tickets. Vérification humaine requise."};
   } catch { return {state:"unverified",reason:"Lecture du reçu de l’avis indisponible."}; }
 }

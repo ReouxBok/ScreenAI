@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import { resolveDeliveryReportTicket } from "./delivery-report-ticket";
+import { deliveryEmailUrl, resolveDeliveryReportTicket } from "./delivery-report-ticket";
 
 const parent = "<out@example.invalid>";
 const sent = {id:"sent",direction:"outbound",fromEmail:"sav@example.invalid",headers:{"x-studio-automation-headers":"singleton-v1","message-id":parent}};
@@ -68,4 +68,14 @@ describe("delivery report operator evidence",()=>{
   it("reports unavailable access without proposing a ticket",async()=>{
     expect(await resolveDeliveryReportTicket([sent,notice],"dsn",async()=>{throw Error("HTTP_403")})).toEqual({ok:false,reason:"Lecture HubSpot indisponible. Le rattachement reste à vérifier."});
   });
+});
+
+
+it("links only the provider's exact inbox activity in the configured portal", () => {
+  const receipt = { state: "unassociated" as const, emailId: "123", providerUrl: "https://app.hubspot.com/contacts/456/record/0-49/123?utm_source=test" };
+  expect(deliveryEmailUrl(receipt, "456")).toBe("https://app.hubspot.com/contacts/456/record/0-49/123");
+  expect(deliveryEmailUrl(receipt, "999")).toBeNull();
+  expect(deliveryEmailUrl({ ...receipt, emailId: "124" }, "456")).toBeNull();
+  expect(deliveryEmailUrl({ ...receipt, providerUrl: "https://app.hubspot.com.example.invalid/contacts/456/record/0-49/123" }, "456")).toBeNull();
+  expect(deliveryEmailUrl({ state: "unverified", reason: "" }, "456")).toBeNull();
 });
