@@ -1,3 +1,5 @@
+import { intakeAutomatedMessage, type IntakeAutomation } from "./automated-message";
+import { intakeThreadHumanHeld } from "./legacy-pause";
 import { readRecoveryDue, DEFAULT_INTAKE_READ_RECOVERY } from "./read-recovery";
 import { readIntakeOperatorInformation } from "./operator-information";
 import { writeReadRecoveryMarker,readRecoverySql,noReadRecoverySql } from "./read-recovery-store";
@@ -34,7 +36,7 @@ type Run = typeof savIntakeRuns.$inferSelect;
 type Body = { text: string; headers?: Record<string, string>; attachments?: unknown[]; attachmentInventory?: unknown };
 export type IntakeLease = { run: Run; token: string; input: EngineInput; provenance: Map<string, ReturnType<typeof prepareSavIntakeMessage>["provenance"]>; body: Body; sourceHash: string; recoveringRead?: true;
   /** RFC Message-IDs of the support mails stored in the same bounded thread window. */
-  supportMessageIds?: string[] };
+  supportMessageIds?: string[]; automation?: IntakeAutomation };
 const fail = (): never => { throw Error("SAV_INTAKE_RUNTIME_CONTEXT_CHANGED"); };
 const budgetColumns={id:savIntakeModelCalls.id,messageKey:savIntakeModelCalls.messageKey,requestHash:savIntakeModelCalls.requestHash,state:savIntakeModelCalls.state,reservedNanoUsd:savIntakeModelCalls.reservedNanoUsd,chargedNanoUsd:savIntakeModelCalls.chargedNanoUsd,payloadCiphertext:savIntakeModelCalls.payloadCiphertext,createdAt:savIntakeModelCalls.createdAt,runId:savIntakeModelCalls.runId};
 /** A received unbilled rejection settled at zero with its explicit marker (see settleSavIntakeCall). */
@@ -167,7 +169,7 @@ export async function savIntakeSourceSnapshot(tx: Pick<Tx, "select">, message: t
   const bind = (hash: string) => information ? intakeRuntimeHash({ exchangedSources: hash, operatorInformation: information }) : hash;
   const sourceHash = bind(messageSourceHash), legacySourceHash = bind(legacyMessageHash);
   return { sourceHash, legacySourceHash, messageSourceHash, body: current.body, provenance: new Map(prepared.map(p => [p.message.id, p.provenance])),
-    supportMessageIds: prepared.flatMap(p => p.message.direction === "outbound" && typeof p.body.headers?.["message-id"] === "string" ? [p.body.headers["message-id"].trim()] : []),
+    supportMessageIds: prepared.flatMap(p => p.message.direction === "outbound" && p.body.headers?.["x-studio-automation-headers"] === "singleton-v1" && typeof p.body.headers?.["message-id"] === "string" ? [p.body.headers["message-id"].trim()] : []),
     input: { message: current.message, latestInboundMessageId: message.id, mode: "current", now: now.toISOString(), identificationAttemptId: message.id,
       ...(identificationContinuation ? {previousIdentification,identificationContinuation} : {}),
       conversation: { data: prepared.map(p => p.message).reverse(), status: rows.length > 50 ? "partial" : "complete", observedAt: now.toISOString() } } satisfies EngineInput };
@@ -306,6 +308,21 @@ async function claimOrReserve(id: string, config: IntakeRuntimeConfig, now: Date
       await tx.update(savMessages).set({ analysisStatus: pending.length ? "intake_uncertain" : "intake_waiting" }).where(eq(savMessages.id, run.messageId));
       await journal(tx, id, "waiting", { reason }); return null;
     }
+    let data: Awaited<ReturnType<typeof savIntakeSourceSnapshot>>;
+    try { data = await savIntakeSourceSnapshot(tx, message, now); }
+    catch (error) {
+      if (!invalidIntakeAddressMetadata(error)) throw error;
+      const payload = decryptSavPayload<IntakeRuntimePayload>(run.payloadCiphertext);
+      await tx.update(savIntakeRuns).set({ state: "waiting", payloadCiphertext: encryptSavPayload({ ...payload, reason: SAV_INTAKE_INVALID_SOURCE }),
+        leaseToken: null, leaseUntil: null, freshUntil: null, updatedAt: now }).where(eq(savIntakeRuns.id, id));
+      await tx.update(savMessages).set({ analysisStatus: "intake_waiting" }).where(eq(savMessages.id, run.messageId));
+      await journal(tx, id, "source_invalid", { reason: SAV_INTAKE_INVALID_SOURCE, attemptsUnchanged: true });
+      return null;
+    }
+    const automation = intakeAutomatedMessage({ message: data.input.message, headers: data.body.headers, bodyText: data.body.text,
+      attachments: data.body.attachments, supportMessageIds: data.supportMessageIds });
+    if (automation && (thread.humanRequestedAt || run.humanChoiceCiphertext || await intakeThreadHumanHeld(run.threadId, tx)
+      || await intakeHasHumanDecision(run.messageId, tx))) return null;
     if(config.budgetProfile===SAV_INTAKE_OPERATIONAL_PROFILE) {
       // Budget deferral is not an analysis attempt. Never burn the two durable
       // attempts merely because another dossier used today's shared margin.
@@ -319,7 +336,7 @@ async function claimOrReserve(id: string, config: IntakeRuntimeConfig, now: Date
       const unknown=rows.some(row=>row.messageKey===messageKey&&row.state!=="settled");
       // The largest single call this dossier may need, not the smaller amount it will reserve.
       const quote=intakeMaxCallReservation(config.model,budgetNow,revoked);
-      if(unknown||!recoveringRead&&(usage.remainingCalls<1||usage.remainingNanoUsd<quote.reservedNanoUsd||usage.remainingRollingNanoUsd<quote.reservedNanoUsd)) {
+      if(unknown||!recoveringRead&&!automation&&(usage.remainingCalls<1||usage.remainingNanoUsd<quote.reservedNanoUsd||usage.remainingRollingNanoUsd<quote.reservedNanoUsd)) {
         const payload=decryptSavPayload<IntakeRuntimePayload>(run.payloadCiphertext);
         // The shared margin, not this dossier. Only the daily margin frees at the next UTC day; the
         // rolling 30-day margin frees when older spend leaves the window, so no date is promised.
@@ -333,17 +350,6 @@ async function claimOrReserve(id: string, config: IntakeRuntimeConfig, now: Date
           blockedByUnsettled:!unknown&&intakeBlockedByUnsettled(usage,quote.reservedNanoUsd)});
         return null;
       }
-    }
-    let data: Awaited<ReturnType<typeof savIntakeSourceSnapshot>>;
-    try { data = await savIntakeSourceSnapshot(tx, message, now); }
-    catch (error) {
-      if (!invalidIntakeAddressMetadata(error)) throw error;
-      const payload = decryptSavPayload<IntakeRuntimePayload>(run.payloadCiphertext);
-      await tx.update(savIntakeRuns).set({ state: "waiting", payloadCiphertext: encryptSavPayload({ ...payload, reason: SAV_INTAKE_INVALID_SOURCE }),
-        leaseToken: null, leaseUntil: null, freshUntil: null, updatedAt: now }).where(eq(savIntakeRuns.id, id));
-      await tx.update(savMessages).set({ analysisStatus: "intake_waiting" }).where(eq(savMessages.id, run.messageId));
-      await journal(tx, id, "source_invalid", { reason: SAV_INTAKE_INVALID_SOURCE, attemptsUnchanged: true });
-      return null;
     }
     if (recoveringRead && retry && retry.sourceHash !== data.sourceHash) {
       retry.state = "invalidated"; priorPayload.readRecovery = retry;priorPayload.reason="SAV_INTAKE_READ_SOURCE_CHANGED";
@@ -378,7 +384,7 @@ async function claimOrReserve(id: string, config: IntakeRuntimeConfig, now: Date
       ...(recoveringRead ? { payloadCiphertext: encryptSavPayload(priorPayload) } : priorPayload.resumeProof ? { payloadCiphertext: encryptSavPayload(withoutIntakeResumeProof(priorPayload)) } : {}) }).where(eq(savIntakeRuns.id, id)).returning();
     await tx.update(savMessages).set({ analysisStatus: "intake_analysing" }).where(eq(savMessages.id, run.messageId));
     await journal(tx, id, recoveringRead ? "read_retry_claimed" : "claimed", { attempt: claimed.attempts, technicalAttempt: recoveringRead ? retry!.attempts : 0, sourceHash: data.sourceHash });
-    return { run: claimed, token, ...data, ...(recoveringRead ? { recoveringRead: true as const } : {}) };
+    return { run: claimed, token, ...data, ...(automation ? { automation } : {}), ...(recoveringRead ? { recoveringRead: true as const } : {}) };
   });
 }
 async function assertLease(tx: Tx, lease: IntakeLease, config: IntakeRuntimeConfig, now: Date) {
@@ -388,6 +394,7 @@ async function assertLease(tx: Tx, lease: IntakeLease, config: IntakeRuntimeConf
   if (!thread || thread.aiPaused || !run?.isCurrent || run.state !== "analysing" || run.leaseToken !== lease.token || !run.leaseUntil || run.leaseUntil <= now
     || run.humanChoiceCiphertext !== lease.run.humanChoiceCiphertext || !await intakeRunConfigurationBound(run, config, tx) || Date.parse(config.expiresAt) <= now.getTime() || message?.id !== run.messageId) return fail();
   const [uncommitted] = await tx.select({ id: savMessages.id }).from(savMessages).where(and(eq(savMessages.id, message.id), noCommittedExecution));
+  if (lease.automation && (thread.humanRequestedAt || run.humanChoiceCiphertext || await intakeHasHumanDecision(run.messageId, tx))) return fail();
   if (!uncommitted || await readSavExternalCompletion(message, tx) || !intakeSourceMatches(await savIntakeSourceSnapshot(tx, message, now), lease.sourceHash)) return fail();
   // A full pause during an analysis stops it before any further reservation or publication.
   await assertSavAgentAnalysisAllowed(tx);

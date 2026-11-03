@@ -160,3 +160,11 @@ describe("provider date in the future", () => {
     expect(parsed.headers).not.toHaveProperty("x-studio-gmail-internal-date");
   });
 });
+
+it("duplicate automation headers cannot supply a conclusive receipt, even with different casing", () => {
+  const headers = [{ name: "Auto-Submitted", value: "auto-replied" }, { name: "auto-submitted", value: "no" }];
+  const parse = (values: typeof headers) => parseGmailMessage("support@example.invalid", { id: "mail", threadId: "thread",
+    internalDate: String(Date.now()), payload: { mimeType: "text/plain", headers: values } }).headers;
+  expect(parse(headers)["x-studio-automation-headers"]).toBe("ambiguous");
+  expect(parse(headers.slice(0, 1))["x-studio-automation-headers"]).toBe("singleton-v1");
+});

@@ -14,7 +14,7 @@ import { analyseSavIntakeRuntime } from "./runtime";
 let f: Awaited<ReturnType<typeof createSavTestDb>>, mailboxId: string, threadId: string;
 let config: IntakeRuntimeConfig, environment: Record<string, string | undefined>;
 const supportId = "<sav-synthetic-action@studio.example.invalid>", campaignId = "<synthetic-campaign@marketing.example.invalid>";
-const absence = { "auto-submitted": "auto-replied", "content-type": "text/plain; charset=UTF-8", "in-reply-to": campaignId, references: campaignId };
+const absence = { "x-studio-automation-headers": "singleton-v1", "auto-submitted": "auto-replied", "content-type": "text/plain; charset=UTF-8", "in-reply-to": campaignId, references: campaignId };
 function env(mailbox: string) {
   const policy = { relationRevision: "synthetic-no-associations", admittedRelations: [], resources: {} };
   return { SAV_INTAKE_RUNTIME_MODE: "observe", SAV_CODE_REVISION: "a".repeat(40), SAV_AI_MODEL: "gemini-3.6-flash", SAV_GEMINI_API_KEY: "fake-model", HUBSPOT_ACCESS_TOKEN: "fake-crm",
@@ -44,8 +44,14 @@ const modelAndCrm = (messageId: string) => vi.fn(async (url: Parameters<typeof f
 async function excluded(messageId: string, code: string) {
   const current = await readSavIntakeCurrent(threadId, config);
   expect(current?.payload.reason).toBe(code);
-  expect(current?.payload.plan?.decision).toMatchObject({ classification: "unknown", requests: [], disposition: { kind: "collect_context" } });
-  expect(current?.payload.plan?.progress).toMatchObject({ kind: "human_choice", questionCode: "request_scope_uncertain", view: "to_validate" });
+  if (code === "SAV_INTAKE_AUTOMATED_REPLY") {
+    expect(current?.payload.plan?.decision).toMatchObject({ classification: "acknowledgement", requests: [],
+      disposition: { kind: "no_ticket", qualifiedInformation: "verified_automatic_reply", reason: "acknowledgement_only" },
+      evidence: expect.arrayContaining([expect.objectContaining({ source: "automation_headers", sourceId: messageId })]) });
+  } else {
+    expect(current?.payload.plan?.decision).toMatchObject({ classification: "unknown", requests: [], disposition: { kind: "collect_context" } });
+    expect(current?.payload.plan?.progress).toMatchObject({ kind: "human_choice", questionCode: "request_scope_uncertain", view: "to_validate" });
+  }
   expect(current?.payload.traces).toEqual([expect.objectContaining({ phase: "automation_gate", code, modelCalled: false })]);
   expect(await f.db.select().from(savIntakeModelCalls)).toHaveLength(0);
   expect((await readSavIntakeBudget(config)).callCount).toBe(0);
@@ -65,7 +71,7 @@ beforeEach(async () => {
 });
 afterEach(() => vi.unstubAllEnvs());
 
-it("a marketing absence reply never reserves, reads CRM/Gmail or calls the model, and stays for a person", async () => {
+it("a proven absence becomes an acknowledgement without a model or CRM call", async () => {
   const m = await mail({ subject: "Réponse automatique : Offre fictive", text: "Je suis absent jusqu'au 10 novembre.", headers: absence });
   const network = forbidden();
   expect(await analyseSavIntakeRuntime((await enqueueSavIntakeMessage(m.id, config))!, config, { env: () => environment, network })).toMatchObject({ state: "observed" });
@@ -86,9 +92,9 @@ it("a human reply with the same subject, or legacy mail without headers, follows
 });
 it("a delivery report about a support mail keeps the proof and a follow-up for the team, without a classification", async () => {
   const sent = await mail({ direction: "outbound", from: "support@example.invalid", subject: "Re: Connexion fictive", text: "Réponse fictive du support.",
-    headers: { "message-id": supportId }, receivedAt: new Date(Date.now() - 60_000) });
+    headers: { "x-studio-automation-headers": "singleton-v1", "message-id": supportId }, receivedAt: new Date(Date.now() - 60_000) });
   const m = await mail({ from: "mailer-daemon@example.invalid", subject: "Delivery Status Notification (Failure)", text: "Adresse introuvable.",
-    headers: { "auto-submitted": "auto-replied", "content-type": 'multipart/report; report-type=delivery-status; boundary="synthetic"', "in-reply-to": supportId, references: supportId } });
+    headers: { "x-studio-automation-headers": "singleton-v1", "auto-submitted": "auto-replied", "content-type": 'multipart/report; report-type=delivery-status; boundary="synthetic"', "in-reply-to": supportId, references: supportId } });
   const network = forbidden();
   expect(await analyseSavIntakeRuntime((await enqueueSavIntakeMessage(m.id, config))!, config, { env: () => environment, network })).toMatchObject({ state: "observed" });
   expect(network).not.toHaveBeenCalled();
@@ -114,4 +120,34 @@ it("a resumed run of an old waiting absence reply is stopped before any reservat
   expect(await analyseSavIntakeRuntime(runId, config, { env: () => environment, network })).toMatchObject({ state: "observed" });
   expect(network).not.toHaveBeenCalled();
   await excluded(m.id, "SAV_INTAKE_AUTOMATED_REPLY");
+});
+
+function minimalBudget() {
+  environment.SAV_INTAKE_RUNTIME_CONFIG = JSON.stringify({ ...JSON.parse(environment.SAV_INTAKE_RUNTIME_CONFIG!),
+    budgetProfile: "operational_utc_v1", maxNanoUsd: 1, maxRollingNanoUsd: 90_000_000_000, maxCalls: 300 });
+  config = savIntakeRuntimeConfig(environment)!;
+}
+
+it("under the operational cap only a proven automatic mail gets through; a subsequent human inbound is deferred", async () => {
+  minimalBudget();
+  const first = await mail({ headers: absence, text: "Je suis absent.", receivedAt: new Date(Date.now() - 300) });
+  const network = forbidden();
+  const id = (await enqueueSavIntakeMessage(first.id, config))!;
+  expect(await analyseSavIntakeRuntime(id, config, { env: () => environment, network })).toMatchObject({ state: "observed" });
+  await excluded(first.id, "SAV_INTAKE_AUTOMATED_REPLY");
+  const next = await mail({ text: "Je suis absent. Mon compte ne fonctionne plus.", headers: absence });
+  await analyseSavIntakeRuntime((await enqueueSavIntakeMessage(next.id, config))!, config, { env: () => environment, network });
+  expect(await readSavIntakeCurrent(threadId, config)).toMatchObject({ attempts: 0, payload: { reason: "SAV_INTAKE_RUNTIME_DAILY_BUDGET_DEFERRED" } });
+  expect(network).not.toHaveBeenCalled();
+});
+
+it("an uncertain reservation from another run for the same mail prevents the automatic result", async () => {
+  minimalBudget();
+  const m = await mail({ headers: absence, text: "Je suis absent." }), id = (await enqueueSavIntakeMessage(m.id, config))!;
+  await f.db.insert(savIntakeModelCalls).values({ messageKey: intakeRuntimeHash(m.id), requestHash: intakeRuntimeHash("unknown"),
+    state: "uncertain", reservedNanoUsd: 817152000, chargedNanoUsd: 817152000, payloadCiphertext: encryptSavPayload({}) });
+  const network = forbidden();
+  await analyseSavIntakeRuntime(id, config, { env: () => environment, network });
+  expect(await readSavIntakeCurrent(threadId, config)).toMatchObject({ state: "uncertain", attempts: 0 });
+  expect(network).not.toHaveBeenCalled();
 });

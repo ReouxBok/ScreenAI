@@ -358,6 +358,13 @@ export function parseGmailMessage(mailboxEmail: string, message: GmailMessage, n
   const futureDate = providerReceivedAt.getTime() > now.getTime();
   const receivedAt = futureDate ? new Date(now.getTime()) : providerReceivedAt;
   const headers = message.payload?.headers;
+  // Only the parser sets this marker. The first value from a repeated header is
+  // fine for display but cannot be evidence for a terminal automatic decision.
+  const automationHeaders = ["from", "to", "auto-submitted", "content-type", "in-reply-to", "references", "message-id"];
+  const unambiguous = automationHeaders.every(name => {
+    const values = headers?.filter(h => h.name?.toLowerCase() === name) ?? [];
+    return values.length <= 1 && (values[0]?.value?.length ?? 0) <= (name === "auto-submitted" ? 200 : 2000);
+  });
   const from = boundedHeader(headerValue(headers, "From"), 500);
   const intakeRecipients = String(process.env.GMAIL_INTAKE_RECIPIENTS || mailboxEmail).split(",");
   const to = normalizeRecipientHeader(headerValue(headers, "To"), intakeRecipients);
@@ -376,6 +383,7 @@ export function parseGmailMessage(mailboxEmail: string, message: GmailMessage, n
     ...(bodies.html.length ? { bodyHtml: bodies.html.join("\n\n").slice(0, 300_000) } : {}),
     autoSubmitted: boundedHeader(headerValue(headers, "Auto-Submitted"), 200) || undefined,
     headers: {
+      "x-studio-automation-headers": unambiguous ? "singleton-v1" : "ambiguous",
       "auto-submitted": boundedHeader(headerValue(headers, "Auto-Submitted"), 200),
       "from-display-name": boundedHeader(from.includes("<") ? from.split("<")[0].trim().replace(/^"|"$/g, "") : "", 100),
       "content-type": boundedHeader(headerValue(headers, "Content-Type") || message.payload?.mimeType || "", 2_000),

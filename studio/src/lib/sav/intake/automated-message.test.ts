@@ -13,12 +13,12 @@ const message = (properties: Partial<IntakeMessage> = {}): IntakeMessage => ({ i
   currentText: "Réponse automatique : je suis absent jusqu'au 10 novembre.", contentComplete: true, direction: "inbound", ...properties });
 const detect = (headers: unknown, options: { message?: Partial<IntakeMessage>; attachments?: unknown; support?: string[] } = {}) =>
   intakeAutomatedMessage({ message: message(options.message), headers, attachments: options.attachments ?? [], supportMessageIds: options.support ?? [supportId] });
-const absence = { "auto-submitted": "auto-replied", "content-type": "text/plain; charset=UTF-8", "in-reply-to": campaignId, references: campaignId };
-const report = { "auto-submitted": "auto-replied", "content-type": 'multipart/report; report-type=delivery-status; boundary="synthetic"', "in-reply-to": supportId, references: supportId };
+const absence = { "x-studio-automation-headers": "singleton-v1", "auto-submitted": "auto-replied", "content-type": "text/plain; charset=UTF-8", "in-reply-to": campaignId, references: campaignId };
+const report = { "x-studio-automation-headers": "singleton-v1", "auto-submitted": "auto-replied", "content-type": 'multipart/report; report-type=delivery-status; boundary="synthetic"', "in-reply-to": supportId, references: supportId };
 
 describe("V1 automation gate before any reservation or model call", () => {
   it("excludes a marketing absence reply proven by its Gmail headers", () => {
-    expect(detect(absence)).toEqual({ revision: "sav-intake-automation-gate.v1", kind: "automatic_reply", code: "SAV_INTAKE_AUTOMATED_REPLY",
+    expect(detect(absence)).toEqual({ revision: "sav-intake-automation-gate.v2", kind: "automatic_reply", code: "SAV_INTAKE_AUTOMATED_REPLY",
       signals: ["auto-submitted:auto-replied", "in-reply-to:present"] });
     expect(detect({ ...absence, "auto-submitted": "Auto-Replied; owner-email=\"synthetic@example.invalid\"" })?.kind).toBe("automatic_reply");
   });
@@ -28,6 +28,10 @@ describe("V1 automation gate before any reservation or model call", () => {
     expect(detect({ ...absence, "auto-submitted": "" })).toBeNull();
   });
   it("leaves mixed or ambiguous messages to the normal SAV", () => {
+    expect(detect(absence, { message: { currentText: "Je suis absent. Je souhaite résilier." } })).toBeNull();
+    expect(detect(absence, { message: { contentComplete: false } })).toBeNull();
+    expect(detect({ ...absence, "x-studio-automation-headers": "ambiguous" })).toBeNull();
+    expect(detect({ ...absence, "x-studio-automation-headers": "" })).toBeNull();
     expect(detect(absence, { attachments: [{ filename: "synthetic.pdf" }] })).toBeNull();
     expect(detect(absence, { message: { unreadAttachments: [{ sourceId: "file-1", reason: "unsupported_type" }] } })).toBeNull();
     expect(detect({ ...absence, "content-type": "multipart/mixed; boundary=x" })).toBeNull();

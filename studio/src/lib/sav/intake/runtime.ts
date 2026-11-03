@@ -14,7 +14,7 @@ import type { EngineInput, MessageAnalysis } from "./engine-types";
 import type { IntakeReadTrace } from "./hubspot-readers";
 import { SAV_INTAKE_MODEL_REVISION } from "./model-readers";
 import { planSavIntake } from "./engine";
-import { intakeAutomatedMessage, intakeAutomationAdapters } from "./automated-message";
+import { intakeAutomationAdapters } from "./automated-message";
 import { intakeCrmEvidenceFingerprint, recordIntakeCrmReads } from "./crm-evidence-fingerprint";
 import { intakeResumeHoldReason, intakeResumeProof, newIntakeResumeObservation, observeIntakeReads } from "./resume-progress";
 import { probeIntakeResumeForRun } from "./resume-progress-store";
@@ -83,10 +83,13 @@ async function analyseSavIntakeRuntimeWithinBudget(runId: string, config: Intake
     await live();
     // V1 cost filter, replay and resume included: an automation proven by the stored Gmail headers
     // never reaches a reservation, a CRM or Gmail read, or a model call. The mail stays for a person.
-    const automation = intakeAutomatedMessage({ message: lease.input.message, headers: lease.body.headers, attachments: lease.body.attachments, supportMessageIds: lease.supportMessageIds ?? [] });
+    const automation = lease.automation;
     if (automation) {
       traces.push({ phase: "automation_gate", ...automation, modelCalled: false });
-      payload.plan = await planSavIntake(lease.input, intakeAutomationAdapters(lease.input.message.id), config.policy, { timeoutMs: 10_000 }, () => new Date());
+      const policy = automation.kind === "automatic_reply"
+        ? { ...config.policy, automatedReply: { messageId: lease.run.messageId, sourceHash: lease.sourceHash, signals: automation.signals } }
+        : config.policy;
+      payload.plan = await planSavIntake(lease.input, intakeAutomationAdapters(lease.input.message.id), policy, { timeoutMs: 10_000 }, () => new Date());
       assertSavIntakeObservation(payload.plan);
       payload.reason = automation.code;
       const state = payload.plan.decision.disposition.kind === "collect_context" && payload.plan.progress.kind !== "human_choice" ? "waiting" : "observed";

@@ -1,6 +1,12 @@
 import type { IntakeAdapters, IntakeMessage } from "./engine-types";
 
-export const SAV_INTAKE_AUTOMATION_REVISION = "sav-intake-automation-gate.v1";
+export const SAV_INTAKE_AUTOMATION_REVISION = "sav-intake-automation-gate.v2";
+
+// Only entire self-contained notices qualify. A second sentence about a
+// callback, an account, an invoice, etc. goes through ordinary analysis.
+const month = "(?:janvier|février|mars|avril|mai|juin|juillet|août|septembre|octobre|novembre|décembre)";
+const date = `(?:lundi|mardi|mercredi|jeudi|vendredi|samedi|dimanche|demain|(?:le )?\\d{1,2}(?: ${month})(?: \\d{4})?)`;
+const simpleNotice = new RegExp(`^(?:réponse automatique\\s*:\\s*)?(?:(?:je suis (?:actuellement )?(?:absent(?:e)?|en congés?)(?: jusqu['’]au ${date})?)|(?:nous avons (?:bien )?reçu votre (?:mail|message|demande))|(?:merci pour votre (?:mail|message))|(?:I am (?:currently )?out of (?:the )?office))\\s*[.!]?$`, "iu");
 export type IntakeAutomation = {
   revision: typeof SAV_INTAKE_AUTOMATION_REVISION;
   kind: "automatic_reply" | "support_delivery_failure";
@@ -17,11 +23,12 @@ const deliveryReport = /^multipart\/report\s*;(?:[^;]*;)*\s*report-type\s*=\s*"?
  * the body text or the sender address alone. Missing, partial, repeated or unknown metadata,
  * attachments and forwarded content return null and the mail follows the normal SAV path. */
 export function intakeAutomatedMessage(input: { message: IntakeMessage; headers: unknown; attachments: unknown;
-  supportMessageIds: readonly string[] }): IntakeAutomation | null {
+  supportMessageIds: readonly string[]; bodyText?: string }): IntakeAutomation | null {
   const { message, headers } = input;
   // Information added by a person asks for the normal path.
   if (message.direction !== "inbound" || message.operatorInformation || !headers || typeof headers !== "object" || Array.isArray(headers)) return null;
   const header = (name: string) => { const value = (headers as Record<string, unknown>)[name]; return typeof value === "string" ? value.trim() : ""; };
+  if (header("x-studio-automation-headers") !== "singleton-v1") return null;
   const contentType = header("content-type"), inReplyTo = ids(header("in-reply-to"));
   const support = new Set(input.supportMessageIds);
   const answersSupport = [...inReplyTo, ...ids(header("references"))].some(id => support.has(id));
@@ -33,6 +40,7 @@ export function intakeAutomatedMessage(input: { message: IntakeMessage; headers:
   // A forward or any attachment may carry a real need, whatever the automation header says.
   if (/\b(?:message\/rfc822|multipart\/mixed)\b/i.test(contentType) || message.attachmentInputs?.length || message.unreadAttachments?.length
     || Array.isArray(input.attachments) && input.attachments.length) return null;
+  if (!message.contentComplete || !simpleNotice.test((input.bodyText ?? message.currentText).trim())) return null;
   // RFC 3834: one keyword, optional parameters. A list or an unknown keyword is ambiguous.
   const keyword = /^([a-z-]+)\s*(?:;[^,]*)?$/i.exec(header("auto-submitted"))?.[1].toLowerCase();
   if (keyword === "auto-replied" && inReplyTo.length) return result("automatic_reply", ["auto-submitted:auto-replied", "in-reply-to:present"]);

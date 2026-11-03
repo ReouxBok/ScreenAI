@@ -203,6 +203,13 @@ export async function planSavIntake(
       for (const prior of conversation) addEvidence(`context-${prior.id}`, "customer_history", prior.id, prior, input.conversation.observedAt);
       return context("classification_incomplete", "request_scope_uncertain");
     }
+    const auto = policy.automatedReply;
+    if (auto && auto.messageId === message.id && !input.humanResolution && !policy.manualSupportOverride && !message.operatorInformation) {
+      const proof = addEvidence("automation", "automation_headers", message.id, auto);
+      classification = "acknowledgement";
+      return finalize({ kind: "no_ticket", reason: "acknowledgement_only", qualifiedInformation: "verified_automatic_reply",
+        nextAction: "none", learning: "excluded", evidenceIds: [current, proof] }, { kind: "processing", phase: "decision", view: null });
+    }
     const continuation = input.identificationContinuation;
     const initial = continuation ? conversation.find(m => m.id === continuation.initialMessageId) : undefined;
     if (continuation && (!initial || !initial.contentComplete || initial.direction !== "inbound" || initial.threadId !== message.threadId

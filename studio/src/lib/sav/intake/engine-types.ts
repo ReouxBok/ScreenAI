@@ -81,6 +81,8 @@ export type EnginePolicy = {
   // Server-qualified rules and operator overrides are inputs, never inferred from a brand keyword.
   qualifiedOther?: { family?: "authenticated_newsletter"; resource: PrivateResource; evidenceSource: "private_rule" | "human_override" };
   manualSupportOverride?: PrivateResource;
+  /** Set by the stored-message automation gate, never read from model output. */
+  automatedReply?: { messageId: string; sourceHash: string; signals: string[] };
 };
 export type IntakeAdapters = {
   analyseMessage(input: { message: IntakeMessage; conversation: readonly IntakeMessage[]; identificationContinuation?: EngineInput["identificationContinuation"] }, signal: AbortSignal): Promise<MessageAnalysis>;
