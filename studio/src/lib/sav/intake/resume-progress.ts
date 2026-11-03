@@ -39,7 +39,23 @@ const canonical = (value: unknown): string => value === undefined ? "null" : val
   : `{${Object.keys(value).sort().map(key => `${JSON.stringify(key)}:${canonical((value as Record<string, unknown>)[key])}`).join(",")}}`;
 const digest = (value: unknown) => createHash("sha256").update(canonical(value)).digest("hex");
 /** What a read says, without when it was observed: only a complete read has content. */
-const readDigest = (result: ReadResult<unknown>) => digest(result.status === "complete" ? result.data : null);
+function readDigest(method: IntakeResumeMethod, result: ReadResult<unknown>) {
+  if (result.status !== "complete") return digest(null);
+  // Contact/ticket/association readers return sets. A different page or batch order is not new evidence.
+  // Preserve the sequence of ticketHistory entries and every actual value.
+  function normalize(row: unknown) {
+    if (!row || typeof row !== "object" || Array.isArray(row)) return row;
+    const value = { ...row } as Record<string, unknown>;
+    for (const field of ["emails", "contactIds"]) if (Array.isArray(value[field])) value[field] = [...value[field]].sort();
+    return value;
+  }
+  if (method === "ticketHistory") return digest(result.data);
+  if (!Array.isArray(result.data)) return digest(normalize(result.data));
+  return digest(result.data.map(normalize).sort((a, b) => {
+    const left = canonical(a), right = canonical(b);
+    return left < right ? -1 : left > right ? 1 : 0;
+  }));
+}
 
 export type IntakeResumeObservation = { reads: IntakeResumeRead[]; truncated: boolean };
 export const newIntakeResumeObservation = (): IntakeResumeObservation => ({ reads: [], truncated: false });
@@ -50,7 +66,7 @@ export function observeIntakeReads<T extends IntakeResumeReaders>(readers: T, si
     const read = readers[method] as (arg: string, signal: AbortSignal) => Promise<ReadResult<unknown>>;
     (wrapped as unknown as Record<string, unknown>)[method] = async (arg: string, signal: AbortSignal) => {
       const result = await read.call(readers, arg, signal);
-      const entry: IntakeResumeRead = { method, arg, status: result.status, digest: readDigest(result) };
+      const entry: IntakeResumeRead = { method, arg, status: result.status, digest: readDigest(method, result) };
       const index = sink.reads.findIndex(r => r.method === method && r.arg === arg);
       if (index >= 0) sink.reads[index] = entry;
       else if (sink.reads.length >= SAV_INTAKE_RESUME_MAX_READS || arg.length === 0 || arg.length > 320) sink.truncated = true;
@@ -81,7 +97,7 @@ export function withoutIntakeResumeProof<T extends { resumeProof?: unknown }>(pa
   return copy;
 }
 /** Identity of what a proof says, for the durable hold: same key = same stuck state. */
-export const intakeResumeProofKey = (proof: IntakeResumeProof) => digest(proof.reads.map(r => [r.method, r.arg, r.status, r.digest])).slice(0, 32);
+export const intakeResumeProofKey = (proof: IntakeResumeProof) => digest(proof);
 
 export type IntakeResumeProbe =
   | { state: "progress"; method: IntakeResumeMethod; change: "completed" | "changed"; checked: number }
@@ -102,7 +118,7 @@ export async function probeIntakeResume(proof: IntakeResumeProof, readers: Intak
     checked++;
     if (result.status === "complete") {
       if (before.status !== "complete") return { state: "progress", method: before.method, change: "completed", checked };
-      if (readDigest(result) !== before.digest) return { state: "progress", method: before.method, change: "changed", checked };
+      if (readDigest(before.method, result) !== before.digest) return { state: "progress", method: before.method, change: "changed", checked };
     } else if (before.status === "complete") regressed = true;
   }
   return signal.aborted || regressed ? { state: "unavailable", checked } : { state: "same", checked };

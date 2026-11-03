@@ -35,10 +35,11 @@ async function stored(text = "La connexion ne marche plus.") {
 /** One synthetic CRM and one synthetic model; the test moves the CRM between resumes. */
 type History = "partial" | "complete" | "grown";
 function world() {
+  const stableNow = Date.now();
   const crm = { history: "partial" as History, ticketSubject: "Connexion fictive", down: false };
   const seen = { model: 0, crm: [] as { method: string; path: string }[] };
   const edge = (id: string) => ({ toObjectId: id, associationTypes: [{ typeId: 1, category: "HUBSPOT_DEFINED" }] });
-  const note = (id: string, text: string) => ({ id, properties: { hs_note_body: text, hs_timestamp: new Date(Date.now() - 20 * 86_400_000).toISOString() } });
+  const note = (id: string, text: string) => ({ id, properties: { hs_note_body: text, hs_timestamp: new Date(stableNow - 20 * 86_400_000).toISOString() } });
   const network = vi.fn(async (url: Parameters<typeof fetch>[0], init?: RequestInit) => {
     if (String(url).startsWith("https://generativelanguage.googleapis.com/")) {
       seen.model++;
@@ -56,8 +57,8 @@ function world() {
     if (path.endsWith("/pipelines/tickets/0")) return Response.json({ id: "0", stages: ["1", "2", "3", "4"].map(id => ({ id, metadata: { isClosed: id === "4" } })) });
     if (path.endsWith("contacts/101/associations/tickets")) return Response.json({ results: [edge("201")] });
     if (path.endsWith("tickets/201/associations/contacts")) return Response.json({ results: [edge("101")] });
-    if (path.endsWith("/tickets/batch/read")) return Response.json({ status: "COMPLETE", results: [{ id: "201", properties: { subject: crm.ticketSubject, content: "Panne de connexion fictive", createdate: new Date(Date.now() - 30 * 86_400_000).toISOString(),
-      hs_pipeline: "0", hs_pipeline_stage: "2", hubspot_owner_id: "301", hs_last_closed_date: new Date(Date.now() - 5 * 86_400_000).toISOString() } }] });
+    if (path.endsWith("/tickets/batch/read")) return Response.json({ status: "COMPLETE", results: [{ id: "201", properties: { subject: crm.ticketSubject, content: "Panne de connexion fictive", createdate: new Date(stableNow - 30 * 86_400_000).toISOString(),
+      hs_pipeline: "0", hs_pipeline_stage: "2", hubspot_owner_id: "301", hs_last_closed_date: new Date(stableNow - 5 * 86_400_000).toISOString() } }] });
     // The same page is offered again and again while the history is partial: the reader reports a pagination cycle, never an empty history.
     if (path.endsWith("tickets/201/associations/notes")) return Response.json(crm.history === "partial" ? { results: [edge("401")], paging: { next: { after: "page-2" } } }
       : { results: crm.history === "grown" ? [edge("401"), edge("402")] : [edge("401")] });
@@ -152,7 +153,7 @@ it("pagination completed: the run is resumed on that real progress, once, with t
   const modelBefore = w.seen.model, result = await analyse(id, w);
   expect(result).toMatchObject({ state: "observed" });
   expect((await run(id)).attempts).toBe(2);
-  expect(w.seen.model).toBe(modelBefore + 2);
+  expect(w.seen.model).toBe(modelBefore + 1); // Understanding is reused; only the issue assessment is newly dispatched.
   const sequence = await kinds(id);
   expect(sequence.filter(k => k === "resume_progress")).toHaveLength(1);
   expect(sequence.filter(k => k === "claimed")).toHaveLength(2);
@@ -185,7 +186,7 @@ it("two simultaneous resumes of an unchanged state: both held, one trace, nothin
   const w = world(), { id } = await firstAttempt(w);
   const modelBefore = w.seen.model;
   const results = await Promise.all([analyse(id, w), analyse(id, w)]);
-  expect(results).toEqual([{ skipped: SAV_INTAKE_RESUME_NO_PROGRESS }, { skipped: SAV_INTAKE_RESUME_NO_PROGRESS }]);
+  expect(results).toEqual(expect.arrayContaining([{ skipped: SAV_INTAKE_RESUME_NO_PROGRESS }, { skipped: "not_claimed" }]));
   expect(w.seen.model).toBe(modelBefore);
   expect((await run(id)).attempts).toBe(1);
   expect((await kinds(id)).filter(k => k === "resume_held")).toHaveLength(1);
@@ -198,7 +199,7 @@ it("two simultaneous resumes on real progress: exactly one takes the attempt and
   expect(results.filter(r => "state" in r)).toHaveLength(1);
   expect(results.filter(r => "skipped" in r)).toHaveLength(1);
   expect((await run(id)).attempts).toBe(2);
-  expect(w.seen.model).toBe(modelBefore + 2);
+  expect(w.seen.model).toBe(modelBefore + 1); // Understanding is reused; only the issue assessment is newly dispatched.
   expect((await kinds(id)).filter(k => k === "claimed")).toHaveLength(2);
 });
 
@@ -235,7 +236,7 @@ it("operator information or an edited mail changes the content hash: the old pro
   const modelBefore = w.seen.model;
   expect(await analyse(id, w)).toMatchObject({ state: "waiting" });
   expect((await run(id)).attempts).toBe(2);
-  expect(w.seen.model).toBeGreaterThan(modelBefore);
+  expect(w.seen.model).toBe(modelBefore); // Unchanged understanding is served from the settled result.
 });
 
 it("old data resumes as it always did: a wait recorded before this change (no proof) or an unreadable proof", async () => {
@@ -251,7 +252,7 @@ it("old data resumes as it always did: a wait recorded before this change (no pr
     const modelBefore = w.seen.model;
     expect(await analyse(id, w)).toMatchObject({ state: "waiting" });
     expect((await run(id)).attempts).toBe(2);
-    expect(w.seen.model).toBeGreaterThan(modelBefore);
+    expect(w.seen.model).toBe(modelBefore); // Unchanged understanding is served from the settled result.
     expect(await kinds(id)).not.toContain("resume_held");
   }
 });
@@ -264,4 +265,35 @@ it("a held run is not blocked: it stays waiting with its two-attempt bound intac
   expect(await kinds(id)).not.toEqual(expect.arrayContaining(["attempts_exhausted"]));
   expect(await kinds(id)).not.toEqual(expect.arrayContaining(["deterministic_block"]));
   expect(await kinds(id)).not.toEqual(expect.arrayContaining(["source_invalid"]));
+});
+
+it("does not probe HubSpot after a dossier has been paused", async () => {
+  const w = world(), { id } = await firstAttempt(w);
+  const reads = w.seen.crm.length;
+  await f.db.update(savThreads).set({ aiPaused: true, humanRequestedAt: new Date() }).where(eq(savThreads.id, threadId));
+  expect(await analyse(id, w)).toEqual({ skipped: "not_claimed" });
+  expect(w.seen.crm).toHaveLength(reads);
+  expect((await run(id)).attempts).toBe(1);
+});
+
+it.each(["proof", "paused"] as const)("ignores a probe when %s changes during the network read", async mutation => {
+  const w = world(), { id } = await firstAttempt(w);
+  const before = w.seen.model;
+  const payload = await payloadOf(id);
+  w.crm.history = "complete";
+  const [path] = w.seen.crm.slice(-1);
+  expect(path).toBeDefined();
+  w.network.mockImplementationOnce(async () => {
+    if (mutation === "proof") {
+      const proof = { ...payload.resumeProof!, incomplete: "different-read" };
+      await f.db.update(savIntakeRuns).set({ payloadCiphertext: encryptSavPayload({ ...payload, resumeProof: proof }) }).where(eq(savIntakeRuns.id, id));
+    } else {
+      await f.db.update(savThreads).set({ aiPaused: true }).where(eq(savThreads.id, threadId));
+    }
+    return Response.json({ results: [] });
+  });
+  expect(await analyse(id, w)).toEqual({ skipped: "not_claimed" });
+  expect((await run(id)).attempts).toBe(1);
+  expect(w.seen.model).toBe(before);
+  expect(await kinds(id)).not.toContain("resume_progress");
 });

@@ -17,7 +17,7 @@ import { planSavIntake } from "./engine";
 import { intakeAutomatedMessage, intakeAutomationAdapters } from "./automated-message";
 import { intakeCrmEvidenceFingerprint, recordIntakeCrmReads } from "./crm-evidence-fingerprint";
 import { intakeResumeHoldReason, intakeResumeProof, newIntakeResumeObservation, observeIntakeReads } from "./resume-progress";
-import { probeIntakeResumeForRun, readIntakeResumeProof } from "./resume-progress-store";
+import { probeIntakeResumeForRun } from "./resume-progress-store";
 import type { IntakeBudgetLimit } from "./budget-limit";
 import { intakeTransientFailure, SAV_INTAKE_DETERMINISTIC_ERRORS } from "./attempt-policy";
 import { createSavIntakeHubspotReaders } from "./hubspot-readers";
@@ -46,11 +46,10 @@ export async function enqueueConfiguredSavIntake(messageId: string) {
 async function analyseSavIntakeRuntimeWithinBudget(runId: string, config: IntakeRuntimeConfig,
   deps: { env?: () => Record<string, string | undefined>; network?: typeof fetch; downloadAttachments?: Parameters<typeof prepareIntakeAttachments>[3]; authenticateOther?: Parameters<typeof qualifyRuntimeOther>[3]; startReadRecovery?: (runId:string)=>Promise<unknown>; deadlineMs?: number } = {}) {
   const env = deps.env ?? (() => process.env), network = deps.network ?? fetch;
-  // A run that waits on an incomplete CRM read is looked at before anything is taken: bounded reads, no model, no attempt.
-  const waitingProof = await readIntakeResumeProof(runId);
-  const resumeProbe = waitingProof ? await probeIntakeResumeForRun(waitingProof, { env, network }) : null;
   const held: { cause?: Parameters<typeof intakeResumeHoldReason>[0] } = {};
-  const lease = await claimSavIntakeRun(runId, config, new Date(), { resumeProbe, onHold: cause => { held.cause = cause; } });
+  const lease = await claimSavIntakeRun(runId, config, new Date(), {
+    probe: (proof, check) => probeIntakeResumeForRun(proof, { env, network, check }), onHold: cause => { held.cause = cause; },
+  });
   if (!lease) return { skipped: held.cause ? intakeResumeHoldReason(held.cause) : "not_claimed" };
   const previous = decryptSavPayload<IntakeRuntimePayload>(lease.run.payloadCiphertext);
   if (lease.recoveringRead && previous.input) lease.input = structuredClone(previous.input) as EngineInput;

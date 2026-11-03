@@ -170,3 +170,11 @@ it("type check helper: a proof is a plain value", async () => {
   const proof: IntakeResumeProof = await proofOf();
   expect(JSON.parse(JSON.stringify(proof))).toEqual(proof);
 });
+
+it("a reordered batch or reordered address list is the same evidence", async () => {
+  const a = { id: "101", emails: ["b@example.invalid", "a@example.invalid"] };
+  const b = { id: "102", emails: ["c@example.invalid"] };
+  const proof = await proofOf({ ...base, findContactsByEmail: () => done([a, b]) });
+  const reordered = { ...base, findContactsByEmail: () => done([b, { ...a, emails: [...a.emails].reverse() }]) };
+  expect(await probeIntakeResume(proof, readers(reordered), signal)).toEqual({ state: "same", checked: 4 });
+});

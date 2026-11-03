@@ -1,33 +1,27 @@
 import "server-only";
 import { and, eq, sql } from "drizzle-orm";
 import { requireDb } from "@/db";
-import { auditLogs, savIntakeJournal, savIntakeRuns } from "@/db/schema";
-import { decryptSavPayload, encryptSavPayload } from "../crypto";
+import { auditLogs, savIntakeJournal } from "@/db/schema";
+import { encryptSavPayload } from "../crypto";
 import { createSavIntakeHubspotReaders } from "./hubspot-readers";
-import { intakeResumeNextProbeAt, intakeResumeProofKey, parseIntakeResumeProof, probeIntakeResume, type IntakeResumeDecision, type IntakeResumeProbe, type IntakeResumeProof } from "./resume-progress";
-import type { IntakeRuntimePayload } from "./runtime-contract";
+import { intakeResumeNextProbeAt, intakeResumeProofKey, probeIntakeResume, type IntakeResumeDecision, type IntakeResumeProbe, type IntakeResumeProof } from "./resume-progress";
 
 type Tx = Parameters<Parameters<ReturnType<typeof requireDb>["transaction"]>[0]>[0];
 const MARKER = "sav_intake_resume_hold";
 const hold = (runId: string) => and(eq(auditLogs.entityType, MARKER), eq(auditLogs.entityId, runId), eq(auditLogs.action, MARKER));
 
-/** Read only, no lock: the proof of the run, when it is current and waiting. Nothing here claims or refunds anything. */
-export async function readIntakeResumeProof(runId: string): Promise<IntakeResumeProof | null> {
-  const [row] = await requireDb().select({ state: savIntakeRuns.state, isCurrent: savIntakeRuns.isCurrent, payloadCiphertext: savIntakeRuns.payloadCiphertext })
-    .from(savIntakeRuns).where(eq(savIntakeRuns.id, runId));
-  if (!row?.isCurrent || row.state !== "waiting") return null;
-  try { return parseIntakeResumeProof(decryptSavPayload<IntakeRuntimePayload>(row.payloadCiphertext).resumeProof); } catch { return null; }
-}
-
 /**
  * Bounded CRM re-read of what the proof names, before any claim: GET and search only (the readers allow nothing else),
  * 15 seconds, the readers' own request bound, and never a model call. Failure to read is « unavailable », not progress.
  */
-export async function probeIntakeResumeForRun(proof: IntakeResumeProof, deps: { env: () => Record<string, string | undefined>; network: typeof fetch }): Promise<IntakeResumeProbe> {
+export async function probeIntakeResumeForRun(proof: IntakeResumeProof, deps: { env: () => Record<string, string | undefined>; network: typeof fetch; check: () => Promise<void> }): Promise<IntakeResumeProbe> {
   const controller = new AbortController(), timer = setTimeout(() => controller.abort(), 15_000);
   try {
-    const readers = createSavIntakeHubspotReaders({ network: async (url, init) => deps.network(url, { ...init, signal: AbortSignal.any([controller.signal, ...(init?.signal ? [init.signal] : [])]), redirect: "error",
-      headers: { ...Object.fromEntries(new Headers(init?.headers)), Authorization: `Bearer ${deps.env().HUBSPOT_ACCESS_TOKEN}` } }) });
+    const readers = createSavIntakeHubspotReaders({ network: async (url, init) => {
+      await deps.check(); controller.signal.throwIfAborted();
+      return deps.network(url, { ...init, signal: AbortSignal.any([controller.signal, ...(init?.signal ? [init.signal] : [])]), redirect: "error",
+      headers: { ...Object.fromEntries(new Headers(init?.headers)), Authorization: `Bearer ${deps.env().HUBSPOT_ACCESS_TOKEN}` } });
+    } });
     return await probeIntakeResume(proof, readers, controller.signal);
   } catch { return { state: "unavailable", checked: 0 }; }
   finally { clearTimeout(timer); }

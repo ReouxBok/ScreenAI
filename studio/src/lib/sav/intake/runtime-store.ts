@@ -2,7 +2,7 @@ import { readRecoveryDue, DEFAULT_INTAKE_READ_RECOVERY } from "./read-recovery";
 import { readIntakeOperatorInformation } from "./operator-information";
 import { writeReadRecoveryMarker,readRecoverySql,noReadRecoverySql } from "./read-recovery-store";
 import { holdIntakeResume, noResumeHoldSql, recordIntakeResumeProgress } from "./resume-progress-store";
-import { intakeResumeDecision, parseIntakeResumeProof, withoutIntakeResumeProof, type IntakeResumeDecision, type IntakeResumeProbe } from "./resume-progress";
+import { intakeResumeDecision, parseIntakeResumeProof, withoutIntakeResumeProof, intakeResumeProofKey, type IntakeResumeDecision, type IntakeResumeProof, type IntakeResumeProbe } from "./resume-progress";
 import { intakeAttemptBudget, SAV_INTAKE_ATTEMPT_POLICY, SAV_INTAKE_BLOCKING_JOURNAL_KINDS, SAV_INTAKE_CALL_POLICY, SAV_INTAKE_TRANSIENT_RETRY } from "./attempt-policy";
 import { readSavExternalCompletion, listSavExternalCompletionMessageIds } from "../external-completion";
 import "server-only";
@@ -232,17 +232,50 @@ export async function catchupSavIntake(config: IntakeRuntimeConfig, limit = 4) {
   return messages.length;
 }
 /** `resumeProbe`: what the bounded CRM re-read found for a run that waits on an incomplete read (see resume-progress.ts). `onHold`: told why a claim was refused without taking an attempt. */
-export type IntakeClaimOptions = { resumeProbe?: IntakeResumeProbe | null; onHold?: (cause: Extract<IntakeResumeDecision, { kind: "hold" }>["cause"]) => void };
+type ResumeReservation = { proof: IntakeResumeProof; token: string; pauseSetAt: string | null };
+export type IntakeClaimOptions = {
+  probe?: (proof: IntakeResumeProof, check: () => Promise<void>) => Promise<IntakeResumeProbe>;
+  onHold?: (cause: Extract<IntakeResumeDecision, { kind: "hold" }>["cause"]) => void;
+};
 export async function claimSavIntakeRun(id: string, config: IntakeRuntimeConfig, now = new Date(), options: IntakeClaimOptions = {}): Promise<IntakeLease | null> {
+  const first = await claimOrReserve(id, config, now, options);
+  if (!first || "run" in first) return first;
+  try {
+    const check = async () => {
+      const db = requireDb(), [row] = await db.select().from(savIntakeRuns).where(eq(savIntakeRuns.id, id));
+      if (!row || !row.isCurrent || row.state !== "waiting" || row.leaseToken !== first.token || !row.leaseUntil || row.leaseUntil <= new Date()
+        || !await intakeRunConfigurationBound(row, config, db)) throw Error("SAV_INTAKE_RUNTIME_CONTEXT_CHANGED");
+      const [thread] = await db.select().from(savThreads).where(eq(savThreads.id, row.threadId));
+      const pause = await readSavAgentPause(db);
+      const [message] = await db.select().from(savMessages).where(and(eq(savMessages.id, row.messageId), noCommittedExecution));
+      if (!thread || thread.aiPaused || thread.humanRequestedAt || pause.level === "fully_paused" || (pause.setting?.setAt ?? null) !== first.pauseSetAt ||
+        !message || await readSavExternalCompletion(message, db) || await intakeHasHumanDecision(row.messageId, db)) throw Error("SAV_INTAKE_RUNTIME_CONTEXT_CHANGED");
+      const proof = parseIntakeResumeProof(decryptSavPayload<IntakeRuntimePayload>(row.payloadCiphertext).resumeProof);
+      if (!proof || intakeResumeProofKey(proof) !== intakeResumeProofKey(first.proof)) throw Error("SAV_INTAKE_RUNTIME_CONTEXT_CHANGED");
+    };
+    const probe = await options.probe!(first.proof, check);
+    const claimed = await claimOrReserve(id, config, new Date(), options, { ...first, result: probe });
+    return claimed && "run" in claimed ? claimed : null;
+  } finally {
+    // A refused or crashed probe must never clear a newer lease or count as an analysis.
+    await requireDb().update(savIntakeRuns).set({ leaseToken: null, leaseUntil: null })
+      .where(and(eq(savIntakeRuns.id, id), eq(savIntakeRuns.leaseToken, first.token), eq(savIntakeRuns.state, "waiting")));
+  }
+}
+async function claimOrReserve(id: string, config: IntakeRuntimeConfig, now: Date, options: IntakeClaimOptions,
+  finished?: ResumeReservation & { result: IntakeResumeProbe }): Promise<IntakeLease | ResumeReservation | null> {
   return requireDb().transaction(async tx => {
     const [initial] = await tx.select().from(savIntakeRuns).where(eq(savIntakeRuns.id, id)); if (!initial) return null;
     const [thread] = await tx.select().from(savThreads).where(eq(savThreads.id, initial.threadId)).for("update");
     const [run] = await tx.select().from(savIntakeRuns).where(eq(savIntakeRuns.id, id)).for("update");
     // Full agent pause: no claim and no write, so the run resumes exactly as it was left
     // (state, reason, attempts). Callers apply their env checks first; this only restricts.
-    if ((await readSavAgentPause(tx)).level === "fully_paused") return null;
-    if (!run.isCurrent || !await intakeRunConfigurationBound(run, config, tx) || ["observed", "uncertain", "superseded"].includes(run.state)
-      || run.leaseUntil && run.leaseUntil > now) return null;
+    const pause = await readSavAgentPause(tx);
+    if (pause.level === "fully_paused" || finished && finished.pauseSetAt !== (pause.setting?.setAt ?? null)) return null;
+    if (!run.isCurrent || !await intakeRunConfigurationBound(run, config, tx) || ["observed", "uncertain", "superseded"].includes(run.state)) return null;
+    if (finished) {
+      if (run.state !== "waiting" || run.leaseToken !== finished.token || !run.leaseUntil || run.leaseUntil <= new Date()) return null;
+    } else if (run.leaseUntil && run.leaseUntil > now) return null;
     const message = await latest(tx, run.threadId);
     if (!message || message.id !== run.messageId || !eligible(message, config)) {
       await tx.update(savIntakeRuns).set({ state: "superseded", isCurrent: false, leaseToken: null, leaseUntil: null, freshUntil: null }).where(eq(savIntakeRuns.id, id)); return null;
@@ -255,6 +288,7 @@ export async function claimSavIntakeRun(id: string, config: IntakeRuntimeConfig,
     const priorPayload = decryptSavPayload<IntakeRuntimePayload>(run.payloadCiphertext);
     const retry = readRecoveryDue(priorPayload.readRecovery, config, now);
     const recoveringRead = Boolean(retry && priorPayload.input && priorPayload.semantics?.records.some(r => r.method === "analyseMessage"));
+    if (finished && priorPayload.readRecovery) return null;
     if (priorPayload.readRecovery && (!retry || ["exhausted", "invalidated", "complete"].includes(priorPayload.readRecovery.state))) return null;
     if(recoveringRead&&retry){
       if(!await intakeConsoleInstalled(tx))return null;
@@ -318,9 +352,19 @@ export async function claimSavIntakeRun(id: string, config: IntakeRuntimeConfig,
     }
     if (!recoveringRead) {
       // A wait that ended on an incomplete CRM read is resumed only on progress: otherwise no attempt, no model call, nothing written to the run.
-      const proof = parseIntakeResumeProof(priorPayload.resumeProof), resume = intakeResumeDecision(proof, { configHash: config.configHash, sourceHash: data.sourceHash }, options.resumeProbe ?? null);
+      const proof = parseIntakeResumeProof(priorPayload.resumeProof);
+      if (finished && (!proof || intakeResumeProofKey(proof) !== intakeResumeProofKey(finished.proof) ||
+        config.configHash !== proof.configHash || data.sourceHash !== proof.sourceHash)) return null;
+      const resume = intakeResumeDecision(proof, { configHash: config.configHash, sourceHash: data.sourceHash }, finished?.result ?? null);
+      if (proof && (thread.humanRequestedAt || run.humanChoiceCiphertext || await intakeHasHumanDecision(run.messageId, tx))) return null;
+      if (proof && resume.kind === "hold" && resume.cause === "unchecked" && options.probe) {
+        // Commit this short reservation before network I/O. The second pass takes all the same locks and revalidates the same proof.
+        const token = randomUUID();
+        await tx.update(savIntakeRuns).set({ leaseToken: token, leaseUntil: new Date(now.getTime() + 30_000) }).where(eq(savIntakeRuns.id, id));
+        return { token, proof, pauseSetAt: pause.setting?.setAt ?? null };
+      }
       if (resume.kind === "hold") { await holdIntakeResume(tx, run.id, proof!, resume.cause, now); options.onHold?.(resume.cause); return null; }
-      if (resume.cause === "progress" && options.resumeProbe?.state === "progress") await recordIntakeResumeProgress(tx, run.id, options.resumeProbe);
+      if (resume.cause === "progress" && finished?.result.state === "progress") await recordIntakeResumeProgress(tx, run.id, finished.result);
     }
     if (recoveringRead && retry) {
       retry.state = "claimed"; retry.attempts++; retry.retryAt = new Date(now.getTime() + (config.readRecovery ?? DEFAULT_INTAKE_READ_RECOVERY).delayMs).toISOString();
