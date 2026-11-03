@@ -483,6 +483,7 @@ export async function planSavIntake(
       candidateTicketIds = plausible.map(t => t.ticketId).sort();
       return context("same_issue_unresolved", "equivalent_ticket_choice");
     }
+    const originallySame = new Set(assessment.tickets.filter(t => t.relation === "same").map(t => t.ticketId));
     if (humanTicketId && humanProof && (assessment.investigationComplete || plausibleChoices)) {
       const selected = assessment.tickets.find(t => t.ticketId === humanTicketId);
       if (!selected || !tickets.has(humanTicketId)) return context("same_issue_unresolved", "equivalent_ticket_choice");
@@ -510,9 +511,12 @@ export async function planSavIntake(
       candidateTicketIds = eligibleChoices.map(t => t.id).sort();
       return context("same_issue_unresolved", "equivalent_ticket_choice");
     }
-    const oldPredecessor = !opened.length && !recent.length
-      ? chosenTicket ? closed.find(t => t.id === chosenTicket) : closed[0]
-      : undefined;
+    const oldMatches = closed.filter(t => originallySame.has(t.id));
+    let oldPredecessor: IntakeTicket | undefined;
+    if (!opened.length && !recent.length) {
+      if (!chosenTicket) oldPredecessor = closed[0];
+      else if (oldMatches.length > 1) oldPredecessor = oldMatches.find(t => t.id === chosenTicket);
+    }
     if (chosenTicket && !oldPredecessor && ![...opened, ...recent].some(t => t.id === chosenTicket))
       return context("same_issue_unresolved", "equivalent_ticket_choice");
     const selected = chosenTicket ? [...opened, ...recent].find(t => t.id === chosenTicket) : opened[0] ?? recent[0];

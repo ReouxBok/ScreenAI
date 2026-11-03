@@ -222,6 +222,13 @@ describe("bounds, source bindings and fail-closed behavior", () => {
     f.input.humanResolution = { choiceId: "old-tie", at, ticketId: "202" };
     expect(target(await f.run()).target).toMatchObject({ operation: "create", predecessor: { ticketId: "202" } });
   });
+  it("declines an unrelated old ticket as a predecessor even if a direct operator override names it", async () => {
+    const f = closed(16);
+    f.tickets.push(ticket("202", { stage: "closed", closedAt: "2026-10-02T00:00:00Z" }));
+    f.matches["202"] = "different";
+    f.input.humanResolution = { choiceId: "unrelated-old-ticket", at, ticketId: "202" };
+    reason(await f.run(), "same_issue_unresolved");
+  });
   it("limits unresponsive injected readers and propagates AbortSignal", async () => { const f = fixture(); let signal: AbortSignal | undefined; f.adapters.findContactsByEmail = async (_, s) => { signal = s; return new Promise(() => {}); }; const p = await planSavIntake(f.input, f.adapters, f.policy, { timeoutMs: 5 }); reason(p, "contact_lookup_failed"); expect(signal?.aborted).toBe(true); });
   it("caps reads rather than manufacture complete absence", async () => { const f = fixture(); reason(await planSavIntake(f.input, f.adapters, f.policy, { readCalls: 1 }), "contact_lookup_failed"); });
   it("does not dispatch a second template when the supplied journal says it is uncertain", async () => { const f = fixture(); delete f.contacts["101"]; f.input.previousIdentification = { messageId: mid, address: "sender@example.test", state: "uncertain" }; expect((await f.run()).steps).toEqual([]); });
