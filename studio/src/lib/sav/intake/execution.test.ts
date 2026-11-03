@@ -1731,3 +1731,67 @@ it.each([true, false])("SAV-31 reconcile_note through the MCP verifies the exist
         if (!associated) expect(p.links.get(`notes:${decryptSavPayload<EffectAck>(note.ackCiphertext!).id}:tickets`) ?? []).toEqual([]);
     } finally { state.adapterDefaults = null; }
 });
+
+it("V1 integrated: absence, real reply, partial history, then observation outage after the email is linked", async () => {
+    const { savIntakeObservationBindings, savIntakeModelCalls } = await import("@/db/schema");
+    const { ensureIntakeObservations } = await import("./observation-binding");
+    const { syncSavObservation } = await import("../observations");
+    const { readSavIntakeCurrent } = await import("./runtime-store");
+    const analyse = async (id: string, network: typeof fetch) =>
+        analyseSavIntakeRuntime(id, options.runtime, { env: () => environment, network });
+    // Gmail stored a verifiable out-of-office response. The next inbound has the same subject.
+    await f.db.update(savMessages).set({ bodyCiphertext: encryptSavPayload({ text: "Automatic out of office.",
+        headers: { "auto-submitted": "auto-replied", "in-reply-to": "<campaign@example.invalid>" }, attachments: [] }) })
+        .where(eq(savMessages.id, messageId));
+    await analyse((await enqueueSavIntakeMessage(messageId, options.runtime))!, async () => { throw Error("unexpected network"); });
+    expect((await readSavIntakeCurrent(threadId, options.runtime))?.payload.reason).toBe("SAV_INTAKE_AUTOMATED_REPLY");
+    expect(await f.db.select().from(savIntakeModelCalls)).toHaveLength(0);
+
+    const human = await storedMessage();
+    p.setGmail(human.gmailMessageId!, "gmail-thread");
+    const ticket = p.seedTicket({ stage: "open" });
+    let partial = true;
+    const network: typeof fetch = async (url, init) => {
+        if (String(url).startsWith("https://generativelanguage.googleapis.com/")) {
+            const prompt = JSON.parse(JSON.parse(String(init?.body)).contents[0].parts[0].text);
+            const cite = (sourceId: string) => prompt.citationCatalogue.find((x: { sourceId: string }) => x.sourceId === sourceId).id;
+            const answer = !prompt.tickets ? { messageId: human.id, requests: [{ id: "r1", kind: "support", currentMessageId: human.id, quoteId: cite("current") }],
+                ticketSummary: { title: "Synthetic connection failure", description: "The synthetic connection fails.", requestIds: ["r1"] } }
+                : { investigationComplete: true, tickets: [{ ticketId: ticket, relation: "same", requestIds: ["r1"],
+                    rationale: "Same failure", evidenceIds: ["current", "ticket-" + ticket, "history-" + ticket],
+                    grounding: ["current", "ticket-" + ticket, "history-" + ticket].map(source => ({ quoteId: cite(source) })) }] };
+            return Response.json({ candidates: [{ finishReason: "STOP", content: { parts: [{ text: JSON.stringify(answer) }] } }],
+                usageMetadata: { promptTokenCount: 100, outputTokenCount: 50, totalTokenCount: 150 } });
+        }
+        if (partial && String(url).includes("/associations/notes"))
+            return Response.json({ results: [], paging: { next: { after: "same-cursor" } } });
+        return p.network(url, init);
+    };
+    const id = (await enqueueSavIntakeMessage(human.id, options.runtime))!;
+    await analyse(id, network);
+    const spent = (await f.db.select().from(savIntakeModelCalls)).length;
+    expect(spent).toBeGreaterThan(0);
+    await analyse(id, network);
+    expect(await f.db.select().from(savIntakeModelCalls)).toHaveLength(spent);
+    partial = false;
+    await analyse(id, network);
+    const execution = await admitIntakeExecution(id, options);
+    expect(execution).toBeTruthy();
+    expect(await executeIntakePass(execution!.id, options)).toMatchObject({ state: "confirmed" });
+    expect(p.objects.tickets[ticket]).toBeTruthy();
+    expect(Object.keys(p.objects.tickets)).toHaveLength(1);
+    expect(Object.keys(p.objects.emails)).toHaveLength(1);
+    expect(p.links.get("tickets:" + ticket + ":emails")).toEqual(Object.keys(p.objects.emails));
+
+    await ensureIntakeObservations();
+    const [binding] = await f.db.select().from(savIntakeObservationBindings).where(eq(savIntakeObservationBindings.executionId, execution!.id));
+    const writesBefore = writes().length;
+    const failed = await syncSavObservation(binding.observationId, async () => { throw Error("Synthetic CRM outage"); });
+    expect(failed.status).toBe("sources_incomplete");
+    await syncSavObservation(binding.observationId, async ticketId => {
+        expect(ticketId).toBe(ticket);
+        return { ticketId, subject: "Synthetic connection failure", status: "open", updatedAt: new Date().toISOString(), events: [], errors: [] };
+    });
+    expect((await readIntakeRunDiagnostics(threadId))?.execution?.followup).toMatchObject({ observationState: "active", sourceErrors: 0 });
+    expect(writes()).toHaveLength(writesBefore);
+});
