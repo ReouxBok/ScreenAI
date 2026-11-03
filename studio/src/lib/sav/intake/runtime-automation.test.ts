@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import { afterAll, afterEach, beforeAll, beforeEach, expect, it, vi } from "vitest";
 import { eq } from "drizzle-orm";
 import { createSavTestDb } from "../../../../test/sav-db";
-import { savMailboxes, savMessages, savThreads, savIntakeRuns, savIntakeModelCalls, savActions } from "@/db/schema";
+import { savMailboxes, savMessages, savThreads, savIntakeRuns, savIntakeModelCalls, savSyncState, savActions } from "@/db/schema";
 const state = vi.hoisted(() => ({ db: null as unknown }));
 vi.mock("@/db", () => ({ requireDb: () => { if (!state.db) throw Error("NO_DATABASE_ALLOWED"); return state.db; } }));
 import { encryptSavPayload } from "../crypto";
@@ -56,7 +56,7 @@ async function excluded(messageId: string, code: string) {
   expect(await f.db.select().from(savIntakeModelCalls)).toHaveLength(0);
   expect((await readSavIntakeBudget(config)).callCount).toBe(0);
   expect(await f.db.select().from(savActions)).toHaveLength(0);
-  // The mail is kept, unprocessed, for a person.
+  // Reading Gmail is a separate worker. Analysis preserves the original message.
   const [m] = await f.db.select().from(savMessages).where(eq(savMessages.id, messageId));
   expect(m.processedAt).toBeNull(); expect(m.analysisStatus).toBe("intake_observed");
 }
@@ -150,4 +150,21 @@ it("an uncertain reservation from another run for the same mail prevents the aut
   await analyseSavIntakeRuntime(id, config, { env: () => environment, network });
   expect(await readSavIntakeCurrent(threadId, config)).toMatchObject({ state: "uncertain", attempts: 0 });
   expect(network).not.toHaveBeenCalled();
+});
+
+it.each(["thread", "agent"] as const)("a %s pause prevents model-free classification at the cap", async kind => {
+  minimalBudget();
+  const mailRow = await mail({ headers: absence, text: "Je suis absent." }), id = (await enqueueSavIntakeMessage(mailRow.id, config))!;
+  const pauseKey = "sav-agent-pause.v1:intake";
+  try {
+    if (kind === "thread") await f.db.update(savThreads).set({ aiPaused: true }).where(eq(savThreads.id, threadId));
+    else await f.db.insert(savSyncState).values({ key: pauseKey, status: "active", updatedAt: new Date(),
+      cursor: encryptSavPayload({ revision: "sav-agent-pause.v1", agent: "intake", level: "fully_paused", setBy: "operator@example.invalid", setAt: new Date().toISOString(), reason: "test pause" }) });
+    const network = forbidden();
+    expect(await analyseSavIntakeRuntime(id, config, { env: () => environment, network })).toMatchObject({ skipped: "not_claimed" });
+    expect(await readSavIntakeCurrent(threadId, config)).toMatchObject({ attempts: 0 });
+    expect(network).not.toHaveBeenCalled();
+  } finally {
+    if (kind === "agent") await f.db.delete(savSyncState).where(eq(savSyncState.key, pauseKey));
+  }
 });

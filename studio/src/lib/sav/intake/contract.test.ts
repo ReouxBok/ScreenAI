@@ -479,3 +479,20 @@ it("requires an explicit authenticated newsletter qualification for a no-request
  expect(savIntakeDecisionSchema.safeParse(decision).success).toBe(true);
  decision.evidence=decision.evidence.filter(e=>e.id!=="rule");expect(savIntakeDecisionSchema.safeParse(decision).success).toBe(false);
 });
+
+it("only current, bound automation evidence can qualify an acknowledgement with no request", () => {
+  const decision = ticketDecision();
+  decision.classification = "acknowledgement";
+  decision.requests = [];
+  decision.evidence = [evidence("current", "current_message", messageId),
+    { ...evidence("headers", "current_message", messageId), source: "automation_headers" }];
+  decision.disposition = { kind: "no_ticket", reason: "acknowledgement_only", qualifiedInformation: "verified_automatic_reply",
+    nextAction: "none", learning: "excluded", evidenceIds: ["current", "headers"] };
+  expect(savIntakeDecisionSchema.safeParse(decision).success).toBe(true);
+  for (const mutation of [
+    { evidence: decision.evidence.slice(0, 1) },
+    { evidence: [decision.evidence[0], { ...decision.evidence[1], sourceId: decision.threadId }] },
+    { latestInboundMessageId: decision.threadId },
+    { disposition: { ...decision.disposition, evidenceIds: ["current"] } },
+  ]) expect(savIntakeDecisionSchema.safeParse({ ...decision, ...mutation }).success).toBe(false);
+});
