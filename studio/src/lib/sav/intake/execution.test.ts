@@ -1750,6 +1750,8 @@ it("V1 integrated: absence, real reply, partial history, then observation outage
     const human = await storedMessage();
     p.setGmail(human.gmailMessageId!, "gmail-thread");
     const ticket = p.seedTicket({ stage: "open" });
+    p.objects.notes["401"] = { id: "401", properties: { hs_note_body: "The synthetic connection fails.", hs_timestamp: new Date().toISOString() } };
+    p.links.set("tickets:" + ticket + ":notes", ["401"]);
     let partial = true;
     const network: typeof fetch = async (url, init) => {
         if (String(url).startsWith("https://generativelanguage.googleapis.com/")) {
@@ -1761,7 +1763,7 @@ it("V1 integrated: absence, real reply, partial history, then observation outage
                     rationale: "Same failure", evidenceIds: ["current", "ticket-" + ticket, "history-" + ticket],
                     grounding: ["current", "ticket-" + ticket, "history-" + ticket].map(source => ({ quoteId: cite(source) })) }] };
             return Response.json({ candidates: [{ finishReason: "STOP", content: { parts: [{ text: JSON.stringify(answer) }] } }],
-                usageMetadata: { promptTokenCount: 100, outputTokenCount: 50, totalTokenCount: 150 } });
+                usageMetadata: { promptTokenCount: 100, candidatesTokenCount: 50, thoughtsTokenCount: 0, totalTokenCount: 150 } });
         }
         if (partial && String(url).includes("/associations/notes"))
             return Response.json({ results: [], paging: { next: { after: "same-cursor" } } });
@@ -1776,7 +1778,7 @@ it("V1 integrated: absence, real reply, partial history, then observation outage
     partial = false;
     await analyse(id, network);
     const execution = await admitIntakeExecution(id, options);
-    expect(execution).toBeTruthy();
+    expect(execution, JSON.stringify(await readIntakeRunDiagnostics(threadId))).toBeTruthy();
     expect(await executeIntakePass(execution!.id, options)).toMatchObject({ state: "confirmed" });
     expect(p.objects.tickets[ticket]).toBeTruthy();
     expect(Object.keys(p.objects.tickets)).toHaveLength(1);
