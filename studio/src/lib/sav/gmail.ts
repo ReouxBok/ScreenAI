@@ -349,6 +349,22 @@ export function normalizeReferencesHeader(value: string, maxLength = 2_000) {
   return kept.join(" ");
 }
 
+/** A single full plain text MIME body is the only representation the gate may
+ * use to discard an automatic reply. Snippets, HTML alternatives, attached
+ * text and complex MIME retain their usual handling in the intake. */
+function completeSinglePlainBody(part?: GmailPart) {
+  if (!part || part.mimeType?.toLowerCase() !== "text/plain" || part.parts?.length || part.filename
+    || headerValue(part.headers, "Content-Disposition") || part.body?.attachmentId) return false;
+  const contentType = headerValue(part.headers, "Content-Type");
+  if (contentType && !/^text\/plain(?:\s*;|$)/i.test(contentType)) return false;
+  const encoded = part.body?.data;
+  if (!encoded || encoded.length > 24_000 || !Number.isSafeInteger(part.body?.size) || !part.body!.size) return false;
+  const bytes = Buffer.from(encoded, "base64url");
+  if (bytes.length !== part.body!.size || bytes.toString("base64url") !== encoded.replace(/=+$/, "")) return false;
+  try { return !new TextDecoder("utf-8", { fatal: true }).decode(bytes).includes("\0"); }
+  catch { return false; }
+}
+
 export function parseGmailMessage(mailboxEmail: string, message: GmailMessage, now = new Date()) {
   if (!message.id || !message.threadId) throw new Error("GMAIL_MESSAGE_INVALID");
   const providerReceivedAt = new Date(Number(message.internalDate));
@@ -384,6 +400,7 @@ export function parseGmailMessage(mailboxEmail: string, message: GmailMessage, n
     autoSubmitted: boundedHeader(headerValue(headers, "Auto-Submitted"), 200) || undefined,
     headers: {
       "x-studio-automation-headers": unambiguous ? "singleton-v1" : "ambiguous",
+      ...(completeSinglePlainBody(message.payload) ? { "x-studio-automation-body": "complete-plain-v1" } : {}),
       "auto-submitted": boundedHeader(headerValue(headers, "Auto-Submitted"), 200),
       "from-display-name": boundedHeader(from.includes("<") ? from.split("<")[0].trim().replace(/^"|"$/g, "") : "", 100),
       "content-type": boundedHeader(headerValue(headers, "Content-Type") || message.payload?.mimeType || "", 2_000),
@@ -435,7 +452,7 @@ async function fetchAndIngestMessage(mailboxEmail: string, messageId: string) {
   const parsed = parseGmailMessage(mailboxEmail, message);
   if (normalizeEmailAddress(parsed.from) === normalizeEmailAddress(mailboxEmail)) return { skipped: "outbound" as const };
   if (!matchesGmailIntakeRecipient(parsed)) return { skipped: "outside_support_intake" as const };
-  return ingestInboundMessage(parsed);
+  return ingestInboundMessage(parsed, "gmail_full");
 }
 
 function isPermanentGmailMessageError(error: unknown) {

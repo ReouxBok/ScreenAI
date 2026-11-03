@@ -274,7 +274,7 @@ async function createDecision(
   });
 }
 
-export async function ingestInboundMessage(rawInput: unknown) {
+export async function ingestInboundMessage(rawInput: unknown, source?: "gmail_full") {
   const input = inboundMessageSchema.parse(rawInput);
   const db = requireDb();
   const mailbox = await ensureSavMailbox(input.mailboxEmail);
@@ -283,6 +283,10 @@ export async function ingestInboundMessage(rawInput: unknown) {
   const normalizedFrom = normalizeEmailAddress(input.from);
   const bodyText = sanitizeInboundText(input.bodyText);
   const headers = Object.fromEntries(Object.entries(input.headers ?? {}).map(([key, value]) => [key.toLocaleLowerCase("en"), value]));
+  if (source !== "gmail_full") {
+    delete headers["x-studio-automation-headers"];
+    delete headers["x-studio-automation-body"];
+  }
   if (input.autoSubmitted !== undefined) headers["auto-submitted"] = input.autoSubmitted;
 
   const result = await db.transaction(async (tx) => {

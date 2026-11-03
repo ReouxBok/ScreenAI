@@ -14,7 +14,7 @@ import { analyseSavIntakeRuntime } from "./runtime";
 let f: Awaited<ReturnType<typeof createSavTestDb>>, mailboxId: string, threadId: string;
 let config: IntakeRuntimeConfig, environment: Record<string, string | undefined>;
 const supportId = "<sav-synthetic-action@studio.example.invalid>", campaignId = "<synthetic-campaign@marketing.example.invalid>";
-const absence = { "x-studio-automation-headers": "singleton-v1", "auto-submitted": "auto-replied", "content-type": "text/plain; charset=UTF-8", "in-reply-to": campaignId, references: campaignId };
+const absence = { "x-studio-automation-body": "complete-plain-v1", "x-studio-automation-headers": "singleton-v1", "auto-submitted": "auto-replied", "content-type": "text/plain; charset=UTF-8", "in-reply-to": campaignId, references: campaignId };
 function env(mailbox: string) {
   const policy = { relationRevision: "synthetic-no-associations", admittedRelations: [], resources: {} };
   return { SAV_INTAKE_RUNTIME_MODE: "observe", SAV_CODE_REVISION: "a".repeat(40), SAV_AI_MODEL: "gemini-3.6-flash", SAV_GEMINI_API_KEY: "fake-model", HUBSPOT_ACCESS_TOKEN: "fake-crm",

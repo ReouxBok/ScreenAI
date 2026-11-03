@@ -43,7 +43,7 @@ export function intakeAutomatedMessage(input: { message: IntakeMessage; headers:
   // A forward or a separately authored subject may be the actual request even
   // when its short body happens to look exactly like an absence message.
   if (input.subject !== undefined && !/^\s*(?:(?:re|rép|aw|sv|réponse automatique|automatic reply)\s*:|(?:absence|out of office)\s*$)/iu.test(input.subject)) return null;
-  if (!message.contentComplete || !simpleNotice.test((input.bodyText ?? message.currentText).trim())) return null;
+  if (header("x-studio-automation-body") !== "complete-plain-v1" || !message.contentComplete || !simpleNotice.test((input.bodyText ?? message.currentText).trim())) return null;
   // RFC 3834: one keyword, optional parameters. A list or an unknown keyword is ambiguous.
   if (inReplyTo.length !== 1 || header("in-reply-to").trim() !== inReplyTo[0]) return null;
   const keyword = /^([a-z-]+)\s*(?:;[^,]*)?$/i.exec(header("auto-submitted"))?.[1].toLowerCase();

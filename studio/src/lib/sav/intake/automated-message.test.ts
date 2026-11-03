@@ -13,7 +13,7 @@ const message = (properties: Partial<IntakeMessage> = {}): IntakeMessage => ({ i
   currentText: "Réponse automatique : je suis absent jusqu'au 10 novembre.", contentComplete: true, direction: "inbound", ...properties });
 const detect = (headers: unknown, options: { message?: Partial<IntakeMessage>; attachments?: unknown; support?: string[] } = {}) =>
   intakeAutomatedMessage({ message: message(options.message), headers, attachments: options.attachments ?? [], supportMessageIds: options.support ?? [supportId] });
-const absence = { "x-studio-automation-headers": "singleton-v1", "auto-submitted": "auto-replied", "content-type": "text/plain; charset=UTF-8", "in-reply-to": campaignId, references: campaignId };
+const absence = { "x-studio-automation-body": "complete-plain-v1", "x-studio-automation-headers": "singleton-v1", "auto-submitted": "auto-replied", "content-type": "text/plain; charset=UTF-8", "in-reply-to": campaignId, references: campaignId };
 const report = { "x-studio-automation-headers": "singleton-v1", "auto-submitted": "auto-replied", "content-type": 'multipart/report; report-type=delivery-status; boundary="synthetic"', "in-reply-to": supportId, references: supportId };
 
 describe("V1 automation gate before any reservation or model call", () => {
