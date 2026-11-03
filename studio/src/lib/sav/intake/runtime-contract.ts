@@ -89,6 +89,8 @@ export type IntakeRuntimePayload = {
   configuration?: { configHash: string; resourcesHash: string; policyHash: string; codeRevision: string; model: string };
   semantics?:import("./semantic-records").AcceptedIntakeSemantics;
   readRecovery?: import("./read-recovery").IntakeReadRecovery;
+  /** Written when a wait ends on an incomplete CRM read; a resume is held, without attempt or model call, until the CRM moves. Digests only. */
+  resumeProof?: import("./resume-progress").IntakeResumeProof;
   reanalysisParent?: { runId: string; payloadHash: string; sourceHash: string; messageSourceHash: string };
   /** Digest-only projection of the CRM evidence this analysis saw (SAV-45): names the
    * fields of a later CRM_CHANGED. Outside the plan fingerprint and configHash. */

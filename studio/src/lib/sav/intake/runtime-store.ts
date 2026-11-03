@@ -1,6 +1,8 @@
 import { readRecoveryDue, DEFAULT_INTAKE_READ_RECOVERY } from "./read-recovery";
 import { readIntakeOperatorInformation } from "./operator-information";
 import { writeReadRecoveryMarker,readRecoverySql,noReadRecoverySql } from "./read-recovery-store";
+import { holdIntakeResume, noResumeHoldSql, recordIntakeResumeProgress } from "./resume-progress-store";
+import { intakeResumeDecision, parseIntakeResumeProof, withoutIntakeResumeProof, type IntakeResumeDecision, type IntakeResumeProbe } from "./resume-progress";
 import { intakeAttemptBudget, SAV_INTAKE_ATTEMPT_POLICY, SAV_INTAKE_BLOCKING_JOURNAL_KINDS, SAV_INTAKE_CALL_POLICY, SAV_INTAKE_TRANSIENT_RETRY } from "./attempt-policy";
 import { readSavExternalCompletion, listSavExternalCompletionMessageIds } from "../external-completion";
 import "server-only";
@@ -226,7 +228,9 @@ export async function catchupSavIntake(config: IntakeRuntimeConfig, limit = 4) {
   for (const message of messages) await enqueueSavIntakeMessage(message.id, config);
   return messages.length;
 }
-export async function claimSavIntakeRun(id: string, config: IntakeRuntimeConfig, now = new Date()): Promise<IntakeLease | null> {
+/** `resumeProbe`: what the bounded CRM re-read found for a run that waits on an incomplete read (see resume-progress.ts). `onHold`: told why a claim was refused without taking an attempt. */
+export type IntakeClaimOptions = { resumeProbe?: IntakeResumeProbe | null; onHold?: (cause: Extract<IntakeResumeDecision, { kind: "hold" }>["cause"]) => void };
+export async function claimSavIntakeRun(id: string, config: IntakeRuntimeConfig, now = new Date(), options: IntakeClaimOptions = {}): Promise<IntakeLease | null> {
   return requireDb().transaction(async tx => {
     const [initial] = await tx.select().from(savIntakeRuns).where(eq(savIntakeRuns.id, id)); if (!initial) return null;
     const [thread] = await tx.select().from(savThreads).where(eq(savThreads.id, initial.threadId)).for("update");
@@ -309,6 +313,12 @@ export async function claimSavIntakeRun(id: string, config: IntakeRuntimeConfig,
       await writeReadRecoveryMarker(tx,id,retry);
       await journal(tx,id,"read_retry_stopped",{reason:"SAV_INTAKE_READ_SOURCE_CHANGED",attemptsUnchanged:true}); return null;
     }
+    if (!recoveringRead) {
+      // A wait that ended on an incomplete CRM read is resumed only on progress: otherwise no attempt, no model call, nothing written to the run.
+      const proof = parseIntakeResumeProof(priorPayload.resumeProof), resume = intakeResumeDecision(proof, { configHash: config.configHash, sourceHash: data.sourceHash }, options.resumeProbe ?? null);
+      if (resume.kind === "hold") { await holdIntakeResume(tx, run.id, proof!, resume.cause, now); options.onHold?.(resume.cause); return null; }
+      if (resume.cause === "progress" && options.resumeProbe?.state === "progress") await recordIntakeResumeProgress(tx, run.id, options.resumeProbe);
+    }
     if (recoveringRead && retry) {
       retry.state = "claimed"; retry.attempts++; retry.retryAt = new Date(now.getTime() + (config.readRecovery ?? DEFAULT_INTAKE_READ_RECOVERY).delayMs).toISOString();
       priorPayload.readRecovery = retry;
@@ -317,7 +327,7 @@ export async function claimSavIntakeRun(id: string, config: IntakeRuntimeConfig,
     const token = randomUUID();
     const [claimed] = await tx.update(savIntakeRuns).set({ state: "analysing", leaseToken: token, leaseUntil: new Date(now.getTime() + 90_000),
       attempts: run.attempts + (recoveringRead ? 0 : 1), sourceHash: data.sourceHash, updatedAt: now,
-      ...(recoveringRead ? { payloadCiphertext: encryptSavPayload(priorPayload) } : {}) }).where(eq(savIntakeRuns.id, id)).returning();
+      ...(recoveringRead ? { payloadCiphertext: encryptSavPayload(priorPayload) } : priorPayload.resumeProof ? { payloadCiphertext: encryptSavPayload(withoutIntakeResumeProof(priorPayload)) } : {}) }).where(eq(savIntakeRuns.id, id)).returning();
     await tx.update(savMessages).set({ analysisStatus: "intake_analysing" }).where(eq(savMessages.id, run.messageId));
     await journal(tx, id, recoveringRead ? "read_retry_claimed" : "claimed", { attempt: claimed.attempts, technicalAttempt: recoveringRead ? retry!.attempts : 0, sourceHash: data.sourceHash });
     return { run: claimed, token, ...data, ...(recoveringRead ? { recoveringRead: true as const } : {}) };
@@ -390,7 +400,7 @@ export async function pendingSavIntakeRuns(config: IntakeRuntimeConfig, now = ne
   const legacy = noReadRecoverySql(sql`${savIntakeRuns.id}`);
   const rows = await requireDb().select({ id: savIntakeRuns.id, attempts: savIntakeRuns.attempts, payloadCiphertext: savIntakeRuns.payloadCiphertext }).from(savIntakeRuns).where(and(eq(savIntakeRuns.isCurrent, true), eq(savIntakeRuns.configHash, config.configHash),
     sql`not exists(select 1 from sav.intake_journal blocked where blocked.run_id=${savIntakeRuns.id} and blocked.kind in (${sql.join(SAV_INTAKE_BLOCKING_JOURNAL_KINDS.map(k => sql`${k}`), sql`, `)}))`,
-    or(and(lt(savIntakeRuns.attempts, 2),legacy), recovery), noHuman, notCompleted, schedulingFilter, noCommittedExecutionFor(sql`${savIntakeRuns.messageId}`),
+    or(and(lt(savIntakeRuns.attempts, 2),legacy), recovery), noHuman, notCompleted, schedulingFilter, noCommittedExecutionFor(sql`${savIntakeRuns.messageId}`), noResumeHoldSql(sql`${savIntakeRuns.id}`, now),
     // Coarse lifetime bound in SQL; the claim applies the full per-version/failed/total policy.
     or(sql`(select coalesce(sum(s.attempts),0) from sav.intake_runs s where s.message_id = ${savIntakeRuns.messageId}) < ${SAV_INTAKE_ATTEMPT_POLICY.totalPerMessage}`, recovery),
     sql`exists (select 1 from sav.threads t where t.id = ${savIntakeRuns.threadId} and not t.ai_paused)`,
