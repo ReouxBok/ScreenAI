@@ -1740,8 +1740,12 @@ it("V1 integrated: absence, real reply, partial history, then observation outage
     const analyse = async (id: string, network: typeof fetch) =>
         analyseSavIntakeRuntime(id, options.runtime, { env: () => environment, network });
     // Gmail stored a verifiable out-of-office response. The next inbound has the same subject.
-    await f.db.update(savMessages).set({ bodyCiphertext: encryptSavPayload({ text: "Automatic out of office.",
-        headers: { "auto-submitted": "auto-replied", "in-reply-to": "<campaign@example.invalid>" }, attachments: [] }) })
+    const { parseGmailMessage } = await import("../gmail");
+    const parsed = parseGmailMessage("support@example.invalid", { id: "vacation", threadId: "gmail-thread",
+        internalDate: String(Date.now()), snippet: "Je suis absent.", payload: { mimeType: "text/plain", headers: [
+            { name: "From", value: "customer@example.invalid" }, { name: "To", value: "support@example.invalid" },
+            { name: "Auto-Submitted", value: "auto-replied" }, { name: "In-Reply-To", value: "<campaign@example.invalid>" }] } });
+    await f.db.update(savMessages).set({ bodyCiphertext: encryptSavPayload({ text: parsed.bodyText, headers: parsed.headers, attachments: [] }) })
         .where(eq(savMessages.id, messageId));
     await analyse((await enqueueSavIntakeMessage(messageId, options.runtime))!, async () => { throw Error("unexpected network"); });
     expect((await readSavIntakeCurrent(threadId, options.runtime))?.payload.reason).toBe("SAV_INTAKE_AUTOMATED_REPLY");
