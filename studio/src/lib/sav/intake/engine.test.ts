@@ -701,13 +701,13 @@ describe('Independent SAV-73 resolved acknowledgements',()=>{
 });
 
 describe("choosing between plausible tickets after a complete CRM read", () => {
-  const setup = () => {
+  const setup = (investigationComplete = false) => {
     const f = fixture();
     f.tickets.push(ticket("201"), ticket("202"));
     f.matches["201"] = "partial";
     f.matches["202"] = "partial";
     const assess = f.adapters.assessIssues;
-    f.adapters.assessIssues = async (...args) => ({ ...await assess(...args), investigationComplete: false });
+    f.adapters.assessIssues = async (...args) => ({ ...await assess(...args), investigationComplete });
     return f;
   };
   it("offers the two evidenced tickets without an effect, then accepts an explicit selection of the second ticket", async () => {
@@ -718,8 +718,8 @@ describe("choosing between plausible tickets after a complete CRM read", () => {
     f.input.humanResolution = { choiceId: "operator-ticket", at, ticketId: "202" };
     expect(target(await f.run()).target).toMatchObject({ operation: "link", ticketId: "202" });
   });
-  it("retains a different ticket as evidence but excludes it from the operator’s choices and from a direct override", async () => {
-    const f = setup();
+  it.each([false, true])("excludes a different ticket from the choices and direct overrides (investigation complete: %s)", async complete => {
+    const f = setup(complete);
     f.tickets.push(ticket("203", { stage: "closed", closedAt: "2026-10-02T00:00:00.000Z" }));
     f.matches["203"] = "different";
     const undecided = await f.run();

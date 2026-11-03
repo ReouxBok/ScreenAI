@@ -474,7 +474,8 @@ export async function planSavIntake(
     // choice only when every destination is an open, evidenced candidate for
     // every request. An invalid assessment or a failed read never reaches here.
     const plausible = assessment.tickets.filter(t => t.relation !== "different");
-    const plausibleChoices = !assessment.investigationComplete && plausible.length >= 2
+    const plausibleChoices = (!assessment.investigationComplete || plausible.some(t => t.relation === "partial"))
+      && plausible.length >= 2
       && plausible.every(t => (t.relation === "same" || t.relation === "partial")
         && requests.every(request => t.requestIds.includes(request.id))
         && ["open", "new"].includes(tickets.get(t.ticketId)!.stage));
