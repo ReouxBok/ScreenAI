@@ -441,15 +441,6 @@ export async function planSavIntake(
     if (!parsedAssessment.success) return context("same_issue_unresolved");
     const assessment = parsedAssessment.data;
     const humanTicketId = input.humanResolution?.ticketId;
-    if (humanTicketId && humanProof && assessment.investigationComplete) {
-      const selected = assessment.tickets.find(t => t.ticketId === humanTicketId);
-      if (!selected || !tickets.has(humanTicketId)) return context("same_issue_unresolved", "equivalent_ticket_choice");
-      // Explicit human correction of the semantic relation, while all real CRM
-      // membership/ticket/history snapshots and other assessments stay intact.
-      selected.relation = "same";
-      selected.requestIds = requests.map(r => r.id);
-      selected.evidenceIds = unique([...selected.evidenceIds, humanProof]);
-    }
     if (assessment.tickets.length !== candidateTickets.length || new Set(assessment.tickets.map(t => t.ticketId)).size !== assessment.tickets.length) return context("same_issue_unresolved");
     for (const match of assessment.tickets) {
       const currentProof = match.evidenceIds.includes(current);
@@ -460,7 +451,24 @@ export async function planSavIntake(
         || match.requestIds.some(id => !requests.some(r => r.id === id))
         || match.relation === "same" && (requests.length !== unique(match.requestIds).length || requests.some(r => !match.requestIds.includes(r.id)))) return context("same_issue_unresolved");
     }
-    if (assessment.tickets.some(t => t.relation === "unknown" || t.relation === "partial") || !assessment.investigationComplete) return context("same_issue_unresolved", assessment.investigationComplete ? "same_issue_uncertain" : undefined);
+    // A comparison can be undecided even though every source was read. Offer a
+    // choice only when every destination is an open, evidenced candidate for
+    // every request. An invalid assessment or a failed read never reaches here.
+    const plausibleChoices = !assessment.investigationComplete && candidateTickets.length >= 2
+      && candidateTickets.every(t => t.stage === "open" || t.stage === "new")
+      && assessment.tickets.every(t => (t.relation === "same" || t.relation === "partial")
+        && requests.every(request => t.requestIds.includes(request.id)));
+    if (plausibleChoices && !humanTicketId) return context("same_issue_unresolved", "equivalent_ticket_choice");
+    if (humanTicketId && humanProof && (assessment.investigationComplete || plausibleChoices)) {
+      const selected = assessment.tickets.find(t => t.ticketId === humanTicketId);
+      if (!selected || !tickets.has(humanTicketId)) return context("same_issue_unresolved", "equivalent_ticket_choice");
+      // Explicit human correction of the semantic relation, while all real CRM
+      // membership/ticket/history snapshots and other assessments stay intact.
+      selected.relation = "same";
+      selected.requestIds = requests.map(r => r.id);
+      selected.evidenceIds = unique([...selected.evidenceIds, humanProof]);
+    }
+    if (!(plausibleChoices && humanTicketId && humanProof) && (assessment.tickets.some(t => t.relation === "unknown" || t.relation === "partial") || !assessment.investigationComplete)) return context("same_issue_unresolved", assessment.investigationComplete ? "same_issue_uncertain" : undefined);
     const same = candidateTickets.filter(t => assessment.tickets.some(m => m.ticketId === t.id && m.relation === "same"));
     if (candidateTickets.some(t => t.stage === "unknown")) return context("ticket_stage_unknown");
     const opened = same.filter(t => t.stage !== "closed").sort((a, b) => Date.parse(b.createdAt!) - Date.parse(a.createdAt!) || a.id.localeCompare(b.id));

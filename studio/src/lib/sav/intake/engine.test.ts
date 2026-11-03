@@ -699,3 +699,38 @@ describe('Independent SAV-73 resolved acknowledgements',()=>{
   expect((await f.run()).decision.disposition).toMatchObject({kind:'collect_context'});expect(f.calls).toEqual(['analyse']);
  });
 });
+
+describe("choosing between plausible tickets after a complete CRM read", () => {
+  const setup = () => {
+    const f = fixture();
+    f.tickets.push(ticket("201"), ticket("202"));
+    f.matches["201"] = "partial";
+    f.matches["202"] = "partial";
+    const assess = f.adapters.assessIssues;
+    f.adapters.assessIssues = async (...args) => ({ ...await assess(...args), investigationComplete: false });
+    return f;
+  };
+  it("offers the two evidenced tickets without an effect, then accepts an explicit selection of the second ticket", async () => {
+    const f = setup(), undecided = await f.run();
+    reason(undecided, "same_issue_unresolved");
+    expect(undecided.progress).toMatchObject({ kind: "human_choice", questionCode: "equivalent_ticket_choice", view: "to_validate" });
+    expect(undecided.decision.evidence.filter(e => e.source === "crm_ticket").map(e => e.sourceId).sort()).toEqual(["201", "202"]);
+    f.input.humanResolution = { choiceId: "operator-ticket", at, ticketId: "202" };
+    expect(target(await f.run()).target).toMatchObject({ operation: "link", ticketId: "202" });
+  });
+  it("keeps an incomplete history out of the choice list", async () => {
+    const f = setup();
+    f.adapters.ticketHistory = async () => ({ ...read([]), status: "partial" });
+    const result = await f.run();
+    reason(result, "history_incomplete");
+    expect(result.progress.kind).toBe("processing");
+  });
+  it("keeps invalid assessments and unrelated tickets out of the choice list", async () => {
+    const f = setup();
+    f.matches["201"] = "different";
+    expect((await f.run()).progress.kind).toBe("processing");
+    f.adapters.assessIssues = async () => ({ investigationComplete: false, tickets: ["201", "202"].map(ticketId => ({
+      ticketId, relation: "same", requestIds: ["r0"], evidenceIds: ["current", "ticket-" + ticketId] })) });
+    expect((await f.run()).progress.kind).toBe("processing");
+  });
+});
