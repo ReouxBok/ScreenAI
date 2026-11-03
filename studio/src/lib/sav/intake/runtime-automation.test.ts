@@ -194,7 +194,7 @@ it.each(["absence", "delivery"] as const)("keeps an earlier unhandled request vi
   expect(await claimSavIntakeRun(oldId, config)).toBeNull();
   await mail({ direction: "outbound", from: "support@example.invalid", text: "Message du support.",
     headers: { "x-studio-automation-headers": "singleton-v1", "message-id": supportId }, receivedAt: new Date(Date.now() - 1000) });
-  const headers = kind === "absence" ? { ...absence, "in-reply-to": supportId, references: supportId } :
+  const headers: Record<string, string> = kind === "absence" ? { ...absence, "in-reply-to": supportId, references: supportId } :
     { "x-studio-automation-headers": "singleton-v1", "content-type": "multipart/report; report-type=delivery-status", "in-reply-to": supportId };
   const notice = await mail({ text: kind === "absence" ? "Je suis absent." : "Avis de distribution.", headers });
   const id = (await enqueueSavIntakeMessage(notice.id, config))!, network = forbidden();

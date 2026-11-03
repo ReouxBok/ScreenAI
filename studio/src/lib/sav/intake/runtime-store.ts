@@ -1,3 +1,4 @@
+import type { ExecutionPayload } from "./execution-types";
 import { intakeAutomatedMessage, type IntakeAutomation } from "./automated-message";
 import { readRecoveryDue, DEFAULT_INTAKE_READ_RECOVERY } from "./read-recovery";
 import { readIntakeOperatorInformation } from "./operator-information";
@@ -184,19 +185,36 @@ async function priorIntakeCompleteForAutomation(tx: Pick<Tx, "select">, data: Aw
   const threadId = data.input.message.threadId;
   if (await hasUnsettledSavIntakeWork(threadId, tx) ||
       hasUnsettledSavHumanAction(await tx.select().from(savActions).where(eq(savActions.threadId, threadId)))) return false;
-  const messages = await tx.select({ id: savMessages.id, threadId: savMessages.threadId, receivedAt: savMessages.receivedAt, createdAt: savMessages.createdAt })
-    .from(savMessages).where(and(eq(savMessages.threadId, threadId), inArray(savMessages.id, ids)));
+  const messages = await tx.select().from(savMessages).where(and(eq(savMessages.threadId, threadId), inArray(savMessages.id, ids)));
   const events = await tx.select().from(auditLogs).where(and(eq(auditLogs.entityType, "sav_message"), inArray(auditLogs.entityId, ids), inArray(auditLogs.action, savExternalCompletionEvents)));
-  const receipts = await tx.select({ messageId: savIntakeExecutions.messageId }).from(savIntakeExecutions)
+  const receipts = await tx.select({ messageId: savIntakeExecutions.messageId, payload: savIntakeExecutions.payloadCiphertext }).from(savIntakeExecutions)
     .innerJoin(savIntakeEffects, eq(savIntakeEffects.executionId, savIntakeExecutions.id))
     .where(and(eq(savIntakeExecutions.threadId, threadId), inArray(savIntakeExecutions.messageId, ids), eq(savIntakeExecutions.state, "confirmed"),
       sql`${savIntakeExecutions.ticketId} is not null`, eq(savIntakeEffects.kind, "email_associate"), eq(savIntakeEffects.state, "confirmed"),
       sql`${savIntakeEffects.confirmedAt} is not null and ${savIntakeEffects.verificationCiphertext} is not null`));
-  const verified = new Set(receipts.map(r => r.messageId));
-  return messages.length === ids.length && messages.every(m => {
+  const verified = new Map<string, string>();
+  if (receipts.length) {
+    const { executionMessageHash } = await import("./execution-store");
+    for (const receipt of receipts) {
+      const message = messages.find(m => m.id === receipt.messageId);
+      if (!message) continue;
+      try {
+        const { completion } = decryptSavPayload<ExecutionPayload>(receipt.payload);
+        if (completion?.sourceHash && completion.messageHash === executionMessageHash(message)) verified.set(message.id, completion.sourceHash);
+      } catch { /* An unreadable receipt is not terminal evidence. */ }
+    }
+  }
+  if (messages.length !== ids.length) return false;
+  for (const m of messages) {
     const mark = findSavExternalCompletion(m, events);
-    return mark ? savExternalDisposition(mark).view !== "to_validate" : verified.has(m.id);
-  });
+    if (mark) {
+      if (savExternalDisposition(mark).view === "to_validate") return false;
+    } else {
+      const hash = verified.get(m.id);
+      if (!hash || !intakeSourceMatches(await savIntakeSourceSnapshot(tx, m, new Date()), hash)) return false;
+    }
+  }
+  return true;
 }
 
 const unclaimedMessage = sql`(${savMessages.analysisStatus} = 'pending' and ${savMessages.analysisAttempts} = 0 and ${savMessages.analysisStartedAt} is null and ${savMessages.processedAt} is null
