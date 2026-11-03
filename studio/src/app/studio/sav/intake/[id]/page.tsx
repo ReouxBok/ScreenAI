@@ -21,9 +21,11 @@ import { CrmRecord, StreamedChoiceForm, StreamedCrmContext } from "../crm-stream
 import { IntakeProcessingSummary } from "../processing-summary";
 import { readUxMessageControls } from "@/lib/sav/intake-ux/message-controls";
 import { readOperatorPanel } from "@/lib/sav/intake-ux/operator-commands";
+import { readDeliveryReportTicket } from "@/lib/sav/intake/delivery-report-ticket";
+import { crmRecordUrl } from "@/lib/sav/intake/crm-display";
 import { IntakeOperatorActions } from "../operator-form";
 export const dynamic = "force-dynamic";
-export default async function IntakeDetailPage({ params, searchParams }: { params: Promise<{ id: string }>; searchParams?: Promise<{holdRelease?:string;returnTo?:string}> }) {
+export default async function IntakeDetailPage({ params, searchParams }: { params: Promise<{ id: string }>; searchParams?: Promise<{holdRelease?:string;returnTo?:string;verifyDelivery?:string}> }) {
   const staff=await requireIntakeConsoleStaff();
   const { id } = await params;
   if (!z.uuid().safeParse(id).success) notFound();
@@ -32,6 +34,11 @@ export default async function IntakeDetailPage({ params, searchParams }: { param
   const query = await searchParams;
   const releaseNotice=query?.holdRelease;
   const { current, blocked, plan, disposition, historicalPlan, contacts, tickets, target, historicalTarget, dirty, canCorrect, currentEffects, question, handoff } = intakeDossierView(data);
+  const deliveryReport = !dirty && !data.handledExternally && !data.humanHeld && !data.thread.paused &&
+    current?.messageId === data.latestMessageId && current?.sourceMatches &&
+    current.payload.reason === "SAV_INTAKE_SUPPORT_DELIVERY_FAILURE";
+  const deliveryTarget = deliveryReport && query?.verifyDelivery === data.latestMessageId && data.latestMessageId
+    ? await readDeliveryReportTicket(id,data.latestMessageId) : null;
   const portal = process.env.HUBSPOT_PORTAL_ID;
   // Not awaited: names stream in under Suspense while the reads below proceed.
   const display=readIntakeCrmDisplay([...contacts,...(target?[target.contactId]:[]),...(historicalTarget?[historicalTarget.contactId]:[])],
@@ -47,6 +54,17 @@ export default async function IntakeDetailPage({ params, searchParams }: { param
     <header className={styles.heading}><div><span className="eyebrow">Dossier · version {current?.version ?? "en attente"}</span><h1>{data.thread.subject || "Nouvelle demande"}</h1>
       <p>{dirty ? "Mise à jour du traitement en cours" : intakeReasonLabel(data.projection.reason) ?? intakeStatusLabel(data.projection.status)}</p></div></header>
     {releaseNotice && <p role="status">{releaseNotice === "released" && !data.thread.paused && !data.humanHeld && !data.handledExternally ? "La pause est levée pour ce dossier. Le moteur pourra poursuivre si les preuves et la politique existante le permettent. Si une nouvelle qualification est nécessaire, utilisez « Refaire l’analyse » dans le panneau de poursuite." : "La pause est conservée : le dossier a changé, une opération reste en cours ou votre accès ne permet pas cette reprise. Rechargez le dossier et vérifiez ses preuves."}</p>}
+    {deliveryReport && <section className={styles.notice} aria-label="Avis de distribution">
+      <h2>Avis de distribution à vérifier</h2>
+      <p>Vérifiez si le message initial a été livré et consignez l’avis sur son ticket.</p>
+      {deliveryTarget?.ok ? <p>Ticket proposé <strong>#{deliveryTarget.ticketId}</strong> — le message HubSpot #{deliveryTarget.emailId} correspond au parent direct de cet avis et est associé uniquement à ce ticket.
+        {crmRecordUrl(portal,"ticket",deliveryTarget.ticketId) && <> <a href={crmRecordUrl(portal,"ticket",deliveryTarget.ticketId)!}>Ouvrir le ticket dans HubSpot</a></>}
+        {" "}Le rattachement de cet avis reste à faire.</p>
+        : <>{deliveryTarget && <p role="status">{deliveryTarget.reason}</p>}
+          <form method="get">{query?.returnTo && <input type="hidden" name="returnTo" value={query.returnTo}/>}
+            <button name="verifyDelivery" value={data.latestMessageId ?? ""}>Vérifier le ticket dans HubSpot</button>
+          </form></>}
+    </section>}
     <StreamedCrmContext display={display} portal={portal} contactId={target?.contactId}
       ticketId={data.confirmedCurrent && data.progress?.ticketId ? data.progress.ticketId : target && target.operation !== "create" ? target.ticketId : undefined}
       confirmed={Boolean(data.confirmedCurrent)} creationPlanned={target?.operation === "create" && !data.confirmedCurrent}
