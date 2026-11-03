@@ -496,19 +496,32 @@ export async function planSavIntake(
     const same = candidateTickets.filter(t => assessment.tickets.some(m => m.ticketId === t.id && m.relation === "same"));
     if (candidateTickets.some(t => t.stage === "unknown")) return context("ticket_stage_unknown");
     const opened = same.filter(t => t.stage !== "closed").sort((a, b) => Date.parse(b.createdAt!) - Date.parse(a.createdAt!) || a.id.localeCompare(b.id));
-    if (!input.humanResolution?.ticketId && opened.length > 1 && Date.parse(opened[0].createdAt!) === Date.parse(opened[1].createdAt!)) return context("same_issue_unresolved", "equivalent_ticket_choice");
     const closed = same.filter(t => t.stage === "closed");
     if (!opened.length && closed.some(t => !t.closedAt || Date.parse(t.closedAt) > Date.parse(message.receivedAt)
       || Date.parse(t.closedAt) < Date.parse(t.createdAt!))) return context("ticket_closure_date_unknown");
     const recent = closed.filter(t => Date.parse(message.receivedAt) - Date.parse(t.closedAt!) <= 15 * DAY);
-    if (!input.humanResolution?.ticketId && !opened.length && (recent.length > 1 || !recent.length && closed.length > 1)) return context("same_issue_unresolved", "equivalent_ticket_choice");
     const chosenTicket = input.humanResolution?.ticketId;
-    if (chosenTicket && ![...opened, ...recent].some(t => t.id === chosenTicket)) return context("same_issue_unresolved", "equivalent_ticket_choice");
+    // Open tickets take priority. Only the newest equal dates form an open tie.
+    // When all matches are old and closed, the choice names a predecessor for
+    // the standard new-ticket operation; it never authorizes reopening one.
+    const openTie = opened.filter(t => Date.parse(t.createdAt!) === Date.parse(opened[0].createdAt!));
+    const eligibleChoices = opened.length ? openTie : recent.length ? recent : closed;
+    if (eligibleChoices.length > 1 && !eligibleChoices.some(t => t.id === chosenTicket)) {
+      candidateTicketIds = eligibleChoices.map(t => t.id).sort();
+      return context("same_issue_unresolved", "equivalent_ticket_choice");
+    }
+    const oldPredecessor = !opened.length && !recent.length
+      ? chosenTicket ? closed.find(t => t.id === chosenTicket) : closed[0]
+      : undefined;
+    if (chosenTicket && !oldPredecessor && ![...opened, ...recent].some(t => t.id === chosenTicket))
+      return context("same_issue_unresolved", "equivalent_ticket_choice");
     const selected = chosenTicket ? [...opened, ...recent].find(t => t.id === chosenTicket) : opened[0] ?? recent[0];
     if (selected?.stage === "closed" && selected.ownerId === undefined) return context("ticket_owner_unknown");
     const targetContactId = selected ? selected.contactIds.includes(primary.id) ? primary.id : selected.contactIds.filter(id => scopeContacts.some(c => c.contactId === id)).sort()[0] : primary.id;
     const binding = (ticket: IntakeTicket, contactId: string) => ({ ticketId: ticket.id, contactId, ticketEvidenceId: `ticket-${ticket.id}`, contactAssociationEvidenceId: `membership-${ticket.id}-${contactId}` });
-    const predecessor = !selected && closed[0] ? { ...binding(closed[0], closed[0].contactIds.includes(primary.id) ? primary.id : closed[0].contactIds.filter(id => scopeContacts.some(c => c.contactId === id)).sort()[0]) } : null;
+    const predecessor = !selected && oldPredecessor
+      ? binding(oldPredecessor, oldPredecessor.contactIds.includes(primary.id) ? primary.id : oldPredecessor.contactIds.filter(id => scopeContacts.some(c => c.contactId === id)).sort()[0])
+      : null;
     const target: Extract<SavIntakeDecision["disposition"], { kind: "ticket" }>["target"] = selected
       ? selected.stage === "closed" ? { operation: "reopen", ...binding(selected, targetContactId), preserveOwnerId: selected.ownerId! }
         : { operation: "link", ...binding(selected, targetContactId), alreadyNew: selected.stage === "new" }

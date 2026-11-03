@@ -197,6 +197,31 @@ describe("bounds, source bindings and fail-closed behavior", () => {
   it("includes a ticket created after reception in a current reprise, avoiding a duplicate", async () => { const f = fixture(); f.input.now = "2026-10-21T10:00:00.000Z"; f.tickets.push(ticket("201", { createdAt: "2026-10-20T10:03:00.000Z" })); expect(target(await f.run()).target.operation).toBe("link"); });
   it("does not choose a ticket created after reception for a reconstructed historical decision", async () => { const f = fixture(); f.input.mode = "at_receipt"; f.input.now = "2026-10-21T10:00:00.000Z"; f.tickets.push(ticket("201", { createdAt: "2026-10-20T10:03:00.000Z" })); expect(target(await f.run()).target.operation).toBe("create"); });
   it("does not break a tie between equivalent closed tickets arbitrarily", async () => { const f = closed(1); f.tickets.push(ticket("202", { stage: "closed", closedAt: "2026-10-19T12:00:00.000Z" })); reason(await f.run(), "same_issue_unresolved"); });
+  it("offers only the newest same-issue open ties, and links the ticket that the operator selected", async () => {
+    const f = fixture();
+    f.tickets.push(ticket("201"), ticket("202"), ticket("203", { createdAt: "2026-09-01T00:00:00Z" }), ticket("204"));
+    f.matches["204"] = "different";
+    expect(intakeSelectableTicketIds(await f.run(), [])).toEqual(["201", "202"]);
+    f.input.humanResolution = { choiceId: "open-tie", at, ticketId: "202" };
+    expect(target(await f.run()).target).toMatchObject({ operation: "link", ticketId: "202" });
+  });
+  it("offers recent matching closed tickets only and reopens the selected recent ticket", async () => {
+    const f = closed(1);
+    f.tickets.push(ticket("202", { stage: "closed", closedAt: "2026-10-19T12:00:00Z" }),
+      ticket("203", { stage: "closed", closedAt: "2026-10-02T00:00:00Z" }), ticket("204"));
+    f.matches["204"] = "different";
+    expect(intakeSelectableTicketIds(await f.run(), [])).toEqual(["201", "202"]);
+    f.input.humanResolution = { choiceId: "recent-tie", at, ticketId: "202" };
+    expect(target(await f.run()).target).toMatchObject({ operation: "reopen", ticketId: "202", preserveOwnerId: null });
+  });
+  it("offers only old matching predecessors and creates the new ticket with the chosen predecessor", async () => {
+    const f = closed(16);
+    f.tickets.push(ticket("202", { stage: "closed", closedAt: "2026-10-02T00:00:00Z" }), ticket("204"));
+    f.matches["204"] = "different";
+    expect(intakeSelectableTicketIds(await f.run(), [])).toEqual(["201", "202"]);
+    f.input.humanResolution = { choiceId: "old-tie", at, ticketId: "202" };
+    expect(target(await f.run()).target).toMatchObject({ operation: "create", predecessor: { ticketId: "202" } });
+  });
   it("limits unresponsive injected readers and propagates AbortSignal", async () => { const f = fixture(); let signal: AbortSignal | undefined; f.adapters.findContactsByEmail = async (_, s) => { signal = s; return new Promise(() => {}); }; const p = await planSavIntake(f.input, f.adapters, f.policy, { timeoutMs: 5 }); reason(p, "contact_lookup_failed"); expect(signal?.aborted).toBe(true); });
   it("caps reads rather than manufacture complete absence", async () => { const f = fixture(); reason(await planSavIntake(f.input, f.adapters, f.policy, { readCalls: 1 }), "contact_lookup_failed"); });
   it("does not dispatch a second template when the supplied journal says it is uncertain", async () => { const f = fixture(); delete f.contacts["101"]; f.input.previousIdentification = { messageId: mid, address: "sender@example.test", state: "uncertain" }; expect((await f.run()).steps).toEqual([]); });
