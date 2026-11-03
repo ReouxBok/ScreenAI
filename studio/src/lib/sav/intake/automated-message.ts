@@ -23,7 +23,7 @@ const deliveryReport = /^multipart\/report\s*;(?:[^;]*;)*\s*report-type\s*=\s*"?
  * the body text or the sender address alone. Missing, partial, repeated or unknown metadata,
  * attachments and forwarded content return null and the mail follows the normal SAV path. */
 export function intakeAutomatedMessage(input: { message: IntakeMessage; headers: unknown; attachments: unknown;
-  supportMessageIds: readonly string[]; bodyText?: string }): IntakeAutomation | null {
+  supportMessageIds: readonly string[]; bodyText?: string; subject?: string }): IntakeAutomation | null {
   const { message, headers } = input;
   // Information added by a person asks for the normal path.
   if (message.direction !== "inbound" || message.operatorInformation || !headers || typeof headers !== "object" || Array.isArray(headers)) return null;
@@ -40,8 +40,12 @@ export function intakeAutomatedMessage(input: { message: IntakeMessage; headers:
   // A forward or any attachment may carry a real need, whatever the automation header says.
   if (/\b(?:message\/rfc822|multipart\/mixed)\b/i.test(contentType) || message.attachmentInputs?.length || message.unreadAttachments?.length
     || Array.isArray(input.attachments) && input.attachments.length) return null;
+  // A forward or a separately authored subject may be the actual request even
+  // when its short body happens to look exactly like an absence message.
+  if (input.subject !== undefined && !/^\s*(?:(?:re|rép|aw|sv|réponse automatique|automatic reply)\s*:|(?:absence|out of office)\s*$)/iu.test(input.subject)) return null;
   if (!message.contentComplete || !simpleNotice.test((input.bodyText ?? message.currentText).trim())) return null;
   // RFC 3834: one keyword, optional parameters. A list or an unknown keyword is ambiguous.
+  if (inReplyTo.length !== 1 || header("in-reply-to").trim() !== inReplyTo[0]) return null;
   const keyword = /^([a-z-]+)\s*(?:;[^,]*)?$/i.exec(header("auto-submitted"))?.[1].toLowerCase();
   if (keyword === "auto-replied" && inReplyTo.length) return result("automatic_reply", ["auto-submitted:auto-replied", "in-reply-to:present"]);
   if (keyword === "auto-generated" && inReplyTo.some(id => support.has(id))) return result("automatic_reply", ["auto-submitted:auto-generated", "in-reply-to:support-message"]);

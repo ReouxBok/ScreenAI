@@ -43,6 +43,9 @@ describe("V1 automation gate before any reservation or model call", () => {
     expect(detect({ ...absence, "auto-submitted": "auto-generated" })).toBeNull();
     expect(detect({ ...absence, "auto-submitted": "auto-generated", "in-reply-to": supportId })?.signals).toEqual(["auto-submitted:auto-generated", "in-reply-to:support-message"]);
   });
+  it.each(["Fwd: problème de paiement", "Je demande une résiliation", "Transfert : incident"])("preserves an independently authored or forwarded subject: %s", subject => {
+    expect(intakeAutomatedMessage({ message: message(), headers: absence, attachments: [], supportMessageIds: [], subject })).toBeNull();
+  });
   it("never hides a forward that carries a need, nor information added by a person", () => {
     expect(detect({ ...absence, "auto-submitted": "auto-forwarded" })).toBeNull();
     expect(detect(absence, { message: { operatorInformation: { id: "30000000-0000-4000-8000-000000000003", revision: 1, messageId: mid,
@@ -63,7 +66,7 @@ describe("V1 automation gate before any reservation or model call", () => {
   it("treats missing, malformed or old metadata as unknown, never as an automation", () => {
     for (const headers of [undefined, null, "auto-replied", [], {}, { "auto-submitted": 1, "in-reply-to": campaignId }, { "auto-submitted": "auto-replied" }])
       expect(detect(headers)).toBeNull();
-    expect(detect({ ...absence, "in-reply-to": `${campaignId} ${campaignId}` })?.kind).toBe("automatic_reply");
+    expect(detect({ ...absence, "in-reply-to": `${campaignId} ${campaignId}` })).toBeNull();
   });
   it("plans the engine's own human question without a model or CRM read", async () => {
     const adapters = intakeAutomationAdapters(mid);

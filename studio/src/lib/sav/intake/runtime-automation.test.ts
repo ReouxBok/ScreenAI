@@ -25,7 +25,7 @@ function env(mailbox: string) {
 async function mail(options: { direction?: "inbound" | "outbound"; from?: string; subject?: string; text?: string; headers?: Record<string, string>; receivedAt?: Date; legacy?: true }) {
   const body = options.legacy ? { text: options.text ?? "" } : { text: options.text ?? "", attachments: [], headers: options.headers ?? {} };
   const [m] = await f.db.insert(savMessages).values({ mailboxId, threadId, direction: options.direction ?? "inbound", fromEmail: options.from ?? "synthetic@example.invalid",
-    toEmails: [options.direction === "outbound" ? "synthetic@example.invalid" : "support@example.invalid"], subject: options.subject ?? "Connexion fictive", gmailMessageId: randomUUID(),
+    toEmails: [options.direction === "outbound" ? "synthetic@example.invalid" : "support@example.invalid"], subject: options.subject ?? "Re : Connexion fictive", gmailMessageId: randomUUID(),
     bodyCiphertext: encryptSavPayload(body), receivedAt: options.receivedAt ?? new Date(), analysisStatus: options.direction === "outbound" ? "done" : "pending" }).returning();
   return m;
 }

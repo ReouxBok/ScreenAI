@@ -320,6 +320,7 @@ async function claimOrReserve(id: string, config: IntakeRuntimeConfig, now: Date
       return null;
     }
     const automation = intakeAutomatedMessage({ message: data.input.message, headers: data.body.headers, bodyText: data.body.text,
+      subject: data.provenance.get(message.id)?.subject,
       attachments: data.body.attachments, supportMessageIds: data.supportMessageIds });
     if (automation && (thread.humanRequestedAt || run.humanChoiceCiphertext || await intakeThreadHumanHeld(run.threadId, tx)
       || await intakeHasHumanDecision(run.messageId, tx))) return null;
