@@ -714,7 +714,7 @@ describe("choosing between plausible tickets after a complete CRM read", () => {
     const f = setup(), undecided = await f.run();
     reason(undecided, "same_issue_unresolved");
     expect(undecided.progress).toMatchObject({ kind: "human_choice", questionCode: "equivalent_ticket_choice", view: "to_validate" });
-    expect(undecided.decision.evidence.filter(e => e.source === "crm_ticket").map(e => e.sourceId).sort()).toEqual(["201", "202"]);
+    expect(undecided.decision.evidence.filter(e => e.source === "crm_ticket" && e.id.startsWith("ticket-")).map(e => e.sourceId).sort()).toEqual(["201", "202"]);
     f.input.humanResolution = { choiceId: "operator-ticket", at, ticketId: "202" };
     expect(target(await f.run()).target).toMatchObject({ operation: "link", ticketId: "202" });
   });

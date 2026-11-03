@@ -1742,16 +1742,18 @@ it("V1 integrated: absence, real reply, partial history, then observation outage
     // Gmail stored a verifiable out-of-office response. The next inbound has the same subject.
     const { parseGmailMessage } = await import("../gmail");
     const parsed = parseGmailMessage("support@example.invalid", { id: "vacation", threadId: "gmail-thread",
-        internalDate: String(Date.now()), snippet: "Je suis absent.", payload: { mimeType: "text/plain", headers: [
+        internalDate: String(Date.now()), payload: { mimeType: "text/plain", body: { size: 14, data: Buffer.from("Je suis absent.").toString("base64url") }, headers: [
+            { name: "Subject", value: "Re: Synthetic connection failure" },
             { name: "From", value: "customer@example.invalid" }, { name: "To", value: "support@example.invalid" },
             { name: "Auto-Submitted", value: "auto-replied" }, { name: "In-Reply-To", value: "<campaign@example.invalid>" }] } });
-    await f.db.update(savMessages).set({ bodyCiphertext: encryptSavPayload({ text: parsed.bodyText, headers: parsed.headers, attachments: [] }) })
+    await f.db.update(savMessages).set({ subject: parsed.subject, bodyCiphertext: encryptSavPayload({ text: parsed.bodyText, headers: parsed.headers, attachments: [] }) })
         .where(eq(savMessages.id, messageId));
     await analyse((await enqueueSavIntakeMessage(messageId, options.runtime))!, async () => { throw Error("unexpected network"); });
     expect((await readSavIntakeCurrent(threadId, options.runtime))?.payload.reason).toBe("SAV_INTAKE_AUTOMATED_REPLY");
     expect(await f.db.select().from(savIntakeModelCalls)).toHaveLength(0);
 
     const human = await storedMessage();
+    await f.db.update(savMessages).set({ subject: parsed.subject }).where(eq(savMessages.id, human.id));
     p.setGmail(human.gmailMessageId!, "gmail-thread");
     const ticket = p.seedTicket({ stage: "open" });
     p.objects.notes["401"] = { id: "401", properties: { hs_note_body: "The synthetic connection fails.", hs_timestamp: new Date().toISOString() } };
