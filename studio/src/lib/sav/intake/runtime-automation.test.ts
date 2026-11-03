@@ -7,7 +7,7 @@ const state = vi.hoisted(() => ({ db: null as unknown }));
 vi.mock("@/db", () => ({ requireDb: () => { if (!state.db) throw Error("NO_DATABASE_ALLOWED"); return state.db; } }));
 import { encryptSavPayload } from "../crypto";
 import { intakeRuntimeHash, savIntakeRuntimeConfig, type IntakeRuntimeConfig } from "./runtime-contract";
-import { enqueueSavIntakeMessage, readSavIntakeBudget, readSavIntakeCurrent } from "./runtime-store";
+import { claimSavIntakeRun, pendingSavIntakeRuns, enqueueSavIntakeMessage, readSavIntakeBudget, readSavIntakeCurrent } from "./runtime-store";
 import { analyseSavIntakeRuntime } from "./runtime";
 
 // Synthetic mails only; the model and CRM are fakes and any other network call fails the test.
@@ -167,4 +167,22 @@ it.each(["thread", "agent"] as const)("a %s pause prevents model-free classifica
   } finally {
     if (kind === "agent") await f.db.delete(savSyncState).where(eq(savSyncState.key, pauseKey));
   }
+});
+
+it("four older capped runs leave a scheduling slot for the next model-free notice", async () => {
+  minimalBudget();
+  const ids: string[] = [];
+  for (let n = 0; n < 5; n++) {
+    const [thread] = await f.db.insert(savThreads).values({ mailboxId, gmailThreadId: randomUUID(), customerEmail: "synthetic@example.invalid" }).returning();
+    threadId = thread.id;
+    const m = n === 4 ? await mail({ text: "Je suis absent.", headers: absence }) : await mail({ text: "Connexion impossible." });
+    const id = (await enqueueSavIntakeMessage(m.id, config))!;
+    ids.push(id);
+    const time = new Date(Date.now() - (5 - n) * 1000);
+    await f.db.update(savIntakeRuns).set({ createdAt: time, updatedAt: time }).where(eq(savIntakeRuns.id, id));
+  }
+  const batch = await pendingSavIntakeRuns(config);
+  expect(batch.map(r => r.id)).toEqual(ids.slice(0, 4));
+  for (const run of batch) expect(await claimSavIntakeRun(run.id, config)).toBeNull();
+  expect((await pendingSavIntakeRuns(config))[0].id).toBe(ids[4]);
 });

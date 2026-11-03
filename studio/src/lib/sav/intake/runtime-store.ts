@@ -462,7 +462,9 @@ export async function pendingSavIntakeRuns(config: IntakeRuntimeConfig, now = ne
     // A scheduled transient retry carries its due time in leaseUntil (no lease token): not before then.
     or(and(inArray(savIntakeRuns.state, ["pending", "waiting"]), or(isNull(savIntakeRuns.leaseUntil), lte(savIntakeRuns.leaseUntil, now))),
       and(eq(savIntakeRuns.state, "analysing"), lt(savIntakeRuns.leaseUntil, now)))))
-    .orderBy(savIntakeRuns.createdAt).limit(4);
+    // A budget deferral updates the last examination. Rotate the four slots so
+    // deferred mail cannot starve newly arrived model-free receipts.
+    .orderBy(savIntakeRuns.updatedAt, savIntakeRuns.createdAt, savIntakeRuns.id).limit(4);
   return rows.filter(row => {
     try { const payload=decryptSavPayload<IntakeRuntimePayload>(row.payloadCiphertext);
       return payload.readRecovery ? Boolean(readRecoveryDue(payload.readRecovery,config,now)) : row.attempts<2;
