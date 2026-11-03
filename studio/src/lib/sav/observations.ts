@@ -56,7 +56,14 @@ export async function refreshSavTicketObservations(ticketId: string) {
 /** Every tracked dossier is due once a day; small worker batches drain the due
  * queue across passages, rather than limiting daily coverage to five tickets. */
 export async function reconcileSavObservations(limit = 5, now = new Date(), options:{deadlineMs?:number;maxComparisons?:number}={}) {
-    const due = await requireDb().select({ id: savResolutionObservations.id }).from(savResolutionObservations).where(and(lte(savResolutionObservations.nextSyncAt, now), or(isNull(savResolutionObservations.leaseUntil), lte(savResolutionObservations.leaseUntil, now)))).orderBy(asc(savResolutionObservations.nextSyncAt), asc(savResolutionObservations.id)).limit(Math.min(20, Math.max(1, limit)));
+    // Frozen legacy observations keep their due date while skipped. Filter before
+    // LIMIT so they cannot permanently hide confirmed intake tickets behind them.
+    const eligibleOrigin = isSavCaseLearningFrozen() ? eq(savResolutionObservations.trackingOrigin, "intake") : undefined;
+    const due = await requireDb().select({ id: savResolutionObservations.id }).from(savResolutionObservations)
+      .where(and(eligibleOrigin, lte(savResolutionObservations.nextSyncAt, now),
+        or(isNull(savResolutionObservations.leaseUntil), lte(savResolutionObservations.leaseUntil, now))))
+      .orderBy(asc(savResolutionObservations.nextSyncAt), asc(savResolutionObservations.id))
+      .limit(Math.min(20, Math.max(1, limit)));
     const results = [];
     const workDeadline=options.deadlineMs??Date.now()+40000;
     const deadline = Math.min(workDeadline,Date.now() + 20000);const collect=cachedCollector();

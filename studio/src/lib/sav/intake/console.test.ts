@@ -48,7 +48,7 @@ import { processPendingHubspotActions } from "../hubspot";
 import { processPendingGmailSendActions } from "../gmail";
 import { processDueFollowups } from "../followups";
 import { approveLearningCandidate } from "../learning";
-import { syncSavObservation, prepareSavObservationLearning } from "../observations";
+import { syncSavObservation, reconcileSavObservations, prepareSavObservationLearning } from "../observations";
 import { recordIntakeLaunch, readIntakeLaunch } from "./launch-boundary";
 import { v0Proposal } from "../../../../test/sav-v0-review-fixture";
 import { ensureSavCaseObservationTx } from "../case-learning";
@@ -374,6 +374,59 @@ it("confirmed effects are not Treated until the first successful operational obs
   await syncSavObservation(observation.id,async ticketId=>({ticketId,subject:"Synthetic",status:"open",updatedAt:new Date().toISOString(),events:[],errors:[]}));
   await projectIntakeThread(threadId);expect((await listIntakeConsole({view:"learning"})).total).toBe(1);
   expect((await readIntakeLearningQualification(threadId))?.allowed).toBe(true);
+});
+it("recovers a confirmed ticket's observation after a CRM outage even with older frozen cases ahead", async () => {
+  vi.stubEnv("SAV_CASE_LEARNING_FROZEN", "true");
+  vi.stubEnv("HUBSPOT_ACCESS_TOKEN", "synthetic");
+  await observed();
+  const execution = (await admitIntakeExecution(runId, options))!;
+  expect((await executeIntakePass(execution.id, options)).state).toBe("confirmed");
+  expect(await ensureIntakeObservations()).toEqual({ created: 1 });
+  const [intake] = await db.db.select().from(savResolutionObservations);
+  const ticketId = intake.hubspotTicketId!;
+  const mutations = structuredClone(mutationsSent());
+  const effects = await getExecutionEffects(execution.id);
+  expect(effects.filter(e => e.kind === "ticket_create" && e.state === "confirmed")).toHaveLength(1);
+  expect(effects.filter(e => e.kind === "email_associate" && e.state === "confirmed")).toHaveLength(1);
+  // This older observation stays due while frozen. It used to consume the only slot on every pass.
+  const [legacy] = await db.db.insert(savResolutionObservations).values({
+    threadId, messageId, trackingOrigin: "draft_feedback", nextSyncAt: new Date(0)
+  }).returning();
+  const now = new Date(Math.max(Date.now(), intake.nextSyncAt.getTime()));
+  let available = false;
+  const read = vi.fn(async (url: string, init?: RequestInit) => {
+    const { pathname } = new URL(url);
+    if (init?.method !== "GET") throw Error("Unexpected provider write");
+    if (pathname === `/crm/v3/objects/tickets/${ticketId}`) return available
+      ? Response.json({ id: ticketId, updatedAt: now.toISOString(), properties: { subject: "Synthetic", hs_pipeline: "0", hs_pipeline_stage: "1" } })
+      : new Response(null, { status: 503 });
+    if (pathname === "/crm/v3/pipelines/tickets/0") return Response.json({ stages: [{id:"1", metadata:{isClosed:false}}] });
+    if (["emails", "notes", "tasks"].some(type => pathname === `/crm/v4/objects/tickets/${ticketId}/associations/${type}`))
+      return Response.json({ results: [] });
+    throw Error("Unexpected provider read");
+  });
+  vi.stubGlobal("fetch", read);
+  expect((await reconcileSavObservations(1, now, {maxComparisons:0})).processed)
+    .toEqual([{id:intake.id, status:"sources_incomplete"}]);
+  const [failed] = await db.db.select().from(savResolutionObservations).where(eq(savResolutionObservations.id, intake.id));
+  expect(failed).toMatchObject({sourceErrors:["HTTP_503"], leaseToken:null, hubspotTicketId:ticketId});
+  expect(failed.nextSyncAt.getTime()).toBeGreaterThan(now.getTime());
+  await projectIntakeThread(threadId);
+  expect((await listIntakeConsole({view:"processing"})).rows[0].status).toBe("followup_pending");
+
+  available = true;
+  expect((await reconcileSavObservations(1, failed.nextSyncAt, {maxComparisons:0})).processed)
+    .toEqual([{id:intake.id,status:"active",cycle:1}]);
+  await projectIntakeThread(threadId);
+  expect((await listIntakeConsole({view:"learning"})).rows[0].status).toBe("followup_started");
+  expect(await ensureIntakeObservations()).toEqual({created:0});
+  expect(await getExecutionEffects(execution.id)).toEqual(effects);
+  expect(mutationsSent()).toEqual(mutations);
+  expect(await db.db.select().from(savIntakeExecutions)).toHaveLength(1);
+  expect(await db.db.select().from(savIntakeModelCalls)).toHaveLength(0);
+  expect(read.mock.calls.every(([, init]) => init?.method === "GET")).toBe(true);
+  expect((await db.db.select().from(savResolutionObservations).where(eq(savResolutionObservations.id, legacy.id)))[0])
+    .toMatchObject({nextSyncAt:new Date(0), lastSyncAt:null});
 });
 it("sensitive operational closure becomes Completed without comparator, and reopening removes Completed", async () => {
   await observed(false,true);const execution=(await admitIntakeExecution(runId,options))!;await executeIntakePass(execution.id,options);await ensureIntakeObservations();
