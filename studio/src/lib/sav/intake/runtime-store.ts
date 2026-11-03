@@ -30,7 +30,9 @@ import { savEffectiveReceivedAt, savNotAfterAnchor, savEffectiveReceivedAtOfRow 
 type Tx = Parameters<Parameters<ReturnType<typeof requireDb>["transaction"]>[0]>[0];
 type Run = typeof savIntakeRuns.$inferSelect;
 type Body = { text: string; headers?: Record<string, string>; attachments?: unknown[]; attachmentInventory?: unknown };
-export type IntakeLease = { run: Run; token: string; input: EngineInput; provenance: Map<string, ReturnType<typeof prepareSavIntakeMessage>["provenance"]>; body: Body; sourceHash: string; recoveringRead?: true };
+export type IntakeLease = { run: Run; token: string; input: EngineInput; provenance: Map<string, ReturnType<typeof prepareSavIntakeMessage>["provenance"]>; body: Body; sourceHash: string; recoveringRead?: true;
+  /** RFC Message-IDs of the support mails stored in the same bounded thread window. */
+  supportMessageIds?: string[] };
 const fail = (): never => { throw Error("SAV_INTAKE_RUNTIME_CONTEXT_CHANGED"); };
 const budgetColumns={id:savIntakeModelCalls.id,messageKey:savIntakeModelCalls.messageKey,requestHash:savIntakeModelCalls.requestHash,state:savIntakeModelCalls.state,reservedNanoUsd:savIntakeModelCalls.reservedNanoUsd,chargedNanoUsd:savIntakeModelCalls.chargedNanoUsd,payloadCiphertext:savIntakeModelCalls.payloadCiphertext,createdAt:savIntakeModelCalls.createdAt,runId:savIntakeModelCalls.runId};
 /** A received unbilled rejection settled at zero with its explicit marker (see settleSavIntakeCall). */
@@ -163,6 +165,7 @@ export async function savIntakeSourceSnapshot(tx: Pick<Tx, "select">, message: t
   const bind = (hash: string) => information ? intakeRuntimeHash({ exchangedSources: hash, operatorInformation: information }) : hash;
   const sourceHash = bind(messageSourceHash), legacySourceHash = bind(legacyMessageHash);
   return { sourceHash, legacySourceHash, messageSourceHash, body: current.body, provenance: new Map(prepared.map(p => [p.message.id, p.provenance])),
+    supportMessageIds: prepared.flatMap(p => p.message.direction === "outbound" && typeof p.body.headers?.["message-id"] === "string" ? [p.body.headers["message-id"].trim()] : []),
     input: { message: current.message, latestInboundMessageId: message.id, mode: "current", now: now.toISOString(), identificationAttemptId: message.id,
       ...(identificationContinuation ? {previousIdentification,identificationContinuation} : {}),
       conversation: { data: prepared.map(p => p.message).reverse(), status: rows.length > 50 ? "partial" : "complete", observedAt: now.toISOString() } } satisfies EngineInput };

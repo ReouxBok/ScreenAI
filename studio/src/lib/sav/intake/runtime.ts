@@ -14,6 +14,7 @@ import type { EngineInput, MessageAnalysis } from "./engine-types";
 import type { IntakeReadTrace } from "./hubspot-readers";
 import { SAV_INTAKE_MODEL_REVISION } from "./model-readers";
 import { planSavIntake } from "./engine";
+import { intakeAutomatedMessage, intakeAutomationAdapters } from "./automated-message";
 import { intakeCrmEvidenceFingerprint, recordIntakeCrmReads } from "./crm-evidence-fingerprint";
 import type { IntakeBudgetLimit } from "./budget-limit";
 import { intakeTransientFailure, SAV_INTAKE_DETERMINISTIC_ERRORS } from "./attempt-policy";
@@ -74,6 +75,20 @@ async function analyseSavIntakeRuntimeWithinBudget(runId: string, config: Intake
   const checkpoint = () => { checkpoints = checkpoints.then(writeCheckpoint); checkpoints.catch(() => {}); };
   try {
     await live();
+    // V1 cost filter, replay and resume included: an automation proven by the stored Gmail headers
+    // never reaches a reservation, a CRM or Gmail read, or a model call. The mail stays for a person.
+    const automation = intakeAutomatedMessage({ message: lease.input.message, headers: lease.body.headers, attachments: lease.body.attachments, supportMessageIds: lease.supportMessageIds ?? [] });
+    if (automation) {
+      traces.push({ phase: "automation_gate", ...automation, modelCalled: false });
+      payload.plan = await planSavIntake(lease.input, intakeAutomationAdapters(lease.input.message.id), config.policy, { timeoutMs: 10_000 }, () => new Date());
+      assertSavIntakeObservation(payload.plan);
+      payload.reason = automation.code;
+      const state = payload.plan.decision.disposition.kind === "collect_context" && payload.plan.progress.kind !== "human_choice" ? "waiting" : "observed";
+      if (lease.recoveringRead) { payload.readRecovery!.state = state === "waiting" ? "invalidated" : "complete"; payload.readRecovery!.cache = []; }
+      else delete payload.readRecovery;
+      await saveSavIntakeResult(lease, config, payload, state);
+      return { runId, state };
+    }
     const other = observeSavOther({ mailboxId: config.mailboxId, fromEmail: lease.input.message.fromEmail,
       subject: lease.provenance.get(lease.run.messageId)!.subject, gmailMessageId: "stored", body: lease.body,
       protectedContext: lease.input.conversation.data.length > 1 }, readSavOtherConfiguration(env().SAV_OTHER_OBSERVATION_RULES_JSON).registry);
