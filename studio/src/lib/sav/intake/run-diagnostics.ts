@@ -185,13 +185,14 @@ export async function readIntakeRunDiagnostics(threadId: string) {
     const undetermined = current && !known && failed + unknown >= SAV_INTAKE_ATTEMPT_POLICY.failedPerMessage;
     const budget = current ? { runAttempts: current.attempts, failed, unknown, total: exactTotal, exhausted: undetermined ? "undetermined" as const : known || null,
       policy: SAV_INTAKE_ATTEMPT_POLICY } : null;
-    const blocked = current ? (await tx.select({ id: savIntakeJournal.id }).from(savIntakeJournal)
-      .where(and(eq(savIntakeJournal.runId, current.id), inArray(savIntakeJournal.kind, [...SAV_INTAKE_BLOCKING_JOURNAL_KINDS]))).limit(1)).length > 0 : false;
+    const [marker] = current ? await tx.select({ kind: savIntakeJournal.kind }).from(savIntakeJournal)
+      .where(and(eq(savIntakeJournal.runId, current.id), inArray(savIntakeJournal.kind, [...SAV_INTAKE_BLOCKING_JOURNAL_KINDS]))).orderBy(desc(savIntakeJournal.createdAt), desc(savIntakeJournal.id)).limit(1) : [];
     const execution = await readExecutionDiagnostic(tx, message.id);
     const modelCalls = await readModelCallDiagnostic(tx, message.id);
     return { messageId: message.id, totalAttempts: exactTotal, execution, modelCalls: modelCalls.slice(0, 20), modelCallsTruncated: modelCalls.length > 20,
       // null: the bounded reader cannot tell; callers must not read it as "attempts remain".
-      attemptsExhausted: blocked || Boolean(known) ? true : undetermined ? null : false,
+      blockingMarker: marker?.kind ?? null,
+      attemptsExhausted: marker?.kind === "attempts_exhausted" || Boolean(known) ? true : undetermined ? null : false,
       attemptBudget: budget,
       versionsTruncated: rows.length > 20, eventsTruncated: events.length > 120,
       runs: displayed.map(r => ({ runId: r.id, version: r.version, isCurrent: r.isCurrent, state: r.state,

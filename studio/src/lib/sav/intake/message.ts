@@ -3,7 +3,7 @@ import { intakeMessageSchema, type IntakeMessage } from "./engine-types";
 import { intakeHtmlDocumentText, intakeHtmlDocumentComplete } from "./html-message";
 
 /** Pure transport derivation. Does not open a Studio dossier or mark it read. */
-export function prepareSavIntakeMessage(input: Omit<IntakeMessage, "currentText" | "contentComplete"> & {
+export function prepareSavIntakeMessage(input: Omit<IntakeMessage, "currentText" | "contentComplete" | "forwardedQuoteOnly"> & {
   subject: string; body: string; bodyComplete: boolean; unresolvedAttachments: boolean;
 }) {
   // Intake needs every section for provenance. The V0 display context caps
@@ -19,10 +19,18 @@ export function prepareSavIntakeMessage(input: Omit<IntakeMessage, "currentText"
   const truncated = input.body.length >= 100_000 || subjectTruncated || currentText.length > 100_000;
   const textComplete = bodyComplete && intakeHtmlDocumentComplete(input.body) && !truncated;
   const message = intakeMessageSchema.parse({ ...metadata,
+    ...(/^\s*(?:fw|fwd|tr)\s*:/i.test(subject) && !context.currentText && context.quotedText ? { forwardedQuoteOnly: true } : {}),
     currentText: currentText.slice(0, 100_000),
     contentComplete: textComplete && !unresolvedAttachments });
   return { message, provenance: { revision: SAV_MESSAGE_CONTEXT_REVISION, messageId: message.id,
     subject: subject.slice(0, 2000), subjectInherited,
     currentText: context.currentText, quotedText: context.quotedText, signatureText: context.signatureText, parts: context.parts,
     truncated, textComplete, unresolvedAttachments } };
+}
+
+/** A quote is context, never an authenticated sender. The worker can park
+ * a complete forwarded-only mail without billing an analysis or reading CRM. */
+export function intakeForwardNeedsOriginal(message: IntakeMessage) {
+  return message.forwardedQuoteOnly === true && message.contentComplete && !message.currentText.trim()
+    && !message.operatorInformation && !message.attachmentInputs?.length && !message.unreadAttachments?.length;
 }

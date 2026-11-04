@@ -215,6 +215,9 @@ it("connects the real stored mail to semantic readers/CRM and keeps effect steps
   const current = await readSavIntakeCurrent(threadId, config); expect(current?.payload.plan?.decision.classification).toBe("support");
   expect(current?.payload.plan?.decision.disposition).toMatchObject({ kind: "collect_context", reasons: ["private_resource_unavailable"] });
   expect(network).toHaveBeenCalledTimes(3); expect((await readSavIntakeBudget(config)).callCount).toBe(1); expect(await f.db.select().from(savActions)).toHaveLength(0);
+  expect(await claimSavIntakeRun(id!, config)).toBeNull();
+  expect(await pendingSavIntakeRuns(config)).not.toContainEqual({ id });
+  expect((await f.db.select().from(savIntakeJournal).where(eq(savIntakeJournal.runId, id!))).some(row => row.kind === "private_resource_unavailable")).toBe(true);
   const m = (await f.db.select().from(savMessages).where(eq(savMessages.id, messageId)))[0]; expect(m.processedAt).toBeNull(); expect(m.analysisStatus).toBe("intake_waiting");
   expect(decryptSavPayload((await f.db.select().from(savIntakeModelCalls))[0].payloadCiphertext)).toHaveProperty("metadata");
 });
@@ -871,7 +874,7 @@ it.each(["sender", "recipients"])("isolates invalid address metadata (%s) before
   expect(await f.db.select().from(savIntakeEffects)).toHaveLength(0);
 });
 
-it("finishes an accepted Other investigation as an explicit rule choice instead of consuming a second automatic analysis", async () => {
+it("keeps an unqualified Other behind a resource block without consuming another automatic analysis", async () => {
   const id = (await enqueueSavIntakeMessage(messageId, config))!;
   const network = vi.fn<typeof fetch>(async (url, init) => {
     expect(String(url)).toContain("generativelanguage.googleapis.com");
@@ -880,8 +883,8 @@ it("finishes an accepted Other investigation as an explicit rule choice instead 
       requests: [{ id: "noise", kind: "other", currentMessageId: messageId, quoteId: data.citationCatalogue[0].id }] }) }] } }],
       usageMetadata: { promptTokenCount: 10, candidatesTokenCount: 10, thoughtsTokenCount: 0, totalTokenCount: 20 } });
   });
-  expect(await analyseSavIntakeRuntime(id, config, { env: () => environment, network })).toMatchObject({ state: "observed" });
-  expect((await readSavIntakeCurrent(threadId, config))?.payload.plan?.progress).toMatchObject({ kind: "human_choice", view: "to_validate" });
+  expect(await analyseSavIntakeRuntime(id, config, { env: () => environment, network })).toMatchObject({ state: "waiting" });
+  expect((await readSavIntakeCurrent(threadId, config))?.payload.plan?.progress).toMatchObject({ kind: "processing", view: null });
   expect(await pendingSavIntakeRuns(config)).toHaveLength(0);
   expect(network).toHaveBeenCalledTimes(1);
   expect(await f.db.select().from(savActions)).toHaveLength(0);
@@ -1225,4 +1228,21 @@ it("two fully read, plausible tickets leave a human choice and a second wake spe
   expect(await analyse()).toMatchObject({ skipped: "not_claimed" });
   expect(modelCalls).toBe(2);
   expect(await f.db.select().from(savActions)).toHaveLength(0);
+});
+
+it("parks a quote-only forward with a source dependency even when the operational cap cannot admit an AI call", async () => {
+  environment.SAV_INTAKE_RUNTIME_CONFIG = JSON.stringify({ ...JSON.parse(environment.SAV_INTAKE_RUNTIME_CONFIG!),
+    budgetProfile: "operational_utc_v1", maxNanoUsd: 1, maxRollingNanoUsd: 90_000_000_000, maxCalls: 300 });
+  config = savIntakeRuntimeConfig(environment)!;
+  const m = await message({ receivedAt: new Date(Date.now()+1), body: "---------- Forwarded message ---------\nDe : Customer <other@example.invalid>\nObjet : My request\n\nI cannot connect." });
+  await f.db.update(savMessages).set({ subject: "Fwd: My request" }).where(eq(savMessages.id,m.id));
+  const id=(await enqueueSavIntakeMessage(m.id,config))!, network=vi.fn(async()=>{throw Error("NETWORK_FORBIDDEN")});
+  expect((await analyseSavIntakeRuntime(id,config,{env:()=>environment,network})).state).toBe("waiting");
+  const current=await readSavIntakeCurrent(threadId,config);
+  expect(current?.payload.plan?.decision.disposition).toMatchObject({kind:"collect_context",reasons:expect.arrayContaining(["forwarded_origin_unverified"])});
+  expect(current?.payload.plan?.progress).toMatchObject({kind:"processing",view:null});
+  expect(await pendingSavIntakeRuns(config)).not.toContainEqual({id});
+  expect(await claimSavIntakeRun(id,config)).toBeNull();
+  expect(await readIntakeRunDiagnostics(threadId)).toMatchObject({blockingMarker:"forwarded_origin_unverified",attemptsExhausted:false});
+  expect(network).not.toHaveBeenCalled(); expect(await f.db.select().from(savActions)).toHaveLength(0);
 });

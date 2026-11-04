@@ -114,7 +114,8 @@ export function intakeBlockedRunSql(threadId: ReturnType<typeof sql>, pause: Int
 export function intakeBlockedCauseSql(threadId: ReturnType<typeof sql>, pause: IntakeBlockedPause = INTAKE_NOT_PAUSED) {
   const marker = (kind: string) => sql`exists(select 1 from sav.intake_runs br join sav.intake_journal bj on bj.run_id = br.id where br.thread_id = ${threadId} and br.is_current and bj.kind = ${kind})`;
   const paused = pause.analysisPaused ? sql`exists(select 1 from sav.intake_runs br where br.thread_id = ${threadId} and br.is_current and br.state in ('pending', 'waiting'))` : sql`false`;
-  return sql<string | null>`case when ${marker("attempts_exhausted")} then 'attempts_exhausted' when ${marker("deterministic_block")} then 'input_invalid'
+  return sql<string | null>`case when ${marker("private_resource_unavailable")} then 'private_resource_unavailable'
+    when ${marker("forwarded_origin_unverified")} then 'forwarded_origin_unverified' when ${marker("attempts_exhausted")} then 'attempts_exhausted' when ${marker("deterministic_block")} then 'input_invalid'
     when ${marker("source_invalid")} then 'source_invalid' when ${intakeBlockedRunSql(threadId, pause)} then 'technical_wait' when ${paused} then 'agent_paused' else null end`;
 }
 /** Due time of a scheduled automatic retry of the current run, if any. */
