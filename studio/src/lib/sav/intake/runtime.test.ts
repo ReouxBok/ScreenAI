@@ -874,7 +874,21 @@ it.each(["sender", "recipients"])("isolates invalid address metadata (%s) before
   expect(await f.db.select().from(savIntakeEffects)).toHaveLength(0);
 });
 
-it("keeps an unqualified Other behind a resource block without consuming another automatic analysis", async () => {
+it.each(["absent","invalid","expired","mismatch","protected","incomplete_evidence","unavailable_gmail","negative_auth"] as const)("routes Other by per-mail qualification outcome without another analysis (%s)", async scenario => {
+  const hash=(s:string)=>createHash("sha256").update(s).digest("hex");
+  const [msg]=await f.db.select().from(savMessages).where(eq(savMessages.id,messageId));
+  const body=decryptSavPayload<{ text:string }>(msg.bodyCiphertext);
+  const rules=[{id:"synthetic-rule",family:"authenticated_newsletter",mailboxId,subjectSha256:hash(msg.subject),
+    bodySha256:hash(scenario==="mismatch"?"different":body.text)}];
+  if(scenario!=="absent") Object.assign(environment,{SAV_INTAKE_OTHER_RULES_JSON:scenario==="invalid"?"{invalid":JSON.stringify({version:1,
+    approvedBy:"synthetic",approvedAt:new Date(Date.now()-60000).toISOString(),expiresAt:new Date(Date.now()+(scenario==="expired"?-1:60000)).toISOString(),
+    resource:{resourceId:"catalogue",revisionId:"1",sha256:hash(JSON.stringify(rules))},rules})});
+  if(scenario==="protected") await f.db.update(savThreads).set({hubspotTicketId:"1234"}).where(eq(savThreads.id,threadId));
+  if(["unavailable_gmail","negative_auth"].includes(scenario)) {
+    const original=decryptSavPayload<Record<string,unknown>>(msg.bodyCiphertext);
+    await f.db.update(savMessages).set({bodyCiphertext:encryptSavPayload({...original,attachmentInventory:{complete:true,limits:[]}})}).where(eq(savMessages.id,messageId));
+  }
+  const authenticateOther=vi.fn(async()=>{if(scenario==="unavailable_gmail")throw Error("SYN_UNAVAILABLE");return null;});
   const id = (await enqueueSavIntakeMessage(messageId, config))!;
   const network = vi.fn<typeof fetch>(async (url, init) => {
     expect(String(url)).toContain("generativelanguage.googleapis.com");
@@ -883,8 +897,13 @@ it("keeps an unqualified Other behind a resource block without consuming another
       requests: [{ id: "noise", kind: "other", currentMessageId: messageId, quoteId: data.citationCatalogue[0].id }] }) }] } }],
       usageMetadata: { promptTokenCount: 10, candidatesTokenCount: 10, thoughtsTokenCount: 0, totalTokenCount: 20 } });
   });
-  expect(await analyseSavIntakeRuntime(id, config, { env: () => environment, network })).toMatchObject({ state: "waiting" });
-  expect((await readSavIntakeCurrent(threadId, config))?.payload.plan?.progress).toMatchObject({ kind: "processing", view: null });
+  const human=["mismatch","protected","negative_auth"].includes(scenario);
+  expect(await analyseSavIntakeRuntime(id, config, { env: () => environment, network, authenticateOther })).toMatchObject({ state: human?"observed":"waiting" });
+  const plan=(await readSavIntakeCurrent(threadId, config))?.payload.plan;
+  expect(plan?.decision.disposition).toMatchObject({kind:"collect_context",reasons:[human?"other_rule_not_applicable":
+    scenario==="incomplete_evidence" || scenario==="unavailable_gmail"?"other_evidence_unavailable":"private_resource_unavailable"]});
+  expect(plan?.progress).toMatchObject(human?{kind:"human_choice",view:"to_validate"}:{kind:"processing",view:null});
+  expect(authenticateOther).toHaveBeenCalledTimes(["unavailable_gmail","negative_auth"].includes(scenario)?1:0);
   expect(await pendingSavIntakeRuns(config)).toHaveLength(0);
   expect(network).toHaveBeenCalledTimes(1);
   expect(await f.db.select().from(savActions)).toHaveLength(0);

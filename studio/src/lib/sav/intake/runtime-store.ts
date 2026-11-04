@@ -470,7 +470,7 @@ export async function saveSavIntakeResult(lease: IntakeLease, config: IntakeRunt
     await journal(tx, lease.run.id, state, payload);
     if (state === "waiting" && payload.plan?.decision.disposition.kind === "collect_context") {
       const dependency = payload.plan.decision.disposition.reasons.find(reason =>
-        reason === "private_resource_unavailable" || reason === "forwarded_origin_unverified");
+        reason === "private_resource_unavailable" || reason === "forwarded_origin_unverified" || reason === "other_evidence_unavailable");
       if (dependency) await journal(tx, lease.run.id, dependency, { reason: dependency });
     }
     if (payload.readRecovery) await writeReadRecoveryMarker(tx,lease.run.id,payload.readRecovery);

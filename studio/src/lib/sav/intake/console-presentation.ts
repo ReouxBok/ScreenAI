@@ -63,6 +63,8 @@ export function intakeReasonLabel(reason: string | null | undefined) {
   return reasons.find(([pattern]) => pattern.test(reason))?.[1] ?? "Une vérification technique est nécessaire ; les éléments déjà établis sont conservés.";
 }
 export const intakeContextReasonLabels: Record<string, string> = {
+  other_rule_not_applicable: "aucune règle approuvée ne permet de classer ce message dans Autres",
+  other_evidence_unavailable: "vérification des preuves de classement indisponible",
   forwarded_origin_unverified: "mail transféré sans texte de l’expéditeur actuel",
   classification_incomplete: "qualification de la demande", contact_lookup_failed: "recherche de la fiche", contact_lookup_incomplete: "complétude de la recherche de fiche",
   contact_ambiguous: "choix entre plusieurs fiches", association_incomplete: "liens directs entre les fiches", ticket_search_incomplete: "recherche exhaustive des tickets",
@@ -75,6 +77,7 @@ export const intakeContextReasonLabels: Record<string, string> = {
 
 /** Team-facing cause of a blocked dossier; the incident stays counted until resolved. */
 const blockedCauses: Record<string, string> = {
+  other_evidence_unavailable: "Bloqué — vérifier les preuves de classement du mail.",
   forwarded_origin_unverified: "Bloqué — transfert sans texte propre. Retrouver le mail ou l’activité CRM d’origine.",
   private_resource_unavailable: "Bloqué — règle ou modèle approuvé indisponible. Vérifier la configuration ou traiter ce dossier manuellement.",
   attempts_exhausted: "Bloqué — tentatives d’analyse épuisées. À traiter par l’équipe.",
@@ -106,6 +109,8 @@ export const intakeExpectedActions: Record<string, string> = {
   ticket_closure_date_unknown: "Vérifier la date de fermeture du ticket : réouverture (15 jours ou moins) ou nouveau ticket.",
   ticket_stage_unknown: "Vérifier le statut actuel du ticket dans HubSpot.",
   ticket_owner_unknown: "Vérifier le responsable du ticket fermé avant sa réouverture.",
+  other_evidence_unavailable: "Vérifier le message source et ses preuves techniques de classement.",
+  other_rule_not_applicable: "Décider du classement à partir du message original et de son historique.",
   forwarded_origin_unverified: "Retrouver le message original et vérifier son auteur et son dossier dans HubSpot avant le rattachement.",
   private_resource_unavailable: "Une ressource approuvée manque (modèle de réponse, règle) : la configurer ou traiter manuellement.",
   attempts_exhausted: "Traiter le dossier manuellement ou relancer une analyse après correction de la cause.",

@@ -329,7 +329,11 @@ export async function planSavIntake(
         // Accepted semantic classification is not authority to hide a mail.
         // Block this version until the missing policy is supplied. A missing
         // resource is not a customer classification question.
-        if (!policy.qualifiedOther) return context("private_resource_unavailable");
+        if (!policy.qualifiedOther) {
+          if (policy.otherRuleStatus === "not_applicable") return context("other_rule_not_applicable", "request_scope_uncertain");
+          if (policy.otherRuleStatus === "evidence_unavailable") return context("other_evidence_unavailable");
+          return context("private_resource_unavailable");
+        }
         const resource = savIntakePrivateResourceSchema.parse(policy.qualifiedOther.resource);
         ruleId = addEvidence("classification-rule", policy.qualifiedOther.evidenceSource, resource.resourceId, resource);
       }

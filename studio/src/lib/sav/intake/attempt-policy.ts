@@ -11,7 +11,7 @@ export const SAV_INTAKE_ATTEMPT_POLICY = Object.freeze({
   totalPerMessage: 8,
 });
 /** Durable markers that remove a run from scheduling; the dossier stays visible as blocked. */
-export const SAV_INTAKE_BLOCKING_JOURNAL_KINDS = ["source_invalid", "attempts_exhausted", "deterministic_block", "private_resource_unavailable", "forwarded_origin_unverified"] as const;
+export const SAV_INTAKE_BLOCKING_JOURNAL_KINDS = ["source_invalid", "attempts_exhausted", "deterministic_block", "private_resource_unavailable", "forwarded_origin_unverified", "other_evidence_unavailable"] as const;
 /** A technical wait older than this is an incident handed to the team, never a silent state. */
 export const SAV_INTAKE_BLOCKED_AFTER_MINUTES = 15;
 /** Local, reproducible input errors: retrying the same input cannot succeed and must not burn attempts. */

@@ -81,6 +81,7 @@ export type EnginePolicy = {
     partnership?: PrivateResource; commercial?: PrivateResource; investor?: PrivateResource;
   };
   // Server-qualified rules and operator overrides are inputs, never inferred from a brand keyword.
+  otherRuleStatus?: "catalogue_unavailable" | "not_applicable" | "evidence_unavailable";
   qualifiedOther?: { family?: "authenticated_newsletter"; resource: PrivateResource; evidenceSource: "private_rule" | "human_override" };
   manualSupportOverride?: PrivateResource;
   /** Set by the stored-message automation gate, never read from model output. */
