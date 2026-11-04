@@ -546,6 +546,13 @@ it("the missing-contact view requires a sent-and-verified exact private template
   const execution=(await admitIntakeExecution(runId,options))!;expect((await executeIntakePass(execution.id,options)).state).toBe("confirmed");
   await projectIntakeThread(threadId);expect((await listIntakeConsole({view:"missing_contact"})).total).toBe(1);
   expect(await ensureIntakeObservations()).toEqual({created:0});expect(Object.keys(p.sent)).toHaveLength(1);
+  await db.db.update(savMailboxes).set({email:"contact@limova.ai"}).where(eq(savMailboxes.id,mailboxId));
+  const readEnv={...environment,SAV_INTAKE_GMAIL_MARK_READ:"on"}, gmail=vi.fn();
+  expect(await syncHandledIntakeGmailRead(messageId,{env:()=>readEnv,gmail})).toEqual({skipped:"not_handled"});
+  expect(gmail).not.toHaveBeenCalled();
+  for(const [key,value] of Object.entries(readEnv)) vi.stubEnv(key,value);
+  expect(await reconcileHandledIntakeGmailRead(5)).toMatchObject({checked:0,confirmed:0});
+  expect(await db.db.select().from(auditLogs).where(eq(auditLogs.action,SAV_INTAKE_GMAIL_READ))).toHaveLength(0);
 });
 async function supportClosedWithHumanEvidence(priorFinance=false) {
   vi.stubEnv("SAV_RELEASE_STAGE","v0");
