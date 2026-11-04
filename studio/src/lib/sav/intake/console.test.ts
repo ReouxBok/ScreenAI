@@ -1505,6 +1505,17 @@ describe("SAV-42 C: a confirmed current acknowledgement is marked read once", ()
     const failures = await db.db.select().from(auditLogs).where(eq(auditLogs.action, "sav_intake_gmail_read_failed"));
     expect(failures.map(f => f.entityId)).toEqual([messageId]);
   });
+  it("keeps pending human choices unread in direct and recovery paths until a real disposition exists", async () => {
+    await readable();
+    const plan = await observed(true);
+    expect(plan.progress).toMatchObject({ kind:"human_choice", view:"to_validate" });
+    await projectIntakeThread(threadId);
+    const g=provider();
+    expect(await syncHandledIntakeGmailRead(messageId,deps(g.gmail))).toEqual({skipped:"not_handled"});
+    for (const [key,value] of Object.entries({...environment,SAV_INTAKE_GMAIL_MARK_READ:"on"})) vi.stubEnv(key,value);
+    expect(await reconcileHandledIntakeGmailRead(5)).toMatchObject({checked:0,confirmed:0});
+    expect(g.state).toMatchObject({writes:0,unread:true});expect(mutationsSent()).toHaveLength(0);
+  });
   it("is not marked read once a newer inbound message supersedes it", async () => {
     await readable(); await acknowledged();
     await message(threadId, new Date(Date.now() + 1000));
