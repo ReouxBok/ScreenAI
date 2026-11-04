@@ -42,3 +42,10 @@ it("shows historical uncertainty in the rolling exposure without implying todayâ
   const [today, exposure] = html.split("Exposition sur 30 jours");
   expect(today).toContain("0,90 USD"); expect(today).not.toContain("18,30 USD"); expect(exposure).toContain("18,30 USD");
 });
+
+it("describes non-operational qualification as cumulative across the whole campaign",async()=>{
+  mocks.panel.mockResolvedValue({...panel,operational:false});
+  const html=renderToStaticMarkup(await Page());
+  expect(html).toContain("Total de la campagne");expect(html).toContain("Appels dans la campagne");
+  expect(html).not.toContain("30 jours");expect(html).not.toContain("Appels aujourdâ€™hui");
+});

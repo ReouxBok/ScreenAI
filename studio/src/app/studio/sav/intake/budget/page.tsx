@@ -21,21 +21,21 @@ export default async function IntakeBudgetPage() {
       <dl>
         <dt>Plafond effectif</dt><dd>{usd(panel.effectiveNanoUsd)} {panel.override?.maxNanoUsd ? "(réglage Studio)" : "(configuration)"}</dd>
         <dt>Plafond de la configuration</dt><dd>{usd(panel.configuredNanoUsd)}</dd>
-        <dt>Compté aujourd’hui</dt><dd>{usd(u?.chargedNanoUsd)}{u && u.dailyUnsettledNanoUsd > 0 ? " — dont des réservations au coût encore inconnu" : ""}</dd>
-        <dt>Dépense confirmée aujourd’hui</dt><dd>{u ? `${usd(u.settledNanoUsd)} (${u.settledCallCount} appel(s))` : "—"}</dd>
-        <dt>Réservations du jour encore non soldées</dt><dd>{u ? `${usd(u.dailyUnsettledNanoUsd)} (${u.dailyUnsettledCallCount} appel(s))` : "—"}</dd>
+        <dt>{panel.operational ? "Compté aujourd’hui" : "Compté depuis le début de la campagne"}</dt><dd>{usd(u?.chargedNanoUsd)}{u && u.dailyUnsettledNanoUsd > 0 ? " — dont des réservations au coût encore inconnu" : ""}</dd>
+        <dt>{panel.operational ? "Dépense confirmée aujourd’hui" : "Dépense confirmée de la campagne"}</dt><dd>{u ? `${usd(u.settledNanoUsd)} (${u.settledCallCount} appel(s))` : "—"}</dd>
+        <dt>{panel.operational ? "Réservations du jour encore non soldées" : "Réservations non soldées de la campagne"}</dt><dd>{u ? `${usd(u.dailyUnsettledNanoUsd)} (${u.dailyUnsettledCallCount} appel(s))` : "—"}</dd>
         <dt>Marge restante</dt><dd>{usd(u?.remainingNanoUsd)}</dd>
         <dt>Marge requise pour démarrer une analyse</dt><dd>{usd(u?.requiredNanoUsd)}</dd>
-        <dt>Appels aujourd’hui</dt><dd>{u ? `${u.callCount} / ${u.maxCalls}` : "—"}</dd>
+        <dt>{panel.operational ? "Appels aujourd’hui" : "Appels dans la campagne"}</dt><dd>{u ? `${u.callCount} / ${u.maxCalls}` : "—"}</dd>
       </dl>
     </section>
     <section className={styles.choice}>
-      <h2>Exposition sur 30 jours</h2>
-      <p>Les réservations non soldées, quelle que soit leur date, restent comptées dans cette enveloppe. Les appels réglés y comptent pendant 30 jours à partir de leur départ.</p>
+      <h2>{panel.operational ? "Exposition sur 30 jours" : "Exposition de la campagne"}</h2>
+      <p>{panel.operational ? "Les réservations non soldées, quelle que soit leur date, restent comptées dans cette enveloppe. Les appels réglés y comptent pendant 30 jours à partir de leur départ." : "Les dépenses réglées et les réservations non soldées comptent sur toute la campagne."}</p>
       <dl>
         <dt>Réservations en cours</dt><dd>{u ? `${usd(u.inFlightNanoUsd)} (${u.inFlightCallCount} appel(s))` : "—"}</dd>
         <dt>Coûts incertains conservés</dt><dd>{u ? `${usd(u.uncertainNanoUsd)} (${u.uncertainCallCount} appel(s)${u.oldestUnsettledAt ? `, le plus ancien depuis ${u.oldestUnsettledAt}` : ""})` : "—"}</dd>
-        <dt>Sur 30 jours glissants</dt><dd>{u ? `${usd(u.rollingChargedNanoUsd)} / ${usd(u.maxRollingNanoUsd)}` : "—"}</dd>
+        <dt>{panel.operational ? "Sur 30 jours glissants" : "Total de la campagne"}</dt><dd>{u ? `${usd(u.rollingChargedNanoUsd)} / ${usd(u.maxRollingNanoUsd)}` : "—"}</dd>
       </dl>
     </section>
     <BudgetForm ceilingUsd={formatNanoUsd(panel.ceilingNanoUsd)} hasOverride={Boolean(panel.override?.maxNanoUsd)}/>
