@@ -52,7 +52,7 @@ async function analyseSavIntakeRuntimeWithinBudget(runId: string, config: Intake
   });
   if (!lease) return { skipped: held.cause ? intakeResumeHoldReason(held.cause) : "not_claimed" };
   const previous = decryptSavPayload<IntakeRuntimePayload>(lease.run.payloadCiphertext);
-  if (lease.recoveringRead && previous.input) lease.input = structuredClone(previous.input) as EngineInput;
+  if (lease.recoveringRead && previous.input && !lease.automation) lease.input = structuredClone(previous.input) as EngineInput;
   const repairMalformedOutput = lease.run.attempts > 1 && ["SAV_INTAKE_MODEL_OUTPUT_REJECTED", "SAV_INTAKE_RUNTIME_CALL_ALREADY_CONSUMED"].includes(previous.reason ?? "");
   const controller = new AbortController(), timer = setTimeout(() => controller.abort(), 45_000);
   const traces: unknown[] = [];
@@ -91,7 +91,7 @@ async function analyseSavIntakeRuntimeWithinBudget(runId: string, config: Intake
         : config.policy;
       payload.plan = await planSavIntake(lease.input, intakeAutomationAdapters(lease.input.message.id), policy, { timeoutMs: 10_000 }, () => new Date());
       assertSavIntakeObservation(payload.plan);
-      payload.reason = automation.code;
+      payload.reason = lease.input.priorRequestReview ? "SAV_INTAKE_PRIOR_REQUEST_PENDING" : automation.code;
       const state = payload.plan.decision.disposition.kind === "collect_context" && payload.plan.progress.kind !== "human_choice" ? "waiting" : "observed";
       if (lease.recoveringRead) { payload.readRecovery!.state = state === "waiting" ? "invalidated" : "complete"; payload.readRecovery!.cache = []; }
       else delete payload.readRecovery;

@@ -2,13 +2,14 @@ import { randomUUID } from "node:crypto";
 import { afterAll, afterEach, beforeAll, beforeEach, expect, it, vi } from "vitest";
 import { eq } from "drizzle-orm";
 import { createSavTestDb } from "../../../../test/sav-db";
-import { auditLogs, savMailboxes, savMessages, savThreads, savIntakeRuns, savIntakeModelCalls, savSyncState, savActions } from "@/db/schema";
+import { auditLogs, savMailboxes, savMessages, savThreads, savIntakeRuns, savIntakeModelCalls, savSyncState, savActions, savIntakeExecutionPolicies, savIntakeExecutions, savIntakeEffects, staffUsers } from "@/db/schema";
 const state = vi.hoisted(() => ({ db: null as unknown }));
 vi.mock("@/db", () => ({ requireDb: () => { if (!state.db) throw Error("NO_DATABASE_ALLOWED"); return state.db; } }));
 import { SAV_EXTERNAL_COMPLETION, SAV_EXTERNAL_COMPLETION_REVERTED } from "../external-completion";
 import { encryptSavPayload } from "../crypto";
 import { intakeRuntimeHash, savIntakeRuntimeConfig, type IntakeRuntimeConfig } from "./runtime-contract";
-import { claimSavIntakeRun, pendingSavIntakeRuns, enqueueSavIntakeMessage, readSavIntakeBudget, readSavIntakeCurrent } from "./runtime-store";
+import { claimSavIntakeRun, pendingSavIntakeRuns, enqueueSavIntakeMessage, readSavIntakeBudget, readSavIntakeCurrent, savIntakeSourceSnapshot } from "./runtime-store";
+import { executionMessageHash } from "./execution-store";
 import { analyseSavIntakeRuntime } from "./runtime";
 
 // Synthetic mails only; the model and CRM are fakes and any other network call fails the test.
@@ -200,8 +201,9 @@ it.each(["absence", "delivery"] as const)("keeps an earlier unhandled request vi
   const notice = await mail({ text: kind === "absence" ? "Je suis absent." : "Avis de distribution.", headers });
   const id = (await enqueueSavIntakeMessage(notice.id, config))!, network = forbidden();
   await analyseSavIntakeRuntime(id, config, { env: () => environment, network });
-  expect(await readSavIntakeCurrent(threadId, config)).toMatchObject({ id, state: "waiting", attempts: 0,
-    payload: { reason: "SAV_INTAKE_RUNTIME_DAILY_BUDGET_DEFERRED" } });
+  expect(await readSavIntakeCurrent(threadId, config)).toMatchObject({ id, state: "observed",
+    payload: { reason: "SAV_INTAKE_PRIOR_REQUEST_PENDING", plan: { progress: { view: "to_validate" }, decision: {
+      evidence: expect.arrayContaining([expect.objectContaining({ sourceId: request.id, source: "customer_history" })]) } } } });
   expect(network).not.toHaveBeenCalled();
 });
 
@@ -242,7 +244,7 @@ it.each(["completed", "to_validate", "reverted"] as const)("only a terminal, unr
   if (disposition === "completed") {
     expect(result).toMatchObject({ state: "observed", payload: { reason: "SAV_INTAKE_AUTOMATED_REPLY" } });
   } else {
-    expect(result).toMatchObject({ state: "waiting", attempts: 0, payload: { reason: "SAV_INTAKE_RUNTIME_DAILY_BUDGET_DEFERRED" } });
+    expect(result).toMatchObject({ state: "observed", payload: { reason: "SAV_INTAKE_PRIOR_REQUEST_PENDING", plan: { progress: { view: "to_validate" } } } });
   }
   expect(network).not.toHaveBeenCalled();
 });
@@ -270,3 +272,24 @@ function ackModel(messageId: string) {
     return Response.json({ candidates: [{ finishReason: "STOP", content: { parts: [{ text: JSON.stringify(answer) }] } }], usageMetadata: { promptTokenCount: 100, candidatesTokenCount: 50, thoughtsTokenCount: 0, totalTokenCount: 150 } });
   });
 }
+
+it.each(["valid", "wrong_hash", "effect_pending"] as const)("an earlier execution receipt must match its original mail and association (%s)", async variant => {
+  const old = await mail({ text: "Le compte est bloqué.", receivedAt: new Date(Date.now() - 1500) });
+  const runId = (await enqueueSavIntakeMessage(old.id, config))!;
+  const snapshot = await f.db.transaction(tx => savIntakeSourceSnapshot(tx, old, new Date()));
+  const [staff] = await f.db.insert(staffUsers).values({ clerkId: randomUUID(), email: `${randomUUID()}@example.invalid`, name: "Test", role: "admin" }).returning();
+  const [policy] = await f.db.insert(savIntakeExecutionPolicies).values({ revision: randomUUID(), state: "approved", administratorId: staff.id, policyHash: config.policyHash, payloadCiphertext: encryptSavPayload({}) }).returning();
+  const [execution] = await f.db.insert(savIntakeExecutions).values({ threadId, messageId: old.id, runId, runVersion: 1, policyId: policy.id,
+    policyHash: config.policyHash, state: "confirmed", ticketId: "101", payloadCiphertext: encryptSavPayload({ completion: { sourceHash: snapshot.sourceHash,
+      messageHash: variant === "wrong_hash" ? "wrong" : executionMessageHash(old) } }) }).returning();
+  await f.db.insert(savIntakeEffects).values({ executionId: execution.id, businessKey: randomUUID(), permission: "hubspot_email", kind: "email_associate",
+    state: variant === "effect_pending" ? "planned" : "confirmed", intentHash: intakeRuntimeHash({}), intentCiphertext: encryptSavPayload({}),
+    verificationCiphertext: variant === "effect_pending" ? null : encryptSavPayload({}), confirmedAt: variant === "effect_pending" ? null : new Date() });
+  const notice = await mail({ headers: absence, text: "Je suis absent." });
+  const id = (await enqueueSavIntakeMessage(notice.id, config))!, network = forbidden();
+  await analyseSavIntakeRuntime(id, config, { env: () => environment, network });
+  const result = await readSavIntakeCurrent(threadId, config);
+  expect(result?.payload.reason).toBe(variant === "valid" ? "SAV_INTAKE_AUTOMATED_REPLY" : "SAV_INTAKE_PRIOR_REQUEST_PENDING");
+  expect(result?.payload.plan?.decision.disposition.kind).toBe(variant === "valid" ? "no_ticket" : "collect_context");
+  expect(network).not.toHaveBeenCalled();
+});

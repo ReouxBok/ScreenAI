@@ -1955,3 +1955,31 @@ it.each(["worker","uncertain_effect"])("REVIEW-AE real close refuses a protected
   expect(await db.db.select().from(auditLogs).where(eq(auditLogs.action,SAV_EXTERNAL_COMPLETION))).toHaveLength(0);
   expect(mutationsSent()).toHaveLength(0);expect(fetch).not.toHaveBeenCalled();
 });
+
+it("preserves the original request across an operator choice on the automatic reply, then accepts explicit outside completion", async () => {
+  vi.stubEnv("SAV_RELEASE_STAGE", "v0"); vi.stubEnv("SAV_PILOT_MODE", "false");
+  await activateSavV0Cutover({receivedAfter:new Date(Date.now()-3600000).toISOString(),mailboxEmail:"support@example.invalid",intakeRecipient:"contact@limova.ai",deploymentSha:"a".repeat(40),activatedBy:"ugo@limova.ai"});
+  const original = messageId;
+  await enqueueSavIntakeMessage(original, options.runtime);
+  const notice = await message(threadId, new Date(), "Re: Connexion");
+  messageId = notice.id;
+  await db.db.update(savMessages).set({ bodyCiphertext: encryptSavPayload({ text: "Je suis absent.", attachments: [], headers: {
+    "x-studio-automation-headers": "singleton-v1", "x-studio-automation-body":"complete-plain-v1", "auto-submitted":"auto-replied", "content-type":"text/plain", "in-reply-to":"<synthetic@other.invalid>" } }) }).where(eq(savMessages.id, notice.id));
+  const id = (await enqueueSavIntakeMessage(notice.id, options.runtime))!;
+  await (await import("./runtime")).analyseSavIntakeRuntime(id, options.runtime, { env: () => environment, network: fetch });
+  await projectIntakeThread(threadId);
+  const current = (await readIntakeConsoleDetail(threadId))!;
+  expect(current.projection.view).toBe("to_validate");
+  expect(current.messages.find(m => m.id === original)?.body.text).toContain("connection fails");
+  const first = (await recordIntakeHumanCommand(await command("classify"))).eventId;
+  await consumeIntakeHumanEvent(first, options.runtime, createSavIntakeHubspotReaders({ network: p.network }));
+  await projectIntakeThread(threadId);
+  const after = (await readIntakeConsoleDetail(threadId))!;
+  expect(after.current?.id).not.toBe(id);
+  expect(after.projection.view).toBe("to_validate");
+  expect(after.current?.payload.plan?.decision.evidence).toContainEqual(expect.objectContaining({source:"customer_history",sourceId:original}));
+  expect(await completeSavDossierManually({requestKey:randomUUID(),threadId,messageId:notice.id,confirmed:true})).toMatchObject({marked:1});
+  expect((await readIntakeConsoleDetail(threadId))?.projection.view).toBe("completed");
+  expect(await db.db.select().from(savIntakeModelCalls)).toHaveLength(0);
+  expect(fetch).not.toHaveBeenCalled(); expect(mutationsSent()).toHaveLength(0);
+});

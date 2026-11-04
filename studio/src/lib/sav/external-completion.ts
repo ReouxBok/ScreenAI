@@ -1,5 +1,5 @@
 import "server-only";
-import { and, asc, desc, eq, inArray, sql } from "drizzle-orm";
+import { and, asc, desc, eq, inArray, ne, sql } from "drizzle-orm";
 import { z } from "zod";
 import { requireDb } from "@/db";
 import { auditLogs, savActions, savDecisions, savMessages, savPilotItems, savThreads, savIntakeHumanEvents, savIntakeExecutions, savIntakeEffects, savIntakeRuns, staffUsers } from "@/db/schema";
@@ -81,9 +81,9 @@ const unsettledIntakeEffect = sql`(
 
 /** Include intake commands and dispatched effects: the administrative marker
  * cannot certify an outcome for work whose result still needs reconciliation. */
-export async function hasUnsettledSavIntakeWork(threadId: string, db: Reader = requireDb()) {
+export async function hasUnsettledSavIntakeWork(threadId: string, db: Reader = requireDb(), currentReaderEvent?: string) {
   if (!await intakeConsoleInstalled(db)) return false;
-  const [command] = await db.select({ id: savIntakeHumanEvents.id }).from(savIntakeHumanEvents).where(and(eq(savIntakeHumanEvents.threadId, threadId), inArray(savIntakeHumanEvents.state, ["pending", "reading", "waiting"])) ).limit(1);
+  const [command] = await db.select({ id: savIntakeHumanEvents.id }).from(savIntakeHumanEvents).where(and(eq(savIntakeHumanEvents.threadId, threadId), inArray(savIntakeHumanEvents.state, ["pending", "reading", "waiting"]), currentReaderEvent ? ne(savIntakeHumanEvents.id, currentReaderEvent) : undefined) ).limit(1);
   const [effect] = await db.select({ id: savIntakeEffects.id }).from(savIntakeEffects)
     .innerJoin(savIntakeExecutions, eq(savIntakeExecutions.id, savIntakeEffects.executionId))
     .where(and(eq(savIntakeExecutions.threadId, threadId), unsettledIntakeEffect)).limit(1);

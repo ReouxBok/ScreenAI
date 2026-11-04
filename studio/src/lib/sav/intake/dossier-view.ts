@@ -39,7 +39,7 @@ export function intakeDossierView(data: IntakeConsoleDetail) {
     && !data.choices.some(event => ["pending", "reading"].includes(event.state)));
   const currentEffects = Boolean(data.confirmedCurrent || applicable && data.progress?.runId === current?.id);
   const question = data.projection.view === "to_validate" || ["human_choice", "human_hold", "human_review"].includes(data.projection.status)
-    ? plan?.progress?.kind === "human_choice" ? "Choisir la bonne fiche ou le ticket qui recevra ce mail"
+    ? current?.payload.reason === "SAV_INTAKE_PRIOR_REQUEST_PENDING" ? "À quel ticket la demande antérieure a-t-elle été rattachée ?" : plan?.progress?.kind === "human_choice" ? "Choisir la bonne fiche ou le ticket qui recevra ce mail"
       : disposition?.kind === "no_ticket" && disposition.nextAction === "supervised_investor" ? "Prendre en charge cette demande d’investissement"
         : disposition?.kind === "no_ticket" && disposition.nextAction === "supervised_partnership" ? "Prendre en charge cette demande de partenariat"
           : disposition?.kind === "no_ticket" && disposition.nextAction === "supervised_commercial" ? "Prendre en charge cette demande commerciale" : "Quelle suite l’équipe doit-elle donner à cette demande ?" : null;

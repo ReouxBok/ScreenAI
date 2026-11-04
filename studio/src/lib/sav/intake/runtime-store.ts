@@ -177,14 +177,15 @@ export async function savIntakeSourceSnapshot(tx: Pick<Tx, "select">, message: t
 
 /** The console projects only the latest inbound. A receipt may shortcut that whole thread only
  * if all older inbound messages have positive terminal evidence. Unknown or truncated history
- * keeps ordinary analysis; a receipt, a read label or a superseded run alone proves nothing. */
-async function priorIntakeCompleteForAutomation(tx: Pick<Tx, "select">, data: Awaited<ReturnType<typeof savIntakeSourceSnapshot>>) {
-  if (data.input.conversation.status !== "complete") return false;
+ * requires a person to verify the earlier requests. A read label or superseded run alone proves nothing. */
+async function priorAutomationReview(tx: Pick<Tx, "select">, data: Awaited<ReturnType<typeof savIntakeSourceSnapshot>>, currentReaderEvent?: string): Promise<EngineInput["priorRequestReview"]> {
   const ids = data.input.conversation.data.filter(m => m.direction === "inbound" && m.id !== data.input.message.id).map(m => m.id);
-  if (!ids.length) return true;
+  const truncated = data.input.conversation.status !== "complete";
+  const unknown = { messageIds: ids, truncated };
+  if (!ids.length) return truncated ? unknown : undefined;
   const threadId = data.input.message.threadId;
-  if (await hasUnsettledSavIntakeWork(threadId, tx) ||
-      hasUnsettledSavHumanAction(await tx.select().from(savActions).where(eq(savActions.threadId, threadId)))) return false;
+  if (await hasUnsettledSavIntakeWork(threadId, tx, currentReaderEvent) ||
+      hasUnsettledSavHumanAction(await tx.select().from(savActions).where(eq(savActions.threadId, threadId)))) return unknown;
   const messages = await tx.select().from(savMessages).where(and(eq(savMessages.threadId, threadId), inArray(savMessages.id, ids)));
   const events = await tx.select().from(auditLogs).where(and(eq(auditLogs.entityType, "sav_message"), inArray(auditLogs.entityId, ids), inArray(auditLogs.action, savExternalCompletionEvents)));
   const receipts = await tx.select({ messageId: savIntakeExecutions.messageId, payload: savIntakeExecutions.payloadCiphertext }).from(savIntakeExecutions)
@@ -204,17 +205,28 @@ async function priorIntakeCompleteForAutomation(tx: Pick<Tx, "select">, data: Aw
       } catch { /* An unreadable receipt is not terminal evidence. */ }
     }
   }
-  if (messages.length !== ids.length) return false;
+  const unresolved = new Set(ids);
   for (const m of messages) {
     const mark = findSavExternalCompletion(m, events);
     if (mark) {
-      if (savExternalDisposition(mark).view === "to_validate") return false;
+      if (savExternalDisposition(mark).view !== "to_validate") unresolved.delete(m.id);
     } else {
       const hash = verified.get(m.id);
-      if (!hash || !intakeSourceMatches(await savIntakeSourceSnapshot(tx, m, new Date()), hash)) return false;
+      if (hash && intakeSourceMatches(await savIntakeSourceSnapshot(tx, m, new Date()), hash)) unresolved.delete(m.id);
     }
   }
-  return true;
+  return unresolved.size || truncated ? { messageIds: [...unresolved], truncated } : undefined;
+}
+
+function noticeInSnapshot(data: Awaited<ReturnType<typeof savIntakeSourceSnapshot>>, forReviewOnly = false) {
+  return intakeAutomatedMessage({ message: forReviewOnly ? { ...data.input.message, operatorInformation: undefined } : data.input.message,
+    headers: data.body.headers, bodyText: data.body.text, subject: data.provenance.get(data.input.message.id)?.subject,
+    attachments: data.body.attachments, supportMessageIds: data.supportMessageIds });
+}
+
+/** Human revisions use the fresh stored notice and original messages, just like the automatic claim. */
+export async function intakePriorNoticeReview(tx: Pick<Tx, "select">, data: Awaited<ReturnType<typeof savIntakeSourceSnapshot>>, currentReaderEvent?: string) {
+  return noticeInSnapshot(data, true) ? priorAutomationReview(tx, data, currentReaderEvent) : undefined;
 }
 
 const unclaimedMessage = sql`(${savMessages.analysisStatus} = 'pending' and ${savMessages.analysisAttempts} = 0 and ${savMessages.analysisStartedAt} is null and ${savMessages.processedAt} is null
@@ -361,10 +373,9 @@ async function claimOrReserve(id: string, config: IntakeRuntimeConfig, now: Date
       await journal(tx, id, "source_invalid", { reason: SAV_INTAKE_INVALID_SOURCE, attemptsUnchanged: true });
       return null;
     }
-    const candidate = intakeAutomatedMessage({ message: data.input.message, headers: data.body.headers, bodyText: data.body.text,
-      subject: data.provenance.get(message.id)?.subject,
-      attachments: data.body.attachments, supportMessageIds: data.supportMessageIds });
-    const automation = candidate && await priorIntakeCompleteForAutomation(tx, data) ? candidate : null;
+    const candidate = noticeInSnapshot(data);
+    const priorRequestReview = await intakePriorNoticeReview(tx, data);
+    const automation = priorRequestReview ? noticeInSnapshot(data, true) : candidate;
     if (automation && (run.humanChoiceCiphertext || await intakeHasHumanDecision(run.messageId, tx))) return null;
     if(config.budgetProfile===SAV_INTAKE_OPERATIONAL_PROFILE) {
       // Budget deferral is not an analysis attempt. Never burn the two durable
@@ -427,7 +438,7 @@ async function claimOrReserve(id: string, config: IntakeRuntimeConfig, now: Date
       ...(recoveringRead ? { payloadCiphertext: encryptSavPayload(priorPayload) } : priorPayload.resumeProof ? { payloadCiphertext: encryptSavPayload(withoutIntakeResumeProof(priorPayload)) } : {}) }).where(eq(savIntakeRuns.id, id)).returning();
     await tx.update(savMessages).set({ analysisStatus: "intake_analysing" }).where(eq(savMessages.id, run.messageId));
     await journal(tx, id, recoveringRead ? "read_retry_claimed" : "claimed", { attempt: claimed.attempts, technicalAttempt: recoveringRead ? retry!.attempts : 0, sourceHash: data.sourceHash });
-    return { run: claimed, token, ...data, ...(automation ? { automation } : {}), ...(recoveringRead ? { recoveringRead: true as const } : {}) };
+    return { run: claimed, token, ...data, input: { ...data.input, ...(priorRequestReview ? { priorRequestReview } : {}) }, ...(automation ? { automation } : {}), ...(recoveringRead ? { recoveringRead: true as const } : {}) };
   });
 }
 async function assertLease(tx: Tx, lease: IntakeLease, config: IntakeRuntimeConfig, now: Date) {
@@ -438,7 +449,7 @@ async function assertLease(tx: Tx, lease: IntakeLease, config: IntakeRuntimeConf
     || run.humanChoiceCiphertext !== lease.run.humanChoiceCiphertext || !await intakeRunConfigurationBound(run, config, tx) || Date.parse(config.expiresAt) <= now.getTime() || message?.id !== run.messageId) return fail();
   const [uncommitted] = await tx.select({ id: savMessages.id }).from(savMessages).where(and(eq(savMessages.id, message.id), noCommittedExecution));
   const snapshot = await savIntakeSourceSnapshot(tx, message, now);
-  if (lease.automation && (run.humanChoiceCiphertext || await intakeHasHumanDecision(run.messageId, tx) || !await priorIntakeCompleteForAutomation(tx, snapshot))) return fail();
+  if (lease.automation && (run.humanChoiceCiphertext || await intakeHasHumanDecision(run.messageId, tx) || intakeRuntimeHash(await priorAutomationReview(tx, snapshot) ?? null) !== intakeRuntimeHash(lease.input.priorRequestReview ?? null))) return fail();
   if (!uncommitted || await readSavExternalCompletion(message, tx) || !intakeSourceMatches(snapshot, lease.sourceHash)) return fail();
   // A full pause during an analysis stops it before any further reservation or publication.
   await assertSavAgentAnalysisAllowed(tx);

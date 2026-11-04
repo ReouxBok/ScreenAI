@@ -214,6 +214,13 @@ export async function planSavIntake(
   }
   try {
     if (message.id !== input.latestInboundMessageId || message.direction !== "inbound") return context("history_incomplete");
+    if (input.priorRequestReview) {
+      for (const id of input.priorRequestReview.messageIds) {
+        const original = input.conversation.data.find(m => m.id === id && m.direction === "inbound" && m.threadId === message.threadId && m.id !== message.id);
+        if (original) addEvidence(`prior-open-${original.id}`, "customer_history", original.id, original, input.conversation.observedAt);
+      }
+      return context("history_incomplete", "request_scope_uncertain");
+    }
     if (!message.contentComplete) return context("classification_incomplete");
     const conversation = complete(input.conversation, z.array(intakeMessageSchema).max(50), "history_incomplete");
     if (new Set(conversation.map(m => m.id)).size !== conversation.length || conversation.some(m => m.threadId !== message.threadId

@@ -102,6 +102,8 @@ export type IntakeAdapters = {
 export type EngineInput = {
   message: IntakeMessage; latestInboundMessageId: string; conversation: ReadResult<IntakeMessage[]>;
   now: string; mode: "at_receipt" | "current"; identificationAttemptId: string;
+  /** The latest message is an automatic notice. These earlier inbound messages still need an operator to check their handling. */
+  priorRequestReview?: { messageIds: string[]; truncated: boolean };
   humanResolution?: {
     suppressOutbound?: true;
     choiceId: string; at: string; contactId?: string; equivalentContactIds?: string[];
