@@ -23,7 +23,7 @@ export type IntakeConsoleDetail = NonNullable<Awaited<ReturnType<typeof readInta
  * tools so both state the same blocked flag, decision, question and handoff. Pure. */
 export function intakeDossierView(data: IntakeConsoleDetail) {
   const current = data.current;
-  const blocked = !data.handledExternally && !data.humanHeld && data.diagnostics?.messageId === data.latestMessageId && data.diagnostics.attemptsExhausted !== false
+  const blocked = !data.handledExternally && !data.humanHeld && data.diagnostics?.messageId === data.latestMessageId && (data.diagnostics.attemptsExhausted !== false || Boolean(data.diagnostics.blockingMarker))
     && current && ["pending", "waiting"].includes(current.state) && !data.confirmedCurrent;
   const applicable = !data.handledExternally && !data.humanHeld && Boolean(data.confirmedCurrent || current && current.messageId === data.latestMessageId && current.sourceMatches);
   const plan = applicable ? current?.payload.plan : undefined, disposition = plan?.decision.disposition;
@@ -39,7 +39,12 @@ export function intakeDossierView(data: IntakeConsoleDetail) {
     && !data.choices.some(event => ["pending", "reading"].includes(event.state)));
   const currentEffects = Boolean(data.confirmedCurrent || applicable && data.progress?.runId === current?.id);
   const question = data.projection.view === "to_validate" || ["human_choice", "human_hold", "human_review"].includes(data.projection.status)
-    ? current?.payload.reason === "SAV_INTAKE_PRIOR_REQUEST_PENDING" ? "À quel ticket la demande antérieure a-t-elle été rattachée ?" : plan?.progress?.kind === "human_choice" ? "Choisir la bonne fiche ou le ticket qui recevra ce mail"
+    ? current?.payload.reason === "SAV_INTAKE_PRIOR_REQUEST_PENDING" ? "À quel ticket la demande antérieure a-t-elle été rattachée ?" : plan?.progress?.kind === "human_choice" ? ({
+      equivalent_contact_choice: "Quelle fiche confirmée correspond au client ?",
+      equivalent_ticket_choice: "Lequel des tickets proposés correspond à cette demande ?",
+      same_issue_uncertain: "Le problème est-il déjà couvert par un ticket du client ?",
+      request_scope_uncertain: "Quelle demande du client faut-il prendre en charge ?",
+    } as const)[plan.progress.questionCode]
       : disposition?.kind === "no_ticket" && disposition.nextAction === "supervised_investor" ? "Prendre en charge cette demande d’investissement"
         : disposition?.kind === "no_ticket" && disposition.nextAction === "supervised_partnership" ? "Prendre en charge cette demande de partenariat"
           : disposition?.kind === "no_ticket" && disposition.nextAction === "supervised_commercial" ? "Prendre en charge cette demande commerciale" : "Quelle suite l’équipe doit-elle donner à cette demande ?" : null;
@@ -47,7 +52,7 @@ export function intakeDossierView(data: IntakeConsoleDetail) {
   const assessed = (current?.payload.semantics?.records.find(r => r.method === "assessIssues")?.result as { tickets?: { ticketId: string; relation: string }[] } | undefined)?.tickets;
   const handoffReasons = [...(disposition?.kind === "collect_context" ? disposition.reasons : []), ...intakeRuntimeHandoffReasons(current?.payload)];
   const handoff = !data.handledExternally && !data.confirmedCurrent && (blocked || handoffReasons.length > 0 || question)
-    ? intakeHandoff({ reasons: handoffReasons, blockedCause: blocked ? "attempts_exhausted" : null, assessments: assessed, judgement }) : null;
+    ? intakeHandoff({ reasons: handoffReasons, blockedCause: blocked ? data.diagnostics?.blockingMarker ?? "attempts_exhausted" : null, assessments: assessed, judgement }) : null;
   return { current, blocked, applicable, plan, disposition, historicalPlan, contacts, tickets, target, historicalTarget, dirty, canCorrect, currentEffects, question, handoff };
 }
 /** Which operator actions the dossier page offers to this staff member, with the page's own

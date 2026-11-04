@@ -1,4 +1,5 @@
 import "server-only";
+import { intakeForwardNeedsOriginal } from "./message";
 import { decryptSavPayload } from "../crypto";
 import { releaseLegacyAiPauses } from "./legacy-pause";
 import { intakeOtherQualificationFresh } from "./other-routing";
@@ -84,14 +85,14 @@ async function analyseSavIntakeRuntimeWithinBudget(runId: string, config: Intake
     // V1 cost filter, replay and resume included: an automation proven by the stored Gmail headers
     // never reaches a reservation, a CRM or Gmail read, or a model call. The disposition depends on the notice kind.
     const automation = lease.automation;
-    if (automation) {
-      traces.push({ phase: "automation_gate", ...automation, modelCalled: false });
-      const policy = automation.kind === "automatic_reply"
+    if (automation || intakeForwardNeedsOriginal(lease.input.message)) {
+      traces.push(automation ? { phase: "automation_gate", ...automation, modelCalled: false } : { phase: "forwarded_origin_gate", modelCalled: false });
+      const policy = automation?.kind === "automatic_reply"
         ? { ...config.policy, automatedReply: { messageId: lease.run.messageId, sourceHash: lease.sourceHash, signals: automation.signals } }
         : config.policy;
       payload.plan = await planSavIntake(lease.input, intakeAutomationAdapters(lease.input.message.id), policy, { timeoutMs: 10_000 }, () => new Date());
       assertSavIntakeObservation(payload.plan);
-      payload.reason = lease.input.priorRequestReview ? "SAV_INTAKE_PRIOR_REQUEST_PENDING" : automation.code;
+      payload.reason = lease.input.priorRequestReview ? "SAV_INTAKE_PRIOR_REQUEST_PENDING" : automation?.code ?? "SAV_INTAKE_FORWARDED_ORIGIN_UNVERIFIED";
       const state = payload.plan.decision.disposition.kind === "collect_context" && payload.plan.progress.kind !== "human_choice" ? "waiting" : "observed";
       if (lease.recoveringRead) { payload.readRecovery!.state = state === "waiting" ? "invalidated" : "complete"; payload.readRecovery!.cache = []; }
       else delete payload.readRecovery;
@@ -103,12 +104,14 @@ async function analyseSavIntakeRuntimeWithinBudget(runId: string, config: Intake
       protectedContext: lease.input.conversation.data.length > 1 }, readSavOtherConfiguration(env().SAV_OTHER_OBSERVATION_RULES_JSON).registry);
     // This is a candidate only. It grants no routing permission or qualifiedOther.
     if (other) traces.push({ otherCandidate: other, qualified: false });
-    let qualifiedOther: Awaited<ReturnType<typeof qualifyRuntimeOther>> = null;
+    let otherEvaluation: Awaited<ReturnType<typeof qualifyRuntimeOther>> = { state: "catalogue_unavailable" };
     if(other || env().SAV_INTAKE_OTHER_RULES_JSON) {
-      try { qualifiedOther=await qualifyRuntimeOther(lease,live,env(),deps.authenticateOther); }
-      catch { traces.push({otherQualification:"unavailable",qualified:false}); await live(); }
+      try { otherEvaluation=await qualifyRuntimeOther(lease,live,env(),deps.authenticateOther); }
+      catch { await live(); otherEvaluation = { state: "evidence_unavailable" }; }
     }
+    const qualifiedOther = otherEvaluation.state === "qualified" ? otherEvaluation.qualification : null;
     if(qualifiedOther) payload.other=qualifiedOther;
+    traces.push({otherQualification:otherEvaluation.state, qualified:Boolean(qualifiedOther)});
     await writeCheckpoint();
     const retryOrdinal = await intakeTransientRetries(lease.run.messageId);
     dispatcher = createIntakeModelDispatcher({ config, live, retryOrdinal, reserve: (hash, size) => reserveSavIntakeCall(lease, config, hash, new Date(), size), preflight: (hashes, sizes) => assertSavIntakeCallPlan(lease.run.messageId, config, hashes, sizes), signal: controller.signal, env, network });
@@ -162,7 +165,8 @@ async function analyseSavIntakeRuntimeWithinBudget(runId: string, config: Intake
       semanticFailureReason = failure.errorCode;
       traces.push({ ...failure, phase: "accepted_semantics", accepted: false }); checkpoint();
     });
-    payload.plan = await withSavAiBudget(() => planSavIntake(lease.input, { ...reads, ...semantic }, qualifiedOther ? {...config.policy,qualifiedOther:{...(qualifiedOther.family==="authenticated_newsletter"?{family:"authenticated_newsletter" as const}:{}),resource:qualifiedOther.resource,evidenceSource:"private_rule"}} : config.policy, { timeoutMs: 10_000 }, () => new Date()));
+    payload.plan = await withSavAiBudget(() => planSavIntake(lease.input, { ...reads, ...semantic }, qualifiedOther ? {...config.policy,qualifiedOther:{...(qualifiedOther.family==="authenticated_newsletter"?{family:"authenticated_newsletter" as const}:{}),resource:qualifiedOther.resource,evidenceSource:"private_rule"}} : { ...config.policy,
+      otherRuleStatus: otherEvaluation.state === "qualified" ? undefined : otherEvaluation.state }, { timeoutMs: 10_000 }, () => new Date()));
     assertSavIntakeObservation(payload.plan);
     payload.crmEvidence = intakeCrmEvidenceFingerprint(payload.plan, recorded.snapshots());
     // Cancellation may finish after the pure planner's per-call timeout.

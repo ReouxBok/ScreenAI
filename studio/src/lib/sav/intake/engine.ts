@@ -228,6 +228,7 @@ export async function planSavIntake(
       || Date.parse(m.receivedAt) > Date.parse(message.receivedAt))) return context("history_incomplete");
     if (!message.currentText.trim()) {
       for (const prior of conversation) addEvidence(`context-${prior.id}`, "customer_history", prior.id, prior, input.conversation.observedAt);
+      if (message.forwardedQuoteOnly) return context("forwarded_origin_unverified");
       return context("classification_incomplete", "request_scope_uncertain");
     }
     const auto = policy.automatedReply;
@@ -262,8 +263,17 @@ export async function planSavIntake(
     // Preserve it for a targeted operator question if the producer omitted it.
     if (/^(?:ça|ca|cela)\s+ne\s+(?:fonctionne|marche)\s+(?:pas|plus)[.!\s]*$/iu.test(message.currentText.trim().split("\n")[0])
       && !analysis.requests.some(r => ["support", "finance", "cancellation"].includes(r.kind))) {
-      classification = "support"; requests = [{ id: "written-support", kind: "support", evidenceIds: [current] }];
-      return context("classification_incomplete", "request_scope_uncertain");
+      // A standalone authored malfunction is itself a support request. Keep the
+      // existing guarded CRM path for selection, creation, and association.
+      // Extra text, another message, an attachment, or competing intent still
+      // needs investigation before inferring scope from a single sentence.
+      const standalone = message.standaloneAuthoredLine === true && !message.currentText.trim().includes("\n") && !message.attachmentInputs?.length
+        && !message.unreadAttachments?.length && !continuation && !input.humanResolution
+        && conversation.every(row => row.id === message.id)
+        && analysis.requests.every(row => ["unknown", "other", "acknowledgement"].includes(row.kind));
+      if (!standalone) return context("classification_incomplete", "request_scope_uncertain");
+      analysis.requests = [{ id: "written-support", kind: "support", currentMessageId: message.id }];
+      analysis.ticketSummary = { title: "Dysfonctionnement signalé", description: message.currentText, requestIds: ["written-support"] };
     }
     analysis.requests.sort((a, b) => a.id.localeCompare(b.id));
     requests = analysis.requests.map(({ id, kind, originMessageId }) => ({ id, kind,
@@ -317,9 +327,13 @@ export async function planSavIntake(
       let ruleId: string | undefined;
       if (outside === "other") {
         // Accepted semantic classification is not authority to hide a mail.
-        // This is an explicit rule decision, not a transient model failure to
-        // retry with the exact same cached output until attempts are exhausted.
-        if (!policy.qualifiedOther) return context("private_resource_unavailable", "request_scope_uncertain");
+        // Block this version until the missing policy is supplied. A missing
+        // resource is not a customer classification question.
+        if (!policy.qualifiedOther) {
+          if (policy.otherRuleStatus === "not_applicable") return context("other_rule_not_applicable", "request_scope_uncertain");
+          if (policy.otherRuleStatus === "evidence_unavailable") return context("other_evidence_unavailable");
+          return context("private_resource_unavailable");
+        }
         const resource = savIntakePrivateResourceSchema.parse(policy.qualifiedOther.resource);
         ruleId = addEvidence("classification-rule", policy.qualifiedOther.evidenceSource, resource.resourceId, resource);
       }

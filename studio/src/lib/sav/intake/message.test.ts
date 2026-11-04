@@ -106,3 +106,10 @@ it("reads a long complete mail in one call with its full provenance, never slici
     const sent = call.mock.calls[0][0].body.contents[0].parts[0].text;
     expect(sent.split("quoted").length - 1).toBeGreaterThanOrEqual(14130);
 });
+
+it("retains the absence of an attributable request on a forwarded-only mail, without trusting its quoted From", () => {
+    const body = "---------- Forwarded message ---------\nDe : Example <person@example.invalid>\n\nMy login is broken";
+    expect(prepareSavIntakeMessage({ ...input, subject: "Fwd: Broken login", body }).message).toMatchObject({ currentText: "", forwardedQuoteOnly: true });
+    expect(prepareSavIntakeMessage({ ...input, subject: "Fwd: Broken login", body: "Independent request\n" + body }).message.forwardedQuoteOnly).toBeUndefined();
+    expect(prepareSavIntakeMessage({ ...input, subject: "Re: My previous mail", body }).message.forwardedQuoteOnly).toBeUndefined();
+});

@@ -88,7 +88,7 @@ const needsContext = z.object({
     "classification_incomplete", "contact_lookup_failed", "contact_lookup_incomplete", "contact_ambiguous",
     "association_incomplete", "ticket_search_incomplete", "history_incomplete", "same_issue_unresolved",
     "ticket_creation_date_unknown", "ticket_closure_date_unknown", "ticket_stage_unknown", "ticket_owner_unknown",
-    "private_resource_unavailable",
+    "private_resource_unavailable", "forwarded_origin_unverified", "other_rule_not_applicable", "other_evidence_unavailable",
   ])).min(1).max(15),
   evidenceIds: refs,
 }).strict();

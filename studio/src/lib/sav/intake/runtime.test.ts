@@ -215,6 +215,9 @@ it("connects the real stored mail to semantic readers/CRM and keeps effect steps
   const current = await readSavIntakeCurrent(threadId, config); expect(current?.payload.plan?.decision.classification).toBe("support");
   expect(current?.payload.plan?.decision.disposition).toMatchObject({ kind: "collect_context", reasons: ["private_resource_unavailable"] });
   expect(network).toHaveBeenCalledTimes(3); expect((await readSavIntakeBudget(config)).callCount).toBe(1); expect(await f.db.select().from(savActions)).toHaveLength(0);
+  expect(await claimSavIntakeRun(id!, config)).toBeNull();
+  expect(await pendingSavIntakeRuns(config)).not.toContainEqual({ id });
+  expect((await f.db.select().from(savIntakeJournal).where(eq(savIntakeJournal.runId, id!))).some(row => row.kind === "private_resource_unavailable")).toBe(true);
   const m = (await f.db.select().from(savMessages).where(eq(savMessages.id, messageId)))[0]; expect(m.processedAt).toBeNull(); expect(m.analysisStatus).toBe("intake_waiting");
   expect(decryptSavPayload((await f.db.select().from(savIntakeModelCalls))[0].payloadCiphertext)).toHaveProperty("metadata");
 });
@@ -402,8 +405,8 @@ it("5 USD deducts settled and uncertain usage, never resets the ledger, and the3
   // Each row costs one full reservation (0.817152 USD): the maximum a single settled call can charge.
   const fill=(n:number,state:string,createdAt=new Date())=>Array.from({length:n},(_,i)=>({messageKey:intakeRuntimeHash(`fill-${state}-${createdAt.getTime()}-${i}`),requestHash:intakeRuntimeHash(`req-${state}-${createdAt.getTime()}-${i}`),state,reservedNanoUsd:817152000,chargedNanoUsd:817152000,
     payloadCiphertext:encryptSavPayload({metadata:{inputTokens:1048576,outputTokens:8192,thoughtTokens:0,totalTokens:1056768}}),createdAt}));
-  // 4.09 USD settled today + one old uncertain reservation of another message: above 3 USD, within 5 USD.
-  await f.db.insert(savIntakeModelCalls).values([...fill(5,"settled"),...fill(1,"uncertain",new Date(Date.now()-40*86400000))]);
+  // 4.09 USD settled today + one current-day uncertain reservation of another message: above 3 USD, within 5 USD.
+  await f.db.insert(savIntakeModelCalls).values([...fill(5,"settled"),...fill(1,"uncertain")]);
   expect(await readSavIntakeBudget(atThree)).toMatchObject({chargedNanoUsd:4902912000,remainingNanoUsd:0,uncertain:true});
   expect(await readSavIntakeBudget(raised)).toMatchObject({chargedNanoUsd:4902912000,remainingNanoUsd:97088000,lifetimeCallCount:6});
   // Remaining 0.097 USD < one 0.817 USD reservation: deferred, no attempt consumed, no reset of history.
@@ -464,7 +467,7 @@ it("one provider timeout reserves its full cost beyond30days, blocks its message
   await f.db.update(savIntakeModelCalls).set({state:"uncertain",createdAt:new Date(Date.now()-31*86400000)}).where(eq(savIntakeModelCalls.id,a.id));
   threadId=(await f.db.insert(savThreads).values({mailboxId,gmailThreadId:randomUUID(),customerEmail:"other@example.invalid"}).returning())[0].id;messageId=(await message()).id;
   const second=await lease(),b=await reserveSavIntakeCall(second,config,"second-b");
-  expect(b.cached).toBeNull();expect((await readSavIntakeBudget(config))).toMatchObject({chargedNanoUsd:1634304000,rollingChargedNanoUsd:1634304000,lifetimeCallCount:2,uncertain:true});
+  expect(b.cached).toBeNull();expect((await readSavIntakeBudget(config))).toMatchObject({chargedNanoUsd:817152000,callCount:1,rollingChargedNanoUsd:1634304000,lifetimeCallCount:2,uncertain:true});
   await expect(reserveSavIntakeCall(first,config,"retry-a")).rejects.toThrow("USAGE_UNCERTAIN");
   expect((await readSavIntakeBudget({...config,maxCalls:299}))).toHaveProperty("lifetimeCallCount",2);
 });
@@ -871,7 +874,22 @@ it.each(["sender", "recipients"])("isolates invalid address metadata (%s) before
   expect(await f.db.select().from(savIntakeEffects)).toHaveLength(0);
 });
 
-it("finishes an accepted Other investigation as an explicit rule choice instead of consuming a second automatic analysis", async () => {
+it.each(["absent","invalid","expired","mismatch","protected","incomplete_evidence","unavailable_gmail","negative_auth"] as const)("routes Other by per-mail qualification outcome without another analysis (%s)", async scenario => {
+  const hash=(s:string)=>createHash("sha256").update(s).digest("hex");
+  const [msg]=await f.db.select().from(savMessages).where(eq(savMessages.id,messageId));
+  const body=decryptSavPayload<{ text:string }>(msg.bodyCiphertext);
+  const rules=[{id:"synthetic-rule",family:"authenticated_newsletter",mailboxId,subjectSha256:hash(msg.subject),
+    bodySha256:hash(scenario==="mismatch"?"different":body.text)}];
+  if(scenario!=="absent") Object.assign(environment,{SAV_INTAKE_OTHER_RULES_JSON:scenario==="invalid"?"{invalid":JSON.stringify({version:1,
+    approvedBy:"synthetic",approvedAt:new Date(Date.now()-60000).toISOString(),expiresAt:new Date(Date.now()+(scenario==="expired"?-1:60000)).toISOString(),
+    resource:{resourceId:"catalogue",revisionId:"1",sha256:hash(JSON.stringify(rules))},rules})});
+  if(scenario==="protected") await f.db.update(savThreads).set({hubspotTicketId:"1234"}).where(eq(savThreads.id,threadId));
+  if(["unavailable_gmail","negative_auth"].includes(scenario)) {
+    const original=decryptSavPayload<Record<string,unknown>>(msg.bodyCiphertext);
+    await f.db.update(savMessages).set({bodyCiphertext:encryptSavPayload({...original,attachmentInventory:{complete:true,limits:[]}})}).where(eq(savMessages.id,messageId));
+  }
+  config = savIntakeRuntimeConfig(environment)!;
+  const authenticateOther=vi.fn(async()=>{if(scenario==="unavailable_gmail")throw Error("SYN_UNAVAILABLE");return null;});
   const id = (await enqueueSavIntakeMessage(messageId, config))!;
   const network = vi.fn<typeof fetch>(async (url, init) => {
     expect(String(url)).toContain("generativelanguage.googleapis.com");
@@ -880,8 +898,13 @@ it("finishes an accepted Other investigation as an explicit rule choice instead 
       requests: [{ id: "noise", kind: "other", currentMessageId: messageId, quoteId: data.citationCatalogue[0].id }] }) }] } }],
       usageMetadata: { promptTokenCount: 10, candidatesTokenCount: 10, thoughtsTokenCount: 0, totalTokenCount: 20 } });
   });
-  expect(await analyseSavIntakeRuntime(id, config, { env: () => environment, network })).toMatchObject({ state: "observed" });
-  expect((await readSavIntakeCurrent(threadId, config))?.payload.plan?.progress).toMatchObject({ kind: "human_choice", view: "to_validate" });
+  const human=["mismatch","protected","negative_auth"].includes(scenario);
+  expect(await analyseSavIntakeRuntime(id, config, { env: () => environment, network, authenticateOther })).toMatchObject({ state: human?"observed":"waiting" });
+  const plan=(await readSavIntakeCurrent(threadId, config))?.payload.plan;
+  expect(plan?.decision.disposition).toMatchObject({kind:"collect_context",reasons:[human?"other_rule_not_applicable":
+    scenario==="incomplete_evidence" || scenario==="unavailable_gmail"?"other_evidence_unavailable":"private_resource_unavailable"]});
+  expect(plan?.progress).toMatchObject(human?{kind:"human_choice",view:"to_validate"}:{kind:"processing",view:null});
+  expect(authenticateOther).toHaveBeenCalledTimes(["unavailable_gmail","negative_auth"].includes(scenario)?1:0);
   expect(await pendingSavIntakeRuns(config)).toHaveLength(0);
   expect(network).toHaveBeenCalledTimes(1);
   expect(await f.db.select().from(savActions)).toHaveLength(0);
@@ -1225,4 +1248,21 @@ it("two fully read, plausible tickets leave a human choice and a second wake spe
   expect(await analyse()).toMatchObject({ skipped: "not_claimed" });
   expect(modelCalls).toBe(2);
   expect(await f.db.select().from(savActions)).toHaveLength(0);
+});
+
+it("parks a quote-only forward with a source dependency even when the operational cap cannot admit an AI call", async () => {
+  environment.SAV_INTAKE_RUNTIME_CONFIG = JSON.stringify({ ...JSON.parse(environment.SAV_INTAKE_RUNTIME_CONFIG!),
+    budgetProfile: "operational_utc_v1", maxNanoUsd: 1, maxRollingNanoUsd: 90_000_000_000, maxCalls: 300 });
+  config = savIntakeRuntimeConfig(environment)!;
+  const m = await message({ receivedAt: new Date(Date.now()+1), body: "---------- Forwarded message ---------\nDe : Customer <other@example.invalid>\nObjet : My request\n\nI cannot connect." });
+  await f.db.update(savMessages).set({ subject: "Fwd: My request" }).where(eq(savMessages.id,m.id));
+  const id=(await enqueueSavIntakeMessage(m.id,config))!, network=vi.fn(async()=>{throw Error("NETWORK_FORBIDDEN")});
+  expect((await analyseSavIntakeRuntime(id,config,{env:()=>environment,network})).state).toBe("waiting");
+  const current=await readSavIntakeCurrent(threadId,config);
+  expect(current?.payload.plan?.decision.disposition).toMatchObject({kind:"collect_context",reasons:expect.arrayContaining(["forwarded_origin_unverified"])});
+  expect(current?.payload.plan?.progress).toMatchObject({kind:"processing",view:null});
+  expect(await pendingSavIntakeRuns(config)).not.toContainEqual({id});
+  expect(await claimSavIntakeRun(id,config)).toBeNull();
+  expect(await readIntakeRunDiagnostics(threadId)).toMatchObject({blockingMarker:"forwarded_origin_unverified",attemptsExhausted:false});
+  expect(network).not.toHaveBeenCalled(); expect(await f.db.select().from(savActions)).toHaveLength(0);
 });

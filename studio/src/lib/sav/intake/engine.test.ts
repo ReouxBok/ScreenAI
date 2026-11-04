@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import { describe, expect, it, vi } from "vitest";
 import { intakeSelectableTicketIds, planSavIntake } from "./engine";
+import { prepareSavIntakeMessage } from "./message";
 import { projectSavIntakeProgress } from "./progress";
 import type { EngineInput, EnginePolicy, IntakeAdapters, IntakeContact, IntakePlan, IntakeTicket, MessageAnalysis, ReadResult } from "./engine-types";
 import type { SavIntakeStepReceipt } from "./contract";
@@ -426,20 +427,39 @@ it.each(["no-episode","unconfirmed","different-sender","no-declaration","wrong-s
  reason(await f.run(),"history_incomplete");expect(f.calls.some(c=>c.startsWith("lookup:"))).toBe(false);
 });
 
-it("routes an accepted Other without an approved rule to an explicit rule decision, never a technical retry", async () => {
+it("keeps an accepted Other with a missing approved rule in technical processing", async () => {
   const f = fixture(["other"]);
   delete f.policy.qualifiedOther;
   const plan = await f.run();
   expect(plan.decision.classification).toBe("other");
   expect(plan.decision.disposition).toMatchObject({ kind: "collect_context", reasons: ["private_resource_unavailable"] });
-  expect(plan.progress).toMatchObject({ kind: "human_choice", classification: "unknown", questionCode: "request_scope_uncertain", view: "to_validate" });
+  expect(plan.progress).toMatchObject({ kind: "processing", phase: "context", view: null });
   expect(plan.steps).toHaveLength(0);
 });
 
 // Synthetic regressions from the five-waiting recovery brief; no real message data.
 it("preserves an original subject-only malfunction even if the producer emits Other", async () => {
-  const f=fixture(["other"]); f.input.message.currentText="ça ne fonctionne pas";
-  const p=await f.run(); expect(p.decision.classification).toBe("support");expect(p.decision.requests[0].kind).toBe("support");expect(p.progress.kind).toBe("human_choice");expect(p.progress.view).toBe("to_validate");
+  const f=fixture(["other"]);
+  f.input.message = prepareSavIntakeMessage({...f.input.message, subject:"ça ne fonctionne pas",body:"",bodyComplete:true,unresolvedAttachments:false}).message;
+  const p=await f.run(); expect(target(p).target.operation).toBe("create");
+ expect(p.newTicket).toMatchObject({ description: "ça ne fonctionne pas", owner: "leave_unassigned" });
+ f.tickets.push(ticket()); expect(target(await f.run()).target).toMatchObject({ operation: "link", ticketId: "201" });
+ f.adapters.ticketHistory=async()=>({...read([]),status:"partial"});reason(await f.run(),"history_incomplete");
+ f.input.message.currentText += "\nDemande secondaire à conserver";expect((await f.run()).progress.kind).toBe("human_choice");
+});
+it.each(["Fwd: Demande client", "Re: Question", ""])("never promotes a malfunction annotation when another party supplied the original (%s)", async subject => {
+  const f = fixture(["unknown"]);
+  const body = "ça ne marche pas\n---------- Forwarded message ---------\nDe : Client <other@example.invalid>\n\nJe demande le remboursement.";
+  const prepared = prepareSavIntakeMessage({ ...f.input.message, subject, body, bodyComplete: true, unresolvedAttachments: false });
+  expect(prepared.provenance.quotedText).toContain("remboursement");expect(prepared.message.standaloneAuthoredLine).toBeUndefined();
+  f.input.message = prepared.message;
+  const result = await f.run(); expect(result.decision.classification).toBe("unknown");expect(result.steps).toEqual([]);
+  expect(f.calls.some(x => x.startsWith("lookup:"))).toBe(false);
+});
+it("an inherited reply subject alone is not proof of a standalone original", async () => {
+  const f = fixture(["unknown"]);
+  f.input.message = prepareSavIntakeMessage({...f.input.message, subject:"Re: Demande",body:"ça ne marche pas",bodyComplete:true,unresolvedAttachments:false}).message;
+  expect(f.input.message.standaloneAuthoredLine).toBeUndefined();expect((await f.run()).steps).toEqual([]);
 });
 it("asks a precise question on an empty reply while retaining conversation evidence",async()=>{
  const f=fixture([]);f.input.message.currentText="";f.input.conversation=read([{...f.input.message,id:otherMid,currentText:"Ancien problème synthétique",receivedAt:"2026-10-19T10:00:00.000Z"}]);

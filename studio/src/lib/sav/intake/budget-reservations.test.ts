@@ -151,8 +151,8 @@ it.each([[400, "settled", 0], [429, "settled", 0], [503, "settled", 0], [401, "u
 });
 it("BUDGET-RES uncertain reservations that alone block the next analysis are named in the deferral, never released", async () => {
   operational(3_000_000_000);
-  // Three old unknown costs of other dossiers: 2.45 USD of a 3 USD daily cap.
-  await f.db.insert(savIntakeModelCalls).values(legacy(3, "uncertain", new Date(Date.now() - 5 * 86400000)));
+  // Three unknown costs dispatched today on other dossiers: 2.45 USD of the daily cap.
+  await f.db.insert(savIntakeModelCalls).values(legacy(3, "uncertain", new Date()));
   const id = (await enqueueSavIntakeMessage(messageId, config))!;
   expect(await claimSavIntakeRun(id, config)).toBeNull();
   const budget = await readSavIntakeBudget(config);

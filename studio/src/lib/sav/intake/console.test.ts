@@ -350,11 +350,11 @@ it("blocked dossiers stay in processing, are counted and carry their cause", asy
     const [r]=await db.db.insert(savIntakeRuns).values({threadId:t.id,messageId:m.id,version:1,state:"waiting",attempts:0,configHash:"a".repeat(64),policyHash:"b".repeat(64),payloadCiphertext:encryptSavPayload({}),createdAt:updatedAt,updatedAt}).returning();
     if(marker)await db.db.insert(savIntakeJournal).values({runId:r.id,kind:marker,payloadCiphertext:encryptSavPayload({})});
   };
-  await dossier("exhausted","attempts_exhausted"); await dossier("input","deterministic_block"); await dossier("stale",undefined,old); await dossier("fresh");
+  await dossier("exhausted","attempts_exhausted"); await dossier("input","deterministic_block"); await dossier("stale",undefined,old); await dossier("fresh"); await dossier("resource","private_resource_unavailable");
   const list=await listIntakeConsole({view:"processing",search:"Blocked"});
-  expect(list.total).toBe(4);
-  expect(list.counts.blocked).toBe(3);
-  expect(Object.fromEntries(list.rows.map(row=>[row.subject,row.blockedCause]))).toEqual({"Blocked exhausted":"attempts_exhausted","Blocked input":"input_invalid","Blocked stale":"technical_wait","Blocked fresh":null});
+  expect(list.total).toBe(5);
+  expect(list.counts.blocked).toBe(4);
+  expect(Object.fromEntries(list.rows.map(row=>[row.subject,row.blockedCause]))).toEqual({"Blocked resource":"private_resource_unavailable","Blocked exhausted":"attempts_exhausted","Blocked input":"input_invalid","Blocked stale":"technical_wait","Blocked fresh":null});
   // SAV-75: under a full pause the stale wait is expected, named, and leaves the incident counter;
   // durable markers stay incidents. After a resume the threshold restarts from the resume.
   const { savAgentPauseKey, SAV_AGENT_PAUSE_REVISION } = await import("./agent-pause");
@@ -364,11 +364,11 @@ it("blocked dossiers stay in processing, are counted and carry their cause", asy
   try {
     await setPause("fully_paused", new Date(Date.now()-3600000));
     const paused=await listIntakeConsole({view:"processing",search:"Blocked"});
-    expect(paused.counts.blocked).toBe(2);
-    expect(Object.fromEntries(paused.rows.map(row=>[row.subject,row.blockedCause]))).toEqual({"Blocked exhausted":"attempts_exhausted","Blocked input":"input_invalid","Blocked stale":"agent_paused","Blocked fresh":"agent_paused"});
+    expect(paused.counts.blocked).toBe(3);
+    expect(Object.fromEntries(paused.rows.map(row=>[row.subject,row.blockedCause]))).toEqual({"Blocked resource":"private_resource_unavailable","Blocked exhausted":"attempts_exhausted","Blocked input":"input_invalid","Blocked stale":"agent_paused","Blocked fresh":"agent_paused"});
     await setPause("running", new Date(Date.now()-60000));
     const resumed=await listIntakeConsole({view:"processing",search:"Blocked"});
-    expect(resumed.counts.blocked).toBe(2); expect(resumed.rows.find(row=>row.subject==="Blocked stale")?.blockedCause).toBeNull();
+    expect(resumed.counts.blocked).toBe(3); expect(resumed.rows.find(row=>row.subject==="Blocked stale")?.blockedCause).toBeNull();
   } finally { await db.client.exec("DELETE FROM sav.sync_state WHERE key LIKE 'sav-agent-pause%'"); }
 });
 it("OFF consultation makes no provider calls; projection absent never queries 0040/41 tables", async () => {
@@ -546,6 +546,13 @@ it("the missing-contact view requires a sent-and-verified exact private template
   const execution=(await admitIntakeExecution(runId,options))!;expect((await executeIntakePass(execution.id,options)).state).toBe("confirmed");
   await projectIntakeThread(threadId);expect((await listIntakeConsole({view:"missing_contact"})).total).toBe(1);
   expect(await ensureIntakeObservations()).toEqual({created:0});expect(Object.keys(p.sent)).toHaveLength(1);
+  await db.db.update(savMailboxes).set({email:"contact@limova.ai"}).where(eq(savMailboxes.id,mailboxId));
+  const readEnv={...environment,SAV_INTAKE_GMAIL_MARK_READ:"on"}, gmail=vi.fn();
+  expect(await syncHandledIntakeGmailRead(messageId,{env:()=>readEnv,gmail})).toEqual({skipped:"not_handled"});
+  expect(gmail).not.toHaveBeenCalled();
+  for(const [key,value] of Object.entries(readEnv)) vi.stubEnv(key,value);
+  expect(await reconcileHandledIntakeGmailRead(5)).toMatchObject({checked:0,confirmed:0});
+  expect(await db.db.select().from(auditLogs).where(eq(auditLogs.action,SAV_INTAKE_GMAIL_READ))).toHaveLength(0);
 });
 async function supportClosedWithHumanEvidence(priorFinance=false) {
   vi.stubEnv("SAV_RELEASE_STAGE","v0");
@@ -1504,6 +1511,17 @@ describe("SAV-42 C: a confirmed current acknowledgement is marked read once", ()
     expect(await reconcileHandledIntakeGmailRead(5)).toMatchObject({ checked: 1 });
     const failures = await db.db.select().from(auditLogs).where(eq(auditLogs.action, "sav_intake_gmail_read_failed"));
     expect(failures.map(f => f.entityId)).toEqual([messageId]);
+  });
+  it("keeps pending human choices unread in direct and recovery paths until a real disposition exists", async () => {
+    await readable();
+    const plan = await observed(true);
+    expect(plan.progress).toMatchObject({ kind:"human_choice", view:"to_validate" });
+    await projectIntakeThread(threadId);
+    const g=provider();
+    expect(await syncHandledIntakeGmailRead(messageId,deps(g.gmail))).toEqual({skipped:"not_handled"});
+    for (const [key,value] of Object.entries({...environment,SAV_INTAKE_GMAIL_MARK_READ:"on"})) vi.stubEnv(key,value);
+    expect(await reconcileHandledIntakeGmailRead(5)).toMatchObject({checked:0,confirmed:0});
+    expect(g.state).toMatchObject({writes:0,unread:true});expect(mutationsSent()).toHaveLength(0);
   });
   it("is not marked read once a newer inbound message supersedes it", async () => {
     await readable(); await acknowledged();

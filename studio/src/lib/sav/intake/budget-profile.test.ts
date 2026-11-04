@@ -1,5 +1,5 @@
 import { it, expect, vi, afterEach } from "vitest";
-import { intakeBudgetUsage, intakeAdmissionUsage, intakeOperationalTermValid, SAV_INTAKE_OPERATIONAL_PROFILE } from "./budget-profile";
+import { intakeBudgetUsage, intakeBlockedByUnsettled, intakeAdmissionUsage, intakeOperationalTermValid, SAV_INTAKE_OPERATIONAL_PROFILE } from "./budget-profile";
 const at=new Date("2026-10-21T00:00:00.000Z"),day=86400000;
 const config={budgetProfile:SAV_INTAKE_OPERATIONAL_PROFILE,maxNanoUsd:3000000000,maxRollingNanoUsd:90000000000,maxCalls:300};
 const row=(ago:number,state="settled",chargedNanoUsd=100)=>({createdAt:new Date(at.getTime()-ago),state,chargedNanoUsd});
@@ -9,10 +9,21 @@ it("UTC midnight excludes settled prior-day costs, including the exact rolling30
   const u=intakeBudgetUsage([row(1),row(0),row(30*day),row(30*day+1)],config,at);
   expect(u).toMatchObject({chargedNanoUsd:100,callCount:1,rollingChargedNanoUsd:300,lifetimeCallCount:4});
 });
-it("unknown reservations older than30days remain fully charged in both current margins",()=>{
+it("keeps yesterday’s uncertain and in-flight costs in the rolling ceiling even beyond 30 days",()=>{
   vi.useFakeTimers();vi.setSystemTime(at);
-  const u=intakeBudgetUsage([row(31*day,"uncertain",817152000),row(100*day,"dispatched",817152000),row(0)],config,at);
-  expect(u.chargedNanoUsd).toBe(1634304100);expect(u.rollingChargedNanoUsd).toBe(u.chargedNanoUsd);expect(u.callCount).toBe(3);
+  const rows = [row(1,"uncertain",300),row(31*day,"uncertain",400),row(100*day,"dispatched",500),row(0,"uncertain",100),row(0,"settled",200)];
+  const u=intakeBudgetUsage(rows,config,at);
+  expect(u).toMatchObject({chargedNanoUsd:300,callCount:2,dailyUnsettledNanoUsd:100,dailyUnsettledCallCount:1,
+    rollingChargedNanoUsd:1500,lifetimeChargedNanoUsd:1500,inFlightNanoUsd:500,uncertainNanoUsd:800});
+  // Same rows and same time, qualification stays cumulative.
+  expect(intakeBudgetUsage(rows,{maxNanoUsd:2000,maxCalls:30},at)).toMatchObject({chargedNanoUsd:1500,callCount:5,dailyUnsettledNanoUsd:1300});
+});
+it("attributes a budget block only to reservations actually counted in that window",()=>{
+  vi.useFakeTimers();vi.setSystemTime(at);
+  const rows=[row(1,"uncertain",900),row(0,"settled",900)];
+  const calc=(daily:number,rolling:number)=>intakeBudgetUsage(rows,{...config,maxNanoUsd:daily,maxRollingNanoUsd:rolling},at);
+  expect(intakeBlockedByUnsettled(calc(1000,5000),200)).toBe(false); // settled today alone blocks
+  expect(intakeBlockedByUnsettled(calc(1500,1900),200)).toBe(true); // yesterday’s uncertainty blocks rolling
 });
 it("config/profile changes never reset the shared ledger and legacy qualification stays cumulative",()=>{
   vi.useFakeTimers();vi.setSystemTime(at);

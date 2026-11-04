@@ -22,7 +22,7 @@ import { requireDb } from "@/db";
 import { auditLogs, savActions, savMessages, savThreads, savIntakeRuns, savIntakeJournal, savIntakeModelCalls, savIntakeHumanEvents, savIntakeIdentityEpisodes, savIntakeEffects, savIntakeExecutions } from "@/db/schema";
 import { decryptSavPayload, encryptSavPayload, savContentHash } from "../crypto";
 import { savAttachmentInventorySchema } from "../attachment-contract";
-import { prepareSavIntakeMessage } from "./message";
+import { prepareSavIntakeMessage, intakeForwardNeedsOriginal } from "./message";
 import { invalidIntakeAddressMetadata, SAV_INTAKE_INVALID_SOURCE } from "./source-validation";
 import { unbilledProviderStatus } from "./model-usage";
 import { intakeMaxCallReservation, intakeRequestReservation, storedIntakeReservation, type IntakeRequestSize } from "./request-reservation";
@@ -390,7 +390,7 @@ async function claimOrReserve(id: string, config: IntakeRuntimeConfig, now: Date
       const unknown=rows.some(row=>row.messageKey===messageKey&&row.state!=="settled");
       // The largest single call this dossier may need, not the smaller amount it will reserve.
       const quote=intakeMaxCallReservation(config.model,budgetNow,revoked);
-      if(unknown||!recoveringRead&&!automation&&(usage.remainingCalls<1||usage.remainingNanoUsd<quote.reservedNanoUsd||usage.remainingRollingNanoUsd<quote.reservedNanoUsd)) {
+      if(unknown||!recoveringRead&&!automation&&!intakeForwardNeedsOriginal(data.input.message)&&(usage.remainingCalls<1||usage.remainingNanoUsd<quote.reservedNanoUsd||usage.remainingRollingNanoUsd<quote.reservedNanoUsd)) {
         const payload=decryptSavPayload<IntakeRuntimePayload>(run.payloadCiphertext);
         // The shared margin, not this dossier. Only the daily margin frees at the next UTC day; the
         // rolling 30-day margin frees when older spend leaves the window, so no date is promised.
@@ -468,6 +468,11 @@ export async function saveSavIntakeResult(lease: IntakeLease, config: IntakeRunt
       leaseToken: null, leaseUntil: null, updatedAt: now }).where(eq(savIntakeRuns.id, lease.run.id));
     await tx.update(savMessages).set({ analysisStatus: state === "observed" ? "intake_observed" : "intake_waiting" }).where(eq(savMessages.id, lease.run.messageId));
     await journal(tx, lease.run.id, state, payload);
+    if (state === "waiting" && payload.plan?.decision.disposition.kind === "collect_context") {
+      const dependency = payload.plan.decision.disposition.reasons.find(reason =>
+        reason === "private_resource_unavailable" || reason === "forwarded_origin_unverified" || reason === "other_evidence_unavailable");
+      if (dependency) await journal(tx, lease.run.id, dependency, { reason: dependency });
+    }
     if (payload.readRecovery) await writeReadRecoveryMarker(tx,lease.run.id,payload.readRecovery);
     if (payload.readRecovery?.state === "scheduled") await journal(tx,lease.run.id,"read_retry_scheduled",{operation:payload.readRecovery.operation,reason:payload.readRecovery.code,technicalAttempt:payload.readRecovery.attempts,retryAt:payload.readRecovery.retryAt});
     if (payload.readRecovery && ["exhausted","invalidated"].includes(payload.readRecovery.state)) await journal(tx,lease.run.id,"read_retry_stopped",{reason:payload.readRecovery.code,technicalAttempt:payload.readRecovery.attempts});

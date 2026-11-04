@@ -11,6 +11,8 @@ export const intakeMessageSchema = z.object({
   // Transport must provide the current authored part, not quoted history/signatures.
   currentText: z.string().max(100_000), contentComplete: z.boolean(),
   direction: z.enum(["inbound", "outbound"]),
+  standaloneAuthoredLine: z.literal(true).optional(),
+  forwardedQuoteOnly: z.literal(true).optional(),
   operatorInformation: intakeOperatorInformationSchema.optional(),
   attachmentInputs: z.array(z.object({ sourceId: ref, fileHash: z.string().regex(/^[a-f0-9]{64}$/) }).strict()).max(3).optional(),
   // Files of a complete text that were NOT read (unsupported type, too large, invalid).
@@ -79,6 +81,7 @@ export type EnginePolicy = {
     partnership?: PrivateResource; commercial?: PrivateResource; investor?: PrivateResource;
   };
   // Server-qualified rules and operator overrides are inputs, never inferred from a brand keyword.
+  otherRuleStatus?: "catalogue_unavailable" | "not_applicable" | "evidence_unavailable";
   qualifiedOther?: { family?: "authenticated_newsletter"; resource: PrivateResource; evidenceSource: "private_rule" | "human_override" };
   manualSupportOverride?: PrivateResource;
   /** Set by the stored-message automation gate, never read from model output. */
