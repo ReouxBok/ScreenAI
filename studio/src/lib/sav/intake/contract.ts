@@ -30,7 +30,7 @@ const evidenceOrigin = {
 };
 export const savIntakeEvidenceSchema = z.discriminatedUnion("source", [
   z.object({ ...evidenceOrigin,
-    source: z.enum(["current_message", "current_attachment", "customer_history", "crm_contact", "contact_association", "crm_ticket", "crm_event", "private_rule", "human_override"]),
+    source: z.enum(["current_message", "automation_headers", "current_attachment", "customer_history", "crm_contact", "contact_association", "crm_ticket", "crm_event", "private_rule", "human_override"]),
   }).strict(),
   z.object({ ...evidenceOrigin, source: z.literal("ticket_contact_association"),
     ticketId: crmId, contactId: crmId, direction: z.literal("ticket_to_contact"),
@@ -77,7 +77,7 @@ export type SavIntakeMutation = z.infer<typeof savIntakeMutationSchema>;
 const noTicket = z.object({
   kind: z.literal("no_ticket"),
   reason: z.enum(["qualified_other", "acknowledgement_only", "outside_support"]),
-  qualifiedInformation: z.literal("authenticated_newsletter").optional(),
+  qualifiedInformation: z.enum(["authenticated_newsletter", "verified_automatic_reply"]).optional(),
   nextAction: z.enum(["none", "supervised_partnership", "supervised_commercial", "supervised_investor"]),
   learning: z.literal("excluded"), evidenceIds: refs,
 }).strict();
@@ -190,9 +190,15 @@ export const savIntakeDecisionSchema = z.object({
   const neutralKinds = (["other", "acknowledgement"] as const).filter(kind => kinds.has(kind));
   const qualifiedInformation = !kinds.size && decision.classification === "other" && disposition.kind === "no_ticket"
     && disposition.reason === "qualified_other" && disposition.qualifiedInformation === "authenticated_newsletter" && decision.evidence.some(e => e.source === "private_rule" && disposition.evidenceIds.includes(e.id));
-  const unresolved = !qualifiedInformation && (!kinds.size || kinds.has("unknown"));
+  const qualifiedReply = !kinds.size && decision.classification === "acknowledgement" && disposition.kind === "no_ticket"
+    && disposition.reason === "acknowledgement_only" && disposition.qualifiedInformation === "verified_automatic_reply"
+    && ["current_message", "automation_headers"].every(source => decision.evidence.some(e => e.source === source
+      && e.sourceId === decision.messageId && disposition.evidenceIds.includes(e.id))) && decision.latestInboundMessageId === decision.messageId;
+  if (disposition.kind === "no_ticket" && disposition.qualifiedInformation === "verified_automatic_reply" && !qualifiedReply) reject("SAV_INTAKE_AUTOMATION_EVIDENCE_REQUIRED");
+  const unresolved = !qualifiedReply && !qualifiedInformation && (!kinds.size || kinds.has("unknown"));
   let compatible: SavIntakeClassification[];
-  if (qualifiedInformation) compatible = ["other"];
+  if (qualifiedReply) compatible = ["acknowledgement"];
+  else if (qualifiedInformation) compatible = ["other"];
   else if (sensitiveKinds.length) compatible = sensitiveKinds;
   else if (unresolved) compatible = ["unknown"];
   else if (kinds.has("support")) compatible = ["support"];

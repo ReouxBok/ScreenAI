@@ -81,6 +81,8 @@ export type EnginePolicy = {
   // Server-qualified rules and operator overrides are inputs, never inferred from a brand keyword.
   qualifiedOther?: { family?: "authenticated_newsletter"; resource: PrivateResource; evidenceSource: "private_rule" | "human_override" };
   manualSupportOverride?: PrivateResource;
+  /** Set by the stored-message automation gate, never read from model output. */
+  automatedReply?: { messageId: string; sourceHash: string; signals: string[] };
 };
 export type IntakeAdapters = {
   analyseMessage(input: { message: IntakeMessage; conversation: readonly IntakeMessage[]; identificationContinuation?: EngineInput["identificationContinuation"] }, signal: AbortSignal): Promise<MessageAnalysis>;
@@ -100,6 +102,8 @@ export type IntakeAdapters = {
 export type EngineInput = {
   message: IntakeMessage; latestInboundMessageId: string; conversation: ReadResult<IntakeMessage[]>;
   now: string; mode: "at_receipt" | "current"; identificationAttemptId: string;
+  /** The latest message is an automatic notice. These earlier inbound messages still need an operator to check their handling. */
+  priorRequestReview?: { messageIds: string[]; truncated: boolean };
   humanResolution?: {
     suppressOutbound?: true;
     choiceId: string; at: string; contactId?: string; equivalentContactIds?: string[];
@@ -122,6 +126,8 @@ export type IntakePlan = {
   noteText: string | null;
   supervisedResource?: PrivateResource;
   candidateContactIds?: string[];
+  /** When present, only these examined tickets are offered to the operator. */
+  candidateTicketIds?: string[];
   // Provider-independent creation intent. The future writer must reuse the existing
   // savSupportTicketProperties mapper; this is not a HubSpot POST payload.
   newTicket?: { contactId: string; title: string; description: string; requestIds: string[];

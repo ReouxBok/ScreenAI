@@ -109,7 +109,7 @@ describe("immutable post-deployment SAV V0 cutover", () => {
   });
   it("persists automation headers and deduplicates classification on receipt retry", async () => {
     await activateSavV0Cutover(boundary);
-    const input = { mailboxEmail: boundary.mailboxEmail, gmailMessageId: "automated", gmailThreadId: "fixture-thread", from: "customer@example.com", to: ["contact@limova.ai"], subject: "Absence", bodyText: "Je reviens lundi", autoSubmitted: "auto-replied", receivedAt: "2026-10-02T12:01:00Z" };
+    const input = { mailboxEmail: boundary.mailboxEmail, gmailMessageId: "automated", gmailThreadId: "fixture-thread", from: "customer@example.com", to: ["contact@limova.ai"], subject: "Absence", bodyText: "Je reviens lundi", headers: { "X-Studio-Automation-Headers": "singleton-v1", "x-studio-automation-body": "complete-plain-v1" }, autoSubmitted: "auto-replied", receivedAt: "2026-10-02T12:01:00Z" };
     const first = await ingestInboundMessage(input);
     const second = await ingestInboundMessage(input);
     expect(second.duplicate).toBe(true);
@@ -117,7 +117,10 @@ describe("immutable post-deployment SAV V0 cutover", () => {
     expect(decision).toMatchObject({ kind: "automatic_reply", reasonCode: "automated_sender_reply" });
     expect(await fixture.db.select().from(savDecisions)).toHaveLength(1);
     expect(await fixture.db.select().from(savActions)).toHaveLength(0);
-    expect(decryptSavPayload<{ headers: Record<string, string> }>(first.message.bodyCiphertext).headers["auto-submitted"]).toBe("auto-replied");
+    const storedHeaders = decryptSavPayload<{ headers: Record<string, string> }>(first.message.bodyCiphertext).headers;
+    expect(storedHeaders["auto-submitted"]).toBe("auto-replied");
+    expect(storedHeaders).not.toHaveProperty("x-studio-automation-headers");
+    expect(storedHeaders).not.toHaveProperty("x-studio-automation-body");
   });
   it("human correction supersedes one decision and cancels its queued actions", async () => {
     await activateSavV0Cutover(boundary);

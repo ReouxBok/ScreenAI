@@ -21,6 +21,8 @@ import { CrmRecord, StreamedChoiceForm, StreamedCrmContext } from "../crm-stream
 import { IntakeProcessingSummary } from "../processing-summary";
 import { readUxMessageControls } from "@/lib/sav/intake-ux/message-controls";
 import { readOperatorPanel } from "@/lib/sav/intake-ux/operator-commands";
+import { deliveryEmailUrl, readDeliveryReportTicket } from "@/lib/sav/intake/delivery-report-ticket";
+import { crmRecordUrl } from "@/lib/sav/intake/crm-display";
 import { IntakeOperatorActions } from "../operator-form";
 export const dynamic = "force-dynamic";
 export default async function IntakeDetailPage({ params, searchParams }: { params: Promise<{ id: string }>; searchParams?: Promise<{holdRelease?:string;returnTo?:string}> }) {
@@ -32,7 +34,17 @@ export default async function IntakeDetailPage({ params, searchParams }: { param
   const query = await searchParams;
   const releaseNotice=query?.holdRelease;
   const { current, blocked, plan, disposition, historicalPlan, contacts, tickets, target, historicalTarget, dirty, canCorrect, currentEffects, question, handoff } = intakeDossierView(data);
+  const pendingOriginals = !dirty && !data.handledExternally && current?.messageId === data.latestMessageId && current?.sourceMatches
+    && current.payload.reason === "SAV_INTAKE_PRIOR_REQUEST_PENDING" ? plan?.decision.evidence.filter(e => e.id.startsWith("prior-open-") && e.source === "customer_history") : undefined;
+  const deliveryReport = !dirty && !data.handledExternally && !data.humanHeld && !data.thread.paused &&
+    current?.messageId === data.latestMessageId && current?.sourceMatches &&
+    (current.payload.reason === "SAV_INTAKE_SUPPORT_DELIVERY_FAILURE" || current.payload.reason === "SAV_INTAKE_PRIOR_REQUEST_PENDING"
+      && current.payload.traces?.some(t => typeof t === "object" && t !== null && "phase" in t && t.phase === "automation_gate" && "kind" in t && t.kind === "support_delivery_failure"));
+  const deliveryTarget = deliveryReport && data.latestMessageId
+    ? await readDeliveryReportTicket(id,data.latestMessageId) : null;
   const portal = process.env.HUBSPOT_PORTAL_ID;
+  const noticeLink = deliveryTarget?.ok ? deliveryEmailUrl(deliveryTarget.receipt, portal) : null;
+  const noticeText = deliveryReport ? data.messages.find(message => message.id === data.latestMessageId)?.body.text : undefined;
   // Not awaited: names stream in under Suspense while the reads below proceed.
   const display=readIntakeCrmDisplay([...contacts,...(target?[target.contactId]:[]),...(historicalTarget?[historicalTarget.contactId]:[])],
     [...tickets,...(target&&target.operation!=="create"?[target.ticketId]:[]),...(historicalTarget&&historicalTarget.operation!=="create"?[historicalTarget.ticketId]:[]),...(data.progress?.ticketId?[data.progress.ticketId]:[])]);
@@ -47,6 +59,37 @@ export default async function IntakeDetailPage({ params, searchParams }: { param
     <header className={styles.heading}><div><span className="eyebrow">Dossier · version {current?.version ?? "en attente"}</span><h1>{data.thread.subject || "Nouvelle demande"}</h1>
       <p>{dirty ? "Mise à jour du traitement en cours" : intakeReasonLabel(data.projection.reason) ?? intakeStatusLabel(data.projection.status)}</p></div></header>
     {releaseNotice && <p role="status">{releaseNotice === "released" && !data.thread.paused && !data.humanHeld && !data.handledExternally ? "La pause est levée pour ce dossier. Le moteur pourra poursuivre si les preuves et la politique existante le permettent. Si une nouvelle qualification est nécessaire, utilisez « Refaire l’analyse » dans le panneau de poursuite." : "La pause est conservée : le dossier a changé, une opération reste en cours ou votre accès ne permet pas cette reprise. Rechargez le dossier et vérifiez ses preuves."}</p>}
+    {pendingOriginals && <section className={styles.notice} aria-label="Demandes antérieures à traiter">
+      <h2>Vérifier la prise en charge des mails précédents</h2>
+      <p>Le dernier message est un avis automatique. Ouvrez les demandes ci-dessous et rattachez les originaux à leur ticket dans HubSpot. Si le fil est incomplet, vérifiez aussi son historique dans la boîte du support.</p>
+      {pendingOriginals.map(e => {
+        const original = data.messages.find(m => m.id === e.sourceId);
+        return original && <details key={original.id}><summary>{original.fromEmail} · {formatParisDateTime(original.receivedAt)}</summary>
+          <p style={{ whiteSpace: "pre-wrap" }}>{original.body.text}</p></details>;
+      })}
+      <p>Une fois les rattachements vérifiés, utilisez « Déjà traité ? » pour attester votre prise en charge du dossier.</p>
+    </section>}
+    {deliveryReport && <section className={styles.notice} aria-label="Avis de distribution">
+      <h2>Avis de distribution à vérifier</h2>
+      <p>Vérifiez si le message initial a été livré et consignez l’avis sur son ticket.</p>
+      {deliveryTarget?.ok ? <p>Ticket proposé <strong>#{deliveryTarget.ticketId}</strong> — le message HubSpot #{deliveryTarget.emailId} correspond au parent direct de cet avis et est associé uniquement à ce ticket.
+        {crmRecordUrl(portal,"ticket",deliveryTarget.ticketId) && <> <a href={crmRecordUrl(portal,"ticket",deliveryTarget.ticketId)!}>Ouvrir le ticket dans HubSpot</a></>}
+        <br/>{deliveryTarget.receipt.state === "associated" ? `Avis entrant HubSpot #${deliveryTarget.receipt.emailId} déjà rattaché à ce ticket.`
+          : deliveryTarget.receipt.state === "unassociated" ? `Avis entrant HubSpot #${deliveryTarget.receipt.emailId} retrouvé sans ticket. Rattachement manuel à vérifier.`
+          : deliveryTarget.receipt.reason}
+        {noticeLink && <> <a href={noticeLink}>Ouvrir l’activité de l’avis entrant</a></>}</p>
+        : deliveryTarget && <p role="status">{deliveryTarget.reason}</p>}
+      {deliveryTarget?.ok && deliveryTarget.receipt.state !== "associated" && <>
+        {deliveryTarget.receipt.state === "unassociated" && <p>Dans HubSpot, associez l’activité entrante #{deliveryTarget.receipt.emailId} au ticket #{deliveryTarget.ticketId}, puis vérifiez le reçu ci-dessous.</p>}
+        {noticeText && <details><summary>Texte de l’avis dans Studio</summary>
+          <textarea aria-label="Texte original de l’avis à copier" readOnly value={noticeText} rows={6}/>
+        </details>}
+        <form method="get">
+          {query?.returnTo && <input type="hidden" name="returnTo" value={query.returnTo}/>}
+          <button type="submit">Relire le rattachement dans HubSpot</button>
+        </form>
+      </>}
+    </section>}
     <StreamedCrmContext display={display} portal={portal} contactId={target?.contactId}
       ticketId={data.confirmedCurrent && data.progress?.ticketId ? data.progress.ticketId : target && target.operation !== "create" ? target.ticketId : undefined}
       confirmed={Boolean(data.confirmedCurrent)} creationPlanned={target?.operation === "create" && !data.confirmedCurrent}
@@ -92,11 +135,11 @@ export default async function IntakeDetailPage({ params, searchParams }: { param
         confirmedEffects={data.progress?.effects.filter(e=>e.state==="confirmed").length??0} uncertain={data.progress?.state==="uncertain"||Boolean(data.progress?.effects.some(e=>["dispatched","acked","uncertain"].includes(e.state)))}
         paused={data.thread.paused||data.humanHeld} exhausted={Boolean(blocked)}
         lastActivity={data.diagnostics?.runs.flatMap(r=>r.events.map(e=>e.createdAt)).sort((a,b)=>b.getTime()-a.getTime())[0] ? formatParisDateTime(data.diagnostics.runs.flatMap(r=>r.events.map(e=>e.createdAt)).sort((a,b)=>b.getTime()-a.getTime())[0]) : undefined}/>
-      {manualOtherBinding && <IntakeManualOtherForm key={`manual-other-${manualOtherBinding.messageId}-${manualOtherBinding.version}-${manualOtherBinding.sourceHash}`} binding={manualOtherBinding} requestKey={randomUUID()}/>}
+      {!pendingOriginals && manualOtherBinding && <IntakeManualOtherForm key={`manual-other-${manualOtherBinding.messageId}-${manualOtherBinding.version}-${manualOtherBinding.sourceHash}`} binding={manualOtherBinding} requestKey={randomUUID()}/>}
       {manualOtherEligibility?.reason && <section className={styles.notice} aria-label="Classement dans Autres indisponible"><h2>Classement dans Autres indisponible</h2>
         <p>{manualOtherUnavailableLabels[manualOtherEligibility.reason]}</p></section>}
       {actions.classifyInvalidSource && current && <IntakeInvalidSourceForm key={`invalid-${current.messageId}`} threadId={id} messageId={current.messageId} requestKey={randomUUID()}/>}
-      {actions.closeHandledOutside && data.latestMessageId && <IntakeCompletionForm key={data.latestMessageId} threadId={id} messageId={data.latestMessageId} requestKey={randomUUID()}/>}
+      {actions.closeHandledOutside && data.latestMessageId && <IntakeCompletionForm priorRequests={Boolean(pendingOriginals)} key={data.latestMessageId} threadId={id} messageId={data.latestMessageId} requestKey={randomUUID()}/>}
       {actions.releaseHold && data.latestMessageId && <section className={styles.notice}><h2>Reprendre ce dossier</h2>
         <p>Cette action lève uniquement sa pause humaine. Le moteur automatique pourra poursuivre si les preuves et la politique existante le permettent. Les tentatives et les preuves sont conservées. Si une nouvelle qualification est nécessaire, utilisez ensuite « Refaire l’analyse » dans le panneau de poursuite.</p>
         <form action={releaseIntakeHumanHoldAction}>
@@ -106,7 +149,7 @@ export default async function IntakeDetailPage({ params, searchParams }: { param
           <label>Motif de la reprise<textarea name="reason" required minLength={10} maxLength={2000}/></label>
           <button type="submit">Lever la pause</button>
         </form></section>}
-      {actions.recordChoice && current?.sourceHash && plan ? <StreamedChoiceForm expected={{ commandKey: randomUUID(), threadId: id,
+      {!pendingOriginals && actions.recordChoice && current?.sourceHash && plan ? <StreamedChoiceForm expected={{ commandKey: randomUUID(), threadId: id,
         messageId: current.messageId, runId: current.id, version: current.version, sourceHash: current.sourceHash,
         candidatesHash: intakeRuntimeHash(contacts) }} contacts={contacts} tickets={tickets} display={display} classification={plan.decision.classification}
         actorId={staff.id} selectedContactId={target?.contactId} selectedTicketId={target && target.operation !== "create" ? target.ticketId : undefined}/> :

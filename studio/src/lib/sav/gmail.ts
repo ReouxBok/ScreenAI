@@ -349,6 +349,22 @@ export function normalizeReferencesHeader(value: string, maxLength = 2_000) {
   return kept.join(" ");
 }
 
+/** A single full plain text MIME body is the only representation the gate may
+ * use to discard an automatic reply. Snippets, HTML alternatives, attached
+ * text and complex MIME retain their usual handling in the intake. */
+function completeSinglePlainBody(part?: GmailPart) {
+  if (!part || part.mimeType?.toLowerCase() !== "text/plain" || part.parts?.length || part.filename
+    || headerValue(part.headers, "Content-Disposition") || part.body?.attachmentId) return false;
+  const contentType = headerValue(part.headers, "Content-Type");
+  if (contentType && !/^text\/plain(?:\s*;|$)/i.test(contentType)) return false;
+  const encoded = part.body?.data;
+  if (!encoded || encoded.length > 24_000 || !Number.isSafeInteger(part.body?.size) || !part.body!.size) return false;
+  const bytes = Buffer.from(encoded, "base64url");
+  if (bytes.length !== part.body!.size || bytes.toString("base64url") !== encoded.replace(/=+$/, "")) return false;
+  try { return !new TextDecoder("utf-8", { fatal: true }).decode(bytes).includes("\0"); }
+  catch { return false; }
+}
+
 export function parseGmailMessage(mailboxEmail: string, message: GmailMessage, now = new Date()) {
   if (!message.id || !message.threadId) throw new Error("GMAIL_MESSAGE_INVALID");
   const providerReceivedAt = new Date(Number(message.internalDate));
@@ -358,6 +374,13 @@ export function parseGmailMessage(mailboxEmail: string, message: GmailMessage, n
   const futureDate = providerReceivedAt.getTime() > now.getTime();
   const receivedAt = futureDate ? new Date(now.getTime()) : providerReceivedAt;
   const headers = message.payload?.headers;
+  // Only the parser sets this marker. The first value from a repeated header is
+  // fine for display but cannot be evidence for a terminal automatic decision.
+  const automationHeaders = ["from", "to", "auto-submitted", "content-type", "in-reply-to", "references", "message-id"];
+  const unambiguous = automationHeaders.every(name => {
+    const values = headers?.filter(h => h.name?.toLowerCase() === name) ?? [];
+    return values.length <= 1 && (values[0]?.value?.length ?? 0) <= (name === "auto-submitted" ? 200 : 2000);
+  });
   const from = boundedHeader(headerValue(headers, "From"), 500);
   const intakeRecipients = String(process.env.GMAIL_INTAKE_RECIPIENTS || mailboxEmail).split(",");
   const to = normalizeRecipientHeader(headerValue(headers, "To"), intakeRecipients);
@@ -376,6 +399,8 @@ export function parseGmailMessage(mailboxEmail: string, message: GmailMessage, n
     ...(bodies.html.length ? { bodyHtml: bodies.html.join("\n\n").slice(0, 300_000) } : {}),
     autoSubmitted: boundedHeader(headerValue(headers, "Auto-Submitted"), 200) || undefined,
     headers: {
+      "x-studio-automation-headers": unambiguous ? "singleton-v1" : "ambiguous",
+      ...(completeSinglePlainBody(message.payload) ? { "x-studio-automation-body": "complete-plain-v1" } : {}),
       "auto-submitted": boundedHeader(headerValue(headers, "Auto-Submitted"), 200),
       "from-display-name": boundedHeader(from.includes("<") ? from.split("<")[0].trim().replace(/^"|"$/g, "") : "", 100),
       "content-type": boundedHeader(headerValue(headers, "Content-Type") || message.payload?.mimeType || "", 2_000),
@@ -427,7 +452,7 @@ async function fetchAndIngestMessage(mailboxEmail: string, messageId: string) {
   const parsed = parseGmailMessage(mailboxEmail, message);
   if (normalizeEmailAddress(parsed.from) === normalizeEmailAddress(mailboxEmail)) return { skipped: "outbound" as const };
   if (!matchesGmailIntakeRecipient(parsed)) return { skipped: "outside_support_intake" as const };
-  return ingestInboundMessage(parsed);
+  return ingestInboundMessage(parsed, "gmail_full");
 }
 
 function isPermanentGmailMessageError(error: unknown) {
@@ -693,7 +718,10 @@ async function sendReplyAction(action: typeof savActions.$inferSelect, text: str
       toEmails: [thread.customerEmail],
       subject: replySubject,
       preview: redactSavLearningText(transparentText.replace(/\s+/g, " ")).slice(0, 280),
-      bodyCiphertext: encryptSavPayload({ text: transparentText, headers: { "message-id": rfcMessageId } }),
+      // This composer generated exactly one Message-ID. A search-only recovery
+      // has no equivalent proof of the raw headers until Gmail is read back.
+      bodyCiphertext: encryptSavPayload({ text: transparentText, headers: { "message-id": rfcMessageId,
+        ...(!existing && sent.id && sent.threadId === thread.gmailThreadId ? { "x-studio-automation-headers": "singleton-v1" } : {}) } }),
       receivedAt: now,
       processedAt: now,
       analysisStatus: "done",

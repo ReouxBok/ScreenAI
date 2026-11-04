@@ -14,7 +14,10 @@ import type { EngineInput, MessageAnalysis } from "./engine-types";
 import type { IntakeReadTrace } from "./hubspot-readers";
 import { SAV_INTAKE_MODEL_REVISION } from "./model-readers";
 import { planSavIntake } from "./engine";
+import { intakeAutomationAdapters } from "./automated-message";
 import { intakeCrmEvidenceFingerprint, recordIntakeCrmReads } from "./crm-evidence-fingerprint";
+import { intakeResumeHoldReason, intakeResumeProof, newIntakeResumeObservation, observeIntakeReads } from "./resume-progress";
+import { probeIntakeResumeForRun } from "./resume-progress-store";
 import type { IntakeBudgetLimit } from "./budget-limit";
 import { intakeTransientFailure, SAV_INTAKE_DETERMINISTIC_ERRORS } from "./attempt-policy";
 import { createSavIntakeHubspotReaders } from "./hubspot-readers";
@@ -43,9 +46,13 @@ export async function enqueueConfiguredSavIntake(messageId: string) {
 async function analyseSavIntakeRuntimeWithinBudget(runId: string, config: IntakeRuntimeConfig,
   deps: { env?: () => Record<string, string | undefined>; network?: typeof fetch; downloadAttachments?: Parameters<typeof prepareIntakeAttachments>[3]; authenticateOther?: Parameters<typeof qualifyRuntimeOther>[3]; startReadRecovery?: (runId:string)=>Promise<unknown>; deadlineMs?: number } = {}) {
   const env = deps.env ?? (() => process.env), network = deps.network ?? fetch;
-  const lease = await claimSavIntakeRun(runId, config); if (!lease) return { skipped: "not_claimed" };
+  const held: { cause?: Parameters<typeof intakeResumeHoldReason>[0] } = {};
+  const lease = await claimSavIntakeRun(runId, config, new Date(), {
+    probe: (proof, check) => probeIntakeResumeForRun(proof, { env, network, check }), onHold: cause => { held.cause = cause; },
+  });
+  if (!lease) return { skipped: held.cause ? intakeResumeHoldReason(held.cause) : "not_claimed" };
   const previous = decryptSavPayload<IntakeRuntimePayload>(lease.run.payloadCiphertext);
-  if (lease.recoveringRead && previous.input) lease.input = structuredClone(previous.input) as EngineInput;
+  if (lease.recoveringRead && previous.input && !lease.automation) lease.input = structuredClone(previous.input) as EngineInput;
   const repairMalformedOutput = lease.run.attempts > 1 && ["SAV_INTAKE_MODEL_OUTPUT_REJECTED", "SAV_INTAKE_RUNTIME_CALL_ALREADY_CONSUMED"].includes(previous.reason ?? "");
   const controller = new AbortController(), timer = setTimeout(() => controller.abort(), 45_000);
   const traces: unknown[] = [];
@@ -74,6 +81,23 @@ async function analyseSavIntakeRuntimeWithinBudget(runId: string, config: Intake
   const checkpoint = () => { checkpoints = checkpoints.then(writeCheckpoint); checkpoints.catch(() => {}); };
   try {
     await live();
+    // V1 cost filter, replay and resume included: an automation proven by the stored Gmail headers
+    // never reaches a reservation, a CRM or Gmail read, or a model call. The disposition depends on the notice kind.
+    const automation = lease.automation;
+    if (automation) {
+      traces.push({ phase: "automation_gate", ...automation, modelCalled: false });
+      const policy = automation.kind === "automatic_reply"
+        ? { ...config.policy, automatedReply: { messageId: lease.run.messageId, sourceHash: lease.sourceHash, signals: automation.signals } }
+        : config.policy;
+      payload.plan = await planSavIntake(lease.input, intakeAutomationAdapters(lease.input.message.id), policy, { timeoutMs: 10_000 }, () => new Date());
+      assertSavIntakeObservation(payload.plan);
+      payload.reason = lease.input.priorRequestReview ? "SAV_INTAKE_PRIOR_REQUEST_PENDING" : automation.code;
+      const state = payload.plan.decision.disposition.kind === "collect_context" && payload.plan.progress.kind !== "human_choice" ? "waiting" : "observed";
+      if (lease.recoveringRead) { payload.readRecovery!.state = state === "waiting" ? "invalidated" : "complete"; payload.readRecovery!.cache = []; }
+      else delete payload.readRecovery;
+      await saveSavIntakeResult(lease, config, payload, state);
+      return { runId, state };
+    }
     const other = observeSavOther({ mailboxId: config.mailboxId, fromEmail: lease.input.message.fromEmail,
       subject: lease.provenance.get(lease.run.messageId)!.subject, gmailMessageId: "stored", body: lease.body,
       protectedContext: lease.input.conversation.data.length > 1 }, readSavOtherConfiguration(env().SAV_OTHER_OBSERVATION_RULES_JSON).registry);
@@ -104,7 +128,8 @@ async function analyseSavIntakeRuntimeWithinBudget(runId: string, config: Intake
       return network(url, { ...init, signal, redirect: "error", headers: { ...Object.fromEntries(new Headers(init?.headers)), Authorization: `Bearer ${env().HUBSPOT_ACCESS_TOKEN}` } });
     } });
     const readPending:Promise<unknown>[]=[];
-    const recorded=recordIntakeCrmReads(recoverableIntakeReads(crm,payload.readRecovery!,{reuse:Boolean(lease.recoveringRead),checkpoint,pending:readPending})),recoverable=recorded.readers;
+    const observation=newIntakeResumeObservation();
+    const recorded=recordIntakeCrmReads(recoverableIntakeReads(crm,payload.readRecovery!,{reuse:Boolean(lease.recoveringRead),checkpoint,pending:readPending})),recoverable=observeIntakeReads(recorded.readers,observation);
     // The simple reader reads the CRM before its single call; the engine then sees the very same answers.
     const reads = pipeline === "simple" ? memoizeIntakeCrmReaders(recoverable) : recoverable;
     const priorAnalysis=lease.recoveringRead?payload.semantics!.records.find(r=>r.method==="analyseMessage")?.result as MessageAnalysis|undefined:undefined;
@@ -158,6 +183,11 @@ async function analyseSavIntakeRuntimeWithinBudget(runId: string, config: Intake
       recovery.state=recovery.attempts<limits.maxAttempts&&Date.parse(recovery.retryAt)<Date.parse(recovery.expiresAt)?"scheduled":"exhausted";
     } else if(lease.recoveringRead) {payload.readRecovery!.state=state==="waiting"?"invalidated":"complete";payload.readRecovery!.cache=[];}
     else delete payload.readRecovery;
+    // The wait ends on an incomplete CRM read that the read-recovery path does not own (it keeps its own bounded retries and never needs this): remember what was read, so a resume can tell whether the CRM moved.
+    if (state === "waiting" && readFailure && !payload.readRecovery) {
+      const proof = intakeResumeProof(observation, { configHash: config.configHash, sourceHash: lease.sourceHash, incomplete: readFailure.reason ?? readFailure.operation });
+      if (proof) payload.resumeProof = proof;
+    }
     await saveSavIntakeResult(lease, config, payload, state);
     // A provider outage is retried automatically at a durable due time, not left to wait.
     const transientRetry = state === "waiting" && !dispatcher.uncertain && payload.readRecovery?.state !== "scheduled" && intakeTransientFailure(payload.reason)

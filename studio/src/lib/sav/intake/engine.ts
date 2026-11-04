@@ -31,9 +31,27 @@ const observationTimeSchema = z.iso.datetime({ offset: true });
 const DAY = 86_400_000;
 
 /** Content binding, not a signature, dispatch authorization or idempotency store. */
-export function savIntakePlanFingerprint(plan: Pick<IntakePlan, "decision" | "noteText" | "newTicket" | "supervisedResource" | "originalThreadId" | "originalRecipientEmails" | "referenceMode">): string {
+export function savIntakePlanFingerprint(plan: Pick<IntakePlan, "decision" | "noteText" | "newTicket" | "supervisedResource" | "candidateTicketIds" | "originalThreadId" | "originalRecipientEmails" | "referenceMode">): string {
   return sha(canonical({ decision: plan.decision, noteText: plan.noteText, newTicket: plan.newTicket ?? null, supervisedResource: plan.supervisedResource ?? null,
+    ...(plan.candidateTicketIds !== undefined ? { candidateTicketIds: plan.candidateTicketIds } : {}),
     originalThreadId: plan.originalThreadId, originalRecipientEmails: plan.originalRecipientEmails, referenceMode: plan.referenceMode }));
+}
+
+/** Used by both the dossier and its write command. A restricted choice
+ * excludes unrelated evidence and previous creation receipts. Older plans
+ * retain their existing choices and their original fingerprint. */
+export function intakeSelectableTicketIds(plan: IntakePlan | undefined, confirmedIds: string[]): string[] {
+  const examined = plan?.decision.evidence.filter(e => e.source === "crm_ticket" && /^\d+$/.test(e.sourceId)).map(e => e.sourceId) ?? [];
+  const equivalentTicketChoice = plan?.progress?.kind === "human_choice" && plan.progress.questionCode === "equivalent_ticket_choice";
+  if (plan?.candidateTicketIds !== undefined || equivalentTicketChoice) {
+    if (!plan || savIntakePlanFingerprint(plan) !== plan.fingerprint) return [];
+    if (plan.candidateTicketIds !== undefined) {
+      const ids = plan.candidateTicketIds;
+      return equivalentTicketChoice
+        && Array.isArray(ids) && ids.length >= 2 && new Set(ids).size === ids.length && ids.every(id => examined.includes(id)) ? [...ids] : [];
+    }
+  }
+  return unique([...confirmedIds, ...examined]);
 }
 
 /** SAV-73: deterministic markers of a request still open in the current authored text
@@ -114,6 +132,7 @@ export async function planSavIntake(
   let noteText: string | null = null;
   let newTicket: IntakePlan["newTicket"];
   let candidateContactIds: string[] | undefined;
+  let candidateTicketIds: string[] | undefined;
   let selectedEquivalent: string[] | undefined;
   const humanProof = input.humanResolution ? addEvidence("human-choice", "human_override", input.humanResolution.choiceId, input.humanResolution, input.humanResolution.at) : undefined;
   const finalize = (disposition: SavIntakeDecision["disposition"], progress: SavIntakeProgress = { kind: "processing", phase: "context", view: null }, supervisedResource?: PrivateResource): IntakePlan => {
@@ -126,11 +145,12 @@ export async function planSavIntake(
     const ticketId = disposition.kind === "ticket" && disposition.target.operation !== "create" ? disposition.target.ticketId : null;
     const finalNote = disposition.kind === "ticket" ? noteText : null;
     const finalCreation = disposition.kind === "ticket" && disposition.target.operation === "create" ? newTicket : undefined;
-    const fingerprint = savIntakePlanFingerprint({ decision, noteText: finalNote, newTicket: finalCreation, supervisedResource,
+    const fingerprint = savIntakePlanFingerprint({ candidateTicketIds, decision, noteText: finalNote, newTicket: finalCreation, supervisedResource,
       originalThreadId: message.threadId, originalRecipientEmails: [message.fromEmail], referenceMode: input.mode });
     return {
       revision: "sav-intake-engine-2026-10-20.v1", fingerprint, decision,
       steps: mutations.map(mutation => ({ id: `${message.id}:${mutation}:${fingerprint}`, mutation, requiresPermission: mutation, ticketId, status: "not_dispatched" as const })),
+      ...(candidateTicketIds ? { candidateTicketIds } : {}),
       progress: savIntakeProgressSchema.parse(progress), noteText: finalNote, ...(supervisedResource ? { supervisedResource } : {}),
       ...(finalCreation ? { newTicket: finalCreation } : {}), ...((candidateContactIds ?? selectedEquivalent) ? { candidateContactIds:candidateContactIds ?? selectedEquivalent } : {}),
       originalThreadId: message.threadId, originalRecipientEmails: [message.fromEmail], referenceMode: input.mode,
@@ -195,6 +215,13 @@ export async function planSavIntake(
   }
   try {
     if (message.id !== input.latestInboundMessageId || message.direction !== "inbound") return context("history_incomplete");
+    if (input.priorRequestReview) {
+      for (const id of input.priorRequestReview.messageIds) {
+        const original = input.conversation.data.find(m => m.id === id && m.direction === "inbound" && m.threadId === message.threadId && m.id !== message.id);
+        if (original) addEvidence(`prior-open-${original.id}`, "customer_history", original.id, original, input.conversation.observedAt);
+      }
+      return context("history_incomplete", "request_scope_uncertain");
+    }
     if (!message.contentComplete) return context("classification_incomplete");
     const conversation = complete(input.conversation, z.array(intakeMessageSchema).max(50), "history_incomplete");
     if (new Set(conversation.map(m => m.id)).size !== conversation.length || conversation.some(m => m.threadId !== message.threadId
@@ -202,6 +229,13 @@ export async function planSavIntake(
     if (!message.currentText.trim()) {
       for (const prior of conversation) addEvidence(`context-${prior.id}`, "customer_history", prior.id, prior, input.conversation.observedAt);
       return context("classification_incomplete", "request_scope_uncertain");
+    }
+    const auto = policy.automatedReply;
+    if (auto && auto.messageId === message.id && !input.humanResolution && !policy.manualSupportOverride && !message.operatorInformation) {
+      const proof = addEvidence("automation", "automation_headers", message.id, auto);
+      classification = "acknowledgement";
+      return finalize({ kind: "no_ticket", reason: "acknowledgement_only", qualifiedInformation: "verified_automatic_reply",
+        nextAction: "none", learning: "excluded", evidenceIds: [current, proof] }, { kind: "processing", phase: "decision", view: null });
     }
     const continuation = input.identificationContinuation;
     const initial = continuation ? conversation.find(m => m.id === continuation.initialMessageId) : undefined;
@@ -434,15 +468,6 @@ export async function planSavIntake(
     if (!parsedAssessment.success) return context("same_issue_unresolved");
     const assessment = parsedAssessment.data;
     const humanTicketId = input.humanResolution?.ticketId;
-    if (humanTicketId && humanProof && assessment.investigationComplete) {
-      const selected = assessment.tickets.find(t => t.ticketId === humanTicketId);
-      if (!selected || !tickets.has(humanTicketId)) return context("same_issue_unresolved", "equivalent_ticket_choice");
-      // Explicit human correction of the semantic relation, while all real CRM
-      // membership/ticket/history snapshots and other assessments stay intact.
-      selected.relation = "same";
-      selected.requestIds = requests.map(r => r.id);
-      selected.evidenceIds = unique([...selected.evidenceIds, humanProof]);
-    }
     if (assessment.tickets.length !== candidateTickets.length || new Set(assessment.tickets.map(t => t.ticketId)).size !== assessment.tickets.length) return context("same_issue_unresolved");
     for (const match of assessment.tickets) {
       const currentProof = match.evidenceIds.includes(current);
@@ -453,23 +478,62 @@ export async function planSavIntake(
         || match.requestIds.some(id => !requests.some(r => r.id === id))
         || match.relation === "same" && (requests.length !== unique(match.requestIds).length || requests.some(r => !match.requestIds.includes(r.id)))) return context("same_issue_unresolved");
     }
-    if (assessment.tickets.some(t => t.relation === "unknown" || t.relation === "partial") || !assessment.investigationComplete) return context("same_issue_unresolved", assessment.investigationComplete ? "same_issue_uncertain" : undefined);
+    // A comparison can be undecided even though every source was read. Offer a
+    // choice only when every destination is an open, evidenced candidate for
+    // every request. An invalid assessment or a failed read never reaches here.
+    const plausible = assessment.tickets.filter(t => t.relation !== "different");
+    const plausibleChoices = (!assessment.investigationComplete || plausible.some(t => t.relation === "partial"))
+      && plausible.length >= 2
+      && plausible.every(t => (t.relation === "same" || t.relation === "partial")
+        && requests.every(request => t.requestIds.includes(request.id))
+        && ["open", "new"].includes(tickets.get(t.ticketId)!.stage));
+    if (plausibleChoices && (!humanTicketId || !plausible.some(t => t.ticketId === humanTicketId))) {
+      candidateTicketIds = plausible.map(t => t.ticketId).sort();
+      return context("same_issue_unresolved", "equivalent_ticket_choice");
+    }
+    const originallySame = new Set(assessment.tickets.filter(t => t.relation === "same").map(t => t.ticketId));
+    if (humanTicketId && humanProof && (assessment.investigationComplete || plausibleChoices)) {
+      const selected = assessment.tickets.find(t => t.ticketId === humanTicketId);
+      if (!selected || !tickets.has(humanTicketId)) return context("same_issue_unresolved", "equivalent_ticket_choice");
+      // Explicit human correction of the semantic relation, while all real CRM
+      // membership/ticket/history snapshots and other assessments stay intact.
+      selected.relation = "same";
+      selected.requestIds = requests.map(r => r.id);
+      selected.evidenceIds = unique([...selected.evidenceIds, humanProof]);
+    }
+    if (!(plausibleChoices && humanTicketId && humanProof) && (assessment.tickets.some(t => t.relation === "unknown" || t.relation === "partial") || !assessment.investigationComplete)) return context("same_issue_unresolved", assessment.investigationComplete ? "same_issue_uncertain" : undefined);
     const same = candidateTickets.filter(t => assessment.tickets.some(m => m.ticketId === t.id && m.relation === "same"));
     if (candidateTickets.some(t => t.stage === "unknown")) return context("ticket_stage_unknown");
     const opened = same.filter(t => t.stage !== "closed").sort((a, b) => Date.parse(b.createdAt!) - Date.parse(a.createdAt!) || a.id.localeCompare(b.id));
-    if (!input.humanResolution?.ticketId && opened.length > 1 && Date.parse(opened[0].createdAt!) === Date.parse(opened[1].createdAt!)) return context("same_issue_unresolved", "equivalent_ticket_choice");
     const closed = same.filter(t => t.stage === "closed");
     if (!opened.length && closed.some(t => !t.closedAt || Date.parse(t.closedAt) > Date.parse(message.receivedAt)
       || Date.parse(t.closedAt) < Date.parse(t.createdAt!))) return context("ticket_closure_date_unknown");
     const recent = closed.filter(t => Date.parse(message.receivedAt) - Date.parse(t.closedAt!) <= 15 * DAY);
-    if (!input.humanResolution?.ticketId && !opened.length && (recent.length > 1 || !recent.length && closed.length > 1)) return context("same_issue_unresolved", "equivalent_ticket_choice");
     const chosenTicket = input.humanResolution?.ticketId;
-    if (chosenTicket && ![...opened, ...recent].some(t => t.id === chosenTicket)) return context("same_issue_unresolved", "equivalent_ticket_choice");
+    // Open tickets take priority. Only the newest equal dates form an open tie.
+    // When all matches are old and closed, the choice names a predecessor for
+    // the standard new-ticket operation; it never authorizes reopening one.
+    const openTie = opened.filter(t => Date.parse(t.createdAt!) === Date.parse(opened[0].createdAt!));
+    const eligibleChoices = opened.length ? openTie : recent.length ? recent : closed;
+    if (eligibleChoices.length > 1 && !eligibleChoices.some(t => t.id === chosenTicket)) {
+      candidateTicketIds = eligibleChoices.map(t => t.id).sort();
+      return context("same_issue_unresolved", "equivalent_ticket_choice");
+    }
+    const oldMatches = closed.filter(t => originallySame.has(t.id));
+    let oldPredecessor: IntakeTicket | undefined;
+    if (!opened.length && !recent.length) {
+      if (!chosenTicket) oldPredecessor = closed[0];
+      else if (oldMatches.length > 1) oldPredecessor = oldMatches.find(t => t.id === chosenTicket);
+    }
+    if (chosenTicket && !oldPredecessor && ![...opened, ...recent].some(t => t.id === chosenTicket))
+      return context("same_issue_unresolved", "equivalent_ticket_choice");
     const selected = chosenTicket ? [...opened, ...recent].find(t => t.id === chosenTicket) : opened[0] ?? recent[0];
     if (selected?.stage === "closed" && selected.ownerId === undefined) return context("ticket_owner_unknown");
     const targetContactId = selected ? selected.contactIds.includes(primary.id) ? primary.id : selected.contactIds.filter(id => scopeContacts.some(c => c.contactId === id)).sort()[0] : primary.id;
     const binding = (ticket: IntakeTicket, contactId: string) => ({ ticketId: ticket.id, contactId, ticketEvidenceId: `ticket-${ticket.id}`, contactAssociationEvidenceId: `membership-${ticket.id}-${contactId}` });
-    const predecessor = !selected && closed[0] ? { ...binding(closed[0], closed[0].contactIds.includes(primary.id) ? primary.id : closed[0].contactIds.filter(id => scopeContacts.some(c => c.contactId === id)).sort()[0]) } : null;
+    const predecessor = !selected && oldPredecessor
+      ? binding(oldPredecessor, oldPredecessor.contactIds.includes(primary.id) ? primary.id : oldPredecessor.contactIds.filter(id => scopeContacts.some(c => c.contactId === id)).sort()[0])
+      : null;
     const target: Extract<SavIntakeDecision["disposition"], { kind: "ticket" }>["target"] = selected
       ? selected.stage === "closed" ? { operation: "reopen", ...binding(selected, targetContactId), preserveOwnerId: selected.ownerId! }
         : { operation: "link", ...binding(selected, targetContactId), alreadyNew: selected.stage === "new" }

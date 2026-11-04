@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { describe, expect, it, vi } from "vitest";
-import { planSavIntake } from "./engine";
+import { intakeSelectableTicketIds, planSavIntake } from "./engine";
 import { projectSavIntakeProgress } from "./progress";
 import type { EngineInput, EnginePolicy, IntakeAdapters, IntakeContact, IntakePlan, IntakeTicket, MessageAnalysis, ReadResult } from "./engine-types";
 import type { SavIntakeStepReceipt } from "./contract";
@@ -197,6 +197,38 @@ describe("bounds, source bindings and fail-closed behavior", () => {
   it("includes a ticket created after reception in a current reprise, avoiding a duplicate", async () => { const f = fixture(); f.input.now = "2026-10-21T10:00:00.000Z"; f.tickets.push(ticket("201", { createdAt: "2026-10-20T10:03:00.000Z" })); expect(target(await f.run()).target.operation).toBe("link"); });
   it("does not choose a ticket created after reception for a reconstructed historical decision", async () => { const f = fixture(); f.input.mode = "at_receipt"; f.input.now = "2026-10-21T10:00:00.000Z"; f.tickets.push(ticket("201", { createdAt: "2026-10-20T10:03:00.000Z" })); expect(target(await f.run()).target.operation).toBe("create"); });
   it("does not break a tie between equivalent closed tickets arbitrarily", async () => { const f = closed(1); f.tickets.push(ticket("202", { stage: "closed", closedAt: "2026-10-19T12:00:00.000Z" })); reason(await f.run(), "same_issue_unresolved"); });
+  it("offers only the newest same-issue open ties, and links the ticket that the operator selected", async () => {
+    const f = fixture();
+    f.tickets.push(ticket("201"), ticket("202"), ticket("203", { createdAt: "2026-09-01T00:00:00Z" }), ticket("204"));
+    f.matches["204"] = "different";
+    expect(intakeSelectableTicketIds(await f.run(), [])).toEqual(["201", "202"]);
+    f.input.humanResolution = { choiceId: "open-tie", at, ticketId: "202" };
+    expect(target(await f.run()).target).toMatchObject({ operation: "link", ticketId: "202" });
+  });
+  it("offers recent matching closed tickets only and reopens the selected recent ticket", async () => {
+    const f = closed(1);
+    f.tickets.push(ticket("202", { stage: "closed", closedAt: "2026-10-19T12:00:00Z" }),
+      ticket("203", { stage: "closed", closedAt: "2026-10-02T00:00:00Z" }), ticket("204"));
+    f.matches["204"] = "different";
+    expect(intakeSelectableTicketIds(await f.run(), [])).toEqual(["201", "202"]);
+    f.input.humanResolution = { choiceId: "recent-tie", at, ticketId: "202" };
+    expect(target(await f.run()).target).toMatchObject({ operation: "reopen", ticketId: "202", preserveOwnerId: null });
+  });
+  it("offers only old matching predecessors and creates the new ticket with the chosen predecessor", async () => {
+    const f = closed(16);
+    f.tickets.push(ticket("202", { stage: "closed", closedAt: "2026-10-02T00:00:00Z" }), ticket("204"));
+    f.matches["204"] = "different";
+    expect(intakeSelectableTicketIds(await f.run(), [])).toEqual(["201", "202"]);
+    f.input.humanResolution = { choiceId: "old-tie", at, ticketId: "202" };
+    expect(target(await f.run()).target).toMatchObject({ operation: "create", predecessor: { ticketId: "202" } });
+  });
+  it("declines an unrelated old ticket as a predecessor even if a direct operator override names it", async () => {
+    const f = closed(16);
+    f.tickets.push(ticket("202", { stage: "closed", closedAt: "2026-10-02T00:00:00Z" }));
+    f.matches["202"] = "different";
+    f.input.humanResolution = { choiceId: "unrelated-old-ticket", at, ticketId: "202" };
+    reason(await f.run(), "same_issue_unresolved");
+  });
   it("limits unresponsive injected readers and propagates AbortSignal", async () => { const f = fixture(); let signal: AbortSignal | undefined; f.adapters.findContactsByEmail = async (_, s) => { signal = s; return new Promise(() => {}); }; const p = await planSavIntake(f.input, f.adapters, f.policy, { timeoutMs: 5 }); reason(p, "contact_lookup_failed"); expect(signal?.aborted).toBe(true); });
   it("caps reads rather than manufacture complete absence", async () => { const f = fixture(); reason(await planSavIntake(f.input, f.adapters, f.policy, { readCalls: 1 }), "contact_lookup_failed"); });
   it("does not dispatch a second template when the supplied journal says it is uncertain", async () => { const f = fixture(); delete f.contacts["101"]; f.input.previousIdentification = { messageId: mid, address: "sender@example.test", state: "uncertain" }; expect((await f.run()).steps).toEqual([]); });
@@ -698,4 +730,58 @@ describe('Independent SAV-73 resolved acknowledgements',()=>{
   const f=fixture(['acknowledgement']);f.input.message.currentText='Merci de me rappeler : mon problème persiste.';f.analysis.nature='information';
   expect((await f.run()).decision.disposition).toMatchObject({kind:'collect_context'});expect(f.calls).toEqual(['analyse']);
  });
+});
+
+describe("choosing between plausible tickets after a complete CRM read", () => {
+  const setup = (investigationComplete = false) => {
+    const f = fixture();
+    f.tickets.push(ticket("201"), ticket("202"));
+    f.matches["201"] = "partial";
+    f.matches["202"] = "partial";
+    const assess = f.adapters.assessIssues;
+    f.adapters.assessIssues = async (...args) => ({ ...await assess(...args), investigationComplete });
+    return f;
+  };
+  it("offers the two evidenced tickets without an effect, then accepts an explicit selection of the second ticket", async () => {
+    const f = setup(), undecided = await f.run();
+    reason(undecided, "same_issue_unresolved");
+    expect(undecided.progress).toMatchObject({ kind: "human_choice", questionCode: "equivalent_ticket_choice", view: "to_validate" });
+    expect(intakeSelectableTicketIds(undecided, [])).toEqual(["201", "202"]);
+    f.input.humanResolution = { choiceId: "operator-ticket", at, ticketId: "202" };
+    expect(target(await f.run()).target).toMatchObject({ operation: "link", ticketId: "202" });
+  });
+  it.each([false, true])("excludes a different ticket from the choices and direct overrides (investigation complete: %s)", async complete => {
+    const f = setup(complete);
+    f.tickets.push(ticket("203", { stage: "closed", closedAt: "2026-10-02T00:00:00.000Z" }));
+    f.matches["203"] = "different";
+    const undecided = await f.run();
+    expect(undecided.candidateTicketIds).toEqual(["201", "202"]);
+    expect(intakeSelectableTicketIds(undecided, ["203"])).toEqual(["201", "202"]);
+    expect(intakeSelectableTicketIds({ ...undecided, candidateTicketIds: ["201", "203"] }, [])).toEqual([]);
+    f.input.humanResolution = { choiceId: "wrong-destination", at, ticketId: "203" };
+    const rejected = await f.run();
+    reason(rejected, "same_issue_unresolved");
+    expect(rejected.candidateTicketIds).toEqual(["201", "202"]);
+  });
+  it("exposes no tickets when a persisted restricted plan is missing its choice progress", async () => {
+    const plan = await setup().run();
+    expect(plan.candidateTicketIds).toEqual(["201", "202"]);
+    Reflect.deleteProperty(plan, "progress");
+    expect(intakeSelectableTicketIds(plan, ["203"])).toEqual([]);
+  });
+  it("keeps an incomplete history out of the choice list", async () => {
+    const f = setup();
+    f.adapters.ticketHistory = async () => ({ ...read([]), status: "partial" });
+    const result = await f.run();
+    reason(result, "history_incomplete");
+    expect(result.progress.kind).toBe("processing");
+  });
+  it("keeps invalid assessments and unrelated tickets out of the choice list", async () => {
+    const f = setup();
+    f.matches["201"] = "different";
+    expect((await f.run()).progress.kind).toBe("processing");
+    f.adapters.assessIssues = async () => ({ investigationComplete: false, tickets: ["201", "202"].map(ticketId => ({
+      ticketId, relation: "same", requestIds: ["r0"], evidenceIds: ["current", "ticket-" + ticketId] })) });
+    expect((await f.run()).progress.kind).toBe("processing");
+  });
 });

@@ -31,7 +31,7 @@ export async function readReadRecoveryWake(runId:string,env:Env=process.env,now=
     sql`(${savEffectiveReceivedAt},${savMessages.createdAt},${savMessages.id})>(select least(original.received_at,original.created_at),original.created_at,original.id from sav.messages original where original.id=${run.messageId}::uuid)`)).limit(1);
   let compatible=Boolean(message&&message.mailboxId===config.mailboxId&&message.createdAt>new Date(config.createdAfter)&&message.receivedAt>new Date(config.receivedAfter)&&!newer);
   if(compatible&&message){const snapshot=await (await import("./runtime-store")).savIntakeSourceSnapshot(tx,message,now);compatible=snapshot.sourceHash===r.sourceHash;}
-  if(!thread||thread.aiPaused||thread.humanRequestedAt||human||!compatible){
+  if(!thread||thread.aiPaused||thread.humanRequestedAt && thread.humanRequestedAt >= message.createdAt||human||!compatible){
    if(!run.leaseUntil||run.leaseUntil<=now){r.state="invalidated";payload.readRecovery=r;await tx.update(savIntakeRuns).set({payloadCiphertext:encryptSavPayload(payload)}).where(eq(savIntakeRuns.id,runId));await writeReadRecoveryMarker(tx,runId,r);}
    return {state:"stopped" as const};
   }

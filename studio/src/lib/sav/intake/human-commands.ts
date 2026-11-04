@@ -11,6 +11,7 @@ import { admissionLock, releaseKeys } from "./execution-store";
 import { intakeRuntimeHash, type IntakeRuntimePayload } from "./runtime-contract";
 import { intakeConsoleInstalled } from "./console-capability";
 import { intakeHumanRefused, intakeRunCandidateContactIds, type HumanEventPayload } from "./human-binding";
+import { intakeSelectableTicketIds } from "./engine";
 import { requireIntakeConsoleStaff } from "./console-auth";
 import { savIntakeSourceSnapshot, intakeSourceMatches } from "./runtime-store";
 import { savEffectiveReceivedAt } from "@/lib/sav/message-order";
@@ -52,7 +53,7 @@ export async function recordIntakeHumanCommand(raw: unknown) {
     if(!candidates)throw Error("SAV_INTAKE_HUMAN_CONFLICT");
     const receipts = execution ? await tx.select().from(savIntakeEffects).where(and(eq(savIntakeEffects.executionId,execution.id),eq(savIntakeEffects.kind,"ticket_create"),eq(savIntakeEffects.state,"confirmed"))) : [];
     const confirmedTicketIds = receipts.flatMap(e=>e.ackCiphertext && e.verificationCiphertext ? [decryptSavPayload<{id:string}>(e.ackCiphertext).id] : []);
-    const candidateTickets = [...confirmedTicketIds,...(payload.plan?.decision.evidence.filter(e => e.source === "crm_ticket" && /^\d+$/.test(e.sourceId)).map(e => e.sourceId) ?? [])];
+    const candidateTickets = intakeSelectableTicketIds(payload.plan, confirmedTicketIds);
     if (command.ticketId && !candidateTickets.includes(command.ticketId)) throw Error("SAV_INTAKE_HUMAN_CONFLICT");
     if (!payload.plan || intakeRuntimeHash(candidates) !== command.candidatesHash
       || command.kind === "select" && (!command.contactId && !command.ticketId || command.contactId && !candidates.includes(command.contactId))

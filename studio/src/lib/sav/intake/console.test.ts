@@ -48,7 +48,7 @@ import { processPendingHubspotActions } from "../hubspot";
 import { processPendingGmailSendActions } from "../gmail";
 import { processDueFollowups } from "../followups";
 import { approveLearningCandidate } from "../learning";
-import { syncSavObservation, prepareSavObservationLearning } from "../observations";
+import { syncSavObservation, reconcileSavObservations, prepareSavObservationLearning } from "../observations";
 import { recordIntakeLaunch, readIntakeLaunch } from "./launch-boundary";
 import { v0Proposal } from "../../../../test/sav-v0-review-fixture";
 import { ensureSavCaseObservationTx } from "../case-learning";
@@ -70,7 +70,7 @@ async function message(thread = threadId, receivedAt = new Date(), subject = "Sy
     fromEmail: "customer@example.invalid", toEmails: ["support@example.invalid"], subject, receivedAt,
     bodyCiphertext: encryptSavPayload({ text: "The synthetic connection fails.", headers: { "message-id": "<incoming@example.invalid>" }, attachments: [] }) }).returning())[0];
 }
-async function observed(multiple = false, sensitive = false, same = true, equivalentContactIds?: string[], kind?: "acknowledgement") {
+async function observed(multiple = false, sensitive = false, same = true, equivalentContactIds?: string[], kind?: "acknowledgement", undecided?: Record<string, "partial" | "different">) {
   if (multiple) p.setContacts([{ id: "101", emails: ["customer@example.invalid"] }, { id: "102", emails: ["customer@example.invalid"] }]);
   const id = (await enqueueSavIntakeMessage(messageId, options.runtime))!, lease = (await claimSavIntakeRun(id, options.runtime))!;
   const semantics: AcceptedIntakeSemantics = { revision: SAV_INTAKE_SEMANTIC_RECORD_REVISION, validatorRevision: SAV_INTAKE_MODEL_REVISION, records: [] };
@@ -79,8 +79,8 @@ async function observed(multiple = false, sensitive = false, same = true, equiva
       ticketSummary: { title: "Synthetic connection failure", description: "The synthetic connection fails.", requestIds: ["r1"] } }),
     assessIdentity: async ({ candidates, evidence }) => ({ kind: "equivalent", investigationComplete: true,
       contactIds: equivalentContactIds ?? candidates.map(c => c.contact.id), evidenceIds: evidence.map(e => e.id) }),
-    assessIssues: async ({ tickets, requests }) => ({ investigationComplete: true, tickets: tickets.map(({ ticket }) => ({ ticketId: ticket.id,
-      relation: same ? "same" as const : "different" as const, requestIds: requests.map(r => r.id), evidenceIds: ["current", `ticket-${ticket.id}`, `history-${ticket.id}`] })) }),
+    assessIssues: async ({ tickets, requests }) => ({ investigationComplete: !undecided, tickets: tickets.map(({ ticket }) => ({ ticketId: ticket.id,
+      relation: undecided?.[ticket.id] ?? (same ? "same" as const : "different" as const), requestIds: requests.map(r => r.id), evidenceIds: ["current", `ticket-${ticket.id}`, `history-${ticket.id}`] })) }),
   }, semantics, () => {});
   const plan = await planSavIntake(lease.input, { ...createSavIntakeHubspotReaders({ network: p.network }), ...semantic }, options.runtime.policy, {}, () => new Date());
   const payload: IntakeRuntimePayload = { revision: SAV_INTAKE_RUNTIME_REVISION, input: lease.input, plan, semantics, effects: "not_connected",
@@ -224,6 +224,22 @@ it("form -> authenticated CAS -> accepted semantics -> derived run -> real HTTP 
   expect((await db.db.select().from(savIntakeModelCalls))).toHaveLength(3);
   expect((await db.db.select().from(savIntakeRuns)).reduce((n,r)=>n+r.attempts,0)).toBe(2);
   expect(fetch).not.toHaveBeenCalled();
+});
+it("offers only the two plausible tickets in Studio and rejects a direct choice of the unrelated third", async () => {
+  const ids = ["201", "202", "203"];
+  for (const id of ids) p.seedTicket({ id, stage: id === "203" ? "closed" : "open" });
+  p.links.set("contacts:101:tickets", ids);
+  const plan = await observed(false, false, true, undefined, undefined, { "201": "partial", "202": "partial", "203": "different" });
+  expect(plan.candidateTicketIds).toEqual(["201", "202"]);
+  await projectIntakeThread(threadId);
+  const detail = (await readIntakeConsoleDetail(threadId))!;
+  const { intakeDossierView } = await import("./dossier-view");
+  expect(intakeDossierView(detail).tickets).toEqual(["201", "202"]);
+  const raw = { ...await command(), contactId: undefined };
+  await expect(recordIntakeHumanCommand({ ...raw, ticketId: "203" })).rejects.toThrow("HUMAN_CONFLICT");
+  expect(await db.db.select().from(savIntakeHumanEvents)).toHaveLength(0);
+  expect((await recordIntakeHumanCommand({ ...raw, ticketId: "202" })).eventId).toBeTruthy();
+  expect(mutationsSent()).toHaveLength(0);
 });
 it("two operators and replay: one event wins, changed command is rejected", async () => {
   await observed(true); const raw = await command();
@@ -374,6 +390,59 @@ it("confirmed effects are not Treated until the first successful operational obs
   await syncSavObservation(observation.id,async ticketId=>({ticketId,subject:"Synthetic",status:"open",updatedAt:new Date().toISOString(),events:[],errors:[]}));
   await projectIntakeThread(threadId);expect((await listIntakeConsole({view:"learning"})).total).toBe(1);
   expect((await readIntakeLearningQualification(threadId))?.allowed).toBe(true);
+});
+it("recovers a confirmed ticket's observation after a CRM outage even with older frozen cases ahead", async () => {
+  vi.stubEnv("SAV_CASE_LEARNING_FROZEN", "true");
+  vi.stubEnv("HUBSPOT_ACCESS_TOKEN", "synthetic");
+  await observed();
+  const execution = (await admitIntakeExecution(runId, options))!;
+  expect((await executeIntakePass(execution.id, options)).state).toBe("confirmed");
+  expect(await ensureIntakeObservations()).toEqual({ created: 1 });
+  const [intake] = await db.db.select().from(savResolutionObservations);
+  const ticketId = intake.hubspotTicketId!;
+  const mutations = structuredClone(mutationsSent());
+  const effects = await getExecutionEffects(execution.id);
+  expect(effects.filter(e => e.kind === "ticket_create" && e.state === "confirmed")).toHaveLength(1);
+  expect(effects.filter(e => e.kind === "email_associate" && e.state === "confirmed")).toHaveLength(1);
+  // This older observation stays due while frozen. It used to consume the only slot on every pass.
+  const [legacy] = await db.db.insert(savResolutionObservations).values({
+    threadId, messageId, trackingOrigin: "draft_feedback", nextSyncAt: new Date(0)
+  }).returning();
+  const now = new Date(Math.max(Date.now(), intake.nextSyncAt.getTime()));
+  let available = false;
+  const read = vi.fn(async (url: string, init?: RequestInit) => {
+    const { pathname } = new URL(url);
+    if (init?.method !== "GET") throw Error("Unexpected provider write");
+    if (pathname === `/crm/v3/objects/tickets/${ticketId}`) return available
+      ? Response.json({ id: ticketId, updatedAt: now.toISOString(), properties: { subject: "Synthetic", hs_pipeline: "0", hs_pipeline_stage: "1" } })
+      : new Response(null, { status: 503 });
+    if (pathname === "/crm/v3/pipelines/tickets/0") return Response.json({ stages: [{id:"1", metadata:{isClosed:false}}] });
+    if (["emails", "notes", "tasks"].some(type => pathname === `/crm/v4/objects/tickets/${ticketId}/associations/${type}`))
+      return Response.json({ results: [] });
+    throw Error("Unexpected provider read");
+  });
+  vi.stubGlobal("fetch", read);
+  expect((await reconcileSavObservations(1, now, {maxComparisons:0})).processed)
+    .toEqual([{id:intake.id, status:"sources_incomplete"}]);
+  const [failed] = await db.db.select().from(savResolutionObservations).where(eq(savResolutionObservations.id, intake.id));
+  expect(failed).toMatchObject({sourceErrors:["HTTP_503"], leaseToken:null, hubspotTicketId:ticketId});
+  expect(failed.nextSyncAt.getTime()).toBeGreaterThan(now.getTime());
+  await projectIntakeThread(threadId);
+  expect((await listIntakeConsole({view:"processing"})).rows[0].status).toBe("followup_pending");
+
+  available = true;
+  expect((await reconcileSavObservations(1, failed.nextSyncAt, {maxComparisons:0})).processed)
+    .toEqual([{id:intake.id,status:"active",cycle:1}]);
+  await projectIntakeThread(threadId);
+  expect((await listIntakeConsole({view:"learning"})).rows[0].status).toBe("followup_started");
+  expect(await ensureIntakeObservations()).toEqual({created:0});
+  expect(await getExecutionEffects(execution.id)).toEqual(effects);
+  expect(mutationsSent()).toEqual(mutations);
+  expect(await db.db.select().from(savIntakeExecutions)).toHaveLength(1);
+  expect(await db.db.select().from(savIntakeModelCalls)).toHaveLength(0);
+  expect(read.mock.calls.every(([, init]) => init?.method === "GET")).toBe(true);
+  expect((await db.db.select().from(savResolutionObservations).where(eq(savResolutionObservations.id, legacy.id)))[0])
+    .toMatchObject({nextSyncAt:new Date(0), lastSyncAt:null});
 });
 it("sensitive operational closure becomes Completed without comparator, and reopening removes Completed", async () => {
   await observed(false,true);const execution=(await admitIntakeExecution(runId,options))!;await executeIntakePass(execution.id,options);await ensureIntakeObservations();
@@ -1885,4 +1954,32 @@ it.each(["worker","uncertain_effect"])("REVIEW-AE real close refuses a protected
   expect(result).toMatchObject({outcome:"refused",code:blocked==="worker"?"SAV_MCP_ACTIVE_WORKER":"SAV_MCP_UNSETTLED_ACTION"});
   expect(await db.db.select().from(auditLogs).where(eq(auditLogs.action,SAV_EXTERNAL_COMPLETION))).toHaveLength(0);
   expect(mutationsSent()).toHaveLength(0);expect(fetch).not.toHaveBeenCalled();
+});
+
+it("preserves the original request across an operator choice on the automatic reply, then accepts explicit outside completion", async () => {
+  vi.stubEnv("SAV_RELEASE_STAGE", "v0"); vi.stubEnv("SAV_PILOT_MODE", "false");
+  await activateSavV0Cutover({receivedAfter:new Date(Date.now()-3600000).toISOString(),mailboxEmail:"support@example.invalid",intakeRecipient:"contact@limova.ai",deploymentSha:"a".repeat(40),activatedBy:"ugo@limova.ai"});
+  const original = messageId;
+  await enqueueSavIntakeMessage(original, options.runtime);
+  const notice = await message(threadId, new Date(), "Re: Connexion");
+  messageId = notice.id;
+  await db.db.update(savMessages).set({ bodyCiphertext: encryptSavPayload({ text: "Je suis absent.", attachments: [], headers: {
+    "x-studio-automation-headers": "singleton-v1", "x-studio-automation-body":"complete-plain-v1", "auto-submitted":"auto-replied", "content-type":"text/plain", "in-reply-to":"<synthetic@other.invalid>" } }) }).where(eq(savMessages.id, notice.id));
+  const id = (await enqueueSavIntakeMessage(notice.id, options.runtime))!;
+  await (await import("./runtime")).analyseSavIntakeRuntime(id, options.runtime, { env: () => environment, network: fetch });
+  await projectIntakeThread(threadId);
+  const current = (await readIntakeConsoleDetail(threadId))!;
+  expect(current.projection.view).toBe("to_validate");
+  expect(current.messages.find(m => m.id === original)?.body.text).toContain("connection fails");
+  const first = (await recordIntakeHumanCommand(await command("classify"))).eventId;
+  await consumeIntakeHumanEvent(first, options.runtime, createSavIntakeHubspotReaders({ network: p.network }));
+  await projectIntakeThread(threadId);
+  const after = (await readIntakeConsoleDetail(threadId))!;
+  expect(after.current?.id).not.toBe(id);
+  expect(after.projection.view).toBe("to_validate");
+  expect(after.current?.payload.plan?.decision.evidence).toContainEqual(expect.objectContaining({source:"customer_history",sourceId:original}));
+  expect(await completeSavDossierManually({requestKey:randomUUID(),threadId,messageId:notice.id,confirmed:true})).toMatchObject({marked:1});
+  expect((await readIntakeConsoleDetail(threadId))?.projection.view).toBe("completed");
+  expect(await db.db.select().from(savIntakeModelCalls)).toHaveLength(0);
+  expect(fetch).not.toHaveBeenCalled(); expect(mutationsSent()).toHaveLength(0);
 });

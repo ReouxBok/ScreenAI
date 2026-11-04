@@ -1,6 +1,10 @@
 import "server-only";
 import { isHubspotOutboundDirection } from "./learning-extraction";
 import { isSavAiAuthoredReply } from "./reply-format";
+/** Delivery notifications can quote the customer's or the agent's entire message. */
+export function isDeliveryReportMime(value:unknown) {
+    return typeof value === "string" && /^multipart\/report\s*;(?:[^;]*;)*\s*report-type\s*=\s*(?:"delivery-status"|delivery-status)\s*(?:;|$)/i.test(value.trim());
+}
 export type ObservationEvent = {
     sourceRef: string;
     kind: string;

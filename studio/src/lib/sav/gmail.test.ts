@@ -160,3 +160,28 @@ describe("provider date in the future", () => {
     expect(parsed.headers).not.toHaveProperty("x-studio-gmail-internal-date");
   });
 });
+
+it("duplicate automation headers cannot supply a conclusive receipt, even with different casing", () => {
+  const headers = [{ name: "Auto-Submitted", value: "auto-replied" }, { name: "auto-submitted", value: "no" }];
+  const parse = (values: typeof headers) => parseGmailMessage("support@example.invalid", { id: "mail", threadId: "thread",
+    internalDate: String(Date.now()), payload: { mimeType: "text/plain", headers: values } }).headers;
+  expect(parse(headers)["x-studio-automation-headers"]).toBe("ambiguous");
+  expect(parse(headers.slice(0, 1))["x-studio-automation-headers"]).toBe("singleton-v1");
+});
+
+it("only a complete, unique plain text MIME body can qualify a terminal automation", () => {
+  const text = "Je suis absent.", body = { data: base64url(text), size: Buffer.byteLength(text) };
+  const parse = (payload: NonNullable<Parameters<typeof parseGmailMessage>[1]["payload"]>) =>
+    parseGmailMessage("support@example.invalid", { id: "m", threadId: "t", snippet: text, internalDate: String(Date.now()),
+      payload: { ...payload, headers: [{ name: "Auto-Submitted", value: "auto-replied" }, { name: "In-Reply-To", value: "<x@example.invalid>" }] } });
+  expect(parse({ mimeType: "text/plain", body }).headers["x-studio-automation-body"]).toBe("complete-plain-v1");
+  for (const payload of [
+    { mimeType: "text/plain" }, // snippet only
+    { mimeType: "text/plain", body: { ...body, size: body.size + 1 } },
+    { mimeType: "text/plain", body: { ...body, attachmentId: "attachment" } },
+    { mimeType: "multipart/alternative", parts: [{ mimeType: "text/plain", body },
+      { mimeType: "text/html", body: { data: base64url("<p>Je souhaite résilier</p>") } }] },
+    { mimeType: "text/plain", body, parts: [{ mimeType: "message/rfc822" }] },
+    { mimeType: "text/html", body },
+  ]) expect(parse(payload).headers).not.toHaveProperty("x-studio-automation-body");
+});

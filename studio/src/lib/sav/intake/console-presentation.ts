@@ -12,6 +12,9 @@ const statuses: Record<string, string> = {
   confirmed: "Actions confirmées", refused: "Poursuite arrêtée", superseded: "Version remplacée",
 };
 const reasons: Array<[RegExp, string]> = [
+  [/PRIOR_REQUEST_PENDING/, "Un mail antérieur reste à traiter. Vérifiez sa prise en charge avant de classer le dernier avis."],
+  [/AUTOMATED_REPLY/, "Accusé de réception automatique classé sans appel à l’IA. Le mail est conservé."],
+  [/SUPPORT_DELIVERY_FAILURE/, "Avis de distribution concernant un mail du support. Consulter l’avis pour vérifier son état."],
   [/ADDRESS_PROOF_UNRESOLVED/, "L’adresse retenue par l’analyse ne peut plus être prouvée à partir du mail. Aucune action n’est envoyée ; une décision humaine est nécessaire."],
   [/CRM_READ_/, "La lecture HubSpot est incomplète ou indisponible. Les actions déjà confirmées sont conservées ; la reprise vérifie le contexte sans les recréer."],
   [/MESSAGE_METADATA_INVALID/, "L’adresse de l’expéditeur ou la liste des destinataires est invalide ou dépasse les limites. Ce mail reste à vérifier ; les autres dossiers peuvent continuer."],

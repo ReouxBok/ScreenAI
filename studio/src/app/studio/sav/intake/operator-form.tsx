@@ -22,6 +22,8 @@ function receiptReason(reason:string){
   SAV_INTAKE_RUNTIME_DAILY_BUDGET_DEFERRED:"Plafond quotidien atteint : reprise automatique au prochain jour.",
   SAV_INTAKE_RUNTIME_ROLLING_BUDGET_DEFERRED:"Plafond sur 30 jours atteint : en attente de budget disponible.",
   SAV_INTAKE_OPERATOR_INTERRUPTED:"La reprise a été interrompue. Ses preuves et sa référence restent conservées.",
+  SAV_INTAKE_RESUME_NO_PROGRESS:"Rien de nouveau dans le CRM : la lecture reste incomplète. Aucune tentative ni appel IA n’a été utilisé. Ajoutez une information ou attendez que l’historique change.",
+  SAV_INTAKE_RESUME_PROBE_UNAVAILABLE:"Le CRM n’a pas pu être relu pour vérifier une nouveauté. Aucune tentative ni appel IA n’a été utilisé ; réessayez plus tard.",
  };
  return labels[reason]??"Une preuve, une autorisation ou une étape reste à vérifier. Le dossier et la demande sont conservés.";
 }

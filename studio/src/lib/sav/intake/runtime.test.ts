@@ -1188,3 +1188,41 @@ it("REVIEW a rolling budget deferral must not promise tomorrow's daily reset",as
  vi.useFakeTimers({toFake:["Date"]});vi.setSystemTime(new Date(Date.parse(new Date().toISOString().slice(0,10)+"T00:00:00Z")+86400000));
  try{expect(await claimSavIntakeRun(id,config)).toBeNull();expect((await readSavIntakeCurrent(threadId,config))?.payload.reason).not.toBe("SAV_INTAKE_RUNTIME_DAILY_BUDGET_DEFERRED");}finally{vi.useRealTimers();}
 });
+
+it("two fully read, plausible tickets leave a human choice and a second wake spends nothing", async () => {
+  const provider = executionProvider("synthetic@example.invalid");
+  const ids = ["201", "202"];
+  for (const ticketId of ids) {
+    provider.seedTicket({ id: ticketId, stage: "open" });
+    const noteId = "4" + ticketId;
+    provider.objects.notes[noteId] = { id: noteId, properties: { hs_note_body: "Connexion indisponible", hs_timestamp: new Date().toISOString() } };
+    provider.links.set("tickets:" + ticketId + ":notes", [noteId]);
+  }
+  provider.links.set("contacts:101:tickets", ids);
+  let modelCalls = 0;
+  const network: typeof fetch = async (url, init) => {
+    if (!String(url).startsWith("https://generativelanguage.googleapis.com/")) return provider.network(url, init);
+    modelCalls++;
+    const data = JSON.parse(JSON.parse(String(init?.body)).contents[0].parts[0].text);
+    const cite = (source: string) => data.citationCatalogue.find((c: { sourceId: string }) => c.sourceId === source)!.id;
+    const answer = !data.tickets ? { messageId, requests: [{ id: "r1", kind: "support", currentMessageId: messageId, quoteId: cite("current") }],
+      ticketSummary: { title: "Connexion synthétique", description: "La connexion ne marche plus.", requestIds: ["r1"] } }
+      : { investigationComplete: false, tickets: ids.map(ticketId => {
+        const sources = ["current", "ticket-" + ticketId, "history-" + ticketId];
+        return { ticketId, relation: "partial", requestIds: ["r1"], evidenceIds: sources, rationale: "Demande plausible sur ces deux dossiers.",
+          grounding: sources.map(source => ({ quoteId: cite(source) })) };
+      }) };
+    return Response.json({ candidates: [{ finishReason: "STOP", content: { parts: [{ text: JSON.stringify(answer) }] } }],
+      usageMetadata: { promptTokenCount: 100, candidatesTokenCount: 50, thoughtsTokenCount: 0, totalTokenCount: 150 } });
+  };
+  const id = (await enqueueSavIntakeMessage(messageId, config))!;
+  const analyse = () => analyseSavIntakeRuntime(id, config, { env: () => environment, network });
+  expect(await analyse()).toMatchObject({ state: "observed" });
+  const current = await readSavIntakeCurrent(threadId, config);
+  expect(current?.payload.plan?.progress).toMatchObject({ kind: "human_choice", questionCode: "equivalent_ticket_choice" });
+  expect(current?.payload.plan?.steps).toEqual([]);
+  expect(modelCalls).toBe(2);
+  expect(await analyse()).toMatchObject({ skipped: "not_claimed" });
+  expect(modelCalls).toBe(2);
+  expect(await f.db.select().from(savActions)).toHaveLength(0);
+});
