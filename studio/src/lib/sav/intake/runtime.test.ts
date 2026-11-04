@@ -888,6 +888,7 @@ it.each(["absent","invalid","expired","mismatch","protected","incomplete_evidenc
     const original=decryptSavPayload<Record<string,unknown>>(msg.bodyCiphertext);
     await f.db.update(savMessages).set({bodyCiphertext:encryptSavPayload({...original,attachmentInventory:{complete:true,limits:[]}})}).where(eq(savMessages.id,messageId));
   }
+  config = savIntakeRuntimeConfig(environment)!;
   const authenticateOther=vi.fn(async()=>{if(scenario==="unavailable_gmail")throw Error("SYN_UNAVAILABLE");return null;});
   const id = (await enqueueSavIntakeMessage(messageId, config))!;
   const network = vi.fn<typeof fetch>(async (url, init) => {
