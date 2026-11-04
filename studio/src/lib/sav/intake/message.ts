@@ -3,7 +3,7 @@ import { intakeMessageSchema, type IntakeMessage } from "./engine-types";
 import { intakeHtmlDocumentText, intakeHtmlDocumentComplete } from "./html-message";
 
 /** Pure transport derivation. Does not open a Studio dossier or mark it read. */
-export function prepareSavIntakeMessage(input: Omit<IntakeMessage, "currentText" | "contentComplete" | "forwardedQuoteOnly"> & {
+export function prepareSavIntakeMessage(input: Omit<IntakeMessage, "currentText" | "contentComplete" | "forwardedQuoteOnly" | "standaloneAuthoredLine"> & {
   subject: string; body: string; bodyComplete: boolean; unresolvedAttachments: boolean;
 }) {
   // Intake needs every section for provenance. The V0 display context caps
@@ -19,6 +19,8 @@ export function prepareSavIntakeMessage(input: Omit<IntakeMessage, "currentText"
   const truncated = input.body.length >= 100_000 || subjectTruncated || currentText.length > 100_000;
   const textComplete = bodyComplete && intakeHtmlDocumentComplete(input.body) && !truncated;
   const message = intakeMessageSchema.parse({ ...metadata,
+    ...(textComplete && !unresolvedAttachments && !subjectInherited && !context.quotedText && !context.signatureText
+      && currentText && !currentText.includes("\n") ? { standaloneAuthoredLine: true } : {}),
     ...(/^\s*(?:fw|fwd|tr)\s*:/i.test(subject) && !context.currentText && context.quotedText ? { forwardedQuoteOnly: true } : {}),
     currentText: currentText.slice(0, 100_000),
     contentComplete: textComplete && !unresolvedAttachments });

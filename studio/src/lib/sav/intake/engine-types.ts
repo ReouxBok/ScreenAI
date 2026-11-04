@@ -11,6 +11,7 @@ export const intakeMessageSchema = z.object({
   // Transport must provide the current authored part, not quoted history/signatures.
   currentText: z.string().max(100_000), contentComplete: z.boolean(),
   direction: z.enum(["inbound", "outbound"]),
+  standaloneAuthoredLine: z.literal(true).optional(),
   forwardedQuoteOnly: z.literal(true).optional(),
   operatorInformation: intakeOperatorInformationSchema.optional(),
   attachmentInputs: z.array(z.object({ sourceId: ref, fileHash: z.string().regex(/^[a-f0-9]{64}$/) }).strict()).max(3).optional(),

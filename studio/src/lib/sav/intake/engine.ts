@@ -263,12 +263,11 @@ export async function planSavIntake(
     // Preserve it for a targeted operator question if the producer omitted it.
     if (/^(?:ça|ca|cela)\s+ne\s+(?:fonctionne|marche)\s+(?:pas|plus)[.!\s]*$/iu.test(message.currentText.trim().split("\n")[0])
       && !analysis.requests.some(r => ["support", "finance", "cancellation"].includes(r.kind))) {
-      classification = "support"; requests = [{ id: "written-support", kind: "support", evidenceIds: [current] }];
       // A standalone authored malfunction is itself a support request. Keep the
       // existing guarded CRM path for selection, creation, and association.
       // Extra text, another message, an attachment, or competing intent still
       // needs investigation before inferring scope from a single sentence.
-      const standalone = !message.currentText.trim().includes("\n") && !message.attachmentInputs?.length
+      const standalone = message.standaloneAuthoredLine === true && !message.currentText.trim().includes("\n") && !message.attachmentInputs?.length
         && !message.unreadAttachments?.length && !continuation && !input.humanResolution
         && conversation.every(row => row.id === message.id)
         && analysis.requests.every(row => ["unknown", "other", "acknowledgement"].includes(row.kind));
