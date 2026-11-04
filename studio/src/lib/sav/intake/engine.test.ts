@@ -763,6 +763,12 @@ describe("choosing between plausible tickets after a complete CRM read", () => {
     reason(rejected, "same_issue_unresolved");
     expect(rejected.candidateTicketIds).toEqual(["201", "202"]);
   });
+  it("exposes no tickets when a persisted restricted plan is missing its choice progress", async () => {
+    const plan = await setup().run();
+    expect(plan.candidateTicketIds).toEqual(["201", "202"]);
+    Reflect.deleteProperty(plan, "progress");
+    expect(intakeSelectableTicketIds(plan, ["203"])).toEqual([]);
+  });
   it("keeps an incomplete history out of the choice list", async () => {
     const f = setup();
     f.adapters.ticketHistory = async () => ({ ...read([]), status: "partial" });

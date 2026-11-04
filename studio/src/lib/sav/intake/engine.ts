@@ -42,11 +42,12 @@ export function savIntakePlanFingerprint(plan: Pick<IntakePlan, "decision" | "no
  * retain their existing choices and their original fingerprint. */
 export function intakeSelectableTicketIds(plan: IntakePlan | undefined, confirmedIds: string[]): string[] {
   const examined = plan?.decision.evidence.filter(e => e.source === "crm_ticket" && /^\d+$/.test(e.sourceId)).map(e => e.sourceId) ?? [];
-  if (plan?.candidateTicketIds !== undefined || plan?.progress.kind === "human_choice" && plan.progress.questionCode === "equivalent_ticket_choice") {
+  const equivalentTicketChoice = plan?.progress?.kind === "human_choice" && plan.progress.questionCode === "equivalent_ticket_choice";
+  if (plan?.candidateTicketIds !== undefined || equivalentTicketChoice) {
     if (!plan || savIntakePlanFingerprint(plan) !== plan.fingerprint) return [];
     if (plan.candidateTicketIds !== undefined) {
       const ids = plan.candidateTicketIds;
-      return plan.progress.kind === "human_choice" && plan.progress.questionCode === "equivalent_ticket_choice"
+      return equivalentTicketChoice
         && Array.isArray(ids) && ids.length >= 2 && new Set(ids).size === ids.length && ids.every(id => examined.includes(id)) ? [...ids] : [];
     }
   }
