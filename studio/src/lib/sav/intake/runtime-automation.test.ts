@@ -246,3 +246,27 @@ it.each(["completed", "to_validate", "reverted"] as const)("only a terminal, unr
   }
   expect(network).not.toHaveBeenCalled();
 });
+
+it("never loses the original customer request when a funded reader would call the new notice an acknowledgement", async () => {
+  const earlier = await mail({ text: "Ma connexion est bloquée.", receivedAt: new Date(Date.now() - 2000) });
+  const first = (await enqueueSavIntakeMessage(earlier.id, config))!;
+  const notice = await mail({ text: "Je suis absent.", headers: absence });
+  const id = (await enqueueSavIntakeMessage(notice.id, config))!;
+  const network = ackModel(notice.id);
+  await analyseSavIntakeRuntime(id, config, { env: () => environment, network });
+  expect((await f.db.select().from(savIntakeRuns).where(eq(savIntakeRuns.id, first)))[0].state).toBe("superseded");
+  const result = (await readSavIntakeCurrent(threadId, config))?.payload.plan;
+  expect(result?.decision.disposition.kind).toBe("collect_context");
+  expect(result?.progress).toMatchObject({ kind: "human_choice", view: "to_validate" });
+  expect(result?.decision.evidence).toContainEqual(expect.objectContaining({ source: "customer_history", sourceId: earlier.id }));
+  expect(network).not.toHaveBeenCalled();
+});
+
+function ackModel(messageId: string) {
+  return vi.fn(async (url: Parameters<typeof fetch>[0], init?: RequestInit) => {
+    expect(String(url)).toMatch(/^https:\/\/generativelanguage.googleapis.com\//);
+    const data = JSON.parse(JSON.parse(String(init?.body)).contents[0].parts[0].text);
+    const answer = { messageId, requests: [{ id: "ack", kind: "acknowledgement", currentMessageId: messageId, quoteId: data.citationCatalogue.find((x: { sourceId: string }) => x.sourceId === "current").id }] };
+    return Response.json({ candidates: [{ finishReason: "STOP", content: { parts: [{ text: JSON.stringify(answer) }] } }], usageMetadata: { promptTokenCount: 100, candidatesTokenCount: 50, thoughtsTokenCount: 0, totalTokenCount: 150 } });
+  });
+}
