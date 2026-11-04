@@ -1,5 +1,5 @@
 import { rename } from "node:fs/promises";
-import os from "node:os";
+import { randomUUID } from "node:crypto";
 import path from "node:path";
 import { PGlite } from "@electric-sql/pglite";
 import { vector } from "@electric-sql/pglite-pgvector";
@@ -8,8 +8,15 @@ import { migrate } from "drizzle-orm/pglite/migrator";
 import { eq } from "drizzle-orm";
 import { categories, contentItems, contentVersions } from "../src/db/schema";
 import { CATEGORIES } from "../src/lib/content";
-const target=path.resolve(process.env.STUDIO_E2E_DB_DIR ?? ".e2e-db");
-try { await rename(target,path.join(os.tmpdir(),`limova-studio-e2e-backup-${Date.now()}`)); } catch (error) { if ((error as NodeJS.ErrnoException).code!=="ENOENT") throw error; }
+const target = path.resolve(process.env.STUDIO_E2E_DB_DIR ?? ".e2e-db");
+// Keep the atomic rename on the checkout's filesystem. CI may mount /tmp on another device.
+const backup = path.join(path.dirname(target), `.e2e-db-backup-${randomUUID()}`);
+try {
+  await rename(target, backup);
+  console.log(`Previous E2E database preserved at ${backup}`);
+} catch (error) {
+  if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+}
 const client=new PGlite(`file://${target}`,{extensions:{vector}});
 const db=drizzle(client);
 await migrate(db,{migrationsFolder:path.resolve("drizzle")});
