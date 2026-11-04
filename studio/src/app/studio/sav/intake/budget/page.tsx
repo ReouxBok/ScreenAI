@@ -17,17 +17,24 @@ export default async function IntakeBudgetPage() {
     {panel.overrideInvalid && <p role="alert">Le réglage enregistré est illisible : les analyses sont suspendues jusqu’à un nouvel enregistrement.</p>}
     {!panel.operational && !panel.configurationError && <p role="alert">Le profil courant n’est pas opérationnel : le plafond Studio ne s’applique pas.</p>}
     <section className={styles.choice}>
-      <h2>Aujourd’hui (jour UTC)</h2>
+      <h2>{panel.operational ? "Aujourd’hui (jour UTC)" : "Campagne de qualification (cumul)"}</h2>
       <dl>
         <dt>Plafond effectif</dt><dd>{usd(panel.effectiveNanoUsd)} {panel.override?.maxNanoUsd ? "(réglage Studio)" : "(configuration)"}</dd>
         <dt>Plafond de la configuration</dt><dd>{usd(panel.configuredNanoUsd)}</dd>
-        <dt>Compté aujourd’hui</dt><dd>{usd(u?.chargedNanoUsd)}{u?.uncertain ? " — dont des réservations au coût encore inconnu" : ""}</dd>
+        <dt>Compté aujourd’hui</dt><dd>{usd(u?.chargedNanoUsd)}{u && u.dailyUnsettledNanoUsd > 0 ? " — dont des réservations au coût encore inconnu" : ""}</dd>
         <dt>Dépense confirmée aujourd’hui</dt><dd>{u ? `${usd(u.settledNanoUsd)} (${u.settledCallCount} appel(s))` : "—"}</dd>
-        <dt>Réservations en cours</dt><dd>{u ? `${usd(u.inFlightNanoUsd)} (${u.inFlightCallCount} appel(s))` : "—"}</dd>
-        <dt>Coûts incertains conservés</dt><dd>{u ? `${usd(u.uncertainNanoUsd)} (${u.uncertainCallCount} appel(s)${u.oldestUnsettledAt ? `, le plus ancien depuis ${u.oldestUnsettledAt}` : ""})` : "—"}</dd>
+        <dt>Réservations du jour encore non soldées</dt><dd>{u ? `${usd(u.dailyUnsettledNanoUsd)} (${u.dailyUnsettledCallCount} appel(s))` : "—"}</dd>
         <dt>Marge restante</dt><dd>{usd(u?.remainingNanoUsd)}</dd>
         <dt>Marge requise pour démarrer une analyse</dt><dd>{usd(u?.requiredNanoUsd)}</dd>
         <dt>Appels aujourd’hui</dt><dd>{u ? `${u.callCount} / ${u.maxCalls}` : "—"}</dd>
+      </dl>
+    </section>
+    <section className={styles.choice}>
+      <h2>Exposition sur 30 jours</h2>
+      <p>Les réservations non soldées, quelle que soit leur date, restent comptées dans cette enveloppe. Les appels réglés y comptent pendant 30 jours à partir de leur départ.</p>
+      <dl>
+        <dt>Réservations en cours</dt><dd>{u ? `${usd(u.inFlightNanoUsd)} (${u.inFlightCallCount} appel(s))` : "—"}</dd>
+        <dt>Coûts incertains conservés</dt><dd>{u ? `${usd(u.uncertainNanoUsd)} (${u.uncertainCallCount} appel(s)${u.oldestUnsettledAt ? `, le plus ancien depuis ${u.oldestUnsettledAt}` : ""})` : "—"}</dd>
         <dt>Sur 30 jours glissants</dt><dd>{u ? `${usd(u.rollingChargedNanoUsd)} / ${usd(u.maxRollingNanoUsd)}` : "—"}</dd>
       </dl>
     </section>

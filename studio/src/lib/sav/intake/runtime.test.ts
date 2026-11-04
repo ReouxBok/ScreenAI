@@ -405,8 +405,8 @@ it("5 USD deducts settled and uncertain usage, never resets the ledger, and the3
   // Each row costs one full reservation (0.817152 USD): the maximum a single settled call can charge.
   const fill=(n:number,state:string,createdAt=new Date())=>Array.from({length:n},(_,i)=>({messageKey:intakeRuntimeHash(`fill-${state}-${createdAt.getTime()}-${i}`),requestHash:intakeRuntimeHash(`req-${state}-${createdAt.getTime()}-${i}`),state,reservedNanoUsd:817152000,chargedNanoUsd:817152000,
     payloadCiphertext:encryptSavPayload({metadata:{inputTokens:1048576,outputTokens:8192,thoughtTokens:0,totalTokens:1056768}}),createdAt}));
-  // 4.09 USD settled today + one old uncertain reservation of another message: above 3 USD, within 5 USD.
-  await f.db.insert(savIntakeModelCalls).values([...fill(5,"settled"),...fill(1,"uncertain",new Date(Date.now()-40*86400000))]);
+  // 4.09 USD settled today + one current-day uncertain reservation of another message: above 3 USD, within 5 USD.
+  await f.db.insert(savIntakeModelCalls).values([...fill(5,"settled"),...fill(1,"uncertain")]);
   expect(await readSavIntakeBudget(atThree)).toMatchObject({chargedNanoUsd:4902912000,remainingNanoUsd:0,uncertain:true});
   expect(await readSavIntakeBudget(raised)).toMatchObject({chargedNanoUsd:4902912000,remainingNanoUsd:97088000,lifetimeCallCount:6});
   // Remaining 0.097 USD < one 0.817 USD reservation: deferred, no attempt consumed, no reset of history.
@@ -467,7 +467,7 @@ it("one provider timeout reserves its full cost beyond30days, blocks its message
   await f.db.update(savIntakeModelCalls).set({state:"uncertain",createdAt:new Date(Date.now()-31*86400000)}).where(eq(savIntakeModelCalls.id,a.id));
   threadId=(await f.db.insert(savThreads).values({mailboxId,gmailThreadId:randomUUID(),customerEmail:"other@example.invalid"}).returning())[0].id;messageId=(await message()).id;
   const second=await lease(),b=await reserveSavIntakeCall(second,config,"second-b");
-  expect(b.cached).toBeNull();expect((await readSavIntakeBudget(config))).toMatchObject({chargedNanoUsd:1634304000,rollingChargedNanoUsd:1634304000,lifetimeCallCount:2,uncertain:true});
+  expect(b.cached).toBeNull();expect((await readSavIntakeBudget(config))).toMatchObject({chargedNanoUsd:817152000,callCount:1,rollingChargedNanoUsd:1634304000,lifetimeCallCount:2,uncertain:true});
   await expect(reserveSavIntakeCall(first,config,"retry-a")).rejects.toThrow("USAGE_UNCERTAIN");
   expect((await readSavIntakeBudget({...config,maxCalls:299}))).toHaveProperty("lifetimeCallCount",2);
 });

@@ -5,7 +5,7 @@ vi.mock("@/lib/sav/intake/budget-admin", () => ({ readIntakeBudgetPanel: mocks.p
 vi.mock("./actions", () => ({ setBudgetAction: mocks.set }));
 import Page from "./page";
 const panel = { configuredNanoUsd: 3_000_000_000, effectiveNanoUsd: 5_000_000_000, override: { maxNanoUsd: 5_000_000_000 }, overrideInvalid: false, operational: true, configurationError: null, ceilingNanoUsd: 20_000_000_000,
-  usage: { chargedNanoUsd: 3_268_608_000, remainingNanoUsd: 1_731_392_000, callCount: 4, maxCalls: 300, rollingChargedNanoUsd: 3_268_608_000, maxRollingNanoUsd: 90_000_000_000, uncertain: true, maxNanoUsd: 5_000_000_000 },
+  usage: { chargedNanoUsd: 3_268_608_000, remainingNanoUsd: 1_731_392_000, callCount: 4, maxCalls: 300, rollingChargedNanoUsd: 3_268_608_000, maxRollingNanoUsd: 90_000_000_000, uncertain: true, dailyUnsettledNanoUsd: 817_152_000, dailyUnsettledCallCount: 1, maxNanoUsd: 5_000_000_000 },
   history: [{ at: "2026-10-26T23:00:00.000Z", actor: "ugo@limova.ai", previousNanoUsd: null, nextNanoUsd: 5_000_000_000, reason: "Blocage" }] };
 beforeEach(() => { vi.clearAllMocks(); mocks.panel.mockResolvedValue(panel); });
 it("shows effective cap, today's usage, the form and history, inert on GET", async () => {
@@ -31,4 +31,14 @@ it("BUDGET-RES breaks down confirmed spend, reservations in flight and unknown c
   for (const text of ["Dépense confirmée aujourd’hui", "0,80 USD (92 appel(s))", "Coûts incertains conservés", "8,99 USD (11 appel(s), le plus ancien depuis 2026-10-22T20:25:34.000Z)",
     "Marge requise pour démarrer une analyse", "0,64 USD", "Les réservations au coût inconnu bloquent les analyses", "rien n’est libéré automatiquement"]) expect(html).toContain(text);
   expect(html).not.toContain("817152");
+});
+
+it("shows historical uncertainty in the rolling exposure without implying today’s settled spend includes it", async () => {
+  mocks.panel.mockResolvedValue({ ...panel, usage: { ...panel.usage, chargedNanoUsd: 900_000_000, settledNanoUsd: 900_000_000,
+    dailyUnsettledNanoUsd: 0, dailyUnsettledCallCount: 0, uncertainNanoUsd: 18_300_312_750, uncertainCallCount: 39,
+    rollingChargedNanoUsd: 19_200_312_750, oldestUnsettledAt: "2026-10-26T14:12:16.838Z" } });
+  const html = renderToStaticMarkup(await Page());
+  expect(html).not.toContain("dont des réservations au coût encore inconnu");
+  const [today, exposure] = html.split("Exposition sur 30 jours");
+  expect(today).toContain("0,90 USD"); expect(today).not.toContain("18,30 USD"); expect(exposure).toContain("18,30 USD");
 });
