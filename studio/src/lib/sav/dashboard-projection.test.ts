@@ -17,7 +17,8 @@ afterEach(() => { vi.unstubAllEnvs(); vi.restoreAllMocks(); });
 beforeEach(async () => {
   vi.stubEnv("SAV_RELEASE_STAGE", "v0"); vi.stubEnv("SAV_PILOT_MODE", "false"); vi.stubEnv("SAV_OTHER_OBSERVATION_RULES_JSON", "");
   vi.stubEnv("SAV_ENCRYPTION_KEY_V1", "test-only-sav-encryption-key-32-characters");
-  await fixture.client.exec("TRUNCATE sav.mailboxes CASCADE; TRUNCATE sav.sync_state; TRUNCATE audit_logs");
+  // sav-v0-cutover is the only sync_state key this file writes; the migrator's schema markers are not this file's to remove.
+  await fixture.client.exec("TRUNCATE sav.mailboxes CASCADE; DELETE FROM sav.sync_state WHERE key = 'sav-v0-cutover'; TRUNCATE audit_logs");
   const [mailbox] = await fixture.db.insert(savMailboxes).values({ email: "contact@limova.ai" }).returning(); mailboxId = mailbox.id;
   await activateSavV0Cutover({ receivedAfter: "2026-10-02T12:00:00Z", mailboxEmail: mailbox.email, intakeRecipient: "contact@limova.ai", deploymentSha: "a".repeat(40), activatedBy: "ugo@limova.ai" });
 });

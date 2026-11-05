@@ -60,10 +60,12 @@ describe("persisted dossier enrichment", () => {
     expect(await fixture.db.select().from(savAgentRuns)).toEqual([]);
     expect(state.analyze).not.toHaveBeenCalled();
   });
-  it("uses the actual sender and persists context before reasoning without changing the source email", async () => {
+  it("uses the actual sender and persists context without changing the source email; the retired analysis never reasons on it", async () => {
     const message = await seed();
-    await processStoredSavMessage(message.id);
-    expect(state.analyze).toHaveBeenCalledOnce();
+    // The old V0 analysis used to collect this context before reasoning (SAV-9 retired it): the collection itself still persists it.
+    expect(await processStoredSavMessage(message.id)).toBeNull();
+    expect(state.analyze).not.toHaveBeenCalled();
+    await collectSavDossierContext(message.id);
     expect(state.crm).toHaveBeenCalledWith(expect.objectContaining({ email: customer, toleratePartial: true }));
     const [stored] = await fixture.db.select().from(savMessages).where(eq(savMessages.id, message.id));
     expect(decryptSavPayload(stored.bodyCiphertext)).toMatchObject({ text: `Message de ${customer}`, html: "<p>Original</p>", supportContext: { crm: { status: "ready", data: { contactId: "42" } } } });
@@ -125,34 +127,35 @@ describe("forwarded customer enrichment", () => {
   });
 });
 
-describe("targeted missing-proposal repair", () => {
+describe("targeted missing-proposal repair (retired with the old V0 analysis, SAV-9)", () => {
   async function incomplete() {
     const message = await seed();
     await fixture.db.update(savMessages).set({ processedAt: at, analysisStatus: "done" }).where(eq(savMessages.id, message.id));
     const [decision] = await fixture.db.insert(savDecisions).values({ messageId: message.id, kind: "human_review_required", reasonCode: "old", explanation: "Ancienne analyse sans snapshot", confidence: 0, model: "rules-v1", actorType: "ai" }).returning();
     return { message, decision };
   }
-  it("preserves the old decision, links a new proposal and queues no external action", async () => {
+  it("generates no proposal: the old decision stays current, nothing is linked and no external action is queued", async () => {
     const { message, decision } = await incomplete();
-    await repairSavProposal(message.id, "ugo@limova.ai");
+    await expect(repairSavProposal(message.id, "ugo@limova.ai")).rejects.toThrow("SAV_V0_ANALYSIS_RETIRED");
     const rows = await fixture.db.select().from(savDecisions);
-    expect(rows).toHaveLength(2);
-    expect(rows.find(row => row.id === decision.id)?.isCurrent).toBe(false);
-    expect(rows.find(row => row.isCurrent)).toMatchObject({ supersedesDecisionId: decision.id, agentRunId: expect.any(String) });
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({ id: decision.id, isCurrent: true, agentRunId: null });
     expect(await fixture.db.select().from(savActions)).toHaveLength(0);
-    await expect(repairSavProposal(message.id, "ugo@limova.ai")).rejects.toThrow("SAV_PROPOSAL_ALREADY_AVAILABLE");
-    expect(await fixture.db.select().from(savDecisions)).toHaveLength(2);
+    expect(await fixture.db.select().from(savAgentRuns)).toHaveLength(0);
+    expect(state.analyze).not.toHaveBeenCalled();
   });
   it("never replaces a human correction", async () => {
     const { message, decision } = await incomplete();
     await fixture.db.update(savDecisions).set({ actorType: "human" }).where(eq(savDecisions.id, decision.id));
-    await expect(repairSavProposal(message.id, "ugo@limova.ai")).rejects.toThrow("SAV_REPAIR_CONTEXT_CHANGED");
-    expect(await fixture.db.select().from(savDecisions)).toHaveLength(1);
+    await expect(repairSavProposal(message.id, "ugo@limova.ai")).rejects.toThrow("SAV_V0_ANALYSIS_RETIRED");
+    const rows = await fixture.db.select().from(savDecisions);
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({ id: decision.id, actorType: "human", isCurrent: true });
   });
-  it("never repairs historical mail or allows unauthorized staff", async () => {
+  it("refuses historical mail and every staff address alike, without any generation", async () => {
     const message = await seed(customer, new Date("2026-10-01T12:00:00Z"));
-    await expect(repairSavProposal(message.id, "ugo@limova.ai")).rejects.toThrow("SAV_MESSAGE_BEFORE_CUTOVER");
-    await expect(repairSavProposal(message.id, "other@limova.ai")).rejects.toThrow();
+    await expect(repairSavProposal(message.id, "ugo@limova.ai")).rejects.toThrow("SAV_V0_ANALYSIS_RETIRED");
+    await expect(repairSavProposal(message.id, "other@limova.ai")).rejects.toThrow("SAV_V0_ANALYSIS_RETIRED");
     expect(state.analyze).not.toHaveBeenCalled();
   });
 });
@@ -171,7 +174,13 @@ it("refreshes the latest inbound message instead of an older inbox row or an out
 });
 
 it("preserves the reviewed process across enrichment refreshes and exposes changed CRM facts for fresh action checks", async () => {
-  const message = await seed(); await processStoredSavMessage(message.id);
+  const message = await seed();
+  // The old analysis is retired (SAV-9) and produces nothing any more: this is a run and a decision it left behind, which a person may still review.
+  expect(await processStoredSavMessage(message.id)).toBeNull();
+  const priorContext = await collectSavDossierContext(message.id);
+  const prior = await state.analyze({ from: customer, subject: message.subject, body: `Message de ${customer}`, dossierContext: priorContext }, { messageId: message.id });
+  await fixture.db.insert(savDecisions).values({ messageId: message.id, agentRunId: prior.agentRunId, kind: prior.proposal.kind, reasonCode: prior.proposal.reasonCode, explanation: prior.proposal.explanation, confidence: prior.proposal.confidence, evidence: [], model: prior.model, actorType: "ai" });
+  await fixture.db.update(savMessages).set({ processedAt: at, analysisStatus: "done" }).where(eq(savMessages.id, message.id));
   // Opening the dossier refreshes the thread state produced by analysis before review.
   await collectLatestSavDossierContext(message.threadId);
   const [stored] = await fixture.db.select().from(savMessages).where(eq(savMessages.id, message.id));

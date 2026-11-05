@@ -167,7 +167,7 @@ describe("SAV dossier SSR and human-review guardrails", () => {
     dependencies.detail.mockResolvedValue(detail); dependencies.review.mockResolvedValue(null);
     const html = await renderPage();
     expect(html).toContain("Fiche de Camille Exemple"); expect(html).toContain("Une autre question"); expect(html).not.toContain("#42"); expect(html).not.toContain("#99");
-    expect(html).toContain("Reconstituer la proposition manquante");
+    expect(html).not.toContain("Reconstituer la proposition manquante"); // SAV-60: A16 retired
     expect(html).not.toContain("Les anciens emails ne sont pas retraités");
   });
   it("does not turn a CRM outage into a missing contact", async () => {
@@ -250,34 +250,34 @@ describe("SAV dossier SSR and human-review guardrails", () => {
     expect(buttonAttributes(html,"Enregistrer ma version")).toHaveLength(1);
     const draftForms = [...html.matchAll(/<form\b[^>]*>([\s\S]*?)<\/form>/g)].map(match=>match[1]);
     expect(draftForms.find(form=>form.includes('name="text"'))).not.toContain('name="status"');
-    expect(buttonAttributes(html, "Confirmer l’envoi de cette réponse")).toEqual([expect.stringContaining('disabled=""')]);
+    expect(buttonAttributes(html, "Confirmer l’envoi de cette réponse")).toHaveLength(0); expect(html).toContain("Ancien circuit retiré : aucun envoi depuis ce dossier.");
     expect(html).toContain("validée séparément par Ugo");
     expect(html).toContain("Non assigné");
     expect(html).not.toContain("Sources et preuves");
   });
 
-  it("renders the independent send confirmation, waiting for the browser preview hash", async () => {
+  it("SAV-60: offers no send confirmation even with writes enabled and an accepted draft", async () => {
     vi.stubEnv("SAV_WRITES_DISABLED", "false");
     dependencies.review.mockResolvedValue({...reviewFixture(),draftVerdict:{id:"verdict",status:"accepted",draftId:"accepted-draft",stale:false,reason:"",reviewedBy:"ugo@limova.ai"}});
     const html = await renderPage();
-    expect(buttonAttributes(html, "Confirmer l’envoi de cette réponse")[0]).toContain("disabled");
-    expect(html).toContain("Ce bouton confirme le texte et le destinataire affichés.");
+    expect(buttonAttributes(html, "Confirmer l’envoi de cette réponse")).toHaveLength(0);
+    expect(html).toContain("Ancien circuit retiré : aucun envoi depuis ce dossier.");
   });
-  it("renders human V0 confirmation on a paused dossier, with browser hash still required", async () => {
+  it("SAV-60: a paused dossier offers neither send nor human transfer", async () => {
     vi.stubEnv("SAV_WRITES_DISABLED", "false");
     const detail = detailFixture();
     detail.thread.aiPaused = true; detail.thread.status = "human_requested";
     dependencies.detail.mockResolvedValue(detail);
     dependencies.review.mockResolvedValue({...reviewFixture(),draftVerdict:{id:"verdict",status:"accepted",draftId:"accepted-draft",stale:false,reason:"",reviewedBy:"ugo@limova.ai"}});
     const html = await renderPage();
-    expect(buttonAttributes(html, "Confirmer l’envoi de cette réponse")[0]).toContain("disabled");
+    expect(buttonAttributes(html, "Confirmer l’envoi de cette réponse")).toHaveLength(0);
     expect(html).not.toContain("Envoi désactivé dans cette prévisualisation");
     expect(buttonAttributes(html, "Transférer à un humain")).toHaveLength(0);
   });
-  it("explains the real environment lock rather than claiming this is a preview", async () => {
+  it("SAV-60: explains that sending left with the V0 circuit", async () => {
     const html = await renderPage();
-    expect(html).toContain("Les envois sont désactivés dans cet environnement");
-    expect(buttonAttributes(html, "Confirmer l’envoi de cette réponse")[0]).toContain("disabled");
+    expect(html).toContain("Ancien circuit retiré : aucun envoi depuis ce dossier.");
+    expect(buttonAttributes(html, "Confirmer l’envoi de cette réponse")).toHaveLength(0);
   });
 
   it("lists only knowledge actually supporting the response/process, not every retrieved search result", async () => {
@@ -289,12 +289,12 @@ describe("SAV dossier SSR and human-review guardrails", () => {
     expect(html).not.toContain("Résultat non utilisé");
   });
 
-  it.each(["succeeded", "pending", "running", "failed"] as const)("blocks a duplicate manual send in state %s", async (status) => {
+  it.each(["succeeded", "pending", "running", "failed"] as const)("SAV-60: no send button whatever the recorded send state (%s)", async (status) => {
     vi.stubEnv("SAV_WRITES_DISABLED", "false");
     const detail = detailFixture();
     detail.actions = [actionFixture({ kind: "send_reply", messageId, status, payload: { manualReplyConfirmed: true, ...(status === "failed" ? { replySendDispatchedAt: now.toISOString() } : {}) } })];
     dependencies.detail.mockResolvedValue(detail);
-    expect(buttonAttributes(await renderPage(), "Confirmer l’envoi de cette réponse")[0]).toContain("disabled");
+    expect(buttonAttributes(await renderPage(), "Confirmer l’envoi de cette réponse")).toHaveLength(0);
   });
 
   it.each(["succeeded", "pending", "failed"] as const)("keeps internal partnership transfer %s separate from customer replies", async status => {
@@ -304,7 +304,7 @@ describe("SAV dossier SSR and human-review guardrails", () => {
     detail.actions = [actionFixture({ kind: "send_reply", messageId, status, payload: { purpose: "partnership_forward", manualReplyConfirmed: true, forwardDispatchedAt: now.toISOString() } })];
     dependencies.detail.mockResolvedValue(detail);
     const html = await renderPage();
-    expect(buttonAttributes(html, "Confirmer l’envoi de cette réponse")[0]).toContain("disabled");
+    expect(buttonAttributes(html, "Confirmer l’envoi de cette réponse")).toHaveLength(0);
     expect(html).toContain("Transfert partenariat à Nathan");
     expect(buttonAttributes(html, "Réessayer")).toHaveLength(0);
   });
@@ -500,7 +500,7 @@ it.each([false, true])("does not expose the colleague's old CRM/history for a fo
   dependencies.detail.mockResolvedValue(detail); dependencies.review.mockResolvedValue(reviewFixture(true));
   const html = await renderPage();
   expect(html).toContain("Identité du client transféré à vérifier");
-  expect(html).toContain("Actualiser le contexte client");
+  expect(html).not.toContain("Actualiser le contexte client"); // SAV-60: A15 retired
   expect(html).not.toContain("Ouvrir la fiche #999");
   expect(html).not.toContain("HISTORIQUE_COLLEGUE");
   expect(buttonAttributes(html, "Préparer l’aperçu de l’action")).toEqual([expect.stringContaining('disabled=""')]);

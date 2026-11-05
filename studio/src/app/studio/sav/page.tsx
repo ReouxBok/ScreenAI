@@ -1,3 +1,4 @@
+import { synPreviewEnabled } from "@/lib/sav/local-syn";
 import { redirect } from "next/navigation";
 import { hasIntakeLaunch } from "@/lib/sav/intake/launch-boundary";
 import { formatParisDateTime } from "@/lib/paris-date";
@@ -9,7 +10,7 @@ import { savAutomationMode, savAutoReplyDailyLimit, savAutoReplyRolloutPercent, 
 import { getHubspotBackfillState, HUBSPOT_EMAIL_READ_SCOPE, isHubspotEmailReadScopeError } from "@/lib/sav/hubspot";
 import { getSavDashboard, getSavImprovementSignals, listSavActionIncidents, listSavAgentPerformance, listSavInbox, listSavPilotBatches, listSavWebhookIncidents } from "@/lib/sav/service";
 import { getSavAutonomyGate } from "@/lib/sav/promotion";
-import { retryAction, retryWebhookAction } from "./actions";
+import { retryWebhookAction } from "./actions";
 import { SavV0Inbox } from "./inbox";
 import { savReleaseStage } from "@/lib/sav/config";
 
@@ -43,6 +44,7 @@ const feedbackLabels: Record<string, string> = {
 
 export default async function SavDashboardPage({ searchParams }: { searchParams: Promise<{ legacy?:string; view?: string; q?: string; page?: string; sort?: string; batch?: string; batchCancelled?: string; launch?: string }> }) {
   await requireStaff("admin");
+  if (synPreviewEnabled()) redirect("/studio/sav/intake");
   if(isDatabaseConfigured() && (await searchParams).legacy!=="1" && await hasIntakeLaunch()) redirect("/studio/sav/intake");
   if (savReleaseStage() === "v0") return <SavV0Inbox searchParams={searchParams}/>;
   const configured = isDatabaseConfigured();
@@ -175,7 +177,7 @@ export default async function SavDashboardPage({ searchParams }: { searchParams:
       <div><span className="eyebrow">Actions externes</span><h2 id="sav-actions-incidents-title">Actions Gmail ou HubSpot en échec</h2><p>L’erreur exacte reste visible. Une relance reprend la même action idempotente, sans créer volontairement de doublon.</p></div>
       <ol>{actionIncidents.map((incident) => <li key={incident.id}>
         <div><strong>{incident.kind} · {incident.subject}</strong><span>{incident.errorCode || "Erreur technique"}</span></div>
-        <form action={retryAction}><input type="hidden" name="actionId" value={incident.id}/><input type="hidden" name="threadId" value={incident.threadId}/><button className="secondary" type="submit">Relancer</button></form>
+        <Link className="button secondary" href={`/studio/sav/${incident.threadId}`}>Vérifier dans le dossier</Link>
       </li>)}</ol>
     </section>}
   </>;

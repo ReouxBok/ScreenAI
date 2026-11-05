@@ -6,6 +6,7 @@ import { z } from "zod";
 import { requireDb } from "@/db";
 import { auditLogs, savMessages, savThreads } from "@/db/schema";
 import { assertSavActor } from "./access";
+import { refuseRetiredSavV0Command } from "./v0-command-retirement";
 import { savV0EligibleMessageFilter } from "./cutover";
 import { executeSavTicketCommandWorkflow, refreshSavContextWorkflow, executeSavEmailOpeningWorkflow } from "@/workflows/sav-commands";
 import { savEffectiveReceivedAt } from "@/lib/sav/message-order";
@@ -41,7 +42,12 @@ export async function dispatchPendingSavEmailOpenings(limit = 10) {
   for (const command of pending) if (await dispatchSavEmailOpening(command.id)) dispatched++;
   return { dispatched };
 }
-export async function enqueueSavContextRefresh(threadId: string, actorEmail: string, schedule?: (work: () => Promise<void>) => void) {
+/** SAV-9/SAV-60: retired V0 command, refused before any read or effect (v0-command-retirement.ts). The archived body below stays for the tests of the worker paths that still run; no source file may import it. */
+export async function enqueueSavContextRefresh(...args: Parameters<typeof enqueueSavContextRefreshArchived>) {
+  refuseRetiredSavV0Command("refreshSavContextAction");
+  return enqueueSavContextRefreshArchived(...args);
+}
+export async function enqueueSavContextRefreshArchived(threadId: string, actorEmail: string, schedule?: (work: () => Promise<void>) => void) {
   assertSavActor(actorEmail);
   z.uuid().parse(threadId);
   const [message] = await requireDb().select({ id: savMessages.id }).from(savMessages)
@@ -73,6 +79,13 @@ export async function enqueueSavContextRefresh(threadId: string, actorEmail: str
 /** Only versioned new requests are recovered; historical requests stay untouched.
  * Refresh is read-only at providers, so a lost dispatch can safely be retried. */
 export async function processPendingSavContextRefreshes(limit = 5) {
+  // SAV-9/SAV-60: the command that created these requests (A15) is retired, so a request left in the log is not redispatched by the cron:
+  // no database read, no workflow start, no provider read. Nothing is reset or deleted; the old requests stay visible in the audit log.
+  void limit;
+  return { dispatched: 0, retired: true as const };
+}
+/** Archived body of the redispatch, kept for its tests only; no source file may import it. */
+export async function processPendingSavContextRefreshesArchived(limit = 5) {
   const db = requireDb();
   const pending = await db.select().from(auditLogs).where(and(eq(auditLogs.action, "sav_context_refresh_requested"), eq(auditLogs.entityType, "sav_context_refresh"),
     sql`${auditLogs.technicalMetadata}->>'version' = '1'`, sql`${auditLogs.createdAt} < now() - interval '5 minutes'`,

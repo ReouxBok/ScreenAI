@@ -14,6 +14,8 @@ export function executionProvider(sender = "customer@example.invalid") {
         method: string;
         body: unknown;
     }[] = [], sent: Record<string, unknown> = {};
+    // Owner history of the tickets this fake created (oldest first), as `propertiesWithHistory` reads it.
+    const ownerHistory = new Map<string, { value: string; timestamp: string }[]>();
     let contacts = [{
             id: "101", emails: [sender]
         }];
@@ -95,7 +97,8 @@ export function executionProvider(sender = "customer@example.invalid") {
                 };
                 if (type === "tickets") {
                     properties.createdate = new Date().toISOString();
-                    properties.hubspot_owner_id = null;
+                    properties.hubspot_owner_id = body.properties.hubspot_owner_id ?? null;
+                    ownerHistory.set(id, [{ value: properties.hubspot_owner_id ?? "", timestamp: properties.createdate }]);
                     const cid = body.associations[0].to.id;
                     links.set(`tickets:${id}:contacts`, [cid]);
                     links.set(`contacts:${cid}:tickets`, [...(links.get(`contacts:${cid}:tickets`) ?? []), id]);
@@ -137,6 +140,15 @@ export function executionProvider(sender = "customer@example.invalid") {
                 return Response.json({
                     results: Object.values(rows).filter(r => Object.values(r.properties).some(v => v?.includes(marker))).map(r => select(r, body.properties))
                 });
+            }
+            if (method === "GET" && type === "tickets" && u.searchParams.get("propertiesWithHistory") === "hubspot_owner_id") {
+                if (!rows[tail])
+                    throw Error("FAKE_OBJECT_MISSING");
+                // Newest first, as HubSpot answers; a value a test set directly is appended as a later change.
+                const history = [...(ownerHistory.get(tail) ?? [])], now = rows[tail].properties.hubspot_owner_id ?? "";
+                const last = history.at(-1);
+                if (last && last.value !== now) history.push({ value: now, timestamp: new Date(Math.max(Date.now(), Date.parse(last.timestamp) + 1000)).toISOString() });
+                return Response.json({ id: tail, properties: {}, propertiesWithHistory: { hubspot_owner_id: history.reverse() } });
             }
             if (method === "GET") {
                 if (!rows[tail])
@@ -199,6 +211,6 @@ export function executionProvider(sender = "customer@example.invalid") {
         return id;
     }
     return {
-        network, gmail, calls, objects, links, sent, seedTicket, setContacts: (v: typeof contacts) => { contacts = v; }, setGmail: (id: string, thread: string) => { gmailIncoming = id; gmailThread = thread; }, histories: [] as IntakeHistory
+        network, gmail, calls, objects, links, sent, seedTicket, ownerHistory, setContacts: (v: typeof contacts) => { contacts = v; }, setGmail: (id: string, thread: string) => { gmailIncoming = id; gmailThread = thread; }, histories: [] as IntakeHistory
     };
 }

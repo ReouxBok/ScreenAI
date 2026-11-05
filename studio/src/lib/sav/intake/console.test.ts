@@ -57,7 +57,7 @@ import { reviewSavProposal } from "../review";
 import { previewIntakeLaunch, commitIntakeLaunch } from "./launch-admin";
 import { previewLaunchAction, commitLaunchAction, revokeLaunchAction } from "@/app/studio/sav/intake/launch/actions";
 import { POST as adminPost } from "@/app/api/sav/intake-admin/route";
-import { getSavThreadDetail, processStoredSavMessage, processPendingSavMessages, requestHumanIntervention } from "../service";
+import { getSavThreadDetail, processStoredSavMessage, processPendingSavMessages, requestHumanInterventionArchived as requestHumanIntervention } from "../service";
 import { enqueueConfiguredSavIntake, reconcileSavIntakeRuntime } from "./runtime";
 import { saveIntakeChoice } from "@/app/studio/sav/intake/actions";
 import {requestIntakeReinvestigation} from "./operator-recovery";
@@ -804,7 +804,9 @@ it("historical pending HubSpot/Gmail actions and followups cannot monopolize the
   expect((await db.db.select().from(savActions).where(eq(savActions.id,hs.id)))[0].attemptCount).toBe(1);
   expect((await db.db.select().from(savActions).where(eq(savActions.id,gm.id)))[0].attemptCount).toBe(1);
   expect((await db.db.select().from(savActions).where(eq(savActions.threadId,threadId))).every(a=>a.attemptCount===0&&a.status==="pending")).toBe(true);
-  expect((await db.db.select().from(savFollowups).where(eq(savFollowups.id,followup.id)))[0].status).toBe("queued");
+  // The old follow-ups are retired (SAV-9): the entry point answers "retired", queues nothing and leaves every scheduled row as it was.
+  expect((await db.db.select().from(savFollowups).where(eq(savFollowups.id,followup.id)))[0]).toMatchObject({status:"scheduled",actionId:null});
+  expect(await db.db.select().from(savActions).where(eq(savActions.threadId,freshThread.id))).toHaveLength(2);
   expect((await db.db.select().from(savFollowups).where(eq(savFollowups.threadId,threadId))).every(f=>f.status==="scheduled")).toBe(true);
 });
 

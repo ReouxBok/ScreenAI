@@ -71,6 +71,16 @@ export const savIntakeContactScopeSchema = z.object({
 
 export const savIntakeMutationSchema = z.enum([
   "create_ticket", "link_ticket", "set_ticket_new", "append_ticket_note", "associate_email", "send_identity_template",
+  // V2 (SAV-11/44): granted by no existing policy.
+  "assign_v2_owner",
+  // Pilot access (3/11, local): the V2 owner in the ticket CREATION itself, never on an existing ticket; granted by no existing policy.
+  "create_ticket_v2_owner",
+  // V2 (SAV-10): each case effect has its own permission; granted by no existing policy.
+  "send_case_reply", "append_case_note",
+  // V2 (human handoff notice): the one Slack post of a final handoff decision; granted by no existing policy.
+  "notify_case_handoff",
+  // V2 (ticket states): the ticket's pipeline stage only (waiting for the customer after a confirmed reply, closed after a proven resolution); granted by no existing policy.
+  "set_case_ticket_stage",
 ]);
 export type SavIntakeMutation = z.infer<typeof savIntakeMutationSchema>;
 

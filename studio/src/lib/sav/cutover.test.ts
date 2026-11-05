@@ -1,9 +1,9 @@
 import { beforeAll, beforeEach, afterAll, afterEach, describe, expect, it, vi } from "vitest";
 import { eq } from "drizzle-orm";
 import { createSavTestDb } from "../../../test/sav-db";
-import { auditLogs, savActions, savAgentRuns, savDecisions, savMailboxes, savMessages, savSyncState, savThreads, savWebhookReceipts } from "@/db/schema";
+import { auditLogs, savActions, savAgentRuns, savDecisions, savMailboxes, savMessages, savPilotBatches, savPilotItems, savSyncState, savThreads, savWebhookReceipts } from "@/db/schema";
 import { activateSavV0Cutover, getSavV0Cutover, isSavMessageEligible, SAV_V0_CUTOVER_KEY } from "./cutover";
-import { correctSavDecision, ingestInboundMessage, listSavPilotCandidates, processPendingSavMessages, processStoredSavMessage, recordWebhookReceipt, updateMailboxWatch, updateMailboxCursor } from "./service";
+import { correctSavDecisionArchived as correctSavDecision, ingestInboundMessage, listSavPilotCandidates, processPendingSavMessages, processPendingSavPilotItems, processSavPilotItem, processStoredSavMessage, recordWebhookReceipt, repairSavProposal, retrySavAnalysis, startSavPilotBatch, updateMailboxWatch, updateMailboxCursor } from "./service";
 import { decryptSavPayload, encryptSavPayload } from "./crypto";
 import { parseGmailMessage, processGmailReceipt } from "./gmail";
 
@@ -21,6 +21,7 @@ beforeAll(async () => { fixture = await createSavTestDb(); state.db = fixture.db
 afterAll(async () => { await fixture?.client.close(); });
 afterEach(() => { vi.unstubAllEnvs(); vi.unstubAllGlobals(); });
 beforeEach(async () => {
+  state.understand.mockReset();
   state.understand.mockImplementation(async (...args) => (await vi.importActual<typeof import("./understanding-model")>("./understanding-model")).understandSavMessage(...args as Parameters<typeof import("./understanding-model").understandSavMessage>));
   state.crm.mockResolvedValue({ contactFound: true, contactId: "contact-fixture", tickets: [], routing: { kind: "new", reason: "no_open_ticket", candidateIds: [] } });
   vi.stubEnv("SAV_RELEASE_STAGE", "v0"); vi.stubEnv("SAV_PILOT_MODE", "false"); vi.stubEnv("SAV_AI_ANALYSIS", "false");
@@ -80,10 +81,13 @@ describe("immutable post-deployment SAV V0 cutover", () => {
     expect(await isSavMessageEligible(old.id)).toBe(false); expect(await isSavMessageEligible(exact.id)).toBe(false);
     expect(await isSavMessageEligible(fresh.id)).toBe(true);
     expect((await listSavPilotCandidates()).map((row) => row.id)).toEqual([fresh.id]);
-    const pass = await processPendingSavMessages(); expect(pass.processed).toHaveLength(1);
-    expect((await processPendingSavMessages()).processed).toHaveLength(0);
-    expect(await fixture.db.select().from(savDecisions)).toHaveLength(1);
+    // The old V0 analysis is retired (SAV-9): eligible mail is recognised but nothing analyses it, however often the worker runs.
+    expect(await processPendingSavMessages()).toEqual({ retired: true, processed: [] });
+    expect(await processPendingSavMessages()).toEqual({ retired: true, processed: [] });
+    expect(await fixture.db.select().from(savDecisions)).toHaveLength(0);
     const [storedOld] = await fixture.db.select().from(savMessages).where(eq(savMessages.id, old.id)); expect(storedOld.processedAt).toBeNull();
+    const [storedFresh] = await fixture.db.select().from(savMessages).where(eq(savMessages.id, fresh.id));
+    expect(storedFresh).toMatchObject({ processedAt: null, analysisStatus: "pending", analysisAttempts: 0 });
   });
   it("does not opt another mailbox into the support flow", async () => {
     await activateSavV0Cutover(boundary);
@@ -107,15 +111,17 @@ describe("immutable post-deployment SAV V0 cutover", () => {
     expect(await getSavV0Cutover()).toEqual(boundary);
     const [persisted] = await fixture.db.select().from(savSyncState).where(eq(savSyncState.key, SAV_V0_CUTOVER_KEY)); expect(persisted.status).toBe("active");
   });
-  it("persists automation headers and deduplicates classification on receipt retry", async () => {
+  it("persists automation headers and deduplicates the stored message on receipt retry; the retired analysis creates no decision", async () => {
     await activateSavV0Cutover(boundary);
     const input = { mailboxEmail: boundary.mailboxEmail, gmailMessageId: "automated", gmailThreadId: "fixture-thread", from: "customer@example.com", to: ["contact@limova.ai"], subject: "Absence", bodyText: "Je reviens lundi", headers: { "X-Studio-Automation-Headers": "singleton-v1", "x-studio-automation-body": "complete-plain-v1" }, autoSubmitted: "auto-replied", receivedAt: "2026-10-02T12:01:00Z" };
     const first = await ingestInboundMessage(input);
     const second = await ingestInboundMessage(input);
+    expect(first).toMatchObject({ v0AnalysisRetired: true });
     expect(second.duplicate).toBe(true);
-    const [decision] = await fixture.db.select().from(savDecisions);
-    expect(decision).toMatchObject({ kind: "automatic_reply", reasonCode: "automated_sender_reply" });
-    expect(await fixture.db.select().from(savDecisions)).toHaveLength(1);
+    expect(await fixture.db.select().from(savDecisions)).toHaveLength(0);
+    expect(await fixture.db.select().from(savAgentRuns)).toHaveLength(0);
+    expect(state.understand).not.toHaveBeenCalled();
+    expect(await fixture.db.select().from(savMessages)).toHaveLength(1);
     expect(await fixture.db.select().from(savActions)).toHaveLength(0);
     const storedHeaders = decryptSavPayload<{ headers: Record<string, string> }>(first.message.bodyCiphertext).headers;
     expect(storedHeaders["auto-submitted"]).toBe("auto-replied");
@@ -125,19 +131,18 @@ describe("immutable post-deployment SAV V0 cutover", () => {
   it("human correction supersedes one decision and cancels its queued actions", async () => {
     await activateSavV0Cutover(boundary);
     const fresh = await message("2026-10-02T12:00:01Z");
-    const first = await processStoredSavMessage(fresh.id);
-    const [run] = await fixture.db.select().from(savAgentRuns);
-    expect(run.knowledgeRevision).toBe("not_consulted");
-    expect(run.proposalCiphertext).toBeTruthy();
-    expect(decryptSavPayload<{ routing: { kind: string }; ticket: { description: string } }>(run.proposalCiphertext!)).toMatchObject({ routing: { kind: "new" }, ticket: { description: "Comment retrouver mes factures ?" } });
-    expect(first).not.toBeNull();
-    const corrected = await correctSavDecision(first!.id, { kind: "no_ticket_needed", reasonCode: "ugo_correction", explanation: "Cet email ne nécessite pas de nouveau ticket." }, "ugo@limova.ai");
-    expect(corrected).toMatchObject({ isCurrent: true, actorType: "human", supersedesDecisionId: first!.id });
+    // The retired analysis creates nothing any more: this is a decision and a queued action of the old engine that already exist.
+    expect(await processStoredSavMessage(fresh.id)).toBeNull();
+    expect(await fixture.db.select().from(savAgentRuns)).toHaveLength(0);
+    const [first] = await fixture.db.insert(savDecisions).values({ messageId: fresh.id, kind: "ticket_pending", reasonCode: "new_support_request", explanation: "Nouvelle demande de support.", confidence: 900, model: "rules-v1", actorType: "ai" }).returning();
+    await fixture.db.insert(savActions).values({ threadId, messageId: fresh.id, decisionId: first.id, kind: "create_ticket", status: "pending", idempotencyKey: `existing:create_ticket:${fresh.id}`, actorType: "ai" });
+    const corrected = await correctSavDecision(first.id, { kind: "no_ticket_needed", reasonCode: "ugo_correction", explanation: "Cet email ne nécessite pas de nouveau ticket." }, "ugo@limova.ai");
+    expect(corrected).toMatchObject({ isCurrent: true, actorType: "human", supersedesDecisionId: first.id });
     const decisions = await fixture.db.select().from(savDecisions);
     expect(decisions.filter((row) => row.isCurrent)).toHaveLength(1);
     const actions = await fixture.db.select().from(savActions).where(eq(savActions.kind, "create_ticket"));
     expect(actions).toHaveLength(1); expect(actions[0]).toMatchObject({ status: "cancelled", errorCode: "SAV_DECISION_SUPERSEDED" });
-    await expect(correctSavDecision(first!.id, { kind: "spam", reasonCode: "old_correction", explanation: "Tentative de correction d’une décision obsolète." }, "ugo@limova.ai")).rejects.toThrow("SAV_DECISION_NOT_CURRENT");
+    await expect(correctSavDecision(first.id, { kind: "spam", reasonCode: "old_correction", explanation: "Tentative de correction d’une décision obsolète." }, "ugo@limova.ai")).rejects.toThrow("SAV_DECISION_NOT_CURRENT");
   });
   it("a non-support message does not close a paused or linked customer dossier", async () => {
     const understood = understandingFixture();
@@ -149,7 +154,9 @@ describe("immutable post-deployment SAV V0 cutover", () => {
     await ingestInboundMessage({ mailboxEmail: boundary.mailboxEmail, gmailMessageId: "thanks", gmailThreadId: "fixture-thread", from: "customer@example.com", subject: "Re: aide", bodyText: "Merci beaucoup !", receivedAt: "2026-10-02T12:01:00Z" });
     const [thread] = await fixture.db.select().from(savThreads).where(eq(savThreads.id, threadId));
     expect(thread).toMatchObject({ aiPaused: true, status: "human_processing", hubspotTicketId: "fixture-ticket" });
-    const [decision] = await fixture.db.select().from(savDecisions); expect(decision.kind).toBe("no_ticket_needed");
+    // The retired analysis neither understands the mail nor decides anything: the dossier is exactly as the person left it.
+    expect(state.understand).not.toHaveBeenCalled();
+    expect(await fixture.db.select().from(savDecisions)).toHaveLength(0);
     expect(await fixture.db.select().from(savActions)).toHaveLength(0);
   });
   it.each(["human_requested", "human_processing"] as const)("preserves %s and its deadline when a follow-up cannot be understood", async (status) => {
@@ -159,9 +166,10 @@ describe("immutable post-deployment SAV V0 cutover", () => {
     await ingestInboundMessage({ mailboxEmail: boundary.mailboxEmail, gmailMessageId: "unavailable-follow-up", gmailThreadId: "fixture-thread", from: "customer@example.com", subject: "Re: aide", bodyText: "Merci beaucoup !", receivedAt: "2026-10-02T12:01:00Z" });
     const [thread] = await fixture.db.select().from(savThreads).where(eq(savThreads.id, threadId));
     expect(thread).toMatchObject({ aiPaused: true, status, humanRequestedAt: requestedAt, humanDueAt: dueAt, hubspotTicketId: "fixture-ticket" });
-    const [decision] = await fixture.db.select().from(savDecisions);
-    expect(decision).toMatchObject({ kind: "human_review_required", reasonCode: "understanding_unavailable" });
-    expect((await fixture.db.select().from(savActions)).every(action => action.status === "pending")).toBe(true);
+    // The retired analysis does not even try to understand the follow-up: no decision, no action, and the person's state and deadline stand.
+    expect(state.understand).not.toHaveBeenCalled();
+    expect(await fixture.db.select().from(savDecisions)).toHaveLength(0);
+    expect(await fixture.db.select().from(savActions)).toHaveLength(0);
   });
   it("keeps the cursor and receipt retryable when a full MIME response exceeds its wire envelope", async () => {
     await activateSavV0Cutover(boundary);
@@ -203,6 +211,35 @@ describe("immutable post-deployment SAV V0 cutover", () => {
     expect(pages[0].searchParams.has("labelIds")).toBe(false);
     expect(pages[1].searchParams.get("pageToken")).toBe("page-2");
     expect(pages[1].searchParams.get("q")).toBe(pages[0].searchParams.get("q"));
+  });
+});
+
+describe("the old V0 analysis stays retired (SAV-9)", () => {
+  it("every entry point is inert or refuses: a post-cutover mail is stored and recognised, then left untouched", async () => {
+    vi.stubEnv("SAV_PILOT_MODE", "true");
+    await activateSavV0Cutover(boundary);
+    const fresh = await message("2026-10-02T12:00:01Z");
+    const [before] = await fixture.db.select().from(savMessages).where(eq(savMessages.id, fresh.id));
+    expect(await processStoredSavMessage(fresh.id)).toBeNull();
+    expect(await processPendingSavMessages(20)).toEqual({ retired: true, processed: [] });
+    expect(await processPendingSavPilotItems(10)).toEqual({ retired: true, processed: [] });
+    expect(await processSavPilotItem(crypto.randomUUID())).toBeNull();
+    await expect(retrySavAnalysis(fresh.id, "ugo@limova.ai")).rejects.toThrow("SAV_V0_ANALYSIS_RETIRED");
+    await expect(repairSavProposal(fresh.id, "ugo@limova.ai")).rejects.toThrow("SAV_V0_ANALYSIS_RETIRED");
+    await expect(startSavPilotBatch("ugo@limova.ai", 10)).rejects.toThrow("SAV_V0_ANALYSIS_RETIRED");
+    const [after] = await fixture.db.select().from(savMessages).where(eq(savMessages.id, fresh.id));
+    expect(after).toEqual(before);
+    for (const table of [savDecisions, savActions, savAgentRuns, savPilotItems, savPilotBatches]) expect(await fixture.db.select().from(table)).toHaveLength(0);
+    expect(state.understand).not.toHaveBeenCalled();
+  });
+  it("a mail that reaches the inbound path is left pending for the intake catch-up and the monitor, never analysed", async () => {
+    await activateSavV0Cutover(boundary);
+    const result = await ingestInboundMessage({ mailboxEmail: boundary.mailboxEmail, gmailMessageId: "fresh-one", gmailThreadId: "fixture-thread", from: "customer@example.com", to: ["contact@limova.ai"], subject: "Aide", bodyText: "Comment retrouver mes factures ?", receivedAt: "2026-10-02T12:01:00Z" });
+    expect(result).toMatchObject({ v0AnalysisRetired: true });
+    expect(result).not.toHaveProperty("decision");
+    const [stored] = await fixture.db.select().from(savMessages).where(eq(savMessages.id, result.message.id));
+    expect(stored).toMatchObject({ analysisStatus: "pending", analysisAttempts: 0, analysisStartedAt: null, processedAt: null });
+    expect(state.understand).not.toHaveBeenCalled();
   });
 });
 

@@ -1,0 +1,6 @@
+{
+  "producerSha": "7ebeb21281bb93e29a7edf335989453ff8098c62",
+  "artifactHash": "361b0cedea2279c78fc91248b7e7bd430e388d50d311f8da6586c0d182b6844a",
+  "evidence": "UX : export SYN régénéré par pilot-passage.compose.test au commit indiqué (ligne d'aide dans le texte). Exécution locale SYN, sans preuve de production.",
+  "authorTested": true
+}

@@ -1,26 +1,69 @@
 import { randomUUID } from "node:crypto";
 import { beforeAll, beforeEach, afterAll, afterEach, expect, it, vi } from "vitest";
-import { eq, sql } from "drizzle-orm";
-import { PgDialect } from "drizzle-orm/pg-core";
+import { eq, inArray, sql } from "drizzle-orm";
+import { PgDialect, type AnyPgColumn } from "drizzle-orm/pg-core";
 import { createSavTestDb } from "../../../test/sav-db";
 import { savMailboxes, savMessages, savThreads, savSyncState, auditLogs, savIntakeRuns, savGmailQuarantine, savIntakeConsole, savIntakeJournal } from "@/db/schema";
 import { encryptSavPayload } from "./crypto";
 const state = vi.hoisted(() => ({ db: null as unknown }));
 vi.mock("@/db", () => ({ requireDb: () => state.db }));
+// Observation only: the delivery hashes the monitor computes name the delivery keys this file writes.
+const own = vi.hoisted(() => ({ deliveries: new Set<string>(), mailboxes: new Set<string>(), before: new Set<string>(), removedMarker: undefined as unknown, pauseOriginal: undefined as unknown }));
+vi.mock("./monitor-contract", async importOriginal => {
+  const actual = await importOriginal<typeof import("./monitor-contract")>();
+  return { ...actual, monitorDeliveryHash: (text: string) => { const hash = actual.monitorDeliveryHash(text); own.deliveries.add(hash); return hash; } };
+});
 import { collectSavMonitorSnapshot, recordSavWorkerPulse, runSavServerMonitor } from "./monitor";
 let f: Awaited<ReturnType<typeof createSavTestDb>>, mailboxId: string;
 beforeAll(async () => { f = await createSavTestDb(); state.db = f.db; }, 30000);
-afterAll(async () => { await f?.client.close(); });
+afterAll(async () => { if (f) try { await restorePause(); } finally { await f.client.close(); } });
+// The schema markers come from the migrations (PGlite) or the real migrator (native), never from this file. sync_state is shared:
+// this file removes only the exact keys it writes (monitor worker/state/snapshot, its delivery receipts, its mailboxes' launches).
+const ownKeys = () => ["sav-monitor:v1:worker", "sav-monitor:v1:state", "sav-monitor:v1:snapshot",
+  ...[...own.deliveries].map(hash => `sav-monitor:v1:delivery:${hash}`), ...[...own.mailboxes].map(id => `sav-intake-launch:${id}`)];
+// Timestamps are read as text: a JavaScript Date would drop PostgreSQL's microseconds.
+const asText = (column: AnyPgColumn) => sql<string | null>`${column}::text`;
+const markerColumns = { key: savSyncState.key, cursor: savSyncState.cursor, status: savSyncState.status, processedCount: savSyncState.processedCount, lastError: savSyncState.lastError,
+  startedAt: asText(savSyncState.startedAt), completedAt: asText(savSyncState.completedAt), updatedAt: asText(savSyncState.updatedAt) };
+type CapturedRow = { [K in keyof typeof markerColumns]: K extends "processedCount" ? number : K extends "key" | "status" ? string : string | null };
+const captureRow = async (key: string) => (await f.db.select(markerColumns).from(savSyncState).where(eq(savSyncState.key, key)))[0] as CapturedRow | undefined;
+async function putBack(row: CapturedRow) {
+  const at = (value: string | null) => value === null ? null : sql`${value}::timestamptz`;
+  await f.db.insert(savSyncState).values({ ...row, startedAt: at(row.startedAt), completedAt: at(row.completedAt), updatedAt: at(row.updatedAt) ?? undefined });
+}
+async function restoreRemovedMarker() {
+  const row = own.removedMarker as CapturedRow | undefined; own.removedMarker = undefined;
+  if (row) await putBack(row);
+}
+// SAV-75 scenarios write the intake pause, a single global key: during each test this file owns it. A row found before the file
+// is captured once, removed for each test and put back unchanged (all columns, microseconds) after it; absent stays absent.
+// Other agents' pauses are never touched.
+const PAUSE_KEY = "sav-agent-pause.v1:intake"; // savAgentPauseKey("intake")
+const removePause = () => f.db.delete(savSyncState).where(eq(savSyncState.key, PAUSE_KEY));
+async function restorePause() {
+  if (own.pauseOriginal === undefined) return; // never captured: nothing of this file's to undo
+  await removePause();
+  if (own.pauseOriginal) await putBack(own.pauseOriginal as CapturedRow);
+}
+async function removeOwnKeys() { await f.db.delete(savSyncState).where(inArray(savSyncState.key, ownKeys())); own.deliveries.clear(); own.mailboxes.clear(); }
+/** sync_state rows written during the current test: keys present when it started belong to someone else. */
+const writtenRows = async () => (await f.db.select().from(savSyncState)).filter(r => !own.before.has(r.key));
 beforeEach(async () => {
-  await f.client.exec("TRUNCATE sav.mailboxes, sav.sync_state, audit_logs CASCADE");
-  const markerValues = ["sav-intake-console-schema-v1", "sav-intake-execution-schema-v1"].map(key => ({ key, status: "installed" }));
-  await f.db.insert(savSyncState).values(markerValues);
+  await f.client.exec("TRUNCATE sav.mailboxes, audit_logs CASCADE");
+  await removeOwnKeys();
+  if (own.pauseOriginal === undefined) own.pauseOriginal = (await captureRow(PAUSE_KEY)) ?? null;
+  await removePause();
+  own.before = new Set((await f.db.select({ key: savSyncState.key }).from(savSyncState)).map(r => r.key));
   mailboxId = (await f.db.insert(savMailboxes).values({ email: "support@example.invalid", watchStatus: "active", watchExpiration: new Date(Date.now()+86400000) }).returning())[0].id;
+  own.mailboxes.add(mailboxId);
   for (const [key, value] of Object.entries({ SAV_INTAKE_RUNTIME_MODE: "off", SAV_INTAKE_EXECUTION_MODE: "off", SAV_MONITOR_SLACK_WEBHOOK_URL: "", SAV_INTAKE_OTHER_RULES_JSON: "" })) vi.stubEnv(key, value);
   vi.stubEnv("SAV_ENCRYPTION_KEY_V1","synthetic-monitor-encryption-key-123456789");
   vi.stubGlobal("fetch", vi.fn(() => { throw Error("NO_REAL_NETWORK"); }));
 });
-afterEach(() => { vi.unstubAllGlobals(); vi.unstubAllEnvs(); });
+afterEach(async () => {
+  vi.unstubAllGlobals(); vi.unstubAllEnvs();
+  try { await restoreRemovedMarker(); } finally { try { await restorePause(); } finally { await removeOwnKeys(); } }
+});
 async function launch() {
   const at = new Date(Date.now()-3600000).toISOString();
   await f.db.insert(savSyncState).values({ key: `sav-intake-launch:${mailboxId}`, status: "intake_launch_v1", cursor: JSON.stringify({ receivedAfter: at, createdAfter: at }) });
@@ -78,7 +121,7 @@ it("captures durable incidents without a configured transport or operational wri
   const result = await runSavServerMonitor(); expect(result).toMatchObject({ complete: true, delivery: "unconfigured" });
   expect(fetch).not.toHaveBeenCalled(); expect((await f.db.select().from(savMessages)).length).toBe(before);
   expect((await f.db.select().from(auditLogs))[0].action).toBe("sav_monitor_observed");
-  expect((await f.db.select().from(savSyncState)).filter(r => r.key.startsWith("sav-monitor:v1:"))).toHaveLength(2);
+  expect((await writtenRows()).filter(r => r.key.startsWith("sav-monitor:v1:"))).toHaveLength(2);
 });
 it("delivers a confirmed Slack alert once and preserves uncertain transport without retry", async () => {
   vi.stubEnv("SAV_MONITOR_SLACK_WEBHOOK_URL", "https://hooks.slack.com/services/T123/B456/synthetic");
@@ -103,11 +146,16 @@ it("allows one monitor lease, and an expired dispatched attempt becomes uncertai
 });
 it("treats schema/configuration failures as partial without falsely closing incidents", async () => {
   await runSavServerMonitor(); await launch();
-  await f.db.delete(savSyncState).where(eq(savSyncState.key, "sav-intake-console-schema-v1"));
-  const snapshot = await collectSavMonitorSnapshot(); expect(snapshot.complete).toBe(false);
-  expect(snapshot.issues.map(i => i.code)).toContain("schema_missing");
-  vi.stubEnv("SAV_INTAKE_EXECUTION_MODE", "execute");
-  expect((await collectSavMonitorSnapshot()).issues.map(i => i.code)).toContain("configuration_invalid");
+  // The collector opens its own read-only repeatable-read transaction, which cannot run inside a rolled-back outer one: the
+  // migrator's console marker row is captured before it is removed and put back unchanged (all columns); absent stays absent.
+  [own.removedMarker] = await f.db.select(markerColumns).from(savSyncState).where(eq(savSyncState.key, "sav-intake-console-schema-v1"));
+  try {
+    await f.db.delete(savSyncState).where(eq(savSyncState.key, "sav-intake-console-schema-v1"));
+    const snapshot = await collectSavMonitorSnapshot(); expect(snapshot.complete).toBe(false);
+    expect(snapshot.issues.map(i => i.code)).toContain("schema_missing");
+    vi.stubEnv("SAV_INTAKE_EXECUTION_MODE", "execute");
+    expect((await collectSavMonitorSnapshot()).issues.map(i => i.code)).toContain("configuration_invalid");
+  } finally { await restoreRemovedMarker(); }
 });
 it("converts SQL exceptions into an explicit partial collection", async () => {
   const actual = state.db; state.db = { transaction: async () => { throw Error("SYNTHETIC_SQL_FAILED"); } };
@@ -152,7 +200,7 @@ it("isolates an uncertain delivery but still sends a new distinct incident",asyn
   expect(await runSavServerMonitor()).toMatchObject({delivery:"sent"});
   expect(fetch).toHaveBeenCalledTimes(2);
   await runSavServerMonitor();expect(fetch).toHaveBeenCalledTimes(2);
-  expect((await f.db.select().from(savSyncState)).filter(r=>r.status==='delivery_uncertain')).toHaveLength(1);
+  expect((await writtenRows()).filter(r=>r.status==='delivery_uncertain')).toHaveLength(1);
 });
 it("bounds retries to a failed batch while allowing a later incident its own attempts",async()=>{
   vi.stubEnv("SAV_MONITOR_SLACK_WEBHOOK_URL","https://hooks.slack.com/services/T123/B456/synthetic");
@@ -232,7 +280,7 @@ it("SAV-75 after a resume the 15-minute threshold restarts from the resume, then
   await pause("running", new Date(Date.now()-60000));
   let snapshot=await collectSavMonitorSnapshot();
   expect(snapshot.issues.map(i=>i.code)).not.toContain("intake_blocked"); expect(snapshot.issues.map(i=>i.code)).not.toContain("analysis_delayed");
-  await f.client.exec("DELETE FROM sav.sync_state WHERE key LIKE 'sav-agent-pause%'");
+  await removePause();
   await pause("running", new Date(Date.now()-1200000));
   snapshot=await collectSavMonitorSnapshot();
   expect(snapshot.issues).toContainEqual({code:"intake_blocked",count:1,severity:"critical"});
@@ -259,7 +307,7 @@ it("SAV-75 review F2: a pause-coded wait is graced only for 10 minutes after its
   await heldDossier(old,{reason:"SAV_INTAKE_AGENT_FULLY_PAUSED"});
   await pause("running", new Date(Date.now()-660000));
   expect((await collectSavMonitorSnapshot()).issues).toContainEqual({code:"analysis_waiting",count:1,severity:"critical"});
-  await f.client.exec("DELETE FROM sav.sync_state WHERE key LIKE 'sav-agent-pause%'");
+  await removePause();
   await pause("running", new Date(Date.now()-60000));
   expect((await collectSavMonitorSnapshot()).issues.map(i=>i.code)).not.toContain("analysis_waiting");
 });

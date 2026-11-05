@@ -1,0 +1,23 @@
+.notice { margin: 0 0 16px; padding: 10px 14px; border-radius: var(--ui-radius-field); background: var(--ui-surface-muted); color: var(--ui-ink-secondary); font: 400 14px/20px var(--ui-font-sans); }
+.seam { display: grid; gap: 4px; margin: 0 0 16px; padding: 16px; border: 1px dashed var(--ui-line); border-radius: var(--ui-radius-field); color: var(--ui-ink-tertiary); font: 400 14px/20px var(--ui-font-sans); }
+.seam h2, .seam h3 { margin: 0; font: 600 14px/20px var(--ui-font-sans); color: var(--ui-ink); }
+.seam p { margin: 0; }
+.search { display: flex; gap: 8px; max-width: 480px; margin-bottom: 16px; }
+.result { display: grid; gap: 2px; padding: 12px 16px; border: 1px solid var(--ui-line); border-radius: var(--ui-radius-field); color: var(--ui-ink); text-decoration: none; }
+.result:hover { background: var(--ui-surface-muted); }
+.result:focus-visible { outline: none; box-shadow: var(--ui-focus); }
+.result span, .small { color: var(--ui-ink-tertiary); font: 400 13px/18px var(--ui-font-sans); }
+.card { margin-bottom: 16px; padding: 20px; background: var(--ui-canvas); border: 1px solid var(--ui-line-subtle); border-radius: 16px; font: 400 14px/20px var(--ui-font-sans); color: var(--ui-ink); }
+.card h2 { margin: 0 0 8px; font: 600 15px/22px var(--ui-font-sans); }
+.card h3 { margin: 12px 0 4px; font: 600 14px/20px var(--ui-font-sans); }
+.card ul { margin: 0; padding-left: 18px; display: grid; gap: 6px; }
+.card p { margin: 0 0 6px; }
+.reply { margin: 0; padding: 12px 14px; border-left: 3px solid var(--ui-line); background: var(--ui-surface-muted); white-space: pre-wrap; }
+.mail { margin-bottom: 12px; overflow-wrap: anywhere; }
+@media (pointer: coarse) { .result { min-height: 44px; } }
+@media (max-width: 640px) { .search { flex-direction: column; } .card { padding: 16px; } }
+.heading { margin: 24px 0 8px; font: 600 15px/22px var(--ui-font-sans); color: var(--ui-ink); }
+.filters { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 12px; }
+.list { display: grid; gap: 8px; margin: 0 0 12px; padding: 0; list-style: none; }
+.pager { display: flex; gap: 16px; align-items: center; margin-bottom: 8px; font: 400 14px/20px var(--ui-font-sans); }
+@media (max-width: 640px) { .filters { flex-direction: column; } }

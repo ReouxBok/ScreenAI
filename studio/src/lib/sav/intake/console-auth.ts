@@ -1,4 +1,6 @@
 import "server-only";
+import { headers } from "next/headers";
+import { synRequestAuthorized, synStaff } from "../local-syn";
 import { AsyncLocalStorage } from "node:async_hooks";
 import { currentUser } from "@clerk/nextjs/server";
 import { and, eq } from "drizzle-orm";
@@ -29,5 +31,9 @@ export async function authorizeSavStaffUser(user: SavClerkUser, code: string) {
   return staff;
 }
 export async function requireIntakeConsoleStaff() {
+  if (process.env.SAV_SYN_PREVIEW === "true") {
+    if (!synRequestAuthorized(await headers())) throw Error("SAV_SYN_UNAUTHORIZED");
+    return synStaff();
+  }
   return authorizeSavStaffUser(await savRequestUser(), "SAV_INTAKE_CONSOLE_UNAUTHORIZED");
 }

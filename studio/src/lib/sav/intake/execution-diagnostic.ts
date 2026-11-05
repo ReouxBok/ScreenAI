@@ -4,7 +4,7 @@ import { CRM_RECHECK_POLICY } from "./crm-recheck";
 /** The next safe step of a waiting execution, as a code. It never authorizes anything:
  * it states what the existing machinery will do, or that a person must decide. */
 export type ExecutionNextStep = "none" | "read_only_verification" | "human_decision" | "automatic_recheck" | "wait_resume" | "unknown";
-const EFFECT_KINDS = new Set(["ticket_create", "note_create", "note_associate", "email_create", "email_associate", "stage_new", "identity_send"]);
+const EFFECT_KINDS = new Set(["ticket_create", "note_create", "note_associate", "email_create", "email_associate", "stage_new", "identity_send", "owner_assign"]);
 const EFFECT_STATES = new Set(["planned", "dispatched", "acked", "uncertain", "confirmed"]);
 export function intakeExecutionNextStep(input: { state: string; reason: string | null; crmDelta: ReturnType<typeof publicIntakeCrmDelta>; effectStates: string[]; crmRecheck?: ReturnType<typeof publicCrmRecheck> }): ExecutionNextStep {
   if (input.state === "confirmed") return "none";

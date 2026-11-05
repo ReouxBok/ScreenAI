@@ -32,10 +32,9 @@ import { decryptSavPayload, encryptSavPayload, savContentHash } from "./crypto";
 import { assertSavWriteAllowed } from "./write-guard";
 import { savModeAllowsWrite } from "./action-policy";
 import { SAV_HUBSPOT_SUPPORT, assertSavSupportConfiguration, assertSavSupportPipeline, savSupportTicketProperties, savReviewedTicketProperties } from "./hubspot-mapping";
-import { autoReplyMinConfidence, canSendRepliesAutomatically, savAutoReplyCategories, savAutoReplyDailyLimit, savAutomationMode, savThreadInAutoReplyRollout, savReleaseStage } from "./config";
+import { savAutomationMode, savReleaseStage } from "./config";
 import { assertSavTicketStageNotClosed, normalizeEmailAddress } from "./policy";
 import { isSavAiAuthoredReply } from "./reply-format";
-import { getSavAutonomyGate } from "./promotion";
 import { savTicketReturnPlan, sortSavTicketsNewestFirst, type SavLifecycleTicket } from "./ticket-lifecycle";
 import { selectSavTicketMatch } from "./ticket-routing";
 import { matchSavTicketsByContent, type SavTicketMatchCache } from "./ticket-routing-model";
@@ -829,16 +828,10 @@ async function finalizeTicketAction(action: typeof savActions.$inferSelect) {
   const contact = existingContact ?? await ensureContactByEmail(thread.customerEmail, action.id);
   const ticket = existing ?? await createHubspotTicket(message, body, contact?.id ?? null, action.id);
   if (!existing) await db.update(savActions).set({ payload: { ...action.payload, hubspotTicketId: ticket.id }, updatedAt: new Date() }).where(eq(savActions.id, action.id));
-  const [sourceDecision] = action.decisionId
-    ? await db.select({ confidence: savDecisions.confidence }).from(savDecisions).where(eq(savDecisions.id, action.decisionId)).limit(1)
-    : [];
   const decisionKind = existing ? "attached_to_existing_ticket" : "ticket_created";
   const explanation = existing
     ? `Le message a été rattaché au ticket HubSpot ${ticket.id}, déjà ouvert pour le même client et le même sujet.`
     : `Un ticket HubSpot ${ticket.id} a été créé car le message contient une demande SAV exploitable.`;
-  const autonomy = canSendRepliesAutomatically() ? await getSavAutonomyGate() : null;
-  const categoryEligible = savAutoReplyCategories().has(String(action.payload.category ?? "other"));
-  const rolloutEligible = savThreadInAutoReplyRollout(thread.id);
   await db.transaction(async (tx) => {
     if (action.decisionId) await tx.update(savDecisions).set({ isCurrent: false }).where(eq(savDecisions.id, action.decisionId));
     await tx.insert(savDecisions).values({
@@ -856,48 +849,8 @@ async function finalizeTicketAction(action: typeof savActions.$inferSelect) {
       .where(eq(savThreads.id, thread.id));
     await tx.update(savActions).set({ status: "succeeded", executedAt: new Date(), updatedAt: new Date(), payload: { ...action.payload, hubspotTicketId: ticket.id } })
       .where(eq(savActions.id, action.id));
-    await tx.insert(savActions).values({
-      threadId: thread.id,
-      messageId: message.id,
-      pilotBatchId: action.pilotBatchId,
-      kind: "log_email",
-      idempotencyKey: `hubspot:log-email:${message.id}`,
-      payload: { hubspotTicketId: ticket.id, contactId: contact.id },
-      actorType: "system",
-    }).onConflictDoNothing();
-    if (thread.aiPaused) await tx.insert(savActions).values({
-      threadId: thread.id,
-      messageId: message.id,
-      pilotBatchId: action.pilotBatchId,
-      kind: "update_ticket_status",
-      status: action.pilotBatchId ? "cancelled" : "pending",
-      idempotencyKey: `hubspot:status:human:${message.id}`,
-      payload: { hubspotTicketId: ticket.id, target: "human" },
-      actorType: "system",
-      errorCode: action.pilotBatchId ? "SAV_PILOT_STATUS_UPDATE_BLOCKED" : null,
-      executedAt: action.pilotBatchId ? new Date() : null,
-    }).onConflictDoNothing();
-    if (!action.pilotBatchId && autonomy?.eligible && categoryEligible && rolloutEligible
-      && !thread.aiPaused && (sourceDecision?.confidence ?? 0) >= autoReplyMinConfidence()) {
-      // Serialize the daily-cap check across concurrent cron instances.
-      await tx.execute(sql`SELECT pg_advisory_xact_lock(1471638451)`);
-      const [dailyAutonomous] = await tx.select({ count: sql<number>`count(*)::int` }).from(savActions).where(and(
-        eq(savActions.kind, "send_reply"), eq(savActions.status, "succeeded"), eq(savActions.actorType, "ai"),
-        sql`${savActions.executedAt} >= ${new Date(Date.now() - 86_400_000)}`,
-      ));
-      if ((dailyAutonomous?.count ?? 0) >= savAutoReplyDailyLimit()) return;
-      const [draft] = await tx.select().from(savActions)
-        .where(and(eq(savActions.messageId, message.id), eq(savActions.kind, "draft_reply"), eq(savActions.status, "succeeded"))).limit(1);
-      if (draft?.payload.bodyCiphertext) await tx.insert(savActions).values({
-        threadId: thread.id,
-        messageId: message.id,
-        decisionId: action.decisionId,
-        kind: "send_reply",
-        idempotencyKey: `reply:send:${message.id}`,
-        payload: { bodyCiphertext: draft.payload.bodyCiphertext, model: draft.payload.model ?? "unknown" },
-        actorType: "ai",
-      }).onConflictDoNothing();
-    }
+    // The old engine's continuation is retired with it (SAV-9): no CRM e-mail log, no status update and, above all, no automatic reply to the
+    // customer is queued from here. What follows a ticket is decided by the V1 intake executor and, for a question, by the V2 agent.
   });
   return ticket;
 }

@@ -1,7 +1,21 @@
 import type { SavAutomationMode, SavReleaseStage } from "./config";
 import { savV0WriteDenial } from "./v0-contract";
 
+export const SAV_V0_ENGINE_RETIRED = "SAV_V0_ENGINE_RETIRED";
+/** Error code of every entry point of the old V0 analysis (SAV-9): nothing analyses, repairs or requeues a message any more. */
+export const SAV_V0_ANALYSIS_RETIRED = "SAV_V0_ANALYSIS_RETIRED";
+
+/**
+ * The old V0 engine no longer acts on its own (SAV-9): through the legacy workers only a person's command still executes. This holds for every
+ * release stage, automation mode and environment value; there is deliberately no switch that turns it back on, so a rollback cannot revive
+ * automatic replies, follow-ups, ticket writes or transfer notices by itself. Rows of other authors stay in the database untouched.
+ */
+export function isSavV0RetiredActor(actorType: string): boolean {
+  return actorType !== "human";
+}
+
 export function savModeAllowsWrite(mode: SavAutomationMode, kind: string, actorType: string, followup = false, releaseStage: SavReleaseStage = "v0") {
+  if (isSavV0RetiredActor(actorType)) return false;
   if (mode === "shadow") return false;
   if (releaseStage === "v0") return savV0WriteDenial(kind, actorType) === null;
   if (!["send_reply", "request_human", "create_ticket", "link_ticket", "log_email", "create_note", "update_ticket_status"].includes(kind)) return false;
@@ -34,6 +48,7 @@ export type SavWriteContext = {
 /** Re-evaluated by workers, not an authorization frozen when a draft is made. */
 export function savWriteDenial(input: SavWriteContext): string | null {
   if (input.pilotBatchId) return "SAV_PILOT_WRITE_BLOCKED";
+  if (isSavV0RetiredActor(input.actorType)) return SAV_V0_ENGINE_RETIRED;
   if (input.writesDisabled || input.mode === "shadow") return "SAV_WRITES_DISABLED";
   if (!["pending", "running"].includes(input.status)) return "SAV_ACTION_NO_LONGER_PENDING";
   if ((input.releaseStage ?? "v0") === "v0") {

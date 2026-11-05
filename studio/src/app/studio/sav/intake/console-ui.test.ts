@@ -16,7 +16,7 @@ vi.mock("./agent-pause-banner",()=>({AgentPauseBanner:()=>null}));
 vi.mock("@/lib/sav/intake/console-detail",()=>({readIntakeConsoleDetail:mocks.detail}));
 vi.mock("./actions",()=>({saveIntakeChoice:mocks.action,requestRecoveryAction:mocks.action,reconcileIdentificationAction:mocks.action,reconcileNoteAction:mocks.action,completeIntakeDossierAction:mocks.action,releaseIntakeHumanHoldAction:mocks.action}));
 vi.mock("next/link",()=>({default:(props:ComponentProps<"a">)=>createElement("a",props)}));
-vi.mock("next/navigation",()=>({notFound:()=>{throw Error("NOT_FOUND");}}));
+vi.mock("next/navigation",()=>({notFound:()=>{throw Error("NOT_FOUND");},usePathname:()=>"/studio/sav/intake/x",useSearchParams:()=>new URLSearchParams(),useRouter:()=>({back:()=>{}})}));
 import IntakeConsolePage from "./page";
 import IntakeDetailPage from "./[id]/page";
 import IntakeConsoleError from "./error";
@@ -64,7 +64,7 @@ it("detail preserves original/recorded translation and shows partial effects wit
 it("database preparation absence and failed reads never become a fabricated zero-success cohort",async()=>{
   mocks.list.mockResolvedValue({...fixture,installed:false});expect(await renderList()).toContain("Console non préparée");
   mocks.list.mockRejectedValue(Error("synthetic"));await expect(renderList()).rejects.toThrow("synthetic");
-  const html=renderToStaticMarkup(createElement(IntakeConsoleError,{reset:()=>{}}));expect(html).toContain("Aucun compteur ni résultat vide");expect(html).toContain("Réessayer");
+  const html=renderToStaticMarkup(createElement(IntakeConsoleError,{reset:()=>{}}));expect(html).toContain("Aucun compteur ni résultat vide");expect(html).toContain("Réessayer");expect(html).toContain('href="/studio/sav/intake"');expect(html).not.toContain("file supervisée");
 });
 it("no authenticated staff means no cohort/detail data is read",async()=>{
   mocks.staff.mockRejectedValue(Error("UNAUTHORIZED"));await expect(renderList()).rejects.toThrow("UNAUTHORIZED");expect(mocks.list).not.toHaveBeenCalled();

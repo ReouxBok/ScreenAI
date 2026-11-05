@@ -15,9 +15,19 @@ import { assertSavTicketPreview } from "./manual-ticket-preview";
 import { SAV_TICKET_RETURN_NOTE_VERSION } from "./ticket-return-note";
 import { resolveSavCustomerIdentity } from "./forwarded-identity";
 import { savEffectiveReceivedAt } from "@/lib/sav/message-order";
+import { refuseRetiredSavV0Command } from "./v0-command-retirement";
 
 const requestSchema = z.object({ threadId: z.uuid(), reviewId: z.uuid(), kind: z.enum(["create_ticket", "link_ticket"]), ticketId: z.string().regex(/^\d{1,30}$/).optional(), returnOperation: z.enum(["keep", "reactivate", "create"]).optional(), previewToken: z.string().max(40_000).optional(), distinctIssueReason: z.string().trim().max(2_000).default("") });
-export async function queueSavManualTicket(raw: unknown, actorEmail: string, verifiedContext?: SavDossierContext) {
+/**
+ * SAV-9/SAV-60: only the signed-preview path (ticket-preview-actions, canonical intake) stays. The old direct create/link forms carry no
+ * preview token and are refused before any read. The archived body below stays for the tests of the worker paths; no source file may import it.
+ */
+export async function queueSavManualTicket(...args: Parameters<typeof queueSavManualTicketArchived>) {
+  const raw = args[0] as { previewToken?: unknown; kind?: unknown } | null;
+  if (!raw?.previewToken) refuseRetiredSavV0Command(raw?.kind === "link_ticket" ? "linkTicketAction" : "createTicketAction");
+  return queueSavManualTicketArchived(...args);
+}
+export async function queueSavManualTicketArchived(raw: unknown, actorEmail: string, verifiedContext?: SavDossierContext) {
   assertSavActor(actorEmail);
   const input = requestSchema.parse(raw);
   if (input.kind === "link_ticket" && !input.ticketId) throw new Error("SAV_LINK_TICKET_ID_REQUIRED");

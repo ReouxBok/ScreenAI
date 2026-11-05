@@ -57,11 +57,18 @@ export function assessSavKnowledgeValidity(candidate: SavRetrievalCandidate, loc
     expiry = resolution.validUntil;
     if (expiry < day(now)) return reject("expired");
   }
-  const verified = candidate.verifiedAt ? Date.parse(candidate.verifiedAt) : NaN;
-  if (!Number.isFinite(verified) || verified > now.getTime()) return reject("unverified");
-  if (now.getTime() - verified > 90 * DAY) return reject("stale");
+  const freshness = savKnowledgeFreshness(candidate.verifiedAt, now);
+  if (freshness === "unverified" || freshness === "stale") return reject(freshness);
   return { eligible: true as const, reason: "available" as const,
-    revalidationDue: now.getTime() - verified >= 75 * DAY || Boolean(expiry && expiry <= day(new Date(now.getTime() + 15 * DAY))) };
+    revalidationDue: freshness === "revalidation_due" || Boolean(expiry && expiry <= day(new Date(now.getTime() + 15 * DAY))) };
+}
+
+/** The one policy on a source's check date: absent, unreadable or future is unverified, more than 90 days is stale, from 75 days a new check is due. */
+export function savKnowledgeFreshness(verifiedAt: string | null, now: Date): "unverified" | "stale" | "revalidation_due" | "fresh" {
+  const verified = verifiedAt ? Date.parse(verifiedAt) : NaN;
+  if (!Number.isFinite(verified) || verified > now.getTime()) return "unverified";
+  if (now.getTime() - verified > 90 * DAY) return "stale";
+  return now.getTime() - verified >= 75 * DAY ? "revalidation_due" : "fresh";
 }
 
 const stopWords = new Set(["avec", "pour", "dans", "comment", "quoi", "faire", "peut", "plus", "pas", "les", "des", "une", "mon", "mes", "sur", "est", "sont", "limova", "bonjour", "merci", "the", "and", "with", "how"]);
@@ -73,11 +80,48 @@ export function savWholeTokenCoverage(query: string, text: string) {
   const terms = savRetrievalTokens(query), candidateTerms = new Set(savRetrievalTokens(text));
   return terms.length ? terms.filter(term => candidateTerms.has(term)).length / terms.length : 0;
 }
+const accessNorm = (text: string) => text.normalize("NFKD").replace(/\p{M}/gu, "").toLocaleLowerCase("fr").replace(/[’`]/g, "'").replace(/\s+/g, " ");
+const OWN = String.raw`(?:mon|ma|mes|votre|vos|son|sa|ses|notre|nos|l'|la|le|au|a l')\s?`;
+const PERSONAL_ACCESS = [
+  // Reflexive login: « me connecter », « se reconnecter », « vous connecter ».
+  /\b(?:me|m'|se|s'|vous|nous) ?(?:re)?connecter\b/,
+  // Reaching one's own account, space or the platform: « accéder à mon compte », « accès à son espace », « connexion à mon compte ».
+  new RegExp(String.raw`\b(?:acceder|acces|connexion|connecte|entrer|rentrer|identifier)\s(?:a|au|aux|sur|dans)\s(?:${OWN})?(?:\w+\s)?(?:compte|espace|plateforme|site|organisation|application|appli|limova)\b`),
+  /\bproblemes? (?:de|d') ?(?:connexion|acces|identification)\b/,
+  /\b(?:code|lien) (?:de connexion|d'acces|a usage unique|unique)\b/,
+  /\b(?:recois|recu|recoit|arrive|vois) (?:aucun|pas (?:de|le|mon)|plus (?:de|le)|jamais (?:de|le)) code\b/,
+  /\bidentifiant (?:introuvable|inconnu|invalide|incorrect)\b/,
+  /\b(?:bloque|bloquee) (?:a|sur|dans) (?:la )?(?:connexion|page de connexion)\b/,
+];
+// Another service or other people: connecting Gmail, inviting a member, a user quota.
+const NOT_PERSONAL_ACCESS = /\b(?:gmail|google|drive|sheets?|calendar|calendrier|outlook|linkedin|facebook|instagram|meta|wordpress|wix|webflow|whatsapp|oauth|integrations?|api)\b|\b(?:invit\w*|membres?|collaborat\w*|quotas?|ajouter (?:un|des) utilisateurs?)\b/;
+/** A continuation on an old ticket must respect the same pilot boundary as a new access query. */
+export function savOutsidePersonalAccessScope(text: string) {
+  return NOT_PERSONAL_ACCESS.test(accessNorm(text));
+}
+// A login error on an existing account, even when the customer describes the account in the next sentence.
+// A bare 4xx, a code being delivered or an error on another product does not establish that intent.
+const PERSONAL_LOGIN_ERROR = /\b(?:(?:lors de|pendant|au moment de) (?:ma|notre) (?:re)?connexion|(?:a|sur) la (?:page de )?connexion (?:a |de )?limova)\b[^.!?\n]{0,80}\b(?:erreur|echoue|echec)\b/;
+const EXISTING_ACCOUNT = /\b(?:j'ai|nous avons) (?:deja |toujours )?(?:un|mon|notre) compte\b|\b(?:mon|notre) compte (?:limova|existant)\b/;
+/** The customer's own access (login, code, account or space), read on whole phrases; a mention of another service or of other people is not it. */
+export function savPersonalAccessIntent(text: string) {
+  const value = accessNorm(text);
+  return !NOT_PERSONAL_ACCESS.test(value) && (PERSONAL_ACCESS.some(pattern => pattern.test(value))
+    || (PERSONAL_LOGIN_ERROR.test(value) && EXISTING_ACCOUNT.test(value) && !/\b(?:internet|wi-?fi|reseau|vpn|serveur|banque|bancaire)\b/.test(value)));
+}
 /** This configurable score orders candidates only; it never grants grounding. */
 export function savRetrievalRanking(query: string, candidate: SavRetrievalCandidate, semanticWeight = 0.75) {
   if (!Number.isFinite(semanticWeight) || semanticWeight < 0 || semanticWeight > 1) throw new Error("SAV_RETRIEVAL_RANKING_CONFIG_INVALID");
   const symptoms = Array.isArray(candidate.resolution?.symptoms) ? candidate.resolution.symptoms.filter(value => typeof value === "string").join(" ") : "";
-  const lexicalScore = savWholeTokenCoverage(query, `${candidate.title} ${symptoms}`);
+  const baseScore = savWholeTokenCoverage(query, `${candidate.title} ${symptoms}`);
+  // Getting into one's own account is one intent under many words; the card is matched on what it explains (title and
+  // symptoms), never on its identifier, and attaching another service or managing other people is not that intent.
+  // Workspace recovery assumes an organisation/space problem. A generic login or missing
+  // code does not supply that evidence; keep the ordinary lexical score for those cards.
+  const workspace = /\b(?:organisation|espace de travail|workspace)\b/;
+  const scopeMatches = !workspace.test(accessNorm(candidate.title)) || workspace.test(accessNorm(query));
+  const lexicalScore = scopeMatches && savPersonalAccessIntent(query) && savPersonalAccessIntent(`${candidate.title}. ${symptoms}`)
+    ? baseScore + (1 - baseScore) * 0.45 : baseScore;
   const semanticScore = candidate.semanticScore !== null && Number.isFinite(candidate.semanticScore) ? Math.max(-1, Math.min(1, candidate.semanticScore)) : null;
   return { semanticScore, lexicalScore, rankingScore: semanticScore === null ? lexicalScore : semanticWeight * (semanticScore + 1) / 2 + (1 - semanticWeight) * lexicalScore };
 }

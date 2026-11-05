@@ -163,7 +163,7 @@ test("un contenu existant peut être mis à jour puis supprimé par un administr
 
 test("le banc E2E utilise l’identité owner et expose les espaces administrateur",async({page})=>{
   await login(page);
-  await expect(page.getByRole("link",{name:"SAV IA",exact:true})).toBeVisible();
+  await expect(page.getByRole("link",{name:"Demandes",exact:true})).toBeVisible();
   await expect(page.getByRole("link",{name:"Entraînements",exact:true})).toBeVisible();
   await page.goto("/studio/validations");
   await page.waitForURL(/\/studio\/validations$/);
@@ -415,7 +415,7 @@ test("un membre crée, finalise et transforme son tutoriel sans accéder à celu
   try {
     await memberPage.goto("/studio");
     await expect(memberPage.getByRole("link", { name: "Entraînements", exact: true })).toBeVisible();
-    await expect(memberPage.getByRole("link", { name: "SAV IA", exact: true })).toHaveCount(0);
+    await expect(memberPage.getByRole("link", { name: "Demandes", exact: true })).toHaveCount(0);
     await expect(memberPage.getByRole("link", { name: "Trame d’onboarding", exact: true })).toHaveCount(0);
     await expect(memberPage.getByRole("link", { name: "Santé", exact: true })).toHaveCount(0);
     await memberPage.goto("/studio/entrainements");

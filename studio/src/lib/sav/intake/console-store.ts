@@ -4,7 +4,7 @@ import "server-only";
 import { and, asc, desc, eq, ilike, or, sql } from "drizzle-orm";
 import { requireDb } from "@/db";
 import { savIntakeConsole, savIntakeRuns, savIntakeHumanEvents, savMessages, savThreads,
-  savIntakeObservationBindings, savResolutionObservations, savObservationCycles } from "@/db/schema";
+  savIntakeObservationBindings, savResolutionObservations, savObservationCycles, savIntakeJournal } from "@/db/schema";
 import { decryptSavPayload } from "../crypto";
 import { historicalMessageSql, historicalThreadSql, intakeMessageHistorical } from "./launch-boundary";
 import type { IntakeRuntimePayload } from "./runtime-contract";
@@ -33,6 +33,9 @@ export async function projectIntakeThread(threadId: string, beforePublish?: () =
   else if (await intakeThreadHumanHeld(threadId)) result = { view: "to_validate", status: "human_hold", reason: "L’équipe garde la main sur ce dossier. L’automatisation reste en pause ; une décision humaine est attendue." };
   else if (message && await intakeMessageHistorical(message.id)) result = { view: "completed", status: "historical_outside_automation", reason: "Historique — hors automatisation. Le statut HubSpot et les preuves sont conservés." };
   else if (thread?.aiPaused) result = { view: null, status: "paused", reason: "Reprise suspendue par l’équipe" };
+  // V2 entry: this mail's V1 run was ended with its record on the V2 case; it is not waiting for an analysis.
+  else if (message && (!run || run.messageId !== message.id) && (await db.select({ id: savIntakeJournal.id }).from(savIntakeJournal).innerJoin(savIntakeRuns, eq(savIntakeRuns.id, savIntakeJournal.runId))
+    .where(and(eq(savIntakeRuns.messageId, message.id), eq(savIntakeJournal.kind, "v2_customer_return"))).limit(1)).length) result = { view: null, status: "v2_customer_return", reason: "Retour client repris sur le dossier V2." };
   else if (!run || run.messageId !== message?.id) result.reason = "Nouvelle entrée en attente d’analyse";
   else {
     try {

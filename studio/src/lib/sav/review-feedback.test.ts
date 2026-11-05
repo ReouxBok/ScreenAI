@@ -11,7 +11,7 @@ import { loadSavDraftContext, reviewSavDraft } from "./draft-verdicts";
 import { savDossierSourceHash, savDraftSourceHash, savReviewReasonsSchema } from "./review-contract";
 import { getSavReviewFeedback } from "./metrics";
 import { saveSavHumanReplyDraft } from "./drafts";
-import { queueSavManualTicket } from "./manual-tickets";
+import { queueSavManualTicketArchived as queueSavManualTicket } from "./manual-tickets";
 import { getSavObservations, syncSavObservation } from "./observations";
 import type { SavStructuredProposal } from "./proposal";
 const state = vi.hoisted(() => ({ db: null as unknown }));
@@ -26,7 +26,8 @@ beforeEach(async () => {
   vi.stubEnv("SAV_ENCRYPTION_KEY_V1", "sav44-synthetic-encryption-key-only-for-tests");
   vi.stubEnv("SAV_RELEASE_STAGE", "v0"); vi.stubEnv("SAV_AUTOMATION_MODE", "assist"); vi.stubEnv("SAV_WRITES_DISABLED", "false");
   vi.stubGlobal("fetch", denyNetwork); denyNetwork.mockClear();
-  await f.client.exec("TRUNCATE sav.mailboxes CASCADE; TRUNCATE sav.sync_state; TRUNCATE active_knowledge; TRUNCATE audit_logs; TRUNCATE sav.learning_candidates CASCADE; TRUNCATE sav.ticket_snapshots CASCADE");
+  // sav-v0-cutover is the only sync_state key this file writes; the migrator's schema markers are not this file's to remove.
+  await f.client.exec("TRUNCATE sav.mailboxes CASCADE; DELETE FROM sav.sync_state WHERE key = 'sav-v0-cutover'; TRUNCATE active_knowledge; TRUNCATE audit_logs; TRUNCATE sav.learning_candidates CASCADE; TRUNCATE sav.ticket_snapshots CASCADE");
   proposal = { ...v0Proposal(), category: "billing", understanding: sav44Understanding() };
   const [mailbox] = await f.db.insert(savMailboxes).values({ email: "contact@limova.ai" }).returning();
   await activateSavV0Cutover({ receivedAfter: "2026-10-02T12:00:00Z", mailboxEmail: mailbox.email, intakeRecipient: "contact@limova.ai", deploymentSha: "a".repeat(40), activatedBy: "ugo@limova.ai" });

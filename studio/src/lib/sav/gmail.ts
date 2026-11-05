@@ -9,7 +9,7 @@ import { timingSafeEqual } from "node:crypto";
 import { and, asc, desc, eq, inArray, isNull, lt, lte, or, sql } from "drizzle-orm";
 import { z } from "zod";
 import { requireDb } from "@/db";
-import { savActions, savFollowups, savGmailQuarantine, savMailboxes, savMessages, savSyncState, savThreads, savWebhookReceipts } from "@/db/schema";
+import { savActions, savGmailQuarantine, savMailboxes, savMessages, savSyncState, savThreads, savWebhookReceipts } from "@/db/schema";
 import { assertSavWriteAllowed } from "./write-guard";
 import { savModeAllowsWrite } from "./action-policy";
 import { savAutomationMode, savReleaseStage } from "./config";
@@ -23,7 +23,7 @@ import {
   updateMailboxCursor,
   updateMailboxWatch,
 } from "./service";
-import { assertSavOutboundRecipientAllowed, ensureAiTransparency, followupDates, normalizeEmailAddress, sanitizeInboundText } from "./policy";
+import { assertSavOutboundRecipientAllowed, ensureAiTransparency, normalizeEmailAddress, sanitizeInboundText } from "./policy";
 import { savActionFailurePlan } from "./retry-policy";
 import { redactSavLearningText } from "./learning-extraction";
 import { getSavV0Cutover } from "./cutover";
@@ -709,7 +709,7 @@ async function sendReplyAction(action: typeof savActions.$inferSelect, text: str
   if (manualV0 && (!sent.id || sent.threadId !== thread.gmailThreadId)) throw new Error("SAV_REPLY_MANUAL_RECONCILIATION_REQUIRED");
   const now = new Date();
   await db.transaction(async (tx) => {
-    const [createdOutbound] = await tx.insert(savMessages).values({
+    await tx.insert(savMessages).values({
       mailboxId: mailbox.id,
       threadId: thread.id,
       gmailMessageId: sent.id,
@@ -725,41 +725,16 @@ async function sendReplyAction(action: typeof savActions.$inferSelect, text: str
       receivedAt: now,
       processedAt: now,
       analysisStatus: "done",
-    }).onConflictDoNothing().returning();
-    const [outbound] = createdOutbound ? [createdOutbound] : await tx.select().from(savMessages)
-      .where(and(eq(savMessages.mailboxId, mailbox.id), eq(savMessages.gmailMessageId, sent.id))).limit(1);
+    }).onConflictDoNothing();
     await tx.update(savActions).set({ status: "succeeded", executedAt: now, updatedAt: now, errorCode: null })
       .where(eq(savActions.id, action.id));
-    if (!manualV0 && thread.hubspotTicketId && outbound) await tx.insert(savActions).values({
-      threadId: thread.id,
-      messageId: outbound.id,
-      kind: "log_email",
-      idempotencyKey: `hubspot:log-email:gmail:${sent.id}`,
-      payload: { hubspotTicketId: thread.hubspotTicketId },
-      actorType: "system",
-    }).onConflictDoNothing();
+    // The old engine's continuation (CRM e-mail log, status update, J+2/5/10 follow-ups) is retired with it (SAV-9): a person's reply
+    // updates the thread and nothing else. Reminders of a question belong to the V2 timer, which never sends from here.
     if (action.kind === "send_reply") {
       await tx.update(savThreads).set({ status: manualV0
         ? sql`case when ${savThreads.aiPaused} then ${savThreads.status} else 'awaiting_customer' end`
         : "awaiting_customer", lastMessageAt: now, updatedAt: now })
         .where(eq(savThreads.id, thread.id));
-      for (const [index, dueAt] of (manualV0 ? [] : followupDates(now)).entries()) {
-        await tx.insert(savFollowups).values({ threadId: thread.id, sequence: index + 1, dueAt })
-          .onConflictDoNothing();
-      }
-    }
-    if (!manualV0 && thread.hubspotTicketId) {
-      await tx.insert(savActions).values({
-        threadId: thread.id,
-        kind: "update_ticket_status",
-        messageId: inbound.id,
-        idempotencyKey: `hubspot:status:${action.kind}:${action.id}`,
-        payload: {
-          hubspotTicketId: thread.hubspotTicketId,
-          target: action.kind === "request_human" ? "human" : "awaiting_customer",
-        },
-        actorType: "ai",
-      }).onConflictDoNothing();
     }
   });
   return sent;
@@ -832,6 +807,8 @@ export async function processPendingGmailSendActions(limit = 20, onlyActionId?: 
   const candidates = await db.select().from(savActions)
     .where(and(
       inArray(savActions.kind, [...allowedKinds]),
+      // Retired engine (SAV-9): machine-authored rows are filtered before LIMIT so they can neither run nor starve a person's command.
+      eq(savActions.actorType, "human"),
       sql`not (${historicalMessageForIdSql(savActions.messageId)} or (${savActions.messageId} is null and ${historicalThreadSql(savActions.threadId)}))`,
       onlyActionId ? eq(savActions.id, onlyActionId) : undefined,
       isNull(savActions.pilotBatchId),

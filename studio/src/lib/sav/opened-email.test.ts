@@ -47,7 +47,8 @@ beforeEach(async () => {
   vi.stubGlobal("__savGmailToken", undefined); vi.stubGlobal("fetch", network); network.mockClear();
   labels = [{ id: "existing-label", name: "MAIl STUDIO SAV", type: "user" }];
   messageLabels = ["INBOX", "UNREAD", "IMPORTANT"]; deniedAt = null; uncertain = false; wrongThread = false; activateKillSwitch = false; wrongReceipt = false;
-  await fixture.client.exec("TRUNCATE sav.mailboxes CASCADE; TRUNCATE sav.sync_state; TRUNCATE audit_logs");
+  // sav-v0-cutover is the only sync_state key this file writes; the migrator's schema markers are not this file's to remove.
+  await fixture.client.exec("TRUNCATE sav.mailboxes CASCADE; DELETE FROM sav.sync_state WHERE key = 'sav-v0-cutover'; TRUNCATE audit_logs");
   const [mailbox] = await fixture.db.insert(savMailboxes).values({ email: "contact@limova.ai" }).returning();
   mailboxId = mailbox.id;
   await activateSavV0Cutover({ receivedAfter: "2026-10-02T12:00:00Z", mailboxEmail: mailbox.email, intakeRecipient: "contact@limova.ai", deploymentSha: "a".repeat(40), activatedBy: "ugo@limova.ai" });

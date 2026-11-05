@@ -9,6 +9,8 @@ import type { requireDb } from "../src/db";
 export async function createSavTestDb() {
   const nativeUrl = process.env.SAV_TEST_POSTGRES_URL;
   if (nativeUrl) return (await import("./sav-native-db")).createSavNativeTestDb(nativeUrl, process.env.SAV_TEST_POSTGRES_TOKEN);
+  // The CI's native step must never fall back to PGlite (test/sav-native-required.setup.ts also refuses any PGlite there).
+  if (process.env.SAV_TEST_NATIVE_REQUIRED === "1") throw new Error("SAV_NATIVE_TEST_REQUIRED: no SAV_TEST_POSTGRES_URL, PGlite refused");
   const client = new PGlite({ extensions: { vector } });
   const directory = new URL("../drizzle/", import.meta.url);
   for (const file of (await readdir(directory)).filter((name) => name.endsWith(".sql")).sort()) {

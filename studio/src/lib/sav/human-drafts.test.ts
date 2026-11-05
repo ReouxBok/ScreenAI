@@ -7,7 +7,7 @@ import { activateSavV0Cutover } from "./cutover";
 import { encryptSavPayload } from "./crypto";
 import { reviewSavDraft } from "./draft-verdicts";
 import { getSavProposalReview, reviewSavProposal } from "./review";
-import { queueSavManualReply } from "./manual-replies";
+import { queueSavManualReplyArchived as queueSavManualReply } from "./manual-replies";
 import { saveSavHumanReplyDraft, getSavReplyDrafts } from "./drafts";
 
 // Synthetic regression scenarios from the independent SAV-56 review.

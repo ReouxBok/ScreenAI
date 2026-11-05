@@ -4,13 +4,10 @@ import Form from "next/form";
 import { ArrowUpRight, BookOpen, CheckCheck, Inbox, ListChecks, RefreshCw, Search, FolderSearch } from "lucide-react";
 import { getSavV0Cutover } from "@/lib/sav/cutover";
 import { listSavActionIncidents, listSavWebhookIncidents } from "@/lib/sav/service";
-import { listSavDossierDashboard } from "@/lib/sav/dashboard";
+import { listSavDossierDashboardReadOnly } from "@/lib/sav/dashboard";
 import { savDashboardLabels, savDashboardViews } from "@/lib/sav/dashboard-state";
 import { retryWebhookAction } from "./actions";
-import { openSavEmailAction } from "./open-email-actions";
 import { SavNavigationPending } from "./navigation-pending";
-import { OpenEmailButton } from "./open-email-button";
-import { SavDashboardProjectionPending } from "@/lib/sav/dashboard-projection";
 import { SavProjectionProgress } from "./projection-progress";
 import styles from "./inbox.module.css";
 
@@ -21,12 +18,14 @@ const ticketLabels = { not_required: "Sans ticket nécessaire", required: "Actio
 
 export async function SavV0Inbox({ searchParams }: { searchParams: Promise<{ view?: string; q?: string; page?: string; sort?: string }> }) {
   const { view = "to_process", q = "", page = "1", sort = "newest" } = await searchParams;
-  let data: Awaited<ReturnType<typeof listSavDossierDashboard>>;
-  try { data = await listSavDossierDashboard({ view, query: q, page: Number(page), sort }); }
-  catch (error) {
-    if (error instanceof SavDashboardProjectionPending) return <><div className="page-intro compact"><div><span className="eyebrow">SAV IA</span><h1>Piloter les demandes</h1></div></div><SavProjectionProgress/></>;
+  // Opening the list writes nothing: a stale projection answers pending and the cron step refreshes it (UX-Q6, option A).
+  let result: Awaited<ReturnType<typeof listSavDossierDashboardReadOnly>>;
+  try { result = await listSavDossierDashboardReadOnly({ view, query: q, page: Number(page), sort }); }
+  catch {
     return <><div className="page-intro compact"><div><span className="eyebrow">SAV IA</span><h1>Piloter les demandes</h1></div></div><section className="card" role="alert"><h2>Les dossiers ne sont pas disponibles</h2><p>Le chargement a échoué. Aucun compteur ni résultat vide n’est présenté comme confirmé.</p><Link className="button secondary" href="/studio/sav">Réessayer</Link></section></>;
   }
+  if (result.pending) return <><div className="page-intro compact"><div><span className="eyebrow">SAV IA</span><h1>Piloter les demandes</h1></div></div><SavProjectionProgress/></>;
+  const data = result.data;
   const cutover = await getSavV0Cutover();
   const [syncIncidents, actionIncidents] = data.view === "incidents" ? await Promise.all([listSavWebhookIncidents(20), listSavActionIncidents(20)]) : [[], []];
   const href = (selectedView: string, selectedPage = 1) => `/studio/sav?${new URLSearchParams({ view: selectedView, q: q.slice(0, 200), page: String(selectedPage), sort: sort === "oldest" ? "oldest" : "newest" })}`;
@@ -53,15 +52,13 @@ export async function SavV0Inbox({ searchParams }: { searchParams: Promise<{ vie
         // Observation opens the dossier without filing Gmail or refreshing CRM.
         // The detail page retains its usual consultation audit after opening.
         if (data.view === "other") return <Link key={row.threadId} id={`dossier-${row.threadId}`} className={`${styles.compactRow} ${styles.observationRow}`} prefetch={false} href={`/studio/sav/${row.threadId}?returnTo=${encodeURIComponent(returnTo)}`}>{content}</Link>;
-        return <form action={openSavEmailAction} key={row.threadId} id={`dossier-${row.threadId}`} className={styles.openForm}>
-          <input type="hidden" name="threadId" value={row.threadId}/><input type="hidden" name="messageId" value={row.messageId}/><input type="hidden" name="returnTo" value={returnTo}/>
-          <OpenEmailButton subject={row.summary.title} compact>{content}</OpenEmailButton>
-        </form>;
+        // SAV-60: opening is a plain read. No Gmail filing, no opening record, no CRM refresh.
+        return <Link key={row.threadId} id={`dossier-${row.threadId}`} className={styles.compactRow} prefetch={false} aria-label={`Ouvrir le dossier : ${row.summary.title}`} href={`/studio/sav/${row.threadId}?returnTo=${encodeURIComponent(returnTo)}`}>{content}</Link>;
       })}
       {!data.rows.length && <div className={styles.empty}><Inbox size={28}/><h2>{q.trim() ? "Aucun dossier ne correspond à cette recherche" : data.view === "other" ? "Aucun candidat dans Autre" : data.view === "completed" ? "Aucun dossier terminé" : data.view === "learning" ? "Aucun apprentissage en cours" : data.view === "to_validate" ? "Aucun dossier à valider" : data.view === "to_process" ? "Aucune nouvelle demande à ouvrir" : "Aucun dossier dans cette vue"}</h2><p>{q.trim() ? "Essayez un autre nom, thème ou numéro de ticket." : data.view === "other" ? "Un résultat vide ne signifie pas que tous les emails sont des demandes clients. Continuez à consulter les vues habituelles." : "Les dossiers apparaîtront ici dès que leur état le permettra."}</p>{q.trim() && <Link href={`/studio/sav?view=${data.view}`}>Effacer la recherche</Link>}</div>}
     </section>
     <nav className={styles.pagination} aria-label="Pagination"><span>{data.total} dossier{data.total > 1 ? "s" : ""}{q.trim() ? " correspondant à la recherche" : ""}</span><span>{data.page > 1 && <Link href={href(data.view, data.page - 1)}>← Précédente<SavNavigationPending/></Link>} Page {data.page} sur {data.totalPages} {data.page < data.totalPages && <Link href={href(data.view, data.page + 1)}>Suivante →<SavNavigationPending/></Link>}</span></nav>
     {data.view === "incidents" && (syncIncidents.length > 0 || actionIncidents.length > 0) && <section className="sav-incidents card"><h2>Journal des incidents</h2><p>Un résultat HubSpot incertain exige une vérification dans le dossier avant toute reprise.</p><ol>{syncIncidents.map(incident => <li key={incident.id}><div><strong>Synchronisation {incident.provider}</strong><small>{formatParisDateTime(incident.receivedAt)}</small></div><form action={retryWebhookAction}><input type="hidden" name="receiptId" value={incident.id}/><button className="button secondary" type="submit">Relancer la synchronisation</button></form></li>)}{actionIncidents.map(incident => <li key={incident.id}><strong>{incident.subject}</strong><Link href={`/studio/sav/${incident.threadId}`}>Vérifier le dossier</Link></li>)}</ol></section>}
-    <nav className={styles.secondaryLinks} aria-label="Outils SAV"><Link href="/studio/sav/resolutions">Bilans de résolution</Link><Link href="/studio/sav/pilote">Laboratoire</Link><Link href="/studio/sav/evaluation">Évaluation</Link></nav>
+    <nav className={styles.secondaryLinks} aria-label="Outils SAV"><Link href="/studio/sav/archives">Archives (lecture seule)</Link><Link href="/studio/sav/resolutions">Bilans de résolution</Link><Link href="/studio/sav/pilote">Laboratoire</Link><Link href="/studio/sav/evaluation">Évaluation</Link></nav>
   </div>;
 }
