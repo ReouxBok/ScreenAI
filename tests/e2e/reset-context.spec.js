@@ -35,14 +35,23 @@ for (const serverOrchestration of [false, true]) {
       });
     }, OLD_SESSION);
     // Restart to load persisted conversation state as a real installed extension does.
-    const sidebar = await context.newPage();
-    await sidebar.goto(`chrome-extension://${extensionId}/src/sidebar/sidebar.html`);
+    const sidebarUrl = `chrome-extension://${extensionId}/src/sidebar/sidebar.html`;
+    const firstPanel = await context.newPage();
+    await firstPanel.goto(sidebarUrl);
+    await firstPanel.waitForFunction(() => document.documentElement.dataset.sidebarReady === 'true');
+    await firstPanel.close();
     const cdp = await context.browser().newBrowserCDPSession();
     const targets = (await cdp.send('Target.getTargets')).targetInfos;
     const worker = targets.find(target => target.type === 'service_worker' && target.url === serviceWorker.url());
+    expect(worker).toBeTruthy();
     await cdp.send('Target.closeTarget', { targetId: worker.targetId });
+    await expect.poll(async () => {
+      const { targetInfos } = await cdp.send('Target.getTargets');
+      return targetInfos.some(target => target.targetId === worker.targetId);
+    }).toBe(false);
     await cdp.detach();
-    await sidebar.reload();
+    const sidebar = await context.newPage();
+    await sidebar.goto(sidebarUrl);
     await sidebar.waitForFunction(() => document.documentElement.dataset.sidebarReady === 'true');
     await expect(sidebar.locator('#chatContainer')).toContainText('audit SEO');
     const limova = await context.newPage();
