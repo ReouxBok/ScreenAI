@@ -670,7 +670,7 @@ function notifyModalDetected(modal) {
 // Popup analysis is a Limova onboarding feature; other sites only get the
 // page map when Charly reads them.
 function refreshModalObserver() {
-  if ((assistantSessionActive || trainingCaptureActive) && window.location.origin === 'https://new.limova.ai') startModalObserver();
+  if ((assistantSessionActive || trainingCaptureActive) && ['https://new.limova.ai', 'https://staging.new.limova.ai'].includes(window.location.origin)) startModalObserver();
   else stopModalObserver();
 }
 

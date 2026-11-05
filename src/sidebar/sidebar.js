@@ -730,7 +730,7 @@ async function checkIfOnLimova() {
   if (!goBtn) return;
   try {
     const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
-    if (tab?.url && !tab.url.startsWith('https://new.limova.ai')) {
+    if (tab?.url && !LIMOVA_APP_ORIGINS.some(origin => tab.url.startsWith(origin))) {
       goBtn.hidden = false;
     } else {
       goBtn.hidden = true;

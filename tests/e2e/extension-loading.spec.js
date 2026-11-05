@@ -42,7 +42,7 @@ test.describe('Extension — loading and bootstrap', () => {
     const manifest = await serviceWorker.evaluate(() => chrome.runtime.getManifest());
     expect(manifest.content_scripts.length).toBeGreaterThan(0);
     for (const cs of manifest.content_scripts) {
-      expect(cs.matches).toEqual(['https://new.limova.ai/*']);
+      expect([...cs.matches].sort()).toEqual(['https://new.limova.ai/*', 'https://staging.new.limova.ai/*']);
     }
   });
 });

@@ -14,6 +14,10 @@ import { createOnboardingPlan, advanceStep } from './prompts/onboarding-plan.js'
 // ============================================================================
 
 const LIMOVA_DOMAIN = 'https://new.limova.ai';
+// Staging runs features ahead of production with the same page paths, so
+// trainings and tests recorded there must work unchanged on new.limova.ai.
+const LIMOVA_STAGING_DOMAIN = 'https://staging.new.limova.ai';
+const LIMOVA_APP_ORIGINS = [LIMOVA_DOMAIN, LIMOVA_STAGING_DOMAIN];
 const LIMOVA_API_DOMAIN = 'https://api.new.limova.ai';
 const PROXY_URL = 'https://limova-proxy-479c7fb78ccf.herokuapp.com';
 const TRAINING_API_URL = 'https://studio.limova.ai/api/training/sessions';
@@ -71,10 +75,19 @@ function errorCodeOf(error, fallback = 'UNEXPECTED_ERROR') {
 
 function isLimovaUrl(value) {
   try {
-    return new URL(value).origin === LIMOVA_DOMAIN;
+    return LIMOVA_APP_ORIGINS.includes(new URL(value).origin);
   } catch {
     return false;
   }
+}
+
+// Studio stores trainings and test traces under the production origin.
+function productionLimovaUrls(value) {
+  return value.replaceAll(LIMOVA_STAGING_DOMAIN, LIMOVA_DOMAIN);
+}
+
+function productionLimovaPayload(value) {
+  return JSON.parse(productionLimovaUrls(JSON.stringify(value)));
 }
 
 function siteNameOf(value) {
@@ -1098,7 +1111,7 @@ async function handleTrainingEvent(rawEvent, sender) {
 
 async function recordTrainingEvent(rawEvent) {
   if (!trainingState.active || trainingState.stopping || !trainingState.token) return { ok: false, error: 'Aucun entraînement actif.' };
-  const event = { kind: String(rawEvent.kind || ''), path: privacySafeUrl(rawEvent.path || sessionState.lastUrl || '') || '/', label: String(rawEvent.label || '').slice(0, 500), payload: rawEvent.payload && typeof rawEvent.payload === 'object' ? rawEvent.payload : {} };
+  const event = productionLimovaPayload({ kind: String(rawEvent.kind || ''), path: privacySafeUrl(rawEvent.path || sessionState.lastUrl || '') || '/', label: String(rawEvent.label || '').slice(0, 500), payload: rawEvent.payload && typeof rawEvent.payload === 'object' ? rawEvent.payload : {} });
   if (['page_context', 'network'].includes(event.kind)
     && !/^Fenêtre d’autorisation externe/.test(event.label)) {
     const signature = `${event.kind}|${event.path}|${event.label}`;
@@ -1218,7 +1231,7 @@ async function startEvaluation(rawToken) {
 
 async function recordEvaluationEvent(event) {
   if (!evaluationState.active || !evaluationState.token) return;
-  await evaluationFetch('events', { body: event }).catch(() => null);
+  await evaluationFetch('events', { body: productionLimovaPayload(event) }).catch(() => null);
 }
 
 async function runEvaluatedVoiceTool(toolName, targetLabel, operation) {
@@ -2489,7 +2502,7 @@ async function getPageContext(tabId, operation = { generation: sessionGeneration
   try {
     const results = await chrome.scripting.executeScript({
       target: { tabId },
-      func: (contextVersion, limovaOrigin) => {
+      func: (contextVersion, limovaOrigins) => {
         document.documentElement.dataset.limovaContextVersion = String(contextVersion);
         // Clean up previous IDs
         document.querySelectorAll('[data-lid]').forEach(el => el.removeAttribute('data-lid'));
@@ -2504,7 +2517,7 @@ async function getPageContext(tabId, operation = { generation: sessionGeneration
           // Limova names its own overlays modal/dialog/drawer/popup. Elsewhere
           // such class names are layout wrappers (Drupal wraps whole sites in
           // .dialog-off-canvas-main-canvas) and only the detected surface counts.
-          if (window.location.origin === limovaOrigin
+          if (limovaOrigins.includes(window.location.origin)
             && el.closest('dialog, [class*="modal" i], [class*="dialog" i], [class*="drawer" i], [class*="popup" i]')) return 'modal';
           const nav = el.closest('nav, [role="navigation"], [class*="sidebar"], [class*="nav"]');
           if (nav) return 'nav';
@@ -3099,11 +3112,11 @@ async function getPageContext(tabId, operation = { generation: sessionGeneration
           viewport: `${window.innerWidth}x${window.innerHeight}`,
           surface: activeModalSurface ? 'modal' : 'page',
           elements: elementMap.slice(0, 150),
-          readable: window.location.origin === limovaOrigin ? null : getReadableText(),
+          readable: limovaOrigins.includes(window.location.origin) ? null : getReadableText(),
           network
         };
       },
-      args: [pageContextVersion + 1, LIMOVA_DOMAIN]
+      args: [pageContextVersion + 1, LIMOVA_APP_ORIGINS]
     });
 
     if (!isCurrentOperation(operation)) return '';
@@ -3508,7 +3521,7 @@ async function getLimovaTabForAuthentication() {
   // focus. Authentication only needs a signed-in Limova page, so fall back to
   // the most recently accessed matching tab instead of claiming the session
   // is disconnected when Limova is already open in the background.
-  const tabs = await chrome.tabs.query({ url: `${LIMOVA_DOMAIN}/*` });
+  const tabs = await chrome.tabs.query({ url: LIMOVA_APP_ORIGINS.map(origin => `${origin}/*`) });
   return tabs
     .filter(tab => tab?.id && isLimovaUrl(tab.url))
     .sort((left, right) => Number(right.lastAccessed || 0) - Number(left.lastAccessed || 0))[0] || null;
@@ -5464,12 +5477,14 @@ export {
   createInLimovaByVoice,
   buildLimovaHandoffPrompt,
   isAssistedUrl,
+  isLimovaUrl,
   normalizeRequestedPageUrl,
   openPageForUser,
   stopAgent,
   showAgentPresence,
   lockTab,
   privacySafeUrl,
+  productionLimovaPayload,
   proposeOrExecuteAction,
   resolveActionIntent,
   resolveElementCommand,
