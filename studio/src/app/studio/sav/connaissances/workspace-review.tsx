@@ -26,6 +26,10 @@ export function KnowledgeWorkspaceReview({ candidateId, revisionId, initialDocum
     if (!result.success) { setError(result.error ?? "Décision non enregistrée."); setPreview(null); setAcknowledged(false); return; }
     router.refresh();
   }); }
+  const nextStep = !preview ? "Vérifiez les sources pour pouvoir valider." :
+    preview.missing.length ? "Complétez les informations signalées puis vérifiez de nouveau les sources." :
+    !acknowledged ? "Confirmez la lecture des sources et des différences." :
+    reason.trim().length < 10 ? "Indiquez un motif de décision d’au moins 10 caractères." : "";
   return <section className={styles.panel} aria-label="Revue de la proposition">
     <h2>Relire et décider</h2><p className={styles.subtle}>Une correction conserve l’origine de la proposition. La validation prépare une version ; publication et activation restent deux actions distinctes d’Ugo.</p>
     <details><summary>Corriger la proposition</summary><KnowledgeEditor disabled={busy} document={document} onChange={next => { setDocument(next); setPreview(null); setAcknowledged(false); }}/></details>
@@ -37,7 +41,8 @@ export function KnowledgeWorkspaceReview({ candidateId, revisionId, initialDocum
       <label className={styles.choice}><input type="checkbox" checked={acknowledged} disabled={busy} onChange={event => setAcknowledged(event.target.checked)}/>J’ai vérifié les sources, la version active et les différences de cette proposition.</label>
     </section>}
     <label className={styles.editor}>Motif de la décision<textarea value={reason} maxLength={2000} minLength={10} disabled={busy} onChange={event => setReason(event.target.value)}/></label>
-    <div className={styles.row}><button className="primary" disabled={busy || !preview || !acknowledged || reason.trim().length < 10 || Boolean(preview?.missing.length)} onClick={() => decide("approve")}>{busy ? "Enregistrement…" : "Valider la proposition"}</button>
+    <p className={styles.subtle} id="review-next-step" aria-live="polite">{nextStep}</p>
+    <div className={styles.row}><button className="primary" aria-describedby="review-next-step" disabled={busy || !preview || !acknowledged || reason.trim().length < 10 || Boolean(preview?.missing.length)} onClick={() => decide("approve")}>{busy ? "Enregistrement…" : "Valider la proposition"}</button>
       <button className="secondary" disabled={busy || reason.trim().length < 10} onClick={() => decide("needs_completion")}>Demander un complément</button>
       <button className="secondary" disabled={busy || reason.trim().length < 10} onClick={() => decide("reject")}>Écarter avec ce motif</button></div>
     {error && <p className={`${styles.alert} ${styles.error}`} role="alert">{error}</p>}
