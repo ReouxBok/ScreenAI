@@ -17,14 +17,21 @@ import { safeKnowledgeReturn, knowledgeErrorMessage } from "./workspace-labels";
 const id = "00550000-0000-4000-8000-000000000001";
 const row: SavKnowledgeRow = { id, kind: "item", itemId: id, candidateId: null, draftId: null, learningCandidateId: null, familyId: id, title: "Renommer une maquette fictive", summary: "Retrouver une maquette facilement.", origin: "human", state: "production", version: 1, updatedAt: new Date("2026-10-14T10:00:00Z"), sourceLabel: "Source fictive", activeVersionId: id, publishedVersionId: id, hasPendingUpdate: true, nextAction: "Consulter la version active" };
 const document = { schemaVersion: 1 as const, objective: row.summary, applicability: "sav_only" as const, locale: "fr-FR", productVersion: "", prerequisites: ["Maquette de démonstration"], expectedResult: "Nom affiché", exceptions: ["Vérifier les droits"], escalation: "Contacter un humain", steps: [{ id: "step.rename", userLabel: "Renommer", objective: "Identifier la maquette", instruction: "Choisir un nom explicite.", location: "", expectedResult: "Nom visible", prerequisites: [], exceptions: [], escalation: "", variants: [] }] };
-const detail: SavKnowledgeDetail = { row, document, sources: [{ ref: "https://example.invalid/reference", label: "Source fictive" }], activeVersion: { id, version: 1, title: row.title, body: "Version active fictive", authorEmail: "staff@example.invalid", createdAt: row.updatedAt }, publishedVersion: null, proposedVersion: null, proposedBody: "Version proposée fictive", revisionId: id, draft: null, comparison: [], snapshot: "snapshot", missing: [], alerts: [], history: [], canReview: false, canPublish: false, canActivate: false, reviewKind: null };
+const detail: SavKnowledgeDetail = { relatedWork: [], row, document, sources: [{ ref: "https://example.invalid/reference", label: "Source fictive" }], activeVersion: { id, version: 1, title: row.title, body: "Version active fictive", authorEmail: "staff@example.invalid", createdAt: row.updatedAt }, publishedVersion: null, proposedVersion: null, proposedBody: "Version proposée fictive", revisionId: id, draft: null, comparison: [], snapshot: "snapshot", missing: [], alerts: [], history: [], canReview: false, canPublish: false, canActivate: false, reviewKind: null };
 beforeEach(() => { vi.clearAllMocks(); state.auth.mockResolvedValue({ email: "ugo@limova.ai", role: "owner" }); state.list.mockResolvedValue({ rows: [row], total: 1, page: 1, pageSize: 20, counts: { production: 1, automatic: 2, human: 3 } }); state.detail.mockResolvedValue(detail); });
 describe("SAV-55 knowledge screens", () => {
-  it("renders exactly three business tabs and a compact linked list", async () => {
+  it("makes each lifecycle queue reachable from the active library and exposes ongoing updates", async () => {
     const html = renderToStaticMarkup(await Library({ searchParams: Promise.resolve({}) }));
-    for (const title of ["En production", "À valider apprentissage automatique", "À valider proposition Humaine"]) expect(html).toContain(title);
-    expect(html).toContain("Mise à jour à valider"); expect(html).toContain(`/studio/sav/connaissances/${id}?kind=item`);
+    for (const title of ["Fiches actives", "Brouillons", "À valider", "À publier", "À activer", "Toutes les propositions"]) expect(html).toContain(title);
+    expect(html).toContain("Modification en cours");
+    for (const stage of ["draft", "pending", "approved", "published_inactive"]) expect(html).toContain(`?tab=proposals&amp;status=${stage}`); expect(html).toContain(`/studio/sav/connaissances/${id}?kind=item`);
     expect(html).not.toContain("Connaissance complète"); expect(html).not.toContain("<textarea");
+  });
+  it("opens an existing draft directly from the combined queue", async () => {
+    state.list.mockResolvedValue({ rows: [{ ...row, id, kind: "draft", state: "draft", version: null, hasPendingUpdate: false }], total: 1, page: 1, pageSize: 20 });
+    const html = renderToStaticMarkup(await Library({ searchParams: Promise.resolve({ tab: "proposals", status: "draft" }) }));
+    expect(html).toContain(`/proposer?draft=${id}`);
+    expect(state.list).toHaveBeenCalledWith(expect.objectContaining({ tab: "proposals", status: "draft" }));
   });
   it("keeps query and pagination in the detail return link", async () => {
     const html = renderToStaticMarkup(await Library({ searchParams: Promise.resolve({ tab: "human", q: "maquette", page: "2", status: "pending" }) }));
@@ -54,6 +61,15 @@ describe("SAV-55 knowledge screens", () => {
     const html = renderToStaticMarkup(await Detail({ params: Promise.resolve({ id }), searchParams: Promise.resolve({ kind: "item" }) }));
     expect(html).toContain("Version active fictive"); expect(html).toContain("Version proposée fictive"); expect(html).toContain("Source fictive");
     expect(html).not.toContain("Publier la version validée"); expect(html).not.toContain("Activer cette version pour le SAV");
+  });
+  it("opens the actual pending revision directly from its active item, before its procedure", async () => {
+    const candidateId = "00550000-0000-4000-8000-000000000002";
+    state.detail.mockResolvedValue({ ...detail, relatedWork: [
+      { ...row, id: candidateId, kind: "candidate", state: "pending", candidateId },
+    ] });
+    const html = renderToStaticMarkup(await Detail({ params: Promise.resolve({ id }), searchParams: Promise.resolve({}) }));
+    expect(html).toContain(`/studio/sav/connaissances/${candidateId}?kind=candidate`);
+    expect(html.indexOf("Relire la proposition")).toBeLessThan(html.indexOf("Procédure de la fiche"));
   });
   it("publication and activation have separate confirmation entry points", () => {
     const html = renderToStaticMarkup(createElement(KnowledgePublication, { itemId: id, proposedVersionId: id, publishedVersionId: id, activeVersionId: null, canPublish: true, canActivate: true, title: row.title }));

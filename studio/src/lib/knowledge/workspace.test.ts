@@ -76,6 +76,9 @@ describe("SAV-55 canonical knowledge workspace", () => {
     const first = await active();
     const changed = { ...document, objective: "Renommer un espace existant", steps: [{ ...document.steps[0], instruction: "Ouvrir les préférences, saisir le nom validé puis enregistrer." }] };
     const candidate = await submit({ ...proposal, mode: "improve", targetItemId: first.targetItemId!, document: changed });
+    expect((await getSavKnowledgeDetail({ itemId: first.targetItemId! }, contact))?.relatedWork).toEqual([
+      expect.objectContaining({ id: candidate.id, state: "pending", kind: "candidate" }),
+    ]);
     const corrected = { ...changed, steps: [{ ...changed.steps[0], instruction: "Ouvrir les préférences de l’espace, saisir le nom corrigé puis enregistrer." }] };
     const approved = await approve(candidate, contact, corrected);
     expect((await getSavKnowledgeDetail({ candidateId: candidate.id }, contact))?.document?.steps[0].instruction).toBe(corrected.steps[0].instruction);
@@ -90,7 +93,18 @@ describe("SAV-55 canonical knowledge workspace", () => {
     expect(await fixture.db.select().from(knowledgeFamilies)).toHaveLength(1);
     expect(await fixture.db.select().from(contentItems)).toHaveLength(1);
     expect((await paginateSavKnowledge({ tab: "production" })).rows[0]).toMatchObject({ origin: "human", hasPendingUpdate: false });
+    expect((await getSavKnowledgeDetail({ itemId: approved.targetItemId! }, actor))?.relatedWork).toEqual([]);
     expect((await getSavKnowledgeDetail({ itemId: approved.targetItemId! }, actor))?.sources[0].ref).toBe(proposal.sources[0].ref);
+  });
+  it("never offers another proposal’s publication or activation on an unapproved revision", async () => {
+    const first = await active();
+    const edit = { ...proposal, mode: "improve" as const, targetItemId: first.targetItemId! };
+    const pending = await submit(edit);
+    const approved = await approve(await submit({ ...edit, title: "Autre modification de test" }));
+    const detail = () => getSavKnowledgeDetail({ candidateId: pending.id }, actor);
+    expect(await detail()).toMatchObject({ proposedVersion: null, canPublish: false, canActivate: false });
+    await publishSavKnowledgeVersion({ itemId: approved.targetItemId!, expectedVersionId: approved.materializedVersionId! }, actor);
+    expect(await detail()).toMatchObject({ proposedVersion: null, canPublish: false, canActivate: false });
   });
   it("requires Ugo for publication and activation, rejects a stale activation preview", async () => {
     const approved = await approve(await submit(), contact);
@@ -126,6 +140,10 @@ describe("SAV-55 canonical knowledge workspace", () => {
     const preview = await previewSavKnowledgeProposal(draft.id, actor); const candidate = await submitSavKnowledgeProposal({ draftId: draft.id, snapshot: preview.snapshot }, actor);
     expect((await paginateSavKnowledge({ tab: "automatic" })).rows[0].candidateId).toBe(candidate.id);
     expect((await getSavKnowledgeDetail({ candidateId: candidate.id }, contact))?.canReview).toBe(true);
+    const human = await saveSavKnowledgeProposal({ ...proposal, title: "Procédure humaine fictive" }, actor);
+    const combined = await paginateSavKnowledge({ tab: "proposals" });
+    expect(combined.rows.map(row => row.id).sort()).toEqual([candidate.id, human.id].sort());
+    expect((await paginateSavKnowledge({ tab: "proposals", status: "pending" })).rows.map(row => row.id)).toEqual([candidate.id]);
     const approved = await approve(candidate, contact);
     expect(approved.targetItemId).toBe(first.targetItemId);
     expect((await fixture.db.select().from(savLearningCandidates))[0]).toMatchObject({ status: "approved", contentItemId: first.targetItemId });
@@ -224,6 +242,8 @@ describe("SAV-55 canonical knowledge workspace", () => {
     await fixture.db.insert(savKnowledgePublicationAttempts).values({ itemId: approved.targetItemId!, versionId: approved.materializedVersionId!, status: "indexing", actorEmail: actor });
     await expect(publishSavKnowledgeVersion({ itemId: approved.targetItemId!, expectedVersionId: approved.materializedVersionId! }, actor)).rejects.toThrow("KNOWLEDGE_PUBLICATION_PENDING");
     expect(state.embed).not.toHaveBeenCalled();
+    expect((await getSavKnowledgeDetail({ candidateId: approved.id }, actor))?.canPublish).toBe(false);
+    expect((await getSavKnowledgeDetail({ itemId: approved.targetItemId! }, actor))?.canPublish).toBe(false);
     expect((await paginateSavKnowledge({ tab: "human" })).rows[0].state).toBe("indexing");
   });
 

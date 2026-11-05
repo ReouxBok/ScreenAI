@@ -1,0 +1,31 @@
+.queue, .filters, .tools { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; }
+.queue { margin-bottom: 20px; border-bottom: 1px solid #dce2de; padding-bottom: 12px; }
+.queue a, .action { display: inline-flex; align-items: center; min-height: 42px; padding: 8px 13px; border-radius: 8px; color: #354239; font-size: 13px; font-weight: 650; text-decoration: none; }
+.queue a:hover, .action:hover { background: #eef2ec; }
+.queue a[aria-current="page"] { color: #152019; background: #e0efb9; }
+.filters { align-items: flex-end; gap: 12px; margin-bottom: 20px; }
+.filters label { display: grid; gap: 6px; color: #354239; font-size: 12px; font-weight: 650; }
+.filters label:first-child { flex: 1 1 220px; }
+.filters a { font-size: 13px; padding: 10px 0; }
+.results { background: white; border: 1px solid #dce2de; border-radius: 14px; overflow: hidden; }
+.resultsHeader { display: flex; align-items: baseline; gap: 10px; padding: 16px 20px; background: #f7f9f6; }
+.resultsHeader h2 { margin: 0; font-size: 18px; }
+.resultsHeader span, .records small { color: #526259; font-size: 12px; }
+.records { margin: 0; padding: 0; list-style: none; }
+.records li { display: grid; grid-template-columns: minmax(0,1fr) minmax(100px,150px) minmax(110px,160px); align-items: center; gap: 16px; padding: 16px 20px; border-top: 1px solid #e5e9e5; }
+.identity { overflow-wrap: anywhere; }
+.identity a { font-weight: 700; text-decoration: none; color: #19251d; }
+.identity a:hover { text-decoration: underline; }
+.identity p { margin: 5px 0; color: #48584e; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+.meta { display: grid; justify-items: start; gap: 5px; }
+.action { justify-self: end; text-align: center; border: 1px solid #cbd4ce; }
+.empty { padding: 24px 20px; }
+.empty h3 { margin: 0; font-size: 16px; }
+.tools { gap: 8px 18px; margin-top: 18px; }
+.tools a { padding-block: 8px; font-size: 13px; color: #4d5f53; }
+@media (max-width: 680px) {
+  .filters label { flex: 1 1 140px; min-width: 0; }
+  .records li { grid-template-columns: minmax(0,1fr) auto; gap: 10px; }
+  .identity { grid-column: 1/-1; }
+  .action { max-width: 150px; }
+}

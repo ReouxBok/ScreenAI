@@ -72,13 +72,14 @@ const actions: Record<string, string> = { production: "Consulter la version acti
 function rowDto(raw: Record<string, unknown>): SavKnowledgeRow {
   return { id: String(raw.id), kind: raw.kind as SavKnowledgeRow["kind"], itemId: raw.item_id as string | null, candidateId: raw.candidate_id as string | null, draftId: raw.draft_id as string | null, learningCandidateId: raw.learning_candidate_id as string | null, familyId: raw.family_id as string | null, title: String(raw.title || "Brouillon sans titre"), summary: String(raw.summary), origin: raw.origin as SavKnowledgeOrigin, state: String(raw.state), version: raw.version == null ? null : Number(raw.version), updatedAt: new Date(String(raw.updated_at)), sourceLabel: String(raw.source_label), activeVersionId: raw.active_version_id as string | null, publishedVersionId: raw.published_version_id as string | null, hasPendingUpdate: raw.has_pending_update === true, nextAction: actions[String(raw.state)] ?? "Consulter le détail" };
 }
-export async function paginateSavKnowledge(input: { tab?: SavKnowledgeTab; q?: string; status?: string; page?: number; pageSize?: number } = {}) {
+export async function paginateSavKnowledge(input: { tab?: SavKnowledgeTab | "proposals"; q?: string; status?: string; page?: number; pageSize?: number } = {}) {
   const db = requireDb();
-  const tab = ["production", "automatic", "human"].includes(input.tab ?? "") ? input.tab! : "production";
+  const tab = ["production", "automatic", "human", "proposals"].includes(input.tab ?? "") ? input.tab! : "production";
   const pageSize = Math.min(50, Math.max(1, Math.floor(input.pageSize ?? 20) || 20));
   const q = (input.q ?? "").trim().slice(0, 200).replace(/[\\%_]/g, "\\$&");
   const search = q ? sql`(title ILIKE ${`%${q}%`} OR summary ILIKE ${`%${q}%`} OR source_label ILIKE ${`%${q}%`})` : sql`TRUE`;
-  const tabFilter = tab === "production" ? sql`kind='item' AND state='production'` : sql`state NOT IN ('production','superseded') AND ${tab === "human" ? sql`origin='human'` : sql`origin IN ('automatic','unknown')`}`;
+  const originFilter = tab === "proposals" ? sql`TRUE` : tab === "human" ? sql`origin='human'` : sql`origin IN ('automatic','unknown')`;
+  const tabFilter = tab === "production" ? sql`kind='item' AND state='production'` : sql`state NOT IN ('production','superseded') AND ${originFilter}`;
   const status = input.status && Object.hasOwn(actions, input.status) ? input.status : "all";
   const filter = sql`${search} AND ${tabFilter} AND ${status === "all" ? sql`TRUE` : sql`state=${status}`}`;
   const countsRows = resultRows<{ production: number; automatic: number; human: number }>(await db.execute(sql`${workspaceRows} SELECT
@@ -143,8 +144,8 @@ export async function getSavKnowledgeDetail(input: { candidateId?: string; itemI
     const [revision] = await db.select().from(knowledgeFamilyRevisions).where(eq(knowledgeFamilyRevisions.id, candidate.revisionId));
     document = revision ? canonicalKnowledgeSchema.parse(revision.document) : null; revisionId = candidate.revisionId;
     proposedBody = candidate.diff.after;
+    proposedVersion = versionDto(versions.find((version) => version.id === candidate.materializedVersionId), row.title);
     if (candidate.materializedVersionId) {
-      proposedVersion = versionDto(versions.find((version) => version.id === candidate.materializedVersionId), row.title);
       const [projection] = await db.select().from(knowledgeProjections).where(and(eq(knowledgeProjections.versionId, candidate.materializedVersionId), eq(knowledgeProjections.surface, "sav")));
       const [approvedRevision] = projection ? await db.select().from(knowledgeFamilyRevisions).where(eq(knowledgeFamilyRevisions.id, projection.revisionId)) : [];
       document = approvedRevision ? canonicalKnowledgeSchema.parse(approvedRevision.document) : null;
@@ -176,7 +177,7 @@ export async function getSavKnowledgeDetail(input: { candidateId?: string; itemI
       missing = [...(!conditions.length ? ["Décrire les conditions d’application."] : []), ...(!expectedResult ? ["Définir le résultat observable attendu."] : []), ...(!limitations.length ? ["Qualifier les limites et les cas d’escalade."] : [])];
     } catch { alerts.push("SAV_LEARNING_PATCH_INVALID"); }
   } else {
-    const version = versions.find((entry) => entry.id === (activeVersion?.id ?? proposedVersion?.id));
+    const version = versions.find((entry) => entry.id === (activeVersion?.id ?? publishedVersion?.id ?? proposedVersion?.id));
     if (version) {
       const [projection] = await db.select().from(knowledgeProjections).where(and(eq(knowledgeProjections.versionId, version.id), eq(knowledgeProjections.surface, "sav")));
       const [revision] = projection ? await db.select().from(knowledgeFamilyRevisions).where(eq(knowledgeFamilyRevisions.id, projection.revisionId)) : [];
@@ -192,10 +193,17 @@ export async function getSavKnowledgeDetail(input: { candidateId?: string; itemI
   }
   const ids = [id, row.itemId, row.candidateId, row.draftId].filter((value): value is string => Boolean(value));
   const logs = await db.select().from(auditLogs).where(or(...ids.map((entityId) => eq(auditLogs.entityId, entityId)))).orderBy(desc(auditLogs.createdAt)).limit(50);
-  return { delivery, reviewKind, row, document, sources, activeVersion, publishedVersion, proposedVersion, proposedBody, revisionId, draft, comparison, snapshot, missing, alerts,
+  const relatedWork = row.kind === "item" ? resultRows<Record<string, unknown>>(await db.execute(sql`
+    ${workspaceRows}
+    SELECT * FROM catalogue
+    WHERE item_id = ${row.id}::uuid AND kind IN ('candidate', 'draft')
+      AND state IN ('pending', 'needs_completion', 'draft', 'approved', 'index_error', 'indexing', 'published_inactive', 'needs_revalidation', 'unavailable')
+    ORDER BY updated_at DESC, id
+  `)).map(rowDto) : [];
+  return { relatedWork, delivery, reviewKind, row, document, sources, activeVersion, publishedVersion, proposedVersion, proposedBody, revisionId, draft, comparison, snapshot, missing, alerts,
     history: logs.map((log) => ({ action: log.action, actor: log.actorEmail, at: log.createdAt, reason: typeof log.technicalMetadata.reason === "string" ? log.technicalMetadata.reason : "" })),
     canReview: Boolean(row.candidateId && canReviewKnowledgeCandidate(actorEmail, "sav") && ["pending", "needs_completion"].includes(row.state)),
-    canPublish: Boolean(!row.learningCandidateId && (!row.candidateId || proposedVersion?.id === item?.currentDraftVersionId) && actorEmail === "ugo@limova.ai" && item?.status === "in_review" && item.currentDraftVersionId && item.currentDraftVersionId !== item.publishedVersionId),
-    canActivate: Boolean(!row.learningCandidateId && (!row.candidateId || proposedVersion?.id === item?.publishedVersionId) && actorEmail === "ugo@limova.ai" && item && item.status !== "archived" && item.publishedVersionId && (item.publishedVersionId !== active?.versionId || !item.aiEnabled)),
+    canPublish: Boolean(row.state !== "indexing" && !relatedWork.some(work => work.state === "indexing") && !row.draftId && !row.learningCandidateId && (!row.candidateId || proposedVersion?.id === item?.currentDraftVersionId) && actorEmail === "ugo@limova.ai" && item?.status === "in_review" && item.currentDraftVersionId && item.currentDraftVersionId !== item.publishedVersionId),
+    canActivate: Boolean(!row.draftId && !row.learningCandidateId && (!row.candidateId || proposedVersion?.id === item?.publishedVersionId) && actorEmail === "ugo@limova.ai" && item && item.status !== "archived" && item.publishedVersionId && (item.publishedVersionId !== active?.versionId || !item.aiEnabled)),
   };
 }
