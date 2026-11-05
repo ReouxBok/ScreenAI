@@ -96,12 +96,19 @@ jobs:
       - run: npx playwright install --with-deps chromium
       - run: npm run test:e2e
       - run: npm run validate:package
+      - name: Locate the validated extension package
+        id: package
+        run: |
+          version=$(node -p "require('./manifest.json').version")
+          name="limova-ai-extension-$version"
+          test -s "dist/$name.zip" && test -s "dist/$name.zip.sha256"
+          echo "name=$name" >> "$GITHUB_OUTPUT"
       - uses: actions/upload-artifact@v4
         with:
-          name: limova-ai-extension-2.2.53
+          name: ${{ steps.package.outputs.name }}
           path: |
-            dist/limova-ai-extension-2.2.53.zip
-            dist/limova-ai-extension-2.2.53.zip.sha256
+            dist/${{ steps.package.outputs.name }}.zip
+            dist/${{ steps.package.outputs.name }}.zip.sha256
           if-no-files-found: error
 
   # Retain the required check name. A missing, cancelled or skipped job must
