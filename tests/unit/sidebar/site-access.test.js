@@ -34,6 +34,7 @@ describe('sidebar/site-access.js', () => {
   it('recognises web pages outside Limova', () => {
     expect(mod.siteOriginOf('https://www.linkedin.com/mynetwork/?x=1')).toBe('https://www.linkedin.com');
     expect(mod.siteOriginOf('https://new.limova.ai/chat/new')).toBeNull();
+    expect(mod.siteOriginOf('https://staging.new.limova.ai/chat/new')).toBeNull();
     expect(mod.siteOriginOf('chrome://extensions')).toBeNull();
     expect(mod.siteOriginOf(undefined)).toBeNull();
   });

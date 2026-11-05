@@ -4,7 +4,8 @@
  * request asks for content that Charly should create inside Limova.
  */
 
-const LIMOVA_APP_ORIGIN = 'https://new.limova.ai';
+// staging.new.limova.ai is Limova too: features land there before production.
+const LIMOVA_APP_ORIGINS = ['https://new.limova.ai', 'https://staging.new.limova.ai'];
 
 // Writing verbs always ask for an output; generic verbs ("fais", "make") only
 // do when they come with something to produce, so "fais défiler" stays a page action.
@@ -16,7 +17,7 @@ function siteOriginOf(url) {
   try {
     const parsed = new URL(url);
     if (!['https:', 'http:'].includes(parsed.protocol)) return null;
-    if (parsed.origin === LIMOVA_APP_ORIGIN) return null;
+    if (LIMOVA_APP_ORIGINS.includes(parsed.origin)) return null;
     return parsed.origin;
   } catch {
     return null;
