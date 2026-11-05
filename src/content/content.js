@@ -128,6 +128,12 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
     refreshAssistantInteractionCapture();
   }
 
+  if (request.type === 'CLEAR_ASSISTANT_OVERLAYS') {
+    clearHighlights();
+    setAgentPresence(false);
+    sendResponse({ ok: true });
+  }
+
   if (request.type === 'TRAINING_STATE') {
     setTrainingCapture(request.active === true);
     refreshModalObserver();

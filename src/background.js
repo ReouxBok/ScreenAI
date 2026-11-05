@@ -63,6 +63,26 @@ function codedError(code, message, cause = null) {
   return error;
 }
 
+// Technical failures get a plain sentence in the chat; the raw message stays
+// in the downloadable logs under the same code.
+const TECHNICAL_ERROR_MESSAGES = [
+  [/^(?:PROXY_NETWORK_FAILED|NETWORK_UNAVAILABLE)$/, 'Impossible de joindre le service Limova. Vérifie ta connexion internet puis réessaie.'],
+  [/^(?:PROXY_REQUEST_TIMEOUT|REQUEST_TIMEOUT)$/, 'Charly met trop de temps à répondre. Réessaie dans un instant.'],
+  [/^(?:GEMINI_HTTP_5XX|PROXY_RATE_LIMITED)$/, 'Le service est momentanément surchargé. Réessaie dans un instant.'],
+  [/^(?:GEMINI_HTTP_\d+|GEMINI_REQUEST_FAILED|UNEXPECTED_ERROR)$/, 'Charly n’a pas pu répondre. Réessaie dans un instant.']
+];
+
+function userFacingErrorMessage(error, code) {
+  return TECHNICAL_ERROR_MESSAGES.find(([pattern]) => pattern.test(code))?.[1]
+    || String(error?.message || '').trim()
+    || 'Charly n’a pas pu répondre. Réessaie dans un instant.';
+}
+
+// A request replaced by a newer one or stopped on purpose is not a failure.
+function isCancellation(error) {
+  return error?.name === 'AbortError' || error?.code === 'PROXY_REQUEST_ABORTED';
+}
+
 function errorCodeOf(error, fallback = 'UNEXPECTED_ERROR') {
   if (typeof error?.code === 'string' && /^[A-Z0-9_]{3,80}$/.test(error.code)) return error.code;
   const message = String(error?.message || '');
@@ -526,6 +546,7 @@ async function finalizeExternalPopupFlow(flow) {
 
 async function handleUrlChange(tabId, url, { force = false } = {}) {
   const generation = sessionGeneration;
+  const pageUrl = url;
   if (trainingState.active) {
     await sendContentMessage(tabId, { type: 'TRAINING_STATE', active: true }).catch(() => {});
     const context = await getPageContext(tabId).catch(() => '');
@@ -540,6 +561,13 @@ async function handleUrlChange(tabId, url, { force = false } = {}) {
   url = privacySafeUrl(url);
   if (!force && url === sessionState.lastUrl) return;
   sessionState.lastUrl = url;
+
+  if (textTurnsInFlight > 0 && !voiceSessionActive) {
+    pageChangedDuringTurn = { tabId, url: pageUrl, generation };
+    await getPageContext(tabId).catch(() => '');
+    Logger.event('background', 'PAGE_ANALYSIS_DEFERRED_DURING_TURN', { url });
+    return;
+  }
 
   Logger.logTurnStart('url_change', {
     url,
@@ -587,9 +615,10 @@ async function handleUrlChange(tabId, url, { force = false } = {}) {
       _sessionGeneration: generation
     });
   } catch (error) {
-    if (generation !== sessionGeneration) return;
-    Logger.error('background', 'URL change handling failed', error);
-    broadcastToSidebar({ type: 'ERROR', content: `Erreur d'analyse : ${error.message}` });
+    if (generation !== sessionGeneration || isCancellation(error)) return;
+    // Nobody asked for this automatic analysis: its failure goes to the logs only.
+    Logger.error('background', 'URL change handling failed', error, errorCodeOf(error, 'PAGE_ANALYSIS_FAILED'));
+    if (!voiceSessionActive) broadcastToSidebar({ type: 'STATUS_UPDATE', status: 'ready' });
   }
 }
 
@@ -1484,7 +1513,29 @@ function rememberUserTurn(text, source = 'text') {
   return lastUserTurn;
 }
 
+// A page change during a written turn is read at once but analysed only once
+// the turn has answered, so Charly's own click never cuts her request short.
+let textTurnsInFlight = 0;
+let pageChangedDuringTurn = null;
+
 async function handleUserMessage(text) {
+  textTurnsInFlight += 1;
+  try {
+    return await runUserMessage(text);
+  } finally {
+    textTurnsInFlight -= 1;
+    if (textTurnsInFlight === 0) analyzePageChangedDuringTurn();
+  }
+}
+
+function analyzePageChangedDuringTurn() {
+  const change = pageChangedDuringTurn;
+  pageChangedDuringTurn = null;
+  if (!change || change.generation !== sessionGeneration) return;
+  handleUrlChange(change.tabId, change.url, { force: true });
+}
+
+async function runUserMessage(text) {
   const generation = sessionGeneration;
   text = String(text || '').trim().slice(0, 8_000);
   if (!text) return { ok: false, error: 'Message vide.' };
@@ -1574,10 +1625,14 @@ async function handleUserMessage(text) {
     });
   } catch (error) {
     if (generation !== sessionGeneration) return { ok: true };
+    if (isCancellation(error)) {
+      Logger.event('background', 'USER_MESSAGE_SUPERSEDED', null, operationId);
+      return { ok: true };
+    }
     const code = errorCodeOf(error);
     analytics.track('assistant_failed', { trigger: 'user_message', error_code: code });
     Logger.error('background', 'User message handling failed', error, code, operationId);
-    broadcastToSidebar({ type: 'ERROR', content: `Erreur : ${error.message}`, code });
+    broadcastToSidebar({ type: 'ERROR', content: userFacingErrorMessage(error, code), code });
   }
 
   return { ok: true };
@@ -1658,7 +1713,7 @@ async function handleTakeScreenshot() {
     const code = errorCodeOf(error, 'PAGE_ANALYSIS_FAILED');
     analytics.track('assistant_failed', { trigger: 'page_analysis_button', error_code: code });
     Logger.error('background', 'Page analysis failed', error, code, operationId);
-    broadcastToSidebar({ type: 'ERROR', content: `Erreur d’analyse : ${error.message}`, code });
+    broadcastToSidebar({ type: 'ERROR', content: userFacingErrorMessage(error, code), code });
   }
 
   return { ok: true };
@@ -1701,7 +1756,7 @@ async function handleNextStep() {
     const code = errorCodeOf(error, 'NEXT_STEP_FAILED');
     analytics.track('assistant_failed', { trigger: 'next_step', error_code: code });
     Logger.error('background', 'Next step failed', error, code, operationId);
-    broadcastToSidebar({ type: 'ERROR', content: error.message, code });
+    broadcastToSidebar({ type: 'ERROR', content: userFacingErrorMessage(error, code), code });
   }
   return { ok: true };
 }
@@ -2317,6 +2372,7 @@ async function sendToGemini({
       resolvedHighlights.forEach((command, i) => {
         setTimeout(() => {
           if (generation !== sessionGeneration) return;
+          highlightTabs.add(sessionState.lockedTabId);
           sendContentMessage(sessionState.lockedTabId, {
             type: 'HIGHLIGHT_ELEMENT',
             id: command.id,
@@ -3278,6 +3334,7 @@ function handleResetSession() {
   sessionState.isActive = false;
   sessionState.lastUrl = null;
   sessionState.lastAnalysisTime = 0;
+  pageChangedDuringTurn = null;
   recentRejectedActionTargets.clear();
   proxyAccessToken = null;
   proxyAccessTokenExpiresAt = 0;
@@ -5142,6 +5199,8 @@ function cancelPendingAction(actionId) {
 // Port-based communication with sidebar (reliable for large payloads)
 let sidebarPort = null;
 const sidebarPorts = new Set();
+// Tabs that received a highlight, so a closed panel can clear them all.
+const highlightTabs = new Set();
 
 chrome.runtime.onConnect.addListener((port) => {
   if (port.name === 'sidebar') {
@@ -5152,10 +5211,11 @@ chrome.runtime.onConnect.addListener((port) => {
     port.onDisconnect.addListener(() => {
       sidebarPorts.delete(port);
       if (sidebarPort === port) sidebarPort = [...sidebarPorts].at(-1) || null;
-      if (sidebarPorts.size === 0) {
-        pauseWhileSidebarClosed();
-        trackSidebarClosed();
-      }
+      // Closing any Charly panel stops the current action, even when the
+      // panel of another tab or window is still open.
+      pauseWhileSidebarClosed();
+      if (sidebarPorts.size === 0) trackSidebarClosed();
+      else broadcastToSidebar({ type: 'STATUS_UPDATE', status: 'ready' });
     });
   }
 });
@@ -5181,6 +5241,10 @@ function pauseWhileSidebarClosed() {
   voiceSessionActive = false;
   voiceSessionGeneration += 1;
   for (const tabId of [...presenceTabs]) hideAgentPresence(tabId);
+  for (const tabId of highlightTabs) {
+    if (tabId !== sessionState.lockedTabId) chrome.tabs.sendMessage(tabId, { type: 'CLEAR_ASSISTANT_OVERLAYS' }).catch(() => {});
+  }
+  highlightTabs.clear();
   if (sessionState.lockedTabId) {
     chrome.tabs.sendMessage(sessionState.lockedTabId, { type: 'SESSION_STATE', active: false }).catch(() => {});
   }
@@ -5472,6 +5536,7 @@ export {
   getProxyAccessToken,
   handleMessage,
   handleResetSession,
+  handleUrlChange,
   handleTakeScreenshot,
   handoffToLimova,
   createInLimovaByVoice,
@@ -5496,5 +5561,6 @@ export {
   scrollVoicePage,
   summarizeRecentOperationalIssues,
   typeVoiceText,
+  userFacingErrorMessage,
   verifyCharlyOtp
 };

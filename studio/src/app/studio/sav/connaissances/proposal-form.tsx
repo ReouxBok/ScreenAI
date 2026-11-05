@@ -5,6 +5,7 @@ import { useRef, useState, useTransition } from "react";
 import { useRouter } from "next/navigation";
 import type { SavKnowledgeDetail, SavKnowledgeDraft, SavKnowledgeRow, SavKnowledgeSource } from "@/lib/knowledge/workspace-contract";
 import { KnowledgeEditor, cleanKnowledgeDocument, emptyKnowledgeDocument } from "./knowledge-editor";
+import { PasteEditor } from "./paste-editor";
 import { KnowledgeDocument } from "./knowledge-document";
 import { findKnowledgeAction, loadKnowledgeTargetAction, previewKnowledgeProposalAction, saveKnowledgeProposalAction, submitKnowledgeProposalAction } from "./workspace-actions";
 import { knowledgeDetailUrl } from "./workspace-labels";
@@ -23,11 +24,12 @@ export function KnowledgeProposalForm({ initial, learningCandidateId }: { initia
   const [mode, setMode] = useState<"new" | "improve">(initialDraft?.mode ?? (initial?.row.itemId ? "improve" : "new"));
   const [targetItemId, setTargetItemId] = useState(initialDraft?.targetItemId ?? initial?.row.itemId ?? "");
   const [targetTitle, setTargetTitle] = useState(initial?.activeVersion?.title ?? initial?.publishedVersion?.title ?? initial?.row.title ?? "");
-  const [title, setTitle] = useState(initialDraft?.title ?? initial?.row.title ?? "");
+  const [title, setTitle] = useState(initialDraft?.title ?? initial?.activeVersion?.title ?? initial?.publishedVersion?.title ?? initial?.row.title ?? "");
   const [document, setDocument] = useState(initialDraft?.document ?? initial?.document ?? emptyKnowledgeDocument);
   const [delivery, setDelivery] = useState<SavSupportDelivery>(initialDraft?.delivery ?? initial?.delivery ?? unclassifiedSavDelivery);
-  const [sources, setSources] = useState<SavKnowledgeSource[]>(initialDraft?.sources ?? (learningCandidateId ? initial?.sources : undefined) ?? [{ label: "", ref: "" }]);
+  const [sources, setSources] = useState<SavKnowledgeSource[]>(initialDraft?.sources ?? (initial?.sources.length ? initial.sources : [{ label: "", ref: "" }]));
   const [reason, setReason] = useState(initialDraft?.reason ?? "");
+  const [pendingPaste, setPendingPaste] = useState(false);
   const [q, setQ] = useState("");
   const [matches, setMatches] = useState<SavKnowledgeRow[]>([]);
   const [searched, setSearched] = useState(false);
@@ -50,6 +52,7 @@ export function KnowledgeProposalForm({ initial, learningCandidateId }: { initia
     setTitle(saved.title); setDocument(saved.document); setDelivery(saved.delivery ?? unclassifiedSavDelivery); setSources(saved.sources); setReason(saved.reason);
   }
   async function save(showPreview: boolean) {
+    if (pendingPaste) return;
     const result = await saveKnowledgeProposalAction({ ...(draft ? { draftId: draft.id, expectedRevision: draft.revision } : {}), mode, ...(mode === "improve" ? { targetItemId } : {}), title, document: cleanKnowledgeDocument(document), delivery, sources: sources.filter(source => source.label.trim() || source.ref.trim()), reason, ...(learningCandidateId ? { learningCandidateId } : {}) });
     if (!result.draft) { setError(result.error ?? "Enregistrement impossible."); return; }
     if (result.draft.status === "submitted" && result.draft.candidateId) { router.push(`/studio/sav/connaissances/${result.draft.candidateId}?kind=candidate`); return; }
@@ -67,19 +70,20 @@ export function KnowledgeProposalForm({ initial, learningCandidateId }: { initia
       <fieldset disabled={busy} className={styles.panel}>
         <legend>Type de proposition</legend>
         {learningCandidateId && <p className={styles.alert}>Cette proposition provient d’une résolution observée. L’origine apprentissage automatique et ses preuves sont conservées.</p>}
-        <label className={styles.choice}><input type="radio" name="mode" value="new" checked={mode === "new"} onChange={() => { setMode("new"); setTargetItemId(""); change(); }}/>Nouvelle connaissance</label>
+        <label className={styles.choice}><input type="radio" name="mode" value="new" checked={mode === "new"} onChange={() => { setMode("new"); setTargetItemId(""); setPendingPaste(false); change(); }}/>Nouvelle connaissance</label>
         <label className={styles.choice}><input type="radio" name="mode" value="improve" checked={mode === "improve"} onChange={() => { setMode("improve"); change(); }}/>Améliorer une connaissance existante</label>
         <label>Rechercher les connaissances proches<input type="search" value={q} maxLength={200} placeholder="Titre ou sujet de la procédure" onChange={event => setQ(event.target.value)}/></label>
         <div><button type="button" className="secondary" onClick={() => run(async () => { const result = await findKnowledgeAction(q); setMatches(result.rows); setSearched(true); setError(result.error ?? ""); })}>Rechercher avant de créer</button></div>
         {searched && matches.length === 0 && <p>Aucune connaissance active trouvée. La comparaison complète sera effectuée avant soumission.</p>}
         {matches.map(row => <div className={styles.choice} key={row.id}><div><Link href={knowledgeDetailUrl(row)} target="_blank" rel="noreferrer">{row.title}</Link><p className={styles.subtle}>{row.summary}</p>
-          <button type="button" className="secondary" onClick={() => run(async () => { if (!row.itemId) return; const result = await loadKnowledgeTargetAction(row.itemId); if (!result.detail) { setError(result.error ?? "Cette connaissance n’est plus accessible."); return; } setMode("improve"); setTargetItemId(row.itemId); setTargetTitle(row.title); setTitle(row.title); setDelivery(result.detail.delivery ?? unclassifiedSavDelivery); if (result.detail.document) setDocument(result.detail.document); change(); })}>Améliorer cette connaissance</button></div></div>)}
+          <button type="button" className="secondary" onClick={() => run(async () => { if (!row.itemId) return; const result = await loadKnowledgeTargetAction(row.itemId); if (!result.detail?.document) { setError(result.error ?? "Le contenu de cette version est indisponible. Réessayez avant de la modifier."); return; } setMode("improve"); setTargetItemId(row.itemId); setPendingPaste(false); const selectedTitle = result.detail.activeVersion?.title ?? result.detail.publishedVersion?.title ?? row.title; setTargetTitle(selectedTitle); setTitle(selectedTitle); setDelivery(result.detail.delivery ?? unclassifiedSavDelivery); setDocument(result.detail.document); setSources(result.detail.sources.length ? result.detail.sources : [{ label: "", ref: "" }]); change(); })}>Améliorer cette connaissance</button></div></div>)}
         {mode === "improve" && <p className={targetItemId ? styles.subtle : styles.alert}>{targetItemId ? `Connaissance ciblée : ${targetTitle}. La version active restera utilisée jusqu’à une activation distincte.` : "Choisissez la connaissance à améliorer dans les résultats."}</p>}
         {mode === "improve" && targetItemId && <Link href={`/studio/sav/connaissances/${targetItemId}?kind=item`} target="_blank" rel="noreferrer">Consulter la connaissance ciblée</Link>}
       </fieldset>
       <fieldset disabled={busy} className={styles.panel}><legend>Proposition</legend>
         <label>Titre de la connaissance<input value={title} maxLength={200} onChange={event => { setTitle(event.target.value); change(); }}/></label>
         <p className={styles.subtle}>Conservez le titre du tutoriel lorsqu’il est la source. Rédigez une procédure générique, sans identité ni corps de mail client.</p>
+        <PasteEditor onPendingChange={pending => { setPendingPaste(pending); if (pending) change(); }} title={title} key={targetItemId || "new"} document={document} onApply={result => { if (!title.trim()) setTitle(result.title); if (result.document !== document) { setDocument(result.document); setDelivery(unclassifiedSavDelivery); } change(); setNotice("Fiche appliquée au formulaire. Vérifiez sa diffusion puis enregistrez le brouillon."); }}/>
         <KnowledgeEditor document={document} onChange={next => { setDocument(next); setDelivery(unclassifiedSavDelivery); change(); }} disabled={busy}/>
         <DeliveryEditor document={cleanKnowledgeDocument(document)} value={delivery} onChange={(next, doc) => { setDelivery(next); setDocument(doc); change(); }}/><label>Motif de la création ou de l’amélioration<textarea value={reason} maxLength={2000} onChange={event => { setReason(event.target.value); change(); }}/></label>
       </fieldset>
@@ -92,7 +96,9 @@ export function KnowledgeProposalForm({ initial, learningCandidateId }: { initia
         </div>)}
         <div><button type="button" className="secondary" disabled={sources.length >= 20} onClick={() => { setSources([...sources, { label: "", ref: "" }]); change(); }}>Ajouter une source</button></div>
       </fieldset>
-      <div className={styles.row}><button type="button" className="secondary" disabled={busy} onClick={() => run(() => save(false))}>{busy ? "Enregistrement…" : "Enregistrer le brouillon"}</button><button className="primary" disabled={busy || mode === "improve" && !targetItemId}>{busy ? "Préparation…" : "Enregistrer et voir l’aperçu"}</button></div>
+      <div className={styles.saveBar}>
+        {pendingPaste && <span role="status">Prévisualisez le texte et appliquez-le au formulaire, ou écartez-le pour enregistrer les champs actuels.</span>}
+        <button type="button" className="secondary" disabled={busy || pendingPaste} onClick={() => run(() => save(false))}>{busy ? "Enregistrement…" : "Enregistrer le brouillon"}</button><button className="primary" disabled={busy || pendingPaste || mode === "improve" && !targetItemId}>{busy ? "Préparation…" : "Enregistrer et voir l’aperçu"}</button></div>
     </form>
     {error && <p className={`${styles.alert} ${styles.error}`} role="alert">{error}</p>}{notice && <p className={styles.alert} role="status">{notice}</p>}
     {preview && <section ref={previewRef} tabIndex={-1} className={styles.panel} aria-label="Aperçu avant soumission">

@@ -51,3 +51,12 @@
 /* Match the existing Studio field treatment on the dedicated SAV forms. */
 .workspace input:not([type=checkbox]):not([type=radio]), .workspace textarea, .workspace select { min-width: 0; border: 1px solid #cad2cc; border-radius: 9px; background: #fff; color: #141a17; padding: 11px 12px; line-height: 1.4; }
 .editor fieldset > button { justify-self: start; }
+
+.saveBar { position: sticky; bottom: 0; z-index: 2; display: flex; align-items: center; flex-wrap: wrap; gap: 10px; padding: 12px 16px; border: 1px solid #cad2cc; border-radius: 12px; background: #fff; box-shadow: 0 -3px 14px #18251a12; }
+.saveBar span { flex: 1 1 240px; color: #4d5f53; font-size: 13px; }
+@media (max-width: 650px) { .saveBar { position: static; } }
+
+@media (max-width: 900px) {
+  :global(.shell):has(.workspace) { grid-template-columns: minmax(0, 1fr); }
+  :global(.shell):has(.workspace) :global(.topline) { flex-wrap: wrap; }
+}

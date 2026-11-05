@@ -89,9 +89,9 @@ test("bibliothèque vide et proposition conservent les actions lisibles sur ordi
   await page.setExtraHTTPHeaders({ "x-studio-test-user": "contact@limova.ai" });
   await page.goto("/studio/sav/connaissances?tab=human&q=sans-resultat-fictif-sav55");
   await expect(page.getByRole("heading", { name: "Aucune connaissance pour ces filtres" })).toBeVisible();
-  for (const label of ["En production", "À valider apprentissage automatique", "À valider proposition Humaine"]) await expect(page.getByRole("link", { name: new RegExp(label) })).toBeVisible();
+  for (const label of ["Fiches actives", "Toutes les propositions", "Brouillons", "À valider", "À publier", "À activer"]) await expect(page.getByRole("link", { name: label, exact: true })).toBeVisible();
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth + 1)).toBe(true);
-  await page.getByRole("link", { name: "Proposer une connaissance", exact: true }).click();
+  await page.getByRole("link", { name: "Créer une fiche", exact: true }).click();
   await expect(page.getByRole("heading", { name: "Proposer une connaissance", exact: true })).toBeVisible();
   await expect(page.getByLabel("Titre de la connaissance", { exact: true })).toBeVisible();
   await page.screenshot({ path: "test-results/sav55-knowledge-proposal.png", fullPage: true });

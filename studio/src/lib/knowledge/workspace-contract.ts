@@ -29,6 +29,7 @@ export type SavKnowledgeDetail = {
   proposedVersion: SavKnowledgeVersion | null; proposedBody: string;
   revisionId: string | null; draft: SavKnowledgeDraft | null;
   comparison: SavKnowledgeComparison[]; snapshot: string | null; missing: string[];
+  relatedWork: SavKnowledgeRow[];
   alerts: string[]; history: Array<{ action: string; actor: string; at: Date; reason: string }>;
   canReview: boolean; canPublish: boolean; canActivate: boolean;
 };
