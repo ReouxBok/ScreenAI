@@ -1,13 +1,30 @@
+import { synPreviewEnabled } from "@/lib/sav/local-syn";
 import Link from "next/link";
 import { UserButton } from "@clerk/nextjs";
-import { Activity, BookOpen, ClipboardCheck, Gauge, GitBranch, GraduationCap, Inbox, ShieldCheck } from "lucide-react";
-import type { ReactNode } from "react";
+import { Suspense, type ReactNode } from "react";
 import type { StaffIdentity } from "@/lib/auth";
-import { canCreateTraining, canManageProduction, staffRoleLabel } from "@/lib/access";
-import { canAccessSav } from "@/lib/sav/access";
+import { staffRoleLabel } from "@/lib/access";
+import { NavigationTrail } from "./ui/back-link";
+import uiStyles from "./ui/ui.module.css";
+import { StudioMenu } from "./studio-nav";
+import { studioNavigation } from "./studio-navigation";
+import styles from "./studio-shell.module.css";
+
 export function StudioShell({ staff, children }: { staff: StaffIdentity; children: ReactNode }) {
   const isDevelopmentAuthBypass =
-    process.env.NODE_ENV !== "production" && process.env.DEV_AUTH_BYPASS === "true";
+    synPreviewEnabled() || (process.env.NODE_ENV !== "production" && process.env.DEV_AUTH_BYPASS === "true");
 
-  return <div className="shell"><aside className="sidebar"><Link href="/studio" className="brand"><span className="brand-mark">C</span><span><strong>Studio Charly</strong><small>Apprentissage interne</small></span></Link><nav className="nav" aria-label="Navigation principale"><Link href="/studio"><Gauge size={17}/> Vue d’ensemble</Link>{canAccessSav(staff.email, staff.role) && <Link href="/studio/sav"><Inbox size={17}/> SAV IA</Link>}<Link href="/studio/contenus"><BookOpen size={17}/> Contenus par agent</Link>{canManageProduction(staff.role) && <Link href="/studio/trame"><GitBranch size={17}/> Trame d’onboarding</Link>}{canCreateTraining(staff.role) && <Link href="/studio/entrainements"><GraduationCap size={17}/> Entraînements</Link>}{canManageProduction(staff.role) && <Link href="/studio/validations"><ShieldCheck size={17}/> Validations</Link>}<Link href="/studio/tests"><ClipboardCheck size={17}/> Qualité</Link>{canManageProduction(staff.role) && <Link href="/studio/sante"><Activity size={17}/> Santé</Link>}</nav><div className="staff-chip"><strong>{staff.name}</strong><br/><span>{staff.email}</span><div className="staff-account">{isDevelopmentAuthBypass ? <span className="brand-mark" aria-label="Compte de test">{staff.name.charAt(0)}</span> : <UserButton showName={false} appearance={{ elements: { userButtonTrigger: { width: "30px", height: "30px" } } }}/>}<span className="staff-role-label">{staffRoleLabel(staff.role)}</span></div></div></aside><main className="main"><div className="topline"><span className="eyebrow">Charly apprend en continu</span><span className="live-indicator"><i/> Base synchronisée</span></div>{children}</main></div>;
+  return <div className={`${uiStyles.theme} ${styles.shell}`}>
+    <Suspense fallback={null}><NavigationTrail/></Suspense>
+    <aside className={styles.sidebar}>
+      <Link href="/studio" className={styles.brand}><span className={styles.brandMark} aria-hidden="true">C</span><span><strong>Studio Charly</strong><small>Apprentissage interne</small></span></Link>
+      <StudioMenu groups={studioNavigation(staff)}>
+        <div className={styles.account}>
+          {isDevelopmentAuthBypass ? <span className={styles.avatar} aria-label="Compte de test">{staff.name.charAt(0)}</span> : <UserButton showName={false} appearance={{ elements: { userButtonTrigger: { width: "32px", height: "32px" } } }}/>}
+          <div><strong>{staff.name}</strong><span>{staffRoleLabel(staff.role)}</span><span>{staff.email}</span></div>
+        </div>
+      </StudioMenu>
+    </aside>
+    <main className={styles.main}><div className={styles.topline}><span>{synPreviewEnabled() ? "Simulation locale SYN · aucun service réel" : "Charly apprend en continu"}</span><span className={styles.live}>{synPreviewEnabled() ? "Lecture seule · aucun envoi" : "Base synchronisée"}</span></div>{children}</main>
+  </div>;
 }

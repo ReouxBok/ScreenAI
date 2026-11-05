@@ -8,8 +8,6 @@ import { dispatchPendingSavIntakeWakes } from "@/lib/sav/intake/event-dispatch";
 import { reconcileSavTranslations } from "@/lib/sav/translations";
 import { processPendingGmailReceipts, processPendingGmailSendActions } from "@/lib/sav/gmail";
 import { continueHubspotBackfill, getHubspotBackfillState, processPendingHubspotActions, processPendingHubspotReceipts, processPendingPilotHubspotActionsAcrossBatches, shouldAttemptHubspotBackfill } from "@/lib/sav/hubspot";
-import { processDueFollowups } from "@/lib/sav/followups";
-import { processPendingSavMessages, processPendingSavPilotItems } from "@/lib/sav/service";
 import { expireStaleEvaluationRuns } from "@/lib/evaluations";
 import { enforceSavRetention } from "@/lib/sav/retention";
 import { reconcileSavObservations } from "@/lib/sav/observations";
@@ -24,6 +22,16 @@ export const maxDuration = 300;
 
 function safeErrorCode(error: unknown) {
   return (error instanceof Error ? error.message : "UNKNOWN_ERROR").replace(/[^A-Z0-9_.:-]/gi, "_").slice(0, 160);
+}
+
+/** V2 catch-up (SAV-11): the wake relays only the executions it confirms itself. An execution this worker confirms, or a wake that crashed after
+ * V1's confirmation, reaches its case here, from V1's records only. The V2 case code is loaded only when the relay is on, as in the wake. */
+async function sweepMissedCaseRelays() {
+  if (process.env.SAV_CASE_RECORDING !== "on") return { skipped: "recording_off" };
+  if (process.env.SAV_V2_ENTRY !== "on") return (await import("@/lib/sav/cases/intake-boundary")).sweepCaseRelays({ limit: 50 });
+  const entry = await import("@/lib/sav/cases/v2-entry");
+  const relays = await (await import("@/lib/sav/cases/intake-boundary")).sweepCaseRelays({ limit: 50, deps: entry.v2EntryRelayDeps(process.env) });
+  return { relays, continuations: await entry.sweepCaseContinuations({ env: process.env }) };
 }
 
 async function runStep<T>(name: string, operation: () => Promise<T>) {
@@ -66,16 +74,14 @@ export async function GET(request: Request) {
   const intakeWakes = await runStep("intake_wakes", () => dispatchPendingSavIntakeWakes());
   const intakeChoices = await runStep<Awaited<ReturnType<typeof reconcileIntakeHumanChoices>> | { skipped: string }>("intake_choices", () => Date.now()+45_000>derivedDeadline?Promise.resolve({skipped:"deadline"}):reconcileIntakeHumanChoices());
   const intakeExecution = await runStep<Awaited<ReturnType<typeof reconcileIntakeExecutor>> | { skipped: string }>("intake_execution",()=>Date.now()+60_000>derivedDeadline?Promise.resolve({skipped:"deadline"}):reconcileIntakeExecutor({deadlineMs:derivedDeadline}));
+  const caseRelays = await runStep("case_relays", () => Date.now()+20_000>derivedDeadline ? Promise.resolve({skipped:"deadline"}) : sweepMissedCaseRelays());
   const intakeTracking = await runStep("intake_tracking", () => ensureIntakeObservations(4));
   const intakeConsole = await runStep("intake_console", () => refreshIntakeConsole(20));
   const intakeRead = await runStep<Awaited<ReturnType<typeof reconcileHandledIntakeGmailRead>> | { skipped: string }>("intake_gmail_read", () => Date.now()+1000>=derivedDeadline ? Promise.resolve({skipped:"deadline"}) : reconcileHandledIntakeGmailRead(3,Math.min(derivedDeadline,Date.now()+30000)));
   // Four model runs leave enough headroom for the 45 s grounded-agent budget,
   // a guarded legacy fallback and the remaining integrations inside the 300 s
   // function deadline. A 10-mail batch advances over at most three passages.
-  const pilotItems = await runStep("pilot_items", () => processPendingSavPilotItems(4));
-  const pendingMessages = await runStep("pending_messages", () => processPendingSavMessages(4));
   const pilotActions = await runStep("pilot_hubspot_actions", () => processPendingPilotHubspotActionsAcrossBatches(100));
-  const followups = await runStep("followups", () => processDueFollowups(50));
   const replies = await runStep("gmail_replies", () => processPendingGmailSendActions(50));
   const statusActions = await runStep("hubspot_status_actions", () => processPendingHubspotActions(50));
   const backfillState = await getHubspotBackfillState().catch(() => null);
@@ -90,7 +96,19 @@ export async function GET(request: Request) {
   const dashboardProjection = savSqlDashboardEnabled()
     ? await runStep("dashboard_projection", () => refreshSavDashboardProjection(25, undefined, { deadlineMs: derivedDeadline }))
     : { status: "skipped" as const, durationMs: 0, data: { reason: "disabled" } };
-  const payload = { intakeRead, intakeWakes, intakeTracking, intakeChoices, intakeConsole, intakeExecution, intakeObservation, gmail, hubspot, emailOpenings, contextRefreshes, trainings, evaluations, ticketActions, pilotItems, pendingMessages, pilotActions, followups, replies, statusActions, learningBackfill, observations, translations, retention, dashboardProjection };
+  const caseReminders = await runStep("v2_case_j2", async () => {
+    if (process.env.SAV_V2_J2 !== "on" || process.env.SAV_CASE_RECORDING !== "on" || process.env.SAV_V2_ENTRY !== "on") return { skipped: "j2_off" };
+    if (Date.now() + 20_000 > derivedDeadline) return { skipped: "deadline" };
+    const { reconcileCaseJ2 } = await import("@/lib/sav/cases/v2-j2-binding");
+    return reconcileCaseJ2({ env: process.env, deadlineMs: derivedDeadline });
+  });
+  const caseEffects = await runStep("v2_case_effects", async () => {
+    if (process.env.SAV_V2_ENTRY !== "on" || process.env.SAV_CASE_RECORDING !== "on") return { skipped: "v2_off" };
+    if (Date.now() + 20_000 > derivedDeadline) return { skipped: "deadline" };
+    const { reconcileCaseV2Effects } = await import("@/lib/sav/cases/v2-effects-binding");
+    return reconcileCaseV2Effects({ env: process.env, deadlineMs: derivedDeadline });
+  });
+  const payload = { caseReminders, caseEffects, intakeRead, intakeWakes, intakeTracking, intakeChoices, intakeConsole, intakeExecution, caseRelays, intakeObservation, gmail, hubspot, emailOpenings, contextRefreshes, trainings, evaluations, ticketActions, pilotActions, replies, statusActions, learningBackfill, observations, translations, retention, dashboardProjection };
   const hasStepFailure = Object.values(payload).some((step) => step.status === "error");
   await recordSavWorkerPulse(pulseId, pulseStartedAt, hasStepFailure);
   return Response.json(payload, { status: hasStepFailure ? 500 : 200 });

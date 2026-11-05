@@ -1,0 +1,389 @@
+{
+ "schema": "sav-v2-pilot-access-evidence",
+ "revision": 1,
+ "synthetic": true,
+ "sources": {
+  "A": {
+   "status": "author_tested",
+   "head": "fdb7199bfd3579584b3ae64d8fdf1a50b53b7d53",
+   "testFile": "studio/src/lib/sav/cases/pilot-access-attribution.compose.test.ts",
+   "result": "17 fichiers, 588 tests réussis ; 7 témoins de sabotage rouges ; sans revue indépendante"
+  },
+  "C": {
+   "status": "unverified",
+   "head": null,
+   "result": "Livraison non commitée et non qualifiée au moment de la lecture : résultat non vérifié"
+  }
+ },
+ "cases": [
+  {
+   "ref": "acces-1",
+   "title": "Pilote accès 1 · Ticket créé avec SAV Pilote, relu ainsi",
+   "subject": "Connexion impossible à mon compte",
+   "message": "Bonjour, je n’arrive plus à me connecter à mon compte Limova depuis ce matin. Pouvez-vous m’aider ? Merci.",
+   "ticket": "Ticket fictif SYN-T-2001",
+   "reading": "confirmed",
+   "hand": "agent",
+   "owner": "sav_pilote",
+   "cause": null,
+   "situation": "agent",
+   "today": "Équipe : aujourd’hui V1 crée les tickets sans propriétaire, aucun dossier n’atteint l’agent.",
+   "flow": [
+    {
+     "step": "Mail reçu (V1)",
+     "value": "Demande de connexion à un compte existant.",
+     "basis": "fixture"
+    },
+    {
+     "step": "Création du ticket par V1",
+     "value": "V1 crée ce ticket avec SAV Pilote comme propriétaire, dans la création elle-même (effet V1 proposé, donnée fictive).",
+     "basis": "fixture"
+    },
+    {
+     "step": "Admission",
+     "value": "Politique accès, identité confirmée, contexte complet : admis pour l’agent.",
+     "basis": "a_teste"
+    },
+    {
+     "step": "Lecture du propriétaire",
+     "value": "SAV Pilote confirmé, relu après la création (1 lecture, aucune écriture).",
+     "basis": "a_teste"
+    },
+    {
+     "step": "Qui a la main",
+     "value": "L’agent, tant qu’aucune personne ne reprend le ticket ; la prise n’est jamais garantie.",
+     "basis": "a_teste"
+    },
+    {
+     "step": "Réponse préparée (C)",
+     "value": "Résultat non vérifié : la livraison de C n’est pas qualifiée.",
+     "basis": "non_verifie"
+    }
+   ],
+   "identities": {
+    "api": "Intégration Studio (identité technique fictive) : elle lit le ticket, elle n’en est jamais propriétaire.",
+    "ticketOwner": "SAV Pilote (compte dédié fictif, identifiant non confirmé)",
+    "author": "Attribution écrite par le système ; auteur des notes et réponses : résultat non vérifié (C)."
+   },
+   "next": "B et C relisent le propriétaire avant chaque étape. Une réponse préparée n’est pas envoyée tant que les deux pauses ne sont pas levées.",
+   "evidence": [
+    {
+     "pole": "A",
+     "test": "confirmed: a ticket V1 created with the dedicated owner, still read as it, goes to the agent once (1 GET, system actor, no write)"
+    },
+    {
+     "pole": "A",
+     "test": "a person who takes the agent's ticket keeps it: takeover recorded, a new mail does not free it, no claim"
+    }
+   ],
+   "downstream": {
+    "status": "unverified",
+    "text": "Résultat non vérifié : réponse préparée, mention IA et non-envoi ne sont pas encore prouvés par une livraison qualifiée de C."
+   }
+  },
+  {
+   "ref": "acces-2",
+   "title": "Pilote accès 2 · Une autre personne tient le ticket",
+   "subject": "Connexion impossible à mon compte",
+   "message": "Bonjour, je n’arrive plus à me connecter à mon compte Limova depuis ce matin. Pouvez-vous m’aider ? Merci.",
+   "ticket": "Ticket fictif SYN-T-2002",
+   "reading": "other_person",
+   "hand": "team",
+   "owner": "human",
+   "cause": "Une autre personne tient le ticket (l’équipe V1 compte comme une autre personne) : rien n’est pris.",
+   "situation": "human_owner",
+   "today": "Équipe : propriétaire humain du ticket.",
+   "flow": [
+    {
+     "step": "Mail reçu (V1)",
+     "value": "Même demande de connexion.",
+     "basis": "fixture"
+    },
+    {
+     "step": "Création du ticket par V1",
+     "value": "V1 crée ce ticket avec SAV Pilote comme propriétaire, dans la création elle-même (effet V1 proposé, donnée fictive).",
+     "basis": "fixture"
+    },
+    {
+     "step": "Lecture du propriétaire",
+     "value": "Une autre personne.",
+     "basis": "a_teste"
+    },
+    {
+     "step": "Qui a la main",
+     "value": "L’équipe ; un nouveau mail ne rend pas le ticket à l’agent.",
+     "basis": "a_teste"
+    }
+   ],
+   "identities": {
+    "api": "Intégration Studio (identité technique fictive) : elle lit le ticket, elle n’en est jamais propriétaire.",
+    "ticketOwner": "Une personne de l’équipe (fictive)",
+    "author": "Aucune action de l’agent."
+   },
+   "next": "L’équipe garde la main dans HubSpot.",
+   "evidence": [
+    {
+     "pole": "A",
+     "test": "another person: whoever took the new ticket keeps it, and a later mail does not give it to the agent"
+    },
+    {
+     "pole": "A",
+     "test": "the team owner (V1) is another person, never the dedicated one"
+    }
+   ],
+   "downstream": {
+    "status": "not_applicable",
+    "text": "Aucun dossier n’est donné à l’agent : B et C ne commencent rien."
+   }
+  },
+  {
+   "ref": "acces-3",
+   "title": "Pilote accès 3 · Accès et facturation dans le même mail",
+   "subject": "Connexion impossible et facture en double",
+   "message": "Bonjour, je n’arrive plus à me connecter et j’ai été facturé deux fois ce mois-ci. Pouvez-vous regarder ? Merci.",
+   "ticket": "Ticket fictif SYN-T-2003",
+   "reading": "not_read",
+   "hand": "team",
+   "owner": "team_sensitive",
+   "cause": "Facturation dans le même mail : tout le dossier va à l’équipe, avant toute lecture du propriétaire.",
+   "situation": "excluded_sensitive",
+   "today": "Équipe : hors autonomie.",
+   "flow": [
+    {
+     "step": "Mail reçu (V1)",
+     "value": "Accès et facture en double dans le même mail.",
+     "basis": "fixture"
+    },
+    {
+     "step": "Admission",
+     "value": "Refusée : la facturation prime ; zéro lecture CRM, zéro attribution.",
+     "basis": "a_teste"
+    },
+    {
+     "step": "Qui a la main",
+     "value": "L’équipe, pour tout le dossier.",
+     "basis": "a_teste"
+    }
+   ],
+   "identities": {
+    "api": "Intégration Studio (identité technique fictive) : elle lit le ticket, elle n’en est jamais propriétaire.",
+    "ticketOwner": "Non lu",
+    "author": "Aucune action de l’agent."
+   },
+   "next": "L’équipe traite le dossier entier, sans réponse IA.",
+   "evidence": [
+    {
+     "pole": "A",
+     "test": "access + billing goes to the team as finance, uncertain identity back to qualification: zero CRM read, zero attribution"
+    }
+   ],
+   "downstream": {
+    "status": "not_applicable",
+    "text": "Aucun dossier n’est donné à l’agent : B et C ne commencent rien."
+   }
+  },
+  {
+   "ref": "acces-4",
+   "title": "Pilote accès 4 · SAV Pilote retiré depuis la création",
+   "subject": "Connexion impossible à mon compte",
+   "message": "Bonjour, je n’arrive plus à me connecter à mon compte Limova depuis ce matin. Pouvez-vous m’aider ? Merci.",
+   "ticket": "Ticket fictif SYN-T-2004",
+   "reading": "empty",
+   "hand": "team",
+   "owner": "owner_empty",
+   "cause": "Ticket sans propriétaire : ce n’est pas un ticket acquis ; SAV Pilote n’est jamais remis.",
+   "situation": "admitted_take_blocked",
+   "today": "Équipe : aucun propriétaire n’est écrit.",
+   "flow": [
+    {
+     "step": "Mail reçu (V1)",
+     "value": "Même demande de connexion.",
+     "basis": "fixture"
+    },
+    {
+     "step": "Création du ticket par V1",
+     "value": "V1 crée ce ticket avec SAV Pilote comme propriétaire, dans la création elle-même (effet V1 proposé, donnée fictive).",
+     "basis": "fixture"
+    },
+    {
+     "step": "Lecture du propriétaire",
+     "value": "Vide : le propriétaire dédié a été retiré depuis la création.",
+     "basis": "a_teste"
+    },
+    {
+     "step": "Qui a la main",
+     "value": "L’équipe ; aucune écriture de propriétaire n’existe.",
+     "basis": "a_teste"
+    }
+   ],
+   "identities": {
+    "api": "Intégration Studio (identité technique fictive) : elle lit le ticket, elle n’en est jamais propriétaire.",
+    "ticketOwner": "Aucun (vide)",
+    "author": "Aucune action de l’agent."
+   },
+   "next": "L’équipe garde le ticket ; rien n’est réattribué.",
+   "evidence": [
+    {
+     "pole": "A",
+     "test": "empty: the dedicated owner removed since the creation is not put back; the team keeps the case (situation: take blocked)"
+    }
+   ],
+   "downstream": {
+    "status": "not_applicable",
+    "text": "Aucun dossier n’est donné à l’agent : B et C ne commencent rien."
+   }
+  },
+  {
+   "ref": "acces-5",
+   "title": "Pilote accès 5 · Propriétaire illisible",
+   "subject": "Connexion impossible à mon compte",
+   "message": "Bonjour, je n’arrive plus à me connecter à mon compte Limova depuis ce matin. Pouvez-vous m’aider ? Merci.",
+   "ticket": "Ticket fictif SYN-T-2005",
+   "reading": "unknown",
+   "hand": "unread",
+   "owner": "owner_unknown",
+   "cause": "Propriété absente ou lecture en échec : rien n’est enregistré ; le rattrapage isole ce mail et réessaie.",
+   "situation": "no_case",
+   "today": "Équipe : aucun lecteur n’est branché en production.",
+   "flow": [
+    {
+     "step": "Mail reçu (V1)",
+     "value": "Même demande de connexion.",
+     "basis": "fixture"
+    },
+    {
+     "step": "Création du ticket par V1",
+     "value": "V1 crée ce ticket avec SAV Pilote comme propriétaire, dans la création elle-même (effet V1 proposé, donnée fictive).",
+     "basis": "fixture"
+    },
+    {
+     "step": "Lecture du propriétaire",
+     "value": "Inconnue : propriété absente, valeur mal formée ou lecture en échec. Ce n’est ni « vide » ni « SAV Pilote ».",
+     "basis": "a_teste"
+    },
+    {
+     "step": "Qui a la main",
+     "value": "Personne n’est désigné : aucun dossier n’est créé tant que la lecture échoue.",
+     "basis": "a_teste"
+    }
+   ],
+   "identities": {
+    "api": "Intégration Studio (identité technique fictive) : elle lit le ticket, elle n’en est jamais propriétaire.",
+    "ticketOwner": "Non lu (inconnu)",
+    "author": "Aucune action de l’agent."
+   },
+   "next": "Le rattrapage réessaie ce mail seul ; les autres mails continuent.",
+   "evidence": [
+    {
+     "pole": "A",
+     "test": "unknown: no owner property, or a failed read, records nothing; the catch-up isolates that mail and relays it once readable"
+    }
+   ],
+   "downstream": {
+    "status": "not_applicable",
+    "text": "Aucun dossier n’est donné à l’agent : B et C ne commencent rien."
+   }
+  },
+  {
+   "ref": "acces-6",
+   "title": "Pilote accès 6 · Ticket déjà existant (forme du cas John)",
+   "subject": "Connexion impossible à mon compte",
+   "message": "Bonjour, je n’arrive plus à me connecter à mon compte Limova depuis ce matin. Pouvez-vous m’aider ? Merci.",
+   "ticket": "Ticket fictif SYN-T-2006, déjà ouvert",
+   "reading": "not_read",
+   "hand": "team",
+   "owner": "team_rule",
+   "cause": "Ticket existant : pas de preuve de création par V1, donc aucune lecture et aucune prise.",
+   "situation": "team_not_admitted",
+   "today": "Équipe.",
+   "flow": [
+    {
+     "step": "Mail reçu (V1)",
+     "value": "Demande rattachée à un ticket déjà ouvert.",
+     "basis": "fixture"
+    },
+    {
+     "step": "Création du ticket par V1",
+     "value": "Aucune : le mail est rattaché à un ticket existant.",
+     "basis": "a_teste"
+    },
+    {
+     "step": "Qui a la main",
+     "value": "L’équipe, sans aucune lecture CRM.",
+     "basis": "a_teste"
+    }
+   ],
+   "identities": {
+    "api": "Intégration Studio (identité technique fictive) : elle lit le ticket, elle n’en est jamais propriétaire.",
+    "ticketOwner": "Non lu",
+    "author": "Aucune action de l’agent."
+   },
+   "next": "L’équipe garde le ticket.",
+   "evidence": [
+    {
+     "pole": "A",
+     "test": "an existing ticket (the John shape) stays with the team without any CRM read"
+    }
+   ],
+   "downstream": {
+    "status": "not_applicable",
+    "text": "Aucun dossier n’est donné à l’agent : B et C ne commencent rien."
+   }
+  },
+  {
+   "ref": "acces-7",
+   "title": "Pilote accès 7 · Mail reçu pendant une pause",
+   "subject": "Connexion impossible à mon compte",
+   "message": "Bonjour, je n’arrive plus à me connecter à mon compte Limova depuis ce matin. Pouvez-vous m’aider ? Merci.",
+   "ticket": "Ticket fictif SYN-T-2007",
+   "reading": "not_read",
+   "hand": "team",
+   "owner": "team_rule",
+   "cause": "Pause : le mail est enregistré, l’agent ne prend rien, aucune lecture du propriétaire.",
+   "situation": "awaiting_v2_attribution",
+   "today": "Équipe.",
+   "flow": [
+    {
+     "step": "Mail reçu (V1)",
+     "value": "Même demande de connexion, pendant une pause.",
+     "basis": "fixture"
+    },
+    {
+     "step": "Création du ticket par V1",
+     "value": "V1 crée ce ticket avec SAV Pilote comme propriétaire, dans la création elle-même (effet V1 proposé, donnée fictive).",
+     "basis": "fixture"
+    },
+    {
+     "step": "Pause",
+     "value": "Mail reçu, enregistré ; l’agent ne prend rien (pause de la console ou pause V2).",
+     "basis": "a_teste"
+    },
+    {
+     "step": "Qui a la main",
+     "value": "L’équipe ; aucune nouvelle tentative automatique après la levée.",
+     "basis": "a_teste"
+    }
+   ],
+   "identities": {
+    "api": "Intégration Studio (identité technique fictive) : elle lit le ticket, elle n’en est jamais propriétaire.",
+    "ticketOwner": "Non lu",
+    "author": "Aucune action de l’agent."
+   },
+   "next": "L’équipe garde le ticket ; seul un rejeu explicite revérifierait tout.",
+   "evidence": [
+    {
+     "pole": "A",
+     "test": "any pause on either agent (the console's intake one included), or an unreadable one: the mail is recorded, never given to the agent, no owner read"
+    },
+    {
+     "pole": "A",
+     "test": "a pause set while the relay runs stops the attribution under the ticket lock; the catch-up then records the mail for the team"
+    }
+   ],
+   "downstream": {
+    "status": "not_applicable",
+    "text": "Aucun dossier n’est donné à l’agent : B et C ne commencent rien."
+   }
+  }
+ ]
+}

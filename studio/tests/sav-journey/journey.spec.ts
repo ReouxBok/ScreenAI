@@ -27,7 +27,7 @@ for (const key of JOURNEY_CASES) {
     if(key==="link") {
       await expect(page.getByText("Original affiché · traduction partielle non affichée.",{exact:true})).toBeVisible();
       await expect(page.locator("#sav-draft").getByRole("textbox",{name:"Suggestion de réponse",exact:true})).not.toHaveValue("Ancienne version humaine périmée.");
-      await expect(page.locator("#sav-draft form").filter({has:page.getByRole("button",{name:"Confirmer l’envoi de cette réponse",exact:true})})).toContainText("Réponse préparée avec l’aide d’une IA et validée par notre équipe.");
+      await expect(page.locator("#sav-draft form").filter({has:page.getByRole("button",{name:"Confirmer l’envoi de cette réponse",exact:true})})).toContainText("Cette réponse a été rédigée avec l’aide de notre agent IA. L’IA peut se tromper. Si quelque chose ne fonctionne pas ou si vous avez une question, n’hésitez pas à répondre à ce message.");
     }
     if(key==="waiting") await expect(page.getByText("Ce mail a été traduit",{exact:false})).toHaveCount(0);
     if(key==="create")await page.screenshot({path:testInfo.outputPath("sav86-translation-original.png"),fullPage:true});

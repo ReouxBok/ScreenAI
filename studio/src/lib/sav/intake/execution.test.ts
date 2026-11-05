@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
-import { afterAll, afterEach, beforeAll, beforeEach, expect, it, vi } from "vitest";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { eq } from "drizzle-orm";
 import { createSavTestDb } from "../../../../test/sav-db";
 import { executionProvider } from "../../../../test/sav-intake-execution-provider";
@@ -87,7 +87,7 @@ async function writePolicy(mutationsOverride = mutations) {
         policyHash: options.config.policyHash, payloadCiphertext: encryptSavPayload(options.policy)
     }).where(eq(savIntakeExecutionPolicies.id, options.config.policyId));
 }
-beforeAll(async () => { f = await createSavTestDb(); state.db = f.db; }, 30000);
+beforeAll(async () => { f = await createSavTestDb(); state.db = f.db; }, 120000);
 afterAll(async () => {
     if (f) {
         await f.client.exec("TRUNCATE sav.intake_identity_episodes,sav.intake_effect_journal,sav.intake_effects,sav.intake_occupations,sav.intake_executions,sav.intake_execution_policies CASCADE; UPDATE sav.intake_execution_budget SET admitted=0; DELETE FROM sav.sync_state WHERE key='sav-intake-execution-scan-v1'");
@@ -1663,6 +1663,466 @@ it("SAV-45 E: read-only recovery of an uncertain effect is not held by a CRM dec
     expect(p.calls.filter(c => c.method === "POST" && c.path.endsWith("/tickets"))).toHaveLength(1);
 });
 
+// ---- SAV-11/SAV-44 (pôle A, 28/10, contract v9 30/10): V2 owner through this ledger, and the V1 → V2 relay.
+// Same real engine, executor, adapters and provider; the case store, port and relay are the real ones.
+import { listCaseEvents, readCaseByTicket } from "../cases/case-store";
+import { caseDedupeKey, caseRequestSearchText, type CaseAdmissionQualification } from "../cases/case-types";
+import { recordAcceptedIntakeSemantics, SAV_INTAKE_SEMANTIC_RECORD_REVISION, type AcceptedIntakeSemantics } from "./semantic-records";
+import { SAV_INTAKE_MODEL_REVISION } from "./model-readers";
+import { recordCaseAfterConfirmedIntake, sweepCaseRelays, type CaseBoundaryDeps } from "../cases/intake-boundary";
+import { v2OwnerAtCreationPort, v2OwnerAttributionAdapter } from "../cases/owner-attribution";
+const V2_OWNER = "90000001", HUMAN_OWNER = "70000001";
+const V2_POLICY = { revision: "policy-r1", admittedFamilies: ["access", "usage"], qualifiedRules: [{ ruleId: "rule-access", revision: "r1", families: ["access"] }], approvedBy: "20000000-0000-4000-8000-000000000001", approvedAt: "2026-10-28T08:00:00.000Z" };
+const ownerWrites = () => p.calls.filter(c => c.method === "PATCH" && (c.body as { properties?: Record<string, unknown> })?.properties && "hubspot_owner_id" in (c.body as { properties: Record<string, unknown> }).properties);
+/** The deps the ROOT/C seam must give both the port and the relay: the same policy and the same
+ * qualification, so the V2 owner is asked for exactly the entries the relay will admit. */
+function v2Deps(family: "access" | "finance" = "access"): CaseBoundaryDeps {
+    return {
+        env: { SAV_V2_HUBSPOT_OWNER_ID: V2_OWNER, SAV_CASE_RECORDING: "on" }, readAdmissionPolicy: async () => V2_POLICY,
+        readQualification: async ({ requests }): Promise<CaseAdmissionQualification> => ({
+            requests: requests.map(request => ({ requestId: request.requestId, family, provenance: { kind: "human" as const, staffUserId: "20000000-0000-4000-8000-000000000001", at: "2026-10-28T08:00:00.000Z" } })),
+            identity: { status: "confirmed", source: { type: "hubspot_object", id: "101" } }, crmContext: "complete", teamSignals: [],
+        }),
+    };
+}
+function v2Port(asked: { n: number }, deps = v2Deps(), before?: () => void) {
+    // Built as the adapter factory would: the executed message comes from the decision, not from the test.
+    const port = v2OwnerAttributionAdapter({ ...deps, readTicketOwner: async ticketId => (p.objects.tickets[ticketId]?.properties.hubspot_owner_id as string | null | undefined) ?? null });
+    return async (input: Parameters<typeof port>[0]) => {
+        asked.n++;
+        const decided = await port(input);
+        before?.();
+        return decided;
+    };
+}
+describe("SAV-11 A: V1 → V2 owner and relay", () => {
+    // The file's setup keeps the V2 case tables, and these tests all use ticket 201: each starts with none.
+    beforeEach(async () => { await f.client.exec("TRUNCATE sav.cases, sav.case_events, sav.case_timers CASCADE"); });
+    it("SAV-11 A: without the V2 permission in the policy, V1 confirms exactly as before and the port is never asked", async () => {
+        vi.stubEnv("SAV_CASE_RECORDING", "on");
+        p.seedTicket({ stage: "open" });
+        const asked = { n: 0 };
+        options.adapters.v2OwnerAttribution = v2Port(asked);
+        const row = await admission();
+        expect(await executeIntakePass(row.id, options)).toMatchObject({ state: "confirmed" });
+        expect(asked.n).toBe(0);
+        expect(ownerWrites()).toHaveLength(0);
+        expect((await getExecutionEffects(row.id)).map(e => e.kind)).not.toContain("owner_assign");
+    });
+    it("SAV-11 A R1: a new ticket created without owner stays without owner even with the permission and a positive decision; the port is never asked and the case stays the team's", async () => {
+        await writePolicy([...mutations, "assign_v2_owner"]);
+        vi.stubEnv("SAV_CASE_RECORDING", "on");
+        const asked = { n: 0 };
+        options.adapters.v2OwnerAttribution = v2Port(asked);
+        const row = await admission();
+        expect(await executeIntakePass(row.id, options)).toMatchObject({ state: "confirmed" });
+        const effects = await getExecutionEffects(row.id);
+        expect(effects.map(e => e.kind)[0]).toBe("ticket_create");
+        expect(effects.map(e => e.kind)).not.toContain("owner_assign");
+        expect(asked.n).toBe(0);
+        const ticketId = (await readIntakeExecutionProgress(messageId))!.ticketId!;
+        const creation = p.calls.find(c => c.method === "POST" && c.path.endsWith("/tickets"))!;
+        expect((creation.body as { properties: Record<string, unknown> }).properties.hubspot_owner_id).toBeUndefined();
+        expect(ownerWrites()).toHaveLength(0);
+        expect(p.objects.tickets[ticketId].properties.hubspot_owner_id).toBeFalsy();
+        // Admitted on the V2 side, but without a verified V2 owner the case stays with the team.
+        expect(await recordCaseAfterConfirmedIntake(messageId, v2Deps())).toMatchObject({ created: true, owner: "human", admission: { target: "agent" } });
+        expect((await readCaseByTicket(ticketId))!.phase).toBe("handoff_pending");
+        expect(await executeIntakePass(row.id, options)).toMatchObject({ skipped: "occupied" });
+        expect(ownerWrites()).toHaveLength(0);
+    });
+    it("SAV-11 A v9: an existing human owner is never captured, keeps the ticket through « Nouveau », and its case never reaches the agent", async () => {
+        await writePolicy([...mutations, "assign_v2_owner"]);
+        vi.stubEnv("SAV_CASE_RECORDING", "on");
+        p.seedTicket({ stage: "open", ownerId: HUMAN_OWNER });
+        options.adapters.v2OwnerAttribution = v2Port({ n: 0 });
+        const row = await admission();
+        expect(await executeIntakePass(row.id, options)).toMatchObject({ state: "confirmed" });
+        expect(p.calls.filter(c => c.method === "PATCH").map(c => c.body)).toEqual([{ properties: { hs_pipeline_stage: "1" } }]);
+        expect(p.objects.tickets["201"].properties).toMatchObject({ hubspot_owner_id: HUMAN_OWNER, hs_pipeline_stage: "1" });
+        expect((await getExecutionEffects(row.id)).map(e => e.kind)).not.toContain("owner_assign");
+        // Admitted on the V2 side, but without the verified V2 owner the case stays with the team.
+        expect(await recordCaseAfterConfirmedIntake(messageId, v2Deps())).toMatchObject({ owner: "human", admission: { target: "agent" } });
+        expect((await readCaseByTicket("201"))!.phase).toBe("handoff_pending");
+    });
+    it("SAV-11 A v9: finance, cancellation or a mixed mail never gets the V2 owner, whatever the qualification port says", async () => {
+        await writePolicy([...mutations, "assign_v2_owner"]);
+        vi.stubEnv("SAV_CASE_RECORDING", "on");
+        p.seedTicket({ stage: "open" });
+        options.adapters.v2OwnerAttribution = v2Port({ n: 0 }, v2Deps("finance"));
+        const row = await admission();
+        expect(await executeIntakePass(row.id, options)).toMatchObject({ state: "confirmed" });
+        expect(ownerWrites()).toHaveLength(0);
+        expect(await recordCaseAfterConfirmedIntake(messageId, v2Deps("finance"))).toMatchObject({ owner: "human", admission: { target: "team" } });
+    });
+    // Review R1 (31/10): HubSpot has no conditional PATCH, so a read then a write let a human who took
+    // the ticket in between be overwritten. Same window as the review's two reproductions, on this head.
+    const humanTakesTicketAtEachRead = (reads: { n: number }): typeof fetch => async (url, init) => {
+        const response = await p.network(url, init);
+        if (new URL(String(url)).pathname === "/crm/v3/objects/tickets/201" && (init?.method ?? "GET") === "GET") {
+            reads.n++;
+            p.objects.tickets["201"].properties.hubspot_owner_id = HUMAN_OWNER;
+        }
+        return response;
+    };
+    it("SAV-11 A R1: the adapter refuses an owner write before any call, so the review's read-then-write window cannot overwrite a human", async () => {
+        p.seedTicket({ stage: "open" });
+        const reads = { n: 0 }, before = p.calls.length;
+        const adapters = createIntakeExecutorAdapters({ network: humanTakesTicketAtEachRead(reads), gmailRequest: p.gmail, gmailPermissions: async () => {}, env: () => environment });
+        await expect(adapters.dispatch({ kind: "owner_assign", permission: "assign_v2_owner", key: `owner-v2:${messageId}:201`, ticketId: "201", sourceMessageId: messageId, expectedOwnerId: null,
+            properties: { hubspot_owner_id: V2_OWNER } }, AbortSignal.timeout(1000))).rejects.toThrow("SAV_INTAKE_EXECUTION_OWNER_UNGUARDED");
+        expect(reads.n).toBe(0);
+        expect(p.calls).toHaveLength(before);
+        expect(ownerWrites()).toHaveLength(0);
+        expect(p.objects.tickets["201"].properties.hubspot_owner_id).toBeNull();
+    });
+    it("SAV-11 A R1: through the real engine, a human who takes the ticket after a read keeps it; no owner effect, and the case never reaches the agent", async () => {
+        await writePolicy([...mutations, "assign_v2_owner"]);
+        vi.stubEnv("SAV_CASE_RECORDING", "on");
+        p.seedTicket({ stage: "open" });
+        const asked = { n: 0 }, reads = { n: 0 };
+        options.adapters.v2OwnerAttribution = v2Port(asked);
+        const race = createIntakeExecutorAdapters({ network: humanTakesTicketAtEachRead(reads), gmailRequest: p.gmail, gmailPermissions: async () => {}, env: () => environment });
+        options.adapters.dispatch = race.dispatch;
+        options.adapters.verify = race.verify;
+        const row = await admission();
+        expect(await executeIntakePass(row.id, options)).toMatchObject({ state: "confirmed" });
+        // The window did open: the stage check read the ticket and the human took it right then.
+        expect(reads.n).toBeGreaterThan(0);
+        expect(asked.n).toBe(0);
+        expect((await getExecutionEffects(row.id)).map(e => e.kind)).not.toContain("owner_assign");
+        expect(ownerWrites()).toHaveLength(0);
+        expect(p.objects.tickets["201"].properties.hubspot_owner_id).toBe(HUMAN_OWNER);
+        expect(await recordCaseAfterConfirmedIntake(messageId, v2Deps())).toMatchObject({ owner: "human" });
+        expect(await readCaseByTicket("201")).toMatchObject({ owner: "human", phase: "handoff_pending" });
+    });
+    it("SAV-11 A: the wake relays a confirmed intake to its case exactly once, and the sweep catches a lost relay up", async () => {
+        environment.SAV_INTAKE_EVENT_DISPATCH = "on";
+        environment.SAV_CASE_RECORDING = "on";
+        vi.stubEnv("SAV_CASE_RECORDING", "on");
+        runId = await observed();
+        expect(await reviewExecuteWake(runId, { env: () => environment, adapters: options.adapters })).toMatchObject({ state: "confirmed" });
+        const ticketId = (await readIntakeExecutionProgress(messageId))!.ticketId!;
+        const created = (await readCaseByTicket(ticketId))!;
+        expect(created).toMatchObject({ owner: "human" });
+        const gmailId = (await f.db.select().from(savMessages).where(eq(savMessages.id, messageId)))[0].gmailMessageId!;
+        expect((await listCaseEvents(created.caseId)).filter(e => e.dedupeKey === caseDedupeKey.inbound(gmailId))).toHaveLength(1);
+        // A second wake, then the sweep: nothing new.
+        await reviewExecuteWake(runId, { env: () => environment, adapters: options.adapters });
+        expect(await sweepCaseRelays({ limit: 50 })).toMatchObject({ relayed: 0 });
+        expect((await readCaseByTicket(ticketId))!.version).toBe(created.version);
+        // A relay lost before the case existed (the next mail's wake crashed after V1 confirmed).
+        environment.SAV_CASE_RECORDING = "off";
+        const next = await storedMessage(threadId, new Date(Date.now() + 1000));
+        messageId = next.id;
+        p.setGmail(next.gmailMessageId!, "gmail-thread");
+        runId = await observed(next.id);
+        expect(await reviewExecuteWake(runId, { env: () => environment, adapters: options.adapters })).toMatchObject({ state: "confirmed" });
+        expect((await listCaseEvents(created.caseId)).some(e => e.dedupeKey === caseDedupeKey.inbound(next.gmailMessageId!))).toBe(false);
+        expect(await sweepCaseRelays({ limit: 50 })).toMatchObject({ relayed: 1 });
+        expect(await sweepCaseRelays({ limit: 50 })).toMatchObject({ relayed: 0 });
+        expect((await listCaseEvents(created.caseId)).filter(e => e.dedupeKey === caseDedupeKey.inbound(next.gmailMessageId!))).toHaveLength(1);
+    });
+    it("SAV-11 A13: a mail V1 attached whose receipt the wake lost is confirmed by the cron worker, which does not relay; the cron's catch-up relays it once, with no provider write", async () => {
+        environment.SAV_INTAKE_EVENT_DISPATCH = "on";
+        environment.SAV_CASE_RECORDING = "on";
+        vi.stubEnv("SAV_CASE_RECORDING", "on");
+        p.seedTicket({ stage: "open" });
+        const dispatch = options.adapters.dispatch;
+        options.adapters.dispatch = async (...args) => {
+            const result = await dispatch(...args);
+            if (args[0].kind === "email_associate") throw Error("LOST_ACK");
+            return result;
+        };
+        runId = await observed();
+        expect(await reviewExecuteWake(runId, { env: () => environment, adapters: options.adapters })).toMatchObject({ state: "uncertain" });
+        expect(await readCaseByTicket("201")).toBeNull();
+        options.adapters.dispatch = dispatch;
+        await f.db.update(savIntakeEffects).set({ nextReconcileAt: null }).where(eq(savIntakeEffects.state, "uncertain"));
+        expect(await reconcileIntakeExecutor({ env: () => environment, adapters: options.adapters })).toMatchObject({ state: "confirmed" });
+        expect((await readIntakeExecutionProgress(messageId))!).toMatchObject({ state: "confirmed", ticketId: "201", confirmed: true });
+        expect(await readCaseByTicket("201")).toBeNull();
+        const writes = providerWrites();
+        expect(await sweepCaseRelays({ limit: 50 })).toMatchObject({ relayed: 1 });
+        expect(await sweepCaseRelays({ limit: 50 })).toMatchObject({ relayed: 0 });
+        const gmailId = (await f.db.select().from(savMessages).where(eq(savMessages.id, messageId)))[0].gmailMessageId!;
+        const created = (await readCaseByTicket("201"))!;
+        expect(created).toMatchObject({ owner: "human" });
+        expect((await listCaseEvents(created.caseId)).filter(e => e.dedupeKey === caseDedupeKey.inbound(gmailId))).toHaveLength(1);
+        expect(providerWrites()).toEqual(writes);
+        expect(ownerWrites()).toHaveLength(0);
+    });
+    it("SAV-11 A R1: with the permission granted, the sweep relays a confirmed intake once with no HubSpot effect, and the case stays the team's", async () => {
+        await writePolicy([...mutations, "assign_v2_owner"]);
+        vi.stubEnv("SAV_CASE_RECORDING", "on");
+        p.seedTicket({ stage: "open" });
+        options.adapters.v2OwnerAttribution = v2Port({ n: 0 });
+        const row = await admission();
+        expect(await executeIntakePass(row.id, options)).toMatchObject({ state: "confirmed" });
+        expect(await readCaseByTicket("201")).toBeNull();
+        const writes = p.calls.length;
+        expect(await sweepCaseRelays({ limit: 50, deps: v2Deps() })).toMatchObject({ relayed: 1 });
+        expect(await sweepCaseRelays({ limit: 50, deps: v2Deps() })).toMatchObject({ relayed: 0 });
+        expect((await readCaseByTicket("201"))!).toMatchObject({ owner: "human", phase: "handoff_pending" });
+        expect(p.calls.length).toBe(writes);
+        expect(ownerWrites()).toHaveLength(0);
+    });
+    it("SAV-11 A R1: an older owner effect is only verified, read-only: confirmed when the V2 owner is read back, never while a human holds the ticket, never rewritten", async () => {
+        p.seedTicket({ stage: "open", ownerId: HUMAN_OWNER });
+        const adapters = createIntakeExecutorAdapters({ network: p.network, gmailRequest: p.gmail, gmailPermissions: async () => {}, env: () => environment });
+        const intent = { kind: "owner_assign", permission: "assign_v2_owner", key: `owner-v2:${messageId}:201`, ticketId: "201", sourceMessageId: messageId, expectedOwnerId: null,
+            properties: { hubspot_owner_id: V2_OWNER } } as const, signal = AbortSignal.timeout(1000), writes = () => p.calls.filter(c => c.method !== "GET").length, before = writes();
+        expect(await adapters.verify(intent, { id: "201" }, new Date(), signal)).toMatchObject({ confirmed: false, attributed: false });
+        p.objects.tickets["201"].properties.hubspot_owner_id = V2_OWNER;
+        // A receipt alone attributes nothing; the read-back owner confirms.
+        expect(await adapters.verify(intent, null, new Date(), signal)).toMatchObject({ confirmed: true, attributed: false });
+        expect(await adapters.verify(intent, { id: "201" }, new Date(), signal)).toMatchObject({ confirmed: true, attributed: true });
+        expect(writes()).toBe(before);
+        expect(p.objects.tickets["201"].properties.hubspot_owner_id).toBe(V2_OWNER);
+    });
+    it("SAV-11 A v10: the relayed request's searchable subject is V1's own accepted summary, recorded by V1's recorder, with its provenance", async () => {
+        vi.stubEnv("SAV_CASE_RECORDING", "on");
+        p.seedTicket({ stage: "open" });
+        const runtime = options.runtime, id = (await enqueueSavIntakeMessage(messageId, runtime))!, lease = (await claimSavIntakeRun(id, runtime))!;
+        const semantics: AcceptedIntakeSemantics = { revision: SAV_INTAKE_SEMANTIC_RECORD_REVISION, validatorRevision: SAV_INTAKE_MODEL_REVISION, records: [] };
+        const accepted = recordAcceptedIntakeSemantics({
+            analyseMessage: async () => ({ messageId, requests: [{ id: "r1", kind: "support", currentMessageId: messageId }],
+                ticketSummary: { title: "Connexion impossible", description: "La connexion échoue depuis la mise à jour, compte 123456789.", requestIds: ["r1"] } }),
+            assessIssues: async ({ tickets, requests }) => ({ investigationComplete: true, tickets: tickets.map(({ ticket: t }) => ({ ticketId: t.id, relation: "same", requestIds: requests.map(r => r.id), evidenceIds: ["current", `ticket-${t.id}`, `history-${t.id}`] })) }),
+            assessIdentity: async () => { throw Error("NOT_USED"); },
+        }, semantics, () => {});
+        const plan = await planSavIntake(lease.input, { ...createSavIntakeHubspotReaders({ network: p.network }), ...accepted }, runtime.policy, {}, () => new Date());
+        await saveSavIntakeResult(lease, runtime, { revision: SAV_INTAKE_RUNTIME_REVISION, effects: "not_connected", plan, input: lease.input, semantics }, "observed");
+        expect(semantics.records.map(r => r.method)).toContain("analyseMessage");
+        const row = (await admitIntakeExecution(id, options))!;
+        expect(await executeIntakePass(row.id, options)).toMatchObject({ state: "confirmed" });
+        await recordCaseAfterConfirmedIntake(messageId, { env: { SAV_CASE_RECORDING: "on" } });
+        const [request] = (await readCaseByTicket("201"))!.body.openRequests;
+        expect(request!.summary).toMatch(/relevée par l'analyse V1/);
+        expect(request!.subject).toEqual({ status: "available", text: "Connexion impossible. La connexion échoue depuis la mise à jour, compte [numéro masqué].",
+            provenance: { source: "v1_accepted_analysis", field: "ticketSummary", runId: id, runVersion: row.runVersion, resultHash: semantics.records.find(r => r.method === "analyseMessage")!.resultHash,
+                validatorRevision: SAV_INTAKE_MODEL_REVISION, acceptedAt: semantics.records.find(r => r.method === "analyseMessage")!.acceptedAt } });
+        expect(caseRequestSearchText(request!)).toBe(request!.subject!.status === "available" ? request!.subject!.text : "unreachable");
+    });
+});
+describe("pilot access route 3A (3/11, local, SYN): V1 creates the ticket with the V2 owner in the POST itself", () => {
+    beforeEach(async () => { await f.client.exec("TRUNCATE sav.cases, sav.case_events, sav.case_timers CASCADE"); });
+    const created = () => p.calls.filter(c => c.method === "POST" && c.path.endsWith("/tickets"));
+    const createdOwner = () => (created()[0]!.body as { properties: Record<string, unknown> }).properties.hubspot_owner_id;
+    const creationPort = (asked: { n: number }, deps = v2Deps()) => { const port = v2OwnerAtCreationPort(deps); return async (input: Parameters<typeof port>[0]) => { asked.n++; return port(input); }; };
+    const readOwner = async (ticketId: string) => (p.objects.tickets[ticketId]?.properties.hubspot_owner_id as string | null | undefined) ?? null;
+    const createIntent = async (rowId: string) => decryptSavPayload<EffectIntent>((await getExecutionEffects(rowId)).find(e => e.kind === "ticket_create")!.intentCiphertext);
+    async function v2Pause(level: "fully_paused" | null) {
+        await f.db.delete(savSyncState).where(eq(savSyncState.key, "sav-agent-pause.v1:v2"));
+        if (level) await f.db.insert(savSyncState).values({ key: "sav-agent-pause.v1:v2", status: "installed", cursor: encryptSavPayload({ revision: "sav-agent-pause.v1", agent: "v2", level, setBy: "fixture@example.invalid", setAt: "2026-11-03T08:00:00.000Z", reason: "pause fictive" }) });
+    }
+    it("without the permission, the port is never asked and the POST is the one of today (no owner property at all)", async () => {
+        vi.stubEnv("SAV_CASE_RECORDING", "on");
+        const asked = { n: 0 };
+        options.adapters.v2OwnerAtCreation = creationPort(asked);
+        const row = await admission();
+        expect(await executeIntakePass(row.id, options)).toMatchObject({ state: "confirmed" });
+        expect(asked.n).toBe(0);
+        expect(Object.keys((created()[0]!.body as { properties: Record<string, unknown> }).properties)).not.toContain("hubspot_owner_id");
+        expect(Object.keys((await createIntent(row.id)).properties!)).not.toContain("hubspot_owner_id");
+    });
+    it("with the permission: the POST carries the V2 owner, V1 verifies exactly that owner, no PATCH; the relay then reads it and gives the case to the agent (no fixture)", async () => {
+        await writePolicy([...mutations, "create_ticket_v2_owner"]);
+        vi.stubEnv("SAV_CASE_RECORDING", "on");
+        const asked = { n: 0 };
+        options.adapters.v2OwnerAtCreation = creationPort(asked);
+        const row = await admission();
+        expect(await executeIntakePass(row.id, options)).toMatchObject({ state: "confirmed" });
+        // Asked when planned, and again just before the marker (review F2).
+        expect(asked.n).toBe(2);
+        expect(created()).toHaveLength(1);
+        expect(createdOwner()).toBe(V2_OWNER);
+        expect((await createIntent(row.id)).properties!.hubspot_owner_id).toBe(V2_OWNER);
+        expect(ownerWrites()).toHaveLength(0);
+        const ticketId = (await readIntakeExecutionProgress(messageId))!.ticketId!;
+        expect(await recordCaseAfterConfirmedIntake(messageId, { ...v2Deps(), readCreatedTicketOwner: readOwner })).toMatchObject({ owner: "agent", admission: { target: "agent" } });
+        const attribution = (await listCaseEvents((await readCaseByTicket(ticketId))!.caseId)).filter(e => e.kind === "owner_changed" && (e.detail as { transition?: string }).transition === "v2_attribution");
+        expect(attribution).toHaveLength(1);
+        expect(JSON.stringify(attribution[0])).toContain("hubspot_owner_at_creation");
+    });
+    it("a person who sets an owner right after the creation wins: V1 confirms its creation from the owner history, writes nothing, and the case never reaches the agent", async () => {
+        await writePolicy([...mutations, "create_ticket_v2_owner"]);
+        vi.stubEnv("SAV_CASE_RECORDING", "on");
+        options.adapters.v2OwnerAtCreation = creationPort({ n: 0 });
+        const dispatch = options.adapters.dispatch;
+        options.adapters.dispatch = async (intent, signal) => {
+            const sent = await dispatch(intent, signal);
+            if (intent.kind === "ticket_create") for (const id of Object.keys(p.objects.tickets)) p.objects.tickets[id].properties.hubspot_owner_id = HUMAN_OWNER;
+            return sent;
+        };
+        const row = await admission();
+        // Review F3 (3/11): the creation is proven by HubSpot's history (first owner = V2 owner, at createdate), not by today's owner.
+        expect(await executeIntakePass(row.id, options)).toMatchObject({ state: "confirmed" });
+        expect(created()).toHaveLength(1);
+        expect(ownerWrites()).toHaveLength(0);
+        expect(Object.values(p.objects.tickets).map(t => t.properties.hubspot_owner_id)).toEqual([HUMAN_OWNER]);
+        expect(await recordCaseAfterConfirmedIntake(messageId, { ...v2Deps(), readCreatedTicketOwner: readOwner })).toMatchObject({ owner: "human" });
+    });
+    it("finance, or a V2 pause, creates the ticket without owner, as today", async () => {
+        await writePolicy([...mutations, "create_ticket_v2_owner"]);
+        vi.stubEnv("SAV_CASE_RECORDING", "on");
+        const asked = { n: 0 };
+        options.adapters.v2OwnerAtCreation = creationPort(asked, v2Deps("finance"));
+        const row = await admission();
+        expect(await executeIntakePass(row.id, options)).toMatchObject({ state: "confirmed" });
+        expect(asked.n).toBe(1);
+        expect(createdOwner()).toBeUndefined();
+        expect(await recordCaseAfterConfirmedIntake(messageId, { ...v2Deps("finance"), readCreatedTicketOwner: readOwner })).toMatchObject({ owner: "human", admission: { target: "team" } });
+    });
+    it("a V2 pause at planning time: no owner in the POST, the relay keeps the case for the team", async () => {
+        await writePolicy([...mutations, "create_ticket_v2_owner"]);
+        vi.stubEnv("SAV_CASE_RECORDING", "on");
+        await v2Pause("fully_paused");
+        try {
+            options.adapters.v2OwnerAtCreation = creationPort({ n: 0 });
+            const row = await admission();
+            expect(await executeIntakePass(row.id, options)).toMatchObject({ state: "confirmed" });
+            expect(createdOwner()).toBeUndefined();
+        } finally { await v2Pause(null); }
+        expect(await recordCaseAfterConfirmedIntake(messageId, { ...v2Deps(), readCreatedTicketOwner: readOwner })).toMatchObject({ owner: "human" });
+    });
+    it("a port that throws, or answers a malformed owner, creates without owner", async () => {
+        await writePolicy([...mutations, "create_ticket_v2_owner"]);
+        vi.stubEnv("SAV_CASE_RECORDING", "on");
+        options.adapters.v2OwnerAtCreation = async () => ({ assign: true, ownerId: "SAV Pilote" });
+        const row = await admission();
+        expect(await executeIntakePass(row.id, options)).toMatchObject({ state: "confirmed" });
+        expect(createdOwner()).toBeUndefined();
+    });
+
+    // UX review of bc5d53b (3/11), F1-F3. SYN only; every provider call goes to the in-memory fake.
+    const timeoutAfterCreate = () => {
+        const dispatch = options.adapters.dispatch;
+        options.adapters.dispatch = async (intent, signal) => { const sent = await dispatch(intent, signal); if (intent.kind === "ticket_create") throw Error("SYNTHETIC_TIMEOUT_AFTER_POST"); return sent; };
+        return () => { options.adapters.dispatch = dispatch; };
+    };
+    const withdrawn = async (rowId: string) => (await f.client.query("SELECT id FROM sav.intake_effect_journal WHERE execution_id = $1 AND kind = 'v2_owner_withdrawn'", [rowId])).rows;
+    it("F1: permission revoked between planning and the marker: no POST at all (the policy binding stops it before any owner leaves)", async () => {
+        await writePolicy([...mutations, "create_ticket_v2_owner"]);
+        vi.stubEnv("SAV_CASE_RECORDING", "on");
+        options.adapters.v2OwnerAtCreation = creationPort({ n: 0 });
+        const row = await admission();
+        await executeIntakePass(row.id, options, { beforeMarker: async () => { throw Error("SYNTHETIC_CRASH_BEFORE_MARKER"); } });
+        expect((await createIntent(row.id)).properties!.hubspot_owner_id).toBe(V2_OWNER);
+        await writePolicy(mutations);
+        expect(await executeIntakePass(row.id, options)).not.toMatchObject({ state: "confirmed" });
+        expect(created()).toHaveLength(0);
+        expect(ownerWrites()).toHaveLength(0);
+    });
+    const ownerChanges: [string, (deps: CaseBoundaryDeps) => Promise<void>][] = [
+        ["a V2 pause", async () => { await v2Pause("fully_paused"); }],
+        ["the V2 owner un-configured", async deps => { delete (deps.env as Record<string, string | undefined>).SAV_V2_HUBSPOT_OWNER_ID; }],
+    ];
+    it.each(ownerChanges)("F2: %s after planning, before the marker: the creation leaves WITHOUT owner (journaled), the team keeps it", async (_label, change) => {
+        await writePolicy([...mutations, "create_ticket_v2_owner"]);
+        vi.stubEnv("SAV_CASE_RECORDING", "on");
+        const deps = v2Deps(), asked = { n: 0 };
+        options.adapters.v2OwnerAtCreation = creationPort(asked, deps);
+        const row = await admission();
+        try {
+            expect(await executeIntakePass(row.id, options, { beforeMarker: async effect => { if (effect.kind === "ticket_create") await change(deps); } })).toMatchObject({ state: "confirmed" });
+        } finally { await v2Pause(null); }
+        expect(asked.n).toBe(2);
+        expect(created()).toHaveLength(1);
+        expect(createdOwner()).toBeUndefined();
+        expect(Object.keys((await createIntent(row.id)).properties!)).not.toContain("hubspot_owner_id");
+        expect(await withdrawn(row.id)).toHaveLength(1);
+        expect(ownerWrites()).toHaveLength(0);
+        expect(await recordCaseAfterConfirmedIntake(messageId, { ...v2Deps(), readCreatedTicketOwner: readOwner })).not.toMatchObject({ owner: "agent" });
+    });
+    it("after the marker: a V2 pause changes nothing but verification; one POST, the stored owner, never a second POST nor a PATCH", async () => {
+        await writePolicy([...mutations, "create_ticket_v2_owner"]);
+        vi.stubEnv("SAV_CASE_RECORDING", "on");
+        options.adapters.v2OwnerAtCreation = creationPort({ n: 0 });
+        const restore = timeoutAfterCreate(), row = await admission();
+        expect(await executeIntakePass(row.id, options)).not.toMatchObject({ state: "confirmed" });
+        restore();
+        await v2Pause("fully_paused");
+        try {
+            await reconcileIntakeEffectsReadOnly(row.id, options.adapters);
+            await executeIntakePass(row.id, options);
+        } finally { await v2Pause(null); }
+        expect(created()).toHaveLength(1);
+        expect(createdOwner()).toBe(V2_OWNER);
+        expect(await withdrawn(row.id)).toHaveLength(0);
+        expect(ownerWrites()).toHaveLength(0);
+    });
+    it("F3: crash after the POST, a person takes the ticket before recovery: confirmed from the history, the person keeps it, nothing written", async () => {
+        await writePolicy([...mutations, "create_ticket_v2_owner"]);
+        vi.stubEnv("SAV_CASE_RECORDING", "on");
+        options.adapters.v2OwnerAtCreation = creationPort({ n: 0 });
+        const restore = timeoutAfterCreate(), row = await admission();
+        await executeIntakePass(row.id, options);
+        restore();
+        const [ticketId] = Object.keys(p.objects.tickets);
+        p.objects.tickets[ticketId].properties.hubspot_owner_id = HUMAN_OWNER;
+        // The first verification is scheduled later: the recovery reads only what is due (as "lost create ACK reconciles" does).
+        await f.db.update(savIntakeEffects).set({ nextReconcileAt: null }).where(eq(savIntakeEffects.executionId, row.id));
+        await reconcileIntakeEffectsReadOnly(row.id, options.adapters);
+        await executeIntakePass(row.id, options);
+        expect(created()).toHaveLength(1);
+        expect((await getExecutionEffects(row.id)).find(e => e.kind === "ticket_create")!.state).toBe("confirmed");
+        expect(p.objects.tickets[ticketId].properties.hubspot_owner_id).toBe(HUMAN_OWNER);
+        expect(ownerWrites()).toHaveLength(0);
+        // Review R3, CT3b witness: on an effect already confirmed the operator's candidate path refuses (nothing left to reconcile).
+        const effect = (await getExecutionEffects(row.id)).find(e => e.kind === "ticket_create")!;
+        await expect(reconcileIntakeEffectCandidate(effect.id, ticketId, "Synthetic exact candidate already confirmed", options.adapters)).rejects.toThrow("SAV_INTAKE_EXECUTION_RECONCILIATION_REQUIRED");
+        expect(await recordCaseAfterConfirmedIntake(messageId, { ...v2Deps(), readCreatedTicketOwner: readOwner })).not.toMatchObject({ owner: "agent" });
+    });
+    it("F3 (review R3): history unreadable at recovery, readable later: the operator's candidate path confirms the creation, read only, the person keeps the ticket", async () => {
+        await writePolicy([...mutations, "create_ticket_v2_owner"]);
+        vi.stubEnv("SAV_CASE_RECORDING", "on");
+        options.adapters.v2OwnerAtCreation = creationPort({ n: 0 });
+        const restore = timeoutAfterCreate(), row = await admission();
+        await executeIntakePass(row.id, options);
+        restore();
+        const [ticketId] = Object.keys(p.objects.tickets), original = p.ownerHistory.get(ticketId)!;
+        p.objects.tickets[ticketId].properties.hubspot_owner_id = HUMAN_OWNER;
+        p.ownerHistory.set(ticketId, []);
+        await reconcileIntakeEffectsReadOnly(row.id, options.adapters);
+        await executeIntakePass(row.id, options);
+        const effect = (await getExecutionEffects(row.id)).find(e => e.kind === "ticket_create")!;
+        expect(effect.state).not.toBe("confirmed");
+        p.ownerHistory.set(ticketId, original);
+        const writes = p.calls.filter(c => c.method !== "GET").length;
+        await reconcileIntakeEffectCandidate(effect.id, ticketId, "Synthetic exact candidate held by a person", options.adapters);
+        expect((await getExecutionEffects(row.id)).find(e => e.id === effect.id)!.state).toBe("confirmed");
+        expect(p.calls.filter(c => c.method !== "GET").length).toBe(writes);
+        expect(created()).toHaveLength(1);
+        expect(p.objects.tickets[ticketId].properties.hubspot_owner_id).toBe(HUMAN_OWNER);
+        expect(ownerWrites()).toHaveLength(0);
+    });
+    const weakHistories: [string, (at: string) => { value: string; timestamp: string }[]][] = [
+        ["no history", () => []],
+        ["a first owner that is the person", at => [{ value: HUMAN_OWNER, timestamp: at }]],
+        ["a first owner set long after the creation", at => [{ value: "", timestamp: at }, { value: V2_OWNER, timestamp: new Date(Date.parse(at) + 60000).toISOString() }]],
+        ["two owners at the creation time", at => [{ value: V2_OWNER, timestamp: at }, { value: HUMAN_OWNER, timestamp: at }]],
+    ];
+    it.each(weakHistories)("F3: a person holds the ticket and the history proves nothing (%s): the creation stays uncertain, also for an operator, nothing sent", async (_label, history) => {
+        await writePolicy([...mutations, "create_ticket_v2_owner"]);
+        vi.stubEnv("SAV_CASE_RECORDING", "on");
+        options.adapters.v2OwnerAtCreation = creationPort({ n: 0 });
+        const restore = timeoutAfterCreate(), row = await admission();
+        await executeIntakePass(row.id, options);
+        restore();
+        const [ticketId] = Object.keys(p.objects.tickets);
+        p.objects.tickets[ticketId].properties.hubspot_owner_id = HUMAN_OWNER;
+        p.ownerHistory.set(ticketId, [...history(p.objects.tickets[ticketId].properties.createdate as string)]);
+        const calls = p.calls.filter(c => c.method !== "GET").length;
+        await reconcileIntakeEffectsReadOnly(row.id, options.adapters);
+        await executeIntakePass(row.id, options);
+        const effect = (await getExecutionEffects(row.id)).find(e => e.kind === "ticket_create")!;
+        expect(effect.state).not.toBe("confirmed");
+        await expect(reconcileIntakeEffectCandidate(effect.id, ticketId, "Synthetic exact candidate held by a person", options.adapters)).rejects.toThrow();
+        expect(p.calls.filter(c => c.method !== "GET").length).toBe(calls);
+        expect(p.objects.tickets[ticketId].properties.hubspot_owner_id).toBe(HUMAN_OWNER);
+    });
+});
 // SAV-31 qualification: MCP → native reconciliation → PGlite, synthetic provider, never a second send.
 async function sav31Mcp(name: string, extra: Record<string, unknown> = {}) {
     await f.db.insert(savSyncState).values({ key: "sav-intake-console-schema-v1", status: "installed" }).onConflictDoNothing();

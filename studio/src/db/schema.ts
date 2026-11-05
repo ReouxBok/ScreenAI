@@ -13,6 +13,7 @@ import {
   primaryKey,
   text,
   timestamp,
+  unique,
   uniqueIndex,
   uuid,
   vector,
@@ -686,7 +687,9 @@ export const savIntakeExecutions = sav.table("intake_executions", {
     }).defaultNow().notNull(),
 });
 export const savIntakeEffects = sav.table("intake_effects", {
-    id: uuid("id").defaultRandom().primaryKey(), businessKey: text("business_key").notNull().unique(), executionId: uuid("execution_id").notNull().references(() => savIntakeExecutions.id),
+    id: uuid("id").defaultRandom().primaryKey(), businessKey: text("business_key").notNull().unique(),
+    // Parent: an intake execution or a case-effect execution, checked by triggers in migration 0050 (a foreign key names one table).
+    executionId: uuid("execution_id").notNull(),
     kind: text("kind").notNull(), permission: text("permission").notNull(), state: text("state").notNull().default("planned"), intentHash: text("intent_hash").notNull(), intentCiphertext: text("intent_ciphertext").notNull(),
     attemptId: uuid("attempt_id").defaultRandom().notNull(), ackCiphertext: text("ack_ciphertext"), verificationCiphertext: text("verification_ciphertext"), dispatchToken: uuid("dispatch_token"),
     dispatchedAt: timestamp("dispatched_at", {
@@ -700,7 +703,7 @@ export const savIntakeEffects = sav.table("intake_effects", {
     }).defaultNow().notNull(),
 });
 export const savIntakeEffectJournal = sav.table("intake_effect_journal", {
-    id: uuid("id").defaultRandom().primaryKey(), executionId: uuid("execution_id").notNull().references(() => savIntakeExecutions.id), effectId: uuid("effect_id").references(() => savIntakeEffects.id),
+    id: uuid("id").defaultRandom().primaryKey(), executionId: uuid("execution_id").notNull() /* parent checked by migration 0050 */, effectId: uuid("effect_id").references(() => savIntakeEffects.id),
     kind: text("kind").notNull(), payloadCiphertext: text("payload_ciphertext").notNull(), createdAt: timestamp("created_at", {
         withTimezone: true
     }).defaultNow().notNull(),
@@ -716,6 +719,69 @@ export const savIntakeIdentityEpisodes = sav.table("intake_identity_episodes", {
         withTimezone: true
     }).defaultNow().notNull(),
 });
+
+/** V2 case record, one per HubSpot ticket (SAV-5). Owner/phase/sensitivity checks
+ * and the append-only trigger on case_events live in migration 0046. */
+export const savCases = sav.table("cases", {
+  id: uuid("id").defaultRandom().primaryKey(), ticketId: text("ticket_id").notNull().unique(),
+  threadIds: uuid("thread_ids").array().notNull().default(sql`'{}'`), version: integer("version").notNull().default(1),
+  owner: text("owner").notNull(), phase: text("phase").notNull(), sensitivity: text("sensitivity").notNull().default("none"),
+  contractRevision: text("contract_revision").notNull(), payloadCiphertext: text("payload_ciphertext").notNull(),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(), updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+  admissionTarget: text("admission_target"), admissionReason: text("admission_reason"), admissionPolicyRevision: text("admission_policy_revision"),
+  admissionVersion: integer("admission_version"), admissionInputVersion: integer("admission_input_version").notNull().default(0),
+  admissionDecidedAt: timestamp("admission_decided_at", { withTimezone: true }), admissionCiphertext: text("admission_ciphertext"),
+  claimToken: uuid("claim_token"), claimVersion: integer("claim_version"), claimHolder: text("claim_holder"), claimUntil: timestamp("claim_until", { withTimezone: true }),
+});
+export const savCaseEvents = sav.table("case_events", {
+  id: uuid("id").defaultRandom().primaryKey(), caseId: uuid("case_id").notNull().references(() => savCases.id),
+  kind: text("kind").notNull(), dedupeKey: text("dedupe_key").notNull(), caseVersion: integer("case_version").notNull(),
+  direction: text("direction").notNull(), occurredAt: timestamp("occurred_at", { withTimezone: true }).notNull(),
+  payloadCiphertext: text("payload_ciphertext").notNull(), createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+}, t => [uniqueIndex("sav_case_events_dedupe").on(t.caseId, t.dedupeKey), index("sav_case_events_case").on(t.caseId, t.caseVersion)]);
+/** A reply / note triggered by a V2 case event (SAV-10, pole C). Its effects live in `intake_effects` (same ledger, same protocol); migration 0050
+ * replaces the foreign keys of `execution_id` by triggers that accept either kind of execution, on the child and on the parent side. */
+export const savCaseEffectExecutions = sav.table("case_effect_executions", {
+  id: uuid("id").defaultRandom().primaryKey(), caseId: uuid("case_id").notNull().references(() => savCases.id), replyKey: text("reply_key").notNull().unique(),
+  threadId: uuid("thread_id").notNull(), policyId: uuid("policy_id").notNull().references(() => savIntakeExecutionPolicies.id), policyHash: text("policy_hash").notNull(),
+  state: text("state").notNull().default("pending"), reason: text("reason"), leaseToken: uuid("lease_token"), leaseUntil: timestamp("lease_until", { withTimezone: true }),
+  payloadCiphertext: text("payload_ciphertext").notNull(),
+  createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(), updatedAt: timestamp("updated_at", { withTimezone: true }).defaultNow().notNull(),
+}, t => [index("case_effect_executions_open").on(t.state, t.updatedAt).where(sql`${t.state} IN ('pending','running','waiting','uncertain')`), index("case_effect_executions_case").on(t.caseId)]);
+/** The human validation of one prepared case reply (SAV-10, pole C). Born a proposal; decision, revocation and payload are frozen by a trigger in
+ * migration 0051, which also never lets a row be deleted. At most one approved row per trigger. */
+export const savCaseReplyValidations = sav.table("case_reply_validations", {
+  id: uuid("id").defaultRandom().primaryKey(), caseId: uuid("case_id").notNull().references(() => savCases.id), replyKey: text("reply_key").notNull(),
+  payloadHash: text("payload_hash").notNull(), caseVersion: integer("case_version").notNull(), recipient: text("recipient").notNull(),
+  state: text("state").notNull().default("proposed"), proposalCiphertext: text("proposal_ciphertext").notNull(),
+  decidedBy: uuid("decided_by"), decidedAt: timestamp("decided_at", { withTimezone: true }), authorizationBasis: text("authorization_basis"),
+  revokedBy: uuid("revoked_by"), revokedAt: timestamp("revoked_at", { withTimezone: true }), revocationBasis: text("revocation_basis"),
+  executionId: uuid("execution_id").references(() => savCaseEffectExecutions.id), createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
+}, t => [
+  unique("case_reply_validations_trigger_payload_unique").on(t.replyKey, t.payloadHash),
+  uniqueIndex("case_reply_validations_one_approved").on(t.replyKey).where(sql`${t.state} = 'approved'`),
+  index("case_reply_validations_case").on(t.caseId, t.createdAt),
+  index("case_reply_validations_awaiting").on(t.createdAt).where(sql`${t.state} = 'proposed'`),
+]);
+/** J2 timers (SAV-8). Terminal states and dates are frozen by a trigger in migration 0048. */
+export const savCaseTimers = sav.table("case_timers", {
+  id: uuid("id").primaryKey(), key: text("key").notNull().unique(), caseId: uuid("case_id").notNull().references(() => savCases.id),
+  questionEffectId: text("question_effect_id").notNull(), sentAt: timestamp("sent_at", { withTimezone: true }).notNull(), dueAt: timestamp("due_at", { withTimezone: true }).notNull(),
+  state: text("state").notNull().default("scheduled"), scheduledAtCaseVersion: integer("scheduled_at_case_version").notNull(),
+  firedAt: timestamp("fired_at", { withTimezone: true }), cancelledAt: timestamp("cancelled_at", { withTimezone: true }), cancelReason: text("cancel_reason"),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+}, t => [index("sav_case_timers_case_state").on(t.caseId, t.state)]);
+
+/** Contract v9 §6: one row per model call key of a case. A key once `dispatched` is never reserved
+ * again, so the same callKey is paid at most once; the guard trigger and checks live in 0049. */
+export const savCaseCalls = sav.table("case_calls", {
+  callKey: text("call_key").primaryKey(), subjectKey: text("subject_key").notNull(), caseId: uuid("case_id").notNull().references(() => savCases.id),
+  caseVersion: integer("case_version").notNull(), purpose: text("purpose").notNull(), state: text("state").notNull(),
+  token: uuid("token").notNull(), holder: text("holder").notNull(), leaseUntil: timestamp("lease_until", { withTimezone: true }),
+  dispatchedAt: timestamp("dispatched_at", { withTimezone: true }), settledAt: timestamp("settled_at", { withTimezone: true }),
+  resultStatus: text("result_status"), resultUncertain: boolean("result_uncertain"), outputCiphertext: text("output_ciphertext"),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(), updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+}, t => [index("sav_case_calls_subject").on(t.subjectKey), index("sav_case_calls_case_created").on(t.caseId, t.createdAt)]);
 
 /** Derived read model only. Invalidation functions/triggers live in migration0039. */
 export const savDashboardProjection = sav.table("dashboard_projection", {

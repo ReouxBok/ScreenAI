@@ -271,7 +271,13 @@ export async function claimExecution(id: string, now = new Date()) {
     const claim = await claimExecutionOrBlock(id, now);
     return "lease" in claim ? claim.lease : null;
 }
-export type ExecutionLease = { row: typeof savIntakeExecutions.$inferSelect; token: string; payload: ExecutionPayload };
+/** SAV-10: a case-effect lease (parent row in `sav.case_effect_executions`, not in `intake_executions`) brings its own local check and its own
+ * withdrawal; every other primitive of the ledger (plan, marker, ack, confirm, defer) is shared unchanged. */
+export type CaseLeaseHooks = {
+    assertLocal(tx: ExecutionTx, now: Date): Promise<void>;
+    withdraw(effect: Effect, reason: string): Promise<boolean>;
+};
+export type ExecutionLease = { row: typeof savIntakeExecutions.$inferSelect; token: string; payload: ExecutionPayload; caseEffect?: CaseLeaseHooks };
 export type EffectRecoveryLease = { executionId: string; token: string };
 /** Reserve the existing execution lease without changing its business state.
  * No admission lock is held across a provider read. The same token is checked
@@ -303,6 +309,7 @@ export async function releaseEffectRecovery(lease: EffectRecoveryLease) {
     });
 }
 export async function assertExecutionLocal(tx: ExecutionTx, lease: ExecutionLease, now = new Date()) {
+    if (lease.caseEffect) { await lease.caseEffect.assertLocal(tx, now); return lease.row; }
     await admissionLock(tx);
     const [row] = await tx.select().from(savIntakeExecutions).where(eq(savIntakeExecutions.id, lease.row.id)).for("update");
     const [thread] = await tx.select().from(savThreads).where(eq(savThreads.id, lease.row.threadId)).for("update");
@@ -400,6 +407,7 @@ export async function markEffectDispatched(lease: ExecutionLease, effect: Effect
 /** Only for a pause seen after the marker and before any provider call by this lease:
  * nothing left, so the action returns to planned. Any other state stays verify-only. */
 export async function withdrawUndispatchedEffect(lease: ExecutionLease, effect: Effect, reason: string) {
+    if (lease.caseEffect) return lease.caseEffect.withdraw(effect, reason);
     return requireDb().transaction(async (tx) => {
         await admissionLock(tx);
         const [execution] = await tx.select().from(savIntakeExecutions).where(eq(savIntakeExecutions.id, lease.row.id)).for("update");
@@ -409,6 +417,25 @@ export async function withdrawUndispatchedEffect(lease: ExecutionLease, effect: 
                 eq(savIntakeEffects.attemptId, effect.attemptId), isNull(savIntakeEffects.ackCiphertext))).returning();
         if (row) await executionJournal(tx, lease.row.id, "dispatch_withdrawn", { attemptId: row.attemptId, reason, dispatch: false }, row.id);
         return Boolean(row);
+    });
+}
+/** Pilot access, review F2 (3/11): a planned creation whose V2 owner is no longer granted leaves without it. Only while nothing
+ * was ever sent (planned, no marker, token, ack or confirmation) and under the execution's lease; journaled with both hashes.
+ * The owner key was the last one, so the new intent is byte-identical to a creation planned without owner. */
+export async function withdrawCreationOwner(lease: ExecutionLease, effect: Effect, reason: string) {
+    return requireDb().transaction(async (tx) => {
+        await assertExecutionLocal(tx, lease);
+        const [old] = await tx.select().from(savIntakeEffects).where(eq(savIntakeEffects.id, effect.id)).for("update");
+        if (!old || old.executionId !== lease.row.id || old.kind !== "ticket_create" || old.state !== "planned" || old.dispatchedAt || old.dispatchToken || old.ackCiphertext || old.confirmedAt)
+            return fault("EFFECT_INTENT_CHANGED");
+        const intent = decryptSavPayload<EffectIntent>(old.intentCiphertext);
+        if (!intent.properties?.hubspot_owner_id)
+            return old;
+        const properties = Object.fromEntries(Object.entries(intent.properties).filter(([key]) => key !== "hubspot_owner_id"));
+        const next: EffectIntent = { ...intent, properties }, hash = intakeRuntimeHash(next);
+        const [row] = await tx.update(savIntakeEffects).set({ intentHash: hash, intentCiphertext: encryptSavPayload(next) }).where(eq(savIntakeEffects.id, old.id)).returning();
+        await executionJournal(tx, lease.row.id, "v2_owner_withdrawn", { previousIntentHash: old.intentHash, intentHash: hash, reason }, old.id);
+        return row;
     });
 }
 /** These receipt functions deliberately do not depend on live authority/lease. */

@@ -16,6 +16,7 @@ import { intakeRuntimeHash, savIntakeRuntimeConfig, SAV_INTAKE_RUNTIME_REVISION,
 import { assertSavIntakeCallPlan, assertSavIntakeLease, catchupSavIntake, claimSavIntakeRun, enqueueSavIntakeMessage, failSavIntakeRun, pendingSavIntakeRuns, readSavIntakeBudget, readSavIntakeCurrent, reconcileConfinedIntakeUsage, reserveSavIntakeCall, saveSavIntakeResult, settleSavIntakeCall } from "./runtime-store";
 import { analyseSavIntakeRuntime, enqueueConfiguredSavIntake, reconcileSavIntakeRuntime } from "./runtime";
 import { readIntakeRunDiagnostics } from "./run-diagnostics";
+import { collectSavMonitorSnapshot } from "../monitor";
 import { SAV_INTAKE_CALL_POLICY } from "./attempt-policy";
 
 let f: Awaited<ReturnType<typeof createSavTestDb>>, mailboxId: string, threadId: string, messageId: string;
@@ -1210,6 +1211,55 @@ it("REVIEW a rolling budget deferral must not promise tomorrow's daily reset",as
  expect(await claimSavIntakeRun(id,config)).toBeNull();
  vi.useFakeTimers({toFake:["Date"]});vi.setSystemTime(new Date(Date.parse(new Date().toISOString().slice(0,10)+"T00:00:00Z")+86400000));
  try{expect(await claimSavIntakeRun(id,config)).toBeNull();expect((await readSavIntakeCurrent(threadId,config))?.payload.reason).not.toBe("SAV_INTAKE_RUNTIME_DAILY_BUDGET_DEFERRED");}finally{vi.useRealTimers();}
+});
+// SAV-9: V0 no longer analyses or resumes mail. Intake claims only a mail V0 never touched (unclaimedMessage), so every other
+// non-terminal V0 state would be silently abandoned unless the monitor makes it visible. This pins both halves together.
+it("a mail the retired V0 engine had started is never claimed by intake and is always counted by the monitor", async () => {
+  const minutes = (n: number) => new Date(Date.now() - n * 60_000);
+  const cases: { name: string; status: string; patch?: Partial<typeof savMessages.$inferInsert>; claimed: boolean; flagged: boolean }[] = [
+    { name: "untouched pending", status: "pending", claimed: true, flagged: false },
+    { name: "V0 processing", status: "processing", patch: { analysisStartedAt: minutes(30) }, claimed: false, flagged: true },
+    { name: "V0 failed", status: "failed", patch: { analysisAttempts: 3 }, claimed: false, flagged: true },
+    { name: "pending after a V0 attempt", status: "pending", patch: { analysisAttempts: 1 }, claimed: false, flagged: true },
+    { name: "pending with a V0 start time", status: "pending", patch: { analysisStartedAt: minutes(30) }, claimed: false, flagged: true },
+    { name: "pending already marked processed", status: "pending", patch: { processedAt: minutes(30) }, claimed: false, flagged: true },
+    { name: "V0 done (terminal)", status: "done", patch: { processedAt: minutes(30) }, claimed: false, flagged: false },
+  ];
+  const created: { id: string; name: string }[] = [];
+  const markers = ["sav-intake-console-schema-v1", "sav-intake-execution-schema-v1"];
+  for (const key of markers) await f.db.insert(savSyncState).values({ key, status: "installed" }).onConflictDoNothing();
+  try {
+    for (const c of cases) {
+      const [thread] = await f.db.insert(savThreads).values({ mailboxId, gmailThreadId: randomUUID(), customerEmail: "synthetic@example.invalid" }).returning();
+      const [m] = await f.db.insert(savMessages).values({ mailboxId, threadId: thread.id, direction: "inbound", fromEmail: "synthetic@example.invalid", toEmails: ["support@example.invalid"],
+        subject: "Connexion fictive", gmailMessageId: randomUUID(), bodyCiphertext: encryptSavPayload({ text: "Synthetic.", attachments: [], headers: {} }), receivedAt: now(), createdAt: now(),
+        analysisStatus: c.status, ...(c.patch ?? {}) }).returning();
+      created.push({ id: m.id, name: c.name });
+      expect(Boolean(await enqueueSavIntakeMessage(m.id, config)), `claim: ${c.name}`).toBe(c.claimed);
+      // Asking again, as the catch-up does on every pass, never changes the answer.
+      if (!c.claimed) expect(await enqueueSavIntakeMessage(m.id, config), `still refused: ${c.name}`).toBeNull();
+    }
+    // The monitor reads only the two frontier dates of the launch row; the runtime would validate the whole row, so it is installed after the claims.
+    await f.db.insert(savSyncState).values({ key: `sav-intake-launch:${mailboxId}`, status: "intake_launch_v1", cursor: JSON.stringify({ receivedAfter: minutes(120).toISOString(), createdAfter: minutes(120).toISOString() }) });
+    // Age the mail past the monitor's grace period (10 min) but inside the launch frontier, without changing what intake decided.
+    await f.client.exec(`update sav.messages set created_at = now() - interval '20 minutes', received_at = now() - interval '20 minutes' where mailbox_id = '${mailboxId}'`);
+    const flaggedNames = cases.filter(c => c.flagged).map(c => c.name);
+    const first = await collectSavMonitorSnapshot();
+    expect(first.issues.find(i => i.code === "legacy_unclaimed")).toEqual({ code: "legacy_unclaimed", count: flaggedNames.length, severity: "warning" });
+    // Nothing is resumed, reset or closed by looking: every mail keeps the state it had.
+    const after = await f.db.select({ id: savMessages.id, status: savMessages.analysisStatus }).from(savMessages).where(eq(savMessages.mailboxId, mailboxId));
+    for (const c of cases) expect(after.find(r => r.id === created.find(x => x.name === c.name)!.id)?.status, `unchanged: ${c.name}`).toBe(c.claimed ? "intake_pending" : c.status);
+    // Older than 30 minutes becomes critical, like analysis_delayed.
+    await f.client.exec(`update sav.messages set created_at = now() - interval '40 minutes' where id = '${created.find(x => x.name === "V0 processing")!.id}'`);
+    expect((await collectSavMonitorSnapshot()).issues.find(i => i.code === "legacy_unclaimed")).toEqual({ code: "legacy_unclaimed", count: flaggedNames.length, severity: "critical" });
+    // A mail under the grace period is not flagged yet, and a paused thread (a person owns it) is never flagged.
+    await f.client.exec(`update sav.messages set created_at = now() - interval '2 minutes', received_at = now() - interval '2 minutes' where mailbox_id = '${mailboxId}'`);
+    expect((await collectSavMonitorSnapshot()).issues.some(i => i.code === "legacy_unclaimed")).toBe(false);
+    await f.client.exec(`update sav.messages set created_at = now() - interval '20 minutes', received_at = now() - interval '20 minutes' where mailbox_id = '${mailboxId}'; update sav.threads set ai_paused = true where mailbox_id = '${mailboxId}'`);
+    expect((await collectSavMonitorSnapshot()).issues.some(i => i.code === "legacy_unclaimed")).toBe(false);
+  } finally {
+    await f.db.delete(savSyncState).where(eq(savSyncState.key, `sav-intake-launch:${mailboxId}`));
+  }
 });
 
 it("two fully read, plausible tickets leave a human choice and a second wake spends nothing", async () => {

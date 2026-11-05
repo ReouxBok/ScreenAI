@@ -1,3 +1,4 @@
+import { synPreviewEnabled } from "@/lib/sav/local-syn";
 import Link from "next/link";
 import { z } from "zod";
 import { formatParisDateTime } from "@/lib/paris-date";
@@ -10,6 +11,7 @@ import styles from "./intake.module.css";
 import { intakeDossierHref } from "@/lib/sav/intake-ux/navigation";
 import { IntakeDossierLink, IntakeListPosition } from "./navigation";
 import { AgentPauseBanner } from "./agent-pause-banner";
+import { demoConsoleEnabled } from "./demo/demo-cases";
 export const dynamic = "force-dynamic";
 export default async function IntakeConsolePage({ searchParams }: { searchParams: Promise<{ view?: string; mailbox?: string; q?: string; page?: string; sort?: string }> }) {
   const staff=await requireIntakeConsoleStaff();
@@ -22,7 +24,8 @@ export default async function IntakeConsolePage({ searchParams }: { searchParams
   return <div className={styles.console}>
     <IntakeListPosition origin={origin}/>
     <header className={styles.heading}><div><span className="eyebrow">SAV · nouveaux dossiers</span><h1>Suivre le traitement</h1>
-      <p>Les actions confirmées et le suivi réel déterminent l’avancement.</p></div><div className={styles.actions}>{["admin","owner"].includes(staff.role)&&<Link className="button secondary" href="/studio/sav/intake/launch">Administration du lancement</Link>}{staff.role==="admin"&&<Link className="button secondary" href="/studio/sav/intake/comparison">Comparaison des lecteurs</Link>}{staff.email===SAV_INTAKE_BUDGET_OWNER_EMAIL&&<Link className="button secondary" href="/studio/sav/intake/budget">Budget IA</Link>}<Link className="button secondary" href="/studio/sav/intake/agents">Accès agents</Link><Link className="button secondary" href="/studio/sav?legacy=1">Archives supervisées</Link></div></header>
+      <p>Les actions confirmées et le suivi réel déterminent l’avancement.</p></div><div className={styles.actions}>{["admin","owner"].includes(staff.role)&&<Link className="button secondary" href="/studio/sav/intake/launch">Administration du lancement</Link>}{staff.role==="admin"&&<Link className="button secondary" href="/studio/sav/intake/comparison">Comparaison des lecteurs</Link>}{staff.email===SAV_INTAKE_BUDGET_OWNER_EMAIL&&<Link className="button secondary" href="/studio/sav/intake/budget">Budget IA</Link>}<Link className="button secondary" href="/studio/sav/intake/agents">Accès agents</Link><Link className="button secondary" href="/studio/sav/v2">Pilote V2</Link>{demoConsoleEnabled()&&<Link className="button secondary" href="/studio/sav/intake/demo">Démonstration V2 (fictive)</Link>}<Link className="button secondary" href="/studio/sav/connaissances">Connaissances</Link><Link className="button secondary" href="/studio/sav?legacy=1">Archives supervisées</Link></div></header>
+    {synPreviewEnabled() && <div className={styles.actions}><Link className="button secondary" href="/studio/sav/intake/pilot">Pilote connexion SYN · trois scénarios vérifiables</Link><span>Simulation locale, aucun envoi</span></div>}
     <AgentPauseBanner role={staff.role}/>
     {!data.installed ? <section className={styles.notice}><h2>Console non préparée</h2><p>Les données de ce parcours ne sont pas encore disponibles. La file supervisée reste accessible.</p></section> : <>
       <nav aria-label="Vues des nouveaux dossiers" className={styles.views}>

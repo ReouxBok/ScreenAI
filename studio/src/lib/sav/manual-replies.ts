@@ -5,12 +5,14 @@ import { requireDb } from "@/db";
 import { activeKnowledge, auditLogs, savActions, savAgentRuns, savDecisions, savMessages, savMessageTranslations, savProposalReviews, savReplyDrafts, savThreads } from "@/db/schema";
 import { SAV_TRANSLATOR_REVISION } from "./translations";
 import { assertSavActor } from "./access";
+import { refuseRetiredSavV0Command } from "./v0-command-retirement";
 import { assertSavAcceptedDraft, loadSavDraftContext, loadSavDossierReviewContext } from "./draft-verdicts";
 import { isSavCaseLearningFrozen, savAutomationMode, savReleaseStage } from "./config";
 import { decryptSavPayload, encryptSavPayload, savContentHash } from "./crypto";
 import { savV0EligibleMessageFilter } from "./cutover";
 import { savDraftSourceHash, savReplyForbidden } from "./review-contract";
 import { savReplyLanguage } from "./reply-language";
+import { LEGACY_SAV_REPLY_FORMAT_V3, renderSealedSavReplyV3 } from "./reply-format-v3";
 import { renderSavOutboundReply, SAV_REPLY_FORMAT_REVISION, savManualReplyMode } from "./reply-format";
 
 import { normalizeSavConfirmationText, SAV_REPLY_CONFIRMATION_TEXT_REVISION } from "./reply-confirmation-text";
@@ -24,7 +26,12 @@ export function assertSavManualReplyEnabled() {
 }
 
 /** Send authorization is separate from process/knowledge approval. Never publishes knowledge. */
-export async function queueSavManualReply(raw: unknown, actorEmail: string) {
+/** SAV-9/SAV-60: retired V0 command, refused before any read or effect (v0-command-retirement.ts). The archived body below stays for the tests of the worker paths that still run; no source file may import it. */
+export async function queueSavManualReply(...args: Parameters<typeof queueSavManualReplyArchived>) {
+  refuseRetiredSavV0Command("sendStudioReplyAction");
+  return queueSavManualReplyArchived(...args);
+}
+export async function queueSavManualReplyArchived(raw: unknown, actorEmail: string) {
   assertSavActor(actorEmail);
   assertSavManualReplyEnabled();
   if(isSavCaseLearningFrozen())throw new Error("SAV_CASE_LEARNING_FROZEN");
@@ -44,7 +51,7 @@ async function queueSavManualReplyTx(input:z.infer<typeof requestSchema>,actorEm
     // One manual answer per inbound. Unknown delivery must never become another POST.
     // A pending pre-rule action can only be upgraded by a NEW explicit send
     // confirmation. Workers never silently add a footer to an old approval.
-    const reconfirmOldPending = existing?.status === "pending" && existing.payload.replyFormatRevision !== SAV_REPLY_FORMAT_REVISION && !existing.payload.replySendDispatchedAt;
+    const reconfirmOldPending = existing?.status === "pending" && existing.payload.replyFormatRevision !== SAV_REPLY_FORMAT_REVISION && existing.payload.replyFormatRevision !== LEGACY_SAV_REPLY_FORMAT_V3 && !existing.payload.replySendDispatchedAt;
     if (existing && !["failed", "cancelled"].includes(existing.status) && !reconfirmOldPending) return existing;
     if (existing?.payload.replySendDispatchedAt) throw new Error("SAV_REPLY_MANUAL_RECONCILIATION_REQUIRED");
     const context = await assertSavAcceptedDraft(draft, tx);
@@ -68,7 +75,12 @@ const confirmationSchema = z.object({ threadId:z.uuid(),messageId:z.uuid(),decis
   expectedDraftId:z.uuid().nullable(),text:z.string().transform(normalizeSavConfirmationText).pipe(z.string().trim().min(1).max(10000)),recipient:z.email(),outboundHash:z.string().length(43),origin:z.enum(["ai","human"]) }).strict();
 /** Exact displayed text and recipient become a version and a send authorization in
  * the same transaction. Neither a dossier review nor copying a suggestion sends. */
-export async function confirmSavSuggestedReply(raw:unknown,actorEmail:string) {
+/** SAV-9/SAV-60: retired V0 command, refused before any read or effect (v0-command-retirement.ts). The archived body below stays for the tests of the worker paths that still run; no source file may import it. */
+export async function confirmSavSuggestedReply(...args: Parameters<typeof confirmSavSuggestedReplyArchived>) {
+  refuseRetiredSavV0Command("sendSuggestedReplyAction");
+  return confirmSavSuggestedReplyArchived(...args);
+}
+export async function confirmSavSuggestedReplyArchived(raw:unknown,actorEmail:string) {
   assertSavActor(actorEmail); assertSavManualReplyEnabled();
   if(isSavCaseLearningFrozen())throw new Error("SAV_CASE_LEARNING_FROZEN");
   const input=confirmationSchema.parse(raw);
@@ -118,9 +130,12 @@ export async function assertSavCurrentManualReply(action: typeof savActions.$inf
   if (draft.status==="send_confirmed" && (typeof action.payload.confirmationHash!=="string" || action.payload.confirmedRecipient!==message.fromEmail)) throw new Error("SAV_REPLY_MANUAL_APPROVAL_REQUIRED");
   const body = decryptSavPayload<{ text: string; headers?: Record<string, string> }>(message.bodyCiphertext);
   if (!/^<[^<>\s]+@[^<>\s]+>$/.test(body.headers?.["message-id"] ?? "")) throw new Error("SAV_REPLY_MANUAL_THREAD_HEADERS_MISSING");
-  if (action.payload.replyFormatRevision !== SAV_REPLY_FORMAT_REVISION || typeof action.payload.outboundBodyCiphertext !== "string") throw new Error("SAV_REPLY_MANUAL_FORMAT_RECONFIRM_REQUIRED");
+  const revision = action.payload.replyFormatRevision;
+  if ((revision !== SAV_REPLY_FORMAT_REVISION && revision !== LEGACY_SAV_REPLY_FORMAT_V3) || typeof action.payload.outboundBodyCiphertext !== "string") throw new Error("SAV_REPLY_MANUAL_FORMAT_RECONFIRM_REQUIRED");
   const outboundText = decryptSavPayload<{ text: string }>(action.payload.outboundBodyCiphertext).text;
   const language = savReplyLanguage(context.proposal, body.text);
-  if (outboundText !== renderSavOutboundReply(decryptSavPayload<{ text: string }>(draft.bodyCiphertext).text, language, savManualReplyMode(decryptSavPayload<{ origin?: string }>(draft.bodyCiphertext).origin)) || action.payload.outboundBodyHash !== savContentHash(outboundText)) throw new Error("SAV_REPLY_MANUAL_OUTBOUND_CHANGED");
+  const renderApproved = revision === LEGACY_SAV_REPLY_FORMAT_V3 ? renderSealedSavReplyV3 : renderSavOutboundReply;
+  const draftText = decryptSavPayload<{ text: string; origin?: string }>(draft.bodyCiphertext);
+  if (outboundText !== renderApproved(draftText.text, language, savManualReplyMode(draftText.origin)) || action.payload.outboundBodyHash !== savContentHash(outboundText)) throw new Error("SAV_REPLY_MANUAL_OUTBOUND_CHANGED");
   return { draft, message, outboundText };
 }

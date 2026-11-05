@@ -1,13 +1,15 @@
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { eq } from "drizzle-orm";
 import { createSavTestDb } from "../../../test/sav-db";
-import { savActions, savAgentRuns, savDecisions, savLearningCandidates, savMailboxes, savMessages, savPilotBatches, savPilotItems, savThreads } from "@/db/schema";
+import { savActions, savAgentRuns, savDecisions, savFollowups, savLearningCandidates, savMailboxes, savMessages, savPilotBatches, savPilotItems, savThreads } from "@/db/schema";
 import { assertSavWriteAllowed } from "./write-guard";
 import { invalidateSavReplies } from "./invalidation";
 import { processPendingGmailSendActions } from "./gmail";
+import { processPendingHubspotActions } from "./hubspot";
+import { processDueFollowups } from "./followups";
 import { encryptSavPayload } from "./crypto";
 import { currentMessageText, loadSavConversation } from "./conversation";
-import { processPendingSavMessages, processSavPilotItem, reviewSavPilotItem } from "./service";
+import { processPendingSavMessages, processSavPilotItem, reviewSavPilotItemArchived as reviewSavPilotItem } from "./service";
 import { getSavAutonomyGate } from "./promotion";
 import { activateSavV0Cutover } from "./cutover";
 import { SAV_UNDERSTANDING_PROMPT_REVISION } from "./understanding";
@@ -40,8 +42,9 @@ beforeEach(async () => {
   messageId = message.id;
 });
 
-async function action(kind: "send_reply" | "draft_reply" = "send_reply") {
-  const [row] = await fixture.db.insert(savActions).values({ threadId, messageId, kind,
+// A person's command: the only author the legacy workers still execute (SAV-9). The guards below are the ones a person's command meets.
+async function action(kind: "send_reply" | "draft_reply" = "send_reply", actorType: "human" | "ai" | "system" = "human") {
+  const [row] = await fixture.db.insert(savActions).values({ threadId, messageId, kind, actorType,
     status: kind === "draft_reply" ? "succeeded" : "running", idempotencyKey: crypto.randomUUID(),
   }).returning();
   return row;
@@ -193,7 +196,17 @@ describe("write guard with migrated database", () => {
     vi.stubEnv("SAV_AI_ANALYSIS", "false");
     const [batch] = await fixture.db.insert(savPilotBatches).values({ targetSize: 1, createdBy: "reviewer@example.com", status: "processing" }).returning();
     const [item] = await fixture.db.insert(savPilotItems).values({ batchId: batch.id, messageId }).returning();
-    await expect(processSavPilotItem(item.id)).resolves.toMatchObject({ status: "ready" });
+    // The old V0 analysis is retired (SAV-9): a pilot item is never claimed or analysed any more, so the run below is an existing one
+    // (a review of past pilot data still links to the prompt and model that produced it).
+    await expect(processSavPilotItem(item.id)).resolves.toBeNull();
+    const [untouched] = await fixture.db.select().from(savPilotItems).where(eq(savPilotItems.id, item.id));
+    expect(untouched).toMatchObject({ status: "pending", attemptCount: 0, agentRunId: null });
+    expect(await fixture.db.select().from(savAgentRuns).where(eq(savAgentRuns.messageId, messageId))).toHaveLength(0);
+    const [existing] = await fixture.db.insert(savAgentRuns).values({
+      messageId, pilotBatchId: batch.id, scope: "sav_ticket_analysis", runtime: "google_adk", mode: "pilot", status: "succeeded",
+      model: "fixture-model", promptRevision: SAV_UNDERSTANDING_PROMPT_REVISION, inputHash: "fixture",
+    }).returning();
+    await fixture.db.update(savPilotItems).set({ status: "ready", agentRunId: existing.id }).where(eq(savPilotItems.id, item.id));
     const [processed] = await fixture.db.select().from(savPilotItems).where(eq(savPilotItems.id, item.id));
     const [run] = await fixture.db.select().from(savAgentRuns).where(eq(savAgentRuns.id, processed.agentRunId!));
     expect(processed.agentRunId).toBeTruthy();
@@ -207,18 +220,111 @@ describe("write guard with migrated database", () => {
     await expect(getSavAutonomyGate("other-version", "fixture")).resolves.toMatchObject({ metrics: { versionReviewed: 0, versionCorrect: 0 } });
     await expect(getSavAutonomyGate("rules-v1", "different-model")).resolves.toMatchObject({ metrics: { versionReviewed: 0, versionCorrect: 0 } });
   });
-  it("reclaims an interrupted non-pilot analysis and finishes it once", async () => {
+  it("never reclaims an interrupted analysis any more: the retired V0 analysis leaves the message untouched, however often it runs", async () => {
     vi.stubEnv("SAV_PILOT_MODE", "false");
     vi.stubEnv("SAV_AI_ANALYSIS", "false");
     await fixture.db.update(savMessages).set({ analysisStatus: "processing", analysisAttempts: 1, analysisStartedAt: new Date(Date.now() - 20 * 60_000) }).where(eq(savMessages.id, messageId));
+    const [before] = await fixture.db.select().from(savMessages).where(eq(savMessages.id, messageId));
     const first = await processPendingSavMessages(4);
     const second = await processPendingSavMessages(4);
     const [message] = await fixture.db.select().from(savMessages).where(eq(savMessages.id, messageId));
     const decisions = await fixture.db.select().from(savDecisions).where(eq(savDecisions.messageId, messageId));
-    expect(first.processed).toEqual([{ messageId, status: "processed" }]);
-    expect(second.processed).toEqual([]);
-    expect(message).toMatchObject({ analysisStatus: "done", analysisAttempts: 2 });
-    expect(message.processedAt).not.toBeNull();
-    expect(decisions).toHaveLength(1);
+    expect(first).toEqual({ retired: true, processed: [] });
+    expect(second).toEqual({ retired: true, processed: [] });
+    expect(message).toEqual(before);
+    expect(message).toMatchObject({ analysisStatus: "processing", analysisAttempts: 1, processedAt: null });
+    expect(decisions).toHaveLength(0);
+  });
+});
+
+describe("retired V0 engine with migrated database (SAV-9)", () => {
+  const stages = ["v0", "v1", "v2", "v3", "v4"] as const;
+  const modes = ["assist", "semi", "on"] as const;
+  const gmailKinds = ["send_reply", "request_human"] as const;
+  const hubspotKinds = ["create_ticket", "link_ticket", "log_email", "update_ticket_status"] as const;
+  const marker = { replySendDispatchedAt: "2026-10-27T10:00:00.000Z", ticketCreateDispatchedAt: "2026-10-27T10:00:00.000Z" };
+  const noNetwork = () => { const network = vi.fn(() => { throw new Error("No network allowed"); }); vi.stubGlobal("fetch", network); return network; };
+
+  async function machineRows() {
+    const staleAt = new Date(Date.now() - 3_600_000);
+    const created = [];
+    for (const actorType of ["ai", "system"] as const) for (const kind of [...gmailKinds, ...hubspotKinds]) {
+      // never sent, and "engaged": a stale running row whose payload says a provider call may have happened
+      for (const [status, payload] of [["pending", { bodyCiphertext: encryptSavPayload({ text: "Proposed response" }) }], ["running", { ...marker, bodyCiphertext: encryptSavPayload({ text: "Proposed response" }) }]] as const) {
+        const [row] = await fixture.db.insert(savActions).values({
+          threadId, messageId, kind, actorType, status, payload, idempotencyKey: crypto.randomUUID(), updatedAt: staleAt,
+        }).returning();
+        created.push(row);
+      }
+    }
+    return created;
+  }
+
+  it("machine-authored actions are never claimed, sent, retried or recovered in any stage or mode; their rows stay untouched", async () => {
+    const rows = await machineRows();
+    const network = noNetwork();
+    for (const stage of stages) for (const mode of modes) {
+      vi.stubEnv("SAV_RELEASE_STAGE", stage);
+      vi.stubEnv("SAV_AUTOMATION_MODE", mode);
+      await processPendingGmailSendActions(100);
+      await processPendingHubspotActions(100);
+    }
+    expect(network).not.toHaveBeenCalled();
+    const after = await fixture.db.select().from(savActions);
+    expect(after).toHaveLength(rows.length);
+    for (const before of rows) expect(after.find((row) => row.id === before.id)).toEqual(before);
+    expect(rows.every((row) => row.attemptCount === 0)).toBe(true);
+  });
+  it("a machine-authored row does not starve a person's command waiting in the same pass", async () => {
+    await machineRows();
+    const human = await action("send_reply", "human");
+    await fixture.db.update(savActions).set({ status: "pending", payload: { bodyCiphertext: encryptSavPayload({ text: "Proposed response" }) } }).where(eq(savActions.id, human.id));
+    let sends = 0;
+    vi.stubGlobal("fetch", vi.fn(async (url: string | URL | Request) => {
+      const path = String(url);
+      if (path.includes("oauth2")) return Response.json({ access_token: "fixture", expires_in: 3600 });
+      if (path.includes("messages?")) return Response.json({ messages: [] });
+      if (path.endsWith("messages/send")) { sends++; return Response.json({ id: "sent-human", threadId: "g1" }); }
+      throw new Error("Unexpected network call");
+    }));
+    await processPendingGmailSendActions(1);
+    expect(sends).toBe(1);
+    expect((await fixture.db.select().from(savActions).where(eq(savActions.id, human.id)))[0].status).toBe("succeeded");
+  });
+  it("the old follow-up trigger, run late or twice, queues nothing and leaves the scheduled rows as they were", async () => {
+    vi.stubEnv("SAV_RELEASE_STAGE", "v4");
+    vi.stubEnv("SAV_AUTOMATION_MODE", "on");
+    await fixture.db.update(savThreads).set({ status: "awaiting_customer", aiPaused: false }).where(eq(savThreads.id, threadId));
+    await fixture.db.insert(savFollowups).values([1, 2, 3].map((sequence) => ({ threadId, sequence, dueAt: new Date(Date.now() - 86_400_000) })));
+    const before = await fixture.db.select().from(savFollowups);
+    const actionsBefore = await fixture.db.select().from(savActions);
+    noNetwork();
+    expect(await processDueFollowups(50)).toEqual({ retired: true, processed: [] });
+    expect(await processDueFollowups(50, new Date(Date.now() + 30 * 86_400_000))).toEqual({ retired: true, processed: [] });
+    expect(await fixture.db.select().from(savFollowups)).toEqual(before);
+    expect(await fixture.db.select().from(savActions)).toEqual(actionsBefore);
+    await processPendingGmailSendActions(100);
+    expect(await fixture.db.select().from(savActions)).toEqual(actionsBefore);
+  });
+  it("a person's reply is sent and recorded without scheduling follow-ups or any CRM log/status row", async () => {
+    vi.stubEnv("SAV_RELEASE_STAGE", "v4");
+    vi.stubEnv("SAV_AUTOMATION_MODE", "on");
+    await fixture.db.update(savThreads).set({ hubspotTicketId: "9001" }).where(eq(savThreads.id, threadId));
+    const human = await action("send_reply", "human");
+    await fixture.db.update(savActions).set({ status: "pending", payload: { bodyCiphertext: encryptSavPayload({ text: "Proposed response" }) } }).where(eq(savActions.id, human.id));
+    vi.stubGlobal("fetch", vi.fn(async (url: string | URL | Request) => {
+      const path = String(url);
+      if (path.includes("oauth2")) return Response.json({ access_token: "fixture", expires_in: 3600 });
+      if (path.includes("messages?")) return Response.json({ messages: [] });
+      if (path.endsWith("messages/send")) return Response.json({ id: "sent-human", threadId: "g1" });
+      throw new Error("Unexpected network call");
+    }));
+    await processPendingGmailSendActions(1);
+    expect((await fixture.db.select().from(savActions).where(eq(savActions.id, human.id)))[0].status).toBe("succeeded");
+    expect(await fixture.db.select().from(savFollowups)).toHaveLength(0);
+    expect((await fixture.db.select().from(savActions)).map((row) => row.kind)).toEqual(["send_reply"]);
+    expect((await fixture.db.select().from(savThreads).where(eq(savThreads.id, threadId)))[0].status).toBe("awaiting_customer");
+    const outbound = await fixture.db.select().from(savMessages).where(eq(savMessages.direction, "outbound"));
+    expect(outbound).toHaveLength(1);
   });
 });

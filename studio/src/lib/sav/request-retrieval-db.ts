@@ -8,18 +8,27 @@ function rowsOf(result: unknown): Record<string, unknown>[] {
   return Array.isArray(result) ? result : (result as { rows: Record<string, unknown>[] }).rows;
 }
 
-/** SAV-only adapter. The installed extension's search API and ranking stay separate. */
-export function createSavRequestRetrievalBackend(options: { locale?: string; audience?: "support" | "lead"; now?: Date } = {}): SavRetrievalBackend {
+export const SAV_RETRIEVAL_EMBEDDING_DIMENSION = 768;
+const withinBudget = (queries: readonly string[], limit: number) =>
+  queries.length <= SAV_RETRIEVAL_LIMITS.queriesPerAttempt && Number.isInteger(limit) && limit >= 1 && limit <= SAV_RETRIEVAL_LIMITS.candidatesPerQuery;
+const validVectors = (queries: readonly string[], vectors: readonly (readonly number[])[]) =>
+  vectors.length === queries.length && !vectors.some(vector => vector.length !== SAV_RETRIEVAL_EMBEDDING_DIMENSION || vector.some(value => !Number.isFinite(value)));
+
+/**
+ * The SAV knowledge index without any embedding call: the active revision, whether any SAV card is active, and the
+ * vector + lexical search given query vectors obtained elsewhere. Same SQL, filters, language, revision and limits as
+ * the V1 backend below, which is now a wrapper over it. V2 passes vectors it paid through its own budget gate.
+ */
+export function createSavKnowledgeVectorIndex(options: { locale?: string; audience?: "support" | "lead"; now?: Date } = {}) {
   const locale = options.locale ?? "fr-FR", audience = options.audience ?? "support", now = options.now ?? new Date();
   const db = requireDb();
   return {
+    dimension: SAV_RETRIEVAL_EMBEDDING_DIMENSION,
     async readRevision() {
       const rows = rowsOf(await db.execute(sql`SELECT revision_id FROM active_knowledge WHERE singleton = true LIMIT 1`));
       return String(rows[0]?.revision_id ?? "kb_empty");
     },
-    async search(queries, limit) {
-      if (queries.length > SAV_RETRIEVAL_LIMITS.queriesPerAttempt || !Number.isInteger(limit) || limit < 1 || limit > SAV_RETRIEVAL_LIMITS.candidatesPerQuery) throw new Error("SAV_RETRIEVAL_DB_BUDGET");
-      if (!queries.length) return [];
+    async available() {
       const availability = rowsOf(await db.execute(sql`SELECT EXISTS (
         SELECT 1 FROM content_items item
         JOIN sav_knowledge_activations activation ON activation.item_id = item.id
@@ -27,10 +36,11 @@ export function createSavRequestRetrievalBackend(options: { locale?: string; aud
         WHERE item.agent_key = 'sav' AND item.slug <> 'sav-master-playbook' AND item.type = 'article' AND item.status <> 'archived'
           AND item.ai_enabled = true AND item.published_version_id IS NOT NULL AND item.locale = ${locale}
       ) AS available`));
-      if (availability[0]?.available !== true) return queries.map(() => []);
-      // One embedding batch for at most three independent requests.
-      const embeddings = await embedTexts([...queries], "RETRIEVAL_QUERY", { scope: "sav" });
-      if (embeddings.length !== queries.length || embeddings.some(vector => vector.length !== 768 || vector.some(value => !Number.isFinite(value)))) throw new Error("SAV_RETRIEVAL_EMBEDDING_INVALID");
+      return availability[0]?.available === true;
+    },
+    async searchByVectors(queries: readonly string[], embeddings: readonly (readonly number[])[], limit: number): Promise<SavRetrievalCandidate[][]> {
+      if (!withinBudget(queries, limit)) throw new Error("SAV_RETRIEVAL_DB_BUDGET");
+      if (!validVectors(queries, embeddings)) throw new Error("SAV_RETRIEVAL_EMBEDDING_INVALID");
       return Promise.all(queries.map(async (query, index) => {
         const vector = `[${embeddings[index].join(",")}]`;
         const terms = savRetrievalTokens(query).slice(0, 40);
@@ -90,6 +100,23 @@ export function createSavRequestRetrievalBackend(options: { locale?: string; aud
           availability: { active: true, published: true, indexed: true, archived: false, aiEnabled: true, locale: String(row.locale), audience: String(row.audience) },
         }));
       }));
+    },
+  };
+}
+
+/** SAV-only adapter. The installed extension's search API and ranking stay separate. */
+export function createSavRequestRetrievalBackend(options: { locale?: string; audience?: "support" | "lead"; now?: Date } = {}): SavRetrievalBackend {
+  const index = createSavKnowledgeVectorIndex(options);
+  return {
+    readRevision: () => index.readRevision(),
+    async search(queries, limit) {
+      if (!withinBudget(queries, limit)) throw new Error("SAV_RETRIEVAL_DB_BUDGET");
+      if (!queries.length) return [];
+      if (!(await index.available())) return queries.map(() => []);
+      // One embedding batch for at most three independent requests.
+      const embeddings = await embedTexts([...queries], "RETRIEVAL_QUERY", { scope: "sav" });
+      if (!validVectors(queries, embeddings)) throw new Error("SAV_RETRIEVAL_EMBEDDING_INVALID");
+      return index.searchByVectors(queries, embeddings, limit);
     },
   };
 }

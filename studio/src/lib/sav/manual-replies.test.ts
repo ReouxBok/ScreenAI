@@ -9,7 +9,7 @@ import { understandingFixture } from "../../../test/sav-understanding-fixtures";
 import {v0Proposal} from "../../../test/sav-v0-review-fixture";
 import {loadSavDraftContext,reviewSavDraft} from "./draft-verdicts";
 import {savDraftVerdicts} from "@/db/schema";
-import { assertSavCurrentManualReply, queueSavManualReply } from "./manual-replies";
+import { assertSavCurrentManualReply, queueSavManualReplyArchived as queueSavManualReply } from "./manual-replies";
 import { processPendingGmailSendActions } from "./gmail";
 
 const state = vi.hoisted(() => ({ db: null as unknown }));

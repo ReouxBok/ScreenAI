@@ -166,10 +166,28 @@ jobs:
       - name: Populated 0037 to 0039 with the real migrator twice
         working-directory: studio
         run: node --conditions=react-server --import tsx test/sav73-native-migration.ts
+      # Required native gate for V2 (poles A, B, C): every file must run on this service, never PGlite, nothing skipped.
+      # It runs right after the migration, before the shared step below: those files TRUNCATE sav.sync_state, which removes the V2
+      # schema markers (sav-case-schema-v2..v7) that the case store checks, so after them every V2 file fails SAV_CASE_SCHEMA_MISSING.
+      # Not listed yet (fixed fixtures collide on this shared database; their owners fix them first): B investigation-relay-journey,
+      # C case-effect-executor and case-reply-durable. case-reply-situation.native (C, B7) holds the one-approved-reply-per-situation
+      # property on real row locks: it must run here, never only as a skipped file under PGlite. investigation-delivery-journey (C) holds the
+      # two executor-gate races (two executions already queued for one situation, two real connections on the case lock), skipped under
+      # PGlite; it runs last here: its fixed mailbox and staff rows collide with none of the files above, and the shared step below
+      # truncates sav.mailboxes and staff_users before inserting its own.
+      - name: V2 cases on native Postgres, each file proven native and nothing skipped
+        working-directory: studio
+        env:
+          SAV_TEST_NATIVE_REQUIRED: '1'
+        run: |
+          FILES="src/lib/sav/native-test-target.test.ts src/lib/sav/cases/case-ddl-native.test.ts src/lib/sav/cases/case-reply-lock-order.native.test.ts src/lib/sav/cases/case-reply-situation.native.test.ts src/lib/sav/cases/case-calls.test.ts src/lib/sav/cases/case-store.test.ts src/lib/sav/cases/intake-boundary.test.ts src/lib/sav/cases/owner-attribution.test.ts src/lib/sav/cases/investigation-call-ledger.test.ts src/lib/sav/cases/investigation-delivery-journey.test.ts"
+          node node_modules/vitest/vitest.mjs run --maxWorkers=1 --no-file-parallelism --no-cache \
+            --reporter=default --reporter=json --outputFile=sav-native-v2.json $FILES
+          node --import tsx test/assert-sav-native-report.ts sav-native-v2.json $FILES
       - name: Native classification, invalidation, concurrent repair and durable opening
         working-directory: studio
         run: >-
-          node node_modules/vitest/vitest.mjs run --maxWorkers=1 --no-file-parallelism
+          node node_modules/vitest/vitest.mjs run --maxWorkers=1 --no-file-parallelism --no-cache
           src/lib/sav/intake-ux/operator-commands.test.ts
           src/lib/sav/intake-ux/orientation-store.test.ts
           src/lib/sav/intake/runtime.test.ts

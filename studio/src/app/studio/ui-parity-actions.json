@@ -1,0 +1,163 @@
+{
+ "base": "f1da0fba353711696a795db960128845d95231a7",
+ "note": "Server actions covered by the SAV-49 parity matrix. Update together with the matrix.",
+ "files": {
+  "app/studio/actions.ts": [
+   "saveContentAction",
+   "setAiEnabledAction",
+   "submitAction",
+   "prepareEvaluationAction",
+   "startEvaluationRunAction",
+   "rejectAction",
+   "publishAction",
+   "reviewDecisionAction",
+   "emergencyPublishAction",
+   "rollbackAction",
+   "archiveAction",
+   "deleteContentAction"
+  ],
+  "app/studio/entrainements/actions.ts": [
+   "createTrainingAction",
+   "restartTrainingAction",
+   "deleteTrainingAction",
+   "recoverTrainingAction",
+   "updateTrainingAction",
+   "convertTrainingAction"
+  ],
+  "app/studio/sav/actions.ts": [
+   "recordDeploymentDecisionAction",
+   "approveReplayAction",
+   "runReviewedReplayAction",
+   "saveReplyDraftAction",
+   "qualifyObservationAction",
+   "reviewDraftAction",
+   "saveHumanDraftAction",
+   "sendStudioReplyAction",
+   "sendSuggestedReplyAction",
+   "requestHumanAction",
+   "correctDecisionAction",
+   "createTicketAction",
+   "linkTicketAction",
+   "retryAnalysisAction",
+   "refreshSavContextAction",
+   "repairSavProposalAction",
+   "reconcileTicketAction",
+   "approveDraftAction",
+   "retryAction",
+   "retryWebhookAction",
+   "startPilotBatchAction",
+   "startSelectedPilotBatchAction",
+   "cancelPilotBatchAction",
+   "cancelPilotBatchLabAction",
+   "reviewPilotItemAction",
+   "continueBackfillAction",
+   "reviewLearningAction",
+   "previewHubspotReviewAction",
+   "reviewKnowledgeAction",
+   "importOnboardingKnowledgeAction",
+   "reviewProposalAction",
+   "importHubspotKnowledgeAction",
+   "reconcileTicketReturnAction"
+  ],
+  "app/studio/sav/connaissances/apprentissage/actions.ts": [
+   "triageLearningSignal"
+  ],
+  "app/studio/sav/connaissances/diagnostic/actions.ts": [
+   "prepareDiagnosticPage"
+  ],
+  "app/studio/sav/connaissances/onboarding-actions.ts": [
+   "startOnboardingImportAction",
+   "continueOnboardingImportAction",
+   "previewOnboardingReviewAction",
+   "reviewOnboardingKnowledgeAction"
+  ],
+  "app/studio/sav/connaissances/playbook/actions.ts": [
+   "changeSavPlaybook"
+  ],
+  "app/studio/sav/connaissances/workspace-actions.ts": [
+   "saveKnowledgeProposalAction",
+   "previewKnowledgeProposalAction",
+   "submitKnowledgeProposalAction",
+   "findKnowledgeAction",
+   "loadKnowledgeTargetAction",
+   "previewKnowledgeReviewAction",
+   "reviewKnowledgeWorkspaceAction",
+   "publishKnowledgeWorkspaceAction",
+   "activateKnowledgeWorkspaceAction",
+   "startKnowledgeRevisionAction",
+   "loadSavFactDictionaryAction"
+  ],
+  "app/studio/sav/intake/actions.ts": [
+   "completeIntakeDossierAction",
+   "classifyInvalidSourceAction",
+   "requestRecoveryAction",
+   "reconcileIdentificationAction",
+   "reconcileNoteAction",
+   "saveIntakeChoice",
+   "releaseIntakeHumanHoldAction"
+  ],
+  "app/studio/sav/intake/agents/actions.ts": [
+   "createAgentKeyAction",
+   "revokeAgentKeyAction"
+  ],
+  "app/studio/sav/intake/budget/actions.ts": [
+   "setBudgetAction"
+  ],
+  "app/studio/sav/intake/comparison/actions.ts": [
+   "runComparisonAction",
+   "attestComparisonAction"
+  ],
+  "app/studio/sav/intake/launch/actions.ts": [
+   "previewLaunchAction",
+   "commitLaunchAction",
+   "revokeLaunchAction"
+  ],
+  "app/studio/sav/intake/manual-other-actions.ts": [
+   "classifyManualOtherAction"
+  ],
+  "app/studio/sav/intake/operator-actions.ts": [
+   "submitOperatorAction",
+   "lookupOperatorAction"
+  ],
+  "app/studio/sav/intake/orientation-actions.ts": [
+   "submitUxOrientation",
+   "lookupUxOrientation"
+  ],
+  "app/studio/sav/intake/pause/actions.ts": [
+   "setPauseAction"
+  ],
+  "app/studio/sav/open-email-actions.ts": [
+   "openSavEmailAction",
+   "recordSavDossierOpenedAction"
+  ],
+  "app/studio/sav/partnership-actions.ts": [
+   "preparePartnershipTransferAction",
+   "confirmPartnershipTransferAction"
+  ],
+  "app/studio/sav/ticket-preview-actions.ts": [
+   "prepareTicketPreviewAction",
+   "confirmTicketPreviewAction"
+  ],
+  "app/studio/tests/actions.ts": [
+   "runQualityTestAction",
+   "runAllQualityTestsAction",
+   "createQualityTestAction"
+  ],
+  "app/studio/trame/actions.ts": [
+   "saveOnboardingTemplateAction",
+   "publishOnboardingTemplateAction"
+  ]
+ },
+ "guards": {
+  "app/studio/sav/intake/agents/actions.ts": {
+   "action": "requireIntakeConsoleStaff()",
+   "lib": "lib/mcp/tokens.ts: own keys only (staffId), active staff, 5 active keys at most",
+   "roles": "any active SAV staff (canAccessSav)"
+  },
+  "app/studio/sav/intake/manual-other-actions.ts": {
+   "action": null,
+   "lib": "lib/sav/external-completion.ts classifySavDossierOtherManually: executionAdministrator() then assertOperator()",
+   "roles": "admin or owner, ugo@limova.ai only, V0 stage only"
+  }
+ }
+}

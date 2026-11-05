@@ -43,6 +43,6 @@ describe("SAV44 original understanding and independent feedback forms", () => {
     const html = renderToStaticMarkup(createElement(DraftReview, props));
     expect(html).toContain("Passage à un humain"); expect(html).toContain("contrôle de cohérence a refusé");
     expect(html).toContain('name="reasons" value="off_topic"'); expect(html).not.toContain("Accepter cette version"); expect(html).toContain("Feedback facultatif");
-    expect(html).toContain('disabled="">Confirmer l’envoi de cette réponse'); expect(html).not.toContain('name="replyDraft"');
+    expect(html).not.toContain('Confirmer l’envoi de cette réponse'); // SAV-60: A09 retired expect(html).not.toContain('name="replyDraft"');
   });
 });

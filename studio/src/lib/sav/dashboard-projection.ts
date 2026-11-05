@@ -148,6 +148,16 @@ async function readPage(options: SavDashboardOptions) {
   }, { isolationLevel: "repeatable read", accessMode: "read only" });
 }
 
+export type SavDashboardReadOnlyResult =
+  | { pending: true }
+  | { pending: false; data: Extract<Awaited<ReturnType<typeof readPage>>, { pending: false }>["data"] };
+
+/** Reads the SQL projection in ONE repeatable-read, read-only transaction. Never repairs: `pending: true` when any row in scope is stale or
+ * missing. The cron step `dashboard_projection` stays the only writer of the cache. Same query as the first read of `listSavDossierDashboardSql`. */
+export function readSavDossierDashboardSqlReadOnly(options: SavDashboardOptions = {}): Promise<SavDashboardReadOnlyResult> {
+  return readPage(options);
+}
+
 export async function listSavDossierDashboardSql(options: SavDashboardOptions = {}) {
   const first = await readPage(options);
   if (!first.pending) return first.data;

@@ -7,7 +7,7 @@ import { activateSavV0Cutover } from "./cutover";
 import { decryptSavPayload, encryptSavPayload } from "./crypto";
 import { analyzeSavMessage } from "./intelligence";
 import { loadSavDraftContext, reviewSavDraft } from "./draft-verdicts";
-import { queueSavManualReply } from "./manual-replies";
+import { queueSavManualReplyArchived as queueSavManualReply } from "./manual-replies";
 import { getSavProposalReview, reviewSavProposal } from "./review";
 import { syncSavObservation } from "./observations";
 import type { SavStructuredProposal } from "./proposal";

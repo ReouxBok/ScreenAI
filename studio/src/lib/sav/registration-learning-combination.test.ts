@@ -10,7 +10,7 @@ import {defaultSavPlaybook} from "./playbook-contract";
 import {analyzeSavMessage} from "./intelligence";
 import {captureSavAnalysisSnapshot,ensureSavCaseObservationTx} from "./case-learning";
 import {loadSavDraftContext} from "./draft-verdicts";
-import {assertSavCurrentManualReply,confirmSavSuggestedReply} from "./manual-replies";
+import { assertSavCurrentManualReply, confirmSavSuggestedReplyArchived as confirmSavSuggestedReply } from "./manual-replies";
 import {prepareSavManualTicketPreview} from "./manual-ticket-preview";
 import {renderSavOutboundReply} from "./reply-format";
 import {syncSavObservation,prepareSavObservationLearning,getSavObservations} from "./observations";

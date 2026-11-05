@@ -9,7 +9,7 @@ const statuses: Record<string, string> = {
   human_revalidation_wait: "Choix en attente de preuves", identity_sent: "Demande d’identification envoyée", human_choice: "Choix humain attendu",
   followup_pending: "Actions confirmées, suivi en attente", followup_started: "Suivi démarré", context_changed: "Nouvelles preuves à vérifier",
   not_applicable_sensitive: "Fermeture vérifiée · apprentissage exclu", summary_finished: "Bilan terminé", qualified_other: "Autres · classement qualifié",
-  confirmed: "Actions confirmées", refused: "Poursuite arrêtée", superseded: "Version remplacée",
+  confirmed: "Actions confirmées", refused: "Poursuite arrêtée", superseded: "Version remplacée", v2_customer_return: "Retour client repris sur le dossier V2",
 };
 const reasons: Array<[RegExp, string]> = [
   [/FORWARDED_ORIGIN_UNVERIFIED/, "Mail transféré sans instruction de l’expéditeur. Identifier la demande originale et vérifier son ticket dans HubSpot."],

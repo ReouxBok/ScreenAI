@@ -18,7 +18,7 @@ import { intakeTicketDescription, intakeUnreadAttachmentNotice } from "./ticket-
 import { assertOriginalExecutionCrm, assertExecutionCrmUnchanged, IntakeCrmDeltaError, publicIntakeCrmDelta } from "./execution-context";
 import { publicCrmRecheck } from "./execution-diagnostic";
 import { crmRecheckDecision } from "./crm-recheck";
-import { crmRecheckDueSql, admitIntakeExecution, claimExecutionOrBlock, claimEffectRecovery, withEffectRecoveryLease, releaseEffectRecovery, activeExecutionEffects, adoptCurrentExecutionVersion, assertExecutionLocal, saveExecutionPayload, expandExecutionScope, getExecutionEffects, ensureExecutionEffect, markEffectDispatched, withdrawUndispatchedEffect, recordEffectAck, confirmExecutionEffect, deferExecutionEffect, endExecutionPass, identityEpisodeEffect, finishExecution, executionJournal, releaseRecoveredExecutionScope, occupationSchemaInstalled, type ExecutionLease, type ExecutionTx } from "./execution-store";
+import { crmRecheckDueSql, admitIntakeExecution, claimExecutionOrBlock, claimEffectRecovery, withEffectRecoveryLease, releaseEffectRecovery, activeExecutionEffects, adoptCurrentExecutionVersion, assertExecutionLocal, saveExecutionPayload, expandExecutionScope, getExecutionEffects, ensureExecutionEffect, markEffectDispatched, withdrawUndispatchedEffect, withdrawCreationOwner, recordEffectAck, confirmExecutionEffect, deferExecutionEffect, endExecutionPass, identityEpisodeEffect, finishExecution, executionJournal, releaseRecoveredExecutionScope, occupationSchemaInstalled, type ExecutionLease, type ExecutionTx } from "./execution-store";
 import type { Effect, EffectIntent, EffectAck, ExecutorAdapters, ExecutionOptions, ExecutionPayload, EffectKind } from "./execution-types";
 const fault = (code: string): never => { throw Error(`SAV_INTAKE_EXECUTION_${code}`); };
 const pauseCodes: ReadonlySet<string> = new Set(Object.values(SAV_AGENT_PAUSE_CODES));
@@ -113,10 +113,13 @@ async function nextIntent(lease: ExecutionLease, effects: Effect[], options: Exe
         // SAV-72: the description is the stored incoming email, not the planner summary.
         const s = await source(lease), key = `create:${messageId}`, marker = intakeRuntimeHash(key);
         const description = intakeTicketDescription({ subject: s.message.subject, text: s.body.text, unreadAttachmentNotice: intakeUnreadAttachmentNotice(plan.newTicket.description) });
+        const owner = await ownerAtCreation(lease, options);
         return {
-            kind: "ticket_create", permission: "create_ticket", key, sourceMessageId: messageId, contactId: d.target.contactId, marker, properties: savSupportTicketProperties({
-                title: plan.newTicket.title, description: `${description}\n\n[Studio intake: ${marker}]`, reviewedTitle: true, categories: plan.decision.classification === "finance" ? ["billing"] : plan.decision.classification === "cancellation" ? ["cancellation"] : undefined
-            })
+            kind: "ticket_create", permission: "create_ticket", key, sourceMessageId: messageId, contactId: d.target.contactId, marker, properties: {
+                ...savSupportTicketProperties({
+                    title: plan.newTicket.title, description: `${description}\n\n[Studio intake: ${marker}]`, reviewedTitle: true, categories: plan.decision.classification === "finance" ? ["billing"] : plan.decision.classification === "cancellation" ? ["cancellation"] : undefined
+                }), ...(owner ? { hubspot_owner_id: owner } : {})
+            }
         };
     }
     const ticketId = finalTicket(lease, effects);
@@ -170,7 +173,40 @@ async function nextIntent(lease: ExecutionLease, effects: Effect[], options: Exe
             kind: "stage_new", permission: "set_ticket_new", key: `stage-new:${messageId}:${ticketId}`, ticketId, sourceMessageId: messageId, expectedOwnerId: t?.ownerId ?? null
         };
     }
+    // No automatic V2 owner (review R1, 31/10): HubSpot's PATCH has no conditional form (no
+    // If-Match or compare-and-set on hubspot_owner_id), so a read then a write can overwrite a
+    // human who takes the ticket in between. Whatever the policy, the port or its decision, V1
+    // finishes as before and the case stays the team's until a guaranteed path is decided.
     return null;
+}
+/** Pilot access (3/11, local): the only owner V1 may set is in the creation POST itself, decided once
+ * when the intent is planned (it is then stored and hashed, so a retry sends the same body). Without the
+ * policy permission or the port, the intent is byte-identical to before. A refusal, or a decision that
+ * cannot be read, creates the ticket without owner: the team keeps it, as today. */
+async function ownerAtCreation(lease: ExecutionLease, options: ExecutionOptions): Promise<string | null> {
+    if (!options.policy.mutations.includes("create_ticket_v2_owner") || !options.adapters.v2OwnerAtCreation)
+        return null;
+    let decided: Awaited<ReturnType<NonNullable<ExecutorAdapters["v2OwnerAtCreation"]>>>;
+    try { decided = await options.adapters.v2OwnerAtCreation({ decision: lease.payload.plan.decision, signal: options.signal }); }
+    catch { return null; }
+    return decided.assign && /^[0-9]{1,20}$/.test(decided.ownerId) ? decided.ownerId : null;
+}
+/** Review F2 (3/11): the V2 owner a planned creation carries is asked again as late as possible before the marker, after
+ * the CRM reads of `preflight`, with the permission read live, pauses, configuration and admission of today. Only a planned
+ * creation with an owner is concerned; without an owner nothing is asked, so the default path is unchanged. An unreadable
+ * configuration, authority or port withdraws the owner for good (closed: the team keeps the ticket). Not atomic with the POST:
+ * what changes after this read, during the marker, the last pause check or the POST itself, is not seen (review R2). */
+async function creationOwnerStillGranted(lease: ExecutionLease, options: ExecutionOptions, intent: EffectIntent) {
+    const planned = intent.kind === "ticket_create" ? intent.properties?.hubspot_owner_id : undefined;
+    if (!planned) return true;
+    const config = intakeExecutionConfig(options.env());
+    if (!config) return false;
+    try {
+        const { policy } = await readIntakeExecutionAuthority(config);
+        if (!policy.mutations.includes("create_ticket_v2_owner")) return false;
+    }
+    catch { return false; }
+    return await ownerAtCreation(lease, options) === planned;
 }
 async function live(lease: ExecutionLease, options: ExecutionOptions, permission?: string) {
     const config = intakeExecutionConfig(options.env()), runtime = savIntakeRuntimeConfig(options.env());
@@ -194,6 +230,11 @@ async function preflight(lease: ExecutionLease, options: ExecutionOptions, inten
     const authority = await live(lease, options, intent?.permission);
     const s = await source(lease);
     if (d.kind === "ticket" && !authority.mutations.includes(d.target.operation === "create" ? "create_ticket" : "link_ticket"))
+        return fault("MUTATION_NOT_GRANTED");
+    // A creation planned with the V2 owner (the STORED intent once the effect exists: `nextIntent` returns it) is sent only
+    // while the policy still grants it. In practice any policy change first fails the policy-hash binding (`DISABLED` in
+    // `live`); this check is the second guard, for an authority that would keep its hash.
+    if (intent?.kind === "ticket_create" && intent.properties?.hubspot_owner_id && !authority.mutations.includes("create_ticket_v2_owner"))
         return fault("MUTATION_NOT_GRANTED");
     const snapshot = await options.adapters.readCrm(lease.payload.plan, lease.payload.input, options.runtime, options.signal);
     await expandExecutionScope(lease, options.adapters.scope(snapshot, lease.row.threadId, finalTicket(lease, await getExecutionEffects(lease.row.id))));
@@ -231,18 +272,43 @@ async function preflight(lease: ExecutionLease, options: ExecutionOptions, inten
         return fault("MUTATION_NOT_GRANTED");
     return finalAuthority;
 }
+/** What differs between the executions this one protocol drives. The default is the V1 intake execution, unchanged; SAV-10 passes the case-effect
+ * driver (`cases/case-effect-driver.ts`) for `reply_send` / `case_note`. The marker-before-send, no-resend and read-only verification below are shared. */
+export type PassDriver = {
+    claim(executionId: string): ReturnType<typeof claimExecutionOrBlock>;
+    adopt(lease: ExecutionLease, options: ExecutionOptions): Promise<unknown>;
+    nextIntent(lease: ExecutionLease, effects: Effect[], options: ExecutionOptions): Promise<EffectIntent | null>;
+    preflight(lease: ExecutionLease, options: ExecutionOptions, intent?: EffectIntent): Promise<unknown>;
+    live(lease: ExecutionLease, options: ExecutionOptions, permission?: string): Promise<unknown>;
+    finish(lease: ExecutionLease, effects: Effect[]): Promise<void>;
+    end(lease: ExecutionLease, state: "waiting" | "uncertain", reason: string, crm?: Parameters<typeof endExecutionPass>[3]): Promise<void>;
+    /** OPTIONAL. A driver that provides it settles a read-only verification itself: the provider read has finished (outside any transaction) and this call
+     * re-checks the lease and the exact effect that was read, then confirms or defers in ONE transaction. `stale` = the lease or the effect moved while the
+     * provider answered: nothing was written and the result is discarded. Without it (V1 intake, supervised case driver) the protocol below is unchanged. */
+    applyVerification?(lease: ExecutionLease, observed: Effect, outcome: VerificationOutcome): Promise<VerificationSettlement>;
+    /** OPTIONAL. Defers (one more read, schedule +60 s) an effect after an error thrown PAST its marker. A driver that provides it settles the deferral itself, under its
+     * lease and only for the attempt this pass marked (`seen`): a pass that lost its lease, or whose effect is on a later attempt, consumes nothing. Without it (V1 intake,
+     * the verification-only driver) the protocol below is unchanged. */
+    deferEffect?(lease: ExecutionLease, seen: Effect, reason: string): Promise<void>;
+};
+export type VerificationOutcome = { proof: Awaited<ReturnType<ExecutorAdapters["verify"]>> } | { error: string };
+export type VerificationSettlement = "confirmed" | "deferred" | "stale";
+const intakePassDriver: PassDriver = {
+    claim: claimExecutionOrBlock, adopt: adoptCurrentExecutionVersion, nextIntent, preflight, live,
+    finish: (lease, effects) => finishExecution(lease, finalTicket(lease, effects)), end: endExecutionPass,
+};
 export async function executeIntakePass(executionId: string, options: ExecutionOptions, hooks: {
     beforeMarker?: (effect: Effect) => Promise<void>;
     afterMarker?: (effect: Effect) => Promise<void>;
     afterAck?: (effect: Effect) => Promise<void>;
-} = {}) {
+} = {}, driver: PassDriver = intakePassDriver) {
     // Any agent pause: no lease, no state change; the execution resumes as it was left.
     const paused = savAgentPauseCode(await readSavAgentPause(requireDb()));
     if (paused)
         return {
             skipped: paused
         };
-    const claim = await claimExecutionOrBlock(executionId);
+    const claim = await driver.claim(executionId);
     if ("blocked" in claim)
         return {
             skipped: claim.blocked
@@ -250,29 +316,35 @@ export async function executeIntakePass(executionId: string, options: ExecutionO
     const lease = claim.lease;
     let current: Effect | undefined;
     try {
-        await adoptCurrentExecutionVersion(lease, options);
+        await driver.adopt(lease, options);
         for (let n = 0; n < 8; n++) {
-            const effects = await getExecutionEffects(executionId), intent = await nextIntent(lease, effects, options);
+            const effects = await getExecutionEffects(executionId), intent = await driver.nextIntent(lease, effects, options);
             if (!intent) {
-                await preflight(lease, options);
-                await finishExecution(lease, finalTicket(lease, effects));
+                await driver.preflight(lease, options);
+                await driver.finish(lease, effects);
                 return {
                     state: "confirmed", executionId
                 };
             }
             current = effects.find(e => e.businessKey === intent.key);
             if (!current) {
-                await preflight(lease, options, intent);
+                await driver.preflight(lease, options, intent);
                 current = intent.kind === "identity_send" ? await identityEpisodeEffect(lease, intent) : await ensureExecutionEffect(lease, intent);
             }
             if (current.state === "planned") {
                 await hooks.beforeMarker?.(current);
-                await preflight(lease, options, intent);
+                // Review F1: the checks read the STORED creation, the body that will be sent.
+                await driver.preflight(lease, options, current.kind === "ticket_create" ? effectIntent(current) : intent);
+                // Review F2/R2: after the CRM reads of preflight, a V2 owner no longer granted (permission, pause, configuration,
+                // admission) leaves the planned creation without owner (a subset of the body just checked), so the team keeps
+                // the ticket. Nothing was sent yet; no ticket exists to write on. Only local reads follow until the POST.
+                if (current.kind === "ticket_create" && !await creationOwnerStillGranted(lease, options, effectIntent(current)))
+                    current = await withdrawCreationOwner(lease, current, "SAV_INTAKE_EXECUTION_V2_OWNER_WITHDRAWN");
                 current = await markEffectDispatched(lease, current);
                 await hooks.afterMarker?.(current);
                 // Last pause check before the provider call. A pause seen here proves nothing
                 // left: the action returns to planned. Past this line an admitted action finishes.
-                try { await live(lease, options, intent.permission); }
+                try { await driver.live(lease, options, intent.permission); }
                 catch (error) {
                     if (pauseCodes.has(code(error)) && await withdrawUndispatchedEffect(lease, current, code(error))) current = undefined;
                     throw error;
@@ -285,24 +357,47 @@ export async function executeIntakePass(executionId: string, options: ExecutionO
             // No dispatch from acked/dispatched/uncertain. Verification remains read only
             // even if authority/pause/version changed while a provider response arrived.
             if (current.reconcileAttempts >= 5 || current.nextReconcileAt && current.nextReconcileAt > new Date()) {
-                await endExecutionPass(lease, "uncertain", "SAV_INTAKE_EXECUTION_RECONCILIATION_WAITING");
+                await driver.end(lease, "uncertain", "SAV_INTAKE_EXECUTION_RECONCILIATION_WAITING");
                 return {
                     state: "uncertain", executionId
                 };
             }
+            if (driver.applyVerification) {
+                // Disarm the generic catch below BEFORE any await: from here the driver owns every write about this effect, under its lease. A provider error is an
+                // outcome (one deferred read), never an unfenced defer; an error of the settlement itself rolled back, so nothing is deferred twice.
+                const observed = current;
+                current = undefined;
+                let outcome: VerificationOutcome;
+                try { outcome = { proof: await options.adapters.verify(effectIntent(observed), ack(observed), observed.dispatchedAt!, AbortSignal.timeout(15000)) }; }
+                catch { outcome = { error: "SAV_INTAKE_EXECUTION_RECONCILIATION_UNAVAILABLE" }; }
+                const settled = await driver.applyVerification(lease, observed, outcome);
+                if (settled === "stale")
+                    return {
+                        skipped: "SAV_INTAKE_EXECUTION_VERIFICATION_STALE", executionId
+                    };
+                if (settled === "deferred") {
+                    const reason = "error" in outcome ? outcome.error : "SAV_INTAKE_EXECUTION_RECONCILIATION_REQUIRED";
+                    await driver.end(lease, "uncertain", reason);
+                    return {
+                        state: "uncertain", executionId
+                    };
+                }
+                await driver.live(lease, options);
+                continue;
+            }
             const proof = await options.adapters.verify(effectIntent(current), ack(current), current.dispatchedAt!, AbortSignal.timeout(15000));
             if (!proof.confirmed || !proof.attributed) {
                 await deferExecutionEffect(current, "SAV_INTAKE_EXECUTION_RECONCILIATION_REQUIRED");
-                await endExecutionPass(lease, "uncertain", "SAV_INTAKE_EXECUTION_RECONCILIATION_REQUIRED");
+                await driver.end(lease, "uncertain", "SAV_INTAKE_EXECUTION_RECONCILIATION_REQUIRED");
                 return {
                     state: "uncertain", executionId
                 };
             }
             await confirmExecutionEffect(current, proof, proof.ack);
             current = undefined;
-            await live(lease, options);
+            await driver.live(lease, options);
         }
-        await endExecutionPass(lease, "waiting", "SAV_INTAKE_EXECUTION_PASS_LIMIT");
+        await driver.end(lease, "waiting", "SAV_INTAKE_EXECUTION_PASS_LIMIT");
         return {
             state: "waiting", executionId
         };
@@ -312,12 +407,14 @@ export async function executeIntakePass(executionId: string, options: ExecutionO
         if(delta){lease.payload.crmDelta=delta;await saveExecutionPayload(lease);}
         if (current && current.state !== "planned") {
             const [row] = (await getExecutionEffects(executionId)).filter(e => e.id === current!.id);
-            if (row?.state !== "confirmed")
-                await deferExecutionEffect(row ?? current, reason);
+            if (row?.state !== "confirmed") {
+                if (driver.deferEffect) await driver.deferEffect(lease, current, reason);
+                else await deferExecutionEffect(row ?? current, reason);
+            }
         }
         const uncertain = (await getExecutionEffects(executionId)).some(e => ["dispatched", "acked", "uncertain"].includes(e.state));
         // CRM waits follow a durable, bounded schedule; a real change goes to a person.
-        await endExecutionPass(lease, uncertain ? "uncertain" : "waiting", reason, uncertain ? undefined : crmRecheckDecision(reason, delta) ?? undefined);
+        await driver.end(lease, uncertain ? "uncertain" : "waiting", reason, uncertain ? undefined : crmRecheckDecision(reason, delta) ?? undefined);
         return {
             state: uncertain ? "uncertain" : "waiting", reason, executionId
         };

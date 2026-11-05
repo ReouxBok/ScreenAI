@@ -13,7 +13,7 @@ export const executionPolicySchema = z.object({
     revision: z.literal("sav-intake-execution-2026-10-21.v1"), mailboxId: z.uuid(), codeRevision: z.string().regex(/^[a-f0-9]{40}$/),
     enginePolicyHash: z.string().regex(/^[a-f0-9]{64}$/), resourcesHash: z.string().regex(/^[a-f0-9]{64}$/),
     receivedAfter: z.iso.datetime(), createdAfter: z.iso.datetime(), expiresAt: z.iso.datetime(), budgetProfile:z.literal(SAV_INTAKE_OPERATIONAL_PROFILE).optional(), maxDossiers: z.number().int().min(1).max(100),
-    mutations: z.array(savIntakeMutationSchema).min(1).max(6).refine(a => new Set(a).size === a.length),
+    mutations: z.array(savIntakeMutationSchema).min(1).max(9).refine(a => new Set(a).size === a.length),
     admission: z.discriminatedUnion("kind", [z.object({
             kind: z.literal("automatic")
         }).strict(), z.object({

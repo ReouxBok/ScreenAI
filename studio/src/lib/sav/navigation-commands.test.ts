@@ -11,7 +11,7 @@ vi.mock("workflow/api", () => ({ start: state.start }));
 vi.mock("@/workflows/sav-commands", () => ({ executeSavEmailOpeningWorkflow: vi.fn(), refreshSavContextWorkflow: vi.fn(), executeSavTicketCommandWorkflow: vi.fn() }));
 import { GET } from "../../app/api/internal/sav/dossiers/[id]/status/route";
 import { executeSavEmailOpening, requestSavEmailOpening } from "./email-opening-command";
-import { dispatchPendingSavEmailOpenings, dispatchSavEmailOpening, enqueueSavContextRefresh, processPendingSavContextRefreshes } from "./dispatch";
+import { dispatchPendingSavEmailOpenings, dispatchSavEmailOpening, enqueueSavContextRefreshArchived as enqueueSavContextRefresh, processPendingSavContextRefreshesArchived as processPendingSavContextRefreshes } from "./dispatch";
 let fixture: Awaited<ReturnType<typeof createSavTestDb>>;
 let input: { threadId: string; messageId: string };
 const actor = "ugo@limova.ai";
@@ -22,7 +22,8 @@ beforeEach(async () => {
   vi.stubEnv("SAV_RELEASE_STAGE", "v0"); vi.stubEnv("SAV_PILOT_MODE", "false");
   state.opened.mockReset(); state.start.mockReset(); state.auth.mockReset(); state.auth.mockResolvedValue({ email: actor, role: "admin" });
   state.opened.mockImplementation(async (_input, _actor, command) => { await command.beforeModify(); return { notice: "filed" }; });
-  await fixture.client.exec("TRUNCATE sav.mailboxes CASCADE; TRUNCATE sav.sync_state; TRUNCATE audit_logs");
+  // sav-v0-cutover is the only sync_state key this file writes; the migrator's schema markers are not this file's to remove.
+  await fixture.client.exec("TRUNCATE sav.mailboxes CASCADE; DELETE FROM sav.sync_state WHERE key = 'sav-v0-cutover'; TRUNCATE audit_logs");
   const [mailbox] = await fixture.db.insert(savMailboxes).values({ email: "contact@limova.ai" }).returning();
   await activateSavV0Cutover({ receivedAfter: "2026-10-02T12:00:00Z", mailboxEmail: mailbox.email, intakeRecipient: "contact@limova.ai", deploymentSha: "a".repeat(40), activatedBy: actor });
   const [thread] = await fixture.db.insert(savThreads).values({ mailboxId: mailbox.id, gmailThreadId: "fixture-navigation", customerEmail: "fixture@example.invalid" }).returning();

@@ -1,0 +1,167 @@
+{
+  "schema": "sav-pilot-passage.syn.v1",
+  "simulated": true,
+  "atomicOwnerCompare": "not_proven",
+  "ids": "invented",
+  "sourcesAndScope": "invented_fixture_no_real_sheet_approved_by_nobody",
+  "model": "synthetic_port_no_paid_call",
+  "rows": [
+    {
+      "ref": "SYN-P1",
+      "label": "Connexion, compte existant, nouveau ticket",
+      "passage": {
+        "state": "agent_ready",
+        "situation": "agent",
+        "v2Work": true,
+        "ownerWrite": false,
+        "atomicOwnerCompare": "not_proven",
+        "caseOwner": "agent",
+        "crmReading": "v2",
+        "admission": {
+          "target": "agent",
+          "reasons": [
+            "admitted"
+          ]
+        }
+      },
+      "decision": {
+        "status": "accepted",
+        "contract": "sav-case-decision-2026-10-27.v1",
+        "decidedOn": 5,
+        "scope": {
+          "revision": "scope-syn-r1",
+          "policyRevision": "policy-syn-access-r1"
+        }
+      },
+      "sourcesStatus": "proven_from_decision",
+      "sources": [
+        {
+          "knowledgeId": "k-syn-login",
+          "contentVersionId": "k-syn-login-v1",
+          "permission": "answer",
+          "title": "Fiche k-syn-login (synthétique)",
+          "content": "Procédure synthétique.",
+          "verifiedAt": "2026-10-25T09:00:00.000Z",
+          "verification": "fresh",
+          "evaluatedAt": "2026-11-04T07:00:00.000Z"
+        }
+      ],
+      "draft": {
+        "status": "awaiting_validation",
+        "validatable": true,
+        "purpose": "answer",
+        "subject": "Accès à la plateforme",
+        "text": "Bonjour, voici la marche à suivre depuis https://new.limova.ai : suivre la fiche.\n\nPour nous aider à vous répondre, précisez ce que vous essayiez de faire, ce qui s’est affiché et ce que vous avez déjà essayé.\n\nL’équipe Limova\nCette réponse a été rédigée avec l’aide de notre agent IA. L’IA peut se tromper. Si quelque chose ne fonctionne pas ou si vous avez une question, n’hésitez pas à répondre à ce message."
+      },
+      "counters": {
+        "modelCalls": 1,
+        "ticketPosts": 1,
+        "ownerWrites": 0,
+        "mailsSent": 0
+      }
+    },
+    {
+      "ref": "SYN-P2",
+      "label": "Ticket tenu par une personne",
+      "passage": {
+        "state": "team_person",
+        "situation": "human_owner",
+        "v2Work": false,
+        "ownerWrite": false,
+        "atomicOwnerCompare": "not_proven",
+        "caseOwner": "human",
+        "crmReading": "human",
+        "admission": {
+          "target": "agent",
+          "reasons": [
+            "admitted"
+          ]
+        }
+      },
+      "decision": null,
+      "sourcesStatus": "no_search_case_with_team",
+      "sources": [],
+      "draft": null,
+      "counters": {
+        "modelCalls": 0,
+        "ticketPosts": 0,
+        "ownerWrites": 0,
+        "mailsSent": 0
+      },
+      "refusedDraftCode": "owner_human"
+    },
+    {
+      "ref": "SYN-P3",
+      "label": "Mixte : connexion et facturation",
+      "passage": {
+        "state": "team_out_of_scope",
+        "situation": "excluded_sensitive",
+        "v2Work": false,
+        "ownerWrite": false,
+        "atomicOwnerCompare": "not_proven",
+        "caseOwner": "human",
+        "crmReading": "none",
+        "admission": {
+          "target": "team",
+          "reasons": [
+            "sensitive_family",
+            "mixed_sensitive"
+          ]
+        }
+      },
+      "decision": null,
+      "sourcesStatus": "no_search_case_with_team",
+      "sources": [],
+      "draft": null,
+      "counters": {
+        "modelCalls": 0,
+        "ticketPosts": 1,
+        "ownerWrites": 0,
+        "mailsSent": 0
+      }
+    },
+    {
+      "ref": "SYN-R2",
+      "label": "Prise humaine entre la lecture du relais et son enregistrement",
+      "passage": {
+        "state": "team_person",
+        "atomicOwnerCompare": "not_proven"
+      },
+      "counters": {
+        "modelCalls": 0,
+        "ticketPosts": 1,
+        "ownerWrites": 0,
+        "mailsSent": 0
+      }
+    },
+    {
+      "ref": "SYN-R3",
+      "label": "Prise humaine après validation, avant le dernier contrôle",
+      "passage": {
+        "state": "person_took_after_verification",
+        "atomicOwnerCompare": "not_proven"
+      },
+      "counters": {
+        "modelCalls": 1,
+        "ticketPosts": 1,
+        "ownerWrites": 0,
+        "mailsSent": 0
+      }
+    },
+    {
+      "ref": "SYN-R4",
+      "label": "Fenêtre résiduelle : prise humaine pendant l'envoi",
+      "passage": {
+        "state": "person_took_after_verification",
+        "atomicOwnerCompare": "not_proven"
+      },
+      "residualWindow": true,
+      "counters": {
+        "modelCalls": 1,
+        "ticketPosts": 1,
+        "ownerWrites": 0,
+        "mailsSent": 1
+      }
+    }
+  ]
+}

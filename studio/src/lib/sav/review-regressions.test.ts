@@ -9,7 +9,7 @@ import {reconcileSavManualTicket} from "./hubspot";
 import { encryptSavPayload, savContentHash } from "./crypto";
 import { loadSavDraftContext, reviewSavDraft } from "./draft-verdicts";
 import { getSavProposalReview, reviewSavProposal } from "./review";
-import { queueSavManualTicket } from "./manual-tickets";
+import { queueSavManualTicketArchived as queueSavManualTicket } from "./manual-tickets";
 import {approveLearningCandidate} from "./learning";
 import { getSavObservations, syncSavObservation, qualifySavObservation } from "./observations";
 import { type ObservationSnapshot, type ObservationEvent } from "./observation-source";
