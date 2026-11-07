@@ -195,7 +195,7 @@ test("une démonstration extension devient un parcours Charly éditable",async({
     await page.goto("/studio/entrainements");
     await page.getByLabel("Nom du parcours").fill("Créer une campagne sociale E2E");
     await page.getByLabel("Ce que Charly doit apprendre").fill("Guider le membre jusqu’à son premier brouillon de campagne.");
-    await page.getByLabel("Agent").selectOption("charly");
+    await page.getByLabel("Agent", { exact: true }).selectOption("charly");
     await page.getByLabel("Page de départ").fill("/super-powers");
     await page.getByRole("button",{name:"Créer la démonstration"}).click();
 
@@ -421,7 +421,7 @@ test("un membre crée, finalise et transforme son tutoriel sans accéder à celu
     await memberPage.goto("/studio/entrainements");
     await memberPage.getByLabel("Nom du parcours").fill(title);
     await memberPage.getByLabel("Ce que Charly doit apprendre").fill("Vérifier tout le parcours de création d’un tutoriel membre.");
-    await memberPage.getByLabel("Agent").selectOption("charly");
+    await memberPage.getByLabel("Agent", { exact: true }).selectOption("charly");
     await memberPage.getByLabel("Page de départ").fill("/super-powers");
     await memberPage.getByRole("button", { name: "Créer la démonstration" }).click();
     await memberPage.waitForURL(/\/studio\/entrainements\/[0-9a-f-]+\?token=/);
@@ -492,7 +492,7 @@ test("dix membres créent et enregistrent leurs tutoriels en parallèle", async 
     await Promise.all(pages.map(async (page, index) => {
       await page.getByLabel("Nom du parcours").fill(`Tutoriel parallèle ${index + 1}`);
       await page.getByLabel("Ce que Charly doit apprendre").fill(`Valider le parcours simultané ${index + 1}.`);
-      await page.getByLabel("Agent").selectOption("charly");
+      await page.getByLabel("Agent", { exact: true }).selectOption("charly");
       await page.getByLabel("Page de départ").fill(`/parallel-${index + 1}`);
     }));
     await Promise.all(pages.map((page) => page.getByRole("button", { name: "Créer la démonstration" }).click()));
