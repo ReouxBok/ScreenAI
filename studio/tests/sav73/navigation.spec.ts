@@ -26,26 +26,33 @@ test("search, sort, pagination and browser history navigate without a document r
   await expect(page.getByLabel("Rechercher un dossier")).toHaveValue("Pagination synthétique");
   expect(await page.evaluate(()=>(window as unknown as {sav73Document:string}).sav73Document)).toBe("same-document");
 });
-test("explicit opening renders the dossier before delayed command confirmation and keeps its viewport",async({page})=>{
-  let release!:()=>void;
-  const confirmation=new Promise<void>(resolve=>{release=resolve;});
-  await page.route("**/status?filingId=*",async route=>{
-    await confirmation;
-    await route.fulfill({json:{filing:{state:"completed",notice:"SAV_GMAIL_FILING_DISABLED"}}});
-  });
+// SAV-60 (decided by Ugo): the V0 list opens a dossier as a plain link. Opening records nothing (no Gmail filing command, no
+// "Ouverture enregistrée", no POST) and the dossier announces the retired circuit with its read-only archive.
+test("explicit opening is a plain link: the dossier renders, records nothing and points to its archive",async({page})=>{
+  const posts:string[]=[], filingPolls:string[]=[];
+  page.on("request",request=>{ if(request.method()!=="GET") posts.push(`${request.method()} ${new URL(request.url()).pathname}`); if(/[?&]filingId=/.test(request.url())) filingPolls.push(request.url()); });
   await page.goto("/studio/sav?q=Échec+export+PDF+fictif");
+  const row=page.locator(`#dossier-${SAV53_THREADS.singleQuoted}`);
+  await expect(row.getByRole("button")).toHaveCount(0);
   const openedAt = Date.now();
-  await page.locator(`#dossier-${SAV53_THREADS.singleQuoted}`).getByRole("button").click();
-  await expect(page).toHaveURL(/filing=pending&filingId=/);
-  await expect(page.getByRole("status").filter({hasText:"Ouverture enregistrée"})).toBeVisible();
+  // The row itself is the link (no button, no server action behind it).
+  await expect(row).toHaveAttribute("aria-label",/^Ouvrir le dossier : /);
+  await expect(row).toHaveAttribute("href",new RegExp(`^/studio/sav/${SAV53_THREADS.singleQuoted}\\?returnTo=`));
+  await row.click();
+  await expect(page).toHaveURL(new RegExp(`/studio/sav/${SAV53_THREADS.singleQuoted}(?:[?#]|$)`));
+  await expect(page).not.toHaveURL(/filing=|filingId=|context=|refreshId=/);
+  const notice=page.getByRole("status").filter({hasText:"Ancien circuit retiré."});
+  await expect(notice).toBeVisible();
+  await expect(notice.getByRole("link",{name:"l’archive",exact:true})).toHaveAttribute("href",`/studio/sav/archives/${SAV53_THREADS.singleQuoted}`);
+  await expect(page.getByRole("status").filter({hasText:"Ouverture enregistrée"})).toHaveCount(0);
   await expect(page.getByRole("button",{name:"Valider le dossier",exact:true})).toBeAttached();
-  await test.info().attach("opening-timing", { body: JSON.stringify({ clickToDossierMs: Date.now()-openedAt, mode:"local-development-auth-bypass", confirmationStillPending:true }), contentType:"application/json" });
+  await test.info().attach("opening-timing", { body: JSON.stringify({ clickToDossierMs: Date.now()-openedAt, mode:"local-development-auth-bypass", openingRecorded:false }), contentType:"application/json" });
   await page.evaluate(()=>window.scrollTo(0,600));
   const before=await page.evaluate(()=>window.scrollY);
-  release();
-  await expect(page).toHaveURL(/filing=SAV_GMAIL_FILING_DISABLED/);
+  await page.waitForLoadState("networkidle");
   await expect.poll(async()=>Math.abs(await page.evaluate(()=>window.scrollY)-before)).toBeLessThan(4);
-  await page.screenshot({ path:test.info().outputPath("dossier-confirmed.png") });
+  expect(posts).toEqual([]); expect(filingPolls).toEqual([]);
+  await page.screenshot({ path:test.info().outputPath("dossier-opened.png") });
 });
 test("dossier transition immediately exposes a loading state while server data is delayed",async({page})=>{
   await page.goto(`/studio/sav/${SAV53_THREADS.singleQuoted}?returnTo=${encodeURIComponent("/studio/sav?view=to_process&q=loading")}`);

@@ -68,8 +68,13 @@ test("same-dossier actions preserve reading position, including repeated redirec
   await expect(page.getByRole("region", { name: "Journal du suivi", exact: true })).toContainText("Fil Gmail suivi");
   await page.getByRole("link", { name: "← Retour aux dossiers", exact: true }).click();
   await expect(page).toHaveURL(/view=learning&q=.*sort=oldest/);
-  await expect(page.getByLabel("Rechercher un dossier")).toHaveValue("Échec export PDF fictif");
-  await expect(page.locator(`#dossier-${SAV53_THREADS.singlePlain}`)).toBeVisible();
+  // SAV-60 / UX-Q6 option A: the list is read-only. The actions above changed this dossier, so its projection row is stale and the
+  // list answers "pending" until the cron step refreshes it; the GET never repairs it and never shows a partial list as complete.
+  // The return keeps view, search and sort in the URL (above); the restored search box is covered on a current projection by
+  // the navigation spec. No cron runs in this local bench.
+  await expect(page.getByRole("heading", { name: "Actualisation des dossiers", exact: true })).toBeVisible();
+  await expect(page.getByRole("status").filter({ hasText: "La liste se met à jour." })).toBeVisible();
+  await expect(page.locator(`#dossier-${SAV53_THREADS.singlePlain}`)).toHaveCount(0);
 });
 
 test("intentional section links and a different dossier keep normal navigation", async ({ page }) => {
