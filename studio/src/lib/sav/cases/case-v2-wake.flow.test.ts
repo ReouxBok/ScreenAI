@@ -740,3 +740,65 @@ describe("the sweeps do not starve case 51, stop between cases on the deadline a
     expect((await replyRows(made.caseId))[0]!.state).toBe("confirmed");
   });
 });
+
+// Review F3/F4 (7/11) on the real wiring: the stored return mail -> the return route -> its re-qualification by the content rule -> B's runner -> the wake. The model is a
+// counted double: a return that is not purely the login trouble must never reach it, and nothing may be sent or closed for it.
+describe("review F3/F4: a return is read whole, signature included, before the agent may act on it", () => {
+  async function returned(gmail: string, text: string) {
+    const made = await queuedAnswer(gmail);
+    await wake();
+    const trial = (await readCase(made.caseId))!.body.trials[0]!;
+    await routeLaterMail(made, `${gmail}-return`, text);
+    return { ...made, trial, mail: `${gmail}-return` };
+  }
+  const counted = (answers: Answer[]) => {
+    const seen = { calls: 0 };
+    return { seen, answers: answers.map(model => (request: CaseInvestigationModelRequest) => { seen.calls += 1; return model(request); }) };
+  };
+
+  it.each([
+    ["f15", "Toujours pas de code. Je veux qu’on me rende mon argent."],
+    ["f06", "Toujours pas de code, pourtant on paie chaque mois."],
+    ["f08", "Toujours pas de code. Combien coûte l’offre au-dessus ?"],
+    ["m06", "Je n’arrive pas à me connecter. Ah et aussi, je veux le RIB de Limova."],
+    ["sommes", "Toujours rien, et j’aimerais récupérer les sommes versées.\n\nCordialement,\nCamille Synthétique"],
+    ["contradiction", "Ça marche maintenant. Ah non, ça replante."],
+    ["after-signature", "Merci, ça remarche !\n\nCamille Synthétique\nPar contre l’export de mes fichiers est bloqué."],
+  ])("F3 %s: not reduced to access: zero model call, no second mail, nothing closed", async (id, text) => {
+    const made = await returned(`gm-f3-${id}`, text);
+    const sentBefore = sends;
+    const model = counted([answer, ask, confirmResolution(made.mail, made.trial.id, "ça remarche"), resolvedVerdict]);
+    const report = await investigate(made.caseId, model.answers);
+    expect(model.seen.calls).toBe(0);
+    expect(report).not.toMatchObject({ status: "recorded" });
+    for (let n = 0; n < 2; n++) await wake();
+    expect(sends).toBe(sentBefore);
+    expect((await readCase(made.caseId))!.phase).not.toBe("resolved");
+    expect((await stageRows(made.caseId)).filter(row => row.replyKey.includes(":closed:"))).toEqual([]);
+  });
+
+  it.each([
+    ["chrome", "Toujours pas de code, j’ai pourtant essayé sur Chrome et sur Firefox.\n\nCordialement,\nCamille Synthétique"],
+    ["help", "Je n’arrive toujours pas à me connecter. Pouvez-vous m’aider ?\n\nCamille"],
+    ["signed-failure", "Merci, mais ça ne fonctionne toujours pas.\n\nCordialement,\nCamille Synthétique\nGérante – Boutique Synthétique"],
+  ])("witness %s: a real access return, signed, still reaches the agent", async (id, text) => {
+    const made = await returned(`gm-f3-ok-${id}`, text);
+    const model = counted([ask]);
+    await investigate(made.caseId, model.answers);
+    expect(model.seen.calls).toBe(1);
+  });
+
+  it("F4: « merci, ça remarche » with a full signature closes the case once, on the customer's words, and sends nothing", async () => {
+    const signed = "Merci, ça remarche !\n\nCordialement,\nCamille Synthétique\nGérante – Boutique Synthétique\n01 23 45 67 89";
+    const made = await returned("gm-f4-signed", signed);
+    const sentBefore = sends;
+    const report = await investigate(made.caseId, [confirmResolution(made.mail, made.trial.id, "ça remarche"), resolvedVerdict]);
+    expect(report).toMatchObject({ status: "recorded", outcome: "accepted", closure: "soft_close" });
+    expect((await wake()).closures).toMatchObject({ resolved: 1 });
+    await wake();
+    expect(await readCase(made.caseId)).toMatchObject({ phase: "resolved", body: { cycle: { endedBy: "resolved" } } });
+    expect((await readCase(made.caseId))!.body.trials).toMatchObject([{ id: made.trial.id, outcome: "succeeded", result: { source: { type: "email", id: made.mail } } }]);
+    expect((await stageRows(made.caseId)).filter(row => row.replyKey.includes(":closed:"))).toHaveLength(1);
+    expect(sends).toBe(sentBefore);
+  });
+});
