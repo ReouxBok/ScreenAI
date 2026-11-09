@@ -294,10 +294,11 @@ async function everyPass(made: { caseId: string; gmail: string; threadId: string
 }
 async function expectNoAutomatedAnswer(made: { caseId: string; gmail: string; threadId: string; ticketId: string }, env: Record<string, string | undefined>, net = network()) {
   const result = await everyPass(made, env, net);
-  expect(result.statuses).not.toContain("queued");
-  expect(await approvedValidations(made.caseId)).toEqual([]);
-  expect(await effectRows(made.caseId)).toEqual([]);
-  expect(result.sends).toBe(0);
+  // Soft: a failure reports every exit that leaked (queue, approval, effect, send), not only the first one.
+  expect.soft(result.statuses).not.toContain("queued");
+  expect.soft(await approvedValidations(made.caseId)).toEqual([]);
+  expect.soft(await effectRows(made.caseId)).toEqual([]);
+  expect.soft(result.sends).toBe(0);
   return result;
 }
 
