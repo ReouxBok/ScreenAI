@@ -147,7 +147,7 @@ describe("independent commercial delivery authority",()=>{
   await fixture.db.update(savActions).set({status:"running",attemptCount:1}).where(eq(savActions.id,a.actionId));
   const [reserved,rotated]=await Promise.allSettled([reserveCommercialForwardDispatch(a.actionId,old.revision,old.contentHash),commitCommercialDeliveryAuthority(p.commandId,p.hash)]);
   expect(rotated.status).toBe("fulfilled");const [saved]=await fixture.db.select().from(savActions).where(eq(savActions.id,a.actionId));
-  if(reserved.status==="fulfilled"){expect(saved.payload.forwardDispatchedAt).toBeTruthy();expect(saved.payload.commercialAuthorityRevision).toBe(old.revision);if(rotated.status==="fulfilled")expect(rotated.value.dispatched?.some(x=>x.id===a.actionId)).toBe(true);}else{expect(saved.payload.forwardDispatchedAt).toBeUndefined();}
+  if(reserved.status==="fulfilled"){expect(saved.payload.forwardDispatchedAt).toBeTruthy();expect(saved.payload.commercialAuthorityRevision).toBe(old.revision);if(rotated.status==="fulfilled"){expect("dispatched" in rotated.value).toBe(true);if("dispatched" in rotated.value)expect(rotated.value.dispatched.some(x=>x.id===a.actionId)).toBe(true);}}else{expect(saved.payload.forwardDispatchedAt).toBeUndefined();}
   expect(posts()).toHaveLength(0);
  });
  it("does not send a successfully forwarded message again after rotation",async()=>{
@@ -165,7 +165,7 @@ describe("independent commercial delivery authority",()=>{
  });
 
  it("labels bounded dispatch history and prioritizes uncertain actions deterministically",async()=>{
-  const values=Array.from({length:102},(_,i)=>({threadId,messageId,kind:"send_reply",status:i===0?"failed":"succeeded",actorType:"human",idempotencyKey:`synthetic-history-${i}`,updatedAt:new Date(i===0?0:Date.now()),payload:{purpose:"intake_commercial_forward",forwardDispatchedAt:new Date().toISOString()}}));
+  const values:Array<typeof savActions.$inferInsert>=Array.from({length:102},(_,i)=>({threadId,messageId,kind:"send_reply",status:i===0?"failed":"succeeded",actorType:"human",idempotencyKey:`synthetic-history-${i}`,updatedAt:new Date(i===0?0:Date.now()),payload:{purpose:"intake_commercial_forward",forwardDispatchedAt:new Date().toISOString()}}));
   const inserted=await fixture.db.insert(savActions).values(values).returning();const first=await getCommercialDeliveryAuthority(),second=await getCommercialDeliveryAuthority();
   expect(first).toMatchObject({dispatchedLimit:100,dispatchedTruncated:true,dispatchedIncludesConfirmed:true});expect(first.dispatched).toHaveLength(100);expect(first.dispatched[0]).toMatchObject({id:inserted[0].id,status:"failed"});expect(second.dispatched).toEqual(first.dispatched);expect(posts()).toHaveLength(0);
  });
