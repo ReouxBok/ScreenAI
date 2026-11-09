@@ -1,3 +1,4 @@
+import {previewCommercialDeliveryAuthority,commitCommercialDeliveryAuthority,commercialDeliverySettingsSchema} from "./commercial-delivery-authority";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { eq } from "drizzle-orm";
 import { createSavTestDb } from "../../../../test/sav-db";
@@ -7,16 +8,15 @@ import { activateSavV0Cutover } from "../cutover";
 import { type SavIntakeDecision, SAV_INTAKE_CONTRACT_REVISION } from "./contract";
 import { prepareSavCommercialForward, queueSavCommercialForward } from "./commercial-forward";
 import { savAgentPauseKey, SAV_AGENT_PAUSE_REVISION } from "./agent-pause";
-import { commercialForwardResourceSchema } from "./commercial-forward-contract";
 import { retrySavAction } from "../service";
 import { processPendingGmailSendActions } from "../gmail";
 type ResourceRef = {resourceId:string;revisionId:string;sha256:string};
 type ObservationFixture = {id:string;messageId:string;fresh:boolean;sourceMatches:boolean;currentSourceHash:string;leaseToken:string|null;leaseUntil:Date|null;payload:{plan:{supervisedResource:ResourceRef;decision:SavIntakeDecision}}};
-const state = vi.hoisted(() => ({ db: null as unknown, current: {} as ObservationFixture, policy: {resources:{commercial:{resourceId:"",revisionId:"",sha256:""}}}, actor: "contact@limova.ai" }));
+const state = vi.hoisted(() => ({ db: null as unknown, current: {} as ObservationFixture, policy: {resources:{commercial:{resourceId:"",revisionId:"",sha256:""}}}, actorId:"", actor: "contact@limova.ai" }));
 vi.mock("@/db", () => ({ requireDb: () => state.db }));
 vi.mock("./runtime-store", () => ({ readSavIntakeCurrent: async () => state.current }));
 vi.mock("./runtime-contract", async (importOriginal) => ({ ...await importOriginal<typeof import("./runtime-contract")>(), savIntakeRuntimeConfig: () => ({ policy: state.policy }) }));
-vi.mock("./execution-policy", async (importOriginal) => ({ ...await importOriginal<typeof import("./execution-policy")>(), executionAdministrator: async () => ({ email: state.actor }) }));
+vi.mock("./execution-policy", async (importOriginal) => ({ ...await importOriginal<typeof import("./execution-policy")>(), executionAdministrator: async () => ({ id:state.actorId,email: state.actor }) }));
 // Occupation is separately qualified; no real HubSpot is reachable in this isolated transport test.
 vi.mock("./legacy-occupation", () => ({ guardLegacyIntakeOccupation: async () => { }, withLegacyOccupationAction: async (_a: unknown, fn: () => unknown) => fn(), markLegacyIntakeDispatch: async () => { }, releaseLegacyIntakeIfConfirmed: async () => { } }));
 let fixture: Awaited<ReturnType<typeof createSavTestDb>>, threadId: string, messageId: string, raw: {raw:string;threadId?:string}, failSend = false;
@@ -45,7 +45,7 @@ beforeEach(async () => {
     failSend = false;
     state.actor = "contact@limova.ai";
     await fixture.client.exec("TRUNCATE sav.mailboxes CASCADE; TRUNCATE sav.sync_state; TRUNCATE audit_logs; TRUNCATE staff_users CASCADE");
-    await fixture.db.insert(staffUsers).values({ clerkId: "synthetic-clerk", email: state.actor, role: "admin", active: true });
+    const [administrator]=await fixture.db.insert(staffUsers).values({ clerkId: "synthetic-clerk", email: state.actor, role: "admin", active: true }).returning();state.actorId=administrator.id;
     const [mailbox] = await fixture.db.insert(savMailboxes).values({ email: "contact@limova.ai" }).returning();
     await activateSavV0Cutover({ receivedAfter: "2026-10-02T12:00:00Z", mailboxEmail: mailbox.email, intakeRecipient: "contact@limova.ai", deploymentSha: "a".repeat(40), activatedBy: "ugo@limova.ai" });
     const [thread] = await fixture.db.insert(savThreads).values({ mailboxId: mailbox.id, gmailThreadId: "original-thread", subject: "Devis", customerEmail: "fiction@example.invalid" }).returning();
@@ -56,6 +56,9 @@ beforeEach(async () => {
     state.policy = { resources: { commercial: ref } };
     vi.stubEnv("SAV_INTAKE_RUNTIME_RESOURCES", JSON.stringify([{ resource: ref, text: JSON.stringify(resource) }]));
     state.current = { id: crypto.randomUUID(), messageId, fresh: true, sourceMatches: true, currentSourceHash: "source", leaseToken: null, leaseUntil: null, payload: { plan: { supervisedResource: ref, decision: { revision: SAV_INTAKE_CONTRACT_REVISION, messageId, latestInboundMessageId: messageId, threadId, receivedAt: message.receivedAt.toISOString(), classification: "commercial", requests: [{ id: "request", kind: "commercial", evidenceIds: ["current"] }], evidence: [{ id: "current", source: "current_message", sourceId: messageId, observedAt: message.receivedAt.toISOString(), contentHash: "a".repeat(43) }], disposition: { kind: "no_ticket", reason: "outside_support", nextAction: "supervised_commercial", learning: "excluded", evidenceIds: ["current"] } } } } };
+    const authorityPreview=await previewCommercialDeliveryAuthority({commandId:crypto.randomUUID(),expectedRevision:null,settings:{scope:"commercial_pure_contact_mailbox",recipient,subjectPrefix:resource.subjectPrefix,introduction:resource.introduction,state:"enabled",expiresAt:new Date(Date.now()+3600000).toISOString()}});
+    await commitCommercialDeliveryAuthority(authorityPreview.commandId,authorityPreview.hash);
+
 });
 describe("commercial forward with private recipient", () => {
     it("previews exact original without any network or mutation", async () => { const p = await prepareSavCommercialForward(threadId); expect(p.to).toBe(recipient); expect(p.text).toContain(body); expect(await fixture.db.select().from(savActions)).toHaveLength(0); expect(network).not.toHaveBeenCalled(); });
@@ -68,7 +71,7 @@ describe("commercial forward with private recipient", () => {
     it("rechecks resource before queue", async () => { const p = await prepareSavCommercialForward(threadId); state.policy.resources.commercial = { ...state.policy.resources.commercial, revisionId: "changed" }; await expect(queueSavCommercialForward(p.token)).rejects.toThrow("RESOURCE_CHANGED"); });
     it("rejects tampered preview body at dispatch", async () => { const p = await prepareSavCommercialForward(threadId); const changed = decryptSavPayload<{text:string}>(p.token); changed.text = "different"; await expect(queueSavCommercialForward(encryptSavPayload(changed))).rejects.toThrow("PREVIEW_STALE"); expect(posts()).toHaveLength(0); });
     it("rechecks actor revocation before dispatch", async () => { const a = await queueSavCommercialForward((await prepareSavCommercialForward(threadId)).token); await fixture.db.update(staffUsers).set({ active: false }); await processPendingGmailSendActions(1, a.actionId); expect(posts()).toHaveLength(0); });
-    it("does not accept header injection", () => { expect(commercialForwardResourceSchema.safeParse({ ...resource, subjectPrefix: "ok\nBcc: bad" }).success).toBe(false); expect(commercialForwardResourceSchema.safeParse({ ...resource, recipient: "desk@example.invalid\r\nBcc: bad" }).success).toBe(false); });
+    it("does not accept header injection", () => { const settings={scope:"commercial_pure_contact_mailbox",recipient,subjectPrefix:resource.subjectPrefix,introduction:resource.introduction,state:"enabled",expiresAt:new Date(Date.now()+3600000).toISOString()};expect(commercialDeliverySettingsSchema.safeParse({...settings,subjectPrefix:"ok\nBcc: bad"}).success).toBe(false);expect(commercialDeliverySettingsSchema.safeParse({...settings,recipient:"desk@example.invalid\r\nBcc: bad"}).success).toBe(false); });
     it.each(["actions_paused", "fully_paused"])("honors global %s", async (level) => { await fixture.db.insert(savSyncState).values({ key: savAgentPauseKey("intake"), cursor: encryptSavPayload({ revision: SAV_AGENT_PAUSE_REVISION, agent: "intake", level, setBy: "fixture", setAt: new Date().toISOString(), reason: "Human fixture pause" }) }); await expect(prepareSavCommercialForward(threadId)).rejects.toThrow("PAUSED"); expect(posts()).toHaveLength(0); });
     it("does not reset a failed action", async () => { const p = await prepareSavCommercialForward(threadId); const a = await queueSavCommercialForward(p.token); await fixture.db.update(savActions).set({ status: "failed", attemptCount: 4, errorCode: "SAV_COMMERCIAL_PREVIEW_STALE" }).where(eq(savActions.id, a.actionId)); expect(await queueSavCommercialForward(p.token)).toMatchObject({ status: "failed" }); const [saved] = await fixture.db.select().from(savActions); expect(saved.attemptCount).toBe(4); expect(saved.errorCode).toBe("SAV_COMMERCIAL_PREVIEW_STALE"); });
     it("rechecks source after confirmation", async () => { const a = await queueSavCommercialForward((await prepareSavCommercialForward(threadId)).token); state.current.sourceMatches = false; await processPendingGmailSendActions(1, a.actionId); expect(posts()).toHaveLength(0); });

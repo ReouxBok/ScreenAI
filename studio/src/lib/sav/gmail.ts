@@ -29,6 +29,7 @@ import { redactSavLearningText } from "./learning-extraction";
 import { getSavV0Cutover } from "./cutover";
 import { assertSavCurrentPartnershipForward, isSavPartnershipForward, SAV_PARTNERSHIP_RECIPIENT } from "./partnership-forward";
 import { assertSavCurrentCommercialForward, isSavCommercialForward } from "./intake/commercial-forward";
+import {reserveCommercialForwardDispatch} from "./intake/commercial-delivery-authority";
 import { savEffectiveReceivedAt } from "@/lib/sav/message-order";
 
 const pubSubEnvelopeSchema = z.object({
@@ -796,6 +797,13 @@ async function sendInternalForwardAction(action: typeof savActions.$inferSelect)
     'Content-Type: text/plain; charset="UTF-8"',
     "Content-Transfer-Encoding: 8bit", "", c.preview.text,
   ].join("\r\n");
+  if(commercial){
+    // Every guard precedes the atomic authority reservation. A subsequent
+    // rotation cannot retarget this reserved message or erase its marker.
+    await assertSavWriteAllowed(action.id);
+    const binding = action.payload;
+    await reserveCommercialForwardDispatch(action.id,String(binding.commercialAuthorityRevision??""),String(binding.commercialAuthorityHash??""));
+  }else{
   const [dispatched] = await db.update(savActions).set({ payload: sql`${savActions.payload} || ${JSON.stringify({ forwardDispatchedAt: new Date().toISOString() })}::jsonb`, updatedAt: new Date() })
     .where(and(eq(savActions.id, action.id), eq(savActions.status, "running"), sql`${savActions.payload}->>'forwardDispatchedAt' is null`)).returning();
   if (!dispatched) throw new Error(reconciliation);
@@ -805,6 +813,7 @@ async function sendInternalForwardAction(action: typeof savActions.$inferSelect)
   catch (error) {
     await db.update(savActions).set({ payload: sql`${savActions.payload} - 'forwardDispatchedAt'`, updatedAt: new Date() }).where(eq(savActions.id, action.id));
     throw error;
+  }
   }
   // Token acquisition and all awaited preflights precede the last authorization.
   // No Gmail threadId, Reply-To, In-Reply-To, References, Cc or Bcc are transmitted.

@@ -15,9 +15,10 @@ import { readSavIntakeCurrent } from "./runtime-store";
 import { savIntakeRuntimeConfig, intakeRuntimeHash } from "./runtime-contract";
 import { assertSavAgentActionsAllowed } from "./agent-pause";
 import { executionAdministrator } from "./execution-policy";
-import { assertPureCommercialDecision, commercialForwardResourceSchema, commercialForwardDeliveryState, COMMERCIAL_FORWARD_PURPOSE } from "./commercial-forward-contract";
+import { assertPureCommercialDecision, commercialForwardDeliveryState, COMMERCIAL_FORWARD_PURPOSE } from "./commercial-forward-contract";
+import {readCommercialDeliveryAuthority} from "./commercial-delivery-authority";
 type Action = typeof savActions.$inferSelect;
-const previewSchema = z.object({ purpose: z.literal(COMMERCIAL_FORWARD_PURPOSE), threadId: z.uuid(), messageId: z.uuid(), runId: z.uuid(), actorEmail: z.email(), sourceHash: z.string(), outboundHash: z.string(), issuedAt: z.number(), from: z.email(), to: z.email(), subject: z.string().max(1200), text: z.string().max(110000), resourceHash: z.string() }).strict();
+const previewSchema = z.object({ purpose: z.literal(COMMERCIAL_FORWARD_PURPOSE), threadId: z.uuid(), messageId: z.uuid(), runId: z.uuid(), actorEmail: z.email(), sourceHash: z.string(), outboundHash: z.string(), issuedAt: z.number(), from: z.email(), to: z.email(), subject: z.string().max(1200), text: z.string().max(110000), resourceHash: z.string(),authorityRevision:z.uuid(),authorityHash:z.string().regex(/^[a-f0-9]{64}$/) }).strict();
 const oneLine = (s: string) => s.replace(/[\r\n\0]+/g, " ").trim();
 const enabled = () => { if (isSavPilotMode() || savAutomationMode() === "shadow" || process.env.SAV_INTAKE_EXECUTION_KILL_SWITCH === "1" || process.env.SAV_WRITES_DISABLED === "true")
     throw Error("SAV_COMMERCIAL_WRITES_DISABLED"); };
@@ -49,14 +50,8 @@ async function loadContext(threadId: string) {
     const ref = runtime.policy.resources.commercial;
     if (!ref || intakeRuntimeHash(ref) !== intakeRuntimeHash(current.payload.plan?.supervisedResource))
         throw Error("SAV_COMMERCIAL_RESOURCE_CHANGED");
-    const catalogue = JSON.parse(process.env.SAV_INTAKE_RUNTIME_RESOURCES ?? "[]") as Array<{
-        resource: unknown;
-        text: string;
-    }>;
-    const item = catalogue.find(x => intakeRuntimeHash(x.resource) === intakeRuntimeHash(ref));
-    if (!item)
-        throw Error("SAV_COMMERCIAL_RESOURCE_REQUIRED");
-    const resource = commercialForwardResourceSchema.parse(JSON.parse(item.text));
+    const authority=await readCommercialDeliveryAuthority();
+    const resource=authority.settings;
     if (resource.recipient.toLowerCase() === mailbox.email.toLowerCase() || resource.recipient.toLowerCase() === message.fromEmail.toLowerCase())
         throw Error("SAV_COMMERCIAL_INTERNAL_RECIPIENT_REQUIRED");
     const body = decryptSavPayload<{
@@ -65,13 +60,13 @@ async function loadContext(threadId: string) {
     if (typeof body !== "string" || body.length > 100000)
         throw Error("SAV_COMMERCIAL_MESSAGE_TOO_LARGE");
     const outbound = { from: mailbox.email.toLowerCase(), to: resource.recipient, subject: `${resource.subjectPrefix} : ${oneLine(message.subject)}`, text: `${resource.introduction}\n\nLes pièces jointes ne sont pas incluses dans ce transfert.\n\n${savReplyFooter("fr")}\n\n---------- Email transféré ----------\nDe : ${oneLine(message.fromEmail)}\nDate : ${message.receivedAt.toISOString()}\nObjet : ${oneLine(message.subject)}\n\n${body}` };
-    const resourceHash = intakeRuntimeHash(ref), outboundHash = savContentHash(outbound), sourceHash = savContentHash({ runId: current.id, source: current.currentSourceHash, decision, resourceHash, outboundHash });
-    return { thread, message, mailbox, current, resourceHash, outbound, sourceHash, outboundHash };
+    const resourceHash = intakeRuntimeHash(ref), outboundHash = savContentHash(outbound), sourceHash = savContentHash({ runId: current.id, source: current.currentSourceHash, decision, resourceHash, outboundHash,authorityRevision:authority.revision,authorityHash:authority.contentHash });
+    return { thread, message, mailbox, current, resourceHash, outbound, sourceHash, outboundHash,authorityRevision:authority.revision,authorityHash:authority.contentHash };
 }
 async function existing(threadId: string, messageId: string, db: Pick<ReturnType<typeof requireDb>, "select"> = requireDb()) { const rows = await db.select().from(savActions).where(and(eq(savActions.threadId, threadId), sql `${savActions.payload}->>'purpose' = ${COMMERCIAL_FORWARD_PURPOSE}`)); if (rows.some(a => a.status !== "succeeded" && a.payload.forwardDispatchedAt))
     throw Error("SAV_COMMERCIAL_RECONCILIATION_REQUIRED"); return rows.find(a => a.idempotencyKey === `gmail:commercial-forward:${messageId}`); }
 export async function prepareSavCommercialForward(threadId: string) { const actor = await executionAdministrator(); enabled(); const c = await loadContext(z.uuid().parse(threadId)); if (commercialForwardDeliveryState(await existing(threadId, c.message.id)) !== "available")
-    throw Error("SAV_COMMERCIAL_ALREADY_REQUESTED"); const issuedAt = Date.now(), p = previewSchema.parse({ purpose: COMMERCIAL_FORWARD_PURPOSE, threadId, messageId: c.message.id, runId: c.current.id, actorEmail: actor.email, issuedAt, sourceHash: c.sourceHash, outboundHash: c.outboundHash, resourceHash: c.resourceHash, ...c.outbound }); return { token: encryptSavPayload(p), ...c.outbound, expiresAt: new Date(issuedAt + 900000).toISOString(), requires: "Review full history, prior transfer and human replies before confirming. No model call." }; }
+    throw Error("SAV_COMMERCIAL_ALREADY_REQUESTED"); const issuedAt = Date.now(), p = previewSchema.parse({ purpose: COMMERCIAL_FORWARD_PURPOSE, threadId, messageId: c.message.id, runId: c.current.id, actorEmail: actor.email, issuedAt, sourceHash: c.sourceHash, outboundHash: c.outboundHash, resourceHash: c.resourceHash,authorityRevision:c.authorityRevision,authorityHash:c.authorityHash, ...c.outbound }); return { token: encryptSavPayload(p), ...c.outbound, expiresAt: new Date(issuedAt + 900000).toISOString(), requires: "Review full history, prior transfer and human replies before confirming. No model call." }; }
 export async function queueSavCommercialForward(token: string) {
     const actor = await executionAdministrator();
     enabled();
@@ -86,7 +81,7 @@ export async function queueSavCommercialForward(token: string) {
         const old = await existing(p.threadId, p.messageId, tx);
         if (old && commercialForwardDeliveryState(old) !== "available")
             return { actionId: old.id, status: commercialForwardDeliveryState(old) };
-        const values = { threadId: p.threadId, messageId: p.messageId, kind: "send_reply", actorType: "human", actorEmail: actor.email, status: "pending", attemptCount: 0, errorCode: null, scheduledAt: null, payload: { purpose: COMMERCIAL_FORWARD_PURPOSE, manualReplyConfirmed: true, forwardConfirmedAt: new Date().toISOString(), previewCiphertext: token, sourceHash: p.sourceHash, outboundHash: p.outboundHash }, updatedAt: new Date() } as const;
+        const values = { threadId: p.threadId, messageId: p.messageId, kind: "send_reply", actorType: "human", actorEmail: actor.email, status: "pending", attemptCount: 0, errorCode: null, scheduledAt: null, payload: { purpose: COMMERCIAL_FORWARD_PURPOSE, manualReplyConfirmed: true, forwardConfirmedAt: new Date().toISOString(), previewCiphertext: token,commercialAuthorityRevision:p.authorityRevision,commercialAuthorityHash:p.authorityHash, sourceHash: p.sourceHash, outboundHash: p.outboundHash }, updatedAt: new Date() } as const;
         const [action] = await tx.insert(savActions).values({ ...values, idempotencyKey: `gmail:commercial-forward:${p.messageId}` }).returning();
         await tx.insert(auditLogs).values({ actorEmail: actor.email, action: "sav_commercial_forward_confirmed", entityType: "sav_action", entityId: action.id, technicalMetadata: { runId: p.runId, resourceHash: p.resourceHash, outboundHash: p.outboundHash } });
         return { actionId: action.id, status: "pending" };
@@ -100,7 +95,7 @@ export async function assertSavCurrentCommercialForward(action: Action) {
     if (!staff?.active || !["admin", "owner"].includes(staff.role) || !canAccessSav(staff.email, staff.role))
         throw Error("SAV_COMMERCIAL_ACTOR_REVOKED");
     const p = previewSchema.parse(decryptSavPayload(String(action.payload.previewCiphertext ?? ""))), c = await loadContext(action.threadId);
-    if (p.actorEmail !== action.actorEmail || p.messageId !== action.messageId || p.threadId !== action.threadId || savContentHash({ from: p.from, to: p.to, subject: p.subject, text: p.text }) !== c.outboundHash || p.sourceHash !== c.sourceHash || p.outboundHash !== c.outboundHash || action.payload.sourceHash !== c.sourceHash || action.payload.outboundHash !== c.outboundHash)
+    if (p.authorityRevision!==c.authorityRevision||p.authorityHash!==c.authorityHash||action.payload.commercialAuthorityRevision!==c.authorityRevision||action.payload.commercialAuthorityHash!==c.authorityHash||p.actorEmail !== action.actorEmail || p.messageId !== action.messageId || p.threadId !== action.threadId || savContentHash({ from: p.from, to: p.to, subject: p.subject, text: p.text }) !== c.outboundHash || p.sourceHash !== c.sourceHash || p.outboundHash !== c.outboundHash || action.payload.sourceHash !== c.sourceHash || action.payload.outboundHash !== c.outboundHash)
         throw Error("SAV_COMMERCIAL_PREVIEW_STALE");
     return { ...c, preview: p };
 }
