@@ -20,7 +20,7 @@ async function waitForRead(delay: number, signal?: AbortSignal | null) {
 /** POST is retryable only for these documented read operations. */
 export function isSavHubspotRead(path: string, method = "GET") {
   if (method.toUpperCase() === "GET") return true;
-  return method.toUpperCase() === "POST" && (/^\/crm\/v3\/objects\/(contacts|tickets|emails)\/(search|batch\/read)$/.test(path) || path === "/crm/v3/objects/notes/batch/read");
+  return method.toUpperCase() === "POST" && (/^\/crm\/v3\/objects\/(contacts|tickets|emails)\/(search|batch\/read)$/.test(path) || /^\/crm\/v3\/objects\/(notes|calls|meetings|tasks)\/batch\/read$/.test(path));
 }
 
 /** Tests may virtualize transport waits without changing the application clock or guards. */

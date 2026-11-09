@@ -64,6 +64,7 @@ export type EffectIntent = {
         revisionId: string;
         sha256: string;
     };
+    ticketHistory?: import("../ticket-creation-history").TicketCreationHistory;
     expectedOwnerId?: string | null;
 };
 export type EffectAck = {
@@ -72,6 +73,7 @@ export type EffectAck = {
     [key: string]: unknown;
 };
 export type ExecutorAdapters = {
+    prepareTicketHistory?(contactId: string, signal: AbortSignal): Promise<import("../ticket-creation-history").TicketCreationHistory>;
     qualifyAddedEmails?(baseline:CrmSnapshot,current:CrmSnapshot,source:import("./crm-continuation").ContinuationSourceEmail,signal:AbortSignal):Promise<import("./crm-continuation").QualifiedCrmEmail[]>;
     readCrm(plan: IntakePlan, input: unknown, config: IntakeRuntimeConfig, signal: AbortSignal): Promise<CrmSnapshot>;
     scope(snapshot: CrmSnapshot, threadId: string, ticketId?: string | null): string[];

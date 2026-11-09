@@ -411,6 +411,22 @@ export async function withdrawUndispatchedEffect(lease: ExecutionLease, effect: 
         return Boolean(row);
     });
 }
+/** Refresh only a creation that has never left Studio. The snapshot is persisted
+ * before its dispatch marker, so recovery verifies the exact sent associations. */
+export async function refreshCreationHistory(lease: ExecutionLease, effect: Effect, history: import("../ticket-creation-history").TicketCreationHistory) {
+    return requireDb().transaction(async tx => {
+        await assertExecutionLocal(tx, lease);
+        const [old] = await tx.select().from(savIntakeEffects).where(eq(savIntakeEffects.id, effect.id)).for("update");
+        if (!old || old.executionId !== lease.row.id || old.kind !== "ticket_create" || old.state !== "planned" || old.dispatchedAt || old.dispatchToken || old.ackCiphertext || old.confirmedAt)
+            return fault("EFFECT_INTENT_CHANGED");
+        const intent = decryptSavPayload<EffectIntent>(old.intentCiphertext);
+        if (history.contactId !== intent.contactId) return fault("EFFECT_INTENT_CHANGED");
+        const next = { ...intent, ticketHistory: history }, hash = intakeRuntimeHash(next);
+        const [row] = await tx.update(savIntakeEffects).set({ intentHash: hash, intentCiphertext: encryptSavPayload(next) }).where(eq(savIntakeEffects.id, old.id)).returning();
+        await executionJournal(tx, lease.row.id, "creation_history_refreshed", { previousIntentHash: old.intentHash, intentHash: hash }, old.id);
+        return row;
+    });
+}
 /** These receipt functions deliberately do not depend on live authority/lease. */
 export async function recordEffectAck(effect: Effect, ack: EffectAck) {
     await requireDb().transaction(async (tx) => {
