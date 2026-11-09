@@ -63,7 +63,7 @@ beforeEach(async () => {
     await fixture.db.insert(savSyncState).values({key:"sav-intake-execution-schema-v1",status:"installed"});
     const id=await enqueueSavIntakeMessage(messageId,config);expect(id).toBeTruthy();
     const lease=await claimSavIntakeRun(id!,config);expect(lease).toBeTruthy();
-    const plan:Omit<IntakePlan,"fingerprint">={revision:"sav-intake-engine-2026-10-20.v1",decision:savIntakeDecisionSchema.parse(state.current.payload.plan.decision),steps:[],progress:{kind:"supervised_action",messageId,classification:"commercial",action:"supervised_commercial",approval:"human_confirmation_required",evidenceIds:["current"],view:"to_validate"},noteText:null,supervisedResource:ref,originalThreadId:threadId,originalRecipientEmails:[message.fromEmail],referenceMode:"current"};
+    const plan:Omit<IntakePlan,"fingerprint">={revision:"sav-intake-engine-2026-10-20.v1",decision:savIntakeDecisionSchema.parse(state.current.payload.plan.decision),steps:[],progress:{kind:"supervised_action",messageId,classification:"commercial",action:"supervised_commercial",approval:"human_confirmation_required",evidenceIds:["current"],view:"to_validate"},noteText:null,supervisedResource:ref,originalThreadId:threadId,originalRecipientEmails:[message.fromEmail],referenceMode:"current",readCalls:0,effects:"not_connected"};
     await saveSavIntakeResult(lease!,config,{revision:SAV_INTAKE_RUNTIME_REVISION,effects:"not_connected",reason:"synthetic-classifier-output",plan:{...plan,fingerprint:savIntakePlanFingerprint(plan)}},"observed");
     expect((await readSavIntakeCurrent(threadId,config))?.fresh).toBe(true);
 
