@@ -1,4 +1,4 @@
-import {previewCommercialDeliveryAuthority,commitCommercialDeliveryAuthority,readCommercialDeliveryAuthority,reserveCommercialForwardDispatch,COMMERCIAL_AUTHORITY_KEY} from "./commercial-delivery-authority";
+import {previewCommercialDeliveryAuthority,commitCommercialDeliveryAuthority,readCommercialDeliveryAuthority,getCommercialDeliveryAuthority,reserveCommercialForwardDispatch,COMMERCIAL_AUTHORITY_KEY} from "./commercial-delivery-authority";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { eq } from "drizzle-orm";
 import { createSavTestDb } from "../../../../test/sav-db";
@@ -162,6 +162,12 @@ describe("independent commercial delivery authority",()=>{
   await fixture.client.exec("CREATE FUNCTION public.fixture_authority_audit_fail() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF NEW.action='sav_commercial_delivery_authority_approved' THEN RAISE EXCEPTION 'synthetic audit failure'; END IF; RETURN NEW; END $$; CREATE TRIGGER fixture_authority_audit_fail BEFORE INSERT ON public.audit_logs FOR EACH ROW EXECUTE FUNCTION public.fixture_authority_audit_fail()");
   try{await expect(commitCommercialDeliveryAuthority(p.commandId,p.hash)).rejects.toThrow();}finally{await fixture.client.exec("DROP TRIGGER fixture_authority_audit_fail ON public.audit_logs; DROP FUNCTION public.fixture_authority_audit_fail()");}
   expect((await readCommercialDeliveryAuthority()).revision).toBe(old.revision);const [draft]=await fixture.db.select().from(savSyncState).where(eq(savSyncState.key,`${COMMERCIAL_AUTHORITY_KEY}:preview:${p.commandId}`));expect(draft.status).toBe("preview");expect(await fixture.db.select().from(savActions)).toHaveLength(0);
+ });
+
+ it("labels bounded dispatch history and prioritizes uncertain actions deterministically",async()=>{
+  const values=Array.from({length:102},(_,i)=>({threadId,messageId,kind:"send_reply",status:i===0?"failed":"succeeded",actorType:"human",idempotencyKey:`synthetic-history-${i}`,updatedAt:new Date(i===0?0:Date.now()),payload:{purpose:"intake_commercial_forward",forwardDispatchedAt:new Date().toISOString()}}));
+  const inserted=await fixture.db.insert(savActions).values(values).returning();const first=await getCommercialDeliveryAuthority(),second=await getCommercialDeliveryAuthority();
+  expect(first).toMatchObject({dispatchedLimit:100,dispatchedTruncated:true,dispatchedIncludesConfirmed:true});expect(first.dispatched).toHaveLength(100);expect(first.dispatched[0]).toMatchObject({id:inserted[0].id,status:"failed"});expect(second.dispatched).toEqual(first.dispatched);expect(posts()).toHaveLength(0);
  });
 
 });

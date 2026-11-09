@@ -1,5 +1,5 @@
 import "server-only";
-import { and, eq, sql } from "drizzle-orm";
+import { and, desc, eq, sql } from "drizzle-orm";
 import { z } from "zod";
 import { requireDb } from "@/db";
 import { auditLogs, savActions, savSyncState, staffUsers } from "@/db/schema";
@@ -49,8 +49,14 @@ export async function readCommercialDeliveryAuthority(db: Db = requireDb()) {
         return fail("ACTOR_REVOKED");
     return a;
 }
-async function affected(db: Db) { return db.select({ id: savActions.id, status: savActions.status }).from(savActions).where(and(sql `${savActions.payload}->>'purpose'=${COMMERCIAL_FORWARD_PURPOSE}`, sql `${savActions.payload}->>'forwardDispatchedAt' is not null`)).limit(101); }
-export async function getCommercialDeliveryAuthority() { await executionAdministrator(); return { authority: await current(requireDb()), dispatched: await affected(requireDb()), warning: "A reserved or dispatched message cannot be retroactively cancelled by rotation." }; }
+async function affected(db: Db) {
+    const rows=await db.select({id:savActions.id,status:savActions.status}).from(savActions).where(and(sql`${savActions.payload}->>'purpose'=${COMMERCIAL_FORWARD_PURPOSE}`,sql`${savActions.payload}->>'forwardDispatchedAt' is not null`)).orderBy(sql`case when ${savActions.status}='succeeded' then 1 else 0 end`,desc(savActions.updatedAt),savActions.id).limit(101);
+    return {dispatched:rows.slice(0,100),dispatchedLimit:100,dispatchedTruncated:rows.length>100,dispatchedIncludesConfirmed:true};
+}
+export async function getCommercialDeliveryAuthority() {
+    await executionAdministrator();
+    return {authority:await current(requireDb()),...await affected(requireDb()),warning:"Bounded dispatch history, uncertain or unfinished actions first. Rotation cannot retroactively cancel a reserved message."};
+}
 export async function previewCommercialDeliveryAuthority(raw: unknown) {
     const input = commercialAuthorityCommandSchema.parse(raw), actor = await executionAdministrator();
     if (Date.parse(input.settings.expiresAt) <= Date.now())
@@ -98,8 +104,8 @@ export async function commitCommercialDeliveryAuthority(commandId: string, expec
         await tx.insert(savSyncState).values({ key: COMMERCIAL_AUTHORITY_KEY, status: p.settings.state, cursor: encryptSavPayload(a) }).onConflictDoUpdate({ target: savSyncState.key, set: { status: p.settings.state, cursor: encryptSavPayload(a), updatedAt: new Date() } });
         await tx.update(savSyncState).set({ status: "committed" }).where(eq(savSyncState.key, previewKey(commandId)));
         const dispatched = await affected(tx);
-        await tx.insert(auditLogs).values({ actorEmail: staff.email, action: "sav_commercial_delivery_authority_approved", entityType: "sav_commercial_delivery_authority", entityId: a.revision, technicalMetadata: { contentHash: a.contentHash, previousRevision: p.expectedRevision, state: a.settings.state, dispatchedActionIds: JSON.stringify(dispatched.map(x => x.id)) } });
-        return { revision: a.revision, contentHash: a.contentHash, state: a.settings.state, idempotent: false, dispatched, warning: "Rotation does not cancel already reserved or dispatched messages." };
+        await tx.insert(auditLogs).values({ actorEmail: staff.email, action: "sav_commercial_delivery_authority_approved", entityType: "sav_commercial_delivery_authority", entityId: a.revision, technicalMetadata: { contentHash: a.contentHash, previousRevision: p.expectedRevision, state: a.settings.state,dispatchedTruncated:dispatched.dispatchedTruncated, dispatchedActionIds: JSON.stringify(dispatched.dispatched.map(x => x.id)) } });
+        return { revision: a.revision, contentHash: a.contentHash, state: a.settings.state, idempotent: false, ...dispatched, warning: "Rotation does not cancel already reserved or dispatched messages." };
     });
 }
 /** Rotation and the irreversible dispatch reservation share this lock. No recipient is read again after reservation. */
