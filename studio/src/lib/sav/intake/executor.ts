@@ -18,7 +18,7 @@ import { intakeTicketDescription, intakeUnreadAttachmentNotice } from "./ticket-
 import { assertOriginalExecutionCrm, assertExecutionCrmUnchanged, IntakeCrmDeltaError, publicIntakeCrmDelta } from "./execution-context";
 import { publicCrmRecheck } from "./execution-diagnostic";
 import { crmRecheckDecision } from "./crm-recheck";
-import { crmRecheckDueSql, admitIntakeExecution, claimExecutionOrBlock, claimEffectRecovery, withEffectRecoveryLease, releaseEffectRecovery, activeExecutionEffects, adoptCurrentExecutionVersion, assertExecutionLocal, saveExecutionPayload, expandExecutionScope, getExecutionEffects, ensureExecutionEffect, markEffectDispatched, withdrawUndispatchedEffect, withdrawCreationOwner, recordEffectAck, confirmExecutionEffect, deferExecutionEffect, endExecutionPass, identityEpisodeEffect, finishExecution, executionJournal, releaseRecoveredExecutionScope, occupationSchemaInstalled, type ExecutionLease, type ExecutionTx } from "./execution-store";
+import { crmRecheckDueSql, admitIntakeExecution, claimExecutionOrBlock, claimEffectRecovery, withEffectRecoveryLease, releaseEffectRecovery, activeExecutionEffects, adoptCurrentExecutionVersion, assertExecutionLocal, saveExecutionPayload, expandExecutionScope, getExecutionEffects, ensureExecutionEffect, markEffectDispatched, refreshCreationHistory, withdrawUndispatchedEffect, withdrawCreationOwner, recordEffectAck, confirmExecutionEffect, deferExecutionEffect, endExecutionPass, identityEpisodeEffect, finishExecution, executionJournal, releaseRecoveredExecutionScope, occupationSchemaInstalled, type ExecutionLease, type ExecutionTx } from "./execution-store";
 import type { Effect, EffectIntent, EffectAck, ExecutorAdapters, ExecutionOptions, ExecutionPayload, EffectKind } from "./execution-types";
 const fault = (code: string): never => { throw Error(`SAV_INTAKE_EXECUTION_${code}`); };
 const pauseCodes: ReadonlySet<string> = new Set(Object.values(SAV_AGENT_PAUSE_CODES));
@@ -329,9 +329,14 @@ export async function executeIntakePass(executionId: string, options: ExecutionO
             current = effects.find(e => e.businessKey === intent.key);
             if (!current) {
                 await driver.preflight(lease, options, intent);
-                current = intent.kind === "identity_send" ? await identityEpisodeEffect(lease, intent) : await ensureExecutionEffect(lease, intent);
+                const prepared = intent.kind === "ticket_create" && options.adapters.prepareTicketHistory
+                    ? { ...intent, ticketHistory: await options.adapters.prepareTicketHistory(intent.contactId!, options.signal) } : intent;
+                current = intent.kind === "identity_send" ? await identityEpisodeEffect(lease, intent) : await ensureExecutionEffect(lease, prepared);
             }
             if (current.state === "planned") {
+                const stored = effectIntent(current), through = Date.parse(stored.ticketHistory?.through ?? "");
+                if (current.kind === "ticket_create" && options.adapters.prepareTicketHistory && (!Number.isFinite(through) || Date.now() - through > 60_000))
+                    current = await refreshCreationHistory(lease, current, await options.adapters.prepareTicketHistory(stored.contactId!, options.signal));
                 await hooks.beforeMarker?.(current);
                 // Review F1: the checks read the STORED creation, the body that will be sent.
                 await driver.preflight(lease, options, current.kind === "ticket_create" ? effectIntent(current) : intent);

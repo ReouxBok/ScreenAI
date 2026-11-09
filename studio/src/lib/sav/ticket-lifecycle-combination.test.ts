@@ -64,6 +64,7 @@ function mockIntegrations() {
       return Response.json(record());
     }
     if (url.includes("/objects/tickets/401?")) return Response.json(record());
+    if (/\/crm\/v4\/objects\/contacts\/\d+\/associations\/(calls|emails|notes|meetings|tasks)\?/.test(url)) return Response.json({ results: [] });
     if (url.endsWith("/objects/tickets") && init?.method === "POST") return Response.json({ id: "301", properties: JSON.parse(String(init.body)).properties });
     throw new Error(`Unexpected fixture call: ${url}`);
   });

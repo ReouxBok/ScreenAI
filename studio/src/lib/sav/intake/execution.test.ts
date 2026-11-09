@@ -578,6 +578,7 @@ it.each(["claim", "marker", "ack"])("real cron resumes expired running after %s 
             }
         };
         const { ensureExecutionEffect, markEffectDispatched, recordEffectAck } = await import("./execution-store");
+        if (intent.kind === "ticket_create") intent.ticketHistory = await options.adapters.prepareTicketHistory!(intent.contactId!, options.signal);
         const effect = await markEffectDispatched(lease, await ensureExecutionEffect(lease, intent));
         if (stage === "ack")
             await recordEffectAck(effect, await options.adapters.dispatch(intent, options.signal));
@@ -2262,4 +2263,32 @@ it("V1 integrated: absence, real reply, partial history, then observation outage
     });
     expect((await readIntakeRunDiagnostics(threadId))?.execution?.followup).toMatchObject({ observationState: "active", sourceErrors: 0 });
     expect(writes()).toHaveLength(writesBefore);
+});
+
+it("new-ticket history partial result keeps durable ID, uncertain state and never creates again", async () => {
+    const historyId = "771", at = new Date(Date.now() - 3600000).toISOString();
+    p.objects.notes[historyId] = { id: historyId, properties: { hs_timestamp: at, hs_note_body: "Synthetic previous human context" } };
+    p.links.set("contacts:101:notes", [historyId]);
+    const row = await admission();
+    const result = await executeIntakePass(row.id, options, { afterAck: async effect => {
+        if (effect.kind === "ticket_create") {
+            const ticketId = Object.keys(p.objects.tickets)[0];
+            p.links.set(`tickets:${ticketId}:notes`, []); // Provider acknowledged ticket, omitted one association.
+        }
+    } });
+    expect(result).toMatchObject({ state: "uncertain" });
+    const [effect] = await getExecutionEffects(row.id);
+    const ack = decryptSavPayload<EffectAck>(effect.ackCiphertext!);
+    expect(ack.id).toBe(Object.keys(p.objects.tickets)[0]);
+    expect(decryptSavPayload<EffectIntent>(effect.intentCiphertext).ticketHistory?.activities).toEqual([
+        { id: historyId, type: "notes", associationTypeId: 1002 }
+    ]);
+    expect((await readIntakeExecutionProgress(messageId))?.confirmed).toBe(false);
+    await executeIntakePass(row.id, options);
+    expect(p.calls.filter(c => c.method === "POST" && c.path.endsWith("/tickets"))).toHaveLength(1);
+    // Simulate eventual provider visibility. Read-only reconciliation may now prove the same object.
+    p.links.set(`tickets:${ack.id}:notes`, [historyId]);
+    const intent = decryptSavPayload<EffectIntent>(effect.intentCiphertext);
+    expect((await options.adapters.verify(intent, ack, effect.dispatchedAt!, options.signal)).confirmed).toBe(true);
+    expect(p.calls.filter(c => c.method === "POST" && c.path.endsWith("/tickets"))).toHaveLength(1);
 });

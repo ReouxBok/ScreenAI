@@ -45,6 +45,7 @@ function mockIntegrations(mode: "create" | "timeout" | "existing" | "unknown" | 
     if (url.endsWith("/tickets/search")) return Response.json({ results: ["existing", "different"].includes(mode) ? [{ id: "401", properties: { subject: mode === "different" ? "Intégration Slack impossible" : "Retrouver les factures", hs_pipeline: "0", hs_pipeline_stage: "1", hs_lastmodifieddate: new Date().toISOString() } }] : [] });
     if (url.endsWith("/objects/emails") && init?.method === "POST") return Response.json({ id: "501", properties: {} });
     if (url.includes("/associations/default/") && init?.method === "PUT") return new Response(null, { status: 204 });
+    if (/\/crm\/v4\/objects\/contacts\/\d+\/associations\/(calls|emails|notes|meetings|tasks)\?/.test(url)) return Response.json({ results: [] });
     if (url.endsWith("/objects/tickets") && init?.method === "POST") {
       if (mode === "timeout") throw new TypeError("Simulated ambiguous transport failure");
       return Response.json({ id: "301", properties: { subject: "Retrouver les factures", hs_pipeline: "0", hs_pipeline_stage: "1" } });
