@@ -1,10 +1,9 @@
-import type { CaseInvestigationModelRequest } from "./investigation-runner";
 import { randomUUID } from "node:crypto";
 import { eq, like } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { createSavTestDb } from "../../../../test/sav-db";
 import {
-  contentChunks, contentItems, contentVersions, savCaseCalls, savCaseEffectExecutions, savIntakeEffects, savIntakeExecutionPolicies, savIntakeExecutions, savIntakeRuns,
+  contentChunks, contentItems, contentVersions, savCaseEffectExecutions, savIntakeEffects, savIntakeExecutionPolicies, savIntakeExecutions, savIntakeRuns,
   savMailboxes, savMessages, savSyncState, savThreads, staffUsers, savKnowledgeActivations, activeKnowledge, knowledgeRevisions, reviewEvents, savCaseReplyValidations,
 } from "@/db/schema";
 const state = vi.hoisted(() => ({ db: null as unknown }));
@@ -26,10 +25,6 @@ import { readCase } from "./case-store";
 import type { CaseAdmissionQualification } from "./case-types";
 import { recordCaseAfterConfirmedIntake } from "./intake-boundary";
 import { SAV_CASE_ACCESS_SCOPE_REVISION } from "./investigation-access-scope";
-import { runCaseInvestigationRuntime } from "./investigation-runtime";
-import { createCaseInvestigationToReplyPlan, createCaseInvestigationV2Deps, type CaseInvestigationV2Input } from "./investigation-v2-factory";
-import { caseGeminiDecisionProvider, caseHubspotOwnerReadTransport } from "./investigation-v2-providers";
-import { readCaseV2SpendDay, readCaseV2SpendPolicy, releaseCaseV2Spend, reserveCaseV2Spend, settleCaseV2Spend } from "./investigation-v2-spend";
 
 /*
  * B (4/11, SYN): the V2 investigation on its REAL adapters, built by the factory A and the wake call. Real database (synthetic), real index
@@ -132,11 +127,8 @@ async function seedCard() {
   await f.db.insert(contentChunks).values({ itemId: item!.id, versionId: version!.id, ordinal: 0, heading: "Connexion", content: body, embedding: UNIT() } as typeof contentChunks.$inferInsert);
   card = { id: item!.id, contentVersionId: version!.id };
 }
-const input = (net: ReturnType<typeof network>, over: Partial<CaseInvestigationV2Input> = {}, env = environment()): CaseInvestigationV2Input =>
-  ({ env: () => env, readPolicyRecord, network: net.net, now: () => new Date(Date.now() + 6 * 60_000), ...over });
 /** Only V2 spend rows: the store's own markers in `sav.sync_state` (schema, cursors) stay. */
 const clearSpend = () => f.db.delete(savSyncState).where(like(savSyncState.key, "sav-v2-spend.v1:%"));
-const today = () => new Date(Date.now() + 6 * 60_000).toISOString().slice(0, 10);
 
 
 import { loadCaseContinuationPoint } from "./v2-entry-binding";
@@ -385,10 +377,10 @@ describe("auto ON: after the automated approval, the send respects people and un
     const counter = { sends: 0 };
     const deps = createCaseV2WakeDeps({ env: () => env, policy: { id: policyId, hash: policyHash }, readPolicyRecord, since: new Date(Date.now() - 60_000), deadlineMs: Date.now() + 60_000,
       network: provider.network as typeof fetch,
-      gmail: { request: async (mailbox, path, init) => {
+      gmail: { request: async <T,>(mailbox: string, path: string, init?: RequestInit) => {
         const send = path.replace(/^\//, "") === "messages/send";
         if (send) counter.sends++;
-        const result = await provider.gmail(mailbox, path, init);
+        const result = await provider.gmail<T>(mailbox, path, init);
         if (send && options.loseAck?.()) throw Error("SAV_TEST_ACK_LOST");
         return result;
       }, permissions: async () => {} } });
