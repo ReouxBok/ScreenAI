@@ -4,7 +4,8 @@ import { createSavTestDb } from "../../../../test/sav-db";
 import { savActions, savMailboxes, savMessages, savThreads, staffUsers, savSyncState } from "@/db/schema";
 import { encryptSavPayload, decryptSavPayload } from "../crypto";
 import { activateSavV0Cutover } from "../cutover";
-import { SAV_INTAKE_CONTRACT_REVISION } from "./contract";
+import type { IntakePlan } from "./engine-types";
+import { savIntakeDecisionSchema, SAV_INTAKE_CONTRACT_REVISION } from "./contract";
 import { prepareSavCommercialForward, queueSavCommercialForward } from "./commercial-forward";
 import { savAgentPauseKey, SAV_AGENT_PAUSE_REVISION } from "./agent-pause";
 import { commercialForwardResourceSchema } from "./commercial-forward-contract";
@@ -62,8 +63,8 @@ beforeEach(async () => {
     await fixture.db.insert(savSyncState).values({key:"sav-intake-execution-schema-v1",status:"installed"});
     const id=await enqueueSavIntakeMessage(messageId,config);expect(id).toBeTruthy();
     const lease=await claimSavIntakeRun(id!,config);expect(lease).toBeTruthy();
-    const plan={revision:"sav-intake-engine-2026-10-20.v1" as const,decision:state.current.payload.plan.decision,steps:[],progress:{kind:"supervised_action",view:"to_validate",reason:"human_confirmation_required"},noteText:null,supervisedResource:ref,originalThreadId:"original-thread",originalRecipientEmails:[]};
-    await saveSavIntakeResult(lease!,config,{revision:SAV_INTAKE_RUNTIME_REVISION,effects:"not_connected",reason:"synthetic-classifier-output",plan:{...plan,fingerprint:savIntakePlanFingerprint(plan)} as any},"observed");
+    const plan:Omit<IntakePlan,"fingerprint">={revision:"sav-intake-engine-2026-10-20.v1",decision:savIntakeDecisionSchema.parse(state.current.payload.plan.decision),steps:[],progress:{kind:"supervised_action",messageId,classification:"commercial",action:"supervised_commercial",approval:"human_confirmation_required",evidenceIds:["current"],view:"to_validate"},noteText:null,supervisedResource:ref,originalThreadId:threadId,originalRecipientEmails:[message.fromEmail],referenceMode:"current"};
+    await saveSavIntakeResult(lease!,config,{revision:SAV_INTAKE_RUNTIME_REVISION,effects:"not_connected",reason:"synthetic-classifier-output",plan:{...plan,fingerprint:savIntakePlanFingerprint(plan)}},"observed");
     expect((await readSavIntakeCurrent(threadId,config))?.fresh).toBe(true);
 
 });
