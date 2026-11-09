@@ -3,8 +3,9 @@ import { renderToStaticMarkup } from "react-dom/server";
 import { prerender } from "react-dom/static";
 import { readFile, writeFile, mkdir } from "node:fs/promises";
 import { beforeEach, it, expect, vi } from "vitest";
-const mocks = vi.hoisted(() => ({ staff: vi.fn(), list: vi.fn(), detail: vi.fn(), action: vi.fn(), crmDisplay: vi.fn(), controls: vi.fn(), manualOther:vi.fn(), operator:vi.fn() }));
+const mocks = vi.hoisted(() => ({ monitoring: vi.fn(), staff: vi.fn(), list: vi.fn(), detail: vi.fn(), action: vi.fn(), crmDisplay: vi.fn(), controls: vi.fn(), manualOther:vi.fn(), operator:vi.fn() }));
 vi.mock("@/lib/sav/intake/manual-other-classification",()=>({readManualOtherEligibility:mocks.manualOther,manualOtherUnavailableLabels:{inventory_incomplete:"L’inventaire des pièces jointes est incomplet ou non certifié.",paused:"Une pause humaine protège ce dossier.",effects_engaged:"Une action engagée ou son résultat reste à vérifier."}}));
+vi.mock("@/lib/sav/intake/monitoring-read",()=>({readIntakeMonitoring:mocks.monitoring}));
 vi.mock("./manual-other-actions",()=>({classifyManualOtherAction:mocks.action}));
 vi.mock("@/lib/sav/intake-ux/operator-commands",()=>({readOperatorPanel:mocks.operator}));
 vi.mock("@/lib/sav/intake-ux/message-controls",()=>({readUxMessageControls:mocks.controls}));
@@ -30,7 +31,7 @@ const detail={thread:{id:threadId,subject:fixture.rows[0].subject,paused:false,t
   current:{id:runId,messageId,candidateContactIds:["101","102"],sourceHash:"a".repeat(64),version:7,sourceMatches:true,payload:{reason:"SAV_INTAKE_RUNTIME_USAGE_UNCERTAIN",plan:{candidateContactIds:["101","102"],decision:{classification:"support",disposition:{kind:"collect_context",reasons:["contact_ambiguous"]},evidence:[{id:"current",source:"current_message",sourceId:messageId,observedAt:at.toISOString()}]}}}},
   messages:[{id:messageId,direction:"inbound",fromEmail:"fiction@example.invalid",receivedAt:at,createdAt:at,body:{text:"My synthetic connection no longer works. Please inspect this complete test request.",attachments:[]},translation:{status:"complete",language:"en",text:"Ma connexion synthétique ne fonctionne plus. Merci de vérifier cette demande de test complète.",revision:"synthetic",sourceHash:"synthetic",errorCode:null}}],historyTruncated:false,
   progress:{runId,confirmed:false,state:"uncertain",ticketId:"201",reason:"SAV_INTAKE_EXECUTION_RECONCILIATION_REQUIRED",effects:[{id:"effect-1",kind:"ticket_create",state:"confirmed",confirmedAt:at},{id:"effect-2",kind:"email_associate",state:"uncertain",confirmedAt:null}]},choices:[]};
-beforeEach(()=>{vi.clearAllMocks();mocks.manualOther.mockResolvedValue(null);vi.unstubAllEnvs();mocks.operator.mockResolvedValue({information:null,allowResume:false,allowReanalysis:true,allowInformation:true,unavailableReason:"Synthetic protected state",resume:null});mocks.controls.mockResolvedValue({blocked:false});mocks.crmDisplay.mockResolvedValue({contacts:{"101":{label:"Alice Test",url:"https://app.hubspot.com/contacts/123/record/0-1/101",available:true}},tickets:{"201":{label:"Connexion interrompue",url:"https://app.hubspot.com/contacts/123/record/0-5/201",available:true}}});mocks.staff.mockResolvedValue({id:"synthetic",email:"ugo@limova.ai",role:"admin"});mocks.list.mockResolvedValue(fixture);mocks.detail.mockResolvedValue(detail);});
+beforeEach(()=>{vi.clearAllMocks();mocks.monitoring.mockResolvedValue({readAt:at.toISOString(),permission:"running",configuration:"restricted",activity:{state:"stale",startedAt:at.toISOString(),finishedAt:null,succeededAt:null,collection:"partial",observedAt:at.toISOString()}});mocks.manualOther.mockResolvedValue(null);vi.unstubAllEnvs();mocks.operator.mockResolvedValue({information:null,allowResume:false,allowReanalysis:true,allowInformation:true,unavailableReason:"Synthetic protected state",resume:null});mocks.controls.mockResolvedValue({blocked:false});mocks.crmDisplay.mockResolvedValue({contacts:{"101":{label:"Alice Test",url:"https://app.hubspot.com/contacts/123/record/0-1/101",available:true}},tickets:{"201":{label:"Connexion interrompue",url:"https://app.hubspot.com/contacts/123/record/0-5/201",available:true}}});mocks.staff.mockResolvedValue({id:"synthetic",email:"ugo@limova.ai",role:"admin"});mocks.list.mockResolvedValue(fixture);mocks.detail.mockResolvedValue(detail);});
 const renderList=async(query:{view?:string;q?:string;page?:string;sort?:string}={})=>renderToStaticMarkup(createElement(Fragment,null,await IntakeConsolePage({searchParams:Promise.resolve(query)})));
 // The detail page streams HubSpot names under Suspense: wait for every boundary,
 // as the browser does once the stream ends. The shell alone is the first flush.
@@ -179,4 +180,18 @@ it("explains an incomplete inventory instead of silently hiding the direct Other
   const html=await renderDetail();expect(html).toContain("Classement dans Autres indisponible");
   expect(html).toContain("inventaire des pièces jointes est incomplet ou non certifié");
   expect(html).not.toContain("Classement humain dans Autres");expect(mocks.action).not.toHaveBeenCalled();
+});
+
+it("separates permission from absent activity and preserves filters on the read-only refresh", async()=>{
+  const html=await renderList({view:"processing",q:"connexion",page:"2",sort:"oldest"});
+  expect(html).toContain("Agent autorisé à travailler");expect(html).toContain("Activité à vérifier");
+  expect(html).toContain("Relevé partiel");expect(html).toContain("Vérification réservée au propriétaire du budget");
+  expect(html).toContain('href="/studio/sav/intake?view=processing&amp;q=connexion&amp;sort=oldest&amp;page=1"');
+  expect(mocks.action).not.toHaveBeenCalled();
+});
+it.each([ ["cost","Coût IA à confirmer"],["effect","Action HubSpot ou Gmail à vérifier"],["both","Coût IA et action externe à vérifier"],["unknown","Incertitude à qualifier"] ])("renders %s uncertainty consistently without claiming completion",async(uncertainty,label)=>{
+ mocks.list.mockResolvedValue({...fixture,rows:[{...fixture.rows[0],status:"uncertain",reason:null,uncertainty}]});
+ expect(await renderList()).toContain(label);
+ mocks.detail.mockResolvedValue({...detail,projection:{...detail.projection,status:"uncertain"},uncertainty});
+ expect(await renderDetail()).toContain(label);expect(mocks.action).not.toHaveBeenCalled();
 });

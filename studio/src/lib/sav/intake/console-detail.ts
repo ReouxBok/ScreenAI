@@ -1,3 +1,4 @@
+import { readIntakeUncertainties } from "./uncertainty-read";
 import { intakeThreadHumanHeld } from "./legacy-pause";
 import { getSavExternalCompletion, readSavExternalCompletion, savExternalDisposition } from "../external-completion";
 import "server-only";
@@ -49,7 +50,8 @@ export async function readIntakeConsoleDetail(threadId: string) {
   const progress=latest ? await readIntakeExecutionProgress(latest.id) : null;
   const diagnostics=await readIntakeRunDiagnostics(threadId);
   const confirmedCurrent=Boolean(!marker && current && current.messageId===latest?.id && progress?.confirmed && progress.runId===current.id && progress.completionSourceHash && progress.completionSourceHash===current.currentSourceHash);
-  return { confirmedCurrent, humanHeld, thread: { id: thread.id, subject: latest?.subject ?? thread.subject, paused: thread.aiPaused, ticketId: thread.hubspotTicketId },
+  const uncertainty = latest ? await db.transaction(async tx => (await readIntakeUncertainties(tx, [latest.id]))[latest.id], { accessMode: "read only", isolationLevel: "repeatable read" }) : null;
+  return { uncertainty, confirmedCurrent, humanHeld, thread: { id: thread.id, subject: latest?.subject ?? thread.subject, paused: thread.aiPaused, ticketId: thread.hubspotTicketId },
     projection, handledExternally: Boolean(marker), latestMessageId: latest?.id ?? null, current, messages, historyTruncated: rows.length > 200,
     progress, choices, diagnostics };
 }

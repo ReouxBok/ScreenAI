@@ -1,3 +1,4 @@
+import { intakeUncertaintyLabel } from "@/lib/sav/intake/uncertainty";
 import { randomUUID } from "node:crypto";
 import { notFound } from "next/navigation";
 import { z } from "zod";
@@ -94,6 +95,7 @@ export default async function IntakeDetailPage({ params, searchParams }: { param
       ticketId={data.confirmedCurrent && data.progress?.ticketId ? data.progress.ticketId : target && target.operation !== "create" ? target.ticketId : undefined}
       confirmed={Boolean(data.confirmedCurrent)} creationPlanned={target?.operation === "create" && !data.confirmedCurrent}
       verifiedAt={data.confirmedCurrent ? data.progress?.effects.filter(e => e.state === "confirmed" && e.confirmedAt).map(e => e.confirmedAt!).sort((a,b)=>b.getTime()-a.getTime())[0]?.toISOString() : undefined}/>
+    {data.projection.status === "uncertain" && <p role="status">{intakeUncertaintyLabel(data.uncertainty)}. Les effets confirmés restent conservés ; ce résumé ne vaut pas résolution du dossier.</p>}
     <div className={styles.detailGrid}><div>
       <MailConversation messages={data.messages}/>
       {data.historyTruncated && <p role="status">Les 200 messages les plus récents sont affichés. L’historique est incomplet.</p>}

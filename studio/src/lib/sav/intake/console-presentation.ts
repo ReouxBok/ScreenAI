@@ -4,7 +4,7 @@ const statuses: Record<string, string> = {
   handled_externally: "Traité hors Studio", external_completion_pending: "Traitement externe à vérifier",
   historical_outside_automation: "Historique — hors automatisation",
   processing: "Traitement en cours", pending: "Analyse en attente", analysing: "Analyse en cours", observed: "Analyse prête, actions en attente",
-  waiting: "Vérification technique en attente", uncertain: "Résultat externe à rapprocher", running: "Vérification des actions en cours",
+  waiting: "Vérification technique en attente", uncertain: "Incertitude à qualifier", running: "Vérification des actions en cours",
   paused: "Dossier en pause", human_refused: "Proposition refusée", human_revalidation: "Choix enregistré, vérification en cours",
   human_revalidation_wait: "Choix en attente de preuves", identity_sent: "Demande d’identification envoyée", human_choice: "Choix humain attendu",
   followup_pending: "Actions confirmées, suivi en attente", followup_started: "Suivi démarré", context_changed: "Nouvelles preuves à vérifier",

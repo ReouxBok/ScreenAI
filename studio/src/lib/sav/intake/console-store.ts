@@ -1,3 +1,4 @@
+import { readIntakeUncertainties } from "./uncertainty-read";
 import { intakeHumanHoldSql, intakeThreadHumanHeld } from "./legacy-pause";
 import { readSavExternalCompletion, listSavExternalCompletionMessageIds } from "../external-completion";
 import "server-only";
@@ -172,6 +173,7 @@ export async function listIntakeConsole(options: { mailboxId?: string; view?: Sa
     }).from(savIntakeConsole).leftJoin(savMessages, latestMessageJoin).where(and(common, selected))
       // Projection refreshes must not reshuffle the chronological list.
       .orderBy(...(options.sort==="oldest"?[sql`${effectiveReceivedAt} asc nulls last`,asc(savMessages.createdAt),asc(savIntakeConsole.threadId)]:[sql`${effectiveReceivedAt} desc nulls last`,desc(savMessages.createdAt),desc(savIntakeConsole.threadId)])).limit(25).offset((currentPage - 1) * 25);
-    return { installed: true, counts: countMap, rows, page: currentPage, pages, total };
+    const uncertainties = await readIntakeUncertainties(tx, rows.filter(row => row.status === "uncertain" && row.messageId).map(row => row.messageId!));
+    return { installed: true, counts: countMap, rows: rows.map(row => ({ ...row, uncertainty: row.messageId ? uncertainties[row.messageId] ?? null : null })), page: currentPage, pages, total };
   }, { isolationLevel: "repeatable read", accessMode: "read only" });
 }

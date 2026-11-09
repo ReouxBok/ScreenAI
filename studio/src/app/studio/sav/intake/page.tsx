@@ -1,4 +1,7 @@
 import { synPreviewEnabled } from "@/lib/sav/local-syn";
+import { readIntakeMonitoring } from "@/lib/sav/intake/monitoring-read";
+import { intakeUncertaintyLabel } from "@/lib/sav/intake/uncertainty";
+import { MonitoringSummary } from "./monitoring-summary";
 import Link from "next/link";
 import { z } from "zod";
 import { formatParisDateTime } from "@/lib/paris-date";
@@ -17,7 +20,7 @@ export default async function IntakeConsolePage({ searchParams }: { searchParams
   const staff=await requireIntakeConsoleStaff();
   const query = await searchParams, selected = savIntakeViewSchema.safeParse(query.view);
   const view = selected.success ? selected.data : "processing", mailbox = z.uuid().safeParse(query.mailbox);
-  const data = await listIntakeConsole({ view, mailboxId: mailbox.success ? mailbox.data : undefined, search: query.q, page: Number(query.page) || 1, ...(query.sort==="oldest"?{sort:"oldest" as const}:{}) });
+  const [data, monitoring] = await Promise.all([listIntakeConsole({ view, mailboxId: mailbox.success ? mailbox.data : undefined, search: query.q, page: Number(query.page) || 1, ...(query.sort==="oldest"?{sort:"oldest" as const}:{}) }), readIntakeMonitoring()]);
   const href = (nextView: string, page = 1, search = query.q ?? "") => `/studio/sav/intake?${new URLSearchParams({ view: nextView, q: search.slice(0, 120),
     ...(mailbox.success ? { mailbox: mailbox.data } : {}), ...(["newest","oldest"].includes(query.sort??"")?{sort:query.sort!}:{}), page: String(page) })}`;
   const origin = href(view, data.page);
@@ -26,6 +29,7 @@ export default async function IntakeConsolePage({ searchParams }: { searchParams
     <header className={styles.heading}><div><span className="eyebrow">SAV · nouveaux dossiers</span><h1>Suivre le traitement</h1>
       <p>Les actions confirmées et le suivi réel déterminent l’avancement.</p></div><div className={styles.actions}>{["admin","owner"].includes(staff.role)&&<Link className="button secondary" href="/studio/sav/intake/launch">Administration du lancement</Link>}{staff.role==="admin"&&<Link className="button secondary" href="/studio/sav/intake/comparison">Comparaison des lecteurs</Link>}{staff.email===SAV_INTAKE_BUDGET_OWNER_EMAIL&&<Link className="button secondary" href="/studio/sav/intake/budget">Budget IA</Link>}<Link className="button secondary" href="/studio/sav/intake/agents">Accès agents</Link><Link className="button secondary" href="/studio/sav/v2">Pilote V2</Link>{demoConsoleEnabled()&&<Link className="button secondary" href="/studio/sav/intake/demo">Démonstration V2 (fictive)</Link>}<Link className="button secondary" href="/studio/sav/connaissances">Connaissances</Link><Link className="button secondary" href="/studio/sav?legacy=1">Archives supervisées</Link></div></header>
     {synPreviewEnabled() && <div className={styles.actions}><Link className="button secondary" href="/studio/sav/intake/pilot">Pilote connexion SYN · trois scénarios vérifiables</Link><span>Simulation locale, aucun envoi</span></div>}
+    <MonitoringSummary data={monitoring} refreshHref={origin}/>
     <AgentPauseBanner role={staff.role}/>
     {!data.installed ? <section className={styles.notice}><h2>Console non préparée</h2><p>Les données de ce parcours ne sont pas encore disponibles. La file supervisée reste accessible.</p></section> : <>
       <nav aria-label="Vues des nouveaux dossiers" className={styles.views}>
@@ -43,7 +47,7 @@ export default async function IntakeConsolePage({ searchParams }: { searchParams
       <section aria-label={view === "processing" ? "Traitements en cours" : savIntakeViewLabels[view]} className={styles.list}>
         {data.rows.length ? data.rows.map(row => <IntakeDossierLink key={row.threadId} id={row.threadId} origin={origin} href={intakeDossierHref(row.threadId, origin)} className={styles.row}>
           <div><strong>{row.subject || "Nouvelle demande"}</strong><span>{row.fromEmail ?? "Expéditeur en cours de préparation"}</span></div>
-          <div>{row.blockedCause ? <span className={row.blockedCause === "agent_paused" ? styles.status : styles.blocked}>{intakeBlockedCauseLabel(row.blockedCause)}</span> : row.retryAt ? <span className={styles.status}>{intakeRetryLabel(row.retryAt)}</span> : <span className={styles.status}>{intakeStatusLabel(row.status)}</span>}{row.reason && <small>{intakeReasonLabel(row.reason)}</small>}</div>
+          <div>{row.blockedCause ? <span className={row.blockedCause === "agent_paused" ? styles.status : styles.blocked}>{intakeBlockedCauseLabel(row.blockedCause)}</span> : row.retryAt ? <span className={styles.status}>{intakeRetryLabel(row.retryAt)}</span> : <span className={styles.status}>{row.status === "uncertain" ? intakeUncertaintyLabel(row.uncertainty) : intakeStatusLabel(row.status)}</span>}{row.reason && <small>{intakeReasonLabel(row.reason)}</small>}</div>
           <div><span>Version {row.version ?? "en attente"}</span><time dateTime={row.receivedAt?.toISOString()}>{row.receivedAt ? formatParisDateTime(row.receivedAt) : "Nouvelle entrée"}</time></div>
         </IntakeDossierLink>) : <div className={styles.empty}><h2>Aucun dossier dans cette vue</h2><p>{query.q ? "Aucun objet ou expéditeur ne correspond à la recherche." : "Les prochains dossiers apparaîtront ici selon leur avancement confirmé."}</p>{query.q && <Link href={href(view,1,"")}>Effacer la recherche</Link>}</div>}
       </section>

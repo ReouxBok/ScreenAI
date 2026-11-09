@@ -88,3 +88,14 @@
 .blockedCount { margin-left: 8px; font-style: normal; font-weight: 600; color: var(--red); }
 .blockedAlert { margin: 0; padding: 10px 14px; border: 1px solid var(--red); border-radius: 10px; font-size: 13px; color: var(--red); background: var(--paper); }
 .blocked { font-weight: 600; color: var(--red); }
+
+.monitoring { border-block: 1px solid var(--line); padding-block: 16px; font-size: 13px; line-height: 1.6; min-width: 0; }
+.monitoring header { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 12px; }
+.monitoring h2 { font-size: 16px; margin: 0; }
+.monitoring dl { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 16px; margin: 12px 0; }
+.monitoring dt { color: var(--muted); }
+.monitoring dd { margin: 0; overflow-wrap: anywhere; }
+.monitoring p { margin: 8px 0; color: var(--muted); }
+.monitoring summary, .monitoring a { min-height: 48px; display: inline-flex; align-items: center; text-decoration: underline; cursor: pointer; }
+.monitoring summary:focus-visible, .monitoring a:focus-visible { outline: 2px solid var(--ink); outline-offset: 4px; }
+@media (max-width: 640px) { .monitoring { font-size: 16px; } .monitoring dl { grid-template-columns: 1fr; gap: 12px; } }
