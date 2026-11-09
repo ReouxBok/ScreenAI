@@ -2263,7 +2263,10 @@ it("V1 integrated: absence, real reply, partial history, then observation outage
     });
     expect((await readIntakeRunDiagnostics(threadId))?.execution?.followup).toMatchObject({ observationState: "active", sourceErrors: 0 });
     expect(writes()).toHaveLength(writesBefore);
-});
+// This single integrated journey performs four analyses, durable execution and
+// two observation syncs on PGlite. CI exceeded the unit-test default of 5s;
+// retain every phase and assertion with a bounded integration-test deadline.
+}, 15_000);
 
 it("new-ticket history partial result keeps durable ID, uncertain state and never creates again", async () => {
     const historyId = "771", at = new Date(Date.now() - 3600000).toISOString();
