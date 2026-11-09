@@ -184,6 +184,8 @@ it("explains an incomplete inventory instead of silently hiding the direct Other
 
 it("separates permission from absent activity and preserves filters on the read-only refresh", async()=>{
   const html=await renderList({view:"processing",q:"connexion",page:"2",sort:"oldest"});
+  expect(html).toContain('<h2 id="sav-monitoring-heading">État de la prise en charge V1</h2>');
+  expect(html).not.toContain("État de l’agent");
   expect(html).toContain("Agent autorisé à travailler");expect(html).toContain("Activité à vérifier");
   expect(html).toContain("Relevé partiel");expect(html).toContain("Vérification réservée au propriétaire du budget");
   expect(html).toContain('href="/studio/sav/intake?view=processing&amp;q=connexion&amp;sort=oldest&amp;page=1"');
