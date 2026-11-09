@@ -5,7 +5,8 @@ import {warmSavJourneyRoutes} from "../helpers/journey-warmup";
 import {submitServerAction} from "../helpers/server-action";
 test.beforeAll(warmSavJourneyRoutes);
 const remote=()=>JSON.parse(readFileSync(".e2e-journey-provider.json","utf8"));
-test("SAV79 + SAV86: English registration clarification, French console, immutable source and one supervised send",async({page,baseURL},info)=>{
+// SAV-60 (decided by Ugo): the V0 dossier no longer sends (A09 retired) nor refreshes the CRM context after validation (A31).
+test("SAV79 + SAV86: English registration clarification, French console, immutable source, no send from the retired circuit",async({page,baseURL},info)=>{
  const external:string[]=[],errors:string[]=[];const before=remote().events.length;
  page.on("pageerror",error=>errors.push(error.message));
  await page.route("**/*",route=>{if(new URL(route.request().url()).origin!==baseURL){external.push(route.request().url());return route.abort();}return route.continue();});
@@ -24,19 +25,20 @@ test("SAV79 + SAV86: English registration clarification, French console, immutab
  await form.getByRole("checkbox",{name:"J’ai relu la demande et l’étape de vérification du compte.",exact:true}).check();
  await submitServerAction(page,form.getByRole("button",{name:"Valider le dossier",exact:true}));
  await page.waitForURL(/review=saved/, {timeout:60000});
- await expect(page.getByText("Contexte client actualisé.",{exact:true})).toBeVisible({timeout:60000});
+ await expect(page).not.toHaveURL(/refreshId=|context=/);
+ await expect(page.getByText("Contexte client actualisé",{exact:false})).toHaveCount(0);
  await expect(form.locator('input[name="humanAction"]')).toHaveCount(0);
  await expect(page.getByRole("checkbox",{name:"J’ai vérifié le compte du demandeur",exact:true})).not.toBeChecked();
  await expect(page.getByText("Fil Gmail suivi · couverture externe limitée · cycle 1",{exact:true})).toBeVisible();
  const send=draft.getByRole("button",{name:"Confirmer l’envoi de cette réponse",exact:true});
- await expect(send).toBeEnabled();await submitServerAction(page,send);await page.waitForURL(/review=reply_sent/,{timeout:60000});
- await expect(draft).toContainText("Réponse déjà envoyée");
- const effects=remote().events.slice(before);expect(effects.filter((e:{kind:string})=>e.kind!=="send")).toEqual([]);
- const sends=effects.filter((e:{kind:string;threadId:string})=>e.kind==="send"&&e.threadId==="journey-registration");expect(sends).toHaveLength(1);
- const mime=Buffer.from(sends[0].raw,"base64url").toString("utf8").replace(/\r\n/g,"\n");
- expect(mime).toContain("To: journey-registration@example.invalid");expect(mime).toContain("register with Limova");expect(mime).toContain("The Limova team");expect(mime).toContain("Reply prepared with AI assistance");expect(mime).not.toContain("L’équipe Limova");
- await page.reload();await expect(send).toBeDisabled();await expect(form.locator('input[name="humanAction"]')).toHaveCount(0);
- expect(remote().events.filter((e:{kind:string;threadId:string})=>e.kind==="send"&&e.threadId==="journey-registration")).toHaveLength(1);
+ await expect(send).toHaveCount(0);
+ await expect(draft.getByRole("status").filter({hasText:"Ancien circuit retiré : aucun envoi depuis ce dossier."})).toBeVisible();
+ await expect(page.getByRole("status").filter({hasText:"Ancien circuit retiré."}).getByRole("link",{name:"l’archive",exact:true})).toHaveAttribute("href",`/studio/sav/archives/${REGISTRATION_JOURNEY_ID}`);
+ // The English clarification stays readable and editable; nothing at all reaches the synthetic providers (no send, no CRM write).
+ await expect(draft.getByRole("textbox",{name:"Suggestion de réponse",exact:true})).toHaveValue(/register with Limova/);
+ expect(remote().events.slice(before)).toEqual([]);
+ await page.reload();await expect(send).toHaveCount(0);await expect(form.locator('input[name="humanAction"]')).toHaveCount(0);
+ expect(remote().events.filter((e:{kind:string;threadId:string})=>e.kind==="send"&&e.threadId==="journey-registration")).toHaveLength(0);
  expect(external).toEqual([]);expect(errors).toEqual([]);expect(readFileSync(".e2e-journey-blocked.log","utf8")).toBe("");
- await page.screenshot({path:info.outputPath("registration-english-send.png"),fullPage:true});
+ await page.screenshot({path:info.outputPath("registration-english-no-send.png"),fullPage:true});
 });

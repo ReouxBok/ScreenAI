@@ -17,6 +17,9 @@ const formPath = path.join(root, "src/app/studio/sav/intake/choice-form.tsx");
 const operatorPath = path.join(root,"src/app/studio/sav/intake/operator-form.tsx");
 const navPath = path.join(root, "src/app/studio/sav/intake/navigation.tsx");
 const linkStub = "import React from 'react';export default function Link({href,children,prefetch,scroll,replace,...props}){return React.createElement('a',{...props,href},children)}";
+// The Studio shell now renders the navigation trail (next/navigation) and checks the local SYN preview (process.env).
+// Same synthetic boundary as next/link: the URL hooks read the page location, the router only navigates in place.
+const navigationStub = "export function usePathname(){return location.pathname}export function useSearchParams(){return new URLSearchParams(location.search)}export function useRouter(){return{push:h=>{location.href=h},replace:h=>{location.replace(h)},back:()=>history.back(),refresh:()=>{},prefetch:()=>{}}}";
 const fakeActions = `export async function submitUxOrientation(previous,form){
  const command=Object.fromEntries(form);window.__uxCalls??=[];window.__uxCalls.push(command);
  if(command.reason.includes('pendant')){sessionStorage.setItem('ux-fixture-receipt:'+command.commandKey,JSON.stringify({eventId:'10000000-0000-4000-8000-000000000099',state:'pending',parentVersion:7}));await new Promise(resolve=>setTimeout(resolve,5000));}
@@ -61,13 +64,14 @@ let browser;
 try {
   const bundle = await build({ stdin: { contents: entry, resolveDir: root, loader: "js" }, bundle: true, write: false, format: "iife", platform: "browser", outfile: path.join(temporary,"ux.js"),
     nodePaths: [path.join(root,"node_modules")], alias: { "@": path.join(root,"src") }, loader: { ".css": "local-css" },
-    define: { "process.env.NODE_ENV": JSON.stringify("production"), "process.env.DEV_AUTH_BYPASS": JSON.stringify("false") },
+    define: { "process.env.NODE_ENV": JSON.stringify("production"), "process.env.DEV_AUTH_BYPASS": JSON.stringify("false"), "process.env": "{}" },
     plugins: [{ name: "synthetic-boundary", setup(b) {
       b.onResolve({filter:/^\.\/orientation-actions$/},args=>args.importer===formPath?{path:"actions",namespace:"ux"}:null);
       b.onResolve({filter:/^\.\/operator-actions$/},args=>args.importer===operatorPath?{path:"operator-actions",namespace:"ux"}:null);
       b.onResolve({filter:/^next\/link$/},()=>({path:"link",namespace:"ux"}));
+      b.onResolve({filter:/^next\/navigation$/},()=>({path:"navigation",namespace:"ux"}));
       b.onResolve({filter:/^@clerk\/nextjs$/},()=>({path:"identity",namespace:"ux"}));
-      b.onLoad({filter:/.*/,namespace:"ux"},args=>({contents:args.path==="actions"?fakeActions:args.path==="operator-actions"?fakeOperatorActions:args.path==="link"?linkStub:"export function UserButton(){return null}",loader:"js",resolveDir:root}));
+      b.onLoad({filter:/.*/,namespace:"ux"},args=>({contents:args.path==="actions"?fakeActions:args.path==="operator-actions"?fakeOperatorActions:args.path==="link"?linkStub:args.path==="navigation"?navigationStub:"export function UserButton(){return null}",loader:"js",resolveDir:root}));
     } }] });
   const js=bundle.outputFiles.find(f=>f.path.endsWith(".js")).text,css=bundle.outputFiles.find(f=>f.path.endsWith(".css"))?.text??"";
   const globals=await readFile(path.join(root,"src/app/globals.css"),"utf8");

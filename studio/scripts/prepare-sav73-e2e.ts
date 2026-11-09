@@ -2,6 +2,10 @@ import { createCipheriv, createHash, randomBytes } from "node:crypto";
 import path from "node:path";
 import { PGlite } from "@electric-sql/pglite";
 import { vector } from "@electric-sql/pglite-pgvector";
+import { drizzle } from "drizzle-orm/pglite";
+import * as schema from "../src/db/schema";
+import { withStudioDatabase, type requireDb } from "../src/db";
+import { refreshSavDashboardProjection } from "../src/lib/sav/dashboard-projection";
 import { SAV53_E2E_KEY, SAV53_THREADS, sav53Proposal } from "../test/sav53-e2e-fixture";
 const target = path.resolve(process.env.STUDIO_E2E_DB_DIR ?? ".e2e-sav73-db");
 if (process.env.NODE_ENV === "production" || process.env.DATABASE_URL !== `pglite://${target}` || process.env.SAV_ENCRYPTION_KEY_V1 !== SAV53_E2E_KEY || process.env.SAV_WRITES_DISABLED !== "true") throw new Error("LOCAL_SYNTHETIC_E2E_CONFIGURATION_REQUIRED");
@@ -22,5 +26,11 @@ try {
   await client.query(`UPDATE sav.agent_runs SET proposal_ciphertext=$1 WHERE message_id IN
     (SELECT id FROM sav.messages WHERE thread_id=$2)`,
     [encrypt({...sav53Proposal(false),replyDraft:"Bonjour, voici une suggestion IA synthétique à relire avant toute utilisation."}),SAV53_THREADS.singlePlain]);
-  console.log("SAV-73: thirty additional synthetic pagination dossiers prepared.");
+  // SAV-60 / UX-Q6 option A: opening the list is read-only and a stale projection answers "pending" until the cron step
+  // `dashboard_projection` refreshes it. No cron runs in this local bench, so the seed performs that same maintenance once,
+  // with the same function, before the server starts (no provider, no model call).
+  await withStudioDatabase(drizzle(client, { schema }) as unknown as ReturnType<typeof requireDb>, async () => {
+    while ((await refreshSavDashboardProjection(100)).refreshed) { /* every seeded dossier indexed */ }
+  });
+  console.log("SAV-73: thirty additional synthetic pagination dossiers prepared, dashboard projection current.");
 } finally { await client.close(); }

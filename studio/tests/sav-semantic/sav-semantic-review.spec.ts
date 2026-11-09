@@ -77,10 +77,12 @@ test("SAV44 exposes understanding and persists independent dossier/draft feedbac
 
   const ticketTitle = reviewForm.getByRole("textbox", { name: "Titre (4 à 6 mots)", exact: true });
   await expect(ticketTitle).toHaveValue("Échec export PDF fictif");
-  const preview = draft.locator("form").filter({has:page.getByRole("button",{name:"Confirmer l’envoi de cette réponse",exact:true})});
-  await expect(preview.locator("pre")).toContainText("L’équipe Limova");
-  await expect(preview.locator("pre")).toContainText("validée par notre équipe");
-  await expect(preview.locator("pre")).not.toContainText("envoyée automatiquement");
+  // SAV-60 (decided by Ugo): the suggestion is no longer sent from the V0 dossier. No send form, no outbound preview (the AI
+  // mention of a sent reply now belongs to the V2 reply contract), a stated reason, and the read-only archive.
+  await expect(draft.getByRole("button", { name: "Confirmer l’envoi de cette réponse", exact: true })).toHaveCount(0);
+  await expect(draft.locator('input[name="outboundHash"], input[name="recipient"]')).toHaveCount(0);
+  await expect(draft.getByRole("status").filter({ hasText: "Ancien circuit retiré : aucun envoi depuis ce dossier." })).toBeVisible();
+  await expect(page.getByRole("status").filter({ hasText: "Ancien circuit retiré." }).getByRole("link", { name: "l’archive", exact: true })).toHaveAttribute("href", `/studio/sav/archives/${SAV_SEMANTIC_E2E_THREAD}`);
   await expect(reviewForm.getByRole("radio")).toHaveCount(6);
   for (const action of ["partnership", "commercial", "no_ticket", "link_ticket", "reopen_ticket", "create_ticket"]) {
     await reviewForm.locator(`label:has(input[name="humanAction"][value="${action}"])`).click();
@@ -133,15 +135,25 @@ test("SAV44 exposes understanding and persists independent dossier/draft feedbac
   // Match its existing humanProcess multipart contract, excluding recordOpened JSON.
   await submitServerAction(page, dossier.getByRole("button", { name: "Valider le dossier", exact: true }), /name="(?:_\d+_)?humanProcess"/);
   await page.waitForURL(/review=saved/, { timeout: 30_000 });
-  // This harness has no CRM credentials. The fresh context read must fail;
-  // a cached ready snapshot before that asynchronous result is not readiness.
-  await expect(page.getByText("Contexte non confirmé. Utilisez Actualiser le contexte client pour reprendre.", { exact: true })).toBeVisible({ timeout: 30_000 });
-  await expect(page.getByText("Le contexte HubSpot est indisponible ou incomplet. Actualisez-le avant de choisir une action.", { exact: true })).toBeVisible();
+  // SAV-60 (decided by Ugo): validating no longer schedules the retired context refresh (A31), so no "context not confirmed"
+  // progress appears and the stored context stays displayed. The safety gate is now server side: this harness has no CRM
+  // credentials, so preparing the preview is refused, no preview and no confirmation are offered, nothing is written.
+  const execution = page.getByLabel("Exécution de l’action", { exact: true });
+  const prepare = page.getByRole("button", { name: "Préparer l’aperçu de l’action", exact: true });
+  await expect(page.getByText("Contexte non confirmé", { exact: false })).toHaveCount(0);
+  await expect(page).not.toHaveURL(/refreshId=|context=/);
+  await expect(page.getByText("Contexte collecté le", { exact: false })).toBeVisible();
+  const refusePreview = async () => {
+    await prepare.click();
+    await expect(execution).toContainText("La demande HubSpot n’a pas pu être confirmée. Faites vérifier le journal d’actions avant de reprendre.", { timeout: 30_000 });
+    await expect(execution.getByRole("region", { name: "Aperçu de l’action HubSpot", exact: true })).toHaveCount(0);
+    await expect(execution.getByRole("button", { name: /^Confirmer :/ })).toHaveCount(0);
+  };
+  await refusePreview();
   await expect(dossier).toContainText("Dossier · validé par ugo@limova.ai");
   await expect(draft).toContainText("Suggestion disponible");
   await expect(draft.getByRole("button", { name: "Accepter cette version", exact: true })).toHaveCount(0);
-  await expect(page.getByRole("button", { name: "Préparer l’aperçu de l’action", exact: true })).toBeDisabled();
-  await expect(draft.getByRole("button", { name: "Confirmer l’envoi de cette réponse", exact: true })).toBeDisabled();
+  await expect(draft.getByRole("button", { name: "Confirmer l’envoi de cette réponse", exact: true })).toHaveCount(0);
 
   await page.reload();
   await expect(page.getByRole("checkbox", { name: "J’ai vérifié le compte du demandeur", exact: true })).toBeChecked();
@@ -160,8 +172,8 @@ test("SAV44 exposes understanding and persists independent dossier/draft feedbac
   await openUnderstanding();
   await expect(understanding).toContainText("L’export du document échoue malgré une nouvelle tentative.");
   await expect(page.getByText("Aucun ticket lié à ce dossier.", { exact: true })).toBeVisible();
-  await expect(page.getByRole("button", { name: "Préparer l’aperçu de l’action", exact: true })).toBeDisabled();
-  await expect(draft.getByRole("button", { name: "Confirmer l’envoi de cette réponse", exact: true })).toBeDisabled();
+  await refusePreview(); // still refused after a reload, still no ticket linked
+  await expect(draft.getByRole("button", { name: "Confirmer l’envoi de cette réponse", exact: true })).toHaveCount(0);
   expect(externalRequests).toEqual([]); expect(browserErrors).toEqual([]);
   await page.screenshot({ path: testInfo.outputPath("sav44-independent-semantic-review.png"), fullPage: true });
   await page.setViewportSize({ width: 390, height: 844 });

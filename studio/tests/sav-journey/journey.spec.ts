@@ -7,7 +7,9 @@ test.beforeAll(warmSavJourneyRoutes);
 const statePath = ".e2e-journey-provider.json";
 function remote() { return JSON.parse(readFileSync(statePath, "utf8")); }
 for (const key of JOURNEY_CASES) {
-  test(`${key}: review → preview → confirmed result → draft → supervised synthetic send → inbox`, async ({ page, baseURL }, testInfo) => {
+  // SAV-60 (decided by Ugo): the V0 dossier no longer sends the suggested reply (A09 retired) and no longer refreshes the CRM
+  // context. The review, the HubSpot preview and its confirmed result remain; the reply part now proves that nothing is sent.
+  test(`${key}: review → preview → confirmed result → draft kept, no send from the retired circuit → inbox`, async ({ page, baseURL }, testInfo) => {
     const external: string[] = [], errors: string[] = [], started = Date.now();
     let clicks = 0;
     await page.route("**/*", route => {
@@ -27,7 +29,8 @@ for (const key of JOURNEY_CASES) {
     if(key==="link") {
       await expect(page.getByText("Original affiché · traduction partielle non affichée.",{exact:true})).toBeVisible();
       await expect(page.locator("#sav-draft").getByRole("textbox",{name:"Suggestion de réponse",exact:true})).not.toHaveValue("Ancienne version humaine périmée.");
-      await expect(page.locator("#sav-draft form").filter({has:page.getByRole("button",{name:"Confirmer l’envoi de cette réponse",exact:true})})).toContainText("Cette réponse a été rédigée avec l’aide de notre agent IA. L’IA peut se tromper. Si quelque chose ne fonctionne pas ou si vous avez une question, n’hésitez pas à répondre à ce message.");
+      // The outbound preview carrying the AI mention left with the send form; the V2 reply contract owns that mention now.
+      await expect(page.locator("#sav-draft").locator('input[name="outboundHash"], input[name="recipient"]')).toHaveCount(0);
     }
     if(key==="waiting") await expect(page.getByText("Ce mail a été traduit",{exact:false})).toHaveCount(0);
     if(key==="create")await page.screenshot({path:testInfo.outputPath("sav86-translation-original.png"),fullPage:true});
@@ -36,10 +39,14 @@ for (const key of JOURNEY_CASES) {
     const execution = page.getByLabel("Exécution de l’action", { exact: true });
     const prepare = execution.getByRole("button", { name: "Préparer l’aperçu de l’action", exact: true });
     await expect(prepare).toBeDisabled();
-    if(key==="reopen") {
-      await expect(draft.getByRole("button", { name: "Confirmer l’envoi de cette réponse", exact: true })).toBeDisabled();
-      await expect(draft.getByRole("alert")).toContainText("Rédigez une réponse humaine adaptée");
-    } else await expect(draft.getByRole("button", { name: "Confirmer l’envoi de cette réponse", exact: true })).toBeEnabled();
+    const noSend = async () => {
+      await expect(draft.getByRole("button", { name: "Confirmer l’envoi de cette réponse", exact: true })).toHaveCount(0);
+      await expect(draft.getByRole("status").filter({ hasText: "Ancien circuit retiré : aucun envoi depuis ce dossier." })).toBeVisible();
+      expect(remote().events.filter((e: {kind:string;threadId?:string}) => e.kind === "send" && e.threadId === `journey-${key}`)).toEqual([]);
+    };
+    await noSend();
+    const notice = page.getByRole("status").filter({ hasText: "Ancien circuit retiré." });
+    await expect(notice.getByRole("link", { name: "l’archive", exact: true })).toHaveAttribute("href", `/studio/sav/archives/${journeyId(key)}`);
     if (key !== "create") {
       await review.getByRole("radiogroup", { name: "Ticket concerné", exact: true }).getByRole("radio").check(); clicks++;
     }
@@ -74,20 +81,6 @@ for (const key of JOURNEY_CASES) {
       expect(remote().events.length).toBe(before);
     } else {
       await expect(execution).toContainText("Action déjà traitée pour cet email");
-      // Reproduce the CI race: a real completed context response arrives while
-      // the send action is pending. Do not fake provider or freshness results.
-      let releaseContext: (() => void) | undefined;
-      let contextReleasedDuringSend = false;
-      if (key === "successor") {
-        const sendStarted = new Promise<void>(resolve => { releaseContext = resolve; });
-        await page.route("**/status?refreshId=*", async route => {
-          // Only this read-only poll may retry ECONNRESET from the local dev
-          // server. The send POST is fetched exactly once by the action helper.
-          const response = await route.fetch({ maxRetries: 2 });
-          if ((await response.json()).context === "completed") await sendStarted;
-          await route.fulfill({ response, body: await response.body() });
-        });
-      }
       await page.reload();
       await expect(execution).toContainText("Action déjà traitée pour cet email");
       if (key === "link") await expect(page.getByRole("link", { name: /Échec export PDF fictif/ }).first()).toHaveAttribute("href", /ticket\/991002$/);
@@ -98,32 +91,18 @@ for (const key of JOURNEY_CASES) {
       expect(notes).toHaveLength(["waiting", "reopen", "retry"].includes(key) ? 1 : 0);
       if (["waiting", "reopen", "retry"].includes(key)) expect(state.tickets[ticketId].properties).toMatchObject({ hs_pipeline_stage: "1", hubspot_owner_id: "999201" });
       const corrected = key === "create" ? "Hello, please send us the exact PDF export error message. We have noted your new attempt." : "Bonjour,\n\nPouvez-vous nous transmettre le message d’erreur exact de l’export PDF ? Nous avons bien noté votre nouvel essai.\n\nMerci pour votre aide.";
-      await draft.getByRole("textbox", { name: "Suggestion de réponse", exact: true }).fill(corrected);
-      await expect(draft.getByRole("button", { name: "Confirmer l’envoi de cette réponse", exact: true })).toBeEnabled();
+      // The human version can still be edited and saved (A06 kept); saving sends nothing and needs no acceptance step.
+      const textbox = draft.getByRole("textbox", { name: "Suggestion de réponse", exact: true });
+      await textbox.fill(corrected);
       await expect(draft.getByRole("button", { name: "Accepter cette version", exact: true })).toHaveCount(0);
-      // No save/accept step: one confirmation binds the edited preview and recipient.
-      await expect(draft).toContainText(`journey-${key}@example.invalid`);
-      await submitServerAction(page, draft.getByRole("button", { name: "Confirmer l’envoi de cette réponse", exact: true }), undefined,
-        key === "successor" ? async () => {
-          releaseContext?.();
-          await expect(page.getByText("Contexte client actualisé.", { exact: true })).toBeVisible();
-          contextReleasedDuringSend = true;
-        } : undefined); clicks++;
-      if (key === "successor") expect(contextReleasedDuringSend).toBe(true);
-      await page.waitForURL(/review=reply_sent/);
-      await expect(draft).toContainText("Réponse déjà envoyée");
-      const sends = remote().events.filter((e: {kind:string;threadId?:string}) => e.kind === "send" && e.threadId === `journey-${key}`);
-      expect(sends).toHaveLength(1);
-      const mime = Buffer.from(sends[0].raw, "base64url").toString("utf8").replace(/\r\n/g, "\n");
-      expect(mime).toContain(`To: journey-${key}@example.invalid`);
-      expect(mime).toContain(corrected);
-      expect(mime).toContain(key === "create" ? "The Limova team" : "L’équipe Limova");
-      expect(mime).not.toContain("envoyée automatiquement");
-      expect(mime).not.toContain("validée par notre équipe");
-      expect(mime).toContain(`In-Reply-To: <journey-${key}@example.invalid>`);
-      if(key==="create")await page.screenshot({path:testInfo.outputPath("sav86-send-confirmed.png"),fullPage:true});
+      await submitServerAction(page, draft.getByRole("button", { name: "Enregistrer ma version", exact: true })); clicks++;
+      await page.waitForURL(/review=draft_saved/);
       await page.reload();
-      await expect(draft.getByRole("button", { name: "Confirmer l’envoi de cette réponse", exact: true })).toBeDisabled();
+      await expect(textbox).toHaveValue(corrected);
+      await expect(draft).not.toContainText("Réponse déjà envoyée");
+      await noSend();
+      expect(remote().events.filter((e: {kind:string}) => e.kind === "send")).toEqual([]);
+      if(key==="create")await page.screenshot({path:testInfo.outputPath("sav86-draft-kept-no-send.png"),fullPage:true});
     }
     await page.getByRole("link", { name: "← Retour aux dossiers", exact: true }).click(); clicks++;
     await expect(page).toHaveURL(/view=to_validate.*q=journey/, { timeout: 60_000 });

@@ -16,7 +16,7 @@ export default defineConfig({
   expect: { timeout:15000 }, outputDir:"test-results/sav73",
   use: { baseURL: `http://127.0.0.1:${port}`, trace: "retain-on-failure", screenshot: "only-on-failure", launchOptions: process.env.STUDIO_E2E_CHROMIUM_PATH ? { executablePath: process.env.STUDIO_E2E_CHROMIUM_PATH } : {} },
   webServer: {
-    command: `node_modules/.bin/tsx scripts/prepare-e2e.ts && node_modules/.bin/tsx scripts/prepare-sav53-e2e.ts && node_modules/.bin/tsx scripts/prepare-sav73-e2e.ts && node_modules/.bin/next dev --webpack --hostname 127.0.0.1 -p ${port}`,
+    command: `node_modules/.bin/tsx scripts/prepare-e2e.ts && node_modules/.bin/tsx scripts/prepare-sav53-e2e.ts && node --import ./test/e2e-server-only-hook.mjs --import tsx scripts/prepare-sav73-e2e.ts && node_modules/.bin/next dev --webpack --hostname 127.0.0.1 -p ${port}`,
     // Compile and load the seeded dossier before the browser scenario timeout starts.
     url: `http://127.0.0.1:${port}/studio/sav/${SAV53_THREADS.conversation}`, timeout: 300000, reuseExistingServer: false, stdout: "pipe", stderr: "pipe",
     env: {
