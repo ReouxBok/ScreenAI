@@ -1,7 +1,7 @@
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { eq } from "drizzle-orm";
 import { createSavTestDb } from "../../../test/sav-db";
-import { auditLogs, categories, contentItems, contentVersions, knowledgeFamilies, knowledgeProjectionCandidates, savKnowledgeActivations, savKnowledgeProposalDrafts, savKnowledgePublicationAttempts, savLearningCandidates } from "@/db/schema";
+import { auditLogs, categories, contentItems, contentVersions, knowledgeFamilies, knowledgeFamilySources, knowledgeProjectionCandidates, savKnowledgeActivations, savKnowledgeProposalDrafts, savKnowledgePublicationAttempts, savLearningCandidates } from "@/db/schema";
 import type { SavSupportDelivery } from "./support-delivery";
 import type { SaveSavKnowledgeProposalInput } from "./proposals";
 import { canonicalKnowledgeSchema } from "./contracts";
@@ -95,6 +95,80 @@ describe("SAV-55 canonical knowledge workspace", () => {
     expect((await paginateSavKnowledge({ tab: "production" })).rows[0]).toMatchObject({ origin: "human", hasPendingUpdate: false });
     expect((await getSavKnowledgeDetail({ itemId: approved.targetItemId! }, actor))?.relatedWork).toEqual([]);
     expect((await getSavKnowledgeDetail({ itemId: approved.targetItemId! }, actor))?.sources[0].ref).toBe(proposal.sources[0].ref);
+  });
+  it.each([true, false])("activates its approved self-source after publication (pinned=%s)", async pinned => {
+    const first = await active();
+    const source = `content:${first.targetItemId}${pinned ? `:${first.materializedVersionId}` : ""}`;
+    const approved = await approve(await submit({ ...proposal, mode: "improve", targetItemId: first.targetItemId!, sources: [{ ref: source, label: "Previously approved version" }] }));
+    await publishSavKnowledgeVersion({ itemId: approved.targetItemId!, expectedVersionId: approved.materializedVersionId! }, actor);
+    await activateSavKnowledgeVersion({ itemId: approved.targetItemId!, expectedPublishedVersionId: approved.materializedVersionId!, expectedActiveVersionId: first.materializedVersionId! }, actor);
+    expect((await fixture.db.select().from(savKnowledgeActivations))[0].versionId).toBe(approved.materializedVersionId);
+  });
+  it("preserves the historical source title when its own approved publication renames the item", async () => {
+    const first = await active();
+    const approved = await approve(await submit({ ...proposal, title: "New approved demonstration title", mode: "improve", targetItemId: first.targetItemId!, sources: [{ ref: `content:${first.targetItemId}:${first.materializedVersionId}`, label: "Approved base" }] }));
+    await publishSavKnowledgeVersion({ itemId: approved.targetItemId!, expectedVersionId: approved.materializedVersionId! }, actor);
+    await activateSavKnowledgeVersion({ itemId: approved.targetItemId!, expectedPublishedVersionId: approved.materializedVersionId!, expectedActiveVersionId: first.materializedVersionId! }, actor);
+    expect((await fixture.db.select().from(savKnowledgeActivations))[0].versionId).toBe(approved.materializedVersionId);
+  });
+  it.each(["title", "archive", "approval", "hash", "base", "other_publication", "other_activation"])("self-source exception remains closed after %s changes", async change => {
+    const first = await active();
+    const approved = await approve(await submit({ ...proposal, mode: "improve", targetItemId: first.targetItemId!, sources: [{ ref: `content:${first.targetItemId}:${first.materializedVersionId}`, label: "Approved base" }] }));
+    await publishSavKnowledgeVersion({ itemId: approved.targetItemId!, expectedVersionId: approved.materializedVersionId! }, actor);
+    if (change === "title") await fixture.db.update(contentItems).set({ title: "Independent unapproved title" }).where(eq(contentItems.id, first.targetItemId!));
+    if (change === "archive") await fixture.db.update(contentItems).set({ status: "archived" }).where(eq(contentItems.id, first.targetItemId!));
+    if (change === "approval") await fixture.db.update(knowledgeProjectionCandidates).set({ status: "rejected" }).where(eq(knowledgeProjectionCandidates.id, approved.id));
+    if (change === "base") await fixture.db.update(knowledgeProjectionCandidates).set({ baseVersionId: approved.materializedVersionId }).where(eq(knowledgeProjectionCandidates.id, approved.id));
+    if (change === "hash") {
+      const [source] = await fixture.db.select().from(knowledgeFamilySources).where(eq(knowledgeFamilySources.id, approved.sourceId));
+      await fixture.db.update(knowledgeFamilySources).set({ evidence: { ...source.evidence, sourceHash: "changed" } }).where(eq(knowledgeFamilySources.id, source.id));
+    }
+    if (change === "other_publication") await fixture.db.update(contentItems).set({ publishedVersionId: first.materializedVersionId }).where(eq(contentItems.id, first.targetItemId!));
+    if (change === "other_activation") await fixture.db.update(savKnowledgeActivations).set({ versionId: approved.materializedVersionId! }).where(eq(savKnowledgeActivations.itemId, first.targetItemId!));
+    const before = await fixture.db.select().from(savKnowledgeActivations);
+    const auditBefore = await fixture.db.select().from(auditLogs);
+    await expect(activateSavKnowledgeVersion({ itemId: approved.targetItemId!, expectedPublishedVersionId: approved.materializedVersionId!, expectedActiveVersionId: first.materializedVersionId! }, actor)).rejects.toThrow();
+    expect(await fixture.db.select().from(savKnowledgeActivations)).toEqual(before);
+    expect(await fixture.db.select().from(auditLogs)).toEqual(auditBefore);
+  });
+  it.each(["title", "version"])("self-source does not hide another source's %s change", async change => {
+    const first = await active();
+    const external = await approve(await submit({ ...proposal, title: "Separate source" }));
+    await publishSavKnowledgeVersion({ itemId: external.targetItemId!, expectedVersionId: external.materializedVersionId! }, actor);
+    const approved = await approve(await submit({ ...proposal, mode: "improve", targetItemId: first.targetItemId!, sources: [
+      { ref: `content:${first.targetItemId}:${first.materializedVersionId}`, label: "Approved base" },
+      { ref: `content:${external.targetItemId}:${external.materializedVersionId}`, label: "External proof" },
+    ] }));
+    await publishSavKnowledgeVersion({ itemId: approved.targetItemId!, expectedVersionId: approved.materializedVersionId! }, actor);
+    await fixture.db.update(contentItems).set(change === "title" ? { title: "External changed title" } : { publishedVersionId: null }).where(eq(contentItems.id, external.targetItemId!));
+    await expect(activateSavKnowledgeVersion({ itemId: approved.targetItemId!, expectedPublishedVersionId: approved.materializedVersionId!, expectedActiveVersionId: first.materializedVersionId! }, actor)).rejects.toThrow("KNOWLEDGE_SOURCE_STALE");
+    expect((await fixture.db.select().from(savKnowledgeActivations))[0].versionId).toBe(first.materializedVersionId);
+  });
+  it.each([":extra", ":"])("refuses trailing reference segments %s", async suffix => {
+    const first = await active();
+    await expect(submit({ ...proposal, mode: "improve", targetItemId: first.targetItemId!, sources: [{ ref: `content:${first.targetItemId}:${first.materializedVersionId}${suffix}`, label: "Invalid reference" }] })).rejects.toThrow("KNOWLEDGE_SOURCE_REFERENCE_INVALID");
+  });
+  it("fails closed when the historical title cannot be proven", async () => {
+    const first = await active();
+    const approved = await approve(await submit({ ...proposal, mode: "improve", targetItemId: first.targetItemId!, sources: [{ ref: `content:${first.targetItemId}:${first.materializedVersionId}`, label: "Approved base" }] }));
+    await publishSavKnowledgeVersion({ itemId: approved.targetItemId!, expectedVersionId: approved.materializedVersionId! }, actor);
+    const [base] = await fixture.db.select().from(contentVersions).where(eq(contentVersions.id, first.materializedVersionId!));
+    const metadata = articleMetadataSchema.parse(base.metadata);
+    delete metadata.sourceMetadata?.knowledgeTitle;
+    delete metadata.sourceMetadata?.sourceTitle;
+    await fixture.db.update(contentVersions).set({ metadata }).where(eq(contentVersions.id, base.id));
+    await expect(activateSavKnowledgeVersion({ itemId: approved.targetItemId!, expectedPublishedVersionId: approved.materializedVersionId!, expectedActiveVersionId: first.materializedVersionId! }, actor)).rejects.toThrow("KNOWLEDGE_SOURCE_STALE");
+  });
+  it("preserves audited restoration and reactivation of a self-referenced amendment", async () => {
+    const first = await active();
+    const approved = await approve(await submit({ ...proposal, mode: "improve", targetItemId: first.targetItemId!, sources: [{ ref: `content:${first.targetItemId}:${first.materializedVersionId}`, label: "Approved base" }] }));
+    await publishSavKnowledgeVersion({ itemId: approved.targetItemId!, expectedVersionId: approved.materializedVersionId! }, actor);
+    await activateSavKnowledgeVersion({ itemId: approved.targetItemId!, expectedPublishedVersionId: approved.materializedVersionId!, expectedActiveVersionId: first.materializedVersionId! }, actor);
+    await rollback(first.targetItemId!, first.materializedVersionId!, actor, "Restore the previously reviewed version.");
+    await activateSavKnowledgeVersion({ itemId: first.targetItemId!, expectedPublishedVersionId: first.materializedVersionId!, expectedActiveVersionId: approved.materializedVersionId! }, actor);
+    await rollback(approved.targetItemId!, approved.materializedVersionId!, actor, "Restore the reviewed amendment separately.");
+    await activateSavKnowledgeVersion({ itemId: approved.targetItemId!, expectedPublishedVersionId: approved.materializedVersionId!, expectedActiveVersionId: first.materializedVersionId! }, actor);
+    expect((await fixture.db.select().from(savKnowledgeActivations))[0].versionId).toBe(approved.materializedVersionId);
   });
   it("never offers another proposal’s publication or activation on an unapproved revision", async () => {
     const first = await active();
