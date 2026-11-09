@@ -2,16 +2,14 @@ import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } 
 import { eq } from "drizzle-orm";
 import { createSavTestDb } from "../../../../test/sav-db";
 import { savActions, savMailboxes, savMessages, savThreads, staffUsers, savSyncState } from "@/db/schema";
-import { encryptSavPayload, decryptSavPayload } from "../crypto";
+import { encryptSavPayload } from "../crypto";
 import { activateSavV0Cutover } from "../cutover";
 import type { IntakePlan } from "./engine-types";
 import { savIntakeDecisionSchema, SAV_INTAKE_CONTRACT_REVISION } from "./contract";
 import { prepareSavCommercialForward, queueSavCommercialForward } from "./commercial-forward";
-import { savAgentPauseKey, SAV_AGENT_PAUSE_REVISION } from "./agent-pause";
-import { commercialForwardResourceSchema } from "./commercial-forward-contract";
 import { retrySavAction } from "../service";
 import { processPendingGmailSendActions } from "../gmail";
-const state = vi.hoisted(() => ({ db: null as unknown, current: null as any, policy: null as any, actor: "contact@limova.ai" }));
+const state = vi.hoisted(() => ({ db: null as unknown, actor: "contact@limova.ai" }));
 vi.mock("@/db", () => ({ requireDb: () => state.db }));
 vi.mock("@clerk/nextjs/server", () => ({ currentUser: async () => ({id:"synthetic-clerk",primaryEmailAddress:{emailAddress:state.actor,verification:{status:"verified"}}}) }));
 import {createHash} from "node:crypto";
@@ -19,15 +17,14 @@ import {savIntakeRuntimeConfig,intakeRuntimeHash,SAV_INTAKE_RUNTIME_REVISION} fr
 import {enqueueSavIntakeMessage,claimSavIntakeRun,saveSavIntakeResult,readSavIntakeCurrent} from "./runtime-store";
 import {savIntakePlanFingerprint} from "./engine";
 import {savIntakeOccupations} from "@/db/schema";
-let fixture: Awaited<ReturnType<typeof createSavTestDb>>, threadId: string, messageId: string, raw: any, failSend = false;
+let fixture: Awaited<ReturnType<typeof createSavTestDb>>, threadId: string, messageId: string, failSend = false;
 let config:NonNullable<ReturnType<typeof savIntakeRuntimeConfig>>;
 const recipient = "commercial-desk@example.invalid", body = "Bonjour, nous souhaitons un devis pour un nouveau projet.";
 const resource = { schema: "sav-commercial-forward.v1", recipient, subjectPrefix: "Demande commerciale", introduction: "Demande à examiner par votre équipe.", policy: "Only a genuine commercial request, with explicit operator confirmation." };
-const network = vi.fn(async (url: string | URL | Request, init?: RequestInit) => { const u = String(url); if(u.endsWith("/crm/v3/objects/contacts/search")) return Response.json({results:[]}); if (u.includes("oauth2.googleapis.com/token"))
+const network = vi.fn(async (url: string | URL | Request) => { const u = String(url); if(u.endsWith("/crm/v3/objects/contacts/search")) return Response.json({results:[]}); if (u.includes("oauth2.googleapis.com/token"))
     return Response.json({ access_token: "fixture", expires_in: 3600 }); if (u.includes("/messages?"))
     return Response.json({ messages: [] }); if (u.includes("/threads/"))
     return Response.json({ messages: [{ id: "gmail-original", internalDate: "1790942460000", labelIds: ["INBOX"], payload: { headers: [{ name: "From", value: "fiction@example.invalid" }] } }] }); if (u.endsWith("/messages/send")) {
-    raw = JSON.parse(String(init?.body));
     if (failSend)
         throw Error("fixture-timeout");
     return Response.json({ id: "ack", threadId: "internal-new-thread" });
@@ -42,7 +39,6 @@ beforeEach(async () => {
     vi.stubGlobal("__savGmailToken", undefined);
     vi.stubGlobal("fetch", network);
     network.mockClear();
-    raw = null;
     failSend = false;
     state.actor = "contact@limova.ai";
     await fixture.client.exec("TRUNCATE sav.intake_occupations,sav.intake_executions,sav.intake_execution_policies,sav.intake_model_calls,sav.mailboxes CASCADE; TRUNCATE sav.sync_state; TRUNCATE audit_logs; TRUNCATE staff_users CASCADE");
@@ -54,16 +50,16 @@ beforeEach(async () => {
     const [message] = await fixture.db.insert(savMessages).values({ mailboxId: mailbox.id, threadId, gmailMessageId: "gmail-original", direction: "inbound", toEmails:["contact@limova.ai"], fromEmail: thread.customerEmail, subject: "Devis", bodyCiphertext: encryptSavPayload({ text: body }), receivedAt: new Date("2026-10-02T12:01:00Z") }).returning();
     messageId = message.id;
     const ref = { resourceId: "synthetic-commercial", revisionId: "synthetic-v1", sha256: createHash("sha256").update(JSON.stringify(resource)).digest("hex") };
-    state.policy = {relationRevision:"synthetic-no-relations",admittedRelations:[], resources: { commercial: ref } };
+    const policy = {relationRevision:"synthetic-no-relations",admittedRelations:[], resources: { commercial: ref } };
     vi.stubEnv("SAV_INTAKE_RUNTIME_RESOURCES", JSON.stringify([{resource:ref,text:JSON.stringify(resource),approvalId:"fixture-approval",approvedBy:"fixture-admin",approvedAt:new Date(Date.now()-1000).toISOString(),status:"approved"}]));
-    state.current = { id: crypto.randomUUID(), messageId, fresh: true, sourceMatches: true, currentSourceHash: "source", leaseToken: null, leaseUntil: null, payload: { plan: { supervisedResource: ref, decision: { revision: SAV_INTAKE_CONTRACT_REVISION, messageId, latestInboundMessageId: messageId, threadId, receivedAt: message.receivedAt.toISOString(), classification: "commercial", requests: [{ id: "request", kind: "commercial", evidenceIds: ["current"] }], evidence: [{ id: "current", source: "current_message", sourceId: messageId, observedAt: new Date().toISOString(), contentHash: "a".repeat(43) }], disposition: { kind: "no_ticket", reason: "outside_support", nextAction: "supervised_commercial", learning: "excluded", evidenceIds: ["current"] } } } } };
-    const pins={mailboxId:mailbox.id,receivedAfter:"2026-10-02T12:00:00.000Z",createdAfter:new Date(Date.now()-60000).toISOString(),expiresAt:new Date(Date.now()+3600000).toISOString(),codeRevision:"a".repeat(40),policyHash:intakeRuntimeHash(state.policy),resourcesHash:intakeRuntimeHash(JSON.parse(process.env.SAV_INTAKE_RUNTIME_RESOURCES!)),maxNanoUsd:3000000000,maxCalls:30};
-    for(const [k,v] of Object.entries({SAV_INTAKE_RUNTIME_MODE:"observe",SAV_CODE_REVISION:pins.codeRevision,SAV_AI_MODEL:"gemini-3.6-flash",SAV_GEMINI_API_KEY:"fake-model",HUBSPOT_ACCESS_TOKEN:"fake-crm",SAV_INTAKE_RUNTIME_POLICY:JSON.stringify(state.policy),SAV_INTAKE_RUNTIME_CONFIG:JSON.stringify(pins),SAV_INTAKE_EXECUTION_MODE:"execute"}))vi.stubEnv(k,v);
+    const decision = savIntakeDecisionSchema.parse({ revision: SAV_INTAKE_CONTRACT_REVISION, messageId, latestInboundMessageId: messageId, threadId, receivedAt: message.receivedAt.toISOString(), classification: "commercial", requests: [{ id: "request", kind: "commercial", evidenceIds: ["current"] }], evidence: [{ id: "current", source: "current_message", sourceId: messageId, observedAt: new Date().toISOString(), contentHash: "a".repeat(43) }], disposition: { kind: "no_ticket", reason: "outside_support", nextAction: "supervised_commercial", learning: "excluded", evidenceIds: ["current"] } });
+    const pins={mailboxId:mailbox.id,receivedAfter:"2026-10-02T12:00:00.000Z",createdAfter:new Date(Date.now()-60000).toISOString(),expiresAt:new Date(Date.now()+3600000).toISOString(),codeRevision:"a".repeat(40),policyHash:intakeRuntimeHash(policy),resourcesHash:intakeRuntimeHash(JSON.parse(process.env.SAV_INTAKE_RUNTIME_RESOURCES!)),maxNanoUsd:3000000000,maxCalls:30};
+    for(const [k,v] of Object.entries({SAV_INTAKE_RUNTIME_MODE:"observe",SAV_CODE_REVISION:pins.codeRevision,SAV_AI_MODEL:"gemini-3.6-flash",SAV_GEMINI_API_KEY:"fake-model",HUBSPOT_ACCESS_TOKEN:"fake-crm",SAV_INTAKE_RUNTIME_POLICY:JSON.stringify(policy),SAV_INTAKE_RUNTIME_CONFIG:JSON.stringify(pins),SAV_INTAKE_EXECUTION_MODE:"execute"}))vi.stubEnv(k,v);
     config=savIntakeRuntimeConfig()!;
     await fixture.db.insert(savSyncState).values({key:"sav-intake-execution-schema-v1",status:"installed"});
     const id=await enqueueSavIntakeMessage(messageId,config);expect(id).toBeTruthy();
     const lease=await claimSavIntakeRun(id!,config);expect(lease).toBeTruthy();
-    const plan:Omit<IntakePlan,"fingerprint">={revision:"sav-intake-engine-2026-10-20.v1",decision:savIntakeDecisionSchema.parse(state.current.payload.plan.decision),steps:[],progress:{kind:"supervised_action",messageId,classification:"commercial",action:"supervised_commercial",approval:"human_confirmation_required",evidenceIds:["current"],view:"to_validate"},noteText:null,supervisedResource:ref,originalThreadId:threadId,originalRecipientEmails:[message.fromEmail],referenceMode:"current",readCalls:0,effects:"not_connected"};
+    const plan:Omit<IntakePlan,"fingerprint">={revision:"sav-intake-engine-2026-10-20.v1",decision,steps:[],progress:{kind:"supervised_action",messageId,classification:"commercial",action:"supervised_commercial",approval:"human_confirmation_required",evidenceIds:["current"],view:"to_validate"},noteText:null,supervisedResource:ref,originalThreadId:threadId,originalRecipientEmails:[message.fromEmail],referenceMode:"current",readCalls:0,effects:"not_connected"};
     await saveSavIntakeResult(lease!,config,{revision:SAV_INTAKE_RUNTIME_REVISION,effects:"not_connected",reason:"synthetic-classifier-output",plan:{...plan,fingerprint:savIntakePlanFingerprint(plan)}},"observed");
     expect((await readSavIntakeCurrent(threadId,config))?.fresh).toBe(true);
 
