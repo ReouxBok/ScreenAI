@@ -155,11 +155,11 @@ vi.mock("../hubspot-transport", async importOriginal => {
 });
 
 let policyHash = "", adminId = "", executionPolicy: ReturnType<typeof executionPolicySchema.parse>;
-async function executionEnv(): Promise<Record<string, string | undefined>> {
+async function executionEnv(mutations: string[] = ["send_case_reply"]): Promise<Record<string, string | undefined>> {
   const policy = executionPolicySchema.parse({
     revision: "sav-intake-execution-2026-10-21.v1", mailboxId, codeRevision: "a".repeat(40), enginePolicyHash: "b".repeat(64), resourcesHash: "c".repeat(64),
     createdAfter: new Date(Date.now() - 60_000).toISOString(), receivedAfter: new Date(Date.now() - 3600_000).toISOString(), expiresAt: new Date(Date.now() + 3600_000).toISOString(),
-    maxDossiers: 100, mutations: ["send_case_reply"], admission: { kind: "automatic" },
+    maxDossiers: 100, mutations, admission: { kind: "automatic" },
   });
   policyHash = intakeRuntimeHash(policy); executionPolicy = policy;
   await f.db.update(savIntakeExecutionPolicies).set({ policyHash, payloadCiphertext: encryptSavPayload(policy) }).where(eq(savIntakeExecutionPolicies.id, policyId));
@@ -412,5 +412,66 @@ describe("auto ON: after the automated approval, the send respects people and un
     await run.pass(); await run.pass();
     expect(run.counter.sends).toBe(1);
     expect(await effectRows(made.caseId)).toHaveLength(1);
+  });
+});
+
+import { runCaseV2Wake } from "./case-v2-wake";
+describe("auto ON: « ça remarche » after the automated answer closes the ticket once, through the actual loader", () => {
+  it("answer sent -> thanks with a quote -> decision and a distinct second reading -> case resolved, ONE closing, no mail, replays add nothing", async () => {
+    // Ticket stages ON and granted by the execution policy, as case-v2-wake.flow: without them the proven resolution refuses ("stages_off") and closes nothing.
+    const env = { ...await executionEnv(["send_case_reply", "set_case_ticket_stage"]), SAV_V2_TICKET_STAGES: "on", SAV_V2_STAGE_WAITING_CUSTOMER: "2", SAV_V2_STAGE_CLOSED: "4" }, made = await returnedCase(env);
+    afterSettle();
+    const provider = executionProvider(); provider.setGmail(made.gmail, `thread-${made.threadId}`); provider.seedTicket({ id: made.ticketId, ownerId: V2_OWNER, stage: "new" });
+    let sends = 0;
+    const wakeDeps = () => {
+      const deps = createCaseV2WakeDeps({ env: () => env, policy: { id: policyId, hash: policyHash }, readPolicyRecord, since: new Date(Date.now() - 600_000), deadlineMs: Date.now() + 60_000,
+        network: provider.network as typeof fetch,
+        gmail: { request: async (mailbox, path, init) => { if (path.replace(/^\//, "") === "messages/send") sends++; return provider.gmail(mailbox, path, init); }, permissions: async () => {} } });
+      const context = { runtime: {} as never, policy: executionPolicy };
+      return { ...deps, replies: { ...deps.replies, context }, handoff: { ...deps.handoff, context, crm: async () => ({ ticket: null, contacts: [] }) }, stages: { ...deps.stages, context } };
+    };
+    // 1. The automated answer, then the wake that sends it (the trial is opened by the confirmed receipt, never by this test).
+    let net = network();
+    vi.stubGlobal("fetch", vi.fn((url: string, init: RequestInit) => net.net(String(url), init)));
+    const point = await loadCaseContinuationPoint();
+    expect(await point({ caseId: made.caseId, trigger: "customer_return", env })).toEqual({ status: "queued" });
+    await runCaseV2Wake(wakeDeps());
+    expect(sends).toBe(1);
+    const trials = (await readCase(made.caseId))!.body.trials;
+    expect(trials).toHaveLength(1);
+    // 2. A minute later (the faked clock does not run by itself), the customer confirms in words that can be quoted.
+    vi.setSystemTime(Date.now() + 60_000);
+    const thanksId = randomUUID(), thanks = `gm-${thanksId}`;
+    await f.db.insert(savMessages).values({ id: thanksId, threadId: made.threadId, mailboxId, direction: "inbound", gmailMessageId: thanks, fromEmail: SENDER, toEmails: ["support@example.invalid"],
+      subject: "Re: Synthétique", bodyCiphertext: encryptSavPayload({ text: "Merci, ça remarche depuis l'autre navigateur !", headers: { "message-id": `<${thanks}@example.invalid>` } }), receivedAt: new Date() });
+    expect(await routeCustomerReturn(thanksId, { env, readTicketOwner: async () => V2_OWNER })).toMatchObject({ route: { route: "continue" }, written: true });
+    vi.setSystemTime(Date.now() + (SAV_CASE_INBOUND_SETTLE_SECONDS + 60) * 1000);
+    // 3. The model proposes the closure citing the customer's words; a distinct second reading confirms it (both synthetic).
+    const purposes: string[] = [];
+    net = network({ generate: body => {
+      const payload = JSON.parse((body as { contents: { parts: { text: string }[] }[] }).contents[0]!.parts[0]!.text) as { caseVersion: number; purpose: string; openRequests: { id: string }[] };
+      purposes.push(payload.purpose);
+      const ids = payload.openRequests.map(row => row.id);
+      const output = payload.purpose === "resolution_check"
+        ? { verdicts: ids.map(requestId => ({ requestId, verdict: "resolved" })) }
+        : { caseVersion: payload.caseVersion, understanding: { requests: ids.map(id => ({ id, summary: "Connexion impossible.", family: "access", status: "open" })), newFacts: [] },
+          nextAction: { kind: "confirm_resolution", requestIds: [ids[0]], evidence: [{ requestId: ids[0], source: { type: "email", id: thanks }, trialId: trials[0]!.id, quote: "ça remarche" }] } };
+      return Response.json({ candidates: [{ content: { parts: [{ text: JSON.stringify(output) }] }, finishReason: "STOP" }], usageMetadata: { promptTokenCount: 1_000, candidatesTokenCount: 200 } });
+    } });
+    const closing = await point({ caseId: made.caseId, trigger: "customer_return", env });
+    expect(purposes).toEqual(["decision", "resolution_check"]);
+    expect(closing.status).not.toBe("queued");
+    // 4. The wake closes the case and the ticket once; later wakes and a replay of the loader add nothing and send nothing.
+    const first = await runCaseV2Wake(wakeDeps());
+    expect(first.closures).toMatchObject({ resolved: 1 });
+    expect(await readCase(made.caseId)).toMatchObject({ phase: "resolved" });
+    for (let n = 0; n < 3; n++) await runCaseV2Wake(wakeDeps());
+    await point({ caseId: made.caseId, trigger: "sweep", env });
+    await runCaseV2Wake(wakeDeps());
+    const closed = (await effectRows(made.caseId)).filter(row => row.replyKey.includes(":closed:"));
+    expect(closed).toHaveLength(1);
+    expect(provider.objects.tickets[made.ticketId]!.properties.hs_pipeline_stage).toBe("4");
+    expect(provider.calls.filter(call => call.method === "PATCH" && (call.body as { properties?: { hs_pipeline_stage?: string } })?.properties?.hs_pipeline_stage === "4")).toHaveLength(1);
+    expect(sends).toBe(1);
   });
 });
