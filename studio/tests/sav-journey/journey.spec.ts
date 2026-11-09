@@ -88,6 +88,14 @@ for (const key of JOURNEY_CASES) {
       const creates = state.events.filter((e: {kind:string;contactId?:string}) => e.kind === "create" && e.contactId === state.cases[key].contactId);
       const notes = state.events.filter((e: {kind:string;ticketId?:string}) => e.kind === "note" && e.ticketId === ticketId);
       expect(creates).toHaveLength(["create", "successor"].includes(key) ? 1 : 0);
+      if (key === "create" || key === "successor") {
+        const created = state.tickets[creates[0].ticketId];
+        for (const type of ["calls", "emails", "notes", "meetings", "tasks"]) {
+          const expected = state.activities[type].filter((activity: { contactId: string }) => activity.contactId === state.cases[key].contactId).map((activity: { id: string }) => activity.id);
+          expect(expected).toHaveLength(1);
+          expect(created.associations[type].results.map((activity: { id: string }) => activity.id)).toEqual(expected);
+        }
+      }
       expect(notes).toHaveLength(["waiting", "reopen", "retry"].includes(key) ? 1 : 0);
       if (["waiting", "reopen", "retry"].includes(key)) expect(state.tickets[ticketId].properties).toMatchObject({ hs_pipeline_stage: "1", hubspot_owner_id: "999201" });
       const corrected = key === "create" ? "Hello, please send us the exact PDF export error message. We have noted your new attempt." : "Bonjour,\n\nPouvez-vous nous transmettre le message d’erreur exact de l’export PDF ? Nous avons bien noté votre nouvel essai.\n\nMerci pour votre aide.";

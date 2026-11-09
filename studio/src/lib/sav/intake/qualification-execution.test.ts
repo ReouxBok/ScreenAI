@@ -504,7 +504,7 @@ async function crashedAfterPost() {
   await saveExecutionPayload(lease);
   const plan = lease.payload.plan, key = `create:${messageId}`, marker = intakeRuntimeHash(key);
   const { savSupportTicketProperties } = await import("../hubspot-mapping");
-  const intent: EffectIntent = { kind: "ticket_create", permission: "create_ticket", key, sourceMessageId: messageId, contactId: "101", marker,
+  const intent: EffectIntent = { kind: "ticket_create", permission: "create_ticket", key, sourceMessageId: messageId, contactId: "101", ticketHistory: await options.adapters.prepareTicketHistory!("101", options.signal), marker,
     properties: savSupportTicketProperties({ title: plan.newTicket!.title, description: `${plan.newTicket!.description}\n\n[Studio intake: ${marker}]`, reviewedTitle: true }) };
   await markEffectDispatched(lease, await ensureExecutionEffect(lease, intent));
   await options.adapters.dispatch(intent, options.signal);
@@ -519,6 +519,19 @@ it("[INV] CD2 after lease expiry the recovery is verifiable and never POSTs twic
   const create = (await effect(row.id, "ticket_create"))!;
   expect(create.state).toBe("confirmed");
   expect(decryptSavPayload<EffectAck>(create.ackCiphertext!).id).toBe(Object.keys(p.objects.tickets)[0]);
+  expect(ticketPosts()).toBe(1);
+});
+it("[INV] a historical dispatched creation without ticketHistory stays read-only and never POSTs again", async () => {
+  const { row } = await crashedAfterPost();
+  const created = (await effect(row.id, "ticket_create"))!;
+  const oldIntent = decryptSavPayload<EffectIntent>(created.intentCiphertext);
+  delete oldIntent.ticketHistory; // Stored by a version before history snapshots existed.
+  await f.db.update(savIntakeEffects).set({ intentCiphertext: encryptSavPayload(oldIntent), intentHash: intakeRuntimeHash(oldIntent) }).where(eq(savIntakeEffects.id, created.id));
+  await f.db.update(savIntakeExecutions).set({ leaseUntil: new Date(Date.now() - 1), updatedAt: new Date(Date.now() - 120000) }).where(eq(savIntakeExecutions.id, row.id));
+  const before = writes().length;
+  await reconcileIntakeEffectsReadOnly(row.id, options.adapters);
+  expect((await effect(row.id, "ticket_create"))!.state).toBe("confirmed");
+  expect(writes()).toHaveLength(before);
   expect(ticketPosts()).toBe(1);
 });
 targetIt("[CIBLE] CD3 lease re-acquired between selection and verification: the reconciler re-checks atomically", async () => {
