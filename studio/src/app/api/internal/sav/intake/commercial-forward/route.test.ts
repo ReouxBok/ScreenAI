@@ -1,0 +1,14 @@
+import {beforeEach,expect,it,vi} from "vitest";
+const f=vi.hoisted(()=>({admin:vi.fn(),prepare:vi.fn(),queue:vi.fn()}));
+vi.mock("@/lib/sav/intake/execution-policy",()=>({executionAdministrator:f.admin}));
+vi.mock("@/lib/sav/intake/commercial-forward",()=>({prepareSavCommercialForward:f.prepare,queueSavCommercialForward:f.queue}));
+import {GET,POST} from "./route";
+const url="https://studio.example.invalid/api/internal/sav/intake/commercial-forward";
+const body={token:"encrypted-preview",confirmed:true,historyReviewed:true};
+const request=(data:unknown=body,origin=new URL(url).origin)=>new Request(url,{method:"POST",headers:{origin,"content-type":"application/json"},body:JSON.stringify(data)});
+beforeEach(()=>{vi.resetAllMocks();f.admin.mockResolvedValue({email:"operator@example.invalid"});f.prepare.mockResolvedValue({token:"preview"});f.queue.mockResolvedValue({actionId:"fixture",status:"pending"});});
+it("rejects unauthenticated GET and POST without preparing or queueing",async()=>{f.admin.mockRejectedValue(Error("forbidden"));expect((await GET(new Request(url))).status).toBe(403);expect((await POST(request())).status).toBe(403);expect(f.prepare).not.toHaveBeenCalled();expect(f.queue).not.toHaveBeenCalled();});
+it("GET is a private read-only preview",async()=>{const r=await GET(new Request(url+"?threadId=20000000-0000-4000-8000-000000000001"));expect(r.status).toBe(200);expect(r.headers.get("cache-control")).toContain("no-store");expect(f.queue).not.toHaveBeenCalled();});
+it("rejects cross-origin confirmation",async()=>{expect((await POST(request(body,"https://other.example.invalid"))).status).toBe(403);expect(f.queue).not.toHaveBeenCalled();});
+it.each([{token:"x",confirmed:true},{token:"x",historyReviewed:true},{...body,recipient:"other@example.invalid"}])("requires explicit complete confirmation without recipient override",async data=>{expect((await POST(request(data))).status).toBe(409);expect(f.queue).not.toHaveBeenCalled();});
+it("queues exactly the preview and does not claim a provider send",async()=>{const r=await POST(request());expect(f.queue).toHaveBeenCalledExactlyOnceWith(body.token);expect(await r.json()).toMatchObject({providerActions:0,modelCalls:0,receipt:{status:"pending"}});});

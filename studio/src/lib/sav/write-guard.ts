@@ -11,6 +11,7 @@ import { isSavMessageEligible } from "./cutover";
 import { assertSavCurrentTicketReview } from "./manual-tickets";
 import { assertSavCurrentManualReply } from "./manual-replies";
 import { assertSavCurrentPartnershipForward, isSavPartnershipForward } from "./partnership-forward";
+import { assertSavCurrentCommercialForward, isSavCommercialForward } from "./intake/commercial-forward";
 import { savEffectiveReceivedAt } from "@/lib/sav/message-order";
 
 /** Load current state as close as possible to the external mutation. */
@@ -38,9 +39,10 @@ async function loadSavWriteAuthority(actionId: string) {
   if (action.messageId && await intakeMessageHistorical(action.messageId)) throw new Error("SAV_MESSAGE_HISTORICAL_OUTSIDE_AUTOMATION");
   if (!action.messageId || !await isSavMessageEligible(action.messageId)) throw new Error("SAV_MESSAGE_BEFORE_CUTOVER");
   if (savReleaseStage() === "v0" && ["create_ticket", "link_ticket"].includes(action.kind)) await assertSavCurrentTicketReview(action);
-  if (isSavPartnershipForward(action)) await assertSavCurrentPartnershipForward(action);
+  if (isSavCommercialForward(action)) await assertSavCurrentCommercialForward(action);
+  else if (isSavPartnershipForward(action)) await assertSavCurrentPartnershipForward(action);
   else if (savReleaseStage() === "v0" && action.kind === "send_reply") await assertSavCurrentManualReply(action);
-  if (!isSavPartnershipForward(action) && ["send_reply", "request_human"].includes(action.kind)) assertSavOutboundRecipientAllowed(thread.customerEmail);
+  if (!isSavPartnershipForward(action) && !isSavCommercialForward(action) && ["send_reply", "request_human"].includes(action.kind)) assertSavOutboundRecipientAllowed(thread.customerEmail);
   return { action, thread, latest };
 }
 

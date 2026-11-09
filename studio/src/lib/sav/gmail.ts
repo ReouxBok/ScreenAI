@@ -28,6 +28,8 @@ import { savActionFailurePlan } from "./retry-policy";
 import { redactSavLearningText } from "./learning-extraction";
 import { getSavV0Cutover } from "./cutover";
 import { assertSavCurrentPartnershipForward, isSavPartnershipForward, SAV_PARTNERSHIP_RECIPIENT } from "./partnership-forward";
+import { assertSavCurrentCommercialForward, isSavCommercialForward } from "./intake/commercial-forward";
+import {reserveCommercialForwardDispatch} from "./intake/commercial-delivery-authority";
 import { savEffectiveReceivedAt } from "@/lib/sav/message-order";
 
 const pubSubEnvelopeSchema = z.object({
@@ -766,17 +768,20 @@ async function sendReplyAction(action: typeof savActions.$inferSelect, text: str
 }
 
 /** Internal forwarding is never a reply to the customer and never changes CRM or followups. */
-async function sendPartnershipForwardAction(action: typeof savActions.$inferSelect) {
+async function sendInternalForwardAction(action: typeof savActions.$inferSelect) {
   const db = requireDb();
   await assertSavWriteAllowed(action.id);
-  const c = await assertSavCurrentPartnershipForward(action);
-  const rfcMessageId = `<sav-partnership-${action.id}@studio.limova.ai>`;
+  const commercial = isSavCommercialForward(action);
+  const c = commercial ? await assertSavCurrentCommercialForward(action) : await assertSavCurrentPartnershipForward(action);
+  const recipient = commercial ? c.preview.to : SAV_PARTNERSHIP_RECIPIENT;
+  const reconciliation = commercial ? "SAV_COMMERCIAL_RECONCILIATION_REQUIRED" : "SAV_PARTNERSHIP_RECONCILIATION_REQUIRED";
+  const rfcMessageId = `<sav-${commercial ? "commercial" : "partnership"}-${action.id}@studio.limova.ai>`;
   const existing = await findSentMessage(c.mailbox.email, rfcMessageId, true);
-  if (!existing && action.payload.forwardDispatchedAt) throw new Error("SAV_PARTNERSHIP_RECONCILIATION_REQUIRED");
+  if (!existing && action.payload.forwardDispatchedAt) throw new Error(reconciliation);
   if (existing) {
     // Read-only recovery of a confirmed provider ACK, never another send.
     const sent = await gmailFetch<GmailMessage>(c.mailbox.email, `messages/${encodeURIComponent(existing.id)}?format=metadata&metadataHeaders=To&metadataHeaders=Message-ID`);
-    if (headerValue(sent.payload?.headers, "Message-ID") !== rfcMessageId || normalizeEmailAddress(headerValue(sent.payload?.headers, "To")) !== SAV_PARTNERSHIP_RECIPIENT || !(sent.labelIds ?? []).includes("SENT")) throw new Error("SAV_PARTNERSHIP_RECONCILIATION_REQUIRED");
+    if (headerValue(sent.payload?.headers, "Message-ID") !== rfcMessageId || normalizeEmailAddress(headerValue(sent.payload?.headers, "To")) !== recipient.toLowerCase() || !(sent.labelIds ?? []).includes("SENT")) throw new Error(reconciliation);
     await recordPartnershipForwardAck(action.id, sent);
     return sent;
   }
@@ -785,22 +790,30 @@ async function sendPartnershipForwardAction(action: typeof savActions.$inferSele
   await assertSavWriteAllowed(action.id);
   const raw = [
     `From: ${safeMailHeader(c.preview.from)}`,
-    `To: ${SAV_PARTNERSHIP_RECIPIENT}`,
+    `To: ${safeMailHeader(recipient)}`,
     `Subject: ${encodedSubject(c.preview.subject)}`,
     `Message-ID: ${rfcMessageId}`,
     "MIME-Version: 1.0",
     'Content-Type: text/plain; charset="UTF-8"',
     "Content-Transfer-Encoding: 8bit", "", c.preview.text,
   ].join("\r\n");
+  if(commercial){
+    // Every guard precedes the atomic authority reservation. A subsequent
+    // rotation cannot retarget this reserved message or erase its marker.
+    await assertSavWriteAllowed(action.id);
+    const binding = action.payload;
+    await reserveCommercialForwardDispatch(action.id,String(binding.commercialAuthorityRevision??""),String(binding.commercialAuthorityHash??""));
+  }else{
   const [dispatched] = await db.update(savActions).set({ payload: sql`${savActions.payload} || ${JSON.stringify({ forwardDispatchedAt: new Date().toISOString() })}::jsonb`, updatedAt: new Date() })
     .where(and(eq(savActions.id, action.id), eq(savActions.status, "running"), sql`${savActions.payload}->>'forwardDispatchedAt' is null`)).returning();
-  if (!dispatched) throw new Error("SAV_PARTNERSHIP_RECONCILIATION_REQUIRED");
+  if (!dispatched) throw new Error(reconciliation);
   // Nothing has been sent if the final guard fails. Only this known pre-dispatch
   // branch may clear the marker; a process crash or fetch error keeps it forever.
   try { await assertSavWriteAllowed(action.id); }
   catch (error) {
     await db.update(savActions).set({ payload: sql`${savActions.payload} - 'forwardDispatchedAt'`, updatedAt: new Date() }).where(eq(savActions.id, action.id));
     throw error;
+  }
   }
   // Token acquisition and all awaited preflights precede the last authorization.
   // No Gmail threadId, Reply-To, In-Reply-To, References, Cc or Bcc are transmitted.
@@ -809,9 +822,9 @@ async function sendPartnershipForwardAction(action: typeof savActions.$inferSele
     method: "POST", headers: { Authorization: `Bearer ${accessToken}`, "Content-Type": "application/json" },
     body: JSON.stringify({ raw: Buffer.from(raw, "utf8").toString("base64url") }), signal: AbortSignal.timeout(20000),
   });
-  if (!response.ok) throw new Error("SAV_PARTNERSHIP_RECONCILIATION_REQUIRED");
+  if (!response.ok) throw new Error(reconciliation);
   const sent = await response.json() as { id?: string; threadId?: string };
-  if (!sent.id || !sent.threadId || sent.threadId === c.thread.gmailThreadId) throw new Error("SAV_PARTNERSHIP_RECONCILIATION_REQUIRED");
+  if (!sent.id || !sent.threadId || sent.threadId === c.thread.gmailThreadId) throw new Error(reconciliation);
   await recordPartnershipForwardAck(action.id, { id: sent.id, threadId: sent.threadId });
   return { id: sent.id, threadId: sent.threadId };
 }
@@ -849,8 +862,8 @@ export async function processPendingGmailSendActions(limit = 20, onlyActionId?: 
     if (!claimed) continue;
     try {
       await withLegacyOccupationAction(claimed, async () => {
-        if (isSavPartnershipForward(claimed)) {
-          const sent = await sendPartnershipForwardAction(claimed);
+        if (isSavPartnershipForward(claimed) || isSavCommercialForward(claimed)) {
+          const sent = await sendInternalForwardAction(claimed);
           processed.push({ actionId: claimed.id, status: "succeeded", gmailMessageId: sent.id });
           return;
         }
@@ -862,10 +875,10 @@ export async function processPendingGmailSendActions(limit = 20, onlyActionId?: 
       });
     } catch (error) {
       let errorCode = (error instanceof Error ? error.message : "UNKNOWN_ERROR").slice(0, 160);
-      if (savReleaseStage() === "v0" || isSavPartnershipForward(claimed)) {
+      if (savReleaseStage() === "v0" || isSavPartnershipForward(claimed) || isSavCommercialForward(claimed)) {
         const [current] = await db.select({ payload: savActions.payload }).from(savActions).where(eq(savActions.id, claimed.id)).limit(1);
         // A timeout, crash or local commit error after dispatch has an unknown outcome.
-        if (current?.payload.forwardDispatchedAt) errorCode = "SAV_PARTNERSHIP_RECONCILIATION_REQUIRED";
+        if (current?.payload.forwardDispatchedAt) errorCode = isSavCommercialForward(claimed) ? "SAV_COMMERCIAL_RECONCILIATION_REQUIRED" : "SAV_PARTNERSHIP_RECONCILIATION_REQUIRED";
         else if (current?.payload.replySendDispatchedAt) errorCode = "SAV_REPLY_MANUAL_RECONCILIATION_REQUIRED";
       }
       const failure = savActionFailurePlan(errorCode, claimed.attemptCount);

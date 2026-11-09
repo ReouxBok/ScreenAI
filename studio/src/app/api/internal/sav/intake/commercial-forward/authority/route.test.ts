@@ -1,0 +1,17 @@
+import {beforeEach,expect,it,vi} from "vitest";
+const f=vi.hoisted(()=>({admin:vi.fn(),preview:vi.fn(),commit:vi.fn(),get:vi.fn()}));
+vi.mock("@/lib/sav/intake/execution-policy",()=>({executionAdministrator:f.admin}));
+vi.mock("@/lib/sav/intake/commercial-delivery-authority",async original=>({...await original<typeof import("@/lib/sav/intake/commercial-delivery-authority")>(),previewCommercialDeliveryAuthority:f.preview,commitCommercialDeliveryAuthority:f.commit,getCommercialDeliveryAuthority:f.get}));
+import {GET,POST} from "./route";
+const url="https://studio.example.invalid/api/internal/sav/intake/commercial-forward/authority";
+const commandId="20000000-0000-4000-8000-000000000001";
+const preview={operation:"preview",commandId,expectedRevision:null,settings:{scope:"commercial_pure_contact_mailbox",recipient:"desk@example.invalid",subjectPrefix:"Synthetic",introduction:"Synthetic delivery authority",state:"enabled",expiresAt:"2030-01-01T00:00:00.000Z"}};
+const commit={operation:"commit",commandId,hash:"a".repeat(64),confirmed:true,reservedDispatchesUnderstood:true};
+const request=(body:unknown,origin=new URL(url).origin)=>new Request(url,{method:"POST",headers:{origin,"content-type":"application/json"},body:JSON.stringify(body)});
+beforeEach(()=>{vi.resetAllMocks();f.admin.mockResolvedValue({id:commandId});f.preview.mockResolvedValue({commandId,hash:commit.hash});f.get.mockResolvedValue({authority:null,dispatched:[]});f.commit.mockResolvedValue({revision:commandId});});
+it("requires administrator for reads and commands",async()=>{f.admin.mockRejectedValue(Error("unauthorized"));expect((await GET()).status).toBe(403);expect((await POST(request(preview))).status).toBe(403);expect(f.preview).not.toHaveBeenCalled();});
+it("rejects cross-origin writes",async()=>{expect((await POST(request(commit,"https://other.example.invalid"))).status).toBe(403);expect(f.commit).not.toHaveBeenCalled();});
+it("previews without granting authority and includes existing reservations",async()=>{const result=await POST(request(preview));expect(result.status).toBe(200);expect(await result.json()).toMatchObject({current:{dispatched:[]},providerActions:0,modelCalls:0});expect(f.commit).not.toHaveBeenCalled();});
+it("requires explicit awareness of reserved sends at commit",async()=>{expect((await POST(request({...commit,reservedDispatchesUnderstood:false}))).status).toBe(409);expect(f.commit).not.toHaveBeenCalled();});
+it("commits only the exact preview hash",async()=>{expect((await POST(request(commit))).status).toBe(200);expect(f.commit).toHaveBeenCalledExactlyOnceWith(commandId,commit.hash);});
+it.each([{...preview,settings:{...preview.settings,policy:"broader domain"}},{...preview,settings:{...preview.settings,scope:"finance"}},{...commit,recipient:"override@example.invalid"}])("rejects scope or recipient override",async body=>{expect((await POST(request(body))).status).toBe(409);expect(f.commit).not.toHaveBeenCalled();expect(f.preview).not.toHaveBeenCalled();});
