@@ -510,6 +510,27 @@ describe("Q3 — accès persistant : historique, spams, capture, puis relais", (
     const decision = accepted(validateCaseDecision(proposal(), thread(relayed(), [signed(A09_TEXT), signed("Toujours pas de code.")]), now));
     expect(decision.nextAction.kind).toBe("handoff");
   });
+  // Contre-recette lot 3 (p5 v2, Q3-1/4/5/6): the official domain written in the customer's sentence must not hide the address confirmed in it.
+  describe("le domaine écrit par le client ne fait pas perdre l'adresse confirmée", () => {
+    const WITH_HOST = "Bonjour, j’ai déjà essayé le bon lien new.limova.ai et la bonne adresse e-mail, mais je ne reçois aucun code de connexion. J’ai aussi déjà vérifié les spams et les courriers indésirables, il n’y a rien.";
+    const noStepAgain = (text: string) => expect(text).not.toMatch(/Saisir l’adresse|Entrez l’adresse|Pouvez-vous me confirmer/);
+    it("spams jamais demandés : lien et adresse reconnus, l'étape adresse n'est pas redonnée", () => {
+      const host = WITH_HOST.replace(" J’ai aussi déjà vérifié les spams et les courriers indésirables, il n’y a rien.", "");
+      const text = accepted(validateCaseDecision(proposal(), context(relayed(FUTURE), host), now)).reply!.text;
+      expect(text).toContain("avec votre adresse d’inscription");
+      noStepAgain(text);
+    });
+    it.each([
+      ["texte de l'écran fourni", [`${WITH_HOST} L’écran affiche « adresse e-mail inconnue ».`], {}],
+      ["capture jointe", [`${WITH_HOST} Je vous joins une capture d’écran.`], {}],
+      ["question d'écran déjà posée, réponse vide", [WITH_HOST, "Je ne sais pas."], asked(["login_error_message"])],
+    ])("%s : relais, rien de redemandé", (_name, mails, over) => {
+      const decision = accepted(validateCaseDecision(proposal(), thread(relayed(FUTURE), mails as string[], over), now));
+      expect(decision.nextAction.kind).toBe("handoff");
+      expect(decision.reply).toBeUndefined();
+      expect(decision.nextAction.kind === "handoff" && decision.nextAction.report.need).toContain("bon lien, bonne adresse, spams");
+    });
+  });
   it("une phrase écrite après le séparateur de signature reste lue dans l'historique (Q1) : le message affiché qu'elle donne n'est pas redemandé", () => {
     const decision = accepted(validateCaseDecision(proposal(), thread(relayed(), [`${A08}\n--\nJean Dupont\nL’écran affiche « identifiant introuvable ».`, "Toujours pas de code."]), now));
     if (decision.nextAction.kind !== "handoff") throw Error(`NOT_HANDOFF:${decision.nextAction.kind}`);

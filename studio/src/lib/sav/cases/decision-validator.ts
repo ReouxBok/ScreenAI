@@ -50,7 +50,9 @@ const ownCustomerWords = (raw: string) => normalize(loginCustomerStatement(split
 // Q3 (9/11): the customer says a screenshot is attached. The agent cannot read an image: the screen is reported as attached, never as words it saw.
 const SCREENSHOT = /\b(?:captures? d'ecran|copies? d'ecran|screenshots?|photos? de l'ecran|captures?)\b/;
 const ATTACHED = /\b(?:ci-jointe?s?|en pieces? jointes?|jointe?s?|attachee?s?|voici|je vous (?:envoie|transmets|joins))\b/;
-const sentencesOf = (text: string) => text.split(/[.!?;\n]+/).map(sentence => sentence.trim()).filter(Boolean);
+// Contre-recette Q3-4/5/6 (9/11): a dot inside a web address (« le bon lien new.limova.ai et la bonne adresse ») does not end the sentence, or the address
+// confirmed in the same sentence was lost and the step already done was given again.
+const sentencesOf = (text: string) => text.split(/[!?;\n]+|\.+(?![a-z0-9])/).map(sentence => sentence.trim()).filter(Boolean);
 /** The yes and no of one mail on one point: any `no` wins over a `yes` (a contradiction proves nothing), silence is null. */
 const saidInMail = (sentences: readonly string[], yes: (sentence: string) => boolean, no: (sentence: string) => boolean): boolean | null =>
   sentences.some(no) ? false : sentences.some(yes) ? true : null;
