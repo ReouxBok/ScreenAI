@@ -15,7 +15,7 @@ function encrypted(value: unknown) {
   return ["v1", iv.toString("base64url"), cipher.getAuthTag().toString("base64url"), data.toString("base64url")].join(".");
 }
 const client = new PGlite(`file://${target}`, { extensions: { vector } }), db = drizzle(client);
-const remote: { cases: Record<string, unknown>; tickets: Record<string, unknown>; notes: Record<string, unknown>; events: unknown[] } = { cases: {}, tickets: {}, notes: {}, events: [] };
+const remote: { cases: Record<string, unknown>; tickets: Record<string, unknown>; notes: Record<string, unknown>; events: unknown[]; activities: Record<string, Array<{ id: string; contactId: string; properties: { hs_timestamp: string } }>> } = { cases: {}, tickets: {}, notes: {}, events: [], activities: {} };
 try {
   const [mailbox] = await db.insert(savMailboxes).values({ email: "contact@limova.ai", active: true }).returning();
   await db.insert(savSyncState).values({ key: "sav-v0-cutover", status: "active", cursor: JSON.stringify({ receivedAfter: "2026-10-01T00:00:00Z", mailboxEmail: mailbox.email, intakeRecipient: mailbox.email, deploymentSha: "a".repeat(40), activatedBy: "ugo@limova.ai" }) });
@@ -25,6 +25,10 @@ try {
     const closedAt = stage === "4" ? key === "successor" ? "2026-09-01T00:00:00Z" : "2026-09-30T00:00:00Z" : null;
     const ticket = { id: ticketId, subject: "Échec export PDF fictif", description: "Export PDF fictif en panne", status: stage === "4" ? "closed" : "open", stageId: stage, pipelineId: "0", ownerId: "999201", ownerName: "Support Fictif", createdAt: "2026-09-01T00:00:00Z", closedAt, updatedAt: null };
     remote.cases[key] = { email, contactId, ticketId, receivedAt, fault: key === "retry" ? "403" : key === "uncertain" ? "timeout" : null };
+    if (key === "create" || key === "successor") for (const [typeIndex, type] of ["calls", "emails", "notes", "meetings", "tasks"].entries()) {
+      remote.activities[type] ??= [];
+      remote.activities[type].push({ id: String(770000 + index * 10 + typeIndex), contactId, properties: { hs_timestamp: new Date(Date.now() - 86400000).toISOString() } });
+    }
     if (key !== "create") remote.tickets[ticketId] = { id: ticketId, properties: { subject: ticket.subject, content: ticket.description, hs_pipeline: "0", hs_pipeline_stage: stage, hubspot_owner_id: "999201", hs_last_closed_date: closedAt, createdate: ticket.createdAt }, associations: { contacts: { results: [{ id: contactId }] } } };
     const proposal = savSemanticE2eProposal();
     const inboundText = key === "create" ? "Hello, my PDF export fails with ERR_42. Please help. https://example.invalid/help 24 MB" : SAV_SEMANTIC_E2E_BODY;

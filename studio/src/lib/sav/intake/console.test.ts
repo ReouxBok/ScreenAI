@@ -491,7 +491,7 @@ it("correction of a never-departed intent reuses the stable effect row and keeps
 it("refusal after dispatch accepts the late ACK and RO proof but no continuation", async () => {
   await observed();const execution=(await admitIntakeExecution(runId,options))!,lease=(await claimExecution(execution.id))!;
   const key=`create:${messageId}`, marker=intakeRuntimeHash(key), intent={kind:"ticket_create" as const,permission:"create_ticket" as const,key,sourceMessageId:messageId,
-    contactId:"101",marker,properties:{subject:"Synthetic",content:`Synthetic\n\n[Studio intake: ${marker}]`,hs_pipeline:"0",hs_pipeline_stage:"1",source_type:"EMAIL"}};
+    contactId:"101",ticketHistory:await options.adapters.prepareTicketHistory!("101",options.signal),marker,properties:{subject:"Synthetic",content:`Synthetic\n\n[Studio intake: ${marker}]`,hs_pipeline:"0",hs_pipeline_stage:"1",source_type:"EMAIL"}};
   const effect=await markEffectDispatched(lease,await ensureExecutionEffect(lease,intent));
   const ack=await options.adapters.dispatch(intent,options.signal);
   await recordIntakeHumanCommand(await command("refuse"));
