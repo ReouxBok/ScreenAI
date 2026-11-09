@@ -6,7 +6,7 @@ import { readIntakeConsoleDetail } from "@/lib/sav/intake/console-detail";
 import { readIntakeRunDiagnostics } from "@/lib/sav/intake/run-diagnostics";
 import { intakeBudgetOwnerFor, readIntakeBudgetPanel } from "@/lib/sav/intake/budget-admin";
 import { savIntakeViewLabels, savIntakeViewSchema } from "@/lib/sav/intake/contract";
-import { intakeStatusLabel, intakeReasonLabel, intakeBlockedCauseLabel, intakeRetryLabel } from "@/lib/sav/intake/console-presentation";
+import { intakeProjectionLabel, intakeReasonLabel, intakeBlockedCauseLabel, intakeRetryLabel } from "@/lib/sav/intake/console-presentation";
 import { readOperatorPanel } from "@/lib/sav/intake-ux/operator-commands";
 import { manualOtherUnavailableLabels } from "@/lib/sav/intake/manual-other-classification";
 import { intakeDossierView, intakeDossierActions, intakeEffectLabels, intakeEffectStateLabels, intakeRouteLabel, intakeEffectsTitle, readIntakeManualOther, type IntakeConsoleDetail } from "@/lib/sav/intake/dossier-view";
@@ -39,7 +39,7 @@ export function intakeDossierSummary(data: IntakeConsoleDetail) {
   return {
     threadId: data.thread.id, subject: data.thread.subject || "Nouvelle demande", version: current?.version ?? null,
     status: { view: data.projection.view, code: data.projection.status,
-      label: view.dirty ? "Mise à jour du traitement en cours" : intakeReasonLabel(data.projection.reason) ?? intakeStatusLabel(data.projection.status) },
+      label: view.dirty ? "Mise à jour du traitement en cours" : intakeReasonLabel(data.projection.reason) ?? intakeProjectionLabel(data.projection.status, data.uncertainty) },
     locks: { humanHeld: data.humanHeld, paused: data.thread.paused, handledExternally: data.handledExternally, blocked: Boolean(view.blocked),
       unsettledEffects: effects.filter(effect => ["dispatched", "acked", "uncertain"].includes(effect.state)).length,
       uncertainExecution: data.progress?.state === "uncertain", pendingHumanEvent: data.choices.some(event => ["pending", "reading"].includes(event.state)),
@@ -97,7 +97,7 @@ const listDossiers = { name: "list_dossiers", title: "Lister les dossiers SAV", 
       rows: data.rows.map(row => ({ threadId: row.threadId, messageId: row.messageId, subject: row.subject || "Nouvelle demande", fromEmail: row.fromEmail,
         receivedAt: row.receivedAt?.toISOString() ?? null, updatedAt: row.updatedAt?.toISOString() ?? null, version: row.version, view: row.view, status: row.status,
         blocked: Boolean(row.blockedCause), blockedCause: row.blockedCause,
-        label: row.blockedCause ? intakeBlockedCauseLabel(row.blockedCause) : row.retryAt ? intakeRetryLabel(row.retryAt) : intakeStatusLabel(row.status),
+        label: row.blockedCause ? intakeBlockedCauseLabel(row.blockedCause) : row.retryAt ? intakeRetryLabel(row.retryAt) : intakeProjectionLabel(row.status, row.uncertainty),
         reason: row.reason ? intakeReasonLabel(row.reason) : null })) });
   } };
 const getDossier = { name: "get_dossier", title: "Lire un dossier SAV", write: false,

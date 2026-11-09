@@ -84,6 +84,16 @@ it("SAV-25 list_dossiers states the console rows, labels and counters", async ()
   expect(html).not.toContain("SAV_INTAKE_RUNTIME_DAILY_BUDGET_DEFERRED");
   expect(JSON.stringify(data)).not.toContain("SAV_INTAKE_RUNTIME_DAILY_BUDGET_DEFERRED\"");
 });
+it.each([["cost", "Coût IA à confirmer"], ["effect", "Action HubSpot ou Gmail à vérifier"], ["both", "Coût IA et action externe à vérifier"], ["unknown", "Incertitude à qualifier"]] as const)(
+  "M1 MCP tools name the same %s uncertainty as the console", async (uncertainty, label) => {
+  mocks.list.mockResolvedValue({ ...list, rows: [{ ...list.rows[0], status: "uncertain", reason: null, uncertainty }] });
+  const html = renderToStaticMarkup(createElement(Fragment, null, await IntakeConsolePage({ searchParams: Promise.resolve({}) })));
+  const rows = ((await tool("list_dossiers").run(context, { view: "processing", page: 1, sort: "newest" } as never)).data as { rows: { label: string }[] }).rows;
+  expect(rows[0].label).toBe(label); expect(html).toContain(escape(label));
+  mocks.detail.mockResolvedValue({ ...base, projection: { ...base.projection, status: "uncertain", reason: null }, uncertainty });
+  const summary = (await tool("get_dossier").run(context, { threadId } as never)).data as ReturnType<typeof intakeDossierSummary>;
+  expect(summary.status.label).toBe(label); expect(await renderDetail()).toContain(escape(label));
+});
 it("SAV-25 get_dossier bounds the message text and never returns the rest of the history", async () => {
   const long = "x".repeat(4100), older = { ...base.messages[0], id: "10000000-0000-4000-8000-000000000099", body: { text: "historique synthétique privé", attachments: [] } };
   mocks.detail.mockResolvedValue({ ...base, messages: [{ ...base.messages[0], body: { text: long, attachments: [{ filename: "capture.png", mimeType: "image/png", size: 1 }] } }, older] });

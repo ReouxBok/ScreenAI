@@ -15,7 +15,7 @@ import { IntakeCompletionForm } from "../completion-form";
 import { manualOtherUnavailableLabels } from "@/lib/sav/intake/manual-other-classification";
 import { IntakeManualOtherForm } from "../manual-other-form";
 import { IntakeInvalidSourceForm } from "../invalid-source-form";
-import { intakeStatusLabel, intakeReasonLabel, intakeContextReasonLabels, intakeCrmDeltaLabel, intakeNextStepLabel } from "@/lib/sav/intake/console-presentation";
+import { intakeStatusLabel, intakeProjectionLabel, intakeExecutionStateLabel, intakeReasonLabel, intakeContextReasonLabels, intakeCrmDeltaLabel, intakeNextStepLabel } from "@/lib/sav/intake/console-presentation";
 import styles from "../intake.module.css";
 import { IntakeBackLink } from "../navigation";
 import { CrmRecord, StreamedChoiceForm, StreamedCrmContext } from "../crm-streamed";
@@ -58,7 +58,7 @@ export default async function IntakeDetailPage({ params, searchParams }: { param
   return <div className={styles.console}>
     <IntakeBackLink className={styles.back} returnTo={query?.returnTo}/>
     <header className={styles.heading}><div><span className="eyebrow">Dossier · version {current?.version ?? "en attente"}</span><h1>{data.thread.subject || "Nouvelle demande"}</h1>
-      <p>{dirty ? "Mise à jour du traitement en cours" : intakeReasonLabel(data.projection.reason) ?? intakeStatusLabel(data.projection.status)}</p></div></header>
+      <p>{dirty ? "Mise à jour du traitement en cours" : intakeReasonLabel(data.projection.reason) ?? intakeProjectionLabel(data.projection.status, data.uncertainty)}</p></div></header>
     {releaseNotice && <p role="status">{releaseNotice === "released" && !data.thread.paused && !data.humanHeld && !data.handledExternally ? "La pause est levée pour ce dossier. Le moteur pourra poursuivre si les preuves et la politique existante le permettent. Si une nouvelle qualification est nécessaire, utilisez « Refaire l’analyse » dans le panneau de poursuite." : "La pause est conservée : le dossier a changé, une opération reste en cours ou votre accès ne permet pas cette reprise. Rechargez le dossier et vérifiez ses preuves."}</p>}
     {pendingOriginals && <section className={styles.notice} aria-label="Demandes antérieures à traiter">
       <h2>Vérifier la prise en charge des mails précédents</h2>
@@ -133,7 +133,7 @@ export default async function IntakeDetailPage({ params, searchParams }: { param
         <p>Aucun brouillon de réponse de résolution n’a été produit par ce parcours. Les réponses supervisées existantes restent dans la file supervisée.</p>
       </section>
     </div><aside className={styles.side}>
-      <IntakeProcessingSummary status={intakeStatusLabel(data.projection.status)} cause={intakeReasonLabel(data.progress?.reason ?? data.projection.reason)} question={question}
+      <IntakeProcessingSummary status={intakeProjectionLabel(data.projection.status, data.uncertainty)} cause={intakeReasonLabel(data.progress?.reason ?? data.projection.reason)} question={question}
         confirmedEffects={data.progress?.effects.filter(e=>e.state==="confirmed").length??0} uncertain={data.progress?.state==="uncertain"||Boolean(data.progress?.effects.some(e=>["dispatched","acked","uncertain"].includes(e.state)))}
         paused={data.thread.paused||data.humanHeld} exhausted={Boolean(blocked)}
         lastActivity={data.diagnostics?.runs.flatMap(r=>r.events.map(e=>e.createdAt)).sort((a,b)=>b.getTime()-a.getTime())[0] ? formatParisDateTime(data.diagnostics.runs.flatMap(r=>r.events.map(e=>e.createdAt)).sort((a,b)=>b.getTime()-a.getTime())[0]) : undefined}/>
@@ -165,7 +165,7 @@ export default async function IntakeDetailPage({ params, searchParams }: { param
           hasNoteReceipt={actions.noteReceipt} allowReanalysis={false} showReanalysis={false}
           unavailableReason={controls.reason}/>}
         <p>{data.diagnostics?.totalAttempts ?? 0} tentative(s) cumulée(s) pour le dernier message. Les versions remplacées ne sont pas des décisions applicables.</p>
-        {data.diagnostics?.execution && <p>Exécution : {intakeStatusLabel(data.diagnostics.execution.state ?? "waiting")} · {data.diagnostics.execution.waitingPasses ?? 0} passage(s) en attente
+        {data.diagnostics?.execution && <p>Exécution : {intakeExecutionStateLabel(data.diagnostics.execution.state ?? "waiting")} · {data.diagnostics.execution.waitingPasses ?? 0} passage(s) en attente
           {data.diagnostics.execution.lastPassAt ? ` · dernier ${formatParisDateTime(data.diagnostics.execution.lastPassAt)}` : ""} · {data.diagnostics.execution.reason ?? "aucun code"}
           {data.diagnostics.execution.originalCrmRecorded === false ? " · empreinte HubSpot d’origine absente (analyse antérieure)" : ""}.</p>}
         {data.diagnostics?.runs.map(run => <details key={run.runId}><summary>Version {run.version} · {intakeStatusLabel(run.state)} · {run.attempts} tentative(s)</summary>

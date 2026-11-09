@@ -188,8 +188,14 @@ it("separates permission from absent activity and preserves filters on the read-
   expect(html).not.toContain("État de l’agent");
   expect(html).toContain("Agent autorisé à travailler");expect(html).toContain("Activité à vérifier");
   expect(html).toContain("Relevé partiel");expect(html).toContain("Vérification réservée au propriétaire du budget");
+  expect(html).toContain("elle ne prouve ni que les modes d’analyse et d’exécution sont actifs, ni la réussite des dossiers");
   expect(html).toContain('href="/studio/sav/intake?view=processing&amp;q=connexion&amp;sort=oldest&amp;page=1"');
   expect(mocks.action).not.toHaveBeenCalled();
+});
+it("names an uncertain execution as an external action to verify, never a generic uncertainty",async()=>{
+ mocks.detail.mockResolvedValue({...detail,diagnostics:{messageId,totalAttempts:1,attemptsExhausted:false,runs:[],execution:{state:"uncertain",waitingPasses:0,lastPassAt:null,reason:"SAV_INTAKE_EXECUTION_RECONCILIATION_REQUIRED"}}});
+ const html=await renderDetail();
+ expect(html).toContain("Exécution : Action HubSpot ou Gmail à vérifier");expect(html).not.toContain("Exécution : Incertitude à qualifier");expect(mocks.action).not.toHaveBeenCalled();
 });
 it.each([ ["cost","Coût IA à confirmer"],["effect","Action HubSpot ou Gmail à vérifier"],["both","Coût IA et action externe à vérifier"],["unknown","Incertitude à qualifier"] ])("renders %s uncertainty consistently without claiming completion",async(uncertainty,label)=>{
  mocks.list.mockResolvedValue({...fixture,rows:[{...fixture.rows[0],status:"uncertain",reason:null,uncertainty}]});
