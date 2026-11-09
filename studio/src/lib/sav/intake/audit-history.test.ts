@@ -366,3 +366,23 @@ it.each(["create", "reopen"] as const)("AUDIT-5 CRM read volume of one nominal %
     console.info(`AUDIT-5 ${op}`, JSON.stringify({ planningReads: planning, effects: (await getExecutionEffects(row.id)).length, executionReads: reads.length, writes: writes.length, gmailReads: exec.filter(c => c.path.startsWith("gmail/")).length,
         byPath: Object.entries(reads.reduce((m: Record<string, number>, c) => { const k = `${c.method} ${c.path.replace(/\d+/g, "N")}`; m[k] = (m[k] ?? 0) + 1; return m; }, {})) }));
 });
+
+it("commercial resource changes refuse code-only continuity with a real approved target configuration", async () => {
+    const {row,next}=await rotateAfterCut();
+    // Positive control: code-only rotation really qualifies this exact execution.
+    await expect(previewIntakeExecutionContinuity(options.config.policyId,next,[row.id])).resolves.toMatchObject({executionIds:[row.id]});
+    const text=JSON.stringify({schema:"sav-commercial-forward.v1",recipient:"desk@example.invalid",subjectPrefix:"Synthetic",introduction:"Synthetic commercial introduction",policy:"Synthetic approved commercial routing policy"});
+    const ref={resourceId:"synthetic-commercial",revisionId:"new-version",sha256:createHash("sha256").update(text).digest("hex")};
+    const catalogue=[...JSON.parse(environment.SAV_INTAKE_RUNTIME_RESOURCES!),{resource:ref,text,approvalId:"synthetic-commercial-approval",approvedBy:"synthetic-admin",approvedAt:new Date(Date.now()-1000).toISOString(),status:"approved"}];
+    const enginePolicy=JSON.parse(environment.SAV_INTAKE_RUNTIME_POLICY!);enginePolicy.resources.commercial=ref;
+    const pins={...JSON.parse(environment.SAV_INTAKE_RUNTIME_CONFIG!),resourcesHash:intakeRuntimeHash(catalogue),policyHash:intakeRuntimeHash(enginePolicy)};
+    environment={...environment,SAV_INTAKE_RUNTIME_RESOURCES:JSON.stringify(catalogue),SAV_INTAKE_RUNTIME_POLICY:JSON.stringify(enginePolicy),SAV_INTAKE_RUNTIME_CONFIG:JSON.stringify(pins)};
+    const runtime=savIntakeRuntimeConfig(environment)!;
+    const policy={...next.policy,resourcesHash:runtime.resourcesHash,enginePolicyHash:runtime.policyHash};
+    const approved=await approveIntakeExecutionPolicy(policy);
+    environment={...environment,SAV_INTAKE_EXECUTION_POLICY_ID:approved.id,SAV_INTAKE_EXECUTION_POLICY_SHA256:approved.policyHash};
+    const changed={...next,runtime,policy,config:intakeExecutionConfig(environment)!};
+    expect(runtime.policy.resources.commercial).toEqual(ref);
+    await expect(previewIntakeExecutionContinuity(options.config.policyId,changed,[row.id])).rejects.toThrow("SAV_INTAKE_EXECUTION_CONTINUITY_REFUSED");
+    expect(posts("/tickets")).toBe(1);expect(posts("/emails")).toBe(0);
+});
