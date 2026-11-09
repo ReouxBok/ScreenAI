@@ -147,20 +147,21 @@ import { runCaseEffectsPass } from "./case-runtime-effects";
 import { createCaseV2WakeDeps } from "./case-v2-wake-ports";
 import { executionProvider } from "../../../../test/sav-intake-execution-provider";
 import { readCaseReplyDisclosure } from "./case-reply-outbound";
+import { SAV_CASE_INBOUND_SETTLE_SECONDS } from "./case-types";
 import type { CaseReplyProposal } from "./case-effects";
 vi.mock("../hubspot-transport", async importOriginal => {
   const { virtualSavHubspotTransportModule } = await import("../../../../test/sav-virtual-hubspot-transport");
   return virtualSavHubspotTransportModule(await importOriginal<typeof import("../hubspot-transport")>());
 });
 
-let policyHash = "", adminId = "";
+let policyHash = "", adminId = "", executionPolicy: ReturnType<typeof executionPolicySchema.parse>;
 async function executionEnv(): Promise<Record<string, string | undefined>> {
   const policy = executionPolicySchema.parse({
     revision: "sav-intake-execution-2026-10-21.v1", mailboxId, codeRevision: "a".repeat(40), enginePolicyHash: "b".repeat(64), resourcesHash: "c".repeat(64),
     createdAfter: new Date(Date.now() - 60_000).toISOString(), receivedAfter: new Date(Date.now() - 3600_000).toISOString(), expiresAt: new Date(Date.now() + 3600_000).toISOString(),
     maxDossiers: 100, mutations: ["send_case_reply"], admission: { kind: "automatic" },
   });
-  policyHash = intakeRuntimeHash(policy);
+  policyHash = intakeRuntimeHash(policy); executionPolicy = policy;
   await f.db.update(savIntakeExecutionPolicies).set({ policyHash, payloadCiphertext: encryptSavPayload(policy) }).where(eq(savIntakeExecutionPolicies.id, policyId));
   return environment({
     SAV_V2_AUTO_REPLY: "access", SAV_V2_AUTO_APPROVER_ID: STAFF,
@@ -179,6 +180,9 @@ async function returnedCase(env: Record<string, string | undefined>, text = "Tou
   expect(await routeCustomerReturn(id, { env, readTicketOwner: async () => V2_OWNER })).toMatchObject({ route: { route: "continue" }, written: true });
   return { ...made, gmail };
 }
+/** The store waits SAV_CASE_INBOUND_SETTLE_SECONDS after the last recorded customer mail before any claim (a burst of mails
+ * is analysed once). The loader reads the real clock, so a case is continued as the next pass would: after that window. */
+const afterSettle = () => { vi.useFakeTimers({ toFake: ["Date"] }); vi.setSystemTime(Date.now() + (SAV_CASE_INBOUND_SETTLE_SECONDS + 60) * 1000); };
 const effectRows = (id: string) => f.db.select().from(savCaseEffectExecutions).where(eq(savCaseEffectExecutions.caseId,id));
 
 beforeAll(async () => {
@@ -198,13 +202,17 @@ beforeEach(async () => {
   vi.stubGlobal("fetch", vi.fn(() => { throw Error("NETWORK_FORBIDDEN"); }));
   await clearSpend(); await seedCard();
 });
-afterEach(() => { vi.unstubAllEnvs(); vi.unstubAllGlobals(); });
+afterEach(() => { vi.useRealTimers(); vi.unstubAllEnvs(); vi.unstubAllGlobals(); });
 
 describe("actual continuation loader: real factory and authorizer, synthetic transport only", () => {
   it("return -> loader -> queued automated reply -> one verified send, replay sends nothing more", async () => {
     const env = await executionEnv(), made = await returnedCase(env), net = network();
     vi.stubGlobal("fetch", vi.fn((url: string, init: RequestInit) => net.net(String(url), init)));
     const point = await loadCaseContinuationPoint();
+    // Inside the settle window the claim is refused: the owner is read first (Ugo 31/10), no model or embedding call.
+    expect(await point({ caseId: made.caseId, trigger: "customer_return", env })).toEqual({ status: "claim_refused" });
+    expect(net.calls.filter(call => call.url.includes("generativelanguage"))).toEqual([]);
+    afterSettle();
     expect(await point({ caseId: made.caseId, trigger: "customer_return", env })).toEqual({ status: "queued" });
     const validations = await f.db.select().from(savCaseReplyValidations).where(eq(savCaseReplyValidations.caseId, made.caseId));
     expect(validations).toHaveLength(1);
@@ -217,13 +225,15 @@ describe("actual continuation loader: real factory and authorizer, synthetic tra
     const deps = createCaseV2WakeDeps({ env: () => env, policy: { id: policyId, hash: policyHash }, readPolicyRecord,
       since: new Date(Date.now() - 60_000), deadlineMs: Date.now() + 60_000,
       network: provider.network as typeof fetch,
-      gmail: { request: async (mailbox, path, init) => { if (path === "/messages/send") sends++; return provider.gmail(mailbox,path,init); }, permissions: async () => {} },
+      gmail: { request: async (mailbox, path, init) => { if (path.replace(/^\//, "") === "messages/send") sends++; return provider.gmail(mailbox,path,init); }, permissions: async () => {} },
     });
-    const report = await runCaseEffectsPass(deps.replies);
+    // As in case-v2-wake.flow: only the pins of the V1 observation environment are replaced, every other port is the canonical adapter.
+    const replies = { ...deps.replies, context: { runtime: {} as never, policy: executionPolicy } };
+    const report = await runCaseEffectsPass(replies);
     expect(report.supervised).toEqual(expect.arrayContaining([expect.objectContaining({ state: "confirmed" })]));
     expect(sends).toBe(1);
     await point({ caseId: made.caseId, trigger: "sweep", env });
-    await runCaseEffectsPass(deps.replies);
+    await runCaseEffectsPass(replies);
     expect(sends).toBe(1);
     expect(await effectRows(made.caseId)).toHaveLength(1);
   });
@@ -231,7 +241,8 @@ describe("actual continuation loader: real factory and authorizer, synthetic tra
     const env = await executionEnv(), made = await returnedCase(env), net = network();
     vi.stubGlobal("fetch", vi.fn((url: string, init: RequestInit) => net.net(String(url),init)));
     delete env.SAV_V2_RETURN_RULE_JSON;
-    await (await loadCaseContinuationPoint())({ caseId: made.caseId, trigger: "customer_return", env });
+    afterSettle(); // outside the settle window, so that only the missing rule can stop the run
+    expect(await (await loadCaseContinuationPoint())({ caseId: made.caseId, trigger: "customer_return", env })).not.toEqual({ status: "claim_refused" });
     expect(net.calls.filter(call => call.url.includes("generativelanguage"))).toEqual([]);
     expect(await effectRows(made.caseId)).toEqual([]);
   });
