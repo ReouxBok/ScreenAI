@@ -7,7 +7,7 @@ export function executionProvider(sender = "customer@example.invalid") {
         id: string;
         properties: Record<string, string | null>;
     }>> = {
-        tickets: {}, notes: {}, emails: {}
+        tickets: {}, notes: {}, emails: {}, calls: {}, meetings: {}, tasks: {}
     };
     const links = new Map<string, string[]>(), calls: {
         path: string;
@@ -64,7 +64,10 @@ export function executionProvider(sender = "customer@example.invalid") {
                         }
                     }]
             });
-        const assoc = path.match(/^\/crm\/v4\/objects\/(contacts|tickets|notes|emails)\/(\d+)\/associations\/(?:default\/)?(contacts|tickets|notes|emails)(?:\/(\d+))?$/);
+        const historyTypes = ["calls", "emails", "notes", "meetings", "tasks"];
+        const labels = path.match(/^\/crm\/v4\/associations\/tickets\/(calls|emails|notes|meetings|tasks)\/labels$/);
+        if (labels) return Response.json({ results: [{ category: "HUBSPOT_DEFINED", label: null, typeId: 1000 + historyTypes.indexOf(labels[1]) }] });
+        const assoc = path.match(/^\/crm\/v4\/objects\/(contacts|tickets|notes|emails|calls|meetings|tasks)\/(\d+)\/associations\/(?:default\/)?(contacts|tickets|notes|emails|calls|meetings|tasks)(?:\/(\d+))?$/);
         if (assoc) {
             const [, type, id, to, target] = assoc, key = `${type}:${id}:${to}`;
             if (method === "PUT") {
@@ -86,7 +89,7 @@ export function executionProvider(sender = "customer@example.invalid") {
                 }))
             });
         }
-        const collection = path.match(/^\/crm\/v3\/objects\/(tickets|notes|emails)(?:\/(batch\/read|search|\d+))?$/);
+        const collection = path.match(/^\/crm\/v3\/objects\/(tickets|notes|emails|calls|meetings|tasks)(?:\/(batch\/read|search|\d+))?$/);
         if (collection) {
             const [, type, tail] = collection, rows = objects[type];
             if (method === "POST" && !tail) {
@@ -99,6 +102,12 @@ export function executionProvider(sender = "customer@example.invalid") {
                     const cid = body.associations[0].to.id;
                     links.set(`tickets:${id}:contacts`, [cid]);
                     links.set(`contacts:${cid}:tickets`, [...(links.get(`contacts:${cid}:tickets`) ?? []), id]);
+                    for (const assoc of body.associations.slice(1)) {
+                        const activity = historyTypes[assoc.types[0].associationTypeId - 1000];
+                        if (!activity) throw Error("FAKE_ACTIVITY_ASSOCIATION_INVALID");
+                        const key = `tickets:${id}:${activity}`;
+                        links.set(key, [...new Set([...(links.get(key) ?? []), String(assoc.to.id)])]);
+                    }
                 }
                 if (type === "emails") {
                     const headers = JSON.parse(properties.hs_email_headers);

@@ -43,6 +43,26 @@ globalThis.fetch = async (input, init = {}) => {
       const contactId = body.filterGroups[0].filters[0].value;
       return Response.json({ results: Object.values(state.tickets).filter(t => t.associations.contacts.results.some(c => c.id === contactId)) });
     }
+    // Explicit synthetic history endpoints only; every other request still fails closed.
+    const historyTypes = { calls: 901, emails: 902, notes: 903, meetings: 904, tasks: 905 };
+    const history = route.match(/^\/crm\/v4\/objects\/(contacts|tickets)\/(\d+)\/associations\/(calls|emails|notes|meetings|tasks)$/);
+    if (history && method === 'GET') {
+      const [, kind, id, type] = history;
+      if (kind === 'contacts' && Object.values(state.cases).some(c => c.contactId === id))
+        return Response.json({ results: (state.activities?.[type] ?? []).filter(a => a.contactId === id).map(a => ({ toObjectId: a.id })) });
+      if (kind === 'tickets' && state.tickets[id])
+        return Response.json({ results: (state.tickets[id].associations[type]?.results ?? []).map(a => ({ toObjectId: a.id })) });
+    }
+    const batch = route.match(/^\/crm\/v3\/objects\/(calls|emails|notes|meetings|tasks)\/batch\/read$/);
+    if (batch && method === 'POST') {
+      const rows = state.activities?.[batch[1]] ?? [];
+      return Response.json({ status: 'COMPLETE', results: (body.inputs ?? []).flatMap(input => {
+        const row = rows.find(a => a.id === input.id);
+        return row ? [{ id: row.id, properties: row.properties }] : [];
+      }) });
+    }
+    const labels = route.match(/^\/crm\/v4\/associations\/tickets\/(calls|emails|notes|meetings|tasks)\/labels$/);
+    if (labels && method === 'GET') return Response.json({ results: [{ category: 'HUBSPOT_DEFINED', label: null, typeId: historyTypes[labels[1]] }] });
     if (/\/tickets\/\d+\/associations\/(notes|emails)$/.test(route)) return Response.json({ results: [] });
     if (route.endsWith('/associations/notes/tickets/labels')) return Response.json({ results: [{ category: 'HUBSPOT_DEFINED', label: null, typeId: 228 }] });
     const ticketId = route.match(/\/objects\/tickets\/(\d+)$/)?.[1];
@@ -66,7 +86,14 @@ globalThis.fetch = async (input, init = {}) => {
     }
     if (route.endsWith('/objects/tickets') && method === 'POST') {
       const id = String(900000 + Object.keys(state.tickets).length);
-      state.tickets[id] = { id, properties: body.properties, createdAt: new Date().toISOString(), associations: { contacts: { results: [{ id: body.associations[0].to.id }] } } };
+      const associations = { contacts: { results: [{ id: body.associations[0].to.id }] } };
+      for (const link of body.associations.slice(1)) {
+        const type = Object.keys(historyTypes).find(key => link.types?.some(t => t.associationCategory === 'HUBSPOT_DEFINED' && t.associationTypeId === historyTypes[key]));
+        if (!type || !(state.activities?.[type] ?? []).some(a => a.id === link.to.id && a.contactId === body.associations[0].to.id)) throw Error('JOURNEY_INVALID_HISTORY_ASSOCIATION');
+        associations[type] ??= { results: [] };
+        associations[type].results.push({ id: link.to.id });
+      }
+      state.tickets[id] = { id, properties: body.properties, createdAt: new Date().toISOString(), associations };
       state.events.push({ kind: 'create', ticketId: id, contactId: body.associations[0].to.id }); save(); return Response.json(state.tickets[id]);
     }
   }

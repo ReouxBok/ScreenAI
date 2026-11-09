@@ -1,5 +1,6 @@
 import { ensureSavCaseObservationTx } from "./case-learning";
 import "server-only";
+import { collectTicketCreationHistory, ticketCreationAssociations, verifyTicketCreationHistory, type TicketCreationHistory } from "./ticket-creation-history";
 import {historicalMessageForIdSql,historicalThreadSql} from "./intake/launch-boundary";
 import { withLegacyOccupationAction, markLegacyIntakeDispatch, releaseLegacyIntakeIfConfirmed } from "./intake/legacy-occupation";
 import { assertSavTicketMatchesDispatch } from "./ticket-confirmation";
@@ -96,6 +97,8 @@ const HUBSPOT_BACKFILL_RETRY_MS = 30 * 60 * 1_000;
 const HUBSPOT_BACKFILL_LEASE_MS = 10 * 60 * 1_000;
 export const HUBSPOT_TICKET_TRANSCRIPT_MAX_BYTES = 48 * 1024;
 const HUBSPOT_TICKET_EMAIL_BODY_MAX_CHARS = 8_000;
+
+const historyRead = (path: string, body?: unknown) => hubspotFetch<unknown>(path, body === undefined ? undefined : { method: "POST", body: JSON.stringify(body) });
 
 function requiredEnv(name: string) {
   const value = process.env[name];
@@ -375,6 +378,8 @@ async function finalizeSavV0TicketAction(action: typeof savActions.$inferSelect)
   const pipeline = await hubspotFetch<{ id: string; stages: Array<{ id: string; metadata?: { isClosed?: string | boolean } }> }>(`/crm/v3/pipelines/tickets/${SAV_HUBSPOT_SUPPORT.pipelineId}`);
   assertSavSupportPipeline(pipeline);
   let ticket: HubspotRecord;
+  let creationHistory = typeof action.payload.ticketCreationHistoryCiphertext === "string"
+    ? decryptSavPayload<TicketCreationHistory>(action.payload.ticketCreationHistoryCiphertext) : null;
   if (knownTicketId) {
     // An acknowledged result is resumed, never replaced by another POST.
     const identity = resolveSavCustomerIdentity({ fromEmail: latest.fromEmail, body: decryptSavPayload<SavMessageBody>(latest.bodyCiphertext).text });
@@ -452,16 +457,17 @@ async function finalizeSavV0TicketAction(action: typeof savActions.$inferSelect)
         if (!returnTarget?.ownerId || !returnRequest.ownerId || returnTarget.ownerId !== returnRequest.ownerId) throw new Error("SAV_TICKET_OWNER_REQUIRED");
         properties.hubspot_owner_id = returnTarget.ownerId;
       }
+      creationHistory = await collectTicketCreationHistory(context.contactId, historyRead);
       const db = requireDb();
       // Durable marker before dispatch. Recovery must fail closed after a crash.
-      const [claimed] = await db.update(savActions).set({ payload: sql`${savActions.payload} || ${JSON.stringify({ ticketCreateDispatchedAt: new Date().toISOString(), ticketCreateRequestCiphertext: encryptSavPayload({
+      const [claimed] = await db.update(savActions).set({ payload: sql`${savActions.payload} || ${JSON.stringify({ ticketCreateDispatchedAt: new Date().toISOString(), ticketCreationHistoryCiphertext: encryptSavPayload(creationHistory), ticketCreateRequestCiphertext: encryptSavPayload({
           actionId: action.id, reviewId: review.id, decisionId: action.decisionId, messageId: action.messageId, threadId: thread.id,
           contactId: context.contactId, customerEmail, customerIdentityKind: customerIdentity.kind, properties,
         }) })}::jsonb`, updatedAt: new Date() })
         .where(and(eq(savActions.id, action.id), eq(savActions.status, "running"), sql`${savActions.payload}->>'ticketCreateDispatchedAt' is null`)).returning();
       if (!claimed) throw new Error("SAV_MANUAL_RECONCILIATION_REQUIRED");
       try {
-        ticket = await guardedHubspotWrite<HubspotRecord>(action.id, "/crm/v3/objects/tickets", { method: "POST", body: JSON.stringify({ properties, associations: [{ to: { id: context.contactId }, types: [{ associationCategory: "HUBSPOT_DEFINED", associationTypeId: 16 }] }] }) });
+        ticket = await guardedHubspotWrite<HubspotRecord>(action.id, "/crm/v3/objects/tickets", { method: "POST", body: JSON.stringify({ properties, associations: ticketCreationAssociations(creationHistory) }) });
         if (!ticket?.id) throw new Error("SAV_MANUAL_RECONCILIATION_REQUIRED");
         await db.update(savActions).set({ payload: sql`${savActions.payload} || ${JSON.stringify({ hubspotTicketId: ticket.id })}::jsonb`, updatedAt: new Date() }).where(eq(savActions.id, action.id));
       } catch (error) {
@@ -476,6 +482,7 @@ async function finalizeSavV0TicketAction(action: typeof savActions.$inferSelect)
       }
     }
   }
+  if (creationHistory && !await verifyTicketCreationHistory(ticket.id, creationHistory, historyRead)) throw Error("SAV_TICKET_HISTORY_INCOMPLETE");
   await requireDb().transaction(async (tx) => {
     await tx.select().from(savThreads).where(eq(savThreads.id, thread.id)).for("update");
     const [current] = await tx.select().from(savThreads).where(eq(savThreads.id, thread.id));
@@ -797,15 +804,21 @@ async function createHubspotTicket(message: typeof savMessages.$inferSelect, bod
     hs_pipeline_stage: requiredEnv("HUBSPOT_NEW_TICKET_STAGE_ID"),
   };
   if (savReleaseStage() !== "v0" && process.env.HUBSPOT_TICKET_PIPELINE_ID) properties.hs_pipeline = process.env.HUBSPOT_TICKET_PIPELINE_ID;
-  const associations = contactId ? [{
-    to: { id: contactId },
-    types: [{ associationCategory: "HUBSPOT_DEFINED", associationTypeId: 16 }],
-  }] : [];
+  if (!contactId) throw Error("SAV_HUBSPOT_CONTACT_REQUIRED");
+  const history = await collectTicketCreationHistory(contactId, historyRead);
+  const associations = ticketCreationAssociations(history);
   await assertSavTicketStageNotClosed(properties.hs_pipeline_stage, await closedTicketStages());
-  return guardedHubspotWrite<HubspotRecord>(actionId, "/crm/v3/objects/tickets", {
-    method: "POST",
-    body: JSON.stringify({ properties, associations }),
+  const [claimed] = await requireDb().update(savActions).set({ payload: sql`${savActions.payload} || ${JSON.stringify({ ticketCreateDispatchedAt: new Date().toISOString(), ticketCreationHistoryCiphertext: encryptSavPayload(history) })}::jsonb`, updatedAt: new Date() })
+    .where(and(eq(savActions.id, actionId), sql`${savActions.payload}->>'ticketCreateDispatchedAt' is null`)).returning();
+  if (!claimed) throw Error("SAV_MANUAL_RECONCILIATION_REQUIRED");
+  const ticket = await guardedHubspotWrite<HubspotRecord>(actionId, "/crm/v3/objects/tickets", {
+    method: "POST", body: JSON.stringify({ properties, associations }),
   });
+  // Persist acknowledgement before read-back: a failed history check must never
+  // create another ticket on the next pass.
+  await requireDb().update(savActions).set({ payload: sql`${savActions.payload} || ${JSON.stringify({ hubspotTicketId: ticket.id, ticketCreationHistoryCiphertext: encryptSavPayload(history) })}::jsonb`, updatedAt: new Date() }).where(eq(savActions.id, actionId));
+  if (!await verifyTicketCreationHistory(ticket.id, history, historyRead)) throw Error("SAV_TICKET_HISTORY_INCOMPLETE");
+  return ticket;
 }
 
 async function finalizeTicketAction(action: typeof savActions.$inferSelect) {
@@ -825,10 +838,12 @@ async function finalizeTicketAction(action: typeof savActions.$inferSelect) {
   const body = decryptSavPayload<SavMessageBody>(message.bodyCiphertext);
   const existingContact = await findContactByEmail(thread.customerEmail);
   const persistedTicketId = typeof action.payload.hubspotTicketId === "string" ? action.payload.hubspotTicketId : null;
+  if (!persistedTicketId && action.payload.ticketCreateDispatchedAt) throw Error("SAV_MANUAL_RECONCILIATION_REQUIRED");
   const existing = await findExistingTicket(existingContact?.id ?? null, thread.subject, persistedTicketId || thread.hubspotTicketId);
   const contact = existingContact ?? await ensureContactByEmail(thread.customerEmail, action.id);
   const ticket = existing ?? await createHubspotTicket(message, body, contact?.id ?? null, action.id);
-  if (!existing) await db.update(savActions).set({ payload: { ...action.payload, hubspotTicketId: ticket.id }, updatedAt: new Date() }).where(eq(savActions.id, action.id));
+  if (existing && typeof action.payload.ticketCreationHistoryCiphertext === "string"
+    && !await verifyTicketCreationHistory(ticket.id, decryptSavPayload<TicketCreationHistory>(action.payload.ticketCreationHistoryCiphertext), historyRead)) throw Error("SAV_TICKET_HISTORY_INCOMPLETE");
   const [sourceDecision] = action.decisionId
     ? await db.select({ confidence: savDecisions.confidence }).from(savDecisions).where(eq(savDecisions.id, action.decisionId)).limit(1)
     : [];
@@ -854,7 +869,7 @@ async function finalizeTicketAction(action: typeof savActions.$inferSelect) {
     });
     await tx.update(savThreads).set({ hubspotTicketId: ticket.id, status: thread.aiPaused ? "human_requested" : "ai_processing", updatedAt: new Date() })
       .where(eq(savThreads.id, thread.id));
-    await tx.update(savActions).set({ status: "succeeded", executedAt: new Date(), updatedAt: new Date(), payload: { ...action.payload, hubspotTicketId: ticket.id } })
+    await tx.update(savActions).set({ status: "succeeded", executedAt: new Date(), updatedAt: new Date(), payload: sql`${savActions.payload} || ${JSON.stringify({ hubspotTicketId: ticket.id })}::jsonb` })
       .where(eq(savActions.id, action.id));
     await tx.insert(savActions).values({
       threadId: thread.id,

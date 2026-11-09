@@ -1,4 +1,5 @@
 import "server-only";
+import { collectTicketCreationHistory, ticketCreationAssociations, ticketCreationHistorySchema, verifyTicketCreationHistory } from "../ticket-creation-history";
 import { z } from "zod";
 import { createSavHubspotTransport } from "../hubspot-transport";
 import { createSavIntakeHubspotReaders } from "./hubspot-readers";
@@ -145,6 +146,7 @@ export function createIntakeExecutorAdapters(options: {
         return matches.length === 1 ? matches[0] : null;
     }
     const adapters: ExecutorAdapters = {
+        prepareTicketHistory: (contactId, signal) => collectTicketCreationHistory(id(contactId), (path, body) => hub(path, body === undefined ? "GET" : "POST", signal, body)),
         qualifyAddedEmails: (baseline,current,source,signal) => qualifyCrmHistoryAdditions(baseline,current,source,{authority:env().SAV_INTAKE_CRM_ACK_TEMPLATES_JSON,
           readEmail: objectId => read("emails",objectId,signal),
           verifyAckOrigin: async expected => {
@@ -201,16 +203,13 @@ export function createIntakeExecutorAdapters(options: {
                 });
             }
             let result: unknown;
-            if (intent.kind === "ticket_create")
+            if (intent.kind === "ticket_create") {
+                const history = ticketCreationHistorySchema.parse(intent.ticketHistory);
+                if (history.contactId !== id(intent.contactId)) throw Error("SAV_TICKET_HISTORY_CONTACT_CHANGED");
                 result = await hub("/crm/v3/objects/tickets", "POST", signal, {
-                    properties: intent.properties, associations: [{
-                            to: {
-                                id: id(intent.contactId)
-                            }, types: [{
-                                    associationCategory: "HUBSPOT_DEFINED", associationTypeId: 16
-                                }]
-                        }]
+                    properties: intent.properties, associations: ticketCreationAssociations(history)
                 });
+            }
             else if (intent.kind === "note_create")
                 result = await hub("/crm/v3/objects/notes", "POST", signal, {
                     properties: intent.properties
@@ -317,6 +316,9 @@ export function createIntakeExecutorAdapters(options: {
                 ok = false;
             if (type === "tickets")
                 ok = ok && Object.hasOwn(row.properties, "hubspot_owner_id") && !row.properties.hubspot_owner_id && await association("tickets", id(candidate), "contacts", id(intent.contactId), signal) && Boolean(row.properties.createdate) && Date.parse(row.properties.createdate!) >= dispatchedAt.getTime() - 5000;
+            if (type === "tickets" && ok && intent.ticketHistory)
+                ok = intent.ticketHistory.contactId === intent.contactId && await verifyTicketCreationHistory(candidate, intent.ticketHistory,
+                    (path, body) => hub(path, body === undefined ? "GET" : "POST", signal, body));
             return {
                 confirmed: ok, attributed: ok, ack: {
                     id: candidate
