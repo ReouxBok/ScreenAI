@@ -435,3 +435,108 @@ describe("login blockage once the card's checks are done (A09)", () => {
     });
   });
 });
+
+// Q3 (9/11, Ugo's acceptance): a persistent access problem reads the history, asks the spam folder only if never asked nor answered, asks the exact text displayed
+// or a screenshot only if absent, then relays with the context. No loop, no repeated procedure, no closure on a thanks, no claim to read an image.
+describe("Q3 — accès persistant : historique, spams, capture, puis relais", () => {
+  const RELAY = "Si le client signale un blocage, demander au besoin le message affiché, puis transmettre à l’équipe.";
+  const relayed = (version = CURRENT, escalation: string | undefined = RELAY) => { const card = login(version); return { ...card, resolution: { ...card.resolution, ...(escalation ? { escalation } : {}) } } as SavRetrievalCandidate; };
+  const email = (id: string, order: number) => ({ ref: { type: "email" as const, id }, direction: "customer_inbound" as const, at: `2026-11-04T0${order}:00:00Z`, order });
+  const thread = (card: SavRetrievalCandidate, mails: string[], over: Partial<CaseDecisionValidationContext> = {}): CaseDecisionValidationContext => ({ ...context(card, mails[0]!),
+    customerTexts: Object.fromEntries(mails.map((text, i) => [`email:m${i + 1}`, text])), sources: mails.map((_, i) => email(`m${i + 1}`, i + 1)), ...over });
+  const accepted = (result: CaseDecisionValidation) => {
+    if (result.outcome !== "accepted") throw Error(`REFUSED:${result.rejections.map(row => row.code).join(",")}`);
+    return result.decision;
+  };
+  const asked = (factKeys: string[]) => ({ questions: [{ id: "q1", factKeys, askedAt: "2026-11-04T01:30:00Z", answeredBy: null }] });
+  const CAPTURE = "Voici une capture d’écran en pièce jointe.";
+  const SCREEN_HOW = "Vous pouvez recopier le texte exact ou joindre une capture d’écran.";
+  const restates = (text: string) => /\b(?:ouvrez|voici le lien|saisissez votre adresse|vérifiez le dossier|pensez à vérifier)\b/i.test(text.replace(/saisissez-le uniquement/g, ""));
+
+  it("bon lien et adresse confirmés, spams jamais demandés : la vérification des spams, puis le texte exact ou une capture", () => {
+    const decision = accepted(validateCaseDecision(proposal(), context(relayed(FUTURE), A06), now));
+    expect(decision.nextAction.kind).toBe("ask");
+    expect(decision.reply!.text).toContain(FUTURE.steps[2]);
+    expect(decision.reply!.text).toContain(SCREEN_HOW);
+  });
+  it("spams déjà demandés, sans réponse : la question des spams n'est pas reposée", () => {
+    const decision = accepted(validateCaseDecision(proposal(), thread(relayed(FUTURE), [A06, "Toujours rien."], asked(["login_spam_checked"])), now));
+    expect(decision.nextAction.kind).toBe("ask");
+    expect(decision.reply!.text).not.toMatch(/spams|indésirables/i);
+    expect(decision.reply!.text).toContain(SCREEN_HOW);
+  });
+  it("spams vérifiés et code absent : le texte exact ou une capture, sans répéter lien, adresse ni spams", () => {
+    const decision = accepted(validateCaseDecision(proposal(), context(relayed(FUTURE), A08), now));
+    expect(decision.reply!.text).toContain("Quel message s’affiche à l’écran après la saisie de votre adresse e-mail ?");
+    expect(decision.reply!.text).toContain(SCREEN_HOW);
+    expect(restates(decision.reply!.text)).toBe(false);
+  });
+  it.each([
+    ["dans le même mail", [`${A08} ${CAPTURE}`], {}],
+    ["en réponse à notre question", [A08, "Ci-joint la capture d’écran."], asked(["login_error_message"])],
+    ["signée", [A08, "Je vous joins une capture.\n\nCordialement,\nJean Dupont\n06 12 34 56 78"], asked(["login_error_message"])],
+  ])("capture jointe %s : rien n'est redemandé, relais avec les faits et la limite de lecture", (_name, mails, over) => {
+    const decision = accepted(validateCaseDecision(proposal(), thread(relayed(), mails as string[], over), now));
+    if (decision.nextAction.kind !== "handoff") throw Error(`NOT_HANDOFF:${decision.nextAction.kind}`);
+    expect(decision.reply).toBeUndefined();
+    expect(decision.nextAction.reason).toBe("diagnosis_out_of_tools");
+    expect(decision.nextAction.report.observed).toContain("capture d’écran");
+    expect(decision.nextAction.report.observed).toContain("L’agent ne lit pas les images");
+    expect(decision.nextAction.report.need).toContain("bon lien, bonne adresse, spams");
+    expect(decision.nextAction.report.hypotheses).toEqual([]);
+  });
+  it("capture jointe et le modèle redemande une capture : traité comme une répétition, relais", () => {
+    const again = { ...proposal(), nextAction: { kind: "ask", questions: [{ requestId: "r1", text: "Pouvez-vous m’envoyer une capture de l’écran ?", reducesUncertainty: "Voir.", seeks: [{ kind: "screenshot" }] }] },
+      reply: { text: "Pouvez-vous m’envoyer une capture de l’écran ?", citations: [], impossibilityClaims: [], accountAdvice: "none" } };
+    expect(accepted(validateCaseDecision(again, context(relayed(), `${A08} ${CAPTURE}`), now)).nextAction.kind).toBe("handoff");
+  });
+  it("capture jointe sur une fiche sans relais : refus corrigible, jamais une nouvelle question", () => {
+    const result = validateCaseDecision(proposal(), context(relayed(CURRENT, "Lire le message disponible."), `${A08} ${CAPTURE}`), now);
+    expect(result.outcome).toBe("needs_review");
+    expect(result.outcome === "needs_review" && result.rejections.map(row => row.code)).toContain("login_procedure_redundant");
+  });
+  it("« je n'ai pas de capture » n'est pas une capture : on demande le texte affiché", () => {
+    const decision = accepted(validateCaseDecision(proposal(), context(relayed(), `${A08} Je n’ai pas de capture d’écran.`), now));
+    expect(decision.nextAction.kind).toBe("ask");
+    expect(decision.reply!.text).toContain("Quel message s’affiche");
+  });
+  it("premier mail avec une capture annoncée : la procédure, sans demander ce qui s'affiche", () => {
+    const text = accepted(validateCaseDecision(proposal(), context(relayed(), `${FIRST} ${CAPTURE}`), now)).reply!.text;
+    expect(text).toContain("Voici le lien de connexion");
+    expect(text).not.toContain("ce qui s’affiche");
+  });
+  it("historique signé : la signature (nom, téléphone) ne fausse ni les vérifications ni le rappel", () => {
+    const signed = (text: string) => `${text}\n\nCordialement,\nJean Dupont\n06 12 34 56 78`;
+    const decision = accepted(validateCaseDecision(proposal(), thread(relayed(), [signed(A09_TEXT), signed("Toujours pas de code.")]), now));
+    expect(decision.nextAction.kind).toBe("handoff");
+  });
+  it("une phrase écrite après le séparateur de signature reste lue dans l'historique (Q1) : le message affiché qu'elle donne n'est pas redemandé", () => {
+    const decision = accepted(validateCaseDecision(proposal(), thread(relayed(), [`${A08}\n--\nJean Dupont\nL’écran affiche « identifiant introuvable ».`, "Toujours pas de code."]), now));
+    if (decision.nextAction.kind !== "handoff") throw Error(`NOT_HANDOFF:${decision.nextAction.kind}`);
+    expect(decision.nextAction.report.observed).toContain("identifiant introuvable");
+  });
+  it("un ancien « ça marche » signé termine l'ancien problème : ses vérifications ne comptent plus", () => {
+    const decision = accepted(validateCaseDecision(proposal(), thread(relayed(), [A09_TEXT, "Ça marche, merci !\n\nJean Dupont", FIRST]), now));
+    expect(decision.nextAction.kind).not.toBe("handoff");
+  });
+
+  const resolution = (quote: string) => ({ caseVersion: 3, understanding: proposal().understanding,
+    nextAction: { kind: "confirm_resolution", requestIds: ["r1"], evidence: [{ requestId: "r1", source: { type: "email", id: "m2" }, trialId: "t1", quote }] } });
+  const afterTrial = (reply: string): CaseDecisionValidationContext => ({ ...thread(relayed(), [FIRST, reply]),
+    trials: [{ id: "t1", requestId: "r1", knowledge: ref, askedAt: "2026-11-04T01:30:00Z", outcome: "pending" as const, resultAt: null }] });
+  it.each([
+    ["merci seul", "Merci beaucoup !", "Merci beaucoup"],
+    ["merci signé", "Merci !\n\nJean Dupont\n06 12 34 56 78", "Merci"],
+    ["ça marche + fonction + demande cachée", "Ça marche, merci !\n\nJean Dupont\nDeux sommes prises en octobre", "Ça marche"],
+    ["ça marche + nom + résiliation paraphrasée", "Ça marche.\n\nJean\nFermez tout au 30", "Ça marche"],
+  ])("%s : aucune preuve de résolution", (_name, reply, quote) => {
+    const result = validateCaseDecision(resolution(quote), afterTrial(reply), now);
+    expect(result.outcome).toBe("needs_review");
+    expect(result.outcome === "needs_review" && result.rejections.map(row => row.detail)).toContain("latest_customer_login_not_confirmed");
+  });
+  it("« ça marche » avec une signature standard reste une preuve recevable", () => {
+    const result = validateCaseDecision(resolution("Ça marche, merci"), afterTrial("Ça marche, merci !\n\nBien cordialement,\nJean Dupont\njean.dupont@exemple.test"), now);
+    expect(result.outcome === "needs_review" ? result.rejections.map(row => row.detail) : []).not.toContain("latest_customer_login_not_confirmed");
+  });
+});
+const A09_TEXT = "J’ai déjà essayé le bon lien et la bonne adresse e-mail, mais je ne reçois aucun code. J’ai déjà vérifié les spams. L’écran affiche l’erreur « identifiant introuvable ».";

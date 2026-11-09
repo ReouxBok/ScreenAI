@@ -764,6 +764,13 @@ describe("review F3/F4: a return is read whole, signature included, before the a
     ["sommes", "Toujours rien, et j’aimerais récupérer les sommes versées.\n\nCordialement,\nCamille Synthétique"],
     ["contradiction", "Ça marche maintenant. Ah non, ça replante."],
     ["after-signature", "Merci, ça remarche !\n\nCamille Synthétique\nPar contre l’export de mes fichiers est bloqué."],
+    // Review Q1 (8/11): a short line under the name is no proven signature; the request it carries stops the case, and « ça marche » proves nothing.
+    ["q1-sommes", "Ça marche, merci !\n\nCamille Synthétique\nDeux sommes prises en octobre"],
+    ["q1-fermez", "Ça marche.\n\nCamille\nFermez tout au 30"],
+    ["q1-titulaire", "Ça marche, merci !\n\nCamille Synthétique\nNouveau propriétaire du compte : Paul Martin"],
+    ["q1-collegue", "Ça marche, merci !\n\nCamille Synthétique\nAjout collègue Marie sur l'espace"],
+    ["q1-fonction", "Merci, ça remarche !\n\nCordialement,\nCamille Synthétique\nGérante – Boutique Synthétique\n01 23 45 67 89"],
+    ["q1-merci-seul", "Merci beaucoup !\n\nCamille Synthétique"],
   ])("F3 %s: not reduced to access: zero model call, no second mail, nothing closed", async (id, text) => {
     const made = await returned(`gm-f3-${id}`, text);
     const sentBefore = sends;
@@ -780,7 +787,9 @@ describe("review F3/F4: a return is read whole, signature included, before the a
   it.each([
     ["chrome", "Toujours pas de code, j’ai pourtant essayé sur Chrome et sur Firefox.\n\nCordialement,\nCamille Synthétique"],
     ["help", "Je n’arrive toujours pas à me connecter. Pouvez-vous m’aider ?\n\nCamille"],
-    ["signed-failure", "Merci, mais ça ne fonctionne toujours pas.\n\nCordialement,\nCamille Synthétique\nGérante – Boutique Synthétique"],
+    ["signed-failure", "Merci, mais ça ne fonctionne toujours pas.\n\nCordialement,\nCamille Synthétique\n01 23 45 67 89"],
+    // Q3 (9/11): a persistent problem with a screenshot announced stays with the agent, whose validator relays it (decision-validator-login.test.ts).
+    ["capture", "J’ai bien utilisé new.limova.ai avec mon adresse d’inscription, toujours pas de code. Voici une capture d’écran en pièce jointe.\n\nCamille"],
   ])("witness %s: a real access return, signed, still reaches the agent", async (id, text) => {
     const made = await returned(`gm-f3-ok-${id}`, text);
     const model = counted([ask]);
@@ -789,7 +798,7 @@ describe("review F3/F4: a return is read whole, signature included, before the a
   });
 
   it("F4: « merci, ça remarche » with a full signature closes the case once, on the customer's words, and sends nothing", async () => {
-    const signed = "Merci, ça remarche !\n\nCordialement,\nCamille Synthétique\nGérante – Boutique Synthétique\n01 23 45 67 89";
+    const signed = "Merci, ça remarche !\n\nCordialement,\nCamille Synthétique\n01 23 45 67 89\ncamille@example.invalid";
     const made = await returned("gm-f4-signed", signed);
     const sentBefore = sends;
     const report = await investigate(made.caseId, [confirmResolution(made.mail, made.trial.id, "ça remarche"), resolvedVerdict]);

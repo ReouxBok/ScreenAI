@@ -1,22 +1,23 @@
 import { splitSavMessageText } from "../message-context";
 
-// A closing block the customer or the mail client adds under the statement: courtesy, a name, a role or company, a phone, a postal or web address, a mail client
-// footer. Review F4 (7/11): such a block no longer hides « ça marche » or « toujours rien ». Only a block made ENTIRELY of these lines, at the very end, is set
-// aside; a line that is not one of them (a sentence, a question, a request) stops the block, so everything from it on stays in the statement and is read.
+// A closing block the customer or the mail client adds under the statement: courtesy, a name, a phone, an e-mail or web address, a postal address, a mail
+// client footer. Review F4 (7/11): such a block no longer hides « ça marche » or « toujours rien ». Only a block made ENTIRELY of these lines, at the very end, is
+// set aside; a line that is not one of them (a sentence, a question, a request) stops the block, so everything from it on stays in the statement and is read.
+// Review Q1 (8/11, blocking): only what is PROVEN to be a signature is set aside. A free « role or company » line is not: « Deux sommes prises en octobre » or
+// « Fermez tout au 30 » under a name looked like one and vanished, so the return read « restored ». Such a line now stays in the statement, which is then not
+// a plain access statement (the team), never a resolution. A real role line costs a transfer, never a lost request.
 // The block is only set aside for reading the meaning: callers still scan the whole mail, signature included, for a sensitive request.
 const COURTESY = String.raw`(?:(?:bien |tres )?cordialement|(?:bien|tres bien) a (?:vous|toi|tous)|(?:sinceres |meilleures |bien )?salutations(?: distinguees)?|bonne (?:journee|soiree|fin de journee)|belle journee|a bientot|merci(?: beaucoup)?(?: d'avance| par avance)?|best regards|kind regards|regards|thanks)`;
 const COURTESY_LINE = new RegExp(String.raw`^(?:--|${COURTESY})[,.! ]*$`);
 const MOBILE_FOOTER = /^(?:envoye (?:a partir d[e'] ?|depuis |de )(?:mon |l')?(?:outlook (?:pour|sur) (?:ios|android)|iphone|ipad|smartphone|mobile|telephone)(?:\s*<?https:\/\/aka\.ms\/[a-z0-9_-]+>?)?|sent from my (?:iphone|ipad|phone|mobile))\.?$/;
 // A name as people sign: one to five capitalised words or initials, with the usual particles. Read on the original casing.
 const NAME_WORD = String.raw`(?:\p{Lu}[\p{Ll}'’-]+(?:-\p{Lu}[\p{Ll}'’-]+)?|\p{Lu}\.|\p{Lu}{2,}(?:[-'’]\p{Lu}+)*)`;
-const NAME_LINE = new RegExp(String.raw`^${NAME_WORD}(?:\s+(?:${NAME_WORD}|de|du|des|la|le|van|von|di|da))*$`, "u");
-// Words that are an answer, never a name: « Ça marche.\nNon » must not lose its « Non ».
-const NOT_A_NAME = /^(?:non|oui|si|rien|toujours|jamais|pas|plus|mais|aucun|aucune|stop|bloque|bloquee|urgent|encore|pareil|idem|ah|oh|ok|bon|bof|super|merci|help|svp|bonjour|bonsoir|autre|question|probleme|souci|demande|aide|erreur|bug)$/;
+const NAME_LINE = new RegExp(String.raw`^${NAME_WORD}(?:\s+(?:${NAME_WORD}|de|du|des|la|le|van|von|di|da)){0,4}$`, "u");
+// Words that are an answer or a request, never a name: « Ça marche.\nNon » must not lose its « Non », nor « Ça marche.\n\nRésiliation » its request.
+const NOT_A_NAME = /^(?:non|oui|si|rien|toujours|jamais|pas|plus|mais|aucun|aucune|stop|bloque|bloquee|urgent|encore|pareil|idem|ah|oh|ok|bon|bof|super|merci|help|svp|bonjour|bonsoir|autre|question|probleme|souci|demande|aide|erreur|bug|ps|remboursement|rembourser|resiliation|resilier|annulation|annuler|facture|factures|facturation|paiement|prelevement|abonnement|contrat|offre|devis|tarif|prix|export|exporter|collegue|invitation|inviter|membre|membres|compte|acces|connexion|code|telephone|fermeture|suppression|transfert|proprietaire|titulaire)$/;
 const PHONE_LINE = /^(?:(?:tel|telephone|mobile|portable|fixe|ligne directe|standard|phone)\s*[.:]?\s*)?\+?\d[\d\s().\/-]{6,}$/;
 const WEB_LINE = /^(?:(?:e-?mail|mail|site|web)\s*:\s*)?(?:[\w.+%-]+@[\w.-]+\.[a-z]{2,}|(?:https?:\/\/|www\.)\S+)$/;
 const ADDRESS_LINE = /^(?:\d{1,4}(?:\s?(?:bis|ter))?,?\s+(?:rue|avenue|av\.|bd|boulevard|place|chemin|allee|impasse|route|quai|cours)\b.{0,60}|\d{5}\s+[a-z' -]{2,40}|(?:cedex|france|belgique|suisse))$/;
-// A role or company line: short, no sentence, no first or second person, no login words, nothing asked.
-const ROLE_FORBIDDEN = /[?!]|\b(?:je|j'|tu|vous|nous|on|il|elle|me|m'|mon|ma|mes|ne|n'|pas|plus|toujours|rien|jamais|code|connect\w*|acces|marche|fonctionne|bloque\w*|merci|svp|aussi|contre|mais|est|sont|ai|as|a|veux|voudrais|souhaite|peux|pouvez|ps)\b/;
 
 const plain = (value: string) => value.normalize("NFKD").replace(/\p{M}/gu, "").toLowerCase().replace(/[’`]/g, "'").replace(/\s+/g, " ").trim();
 const nameLine = (line: string) => NAME_LINE.test(line) && line.split(/\s+/).every(word => !NOT_A_NAME.test(plain(word)));
@@ -24,13 +25,12 @@ const courtesyWithName = (line: string) => {
   const match = new RegExp(String.raw`^(${COURTESY})[,.!]?\s+(.+)$`).exec(plain(line));
   return Boolean(match && nameLine(line.slice(line.length - match[2]!.length).trim()));
 };
-const roleLine = (line: string) => line.length <= 60 && /^[\p{Lu}\d]/u.test(line) && line.split(/\s+/).length <= 7 && !/\.$/.test(line) && !ROLE_FORBIDDEN.test(plain(line));
 type SignatureLine = "head" | "body" | null;
 function signatureLine(line: string): SignatureLine {
   const value = plain(line);
   if (COURTESY_LINE.test(value) || MOBILE_FOOTER.test(value) || courtesyWithName(line)) return "head";
   if (nameLine(line)) return "head";
-  if (PHONE_LINE.test(value) || WEB_LINE.test(value) || ADDRESS_LINE.test(value) || roleLine(line)) return "body";
+  if (PHONE_LINE.test(value) || WEB_LINE.test(value) || ADDRESS_LINE.test(value)) return "body";
   return null;
 }
 

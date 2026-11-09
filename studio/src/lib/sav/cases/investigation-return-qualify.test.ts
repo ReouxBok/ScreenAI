@@ -158,7 +158,7 @@ describe("F4 — une signature conserve le sens, sans avaler une vraie demande",
   const SIGNED: Array<[string, string, "restored" | "ongoing" | "access"]> = [
     ["R02", "Ça marche, merci !\n\nJean Dupont", "restored"],
     ["R03", "Ça marche, merci !\n\nCordialement,\nJean Dupont", "restored"],
-    ["R04", "Ça marche, merci !\n\nCordialement,\nJean Dupont\nGérant – Boulangerie Dupont\n06 12 34 56 78", "restored"],
+    ["R04 sans fonction", "Ça marche, merci !\n\nCordialement,\nJean Dupont\n06 12 34 56 78\njean.dupont@exemple.test", "restored"],
     ["R05", "Merci, ça remarche.\n--\nJean Dupont", "restored"],
     ["R06", "Bonjour,\n\nC’est bon, j’ai pu me connecter. Merci !\n\nJean", "restored"],
     ["R07", "Merci, mais ça ne fonctionne toujours pas.\n\nCordialement,\nJean Dupont", "ongoing"],
@@ -179,6 +179,7 @@ describe("F4 — une signature conserve le sens, sans avaler une vraie demande",
     ["nouvelle phrase sous le nom", "Ça marche, merci !\n\nJean Dupont\nPar contre l’export de mes fichiers est bloqué.", []],
     ["PS financier", "Ça marche, merci !\nCordialement,\nJean\nPS : pouvez-vous m’envoyer la facture ?", ["finance"]],
     ["résiliation après le rôle", "Ça marche.\n\nJean Dupont\nGérant\nJe veux résilier.", ["cancellation"]],
+    ["fonction libre (R04 du reviewer) : la ligne reste, jamais rétabli", "Ça marche, merci !\n\nCordialement,\nJean Dupont\nGérant – Boulangerie Dupont\n06 12 34 56 78", []],
     ["rôle facturation (témoin du reviewer)", "Toujours rien.\n\nCordialement,\nJean Dupont\nService facturation", ["finance"]],
     ["mot seul sans séparation", "Ça marche\nNon", []],
     ["mot de négation après un point", "Ça marche.\nNon", []],
@@ -186,6 +187,49 @@ describe("F4 — une signature conserve le sens, sans avaler une vraie demande",
   ])("%s : la demande reste lue", async (_id, text, expected) => {
     expect(await families(text)).toEqual(expected);
     expect(reportsRestoredAccess(loginCustomerStatement(splitSavMessageText(text)))).toBe(false);
+  });
+});
+
+// Review Q1 (8/11, blocking): a short capitalised line under the name was taken for a role or a company and set aside, so a request written there vanished
+// and the return read « restored ». Only proven signature lines (courtesy, name, phone, e-mail, web or postal address, mail client footer) are set aside now.
+describe("Q1 — aucune demande ne disparaît sous une signature, aucune fausse preuve de résolution", () => {
+  it.each([
+    ["S01 ajout collègue", "Ça marche, merci !\n\nJean Dupont\nAjout collègue Marie sur l'espace"],
+    ["S02 finance paraphrasée", "Ça marche, merci !\n\nJean Dupont\nDeux sommes prises en octobre"],
+    ["S03 fin de contrat", "Toujours pas de code.\n\nCordialement,\nJean Dupont\nFin de contrat souhaitée au 30/11"],
+    ["S04 export", "Ça marche.\n\nMarie Martin\nExport des conversations vide"],
+    ["S05 résiliation paraphrasée", "Ça marche.\n\nJean\nFermez tout au 30"],
+    ["S06 remboursement", "Ça marche, merci !\n\nJean Dupont\nRemboursement facture de mars"],
+    ["S07 titulaire", "Ça marche, merci !\n\nJean Dupont\nNouveau propriétaire du compte : Paul Martin"],
+    ["D06 après le séparateur", "Ça marche, merci !\n--\nJean Dupont\nRemboursement facture de mars"],
+    ["un seul mot de demande", "Ça marche.\n\nRésiliation"],
+    ["un seul mot sous le nom", "Ça marche, merci !\n\nJean Dupont\nRemboursement"],
+    ["fonction puis demande", "Ça marche.\n\nJean Dupont\nResponsable\nAjouter deux utilisateurs"],
+    ["ligne courte en majuscules", "C'est bon ça fonctionne.\n\nMarie Martin\nNouvelle Offre Pro"],
+  ])("%s : le retour n'est ni accès seul ni une résolution", async (_id, text) => {
+    expect(await families(text)).not.toEqual(["access"]);
+    expect(reportsRestoredAccess(loginCustomerStatement(splitSavMessageText(text)))).toBe(false);
+  });
+  it.each([
+    ["nom seul", "Ça marche, merci !\n\nJean Dupont"],
+    ["politesse, nom, téléphone, e-mail", "Ça marche, merci !\n\nBien cordialement,\nJean Dupont\n+33 6 12 34 56 78\njean.dupont@exemple.test"],
+    ["site et adresse postale", "C'est bon, j'ai pu me connecter.\n\nMarie Martin\nwww.exemple.test\n12 rue des Lilas\n75011 Paris"],
+    ["pied de mail", "Ça remarche, merci.\n\nEnvoyé de mon iPhone"],
+  ])("%s : signature standard, la résolution reste lue", async (_id, text) => {
+    expect(await families(text)).toEqual(["access"]);
+    expect(reportsRestoredAccess(loginCustomerStatement(splitSavMessageText(text)))).toBe(true);
+  });
+});
+
+// Review Q3 P3 (8/11): real access returns of the blind counter-check lost to the team (B04, B07 on 70f; B02 since cf15).
+describe("Q3 — témoins accès de la contre-recette", () => {
+  it.each([
+    ["B02", "Toujours rien reçu, même dans les courriers indésirables."],
+    ["B04", "Je voudrais juste avoir accès à mon compte, toujours pas de code."],
+    ["B07", "J'ai bien utilisé new.limova.ai avec mon adresse d'inscription, toujours pas de code."],
+    ["B07 signé", "J'ai bien utilisé new.limova.ai avec mon adresse d'inscription, toujours pas de code.\n\nCordialement,\nJean Dupont"],
+  ])("%s : reste un accès", async (_id, text) => {
+    expect(await families(text)).toEqual(["access"]);
   });
 });
 
@@ -207,7 +251,7 @@ describe("F5 — le compte d'un tiers n'est pas un accès personnel", () => {
   it.each([
     ["E01", "Bonjour, je n’arrive pas à me connecter à mon compte Limova, je ne reçois pas le code."],
     ["E07", "Erreur lors de ma connexion à Limova. J’ai déjà un compte."],
-    ["signé", "Bonjour, je ne reçois pas le code de connexion.\n\nCordialement,\nJeanne Martin\nAssistante de direction"],
+    ["signé", "Bonjour, je ne reçois pas le code de connexion.\n\nCordialement,\nJeanne Martin\n01 23 45 67 89"],
     ["cliente", "Je suis cliente depuis deux mois et je n’arrive plus à me connecter à mon compte."],
     ["espace client", "Je n’arrive pas à accéder à mon espace client, le code n’arrive pas."],
   ])("premier mail personnel admis : %s", (_id, text) => {

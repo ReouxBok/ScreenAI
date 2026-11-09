@@ -118,7 +118,7 @@ const SENDER_ADDRESS = /[\w.+%-]+@[\w.-]+\.[a-z]{2,}\b/g;
 // A plain continuation of the same access trouble: still no code, still blocked, what the screen shows.
 const ACCESS_CONTINUATION = /\b(?:(?:aucun|pas de|pas le) code|pas (?:encore |toujours )?(?:recu|eu) (?:le|de|mon|aucun) code|(?:le|mon|un|aucun) code (?:ne m'|n')?(?:arrive|est arrive|parvient)(?: toujours| jamais)? ?(?:pas|plus)?|(?:avoir|obtenir|recevoir) (?:le|mon|un) code|identifiant (?:introuvable|inconnu|invalide)|message d'erreur|l'ecran affiche|je n'arrive (?:toujours )?pas a me connecter|(?:toujours|encore) bloquee?)\b/;
 const BARE_REMINDER = /^(?:(?:bonjour|bonsoir)[\s,.!;-]+)?(?:merci(?: (?:de|pour) (?:votre|le) (?:retour|message|conseil))?[\s,.!;-]+)?(?:je suis |c'est )?(?:toujours (?:pas|rien|bloquee?|le meme probleme)|ca ne (?:marche|fonctionne) (?:toujours )?pas|(?:je n'ai |j'ai )?(?:toujours )?rien recu|meme probleme)[\s,.!;-]*(?:merci[\s,.!;-]*)?$/;
-const CHECKED_INBOX = /\b(?:j'ai|nous avons|apres avoir|avoir) (?:bien |deja |aussi )?(?:verifie|regarde|consulte) (?:dans )?(?:mes |nos |les )?(?:spams?|courriers indesirables)\b|\bmalgre (?:mes|les) (?:spams?|courriers indesirables) verifies\b/;
+const CHECKED_INBOX = /\b(?:j'ai|nous avons|apres avoir|avoir) (?:bien |deja |aussi )?(?:verifie|regarde|consulte) (?:dans )?(?:mes |nos |les )?(?:spams?|courriers indesirables)\b|\bmalgre (?:mes|les) (?:spams?|courriers indesirables) verifies\b|^(?:meme |ni |et )?(?:dans|parmi) (?:les|mes|nos) (?:spams?|courriers? indesirables?)(?: non plus)?$/;
 
 /*
  * Review F3/F5 (7/11): the WHOLE statement must be the customer's own login trouble. One login phrase anywhere used to carry the rest of the mail, so « toujours pas
@@ -139,15 +139,15 @@ const NEUTRAL_CLAUSE = new RegExp([
   // Device or time context on its own.
   String.raw`^(?:(?:et |aussi |meme |pareil )?(?:sur|avec|depuis|dans) (?:un autre navigateur|un autre appareil|(?:mon|ma|le|la|un|une) (?:navigateur|telephone|portable|ordinateur|pc|mac|tablette|mobile)|chrome|firefox|safari|edge)(?: comme (?:sur|avec) (?:mon|ma|le|la) (?:navigateur|telephone|portable|ordinateur|pc|mac|tablette|mobile))?|depuis (?:hier|ce matin|ce soir|cet apres-midi|quelques jours|plusieurs jours|lundi|mardi|mercredi|jeudi|vendredi|samedi|dimanche)(?: soir| matin)?)$`,
   // The link and the address the customer says they used (domains are read with their dots protected, see `protectDomains`).
-  String.raw`^(?:(?:j'utilise|j'ai utilise|je passe par|via|avec) (?:bien |pourtant |toujours )?)?${LINK}(?: (?:et|avec) ${LINK})*$`,
+  String.raw`^(?:(?:j'utilise|(?:j'ai|nous avons) (?:bien |pourtant |toujours |deja )*utilise|je passe par|via|avec) (?:bien |pourtant |toujours )?)?${LINK}(?: (?:et|avec) ${LINK})*$`,
   // A screenshot is attached; « nothing », « still nothing », « same ».
-  String.raw`^(?:ci-joint|vous trouverez ci-joint|je vous joins|voici) (?:une |la |ma )?capture(?: d'ecran)?$`,
+  String.raw`^(?:ci-joint|vous trouverez ci-joint|je vous joins|voici) (?:une |la |ma )?capture(?: d'ecran)?(?: (?:en piece jointe|ci-jointe?|jointe?))?$`,
   String.raw`^(?:toujours )?(?:rien|aucun|pareil|idem|meme chose|rien du tout|toujours pareil)$`,
 ].join("|"));
 // The access trouble may be described, never alongside another subject or another thing asked in the same clause.
 const OTHER_TOPIC = /\b(?:aussi|egalement|par ailleurs|d'ailleurs|au passage|en plus|de plus|par contre|autre (?:chose|question|demande|souci|probleme|sujet)|combien|argent|sommes?|rib|montant|offre|contrat|engage\w*|devis|concurrent|rappel\w*|export\w*|prompt|agents?|appels?|telephonie|sms|whatsapp|routines?|campagnes?|publications?|documents?|fichiers?|historique|mails? automatiques?)\b/;
 const REQUEST_VERB = /\b(?:je (?:veux|voudrais|souhaite|souhaiterais|aimerais|demande)|(?:pouvez|pourriez)-? ?vous|merci de|envoyez|rappelez|changez|modifiez|ajoutez|supprimez|faites)\b/;
-const ACCESS_REQUEST = /\b(?:je (?:veux|voudrais|souhaite|souhaiterais|aimerais)|(?:pouvez|pourriez)-? ?vous|merci de) (?:juste |simplement |bien )?(?:me (?:re)?connecter|acceder a (?:mon|notre) (?:compte|espace)|recevoir (?:le|mon|un) code|m'aider(?: a me (?:re)?connecter)?|me (?:renvoyer|envoyer|redonner) (?:le|un|mon) (?:code|lien)|(?:me )?debloquer (?:mon|notre) (?:compte|acces))\b/;
+const ACCESS_REQUEST = /\b(?:je (?:veux|voudrais|souhaite|souhaiterais|aimerais)|(?:pouvez|pourriez)-? ?vous|merci de) (?:juste |simplement |bien )?(?:me (?:re)?connecter|(?:acceder|avoir acces|retrouver (?:l')?acces) a (?:mon|notre) (?:compte|espace)|recevoir (?:le|mon|un) code|m'aider(?: a me (?:re)?connecter)?|me (?:renvoyer|envoyer|redonner) (?:le|un|mon) (?:code|lien)|(?:me )?debloquer (?:mon|notre) (?:compte|acces))\b/;
 // An error at login, or an account the customer says they already have: context for the personal login trouble on a first mail.
 const LOGIN_ERROR_CLAUSE = /^(?:(?:une )?erreur (?:\d{3} )?(?:lors de|pendant|au moment de) (?:ma|notre|la) (?:re)?connexion(?: a limova)?|(?:lors de|pendant|au moment de) (?:ma|notre) (?:re)?connexion,? (?:une |un code d')?erreur(?: \d{3})? (?:apparait|s'affiche))$/;
 const EXISTING_ACCOUNT_CLAUSE = /^(?:j'ai|nous avons) (?:deja |bien |toujours )?(?:un|mon|notre) compte(?: limova)?$|^je suis (?:deja )?client(?:e)?(?: depuis [\w ]{1,30})?$/;

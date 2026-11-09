@@ -29,7 +29,7 @@ const squash = (value: string) => normalize(value).replace(/[«»“”"]/g, "")
  * What WE advised is never read here: see `readLoginOutgoing`, on the case's own trials and questions.
  */
 type LoginPoint = "link" | "address" | "spam";
-type LoginThread = { complete: boolean; link: boolean | null; address: boolean | null; noCode: boolean | null; spam: boolean | null; screen: "told" | "nothing" | null; displayed: string | null;
+type LoginThread = { complete: boolean; link: boolean | null; address: boolean | null; noCode: boolean | null; spam: boolean | null; screen: "told" | "attached" | "nothing" | null; displayed: string | null;
   /** `other`: the latest thing said is not about this login. */ scope: "login" | "other"; /** The latest mail is a bare reminder, with nothing new. */ bareReminder: boolean;
   /** Date of the mail that ended the previous problem: what we advised before it belongs to that problem. */ since: number; sources: Partial<Record<LoginPoint, CaseDecisionSourceRef>> };
 const LOGIN_DOUBT = /\b(?:peut-etre|si|doute|pas sure?|pas certaine?|je ne sais pas|je crois|il me semble|vais|faut-il|dois-je)\b/;
@@ -44,16 +44,21 @@ const LOGIN_NEW_ASK = /\b(?:comment|ajouter|changer|supprimer|modifier|creer|ins
 const LOGIN_ADDRESS_NOT_OWN = /\b(?:mauvaise adresse|autre adresse|trompee? d'adresse|pas (?:(?:avec|sur|utilise|saisi|renseigne|entre|la|ma|mon|une|cette|bonne|bien|vraiment) ){0,3}(?:l')?adresse|celle (?:de (?:mon|ma|notre|son|sa|leur)|du|d'une?) |(?:adresse|e-?mail|mail)(?: d'inscription| e-?mail| mail)? (?:de (?:mon|ma|notre|son|sa|leur)|du|de la|d'une?) (?!inscription\b|compte\b|espace\b|boite\b|messagerie\b)\S)/;
 const LOGIN_QUESTION_KEY = "login_error_message", LOGIN_PATH_KEY = "login_path_checked", LOGIN_SPAM_KEY = "login_spam_checked";
 const QUOTED = /[«"“][^»"”]*[»"”]/g;
-/** The customer's own new words of a stored mail: never what they quote from us or from earlier mails. */
-const ownCustomerWords = (raw: string) => normalize(splitSavMessageText(raw).currentText);
+/** The customer's own new words of a stored mail: never what they quote from us or from earlier mails. Review Q1 (8/11): read like the latest mail, a proven
+ * signature (courtesy, name, phone, address, footer) set aside and anything else kept, so the history and the closure read the same words. */
+const ownCustomerWords = (raw: string) => normalize(loginCustomerStatement(splitSavMessageText(raw)));
+// Q3 (9/11): the customer says a screenshot is attached. The agent cannot read an image: the screen is reported as attached, never as words it saw.
+const SCREENSHOT = /\b(?:captures? d'ecran|copies? d'ecran|screenshots?|photos? de l'ecran|captures?)\b/;
+const ATTACHED = /\b(?:ci-jointe?s?|en pieces? jointes?|jointe?s?|attachee?s?|voici|je vous (?:envoie|transmets|joins))\b/;
 const sentencesOf = (text: string) => text.split(/[.!?;\n]+/).map(sentence => sentence.trim()).filter(Boolean);
 /** The yes and no of one mail on one point: any `no` wins over a `yes` (a contradiction proves nothing), silence is null. */
 const saidInMail = (sentences: readonly string[], yes: (sentence: string) => boolean, no: (sentence: string) => boolean): boolean | null =>
   sentences.some(no) ? false : sentences.some(yes) ? true : null;
-function screenInMail(sentences: readonly string[]): { screen: "told" | "nothing" | "conflict" | null; displayed: string | null } {
-  let told = false, nothing = false, displayed: string | null = null;
+function screenInMail(sentences: readonly string[]): { screen: "told" | "attached" | "nothing" | "conflict" | null; displayed: string | null } {
+  let told = false, nothing = false, attached = false, displayed: string | null = null;
   for (const sentence of sentences) {
     if (LOGIN_DOUBT.test(sentence) || /\b(?:quel|quelle|quels|quelles|est-ce que)\b/.test(sentence)) continue;
+    if (SCREENSHOT.test(sentence) && ATTACHED.test(sentence) && !/\b(?:pas|aucune?|sans)\b[^.!?\n]{0,30}\b(?:captures?|copies?|screenshots?|photos?)\b/.test(sentence)) { attached = true; continue; }
     if (/\b(?:aucune? (?:message|erreur)|pas (?:de |d')(?:message|erreur)|sans (?:message|erreur)|rien ne s'affiche|n'affiche rien|rien a l'ecran)\b/.test(sentence)) { nothing = true; continue; }
     if (!/\b(?:erreur|message|ecran|page|affiche|indique)\b/.test(sentence)) continue;
     // A concrete wording only: « j'ai une erreur » says nothing of what is displayed, so the question stays useful.
@@ -64,7 +69,7 @@ function screenInMail(sentences: readonly string[]): { screen: "told" | "nothing
     // Never carries what may be a code: the fact is kept, not the wording.
     displayed ??= /\d{4,}/.test(wording) ? null : wording.trim();
   }
-  return { screen: told && nothing ? "conflict" : told ? "told" : nothing ? "nothing" : null, displayed };
+  return { screen: told && nothing ? "conflict" : told ? "told" : attached ? "attached" : nothing ? "nothing" : null, displayed };
 }
 function readLoginThread(context: CaseDecisionValidationContext, askedAlready: boolean): LoginThread {
   const thread: LoginThread = { complete: true, link: null, address: null, noCode: null, spam: null, screen: null, displayed: null, scope: "login", bareReminder: false, since: -Infinity, sources: {} };
@@ -556,7 +561,7 @@ function validate(input: unknown, context: CaseDecisionValidationContext, now: D
       || (thread.link === true && /\b(?:ouvrez|rendez-vous|allez sur|voici le lien|cliquez|connectez-vous|utilisez le lien|avez-vous (?:bien )?utilise le bon lien)\b/.test(proposedText))
       || (thread.address === true && /\b(?:entrez|saisissez|renseignez|verifiez|indiquez|utilisez|confirmez|avez-vous (?:bien )?(?:utilise|saisi|renseigne))\b[^.!?\n]{0,60}\badresse\b/.test(proposedText))
       || (thread.spam === true && /\b(?:verifiez|verifier|regardez|regarder|consultez|consulter|avez-vous (?:\w+ ){0,2}(?:regarde|verifie))\b[^.!?\n]{0,60}\b(?:spams?|indesirables?)\b/.test(proposedText))
-      || (thread.screen === "told" && /\b(?:quel(?:le)? (?:message|erreur)|ce qui s'affiche)\b/.test(proposedText)));
+      || ((thread.screen === "told" || thread.screen === "attached") && /\b(?:quel(?:le)? (?:message|erreur)|ce qui s'affiche|capture)\b/.test(proposedText)));
   const confirmedAny = thread.link === true || thread.address === true || thread.spam === true;
   const citesLogin = loginRef !== null && ((proposal.reply?.citations ?? []).some(ref => ref.knowledgeId === loginRef.knowledgeId)
     || (action.kind === "answer" && action.steps.some(step => step.knowledge.knowledgeId === loginRef.knowledgeId)));
@@ -580,6 +585,7 @@ function validate(input: unknown, context: CaseDecisionValidationContext, now: D
     if (!tell.link && !tell.address && !tell.spam && !confirm.path && !confirm.spam && screenKnown) {
       if (loginSays.relay && open.length === 1) {
         const observed = thread.screen === "told" ? (thread.displayed ? `Message affiché selon le client : « ${thread.displayed} ».` : "Le client rapporte un message affiché (voir son mail).")
+          : thread.screen === "attached" ? "Le client indique avoir joint une capture d’écran. L’agent ne lit pas les images : la capture est à consulter par l’équipe dans le mail du client."
           : thread.screen === "nothing" ? "Selon le client, aucun message ne s’affiche." : "Le client n’a pas précisé de message affiché après notre question.";
         const routed = validate({ caseVersion: proposal.caseVersion, understanding, nextAction: { kind: "handoff", reason: "diagnosis_out_of_tools", requestIds: [open[0]!.id], report: {
           need: `${unconfirmed.length ? "Connexion toujours impossible selon le client." : "Connexion impossible malgré les vérifications de la fiche."} Déjà fait selon le client : ${said.length ? said.join(", ") : "rien de confirmé"}.${unconfirmed.length ? ` Conseillé sans confirmation du client : ${unconfirmed.join(", ")}.` : ""}`,
@@ -598,8 +604,10 @@ function validate(input: unknown, context: CaseDecisionValidationContext, now: D
         tell.spam ? loginCardStep(loginCard, "spam") ?? "Si le code n’est pas dans votre boîte de réception, regardez dans le dossier « Spams » ou « Courriers indésirables » de cette même adresse." : ""].filter(Boolean);
       const unknownPath = thread.link === null && thread.address === null ? `${SAV_CASE_ACCESS_URL} avec l’adresse e-mail de votre inscription` : thread.link === null ? SAV_CASE_ACCESS_URL : "l’adresse e-mail de votre inscription";
       const asks = [confirm.path ? `Pouvez-vous me confirmer que vous avez bien utilisé ${unknownPath} ?` : "", confirm.spam ? "Avez-vous pu regarder dans le dossier « Spams » ou « Courriers indésirables » de cette adresse ?" : ""].filter(Boolean);
-      const screenAsk = screenKnown ? "" : tell.spam ? "Si vous ne trouvez pas le code dans les spams non plus, quel message s’affiche à l’écran après la saisie de votre adresse e-mail ?"
-        : confirm.spam ? "Si le code ne s’y trouve pas, quel message s’affiche à l’écran après la saisie de votre adresse e-mail ?" : "Quel message s’affiche à l’écran après la saisie de votre adresse e-mail ?";
+      // Q3 (9/11): the useful information is the exact text displayed, or a screenshot the team will read (the agent does not read images).
+      const SCREEN_HOW = " Vous pouvez recopier le texte exact ou joindre une capture d’écran.";
+      const screenAsk = screenKnown ? "" : (tell.spam ? "Si vous ne trouvez pas le code dans les spams non plus, quel message s’affiche à l’écran après la saisie de votre adresse e-mail ?"
+        : confirm.spam ? "Si le code ne s’y trouve pas, quel message s’affiche à l’écran après la saisie de votre adresse e-mail ?" : "Quel message s’affiche à l’écran après la saisie de votre adresse e-mail ?") + SCREEN_HOW;
       const question = [...asks, screenAsk].filter(Boolean).join(" ") || (tell.spam ? "Le code se trouve-t-il dans ce dossier ?" : "Le code arrive-t-il sur cette adresse ?");
       const reminder = [acknowledged, ...told, question].join(" ").includes(SAV_CASE_ACCESS_URL) ? "" : `La page de connexion reste ${SAV_CASE_ACCESS_URL}.`;
       const seeks = [...(tell.link || tell.address || confirm.path ? [{ kind: "observed_result" as const, factKey: LOGIN_PATH_KEY }] : []), ...(tell.spam || confirm.spam ? [{ kind: "observed_result" as const, factKey: LOGIN_SPAM_KEY }] : []),
@@ -642,7 +650,7 @@ Voici le lien de connexion : ${SAV_CASE_ACCESS_URL}. Une fois sur la page, entre
 
 Il vous suffira ensuite de saisir ce code sur la page pour accéder à votre espace. Gardez-le pour vous : même si vous nous répondez, ne nous communiquez pas ce code.
 
-Si vous restez bloqué, dites-moi simplement à quelle étape${thread.screen === "told" ? "" : " et ce qui s’affiche à l’écran"}.`;
+Si vous restez bloqué, dites-moi simplement à quelle étape${thread.screen === "told" || thread.screen === "attached" ? "" : " et ce qui s’affiche à l’écran"}.`;
         }
         if (reply.text.length > 6000) reject("proposal_schema_invalid", "reply.text", "procedure_too_long");
       }
