@@ -1,3 +1,4 @@
+import { COMMERCIAL_FORWARD_PURPOSE } from "./intake/commercial-forward-contract";
 import { intakeConsoleInstalled } from "./intake/console-capability";
 import { historicalMessageSql, intakeMessageHistorical, readIntakeLaunch } from "./intake/launch-boundary";
 import { enqueueConfiguredSavIntake } from "./intake/runtime";
@@ -1387,6 +1388,7 @@ export async function retrySavAction(actionId: string, actorEmail: string) {
   const db = requireDb();
   const [current] = await db.select().from(savActions).where(eq(savActions.id, actionId)).limit(1);
   if (current?.errorCode === "SAV_PROPOSAL_STALE" || current?.errorCode === "SAV_REVIEW_STALE") throw new Error(current.errorCode);
+  if (current?.payload.purpose === COMMERCIAL_FORWARD_PURPOSE) throw new Error(current.payload.forwardDispatchedAt ? "SAV_COMMERCIAL_RECONCILIATION_REQUIRED" : "SAV_COMMERCIAL_CONFIRMATION_REQUIRED");
   if (current?.payload.purpose === "partnership_forward") throw new Error(current.payload.forwardDispatchedAt ? "SAV_PARTNERSHIP_RECONCILIATION_REQUIRED" : "SAV_PARTNERSHIP_CONFIRMATION_REQUIRED");
   if (current?.errorCode === "SAV_TICKET_ACK_CONTEXT_CHANGED") throw new Error(current.errorCode);
   if (current?.errorCode?.startsWith("SAV_TICKET_PREVIEW_")) throw new Error("SAV_TICKET_PREVIEW_CHANGED");
