@@ -87,16 +87,26 @@ async function targetState(itemId: string | null | undefined, db: Db = requireDb
   const activeVersion: SavKnowledgeVersion | null = active && version ? { id: version.id, version: version.version, title: active.title, body: version.bodyMarkdown, createdAt: version.createdAt, authorEmail: version.authorEmail } : null;
   return { item, base: base ?? null, active: active ?? null, activeVersion };
 }
-async function sourceFingerprint(sources: SavKnowledgeSource[], db: Db = requireDb(), lock = false) {
+type ApprovedSelfSource = { itemId: string; baseVersionId: string; materializedVersionId: string; baseTitle: string; publishedTitle: string };
+async function sourceFingerprint(sources: SavKnowledgeSource[], db: Db = requireDb(), lock = false, self?: ApprovedSelfSource) {
   const proofs = [];
   for (const source of sources) {
     if (source.ref.startsWith("content:")) {
-      const [, itemId, expectedVersion] = source.ref.split(":");
-      if (!z.uuid().safeParse(itemId).success) throw new Error("KNOWLEDGE_SOURCE_REFERENCE_INVALID");
+      const parts = source.ref.split(":");
+      const [, itemId, expectedVersion] = parts;
+      if (parts.length < 2 || parts.length > 3 || !z.uuid().safeParse(itemId).success || parts.length === 3 && !z.uuid().safeParse(expectedVersion).success) throw new Error("KNOWLEDGE_SOURCE_REFERENCE_INVALID");
       const query = db.select().from(contentItems).where(eq(contentItems.id, itemId));
       const [item] = await (lock ? query.for("update") : query);
-      if (!item || item.status === "archived" || !item.publishedVersionId || expectedVersion && expectedVersion !== item.publishedVersionId) throw new Error("KNOWLEDGE_SOURCE_STALE");
-      proofs.push({ ref: source.ref, versionId: item.publishedVersionId, title: item.title });
+      if (!item || item.status === "archived" || !item.publishedVersionId) throw new Error("KNOWLEDGE_SOURCE_STALE");
+      // Publishing this approved amendment moves the item's pointer, not the historical proof it cited.
+      // Only that exact transition can reuse the approved base; other sources still require their current publication.
+      if (self && item.id === self.itemId && item.publishedVersionId === self.materializedVersionId && (!expectedVersion || expectedVersion === self.baseVersionId)) {
+        if (item.title !== self.publishedTitle) throw new Error("KNOWLEDGE_SOURCE_STALE");
+        proofs.push({ ref: source.ref, versionId: self.baseVersionId, title: self.baseTitle });
+      } else {
+        if (expectedVersion && expectedVersion !== item.publishedVersionId) throw new Error("KNOWLEDGE_SOURCE_STALE");
+        proofs.push({ ref: source.ref, versionId: item.publishedVersionId, title: item.title });
+      }
     } else if (source.ref.startsWith("sav-learning:")) {
       proofs.push({ ref: source.ref, hash: (await readSavLearningEvidence(source.ref.slice(13), db, lock)).fingerprint });
     } else if (source.ref.startsWith("sav-observation:")) {
@@ -330,7 +340,23 @@ export async function assertWorkspacePublicationSource(metadata: { sourceMetadat
   if (!restored && (target.active?.versionId ?? null) !== source.evidence.activeVersionId && target.active?.versionId !== candidate.materializedVersionId) throw new Error("KNOWLEDGE_REVIEW_STALE");
   if (!restored && (target.item?.publishedVersionId ?? null) !== source.evidence.publishedVersionId && target.item?.publishedVersionId !== candidate.materializedVersionId) throw new Error("KNOWLEDGE_REVIEW_STALE");
   const sources = source.evidence.sources as SavKnowledgeSource[];
-  if (!Array.isArray(sources) || !sources.length || await sourceFingerprint(sources, db, lock) !== source.evidence.sourceHash) throw new Error("KNOWLEDGE_SOURCE_STALE");
+  let self: ApprovedSelfSource | undefined;
+  if (candidate.targetItemId && candidate.baseVersionId && candidate.materializedVersionId
+    && candidate.baseVersionId === source.evidence.baseVersionId && candidate.baseVersionId === source.evidence.activeVersionId
+    && candidate.baseVersionId === source.evidence.publishedVersionId && target.item?.publishedVersionId === candidate.materializedVersionId) {
+    const [base] = await db.select().from(contentVersions).where(and(eq(contentVersions.id, candidate.baseVersionId), eq(contentVersions.itemId, candidate.targetItemId)));
+    const [published] = await db.select().from(contentVersions).where(and(eq(contentVersions.id, candidate.materializedVersionId), eq(contentVersions.itemId, candidate.targetItemId)));
+    const titleOf = (version: typeof base | undefined) => {
+      const meta = version?.metadata.sourceMetadata;
+      return typeof meta?.sourceTitle === "string" ? meta.sourceTitle : typeof meta?.knowledgeTitle === "string" ? meta.knowledgeTitle : null;
+    };
+    const baseTitle = titleOf(base), publishedTitle = titleOf(published);
+    if (base && published && baseTitle && publishedTitle && published.metadata.sourceMetadata?.approvedCandidateId === candidate.id
+      && published.metadata.sourceMetadata?.canonicalRevisionId === metadata.sourceMetadata?.canonicalRevisionId) {
+      self = { itemId: candidate.targetItemId, baseVersionId: base.id, materializedVersionId: published.id, baseTitle, publishedTitle };
+    }
+  }
+  if (!Array.isArray(sources) || !sources.length || await sourceFingerprint(sources, db, lock, self) !== source.evidence.sourceHash) throw new Error("KNOWLEDGE_SOURCE_STALE");
   if (typeof source.evidence.learningCandidateId === "string" && (await readSavLearningEvidence(source.evidence.learningCandidateId, db, lock)).fingerprint !== source.evidence.learningSourceHash) throw new Error("SAV_OBSERVATION_STALE");
 }
 
