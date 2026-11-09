@@ -1,3 +1,4 @@
+import { assertSavSharedSpend, lockSavSharedSpend } from "../shared-spend";
 import "server-only";
 import { and, eq, sql } from "drizzle-orm";
 import { requireDb } from "@/db";
@@ -73,6 +74,8 @@ export async function reserveServerEvaluationCall(runId: string, requestHash: st
     const calls = await tx.select().from(auditLogs).where(eq(auditLogs.action, EVALUATION_CALL));
     const used = calls.reduce((total, call) => total + charge(call.technicalMetadata), 0);
     if (calls.length >= EVALUATION_MAX_CALLS || used + price.reservedNanoUsd > EVALUATION_CAP) throw Error("SAV_EVAL_BUDGET_EXHAUSTED");
+    await lockSavSharedSpend(tx);
+    await assertSavSharedSpend(tx, price.reservedNanoUsd);
     const [row] = await tx.insert(auditLogs).values({ actorEmail, action: EVALUATION_CALL, entityType: "private_intake_evaluation_call", entityId: runId,
       technicalMetadata: { state: "dispatched", requestHash, reservedNanoUsd: price.reservedNanoUsd, chargedNanoUsd: price.reservedNanoUsd, dispatchedAt: new Date().toISOString() } }).returning({ id: auditLogs.id });
     return row.id;

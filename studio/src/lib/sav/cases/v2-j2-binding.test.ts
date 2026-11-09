@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
-const f=vi.hoisted(()=>({db:vi.fn(),day:vi.fn(),policy:vi.fn()}));
+const f=vi.hoisted(()=>({db:vi.fn(),day:vi.fn(),policy:vi.fn(),shared:vi.fn()}));
+vi.mock("../shared-spend",()=>({savSharedSpendAvailable:f.shared}));
 vi.mock("@/db",()=>({requireDb:f.db}));
 vi.mock("./investigation-v2-spend",()=>({readCaseV2SpendPolicy:f.policy,readCaseV2SpendDay:f.day}));
 import { enqueueApprovedJ2, j2BudgetAvailable, readJ2ReminderEffect, reconcileCaseJ2 } from "./v2-j2-binding";
@@ -35,6 +36,8 @@ describe("J2 wake binding",()=>{
     f.policy.mockReturnValue({ok:true,policy:{model:section,embedding:section}});
     f.day.mockResolvedValueOnce(null).mockResolvedValueOnce({heldMicroUsd:12,settledMicroUsd:6});
     expect(await j2BudgetAvailable({},new Date())).toBe(false);
-    f.day.mockResolvedValue(null);expect(await j2BudgetAvailable({},new Date())).toBe(true);
+    f.day.mockResolvedValue(null);f.shared.mockResolvedValue(false);expect(await j2BudgetAvailable({},new Date())).toBe(false);
+    f.shared.mockResolvedValue(true);expect(await j2BudgetAvailable({},new Date())).toBe(true);
+    expect(f.shared).toHaveBeenLastCalledWith(8000,expect.any(Date));
   });
 });

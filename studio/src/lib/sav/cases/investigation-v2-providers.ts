@@ -1,3 +1,4 @@
+import { readCaseV2TransportPolicy, assertCaseV2ReservedPolicy } from "./investigation-v2-spend";
 import "server-only";
 import { and, eq, inArray } from "drizzle-orm";
 import { z } from "zod";
@@ -54,10 +55,14 @@ const embedResponse = z.object({ embeddings: z.array(z.object({ values: z.array(
 export function caseGeminiEmbeddingTransport(input: Readonly<{ env: () => Env; network?: CaseV2Network; dimension?: number }>): CaseEmbeddingTransport {
   const network = input.network ?? ((url, init) => fetch(url, init));
   const dimension = input.dimension ?? SAV_RETRIEVAL_EMBEDDING_DIMENSION;
-  return async ({ texts, signal }) => {
+  return async ({ texts, signal, reservationId }) => {
     const env = input.env(), key = env[SAV_V2_GEMINI_KEY_ENV]?.trim(), model = env[SAV_V2_EMBEDDING_MODEL_ENV] ?? "";
     if (!key) throw Error("SAV_V2_GEMINI_KEY_ABSENT");
     if (!MODEL_ID.test(model)) throw Error("SAV_V2_EMBEDDING_MODEL_ABSENT");
+    const bounds = readCaseV2TransportPolicy(env);
+    if (!texts.length || texts.length>bounds.embeddingMaxTexts || texts.some(text=>!text.trim() || Buffer.byteLength(text,"utf8")>bounds.embeddingMaxTextBytes)) throw Error("SAV_V2_EMBEDDING_REQUEST_UNBOUNDED");
+    if (!reservationId) throw Error("SAV_V2_EMBEDDING_RESERVATION_REQUIRED");
+    await assertCaseV2ReservedPolicy(reservationId,env);
     const response = await network(`${GEMINI}/${encodeURIComponent(model)}:batchEmbedContents`, {
       method: "POST", signal, headers: { "content-type": "application/json", "x-goog-api-key": key },
       body: JSON.stringify({ requests: texts.map(text => ({ model: `models/${model}`, content: { parts: [{ text }] }, taskType: "RETRIEVAL_QUERY", outputDimensionality: dimension })) }),
@@ -111,13 +116,17 @@ export function caseGeminiDecisionProvider(input: Readonly<{ env: () => Env; net
   return async request => {
     const env = input.env(), key = env[SAV_V2_GEMINI_KEY_ENV]?.trim(), model = env[SAV_V2_MODEL_ENV] ?? "";
     if (!key || !MODEL_ID.test(model)) return { result: { status: "failed", uncertain: false }, usage: { inputTokens: 0, outputTokens: 0 } };
+    let bounds: ReturnType<typeof readCaseV2TransportPolicy>;
+    try { bounds = readCaseV2TransportPolicy(env); } catch { return { result: { status: "failed", uncertain: false }, usage: { inputTokens: 0, outputTokens: 0 } }; }
     const prompt = caseInvestigationPrompt(request);
+    const body = JSON.stringify({ systemInstruction: { parts: [{ text: `${prompt.instruction}\n\nSchéma JSON de la réponse :\n${prompt.schema}` }] },
+      contents: [{ role: "user", parts: [{ text: JSON.stringify(prompt.payload) }] }], generationConfig: { responseMimeType: "application/json", temperature: 0, maxOutputTokens: bounds.maxOutputTokens } });
+    if (Buffer.byteLength(body,"utf8")>bounds.maxInputBytes) return { result: { status: "failed", uncertain: false }, usage: { inputTokens: 0, outputTokens: 0 } };
     let response: Response;
     try {
       response = await network(`${GEMINI}/${encodeURIComponent(model)}:generateContent`, {
         method: "POST", signal: AbortSignal.timeout(input.timeoutMs ?? 60_000), headers: { "content-type": "application/json", "x-goog-api-key": key },
-        body: JSON.stringify({ systemInstruction: { parts: [{ text: `${prompt.instruction}\n\nSchéma JSON de la réponse :\n${prompt.schema}` }] },
-          contents: [{ role: "user", parts: [{ text: JSON.stringify(prompt.payload) }] }], generationConfig: { responseMimeType: "application/json", temperature: 0 } }),
+        body,
       });
     } catch { return { result: { status: "failed", uncertain: true }, usage: null }; }
     if (!response.ok) {
@@ -128,7 +137,7 @@ export function caseGeminiDecisionProvider(input: Readonly<{ env: () => Env; net
     let parsed: z.infer<typeof generateResponse>;
     try { parsed = generateResponse.parse(await response.json()); } catch { return { result: { status: "failed", uncertain: true }, usage: null }; }
     const meta = parsed.usageMetadata;
-    const usage = meta && typeof meta.promptTokenCount === "number" ? { inputTokens: meta.promptTokenCount, outputTokens: (meta.candidatesTokenCount ?? 0) + (meta.thoughtsTokenCount ?? 0) } : null;
+    const usage = meta && Number.isSafeInteger(meta.promptTokenCount) && Number(meta.promptTokenCount)>=0 && Number.isSafeInteger(meta.candidatesTokenCount) && Number(meta.candidatesTokenCount)>=0 && (meta.thoughtsTokenCount===undefined || Number.isSafeInteger(meta.thoughtsTokenCount) && meta.thoughtsTokenCount>=0) ? { inputTokens: meta.promptTokenCount!, outputTokens: (meta.candidatesTokenCount ?? 0) + (meta.thoughtsTokenCount ?? 0) } : null;
     const candidate = parsed.candidates?.[0];
     const text = candidate?.content?.parts.map(part => part.text ?? "").join("") ?? "";
     if (!text.trim() || (candidate?.finishReason && candidate.finishReason !== "STOP")) return { result: { status: "failed", uncertain: false }, usage };

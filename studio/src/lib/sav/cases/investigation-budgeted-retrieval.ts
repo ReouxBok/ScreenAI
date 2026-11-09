@@ -48,7 +48,7 @@ export function caseKnowledgeRequestProblem(input: { inputKey: string; queries: 
 
 /** What the embedding provider reports it billed. `null` (or nothing usable) when it reports nothing. */
 export type CaseEmbeddingUsage = { inputTokens?: number; billableCharacters?: number };
-export type CaseEmbeddingTransport = (input: { texts: readonly string[]; signal: AbortSignal }) => Promise<{ vectors: number[][]; usage: CaseEmbeddingUsage | null }>;
+export type CaseEmbeddingTransport = (input: { texts: readonly string[]; signal: AbortSignal; reservationId?: string }) => Promise<{ vectors: number[][]; usage: CaseEmbeddingUsage | null }>;
 /**
  * How a dispatched embedding call is settled with ROOT. `usage`: what the provider reported, or `"unknown"` when it
  * reported nothing usable; `uncertain`: the call's result is unknown (timeout or error after dispatch). An unknown
@@ -206,7 +206,7 @@ export function createCaseBudgetedRetrieval(deps: CaseBudgetedRetrievalDeps) {
       let sent: Awaited<ReturnType<CaseEmbeddingTransport>> | null = null;
       try {
         sent = await Promise.race([
-          deps.embed({ texts: queries, signal: controller.signal }),
+          deps.embed({ texts: queries, signal: controller.signal, reservationId }),
           new Promise<never>((_, reject) => { timer = setTimeout(() => { controller.abort(); reject(Error("SAV_CASE_EMBEDDING_TIMEOUT")); }, deps.leaseSeconds * 1000); }),
         ]);
       } catch { sent = null; } finally { clearTimeout(timer); }

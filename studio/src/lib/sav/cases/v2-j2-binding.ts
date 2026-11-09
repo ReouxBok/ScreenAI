@@ -1,3 +1,4 @@
+import { savSharedSpendAvailable } from "../shared-spend";
 import "server-only";
 import { and, eq } from "drizzle-orm";
 import { requireDb } from "@/db";
@@ -46,7 +47,7 @@ export async function j2BudgetAvailable(env: Env, now: Date) {
     const section = read.policy[purpose], held = day?.heldMicroUsd ?? 0, settled = day?.settledMicroUsd ?? 0;
     if (![held,settled].every(n=>Number.isSafeInteger(n)&&n>=0) || held+settled+section.reserveMicroUsdPerCall>section.dailyCapMicroUsd) return false;
   }
-  return true;
+  return savSharedSpendAvailable((read.policy.model.reserveMicroUsdPerCall + read.policy.embedding.reserveMicroUsdPerCall) * 1000, now);
 }
 
 export async function enqueueApprovedJ2(timer: Pick<J2Timer,"id"|"caseId">, caseVersion: number,

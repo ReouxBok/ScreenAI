@@ -14,7 +14,7 @@ import {
   caseCustomerTextsReader, caseGeminiDecisionProvider, caseGeminiEmbeddingTransport, caseHubspotOwnerReadTransport, caseKnowledgeVectorSearch,
   caseV2PauseState, caseV2ProviderConfigProblems, SAV_CASE_INVESTIGATION_PROMPT_REVISION, SAV_V2_MODEL_ENV, type CaseV2Network,
 } from "./investigation-v2-providers";
-import { caseV2EmbeddingSpend, caseV2ModelSpend, readCaseV2SpendPolicy } from "./investigation-v2-spend";
+import { caseV2EmbeddingSpend, caseV2ModelSpend, readCaseV2SpendPolicy, readCaseV2TransportPolicy } from "./investigation-v2-spend";
 import { pilotProvenanceGate, type PilotProvenanceDeps } from "./pilot-passage-provenance";
 
 /*
@@ -60,6 +60,7 @@ export function createCaseInvestigationV2Deps(input: CaseInvestigationV2Input): 
   refusals.push(...caseV2ProviderConfigProblems(env));
   const spend = readCaseV2SpendPolicy(env);
   if (!spend.ok) refusals.push(spend.reason);
+  try { if (spend.ok) readCaseV2TransportPolicy(env, input.now?.() ?? new Date()); } catch { refusals.push("v2_transport_policy_invalid"); }
   if (refusals.length) return { ok: false, refusals };
   const now = input.now ?? (() => new Date()), readPolicyRecord = input.readPolicyRecord!, scope = input.scope ?? { locale: "fr-FR", audience: "support" as const };
   const spendDeps = { env: input.env, now }, model = caseV2ModelSpend(spendDeps);

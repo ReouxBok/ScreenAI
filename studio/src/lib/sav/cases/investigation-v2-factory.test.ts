@@ -75,6 +75,7 @@ async function v1Mail(options: { ticketId?: string; threadId?: string; ownerEffe
 
 /** SYN spend policy: invented amounts for this test only, approved by nobody. */
 const SPEND = { revision: "spend-syn-r1", approvedBy: STAFF, approvedAt: AT,
+  transport: { model: "syn-model", embeddingModel: "syn-embedding", priceExpiresAt:"2027-01-01T00:00:00Z", maxInputTokens:131072, maxOutputTokens:1024, maxInputBytes:100_000, embeddingMaxInputTokens:8192, embeddingMaxTexts:3, embeddingMaxTextBytes:4000 },
   embedding: { dailyCapMicroUsd: 10_000, reserveMicroUsdPerCall: 100, microUsdPerMillionInputTokens: 150 },
   model: { dailyCapMicroUsd: 1_000_000, reserveMicroUsdPerCall: 50_000, microUsdPerMillionInputTokens: 300, microUsdPerMillionOutputTokens: 2_500 } };
 const V2_KEY = "syn-v2-key", V1_KEY = "syn-v1-key-never-used";
