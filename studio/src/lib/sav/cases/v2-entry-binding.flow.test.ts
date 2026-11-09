@@ -257,3 +257,159 @@ describe("actual continuation loader: real factory and authorizer, synthetic tra
     expect(fetch).not.toHaveBeenCalled();
   });
 });
+
+/*
+ * Lot 2 (V2 access release, 9/11): auto ON on a customer return, through the actual loader and its real controls
+ * (admission, family, access scope, owner, pause, authorizer). Only the network and Gmail are doubles.
+ * A case that must not be answered automatically is checked at every exit: no approved validation, no effect row, no send.
+ */
+import { savAgentPauseKey, SAV_AGENT_PAUSE_REVISION } from "../intake/agent-pause";
+
+/** The return as recorded, without presuming its route: a mixed or sensitive return may well leave the access path. */
+async function returnOnly(env: Record<string, string | undefined>, text: string) {
+  const made = await v1Mail({ ownerEffect: true });
+  const id = randomUUID(), gmail = `gm-${id}`;
+  await f.db.insert(savMessages).values({ id, threadId: made.threadId, mailboxId, direction: "inbound", gmailMessageId: gmail,
+    fromEmail: SENDER, toEmails: ["support@example.invalid"], subject: "Re: Synthétique",
+    bodyCiphertext: encryptSavPayload({ text, headers: { "message-id": `<${gmail}@example.invalid>` } }), receivedAt: new Date() });
+  const routed = await routeCustomerReturn(id, { env, readTicketOwner: async () => V2_OWNER });
+  return { ...made, gmail, routed };
+}
+const approvedValidations = async (caseId: string) =>
+  (await f.db.select().from(savCaseReplyValidations).where(eq(savCaseReplyValidations.caseId, caseId))).filter(row => row.state === "approved");
+/** Every pass a deployment could run on the case: the loader on each trigger, then the effects pass. Returns what was attempted. */
+async function everyPass(made: { caseId: string; gmail: string; threadId: string; ticketId: string }, env: Record<string, string | undefined>, net: ReturnType<typeof network>) {
+  vi.stubGlobal("fetch", vi.fn((url: string, init: RequestInit) => net.net(String(url), init)));
+  const point = await loadCaseContinuationPoint(), statuses: string[] = [];
+  for (const trigger of ["customer_return", "sweep"] as const) {
+    try { statuses.push((await point({ caseId: made.caseId, trigger, env })).status); } catch (error) { statuses.push(`threw:${(error as Error).message}`); }
+  }
+  const provider = executionProvider(); provider.setGmail(made.gmail, `thread-${made.threadId}`); provider.seedTicket({ id: made.ticketId, ownerId: V2_OWNER, stage: "new" });
+  let sends = 0;
+  const deps = createCaseV2WakeDeps({ env: () => env, policy: { id: policyId, hash: policyHash }, readPolicyRecord, since: new Date(Date.now() - 60_000), deadlineMs: Date.now() + 60_000,
+    network: provider.network as typeof fetch,
+    gmail: { request: async (mailbox, path, init) => { if (path.replace(/^\//, "") === "messages/send") sends++; return provider.gmail(mailbox, path, init); }, permissions: async () => {} } });
+  await runCaseEffectsPass({ ...deps.replies, context: { runtime: {} as never, policy: executionPolicy } });
+  return { statuses, sends, modelCalls: net.calls.filter(call => call.url.includes(":generateContent")).length };
+}
+async function expectNoAutomatedAnswer(made: { caseId: string; gmail: string; threadId: string; ticketId: string }, env: Record<string, string | undefined>, net = network()) {
+  const result = await everyPass(made, env, net);
+  expect(result.statuses).not.toContain("queued");
+  expect(await approvedValidations(made.caseId)).toEqual([]);
+  expect(await effectRows(made.caseId)).toEqual([]);
+  expect(result.sends).toBe(0);
+  return result;
+}
+
+describe("auto ON on a customer return (G-AUTO-1): a request that is not only access is never answered automatically", () => {
+  // Control of this harness: the same passes DO answer a return that is only access, so a green refusal below is a real refusal.
+  it("control — a return that is only access is answered once by the same passes", async () => {
+    const env = await executionEnv(), made = await returnOnly(env, "Toujours pas de code.");
+    expect(made.routed).toMatchObject({ route: { route: "continue" }, written: true });
+    afterSettle();
+    const result = await everyPass(made, env, network());
+    expect(result.statuses[0]).toBe("queued");
+    expect(await approvedValidations(made.caseId)).toHaveLength(1);
+    expect(await effectRows(made.caseId)).toHaveLength(1);
+    expect(result.sends).toBe(1);
+  });
+  // Q1 (review 70f, S02/S05/S07): a request written under the name, shaped like a job title, must not vanish behind « ça marche ».
+  it.each([
+    ["finance under the signature", "Ça marche, merci !\n\nJean Dupont\nDeux sommes prises en octobre"],
+    ["termination under the signature", "Ça marche.\n\nJean\nFermez tout au 30"],
+    ["account holder under the signature", "Ça marche, merci !\n\nJean Dupont\nNouveau propriétaire du compte : Paul Martin"],
+    ["export under the signature", "Ça marche.\n\nMarie Martin\nExport des conversations vide"],
+  ])("Q1 — %s: no automated reply, no closing proof", async (_name, text) => {
+    const env = await executionEnv(), made = await returnOnly(env, text);
+    afterSettle();
+    await expectNoAutomatedAnswer(made, env);
+    expect((await readCase(made.caseId))?.phase).not.toBe("resolved");
+  });
+  it("mixed return (F3): still no code AND a double debit -> no automated reply", async () => {
+    const env = await executionEnv(), made = await returnOnly(env, "Toujours pas de code. Par ailleurs vous m'avez prélevé deux fois ce mois-ci, merci de me rembourser.");
+    afterSettle();
+    await expectNoAutomatedAnswer(made, env);
+  });
+  it("a plain thank-you is not a resolution: no automated reply, the case is not resolved", async () => {
+    const env = await executionEnv(), made = await returnOnly(env, "Merci.");
+    afterSettle();
+    await expectNoAutomatedAnswer(made, env);
+    expect((await readCase(made.caseId))?.phase).not.toBe("resolved");
+  });
+});
+
+describe("auto ON: the real controls of the loader refuse before any automated reply (G-AUTO-3)", () => {
+  it("an access scope approved for another policy revision is stale: no model call, nothing queued", async () => {
+    const env = await executionEnv(), made = await returnedCase(env);
+    env.SAV_V2_ACCESS_SCOPE_JSON = JSON.stringify({ ...JSON.parse(scopeJson()), policyRevision: "policy-r0" });
+    afterSettle();
+    const result = await expectNoAutomatedAnswer(made, env);
+    expect(result.modelCalls).toBe(0);
+  });
+  it("an access scope that does not list the cited card: the reply is never approved automatically", async () => {
+    const env = await executionEnv(), made = await returnedCase(env);
+    env.SAV_V2_ACCESS_SCOPE_JSON = JSON.stringify({ ...JSON.parse(scopeJson()), sources: [{ knowledgeId: randomUUID(), contentVersionId: randomUUID(), use: "answer" }] });
+    afterSettle();
+    await expectNoAutomatedAnswer(made, env);
+  });
+  it("a person owns the ticket in HubSpot: no model call, nothing queued", async () => {
+    const env = await executionEnv(), made = await returnedCase(env);
+    afterSettle();
+    const result = await expectNoAutomatedAnswer(made, env, network({ owner: "70000007" }));
+    expect(result.modelCalls).toBe(0);
+  });
+  it("the console pause of the SAV agent stops the V2 claim: no model call, nothing queued", async () => {
+    const env = await executionEnv(), made = await returnedCase(env);
+    const pause = { revision: SAV_AGENT_PAUSE_REVISION, agent: "intake", level: "fully_paused", setBy: "staff@example.invalid", setAt: new Date().toISOString(), reason: "Pause synthétique" };
+    await f.db.insert(savSyncState).values({ key: savAgentPauseKey("intake"), cursor: encryptSavPayload(pause), status: "active", updatedAt: new Date() });
+    try {
+      afterSettle();
+      const result = await expectNoAutomatedAnswer(made, env);
+      expect(result.modelCalls).toBe(0);
+    } finally { await f.db.delete(savSyncState).where(eq(savSyncState.key, savAgentPauseKey("intake"))); }
+  });
+});
+
+describe("auto ON: after the automated approval, the send respects people and uncertain results", () => {
+  async function queuedCase() {
+    const env = await executionEnv(), made = await returnedCase(env), net = network();
+    afterSettle();
+    vi.stubGlobal("fetch", vi.fn((url: string, init: RequestInit) => net.net(String(url), init)));
+    expect(await (await loadCaseContinuationPoint())({ caseId: made.caseId, trigger: "customer_return", env })).toEqual({ status: "queued" });
+    expect(await effectRows(made.caseId)).toHaveLength(1);
+    return { env, made };
+  }
+  function effects(env: Record<string, string | undefined>, made: { gmail: string; threadId: string; ticketId: string }, options: { owner?: string; loseAck?: () => boolean } = {}) {
+    const provider = executionProvider(); provider.setGmail(made.gmail, `thread-${made.threadId}`); provider.seedTicket({ id: made.ticketId, ownerId: options.owner ?? V2_OWNER, stage: "new" });
+    const counter = { sends: 0 };
+    const deps = createCaseV2WakeDeps({ env: () => env, policy: { id: policyId, hash: policyHash }, readPolicyRecord, since: new Date(Date.now() - 60_000), deadlineMs: Date.now() + 60_000,
+      network: provider.network as typeof fetch,
+      gmail: { request: async (mailbox, path, init) => {
+        const send = path.replace(/^\//, "") === "messages/send";
+        if (send) counter.sends++;
+        const result = await provider.gmail(mailbox, path, init);
+        if (send && options.loseAck?.()) throw Error("SAV_TEST_ACK_LOST");
+        return result;
+      }, permissions: async () => {} } });
+    return { provider, counter, pass: () => runCaseEffectsPass({ ...deps.replies, context: { runtime: {} as never, policy: executionPolicy } }) };
+  }
+  it("a person takes the ticket between the approval and the send: nothing is sent, the execution ends for the person", async () => {
+    const { env, made } = await queuedCase();
+    const run = effects(env, made, { owner: "70000007" });
+    const report = await run.pass();
+    expect(report.supervised).toEqual([expect.objectContaining({ state: "refused", reason: "SAV_CASE_EFFECT_CANCELLED_OWNER_HUMAN" })]);
+    await run.pass();
+    expect(run.counter.sends).toBe(0);
+  });
+  it("a lost Gmail acknowledgement is an uncertain result: it is verified, never sent again", async () => {
+    const { env, made } = await queuedCase();
+    let first = true;
+    const run = effects(env, made, { loseAck: () => { const lose = first; first = false; return lose; } });
+    await run.pass();
+    expect(run.counter.sends).toBe(1);
+    await f.client.exec("UPDATE sav.intake_effects SET next_reconcile_at = NULL");
+    await run.pass(); await run.pass();
+    expect(run.counter.sends).toBe(1);
+    expect(await effectRows(made.caseId)).toHaveLength(1);
+  });
+});
