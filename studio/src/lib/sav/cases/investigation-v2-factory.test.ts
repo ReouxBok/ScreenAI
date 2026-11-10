@@ -201,11 +201,11 @@ describe("real adapters over the network double", () => {
   it("decision provider: V2 key and model only, one request; 4xx consumed nothing, 503 or a lost connection is uncertain, non-JSON is a failure with its usage", async () => {
     const request = { purpose: "decision", snapshot: { version: 3, body: { openRequests: [], facts: [], questions: [], trials: [] } }, knowledge: [], coverage: null, feedback: [], closure: [] } as never;
     const answer = (response: Response | Error) => caseGeminiDecisionProvider({ env: () => environment(), network: async () => { if (response instanceof Error) throw response; return response; } })(request);
-    expect(await answer(new Response("{}", { status: 401 }))).toEqual({ result: { status: "failed", uncertain: false }, usage: { inputTokens: 0, outputTokens: 0 } });
-    expect(await answer(new Response("{}", { status: 503 }))).toEqual({ result: { status: "failed", uncertain: true }, usage: null });
-    expect(await answer(new Error("ECONNRESET"))).toEqual({ result: { status: "failed", uncertain: true }, usage: null });
+    expect(await answer(new Response("{}", { status: 401 }))).toMatchObject({ result: { status: "failed", uncertain: false }, usage: { inputTokens: 0, outputTokens: 0 } });
+    expect(await answer(new Response("{}", { status: 503 }))).toMatchObject({ result: { status: "failed", uncertain: true }, usage: null });
+    expect(await answer(new Error("ECONNRESET"))).toMatchObject({ result: { status: "failed", uncertain: true }, usage: null });
     expect(await answer(Response.json({ candidates: [{ content: { parts: [{ text: "pas du json" }] }, finishReason: "STOP" }], usageMetadata: { promptTokenCount: 5, candidatesTokenCount: 2 } })))
-      .toEqual({ result: { status: "failed", uncertain: false }, usage: { inputTokens: 5, outputTokens: 2 } });
+      .toMatchObject({ result: { status: "failed", uncertain: false }, usage: { inputTokens: 5, outputTokens: 2 } });
     const net = network();
     await caseGeminiDecisionProvider({ env: () => environment(), network: net.net })(request);
     expect(net.calls).toHaveLength(1);

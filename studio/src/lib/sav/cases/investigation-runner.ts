@@ -1,3 +1,4 @@
+import type { CaseModelTransportDiagnostic } from "./investigation-transport-diagnostic";
 import type { SavRetrievalCandidate } from "../request-retrieval";
 import { SAV_CASE_HOLDS_KEEPING_TIMERS, type CaseEvent, type CaseSnapshot, type SourceRef } from "./case-types";
 import { buildCaseDecisionContext, type CaseDecisionContextProblem } from "./decision-context";
@@ -63,7 +64,8 @@ export type CaseInvestigationModelResult =
   | { status: "deferred" }
   | { status: "ok"; output: unknown }
   /** `uncertain`: the provider may have run it; it is verified, never repeated. */
-  | { status: "failed"; uncertain: boolean }
+  | { status: "failed"; uncertain: boolean; diagnostic?: CaseModelTransportDiagnostic }
+  | { status: "input_rejected"; diagnostic: CaseModelTransportDiagnostic }
   /** The shared ledger already holds every call allowed for this subject (calls whose results were lost in a
    * crash): nothing was dispatched, and no further call is possible for this input. */
   | { status: "subject_exhausted" }
@@ -76,7 +78,7 @@ export type CaseInvestigationRevisions = { rules: string; playbookId: string; mo
 export type CaseInvestigationAttempt =
   | { call: number; result: "validated"; outcome: CaseDecisionValidation["outcome"]; kinds: CaseDecisionRefusalKind[]; codes: string[] }
   | { call: number; result: "checked"; plan: CaseClosurePlan }
-  | { call: number; result: "failed"; purpose: CaseInvestigationCallPurpose; uncertain: boolean };
+  | { call: number; result: "failed"; purpose: CaseInvestigationCallPurpose; uncertain: boolean; diagnostic?: CaseModelTransportDiagnostic };
 
 /**
  * Why an investigation is not progressing. `usage_uncertain`: the last call may have run at the provider,
@@ -91,7 +93,7 @@ export type CaseInvestigationAttempt =
  */
 export type CaseInvestigationWaitReason = "deferred_budget" | "case_budget" | "technical_wait" | "usage_uncertain" | "technical_exhausted" | "paused" | "decision_refused" | "context_invalid" | "knowledge_request_invalid" | "knowledge_changed";
 export type CaseKnowledgeChangedProblem = "revision_moved" | "revision_unreadable";
-export type CaseInvestigationWait = { reason: CaseInvestigationWaitReason; since: string; caseVersion: number; problem?: CaseDecisionContextProblem | CaseKnowledgeChangedProblem; embeddingCalls?: number };
+export type CaseInvestigationWait = { reason: CaseInvestigationWaitReason; since: string; caseVersion: number; problem?: CaseDecisionContextProblem | CaseKnowledgeChangedProblem; embeddingCalls?: number; diagnostic?: CaseModelTransportDiagnostic };
 
 /** Calls already made for one input, as stored between runs. No customer text beyond the last proposal. */
 export type CaseInvestigationProgress = {
@@ -344,7 +346,7 @@ export async function runCaseInvestigation(caseId: string, mode: CaseInvestigati
     const attempts = [...(prior?.attempts ?? [])];
     if (prior?.waiting?.reason === "usage_uncertain") return { status: "usage_uncertain", caseId, caseVersion, modelCalls };
     // A wait keeps the time it started, so a case retried every hour still shows how long it has been stuck.
-    const wait = (reason: CaseInvestigationWaitReason, extra: Pick<CaseInvestigationWait, "problem" | "embeddingCalls"> = {}): CaseInvestigationWait =>
+    const wait = (reason: CaseInvestigationWaitReason, extra: Pick<CaseInvestigationWait, "problem" | "embeddingCalls" | "diagnostic"> = {}): CaseInvestigationWait =>
       ({ reason, since: prior?.waiting?.since ?? ports.now().toISOString(), caseVersion, ...extra });
     // The stored progress is kept as is (proposal, calls); after a recorded decision nothing is written over it.
     const keep = async (waiting: CaseInvestigationWait) => {
@@ -434,6 +436,10 @@ export async function runCaseInvestigation(caseId: string, mode: CaseInvestigati
       if (moved) { await save(knowledgeChanged(moved)); return { stop: moved }; }
       const call = modelCalls + 1, subjectKey = `sav-case:${caseId}:${inputKey}`;
       const result = await ports.callModel({ purpose, caseId, caseVersion, inputKey, call, subjectKey, callKey: `${subjectKey}:call${call}`, caseBudgetKey: `sav-case:${caseId}`, snapshot, events, knowledge, coverage, customerReportedLogin, feedback, closure: items });
+      if (result.status === "input_rejected") {
+        await save(wait("technical_wait", { diagnostic: result.diagnostic }));
+        return { stop: { status: "technical_wait", caseId, caseVersion, modelCalls } };
+      }
       if (result.status === "deferred") {
         await save(wait("deferred_budget"));
         return { stop: { status: "deferred_budget", caseId, caseVersion, modelCalls } };
@@ -451,11 +457,11 @@ export async function runCaseInvestigation(caseId: string, mode: CaseInvestigati
       }
       modelCalls = call;
       if (result.status === "ok") return { output: result.output };
-      attempts.push({ call, result: "failed", purpose, uncertain: result.uncertain });
+      attempts.push({ call, result: "failed", purpose, uncertain: result.uncertain, ...(result.diagnostic ? { diagnostic: result.diagnostic } : {}) });
       // The last allowed call failed after a proposal: that proposal is the result, recorded below.
       if (!result.uncertain && call >= SAV_CASE_INVESTIGATION_MAX_CALLS && validation) { await save(null); return { lastCallFailed: true }; }
       const status = result.uncertain ? "usage_uncertain" : call < SAV_CASE_INVESTIGATION_MAX_CALLS ? "technical_wait" : "technical_exhausted";
-      await save(wait(status));
+      await save(wait(status, result.diagnostic ? { diagnostic: result.diagnostic } : {}));
       return { stop: { status, caseId, caseVersion, modelCalls } };
     };
 

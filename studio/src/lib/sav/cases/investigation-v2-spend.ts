@@ -1,3 +1,4 @@
+import type { CaseModelTransportDiagnostic } from "./investigation-transport-diagnostic";
 import { createHash } from "node:crypto";
 import { assertSavSharedSpend, lockSavSharedSpend } from "../shared-spend";
 import "server-only";
@@ -203,7 +204,7 @@ export function caseV2EmbeddingSpend(deps: CaseV2SpendDeps): CaseEmbeddingSpendP
   };
 }
 
-type ProviderResult = { status: "ok"; output: unknown } | { status: "failed"; uncertain: boolean };
+type ProviderResult = { status: "ok"; output: unknown } | { status: "failed"; uncertain: boolean; diagnostic?: CaseModelTransportDiagnostic };
 /** A model transport that reports what the provider said it used (null when it said nothing usable). */
 export type CaseV2ModelTransport = (request: CaseInvestigationModelRequest) => Promise<{ result: ProviderResult; usage: CaseV2SpendUsage | null }>;
 
@@ -225,14 +226,14 @@ export function caseV2ModelSpend(deps: CaseV2SpendDeps) {
   const provider = (transport: CaseV2ModelTransport) => async (request: CaseInvestigationModelRequest): Promise<ProviderResult> => {
     // The reservation made for this call, on the day it was made, even if midnight has passed since. None: not sent, since nothing could account for it.
     const reservationId = held.get(request.callKey);
-    if (!reservationId) return { status: "failed", uncertain: false };
+    if (!reservationId) return { status: "failed", uncertain: false, diagnostic: { stage: "reservation", code: "reservation_missing", networkAttempted: false } };
     held.delete(request.callKey);
     const policy = policies.get(request.callKey); policies.delete(request.callKey);
     let matches = policy === fingerprint();
     try { await assertCaseV2ReservedPolicy(reservationId,deps.env()); } catch { matches=false; }
     if (!matches) {
       await releaseCaseV2Spend({reservationId});
-      return {status:"failed",uncertain:false};
+      return {status:"failed",uncertain:false,diagnostic:{stage:"reservation",code:"reservation_policy_changed",networkAttempted:false}};
     }
     let sent: Awaited<ReturnType<CaseV2ModelTransport>>;
     try { sent = await transport(request); } catch (error) {

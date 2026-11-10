@@ -1,3 +1,4 @@
+import { describeCaseModelTransportDiagnostic } from "@/lib/sav/cases/investigation-transport-diagnostic";
 import { caseAwaitsV2Attribution, caseRequestSubject, currentCaseFacts, SAV_CASE_ADMISSION_REASON_LABELS, type CaseAdmissionReason, type CaseEvent, type CaseSnapshot, type CaseTimer, type KnowledgeRef } from "@/lib/sav/cases/case-types";
 import { caseDecisionProposalSchema, caseDecisionRejectionLabels, caseDecisionSignalLabels, caseDecisionUnverifiedLabels, type CaseDecisionProposal } from "@/lib/sav/cases/decision-contract";
 import { caseDecisionNextStepLabels } from "@/lib/sav/cases/decision-recovery";
@@ -249,7 +250,7 @@ export function buildCasePilotView(input: { snapshot: CaseSnapshot; events: read
   }
   if (body.waiting) waits.push({ label: waitingKindLabels[body.waiting.kind], detail: `Motif ${body.waiting.reasonCode}, depuis ${body.waiting.since}${body.waiting.dueAt ? `, échéance ${body.waiting.dueAt}` : ""}`, needsPerson: body.waiting.kind === "team" });
   if (read.state === "found" && read.record.progress.waiting) {
-    const waiting = read.record.progress.waiting as { reason: string; since: string; caseVersion?: unknown; problem?: unknown; detail?: unknown; embeddingCalls?: unknown };
+    const waiting = read.record.progress.waiting as { reason: string; since: string; caseVersion?: unknown; problem?: unknown; detail?: unknown; embeddingCalls?: unknown; diagnostic?: unknown };
     const generation = storedCount(read.record.progress.modelCalls), embeddings = storedCount(waiting.embeddingCalls);
     // Two different costs: a generation (model) call and a knowledge-search embedding. "No generation call" never means "no embedding".
     const calls = `Appels de génération (modèle) enregistrés : ${generation ?? "non enregistré"}. Embeddings envoyés pendant ce passage : ${embeddings ?? "non enregistré"}.`;
@@ -257,7 +258,9 @@ export function buildCasePilotView(input: { snapshot: CaseSnapshot; events: read
     const kindOf = (reason: string, needsPerson: boolean): CasePilotWaitKind => reason === "decision_refused" ? "team" : needsPerson ? "technical" : "resume";
     const push = (wait: { label: string; body: string; needsPerson: boolean; kind: CasePilotWaitKind }) =>
       waits.push({ label: wait.label, detail: `${waitKindLabels[wait.kind]} ${wait.body} ${calls} ${since}`, needsPerson: wait.needsPerson, kind: wait.kind });
-    if (waiting.reason === "context_invalid") push({ label: "Contexte de décision impossible à construire depuis le dossier : aucun appel de génération (modèle) de décision.",
+    const transport = describeCaseModelTransportDiagnostic(waiting.diagnostic);
+    if (transport) push({ label: transport.label, body: transport.detail, needsPerson: waiting.reason === "technical_exhausted", kind: "technical" });
+    else if (waiting.reason === "context_invalid") push({ label: "Contexte de décision impossible à construire depuis le dossier : aucun appel de génération (modèle) de décision.",
       body: `Motif : ${safeContextProblem(waiting)}.`, needsPerson: true, kind: "technical" });
     else {
       // Own keys only: a stored reason such as "constructor" or "__proto__" is unknown, never an inherited property.

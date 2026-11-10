@@ -106,7 +106,7 @@ describe("the V2 model budget across midnight", () => {
   });
   it("a provider with no reservation sends nothing: no paid call can escape the register", async () => {
     const transport = vi.fn<CaseV2ModelTransport>(async () => paid());
-    expect(await caseV2ModelSpend(spendDeps).provider(transport)(request(randomUUID()))).toEqual({ status: "failed", uncertain: false });
+    expect(await caseV2ModelSpend(spendDeps).provider(transport)(request(randomUUID()))).toMatchObject({ status: "failed", uncertain: false });
     expect(transport).not.toHaveBeenCalled();
   });
 });

@@ -1,3 +1,4 @@
+import type { CaseModelTransportDiagnostic } from "./investigation-transport-diagnostic";
 import type { CaseInvestigationModelRequest, CaseInvestigationPorts } from "./investigation-runner";
 
 /*
@@ -16,7 +17,7 @@ type Reservation =
   | { status: "uncertain" }
   | { status: "busy"; retryAt: string }
   | { status: "subject_exhausted" };
-type ProviderResult = { status: "ok"; output: unknown } | { status: "failed"; uncertain: boolean };
+type ProviderResult = { status: "ok"; output: unknown } | { status: "failed"; uncertain: boolean; diagnostic?: CaseModelTransportDiagnostic };
 
 /** Pole A's `case-calls.ts` functions, by shape. */
 export type CaseCallLedgerPort = {
@@ -35,6 +36,7 @@ export type CaseCallMoneyGate = (request: CaseInvestigationModelRequest) => Prom
 export type CaseCallLedgerAdapterOptions = {
   ledger: CaseCallLedgerPort;
   money: CaseCallMoneyGate;
+  preflight?(request: CaseInvestigationModelRequest): CaseModelTransportDiagnostic | null;
   /** Gives back what `money` reserved when the provider was proven not called. Absent: the reservation stays held. */
   releaseMoney?(request: CaseInvestigationModelRequest): Promise<unknown>;
   /** The provider adapter; a thrown error after dispatch is an uncertain call. */
@@ -56,6 +58,15 @@ export function caseCallLedgerAdapter(options: CaseCallLedgerAdapterOptions): Ca
       case "subject_exhausted": return { status: "subject_exhausted" };
     }
     const held = { callKey: request.callKey, token: reservation.token };
+    if (options.preflight) {
+      let diagnostic: CaseModelTransportDiagnostic | null;
+      try { diagnostic = options.preflight(request); }
+      catch { diagnostic = { stage: "preflight", code: "preflight_failed", networkAttempted: false }; }
+      if (diagnostic) {
+        await options.ledger.release(held);
+        return { status: "input_rejected", diagnostic };
+      }
+    }
     let gate: Awaited<ReturnType<CaseCallMoneyGate>> | null = null;
     try { gate = await options.money(request); } catch { gate = null; }
     if (gate?.status !== "allowed") {

@@ -1,3 +1,4 @@
+import { describeCaseModelTransportDiagnostic } from "./investigation-transport-diagnostic";
 import { caseDecisionNextStepLabels, classifyCaseDecisionRefusal } from "./decision-recovery";
 import type { CaseInvestigationProgress, CaseInvestigationWaitReason } from "./investigation-runner";
 
@@ -11,7 +12,7 @@ import type { CaseInvestigationProgress, CaseInvestigationWaitReason } from "./i
 export const caseInvestigationWaitLabels: Record<CaseInvestigationWaitReason, { label: string; unblock: string; needsPerson: boolean }> = {
   deferred_budget: { label: "Budget modèle indisponible : aucun appel consommé.", unblock: "Reprise automatique quand le budget le permet.", needsPerson: false },
   case_budget: { label: "Plafond d'appels du dossier atteint sur la période : aucun appel consommé.", unblock: "Reprise automatique quand la période libère des appels ; un dossier qui l'atteint souvent mérite un regard.", needsPerson: false },
-  technical_wait: { label: "Panne technique du fournisseur : appels restants conservés.", unblock: "Nouvelle tentative au prochain passage, dans le même plafond.", needsPerson: false },
+  technical_wait: { label: "Échec technique de génération : cause précise non enregistrée, appels restants conservés.", unblock: "Nouvelle tentative au prochain passage, dans le même plafond.", needsPerson: false },
   usage_uncertain: { label: "Appel au résultat incertain : aucun nouvel appel avant vérification.", unblock: "Vérification de l'appel par le registre des appels.", needsPerson: false },
   paused: { label: "Agent V2 en pause pendant l'investigation.", unblock: "Reprise à la levée de la pause, sans appel perdu.", needsPerson: false },
   technical_exhausted: { label: "Tous les appels permis ont échoué techniquement.", unblock: "Une personne doit examiner la panne : aucune reprise automatique.", needsPerson: true },
@@ -38,7 +39,8 @@ export function listCaseInvestigationWaits(rows: readonly CaseInvestigationWaitR
     // An unreadable date is shown as the oldest possible wait rather than hidden.
     const since = Date.parse(wait.since), waitingMinutes = Number.isFinite(since) ? Math.max(0, Math.floor((now.getTime() - since) / 60_000)) : Number.MAX_SAFE_INTEGER;
     const refusal = wait.reason === "decision_refused" && progress.last?.outcome === "needs_review" ? classifyCaseDecisionRefusal(progress.last.rejections) : null;
+    const diagnostic = describeCaseModelTransportDiagnostic(wait.diagnostic);
     return [{ caseId, inputKey, caseVersion: wait.caseVersion, reason: wait.reason, since: wait.since, waitingMinutes, modelCalls: progress.modelCalls, problem: wait.problem ?? null, embeddingCalls: wait.embeddingCalls ?? null,
-      ...caseInvestigationWaitLabels[wait.reason], refusalNextStep: refusal ? caseDecisionNextStepLabels[refusal.nextStep] : null }];
+      ...caseInvestigationWaitLabels[wait.reason], ...(diagnostic ? { label: `${diagnostic.label} ${diagnostic.detail}` } : {}), refusalNextStep: refusal ? caseDecisionNextStepLabels[refusal.nextStep] : null }];
   }).sort((a, b) => Number(b.needsPerson) - Number(a.needsPerson) || b.waitingMinutes - a.waitingMinutes || a.caseId.localeCompare(b.caseId));
 }

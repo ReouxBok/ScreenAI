@@ -61,3 +61,13 @@ describe("B5 (night 01/11): the knowledge_changed wait and its closed codes", ()
     expect(() => caseInvestigationObservationRecord("in:e3", progress({ waiting: { since: at, caseVersion: 4, ...wait } as never }), null)).toThrow("SAV_CASE_INVESTIGATION_RECORD_INVALID");
   });
 });
+
+
+it("round-trips closed transport diagnostics durably and reads old records without them", () => {
+  const diagnostic = { stage: "http" as const, code: "http_rejected" as const, networkAttempted: true, httpStatus: 403 };
+  const value = progress({ attempts: [{ call: 1, result: "failed", purpose: "decision", uncertain: false, diagnostic }], waiting: { reason: "technical_wait", since: "2026-11-10T00:00:00Z", caseVersion: 4, diagnostic } });
+  const stored = caseInvestigationObservationRecord("in:e3", value, null);
+  expect(readCaseInvestigationProgress([observed(5, structuredClone(stored))], "in:e3")).toMatchObject({ state: "found", record: { progress: { attempts: [{ diagnostic }], waiting: { diagnostic } } } });
+  expect(readCaseInvestigationProgress([observed(4, caseInvestigationObservationRecord("in:e3", progress(), null))], "in:e3").state).toBe("found");
+  expect(() => caseInvestigationObservationRecord("in:e3", { ...value, waiting: { ...value.waiting!, diagnostic: { ...diagnostic, secret: "forbidden" } } } as never, null)).toThrow("SAV_CASE_INVESTIGATION_RECORD_INVALID");
+});
