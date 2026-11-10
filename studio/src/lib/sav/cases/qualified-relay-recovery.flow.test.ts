@@ -21,8 +21,10 @@ import { SAV_INTAKE_CONTRACT_REVISION, savIntakeDecisionSchema, type SavIntakeDe
 import { listCaseEvents, readCaseByTicket, transitionCaseOwner, v1IntentHash } from "./case-store";
 import { recordCaseAfterConfirmedIntake, sweepCaseRelays } from "./intake-boundary";
 import { firstPersonalLoginRequest } from "./investigation-return-qualify";
-import { SAV_V2_QUALIFICATION_SCOPE_SCHEMA, savV2QualificationMessageAllowed } from "./qualification-scope";
+import { SAV_V2_QUALIFICATION_SCOPE_SCHEMA, savV2QualificationCaseAllowed, savV2QualificationMessageAllowed } from "./qualification-scope";
 import { v2EntryRelayDeps } from "./v2-entry";
+import { manualQualificationPorts } from "./manual-qualification-runtime";
+import { manualQualification } from "./manual-qualification";
 
 const STAFF = "20000000-0000-4000-8000-000000000081", AT = "2026-11-01T09:00:00.000Z";
 const V2_OWNER = "90000081", TEAM = "80000081", PERSON = "70000081", CONTACT = "100000081";
@@ -374,5 +376,64 @@ describe("M9 (SAV-80 survivor): the relay itself, out of scope, never reads the 
     expect(await recordCaseAfterConfirmedIntake(m.messageId, deps({ ...BASE }))).toMatchObject({ created: true, owner: "agent" });
     expect(ownerReads(m.ticketId).length).toBeGreaterThanOrEqual(1);
     expect(await bindings()).toEqual([]);
+  });
+});
+
+
+describe("manual qualification renewal on an already agent-owned case", () => {
+  async function agentCase() {
+    const w = await waitingCase(); owners.set(w.ticketId, V2_OWNER);
+    const previous = env(); await recordCaseAfterConfirmedIntake(w.messageId, deps(previous));
+    expect((await savV2QualificationCaseAllowed(previous, w.caseId)).allowed).toBe(true);
+    const before = (await readCaseByTicket(w.ticketId))!;
+    const old = (await bindings())[0]!;
+    return { w, before, old, next: env() };
+  }
+  it("binds the new exact scope through fresh owner proof, without another attribution, event or effect", async () => {
+    const { w, before, old, next } = await agentCase();
+    const effects = await intakeEffects(w.executionId); requests.length = 0;
+    vi.stubGlobal("fetch", network);
+    expect(await manualQualificationPorts(next).relay(w.messageId)).toMatchObject({ caseId: w.caseId, owner: "agent" });
+    expect(await savV2QualificationCaseAllowed(next, w.caseId)).toEqual({ allowed: true });
+    expect(await readCaseByTicket(w.ticketId)).toMatchObject({ caseId: w.caseId, owner: "agent", version: before.version });
+    const bound = await bindings(); expect(bound).toHaveLength(2);
+    expect(bound.find(b => b.key === old.key)?.cursor).toBe(old.cursor);
+    expect(await attributions(w.caseId)).toHaveLength(1); expect(await inbounds(w.caseId)).toHaveLength(1);
+    expect(await intakeEffects(w.executionId)).toBe(effects); expect(requests.every(r => r.method === "GET")).toBe(true);
+    expect(ownerReads(w.ticketId)).toHaveLength(1);
+    // Repeating the relay on an already-bound revision leaves both binding and owner intact, without another CRM read.
+    await manualQualificationPorts(next).relay(w.messageId);
+    expect(await bindings()).toHaveLength(2); expect(ownerReads(w.ticketId)).toHaveLength(1);
+  });
+  it("the real operator preview is read-only and its run binds before the scope-checking continuation double", async () => {
+    const { w, next } = await agentCase(); vi.stubGlobal("fetch", network);
+    const e = { ...next, SAV_V2_INVESTIGATION: "observe" };
+    const ports = manualQualificationPorts(e);
+    const continuation = vi.fn(async (caseId: string) => ({ status: (await savV2QualificationCaseAllowed(e, caseId)).allowed ? "qualified_no_model_fixture" : "qualification_out_of_scope" }));
+    ports.continue = continuation;
+    const preview = await manualQualification({ operation: "preview", messageId: w.messageId }, e, ports);
+    expect(preview.status).toBe("ready"); if (preview.status !== "ready") throw Error("PREVIEW_NOT_READY");
+    expect(await bindings()).toHaveLength(1); expect(continuation).not.toHaveBeenCalled();
+    expect(await manualQualification({ operation: "run", messageId: w.messageId, expected: preview.expected }, e, ports)).toMatchObject({ status: "attempted", outcome: "qualified_no_model_fixture" });
+    expect(continuation).toHaveBeenCalledExactlyOnceWith(w.caseId); expect(await bindings()).toHaveLength(2);
+  });
+  it("a human takeover during the owner read prevents binding the renewed scope", async () => {
+    const { w, next, before } = await agentCase(); vi.stubGlobal("fetch", network);
+    onOwnerRead = async () => { await transitionCaseOwner({ caseId: w.caseId, expectedVersion: before.version,
+      transition: "human_takeover", actor: { type: "system" }, commandKey: `synthetic-renewal-${w.caseId}`, reason: "synthetic_human", sourceRef: { type: "hubspot_object", id: w.ticketId } }); };
+    expect(await manualQualificationPorts(next).relay(w.messageId)).not.toMatchObject({ owner: "agent" });
+    expect(await bindings()).toHaveLength(1); expect(await readCaseByTicket(w.ticketId)).toMatchObject({ owner: "human" });
+  });
+  it.each([PERSON, TEAM, null, "fail", "missing"] as const)("does not bind an agent case when its fresh CRM owner is %s", async owner => {
+    const { w, next, old } = await agentCase(); owners.set(w.ticketId, owner); vi.stubGlobal("fetch", network);
+    expect(await manualQualificationPorts(next).relay(w.messageId)).not.toMatchObject({ owner: "agent" });
+    expect(await savV2QualificationCaseAllowed(next, w.caseId)).toEqual({ allowed: false, reason: "qualification_thread_unbound" });
+    expect(await bindings()).toHaveLength(1); expect((await bindings())[0]!.cursor).toBe(old.cursor);
+  });
+  it("does not bind when the agent is paused during the fresh owner read", async () => {
+    const { w, next } = await agentCase(); vi.stubGlobal("fetch", network);
+    onOwnerRead = async () => { await setPause("v2", "fully_paused"); };
+    expect(await manualQualificationPorts(next).relay(w.messageId)).not.toMatchObject({ owner: "agent" });
+    expect(await bindings()).toHaveLength(1);
   });
 });
