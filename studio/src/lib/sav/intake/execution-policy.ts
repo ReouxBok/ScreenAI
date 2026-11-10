@@ -51,8 +51,10 @@ export async function executionAdministratorFor(user: SavClerkUser) {
         throw Error("SAV_INTAKE_EXECUTION_UNAUTHORIZED");
     return staff;
 }
-/** Intentionally no route/UI in this lot; an explicit administrator operation only. */
-export async function approveIntakeExecutionPolicy(raw: unknown, commandId?: string) {
+export type IntakeExecutionPolicyTx = Parameters<Parameters<ReturnType<typeof requireDb>["transaction"]>[0]>[0];
+/** Explicit administrator operation only. `beforeCreate` (renewal) runs inside the approval transaction, after the
+ * administrator lock and only when a new policy row would be created, so a concurrent source revocation is serialized. */
+export async function approveIntakeExecutionPolicy(raw: unknown, commandId?: string, beforeCreate?: (tx: IntakeExecutionPolicyTx) => Promise<void>) {
     const staff = await executionAdministrator(), policy = executionPolicySchema.parse(raw), now = Date.now();
     if (Date.parse(policy.expiresAt) <= now || (policy.budgetProfile===SAV_INTAKE_OPERATIONAL_PROFILE ? !intakeOperationalTermValid(policy.expiresAt,new Date(now)) : Date.parse(policy.expiresAt) - now > 86400000) || Date.parse(policy.createdAfter) > now || Date.parse(policy.receivedAfter) >= Date.parse(policy.expiresAt))
         throw Error("SAV_INTAKE_EXECUTION_POLICY_INVALID");
@@ -68,6 +70,7 @@ export async function approveIntakeExecutionPolicy(raw: unknown, commandId?: str
                 return existing;
             }
         }
+        if (beforeCreate) await beforeCreate(tx);
         const [created] = await tx.insert(savIntakeExecutionPolicies).values({
             id:commandId, revision: policy.revision, state: "approved", administratorId: staff.id, policyHash: intakeRuntimeHash(policy), payloadCiphertext: encryptSavPayload(policy)
         }).returning();

@@ -1,6 +1,7 @@
 "use server";
 import { revalidatePath } from "next/cache";
 import { previewIntakeLaunch, commitIntakeLaunch, revokeIntakeExecutionPolicy } from "@/lib/sav/intake/launch-admin";
+import { previewIntakeExecutionRenewal, commitIntakeExecutionRenewal, type IntakeRenewalSummary, type IntakeRenewalReceipt } from "@/lib/sav/intake/execution-renewal";
 export type LaunchAdminState = {
   ok:boolean; message:string; code?:string; submittedJson?:string;
   preview?:{id:string;hash:string;expiresAt:string;input:unknown};
@@ -35,4 +36,31 @@ export async function revokeLaunchAction(_previous:LaunchAdminState,form:FormDat
     revalidatePath("/studio/sav/intake");
     return {ok:true,message:"Autorité révoquée. Aucun nouveau départ sous cette politique ; les rapprochements et reçus tardifs restent conservés."};
   } catch(error) {return rejected(error);}
+}
+export type RenewalAdminState = {
+  ok:boolean; message:string; code?:string; submittedSource?:string;
+  preview?:{id:string;hash:string;expiresAt:string;sourcePolicyId:string;sourcePolicyHash:string;fromCodeRevision:string;toCodeRevision:string;summary:IntakeRenewalSummary};
+  receipt?:IntakeRenewalReceipt;
+};
+function renewalRejected(error:unknown):RenewalAdminState {
+  const code=error instanceof Error&&/^SAV_[A-Z_]+$/.test(error.message)?error.message:"SAV_INTAKE_ADMIN_INVALID_COMMAND";
+  return {ok:false,message:"Le renouvellement a été refusé. Aucune politique n’a été créée ni modifiée ; vérifiez le diagnostic.",code};
+}
+/** Renewal: server-side copy of an existing policy for the deployed code revision only. No JSON, payload or key from the browser. */
+export async function previewRenewalAction(_previous:RenewalAdminState,form:FormData):Promise<RenewalAdminState> {
+  try {
+    const source=text(form,"sourcePolicyId");
+    if(source.length>100)throw Error("SAV_INTAKE_ADMIN_INPUT_TOO_LARGE");
+    const preview=await previewIntakeExecutionRenewal(text(form,"commandId"),source);
+    return {ok:true,message:"Aperçu de renouvellement conservé dix minutes. Seule la version de code change.",submittedSource:source,
+      preview:{id:preview.previewId,hash:preview.hash,expiresAt:preview.expiresAt,sourcePolicyId:preview.sourcePolicyId,sourcePolicyHash:preview.sourcePolicyHash,
+        fromCodeRevision:preview.fromCodeRevision,toCodeRevision:preview.toCodeRevision,summary:preview.summary}};
+  } catch(error) {return renewalRejected(error);}
+}
+export async function commitRenewalAction(_previous:RenewalAdminState,form:FormData):Promise<RenewalAdminState> {
+  try {
+    const receipt=await commitIntakeExecutionRenewal(text(form,"previewId"),text(form,"hash"));
+    revalidatePath("/studio/sav/intake");
+    return {ok:true,message:"Nouvelle politique approuvée. L’ancienne est conservée telle quelle. Aucune variable serveur n’a été modifiée : reportez l’identifiant et l’empreinte dans la configuration canonique.",receipt};
+  } catch(error) {return renewalRejected(error);}
 }
