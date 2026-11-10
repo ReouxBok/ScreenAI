@@ -44,7 +44,8 @@ export type RenewalAdminState = {
 };
 function renewalRejected(error:unknown):RenewalAdminState {
   const code=error instanceof Error&&/^SAV_[A-Z_]+$/.test(error.message)?error.message:"SAV_INTAKE_ADMIN_INVALID_COMMAND";
-  return {ok:false,message:"Le renouvellement a été refusé. Aucune politique n’a été créée ni modifiée ; vérifiez le diagnostic.",code};
+  // Review M-1: a commit can fail after the canonical approval (lost lease, receipt write), so no non-effect is claimed.
+  return {ok:false,message:"Le renouvellement n’a pas abouti. Vérifiez le diagnostic et l’état des politiques. Si une confirmation a été interrompue, reprenez la même commande avant de préparer un nouvel aperçu.",code};
 }
 /** Renewal: server-side copy of an existing policy for the deployed code revision only. No JSON, payload or key from the browser. */
 export async function previewRenewalAction(_previous:RenewalAdminState,form:FormData):Promise<RenewalAdminState> {

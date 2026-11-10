@@ -14,9 +14,9 @@ it("preview passes only the command id and the typed source id to the server pri
   expect(mocks.preview).toHaveBeenCalledWith("p","s");
   expect(state).toMatchObject({ok:true,submittedSource:"s",preview:{id:"p",hash:"h",fromCodeRevision:"a",toCodeRevision:"b",summary}});
 });
-it("refusals keep the exact SAV code and say nothing was created; oversized input never reaches the server primitive",async()=>{
+it("refusals keep the exact SAV code with a neutral label; oversized input never reaches the server primitive",async()=>{
   mocks.preview.mockRejectedValue(Error("SAV_INTAKE_RENEWAL_SOURCE_REVOKED"));
-  expect(await previewRenewalAction(initial,form({commandId:"p",sourcePolicyId:"s"}))).toMatchObject({ok:false,code:"SAV_INTAKE_RENEWAL_SOURCE_REVOKED",message:expect.stringContaining("Aucune politique n’a été créée")});
+  expect(await previewRenewalAction(initial,form({commandId:"p",sourcePolicyId:"s"}))).toMatchObject({ok:false,code:"SAV_INTAKE_RENEWAL_SOURCE_REVOKED",message:expect.stringContaining("Vérifiez le diagnostic")});
   mocks.preview.mockClear();
   expect(await previewRenewalAction(initial,form({commandId:"p",sourcePolicyId:"x".repeat(101)}))).toMatchObject({ok:false,code:"SAV_INTAKE_ADMIN_INPUT_TOO_LARGE"});
   expect(mocks.preview).not.toHaveBeenCalled();
@@ -30,4 +30,15 @@ it("commit returns the new policy id and hash for the canonical configuration an
   expect(mocks.commit).toHaveBeenCalledWith("p","h");
   expect(state).toMatchObject({ok:true,receipt,message:expect.stringContaining("Aucune variable serveur n’a été modifiée")});
   expect(mocks.revalidate).toHaveBeenCalledWith("/studio/sav/intake");
+});
+it("review M-1: a commit failing after the approval (lost lease or receipt write) claims no non-effect, points to the same command and leaks no driver detail",async()=>{
+  const noClaim=(message:string)=>{expect(message).not.toMatch(/aucune politique|n’a été créée|n'a été créée|ni modifiée|aucun effet/i);expect(message).toContain("reprenez la même commande");expect(message).toContain("état des politiques");};
+  mocks.commit.mockRejectedValue(Error("SAV_INTAKE_RENEWAL_PREVIEW_CONFLICT"));
+  const lost=await commitRenewalAction(initial,form({previewId:"p",hash:"h"}));
+  expect(lost).toMatchObject({ok:false,code:"SAV_INTAKE_RENEWAL_PREVIEW_CONFLICT"});expect(lost.receipt).toBeUndefined();noClaim(lost.message);
+  mocks.commit.mockRejectedValue(Error("duplicate key value violates unique constraint \"intake_execution_policies_pkey\" (synthetic driver detail)"));
+  const receiptWrite=await commitRenewalAction(initial,form({previewId:"p",hash:"h"}));
+  expect(receiptWrite).toMatchObject({ok:false,code:"SAV_INTAKE_ADMIN_INVALID_COMMAND"});expect(receiptWrite.receipt).toBeUndefined();noClaim(receiptWrite.message);
+  expect(JSON.stringify(receiptWrite)).not.toMatch(/duplicate key|intake_execution_policies_pkey|synthetic driver detail/);
+  expect(mocks.commit).toHaveBeenCalledTimes(2);expect(mocks.revalidate).not.toHaveBeenCalled();
 });
