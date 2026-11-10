@@ -148,3 +148,15 @@ describe("pole B lot 5 wait contract (knowledge_changed) — NOT COMPOSED: B5's 
     expect(waitOf().detail).toContain(`Depuis ${SINCE}, version non enregistrée.`);
   });
 });
+
+
+it("shows the closed transport failure and counts without calling it a generic provider outage", () => {
+  progress.modelCalls = 0; progress.waiting = { reason: "technical_wait", since: SINCE, caseVersion: 3,
+    diagnostic: { stage: "preflight", code: "input_too_large", networkAttempted: false, inputBytes: 30000, maxInputBytes: 26000, knowledgeCards: 3 } };
+  const wait = waitOf();
+  expect(wait.label).toContain("Contexte trop volumineux"); expect(wait.detail).toContain("30000 octets / limite 26000");
+  expect(wait.detail).toContain("enregistrés : 0"); expect(wait.label).not.toContain("fournisseur");
+  progress.modelCalls = 3; progress.waiting = { ...progress.waiting, reason: "technical_exhausted",
+    diagnostic: { stage: "http", code: "http_rejected", networkAttempted: true, httpStatus: 403 } };
+  const exhausted = waitOf(); expect(exhausted.needsPerson).toBe(true); expect(exhausted.detail).toContain("HTTP 403");
+});

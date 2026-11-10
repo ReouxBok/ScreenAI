@@ -11,7 +11,7 @@ import { bindCaseInvestigationToReplyPlan, type CaseReplyPassageDeps, type CaseR
 import { caseInvestigationReturnAwareQualify, caseReturnContentRule } from "./investigation-return-qualify";
 import { caseCallLedgerOnStore, type CaseInvestigationRuntimeDeps } from "./investigation-runtime";
 import {
-  caseCustomerTextsReader, caseGeminiDecisionProvider, caseGeminiEmbeddingTransport, caseHubspotOwnerReadTransport, caseKnowledgeVectorSearch,
+  caseCustomerTextsReader, caseGeminiDecisionPreflight, caseGeminiDecisionProvider, caseGeminiEmbeddingTransport, caseHubspotOwnerReadTransport, caseKnowledgeVectorSearch,
   caseV2PauseState, caseV2ProviderConfigProblems, SAV_CASE_INVESTIGATION_PROMPT_REVISION, SAV_V2_MODEL_ENV, type CaseV2Network,
 } from "./investigation-v2-providers";
 import { caseV2EmbeddingSpend, caseV2ModelSpend, readCaseV2SpendPolicy, readCaseV2TransportPolicy } from "./investigation-v2-spend";
@@ -100,7 +100,7 @@ export function createCaseInvestigationV2Deps(input: CaseInvestigationV2Input): 
     revisions: async () => ({ rules: SAV_CASE_DECISION_CONTRACT_REVISION, playbookId: await vectors.readRevision(), model: input.env()[SAV_V2_MODEL_ENV] ?? "", prompt: SAV_CASE_INVESTIGATION_PROMPT_REVISION }),
     ledger: caseCallLedgerOnStore,
     knowledge: { vectors, embed: caseGeminiEmbeddingTransport({ env: input.env, ...(input.network ? { network: input.network } : {}) }), spend: caseV2EmbeddingSpend(spendDeps) },
-    model: { money: model.money, releaseMoney: model.release, provider: model.provider(caseGeminiDecisionProvider({ env: input.env, ...(input.network ? { network: input.network } : {}) })) },
+    model: { preflight: caseGeminiDecisionPreflight(input.env), money: model.money, releaseMoney: model.release, provider: model.provider(caseGeminiDecisionProvider({ env: input.env, ...(input.network ? { network: input.network } : {}) })) },
   };
   return { ok: true, deps, provenance };
 }

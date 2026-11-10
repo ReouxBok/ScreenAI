@@ -69,7 +69,7 @@ describe("V2 Gemini key source (explicit, non-secret selector)", () => {
     for (const keys of [{ SAV_GEMINI_API_KEY: V1 }, { SAV_V2_GEMINI_KEY_SOURCE: "shared_v1" }, { SAV_V2_GEMINI_KEY_SOURCE: "bogus", SAV_GEMINI_API_KEY: V1, SAV_V2_GEMINI_API_KEY: V2 },
       { SAV_V2_GEMINI_KEY_SOURCE: "shared_v1", SAV_GEMINI_API_KEY: V1, SAV_V2_GEMINI_API_KEY: V2 }])
       expect(await caseGeminiDecisionProvider({ env: () => ({ ...base, ...keys }), network })(request))
-        .toEqual({ result: { status: "failed", uncertain: false }, usage: { inputTokens: 0, outputTokens: 0 } });
+        .toMatchObject({ result: { status: "failed", uncertain: false }, usage: { inputTokens: 0, outputTokens: 0 } });
     expect(network).not.toHaveBeenCalled();
   });
 

@@ -41,7 +41,7 @@ export type CaseInvestigationRuntimeDeps = {
   revisions?: CaseInvestigationPorts["revisions"];
   ledger?: CaseCallLedgerPort;
   knowledge: { vectors?: CaseKnowledgeVectorSearch; embed?: CaseEmbeddingTransport; spend?: CaseEmbeddingSpendPort };
-  model: { provider?: CaseCallLedgerAdapterOptions["provider"]; money?: CaseCallLedgerAdapterOptions["money"]; releaseMoney?: CaseCallLedgerAdapterOptions["releaseMoney"] };
+  model: { preflight?: CaseCallLedgerAdapterOptions["preflight"]; provider?: CaseCallLedgerAdapterOptions["provider"]; money?: CaseCallLedgerAdapterOptions["money"]; releaseMoney?: CaseCallLedgerAdapterOptions["releaseMoney"] };
 };
 
 export type CaseInvestigationRuntimeReport = CaseInvestigationReport | { status: "not_wired"; caseId: string; missing: string[]; modelCalls: 0 };
@@ -66,7 +66,7 @@ export async function runCaseInvestigationRuntime(caseId: string, deps: CaseInve
       vectors: deps.knowledge.vectors!, embed: deps.knowledge.embed!, spend: deps.knowledge.spend!, ledger,
       pauseState: deps.pauseState, readTicketOwner: deps.readTicketOwner!, readCase: id => readCase!(id),
     })(snapshot, context),
-    callModel: caseCallLedgerAdapter({ ledger, money: deps.model.money!, ...(deps.model.releaseMoney ? { releaseMoney: deps.model.releaseMoney } : {}), provider: deps.model.provider!, holder: deps.holder,
+    callModel: caseCallLedgerAdapter({ ledger, ...(deps.model.preflight ? { preflight: deps.model.preflight } : {}), money: deps.model.money!, ...(deps.model.releaseMoney ? { releaseMoney: deps.model.releaseMoney } : {}), provider: deps.model.provider!, holder: deps.holder,
       leaseSeconds: deps.leaseSeconds, maxPerSubject: SAV_CASE_INVESTIGATION_MAX_CALLS }),
   });
   // The freshness check of the budgeted search reads the case the same way the runner does.

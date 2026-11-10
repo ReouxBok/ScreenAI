@@ -1,3 +1,4 @@
+import { caseModelFinishReason, type CaseModelTransportDiagnostic } from "./investigation-transport-diagnostic";
 import { readCaseV2TransportPolicy, assertCaseV2ReservedPolicy } from "./investigation-v2-spend";
 import "server-only";
 import { and, eq, inArray } from "drizzle-orm";
@@ -145,37 +146,64 @@ const generateResponse = z.object({
  * consumed nothing; 408, 429, 5xx, a timeout or a lost connection are uncertain (verified, never resent); an answer that is not JSON is a
  * failure whose usage is still reported.
  */
+/** Prepare the EXACT existing prompt/body. No source, fact, instruction or reply rule is removed to fit. */
+export function prepareCaseGeminiDecisionRequest(request: CaseInvestigationModelRequest, env: Env):
+  | { ok: true; key: string; model: string; body: string; metadata: Pick<CaseModelTransportDiagnostic, "inputBytes" | "maxInputBytes" | "knowledgeCards"> }
+  | { ok: false; diagnostic: CaseModelTransportDiagnostic } {
+  const resolved = resolveCaseV2GeminiKey(env), model = env[SAV_V2_MODEL_ENV] ?? "";
+  if (!resolved.ok) return { ok: false, diagnostic: { stage: "preflight", code: "key_unavailable", networkAttempted: false } };
+  if (!MODEL_ID.test(model)) return { ok: false, diagnostic: { stage: "preflight", code: "model_invalid", networkAttempted: false } };
+  let bounds: ReturnType<typeof readCaseV2TransportPolicy>;
+  try { bounds = readCaseV2TransportPolicy(env); } catch { return { ok: false, diagnostic: { stage: "preflight", code: "policy_invalid", networkAttempted: false } }; }
+  const prompt = caseInvestigationPrompt(request);
+  const body = JSON.stringify({ systemInstruction: { parts: [{ text: `${prompt.instruction}\n\nSchéma JSON de la réponse :\n${prompt.schema}` }] },
+    contents: [{ role: "user", parts: [{ text: JSON.stringify(prompt.payload) }] }], generationConfig: { responseMimeType: "application/json", temperature: 0, maxOutputTokens: bounds.maxOutputTokens } });
+  const metadata = { inputBytes: Buffer.byteLength(body, "utf8"), maxInputBytes: bounds.maxInputBytes, knowledgeCards: request.knowledge.length };
+  if (metadata.inputBytes > bounds.maxInputBytes) return { ok: false, diagnostic: { stage: "preflight", code: "input_too_large", networkAttempted: false, ...metadata } };
+  return { ok: true, key: resolved.key, model, body, metadata };
+}
+
+/** Runs before money and dispatch; ledger-known/uncertain calls retain their precedence. */
+export function caseGeminiDecisionPreflight(env: () => Env) {
+  return (request: CaseInvestigationModelRequest): CaseModelTransportDiagnostic | null => {
+    const prepared = prepareCaseGeminiDecisionRequest(request, env());
+    return prepared.ok ? null : prepared.diagnostic;
+  };
+}
+
 export function caseGeminiDecisionProvider(input: Readonly<{ env: () => Env; network?: CaseV2Network; timeoutMs?: number }>): CaseV2ModelTransport {
   const network = input.network ?? ((url, init) => fetch(url, init));
   return async request => {
-    const env = input.env(), resolved = resolveCaseV2GeminiKey(env), key = resolved.ok ? resolved.key : "", model = env[SAV_V2_MODEL_ENV] ?? "";
-    if (!key || !MODEL_ID.test(model)) return { result: { status: "failed", uncertain: false }, usage: { inputTokens: 0, outputTokens: 0 } };
-    let bounds: ReturnType<typeof readCaseV2TransportPolicy>;
-    try { bounds = readCaseV2TransportPolicy(env); } catch { return { result: { status: "failed", uncertain: false }, usage: { inputTokens: 0, outputTokens: 0 } }; }
-    const prompt = caseInvestigationPrompt(request);
-    const body = JSON.stringify({ systemInstruction: { parts: [{ text: `${prompt.instruction}\n\nSchéma JSON de la réponse :\n${prompt.schema}` }] },
-      contents: [{ role: "user", parts: [{ text: JSON.stringify(prompt.payload) }] }], generationConfig: { responseMimeType: "application/json", temperature: 0, maxOutputTokens: bounds.maxOutputTokens } });
-    if (Buffer.byteLength(body,"utf8")>bounds.maxInputBytes) return { result: { status: "failed", uncertain: false }, usage: { inputTokens: 0, outputTokens: 0 } };
+    const failed = (diagnostic: CaseModelTransportDiagnostic, uncertain: boolean, usage: { inputTokens?: number; outputTokens?: number } | null) => {
+      // Structured, closed metadata is useful even if the later journal write fails. No raw error/provider response.
+      console.warn("sav_v2_model_transport", diagnostic);
+      return { result: { status: "failed" as const, uncertain, diagnostic }, usage };
+    };
+    const prepared = prepareCaseGeminiDecisionRequest(request, input.env());
+    if (!prepared.ok) return failed(prepared.diagnostic, false, { inputTokens: 0, outputTokens: 0 });
+    const { key, model, body, metadata } = prepared;
     let response: Response;
     try {
       response = await network(`${GEMINI}/${encodeURIComponent(model)}:generateContent`, {
-        method: "POST", signal: AbortSignal.timeout(input.timeoutMs ?? 60_000), headers: { "content-type": "application/json", "x-goog-api-key": key },
-        body,
+        method: "POST", signal: AbortSignal.timeout(input.timeoutMs ?? 60_000), headers: { "content-type": "application/json", "x-goog-api-key": key }, body,
       });
-    } catch { return { result: { status: "failed", uncertain: true }, usage: null }; }
+    } catch { return failed({ stage: "network", code: "network_failed", networkAttempted: true, ...metadata }, true, null); }
     if (!response.ok) {
       await response.body?.cancel();
       const unprocessed = response.status >= 400 && response.status < 500 && response.status !== 408 && response.status !== 429;
-      return { result: { status: "failed", uncertain: !unprocessed }, usage: unprocessed ? { inputTokens: 0, outputTokens: 0 } : null };
+      return failed({ stage: "http", code: "http_rejected", networkAttempted: true, httpStatus: response.status, ...metadata }, !unprocessed, unprocessed ? { inputTokens: 0, outputTokens: 0 } : null);
     }
     let parsed: z.infer<typeof generateResponse>;
-    try { parsed = generateResponse.parse(await response.json()); } catch { return { result: { status: "failed", uncertain: true }, usage: null }; }
+    try { parsed = generateResponse.parse(await response.json()); } catch { return failed({ stage: "envelope", code: "envelope_invalid", networkAttempted: true, ...metadata }, true, null); }
     const meta = parsed.usageMetadata;
     const usage = meta && Number.isSafeInteger(meta.promptTokenCount) && Number(meta.promptTokenCount)>=0 && Number.isSafeInteger(meta.candidatesTokenCount) && Number(meta.candidatesTokenCount)>=0 && (meta.thoughtsTokenCount===undefined || Number.isSafeInteger(meta.thoughtsTokenCount) && meta.thoughtsTokenCount>=0) ? { inputTokens: meta.promptTokenCount!, outputTokens: (meta.candidatesTokenCount ?? 0) + (meta.thoughtsTokenCount ?? 0) } : null;
     const candidate = parsed.candidates?.[0];
     const text = candidate?.content?.parts.map(part => part.text ?? "").join("") ?? "";
-    if (!text.trim() || (candidate?.finishReason && candidate.finishReason !== "STOP")) return { result: { status: "failed", uncertain: false }, usage };
-    try { return { result: { status: "ok", output: JSON.parse(text) as unknown }, usage }; } catch { return { result: { status: "failed", uncertain: false }, usage }; }
+    const finish = candidate?.finishReason ? { finishReason: caseModelFinishReason(candidate.finishReason) } : {};
+    if (candidate?.finishReason && candidate.finishReason !== "STOP") return failed({ stage: "content", code: "finish_not_stop", networkAttempted: true, ...metadata, ...finish }, false, usage);
+    if (!text.trim()) return failed({ stage: "content", code: "empty_response", networkAttempted: true, ...metadata, ...finish }, false, usage);
+    try { return { result: { status: "ok", output: JSON.parse(text) as unknown }, usage }; }
+    catch { return failed({ stage: "json", code: "output_json_invalid", networkAttempted: true, ...metadata, ...finish }, false, usage); }
   };
 }
 

@@ -804,3 +804,25 @@ describe("login history at the investigation model boundary", () => {
     expect(await history(stated, "Comment connecter Gmail ?")).toBeNull();
   });
 });
+
+
+describe("transport-only diagnostics preserve business decisions and call ceilings", () => {
+  const diagnostic = { stage: "preflight" as const, code: "input_too_large" as const, networkAttempted: false, inputBytes: 30000, maxInputBytes: 26000, knowledgeCards: 3 };
+  it("keeps the previous attempts/proposal but does not count a locally rejected request", async () => {
+    const run = fake({ owner: "v2", model: [{ status: "input_rejected", diagnostic }] });
+    expect(await runCaseInvestigation("case-1", "observe", run.ports)).toMatchObject({ status: "technical_wait", modelCalls: 0 });
+    const progress = run.progress.get("case-1:in:e1")!;
+    expect(progress).toMatchObject({ modelCalls: 0, attempts: [], waiting: { diagnostic } });
+    expect(run.records).toHaveLength(0);
+    expect(listCaseInvestigationWaits([{ caseId: "case-1", inputKey: "in:e1", progress }], new Date("2026-11-10T12:00:00Z"))[0].label).toContain("Contexte trop volumineux");
+  });
+  it("stores an HTTP diagnostic on the same failed attempt and wait, without changing uncertainty", async () => {
+    const http = { stage: "http" as const, code: "http_rejected" as const, networkAttempted: true, httpStatus: 429 };
+    const run = fake({ owner: "v2", model: [{ status: "failed", uncertain: true, diagnostic: http }] });
+    expect(await runCaseInvestigation("case-1", "observe", run.ports)).toMatchObject({ status: "usage_uncertain", modelCalls: 1 });
+    expect(run.progress.get("case-1:in:e1")).toMatchObject({ modelCalls: 1, attempts: [{ diagnostic: http, uncertain: true }], waiting: { diagnostic: http } });
+    const next = fake({ owner: "v2", progress: run.progress });
+    expect(await runCaseInvestigation("case-1", "observe", next.ports)).toMatchObject({ status: "usage_uncertain" });
+    expect(next.calls).toHaveLength(0); expect(next.log).not.toContain("knowledge");
+  });
+});

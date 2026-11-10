@@ -1,3 +1,4 @@
+import { caseModelTransportDiagnosticSchema } from "./investigation-transport-diagnostic";
 import { z } from "zod";
 import type { CaseDecisionContextProblem } from "./decision-context";
 import { CASE_RESOLUTION_VERDICTS } from "./investigation-closure";
@@ -26,7 +27,7 @@ const at = z.string().refine(value => Number.isFinite(Date.parse(value)), "date"
 const attemptSchema = z.union([
   z.object({ call: count, result: z.literal("validated"), outcome: z.enum(["accepted", "needs_review"]), kinds: z.array(z.string()), codes: z.array(z.string()) }).strict(),
   z.object({ call: count, result: z.literal("checked"), plan: z.enum(["soft_close", "no_close_transfer_thanks", "no_close_not_resolved", "ask_confirmation"]) }).strict(),
-  z.object({ call: count, result: z.literal("failed"), purpose: z.enum(["decision", "resolution_check"]), uncertain: z.boolean() }).strict(),
+  z.object({ call: count, result: z.literal("failed"), purpose: z.enum(["decision", "resolution_check"]), uncertain: z.boolean(), diagnostic: caseModelTransportDiagnosticSchema.optional() }).strict(),
 ]);
 const closureSchema = z.object({
   plan: z.enum(["soft_close", "no_close_transfer_thanks", "no_close_not_resolved", "ask_confirmation"]),
@@ -38,10 +39,11 @@ const progressSchema = z.object({
   modelCalls: count.max(3), attempts: z.array(attemptSchema).max(12),
   waiting: z.object({
     reason: z.enum(["deferred_budget", "case_budget", "technical_wait", "usage_uncertain", "technical_exhausted", "paused", "decision_refused", "context_invalid", "knowledge_request_invalid", "knowledge_changed"]),
-    since: at, caseVersion: count, problem: z.union([contextProblem, knowledgeChangedProblem]).optional(), embeddingCalls: count.max(1000).optional(),
+    since: at, caseVersion: count, problem: z.union([contextProblem, knowledgeChangedProblem]).optional(), embeddingCalls: count.max(1000).optional(), diagnostic: caseModelTransportDiagnosticSchema.optional(),
   }).strict()
     // Each closed code belongs to its own reason: a context code only on context_invalid, a revision code only on knowledge_changed.
     .refine(wait => wait.problem === undefined || (wait.reason === "knowledge_changed" ? knowledgeChangedProblem.safeParse(wait.problem).success : wait.reason === "context_invalid" && contextProblem.safeParse(wait.problem).success), "problem")
+    .refine(wait => wait.diagnostic === undefined || ["technical_wait", "usage_uncertain", "technical_exhausted"].includes(wait.reason), "diagnostic")
     .nullable(),
   proposal: z.object({ output: z.unknown(), proposedOn: count }).strict().nullable(),
   last: z.unknown(),
