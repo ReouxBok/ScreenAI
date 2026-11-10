@@ -51,7 +51,7 @@ export default async function SavKnowledgeLibrary({ searchParams }: { searchPara
   const pages = catalog ? Math.max(1, Math.ceil(catalog.total / catalog.pageSize)) : 1;
   return <div className={styles.workspace}>
     <header className={styles.heading}><div><span className="eyebrow">Studio SAV</span><h1>Bibliothèque des connaissances</h1></div>
-      <Link className="button primary" href={`${base}/proposer`}>Créer une fiche</Link>
+      <Link className="button primary" href={`${base}/proposer`}>Créer une fiche</Link><Link className="button" href={`${base}/coller`}>Coller une connaissance</Link><Link className="button" href={`${base}/temporaires`}>Voir les incidents temporaires</Link>
     </header>
     <nav className={library.queue} aria-label="Files de connaissances">
       <Link href={url("production")} aria-current={active ? "page" : undefined}>Fiches actives</Link>

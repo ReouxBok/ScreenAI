@@ -1,5 +1,6 @@
 import { z } from "zod";
 import { diagnosticKnowledgeSchema } from "./diagnostic-contract";
+import { temporaryIncidentDocumentSchema } from "./temporary-incident-schema";
 
 const label = z.string().trim().min(1).max(500);
 const text = z.string().trim().max(5_000);
@@ -51,6 +52,8 @@ export const canonicalKnowledgeSchema = z.object({
     // Immutable source text plus Ugo's explicit classification, kept with the reviewed revision.
     sourceSections: z.array(onboardingSourceSectionSchema).max(50).optional(),
   }).strict().optional(),
+  // SAV-79: optional, reviewed with the revision; never projected (support/onboarding allowlists ignore it).
+  temporaryIncident: temporaryIncidentDocumentSchema.optional(),
 }).strict().superRefine((value, ctx) => {
   if (value.diagnostic?.checks.some(check => !value.steps.some(step => step.id === check.evidenceStepId))) ctx.addIssue({ code: "custom", message: "SAV_DIAGNOSTIC_STEP_REFERENCE_INVALID", path: ["diagnostic"] });
   if (new Set(value.steps.map((step) => step.id)).size !== value.steps.length) ctx.addIssue({ code: "custom", message: "SEMANTIC_STEP_IDS_MUST_BE_UNIQUE", path: ["steps"] });
