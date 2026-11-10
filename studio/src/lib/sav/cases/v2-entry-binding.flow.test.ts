@@ -469,3 +469,185 @@ describe("auto ON: « ça remarche » after the automated answer closes the tick
     expect(sends).toBe(1);
   });
 });
+
+import { continueCaseAfterCommit, customerReturnGate } from "./v2-entry";
+import { bindSavV2QualificationThread, SAV_V2_QUALIFICATION_SCOPE_SCHEMA } from "./qualification-scope";
+/*
+ * SAV-80 on the real chain (same real database, loader, factory, ledger and effect driver as above; the network is the only double): the qualification scope
+ * narrows V2 to ONE bound thread. Synthetic values only (example.invalid sender, invented contact id). Slack, stages and J2 stay OFF as root decided.
+ */
+describe("SAV-80 qualification scope: one bound thread, closed for everything else, uncertain results still verified", () => {
+  const CONTACT = "100000001";
+  let windowStart = 0;
+  const scoped = (env: Record<string, string | undefined>, over: Record<string, string> = {}) => ({ ...env, SAV_V2_SCOPE_MODE: "qualification",
+    SAV_V2_QUALIFICATION_SCOPE_JSON: JSON.stringify({ schema: SAV_V2_QUALIFICATION_SCOPE_SCHEMA, revision: `q-syn-${windowStart}`, senderEmail: SENDER, hubspotContactId: CONTACT,
+      initialSubject: "Synthétique", notBefore: new Date(windowStart - 30 * 60_000).toISOString(), expiresAt: new Date(windowStart + 15 * 60_000).toISOString(), ...over }) });
+  /** The opening mail of a thread, bound as the owner at creation would (the only binder), then a return on it routed by V2. */
+  async function boundCase(env: Record<string, string | undefined>) {
+    const made = await returnedCase(env);
+    const [first] = await f.db.select({ id: savMessages.id }).from(savMessages).where(eq(savMessages.threadId, made.threadId)).orderBy(savMessages.receivedAt).limit(1);
+    expect(await bindSavV2QualificationThread(env, { messageId: first!.id, primaryContactId: CONTACT })).toEqual({ allowed: true });
+    return made;
+  }
+  const continued = async (env: Record<string, string | undefined>, caseId: string) =>
+    continueCaseAfterCommit(caseId, "customer_return", { env, continuation: await loadCaseContinuationPoint() });
+  function effectsFor(env: Record<string, string | undefined>, made: { gmail: string; threadId: string; ticketId: string }, loseAck?: () => boolean) {
+    const provider = executionProvider(); provider.setGmail(made.gmail, `thread-${made.threadId}`); provider.seedTicket({ id: made.ticketId, ownerId: V2_OWNER, stage: "new" });
+    const counter = { sends: 0 };
+    const pass = () => {
+      const deps = createCaseV2WakeDeps({ env: () => env, policy: { id: policyId, hash: policyHash }, readPolicyRecord, since: new Date(Date.now() - 600_000), deadlineMs: Date.now() + 60_000,
+        network: provider.network as typeof fetch,
+        gmail: { request: async <T,>(mailbox: string, path: string, init?: RequestInit) => {
+          const send = path.replace(/^\//, "") === "messages/send";
+          if (send) counter.sends++;
+          const result = await provider.gmail<T>(mailbox, path, init);
+          if (send && loseAck?.()) throw Error("SAV_TEST_ACK_LOST");
+          return result;
+        }, permissions: async () => {} } });
+      return runCaseEffectsPass({ ...deps.replies, context: { runtime: {} as never, policy: executionPolicy } });
+    };
+    return { counter, pass };
+  }
+  beforeEach(() => { windowStart = Date.now(); });
+
+  it("the bound thread: investigated and answered once, exactly as without the scope", async () => {
+    const env = scoped(await executionEnv()), made = await boundCase(env), net = network();
+    afterSettle();
+    vi.stubGlobal("fetch", vi.fn((url: string, init: RequestInit) => net.net(String(url), init)));
+    expect(await continued(env, made.caseId)).toEqual({ status: "queued" });
+    const run = effectsFor(env, made);
+    await run.pass(); await run.pass();
+    expect(run.counter.sends).toBe(1);
+  });
+  it.each([
+    ["no thread bound yet", false],
+    ["the scope expired", true],
+    ["another thread is bound", "other"],
+  ] as const)("%s: no model call, nothing queued, nothing marked", async (_name, bind) => {
+    const base = await executionEnv(), env = scoped(base), net = network();
+    if (bind === "other") await boundCase(env);
+    const made = bind === true ? await boundCase(env) : await returnedCase(env);
+    afterSettle();
+    if (bind === true) vi.setSystemTime(windowStart + 20 * 60_000);
+    vi.stubGlobal("fetch", vi.fn((url: string, init: RequestInit) => net.net(String(url), init)));
+    expect(await continued(env, made.caseId)).toEqual({ status: "qualification_out_of_scope" });
+    expect(net.calls).toEqual([]);
+    expect(await effectRows(made.caseId)).toHaveLength(0);
+  });
+  it.each([
+    ["before the embedding", (url: string) => url.startsWith("https://api.hubapi.com/"), ":batchEmbedContents"],
+    ["after the embedding, before the model call", (url: string) => url.endsWith(":batchEmbedContents"), ":generateContent"],
+  ] as const)("the scope expires during the investigation, %s: no further provider call, nothing queued", async (_name, expiresAt, never) => {
+    const env = scoped(await executionEnv()), made = await boundCase(env), net = network();
+    afterSettle();
+    let advanced = false;
+    // The clock moves past the window while the entry is already passed: on the owner read (before retrieval) or on the embedding answer (before generation).
+    vi.stubGlobal("fetch", vi.fn(async (url: string, init: RequestInit) => {
+      const response = await net.net(String(url), init);
+      if (!advanced && expiresAt(String(url))) { advanced = true; vi.setSystemTime(windowStart + 20 * 60_000); }
+      return response;
+    }));
+    const outcome = await continued(env, made.caseId);
+    expect(advanced).toBe(true);
+    expect(outcome.status).not.toBe("queued");
+    expect(net.calls.filter(call => call.url.endsWith(never))).toEqual([]);
+    expect(net.calls.filter(call => call.url.endsWith(":generateContent"))).toEqual([]);
+    expect(await effectRows(made.caseId)).toHaveLength(0);
+  });
+  it.each([["control: the scope stays open", false], ["the scope expires between the first model call and its correction", true]] as const)("%s", async (_name, expire) => {
+    const env = scoped(await executionEnv()), made = await boundCase(env);
+    let generations = 0;
+    // First answer: a stale case version (a correctable refusal), then the valid decision: two model calls in one pass when nothing stops it.
+    const net = network({ generate: body => {
+      generations++;
+      if (generations > 1) return decision(body);
+      const text = (body as { contents: { parts: { text: string }[] }[] }).contents[0]!.parts[0]!.text, payload = JSON.parse(text) as { caseVersion: number };
+      return decision({ contents: [{ parts: [{ text: JSON.stringify({ ...payload, caseVersion: payload.caseVersion + 7 }) }] }] });
+    } });
+    afterSettle();
+    vi.stubGlobal("fetch", vi.fn(async (url: string, init: RequestInit) => {
+      const response = await net.net(String(url), init);
+      if (expire && String(url).endsWith(":generateContent")) vi.setSystemTime(windowStart + 20 * 60_000);
+      return response;
+    }));
+    const outcome = await continued(env, made.caseId);
+    expect(generations).toBe(expire ? 1 : 2);
+    expect(outcome.status === "queued").toBe(!expire);
+    // The corrected reply of the control goes all the way (and leaves nothing queued for the next cases); the expired one has nothing to send.
+    const run = effectsFor(env, made);
+    await run.pass();
+    expect(run.counter.sends).toBe(expire ? 0 : 1);
+  });
+  it("a scope JSON without the mode is refused (no silent fallback to the open behaviour)", async () => {
+    const env = scoped(await executionEnv()), made = await boundCase(env), net = network();
+    afterSettle();
+    vi.stubGlobal("fetch", vi.fn((url: string, init: RequestInit) => net.net(String(url), init)));
+    expect(await continued({ ...env, SAV_V2_SCOPE_MODE: undefined }, made.caseId)).toEqual({ status: "qualification_out_of_scope" });
+    expect(net.calls).toEqual([]);
+  });
+  it.each([
+    ["the contact", { hubspotContactId: "100000002" }], ["the sender", { senderEmail: "other@example.invalid" }], ["the subject", { initialSubject: "Autre objet" }],
+  ])("%s changed after the plan, before the dispatch: the queued reply is cancelled, nothing is sent", async (_name, change) => {
+    const env = scoped(await executionEnv()), made = await boundCase(env), net = network();
+    afterSettle();
+    vi.stubGlobal("fetch", vi.fn((url: string, init: RequestInit) => net.net(String(url), init)));
+    expect(await continued(env, made.caseId)).toEqual({ status: "queued" });
+    const run = effectsFor(scoped(env, change), made);
+    const report = await run.pass();
+    expect(report.supervised).toEqual([expect.objectContaining({ state: "refused", reason: "SAV_CASE_EFFECT_CANCELLED_QUALIFICATION_SCOPE" })]);
+    await run.pass();
+    expect(run.counter.sends).toBe(0);
+  });
+  it("the scope expires between the plan and the dispatch: no new send", async () => {
+    const env = scoped(await executionEnv()), made = await boundCase(env), net = network();
+    afterSettle();
+    vi.stubGlobal("fetch", vi.fn((url: string, init: RequestInit) => net.net(String(url), init)));
+    expect(await continued(env, made.caseId)).toEqual({ status: "queued" });
+    vi.setSystemTime(windowStart + 20 * 60_000);
+    const run = effectsFor(env, made);
+    expect((await run.pass()).supervised).toEqual([expect.objectContaining({ state: "refused", reason: "SAV_CASE_EFFECT_CANCELLED_QUALIFICATION_SCOPE" })]);
+    expect(run.counter.sends).toBe(0);
+  });
+  it("the mode removed after the plan (scope JSON left): the reply is held, never sent", async () => {
+    const env = scoped(await executionEnv()), made = await boundCase(env), net = network();
+    afterSettle();
+    vi.stubGlobal("fetch", vi.fn((url: string, init: RequestInit) => net.net(String(url), init)));
+    expect(await continued(env, made.caseId)).toEqual({ status: "queued" });
+    const run = effectsFor({ ...env, SAV_V2_SCOPE_MODE: undefined }, made);
+    expect(JSON.stringify((await run.pass()).supervised)).toContain("SAV_CASE_EFFECT_HOLD_QUALIFICATION_SCOPE");
+    expect(run.counter.sends).toBe(0);
+  });
+  it("an uncertain send, then the scope expires: it is still verified, never sent again", async () => {
+    const env = scoped(await executionEnv()), made = await boundCase(env), net = network();
+    afterSettle();
+    vi.stubGlobal("fetch", vi.fn((url: string, init: RequestInit) => net.net(String(url), init)));
+    expect(await continued(env, made.caseId)).toEqual({ status: "queued" });
+    let first = true;
+    const run = effectsFor(env, made, () => { const lose = first; first = false; return lose; });
+    await run.pass();
+    expect(run.counter.sends).toBe(1);
+    const [uncertain] = await f.db.select().from(savIntakeEffects).where(like(savIntakeEffects.businessKey, `%${made.caseId}%`));
+    vi.setSystemTime(windowStart + 20 * 60_000);
+    await f.client.exec("UPDATE sav.intake_effects SET next_reconcile_at = NULL");
+    await run.pass(); await run.pass();
+    expect(run.counter.sends).toBe(1);
+    // The read-only reconciliation of an engaged effect never passes the scope gate: verified with Gmail, confirmed, the case's execution completed.
+    expect(uncertain?.state).toBe("uncertain");
+    const [verified] = await f.db.select({ state: savIntakeEffects.state }).from(savIntakeEffects).where(eq(savIntakeEffects.businessKey, uncertain!.businessKey));
+    expect(verified?.state).toBe("confirmed");
+    expect(await f.db.select({ state: savCaseEffectExecutions.state }).from(savCaseEffectExecutions).where(eq(savCaseEffectExecutions.caseId, made.caseId))).toEqual([{ state: "confirmed" }]);
+  });
+  it("customer return gate: a mail on another thread is never consumed by V2 (V1 goes on)", async () => {
+    const env = { ...scoped(await executionEnv()), SAV_V2_ENTRY: "on" }, bound = await boundCase(env);
+    const other = await v1Mail({ ownerEffect: true });
+    const id = randomUUID();
+    await f.db.insert(savMessages).values({ id, threadId: other.threadId, mailboxId, direction: "inbound", gmailMessageId: `gm-${id}`, fromEmail: SENDER, toEmails: ["support@example.invalid"],
+      subject: "Re: Synthétique", bodyCiphertext: encryptSavPayload({ text: "Toujours pas de code." }), receivedAt: new Date() });
+    const [run] = await f.db.insert(savIntakeRuns).values({ threadId: other.threadId, messageId: id, version: 99, isCurrent: true, state: "pending", configHash: "syn", policyHash: "syn",
+      payloadCiphertext: encryptSavPayload({}) }).returning();
+    expect(await customerReturnGate(run!.id, { env })).toBeNull();
+    const [after] = await f.db.select().from(savIntakeRuns).where(eq(savIntakeRuns.id, run!.id));
+    expect(after).toMatchObject({ state: "pending", isCurrent: true });
+    expect(bound.caseId).not.toBe(other.caseId);
+  });
+});

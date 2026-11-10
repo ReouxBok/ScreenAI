@@ -13,6 +13,7 @@ import { readIntakeExecutionAuthority } from "../intake/execution-policy";
 import { confirmExecutionEffect, deferExecutionEffect, executionJournal, type ExecutionLease, type ExecutionTx } from "../intake/execution-store";
 import type { PassDriver, VerificationSettlement } from "../intake/executor";
 import type { Effect, EffectAck, EffectIntent, Execution, ExecutionPayload } from "../intake/execution-types";
+import { savV2QualificationCaseAllowed } from "./qualification-scope";
 import { HANDOFF_NOTICE_KEY_PREFIX } from "./case-handoff-notice";
 import { buildCaseNoteAssociateIntent, buildCaseNoteIntent, buildReplySendIntent, type CaseNoteCreateIntent } from "./case-effect-intents";
 import { recordConfirmedCaseReply } from "./case-effect-outcomes";
@@ -33,6 +34,8 @@ import type { CaseEffectPayload } from "./case-reply-store";
 export type { CaseEffectPayload };
 const fault = (code: string): never => { throw Error(`SAV_CASE_EFFECT_${code}`); };
 const LEASE_MS = 80_000;
+/** A configuration that cannot be read now holds; a scope that excludes the case, or expired, cancels. */
+const QUALIFICATION_HOLD = new Set(["qualification_scope_mode_missing", "qualification_scope_mode_invalid", "qualification_scope_missing", "qualification_scope_invalid", "qualification_scope_not_open", "qualification_binding_unreadable"]);
 
 /** What a VERIFICATION-ONLY pass needs: no owner port (a send that already left is verified whoever owns the ticket now). */
 export type CaseEffectRecoveryDriverDeps = Readonly<{
@@ -180,6 +183,10 @@ export function createCaseEffectDriver(deps: CaseEffectDriverDeps): PassDriver {
     const payload = payloads.get(lease)!;
     const { proposal } = payload;
     const facts = await readCaseReplyFacts(tx, proposal, policyRevision, { lockCase: true });
+    // SAV-80, under the case lock, at every look before a NEW plan, marker or send: outside the qualification scope or after it expired the
+    // effect is cancelled; an unreadable scope or binding holds it. A verification of an engaged effect never comes here: it stays possible.
+    const scoped = await savV2QualificationCaseAllowed(deps.env(), proposal.caseId, new Date(), tx);
+    if (!scoped.allowed) return fault(QUALIFICATION_HOLD.has(scoped.reason) ? "HOLD_QUALIFICATION_SCOPE" : "CANCELLED_QUALIFICATION_SCOPE");
     const { check, approval } = await durableApproval(tx, lease, payload);
     // Under the same lock as the marker: the mention of the text must be the one the PERSISTED basis allows (a falsified or swapped basis, or a text under the wrong authority, never reaches a marker).
     if (phase === "reply" && check === "ok" && caseReplyTextProblemForBasis(proposal.text, approval?.basis)) return fault("CANCELLED_AI_NOTICE");

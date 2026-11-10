@@ -16,6 +16,7 @@ import {
 } from "./investigation-v2-providers";
 import { caseV2EmbeddingSpend, caseV2ModelSpend, readCaseV2SpendPolicy, readCaseV2TransportPolicy } from "./investigation-v2-spend";
 import { pilotProvenanceGate, type PilotProvenanceDeps } from "./pilot-passage-provenance";
+import { readSavV2QualificationScope } from "./qualification-scope";
 
 /*
  * B (4/11, LOCAL and OFF): the concrete factory of the V2 investigation, for A's trigger and the wake. One real adapter per port, nothing
@@ -31,6 +32,12 @@ export const SAV_V2_INVESTIGATION_ENV = "SAV_V2_INVESTIGATION";
 export type CaseInvestigationV2Input = Readonly<{
   /** Read at each call, never frozen. */
   env: () => Env;
+  /**
+   * SAV-80: may V2 still spend on THIS case (the qualification scope, read now)? Composed into the pause port, so the runner and the
+   * retrieval read it at the start, before every embedding, after every dispatch mark and before every model call: false, or a failed read, is a
+   * full pause for this case only. Absent: the global pause alone, as before.
+   */
+  caseAllowed?: () => Promise<boolean>;
   /** A's approved admission policy record: REQUIRED, no default (none exists in the repository). */
   readPolicyRecord: (() => Promise<AdmissionPolicyRecord | null>) | null | undefined;
   network?: CaseV2Network;
@@ -52,6 +59,20 @@ export type CaseInvestigationV2Factory =
   | Readonly<{ ok: true; deps: CaseInvestigationRuntimeDeps; provenance: PilotProvenanceDeps }>
   | Readonly<{ ok: false; refusals: readonly string[] }>;
 
+/**
+ * SAV-80. The global pause; then a closed qualification scope (expired, not open, invalid, JSON without the mode), read from the env at every
+ * look and without any database read, is a full pause for every caller; then, when given, the per-case permission (thread bound, configuration
+ * unchanged), whose false or failed read is a full pause for this case.
+ */
+function casePauseState(global: CaseInvestigationRuntimeDeps["pauseState"], env: () => Env, now: () => Date, caseAllowed: CaseInvestigationV2Input["caseAllowed"]): CaseInvestigationRuntimeDeps["pauseState"] {
+  return async () => {
+    const level = await global();
+    if (level === "fully_paused" || readSavV2QualificationScope(env(), now()).mode === "closed") return "fully_paused";
+    if (!caseAllowed) return level;
+    return await caseAllowed().catch(() => false) ? level : "fully_paused";
+  };
+}
+
 /** The V2 investigation's runtime ports and provenance readers, or every precise reason why none is built. */
 export function createCaseInvestigationV2Deps(input: CaseInvestigationV2Input): CaseInvestigationV2Factory {
   const env = input.env(), refusals: string[] = [];
@@ -72,7 +93,7 @@ export function createCaseInvestigationV2Deps(input: CaseInvestigationV2Input): 
     ...(input.approvedRules ? { approvedRules: input.approvedRules } : {}) });
   const deps: CaseInvestigationRuntimeDeps = {
     mode: "observe", holder: input.holder ?? "sav-v2-investigation", scope, now, leaseSeconds: input.leaseSeconds ?? 90,
-    pauseState: caseV2PauseState(), readTicketOwner, accessScope: provenance.accessScope, admissionPolicyRevision: provenance.currentPolicyRevision,
+    pauseState: casePauseState(caseV2PauseState(), input.env, now, input.caseAllowed), readTicketOwner, accessScope: provenance.accessScope, admissionPolicyRevision: provenance.currentPolicyRevision,
     qualify: caseInvestigationReturnAwareQualify(v1Qualify, { readPolicyRecord, now, ...(input.returnRule ? { returnRules: caseReturnContentRule(input.returnRule, now) } : {}) }),
     customerTexts: caseCustomerTextsReader(),
     // What the decision rests on, read now: the contract, the active knowledge revision, the configured model and this prompt.

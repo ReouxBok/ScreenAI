@@ -7,6 +7,7 @@ export async function loadCaseContinuationPoint(): Promise<CaseContinuationPoint
   const { createCaseTicketOwnerPort } = await import("./case-v2-wake-ports");
   const { v2EntryPolicySources } = await import("./v2-entry");
   const { intakeExecutionConfig, readIntakeExecutionAuthority } = await import("../intake/execution-policy");
+  const { savV2QualificationCaseAllowed } = await import("./qualification-scope");
   return async ({ caseId, env }) => {
     if (env.SAV_V2_INVESTIGATION !== "observe") return { status: "investigation_off" };
     const config = intakeExecutionConfig(env);
@@ -19,6 +20,8 @@ export async function loadCaseContinuationPoint(): Promise<CaseContinuationPoint
       ? { ruleId: configuredRule.ruleId, revision: configuredRule.revision } : undefined;
     const binding = createCaseInvestigationToReplyPlan({
       ...v2EntryPolicySources(env), env: source, readTicketOwner, store: { env: source, readTicketOwner },
+      // SAV-80: the qualification scope read again before every new cost of this case (embedding, model call), not only at the entry.
+      caseAllowed: async () => (await savV2QualificationCaseAllowed(env, caseId)).allowed,
       executionPolicy: { id: config.policyId, hash: config.policyHash }, ...(returnRule ? { returnRule } : {}),
     });
     if (!binding.ok) throw Error("SAV_V2_" + (("refusals" in binding ? binding.refusals : binding.missing)[0] ?? "BINDING_INVALID").replace(/[^a-z0-9]/gi,"_").toUpperCase());

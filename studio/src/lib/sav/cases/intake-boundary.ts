@@ -1,4 +1,5 @@
 import "server-only";
+import { savV2QualificationMessageAllowed } from "./qualification-scope";
 import { and, asc, desc, eq, isNotNull, min, sql } from "drizzle-orm";
 import { requireDb } from "@/db";
 import { savCaseEvents, savCases, savIntakeEffects, savIntakeExecutions, savIntakeRuns, savMessages } from "@/db/schema";
@@ -309,12 +310,14 @@ async function relayToCase(input: {
   // No attribution while paused (and no CRM read for it). The creation route reads the CRM owner only for a
   // mail admitted for the agent: a sensitive, mixed or unqualified one is never read. The store decides the
   // admission again under its lock.
-  let attribution = input.attribution !== "pending" && await relayPaused(requireDb()) ? "pending" as const : input.attribution;
+  // SAV-80: outside the qualification scope the mail is recorded, never attributed to the agent (no owner read for it either).
+  const inScope = (await savV2QualificationMessageAllowed(input.deps.env ?? process.env, input.relay.messageId)).allowed;
+  let attribution = !inScope || (input.attribution !== "pending" && await relayPaused(requireDb())) ? "pending" as const : input.attribution;
   if (attribution !== "pending" && attribution.kind === "hubspot_owner_at_creation")
     attribution = decideCaseAdmission({ policy: admission.policy, qualification: admission.qualification, caseSensitivity: "none" }).target === "agent"
       ? await confirmCreatedOwner(attribution, input.deps) : "pending";
   // No V1 owner effect for this mail: the owner as it reads now is enough. An acknowledgement opens nothing and proves no ticket: it never takes this route.
-  else if (input.attribution === "pending" && input.relay.kind === "intake_effects_confirmed")
+  else if (inScope && input.attribution === "pending" && input.relay.kind === "intake_effects_confirmed")
     attribution = await ownerReadProof({ ticketId: input.ticketId, messageId: input.relay.messageId, admission, deps: input.deps });
   const subjects = requests.length ? await readRequestSubjects({ runId: input.relay.intakeRunId, runVersion: input.relay.intakeRunVersion, messageId: input.relay.messageId,
     gmailMessageId: input.gmailMessageId, requestIds: input.decision.requests.filter(request => request.kind !== "acknowledgement").map(request => request.id) }) : new Map<string, CaseRequestSubject>();
