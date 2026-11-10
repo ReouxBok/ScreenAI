@@ -20,6 +20,7 @@ import { caseDedupeKey } from "./case-types";
 import type { CaseRequestFamily } from "./case-types";
 import { routeCustomerReturn, type CustomerReturnDeps } from "./customer-return-store";
 import { v2OwnerAtCreationPort } from "./owner-attribution";
+import { bindSavV2QualificationThread, savV2QualificationCaseAllowed, savV2QualificationMessageAllowed } from "./qualification-scope";
 import { firstPersonalLoginRequest } from "./investigation-return-qualify";
 import type { ExecutorAdapters } from "../intake/execution-types";
 import { SAV_INTAKE_CONTRACT_REVISION } from "../intake/contract";
@@ -69,7 +70,7 @@ export const creationOwnerForIntake = async (env: Env, input: Parameters<NonNull
     || disposition.target.contactId !== disposition.contactScope.primaryContactId)
     return { assign: false as const, reason: "not_admitted" };
   const sources = v2EntryPolicySources(env);
-  return v2OwnerAtCreationPort({ env,
+  const decided = await v2OwnerAtCreationPort({ env,
     readAdmissionPolicy: admissionPolicyPort({ read: sources.readPolicyRecord, now: () => new Date() }),
     readQualification: async ({messageId, gmailMessageId, requests}) => {
       if (signal.aborted || await intakeHumanRefused(messageId)) return null;
@@ -77,6 +78,11 @@ export const creationOwnerForIntake = async (env: Env, input: Parameters<NonNull
       return { ...qualification, requests: await firstAccessEvidence(env, messageId, gmailMessageId, requests) };
     },
   })(input);
+  if (!decided.assign) return decided;
+  // SAV-80: in qualification mode only the first admissible thread of the exact sender, contact, subject and window gets the V2 owner;
+  // it is bound here, at this check and at the final pre-dispatch one alike. Anything else: no V2 owner, V1 creates its ticket as today.
+  const scoped = await bindSavV2QualificationThread(env, { messageId: decision.messageId, primaryContactId: disposition.contactScope.primaryContactId });
+  return scoped.allowed ? decided : { assign: false as const, reason: "not_admitted" as const };
 };
 
 /** One authenticated GET on V1's own HubSpot transport. Throws on anything but a 2xx: a failed read is never « no owner ». */
@@ -119,6 +125,8 @@ export function v2EntryRelayDeps(env: Env, input: Omit<EntryDeps, "env"> = {}): 
   return {
     env, ...admissionSources(env), readCreatedTicketOwner: sources.readTicketOwner!,
     routeReturn: async (messageId): Promise<CaseRelayResult | null> => {
+      // SAV-80: outside the qualification scope a mail is never routed as a V2 return; the normal relay goes on.
+      if (!(await savV2QualificationMessageAllowed(env, messageId)).allowed) return null;
       const outcome = await routeCustomerReturn(messageId, sources);
       if ("skipped" in outcome) return null;
       if (outcome.written) return { caseId: outcome.record.case.caseId, version: outcome.record.case.version, created: false, appended: !outcome.record.replayed, owner: outcome.record.case.owner,
@@ -192,6 +200,8 @@ export async function customerReturnGate(runId: string, input: EntryDeps): Promi
   if (pause.invalid || pause.level === "fully_paused") return null;
   const [source] = await db.select({ gmail: savMessages.gmailMessageId }).from(savMessages).where(eq(savMessages.id, run.messageId));
   if (await consumedByReturn(source?.gmail ?? null)) return stopConsumedRun(run);
+  // SAV-80: outside the qualification scope (another thread, another sender, no or an expired scope) V2 takes nothing: V1 goes on.
+  if (!(await savV2QualificationMessageAllowed(input.env, run.messageId)).allowed) return null;
   if (!run.isCurrent || run.attempts !== 0 || run.leaseToken || !["pending", "waiting"].includes(run.state)) return null;
   const [execution] = await db.select({ id: savIntakeExecutions.id }).from(savIntakeExecutions).where(eq(savIntakeExecutions.messageId, run.messageId));
   const [thread] = await db.select({ aiPaused: savThreads.aiPaused }).from(savThreads).where(eq(savThreads.id, run.threadId));
@@ -244,6 +254,9 @@ export type CaseContinuationOutcome = { status: string } | { status: "failed"; c
 /** Called after the commit, on every path. It never undoes or fails what was committed; what went wrong is logged and marked, and the sweep tries the case again. */
 export async function continueCaseAfterCommit(caseId: string, trigger: CaseContinuationTrigger, input: EntryDeps): Promise<CaseContinuationOutcome> {
   let code: string;
+  // SAV-80: no investigation, retrieval or model cost for a case outside the qualification scope or after it expired. Not a failure: nothing is marked.
+  const scoped = await savV2QualificationCaseAllowed(input.env, caseId).catch(() => ({ allowed: false as const, reason: "qualification_unreadable" }));
+  if (!scoped.allowed) return { status: "qualification_out_of_scope" };
   try {
     const point = input.continuation === undefined ? await loadCaseContinuationPoint() : input.continuation;
     if (point) {
