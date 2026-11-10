@@ -1,0 +1,561 @@
+{
+  "schema": "sav-block-harness.cases.v1",
+  "note": "Cas synthétiques uniquement (aucune donnée client). Ajouter une entrée puis relancer la même commande. requests: [famille, provenance] avec provenance human | rule:<ruleId>@<revision> | hint.",
+  "policies": {
+    "standard": {
+      "revision": "policy-h1",
+      "admittedFamilies": [
+        "access",
+        "usage"
+      ],
+      "qualifiedRules": [
+        {
+          "ruleId": "rule-access",
+          "revision": "r1",
+          "families": [
+            "access"
+          ]
+        }
+      ]
+    },
+    "access-only": {
+      "revision": "policy-h2",
+      "admittedFamilies": [
+        "access"
+      ],
+      "qualifiedRules": []
+    },
+    "none": null,
+    "invalid": {
+      "revision": "policy-bad",
+      "admittedFamilies": [
+        "finance"
+      ],
+      "qualifiedRules": []
+    }
+  },
+  "admission": [
+    {
+      "id": "access.human.admitted",
+      "family": "access",
+      "policy": "standard",
+      "requests": [
+        [
+          "access",
+          "human"
+        ]
+      ],
+      "expect": {
+        "target": "agent",
+        "reasons": [
+          "admitted"
+        ]
+      }
+    },
+    {
+      "id": "access.rule.admitted",
+      "family": "access",
+      "policy": "standard",
+      "requests": [
+        [
+          "access",
+          "rule:rule-access@r1"
+        ]
+      ],
+      "expect": {
+        "target": "agent",
+        "reasons": [
+          "admitted"
+        ]
+      }
+    },
+    {
+      "id": "access.rule.stale-revision",
+      "family": "access",
+      "policy": "standard",
+      "requests": [
+        [
+          "access",
+          "rule:rule-access@r0"
+        ]
+      ],
+      "expect": {
+        "target": "qualification",
+        "reasons": [
+          "qualification_unproven"
+        ]
+      }
+    },
+    {
+      "id": "access.hint.never-admits",
+      "family": "access",
+      "policy": "standard",
+      "requests": [
+        [
+          "access",
+          "hint"
+        ]
+      ],
+      "expect": {
+        "target": "qualification",
+        "reasons": [
+          "qualification_unproven"
+        ]
+      }
+    },
+    {
+      "id": "usage.rule-not-listed",
+      "family": "usage",
+      "policy": "standard",
+      "requests": [
+        [
+          "usage",
+          "rule:rule-access@r1"
+        ]
+      ],
+      "expect": {
+        "target": "qualification",
+        "reasons": [
+          "qualification_unproven"
+        ]
+      }
+    },
+    {
+      "id": "usage.not-admitted-by-policy",
+      "family": "usage",
+      "policy": "access-only",
+      "requests": [
+        [
+          "usage",
+          "human"
+        ]
+      ],
+      "expect": {
+        "target": "qualification",
+        "reasons": [
+          "family_not_admitted"
+        ]
+      }
+    },
+    {
+      "id": "integration.not-admissible",
+      "family": "integration",
+      "policy": "standard",
+      "requests": [
+        [
+          "integration",
+          "human"
+        ]
+      ],
+      "expect": {
+        "target": "qualification",
+        "reasons": [
+          "family_not_admitted"
+        ]
+      }
+    },
+    {
+      "id": "telephony.charly-max.not-admissible",
+      "family": "telephony",
+      "policy": "standard",
+      "requests": [
+        [
+          "telephony",
+          "human"
+        ]
+      ],
+      "expect": {
+        "target": "qualification",
+        "reasons": [
+          "family_not_admitted"
+        ]
+      }
+    },
+    {
+      "id": "rights.collaborator.team",
+      "family": "rights",
+      "policy": "standard",
+      "requests": [
+        [
+          "rights",
+          "human"
+        ]
+      ],
+      "expect": {
+        "target": "team",
+        "reasons": [
+          "sensitive_family"
+        ]
+      }
+    },
+    {
+      "id": "finance.team",
+      "family": "finance",
+      "policy": "standard",
+      "requests": [
+        [
+          "finance",
+          "hint"
+        ]
+      ],
+      "expect": {
+        "target": "team",
+        "reasons": [
+          "sensitive_family"
+        ],
+        "sensitivity": "finance"
+      }
+    },
+    {
+      "id": "cancellation.team",
+      "family": "cancellation",
+      "policy": "standard",
+      "requests": [
+        [
+          "cancellation",
+          "hint"
+        ]
+      ],
+      "expect": {
+        "target": "team",
+        "reasons": [
+          "sensitive_family"
+        ],
+        "sensitivity": "cancellation"
+      }
+    },
+    {
+      "id": "multi.access+finance.whole-case-team",
+      "family": "multi",
+      "policy": "standard",
+      "requests": [
+        [
+          "access",
+          "human"
+        ],
+        [
+          "finance",
+          "hint"
+        ]
+      ],
+      "expect": {
+        "target": "team",
+        "reasons": [
+          "sensitive_family",
+          "mixed_sensitive"
+        ],
+        "sensitivity": "finance"
+      }
+    },
+    {
+      "id": "multi.access+usage.admitted",
+      "family": "multi",
+      "policy": "standard",
+      "requests": [
+        [
+          "access",
+          "human"
+        ],
+        [
+          "usage",
+          "human"
+        ]
+      ],
+      "expect": {
+        "target": "agent",
+        "reasons": [
+          "admitted"
+        ]
+      }
+    },
+    {
+      "id": "multi.access+unknown.qualify",
+      "family": "multi",
+      "policy": "standard",
+      "requests": [
+        [
+          "access",
+          "human"
+        ],
+        [
+          "unknown",
+          "hint"
+        ]
+      ],
+      "expect": {
+        "target": "qualification",
+        "reasons": [
+          "family_unknown"
+        ]
+      }
+    },
+    {
+      "id": "case.sensitive.overrides",
+      "family": "access",
+      "policy": "standard",
+      "caseSensitivity": "cancellation",
+      "requests": [
+        [
+          "access",
+          "human"
+        ]
+      ],
+      "expect": {
+        "target": "team",
+        "reasons": [
+          "case_sensitive"
+        ],
+        "sensitivity": "cancellation"
+      }
+    },
+    {
+      "id": "confirmed-bug.team",
+      "family": "technical",
+      "policy": "standard",
+      "teamSignals": [
+        "confirmed_bug"
+      ],
+      "requests": [
+        [
+          "access",
+          "human"
+        ]
+      ],
+      "expect": {
+        "target": "team",
+        "reasons": [
+          "confirmed_bug"
+        ]
+      }
+    },
+    {
+      "id": "policy.missing",
+      "family": "access",
+      "policy": "none",
+      "requests": [
+        [
+          "access",
+          "human"
+        ]
+      ],
+      "expect": {
+        "target": "qualification",
+        "reasons": [
+          "policy_missing"
+        ]
+      }
+    },
+    {
+      "id": "policy.invalid",
+      "family": "access",
+      "policy": "invalid",
+      "requests": [
+        [
+          "access",
+          "human"
+        ]
+      ],
+      "expect": {
+        "target": "qualification",
+        "reasons": [
+          "policy_invalid"
+        ]
+      }
+    },
+    {
+      "id": "no-request.qualify",
+      "family": "other",
+      "policy": "standard",
+      "requests": [],
+      "expect": {
+        "target": "qualification",
+        "reasons": [
+          "no_request"
+        ]
+      }
+    },
+    {
+      "id": "identity.ambiguous",
+      "family": "access",
+      "policy": "standard",
+      "identity": "ambiguous",
+      "requests": [
+        [
+          "access",
+          "human"
+        ]
+      ],
+      "expect": {
+        "target": "qualification",
+        "reasons": [
+          "identity_unconfirmed"
+        ]
+      }
+    },
+    {
+      "id": "crm.incomplete",
+      "family": "access",
+      "policy": "standard",
+      "crmContext": "incomplete",
+      "requests": [
+        [
+          "access",
+          "human"
+        ]
+      ],
+      "expect": {
+        "target": "qualification",
+        "reasons": [
+          "context_incomplete"
+        ]
+      }
+    }
+  ],
+  "status": [
+    {
+      "id": "owner.human-hold",
+      "owner": "human",
+      "admission": {
+        "target": "agent",
+        "policyRevision": "policy-h1",
+        "inputVersion": 3
+      },
+      "admissionInputVersion": 3,
+      "currentPolicy": "policy-h1",
+      "expect": "owner_not_agent"
+    },
+    {
+      "id": "owner.agent.admitted",
+      "owner": "agent",
+      "admission": {
+        "target": "agent",
+        "policyRevision": "policy-h1",
+        "inputVersion": 3
+      },
+      "admissionInputVersion": 3,
+      "currentPolicy": "policy-h1",
+      "expect": "admitted"
+    },
+    {
+      "id": "new-input.stale",
+      "owner": "agent",
+      "admission": {
+        "target": "agent",
+        "policyRevision": "policy-h1",
+        "inputVersion": 3
+      },
+      "admissionInputVersion": 4,
+      "currentPolicy": "policy-h1",
+      "expect": "input_newer"
+    },
+    {
+      "id": "policy.changed",
+      "owner": "agent",
+      "admission": {
+        "target": "agent",
+        "policyRevision": "policy-h1",
+        "inputVersion": 3
+      },
+      "admissionInputVersion": 3,
+      "currentPolicy": "policy-h2",
+      "expect": "policy_changed"
+    },
+    {
+      "id": "policy.withdrawn",
+      "owner": "agent",
+      "admission": {
+        "target": "agent",
+        "policyRevision": "policy-h1",
+        "inputVersion": 3
+      },
+      "admissionInputVersion": 3,
+      "currentPolicy": null,
+      "expect": "policy_missing"
+    },
+    {
+      "id": "not-admitted",
+      "owner": "agent",
+      "admission": {
+        "target": "team",
+        "policyRevision": "policy-h1",
+        "inputVersion": 3
+      },
+      "admissionInputVersion": 3,
+      "currentPolicy": "policy-h1",
+      "expect": "not_admitted"
+    },
+    {
+      "id": "no-admission",
+      "owner": "agent",
+      "admission": null,
+      "admissionInputVersion": 0,
+      "currentPolicy": "policy-h1",
+      "expect": "no_admission"
+    }
+  ],
+  "ticketReturn": [
+    {
+      "id": "closed.exactly-15-days.reactivate",
+      "status": "closed",
+      "closedAt": "2026-10-01T10:00:00.000Z",
+      "returnedAt": "2026-10-16T10:00:00.000Z",
+      "expect": "reactivate"
+    },
+    {
+      "id": "closed.15-days-plus-1ms.create",
+      "status": "closed",
+      "closedAt": "2026-10-01T10:00:00.000Z",
+      "returnedAt": "2026-10-16T10:00:00.001Z",
+      "expect": "create"
+    },
+    {
+      "id": "closed.1-day.reactivate",
+      "status": "closed",
+      "closedAt": "2026-10-01T10:00:00.000Z",
+      "returnedAt": "2026-10-02T10:00:00.000Z",
+      "expect": "reactivate"
+    },
+    {
+      "id": "closed.no-date.review",
+      "status": "closed",
+      "closedAt": null,
+      "returnedAt": "2026-10-02T10:00:00.000Z",
+      "expect": "review"
+    },
+    {
+      "id": "closed.after-return.review",
+      "status": "closed",
+      "closedAt": "2026-10-03T10:00:00.000Z",
+      "returnedAt": "2026-10-02T10:00:00.000Z",
+      "expect": "review"
+    },
+    {
+      "id": "open.new.keep",
+      "status": "open",
+      "stage": "new",
+      "returnedAt": "2026-10-02T10:00:00.000Z",
+      "expect": "keep"
+    },
+    {
+      "id": "open.awaiting-contact.reactivate",
+      "status": "open",
+      "stage": "awaitingContact",
+      "returnedAt": "2026-10-02T10:00:00.000Z",
+      "expect": "reactivate"
+    },
+    {
+      "id": "open.awaiting-team.reactivate",
+      "status": "open",
+      "stage": "awaitingTeam",
+      "returnedAt": "2026-10-02T10:00:00.000Z",
+      "expect": "reactivate"
+    },
+    {
+      "id": "open.unknown-stage.review",
+      "status": "open",
+      "stage": "unknown",
+      "returnedAt": "2026-10-02T10:00:00.000Z",
+      "expect": "review"
+    }
+  ]
+}

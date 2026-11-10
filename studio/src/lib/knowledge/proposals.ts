@@ -12,6 +12,7 @@ import { assertSavLearningAdmitted } from "@/lib/sav/learning-origin";
 import { assertSavCrmLearningSource } from "@/lib/sav/learning-source";
 import { assertKnowledgeCandidateReview, assertKnowledgeUgoApproval, canonicalKnowledgeSchema, semanticStepSchema, type CanonicalKnowledge } from "./contracts";
 import { assertSafeKnowledgeDraft, assertSafeOnboardingKnowledge } from "./onboarding-extraction";
+import { inheritedTemporaryIncident } from "./temporary-incidents-read";
 import { savQualifiedProjectionBody as savProjectionBody } from "./conversion";
 import { knowledgeComparisonInventory, prepareHubspotReview } from "./hubspot-import";
 import { prepareOnboardingReview } from "./onboarding-import";
@@ -154,12 +155,15 @@ export async function saveSavKnowledgeProposal(raw: SaveSavKnowledgeProposalInpu
       if (retained) return draftWithDelivery(retained, tx);
     }
     const learning = input.learningCandidateId ? await readSavLearningEvidence(input.learningCandidateId, tx, true) : null;
+    // SAV-79: an improvement rebuilt from the published version must not silently drop the approved temporary incident.
+    const inherited = input.mode === "improve" && input.targetItemId && !input.document.temporaryIncident ? await inheritedTemporaryIncident(input.targetItemId, tx) : undefined;
+    const document = inherited ? { ...input.document, temporaryIncident: inherited } : input.document;
     const values = { mode: input.mode, targetItemId: input.targetItemId ?? null, baseVersionId: target.base?.id ?? null, activeVersionId: target.active?.versionId ?? null,
       title: target.base?.metadata.sourceMetadata?.importKind === "onboarding_catalog" ? target.item!.title : input.title,
-      document: input.document, sources: input.sources, reason: input.reason, origin: existing?.origin ?? (learning ? "automatic" : "human"), learningCandidateId: input.learningCandidateId ?? null, learningSourceHash: learning?.fingerprint ?? null,
+      document, sources: input.sources, reason: input.reason, origin: existing?.origin ?? (learning ? "automatic" : "human"), learningCandidateId: input.learningCandidateId ?? null, learningSourceHash: learning?.fingerprint ?? null,
       revision: (existing?.revision ?? 0) + 1, updatedAt: new Date() };
     const [draft] = existing ? await tx.update(savKnowledgeProposalDrafts).set(values).where(eq(savKnowledgeProposalDrafts.id, existing.id)).returning() : await tx.insert(savKnowledgeProposalDrafts).values({ ...values, createdBy: actorEmail }).returning();
-    await tx.insert(auditLogs).values({ actorEmail, action: "sav_knowledge_proposal_saved", entityType: "knowledge_draft", entityId: draft.id, technicalMetadata: { revision: draft.revision, targetItemId: draft.targetItemId, origin: draft.origin, delivery: JSON.stringify(createSavDeliveryEnvelope(input.document, delivery)) } });
+    await tx.insert(auditLogs).values({ actorEmail, action: "sav_knowledge_proposal_saved", entityType: "knowledge_draft", entityId: draft.id, technicalMetadata: { revision: draft.revision, targetItemId: draft.targetItemId, origin: draft.origin, delivery: JSON.stringify(createSavDeliveryEnvelope(document, delivery)) } });
     return { ...toSavKnowledgeDraft(draft), delivery };
   };
   return transaction ? persist(transaction) : requireDb().transaction(persist);
@@ -240,6 +244,12 @@ export async function submitSavKnowledgeProposal(input: { draftId: string; snaps
   });
 }
 
+/** SAV-79: a reviewer correction that omits the temporary incident keeps the submitted one; ending it is a revocation, never an omission. */
+function keepRevisionTemporaryIncident(raw: unknown, revisionDocument: unknown) {
+  if (!raw || typeof raw !== "object" || "temporaryIncident" in raw) return raw;
+  const stored = (revisionDocument as { temporaryIncident?: unknown }).temporaryIncident;
+  return stored === undefined ? raw : { ...raw, temporaryIncident: stored };
+}
 export async function previewSavKnowledgeReview(candidateId: string, actorEmail: string, rawDocument?: unknown, db: Db = requireDb()) {
   assertSavActor(actorEmail);
   const [candidate] = await db.select().from(knowledgeProjectionCandidates).where(eq(knowledgeProjectionCandidates.id, candidateId));
@@ -247,7 +257,7 @@ export async function previewSavKnowledgeReview(candidateId: string, actorEmail:
   const [source] = await db.select().from(knowledgeFamilySources).where(eq(knowledgeFamilySources.id, candidate.sourceId));
   const [revision] = await db.select().from(knowledgeFamilyRevisions).where(eq(knowledgeFamilyRevisions.id, candidate.revisionId));
   if (!source || !revision) throw new Error("KNOWLEDGE_PROVENANCE_REQUIRED");
-  const document = canonicalKnowledgeSchema.parse(rawDocument ?? revision.document);
+  const document = canonicalKnowledgeSchema.parse(keepRevisionTemporaryIncident(rawDocument, revision.document) ?? revision.document);
   let delivery = unclassifiedSavDelivery;
   if (source.evidence.importKind === "sav_workspace" && source.evidence.delivery) {
     // Bind the submitted qualification to its immutable source first. A review
@@ -290,7 +300,7 @@ export async function reviewSavKnowledgeProposal(input: { candidateId: string; e
   if (input.decision === "reject") return reviewKnowledgeCandidate(input.candidateId, { expectedRevisionId: input.expectedRevisionId, decision: "reject", reason: input.reason }, actorEmail);
   const preview = await previewSavKnowledgeReview(input.candidateId, actorEmail, input.document);
   if (preview.snapshot !== input.snapshot || preview.candidate.revisionId !== input.expectedRevisionId) throw new Error("KNOWLEDGE_REVIEW_STALE");
-  return reviewKnowledgeCandidate(input.candidateId, { expectedRevisionId: input.expectedRevisionId, decision: input.decision, reason: input.reason, document: input.document, comparison: { snapshot: preview.legacySnapshot ?? input.snapshot, acknowledged: true }, workspaceSnapshot: input.snapshot }, actorEmail);
+  return reviewKnowledgeCandidate(input.candidateId, { expectedRevisionId: input.expectedRevisionId, decision: input.decision, reason: input.reason, document: keepRevisionTemporaryIncident(input.document, preview.revision.document), comparison: { snapshot: preview.legacySnapshot ?? input.snapshot, acknowledged: true }, workspaceSnapshot: input.snapshot }, actorEmail);
 }
 export async function requestSavKnowledgeCompletion(input: { candidateId: string; expectedRevisionId: string; reason: string }, actorEmail: string) {
   assertKnowledgeCandidateReview(actorEmail, "sav");
