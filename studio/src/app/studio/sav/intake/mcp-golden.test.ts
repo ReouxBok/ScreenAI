@@ -84,7 +84,7 @@ it("SAV-25 list_dossiers states the console rows, labels and counters", async ()
   expect(html).not.toContain("SAV_INTAKE_RUNTIME_DAILY_BUDGET_DEFERRED");
   expect(JSON.stringify(data)).not.toContain("SAV_INTAKE_RUNTIME_DAILY_BUDGET_DEFERRED\"");
 });
-it.each([["cost", "Coût IA à confirmer"], ["effect", "Action HubSpot ou Gmail à vérifier"], ["both", "Coût IA et action externe à vérifier"], ["unknown", "Incertitude à qualifier"]] as const)(
+it.each([["cost", "Coût IA à confirmer"], ["effect", "Action HubSpot ou Gmail à vérifier"], ["both", "Coût IA et action externe à vérifier"], ["unknown", "Incertitude à qualifier"], ["unread", "Incertitude non lue : coût IA ou action HubSpot ou Gmail possible, à vérifier avant tout renvoi"]] as const)(
   "M1 MCP tools name the same %s uncertainty as the console", async (uncertainty, label) => {
   mocks.list.mockResolvedValue({ ...list, rows: [{ ...list.rows[0], status: "uncertain", reason: null, uncertainty }] });
   const html = renderToStaticMarkup(createElement(Fragment, null, await IntakeConsolePage({ searchParams: Promise.resolve({}) })));

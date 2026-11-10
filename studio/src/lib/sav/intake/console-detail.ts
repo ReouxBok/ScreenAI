@@ -1,6 +1,7 @@
-import { readIntakeUncertainties } from "./uncertainty-read";
+import { readIntakeUncertaintiesOrUnread } from "./uncertainty-read";
 import { intakeThreadHumanHeld } from "./legacy-pause";
-import { getSavExternalCompletion, readSavExternalCompletion, savExternalDisposition } from "../external-completion";
+import { getSavExternalCompletion, readSavCompletionBlockers, readSavCompletionPrecheck, readSavExternalCompletion, savExternalDisposition } from "../external-completion";
+import type { SavCompletionBlocker, SavCompletionPrecheck } from "../completion-blockers";
 import "server-only";
 import { intakeAttachmentBody } from "./attachment-display";
 import { and, desc, eq } from "drizzle-orm";
@@ -13,6 +14,7 @@ import { intakeMessageHistorical } from "./launch-boundary";
 import { readSavIntakeCurrent } from "./runtime-store";
 import { readIntakeRunDiagnostics } from "./run-diagnostics";
 import { readIntakeExecutionProgress } from "./executor";
+import { readIntakeExecutionAuthorityState } from "./execution-policy";
 import type { HumanEventPayload } from "./human-binding";
 import { savEffectiveReceivedAt } from "@/lib/sav/message-order";
 export async function readIntakeConsoleDetail(threadId: string) {
@@ -50,8 +52,19 @@ export async function readIntakeConsoleDetail(threadId: string) {
   const progress=latest ? await readIntakeExecutionProgress(latest.id) : null;
   const diagnostics=await readIntakeRunDiagnostics(threadId);
   const confirmedCurrent=Boolean(!marker && current && current.messageId===latest?.id && progress?.confirmed && progress.runId===current.id && progress.completionSourceHash && progress.completionSourceHash===current.currentSourceHash);
-  const uncertainty = latest ? await db.transaction(async tx => (await readIntakeUncertainties(tx, [latest.id]))[latest.id], { accessMode: "read only", isolationLevel: "repeatable read" }) : null;
-  return { uncertainty, confirmedCurrent, humanHeld, thread: { id: thread.id, subject: latest?.subject ?? thread.subject, paused: thread.aiPaused, ticketId: thread.hubspotTicketId },
+  // A failed read shows `unread` (warning kept, no absence claimed) instead of failing the whole detail page.
+  // Night V1 (A + cycle 1): the server's completion refusals (pre-checks, then blockers), so the page and the MCP never
+  // offer « Terminés » it would refuse; only `source_changed` (version guard under lock) stays server-side. A failed
+  // read fails closed like `unread` below: not offered, page readable, no absence claimed (M-5).
+  let completionBlockers: SavCompletionBlocker[] = [], completionPrecheck: SavCompletionPrecheck | null = null;
+  if (latest) {
+    try { completionBlockers = await readSavCompletionBlockers(threadId, db); completionPrecheck = await readSavCompletionPrecheck(threadId, latest.id, db); }
+    catch { console.error("sav_intake_completion_blockers_unread", { threadId }); completionBlockers = ["unreadable"]; completionPrecheck = null; }
+  }
+  // Night V1 (C): an observed decision without execution states WHY automatic execution cannot start (read-only).
+  const executionAuthority = current?.state === "observed" && !progress ? await readIntakeExecutionAuthorityState().catch(() => "unreadable" as const) : null;
+  const uncertainty = latest ? (await readIntakeUncertaintiesOrUnread([latest.id], read => db.transaction(read, { accessMode: "read only", isolationLevel: "repeatable read" })))[latest.id] ?? null : null;
+  return { uncertainty, completionBlockers, completionPrecheck, executionAuthority, confirmedCurrent, humanHeld, thread: { id: thread.id, subject: latest?.subject ?? thread.subject, paused: thread.aiPaused, ticketId: thread.hubspotTicketId },
     projection, handledExternally: Boolean(marker), latestMessageId: latest?.id ?? null, current, messages, historyTruncated: rows.length > 200,
     progress, choices, diagnostics };
 }

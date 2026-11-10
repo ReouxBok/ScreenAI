@@ -95,6 +95,34 @@ export async function readIntakeExecutionAuthority(config: ExecutionConfig, now 
         row, staff, policy
     };
 }
+/** Night V1 (C): why automatic execution can or cannot start now, read-only, for the console and the MCP.
+ * Production evidence: observed runs ended with SAV_INTAKE_EXECUTION_POLICY_EXPIRED after a redeploy, while the
+ * console only said « Analyse prête, actions en attente ». Codes only: no hash, id, secret or customer data. */
+import type { IntakeExecutionAuthorityState } from "./execution-authority";
+export type { IntakeExecutionAuthorityState } from "./execution-authority";
+export async function readIntakeExecutionAuthorityState(env: Record<string, string | undefined> = process.env, now = new Date()): Promise<IntakeExecutionAuthorityState> {
+    let config: ExecutionConfig | null;
+    try { config = intakeExecutionConfig(env); }
+    catch (error) { return error instanceof Error && error.message === "SAV_INTAKE_EXECUTION_DISABLED" ? "disabled" : "configuration_required"; }
+    if (!config) return "off";
+    // Night V1 cycle 1 (M-2): the same checks as readIntakeExecutionAuthority, in its order, each named exactly
+    // (no "revoked" for a missing row or an env hash mismatch, no "expired" for an incoherent payload). Read-only.
+    try {
+        const db = requireDb(), [row] = await db.select().from(savIntakeExecutionPolicies).where(eq(savIntakeExecutionPolicies.id, config.policyId));
+        if (!row) return "policy_missing";
+        if (row.state === "revoked") return "revoked";
+        if (row.state !== "approved") return "not_approved";
+        if (row.policyHash !== config.policyHash) return "configuration_mismatch";
+        const [staff] = await db.select().from(staffUsers).where(eq(staffUsers.id, row.administratorId));
+        if (!staff?.active || !["admin", "owner"].includes(staff.role) || !canAccessSav(staff.email, staff.role)) return "approver_unauthorized";
+        let policy: z.infer<typeof executionPolicySchema>;
+        try { policy = executionPolicySchema.parse(decryptSavPayload(row.payloadCiphertext)); } catch { return "unreadable"; }
+        if (intakeRuntimeHash(policy) !== row.policyHash) return "policy_incoherent";
+        if (policy.codeRevision !== config.codeRevision) return "code_revision_changed";
+        if (Date.parse(policy.expiresAt) <= now.getTime() || policy.budgetProfile === SAV_INTAKE_OPERATIONAL_PROFILE && !intakeOperationalTermValid(policy.expiresAt, now)) return "expired";
+        return "valid";
+    } catch { return "unreadable"; }
+}
 /** Revocation persists independently of directory provisioning. Approval always
  * creates another policy; this primitive never resurrects a revoked record. */
 export async function revokeIntakeExecutionPolicy(policyId: string, reason: string) {

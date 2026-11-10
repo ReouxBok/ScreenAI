@@ -18,14 +18,45 @@ import type { CaseV2ModelTransport } from "./investigation-v2-spend";
 /*
  * B (4/11, LOCAL and OFF): the real adapters of the V2 investigation. Each talks to its provider through an injected `network` (`fetch` by
  * default), so a test replaces the network and nothing else. Keys and models are read from the environment at each call, never cached,
- * never defaulted; V2 has its own key (`SAV_V2_GEMINI_API_KEY`), never V1's. No SDK, no retry here: a call is sent at most once (the
- * ledger and the spend register decide), and an error body is never read nor logged.
+ * never defaulted. The key is V2's own (`SAV_V2_GEMINI_API_KEY`) unless the approved, non-secret `SAV_V2_GEMINI_KEY_SOURCE=shared_v1`
+ * names V1's key (`SAV_GEMINI_API_KEY`) explicitly: no silent fallback either way, an unknown source or both keys at once is refused.
+ * The models stay V2's own and every V2 bound, budget and permission still applies. No SDK, no retry here: a call is sent at most once
+ * (the ledger and the spend register decide), and an error body is never read nor logged.
  */
 
 type Env = Readonly<Record<string, string | undefined>>;
 export type CaseV2Network = (url: string, init: RequestInit) => Promise<Response>;
 const GEMINI = "https://generativelanguage.googleapis.com/v1beta/models";
 export const SAV_V2_GEMINI_KEY_ENV = "SAV_V2_GEMINI_API_KEY";
+/** Non-secret selector of the V2 key. Absent or `dedicated`: V2's own key only. `shared_v1`: V1's key only (approved sharing). */
+export const SAV_V2_GEMINI_KEY_SOURCE_ENV = "SAV_V2_GEMINI_KEY_SOURCE";
+export const SAV_V1_GEMINI_KEY_ENV = "SAV_GEMINI_API_KEY";
+export type CaseV2GeminiKeySource = "dedicated" | "shared_v1";
+export type CaseV2GeminiKey =
+  | Readonly<{ ok: true; source: CaseV2GeminiKeySource; key: string }>
+  | Readonly<{ ok: false; problem: "v2_gemini_key_source_invalid" | "v2_gemini_key_source_conflict" | "v2_gemini_key_absent" | "v2_shared_v1_gemini_key_absent" }>;
+
+/**
+ * The key V2 sends, chosen ONLY by the explicit source: `dedicated` never reads V1's key, `shared_v1` never reads V2's. A shared source
+ * while a dedicated key is also set is a conflict (which key is meant is not guessed). The key is returned to the transport only.
+ */
+export function resolveCaseV2GeminiKey(env: Env): CaseV2GeminiKey {
+  const raw = env[SAV_V2_GEMINI_KEY_SOURCE_ENV], source = raw === undefined || raw.trim() === "" ? "dedicated" : raw.trim();
+  if (source !== "dedicated" && source !== "shared_v1") return { ok: false, problem: "v2_gemini_key_source_invalid" };
+  const dedicated = env[SAV_V2_GEMINI_KEY_ENV]?.trim() ?? "";
+  if (source === "dedicated") return dedicated ? { ok: true, source, key: dedicated } : { ok: false, problem: "v2_gemini_key_absent" };
+  if (dedicated) return { ok: false, problem: "v2_gemini_key_source_conflict" };
+  const shared = env[SAV_V1_GEMINI_KEY_ENV]?.trim() ?? "";
+  return shared ? { ok: true, source, key: shared } : { ok: false, problem: "v2_shared_v1_gemini_key_absent" };
+}
+
+/** Which key source V2 would use and whether it is usable, never the key itself. Not wired to a page yet: available to a later diagnostic. */
+export function caseV2GeminiKeyStatus(env: Env): Readonly<{ source: CaseV2GeminiKeySource | "invalid"; usable: boolean; problem: string | null }> {
+  const resolved = resolveCaseV2GeminiKey(env);
+  if (resolved.ok) return { source: resolved.source, usable: true, problem: null };
+  const source = resolved.problem === "v2_gemini_key_source_invalid" ? "invalid" : resolved.problem === "v2_gemini_key_absent" ? "dedicated" : "shared_v1";
+  return { source, usable: false, problem: resolved.problem };
+}
 export const SAV_V2_EMBEDDING_MODEL_ENV = "SAV_V2_EMBEDDING_MODEL";
 export const SAV_V2_MODEL_ENV = "SAV_V2_MODEL";
 const MODEL_ID = /^[a-z0-9][a-z0-9.-]{0,99}$/;
@@ -33,7 +64,8 @@ const MODEL_ID = /^[a-z0-9][a-z0-9.-]{0,99}$/;
 /** What the V2 provider configuration lacks, by precise code; empty when keys and models are set (their values are never returned). */
 export function caseV2ProviderConfigProblems(env: Env): string[] {
   const problems: string[] = [];
-  if (!env[SAV_V2_GEMINI_KEY_ENV]?.trim()) problems.push("v2_gemini_key_absent");
+  const key = resolveCaseV2GeminiKey(env);
+  if (!key.ok) problems.push(key.problem);
   if (!MODEL_ID.test(env[SAV_V2_EMBEDDING_MODEL_ENV] ?? "")) problems.push("v2_embedding_model_absent");
   if (!MODEL_ID.test(env[SAV_V2_MODEL_ENV] ?? "")) problems.push("v2_model_absent");
   return problems;
@@ -56,8 +88,10 @@ export function caseGeminiEmbeddingTransport(input: Readonly<{ env: () => Env; n
   const network = input.network ?? ((url, init) => fetch(url, init));
   const dimension = input.dimension ?? SAV_RETRIEVAL_EMBEDDING_DIMENSION;
   return async ({ texts, signal, reservationId }) => {
-    const env = input.env(), key = env[SAV_V2_GEMINI_KEY_ENV]?.trim(), model = env[SAV_V2_EMBEDDING_MODEL_ENV] ?? "";
-    if (!key) throw Error("SAV_V2_GEMINI_KEY_ABSENT");
+    const env = input.env(), resolved = resolveCaseV2GeminiKey(env), model = env[SAV_V2_EMBEDDING_MODEL_ENV] ?? "";
+    if (!resolved.ok) throw Error(({ v2_gemini_key_source_invalid: "SAV_V2_GEMINI_KEY_SOURCE_INVALID", v2_gemini_key_source_conflict: "SAV_V2_GEMINI_KEY_SOURCE_CONFLICT",
+      v2_gemini_key_absent: "SAV_V2_GEMINI_KEY_ABSENT", v2_shared_v1_gemini_key_absent: "SAV_V2_GEMINI_KEY_ABSENT" } as const)[resolved.problem]);
+    const key = resolved.key;
     if (!MODEL_ID.test(model)) throw Error("SAV_V2_EMBEDDING_MODEL_ABSENT");
     const bounds = readCaseV2TransportPolicy(env);
     if (!texts.length || texts.length>bounds.embeddingMaxTexts || texts.some(text=>!text.trim() || Buffer.byteLength(text,"utf8")>bounds.embeddingMaxTextBytes)) throw Error("SAV_V2_EMBEDDING_REQUEST_UNBOUNDED");
@@ -114,7 +148,7 @@ const generateResponse = z.object({
 export function caseGeminiDecisionProvider(input: Readonly<{ env: () => Env; network?: CaseV2Network; timeoutMs?: number }>): CaseV2ModelTransport {
   const network = input.network ?? ((url, init) => fetch(url, init));
   return async request => {
-    const env = input.env(), key = env[SAV_V2_GEMINI_KEY_ENV]?.trim(), model = env[SAV_V2_MODEL_ENV] ?? "";
+    const env = input.env(), resolved = resolveCaseV2GeminiKey(env), key = resolved.ok ? resolved.key : "", model = env[SAV_V2_MODEL_ENV] ?? "";
     if (!key || !MODEL_ID.test(model)) return { result: { status: "failed", uncertain: false }, usage: { inputTokens: 0, outputTokens: 0 } };
     let bounds: ReturnType<typeof readCaseV2TransportPolicy>;
     try { bounds = readCaseV2TransportPolicy(env); } catch { return { result: { status: "failed", uncertain: false }, usage: { inputTokens: 0, outputTokens: 0 } }; }

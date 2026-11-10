@@ -6,7 +6,7 @@ import { intakeExecutionConfigurationBound } from "./execution-continuity";
 import { createHash } from "node:crypto";
 import { and, eq, inArray, lte, or, sql } from "drizzle-orm";
 import { requireDb } from "@/db";
-import { savIntakeExecutions, savIntakeEffects, savIntakeRuns, savMessages, savThreads, savMailboxes, savSyncState } from "@/db/schema";
+import { savIntakeExecutions, savIntakeExecutionBudget, savIntakeEffects, savIntakeRuns, savMessages, savThreads, savMailboxes, savSyncState } from "@/db/schema";
 import { decryptSavPayload } from "../crypto";
 import { savSupportTicketProperties } from "../hubspot-mapping";
 import { assertSavOutboundRecipientAllowed } from "../policy";
@@ -471,6 +471,14 @@ export async function pendingIntakeEffectRecoveries(now = new Date()) {
         or(sql`${savIntakeExecutions.leaseUntil} is null`, lte(savIntakeExecutions.leaseUntil, now)),
         inArray(savIntakeEffects.state, ["dispatched", "acked", "uncertain"]), sql `${savIntakeEffects.reconcileAttempts}<5`, or(sql `${savIntakeEffects.nextReconcileAt} is null`, lte(savIntakeEffects.nextReconcileAt, now)))).orderBy(savIntakeExecutions.updatedAt, savIntakeExecutions.id).limit(2);
 }
+/** Night V1 cycle 1 (M-1): why admission answered ADMISSION_LIMIT, read-only (mirrors execution-store's check). */
+async function admissionLimitCause(): Promise<"ledger_incoherent" | "ceiling_reached"> {
+    const db = requireDb(), [budget] = await db.select().from(savIntakeExecutionBudget).where(eq(savIntakeExecutionBudget.id, "global"));
+    const [row] = await db.select({ n: sql<number>`count(*)::int` }).from(savIntakeExecutions);
+    return !budget || budget.admitted !== Number(row?.n ?? 0) ? "ledger_incoherent" : "ceiling_reached";
+}
+const SCAN_OCCUPIED = ["SAV_INTAKE_EXECUTION_SCOPE_OCCUPIED", "SAV_INTAKE_EXECUTION_LEGACY_SCOPE_OCCUPIED", "SAV_INTAKE_EXECUTION_LEGACY_SCOPE_UNKNOWN"];
+const SCAN_RUN_REFUSALS = [...SCAN_OCCUPIED, "SAV_INTAKE_EXECUTION_NOT_ADMITTED", "SAV_INTAKE_EXECUTION_PLAN_INVALID"];
 export async function scanIntakeExecutionCandidates(options: ExecutionOptions) {
     await releaseNeverDispatchedIntakeScopes(options.runtime.mailboxId);
     const key = "sav-intake-execution-scan-v1", db = requireDb(), [cursor] = await db.select().from(savSyncState).where(eq(savSyncState.key, key));
@@ -500,8 +508,20 @@ export async function scanIntakeExecutionCandidates(options: ExecutionOptions) {
             if (candidate && await intakeRunConfigurationBound(candidate, options.runtime)) await admitIntakeExecution(run.id, options);
         }
         catch (error) {
-            if (!["SAV_INTAKE_EXECUTION_SCOPE_OCCUPIED", "SAV_INTAKE_EXECUTION_LEGACY_SCOPE_OCCUPIED", "SAV_INTAKE_EXECUTION_LEGACY_SCOPE_UNKNOWN"].includes(code(error)))
+            // Night V1 (C): an admission refusal commits nothing. A GLOBAL limit ends this tick on this run (retried
+            // first next tick). A refusal of THIS run (scope occupied, outside the policy, invalid plan) must not abort
+            // the step: it used to block every later observed run and the pending-execution pass below. It is retried
+            // when the cursor wraps. Anything else still fails closed, as before.
+            if (code(error) === "SAV_INTAKE_EXECUTION_ADMISSION_LIMIT") {
+                // Night V1 cycle 1 (M-1): bounded trace (once per tick), read-only, same safe stop: nothing admitted,
+                // cursor not advanced. Tells a reached ceiling from an incoherent admission ledger.
+                console.error("sav_intake_execution_admission_limit", { runId: run.id, cause: await admissionLimitCause().catch(() => "unreadable") });
+                break;
+            }
+            if (!SCAN_RUN_REFUSALS.includes(code(error)))
                 throw error;
+            if (!SCAN_OCCUPIED.includes(code(error)))
+                console.error("sav_intake_execution_candidate_refused", { runId: run.id, code: code(error) });
         }
         // Cursor progress does not change evidence dates, freshness, model attempts,
         // admission counters or the immutable observation payload.

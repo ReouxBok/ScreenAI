@@ -9,6 +9,8 @@ import { savIntakeViewLabels, savIntakeViewSchema } from "@/lib/sav/intake/contr
 import { intakeProjectionLabel, intakeReasonLabel, intakeBlockedCauseLabel, intakeRetryLabel } from "@/lib/sav/intake/console-presentation";
 import { readOperatorPanel } from "@/lib/sav/intake-ux/operator-commands";
 import { manualOtherUnavailableLabels } from "@/lib/sav/intake/manual-other-classification";
+import { savCompletionBlockerLabels, savCompletionPrecheckLabels } from "@/lib/sav/completion-blockers";
+import { intakeExecutionAuthorityLabels } from "@/lib/sav/intake/execution-authority";
 import { intakeDossierView, intakeDossierActions, intakeEffectLabels, intakeEffectStateLabels, intakeRouteLabel, intakeEffectsTitle, readIntakeManualOther, type IntakeConsoleDetail } from "@/lib/sav/intake/dossier-view";
 
 /** Uniform tool result. A refusal is an answer, not a transport error. */
@@ -43,7 +45,7 @@ export function intakeDossierSummary(data: IntakeConsoleDetail) {
     locks: { humanHeld: data.humanHeld, paused: data.thread.paused, handledExternally: data.handledExternally, blocked: Boolean(view.blocked),
       unsettledEffects: effects.filter(effect => ["dispatched", "acked", "uncertain"].includes(effect.state)).length,
       uncertainExecution: data.progress?.state === "uncertain", pendingHumanEvent: data.choices.some(event => ["pending", "reading"].includes(event.state)),
-      holdEpoch: data.projection.epoch },
+      holdEpoch: data.projection.epoch, completionBlockers: data.completionBlockers ?? [], completionPrecheck: data.completionPrecheck ?? null },
     confirmedCurrent: data.confirmedCurrent,
     decision: plan ? { classification: plan.decision.classification, route: intakeRouteLabel(disposition),
       contactId: target?.contactId ?? null, ticketId: target && target.operation !== "create" ? target.ticketId : null } : null,
@@ -56,6 +58,7 @@ export function intakeDossierSummary(data: IntakeConsoleDetail) {
     effects: effects.map(effect => ({ kind: effect.kind, label: intakeEffectLabels[effect.kind] ?? effect.kind, state: effect.state,
       stateLabel: intakeEffectStateLabels[effect.state] ?? effect.state, confirmedAt: effect.confirmedAt?.toISOString() ?? null })),
     waitingReason: data.progress?.reason ? intakeReasonLabel(data.progress.reason) : null,
+    executionAuthority: data.executionAuthority && data.executionAuthority !== "valid" ? { state: data.executionAuthority, label: intakeExecutionAuthorityLabels[data.executionAuthority] } : null,
     linkedTicketId: data.confirmedCurrent ? data.progress?.ticketId ?? null : null,
     lastMessage: latest ? { id: latest.id, fromEmail: latest.fromEmail, receivedAt: latest.receivedAt?.toISOString() ?? null,
       text: latest.body.text.slice(0, STUDIO_MCP_MESSAGE_CHARS), truncated: latest.body.text.length > STUDIO_MCP_MESSAGE_CHARS,
@@ -72,7 +75,8 @@ export async function intakeAvailableActions(data: IntakeConsoleDetail, staff: S
   const panel = actions.administrator && actions.operatorBinding ? await readOperatorPanel(actions.operatorBinding).catch(() => null) : null;
   const manualOther = await readIntakeManualOther(data, actions.manualOther).catch(() => null);
   return [
-    { tool: "close_handled_outside", available: actions.closeHandledOutside, requires: "attestHandled: true" },
+    { tool: "close_handled_outside", available: actions.closeHandledOutside, requires: "attestHandled: true",
+      unavailableReason: actions.completionPrecheck || actions.completionBlockers.length ? [...(actions.completionPrecheck ? [savCompletionPrecheckLabels[actions.completionPrecheck]] : []), ...actions.completionBlockers.map(blocker => savCompletionBlockerLabels[blocker])].join(" ") : null },
     { tool: "classify_invalid_source_other", available: actions.classifyInvalidSource, requires: "attest: true" },
     { tool: "classify_other", available: Boolean(manualOther?.binding), requires: "attest: true, reason",
       unavailableReason: manualOther?.reason ? manualOtherUnavailableLabels[manualOther.reason] : null },

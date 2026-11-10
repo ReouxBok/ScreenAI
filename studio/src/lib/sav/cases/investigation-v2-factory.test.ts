@@ -28,7 +28,7 @@ import { recordCaseAfterConfirmedIntake } from "./intake-boundary";
 import { SAV_CASE_ACCESS_SCOPE_REVISION } from "./investigation-access-scope";
 import { runCaseInvestigationRuntime } from "./investigation-runtime";
 import { createCaseInvestigationToReplyPlan, createCaseInvestigationV2Deps, type CaseInvestigationV2Input } from "./investigation-v2-factory";
-import { caseGeminiDecisionProvider, caseHubspotOwnerReadTransport } from "./investigation-v2-providers";
+import { caseGeminiDecisionProvider, caseGeminiEmbeddingTransport, caseHubspotOwnerReadTransport } from "./investigation-v2-providers";
 import { readCaseV2SpendDay, readCaseV2SpendPolicy, releaseCaseV2Spend, reserveCaseV2Spend, settleCaseV2Spend } from "./investigation-v2-spend";
 
 /*
@@ -147,9 +147,14 @@ describe("factory: precise refusals, nothing built without every proof", () => {
     for (const [over, reason] of [[{ SAV_V2_SPEND_POLICY_JSON: "{" }, "v2_spend_policy_invalid"],
       [{ SAV_V2_SPEND_POLICY_JSON: JSON.stringify({ ...SPEND, approvedBy: "someone" }) }, "v2_spend_policy_invalid"],
       [{ SAV_V2_SPEND_POLICY_JSON: JSON.stringify({ ...SPEND, model: { ...SPEND.model, reserveMicroUsdPerCall: 0 } }) }, "v2_spend_policy_invalid"],
-      [{ SAV_V2_SPEND_POLICY_JSON: JSON.stringify({ ...SPEND, embedding: undefined }) }, "v2_spend_policy_invalid"]] as const) {
+      [{ SAV_V2_SPEND_POLICY_JSON: JSON.stringify({ ...SPEND, embedding: undefined }) }, "v2_spend_policy_invalid"],
+      [{ SAV_V2_GEMINI_KEY_SOURCE: "shared_v1" }, "v2_gemini_key_source_conflict"],
+      [{ SAV_V2_GEMINI_KEY_SOURCE: "shared_v1", SAV_V2_GEMINI_API_KEY: undefined, SAV_GEMINI_API_KEY: undefined }, "v2_shared_v1_gemini_key_absent"],
+      [{ SAV_V2_GEMINI_KEY_SOURCE: "v1", SAV_V2_GEMINI_API_KEY: undefined, SAV_GEMINI_API_KEY: V1_KEY }, "v2_gemini_key_source_invalid"]] as const) {
       expect(createCaseInvestigationV2Deps(input(net, {}, environment(over)))).toEqual({ ok: false, refusals: [reason] });
     }
+    // The approved sharing builds on V1's key alone, every other proof (switch, models, spend and transport policy) still required.
+    expect(createCaseInvestigationV2Deps(input(net, {}, environment({ SAV_V2_GEMINI_KEY_SOURCE: "shared_v1", SAV_V2_GEMINI_API_KEY: undefined, SAV_GEMINI_API_KEY: V1_KEY }))).ok).toBe(true);
     expect(net.calls).toEqual([]);
   });
   it("the binding for A and the wake refuses the same way, and builds when every proof is there", () => {
@@ -289,6 +294,88 @@ describe("the canonical runtime on the factory's real adapters (network double o
     expect(report.reply).toMatchObject({ status: "awaiting_person", reasons: ["auto_disabled"] });
     expect(await f.db.select().from(savCaseEffectExecutions).where(eq(savCaseEffectExecutions.caseId, mail.caseId))).toEqual([]);
     expect((await readCase(mail.caseId))!.owner).toBe("agent");
+  });
+});
+
+/*
+ * K-1 (night 9-10 Nov): V2 on V1's key by the approved selector, the embedding sent end to end on the real spend register and call ledger
+ * (PGlite), only the network simulated. No real Gemini call. The key goes in the header of the simulated request and nowhere else.
+ */
+describe("K-1: shared_v1 embedding, real reservation/settle/release at the boundaries (network double only)", () => {
+  const shared = (over: Record<string, string | undefined> = {}) => environment({ SAV_V2_GEMINI_KEY_SOURCE: "shared_v1", SAV_V2_GEMINI_API_KEY: undefined, SAV_GEMINI_API_KEY: V1_KEY, ...over });
+  const geminiCalls = (net: ReturnType<typeof network>) => net.calls.filter(call => call.url.includes("generativelanguage"));
+  /** No key value anywhere but the request header: not in URLs, bodies, spend rows, ledger rows nor logs. */
+  async function expectNoKeyLeak(net: ReturnType<typeof network>, logs: string) {
+    const outsideHeader = JSON.stringify(net.calls.map(call => ({ url: call.url, body: call.body, headers: { ...call.headers, "x-goog-api-key": undefined } })));
+    const stored = JSON.stringify([await f.db.select().from(savSyncState), await f.db.select().from(savCaseCalls)]);
+    for (const key of [V1_KEY, V2_KEY]) { expect(outsideHeader).not.toContain(key); expect(stored).not.toContain(key); expect(logs).not.toContain(key); }
+  }
+  const captureLogs = () => {
+    const spies = (["log", "info", "warn", "error", "debug"] as const).map(level => vi.spyOn(console, level));
+    return () => spies.flatMap(spy => spy.mock.calls.map(args => args.map(arg => typeof arg === "string" ? arg : JSON.stringify(arg) ?? String(arg)).join(" "))).join("\n");
+  };
+  beforeEach(async () => { await seedCard(); await clearSpend(); });
+
+  it("commit: the full runtime embeds and generates with V1's key in the header only, V2's models, one settled reservation per budget", async () => {
+    const logs = captureLogs(), mail = await v1Mail({ ownerEffect: true }), net = network();
+    const built = createCaseInvestigationV2Deps(input(net, {}, shared()));
+    if (!built.ok) throw Error(built.refusals.join(","));
+    expect(await runCaseInvestigationRuntime(mail.caseId, built.deps)).toMatchObject({ status: "recorded", outcome: "accepted", modelCalls: 1 });
+    expect(geminiCalls(net).map(call => call.url)).toEqual(["https://generativelanguage.googleapis.com/v1beta/models/syn-embedding:batchEmbedContents",
+      "https://generativelanguage.googleapis.com/v1beta/models/syn-model:generateContent"]);
+    expect(geminiCalls(net).every(call => call.headers["x-goog-api-key"] === V1_KEY)).toBe(true);
+    expect((geminiCalls(net)[0]!.body as { requests: { model: string }[] }).requests.every(request => request.model === "models/syn-embedding")).toBe(true);
+    expect(await readCaseV2SpendDay("embedding", today())).toEqual({ settledMicroUsd: 100, heldMicroUsd: 0, open: 0, settled: 1 });
+    expect(await readCaseV2SpendDay("model", today())).toEqual({ settledMicroUsd: 1, heldMicroUsd: 0, open: 0, settled: 1 });
+    await expectNoKeyLeak(net, logs());
+  });
+
+  it("uncertain: a 503 after dispatch keeps the reservation held as spent (never released), and the call is never resent", async () => {
+    const logs = captureLogs(), mail = await v1Mail({ ownerEffect: true }), net = network({ embedStatus: 503 });
+    const built = createCaseInvestigationV2Deps(input(net, {}, shared()));
+    if (!built.ok) throw Error(built.refusals.join(","));
+    expect((await runCaseInvestigationRuntime(mail.caseId, built.deps)).modelCalls).toBe(0);
+    expect(geminiCalls(net)).toHaveLength(1);
+    expect(geminiCalls(net)[0]!.headers["x-goog-api-key"]).toBe(V1_KEY);
+    expect(await readCaseV2SpendDay("embedding", today())).toEqual({ settledMicroUsd: 100, heldMicroUsd: 0, open: 0, settled: 1 });
+    await runCaseInvestigationRuntime(mail.caseId, built.deps);
+    expect(geminiCalls(net)).toHaveLength(1);
+    await expectNoKeyLeak(net, logs());
+  });
+
+  it("release: a stop after the money was reserved and before dispatch releases it for real; nothing is sent", async () => {
+    const mail = await v1Mail({ ownerEffect: true }), net = network();
+    const built = createCaseInvestigationV2Deps(input(net, {}, shared()));
+    if (!built.ok) throw Error(built.refusals.join(","));
+    let reserved = false;
+    const spend = built.deps.knowledge.spend!, pause = built.deps.pauseState;
+    const deps = { ...built.deps, pauseState: async () => reserved ? "fully_paused" as const : pause(),
+      knowledge: { ...built.deps.knowledge, spend: { ...spend, reserve: async (request: Parameters<typeof spend.reserve>[0]) => { const answer = await spend.reserve(request); reserved = answer.status === "allowed"; return answer; } } } };
+    expect((await runCaseInvestigationRuntime(mail.caseId, deps)).modelCalls).toBe(0);
+    expect(reserved).toBe(true);
+    expect(geminiCalls(net)).toEqual([]);
+    expect(await readCaseV2SpendDay("embedding", today())).toEqual({ settledMicroUsd: 0, heldMicroUsd: 0, open: 0, settled: 0 });
+  });
+
+  it("transport at its boundary: a real reservation is required and fenced, V1's key sent once, then a real settle", async () => {
+    const now = () => new Date(Date.now() + 6 * 60_000), env = shared(), net = network();
+    const reservation = await reserveCaseV2Spend({ env: () => env, now }, "embedding", "k1-boundary");
+    if (reservation.status !== "allowed") throw Error(reservation.reason);
+    const embed = caseGeminiEmbeddingTransport({ env: () => env, network: net.net });
+    await expect(embed({ texts: ["accès"], signal: AbortSignal.timeout(5000) })).rejects.toThrow("SAV_V2_EMBEDDING_RESERVATION_REQUIRED");
+    // The policy moved after the reservation: the old, smaller reservation cannot be spent, even on the shared key.
+    const moved = { ...env, SAV_V2_SPEND_POLICY_JSON: JSON.stringify({ ...SPEND, revision: "moved" }) };
+    await expect(caseGeminiEmbeddingTransport({ env: () => moved, network: net.net })({ texts: ["accès"], signal: AbortSignal.timeout(5000), reservationId: reservation.reservationId }))
+      .rejects.toThrow("SAV_V2_SPEND_POLICY_CHANGED");
+    expect(net.calls).toEqual([]);
+    const sent = await embed({ texts: ["accès"], signal: AbortSignal.timeout(5000), reservationId: reservation.reservationId });
+    expect(sent.vectors).toHaveLength(1);
+    expect(net.calls).toHaveLength(1);
+    expect(net.calls[0]!.headers["x-goog-api-key"]).toBe(V1_KEY);
+    expect(JSON.stringify([net.calls[0]!.url, net.calls[0]!.body])).not.toMatch(new RegExp(`${V1_KEY}|${V2_KEY}`));
+    expect(await settleCaseV2Spend({ env: () => env, now }, { reservationId: reservation.reservationId, usage: "unknown", uncertain: false })).toEqual({ settled: true, costMicroUsd: 100, fromUsage: false });
+    expect(await releaseCaseV2Spend({ reservationId: reservation.reservationId })).toEqual({ released: false });
+    expect(await readCaseV2SpendDay("embedding", today())).toEqual({ settledMicroUsd: 100, heldMicroUsd: 0, open: 0, settled: 1 });
   });
 });
 

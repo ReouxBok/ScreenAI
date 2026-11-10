@@ -5,7 +5,7 @@ import { createSavTestDb } from "../../../../test/sav-db";
 import { executionProvider } from "../../../../test/sav-intake-execution-provider";
 import { auditLogs, savMailboxes, savThreads, savMessages, staffUsers, savSyncState, savIntakeRuns, savIntakeModelCalls,
   savIntakeHumanEvents, savIntakeJournal, savIntakeConsole, savIntakeExecutions, savIntakeEffects, savIntakeExecutionBudget,
-  savIntakeExecutionPolicies, savIntakeObservationBindings, savResolutionObservations, savAgentRuns, savDecisions, savActions, savFollowups, savLearningCandidates, savKnowledgeActivations, categories } from "@/db/schema";
+  savIntakeExecutionPolicies, savIntakeObservationBindings, savResolutionObservations, savAgentRuns, savDecisions, savActions, savPilotBatches, savPilotItems, savFollowups, savLearningCandidates, savKnowledgeActivations, categories } from "@/db/schema";
 const state = vi.hoisted(() => ({ db: null as unknown, user: null as unknown }));
 // Scheduling is covered by hubspot-transport.test.ts; keep business scenarios
 // independent of real rate-limit waits without replacing readers or guards.
@@ -199,6 +199,183 @@ it("manual completion preserves a pending human choice and an uncertain legacy s
   expect(await completeSavDossierManually(input)).toMatchObject({marked:0,skipped:{unsettled_action:1}});
   expect(fetch).not.toHaveBeenCalled();expect(mutationsSent()).toHaveLength(0);
 });
+// Night V1 (A), reproduced from a production dossier shape: effects [] on the latest message, no pending choice shown,
+// « Terminés » offered by the page and the MCP, then refused by the server (unsettled_action). Synthetic data only.
+it("night V1 A: Terminés is offered only when the server would accept it, and the exact blocker is named", async () => {
+  const input = await prepareManualCompletion();
+  const { intakeDossierActions, intakeDossierView } = await import("./dossier-view");
+  const offered = async () => { await projectIntakeThread(threadId); const detail = (await readIntakeConsoleDetail(threadId))!;
+    return { detail, actions: intakeDossierActions(detail, intakeDossierView(detail), { email: "ugo@limova.ai", role: "admin" }) }; };
+  // An earlier human send left without a verified result: nothing in the latest message's progress shows it.
+  const [legacy] = await db.db.insert(savActions).values({ threadId, messageId, kind: "send_reply", actorType: "human", status: "failed", idempotencyKey: randomUUID(),
+    payload: { replySendDispatchedAt: new Date().toISOString() } }).returning();
+  let view = await offered();
+  expect(view.detail.progress?.effects ?? []).toEqual([]);
+  expect(view.actions.closeHandledOutside).toBe(false);
+  expect(view.actions.completionBlockers).toEqual(["human_action"]);
+  expect(await completeSavDossierManually({ ...input, requestKey: randomUUID() })).toMatchObject({ marked: 0, skipped: { unsettled_action: 1 } });
+  // A pending human command (state « waiting » is counted by the server, not by the old lock flag).
+  await db.db.update(savActions).set({ status: "succeeded" }).where(eq(savActions.id, legacy.id));
+  await recordIntakeHumanCommand(await command());
+  await db.db.update(savIntakeHumanEvents).set({ state: "waiting" });
+  view = await offered();
+  expect(view.actions.completionBlockers).toEqual(["human_command"]);
+  expect(view.actions.closeHandledOutside).toBe(false);
+  expect(await completeSavDossierManually({ ...input, requestKey: randomUUID() })).toMatchObject({ marked: 0, skipped: { unsettled_action: 1 } });
+  // An active analysis lease: same order as the server (unsettled first, then the lease).
+  await db.db.update(savIntakeHumanEvents).set({ state: "refused" });
+  await db.db.update(savIntakeRuns).set({ leaseUntil: new Date(Date.now() + 60000) }).where(eq(savIntakeRuns.id, runId));
+  view = await offered();
+  expect(view.actions.completionBlockers).toEqual(["active_worker"]);
+  expect(view.actions.closeHandledOutside).toBe(false);
+  expect(await completeSavDossierManually({ ...input, requestKey: randomUUID() })).toMatchObject({ marked: 0, skipped: { active_worker: 1 } });
+  // Nothing left: offered, and the server accepts exactly then. Nothing was cleared or retried by the readers.
+  await db.db.update(savIntakeRuns).set({ leaseUntil: null }).where(eq(savIntakeRuns.id, runId));
+  view = await offered();
+  expect(view.actions.completionBlockers).toEqual([]);
+  expect(view.actions.closeHandledOutside).toBe(true);
+  expect(await completeSavDossierManually({ ...input, requestKey: randomUUID() })).toMatchObject({ marked: 1 });
+  expect((await db.db.select().from(savActions))[0]).toMatchObject({ status: "succeeded" });
+  expect(fetch).not.toHaveBeenCalled(); expect(mutationsSent()).toHaveLength(0);
+});
+// Night V1 cycle 1 (I-1, M-6, M-5 review): every server refusal is visible in the offer (same pure function), and the
+// missing intake_effect blocker is covered. Only source_changed stays a server-side version guard.
+it("night V1 cycle 1: each server refusal outside the blockers, and intake_effect, is not offered and named", async () => {
+  const input = await prepareManualCompletion();
+  const { intakeDossierActions, intakeDossierView } = await import("./dossier-view");
+  const { readSavCompletionPrecheck } = await import("../external-completion");
+  const { SAV_V0_CUTOVER_KEY } = await import("../cutover");
+  const offered = async () => { await projectIntakeThread(threadId); const detail = (await readIntakeConsoleDetail(threadId))!;
+    return intakeDossierActions(detail, intakeDossierView(detail), { email: "ugo@limova.ai", role: "admin" }); };
+  const serverSkip = async () => (await completeSavDossierManually({ ...input, requestKey: randomUUID() })).skipped;
+  // technical_exclusion: a current V0 technical decision (internal notification), no effect, no lease.
+  const [decision] = await db.db.insert(savDecisions).values({ messageId, kind: "internal_notification", reasonCode: "fixture", explanation: "Synthetic notification", confidence: 900, model: "rules-v1", actorType: "ai" }).returning();
+  let actions = await offered();
+  expect(actions).toMatchObject({ closeHandledOutside: false, completionPrecheck: "technical_exclusion", completionBlockers: [] });
+  expect(await serverSkip()).toEqual({ technical_exclusion: 1 });
+  await db.db.delete(savDecisions).where(eq(savDecisions.id, decision.id));
+  // not_live_eligible: a pilot message.
+  const [batch] = await db.db.insert(savPilotBatches).values({ createdBy: "ugo@limova.ai" }).returning();
+  await db.db.insert(savPilotItems).values({ batchId: batch.id, messageId });
+  actions = await offered();
+  expect(actions).toMatchObject({ closeHandledOutside: false, completionPrecheck: "not_live_eligible" });
+  expect(await serverSkip()).toEqual({ not_live_eligible: 1 });
+  await db.db.delete(savPilotItems); await db.db.delete(savPilotBatches);
+  // not_live_eligible: outside the active V0 cutover.
+  await db.db.update(savSyncState).set({ status: "paused" }).where(eq(savSyncState.key, SAV_V0_CUTOVER_KEY));
+  expect(await offered()).toMatchObject({ closeHandledOutside: false, completionPrecheck: "not_live_eligible" });
+  expect(await serverSkip()).toEqual({ not_live_eligible: 1 });
+  await db.db.update(savSyncState).set({ status: "active" }).where(eq(savSyncState.key, SAV_V0_CUTOVER_KEY));
+  // new_inbound / after_boundary: the same pure function as the server, same inputs.
+  const other = randomUUID(), past = new Date(0).toISOString();
+  expect(await readSavCompletionPrecheck(threadId, other, db.db)).toBe("new_inbound");
+  expect((await markSavDossiersHandledExternally({ batchId: randomUUID(), receivedBefore: new Date().toISOString(), messages: [{ threadId, messageId: other }] }, "ugo@limova.ai")).skipped).toEqual({ new_inbound: 1 });
+  expect(await readSavCompletionPrecheck(threadId, messageId, db.db, "completed", past)).toBe("after_boundary");
+  expect((await markSavDossiersHandledExternally({ batchId: randomUUID(), receivedBefore: past, messages: [{ threadId, messageId }] }, "ugo@limova.ai")).skipped).toEqual({ after_boundary: 1 });
+  // intake_effect: an uncertain engine effect on this thread (the blocker the first night test did not cover).
+  const policy = await approveIntakeExecutionPolicy(options.policy);
+  // On an EARLIER message of the thread (the server counts every execution of the thread).
+  const [earlier] = await db.db.insert(savMessages).values({ threadId, mailboxId, direction: "inbound", fromEmail: "customer@example.invalid", bodyCiphertext: encryptSavPayload({ text: "Synthetic earlier mail" }),
+    receivedAt: new Date(Date.now() - 7200000), createdAt: new Date(Date.now() - 7200000) }).returning();
+  const [execution] = await db.db.insert(savIntakeExecutions).values({ messageId: earlier.id, threadId, runId, runVersion: 1, policyId: policy.id, policyHash: policy.policyHash, payloadCiphertext: encryptSavPayload({}) }).returning();
+  const [effect] = await db.db.insert(savIntakeEffects).values({ id: randomUUID(), executionId: execution.id, businessKey: "synthetic-uncertain", kind: "ticket_create", permission: "create_ticket", state: "uncertain",
+    intentHash: "a".repeat(64), intentCiphertext: encryptSavPayload({}), dispatchedAt: new Date() }).returning();
+  actions = await offered();
+  expect(actions.closeHandledOutside).toBe(false);
+  expect(actions.completionBlockers).toContain("intake_effect");
+  expect(await serverSkip()).toEqual({ unsettled_action: 1 });
+  // M-5: a failed blocker read fails closed (not offered), the page stays readable.
+  const completionModule = await import("../external-completion");
+  const spy = vi.spyOn(completionModule, "readSavCompletionBlockers").mockRejectedValueOnce(new Error("synthetic read failure"));
+  const errors = vi.spyOn(console, "error").mockImplementation(() => {});
+  actions = await offered();
+  expect(actions).toMatchObject({ closeHandledOutside: false, completionBlockers: ["unreadable"] });
+  spy.mockRestore(); errors.mockRestore();
+  expect((await db.db.select().from(savIntakeEffects).where(eq(savIntakeEffects.id, effect.id)))[0]).toMatchObject({ state: "uncertain" });
+  expect(fetch).not.toHaveBeenCalled(); expect(mutationsSent()).toHaveLength(0);
+});
+// Night V1 (C), production evidence (wake logs: observed, execution null, SAV_INTAKE_EXECUTION_POLICY_EXPIRED after a
+// redeploy): the dossier must say why automatic execution cannot start instead of only « actions en attente ». Read-only.
+it("night V1 C: an observed decision without execution names the execution authority state, without acting", async () => {
+  await observed();
+  const state = async () => (await readIntakeConsoleDetail(threadId))!.executionAuthority;
+  expect(await state()).toBe("off");
+  for (const [k, v] of Object.entries(environment)) if (k.startsWith("SAV_INTAKE_EXECUTION_")) vi.stubEnv(k, v!);
+  vi.stubEnv("VERCEL_GIT_COMMIT_SHA", "b".repeat(40));
+  expect(await state()).toBe("code_revision_changed");
+  vi.stubEnv("VERCEL_GIT_COMMIT_SHA", "a".repeat(40));
+  expect(await state()).toBe("valid");
+  vi.stubEnv("SAV_INTAKE_EXECUTION_KILL_SWITCH", "1");
+  expect(await state()).toBe("disabled");
+  vi.stubEnv("SAV_INTAKE_EXECUTION_KILL_SWITCH", "0");
+  await db.db.update(savIntakeExecutionPolicies).set({ state: "revoked" });
+  expect(await state()).toBe("revoked");
+  expect(await db.db.select().from(savIntakeExecutions)).toHaveLength(0);
+  expect(fetch).not.toHaveBeenCalled(); expect(mutationsSent()).toHaveLength(0);
+});
+// Night V1 cycle 1 (M-2 review): each authority state is named exactly, in readIntakeExecutionAuthority's order. Read-only.
+it("night V1 cycle 1: execution authority states are exact (missing, config mismatch, incoherent, expired, unreadable, configuration required)", async () => {
+  await observed();
+  const { readIntakeExecutionAuthorityState, readIntakeExecutionAuthority } = executionPolicyModule;
+  const env = { ...environment, VERCEL_GIT_COMMIT_SHA: "a".repeat(40) } as Record<string, string | undefined>;
+  expect(await readIntakeExecutionAuthorityState(env)).toBe("valid");
+  await expect(readIntakeExecutionAuthority(intakeExecutionConfig(env)!)).resolves.toBeTruthy();
+  const far = new Date(Date.now() + 400 * 86400000);
+  expect(await readIntakeExecutionAuthorityState(env, far)).toBe("expired");
+  await expect(readIntakeExecutionAuthority(intakeExecutionConfig(env)!, far)).rejects.toThrow("SAV_INTAKE_EXECUTION_POLICY_EXPIRED");
+  expect(await readIntakeExecutionAuthorityState({ ...env, SAV_INTAKE_EXECUTION_POLICY_ID: randomUUID() })).toBe("policy_missing");
+  expect(await readIntakeExecutionAuthorityState({ ...env, SAV_INTAKE_EXECUTION_POLICY_SHA256: "e".repeat(64) })).toBe("configuration_mismatch");
+  expect(await readIntakeExecutionAuthorityState({ ...env, SAV_INTAKE_EXECUTION_POLICY_ID: undefined })).toBe("configuration_required");
+  const [row] = await db.db.select().from(savIntakeExecutionPolicies);
+  const payload = decryptSavPayload<Record<string, unknown>>(row.payloadCiphertext);
+  await db.db.update(savIntakeExecutionPolicies).set({ payloadCiphertext: encryptSavPayload({ ...payload, maxDossiers: Number(payload.maxDossiers) - 1 }) });
+  expect(await readIntakeExecutionAuthorityState(env)).toBe("policy_incoherent");
+  await db.db.update(savIntakeExecutionPolicies).set({ payloadCiphertext: "not-a-ciphertext" });
+  expect(await readIntakeExecutionAuthorityState(env)).toBe("unreadable");
+  await db.db.update(savIntakeExecutionPolicies).set({ payloadCiphertext: row.payloadCiphertext });
+  expect(await readIntakeExecutionAuthorityState(env)).toBe("valid");
+  await db.db.update(staffUsers).set({ active: false });
+  expect(await readIntakeExecutionAuthorityState(env)).toBe("approver_unauthorized");
+  expect(await db.db.select().from(savIntakeExecutions)).toHaveLength(0);
+  expect(fetch).not.toHaveBeenCalled(); expect(mutationsSent()).toHaveLength(0);
+});
+// Night V1 cycle 2 (N-2 review): parity of the display reader with the server authority reader, for every reachable
+// state: the server refuses exactly when the state is not « valid », with the code family that state names.
+it("night V1 cycle 2: execution authority state and the server authority reader agree on every reachable state", async () => {
+  await observed();
+  const { readIntakeExecutionAuthorityState, readIntakeExecutionAuthority } = executionPolicyModule;
+  const base = { ...environment, VERCEL_GIT_COMMIT_SHA: "a".repeat(40) } as Record<string, string | undefined>;
+  const [row] = await db.db.select().from(savIntakeExecutionPolicies);
+  const payload = decryptSavPayload<Record<string, unknown>>(row.payloadCiphertext);
+  const far = new Date(Date.now() + 400 * 86400000);
+  const serverCode: Record<string, string | null> = { valid: null, policy_missing: "SAV_INTAKE_EXECUTION_PERMISSION_REVOKED", revoked: "SAV_INTAKE_EXECUTION_PERMISSION_REVOKED",
+    configuration_mismatch: "SAV_INTAKE_EXECUTION_PERMISSION_REVOKED", approver_unauthorized: "SAV_INTAKE_EXECUTION_PERMISSION_REVOKED",
+    policy_incoherent: "SAV_INTAKE_EXECUTION_POLICY_EXPIRED", code_revision_changed: "SAV_INTAKE_EXECUTION_POLICY_EXPIRED", expired: "SAV_INTAKE_EXECUTION_POLICY_EXPIRED", unreadable: "" };
+  const cases: Array<[string, () => Promise<void>, Record<string, string | undefined>, Date | undefined]> = [
+    ["valid", async () => {}, base, undefined],
+    ["expired", async () => {}, base, far],
+    ["code_revision_changed", async () => {}, { ...base, VERCEL_GIT_COMMIT_SHA: "b".repeat(40) }, undefined],
+    ["policy_missing", async () => {}, { ...base, SAV_INTAKE_EXECUTION_POLICY_ID: randomUUID() }, undefined],
+    ["configuration_mismatch", async () => {}, { ...base, SAV_INTAKE_EXECUTION_POLICY_SHA256: "e".repeat(64) }, undefined],
+    ["policy_incoherent", async () => { await db.db.update(savIntakeExecutionPolicies).set({ payloadCiphertext: encryptSavPayload({ ...payload, maxDossiers: Number(payload.maxDossiers) - 1 }) }); }, base, undefined],
+    ["unreadable", async () => { await db.db.update(savIntakeExecutionPolicies).set({ payloadCiphertext: "not-a-ciphertext" }); }, base, undefined],
+    ["approver_unauthorized", async () => { await db.db.update(staffUsers).set({ active: false }); }, base, undefined],
+    ["revoked", async () => { await db.db.update(savIntakeExecutionPolicies).set({ state: "revoked" }); }, base, undefined],
+  ];
+  for (const [expected, arrange, env, now] of cases) {
+    await db.db.update(savIntakeExecutionPolicies).set({ payloadCiphertext: row.payloadCiphertext, state: "approved" });
+    await db.db.update(staffUsers).set({ active: true });
+    await arrange();
+    const state = await readIntakeExecutionAuthorityState(env, now);
+    const server = await readIntakeExecutionAuthority(intakeExecutionConfig(env)!, now).then(() => null, (error: Error) => error.message);
+    expect({ expected, state }).toEqual({ expected, state: expected });
+    if (serverCode[expected] === null) expect(server).toBeNull();
+    else if (serverCode[expected]) expect({ expected, server }).toEqual({ expected, server: serverCode[expected] });
+    else expect({ expected, refused: server !== null }).toEqual({ expected, refused: true });
+  }
+  expect(await db.db.select().from(savIntakeExecutions)).toHaveLength(0);
+  expect(fetch).not.toHaveBeenCalled(); expect(mutationsSent()).toHaveLength(0);
+});
 it("form -> authenticated CAS -> accepted semantics -> derived run -> real HTTP fake execution; exhausted quotas stay exhausted", async () => {
   await observed(true);
   await db.db.update(savIntakeRuns).set({ attempts: 2 }).where(eq(savIntakeRuns.id, runId));
@@ -301,6 +478,38 @@ it("projection CAS cannot clear dirty or retain a previous success across a new 
   await observed();
   expect(await projectIntakeThread(threadId,async()=>{await message(threadId,new Date(Date.now()+1000),"Newest synthetic request");})).toBe(false);
   const list=await listIntakeConsole({view:"processing",search:"Newest"});expect(list.total).toBe(1);expect(list.rows[0].status).toBe("processing");
+});
+it("R3: a failed uncertainty read keeps the list and the detail usable, marked unread (never 'no effect')", async () => {
+  await observed(); await projectIntakeThread(threadId);
+  const [row] = await db.db.select().from(savIntakeConsole).where(eq(savIntakeConsole.threadId, threadId));
+  await db.db.update(savIntakeConsole).set({ status: "uncertain", view: null, reason: null, projectedEpoch: row.epoch }).where(eq(savIntakeConsole.threadId, threadId));
+  const listed = async () => (await listIntakeConsole({ view: "processing" })).rows.find(r => r.threadId === threadId);
+  // Normal path through the savepoint: the exact read, nothing found is "unknown".
+  expect(await listed()).toMatchObject({ status: "uncertain", uncertainty: "unknown" });
+  expect((await readIntakeConsoleDetail(threadId))?.uncertainty).toBe("unknown");
+  const error = vi.spyOn(console, "error").mockImplementation(() => {});
+  await db.client.exec("ALTER TABLE sav.intake_model_calls RENAME TO intake_model_calls_r3_hidden");
+  try {
+    // The read fails inside the console's own transaction: the savepoint isolates it, the page keeps its rows and counts.
+    const list = await listIntakeConsole({ view: "processing" });
+    expect(list.installed).toBe(true); expect(list.total).toBeGreaterThan(0);
+    expect(list.rows.find(r => r.threadId === threadId)).toMatchObject({ status: "uncertain", uncertainty: "unread" });
+    expect(error).toHaveBeenCalledWith("SAV_INTAKE_UNCERTAINTY_READ_UNAVAILABLE");
+    expect(error.mock.calls.flat().join(" ")).not.toMatch(/intake_model_calls|relation|does not exist/);
+  } finally {
+    await db.client.exec("ALTER TABLE sav.intake_model_calls_r3_hidden RENAME TO intake_model_calls");
+  }
+  expect(await listed()).toMatchObject({ uncertainty: "unknown" });
+  // The detail page's real path: its read-only ledger transaction fails, the rest of the dossier is still returned, marked unread.
+  const original = db.db.transaction.bind(db.db);
+  const spy = vi.spyOn(db.db, "transaction").mockImplementation(((run: (tx: unknown) => Promise<unknown>, config?: { accessMode?: string }) =>
+    // Only the uncertainty-ledger read fails; every other read of the detail runs normally.
+    config?.accessMode === "read only" && String(run).includes("readIntakeUncertainties") ? original(async tx => { await tx.execute(sql`select 1/0`); return run(tx); }, config as never) : original(run as never, config as never)) as never);
+  try {
+    expect(await readIntakeConsoleDetail(threadId)).toMatchObject({ uncertainty: "unread", projection: { status: "uncertain" }, thread: { id: threadId } });
+    expect(spy).toHaveBeenCalled();
+  } finally { spy.mockRestore(); }
+  expect((await readIntakeConsoleDetail(threadId))?.uncertainty).toBe("unknown");
 });
 it("more than 250 dossiers share list/count/search predicate, stable equal-date pagination and mailbox isolation", async () => {
   const threads=await db.db.insert(savThreads).values(Array.from({length:276},(_,i)=>({mailboxId,gmailThreadId:`synthetic-thread-${i}`,customerEmail:`synthetic-${i}@example.invalid`}))).returning();

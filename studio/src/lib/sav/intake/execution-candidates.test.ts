@@ -2,13 +2,13 @@ import { randomUUID } from "node:crypto";
 import { afterAll, afterEach, beforeAll, beforeEach, expect, it, vi } from "vitest";
 import { eq } from "drizzle-orm";
 import { createSavTestDb } from "../../../../test/sav-db";
-import { auditLogs, savMailboxes, savThreads, savMessages, savIntakeRuns, savIntakeExecutions, savIntakeEffects, savIntakeExecutionPolicies, savIntakeOccupations, savSyncState, staffUsers } from "@/db/schema";
-const state = vi.hoisted(() => ({ db: null as unknown, admissions: [] as string[], claims: [] as string[], policy: {} as unknown }));
+import { auditLogs, savMailboxes, savThreads, savMessages, savIntakeRuns, savIntakeExecutions, savIntakeEffects, savIntakeExecutionPolicies, savIntakeOccupations, savSyncState, staffUsers, savIntakeExecutionBudget } from "@/db/schema";
+const state = vi.hoisted(() => ({ db: null as unknown, admissions: [] as string[], claims: [] as string[], policy: {} as unknown, refusals: {} as Record<string, string> }));
 vi.mock("@/db", () => ({ requireDb: () => { if (!state.db) throw Error("NO_DB_ALLOWED"); return state.db; } }));
 // Only the admission/claim boundaries are probes. Selection SQL and canonical
 // external-completion validation are real, including pagination and recovery.
 vi.mock("./execution-store", async importOriginal => ({ ...await importOriginal<typeof import("./execution-store")>(),
-    admitIntakeExecution: async (id: string) => { state.admissions.push(id); return null; },
+    admitIntakeExecution: async (id: string) => { state.admissions.push(id); if (state.refusals[id]) throw Error(state.refusals[id]); return null; },
     claimExecutionOrBlock: async (id: string) => { state.claims.push(id); return { blocked: "occupied" as const }; } }));
 vi.mock("./human-binding", async importOriginal => ({ ...await importOriginal<typeof import("./human-binding")>(), intakeRunConfigurationBound: async () => true }));
 vi.mock("./execution-policy", async importOriginal => ({ ...await importOriginal<typeof import("./execution-policy")>(), readIntakeExecutionAuthority: async () => ({ policy: state.policy }) }));
@@ -39,7 +39,7 @@ beforeEach(async () => {
     vi.stubEnv("SAV_ENCRYPTION_KEY_V1", "synthetic-selection-encryption-key-32-characters");
     vi.stubGlobal("fetch", vi.fn(async () => { throw Error("NETWORK_FORBIDDEN"); }));
     await f.client.exec("TRUNCATE sav.intake_effect_journal,sav.intake_effects,sav.intake_occupations,sav.intake_executions,sav.intake_execution_policies,sav.mailboxes CASCADE; DELETE FROM public.staff_users; TRUNCATE public.audit_logs; DELETE FROM sav.sync_state WHERE key in ('sav-intake-execution-scan-v1','sav-v0-cutover')");
-    state.admissions = []; state.claims = [];
+    state.admissions = []; state.claims = []; state.refusals = {};
     mailboxId = (await f.db.insert(savMailboxes).values({ email: "support@example.invalid" }).returning())[0].id;
     const policy = { relationRevision: "synthetic", admittedRelations: [], resources: {} };
     environment = { SAV_INTAKE_RUNTIME_MODE: "observe", SAV_INTAKE_EXECUTION_MODE: "execute", SAV_CODE_REVISION: "a".repeat(40), SAV_AI_MODEL: "gemini-3.6-flash", SAV_GEMINI_API_KEY: "synthetic", HUBSPOT_ACCESS_TOKEN: "synthetic",
@@ -129,4 +129,51 @@ it("allows administrative completion after the execution is terminal and its sco
     expect(await markSavDossiersHandledExternally(command, "ugo@limova.ai")).toMatchObject({ marked: 1, skipped: {} });
     expect(await getSavExternalCompletion(row.message, f.db)).not.toBeNull();
     expect(await listSavExternalCompletionMessageIds(f.db, true, mailboxId)).toEqual([row.message.id]);
+});
+
+// Night V1 (C), « decision ready without execution »: one observed run refused for ITS OWN reason (not admitted by the
+// policy boundaries, invalid plan) used to abort the whole cron step before the cursor moved: every later observed run
+// stayed un-admitted, and the pending-execution pass after the scan never ran. Admission refusals commit nothing.
+it("night V1 C: a run refused for its own reason never blocks later observed runs nor the execution pass", async () => {
+    const refused = await seed(0), invalid = await seed(1), live = await seed(2), other = await seed(3);
+    state.refusals[refused.run.id] = "SAV_INTAKE_EXECUTION_NOT_ADMITTED"; state.refusals[invalid.run.id] = "SAV_INTAKE_EXECUTION_PLAN_INVALID";
+    const pending = await execution(other, 0);
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    await reconcileIntakeExecutor({ env: () => environment, adapters: options.adapters });
+    expect(state.admissions).toEqual([refused.run.id, invalid.run.id, live.run.id]);
+    expect(state.claims).toEqual([pending.id]);
+    // The refused runs are retried after the cursor wraps, never dropped.
+    state.admissions = []; delete state.refusals[refused.run.id];
+    await scanIntakeExecutionCandidates(options); await scanIntakeExecutionCandidates(options);
+    expect(state.admissions).toContain(refused.run.id);
+});
+// Night V1 cycle 1 (M-1 review): the ADMISSION_LIMIT stop leaves one bounded, read-only trace per tick that tells a
+// reached ceiling from an incoherent admission ledger; the stop itself is unchanged (nothing admitted, cursor kept).
+it("night V1 cycle 1: ADMISSION_LIMIT logs once per tick whether the ceiling is reached or the ledger is incoherent", async () => {
+    const limited = await seed(0); await seed(1);
+    state.refusals[limited.run.id] = "SAV_INTAKE_EXECUTION_ADMISSION_LIMIT";
+    const errors = vi.spyOn(console, "error").mockImplementation(() => {});
+    const traces = () => errors.mock.calls.filter(c => c[0] === "sav_intake_execution_admission_limit").map(c => c[1]);
+    await scanIntakeExecutionCandidates(options);
+    expect(traces()).toEqual([{ runId: limited.run.id, cause: "ceiling_reached" }]);
+    // The counter no longer matches the admitted executions (the same check as execution-store).
+    await f.db.insert(savIntakeExecutionBudget).values({ id: "global", admitted: 5 }).onConflictDoUpdate({ target: savIntakeExecutionBudget.id, set: { admitted: 5 } });
+    errors.mockClear(); state.admissions = [];
+    await scanIntakeExecutionCandidates(options);
+    expect(traces()).toEqual([{ runId: limited.run.id, cause: "ledger_incoherent" }]);
+    expect(state.admissions).toEqual([limited.run.id]);
+    expect(await f.db.select().from(savIntakeExecutions)).toHaveLength(0);
+    errors.mockRestore();
+});
+it("night V1 C: a global admission limit stops this tick without skipping the run; an unknown failure still fails closed", async () => {
+    const limited = await seed(0), later = await seed(1);
+    state.refusals[limited.run.id] = "SAV_INTAKE_EXECUTION_ADMISSION_LIMIT";
+    expect(await scanIntakeExecutionCandidates(options)).toBe(2);
+    expect(state.admissions).toEqual([limited.run.id]);
+    state.admissions = [];
+    await scanIntakeExecutionCandidates(options);
+    expect(state.admissions[0]).toBe(limited.run.id);
+    state.refusals[limited.run.id] = "SAV_INTAKE_EXECUTION_INTERRUPTED"; state.admissions = [];
+    await expect(scanIntakeExecutionCandidates(options)).rejects.toThrow("SAV_INTAKE_EXECUTION_INTERRUPTED");
+    expect(state.admissions).toEqual([limited.run.id]); expect(later.run.id).not.toBe(limited.run.id);
 });

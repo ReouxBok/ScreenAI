@@ -13,6 +13,8 @@ import { releaseIntakeHumanHoldAction } from "../actions";
 import {IntakeRecoveryForm} from "../recovery-form";
 import { IntakeCompletionForm } from "../completion-form";
 import { manualOtherUnavailableLabels } from "@/lib/sav/intake/manual-other-classification";
+import { savCompletionBlockerLabels, savCompletionPrecheckLabels } from "@/lib/sav/completion-blockers";
+import { intakeExecutionAuthorityLabels } from "@/lib/sav/intake/execution-authority";
 import { IntakeManualOtherForm } from "../manual-other-form";
 import { IntakeInvalidSourceForm } from "../invalid-source-form";
 import { intakeStatusLabel, intakeProjectionLabel, intakeExecutionStateLabel, intakeReasonLabel, intakeContextReasonLabels, intakeCrmDeltaLabel, intakeNextStepLabel } from "@/lib/sav/intake/console-presentation";
@@ -141,6 +143,11 @@ export default async function IntakeDetailPage({ params, searchParams }: { param
       {manualOtherEligibility?.reason && <section className={styles.notice} aria-label="Classement dans Autres indisponible"><h2>Classement dans Autres indisponible</h2>
         <p>{manualOtherUnavailableLabels[manualOtherEligibility.reason]}</p></section>}
       {actions.classifyInvalidSource && current && <IntakeInvalidSourceForm key={`invalid-${current.messageId}`} threadId={id} messageId={current.messageId} requestKey={randomUUID()}/>}
+      {data.executionAuthority && data.executionAuthority !== "valid" && <section className={styles.notice} aria-label="Exécution automatique"><h2>Exécution automatique</h2>
+        <p>{intakeExecutionAuthorityLabels[data.executionAuthority]}</p></section>}
+      {!actions.closeHandledOutside && actions.administrator && (actions.completionPrecheck || actions.completionBlockers.length > 0) && <section className={styles.notice} aria-label="Passage en Terminés indisponible"><h2>Passage en Terminés indisponible</h2>
+        {actions.completionPrecheck && <p>{savCompletionPrecheckLabels[actions.completionPrecheck]}</p>}
+        {actions.completionBlockers.map(blocker => <p key={blocker}>{savCompletionBlockerLabels[blocker]}</p>)}</section>}
       {actions.closeHandledOutside && data.latestMessageId && <IntakeCompletionForm priorRequests={Boolean(pendingOriginals)} key={data.latestMessageId} threadId={id} messageId={data.latestMessageId} requestKey={randomUUID()}/>}
       {actions.releaseHold && data.latestMessageId && <section className={styles.notice}><h2>Reprendre ce dossier</h2>
         <p>Cette action lève uniquement sa pause humaine. Le moteur automatique pourra poursuivre si les preuves et la politique existante le permettent. Les tentatives et les preuves sont conservées. Si une nouvelle qualification est nécessaire, utilisez ensuite « Refaire l’analyse » dans le panneau de poursuite.</p>

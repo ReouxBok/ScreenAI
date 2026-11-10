@@ -61,14 +61,23 @@ export function intakeDossierActions(data: IntakeConsoleDetail, view: Pick<Retur
   const { current } = view, administrator = ["admin", "owner"].includes(staff.role), owner = staff.email === "ugo@limova.ai" && administrator;
   return {
     administrator,
-    closeHandledOutside: Boolean((!data.handledExternally || data.projection.status === "human_review") && data.latestMessageId && owner),
+    // Night V1 (A + cycle 1): offered only when the server would not refuse it: no pre-check refusal and no blocker
+    // (same pure function and readers as applyExternalCompletion; `source_changed` is re-read only at action time).
+    closeHandledOutside: Boolean((!data.handledExternally || data.projection.status === "human_review") && data.latestMessageId && owner
+      && !(data.completionBlockers ?? []).length && !data.completionPrecheck),
+    completionBlockers: data.completionBlockers ?? [],
+    completionPrecheck: data.completionPrecheck ?? null,
     classifyInvalidSource: Boolean(!data.handledExternally && current?.sourceInvalid && current.messageId === data.latestMessageId && owner),
     releaseHold: Boolean(data.humanHeld && !data.handledExternally && data.latestMessageId && administrator),
     recordChoice: Boolean(view.canCorrect && current?.sourceHash && view.plan),
     // SAV-71: not offered (null), a reason known from the dossier, or "read" for the eligibility reader.
     manualOther: !(owner && data.latestMessageId && !data.handledExternally && !current?.sourceInvalid) ? null
       : data.humanHeld || data.thread.paused ? "paused" as const
-        : data.confirmedCurrent || data.progress?.effects.some(effect => effect.state !== "planned") ? "effects_engaged" as const : "read" as const,
+        // Night V1 cycle 2 (N-1): a failed blocker read is said as such (still not offered), never as an engaged action.
+        : (data.completionBlockers ?? []).includes("unreadable") ? "read_failed" as const
+        : (data.completionBlockers ?? []).some(blocker => blocker !== "active_worker") || data.progress?.effects.some(effect => !["planned", "confirmed"].includes(effect.state)) ? "effects_engaged" as const
+          // Night V1 (A): a VERIFIED external result is not "to verify"; « Autres » would hide it, « Terminés » remains the exit.
+          : data.confirmedCurrent || data.progress?.effects.some(effect => effect.state === "confirmed") ? "effects_confirmed" as const : "read" as const,
     operatorBinding: current?.sourceHash && current.messageId === data.latestMessageId
       ? { threadId: data.thread.id, messageId: current.messageId, runId: current.id, version: current.version, sourceHash: current.sourceHash } : null,
     administratorVerifications: Boolean(administrator && data.latestMessageId),

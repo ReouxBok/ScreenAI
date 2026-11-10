@@ -3,7 +3,7 @@ import { eq, inArray, sql } from "drizzle-orm";
 import { requireDb } from "@/db";
 import { savIntakeModelCalls, savIntakeExecutions, savIntakeEffects } from "@/db/schema";
 import { intakeRuntimeHash } from "./runtime-contract";
-import { classifyIntakeUncertainty, type IntakeUncertainty } from "./uncertainty";
+import { classifyIntakeUncertainty, unreadIntakeUncertainties, type IntakeUncertainty } from "./uncertainty";
 type Reader = Pick<Parameters<Parameters<ReturnType<typeof requireDb>["transaction"]>[0]>[0], "select">;
 /** Exact aggregate over the current message's V1 ledgers, across all run versions.
  * Output and input bounded to one page, no payload decryption or provider calls.
@@ -21,4 +21,20 @@ export async function readIntakeUncertainties(tx: Reader, messageIds: string[]):
     .from(savIntakeExecutions).innerJoin(savIntakeEffects, eq(savIntakeEffects.executionId, savIntakeExecutions.id))
     .where(inArray(savIntakeExecutions.messageId, ids)).groupBy(savIntakeExecutions.messageId);
   return Object.fromEntries(ids.map((id, i) => [id, classifyIntakeUncertainty(calls.find(row => row.key === keys[i])?.uncertain === true, effects.find(row => row.id === id)?.uncertain === true)]));
+}
+
+/**
+ * The same read, but a query failure (statement timeout, lock timeout, missing table) degrades to `unread` for these ids instead of
+ * failing the console (a dead connection still fails the caller's commit; that is not rescued here): the
+ * page stays usable and still warns that a cost or an external action may be unsettled. `run` isolates the read (a savepoint inside
+ * the console's transaction, or its own read-only transaction) so the caller's transaction is not aborted. No raw error is logged.
+ */
+export async function readIntakeUncertaintiesOrUnread(messageIds: string[], run: (read: (tx: Reader) => Promise<Record<string, IntakeUncertainty>>) => Promise<Record<string, IntakeUncertainty>>): Promise<Record<string, IntakeUncertainty>> {
+  if (!messageIds.length) return {};
+  try {
+    return await run(tx => readIntakeUncertainties(tx, messageIds));
+  } catch {
+    console.error("SAV_INTAKE_UNCERTAINTY_READ_UNAVAILABLE");
+    return unreadIntakeUncertainties(messageIds);
+  }
 }

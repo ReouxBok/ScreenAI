@@ -197,7 +197,7 @@ it("names an uncertain execution as an external action to verify, never a generi
  const html=await renderDetail();
  expect(html).toContain("Exécution : Action HubSpot ou Gmail à vérifier");expect(html).not.toContain("Exécution : Incertitude à qualifier");expect(mocks.action).not.toHaveBeenCalled();
 });
-it.each([ ["cost","Coût IA à confirmer"],["effect","Action HubSpot ou Gmail à vérifier"],["both","Coût IA et action externe à vérifier"],["unknown","Incertitude à qualifier"] ])("renders %s uncertainty consistently without claiming completion",async(uncertainty,label)=>{
+it.each([ ["cost","Coût IA à confirmer"],["effect","Action HubSpot ou Gmail à vérifier"],["both","Coût IA et action externe à vérifier"],["unknown","Incertitude à qualifier"],["unread","Incertitude non lue : coût IA ou action HubSpot ou Gmail possible, à vérifier avant tout renvoi"] ])("renders %s uncertainty consistently without claiming completion",async(uncertainty,label)=>{
  mocks.list.mockResolvedValue({...fixture,rows:[{...fixture.rows[0],status:"uncertain",reason:null,uncertainty}]});
  expect(await renderList()).toContain(label);
  mocks.detail.mockResolvedValue({...detail,projection:{...detail.projection,status:"uncertain"},uncertainty});
