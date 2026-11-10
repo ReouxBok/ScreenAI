@@ -1,3 +1,5 @@
+import { readUnifiedMonitoring } from "./unified-monitoring-read";
+import { UnifiedConsoleOverview } from "./unified-console-overview";
 import { synPreviewEnabled } from "@/lib/sav/local-syn";
 import { readIntakeMonitoring } from "@/lib/sav/intake/monitoring-read";
 import { MonitoringSummary } from "./monitoring-summary";
@@ -14,15 +16,20 @@ import { intakeDossierHref } from "@/lib/sav/intake-ux/navigation";
 import { IntakeDossierLink, IntakeListPosition } from "./navigation";
 import { AgentPauseBanner } from "./agent-pause-banner";
 import { demoConsoleEnabled } from "./demo/demo-cases";
+import { Fragment } from "react";
+import { readUnifiedLines } from "./unified-console-read";
+import { UnifiedConsoleLine } from "./unified-console-line";
 export const dynamic = "force-dynamic";
 export default async function IntakeConsolePage({ searchParams }: { searchParams: Promise<{ view?: string; mailbox?: string; q?: string; page?: string; sort?: string }> }) {
   const staff=await requireIntakeConsoleStaff();
   const query = await searchParams, selected = savIntakeViewSchema.safeParse(query.view);
   const view = selected.success ? selected.data : "processing", mailbox = z.uuid().safeParse(query.mailbox);
-  const [data, monitoring] = await Promise.all([listIntakeConsole({ view, mailboxId: mailbox.success ? mailbox.data : undefined, search: query.q, page: Number(query.page) || 1, ...(query.sort==="oldest"?{sort:"oldest" as const}:{}) }), readIntakeMonitoring()]);
+  const [data, monitoring, unifiedMonitoring] = await Promise.all([listIntakeConsole({ view, mailboxId: mailbox.success ? mailbox.data : undefined, search: query.q, page: Number(query.page) || 1, ...(query.sort==="oldest"?{sort:"oldest" as const}:{}) }), readIntakeMonitoring(), readUnifiedMonitoring()]);
   const href = (nextView: string, page = 1, search = query.q ?? "") => `/studio/sav/intake?${new URLSearchParams({ view: nextView, q: search.slice(0, 120),
     ...(mailbox.success ? { mailbox: mailbox.data } : {}), ...(["newest","oldest"].includes(query.sort??"")?{sort:query.sort!}:{}), page: String(page) })}`;
   const origin = href(view, data.page);
+  // Page-bounded, select-only: V1 latest run + V2 case of the exact confirmed ticket.
+  const lines = data.installed ? await readUnifiedLines(data.rows) : {};
   return <div className={styles.console}>
     <IntakeListPosition origin={origin}/>
     <header className={styles.heading}><div><span className="eyebrow">SAV · nouveaux dossiers</span><h1>Suivre le traitement</h1>
@@ -43,12 +50,13 @@ export default async function IntakeConsolePage({ searchParams }: { searchParams
           <label className={styles.srOnly} htmlFor="intake-sort">Trier les dossiers</label><select id="intake-sort" name="sort" defaultValue={query.sort==="oldest"?"oldest":"newest"}><option value="newest">Plus récents d’abord</option><option value="oldest">Plus anciens d’abord</option></select>
           <button type="submit" className="secondary">Rechercher</button></form></div>
       {(data.counts.blocked ?? 0) > 0 && <p role="alert" className={styles.blockedAlert}>{data.counts.blocked} dossier{data.counts.blocked > 1 ? "s" : ""} bloqué{data.counts.blocked > 1 ? "s" : ""} — à traiter par l’équipe. Chaque ligne indique la cause ; ils restent comptés jusqu’à leur résolution.</p>}
+      <UnifiedConsoleOverview lines={lines} monitoring={unifiedMonitoring}/>
       <section aria-label={view === "processing" ? "Traitements en cours" : savIntakeViewLabels[view]} className={styles.list}>
-        {data.rows.length ? data.rows.map(row => <IntakeDossierLink key={row.threadId} id={row.threadId} origin={origin} href={intakeDossierHref(row.threadId, origin)} className={styles.row}>
+        {data.rows.length ? data.rows.map(row => <Fragment key={row.threadId}><IntakeDossierLink id={row.threadId} origin={origin} href={intakeDossierHref(row.threadId, origin)} className={styles.row}>
           <div><strong>{row.subject || "Nouvelle demande"}</strong><span>{row.fromEmail ?? "Expéditeur en cours de préparation"}</span></div>
           <div>{row.blockedCause ? <span className={row.blockedCause === "agent_paused" ? styles.status : styles.blocked}>{intakeBlockedCauseLabel(row.blockedCause)}</span> : row.retryAt ? <span className={styles.status}>{intakeRetryLabel(row.retryAt)}</span> : <span className={styles.status}>{intakeProjectionLabel(row.status, row.uncertainty)}</span>}{row.reason && <small>{intakeReasonLabel(row.reason)}</small>}</div>
           <div><span>Version {row.version ?? "en attente"}</span><time dateTime={row.receivedAt?.toISOString()}>{row.receivedAt ? formatParisDateTime(row.receivedAt) : "Nouvelle entrée"}</time></div>
-        </IntakeDossierLink>) : <div className={styles.empty}><h2>Aucun dossier dans cette vue</h2><p>{query.q ? "Aucun objet ou expéditeur ne correspond à la recherche." : "Les prochains dossiers apparaîtront ici selon leur avancement confirmé."}</p>{query.q && <Link href={href(view,1,"")}>Effacer la recherche</Link>}</div>}
+        </IntakeDossierLink><UnifiedConsoleLine line={lines[row.threadId]} origin={origin}/></Fragment>) : <div className={styles.empty}><h2>Aucun dossier dans cette vue</h2><p>{query.q ? "Aucun objet ou expéditeur ne correspond à la recherche." : "Les prochains dossiers apparaîtront ici selon leur avancement confirmé."}</p>{query.q && <Link href={href(view,1,"")}>Effacer la recherche</Link>}</div>}
       </section>
       <footer className={styles.pagination}><span>{data.total} dossier{data.total > 1 ? "s" : ""} · page {data.page} sur {data.pages}</span>
         <div>{data.page > 1 && <Link href={href(view, data.page - 1)}>Précédente</Link>}{data.page < data.pages && <Link href={href(view, data.page + 1)}>Suivante</Link>}</div></footer>
