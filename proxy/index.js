@@ -823,6 +823,7 @@ app.post('/api/copilot/voice-turn', verifyAssistantAuth, track('server_voice_tur
 app.post('/api/knowledge/search', verifyAssistantAuth, track('server_knowledge_search'), assistantLimiter, async (req, res) => {
   const requestId = crypto.randomUUID();
   if (!KNOWLEDGE_API_URL || !KNOWLEDGE_SERVICE_TOKEN) {
+    res.locals.analytics = { knowledge_outcome: 'configuration_unavailable' };
     return res.status(503).json({ error: 'Knowledge service unavailable', requestId });
   }
   const query = String(req.body?.query || '').trim();
@@ -833,6 +834,7 @@ app.post('/api/knowledge/search', verifyAssistantAuth, track('server_knowledge_s
     : ['article', 'onboarding'];
   const limit = Math.max(1, Math.min(10, Number(req.body?.limit) || 5));
   if (query.length < 2 || query.length > 2_000 || path.length > 1_000 || contentTypes.length === 0) {
+    res.locals.analytics = { knowledge_outcome: 'invalid_payload' };
     return res.status(400).json({ error: 'Invalid knowledge search payload', requestId });
   }
   const startedAt = Date.now();
@@ -843,7 +845,11 @@ app.post('/api/knowledge/search', verifyAssistantAuth, track('server_knowledge_s
       body: JSON.stringify({ query, path, locale, contentTypes, limit }),
       signal: AbortSignal.timeout(8_000)
     });
-    const data = await response.json().catch(() => ({ error: 'Invalid knowledge response' }));
+    let validJson = true;
+    const data = await response.json().catch(() => {
+      validJson = false;
+      return { error: 'Invalid knowledge response' };
+    });
     if (response.ok && data?.revision === 'kb_empty' && Array.isArray(data?.results) && data.results.length === 0) {
       // Installed extension versions still contain the historical embedded
       // fallback. Return an explicit empty-state result so those clients do
@@ -857,19 +863,30 @@ app.post('/api/knowledge/search', verifyAssistantAuth, track('server_knowledge_s
         verifiedAt: null
       }];
     }
-    res.locals.analytics = { result_count: Array.isArray(data?.results) ? data.results.length : 0 };
+    const resultCount = Array.isArray(data?.results) ? data.results.length : 0;
+    const knowledgeOutcome = !validJson ? 'invalid_response'
+      : !response.ok ? (response.status >= 500 ? 'upstream_5xx' : response.status >= 400 ? 'upstream_4xx' : 'upstream_http_error')
+        : !Array.isArray(data?.results) ? 'invalid_response'
+          : data.revision === 'kb_empty' ? 'empty_base'
+            : resultCount > 0 ? 'matched' : 'no_results';
+    res.locals.analytics = { result_count: resultCount, knowledge_outcome: knowledgeOutcome };
     console.info(JSON.stringify({ type: 'knowledge_search', requestId, status: response.status, revision: data?.revision || null, articleIds: Array.isArray(data?.results) ? data.results.map(result => result.id) : [], latencyMs: Date.now() - startedAt }));
     res.set('X-Request-Id', requestId);
     return res.status(response.status).json(data);
   } catch (error) {
+    res.locals.analytics = {
+      knowledge_outcome: ['TimeoutError', 'AbortError'].includes(error?.name)
+        ? 'upstream_timeout' : 'upstream_network_failure'
+    };
     console.error(JSON.stringify({ type: 'knowledge_error', requestId, message: error.message, latencyMs: Date.now() - startedAt }));
     return res.status(503).json({ error: 'Knowledge service unavailable', requestId });
   }
 });
 
-app.get('/api/onboarding/template', verifyAssistantAuth, assistantLimiter, async (req, res) => {
+app.get('/api/onboarding/template', verifyAssistantAuth, track('server_onboarding_template'), assistantLimiter, async (req, res) => {
   const requestId = crypto.randomUUID();
   const template = await fetchPublishedOnboardingTemplate(requestId);
+  res.locals.analytics = { template_outcome: template ? 'available' : 'unavailable' };
   res.set('X-Request-Id', requestId);
   if (!template) return res.status(503).json({ error: 'Onboarding template unavailable', requestId });
   console.info(JSON.stringify({ type: 'onboarding_template', requestId, revision: template.revision || null, stepCount: template.steps.length }));
