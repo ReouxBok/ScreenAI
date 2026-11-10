@@ -9,7 +9,7 @@ export type V2WiringStep = Readonly<{ step: string; label: string; state: V2Wiri
 
 export const V2_PIPELINE_WIRING: readonly V2WiringStep[] = [
   { step: "entry", label: "Entrée : mail confirmé par V1 → dossier V2", state: "wired_behind_flag", flag: "SAV_CASE_RECORDING",
-    detail: "Relais après l’intake V1 confirmée, rattrapage des relais manqués ; un relais raté ne bloque jamais V1." },
+    detail: "Relais après l’intake V1 confirmée et rattrapage des relais manqués. Une commande opérateur peut lancer un dossier existant dans le périmètre de qualification ; un relais raté ne bloque jamais V1." },
   { step: "owner_admission", label: "Propriétaire V2 et admission automatique", state: "dormant",
     detail: "Le pilote traite les tickets admissibles déjà attribués à SAV Pilote. L’attribution automatique à la création reste à raccorder. Les tickets des personnes restent à l’équipe." },
   { step: "investigation", label: "Investigation de l’agent", state: "wired_behind_flag",
