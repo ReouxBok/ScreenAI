@@ -40,6 +40,7 @@ export const manualOtherUnavailableLabels = {
   pending_command: "Une commande humaine reste à vérifier.",
   human_refusal: "Un refus humain protège ce dossier.",
   effects_engaged: "Une action engagée ou son résultat reste à vérifier.",
+  effects_confirmed: "Une action a déjà été réellement accomplie sur ce message (résultat vérifié) : « Autres » la masquerait. Si le dossier est traité, utilisez « Passer en Terminés ».",
   outside_launch: "Ce message est hors du périmètre lancé.",
   read_failed: "Les preuves n’ont pas pu être relues. Aucun classement n’est disponible.",
 } as const;
@@ -95,7 +96,10 @@ export async function readManualOtherEligibility(threadId: string, messageId: st
         sql`${auditLogs.technicalMetadata}->>'messageId'=${messageId} and ${auditLogs.technicalMetadata}->>'state' in ('queued','running')`)).limit(1);
       if (pendingOperator) return unavailable("pending_command");
       const effects = executions.length ? await tx.select().from(savIntakeEffects).where(inArray(savIntakeEffects.executionId, executions.map(value => value.id))) : [];
-      if (await hasUnsettledSavIntakeWork(threadId, tx) || executions.some(value => value.messageId === messageId && value.state === "confirmed") || effects.some(effect => executions.some(execution => execution.id === effect.executionId && execution.messageId === messageId) && effectEngaged(effect))) return unavailable("effects_engaged");
+      const ownEffects = effects.filter(effect => executions.some(execution => execution.id === effect.executionId && execution.messageId === messageId) && effectEngaged(effect));
+      if (await hasUnsettledSavIntakeWork(threadId, tx) || ownEffects.some(effect => effect.state !== "confirmed")) return unavailable("effects_engaged");
+      // Night V1 (A): verified results stay protected (never hidden in « Autres »), with their own truthful reason.
+      if (executions.some(value => value.messageId === messageId && value.state === "confirmed") || ownEffects.length) return unavailable("effects_confirmed");
       const legacy = await tx.select().from(savActions).where(eq(savActions.threadId, threadId));
       if (legacy.some(action => ["pending", "running"].includes(action.status) || action.messageId === messageId && (action.payload.ticketCreateDispatchedAt || action.payload.ticketReturnDispatchedAt || action.payload.replySendDispatchedAt || action.payload.forwardDispatchedAt || action.payload.intakeOccupationDispatchedAt))) return unavailable("effects_engaged");
       const snapshot = await savIntakeSourceSnapshot(tx, message, new Date()), review = humanSourceReview(snapshot);

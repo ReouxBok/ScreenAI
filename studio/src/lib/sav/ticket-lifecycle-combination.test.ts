@@ -8,8 +8,8 @@ import { resolveSavCustomerIdentity, resolveSavCustomerMessage } from "./forward
 import { savStructuredProposalSchema } from "./proposal";
 import { reviewSavProposal } from "./review";
 import { prepareSavManualTicketPreview, readSavTicketPreviewToken, readSavManualTicketPreviewContext } from "./manual-ticket-preview";
-import { queueSavManualTicket } from "./manual-tickets";
-import { retrySavAction } from "./service";
+import { queueSavManualTicketArchived as queueSavManualTicket } from "./manual-tickets";
+import { retrySavActionArchived as retrySavAction } from "./service";
 import { processPendingHubspotActions, reconcileSavTicketReturn, readSavHubspotContext } from "./hubspot";
 import { geminiFixture } from "../../../test/sav-understanding-fixtures";
 

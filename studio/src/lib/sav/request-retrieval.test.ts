@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import { assessSavKnowledgeValidity, assertSavRequestCandidateLinks, calibrateSavRetrievalRanking, retrieveSavKnowledgeByRequest, savRetrievalRanking, savWholeTokenCoverage, SAV_RETRIEVAL_LIMITS, type SavRetrievalCandidate } from "./request-retrieval";
+import { assessSavKnowledgeValidity, assertSavRequestCandidateLinks, calibrateSavRetrievalRanking, retrieveSavKnowledgeByRequest, savPersonalAccessIntent, savRetrievalRanking, savWholeTokenCoverage, SAV_RETRIEVAL_LIMITS, type SavRetrievalCandidate } from "./request-retrieval";
 
 const now = new Date("2026-10-15T12:00:00Z");
 function card(id = "card-a", patch: Partial<SavRetrievalCandidate> = {}): SavRetrievalCandidate {
@@ -129,5 +129,53 @@ describe("SAV72 source validity", () => {
   it("keeps a card valid through its expiry day and alerts before verification ages out", () => {
     const source = card("a", { verifiedAt: "2026-07-30T12:00:00Z", resolution: { steps: ["Étape"], validUntil: "2026-10-15" } });
     expect(assessSavKnowledgeValidity(source, "fr-FR", "support", now)).toEqual({ eligible: true, reason: "available", revalidationDue: true });
+  });
+});
+
+describe("personal access intent (review d70a A02/A04/A05/A09): synonyms ranked, other services and people not", () => {
+  // Synthetic catalogue shaped like the confusable cards (own login vs connecting a service, a workspace, a member); no real card or id.
+  const syn = (id: string, title: string, symptom: string) => card(id, { title, resolution: { steps: ["Étape synthétique."], symptoms: [symptom], conflictsWith: [], supersedes: [] } });
+  const catalogue = [
+    syn("login", "Se connecter avec le code reçu par e-mail", "Expliquer la connexion à son espace avec le code reçu par e-mail."),
+    syn("space", "Retrouver l’accès à son espace", "Aider le client à retrouver le bon compte et un espace déjà accessible."),
+    syn("linkedin", "Connecter LinkedIn pour publier", "Expliquer la connexion LinkedIn."),
+    syn("meta", "Connecter Facebook ou Instagram", "Expliquer la connexion Facebook ou Instagram."),
+    syn("integration", "Trouver et connecter une intégration", "Trouver un service et connecter le bon compte."),
+    syn("google", "Connecter Gmail ou Calendar", "Expliquer la connexion d’un compte Google."),
+    syn("outlook", "Connecter Outlook ou un calendrier compatible", "Expliquer comment connecter Outlook à l’outil."),
+    syn("chat", "Utiliser les conversations", "Où ouvrir une conversation ? Je ne retrouve pas le menu."),
+    syn("seo", "Rédiger un audit de site", "Je veux analyser le référencement de mon site."),
+    syn("member", "Inviter un membre dans l’organisation", "Expliquer où ajouter des utilisateurs à l’organisation."),
+    syn("email", "Changer son adresse e-mail", "Expliquer le changement de l’adresse e-mail de connexion."),
+  ];
+  const top3 = (query: string) => [...catalogue].sort((a, b) => savRetrievalRanking(query, b).rankingScore - savRetrievalRanking(query, a).rankingScore).slice(0, 3).map(row => row.id);
+  it.each([
+    ["A01", "Re: Découvrir. Bonjour, j’ai tenté de me connecter à mon espace avec mon adresse d’inscription, sans succès."],
+    ["A02", "Pourquoi je ne peux pas accéder au site ?"],
+    ["A03", "J’ouvre le chat mais je n’arrive pas à me connecter à la plateforme pour travailler. J’ai déjà payé."],
+    ["A04", "Je n’arrive pas à accéder à mon compte. J’ai pris un abonnement avec un essai aujourd’hui."],
+    ["A05", "Objet : problème de connexion à mon compte. Je vous ai déjà envoyé une capture."],
+    ["A06", "J’ai déjà essayé le bon lien et la bonne adresse e-mail, mais je ne reçois aucun code de connexion."],
+    ["A08", "J’ai déjà essayé le bon lien et la bonne adresse e-mail, je ne reçois aucun code. J’ai aussi vérifié les spams, rien."],
+    ["A09", "J’ai déjà essayé le bon lien et la bonne adresse, je ne reçois aucun code. Spams vérifiés. L’écran affiche « identifiant introuvable »."],
+  ])("%s: the login card is in the TOP 3", (_id, query) => {
+    expect(savPersonalAccessIntent(query)).toBe(true);
+    expect(top3(query)).toContain("login");
+  });
+  it.each([
+    "Je n’arrive pas à connecter mon Gmail.",
+    "Comment me connecter à Outlook depuis l’outil ?",
+    "Je voudrais inviter un collaborateur dans mon organisation.",
+    "Combien d’utilisateurs puis-je ajouter, quel est le quota ?",
+    "La fenêtre de connexion LinkedIn reste bloquée.",
+    "Je n’arrive pas à accéder au site web de mon client depuis mon intégration WordPress.",
+  ])("negative « %s »: no personal access intent, the login card is not first", query => {
+    expect(savPersonalAccessIntent(query)).toBe(false);
+    expect(top3(query)[0]).not.toBe("login");
+  });
+  it("the boost reads the card's own words, never an id: the same card under another id ranks the same", () => {
+    const query = "Je n’arrive pas à accéder à mon compte.";
+    const renamed = { ...catalogue[0]!, id: "other-id", contentVersionId: "other-id-v9" };
+    expect(savRetrievalRanking(query, renamed).rankingScore).toBe(savRetrievalRanking(query, catalogue[0]!).rankingScore);
   });
 });

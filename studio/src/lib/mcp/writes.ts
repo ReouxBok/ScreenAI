@@ -6,6 +6,7 @@ import { z } from "zod";
 import { requireDb } from "@/db";
 import { auditLogs } from "@/db/schema";
 import { completeSavDossierManually } from "@/lib/sav/external-completion";
+import { savCompletionBlockerLabels, savCompletionPrecheckCodes, savCompletionPrecheckLabels, type SavCompletionPrecheck } from "@/lib/sav/completion-blockers";
 import { classifyInvalidSourceAsOther } from "@/lib/sav/intake/invalid-source-classification";
 import { classifyValidSourceAsOther, manualOtherUnavailableLabels } from "@/lib/sav/intake/manual-other-classification";
 import { releaseIntakeHumanHold } from "@/lib/sav/intake/human-hold-release";
@@ -133,15 +134,27 @@ const completion = (result: { marked: number; alreadyCompleted: number; skipped:
   result.marked ? done(okMessage) : result.alreadyCompleted ? alreadyDone("Déjà fait pour ce message.")
     : result.skipped.active_worker ? refused("SAV_MCP_ACTIVE_WORKER", "Un traitement est encore en cours : réessayer après sa fin.")
       : result.skipped.unsettled_action ? refused("SAV_MCP_UNSETTLED_ACTION", "Une action ou un résultat externe reste à vérifier : dossier conservé en attente.")
-        : refused("SAV_MCP_DOSSIER_CHANGED", "Le dossier a changé ou ne peut pas être traité ainsi : relire avant de réessayer.");
+        // Night V1 cycle 1 (I-1): explicit codes for the server's pre-check refusals instead of « dossier changé ».
+        : serverPrecheck(result.skipped) ? refused(savCompletionPrecheckCodes[serverPrecheck(result.skipped)!], savCompletionPrecheckLabels[serverPrecheck(result.skipped)!])
+          : refused("SAV_MCP_DOSSIER_CHANGED", "Le dossier a changé ou ne peut pas être traité ainsi : relire avant de réessayer.");
+const serverPrecheck = (skipped: Record<string, number>) => (Object.keys(savCompletionPrecheckLabels) as SavCompletionPrecheck[]).find(reason => skipped[reason]);
 const unavailable = (what: string) => refused("SAV_MCP_ACTION_UNAVAILABLE", `${what} n’est pas proposé sur ce dossier pour vous, comme dans la console.`);
 
 const closeHandledOutside = studioMcpWrite("close_handled_outside", "Passer en Terminés (déjà traité)",
   "Passe le dernier message en Terminés comme traité hors Studio. Aucun mail envoyé, aucun ticket HubSpot fermé. Réservé à l’opérateur autorisé, comme dans la console. Exige attestHandled: true.",
   { ...dossierInput, attestHandled: z.literal(true) }, async (context, input, claim) => {
     const found = await currentDossier(input); if (!found.ok) return found.result;
-    const view = intakeDossierView(found.data);
-    if (!intakeDossierActions(found.data, view, context.staff).closeHandledOutside || !found.version.messageId) return unavailable("Le passage en Terminés");
+    const view = intakeDossierView(found.data), actions = intakeDossierActions(found.data, view, context.staff);
+    // Night V1 (A + cycle 1): refused for a named server reason keeps that reason's explicit code, before any claim
+    // (server order: pre-check first, then blockers).
+    if (!actions.closeHandledOutside && (actions.completionPrecheck || actions.completionBlockers.length)
+      && intakeDossierActions({ ...found.data, completionBlockers: [], completionPrecheck: null }, view, context.staff).closeHandledOutside) {
+      if (actions.completionPrecheck) return refused(savCompletionPrecheckCodes[actions.completionPrecheck], savCompletionPrecheckLabels[actions.completionPrecheck]);
+      const labels = actions.completionBlockers.map(blocker => savCompletionBlockerLabels[blocker]).join(" ");
+      if (actions.completionBlockers.includes("unreadable")) return refused("SAV_MCP_ACTION_UNAVAILABLE", labels);
+      return refused(actions.completionBlockers.every(blocker => blocker === "active_worker") ? "SAV_MCP_ACTIVE_WORKER" : "SAV_MCP_UNSETTLED_ACTION", labels);
+    }
+    if (!actions.closeHandledOutside || !found.version.messageId) return unavailable("Le passage en Terminés");
     const lost = await claim(); if (lost) return lost;
     return completion(await completeSavDossierManually({ requestKey: input.idempotencyKey, threadId: input.threadId, messageId: found.version.messageId, confirmed: true }, versionGuard(found.version)),
       "Dossier passé en Terminés : déjà traité. Aucun mail envoyé ni ticket HubSpot fermé.");

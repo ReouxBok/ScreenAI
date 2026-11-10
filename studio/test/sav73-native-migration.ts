@@ -9,6 +9,8 @@ import { drizzle } from "drizzle-orm/postgres-js";
 import { migrate } from "drizzle-orm/postgres-js/migrator";
 import { validateSavNativeTestTarget } from "./sav-native-db";
 import { encryptSavPayload } from "../src/lib/sav/crypto";
+/** Tags and whens of 0000..0045 as applied in production, and 0045 as drizzle hashes it. */
+const HISTORY_PREFIX_SHA256="83a4c3e1c41adfc94332bf7211600e05e3626324efc76e0b101a9feec4a2417e",MCP0045_SHA256="48df7d72bdad68140488aad3c5fb22fefd5b556bef63be39e82600e3950879e9";
 const url=process.env.SAV_TEST_POSTGRES_URL ?? "";
 validateSavNativeTestTarget(url,process.env.SAV_TEST_POSTGRES_TOKEN);
 const client=postgres(url,{max:1,prepare:false,onnotice:()=>{}}),db=drizzle(client);
@@ -23,7 +25,12 @@ try {
   for(let i=1;i<journal.entries.length;i++)assert.ok(journal.entries[i].when>journal.entries[i-1].when,"Migration timestamps must increase");
   const tags=journal.entries.map((entry:{tag:string})=>entry.tag);
   for(const required of ["0037_sav_case_learning","0039_sav_dashboard_projection","0040_sav_intake_runtime","0041_sav_intake_execution","0042_sav_intake_console","0043_sav_intake_launch_guards","0044_sav_operator_command_indexes","0045_studio_mcp_tokens"])assert.ok(tags.includes(required),`Missing migration ${required}`);
-  assert.equal(journal.entries.at(-1).tag,"0045_studio_mcp_tokens");
+  // The applied history up to MCP0045 is frozen: same tags and whens, byte-identical 0045. Later
+  // migrations (V2 0046+) may follow it, each strictly later; 0045 need not stay the last one.
+  const mcp=tags.indexOf("0045_studio_mcp_tokens"),prefix=JSON.stringify(journal.entries.slice(0,mcp+1).map((entry:{tag:string;when:number})=>[entry.tag,entry.when]));
+  assert.equal(createHash("sha256").update(prefix).digest("hex"),HISTORY_PREFIX_SHA256,"Applied migration history up to 0045 must not change");
+  const mcpSql=await readFile(new URL("0045_studio_mcp_tokens.sql",directory),"utf8");
+  assert.equal(createHash("sha256").update(mcpSql).digest("hex"),MCP0045_SHA256,"Migration 0045 content must not change");
   assert.ok(tags.indexOf("0044_sav_operator_command_indexes")<tags.indexOf("0045_studio_mcp_tokens"));
   assert.ok(tags.indexOf("0037_sav_case_learning")<tags.indexOf("0039_sav_dashboard_projection"));
   const entries=journal.entries.filter((entry:{tag:string})=>entry.tag<"0039_sav_dashboard_projection");
@@ -48,6 +55,8 @@ try {
   assert.deepEqual({...projection},{rows:1,dirty:1});
   const [journalCount]=await client`select count(*)::int as migrations from drizzle.__drizzle_migrations`;
   assert.equal(journalCount.migrations,journal.entries.length,"Every journal migration must be recorded exactly once");
+  const [mcpRow]=await client`select hash from drizzle.__drizzle_migrations where created_at=${journal.entries[mcp].when}`;
+  assert.equal(mcpRow?.hash,MCP0045_SHA256,"The recorded 0045 must be the frozen one");
   const [intake]=await client`select (select count(*)::int from sav.intake_console) as projections,(select count(*)::int from sav.intake_runs) as runs,(select count(*)::int from sav.intake_effects) as effects,(select admitted from sav.intake_execution_budget where id='global') as admitted`;
   assert.deepEqual({...intake},{projections:0,runs:0,effects:0,admitted:0},"Migrating V0 data must not admit or execute an intake");
   const [operatorIndexes]=await client`select count(*)::int as indexes from pg_indexes where schemaname='public' and indexname in ('sav_operator_message_idx','sav_operator_pending_idx')`;
@@ -67,5 +76,5 @@ try {
   const [tokenIndex]=await client`select indexdef from pg_indexes where schemaname='public' and indexname='studio_mcp_tokens_staff_idx'`;
   assert.equal(tokenIndex?.indexdef,"CREATE INDEX studio_mcp_tokens_staff_idx ON public.studio_mcp_tokens USING btree (staff_id, created_at DESC NULLS LAST)");
   const [triggers]=await client`select count(*)::int as triggers from pg_trigger where not tgisinternal and tgname like 'sav_dashboard_%'`;
-  console.log(JSON.stringify({status:"pass",upgrade:"populated0037-to0045",intake,mcpTokenColumns:tokenColumns.length,mcpTokenConstraints:tokenConstraints.length,mcpStaffIndex:true,migratorRunTwice:true,sourceSnapshotSha256:createHash("sha256").update(before).digest("hex"),humanCiphertextUnchanged:true,pauseUnchanged:true,projection,journalCount,triggers}));
+  console.log(JSON.stringify({status:"pass",upgrade:`populated0037-to${journal.entries.at(-1).tag}`,intake,mcpTokenColumns:tokenColumns.length,mcpTokenConstraints:tokenConstraints.length,mcpStaffIndex:true,migratorRunTwice:true,sourceSnapshotSha256:createHash("sha256").update(before).digest("hex"),humanCiphertextUnchanged:true,pauseUnchanged:true,projection,journalCount,triggers}));
 } finally {await client.end();await rm(folder,{recursive:true,force:true});}

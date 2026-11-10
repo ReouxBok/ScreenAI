@@ -8,6 +8,7 @@ import { intakeExecutionConfig, readIntakeExecutionAuthority } from "./intake/ex
 import { SAV_INTAKE_OPERATIONAL_PROFILE, intakeAdmissionUsage } from "./intake/budget-profile";
 import { readIntakeOtherRules } from "./intake/other-routing";
 import { decryptSavPayload } from "./crypto";
+import { countLegacyHumanCommands, countLegacyStartedMails } from "./intake/legacy-started";
 import { intakeBlockedRunSql, intakeBlockedPause } from "./intake/console-store";
 import { readSavAgentPause, SAV_AGENT_PAUSE_CODES } from "./intake/agent-pause";
 import { monitorStateSchema, monitorCodes, nextMonitorState, monitorWebhook, monitorSlackText, monitorDeliveryHash, type MonitorState, type MonitorSnapshot, type MonitorIssue, type MonitorCode } from "./monitor-contract";
@@ -97,6 +98,19 @@ export async function collectSavMonitorSnapshot(): Promise<MonitorSnapshot> {
       if (pause.analysisPaused) pausedHeld += metrics.pending;
       else add("analysis_delayed", delaySeconds > 600 ? metrics.pending : 0, delaySeconds > 1800 ? "critical" : "warning");
       add("analysis_uncertain", messages[0]?.uncertain ?? 0, "critical");
+      // Mail the retired V0 engine had started (processing, failed, or pending with attempts or any V0 trace): intake never claims it
+      // (unclaimedMessage in runtime-store.ts) and V0 no longer resumes it. Read-only counts by cause (intake/legacy-started.ts, the same
+      // predicate as the readable inventory); nothing is resumed, reset or closed here.
+      const abandoned = await countLegacyStartedMails(tx, now);
+      metrics.legacyStartedProcessing = abandoned.byCause.v0_processing; metrics.legacyStartedFailed = abandoned.byCause.v0_failed;
+      metrics.legacyStartedPendingAfterAttempt = abandoned.byCause.v0_pending_after_attempt; metrics.legacyStartedPendingWithTraces = abandoned.byCause.v0_pending_with_traces;
+      add("legacy_unclaimed", abandoned.total, abandoned.oldestAgeSeconds > 1800 ? "critical" : "warning");
+      // Human commands of the retired circuit still open when it was retired. Counted only: nothing is executed, cancelled or acknowledged
+      // (decision C2 is Ugo's). A dispatch trace without confirmation is verify-only and never re-sent.
+      const queued = await countLegacyHumanCommands(tx, now);
+      metrics.legacyHumanQueuedNotDispatched = queued.byState.queued_not_dispatched; metrics.legacyHumanRunningNotDispatched = queued.byState.running_not_dispatched;
+      metrics.legacyHumanDispatchUnconfirmed = queued.byState.dispatch_started_unconfirmed; metrics.legacyMachineRowsOpen = queued.machineRowsOpen;
+      add("legacy_human_queued", queued.total, queued.oldestAgeSeconds > 1800 ? "critical" : "warning");
       const waiting = await queryRows<{payload_ciphertext:string;attempts:number}>(tx,sql`select r.payload_ciphertext,r.attempts from sav.intake_runs r
         join sav.messages m on m.id=r.message_id join sav.threads t on t.id=r.thread_id
         join sav.sync_state l on l.key='sav-intake-launch:'||m.mailbox_id::text and l.status='intake_launch_v1'

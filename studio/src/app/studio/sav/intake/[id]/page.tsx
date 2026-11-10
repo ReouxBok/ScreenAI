@@ -1,3 +1,4 @@
+import { intakeUncertaintyLabel } from "@/lib/sav/intake/uncertainty";
 import { randomUUID } from "node:crypto";
 import { notFound } from "next/navigation";
 import { z } from "zod";
@@ -12,9 +13,11 @@ import { releaseIntakeHumanHoldAction } from "../actions";
 import {IntakeRecoveryForm} from "../recovery-form";
 import { IntakeCompletionForm } from "../completion-form";
 import { manualOtherUnavailableLabels } from "@/lib/sav/intake/manual-other-classification";
+import { savCompletionBlockerLabels, savCompletionPrecheckLabels } from "@/lib/sav/completion-blockers";
+import { intakeExecutionAuthorityLabels } from "@/lib/sav/intake/execution-authority";
 import { IntakeManualOtherForm } from "../manual-other-form";
 import { IntakeInvalidSourceForm } from "../invalid-source-form";
-import { intakeStatusLabel, intakeReasonLabel, intakeContextReasonLabels, intakeCrmDeltaLabel, intakeNextStepLabel } from "@/lib/sav/intake/console-presentation";
+import { intakeStatusLabel, intakeProjectionLabel, intakeExecutionStateLabel, intakeReasonLabel, intakeContextReasonLabels, intakeCrmDeltaLabel, intakeNextStepLabel } from "@/lib/sav/intake/console-presentation";
 import styles from "../intake.module.css";
 import { IntakeBackLink } from "../navigation";
 import { CrmRecord, StreamedChoiceForm, StreamedCrmContext } from "../crm-streamed";
@@ -57,7 +60,7 @@ export default async function IntakeDetailPage({ params, searchParams }: { param
   return <div className={styles.console}>
     <IntakeBackLink className={styles.back} returnTo={query?.returnTo}/>
     <header className={styles.heading}><div><span className="eyebrow">Dossier · version {current?.version ?? "en attente"}</span><h1>{data.thread.subject || "Nouvelle demande"}</h1>
-      <p>{dirty ? "Mise à jour du traitement en cours" : intakeReasonLabel(data.projection.reason) ?? intakeStatusLabel(data.projection.status)}</p></div></header>
+      <p>{dirty ? "Mise à jour du traitement en cours" : intakeReasonLabel(data.projection.reason) ?? intakeProjectionLabel(data.projection.status, data.uncertainty)}</p></div></header>
     {releaseNotice && <p role="status">{releaseNotice === "released" && !data.thread.paused && !data.humanHeld && !data.handledExternally ? "La pause est levée pour ce dossier. Le moteur pourra poursuivre si les preuves et la politique existante le permettent. Si une nouvelle qualification est nécessaire, utilisez « Refaire l’analyse » dans le panneau de poursuite." : "La pause est conservée : le dossier a changé, une opération reste en cours ou votre accès ne permet pas cette reprise. Rechargez le dossier et vérifiez ses preuves."}</p>}
     {pendingOriginals && <section className={styles.notice} aria-label="Demandes antérieures à traiter">
       <h2>Vérifier la prise en charge des mails précédents</h2>
@@ -94,6 +97,7 @@ export default async function IntakeDetailPage({ params, searchParams }: { param
       ticketId={data.confirmedCurrent && data.progress?.ticketId ? data.progress.ticketId : target && target.operation !== "create" ? target.ticketId : undefined}
       confirmed={Boolean(data.confirmedCurrent)} creationPlanned={target?.operation === "create" && !data.confirmedCurrent}
       verifiedAt={data.confirmedCurrent ? data.progress?.effects.filter(e => e.state === "confirmed" && e.confirmedAt).map(e => e.confirmedAt!).sort((a,b)=>b.getTime()-a.getTime())[0]?.toISOString() : undefined}/>
+    {data.projection.status === "uncertain" && <p role="status">{intakeUncertaintyLabel(data.uncertainty)}. Les effets confirmés restent conservés ; ce résumé ne vaut pas résolution du dossier.</p>}
     <div className={styles.detailGrid}><div>
       <MailConversation messages={data.messages}/>
       {data.historyTruncated && <p role="status">Les 200 messages les plus récents sont affichés. L’historique est incomplet.</p>}
@@ -131,7 +135,7 @@ export default async function IntakeDetailPage({ params, searchParams }: { param
         <p>Aucun brouillon de réponse de résolution n’a été produit par ce parcours. Les réponses supervisées existantes restent dans la file supervisée.</p>
       </section>
     </div><aside className={styles.side}>
-      <IntakeProcessingSummary status={intakeStatusLabel(data.projection.status)} cause={intakeReasonLabel(data.progress?.reason ?? data.projection.reason)} question={question}
+      <IntakeProcessingSummary status={intakeProjectionLabel(data.projection.status, data.uncertainty)} cause={intakeReasonLabel(data.progress?.reason ?? data.projection.reason)} question={question}
         confirmedEffects={data.progress?.effects.filter(e=>e.state==="confirmed").length??0} uncertain={data.progress?.state==="uncertain"||Boolean(data.progress?.effects.some(e=>["dispatched","acked","uncertain"].includes(e.state)))}
         paused={data.thread.paused||data.humanHeld} exhausted={Boolean(blocked)}
         lastActivity={data.diagnostics?.runs.flatMap(r=>r.events.map(e=>e.createdAt)).sort((a,b)=>b.getTime()-a.getTime())[0] ? formatParisDateTime(data.diagnostics.runs.flatMap(r=>r.events.map(e=>e.createdAt)).sort((a,b)=>b.getTime()-a.getTime())[0]) : undefined}/>
@@ -139,6 +143,11 @@ export default async function IntakeDetailPage({ params, searchParams }: { param
       {manualOtherEligibility?.reason && <section className={styles.notice} aria-label="Classement dans Autres indisponible"><h2>Classement dans Autres indisponible</h2>
         <p>{manualOtherUnavailableLabels[manualOtherEligibility.reason]}</p></section>}
       {actions.classifyInvalidSource && current && <IntakeInvalidSourceForm key={`invalid-${current.messageId}`} threadId={id} messageId={current.messageId} requestKey={randomUUID()}/>}
+      {data.executionAuthority && data.executionAuthority !== "valid" && <section className={styles.notice} aria-label="Exécution automatique"><h2>Exécution automatique</h2>
+        <p>{intakeExecutionAuthorityLabels[data.executionAuthority]}</p></section>}
+      {!actions.closeHandledOutside && actions.administrator && (actions.completionPrecheck || actions.completionBlockers.length > 0) && <section className={styles.notice} aria-label="Passage en Terminés indisponible"><h2>Passage en Terminés indisponible</h2>
+        {actions.completionPrecheck && <p>{savCompletionPrecheckLabels[actions.completionPrecheck]}</p>}
+        {actions.completionBlockers.map(blocker => <p key={blocker}>{savCompletionBlockerLabels[blocker]}</p>)}</section>}
       {actions.closeHandledOutside && data.latestMessageId && <IntakeCompletionForm priorRequests={Boolean(pendingOriginals)} key={data.latestMessageId} threadId={id} messageId={data.latestMessageId} requestKey={randomUUID()}/>}
       {actions.releaseHold && data.latestMessageId && <section className={styles.notice}><h2>Reprendre ce dossier</h2>
         <p>Cette action lève uniquement sa pause humaine. Le moteur automatique pourra poursuivre si les preuves et la politique existante le permettent. Les tentatives et les preuves sont conservées. Si une nouvelle qualification est nécessaire, utilisez ensuite « Refaire l’analyse » dans le panneau de poursuite.</p>
@@ -163,7 +172,7 @@ export default async function IntakeDetailPage({ params, searchParams }: { param
           hasNoteReceipt={actions.noteReceipt} allowReanalysis={false} showReanalysis={false}
           unavailableReason={controls.reason}/>}
         <p>{data.diagnostics?.totalAttempts ?? 0} tentative(s) cumulée(s) pour le dernier message. Les versions remplacées ne sont pas des décisions applicables.</p>
-        {data.diagnostics?.execution && <p>Exécution : {intakeStatusLabel(data.diagnostics.execution.state ?? "waiting")} · {data.diagnostics.execution.waitingPasses ?? 0} passage(s) en attente
+        {data.diagnostics?.execution && <p>Exécution : {intakeExecutionStateLabel(data.diagnostics.execution.state ?? "waiting")} · {data.diagnostics.execution.waitingPasses ?? 0} passage(s) en attente
           {data.diagnostics.execution.lastPassAt ? ` · dernier ${formatParisDateTime(data.diagnostics.execution.lastPassAt)}` : ""} · {data.diagnostics.execution.reason ?? "aucun code"}
           {data.diagnostics.execution.originalCrmRecorded === false ? " · empreinte HubSpot d’origine absente (analyse antérieure)" : ""}.</p>}
         {data.diagnostics?.runs.map(run => <details key={run.runId}><summary>Version {run.version} · {intakeStatusLabel(run.state)} · {run.attempts} tentative(s)</summary>

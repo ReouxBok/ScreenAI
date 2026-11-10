@@ -1,15 +1,16 @@
+import { intakeUncertaintyLabel, type IntakeUncertainty } from "./uncertainty";
 const statuses: Record<string, string> = {
   human_hold: "À valider par l’équipe",
   human_other: "Autres · classement humain", human_review: "Décision confiée à l’équipe",
   handled_externally: "Traité hors Studio", external_completion_pending: "Traitement externe à vérifier",
   historical_outside_automation: "Historique — hors automatisation",
   processing: "Traitement en cours", pending: "Analyse en attente", analysing: "Analyse en cours", observed: "Analyse prête, actions en attente",
-  waiting: "Vérification technique en attente", uncertain: "Résultat externe à rapprocher", running: "Vérification des actions en cours",
+  waiting: "Vérification technique en attente", uncertain: "Incertitude à qualifier", running: "Vérification des actions en cours",
   paused: "Dossier en pause", human_refused: "Proposition refusée", human_revalidation: "Choix enregistré, vérification en cours",
   human_revalidation_wait: "Choix en attente de preuves", identity_sent: "Demande d’identification envoyée", human_choice: "Choix humain attendu",
   followup_pending: "Actions confirmées, suivi en attente", followup_started: "Suivi démarré", context_changed: "Nouvelles preuves à vérifier",
   not_applicable_sensitive: "Fermeture vérifiée · apprentissage exclu", summary_finished: "Bilan terminé", qualified_other: "Autres · classement qualifié",
-  confirmed: "Actions confirmées", refused: "Poursuite arrêtée", superseded: "Version remplacée",
+  confirmed: "Actions confirmées", refused: "Poursuite arrêtée", superseded: "Version remplacée", v2_customer_return: "Retour client repris sur le dossier V2",
 };
 const reasons: Array<[RegExp, string]> = [
   [/FORWARDED_ORIGIN_UNVERIFIED/, "Mail transféré sans instruction de l’expéditeur. Identifier la demande originale et vérifier son ticket dans HubSpot."],
@@ -33,6 +34,10 @@ const reasons: Array<[RegExp, string]> = [
   [/RESOURCE/, "La ressource approuvée nécessaire à ce parcours est indisponible."],
 ];
 export const intakeStatusLabel = (status: string) => statuses[status] ?? "Vérification en attente";
+/** Console projection: an uncertain dossier names what is uncertain (AI cost, external HubSpot/Gmail action, both) when the V1 ledgers say so. */
+export const intakeProjectionLabel = (status: string, uncertainty?: IntakeUncertainty | null) => status === "uncertain" ? intakeUncertaintyLabel(uncertainty) : intakeStatusLabel(status);
+/** An execution ends `uncertain` only when one of its HubSpot/Gmail effects is unconfirmed (executor reconciliation): never a generic uncertainty. */
+export const intakeExecutionStateLabel = (state: string) => state === "uncertain" ? intakeUncertaintyLabel("effect") : intakeStatusLabel(state);
 const crmClasses: Record<string, string> = {
   business_change: "changement dans HubSpot sur un élément utilisé par la décision", unattributed_email: "email ajouté dans HubSpot, non encore attribué",
   unknown: "écart dont le détail n’est pas disponible",

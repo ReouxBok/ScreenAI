@@ -216,6 +216,12 @@ async function analyseSavIntakeRuntimeWithinBudget(runId: string, config: Intake
   } finally { controller.abort(); clearTimeout(timer); }
 }
 export async function analyseSavIntakeRuntime(...args: Parameters<typeof analyseSavIntakeRuntimeWithinBudget>) {
+  // V2 entry, before any claim, read or model call on every path. Off, nothing of V2 is even loaded: V1 as it always was.
+  const entryEnv = (args[2]?.env ?? (() => process.env))();
+  if (entryEnv.SAV_V2_ENTRY === "on" && entryEnv.SAV_CASE_RECORDING === "on") {
+    const stopped = await (await import("../cases/v2-entry")).customerReturnGate(args[0], { env: entryEnv });
+    if (stopped) return stopped as Extract<Awaited<ReturnType<typeof analyseSavIntakeRuntimeWithinBudget>>, { skipped: string }>;
+  }
   const first = await withSavAiBudget(() => analyseSavIntakeRuntimeWithinBudget(...args));
   if (!("retryFormat" in first) || !first.retryFormat) return first;
   const deadline = args[2]?.deadlineMs;

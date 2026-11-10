@@ -163,7 +163,7 @@ test("un contenu existant peut être mis à jour puis supprimé par un administr
 
 test("le banc E2E utilise l’identité owner et expose les espaces administrateur",async({page})=>{
   await login(page);
-  await expect(page.getByRole("link",{name:"SAV IA",exact:true})).toBeVisible();
+  await expect(page.getByRole("link",{name:"Demandes",exact:true})).toBeVisible();
   await expect(page.getByRole("link",{name:"Entraînements",exact:true})).toBeVisible();
   await page.goto("/studio/validations");
   await page.waitForURL(/\/studio\/validations$/);
@@ -195,7 +195,7 @@ test("une démonstration extension devient un parcours Charly éditable",async({
     await page.goto("/studio/entrainements");
     await page.getByLabel("Nom du parcours").fill("Créer une campagne sociale E2E");
     await page.getByLabel("Ce que Charly doit apprendre").fill("Guider le membre jusqu’à son premier brouillon de campagne.");
-    await page.getByLabel("Agent").selectOption("charly");
+    await page.getByLabel("Agent", { exact: true }).selectOption("charly");
     await page.getByLabel("Page de départ").fill("/super-powers");
     await page.getByRole("button",{name:"Créer la démonstration"}).click();
 
@@ -415,13 +415,13 @@ test("un membre crée, finalise et transforme son tutoriel sans accéder à celu
   try {
     await memberPage.goto("/studio");
     await expect(memberPage.getByRole("link", { name: "Entraînements", exact: true })).toBeVisible();
-    await expect(memberPage.getByRole("link", { name: "SAV IA", exact: true })).toHaveCount(0);
+    await expect(memberPage.getByRole("link", { name: "Demandes", exact: true })).toHaveCount(0);
     await expect(memberPage.getByRole("link", { name: "Trame d’onboarding", exact: true })).toHaveCount(0);
     await expect(memberPage.getByRole("link", { name: "Santé", exact: true })).toHaveCount(0);
     await memberPage.goto("/studio/entrainements");
     await memberPage.getByLabel("Nom du parcours").fill(title);
     await memberPage.getByLabel("Ce que Charly doit apprendre").fill("Vérifier tout le parcours de création d’un tutoriel membre.");
-    await memberPage.getByLabel("Agent").selectOption("charly");
+    await memberPage.getByLabel("Agent", { exact: true }).selectOption("charly");
     await memberPage.getByLabel("Page de départ").fill("/super-powers");
     await memberPage.getByRole("button", { name: "Créer la démonstration" }).click();
     await memberPage.waitForURL(/\/studio\/entrainements\/[0-9a-f-]+\?token=/);
@@ -492,7 +492,7 @@ test("dix membres créent et enregistrent leurs tutoriels en parallèle", async 
     await Promise.all(pages.map(async (page, index) => {
       await page.getByLabel("Nom du parcours").fill(`Tutoriel parallèle ${index + 1}`);
       await page.getByLabel("Ce que Charly doit apprendre").fill(`Valider le parcours simultané ${index + 1}.`);
-      await page.getByLabel("Agent").selectOption("charly");
+      await page.getByLabel("Agent", { exact: true }).selectOption("charly");
       await page.getByLabel("Page de départ").fill(`/parallel-${index + 1}`);
     }));
     await Promise.all(pages.map((page) => page.getByRole("button", { name: "Créer la démonstration" }).click()));

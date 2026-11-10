@@ -8,7 +8,7 @@ describe("mode-specific preview and send formatting", () => {
     expect(footer).toMatch(/automatiquement.*IA/); expect(footer).not.toMatch(/validée|relue|3 jours|rapide|instantanée/);
   });
   it("distinguishes reviewed AI from a human-authored reply", () => {
-    expect(savReplyFooter("fr", "manual_reviewed")).toMatch(/L’équipe Limova.*\n.*IA.*validée/);
+    expect(savReplyFooter("fr", "manual_reviewed")).toMatch(/L’équipe Limova.*\n.*agent IA.*peut se tromper.*répondre à ce message/);
     expect(savReplyFooter("fr", "manual_authored")).toBe("L’équipe Limova");
     expect(savReplyFooter("en", "manual_authored")).toBe("The Limova team");
   });

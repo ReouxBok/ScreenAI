@@ -1,24 +1,14 @@
 "use server";
 
-import { processManualSavTicketActionImmediately, processPendingHubspotActions, reconcileSavTicketReturn } from "@/lib/sav/hubspot";
+import { reconcileSavTicketReturn } from "@/lib/sav/hubspot";
 
 import { revalidatePath } from "next/cache";
 import { redirect } from "next/navigation";
-import { start } from "workflow/api";
+import { z } from "zod";
 import { requireSavApiStaff as requireApiStaff } from "@/lib/sav/auth";
 import { continueHubspotBackfill, reconcileSavManualTicket } from "@/lib/sav/hubspot";
 import { approveLearningCandidate, rejectLearningCandidate } from "@/lib/sav/learning";
-import {
-  approveSavDraft,
-  cancelSavPilotBatch,
-  correctSavDecision,
-  requestHumanIntervention,
-  retrySavAction,
-  retrySavWebhookReceipt,
-  reviewSavPilotItem,
-  startSavPilotBatch,
-} from "@/lib/sav/service";
-import { analyzeSavPilotBatchWorkflow } from "@/workflows/sav-pilot";
+import { retrySavWebhookReceipt } from "@/lib/sav/service";
 import { reviewKnowledgeCandidate } from "@/lib/knowledge/review";
 import { HUBSPOT_IMPORT_MAX_BYTES } from "@/lib/knowledge/hubspot-input";
 import { importHubspotKnowledge, prepareHubspotReview } from "@/lib/knowledge/hubspot-import";
@@ -28,18 +18,23 @@ import { knowledgeProjectionCandidates } from "@/db/schema";
 import { eq } from "drizzle-orm";
 import { proposeActiveOnboardingKnowledge } from "@/lib/knowledge/onboarding-import";
 import { reviewSavProposal } from "@/lib/sav/review";
-import { queueSavManualTicket } from "@/lib/sav/manual-tickets";
-import { retrySavAnalysis, repairSavProposal } from "@/lib/sav/service";
-import { collectLatestSavDossierContext } from "@/lib/sav/dossier-context";
 import { qualifySavObservation } from "@/lib/sav/observations";
 import { reviewSavDraft } from "@/lib/sav/draft-verdicts";
 import { saveSavHumanReplyDraft } from "@/lib/sav/drafts";
-import { assertSavManualReplyEnabled, queueSavManualReply, confirmSavSuggestedReply } from "@/lib/sav/manual-replies";
-import { processPendingGmailSendActions } from "@/lib/sav/gmail";
-import { after } from "next/server";
-import { enqueueSavContextRefresh } from "@/lib/sav/dispatch";
 import { recordSavDeploymentDecision } from "@/lib/sav/metrics";
 import { createReviewedSavReplay, runReviewedSavRuleReplay } from "@/lib/sav/reviewed-replay";
+import { SAV_LEGACY_COMMAND_RETIRED, type LegacyCommandKind } from "@/lib/ui/legacy-notice";
+
+// SAV-60 (decision Ugo 28/10): the commands of the retired V0 circuit. The role guard
+// runs first, unchanged; the command is then refused here, before any read, provider
+// call, queue or log, and its code reaches the archive notice instead of a generic
+// error. Pole C's lib functions throw the same code (be24f6c) as a second barrier.
+async function refuseLegacyCommand(form: FormData | null, kind?: LegacyCommandKind): Promise<never> {
+  await requireApiStaff("admin");
+  const threadId = String(form?.get("threadId") ?? "").trim();
+  const query = new URLSearchParams({ notice: SAV_LEGACY_COMMAND_RETIRED, ...kind ? { kind } : {} });
+  redirect(z.uuid().safeParse(threadId).success ? `/studio/sav/archives/${threadId}?${query}` : `/studio/sav/archives?${query}`);
+}
 
 async function evaluationAction(operation: () => Promise<unknown>, success: string) {
   let result = success;
@@ -62,8 +57,7 @@ export async function runReviewedReplayAction() {
 }
 
 export async function saveReplyDraftAction(form: FormData) {
-  await requireApiStaff("admin");
-  redirect(`/studio/sav/${encodeURIComponent(id(form, "threadId"))}?review=SAV_DRAFT_READ_ONLY`);
+  await refuseLegacyCommand(form);
 }
 
 export async function qualifyObservationAction(form:FormData) {
@@ -100,33 +94,11 @@ export async function saveHumanDraftAction(form: FormData) {
 }
 
 export async function sendStudioReplyAction(form: FormData) {
-  const staff = await requireApiStaff("admin");
-  const threadId = id(form, "threadId");
-  let result = "reply_queued";
-  try {
-    assertSavManualReplyEnabled();
-    if (form.has("replyDraft") || form.has("text")) throw new Error("SAV_DRAFT_READ_ONLY");
-    const action = await queueSavManualReply({ threadId, draftId: id(form,"draftId") }, staff.email);
-    if (action.status === "succeeded") result = "reply_sent";
-    else {
-      const delivery = await processPendingGmailSendActions(1, action.id);
-      const processed = delivery.processed[0];
-      result = processed?.status === "succeeded" ? "reply_sent" : typeof processed?.errorCode === "string" ? processed.errorCode : "reply_queued";
-    }
-  } catch (error) { result = error instanceof Error && /^SAV_[A-Z_]+$/.test(error.message) ? error.message : "SAV_REPLY_MANUAL_INVALID"; }
-  revalidatePath(`/studio/sav/${threadId}`);
-  revalidatePath("/studio/sav");
-  redirect(`/studio/sav/${encodeURIComponent(threadId)}?review=${result}`);
+  await refuseLegacyCommand(form, "reply");
 }
 
-export async function sendSuggestedReplyAction(form:FormData) {
- const staff=await requireApiStaff("admin");const threadId=id(form,"threadId");let result="reply_queued";
- try {
-  const action=await confirmSavSuggestedReply({threadId,messageId:id(form,"messageId"),decisionId:id(form,"decisionId"),agentRunId:id(form,"agentRunId"),sourceHash:id(form,"sourceHash"),expectedDraftId:String(form.get("expectedDraftId")||"")||null,text:String(form.get("text")||""),recipient:String(form.get("recipient")||""),outboundHash:id(form,"outboundHash"),origin:String(form.get("origin")||"")},staff.email);
-  if(action.status==="succeeded")result="reply_sent";
-  else {const delivery=await processPendingGmailSendActions(1,action.id);const processed=delivery.processed[0];result=processed?.status==="succeeded"?"reply_sent":typeof processed?.errorCode==="string"?processed.errorCode:"reply_queued";}
- }catch(error){result=error instanceof Error&&/^SAV_[A-Z_]+$/.test(error.message)?error.message:"SAV_REPLY_MANUAL_INVALID";}
- revalidatePath(`/studio/sav/${threadId}`);revalidatePath("/studio/sav");redirect(`/studio/sav/${encodeURIComponent(threadId)}?review=${result}`);
+export async function sendSuggestedReplyAction(form: FormData) {
+  await refuseLegacyCommand(form, "reply");
 }
 
 function id(form: FormData, name: string) {
@@ -135,118 +107,35 @@ function id(form: FormData, name: string) {
   return value;
 }
 
-async function enqueuePilotBatch(batchId: string, actorEmail: string) {
-  let launch: "instant" | "deferred" = "instant";
-  try {
-    const run = await start(analyzeSavPilotBatchWorkflow, [batchId]);
-    console.info("sav_pilot_workflow_enqueued", { batchId, runId: run.runId, actorEmail });
-  } catch (error) {
-    launch = "deferred";
-    console.error("sav_pilot_workflow_enqueue_failed", {
-      batchId,
-      actorEmail,
-      errorCode: error instanceof Error ? error.message.slice(0, 160) : "UNKNOWN_ERROR",
-    });
-  }
-  return launch;
-}
 
 export async function requestHumanAction(form: FormData) {
-  const staff = await requireApiStaff("admin");
-  const threadId = id(form, "threadId");
-  await requestHumanIntervention(threadId, staff.email, String(form.get("reason") || "Reprise demandée par l’administrateur"));
-  revalidatePath("/studio/sav");
-  revalidatePath(`/studio/sav/${threadId}`);
+  await refuseLegacyCommand(form);
 }
 
 export async function correctDecisionAction(form: FormData) {
-  const staff = await requireApiStaff("admin");
-  const threadId = id(form, "threadId");
-  await correctSavDecision(id(form, "decisionId"), {
-    kind: String(form.get("kind")),
-    reasonCode: String(form.get("reasonCode")),
-    explanation: String(form.get("explanation")),
-  }, staff.email);
-  revalidatePath("/studio/sav");
-  revalidatePath(`/studio/sav/${threadId}`);
+  await refuseLegacyCommand(form);
 }
 
 export async function createTicketAction(form: FormData) {
-  const staff = await requireApiStaff("admin");
-  const threadId = id(form, "threadId");
-  let errorCode = "";
-  try {
-    await refreshTicketContext(threadId);
-    const action = await queueSavManualTicket({ threadId, reviewId: id(form, "reviewId"), kind: "create_ticket", ticketId: String(form.get("ticketId") || "") || undefined, returnOperation: String(form.get("returnOperation") || "") || undefined, distinctIssueReason: String(form.get("distinctIssueReason") || "") }, staff.email);
-    errorCode = await executeQueuedTicketAction(action.id);
-  }
-  catch (error) { errorCode = error instanceof Error && /^[A-Z][A-Z_]+$/.test(error.message) ? error.message : "SAV_MANUAL_TICKET_INVALID"; }
-  revalidatePath("/studio/sav");
-  revalidatePath(`/studio/sav/${threadId}`);
-  redirect(`/studio/sav/${encodeURIComponent(threadId)}?review=${errorCode || "ticket_queued"}`);
+  await refuseLegacyCommand(form, "ticket");
 }
 
 export async function linkTicketAction(form: FormData) {
-  const staff = await requireApiStaff("admin");
-  const threadId = id(form, "threadId");
-  let errorCode = "";
-  try {
-    await refreshTicketContext(threadId);
-    const action = await queueSavManualTicket({ threadId, reviewId: id(form, "reviewId"), kind: "link_ticket", ticketId: id(form, "ticketId"), returnOperation: String(form.get("returnOperation") || "") || undefined }, staff.email);
-    errorCode = await executeQueuedTicketAction(action.id);
-  }
-  catch (error) { errorCode = error instanceof Error && /^[A-Z][A-Z_]+$/.test(error.message) ? error.message : "SAV_MANUAL_TICKET_INVALID"; }
-  revalidatePath("/studio/sav"); revalidatePath(`/studio/sav/${threadId}`);
-  redirect(`/studio/sav/${encodeURIComponent(threadId)}?review=${errorCode || "ticket_queued"}`);
+  await refuseLegacyCommand(form, "ticket");
 }
 
-async function executeQueuedTicketAction(actionId: string) {
-  try {
-    const result = await processManualSavTicketActionImmediately(actionId);
-    if (result.status === "completed") return "ticket_done";
-    if (result.status === "failed" && /^[A-Z][A-Z0-9_]+$/.test(result.errorCode)) return result.errorCode;
-    // A cron worker may already own the durable action, or writes may be paused.
-    // In both cases the action remains visible and the cron stays its recovery path.
-    return "ticket_queued";
-  } catch {
-    // Preserve the durable command if the fast path itself is unavailable.
-    return "ticket_processing_deferred";
-  }
-}
 
-async function refreshTicketContext(threadId: string) {
-  try {
-    const dossier = await collectLatestSavDossierContext(threadId);
-    if (dossier.crm.status !== "ready") throw new Error("SAV_CONTEXT_REFRESH_FAILED");
-  } catch {
-    throw new Error("SAV_CONTEXT_REFRESH_FAILED");
-  }
-}
 
 export async function retryAnalysisAction(form: FormData) {
-  const staff = await requireApiStaff("admin");
-  await retrySavAnalysis(id(form, "messageId"), staff.email);
-  revalidatePath("/studio/sav"); revalidatePath(`/studio/sav/${id(form, "threadId")}`);
+  await refuseLegacyCommand(form);
 }
 
 export async function refreshSavContextAction(form: FormData) {
-  const staff = await requireApiStaff("admin");
-  const threadId = id(form, "threadId");
-  let refreshId = "";
-  try { refreshId = await enqueueSavContextRefresh(threadId,staff.email,after); }
-  catch { /* Keep the dossier readable if the refresh could not be scheduled. */ }
-  revalidatePath(`/studio/sav/${threadId}`);
-  redirect(`/studio/sav/${encodeURIComponent(threadId)}?${refreshId ? `context=refreshing&refreshId=${refreshId}` : "context=failed"}`);
+  await refuseLegacyCommand(form);
 }
 
 export async function repairSavProposalAction(form: FormData) {
-  const staff = await requireApiStaff("admin");
-  const threadId = id(form, "threadId");
-  let notice = "proposal_repaired";
-  try { await repairSavProposal(id(form, "messageId"), staff.email); }
-  catch (error) { notice = error instanceof Error && /^SAV_[A-Z_]+$/.test(error.message) ? error.message : "SAV_PROPOSAL_REPAIR_FAILED"; }
-  revalidatePath("/studio/sav"); revalidatePath(`/studio/sav/${threadId}`);
-  redirect(`/studio/sav/${encodeURIComponent(threadId)}?review=${notice}`);
+  await refuseLegacyCommand(form);
 }
 
 export async function reconcileTicketAction(form: FormData) {
@@ -260,22 +149,11 @@ export async function reconcileTicketAction(form: FormData) {
 }
 
 export async function approveDraftAction(form: FormData) {
-  const staff = await requireApiStaff("admin");
-  const threadId = id(form, "threadId");
-  await approveSavDraft(id(form, "draftActionId"), staff.email);
-  revalidatePath(`/studio/sav/${threadId}`);
+  await refuseLegacyCommand(form);
 }
 
 export async function retryAction(form: FormData) {
-  const staff = await requireApiStaff("admin");
-  const threadId = id(form, "threadId");
-  const action = await retrySavAction(id(form, "actionId"), staff.email);
-  if (["create_ticket", "link_ticket"].includes(action.kind)) {
-    await processManualSavTicketActionImmediately(action.id);
-  } else if (["log_email", "update_ticket_status"].includes(action.kind)) {
-    await processPendingHubspotActions(1, action.id);
-  }
-  revalidatePath(`/studio/sav/${threadId}`);
+  await refuseLegacyCommand(form);
 }
 
 export async function retryWebhookAction(form: FormData) {
@@ -285,74 +163,23 @@ export async function retryWebhookAction(form: FormData) {
 }
 
 export async function startPilotBatchAction() {
-  const staff = await requireApiStaff("admin");
-  const batch = await startSavPilotBatch(staff.email, 10);
-  const launch = await enqueuePilotBatch(batch.id, staff.email);
-  revalidatePath("/studio/sav");
-  redirect(`/studio/sav?batch=${batch.id}&launch=${launch}`);
+  await refuseLegacyCommand(null);
 }
 
 export async function startSelectedPilotBatchAction(form: FormData) {
-  const staff = await requireApiStaff("admin");
-  const messageIds = [...new Set(form.getAll("messageIds").map(String).map((value) => value.trim()).filter(Boolean))];
-  if (messageIds.length !== 10) redirect("/studio/sav/pilote?error=select_10");
-  let batch: Awaited<ReturnType<typeof startSavPilotBatch>> | null = null;
-  let errorCode = "";
-  try {
-    batch = await startSavPilotBatch(staff.email, messageIds);
-  } catch (error) {
-    errorCode = error instanceof Error ? error.message : "SAV_PILOT_START_FAILED";
-  }
-  if (!batch) redirect(`/studio/sav/pilote?error=${errorCode === "SAV_PILOT_SELECTION_STALE" ? "selection_stale" : "start_failed"}`);
-  const launch = await enqueuePilotBatch(batch.id, staff.email);
-  revalidatePath("/studio/sav");
-  revalidatePath("/studio/sav/pilote");
-  redirect(`/studio/sav/pilote?batch=${batch.id}&launch=${launch}`);
+  await refuseLegacyCommand(form);
 }
 
 export async function cancelPilotBatchAction(form: FormData) {
-  const staff = await requireApiStaff("admin");
-  await cancelSavPilotBatch(
-    id(form, "pilotBatchId"),
-    staff.email,
-    String(form.get("reason") || "Batch invalide : relance demandée après audit"),
-  );
-  revalidatePath("/studio/sav");
-  redirect("/studio/sav?batchCancelled=1");
+  await refuseLegacyCommand(form);
 }
 
 export async function cancelPilotBatchLabAction(form: FormData) {
-  const staff = await requireApiStaff("admin");
-  await cancelSavPilotBatch(
-    id(form, "pilotBatchId"),
-    staff.email,
-    String(form.get("reason") || "Batch annulé depuis le laboratoire SAV"),
-  );
-  revalidatePath("/studio/sav");
-  revalidatePath("/studio/sav/pilote");
-  redirect("/studio/sav/pilote?batchCancelled=1");
+  await refuseLegacyCommand(form);
 }
 
 export async function reviewPilotItemAction(form: FormData) {
-  const staff = await requireApiStaff("admin");
-  const threadId = id(form, "threadId");
-  await reviewSavPilotItem(id(form, "pilotItemId"), {
-    verdict: String(form.get("verdict")),
-    dimensions: {
-      classification: String(form.get("dimensionClassification")),
-      routing: String(form.get("dimensionRouting")),
-      grounding: String(form.get("dimensionGrounding")),
-      tone: String(form.get("dimensionTone")),
-      escalation: String(form.get("dimensionEscalation")),
-    },
-    feedbackCodes: form.getAll("feedbackCodes").map(String),
-    comment: String(form.get("comment") || ""),
-    correctedDraft: String(form.get("correctedDraft") || ""),
-  }, staff.email);
-  revalidatePath("/studio/sav");
-  revalidatePath("/studio/sav/pilote");
-  revalidatePath(`/studio/sav/${threadId}`);
-  if (String(form.get("returnTo")) === "pilot") redirect(`/studio/sav/pilote?batch=${encodeURIComponent(String(form.get("pilotBatchId") || ""))}#batch-review`);
+  await refuseLegacyCommand(form);
 }
 
 export async function continueBackfillAction() {
@@ -420,7 +247,6 @@ export async function reviewProposalAction(form: FormData) {
   const staff = await requireApiStaff("admin");
   const threadId = id(form, "threadId");
   let errorCode = "";
-  let refreshId = "";
   try {
     if (form.has("replyDraft")) throw new Error("SAV_DRAFT_READ_ONLY");
     await reviewSavProposal({ reviewScope: "dossier", messageId: id(form, "messageId"), decisionId: id(form, "decisionId"), agentRunId: id(form, "agentRunId"), expectedReviewId: String(form.get("reviewId") || "") || null,
@@ -434,15 +260,11 @@ export async function reviewProposalAction(form: FormData) {
         ...(form.get("humanProcess") ? { humanProcess: JSON.parse(String(form.get("humanProcess"))) } : {}) },
     }, staff.email);
   } catch (error) { errorCode = error instanceof Error && /^[A-Z][A-Z_]+$/.test(error.message) ? error.message : "SAV_REVIEW_INVALID"; }
-  if (!errorCode) {
-    try { refreshId = await enqueueSavContextRefresh(threadId,staff.email,after); }
-    catch { /* The review is committed; enrichment failure cannot undo validation. */ }
-  }
   revalidatePath("/studio/sav");
   revalidatePath(`/studio/sav/${threadId}`);
   revalidatePath("/studio/sav/resolutions");
   revalidatePath("/studio/sav/evaluation");
-  redirect(`/studio/sav/${encodeURIComponent(threadId)}?review=${errorCode || "saved"}${refreshId ? `&context=refreshing&refreshId=${refreshId}` : ""}`);
+  redirect(`/studio/sav/${encodeURIComponent(threadId)}?review=${errorCode || "saved"}`);
 }
 
 export async function importHubspotKnowledgeAction(form: FormData) {

@@ -1,3 +1,4 @@
+import { assertSavSharedSpend, lockSavSharedSpend } from "./shared-spend";
 import "server-only";
 import { and, eq, gt, sql } from "drizzle-orm";
 import { requireDb } from "@/db";
@@ -15,7 +16,7 @@ const DAY_MS = 86400000, RESERVED = "sav_derived_call_reserved";
 const integer = (value: unknown): value is number => typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
 const failure = (code: string): never => { throw new Error(code); };
 export function isSavDerivedBudgetDeferred(error: unknown) {
-    return error instanceof Error && /^SAV_DERIVED_(?:DAILY|MONETARY|COST|PRICE|MODEL|RESERVATION|REQUEST)/.test(error.message);
+    return error instanceof Error && (error.message === "SAV_SHARED_SPEND_BUDGET_EXHAUSTED" || /^SAV_DERIVED_(?:DAILY|MONETARY|COST|PRICE|MODEL|RESERVATION|REQUEST)/.test(error.message));
 }
 export function savDerivedBudgets() {
     const bound = (name: string, fallback: number) => {
@@ -122,7 +123,9 @@ export async function reserveSavDerivedCallTx(tx: Tx, stage: Stage, now = new Da
 }) {
     const quote = savDerivedCostQuote(request.model, request.maxOutputTokens, now);
     await lock(tx);
+    await lockSavSharedSpend(tx);
     const used = await usage(tx, now), limits = savDerivedBudgets();
+    await assertSavSharedSpend(tx, quote.reservedNanoUsd, now);
     if (used.dayCalls >= limits.total || used.stageCalls[stage] >= limits[stage])
         return failure("SAV_DERIVED_DAILY_BUDGET_EXHAUSTED");
     if (used.dayNanoUsd + quote.reservedNanoUsd > SAV_DERIVED_MONEY.dayNanoUsd || used.rollingNanoUsd + quote.reservedNanoUsd > SAV_DERIVED_MONEY.rollingNanoUsd)

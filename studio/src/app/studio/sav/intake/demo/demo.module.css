@@ -1,0 +1,25 @@
+/* Access pilot additions to the demonstration; the console layout itself comes from ../intake.module.css. */
+.flow { display: grid; gap: 10px; margin: 0; padding: 0; list-style: none; counter-reset: step; }
+.flow li { display: grid; grid-template-columns: 28px minmax(0, 1fr); gap: 10px; align-items: start; counter-increment: step; }
+.flow li::before { content: counter(step); display: grid; place-items: center; width: 24px; height: 24px; border: 1px solid var(--line); border-radius: 50%; font-size: 11px; color: var(--muted); }
+.flow strong { display: block; font-size: 12px; }
+.flow p { margin: 4px 0; font-size: 13px; overflow-wrap: anywhere; }
+.basis { display: inline-block; padding: 2px 8px; border: 1px solid var(--line); border-radius: 999px; font-size: 10px; color: var(--muted); background: var(--paper); }
+.basis[data-basis="a_teste"] { border-color: #9fbdaa; color: var(--moss-dark); background: #e9f2ed; }
+.basis[data-basis="reel"] { color: var(--ink); }
+.basis[data-basis="non_verifie"] { border-style: dashed; border-color: var(--ochre); color: var(--ink); }
+.hand { display: inline-block; padding: 4px 10px; border: 1px solid var(--line); border-radius: 999px; font-size: 12px; font-weight: 600; }
+.hand[data-hand="agent"] { border-color: #9fbdaa; color: var(--moss-dark); background: #e9f2ed; }
+.hand[data-hand="team"] { color: var(--ink); background: var(--paper); }
+.hand[data-hand="unread"] { border-style: dashed; border-color: var(--ochre); color: var(--ink); }
+.compare { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 12px; }
+.compare > div { padding: 12px; border: 1px solid var(--line); border-radius: 10px; }
+.compare > div[data-status="unverified"] { border-style: dashed; border-color: var(--ochre); }
+.compare h3 { margin: 0 0 6px; font-size: 12px; }
+.compare p { margin: 4px 0; font-size: 13px; }
+.handSummary { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin: 0; font-size: 12px; color: var(--muted); }
+.rowHand { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+.techRefs { margin-top: 12px; font-size: 11px; color: var(--muted); }
+.techRefs summary { cursor: pointer; width: fit-content; border-radius: 4px; }
+.techRefs summary:focus-visible { outline: 3px solid var(--ochre); outline-offset: 2px; }
+.techRefs code { font-size: 10px; overflow-wrap: anywhere; }

@@ -8,6 +8,8 @@ import { savV0EligibleMessageFilter } from "./cutover";
 import { executionAdministrator } from "./intake/execution-policy";
 import { canAccessSav } from "./access";
 import { savEffectiveReceivedAt, savEffectiveReceivedAtOfRow } from "@/lib/sav/message-order";
+import type { SavCompletionBlocker, SavCompletionPrecheck } from "./completion-blockers";
+export { savCompletionBlockerLabels, type SavCompletionBlocker } from "./completion-blockers";
 
 export const SAV_EXTERNAL_COMPLETION = "sav_dossier_completed_externally";
 export const SAV_EXTERNAL_COMPLETION_REVERTED = "sav_dossier_external_completion_reverted";
@@ -82,12 +84,59 @@ const unsettledIntakeEffect = sql`(
 /** Include intake commands and dispatched effects: the administrative marker
  * cannot certify an outcome for work whose result still needs reconciliation. */
 export async function hasUnsettledSavIntakeWork(threadId: string, db: Reader = requireDb(), currentReaderEvent?: string) {
-  if (!await intakeConsoleInstalled(db)) return false;
+  const work = await unsettledSavIntakeWork(threadId, db, currentReaderEvent);
+  return work.command || work.effect;
+}
+async function unsettledSavIntakeWork(threadId: string, db: Reader, currentReaderEvent?: string) {
+  if (!await intakeConsoleInstalled(db)) return { command: false, effect: false };
   const [command] = await db.select({ id: savIntakeHumanEvents.id }).from(savIntakeHumanEvents).where(and(eq(savIntakeHumanEvents.threadId, threadId), inArray(savIntakeHumanEvents.state, ["pending", "reading", "waiting"]), currentReaderEvent ? ne(savIntakeHumanEvents.id, currentReaderEvent) : undefined) ).limit(1);
   const [effect] = await db.select({ id: savIntakeEffects.id }).from(savIntakeEffects)
     .innerJoin(savIntakeExecutions, eq(savIntakeExecutions.id, savIntakeEffects.executionId))
     .where(and(eq(savIntakeExecutions.threadId, threadId), unsettledIntakeEffect)).limit(1);
-  return Boolean(command || effect);
+  return { command: Boolean(command), effect: Boolean(effect) };
+}
+
+const technicalCompletionKinds = new Set(["spam", "automatic_reply", "bounce", "internal_notification", "duplicate"]);
+/** Night V1 cycle 1 (I-1): the refusals `applyExternalCompletion` checks before the blockers, as ONE pure
+ * function used by the server loop and by the console/MCP reader below (same order, same inputs). */
+export function savCompletionPrecheckReason(input: { latest: Message | undefined; requestedId: string; receivedBefore: string;
+  eligible: boolean; pilot: boolean; technical: boolean; disposition: z.infer<typeof externalDispositionSchema> }): SavCompletionPrecheck | null {
+  if (!input.latest || input.latest.id !== input.requestedId) return "new_inbound";
+  if (savEffectiveReceivedAtOfRow(input.latest).getTime() >= Date.parse(input.receivedBefore)) return "after_boundary";
+  if (!input.eligible || input.pilot) return "not_live_eligible";
+  if (input.technical && input.disposition === "completed") return "technical_exclusion";
+  return null;
+}
+/** Night V1 cycle 1 (I-1): the same pre-checks read for one message, for the console offer and the MCP.
+ * Read-only. `receivedBefore` defaults to now, like the manual entry points. */
+export async function readSavCompletionPrecheck(threadId: string, messageId: string, db: Reader = requireDb(),
+  disposition: z.infer<typeof externalDispositionSchema> = "completed", receivedBefore = new Date().toISOString()): Promise<SavCompletionPrecheck | null> {
+  const [latest] = await db.select().from(savMessages).where(and(eq(savMessages.threadId, threadId), eq(savMessages.direction, "inbound")))
+    .orderBy(desc(savEffectiveReceivedAt), desc(savMessages.createdAt), desc(savMessages.id)).limit(1);
+  const [eligible] = await db.select({ id: savMessages.id }).from(savMessages).where(and(eq(savMessages.id, messageId), savV0EligibleMessageFilter())).limit(1);
+  const [pilot] = await db.select({ messageId: savPilotItems.messageId }).from(savPilotItems).where(eq(savPilotItems.messageId, messageId)).limit(1);
+  const decisions = await db.select({ kind: savDecisions.kind }).from(savDecisions).where(and(eq(savDecisions.messageId, messageId), eq(savDecisions.isCurrent, true)));
+  return savCompletionPrecheckReason({ latest, requestedId: messageId, receivedBefore, eligible: Boolean(eligible), pilot: Boolean(pilot),
+    technical: decisions.some(row => technicalCompletionKinds.has(row.kind)), disposition });
+}
+/** Night V1 (A): the blocker part of the `applyExternalCompletion` predicate (unsettled_action, then
+ * active_worker), shared with the console and the MCP. Together with `readSavCompletionPrecheck` it covers
+ * every refusal except `source_changed`, a version guard that only the server re-reads under lock at action
+ * time (the MCP already refuses a stale version token before that). Diagnostic codes only. It never settles,
+ * clears or retries anything. */
+export async function readSavCompletionBlockers(threadId: string, db: Reader = requireDb(), threadActions?: Action[]): Promise<SavCompletionBlocker[]> {
+  const actions = threadActions ?? await db.select().from(savActions).where(eq(savActions.threadId, threadId));
+  const blockers: SavCompletionBlocker[] = [];
+  if (hasUnsettledSavHumanAction(actions)) blockers.push("human_action");
+  const work = await unsettledSavIntakeWork(threadId, db);
+  if (work.command) blockers.push("human_command");
+  if (work.effect) blockers.push("intake_effect");
+  if (await intakeConsoleInstalled(db)) {
+    const runs = await db.select({ leaseUntil: savIntakeRuns.leaseUntil }).from(savIntakeRuns).where(eq(savIntakeRuns.threadId, threadId));
+    const executions = await db.select({ leaseUntil: savIntakeExecutions.leaseUntil }).from(savIntakeExecutions).where(eq(savIntakeExecutions.threadId, threadId));
+    if ([...runs, ...executions].some(row => row.leaseUntil && row.leaseUntil > new Date())) blockers.push("active_worker");
+  }
+  return blockers;
 }
 
 async function completionForDisplay(message: Message, db: Reader) {
@@ -211,25 +260,22 @@ async function applyExternalCompletion(raw: unknown, actorEmail: string, actor?:
     const eligible = new Set((await tx.select({ id: savMessages.id }).from(savMessages).where(and(inArray(savMessages.id, ids), savV0EligibleMessageFilter()))).map(message => message.id));
     const pilots = new Set((await tx.select({ messageId: savPilotItems.messageId }).from(savPilotItems).where(inArray(savPilotItems.messageId, ids))).map(item => item.messageId));
     const actions = await tx.select().from(savActions).where(inArray(savActions.threadId, threadIds));
-    const technicalKinds = new Set(["spam", "automatic_reply", "bounce", "internal_notification", "duplicate"]);
     const decisions = await tx.select({ messageId: savDecisions.messageId, kind: savDecisions.kind }).from(savDecisions).where(and(inArray(savDecisions.messageId, ids), eq(savDecisions.isCurrent, true)));
-    const technicalMessages = new Set(decisions.filter(row => technicalKinds.has(row.kind)).map(row => row.messageId));
+    const technicalMessages = new Set(decisions.filter(row => technicalCompletionKinds.has(row.kind)).map(row => row.messageId));
     const events = await tx.select().from(auditLogs).where(and(eq(auditLogs.entityType, "sav_message"), inArray(auditLogs.entityId, ids), inArray(auditLogs.action, savExternalCompletionEvents)));
     const rows: Array<typeof auditLogs.$inferInsert> = [];
     const skipped: Record<string, number> = {};
     let alreadyCompleted = 0;
     for (const requested of input.messages) {
       const message = latest.find(row => row.threadId === requested.threadId);
-      let reason: string | null = null;
-      if (!message || message.id !== requested.messageId) reason = "new_inbound";
-      else if (savEffectiveReceivedAtOfRow(message).getTime() >= Date.parse(input.receivedBefore)) reason = "after_boundary";
-      else if (!eligible.has(message.id) || pilots.has(message.id)) reason = "not_live_eligible";
-      else if (technicalMessages.has(message.id) && input.disposition === "completed") reason = "technical_exclusion";
-      else if (hasUnsettledSavHumanAction(actions.filter(action => action.threadId === message.threadId)) || await hasUnsettledSavIntakeWork(message.threadId, tx)) reason = "unsettled_action";
-      if (!reason && await intakeConsoleInstalled(tx)) {
-        const runs = await tx.select({ leaseUntil: savIntakeRuns.leaseUntil }).from(savIntakeRuns).where(eq(savIntakeRuns.threadId, requested.threadId));
-        const executions = await tx.select({ leaseUntil: savIntakeExecutions.leaseUntil }).from(savIntakeExecutions).where(eq(savIntakeExecutions.threadId, requested.threadId));
-        if ([...runs, ...executions].some(row => row.leaseUntil && row.leaseUntil > new Date())) reason = "active_worker";
+      let reason: string | null = savCompletionPrecheckReason({ latest: message, requestedId: requested.messageId, receivedBefore: input.receivedBefore,
+        eligible: Boolean(message && eligible.has(message.id)), pilot: Boolean(message && pilots.has(message.id)),
+        technical: Boolean(message && technicalMessages.has(message.id)), disposition: input.disposition });
+      if (!reason && message) {
+        // Same reader as the console/MCP availability (night V1, A): unsettled work first, then an active lease.
+        const blockers = await readSavCompletionBlockers(message.threadId, tx, actions.filter(action => action.threadId === message.threadId));
+        if (blockers.some(blocker => blocker !== "active_worker")) reason = "unsettled_action";
+        else if (blockers.includes("active_worker")) reason = "active_worker";
       }
       const guarded = !reason && underLock ? await underLock(tx, message!) : true;
       if (!reason && !guarded) reason = "source_changed";

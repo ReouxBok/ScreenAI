@@ -17,7 +17,7 @@ vi.mock("@/lib/sav/intake/invalid-source-classification", () => ({ classifyInval
 // SAV-71 eligibility: state.manualBinding gives the binding, or null for a bounded "not waiting" reason.
 vi.mock("@/lib/sav/intake/manual-other-classification", () => ({ classifyValidSourceAsOther: as(state.manual),
   readManualOtherEligibility: as(async (...args: unknown[]) => { const binding = await state.manualBinding(...args); return binding ? { binding, reason: null } : { binding: null, reason: "not_waiting" }; }),
-  manualOtherUnavailableLabels: { not_waiting: "Ce dossier n’attend pas un classement humain.", paused: "Une pause humaine protège ce dossier.", effects_engaged: "Une action engagée ou son résultat reste à vérifier." } }));
+  manualOtherUnavailableLabels: { not_waiting: "Ce dossier n’attend pas un classement humain.", paused: "Une pause humaine protège ce dossier.", read_failed: "Les preuves n’ont pas pu être relues. Aucun classement n’est disponible.", effects_engaged: "Une action engagée ou son résultat reste à vérifier.", effects_confirmed: "Une action a déjà été réellement accomplie sur ce message (résultat vérifié) : « Autres » la masquerait. Si le dossier est traité, utilisez « Passer en Terminés »." } }));
 vi.mock("@/lib/sav/intake/human-hold-release", () => ({ releaseIntakeHumanHold: as(state.release) }));
 vi.mock("@/lib/sav/intake/human-commands", () => ({ recordIntakeHumanCommand: as(state.choice) }));
 vi.mock("@/lib/sav/intake/operator-recovery", () => ({ requestIntakeReinvestigation: as(state.reinvestigate), reconcileThreadIdentification: as(state.identification) }));
@@ -356,6 +356,62 @@ it("SAV-71 composition: get_dossier and classify_other give the page's manual-Ot
   detail.humanHeld = true; state.manualBinding.mockClear();
   expect(await other()).toMatchObject({ available: false, unavailableReason: "Une pause humaine protège ce dossier." });
   expect(state.manualBinding).not.toHaveBeenCalled(); expect(state.manual).not.toHaveBeenCalled();
+});
+
+// Night V1 (A): production shapes. (1) An identification email already sent and VERIFIED: « Autres » stays refused,
+// with a truthful reason (nothing is « to verify »), and « Terminés » stays the offered exit. (2) A server blocker that the
+// latest message's effects do not show: « Terminés » is not offered, its reason is named, and a call is refused before any function.
+it("night V1 A: verified effects are not called « to verify », and Terminés is not offered while the server predicate blocks", async () => {
+  state.manualBinding.mockResolvedValue(null); state.panel.mockResolvedValue({ allowResume: false, allowReanalysis: false, allowInformation: false, unavailableReason: "x", information: null });
+  const actions = async () => Object.fromEntries((await call("get_dossier", { threadId }) as { data: { availableActions: { tool: string; available: boolean; unavailableReason?: string | null }[] } }).data.availableActions.map(a => [a.tool, a]));
+  Object.assign(detail, { confirmedCurrent: true, progress: { executionId: "e", runId, version: 7, state: "confirmed", effects: [{ kind: "identity_send", state: "confirmed", confirmedAt: at }] } });
+  let listed = await actions();
+  expect(listed.classify_other).toMatchObject({ available: false, unavailableReason: expect.stringContaining("résultat vérifié") });
+  expect(listed.classify_other.unavailableReason).not.toContain("reste à vérifier");
+  expect(listed.close_handled_outside).toMatchObject({ available: true, unavailableReason: null });
+  expect(state.manualBinding).not.toHaveBeenCalled();
+  Object.assign(detail, { confirmedCurrent: false, progress: null, completionBlockers: ["human_action"] });
+  listed = await actions();
+  expect(listed.close_handled_outside).toMatchObject({ available: false, unavailableReason: expect.stringContaining("action humaine historique") });
+  expect(listed.classify_other).toMatchObject({ available: false, unavailableReason: "Une action engagée ou son résultat reste à vérifier." });
+  const dossier = (await call("get_dossier", { threadId }) as { data: { locks: { completionBlockers: string[]; unsettledEffects: number } } }).data;
+  expect(dossier.locks).toMatchObject({ completionBlockers: ["human_action"], unsettledEffects: 0 });
+  expect(await call("close_handled_outside", { threadId, versionToken: token(), idempotencyKey: key(), attestHandled: true })).toMatchObject({ outcome: "refused", code: "SAV_MCP_UNSETTLED_ACTION" });
+  current = contact; // not the owner operator: still the generic unavailability, no blocker detail
+  expect(await call("close_handled_outside", { threadId, versionToken: token(), idempotencyKey: key(), attestHandled: true })).toMatchObject({ outcome: "refused", code: "SAV_MCP_ACTION_UNAVAILABLE" });
+  expect(state.complete).not.toHaveBeenCalled(); expect(await writes()).toHaveLength(0);
+});
+
+// Night V1 cycle 1 (I-1 review): the server's pre-check refusals are part of the offer and get explicit codes.
+it("night V1 cycle 1: server pre-check refusals are not offered, refused before any claim with an explicit code, and mapped after the server", async () => {
+  state.manualBinding.mockResolvedValue(null);
+  const close = () => call("close_handled_outside", { threadId, versionToken: token(), idempotencyKey: key(), attestHandled: true });
+  const listed = async () => Object.fromEntries((await call("get_dossier", { threadId }) as { data: { availableActions: { tool: string; available: boolean; unavailableReason?: string | null }[] } }).data.availableActions.map(a => [a.tool, a]));
+  Object.assign(detail, { completionBlockers: [], completionPrecheck: "technical_exclusion" });
+  expect((await listed()).close_handled_outside).toMatchObject({ available: false, unavailableReason: expect.stringContaining("classé technique") });
+  expect(await close()).toMatchObject({ outcome: "refused", code: "SAV_MCP_TECHNICAL_EXCLUSION" });
+  for (const [reason, code] of [["not_live_eligible", "SAV_MCP_NOT_LIVE_ELIGIBLE"], ["new_inbound", "SAV_MCP_NEW_INBOUND"], ["after_boundary", "SAV_MCP_AFTER_BOUNDARY"]]) {
+    Object.assign(detail, { completionPrecheck: reason });
+    expect(await close()).toMatchObject({ outcome: "refused", code });
+  }
+  // M-5: an unreadable blocker read is not offered and says so, before any claim.
+  Object.assign(detail, { completionPrecheck: null, completionBlockers: ["unreadable"] });
+  // N-1 (cycle 2): « Autres » says the read failed, not that an action is engaged.
+  const unread = await listed();
+  expect(unread.classify_other).toMatchObject({ available: false, unavailableReason: expect.stringContaining("n’ont pas pu être relues") });
+  expect(unread.classify_other.unavailableReason).not.toContain("action engagée");
+  expect(await close()).toMatchObject({ outcome: "refused", code: "SAV_MCP_ACTION_UNAVAILABLE", message: expect.stringContaining("n’ont pas pu être lus") });
+  expect(state.complete).not.toHaveBeenCalled(); expect(await writes()).toHaveLength(0);
+  // Offered, then refused by the server (state changed between read and action): explicit code, not « dossier changé ».
+  Object.assign(detail, { completionBlockers: [] });
+  expect((await listed()).close_handled_outside).toMatchObject({ available: true, unavailableReason: null });
+  state.complete.mockResolvedValueOnce({ marked: 0, alreadyCompleted: 0, skipped: { not_live_eligible: 1 } });
+  expect(await close()).toMatchObject({ outcome: "refused", code: "SAV_MCP_NOT_LIVE_ELIGIBLE" });
+  state.complete.mockResolvedValueOnce({ marked: 0, alreadyCompleted: 0, skipped: { technical_exclusion: 1 } });
+  expect(await close()).toMatchObject({ outcome: "refused", code: "SAV_MCP_TECHNICAL_EXCLUSION" });
+  // source_changed stays the version guard re-read under lock at action time.
+  state.complete.mockResolvedValueOnce({ marked: 0, alreadyCompleted: 0, skipped: { source_changed: 1 } });
+  expect(await close()).toMatchObject({ outcome: "refused", code: "SAV_MCP_DOSSIER_CHANGED" });
 });
 
 it("REVIEW-AE running remains UI-only and cannot be activated through the MCP", async () => {

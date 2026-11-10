@@ -15,18 +15,19 @@ function props(stale=true):Props {
 beforeEach(()=>{vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT",true);vi.stubGlobal("crypto",webcrypto);host=document.createElement("div");document.body.append(host);root=createRoot(host);});
 afterEach(async()=>{await act(async()=>root.unmount());host.remove();vi.unstubAllGlobals();});
 const field=()=>host.querySelector<HTMLTextAreaElement>('textarea[name="text"]')!;
-const origin=()=>host.querySelector<HTMLInputElement>('input[name="origin"]')!.value;
+// SAV-60: the send form (and its origin field and outbound preview) left with the V0 circuit.
+const noSend=()=>expect(host.textContent).not.toContain("Confirmer l’envoi");
 async function render(p:Props){await act(async()=>{root.render(createElement(DraftReview,p));});}
 it.each(["sourceHash","messageId","decisionId","agentRunId"])("resets untouched stale-current editor on %s change without claiming human authorship",async changed=>{
- const before=props();await render(before);expect(field().value).toBe("Suggestion IA initiale.");expect(origin()).toBe("ai");
+ const before=props();await render(before);expect(field().value).toBe("Suggestion IA initiale.");noSend();
  const next={...before,data:{...before.data,proposal:{...before.data.proposal,replyDraft:"Nouvelle suggestion IA."}}};
  if(changed==="sourceHash")next.data.confirmationSourceHash="b".repeat(43);else if(changed==="messageId")next.messageId="new-message";else next.data[changed as "decisionId"|"agentRunId"]="new-identity";
- await render(next);expect(field().value).toBe("Nouvelle suggestion IA.");expect(origin()).toBe("ai");expect(host.textContent).toContain("Réponse préparée avec l’aide d’une IA et validée par notre équipe.");expect(host.textContent).toContain("Version humaine historique.");expect(next.drafts.versions[0].id).toBe(before.drafts.versions[0].id);
+ await render(next);expect(field().value).toBe("Nouvelle suggestion IA.");noSend();expect(host.textContent).toContain("Version humaine historique.");expect(next.drafts.versions[0].id).toBe(before.drafts.versions[0].id);
 });
 it("replaces an applicable human version with the new AI suggestion when that same current version becomes stale",async()=>{
- const before=props(false);await render(before);expect(field().value).toBe("Version humaine historique.");expect(origin()).toBe("human");
+ const before=props(false);await render(before);expect(field().value).toBe("Version humaine historique.");noSend();
  const next={...before,data:{...before.data,confirmationSourceHash:"b".repeat(43),proposal:{...before.data.proposal,replyDraft:"Nouvelle suggestion IA."}},drafts:{...before.drafts,versions:before.drafts.versions.map(d=>({...d,stale:true}))}};
- await render(next);expect(field().value).toBe("Nouvelle suggestion IA.");expect(origin()).toBe("ai");expect(host.textContent).toContain("Version humaine historique.");
+ await render(next);expect(field().value).toBe("Nouvelle suggestion IA.");noSend();expect(host.textContent).toContain("Version humaine historique.");
 });
 it("binds optional AI feedback to the suggestion hash independently of the saved human version",async()=>{
  const data=props(false);data.data.draftHash="h".repeat(43);await render(data);

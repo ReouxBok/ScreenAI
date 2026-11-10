@@ -14,7 +14,7 @@ export async function measureSavDashboardRead<T>(mode: "reference" | "sql", oper
   let status = "failed";
   try {
     const value = await scope.run(counters, operation);
-    status = "ok";
+    status = (value as { pending?: unknown } | null)?.pending === true ? "pending" : "ok";
     return value;
   } catch (error) {
     if (error instanceof Error && error.message === "SAV_DASHBOARD_PROJECTION_PENDING") status = "pending";

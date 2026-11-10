@@ -119,12 +119,29 @@ export async function executeSavIntakeWake(runId: string, deps: SavIntakeWakeDep
       if (executionId) {
         const pass = await executeIntakePass(executionId, options) as { state?: string; skipped?: string; reason?: string };
         result = pass.skipped ? { state: "waiting", reason: pass.skipped } : { state: pass.state ?? "waiting", ...(pass.reason ? { reason: pass.reason } : {}) };
+        if (pass.state === "confirmed") await relayToCase(run.messageId, env());
       }
     }
   } catch (error) { result = { state: "waiting", reason: code(error) }; }
   // Waiting/uncertain executions stay resumable (wake recovery, then cron executor).
   await markSavIntakeWake(runId, await savIntakeWakeStage(runId) ? "waiting" : "completed", { outcome: result.reason ?? result.state, executedAt: new Date().toISOString() });
   return { stage: "execution", ...result };
+}
+
+/** V2 relay (SAV-11): nothing unless SAV_CASE_RECORDING=on. It reads V1's durable records
+ * only and never fails V1; a lost relay is caught up by sweepCaseRelays. */
+async function relayToCase(messageId: string, env: Record<string, string | undefined>) {
+  if (env.SAV_CASE_RECORDING !== "on") return;
+  try {
+    const result = await (await import("../cases/intake-boundary")).recordCaseAfterConfirmedIntake(messageId, await v2EntryRelayDeps(env));
+    if (env.SAV_V2_ENTRY === "on" && "owner" in result && result.owner === "agent") await (await import("../cases/v2-entry")).continueCaseAfterCommit(result.caseId, "relay", { env });
+  } catch (error) {
+    // The sweep replays the relay from V1's records; with the V2 entry on, the failure also stays visible.
+    if (env.SAV_V2_ENTRY === "on") console.error("sav_v2_entry_relay", { messageId, errorCode: code(error) });
+  }
+}
+async function v2EntryRelayDeps(env: Record<string, string | undefined>) {
+  return env.SAV_V2_ENTRY === "on" ? (await import("../cases/v2-entry")).v2EntryRelayDeps(env) : { env };
 }
 
 /** Step 3: targeted console projection and stage timings, ids only.

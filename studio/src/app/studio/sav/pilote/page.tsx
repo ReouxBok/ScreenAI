@@ -3,11 +3,8 @@ import Link from "next/link";
 import { AlertTriangle, ArrowLeft, ArrowUpRight, Bot, Check, CheckCircle2, Clock3, FileText, LockKeyhole, MessageSquareText, NotebookPen, TicketCheck, UserRoundCheck, XCircle } from "lucide-react";
 import { isDatabaseConfigured } from "@/db";
 import { requireSavStaff as requireStaff } from "@/lib/sav/auth";
-import { isSavPilotMode, savGeminiApiKey } from "@/lib/sav/config";
-import { listSavPilotBatchItems, listSavPilotBatches, listSavPilotCandidates } from "@/lib/sav/service";
-import { cancelPilotBatchLabAction } from "../actions";
+import { listSavPilotBatchItems, listSavPilotBatches } from "@/lib/sav/service";
 import { SavLiveRefresh } from "../live-refresh";
-import { PilotCandidateSelector } from "./candidate-selector";
 
 export const dynamic = "force-dynamic";
 
@@ -38,9 +35,7 @@ export default async function SavPilotLabPage({ searchParams }: { searchParams: 
   await requireStaff("admin");
   const { batch = "", launch = "", error = "", batchCancelled = "" } = await searchParams;
   const configured = isDatabaseConfigured();
-  const [candidates, batches] = configured
-    ? await Promise.all([listSavPilotCandidates(80), listSavPilotBatches(30)])
-    : [[], []];
+  const batches = configured ? await listSavPilotBatches(30) : [];
   const activeBatch = batches.find((item) => item.status === "processing" || item.status === "reviewing");
   const requestedBatch = batch ? batches.find((item) => item.id === batch) : undefined;
   const focusBatch = activeBatch ?? requestedBatch;
@@ -49,9 +44,6 @@ export default async function SavPilotLabPage({ searchParams }: { searchParams: 
   const invalidActiveBatch = Boolean(activeBatch?.externalWrites);
   const stage = invalidActiveBatch ? 1 : focusBatch?.status === "processing" ? 2 : focusBatch?.status === "reviewing" ? 3 : focusBatch ? 4 : 1;
   const canSelect = !activeBatch && !focusBatch;
-  const pilotReady = isSavPilotMode();
-  const modelReady = Boolean(savGeminiApiKey());
-  const canLaunch = configured && pilotReady && modelReady && candidates.length >= 10;
   const reviewedItems = items.filter((item) => item.status === "reviewed").length;
   const safeFocusBatch = focusBatch && focusBatch.externalWrites === 0;
 
@@ -79,14 +71,12 @@ export default async function SavPilotLabPage({ searchParams }: { searchParams: 
     {activeBatch && invalidActiveBatch && <section className="sav-lab-incident card" role="alert">
       <AlertTriangle size={24}/>
       <div><span className="eyebrow">Ancien lot non conforme</span><h2>Ce lot ne peut pas servir au test.</h2><p>{activeBatch.externalWrites} écriture{activeBatch.externalWrites > 1 ? "s" : ""} HubSpot issue{activeBatch.externalWrites > 1 ? "s" : ""} de l’ancienne version ont été détectées. Les preuves restent conservées, mais le lot doit être annulé avant de repartir en simulation stricte.</p></div>
-      <form action={cancelPilotBatchLabAction}><input type="hidden" name="pilotBatchId" value={activeBatch.id}/><input type="hidden" name="reason" value="Lot historique non conforme avec écritures externes"/><button className="danger" type="submit">Annuler ce lot et repartir</button></form>
     </section>}
 
     {focusBatch && !invalidActiveBatch && processing && <section className="sav-lab-batch card">
       <header><div><span className="eyebrow">Étape 2 · Analyse</span><h2>Charly traite les 10 mails sélectionnés.</h2><p>La page s’actualise automatiquement. Les propositions sont enregistrées dans le Studio uniquement.</p></div><span className="pilot-working"><Clock3 size={16}/> Analyse en cours</span></header>
       <div className="pilot-progress"><div>{Array.from({ length: focusBatch.total }, (_, index) => <i className={index < focusBatch.ready ? "ready" : ""} key={index}/>)}</div><span><strong>{focusBatch.ready}</strong>/{focusBatch.total} prêts</span></div>
       <div className="sav-lab-processing-list">{items.map((item, index) => <article key={item.id}><span>{String(index + 1).padStart(2, "0")}</span><div><strong>{item.subject}</strong><small>{item.fromEmail}</small></div><em className={item.status}>{item.status === "ready" ? "Prêt" : item.status === "error" ? "Erreur" : item.status === "processing" ? "En analyse" : "En attente"}</em></article>)}</div>
-      <form action={cancelPilotBatchLabAction}><input type="hidden" name="pilotBatchId" value={focusBatch.id}/><input type="hidden" name="reason" value="Lot annulé manuellement pendant l’analyse"/><button className="ghost-danger" type="submit">Annuler ce test</button></form>
     </section>}
 
     {safeFocusBatch && focusBatch.status === "reviewing" && <section className="sav-lab-batch card" id="batch-review">
@@ -105,19 +95,16 @@ export default async function SavPilotLabPage({ searchParams }: { searchParams: 
         </div>
         <Link className="button secondary" href={`/studio/sav/${item.threadId}?from=pilot&batch=${focusBatch.id}`}>{item.status === "reviewed" ? "Voir la revue" : "Relire ce mail"}<ArrowUpRight size={14}/></Link>
       </article>)}</div>
-      <form action={cancelPilotBatchLabAction}><input type="hidden" name="pilotBatchId" value={focusBatch.id}/><input type="hidden" name="reason" value="Lot annulé manuellement pendant la revue"/><button className="ghost-danger" type="submit">Annuler ce test</button></form>
     </section>}
 
     {focusBatch && ["completed", "cancelled"].includes(focusBatch.status) && <section className="sav-lab-report card">
       <div><span className="eyebrow">Étape 4 · Rapport</span><h2>{focusBatch.status === "completed" ? "Le lot est entièrement relu." : "Ce lot a été annulé."}</h2><p>{focusBatch.status === "completed" ? "Voici la qualité mesurée sur ces 10 mails. Les résultats restent rattachés à cette version du harness." : "Les traces sont conservées pour l’audit, mais ce lot ne compte pas dans la validation."}</p></div>
       <div className="sav-lab-report-score"><strong>{focusBatch.acceptanceRate ?? 0}%</strong><span>de conformité pondérée</span></div>
       <dl><div><dt>Corrects</dt><dd>{focusBatch.correct}</dd></div><div><dt>Partiels</dt><dd>{focusBatch.partial}</dd></div><div><dt>Incorrects</dt><dd>{focusBatch.incorrect}</dd></div><div className={focusBatch.critical ? "critical" : ""}><dt>Critiques</dt><dd>{focusBatch.critical}</dd></div></dl>
-      {!activeBatch && <Link className="button primary" href="/studio/sav/pilote">Préparer un nouveau lot de 10 mails</Link>}
     </section>}
 
-    {canSelect && <section className="sav-lab-selection">
-      <PilotCandidateSelector candidates={candidates.map((candidate) => ({ ...candidate, receivedLabel: formatDate(candidate.receivedAt) }))} canLaunch={canLaunch} blockedReason={!configured ? "La base SAV n’est pas configurée." : !pilotReady ? "Le mode pilote doit être activé." : !modelReady ? "La clé Gemini SAV doit être connectée." : candidates.length < 10 ? `Il faut encore ${10 - candidates.length} mail${10 - candidates.length > 1 ? "s" : ""} éligible${10 - candidates.length > 1 ? "s" : ""}.` : ""}/>
-    </section>}
+    {/* SAV-60: new test batches belonged to the retired V0 circuit (A21/A22); history and reports stay readable. */}
+    {canSelect && <p className="login-notice" role="status">Les lots de test font partie de l’ancien circuit retiré : aucun nouveau lot ne peut être lancé. L’historique et les rapports restent consultables.</p>}
 
     {batches.length > 0 && <details className="sav-lab-history card"><summary>Historique des lots <span>{batches.length}</span></summary><div>{batches.map((item, index) => <Link className={item.id === focusBatch?.id ? "active" : ""} href={`/studio/sav/pilote?batch=${item.id}`} key={item.id}><span>Lot {batches.length - index}</span><strong>{item.reviewed}/{item.total} relus</strong><small>{item.status === "completed" ? `${item.acceptanceRate ?? 0}% conformes` : item.status === "cancelled" ? "Annulé · audit conservé" : item.status === "processing" ? "Analyse en cours" : "Revue en cours"}</small>{item.externalWrites > 0 && <em>Incident historique</em>}</Link>)}</div></details>}
   </div>;

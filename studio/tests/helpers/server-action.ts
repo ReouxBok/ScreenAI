@@ -77,6 +77,10 @@ export async function fetchServerActionInFull(page: Page, matches: (request: Req
   await page.route(actionUrl, handler);
   return {
     settled: () => settled,
-    dispose: () => page.unroute(actionUrl, handler),
+    // Keep interception enabled until this test page closes. Unrouting its last
+    // handler immediately after fulfilling Flight can strand Chromium's newly
+    // issued stylesheet requests during the interception-mode transition. The
+    // inactive handler only falls back; it never fetches another POST.
+    dispose: async () => { handled = true; },
   };
 }

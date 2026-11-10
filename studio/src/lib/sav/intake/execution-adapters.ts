@@ -14,6 +14,7 @@ const object = (v: unknown) => z.object({
 }).parse(v);
 const plain = (s: string) => s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&#39;");
 export const renderIntakeNote = (text: string, marker: string) => `<p>${plain(text).replace(/\n/g, "<br>")}</p><p>[Studio intake: ${plain(marker)}]</p>`;
+const ownerHistorySchema = z.object({ propertiesWithHistory: z.object({ hubspot_owner_id: z.array(z.object({ value: z.string().nullable().optional(), timestamp: z.string() }).passthrough()).min(1) }).passthrough() }).passthrough();
 const sameProperties = (actual: Record<string, string | null>, expected: Record<string, string>) => Object.entries(expected).every(([k, v]) => k === "hs_timestamp" ? Date.parse(actual[k] ?? "") === Date.parse(v) : actual[k] === v);
 // HubSpot removes this exact historical comment and may append one LF. Do
 // not strip arbitrary HTML or infer ownership from matching business text.
@@ -72,6 +73,17 @@ export function createIntakeExecutorAdapters(options: {
         } : {})
     }, status => `HUBSPOT_HTTP_${status}`);
     const read = (type: "tickets" | "notes" | "emails", objectId: string, signal: AbortSignal) => hub<unknown>(`/crm/v3/objects/${type}/${id(objectId)}?properties=${type === "tickets" ? "subject,content,hs_pipeline,hs_pipeline_stage,hubspot_owner_id,createdate,source_type,hs_ticket_category" : type === "notes" ? "hs_note_body,hs_timestamp" : "hs_email_subject,hs_email_text,hs_email_headers,hs_timestamp,hs_email_direction,hs_email_from_email,hs_email_to_email"}`, "GET", signal).then(object);
+    /** Review F3: the ticket's owner history, read only. Its earliest entry, alone at that time, must be `ownerId`, set within
+     * 5 s of `createdate`. A missing, malformed, truncated or ambiguous history proves nothing. */
+    async function createdWithOwner(ticketId: string, ownerId: string, createdate: string, signal: AbortSignal) {
+        const parsed = ownerHistorySchema.safeParse(await hub<unknown>(`/crm/v3/objects/tickets/${id(ticketId)}?propertiesWithHistory=hubspot_owner_id`, "GET", signal));
+        const created = Date.parse(createdate);
+        if (!parsed.success || !Number.isFinite(created)) return false;
+        const entries = parsed.data.propertiesWithHistory.hubspot_owner_id.map(entry => ({ value: entry.value ?? "", at: Date.parse(entry.timestamp) }));
+        if (entries.some(entry => !Number.isFinite(entry.at))) return false;
+        const earliest = Math.min(...entries.map(entry => entry.at)), first = entries.filter(entry => entry.at === earliest);
+        return first.length === 1 && first[0]!.value === ownerId && Math.abs(earliest - created) <= 5000;
+    }
     async function association(type: string, objectId: string, to: string, target: string, signal: AbortSignal) {
         let after: string | undefined;
         const seen = new Set<string>();
@@ -141,12 +153,20 @@ export function createIntakeExecutorAdapters(options: {
                 || parsed.headers["in-reply-to"] !== expectedParent || parsed.headers.references !== expectedReferences
                 || !parsed.headers["message-id"] || exactMimeText(message.payload) !== intent.text
                 || headers.some(h => ["cc", "bcc"].includes(h.name?.toLowerCase() ?? "") && Boolean(h.value?.trim()))) continue;
-            matches.push({ id: parsed.gmailMessageId, threadId: parsed.gmailThreadId });
+            // SAV-10: the verified Gmail send time (internalDate, already checked against the marker above) is kept in the receipt of a case reply, so that its J2 counts from the real mail.
+            matches.push({ id: parsed.gmailMessageId, threadId: parsed.gmailThreadId, ...(intent.kind === "reply_send" ? { sentAt: new Date(sentAt).toISOString() } : {}) });
         }
         return matches.length === 1 ? matches[0] : null;
     }
     const adapters: ExecutorAdapters = {
         prepareTicketHistory: (contactId, signal) => collectTicketCreationHistory(id(contactId), (path, body) => hub(path, body === undefined ? "GET" : "POST", signal, body)),
+        async v2OwnerAtCreation(input) {
+            const current = env();
+            if (current.SAV_CASE_RECORDING !== "on" || current.SAV_V2_ENTRY !== "on" || input.signal.aborted)
+                return { assign: false, reason: "v2_off" };
+            const { creationOwnerForIntake } = await import("../cases/v2-entry");
+            return creationOwnerForIntake(current, input);
+        },
         qualifyAddedEmails: (baseline,current,source,signal) => qualifyCrmHistoryAdditions(baseline,current,source,{authority:env().SAV_INTAKE_CRM_ACK_TEMPLATES_JSON,
           readEmail: objectId => read("emails",objectId,signal),
           verifyAckOrigin: async expected => {
@@ -193,7 +213,8 @@ export function createIntakeExecutorAdapters(options: {
                 throw Error("SAV_INTAKE_EXECUTION_GMAIL_CHANGED");
         },
         dispatch: async (intent, signal) => {
-            if (intent.kind === "identity_send") {
+            // SAV-10: `reply_send` is the same in-thread Gmail send as `identity_send` (same fields, same verification); only its permission differs.
+            if (intent.kind === "identity_send" || intent.kind === "reply_send") {
                 if (!intent.mailbox || !intent.raw || !intent.threadId)
                     throw Error("SAV_INTAKE_EXECUTION_TEMPLATE_INVALID");
                 return gmail<EffectAck>(intent.mailbox, "messages/send", {
@@ -228,6 +249,11 @@ export function createIntakeExecutorAdapters(options: {
                         hs_pipeline_stage: "1"
                     }
                 });
+            else if (intent.kind === "owner_assign")
+                // Refused before any call (review R1, 31/10): a re-read then a PATCH is not atomic and
+                // HubSpot offers no conditional write, so a human set in between would be overwritten.
+                // The executor no longer plans it; verify below stays read-only for any older effect.
+                throw Error("SAV_INTAKE_EXECUTION_OWNER_UNGUARDED");
             else if (intent.kind === "note_associate" || intent.kind === "email_associate") {
                 await hub(`/crm/v4/objects/${intent.kind === "note_associate" ? "notes" : "emails"}/${id(intent.objectId)}/associations/default/tickets/${id(intent.ticketId)}`, "PUT", signal);
                 return {
@@ -243,7 +269,7 @@ export function createIntakeExecutorAdapters(options: {
             };
         },
         verify: async (intent, ack, dispatchedAt, signal) => {
-            if (intent.kind === "identity_send") {
+            if (intent.kind === "identity_send" || intent.kind === "reply_send") {
                 const a = await sent(intent, ack, dispatchedAt, signal);
                 return {
                     confirmed: Boolean(a), attributed: Boolean(a), ...(a ? {
@@ -271,6 +297,15 @@ export function createIntakeExecutorAdapters(options: {
                         id: intent.objectId
                     }, observedHistory: {
                         id: `${type}:${row.id}`, kind: type === "notes" ? "note" : "email", at: new Date(p.hs_timestamp).toISOString(), text
+                    }
+                };
+            }
+            if (intent.kind === "owner_assign") {
+                const row = await read("tickets", id(intent.ticketId), signal);
+                const ok = row.id === intent.ticketId && Boolean(intent.properties?.hubspot_owner_id) && row.properties.hubspot_owner_id === intent.properties?.hubspot_owner_id;
+                return {
+                    confirmed: ok, attributed: ok && Boolean(ack?.id === intent.ticketId), ack: {
+                        id: row.id
                     }
                 };
             }
@@ -309,22 +344,30 @@ export function createIntakeExecutorAdapters(options: {
             const noteBody = intent.properties?.hs_note_body;
             const validNoteIntent = intent.kind !== "note_create" || typeof intent.text === "string" && Boolean(intent.marker?.match(/^[a-f0-9]{64}$/))
                 && (noteBody === renderIntakeNote(intent.text, intent.marker!) || noteBody === `<p>${plain(intent.text).replace(/\n/g, "<br>")}</p><!-- sav-intake:${intent.marker} -->`);
+            // The owner a creation carried is proven apart (review F3): today's owner may be a person who took the ticket since.
+            const createdOwner = type === "tickets" ? intent.properties?.hubspot_owner_id ?? null : null;
+            const expected = createdOwner ? Object.fromEntries(Object.entries(intent.properties ?? {}).filter(([key]) => key !== "hubspot_owner_id")) : intent.properties ?? {};
             let ok = row.id === candidate && validNoteIntent && (type === "notes"
                 ? sameNoteProperties(row.properties, intent.properties ?? {}, Boolean(ack?.id === candidate && ack.operatorCandidate !== true))
-                : sameProperties(row.properties, intent.properties ?? {}));
+                : sameProperties(row.properties, expected));
             if (!ack && !intent.objectId && (!intent.marker || !Object.values(row.properties).some(v => v?.includes(intent.marker!))))
                 ok = false;
+            // Without a created owner: empty, as before. With one: the creation is proven by today's owner being it, or else by
+            // HubSpot's history showing it was the ticket's FIRST owner, set at its creation (review F3). A person who took the
+            // ticket since keeps it (nothing is written) and the relay then reads « a person »; an insufficient history stays uncertain.
             if (type === "tickets")
-                ok = ok && Object.hasOwn(row.properties, "hubspot_owner_id") && !row.properties.hubspot_owner_id && await association("tickets", id(candidate), "contacts", id(intent.contactId), signal) && Boolean(row.properties.createdate) && Date.parse(row.properties.createdate!) >= dispatchedAt.getTime() - 5000;
+                ok = ok && Object.hasOwn(row.properties, "hubspot_owner_id") && (createdOwner ? true : !row.properties.hubspot_owner_id) && await association("tickets", id(candidate), "contacts", id(intent.contactId), signal) && Boolean(row.properties.createdate) && Date.parse(row.properties.createdate!) >= dispatchedAt.getTime() - 5000;
             if (type === "tickets" && ok && intent.ticketHistory)
                 ok = intent.ticketHistory.contactId === intent.contactId && await verifyTicketCreationHistory(candidate, intent.ticketHistory,
                     (path, body) => hub(path, body === undefined ? "GET" : "POST", signal, body));
+            if (type === "tickets" && ok && createdOwner && row.properties.hubspot_owner_id !== createdOwner)
+                ok = await createdWithOwner(candidate, createdOwner, row.properties.createdate!, signal);
             return {
                 confirmed: ok, attributed: ok, ack: {
                     id: candidate
                 }, ...(type === "tickets" && ok ? {
                     observedTicket: {
-                        id: row.id, contactIds: [id(intent.contactId)], stage: "new" as const, ownerId: null, subject: row.properties.subject!, content: row.properties.content!, createdAt: new Date(row.properties.createdate!).toISOString()
+                        id: row.id, contactIds: [id(intent.contactId)], stage: "new" as const, ownerId: createdOwner ? row.properties.hubspot_owner_id || null : null, subject: row.properties.subject!, content: row.properties.content!, createdAt: new Date(row.properties.createdate!).toISOString()
                     }
                 } : {})
             };

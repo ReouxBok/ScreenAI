@@ -1,4 +1,5 @@
 import "server-only";
+import { synRequestAuthorized, synStaff } from "./sav/local-syn";
 
 import { cache } from "react";
 import { currentUser } from "@clerk/nextjs/server";
@@ -32,6 +33,7 @@ async function persistStaff(identity: StaffIdentity) {
 }
 
 export const getStaff = cache(async (): Promise<StaffIdentity | null> => {
+  if (process.env.SAV_SYN_PREVIEW === "true") return synRequestAuthorized(await headers()) ? synStaff() : null;
   const bypass = process.env.NODE_ENV !== "production" && process.env.DEV_AUTH_BYPASS === "true";
   if (bypass) {
     const requestedEmail = (await headers()).get("x-studio-test-user") || process.env.DEV_USER_EMAIL;

@@ -1,10 +1,11 @@
+import { readIntakeUncertaintiesOrUnread } from "./uncertainty-read";
 import { intakeHumanHoldSql, intakeThreadHumanHeld } from "./legacy-pause";
 import { readSavExternalCompletion, listSavExternalCompletionMessageIds } from "../external-completion";
 import "server-only";
 import { and, asc, desc, eq, ilike, or, sql } from "drizzle-orm";
 import { requireDb } from "@/db";
 import { savIntakeConsole, savIntakeRuns, savIntakeHumanEvents, savMessages, savThreads,
-  savIntakeObservationBindings, savResolutionObservations, savObservationCycles } from "@/db/schema";
+  savIntakeObservationBindings, savResolutionObservations, savObservationCycles, savIntakeJournal } from "@/db/schema";
 import { decryptSavPayload } from "../crypto";
 import { historicalMessageSql, historicalThreadSql, intakeMessageHistorical } from "./launch-boundary";
 import type { IntakeRuntimePayload } from "./runtime-contract";
@@ -33,6 +34,9 @@ export async function projectIntakeThread(threadId: string, beforePublish?: () =
   else if (await intakeThreadHumanHeld(threadId)) result = { view: "to_validate", status: "human_hold", reason: "L’équipe garde la main sur ce dossier. L’automatisation reste en pause ; une décision humaine est attendue." };
   else if (message && await intakeMessageHistorical(message.id)) result = { view: "completed", status: "historical_outside_automation", reason: "Historique — hors automatisation. Le statut HubSpot et les preuves sont conservés." };
   else if (thread?.aiPaused) result = { view: null, status: "paused", reason: "Reprise suspendue par l’équipe" };
+  // V2 entry: this mail's V1 run was ended with its record on the V2 case; it is not waiting for an analysis.
+  else if (message && (!run || run.messageId !== message.id) && (await db.select({ id: savIntakeJournal.id }).from(savIntakeJournal).innerJoin(savIntakeRuns, eq(savIntakeRuns.id, savIntakeJournal.runId))
+    .where(and(eq(savIntakeRuns.messageId, message.id), eq(savIntakeJournal.kind, "v2_customer_return"))).limit(1)).length) result = { view: null, status: "v2_customer_return", reason: "Retour client repris sur le dossier V2." };
   else if (!run || run.messageId !== message?.id) result.reason = "Nouvelle entrée en attente d’analyse";
   else {
     try {
@@ -169,6 +173,9 @@ export async function listIntakeConsole(options: { mailboxId?: string; view?: Sa
     }).from(savIntakeConsole).leftJoin(savMessages, latestMessageJoin).where(and(common, selected))
       // Projection refreshes must not reshuffle the chronological list.
       .orderBy(...(options.sort==="oldest"?[sql`${effectiveReceivedAt} asc nulls last`,asc(savMessages.createdAt),asc(savIntakeConsole.threadId)]:[sql`${effectiveReceivedAt} desc nulls last`,desc(savMessages.createdAt),desc(savIntakeConsole.threadId)])).limit(25).offset((currentPage - 1) * 25);
-    return { installed: true, counts: countMap, rows, page: currentPage, pages, total };
+    // Read in a savepoint: its failure rolls back to it and the page keeps its rows, marked `unread` (never "no effect").
+    const uncertainties = await readIntakeUncertaintiesOrUnread(rows.filter(row => row.status === "uncertain" && row.messageId).map(row => row.messageId!),
+      read => tx.transaction(read));
+    return { installed: true, counts: countMap, rows: rows.map(row => ({ ...row, uncertainty: row.messageId ? uncertainties[row.messageId] ?? null : null })), page: currentPage, pages, total };
   }, { isolationLevel: "repeatable read", accessMode: "read only" });
 }

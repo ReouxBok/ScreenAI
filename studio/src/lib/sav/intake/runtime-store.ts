@@ -1,3 +1,4 @@
+import { assertSavSharedSpend, SavSharedSpendExhaustedError } from "../shared-spend";
 import type { ExecutionPayload } from "./execution-types";
 import { intakeAutomatedMessage, type IntakeAutomation } from "./automated-message";
 import { readRecoveryDue, DEFAULT_INTAKE_READ_RECOVERY } from "./read-recovery";
@@ -577,6 +578,8 @@ async function reserveIntakeCall(tx: Tx, run: Run, config: IntakeRuntimeConfig, 
     const limit = intakeExhaustedLimit({ own: rows.filter(row => row.messageKey === messageKey).length, version: rows.filter(row => row.runId === run.id).length, needed: 1,
       perMessage: SAV_INTAKE_CALL_POLICY.perMessage, perVersion: SAV_INTAKE_CALL_POLICY.perVersion, priceNanoUsd: price.reservedNanoUsd, usage });
     if (limit) throw new IntakeBudgetExhaustedError(limit);
+    try { await assertSavSharedSpend(tx, price.reservedNanoUsd, budgetNow); }
+    catch(error) { if(error instanceof SavSharedSpendExhaustedError) throw new IntakeBudgetExhaustedError(error.limit); throw error; }
     const [row] = await tx.insert(savIntakeModelCalls).values({ runId: run.id, messageKey, requestHash, state: "dispatched", reservedNanoUsd: price.reservedNanoUsd,
       chargedNanoUsd: price.reservedNanoUsd, createdAt:budgetNow, payloadCiphertext: encryptSavPayload({ model: config.model, configHash: config.configHash, reservation: price }) }).returning();
     return { id: row.id, cached: null };

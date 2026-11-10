@@ -62,6 +62,10 @@ const activeRequestMarkers = [
   "ne\\s+(?:fonctionne|marche|fonctionnent|marchent)\\s+(?:toujours\\s+)?(?:pas|plus)", "toujours\\s+(?:pas|en panne|bloqu[ée]e?s?|le m[êe]me (?:probl[èe]me|souci))",
   "recommence", "persiste", "still (?:not|broken|failing|down)",
   "pouvez[- ]vous", "pourriez[- ]vous", "est[- ]il possible", "j'aimerais", "je voudrais", "je souhaiterais?", "merci de (?:me|nous)", "could you", "can you", "please",
+  // Night V1 (D): an answer still awaited from the team keeps the request open, even inside a thanks.
+  "j'attends\\s+(?:toujours\\s+|encore\\s+)?(?:votre|vos|une|la)\\s+(?:retour|réponse|nouvelles)", "(?:nous\\s+)?attendons\\s+(?:toujours\\s+|encore\\s+)?(?:votre|vos|une|la)\\s+(?:retour|réponse|nouvelles)",
+  "dans\\s+l'attente\\s+(?:de\\s+)?(?:votre|vos|d'une)\\s+(?:retour|réponse|nouvelles)", "en\\s+attente\\s+de\\s+(?:votre|vos|d'une)\\s+(?:retour|réponse|nouvelles)",
+  "waiting for (?:your|a) (?:reply|answer|response|feedback)",
 ].map(source => new RegExp(`(?<![\\p{L}\\d])(?:${source})(?![\\p{L}\\d])`, "u"));
 /** A callback already received or explicitly declined is not a new callback request.
  * Only these exact phrases are neutralized; any other marker in the text still counts. */
@@ -73,6 +77,11 @@ const settledCallbackPhrases = [
   "ne (?:me|nous) (?:rappelez|recontactez|appelez) (?:pas|plus)",
   "no need to call (?:me|us)(?: back)?",
 ].map(source => new RegExp(`(?<![\\p{L}\\d])(?:${source})(?![\\p{L}\\d])`, "gu"));
+/** Night V1 (D): local part naming a no-reply system mailbox (noreply, do-not-reply, mailer-daemon, postmaster). */
+export function savIntakeNoReplyAddress(address: string) {
+  const local = address.toLowerCase().split("@")[0] ?? "";
+  return /(?:^|[-_.+])(?:no[-_.]?reply|do[-_.]?not[-_.]?reply|mailer[-_.]?daemon|postmaster)(?:$|[-_.+])/.test(local);
+}
 export function savIntakeActiveRequestSignal(currentText: string) {
   const text = settledCallbackPhrases.reduce((rest, phrase) => rest.replace(phrase, " "),
     currentText.normalize("NFC").toLowerCase().replace(/[’`]/g, "'").replace(/\b(?:https?:\/\/|www\.)\S+/g, " "));
@@ -381,6 +390,9 @@ export async function planSavIntake(
     if (expectedHumanCandidates?.some(id => !contacts.some(contact => contact.id === id))) return context("contact_ambiguous");
     if (!contacts.length) {
       if (input.previousIdentification?.messageId === message.id && normalizeEmail(input.previousIdentification.address) === address) return context("history_incomplete");
+      // Night V1 (D): never an automatic identification email to an address that declares it cannot receive replies
+      // (RFC 3834 spirit). Nothing is discarded: a person qualifies the message (notification or real request).
+      if (addressOrigin === "sender" && savIntakeNoReplyAddress(address)) return context("classification_incomplete");
       const resource = addressOrigin === "sender" ? policy.resources.identification : policy.resources.registrationNotFound;
       if (!resource) return context("private_resource_unavailable");
       savIntakePrivateResourceSchema.parse(resource);

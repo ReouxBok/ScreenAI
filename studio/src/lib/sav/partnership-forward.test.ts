@@ -8,7 +8,7 @@ import { activateSavV0Cutover } from "./cutover";
 import { decryptSavPayload, encryptSavPayload } from "./crypto";
 import { assertSavCurrentPartnershipForward, getSavPartnershipTransferState, prepareSavPartnershipForward, queueSavPartnershipForward } from "./partnership-forward";
 import { processPendingGmailSendActions } from "./gmail";
-import { retrySavAction } from "./service";
+import { retrySavActionArchived as retrySavAction } from "./service";
 import { savSemanticPlan } from "./understanding";
 import { savDossierSourceHash } from "./review-contract";
 const state = vi.hoisted(() => ({ db: null as unknown }));

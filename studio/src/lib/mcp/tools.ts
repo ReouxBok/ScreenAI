@@ -6,9 +6,11 @@ import { readIntakeConsoleDetail } from "@/lib/sav/intake/console-detail";
 import { readIntakeRunDiagnostics } from "@/lib/sav/intake/run-diagnostics";
 import { intakeBudgetOwnerFor, readIntakeBudgetPanel } from "@/lib/sav/intake/budget-admin";
 import { savIntakeViewLabels, savIntakeViewSchema } from "@/lib/sav/intake/contract";
-import { intakeStatusLabel, intakeReasonLabel, intakeBlockedCauseLabel, intakeRetryLabel } from "@/lib/sav/intake/console-presentation";
+import { intakeProjectionLabel, intakeReasonLabel, intakeBlockedCauseLabel, intakeRetryLabel } from "@/lib/sav/intake/console-presentation";
 import { readOperatorPanel } from "@/lib/sav/intake-ux/operator-commands";
 import { manualOtherUnavailableLabels } from "@/lib/sav/intake/manual-other-classification";
+import { savCompletionBlockerLabels, savCompletionPrecheckLabels } from "@/lib/sav/completion-blockers";
+import { intakeExecutionAuthorityLabels } from "@/lib/sav/intake/execution-authority";
 import { intakeDossierView, intakeDossierActions, intakeEffectLabels, intakeEffectStateLabels, intakeRouteLabel, intakeEffectsTitle, readIntakeManualOther, type IntakeConsoleDetail } from "@/lib/sav/intake/dossier-view";
 
 /** Uniform tool result. A refusal is an answer, not a transport error. */
@@ -39,11 +41,11 @@ export function intakeDossierSummary(data: IntakeConsoleDetail) {
   return {
     threadId: data.thread.id, subject: data.thread.subject || "Nouvelle demande", version: current?.version ?? null,
     status: { view: data.projection.view, code: data.projection.status,
-      label: view.dirty ? "Mise à jour du traitement en cours" : intakeReasonLabel(data.projection.reason) ?? intakeStatusLabel(data.projection.status) },
+      label: view.dirty ? "Mise à jour du traitement en cours" : intakeReasonLabel(data.projection.reason) ?? intakeProjectionLabel(data.projection.status, data.uncertainty) },
     locks: { humanHeld: data.humanHeld, paused: data.thread.paused, handledExternally: data.handledExternally, blocked: Boolean(view.blocked),
       unsettledEffects: effects.filter(effect => ["dispatched", "acked", "uncertain"].includes(effect.state)).length,
       uncertainExecution: data.progress?.state === "uncertain", pendingHumanEvent: data.choices.some(event => ["pending", "reading"].includes(event.state)),
-      holdEpoch: data.projection.epoch },
+      holdEpoch: data.projection.epoch, completionBlockers: data.completionBlockers ?? [], completionPrecheck: data.completionPrecheck ?? null },
     confirmedCurrent: data.confirmedCurrent,
     decision: plan ? { classification: plan.decision.classification, route: intakeRouteLabel(disposition),
       contactId: target?.contactId ?? null, ticketId: target && target.operation !== "create" ? target.ticketId : null } : null,
@@ -56,6 +58,7 @@ export function intakeDossierSummary(data: IntakeConsoleDetail) {
     effects: effects.map(effect => ({ kind: effect.kind, label: intakeEffectLabels[effect.kind] ?? effect.kind, state: effect.state,
       stateLabel: intakeEffectStateLabels[effect.state] ?? effect.state, confirmedAt: effect.confirmedAt?.toISOString() ?? null })),
     waitingReason: data.progress?.reason ? intakeReasonLabel(data.progress.reason) : null,
+    executionAuthority: data.executionAuthority && data.executionAuthority !== "valid" ? { state: data.executionAuthority, label: intakeExecutionAuthorityLabels[data.executionAuthority] } : null,
     linkedTicketId: data.confirmedCurrent ? data.progress?.ticketId ?? null : null,
     lastMessage: latest ? { id: latest.id, fromEmail: latest.fromEmail, receivedAt: latest.receivedAt?.toISOString() ?? null,
       text: latest.body.text.slice(0, STUDIO_MCP_MESSAGE_CHARS), truncated: latest.body.text.length > STUDIO_MCP_MESSAGE_CHARS,
@@ -72,7 +75,8 @@ export async function intakeAvailableActions(data: IntakeConsoleDetail, staff: S
   const panel = actions.administrator && actions.operatorBinding ? await readOperatorPanel(actions.operatorBinding).catch(() => null) : null;
   const manualOther = await readIntakeManualOther(data, actions.manualOther).catch(() => null);
   return [
-    { tool: "close_handled_outside", available: actions.closeHandledOutside, requires: "attestHandled: true" },
+    { tool: "close_handled_outside", available: actions.closeHandledOutside, requires: "attestHandled: true",
+      unavailableReason: actions.completionPrecheck || actions.completionBlockers.length ? [...(actions.completionPrecheck ? [savCompletionPrecheckLabels[actions.completionPrecheck]] : []), ...actions.completionBlockers.map(blocker => savCompletionBlockerLabels[blocker])].join(" ") : null },
     { tool: "classify_invalid_source_other", available: actions.classifyInvalidSource, requires: "attest: true" },
     { tool: "classify_other", available: Boolean(manualOther?.binding), requires: "attest: true, reason",
       unavailableReason: manualOther?.reason ? manualOtherUnavailableLabels[manualOther.reason] : null },
@@ -97,7 +101,7 @@ const listDossiers = { name: "list_dossiers", title: "Lister les dossiers SAV", 
       rows: data.rows.map(row => ({ threadId: row.threadId, messageId: row.messageId, subject: row.subject || "Nouvelle demande", fromEmail: row.fromEmail,
         receivedAt: row.receivedAt?.toISOString() ?? null, updatedAt: row.updatedAt?.toISOString() ?? null, version: row.version, view: row.view, status: row.status,
         blocked: Boolean(row.blockedCause), blockedCause: row.blockedCause,
-        label: row.blockedCause ? intakeBlockedCauseLabel(row.blockedCause) : row.retryAt ? intakeRetryLabel(row.retryAt) : intakeStatusLabel(row.status),
+        label: row.blockedCause ? intakeBlockedCauseLabel(row.blockedCause) : row.retryAt ? intakeRetryLabel(row.retryAt) : intakeProjectionLabel(row.status, row.uncertainty),
         reason: row.reason ? intakeReasonLabel(row.reason) : null })) });
   } };
 const getDossier = { name: "get_dossier", title: "Lire un dossier SAV", write: false,

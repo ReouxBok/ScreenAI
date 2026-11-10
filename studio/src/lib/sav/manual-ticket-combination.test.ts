@@ -6,8 +6,8 @@ import { activateSavV0Cutover } from "./cutover";
 import { decryptSavPayload, encryptSavPayload } from "./crypto";
 import { savStructuredProposalSchema } from "./proposal";
 import { getSavProposalReview, reviewSavProposal } from "./review";
-import { queueSavManualTicket } from "./manual-tickets";
-import { listSavInbox, retrySavAction } from "./service";
+import { queueSavManualTicketArchived as queueSavManualTicket } from "./manual-tickets";
+import { listSavInbox, retrySavActionArchived as retrySavAction } from "./service";
 import { processPendingHubspotActions, reconcileSavManualTicket } from "./hubspot";
 import { geminiFixture } from "../../../test/sav-understanding-fixtures";
 

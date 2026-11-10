@@ -15,7 +15,12 @@ it("passes UTF-8 Flight bytes to Chromium without charset guessing or replaying 
   expect(route.fetch).toHaveBeenCalledWith({ maxRedirects: 0, maxRetries: 0, timeout: 90_000, headers: { "next-action": "synthetic-action", "content-type": "multipart/form-data; boundary=fixture", connection: "close" } });
   expect(route.fulfill).toHaveBeenCalledExactlyOnceWith({ response, headers: { "content-type": "text/x-component; charset=utf-8", "x-action-redirect": "/done;push" }, body: bytes });
   expect(route.fulfill.mock.calls[0][0].body.toString("utf8")).toContain("Import préparé");
-  await action.dispose(); expect(page.unroute).toHaveBeenCalledTimes(1);
+  await action.dispose();
+  await handler(route as unknown as Route);
+  expect(page.unroute).not.toHaveBeenCalled();
+  expect(route.fallback).toHaveBeenCalledTimes(1);
+  expect(route.fetch).toHaveBeenCalledTimes(1);
+  expect(route.fulfill).toHaveBeenCalledTimes(1);
 });
 
 it("runs the race barrier after the single POST response and before Chromium receives its bytes", async () => {
@@ -67,7 +72,7 @@ it("scopes interception and disposal to the invoking page, never its rendering a
     route: vi.fn(async () => {}), unroute: vi.fn(async () => {}),
   };
   const action = await fetchServerActionInFull(page as unknown as Page, () => true);
-  const [pattern, handler] = page.route.mock.calls[0] as unknown as [RegExp, unknown];
+  const [pattern, handler] = page.route.mock.calls[0] as unknown as [RegExp, (route: Route) => Promise<void>];
   expect(pattern).toBeInstanceOf(RegExp);
   for (const url of ["http://127.0.0.1:3100/studio/review", "http://127.0.0.1:3100/studio/review?result=new&returnTo=/studio"]) {
     expect(pattern.test(url), url).toBe(true);
@@ -76,7 +81,14 @@ it("scopes interception and disposal to the invoking page, never its rendering a
     expect(pattern.test(url), url).toBe(false);
   }
   await action.dispose();
-  expect(page.unroute).toHaveBeenCalledExactlyOnceWith(pattern, handler);
+  await action.dispose(); // Disposal is idempotent, including before any matching action.
+  const route = { request: vi.fn(), fetch: vi.fn(), fulfill: vi.fn(), fallback: vi.fn(async () => {}) };
+  await handler(route as unknown as Route);
+  expect(page.unroute).not.toHaveBeenCalled();
+  expect(route.fallback).toHaveBeenCalledTimes(1);
+  expect(route.request).not.toHaveBeenCalled();
+  expect(route.fetch).not.toHaveBeenCalled();
+  expect(route.fulfill).not.toHaveBeenCalled();
 });
 
 

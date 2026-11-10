@@ -1,0 +1,933 @@
+{
+ "kind": "sav-v2-simulation-report.proposal-1",
+ "run": {
+  "id": "syn-delivery-2026-10-31T00:29:59.316Z",
+  "startedAt": "2026-10-31T00:29:59.316Z",
+  "expectationsFrozenAt": "2026-10-31T00:29:59.309Z",
+  "base": {
+   "sha": "19ef4900a9e95c8008de94c60b4bc8b9dfffb827",
+   "tree": "1f757e6c0271c32b096f2d0effbbf397ccb66b28"
+  },
+  "synthetic": true,
+  "provenance": {
+   "contract": "sav-v2-simulation-report.common-1",
+   "generator": "studio/src/lib/sav/cases/investigation-delivery-journey.test.ts",
+   "executor": "simulated",
+   "provider": "synthetic-gmail-no-socket",
+   "model": "synthetic-double",
+   "policy": {
+    "admission": "policy-r1",
+    "executionPolicyHash": "9e3bfa906b3ec5d10f7d845c5a130f18d82b6e8f454ccc0c19ffd74b142d930e",
+    "knowledge": "kb-r1",
+    "rules": "rules-r1",
+    "playbook": "playbook-1",
+    "prompt": "prompt-r1"
+   },
+   "cohort": {
+    "id": "syn-delivery-v1",
+    "kind": "synthetic",
+    "cases": 10,
+    "selection": "fixed list of B scenarios, no customer case"
+   }
+  }
+ },
+ "cases": [
+  {
+   "caseRef": "SYN-B01",
+   "scenario": "Accès : code non reçu, fiche couvrante (synthétique)",
+   "expected": {
+    "frozenAt": "2026-10-31T00:29:59.309Z",
+    "hash": "957a3fc3daa3bd7aec0ee26931f738f43ea936182165be57891ed3161231a305"
+   },
+   "proposedAt": "2026-10-31T00:29:59.339Z",
+   "fields": [
+    {
+     "field": "reply.purpose",
+     "expected": "answer",
+     "proposed": "answer"
+    },
+    {
+     "field": "effect.final",
+     "expected": "would_send",
+     "proposed": "would_send"
+    },
+    {
+     "field": "effect.reason",
+     "expected": null,
+     "proposed": null
+    },
+    {
+     "field": "sends.total",
+     "expected": 1,
+     "proposed": 1
+    },
+    {
+     "field": "refusals",
+     "expected": [],
+     "proposed": []
+    }
+   ],
+   "declaredVerdict": "match",
+   "refusals": [],
+   "actions": [
+    {
+     "kind": "reply",
+     "simulated": true,
+     "outcome": "would_send",
+     "reason": null
+    }
+   ],
+   "proofs": [
+    {
+     "kind": "replyKeys",
+     "ref": "reply:5502368a-6aa8-4452-aa22-0921cd55317b:inbound:gm-12d789c7-ddf7-40f4-9e22-05ffe02d60aa"
+    },
+    {
+     "kind": "networkCalls",
+     "ref": "0"
+    }
+   ],
+   "cost": {
+    "modelCalls": 1,
+    "paidCalls": 0
+   },
+   "latencyMs": 36,
+   "timeline": [],
+   "executor": {
+    "simulated": true,
+    "syntheticSends": 1,
+    "sendsByReplyKey": [
+     {
+      "replyKey": "reply:5502368a-6aa8-4452-aa22-0921cd55317b:inbound:gm-12d789c7-ddf7-40f4-9e22-05ffe02d60aa",
+      "count": 1
+     }
+    ],
+    "replyKeys": 1
+   },
+   "notComparable": [],
+   "expectedMeta": {
+    "canonicalization": "sorted-keys-json-utf8-sha256",
+    "frozenBy": null,
+    "b7Policy": "undecided",
+    "frozen": {
+     "caseRef": "SYN-B01",
+     "scenario": "Accès : code non reçu, fiche couvrante (synthétique)",
+     "timeline": [],
+     "expected": {
+      "purpose": "answer",
+      "final": "would_send",
+      "reason": null,
+      "sends": 1,
+      "refusals": []
+     }
+    }
+   }
+  },
+  {
+   "caseRef": "SYN-B02",
+   "scenario": "Même mail, second producteur après validation (synthétique)",
+   "expected": {
+    "frozenAt": "2026-10-31T00:29:59.309Z",
+    "hash": "3f818cea153bbb2ca2ebd3b8c374eae9e1a59cf725ac22eef3e0d14321f2ee99"
+   },
+   "proposedAt": "2026-10-31T00:29:59.375Z",
+   "fields": [
+    {
+     "field": "reply.purpose",
+     "expected": "answer",
+     "proposed": "answer"
+    },
+    {
+     "field": "effect.final",
+     "expected": "would_send",
+     "proposed": "would_send"
+    },
+    {
+     "field": "effect.reason",
+     "expected": null,
+     "proposed": null
+    },
+    {
+     "field": "sends.total",
+     "expected": 1,
+     "proposed": 1
+    },
+    {
+     "field": "refusals",
+     "expected": [
+      "trigger_already_approved"
+     ],
+     "proposed": [
+      "trigger_already_approved"
+     ]
+    }
+   ],
+   "declaredVerdict": "refused_as_expected",
+   "refusals": [
+    "trigger_already_approved"
+   ],
+   "actions": [
+    {
+     "kind": "reply",
+     "simulated": true,
+     "outcome": "would_send",
+     "reason": null
+    }
+   ],
+   "proofs": [
+    {
+     "kind": "replyKeys",
+     "ref": "reply:eb6b16bf-1707-48fc-840a-f7ccf7dc1f48:inbound:gm-2c65243c-3f1f-4476-bcff-864de0e95deb"
+    },
+    {
+     "kind": "networkCalls",
+     "ref": "0"
+    }
+   ],
+   "cost": {
+    "modelCalls": 1,
+    "paidCalls": 0
+   },
+   "latencyMs": 38,
+   "timeline": [
+    "second_producer_after_approval"
+   ],
+   "executor": {
+    "simulated": true,
+    "syntheticSends": 1,
+    "sendsByReplyKey": [
+     {
+      "replyKey": "reply:eb6b16bf-1707-48fc-840a-f7ccf7dc1f48:inbound:gm-2c65243c-3f1f-4476-bcff-864de0e95deb",
+      "count": 1
+     }
+    ],
+    "replyKeys": 1
+   },
+   "notComparable": [],
+   "expectedMeta": {
+    "canonicalization": "sorted-keys-json-utf8-sha256",
+    "frozenBy": null,
+    "b7Policy": "undecided",
+    "frozen": {
+     "caseRef": "SYN-B02",
+     "scenario": "Même mail, second producteur après validation (synthétique)",
+     "timeline": [
+      "second_producer_after_approval"
+     ],
+     "expected": {
+      "purpose": "answer",
+      "final": "would_send",
+      "reason": null,
+      "sends": 1,
+      "refusals": [
+       "trigger_already_approved"
+      ]
+     }
+    }
+   }
+  },
+  {
+   "caseRef": "SYN-B03",
+   "scenario": "Nouveau mail client après validation (synthétique)",
+   "expected": {
+    "frozenAt": "2026-10-31T00:29:59.309Z",
+    "hash": "8d65e56f91d8bb749a429f0190ec1fc033c2b30f0b0a4f1d53cdfc36a0019b18"
+   },
+   "proposedAt": "2026-10-31T00:29:59.413Z",
+   "fields": [
+    {
+     "field": "reply.purpose",
+     "expected": "answer",
+     "proposed": "answer"
+    },
+    {
+     "field": "effect.final",
+     "expected": "cancelled",
+     "proposed": "cancelled"
+    },
+    {
+     "field": "effect.reason",
+     "expected": "new_input",
+     "proposed": "new_input"
+    },
+    {
+     "field": "sends.total",
+     "expected": 0,
+     "proposed": 0
+    },
+    {
+     "field": "refusals",
+     "expected": [],
+     "proposed": []
+    }
+   ],
+   "declaredVerdict": "match",
+   "refusals": [],
+   "actions": [
+    {
+     "kind": "reply",
+     "simulated": true,
+     "outcome": "cancelled",
+     "reason": "new_input"
+    }
+   ],
+   "proofs": [
+    {
+     "kind": "replyKeys",
+     "ref": "unattributed:f8cc83c7-4913-4b19-b6b4-f0eb5a82f1c9"
+    },
+    {
+     "kind": "networkCalls",
+     "ref": "0"
+    }
+   ],
+   "cost": {
+    "modelCalls": 1,
+    "paidCalls": 0
+   },
+   "latencyMs": 33,
+   "timeline": [
+    "new_mail_after_approval"
+   ],
+   "executor": {
+    "simulated": true,
+    "syntheticSends": 0,
+    "sendsByReplyKey": [
+     {
+      "replyKey": "unattributed:f8cc83c7-4913-4b19-b6b4-f0eb5a82f1c9",
+      "count": 0
+     }
+    ],
+    "replyKeys": 1
+   },
+   "notComparable": [],
+   "expectedMeta": {
+    "canonicalization": "sorted-keys-json-utf8-sha256",
+    "frozenBy": null,
+    "b7Policy": "undecided",
+    "frozen": {
+     "caseRef": "SYN-B03",
+     "scenario": "Nouveau mail client après validation (synthétique)",
+     "timeline": [
+      "new_mail_after_approval"
+     ],
+     "expected": {
+      "purpose": "answer",
+      "final": "cancelled",
+      "reason": "new_input",
+      "sends": 0,
+      "refusals": []
+     }
+    }
+   }
+  },
+  {
+   "caseRef": "SYN-B04",
+   "scenario": "Prise par une personne après validation (synthétique)",
+   "expected": {
+    "frozenAt": "2026-10-31T00:29:59.309Z",
+    "hash": "3a8032045e7512b5031804c7f65c52a3cb93a961c5bdc5a4d9e9e7362a32ecc2"
+   },
+   "proposedAt": "2026-10-31T00:29:59.446Z",
+   "fields": [
+    {
+     "field": "reply.purpose",
+     "expected": "answer",
+     "proposed": "answer"
+    },
+    {
+     "field": "effect.final",
+     "expected": "cancelled",
+     "proposed": "cancelled"
+    },
+    {
+     "field": "effect.reason",
+     "expected": "owner_changed",
+     "proposed": "owner_changed"
+    },
+    {
+     "field": "sends.total",
+     "expected": 0,
+     "proposed": 0
+    },
+    {
+     "field": "refusals",
+     "expected": [],
+     "proposed": []
+    }
+   ],
+   "declaredVerdict": "match",
+   "refusals": [],
+   "actions": [
+    {
+     "kind": "reply",
+     "simulated": true,
+     "outcome": "cancelled",
+     "reason": "owner_changed"
+    }
+   ],
+   "proofs": [
+    {
+     "kind": "replyKeys",
+     "ref": "unattributed:52c0bad4-438b-4dfd-9d23-55f35a8af052"
+    },
+    {
+     "kind": "networkCalls",
+     "ref": "0"
+    }
+   ],
+   "cost": {
+    "modelCalls": 1,
+    "paidCalls": 0
+   },
+   "latencyMs": 30,
+   "timeline": [
+    "human_takeover_after_approval"
+   ],
+   "executor": {
+    "simulated": true,
+    "syntheticSends": 0,
+    "sendsByReplyKey": [
+     {
+      "replyKey": "unattributed:52c0bad4-438b-4dfd-9d23-55f35a8af052",
+      "count": 0
+     }
+    ],
+    "replyKeys": 1
+   },
+   "notComparable": [],
+   "expectedMeta": {
+    "canonicalization": "sorted-keys-json-utf8-sha256",
+    "frozenBy": null,
+    "b7Policy": "undecided",
+    "frozen": {
+     "caseRef": "SYN-B04",
+     "scenario": "Prise par une personne après validation (synthétique)",
+     "timeline": [
+      "human_takeover_after_approval"
+     ],
+     "expected": {
+      "purpose": "answer",
+      "final": "cancelled",
+      "reason": "owner_changed",
+      "sends": 0,
+      "refusals": []
+     }
+    }
+   }
+  },
+  {
+   "caseRef": "SYN-B05",
+   "scenario": "Pause complète V2 après validation (synthétique)",
+   "expected": {
+    "frozenAt": "2026-10-31T00:29:59.309Z",
+    "hash": "fdf426fc6bd324866d6f201c61332cbe710a9d8ee867ce8e229c462503c599f4"
+   },
+   "proposedAt": "2026-10-31T00:29:59.476Z",
+   "fields": [
+    {
+     "field": "reply.purpose",
+     "expected": "answer",
+     "proposed": "answer"
+    },
+    {
+     "field": "effect.final",
+     "expected": "held",
+     "proposed": "held"
+    },
+    {
+     "field": "effect.reason",
+     "expected": "paused",
+     "proposed": "paused"
+    },
+    {
+     "field": "sends.total",
+     "expected": 0,
+     "proposed": 0
+    },
+    {
+     "field": "refusals",
+     "expected": [],
+     "proposed": []
+    }
+   ],
+   "declaredVerdict": "match",
+   "refusals": [],
+   "actions": [
+    {
+     "kind": "reply",
+     "simulated": true,
+     "outcome": "held",
+     "reason": "paused"
+    }
+   ],
+   "proofs": [
+    {
+     "kind": "replyKeys",
+     "ref": "unattributed:209942a0-184e-4b82-8743-59f127f408ed"
+    },
+    {
+     "kind": "networkCalls",
+     "ref": "0"
+    }
+   ],
+   "cost": {
+    "modelCalls": 1,
+    "paidCalls": 0
+   },
+   "latencyMs": 25,
+   "timeline": [
+    "pause_full_after_approval"
+   ],
+   "executor": {
+    "simulated": true,
+    "syntheticSends": 0,
+    "sendsByReplyKey": [
+     {
+      "replyKey": "unattributed:209942a0-184e-4b82-8743-59f127f408ed",
+      "count": 0
+     }
+    ],
+    "replyKeys": 1
+   },
+   "notComparable": [],
+   "expectedMeta": {
+    "canonicalization": "sorted-keys-json-utf8-sha256",
+    "frozenBy": null,
+    "b7Policy": "undecided",
+    "frozen": {
+     "caseRef": "SYN-B05",
+     "scenario": "Pause complète V2 après validation (synthétique)",
+     "timeline": [
+      "pause_full_after_approval"
+     ],
+     "expected": {
+      "purpose": "answer",
+      "final": "held",
+      "reason": "paused",
+      "sends": 0,
+      "refusals": []
+     }
+    }
+   }
+  },
+  {
+   "caseRef": "SYN-B06",
+   "scenario": "Crash après le marqueur d'envoi (synthétique)",
+   "expected": {
+    "frozenAt": "2026-10-31T00:29:59.309Z",
+    "hash": "b9597cbe96daad71ec5ac13198177c20fb0d68cd2cdbbd290eed014e9a7fe4a4"
+   },
+   "proposedAt": "2026-10-31T00:29:59.501Z",
+   "fields": [
+    {
+     "field": "reply.purpose",
+     "expected": "answer",
+     "proposed": "answer"
+    },
+    {
+     "field": "effect.final",
+     "expected": "uncertain",
+     "proposed": "uncertain"
+    },
+    {
+     "field": "effect.reason",
+     "expected": "marker_without_receipt",
+     "proposed": "marker_without_receipt"
+    },
+    {
+     "field": "sends.total",
+     "expected": 0,
+     "proposed": 0
+    },
+    {
+     "field": "refusals",
+     "expected": [],
+     "proposed": []
+    }
+   ],
+   "declaredVerdict": "match",
+   "refusals": [],
+   "actions": [
+    {
+     "kind": "reply",
+     "simulated": true,
+     "outcome": "uncertain",
+     "reason": "marker_without_receipt"
+    }
+   ],
+   "proofs": [
+    {
+     "kind": "replyKeys",
+     "ref": "reply:0372bdba-8685-44b6-91fe-033a89d99be5:inbound:gm-6713ce4d-4418-4f1f-a49b-99cfd919b986"
+    },
+    {
+     "kind": "networkCalls",
+     "ref": "0"
+    }
+   ],
+   "cost": {
+    "modelCalls": 1,
+    "paidCalls": 0
+   },
+   "latencyMs": 32,
+   "timeline": [
+    "crash_after_marker"
+   ],
+   "executor": {
+    "simulated": true,
+    "syntheticSends": 0,
+    "sendsByReplyKey": [
+     {
+      "replyKey": "reply:0372bdba-8685-44b6-91fe-033a89d99be5:inbound:gm-6713ce4d-4418-4f1f-a49b-99cfd919b986",
+      "count": 0
+     }
+    ],
+    "replyKeys": 1
+   },
+   "notComparable": [],
+   "expectedMeta": {
+    "canonicalization": "sorted-keys-json-utf8-sha256",
+    "frozenBy": null,
+    "b7Policy": "undecided",
+    "frozen": {
+     "caseRef": "SYN-B06",
+     "scenario": "Crash après le marqueur d'envoi (synthétique)",
+     "timeline": [
+      "crash_after_marker"
+     ],
+     "expected": {
+      "purpose": "answer",
+      "final": "uncertain",
+      "reason": "marker_without_receipt",
+      "sends": 0,
+      "refusals": []
+     }
+    }
+   }
+  },
+  {
+   "caseRef": "SYN-B07",
+   "scenario": "Expéditeur stocké changé après validation (synthétique)",
+   "expected": {
+    "frozenAt": "2026-10-31T00:29:59.309Z",
+    "hash": "52576bf1567f4af2b3808328d773f0d5ee70b7a230ed0e288cdb021113866ec9"
+   },
+   "proposedAt": "2026-10-31T00:29:59.534Z",
+   "fields": [
+    {
+     "field": "reply.purpose",
+     "expected": "answer",
+     "proposed": "answer"
+    },
+    {
+     "field": "effect.final",
+     "expected": "cancelled",
+     "proposed": "cancelled"
+    },
+    {
+     "field": "effect.reason",
+     "expected": "recipient_changed",
+     "proposed": "recipient_changed"
+    },
+    {
+     "field": "sends.total",
+     "expected": 0,
+     "proposed": 0
+    },
+    {
+     "field": "refusals",
+     "expected": [],
+     "proposed": []
+    }
+   ],
+   "declaredVerdict": "match",
+   "refusals": [],
+   "actions": [
+    {
+     "kind": "reply",
+     "simulated": true,
+     "outcome": "cancelled",
+     "reason": "recipient_changed"
+    }
+   ],
+   "proofs": [
+    {
+     "kind": "replyKeys",
+     "ref": "unattributed:45256a2d-05b6-4a77-9c5a-1ffa2d37e258"
+    },
+    {
+     "kind": "networkCalls",
+     "ref": "0"
+    }
+   ],
+   "cost": {
+    "modelCalls": 1,
+    "paidCalls": 0
+   },
+   "latencyMs": 28,
+   "timeline": [
+    "sender_changed_after_approval"
+   ],
+   "executor": {
+    "simulated": true,
+    "syntheticSends": 0,
+    "sendsByReplyKey": [
+     {
+      "replyKey": "unattributed:45256a2d-05b6-4a77-9c5a-1ffa2d37e258",
+      "count": 0
+     }
+    ],
+    "replyKeys": 1
+   },
+   "notComparable": [],
+   "expectedMeta": {
+    "canonicalization": "sorted-keys-json-utf8-sha256",
+    "frozenBy": null,
+    "b7Policy": "undecided",
+    "frozen": {
+     "caseRef": "SYN-B07",
+     "scenario": "Expéditeur stocké changé après validation (synthétique)",
+     "timeline": [
+      "sender_changed_after_approval"
+     ],
+     "expected": {
+      "purpose": "answer",
+      "final": "cancelled",
+      "reason": "recipient_changed",
+      "sends": 0,
+      "refusals": []
+     }
+    }
+   }
+  },
+  {
+   "caseRef": "SYN-B08",
+   "scenario": "B-7 : remise par une personne puis deux producteurs (synthétique, règle non décidée)",
+   "expected": {
+    "frozenAt": "2026-10-31T00:29:59.309Z",
+    "hash": "99ba9370657e1d0cc24720cac65b0fa1afcc138e9cd7246ff3fb11f0ee30696a"
+   },
+   "proposedAt": "2026-10-31T00:29:59.561Z",
+   "fields": [
+    {
+     "field": "reply.purpose",
+     "expected": "answer",
+     "proposed": "answer"
+    },
+    {
+     "field": "effect.final",
+     "expected": "would_send",
+     "proposed": "would_send"
+    },
+    {
+     "field": "effect.reason",
+     "expected": null,
+     "proposed": null
+    },
+    {
+     "field": "sends.total",
+     "expected": 1,
+     "proposed": 2
+    },
+    {
+     "field": "refusals",
+     "expected": [],
+     "proposed": []
+    }
+   ],
+   "declaredVerdict": "mismatch",
+   "refusals": [],
+   "actions": [
+    {
+     "kind": "reply",
+     "simulated": true,
+     "outcome": "would_send",
+     "reason": null
+    }
+   ],
+   "proofs": [
+    {
+     "kind": "replyKeys",
+     "ref": "reply:2aeb6acd-3d87-42e2-a9e9-2c8e31f1e98b:inbound:gm-c467a453-c6bf-48f9-959f-f9e0ad2ad1ac reply:2aeb6acd-3d87-42e2-a9e9-2c8e31f1e98b:back:7dedc575-968e-4fba-ae15-8a5a92fbf105"
+    },
+    {
+     "kind": "networkCalls",
+     "ref": "0"
+    }
+   ],
+   "cost": {
+    "modelCalls": 1,
+    "paidCalls": 0
+   },
+   "latencyMs": 89,
+   "timeline": [
+    "hand_back",
+    "second_producer_back_key"
+   ],
+   "executor": {
+    "simulated": true,
+    "syntheticSends": 2,
+    "sendsByReplyKey": [
+     {
+      "replyKey": "reply:2aeb6acd-3d87-42e2-a9e9-2c8e31f1e98b:inbound:gm-c467a453-c6bf-48f9-959f-f9e0ad2ad1ac",
+      "count": 1
+     },
+     {
+      "replyKey": "reply:2aeb6acd-3d87-42e2-a9e9-2c8e31f1e98b:back:7dedc575-968e-4fba-ae15-8a5a92fbf105",
+      "count": 1
+     }
+    ],
+    "replyKeys": 2
+   },
+   "notComparable": [],
+   "expectedMeta": {
+    "canonicalization": "sorted-keys-json-utf8-sha256",
+    "frozenBy": null,
+    "b7Policy": "undecided",
+    "frozen": {
+     "caseRef": "SYN-B08",
+     "scenario": "B-7 : remise par une personne puis deux producteurs (synthétique, règle non décidée)",
+     "timeline": [
+      "hand_back",
+      "second_producer_back_key"
+     ],
+     "expected": {
+      "purpose": "answer",
+      "final": "would_send",
+      "reason": null,
+      "sends": 1,
+      "refusals": []
+     }
+    }
+   }
+  },
+  {
+   "caseRef": "SYN-B09",
+   "scenario": "Entrée sans attendu figé (synthétique)",
+   "expected": null,
+   "proposedAt": "2026-10-31T00:29:59.650Z",
+   "fields": [],
+   "declaredVerdict": "not_comparable",
+   "refusals": [],
+   "actions": [
+    {
+     "kind": "reply",
+     "simulated": true,
+     "outcome": "would_send",
+     "reason": null
+    }
+   ],
+   "proofs": [
+    {
+     "kind": "replyKeys",
+     "ref": "reply:570debb5-749f-4593-aa86-f241f0813a03:inbound:gm-02237584-6c7a-41a8-b63f-7b2d2cf5c08b"
+    },
+    {
+     "kind": "networkCalls",
+     "ref": "0"
+    }
+   ],
+   "cost": {
+    "modelCalls": 1,
+    "paidCalls": 0
+   },
+   "latencyMs": 34,
+   "timeline": [],
+   "executor": {
+    "simulated": true,
+    "syntheticSends": 1,
+    "sendsByReplyKey": [
+     {
+      "replyKey": "reply:570debb5-749f-4593-aa86-f241f0813a03:inbound:gm-02237584-6c7a-41a8-b63f-7b2d2cf5c08b",
+      "count": 1
+     }
+    ],
+    "replyKeys": 1
+   },
+   "notComparable": [],
+   "expectedMeta": null
+  },
+  {
+   "caseRef": "SYN-B10",
+   "scenario": "Attendu figé, exécuteur jamais lancé : résultat inconnu (synthétique)",
+   "expected": {
+    "frozenAt": "2026-10-31T00:29:59.309Z",
+    "hash": "cc849bf2c7f553749dde872e8427791f0b015e98771835f4aba62d649c42e23c"
+   },
+   "proposedAt": "2026-10-31T00:29:59.686Z",
+   "fields": [
+    {
+     "field": "reply.purpose",
+     "expected": "answer",
+     "proposed": "answer"
+    },
+    {
+     "field": "refusals",
+     "expected": [],
+     "proposed": []
+    }
+   ],
+   "declaredVerdict": "not_comparable",
+   "refusals": [],
+   "actions": [],
+   "proofs": [
+    {
+     "kind": "replyKeys",
+     "ref": "none"
+    },
+    {
+     "kind": "networkCalls",
+     "ref": "0"
+    }
+   ],
+   "cost": {
+    "modelCalls": 1,
+    "paidCalls": 0
+   },
+   "latencyMs": null,
+   "timeline": [
+    "executor_not_run"
+   ],
+   "executor": {
+    "simulated": true,
+    "syntheticSends": null,
+    "sendsByReplyKey": null,
+    "replyKeys": null
+   },
+   "notComparable": [
+    {
+     "field": "effect.final",
+     "reason": "executor_not_run"
+    },
+    {
+     "field": "effect.reason",
+     "reason": "executor_not_run"
+    },
+    {
+     "field": "sends.total",
+     "reason": "executor_not_run"
+    }
+   ],
+   "expectedMeta": {
+    "canonicalization": "sorted-keys-json-utf8-sha256",
+    "frozenBy": null,
+    "b7Policy": "undecided",
+    "frozen": {
+     "caseRef": "SYN-B10",
+     "scenario": "Attendu figé, exécuteur jamais lancé : résultat inconnu (synthétique)",
+     "timeline": [
+      "executor_not_run"
+     ],
+     "expected": {
+      "purpose": "answer",
+      "final": "would_send",
+      "reason": null,
+      "sends": 1,
+      "refusals": []
+     }
+    }
+   }
+  }
+ ]
+}
