@@ -41,6 +41,22 @@ afterEach(() => {
 });
 
 describe('POST /api/events (extension >= 2.2.53)', () => {
+  it('accepts diagnostic enums and recovery flags while dropping arbitrary diagnostic text', async () => {
+    const res = await post('/api/events').send({ installId: INSTALL_ID, events: [
+      { event: 'extension_error', properties: { component: 'voice', code: 'VOICE_TEXT_INPUT_FAILED', error_type: 'TypeError', failure_reason: 'framework_reverted_input', message: 'private message' } },
+      { event: 'extension_error', properties: { component: 'voice', code: 'VOICE_SESSION_FAILED', error_type: 'private name', failure_reason: 'private reason' } },
+      { event: 'tool_executed', properties: { tool: 'fill_field', status: 'not_found', channel: 'voice', failure_reason: 'stale_context', recovery_requested: true } }
+    ] });
+    expect(res.status).toBe(202);
+    await vi.waitFor(() => expect(transport).toHaveBeenCalledOnce());
+    const events = sentEvents();
+    expect(events[0].properties).toMatchObject({ error_type: 'TypeError', failure_reason: 'framework_reverted_input' });
+    expect(events[1].properties).not.toHaveProperty('error_type');
+    expect(events[1].properties).not.toHaveProperty('failure_reason');
+    expect(events[2].properties).toMatchObject({ failure_reason: 'stale_context', recovery_requested: true });
+    expect(JSON.stringify(events)).not.toContain('private');
+  });
+
   it('forwards an anonymous batch keyed by the install id, keeping only allowlisted data', async () => {
     const res = await post('/api/events').send({
       installId: INSTALL_ID,

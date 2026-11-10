@@ -63,6 +63,7 @@ function abortable(options) {
 }
 
 afterEach(() => {
+  vi.useRealTimers();
   uninstallFullChromeMock();
   delete globalThis.fetch;
   vi.restoreAllMocks();
@@ -141,6 +142,7 @@ describe('page change while Charly answers', () => {
       }
     });
     const port = openPanel();
+    const track = vi.spyOn(background.analytics, 'track');
     const first = message({ type: 'USER_MESSAGE', text: 'Première demande' });
     await vi.waitFor(() => expect(calls(/\/v2\/turn$/)).toHaveLength(1));
 
@@ -149,6 +151,100 @@ describe('page change while Charly answers', () => {
 
     expect(errors(port)).toEqual([]);
     expect(port.messages).toContainEqual(expect.objectContaining({ type: 'GEMINI_RESPONSE', content: 'Deuxième réponse.' }));
+    expect(track.mock.calls.filter(([event, properties]) =>
+      ['extension_error', 'assistant_failed'].includes(event)
+      && [properties.code, properties.error_code].includes('PROXY_REQUEST_ABORTED')
+    )).toEqual([]);
+  });
+
+  it('drops an old legacy response whose body finishes after the newer answer', async () => {
+    let finishBody;
+    let first = true;
+    await setup({
+      '/bootstrap': () => response({ available: true, enabled: true, serverOrchestration: false }),
+      '/api/gemini': () => {
+        if (!first) return response({ candidates: [{ content: { parts: [{ text: 'Réponse actuelle.' }] } }] });
+        first = false;
+        return { ok: true, status: 200, json: () => new Promise(resolve => { finishBody = resolve; }) };
+      }
+    });
+    const port = openPanel();
+    const pending = message({ type: 'USER_MESSAGE', text: 'Ancienne demande' });
+    await vi.waitFor(() => expect(finishBody).toBeTypeOf('function'));
+    await message({ type: 'USER_MESSAGE', text: 'Nouvelle demande' });
+    finishBody({ candidates: [{ content: { parts: [{ text: 'Réponse périmée.' }] } }] });
+    await pending;
+
+    expect(port.messages.filter(item => item.type === 'GEMINI_RESPONSE').map(item => item.content)).toEqual(['Réponse actuelle.']);
+    expect(errors(port)).toEqual([]);
+  });
+
+  it('keeps an external knowledge deadline visible as a timeout', async () => {
+    await setup({ '/api/knowledge/search': abortable });
+    const deadline = new AbortController();
+    vi.spyOn(AbortSignal, 'timeout').mockReturnValue(deadline.signal);
+    const track = vi.spyOn(background.analytics, 'track');
+    const pending = background.getKnowledgeContext('Connexion Gmail');
+    await vi.waitFor(() => expect(calls(/\/api\/knowledge\/search$/)).toHaveLength(1));
+    deadline.abort(new DOMException('The operation timed out', 'TimeoutError'));
+    await pending;
+
+    expect(track).toHaveBeenCalledWith('extension_error', expect.objectContaining({
+      component: 'proxy', code: 'PROXY_REQUEST_TIMEOUT'
+    }));
+    expect(track.mock.calls.some(([event, properties]) => event === 'extension_error' && properties.code === 'PROXY_REQUEST_ABORTED')).toBe(false);
+  });
+
+  it('does not execute tools from an ADK response superseded while its body was loading', async () => {
+    let finishBody;
+    let first = true;
+    await setup({ '/v2/turn': () => {
+      if (!first) return response({ type: 'message', content: 'Réponse actuelle.' });
+      first = false;
+      return { ok: true, status: 200, json: () => new Promise(resolve => { finishBody = resolve; }) };
+    } });
+    const port = openPanel();
+    const pending = message({ type: 'USER_MESSAGE', text: 'Ancienne demande' });
+    await vi.waitFor(() => expect(finishBody).toBeTypeOf('function'));
+    await message({ type: 'USER_MESSAGE', text: 'Nouvelle demande' });
+    chromeMock.scripting.executeScript.mockClear();
+    finishBody({ type: 'tool_call', runId: 'stale-run', call: { id: 'old-tool', name: 'capture_current_view', args: {} } });
+    await pending;
+
+    expect(chromeMock.scripting.executeScript).not.toHaveBeenCalled();
+    expect(fetch.mock.calls.some(([url]) => String(url).includes('/stale-run/result'))).toBe(false);
+    expect(port.messages.filter(item => item.type === 'GEMINI_RESPONSE').map(item => item.content)).toEqual(['Réponse actuelle.']);
+    expect(errors(port)).toEqual([]);
+  });
+
+  it.each([
+    [{ candidates: [] }, 'GEMINI_EMPTY_RESPONSE'],
+    [{ candidates: [{ content: { parts: [{ text: '   ' }] } }] }, 'GEMINI_EMPTY_RESPONSE'],
+    [{ promptFeedback: { blockReason: 'SAFETY' } }, 'GEMINI_RESPONSE_BLOCKED']
+  ])('reports a structured failure for an unusable model response', async (payload, code) => {
+    await setup({
+      '/bootstrap': () => response({ available: true, enabled: true, serverOrchestration: false }),
+      '/api/gemini': () => response(payload)
+    });
+    const port = openPanel();
+    await message({ type: 'USER_MESSAGE', text: 'Aide-moi' });
+    expect(errors(port)).toEqual([expect.objectContaining({ code })]);
+    expect(port.messages.some(item => item.type === 'GEMINI_RESPONSE')).toBe(false);
+  });
+
+  it('reads all public text parts without exposing model thoughts', async () => {
+    await setup({
+      '/bootstrap': () => response({ available: true, enabled: true, serverOrchestration: false }),
+      '/api/gemini': () => response({ candidates: [{ content: { parts: [
+        { thought: true, text: 'internal thought' }, { text: 'Première partie.' }, { text: 'Suite.' }
+      ] } }] })
+    });
+    const port = openPanel();
+    await message({ type: 'USER_MESSAGE', text: 'Aide-moi' });
+    expect(port.messages.filter(item => item.type === 'GEMINI_RESPONSE')).toEqual([
+      expect.objectContaining({ content: 'Première partie.\nSuite.' })
+    ]);
+    expect(JSON.stringify(port.messages)).not.toContain('internal thought');
   });
 
   it('keeps a failed automatic analysis out of the chat', async () => {

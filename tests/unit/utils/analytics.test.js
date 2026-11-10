@@ -197,4 +197,24 @@ describe('usage analytics', () => {
     expect(events).toHaveLength(2);
     expect(events[0].properties).toMatchObject({ component: 'proxy', code: 'PROXY_NETWORK_FAILED' });
   });
+
+  it('keeps distinct causes visible while deduplicating the same failure', async () => {
+    const analytics = make();
+    await analytics.initialize();
+    analytics.trackError('content_script', 'CONTENT_SCRIPT_REPAIR_FAILED', { errorType: 'Error', failureReason: 'tab_closed' });
+    analytics.trackError('content_script', 'CONTENT_SCRIPT_REPAIR_FAILED', { errorType: 'Error', failureReason: 'tab_closed' });
+    analytics.trackError('content_script', 'CONTENT_SCRIPT_REPAIR_FAILED', { errorType: 'Error', failureReason: 'host_permission_denied' });
+    await vi.advanceTimersByTimeAsync(3_000);
+    const events = sentBodies().flatMap(body => body.events);
+    expect(events.map(event => event.properties.failure_reason)).toEqual(['tab_closed', 'host_permission_denied']);
+  });
+
+  it('does not count the same voice failure twice when the catch adds its error type', async () => {
+    const analytics = make();
+    await analytics.initialize();
+    analytics.trackError('voice', 'LIVE_SERVER_ERROR');
+    analytics.trackError('voice', 'LIVE_SERVER_ERROR', { errorType: 'Error' });
+    await vi.advanceTimersByTimeAsync(3_000);
+    expect(sentBodies().flatMap(body => body.events)).toHaveLength(1);
+  });
 });

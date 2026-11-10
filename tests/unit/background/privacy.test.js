@@ -386,6 +386,15 @@ describe('background privacy boundaries', () => {
     globalThis.fetch.mockRejectedValueOnce(new Error('studio unavailable'));
     const result = await background.searchVoiceKnowledge('Comment connecter Gmail à Limova ?');
     expect(result.ok).toBe(false);
+    expect(result.error).toContain('momentanément indisponible');
+    expect(result.failureCode).toBe('knowledge_unavailable');
+    expect(result).not.toHaveProperty('knowledge');
+  });
+
+  it('distinguishes a working search with no relevant article from an outage', async () => {
+    globalThis.fetch.mockResolvedValueOnce({ ok: true, status: 200, json: async () => ({ revision: 'kb_empty', results: [] }) });
+    const result = await background.searchVoiceKnowledge('Sujet sans documentation correspondante');
+    expect(result).toMatchObject({ ok: false, status: 'not_found', failureCode: 'no_relevant_article' });
     expect(result.error).toContain('Aucun article pertinent');
   });
 });

@@ -122,6 +122,30 @@ describe('controlled page actions', () => {
     expect(sendOrder).toEqual(['click:1:v1', 'click:1:v2']);
   });
 
+  it.each([
+    ['chrome://settings/', 'Cannot access contents of the page', 'restricted_browser_page'],
+    ['https://chromewebstore.google.com/detail/example', 'Cannot access contents of the page', 'restricted_browser_page'],
+    ['https://private.example/document', 'Missing host permission for the tab', 'host_permission_denied'],
+    ['https://private.example/document', 'Frame with ID 0 was removed', 'navigation_race']
+  ])('categorizes a repair failure on %s without sending the URL or message to analytics', async (url, errorMessage, reason) => {
+    const track = vi.spyOn(background.analytics, 'trackError');
+    chromeMock.tabs.get.mockResolvedValue({ id: 17, url, active: true });
+    chromeMock.tabs.sendMessage.mockRejectedValue(new Error('Receiving end does not exist'));
+    chromeMock.scripting.executeScript.mockRejectedValue(new Error(errorMessage));
+    try {
+      const result = await background.proposeOrExecuteAction(1, 'Clique sur Documents');
+      expect(result.ok).toBe(false);
+      expect(track).toHaveBeenCalledWith('content_script', 'CONTENT_SCRIPT_REPAIR_FAILED', {
+        errorType: 'Error', failureReason: reason
+      });
+      expect(JSON.stringify(track.mock.calls)).not.toContain('private.example');
+      expect(JSON.stringify(track.mock.calls)).not.toContain(errorMessage);
+    } finally {
+      track.mockRestore();
+      chromeMock.tabs.get.mockResolvedValue({ id: 17, windowId: 1, url: 'https://new.limova.ai/home', active: true });
+    }
+  });
+
   it('executes a safe action marker without showing a confirmation card', async () => {
     const result = await background.proposeOrExecuteAction(1, 'Que contient cette page ?');
     expect(result.ok).toBe(true);
@@ -362,6 +386,26 @@ describe('controlled page actions', () => {
       contextVersion: 1,
       text: 'Prépare un résumé concis'
     });
+  });
+
+  it('does not type after a text tool is superseded while checking consent', async () => {
+    let finishConsent;
+    const get = chromeMock.storage.local.get.getMockImplementation();
+    chromeMock.storage.local.get.mockImplementation(key => key === 'limova_ai_processing_consent_v1'
+      ? new Promise(resolve => { finishConsent = resolve; }) : get(key));
+    const controller = new AbortController();
+    try {
+      const pending = background.executeCopilotTool({
+        id: 'superseded-fill', name: 'fill_field', args: { elementId: 5, contextVersion: 1, text: 'Old instruction', targetLabel: 'Instructions' }
+      }, 'Remplis Instructions', 'old-turn', controller.signal);
+      await vi.waitFor(() => expect(finishConsent).toBeTypeOf('function'));
+      controller.abort();
+      finishConsent({ limova_ai_processing_consent_v1: true });
+      expect(await pending).toMatchObject({ cancelled: true });
+      expect(chromeMock.tabs.sendMessage).not.toHaveBeenCalledWith(17, expect.objectContaining({ type: 'TYPE_ELEMENT_TEXT' }));
+    } finally {
+      chromeMock.storage.local.get.mockImplementation(get);
+    }
   });
 
   it('refreshes and remaps a field once when the SPA replaced the original DOM node', async () => {
