@@ -14,6 +14,8 @@ import { caseReplyTriggerOf } from "./investigation-intent";
 import type { CaseKnowledgeCoverage } from "./decision-contract";
 import type { CaseKnowledgeRead, CaseKnowledgeRequestProblem } from "./investigation-knowledge";
 import type { CaseQualificationUnavailable } from "./qualification-diagnostic";
+import { caseIncidentBindings, revalidateIncidentContext } from "./investigation-incidents";
+import type { IncidentContext, IncidentReader } from "./investigation-incidents-contract";
 
 /*
  * SAV-7 investigation in observation (local sub-lot 1). The flow only: every read, lease, model
@@ -53,6 +55,10 @@ export type CaseInvestigationModelRequest = {
   /** Per open request: the cards retrieved for it, or why there are none (`selectCaseKnowledge`). Null when the
    * knowledge port gives a plain list. A request `no_applicable_knowledge` calls for a targeted question or a handoff. */
   coverage: CaseKnowledgeCoverage[] | null;
+  /** Separately approved temporary context, bound to exact canonical SAV projections. Never a published/indexed card or an action grant. */
+  temporaryIncidents?: IncidentContext;
+  /** Internal ledger receipt only; never serialized into the model payload. Also binds an empty incident read. */
+  temporaryIncidentContext?: { fingerprint: string; applicable: boolean };
   /** Codes, paths and our own fixed labels of the previous rejections; never free text from the model. */
   feedback: Array<Pick<CaseDecisionRejection, "code" | "label" | "path" | "detail"> & { kind: CaseDecisionRefusalKind }>;
   /** `resolution_check` only: the requests the decision closes, with the quoted customer words. */
@@ -63,6 +69,7 @@ export type CaseInvestigationModelResult =
   /** Budget unavailable before dispatch: nothing was consumed. */
   | { status: "deferred" }
   | { status: "ok"; output: unknown }
+  | { status: "context_unproven" }
   /** `uncertain`: the provider may have run it; it is verified, never repeated. */
   | { status: "failed"; uncertain: boolean; diagnostic?: CaseModelTransportDiagnostic }
   | { status: "input_rejected"; diagnostic: CaseModelTransportDiagnostic }
@@ -93,7 +100,8 @@ export type CaseInvestigationAttempt =
  */
 export type CaseInvestigationWaitReason = "deferred_budget" | "case_budget" | "technical_wait" | "usage_uncertain" | "technical_exhausted" | "paused" | "decision_refused" | "context_invalid" | "knowledge_request_invalid" | "knowledge_changed";
 export type CaseKnowledgeChangedProblem = "revision_moved" | "revision_unreadable";
-export type CaseInvestigationWait = { reason: CaseInvestigationWaitReason; since: string; caseVersion: number; problem?: CaseDecisionContextProblem | CaseKnowledgeChangedProblem; embeddingCalls?: number; diagnostic?: CaseModelTransportDiagnostic };
+export type CaseInvestigationWait = { reason: CaseInvestigationWaitReason; since: string; caseVersion: number; problem?: CaseDecisionContextProblem | CaseKnowledgeChangedProblem; embeddingCalls?: number; diagnostic?: CaseModelTransportDiagnostic;
+  temporaryIncidentProblem?: "invalid" | "conflict" | "scope_limit" | "read_failed" };
 
 /** Calls already made for one input, as stored between runs. No customer text beyond the last proposal. */
 export type CaseInvestigationProgress = {
@@ -101,7 +109,7 @@ export type CaseInvestigationProgress = {
   /** Null while progressing; otherwise the current wait, kept with its first start time. */
   waiting: CaseInvestigationWait | null;
   /** Last model proposal and the version it was made on: re-validated on every run, never trusted as is. */
-  proposal: { output: unknown; proposedOn: number } | null;
+  proposal: { output: unknown; proposedOn: number; temporaryIncidentFingerprint?: string } | null;
   last: CaseDecisionValidation | null;
   /** Second reading of the accepted closure, so that it is not paid twice. */
   closure: CaseClosureCheck | null;
@@ -128,6 +136,7 @@ export type CaseInvestigationRecord = {
   knowledgeRevision: string | null;
   /** `limitations`: fixed codes only (why a request was `not_searched`, e.g. `subject_unavailable`), for the console. */
   coverage: Array<Pick<CaseKnowledgeCoverage, "requestId" | "status" | "knowledge" | "limitations">> | null;
+  temporaryIncidents?: IncidentContext;
   /** Pilot ACCÈS: the scope this decision was validated under. Absent: no pilot scope (a pilot consumer then refuses it). */
   accessScope?: CaseAccessScopeStamp;
   /**
@@ -182,6 +191,8 @@ export type CaseInvestigationPorts = {
    * before or instead of an embedding call. `context.inputKey` is the input the search is paid for.
    */
   knowledge(snapshot: CaseSnapshot, context?: { inputKey: string }): Promise<SavRetrievalCandidate[] | CaseKnowledgeRead>;
+  /** Concrete canonical projection reader in the runtime. Absent preserves the legacy no-incident flow. */
+  temporaryIncidents?: IncidentReader;
   /** Texts of these customer messages keyed `type:id`, for resolution quote checks; an unreadable one is simply absent. */
   customerTexts(caseId: string, refs: SourceRef[]): Promise<Record<string, string>>;
   revisions(): Promise<CaseInvestigationRevisions>;
@@ -262,6 +273,8 @@ export type CaseInvestigationReport =
       qualification: CaseQualificationUnavailable | null }
   /** The knowledge moved since the search (null: unreadable): no call on it, nothing recorded on it; the next pass searches again. */
   | { status: "knowledge_requeue"; caseId: string; caseVersion: number; searchedRevision: string; currentRevision: string | null; modelCalls: number }
+  /** A recorded decision's incident proof changed: its immutable receipt stays, a person reviews the held reply. */
+  | { status: "incident_context_review"; caseId: string; caseVersion: number; modelCalls: number }
   | { status: "recorded"; caseId: string; caseVersion: number; outcome: CaseDecisionValidation["outcome"]; refusal: CaseDecisionRefusal | null; closure: CaseClosurePlan | null; modelCalls: number; actionsPaused: boolean; callSignal: CaseCallSignal | null }
   /** The decision of this input was already recorded: re-checked on today's read, no call, nothing written. A timer or a
    * CRM note can run the investigation again, never pay for it. `outcome` is today's re-check, for information only:
@@ -346,7 +359,7 @@ export async function runCaseInvestigation(caseId: string, mode: CaseInvestigati
     const attempts = [...(prior?.attempts ?? [])];
     if (prior?.waiting?.reason === "usage_uncertain") return { status: "usage_uncertain", caseId, caseVersion, modelCalls };
     // A wait keeps the time it started, so a case retried every hour still shows how long it has been stuck.
-    const wait = (reason: CaseInvestigationWaitReason, extra: Pick<CaseInvestigationWait, "problem" | "embeddingCalls" | "diagnostic"> = {}): CaseInvestigationWait =>
+    const wait = (reason: CaseInvestigationWaitReason, extra: Pick<CaseInvestigationWait, "problem" | "embeddingCalls" | "diagnostic" | "temporaryIncidentProblem"> = {}): CaseInvestigationWait =>
       ({ reason, since: prior?.waiting?.since ?? ports.now().toISOString(), caseVersion, ...extra });
     // The stored progress is kept as is (proposal, calls); after a recorded decision nothing is written over it.
     const keep = async (waiting: CaseInvestigationWait) => {
@@ -376,10 +389,29 @@ export async function runCaseInvestigation(caseId: string, mode: CaseInvestigati
       return { status: "technical_wait", caseId, caseVersion, modelCalls };
     }
     const knowledge = selection.cards, coverage = selection.coverage;
+    let temporaryIncidents: IncidentContext | undefined;
+    if (ports.temporaryIncidents) {
+      const bindings = caseIncidentBindings(snapshot, knowledge, coverage, accessScope, ports.scope.locale, ports.scope.audience, ports.now());
+      const read = await ports.temporaryIncidents(bindings, ports.now()).catch(() => ({ ok: false as const, problem: "read_failed" as const }));
+      if (!read.ok) { await keep(wait("technical_wait", { temporaryIncidentProblem: read.problem })); return { status: "technical_wait", caseId, caseVersion, modelCalls }; }
+      temporaryIncidents = read.context;
+    }
+    const incidentFingerprint = temporaryIncidents?.fingerprint;
+    // A cached proposal was generated on THIS exact incident context, never on a newly approved/revoked replacement.
+    const staleIncidentProposal = prior?.proposal?.temporaryIncidentFingerprint !== undefined
+      ? prior.proposal.temporaryIncidentFingerprint !== incidentFingerprint : Boolean(temporaryIncidents?.entries.length);
+    if (prior?.proposal && staleIncidentProposal) {
+      if (prior.recordedOn !== null) return { status: "incident_context_review", caseId, caseVersion, modelCalls };
+      // Invalidate the stale proposal/closure, keeping every spent call and attempt. Next pass uses the NEXT ledger key.
+      await ports.progress.save(caseId, inputKey, { modelCalls, attempts, waiting: wait("knowledge_changed", { problem: "revision_moved" }), proposal: null, last: null, closure: null, recordedOn: null });
+      return { status: "knowledge_requeue", caseId, caseVersion, searchedRevision: prior.proposal.temporaryIncidentFingerprint ?? "temporary_scope_absent", currentRevision: incidentFingerprint ?? null, modelCalls };
+    }
     // B4 (night 01/11): the cards were read at one knowledge revision; a model call or a record on them is only made while
     // that revision is still the current one. Unreadable is not unchanged. A plain list has no revision to compare.
     const currentRevision = !Array.isArray(fetched) && fetched.status === "ready" ? fetched.currentRevision : undefined;
     const knowledgeMoved = async (): Promise<CaseInvestigationReport | null> => {
+      if (temporaryIncidents && !await revalidateIncidentContext(temporaryIncidents, ports.temporaryIncidents, ports.now()))
+        return { status: "knowledge_requeue", caseId, caseVersion, searchedRevision: temporaryIncidents.fingerprint, currentRevision: null, modelCalls };
       const searchedRevision = selection.revision;
       if (searchedRevision === null) return null;
       let now: string | null = null;
@@ -435,7 +467,9 @@ export async function runCaseInvestigation(caseId: string, mode: CaseInvestigati
       const moved = await knowledgeMoved();
       if (moved) { await save(knowledgeChanged(moved)); return { stop: moved }; }
       const call = modelCalls + 1, subjectKey = `sav-case:${caseId}:${inputKey}`;
-      const result = await ports.callModel({ purpose, caseId, caseVersion, inputKey, call, subjectKey, callKey: `${subjectKey}:call${call}`, caseBudgetKey: `sav-case:${caseId}`, snapshot, events, knowledge, coverage, customerReportedLogin, feedback, closure: items });
+      const result = await ports.callModel({ purpose, caseId, caseVersion, inputKey, call, subjectKey, callKey: `${subjectKey}:call${call}`, caseBudgetKey: `sav-case:${caseId}`, snapshot, events, knowledge, coverage, customerReportedLogin, feedback, closure: items,
+        ...(temporaryIncidents?.entries.length ? { temporaryIncidents } : {}),
+        ...(temporaryIncidents ? { temporaryIncidentContext: { fingerprint: temporaryIncidents.fingerprint, applicable: temporaryIncidents.entries.length > 0 } } : {}) });
       if (result.status === "input_rejected") {
         await save(wait("technical_wait", { diagnostic: result.diagnostic }));
         return { stop: { status: "technical_wait", caseId, caseVersion, modelCalls } };
@@ -456,6 +490,11 @@ export async function runCaseInvestigation(caseId: string, mode: CaseInvestigati
         return { stop: { status: "technical_exhausted", caseId, caseVersion, modelCalls } };
       }
       modelCalls = call;
+      if (result.status === "context_unproven") {
+        proposal = null; validation = undefined; closure = null;
+        await save(wait("knowledge_changed", { problem: "revision_moved" }));
+        return { stop: { status: "knowledge_requeue", caseId, caseVersion, searchedRevision: "incident_context_unproven", currentRevision: incidentFingerprint ?? null, modelCalls } };
+      }
       if (result.status === "ok") return { output: result.output };
       attempts.push({ call, result: "failed", purpose, uncertain: result.uncertain, ...(result.diagnostic ? { diagnostic: result.diagnostic } : {}) });
       // The last allowed call failed after a proposal: that proposal is the result, recorded below.
@@ -472,7 +511,7 @@ export async function runCaseInvestigation(caseId: string, mode: CaseInvestigati
       const sent = await dispatch("decision", feedback, []);
       if ("stop" in sent) return sent.stop;
       if ("lastCallFailed" in sent) break;
-      proposal = { output: sent.output, proposedOn: caseVersion };
+      proposal = { output: sent.output, proposedOn: caseVersion, ...(incidentFingerprint ? { temporaryIncidentFingerprint: incidentFingerprint } : {}) };
       validation = validate(proposal);
       closure = null;
       const latest = refusal();
@@ -527,6 +566,7 @@ export async function runCaseInvestigation(caseId: string, mode: CaseInvestigati
       flags: { sensitiveFoundByModel, learningExcluded: sensitiveFoundByModel, sameRefusalRepeated }, attempts, modelCalls,
       revisions: await ports.revisions(), knowledge: knowledge.map(card => ({ knowledgeId: card.id, contentVersionId: card.contentVersionId })),
       knowledgeRevision: selection.revision, coverage: coverage?.map(({ requestId, status, knowledge: refs, limitations }) => ({ requestId, status, knowledge: refs, limitations: [...limitations] })) ?? null, actionsPaused, callSignal,
+      ...(temporaryIncidents ? { temporaryIncidents } : {}),
       ...(accessScope ? { accessScope: caseAccessScopeStamp(accessScope) } : {}),
     });
     // A refused decision is never left with the agent: it stays listed until the team takes it.

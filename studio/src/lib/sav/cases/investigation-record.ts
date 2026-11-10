@@ -40,12 +40,13 @@ const progressSchema = z.object({
   waiting: z.object({
     reason: z.enum(["deferred_budget", "case_budget", "technical_wait", "usage_uncertain", "technical_exhausted", "paused", "decision_refused", "context_invalid", "knowledge_request_invalid", "knowledge_changed"]),
     since: at, caseVersion: count, problem: z.union([contextProblem, knowledgeChangedProblem]).optional(), embeddingCalls: count.max(1000).optional(), diagnostic: caseModelTransportDiagnosticSchema.optional(),
+    temporaryIncidentProblem: z.enum(["invalid", "conflict", "scope_limit", "read_failed"]).optional(),
   }).strict()
     // Each closed code belongs to its own reason: a context code only on context_invalid, a revision code only on knowledge_changed.
     .refine(wait => wait.problem === undefined || (wait.reason === "knowledge_changed" ? knowledgeChangedProblem.safeParse(wait.problem).success : wait.reason === "context_invalid" && contextProblem.safeParse(wait.problem).success), "problem")
     .refine(wait => wait.diagnostic === undefined || ["technical_wait", "usage_uncertain", "technical_exhausted"].includes(wait.reason), "diagnostic")
     .nullable(),
-  proposal: z.object({ output: z.unknown(), proposedOn: count }).strict().nullable(),
+  proposal: z.object({ output: z.unknown(), proposedOn: count, temporaryIncidentFingerprint: z.string().regex(/^[a-f0-9]{64}$/).optional() }).strict().nullable(),
   last: z.unknown(),
   closure: closureSchema.nullable(),
   recordedOn: count.nullable(),

@@ -35,6 +35,7 @@ export type CaseInvestigationRuntimeDeps = {
   readTicketOwner?: CaseInvestigationPorts["readTicketOwner"];
   /** Pilot ACCÈS scope of sources (approved policy datum). Absent: closed, so no `access` case is searched or answered. */
   accessScope?: CaseInvestigationPorts["accessScope"];
+  temporaryIncidents?: CaseInvestigationPorts["temporaryIncidents"];
   admissionPolicyRevision?: CaseInvestigationStoreDeps["admissionPolicyRevision"];
   qualify?: CaseInvestigationStoreDeps["qualify"];
   customerTexts?: CaseInvestigationPorts["customerTexts"];
@@ -71,5 +72,6 @@ export async function runCaseInvestigationRuntime(caseId: string, deps: CaseInve
   });
   // The freshness check of the budgeted search reads the case the same way the runner does.
   readCase = ports.readCase;
-  return runCaseInvestigation(caseId, "observe", { ...ports, accessScope: deps.accessScope ?? (async () => null) });
+  return runCaseInvestigation(caseId, "observe", { ...ports, accessScope: deps.accessScope ?? (async () => null),
+    ...(deps.temporaryIncidents ? { temporaryIncidents: deps.temporaryIncidents } : {}) });
 }

@@ -13,11 +13,15 @@ import { caseAccessScopeStamp, caseAccessSourceProblem, readCaseAccessScope, typ
 import { caseDecisionDraft } from "./investigation-intent";
 import { readCaseInvestigationProgress } from "./investigation-record";
 import { latestInvestigationInput } from "./investigation-runner";
+import { parseIncidentContext, revalidateIncidentContext } from "./investigation-incidents";
+import type { IncidentReader } from "./investigation-incidents-contract";
+import { unprovenFixClaim } from "@/lib/knowledge/temporary-incident-schema";
 
 export const SAV_PILOT_PROVENANCE_REVISION = "sav-pilot-provenance-2026-11-04.v1";
 export const SAV_PILOT_PROVENANCE_REASONS = [
   "scope_missing", "scope_invalid", "scope_unreadable", "scope_policy_mismatch", "decision_missing", "decision_unreadable", "decision_not_accepted", "decision_not_latest", "access_scope_unknown", "access_scope_changed",
   "reply_not_from_decision", "sources_missing", "access_source_out_of_scope", "access_source_version_out_of_scope", "access_source_orient_only", "access_scope_missing", "source_version_unknown", "source_retired", "source_unverified", "source_stale",
+  "temporary_incident_unproven", "temporary_incident_claim_unproven",
 ] as const;
 export type PilotProvenanceReason = typeof SAV_PILOT_PROVENANCE_REASONS[number];
 
@@ -28,6 +32,7 @@ export type PilotProvenanceDeps = Readonly<{
   accessScope: () => Promise<unknown>;
   currentPolicyRevision: () => Promise<string | null>;
   readActiveSource: (ref: KnowledgeRef) => Promise<PilotActiveSource | null>;
+  readTemporaryIncidents?: IncidentReader;
   now: () => Date;
 }>;
 export type PilotProvenanceSource = KnowledgeRef & Readonly<{ use: "answer"; title: string; content: string; verifiedAt: string; verification: "fresh" | "revalidation_due"; evaluatedAt: string }>;
@@ -58,6 +63,15 @@ export async function readPilotReplyProvenance(proposal: Pick<CaseReplyProposal,
   // A decision about an older input does not answer the latest one; another text or purpose is not this decision's reply.
   if (draft.triggerEventId !== proposal.triggerEventId) return unproven("decision_not_latest");
   if (draft.reply.purpose !== proposal.purpose || !sameFinalText(draft.reply.text, proposal.text)) return unproven("reply_not_from_decision");
+  const rawIncidents = read.record.decision?.temporaryIncidents;
+  if (rawIncidents !== undefined) {
+    const incidents = parseIncidentContext(rawIncidents);
+    if (!incidents) return unproven("temporary_incident_unproven");
+    if (!await revalidateIncidentContext(incidents, deps.readTemporaryIncidents, deps.now())) return unproven("temporary_incident_unproven");
+    if (incidents.entries.length) {
+      if (incidents.entries.some(entry => unprovenFixClaim(draft.reply!.text, entry.fixLevel))) return unproven("temporary_incident_claim_unproven");
+    }
+  }
   // The type decides, never an empty list: only a real question may rest on no source; an answer must show what supports it.
   if (!draft.shownSources.length && proposal.purpose !== "question") return unproven("sources_missing");
   const reasons = new Set<PilotProvenanceReason>(), sources: PilotProvenanceSource[] = [];

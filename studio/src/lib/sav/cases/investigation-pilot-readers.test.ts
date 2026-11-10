@@ -94,7 +94,8 @@ describe("now and currentPolicyRevision", () => {
   });
   it("the four readers together are A's record, the configuration, the base and the clock: OFF without configuration", async () => {
     const readers = caseProvenanceReaders({ readPolicyRecord: async () => null, env: () => ({}) });
-    expect(Object.keys(readers).sort()).toEqual(["accessScope", "currentPolicyRevision", "now", "readActiveSource"]);
+    expect(Object.keys(readers).sort()).toEqual(["accessScope", "currentPolicyRevision", "now", "readActiveSource", "readTemporaryIncidents"]);
+    expect(await readers.readTemporaryIncidents!([], new Date())).toMatchObject({ ok: true, context: { scope: "scope_missing", entries: [] } });
     expect(await readers.accessScope()).toBeNull();
     expect(await readers.currentPolicyRevision()).toBeNull();
   });
