@@ -13,7 +13,8 @@ import { savCases, savMessages, savSyncState } from "@/db/schema";
  * address is not a sender. Absent mode AND absent scope: today's behaviour, unchanged. A scope without the mode, any other mode value, or a
  * missing, invalid, not yet open or expired scope in qualification mode: nothing is allowed, never a permissive fallback. The binding holds
  * the hash of the exact configuration: any change of contact, sender, subject or window under the same revision refuses, it never
- * reinterprets an older thread. No value lives in code: root sets the configuration.
+ * reinterprets an older thread. No value lives in code: root sets the configuration. SAV-81: a mail V1 already confirmed on the ticket it
+ * created can bind through the relay too, only with the same checks, V1's proofs and a fresh V2 owner reading (see `v2EntryRelayDeps`).
  */
 
 type Env = Readonly<Record<string, string | undefined>>;
@@ -99,11 +100,21 @@ async function firstAdmissibleMessage(db: Db, scope: SavV2QualificationScope, me
 }
 
 /**
- * Owner at creation (the ONLY place a thread is bound): V1 is about to create the ticket for this message with this primary contact.
- * In qualification mode the message must open an admissible thread for the exact contact; the first such thread is bound atomically
- * (`insert … on conflict do nothing`, then read back), and any other thread is refused for this scope revision.
+ * Owner at creation: V1 is about to create the ticket for this message with this primary contact. SAV-81: also the relay of a mail V1
+ * already confirmed on the ticket it created, once an operator put that ticket under the V2 owner (`v2EntryRelayDeps`); these two are
+ * the only binders. In qualification mode the message must open an admissible thread for the exact contact; the first such thread is
+ * bound atomically (`insert … on conflict do nothing`, then read back), and any other thread is refused for this scope revision.
  */
 export async function bindSavV2QualificationThread(env: Env, input: Readonly<{ messageId: string; primaryContactId: string | null | undefined }>, now: Date = new Date(), given?: Db): Promise<SavV2ScopeDecision> {
+  return checkOrBind(env, input, now, given, true);
+}
+
+/** SAV-81: the same checks as the binding, read only: would this message bind (or is its thread already the bound one)? Nothing is written. */
+export async function previewSavV2QualificationThread(env: Env, input: Readonly<{ messageId: string; primaryContactId: string | null | undefined }>, now: Date = new Date(), given?: Db): Promise<SavV2ScopeDecision> {
+  return checkOrBind(env, input, now, given, false);
+}
+
+async function checkOrBind(env: Env, input: Readonly<{ messageId: string; primaryContactId: string | null | undefined }>, now: Date, given: Db | undefined, write: boolean): Promise<SavV2ScopeDecision> {
   const read = readSavV2QualificationScope(env, now);
   if (read.mode === "open") return ALLOWED;
   if (read.mode === "closed") return refuse(`qualification_${read.problem}`);
@@ -117,6 +128,7 @@ export async function bindSavV2QualificationThread(env: Env, input: Readonly<{ m
   if (input.primaryContactId !== scope.hubspotContactId) return refuse("qualification_contact_mismatch");
   const admissible = await firstAdmissibleMessage(db, scope, input.messageId);
   if (!admissible.allowed) return admissible;
+  if (!write) return existing && existing.threadId !== admissible.threadId ? refuse("qualification_other_thread_bound") : ALLOWED;
   const cursor: Binding = { threadId: admissible.threadId!, messageId: input.messageId, configHash: read.configHash, boundAt: now.toISOString() };
   await db.insert(savSyncState).values({ key: bindingKey(scope), status: "bound", cursor: JSON.stringify(cursor) }).onConflictDoNothing();
   const bound = await readBinding(db, scope);

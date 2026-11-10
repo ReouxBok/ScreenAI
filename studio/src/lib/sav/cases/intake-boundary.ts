@@ -36,6 +36,10 @@ export type CaseBoundaryDeps = {
   readCreatedTicketOwner?: (ticketId: string) => Promise<string | null | undefined>;
   /** The V2 entry (`SAV_V2_ENTRY=on` only): the customer-return route of a mail V1 finished with, before any relay. A result ends it; null lets the normal relay go on. */
   routeReturn?: (messageId: string) => Promise<CaseRelayResult | null>;
+  /** SAV-81 (V2 entry only): in qualification mode, while no thread is bound yet, a mail V1 confirmed on the ticket it created may bind its thread here.
+   * `write: false` checks V1's proofs and the exact scope without writing anything (before any owner read); `write: true` binds atomically, asked only
+   * after the fresh reading of the V2 owner. False refuses: the mail is recorded, never attributed. Not injected: no other way to bind than at creation. */
+  bindQualificationThread?: (input: { messageId: string; ticketId: string; executionId: string; runId: string | null; runVersion: number; write: boolean }) => Promise<boolean>;
 };
 export type CaseRelayRequest = { requestId: string; kind: string };
 /** What the relay is about to record, from its own V1 proof: a qualification port compares its
@@ -311,14 +315,24 @@ async function relayToCase(input: {
   // mail admitted for the agent: a sensitive, mixed or unqualified one is never read. The store decides the
   // admission again under its lock.
   // SAV-80: outside the qualification scope the mail is recorded, never attributed to the agent (no owner read for it either).
-  const inScope = (await savV2QualificationMessageAllowed(input.deps.env ?? process.env, input.relay.messageId)).allowed;
+  const scope = await savV2QualificationMessageAllowed(input.deps.env ?? process.env, input.relay.messageId), inScope = scope.allowed;
   let attribution = !inScope || (input.attribution !== "pending" && await relayPaused(requireDb())) ? "pending" as const : input.attribution;
   if (attribution !== "pending" && attribution.kind === "hubspot_owner_at_creation")
     attribution = decideCaseAdmission({ policy: admission.policy, qualification: admission.qualification, caseSensitivity: "none" }).target === "agent"
       ? await confirmCreatedOwner(attribution, input.deps) : "pending";
   // No V1 owner effect for this mail: the owner as it reads now is enough. An acknowledgement opens nothing and proves no ticket: it never takes this route.
-  else if (inScope && input.attribution === "pending" && input.relay.kind === "intake_effects_confirmed")
-    attribution = await ownerReadProof({ ticketId: input.ticketId, messageId: input.relay.messageId, admission, deps: input.deps });
+  else if (input.attribution === "pending" && input.relay.kind === "intake_effects_confirmed") {
+    // SAV-81: a mail V1 confirmed while no thread was bound (its subject did not match at the creation) is otherwise never attributed. Only through the
+    // entry's binder, and in this order: V1's proofs and the exact scope read only, then the owner read now, then the atomic binding. Anything else: out of scope.
+    const relay = input.relay, bind = !inScope && !scope.allowed && scope.reason === "qualification_thread_unbound" ? input.deps.bindQualificationThread : undefined;
+    const proofs = bind && { messageId: relay.messageId, ticketId: input.ticketId, executionId: relay.executionId, runId: relay.intakeRunId, runVersion: relay.intakeRunVersion };
+    if (inScope || (bind && proofs && await bind({ ...proofs, write: false }))) {
+      attribution = await ownerReadProof({ ticketId: input.ticketId, messageId: relay.messageId, admission, deps: input.deps });
+      // Bound, then read back: the attribution stands only on a thread the scope now covers.
+      if (attribution !== "pending" && bind && proofs && (!await bind({ ...proofs, write: true })
+        || !(await savV2QualificationMessageAllowed(input.deps.env ?? process.env, relay.messageId)).allowed)) attribution = "pending";
+    }
+  }
   const subjects = requests.length ? await readRequestSubjects({ runId: input.relay.intakeRunId, runVersion: input.relay.intakeRunVersion, messageId: input.relay.messageId,
     gmailMessageId: input.gmailMessageId, requestIds: input.decision.requests.filter(request => request.kind !== "acknowledgement").map(request => request.id) }) : new Map<string, CaseRequestSubject>();
   const result = await openCaseEvent({

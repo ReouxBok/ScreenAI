@@ -6,7 +6,7 @@
 import "server-only";
 import { and, asc, eq, inArray } from "drizzle-orm";
 import { requireDb } from "@/db";
-import { auditLogs, savCaseEvents, savCases, savIntakeExecutions, savIntakeJournal, savIntakeRuns, savMessages, savThreads } from "@/db/schema";
+import { auditLogs, savCaseEvents, savCases, savIntakeEffects, savIntakeExecutions, savIntakeJournal, savIntakeRuns, savMessages, savThreads } from "@/db/schema";
 import { decryptSavPayload, encryptSavPayload } from "../crypto";
 import { readSavExternalCompletion } from "../external-completion";
 import { readSavAgentPause } from "../intake/agent-pause";
@@ -15,15 +15,15 @@ import { caseRelayAdmissionDeps, type CaseApprovedRulePort } from "./admission-i
 import { readConfirmedV1Context } from "./admission-context-reader";
 import { hubspotTicketOwnerReader, type CaseOwnerReadTransport } from "./admission-owner-reader";
 import { admissionPolicyPort, qualifyTicketIdentity, type AdmissionPolicyRecord, type V1AdmissionAdapterPolicy } from "./admission-runtime";
-import { savCaseRecordingEnabled, type CaseTx } from "./case-store";
+import { savCaseRecordingEnabled, v1IntentHash, type CaseTx } from "./case-store";
 import { caseDedupeKey } from "./case-types";
 import type { CaseRequestFamily } from "./case-types";
 import { routeCustomerReturn, type CustomerReturnDeps } from "./customer-return-store";
 import { v2OwnerAtCreationPort } from "./owner-attribution";
-import { bindSavV2QualificationThread, savV2QualificationCaseAllowed, savV2QualificationMessageAllowed } from "./qualification-scope";
+import { bindSavV2QualificationThread, previewSavV2QualificationThread, savV2QualificationCaseAllowed, savV2QualificationMessageAllowed } from "./qualification-scope";
 import { firstPersonalLoginRequest } from "./investigation-return-qualify";
 import type { ExecutorAdapters } from "../intake/execution-types";
-import { SAV_INTAKE_CONTRACT_REVISION } from "../intake/contract";
+import { SAV_INTAKE_CONTRACT_REVISION, type SavIntakeDecision } from "../intake/contract";
 import { relayPaused, type CaseRelayRequest, type CaseBoundaryDeps, type CaseRelayResult } from "./intake-boundary";
 import { loadCaseContinuationPoint, type CaseContinuationPoint, type CaseContinuationTrigger } from "./v2-entry-binding";
 
@@ -85,6 +85,54 @@ export const creationOwnerForIntake = async (env: Env, input: Parameters<NonNull
   return scoped.allowed ? decided : { assign: false as const, reason: "not_admitted" as const };
 };
 
+/** The ticket V1 created for this execution: its `ticket_create` confirmed, intact, acknowledged with this ticket id. Uncertain, merely sent or another ticket is no proof. */
+async function v1CreatedTicket(executionId: string, ticketId: string) {
+  const [create] = await requireDb().select().from(savIntakeEffects).where(and(eq(savIntakeEffects.executionId, executionId), eq(savIntakeEffects.kind, "ticket_create")));
+  if (!create || create.state !== "confirmed" || !create.ackCiphertext) return false;
+  const intent = decryptSavPayload<{ kind?: string; key?: string }>(create.intentCiphertext);
+  return v1IntentHash(intent) === create.intentHash && intent.kind === "ticket_create" && intent.key === create.businessKey && decryptSavPayload<{ id?: string }>(create.ackCiphertext).id === ticketId;
+}
+
+/**
+ * SAV-81: the relay's binder for a mail V1 already confirmed, in qualification mode only (the scope checks themselves answer `open` or `closed` otherwise).
+ * The real test mail opened its thread and V1 created its ticket, but its subject did not match at the creation, so nothing was bound and the relay could
+ * never attribute it. This binds it once an operator put that ticket under the V2 owner, with exactly the creation's conditions and V1's current proofs:
+ * the execution confirmed on this ticket and run version, no newer run, no operator refusal, the current contract's decision of ONE support request that
+ * CREATED this ticket for the unique primary contact, its `ticket_create` confirmed for this ticket, no other mail on the thread, the thread not paused, no
+ * person's decision on the mail, not handled outside, and (before the write) no agent pause; then
+ * the exact scope (sender, contact, first message, subject, window, hash, revision, one thread). The owner itself is read by the relay, between the read-only
+ * check and the write. It writes no CRM owner. Unreadable is refused, never guessed.
+ */
+export function qualificationRelayBinder(env: Env): NonNullable<CaseBoundaryDeps["bindQualificationThread"]> {
+  return async input => {
+    try {
+      const context = await readConfirmedV1Context(input.messageId);
+      if (!context) return false;
+      const { source, freshness } = context, decision = context.decision as SavIntakeDecision, disposition = decision.disposition;
+      if (source.executionState !== "confirmed" || source.executionId !== input.executionId || source.ticketId !== input.ticketId || source.runId !== input.runId
+        || source.runVersion !== input.runVersion || freshness.latestRunVersion !== input.runVersion || freshness.humanRefused) return false;
+      if (decision.revision !== SAV_INTAKE_CONTRACT_REVISION || decision.messageId !== input.messageId || decision.latestInboundMessageId !== input.messageId
+        || decision.classification !== "support" || decision.requests.length !== 1 || decision.requests[0]!.kind !== "support"
+        || disposition.kind !== "ticket" || disposition.target.operation !== "create" || disposition.target.contactId !== disposition.contactScope.primaryContactId) return false;
+      if (!await v1CreatedTicket(input.executionId, input.ticketId)) return false;
+      const db = requireDb();
+      const [message] = await db.select({ id: savMessages.id, threadId: savMessages.threadId, receivedAt: savMessages.receivedAt, gmailMessageId: savMessages.gmailMessageId })
+        .from(savMessages).where(eq(savMessages.id, input.messageId));
+      if (!message) return false;
+      // A person's hold: the thread paused, a person's decision on the mail, or the case handled outside. Any of them keeps it with the team.
+      const [thread] = await db.select({ aiPaused: savThreads.aiPaused }).from(savThreads).where(eq(savThreads.id, message.threadId));
+      if (!thread || thread.aiPaused || await intakeHasHumanDecision(input.messageId) || await readSavExternalCompletion(message)) return false;
+      // A new customer mail since: it is not the confirmed mail this binding stands on.
+      const inbound = await db.select({ id: savMessages.id }).from(savMessages).where(and(eq(savMessages.threadId, message.threadId), eq(savMessages.direction, "inbound")));
+      if (inbound.some(row => row.id !== input.messageId)) return false;
+      // A pause set since the owner read: nothing is bound (the store would refuse the attribution under its lock anyway).
+      if (input.write && await relayPaused(db)) return false;
+      const scope = { messageId: input.messageId, primaryContactId: disposition.contactScope.primaryContactId };
+      return (await (input.write ? bindSavV2QualificationThread(env, scope) : previewSavV2QualificationThread(env, scope))).allowed;
+    } catch { return false; }
+  };
+}
+
 /** One authenticated GET on V1's own HubSpot transport. Throws on anything but a 2xx: a failed read is never « no owner ». */
 function ownerTransport(env: Env, network?: typeof fetch): CaseOwnerReadTransport {
   return async ({ path }) => {
@@ -123,7 +171,7 @@ function admissionSources(env: Env) {
 export function v2EntryRelayDeps(env: Env, input: Omit<EntryDeps, "env"> = {}): CaseBoundaryDeps {
   const sources = returnSources({ env, ...input });
   return {
-    env, ...admissionSources(env), readCreatedTicketOwner: sources.readTicketOwner!,
+    env, ...admissionSources(env), readCreatedTicketOwner: sources.readTicketOwner!, bindQualificationThread: qualificationRelayBinder(env),
     routeReturn: async (messageId): Promise<CaseRelayResult | null> => {
       // SAV-80: outside the qualification scope a mail is never routed as a V2 return; the normal relay goes on.
       if (!(await savV2QualificationMessageAllowed(env, messageId)).allowed) return null;
