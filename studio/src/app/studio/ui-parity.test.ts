@@ -17,7 +17,7 @@ it("server actions match the parity matrix exactly", () => {
     found[path.relative(src, file).split(path.sep).join("/")] = [...text.matchAll(/export\s+async\s+function\s+(\w+)\s*\(/g)].map(match => match[1]);
   }
   expect(found).toEqual(snapshot.files);
-  expect(Object.values(found).flat()).toHaveLength(101);
+  expect(Object.values(found).flat()).toHaveLength(103);
 });
 
 // The guards recorded in the matrix are the real ones: the key actions check SAV staff first and
