@@ -110,7 +110,9 @@
   "app/studio/sav/intake/launch/actions.ts": [
    "previewLaunchAction",
    "commitLaunchAction",
-   "revokeLaunchAction"
+   "revokeLaunchAction",
+   "previewRenewalAction",
+   "commitRenewalAction"
   ],
   "app/studio/sav/intake/manual-other-actions.ts": [
    "classifyManualOtherAction"
