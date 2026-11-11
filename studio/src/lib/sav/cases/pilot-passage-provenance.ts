@@ -45,7 +45,7 @@ const unproven = (...reasons: PilotProvenanceReason[]): PilotProvenance => ({ st
 /** Only a full ISO date with its time zone is a date here: `Date.parse` alone would read "2010", or a local date, as one. */
 const ISO_INSTANT = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,3})?(?:Z|[+-]\d{2}:\d{2})$/;
 // The substance is what is compared: the decided text under either mention. WHICH mention may be sent is the persisted authorization basis' business (`case-reply-mode.ts`).
-const sameFinalText = (decided: string, proposed: string) => (["fr", "en"] as const).some(language => (["manual_reviewed", "automated"] as const).some(mode => prepareCaseReplyText(decided, language, mode) === proposed));
+const sameFinalText = (decided: string, proposed: string, purpose: CaseReplyProposal["purpose"]) => (["fr", "en"] as const).some(language => (["manual_reviewed", "automated"] as const).some(mode => prepareCaseReplyText(decided, language, mode, purpose) === proposed));
 
 export async function readPilotReplyProvenance(proposal: Pick<CaseReplyProposal, "caseId" | "triggerEventId" | "purpose" | "text">, deps: PilotProvenanceDeps): Promise<PilotProvenance> {
   const policyRevision = await deps.currentPolicyRevision();
@@ -64,7 +64,7 @@ export async function readPilotReplyProvenance(proposal: Pick<CaseReplyProposal,
   if (!draft.reply) return unproven("reply_not_from_decision");
   // A decision about an older input does not answer the latest one; another text or purpose is not this decision's reply.
   if (draft.triggerEventId !== proposal.triggerEventId) return unproven("decision_not_latest");
-  if (draft.reply.purpose !== proposal.purpose || !sameFinalText(draft.reply.text, proposal.text)) return unproven("reply_not_from_decision");
+  if (draft.reply.purpose !== proposal.purpose || !sameFinalText(draft.reply.text, proposal.text, draft.reply.purpose)) return unproven("reply_not_from_decision");
   const rawIncidents = read.record.decision?.temporaryIncidents;
   if (rawIncidents !== undefined) {
     const incidents = parseIncidentContext(rawIncidents);

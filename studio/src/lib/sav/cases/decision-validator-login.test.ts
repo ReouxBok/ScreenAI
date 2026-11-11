@@ -6,6 +6,7 @@ import type { SavRetrievalCandidate } from "../request-retrieval";
 import type { CaseDecisionValidation, CaseDecisionValidationContext } from "./decision-contract";
 import { classifyCaseDecisionRefusal } from "./decision-recovery";
 import { validateCaseDecision } from "./decision-validator";
+import { caseReplyHelpLine, prepareCaseReplyText } from "./case-reply-outbound";
 import { SAV_CASE_ACCESS_SCOPE_REVISION } from "./investigation-access-scope";
 
 // B (4/11, SYN): the login-code reply says what the AUTHORIZED card version says, and never asks again what the customer already did.
@@ -204,15 +205,22 @@ describe("login blockage once the card's checks are done (A09)", () => {
   });
 
   describe("nominal: what was useful stays", () => {
-    it("a plain first mail still gets the procedure, with the invitation to say what is displayed", () => {
+    // 11/11 (real Access test): the first reply asked for the step and the screen twice, once in this template and once in the standard line added when the reply is prepared.
+    // The template no longer closes with its own invitation: the standard line is the ONE follow-up, so the customer is asked once.
+    it("a plain first mail still gets the procedure, with ONE invitation to say what happened (the standard line, never a second one)", () => {
       const text = textOf(validateCaseDecision(proposal(), context(relayed(), FIRST), now));
       expect(text).toContain("Voici le lien de connexion");
-      expect(text).toContain("à quelle étape et ce qui s’affiche à l’écran");
+      expect(text).not.toMatch(/restez bloqu|dites-moi simplement|à quelle étape/);
+      const final = prepareCaseReplyText(text, "fr", "automated", "answer");
+      const help = caseReplyHelpLine("fr");
+      expect(final.split(help).length - 1).toBe(1);
+      expect(final.indexOf(help)).toBeGreaterThan(final.indexOf("ne nous communiquez pas ce code"));
+      expect(final.split(/précisez|dites-moi|pouvez-vous|\?/).length - 1).toBe(1);
     });
     it("the screen's words without any check told: the procedure, never asking what is displayed again", () => {
       const text = textOf(validateCaseDecision(proposal(), context(relayed(), "Bonjour, je n’arrive pas à me connecter. L’écran affiche l’erreur « identifiant introuvable »."), now));
       expect(text).toContain("Voici le lien de connexion");
-      expect(text).toContain("à quelle étape.");
+      expect(text).not.toMatch(/restez bloqu|dites-moi simplement|à quelle étape/); // the standard line is the only follow-up (11/11)
       expect(text).not.toContain("ce qui s’affiche");
     });
     it("A06 and A08 still ask the one question; « an error » with no words is no answer to it", () => {

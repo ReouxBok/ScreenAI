@@ -652,9 +652,7 @@ Merci pour votre message. Je vais vous guider pour vous connecter à Limova.
 
 Voici le lien de connexion : ${SAV_CASE_ACCESS_URL}. Une fois sur la page, entrez l’adresse e-mail que vous avez utilisée lors de votre inscription à Limova. Si vous utilisez plusieurs adresses, vérifiez que vous avez bien choisi celle de votre inscription : c’est là que vous recevrez votre code de connexion.${says.spamFolder && thread.spam !== true ? " Si vous ne le voyez pas dans votre boîte de réception, pensez à vérifier le dossier « Spams » ou « Courriers indésirables »." : ""}
 
-Il vous suffira ensuite de saisir ce code sur la page pour accéder à votre espace. Gardez-le pour vous : même si vous nous répondez, ne nous communiquez pas ce code.
-
-Si vous restez bloqué, dites-moi simplement à quelle étape${thread.screen === "told" || thread.screen === "attached" ? "" : " et ce qui s’affiche à l’écran"}.`;
+Il vous suffira ensuite de saisir ce code sur la page pour accéder à votre espace. Gardez-le pour vous : même si vous nous répondez, ne nous communiquez pas ce code.`;
         }
         if (reply.text.length > 6000) reject("proposal_schema_invalid", "reply.text", "procedure_too_long");
       }

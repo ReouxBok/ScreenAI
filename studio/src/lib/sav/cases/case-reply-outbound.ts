@@ -10,7 +10,7 @@
 // 3. `buildReplySendIntent` re-checks the approved text and refuses (never fixes) one that breaks the contract;
 // 4. any edit is a new text: it goes through 1 again and needs its own approval (the hash covers the text, mention included).
 import { cleanSavModelDraft, renderSavOutboundReply, savReplyFooter, type SavReplySendMode } from "../reply-format";
-import type { CaseReplyApproval, CaseReplyProposal } from "./case-effects";
+import type { CaseReplyApproval, CaseReplyProposal, CaseReplyPurpose } from "./case-effects";
 
 export const CASE_REPLY_OUTBOUND_CONTRACT = "sav-v2-reply-outbound.v1";
 
@@ -51,10 +51,12 @@ function caseReplyBody(draft: string): string {
  * is re-rendered with exactly one, so preparing twice, or again in the other language, never stacks. `unknown` reads as French, like the shared format.
  * `automated` keeps the shared "sent automatically by an AI, may contain errors, reply to continue" notice; the human-validation path never uses it (see `finalize…`).
  */
-export function prepareCaseReplyText(draft: string, language: CaseReplyLanguage | "unknown", mode: CaseReplyAiMode): string {
+export function prepareCaseReplyText(draft: string, language: CaseReplyLanguage | "unknown", mode: CaseReplyAiMode, purpose?: CaseReplyPurpose): string {
   const body = caseReplyBody(draft);
   if (!body) throw new Error("SAV_REPLY_EMPTY");
-  return renderSavOutboundReply(`${body}\n\n${caseReplyHelpLine(language)}`, language, mode);
+  // ONE follow-up per reply (Ugo 11/11): a `question` reply IS its follow-up (the tracked question, which J2 follows), so the standard line is not stacked after it.
+  // Every other purpose keeps the standard line as its only generic follow-up; the code that composes a reply (decision-validator) never writes a second one.
+  return renderSavOutboundReply(purpose === "question" ? body : `${body}\n\n${caseReplyHelpLine(language)}`, language, mode);
 }
 
 /**
@@ -95,7 +97,7 @@ export function caseReplyFinalTextProblem(text: string, expectedMode: CaseReplyA
 export function finalizeCaseReplyProposal(draft: Omit<CaseReplyProposal, "text"> & Readonly<{ text: string }>,
   options: Readonly<{ language: CaseReplyLanguage | "unknown"; validation: "human" | "automated" }>): CaseReplyProposal {
   if (options.validation !== "human" && options.validation !== "automated") throw new Error("SAV_REPLY_VALIDATION_INVALID");
-  return { ...draft, text: prepareCaseReplyText(draft.text, options.language, options.validation === "automated" ? "automated" : CASE_REPLY_V2_MODE) };
+  return { ...draft, text: prepareCaseReplyText(draft.text, options.language, options.validation === "automated" ? "automated" : CASE_REPLY_V2_MODE, draft.purpose) };
 }
 
 /**

@@ -111,7 +111,7 @@ export async function proposeCaseReplyFromDraft(input: CaseReplyDraftInput, deps
     ...(input.reply.procedures?.length ? { procedures: input.reply.procedures } : {}),
   };
   // `automated` is formatting only: the shared preparer is called with the mode (UX's guidance), not the human-only finalizer. No right comes out of it.
-  const proposal = input.validation === "automated" ? { ...draft, text: prepareCaseReplyText(draft.text, language.language, "automated") } : finalizeCaseReplyProposal(draft, { language: language.language, validation: "human" });
+  const proposal = input.validation === "automated" ? { ...draft, text: prepareCaseReplyText(draft.text, language.language, "automated", draft.purpose) } : finalizeCaseReplyProposal(draft, { language: language.language, validation: "human" });
   const submitted = await submitCaseReplyProposal(proposal, deps);
   if (!submitted.ok) return no(submitted.code, submitted.detail);
   return { ok: true, validationId: submitted.id, created: submitted.created, state: submitted.state, payloadHash: caseReplyPayloadHash(proposal), caseVersion: proposal.caseVersion, recipient: proposal.recipient, language };
