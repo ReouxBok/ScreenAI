@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { caseGeminiDecisionPreflight, caseGeminiDecisionProvider, caseInvestigationPrompt, prepareCaseGeminiDecisionRequest } from "./investigation-v2-providers";
 import { caseModelTransportDiagnosticSchema, describeCaseModelTransportDiagnostic } from "./investigation-transport-diagnostic";
@@ -31,16 +32,16 @@ it("keeps the existing serialized instructions, schema, facts and all cards EXAC
 });
 
 it("uses the FULL UTF8 body at the exact limit, rejects one byte less without dropping data", () => {
-  const req = request(); req.snapshot.body.facts = [{ value: "é🔒".repeat(1000) }] as never;
+  const req = request(); req.snapshot.body.facts = [{ value: Array.from({length:60},(_,i)=>createHash("sha256").update(`synthetic-fact-${i}`).digest("hex")+"é🔒").join(" ") }] as never;
   const prepared = prepareCaseGeminiDecisionRequest(req, environment()); if (!prepared.ok) throw Error("PREPARE_FAILED");
   const bytes = prepared.metadata.inputBytes!;
   expect(prepareCaseGeminiDecisionRequest(req, environment({ ...policy, transport: { ...policy.transport, maxInputBytes: bytes } })).ok).toBe(true);
   expect(caseGeminiDecisionPreflight(() => environment({ ...policy, transport: { ...policy.transport, maxInputBytes: bytes - 1 } }))(req)).toMatchObject({ code: "input_too_large", networkAttempted: false, inputBytes: bytes, maxInputBytes: bytes - 1 });
 });
 
-it("three cards accepted by REAL retrieval are rejected before MONEY/dispatch, not silently truncated or counted", async () => {
-  const candidates = Array.from({ length: 3 }, (_, i) => ({ id: `synthetic-card-${i}`, contentVersionId: `synthetic-version-${i}`, title: "Connexion impossible", content: "Connexion impossible. ".repeat(220), source: "synthetic", verifiedAt: "2026-11-10T00:00:00Z", semanticScore: 1,
-    resolution: { steps: ["Connexion impossible. ".repeat(170)], symptoms: ["Connexion impossible"] }, availability: { active: true, published: true, indexed: true, archived: false, aiEnabled: true, locale: "fr-FR", audience: "support" } }));
+it("three distinct incompressible cards accepted by REAL retrieval are rejected before MONEY/dispatch, not silently truncated or counted", async () => {
+  const candidates = Array.from({ length: 3 }, (_, i) => ({ id: `synthetic-card-${i}`, contentVersionId: `synthetic-version-${i}`, title: "Connexion impossible", content: Array.from({length:80},(_,j)=>createHash("sha256").update(`synthetic-content-${i}-${j}`).digest("hex")).join(" "), source: "synthetic", verifiedAt: "2026-11-10T00:00:00Z", semanticScore: 1,
+    resolution: { steps: [Array.from({length:55},(_,j)=>createHash("sha256").update(`synthetic-step-${i}-${j}`).digest("hex")).join(" ")], symptoms: ["Connexion impossible"] }, availability: { active: true, published: true, indexed: true, archived: false, aiEnabled: true, locale: "fr-FR", audience: "support" } }));
   const found = await retrieveSavKnowledgeByRequest({ requests: [{ id: "synthetic", summary: "Connexion impossible" }], now: new Date("2026-11-10T12:00:00Z") }, { readRevision: async () => "synthetic", search: async () => [candidates] });
   expect(found.sources).toHaveLength(3);
   const req = request(); req.knowledge = found.sources as never;

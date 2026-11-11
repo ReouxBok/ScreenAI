@@ -1,3 +1,4 @@
+import { compactInvestigationContext, INVESTIGATION_CONTEXT_INSTRUCTION } from "./investigation-context-view";
 import { caseModelFinishReason, type CaseModelTransportDiagnostic } from "./investigation-transport-diagnostic";
 import { readCaseV2TransportPolicy, assertCaseV2ReservedPolicy } from "./investigation-v2-spend";
 import "server-only";
@@ -156,8 +157,18 @@ export function prepareCaseGeminiDecisionRequest(request: CaseInvestigationModel
   let bounds: ReturnType<typeof readCaseV2TransportPolicy>;
   try { bounds = readCaseV2TransportPolicy(env); } catch { return { ok: false, diagnostic: { stage: "preflight", code: "policy_invalid", networkAttempted: false } }; }
   const prompt = caseInvestigationPrompt(request);
-  const body = JSON.stringify({ systemInstruction: { parts: [{ text: `${prompt.instruction}\n\nSchéma JSON de la réponse :\n${prompt.schema}` }] },
-    contents: [{ role: "user", parts: [{ text: JSON.stringify(prompt.payload) }] }], generationConfig: { responseMimeType: "application/json", temperature: 0, maxOutputTokens: bounds.maxOutputTokens } });
+  const serialize = (payload: unknown, decoding = "") => JSON.stringify({ systemInstruction: { parts: [{ text: `${prompt.instruction}\n\nSchéma JSON de la réponse :\n${prompt.schema}${decoding}` }] },
+    contents: [{ role: "user", parts: [{ text: JSON.stringify(payload) }] }], generationConfig: { responseMimeType: "application/json", temperature: 0, maxOutputTokens: bounds.maxOutputTokens } });
+  let body = serialize(prompt.payload);
+  // Preserve the original wire format whenever it fits. Only exact, reversible
+  // sharing is allowed; measure the ENTIRE candidate, including decoding rules.
+  if (Buffer.byteLength(body, "utf8") > bounds.maxInputBytes) {
+    const compact = compactInvestigationContext(prompt.payload);
+    if (compact) {
+      const candidate = serialize(compact, `\n\n${INVESTIGATION_CONTEXT_INSTRUCTION}`);
+      if (Buffer.byteLength(candidate, "utf8") < Buffer.byteLength(body, "utf8")) body = candidate;
+    }
+  }
   const metadata = { inputBytes: Buffer.byteLength(body, "utf8"), maxInputBytes: bounds.maxInputBytes, knowledgeCards: request.knowledge.length };
   if (metadata.inputBytes > bounds.maxInputBytes) return { ok: false, diagnostic: { stage: "preflight", code: "input_too_large", networkAttempted: false, ...metadata } };
   return { ok: true, key: resolved.key, model, body, metadata };
