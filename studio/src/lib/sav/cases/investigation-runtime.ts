@@ -72,6 +72,9 @@ export async function runCaseInvestigationRuntime(caseId: string, deps: CaseInve
   });
   // The freshness check of the budgeted search reads the case the same way the runner does.
   readCase = ports.readCase;
+  const readExact = deps.knowledge.vectors!.readExact?.bind(deps.knowledge.vectors);
   return runCaseInvestigation(caseId, "observe", { ...ports, accessScope: deps.accessScope ?? (async () => null),
-    ...(deps.temporaryIncidents ? { temporaryIncidents: deps.temporaryIncidents } : {}) });
+    ...(deps.temporaryIncidents ? { temporaryIncidents: deps.temporaryIncidents } : {}),
+    // Scope-first knowledge (11/11): the exact-version read of the block's scope sources, and the transport's own preflight to fit the input.
+    ...(readExact ? { readScopeCards: readExact } : {}), ...(deps.model.preflight ? { preflight: deps.model.preflight } : {}) });
 }

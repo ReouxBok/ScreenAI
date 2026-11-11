@@ -1,6 +1,6 @@
 import type { CaseModelTransportDiagnostic } from "./investigation-transport-diagnostic";
-import type { SavRetrievalCandidate } from "../request-retrieval";
-import { SAV_CASE_ACCESS_BLOCK_ID, SAV_CASE_HOLDS_KEEPING_TIMERS, type CaseEvent, type CaseSnapshot, type SourceRef } from "./case-types";
+import { assessSavKnowledgeValidity, type SavRetrievalCandidate } from "../request-retrieval";
+import { SAV_CASE_ACCESS_BLOCK_ID, SAV_CASE_HOLDS_KEEPING_TIMERS, type CaseEvent, type CaseSnapshot, type KnowledgeRef, type SourceRef } from "./case-types";
 import { buildCaseDecisionContext, type CaseDecisionContextProblem } from "./decision-context";
 import { caseAccessScopeStamp, readCaseAccessScope, type CaseAccessScopeStamp, type CaseBlockScope } from "./investigation-access-scope";
 import { caseAdmissionStatus } from "./admission-policy";
@@ -16,6 +16,7 @@ import type { CaseKnowledgeCoverage } from "./decision-contract";
 import type { CaseKnowledgeRead, CaseKnowledgeRequestProblem } from "./investigation-knowledge";
 import type { CaseQualificationUnavailable } from "./qualification-diagnostic";
 import { caseIncidentBindings, revalidateIncidentContext } from "./investigation-incidents";
+import { arrangeCaseScopedKnowledge, caseScopedRecordCoverage, trimCaseScopedKnowledge, type CaseScopedKnowledge } from "./investigation-knowledge-ranking";
 import type { IncidentContext, IncidentReader } from "./investigation-incidents-contract";
 
 /*
@@ -224,6 +225,13 @@ export type CaseInvestigationPorts = {
    * Not wired: unchanged (the runtime wires it closed by default).
    */
   accessScope?(): Promise<unknown>;
+  /**
+   * Scope-first knowledge (11/11): the block's scope sources the search did not return, read at their exact version (the knowledge base's
+   * active version only; the runner keeps a card only if it is that exact version and valid now). Absent: only retrieved scope cards are sent.
+   */
+  readScopeCards?(refs: KnowledgeRef[]): Promise<SavRetrievalCandidate[]>;
+  /** The model transport's own preflight (no network, no cost): used only to drop out-of-scope cards before a request too large to send. */
+  preflight?(request: CaseInvestigationModelRequest): CaseModelTransportDiagnostic | null;
 };
 
 /**
@@ -402,7 +410,28 @@ export async function runCaseInvestigation(caseId: string, mode: CaseInvestigati
       await keep(wait("technical_wait"));
       return { status: "technical_wait", caseId, caseVersion, modelCalls };
     }
-    const knowledge = selection.cards, coverage = selection.coverage;
+    let knowledge = selection.cards, coverage = selection.coverage;
+    // Scope-first, ranked (11/11): on a pilot block, its scope sources first and never dropped (read at their exact version when the search
+    // missed them), then the other cards only when relevant (`investigation-knowledge-ranking.ts`). No block scope: unchanged.
+    let scoped: CaseScopedKnowledge | null = null;
+    if (accessScope && coverage) {
+      const missing = accessScope.sources.filter(source => !knowledge.some(card => card.id === source.knowledgeId && card.contentVersionId === source.contentVersionId))
+        .map(source => ({ knowledgeId: source.knowledgeId, contentVersionId: source.contentVersionId }));
+      let fetchedCards: SavRetrievalCandidate[] = [];
+      if (missing.length && ports.readScopeCards) {
+        try {
+          const read = await ports.readScopeCards(missing), at = ports.now();
+          fetchedCards = read.filter(card => missing.some(ref => ref.knowledgeId === card.id && ref.contentVersionId === card.contentVersionId)
+            && assessSavKnowledgeValidity(card, ports.scope.locale, ports.scope.audience, at).eligible);
+        } catch {
+          // An unread scope source is never silently left out: the case waits, nothing is sent.
+          await keep(wait("technical_wait"));
+          return { status: "technical_wait", caseId, caseVersion, modelCalls };
+        }
+      }
+      scoped = arrangeCaseScopedKnowledge({ cards: knowledge, coverage, relevance: "relevance" in selection ? selection.relevance ?? [] : [], scope: accessScope, fetched: fetchedCards });
+      knowledge = scoped.knowledge; coverage = scoped.coverage;
+    }
     let temporaryIncidents: IncidentContext | undefined;
     if (ports.temporaryIncidents) {
       const bindings = caseIncidentBindings(snapshot, knowledge, coverage, accessScope, ports.scope.locale, ports.scope.audience, ports.now());
@@ -437,7 +466,7 @@ export async function runCaseInvestigation(caseId: string, mode: CaseInvestigati
     const knowledgeChanged = (moved: CaseInvestigationReport) =>
       wait("knowledge_changed", { problem: moved.status === "knowledge_requeue" && moved.currentRevision === null ? "revision_unreadable" : "revision_moved" });
     const customerTexts = await ports.customerTexts(caseId, events.filter(event => event.direction === "customer_inbound").map(event => event.sourceRef));
-    const built = buildCaseDecisionContext({ snapshot, events, knowledge, coverage, locale: ports.scope.locale, audience: ports.scope.audience, admission, customerTexts });
+    let built = buildCaseDecisionContext({ snapshot, events, knowledge, coverage, locale: ports.scope.locale, audience: ports.scope.audience, admission, customerTexts });
     if (!built.ok) {
       // Never a silent return: the case waits for a person with the closed reason code, and no generation call is made.
       // Embedding calls the search already sent are counted, never hidden behind « no call ».
@@ -450,10 +479,33 @@ export async function runCaseInvestigation(caseId: string, mode: CaseInvestigati
     // it is never trusted as is. Same input, so a proposal that echoed its own version is checked on the current one;
     // one that echoed a wrong version keeps that error.
     const customerReportedLogin = caseModelLoginHistory(built.context);
+    // Over the model's input bound (measured by the transport's own preflight on the first decision request): the lowest-ranked
+    // out-of-scope cards go first, never a scope card. What is dropped is what neither the model nor the validator reads.
+    if (scoped && ports.preflight) {
+      const subjectKey = `sav-case:${caseId}:${inputKey}`, call = modelCalls + 1, preflight = ports.preflight;
+      const fits = (cards: SavRetrievalCandidate[], rows: CaseKnowledgeCoverage[]) => {
+        try {
+          return preflight({ purpose: "decision", caseId, caseVersion, inputKey, call, subjectKey, callKey: `${subjectKey}:call${call}`, caseBudgetKey: `sav-case:${caseId}`,
+            snapshot, events, knowledge: cards, coverage: rows, customerReportedLogin, feedback: [], closure: [],
+            ...(temporaryIncidents?.entries.length ? { temporaryIncidents } : {}),
+            ...(temporaryIncidents ? { temporaryIncidentContext: { fingerprint: temporaryIncidents.fingerprint, applicable: temporaryIncidents.entries.length > 0 } } : {}) })?.code !== "input_too_large";
+        } catch { return true; }
+      };
+      const trimmed = trimCaseScopedKnowledge(scoped, fits);
+      if (trimmed !== scoped) {
+        scoped = trimmed; knowledge = trimmed.knowledge; coverage = trimmed.coverage;
+        built = { ok: true, context: { ...built.context, knowledge, coverage } };
+      }
+    }
+    if (scoped && (scoped.dropped.length || scoped.added.length || scoped.unavailable.length))
+      // Ids and codes only, never a card's content.
+      console.info("sav_v2_knowledge_selection", { caseId, caseVersion, sent: knowledge.map(card => card.id), scope: [...scoped.scopeKeys],
+        dropped: scoped.dropped, added: scoped.added, scopeUnavailable: scoped.unavailable });
+    const decisionContext = built.context;
     let proposal = prior?.proposal ?? null;
     const validate = (stored: { output: unknown; proposedOn: number }) => {
       const output = stored.output, echoed = typeof output === "object" && output !== null && (output as { caseVersion?: unknown }).caseVersion === stored.proposedOn;
-      return validateCaseDecision(echoed ? { ...output, caseVersion } : output, accessScope ? { ...built.context, accessScope } : built.context, ports.now());
+      return validateCaseDecision(echoed ? { ...output, caseVersion } : output, accessScope ? { ...decisionContext, accessScope } : decisionContext, ports.now());
     };
     let validation = proposal ? validate(proposal) : undefined;
     let closure = validation?.outcome === "accepted" ? prior?.closure ?? null : null;
@@ -540,7 +592,7 @@ export async function runCaseInvestigation(caseId: string, mode: CaseInvestigati
 
     // A closure is planned only after a second, independent reading of the customer's words.
     if (validation.outcome === "accepted" && !closure) {
-      const items = caseClosureItems(validation.decision, built.context);
+      const items = caseClosureItems(validation.decision, decisionContext);
       if (items.length) {
         if (modelCalls >= SAV_CASE_INVESTIGATION_MAX_CALLS) closure = { plan: "ask_confirmation", verdicts: [], reason: "no_call_left" };
         else {
@@ -579,7 +631,7 @@ export async function runCaseInvestigation(caseId: string, mode: CaseInvestigati
       caseId, caseVersion, inputKey, leaseToken: lease.token, mode: "observe", validation: decided, refusal: refused, closure,
       flags: { sensitiveFoundByModel, learningExcluded: sensitiveFoundByModel, sameRefusalRepeated }, attempts, modelCalls,
       revisions: await ports.revisions(), knowledge: knowledge.map(card => ({ knowledgeId: card.id, contentVersionId: card.contentVersionId })),
-      knowledgeRevision: selection.revision, coverage: coverage?.map(({ requestId, status, knowledge: refs, limitations }) => ({ requestId, status, knowledge: refs, limitations: [...limitations] })) ?? null, actionsPaused, callSignal,
+      knowledgeRevision: selection.revision, coverage: (scoped ? caseScopedRecordCoverage(scoped) : coverage)?.map(({ requestId, status, knowledge: refs, limitations }) => ({ requestId, status, knowledge: refs, limitations: [...limitations] })) ?? null, actionsPaused, callSignal,
       ...(temporaryIncidents ? { temporaryIncidents } : {}),
       ...(accessScope ? { accessScope: caseAccessScopeStamp(accessScope) } : {}),
     });

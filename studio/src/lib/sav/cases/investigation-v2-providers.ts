@@ -81,6 +81,7 @@ export function caseKnowledgeVectorSearch(options: Readonly<{ locale: string; au
     readRevision: () => index().readRevision(),
     available: () => index().available(),
     search: (queries, vectors, limit) => index().searchByVectors(queries, vectors, limit),
+    readExact: refs => index().readExact(refs),
   };
 }
 

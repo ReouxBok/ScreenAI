@@ -74,6 +74,8 @@ export type CaseKnowledgeVectorSearch = {
   /** The vector size the index expects. */
   dimension: number;
   search(queries: readonly string[], vectors: readonly number[][], limit: number): Promise<SavRetrievalCandidate[][]>;
+  /** The active version of these exact cards, with the search's own filters and no embedding; a card at another version is absent. */
+  readExact?(refs: readonly { knowledgeId: string; contentVersionId: string }[]): Promise<SavRetrievalCandidate[]>;
 };
 
 export type CaseBudgetedRetrievalDeps = {
