@@ -14,9 +14,11 @@ import { intakeHasHumanDecision, intakeHumanRefused } from "../intake/human-bind
 import { caseRelayAdmissionDeps, type CaseApprovedRulePort } from "./admission-investigation-ports";
 import { readConfirmedV1Context } from "./admission-context-reader";
 import { hubspotTicketOwnerReader, type CaseOwnerReadTransport } from "./admission-owner-reader";
-import { admissionPolicyPort, qualifyTicketIdentity, type AdmissionPolicyRecord, type V1AdmissionAdapterPolicy } from "./admission-runtime";
+import { admissionPolicyPort, admissionPolicyRevisionPort, qualifyTicketIdentity, type AdmissionPolicyRecord, type V1AdmissionAdapterPolicy } from "./admission-runtime";
 import { savCaseRecordingEnabled, v1IntentHash, type CaseTx } from "./case-store";
-import { caseDedupeKey } from "./case-types";
+import { caseDedupeKey, SAV_CASE_ACCESS_BLOCK_ID } from "./case-types";
+import { readCaseAccessScope } from "./investigation-access-scope";
+import { caseAccessScopeConfigReader } from "./investigation-pilot-readers";
 import { routeCustomerReturn, type CustomerReturnDeps } from "./customer-return-store";
 import { v2OwnerAtCreationPort } from "./owner-attribution";
 import { bindSavV2QualificationThread, previewSavV2QualificationThread, savV2QualificationCaseAllowed, savV2QualificationMessageAllowed } from "./qualification-scope";
@@ -59,6 +61,17 @@ export async function firstBlockEvidence(env: Env, messageId: string, gmailMessa
   // Two blocks claiming one mail is a configuration to review: visible, with no customer text, and nobody admitted.
   if (selected.reason === "ambiguous_block") console.error("sav_v2_entry_block_ambiguous", { messageId, blockIds: selected.blockIds });
   if (selected.reason !== "admitted") return [];
+  // A block other than Access is admitted only with its own valid scope for the policy in force: otherwise its case would go to V2 and wait
+  // forever (`block_scope_missing`). V1 and the team keep the mail. Access is not checked here, exactly as before blocks.
+  if (selected.block.blockId !== SAV_CASE_ACCESS_BLOCK_ID) {
+    // An unreadable policy is no policy: the scope cannot match it, nobody is admitted.
+    const policyRevision = await admissionPolicyRevisionPort({ read: async () => readV2EntryPolicyRecord(env), now: () => new Date() })().catch(() => null);
+    const scope = await readCaseAccessScope(caseAccessScopeConfigReader(() => env), policyRevision, selected.block.blockId);
+    if (!scope.ok) {
+      console.error("sav_v2_entry_block_not_admitted", { messageId, blockId: selected.block.blockId, reason: "block_scope_unavailable", problem: scope.problem });
+      return [];
+    }
+  }
   return [{ requestId: requests[0].requestId, family: selected.rule.family, provenance: caseBlockRuleProvenance(selected.rule) }];
 }
 const rulesPort = (env: Env): CaseApprovedRulePort => ({context, requests}) =>

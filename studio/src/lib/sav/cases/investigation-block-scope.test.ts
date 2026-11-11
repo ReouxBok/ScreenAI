@@ -32,10 +32,12 @@ import { caseInvestigationStorePorts } from "./investigation-store-ports";
 let f: Awaited<ReturnType<typeof createSavTestDb>>, ticketSeq = 9_100_000;
 const STAFF = "20000000-0000-4000-8000-000000000011", AT = "2026-11-11T09:00:00.000Z";
 const POLICY = { revision: "policy-r1", admittedFamilies: ["access", "usage"], qualifiedRules: [
-  { ruleId: "rule-access", revision: "r1", families: ["access"] }, { ruleId: "rule-syn-widget", revision: "r1", families: ["usage"] }], approvedBy: STAFF, approvedAt: AT };
+  { ruleId: "rule-access", revision: "r1", families: ["access"] }, { ruleId: "rule-syn-widget", revision: "r1", families: ["usage"], blockId: "syn-widget" },
+  // A rule approved before blocks, of another family: its requests name no block.
+  { ruleId: "rule-syn-usage", revision: "r1", families: ["usage"] }], approvedBy: STAFF, approvedAt: AT };
 const CONFIRMED: CaseAdmissionQualification["identity"] = { status: "confirmed", source: { type: "hubspot_object", id: "contact-syn" } };
 const ruled = (requestId: string, family: CaseRequestFamily, blockId?: string) => ({ requestId, family,
-  provenance: { kind: "qualified_rule" as const, ruleId: family === "access" ? "rule-access" : "rule-syn-widget", revision: "r1", at: AT, ...(blockId ? { blockId } : {}) } });
+  provenance: { kind: "qualified_rule" as const, ruleId: family === "access" ? "rule-access" : blockId ? "rule-syn-widget" : "rule-syn-usage", revision: "r1", at: AT, ...(blockId ? { blockId } : {}) } });
 
 const card = (id: string, version: string): SavRetrievalCandidate => ({
   id, contentVersionId: version, title: `Fiche ${id}`, content: "Procédure synthétique.", source: "fixture", verifiedAt: new Date(Date.now() - 10 * 86_400_000).toISOString(), semanticScore: null,

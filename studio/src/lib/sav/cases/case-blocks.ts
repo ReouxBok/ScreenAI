@@ -20,11 +20,12 @@ export type CaseBlockDetector = Readonly<{ blockId: string; family: CaseRequestF
 export type CaseBlockCandidate = Readonly<{ rule: CaseEntryRule; block: CaseBlockDetector }>;
 
 /** Closed reasons of the entry's block selection. Only `admitted` gives evidence; the others admit nobody. */
-export const SAV_CASE_BLOCK_ENTRY_REASONS = ["admitted", "no_block_rule", "no_block_match", "ambiguous_block"] as const;
+/** `block_scope_unavailable` (entry, `v2-entry.ts`): a block other than Access matched, but has no valid scope for the policy in force. */
+export const SAV_CASE_BLOCK_ENTRY_REASONS = ["admitted", "no_block_rule", "no_block_match", "ambiguous_block", "block_scope_unavailable"] as const;
 export type CaseBlockEntryReason = typeof SAV_CASE_BLOCK_ENTRY_REASONS[number];
 export type CaseBlockSelection =
   | Readonly<{ reason: "admitted"; rule: CaseEntryRule; block: CaseBlockDetector }>
-  | Readonly<{ reason: Exclude<CaseBlockEntryReason, "admitted">; blockIds: readonly string[] }>;
+  | Readonly<{ reason: Exclude<CaseBlockEntryReason, "admitted" | "block_scope_unavailable">; blockIds: readonly string[] }>;
 
 /** The block a rule names; a rule written before blocks is Access's only when its family is `access`. */
 export const caseRuleBlockId = (rule: Pick<CaseEntryRule, "family" | "blockId">): string | null =>
@@ -35,7 +36,9 @@ export function caseBlockCandidates(rules: readonly CaseEntryRule[], registry: r
   return rules.flatMap(rule => {
     if (rule?.v1Kind !== "support") return [];
     const blockId = caseRuleBlockId(rule), block = registry.find(entry => entry.blockId === blockId);
-    return block && block.family === rule.family ? [{ rule, block }] : [];
+    // The family `access` is the Access block's alone, both ways, whatever the registry or the configured rule says.
+    if (!block || (rule.family === "access") !== (blockId === SAV_CASE_ACCESS_BLOCK_ID) || (block.family === "access") !== (block.blockId === SAV_CASE_ACCESS_BLOCK_ID)) return [];
+    return block.family === rule.family ? [{ rule, block }] : [];
   });
 }
 

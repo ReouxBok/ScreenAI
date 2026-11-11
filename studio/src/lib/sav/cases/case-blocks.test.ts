@@ -5,7 +5,8 @@ vi.mock("@/db", () => ({ requireDb: () => ({ select: () => ({ from: () => ({ whe
 import { encryptSavPayload } from "../crypto";
 import { caseBlockCandidates, caseOpenBlockId, caseRequestBlockId, selectCaseBlockRule, type CaseBlockDetector, type CaseEntryRule } from "./case-blocks";
 import { SAV_CASE_BLOCK_REGISTRY } from "./case-block-registry";
-import { caseAdmissionQualificationSchema, SAV_CASE_ACCESS_BLOCK_ID, SAV_CASE_ADMISSIBLE_FAMILIES, SAV_CASE_BLOCK_ID, type CaseSnapshot } from "./case-types";
+import { caseRequestFamilyProven, decideCaseAdmission } from "./admission-policy";
+import { caseAdmissionPolicySchema, caseAdmissionQualificationSchema, SAV_CASE_ACCESS_BLOCK_ID, SAV_CASE_ADMISSIBLE_FAMILIES, SAV_CASE_BLOCK_ID, type CaseSnapshot } from "./case-types";
 import { decideAccessAutoApproval, readAccessAutoApprovalConfig } from "./customer-return";
 import type { CaseDecisionValidationContext } from "./decision-contract";
 import { validateCaseDecision } from "./decision-validator";
@@ -32,14 +33,23 @@ const LOGIN_TEXT = "Bonjour, je ne reçois pas le code de connexion à mon compt
 const WIDGET_TEXT = "Bonjour, comment configurer le widget synthétique de mon espace ?", WIDGET_SUBJECT = "Question widget";
 const OTHER_TEXT = "Bonjour, pouvez-vous m'envoyer la documentation générale ?", OTHER_SUBJECT = "Documentation";
 
-const env = (rules: readonly unknown[]) => ({ SAV_V2_ADMISSION_RULES_JSON: JSON.stringify(rules) });
+const STAFF = "20000000-0000-4000-8000-000000000012";
+const POLICY = { revision: POLICY_REVISION, admittedFamilies: ["access", "usage"], approvedBy: STAFF, approvedAt: AT,
+  qualifiedRules: [{ ruleId: "rule-syn-access", revision: "r1", families: ["access"] }, { ruleId: "rule-syn-widget", revision: "r1", families: ["usage"], blockId: "syn-widget" }] };
+const policyRecord = (policy: unknown = POLICY) => JSON.stringify({ policy, validFrom: "2025-01-01T00:00:00Z", validUntil: "2099-01-01T00:00:00Z" });
+const WIDGET_SCOPE = { schema: SAV_CASE_BLOCK_SCOPE_REVISION, blockId: "syn-widget", family: "usage", policyRevision: POLICY_REVISION, revision: "scope-syn-widget-r1",
+  sources: [{ knowledgeId: "k-syn-widget", contentVersionId: "k-syn-widget-v1", use: "answer" }] };
+/** The block's admission needs its scope for the policy in force (F3); Access's never reads either. */
+const BLOCK_ENV = { SAV_V2_ADMISSION_POLICY_JSON: policyRecord(), [SAV_V2_BLOCK_SCOPES_ENV]: JSON.stringify([WIDGET_SCOPE]) };
+let extraEnv: Record<string, string> = BLOCK_ENV;
+const env = (rules: readonly unknown[]) => ({ SAV_V2_ADMISSION_RULES_JSON: JSON.stringify(rules), ...extraEnv });
 const request = [{ requestId: "gm-syn/r1", kind: "support" }] as Parameters<typeof firstBlockEvidence>[3];
 const mail = (text: string, subject: string) => { state.message = { body: encryptSavPayload({ text }), subject }; };
 const evidence = (rules: readonly unknown[], registry: readonly CaseBlockDetector[] = REGISTRY) => firstBlockEvidence(env(rules), "message-syn", "gm-syn", request, registry);
 
 beforeEach(() => {
   vi.stubEnv("SAV_ENCRYPTION_KEY_V1", "case-blocks-fixture-key-32-chars!!!");
-  state.message = null; state.reads = 0;
+  state.message = null; state.reads = 0; extraEnv = BLOCK_ENV;
 });
 afterEach(() => { vi.unstubAllEnvs(); vi.restoreAllMocks(); });
 
@@ -65,6 +75,7 @@ describe("the code registry: one detector per block, the family `access` is Acce
 
 describe("entry: every approved rule is evaluated, exactly one block admits", () => {
   it("(a) Access with only its rule admits exactly as before: same family, same provenance bytes (no blockId), one mail read", async () => {
+    extraEnv = {}; // As before blocks: no policy, scope or block list is read for Access at entry.
     mail(LOGIN_TEXT, LOGIN_SUBJECT);
     const admitted = await evidence([ACCESS_RULE], SAV_CASE_BLOCK_REGISTRY);
     expect(admitted).toEqual([{ requestId: "gm-syn/r1", family: "access", provenance: { kind: "qualified_rule", ruleId: "rule-syn-access", revision: "r1", at: AT } }]);
@@ -220,5 +231,58 @@ describe("(f) auto approval stays Access's only", () => {
     expect(decide(["usage"])).toEqual({ allowed: false, reason: "not_access_only" });
     expect(decide(["access", "usage"])).toEqual({ allowed: false, reason: "not_access_only" });
     expect(readAccessAutoApprovalConfig({ SAV_V2_AUTO_REPLY: "syn-widget", SAV_V2_AUTO_APPROVER_ID: "30000000-0000-4000-8000-0000000000aa" })).toEqual({ mode: "off", why: "disabled" });
+  });
+});
+
+describe("review 5f85a1a: a block's rule is bound by the approved policy (F2), admitted only with its scope (F3), `access` is Access's (F4)", () => {
+  it("F4: the family `access` implies the block `access`, and the reverse, whatever the rule or the registry says", () => {
+    const fakeAccess: CaseBlockDetector = { blockId: "syn-fake", family: "access", firstRequest: () => true };
+    const accessAsUsage: CaseBlockDetector = { blockId: "access", family: "usage", firstRequest: () => true };
+    expect(caseBlockCandidates([{ ...ACCESS_RULE, blockId: "syn-fake" }], [...SAV_CASE_BLOCK_REGISTRY, fakeAccess])).toEqual([]);
+    expect(caseBlockCandidates([{ ...WIDGET_RULE, blockId: "access" }], [accessAsUsage])).toEqual([]);
+    expect(caseBlockCandidates([{ ...ACCESS_RULE, blockId: "access" }], SAV_CASE_BLOCK_REGISTRY).map(row => row.block.blockId)).toEqual(["access"]);
+  });
+
+  it("F3: the block's mail is not admitted without its valid scope for the policy in force; V1 and the team keep it", async () => {
+    const logged = vi.spyOn(console, "error").mockImplementation(() => {});
+    mail(WIDGET_TEXT, WIDGET_SUBJECT);
+    for (const [over, problem] of [[{ [SAV_V2_BLOCK_SCOPES_ENV]: "" }, "scope_missing"], [{ [SAV_V2_BLOCK_SCOPES_ENV]: "{not json" }, "scope_unreadable"],
+      [{ [SAV_V2_BLOCK_SCOPES_ENV]: JSON.stringify([{ ...WIDGET_SCOPE, family: "access" }]) }, "scope_invalid"],
+      [{ SAV_V2_ADMISSION_POLICY_JSON: policyRecord({ ...POLICY, revision: "policy-syn-r2" }) }, "scope_policy_mismatch"],
+      [{ SAV_V2_ADMISSION_POLICY_JSON: "" }, "scope_policy_mismatch"], [{ SAV_V2_ADMISSION_POLICY_JSON: "{not json" }, "scope_policy_mismatch"]] as const) {
+      extraEnv = { ...BLOCK_ENV, ...over };
+      logged.mockClear();
+      expect(await evidence([ACCESS_RULE, WIDGET_RULE])).toEqual([]);
+      expect(logged).toHaveBeenCalledWith("sav_v2_entry_block_not_admitted", { messageId: "message-syn", blockId: "syn-widget", reason: "block_scope_unavailable", problem });
+      // Ids and closed codes only: no customer text or subject in the log.
+      expect(JSON.stringify(logged.mock.calls)).not.toMatch(/widget synthétique|Question widget/);
+    }
+    // Access is not checked against any scope at entry, exactly as before: the same broken block configuration never stops it.
+    mail(LOGIN_TEXT, LOGIN_SUBJECT);
+    extraEnv = { [SAV_V2_BLOCK_SCOPES_ENV]: "{not json" };
+    expect(await evidence([ACCESS_RULE, WIDGET_RULE])).toMatchObject([{ family: "access", provenance: { ruleId: "rule-syn-access" } }]);
+  });
+
+  it("F2: a block's rule admits only under a policy entry carrying that very block; Access's rule and today's policies are unchanged", () => {
+    const ruled = (family: "access" | "usage", ruleId: string, blockId?: string) => ({ requestId: "gm-syn/r1", family,
+      provenance: { kind: "qualified_rule" as const, ruleId, revision: "r1", at: AT, ...(blockId ? { blockId } : {}) } });
+    const proven = (request: ReturnType<typeof ruled>, policy: unknown) => caseRequestFamilyProven(request, policy);
+    const legacyPolicy = { ...POLICY, qualifiedRules: [{ ruleId: "rule-syn-access", revision: "r1", families: ["access"] }, { ruleId: "rule-syn-widget", revision: "r1", families: ["usage"] }] };
+    // A policy written before blocks parses and proves exactly as before (no blockId on either side).
+    expect(caseAdmissionPolicySchema.safeParse(legacyPolicy).success).toBe(true);
+    expect([proven(ruled("access", "rule-syn-access"), legacyPolicy), proven(ruled("usage", "rule-syn-widget"), legacyPolicy)]).toEqual([true, true]);
+    expect(proven(ruled("access", "rule-syn-access", "access"), legacyPolicy)).toBe(true);
+    // A rule moved to a block by the configuration alone is not proven by a policy that did not approve that block.
+    expect(proven(ruled("usage", "rule-syn-widget", "syn-widget"), legacyPolicy)).toBe(false);
+    expect(proven(ruled("usage", "rule-syn-widget", "syn-widget"), POLICY)).toBe(true);
+    expect(proven(ruled("usage", "rule-syn-widget", "syn-other"), POLICY)).toBe(false);
+    expect(proven(ruled("usage", "rule-syn-widget"), POLICY)).toBe(false);
+    // An approved block entry may not list the family `access`.
+    expect(caseAdmissionPolicySchema.safeParse({ ...POLICY, qualifiedRules: [{ ruleId: "r", revision: "r1", families: ["access", "usage"], blockId: "syn-widget" }] }).success).toBe(false);
+    expect(caseAdmissionPolicySchema.safeParse({ ...POLICY, qualifiedRules: [{ ruleId: "r", revision: "r1", families: ["access"], blockId: "access" }] }).success).toBe(true);
+    // Through the full admission: the block's request is admitted only under the policy that binds its block.
+    const decide = (policy: unknown) => decideCaseAdmission({ policy, caseSensitivity: "none", qualification: { requests: [ruled("usage", "rule-syn-widget", "syn-widget")],
+      identity: { status: "confirmed", source: { type: "hubspot_object", id: "contact-syn" } }, crmContext: "complete", teamSignals: [] } }).reasons;
+    expect([decide(POLICY), decide(legacyPolicy)]).toEqual([["admitted"], ["qualification_unproven"]]);
   });
 });
