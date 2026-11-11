@@ -125,7 +125,7 @@ export async function passCaseInvestigationToReplyPlan(caseId: string, deps: Cas
   if (config.mode !== "on") reasons.push(`auto_${config.why}`);
   else if (!language) reasons.push("language_human_required");
   else {
-    const text = prepareCaseReplyText(draft.reply.text, language.language, "automated");
+    const text = prepareCaseReplyText(draft.reply.text, language.language, "automated", draft.reply.purpose);
     let proven = false;
     try {
       proven = (await readPilotReplyProvenance({ caseId, triggerEventId: draft.triggerEventId!, purpose: draft.reply.purpose, text }, deps.provenance)).status === "proven";

@@ -32,6 +32,30 @@ describe("prepareCaseReplyText: the final V2 text, prepared once before validati
     expect(prepareCaseReplyText(BODY, "unknown", "manual_reviewed")).toBe(prepareCaseReplyText(BODY, "fr", "manual_reviewed"));
   });
 
+  // 11/11 (real Access test): a reply asked the customer twice at its end. ONE follow-up per reply: a question reply is its own follow-up, every other purpose has the standard line.
+  it("a question reply carries its own question and no standard line; an answer keeps the line once; neither stacks", () => {
+    const ASK = "Bonjour,\n\nQuel message s’affiche à l’écran après la saisie de votre adresse e-mail ?";
+    const line = caseReplyHelpLine("fr");
+    for (const mode of ["manual_reviewed", "automated"] as const) {
+      const question = prepareCaseReplyText(ASK, "fr", mode, "question");
+      expect(question).not.toContain(line);
+      expect(question.split("?").length - 1).toBe(1);
+      expect(prepareCaseReplyText(question, "fr", mode, "question")).toBe(question);
+      expect(readCaseReplyDisclosure(question)).toEqual({ mode, language: "fr" });
+      for (const purpose of ["answer", "reminder", undefined] as const) {
+        const answer = prepareCaseReplyText(BODY, "fr", mode, purpose);
+        expect(answer.split(line).length - 1).toBe(1);
+        expect(prepareCaseReplyText(answer, "fr", mode, purpose)).toBe(answer);
+      }
+      // a draft that already carries the line (an older proposal) is re-prepared as a question without it, never with two
+      expect(prepareCaseReplyText(prepareCaseReplyText(ASK, "fr", mode, "answer"), "fr", mode, "question")).toBe(question);
+    }
+    const proposal = { caseId: "c", caseVersion: 1, triggerEventId: "inbound:g", inboundMessageId: "m", purpose: "question" as const, recipient: "a@example.invalid", subject: "S", text: ASK,
+      question: { id: "q1", text: "Quel message ?", factKeys: [] } };
+    expect(finalizeCaseReplyProposal(proposal, { language: "fr", validation: "human" }).text).not.toContain(line);
+    expect(finalizeCaseReplyProposal({ ...proposal, purpose: "answer", question: undefined }, { language: "fr", validation: "human" }).text).toContain(line);
+  });
+
   it("a draft without content is refused, not turned into a mention alone", () => {
     for (const draft of ["", "   ", savReplyFooter("fr", "manual_reviewed")]) expect(() => prepareCaseReplyText(draft, "fr", "manual_reviewed")).toThrow("SAV_REPLY_EMPTY");
   });
@@ -71,7 +95,7 @@ describe("contract for the producer and the store: finalize before the proposal 
     for (const language of ["fr", "en"] as const) {
       const final = finalizeCaseReplyProposal(draft, { language, validation: "human" });
       expect({ ...final, text: BODY }).toEqual(draft);
-      expect(final.text).toBe(prepareCaseReplyText(BODY, language, "manual_reviewed"));
+      expect(final.text).toBe(prepareCaseReplyText(BODY, language, "manual_reviewed", draft.purpose)); // the draft is a question reply: its question is its follow-up
       expect(finalizeCaseReplyProposal(final, { language, validation: "human" })).toEqual(final);
       expect(caseReplyPayloadHash(finalizeCaseReplyProposal(final, { language, validation: "human" }))).toBe(caseReplyPayloadHash(final));
       expect(caseReplyFinalTextProblem(final.text)).toBeNull();
@@ -93,7 +117,7 @@ describe("contract for the producer and the store: finalize before the proposal 
     for (const body of [BODY, `${LEGACY_AI_DISCLOSURE}\n${BODY}`, `${BODY}\n\nL’équipe Limova`, prepareCaseReplyText(BODY, "en", "automated"), "  Hello.  "]) for (const language of ["fr", "en", "unknown"] as const) {
       const text = finalizeCaseReplyProposal({ ...draft, text: body }, { language, validation: "human" }).text;
       expect(caseReplyFinalTextProblem(text)).toBeNull();
-      expect(prepareCaseReplyText(text, language, "manual_reviewed")).toBe(text);
+      expect(prepareCaseReplyText(text, language, "manual_reviewed", draft.purpose)).toBe(text);
       expect(text.split("\n\n").filter(part => part.includes("IA") || part.includes("AI"))).toHaveLength(1);
     }
   });
