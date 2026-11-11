@@ -1,6 +1,7 @@
 import { after } from "next/server";
 import { ZodError } from "zod";
 import { acceptGmailWebhook, processGmailReceipt, verifyGmailWebhookRequest } from "@/lib/sav/gmail";
+import { watchSavReconcilePulse } from "@/lib/sav/monitor-watchdog";
 
 export const runtime = "nodejs";
 export const maxDuration = 300;
@@ -17,7 +18,8 @@ export async function POST(request: Request) {
   }
   try {
     const result = await acceptGmailWebhook(payload);
-    if (!result.duplicate) after(() => processGmailReceipt(result.receipt.id));
+    // After the 204: the receipt, then the watchdog of the scheduled catch-up (one row read, at most once a minute, never throws).
+    if (!result.duplicate) after(() => Promise.all([processGmailReceipt(result.receipt.id), watchSavReconcilePulse()]));
     return new Response(null, { status: 204 });
   } catch (error) {
     const invalidPayload = error instanceof ZodError || error instanceof SyntaxError;

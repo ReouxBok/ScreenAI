@@ -26,6 +26,9 @@ export type SavIntakeWakeDeps = {
   network?: typeof fetch;
   adapters?: ExecutorAdapters;
   readExternalCompletion?: SavExternalCompletionReader;
+  /** V2 (11/11): when this wake step must be done. Given (the workflow steps), a V2 reply queued by the relay or the return gate may be sent at once
+   * within it; absent (the operator resume inside `sav-reconcile`), the effects catch-up sends it. */
+  v2ImmediateDeadlineMs?: number;
 };
 const code = (e: unknown) => e instanceof Error && /^SAV_[A-Z_]+$/.test(e.message) ? e.message : "SAV_INTAKE_WAKE_INTERRUPTED";
 // Same tolerated admission refusals as the cron scanner: the dossier stays durable.
@@ -63,7 +66,8 @@ export async function analyseSavIntakeWake(runId: string, deps: SavIntakeWakeDep
   // Already analysed (observed/admitted): continue without the model.
   if (stage !== "analysis") return { stage: "analysis", state: stage ? "done" : "skipped", reason: stage ?? "no_durable_work" };
   await markSavIntakeWake(runId, "running", { startedAt: new Date().toISOString() });
-  try { await (await import("./runtime")).analyseSavIntakeRuntime(runId, config, { env, ...(deps.network ? { network: deps.network } : {}) }); }
+  try { await (await import("./runtime")).analyseSavIntakeRuntime(runId, config, { env, ...(deps.network ? { network: deps.network } : {}),
+    ...(deps.v2ImmediateDeadlineMs === undefined ? {} : { v2ImmediateDeadlineMs: deps.v2ImmediateDeadlineMs }) }); }
   catch (error) { console.error("sav_intake_wake_step", { runId, stage: "analysis", errorCode: code(error) }); }
   const after = await currentRun(runId, config), state = after?.state ?? "superseded";
   await markSavIntakeWake(runId, state === "observed" ? "running" : state === "superseded" ? "completed" : "waiting", { outcome: state, analysedAt: new Date().toISOString() });
@@ -119,7 +123,7 @@ export async function executeSavIntakeWake(runId: string, deps: SavIntakeWakeDep
       if (executionId) {
         const pass = await executeIntakePass(executionId, options) as { state?: string; skipped?: string; reason?: string };
         result = pass.skipped ? { state: "waiting", reason: pass.skipped } : { state: pass.state ?? "waiting", ...(pass.reason ? { reason: pass.reason } : {}) };
-        if (pass.state === "confirmed") await relayToCase(run.messageId, env());
+        if (pass.state === "confirmed") await relayToCase(run.messageId, env(), deps.v2ImmediateDeadlineMs);
       }
     }
   } catch (error) { result = { state: "waiting", reason: code(error) }; }
@@ -130,11 +134,11 @@ export async function executeSavIntakeWake(runId: string, deps: SavIntakeWakeDep
 
 /** V2 relay (SAV-11): nothing unless SAV_CASE_RECORDING=on. It reads V1's durable records
  * only and never fails V1; a lost relay is caught up by sweepCaseRelays. */
-async function relayToCase(messageId: string, env: Record<string, string | undefined>) {
+async function relayToCase(messageId: string, env: Record<string, string | undefined>, immediateDeadlineMs?: number) {
   if (env.SAV_CASE_RECORDING !== "on") return;
   try {
     const result = await (await import("../cases/intake-boundary")).recordCaseAfterConfirmedIntake(messageId, await v2EntryRelayDeps(env));
-    if (env.SAV_V2_ENTRY === "on" && "owner" in result && result.owner === "agent") await (await import("../cases/v2-entry")).continueCaseAfterCommit(result.caseId, "relay", { env });
+    if (env.SAV_V2_ENTRY === "on" && "owner" in result && result.owner === "agent") await (await import("../cases/v2-entry")).continueCaseAfterCommit(result.caseId, "relay", { env, ...(immediateDeadlineMs === undefined ? {} : { immediateDeadlineMs }) });
   } catch (error) {
     // The sweep replays the relay from V1's records; with the V2 entry on, the failure also stays visible.
     if (env.SAV_V2_ENTRY === "on") console.error("sav_v2_entry_relay", { messageId, errorCode: code(error) });

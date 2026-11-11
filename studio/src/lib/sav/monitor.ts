@@ -11,9 +11,11 @@ import { decryptSavPayload } from "./crypto";
 import { countLegacyHumanCommands, countLegacyStartedMails } from "./intake/legacy-started";
 import { intakeBlockedRunSql, intakeBlockedPause } from "./intake/console-store";
 import { readSavAgentPause, SAV_AGENT_PAUSE_CODES } from "./intake/agent-pause";
-import { monitorStateSchema, monitorCodes, nextMonitorState, monitorWebhook, monitorSlackText, monitorDeliveryHash, type MonitorState, type MonitorSnapshot, type MonitorIssue, type MonitorCode } from "./monitor-contract";
+import { SAV_V2_EFFECTS_WORKER, SAV_V2_EFFECTS_STALE_MS, savV2EffectsExpected, monitorStateSchema, monitorCodes, nextMonitorState, monitorWebhook, monitorSlackText, monitorDeliveryHash, type MonitorState, type MonitorSnapshot, type MonitorIssue, type MonitorCode } from "./monitor-contract";
 
 const WORKER = "sav-monitor:v1:worker", STATE = "sav-monitor:v1:state", SNAPSHOT = "sav-monitor:v1:snapshot";
+const workerKey = (worker: "sav-reconcile" | "sav-v2-effects") => worker === "sav-v2-effects" ? SAV_V2_EFFECTS_WORKER : WORKER;
+
 type Tx = Parameters<Parameters<ReturnType<typeof requireDb>["transaction"]>[0]>[0];
 async function queryRows<T extends Record<string, unknown>>(tx: Pick<Tx, "execute">, statement: SQL): Promise<T[]> {
   const result = await tx.execute<T>(statement);
@@ -22,18 +24,19 @@ async function queryRows<T extends Record<string, unknown>>(tx: Pick<Tx, "execut
   return rows as T[];
 }
 type Pulse = { id: string; startedAt: string; finishedAt?: string; lastFinishedAt?: string; lastSucceededAt?: string; monitoringSince?: string; failed?: boolean };
-export async function recordSavWorkerPulse(id: string, startedAt: string, failed?: boolean) {
+export async function recordSavWorkerPulse(id: string, startedAt: string, failed?: boolean, worker: "sav-reconcile" | "sav-v2-effects" = "sav-reconcile") {
+  const key = workerKey(worker);
   try {
     await requireDb().transaction(async tx => {
       await tx.execute(sql`select set_config('statement_timeout','3s',true),set_config('lock_timeout','1s',true)`);
       const finishedAt = new Date().toISOString();
       const value: Pulse = failed === undefined ? { id, startedAt } : { id, startedAt, finishedAt, lastFinishedAt: finishedAt, ...(!failed ? { lastSucceededAt: finishedAt } : {}), failed };
       const encoded = JSON.stringify(value);
-      if (failed === undefined) await tx.execute(sql`insert into sav.sync_state(key,status,cursor) values(${WORKER},'running',${JSON.stringify({...value,monitoringSince:startedAt})})
+      if (failed === undefined) await tx.execute(sql`insert into sav.sync_state(key,status,cursor) values(${key},'running',${JSON.stringify({...value,monitoringSince:startedAt})})
         on conflict(key) do update set status='running',cursor=(sav.sync_state.cursor::jsonb || ${encoded}::jsonb)::text
         where (sav.sync_state.cursor::jsonb->>'startedAt')::timestamptz <= ${startedAt}::timestamptz`);
       else await tx.execute(sql`update sav.sync_state set status=${failed ? "failed" : "finished"},cursor=(cursor::jsonb || ${encoded}::jsonb)::text
-        where key=${WORKER} and cursor::jsonb->>'id'=${id}`);
+        where key=${key} and cursor::jsonb->>'id'=${id}`);
     });
     return true;
   } catch { console.error("sav_monitor_pulse_failed"); return false; }
@@ -51,7 +54,7 @@ export async function collectSavMonitorSnapshot(): Promise<MonitorSnapshot> {
     await requireDb().transaction(async tx => {
       await tx.execute(sql`set transaction isolation level repeatable read read only`);
       await tx.execute(sql`select set_config('statement_timeout','5s',true),set_config('lock_timeout','1s',true),set_config('transaction_timeout','20s',true)`);
-      const rows = await tx.select().from(savSyncState).where(sql`${savSyncState.key}=${WORKER} or ${savSyncState.key} like 'sav-intake-launch:%' or ${savSyncState.key}='sav-intake-console-schema-v1' or ${savSyncState.key}='sav-intake-execution-schema-v1'`).limit(15);
+      const rows = await tx.select().from(savSyncState).where(sql`${savSyncState.key}=${WORKER} or ${savSyncState.key}=${SAV_V2_EFFECTS_WORKER} or ${savSyncState.key} like 'sav-intake-launch:%' or ${savSyncState.key}='sav-intake-console-schema-v1' or ${savSyncState.key}='sav-intake-execution-schema-v1'`).limit(15);
       if (rows.length >= 15) throw Error("MONITOR_SCOPE_LIMIT");
       const worker = rows.find(r => r.key === WORKER);
       if (!worker) add("worker_missing", 1);
@@ -63,6 +66,19 @@ export async function collectSavMonitorSnapshot(): Promise<MonitorSnapshot> {
         metrics.workerAgeSeconds = Math.floor(age / 1000);
         metrics.workerCompletionAgeSeconds=Math.floor(completionAge/1000);
         add("worker_stalled", age > 15 * 60000 || completionAge > 15*60000 ? 1 : 0, "critical"); add("worker_failed", worker.status === "failed" || p.failed === true ? 1 : 0, "critical");
+      }
+      // 11/11: the V2 effects worker, judged like the main worker on its own period (missing, stalled > 25 min, failed), only when V2 runs.
+      if (savV2EffectsExpected()) {
+        const v2 = rows.find(r => r.key === SAV_V2_EFFECTS_WORKER);
+        if (!v2) add("v2_effects_missing", 1);
+        else {
+          const p = JSON.parse(v2.cursor ?? "null") as Pulse;
+          const age = now.getTime() - Date.parse(p.startedAt), completionAge = now.getTime() - Date.parse(p.lastFinishedAt ?? p.monitoringSince ?? p.startedAt);
+          if (!Number.isFinite(age) || age < 0 || !Number.isFinite(completionAge) || completionAge < 0) throw Error("MONITOR_WORKER_CLOCK");
+          metrics.v2EffectsAgeSeconds = Math.floor(age / 1000); metrics.v2EffectsCompletionAgeSeconds = Math.floor(completionAge / 1000);
+          add("v2_effects_stalled", age > SAV_V2_EFFECTS_STALE_MS || completionAge > SAV_V2_EFFECTS_STALE_MS ? 1 : 0, "critical");
+          add("v2_effects_failed", v2.status === "failed" || p.failed === true ? 1 : 0, "critical");
+        }
       }
       const launches = rows.filter(r => r.status === "intake_launch_v1" && r.key.startsWith("sav-intake-launch:"));
       metrics.launchedMailboxes = launches.length;
