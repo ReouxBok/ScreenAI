@@ -13,7 +13,7 @@ import { judgeCurrentTicketOwner } from "./case-ticket-owner";
 import { listCaseEvents, readCase } from "./case-store";
 import { accessAutoReplyAuthorizer } from "./customer-return-store";
 import { readAccessAutoApprovalConfig, type AccessAutoApprovalFacts } from "./customer-return";
-import { caseAccessScopeStamp, readCaseAccessScope } from "./investigation-access-scope";
+import { caseAccessScopeStamp, caseStampBlockId, readCaseAccessScope } from "./investigation-access-scope";
 import { caseDecisionDraft, type CaseDecisionDraft } from "./investigation-intent";
 import { readCaseInvestigationProgress } from "./investigation-record";
 import { caseAdmissionNamesLatestInput, latestInvestigationInput } from "./investigation-runner";
@@ -54,7 +54,8 @@ async function latestDraft(caseId: string, provenance: PilotProvenanceDeps) {
   if (!inputKey) return { draft: null, reason: "no_input" } as const;
   const read = readCaseInvestigationProgress(events, inputKey);
   if (read.state !== "found") return { draft: null, reason: `decision_${read.state}` } as const;
-  const scope = await readCaseAccessScope(provenance.accessScope, await provenance.currentPolicyRevision());
+  // Treatment blocks (11/11): the scope in force of the block the decision was taken under (Access when its stamp names none).
+  const scope = await readCaseAccessScope(provenance.accessScope, await provenance.currentPolicyRevision(), caseStampBlockId(read.record.decision?.accessScope));
   const draft = caseDecisionDraft(caseId, read.record, events, { accessScope: scope.ok ? caseAccessScopeStamp(scope.scope) : null });
   if (!draft) return { draft: null, reason: "decision_not_accepted" } as const;
   const nextAction = read.record.decision?.validation.outcome === "accepted" ? read.record.decision.validation.decision.nextAction.kind : "none";

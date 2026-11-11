@@ -238,10 +238,16 @@ export const caseAdmissionPolicySchema = z.object({
 }).strict();
 export type CaseAdmissionPolicy = z.infer<typeof caseAdmissionPolicySchema>;
 
+/** Treatment blocks (11/11, `case-blocks.ts`): a block's identity, distinct from its family. The family `access` is the `access` block's alone. */
+export const SAV_CASE_ACCESS_BLOCK_ID = "access";
+export const SAV_CASE_BLOCK_ID = /^[a-z][a-z0-9_-]{1,39}$/;
+export const caseBlockIdSchema = z.string().regex(SAV_CASE_BLOCK_ID);
+
 export const caseAdmissionProvenanceSchema = z.discriminatedUnion("kind", [
   z.object({ kind: z.literal("human"), staffUserId: staffId, at }).strict(),
-  // Admits only when the policy lists this rule and revision for the family.
-  z.object({ kind: z.literal("qualified_rule"), ruleId: ref, revision: ref, at }).strict(),
+  // Admits only when the policy lists this rule and revision for the family. `blockId`: the block the rule names; absent for a
+  // rule written before blocks (then only the family `access` has one, the Access block), so Access records exactly what it did.
+  z.object({ kind: z.literal("qualified_rule"), ruleId: ref, revision: ref, at, blockId: caseBlockIdSchema.optional() }).strict(),
   // An intake category proposed by the model: may exclude, never admits.
   z.object({ kind: z.literal("intake_hint"), source: sourceRefSchema }).strict(),
 ]);

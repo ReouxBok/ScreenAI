@@ -9,7 +9,7 @@ import { prepareCaseReplyText } from "./case-reply-outbound";
 import type { CaseReplyProposal } from "./case-effects";
 import { listCaseEvents } from "./case-store";
 import type { KnowledgeRef } from "./case-types";
-import { caseAccessScopeStamp, caseAccessSourceProblem, readCaseAccessScope, type CaseAccessScopeStamp } from "./investigation-access-scope";
+import { caseAccessScopeStamp, caseAccessSourceProblem, caseStampBlockId, readCaseAccessScope, type CaseAccessScopeStamp } from "./investigation-access-scope";
 import { caseDecisionDraft } from "./investigation-intent";
 import { readCaseInvestigationProgress } from "./investigation-record";
 import { latestInvestigationInput } from "./investigation-runner";
@@ -48,11 +48,13 @@ const ISO_INSTANT = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,3})?(?:Z|[+-]
 const sameFinalText = (decided: string, proposed: string) => (["fr", "en"] as const).some(language => (["manual_reviewed", "automated"] as const).some(mode => prepareCaseReplyText(decided, language, mode) === proposed));
 
 export async function readPilotReplyProvenance(proposal: Pick<CaseReplyProposal, "caseId" | "triggerEventId" | "purpose" | "text">, deps: PilotProvenanceDeps): Promise<PilotProvenance> {
-  const scope = await readCaseAccessScope(deps.accessScope, await deps.currentPolicyRevision());
-  if (!scope.ok) return unproven(scope.problem);
+  const policyRevision = await deps.currentPolicyRevision();
   const events = await listCaseEvents(proposal.caseId), inputKey = latestInvestigationInput(events);
-  if (!inputKey) return unproven("decision_missing");
-  const read = readCaseInvestigationProgress(events, inputKey);
+  const read = inputKey ? readCaseInvestigationProgress(events, inputKey) : null;
+  // Treatment blocks (11/11): the scope in force of the block the decision was taken under (Access when its stamp names none).
+  const scope = await readCaseAccessScope(deps.accessScope, policyRevision, caseStampBlockId(read?.state === "found" ? read.record.decision?.accessScope : undefined));
+  if (!scope.ok) return unproven(scope.problem);
+  if (!inputKey || !read) return unproven("decision_missing");
   if (read.state === "none") return unproven("decision_missing");
   if (read.state !== "found") return unproven("decision_unreadable");
   const stamp = caseAccessScopeStamp(scope.scope);

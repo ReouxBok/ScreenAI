@@ -1,6 +1,6 @@
 import { z } from "zod";
 import type { CaseAdmissionStatus } from "./admission-policy";
-import type { CaseAccessScope } from "./investigation-access-scope";
+import type { CaseBlockScope } from "./investigation-access-scope";
 import { savFactKeySchema } from "../playbook-contract";
 import type { SavRetrievalCandidate } from "../request-retrieval";
 import {
@@ -150,7 +150,7 @@ export type CaseDecisionValidationContext = {
    * version; set, it also means only `access` (or a sensitive family, handed off) is admissible. Absent: not the pilot, not
    * checked (the runner sets it whenever its scope port is wired). Null: no scope, so nothing is shown from any source.
    */
-  accessScope?: CaseAccessScope | null;
+  accessScope?: CaseBlockScope | null;
 };
 
 export const SAV_CASE_ACCESS_URL = "https://new.limova.ai";
