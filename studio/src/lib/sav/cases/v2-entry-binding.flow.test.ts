@@ -204,7 +204,7 @@ describe("actual continuation loader: real factory and authorizer, synthetic tra
     vi.stubGlobal("fetch", vi.fn((url: string, init: RequestInit) => net.net(String(url), init)));
     const point = await loadCaseContinuationPoint();
     // Inside the settle window the claim is refused: the owner is read first (Ugo 31/10), no model or embedding call.
-    expect(await point({ caseId: made.caseId, trigger: "customer_return", env })).toEqual({ status: "claim_refused" });
+    expect(await point({ caseId: made.caseId, trigger: "customer_return", env })).toMatchObject({ status: "claim_refused" });
     expect(net.calls.filter(call => call.url.includes("generativelanguage"))).toEqual([]);
     afterSettle();
     expect(await point({ caseId: made.caseId, trigger: "customer_return", env })).toEqual({ status: "queued" });
@@ -236,7 +236,7 @@ describe("actual continuation loader: real factory and authorizer, synthetic tra
     vi.stubGlobal("fetch", vi.fn((url: string, init: RequestInit) => net.net(String(url),init)));
     delete env.SAV_V2_RETURN_RULE_JSON;
     afterSettle(); // outside the settle window, so that only the missing rule can stop the run
-    expect(await (await loadCaseContinuationPoint())({ caseId: made.caseId, trigger: "customer_return", env })).not.toEqual({ status: "claim_refused" });
+    expect((await (await loadCaseContinuationPoint())({ caseId: made.caseId, trigger: "customer_return", env })).status).not.toBe("claim_refused");
     expect(net.calls.filter(call => call.url.includes("generativelanguage"))).toEqual([]);
     expect(await effectRows(made.caseId)).toEqual([]);
   });

@@ -45,6 +45,13 @@ describe("manual V2 qualification: one existing message, canonical guards", () =
     expect(p.relay).toHaveBeenCalledExactlyOnceWith(messageId); expect(p.continue).toHaveBeenCalledExactlyOnceWith(caseId);
     // No success or sent claim is inferred from a queued preparation.
   });
+  it("a skipped passage names its closed gate code; free text is never echoed", async () => {
+    const { p, request } = await confirmed();
+    p.continue.mockResolvedValue({ status: "skipped", reason: "ticket_owner_unverified", detail: "none" } as never);
+    expect(await manualQualification(request, env, p)).toEqual({ status: "attempted", caseId, ticketId: "202", outcome: "skipped", reason: "ticket_owner_unverified", detail: "none" });
+    p.continue.mockResolvedValue({ status: "skipped", reason: "Owner is Jane <jane@example.com>", detail: "a b" } as never);
+    expect(await manualQualification(request, env, p)).toEqual({ status: "attempted", caseId, ticketId: "202", outcome: "skipped" });
+  });
   it("human ownership or a different returned case never continues", async () => {
     const { p, request } = await confirmed(); p.relay.mockResolvedValue({ caseId, owner: "human" });
     expect(await manualQualification(request, env, p)).toMatchObject({ code: "relay_not_agent" }); expect(p.continue).not.toHaveBeenCalled();
