@@ -1,6 +1,7 @@
 import "server-only";
 import { sql } from "drizzle-orm";
 import { requireDb } from "@/db";
+import { readRuntimeTemporaryIncidents } from "@/lib/knowledge/temporary-incidents-runtime";
 import { admissionPolicyRevisionPort, type AdmissionPolicyRecord } from "./admission-runtime";
 import type { KnowledgeRef } from "./case-types";
 import type { PilotActiveSource, PilotProvenanceDeps } from "./pilot-passage-provenance";
@@ -85,6 +86,7 @@ export function caseProvenanceReaders(input: Readonly<{
 }>): PilotProvenanceDeps {
   const now = input.now ?? caseInvestigationClock;
   return {
+    readTemporaryIncidents: readRuntimeTemporaryIncidents,
     accessScope: caseAccessScopeConfigReader(input.env), currentPolicyRevision: casePolicyRevisionReader(input.readPolicyRecord, now),
     readActiveSource: caseActiveSourceReader({ ...(input.locale ? { locale: input.locale } : {}), ...(input.audience ? { audience: input.audience } : {}) }), now,
   };

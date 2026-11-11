@@ -40,7 +40,11 @@ export function listCaseInvestigationWaits(rows: readonly CaseInvestigationWaitR
     const since = Date.parse(wait.since), waitingMinutes = Number.isFinite(since) ? Math.max(0, Math.floor((now.getTime() - since) / 60_000)) : Number.MAX_SAFE_INTEGER;
     const refusal = wait.reason === "decision_refused" && progress.last?.outcome === "needs_review" ? classifyCaseDecisionRefusal(progress.last.rejections) : null;
     const diagnostic = describeCaseModelTransportDiagnostic(wait.diagnostic);
-    return [{ caseId, inputKey, caseVersion: wait.caseVersion, reason: wait.reason, since: wait.since, waitingMinutes, modelCalls: progress.modelCalls, problem: wait.problem ?? null, embeddingCalls: wait.embeddingCalls ?? null,
-      ...caseInvestigationWaitLabels[wait.reason], ...(diagnostic ? { label: `${diagnostic.label} ${diagnostic.detail}` } : {}), refusalNextStep: refusal ? caseDecisionNextStepLabels[refusal.nextStep] : null }];
+    const incident = wait.temporaryIncidentProblem ? { label: "Attente de vérification des informations temporaires.",
+      unblock: "Vérifier la lecture, l’approbation, le périmètre et la validité des informations temporaires. Les appels déjà consommés restent conservés.",
+      needsPerson: wait.temporaryIncidentProblem !== "read_failed" } : null;
+    return [{ caseId, inputKey, caseVersion: wait.caseVersion, reason: wait.reason, since: wait.since, waitingMinutes, modelCalls: progress.modelCalls,
+      problem: wait.temporaryIncidentProblem ? `temporary_incident_${wait.temporaryIncidentProblem}` : wait.problem ?? null, embeddingCalls: wait.embeddingCalls ?? null,
+      ...caseInvestigationWaitLabels[wait.reason], ...(diagnostic ? { label: `${diagnostic.label} ${diagnostic.detail}` } : {}), ...(incident ?? {}), refusalNextStep: refusal ? caseDecisionNextStepLabels[refusal.nextStep] : null }];
   }).sort((a, b) => Number(b.needsPerson) - Number(a.needsPerson) || b.waitingMinutes - a.waitingMinutes || a.caseId.localeCompare(b.caseId));
 }

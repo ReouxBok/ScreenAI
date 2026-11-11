@@ -17,6 +17,7 @@ import {
 import { caseV2EmbeddingSpend, caseV2ModelSpend, readCaseV2SpendPolicy, readCaseV2TransportPolicy } from "./investigation-v2-spend";
 import { pilotProvenanceGate, type PilotProvenanceDeps } from "./pilot-passage-provenance";
 import { readSavV2QualificationScope } from "./qualification-scope";
+import { readRuntimeTemporaryIncidents } from "@/lib/knowledge/temporary-incidents-runtime";
 
 /*
  * B (4/11, LOCAL and OFF): the concrete factory of the V2 investigation, for A's trigger and the wake. One real adapter per port, nothing
@@ -92,6 +93,7 @@ export function createCaseInvestigationV2Deps(input: CaseInvestigationV2Input): 
   const v1Qualify = caseInvestigationQualify({ readConfirmedContext: readConfirmedV1Context, adapterPolicy: input.adapterPolicy ?? (async () => null), readPolicyRecord, now,
     ...(input.approvedRules ? { approvedRules: input.approvedRules } : {}) });
   const deps: CaseInvestigationRuntimeDeps = {
+    temporaryIncidents: readRuntimeTemporaryIncidents,
     mode: "observe", holder: input.holder ?? "sav-v2-investigation", scope, now, leaseSeconds: input.leaseSeconds ?? 90,
     pauseState: casePauseState(caseV2PauseState(), input.env, now, input.caseAllowed), readTicketOwner, accessScope: provenance.accessScope, admissionPolicyRevision: provenance.currentPolicyRevision,
     qualify: caseInvestigationReturnAwareQualify(v1Qualify, { readPolicyRecord, now, ...(input.returnRule ? { returnRules: caseReturnContentRule(input.returnRule, now) } : {}) }),

@@ -6,6 +6,7 @@ import { createSavTestDb } from "../../../../test/sav-db";
 import {
   contentChunks, contentItems, contentVersions, savCaseCalls, savCaseEffectExecutions, savIntakeEffects, savIntakeExecutionPolicies, savIntakeExecutions, savIntakeRuns,
   savMailboxes, savMessages, savSyncState, savThreads, staffUsers, savKnowledgeActivations, activeKnowledge, knowledgeRevisions, reviewEvents,
+  knowledgeFamilies, knowledgeFamilyRevisions, knowledgeProjections,
 } from "@/db/schema";
 const state = vi.hoisted(() => ({ db: null as unknown }));
 vi.mock("@/db", () => ({ requireDb: () => { if (!state.db) throw Error("NO_DB_ALLOWED"); return state.db; } }));
@@ -22,7 +23,10 @@ import { savIntakeEvidenceContentHash } from "../intake/engine";
 import { SAV_INTAKE_MODEL_REVISION } from "../intake/model-readers";
 import { intakeRuntimeHash } from "../intake/runtime-contract";
 import { intakeSemanticInputHash, SAV_INTAKE_SEMANTIC_RECORD_REVISION } from "../intake/semantic-records";
-import { readCase } from "./case-store";
+import { readCase, listCaseEvents } from "./case-store";
+import { latestInvestigationInput } from "./investigation-runner";
+import { readCaseInvestigationProgress } from "./investigation-record";
+import { canonicalKnowledgeSchema } from "@/lib/knowledge/contracts";
 import type { CaseAdmissionQualification } from "./case-types";
 import { recordCaseAfterConfirmedIntake } from "./intake-boundary";
 import { SAV_CASE_ACCESS_SCOPE_REVISION } from "./investigation-access-scope";
@@ -240,6 +244,21 @@ describe("real adapters over the network double", () => {
 
 describe("the canonical runtime on the factory's real adapters (network double only)", () => {
   beforeEach(async () => { await seedCard(); await clearSpend(); });
+  it("factory→runtime→exact DB reader records approved incident provenance without an optional orphan port", async () => {
+    const now = new Date(Date.now() + 6 * 60000), familyId = randomUUID(), revisionId = randomUUID();
+    const doc = canonicalKnowledgeSchema.parse({ schemaVersion: 1, applicability: "sav_only", locale: "fr-FR", objective: "Connexion SYN", prerequisites: [], expectedResult: "Connexion", exceptions: [], escalation: "Revue humaine", steps: [{ id: "login.open", userLabel: "Ouvrir", objective: "Connexion", instruction: "Ouvrir la page de connexion", expectedResult: "Page affichée", prerequisites: [], exceptions: [], escalation: "", variants: [] }], temporaryIncident: { schemaVersion: 1, id: "syn-runtime-delay", revision: 1, title: "SYN délai", scope: { families: ["access"], productArea: "Connexion SYN" }, status: "active", knownSince: new Date(now.getTime() - 3600000).toISOString(), validUntil: new Date(now.getTime() + 86400000).toISOString(), approvedReply: "Un délai est connu de l’équipe.", fix: { level: "none", evidence: "" }, provenance: { source: "Déclaration synthétique", recordedAt: new Date(now.getTime() - 3600000).toISOString() } } });
+    await f.db.insert(knowledgeFamilies).values({ id: familyId, canonicalKey: "syn-runtime-family", title: "Connexion SYN", createdBy: "staff@example.invalid", approvedRevisionId: revisionId });
+    await f.db.insert(knowledgeFamilyRevisions).values({ id: revisionId, familyId, revision: 1, canonicalHash: "syn-runtime-hash", document: doc, reviewState: "approved", reviewedBy: "ugo@limova.ai", reviewedAt: new Date(now.getTime() - 60000) });
+    await f.db.insert(knowledgeProjections).values({ familyId, revisionId, surface: "sav", itemId: card.id, versionId: card.contentVersionId });
+    const mail = await v1Mail({ ownerEffect: true }), net = network(), built = createCaseInvestigationV2Deps(input(net));
+    if (!built.ok) throw Error(built.refusals.join(","));
+    expect(await runCaseInvestigationRuntime(mail.caseId, built.deps)).toMatchObject({ status: "recorded", outcome: "accepted", modelCalls: 1 });
+    const events = await listCaseEvents(mail.caseId), record = readCaseInvestigationProgress(events, latestInvestigationInput(events)!);
+    expect(record).toMatchObject({ state: "found", record: { decision: { temporaryIncidents: { scope: "bound", entries: [{ proof: { knowledgeId: card.id, contentVersionId: card.contentVersionId, familyId, canonicalRevisionId: revisionId, incidentId: "syn-runtime-delay" } }] } } } });
+    expect(net.calls.filter(call => call.url.endsWith(":generateContent"))).toHaveLength(1);
+    const sent = net.calls.find(call => call.url.endsWith(":generateContent"))!.body as { contents: { parts: { text: string }[] }[] };
+    expect(JSON.parse(sent.contents[0]!.parts[0]!.text)).toMatchObject({ temporaryIncidents: { entries: [{ proof: { familyId, canonicalRevisionId: revisionId, incidentId: "syn-runtime-delay" } }] } });
+  });
   it("an admitted access case: one embedding and one generation, both through the ledger and their own V2 budget, decision recorded", async () => {
     const mail = await v1Mail({ ownerEffect: true }), net = network();
     const built = createCaseInvestigationV2Deps(input(net));

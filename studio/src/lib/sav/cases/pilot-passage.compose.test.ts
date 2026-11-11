@@ -23,7 +23,10 @@ vi.mock("../intake/model-dispatch", async importOriginal => {
   const real = await importOriginal<Record<string, unknown>>();
   return Object.fromEntries(Object.entries(real).map(([name, value]) => [name, typeof value === "function" ? () => { throw Error(`MODEL_DISPATCH_FORBIDDEN:${name}`); } : value]));
 });
-import { savCaseEffectExecutions, savMailboxes, savMessages, savSyncState, savThreads, staffUsers } from "@/db/schema";
+import { savCaseEffectExecutions, savMailboxes, savMessages, savSyncState, savThreads, staffUsers, contentItems, contentVersions, knowledgeFamilies, knowledgeFamilyRevisions, knowledgeProjections } from "@/db/schema";
+import { canonicalKnowledgeSchema } from "@/lib/knowledge/contracts";
+import { readRuntimeTemporaryIncidents } from "@/lib/knowledge/temporary-incidents-runtime";
+import type { IncidentReader } from "./investigation-incidents-contract";
 import { encryptSavPayload } from "../crypto";
 import { readSavAgentPause } from "../intake/agent-pause";
 import { planSavIntake, savIntakeEvidenceContentHash } from "../intake/engine";
@@ -125,11 +128,11 @@ const refOf = (row: SavRetrievalCandidate): KnowledgeRef => ({ knowledgeId: row.
 const synScope = (over: Record<string, unknown> = {}) => ({ schema: SAV_CASE_ACCESS_SCOPE_REVISION, policyRevision: POLICY.revision, revision: "scope-syn-r1", family: "access", sources: [{ knowledgeId: LOGIN.id, contentVersionId: LOGIN.contentVersionId, use: "answer" }], ...over });
 let scope: unknown = synScope(), activeSource: PilotActiveSource | null | "throw" = null;
 const provenanceDeps: PilotProvenanceDeps = { accessScope: async () => scope, currentPolicyRevision: async () => POLICY.revision,
-  readActiveSource: async () => { if (activeSource === "throw") throw Error("SYNTHETIC_READ_FAILED"); return activeSource; }, now: () => SYN_NOW };
+  readActiveSource: async () => { if (activeSource === "throw") throw Error("SYNTHETIC_READ_FAILED"); return activeSource; }, readTemporaryIncidents: readRuntimeTemporaryIncidents, now: () => SYN_NOW };
 const provenance = pilotProvenanceGate(provenanceDeps);
 const backend: SavRetrievalBackend = { readRevision: async () => "kb-syn-r1", search: async queries => queries.map(query => /connexion/i.test(query) ? [LOGIN] : []) };
 const realLedger: CaseCallLedgerPort = { reserve: reserveSavCaseCall, markDispatched: markSavCaseCallDispatched, settle: settleSavCaseCall, release: releaseSavCaseCall };
-async function investigate(caseId: string) {
+async function investigate(caseId: string, temporaryIncidents?: IncidentReader) {
   const now = () => new Date(Date.now() + 6 * 60_000);
   const provider = async (request: CaseInvestigationModelRequest) => {
     modelCalls += 1;
@@ -151,7 +154,7 @@ async function investigate(caseId: string) {
       return latest ? { admission: { policy: POLICY, qualification: { requests: snapshot.body.openRequests.filter(row => row.status === "open").map(row => ruled(row.id)), identity: CONFIRMED, crmContext: "complete" as const, teamSignals: [] } }, sourceRef: latest.sourceRef } : null;
     },
   });
-  return runCaseInvestigation(caseId, "observe", { ...ports, accessScope: async () => scope });
+  return runCaseInvestigation(caseId, "observe", { ...ports, accessScope: async () => scope, ...(temporaryIncidents ? { temporaryIncidents } : {}) });
 }
 async function proposalOf(caseId: string, messageId: string): Promise<CaseReplyProposal> {
   const events = await listCaseEvents(caseId), read = readCaseInvestigationProgress(events, latestInvestigationInput(events)!);
@@ -175,9 +178,9 @@ async function agentCase() {
   expect(relayed.owner).toBe("agent");
   return { ...mail, caseId: relayed.caseId };
 }
-async function queued() {
+async function queued(temporaryIncidents?: IncidentReader) {
   const mail = await agentCase();
-  expect(await investigate(mail.caseId)).toMatchObject({ status: "recorded", outcome: "accepted" });
+  expect(await investigate(mail.caseId, temporaryIncidents)).toMatchObject({ status: "recorded", outcome: "accepted" });
   const proposal = await proposalOf(mail.caseId, mail.messageId);
   const submitted = await submitCaseReplyProposal(proposal, storeDeps());
   if (!submitted.ok) throw Error(`SUBMIT_REFUSED:${submitted.code}`);
@@ -525,6 +528,27 @@ describe("provenance of a pilot reply, recomputed from the recorded decision: no
     expect(result).toMatchObject({ reason: "SAV_CASE_EFFECT_HOLD_PROVENANCE_UNPROVEN" });
     expect(sends).toBe(0);
     expect((await getExecutionEffects(mail.replyExecutionId)).find(effect => effect.kind === "reply_send")).toMatchObject({ state: "planned" });
+  });
+  it.each(["withdraw", "approve"])("incident transition %s after marker is re-read by the REAL driver before SDK: 0 mail, effect planned", async transition => {
+    const original = { id: LOGIN.id, contentVersionId: LOGIN.contentVersionId }, familyId = randomUUID(), revisionId = randomUUID();
+    LOGIN.id = randomUUID(); LOGIN.contentVersionId = randomUUID(); scope = synScope();
+    try {
+      const doc = canonicalKnowledgeSchema.parse({ schemaVersion: 1, objective: "Connexion SYN", applicability: "sav_only", locale: "fr-FR", prerequisites: [], expectedResult: "Connexion", exceptions: [], escalation: "Revue humaine", steps: [{ id: "login.open", userLabel: "Ouvrir", objective: "Connexion", instruction: "Ouvrir la page de connexion", expectedResult: "Page affichée", prerequisites: [], exceptions: [], escalation: "", variants: [] }], temporaryIncident: { schemaVersion: 1, id: "syn-last-guard", revision: 1, title: "SYN délai", scope: { families: ["access"], productArea: "Connexion SYN" }, status: "active", knownSince: "2026-11-01T00:00:00Z", validUntil: "2026-11-20T00:00:00Z", approvedReply: "Un délai est connu de l’équipe.", fix: { level: "none", evidence: "" }, provenance: { source: "Déclaration synthétique", recordedAt: "2026-11-01T00:00:00Z" } } });
+      await f.db.insert(contentItems).values({ id: LOGIN.id, slug: `syn-${LOGIN.id}`, type: "article", title: "Connexion SYN", ownerEmail: "staff@example.invalid" });
+      await f.db.insert(contentVersions).values({ id: LOGIN.contentVersionId, itemId: LOGIN.id, version: 1, bodyMarkdown: "Connexion SYN", metadata: { intents: [], limovaPaths: [], prerequisites: [], expectedResult: "Connexion", troubleshooting: "" }, authorEmail: "staff@example.invalid", changeNote: "SYN" });
+      await f.db.insert(knowledgeFamilies).values({ id: familyId, canonicalKey: `syn-${familyId}`, title: "Connexion SYN", createdBy: "staff@example.invalid", approvedRevisionId: revisionId });
+      await f.db.insert(knowledgeFamilyRevisions).values({ id: revisionId, familyId, revision: 1, canonicalHash: "syn-last-guard", document: doc, reviewState: transition === "approve" ? "pending" : "approved", reviewedBy: "ugo@limova.ai", reviewedAt: new Date("2026-11-02T00:00:00Z") });
+      await f.db.insert(knowledgeProjections).values({ familyId, revisionId, surface: "sav", itemId: LOGIN.id, versionId: LOGIN.contentVersionId });
+      const mail = await queued(readRuntimeTemporaryIncidents);
+      expect(await readPilotReplyProvenance(mail.proposal, provenanceDeps)).toMatchObject({ status: "proven" });
+      const result = await executeIntakePass(mail.replyExecutionId, options, { afterMarker: async () => {
+        if (transition === "approve") await f.db.update(knowledgeFamilyRevisions).set({ reviewState: "approved" }).where(eq(knowledgeFamilyRevisions.id, revisionId));
+        else await f.db.update(knowledgeFamilies).set({ approvedRevisionId: null }).where(eq(knowledgeFamilies.id, familyId));
+      } }, driver());
+      expect(result).toMatchObject({ reason: "SAV_CASE_EFFECT_HOLD_PROVENANCE_UNPROVEN" });
+      expect(sends).toBe(0);
+      expect((await getExecutionEffects(mail.replyExecutionId)).find(effect => effect.kind === "reply_send")).toMatchObject({ state: "planned" });
+    } finally { Object.assign(LOGIN, original); }
   });
   it.each<[number, string]>([[10, "fresh"], [75, "revalidation_due"], [90, "revalidation_due"]])("a check %i days old is evaluated by the existing policy, and the exact date read is what comes out", async (days, verification) => {
     const mail = await proposed(), verifiedAt = daysBefore(days);

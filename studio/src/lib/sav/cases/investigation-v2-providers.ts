@@ -133,6 +133,7 @@ export function caseInvestigationPrompt(request: CaseInvestigationModelRequest) 
   const payload = { caseVersion: request.snapshot.version, purpose: request.purpose,
     openRequests: body.openRequests.filter(row => row.status === "open"), facts: body.facts, questions: body.questions, trials: body.trials,
     ...(request.customerReportedLogin ? { customerReportedLogin: request.customerReportedLogin } : {}),
+    ...(request.temporaryIncidents?.entries.length ? { temporaryIncidents: request.temporaryIncidents } : {}),
     knowledge: cards, coverage: request.coverage, previousRejections: request.feedback, closure: request.closure };
   return { instruction, schema: request.purpose === "resolution_check" ? CLOSURE_JSON_SCHEMA : DECISION_JSON_SCHEMA, payload };
 }

@@ -1,5 +1,27 @@
 import type { CaseModelTransportDiagnostic } from "./investigation-transport-diagnostic";
 import type { CaseInvestigationModelRequest, CaseInvestigationPorts } from "./investigation-runner";
+import { decryptSavPayload, encryptSavPayload, savContentHash } from "../crypto";
+
+const RECEIPT = "sav-incident-call.v1";
+/** Server-authenticated nested receipt: model JSON can never supply this authority. Never unwrap recursively. */
+function boundOutput(output: unknown, request: CaseInvestigationModelRequest): unknown {
+  return { savIncidentCallReceipt: encryptSavPayload({ revision: RECEIPT, callKey: request.callKey, purpose: request.purpose, fingerprint: request.temporaryIncidentContext!.fingerprint, outputHash: savContentHash(output) }), output };
+}
+function knownOutput(output: unknown, request: CaseInvestigationModelRequest): { ok: true; output: unknown } | { ok: false } {
+  const context = request.temporaryIncidentContext;
+  if (output && typeof output === "object" && Object.hasOwn(output, "savIncidentCallReceipt")) {
+    try {
+      const envelope = output as { savIncidentCallReceipt: string; output: unknown };
+      if (Object.keys(envelope).sort().join(",") !== "output,savIncidentCallReceipt" || typeof envelope.savIncidentCallReceipt !== "string") return { ok: false };
+      const proof = decryptSavPayload<{ revision: string; callKey: string; purpose: string; fingerprint: string; outputHash: string }>(envelope.savIncidentCallReceipt);
+      return context && proof.revision === RECEIPT && proof.callKey === request.callKey && proof.purpose === request.purpose
+        && proof.fingerprint === context.fingerprint && proof.outputHash === savContentHash(envelope.output)
+        ? { ok: true, output: envelope.output } : { ok: false };
+    } catch { return { ok: false }; }
+  }
+  // Before incident support the ledger held plain model output: reusable only while no incident applies now.
+  return context?.applicable ? { ok: false } : { ok: true, output };
+}
 
 /*
  * The runner's `callModel` on pole A's V2 call ledger (`reserveSavCaseCall`, contract v9 §6). Local and OFF: nothing
@@ -51,7 +73,11 @@ export function caseCallLedgerAdapter(options: CaseCallLedgerAdapterOptions): Ca
     const reservation = await options.ledger.reserve({ callKey: request.callKey, subjectKey: request.subjectKey, caseId: request.caseId,
       caseVersion: request.caseVersion, purpose: request.purpose, holder: options.holder, leaseSeconds: options.leaseSeconds, maxPerSubject: options.maxPerSubject });
     switch (reservation.status) {
-      case "known": return reservation.result;
+      case "known": {
+        if (reservation.result.status !== "ok") return reservation.result;
+        const known = knownOutput(reservation.result.output, request);
+        return known.ok ? { status: "ok", output: known.output } : { status: "context_unproven" };
+      }
       case "uncertain": return { status: "failed", uncertain: true };
       // Another holder has the key under a live lease: nothing was sent by this run, which tries again later.
       case "busy": return { status: "deferred" };
@@ -80,7 +106,9 @@ export function caseCallLedgerAdapter(options: CaseCallLedgerAdapterOptions): Ca
     }
     let result: ProviderResult;
     try { result = await options.provider(request); } catch { result = { status: "failed", uncertain: true }; }
-    await options.ledger.settle({ ...held, result });
+    const stored = result.status === "ok" && request.temporaryIncidentContext
+      ? { ...result, output: boundOutput(result.output, request) } : result;
+    await options.ledger.settle({ ...held, result: stored });
     return result;
   };
 }
