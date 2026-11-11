@@ -37,7 +37,16 @@ const notSearchedLabels: Record<string, string> = {
 };
 export type CasePilotKnowledge = { label: string; gap: boolean };
 function describeCoverage(row: { status?: unknown; knowledge?: unknown; limitations?: unknown }): CasePilotKnowledge {
-  if (row.status === "covered") { const n = Array.isArray(row.knowledge) ? row.knowledge.length : 0; return { label: `Fiche trouvée${n > 1 ? ` (${n})` : ""}`, gap: false }; }
+  if (row.status === "covered") {
+    const n = Array.isArray(row.knowledge) ? row.knowledge.length : 0;
+    // Scope-first knowledge (11/11): the cards left out for this request, by fixed code (`investigation-knowledge-ranking.ts`).
+    const codes = Array.isArray(row.limitations) ? row.limitations.filter((code): code is string => typeof code === "string") : [];
+    const low = codes.filter(code => code.startsWith("knowledge_dropped:low_relevance:")).length, budget = codes.filter(code => code.startsWith("knowledge_dropped:input_budget:")).length;
+    const added = codes.filter(code => code.startsWith("block_scope_source_added:")).length;
+    const notes = [low ? `${low} fiche(s) hors bloc écartée(s) : pertinence faible` : null, budget ? `${budget} fiche(s) hors bloc écartée(s) : taille du contexte` : null,
+      added ? `${added} fiche(s) du bloc ajoutée(s)` : null].filter(Boolean);
+    return { label: `Fiche trouvée${n > 1 ? ` (${n})` : ""}${notes.length ? ` · ${notes.join(" · ")}` : ""}`, gap: false };
+  }
   if (row.status === "no_applicable_knowledge") return { label: "Aucune fiche publiée applicable : vrai manque de la base de connaissances", gap: true };
   if (row.status === "not_searched") {
     // Records written before d71b077 carry no limitations: the reason is unknown, still not a gap.

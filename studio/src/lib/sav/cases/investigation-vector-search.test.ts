@@ -166,3 +166,21 @@ describe("V2 budgeted search on the index: the paid vectors are searched, the V1
     expect(read).toMatchObject({ status: "ready", selection: { cards: [], coverage: [{ requestId: "r1", status: "not_searched", limitations: expect.arrayContaining(["knowledge_source_incomplete"]) }, { requestId: "r2" }] } });
   });
 });
+
+describe("scope-first knowledge (11/11): the exact read of a scope source, without any embedding", () => {
+  it("the active exact version is read with the search's fields; another version, an inactive card or a non-id is absent", async () => {
+    const alpha = await seed("connecteur alpha", { axis: 0 }), inactive = await seed("inactive", { active: false }), stale = await seed("stale", { verifiedAt: new Date("2026-01-01") });
+    // A second, never activated version of the same card: never read in place of the active one.
+    const [draft] = await f.db.insert(contentVersions).values({ itemId: alpha.item.id, version: 2, bodyMarkdown: "Brouillon synthétique", metadata: alpha.version.metadata,
+      changeNote: "Fixture isolée", authorEmail: "staff@example.invalid" }).returning();
+    const index = createSavKnowledgeVectorIndex({ now });
+    const read = await index.readExact([{ knowledgeId: alpha.item.id, contentVersionId: alpha.version.id }, { knowledgeId: alpha.item.id, contentVersionId: draft!.id },
+      { knowledgeId: inactive.item.id, contentVersionId: inactive.version.id }, { knowledgeId: stale.item.id, contentVersionId: stale.version.id }, { knowledgeId: "not-a-uuid", contentVersionId: "x" }]);
+    expect(read.map(card => [card.id, card.contentVersionId])).toEqual([[alpha.item.id, alpha.version.id]]);
+    const searched = (await index.searchByVectors(["Connecteur alpha"], [unit(0)], 24))[0]!.find(card => card.id === alpha.item.id)!;
+    expect(read[0]).toEqual({ ...searched, semanticScore: null });
+    expect(await index.readExact([])).toEqual([]);
+    await expect(index.readExact(Array.from({ length: 201 }, () => ({ knowledgeId: alpha.item.id, contentVersionId: alpha.version.id })))).rejects.toThrow("SAV_RETRIEVAL_DB_BUDGET");
+    expect(state.embed).not.toHaveBeenCalled();
+  });
+});

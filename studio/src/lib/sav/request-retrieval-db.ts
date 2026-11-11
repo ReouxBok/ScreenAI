@@ -9,6 +9,20 @@ function rowsOf(result: unknown): Record<string, unknown>[] {
 }
 
 export const SAV_RETRIEVAL_EMBEDDING_DIMENSION = 768;
+const RESOLUTION = sql`((version.metadata -> 'resolution') || jsonb_build_object(
+          'prerequisites', COALESCE(version.metadata -> 'prerequisites', '[]'::jsonb),
+          'expectedResult', COALESCE(version.metadata ->> 'expectedResult', ''),
+          'troubleshooting', COALESCE(version.metadata ->> 'troubleshooting', '')
+        ))`;
+// Publishing another version must not renew the active version's proof.
+const VERIFICATION = sql`CASE WHEN item.verified_at IS NULL THEN NULL ELSE
+          COALESCE(version_review.verified_at, CASE
+            WHEN item.published_version_id = activation.version_id THEN LEAST(item.verified_at, activation.activated_at)
+            ELSE LEAST(item.verified_at, activation.activated_at, version.created_at)
+          END) END`;
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+/** At most the scope's own bound of sources per exact read. */
+export const SAV_RETRIEVAL_EXACT_READ_MAX = 200;
 const withinBudget = (queries: readonly string[], limit: number) =>
   queries.length <= SAV_RETRIEVAL_LIMITS.queriesPerAttempt && Number.isInteger(limit) && limit >= 1 && limit <= SAV_RETRIEVAL_LIMITS.candidatesPerQuery;
 const validVectors = (queries: readonly string[], vectors: readonly (readonly number[])[]) =>
@@ -46,17 +60,7 @@ export function createSavKnowledgeVectorIndex(options: { locale?: string; audien
         const terms = savRetrievalTokens(query).slice(0, 40);
         const fullTextQuery = terms.map(term => `"${term}"`).join(" OR ");
         const half = Math.ceil(limit / 2);
-        const resolution = sql`((version.metadata -> 'resolution') || jsonb_build_object(
-          'prerequisites', COALESCE(version.metadata -> 'prerequisites', '[]'::jsonb),
-          'expectedResult', COALESCE(version.metadata ->> 'expectedResult', ''),
-          'troubleshooting', COALESCE(version.metadata ->> 'troubleshooting', '')
-        ))`;
-        // Publishing another version must not renew the active version's proof.
-        const verification = sql`CASE WHEN item.verified_at IS NULL THEN NULL ELSE
-          COALESCE(version_review.verified_at, CASE
-            WHEN item.published_version_id = activation.version_id THEN LEAST(item.verified_at, activation.activated_at)
-            ELSE LEAST(item.verified_at, activation.activated_at, version.created_at)
-          END) END`;
+        const resolution = RESOLUTION, verification = VERIFICATION;
         const response = await db.execute(sql`
           WITH scored AS (
             SELECT item.id, version.id AS "contentVersionId", activation.title AS title, item.slug AS source,
@@ -99,6 +103,48 @@ export function createSavKnowledgeVectorIndex(options: { locale?: string; audien
           sourceTooLarge: row.sourceTooLarge === true,
           availability: { active: true, published: true, indexed: true, archived: false, aiEnabled: true, locale: String(row.locale), audience: String(row.audience) },
         }));
+      }));
+    },
+    /**
+     * Scope-first knowledge (11/11): these exact cards at their ACTIVE version, with the search's own filters (SAV article, published,
+     * AI enabled, locale, audience, indexed, check date within 90 days), without any embedding. A pair whose version is not the active
+     * one is absent: a stale version is never read. Validity (resolution, expiry) is still judged by the caller.
+     */
+    async readExact(refs: readonly { knowledgeId: string; contentVersionId: string }[]): Promise<SavRetrievalCandidate[]> {
+      if (refs.length > SAV_RETRIEVAL_EXACT_READ_MAX) throw new Error("SAV_RETRIEVAL_DB_BUDGET");
+      const wanted = refs.filter(ref => UUID.test(ref.knowledgeId) && UUID.test(ref.contentVersionId));
+      if (!wanted.length) return [];
+      const pairs = sql.join(wanted.map(ref => sql`(${ref.knowledgeId}::uuid, ${ref.contentVersionId}::uuid)`), sql`, `);
+      const response = await db.execute(sql`
+        SELECT item.id, version.id AS "contentVersionId", activation.title AS title, item.slug AS source,
+          CASE WHEN octet_length(version.body_markdown) <= ${SAV_RETRIEVAL_LIMITS.sourceBytes} THEN version.body_markdown ELSE '' END AS content,
+          ${VERIFICATION} AS "verifiedAt", item.locale,
+          CASE WHEN octet_length(${RESOLUTION}::text) <= ${SAV_RETRIEVAL_LIMITS.sourceBytes} THEN ${RESOLUTION} ELSE NULL END AS resolution,
+          (octet_length(version.body_markdown) > ${SAV_RETRIEVAL_LIMITS.sourceBytes} OR octet_length(COALESCE(${RESOLUTION}::text, '')) > ${SAV_RETRIEVAL_LIMITS.sourceBytes}) AS "sourceTooLarge",
+          COALESCE(version.metadata -> 'resolution' ->> 'audience', 'support') AS audience
+        FROM content_items item
+        JOIN sav_knowledge_activations activation ON activation.item_id = item.id
+        JOIN content_versions version ON version.id = activation.version_id AND version.item_id = item.id
+        LEFT JOIN LATERAL (
+          SELECT max(event.created_at) AS verified_at FROM review_events event
+          WHERE event.version_id = version.id AND event.item_id = item.id
+            AND event.action IN ('approved', 'emergency_published')
+        ) version_review ON TRUE
+        WHERE (item.id, version.id) IN (VALUES ${pairs})
+          AND EXISTS (SELECT 1 FROM content_chunks chunk WHERE chunk.item_id = item.id AND chunk.version_id = activation.version_id)
+          AND item.agent_key = 'sav' AND item.slug <> 'sav-master-playbook' AND item.type = 'article' AND item.status <> 'archived'
+          AND item.ai_enabled = true AND item.published_version_id IS NOT NULL AND item.locale = ${locale}
+          AND COALESCE(version.metadata -> 'resolution' ->> 'audience', 'support') = ${audience}
+          AND ${VERIFICATION} >= ${new Date(now.getTime() - 90 * 86_400_000).toISOString()}::timestamptz
+          AND ${VERIFICATION} <= ${now.toISOString()}::timestamptz
+          AND item.verified_at <= ${now.toISOString()}::timestamptz
+      `);
+      return rowsOf(response).map((row): SavRetrievalCandidate => ({
+        id: String(row.id), contentVersionId: String(row.contentVersionId), title: String(row.title), source: String(row.source), content: String(row.content),
+        verifiedAt: row.verifiedAt ? new Date(String(row.verifiedAt)).toISOString() : null, semanticScore: null,
+        resolution: row.resolution && typeof row.resolution === "object" ? row.resolution as SavRetrievalCandidate["resolution"] : null,
+        sourceTooLarge: row.sourceTooLarge === true,
+        availability: { active: true, published: true, indexed: true, archived: false, aiEnabled: true, locale: String(row.locale), audience: String(row.audience) },
       }));
     },
   };
