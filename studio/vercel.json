@@ -14,22 +14,26 @@
       "codex/ugo/**": false
     }
   },
-  "crons": [
-    {
+  "schedules": {
+    "memory-retention": {
+      "schedule": "17 3 * * *",
       "path": "/api/cron/memory-retention",
-      "schedule": "17 3 * * *"
+      "requestMethod": "GET"
     },
-    {
+    "gmail-watch-renew": {
+      "schedule": "11 4 * * *",
       "path": "/api/cron/gmail-watch-renew",
-      "schedule": "11 4 * * *"
+      "requestMethod": "GET"
     },
-    {
+    "sav-reconcile": {
+      "schedule": "*/5 * * * *",
       "path": "/api/cron/sav-reconcile",
-      "schedule": "*/5 * * * *"
+      "requestMethod": "GET"
     },
-    {
+    "sav-monitor": {
+      "schedule": "2-59/5 * * * *",
       "path": "/api/cron/sav-monitor",
-      "schedule": "2-59/5 * * * *"
+      "requestMethod": "GET"
     }
-  ]
+  }
 }
