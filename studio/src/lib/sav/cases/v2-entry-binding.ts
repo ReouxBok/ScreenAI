@@ -1,6 +1,15 @@
 export type CaseContinuationTrigger = "customer_return" | "relay" | "sweep";
 /** Idempotent and safe to call again for one case: it stops by itself on a stale admission, a sensitive case, a pause or an owner who is not V2's. A failure throws. */
-export type CaseContinuationPoint = (input: { caseId: string; trigger: CaseContinuationTrigger; env: Record<string, string | undefined> }) => Promise<{ status: string }>;
+export type CaseContinuationReport = { status: string; reason?: string; detail?: string };
+export type CaseContinuationPoint = (input: { caseId: string; trigger: CaseContinuationTrigger; env: Record<string, string | undefined> }) => Promise<CaseContinuationReport>;
+
+const CODE = /^[a-z0-9_]{1,80}$/, DETAIL = /^[a-z0-9_,.:-]{1,160}$/;
+/** Closed codes only (never client, provider or CRM text): why a passage stopped, for the operator and the logs. */
+export function caseContinuationReport(status: string, source: { reason?: unknown; detail?: unknown; problem?: unknown }): CaseContinuationReport {
+  const reason = typeof source.reason === "string" ? source.reason : typeof source.problem === "string" ? source.problem : undefined;
+  const detail = typeof source.detail === "string" ? source.detail : undefined;
+  return { status, ...(reason && CODE.test(reason) ? { reason } : {}), ...(detail && DETAIL.test(detail) ? { detail } : {}) };
+}
 
 export async function loadCaseContinuationPoint(): Promise<CaseContinuationPoint> {
   const { createCaseInvestigationToReplyPlan } = await import("./investigation-v2-factory");
@@ -26,6 +35,9 @@ export async function loadCaseContinuationPoint(): Promise<CaseContinuationPoint
     });
     if (!binding.ok) throw Error("SAV_V2_" + (("refusals" in binding ? binding.refusals : binding.missing)[0] ?? "BINDING_INVALID").replace(/[^a-z0-9]/gi,"_").toUpperCase());
     const result = await binding.run(caseId);
-    return { status: result.reply?.status ?? result.investigation.status };
+    const report = result.reply ? caseContinuationReport(result.reply.status, result.reply as Record<string, unknown>)
+      : caseContinuationReport(result.investigation.status, result.investigation as Record<string, unknown>);
+    console.info("sav_v2_continuation_report", { caseId, ...report });
+    return report;
   };
 }

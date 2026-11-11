@@ -14,7 +14,7 @@ export type ManualQualificationPorts = {
   target(messageId: string): Promise<Target | null>;
   eligible(messageId: string, target: Target): Promise<boolean>;
   relay(messageId: string): Promise<{ caseId?: string; owner?: string }>;
-  continue(caseId: string): Promise<{ status: string }>;
+  continue(caseId: string): Promise<{ status: string; reason?: string; detail?: string }>;
 };
 /** One explicit operator passage, never a sweep or a substitute model prompt. A preview is read-only.
  * Every live gate is rechecked on run; the canonical relay/continuation keep their own locks and receipts.
@@ -37,5 +37,9 @@ export async function manualQualification(raw: unknown, env: Record<string, stri
   if (current.mode !== "qualification" || current.configHash !== expected.scopeHash || await ports.paused() || !await ports.eligible(request.messageId, target)) return { status: "refused", code: "gate_changed" } as const;
   // The continuation re-reads the owner, admission, pauses, expiry and budget before every cost.
   const result = await ports.continue(target.caseId);
-  return { status: "attempted", caseId: target.caseId, ticketId: target.ticketId, outcome: /^[a-z0-9_]{1,80}$/.test(result.status) ? result.status : "unknown" } as const;
+  // Closed codes only: why the passage stopped (a skip names its gate), never client, provider or CRM text.
+  const reason = typeof result.reason === "string" && /^[a-z0-9_]{1,80}$/.test(result.reason) ? result.reason : undefined;
+  const detail = typeof result.detail === "string" && /^[a-z0-9_,.:-]{1,160}$/.test(result.detail) ? result.detail : undefined;
+  return { status: "attempted", caseId: target.caseId, ticketId: target.ticketId, outcome: /^[a-z0-9_]{1,80}$/.test(result.status) ? result.status : "unknown",
+    ...(reason ? { reason } : {}), ...(detail ? { detail } : {}) } as const;
 }
