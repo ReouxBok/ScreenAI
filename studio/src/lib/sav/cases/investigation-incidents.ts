@@ -1,12 +1,12 @@
 import { assessSavKnowledgeValidity, type SavRetrievalCandidate } from "../request-retrieval";
-import { caseAccessSourceProblem, type CaseAccessScope } from "./investigation-access-scope";
+import { caseAccessSourceProblem, type CaseBlockScope } from "./investigation-access-scope";
 import type { CaseKnowledgeCoverage } from "./decision-contract";
 import type { CaseSnapshot } from "./case-types";
 import { incidentContext, incidentContextSchema, type IncidentBinding, type IncidentContext, type IncidentReader } from "./investigation-incidents-contract";
 
 /** Only an exact already-retrieved ANSWER source for the admitted open request establishes the projection lookup. */
 export function caseIncidentBindings(snapshot: CaseSnapshot, cards: SavRetrievalCandidate[], coverage: CaseKnowledgeCoverage[] | null,
-  accessScope: CaseAccessScope | null | undefined, locale: string, audience: string, now: Date): IncidentBinding[] {
+  accessScope: CaseBlockScope | null | undefined, locale: string, audience: string, now: Date): IncidentBinding[] {
   if (!accessScope || !coverage) return [];
   return coverage.flatMap(row => {
     const request = snapshot.body.openRequests.find(request => request.id === row.requestId && request.status === "open");

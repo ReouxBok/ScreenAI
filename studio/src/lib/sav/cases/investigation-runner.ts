@@ -1,9 +1,10 @@
 import type { CaseModelTransportDiagnostic } from "./investigation-transport-diagnostic";
 import type { SavRetrievalCandidate } from "../request-retrieval";
-import { SAV_CASE_HOLDS_KEEPING_TIMERS, type CaseEvent, type CaseSnapshot, type SourceRef } from "./case-types";
+import { SAV_CASE_ACCESS_BLOCK_ID, SAV_CASE_HOLDS_KEEPING_TIMERS, type CaseEvent, type CaseSnapshot, type SourceRef } from "./case-types";
 import { buildCaseDecisionContext, type CaseDecisionContextProblem } from "./decision-context";
-import { caseAccessScopeStamp, readCaseAccessScope, type CaseAccessScope, type CaseAccessScopeStamp } from "./investigation-access-scope";
+import { caseAccessScopeStamp, readCaseAccessScope, type CaseAccessScopeStamp, type CaseBlockScope } from "./investigation-access-scope";
 import { caseAdmissionStatus } from "./admission-policy";
+import { caseOpenBlockId } from "./case-blocks";
 import type { CaseDecisionRejection, CaseDecisionValidation } from "./decision-contract";
 import { caseDecisionRefusalKinds, classifyCaseDecisionRefusal, type CaseDecisionRefusal, type CaseDecisionRefusalKind } from "./decision-recovery";
 import { caseModelLoginHistory, validateCaseDecision } from "./decision-validator";
@@ -238,6 +239,8 @@ export type CaseInvestigationTicketOwner = "v2" | "human" | "none" | "unknown";
 export type CaseInvestigationOwnerStop = { reason: "ticket_owner_human" | "ticket_owner_unverified"; detail: string };
 
 export type CaseInvestigationSkipReason = CaseInvestigationGateReason | "no_customer_input" | CaseInvestigationOwnerStop["reason"] | "pilot_family_not_access" | "access_scope_missing"
+  /** Treatment blocks (11/11): the case's block (other than Access) has no valid scope for the policy in force, or one of another family. */
+  | "block_scope_missing"
   | "admission_not_current_input";
 
 /** Fail closed: only a read that answers the V2 owner lets the run go on. */
@@ -332,14 +335,25 @@ export async function runCaseInvestigation(caseId: string, mode: CaseInvestigati
   if (!inputKey) return { status: "skipped", caseId, caseVersion, reason: "no_customer_input", modelCalls: 0 };
   // Pilot ACCÈS (ROOT 3/11): `access` is the only admissible family, whatever the policy admits, and its sources are never
   // widened; then no approved scope for the policy in force, no search (the scope is the proof its answers stay low risk).
-  let accessScope: CaseAccessScope | undefined;
+  let accessScope: CaseBlockScope | undefined;
   if (ports.accessScope) {
     if (!caseAdmissionNamesLatestInput(snapshot, events)) return { status: "skipped", caseId, caseVersion, reason: "admission_not_current_input", modelCalls: 0 };
-    const others = [...new Set(snapshot.body.openRequests.filter(row => row.status === "open" && row.family !== "access").map(row => row.family))].sort();
-    if (others.length) return { status: "skipped", caseId, caseVersion, reason: "pilot_family_not_access", detail: others.join(","), modelCalls: 0 };
-    const scope = await readCaseAccessScope(() => ports.accessScope!(), policyRevision);
-    if (!scope.ok) return { status: "skipped", caseId, caseVersion, reason: "access_scope_missing", detail: scope.problem, modelCalls: 0 };
-    accessScope = scope.scope;
+    // Treatment blocks (11/11): a case whose open requests all belong to ONE other block is checked against that block's own scope, of its
+    // own family. Anything else (Access, no request, a request without a block, two blocks) keeps the Access pilot's checks, unchanged.
+    const blockId = caseOpenBlockId(snapshot);
+    if (blockId !== null && blockId !== SAV_CASE_ACCESS_BLOCK_ID) {
+      const scope = await readCaseAccessScope(() => ports.accessScope!(), policyRevision, blockId);
+      if (!scope.ok) return { status: "skipped", caseId, caseVersion, reason: "block_scope_missing", detail: `${blockId}:${scope.problem}`, modelCalls: 0 };
+      if (snapshot.body.openRequests.some(row => row.status === "open" && row.family !== scope.scope.family))
+        return { status: "skipped", caseId, caseVersion, reason: "block_scope_missing", detail: `${blockId}:scope_family_mismatch`, modelCalls: 0 };
+      accessScope = scope.scope;
+    } else {
+      const others = [...new Set(snapshot.body.openRequests.filter(row => row.status === "open" && row.family !== "access").map(row => row.family))].sort();
+      if (others.length) return { status: "skipped", caseId, caseVersion, reason: "pilot_family_not_access", detail: others.join(","), modelCalls: 0 };
+      const scope = await readCaseAccessScope(() => ports.accessScope!(), policyRevision);
+      if (!scope.ok) return { status: "skipped", caseId, caseVersion, reason: "access_scope_missing", detail: scope.problem, modelCalls: 0 };
+      accessScope = scope.scope;
+    }
   }
 
   const lease = await ports.claim(caseId, caseVersion);

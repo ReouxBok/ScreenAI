@@ -383,9 +383,11 @@ function validate(input: unknown, context: CaseDecisionValidationContext, now: D
     else if (status.get(requestId) !== "open") reject("request_not_open", path, status.get(requestId));
   };
   // Pilot ACCÈS (ROOT 3/11): `access` is the only admissible family; a proposal may name a sensitive family (then only a
-  // handoff is allowed), never another ordinary one, which would leave the pilot's scope.
+  // handoff is allowed), never another ordinary one, which would leave the pilot's scope. Treatment blocks (11/11): the same rule
+  // with the family of the block's own scope; no scope (null) keeps `access`, so a request of another block is still refused.
+  const pilotFamily = context.accessScope?.family ?? "access";
   if (context.accessScope !== undefined) proposal.understanding.requests.forEach((request, index) => {
-    if (request.family !== "access" && !isSensitiveCaseFamily(request.family)) reject("pilot_family_out_of_scope", `understanding.requests.${index}.family`, request.family);
+    if (request.family !== pilotFamily && !isSensitiveCaseFamily(request.family)) reject("pilot_family_out_of_scope", `understanding.requests.${index}.family`, request.family);
   });
 
   const sensitive = new Set<SavCaseSensitiveFamily>(context.sensitiveCategories);

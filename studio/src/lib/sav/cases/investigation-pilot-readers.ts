@@ -4,6 +4,7 @@ import { requireDb } from "@/db";
 import { readRuntimeTemporaryIncidents } from "@/lib/knowledge/temporary-incidents-runtime";
 import { admissionPolicyRevisionPort, type AdmissionPolicyRecord } from "./admission-runtime";
 import type { KnowledgeRef } from "./case-types";
+import { SAV_CASE_BLOCK_SCOPES_BUNDLE, type CaseBlockScopesBundle, type CaseScopePart } from "./investigation-access-scope";
 import type { PilotActiveSource, PilotProvenanceDeps } from "./pilot-passage-provenance";
 
 /*
@@ -26,11 +27,29 @@ export const SAV_V2_ACCESS_SCOPE_MAX_CHARS = 32_768;
  */
 export function caseAccessScopeConfigReader(env: () => Env = () => process.env): () => Promise<unknown> {
   return async () => {
-    const raw = env()[SAV_V2_ACCESS_SCOPE_ENV];
-    if (raw === undefined || raw.trim() === "") return null;
-    if (raw.length > SAV_V2_ACCESS_SCOPE_MAX_CHARS) throw Error("SAV_V2_ACCESS_SCOPE_TOO_LARGE");
-    return JSON.parse(raw) as unknown;
+    const values = env();
+    const blocks = values[SAV_V2_BLOCK_SCOPES_ENV];
+    // No other block configured: Access's datum, read exactly as before blocks existed.
+    if (blocks === undefined || blocks.trim() === "") {
+      const raw = values[SAV_V2_ACCESS_SCOPE_ENV];
+      if (raw === undefined || raw.trim() === "") return null;
+      if (raw.length > SAV_V2_ACCESS_SCOPE_MAX_CHARS) throw Error("SAV_V2_ACCESS_SCOPE_TOO_LARGE");
+      return JSON.parse(raw) as unknown;
+    }
+    // Other blocks configured: each datum read on its own, so a broken list never voids Access (nor the reverse).
+    const bundle: CaseBlockScopesBundle = { [SAV_CASE_BLOCK_SCOPES_BUNDLE]: true,
+      access: scopePart(values[SAV_V2_ACCESS_SCOPE_ENV], SAV_V2_ACCESS_SCOPE_MAX_CHARS), blocks: scopePart(blocks, SAV_V2_BLOCK_SCOPES_MAX_CHARS) };
+    return bundle;
   };
+}
+
+/** Treatment blocks (11/11): the scopes of the blocks other than Access, a JSON list (`investigation-access-scope.ts`). Absent: no other block has a scope. */
+export const SAV_V2_BLOCK_SCOPES_ENV = "SAV_V2_BLOCK_SCOPES_JSON";
+export const SAV_V2_BLOCK_SCOPES_MAX_CHARS = 131_072;
+function scopePart(raw: string | undefined, max: number): CaseScopePart {
+  if (raw === undefined || raw.trim() === "") return { state: "absent" };
+  if (raw.length > max) return { state: "unreadable" };
+  try { return { state: "read", value: JSON.parse(raw) as unknown }; } catch { return { state: "unreadable" }; }
 }
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;

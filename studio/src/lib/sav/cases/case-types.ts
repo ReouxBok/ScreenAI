@@ -227,21 +227,30 @@ export const SAV_CASE_ADMISSION_REASON_LABELS: Record<CaseAdmissionReason, strin
   admitted: "Admis pour l'agent.",
 };
 
+/** Treatment blocks (11/11, `case-blocks.ts`): a block's identity, distinct from its family. The family `access` is the `access` block's alone. */
+export const SAV_CASE_ACCESS_BLOCK_ID = "access";
+export const SAV_CASE_BLOCK_ID = /^[a-z][a-z0-9_-]{1,39}$/;
+export const caseBlockIdSchema = z.string().regex(SAV_CASE_BLOCK_ID);
+
 const staffId = z.string().uuid();
 const admissibleFamilies = z.array(z.enum(SAV_CASE_ADMISSIBLE_FAMILIES)).min(1).max(SAV_CASE_ADMISSIBLE_FAMILIES.length)
   .refine(values => new Set(values).size === values.length, "DUPLICATE_FAMILY");
 /** Approved by Ugo; none exists yet, and `null` admits nobody. */
 export const caseAdmissionPolicySchema = z.object({
   revision: ref, admittedFamilies: admissibleFamilies,
-  qualifiedRules: z.array(z.object({ ruleId: ref, revision: ref, families: admissibleFamilies }).strict()).max(20),
+  // Treatment blocks (11/11): `blockId` binds an approved rule to its block. Absent (every policy written before blocks) or `access`: today's
+  // exact semantics. Another block's rule never lists the family `access`, which is the Access block's alone.
+  qualifiedRules: z.array(z.object({ ruleId: ref, revision: ref, families: admissibleFamilies, blockId: caseBlockIdSchema.optional() }).strict()
+    .refine(rule => rule.blockId === undefined || rule.blockId === SAV_CASE_ACCESS_BLOCK_ID || !rule.families.includes("access"), "ACCESS_FAMILY_RESERVED")).max(20),
   approvedBy: staffId, approvedAt: at,
 }).strict();
 export type CaseAdmissionPolicy = z.infer<typeof caseAdmissionPolicySchema>;
 
 export const caseAdmissionProvenanceSchema = z.discriminatedUnion("kind", [
   z.object({ kind: z.literal("human"), staffUserId: staffId, at }).strict(),
-  // Admits only when the policy lists this rule and revision for the family.
-  z.object({ kind: z.literal("qualified_rule"), ruleId: ref, revision: ref, at }).strict(),
+  // Admits only when the policy lists this rule and revision for the family. `blockId`: the block the rule names; absent for a
+  // rule written before blocks (then only the family `access` has one, the Access block), so Access records exactly what it did.
+  z.object({ kind: z.literal("qualified_rule"), ruleId: ref, revision: ref, at, blockId: caseBlockIdSchema.optional() }).strict(),
   // An intake category proposed by the model: may exclude, never admits.
   z.object({ kind: z.literal("intake_hint"), source: sourceRefSchema }).strict(),
 ]);

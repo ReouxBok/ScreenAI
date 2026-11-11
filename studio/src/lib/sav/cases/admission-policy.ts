@@ -1,5 +1,5 @@
 import {
-  SAV_CASE_ADMISSION_REASONS, SAV_CASE_ADMISSION_REVISION, SAV_CASE_ADMISSION_TEAM_REASONS, SAV_CASE_SENSITIVE_FAMILIES,
+  SAV_CASE_ACCESS_BLOCK_ID, SAV_CASE_ADMISSION_REASONS, SAV_CASE_ADMISSION_REVISION, SAV_CASE_ADMISSION_TEAM_REASONS, SAV_CASE_SENSITIVE_FAMILIES,
   caseAdmissionPolicySchema, caseAdmissionQualificationSchema, caseSensitivityForFamily,
   type CaseAdmissionDecision, type CaseAdmissionPolicy, type CaseAdmissionQualification, type CaseAdmissionReason,
   type CaseRequestFamily, type CaseSensitivity, type CaseSnapshot,
@@ -15,8 +15,13 @@ function provenAdmissible(request: CaseAdmissionQualification["requests"][number
   const { provenance, family } = request;
   if (provenance.kind === "human") return true;
   if (provenance.kind === "intake_hint") return false;
-  return policy.qualifiedRules.some(rule => rule.ruleId === provenance.ruleId && rule.revision === provenance.revision && (rule.families as readonly string[]).includes(family));
+  return policy.qualifiedRules.some(rule => rule.ruleId === provenance.ruleId && rule.revision === provenance.revision && (rule.families as readonly string[]).includes(family)
+    && approvedBlock(rule.blockId) === approvedBlock(provenance.blockId));
 }
+/** Treatment blocks (11/11): the block a rule was approved for, and the block its provenance names, must be the same. No `blockId` on either
+ * side is Access's (every policy and provenance written before blocks), so Access keeps today's exact semantics; another block's rule admits
+ * only under a policy entry that carries that very block, never by an edit of the configured rules alone. */
+const approvedBlock = (blockId: string | undefined) => blockId ?? SAV_CASE_ACCESS_BLOCK_ID;
 
 /** Whether a human or a rule the policy lists proves this request's family (v8: the family a
  * relayed request is recorded with). A model hint proves nothing, and neither does `unknown`. */
