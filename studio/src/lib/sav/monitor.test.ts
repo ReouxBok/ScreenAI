@@ -19,7 +19,7 @@ beforeAll(async () => { f = await createSavTestDb(); state.db = f.db; }, 30000);
 afterAll(async () => { if (f) try { await restorePause(); } finally { await f.client.close(); } });
 // The schema markers come from the migrations (PGlite) or the real migrator (native), never from this file. sync_state is shared:
 // this file removes only the exact keys it writes (monitor worker/state/snapshot, its delivery receipts, its mailboxes' launches).
-const ownKeys = () => ["sav-monitor:v1:worker", "sav-monitor:v1:state", "sav-monitor:v1:snapshot",
+const ownKeys = () => ["sav-monitor:v1:worker", "sav-monitor:v1:state", "sav-monitor:v1:snapshot", "sav-self-scheduler:v1:sav-reconcile",
   ...[...own.deliveries].map(hash => `sav-monitor:v1:delivery:${hash}`), ...[...own.mailboxes].map(id => `sav-intake-launch:${id}`)];
 // Timestamps are read as text: a JavaScript Date would drop PostgreSQL's microseconds.
 const asText = (column: AnyPgColumn) => sql<string | null>`${column}::text`;
@@ -168,6 +168,14 @@ it("detects repeated worker starts without completion instead of hiding killed w
   const snapshot=await collectSavMonitorSnapshot();
   expect(snapshot.metrics.workerAgeSeconds).toBeLessThan(5);
   expect(snapshot.issues).toContainEqual({code:"worker_stalled",count:1,severity:"critical"});
+});
+it("keeps the Vercel outage visible: vercel_cron_missing while the current pulse is the self-scheduler fallback's, gone after a cron pass",async()=>{
+  const fallbackPulse=randomUUID();
+  await recordSavWorkerPulse(fallbackPulse,new Date().toISOString());
+  await f.db.insert(savSyncState).values({key:"sav-self-scheduler:v1:sav-reconcile",status:"ok",cursor:JSON.stringify({lastPulseId:fallbackPulse})});
+  expect((await collectSavMonitorSnapshot()).issues).toContainEqual({code:"vercel_cron_missing",count:1,severity:"warning"});
+  await recordSavWorkerPulse(randomUUID(),new Date(Date.now()+1000).toISOString());
+  expect((await collectSavMonitorSnapshot()).issues.map(i=>i.code)).not.toContain("vercel_cron_missing");
 });
 it("keeps an unresolved old quarantine visible after its timestamps age",async()=>{
   await f.db.insert(savGmailQuarantine).values({mailboxId,gmailMessageId:randomUUID(),cause:"synthetic",lastFailedAt:new Date(Date.now()-2*86400000)});

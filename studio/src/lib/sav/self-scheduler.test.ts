@@ -1,0 +1,179 @@
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import type { SelfSchedulerJobRecord, SelfSchedulerSignals } from "./self-scheduler-store";
+
+// In-memory double of the store with the same contract: one claim at a time per key (the advisory lock), the decision
+// sees the current record and signals, a run takes the lease. The PGlite test of the real store is self-scheduler-store.test.ts.
+const s = vi.hoisted(() => ({
+  records: new Map<string, SelfSchedulerJobRecord>(),
+  signals: { pulse: null, monitorObservedAt: null, watchExpirations: [], catchUpPulseId: null } as SelfSchedulerSignals,
+  chain: Promise.resolve() as Promise<unknown>,
+  claims: 0, beat: vi.fn(), pass: vi.fn(), monitor: vi.fn(), renew: vi.fn(), purge: vi.fn(),
+}));
+vi.mock("./self-scheduler-store", () => ({
+  claimSelfSchedulerJob: (input: { job: string; owner: string; trigger: string; now: Date; leaseMs: number; pulseId?: string;
+    decide: (r: SelfSchedulerJobRecord | null, g: SelfSchedulerSignals, n: number) => { run: boolean; reason?: string } }) => {
+    s.claims++;
+    const next = s.chain.then(async () => {
+      await new Promise(resolve => setTimeout(resolve, 1));
+      const record = s.records.get(input.job) ?? null, decision = input.decide(record, s.signals, input.now.getTime());
+      if (decision.run) s.records.set(input.job, { ...(record ?? { lastFinishedAt: null, lastStatus: null, lastPulseId: null }), owner: input.owner,
+        leaseUntil: new Date(input.now.getTime() + input.leaseMs).toISOString(), lastStartedAt: input.now.toISOString(), lastTrigger: input.trigger,
+        lastStatus: "running", ...(input.pulseId ? { lastPulseId: input.pulseId } : {}) });
+      return decision;
+    });
+    s.chain = next.catch(() => undefined);
+    return next;
+  },
+  finishSelfSchedulerJob: async (input: { job: string; owner: string; status: string; now: Date }) => {
+    const record = s.records.get(input.job);
+    if (record?.owner === input.owner) s.records.set(input.job, { ...record, leaseUntil: input.now.toISOString(), lastStatus: input.status });
+  },
+  beatSavHeartbeat: s.beat,
+}));
+vi.mock("./reconcile-pass", () => ({ runSavReconcilePass: s.pass }));
+vi.mock("./monitor", () => ({ runSavServerMonitor: s.monitor }));
+vi.mock("./gmail", () => ({ renewActiveGmailWatches: s.renew }));
+vi.mock("@/memory/service", () => ({ purgeExpiredMemory: s.purge }));
+import { decideCatchUp, decideMonitor, decideRetention, decideWatchRenewal, maybeRenewGmailWatch, maybeRunCatchUp, maybeRunMemoryRetention,
+  maybeRunMonitor, runSavHeartbeatTick, runSavSelfSchedulerFromWebhook, savSelfSchedulerDisabled } from "./self-scheduler";
+
+const NOW = Date.parse("2026-11-11T12:00:00.000Z"), MIN = 60_000, HOUR = 60 * MIN;
+const iso = (ms: number) => new Date(ms).toISOString();
+const signals = (patch: Partial<SelfSchedulerSignals> = {}): SelfSchedulerSignals => ({ pulse: null, monitorObservedAt: null, watchExpirations: [], catchUpPulseId: null, ...patch });
+const record = (patch: Partial<SelfSchedulerJobRecord> = {}): SelfSchedulerJobRecord => ({ owner: "o", leaseUntil: null, lastStartedAt: null, lastTrigger: null, lastPulseId: null, lastFinishedAt: null, lastStatus: null, ...patch });
+
+beforeEach(() => {
+  vi.useFakeTimers({ toFake: ["Date"] }); vi.setSystemTime(NOW); vi.stubEnv("VERCEL_ENV", "production");
+  s.records.clear(); s.signals = signals(); s.chain = Promise.resolve(); s.claims = 0;
+  for (const fn of [s.beat, s.pass, s.monitor, s.renew, s.purge]) fn.mockReset();
+  s.pass.mockResolvedValue({ payload: {}, hasStepFailure: false, pulseId: "p" }); s.monitor.mockResolvedValue({ complete: true });
+  s.renew.mockResolvedValue([{}]); s.purge.mockResolvedValue({ ok: true }); s.beat.mockResolvedValue({ alive: true });
+  vi.spyOn(console, "info").mockImplementation(() => {}); vi.spyOn(console, "error").mockImplementation(() => {});
+});
+afterEach(() => { vi.useRealTimers(); vi.unstubAllEnvs(); vi.restoreAllMocks(); });
+
+describe("staleness decisions", () => {
+  it("catch-up: a pulse started less than 12 min ago keeps the fallback idle; older (or none) runs one pass", () => {
+    expect(decideCatchUp(null, signals({ pulse: { id: "cron", startedAt: iso(NOW - 4 * MIN) } }), NOW)).toEqual({ run: false, reason: "fresh" });
+    expect(decideCatchUp(null, signals({ pulse: { id: "cron", startedAt: iso(NOW - 11 * MIN) } }), NOW)).toEqual({ run: false, reason: "fresh" });
+    expect(decideCatchUp(null, signals({ pulse: { id: "cron", startedAt: iso(NOW - 12 * MIN) } }), NOW)).toEqual({ run: true });
+    expect(decideCatchUp(null, signals(), NOW)).toEqual({ run: true });
+    // The fallback's own last start counts too, even if its pulse write was lost.
+    expect(decideCatchUp(record({ lastStartedAt: iso(NOW - 2 * MIN) }), signals(), NOW)).toEqual({ run: false, reason: "fresh" });
+    expect(decideCatchUp(record({ leaseUntil: iso(NOW + MIN) }), signals(), NOW)).toEqual({ run: false, reason: "leased" });
+  });
+  it("monitor: a snapshot observed less than 10 min ago keeps it idle", () => {
+    expect(decideMonitor(null, signals({ monitorObservedAt: iso(NOW - 5 * MIN) }), NOW)).toEqual({ run: false, reason: "fresh" });
+    expect(decideMonitor(null, signals({ monitorObservedAt: iso(NOW - 11 * MIN) }), NOW)).toEqual({ run: true });
+  });
+  it("watch: renews only when less than 48 h remain or the expiration is unknown, at most once an hour", () => {
+    expect(decideWatchRenewal(null, signals({ watchExpirations: [iso(NOW + 6 * 24 * HOUR)] }), NOW)).toEqual({ run: false, reason: "watch_valid" });
+    expect(decideWatchRenewal(null, signals({ watchExpirations: [iso(NOW + 49 * HOUR)] }), NOW)).toEqual({ run: false, reason: "watch_valid" });
+    expect(decideWatchRenewal(null, signals({ watchExpirations: [iso(NOW + 47 * HOUR)] }), NOW)).toEqual({ run: true });
+    expect(decideWatchRenewal(null, signals({ watchExpirations: [iso(NOW - HOUR)] }), NOW)).toEqual({ run: true });
+    expect(decideWatchRenewal(null, signals({ watchExpirations: [iso(NOW + 6 * 24 * HOUR), null] }), NOW)).toEqual({ run: true });
+    expect(decideWatchRenewal(null, signals({ watchExpirations: [] }), NOW)).toEqual({ run: true });
+    expect(decideWatchRenewal(record({ lastStartedAt: iso(NOW - 30 * MIN) }), signals({ watchExpirations: [null] }), NOW)).toEqual({ run: false, reason: "attempted_within_hour" });
+    expect(decideWatchRenewal(record({ lastStartedAt: iso(NOW - 61 * MIN) }), signals({ watchExpirations: [null] }), NOW)).toEqual({ run: true });
+  });
+  it("retention: idle while the cron's pulse is fresh; daily while the current pulse is stale or the fallback's own", () => {
+    expect(decideRetention(null, signals({ pulse: { id: "cron", startedAt: iso(NOW - 3 * MIN) } }), NOW)).toEqual({ run: false, reason: "scheduler_healthy" });
+    expect(decideRetention(null, signals({ pulse: { id: "cron", startedAt: iso(NOW - 30 * MIN) } }), NOW)).toEqual({ run: true });
+    expect(decideRetention(null, signals({ pulse: { id: "mine", startedAt: iso(NOW - 3 * MIN) }, catchUpPulseId: "mine" }), NOW)).toEqual({ run: true });
+    expect(decideRetention(record({ lastStartedAt: iso(NOW - 23 * HOUR) }), signals(), NOW)).toEqual({ run: false, reason: "fresh" });
+    expect(decideRetention(record({ lastStartedAt: iso(NOW - 25 * HOUR) }), signals(), NOW)).toEqual({ run: true });
+  });
+});
+
+describe("runs", () => {
+  it("fresh pulse: no pass; stale pulse: exactly one pass, with the fallback's trigger, budget and pulse id", async () => {
+    s.signals = signals({ pulse: { id: "cron", startedAt: iso(NOW - 4 * MIN) } });
+    expect(await maybeRunCatchUp("heartbeat_workflow")).toEqual({ job: "sav-reconcile", status: "skipped", reason: "fresh" });
+    expect(s.pass).not.toHaveBeenCalled();
+    s.signals = signals({ pulse: { id: "cron", startedAt: iso(NOW - 25 * MIN) } });
+    expect(await maybeRunCatchUp("heartbeat_workflow")).toEqual({ job: "sav-reconcile", status: "ran", reason: "ok" });
+    expect(s.pass).toHaveBeenCalledTimes(1);
+    const [options] = s.pass.mock.calls[0];
+    expect(options).toMatchObject({ trigger: "heartbeat_workflow", budgetMs: 270_000 });
+    expect(s.records.get("sav-reconcile")).toMatchObject({ lastPulseId: options.pulseId, lastTrigger: "heartbeat_workflow", lastStatus: "ok", leaseUntil: iso(NOW) });
+    expect(await maybeRunCatchUp("gmail_webhook")).toEqual({ job: "sav-reconcile", status: "skipped", reason: "fresh" });
+    expect(s.pass).toHaveBeenCalledTimes(1);
+  });
+  it("single-flight: two concurrent triggers (webhook and heartbeat) give one pass", async () => {
+    s.signals = signals({ pulse: { id: "cron", startedAt: iso(NOW - 25 * MIN) } });
+    let release!: () => void;
+    s.pass.mockImplementation(() => new Promise(resolve => { release = () => resolve({ payload: {}, hasStepFailure: false, pulseId: "p" }); }));
+    const first = maybeRunCatchUp("gmail_webhook"), second = maybeRunCatchUp("heartbeat_workflow");
+    expect(await second).toEqual({ job: "sav-reconcile", status: "skipped", reason: "leased" });
+    release();
+    expect(await first).toMatchObject({ status: "ran" });
+    expect(s.claims).toBe(2); expect(s.pass).toHaveBeenCalledTimes(1);
+    expect(s.pass.mock.calls[0][0]).toMatchObject({ trigger: "gmail_webhook", budgetMs: 250_000 });
+  });
+  it("kill switch: SAV_SELF_SCHEDULER_DISABLED=1 reads and runs nothing", async () => {
+    vi.stubEnv("SAV_SELF_SCHEDULER_DISABLED", "1");
+    expect(savSelfSchedulerDisabled()).toBe(true);
+    for (const run of [maybeRunCatchUp, maybeRenewGmailWatch, maybeRunMonitor, maybeRunMemoryRetention]) expect(await run("heartbeat_workflow")).toMatchObject({ status: "disabled" });
+    expect(await runSavSelfSchedulerFromWebhook({ ensureHeartbeat: s.beat })).toEqual({ status: "disabled" });
+    expect(await runSavHeartbeatTick("owner")).toEqual({ alive: false, reason: "disabled" });
+    expect(s.claims).toBe(0);
+    for (const fn of [s.beat, s.pass, s.monitor, s.renew, s.purge]) expect(fn).not.toHaveBeenCalled();
+    vi.stubEnv("SAV_SELF_SCHEDULER_DISABLED", "0"); expect(savSelfSchedulerDisabled()).toBe(false);
+    vi.stubEnv("SAV_SELF_SCHEDULER_DISABLED", ""); expect(savSelfSchedulerDisabled()).toBe(false);
+  });
+  it("watch renewal: calls the cron's renewal only under the 48 h threshold", async () => {
+    s.signals = signals({ watchExpirations: [iso(NOW + 5 * 24 * HOUR)] });
+    expect(await maybeRenewGmailWatch("gmail_webhook")).toMatchObject({ status: "skipped", reason: "watch_valid" });
+    s.signals = signals({ watchExpirations: [iso(NOW + 20 * HOUR)] });
+    expect(await maybeRenewGmailWatch("gmail_webhook")).toEqual({ job: "gmail-watch", status: "ran", reason: "renewed_1" });
+    expect(s.renew).toHaveBeenCalledTimes(1);
+    s.signals = signals({ watchExpirations: [iso(NOW + 20 * HOUR)] }); // renewal failed to move it: not before an hour
+    expect(await maybeRenewGmailWatch("heartbeat_workflow")).toMatchObject({ status: "skipped", reason: "attempted_within_hour" });
+  });
+  it("a failing job is logged, releases its lease and never throws", async () => {
+    s.signals = signals({ watchExpirations: [null] });
+    s.renew.mockRejectedValue(Error("GMAIL_HTTP_500"));
+    expect(await maybeRenewGmailWatch("gmail_webhook")).toEqual({ job: "gmail-watch", status: "error", reason: "GMAIL_HTTP_500" });
+    expect(s.records.get("gmail-watch")).toMatchObject({ lastStatus: "error", leaseUntil: iso(NOW) });
+  });
+  it("the webhook entry never rejects, even when every dependency throws", async () => {
+    s.pass.mockRejectedValue(Error("boom")); s.monitor.mockRejectedValue(Error("boom")); s.renew.mockRejectedValue(Error("boom")); s.purge.mockRejectedValue(Error("boom"));
+    const result = await runSavSelfSchedulerFromWebhook({ ensureHeartbeat: async () => { throw Error("workflow down"); } });
+    expect(result.status).toBe("checked");
+    expect(s.pass).toHaveBeenCalledTimes(1); expect(s.monitor).toHaveBeenCalledTimes(1);
+  });
+  it("heartbeat tick: a superseded run stops without running anything; a live one runs the light checks", async () => {
+    s.beat.mockResolvedValue({ alive: false, reason: "superseded" });
+    expect(await runSavHeartbeatTick("old-owner")).toEqual({ alive: false, reason: "superseded" });
+    expect(s.claims).toBe(0);
+    s.beat.mockResolvedValue({ alive: true });
+    s.signals = signals({ pulse: { id: "cron", startedAt: iso(NOW - MIN) }, monitorObservedAt: iso(NOW - MIN), watchExpirations: [iso(NOW + 6 * 24 * HOUR)] });
+    expect(await runSavHeartbeatTick("owner")).toEqual({ alive: true, results: [
+      { job: "gmail-watch", status: "skipped", reason: "watch_valid" }, { job: "sav-monitor", status: "skipped", reason: "fresh" },
+      { job: "memory-retention", status: "skipped", reason: "scheduler_healthy" }] });
+    expect(s.pass).not.toHaveBeenCalled(); expect(s.monitor).not.toHaveBeenCalled(); expect(s.renew).not.toHaveBeenCalled(); expect(s.purge).not.toHaveBeenCalled();
+  });
+  it("webhook pass budget counts from the request start: 250 s minus elapsed, none under a minute", async () => {
+    s.signals = signals({ pulse: { id: "cron", startedAt: iso(NOW - 25 * MIN) } });
+    expect(await maybeRunCatchUp("gmail_webhook", { requestStartedAt: NOW - 30_000 })).toMatchObject({ status: "ran" });
+    expect(s.pass.mock.calls[0][0]).toMatchObject({ budgetMs: 220_000 });
+    s.records.clear();
+    expect(await maybeRunCatchUp("gmail_webhook", { requestStartedAt: NOW - 200_000 })).toEqual({ job: "sav-reconcile", status: "skipped", reason: "insufficient_budget" });
+    expect(s.pass).toHaveBeenCalledTimes(1);
+  });
+  it("outside production (preview, local) the webhook path and the heartbeat do nothing, not even a claim", async () => {
+    for (const value of ["preview", "development", ""]) {
+      vi.stubEnv("VERCEL_ENV", value);
+      expect(await runSavSelfSchedulerFromWebhook({ ensureHeartbeat: s.beat })).toEqual({ status: "not_production" });
+      expect(await maybeRunCatchUp("gmail_webhook")).toMatchObject({ status: "not_production" });
+      expect(await runSavHeartbeatTick("owner")).toEqual({ alive: false, reason: "not_production" });
+    }
+    expect(s.claims).toBe(0);
+    for (const fn of [s.beat, s.pass, s.monitor, s.renew, s.purge]) expect(fn).not.toHaveBeenCalled();
+  });
+  it("heartbeat tick: a switched-OFF beat stops the run at this tick and runs nothing", async () => {
+    s.beat.mockResolvedValue({ alive: false, reason: "switch_off" });
+    expect(await runSavHeartbeatTick("root#3")).toEqual({ alive: false, reason: "switch_off" });
+    expect(s.claims).toBe(0);
+  });
+});

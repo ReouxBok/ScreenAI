@@ -41,7 +41,8 @@ describe("the old producers stay retired", () => {
     expect(text).not.toMatch(/requireDb|savActions|savFollowups|insert\(|update\(|fetch\(/);
   });
   it("the cron no longer triggers the old follow-ups and keeps what V1 and the receipts need", () => {
-    const cron = source("app/api/cron/sav-reconcile/route.ts");
+    // The pass lives in lib/sav/reconcile-pass.ts, shared by the cron route and the self-scheduler fallback.
+    const cron = source("app/api/cron/sav-reconcile/route.ts") + source("lib/sav/reconcile-pass.ts");
     expect(cron).not.toMatch(/followups|processDueFollowups/);
     for (const step of ["gmail_receipts", "hubspot_receipts", "email_openings", "context_refreshes", "intake_observation", "intake_wakes", "intake_choices",
       "intake_execution", "intake_tracking", "intake_console", "intake_gmail_read", "hubspot_ticket_actions", "gmail_replies", "hubspot_status_actions"]) {
@@ -72,7 +73,7 @@ describe("the old V0 analysis stays retired", () => {
     expect(text).not.toMatch(/requireDb|savMessages|savPilotItems|savDecisions|savActions|savAgentRuns|insert\(|update\(|select\(|fetch\(|enqueueConfiguredSavIntake|analyzeStoredSavMessage|analyzeSavMessage/);
   });
   it("the cron has neither the pilot-item step nor the pending-message step", () => {
-    expect(source("app/api/cron/sav-reconcile/route.ts")).not.toMatch(/pilot_items|pending_messages|processPendingSavMessages|processPendingSavPilotItems/);
+    expect(source("app/api/cron/sav-reconcile/route.ts") + source("lib/sav/reconcile-pass.ts")).not.toMatch(/pilot_items|pending_messages|processPendingSavMessages|processPendingSavPilotItems/);
   });
   it("no runtime code reaches the analysis: the stored-message analyser has no caller, the model entry has only the audited ones", () => {
     const callers = (needle: string) => sources.filter((entry) => entry.text.includes(needle)).map((entry) => `${entry.name}:${entry.text.split(needle).length - 1}`);
