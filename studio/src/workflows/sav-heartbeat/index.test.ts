@@ -12,11 +12,11 @@ beforeEach(() => {
   vi.spyOn(console, "error").mockImplementation(() => {});
 });
 
-it("is bounded: 72 ticks 5 min apart (about 6 h), then exactly one continuation step", async () => {
+it("is bounded: 72 ticks 4 min apart plus their steps (about 5 to 6 h), then exactly one continuation step", async () => {
   expect(SAV_HEARTBEAT_ITERATIONS).toBe(72);
   const result = await savHeartbeatWorkflow({ owner: "root#3", generation: 3 });
   expect(f.tick).toHaveBeenCalledTimes(72); expect(f.catchUp).toHaveBeenCalledTimes(72); expect(f.v2Effects).toHaveBeenCalledTimes(72); expect(f.sleep).toHaveBeenCalledTimes(72);
-  expect(f.sleep).toHaveBeenCalledWith("5m"); expect(f.tick).toHaveBeenCalledWith("root#3");
+  expect(f.sleep).toHaveBeenCalledWith("4m"); expect(f.sleep).not.toHaveBeenCalledWith("5m"); expect(f.tick).toHaveBeenCalledWith("root#3");
   expect(f.next).toHaveBeenCalledTimes(1); expect(f.next).toHaveBeenCalledWith({ owner: "root#3", generation: 3 });
   expect(result).toEqual({ continuedAs: "wrun_next", reason: null, iterations: 72, generation: 3 });
 });

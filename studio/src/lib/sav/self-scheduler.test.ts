@@ -37,7 +37,7 @@ vi.mock("./monitor", () => ({ runSavServerMonitor: s.monitor }));
 vi.mock("./gmail", () => ({ renewActiveGmailWatches: s.renew }));
 vi.mock("@/memory/service", () => ({ purgeExpiredMemory: s.purge }));
 import { decideCatchUp, decideMonitor, decideRetention, decideV2Effects, decideWatchRenewal, maybeRenewGmailWatch, maybeRunCatchUp, maybeRunMemoryRetention,
-  maybeRunMonitor, maybeRunV2Effects, runSavHeartbeatTick, runSavSelfSchedulerFromWebhook, savSelfSchedulerDisabled } from "./self-scheduler";
+  maybeRunMonitor, maybeRunV2Effects, runSavHeartbeatTick, runSavSelfSchedulerFromWebhook, savSelfSchedulerDisabled, SELF_SCHEDULER_TIMING } from "./self-scheduler";
 
 const NOW = Date.parse("2026-11-11T12:00:00.000Z"), MIN = 60_000, HOUR = 60 * MIN;
 const iso = (ms: number) => new Date(ms).toISOString();
@@ -85,6 +85,55 @@ describe("staleness decisions", () => {
     expect(decideRetention(null, signals({ pulse: { id: "mine", startedAt: iso(NOW - 3 * MIN) }, catchUpPulseId: "mine" }), NOW)).toEqual({ run: true });
     expect(decideRetention(record({ lastStartedAt: iso(NOW - 23 * HOUR) }), signals(), NOW)).toEqual({ run: false, reason: "fresh" });
     expect(decideRetention(record({ lastStartedAt: iso(NOW - 25 * HOUR) }), signals(), NOW)).toEqual({ run: true });
+  });
+});
+
+describe("5-min fallback cadence (12/11)", () => {
+  const own = (pulseId: string, minutes: number) => ({ rec: record({ lastStartedAt: iso(NOW - minutes * MIN), lastPulseId: pulseId }),
+    sig: signals({ pulse: { id: pulseId, startedAt: iso(NOW - minutes * MIN + 1000) }, catchUpPulseId: pulseId }) });
+  it("timing: the fallback's own sav-reconcile pass every tick (4 min sleep), v2 every second tick, cron thresholds unchanged", () => {
+    expect(SELF_SCHEDULER_TIMING).toMatchObject({ catchUpStaleMs: 12 * MIN, catchUpOwnIntervalMs: 3.5 * MIN, v2EffectsStaleMs: 12 * MIN,
+      v2EffectsOwnIntervalMs: 7.5 * MIN, monitorStaleMs: 10 * MIN, heartbeatStaleMs: 15 * MIN });
+    // One heartbeat tick is at least the 4 min sleep: the own interval is below one tick, two ticks clear the v2 one.
+    expect(SELF_SCHEDULER_TIMING.catchUpOwnIntervalMs).toBeLessThan(4 * MIN);
+    expect(SELF_SCHEDULER_TIMING.v2EffectsOwnIntervalMs).toBeGreaterThan(4 * MIN);
+    expect(SELF_SCHEDULER_TIMING.v2EffectsOwnIntervalMs).toBeLessThan(8 * MIN);
+  });
+  it("catch-up: after its own pass the fallback runs again after 3.5 min (about every 5 min), not 12", () => {
+    let o = own("mine", 3); expect(decideCatchUp(o.rec, o.sig, NOW)).toEqual({ run: false, reason: "fresh" });
+    o = own("mine", 4); expect(decideCatchUp(o.rec, o.sig, NOW)).toEqual({ run: true });
+    o = own("mine", 5); expect(decideCatchUp(o.rec, o.sig, NOW)).toEqual({ run: true });
+    // Its own pulse recognised by the shared catch-up pulse id alone (record write lost) counts as its own, too.
+    expect(decideCatchUp(null, signals({ pulse: { id: "mine", startedAt: iso(NOW - 4 * MIN) }, catchUpPulseId: "mine" }), NOW)).toEqual({ run: true });
+    // The lease still forbids a second pass while one runs.
+    expect(decideCatchUp(record({ leaseUntil: iso(NOW + MIN), lastStartedAt: iso(NOW - 10 * MIN), lastPulseId: "mine" }), own("mine", 10).sig, NOW)).toEqual({ run: false, reason: "leased" });
+  });
+  it("catch-up: a cron pulse younger than 12 min still keeps the fallback idle (no overlap with a healthy cron), even when the fallback's own pass is old", () => {
+    const rec = record({ lastStartedAt: iso(NOW - 30 * MIN), lastPulseId: "mine" });
+    expect(decideCatchUp(rec, signals({ pulse: { id: "cron", startedAt: iso(NOW - 4 * MIN) }, catchUpPulseId: "mine" }), NOW)).toEqual({ run: false, reason: "fresh" });
+    expect(decideCatchUp(rec, signals({ pulse: { id: "cron", startedAt: iso(NOW - 11 * MIN) }, catchUpPulseId: "mine" }), NOW)).toEqual({ run: false, reason: "fresh" });
+    expect(decideCatchUp(rec, signals({ pulse: { id: "cron", startedAt: iso(NOW - 12 * MIN) }, catchUpPulseId: "mine" }), NOW)).toEqual({ run: true });
+  });
+  it("v2-effects: its own pass again after 7.5 min (every second tick, about 10 min); a cron pulse under 12 min keeps it idle", () => {
+    const mine = (minutes: number) => [record({ lastStartedAt: iso(NOW - minutes * MIN), lastPulseId: "v2-mine" }),
+      signals({ v2EffectsPulse: { id: "v2-mine", startedAt: iso(NOW - minutes * MIN + 1000) } })] as const;
+    expect(decideV2Effects(...mine(5), NOW)).toEqual({ run: false, reason: "fresh" });
+    expect(decideV2Effects(...mine(8), NOW)).toEqual({ run: true });
+    expect(decideV2Effects(record({ lastStartedAt: iso(NOW - 30 * MIN), lastPulseId: "v2-mine" }), signals({ v2EffectsPulse: { id: "cron-v2", startedAt: iso(NOW - 9 * MIN) } }), NOW))
+      .toEqual({ run: false, reason: "fresh" });
+  });
+  it("runs: two heartbeat ticks 5 min apart give two sav-reconcile passes; a concurrent claim while leased gives none", async () => {
+    s.signals = signals();
+    expect(await maybeRunCatchUp("heartbeat_workflow")).toMatchObject({ status: "ran" });
+    const first = s.records.get("sav-reconcile")!;
+    s.signals = signals({ pulse: { id: first.lastPulseId!, startedAt: first.lastStartedAt! }, catchUpPulseId: first.lastPulseId });
+    vi.setSystemTime(NOW + 5 * MIN);
+    expect(await maybeRunCatchUp("heartbeat_workflow")).toMatchObject({ status: "ran" });
+    expect(s.pass).toHaveBeenCalledTimes(2);
+    s.records.set("sav-reconcile", { ...s.records.get("sav-reconcile")!, leaseUntil: iso(NOW + 11 * MIN) });
+    vi.setSystemTime(NOW + 10 * MIN);
+    expect(await maybeRunCatchUp("heartbeat_workflow")).toEqual({ job: "sav-reconcile", status: "skipped", reason: "leased" });
+    expect(s.pass).toHaveBeenCalledTimes(2);
   });
 });
 

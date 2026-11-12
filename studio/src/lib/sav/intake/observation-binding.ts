@@ -66,21 +66,45 @@ export async function intakeObservationBlocker(tx: ExecutionTx, executionId: str
     // With no blocker, every fact the binding needs is proven present.
     return { blocker, facts: blocker ? undefined : { execution: { ...execution, ticketId: execution.ticketId! }, run: run!, payload: { ...payload, completion: payload.completion! }, plan, effects } };
 }
-export async function ensureIntakeObservations(limit = 4) {
+/** Bounds of one follow-up scan (12/11). The two lanes below share the same rule (intakeObservationBlocker) and the same
+ * binding transaction; they only choose which unbound confirmed executions are looked at in this pass. */
+export const INTAKE_TRACKING_SCAN = { recent: 20, backlog: 40, budgetMs: 30_000 } as const;
+export type IntakeTrackingScanOptions = { recent?: number; backlog?: number; deadlineMs?: number };
+/** Binds the follow-up of confirmed executions. Two lanes per pass:
+ * - recent: the most recently updated unbound confirmed executions (newest first), so a dossier just confirmed is bound
+ *   at the next pass, however many old executions can never bind (newer inbound, run no longer current, not a ticket...);
+ * - backlog: the persisted oldest-first cursor (sav-intake-tracking-scan-v1), with a larger batch, so an old execution
+ *   whose blocker disappeared without touching it is still bound within a few passes.
+ * An unlocked read skips a blocked candidate without taking the admission lock; a candidate with no blocker is re-checked
+ * under the admission lock and the row locks, then bound once (an existing binding wins). Stops at the deadline. */
+export async function ensureIntakeObservations(options: IntakeTrackingScanOptions | number = {}) {
   if (!await intakeConsoleInstalled()) return { skipped: "migration_absent" };
+  const scan = typeof options === "number" ? { backlog: options } : options;
+  const clamp = (value: number | undefined, fallback: number) => Math.min(100, Math.max(0, Math.floor(value ?? fallback)));
+  const recentLimit = clamp(scan.recent, INTAKE_TRACKING_SCAN.recent), backlogLimit = clamp(scan.backlog, INTAKE_TRACKING_SCAN.backlog);
+  const deadline = Math.min(scan.deadlineMs ?? Infinity, Date.now() + INTAKE_TRACKING_SCAN.budgetMs);
   const db = requireDb(), key = "sav-intake-tracking-scan-v1";
   const [storedCursor] = await db.select().from(savSyncState).where(eq(savSyncState.key,key));
   const cursor = storedCursor?.cursor ? JSON.parse(storedCursor.cursor) as {at:string;id:string} : null;
   const base = and(eq(savIntakeExecutions.state,"confirmed"), sql`${savIntakeExecutions.ticketId} is not null`,
     sql`not exists(select 1 from sav.intake_observation_bindings b where b.execution_id=${savIntakeExecutions.id})`);
-  let rows = await db.select({ id: savIntakeExecutions.id, at:savIntakeExecutions.updatedAt }).from(savIntakeExecutions)
+  const columns = { id: savIntakeExecutions.id, at: savIntakeExecutions.updatedAt };
+  const recent = recentLimit ? await db.select(columns).from(savIntakeExecutions).where(base)
+    .orderBy(desc(savIntakeExecutions.updatedAt), desc(savIntakeExecutions.id)).limit(recentLimit) : [];
+  let backlog = backlogLimit ? await db.select(columns).from(savIntakeExecutions)
     .where(and(base,cursor ? sql`(${savIntakeExecutions.updatedAt},${savIntakeExecutions.id}) > (${cursor.at}::timestamptz,${cursor.id}::uuid)` : undefined))
-    .orderBy(savIntakeExecutions.updatedAt, savIntakeExecutions.id).limit(Math.min(10, Math.max(1,limit)));
-  if (!rows.length && cursor) rows = await db.select({id:savIntakeExecutions.id,at:savIntakeExecutions.updatedAt}).from(savIntakeExecutions)
-    .where(base).orderBy(savIntakeExecutions.updatedAt,savIntakeExecutions.id).limit(Math.min(10,Math.max(1,limit)));
-  let created = 0;
-  for (const candidate of rows) {
-   await requireDb().transaction(async tx => {
+    .orderBy(savIntakeExecutions.updatedAt, savIntakeExecutions.id).limit(backlogLimit) : [];
+  if (backlogLimit && !backlog.length && cursor) backlog = await db.select(columns).from(savIntakeExecutions)
+    .where(base).orderBy(savIntakeExecutions.updatedAt,savIntakeExecutions.id).limit(backlogLimit);
+  const seen = new Set<string>();
+  const candidates = [...recent.map(row => ({ ...row, lane: "recent" as const })), ...backlog.map(row => ({ ...row, lane: "backlog" as const }))];
+  let created = 0, deadlineReached = false, lastBacklog: { id: string; at: Date } | null = null;
+  for (const candidate of candidates) {
+   if (Date.now() >= deadline) { deadlineReached = true; break; }
+   if (!seen.has(candidate.id)) {
+    seen.add(candidate.id);
+    const unlocked = await requireDb().transaction(tx => intakeObservationBlocker(tx, candidate.id));
+    if (!unlocked.blocker) await requireDb().transaction(async tx => {
     await admissionLock(tx);
     const checked = await intakeObservationBlocker(tx, candidate.id, true);
     if (checked.blocker) return;
@@ -99,11 +123,15 @@ export async function ensureIntakeObservations(limit = 4) {
     await tx.insert(savIntakeObservationBindings).values({ observationId: observation.id, executionId: execution.id, runId: run.id,
       threadId: execution.threadId, messageId: execution.messageId, sensitive, baselineCiphertext: encryptSavPayload(baseline), baselineHash: intakeRuntimeHash(baseline) });
     created++;
-   });
-   await db.insert(savSyncState).values({key,cursor:JSON.stringify({at:candidate.at.toISOString(),id:candidate.id})})
-     .onConflictDoUpdate({target:savSyncState.key,set:{cursor:JSON.stringify({at:candidate.at.toISOString(),id:candidate.id}),updatedAt:new Date()}});
+    });
+   }
+   if (candidate.lane === "backlog") lastBacklog = candidate;
   }
-  return { created };
+  // Only the backlog lane moves the persisted cursor, once per pass, to the last backlog candidate checked; the recent lane
+  // is re-read from the newest at every pass.
+  if (lastBacklog) { const value = JSON.stringify({ at: lastBacklog.at.toISOString(), id: lastBacklog.id });
+    await db.insert(savSyncState).values({ key, cursor: value }).onConflictDoUpdate({ target: savSyncState.key, set: { cursor: value, updatedAt: new Date() } }); }
+  return deadlineReached ? { created, deadlineReached } : { created };
 }
 export async function readIntakeObservationBinding(observationId: string, db: Db = requireDb()) {
   if (!await intakeConsoleInstalled(db)) return null;

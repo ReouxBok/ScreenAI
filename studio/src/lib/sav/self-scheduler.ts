@@ -16,18 +16,24 @@ import { beatSavHeartbeat, claimSelfSchedulerJob, finishSelfSchedulerJob, type S
  * self-scheduler-store.ts), through the same function as its cron route, and never throws. */
 const MINUTE = 60_000, HOUR = 60 * MINUTE;
 export const SELF_SCHEDULER_TIMING = {
-  /** sav-reconcile runs every 5 min: a pass started more than 12 min ago means at least two missed runs. */
+  /** sav-reconcile runs every 5 min: a pass the cron (or anyone but the fallback) started less than 12 min ago keeps the
+   * fallback idle, so a healthy cron never overlaps with it. */
   catchUpStaleMs: 12 * MINUTE,
-  /** sav-v2-effects runs every 10 min: a pass started more than 12 min ago means its last run was missed. */
+  /** Once the fallback is the one running sav-reconcile (the latest pulse is its own), it runs again after 3.5 min, i.e. at
+   * every heartbeat tick (4 min sleep + steps): about every 5 min, like the cron. Lease and single-flight unchanged. */
+  catchUpOwnIntervalMs: 3.5 * MINUTE,
+  /** sav-v2-effects runs every 10 min: a pass the cron started less than 12 min ago keeps the fallback idle. */
   v2EffectsStaleMs: 12 * MINUTE,
-  /** sav-monitor runs every 5 min (2-59/5). */
+  /** The fallback's own v2-effects pass runs again after 7.5 min: every second tick, about every 10 min, like its cron. */
+  v2EffectsOwnIntervalMs: 7.5 * MINUTE,
+  /** sav-monitor runs every 5 min (2-59/5); the fallback keeps a snapshot at most about 10 min old (every second tick). */
   monitorStaleMs: 10 * MINUTE,
   /** The daily cron renews the 7-day watch; the fallback renews when less than 48 h remain, or when unknown. */
   watchRenewBeforeMs: 48 * HOUR,
   watchMinIntervalMs: HOUR,
   /** memory-retention is daily. */
   retentionIntervalMs: 24 * HOUR,
-  /** The heartbeat beats every 5 min plus its steps; without a beat for 15 min it is considered gone. */
+  /** The heartbeat beats every 4 min plus its steps; without a beat for 15 min it is considered gone. */
   heartbeatStaleMs: 15 * MINUTE,
 } as const;
 export type SelfSchedulerTrigger = "gmail_webhook" | "heartbeat_workflow";
@@ -51,15 +57,24 @@ const leased = (record: SelfSchedulerJobRecord | null, now: number) => (at(recor
 const skip = (reason: string): SelfSchedulerDecision => ({ run: false, reason });
 const RUN: SelfSchedulerDecision = { run: true };
 
-export function decideCatchUp(record: SelfSchedulerJobRecord | null, signals: SelfSchedulerSignals, now: number): SelfSchedulerDecision {
+/** A pass someone else started (the cron, or a pulse the fallback cannot recognise as its own) keeps the fallback idle for
+ * `staleMs`; the fallback's own last pass (its lease record, or the current pulse when it carries the fallback's pulse id)
+ * keeps it idle for the shorter `ownMs`. The lease still forbids two fallback passes at once. */
+function decidePulsed(record: SelfSchedulerJobRecord | null, pulse: { id: string; startedAt: string } | null | undefined,
+  ownPulseIds: (string | null | undefined)[], now: number, staleMs: number, ownMs: number): SelfSchedulerDecision {
   if (leased(record, now)) return skip("leased");
-  const last = latest(signals.pulse?.startedAt, record?.lastStartedAt);
-  return last !== null && now - last < SELF_SCHEDULER_TIMING.catchUpStaleMs ? skip("fresh") : RUN;
+  const own = Boolean(pulse && ownPulseIds.some(id => id && id === pulse.id));
+  const other = own ? null : at(pulse?.startedAt), mine = latest(record?.lastStartedAt, own ? pulse?.startedAt : null);
+  if (other !== null && now - other < staleMs) return skip("fresh");
+  return mine !== null && now - mine < ownMs ? skip("fresh") : RUN;
+}
+export function decideCatchUp(record: SelfSchedulerJobRecord | null, signals: SelfSchedulerSignals, now: number): SelfSchedulerDecision {
+  return decidePulsed(record, signals.pulse, [record?.lastPulseId, signals.catchUpPulseId], now,
+    SELF_SCHEDULER_TIMING.catchUpStaleMs, SELF_SCHEDULER_TIMING.catchUpOwnIntervalMs);
 }
 export function decideV2Effects(record: SelfSchedulerJobRecord | null, signals: SelfSchedulerSignals, now: number): SelfSchedulerDecision {
-  if (leased(record, now)) return skip("leased");
-  const last = latest(signals.v2EffectsPulse?.startedAt, record?.lastStartedAt);
-  return last !== null && now - last < SELF_SCHEDULER_TIMING.v2EffectsStaleMs ? skip("fresh") : RUN;
+  return decidePulsed(record, signals.v2EffectsPulse, [record?.lastPulseId], now,
+    SELF_SCHEDULER_TIMING.v2EffectsStaleMs, SELF_SCHEDULER_TIMING.v2EffectsOwnIntervalMs);
 }
 export function decideMonitor(record: SelfSchedulerJobRecord | null, signals: SelfSchedulerSignals, now: number): SelfSchedulerDecision {
   if (leased(record, now)) return skip("leased");
@@ -122,7 +137,7 @@ async function runJob(input: {
   return result;
 }
 
-/** One sav-reconcile pass when the last one started more than 12 min ago. The heartbeat's pass has the cron's 270 s;
+/** One sav-reconcile pass when the cron's last one started more than 12 min ago, or the fallback's own more than 3.5 min ago. The heartbeat's pass has the cron's 270 s;
  * the webhook's pass ends by the webhook's own deadline (computed from the request start, 50 s before its 300 s), and is
  * not started with less than a minute left. */
 export const WEBHOOK_PASS_DEADLINE_MS = 250_000;
@@ -132,7 +147,8 @@ export function maybeRunCatchUp(trigger: SelfSchedulerTrigger, options: { env?: 
   return runJob({ job: "sav-reconcile", trigger, env: options.env, pulseId, leaseMs: budgetMs + 60_000, decide: decideCatchUp,
     work: async () => (await runSavReconcilePass({ trigger, pulseId, budgetMs })).hasStepFailure ? "step_failure" : "ok" });
 }
-/** One sav-v2-effects pass (the cron route's runSavV2EffectsPass, same pulse) when the last one started more than 12 min ago.
+/** One sav-v2-effects pass (the cron route's runSavV2EffectsPass, same pulse) when the cron's last one started more than 12 min ago,
+ * or the fallback's own more than 7.5 min ago.
  * Same budgets as the catch-up: 270 s from the heartbeat, the webhook's own deadline from the webhook, none under a minute. */
 export function maybeRunV2Effects(trigger: SelfSchedulerTrigger, options: { env?: Env; requestStartedAt?: number } = {}) {
   const budgetMs = trigger === "gmail_webhook" ? (options.requestStartedAt ?? Date.now()) + WEBHOOK_PASS_DEADLINE_MS - Date.now() : 270_000, pulseId = randomUUID();
