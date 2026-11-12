@@ -42,9 +42,11 @@ function describeCoverage(row: { status?: unknown; knowledge?: unknown; limitati
     // Scope-first knowledge (11/11): the cards left out for this request, by fixed code (`investigation-knowledge-ranking.ts`).
     const codes = Array.isArray(row.limitations) ? row.limitations.filter((code): code is string => typeof code === "string") : [];
     const low = codes.filter(code => code.startsWith("knowledge_dropped:low_relevance:")).length, budget = codes.filter(code => code.startsWith("knowledge_dropped:input_budget:")).length;
+    const floor = codes.filter(code => code.startsWith("knowledge_dropped:below_floor:")).length;
     const added = codes.filter(code => code.startsWith("block_scope_source_added:")).length;
-    const notes = [low ? `${low} fiche(s) hors bloc écartée(s) : pertinence faible` : null, budget ? `${budget} fiche(s) hors bloc écartée(s) : taille du contexte` : null,
-      added ? `${added} fiche(s) du bloc ajoutée(s)` : null].filter(Boolean);
+    // K3 (12/11): a scope card may now be left out too (floor, budget), so the wording no longer says « hors bloc ».
+    const notes = [floor ? `${floor} fiche(s) écartée(s) : sous le seuil de pertinence` : null, low ? `${low} fiche(s) écartée(s) : pertinence faible` : null,
+      budget ? `${budget} fiche(s) écartée(s) : taille du contexte` : null, added ? `${added} fiche(s) du bloc ajoutée(s)` : null].filter(Boolean);
     return { label: `Fiche trouvée${n > 1 ? ` (${n})` : ""}${notes.length ? ` · ${notes.join(" · ")}` : ""}`, gap: false };
   }
   if (row.status === "no_applicable_knowledge") return { label: "Aucune fiche publiée applicable : vrai manque de la base de connaissances", gap: true };

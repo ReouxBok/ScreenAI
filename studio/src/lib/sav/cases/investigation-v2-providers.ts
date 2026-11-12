@@ -1,4 +1,5 @@
 import { compactInvestigationContext, INVESTIGATION_CONTEXT_INSTRUCTION } from "./investigation-context-view";
+import { caseDecisionBodyBreakdown, caseGeminiDecisionBody, type CaseDecisionBodyBreakdown } from "./investigation-context-budget";
 import { caseModelFinishReason, type CaseModelTransportDiagnostic } from "./investigation-transport-diagnostic";
 import { readCaseV2TransportPolicy, assertCaseV2ReservedPolicy } from "./investigation-v2-spend";
 import "server-only";
@@ -151,72 +152,83 @@ const generateResponse = z.object({
  */
 /** Prepare the EXACT existing prompt/body. No source, fact, instruction or reply rule is removed to fit. */
 export function prepareCaseGeminiDecisionRequest(request: CaseInvestigationModelRequest, env: Env):
-  | { ok: true; key: string; model: string; body: string; metadata: Pick<CaseModelTransportDiagnostic, "inputBytes" | "maxInputBytes" | "knowledgeCards"> }
-  | { ok: false; diagnostic: CaseModelTransportDiagnostic } {
+  | { ok: true; key: string; model: string; body: string; metadata: Pick<CaseModelTransportDiagnostic, "inputBytes" | "maxInputBytes" | "knowledgeCards">; compacted: boolean }
+  | { ok: false; diagnostic: CaseModelTransportDiagnostic; breakdown?: CaseDecisionBodyBreakdown } {
   const resolved = resolveCaseV2GeminiKey(env), model = env[SAV_V2_MODEL_ENV] ?? "";
   if (!resolved.ok) return { ok: false, diagnostic: { stage: "preflight", code: "key_unavailable", networkAttempted: false } };
   if (!MODEL_ID.test(model)) return { ok: false, diagnostic: { stage: "preflight", code: "model_invalid", networkAttempted: false } };
   let bounds: ReturnType<typeof readCaseV2TransportPolicy>;
   try { bounds = readCaseV2TransportPolicy(env); } catch { return { ok: false, diagnostic: { stage: "preflight", code: "policy_invalid", networkAttempted: false } }; }
   const prompt = caseInvestigationPrompt(request);
-  const serialize = (payload: unknown, decoding = "") => JSON.stringify({ systemInstruction: { parts: [{ text: `${prompt.instruction}\n\nSchéma JSON de la réponse :\n${prompt.schema}${decoding}` }] },
-    contents: [{ role: "user", parts: [{ text: JSON.stringify(payload) }] }], generationConfig: { responseMimeType: "application/json", temperature: 0, maxOutputTokens: bounds.maxOutputTokens } });
-  let body = serialize(prompt.payload);
+  const serialize = (payload: unknown, decoding = "") => caseGeminiDecisionBody(prompt, payload, bounds.maxOutputTokens, decoding);
+  let body = serialize(prompt.payload), compacted = false;
   // Preserve the original wire format whenever it fits. Only exact, reversible
   // sharing is allowed; measure the ENTIRE candidate, including decoding rules.
   if (Buffer.byteLength(body, "utf8") > bounds.maxInputBytes) {
     const compact = compactInvestigationContext(prompt.payload);
     if (compact) {
       const candidate = serialize(compact, `\n\n${INVESTIGATION_CONTEXT_INSTRUCTION}`);
-      if (Buffer.byteLength(candidate, "utf8") < Buffer.byteLength(body, "utf8")) body = candidate;
+      if (Buffer.byteLength(candidate, "utf8") < Buffer.byteLength(body, "utf8")) { body = candidate; compacted = true; }
     }
   }
   const metadata = { inputBytes: Buffer.byteLength(body, "utf8"), maxInputBytes: bounds.maxInputBytes, knowledgeCards: request.knowledge.length };
-  if (metadata.inputBytes > bounds.maxInputBytes) return { ok: false, diagnostic: { stage: "preflight", code: "input_too_large", networkAttempted: false, ...metadata } };
-  return { ok: true, key: resolved.key, model, body, metadata };
+  // K1: measured on the raw body when too large; returned BESIDE the diagnostic (logged, never stored: the record keeps main's schema).
+  if (metadata.inputBytes > bounds.maxInputBytes)
+    return { ok: false, diagnostic: { stage: "preflight", code: "input_too_large", networkAttempted: false, ...metadata }, breakdown: caseDecisionBodyBreakdown(prompt, bounds.maxOutputTokens, compacted) };
+  return { ok: true, key: resolved.key, model, body, metadata, compacted };
 }
 
 /** Runs before money and dispatch; ledger-known/uncertain calls retain their precedence. */
 export function caseGeminiDecisionPreflight(env: () => Env) {
   return (request: CaseInvestigationModelRequest): CaseModelTransportDiagnostic | null => {
     const prepared = prepareCaseGeminiDecisionRequest(request, env());
-    return prepared.ok ? null : prepared.diagnostic;
+    if (prepared.ok) return null;
+    // K1: structured log of the breakdown (ids and byte counts only); the returned diagnostic is the one the record may store, unchanged.
+    if (prepared.breakdown) console.warn("sav_v2_model_transport", { ...prepared.diagnostic, breakdown: prepared.breakdown });
+    return prepared.diagnostic;
   };
 }
 
 export function caseGeminiDecisionProvider(input: Readonly<{ env: () => Env; network?: CaseV2Network; timeoutMs?: number }>): CaseV2ModelTransport {
   const network = input.network ?? ((url, init) => fetch(url, init));
   return async request => {
-    const failed = (diagnostic: CaseModelTransportDiagnostic, uncertain: boolean, usage: { inputTokens?: number; outputTokens?: number } | null) => {
+    const failed = (diagnostic: CaseModelTransportDiagnostic, uncertain: boolean, usage: { inputTokens?: number; outputTokens?: number } | null, breakdown?: CaseDecisionBodyBreakdown) => {
       // Structured, closed metadata is useful even if the later journal write fails. No raw error/provider response.
-      console.warn("sav_v2_model_transport", diagnostic);
+      // K1: the breakdown is logged here only; the returned (and stored) diagnostic keeps main's exact shape.
+      console.warn("sav_v2_model_transport", breakdown ? { ...diagnostic, breakdown } : diagnostic);
       return { result: { status: "failed" as const, uncertain, diagnostic }, usage };
     };
-    const prepared = prepareCaseGeminiDecisionRequest(request, input.env());
-    if (!prepared.ok) return failed(prepared.diagnostic, false, { inputTokens: 0, outputTokens: 0 });
-    const { key, model, body, metadata } = prepared;
+    const env = input.env(), prepared = prepareCaseGeminiDecisionRequest(request, env);
+    if (!prepared.ok) return failed(prepared.diagnostic, false, { inputTokens: 0, outputTokens: 0 }, prepared.breakdown);
+    const { key, model, body } = prepared;
+    // K1: a stored failure keeps the breakdown of the body it concerns (measured only on failure; the policy was read just above).
+    const metadata = prepared.metadata;
+    const breakdown = (): CaseDecisionBodyBreakdown | undefined => {
+      try { return caseDecisionBodyBreakdown(caseInvestigationPrompt(request), readCaseV2TransportPolicy(env).maxOutputTokens, prepared.compacted); }
+      catch { return undefined; } // never lose the failure itself to its measurement
+    };
     let response: Response;
     try {
       response = await network(`${GEMINI}/${encodeURIComponent(model)}:generateContent`, {
         method: "POST", signal: AbortSignal.timeout(input.timeoutMs ?? 60_000), headers: { "content-type": "application/json", "x-goog-api-key": key }, body,
       });
-    } catch { return failed({ stage: "network", code: "network_failed", networkAttempted: true, ...metadata }, true, null); }
+    } catch { return failed({ stage: "network", code: "network_failed", networkAttempted: true, ...metadata }, true, null, breakdown()); }
     if (!response.ok) {
       await response.body?.cancel();
       const unprocessed = response.status >= 400 && response.status < 500 && response.status !== 408 && response.status !== 429;
-      return failed({ stage: "http", code: "http_rejected", networkAttempted: true, httpStatus: response.status, ...metadata }, !unprocessed, unprocessed ? { inputTokens: 0, outputTokens: 0 } : null);
+      return failed({ stage: "http", code: "http_rejected", networkAttempted: true, httpStatus: response.status, ...metadata }, !unprocessed, unprocessed ? { inputTokens: 0, outputTokens: 0 } : null, breakdown());
     }
     let parsed: z.infer<typeof generateResponse>;
-    try { parsed = generateResponse.parse(await response.json()); } catch { return failed({ stage: "envelope", code: "envelope_invalid", networkAttempted: true, ...metadata }, true, null); }
+    try { parsed = generateResponse.parse(await response.json()); } catch { return failed({ stage: "envelope", code: "envelope_invalid", networkAttempted: true, ...metadata }, true, null, breakdown()); }
     const meta = parsed.usageMetadata;
     const usage = meta && Number.isSafeInteger(meta.promptTokenCount) && Number(meta.promptTokenCount)>=0 && Number.isSafeInteger(meta.candidatesTokenCount) && Number(meta.candidatesTokenCount)>=0 && (meta.thoughtsTokenCount===undefined || Number.isSafeInteger(meta.thoughtsTokenCount) && meta.thoughtsTokenCount>=0) ? { inputTokens: meta.promptTokenCount!, outputTokens: (meta.candidatesTokenCount ?? 0) + (meta.thoughtsTokenCount ?? 0) } : null;
     const candidate = parsed.candidates?.[0];
     const text = candidate?.content?.parts.map(part => part.text ?? "").join("") ?? "";
     const finish = candidate?.finishReason ? { finishReason: caseModelFinishReason(candidate.finishReason) } : {};
-    if (candidate?.finishReason && candidate.finishReason !== "STOP") return failed({ stage: "content", code: "finish_not_stop", networkAttempted: true, ...metadata, ...finish }, false, usage);
-    if (!text.trim()) return failed({ stage: "content", code: "empty_response", networkAttempted: true, ...metadata, ...finish }, false, usage);
+    if (candidate?.finishReason && candidate.finishReason !== "STOP") return failed({ stage: "content", code: "finish_not_stop", networkAttempted: true, ...metadata, ...finish }, false, usage, breakdown());
+    if (!text.trim()) return failed({ stage: "content", code: "empty_response", networkAttempted: true, ...metadata, ...finish }, false, usage, breakdown());
     try { return { result: { status: "ok", output: JSON.parse(text) as unknown }, usage }; }
-    catch { return failed({ stage: "json", code: "output_json_invalid", networkAttempted: true, ...metadata, ...finish }, false, usage); }
+    catch { return failed({ stage: "json", code: "output_json_invalid", networkAttempted: true, ...metadata, ...finish }, false, usage, breakdown()); }
   };
 }
 

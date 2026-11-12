@@ -1,3 +1,4 @@
+import type { SavCardPublicationWarning } from "./publication-check";
 import type { CanonicalKnowledge } from "./contracts";
 import type { SavSupportDelivery } from "./support-delivery";
 
@@ -23,6 +24,8 @@ export type SavKnowledgeDraft = {
 export type SavKnowledgeComparison = { ref: string; title: string; body: string; versionId: string; signal: "duplicate" | "related"; explanation: string };
 export type SavKnowledgeDetail = {
   delivery?: SavSupportDelivery;
+  /** K2: warnings of the publication check on the version Ugo would publish (never a block). Absent: none computed. */
+  publicationWarnings?: SavCardPublicationWarning[];
   reviewKind: "workspace" | "onboarding" | "hubspot" | "legacy" | null;
   row: SavKnowledgeRow; document: CanonicalKnowledge | null; sources: SavKnowledgeSource[];
   activeVersion: SavKnowledgeVersion | null; publishedVersion: SavKnowledgeVersion | null;
