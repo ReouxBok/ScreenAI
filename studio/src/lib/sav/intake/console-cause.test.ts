@@ -48,3 +48,25 @@ describe("stale reconcile pulse", () => {
     expect(intakeSchedulerStopped({ startedAt: "nope", finishedAt: null }, now)).toBe(false);
   });
 });
+
+/** SAV-88 (SAV-82 follow-up): a dossier whose ticket really exists is followed, not waiting for an analysis. */
+describe("dossier with a ticket", () => {
+  it.each([["pending", "Nouvelle entrée en attente d’analyse"], ["processing", null]])("%s / %s with a ticket -> ticket_tracked, never « Mail en attente d’analyse »", (status, reason) => {
+    const row = { ...wait(status, reason), ticketId: "449217648841" };
+    expect(intakeBlockedSubCause(row)).toBe("ticket_tracked");
+    expect(intakeBlockedRowLabel(row)).toBe("Ticket créé, suivi en cours : l’équipe le voit dans HubSpot");
+  });
+  it.each([["waiting", null], ["waiting", "SAV_INTAKE_CRM_READ_INCOMPLETE"]])("a pending HubSpot/Gmail check stays named even with a ticket (%s / %s)", (status, reason) => {
+    expect(intakeBlockedSubCause({ ...wait(status, reason), ticketId: "1" })).toBe("verification_pending");
+  });
+  it("a sources change stays named even with a ticket", () => {
+    expect(intakeBlockedSubCause({ ...wait("context_changed", null), ticketId: "1" })).toBe("sources_changed");
+  });
+  it("without a ticket the labels are unchanged", () => {
+    expect(intakeBlockedRowLabel({ ...wait("pending", null), ticketId: null })).toBe("Mail en attente d’analyse : le prochain passage le prendra");
+  });
+  it("a failed rescue is terminal and says « à traiter à la main »", () => {
+    expect(intakeBlockedRowLabel({ blockedCause: "manual_required", status: "waiting", reason: null })).toBe("À traiter à la main — l’analyse de secours n’a pas abouti, aucun ticket n’a été créé.");
+    expect(intakeBlockedSubCause({ blockedCause: "manual_required", status: "waiting", reason: null })).toBeNull();
+  });
+});

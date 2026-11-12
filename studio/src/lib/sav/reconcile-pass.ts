@@ -4,6 +4,7 @@ import { reconcileHandledIntakeGmailRead } from "@/lib/sav/intake/gmail-read";
 import { ensureIntakeObservations } from "@/lib/sav/intake/observation-binding";
 import { reconcileIntakeHumanChoices } from "@/lib/sav/intake/human-worker";
 import { reconcileIntakeExecutor } from "@/lib/sav/intake/executor";
+import { reconcileTicketSafetyNet } from "@/lib/sav/intake/ticket-safety-net";
 import { reconcileSavIntakeRuntime } from "@/lib/sav/intake/runtime";
 import { dispatchPendingSavIntakeWakes } from "@/lib/sav/intake/event-dispatch";
 import { reconcileSavTranslations } from "@/lib/sav/translations";
@@ -79,6 +80,8 @@ export async function runSavReconcilePass(options: SavReconcilePassOptions) {
   const intakeWakes = await runStep("intake_wakes", () => dispatchPendingSavIntakeWakes());
   const intakeChoices = await runStep<Awaited<ReturnType<typeof reconcileIntakeHumanChoices>> | { skipped: string }>("intake_choices", () => Date.now()+45_000>derivedDeadline?Promise.resolve({skipped:"deadline"}):reconcileIntakeHumanChoices());
   const intakeExecution = await runStep<Awaited<ReturnType<typeof reconcileIntakeExecutor>> | { skipped: string }>("intake_execution",()=>Date.now()+60_000>derivedDeadline?Promise.resolve({skipped:"deadline"}):reconcileIntakeExecutor({deadlineMs:derivedDeadline}));
+  // SAV-88: a mail whose analysis is blocked or older than 24 h without ticket gets the V1 ticket rules without a model (observe by default).
+  const ticketSafetyNet = await runStep<Awaited<ReturnType<typeof reconcileTicketSafetyNet>> | { skipped: string }>("intake_ticket_safety_net", () => Date.now()+30_000>derivedDeadline ? Promise.resolve({skipped:"deadline"}) : reconcileTicketSafetyNet({ deadlineMs: Math.min(derivedDeadline, Date.now()+60_000) }));
   const caseRelays = await runStep<Awaited<ReturnType<typeof sweepMissedCaseRelays>> | { skipped: string }>("case_relays", () => Date.now()+20_000>derivedDeadline ? Promise.resolve({skipped:"deadline"}) : sweepMissedCaseRelays());
   const intakeTracking = await runStep("intake_tracking", () => ensureIntakeObservations({ deadlineMs: derivedDeadline }));
   const intakeConsole = await runStep("intake_console", () => refreshIntakeConsole(20));
@@ -108,7 +111,7 @@ export async function runSavReconcilePass(options: SavReconcilePassOptions) {
     return reconcileCaseJ2({ env: process.env, deadlineMs: derivedDeadline });
   });
   // V2 effects (replies, handoff notices, ticket stages, closures) have their own worker: /api/cron/sav-v2-effects (11/11).
-  const payload = { caseReminders, intakeRead, intakeWakes, intakeTracking, intakeChoices, intakeConsole, intakeExecution, caseRelays, intakeObservation, gmail, hubspot, emailOpenings, contextRefreshes, trainings, evaluations, ticketActions, pilotActions, replies, statusActions, learningBackfill, observations, translations, retention, dashboardProjection };
+  const payload = { caseReminders, ticketSafetyNet, intakeRead, intakeWakes, intakeTracking, intakeChoices, intakeConsole, intakeExecution, caseRelays, intakeObservation, gmail, hubspot, emailOpenings, contextRefreshes, trainings, evaluations, ticketActions, pilotActions, replies, statusActions, learningBackfill, observations, translations, retention, dashboardProjection };
   const hasStepFailure = Object.values(payload).some((step) => step.status === "error");
   await recordSavWorkerPulse(pulseId, pulseStartedAt, hasStepFailure);
   return { payload, hasStepFailure, pulseId };
