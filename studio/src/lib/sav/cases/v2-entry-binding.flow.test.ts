@@ -651,3 +651,216 @@ describe("SAV-80 qualification scope: one bound thread, closed for everything el
     expect(bound.caseId).not.toBe(other.caseId);
   });
 });
+
+import { caseV2EffectsWithTestPorts, sendQueuedCaseReplyNow } from "./v2-effects-binding";
+import type { ImmediateCaseReplySend } from "./immediate-send-budget";
+import { intakeRuntimeHash as runtimeHash, savIntakeRuntimeConfig } from "../intake/runtime-contract";
+// The production path of the immediate send (no injected transport or context) reaches Gmail only through these two boundaries; by default they are
+// the real modules (and the network is forbidden), a test routes them to the synthetic provider.
+const gmailBoundary = vi.hoisted(() => ({ request: null as null | ((mailbox: string, path: string, init?: RequestInit) => Promise<unknown>), permissions: null as null | (() => Promise<unknown>) }));
+vi.mock("../gmail", async importOriginal => {
+  const real = await importOriginal<typeof import("../gmail")>();
+  return { ...real, requestSavGmail: (mailbox: string, path: string, init?: RequestInit) => gmailBoundary.request ? gmailBoundary.request(mailbox, path, init) : (real.requestSavGmail as (...a: unknown[]) => unknown)(mailbox, path, init) };
+});
+vi.mock("../gmail-permissions", async importOriginal => {
+  const real = await importOriginal<typeof import("../gmail-permissions")>();
+  return { ...real, readSavGmailPermissions: () => gmailBoundary.permissions ? gmailBoundary.permissions() : real.readSavGmailPermissions() };
+});
+/*
+ * Immediate send (11/11) on the same real chain: the loader queues the automated reply and, when its CALLER gives a deadline with enough time left, sends it
+ * AT ONCE through the catch-up's own guards, claim and lease; then the catch-up (`reconcileCaseV2Effects`) finds nothing more to send. The network and the
+ * Gmail transport are the only doubles, shared by both paths so that every send is counted once, whoever makes it.
+ */
+describe("immediate send: the queued reply leaves at once within the caller's budget, under the catch-up's own guards, and never twice", () => {
+  const immediateEnv = async () => ({ ...await executionEnv(), SAV_V2_ENTRY: "on" });
+  const callerDeadline = () => Date.now() + 120_000;
+  function rig(env: Record<string, string | undefined>, made: { gmail: string; threadId: string; ticketId: string }) {
+    const provider = executionProvider(); provider.setGmail(made.gmail, `thread-${made.threadId}`); provider.seedTicket({ id: made.ticketId, ownerId: V2_OWNER, stage: "new" });
+    const counter = { sends: 0, inner: null as unknown };
+    let duringSend: (() => Promise<unknown>) | null = null;
+    const gmail = { request: async <T,>(mailbox: string, path: string, init?: RequestInit) => {
+      if (path.replace(/^\//, "") === "messages/send") {
+        counter.sends++;
+        // The other path runs WHILE this one holds the lease, between its marker and the provider's answer.
+        const hook = duringSend; duringSend = null;
+        if (hook) counter.inner = await hook();
+      }
+      return provider.gmail<T>(mailbox, path, init);
+    }, permissions: async () => {} };
+    const test = caseV2EffectsWithTestPorts({ gmail, network: provider.network as typeof fetch, context: { runtime: {} as never, policy: executionPolicy } });
+    const sendNow: ImmediateCaseReplySend = input => test.sendNow(input);
+    const catchUp = () => test.reconcile({ env, deadlineMs: Date.now() + 60_000 });
+    return { provider, counter, sendNow, catchUp, during: (hook: () => Promise<unknown>) => { duringSend = hook; } };
+  }
+  async function queued(sendNow: ImmediateCaseReplySend | null | undefined, rigOf?: (env: Record<string, string | undefined>, made: { gmail: string; threadId: string; ticketId: string }) => ReturnType<typeof rig>, envOf = immediateEnv) {
+    const env = await envOf(), made = await returnedCase(env), net = network();
+    afterSettle();
+    vi.stubGlobal("fetch", vi.fn((url: string, init: RequestInit) => net.net(String(url), init)));
+    const r = (rigOf ?? rig)(env, made);
+    const point = await loadCaseContinuationPoint(sendNow === undefined ? {} : { sendNow });
+    return { env, made, r, net, point };
+  }
+  const openStates = ["pending", "running", "waiting"];
+  // Each test starts from an empty queue: what earlier describes left open is closed (a refused execution is never listed nor claimed), as in case-runtime-effects.
+  beforeEach(async () => { await f.client.exec("UPDATE sav.case_effect_executions SET state = 'refused', lease_until = NULL, lease_token = NULL WHERE state NOT IN ('confirmed','refused')"); });
+  afterEach(() => { gmailBoundary.request = null; gmailBoundary.permissions = null; });
+
+  it("queued with a caller deadline -> sent at once (ONE send, execution confirmed) -> the catch-up and a replay of the loader send nothing more", async () => {
+    let r!: ReturnType<typeof rig>;
+    const q = await queued(input => r.sendNow(input), (env, made) => (r = rig(env, made)));
+    expect(await q.point({ caseId: q.made.caseId, trigger: "customer_return", env: q.env, deadlineMs: callerDeadline() })).toEqual({ status: "queued" });
+    expect(r.counter.sends).toBe(1);
+    expect(await effectRows(q.made.caseId)).toEqual([expect.objectContaining({ state: "confirmed" })]);
+    await r.catchUp();
+    expect(await q.point({ caseId: q.made.caseId, trigger: "relay", env: q.env, deadlineMs: callerDeadline() })).toMatchObject({ status: expect.any(String) });
+    await r.catchUp();
+    expect(r.counter.sends).toBe(1);
+    expect(await effectRows(q.made.caseId)).toHaveLength(1);
+  });
+
+  it("the caller's budget: no deadline (the shared worker) never sends here; a deadline too close is refused BEFORE any read; the catch-up sends once", async () => {
+    let r!: ReturnType<typeof rig>;
+    const calls: unknown[] = [];
+    const q = await queued(async input => { const outcome = await r.sendNow(input); calls.push({ input, outcome }); return outcome; }, (env, made) => (r = rig(env, made)));
+    expect(await q.point({ caseId: q.made.caseId, trigger: "customer_return", env: q.env })).toEqual({ status: "queued" });
+    expect(calls).toEqual([]);
+    expect(await q.point({ caseId: q.made.caseId, trigger: "relay", env: q.env, deadlineMs: Date.now() + 59_000 })).toMatchObject({ status: "queued" });
+    expect(calls).toEqual([{ input: expect.objectContaining({ callerDeadlineMs: expect.any(Number) }), outcome: { skipped: "caller_budget" } }]);
+    expect(r.provider.calls).toEqual([]); // not even the owner read
+    expect(r.counter.sends).toBe(0);
+    expect(openStates).toContain((await effectRows(q.made.caseId))[0]!.state);
+    await r.catchUp();
+    expect(r.counter.sends).toBe(1);
+  });
+
+  it("continueCaseAfterCommit carries the caller's deadline to the point; without it (the worker) nothing is sent at once", async () => {
+    let r!: ReturnType<typeof rig>;
+    const seen: (number | undefined)[] = [];
+    const q = await queued(input => { seen.push(input.callerDeadlineMs); return r.sendNow(input); }, (env, made) => (r = rig(env, made)));
+    const point = async (input: Parameters<typeof q.point>[0]) => { seen.push(input.deadlineMs); return q.point(input); };
+    expect(await continueCaseAfterCommit(q.made.caseId, "customer_return", { env: q.env, continuation: point })).toEqual({ status: "queued" });
+    expect(seen).toEqual([undefined]);
+    expect(r.counter.sends).toBe(0);
+    const deadline = callerDeadline();
+    await continueCaseAfterCommit(q.made.caseId, "customer_return", { env: q.env, continuation: point, immediateDeadlineMs: deadline });
+    expect(seen).toEqual([undefined, deadline, deadline]);
+    expect(r.counter.sends).toBe(1);
+  });
+
+  it("race: the catch-up holds the lease when the immediate send runs -> the immediate pass selects nothing; ONE send in all", async () => {
+    let r!: ReturnType<typeof rig>;
+    const q = await queued(null, (env, made) => (r = rig(env, made)));
+    expect(await q.point({ caseId: q.made.caseId, trigger: "customer_return", env: q.env, deadlineMs: callerDeadline() })).toEqual({ status: "queued" });
+    expect(r.counter.sends).toBe(0);
+    const [execution] = await effectRows(q.made.caseId);
+    r.during(() => r.sendNow({ env: q.env, executionId: execution!.id, callerDeadlineMs: callerDeadline() }));
+    await r.catchUp();
+    expect(r.counter.inner).toMatchObject({ pass: { skipped: null, supervised: [] } });
+    await r.sendNow({ env: q.env, executionId: execution!.id, callerDeadlineMs: callerDeadline() });
+    expect(r.counter.sends).toBe(1);
+    expect(await effectRows(q.made.caseId)).toEqual([expect.objectContaining({ state: "confirmed" })]);
+  });
+
+  it("race: the immediate send holds the lease when the catch-up runs -> the catch-up sends nothing; ONE send in all", async () => {
+    let r!: ReturnType<typeof rig>;
+    const q = await queued(null, (env, made) => (r = rig(env, made)));
+    expect(await q.point({ caseId: q.made.caseId, trigger: "customer_return", env: q.env, deadlineMs: callerDeadline() })).toEqual({ status: "queued" });
+    const [execution] = await effectRows(q.made.caseId);
+    r.during(() => r.catchUp());
+    expect(await r.sendNow({ env: q.env, executionId: execution!.id, callerDeadlineMs: callerDeadline() })).toMatchObject({ pass: { supervised: [{ executionId: execution!.id, state: "confirmed" }] } });
+    expect(r.counter.inner).toMatchObject({ replies: { supervised: [] } });
+    await r.catchUp();
+    expect(r.counter.sends).toBe(1);
+  });
+
+  it("race: two immediate sends and the catch-up started together -> ONE send", async () => {
+    let r!: ReturnType<typeof rig>;
+    const q = await queued(null, (env, made) => (r = rig(env, made)));
+    expect(await q.point({ caseId: q.made.caseId, trigger: "customer_return", env: q.env, deadlineMs: callerDeadline() })).toEqual({ status: "queued" });
+    const [execution] = await effectRows(q.made.caseId);
+    const now = { env: q.env, executionId: execution!.id, callerDeadlineMs: callerDeadline() };
+    await Promise.all([r.sendNow(now), r.catchUp(), r.sendNow(now)]);
+    await r.catchUp();
+    expect(r.counter.sends).toBe(1);
+    expect(await effectRows(q.made.caseId)).toEqual([expect.objectContaining({ state: "confirmed" })]);
+  });
+
+  it("a closed guard (agent fully paused at the immediate send) sends nothing and keeps the reply queued; the catch-up sends it once after the pause", async () => {
+    let r!: ReturnType<typeof rig>;
+    const pause = { revision: SAV_AGENT_PAUSE_REVISION, agent: "intake", level: "fully_paused", setBy: "staff@example.invalid", setAt: new Date().toISOString(), reason: "Pause synthétique" };
+    const outcomes: unknown[] = [];
+    const q = await queued(async input => {
+      await f.db.insert(savSyncState).values({ key: savAgentPauseKey("intake"), cursor: encryptSavPayload(pause), status: "active", updatedAt: new Date() });
+      try { const outcome = await r.sendNow(input); outcomes.push(outcome); return outcome; } finally { await f.db.delete(savSyncState).where(eq(savSyncState.key, savAgentPauseKey("intake"))); }
+    }, (env, made) => (r = rig(env, made)));
+    expect(await q.point({ caseId: q.made.caseId, trigger: "customer_return", env: q.env, deadlineMs: callerDeadline() })).toEqual({ status: "queued" });
+    expect(outcomes).toEqual([{ skipped: "SAV_INTAKE_AGENT_FULLY_PAUSED" }]);
+    expect(r.counter.sends).toBe(0);
+    expect(openStates).toContain((await effectRows(q.made.caseId))[0]!.state);
+    await r.catchUp();
+    expect(r.counter.sends).toBe(1);
+    expect(await effectRows(q.made.caseId)).toEqual([expect.objectContaining({ state: "confirmed" })]);
+  });
+
+  it("a failing immediate send (CRM owner unreadable) changes neither the report nor the queue; the catch-up sends once", async () => {
+    let r!: ReturnType<typeof rig>;
+    const outcomes: unknown[] = [];
+    const failing = caseV2EffectsWithTestPorts({ network: (async () => { throw Error("SYNTHETIC_CRM_DOWN"); }) as typeof fetch, context: { runtime: {} as never, policy: executionPolicy } });
+    const q = await queued(async input => { const outcome = await failing.sendNow(input); outcomes.push(outcome); return outcome; }, (env, made) => (r = rig(env, made)));
+    expect(await q.point({ caseId: q.made.caseId, trigger: "customer_return", env: q.env, deadlineMs: callerDeadline() })).toEqual({ status: "queued" });
+    expect(JSON.stringify(outcomes)).toMatch(/HOLD|failed/);
+    expect(r.counter.sends).toBe(0);
+    expect(openStates).toContain((await effectRows(q.made.caseId))[0]!.state);
+    await r.catchUp();
+    expect(r.counter.sends).toBe(1);
+  });
+
+  it("a sender that throws never fails the passage; the sweep (a catch-up inside the shared worker) never sends at once", async () => {
+    const thrower = vi.fn(async () => { throw Error("SYNTHETIC_IMMEDIATE_CRASH"); });
+    const q = await queued(thrower);
+    expect(await q.point({ caseId: q.made.caseId, trigger: "customer_return", env: q.env, deadlineMs: callerDeadline() })).toEqual({ status: "queued" });
+    expect(thrower).toHaveBeenCalledTimes(1);
+    expect(openStates).toContain((await effectRows(q.made.caseId))[0]!.state);
+    await q.point({ caseId: q.made.caseId, trigger: "sweep", env: q.env, deadlineMs: callerDeadline() });
+    expect(thrower).toHaveBeenCalledTimes(1);
+  });
+
+  /** A real runtime configuration (V1 observation pins) and the signed grant that matches it: what production reads when nothing is injected. */
+  async function productionEnv() {
+    const enginePolicy = { relationRevision: "synthetic", admittedRelations: [], resources: {} };
+    const runtimeEnv = { SAV_INTAKE_RUNTIME_MODE: "observe", SAV_AI_MODEL: "gemini-3.6-flash", SAV_INTAKE_RUNTIME_POLICY: JSON.stringify(enginePolicy), SAV_INTAKE_RUNTIME_RESOURCES: "[]",
+      SAV_INTAKE_RUNTIME_CONFIG: JSON.stringify({ mailboxId, createdAfter: new Date(Date.now() - 60_000).toISOString(), receivedAfter: new Date(Date.now() - 3600_000).toISOString(),
+        expiresAt: new Date(Date.now() + 3600_000).toISOString(), codeRevision: "a".repeat(40), policyHash: runtimeHash(enginePolicy), resourcesHash: runtimeHash([]), maxCalls: 30, maxNanoUsd: 3000000000 }) };
+    const base = await immediateEnv(), env = { ...base, ...runtimeEnv, SAV_ENCRYPTION_KEY_V1: process.env.SAV_ENCRYPTION_KEY_V1 };
+    const runtime = savIntakeRuntimeConfig(env)!;
+    expect(runtime).not.toBeNull();
+    const policy = executionPolicySchema.parse({ ...executionPolicy, enginePolicyHash: runtime.policyHash, resourcesHash: runtime.resourcesHash, codeRevision: runtime.codeRevision });
+    const hash = runtimeHash(policy);
+    await f.db.update(savIntakeExecutionPolicies).set({ policyHash: hash, payloadCiphertext: encryptSavPayload(policy) }).where(eq(savIntakeExecutionPolicies.id, policyId));
+    executionPolicy = policy; policyHash = hash;
+    return { ...env, SAV_INTAKE_EXECUTION_POLICY_SHA256: hash };
+  }
+
+  it("the PRODUCTION immediate sender (no injected transport or context): configuration and grant read from the environment, ONE send through the Gmail boundary", async () => {
+    const env = await productionEnv(), made = await returnedCase(env), net = network();
+    afterSettle();
+    const provider = executionProvider(); provider.setGmail(made.gmail, `thread-${made.threadId}`); provider.seedTicket({ id: made.ticketId, ownerId: V2_OWNER, stage: "new" });
+    // HubSpot answers from the provider, Gemini from the synthetic model; anything else is refused.
+    vi.stubGlobal("fetch", vi.fn((url: string, init: RequestInit) => String(url).startsWith("https://api.hubapi.com/") ? provider.network(String(url), init) : net.net(String(url), init)));
+    let sends = 0;
+    gmailBoundary.request = async (mailbox, path, init) => { if (path.replace(/^\//, "") === "messages/send") sends++; return provider.gmail(mailbox, path, init); };
+    gmailBoundary.permissions = async () => ({ ok: true, mailboxEmail: "support@example.invalid", sendScopeGranted: true });
+    const point = await loadCaseContinuationPoint(); // the real sender: sendQueuedCaseReplyNow
+    expect(await point({ caseId: made.caseId, trigger: "customer_return", env, deadlineMs: callerDeadline() })).toEqual({ status: "queued" });
+    expect(sends).toBe(1);
+    expect(await effectRows(made.caseId)).toEqual([expect.objectContaining({ state: "confirmed" })]);
+    const [execution] = await effectRows(made.caseId);
+    expect(await sendQueuedCaseReplyNow({ env, executionId: execution!.id, callerDeadlineMs: callerDeadline() })).toMatchObject({ pass: { skipped: null, supervised: [] } });
+    expect(sends).toBe(1);
+  });
+
+  it("the test ports are refused in a production build", () => {
+    vi.stubEnv("NODE_ENV", "production");
+    expect(() => caseV2EffectsWithTestPorts({})).toThrow("SAV_V2_TEST_PORTS_FORBIDDEN");
+  });
+});

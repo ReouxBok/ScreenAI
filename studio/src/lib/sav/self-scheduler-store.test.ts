@@ -6,7 +6,7 @@ const state = vi.hoisted(() => ({ db: null as unknown }));
 vi.mock("@/db", () => ({ requireDb: () => state.db }));
 import { abandonSavHeartbeatStart, beatSavHeartbeat, claimSelfSchedulerJob, finishSelfSchedulerJob, handOffSavHeartbeat, readSelfSchedulerState,
   requestSavHeartbeatStart, setSelfSchedulerSwitch } from "./self-scheduler-store";
-import { decideCatchUp, decideWatchRenewal } from "./self-scheduler";
+import { decideCatchUp, decideV2Effects, decideWatchRenewal } from "./self-scheduler";
 
 // The real store on the migrated schema (PGlite, or native Postgres when SAV_TEST_POSTGRES_URL is set). Only the keys this
 // store owns, the worker pulse/snapshot keys, its audit rows and the synthetic mailboxes are written; migrator markers stay.
@@ -14,7 +14,7 @@ let fixture: Awaited<ReturnType<typeof createSavTestDb>>;
 beforeAll(async () => { fixture = await createSavTestDb(); state.db = fixture.db; }, 60_000);
 afterAll(async () => fixture?.client.close());
 beforeEach(async () => {
-  await fixture.client.exec("DELETE FROM sav.sync_state WHERE key LIKE 'sav-self-scheduler:v1:%' OR key IN ('sav-monitor:v1:worker','sav-monitor:v1:snapshot'); DELETE FROM sav.mailboxes WHERE email LIKE '%@example.invalid'; DELETE FROM audit_logs WHERE entity_type = 'sav_self_scheduler'");
+  await fixture.client.exec("DELETE FROM sav.sync_state WHERE key LIKE 'sav-self-scheduler:v1:%' OR key IN ('sav-monitor:v1:worker','sav-monitor:v1:worker:sav-v2-effects','sav-monitor:v1:snapshot'); DELETE FROM sav.mailboxes WHERE email LIKE '%@example.invalid'; DELETE FROM audit_logs WHERE entity_type = 'sav_self_scheduler'");
 });
 const NOW = new Date("2026-11-11T12:00:00.000Z"), MIN = 60_000;
 const pulse = (id: string, startedAt: Date) => fixture.db.insert(savSyncState).values({ key: "sav-monitor:v1:worker", status: "finished", cursor: JSON.stringify({ id, startedAt: startedAt.toISOString() }) });
@@ -105,4 +105,22 @@ it("same-owner duplicates are impossible: a generation is handed off once, and t
   expect(handOffs.find(result => !result.handedOff)).toEqual({ handedOff: false, reason: "not_owner" });
   expect(await beatSavHeartbeat(hb("root#0", 61))).toEqual({ alive: false, reason: "superseded" });
   expect(await beatSavHeartbeat(hb("root#1", 61))).toEqual({ alive: true });
+});
+
+it("sav-v2-effects: reads its own pulse (not sav-reconcile's), honors the switch, stays idle while fresh, and a stale pulse gives one run under concurrency", async () => {
+  const v2Pulse = (id: string, startedAt: Date) => fixture.db.insert(savSyncState).values({ key: "sav-monitor:v1:worker:sav-v2-effects", status: "finished", cursor: JSON.stringify({ id, startedAt: startedAt.toISOString() }) })
+    .onConflictDoUpdate({ target: savSyncState.key, set: { cursor: JSON.stringify({ id, startedAt: startedAt.toISOString() }) } });
+  const claim = (owner: string) => claimSelfSchedulerJob({ job: "sav-v2-effects", owner, trigger: owner, now: NOW, leaseMs: 300_000, pulseId: `pulse-${owner}`, decide: decideV2Effects });
+  await v2Pulse("cron-v2", new Date(NOW.getTime() - 60 * MIN));
+  expect(await claim("off")).toEqual({ run: false, reason: "switch_off" });
+  await enable();
+  await pulse("cron-pass", new Date(NOW.getTime() - 60 * MIN)); // a stale sav-reconcile pulse does not move the V2 decision
+  await v2Pulse("cron-v2", new Date(NOW.getTime() - 5 * MIN));
+  expect(await claim("fresh")).toEqual({ run: false, reason: "fresh" });
+  await v2Pulse("cron-v2", new Date(NOW.getTime() - 13 * MIN));
+  const results = await Promise.all([claim("first"), claim("second")]);
+  expect(results.filter(result => result.run)).toHaveLength(1);
+  expect(results.find(result => !result.run)).toEqual({ run: false, reason: "leased" });
+  const winner = results[0].run ? "first" : "second";
+  expect((await readSelfSchedulerState())["sav-v2-effects"]).toMatchObject({ owner: winner, lastStatus: "running", lastPulseId: `pulse-${winner}` });
 });

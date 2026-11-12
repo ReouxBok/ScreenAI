@@ -1,7 +1,9 @@
 export type CaseContinuationTrigger = "customer_return" | "relay" | "sweep";
 /** Idempotent and safe to call again for one case: it stops by itself on a stale admission, a sensitive case, a pause or an owner who is not V2's. A failure throws. */
 export type CaseContinuationReport = { status: string; reason?: string; detail?: string };
-export type CaseContinuationPoint = (input: { caseId: string; trigger: CaseContinuationTrigger; env: Record<string, string | undefined> }) => Promise<CaseContinuationReport>;
+/** `deadlineMs`: when the CALLER must be done. Given, a reply queued by this passage is sent at once if that budget allows it; absent (a shared worker),
+ * nothing is sent here and the reply waits, queued, for the effects catch-up. */
+export type CaseContinuationPoint = (input: { caseId: string; trigger: CaseContinuationTrigger; env: Record<string, string | undefined>; deadlineMs?: number }) => Promise<CaseContinuationReport>;
 
 const CODE = /^[a-z0-9_]{1,80}$/, DETAIL = /^[a-z0-9_,.:-]{1,160}$/;
 /** Closed codes only (never client, provider or CRM text): why a passage stopped, for the operator and the logs. */
@@ -11,13 +13,17 @@ export function caseContinuationReport(status: string, source: { reason?: unknow
   return { status, ...(reason && CODE.test(reason) ? { reason } : {}), ...(detail && DETAIL.test(detail) ? { detail } : {}) };
 }
 
-export async function loadCaseContinuationPoint(): Promise<CaseContinuationPoint> {
+/** Immediate send (11/11): the sender used right after a reply is queued. Absent: the real one (`sendQueuedCaseReplyNow`); null: none (the catch-up sends). */
+export type CaseContinuationOptions = { sendNow?: import("./immediate-send-budget").ImmediateCaseReplySend | null };
+
+export async function loadCaseContinuationPoint(options: CaseContinuationOptions = {}): Promise<CaseContinuationPoint> {
   const { createCaseInvestigationToReplyPlan } = await import("./investigation-v2-factory");
   const { createCaseTicketOwnerPort } = await import("./case-v2-wake-ports");
   const { v2EntryPolicySources } = await import("./v2-entry");
   const { intakeExecutionConfig, readIntakeExecutionAuthority } = await import("../intake/execution-policy");
   const { savV2QualificationCaseAllowed } = await import("./qualification-scope");
-  return async ({ caseId, env }) => {
+  const sendNow = options.sendNow === undefined ? await import("./v2-effects-binding").then(module => module.sendQueuedCaseReplyNow, () => null) : options.sendNow;
+  return async ({ caseId, trigger, env, deadlineMs }) => {
     if (env.SAV_V2_INVESTIGATION !== "observe") return { status: "investigation_off" };
     const config = intakeExecutionConfig(env);
     if (!config) throw Error("SAV_V2_EXECUTION_POLICY_ABSENT");
@@ -38,6 +44,13 @@ export async function loadCaseContinuationPoint(): Promise<CaseContinuationPoint
     const report = result.reply ? caseContinuationReport(result.reply.status, result.reply as Record<string, unknown>)
       : caseContinuationReport(result.investigation.status, result.investigation as Record<string, unknown>);
     console.info("sav_v2_continuation_report", { caseId, ...report });
+    // The reply is queued (now or by an earlier pass): it is sent at once, under the catch-up's own guards, claim and lease, and only within the caller's
+    // budget. No deadline (a shared worker) or the sweep (itself a catch-up): nothing here, the effects worker sends it. Never throws, never changes the report.
+    if (sendNow && deadlineMs !== undefined && trigger !== "sweep" && result.reply?.status === "queued") {
+      const sent = await sendNow({ env, executionId: result.reply.executionId, callerDeadlineMs: deadlineMs }).catch(() => ({ failed: "SAV_V2_IMMEDIATE_SEND_THREW" }));
+      console.info("sav_v2_immediate_send", { caseId, executionId: result.reply.executionId,
+        ...("pass" in sent ? { supervised: sent.pass.skipped ?? sent.pass.supervisedSkipped ?? (sent.pass.supervised.map(row => row.state).join(",") || "none") } : sent) });
+    }
     return report;
   };
 }

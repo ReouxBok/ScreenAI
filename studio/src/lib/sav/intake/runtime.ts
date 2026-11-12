@@ -45,7 +45,9 @@ export async function enqueueConfiguredSavIntake(messageId: string) {
   return !runId && launch ? launch : {runId};
 }
 async function analyseSavIntakeRuntimeWithinBudget(runId: string, config: IntakeRuntimeConfig,
-  deps: { env?: () => Record<string, string | undefined>; network?: typeof fetch; downloadAttachments?: Parameters<typeof prepareIntakeAttachments>[3]; authenticateOther?: Parameters<typeof qualifyRuntimeOther>[3]; startReadRecovery?: (runId:string)=>Promise<unknown>; deadlineMs?: number } = {}) {
+  deps: { env?: () => Record<string, string | undefined>; network?: typeof fetch; downloadAttachments?: Parameters<typeof prepareIntakeAttachments>[3]; authenticateOther?: Parameters<typeof qualifyRuntimeOther>[3]; startReadRecovery?: (runId:string)=>Promise<unknown>; deadlineMs?: number;
+    /** V2 (11/11): when the caller (a wake step) must be done; a V2 reply queued on this mail may then be sent at once. Absent in the shared worker. */
+    v2ImmediateDeadlineMs?: number } = {}) {
   const env = deps.env ?? (() => process.env), network = deps.network ?? fetch;
   const held: { cause?: Parameters<typeof intakeResumeHoldReason>[0] } = {};
   const lease = await claimSavIntakeRun(runId, config, new Date(), {
@@ -219,7 +221,8 @@ export async function analyseSavIntakeRuntime(...args: Parameters<typeof analyse
   // V2 entry, before any claim, read or model call on every path. Off, nothing of V2 is even loaded: V1 as it always was.
   const entryEnv = (args[2]?.env ?? (() => process.env))();
   if (entryEnv.SAV_V2_ENTRY === "on" && entryEnv.SAV_CASE_RECORDING === "on") {
-    const stopped = await (await import("../cases/v2-entry")).customerReturnGate(args[0], { env: entryEnv });
+    const immediate = args[2]?.v2ImmediateDeadlineMs;
+    const stopped = await (await import("../cases/v2-entry")).customerReturnGate(args[0], { env: entryEnv, ...(immediate === undefined ? {} : { immediateDeadlineMs: immediate }) });
     if (stopped) return stopped as Extract<Awaited<ReturnType<typeof analyseSavIntakeRuntimeWithinBudget>>, { skipped: string }>;
   }
   const first = await withSavAiBudget(() => analyseSavIntakeRuntimeWithinBudget(...args));

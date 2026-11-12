@@ -1,6 +1,7 @@
 import { after } from "next/server";
 import { ZodError } from "zod";
 import { acceptGmailWebhook, processGmailReceipt, verifyGmailWebhookRequest } from "@/lib/sav/gmail";
+import { watchSavReconcilePulse } from "@/lib/sav/monitor-watchdog";
 
 export const runtime = "nodejs";
 export const maxDuration = 300;
@@ -18,10 +19,11 @@ export async function POST(request: Request) {
   }
   try {
     const result = await acceptGmailWebhook(payload);
-    // After the 204, one post-commit work: the receipt and, beside it, the self-scheduler fallback. allSettled keeps the
-    // fallback alive until it settles even when the receipt fails; the receipt's failure is then rethrown as before.
+    // After the 204, one post-commit work: the receipt and, beside it, the watchdog of the scheduled catch-up (one row read, at most
+    // once a minute, never throws) and the self-scheduler fallback. allSettled keeps the watchdog and the fallback alive until they
+    // settle even when the receipt fails; the receipt's failure is then rethrown as before.
     if (!result.duplicate) after(async () => {
-      const [receipt] = await Promise.allSettled([processGmailReceipt(result.receipt.id), runSelfSchedulerFallback(requestStartedAt)]);
+      const [receipt] = await Promise.allSettled([processGmailReceipt(result.receipt.id), watchSavReconcilePulse(), runSelfSchedulerFallback(requestStartedAt)]);
       if (receipt.status === "rejected") throw receipt.reason;
     });
     return new Response(null, { status: 204 });

@@ -110,11 +110,10 @@ it("SAV-11: the V2 catch-up keeps the shared deadline",async()=>{
   finally {vi.useRealTimers();}
 });
 
-it("keeps both V2 switches closed on the shared reconcile entry, then honors the effects switch", async () => {
-  expect(await (await GET(request())).json()).toMatchObject({ caseEffects: { data: { skipped: "v2_off" } }, caseReminders: { data: { skipped: "j2_off" } } });
-  vi.stubEnv("SAV_V2_ENTRY", "on");
-  expect(await (await GET(request())).json()).toMatchObject({ caseEffects: { data: { skipped: "v2_off" } } });
-  vi.stubEnv("SAV_CASE_RECORDING", "on");
-  const report = await (await GET(request())).json();
-  expect(report.caseEffects).toMatchObject({ status: "ok", data: { skipped: "effects_off" } });
+// 11/11: the V2 effects left this worker for /api/cron/sav-v2-effects (its own test carries the switch assertions that were here); J2 stays here.
+it("keeps the J2 switch closed on the shared reconcile entry, and no longer runs the V2 effects, whatever the switches", async () => {
+  expect(await (await GET(request())).json()).toMatchObject({ caseReminders: { data: { skipped: "j2_off" } } });
+  vi.stubEnv("SAV_V2_ENTRY", "on"); vi.stubEnv("SAV_CASE_RECORDING", "on"); vi.stubEnv("SAV_CASE_EFFECTS", "supervised");
+  const report = await (await GET(request())).json() as Record<string, unknown>;
+  expect(report).not.toHaveProperty("caseEffects");
 });

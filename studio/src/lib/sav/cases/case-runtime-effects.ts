@@ -151,6 +151,9 @@ export type CaseRuntimeDeps = CaseEffectDriverDeps & Readonly<{
   schemaInstalled?: () => Promise<boolean>;
   /** Executions handled per list per call. Default 3, at most 5. */
   limit?: number;
+  /** Immediate send (11/11): only this execution is considered for the supervised part, under the same guards, query and claim as any pass; the
+   * verification-only recovery is left to the catch-up (a just-queued reply has nothing engaged yet, and an engaged one is never selected here). */
+  executionId?: string;
 }>;
 
 export type CaseEffectNeedingPerson = Readonly<{
@@ -191,9 +194,10 @@ export async function listCaseEffectsNeedingPerson(limit = 20): Promise<CaseEffe
  * Supervised work: open executions with NO engaged effect (an engaged one is verification-only, or waits for a person at the ceiling), lease free or expired, oldest
  * first. The "no engaged effect" test is part of the query, not a filter on a short list: executions stuck at the ceiling can never fill the window and starve new work.
  */
-async function pendingSupervisedExecutions(limit: number, skipIds: ReadonlySet<string>, now = new Date()): Promise<string[]> {
+async function pendingSupervisedExecutions(limit: number, skipIds: ReadonlySet<string>, now = new Date(), only?: string): Promise<string[]> {
   const db = requireDb(), e = savCaseEffectExecutions;
   const rows = await db.select({ id: e.id }).from(e).where(and(
+    ...(only === undefined ? [] : [eq(e.id, only)]),
     inArray(e.state, ["pending", "running", "waiting", "uncertain"]), or(isNull(e.leaseUntil), lte(e.leaseUntil, now)),
     notLike(e.replyKey, `${HANDOFF_NOTICE_KEY_PREFIX}%`), // a handoff notice has its own pass (`case-handoff-notice-store.ts`)
     notLike(e.replyKey, `${TICKET_STAGE_KEY_PREFIX}%`), // so has a ticket stage (`case-ticket-stage-store.ts`)
@@ -233,7 +237,7 @@ export async function runCaseEffectsPass(deps: CaseRuntimeDeps): Promise<CaseRun
   const limit = Math.min(Math.max(Math.trunc(deps.limit ?? 3), 1), 5);
 
   const recovery: CaseEffectRecoveryResult[] = [], touched = new Set<string>();
-  for (let n = 0; n < limit; n++) {
+  for (let n = 0; deps.executionId === undefined && n < limit; n++) {
     if (n > 0 && Date.now() >= deps.deadlineMs) break; // the budget is spent: the next pass continues, each execution keeps its own schedule
     const result = await recoverCaseEffects({ ...deps, adapters: { verify: deps.adapters.verify }, context });
     // "nothing due" is reported once, when it is the whole answer; after a processed execution it is only the end of the loop.
@@ -246,7 +250,7 @@ export async function runCaseEffectsPass(deps: CaseRuntimeDeps): Promise<CaseRun
   const supervised: { executionId: string; state: string; reason: string | null }[] = [];
   // NEW work needs the current CRM owner: without the port nothing new starts (the verification above does not need it and has already run).
   if (typeof deps.readTicketOwner !== "function") return { skipped: null, recovery, supervised, supervisedSkipped: "owner_port_absent", needsPerson: await listCaseEffectsNeedingPerson() };
-  for (const executionId of await pendingSupervisedExecutions(limit, touched)) {
+  for (const executionId of await pendingSupervisedExecutions(limit, touched, new Date(), deps.executionId)) {
     if (Date.now() >= deps.deadlineMs) break; // no NEW send is started past the budget; a marker already written is only verified by the next pass
     // Before the claim (which decrypts the sealed payload): the ticket's current owner, from minimal identifiers. A refusal skips this execution; a person owning the ticket ends it.
     const owner = await ownerBeforeClaim(executionId, deps.readTicketOwner);

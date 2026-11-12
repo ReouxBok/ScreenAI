@@ -319,3 +319,24 @@ it("SAV-75 review F2: a pause-coded wait is graced only for 10 minutes after its
   await pause("running", new Date(Date.now()-60000));
   expect((await collectSavMonitorSnapshot()).issues.map(i=>i.code)).not.toContain("analysis_waiting");
 });
+
+it("11/11: the V2 effects worker has its own pulse, judged only when V2 runs: missing, stalled after 25 min, failed; fresh is quiet",async()=>{
+  const KEY="sav-monitor:v1:worker:sav-v2-effects";
+  const codes=async()=>(await collectSavMonitorSnapshot()).issues.filter(i=>i.code.startsWith("v2_effects")).map(i=>[i.code,i.severity]);
+  try {
+    expect(await codes()).toEqual([]); // V2 off: not expected
+    vi.stubEnv("SAV_V2_ENTRY","on"); vi.stubEnv("SAV_CASE_RECORDING","on");
+    expect(await codes()).toEqual([["v2_effects_missing","warning"]]);
+    const id=randomUUID(), started=new Date().toISOString();
+    await recordSavWorkerPulse(id,started,undefined,"sav-v2-effects"); await recordSavWorkerPulse(id,started,false,"sav-v2-effects");
+    expect(await codes()).toEqual([]);
+    // The main worker's pulse is untouched by the V2 one.
+    expect((await f.db.select().from(savSyncState).where(eq(savSyncState.key,"sav-monitor:v1:worker")))).toEqual([]);
+    const old=new Date(Date.now()-26*60_000).toISOString();
+    await f.db.update(savSyncState).set({cursor:JSON.stringify({id,startedAt:old,lastFinishedAt:old,monitoringSince:old})}).where(eq(savSyncState.key,KEY));
+    expect(await codes()).toEqual([["v2_effects_stalled","critical"]]);
+    const fail=randomUUID(), now=new Date().toISOString();
+    await recordSavWorkerPulse(fail,now,undefined,"sav-v2-effects"); await recordSavWorkerPulse(fail,now,true,"sav-v2-effects");
+    expect(await codes()).toEqual([["v2_effects_failed","critical"]]);
+  } finally { await f.db.delete(savSyncState).where(eq(savSyncState.key,KEY)); }
+});
