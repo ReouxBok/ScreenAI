@@ -57,11 +57,11 @@ it("single-flight: two concurrent claims on a stale pulse give one run; the rele
   const winner = results[0].run ? "first" : "second";
   await finishSelfSchedulerJob({ job: "sav-reconcile", owner: "intruder", status: "ok", now: new Date(NOW.getTime() + MIN) });
   expect((await readSelfSchedulerState())["sav-reconcile"]).toMatchObject({ owner: winner, lastStatus: "running", leaseUntil: new Date(NOW.getTime() + 300_000).toISOString() });
-  await finishSelfSchedulerJob({ job: "sav-reconcile", owner: winner, status: "ok", now: new Date(NOW.getTime() + 4 * MIN) });
-  expect((await readSelfSchedulerState())["sav-reconcile"]).toMatchObject({ status: "ok", lastStatus: "ok", lastPulseId: `pulse-${winner}`, lastStartedAt: NOW.toISOString(), leaseUntil: new Date(NOW.getTime() + 4 * MIN).toISOString() });
-  // Released, but started 5 min ago: still fresh; 12 min after the start it is due again.
-  expect(await claim("third", new Date(NOW.getTime() + 5 * MIN))).toEqual({ run: false, reason: "fresh" });
-  expect(await claim("fourth", new Date(NOW.getTime() + 12 * MIN))).toEqual({ run: true });
+  await finishSelfSchedulerJob({ job: "sav-reconcile", owner: winner, status: "ok", now: new Date(NOW.getTime() + 2 * MIN) });
+  expect((await readSelfSchedulerState())["sav-reconcile"]).toMatchObject({ status: "ok", lastStatus: "ok", lastPulseId: `pulse-${winner}`, lastStartedAt: NOW.toISOString(), leaseUntil: new Date(NOW.getTime() + 2 * MIN).toISOString() });
+  // Released, its own pass started 3 min ago: still fresh; 4 min after the start (one heartbeat tick) it is due again (12/11: about every 5 min).
+  expect(await claim("third", new Date(NOW.getTime() + 3 * MIN))).toEqual({ run: false, reason: "fresh" });
+  expect(await claim("fourth", new Date(NOW.getTime() + 4 * MIN))).toEqual({ run: true });
 });
 
 it("reads active mailboxes' watch expirations (unknown included)", async () => {

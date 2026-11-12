@@ -2295,3 +2295,73 @@ it("new-ticket history partial result keeps durable ID, uncertain state and neve
     expect((await options.adapters.verify(intent, ack, effect.dispatchedAt!, options.signal)).confirmed).toBe(true);
     expect(p.calls.filter(c => c.method === "POST" && c.path.endsWith("/tickets"))).toHaveLength(1);
 });
+
+// ---- 12/11 production fix: the follow-up scan must not starve a newly confirmed dossier behind old executions that cannot bind.
+import { savIntakeObservationBindings as followupBindings, savResolutionObservations as followupObservations } from "@/db/schema";
+import { intakeObservationBlocker as followupBlocker } from "./observation-binding";
+describe("12/11 follow-up scan: new confirmed dossiers are bound promptly, once", () => {
+    const OLD = Date.parse("2026-01-01T00:00:00.000Z");
+    async function confirmedEligible() {
+        await f.db.insert(savSyncState).values({ key: "sav-intake-console-schema-v1", status: "installed" }).onConflictDoUpdate({ target: savSyncState.key, set: { status: "installed" } });
+        await f.client.exec("DELETE FROM sav.sync_state WHERE key='sav-intake-tracking-scan-v1'");
+        const row = await admission();
+        expect(await executeIntakePass(row.id, options)).toMatchObject({ state: "confirmed" });
+        const [execution] = await f.db.select().from(savIntakeExecutions).where(eq(savIntakeExecutions.id, row.id));
+        return execution;
+    }
+    /** Old confirmed executions of the same ticket that can never bind: no current run (run_not_current), never touched again. */
+    async function permanentlyBlocked(source: typeof savIntakeExecutions.$inferSelect, count: number) {
+        await f.db.insert(savIntakeExecutions).values(Array.from({ length: count }, (_, i) => ({ messageId: randomUUID(), threadId: source.threadId, runId: null,
+            runVersion: source.runVersion, policyId: source.policyId, policyHash: source.policyHash, state: "confirmed", ticketId: source.ticketId,
+            payloadCiphertext: source.payloadCiphertext, createdAt: new Date(OLD + i * 1000), updatedAt: new Date(OLD + i * 1000) })));
+    }
+    const bindingsOf = async (executionId: string) => f.db.select().from(followupBindings).where(eq(followupBindings.executionId, executionId));
+
+    it("reproduction: 200 permanently blocked old executions and 1 new eligible one; the new one is bound at the first pass", async () => {
+        const execution = await confirmedEligible();
+        await permanentlyBlocked(execution, 200);
+        const blocked = (await f.db.select().from(savIntakeExecutions)).filter(e => e.id !== execution.id);
+        expect(blocked).toHaveLength(200);
+        expect((await f.db.transaction(tx => followupBlocker(tx, blocked[0].id))).blocker).toBe("run_not_current");
+        expect((await f.db.transaction(tx => followupBlocker(tx, execution.id))).blocker).toBeNull();
+        expect(await ensureIntakeObservations()).toMatchObject({ created: 1 });
+        expect(await bindingsOf(execution.id)).toHaveLength(1);
+        expect((await readIntakeRunDiagnostics(threadId))?.execution?.followup).toMatchObject({ bound: true });
+        // Idempotent: further passes never bind it again, and the blocked ones stay unbound (eligibility unchanged).
+        expect(await ensureIntakeObservations()).toMatchObject({ created: 0 });
+        expect(await bindingsOf(execution.id)).toHaveLength(1);
+        expect(await f.db.select().from(followupBindings)).toHaveLength(1);
+    });
+
+    it("an old execution whose blocker disappears without being touched is still bound within a few passes (backlog cursor)", async () => {
+        const execution = await confirmedEligible();
+        await permanentlyBlocked(execution, 200);
+        // The real execution sits in the middle of the old population, far from the newest, and its run stops being current.
+        await f.client.exec(`UPDATE sav.intake_executions SET updated_at='${new Date(OLD + 100_500).toISOString()}' WHERE id='${execution.id}'`);
+        await f.client.exec(`UPDATE sav.intake_runs SET is_current=false WHERE id='${execution.runId}'`);
+        expect(await ensureIntakeObservations()).toMatchObject({ created: 0 });
+        expect(await bindingsOf(execution.id)).toHaveLength(0);
+        // The blocker disappears; the execution row itself is not updated.
+        await f.client.exec(`UPDATE sav.intake_runs SET is_current=true WHERE id='${execution.runId}'`);
+        let passes = 0;
+        while (!(await bindingsOf(execution.id)).length && passes < 7) { await ensureIntakeObservations(); passes++; }
+        expect(await bindingsOf(execution.id)).toHaveLength(1);
+        expect(passes).toBeLessThanOrEqual(Math.ceil(201 / 40) + 1);
+    });
+
+    it("concurrent scans never create two bindings or two observations", async () => {
+        const execution = await confirmedEligible();
+        await permanentlyBlocked(execution, 30);
+        const results = await Promise.all([ensureIntakeObservations(), ensureIntakeObservations(), ensureIntakeObservations()]);
+        expect(results.reduce((sum, r) => sum + ("created" in r ? r.created as number : 0), 0)).toBe(1);
+        expect(await bindingsOf(execution.id)).toHaveLength(1);
+        expect(await f.db.select().from(followupObservations).where(eq(followupObservations.threadId, threadId))).toHaveLength(1);
+    });
+
+    it("respects the pass deadline: nothing is checked after it, the next pass binds", async () => {
+        const execution = await confirmedEligible();
+        expect(await ensureIntakeObservations({ deadlineMs: Date.now() - 1 })).toEqual({ created: 0, deadlineReached: true });
+        expect(await bindingsOf(execution.id)).toHaveLength(0);
+        expect(await ensureIntakeObservations({ deadlineMs: Date.now() + 60_000 })).toEqual({ created: 1 });
+    });
+});
