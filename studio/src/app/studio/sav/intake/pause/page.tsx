@@ -16,7 +16,8 @@ export default async function IntakePausePage() {
         <li>Suspendre les actions : l’analyse continue et ses appels IA sont facturés normalement ; aucune nouvelle action HubSpot ou Gmail ne part.</li>
         <li>Pause complète : aucune nouvelle analyse ni aucun appel IA n’est lancé ; une analyse interrompue ne consomme ni tentative automatique ni essai de reprise humaine.</li>
         <li>Dans les deux cas, un appel IA déjà lancé garde son coût, une action déjà envoyée va au bout et reste vérifiée en lecture seule.</li>
-      </ul></div></header>
+      </ul>
+      <p><Link href="/studio/sav/intake/blocks">Mode et pause par bloc de traitement</Link></p></div></header>
     {state.invalid && <p role="alert">Le réglage enregistré est illisible : l’agent est en pause complète par sécurité (<code>SAV_INTAKE_AGENT_PAUSE_INVALID</code>) jusqu’à un nouvel enregistrement.</p>}
     <section className={styles.choice}>
       <h2>État actuel</h2>

@@ -67,6 +67,13 @@ beforeEach(() => {
 });
 
 describe("case view: real states, nothing invented", () => {
+  it("SAV-18: a case held by its block's switch shows a visible wait, off or paused, never a silent skip", () => {
+    const off = buildCasePilotView({ snapshot: snapshot(), events: [event({})], timers: [], pause: running, now, blockHold: { blockId: "access", reason: "block_off", since: "2026-11-12T09:00:00.000Z" } });
+    expect(off.waits).toContainEqual(expect.objectContaining({ label: expect.stringContaining("Bloc éteint"), detail: "Bloc access, motif block_off, depuis 2026-11-12T09:00:00.000Z.", needsPerson: false }));
+    const paused = buildCasePilotView({ snapshot: snapshot(), events: [event({})], timers: [], pause: running, now, blockHold: { blockId: "access", reason: "block_paused", since: "2026-11-12T09:00:00.000Z" } });
+    expect(paused.waits).toContainEqual(expect.objectContaining({ label: expect.stringContaining("Bloc en pause") }));
+    expect(buildCasePilotView({ snapshot: snapshot(), events: [event({})], timers: [], pause: running, now }).waits.some(w => w.label.includes("Bloc"))).toBe(false);
+  });
   it("current proposal, open question, customer wait and J2 follow-up", () => {
     const view = buildCasePilotView({ snapshot: snapshot(), events: [event({}), record(proposal(4), 4)], timers: [timer], pause: running, now });
     expect(view.proposal).toMatchObject({ state: "found", stale: false, action: "Répondre au client", reply: reply.text, citations: 1 });

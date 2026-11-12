@@ -17,7 +17,7 @@ it("server actions match the parity matrix exactly", () => {
     found[path.relative(src, file).split(path.sep).join("/")] = [...text.matchAll(/export\s+async\s+function\s+(\w+)\s*\(/g)].map(match => match[1]);
   }
   expect(found).toEqual(snapshot.files);
-  expect(Object.values(found).flat()).toHaveLength(103);
+  expect(Object.values(found).flat()).toHaveLength(104);
 });
 
 // The guards recorded in the matrix are the real ones: the key actions check SAV staff first and
@@ -44,4 +44,12 @@ it("manual Other is guarded in its lib by the administrator and the operator che
   expect(source("lib/sav/intake/execution-policy.ts")).toMatch(/\["admin", "owner"\]\.includes\(staff\.role\)/);
   expect(lib).toMatch(/function assertOperator\(actorEmail: string\) \{\n\s*if \(actorEmail\.toLowerCase\(\) !== "ugo@limova\.ai"\) throw/);
   expect(snapshot.guards["app/studio/sav/intake/manual-other-actions.ts"].action).toBeNull();
+});
+it("per-block switch is guarded in its lib by the administrator before any parsing or write", () => {
+  const action = source("app/studio/sav/intake/blocks/actions.ts"), lib = source("lib/sav/cases/block-switch-admin.ts");
+  expect(action).toContain("await setSavBlockSwitch(");
+  expect(bodyOf(lib, "savBlockSwitchAdministrator")).toContain("return executionAdministrator()");
+  expect(bodyOf(lib, "setSavBlockSwitch")).toMatch(/const staff = await savBlockSwitchAdministrator\(\), input = inputSchema\.parse\(raw\);/);
+  expect(bodyOf(lib, "readSavBlockSwitchPanel")).toMatch(/^[^\n]*\n\s*await savBlockSwitchAdministrator\(\);/);
+  expect(snapshot.guards["app/studio/sav/intake/blocks/actions.ts"].action).toBeNull();
 });

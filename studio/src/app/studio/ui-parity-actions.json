@@ -100,6 +100,9 @@
    "createAgentKeyAction",
    "revokeAgentKeyAction"
   ],
+  "app/studio/sav/intake/blocks/actions.ts": [
+   "setBlockSwitchAction"
+  ],
   "app/studio/sav/intake/budget/actions.ts": [
    "setBudgetAction"
   ],
@@ -160,6 +163,11 @@
    "action": null,
    "lib": "lib/sav/external-completion.ts classifySavDossierOtherManually: executionAdministrator() then assertOperator()",
    "roles": "admin or owner, ugo@limova.ai only, V0 stage only"
+  },
+  "app/studio/sav/intake/blocks/actions.ts": {
+   "action": null,
+   "lib": "lib/sav/cases/block-switch-admin.ts setSavBlockSwitch: savBlockSwitchAdministrator() (executionAdministrator) before parsing or writing",
+   "roles": "admin or owner with SAV access"
   }
  }
 }

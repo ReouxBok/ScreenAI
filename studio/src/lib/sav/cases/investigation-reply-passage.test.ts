@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import { eq } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { createSavTestDb } from "../../../../test/sav-db";
-import { savCaseEffectExecutions, savCaseReplyValidations, savCaseTimers, savIntakeEffects, savIntakeExecutionPolicies, savIntakeExecutions, savIntakeRuns, savMailboxes, savMessages, savThreads, staffUsers } from "@/db/schema";
+import { savCaseEffectExecutions, savCaseReplyValidations, savCaseTimers, savIntakeEffects, savIntakeExecutionPolicies, savIntakeExecutions, savIntakeRuns, savMailboxes, savMessages, savSyncState, savThreads, staffUsers } from "@/db/schema";
 const state = vi.hoisted(() => ({ db: null as unknown }));
 vi.mock("@/db", () => ({ requireDb: () => { if (!state.db) throw Error("NO_DB_ALLOWED"); return state.db; } }));
 // B7 T8: pole A's journal read, passed through as is, except once when a test arms a failure (sav.case_events is append-only:
@@ -274,5 +274,58 @@ describe("passage to the send plan (B): C's store, A's rule, nothing short of ev
     expect(bound.ok).toBe(true);
     if (bound.ok) expect((await bound.run(mail.caseId)).reply).toMatchObject({ status: "awaiting_person" });
     expect(CASE_REPLY_PLAN_PORTS).toHaveLength(20);
+  });
+
+  // Per-block switch (12/11): stored like the agent pause; the default (no row) is today's behaviour, tested above.
+  const BLOCK_KEY = "sav-block-switch.v1:access";
+  const setBlock = async (mode: "off" | "draft" | "auto", paused: boolean) => {
+    const values = { key: BLOCK_KEY, status: "active", cursor: encryptSavPayload({ revision: "sav-block-switch.v1", blockId: "access", mode, paused,
+      setBy: "admin@example.invalid", setAt: new Date().toISOString(), reason: "Réglage synthétique" }) };
+    await f.db.insert(savSyncState).values(values).onConflictDoUpdate({ target: savSyncState.key, set: values });
+  };
+  const clearBlock = () => f.db.delete(savSyncState).where(eq(savSyncState.key, BLOCK_KEY));
+  describe("per-block switch: off, pause and draft never send; the global switch off wins over the block's auto", () => {
+    afterEach(async () => { await clearBlock(); });
+    it("no row: Access keeps today's automatic send under the global switch (default unchanged)", async () => {
+      await clearBlock();
+      const mail = await answered();
+      expect(await passCaseInvestigationToReplyPlan(mail.caseId, passage(AUTO))).toMatchObject({ status: "queued", created: true });
+    });
+    for (const [mode, paused, code] of [["off", false, "block_off"], ["auto", true, "block_paused"], ["draft", true, "block_paused"]] as const) {
+      it(`${mode}${paused ? " + pause" : ""}: a visible wait (${code}), no proposal, no approval, no execution, even with the global switch on`, async () => {
+        await setBlock(mode, paused);
+        const mail = await answered();
+        const report = await passCaseInvestigationToReplyPlan(mail.caseId, passage(AUTO));
+        expect(report).toEqual({ status: "block_held", caseId: mail.caseId, blockId: "access", reason: code, detail: "access" });
+        expect(await passCaseInvestigationToReplyPlan(mail.caseId, passage(AUTO))).toEqual(report);
+        expect(await sideEffects(mail.caseId)).toEqual({ effects: 0, validations: 0, timers: 0 });
+      });
+    }
+    it("draft: the reply is proposed for a person and never approved or queued by the rule", async () => {
+      await setBlock("draft", false);
+      const mail = await answered();
+      const report = await passCaseInvestigationToReplyPlan(mail.caseId, passage(AUTO));
+      expect(report).toMatchObject({ status: "awaiting_person", reasons: ["block_draft"] });
+      const [row] = await f.db.select().from(savCaseReplyValidations).where(eq(savCaseReplyValidations.caseId, mail.caseId));
+      expect(row).toMatchObject({ state: "proposed" });
+      expect(await sideEffects(mail.caseId)).toEqual({ effects: 0, validations: 1, timers: 0 });
+    });
+    it("draft: B's authorizer refuses the rule's approval even on an automated, proven proposal", async () => {
+      const mail = await answered();
+      // Proposed in the automated mode while the block was auto but the approval is asked after the switch to draft.
+      await setBlock("draft", false);
+      const proposed = await passCaseInvestigationToReplyPlan(mail.caseId, passage(AUTO));
+      if (proposed.status !== "awaiting_person") throw Error("NO_PROPOSAL");
+      const [row] = await f.db.select().from(savCaseReplyValidations).where(eq(savCaseReplyValidations.id, proposed.validationId));
+      expect(await caseAccessAutoReplyAuthorizer(passage(AUTO))({ action: "approve", approverId: APPROVER, caseId: mail.caseId, replyKey: row!.replyKey, payloadHash: row!.payloadHash, purpose: "answer" }))
+        .toEqual({ allowed: false, reason: "block_draft" });
+      expect((await sideEffects(mail.caseId)).effects).toBe(0);
+    });
+    it("global switch off wins over the block's explicit auto: a person validates, nothing is queued", async () => {
+      await setBlock("auto", false);
+      const mail = await answered();
+      expect(await passCaseInvestigationToReplyPlan(mail.caseId, passage({}))).toMatchObject({ status: "awaiting_person", reasons: ["auto_disabled"] });
+      expect(await sideEffects(mail.caseId)).toEqual({ effects: 0, validations: 1, timers: 0 });
+    });
   });
 });
