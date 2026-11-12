@@ -1,5 +1,5 @@
 import { sleep } from "workflow";
-import { continueSavHeartbeatStep, savHeartbeatCatchUpStep, savHeartbeatTickStep } from "./steps";
+import { continueSavHeartbeatStep, savHeartbeatCatchUpStep, savHeartbeatTickStep, savHeartbeatV2EffectsStep } from "./steps";
 
 /** Fallback heartbeat of the self-scheduler (lib/sav/self-scheduler.ts): a bounded loop of ticks 5 min apart (about 6 h),
  * then a fresh run of itself on the latest deployment (continueSavHeartbeat documents "latest" and rollbacks), so the event
@@ -13,12 +13,22 @@ export type SavHeartbeatResult = { stopped: string; iterations: number; generati
 export async function savHeartbeatWorkflow(state: SavHeartbeatState): Promise<SavHeartbeatResult> {
   "use workflow";
   for (let iteration = 0; iteration < SAV_HEARTBEAT_ITERATIONS; iteration++) {
+    let ticked = false;
     try {
       const tick = await savHeartbeatTickStep(state.owner);
       if (!tick.alive) return { stopped: tick.reason, iterations: iteration, generation: state.generation };
+      ticked = true;
       await savHeartbeatCatchUpStep();
     } catch {
       console.error("sav_self_scheduler_heartbeat", { status: "step_failed", iteration, generation: state.generation });
+    }
+    // After a live tick, the V2 effects pass is guarded on its own: a failed catch-up pass does not skip it.
+    if (ticked) {
+      try {
+        await savHeartbeatV2EffectsStep();
+      } catch {
+        console.error("sav_self_scheduler_heartbeat", { status: "v2_effects_step_failed", iteration, generation: state.generation });
+      }
     }
     await sleep("5m");
   }

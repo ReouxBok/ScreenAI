@@ -8,7 +8,8 @@ import { continueCaseAfterCommit, qualificationRelayBinder, v2EntryRelayDeps } f
 import { savV2QualificationCaseAllowed } from "./qualification-scope";
 import type { ManualQualificationPorts } from "./manual-qualification";
 
-export function manualQualificationPorts(env: Record<string, string | undefined>): ManualQualificationPorts {
+/** `immediateDeadlineMs` (11/11): when the request must be done; a reply queued by the continuation may then be sent at once within it. */
+export function manualQualificationPorts(env: Record<string, string | undefined>, options: { immediateDeadlineMs?: number } = {}): ManualQualificationPorts {
   return {
     now: () => new Date(), paused: () => relayPaused(requireDb()),
     async target(messageId) {
@@ -46,6 +47,6 @@ export function manualQualificationPorts(env: Record<string, string | undefined>
       }
       return { caseId: result.caseId, owner: result.owner };
     },
-    continue: caseId => continueCaseAfterCommit(caseId, "relay", { env }),
+    continue: caseId => continueCaseAfterCommit(caseId, "relay", { env, ...(options.immediateDeadlineMs === undefined ? {} : { immediateDeadlineMs: options.immediateDeadlineMs }) }),
   };
 }

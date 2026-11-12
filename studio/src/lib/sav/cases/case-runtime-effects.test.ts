@@ -885,6 +885,38 @@ describe("the receipt transaction, read as code", () => {
   });
 });
 
+describe("immediate send (11/11): a pass targeted at ONE execution", () => {
+  it("sends that execution only, through the same query and claim; an older queued execution is not read, claimed or changed (left to the catch-up)", async () => {
+    const older = await admit(await scenario("answer"));
+    const before = await execution(older.id);
+    const s = await scenario("answer"), target = await admit(s);
+    const result = await pass({ executionId: target.id });
+    expect(result).toMatchObject({ skipped: null, recovery: [], supervised: [{ executionId: target.id, state: "confirmed", reason: null }] });
+    expect(sends).toBe(1);
+    const after = await execution(older.id);
+    expect({ state: after.state, leaseToken: after.leaseToken, leaseUntil: after.leaseUntil, updatedAt: after.updatedAt })
+      .toEqual({ state: before.state, leaseToken: before.leaseToken, leaseUntil: before.leaseUntil, updatedAt: before.updatedAt });
+    expect(await effectsOf(older.id)).toEqual([]);
+    // Targeted again once confirmed: nothing is selected, nothing is sent.
+    expect(await pass({ executionId: target.id })).toMatchObject({ skipped: null, supervised: [] });
+    expect(sends).toBe(1);
+  });
+  it("the same guards: fully paused, the targeted pass reads and sends nothing; an engaged (uncertain) execution is never selected, only verified by the catch-up", async () => {
+    const s = await scenario("answer"), { id } = await admit(s);
+    await setPause("v2", "fully_paused");
+    expect(await pass({ executionId: id })).toMatchObject({ skipped: expect.any(String), supervised: [] });
+    await setPause("v2", null);
+    expect(providerCalls()).toBe(0);
+    loseAck = true; expect(await run(id)).toMatchObject({ state: "uncertain" }); loseAck = false;
+    expect(sends).toBe(1);
+    // Lease free: only the « engaged effect » rule of the shared query keeps it out of the targeted pass.
+    await f.client.exec(`UPDATE sav.case_effect_executions SET lease_until = NULL, lease_token = NULL WHERE id = '${id}'`);
+    expect((await effectsOf(id)).map(effect => effect.state)).toEqual(["uncertain"]);
+    expect(await pass({ executionId: id })).toMatchObject({ skipped: null, recovery: [], supervised: [] });
+    expect(sends).toBe(1);
+  });
+});
+
 describe("one executor, no transport of its own", () => {
   it("the entrypoint file reaches the provider only through `executeIntakePass` / `recoverCaseEffects`: no adapter dispatch, no marker, no ledger write, no network import", () => {
     const source = readFileSync(fileURLToPath(new URL("./case-runtime-effects.ts", import.meta.url)), "utf8");

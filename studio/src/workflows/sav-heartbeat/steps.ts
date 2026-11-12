@@ -1,5 +1,5 @@
 import "server-only";
-import { maybeRunCatchUp, runSavHeartbeatTick } from "@/lib/sav/self-scheduler";
+import { maybeRunCatchUp, maybeRunV2Effects, runSavHeartbeatTick } from "@/lib/sav/self-scheduler";
 import { continueSavHeartbeat } from "@/lib/sav/self-scheduler-heartbeat";
 import type { SavHeartbeatState } from "./index";
 
@@ -19,6 +19,15 @@ export async function savHeartbeatCatchUpStep() {
   return { status: result.status, reason: result.reason ?? null };
 }
 savHeartbeatCatchUpStep.maxRetries = 0;
+
+/** At most one sav-v2-effects pass (270 s budget, the cron route's function) when the last one started more than 12 min ago.
+ * Its own step, like the catch-up: two 270 s passes never share one step's function deadline. */
+export async function savHeartbeatV2EffectsStep() {
+  "use step";
+  const result = await maybeRunV2Effects("heartbeat_workflow");
+  return { status: result.status, reason: result.reason ?? null };
+}
+savHeartbeatV2EffectsStep.maxRetries = 0;
 
 /** Hands the singleton to the next generation and starts it once (see continueSavHeartbeat). */
 export async function continueSavHeartbeatStep(state: SavHeartbeatState) {

@@ -107,13 +107,8 @@ export async function runSavReconcilePass(options: SavReconcilePassOptions) {
     const { reconcileCaseJ2 } = await import("@/lib/sav/cases/v2-j2-binding");
     return reconcileCaseJ2({ env: process.env, deadlineMs: derivedDeadline });
   });
-  const caseEffects = await runStep("v2_case_effects", async () => {
-    if (process.env.SAV_V2_ENTRY !== "on" || process.env.SAV_CASE_RECORDING !== "on") return { skipped: "v2_off" };
-    if (Date.now() + 20_000 > derivedDeadline) return { skipped: "deadline" };
-    const { reconcileCaseV2Effects } = await import("@/lib/sav/cases/v2-effects-binding");
-    return reconcileCaseV2Effects({ env: process.env, deadlineMs: derivedDeadline });
-  });
-  const payload = { caseReminders, caseEffects, intakeRead, intakeWakes, intakeTracking, intakeChoices, intakeConsole, intakeExecution, caseRelays, intakeObservation, gmail, hubspot, emailOpenings, contextRefreshes, trainings, evaluations, ticketActions, pilotActions, replies, statusActions, learningBackfill, observations, translations, retention, dashboardProjection };
+  // V2 effects (replies, handoff notices, ticket stages, closures) have their own worker: /api/cron/sav-v2-effects (11/11).
+  const payload = { caseReminders, intakeRead, intakeWakes, intakeTracking, intakeChoices, intakeConsole, intakeExecution, caseRelays, intakeObservation, gmail, hubspot, emailOpenings, contextRefreshes, trainings, evaluations, ticketActions, pilotActions, replies, statusActions, learningBackfill, observations, translations, retention, dashboardProjection };
   const hasStepFailure = Object.values(payload).some((step) => step.status === "error");
   await recordSavWorkerPulse(pulseId, pulseStartedAt, hasStepFailure);
   return { payload, hasStepFailure, pulseId };

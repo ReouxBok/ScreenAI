@@ -30,6 +30,11 @@
       "path": "/api/cron/sav-reconcile",
       "requestMethod": "GET"
     },
+    "sav-v2-effects": {
+      "schedule": "*/10 * * * *",
+      "path": "/api/cron/sav-v2-effects",
+      "requestMethod": "GET"
+    },
     "sav-monitor": {
       "schedule": "2-59/5 * * * *",
       "path": "/api/cron/sav-monitor",

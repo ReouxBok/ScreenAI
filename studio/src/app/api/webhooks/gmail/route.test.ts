@@ -5,12 +5,15 @@ vi.mock("@/lib/sav/gmail", () => ({ acceptGmailWebhook: state.accept, processGma
 const fallback = vi.hoisted(() => ({ run: vi.fn(), ensure: vi.fn() }));
 vi.mock("@/lib/sav/self-scheduler", () => ({ runSavSelfSchedulerFromWebhook: fallback.run }));
 vi.mock("@/lib/sav/self-scheduler-heartbeat", () => ({ ensureSavHeartbeat: fallback.ensure }));
+const watchdog = vi.hoisted(() => ({ watch: vi.fn() }));
+vi.mock("@/lib/sav/monitor-watchdog", () => ({ watchSavReconcilePulse: watchdog.watch }));
 import { POST } from "./route";
 
 const request = () => new Request("https://studio.example.invalid/api/webhooks/gmail", { method: "POST", body: JSON.stringify({ message: { data: "e30=" } }) });
 beforeEach(() => {
   state.after = []; state.accept.mockReset(); state.process.mockReset(); state.verify.mockReset(); state.verify.mockResolvedValue(true);
   fallback.run.mockReset(); fallback.run.mockResolvedValue({ status: "checked" }); fallback.ensure.mockReset();
+  watchdog.watch.mockReset(); watchdog.watch.mockResolvedValue({ checked: true, stale: false });
   vi.spyOn(console, "error").mockImplementation(() => {});
 });
 
@@ -72,5 +75,21 @@ it("12f. a receipt rejection does not cut the fallback: the post-commit work wai
   expect(fallback.run).toHaveBeenCalledTimes(1); expect(settled).toBe(false);
   finish();
   await expect(work).rejects.toThrow("SAV_RECEIPT_FAILED");
-  expect(fallbackDone).toBe(true);
+  expect(fallbackDone).toBe(true); expect(watchdog.watch).toHaveBeenCalledTimes(1);
+});
+
+it("12g. the watchdog of the scheduled catch-up runs only after the acknowledgement, with the receipt, and never for a duplicate or a rejection", async () => {
+  watchdog.watch.mockReset(); watchdog.watch.mockResolvedValue({ checked: true, stale: false });
+  state.accept.mockResolvedValue({ duplicate: false, receipt: { id: "receipt-2" } });
+  state.process.mockResolvedValue(undefined);
+  expect((await POST(request())).status).toBe(204);
+  expect(watchdog.watch).not.toHaveBeenCalled();
+  expect(state.after).toHaveLength(1);
+  await state.after[0]();
+  expect(state.process).toHaveBeenCalledWith("receipt-2"); expect(watchdog.watch).toHaveBeenCalledTimes(1);
+  state.after = []; state.accept.mockResolvedValue({ duplicate: true, receipt: { id: "receipt-2" } });
+  expect((await POST(request())).status).toBe(204); expect(state.after).toHaveLength(0);
+  state.verify.mockResolvedValue(false);
+  expect((await POST(request())).status).toBe(401);
+  expect(watchdog.watch).toHaveBeenCalledTimes(1);
 });

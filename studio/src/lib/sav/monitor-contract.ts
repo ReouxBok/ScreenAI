@@ -1,8 +1,14 @@
 import { createHash } from "node:crypto";
 import { z } from "zod";
 
-export const monitorCodes = ["worker_missing", "worker_stalled", "worker_failed", "watch_unavailable", "ingestion_failed", "ingestion_delayed", "quarantine", "schema_missing", "configuration_invalid", "automation_off", "authority_expiring", "authority_admission_limit", "runtime_expiring", "intake_held", "sources_changed_waiting", "dossier_waiting", "intake_blocked", "other_rules_expiring", "analysis_delayed", "analysis_waiting", "analysis_uncertain", "legacy_unclaimed", "legacy_human_queued", "execution_delayed", "effect_uncertain", "effect_failed", "daily_budget_low", "rolling_budget_low", "collection_failed", "agent_paused", "vercel_cron_missing"] as const;
+export const monitorCodes = ["worker_missing", "worker_stalled", "worker_failed", "watch_unavailable", "ingestion_failed", "ingestion_delayed", "quarantine", "schema_missing", "configuration_invalid", "automation_off", "authority_expiring", "authority_admission_limit", "runtime_expiring", "intake_held", "sources_changed_waiting", "dossier_waiting", "intake_blocked", "other_rules_expiring", "analysis_delayed", "analysis_waiting", "analysis_uncertain", "legacy_unclaimed", "legacy_human_queued", "execution_delayed", "effect_uncertain", "effect_failed", "daily_budget_low", "rolling_budget_low", "collection_failed", "agent_paused", "vercel_cron_missing", "v2_effects_missing", "v2_effects_stalled", "v2_effects_failed"] as const;
 export type MonitorCode = typeof monitorCodes[number];
+/** 11/11: the V2 effects catch-up (`/api/cron/sav-v2-effects`, every 10 min) keeps its own pulse, in the same table and format as `sav-reconcile`, under its own key. */
+export const SAV_V2_EFFECTS_WORKER = "sav-monitor:v1:worker:sav-v2-effects";
+/** Two missed periods and a half: stalled. */
+export const SAV_V2_EFFECTS_STALE_MS = 25 * 60_000;
+/** The V2 effects worker is expected only when V2 runs (the same switches as its route). */
+export const savV2EffectsExpected = (env: Record<string, string | undefined> = process.env) => env.SAV_V2_ENTRY === "on" && env.SAV_CASE_RECORDING === "on";
 const issue = z.object({ code: z.enum(monitorCodes), count: z.number().int().nonnegative().max(2_147_483_647), severity: z.enum(["warning", "critical"]) }).strict();
 const event = issue.extend({ change: z.enum(["opened", "worsened", "recovered"]), at: z.iso.datetime() });
 export const monitorStateSchema = z.object({

@@ -162,7 +162,9 @@ function ownerTransport(env: Env, network?: typeof fetch): CaseOwnerReadTranspor
   };
 }
 
-type EntryDeps = { env: Env; network?: typeof fetch; continuation?: CaseContinuationPoint | null; returnDeps?: Partial<CustomerReturnDeps> };
+/** `immediateDeadlineMs` (11/11): when the caller must be done; given, a reply queued by the continuation may be sent at once within that budget.
+ * Absent (the shared `sav-reconcile` worker): never sent here, the effects catch-up sends it. */
+type EntryDeps = { env: Env; network?: typeof fetch; continuation?: CaseContinuationPoint | null; returnDeps?: Partial<CustomerReturnDeps>; immediateDeadlineMs?: number };
 
 function returnSources(input: EntryDeps): CustomerReturnDeps {
   const { env } = input, readOwner = hubspotTicketOwnerReader(ownerTransport(env, input.network));
@@ -327,7 +329,7 @@ export async function continueCaseAfterCommit(caseId: string, trigger: CaseConti
   try {
     const point = input.continuation === undefined ? await loadCaseContinuationPoint() : input.continuation;
     if (point) {
-      const report = await point({ caseId, trigger, env: input.env });
+      const report = await point({ caseId, trigger, env: input.env, ...(input.immediateDeadlineMs === undefined ? {} : { deadlineMs: input.immediateDeadlineMs }) });
       await markContinuation(caseId, trigger, null);
       return report;
     }

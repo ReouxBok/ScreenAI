@@ -2,12 +2,15 @@ import "server-only";
 import { eq, inArray, sql } from "drizzle-orm";
 import { requireDb } from "@/db";
 import { auditLogs, savMailboxes, savSyncState } from "@/db/schema";
+import { SAV_V2_EFFECTS_WORKER } from "@/lib/sav/monitor-contract";
 
 /** Durable state of the self-scheduler fallback (lib/sav/self-scheduler.ts). Rows of the existing sav.sync_state
  * table only, under their own keys: no migration, no other key is written. Each claim is serialized by a transaction
  * advisory lock on its key, the same mechanism as the monitor lease (lib/sav/monitor.ts). */
 export const SELF_SCHEDULER_KEY_PREFIX = "sav-self-scheduler:v1:";
 export const SAV_WORKER_PULSE_KEY = "sav-monitor:v1:worker";
+/** The sav-v2-effects worker pulse (11/11), written at the start of every V2 effects pass (cron or fallback). */
+export const SAV_V2_EFFECTS_PULSE_KEY = SAV_V2_EFFECTS_WORKER;
 export const SAV_MONITOR_SNAPSHOT_KEY = "sav-monitor:v1:snapshot";
 export const SAV_HEARTBEAT_KEY = `${SELF_SCHEDULER_KEY_PREFIX}heartbeat`;
 /** Opt-in switch. Absent, unreadable or anything but enabled=true means OFF: delivering the code changes nothing. */
@@ -15,7 +18,7 @@ export const SELF_SCHEDULER_SWITCH_KEY = `${SELF_SCHEDULER_KEY_PREFIX}switch`;
 /** The fallback's sav-reconcile row; its lastPulseId tells the monitor whether the current pulse is the fallback's. */
 export const SELF_SCHEDULER_CATCH_UP_KEY = `${SELF_SCHEDULER_KEY_PREFIX}sav-reconcile`;
 
-export type SelfSchedulerJob = "sav-reconcile" | "sav-monitor" | "gmail-watch" | "memory-retention";
+export type SelfSchedulerJob = "sav-reconcile" | "sav-v2-effects" | "sav-monitor" | "gmail-watch" | "memory-retention";
 export type SelfSchedulerJobRecord = {
   owner: string | null; leaseUntil: string | null; lastStartedAt: string | null; lastTrigger: string | null;
   lastPulseId: string | null; lastFinishedAt: string | null; lastStatus: string | null;
@@ -23,6 +26,8 @@ export type SelfSchedulerJobRecord = {
 export type SelfSchedulerSignals = {
   /** The sav-reconcile worker pulse, written at the start of every pass (cron or fallback). */
   pulse: { id: string; startedAt: string } | null;
+  /** The sav-v2-effects worker pulse, written at the start of every V2 effects pass (cron or fallback). Optional: absent means none. */
+  v2EffectsPulse?: { id: string; startedAt: string } | null;
   /** observedAt of the last monitor snapshot. */
   monitorObservedAt: string | null;
   /** watch_expiration of each active mailbox (null when unknown). */
@@ -68,12 +73,15 @@ async function switchOn(tx: Pick<Tx, "select">) {
 const OFF = { run: false as const, reason: "switch_off" };
 async function readSignals(tx: Tx): Promise<SelfSchedulerSignals> {
   const rows = await tx.select({ key: savSyncState.key, cursor: savSyncState.cursor }).from(savSyncState)
-    .where(inArray(savSyncState.key, [SAV_WORKER_PULSE_KEY, SAV_MONITOR_SNAPSHOT_KEY, SELF_SCHEDULER_CATCH_UP_KEY]));
+    .where(inArray(savSyncState.key, [SAV_WORKER_PULSE_KEY, SAV_V2_EFFECTS_PULSE_KEY, SAV_MONITOR_SNAPSHOT_KEY, SELF_SCHEDULER_CATCH_UP_KEY]));
   const pulse = parse(rows.find(row => row.key === SAV_WORKER_PULSE_KEY)?.cursor);
   const pulseId = text(pulse?.id), pulseStartedAt = text(pulse?.startedAt);
+  const v2Pulse = parse(rows.find(row => row.key === SAV_V2_EFFECTS_PULSE_KEY)?.cursor);
+  const v2PulseId = text(v2Pulse?.id), v2PulseStartedAt = text(v2Pulse?.startedAt);
   const mailboxes = await tx.select({ watchExpiration: savMailboxes.watchExpiration }).from(savMailboxes).where(eq(savMailboxes.active, true)).limit(50);
   return {
     pulse: pulseId && pulseStartedAt ? { id: pulseId, startedAt: pulseStartedAt } : null,
+    v2EffectsPulse: v2PulseId && v2PulseStartedAt ? { id: v2PulseId, startedAt: v2PulseStartedAt } : null,
     monitorObservedAt: text(parse(rows.find(row => row.key === SAV_MONITOR_SNAPSHOT_KEY)?.cursor)?.observedAt),
     watchExpirations: mailboxes.map(mailbox => mailbox.watchExpiration ? mailbox.watchExpiration.toISOString() : null),
     catchUpPulseId: jobRecord(rows.find(row => row.key === SELF_SCHEDULER_CATCH_UP_KEY)?.cursor)?.lastPulseId ?? null,

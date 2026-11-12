@@ -4,10 +4,11 @@ import { renewActiveGmailWatches } from "@/lib/sav/gmail";
 import { runSavServerMonitor } from "@/lib/sav/monitor";
 import { purgeExpiredMemory } from "@/memory/service";
 import { runSavReconcilePass } from "@/lib/sav/reconcile-pass";
+import { runSavV2EffectsPass } from "@/lib/sav/v2-effects-pass";
 import { beatSavHeartbeat, claimSelfSchedulerJob, finishSelfSchedulerJob, type SelfSchedulerDecision, type SelfSchedulerJob,
   type SelfSchedulerJobRecord, type SelfSchedulerSignals } from "@/lib/sav/self-scheduler-store";
 
-/** Fallback for the four Vercel schedules (vercel.json, kept as the primary path). OPT-IN: nothing runs unless an
+/** Fallback for the Vercel schedules (the four of #244 and sav-v2-effects) (vercel.json, kept as the primary path). OPT-IN: nothing runs unless an
  * administrator turned the database switch ON (sav-self-scheduler:v1:switch, /api/internal/sav/self-scheduler); an absent
  * row means OFF, and the switch is re-read at every lease claim and every heartbeat tick. SAV_SELF_SCHEDULER_DISABLED=1 is
  * an extra hard stop, and nothing runs outside VERCEL_ENV=production. When ON, each job still runs only when the scheduled
@@ -17,6 +18,8 @@ const MINUTE = 60_000, HOUR = 60 * MINUTE;
 export const SELF_SCHEDULER_TIMING = {
   /** sav-reconcile runs every 5 min: a pass started more than 12 min ago means at least two missed runs. */
   catchUpStaleMs: 12 * MINUTE,
+  /** sav-v2-effects runs every 10 min: a pass started more than 12 min ago means its last run was missed. */
+  v2EffectsStaleMs: 12 * MINUTE,
   /** sav-monitor runs every 5 min (2-59/5). */
   monitorStaleMs: 10 * MINUTE,
   /** The daily cron renews the 7-day watch; the fallback renews when less than 48 h remain, or when unknown. */
@@ -52,6 +55,11 @@ export function decideCatchUp(record: SelfSchedulerJobRecord | null, signals: Se
   if (leased(record, now)) return skip("leased");
   const last = latest(signals.pulse?.startedAt, record?.lastStartedAt);
   return last !== null && now - last < SELF_SCHEDULER_TIMING.catchUpStaleMs ? skip("fresh") : RUN;
+}
+export function decideV2Effects(record: SelfSchedulerJobRecord | null, signals: SelfSchedulerSignals, now: number): SelfSchedulerDecision {
+  if (leased(record, now)) return skip("leased");
+  const last = latest(signals.v2EffectsPulse?.startedAt, record?.lastStartedAt);
+  return last !== null && now - last < SELF_SCHEDULER_TIMING.v2EffectsStaleMs ? skip("fresh") : RUN;
 }
 export function decideMonitor(record: SelfSchedulerJobRecord | null, signals: SelfSchedulerSignals, now: number): SelfSchedulerDecision {
   if (leased(record, now)) return skip("leased");
@@ -124,6 +132,14 @@ export function maybeRunCatchUp(trigger: SelfSchedulerTrigger, options: { env?: 
   return runJob({ job: "sav-reconcile", trigger, env: options.env, pulseId, leaseMs: budgetMs + 60_000, decide: decideCatchUp,
     work: async () => (await runSavReconcilePass({ trigger, pulseId, budgetMs })).hasStepFailure ? "step_failure" : "ok" });
 }
+/** One sav-v2-effects pass (the cron route's runSavV2EffectsPass, same pulse) when the last one started more than 12 min ago.
+ * Same budgets as the catch-up: 270 s from the heartbeat, the webhook's own deadline from the webhook, none under a minute. */
+export function maybeRunV2Effects(trigger: SelfSchedulerTrigger, options: { env?: Env; requestStartedAt?: number } = {}) {
+  const budgetMs = trigger === "gmail_webhook" ? (options.requestStartedAt ?? Date.now()) + WEBHOOK_PASS_DEADLINE_MS - Date.now() : 270_000, pulseId = randomUUID();
+  if (budgetMs < 60_000) return Promise.resolve<SelfSchedulerResult>({ job: "sav-v2-effects", status: "skipped", reason: "insufficient_budget" });
+  return runJob({ job: "sav-v2-effects", trigger, env: options.env, pulseId, leaseMs: budgetMs + 60_000, decide: decideV2Effects,
+    work: async () => (await runSavV2EffectsPass({ trigger, pulseId, budgetMs })).hasStepFailure ? "step_failure" : "ok" });
+}
 export function maybeRenewGmailWatch(trigger: SelfSchedulerTrigger, options: { env?: Env } = {}) {
   return runJob({ job: "gmail-watch", trigger, env: options.env, leaseMs: 120_000, decide: decideWatchRenewal,
     work: async () => `renewed_${(await renewActiveGmailWatches()).length}` });
@@ -145,8 +161,9 @@ export async function runSavSelfSchedulerFromWebhook(options: { env?: Env; reque
   try {
     if (options.ensureHeartbeat) await options.ensureHeartbeat().catch(error => console.error("sav_self_scheduler_heartbeat", { status: "ensure_failed", errorCode: errorCode(error) }));
     const watch = await maybeRenewGmailWatch("gmail_webhook", options);
-    const [catchUp, monitor, retention] = await Promise.all([maybeRunCatchUp("gmail_webhook", options), maybeRunMonitor("gmail_webhook", options), maybeRunMemoryRetention("gmail_webhook", options)]);
-    return { status: "checked" as const, results: [watch, catchUp, monitor, retention] };
+    const [catchUp, v2Effects, monitor, retention] = await Promise.all([maybeRunCatchUp("gmail_webhook", options), maybeRunV2Effects("gmail_webhook", options),
+      maybeRunMonitor("gmail_webhook", options), maybeRunMemoryRetention("gmail_webhook", options)]);
+    return { status: "checked" as const, results: [watch, catchUp, v2Effects, monitor, retention] };
   } catch (error) {
     console.error("sav_self_scheduler_webhook", { status: "failed", errorCode: errorCode(error) });
     return { status: "error" as const };

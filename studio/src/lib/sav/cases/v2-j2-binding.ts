@@ -18,9 +18,11 @@ import { pilotProvenanceGate } from "./pilot-passage-provenance";
 import type { J2ReminderEffect, J2Timer } from "./timer-lifecycle";
 import { revalidateJ2Timer, runDueJ2Pass, type J2Ports } from "./timer-store";
 import { savV2EntryEnabled } from "./v2-entry";
+import { immediateSendDeadline, type ImmediateCaseReplyOutcome, type ImmediateCaseReplySend } from "./immediate-send-budget";
 
 type Env = Record<string, string | undefined>;
-type Tick = { env: Env; deadlineMs: number; network?: typeof fetch };
+/** `sendNow` (11/11): the immediate sender for a reminder this tick queued; absent, the real one; null, none (the effects catch-up sends it). */
+type Tick = { env: Env; deadlineMs: number; network?: typeof fetch; sendNow?: ImmediateCaseReplySend | null };
 
 export async function readJ2ReminderEffect(timer: Pick<J2Timer,"caseId"|"id">): Promise<J2ReminderEffect> {
   const key = caseReplyKey(timer.caseId, j2TriggerEventId(timer.id)), db = requireDb();
@@ -51,7 +53,7 @@ export async function j2BudgetAvailable(env: Env, now: Date) {
 }
 
 export async function enqueueApprovedJ2(timer: Pick<J2Timer,"id"|"caseId">, caseVersion: number,
-  policy: {id:string;hash:string}, deps: CaseReplyStoreDeps) {
+  policy: {id:string;hash:string}, deps: CaseReplyStoreDeps, onQueued?: (executionId: string) => void) {
   const trigger = j2TriggerEventId(timer.id), key = caseReplyKey(timer.caseId,trigger);
   const [row] = await requireDb().select().from(savCaseReplyValidations).where(and(eq(savCaseReplyValidations.replyKey,key),
     eq(savCaseReplyValidations.caseId,timer.caseId),eq(savCaseReplyValidations.state,"approved")));
@@ -60,11 +62,12 @@ export async function enqueueApprovedJ2(timer: Pick<J2Timer,"id"|"caseId">, case
   if (proposal.purpose !== "reminder" || proposal.triggerEventId !== trigger || proposal.caseId !== timer.caseId ||
       proposal.caseVersion !== caseVersion || row.caseVersion !== caseVersion) return "reminder_approval_stale";
   const result = await enqueueApprovedCaseReply({validationId:row.id,policy,deps});
+  if (result.ok && result.created) onQueued?.(result.executionId);
   return result.ok ? (result.created ? "queued" : "already_queued") : result.code;
 }
 
 /** A wake may fire a due timer and enqueue an already approved, versioned reminder. It cannot author or approve a reminder. */
-export async function reconcileCaseJ2({env,deadlineMs,network}:Tick) {
+export async function reconcileCaseJ2({env,deadlineMs,network,sendNow}:Tick) {
   if (!savV2EntryEnabled(env) || env.SAV_V2_J2 !== "on" || readCaseEffectsMode(env).mode !== "supervised") return { skipped:"j2_off" };
   const expired = () => !Number.isFinite(deadlineMs) || Date.now() >= deadlineMs;
   if (expired()) return { skipped:"deadline" };
@@ -91,10 +94,10 @@ export async function reconcileCaseJ2({env,deadlineMs,network}:Tick) {
   const deps:CaseReplyStoreDeps={env:()=>env,currentPolicyRevision:provenance.currentPolicyRevision,
     readTicketOwner:createCaseTicketOwnerPort({env:()=>env,network}),pilotProvenance:pilotProvenanceGate(provenance)};
   const outcomes: {timerId:string;status:string}[] = [];
-  const observed = new Set<string>();
+  const observed = new Set<string>(), queued: string[] = [];
   const ports:J2Ports={reminderEffect:readJ2ReminderEffect,budgetAvailable,
     onConditionsMet:async ({timer,caseVersion})=>{
-      const status=expired()?"deadline":await enqueueApprovedJ2(timer,caseVersion,{id:config.policyId,hash:config.policyHash},deps);
+      const status=expired()?"deadline":await enqueueApprovedJ2(timer,caseVersion,{id:config.policyId,hash:config.policyHash},deps,id=>queued.push(id));
       outcomes.push({timerId:timer.id,status});
     }};
   for(let i=0;i<limit&&!expired();i++) {
@@ -105,6 +108,9 @@ export async function reconcileCaseJ2({env,deadlineMs,network}:Tick) {
     }
     if(!pass.outcomes[0]?.fired) break;
   }
+  // The reminders this tick queued leave at once, as they did when the effects ran in this worker, within the worker's budget (after the timer
+  // transactions, never inside one). Short of budget, or on any refusal, they stay queued for the effects catch-up.
+  const sentNow = await sendQueuedJ2Now(queued, { env, deadlineMs, sendNow });
   // A fired timer survives a crash after its transaction. Scan only the timer still named by each
   // current waiting case; the durable cursor advances even when an earlier case still lacks approval.
   if(!expired()) {
@@ -121,5 +127,21 @@ export async function reconcileCaseJ2({env,deadlineMs,network}:Tick) {
     }
     await page.commit(handled);
   }
-  return {outcomes,deadlineReached:expired()};
+  return {outcomes,deadlineReached:expired(),...(sentNow.length?{sentNow}:{})};
+}
+
+/** Immediate send of the reminders a J2 tick queued, one after the other, each only while the caller's budget allows a full send (`immediateSendDeadline`).
+ * Never throws: what is not sent stays queued for the effects catch-up. */
+export async function sendQueuedJ2Now(executionIds: readonly string[], input: { env: Env; deadlineMs: number; sendNow?: ImmediateCaseReplySend | null }) {
+  const out: { executionId: string; outcome: ImmediateCaseReplyOutcome }[] = [];
+  if (!executionIds.length || input.sendNow === null) return out;
+  let sendNow = input.sendNow;
+  for (const executionId of executionIds) {
+    if (immediateSendDeadline(input.deadlineMs) === null) { out.push({ executionId, outcome: { skipped: "caller_budget" } }); continue; }
+    try {
+      sendNow ??= (await import("./v2-effects-binding")).sendQueuedCaseReplyNow;
+      out.push({ executionId, outcome: await sendNow({ env: input.env, executionId, callerDeadlineMs: input.deadlineMs }) });
+    } catch { out.push({ executionId, outcome: { failed: "SAV_V2_IMMEDIATE_SEND_THREW" } }); }
+  }
+  return out;
 }

@@ -8,7 +8,11 @@ export const maxDuration = 180;
 const headers = { "Cache-Control": "private, no-store", "X-Content-Type-Options": "nosniff" };
 
 /** No GET mutation, no cron secret, no user-supplied model/config/owner, no batch. */
+/** The request's own budget for an immediate V2 send, inside maxDuration (180 s); the send needs 60 s of it left, else the catch-up sends. */
+const IMMEDIATE_BUDGET_MS = 165_000;
+
 export async function POST(request: Request) {
+  const startedAt = Date.now();
   let staff;
   try { staff = await requireApiStaff("admin"); }
   catch { return Response.json({ error: "forbidden" }, { status: 403, headers }); }
@@ -31,7 +35,7 @@ export async function POST(request: Request) {
     if (!input.success) return Response.json({ error: "invalid_request" }, { status: 400, headers });
   } catch { return Response.json({ error: "invalid_request" }, { status: 400, headers }); }
   try {
-    const result = await manualQualification(input.data, process.env, manualQualificationPorts(process.env));
+    const result = await manualQualification(input.data, process.env, manualQualificationPorts(process.env, { immediateDeadlineMs: startedAt + IMMEDIATE_BUDGET_MS }));
     return Response.json(result, { status: result.status === "refused" ? 409 : 200, headers });
   } catch {
     // An interrupted request is not proof of non-effect. Never retry automatically or expose provider/client text.
