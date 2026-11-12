@@ -63,3 +63,14 @@ export async function readIntakeMonitoring(): Promise<IntakeMonitoring> {
   }
   return result;
 }
+
+/** Console PR-1: the worker pulse alone (no auth, no pause, no budget), for callers that already authenticated staff. Null when missing or unreadable. */
+export async function readSchedulerPulse(now = new Date()): Promise<{ startedAt: string | null; finishedAt: string | null } | null> {
+  try {
+    const rows = await requireDb().select({ key: savSyncState.key, status: savSyncState.status,
+      cursor: sql<string | null>`case when octet_length(${savSyncState.cursor}) <= 8192 then ${savSyncState.cursor} else null end` })
+      .from(savSyncState).where(inArray(savSyncState.key, [WORKER])).limit(1);
+    const activity = projectMonitoringActivity(rows, now);
+    return activity.state === "missing" || activity.state === "unavailable" ? null : { startedAt: activity.startedAt, finishedAt: activity.finishedAt };
+  } catch { return null; }
+}

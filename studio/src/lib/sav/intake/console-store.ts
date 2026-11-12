@@ -15,6 +15,7 @@ import { SAV_INTAKE_BLOCKED_AFTER_MINUTES, SAV_INTAKE_BLOCKING_JOURNAL_KINDS } f
 import { readSavAgentPause, type SavAgentPauseState } from "./agent-pause";
 import { savIntakeSourceSnapshot, intakeSourceMatches } from "./runtime-store";
 import { intakeDossierSensitive } from "./observation-binding";
+import { intakeBlockedSubCause } from "./console-presentation";
 import { readIntakeExecutionProgress } from "./executor";
 import { invalidIntakeAddressMetadata, SAV_INTAKE_INVALID_SOURCE } from "./source-validation";
 import { savEffectiveReceivedAt } from "@/lib/sav/message-order";
@@ -176,6 +177,6 @@ export async function listIntakeConsole(options: { mailboxId?: string; view?: Sa
     // Read in a savepoint: its failure rolls back to it and the page keeps its rows, marked `unread` (never "no effect").
     const uncertainties = await readIntakeUncertaintiesOrUnread(rows.filter(row => row.status === "uncertain" && row.messageId).map(row => row.messageId!),
       read => tx.transaction(read));
-    return { installed: true, counts: countMap, rows: rows.map(row => ({ ...row, uncertainty: row.messageId ? uncertainties[row.messageId] ?? null : null })), page: currentPage, pages, total };
+    return { installed: true, counts: countMap, rows: rows.map(row => ({ ...row, blockedSubCause: intakeBlockedSubCause(row), uncertainty: row.messageId ? uncertainties[row.messageId] ?? null : null })), page: currentPage, pages, total };
   }, { isolationLevel: "repeatable read", accessMode: "read only" });
 }

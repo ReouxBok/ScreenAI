@@ -52,6 +52,26 @@ it("six business views and distinct technical area use supplied counts and Frenc
   expect(html).not.toContain("SAV_INTAKE_RUNTIME_BUDGET_EXHAUSTED");expect(mocks.action).not.toHaveBeenCalled();
   expect(mocks.list).toHaveBeenCalledWith({view:"processing",mailboxId:undefined,search:undefined,page:1});
 });
+const waitRows=[
+  {threadId:"20000000-0000-4000-8000-000000000001",messageId:"20000000-0000-4000-8000-000000000011",version:3,subject:"Demande fictive A",fromEmail:"a@example.invalid",receivedAt:at,updatedAt:at,view:null,status:"followup_pending",reason:"Actions confirmées, premier suivi en attente",blockedCause:"technical_wait",blockedSubCause:"followup_queued",retryAt:null},
+  {threadId:"20000000-0000-4000-8000-000000000002",messageId:"20000000-0000-4000-8000-000000000012",version:2,subject:"Demande fictive B",fromEmail:"b@example.invalid",receivedAt:at,updatedAt:at,view:null,status:"context_changed",reason:"Les sources locales doivent être réinvestiguées",blockedCause:"technical_wait",blockedSubCause:"sources_changed",retryAt:null},
+  {threadId:"20000000-0000-4000-8000-000000000003",messageId:"20000000-0000-4000-8000-000000000013",version:1,subject:"Demande fictive C",fromEmail:"c@example.invalid",receivedAt:at,updatedAt:at,view:null,status:"waiting",reason:null,blockedCause:"attempts_exhausted",blockedSubCause:null,retryAt:null}];
+const pulse=(finishedMinutesAgo:number)=>({readAt:new Date().toISOString(),permission:"running",configuration:"restricted",activity:{state:finishedMinutesAgo>15?"stale":"observed",startedAt:new Date(Date.now()-(finishedMinutesAgo+2)*60_000).toISOString(),finishedAt:new Date(Date.now()-finishedMinutesAgo*60_000).toISOString(),succeededAt:null,collection:"partial",observedAt:at.toISOString()}});
+it("PR-1 names the real sub-cause of each technical wait instead of the generic 15-minute label",async()=>{
+  mocks.monitoring.mockResolvedValue(pulse(3));mocks.list.mockResolvedValue({...fixture,counts:{...fixture.counts,blocked:3},rows:waitRows,total:3,pages:1});
+  const html=await renderList();
+  expect(html).toContain("Premier suivi en file : le rattrapage le traitera au prochain passage");expect(html).toContain("Sources modifiées : nouvelle vérification nécessaire");
+  expect(html).toContain("Bloqué — tentatives d’analyse épuisées");expect(html).not.toContain("attente technique de plus de 15 minutes");expect(html).not.toContain("Traitement automatique arrêté");
+});
+it("PR-1 groups technical waits under the stopped scheduler when the pulse is older than 30 minutes, and only them",async()=>{
+  mocks.monitoring.mockResolvedValue(pulse(45));mocks.list.mockResolvedValue({...fixture,counts:{...fixture.counts,blocked:3},rows:waitRows,total:3,pages:1});
+  const html=await renderList();const group=html.slice(html.indexOf('id="scheduler-stopped-heading"'));
+  expect(html).toContain("Traitement automatique arrêté");expect(html).toContain("Rien à relancer dossier par dossier");
+  const at1=html.indexOf("Demande fictive A"),at2=html.indexOf("Demande fictive B"),at3=html.indexOf("Demande fictive C"),end=html.indexOf("</section>",html.indexOf('id="scheduler-stopped-heading"'));
+  expect(at1).toBeGreaterThan(html.indexOf('id="scheduler-stopped-heading"'));expect(at1).toBeLessThan(end);expect(at2).toBeLessThan(end);expect(at3).toBeGreaterThan(end);
+  expect(group).toBeTruthy();
+  mocks.monitoring.mockResolvedValue(pulse(16));expect(await renderList()).not.toContain("Traitement automatique arrêté");
+});
 it("server search and pagination preserve the exact cohort",async()=>{
   const html=await renderList({view:"to_validate",q:"connexion",page:"2"});expect(mocks.list).toHaveBeenCalledWith({view:"to_validate",mailboxId:undefined,search:"connexion",page:2});
   expect(html).toContain("view=to_validate&amp;q=connexion");expect(html).toContain('name="q"');
