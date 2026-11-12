@@ -11,6 +11,7 @@ import { articleMetadataSchema } from "@/lib/content";
 import { canReviewKnowledgeCandidate, canonicalKnowledgeSchema, type CanonicalKnowledge } from "./contracts";
 import { canonicalFromSav, publicKnowledgeText, savProjectionBody } from "./conversion";
 import { onboardingSourceStatus } from "./onboarding-import";
+import { savCardPublicationWarnings } from "./publication-check";
 import { previewSavKnowledgeProposal, previewSavKnowledgeReview, toSavKnowledgeDraft, workspaceSourceStatus } from "./proposals";
 import type { SavKnowledgeDetail, SavKnowledgeOrigin, SavKnowledgeRow, SavKnowledgeTab, SavKnowledgeVersion } from "./workspace-contract";
 export * from "./workspace-contract";
@@ -200,7 +201,10 @@ export async function getSavKnowledgeDetail(input: { candidateId?: string; itemI
       AND state IN ('pending', 'needs_completion', 'draft', 'approved', 'index_error', 'indexing', 'published_inactive', 'needs_revalidation', 'unavailable')
     ORDER BY updated_at DESC, id
   `)).map(rowDto) : [];
-  return { relatedWork, delivery, reviewKind, row, document, sources, activeVersion, publishedVersion, proposedVersion, proposedBody, revisionId, draft, comparison, snapshot, missing, alerts,
+  // K2: the version a publication would index, checked as the agent will read it (body and resolution). Warning only.
+  const toPublish = versions.find((version) => version.id === item?.currentDraftVersionId);
+  const publicationWarnings = toPublish ? savCardPublicationWarnings({ bodyMarkdown: toPublish.bodyMarkdown, metadata: toPublish.metadata }) : [];
+  return { relatedWork, delivery, reviewKind, row, document, sources, activeVersion, publishedVersion, proposedVersion, proposedBody, revisionId, draft, comparison, snapshot, missing, alerts, publicationWarnings,
     history: logs.map((log) => ({ action: log.action, actor: log.actorEmail, at: log.createdAt, reason: typeof log.technicalMetadata.reason === "string" ? log.technicalMetadata.reason : "" })),
     canReview: Boolean(row.candidateId && canReviewKnowledgeCandidate(actorEmail, "sav") && ["pending", "needs_completion"].includes(row.state)),
     canPublish: Boolean(row.state !== "indexing" && !relatedWork.some(work => work.state === "indexing") && !row.draftId && !row.learningCandidateId && (!row.candidateId || proposedVersion?.id === item?.currentDraftVersionId) && actorEmail === "ugo@limova.ai" && item?.status === "in_review" && item.currentDraftVersionId && item.currentDraftVersionId !== item.publishedVersionId),

@@ -4,7 +4,7 @@ import { SAV_CASE_ACCESS_BLOCK_ID, SAV_CASE_HOLDS_KEEPING_TIMERS, type CaseEvent
 import { buildCaseDecisionContext, type CaseDecisionContextProblem } from "./decision-context";
 import { caseAccessScopeStamp, readCaseAccessScope, type CaseAccessScopeStamp, type CaseBlockScope } from "./investigation-access-scope";
 import { caseAdmissionStatus } from "./admission-policy";
-import { caseOpenBlockId } from "./case-blocks";
+import { caseOpenBlockId, caseRequestBlockId } from "./case-blocks";
 import type { CaseDecisionRejection, CaseDecisionValidation } from "./decision-contract";
 import { caseDecisionRefusalKinds, classifyCaseDecisionRefusal, type CaseDecisionRefusal, type CaseDecisionRefusalKind } from "./decision-recovery";
 import { caseModelLoginHistory, validateCaseDecision } from "./decision-validator";
@@ -411,11 +411,16 @@ export async function runCaseInvestigation(caseId: string, mode: CaseInvestigati
       return { status: "technical_wait", caseId, caseVersion, modelCalls };
     }
     let knowledge = selection.cards, coverage = selection.coverage;
-    // Scope-first, ranked (11/11): on a pilot block, its scope sources first and never dropped (read at their exact version when the search
-    // missed them), then the other cards only when relevant (`investigation-knowledge-ranking.ts`). No block scope: unchanged.
+    // Scope-first, ranked, filtered by relevance (K3, 12/11): on a pilot block, its relevant scope cards first and its template card always
+    // (read at its exact version when the search missed it), then the other cards only when relevant (`investigation-knowledge-ranking.ts`).
+    // No block scope: unchanged.
     let scoped: CaseScopedKnowledge | null = null;
     if (accessScope && coverage) {
-      const missing = accessScope.sources.filter(source => !knowledge.some(card => card.id === source.knowledgeId && card.contentVersionId === source.contentVersionId))
+      const pool = "pool" in selection ? selection.pool ?? [] : [];
+      const returned = (source: { knowledgeId: string; contentVersionId: string }) => [...knowledge, ...pool.map(entry => entry.card)]
+        .some(card => card.id === source.knowledgeId && card.contentVersionId === source.contentVersionId);
+      // Only the template is read when the search did not return it: another scope card the search never returned is not relevant.
+      const missing = accessScope.sources.filter(source => source.use === "answer" && source.firstReply !== undefined && !returned(source))
         .map(source => ({ knowledgeId: source.knowledgeId, contentVersionId: source.contentVersionId }));
       let fetchedCards: SavRetrievalCandidate[] = [];
       if (missing.length && ports.readScopeCards) {
@@ -429,7 +434,8 @@ export async function runCaseInvestigation(caseId: string, mode: CaseInvestigati
           return { status: "technical_wait", caseId, caseVersion, modelCalls };
         }
       }
-      scoped = arrangeCaseScopedKnowledge({ cards: knowledge, coverage, relevance: "relevance" in selection ? selection.relevance ?? [] : [], scope: accessScope, fetched: fetchedCards });
+      scoped = arrangeCaseScopedKnowledge({ cards: knowledge, coverage, relevance: "relevance" in selection ? selection.relevance ?? [] : [], scope: accessScope, fetched: fetchedCards,
+        pool, blockOf: row => caseRequestBlockId(snapshot, { id: row.requestId, family: row.family }) });
       knowledge = scoped.knowledge; coverage = scoped.coverage;
     }
     let temporaryIncidents: IncidentContext | undefined;
@@ -497,10 +503,10 @@ export async function runCaseInvestigation(caseId: string, mode: CaseInvestigati
         built = { ok: true, context: { ...built.context, knowledge, coverage } };
       }
     }
-    if (scoped && (scoped.dropped.length || scoped.added.length || scoped.unavailable.length))
+    if (scoped && (scoped.dropped.length || scoped.added.length || scoped.unavailable.length || scoped.scopeLeftOut.length))
       // Ids and codes only, never a card's content.
       console.info("sav_v2_knowledge_selection", { caseId, caseVersion, sent: knowledge.map(card => card.id), scope: [...scoped.scopeKeys],
-        dropped: scoped.dropped, added: scoped.added, scopeUnavailable: scoped.unavailable });
+        dropped: scoped.dropped, added: scoped.added, scopeUnavailable: scoped.unavailable, scopeLeftOut: scoped.scopeLeftOut });
     const decisionContext = built.context;
     let proposal = prior?.proposal ?? null;
     const validate = (stored: { output: unknown; proposedOn: number }) => {

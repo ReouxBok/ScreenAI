@@ -3,6 +3,7 @@
 import { useRef, useState, useTransition } from "react";
 import { useRouter } from "next/navigation";
 import type { CanonicalKnowledge } from "@/lib/knowledge/contracts";
+import type { SavCardPublicationWarning } from "@/lib/knowledge/publication-check";
 import { DeliveryPreview } from "./delivery-editor";
 import { KnowledgeDocument } from "./knowledge-document";
 import { KnowledgeEditor, cleanKnowledgeDocument } from "./knowledge-editor";
@@ -49,7 +50,7 @@ export function KnowledgeWorkspaceReview({ candidateId, revisionId, initialDocum
   </section>;
 }
 
-export function KnowledgePublication({ itemId, proposedVersionId, publishedVersionId, activeVersionId, canPublish, canActivate, title }: { itemId: string; proposedVersionId: string | null; publishedVersionId: string | null; activeVersionId: string | null; canPublish: boolean; canActivate: boolean; title: string }) {
+export function KnowledgePublication({ itemId, proposedVersionId, publishedVersionId, activeVersionId, canPublish, canActivate, title, warnings = [] }: { itemId: string; proposedVersionId: string | null; publishedVersionId: string | null; activeVersionId: string | null; canPublish: boolean; canActivate: boolean; title: string; warnings?: readonly SavCardPublicationWarning[] }) {
   const router = useRouter();
   const [confirmation, setConfirmation] = useState<"publish" | "activate" | null>(null);
   const [error, setError] = useState("");
@@ -66,6 +67,7 @@ export function KnowledgePublication({ itemId, proposedVersionId, publishedVersi
     } catch { setError("L’action n’a pas abouti. Vérifiez l’état courant avant de confirmer à nouveau."); } finally { lock.current = false; } });
   }
   return <section className={styles.panel} aria-label="Publication et activation"><h2>Publication et utilisation par l’agent</h2><p className={styles.subtle}>Ugo publie la version validée, puis décide séparément de son activation. La version active reste utilisée entre ces deux étapes.</p>
+    {canPublish && warnings.length > 0 && <div className={styles.alert} role="status" aria-label="Contrôle de la fiche avant publication"><h3>Contrôle de la fiche</h3><ul>{warnings.map(warning => <li key={warning.code}>{warning.label}</li>)}</ul><p className={styles.subtle}>Avertissement seulement : il ne bloque pas la publication et ne modifie pas la fiche.</p></div>}
     <div className={styles.row}>{canPublish && <button className="secondary" disabled={busy} onClick={() => setConfirmation("publish")}>Publier la version validée</button>}{canActivate && <button className="primary" disabled={busy} onClick={() => setConfirmation("activate")}>Activer cette version pour le SAV</button>}</div>
     {confirmation && <div className={styles.alert} role="region" aria-label="Confirmer l’action sur la connaissance"><h3>{confirmation === "publish" ? "Confirmer la publication" : "Confirmer l’activation"} : {title}</h3><p>{confirmation === "publish" ? "La version sera publiée et indexée. La version utilisée par l’agent ne change pas à cette étape." : "La version publiée remplacera la version actuellement utilisée par l’agent SAV après vérification de son index."}</p><div className={styles.row}><button className="primary" disabled={busy} onClick={confirm}>{busy ? "Action en cours…" : confirmation === "publish" ? "Confirmer la publication" : "Confirmer l’activation"}</button><button className="secondary" disabled={busy} onClick={() => setConfirmation(null)}>Annuler</button></div></div>}
     {error && <p className={`${styles.alert} ${styles.error}`} role="alert">{error}</p>}

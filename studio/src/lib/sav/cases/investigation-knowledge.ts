@@ -1,8 +1,8 @@
-import { retrieveSavKnowledgeByRequest, type SavRetrievalBackend, type SavRetrievalCandidate } from "../request-retrieval";
+import { assessSavKnowledgeValidity, retrieveSavKnowledgeByRequest, type SavRetrievalBackend, type SavRetrievalCandidate } from "../request-retrieval";
 import { caseRequestSearchText, caseRequestSubject, SAV_CASE_SENSITIVE_FAMILIES, type CaseRequestFamily, type CaseSnapshot } from "./case-types";
 import type { CaseKnowledgeCoverage, CaseKnowledgeCoverageStatus } from "./decision-contract";
 import type { CaseInvestigationOwnerStop } from "./investigation-runner";
-import { caseRequestCardRelevance, type CaseKnowledgeRelevance } from "./investigation-knowledge-ranking";
+import { caseRequestCardRelevance, type CaseKnowledgePoolEntry, type CaseKnowledgeRelevance } from "./investigation-knowledge-ranking";
 
 /*
  * SAV-7/SAV-19: which published, applicable cards the investigation may use, per open request of the case. Read only:
@@ -26,6 +26,11 @@ export type CaseKnowledgeSelection = {
    * (`investigation-knowledge-ranking.ts`). Read only by a pilot block's scope-first selection; never sent nor recorded as such.
    */
   relevance?: CaseKnowledgeRelevance[];
+  /**
+   * K3: per searched request, the valid candidates the vector search returned for its query (selected or not), as returned. Read only by a
+   * pilot block's selection, to judge a scope card the search did not select; never sent nor recorded as such.
+   */
+  pool?: CaseKnowledgePoolEntry[];
 };
 
 /**
@@ -101,7 +106,7 @@ export async function selectCaseKnowledge(snapshot: CaseSnapshot, backend: SavRe
   const failed = result.requests.find(row => row.status === "search_unavailable" || row.status === "revision_unstable");
   if (failed) return { status: "unavailable", reason: failed.status === "revision_unstable" ? "revision_unstable" : "search_unavailable" };
 
-  const cards = new Map<string, SavRetrievalCandidate>(), relevance: CaseKnowledgeRelevance[] = [];
+  const cards = new Map<string, SavRetrievalCandidate>(), relevance: CaseKnowledgeRelevance[] = [], pool: CaseKnowledgePoolEntry[] = [];
   const coverage = open.map((row): CaseKnowledgeCoverage => {
     const plan = searched.find(entry => entry.row === row), found = plan && result.requests.find(entry => entry.requestId === plan.alias);
     if (!found) return { requestId: row.id, family: row.family, status: "not_searched", knowledge: [], limitations: unsearchedBecause(row, subjects.get(row) ?? null) };
@@ -115,10 +120,16 @@ export async function selectCaseKnowledge(snapshot: CaseSnapshot, backend: SavRe
     // The scores the search already returned for this very query: no new call decides relevance.
     caseRequestCardRelevance(plan.summary, selected, byQuery.get(plan.summary) ?? [], { locale: scope.locale, audience: scope.audience, now: scope.now })
       .forEach((verdict, rank) => relevance.push({ ...knowledge[rank]!, requestId: row.id, rank, verdict }));
+    const seen = new Set<string>();
+    for (const card of byQuery.get(plan.summary) ?? []) {
+      const key = `${card.id}:${card.contentVersionId}`;
+      if (seen.has(key) || !assessSavKnowledgeValidity(card, scope.locale, scope.audience, scope.now).eligible) continue;
+      seen.add(key); pool.push({ requestId: row.id, card });
+    }
     // A card found but too large to be read whole is knowledge we could not use, not an absence of knowledge.
     const incomplete = !knowledge.length && found.status === "no_source" && (byQuery.get(plan.summary) ?? []).some(card => card.sourceTooLarge === true);
     const status: CaseKnowledgeCoverageStatus = knowledge.length ? "covered" : found.status === "no_source" && !incomplete ? "no_applicable_knowledge" : "not_searched";
     return { requestId: row.id, family: row.family, status, knowledge, limitations: [...found.limitations, ...(incomplete ? ["knowledge_source_incomplete"] : [])] };
   });
-  return { status: "ready", selection: { revision: result.revision, cards: [...cards.values()], coverage, alerts: result.alerts, relevance }, currentRevision: () => backend.readRevision() };
+  return { status: "ready", selection: { revision: result.revision, cards: [...cards.values()], coverage, alerts: result.alerts, relevance, pool }, currentRevision: () => backend.readRevision() };
 }
