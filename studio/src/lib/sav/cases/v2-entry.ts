@@ -16,6 +16,7 @@ import { readConfirmedV1Context } from "./admission-context-reader";
 import { hubspotTicketOwnerReader, type CaseOwnerReadTransport } from "./admission-owner-reader";
 import { admissionPolicyPort, admissionPolicyRevisionPort, qualifyTicketIdentity, type AdmissionPolicyRecord, type V1AdmissionAdapterPolicy } from "./admission-runtime";
 import { savCaseRecordingEnabled, v1IntentHash, type CaseTx } from "./case-store";
+import { caseIdsStillHeldByBlock, markCaseBlockHold } from "./case-block-hold";
 import { caseDedupeKey, SAV_CASE_ACCESS_BLOCK_ID } from "./case-types";
 import { readCaseAccessScope } from "./investigation-access-scope";
 import { caseAccessScopeConfigReader } from "./investigation-pilot-readers";
@@ -331,6 +332,8 @@ export async function continueCaseAfterCommit(caseId: string, trigger: CaseConti
     if (point) {
       const report = await point({ caseId, trigger, env: input.env, ...(input.immediateDeadlineMs === undefined ? {} : { deadlineMs: input.immediateDeadlineMs }) });
       await markContinuation(caseId, trigger, null);
+      // SAV-18: a block held by its switch is a durable, visible wait (console, diagnostics), cleared by the next pass that is not held.
+      await markCaseBlockHold(caseId, report.status === "block_held" ? { blockId: report.detail ?? SAV_CASE_ACCESS_BLOCK_ID, reason: report.reason ?? "block_setting_invalid" } : null);
       return report;
     }
     code = "point_not_bound";
@@ -348,11 +351,13 @@ export async function sweepCaseContinuations(input: EntryDeps & { limit?: number
   if (await relayPaused(db)) return { skipped: "paused" as const };
   const limit = Math.min(Math.max(input.limit ?? 4, 1), 20);
   const candidates = await db.select({ id: savCases.id }).from(savCases).where(and(eq(savCases.owner, "agent"), eq(savCases.phase, "queued"))).orderBy(asc(savCases.updatedAt), asc(savCases.id)).limit(200);
+  // SAV-18: a case held by its block while that block still never sends takes no slot; once the block may act again, it is taken like any other.
+  const held = await caseIdsStillHeldByBlock(candidates.map(row => row.id), db);
   const marks = candidates.length ? await db.select({ id: auditLogs.entityId, meta: auditLogs.technicalMetadata }).from(auditLogs)
     .where(and(eq(auditLogs.entityType, FAILURE_MARK.entityType), eq(auditLogs.action, FAILURE_MARK.action), inArray(auditLogs.entityId, candidates.map(row => row.id)))) : [];
   const failedAt = new Map(marks.map(mark => [mark.id, Date.parse(String((mark.meta as { lastAt?: unknown } | null)?.lastAt)) || 0]));
   // Stable sort: untouched cases keep their oldest-first order.
-  const queued = [...candidates].sort((a, b) => (failedAt.get(a.id) ?? -1) - (failedAt.get(b.id) ?? -1)).slice(0, limit);
+  const queued = candidates.filter(row => !held.has(row.id)).sort((a, b) => (failedAt.get(a.id) ?? -1) - (failedAt.get(b.id) ?? -1)).slice(0, limit);
   const outcome = { tried: 0, failed: {} as Record<string, number> };
   for (const { id } of queued) {
     outcome.tried++;

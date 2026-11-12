@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { and, eq } from "drizzle-orm";
 import { createSavTestDb } from "../../../../test/sav-db";
-import { auditLogs, savCaseTimers, savIntakeExecutionPolicies, savIntakeExecutions, savIntakeJournal, savIntakeModelCalls, savIntakeRuns, savMailboxes, savMessages, savSyncState, savThreads, staffUsers } from "@/db/schema";
+import { auditLogs, savCases, savCaseTimers, savIntakeExecutionPolicies, savIntakeExecutions, savIntakeJournal, savIntakeModelCalls, savIntakeRuns, savMailboxes, savMessages, savSyncState, savThreads, staffUsers } from "@/db/schema";
 const state = vi.hoisted(() => ({ db: null as unknown }));
 vi.mock("@/db", () => ({ requireDb: () => { if (!state.db) throw Error("NO_DB_ALLOWED"); return state.db; } }));
 import { encryptSavPayload } from "../crypto";
@@ -10,7 +10,8 @@ import { savAgentPauseKey } from "../intake/agent-pause";
 import { analyseSavIntakeRuntime } from "../intake/runtime";
 import type { IntakeRuntimeConfig } from "../intake/runtime-contract";
 import { caseAdmissionStatus } from "./admission-policy";
-import { listCaseEvents, openCaseEvent, readCase, readCaseByTicket, reevaluateCaseAdmission, updateCaseRecord } from "./case-store";
+import { readCaseBlockHold } from "./case-block-hold";
+import { listCaseEvents, openCaseEvent, readCase, readCaseByTicket, readCaseDiagnostics, reevaluateCaseAdmission, updateCaseRecord } from "./case-store";
 import { caseDedupeKey } from "./case-types";
 import { recordCaseAfterConfirmedIntake, sweepCaseRelays } from "./intake-boundary";
 import { scheduleJ2ForConfirmedQuestion } from "./timer-store";
@@ -416,5 +417,61 @@ describe("après V1 : le relais route d'abord, puis admet sur l'effet réel conf
     const woken: string[] = [];
     await sweepCaseContinuations(entry({ limit: 20, continuation: async ({ caseId }: { caseId: string }) => { woken.push(caseId); return { status: "started" }; } }));
     expect(woken).not.toContain(w.caseId);
+  });
+});
+
+describe("SAV-18 : un dossier retenu par son bloc (arrêt ou pause) attend de façon durable et visible, sans prendre les places de la reprise", () => {
+  const BLOCK_KEY = "sav-block-switch.v1:access";
+  const setBlock = async (mode: "off" | "auto" | null, paused = false) => {
+    await f.db.delete(savSyncState).where(eq(savSyncState.key, BLOCK_KEY));
+    if (mode) await f.db.insert(savSyncState).values({ key: BLOCK_KEY, status: "active", cursor: encryptSavPayload({ revision: "sav-block-switch.v1", blockId: "access", mode, paused,
+      setBy: "fixture@example.invalid", setAt: new Date().toISOString(), reason: "réglage fictif" }) });
+  };
+  const OLD = new Date("2000-01-01T00:00:00.000Z");
+  afterEach(async () => { await setBlock(null); });
+  /** A committed return whose passage the block held; dated oldest so that, without the fix, it would take the sweep's first slots. */
+  const heldCase = async (offsetMs: number) => {
+    const w = await waitingWithReturn();
+    await customerReturnGate(w.run.id, entry({ continuation: async () => ({ status: "block_held", reason: "block_off", detail: "access" }) }));
+    await f.db.update(savCases).set({ updatedAt: new Date(OLD.getTime() + offsetMs) }).where(eq(savCases.id, w.caseId));
+    return w;
+  };
+
+  it("le blocage est enregistré et lisible dans les diagnostics, puis effacé par un passage non retenu", async () => {
+    await setBlock("off");
+    const w = await heldCase(0);
+    expect(await readCaseBlockHold(w.caseId)).toMatchObject({ blockId: "access", reason: "block_off" });
+    expect((await readCaseDiagnostics(w.ticketId))?.blockHold).toMatchObject({ blockId: "access", reason: "block_off" });
+    expect(await failureMark(w.caseId)).toBeUndefined();
+    await continueCaseAfterCommit(w.caseId, "sweep", entry({ continuation: async () => ({ status: "awaiting_person" }) }));
+    expect(await readCaseBlockHold(w.caseId)).toBeNull();
+    expect((await readCaseDiagnostics(w.ticketId))?.blockHold).toBeNull();
+  });
+  it("5 dossiers retenus + 1 normal : le normal est repris dès la première passe (4 places), aucun retenu n'est réveillé", async () => {
+    await setBlock("off");
+    const held: string[] = [];
+    for (let i = 0; i < 5; i++) held.push((await heldCase(i * 1000)).caseId);
+    const normal = await waitingWithReturn();
+    await customerReturnGate(normal.run.id, entry({ continuation: async () => { throw Error("SAV_SYN_CRASH"); } }));
+    await f.db.delete(auditLogs).where(and(eq(auditLogs.entityId, normal.caseId), eq(auditLogs.action, "sav_v2_continuation_failed")));
+    await f.db.update(savCases).set({ updatedAt: new Date(OLD.getTime() + 10_000) }).where(eq(savCases.id, normal.caseId));
+    const woken: string[] = [];
+    await sweepCaseContinuations(entry({ continuation: async ({ caseId }: { caseId: string }) => { woken.push(caseId); return { status: "started" }; } }));
+    expect(woken).toContain(normal.caseId);
+    expect(woken.filter(id => held.includes(id))).toEqual([]);
+  });
+  it("le bloc repasse en automatique : chaque dossier retenu est repris une seule fois par la passe suivante et son marqueur s'efface", async () => {
+    await setBlock("off");
+    const held: string[] = [];
+    for (let i = 0; i < 3; i++) held.push((await heldCase(20_000 + i * 1000)).caseId);
+    const woken: string[] = [], point = async ({ caseId }: { caseId: string }) => { woken.push(caseId); return { status: "started" }; };
+    await sweepCaseContinuations(entry({ limit: 20, continuation: point }));
+    expect(woken.filter(id => held.includes(id))).toEqual([]);
+    await setBlock("auto");
+    await sweepCaseContinuations(entry({ limit: 20, continuation: point }));
+    for (const id of held) {
+      expect(woken.filter(seen => seen === id)).toHaveLength(1);
+      expect(await readCaseBlockHold(id)).toBeNull();
+    }
   });
 });

@@ -216,7 +216,14 @@ export type CasePilotProposal =
   | { state: "unreadable"; recordedOn: number }
   | { state: "found"; proposedOn: number; stale: boolean; action: string; reply: string | null; citations: number; missingInformation: string[]; handoffNeed: string | null; chosen: KnowledgeRef[] };
 
-export function buildCasePilotView(input: { snapshot: CaseSnapshot; events: readonly CaseEvent[]; timers: readonly CaseTimer[]; pause: SavAgentPauseState; now: Date }) {
+/** SAV-18: the closed reasons of a case held by its block's switch, as the Studio says them. */
+export const caseBlockHoldLabels: Record<string, string> = {
+  block_off: "Bloc éteint : l’agent ne propose ni n’envoie rien pour ce bloc. Le dossier attend et reprend quand un administrateur rallume le bloc.",
+  block_paused: "Bloc en pause : l’agent ne propose ni n’envoie rien pour ce bloc. Le dossier attend et reprend à la fin de la pause.",
+  block_setting_invalid: "Réglage du bloc illisible : traité comme un bloc éteint jusqu’à un nouvel enregistrement.",
+};
+export type CasePilotBlockHold = Readonly<{ blockId: string; reason: string; since: string }> | null;
+export function buildCasePilotView(input: { snapshot: CaseSnapshot; events: readonly CaseEvent[]; timers: readonly CaseTimer[]; pause: SavAgentPauseState; now: Date; blockHold?: CasePilotBlockHold }) {
   const { snapshot, events, timers, pause, now } = input, body = snapshot.body;
   const firstInbound = [...events].sort((a, b) => a.caseVersion - b.caseVersion).find(event => event.kind === "inbound_confirmed") ?? null;
 
@@ -247,6 +254,8 @@ export function buildCasePilotView(input: { snapshot: CaseSnapshot; events: read
   const waits: CasePilotWait[] = [];
   if (pause.invalid) waits.push({ label: "Réglage de pause V2 illisible : traité comme une pause complète.", needsPerson: true });
   else if (pause.level !== "running") waits.push({ label: pauseLabels[pause.level], detail: pause.setting ? `Depuis ${pause.setting.setAt} par ${pause.setting.setBy}` : undefined, needsPerson: false });
+  if (input.blockHold) waits.push({ label: caseBlockHoldLabels[input.blockHold.reason] ?? caseBlockHoldLabels.block_setting_invalid,
+    detail: `Bloc ${input.blockHold.blockId}, motif ${input.blockHold.reason}${input.blockHold.since ? `, depuis ${input.blockHold.since}` : ""}.`, needsPerson: input.blockHold.reason === "block_setting_invalid" });
   // A relayed case waits for the V2 owner read on the ticket (no V1 attribution needed since 4/11); that is not a handoff to the team.
   const awaitingAttribution = caseAwaitsV2Attribution(snapshot);
   if (awaitingAttribution) waits.push({ label: "En attente du propriétaire V2 : l’agent prend le dossier dès que le propriétaire actuel du ticket HubSpot est lu comme V2. Ticket sans propriétaire ou tenu par une personne : il reste à l’équipe, rien n’est écrit.", needsPerson: false });
