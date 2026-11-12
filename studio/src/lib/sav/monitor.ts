@@ -13,6 +13,7 @@ import { intakeBlockedRunSql, intakeBlockedPause } from "./intake/console-store"
 import { readSavAgentPause, SAV_AGENT_PAUSE_CODES } from "./intake/agent-pause";
 import { monitorStateSchema, monitorCodes, nextMonitorState, monitorWebhook, monitorSlackText, monitorDeliveryHash, type MonitorState, type MonitorSnapshot, type MonitorIssue, type MonitorCode } from "./monitor-contract";
 
+const FALLBACK = "sav-self-scheduler:v1:sav-reconcile";
 const WORKER = "sav-monitor:v1:worker", STATE = "sav-monitor:v1:state", SNAPSHOT = "sav-monitor:v1:snapshot";
 type Tx = Parameters<Parameters<ReturnType<typeof requireDb>["transaction"]>[0]>[0];
 async function queryRows<T extends Record<string, unknown>>(tx: Pick<Tx, "execute">, statement: SQL): Promise<T[]> {
@@ -51,7 +52,7 @@ export async function collectSavMonitorSnapshot(): Promise<MonitorSnapshot> {
     await requireDb().transaction(async tx => {
       await tx.execute(sql`set transaction isolation level repeatable read read only`);
       await tx.execute(sql`select set_config('statement_timeout','5s',true),set_config('lock_timeout','1s',true),set_config('transaction_timeout','20s',true)`);
-      const rows = await tx.select().from(savSyncState).where(sql`${savSyncState.key}=${WORKER} or ${savSyncState.key} like 'sav-intake-launch:%' or ${savSyncState.key}='sav-intake-console-schema-v1' or ${savSyncState.key}='sav-intake-execution-schema-v1'`).limit(15);
+      const rows = await tx.select().from(savSyncState).where(sql`${savSyncState.key}=${WORKER} or ${savSyncState.key}=${FALLBACK} or ${savSyncState.key} like 'sav-intake-launch:%' or ${savSyncState.key}='sav-intake-console-schema-v1' or ${savSyncState.key}='sav-intake-execution-schema-v1'`).limit(15);
       if (rows.length >= 15) throw Error("MONITOR_SCOPE_LIMIT");
       const worker = rows.find(r => r.key === WORKER);
       if (!worker) add("worker_missing", 1);
@@ -63,6 +64,10 @@ export async function collectSavMonitorSnapshot(): Promise<MonitorSnapshot> {
         metrics.workerAgeSeconds = Math.floor(age / 1000);
         metrics.workerCompletionAgeSeconds=Math.floor(completionAge/1000);
         add("worker_stalled", age > 15 * 60000 || completionAge > 15*60000 ? 1 : 0, "critical"); add("worker_failed", worker.status === "failed" || p.failed === true ? 1 : 0, "critical");
+        // The current pulse was written by the self-scheduler fallback (lib/sav/self-scheduler.ts), which starts a pass only after
+        // 12 min without one: Vercel's scheduler made no pass since. The work goes on, the outage stays visible.
+        let fallbackPulse: unknown = null; try { fallbackPulse = JSON.parse(rows.find(r => r.key === FALLBACK)?.cursor ?? "null")?.lastPulseId; } catch { /* unreadable: not the fallback's */ }
+        add("vercel_cron_missing", fallbackPulse === p.id ? 1 : 0);
       }
       const launches = rows.filter(r => r.status === "intake_launch_v1" && r.key.startsWith("sav-intake-launch:"));
       metrics.launchedMailboxes = launches.length;

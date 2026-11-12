@@ -6,6 +6,7 @@ export const runtime = "nodejs";
 export const maxDuration = 300;
 
 export async function POST(request: Request) {
+  const requestStartedAt = Date.now();
   if (!await verifyGmailWebhookRequest(request)) {
     return Response.json({ error: "unauthorized" }, { status: 401 });
   }
@@ -17,7 +18,12 @@ export async function POST(request: Request) {
   }
   try {
     const result = await acceptGmailWebhook(payload);
-    if (!result.duplicate) after(() => processGmailReceipt(result.receipt.id));
+    // After the 204, one post-commit work: the receipt and, beside it, the self-scheduler fallback. allSettled keeps the
+    // fallback alive until it settles even when the receipt fails; the receipt's failure is then rethrown as before.
+    if (!result.duplicate) after(async () => {
+      const [receipt] = await Promise.allSettled([processGmailReceipt(result.receipt.id), runSelfSchedulerFallback(requestStartedAt)]);
+      if (receipt.status === "rejected") throw receipt.reason;
+    });
     return new Response(null, { status: 204 });
   } catch (error) {
     const invalidPayload = error instanceof ZodError || error instanceof SyntaxError;
@@ -36,5 +42,18 @@ export async function POST(request: Request) {
       { error: invalidPayload ? "invalid_notification" : "webhook_storage_failed" },
       { status: invalidPayload ? 400 : 500 },
     );
+  }
+}
+
+/** Fallback for the Vercel schedules (lib/sav/self-scheduler.ts). Opt-in: it does nothing unless the production database
+ * switch is ON, and then only what the schedules visibly missed. It never changes the response or the receipt's processing
+ * and never rejects; its errors are only logged. Loaded lazily, so that module can neither slow down nor break the
+ * acknowledgement. Its pass ends by this request's deadline (computed from requestStartedAt). */
+async function runSelfSchedulerFallback(requestStartedAt: number) {
+  try {
+    const [{ runSavSelfSchedulerFromWebhook }, { ensureSavHeartbeat }] = await Promise.all([import("@/lib/sav/self-scheduler"), import("@/lib/sav/self-scheduler-heartbeat")]);
+    await runSavSelfSchedulerFromWebhook({ requestStartedAt, ensureHeartbeat: () => ensureSavHeartbeat({ trigger: "gmail_webhook" }) });
+  } catch {
+    console.error("sav_self_scheduler_webhook", { status: "failed" });
   }
 }
