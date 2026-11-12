@@ -1,3 +1,4 @@
+import { sql, type SQL } from "drizzle-orm";
 import { decryptSavPayload } from "../crypto";
 
 /** Analysis attempts are bounded per configuration version AND per message for
@@ -11,7 +12,27 @@ export const SAV_INTAKE_ATTEMPT_POLICY = Object.freeze({
   totalPerMessage: 8,
 });
 /** Durable markers that remove a run from scheduling; the dossier stays visible as blocked. */
-export const SAV_INTAKE_BLOCKING_JOURNAL_KINDS = ["source_invalid", "attempts_exhausted", "deterministic_block", "private_resource_unavailable", "forwarded_origin_unverified", "other_evidence_unavailable"] as const;
+export const SAV_INTAKE_BLOCKING_JOURNAL_KINDS = ["source_invalid", "attempts_exhausted", "deterministic_block", "private_resource_unavailable", "forwarded_origin_unverified", "other_evidence_unavailable", "rescue_failed"] as const;
+/** SAV-88 rescue: ONE extra, recorded analysis attempt per message, through the normal V1 claim, never a reset.
+ * `granted` (journal of the current run) opens it, `claimed` consumes it with the claim, `failed` ends it for good:
+ * the dossier is then "à traiter à la main". Only an `attempts_exhausted` caused by the lifetime caps is lifted,
+ * and only on the run where the rescue was claimed; every other blocking marker keeps blocking. */
+export const SAV_INTAKE_RESCUE_KINDS = { granted: "rescue_granted", claimed: "rescue_claimed", returned: "rescue_returned", failed: "rescue_failed" } as const;
+/** A blocking marker of `runId` that still blocks: an attempts_exhausted followed by a rescue claim on the same run does not. */
+export function intakeActiveBlockSql(runId: SQL, kinds: readonly string[] = SAV_INTAKE_BLOCKING_JOURNAL_KINDS) {
+  return sql`exists(select 1 from sav.intake_journal bj where bj.run_id = ${runId} and bj.kind in (${sql.join(kinds.map(k => sql`${k}`), sql`, `)})
+    and not (bj.kind = 'attempts_exhausted' and exists(select 1 from sav.intake_journal rj where rj.run_id = bj.run_id and rj.kind = 'rescue_claimed' and rj.created_at >= bj.created_at)))`;
+}
+const rescueCount = (messageId: SQL, kind: string, runId?: SQL) => sql`(select count(*) from sav.intake_journal c join sav.intake_runs cr on cr.id = c.run_id
+  where cr.message_id = ${messageId} and c.kind = ${kind}${runId ? sql` and c.run_id = ${runId}` : sql``})`;
+/** The rescue was used: claimed and not given back by an agent pause, or failed. Message-wide, or on one run with `runId`. */
+export function intakeRescueConsumedSql(messageId: SQL, runId?: SQL) {
+  return sql`(${rescueCount(messageId, "rescue_claimed", runId)} > ${rescueCount(messageId, "rescue_returned", runId)} or ${rescueCount(messageId, "rescue_failed", runId)} > 0)`;
+}
+/** A rescue granted on `runId` and not used for its message (one per message, whatever the version; a pause gives it back). */
+export function intakeRescueOpenSql(runId: SQL, messageId: SQL) {
+  return sql`(exists(select 1 from sav.intake_journal g where g.run_id = ${runId} and g.kind = 'rescue_granted') and not ${intakeRescueConsumedSql(messageId)})`;
+}
 /** A technical wait older than this is an incident handed to the team, never a silent state. */
 export const SAV_INTAKE_BLOCKED_AFTER_MINUTES = 15;
 /** Local, reproducible input errors: retrying the same input cannot succeed and must not burn attempts. */

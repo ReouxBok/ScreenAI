@@ -79,6 +79,12 @@ export function intakeDiagnosticPayload(ciphertext: string) {
     // or an explicitly unknown one. Never an invented code (SAV-45 C).
     const waitingCause = code(payload.reason) ? null : contextReasons.length ? "context_required" : object(plan.progress).kind === "human_choice" ? "human_choice" : plan.decision ? "plan_without_code" : "unknown";
     return { readable: true, reason: code(payload.reason), waitingCause, budgetLimit: publicIntakeBudgetLimit(payload.budgetLimit),
+      // SAV-88: what V1 decided, allow-listed codes only, so "plan_without_code" is never read without its decision.
+      decision: plan.decision ? { disposition: ["ticket", "no_ticket", "request_identification", "collect_context"].includes(String(disposition.kind)) ? String(disposition.kind) : null,
+        reason: ["qualified_other", "acknowledgement_only", "outside_support", "sender_contact_absent", "declared_registration_address_absent"].includes(String(disposition.reason)) ? String(disposition.reason) : null,
+        operation: ["create", "link", "reopen"].includes(String(object(disposition.target).operation)) ? String(object(disposition.target).operation) : null,
+        classification: ["support", "finance", "cancellation", "unknown", "mixed", "commercial", "investor", "partnership", "other", "acknowledgement"].includes(String(decision.classification)) ? String(decision.classification) : null,
+        progress: ["processing", "retry_scheduled", "human_choice", "qualified_other", "supervised_action", "identity_wait", "learning_followup", "sensitive_followup", "completed"].includes(String(object(plan.progress).kind)) ? String(object(plan.progress).kind) : null } : null,
       qualification:{nature:["request","newsletter","information","indeterminate"].includes(String(analysis.nature))?String(analysis.nature):null,requestCount:Array.isArray(analysis.requests)?count(analysis.requests.length):null},
       readRecovery:Object.keys(recovery).length?{state:["scheduled","claimed","exhausted","invalidated","complete"].includes(String(recovery.state))?String(recovery.state):null,technicalAttempts:count(recovery.attempts),operation:operations.has(String(recovery.operation))?String(recovery.operation):null,code:code(recovery.code),expired:typeof recovery.expiresAt==="string"&&Number.isFinite(Date.parse(recovery.expiresAt))?Date.parse(recovery.expiresAt)<=Date.now():null}:null,
       codeRevision: typeof configuration.codeRevision === "string" && /^[a-f0-9]{40}$/.test(configuration.codeRevision) ? configuration.codeRevision : null,
@@ -91,7 +97,7 @@ export function intakeDiagnosticPayload(ciphertext: string) {
           const o = object(raw); return { status: code(o.status), reason: code(o.reason) };
         }) }, traces, tracesTruncated: Array.isArray(payload.traces) && payload.traces.length > 40 };
   } catch {
-    return { readable: false, reason: null, waitingCause: "unknown" as const, budgetLimit: null, codeRevision: null, contextReasons: [], input: null, attachments: null, traces: [], tracesTruncated: false };
+    return { readable: false, reason: null, waitingCause: "unknown" as const, decision: null, budgetLimit: null, codeRevision: null, contextReasons: [], input: null, attachments: null, traces: [], tracesTruncated: false };
   }
 }
 

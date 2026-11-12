@@ -168,3 +168,16 @@ it("SAV-45 C: uncertain usages are described from the ledger, never settled, zer
   expect(await fixture.db.select().from(savIntakeModelCalls)).toEqual(before);
   expect(JSON.stringify(calls)).not.toMatch(/gemini|metadata|inputTokens/);
 });
+
+/** SAV-88: "plan_without_code" only says a decision exists. The decision itself is now readable, allow-listed codes only. */
+it("names what V1 decided behind plan_without_code, codes only", () => {
+  const plan = (disposition: Record<string, unknown>, classification: string, progress = "processing") => intakeDiagnosticPayload(encryptSavPayload({
+    plan: { decision: { classification, disposition }, progress: { kind: progress } } }));
+  expect(plan({ kind: "no_ticket", reason: "acknowledgement_only" }, "acknowledgement")).toMatchObject({ waitingCause: "plan_without_code",
+    decision: { disposition: "no_ticket", reason: "acknowledgement_only", operation: null, classification: "acknowledgement", progress: "processing" } });
+  expect(plan({ kind: "ticket", target: { operation: "link", ticketId: "1" } }, "support")).toMatchObject({ decision: { disposition: "ticket", operation: "link", classification: "support" } });
+  expect(plan({ kind: "request_identification", reason: "sender_contact_absent" }, "support")).toMatchObject({ decision: { disposition: "request_identification", reason: "sender_contact_absent" } });
+  expect(plan({ kind: "ticket", target: { operation: "<script>" } }, "free text", "invented_kind")).toMatchObject({ decision: { operation: null, classification: null, progress: null } });
+  expect(plan({ kind: "collect_context", reasons: [] }, "unknown", "human_choice")).toMatchObject({ decision: { progress: "human_choice" } });
+  expect(intakeDiagnosticPayload(encryptSavPayload({}))).toMatchObject({ decision: null });
+});

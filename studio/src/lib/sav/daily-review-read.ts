@@ -19,6 +19,8 @@ export type DailyReviewReadPorts = {
   now(): Date;
   dossiers(engine: Engine, window: Window, limit: number): Promise<unknown[]>;
   monitor(): Promise<unknown>;
+  /** SAV-88: dossiers older than 24 h without a HubSpot ticket (ids, ages and codes only). Optional: absent, the snapshot has no such section. */
+  ticketBacklog?(): Promise<unknown>;
 };
 export type DailyReviewSnapshot = {
   revision: "sav-daily-review-read.v1"; observedAt: string; window: Window;
@@ -26,6 +28,7 @@ export type DailyReviewSnapshot = {
     monitorObservedAt: string | null; monitorAgeSeconds: number | null;
     sources: { v1: "available" | "unavailable"; v2: "available" | "unavailable"; monitor: "fresh" | "stale" | "missing" | "unavailable" } };
   missing: string[]; report: DailyReview;
+  ticketSafetyNet?: unknown;
 };
 
 async function selectRows(statement: SQL): Promise<Record<string, unknown>[]> {
@@ -69,6 +72,7 @@ export const dailyReviewDatabasePorts: DailyReviewReadPorts = {
     const rows = await selectRows(sql`select cursor from sav.sync_state where key='sav-monitor:v1:snapshot' limit 1`);
     return rows[0]?.cursor ? JSON.parse(String(rows[0].cursor)) : null;
   },
+  ticketBacklog: async () => (await import("./intake/ticket-safety-net")).readTicketSafetyNetBacklog(),
 };
 
 /** Staff read model. Authentication precedes validation/DB access. Missing telemetry remains explicit. */
@@ -122,7 +126,12 @@ export async function readDailyReviewSnapshot(raw: unknown = {}, ports: DailyRev
     }
   } catch { coverage.sources.monitor = "unavailable"; missing.add("monitor_snapshot_unavailable"); }
   if (coverage.sources.v1 === "unavailable" && coverage.sources.v2 === "unavailable") coverage.state = "unknown";
-  return { revision: "sav-daily-review-read.v1", observedAt, window, coverage, missing: [...missing].sort(), report: buildDailyReview({ window, monitor, dossiers }) };
+  let ticketSafetyNet: unknown;
+  if (ports.ticketBacklog) {
+    try { ticketSafetyNet = await ports.ticketBacklog(); } catch { ticketSafetyNet = { available: false, reason: "unavailable" }; missing.add("ticket_backlog_unavailable"); }
+  }
+  return { revision: "sav-daily-review-read.v1", observedAt, window, coverage, missing: [...missing].sort(), report: buildDailyReview({ window, monitor, dossiers }),
+    ...(ports.ticketBacklog ? { ticketSafetyNet } : {}) };
 }
 
 /** UI adapter is deliberately separate from counts and missing technical evidence. */

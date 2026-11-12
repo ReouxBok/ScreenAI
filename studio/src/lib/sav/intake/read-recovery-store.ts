@@ -1,7 +1,8 @@
 import "server-only";
 import { and,eq,sql } from "drizzle-orm";
 import { requireDb } from "@/db";
-import { auditLogs,savIntakeRuns,savThreads,savIntakeModelCalls,savMessages } from "@/db/schema";
+import { auditLogs,savIntakeRuns,savThreads,savIntakeModelCalls,savMessages,savIntakeJournal } from "@/db/schema";
+import { intakeRescueConsumedSql,SAV_INTAKE_RESCUE_KINDS } from "./attempt-policy";
 import { decryptSavPayload,encryptSavPayload } from "../crypto";
 import type { IntakeRuntimeConfig,IntakeRuntimePayload } from "./runtime-contract";
 import type { IntakeReadRecovery } from "./read-recovery";
@@ -45,6 +46,12 @@ export async function expireIntakeReadRecoveries(config:IntakeRuntimeConfig,now=
    payload.reason="SAV_INTAKE_READ_RECOVERY_EXPIRED";
    await tx.update(savIntakeRuns).set({payloadCiphertext:encryptSavPayload(payload),state:pending.length?"uncertain":"waiting",leaseToken:null,leaseUntil:null,freshUntil:null}).where(eq(savIntakeRuns.id,run.id));
    await tx.update(savMessages).set({analysisStatus:pending.length?"intake_uncertain":"intake_waiting"}).where(eq(savMessages.id,run.messageId));
+   // SAV-88: a rescue that was waiting on this read retry has no further attempt: it ends "à traiter à la main", never an open wait.
+   if(!pending.length){
+    const [used]=await tx.select({id:savIntakeRuns.id}).from(savIntakeRuns).where(and(eq(savIntakeRuns.id,run.id),intakeRescueConsumedSql(sql`${savIntakeRuns.messageId}`,sql`${savIntakeRuns.id}`),
+     sql`not exists(select 1 from sav.intake_journal f where f.run_id=${savIntakeRuns.id} and f.kind=${SAV_INTAKE_RESCUE_KINDS.failed})`)).limit(1);
+    if(used)await tx.insert(savIntakeJournal).values({runId:run.id,kind:SAV_INTAKE_RESCUE_KINDS.failed,payloadCiphertext:encryptSavPayload({reason:payload.reason})});
+   }
   }
   await writeReadRecoveryMarker(tx,run.id,r);expired++;
  });

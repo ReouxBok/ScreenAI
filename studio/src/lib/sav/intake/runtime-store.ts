@@ -6,7 +6,7 @@ import { readIntakeOperatorInformation } from "./operator-information";
 import { writeReadRecoveryMarker,readRecoverySql,noReadRecoverySql } from "./read-recovery-store";
 import { holdIntakeResume, noResumeHoldSql, recordIntakeResumeProgress } from "./resume-progress-store";
 import { intakeResumeDecision, parseIntakeResumeProof, withoutIntakeResumeProof, intakeResumeProofKey, type IntakeResumeDecision, type IntakeResumeProof, type IntakeResumeProbe } from "./resume-progress";
-import { intakeAttemptBudget, SAV_INTAKE_ATTEMPT_POLICY, SAV_INTAKE_BLOCKING_JOURNAL_KINDS, SAV_INTAKE_CALL_POLICY, SAV_INTAKE_TRANSIENT_RETRY } from "./attempt-policy";
+import { intakeAttemptBudget, intakeActiveBlockSql, intakeRescueOpenSql, intakeRescueConsumedSql, SAV_INTAKE_RESCUE_KINDS, SAV_INTAKE_ATTEMPT_POLICY, SAV_INTAKE_BLOCKING_JOURNAL_KINDS, SAV_INTAKE_CALL_POLICY, SAV_INTAKE_TRANSIENT_RETRY } from "./attempt-policy";
 import { findSavExternalCompletion, hasUnsettledSavHumanAction, hasUnsettledSavIntakeWork, readSavExternalCompletion, listSavExternalCompletionMessageIds, savExternalCompletionEvents, savExternalDisposition } from "../external-completion";
 import "server-only";
 import { reconcileIntakeZeroThoughtUsage } from "./model-usage";
@@ -102,8 +102,16 @@ const journal = async (tx: Tx, runId: string, kind: string, value: unknown) => {
   await tx.insert(savIntakeJournal).values({ runId, kind, payloadCiphertext: encryptSavPayload(value) });
 };
 /** A blocking marker is final for its run: only a new version (or a person) can move the dossier. */
-const blockedRun = async (tx: Tx, runId: string) => (await tx.select({ id: savIntakeJournal.id }).from(savIntakeJournal)
-  .where(and(eq(savIntakeJournal.runId, runId), inArray(savIntakeJournal.kind, [...SAV_INTAKE_BLOCKING_JOURNAL_KINDS]))).limit(1)).length > 0;
+const blockedRun = async (tx: Tx, runId: string, kinds: readonly string[] = SAV_INTAKE_BLOCKING_JOURNAL_KINDS) =>
+  (await tx.select({ id: savIntakeRuns.id }).from(savIntakeRuns).where(and(eq(savIntakeRuns.id, runId), intakeActiveBlockSql(sql`${savIntakeRuns.id}`, kinds))).limit(1)).length > 0;
+/** SAV-88: the rescue granted on this run, still unclaimed for the message (see attempt-policy.ts). */
+const rescueOpen = async (tx: Tx, run: Pick<Run, "id" | "messageId">) =>
+  (await tx.select({ id: savIntakeRuns.id }).from(savIntakeRuns).where(and(eq(savIntakeRuns.id, run.id), intakeRescueOpenSql(sql`${savIntakeRuns.id}`, sql`${savIntakeRuns.messageId}`))).limit(1)).length > 0;
+/** The rescue was used (claimed and not given back, or failed): on this run only with `onRun`, else on any version of the message. */
+const rescueConsumed = async (tx: Tx, runId: string, onRun = false) => (await tx.select({ id: savIntakeRuns.id }).from(savIntakeRuns)
+  .where(and(eq(savIntakeRuns.id, runId), intakeRescueConsumedSql(sql`${savIntakeRuns.messageId}`, onRun ? sql`${savIntakeRuns.id}` : undefined))).limit(1)).length > 0;
+/** The attempt budget ran out: a run that already consumed its rescue ends "à traiter à la main", never a second rescue. */
+const exhaustionKind = async (tx: Tx, runId: string) => await rescueConsumed(tx, runId) ? SAV_INTAKE_RESCUE_KINDS.failed : "attempts_exhausted";
 const attemptRows = (tx: Tx, messageId: string) => tx.select({ id: savIntakeRuns.id, attempts: savIntakeRuns.attempts, payloadCiphertext: savIntakeRuns.payloadCiphertext })
   .from(savIntakeRuns).where(eq(savIntakeRuns.messageId, messageId));
 export const SAV_INTAKE_SOURCE_REVISION = "sav-intake-source.v2";
@@ -341,8 +349,12 @@ async function claimOrReserve(id: string, config: IntakeRuntimeConfig, now: Date
     if (await readSavExternalCompletion(message, tx)) return null;
     const [uncommitted] = await tx.select({ id: savMessages.id }).from(savMessages).where(and(eq(savMessages.id, message.id), noCommittedExecution));
     if (!uncommitted) return null;
-    if (await blockedRun(tx, run.id)) return null;
     const budget = intakeAttemptBudget(run.id, await attemptRows(tx, run.messageId));
+    // SAV-88: an open rescue lifts ONLY a lifetime exhaustion, on a version that still has a slot; any other marker still blocks.
+    // Evaluated identically on the fenced second pass after a resume probe, or a run holding a CRM proof could never take its rescue.
+    const rescue = budget.exhausted !== "per_version" && run.attempts < SAV_INTAKE_ATTEMPT_POLICY.perVersion && await rescueOpen(tx, run)
+      && !await blockedRun(tx, run.id, SAV_INTAKE_BLOCKING_JOURNAL_KINDS.filter(k => k !== "attempts_exhausted"));
+    if (!rescue && await blockedRun(tx, run.id)) return null;
     const priorPayload = decryptSavPayload<IntakeRuntimePayload>(run.payloadCiphertext);
     const retry = readRecoveryDue(priorPayload.readRecovery, config, now);
     const recoveringRead = Boolean(retry && priorPayload.input && priorPayload.semantics?.records.some(r => r.method === "analyseMessage"));
@@ -355,10 +367,10 @@ async function claimOrReserve(id: string, config: IntakeRuntimeConfig, now: Date
         await tx.update(savIntakeRuns).set({payloadCiphertext:encryptSavPayload(priorPayload)}).where(eq(savIntakeRuns.id,run.id));await writeReadRecoveryMarker(tx,run.id,retry);return null;}
     }
     const pending = await tx.select({id:savIntakeModelCalls.id}).from(savIntakeModelCalls).where(and(eq(savIntakeModelCalls.runId, id), inArray(savIntakeModelCalls.state, ["dispatched", "uncertain"])));
-    const reason = pending.length ? "usage_uncertain" : thread.aiPaused ? "paused" : budget.exhausted && !recoveringRead ? "attempts_exhausted" : null;
+    const reason = pending.length ? "usage_uncertain" : thread.aiPaused ? "paused" : budget.exhausted && !recoveringRead && !rescue ? "attempts_exhausted" : null;
     if (reason) {
       // A durable marker: the run leaves scheduling but stays visible as blocked.
-      if (reason === "attempts_exhausted" && !await blockedRun(tx, id)) await journal(tx, id, "attempts_exhausted", { cause: budget.exhausted, failed: budget.failed, total: budget.total, policy: SAV_INTAKE_ATTEMPT_POLICY });
+      if (reason === "attempts_exhausted" && !await blockedRun(tx, id)) await journal(tx, id, await exhaustionKind(tx, id), { cause: budget.exhausted, failed: budget.failed, total: budget.total, policy: SAV_INTAKE_ATTEMPT_POLICY });
       await tx.update(savIntakeRuns).set({ state: pending.length ? "uncertain" : "waiting", leaseToken: null, leaseUntil: null, freshUntil: null, updatedAt: now }).where(eq(savIntakeRuns.id, id));
       await tx.update(savMessages).set({ analysisStatus: pending.length ? "intake_uncertain" : "intake_waiting" }).where(eq(savMessages.id, run.messageId));
       await journal(tx, id, "waiting", { reason }); return null;
@@ -438,6 +450,8 @@ async function claimOrReserve(id: string, config: IntakeRuntimeConfig, now: Date
       attempts: run.attempts + (recoveringRead ? 0 : 1), sourceHash: data.sourceHash, updatedAt: now,
       ...(recoveringRead ? { payloadCiphertext: encryptSavPayload(priorPayload) } : priorPayload.resumeProof ? { payloadCiphertext: encryptSavPayload(withoutIntakeResumeProof(priorPayload)) } : {}) }).where(eq(savIntakeRuns.id, id)).returning();
     await tx.update(savMessages).set({ analysisStatus: "intake_analysing" }).where(eq(savMessages.id, run.messageId));
+    // SAV-88: the rescue is consumed by this very claim (same transaction, same locks): exactly one per message.
+    if (rescue && budget.exhausted && !recoveringRead) await journal(tx, id, SAV_INTAKE_RESCUE_KINDS.claimed, { attempt: claimed.attempts, cause: budget.exhausted, failed: budget.failed, total: budget.total });
     await journal(tx, id, recoveringRead ? "read_retry_claimed" : "claimed", { attempt: claimed.attempts, technicalAttempt: recoveringRead ? retry!.attempts : 0, sourceHash: data.sourceHash });
     return { run: claimed, token, ...data, input: { ...data.input, ...(priorRequestReview ? { priorRequestReview } : {}) }, ...(automation ? { automation } : {}), ...(recoveringRead ? { recoveringRead: true as const } : {}) };
   });
@@ -469,6 +483,11 @@ export async function saveSavIntakeResult(lease: IntakeLease, config: IntakeRunt
       leaseToken: null, leaseUntil: null, updatedAt: now }).where(eq(savIntakeRuns.id, lease.run.id));
     await tx.update(savMessages).set({ analysisStatus: state === "observed" ? "intake_observed" : "intake_waiting" }).where(eq(savMessages.id, lease.run.messageId));
     await journal(tx, lease.run.id, state, payload);
+    // SAV-88: the rescue had to conclude. "observed" is a V1 decision taken (ticket, identification, no ticket, or a
+    // human choice for the team's queue); any other end (collect_context without a human choice, stale sources,
+    // rejected output, recorded provider error) is a dead end: "à traiter à la main", unless a read retry is scheduled.
+    if (state === "waiting" && payload.readRecovery?.state !== "scheduled" && await rescueConsumed(tx, lease.run.id, true) && !await blockedRun(tx, lease.run.id, [SAV_INTAKE_RESCUE_KINDS.failed]))
+      await journal(tx, lease.run.id, SAV_INTAKE_RESCUE_KINDS.failed, { reason: payload.reason ?? null, disposition: payload.plan?.decision.disposition.kind ?? null });
     if (state === "waiting" && payload.plan?.decision.disposition.kind === "collect_context") {
       const dependency = payload.plan.decision.disposition.reasons.find(reason =>
         reason === "private_resource_unavailable" || reason === "forwarded_origin_unverified" || reason === "other_evidence_unavailable");
@@ -491,13 +510,20 @@ export async function failSavIntakeRun(lease: IntakeLease, payload: IntakeRuntim
       ...(deterministic || paused && !lease.recoveringRead ? { attempts: sql`greatest(${savIntakeRuns.attempts} - 1, 0)` } : {}),
       freshUntil: null, leaseToken: null, leaseUntil: null, updatedAt: new Date() }).where(and(eq(savIntakeRuns.id, lease.run.id), eq(savIntakeRuns.leaseToken, lease.token), eq(savIntakeRuns.isCurrent, true))).returning();
     if (rows.length && deterministic) await journal(tx, lease.run.id, "deterministic_block", { reason: payload.reason, attemptRefunded: true });
-    else if (rows.length && paused) await journal(tx, lease.run.id, "agent_paused", { reason: payload.reason, attemptRefunded: !lease.recoveringRead });
+    else if (rows.length && paused) {
+      await journal(tx, lease.run.id, "agent_paused", { reason: payload.reason, attemptRefunded: !lease.recoveringRead });
+      // SAV-88: a pause gives the rescue back with the attempt: it runs once the agent resumes, it is never counted as failed.
+      if (!lease.recoveringRead && await rescueConsumed(tx, lease.run.id, true)) await journal(tx, lease.run.id, SAV_INTAKE_RESCUE_KINDS.returned, { reason: payload.reason });
+    }
     else if (rows.length && !uncertain && !payload.readRecovery) {
       // The last allowed attempt failed: mark it now so the console shows the cause instead of a silent wait.
       const budget = intakeAttemptBudget(lease.run.id, await attemptRows(tx, lease.run.messageId));
-      if (budget.exhausted && !await blockedRun(tx, lease.run.id)) await journal(tx, lease.run.id, "attempts_exhausted",
+      if (budget.exhausted && !await blockedRun(tx, lease.run.id)) await journal(tx, lease.run.id, await exhaustionKind(tx, lease.run.id),
         { cause: budget.exhausted, failed: budget.failed, total: budget.total, policy: SAV_INTAKE_ATTEMPT_POLICY });
     }
+    // SAV-88: a rescue that ends here without a scheduled read retry did not conclude: terminal, whatever the error (a pause excepted, above).
+    if (rows.length && !uncertain && !paused && payload.readRecovery?.state !== "scheduled" && await rescueConsumed(tx, lease.run.id, true)
+      && !await blockedRun(tx, lease.run.id, [SAV_INTAKE_RESCUE_KINDS.failed])) await journal(tx, lease.run.id, SAV_INTAKE_RESCUE_KINDS.failed, { reason: payload.reason ?? null });
     if (rows.length) {
       if(payload.readRecovery)await writeReadRecoveryMarker(tx,lease.run.id,payload.readRecovery);
       await tx.update(savMessages).set({ analysisStatus: uncertain ? "intake_uncertain" : "intake_waiting" }).where(eq(savMessages.id, lease.run.messageId));
@@ -515,10 +541,11 @@ export async function pendingSavIntakeRuns(config: IntakeRuntimeConfig, now = ne
   const recovery = readRecoverySql(sql`${savIntakeRuns.id}`,config,now);
   const legacy = noReadRecoverySql(sql`${savIntakeRuns.id}`);
   const rows = await requireDb().select({ id: savIntakeRuns.id, attempts: savIntakeRuns.attempts, payloadCiphertext: savIntakeRuns.payloadCiphertext }).from(savIntakeRuns).where(and(eq(savIntakeRuns.isCurrent, true), eq(savIntakeRuns.configHash, config.configHash),
-    sql`not exists(select 1 from sav.intake_journal blocked where blocked.run_id=${savIntakeRuns.id} and blocked.kind in (${sql.join(SAV_INTAKE_BLOCKING_JOURNAL_KINDS.map(k => sql`${k}`), sql`, `)}))`,
+    // SAV-88: an open rescue lifts only the lifetime exhaustion; the claim re-checks everything under its locks.
+    or(sql`not ${intakeActiveBlockSql(sql`${savIntakeRuns.id}`)}`, and(intakeRescueOpenSql(sql`${savIntakeRuns.id}`, sql`${savIntakeRuns.messageId}`), sql`not ${intakeActiveBlockSql(sql`${savIntakeRuns.id}`, SAV_INTAKE_BLOCKING_JOURNAL_KINDS.filter(k => k !== "attempts_exhausted"))}`)),
     or(and(lt(savIntakeRuns.attempts, 2),legacy), recovery), noHuman, notCompleted, schedulingFilter, noCommittedExecutionFor(sql`${savIntakeRuns.messageId}`), noResumeHoldSql(sql`${savIntakeRuns.id}`, now),
     // Coarse lifetime bound in SQL; the claim applies the full per-version/failed/total policy.
-    or(sql`(select coalesce(sum(s.attempts),0) from sav.intake_runs s where s.message_id = ${savIntakeRuns.messageId}) < ${SAV_INTAKE_ATTEMPT_POLICY.totalPerMessage}`, recovery),
+    or(sql`(select coalesce(sum(s.attempts),0) from sav.intake_runs s where s.message_id = ${savIntakeRuns.messageId}) < ${SAV_INTAKE_ATTEMPT_POLICY.totalPerMessage}`, recovery, intakeRescueOpenSql(sql`${savIntakeRuns.id}`, sql`${savIntakeRuns.messageId}`)),
     sql`exists (select 1 from sav.threads t where t.id = ${savIntakeRuns.threadId} and not t.ai_paused)`,
     // A scheduled transient retry carries its due time in leaseUntil (no lease token): not before then.
     or(and(inArray(savIntakeRuns.state, ["pending", "waiting"]), or(isNull(savIntakeRuns.leaseUntil), lte(savIntakeRuns.leaseUntil, now))),

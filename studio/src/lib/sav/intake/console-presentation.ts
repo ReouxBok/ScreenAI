@@ -86,6 +86,8 @@ const blockedCauses: Record<string, string> = {
   forwarded_origin_unverified: "Bloqué — transfert sans texte propre. Retrouver le mail ou l’activité CRM d’origine.",
   private_resource_unavailable: "Bloqué — règle ou modèle approuvé indisponible. Vérifier la configuration ou traiter ce dossier manuellement.",
   attempts_exhausted: "Bloqué — tentatives d’analyse épuisées. À traiter par l’équipe.",
+  // SAV-88: the one rescue analysis did not conclude either. Terminal: no further automatic attempt.
+  manual_required: "À traiter à la main — l’analyse de secours n’a pas abouti, aucun ticket n’a été créé.",
   input_invalid: "Bloqué — entrée invalide (date ou contenu). À traiter par l’équipe.",
   source_invalid: "Bloqué — source du mail invalide. À traiter par l’équipe.",
   technical_wait: "Bloqué — attente technique de plus de 15 minutes. À traiter par l’équipe.",
@@ -96,7 +98,9 @@ export function intakeBlockedCauseLabel(cause: string | null | undefined) { retu
 
 /** Console PR-1: `technical_wait` stays the stable API code; this names the real sub-cause from the status and reason the console already reads
  * (no extra query, no amount). Anything not recognised is said to be unclassified, never guessed. */
-export type IntakeBlockedSubCause = "followup_queued" | "followup_incomplete" | "sources_changed" | "verification_pending" | "revalidation_running" | "analysis_queued" | "budget_deferred" | "unclassified";
+export type IntakeBlockedSubCause = "followup_queued" | "followup_incomplete" | "sources_changed" | "verification_pending" | "revalidation_running" | "analysis_queued" | "budget_deferred" | "unclassified"
+  /** SAV-88: the dossier already has a ticket the team sees; only the follow-up is waiting. */
+  | "ticket_tracked";
 const subCauseLabels: Record<IntakeBlockedSubCause, string> = {
   followup_queued: "Premier suivi en file : le rattrapage le traitera au prochain passage",
   followup_incomplete: "Suivi incomplet : une source n’a pas été lue, le rattrapage la relira",
@@ -106,10 +110,19 @@ const subCauseLabels: Record<IntakeBlockedSubCause, string> = {
   analysis_queued: "Mail en attente d’analyse : le prochain passage le prendra",
   budget_deferred: "Plafond IA atteint : reprise automatique quand il se libère",
   unclassified: "Attente technique : cause non classée, ouvrir le dossier",
+  ticket_tracked: "Ticket créé, suivi en cours : l’équipe le voit dans HubSpot",
 };
 export const intakeSubCauseLabel = (sub: IntakeBlockedSubCause) => subCauseLabels[sub];
-export function intakeBlockedSubCause(row: { blockedCause?: string | null; status: string; reason?: string | null }): IntakeBlockedSubCause | null {
+/** A console row; `ticketId` (thread ticket, SAV-88) is optional so older callers keep their labels. */
+export type IntakeBlockedRow = { blockedCause?: string | null; status: string; reason?: string | null; ticketId?: string | null };
+export function intakeBlockedSubCause(row: IntakeBlockedRow): IntakeBlockedSubCause | null {
   if (row.blockedCause !== "technical_wait") return null;
+  const sub = technicalWaitSubCause(row);
+  // SAV-88 (SAV-82 follow-up): with a real ticket nothing waits for an analysis any more: the ticket is followed.
+  // A pending HubSpot/Gmail check stays named as such.
+  return row.ticketId && sub === "analysis_queued" ? "ticket_tracked" : sub;
+}
+function technicalWaitSubCause(row: IntakeBlockedRow): IntakeBlockedSubCause {
   const reason = row.reason ?? "";
   if (/DAILY_BUDGET_DEFERRED|ROLLING_BUDGET_DEFERRED|Plafond (quotidien|d’analyse)/.test(reason)) return "budget_deferred";
   if (row.status === "human_revalidation" || row.status === "human_revalidation_wait") return "revalidation_running";
@@ -128,7 +141,7 @@ export function intakeSchedulerStopped(pulse: { startedAt: string | null; finish
 }
 export const INTAKE_SCHEDULER_STOPPED_LABEL = "Traitement automatique arrêté";
 /** The single line of a list row: the real sub-cause for a technical wait, else the stable cause label. */
-export function intakeBlockedRowLabel(row: { blockedCause?: string | null; status: string; reason?: string | null }) {
+export function intakeBlockedRowLabel(row: IntakeBlockedRow) {
   const sub = intakeBlockedSubCause(row);
   return sub ? intakeSubCauseLabel(sub) : intakeBlockedCauseLabel(row.blockedCause);
 }
@@ -158,6 +171,7 @@ export const intakeExpectedActions: Record<string, string> = {
   forwarded_origin_unverified: "Retrouver le message original et vérifier son auteur et son dossier dans HubSpot avant le rattachement.",
   private_resource_unavailable: "Une ressource approuvée manque (modèle de réponse, règle) : la configurer ou traiter manuellement.",
   attempts_exhausted: "Traiter le dossier manuellement ou relancer une analyse après correction de la cause.",
+  manual_required: "Lire le mail et le traiter à la main dans HubSpot : l’analyse de secours a échoué, plus aucune tentative automatique.",
   SAV_INTAKE_RUNTIME_BUDGET_EXHAUSTED: "Le budget d’appels IA de ce message est atteint : traiter manuellement.",
   analysis_calls_limit: "Les tickets et historiques du contact demandent plus de lots d’analyse que la limite par analyse : choisir le ticket qui reçoit ce mail ou demander une création. Une nouvelle tentative identique échouerait de la même façon.",
   SAV_INTAKE_RUNTIME_DAILY_BUDGET_DEFERRED: "Aucune action requise : reprise automatique au prochain jour (minuit UTC). Relever le plafond quotidien si l’attente gêne.",
