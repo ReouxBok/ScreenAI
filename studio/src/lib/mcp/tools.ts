@@ -6,7 +6,8 @@ import { readIntakeConsoleDetail } from "@/lib/sav/intake/console-detail";
 import { readIntakeRunDiagnostics } from "@/lib/sav/intake/run-diagnostics";
 import { intakeBudgetOwnerFor, readIntakeBudgetPanel } from "@/lib/sav/intake/budget-admin";
 import { savIntakeViewLabels, savIntakeViewSchema } from "@/lib/sav/intake/contract";
-import { intakeProjectionLabel, intakeReasonLabel, intakeBlockedCauseLabel, intakeRetryLabel } from "@/lib/sav/intake/console-presentation";
+import { readSchedulerPulse } from "@/lib/sav/intake/monitoring-read";
+import { intakeProjectionLabel, intakeReasonLabel, intakeBlockedRowLabel, intakeRetryLabel, intakeBlockedSubCause, intakeSchedulerStopped, INTAKE_SCHEDULER_STOPPED_LABEL } from "@/lib/sav/intake/console-presentation";
 import { readOperatorPanel } from "@/lib/sav/intake-ux/operator-commands";
 import { manualOtherUnavailableLabels } from "@/lib/sav/intake/manual-other-classification";
 import { savCompletionBlockerLabels, savCompletionPrecheckLabels } from "@/lib/sav/completion-blockers";
@@ -96,12 +97,14 @@ const listDossiers = { name: "list_dossiers", title: "Lister les dossiers SAV", 
   async run(_context: StudioMcpContext, input: { view: z.infer<typeof viewSchema>; search?: string; page: number; sort: "newest" | "oldest" }) {
     const data = await listIntakeConsole({ view: input.view, search: input.search, page: input.page, ...(input.sort === "oldest" ? { sort: "oldest" as const } : {}) });
     if (!data.installed) return refused("SAV_INTAKE_CONSOLE_NOT_INSTALLED", "La console des nouveaux dossiers n’est pas préparée.");
-    return done({ view: input.view, page: data.page, pages: data.pages, total: data.total,
+    const schedulerStopped = data.rows.some(row => row.blockedCause === "technical_wait") && intakeSchedulerStopped(await readSchedulerPulse());
+    return done({ view: input.view, page: data.page, pages: data.pages, total: data.total, schedulerStopped,
       counts: { processing: data.counts.processing ?? 0, blocked: data.counts.blocked ?? 0, ...Object.fromEntries(Object.keys(savIntakeViewLabels).map(key => [key, data.counts[key] ?? 0])) },
       rows: data.rows.map(row => ({ threadId: row.threadId, messageId: row.messageId, subject: row.subject || "Nouvelle demande", fromEmail: row.fromEmail,
         receivedAt: row.receivedAt?.toISOString() ?? null, updatedAt: row.updatedAt?.toISOString() ?? null, version: row.version, view: row.view, status: row.status,
         blocked: Boolean(row.blockedCause), blockedCause: row.blockedCause,
-        label: row.blockedCause ? intakeBlockedCauseLabel(row.blockedCause) : row.retryAt ? intakeRetryLabel(row.retryAt) : intakeProjectionLabel(row.status, row.uncertainty),
+        blockedSubCause: intakeBlockedSubCause(row), schedulerGroup: schedulerStopped && row.blockedCause === "technical_wait" ? INTAKE_SCHEDULER_STOPPED_LABEL : null,
+        label: row.blockedCause ? intakeBlockedRowLabel(row) : row.retryAt ? intakeRetryLabel(row.retryAt) : intakeProjectionLabel(row.status, row.uncertainty),
         reason: row.reason ? intakeReasonLabel(row.reason) : null })) });
   } };
 const getDossier = { name: "get_dossier", title: "Lire un dossier SAV", write: false,

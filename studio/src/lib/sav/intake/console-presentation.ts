@@ -94,6 +94,45 @@ const blockedCauses: Record<string, string> = {
 };
 export function intakeBlockedCauseLabel(cause: string | null | undefined) { return cause ? blockedCauses[cause] ?? "Bloqué — à traiter par l’équipe." : null; }
 
+/** Console PR-1: `technical_wait` stays the stable API code; this names the real sub-cause from the status and reason the console already reads
+ * (no extra query, no amount). Anything not recognised is said to be unclassified, never guessed. */
+export type IntakeBlockedSubCause = "followup_queued" | "followup_incomplete" | "sources_changed" | "verification_pending" | "revalidation_running" | "analysis_queued" | "budget_deferred" | "unclassified";
+const subCauseLabels: Record<IntakeBlockedSubCause, string> = {
+  followup_queued: "Premier suivi en file : le rattrapage le traitera au prochain passage",
+  followup_incomplete: "Suivi incomplet : une source n’a pas été lue, le rattrapage la relira",
+  sources_changed: "Sources modifiées : nouvelle vérification nécessaire",
+  verification_pending: "Vérification HubSpot/Gmail en attente",
+  revalidation_running: "Choix enregistré : vérification en cours",
+  analysis_queued: "Mail en attente d’analyse : le prochain passage le prendra",
+  budget_deferred: "Plafond IA atteint : reprise automatique quand il se libère",
+  unclassified: "Attente technique : cause non classée, ouvrir le dossier",
+};
+export const intakeSubCauseLabel = (sub: IntakeBlockedSubCause) => subCauseLabels[sub];
+export function intakeBlockedSubCause(row: { blockedCause?: string | null; status: string; reason?: string | null }): IntakeBlockedSubCause | null {
+  if (row.blockedCause !== "technical_wait") return null;
+  const reason = row.reason ?? "";
+  if (/DAILY_BUDGET_DEFERRED|ROLLING_BUDGET_DEFERRED|Plafond (quotidien|d’analyse)/.test(reason)) return "budget_deferred";
+  if (row.status === "human_revalidation" || row.status === "human_revalidation_wait") return "revalidation_running";
+  if (row.status === "followup_pending") return /incompl/i.test(reason) ? "followup_incomplete" : "followup_queued";
+  if (row.status === "context_changed" || /SEMANTIC_CONTEXT_CHANGED|CONTEXT_CHANGED|CRM_CHANGED|SOURCES_STALE|sources (locales )?(ont changé|doivent)/i.test(reason)) return "sources_changed";
+  if (row.status === "waiting" && (!reason || /CRM_READ_|vérification technique/i.test(reason))) return "verification_pending";
+  if (row.status === "pending" || row.status === "analysing" || (row.status === "processing" && !reason) || /Nouvelle entrée en attente/.test(reason)) return "analysis_queued";
+  return "unclassified";
+}
+/** The reconcile pulse older than this means the scheduler, not the dossier, is the cause. */
+export const INTAKE_SCHEDULER_STALE_MINUTES = 30;
+export function intakeSchedulerStopped(pulse: { startedAt: string | null; finishedAt: string | null } | null | undefined, now: Date = new Date()) {
+  const last = pulse?.finishedAt ?? pulse?.startedAt ?? null;
+  if (!last || Number.isNaN(Date.parse(last))) return false; // no pulse is unknown, never declared a stop
+  return now.getTime() - Date.parse(last) > INTAKE_SCHEDULER_STALE_MINUTES * 60_000;
+}
+export const INTAKE_SCHEDULER_STOPPED_LABEL = "Traitement automatique arrêté";
+/** The single line of a list row: the real sub-cause for a technical wait, else the stable cause label. */
+export function intakeBlockedRowLabel(row: { blockedCause?: string | null; status: string; reason?: string | null }) {
+  const sub = intakeBlockedSubCause(row);
+  return sub ? intakeSubCauseLabel(sub) : intakeBlockedCauseLabel(row.blockedCause);
+}
+
 /** Paris time of the next automatic retry, for the processing list. */
 export function intakeRetryLabel(retryAt: string | Date) {
   const time = new Date(retryAt).toLocaleTimeString("fr-FR", { hour: "2-digit", minute: "2-digit", timeZone: "Europe/Paris" });

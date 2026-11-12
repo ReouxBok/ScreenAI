@@ -10,7 +10,7 @@ import { requireIntakeConsoleStaff } from "@/lib/sav/intake/console-auth";
 import { SAV_INTAKE_BUDGET_OWNER_EMAIL } from "@/lib/sav/intake/budget-amount";
 import { listIntakeConsole } from "@/lib/sav/intake/console-store";
 import { savIntakeViewLabels, savIntakeViewSchema } from "@/lib/sav/intake/contract";
-import { intakeProjectionLabel, intakeReasonLabel, intakeBlockedCauseLabel, intakeRetryLabel } from "@/lib/sav/intake/console-presentation";
+import { intakeProjectionLabel, intakeReasonLabel, intakeBlockedRowLabel, intakeRetryLabel, intakeSchedulerStopped, INTAKE_SCHEDULER_STOPPED_LABEL, INTAKE_SCHEDULER_STALE_MINUTES } from "@/lib/sav/intake/console-presentation";
 import styles from "./intake.module.css";
 import { intakeDossierHref } from "@/lib/sav/intake-ux/navigation";
 import { IntakeDossierLink, IntakeListPosition } from "./navigation";
@@ -28,8 +28,15 @@ export default async function IntakeConsolePage({ searchParams }: { searchParams
   const href = (nextView: string, page = 1, search = query.q ?? "") => `/studio/sav/intake?${new URLSearchParams({ view: nextView, q: search.slice(0, 120),
     ...(mailbox.success ? { mailbox: mailbox.data } : {}), ...(["newest","oldest"].includes(query.sort??"")?{sort:query.sort!}:{}), page: String(page) })}`;
   const origin = href(view, data.page);
+  const stopped = intakeSchedulerStopped(monitoring.activity), pulseAt = monitoring.activity.finishedAt ?? monitoring.activity.startedAt;
+  const grouped = stopped ? data.rows.filter(row => row.blockedCause === "technical_wait") : [], rest = stopped ? data.rows.filter(row => row.blockedCause !== "technical_wait") : data.rows;
   // Page-bounded, select-only: V1 latest run + V2 case of the exact confirmed ticket.
   const lines = data.installed ? await readUnifiedLines(data.rows) : {};
+  const renderRow = (row: (typeof data.rows)[number]) => <Fragment key={row.threadId}><IntakeDossierLink id={row.threadId} origin={origin} href={intakeDossierHref(row.threadId, origin)} className={styles.row}>
+          <div><strong>{row.subject || "Nouvelle demande"}</strong><span>{row.fromEmail ?? "Expéditeur en cours de préparation"}</span></div>
+          <div>{row.blockedCause ? <span className={row.blockedCause === "agent_paused" ? styles.status : styles.blocked}>{intakeBlockedRowLabel(row)}</span> : row.retryAt ? <span className={styles.status}>{intakeRetryLabel(row.retryAt)}</span> : <span className={styles.status}>{intakeProjectionLabel(row.status, row.uncertainty)}</span>}{row.reason && <small>{intakeReasonLabel(row.reason)}</small>}</div>
+          <div><span>Version {row.version ?? "en attente"}</span><time dateTime={row.receivedAt?.toISOString()}>{row.receivedAt ? formatParisDateTime(row.receivedAt) : "Nouvelle entrée"}</time></div>
+        </IntakeDossierLink><UnifiedConsoleLine line={lines[row.threadId]} origin={origin}/></Fragment>;
   return <div className={styles.console}>
     <IntakeListPosition origin={origin}/>
     <header className={styles.heading}><div><span className="eyebrow">SAV · nouveaux dossiers</span><h1>Suivre le traitement</h1>
@@ -52,11 +59,10 @@ export default async function IntakeConsolePage({ searchParams }: { searchParams
       {(data.counts.blocked ?? 0) > 0 && <p role="alert" className={styles.blockedAlert}>{data.counts.blocked} dossier{data.counts.blocked > 1 ? "s" : ""} bloqué{data.counts.blocked > 1 ? "s" : ""} — à traiter par l’équipe. Chaque ligne indique la cause ; ils restent comptés jusqu’à leur résolution.</p>}
       <UnifiedConsoleOverview lines={lines} monitoring={unifiedMonitoring}/>
       <section aria-label={view === "processing" ? "Traitements en cours" : savIntakeViewLabels[view]} className={styles.list}>
-        {data.rows.length ? data.rows.map(row => <Fragment key={row.threadId}><IntakeDossierLink id={row.threadId} origin={origin} href={intakeDossierHref(row.threadId, origin)} className={styles.row}>
-          <div><strong>{row.subject || "Nouvelle demande"}</strong><span>{row.fromEmail ?? "Expéditeur en cours de préparation"}</span></div>
-          <div>{row.blockedCause ? <span className={row.blockedCause === "agent_paused" ? styles.status : styles.blocked}>{intakeBlockedCauseLabel(row.blockedCause)}</span> : row.retryAt ? <span className={styles.status}>{intakeRetryLabel(row.retryAt)}</span> : <span className={styles.status}>{intakeProjectionLabel(row.status, row.uncertainty)}</span>}{row.reason && <small>{intakeReasonLabel(row.reason)}</small>}</div>
-          <div><span>Version {row.version ?? "en attente"}</span><time dateTime={row.receivedAt?.toISOString()}>{row.receivedAt ? formatParisDateTime(row.receivedAt) : "Nouvelle entrée"}</time></div>
-        </IntakeDossierLink><UnifiedConsoleLine line={lines[row.threadId]} origin={origin}/></Fragment>) : <div className={styles.empty}><h2>Aucun dossier dans cette vue</h2><p>{query.q ? "Aucun objet ou expéditeur ne correspond à la recherche." : "Les prochains dossiers apparaîtront ici selon leur avancement confirmé."}</p>{query.q && <Link href={href(view,1,"")}>Effacer la recherche</Link>}</div>}
+        {data.rows.length ? <>{grouped.length > 0 && <section className={styles.schedulerGroup} aria-labelledby="scheduler-stopped-heading">
+          <h2 id="scheduler-stopped-heading">{INTAKE_SCHEDULER_STOPPED_LABEL} <b>{grouped.length}</b></h2>
+          <p>Dernier passage terminé le {pulseAt ? formatParisDateTime(pulseAt) : "—"}, il y a plus de {INTAKE_SCHEDULER_STALE_MINUTES} minutes. Ces dossiers de la page attendent ce traitement : la cause est le traitement planifié, pas le dossier. Rien à relancer dossier par dossier.</p>
+          {grouped.map(renderRow)}</section>}{rest.map(renderRow)}</> : <div className={styles.empty}><h2>Aucun dossier dans cette vue</h2><p>{query.q ? "Aucun objet ou expéditeur ne correspond à la recherche." : "Les prochains dossiers apparaîtront ici selon leur avancement confirmé."}</p>{query.q && <Link href={href(view,1,"")}>Effacer la recherche</Link>}</div>}
       </section>
       <footer className={styles.pagination}><span>{data.total} dossier{data.total > 1 ? "s" : ""} · page {data.page} sur {data.pages}</span>
         <div>{data.page > 1 && <Link href={href(view, data.page - 1)}>Précédente</Link>}{data.page < data.pages && <Link href={href(view, data.page + 1)}>Suivante</Link>}</div></footer>
