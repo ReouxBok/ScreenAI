@@ -293,8 +293,12 @@ describe("non-regression of the existing routes (lot 3)", () => {
   });
   it("Other with requests is never hidden without the qualified rule", async () => {
     const b = bench({ text: "Information générale." });
-    const plan = await b.run(d => judgement(d, { requests: [{ id: "r1", kind: "other", summary: "Information.", sourceIds: ["current"] }] }));
+    const plan = await b.run(d => judgement(d, { nature: "information", requests: [{ id: "r1", kind: "other", summary: "Information.", sourceIds: ["current"] }] }));
     expect(plan.decision.disposition).toMatchObject({ kind: "collect_context", reasons: expect.arrayContaining(["private_resource_unavailable"]) });
+    // SAV-90: the reader's own nature « request » is never accepted as Other: the team chooses the classification.
+    const request = await bench({ text: "Information générale." }).run(d => judgement(d, { requests: [{ id: "r1", kind: "other", summary: "Information.", sourceIds: ["current"] }] }));
+    expect(request.decision.disposition).toMatchObject({ kind: "collect_context", reasons: expect.arrayContaining(["classification_incomplete"]) });
+    expect(request.progress).toMatchObject({ kind: "human_choice", questionCode: "request_scope_uncertain" });
   });
   it("a mixed support and finance message keeps both requests in one ticket decision", async () => {
     const b = bench({ text: "Ma synchronisation échoue et je veux aussi ma facture." });

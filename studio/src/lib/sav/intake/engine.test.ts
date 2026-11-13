@@ -805,3 +805,57 @@ describe("choosing between plausible tickets after a complete CRM read", () => {
     expect((await f.run()).progress.kind).toBe("processing");
   });
 });
+
+// SAV-90 (13/11): an accepted « other » is never a silent block, and never hides a real request. Synthetic data only.
+describe("SAV-90 Other without catalogue and real requests", () => {
+  const humanChoice = (plan: IntakePlan, code: string) => {
+    reason(plan, code);
+    expect(plan.progress).toMatchObject({ kind: "human_choice", questionCode: "request_scope_uncertain", view: "to_validate" });
+    expect(plan.decision.disposition).not.toMatchObject({ reasons: expect.arrayContaining(["private_resource_unavailable"]) });
+  };
+  it("an unavailable Other catalogue (absent, invalid or expired) gives a non-blocking human choice, never a hidden mail", async () => {
+    const f = fixture(["other"]); delete f.policy.qualifiedOther; f.policy.otherRuleStatus = "catalogue_unavailable";
+    const plan = await f.run();
+    humanChoice(plan, "other_rule_not_applicable");
+    expect(plan.decision.disposition.kind).not.toBe("no_ticket");
+    expect(f.calls.some(c => c.startsWith("lookup:"))).toBe(false);
+  });
+  it("a request addressed to Limova (nature request) is never accepted as Other, even with a qualified rule", async () => {
+    const f = fixture(["other"]); f.analysis.nature = "request"; f.input.message.currentText = "Pouvez-vous me rappeler au sujet de ma réclamation ?";
+    const plan = await f.run();
+    humanChoice(plan, "classification_incomplete");
+    expect(plan.decision.classification).toBe("unknown");
+    expect(plan.decision.requests.every(r => r.kind === "unknown")).toBe(true);
+    expect(plan.steps).toEqual([]);
+  });
+  it("a reply in a support thread (an earlier mail sent by the mailbox) is never accepted as Other", async () => {
+    const f = fixture(["other"]); f.analysis.nature = "information";
+    f.input.conversation = read([{ ...f.input.message, id: otherMid, direction: "outbound", fromEmail: "support@example.test", toEmails: ["sender@example.test"],
+      currentText: "Synthetic support answer", receivedAt: "2026-10-19T10:00:00.000Z" }, f.input.message]);
+    humanChoice(await f.run(), "classification_incomplete");
+  });
+  it("a reply quoting a mail of the support mailbox (runtime evidence) is never accepted as Other", async () => {
+    const f = fixture(["other"]); f.policy.quotedMailboxReply = true;
+    humanChoice(await f.run(), "classification_incomplete");
+  });
+  it("leaves the existing Other rules unchanged: qualified Other, newsletter and a human's own Other choice", async () => {
+    const f = fixture(["other"]);
+    expect((await f.run()).progress.view).toBe("other");
+    f.analysis.nature = "information"; expect((await f.run()).progress.view).toBe("other");
+    const n = fixture([]); delete n.analysis.ticketSummary; n.analysis.nature = "newsletter"; n.policy.qualifiedOther!.family = "authenticated_newsletter";
+    expect((await n.run()).progress.view).toBe("other");
+    const h = fixture(["other"]); h.analysis.nature = "request"; h.policy.quotedMailboxReply = true;
+    h.input.humanResolution = { choiceId: "synthetic-choice", at, classification: "other" };
+    h.policy.qualifiedOther = { resource, evidenceSource: "human_override" };
+    expect((await h.run()).progress.view).toBe("other");
+    // Without any catalogue status (non-runtime callers) the historical technical wait is unchanged.
+    const t = fixture(["other"]); delete t.policy.qualifiedOther;
+    reason(await t.run(), "private_resource_unavailable");
+  });
+  it("does not touch acknowledgement, commercial or support classifications", async () => {
+    const a = fixture(["acknowledgement"]); a.input.message.currentText = "Merci."; a.analysis.nature = "information"; a.policy.quotedMailboxReply = true;
+    expect((await a.run()).decision.disposition).toMatchObject({ kind: "no_ticket", reason: "acknowledgement_only" });
+    const c = fixture(["commercial"]); c.analysis.nature = "request"; c.policy.quotedMailboxReply = true;
+    expect((await c.run()).progress).toMatchObject({ kind: "supervised_action", classification: "commercial" });
+  });
+});

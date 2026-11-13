@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import { expect, it, vi } from "vitest";
 import { buildSavInboundContext, splitSavMessageText } from "../message-context";
-import { prepareSavIntakeMessage } from "./message";
+import { intakeQuotesMailbox, prepareSavIntakeMessage } from "./message";
 import { createSavIntakeSemanticReaders, type IntakeGeminiCall } from "./model-readers";
 import { normalizeSavEvidenceText } from "../evidence-text";
 
@@ -112,4 +112,25 @@ it("retains the absence of an attributable request on a forwarded-only mail, wit
     expect(prepareSavIntakeMessage({ ...input, subject: "Fwd: Broken login", body }).message).toMatchObject({ currentText: "", forwardedQuoteOnly: true });
     expect(prepareSavIntakeMessage({ ...input, subject: "Fwd: Broken login", body: "Independent request\n" + body }).message.forwardedQuoteOnly).toBeUndefined();
     expect(prepareSavIntakeMessage({ ...input, subject: "Re: My previous mail", body }).message.forwardedQuoteOnly).toBeUndefined();
+});
+
+// SAV-90: a reply in a support thread is recognised from a quote header naming the mailbox's own address. Synthetic addresses.
+it("recognises a quote header naming the support mailbox, and nothing else", () => {
+  const box = "support@example.invalid";
+  const quoted = (body: string) => { const p = prepareSavIntakeMessage({ ...input, body }).provenance; return intakeQuotesMailbox(p, box); };
+  // Gmail (FR/EN), wrapped Gmail header, Outlook block, forwarded block, '>' quoting, upper case.
+  expect(quoted("Toujours en panne.\n\nLe lun. 10 nov. 2026 à 10:00, Support <support@example.invalid> a écrit :\n> Bonjour, avez-vous essayé ?")).toBe(true);
+  expect(quoted("Still broken.\n\nOn Mon, Nov 10, 2026 at 10:00 AM Support <support@example.invalid> wrote:\n> Hello")).toBe(true);
+  expect(quoted("Toujours en panne.\nLe lun. 10 nov. 2026 à 10:00, Support <support@example.invalid> a\nécrit :\n> Bonjour")).toBe(true);
+  expect(quoted("Merci de me rappeler.\n\nDe : Support <SUPPORT@example.invalid>\nEnvoyé : lundi 10 novembre 2026 10:00\nÀ : client@example.invalid\nObjet : Votre demande\n\nBonjour")).toBe(true);
+  expect(quoted("Voir ci-dessous.\n---------- Forwarded message ---------\nFrom: support@example.invalid\nDate: Mon\nTo: client@example.invalid\nSubject: Votre demande")).toBe(true);
+  expect(quoted("> Le 10 nov. 2026, support@example.invalid a écrit :\n> Bonjour")).toBe(true);
+  // Not a support-thread reply: another sender quoted, the address only in a signature or the authored text, a look-alike address, no quote.
+  expect(quoted("Candidature.\n\nLe lun. 10 nov. 2026, Recruteur <jobs@example.invalid> a écrit :\n> Offre")).toBe(false);
+  expect(quoted("Bonjour, écrivez-nous à support@example.invalid pour toute question.")).toBe(false);
+  expect(quoted("Offre exceptionnelle.\n--\nContact : support@example.invalid")).toBe(false);
+  expect(quoted("Re.\n\nLe lun. 10 nov. 2026, X <nosupport@example.invalid> a écrit :\n> a")).toBe(false);
+  expect(quoted("Re.\n\nLe lun. 10 nov. 2026, X <support@example.invalid.evil> a écrit :\n> a")).toBe(false);
+  expect(quoted("Message automatique : je suis absent jusqu'au 12 novembre.")).toBe(false);
+  expect(intakeQuotesMailbox(prepareSavIntakeMessage({ ...input, body: "Le lun., <support@example.invalid> a écrit :\n> a" }).provenance, "")).toBe(false);
 });

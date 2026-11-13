@@ -3,7 +3,7 @@ import { intakeForwardNeedsOriginal } from "./message";
 import { decryptSavPayload } from "../crypto";
 import { releaseLegacyAiPauses } from "./legacy-pause";
 import { intakeOtherQualificationFresh } from "./other-routing";
-import { qualifyRuntimeOther } from "./other-routing-runtime";
+import { intakeQuotedMailboxReply, qualifyRuntimeOther } from "./other-routing-runtime";
 import { assertSavIntakeCallPlan } from "./runtime-store";
 import { createIntakeModelDispatcher } from "./model-dispatch";
 import { prepareIntakeAttachments, intakeInputWithAttachments, finishIntakeAttachmentRead } from "./attachments";
@@ -114,6 +114,9 @@ async function analyseSavIntakeRuntimeWithinBudget(runId: string, config: Intake
     const qualifiedOther = otherEvaluation.state === "qualified" ? otherEvaluation.qualification : null;
     if(qualifiedOther) payload.other=qualifiedOther;
     traces.push({otherQualification:otherEvaluation.state, qualified:Boolean(qualifiedOther)});
+    // SAV-90: a reply quoting a mail of the mailbox is never accepted as Other (engine rule); no evidence when unreadable.
+    const quotedMailboxReply = await intakeQuotedMailboxReply(lease, config.mailboxId).catch(() => false);
+    if (quotedMailboxReply) traces.push({ phase: "support_thread_reply", quotedMailbox: true });
     await writeCheckpoint();
     const retryOrdinal = await intakeTransientRetries(lease.run.messageId);
     dispatcher = createIntakeModelDispatcher({ config, live, retryOrdinal, reserve: (hash, size) => reserveSavIntakeCall(lease, config, hash, new Date(), size), preflight: (hashes, sizes) => assertSavIntakeCallPlan(lease.run.messageId, config, hashes, sizes), signal: controller.signal, env, network });
@@ -167,8 +170,9 @@ async function analyseSavIntakeRuntimeWithinBudget(runId: string, config: Intake
       semanticFailureReason = failure.errorCode;
       traces.push({ ...failure, phase: "accepted_semantics", accepted: false }); checkpoint();
     });
-    payload.plan = await withSavAiBudget(() => planSavIntake(lease.input, { ...reads, ...semantic }, qualifiedOther ? {...config.policy,qualifiedOther:{...(qualifiedOther.family==="authenticated_newsletter"?{family:"authenticated_newsletter" as const}:{}),resource:qualifiedOther.resource,evidenceSource:"private_rule"}} : { ...config.policy,
-      otherRuleStatus: otherEvaluation.state === "qualified" ? undefined : otherEvaluation.state }, { timeoutMs: 10_000 }, () => new Date()));
+    const otherPolicy = qualifiedOther ? {...config.policy,qualifiedOther:{...(qualifiedOther.family==="authenticated_newsletter"?{family:"authenticated_newsletter" as const}:{}),resource:qualifiedOther.resource,evidenceSource:"private_rule" as const}} : { ...config.policy,
+      otherRuleStatus: otherEvaluation.state === "qualified" ? undefined : otherEvaluation.state };
+    payload.plan = await withSavAiBudget(() => planSavIntake(lease.input, { ...reads, ...semantic }, quotedMailboxReply ? { ...otherPolicy, quotedMailboxReply: true as const } : otherPolicy, { timeoutMs: 10_000 }, () => new Date()));
     assertSavIntakeObservation(payload.plan);
     payload.crmEvidence = intakeCrmEvidenceFingerprint(payload.plan, recorded.snapshots());
     // Cancellation may finish after the pure planner's per-call timeout.

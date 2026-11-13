@@ -36,3 +36,21 @@ export function intakeForwardNeedsOriginal(message: IntakeMessage) {
   return message.forwardedQuoteOnly === true && message.contentComplete && !message.currentText.trim()
     && !message.operatorInformation && !message.attachmentInputs?.length && !message.unreadAttachments?.length;
 }
+
+/** SAV-90: the current mail answers a mail of the support mailbox itself. True only when a quote header
+ * (Gmail/Apple « Le … a écrit : » / « On … wrote: », possibly wrapped on two lines, or an Outlook/forward
+ * « De : » / « From: » line) names the mailbox's exact address. An address merely mentioned in prose,
+ * another sender, or a look-alike address does not count; a line in the text that imitates a quote header
+ * does count, which at worst sends the mail to a human choice. It only keeps a mail out of « Autres »
+ * and in the team's classification choice: it never creates a ticket nor chooses a classification. */
+export function intakeQuotesMailbox(provenance: { currentText: string; quotedText: string }, mailboxEmail: string) {
+  const address = mailboxEmail.trim().toLowerCase();
+  if (!/^[^\s@<>]+@[^\s@<>]+$/.test(address)) return false;
+  const named = new RegExp(`(?<![\\w.+@-])${address.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}(?![\\w.@-])`, "i");
+  const lines = `${provenance.currentText}\n${provenance.quotedText}`.split("\n").map(line => line.replace(/^[\s>]+/, "").trim());
+  return lines.some((line, index) => {
+    const next = lines[index + 1] ?? "";
+    const header = /^(?:a\s+)?(?:écrit|wrote)\s*:$/i.test(next) ? `${line} ${next}` : line;
+    return named.test(header) && (/(?:\bwrote|a\s+écrit|écrit)\s*:$/i.test(header) || /^(?:from|de)\s*:/i.test(header));
+  });
+}
