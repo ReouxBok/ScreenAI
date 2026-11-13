@@ -7,6 +7,7 @@ import { savAttachmentInventorySchema } from "../attachment-contract";
 import { readSavOtherConfiguration } from "../other-observation";
 import { readIntakeOtherRules, qualifyIntakeOther, type IntakeOtherQualification } from "./other-routing";
 import type { IntakeLease } from "./runtime-store";
+import { intakeQuotesMailbox } from "./message";
 
 type OtherEvaluation =
   | { state: "catalogue_unavailable" | "not_applicable" | "evidence_unavailable" }
@@ -50,3 +51,10 @@ export function qualifyRuntimeCandidate(input:{mailboxId:string;subject:string;b
   return catalogue.rules.some(r=>r.mailboxId===input.mailboxId&&r.subjectSha256===hash(input.subject)&&r.bodySha256===hash(input.body.text));
 }
 const requireHash=(text:string)=>createHash("sha256").update(text.replace(/\r\n?/g,"\n")).digest("hex");
+/** SAV-90: per-mail evidence that the current mail answers a mail of the mailbox itself (its stored quote header
+ * names the mailbox address). Read only; any read failure is « no evidence », never a classification. */
+export async function intakeQuotedMailboxReply(lease:Pick<IntakeLease,"run"|"provenance">,mailboxId:string) {
+  const provenance=lease.provenance.get(lease.run.messageId);if(!provenance)return false;
+  const [mailbox]=await requireDb().select({email:savMailboxes.email}).from(savMailboxes).where(eq(savMailboxes.id,mailboxId));
+  return Boolean(mailbox&&intakeQuotesMailbox(provenance,mailbox.email));
+}

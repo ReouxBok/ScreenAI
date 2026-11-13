@@ -335,11 +335,22 @@ export async function planSavIntake(
       const outside = classification as "other" | "acknowledgement" | "partnership" | "commercial" | "investor";
       let ruleId: string | undefined;
       if (outside === "other") {
+        // SAV-90: a real request is never Other, whatever rule matched. A reply in a support thread (an earlier
+        // mail of the mailbox in the stored thread, or a quote header naming the mailbox) or a mail the reader
+        // itself calls a request goes to the team's classification choice. Nothing is forced to support;
+        // a person who already chose the classification is not asked again.
+        const supportThreadReply = policy.quotedMailboxReply === true
+          || conversation.some(row => row.direction === "outbound" && row.id !== message.id);
+        if (!input.humanResolution?.classification && (analysis.nature === "request" || supportThreadReply)) {
+          classification = "unknown"; requests = requests.map(r => ({ ...r, kind: "unknown" as const }));
+          return context("classification_incomplete", "request_scope_uncertain");
+        }
         // Accepted semantic classification is not authority to hide a mail.
-        // Block this version until the missing policy is supplied. A missing
-        // resource is not a customer classification question.
+        // SAV-90: an unavailable catalogue (absent, invalid or expired) is a
+        // non-blocking classification choice for the team, never a blocking
+        // marker. Without any runtime status the technical wait is unchanged.
         if (!policy.qualifiedOther) {
-          if (policy.otherRuleStatus === "not_applicable") return context("other_rule_not_applicable", "request_scope_uncertain");
+          if (policy.otherRuleStatus === "not_applicable" || policy.otherRuleStatus === "catalogue_unavailable") return context("other_rule_not_applicable", "request_scope_uncertain");
           if (policy.otherRuleStatus === "evidence_unavailable") return context("other_evidence_unavailable");
           return context("private_resource_unavailable");
         }

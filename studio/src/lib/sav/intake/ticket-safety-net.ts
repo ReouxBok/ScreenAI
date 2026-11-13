@@ -35,13 +35,13 @@ export type SafetyNetCategory =
   | "rescue_pending"    // rescue granted, waiting for the next V1 analysis pass
   | "rescue_running"    // rescue claimed by V1: analysis or execution in progress
   | "manual"            // "à traiter à la main": rescue failed, or blocked by a marker a new attempt cannot lift
-  | "human_decision"    // V1 decided a person must choose or complete (collect_context / human choice)
+  | "human_decision"    // V1 decided a person must choose or complete (collect_context / human choice), or a human pause holds the dossier (human_hold)
   | "execution_pending" // V1 decided a ticket or an identification email; the V1 executor has not done it yet
   | "in_progress";      // V1 still has attempts (queued, deferred, waiting): nothing to rescue yet
 export type SafetyNetItem = { messageId: string; threadId: string; ageHours: number; over24h: boolean; category: SafetyNetCategory; cause: string | null };
 
 type Row = { message_id: string; thread_id: string; received_at: string | Date; run_id: string | null; run_state: string | null; run_attempts: number | null;
-  run_config: string | null; run_payload: string | null; blocking: string | null; lifetime: string | null; granted: boolean; claimed: boolean; usedHere: boolean; failed: boolean };
+  run_config: string | null; run_payload: string | null; blocking: string | null; lifetime: string | null; granted: boolean; claimed: boolean; usedHere: boolean; failed: boolean; ai_paused?: boolean | null };
 
 function rows<T>(result: unknown): T[] {
   return (Array.isArray(result) ? result : (result as { rows?: T[] }).rows ?? []) as T[];
@@ -54,7 +54,7 @@ async function readCandidates(runtime: Pick<IntakeRuntimeConfig, "mailboxId">, l
   const notHandled = handled.length ? sql`m.id not in (${sql.join(handled.map(id => sql`${id}::uuid`), sql`, `)})` : sql`true`;
   const others = SAV_INTAKE_BLOCKING_JOURNAL_KINDS.filter(k => k !== "attempts_exhausted");
   return rows<Row>(await db.execute(sql`select m.id as message_id, m.thread_id, least(m.received_at, m.created_at) as received_at,
-      r.id as run_id, r.state as run_state, r.attempts as run_attempts, r.config_hash as run_config, r.payload_ciphertext as run_payload,
+      t.ai_paused as ai_paused, r.id as run_id, r.state as run_state, r.attempts as run_attempts, r.config_hash as run_config, r.payload_ciphertext as run_payload,
       (select bj.kind from sav.intake_journal bj where bj.run_id = r.id and bj.kind in (${sql.join(others.map(k => sql`${k}`), sql`, `)}) order by bj.created_at desc limit 1) as blocking,
       case when ${intakeActiveBlockSql(sql`r.id`, ["attempts_exhausted"])} then 'attempts_exhausted' else null end as lifetime,
       exists(select 1 from sav.intake_journal g where g.run_id = r.id and g.kind = ${SAV_INTAKE_RESCUE_KINDS.granted}) as granted,
@@ -85,6 +85,9 @@ function categorize(row: Row, runtime: Pick<IntakeRuntimeConfig, "configHash">, 
   if (row.blocking) return item("manual", row.blocking);
   // Once the rescue analysis is observed, it is V1's decision (categories below), never a rescue still running.
   if (row.usedHere && row.run_state !== "observed") return item("rescue_running", row.run_state);
+  // SAV-90: the team holds the thread (threads.ai_paused). V1 legitimately waits on it and a rescue is never granted
+  // there (grantIntakeRescue): a human decision, listed when it would otherwise be, never « in progress / pending ».
+  if (row.ai_paused) return base.over24h || row.lifetime ? item("human_decision", "human_hold") : null;
   if (row.lifetime) {
     // Exhausted again after the one rescue of this message (for example on a later version): no second rescue.
     if (row.claimed) return item("manual", "rescue_used");

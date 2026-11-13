@@ -899,12 +899,13 @@ it.each(["absent","invalid","expired","mismatch","protected","incomplete_evidenc
       requests: [{ id: "noise", kind: "other", currentMessageId: messageId, quoteId: data.citationCatalogue[0].id }] }) }] } }],
       usageMetadata: { promptTokenCount: 10, candidatesTokenCount: 10, thoughtsTokenCount: 0, totalTokenCount: 20 } });
   });
-  const human=["mismatch","protected","negative_auth"].includes(scenario);
+  // SAV-90: an absent, invalid or expired catalogue is a non-blocking human choice, like a rule that does not apply.
+  const human=["absent","invalid","expired","mismatch","protected","negative_auth"].includes(scenario);
   expect(await analyseSavIntakeRuntime(id, config, { env: () => environment, network, authenticateOther })).toMatchObject({ state: human?"observed":"waiting" });
   const plan=(await readSavIntakeCurrent(threadId, config))?.payload.plan;
-  expect(plan?.decision.disposition).toMatchObject({kind:"collect_context",reasons:[human?"other_rule_not_applicable":
-    scenario==="incomplete_evidence" || scenario==="unavailable_gmail"?"other_evidence_unavailable":"private_resource_unavailable"]});
+  expect(plan?.decision.disposition).toMatchObject({kind:"collect_context",reasons:[human?"other_rule_not_applicable":"other_evidence_unavailable"]});
   expect(plan?.progress).toMatchObject(human?{kind:"human_choice",view:"to_validate"}:{kind:"processing",view:null});
+  expect((await f.db.select().from(savIntakeJournal).where(eq(savIntakeJournal.runId, id))).some(row => row.kind === "private_resource_unavailable")).toBe(false);
   expect(authenticateOther).toHaveBeenCalledTimes(["unavailable_gmail","negative_auth"].includes(scenario)?1:0);
   expect(await pendingSavIntakeRuns(config)).toHaveLength(0);
   expect(network).toHaveBeenCalledTimes(1);
@@ -1315,4 +1316,34 @@ it("parks a quote-only forward with a source dependency even when the operationa
   expect(await claimSavIntakeRun(id,config)).toBeNull();
   expect(await readIntakeRunDiagnostics(threadId)).toMatchObject({blockingMarker:"forwarded_origin_unverified",attemptsExhausted:false});
   expect(network).not.toHaveBeenCalled(); expect(await f.db.select().from(savActions)).toHaveLength(0);
+});
+
+// SAV-90 (13/11): the production pattern, synthetic data. The model calls the mail « other », no Other catalogue is
+// configured; a reply quoting the support mailbox or a callback request must reach « À valider », never a blocking marker.
+it.each([
+  ["reply in a support thread", "Toujours rien de mon côté.\n\nLe lun. 10 nov. 2026 à 10:00, Support <support@example.invalid> a écrit :\n> Bonjour, pouvez-vous réessayer ?", "information", "classification_incomplete"],
+  ["callback request", "Merci de me rappeler au plus vite.", "request", "classification_incomplete"],
+  ["plain other, catalogue absent", "Information générale sans demande.", "information", "other_rule_not_applicable"],
+] as const)("SAV-90 routes an « other » without catalogue to the team's classification choice (%s)", async (_case, body, nature, expected) => {
+  await f.db.delete(savMessages).where(eq(savMessages.id, messageId));
+  messageId = (await message({ body })).id;
+  const id = (await enqueueSavIntakeMessage(messageId, config))!;
+  const network = vi.fn<typeof fetch>(async (url, init) => {
+    expect(String(url)).toContain("generativelanguage.googleapis.com");
+    const data = JSON.parse(JSON.parse(String(init?.body)).contents[0].parts[0].text);
+    return Response.json({ candidates: [{ finishReason: "STOP", content: { parts: [{ text: JSON.stringify({ messageId, nature,
+      requests: [{ id: "r1", kind: "other", currentMessageId: messageId, quoteId: data.citationCatalogue[0].id }] }) }] } }],
+      usageMetadata: { promptTokenCount: 10, candidatesTokenCount: 10, thoughtsTokenCount: 0, totalTokenCount: 20 } });
+  });
+  expect(await analyseSavIntakeRuntime(id, config, { env: () => environment, network })).toMatchObject({ state: "observed" });
+  const plan = (await readSavIntakeCurrent(threadId, config))?.payload.plan;
+  expect(plan?.decision.disposition).toMatchObject({ kind: "collect_context", reasons: expect.arrayContaining([expected]) });
+  expect(plan?.decision.disposition).not.toMatchObject({ reasons: expect.arrayContaining(["private_resource_unavailable"]) });
+  expect(plan?.decision.classification).toBe(expected === "classification_incomplete" ? "unknown" : "other");
+  expect(plan?.progress).toMatchObject({ kind: "human_choice", questionCode: "request_scope_uncertain", view: "to_validate" });
+  expect((await f.db.select().from(savIntakeJournal).where(eq(savIntakeJournal.runId, id))).map(row => row.kind)).not.toContain("private_resource_unavailable");
+  expect(await pendingSavIntakeRuns(config)).toHaveLength(0);
+  expect(network).toHaveBeenCalledTimes(1);
+  expect(await f.db.select().from(savActions)).toHaveLength(0);
+  expect(await f.db.select().from(savIntakeEffects)).toHaveLength(0);
 });

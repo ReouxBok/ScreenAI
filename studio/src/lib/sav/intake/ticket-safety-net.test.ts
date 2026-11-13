@@ -285,4 +285,24 @@ describe("SAV-88 rescue through V1", () => {
     expect((await reconcileTicketSafetyNet({ env: { ...env(revision(0)), SAV_INTAKE_TICKET_SAFETY_NET: "execute" } })).granted).toBe(0);
     expect(await f.db.select().from(savIntakeJournal).where(and(eq(savIntakeJournal.kind, "rescue_granted")))).toEqual([]);
   });
+
+  it("SAV-90: a dossier under a human pause is a human decision (human_hold), never « in progress / pending » nor a rescue", async () => {
+    // A pending version recreated by deployments on a paused thread (production pattern), and an exhausted one.
+    const pending = await message(200 * HOUR);
+    await enqueueSavIntakeMessage(pending.id, configOf(env(revision(0))));
+    const { m: spent } = await exhausted();
+    const young = await message(2 * HOUR);
+    await enqueueSavIntakeMessage(young.id, configOf(env(revision(8))));
+    for (const m of [pending, spent, young]) await f.db.update(savThreads).set({ aiPaused: true }).where(eq(savThreads.id, m.threadId));
+    const items = await listTicketSafetyNet(configOf(env(revision(8))));
+    expect(items.find(x => x.messageId === pending.id)).toMatchObject({ category: "human_decision", cause: "human_hold", over24h: true });
+    expect(items.find(x => x.messageId === spent.id)).toMatchObject({ category: "human_decision", cause: "human_hold" });
+    expect(items.find(x => x.messageId === young.id)).toBeUndefined();
+    const report = await reconcileTicketSafetyNet({ env: execute(8) });
+    expect(report).toMatchObject({ eligible: 0, granted: 0 });
+    expect(await kinds("rescue_granted")).toBe(0);
+    // The pause lifted, the same dossier is listed as before (no change to the other categories).
+    await f.db.update(savThreads).set({ aiPaused: false }).where(eq(savThreads.id, pending.threadId));
+    expect((await listTicketSafetyNet(configOf(env(revision(8))))).find(x => x.messageId === pending.id)).toMatchObject({ category: "in_progress" });
+  });
 });
