@@ -201,12 +201,13 @@ export type HandoffNoticeFacts = Readonly<{
 }>;
 
 /** The synthesis never blocks a notice: a body it cannot read gives a notice without it (the template alone, as before SAV-92). */
-function handoffSummaryOf(body: Parameters<typeof buildCaseHandoffSummary>[0]): { summary?: CaseHandoffSummary } {
-  try { return { summary: buildCaseHandoffSummary(body) }; } catch { return {}; }
+function handoffSummaryOf(body: Parameters<typeof buildCaseHandoffSummary>[0], received?: Parameters<typeof buildCaseHandoffSummary>[1]): { summary?: CaseHandoffSummary } {
+  try { return { summary: buildCaseHandoffSummary(body, received) }; } catch { return {}; }
 }
 
 /** The sealed facts of a notice: the decision's report, the trials it cites and the questions already asked, all taken from the stored case and already made safe. */
-export function handoffNoticeFacts(trigger: Extract<HandoffNoticeTrigger, { ok: true }>, body: Pick<CaseSnapshot["body"], "trials" | "questions" | "facts" | "openRequests">): HandoffNoticeFacts {
+export function handoffNoticeFacts(trigger: Extract<HandoffNoticeTrigger, { ok: true }>, body: Pick<CaseSnapshot["body"], "trials" | "questions" | "facts" | "openRequests">,
+  /** SAV-92 (15/11): files received on the case's stored mails (names masked), read by the caller; absent: not listed. */ received?: Parameters<typeof buildCaseHandoffSummary>[1]): HandoffNoticeFacts {
   const cited = new Set(trigger.report.trialIds);
   // A knowledge id is our own structured identifier, not free text: it is kept as is when it has the shape of one, and masked otherwise.
   const knowledgeId = (id: string) => /^[A-Za-z0-9._-]{1,80}$/.test(id) ? id : "[identifiant masqué]";
@@ -218,7 +219,7 @@ export function handoffNoticeFacts(trigger: Extract<HandoffNoticeTrigger, { ok: 
     hypotheses: trigger.report.hypotheses.slice(0, NOTICE_LIMITS.hypotheses).map(item => sanitizeNoticeText(item)).filter(Boolean),
     missingInformation: trigger.report.missingInformation.slice(0, NOTICE_LIMITS.missing).map(item => sanitizeNoticeText(item, 160)).filter(Boolean),
     expectedIntervention: sanitizeNoticeText(trigger.report.expectedIntervention, NOTICE_LIMITS.intervention),
-    trials, questionsAsked: body.questions.length, ...handoffSummaryOf(body),
+    trials, questionsAsked: body.questions.length, ...handoffSummaryOf(body, received),
   };
 }
 

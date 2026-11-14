@@ -100,7 +100,7 @@ export function createCaseInvestigationV2Deps(input: CaseInvestigationV2Input): 
     qualify: caseInvestigationReturnAwareQualify(v1Qualify, { readPolicyRecord, now, ...(input.returnRule ? { returnRules: caseReturnContentRule(input.returnRule, now) } : {}) }),
     customerTexts: caseCustomerTextsReader(),
     // SAV-92: the customer's mails and V1's CRM snapshot, read only from the database (no HubSpot call), masked and bounded.
-    customerContext: caseCustomerContextReader(),
+    customerContext: caseCustomerContextReader({ env: input.env }),
     // What the decision rests on, read now: the contract, the active knowledge revision, the configured model and this prompt.
     revisions: async () => ({ rules: SAV_CASE_DECISION_CONTRACT_REVISION, playbookId: await vectors.readRevision(), model: input.env()[SAV_V2_MODEL_ENV] ?? "", prompt: SAV_CASE_INVESTIGATION_PROMPT_REVISION }),
     ledger: caseCallLedgerOnStore,
