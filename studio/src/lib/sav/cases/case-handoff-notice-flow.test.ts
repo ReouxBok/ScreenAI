@@ -267,11 +267,28 @@ describe("no notice for anything that is not a final handoff decision", () => {
     await expectNoNotice(made.c.caseId);
   });
 
-  it("a decision sent to review (the validator refused every attempt): no notice", async () => {
-    const made = await newCase("gm-no-review");
+  it("Ugo 14/11: a decision the validator refused twice goes to the team (owner transfer + one notice with the refusal reasons), never a silent wait", async () => {
+    const made = await newCase("gm-review-handoff");
+    crmReading = () => goodCrm(made.ticketId);
     const report = await investigate(made.c.caseId, Array.from({ length: SAV_CASE_INVESTIGATION_MAX_CALLS }, () => answer));
     expect(report).toMatchObject({ status: "recorded", outcome: "needs_review" });
-    await expectNoNotice(made.c.caseId);
+    const after = (await readCase(made.c.caseId))!;
+    expect({ owner: after.owner, phase: after.phase, handoff: after.body.handoff }).toEqual({ owner: "human", phase: "handoff_pending", handoff: { reason: "decision_refused" } });
+    const transfer = (await listCaseEvents(made.c.caseId, { limit: 500 })).filter(event => event.kind === "owner_changed" && event.detail?.reason === "decision_refused");
+    expect(transfer).toHaveLength(1);
+    const [row] = (await noticeRows()).filter(r => r.caseId === made.c.caseId);
+    expect(row).toMatchObject({ state: "pending" });
+    await pass();
+    const text = messageOf();
+    expect(text).toContain("*Motif du relais :* le validateur a refusé deux fois la décision de l'agent pour ce message");
+    expect(text).toContain("*Problème :* Connexion impossible à la plateforme.");
+    expect(text).toMatch(/Motifs des refus : /);
+    expect(text).toContain("Aucune réponse n'a été envoyée par l'agent.");
+    // SAV-92: the synthesis of the stored case follows the template (V1 subject here: the fixture records no customer statement).
+    expect(text).toContain("*Synthèse du dossier :*\n• Problème, d'après l'analyse V1 : « Connexion impossible à la plateforme. »");
+    expect(text).toContain("• Raison du transfert : le validateur a refusé deux fois la décision de l'agent pour ce message");
+    // A notice to the team only: no customer reply was planned for this case.
+    expect((await f.db.select().from(savCaseEffectExecutions).where(eq(savCaseEffectExecutions.caseId, made.c.caseId))).map(r => r.replyKey.split(":")[0])).toEqual(["handoff-notice"]);
   });
 
   it("a retry in progress (technical failure, no decision): no notice", async () => {
@@ -557,5 +574,85 @@ describe("review A10: the hostile model text through the real driver", () => {
     expect(posted).toContain(`<https://app.hubspot.com/contacts/${PORTAL}/record/0-1/777|fiche contact HubSpot>`);
     expect(posted).toContain(`<https://app.hubspot.com/contacts/${PORTAL}/record/0-5/${made.ticketId}|ticket ${made.ticketId}>`);
     expect(posted).toMatch(/_Réf\. HO-[0-9a-f]{12}_$/);
+  });
+});
+
+describe("SAV-92 (Ugo 14/11): the HubSpot handoff note, on the existing case note effect", () => {
+  type Hub = { calls: Array<{ op: "dispatch" | "verify"; kind: string; intent: Record<string, unknown> }>; failCreate: boolean };
+  const fakeHub = (hub: Hub) => ({
+    dispatch: async (intent: { kind: string }) => {
+      hub.calls.push({ op: "dispatch", kind: intent.kind, intent: intent as never });
+      if (intent.kind === "note_create" && hub.failCreate) throw Error("HUBSPOT_TIMEOUT");
+      return intent.kind === "note_create" ? { id: "5550001" } : { id: "5550001" };
+    },
+    verify: async (intent: { kind: string }) => {
+      hub.calls.push({ op: "verify", kind: intent.kind, intent: intent as never });
+      return { confirmed: true, attributed: true, ack: { id: "5550001" } };
+    },
+  });
+  async function granting<T>(run: () => Promise<T>) {
+    const both = await approveIntakeExecutionPolicy({ ...policy, mutations: ["notify_case_handoff", "append_case_note"], maxDossiers: 8 });
+    const before = environment;
+    environment = { ...environment, SAV_INTAKE_EXECUTION_POLICY_ID: both.id, SAV_INTAKE_EXECUTION_POLICY_SHA256: both.policyHash };
+    try { return await run(); } finally { environment = before; }
+  }
+  const noteEffects = async (executionId: string) => (await effectsOf(executionId)).filter(effect => effect.kind === "note_create" || effect.kind === "note_associate");
+
+  it("granted: after the confirmed post, one note on the case's ticket with the synthesis (create then associate), confirmed; nothing more on later passes", async () => {
+    const hub: Hub = { calls: [], failCreate: false };
+    const made = await handedOver("gm-note-ok");
+    // The execution was admitted under the notice-only policy: the grant read at planning time is the one that counts.
+    await granting(async () => {
+      const result = await pass({ hubspot: fakeHub(hub) as never });
+      expect(result).toMatchObject({ processed: [{ executionId: made.execution!.id, state: "confirmed" }] });
+      expect(posts()).toHaveLength(1);
+      const dispatched = hub.calls.filter(call => call.op === "dispatch");
+      expect(dispatched.map(call => call.kind)).toEqual(["note_create", "note_associate"]);
+      const create = dispatched[0]!.intent as { ticketId: string; key: string; permission: string; text: string; properties: { hs_note_body: string } };
+      expect(create).toMatchObject({ ticketId: made.ticketId, permission: "append_case_note", key: expect.stringMatching(new RegExp(`^note:${made.c.caseId}:handoff:[0-9a-f]{32}$`)) });
+      expect(create.text.split("\n")[0]).toBe("Transfert à l'équipe SAV (agent V2)");
+      expect(create.text).toContain("Raison du transfert : aucune fiche de connaissance ne couvre la demande");
+      expect(create.text).toContain("Éléments transmis : aucune capture d'écran ni pièce jointe, aucun lien");
+      // Rendered by the existing note renderer (escaped HTML + marker), so the existing HubSpot verification applies unchanged.
+      expect(create.properties.hs_note_body).toMatch(/^<p>Transfert à l&#39;équipe SAV \(agent V2\)<br>[^]*\[Studio intake: [0-9a-f]{64}\]<\/p>$/);
+      expect(dispatched[1]!.intent).toMatchObject({ objectId: "5550001", ticketId: made.ticketId });
+      expect((await noteEffects(made.execution!.id)).map(effect => effect.state)).toEqual(["confirmed", "confirmed"]);
+      const journal = await f.db.select().from(savIntakeEffectJournal).where(and(eq(savIntakeEffectJournal.executionId, made.execution!.id), eq(savIntakeEffectJournal.kind, "execution_confirmed")));
+      expect(journal).toHaveLength(1);
+      expect(await pass({ hubspot: fakeHub(hub) as never })).toEqual({ skipped: "nothing_due" });
+      expect(hub.calls.filter(call => call.op === "dispatch")).toHaveLength(2);
+    });
+  });
+
+  it("an uncertain HubSpot answer is only verified, never written again; then the association follows", async () => {
+    const hub: Hub = { calls: [], failCreate: true };
+    const made = await handedOver("gm-note-uncertain");
+    await granting(async () => {
+      await pass({ hubspot: fakeHub(hub) as never });
+      expect(posts()).toHaveLength(1);
+      expect(hub.calls.filter(call => call.op === "dispatch" && call.kind === "note_create")).toHaveLength(1);
+      expect((await noteEffects(made.execution!.id)).map(effect => effect.state)).toEqual(["uncertain"]);
+      expect((await noticeRows()).find(row => row.id === made.execution!.id)?.state).not.toBe("confirmed");
+      hub.failCreate = false;
+      await letReconcile();
+      await pass({ hubspot: fakeHub(hub) as never });
+      await pass({ hubspot: fakeHub(hub) as never });
+      // The creation was read back (verify), never dispatched a second time.
+      expect(hub.calls.filter(call => call.op === "dispatch" && call.kind === "note_create")).toHaveLength(1);
+      expect(hub.calls.some(call => call.op === "verify" && call.kind === "note_create")).toBe(true);
+      expect(hub.calls.filter(call => call.op === "dispatch" && call.kind === "note_associate")).toHaveLength(1);
+      expect((await noticeRows()).find(row => row.id === made.execution!.id)).toMatchObject({ state: "confirmed" });
+      expect(posts()).toHaveLength(1);
+    });
+  });
+
+  it("not granted (the default policy): no HubSpot call, the notice is confirmed as before and the journal says the note was not granted", async () => {
+    const hub: Hub = { calls: [], failCreate: false };
+    const made = await handedOver("gm-note-off");
+    expect(await pass({ hubspot: fakeHub(hub) as never })).toMatchObject({ processed: [{ executionId: made.execution!.id, state: "confirmed" }] });
+    expect(hub.calls).toHaveLength(0);
+    expect(await noteEffects(made.execution!.id)).toHaveLength(0);
+    const [done] = await f.db.select().from(savIntakeEffectJournal).where(and(eq(savIntakeEffectJournal.executionId, made.execution!.id), eq(savIntakeEffectJournal.kind, "execution_confirmed")));
+    expect(done).toBeDefined();
   });
 });

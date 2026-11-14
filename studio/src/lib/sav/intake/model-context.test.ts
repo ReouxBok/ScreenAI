@@ -1,3 +1,4 @@
+import { boundIntakeTicketHistories } from "./history-budget";
 import { describe, expect, it, vi } from "vitest";
 import { createSavIntakeSemanticReaders, type IntakeGeminiCall, type IntakeModelTrace } from "./model-readers";
 import { intakeEvidenceCatalogue } from "./model-evidence";
@@ -56,10 +57,16 @@ describe("ticket_matching context budget", () => {
     expect(b.catalogue.bySource.history/b.sections.catalogue).toBeGreaterThan(0.9);
     expect(b.history).toMatchObject({tickets:1,events:16,emails:16,duplicateEvents:8});
     expect(b.history!.quotedBytes).toBeGreaterThan(b.history!.duplicateBytes/2);
+    // SAV-92: the history actually sent is the bounded one (newest events, explicit notice), never the raw excess.
+    const [bounded]=boundIntakeTicketHistories(input.tickets);
+    expect(bounded.historyOmitted).toBeDefined();
+    const expected=intakeEvidenceCatalogue(new Map([["current",message.currentText],["ticket-201",`${input.tickets[0].ticket.subject}\n${input.tickets[0].ticket.content}`],["history-201",bounded.history.map(e=>`[${e.id} ${e.at} ${e.kind}] ${e.text}`).join("\n")]])).entries;
     const call=vi.fn<IntakeGeminiCall>(async arg=>{
       const sent=data(arg);
       expect(Buffer.byteLength(arg.body.contents[0].parts[0].text)).toBeLessThanOrEqual(SAV_INTAKE_MODEL_LIMITS.dataBytes);
-      expect(expandIntakeContextView({entries:sent.citationCatalogue as CompactIntakeAnchor[],blocks:sent.contextBlocks??[]})).toEqual(original);
+      expect(Buffer.byteLength(arg.body.contents[0].parts[0].text)).toBeLessThan(rawBytes);
+      expect(expandIntakeContextView({entries:sent.citationCatalogue as CompactIntakeAnchor[],blocks:sent.contextBlocks??[]})).toEqual(expected);
+      expect(JSON.stringify((sent as {tickets?:unknown}).tickets)).toContain("never conclude");
       return sameVerdict(arg,["current","ticket-201","history-201"]);
     });
     const reader=createSavIntakeSemanticReaders({model:"gemini-fixture",call,onTrace:t=>traces.push(t)});
@@ -81,7 +88,10 @@ describe("ticket_matching context budget", () => {
       return bytes;
     };
     const six = await size(threadHistory(6)), two = await size(threadHistory(2));
-    expect(six / two).toBeGreaterThan(5); // three times the replies, more than five times the bytes
+    // Three times the replies, more than four times the bytes; SAV-92 caps each event at
+    // SAV_INTAKE_HISTORY_BUDGET.eventChars, so the growth no longer runs away (it was > 5x).
+    expect(six / two).toBeGreaterThan(4);
+    expect(await size(threadHistory(20))).toBeLessThan(SAV_INTAKE_MODEL_LIMITS.dataBytes);
     // The same eight authored replies, logged once and unquoted, fit comfortably.
     expect(await size(threadHistory(8, { quoted: false, nativeCopy: false }))).toBeLessThan(SAV_INTAKE_MODEL_LIMITS.dataBytes / 4);
   });

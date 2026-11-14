@@ -10,8 +10,9 @@
 import { createHash } from "node:crypto";
 import { crmRecordUrl } from "../intake/crm-display";
 import type { EffectIntent } from "../intake/execution-types";
-import type { CaseSnapshot, CaseTrial } from "./case-types";
+import { caseRequestSearchText, type CaseSnapshot, type CaseTrial } from "./case-types";
 import { SAV_CASE_EFFECT_PERMISSIONS } from "./case-effects";
+import { buildCaseHandoffSummary, caseHandoffSummaryLines, type CaseHandoffSummary } from "./case-handoff-summary";
 import { investigationHandoffCommand, readCaseInvestigationProgress, SAV_CASE_INVESTIGATION_RECORD_KIND, type CaseInvestigationJournalEvent } from "./investigation-record";
 
 export const HANDOFF_NOTICE_CONTRACT = "sav-v2-handoff-notice.v1";
@@ -59,7 +60,9 @@ export function readHandoffNoticeConfig(env: Readonly<Record<string, string | un
 // The trigger
 // ---------------------------------------------------------------------------------------------------------------------------------
 
-export const HANDOFF_REASONS = ["explicit_human_request", "sensitive_request", "knowledge_missing", "knowledge_conflict", "evidence_inaccessible", "diagnosis_out_of_tools", "repeated_failure"] as const;
+export const HANDOFF_REASONS = ["explicit_human_request", "sensitive_request", "knowledge_missing", "knowledge_conflict", "evidence_inaccessible", "diagnosis_out_of_tools", "repeated_failure",
+  // Ugo (14/11): not a model reason. The store hands the case over itself when the validator refused the decision of an input twice (`refusalHandoff`).
+  "decision_refused"] as const;
 export type HandoffReason = typeof HANDOFF_REASONS[number];
 export const HANDOFF_REASON_LABELS: Record<HandoffReason, string> = {
   explicit_human_request: "le client demande à parler à une personne",
@@ -69,7 +72,10 @@ export const HANDOFF_REASON_LABELS: Record<HandoffReason, string> = {
   evidence_inaccessible: "un élément nécessaire au diagnostic n'est pas accessible à l'agent",
   diagnosis_out_of_tools: "le diagnostic dépasse les outils de l'agent",
   repeated_failure: "les essais de l'agent ont échoué à répétition",
+  decision_refused: "le validateur a refusé deux fois la décision de l'agent pour ce message",
 };
+/** The fixed next human action of a refused decision: never model text. */
+export const HANDOFF_REFUSED_INTERVENTION = "Reprendre le dossier : vérifier les faits constatés et la demande, puis répondre au client. Aucune réponse n'a été envoyée par l'agent.";
 
 export type HandoffTriggerRefusal = "no_record" | "no_decision" | "not_handoff" | "not_accepted" | "stale_input" | "taken_by_person";
 export type HandoffNoticeTrigger = Readonly<{
@@ -78,6 +84,17 @@ export type HandoffNoticeTrigger = Readonly<{
   recordedAtVersion: number; reason: HandoffReason;
   report: Readonly<{ need: string; expected: string | null; observed: string | null; trialIds: readonly string[]; hypotheses: readonly string[]; missingInformation: readonly string[]; expectedIntervention: string }>;
 }> | Readonly<{ ok: false; why: HandoffTriggerRefusal }>;
+
+/** The handoff a twice-refused decision stands for: requests, observed facts and trials as stored, refusal labels as written by our validator. */
+function refusedHandoffAction(snapshot: Pick<CaseSnapshot, "body">, rejections: ReadonlyArray<{ label: string }>) {
+  const open = snapshot.body.openRequests.filter(row => row.status === "open");
+  const need = open.map(row => caseRequestSearchText(row) ?? row.summary).join(" ; ") || "non précisé";
+  const observed = snapshot.body.facts.filter(fact => fact.kind === "observed").slice(-3).map(fact => fact.text).join(" ; ") || null;
+  return { kind: "handoff" as const, reason: "decision_refused" as const, report: { need, expected: null, observed,
+    trialIds: snapshot.body.trials.map(trial => trial.id), hypotheses: [] as string[],
+    // Rendered as « Motifs des refus » for this reason (renderHandoffNotice).
+    missingInformation: [...new Set(rejections.map(row => row.label))].slice(0, 5), expectedIntervention: HANDOFF_REFUSED_INTERVENTION } };
+}
 
 /** Events after the decision that make it no longer the final word: a newer customer mail, a newer investigation, a person's command, an owner change. */
 export function staleHandoffEventKinds(transferred: boolean) {
@@ -105,9 +122,12 @@ export function handoffNoticeTrigger(snapshot: Pick<CaseSnapshot, "caseId" | "ti
   if (read.state !== "found" || read.caseVersion !== latest.caseVersion) return { ok: false, why: "no_record" };
   const decision = read.record.decision;
   if (!decision) return { ok: false, why: "no_decision" };
-  if (decision.validation.outcome !== "accepted") return { ok: false, why: "not_accepted" };
-  const action = decision.validation.decision.nextAction;
-  if (action.kind !== "handoff") return { ok: false, why: "not_handoff" };
+  // Ugo (14/11): a decision the validator refused twice is handed over like an accepted handoff, with a report built from the STORED case (verified
+  // facts, trials, requests) and our own fixed refusal labels; never from the refused model output.
+  const refused = decision.validation.outcome === "needs_review" && decision.refusalHandoff?.reason === "decision_refused" ? decision.validation : null;
+  if (decision.validation.outcome !== "accepted" && !refused) return { ok: false, why: "not_accepted" };
+  const action = refused ? refusedHandoffAction(snapshot, refused.rejections) : decision.validation.outcome === "accepted" ? decision.validation.decision.nextAction : null;
+  if (!action || action.kind !== "handoff") return { ok: false, why: "not_handoff" };
   if (snapshot.body.handoff?.humanSince) return { ok: false, why: "taken_by_person" };
   if (latest.detail?.applied === false) return { ok: false, why: "stale_input" };
   // Only a matching, committed transfer lets new mail wait for the human team.
@@ -176,10 +196,17 @@ export type HandoffNoticeFacts = Readonly<{
   contract: typeof HANDOFF_NOTICE_CONTRACT; caseId: string; ticketId: string; inputKey: string; recordedAtVersion: number; reason: HandoffReason;
   need: string; expected: string | null; observed: string | null; hypotheses: readonly string[]; missingInformation: readonly string[]; expectedIntervention: string;
   trials: ReadonlyArray<Readonly<{ knowledgeId: string; outcome: CaseTrial["outcome"] }>>; questionsAsked: number;
+  /** SAV-92: the synthesis of the stored case (`case-handoff-summary.ts`), masked and bounded. Absent from notices sealed before it existed. */
+  summary?: CaseHandoffSummary;
 }>;
 
+/** The synthesis never blocks a notice: a body it cannot read gives a notice without it (the template alone, as before SAV-92). */
+function handoffSummaryOf(body: Parameters<typeof buildCaseHandoffSummary>[0]): { summary?: CaseHandoffSummary } {
+  try { return { summary: buildCaseHandoffSummary(body) }; } catch { return {}; }
+}
+
 /** The sealed facts of a notice: the decision's report, the trials it cites and the questions already asked, all taken from the stored case and already made safe. */
-export function handoffNoticeFacts(trigger: Extract<HandoffNoticeTrigger, { ok: true }>, body: Pick<CaseSnapshot["body"], "trials" | "questions">): HandoffNoticeFacts {
+export function handoffNoticeFacts(trigger: Extract<HandoffNoticeTrigger, { ok: true }>, body: Pick<CaseSnapshot["body"], "trials" | "questions" | "facts" | "openRequests">): HandoffNoticeFacts {
   const cited = new Set(trigger.report.trialIds);
   // A knowledge id is our own structured identifier, not free text: it is kept as is when it has the shape of one, and masked otherwise.
   const knowledgeId = (id: string) => /^[A-Za-z0-9._-]{1,80}$/.test(id) ? id : "[identifiant masqué]";
@@ -191,7 +218,7 @@ export function handoffNoticeFacts(trigger: Extract<HandoffNoticeTrigger, { ok: 
     hypotheses: trigger.report.hypotheses.slice(0, NOTICE_LIMITS.hypotheses).map(item => sanitizeNoticeText(item)).filter(Boolean),
     missingInformation: trigger.report.missingInformation.slice(0, NOTICE_LIMITS.missing).map(item => sanitizeNoticeText(item, 160)).filter(Boolean),
     expectedIntervention: sanitizeNoticeText(trigger.report.expectedIntervention, NOTICE_LIMITS.intervention),
-    trials, questionsAsked: body.questions.length,
+    trials, questionsAsked: body.questions.length, ...handoffSummaryOf(body),
   };
 }
 
@@ -261,8 +288,9 @@ export function renderHandoffNotice(sealed: HandoffNoticeFacts, crm: HandoffCrmV
   if (facts.observed) tried.push(`• Constaté : ${facts.observed}`);
   facts.hypotheses.forEach(item => tried.push(`• Hypothèse : ${item}`));
   if (!tried.length) tried.push("• Aucun essai enregistré avant le relais");
-  const next = [facts.expectedIntervention || "à définir par l'équipe", ...(facts.missingInformation.length ? [`Informations manquantes : ${facts.missingInformation.join(" ; ")}`] : [])];
-  const text = [
+  const next = [facts.expectedIntervention || "à définir par l'équipe", ...(facts.missingInformation.length
+    ? [`${facts.reason === "decision_refused" ? "Motifs des refus" : "Informations manquantes"} : ${facts.missingInformation.join(" ; ")}`] : [])];
+  const body = [
     `*${HANDOFF_NOTICE_TITLE}*`,
     `*Client :* ${client}`,
     `*Problème :* ${facts.need || "non précisé"}`,
@@ -270,13 +298,17 @@ export function renderHandoffNotice(sealed: HandoffNoticeFacts, crm: HandoffCrmV
     `*Motif du relais :* ${HANDOFF_REASON_LABELS[facts.reason]}`,
     `*Ticket HubSpot :* ${ticket}`,
     `*Prochaine action proposée :* ${next.join(". ")}`,
-    `_Réf. ${marker}_`,
-  ].join("\n").slice(0, NOTICE_LIMITS.text);
+    // SAV-92: after the existing template, so a cut only ever shortens the synthesis.
+    ...(facts.summary ? [`*Synthèse du dossier :*\n${caseHandoffSummaryLines(facts.summary, HANDOFF_REASON_LABELS[facts.reason], sanitizeNoticeText).join("\n")}`] : []),
+  ].join("\n");
+  // The marker always survives the cut: the verification ties the posted message to its key by it.
+  const reference = `_Réf. ${marker}_`;
+  const text = `${body.slice(0, NOTICE_LIMITS.text - reference.length - 1)}\n${reference}`;
   return { text, marker, key };
 }
 
 // The lines of the notice that carry free text, and the only links that may stay in it (the ones `renderHandoffNotice` builds from a CRM-verified id and the portal id).
-const FREE_TEXT_LINE = /^(\*Problème :\* |• (?:Attendu|Constaté|Hypothèse) : |\*Prochaine action proposée :\* )(.*)$/;
+const FREE_TEXT_LINE = /^(\*Problème :\* |• (?:Attendu|Constaté|Hypothèse|Question|Réponse) : |• Problème, [a-zA-ZÀ-ÿ' ]{1,40} : |• Essai [A-Za-z0-9._[\] -]{1,80} : |\*Prochaine action proposée :\* )(.*)$/;
 const INTERNAL_LINK = /<https:\/\/app\.hubspot\.com\/contacts\/[0-9]{1,20}\/record\/0-[15]\/[0-9]{1,30}\|[^<>|\n]{1,80}>/g;
 /**
  * The last look before Slack, on the text exactly as it is about to leave (including an intent sealed in the ledger BEFORE a rule existed): the free-text lines are made

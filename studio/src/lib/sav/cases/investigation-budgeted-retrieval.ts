@@ -250,12 +250,14 @@ export function createCaseBudgetedRetrieval(deps: CaseBudgetedRetrievalDeps) {
 
 /** The runner's `knowledge` port on the budgeted search: one budgeted backend per run, its stop surfaced as such. */
 export function caseBudgetedKnowledge(deps: Omit<CaseBudgetedRetrievalDeps, "snapshot" | "inputKey"> & { scope: { locale: string; audience: "support" | "lead" }; now: () => Date }) {
-  return async (snapshot: CaseSnapshot, context?: { inputKey: string }): Promise<CaseKnowledgeRead> => {
+  return async (snapshot: CaseSnapshot, context?: { inputKey: string; customerWords?: string | null }): Promise<CaseKnowledgeRead> => {
     // Without the input there is no ledger subject: nothing may be paid. Only the runner's canonical keys are accepted here.
     if (!context) return { status: "unavailable", reason: "search_unavailable" };
     if (!SAV_CASE_INPUT_KEY.test(context.inputKey)) return { status: "stopped", stop: { reason: "knowledge_request_invalid", problem: "input_key_invalid" } };
     const retrieval = createCaseBudgetedRetrieval({ ...deps, snapshot, inputKey: context.inputKey });
-    const read = await selectCaseKnowledge(snapshot, retrieval.backend, { locale: deps.scope.locale, audience: deps.scope.audience, now: deps.now() });
+    // SAV-92: the customer's own words are a second query of the same single embedding batch (see `selectCaseKnowledge`).
+    const read = await selectCaseKnowledge(snapshot, retrieval.backend, { locale: deps.scope.locale, audience: deps.scope.audience, now: deps.now(),
+      ...(context.customerWords ? { customerWords: context.customerWords } : {}) });
     const stopped = retrieval.stop();
     if (stopped) return { status: "stopped", stop: stopped };
     // The embedding calls this search sent, so that a later stop of the run never reads as « no call ».

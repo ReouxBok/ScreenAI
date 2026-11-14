@@ -5,10 +5,14 @@
 //   driver     what is checked before every plan, marker and send (mode, pauses, the execution's permission, the lease, and under the case lock that the decision is still
 //              the final word); the CRM is read just before the plan so the links are verified; what is recorded once the post is confirmed.
 //   pass       `runHandoffNoticePass`: the open notices, oldest first. A Slack answer that is lost or unclear is verified by reading the channel, never posted again.
+//   note       SAV-92 (Ugo 14/11): once the post is confirmed, the same execution writes ONE HubSpot note on the case's ticket with the synthesis of the stored case,
+//              through the EXISTING V2 case note effect (`buildCaseNoteIntent` / `buildCaseNoteAssociateIntent`: key `note:<caseId>:handoff:<hash of input>`,
+//              marker before the call, an uncertain result only verified, never written again). Only when the policy grants `append_case_note`; otherwise
+//              the notice ends as before and the journal says the note was not granted.
 // Nothing here is called by a route, a cron or an action: the caller injects the clock, the network and the policy. OFF until `SAV_HANDOFF_NOTICE=on` AND the execution
 // policy grants `notify_case_handoff`; `SAV_CASE_EFFECTS` (reply and note effects) is neither read nor needed.
 import "server-only";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { and, asc, eq, gt, inArray, isNull, like, lt, lte, notExists, or, sql } from "drizzle-orm";
 import { requireDb } from "@/db";
 import { savCaseEffectExecutions, savCaseEvents, savIntakeEffectJournal, savIntakeEffects, savThreads } from "@/db/schema";
@@ -25,10 +29,14 @@ import { caseEffectSchemaInstalled } from "./case-effect-recovery";
 import { createHandoffCrmReader, type HandoffCrmReader } from "./case-handoff-crm";
 import { nextSweepPage } from "./case-sweep-cursor";
 import {
-  buildHandoffNoticeIntent, HANDOFF_NOTICE_CONTRACT, HANDOFF_NOTICE_KEY_PREFIX, awaitingHandoff, staleHandoffEventKinds, handoffNoticeFacts, handoffNoticeKey, handoffNoticeTrigger,
+  buildHandoffNoticeIntent, HANDOFF_NOTICE_CONTRACT, HANDOFF_REASON_LABELS, HANDOFF_NOTICE_KEY_PREFIX, awaitingHandoff, staleHandoffEventKinds, handoffNoticeFacts, handoffNoticeKey, handoffNoticeTrigger,
   judgeHandoffCrm, readHandoffNoticeConfig, renderHandoffNotice, type HandoffNoticeFacts,
 } from "./case-handoff-notice";
 import { createHandoffSlackAdapters, SLACK_NOT_POSTED_PREFIX } from "./case-handoff-slack";
+import { caseHandoffSummaryLines } from "./case-handoff-summary";
+import { buildCaseNoteAssociateIntent, buildCaseNoteIntent, type CaseNoteCreateIntent } from "./case-effect-intents";
+import { caseNoteAssociationKey, caseNoteKey, SAV_CASE_EFFECT_PERMISSIONS } from "./case-effects";
+import { createIntakeExecutorAdapters } from "../intake/execution-adapters";
 import { investigationHandoffCommand } from "./investigation-record";
 import { lockCaseForWrite, listCaseEvents, readCase } from "./case-store";
 
@@ -39,7 +47,21 @@ const fault = (code: string): never => { throw Error(`SAV_HANDOFF_NOTICE_${code}
 const code = (error: unknown) => (error instanceof Error ? error.message : "UNKNOWN_ERROR").replace(/[^A-Z0-9_.:-]/gi, "_").slice(0, 160);
 
 /** The sealed payload of a notice execution: what the decision said, already made safe. The channel, the portal and the links are never in it (read when the notice is planned). */
-export type HandoffNoticePayload = Readonly<{ contract: typeof HANDOFF_NOTICE_CONTRACT; key: string; facts: HandoffNoticeFacts; teamOwnerId: string | null }>;
+export type HandoffNoticePayload = Readonly<{ contract: typeof HANDOFF_NOTICE_CONTRACT; key: string; facts: HandoffNoticeFacts; teamOwnerId: string | null;
+  /** SAV-92: the HubSpot handoff note, sealed at admission (text and time never rebuilt). Absent from notices admitted before it existed. */
+  note?: Readonly<{ interactionId: string; text: string; at: string }> }>;
+const ackOf = (effect: Effect) => effect.ackCiphertext ? decryptSavPayload<{ id?: string }>(effect.ackCiphertext) : null;
+const NOTE_KINDS = new Set(["note_create", "note_associate"]);
+
+/** The HubSpot note of a handoff: team-facing, from the sealed synthesis of the stored case (already masked). Null without a synthesis. */
+export function handoffNoteOf(facts: HandoffNoticeFacts, at: string): HandoffNoticePayload["note"] | undefined {
+  if (!facts.summary) return undefined;
+  const interactionId = `handoff:${createHash("sha256").update(facts.inputKey).digest("hex").slice(0, 32)}`;
+  const text = ["Transfert à l'équipe SAV (agent V2)", `Demande : ${facts.need || "non précisée"}`,
+    ...caseHandoffSummaryLines(facts.summary, HANDOFF_REASON_LABELS[facts.reason]),
+    `Prochaine action proposée : ${facts.expectedIntervention || "à définir par l'équipe"}`].join("\n");
+  return { interactionId, text, at };
+}
 const payloadOf = (row: typeof savCaseEffectExecutions.$inferSelect) => decryptSavPayload<HandoffNoticePayload>(row.payloadCiphertext);
 const effectIntent = (effect: Effect) => decryptSavPayload<EffectIntent>(effect.intentCiphertext);
 
@@ -75,7 +97,8 @@ export async function enqueueHandoffNotice(input: Readonly<{ caseId: string; pol
   const threadId = snapshot.threadIds.at(-1);
   if (!threadId) return { ok: false, code: "no_thread" };
   const key = handoffNoticeKey(trigger.caseId, trigger.inputKey);
-  const payload: HandoffNoticePayload = { contract: HANDOFF_NOTICE_CONTRACT, key, facts: handoffNoticeFacts(trigger, snapshot.body), teamOwnerId: config.teamOwnerId };
+  const facts = handoffNoticeFacts(trigger, snapshot.body), note = handoffNoteOf(facts, new Date().toISOString());
+  const payload: HandoffNoticePayload = { contract: HANDOFF_NOTICE_CONTRACT, key, facts, teamOwnerId: config.teamOwnerId, ...(note ? { note } : {}) };
   return requireDb().transaction(async (tx): Promise<EnqueueHandoffNoticeResult> => {
     const [created] = await tx.insert(savCaseEffectExecutions).values({
       caseId: snapshot.caseId, replyKey: key, threadId, policyId: input.policy.id, policyHash: input.policy.hash, payloadCiphertext: encryptSavPayload(payload),
@@ -192,6 +215,28 @@ export function createHandoffNoticeDriver(deps: HandoffNoticeDriverDeps): PassDr
     }
   }
 
+  /**
+   * After the confirmed post: the HubSpot note, on the existing case note effect. A planned row is returned as stored (never rebuilt); a new note is planned only
+   * when the policy grants `append_case_note`. Create first, then associate from the CONFIRMED creation's object id, as for every case note.
+   */
+  async function nextNoteIntent(lease: ExecutionLease, effects: readonly Effect[], options: Parameters<PassDriver["nextIntent"]>[2]): Promise<EffectIntent | null> {
+    const payload = payloads.get(lease)!, note = payload.note;
+    if (!note) return null;
+    const caseId = payload.facts.caseId;
+    const created = effects.find(effect => effect.businessKey === caseNoteKey(caseId, note.interactionId));
+    const associated = effects.find(effect => effect.businessKey === caseNoteAssociationKey(caseId, note.interactionId));
+    if (created && created.state !== "confirmed") return effectIntent(created);
+    if (!created) {
+      const { policy } = await readIntakeExecutionAuthority(options.config);
+      if (!policy.mutations.includes(SAV_CASE_EFFECT_PERMISSIONS.note)) return null;
+      return buildCaseNoteIntent({ caseId, interactionId: note.interactionId, ticketId: payload.facts.ticketId, sourceMessageId: caseId, text: note.text, at: note.at }) as unknown as EffectIntent;
+    }
+    if (associated) return associated.state === "confirmed" ? null : effectIntent(associated);
+    const objectId = ackOf(created)?.id;
+    if (!objectId) return fault("NOTE_ACK_MISSING");
+    return buildCaseNoteAssociateIntent({ caseId, interactionId: note.interactionId, created: effectIntent(created) as unknown as CaseNoteCreateIntent, createEffectId: created.id, objectId }) as unknown as EffectIntent;
+  }
+
   const driver: PassDriver = {
     async claim(executionId) {
       return requireDb().transaction(async (tx): Promise<{ lease: ExecutionLease } | { blocked: "occupied" }> => {
@@ -217,7 +262,8 @@ export function createHandoffNoticeDriver(deps: HandoffNoticeDriverDeps): PassDr
       const payload = payloads.get(lease)!;
       const existing = effects.find(effect => effect.businessKey === payload.key);
       // A ledger row that exists is what was planned: its stored intent is returned, never a rebuilt one.
-      if (existing) return existing.state === "confirmed" ? null : effectIntent(existing);
+      if (existing && existing.state !== "confirmed") return effectIntent(existing);
+      if (existing) return nextNoteIntent(lease, effects, options);
       const config = readHandoffNoticeConfig(deps.env());
       if (config.mode !== "on") return fault("HOLD_NOTICE_OFF");
       const [thread] = await requireDb().select({ customerEmail: savThreads.customerEmail }).from(savThreads).where(eq(savThreads.id, lease.row.threadId));
@@ -262,9 +308,14 @@ export function createHandoffNoticeDriver(deps: HandoffNoticeDriverDeps): PassDr
         const notice = effects.find(effect => effect.businessKey === payload.key);
         const [fresh] = notice ? await tx.select().from(savIntakeEffects).where(eq(savIntakeEffects.id, notice.id)).for("share") : [];
         if (!fresh || fresh.state !== "confirmed") return fault("RECEIPT_MISSING");
+        const note = payload.note, noteRows = note ? effects.filter(effect => effect.businessKey === caseNoteKey(payload.facts.caseId, note.interactionId)
+          || effect.businessKey === caseNoteAssociationKey(payload.facts.caseId, note.interactionId)) : [];
+        // A planned note is never left half done: both steps confirmed, or the execution stays open (verified, never written again).
+        if (noteRows.some(effect => effect.state !== "confirmed") || noteRows.length === 1) return fault("NOTE_RECEIPT_MISSING");
         await tx.update(savCaseEffectExecutions).set({ state: "confirmed", leaseToken: null, leaseUntil: null, reason: null, updatedAt: new Date() })
           .where(and(eq(savCaseEffectExecutions.id, lease.row.id), eq(savCaseEffectExecutions.leaseToken, lease.token)));
-        await executionJournal(tx, lease.row.id, "execution_confirmed", { noticeEffectId: fresh.id });
+        await executionJournal(tx, lease.row.id, "execution_confirmed", { noticeEffectId: fresh.id,
+          note: !note ? "none" : noteRows.length ? "confirmed" : "not_granted", ...(noteRows.length ? { noteEffectIds: noteRows.map(effect => effect.id) } : {}) });
       });
     },
     async end(lease, state, reason) {
@@ -312,13 +363,16 @@ export type HandoffNoticeRuntimeDeps = Readonly<{
   context?: Pick<ExecutionOptions, "runtime" | "policy">;
   crm?: HandoffCrmReader;
   adapters?: Pick<ExecutorAdapters, "dispatch" | "verify">;
+  /** SAV-92: the HubSpot note's adapters (tests inject them); by default the existing executor adapters, built only when a note is dispatched or verified. */
+  hubspot?: Pick<ExecutorAdapters, "dispatch" | "verify">;
   schemaInstalled?: () => Promise<boolean>;
 }>;
 export type HandoffNoticePassResult =
   | Readonly<{ skipped: "notice_off" | "execution_off" | "schema_absent" | "observation_required" | "nothing_due" | (string & {}) }>
   | Readonly<{ skipped: null; processed: ReadonlyArray<Readonly<{ executionId: string; state: string; reason: string | null }>> }>;
 
-/** One bounded pass: the due notices, each on the existing executor with the notice driver. The Slack adapter is the only port of the executor that is ever called. */
+/** One bounded pass: the due notices, each on the existing executor with the notice driver. Only two ports are ever called: Slack for the post and, for the
+ * granted HubSpot handoff note (SAV-92), the existing executor's HubSpot dispatch/verify. No CRM read, no Gmail. */
 export async function runHandoffNoticePass(deps: HandoffNoticeRuntimeDeps): Promise<HandoffNoticePassResult> {
   const env = deps.env();
   if (readHandoffNoticeConfig(env).mode !== "on") return { skipped: "notice_off" };
@@ -340,8 +394,12 @@ export async function runHandoffNoticePass(deps: HandoffNoticeRuntimeDeps): Prom
   }
   const slack = deps.adapters ?? createHandoffSlackAdapters({ network: deps.network, env: deps.env });
   const forbidden = (port: string) => async () => { throw Error(`SAV_HANDOFF_NOTICE_FORBIDDEN_PORT_${port.toUpperCase()}`); };
+  let hub = deps.hubspot;
+  const hubspot = () => hub ??= createIntakeExecutorAdapters({ network: deps.network, env: deps.env });
   const adapters: ExecutorAdapters = {
-    dispatch: slack.dispatch, verify: slack.verify, readCrm: forbidden("readCrm"), gmailCurrent: forbidden("gmailCurrent"), gmailPermissions: forbidden("gmailPermissions"),
+    // The HubSpot note goes to the existing executor adapters; everything else (the post) to Slack only.
+    dispatch: (intent, signal) => NOTE_KINDS.has(intent.kind) ? hubspot().dispatch(intent, signal) : slack.dispatch(intent, signal),
+    verify: (intent, ack, at, signal) => NOTE_KINDS.has(intent.kind) ? hubspot().verify(intent, ack, at, signal) : slack.verify(intent, ack, at, signal), readCrm: forbidden("readCrm"), gmailCurrent: forbidden("gmailCurrent"), gmailPermissions: forbidden("gmailPermissions"),
     scope: (() => { throw Error("SAV_HANDOFF_NOTICE_FORBIDDEN_PORT_SCOPE"); }) as ExecutorAdapters["scope"],
   };
   const crm = deps.crm ?? createHandoffCrmReader({ network: deps.network, env: deps.env });

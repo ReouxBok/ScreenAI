@@ -10,7 +10,16 @@ export const SAV_DERIVED_COST_REVISION = "sav-derived-usd-2026-10-19.v1";
 export const SAV_DERIVED_MONEY = {
     dayNanoUsd: 1000000000, rollingNanoUsd: 30000000000, alertNanoUsd: 24000000000
 } as const;
-const PRICE_FROM = Date.parse("2026-07-30T00:00:00Z"), PRICE_UNTIL = Date.parse("2027-01-01T00:00:00Z");
+/** Validity of the hard-coded tariff below, [PRICE_FROM, PRICE_UNTIL). Past it every model call refuses
+ * (SAV_DERIVED_PRICE_EXPIRED), fail-closed. SAV-92 B (Ugo, 14/11): extended from 2027-01-01 to 2027-07-01 with
+ * the same tariff, so calls do not stop on 1 January; the monitor raises model_price_expiring from
+ * SAV_DERIVED_PRICE_ALERT_DAYS before the end (critical in the last 7 days), so the tariff is re-checked
+ * against Google's published price and the period renewed (or the price changed) by a reviewed commit. */
+const PRICE_FROM = Date.parse("2026-07-30T00:00:00Z"), PRICE_UNTIL = Date.parse("2027-07-01T00:00:00Z");
+export const SAV_DERIVED_PRICE_EXPIRES_AT = new Date(PRICE_UNTIL).toISOString();
+export const SAV_DERIVED_PRICE_ALERT_DAYS = 45;
+/** Every expiry an earlier quote recorded for this same tariff: audits keep the value of their time. */
+const RECORDED_PRICE_EXPIRIES = new Set(["2027-01-01T00:00:00.000Z", SAV_DERIVED_PRICE_EXPIRES_AT]);
 const INPUT_LIMIT = 1048576, INPUT_NANO_USD = 750, OUTPUT_NANO_USD = 3750;
 const DAY_MS = 86400000, RESERVED = "sav_derived_call_reserved";
 const integer = (value: unknown): value is number => typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
@@ -67,7 +76,8 @@ function charge(metadata: Record<string, unknown>) {
     catch {
         return failure("SAV_DERIVED_COST_HISTORY_UNKNOWN");
     }
-    if (Object.entries(quote).some(([key, value]) => metadata[key] !== value))
+    // Same tariff, any recorded validity end of it: extending the period never orphans an earlier audit.
+    if (Object.entries(quote).some(([key, value]) => key === "priceExpiresAt" ? !RECORDED_PRICE_EXPIRIES.has(String(metadata[key])) : metadata[key] !== value))
         return failure("SAV_DERIVED_COST_HISTORY_UNKNOWN");
     if (metadata.chargedNanoUsd === undefined)
         return quote.reservedNanoUsd;

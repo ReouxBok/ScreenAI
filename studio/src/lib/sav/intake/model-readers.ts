@@ -15,6 +15,7 @@ import {
 } from "./engine-types";
 import type { prepareSavIntakeMessage } from "./message";
 import { SAV_INTAKE_MODEL_LIMITS } from "./model-limits";
+import { boundIntakeTicketHistories, intakeHistoryNotice } from "./history-budget";
 import { intakeContextBreakdown, type IntakeContextBreakdown } from "./model-context";
 import { compactIntakeContextView, INTAKE_CONTEXT_VIEW_INSTRUCTION } from "./model-context-view";
 import type { IntakeEvidenceAnchor } from "./model-evidence";
@@ -125,6 +126,8 @@ export function createSavIntakeSemanticReaders(options: {
   provenance?: ReadonlyMap<string, ReturnType<typeof prepareSavIntakeMessage>["provenance"]>;
   /** Comparison only; operational callers leave it absent. */
   onValidatedEvidence?: (evidence: IntakeValidatedEvidence) => void;
+  /** SAV-92: tickets already tied to the dossier (thread ticket, human choice) whose history is bounded last. */
+  historyPriorityTicketIds?: readonly (string | null | undefined)[];
 }): SavIntakeSemanticReaders {
   if (!/^gemini-[A-Za-z0-9._-]{1,100}$/.test(options.model)) throw Error("SAV_INTAKE_CONFIGURED_MODEL_REQUIRED");
   let calls = 0;
@@ -365,7 +368,9 @@ export function createSavIntakeSemanticReaders(options: {
     },
     assessIssues: async (input, signal) => {
       if (!input.tickets.length) return { investigationComplete: true, tickets: [] };
-      const build = (tickets: typeof input.tickets) => {
+      // SAV-92: bounded, explicit history per ticket (history-budget.ts); every ticket is still assessed.
+      const boundedTickets = boundIntakeTicketHistories(input.tickets, options.historyPriorityTicketIds);
+      const build = (tickets: typeof boundedTickets) => {
       const sources = new Map<string, string>([["current", input.message.currentText]]);
       if (input.requestContext) sources.set("initial-request", input.requestContext.currentText);
       for (const observation of visualObservations) if (observation.fileHash && ["analyzed", "partial"].includes(observation.status))
@@ -391,7 +396,8 @@ export function createSavIntakeSemanticReaders(options: {
       })).max(20) });
       const data = { message: messageMetadata(input.message, "current"), requests: input.requests,
         ...(input.requestContext ? { requestContext: messageMetadata(input.requestContext, "initial-request"), continuationInstructions: "The initial-request is an explicitly verified continuation. Read and cite it as well as current, without attributing its words to current. Include initial-request in evidenceIds for each ticket assessment." } : {}),
-        tickets: tickets.map(t => ({ ticket: ticketMetadata(t.ticket), historyEntries: t.history.length })), evidence: input.evidence, citationCatalogue: catalogue.entries };
+        tickets: tickets.map(t => ({ ticket: ticketMetadata(t.ticket), historyEntries: t.history.length,
+          ...(t.historyOmitted ? { historyOmittedEntries: t.historyOmitted.events, historyNotice: intakeHistoryNotice(t.historyOmitted) } : {}) })), evidence: input.evidence, citationCatalogue: catalogue.entries };
       const instruction = "Assess EVERY ticket against ALL current requests, reading its notes/exchanges. same means this single ticket covers every request; partial/unknown must remain explicit. A shared name, generic topic or keyword is insufficient. Cite current, ticket and nonempty history with exact excerpts for same/different. For each ticket, evidenceIds must include current, ticket-<ticketId>, history-<ticketId> from the supplied evidence list (including the aggregate history proof when history is empty). Fill grounding.current, grounding.ticket and grounding.history with quoteIds from the corresponding source for THIS ticket; history is null only when that ticket has no history. Cite initialRequest when supplied. Additional anchors are optional and never replace these source slots. Never substitute individual note/email IDs or quoteIds for these aggregate evidenceIds. Do not select or create a destination here.";
       boundedBody("ticket_matching", instruction, data, wireSchema, signal, histories);
       return { data, histories, wireSchema, catalogue, sources, instruction, tickets };
@@ -399,15 +405,15 @@ export function createSavIntakeSemanticReaders(options: {
       type Group = ReturnType<typeof build>;
       const groups: Group[] = [];
       try {
-        try { groups.push(build(input.tickets)); }
+        try { groups.push(build(boundedTickets)); }
         catch (error) {
           if (!(error instanceof Error) || error.message !== "SAV_INTAKE_MODEL_CONTEXT_LIMIT") throw error;
           // SAV-74: first-fit decreasing, deterministic. Every ticket is still read whole; packing
           // the largest first needs fewer calls than filling groups in id order.
-          const size = (row: (typeof input.tickets)[number]) => Buffer.byteLength(JSON.stringify(row), "utf8");
-          const ordered = input.tickets.map((row, index) => ({ row, index, bytes: size(row) }))
+          const size = (row: (typeof boundedTickets)[number]) => Buffer.byteLength(JSON.stringify(row), "utf8");
+          const ordered = boundedTickets.map((row, index) => ({ row, index, bytes: size(row) }))
             .sort((a, b) => b.bytes - a.bytes || a.index - b.index);
-          const bins: { rows: (typeof input.tickets)[number][]; group: Group }[] = [];
+          const bins: { rows: (typeof boundedTickets)[number][]; group: Group }[] = [];
           for (const { row } of ordered) {
             let placed = false;
             for (const bin of bins) {

@@ -340,3 +340,13 @@ it("11/11: the V2 effects worker has its own pulse, judged only when V2 runs: mi
     expect(await codes()).toEqual([["v2_effects_failed","critical"]]);
   } finally { await f.db.delete(savSyncState).where(eq(savSyncState.key,KEY)); }
 });
+
+it("SAV-92 B warns 45 days before the hard-coded model price ends, critical in the last 7 days", async () => {
+  vi.useFakeTimers({ toFake: ["Date"] });
+  try {
+    for (const [at, severity] of [["2027-05-10T00:00:00Z", null], ["2027-05-20T00:00:00Z", "warning"], ["2027-06-26T00:00:00Z", "critical"]] as const) {
+      vi.setSystemTime(new Date(at));
+      expect((await collectSavMonitorSnapshot()).issues.find(i => i.code === "model_price_expiring")?.severity ?? null).toBe(severity);
+    }
+  } finally { vi.useRealTimers(); }
+});

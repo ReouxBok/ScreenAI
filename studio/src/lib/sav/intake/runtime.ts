@@ -20,7 +20,9 @@ import { intakeCrmEvidenceFingerprint, recordIntakeCrmReads } from "./crm-eviden
 import { intakeResumeHoldReason, intakeResumeProof, newIntakeResumeObservation, observeIntakeReads } from "./resume-progress";
 import { probeIntakeResumeForRun } from "./resume-progress-store";
 import type { IntakeBudgetLimit } from "./budget-limit";
-import { intakeTransientFailure, SAV_INTAKE_DETERMINISTIC_ERRORS } from "./attempt-policy";
+import { intakeTransientFailure, SAV_INTAKE_ANALYSIS_TIMING, SAV_INTAKE_DETERMINISTIC_ERRORS, SAV_INTAKE_DISPATCH_LANES } from "./attempt-policy";
+import { readSavAgentPause } from "./agent-pause";
+import { requireDb } from "@/db";
 import { createSavIntakeHubspotReaders } from "./hubspot-readers";
 import { createSavIntakeSemanticReaders } from "./model-readers";
 import { createSavIntakeSimpleReaders, memoizeIntakeCrmReaders, SAV_INTAKE_SIMPLE_REVISION } from "./simple-readers";
@@ -57,7 +59,7 @@ async function analyseSavIntakeRuntimeWithinBudget(runId: string, config: Intake
   const previous = decryptSavPayload<IntakeRuntimePayload>(lease.run.payloadCiphertext);
   if (lease.recoveringRead && previous.input && !lease.automation) lease.input = structuredClone(previous.input) as EngineInput;
   const repairMalformedOutput = lease.run.attempts > 1 && ["SAV_INTAKE_MODEL_OUTPUT_REJECTED", "SAV_INTAKE_RUNTIME_CALL_ALREADY_CONSUMED"].includes(previous.reason ?? "");
-  const controller = new AbortController(), timer = setTimeout(() => controller.abort(), 45_000);
+  const controller = new AbortController(), timer = setTimeout(() => controller.abort(), SAV_INTAKE_ANALYSIS_TIMING.analysisMs);
   const traces: unknown[] = [];
   let semanticFailureReason: string | undefined, readerBudgetLimit: IntakeBudgetLimit | undefined;
   // The sub-limit is kept only beside the very code it explains.
@@ -119,7 +121,9 @@ async function analyseSavIntakeRuntimeWithinBudget(runId: string, config: Intake
     if (quotedMailboxReply) traces.push({ phase: "support_thread_reply", quotedMailbox: true });
     await writeCheckpoint();
     const retryOrdinal = await intakeTransientRetries(lease.run.messageId);
-    dispatcher = createIntakeModelDispatcher({ config, live, retryOrdinal, reserve: (hash, size) => reserveSavIntakeCall(lease, config, hash, new Date(), size), preflight: (hashes, sizes) => assertSavIntakeCallPlan(lease.run.messageId, config, hashes, sizes), signal: controller.signal, env, network });
+    // SAV-92: the single-call reader (simple pipeline, never at_receipt) runs exactly as the comparison's simple side.
+    const singlePassWhenEligible = pipeline === "simple" && lease.input.mode !== "at_receipt";
+    dispatcher = createIntakeModelDispatcher({ config, live, retryOrdinal, singlePassWhenEligible, reserve: (hash, size) => reserveSavIntakeCall(lease, config, hash, new Date(), size), preflight: (hashes, sizes) => assertSavIntakeCallPlan(lease.run.messageId, config, hashes, sizes), signal: controller.signal, env, network });
     const { call, pending } = dispatcher;
     const attachments = lease.recoveringRead ? null : await prepareIntakeAttachments(lease, config.model, live, deps.downloadAttachments, { pdf: config.pdfReading === true });
     if (attachments) {
@@ -147,14 +151,16 @@ async function analyseSavIntakeRuntimeWithinBudget(runId: string, config: Intake
       traces.push({ pipeline: "simple", reader: "current", cause: "at_receipt_not_supported" });
       if (!lease.recoveringRead) payload.semantics!.validatorRevision = SAV_INTAKE_MODEL_REVISION;
     }
-    const semanticReader = simple ? createSavIntakeSimpleReaders({ model: config.model, call, crm: reads, policy: config.policy, provenance: lease.provenance,
+    // SAV-92: the ticket of the Gmail thread (or a person's choice) keeps the larger history share.
+    const historyPriorityTicketIds = [lease.threadTicketId, lease.input.humanResolution?.ticketId];
+    const semanticReader = simple ? createSavIntakeSimpleReaders({ model: config.model, call, crm: reads, policy: config.policy, provenance: lease.provenance, historyPriorityTicketIds,
       ...(attachments?.complete ? { attachments: { prepared: attachments.prepared, onRead: observations => {
         attachments.state.read = { ...attachments.state.read, observations, state: "complete", completedAt: new Date().toISOString() };
         payload.attachments = attachments.state; checkpoint();
       } } } : {}),
       onTrace: trace => { semanticFailureReason = trace.errorCode ?? undefined; if (trace.budgetLimit) readerBudgetLimit = trace.budgetLimit; traces.push(trace); checkpoint(); },
       onJudgement: judgement => { traces.push({ phase: "simple_judgement", ...judgement }); checkpoint(); } })
-      : createSavIntakeSemanticReaders({ planCalls: dispatcher.plan, repairMalformedOutput,
+      : createSavIntakeSemanticReaders({ planCalls: dispatcher.plan, repairMalformedOutput, historyPriorityTicketIds,
       repairIssues:publicIntakeSchemaIssues((previous.traces?.findLast(t=>(t as {validationFailure?:unknown})?.validationFailure) as {validationFailure?:{issues?:unknown}}|undefined)?.validationFailure?.issues),
       ...(priorAnalysis?.attachmentObservations?{acceptedImages:priorAnalysis.attachmentObservations}:{}), ...(attachments?.complete ? { attachments: { prepared: attachments.prepared, onRead: observations => {
       attachments.state.read = { ...attachments.state.read, observations, state: "complete", completedAt: new Date().toISOString() };
@@ -172,12 +178,14 @@ async function analyseSavIntakeRuntimeWithinBudget(runId: string, config: Intake
     });
     const otherPolicy = qualifiedOther ? {...config.policy,qualifiedOther:{...(qualifiedOther.family==="authenticated_newsletter"?{family:"authenticated_newsletter" as const}:{}),resource:qualifiedOther.resource,evidenceSource:"private_rule" as const}} : { ...config.policy,
       otherRuleStatus: otherEvaluation.state === "qualified" ? undefined : otherEvaluation.state };
-    payload.plan = await withSavAiBudget(() => planSavIntake(lease.input, { ...reads, ...semantic }, quotedMailboxReply ? { ...otherPolicy, quotedMailboxReply: true as const } : otherPolicy, { timeoutMs: 10_000 }, () => new Date()));
+    payload.plan = await withSavAiBudget(() => planSavIntake(lease.input, { ...reads, ...semantic }, quotedMailboxReply ? { ...otherPolicy, quotedMailboxReply: true as const } : otherPolicy,
+      // SAV-92: CRM reads keep 10 s each; the model gets the whole shared AI allowance, exactly like the comparison campaign.
+      { timeoutMs: 10_000, modelTimeoutMs: SAV_INTAKE_ANALYSIS_TIMING.modelMs }, () => new Date()));
     assertSavIntakeObservation(payload.plan);
     payload.crmEvidence = intakeCrmEvidenceFingerprint(payload.plan, recorded.snapshots());
     // Cancellation may finish after the pure planner's per-call timeout.
     let drainTimer: ReturnType<typeof setTimeout> | undefined;
-    try { await Promise.race([Promise.allSettled([...pending,...readPending]), new Promise<never>((_, reject) => { drainTimer = setTimeout(() => reject(Error("SAV_INTAKE_RUNTIME_SETTLEMENT_UNCERTAIN")), 15_000); })]); }
+    try { await Promise.race([Promise.allSettled([...pending,...readPending]), new Promise<never>((_, reject) => { drainTimer = setTimeout(() => reject(Error("SAV_INTAKE_RUNTIME_SETTLEMENT_UNCERTAIN")), SAV_INTAKE_ANALYSIS_TIMING.settlementMs); })]); }
     finally { if (drainTimer) clearTimeout(drainTimer); }
     await checkpoints;
     if (dispatcher.uncertain) throw Error("SAV_INTAKE_RUNTIME_USAGE_UNCERTAIN");
@@ -232,31 +240,41 @@ export async function analyseSavIntakeRuntime(...args: Parameters<typeof analyse
   const first = await withSavAiBudget(() => analyseSavIntakeRuntimeWithinBudget(...args));
   if (!("retryFormat" in first) || !first.retryFormat) return first;
   const deadline = args[2]?.deadlineMs;
-  if (deadline !== undefined && (!Number.isFinite(deadline) || deadline - Date.now() < 65_000)) return first;
+  if (deadline !== undefined && (!Number.isFinite(deadline) || deadline - Date.now() < SAV_INTAKE_ANALYSIS_TIMING.startMarginMs)) return first;
   // A new lease increments the unchanged two-attempt bound, rechecks pause,
   // latest message and uncertain usage, and retains the same durable ledger.
   const second = await withSavAiBudget(() => analyseSavIntakeRuntimeWithinBudget(...args));
   return "skipped" in second ? first : second;
 }
-/** Cron reconciliation is bounded to four queued messages and one analysis/pass.
- * It runs alongside V0 observation and never acquires action/send capabilities. */
+/** Cron reconciliation: normally four queued messages and one analysis per pass. SAV-92 fix 4: when more
+ * runs are eligible (a backlog, typically after a pause) it takes up to ten, recent mail first, and keeps
+ * analysing while each new analysis still fits the start margin of the pass deadline. A full agent pause
+ * dispatches nothing. It runs alongside V0 observation and never acquires action/send capabilities. */
 export async function reconcileSavIntakeRuntime(options: { deadlineMs?: number } = {}) {
   const config = savIntakeRuntimeConfig(); if (!config) return { skipped: "off" as const };
   await (await import("./read-recovery-store")).expireIntakeReadRecoveries(config);
   await (await import("./read-recovery-wake")).dispatchPendingReadRecoveryWakes({env:process.env});
-  if (options.deadlineMs && options.deadlineMs - Date.now() < 65_000) return { skipped: "deadline" as const };
+  if (options.deadlineMs && options.deadlineMs - Date.now() < SAV_INTAKE_ANALYSIS_TIMING.startMarginMs) return { skipped: "deadline" as const };
   const operatorResume = await (await import("./operator-resume")).reconcileOperatorResumes();
   if (operatorResume) return { mode: "observe", operatorResume };
   await reconcileConfinedIntakeUsage(config);
   // Before catch-up, so a customer reply on a legacy-paused thread is analysed in this pass.
   const legacyPauses = await releaseLegacyAiPauses(config);
-  const queued = await catchupSavIntake(config), runs = await pendingSavIntakeRuns(config);
-  let result: Awaited<ReturnType<typeof analyseSavIntakeRuntime>> | null = null;
+  const queued = await catchupSavIntake(config);
+  // A full pause dispatches nothing (each claim would refuse anyway): no candidate list, no attempt.
+  const paused = (await readSavAgentPause(requireDb())).level === "fully_paused";
+  const runs = paused ? [] : await pendingSavIntakeRuns(config, new Date(), undefined, SAV_INTAKE_DISPATCH_LANES.catchUpBatch);
+  const catchUp = runs.length > SAV_INTAKE_DISPATCH_LANES.normalBatch;
+  let result: Awaited<ReturnType<typeof analyseSavIntakeRuntime>> | null = null, analysed = 0;
   for (const run of runs) {
-    result = await analyseSavIntakeRuntime(run.id, config, { deadlineMs: options.deadlineMs });
-    if (!("skipped" in result)) break;
+    // Every analysis after the first needs the full start margin, so the pass ends within its budget.
+    if (analysed && (!options.deadlineMs || options.deadlineMs - Date.now() < SAV_INTAKE_ANALYSIS_TIMING.startMarginMs)) break;
+    const next = await analyseSavIntakeRuntime(run.id, config, { deadlineMs: options.deadlineMs });
+    if ("skipped" in next) { if (!analysed) result = next; continue; }
+    result = next; analysed++;
+    if (!catchUp) break;
   }
-  return { mode: "observe", queued, legacyPauses, result, budget: await readSavIntakeBudget(config) };
+  return { mode: "observe", queued, legacyPauses, result, ...(catchUp ? { catchUp: { candidates: runs.length, analysed } } : {}), budget: await readSavIntakeBudget(config) };
 }
 
 function attachmentFailureReason(reason:string|undefined,uncertain:boolean):import("../attachment-contract").SavAttachmentObservation["reason"] {

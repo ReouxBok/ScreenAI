@@ -119,17 +119,19 @@ export function caseInvestigationStorePorts(deps: CaseInvestigationStoreDeps): C
       const record = caseInvestigationObservationRecord(kept.inputKey, kept.progress, decision);
       const decided = decision !== null;
       const action = decision?.validation.outcome === "accepted" ? decision.validation.decision.nextAction : null;
+      // An accepted handoff, or (Ugo 14/11) a decision the validator refused twice: the same durable transfer to the team, then the same notice.
+      const handoffReason = action?.kind === "handoff" ? action.reason : decision?.validation.outcome === "needs_review" ? decision.refusalHandoff?.reason ?? null : null;
       decision = null;
       try {
         const observation = { caseId, claimToken: token, currentPolicyRevision: policyRevision, observation: { record } };
-        if (action?.kind === "handoff") {
+        if (handoffReason) {
           // The team owns the case even when Slack is off or unavailable. A stale or replayed
           // observation must never take the case away from its current owner.
           await requireDb().transaction(async tx => {
             const saved = await recordCaseObservation({ ...observation, requireLiveClaimAt: deps.now }, tx);
             if (saved.applied && !saved.replayed) {
               await transitionCaseOwner({ caseId, expectedVersion: saved.case.version, transition: "handoff",
-                actor: { type: "agent" }, commandKey: investigationHandoffCommand(saved.case.version), reason: action.reason }, tx);
+                actor: { type: "agent" }, commandKey: investigationHandoffCommand(saved.case.version), reason: handoffReason }, tx);
             }
           });
         } else {

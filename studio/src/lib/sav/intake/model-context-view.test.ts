@@ -7,6 +7,10 @@ import { savGeminiWireBody } from "../gemini-transport";
 // Boundary mechanics (grouping, compaction, exact traces) are exercised at the former
 // compact caps so fixtures stay small; production capacity: model-limits-capacity.test.ts.
 vi.mock("./model-limits", () => ({ SAV_INTAKE_MODEL_LIMITS: { dataBytes: 96 * 1024, wireTextBytes: 128 * 1024 } }));
+// SAV-92: these fixtures use long histories to drive the size mechanics (catalogue, compaction, grouping), which still
+// guard large ticket bodies. The production history bound itself is covered by history-budget.test.ts and model-context.test.ts.
+vi.mock("./history-budget", async original => ({ ...await original<typeof import("./history-budget")>(),
+  boundIntakeTicketHistories: <T,>(rows: readonly T[]) => [...rows] }));
 
 const repeated = Array.from({length:70},(_,i)=>`Fait ${i} é😀 : valeur vérifiée. `).join("").slice(0,1700);
 it("shares exact text without merging sources, envelope differences, notes or final new facts",()=>{

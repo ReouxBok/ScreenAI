@@ -48,7 +48,10 @@ it("explicit authority lasts at most30days and never exceeds the existing price 
   vi.useFakeTimers();vi.setSystemTime(at);
   expect(intakeOperationalTermValid(new Date(at.getTime()+30*day).toISOString(),at)).toBe(true);
   expect(intakeOperationalTermValid(new Date(at.getTime()+30*day+1).toISOString(),at)).toBe(false);
+  // SAV-92 B: an authority may now run past 1 January, never past the extended price validity (2027-07-01).
   const december=new Date("2026-12-15T00:00:00Z");vi.setSystemTime(december);
-  expect(intakeOperationalTermValid("2027-01-01T00:00:00Z",december)).toBe(true);
-  expect(intakeOperationalTermValid("2027-01-01T00:00:00.001Z",december)).toBe(false);
+  expect(intakeOperationalTermValid("2027-01-10T00:00:00Z",december)).toBe(true);
+  const june=new Date("2027-06-15T00:00:00Z");vi.setSystemTime(june);
+  expect(intakeOperationalTermValid("2027-07-01T00:00:00Z",june)).toBe(true);
+  expect(intakeOperationalTermValid("2027-07-01T00:00:00.001Z",june)).toBe(false);
 });

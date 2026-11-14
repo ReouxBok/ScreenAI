@@ -75,7 +75,10 @@ describe("SAV derived monetary admission", () => {
         expect(() => savDerivedCostQuote(model, 0, now)).toThrow("REQUEST_UNBOUNDED");
         expect(() => savDerivedCostQuote(model, 8193, now)).toThrow("REQUEST_UNBOUNDED");
         expect(savDerivedCostQuote(model, 8192, new Date("2026-12-31T23:59:59.999Z"))).toBeDefined();
-        expect(() => savDerivedCostQuote(model, 4096, new Date("2027-01-01T00:00:00Z"))).toThrow("PRICE_EXPIRED");
+        // SAV-92 B: the same tariff is valid until 2027-07-01 (exclusive), then every call still fails closed.
+        expect(savDerivedCostQuote(model, 4096, new Date("2027-01-01T00:00:00Z")).priceExpiresAt).toBe("2027-07-01T00:00:00.000Z");
+        expect(savDerivedCostQuote(model, 8192, new Date("2027-06-30T23:59:59.999Z"))).toBeDefined();
+        expect(() => savDerivedCostQuote(model, 4096, new Date("2027-07-01T00:00:00Z"))).toThrow("PRICE_EXPIRED");
     });
     it("cannot raise approved quotas through configuration and invalid config closes admission", () => {
         vi.stubEnv("SAV_COMPARISON_DAILY_CALLS", "900");
@@ -104,6 +107,15 @@ describe("SAV derived monetary admission", () => {
             unknown: true
         });
         await expect(reserve(new Date("2026-11-17T12:00:00Z"))).resolves.toBeDefined();
+    });
+    it("SAV-92 B: an audit recorded with the former 2027-01-01 price end keeps being charged, never orphaned", async () => {
+        const r = await reserve();
+        const [row] = await f.db.select().from(auditLogs).where(eq(auditLogs.id, r.reservationId));
+        expect((row.technicalMetadata as Record<string, unknown>).priceExpiresAt).toBe("2027-07-01T00:00:00.000Z");
+        await f.db.update(auditLogs).set({ technicalMetadata: { ...(row.technicalMetadata as object), priceExpiresAt: "2027-01-01T00:00:00.000Z" } }).where(eq(auditLogs.id, r.reservationId));
+        expect(await getSavDerivedMoneyStatus(now)).toMatchObject({ dayNanoUsd: 801792000 });
+        await f.db.update(auditLogs).set({ technicalMetadata: { ...(row.technicalMetadata as object), priceExpiresAt: "2028-01-01T00:00:00.000Z" } }).where(eq(auditLogs.id, r.reservationId));
+        expect(await getSavDerivedMoneyStatus(now)).toEqual({ unknown: true });
     });
     it("settles exact thinking usage once, including concurrent settlements and one dispatch only", async () => {
         const r = await reserve();

@@ -8,6 +8,10 @@ import { SAV_INTAKE_MODEL_LIMITS } from "./model-limits";
 // Boundary mechanics (grouping, compaction, exact traces) are exercised at the former
 // compact caps so fixtures stay small; production capacity: model-limits-capacity.test.ts.
 vi.mock("./model-limits", () => ({ SAV_INTAKE_MODEL_LIMITS: { dataBytes: 96 * 1024, wireTextBytes: 128 * 1024 } }));
+// SAV-92: these fixtures use long histories to drive the size mechanics (catalogue, compaction, grouping), which still
+// guard large ticket bodies. The production history bound itself is covered by history-budget.test.ts and model-context.test.ts.
+vi.mock("./history-budget", async original => ({ ...await original<typeof import("./history-budget")>(),
+  boundIntakeTicketHistories: <T,>(rows: readonly T[]) => [...rows] }));
 
 const at = "2026-10-21T10:00:00.000Z", mid = "10000000-0000-4000-8000-000000000001", tid = "20000000-0000-4000-8000-000000000001";
 const message = { id: mid, threadId: tid, receivedAt: at, fromEmail: "sender@example.test", toEmails: ["support@example.test"],

@@ -826,3 +826,17 @@ describe("transport-only diagnostics preserve business decisions and call ceilin
     expect(next.calls).toHaveLength(0); expect(next.log).not.toContain("knowledge");
   });
 });
+
+describe("Ugo 14/11: a decision refused twice for one input is handed to the team (caseRefusalHandoff)", () => {
+  const refusal = (kind: "repairable_format" | "stale" | "forbidden_case") => ({ kind, correctable: kind === "repairable_format", nextStep: "review_model_output" as const, kinds: [kind], codes: ["source_reference_unknown"] as never[] });
+  const refused = (call: number) => ({ call, result: "validated" as const, outcome: "needs_review" as const, kinds: ["repairable_format" as const], codes: ["source_reference_unknown"] });
+  it("one refusal waits; two refusals (this run or an earlier one) hand over with the refusal codes; a stale read or no refusal never does", async () => {
+    const { caseRefusalHandoff } = await import("./investigation-runner");
+    expect(caseRefusalHandoff(refusal("repairable_format"), [refused(1)])).toBeUndefined();
+    expect(caseRefusalHandoff(refusal("repairable_format"), [refused(1), { call: 2, result: "failed", purpose: "decision", uncertain: false } as never, refused(3)]))
+      .toEqual({ reason: "decision_refused", refusals: 2, codes: ["source_reference_unknown"] });
+    expect(caseRefusalHandoff(refusal("forbidden_case"), [refused(1), refused(2)])).toMatchObject({ reason: "decision_refused" });
+    expect(caseRefusalHandoff(refusal("stale"), [refused(1), refused(2)])).toBeUndefined();
+    expect(caseRefusalHandoff(null, [refused(1), refused(2)])).toBeUndefined();
+  });
+});

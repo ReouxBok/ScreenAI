@@ -6,6 +6,7 @@ import { auditLogs, savIntakeExecutions, savIntakeRuns } from "@/db/schema";
 import { savIntakeRuntimeConfig } from "./runtime-contract";
 import { intakeExecutionConfig } from "./execution-policy";
 import { pendingSavIntakeRuns } from "./runtime-store";
+import { SAV_INTAKE_DISPATCH_LANES } from "./attempt-policy";
 import { readSavAgentPause, savAgentPauseCode } from "./agent-pause";
 import { listSavExternalCompletionMessageIds } from "../external-completion";
 import { processSavIntakeWakeWorkflow } from "@/workflows/sav-intake";
@@ -116,7 +117,7 @@ export async function dispatchPendingSavIntakeWakes(options: { env?: Env; start?
   let config: ReturnType<typeof savIntakeRuntimeConfig>;
   try { config = savIntakeRuntimeConfig(env); } catch { return { skipped: "configuration_invalid" as const }; }
   if (!config) return { skipped: "off" as const };
-  const limit = Math.max(1, Math.min(8, options.limit ?? 4)), db = requireDb();
+  const db = requireDb();
   const pause = await readSavAgentPause(db);
   if (pause.level === "fully_paused") return { skipped: savAgentPauseCode(pause)! };
   let execution: ReturnType<typeof intakeExecutionConfig> = null;
@@ -136,8 +137,12 @@ export async function dispatchPendingSavIntakeWakes(options: { env?: Env; start?
     sql`not exists(select 1 from public.audit_logs w where w.entity_type='sav_intake_wake' and w.entity_id=${savIntakeRuns.id}::text and w.action='sav_intake_wake_requested'
       and (case when jsonb_typeof(w.technical_metadata->'dispatches')='number' then (w.technical_metadata->>'dispatches')::numeric>=${SAV_INTAKE_WAKE_MAX_DISPATCHES} else false end
         or w.technical_metadata->>'lastDispatchedAt'>${new Date(now.getTime() - REDISPATCH_AFTER_MS).toISOString()}))`);
-  const ids = new Set((await pendingSavIntakeRuns(config, now, and(ready,
-    eq(savIntakeRuns.attempts, 0), inArray(savIntakeRuns.state, ["pending", "waiting"])))).map(run => run.id));
+  // SAV-92 fix 4: recent mail first, then the stock; a backlog (more than the normal batch) widens the batch.
+  const analyses = await pendingSavIntakeRuns(config, now, and(ready,
+    eq(savIntakeRuns.attempts, 0), inArray(savIntakeRuns.state, ["pending", "waiting"])), SAV_INTAKE_DISPATCH_LANES.catchUpBatch);
+  const limit = Math.max(1, Math.min(SAV_INTAKE_DISPATCH_LANES.catchUpBatch, options.limit
+    ?? (analyses.length > SAV_INTAKE_DISPATCH_LANES.normalBatch ? SAV_INTAKE_DISPATCH_LANES.catchUpBatch : SAV_INTAKE_DISPATCH_LANES.normalBatch)));
+  const ids = new Set(analyses.slice(0, limit).map(run => run.id));
   if (execution) {
     const observed = await db.select({ id: savIntakeRuns.id }).from(savIntakeRuns).where(and(ready,
       eq(savIntakeRuns.state, "observed"), notExists(db.select({ id: savIntakeExecutions.id }).from(savIntakeExecutions).where(eq(savIntakeExecutions.messageId, savIntakeRuns.messageId)))))
