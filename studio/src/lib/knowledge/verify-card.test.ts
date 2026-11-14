@@ -19,11 +19,14 @@ const goodInput = { title: "Se reconnecter à Limova", document: card(), deliver
 
 describe("official link allowlist (card content)", () => {
   it("accepts an official Academy, app, welcome or Limova booking link, even with a public tutorial id", () => {
-    for (const link of ["https://academy.limova.ai/", "https://academy.limova.ai/tutorials/a642045f-d118-41af-bd8a-58ad05461520", "https://new.limova.ai", "https://bienvenue.limova.ai/", "https://calendly.com/d/cszz-77d-g2h/onboarding-premium"])
+    for (const link of ["https://academy.limova.ai/", "https://academy.limova.ai/tutorials/a642045f-d118-41af-bd8a-58ad05461520", "https://new.limova.ai", "https://bienvenue.limova.ai/", "https://us06web.zoom.us/webinar/register/WN_OBY9OMWETKaRhGrPr3TyJw", "https://us06web.zoom.us/webinar/register/WN_us7DbTjVT2uM-23-Xgz_Eg"])
       expect(officialCardLink(link), link).not.toBeNull();
     expect(hasUnsafeSavCardText("Suivez le tutoriel https://academy.limova.ai/tutorials/a642045f-d118-41af-bd8a-58ad05461520.")).toBe(false);
-    expect(hasUnsafeSavCardText("Voir [le tutoriel](https://academy.limova.ai/superpowers/support-client) puis réservez (https://calendly.com/d/cszz-77d-g2h/onboarding-premium).")).toBe(false);
-    expect(SAV_CARD_OFFICIAL_LINKS.map(row => row.host)).toEqual(["academy.limova.ai", "new.limova.ai", "bienvenue.limova.ai", "calendly.com"]);
+    expect(hasUnsafeSavCardText("Voir [le tutoriel](https://academy.limova.ai/superpowers/support-client) puis inscrivez-vous (https://us06web.zoom.us/webinar/register/WN_OBY9OMWETKaRhGrPr3TyJw).")).toBe(false);
+    expect(hasUnsafeSavCardText("Réservez https://calendly.com/d/cszz-77d-g2h/onboarding-premium")).toBe(true);
+    expect(hasUnsafeSavCardText("Voir https://us06web.zoom.us/webinar/register/WN_autre")).toBe(true);
+    expect(hasUnsafeSavCardText("Voir https://us06web.zoom.us/webinar/register/WN_OBY9OMWETKaRhGrPr3TyJw/extra")).toBe(true);
+    expect(SAV_CARD_OFFICIAL_LINKS.map(row => row.host)).toEqual(["academy.limova.ai", "new.limova.ai", "bienvenue.limova.ai", "us06web.zoom.us"]);
   });
 
   it("still rejects any other link, a look-alike host, a query, a customer path, and every other kind of data", () => {

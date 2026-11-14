@@ -16,8 +16,9 @@ export const SAV_CARD_OFFICIAL_LINKS: readonly SavCardOfficialLink[] = Object.fr
   { host: "new.limova.ai", label: "Application Limova", pathPrefixes: ["/"], identifiersInPath: false },
   // Public onboarding and webinar page, already linked by the extension.
   { host: "bienvenue.limova.ai", label: "Page d'accueil et webinaire Limova", pathPrefixes: ["/"], identifiersInPath: false },
-  // Limova's own booking page only: a rescheduling or cancellation link of one customer is refused.
-  { host: "calendly.com", label: "Prise de rendez-vous Limova", pathPrefixes: ["/d/cszz-77d-g2h/"], identifiersInPath: false },
+  // The two public onboarding webinars (morning and afternoon), exact registration pages only. The individual booking link is not listed:
+  // it is reserved to business customers and the agent cannot check the customer's plan (owner decision, 15/11).
+  { host: "us06web.zoom.us", label: "Webinaire d'onboarding Limova", pathPrefixes: ["/webinar/register/WN_OBY9OMWETKaRhGrPr3TyJw", "/webinar/register/WN_us7DbTjVT2uM-23-Xgz_Eg"], identifiersInPath: true },
 ].map(entry => Object.freeze({ ...entry, pathPrefixes: Object.freeze(entry.pathPrefixes) })));
 
 export type SavCardTextProblemCode = "link_not_allowed" | "identifier" | "phone" | "path" | "email" | "customer_data" | "secret" | "card_number" | "bank_details" | "markup" | "technical";
@@ -52,7 +53,7 @@ export function officialCardLink(link: string): SavCardOfficialLink | null {
   try { url = new URL(link); } catch { return null; }
   if (url.protocol !== "https:" || url.username || url.password || url.port || url.search || url.hash) return null;
   const entry = SAV_CARD_OFFICIAL_LINKS.find(row => row.host === url.hostname);
-  if (!entry || !entry.pathPrefixes.some(prefix => url.pathname === prefix.replace(/\/$/, "") || url.pathname.startsWith(prefix))) return null;
+  if (!entry || !entry.pathPrefixes.some(prefix => url.pathname === prefix.replace(/\/$/, "") || (prefix.endsWith("/") && url.pathname.startsWith(prefix)))) return null;
   if (!entry.identifiersInPath && PATH_IDENTIFIER.test(url.pathname)) return null;
   return entry;
 }
