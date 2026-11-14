@@ -15,6 +15,7 @@ import { caseRequestSearchText, type SourceRef } from "./case-types";
 import { caseResolutionCheckSchema } from "./investigation-closure";
 import { caseDecisionProposalSchema } from "./decision-contract";
 import { reduceCaseCustomerContext, SAV_CASE_CUSTOMER_CONTEXT_LEVELS } from "./investigation-customer-context";
+import { appendCaseAttachmentParts, caseAttachmentPartsOf, fitCaseCustomerAttachmentMedia, SAV_CASE_ATTACHMENTS_INSTRUCTION } from "./investigation-customer-attachments";
 import type { CaseEmbeddingTransport, CaseKnowledgeVectorSearch } from "./investigation-budgeted-retrieval";
 import type { CaseInvestigationModelRequest, CaseInvestigationPauseLevel } from "./investigation-runner";
 import type { CaseV2ModelTransport } from "./investigation-v2-spend";
@@ -114,7 +115,7 @@ export function caseGeminiEmbeddingTransport(input: Readonly<{ env: () => Env; n
   };
 }
 
-export const SAV_CASE_INVESTIGATION_PROMPT_REVISION = "sav-v2-investigation-prompt-2026-11-14.v4";
+export const SAV_CASE_INVESTIGATION_PROMPT_REVISION = "sav-v2-investigation-prompt-2026-11-15.v5";
 const CLOSURE_JSON_SCHEMA = JSON.stringify(z.toJSONSchema(caseResolutionCheckSchema));
 const DECISION_JSON_SCHEMA = JSON.stringify(z.toJSONSchema(caseDecisionProposalSchema, { io: "input", unrepresentable: "any" }));
 /**
@@ -149,6 +150,7 @@ export function caseInvestigationPrompt(request: CaseInvestigationModelRequest) 
     ...(request.customerReportedLogin ? ["customerReportedLogin résume les déclarations du client sur la connexion. Un indicateur false signifie non établi. Tiens compte des contrôles confirmés sans les redemander. restoredAccessReported contient la citation et sa source si le dernier mail confirme explicitement le rétablissement. Cite-les pour proposer confirm_resolution si la chronologie le permet. stillBlockedReported demande de poursuivre le diagnostic. Une seconde lecture distincte doit confirmer toute clôture."] : []),
     ...(request.customerContext ? [SAV_CASE_CUSTOMER_CONTEXT_INSTRUCTION] : []),
     ...(handedToTeam.length ? [SAV_CASE_TEAM_PARTS_INSTRUCTION] : []),
+    ...(request.customerContext?.evidence ? [SAV_CASE_ATTACHMENTS_INSTRUCTION] : []),
     request.purpose === "resolution_check" ? "Objet : vérifier si les demandes listées dans « closure » sont résolues, d'après les mots du client cités." : "Objet : la prochaine action sur les demandes ouvertes.",
     `Le champ caseVersion vaut ${request.snapshot.version}.`,
   ].join("\n");
@@ -173,7 +175,7 @@ const generateResponse = z.object({
  * failure whose usage is still reported.
  */
 /** Prepare the EXACT existing prompt/body. No source, fact, instruction or reply rule is removed to fit. */
-export function prepareCaseGeminiDecisionRequest(request: CaseInvestigationModelRequest, env: Env):
+export function prepareCaseGeminiDecisionRequest(original: CaseInvestigationModelRequest, env: Env):
   | { ok: true; key: string; model: string; body: string; metadata: Pick<CaseModelTransportDiagnostic, "inputBytes" | "maxInputBytes" | "knowledgeCards">; compacted: boolean }
   | { ok: false; diagnostic: CaseModelTransportDiagnostic; breakdown?: CaseDecisionBodyBreakdown } {
   const resolved = resolveCaseV2GeminiKey(env), model = env[SAV_V2_MODEL_ENV] ?? "";
@@ -181,6 +183,10 @@ export function prepareCaseGeminiDecisionRequest(request: CaseInvestigationModel
   if (!MODEL_ID.test(model)) return { ok: false, diagnostic: { stage: "preflight", code: "model_invalid", networkAttempted: false } };
   let bounds: ReturnType<typeof readCaseV2TransportPolicy>;
   try { bounds = readCaseV2TransportPolicy(env); } catch { return { ok: false, diagnostic: { stage: "preflight", code: "policy_invalid", networkAttempted: false } }; }
+  // SAV-92 (15/11): the customer's files are attached only within the token room the approved policy leaves above the text bound, so the
+  // per-call reservation (computed from maxInputTokens) still covers the call; the text body and its bound are measured without them.
+  const fitted = original.customerContext ? fitCaseCustomerAttachmentMedia(original.customerContext, { model, mediaTokens: bounds.maxInputTokens - bounds.maxInputBytes }) : null;
+  const request: CaseInvestigationModelRequest = fitted ? { ...original, customerContext: fitted.context } : original;
   const build = (candidate: CaseInvestigationModelRequest) => {
     const prompt = caseInvestigationPrompt(candidate);
     const serialize = (payload: unknown, decoding = "") => caseGeminiDecisionBody(prompt, payload, bounds.maxOutputTokens, decoding);
@@ -198,12 +204,12 @@ export function prepareCaseGeminiDecisionRequest(request: CaseInvestigationModel
   };
   // SAV-92: the customer context gives way first, level by level (`reduceCaseCustomerContext`), never a card nor a rule. The last level is
   // the exact pre-SAV-92 body: a request that fitted without context still fits, and only then does the runner trim cards as before.
-  let built = build(request);
+  let built = build(request), sent = request;
   for (let level = 1; request.customerContext && level < SAV_CASE_CUSTOMER_CONTEXT_LEVELS && Buffer.byteLength(built.body, "utf8") > bounds.maxInputBytes; level++) {
     const reduced = reduceCaseCustomerContext(request.customerContext, level);
     const next: CaseInvestigationModelRequest = { ...request };
     if (reduced) next.customerContext = reduced; else delete next.customerContext;
-    built = build(next);
+    built = build(next); sent = next;
   }
   const { prompt, compacted } = built;
   const body = built.body;
@@ -211,7 +217,7 @@ export function prepareCaseGeminiDecisionRequest(request: CaseInvestigationModel
   // K1: measured on the raw body when too large; returned BESIDE the diagnostic (logged, never stored: the record keeps main's schema).
   if (metadata.inputBytes > bounds.maxInputBytes)
     return { ok: false, diagnostic: { stage: "preflight", code: "input_too_large", networkAttempted: false, ...metadata }, breakdown: caseDecisionBodyBreakdown(prompt, bounds.maxOutputTokens, compacted) };
-  return { ok: true, key: resolved.key, model, body, metadata, compacted };
+  return { ok: true, key: resolved.key, model, body: appendCaseAttachmentParts(body, caseAttachmentPartsOf(sent.customerContext, fitted?.media ?? [])), metadata, compacted };
 }
 
 /** Runs before money and dispatch; ledger-known/uncertain calls retain their precedence. */

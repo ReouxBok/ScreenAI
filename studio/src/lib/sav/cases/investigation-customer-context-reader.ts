@@ -2,13 +2,18 @@ import "server-only";
 import { and, desc, eq, inArray, lte } from "drizzle-orm";
 import { z } from "zod";
 import { requireDb } from "@/db";
-import { savIntakeExecutions, savMessages } from "@/db/schema";
+import { savIntakeExecutions, savMailboxes, savMessages, savThreads } from "@/db/schema";
 import { decryptSavPayload } from "../crypto";
 import type { CaseEvent, CaseSnapshot } from "./case-types";
 import {
   buildCaseCustomerContext, caseCustomerContextUnavailable, SAV_CASE_CUSTOMER_CONTEXT_LIMITS,
   type CaseCustomerContext, type CaseCustomerContextMissing, type CaseCustomerRawCrm, type CaseCustomerRawMessage,
 } from "./investigation-customer-context";
+import { withCaseCustomerAttachments } from "./investigation-customer-attachments";
+import {
+  caseAttachmentMediaMode, caseStoredAttachmentMetadata, readCaseCustomerAttachments,
+  type CaseAttachmentDownload, type CaseStoredMail, type CaseStoredMailBody,
+} from "./investigation-customer-attachments-reader";
 
 /*
  * SAV-92: the runner's `customerContext` port, READ ONLY, from what V1 already stored. No HubSpot, Gmail or model call:
@@ -31,8 +36,16 @@ const payloadSchema = z.object({
   baseline: z.object({ tickets: z.record(z.string(), z.array(z.unknown())), histories: z.record(z.string(), z.unknown()) }).passthrough().optional(),
 }).passthrough();
 
-function decryptText(ciphertext: string): string | null {
-  try { const body = decryptSavPayload<{ text?: unknown }>(ciphertext); return typeof body.text === "string" ? body.text : null; } catch { return null; }
+function decryptBody(ciphertext: string): CaseStoredMailBody | null {
+  try { const body = decryptSavPayload<CaseStoredMailBody>(ciphertext); return body && typeof body === "object" ? body : null; } catch { return null; }
+}
+const textOf = (body: CaseStoredMailBody | null) => typeof body?.text === "string" ? body.text : null;
+
+/** The stored mailbox and Gmail thread of a mail: what V1's download path re-validates each reference against. */
+async function attachmentOwner(mail: CaseStoredMail & { threadId: string }) {
+  const [row] = await requireDb().select({ email: savMailboxes.email, gmailThreadId: savThreads.gmailThreadId }).from(savThreads)
+    .innerJoin(savMailboxes, eq(savMailboxes.id, savThreads.mailboxId)).where(eq(savThreads.id, mail.threadId)).limit(1);
+  return row && mail.gmailMessageId ? { mailboxEmail: row.email, gmailMessageId: mail.gmailMessageId, gmailThreadId: row.gmailThreadId } : null;
 }
 
 /** V1's stored CRM snapshot for this case's contact, or the reason why none is usable. */
@@ -68,14 +81,15 @@ async function readV1CrmSnapshot(snapshot: CaseSnapshot, gmailIds: readonly stri
 }
 
 /** The `customerContext` port: never throws; a failed read is a context that says it could not be read. */
-export function caseCustomerContextReader() {
+export function caseCustomerContextReader(options: Readonly<{ env?: () => Readonly<Record<string, string | undefined>>; download?: CaseAttachmentDownload }> = {}) {
   return async (snapshot: CaseSnapshot, events: readonly CaseEvent[]): Promise<CaseCustomerContext> => {
     try {
       const inbound = events.filter(event => event.direction === "customer_inbound" && event.sourceRef.type === "email")
         .sort((a, b) => b.occurredAt.localeCompare(a.occurredAt) || b.caseVersion - a.caseVersion);
       if (!snapshot.threadIds.length) return buildCaseCustomerContext({ latestMessageId: null, messages: [], crm: { status: "missing", reason: "crm_unavailable" } });
       const db = requireDb(), missing: CaseCustomerContextMissing[] = [];
-      const columns = { id: savMessages.id, direction: savMessages.direction, at: savMessages.receivedAt, subject: savMessages.subject, body: savMessages.bodyCiphertext };
+      const columns = { id: savMessages.id, direction: savMessages.direction, at: savMessages.receivedAt, subject: savMessages.subject, body: savMessages.bodyCiphertext,
+        gmailMessageId: savMessages.gmailMessageId, threadId: savMessages.threadId };
       const latestGmail = inbound[0]?.sourceRef.id;
       const [latest] = latestGmail ? await db.select(columns).from(savMessages)
         .where(and(eq(savMessages.direction, "inbound"), eq(savMessages.gmailMessageId, latestGmail), inArray(savMessages.threadId, snapshot.threadIds))).limit(1) : [];
@@ -83,10 +97,29 @@ export function caseCustomerContextReader() {
       const rows = await db.select(columns).from(savMessages)
         .where(and(inArray(savMessages.threadId, snapshot.threadIds), ...(latest ? [lte(savMessages.receivedAt, latest.at)] : [])))
         .orderBy(desc(savMessages.receivedAt), desc(savMessages.createdAt)).limit(MESSAGE_ROWS);
-      const messages: CaseCustomerRawMessage[] = rows.map(row => ({ id: row.id, direction: row.direction, at: row.at.toISOString(), subject: row.subject, text: decryptText(row.body) }));
+      const bodies = new Map(rows.map(row => [row.id, decryptBody(row.body)]));
+      const messages: CaseCustomerRawMessage[] = rows.map(row => ({ id: row.id, direction: row.direction, at: row.at.toISOString(), subject: row.subject, text: textOf(bodies.get(row.id) ?? null) }));
       let crm: CaseCustomerRawCrm;
       try { crm = await readV1CrmSnapshot(snapshot, inbound.map(event => event.sourceRef.id)); } catch { crm = { status: "missing", reason: "crm_unavailable" }; }
-      return buildCaseCustomerContext({ latestMessageId: latest?.id ?? null, messages, crm, missing });
+      const context = buildCaseCustomerContext({ latestMessageId: latest?.id ?? null, messages, crm, missing });
+      // SAV-92 (15/11): the files of the latest customer mail and the previous one. A failure here keeps the context without them.
+      try {
+        const inboundRows = rows.filter(row => row.direction === "inbound" && (!latest || row.at.getTime() <= latest.at.getTime()));
+        const ordered = latest ? [latest.id, ...inboundRows.filter(row => row.id !== latest.id).map(row => row.id)] : inboundRows.map(row => row.id);
+        const byId = new Map([...(latest ? [latest] : []), ...rows].map(row => [row.id, row]));
+        if (latest && !bodies.has(latest.id)) bodies.set(latest.id, decryptBody(latest.body));
+        const mails = ordered.slice(0, 2).flatMap((id, index) => {
+          const row = byId.get(id);
+          return row ? [{ id, role: index === 0 ? "latest" as const : "previous" as const, gmailMessageId: row.gmailMessageId, threadId: row.threadId, body: bodies.get(id) ?? null }] : [];
+        });
+        const earlier = ordered.slice(2).some(id => caseStoredAttachmentMetadata(bodies.get(id)).some(item => /^image\//i.test(item.mimeType)))
+          || snapshot.body.facts.some(fact => fact.source.type === "attachment");
+        const built = await readCaseCustomerAttachments(mails, { mode: caseAttachmentMediaMode(options.env?.() ?? {}),
+          owner: mail => attachmentOwner(mail as CaseStoredMail & { threadId: string }), ...(options.download ? { download: options.download } : {}) });
+        return withCaseCustomerAttachments(context, built, earlier);
+      } catch {
+        return withCaseCustomerAttachments(context, null);
+      }
     } catch {
       return caseCustomerContextUnavailable();
     }

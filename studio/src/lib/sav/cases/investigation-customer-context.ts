@@ -1,5 +1,6 @@
 import { splitSavMessageText } from "../message-context";
 import { containsPromptInjection } from "../policy";
+import type { CaseCustomerAttachments, CaseCustomerEvidence } from "./investigation-customer-attachments";
 
 /*
  * SAV-92 (14/11): what the V2 decision model may read of the customer's own context, built from data V1 already stored.
@@ -66,6 +67,10 @@ export type CaseCustomerContext = {
     otherTicketsOmitted: number;
   } | null;
   missing: CaseCustomerContextMissing[];
+  /** SAV-92 (15/11): the files of the latest customer mails (`investigation-customer-attachments.ts`); absent when no reader produced them. */
+  attachments?: CaseCustomerAttachments;
+  /** SAV-92 (15/11): what the screenshot-or-link rule reads; its presence turns on the attachment instruction. */
+  evidence?: CaseCustomerEvidence;
 };
 
 /** Constant, written by us: repeated at the top of the data block so that the boundary is visible inside the payload too. */
@@ -272,6 +277,9 @@ export function reduceCaseCustomerContext(context: CaseCustomerContext, level: n
   if (level >= 3) {
     if (next.crm) missing.add("crm_input_budget");
     next = { ...next, crm: null };
+    // The files stay listed (and attached: their parts are never renumbered here); only V1's readings of them give way.
+    if (next.attachments?.files.some(file => file.v1Reading)) next = { ...next, attachments: { ...next.attachments, files: next.attachments.files.map(file => ({ ...file, v1Reading: null })),
+      missing: [...next.attachments.missing.filter(code => code !== "attachment_readings_input_budget"), "attachment_readings_input_budget"] } };
     if (next.latestMessage && next.latestMessage.text.length > L.minimalLatestChars) {
       next = { ...next, latestMessage: { ...next.latestMessage, ...cut(next.latestMessage.text, L.minimalLatestChars), truncated: true } };
       missing.add("latest_message_input_budget");

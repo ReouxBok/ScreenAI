@@ -15,7 +15,7 @@ import "server-only";
 import { createHash, randomUUID } from "node:crypto";
 import { and, asc, eq, gt, inArray, isNull, like, lt, lte, notExists, or, sql } from "drizzle-orm";
 import { requireDb } from "@/db";
-import { savCaseEffectExecutions, savCaseEvents, savIntakeEffectJournal, savIntakeEffects, savThreads } from "@/db/schema";
+import { savCaseEffectExecutions, savCaseEvents, savIntakeEffectJournal, savIntakeEffects, savMessages, savThreads } from "@/db/schema";
 import { decryptSavPayload, encryptSavPayload } from "../crypto";
 import { readSavAgentPause, SAV_AGENT_PAUSE_CODES, savAgentPauseCode } from "../intake/agent-pause";
 import { intakeExecutionConfig, readIntakeExecutionAuthority } from "../intake/execution-policy";
@@ -34,6 +34,7 @@ import {
 } from "./case-handoff-notice";
 import { createHandoffSlackAdapters, SLACK_NOT_POSTED_PREFIX } from "./case-handoff-slack";
 import { caseHandoffSummaryLines } from "./case-handoff-summary";
+import { caseReceivedAttachments, type CaseStoredMailBody } from "./investigation-customer-attachments";
 import { buildCaseNoteAssociateIntent, buildCaseNoteIntent, type CaseNoteCreateIntent } from "./case-effect-intents";
 import { caseNoteAssociationKey, caseNoteKey, SAV_CASE_EFFECT_PERMISSIONS } from "./case-effects";
 import { createIntakeExecutorAdapters } from "../intake/execution-adapters";
@@ -82,6 +83,16 @@ async function readJournal(caseId: string) {
   return events;
 }
 
+/** SAV-92 (15/11): the files received on the case's last stored customer mails (names masked, type, size), read only; null when unreadable. */
+async function readReceivedAttachments(threadIds: readonly string[]) {
+  if (!threadIds.length) return null;
+  try {
+    const rows = await requireDb().select({ body: savMessages.bodyCiphertext }).from(savMessages)
+      .where(and(inArray(savMessages.threadId, [...threadIds]), eq(savMessages.direction, "inbound"))).orderBy(sql`${savMessages.receivedAt} desc`).limit(10);
+    return caseReceivedAttachments(rows.map(row => { try { return decryptSavPayload<CaseStoredMailBody>(row.body); } catch { return null; } }));
+  } catch { return null; }
+}
+
 /**
  * The trigger, read from the STORED case: the latest investigation record holds an accepted decision to hand the case to the team and nothing happened since. Nothing comes
  * from a caller except the policy the execution is queued under (as for a reply). Idempotent on (case, input): the unique reply key makes any second call, concurrent or
@@ -97,7 +108,7 @@ export async function enqueueHandoffNotice(input: Readonly<{ caseId: string; pol
   const threadId = snapshot.threadIds.at(-1);
   if (!threadId) return { ok: false, code: "no_thread" };
   const key = handoffNoticeKey(trigger.caseId, trigger.inputKey);
-  const facts = handoffNoticeFacts(trigger, snapshot.body), note = handoffNoteOf(facts, new Date().toISOString());
+  const facts = handoffNoticeFacts(trigger, snapshot.body, await readReceivedAttachments(snapshot.threadIds)), note = handoffNoteOf(facts, new Date().toISOString());
   const payload: HandoffNoticePayload = { contract: HANDOFF_NOTICE_CONTRACT, key, facts, teamOwnerId: config.teamOwnerId, ...(note ? { note } : {}) };
   return requireDb().transaction(async (tx): Promise<EnqueueHandoffNoticeResult> => {
     const [created] = await tx.insert(savCaseEffectExecutions).values({
