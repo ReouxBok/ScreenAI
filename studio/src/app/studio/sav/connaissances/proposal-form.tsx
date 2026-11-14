@@ -7,7 +7,8 @@ import type { SavKnowledgeDetail, SavKnowledgeDraft, SavKnowledgeRow, SavKnowled
 import { KnowledgeEditor, cleanKnowledgeDocument, emptyKnowledgeDocument } from "./knowledge-editor";
 import { PasteEditor } from "./paste-editor";
 import { KnowledgeDocument } from "./knowledge-document";
-import { findKnowledgeAction, loadKnowledgeTargetAction, previewKnowledgeProposalAction, saveKnowledgeProposalAction, submitKnowledgeProposalAction } from "./workspace-actions";
+import { findKnowledgeAction, loadKnowledgeTargetAction, previewKnowledgeProposalAction, saveKnowledgeProposalAction, submitKnowledgeProposalAction, verifyKnowledgeCardAction } from "./workspace-actions";
+import type { SavCardVerification } from "@/lib/knowledge/verify-card";
 import { knowledgeDetailUrl } from "./workspace-labels";
 import { DeliveryEditor, DeliveryPreview } from "./delivery-editor";
 import { unclassifiedSavDelivery, type SavSupportDelivery } from "@/lib/knowledge/support-delivery";
@@ -37,10 +38,16 @@ export function KnowledgeProposalForm({ initial, learningCandidateId }: { initia
   const [acknowledged, setAcknowledged] = useState(false);
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
+  const [verification, setVerification] = useState<SavCardVerification | null>(null);
   const [busy, startTransition] = useTransition();
   const locked = useRef(false);
   const previewRef = useRef<HTMLElement>(null);
-  function change() { setPreview(null); setAcknowledged(false); setNotice(""); setError(""); }
+  function change() { setPreview(null); setAcknowledged(false); setNotice(""); setError(""); setVerification(null); }
+  // SAV-92: every card check at once on the form as it is; nothing is saved or submitted.
+  async function verify() {
+    const result = await verifyKnowledgeCardAction({ title, document: cleanKnowledgeDocument(document), delivery, sources: sources.filter(source => source.label.trim() || source.ref.trim()), reason });
+    setVerification(result.verification); setError(result.error ?? "");
+  }
   function run(operation: () => Promise<void>) {
     if (locked.current) return;
     locked.current = true;
@@ -98,9 +105,15 @@ export function KnowledgeProposalForm({ initial, learningCandidateId }: { initia
       </fieldset>
       <div className={styles.saveBar}>
         {pendingPaste && <span role="status">Prévisualisez le texte et appliquez-le au formulaire, ou écartez-le pour enregistrer les champs actuels.</span>}
+        <button type="button" className="secondary" disabled={busy || pendingPaste} onClick={() => run(verify)}>Vérifier ma fiche</button>
         <button type="button" className="secondary" disabled={busy || pendingPaste} onClick={() => run(() => save(false))}>{busy ? "Enregistrement…" : "Enregistrer le brouillon"}</button><button className="primary" disabled={busy || pendingPaste || mode === "improve" && !targetItemId}>{busy ? "Préparation…" : "Enregistrer et voir l’aperçu"}</button></div>
     </form>
     {error && <p className={`${styles.alert} ${styles.error}`} role="alert">{error}</p>}{notice && <p className={styles.alert} role="status">{notice}</p>}
+    {verification && <section className={styles.panel} aria-label="Vérification de la fiche">
+      <h2>Vérification de la fiche</h2>
+      <p role="status">{verification.ok ? (verification.warnings ? `Aucun problème bloquant. ${verification.warnings} point${verification.warnings > 1 ? "s" : ""} à revoir.` : "Aucun problème détecté.") : `${verification.errors} problème${verification.errors > 1 ? "s" : ""} à corriger${verification.warnings ? `, ${verification.warnings} point${verification.warnings > 1 ? "s" : ""} à revoir` : ""}.`} Rien n’a été enregistré ni soumis.</p>
+      {verification.problems.length > 0 && <ul>{verification.problems.map(problem => <li key={`${problem.field}|${problem.code}`}><strong>{problem.severity === "error" ? "À corriger" : "À revoir"} · {problem.fieldLabel}</strong> : {problem.message}</li>)}</ul>}
+    </section>}
     {preview && <section ref={previewRef} tabIndex={-1} className={styles.panel} aria-label="Aperçu avant soumission">
       <h2>Aperçu avant soumission</h2><p>Relisez la procédure et les sujets proches. La soumission crée une proposition à valider ; elle ne remplace aucune version active.</p>
       <div className={styles.comparison}><section><h3>Version active conservée</h3><pre className={styles.text}>{preview.activeVersion?.body ?? "Nouvelle connaissance : aucune version active."}</pre></section><KnowledgeProposalPreviewDocument draft={preview.draft} sources={preview.sources}/></div>

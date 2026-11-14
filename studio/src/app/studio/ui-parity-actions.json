@@ -85,7 +85,8 @@
    "publishKnowledgeWorkspaceAction",
    "activateKnowledgeWorkspaceAction",
    "startKnowledgeRevisionAction",
-   "loadSavFactDictionaryAction"
+   "loadSavFactDictionaryAction",
+   "verifyKnowledgeCardAction"
   ],
   "app/studio/sav/intake/actions.ts": [
    "completeIntakeDossierAction",
