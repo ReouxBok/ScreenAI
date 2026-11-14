@@ -39,6 +39,8 @@ export type CaseInvestigationRuntimeDeps = {
   admissionPolicyRevision?: CaseInvestigationStoreDeps["admissionPolicyRevision"];
   qualify?: CaseInvestigationStoreDeps["qualify"];
   customerTexts?: CaseInvestigationPorts["customerTexts"];
+  /** SAV-92: optional; absent, the model sees no customer context and the search uses V1's subjects only (as before). */
+  customerContext?: CaseInvestigationPorts["customerContext"];
   revisions?: CaseInvestigationPorts["revisions"];
   ledger?: CaseCallLedgerPort;
   knowledge: { vectors?: CaseKnowledgeVectorSearch; embed?: CaseEmbeddingTransport; spend?: CaseEmbeddingSpendPort };
@@ -75,6 +77,7 @@ export async function runCaseInvestigationRuntime(caseId: string, deps: CaseInve
   const readExact = deps.knowledge.vectors!.readExact?.bind(deps.knowledge.vectors);
   return runCaseInvestigation(caseId, "observe", { ...ports, accessScope: deps.accessScope ?? (async () => null),
     ...(deps.temporaryIncidents ? { temporaryIncidents: deps.temporaryIncidents } : {}),
+    ...(deps.customerContext ? { customerContext: deps.customerContext } : {}),
     // Scope-first knowledge (11/11): the exact-version read of the block's scope sources, and the transport's own preflight to fit the input.
     ...(readExact ? { readScopeCards: readExact } : {}), ...(deps.model.preflight ? { preflight: deps.model.preflight } : {}) });
 }

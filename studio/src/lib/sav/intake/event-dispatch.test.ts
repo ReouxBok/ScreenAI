@@ -358,7 +358,8 @@ it.each(["pending", "observed", "admitted"] as const)("recovery skips more than 
   const budget = await readSavIntakeBudget(runtime), admitted = (await f.db.select().from(savIntakeExecutionBudget))[0]?.admitted;
   for (let pass = 0; pass < 3; pass++) {
     state.start.mockReset();
-    const page = eligible.slice(pass * 4, (pass + 1) * 4);
+    // SAV-92 fix 4: every fixture mail is recent, so the analysis lane serves the newest first (observed/admitted keep their order).
+    const page = (stage === "pending" ? [...eligible].reverse() : eligible).slice(pass * 4, (pass + 1) * 4);
     expect(await dispatchPendingSavIntakeWakes({ env: environment, start: state.start, limit: 4 })).toEqual({ dispatched: page.length });
     expect(state.start.mock.calls.map(call => call[0])).toEqual(page);
   }

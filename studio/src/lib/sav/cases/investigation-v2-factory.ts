@@ -17,6 +17,7 @@ import {
 import { caseV2EmbeddingSpend, caseV2ModelSpend, readCaseV2SpendPolicy, readCaseV2TransportPolicy } from "./investigation-v2-spend";
 import { pilotProvenanceGate, type PilotProvenanceDeps } from "./pilot-passage-provenance";
 import { readSavV2QualificationScope } from "./qualification-scope";
+import { caseCustomerContextReader } from "./investigation-customer-context-reader";
 import { readRuntimeTemporaryIncidents } from "@/lib/knowledge/temporary-incidents-runtime";
 
 /*
@@ -98,6 +99,8 @@ export function createCaseInvestigationV2Deps(input: CaseInvestigationV2Input): 
     pauseState: casePauseState(caseV2PauseState(), input.env, now, input.caseAllowed), readTicketOwner, accessScope: provenance.accessScope, admissionPolicyRevision: provenance.currentPolicyRevision,
     qualify: caseInvestigationReturnAwareQualify(v1Qualify, { readPolicyRecord, now, ...(input.returnRule ? { returnRules: caseReturnContentRule(input.returnRule, now) } : {}) }),
     customerTexts: caseCustomerTextsReader(),
+    // SAV-92: the customer's mails and V1's CRM snapshot, read only from the database (no HubSpot call), masked and bounded.
+    customerContext: caseCustomerContextReader(),
     // What the decision rests on, read now: the contract, the active knowledge revision, the configured model and this prompt.
     revisions: async () => ({ rules: SAV_CASE_DECISION_CONTRACT_REVISION, playbookId: await vectors.readRevision(), model: input.env()[SAV_V2_MODEL_ENV] ?? "", prompt: SAV_CASE_INVESTIGATION_PROMPT_REVISION }),
     ledger: caseCallLedgerOnStore,

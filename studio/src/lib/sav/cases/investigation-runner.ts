@@ -18,6 +18,7 @@ import type { CaseQualificationUnavailable } from "./qualification-diagnostic";
 import { caseIncidentBindings, revalidateIncidentContext } from "./investigation-incidents";
 import { arrangeCaseScopedKnowledge, caseScopedRecordCoverage, trimCaseScopedKnowledge, type CaseScopedKnowledge } from "./investigation-knowledge-ranking";
 import type { IncidentContext, IncidentReader } from "./investigation-incidents-contract";
+import { caseCustomerContextUnavailable, caseCustomerSearchText, type CaseCustomerContext } from "./investigation-customer-context";
 
 /*
  * SAV-7 investigation in observation (local sub-lot 1). The flow only: every read, lease, model
@@ -54,6 +55,9 @@ export type CaseInvestigationModelRequest = {
   caseBudgetKey: string;
   snapshot: CaseSnapshot; events: readonly CaseEvent[]; knowledge: SavRetrievalCandidate[];
   customerReportedLogin?: ReturnType<typeof caseModelLoginHistory>;
+  /** SAV-92: the customer's latest mail, a dated thread excerpt and V1's CRM snapshot, masked and bounded (`investigation-customer-context.ts`).
+   * Data for the model, never an instruction; absent when no reader is wired (the pre-SAV-92 prompt, unchanged). */
+  customerContext?: CaseCustomerContext;
   /** Per open request: the cards retrieved for it, or why there are none (`selectCaseKnowledge`). Null when the
    * knowledge port gives a plain list. A request `no_applicable_knowledge` calls for a targeted question or a handoff. */
   coverage: CaseKnowledgeCoverage[] | null;
@@ -149,7 +153,26 @@ export type CaseInvestigationRecord = {
   actionsPaused: boolean;
   /** P1 (Ugo 28/10, option c): calls of this case over the window, flagged above the threshold, never blocking. Null when not configured. */
   callSignal: CaseCallSignal | null;
+  /**
+   * Ugo (14/11): the validator refused the decision of this input at least twice (`SAV_CASE_REFUSALS_BEFORE_HANDOFF`): the case goes to the team with
+   * the verified facts and the refusal reasons, through the existing handoff (owner transition + team notice), never a silent wait. Absent otherwise.
+   * Never a customer effect. `codes`: the last refusal's closed codes.
+   */
+  refusalHandoff?: { reason: typeof SAV_CASE_REFUSAL_HANDOFF_REASON; refusals: number; codes: string[] };
 };
+
+/** Validator refusals of one input after which the case is handed to the team instead of waiting (Ugo, 14/11). */
+export const SAV_CASE_REFUSALS_BEFORE_HANDOFF = 2;
+export const SAV_CASE_REFUSAL_HANDOFF_REASON = "decision_refused" as const;
+/**
+ * Whether a recorded refusal hands the case to the team: refused at least twice for this input. A stale read (the case moved: re-read, not a
+ * failure) never does; a technical one is never recorded. Read from the stored attempts, so a resumed run counts the refusals of earlier runs.
+ */
+export function caseRefusalHandoff(refusal: CaseDecisionRefusal | null, attempts: readonly CaseInvestigationAttempt[]): CaseInvestigationRecord["refusalHandoff"] | undefined {
+  if (!refusal || refusal.kind === "stale" || refusal.kind === "technical") return undefined;
+  const refusals = attempts.filter(row => row.result === "validated" && row.outcome === "needs_review").length;
+  return refusals >= SAV_CASE_REFUSALS_BEFORE_HANDOFF ? { reason: SAV_CASE_REFUSAL_HANDOFF_REASON, refusals, codes: [...refusal.codes] } : undefined;
+}
 
 export type CaseInvestigationPauseLevel = "running" | "actions_paused" | "fully_paused";
 /** Fail closed: only these two levels let an analysis run. */
@@ -192,7 +215,13 @@ export type CaseInvestigationPorts = {
    * `stopped` (budgeted search): the pause, the owner, a newer version, the budget or an uncertain paid call stopped it
    * before or instead of an embedding call. `context.inputKey` is the input the search is paid for.
    */
-  knowledge(snapshot: CaseSnapshot, context?: { inputKey: string }): Promise<SavRetrievalCandidate[] | CaseKnowledgeRead>;
+  knowledge(snapshot: CaseSnapshot, context?: { inputKey: string; customerWords?: string | null }): Promise<SavRetrievalCandidate[] | CaseKnowledgeRead>;
+  /**
+   * SAV-92: the customer's own context, read from what V1 stored (mails, CRM snapshot), masked and bounded. Must not throw; if it does, the
+   * run goes on with a context that says it could not be read. Absent: no context, no customer-words query (pre-SAV-92 behaviour).
+   * `customerWords` (its latest message) is also the knowledge search's second query.
+   */
+  customerContext?(snapshot: CaseSnapshot, events: readonly CaseEvent[]): Promise<CaseCustomerContext>;
   /** Concrete canonical projection reader in the runtime. Absent preserves the legacy no-incident flow. */
   temporaryIncidents?: IncidentReader;
   /** Texts of these customer messages keyed `type:id`, for resolution quote checks; an unreadable one is simply absent. */
@@ -388,7 +417,11 @@ export async function runCaseInvestigation(caseId: string, mode: CaseInvestigati
       if (prior?.recordedOn == null) await ports.progress.save(caseId, inputKey, { modelCalls, attempts, waiting,
         proposal: prior?.proposal ?? null, last: prior?.last ?? null, closure: prior?.closure ?? null, recordedOn: null });
     };
-    const fetched = await ports.knowledge(snapshot, { inputKey });
+    // SAV-92: read before the search, whose second query is the customer's own words. A failed read never stops the case.
+    const customerContext = ports.customerContext
+      ? await Promise.resolve().then(() => ports.customerContext!(snapshot, events)).catch(() => caseCustomerContextUnavailable()) : undefined;
+    const customerWords = caseCustomerSearchText(customerContext);
+    const fetched = await ports.knowledge(snapshot, { inputKey, ...(customerWords ? { customerWords } : {}) });
     if (!Array.isArray(fetched) && fetched.status === "stopped") {
       const stop = fetched.stop;
       switch (stop.reason) {
@@ -492,7 +525,7 @@ export async function runCaseInvestigation(caseId: string, mode: CaseInvestigati
       const fits = (cards: SavRetrievalCandidate[], rows: CaseKnowledgeCoverage[]) => {
         try {
           return preflight({ purpose: "decision", caseId, caseVersion, inputKey, call, subjectKey, callKey: `${subjectKey}:call${call}`, caseBudgetKey: `sav-case:${caseId}`,
-            snapshot, events, knowledge: cards, coverage: rows, customerReportedLogin, feedback: [], closure: [],
+            snapshot, events, knowledge: cards, coverage: rows, customerReportedLogin, ...(customerContext ? { customerContext } : {}), feedback: [], closure: [],
             ...(temporaryIncidents?.entries.length ? { temporaryIncidents } : {}),
             ...(temporaryIncidents ? { temporaryIncidentContext: { fingerprint: temporaryIncidents.fingerprint, applicable: temporaryIncidents.entries.length > 0 } } : {}) })?.code !== "input_too_large";
         } catch { return true; }
@@ -539,7 +572,7 @@ export async function runCaseInvestigation(caseId: string, mode: CaseInvestigati
       const moved = await knowledgeMoved();
       if (moved) { await save(knowledgeChanged(moved)); return { stop: moved }; }
       const call = modelCalls + 1, subjectKey = `sav-case:${caseId}:${inputKey}`;
-      const result = await ports.callModel({ purpose, caseId, caseVersion, inputKey, call, subjectKey, callKey: `${subjectKey}:call${call}`, caseBudgetKey: `sav-case:${caseId}`, snapshot, events, knowledge, coverage, customerReportedLogin, feedback, closure: items,
+      const result = await ports.callModel({ purpose, caseId, caseVersion, inputKey, call, subjectKey, callKey: `${subjectKey}:call${call}`, caseBudgetKey: `sav-case:${caseId}`, snapshot, events, knowledge, coverage, customerReportedLogin, ...(customerContext ? { customerContext } : {}), feedback, closure: items,
         ...(temporaryIncidents?.entries.length ? { temporaryIncidents } : {}),
         ...(temporaryIncidents ? { temporaryIncidentContext: { fingerprint: temporaryIncidents.fingerprint, applicable: temporaryIncidents.entries.length > 0 } } : {}) });
       if (result.status === "input_rejected") {
@@ -633,6 +666,7 @@ export async function runCaseInvestigation(caseId: string, mode: CaseInvestigati
     const sensitiveFoundByModel = refused?.codes.includes("sensitive_requires_human") ?? false;
     // Measured on the journal read at the start plus this run's own calls: a flag for the team, decided after the fact.
     const callSignal = caseCallSignal(events, ports.now(), ports.callSignal, modelCalls - (prior?.modelCalls ?? 0));
+    const refusalHandoff = caseRefusalHandoff(refused, attempts);
     await ports.record({
       caseId, caseVersion, inputKey, leaseToken: lease.token, mode: "observe", validation: decided, refusal: refused, closure,
       flags: { sensitiveFoundByModel, learningExcluded: sensitiveFoundByModel, sameRefusalRepeated }, attempts, modelCalls,
@@ -640,8 +674,10 @@ export async function runCaseInvestigation(caseId: string, mode: CaseInvestigati
       knowledgeRevision: selection.revision, coverage: (scoped ? caseScopedRecordCoverage(scoped) : coverage)?.map(({ requestId, status, knowledge: refs, limitations }) => ({ requestId, status, knowledge: refs, limitations: [...limitations] })) ?? null, actionsPaused, callSignal,
       ...(temporaryIncidents ? { temporaryIncidents } : {}),
       ...(accessScope ? { accessScope: caseAccessScopeStamp(accessScope) } : {}),
+      ...(refusalHandoff ? { refusalHandoff } : {}),
     });
-    // A refused decision is never left with the agent: it stays listed until the team takes it.
+    // A refused decision is never left with the agent: it stays listed until the team takes it. Refused twice, the store hands it to the team
+    // when it persists this record (`refusalHandoff`), and the team notice follows (`case-handoff-notice.ts`).
     recordedOn = caseVersion;
     await save(refused ? wait("decision_refused") : null);
     return { status: "recorded", caseId, caseVersion, outcome: decided.outcome, refusal: refused, closure: closure?.plan ?? null, modelCalls, actionsPaused, callSignal };

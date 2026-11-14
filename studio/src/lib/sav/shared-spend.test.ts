@@ -38,11 +38,11 @@ it("counts embedding and model together, and idempotence does not reserve twice"
  expect((await reserveCaseV2Spend(deps,"model","over")).status).toBe("refused");
  expect((await readSavSharedSpend(f.db,now)).dailyNanoUsd).toBe(20*billion);
 });
-it("enforces rolling90 across V1 and V2 and never forgets uncertain older calls",async()=>{
- await intake(89*billion,new Date("2026-09-01"),"uncertain");
+it("enforces rolling200 across V1 and V2 and never forgets uncertain older calls",async()=>{
+ await intake(199*billion,new Date("2026-09-01"),"uncertain");
  expect((await reserveCaseV2Spend(deps,"model","ninety")).status).toBe("allowed");
  expect((await reserveCaseV2Spend(deps,"embedding","over")).status).toBe("refused");
- expect((await readSavSharedSpend(f.db,now)).rollingNanoUsd).toBe(90*billion);
+ expect((await readSavSharedSpend(f.db,now)).rollingNanoUsd).toBe(200*billion);
 });
 it("known usage settles once; uncertain usage remains rolling after30 days; release only before send",async()=>{
  const a=await reserveCaseV2Spend(deps,"model","known"),b=await reserveCaseV2Spend(deps,"embedding","unknown");

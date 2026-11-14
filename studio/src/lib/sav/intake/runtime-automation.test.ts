@@ -143,15 +143,21 @@ it("under the operational cap only a proven automatic mail gets through; a subse
   expect(network).not.toHaveBeenCalled();
 });
 
-it("an uncertain reservation from another run for the same mail prevents the automatic result", async () => {
+// SAV-92: only a call that may still settle holds the mail; a definitively uncertain one stays counted, never blocks forever.
+it.each([["in flight", "dispatched", 0, true], ["definitively uncertain", "uncertain", 0, false], ["dispatched past the settlement horizon", "dispatched", 16 * 60_000, false]] as const)(
+  "a %s reservation from another run for the same mail: blocks the automatic result = %s", async (_, state, ageMs, blocks) => {
   minimalBudget();
   const m = await mail({ headers: absence, text: "Je suis absent." }), id = (await enqueueSavIntakeMessage(m.id, config))!;
   await f.db.insert(savIntakeModelCalls).values({ messageKey: intakeRuntimeHash(m.id), requestHash: intakeRuntimeHash("unknown"),
-    state: "uncertain", reservedNanoUsd: 817152000, chargedNanoUsd: 817152000, payloadCiphertext: encryptSavPayload({}) });
+    state, reservedNanoUsd: 817152000, chargedNanoUsd: 817152000, payloadCiphertext: encryptSavPayload({}), createdAt: new Date(Date.now() - ageMs) });
   const network = forbidden();
   await analyseSavIntakeRuntime(id, config, { env: () => environment, network });
-  expect(await readSavIntakeCurrent(threadId, config)).toMatchObject({ state: "uncertain", attempts: 0 });
+  const current = await readSavIntakeCurrent(threadId, config);
+  if (blocks) expect(current).toMatchObject({ state: "uncertain", attempts: 0 });
+  else { expect(current).toMatchObject({ attempts: 1 }); expect(current?.state).not.toBe("uncertain"); }
   expect(network).not.toHaveBeenCalled();
+  // The uncertain charge is never released or reset.
+  expect((await f.db.select().from(savIntakeModelCalls))[0]).toMatchObject({ state, chargedNanoUsd: 817152000 });
 });
 
 it.each(["thread", "agent"] as const)("a %s pause prevents model-free classification at the cap", async kind => {
@@ -183,9 +189,10 @@ it("four older capped runs leave a scheduling slot for the next model-free notic
     const time = new Date(Date.now() - (5 - n) * 1000);
     await f.db.update(savIntakeRuns).set({ createdAt: time, updatedAt: time }).where(eq(savIntakeRuns.id, id));
   }
+  // SAV-92 fix 4: all five mails are recent, so the newest (the notice) is served first, before the capped runs.
   const batch = await pendingSavIntakeRuns(config);
-  expect(batch.map(r => r.id)).toEqual(ids.slice(0, 4));
-  for (const run of batch) expect(await claimSavIntakeRun(run.id, config)).toBeNull();
+  expect(batch.map(r => r.id)).toEqual([ids[4], ids[3], ids[2], ids[1]]);
+  for (const id of ids.slice(0, 4)) expect(await claimSavIntakeRun(id, config)).toBeNull();
   expect((await pendingSavIntakeRuns(config))[0].id).toBe(ids[4]);
 });
 
@@ -218,11 +225,12 @@ it("four released threads with an old human timestamp can finish, leaving a slot
     ids.push(id);
     await f.db.update(savIntakeRuns).set({ updatedAt: new Date(Date.now() - (5 - index) * 1000) }).where(eq(savIntakeRuns.id, id));
   }
+  // SAV-92 fix 4: recent mail, newest first.
   const batch = await pendingSavIntakeRuns(config);
-  expect(batch.map(r => r.id)).toEqual(ids.slice(0, 4));
-  for (const run of batch) {
+  expect(batch.map(r => r.id)).toEqual([ids[4], ids[3], ids[2], ids[1]]);
+  for (const id of ids.slice(0, 4)) {
     const network = forbidden();
-    expect(await analyseSavIntakeRuntime(run.id, config, { env: () => environment, network })).toMatchObject({ state: "observed" });
+    expect(await analyseSavIntakeRuntime(id, config, { env: () => environment, network })).toMatchObject({ state: "observed" });
     expect(network).not.toHaveBeenCalled();
   }
   expect((await pendingSavIntakeRuns(config)).map(r => r.id)).toEqual([ids[4]]);

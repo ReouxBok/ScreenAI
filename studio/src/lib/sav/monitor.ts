@@ -11,6 +11,10 @@ import { decryptSavPayload } from "./crypto";
 import { countLegacyHumanCommands, countLegacyStartedMails } from "./intake/legacy-started";
 import { intakeBlockedRunSql, intakeBlockedPause } from "./intake/console-store";
 import { readSavAgentPause, SAV_AGENT_PAUSE_CODES } from "./intake/agent-pause";
+import { SAV_SHARED_SPEND_CAPS } from "./shared-spend";
+import { SAV_DERIVED_PRICE_ALERT_DAYS, SAV_DERIVED_PRICE_EXPIRES_AT } from "./derived-budget";
+/** 80 % of the shared 30-day cap (SAV-92: 160 of 200 USD). */
+const SAV_ROLLING_BUDGET_ALERT_NANO_USD = SAV_SHARED_SPEND_CAPS.rollingNanoUsd * 0.8;
 import { SAV_V2_EFFECTS_WORKER, SAV_V2_EFFECTS_STALE_MS, savV2EffectsExpected, monitorStateSchema, monitorCodes, nextMonitorState, monitorWebhook, monitorSlackText, monitorDeliveryHash, type MonitorState, type MonitorSnapshot, type MonitorIssue, type MonitorCode } from "./monitor-contract";
 
 const FALLBACK = "sav-self-scheduler:v1:sav-reconcile";
@@ -183,8 +187,11 @@ export async function collectSavMonitorSnapshot(): Promise<MonitorSnapshot> {
         coalesce(sum(charged_nano_usd) filter(where state<>'settled' or created_at >= date_trunc('day',${now.toISOString()}::timestamptz at time zone 'UTC') at time zone 'UTC'),0)::text as daily,
         coalesce(sum(charged_nano_usd) filter(where state<>'settled' or created_at >= ${new Date(now.getTime()-30*86400000).toISOString()}),0)::text as rolling from sav.intake_model_calls`);
       metrics.dailyNanoUsd = Number(budget[0]?.daily ?? 0); metrics.rollingNanoUsd = Number(budget[0]?.rolling ?? 0);
-      add("daily_budget_low", metrics.dailyNanoUsd >= 2400000000 ? 1 : 0); add("rolling_budget_low", metrics.rollingNanoUsd >= 72000000000 ? 1 : 0);
+      add("daily_budget_low", metrics.dailyNanoUsd >= 2400000000 ? 1 : 0); add("rolling_budget_low", metrics.rollingNanoUsd >= SAV_ROLLING_BUDGET_ALERT_NANO_USD ? 1 : 0);
     });
+    // SAV-92 B: the hard-coded model tariff stops every model call at its end; warn well before, whatever the configuration.
+    const priceLeft = Date.parse(SAV_DERIVED_PRICE_EXPIRES_AT) - now.getTime();
+    add("model_price_expiring", priceLeft < SAV_DERIVED_PRICE_ALERT_DAYS * 86400000 ? 1 : 0, priceLeft < 7 * 86400000 ? "critical" : "warning");
     try {
       const config = savIntakeRuntimeConfig();
       const execution = intakeExecutionConfig();

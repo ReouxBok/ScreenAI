@@ -6,7 +6,7 @@ import { readIntakeOperatorInformation } from "./operator-information";
 import { writeReadRecoveryMarker,readRecoverySql,noReadRecoverySql } from "./read-recovery-store";
 import { holdIntakeResume, noResumeHoldSql, recordIntakeResumeProgress } from "./resume-progress-store";
 import { intakeResumeDecision, parseIntakeResumeProof, withoutIntakeResumeProof, intakeResumeProofKey, type IntakeResumeDecision, type IntakeResumeProof, type IntakeResumeProbe } from "./resume-progress";
-import { intakeAttemptBudget, intakeActiveBlockSql, intakeRescueOpenSql, intakeRescueConsumedSql, SAV_INTAKE_RESCUE_KINDS, SAV_INTAKE_ATTEMPT_POLICY, SAV_INTAKE_BLOCKING_JOURNAL_KINDS, SAV_INTAKE_CALL_POLICY, SAV_INTAKE_TRANSIENT_RETRY } from "./attempt-policy";
+import { intakeAttemptBudget, intakeActiveBlockSql, intakeRescueOpenSql, intakeRescueConsumedSql, SAV_INTAKE_RESCUE_KINDS, SAV_INTAKE_ANALYSIS_TIMING, SAV_INTAKE_DISPATCH_LANES, SAV_INTAKE_ATTEMPT_POLICY, intakeCallBlocksDispatch, intakeInFlightCallSql, SAV_INTAKE_BLOCKING_JOURNAL_KINDS, SAV_INTAKE_CALL_POLICY, SAV_INTAKE_TRANSIENT_RETRY } from "./attempt-policy";
 import { findSavExternalCompletion, hasUnsettledSavHumanAction, hasUnsettledSavIntakeWork, readSavExternalCompletion, listSavExternalCompletionMessageIds, savExternalCompletionEvents, savExternalDisposition } from "../external-completion";
 import "server-only";
 import { reconcileIntakeZeroThoughtUsage } from "./model-usage";
@@ -37,7 +37,9 @@ type Run = typeof savIntakeRuns.$inferSelect;
 type Body = { text: string; headers?: Record<string, string>; attachments?: unknown[]; attachmentInventory?: unknown };
 export type IntakeLease = { run: Run; token: string; input: EngineInput; provenance: Map<string, ReturnType<typeof prepareSavIntakeMessage>["provenance"]>; body: Body; sourceHash: string; recoveringRead?: true;
   /** RFC Message-IDs of the support mails stored in the same bounded thread window. */
-  supportMessageIds?: string[]; automation?: IntakeAutomation };
+  supportMessageIds?: string[]; automation?: IntakeAutomation;
+  /** The HubSpot ticket of the Gmail thread, read with the snapshot; its history is bounded last (SAV-92). */
+  threadTicketId?: string | null };
 const fail = (): never => { throw Error("SAV_INTAKE_RUNTIME_CONTEXT_CHANGED"); };
 const budgetColumns={id:savIntakeModelCalls.id,messageKey:savIntakeModelCalls.messageKey,requestHash:savIntakeModelCalls.requestHash,state:savIntakeModelCalls.state,reservedNanoUsd:savIntakeModelCalls.reservedNanoUsd,chargedNanoUsd:savIntakeModelCalls.chargedNanoUsd,payloadCiphertext:savIntakeModelCalls.payloadCiphertext,createdAt:savIntakeModelCalls.createdAt,runId:savIntakeModelCalls.runId};
 /** A received unbilled rejection settled at zero with its explicit marker (see settleSavIntakeCall). */
@@ -50,13 +52,19 @@ function unbilledProviderRow(row: Pick<typeof savIntakeModelCalls.$inferSelect, 
 /** The ledger row a dispatch of this exact body maps to, shared by preflight and reservation:
  * a cached result is reused; an explicitly unbilled provider rejection is followed by a new,
  * separately reserved retry row (chain transientRetry:k); any other consumed row is refused,
- * and unsettled usage blocks everything. */
-async function resolveIntakeDispatch(tx: Pick<Tx, "select">, rows: readonly { id: string; messageKey: string; requestHash: string; state: string; chargedNanoUsd: number; payloadCiphertext: string }[], messageKey: string, base: string) {
+ * and usage that may still settle blocks everything. SAV-92: in the operational profile a
+ * definitively uncertain row (intakeCallBlocksDispatch false) stays in the ledger at its reserved
+ * price and is followed, like an unbilled rejection, by a new separately reserved row. */
+async function resolveIntakeDispatch(tx: Pick<Tx, "select">, rows: readonly { id: string; messageKey: string; requestHash: string; state: string; chargedNanoUsd: number; payloadCiphertext: string; createdAt: Date }[], messageKey: string, base: string,
+  definitiveUncertaintyFollows = false, now = new Date()) {
   let hash = base;
   for (let k = 1; k <= SAV_INTAKE_CALL_POLICY.perMessage; k++) {
     const prior = rows.find(row => row.messageKey === messageKey && row.requestHash === hash);
     if (!prior) return { kind: "new" as const, hash };
-    if (prior.state !== "settled") throw Error("SAV_INTAKE_RUNTIME_USAGE_UNCERTAIN");
+    if (prior.state !== "settled") {
+      if (!definitiveUncertaintyFollows || intakeCallBlocksDispatch(prior, now)) throw Error("SAV_INTAKE_RUNTIME_USAGE_UNCERTAIN");
+      hash = intakeRuntimeHash({ transientRetry: k, body: base }); continue;
+    }
     const [row] = await tx.select({ resultCiphertext: savIntakeModelCalls.resultCiphertext }).from(savIntakeModelCalls).where(eq(savIntakeModelCalls.id, prior.id));
     if (row?.resultCiphertext) return { kind: "cached" as const, id: prior.id, resultCiphertext: row.resultCiphertext };
     if (!unbilledProviderRow(prior)) throw Error("SAV_INTAKE_RUNTIME_CALL_ALREADY_CONSUMED");
@@ -177,7 +185,7 @@ export async function savIntakeSourceSnapshot(tx: Pick<Tx, "select">, message: t
     ...(identificationContinuation ? {identificationContinuation} : {}), thread });
   const bind = (hash: string) => information ? intakeRuntimeHash({ exchangedSources: hash, operatorInformation: information }) : hash;
   const sourceHash = bind(messageSourceHash), legacySourceHash = bind(legacyMessageHash);
-  return { sourceHash, legacySourceHash, messageSourceHash, body: current.body, provenance: new Map(prepared.map(p => [p.message.id, p.provenance])),
+  return { sourceHash, legacySourceHash, messageSourceHash, threadTicketId: thread?.ticketId ?? null, body: current.body, provenance: new Map(prepared.map(p => [p.message.id, p.provenance])),
     supportMessageIds: prepared.flatMap(p => p.message.direction === "outbound" && p.body.headers?.["x-studio-automation-headers"] === "singleton-v1" && typeof p.body.headers?.["message-id"] === "string" ? [p.body.headers["message-id"].trim()] : []),
     input: { message: current.message, latestInboundMessageId: message.id, mode: "current", now: now.toISOString(), identificationAttemptId: message.id,
       ...(identificationContinuation ? {previousIdentification,identificationContinuation} : {}),
@@ -338,7 +346,9 @@ async function claimOrReserve(id: string, config: IntakeRuntimeConfig, now: Date
     // (state, reason, attempts). Callers apply their env checks first; this only restricts.
     const pause = await readSavAgentPause(tx);
     if (pause.level === "fully_paused" || finished && finished.pauseSetAt !== (pause.setting?.setAt ?? null)) return null;
-    if (!run.isCurrent || !await intakeRunConfigurationBound(run, config, tx) || ["observed", "uncertain", "superseded"].includes(run.state)) return null;
+    // SAV-92: an "uncertain" run is claimable again in the operational profile; the in-flight check below still holds it while a call may settle.
+    const operational = config.budgetProfile === SAV_INTAKE_OPERATIONAL_PROFILE;
+    if (!run.isCurrent || !await intakeRunConfigurationBound(run, config, tx) || ["observed", "superseded", ...(operational ? [] : ["uncertain"])].includes(run.state)) return null;
     if (finished) {
       if (run.state !== "waiting" || run.leaseToken !== finished.token || !run.leaseUntil || run.leaseUntil <= new Date()) return null;
     } else if (run.leaseUntil && run.leaseUntil > now) return null;
@@ -366,7 +376,8 @@ async function claimOrReserve(id: string, config: IntakeRuntimeConfig, now: Date
       if(human||thread.aiPaused||thread.humanRequestedAt && thread.humanRequestedAt >= message.createdAt){retry.state="invalidated";priorPayload.readRecovery=retry;priorPayload.reason="SAV_INTAKE_READ_HUMAN_PRIORITY";
         await tx.update(savIntakeRuns).set({payloadCiphertext:encryptSavPayload(priorPayload)}).where(eq(savIntakeRuns.id,run.id));await writeReadRecoveryMarker(tx,run.id,retry);return null;}
     }
-    const pending = await tx.select({id:savIntakeModelCalls.id}).from(savIntakeModelCalls).where(and(eq(savIntakeModelCalls.runId, id), inArray(savIntakeModelCalls.state, ["dispatched", "uncertain"])));
+    const pending = (await tx.select({ state: savIntakeModelCalls.state, createdAt: savIntakeModelCalls.createdAt }).from(savIntakeModelCalls).where(and(eq(savIntakeModelCalls.runId, id), inArray(savIntakeModelCalls.state, ["dispatched", "uncertain"]))))
+      .filter(row => !operational || intakeCallBlocksDispatch(row, now));
     const reason = pending.length ? "usage_uncertain" : thread.aiPaused ? "paused" : budget.exhausted && !recoveringRead && !rescue ? "attempts_exhausted" : null;
     if (reason) {
       // A durable marker: the run leaves scheduling but stays visible as blocked.
@@ -400,7 +411,8 @@ async function claimOrReserve(id: string, config: IntakeRuntimeConfig, now: Date
       const {revoked}=budgetRowsValid(rows);
       const budgetNow=new Date(),usage=intakeBudgetUsage(rows,await effectiveIntakeBudgetPins(tx,config),budgetNow);
       const messageKey=intakeRuntimeHash(run.messageId);
-      const unknown=rows.some(row=>row.messageKey===messageKey&&row.state!=="settled");
+      // SAV-92: only a call that may still settle holds the mail; a definitively uncertain one stays counted in usage above.
+      const unknown=rows.some(row=>row.messageKey===messageKey&&intakeCallBlocksDispatch(row,budgetNow));
       // The largest single call this dossier may need, not the smaller amount it will reserve.
       const quote=intakeMaxCallReservation(config.model,budgetNow,revoked);
       if(unknown||!recoveringRead&&!automation&&!intakeForwardNeedsOriginal(data.input.message)&&(usage.remainingCalls<1||usage.remainingNanoUsd<quote.reservedNanoUsd||usage.remainingRollingNanoUsd<quote.reservedNanoUsd)) {
@@ -446,7 +458,7 @@ async function claimOrReserve(id: string, config: IntakeRuntimeConfig, now: Date
       await writeReadRecoveryMarker(tx,run.id,retry);
     }
     const token = randomUUID();
-    const [claimed] = await tx.update(savIntakeRuns).set({ state: "analysing", leaseToken: token, leaseUntil: new Date(now.getTime() + 90_000),
+    const [claimed] = await tx.update(savIntakeRuns).set({ state: "analysing", leaseToken: token, leaseUntil: new Date(now.getTime() + SAV_INTAKE_ANALYSIS_TIMING.leaseMs),
       attempts: run.attempts + (recoveringRead ? 0 : 1), sourceHash: data.sourceHash, updatedAt: now,
       ...(recoveringRead ? { payloadCiphertext: encryptSavPayload(priorPayload) } : priorPayload.resumeProof ? { payloadCiphertext: encryptSavPayload(withoutIntakeResumeProof(priorPayload)) } : {}) }).where(eq(savIntakeRuns.id, id)).returning();
     await tx.update(savMessages).set({ analysisStatus: "intake_analysing" }).where(eq(savMessages.id, run.messageId));
@@ -534,13 +546,14 @@ export async function failSavIntakeRun(lease: IntakeLease, payload: IntakeRuntim
     }
   });
 }
-export async function pendingSavIntakeRuns(config: IntakeRuntimeConfig, now = new Date(), schedulingFilter?: ReturnType<typeof sql>) {
+export async function pendingSavIntakeRuns(config: IntakeRuntimeConfig, now = new Date(), schedulingFilter?: ReturnType<typeof sql>, limit: number = SAV_INTAKE_DISPATCH_LANES.normalBatch) {
+  limit = Math.max(1, Math.min(SAV_INTAKE_DISPATCH_LANES.catchUpBatch, Math.floor(limit)));
   const completedIds = await listSavExternalCompletionMessageIds(requireDb(), false, config.mailboxId);
   const notCompleted = completedIds.length ? sql`${savIntakeRuns.messageId} not in (${sql.join(completedIds.map(id => sql`${id}::uuid`), sql`, `)})` : undefined;
   const noHuman = await intakeConsoleInstalled() ? sql`not exists(select 1 from sav.intake_human_events h where h.message_id=${savIntakeRuns.messageId})` : undefined;
   const recovery = readRecoverySql(sql`${savIntakeRuns.id}`,config,now);
   const legacy = noReadRecoverySql(sql`${savIntakeRuns.id}`);
-  const rows = await requireDb().select({ id: savIntakeRuns.id, attempts: savIntakeRuns.attempts, payloadCiphertext: savIntakeRuns.payloadCiphertext }).from(savIntakeRuns).where(and(eq(savIntakeRuns.isCurrent, true), eq(savIntakeRuns.configHash, config.configHash),
+  const eligible = and(eq(savIntakeRuns.isCurrent, true), eq(savIntakeRuns.configHash, config.configHash),
     // SAV-88: an open rescue lifts only the lifetime exhaustion; the claim re-checks everything under its locks.
     or(sql`not ${intakeActiveBlockSql(sql`${savIntakeRuns.id}`)}`, and(intakeRescueOpenSql(sql`${savIntakeRuns.id}`, sql`${savIntakeRuns.messageId}`), sql`not ${intakeActiveBlockSql(sql`${savIntakeRuns.id}`, SAV_INTAKE_BLOCKING_JOURNAL_KINDS.filter(k => k !== "attempts_exhausted"))}`)),
     or(and(lt(savIntakeRuns.attempts, 2),legacy), recovery), noHuman, notCompleted, schedulingFilter, noCommittedExecutionFor(sql`${savIntakeRuns.messageId}`), noResumeHoldSql(sql`${savIntakeRuns.id}`, now),
@@ -549,15 +562,30 @@ export async function pendingSavIntakeRuns(config: IntakeRuntimeConfig, now = ne
     sql`exists (select 1 from sav.threads t where t.id = ${savIntakeRuns.threadId} and not t.ai_paused)`,
     // A scheduled transient retry carries its due time in leaseUntil (no lease token): not before then.
     or(and(inArray(savIntakeRuns.state, ["pending", "waiting"]), or(isNull(savIntakeRuns.leaseUntil), lte(savIntakeRuns.leaseUntil, now))),
-      and(eq(savIntakeRuns.state, "analysing"), lt(savIntakeRuns.leaseUntil, now)))))
-    // A budget deferral updates the last examination. Rotate the four slots so
-    // deferred mail cannot starve newly arrived model-free receipts.
-    .orderBy(savIntakeRuns.updatedAt, savIntakeRuns.createdAt, savIntakeRuns.id).limit(4);
-  return rows.filter(row => {
+      and(eq(savIntakeRuns.state, "analysing"), lt(savIntakeRuns.leaseUntil, now)),
+      // SAV-92: a run left "uncertain" by a model call returns to normal scheduling once no call of its mail may still
+      // settle (operational profile). Its uncertain cost stays in the ledger; attempts and limits above are unchanged.
+      config.budgetProfile === SAV_INTAKE_OPERATIONAL_PROFILE ? and(eq(savIntakeRuns.state, "uncertain"), or(isNull(savIntakeRuns.leaseUntil), lte(savIntakeRuns.leaseUntil, now)),
+        sql`not ${intakeInFlightCallSql(sql`${savIntakeRuns.messageId}`, now)}`) : undefined));
+  // SAV-92 fix 4: recent customer mails first (newest first), then the older stock.
+  const receivedAt = sql`(select least(m.received_at, m.created_at) from sav.messages m where m.id = ${savIntakeRuns.messageId})`;
+  const recentSince = sql`${new Date(now.getTime() - SAV_INTAKE_DISPATCH_LANES.recentWindowMs).toISOString()}::timestamptz`;
+  const columns = { id: savIntakeRuns.id, attempts: savIntakeRuns.attempts, payloadCiphertext: savIntakeRuns.payloadCiphertext };
+  const recent = await requireDb().select(columns).from(savIntakeRuns).where(and(eligible, sql`${receivedAt} >= ${recentSince}`))
+    .orderBy(sql`${receivedAt} desc`, savIntakeRuns.createdAt, savIntakeRuns.id).limit(limit);
+  // A budget deferral updates the last examination. Rotate the stock slots so
+  // deferred mail cannot starve newly arrived model-free receipts.
+  const stock = await requireDb().select(columns).from(savIntakeRuns).where(and(eligible, sql`(${receivedAt} is null or ${receivedAt} < ${recentSince})`))
+    .orderBy(savIntakeRuns.updatedAt, savIntakeRuns.createdAt, savIntakeRuns.id).limit(limit);
+  const due = (rows: typeof recent) => rows.filter(row => {
     try { const payload=decryptSavPayload<IntakeRuntimePayload>(row.payloadCiphertext);
       return payload.readRecovery ? Boolean(readRecoveryDue(payload.readRecovery,config,now)) : row.attempts<2;
     } catch { return false; }
-  }).slice(0,4).map(({id})=>({id}));
+  });
+  const fresh = due(recent), old = due(stock);
+  // One slot (when the stock has work) is always kept for the older stock: recent mail first, never only recent mail.
+  const head = fresh.slice(0, limit - Math.min(old.length, SAV_INTAKE_DISPATCH_LANES.oldStockSlots));
+  return [...head, ...old].slice(0, limit).map(({id})=>({id}));
 }
 /** Read-only preflight for a complete comparison batch. This is not a reservation:
  * each dispatch still acquires its normal lock and enforces the same limits. */
@@ -569,11 +597,12 @@ export async function assertSavIntakeCallPlan(messageId: string, config: IntakeR
     await assertSavAgentAnalysisAllowed(tx);
     const rows = await tx.select(budgetColumns).from(savIntakeModelCalls), messageKey = intakeRuntimeHash(messageId);
     const { revoked } = budgetRowsValid(rows);
-    if (rows.some(row => row.state !== "settled" && (config.budgetProfile !== SAV_INTAKE_OPERATIONAL_PROFILE || row.messageKey === messageKey))) throw Error("SAV_INTAKE_RUNTIME_USAGE_UNCERTAIN");
+    const now = new Date(), operational = config.budgetProfile === SAV_INTAKE_OPERATIONAL_PROFILE;
+    if (rows.some(row => operational ? row.messageKey === messageKey && intakeCallBlocksDispatch(row, now) : row.state !== "settled")) throw Error("SAV_INTAKE_RUNTIME_USAGE_UNCERTAIN");
     const own = rows.filter(row => row.messageKey === messageKey);
-    // The exact rows the next dispatches will use: cache, unbilled-rejection retry or new.
-    const resolved = await Promise.all(hashes.map(h => resolveIntakeDispatch(tx, rows, messageKey, h)));
-    const needed = resolved.filter(r => r.kind === "new").length, now = new Date();
+    // The exact rows the next dispatches will use: cache, unbilled-rejection retry, retry after a definitive uncertainty, or new.
+    const resolved = await Promise.all(hashes.map(h => resolveIntakeDispatch(tx, rows, messageKey, h, operational, now)));
+    const needed = resolved.filter(r => r.kind === "new").length;
     // The same amounts the dispatches will reserve: each new request at its own size.
     const neededNanoUsd = resolved.reduce((sum, r, i) => r.kind === "new" ? sum + intakeRequestReservation(config.model, sizes?.[i], now, revoked).reservedNanoUsd : sum, 0);
     // The same per-version bound as the reservation, for the current version of this message.
@@ -593,10 +622,11 @@ async function reserveIntakeCall(tx: Tx, run: Run, config: IntakeRuntimeConfig, 
     await assertSavAgentAnalysisAllowed(tx);
     const rows = await tx.select(budgetColumns).from(savIntakeModelCalls), messageKey = intakeRuntimeHash(run.messageId);
     const { revoked } = budgetRowsValid(rows);
-    const resolved = await resolveIntakeDispatch(tx, rows, messageKey, requestHash);
+    const operational = config.budgetProfile === SAV_INTAKE_OPERATIONAL_PROFILE, ledgerNow = new Date();
+    const resolved = await resolveIntakeDispatch(tx, rows, messageKey, requestHash, operational, ledgerNow);
     if (resolved.kind === "cached") return { id: resolved.id, cached: decryptSavPayload<{ json: unknown; metadata: SavGeminiMetadata }>(resolved.resultCiphertext) };
     requestHash = resolved.hash;
-    if (rows.some(row => row.state !== "settled" && (config.budgetProfile !== SAV_INTAKE_OPERATIONAL_PROFILE || row.messageKey === messageKey))) throw Error("SAV_INTAKE_RUNTIME_USAGE_UNCERTAIN");
+    if (rows.some(row => operational ? row.messageKey === messageKey && intakeCallBlocksDispatch(row, ledgerNow) : row.state !== "settled")) throw Error("SAV_INTAKE_RUNTIME_USAGE_UNCERTAIN");
     const budgetNow=config.budgetProfile===SAV_INTAKE_OPERATIONAL_PROFILE ? new Date() : now;
     if(!Number.isFinite(now.getTime())||now>budgetNow)throw Error("SAV_INTAKE_RUNTIME_LEDGER_CLOCK_REJECTED");
     // Sized from the exact body; a caller without a size, or a revoked bound, reserves the full window.

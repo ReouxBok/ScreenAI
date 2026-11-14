@@ -206,7 +206,7 @@ export async function consumeIntakeHumanEvent(id: string, config: IntakeRuntimeC
       ...(attachments?.complete ? {attachments:{prepared:attachments.prepared,onRead:observations=>{
         attachments.state.read={...attachments.state.read,observations,state:"complete",completedAt:new Date().toISOString()};
       }}} : {}),
-      provenance:snapshot.provenance,humanClassification:input.humanResolution?.classification}),semantics,()=>{}):null;
+      provenance:snapshot.provenance,humanClassification:input.humanResolution?.classification,historyPriorityTicketIds:[snapshot.threadTicketId,input.humanResolution?.ticketId]}),semantics,()=>{}):null;
     const boundedReaders = Object.fromEntries(Object.entries(readers).map(([name, fn]) => [name, async (argument: string, signal: AbortSignal) => {
       if (deadline.aborted) throw Error("SAV_INTAKE_HUMAN_REVALIDATION_REQUIRED");
       await assertSavAgentAnalysisAllowed(db);

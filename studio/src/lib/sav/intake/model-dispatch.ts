@@ -44,7 +44,11 @@ export function createIntakeModelDispatcher(options: { config: IntakeRuntimeConf
   /** Settlement of a reservation; the live ledger by default, a separate one for the comparison. */
   settle?: typeof settleSavIntakeCall;
   /** Comparison only: operational callers leave both options absent. */
-  generationBudget?: "single_pass"; captureDiagnostics?: boolean }) {
+  generationBudget?: "single_pass"; captureDiagnostics?: boolean;
+  /** SAV-92: production single-call reader. Each non-visual understanding/ticket-matching call uses the
+   * shared allowance in one attempt (the transport's "single_pass"), exactly as the comparison's simple side;
+   * a visual or any other call keeps the standard attempt bounds. */
+  singlePassWhenEligible?: boolean }) {
   const {config,live}=options, env=options.env??(()=>process.env), network=options.network??fetch, settle=options.settle??settleSavIntakeCall;
   let uncertain=false, failureReason:string|undefined, budgetLimit:IntakeBudgetLimit|undefined;
   const diagnostics: IntakeDispatchDiagnostic[] = [];
@@ -60,10 +64,12 @@ export function createIntakeModelDispatcher(options: { config: IntakeRuntimeConf
       const wire = savGeminiWireBody(input);
       const expectedBody = wire.body;
       if (wire.textBytes > SAV_INTAKE_MODEL_LIMITS.wireTextBytes || input.body.generationConfig.maxOutputTokens !== 8192) throw Error("SAV_INTAKE_RUNTIME_REQUEST_REJECTED");
+      const generationBudget = options.generationBudget
+        ?? (options.singlePassWhenEligible && !input.media && ["understanding", "ticket_matching"].includes(input.phase) ? "single_pass" as const : undefined);
       const diagnostic: IntakeDispatchDiagnostic | undefined = options.captureDiagnostics ? {
         phase: input.phase, promptRevision: input.promptRevision, requestHash: intakeRuntimeHash(expectedBody),
         textBytes: wire.textBytes, wireBytes: Buffer.byteLength(expectedBody, "utf8"),
-        generationBudget: options.generationBudget ?? "standard", dispatched: false, httpStatus: null, cached: false,
+        generationBudget: generationBudget ?? "standard", dispatched: false, httpStatus: null, cached: false,
         schema: providerSchemaDiagnostic(input.body.generationConfig.responseSchema),
       } : undefined;
       if (diagnostic) diagnostics.push(diagnostic);
@@ -116,7 +122,7 @@ export function createIntakeModelDispatcher(options: { config: IntakeRuntimeConf
       try {
         active();
         const generated = await requestSavGeminiJson({ ...input, signal, apiKey: key, fetch: guardedNetwork, allowRetry: false,
-          ...(options.generationBudget ? { generationBudget: options.generationBudget } : {}) });
+          ...(generationBudget ? { generationBudget } : {}) });
         if (diagnostic) Object.assign(diagnostic, savGeminiDiagnosticMetadata(generated.metadata), { transport: dispatchTransportDiagnostic(generated.metadata) });
         const metadata = exactUsage(generated.metadata);
         if (input.media && !input.sanitizeResponse) throw Error("SAV_INTAKE_VISUAL_VALIDATOR_REQUIRED");

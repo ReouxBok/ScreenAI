@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import { encodeSimpleWireFixture } from "./simple-wire.fixture";
 import { afterAll, afterEach, beforeAll, beforeEach, expect, it, vi } from "vitest";
-import { eq } from "drizzle-orm";
+import { eq, inArray } from "drizzle-orm";
 import { createSavTestDb } from "../../../../test/sav-db";
 import { savSyncState, savMailboxes, savMessages, savThreads, savIntakeRuns, savIntakeModelCalls, savIntakeJournal, savActions, savDecisions, savIntakeExecutions, savIntakeEffects, savIntakeExecutionPolicies, staffUsers, auditLogs } from "@/db/schema";
 import { executionProvider } from "../../../../test/sav-intake-execution-provider";
@@ -382,7 +382,7 @@ function operational() {
 it("operational profile separates an old initial frontier from bounded30day authority and requires explicit rolling cap",()=>{
   const pins={...JSON.parse(environment.SAV_INTAKE_RUNTIME_CONFIG!),budgetProfile:"operational_utc_v1",maxRollingNanoUsd:90000000000,maxCalls:300,createdAfter:"2020-01-01T00:00:00.000Z",expiresAt:new Date(Date.now()+29*86400000).toISOString()};
   expect(savIntakeRuntimeConfig({...environment,SAV_INTAKE_RUNTIME_CONFIG:JSON.stringify(pins)})).toHaveProperty("budgetProfile","operational_utc_v1");
-  for(const change of [{maxRollingNanoUsd:undefined},{maxCalls:301},{maxRollingNanoUsd:90000000001},{expiresAt:new Date(Date.now()+31*86400000).toISOString()}]) expect(()=>savIntakeRuntimeConfig({...environment,SAV_INTAKE_RUNTIME_CONFIG:JSON.stringify({...pins,...change})})).toThrow();
+  for(const change of [{maxRollingNanoUsd:undefined},{maxCalls:301},{maxRollingNanoUsd:200000000001},{expiresAt:new Date(Date.now()+31*86400000).toISOString()}]) expect(()=>savIntakeRuntimeConfig({...environment,SAV_INTAKE_RUNTIME_CONFIG:JSON.stringify({...pins,...change})})).toThrow();
 });
 it("operational profile accepts the approved5 USD daily cap while every other bound stays strict",()=>{
   const pins={...JSON.parse(environment.SAV_INTAKE_RUNTIME_CONFIG!),budgetProfile:"operational_utc_v1",maxRollingNanoUsd:90000000000,maxCalls:300,maxNanoUsd:5000000000,expiresAt:new Date(Date.now()+29*86400000).toISOString()};
@@ -391,7 +391,7 @@ it("operational profile accepts the approved5 USD daily cap while every other bo
   expect(parse({maxNanoUsd:3000000000})).toHaveProperty("maxNanoUsd",3000000000);
   expect(parse({})!.configHash).not.toBe(parse({maxNanoUsd:3000000000})!.configHash);
   for(const maxNanoUsd of [5000000001,0,-1,1.5,Number.NaN,Number.POSITIVE_INFINITY,"5000000000",null]) expect(()=>parse({maxNanoUsd})).toThrow("SAV_INTAKE_RUNTIME_CONFIGURATION_REQUIRED");
-  for(const change of [{maxRollingNanoUsd:90000000001},{maxCalls:301}]) expect(()=>parse(change)).toThrow("SAV_INTAKE_RUNTIME_CONFIGURATION_REQUIRED");
+  for(const change of [{maxRollingNanoUsd:200000000001},{maxCalls:301}]) expect(()=>parse(change)).toThrow("SAV_INTAKE_RUNTIME_CONFIGURATION_REQUIRED");
   // Qualification (no profile) keeps its historical lifetime cap and30 calls.
   const legacy=JSON.parse(environment.SAV_INTAKE_RUNTIME_CONFIG!);
   expect(()=>savIntakeRuntimeConfig({...environment,SAV_INTAKE_RUNTIME_CONFIG:JSON.stringify({...legacy,maxNanoUsd:5000000000})})).toThrow("SAV_INTAKE_RUNTIME_CONFIGURATION_REQUIRED");
@@ -462,15 +462,16 @@ it("Studio daily cap overrides the pinned operational cap under the budget lock,
   await expect(readSavIntakeBudget(config)).rejects.toThrow("SAV_INTAKE_BUDGET_OVERRIDE_INVALID");
   await f.db.delete(savSyncState).where(eq(savSyncState.key,"sav-intake-daily-budget-override.v1"));
 });
-it("one provider timeout reserves its full cost beyond30days, blocks its message, and permits a second dossier within both margins",async()=>{
+it("one provider timeout reserves its full cost beyond30days, no longer freezes its message (SAV-92), and permits a second dossier within both margins",async()=>{
   operational();const first=await lease();
   const a=await reserveSavIntakeCall(first,config,"timeout-a");
   await f.db.update(savIntakeModelCalls).set({state:"uncertain",createdAt:new Date(Date.now()-31*86400000)}).where(eq(savIntakeModelCalls.id,a.id));
   threadId=(await f.db.insert(savThreads).values({mailboxId,gmailThreadId:randomUUID(),customerEmail:"other@example.invalid"}).returning())[0].id;messageId=(await message()).id;
   const second=await lease(),b=await reserveSavIntakeCall(second,config,"second-b");
   expect(b.cached).toBeNull();expect((await readSavIntakeBudget(config))).toMatchObject({chargedNanoUsd:817152000,callCount:1,rollingChargedNanoUsd:1634304000,lifetimeCallCount:2,uncertain:true});
-  await expect(reserveSavIntakeCall(first,config,"retry-a")).rejects.toThrow("USAGE_UNCERTAIN");
-  expect((await readSavIntakeBudget({...config,maxCalls:299}))).toHaveProperty("lifetimeCallCount",2);
+  // SAV-92: the definitively uncertain call stays counted at its full price; a new attempt is a new, separately reserved call.
+  const retry=await reserveSavIntakeCall(first,config,"retry-a");expect(retry.cached).toBeNull();
+  expect((await readSavIntakeBudget({...config,maxCalls:299}))).toMatchObject({lifetimeCallCount:3,uncertainCallCount:1,uncertainNanoUsd:817152000});
 });
 it("operational profile still enforces the durable per-version call bound and rejects a future ledger timestamp",async()=>{
   operational();const l=await lease();
@@ -1164,8 +1165,9 @@ it.each([["without", false], ["with", true]] as const)("current reader: a groupe
   const at = new Date(Date.now() - 3600_000).toISOString(), mid = messageId;
   const message = { id: mid, threadId, receivedAt: at, fromEmail: "client@example.invalid", toEmails: ["support@example.invalid"], direction: "inbound" as const, currentText: "La synchronisation échoue encore.", contentComplete: true };
   // Two tickets whose citation catalogues together exceed one call: the reader plans two groups.
-  const tickets = ["201", "202"].map((id, i) => ({ ticket: { id, contactIds: ["101"], stage: "open" as const, createdAt: at, ownerId: null, subject: `Ticket ${id}`, content: "Synchronisation" },
-    history: [{ id: `note-${id}`, kind: "note" as const, at, text: uniqueText(500 + i, 270_000) }] }));
+  // SAV-92: histories are now bounded (history-budget.ts), so the size comes from the ticket bodies.
+  const tickets = ["201", "202"].map((id, i) => ({ ticket: { id, contactIds: ["101"], stage: "open" as const, createdAt: at, ownerId: null, subject: `Ticket ${id}`, content: uniqueText(500 + i, 270_000) },
+    history: [{ id: `note-${id}`, kind: "note" as const, at, text: "Synchronisation toujours en échec." }] }));
   const input = { message, requests: [{ id: "r1", kind: "support" as const, currentMessageId: mid }], tickets,
     evidence: ["current", ...tickets.flatMap(t => [`ticket-${t.ticket.id}`, `history-${t.ticket.id}`])].map(id => ({ id, sourceId: id, observedAt: at, contentHash: "a".repeat(43), source: "crm_ticket" as const })) } as never;
   let gemini = 0; const refuse = new Set<number>([2]);
@@ -1346,4 +1348,93 @@ it.each([
   expect(network).toHaveBeenCalledTimes(1);
   expect(await f.db.select().from(savActions)).toHaveLength(0);
   expect(await f.db.select().from(savIntakeEffects)).toHaveLength(0);
+});
+
+// SAV-92 fix 2: an uncertain cost stays counted but no longer blocks the mail forever.
+it("SAV-92 a timed-out call stays in the ledger at its reserved price; the mail returns to normal scheduling under the attempt limits", async () => {
+  operational(); const l = await lease(), r = await reserveSavIntakeCall(l, config, "a".repeat(64));
+  expect(await settleSavIntakeCall(r.id)).toBe(false); // timeout: no usage, definitively uncertain
+  await failSavIntakeRun(l, { ...payload(), reason: "SAV_INTAKE_RUNTIME_USAGE_UNCERTAIN" }, true);
+  expect((await readSavIntakeCurrent(threadId, config))?.state).toBe("uncertain");
+  const before = await readSavIntakeBudget(config);
+  expect(before.uncertainCallCount).toBe(1);
+  expect(before.uncertainNanoUsd).toBeGreaterThan(0);
+  expect((await pendingSavIntakeRuns(config)).map(x => x.id)).toEqual([l.run.id]);
+  const second = (await claimSavIntakeRun(l.run.id, config))!; expect(second.run.attempts).toBe(2);
+  // Same body: the uncertain row is kept as is and the retry is a new reserved row (no reset, no replay of the old row).
+  const retry = await reserveSavIntakeCall(second, config, "a".repeat(64)); expect(retry.cached).toBeNull(); expect(retry.id).not.toBe(r.id);
+  const [old] = await f.db.select().from(savIntakeModelCalls).where(eq(savIntakeModelCalls.id, r.id));
+  expect(old).toMatchObject({ state: "uncertain", chargedNanoUsd: old.reservedNanoUsd });
+  expect((await readSavIntakeBudget(config)).chargedNanoUsd).toBe(before.chargedNanoUsd + (await f.db.select().from(savIntakeModelCalls).where(eq(savIntakeModelCalls.id, retry.id)))[0].reservedNanoUsd);
+  expect(await settleSavIntakeCall(retry.id)).toBe(false);
+  await failSavIntakeRun(second, { ...payload(), reason: "SAV_INTAKE_RUNTIME_USAGE_UNCERTAIN" }, true);
+  // Two attempts used: the normal per-version limit stops it, nothing reopens it.
+  expect(await pendingSavIntakeRuns(config)).toHaveLength(0); expect(await claimSavIntakeRun(l.run.id, config)).toBeNull();
+});
+it("SAV-92 a dispatched call that may still settle keeps holding the mail; past the settlement horizon it no longer does", async () => {
+  operational(); const l = await lease(), r = await reserveSavIntakeCall(l, config, "a".repeat(64));
+  await f.db.update(savIntakeRuns).set({ leaseUntil: new Date(Date.now() - 1) }).where(eq(savIntakeRuns.id, l.run.id));
+  expect(await claimSavIntakeRun(l.run.id, config)).toBeNull(); expect((await readSavIntakeCurrent(threadId, config))?.state).toBe("uncertain");
+  expect(await pendingSavIntakeRuns(config)).toHaveLength(0);
+  await expect(assertSavIntakeCallPlan(messageId, config, ["b".repeat(64)])).rejects.toThrow("USAGE_UNCERTAIN");
+  await f.db.update(savIntakeModelCalls).set({ createdAt: new Date(Date.now() - 16 * 60_000) }).where(eq(savIntakeModelCalls.id, r.id));
+  expect((await pendingSavIntakeRuns(config)).map(x => x.id)).toEqual([l.run.id]);
+  const second = (await claimSavIntakeRun(l.run.id, config))!; expect(second.run.attempts).toBe(2);
+  expect((await reserveSavIntakeCall(second, config, "a".repeat(64))).cached).toBeNull();
+  const [old] = await f.db.select().from(savIntakeModelCalls).where(eq(savIntakeModelCalls.id, r.id));
+  expect(old.state).toBe("dispatched"); expect(old.chargedNanoUsd).toBe(old.reservedNanoUsd);
+});
+it("SAV-92 the qualification profile keeps the strict rule: any unsettled call blocks", async () => {
+  const l = await lease(), r = await reserveSavIntakeCall(l, config, "a".repeat(64));
+  expect(await settleSavIntakeCall(r.id)).toBe(false);
+  await failSavIntakeRun(l, payload(), true);
+  expect(await pendingSavIntakeRuns(config)).toHaveLength(0); expect(await claimSavIntakeRun(l.run.id, config)).toBeNull();
+});
+
+// SAV-92 fix 4: catch-up after a pause.
+function catchUpConfig() {
+  const pins = { ...JSON.parse(environment.SAV_INTAKE_RUNTIME_CONFIG!), budgetProfile: "operational_utc_v1", maxRollingNanoUsd: 90000000000, maxCalls: 300,
+    createdAfter: "2020-01-01T00:00:00.000Z", receivedAfter: "2020-01-01T00:00:00.000Z", expiresAt: new Date(Date.now() + 29 * 86400000).toISOString() };
+  environment = { ...environment, SAV_INTAKE_RUNTIME_CONFIG: JSON.stringify(pins) }; config = savIntakeRuntimeConfig(environment)!;
+}
+async function runAt(at: Date) {
+  threadId = (await f.db.insert(savThreads).values({ mailboxId, gmailThreadId: randomUUID(), customerEmail: "synthetic@example.invalid" }).returning())[0].id;
+  const m = await message({ receivedAt: at, createdAt: at }), id = (await enqueueSavIntakeMessage(m.id, config))!;
+  await f.db.update(savIntakeRuns).set({ updatedAt: at, createdAt: at }).where(eq(savIntakeRuns.id, id));
+  return id;
+}
+it("SAV-92 catch-up lanes: recent mails newest first, then the stock least recently examined first, one slot kept for the stock", async () => {
+  catchUpConfig();
+  const t = Date.now(), stock: string[] = [], recent: string[] = [];
+  for (let i = 0; i < 6; i++) stock.push(await runAt(new Date(t - 3 * 86400_000 + i * 60_000)));
+  for (let i = 0; i < 6; i++) recent.push(await runAt(new Date(t - 5 * 3600_000 + i * 60_000)));
+  const newestFirst = [...recent].reverse();
+  expect((await pendingSavIntakeRuns(config)).map(r => r.id)).toEqual([...newestFirst.slice(0, 3), stock[0]]);
+  expect((await pendingSavIntakeRuns(config, new Date(), undefined, 10)).map(r => r.id)).toEqual([...newestFirst, ...stock.slice(0, 4)]);
+  expect(await pendingSavIntakeRuns(config, new Date(), undefined, 50)).toHaveLength(10);
+  // Without stock work, recent mail takes every slot.
+  await f.db.update(savIntakeRuns).set({ isCurrent: false, state: "superseded" }).where(inArray(savIntakeRuns.id, stock));
+  expect((await pendingSavIntakeRuns(config)).map(r => r.id)).toEqual(newestFirst.slice(0, 4));
+});
+it.each([[3, 1], [6, 6]] as const)("SAV-92 a pass with %s eligible runs analyses %s inline within the start margin; nothing while fully paused", async (count, expected) => {
+  catchUpConfig();
+  for (const [key, value] of Object.entries(environment)) vi.stubEnv(key, value!);
+  vi.stubGlobal("fetch", vi.fn(async () => { throw Error("SYNTHETIC_NETWORK_DOWN"); }));
+  try {
+    // Only the runs of this test: the default fixture mail would otherwise be enqueued by the pass's own catch-up.
+    await f.db.delete(savMessages).where(eq(savMessages.id, messageId));
+    const ids: string[] = [];
+    for (let i = 0; i < count; i++) ids.push(await runAt(new Date(Date.now() - (i + 1) * 60_000)));
+    const pauseKey = "sav-agent-pause.v1:intake";
+    await f.db.insert(savSyncState).values({ key: pauseKey, status: "active", updatedAt: new Date(),
+      cursor: encryptSavPayload({ revision: "sav-agent-pause.v1", agent: "intake", level: "fully_paused", setBy: "operator@example.invalid", setAt: new Date().toISOString(), reason: "test pause" }) });
+    expect(await reconcileSavIntakeRuntime({ deadlineMs: Date.now() + 270_000 })).toMatchObject({ result: null });
+    expect((await f.db.select().from(savIntakeRuns).where(inArray(savIntakeRuns.id, ids))).every(r => r.attempts === 0)).toBe(true);
+    await f.db.delete(savSyncState).where(eq(savSyncState.key, pauseKey));
+    await reconcileSavIntakeRuntime({ deadlineMs: Date.now() + 270_000 });
+    const runs = await f.db.select().from(savIntakeRuns).where(inArray(savIntakeRuns.id, ids));
+    expect(runs.filter(r => r.attempts === 1)).toHaveLength(expected);
+    // Each run is analysed at most once per pass.
+    if (count === 6) expect(runs.every(r => r.attempts <= 1)).toBe(true);
+  } finally { vi.unstubAllGlobals(); }
 });

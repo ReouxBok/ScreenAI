@@ -4,7 +4,8 @@ import { requireDb } from "@/db";
 import { auditLogs, savIntakeModelCalls, savSyncState } from "@/db/schema";
 
 type Tx = Parameters<Parameters<ReturnType<typeof requireDb>["transaction"]>[0]>[0];
-export const SAV_SHARED_SPEND_CAPS = { dailyNanoUsd: 20_000_000_000, rollingNanoUsd: 90_000_000_000 } as const;
+/** SAV-92 (Ugo, 14/11): rolling 30-day cap raised from 90 to 200 USD; the daily cap stays 20 USD. */
+export const SAV_SHARED_SPEND_CAPS = { dailyNanoUsd: 20_000_000_000, rollingNanoUsd: 200_000_000_000 } as const;
 // Reuse intake's lock: V1 remains compatible, V2 and the other durable monetary
 // reservers join it. Check and canonical insertion MUST share this transaction.
 export async function lockSavSharedSpend(tx: Tx) {
