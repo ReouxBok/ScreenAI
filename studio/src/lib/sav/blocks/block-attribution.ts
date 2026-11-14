@@ -1,7 +1,7 @@
 import { assessSavKnowledgeValidity, savRetrievalRanking, type SavRetrievalCandidate } from "../request-retrieval";
 import { SAV_CASE_RELEVANCE_SEMANTIC_FLOOR } from "../cases/investigation-knowledge-ranking";
 import { caseSensitiveFamiliesInText, normalizeSensitiveText } from "../cases/sensitive-words";
-import type { CaseRequestFamily } from "../cases/case-types";
+import { SAV_CASE_BLOCK_ID, type CaseRequestFamily } from "../cases/case-types";
 
 /*
  * SAV-92 harness, phase 1: attribution of a mail to a block BY ITS CARDS (target of the audit §5.3), measured offline only. Nothing here is
@@ -48,14 +48,13 @@ export type SavBlockAttribution =
   | Readonly<{ outcome: "team"; reason: "no_block_card" | "below_floor" | "excluded"; blockId?: string; exclusion?: string; score?: number }>;
 
 export type SavBlockManifestProblem = Readonly<{ code: "block_id_invalid" | "block_id_duplicate" | "card_in_two_blocks" | "mode_invalid" | "card_list_empty"; blockId: string; cardId?: string }>;
-const BLOCK_ID = /^[a-z][a-z0-9_-]{1,63}$/;
 
 /** A manifest must be unambiguous before anything is measured: one block per attribution card, unique ids, a known mode. */
 export function savBlockManifestProblems(blocks: readonly SavBlockDraft[]): SavBlockManifestProblem[] {
   const problems: SavBlockManifestProblem[] = [];
   const owner = new Map<string, string>(), ids = new Set<string>();
   for (const block of blocks) {
-    if (!BLOCK_ID.test(block.blockId)) problems.push({ code: "block_id_invalid", blockId: block.blockId });
+    if (!SAV_CASE_BLOCK_ID.test(block.blockId)) problems.push({ code: "block_id_invalid", blockId: block.blockId });
     if (ids.has(block.blockId)) problems.push({ code: "block_id_duplicate", blockId: block.blockId });
     ids.add(block.blockId);
     if (!(SAV_BLOCK_MODES as readonly string[]).includes(block.mode)) problems.push({ code: "mode_invalid", blockId: block.blockId });
