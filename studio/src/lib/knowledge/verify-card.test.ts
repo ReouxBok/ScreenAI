@@ -24,6 +24,9 @@ describe("official link allowlist (card content)", () => {
     expect(hasUnsafeSavCardText("Suivez le tutoriel https://academy.limova.ai/tutorials/a642045f-d118-41af-bd8a-58ad05461520.")).toBe(false);
     expect(hasUnsafeSavCardText("Voir [le tutoriel](https://academy.limova.ai/superpowers/support-client) puis inscrivez-vous (https://us06web.zoom.us/webinar/register/WN_OBY9OMWETKaRhGrPr3TyJw).")).toBe(false);
     expect(hasUnsafeSavCardText("Réservez https://calendly.com/d/cszz-77d-g2h/onboarding-premium")).toBe(true);
+    for (const glued of ['https://new.limova.ai/"https://evil.com', "https://new.limova.ai/»https://evil.com", "https://new.limova.ai/)https://evil.com",
+      "https://new.limova.ai//evil.com", "https://new.limova.ai/\\evil.com", "https://academy.limova.ai/%2e%2e/x", "https://NEW.limova.ai/"])
+      expect(hasUnsafeSavCardText(`Voir ${glued}`), glued).toBe(true);
     expect(hasUnsafeSavCardText("Voir https://us06web.zoom.us/webinar/register/WN_autre")).toBe(true);
     expect(hasUnsafeSavCardText("Voir https://us06web.zoom.us/webinar/register/WN_OBY9OMWETKaRhGrPr3TyJw/extra")).toBe(true);
     expect(SAV_CARD_OFFICIAL_LINKS.map(row => row.host)).toEqual(["academy.limova.ai", "new.limova.ai", "bienvenue.limova.ai", "us06web.zoom.us"]);

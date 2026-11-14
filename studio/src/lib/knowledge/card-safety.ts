@@ -48,7 +48,12 @@ const PATH_IDENTIFIER = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f
 /** What replaces an official link before the other checks: plain words that no rule reads as data. */
 const OFFICIAL_LINK_TOKEN = "lien officiel";
 
+/** The raw text of an accepted link: lowercase host, plain path segments only. No quote, guillemet, bracket, backslash, percent-encoding or
+ * empty segment ("//"), so a second address glued to an official one is never accepted with it. */
+const PLAIN_OFFICIAL_LINK = /^https:\/\/[a-z0-9.-]+(?:\/[A-Za-z0-9._~-]+)*\/?$/;
+
 export function officialCardLink(link: string): SavCardOfficialLink | null {
+  if (!PLAIN_OFFICIAL_LINK.test(link)) return null;
   let url: URL;
   try { url = new URL(link); } catch { return null; }
   if (url.protocol !== "https:" || url.username || url.password || url.port || url.search || url.hash) return null;
