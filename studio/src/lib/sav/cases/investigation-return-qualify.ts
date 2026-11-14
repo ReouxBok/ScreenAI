@@ -191,6 +191,17 @@ function readAccessStatement(value: string, first = false): StatementReading {
   return { accounted: (restored || trouble) && !(restored && trouble), restored, trouble };
 }
 
+/**
+ * SAV-92 (Ugo 14/11): the safety net of a multi-request mail at entry. Any finance, cancellation, billing, subscription, rights or identity wording in the
+ * customer's own new words (subject, current text and what follows a sign-off; quoted history set aside) keeps the WHOLE mail with the team, whatever
+ * V1 classified: the same words as every other sensitive check of this file.
+ */
+export function savCaseSensitiveWording(text: string, subject: string): boolean {
+  const parts = splitSavMessageText(text);
+  const all = normalize([subject, parts.currentText, parts.signatureText].join("\n")).replace(LOGIN_INFINITIVE, "");
+  return SENSITIVE.some(([, pattern]) => pattern.test(all));
+}
+
 // A title can describe an older topic. Only the inbound customer's own request can admit a new ticket.
 export function firstPersonalLoginRequest(text: string, subject: string): boolean {
   const parts = splitSavMessageText(text);

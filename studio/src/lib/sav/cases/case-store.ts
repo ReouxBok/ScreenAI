@@ -230,8 +230,11 @@ async function memoryFullLocked(tx: CaseTx, row: CaseRow, sourceRef: SourceRef) 
 async function openRequestsLocked(tx: CaseTx, row: CaseRow, opens: CaseOpenedRequest[], admission: CaseAdmissionInput & { qualification: CaseAdmissionQualification }, event: ValidEvent) {
   const current = toSnapshot(row);
   const known = new Set(current.body.openRequests.map(request => request.id));
+  // SAV-92 (Ugo 14/11): a request the entry left to the team (`team_part`) is opened already handed off; the agent answers the others, the team takes this one.
+  const teamPart = (id: string) => admission.qualification.requests.some(entry => entry.requestId === id && entry.provenance.kind === "team_part");
   const added = opens.filter(request => !known.has(request.id)).map(request => ({
-    id: request.id, summary: request.summary, family: openedFamily(request.id, admission.qualification, admission.policy), status: "open" as const, openedAt: event.occurredAt,
+    id: request.id, summary: request.summary, family: openedFamily(request.id, admission.qualification, admission.policy),
+    status: teamPart(request.id) ? "handed_off" as const : "open" as const, openedAt: event.occurredAt,
     ...(request.subject ? { subject: request.subject } : {}),
   }));
   if (!added.length) return row;

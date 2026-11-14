@@ -73,3 +73,11 @@ export function caseOpenBlockId(snapshot: Pick<CaseSnapshot, "admission" | "body
   const [only] = [...ids];
   return ids.size === 1 && only ? only : null;
 }
+
+/**
+ * SAV-92 (Ugo 14/11, multi-request mails): one request of a mail, read on its OWN words (the quote V1 verified in the message), by the same detectors
+ * and the same rule as a whole first mail: exactly one matching rule gives its block; none or several (`ambiguous_block`, per request) give none.
+ * The subject is the mail's, shared by every request: it is not read here.
+ */
+export const selectCaseRequestBlock = (candidates: readonly CaseBlockCandidate[], requestText: string): CaseBlockSelection =>
+  selectCaseBlockRule(candidates, requestText, "");

@@ -22,7 +22,7 @@ import {
  */
 
 /** Requests an approved rule proves, from V1's confirmed context. Not injected in production: none is approved, so
- * no family is ever proven and nobody is admitted. Only `qualified_rule` provenance is accepted from it. */
+ * no family is ever proven and nobody is admitted. Only `qualified_rule` provenance is accepted from it, and (SAV-92) `team_part` for a request it leaves to the team. */
 export type CaseApprovedRulePort = (input: { context: ConfirmedV1Context; requests: CaseRelayRequest[] }) => Promise<CaseAdmissionQualification["requests"]>;
 
 export type AdmissionInvestigationDeps = {
@@ -65,7 +65,8 @@ async function qualifyFromV1(deps: AdmissionInvestigationDeps, input: { messageI
   if (closed || !deps.approvedRules) return { context: read, requests, qualification: base };
   const rules = deps.approvedRules;
   const ruled = await guarded(failed, "rules", () => rules({ context: read, requests }));
-  if (ruled.some(request => request.provenance.kind !== "qualified_rule")) fault("SAV_CASE_RULE_PROVENANCE_INVALID");
+  // SAV-92: a multi-request mail's entry also names the requests it leaves to the team (`team_part`); that never admits (`decideCaseAdmission`).
+  if (ruled.some(request => request.provenance.kind !== "qualified_rule" && request.provenance.kind !== "team_part")) fault("SAV_CASE_RULE_PROVENANCE_INVALID");
   if (ruled.some(request => !given.has(request.requestId))) fault("SAV_CASE_QUALIFICATION_REQUEST_UNKNOWN");
   return { context: read, requests, qualification: { ...base, requests: ruled } };
 }
