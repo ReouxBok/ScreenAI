@@ -151,7 +151,16 @@ export type CaseDecisionValidationContext = {
    * checked (the runner sets it whenever its scope port is wired). Null: no scope, so nothing is shown from any source.
    */
   accessScope?: CaseBlockScope | null;
+  /**
+   * SAV-92 (Ugo 14/11): the requests of this mail the entry left to the team, opened already handed off (`caseTeamPartRequests`). Set and not empty, an accepted
+   * reply to the customer states that the rest of the message was passed to the team (`SAV_CASE_TEAM_PART_MENTION`); the team's notice names those parts.
+   * Absent: no such request, nothing is added.
+   */
+  teamParts?: ReadonlyArray<Readonly<{ id: string }>>;
 };
+
+/** SAV-92: the fixed sentence an accepted reply ends with when part of the customer's message is the team's. Our text, never the model's nor the customer's. */
+export const SAV_CASE_TEAM_PART_MENTION = "Les autres points de votre message ont été transmis à notre équipe, qui reviendra vers vous directement à leur sujet.";
 
 export const SAV_CASE_ACCESS_URL = "https://new.limova.ai";
 

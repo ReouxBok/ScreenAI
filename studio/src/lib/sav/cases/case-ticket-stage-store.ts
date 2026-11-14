@@ -76,7 +76,8 @@ export function createTicketStageDriver(deps: TicketStageDriverDeps): PassDriver
     let still = false;
     try {
       const planned = planCaseTicketStage({
-        config, caseId, ticketId: snapshot.ticketId, case: { owner: snapshot.owner, phase: snapshot.phase, sensitivity: snapshot.sensitivity, cycle: snapshot.body.cycle },
+        config, caseId, ticketId: snapshot.ticketId, case: { owner: snapshot.owner, phase: snapshot.phase, sensitivity: snapshot.sensitivity, cycle: snapshot.body.cycle,
+        ...(snapshot.body.openRequests.some(row => row.status === "handed_off") ? { teamPartPending: true } : {}) },
         trigger: payload.trigger, lastCustomerInboundAt: null,
       });
       still = planned.plan && planned.intent.key === intent.key && planned.intent.stageId === intent.stageId && planned.intent.ticketId === intent.ticketId;

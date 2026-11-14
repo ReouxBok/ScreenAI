@@ -3,7 +3,7 @@ import { splitSavMessageText } from "../message-context";
 import { assessSavKnowledgeValidity, type SavRetrievalCandidate } from "../request-retrieval";
 import {
   caseAdmissionRefusalCode, caseDecisionAttachmentMail, caseDecisionProposalSchema, caseDecisionRejectionLabels, caseDecisionSignalLabels, caseDecisionUnverifiedLabels,
-  isSensitiveCaseFamily, SAV_CASE_ACCESS_URL, SAV_CASE_DECISION_CONTRACT_REVISION,
+  isSensitiveCaseFamily, SAV_CASE_ACCESS_URL, SAV_CASE_DECISION_CONTRACT_REVISION, SAV_CASE_TEAM_PART_MENTION,
   type CaseDecisionKnowledgeRef, type CaseDecisionRejection, type CaseDecisionRejectionCode, type CaseDecisionSignal,
   type CaseDecisionSourceRef, type CaseDecisionUnverifiedJudgment, type CaseDecisionValidation,
   type CaseDecisionValidationContext, type CaseResolutionEvidence, type SavCaseSensitiveFamily,
@@ -302,7 +302,22 @@ function contextProblem(context: CaseDecisionValidationContext, now: Date) {
   return null;
 }
 
-export const validateCaseDecision = (input: unknown, context: CaseDecisionValidationContext, now: Date): CaseDecisionValidation => validate(input, context, now, false);
+export const validateCaseDecision = (input: unknown, context: CaseDecisionValidationContext, now: Date): CaseDecisionValidation => withTeamPartMention(validate(input, context, now, false), context);
+
+/**
+ * SAV-92 (Ugo 14/11): part of this mail is the team's (`context.teamParts`). An accepted answer or question, whatever composed its text (the model, the
+ * Access template or the login step), ends with our fixed sentence saying the rest was passed to the team: ONE reply covers the customer's whole message.
+ * Idempotent (a stored text already ending with it is kept as is); a text that would exceed the contract is refused, never cut.
+ */
+function withTeamPartMention(result: CaseDecisionValidation, context: CaseDecisionValidationContext): CaseDecisionValidation {
+  if (result.outcome !== "accepted" || !context.teamParts?.length) return result;
+  const { decision } = result, reply = decision.reply;
+  if (!reply || (decision.nextAction.kind !== "answer" && decision.nextAction.kind !== "ask") || reply.text.trimEnd().endsWith(SAV_CASE_TEAM_PART_MENTION)) return result;
+  const text = `${reply.text.trimEnd()}\n\n${SAV_CASE_TEAM_PART_MENTION}`;
+  if (text.length > 6000) return { outcome: "needs_review", contractRevision: result.contractRevision, unverified: result.unverified, signals: result.signals,
+    rejections: [{ code: "proposal_schema_invalid", label: caseDecisionRejectionLabels.proposal_schema_invalid, path: "reply.text", detail: "team_part_mention_too_long" }] };
+  return { ...result, decision: { ...decision, reply: { ...reply, text } } };
+}
 
 /** `composed`: the proposal is this validator's own next step on the login, checked like any other but not composed again. */
 function validate(input: unknown, context: CaseDecisionValidationContext, now: Date, composed: boolean): CaseDecisionValidation {

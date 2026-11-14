@@ -11,7 +11,7 @@ import { decryptSavPayload } from "../crypto";
 import { readSavAgentPause } from "../intake/agent-pause";
 import { createSavKnowledgeVectorIndex, SAV_RETRIEVAL_EMBEDDING_DIMENSION } from "../request-retrieval-db";
 import type { CaseOwnerReadTransport } from "./admission-owner-reader";
-import type { SourceRef } from "./case-types";
+import { caseRequestSearchText, type SourceRef } from "./case-types";
 import { caseResolutionCheckSchema } from "./investigation-closure";
 import { caseDecisionProposalSchema } from "./decision-contract";
 import { reduceCaseCustomerContext, SAV_CASE_CUSTOMER_CONTEXT_LEVELS } from "./investigation-customer-context";
@@ -130,12 +130,16 @@ export const SAV_CASE_CUSTOMER_CONTEXT_INSTRUCTION = [
   "Les valeurs « [... masqué] » ont été retirées volontairement : ne les recopie pas et ne les redemande pas. Ce qui figure dans customerContext.missing n'a pas pu être lu : ne le suppose pas.",
 ].join("\n");
 
+/** SAV-92 (multi-request mails): sent only when part of the mail is the team's, so every other request keeps its exact wording and body. */
+export const SAV_CASE_TEAM_PARTS_INSTRUCTION = "handedToTeam liste les demandes de ce message confiées à l'équipe humaine (aucun bloc de l'agent ne les couvre) : n'y réponds pas, ne promets rien à leur sujet et ne les mentionne pas ; le serveur ajoute lui-même à ta réponse la phrase qui les signale au client. Ta décision porte uniquement sur openRequests.";
+
 /**
  * The decision prompt: the contract (the proposal's JSON schema, the one the validator applies), the case as stored (open requests, facts,
  * questions, trials), the cards retrieved for it and the previous rejections. Nothing is decided here; the validator judges the answer.
  */
 export function caseInvestigationPrompt(request: CaseInvestigationModelRequest) {
   const body = request.snapshot.body;
+  const handedToTeam = body.openRequests.filter(row => row.status === "handed_off");
   const cards = request.knowledge.map(card => ({ knowledgeId: card.id, contentVersionId: card.contentVersionId, title: card.title,
     content: card.content.slice(0, 6_000), resolution: card.resolution }));
   const instruction = [
@@ -144,6 +148,7 @@ export function caseInvestigationPrompt(request: CaseInvestigationModelRequest) 
     "N'invente ni lien, ni état de compte, ni paiement, ni droit. Ne demande jamais de mot de passe ni de code. Si les fiches ne suffisent pas, pose une question ciblée ou transmets à l'équipe.",
     ...(request.customerReportedLogin ? ["customerReportedLogin résume les déclarations du client sur la connexion. Un indicateur false signifie non établi. Tiens compte des contrôles confirmés sans les redemander. restoredAccessReported contient la citation et sa source si le dernier mail confirme explicitement le rétablissement. Cite-les pour proposer confirm_resolution si la chronologie le permet. stillBlockedReported demande de poursuivre le diagnostic. Une seconde lecture distincte doit confirmer toute clôture."] : []),
     ...(request.customerContext ? [SAV_CASE_CUSTOMER_CONTEXT_INSTRUCTION] : []),
+    ...(handedToTeam.length ? [SAV_CASE_TEAM_PARTS_INSTRUCTION] : []),
     request.purpose === "resolution_check" ? "Objet : vérifier si les demandes listées dans « closure » sont résolues, d'après les mots du client cités." : "Objet : la prochaine action sur les demandes ouvertes.",
     `Le champ caseVersion vaut ${request.snapshot.version}.`,
   ].join("\n");
@@ -152,7 +157,8 @@ export function caseInvestigationPrompt(request: CaseInvestigationModelRequest) 
     ...(request.customerReportedLogin ? { customerReportedLogin: request.customerReportedLogin } : {}),
     ...(request.temporaryIncidents?.entries.length ? { temporaryIncidents: request.temporaryIncidents } : {}),
     knowledge: cards, coverage: request.coverage, previousRejections: request.feedback, closure: request.closure,
-    ...(request.customerContext ? { customerContext: request.customerContext } : {}) };
+    ...(request.customerContext ? { customerContext: request.customerContext } : {}),
+    ...(handedToTeam.length ? { handedToTeam: handedToTeam.map(row => ({ id: row.id, subject: caseRequestSearchText(row) })) } : {}) };
   return { instruction, schema: request.purpose === "resolution_check" ? CLOSURE_JSON_SCHEMA : DECISION_JSON_SCHEMA, payload };
 }
 

@@ -133,7 +133,9 @@ export type CaseTicketStagePlanInput = Readonly<{
   config: CaseTicketStageConfig;
   caseId: string;
   ticketId: string;
-  case: Readonly<{ owner: CaseOwner; phase: CasePhase; sensitivity: CaseSensitivity; cycle: Readonly<{ number: number; endedBy?: "resolved" | "closed_no_reply" | "handoff" }> }>;
+  case: Readonly<{ owner: CaseOwner; phase: CasePhase; sensitivity: CaseSensitivity; cycle: Readonly<{ number: number; endedBy?: "resolved" | "closed_no_reply" | "handoff" }>;
+    /** SAV-92: a request of the case is the team's (handed off by the entry): the team works the ticket too, V2 moves no stage. Absent: none. */
+    teamPartPending?: boolean }>;
   trigger: CaseTicketStageTrigger;
   /** Date of the latest customer mail of the case, if any: one received after the reply makes « attente client » stale. */
   lastCustomerInboundAt: string | null;
@@ -147,6 +149,8 @@ export function planCaseTicketStage(input: CaseTicketStagePlanInput): CaseTicket
   // A person's or the team's ticket is never moved by V2, whatever its stage.
   if (current.owner !== "agent") return { plan: false, reason: "owner_not_agent" };
   if (current.sensitivity !== "none") return { plan: false, reason: "sensitive" };
+  // SAV-92: neither « attente client » nor « fermé » while the team still has its part of the customer's message on this ticket.
+  if (current.teamPartPending) return { plan: false, reason: "team_part_pending" };
   if (trigger.kind === "reply_confirmed") {
     if (current.phase === "resolved") return { plan: false, reason: "case_resolved" };
     if (!Number.isFinite(Date.parse(trigger.sentAt))) return { plan: false, reason: "sent_at_invalid" };

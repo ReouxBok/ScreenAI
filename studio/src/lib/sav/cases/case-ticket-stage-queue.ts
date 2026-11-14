@@ -34,7 +34,8 @@ export async function enqueueCaseTicketStage(tx: ExecutionTx, input: Readonly<{
   let planned: ReturnType<typeof planCaseTicketStage>;
   try {
     planned = planCaseTicketStage({
-      config, caseId: snapshot.caseId, ticketId: snapshot.ticketId, case: { owner: snapshot.owner, phase: snapshot.phase, sensitivity: snapshot.sensitivity, cycle: snapshot.body.cycle },
+      config, caseId: snapshot.caseId, ticketId: snapshot.ticketId, case: { owner: snapshot.owner, phase: snapshot.phase, sensitivity: snapshot.sensitivity, cycle: snapshot.body.cycle,
+        ...(snapshot.body.openRequests.some(row => row.status === "handed_off") ? { teamPartPending: true } : {}) },
       trigger: input.trigger, lastCustomerInboundAt: await lastCustomerInboundAt(tx, snapshot.caseId),
     });
   } catch { return { ok: false, reason: "key_invalid" }; }
