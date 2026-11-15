@@ -83,7 +83,7 @@ export const HANDOFF_TEAM_PART_INTERVENTION = "Reprendre uniquement la partie ci
 /** The fixed next human action of a refused decision: never model text. */
 export const HANDOFF_REFUSED_INTERVENTION = "Reprendre le dossier : vérifier les faits constatés et la demande, puis répondre au client. Aucune réponse n'a été envoyée par l'agent.";
 
-export type HandoffTriggerRefusal = "no_record" | "no_decision" | "not_handoff" | "not_accepted" | "stale_input" | "taken_by_person";
+export type HandoffTriggerRefusal = "no_record" | "no_decision" | "not_handoff" | "not_accepted" | "stale_input" | "taken_by_person" | "whole_mail_handed_off";
 export type HandoffNoticeTrigger = Readonly<{
   ok: true; caseId: string; ticketId: string; inputKey: string;
   /** Case version of the event that persisted the decision: whatever happens to the case after it makes the decision stale. */
@@ -114,6 +114,16 @@ function teamPartHandoffAction(snapshot: Pick<CaseSnapshot, "body"> & Partial<Pi
   const need = `Partie du message à reprendre par l'équipe (${parts.length} demande${parts.length > 1 ? "s" : ""}) : ${described.map(text => text ? `« ${text} »` : "demande non décrite, voir le mail du client").join(" ; ")}`;
   return { kind: "handoff" as const, reason: "outside_active_blocks" as const, report: { need, expected: null, observed: null, trialIds: [] as string[], hypotheses: [] as string[],
     missingInformation: [] as string[], expectedIntervention: HANDOFF_TEAM_PART_INTERVENTION } };
+}
+
+/** The reason of the transfer at the bound of a team-part wait (`SAV_CASE_TEAM_PART_WAIT_CODE` in case-team-part-wait.ts, a server-only module). */
+const TEAM_PART_WAIT_HANDOFF_REASON = "team_part_handoff_unavailable";
+/**
+ * SAV-92 review P2-4: the decision recorded at `version` never reached the customer: its team part could not be noticed, and at the bound of that wait the
+ * WHOLE mail was handed to the team (owner_changed `handoff`, reason above). Its "team part" notice would say the agent replied and keeps the rest: false.
+ */
+export function teamPartWaitHandedOff(events: readonly CaseInvestigationJournalEvent[], version: number) {
+  return events.some(event => event.kind === "owner_changed" && event.caseVersion > version && event.detail?.transition === "handoff" && event.detail.reason === TEAM_PART_WAIT_HANDOFF_REASON);
 }
 
 /** Events after the decision that make it no longer the final word: a newer customer mail, a newer investigation, a person's command, an owner change. */
@@ -155,6 +165,8 @@ export function handoffNoticeTrigger(snapshot: Pick<CaseSnapshot, "caseId" | "ti
   const action = decided && decided.kind !== "handoff" ? teamPartHandoffAction(snapshot, decision.teamParts) : decided;
   if (!action || action.kind !== "handoff") return { ok: false, why: "not_handoff" };
   if (snapshot.body.handoff?.humanSince) return { ok: false, why: "taken_by_person" };
+  // Review P2-4: the whole mail already went to the team at the bound of the team-part wait; no partial notice saying the agent replied.
+  if (action.reason === "outside_active_blocks" && teamPartWaitHandedOff(events, read.caseVersion)) return { ok: false, why: "whole_mail_handed_off" };
   if (latest.detail?.applied === false) return { ok: false, why: "stale_input" };
   // Only a matching, committed transfer lets new mail wait for the human team.
   const transferred = events.find(event => event.caseVersion === read.caseVersion + 1 && event.kind === "owner_changed"
@@ -187,6 +199,8 @@ export function teamPartNoticeTriggers(snapshot: Pick<CaseSnapshot, "caseId" | "
     if (read.state !== "found") return [];
     const decision = read.record.decision, recorded = events.find(event => event.kind === "observation_recorded" && event.caseVersion === read.caseVersion);
     if (!decision?.teamParts?.length || decision.validation.outcome !== "accepted" || decision.validation.decision.nextAction.kind === "handoff" || recorded?.detail?.applied === false) return [];
+    // Review P2-4: this input's reply never left (its notice could not be queued) and the whole mail went to the team at the wait's bound.
+    if (teamPartWaitHandedOff(events, read.caseVersion)) return [];
     const action = teamPartHandoffAction(snapshot, decision.teamParts);
     if (!action) return [];
     return [{ ok: true as const, caseId: snapshot.caseId, ticketId: snapshot.ticketId, inputKey, recordedAtVersion: read.caseVersion, reason: action.reason, report: { ...action.report } }];
