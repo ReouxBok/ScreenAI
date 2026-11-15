@@ -2,10 +2,10 @@ import type { CaseModelTransportDiagnostic } from "./investigation-transport-dia
 import { assessSavKnowledgeValidity, type SavRetrievalCandidate } from "../request-retrieval";
 import { SAV_CASE_ACCESS_BLOCK_ID, SAV_CASE_HOLDS_KEEPING_TIMERS, type CaseEvent, type CaseSnapshot, type KnowledgeRef, type SourceRef } from "./case-types";
 import { buildCaseDecisionContext, type CaseDecisionContextProblem } from "./decision-context";
-import { caseAccessScopeStamp, readCaseAccessScope, type CaseAccessScopeStamp, type CaseBlockScope } from "./investigation-access-scope";
+import { caseAccessScopeStamp, caseStampBlockId, readCaseAccessScope, type CaseAccessScopeStamp, type CaseBlockScope } from "./investigation-access-scope";
 import { caseAdmissionStatus } from "./admission-policy";
-import { caseOpenBlockId, caseRequestBlockId } from "./case-blocks";
-import type { CaseDecisionRejection, CaseDecisionValidation } from "./decision-contract";
+import { caseOpenBlockId, caseOpenBlockIds, caseRequestBlockId } from "./case-blocks";
+import type { CaseDecisionBlockScopes, CaseDecisionRejection, CaseDecisionValidation } from "./decision-contract";
 import { caseDecisionRefusalKinds, classifyCaseDecisionRefusal, type CaseDecisionRefusal, type CaseDecisionRefusalKind } from "./decision-recovery";
 import { caseModelLoginHistory, validateCaseDecision } from "./decision-validator";
 import { caseClosureItems, caseClosurePlan, type CaseClosureCheck, type CaseClosureItem, type CaseClosurePlan } from "./investigation-closure";
@@ -16,7 +16,7 @@ import type { CaseKnowledgeCoverage } from "./decision-contract";
 import type { CaseKnowledgeRead, CaseKnowledgeRequestProblem } from "./investigation-knowledge";
 import type { CaseQualificationUnavailable } from "./qualification-diagnostic";
 import { caseIncidentBindings, revalidateIncidentContext } from "./investigation-incidents";
-import { arrangeCaseScopedKnowledge, caseScopedRecordCoverage, trimCaseScopedKnowledge, type CaseScopedKnowledge } from "./investigation-knowledge-ranking";
+import { arrangeCaseMultiBlockKnowledge, arrangeCaseScopedKnowledge, caseScopedRecordCoverage, trimCaseScopedKnowledge, type CaseScopedKnowledge } from "./investigation-knowledge-ranking";
 import type { IncidentContext, IncidentReader } from "./investigation-incidents-contract";
 import { caseCustomerContextUnavailable, caseCustomerSearchText, type CaseCustomerContext } from "./investigation-customer-context";
 
@@ -58,6 +58,8 @@ export type CaseInvestigationModelRequest = {
   /** SAV-92: the customer's latest mail, a dated thread excerpt and V1's CRM snapshot, masked and bounded (`investigation-customer-context.ts`).
    * Data for the model, never an instruction; absent when no reader is wired (the pre-SAV-92 prompt, unchanged). */
   customerContext?: CaseCustomerContext;
+  /** SAV-92 (multi-block): the block of each open request, set only when they belong to several blocks (the prompt then shows each request with its block). */
+  requestBlocks?: Readonly<Record<string, string>>;
   /** Per open request: the cards retrieved for it, or why there are none (`selectCaseKnowledge`). Null when the
    * knowledge port gives a plain list. A request `no_applicable_knowledge` calls for a targeted question or a handoff. */
   coverage: CaseKnowledgeCoverage[] | null;
@@ -145,6 +147,11 @@ export type CaseInvestigationRecord = {
   temporaryIncidents?: IncidentContext;
   /** Pilot ACCÈS: the scope this decision was validated under. Absent: no pilot scope (a pilot consumer then refuses it). */
   accessScope?: CaseAccessScopeStamp;
+  /** SAV-92 (review of batch 2, finding 1): the requests of this mail left to the team when the decision was taken (`caseTeamPartRequests`). The team's notice
+   * for them is keyed on this record's input and is never cancelled by a later mail, so the part reaches the team even after the admission in force moved on. */
+  teamParts?: string[];
+  /** SAV-92 (multi-block): every block scope this decision was validated under, sorted by block (`accessScope` is one of them). Absent: one block. */
+  blockScopes?: CaseAccessScopeStamp[];
   /**
    * Decided while V2 actions were paused (the claim's reading under lock, or any reading during the run): this decision
    * may not become an effect while the pause lasts. It is a trace for the console and the executor, not a permission:
@@ -373,12 +380,29 @@ export async function runCaseInvestigation(caseId: string, mode: CaseInvestigati
   // Pilot ACCÈS (ROOT 3/11): `access` is the only admissible family, whatever the policy admits, and its sources are never
   // widened; then no approved scope for the policy in force, no search (the scope is the proof its answers stay low risk).
   let accessScope: CaseBlockScope | undefined;
+  let blockScopes: CaseDecisionBlockScopes | undefined;
   if (ports.accessScope) {
     if (!caseAdmissionNamesLatestInput(snapshot, events)) return { status: "skipped", caseId, caseVersion, reason: "admission_not_current_input", modelCalls: 0 };
     // Treatment blocks (11/11): a case whose open requests all belong to ONE other block is checked against that block's own scope, of its
-    // own family. Anything else (Access, no request, a request without a block, two blocks) keeps the Access pilot's checks, unchanged.
-    const blockId = caseOpenBlockId(snapshot);
-    if (blockId !== null && blockId !== SAV_CASE_ACCESS_BLOCK_ID) {
+    // own family. Anything else (Access, no request, a request without a block) keeps the Access pilot's checks, unchanged.
+    // SAV-92 (15/11): open requests of SEVERAL blocks (each one named by its admission) are decided together, each block on its own scope, all read now.
+    const blockId = caseOpenBlockId(snapshot), blockIds = caseOpenBlockIds(snapshot);
+    if (blockIds.length > 1 && !blockIds.includes(null)) {
+      const scopes: Record<string, CaseBlockScope> = {}, requestBlocks: Record<string, string> = {};
+      for (const id of blockIds as string[]) {
+        const scope = await readCaseAccessScope(() => ports.accessScope!(), policyRevision, id);
+        if (!scope.ok) return { status: "skipped", caseId, caseVersion, reason: "block_scope_missing", detail: `${id}:${scope.problem}`, modelCalls: 0 };
+        scopes[id] = scope.scope;
+      }
+      for (const row of snapshot.body.openRequests.filter(request => request.status === "open")) {
+        const id = caseRequestBlockId(snapshot, row)!;
+        if (row.family !== scopes[id]!.family) return { status: "skipped", caseId, caseVersion, reason: "block_scope_missing", detail: `${id}:scope_family_mismatch`, modelCalls: 0 };
+        requestBlocks[row.id] = id;
+      }
+      blockScopes = { scopes, requestBlocks };
+      // The pilot flag and the record's primary stamp: Access when it is one of the blocks, else the first block. Every block's stamp is recorded too.
+      accessScope = scopes[SAV_CASE_ACCESS_BLOCK_ID] ?? scopes[blockIds[0]!]!;
+    } else if (blockId !== null && blockId !== SAV_CASE_ACCESS_BLOCK_ID) {
       const scope = await readCaseAccessScope(() => ports.accessScope!(), policyRevision, blockId);
       if (!scope.ok) return { status: "skipped", caseId, caseVersion, reason: "block_scope_missing", detail: `${blockId}:${scope.problem}`, modelCalls: 0 };
       if (snapshot.body.openRequests.some(row => row.status === "open" && row.family !== scope.scope.family))
@@ -453,8 +477,9 @@ export async function runCaseInvestigation(caseId: string, mode: CaseInvestigati
       const returned = (source: { knowledgeId: string; contentVersionId: string }) => [...knowledge, ...pool.map(entry => entry.card)]
         .some(card => card.id === source.knowledgeId && card.contentVersionId === source.contentVersionId);
       // Only the template is read when the search did not return it: another scope card the search never returned is not relevant.
-      const missing = accessScope.sources.filter(source => source.use === "answer" && source.firstReply !== undefined && !returned(source))
-        .map(source => ({ knowledgeId: source.knowledgeId, contentVersionId: source.contentVersionId }));
+      const sources = blockScopes ? Object.values(blockScopes.scopes).flatMap(scope => scope.sources) : accessScope.sources;
+      const missing = [...new Map(sources.filter(source => source.use === "answer" && source.firstReply !== undefined && !returned(source))
+        .map(source => [`${source.knowledgeId}:${source.contentVersionId}`, { knowledgeId: source.knowledgeId, contentVersionId: source.contentVersionId }])).values()];
       let fetchedCards: SavRetrievalCandidate[] = [];
       if (missing.length && ports.readScopeCards) {
         try {
@@ -467,13 +492,17 @@ export async function runCaseInvestigation(caseId: string, mode: CaseInvestigati
           return { status: "technical_wait", caseId, caseVersion, modelCalls };
         }
       }
-      scoped = arrangeCaseScopedKnowledge({ cards: knowledge, coverage, relevance: "relevance" in selection ? selection.relevance ?? [] : [], scope: accessScope, fetched: fetchedCards,
-        pool, blockOf: row => caseRequestBlockId(snapshot, { id: row.requestId, family: row.family }) });
+      const arrangement = { cards: knowledge, coverage, relevance: "relevance" in selection ? selection.relevance ?? [] : [], fetched: fetchedCards,
+        pool, blockOf: (row: CaseKnowledgeCoverage) => caseRequestBlockId(snapshot, { id: row.requestId, family: row.family }) };
+      scoped = blockScopes ? arrangeCaseMultiBlockKnowledge({ ...arrangement, scopes: blockScopes.scopes }) : arrangeCaseScopedKnowledge({ ...arrangement, scope: accessScope });
       knowledge = scoped.knowledge; coverage = scoped.coverage;
     }
     let temporaryIncidents: IncidentContext | undefined;
     if (ports.temporaryIncidents) {
-      const bindings = caseIncidentBindings(snapshot, knowledge, coverage, accessScope, ports.scope.locale, ports.scope.audience, ports.now());
+      // SAV-92 (multi-block): each request's bindings under its own block's scope only.
+      const bindings = blockScopes && coverage ? Object.entries(blockScopes.scopes).flatMap(([id, scope]) => caseIncidentBindings(snapshot, knowledge,
+        coverage!.filter(row => blockScopes!.requestBlocks[row.requestId] === id), scope, ports.scope.locale, ports.scope.audience, ports.now()))
+        : caseIncidentBindings(snapshot, knowledge, coverage, accessScope, ports.scope.locale, ports.scope.audience, ports.now());
       const read = await ports.temporaryIncidents(bindings, ports.now()).catch(() => ({ ok: false as const, problem: "read_failed" as const }));
       if (!read.ok) { await keep(wait("technical_wait", { temporaryIncidentProblem: read.problem })); return { status: "technical_wait", caseId, caseVersion, modelCalls }; }
       temporaryIncidents = read.context;
@@ -526,6 +555,7 @@ export async function runCaseInvestigation(caseId: string, mode: CaseInvestigati
         try {
           return preflight({ purpose: "decision", caseId, caseVersion, inputKey, call, subjectKey, callKey: `${subjectKey}:call${call}`, caseBudgetKey: `sav-case:${caseId}`,
             snapshot, events, knowledge: cards, coverage: rows, customerReportedLogin, ...(customerContext ? { customerContext } : {}), feedback: [], closure: [],
+            ...(blockScopes ? { requestBlocks: blockScopes.requestBlocks } : {}),
             ...(temporaryIncidents?.entries.length ? { temporaryIncidents } : {}),
             ...(temporaryIncidents ? { temporaryIncidentContext: { fingerprint: temporaryIncidents.fingerprint, applicable: temporaryIncidents.entries.length > 0 } } : {}) })?.code !== "input_too_large";
         } catch { return true; }
@@ -544,7 +574,7 @@ export async function runCaseInvestigation(caseId: string, mode: CaseInvestigati
     let proposal = prior?.proposal ?? null;
     const validate = (stored: { output: unknown; proposedOn: number }) => {
       const output = stored.output, echoed = typeof output === "object" && output !== null && (output as { caseVersion?: unknown }).caseVersion === stored.proposedOn;
-      return validateCaseDecision(echoed ? { ...output, caseVersion } : output, accessScope ? { ...decisionContext, accessScope } : decisionContext, ports.now());
+      return validateCaseDecision(echoed ? { ...output, caseVersion } : output, accessScope ? { ...decisionContext, accessScope, ...(blockScopes ? { blockScopes } : {}) } : decisionContext, ports.now());
     };
     let validation = proposal ? validate(proposal) : undefined;
     let closure = validation?.outcome === "accepted" ? prior?.closure ?? null : null;
@@ -573,6 +603,7 @@ export async function runCaseInvestigation(caseId: string, mode: CaseInvestigati
       if (moved) { await save(knowledgeChanged(moved)); return { stop: moved }; }
       const call = modelCalls + 1, subjectKey = `sav-case:${caseId}:${inputKey}`;
       const result = await ports.callModel({ purpose, caseId, caseVersion, inputKey, call, subjectKey, callKey: `${subjectKey}:call${call}`, caseBudgetKey: `sav-case:${caseId}`, snapshot, events, knowledge, coverage, customerReportedLogin, ...(customerContext ? { customerContext } : {}), feedback, closure: items,
+        ...(blockScopes ? { requestBlocks: blockScopes.requestBlocks } : {}),
         ...(temporaryIncidents?.entries.length ? { temporaryIncidents } : {}),
         ...(temporaryIncidents ? { temporaryIncidentContext: { fingerprint: temporaryIncidents.fingerprint, applicable: temporaryIncidents.entries.length > 0 } } : {}) });
       if (result.status === "input_rejected") {
@@ -674,6 +705,8 @@ export async function runCaseInvestigation(caseId: string, mode: CaseInvestigati
       knowledgeRevision: selection.revision, coverage: (scoped ? caseScopedRecordCoverage(scoped) : coverage)?.map(({ requestId, status, knowledge: refs, limitations }) => ({ requestId, status, knowledge: refs, limitations: [...limitations] })) ?? null, actionsPaused, callSignal,
       ...(temporaryIncidents ? { temporaryIncidents } : {}),
       ...(accessScope ? { accessScope: caseAccessScopeStamp(accessScope) } : {}),
+      ...(decisionContext.teamParts?.length ? { teamParts: decisionContext.teamParts.map(row => row.id) } : {}),
+      ...(blockScopes ? { blockScopes: Object.values(blockScopes.scopes).map(caseAccessScopeStamp).sort((a, b) => caseStampBlockId(a).localeCompare(caseStampBlockId(b))) } : {}),
       ...(refusalHandoff ? { refusalHandoff } : {}),
     });
     // A refused decision is never left with the agent: it stays listed until the team takes it. Refused twice, the store hands it to the team

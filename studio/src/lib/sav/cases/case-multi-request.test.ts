@@ -51,7 +51,9 @@ const AT = "2026-11-14T09:00:00.000Z", STAFF = "20000000-0000-4000-8000-00000000
 const SENDER = "client@example.invalid";
 const ACCESS_RULE: CaseEntryRule = { ruleId: "rule-access", revision: "r1", v1Kind: "support", family: "access", at: AT };
 const POLICY = { revision: "policy-r1", admittedFamilies: ["access"], qualifiedRules: [{ ruleId: "rule-access", revision: "r1", families: ["access"] }], approvedBy: STAFF, approvedAt: AT };
-const ENV = { SAV_V2_ADMISSION_RULES_JSON: JSON.stringify([ACCESS_RULE]) };
+// Review of batch 2 (finding 1): a team part is only ever left to the team through its notice, so the notice channel is configured (SYN values, nothing is sent).
+const NOTICE_ENV = { SAV_HANDOFF_NOTICE: "on", SAV_HANDOFF_SLACK_BOT_TOKEN: "xoxb-synthetic-0000000000", SAV_HANDOFF_SLACK_CHANNEL_ID: "C0SYNTHETIC0" };
+const ENV = { SAV_V2_ADMISSION_RULES_JSON: JSON.stringify([ACCESS_RULE]), ...NOTICE_ENV };
 const CONFIRMED: CaseAdmissionQualification["identity"] = { status: "confirmed", source: { type: "hubspot_object", id: "contact-1" } };
 
 const LOGIN_CODE = "Je ne reçois pas le code de connexion à mon compte.";
@@ -307,7 +309,7 @@ describe("two blocks claiming the same request: that request goes to the team (p
   const TWIN: CaseBlockDetector = { blockId: "syn-twin", family: "usage", firstRequest: text => /lien de connexion/i.test(text) };
   const TWIN_RULE: CaseEntryRule = { ruleId: "rule-syn-twin", revision: "r1", v1Kind: "support", family: "usage", at: AT, blockId: "syn-twin" };
   const TWIN_POLICY = { ...POLICY, admittedFamilies: ["access", "usage"], qualifiedRules: [...POLICY.qualifiedRules, { ruleId: "rule-syn-twin", revision: "r1", families: ["usage"], blockId: "syn-twin" }] };
-  const twinEnv = { SAV_V2_ADMISSION_RULES_JSON: JSON.stringify([ACCESS_RULE, TWIN_RULE]),
+  const twinEnv = { ...NOTICE_ENV, SAV_V2_ADMISSION_RULES_JSON: JSON.stringify([ACCESS_RULE, TWIN_RULE]),
     SAV_V2_ADMISSION_POLICY_JSON: JSON.stringify({ policy: TWIN_POLICY, validFrom: "2025-01-01T00:00:00Z", validUntil: "2099-01-01T00:00:00Z" }),
     [SAV_V2_BLOCK_SCOPES_ENV]: JSON.stringify([{ schema: SAV_CASE_BLOCK_SCOPE_REVISION, blockId: "syn-twin", family: "usage", policyRevision: "policy-r1", revision: "scope-syn-twin-r1",
       sources: [{ knowledgeId: "k-syn-twin", contentVersionId: "k-syn-twin-v1", use: "answer" }] }]) };

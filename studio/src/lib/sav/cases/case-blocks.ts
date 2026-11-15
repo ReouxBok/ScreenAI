@@ -81,3 +81,29 @@ export function caseOpenBlockId(snapshot: Pick<CaseSnapshot, "admission" | "body
  */
 export const selectCaseRequestBlock = (candidates: readonly CaseBlockCandidate[], requestText: string): CaseBlockSelection =>
   selectCaseBlockRule(candidates, requestText, "");
+
+/**
+ * SAV-92 (Ugo 15/11, multi-block mails): the blocks of a case's open requests, sorted, `null` for an open request no admission names a block for.
+ * Exactly one non-null id is `caseOpenBlockId`'s single block; two or more non-null ids (and no null) is a case decided under several blocks.
+ */
+export function caseOpenBlockIds(snapshot: Pick<CaseSnapshot, "admission" | "body">): Array<string | null> {
+  const ids = new Set(snapshot.body.openRequests.filter(row => row.status === "open").map(row => caseRequestBlockId(snapshot, row)));
+  return [...ids].sort((a, b) => (a ?? "").localeCompare(b ?? ""));
+}
+
+/** The effective mode of one block for the entry (`savBlockEffectiveMode`: the stricter of its switch and the global automatic reply). */
+export type CaseEntryBlockMode = "off" | "paused" | "draft" | "auto";
+const MODE_LEVEL: Readonly<Record<CaseEntryBlockMode, number>> = { off: 0, paused: 0, draft: 1, auto: 2 };
+
+/**
+ * SAV-92 (Ugo 15/11): ONE reply per customer mail, so the requests of several blocks are decided together, and the reply can only go out in ONE mode.
+ * Rule (documented in FIX_MULTI_BLOCK.md): the blocks at the most permissive mode present in the mail keep their requests; the requests of every stricter
+ * block become team parts (`block_switch_restricted`), named in the same reply and in the team's notice. So an automatic block is never held back by a
+ * block in draft or off, and a draft block is never held back by an off one. When every block is off or paused, nothing is moved: the case is held
+ * visibly exactly like a single-block mail whose block is off (`block_held`), and nothing is proposed. Pure.
+ */
+export function planCaseMultiBlockModes(modes: ReadonlyMap<string, CaseEntryBlockMode>): Readonly<{ kept: string[]; restricted: string[] }> {
+  const ids = [...modes.keys()].sort(), best = Math.max(...ids.map(id => MODE_LEVEL[modes.get(id)!] ?? 0));
+  if (!ids.length || best === 0) return { kept: ids, restricted: [] };
+  return { kept: ids.filter(id => MODE_LEVEL[modes.get(id)!] === best), restricted: ids.filter(id => MODE_LEVEL[modes.get(id)!] !== best) };
+}

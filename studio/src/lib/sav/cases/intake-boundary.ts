@@ -5,6 +5,7 @@ import { requireDb } from "@/db";
 import { savCaseEvents, savCases, savIntakeEffects, savIntakeExecutions, savIntakeRuns, savMessages } from "@/db/schema";
 import { decryptSavPayload } from "../crypto";
 import { redactSavLearningText } from "../learning-extraction";
+import { containsPromptInjection } from "../policy";
 import type { SavIntakeDecision } from "../intake/contract";
 import type { ExecutionPayload } from "../intake/execution-types";
 import type { IntakeRuntimePayload } from "../intake/runtime-contract";
@@ -240,6 +241,8 @@ export async function readRequestSubjects(input: { runId: string | null; runVers
       const quote = several ? requestQuoteOf(read, id) : null;
       const quoted = quote ? maskSearchText(quote) : "";
       if (!quoted) { absent(summary ? "summary_shared" : "not_in_summary"); continue; }
+      // Review of batch 2 (finding 5): the customer's own words; one that reads as an instruction is never a search subject nor a prompt field.
+      if (containsPromptInjection(quote!)) { absent("source_invalid"); continue; }
       if (quoted.replace(/\[[^\]]*masqu[^\]]*\]/g, "").replace(/[^\p{L}\p{N}]+/gu, "").length < SAV_CASE_SUBJECT_LENGTH.min) { absent("redacted_empty"); continue; }
       const subject = available(quoted, entry, "requestQuote");
       if (subject.success) subjects.set(key, subject.data); else absent("source_invalid");

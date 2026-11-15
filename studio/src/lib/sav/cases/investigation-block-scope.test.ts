@@ -151,10 +151,11 @@ describe("(e, runner) a block's case is checked against ITS scope; a block with 
     expect(kb.searches).toBe(0);
   });
 
-  it("a request of another family with no block recorded, or Access mixed with a block: the Access pilot's refusal, unchanged", async () => {
+  it("a request of another family with no block recorded, alone or beside Access: the Access pilot's refusal, unchanged", async () => {
     const unnamed = await relayedCase("gm-blk-unnamed", [{ family: "usage", about: "Configurer le widget synthétique." }]);
     expect((await investigate(unnamed, [answerWith(refOf(WIDGET), "usage")], BOTH_ENV)).report).toMatchObject({ status: "skipped", reason: "pilot_family_not_access", detail: "usage", modelCalls: 0 });
-    const mixed = await relayedCase("gm-blk-mixed", [{ family: "access", about: "Connexion impossible à la plateforme." }, { family: "usage", blockId: "syn-widget", about: "Configurer le widget synthétique." }]);
+    // SAV-92 (15/11): Access mixed with a NAMED block is now decided under both blocks (section f); a request without a block beside Access still is not.
+    const mixed = await relayedCase("gm-blk-mixed", [{ family: "access", about: "Connexion impossible à la plateforme." }, { family: "usage", about: "Configurer le widget synthétique." }]);
     expect((await investigate(mixed, [answerWith(refOf(LOGIN), "access")], BOTH_ENV)).report).toMatchObject({ status: "skipped", reason: "pilot_family_not_access", detail: "usage", modelCalls: 0 });
     expect(kb.searches).toBe(0);
   });
@@ -166,5 +167,71 @@ describe("(e, runner) a block's case is checked against ITS scope; a block with 
     expect(feedback(1)).toContainEqual(["access_source_out_of_scope", "nextAction.steps.0.knowledge", LOGIN.id]);
     expect(feedback(2)).toContainEqual(["pilot_family_out_of_scope", "understanding.requests.0.family", "access"]);
     expect(report).toMatchObject({ status: "recorded", outcome: "accepted", modelCalls: 3 });
+  });
+});
+
+describe("(f) SAV-92 multi-block: Access and another block in ONE case, ONE decision, each request on its own block's scope", () => {
+  const MIXED = [{ family: "access" as const, about: "Connexion impossible à la plateforme." }, { family: "usage" as const, blockId: "syn-widget", about: "Configurer le widget synthétique." }];
+  /** The model answering both requests in one reply; `steps` names the card each request's step cites. */
+  const answerBoth = (cards: { access: KnowledgeRef; usage: KnowledgeRef }, only?: "usage"): Answer => request => {
+    const open = request.snapshot.body.openRequests.filter(row => row.status === "open");
+    const [access, usage] = [open.find(row => row.family === "access")!, open.find(row => row.family === "usage")!];
+    const answered = only ? [usage] : [access, usage];
+    return { status: "ok", output: { caseVersion: request.snapshot.version,
+      understanding: { requests: open.map(row => ({ id: row.id, summary: "Demande du client.", family: row.family, status: "open" })), newFacts: [] },
+      nextAction: { kind: "answer", requestIds: answered.map(row => row.id), steps: answered.map(row => ({ text: "Suivre la fiche citée.", knowledge: row.family === "access" ? cards.access : cards.usage })),
+        expectedResult: "Le client est débloqué." },
+      reply: { text: `Bonjour, pour la connexion, depuis ${SAV_CASE_ACCESS_URL} : suivez la fiche. Pour le widget : suivez sa fiche.`,
+        citations: only ? [cards.usage] : [cards.access, cards.usage], impossibilityClaims: [], accountAdvice: "none" } } };
+  };
+  const ACCESS_STAMP = { revision: "syn-scope-r1", policyRevision: "policy-r1" }, WIDGET_STAMP = { revision: "syn-widget-scope-r1", policyRevision: "policy-r1", blockId: "syn-widget" };
+
+  it("both scopes in force: one call, each request linked to its own block's card only, both stamps recorded, the prompt names each request's block", async () => {
+    const c = await relayedCase("gm-blk-multi-ok", MIXED);
+    const { report, calls } = await investigate(c, [answerBoth({ access: refOf(LOGIN), usage: refOf(WIDGET) })], BOTH_ENV);
+    expect(report).toMatchObject({ status: "recorded", outcome: "accepted", modelCalls: 1 });
+    const [r1, r2] = c.body.openRequests.map(row => row.id);
+    expect(calls[0]!.requestBlocks).toEqual({ [r1!]: "access", [r2!]: "syn-widget" });
+    const linked = (id: string) => calls[0]!.coverage!.find(row => row.requestId === id)!.knowledge.map(ref => ref.knowledgeId);
+    expect(linked(r1!)).toContain(LOGIN.id); expect(linked(r1!)).not.toContain(WIDGET.id);
+    expect(linked(r2!)).toContain(WIDGET.id); expect(linked(r2!)).not.toContain(LOGIN.id);
+    const { caseInvestigationPrompt, SAV_CASE_REQUEST_BLOCKS_INSTRUCTION } = await import("./investigation-v2-providers");
+    const prompt = caseInvestigationPrompt(calls[0]!);
+    expect(prompt.instruction).toContain(SAV_CASE_REQUEST_BLOCKS_INSTRUCTION);
+    expect((prompt.payload as { requestBlocks: unknown }).requestBlocks).toEqual([{ requestId: r1, blockId: "access", knowledge: expect.arrayContaining([refOf(LOGIN)]) },
+      { requestId: r2, blockId: "syn-widget", knowledge: expect.arrayContaining([refOf(WIDGET)]) }]);
+    const stored = (await recorded(c.caseId))!;
+    expect(stored.record.decision!.accessScope).toEqual(ACCESS_STAMP);
+    expect(stored.record.decision!.blockScopes).toEqual([ACCESS_STAMP, WIDGET_STAMP]);
+    // A consumer gets the reply only while EVERY block scope is still in force.
+    expect(caseDecisionDraft(c.caseId, stored.record, stored.events, { accessScope: ACCESS_STAMP, blockScopes: [ACCESS_STAMP, WIDGET_STAMP] })).toMatchObject({ reply: { purpose: "answer" }, replyLimit: null });
+    expect(caseDecisionDraft(c.caseId, stored.record, stored.events, { accessScope: ACCESS_STAMP, blockScopes: [ACCESS_STAMP, { ...WIDGET_STAMP, revision: "syn-widget-scope-r2" }] }))
+      .toMatchObject({ reply: null, replyLimit: "access_scope_changed" });
+    expect(caseDecisionDraft(c.caseId, stored.record, stored.events, { accessScope: ACCESS_STAMP })).toMatchObject({ reply: null, replyLimit: "access_scope_unknown" });
+  });
+
+  it("block A's card never answers block B's request: Access's card cited for the widget request is refused, then the right card is accepted", async () => {
+    const c = await relayedCase("gm-blk-multi-cross", MIXED);
+    const { report, calls } = await investigate(c, [answerBoth({ access: refOf(LOGIN), usage: refOf(LOGIN) }, "usage"), answerBoth({ access: refOf(LOGIN), usage: refOf(WIDGET) })], BOTH_ENV);
+    expect(calls[1]!.feedback.map(row => [row.code, row.path])).toContainEqual(["access_source_out_of_scope", "nextAction.steps.0.knowledge"]);
+    expect(report).toMatchObject({ status: "recorded", outcome: "accepted", modelCalls: 2 });
+  });
+
+  it("each request keeps its own block's family: the widget request moved to `access` is refused", async () => {
+    const c = await relayedCase("gm-blk-multi-family", MIXED);
+    const wrongFamily: Answer = request => {
+      const result = answerBoth({ access: refOf(LOGIN), usage: refOf(WIDGET) })(request) as { status: "ok"; output: { understanding: { requests: Array<{ family: string }> } } };
+      result.output.understanding.requests.forEach(row => { row.family = "access"; });
+      return result as CaseInvestigationModelResult;
+    };
+    const { calls } = await investigate(c, [wrongFamily, answerBoth({ access: refOf(LOGIN), usage: refOf(WIDGET) })], BOTH_ENV);
+    expect(calls[1]!.feedback.map(row => [row.code, row.detail])).toContainEqual(["pilot_family_out_of_scope", "access"]);
+  });
+
+  it("one of the blocks has no scope in force: skipped before any search or call, nothing recorded", async () => {
+    const c = await relayedCase("gm-blk-multi-noscope", MIXED);
+    const { report, calls } = await investigate(c, [answerBoth({ access: refOf(LOGIN), usage: refOf(WIDGET) })], LEGACY_ENV);
+    expect(report).toMatchObject({ status: "skipped", reason: "block_scope_missing", detail: "syn-widget:scope_missing", modelCalls: 0 });
+    expect({ calls: calls.length, recorded: await recorded(c.caseId) }).toEqual({ calls: 0, recorded: null });
   });
 });
