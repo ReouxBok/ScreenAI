@@ -40,7 +40,7 @@ import { caseAccessScopeConfigReader, SAV_V2_ACCESS_SCOPE_ENV } from "./investig
 import { planCaseMultiBlockModes } from "./case-blocks";
 import { appendCaseEvent } from "./case-store";
 import { enqueueHandoffNotice } from "./case-handoff-notice-store";
-import { staleHandoffEventKinds, teamPartNoticeTriggers } from "./case-handoff-notice";
+import { HANDOFF_WHOLE_MAIL_INTERVENTION, staleHandoffEventKinds, teamPartNoticeTriggers } from "./case-handoff-notice";
 import { SAV_CASE_TEAM_PART_WAIT_BOUNDS, settleCaseTeamPartWait } from "./case-team-part-wait";
 import { caseTeamPartPending } from "./case-ticket-stage-queue";
 
@@ -287,19 +287,27 @@ describe("review of batch 2, findings 1, 2 and 5", () => {
     expect(await enqueueHandoffNotice({ caseId: mail.caseId, policy, env: () => NOTICE_ENV })).toMatchObject({ ok: true, created: false, key: (first as { key: string }).key });
     expect(vi.mocked(fetch)).not.toHaveBeenCalled();
   });
-  it("review P2-4: once the whole mail went to the team at the bound of the team-part wait, no partial notice is created any more (it would say the agent replied)", async () => {
+  it("review P2-4 (counter-review): once the whole mail went to the team at the bound of the team-part wait, ONE fixed notice says « mail entier, aucune réponse envoyée »", async () => {
     const mail = await v1Mail(OWNER_EXAMPLE);
     await investigate(mail.caseId);
     const policy = { id: policyId, hash: "fixture" };
-    // Before the bound: the team part is owed (the notice could not be queued, e.g. the channel was down).
-    expect(teamPartNoticeTriggers((await readCase(mail.caseId))!, await listCaseEvents(mail.caseId))).toHaveLength(1);
+    // Before the bound: the partial team-part notice is owed (it could not be queued, e.g. the channel was down).
+    const before = teamPartNoticeTriggers((await readCase(mail.caseId))!, await listCaseEvents(mail.caseId));
+    expect(before.map(row => row.reason)).toEqual(["outside_active_blocks"]);
     for (let pass = 0; pass < SAV_CASE_TEAM_PART_WAIT_BOUNDS.maxPasses; pass++) await settleCaseTeamPartWait(mail.caseId, { detail: "disabled" });
     const handed = (await readCase(mail.caseId))!, events = await listCaseEvents(mail.caseId);
     expect(handed).toMatchObject({ owner: "human", phase: "handoff_pending", body: { handoff: { reason: "team_part_handoff_unavailable" } } });
-    // The channel is back: neither trigger offers the partial notice, so the notice sweep creates nothing.
-    expect(teamPartNoticeTriggers(handed, events)).toEqual([]);
-    expect(handoffNoticeTrigger(handed, events)).toEqual({ ok: false, why: "whole_mail_handed_off" });
-    expect(await enqueueHandoffNotice({ caseId: mail.caseId, policy, env: () => NOTICE_ENV })).toMatchObject({ ok: false, code: "no_trigger", why: "whole_mail_handed_off" });
+    // The channel is back: both triggers give the same whole-mail notice (its own key), never the partial text.
+    const parts = teamPartNoticeTriggers(handed, events), latest = handoffNoticeTrigger(handed, events);
+    expect(parts).toHaveLength(1);
+    expect(latest).toMatchObject({ ok: true, reason: "team_part_handoff_unavailable", inputKey: parts[0]!.inputKey });
+    expect(parts[0]).toMatchObject({ reason: "team_part_handoff_unavailable", inputKey: `${before[0]!.inputKey}+whole-mail`,
+      report: { expectedIntervention: HANDOFF_WHOLE_MAIL_INTERVENTION, need: expect.stringMatching(/^Mail entier à reprendre \(3 demandes\), aucune réponse envoyée/) } });
+    expect(HANDOFF_WHOLE_MAIL_INTERVENTION).toMatch(/^Mail entier à reprendre, aucune réponse envoyée/);
+    expect(JSON.stringify(parts[0])).not.toContain(HANDOFF_TEAM_PART_INTERVENTION);
+    const first = await enqueueHandoffNotice({ caseId: mail.caseId, policy, env: () => NOTICE_ENV });
+    expect(first).toMatchObject({ ok: true, created: true });
+    expect(await enqueueHandoffNotice({ caseId: mail.caseId, policy, env: () => NOTICE_ENV })).toMatchObject({ ok: true, created: false, key: (first as { key: string }).key });
     expect(vi.mocked(fetch)).not.toHaveBeenCalled();
   });
   it("(2) the ticket stage is frozen only while the team part of the admission in force is unanswered: a person's reply ends it", async () => {

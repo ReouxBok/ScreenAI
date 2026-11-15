@@ -202,6 +202,13 @@ export function createHandoffNoticeDriver(deps: HandoffNoticeDriverDeps): PassDr
     const [later] = staleKinds.length ? await tx.select({ kind: savCaseEvents.kind }).from(savCaseEvents)
       .where(and(eq(savCaseEvents.caseId, caseId), gt(savCaseEvents.caseVersion, payload.facts.recordedAtVersion), inArray(savCaseEvents.kind, staleKinds))).limit(1) : [];
     if (later) return fault("CANCELLED_STALE_INPUT");
+    // Counter-review of 66e648a: a partial "team part" notice whose wait reached its bound never leaves (the whole mail went to the team, the agent sent
+    // nothing): the fixed whole-mail notice, under its own key, carries the case. The detail is encrypted: the transfer is found by its command key.
+    if (payload.facts.reason === "outside_active_blocks") {
+      const [whole] = await tx.select({ id: savCaseEvents.id }).from(savCaseEvents).where(and(eq(savCaseEvents.caseId, caseId), gt(savCaseEvents.caseVersion, recordedVersion),
+        eq(savCaseEvents.kind, "owner_changed"), like(savCaseEvents.dedupeKey, "cmd:team-part-wait-handoff-v%"))).limit(1);
+      if (whole) return fault("CANCELLED_WHOLE_MAIL_HANDED_OFF");
+    }
     // The lock waits above can cross the lease expiry: judged again against a clock read after the last of them.
     if (!await ownedExecution(tx, lease)) return fault("LEASE_LOST");
   }

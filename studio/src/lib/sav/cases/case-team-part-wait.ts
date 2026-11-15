@@ -28,7 +28,7 @@ export type CaseTeamPartWaitDetail = typeof SAV_CASE_TEAM_PART_WAIT_DETAILS[numb
 export type CaseTeamPartWait = Readonly<{ code: typeof SAV_CASE_TEAM_PART_WAIT_CODE; detail: CaseTeamPartWaitDetail; passes: number; since: string; lastAt: string; handedToTeam: string | null }>;
 
 const closedDetail = (value: string | undefined): CaseTeamPartWaitDetail => (SAV_CASE_TEAM_PART_WAIT_DETAILS as readonly string[]).includes(value ?? "") ? value as CaseTeamPartWaitDetail
-  : value && /^(no_record|no_decision|not_handoff|not_accepted|stale_input|taken_by_person|whole_mail_handed_off|input_other|key_conflict)$/.test(value) ? "trigger_refused" : "other";
+  : value && /^(no_record|no_decision|not_handoff|not_accepted|stale_input|taken_by_person|input_other|key_conflict)$/.test(value) ? "trigger_refused" : "other";
 
 function parse(meta: unknown): CaseTeamPartWait | null {
   const m = meta as Partial<Record<keyof CaseTeamPartWait, unknown>> | null;
