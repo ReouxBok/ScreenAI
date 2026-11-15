@@ -114,10 +114,9 @@ describe("binding: the first admissible thread only, atomically, bound to the ex
     const first = await thread([{}]), second = await thread([{}]);
     expect(await bindSavV2QualificationThread(env(), { messageId: first.ids[0]!, primaryContactId: CONTACT }, NOW)).toEqual({ allowed: true });
     expect(await bindSavV2QualificationThread(env(), { messageId: second.ids[0]!, primaryContactId: CONTACT }, NOW)).toEqual({ allowed: false, reason: "qualification_other_thread_bound" });
+    // Not gathered with the bound thread in one case: its messages and its own case are refused.
     expect(await savV2QualificationMessageAllowed(env(), second.ids[0]!, NOW)).toEqual({ allowed: false, reason: "qualification_other_thread" });
     expect(await savV2QualificationCaseAllowed(env(), await caseFor([second.threadId]), NOW)).toEqual({ allowed: false, reason: "qualification_other_thread" });
-    // A case that gathered a second thread is no longer the test exchange.
-    expect(await savV2QualificationCaseAllowed(env(), await caseFor([first.threadId, second.threadId]), NOW)).toEqual({ allowed: false, reason: "qualification_other_thread" });
   });
   it("two threads binding concurrently: exactly one wins", async () => {
     const threads = await Promise.all([thread([{}]), thread([{}]), thread([{}])]);
@@ -184,5 +183,53 @@ describe("owner at creation (creationOwnerForIntake): the only binder, after V2'
   it("outside qualification mode nothing changes: the port's answer is returned as before", async () => {
     const t = await thread([{ from: "anyone@example.invalid", subject: "Autre" }]);
     expect(await creationOwnerForIntake({ SAV_V2_ENTRY: "on", SAV_CASE_RECORDING: "on" }, { decision: decision(t.ids[0]!, "100000009"), signal })).toEqual({ assign: true, ownerId: "90000001" });
+  });
+});
+
+describe("multi-thread (15/11): a tester's new thread gathered in the test case", () => {
+  async function bound() {
+    const first = await thread([{}]);
+    expect(await bindSavV2QualificationThread(env(), { messageId: first.ids[0]!, primaryContactId: CONTACT }, NOW)).toEqual({ allowed: true });
+    return first;
+  }
+  it("a second thread of the tester, any subject, with an outbound reply: the case and the tester's message are allowed", async () => {
+    const first = await bound();
+    const second = await thread([{ subject: "Je n'arrive pas à me connecter", at: "2026-11-10T11:45:00.000Z" }, { direction: "outbound", from: "contact@example.invalid", subject: "Re: autre", at: "2026-11-10T11:46:00.000Z" },
+      { subject: "Re: autre", at: "2026-11-10T11:50:00.000Z" }]);
+    expect(await savV2QualificationCaseAllowed(env(), await caseFor([first.threadId, second.threadId]), NOW)).toEqual({ allowed: true });
+    expect(await savV2QualificationMessageAllowed(env(), second.ids[0]!, NOW)).toEqual({ allowed: true });
+    expect(await savV2QualificationMessageAllowed(env(), second.ids[2]!, NOW)).toEqual({ allowed: true });
+    // The outbound message itself is never one V2 acts on.
+    expect(await savV2QualificationMessageAllowed(env(), second.ids[1]!, NOW)).toEqual({ allowed: false, reason: "qualification_sender_mismatch" });
+    // The binding did not move: the initial subject still selects only the first thread.
+    const [row] = await f.db.select().from(savSyncState).where(eq(savSyncState.key, "sav-v2-qualification-thread.v1:q-syn-r1"));
+    expect(JSON.parse(row!.cursor!)).toMatchObject({ threadId: first.threadId });
+  });
+  it("a second thread with a foreign inbound sender: the case is refused, the foreign message too", async () => {
+    const first = await bound();
+    const second = await thread([{ subject: "Autre" }, { from: "colleague@example.invalid", subject: "Re: Autre", text: `De : ${SENDER}` }]);
+    expect(await savV2QualificationCaseAllowed(env(), await caseFor([first.threadId, second.threadId]), NOW)).toEqual({ allowed: false, reason: "qualification_foreign_thread" });
+    expect(await savV2QualificationMessageAllowed(env(), second.ids[1]!, NOW)).toEqual({ allowed: false, reason: "qualification_sender_mismatch" });
+    expect(await savV2QualificationMessageAllowed(env(), second.ids[0]!, NOW)).toEqual({ allowed: false, reason: "qualification_foreign_thread" });
+  });
+  it("a second thread opened before the window (even by the tester): refused", async () => {
+    const first = await bound();
+    const second = await thread([{ subject: "Ancien", at: "2026-11-10T10:59:59.000Z" }, { subject: "Re: Ancien", at: "2026-11-10T11:40:00.000Z" }]);
+    expect(await savV2QualificationCaseAllowed(env(), await caseFor([first.threadId, second.threadId]), NOW)).toEqual({ allowed: false, reason: "qualification_thread_outside_window" });
+    expect(await savV2QualificationMessageAllowed(env(), second.ids[1]!, NOW)).toEqual({ allowed: false, reason: "qualification_thread_outside_window" });
+  });
+  it("a second thread with no inbound message at all, or a case without the bound thread: refused", async () => {
+    const first = await bound();
+    const outboundOnly = await thread([{ direction: "outbound", from: "contact@example.invalid", subject: "Info" }]);
+    expect(await savV2QualificationCaseAllowed(env(), await caseFor([first.threadId, outboundOnly.threadId]), NOW)).toEqual({ allowed: false, reason: "qualification_foreign_thread" });
+    const a = await thread([{ subject: "A" }]), b = await thread([{ subject: "B" }]);
+    expect(await savV2QualificationCaseAllowed(env(), await caseFor([a.threadId, b.threadId]), NOW)).toEqual({ allowed: false, reason: "qualification_other_thread" });
+  });
+  it("open mode and a closed scope are unchanged for a multi-thread case, without touching the database", async () => {
+    expect(await savV2QualificationCaseAllowed({}, randomUUID(), NOW, noDb)).toEqual({ allowed: true });
+    expect(await savV2QualificationMessageAllowed({}, randomUUID(), NOW, noDb)).toEqual({ allowed: true });
+    const expired = env({ expiresAt: "2026-11-10T12:00:00.000Z" });
+    expect(await savV2QualificationCaseAllowed(expired, randomUUID(), NOW, noDb)).toEqual({ allowed: false, reason: "qualification_scope_expired" });
+    expect(await savV2QualificationMessageAllowed(expired, randomUUID(), NOW, noDb)).toEqual({ allowed: false, reason: "qualification_scope_expired" });
   });
 });

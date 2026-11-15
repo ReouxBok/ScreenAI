@@ -24,7 +24,10 @@ export async function loadCaseContinuationPoint(options: CaseContinuationOptions
   const { savV2QualificationCaseAllowed } = await import("./qualification-scope");
   const sendNow = options.sendNow === undefined ? await import("./v2-effects-binding").then(module => module.sendQueuedCaseReplyNow, () => null) : options.sendNow;
   return async ({ caseId, trigger, env, deadlineMs }) => {
-    if (env.SAV_V2_INVESTIGATION !== "observe") return { status: "investigation_off" };
+    if (env.SAV_V2_INVESTIGATION !== "observe") {
+      console.info("sav_v2_continuation_skipped", { caseId, reason: "investigation_off" });
+      return { status: "investigation_off" };
+    }
     const config = intakeExecutionConfig(env);
     if (!config) throw Error("SAV_V2_EXECUTION_POLICY_ABSENT");
     await readIntakeExecutionAuthority(config);
