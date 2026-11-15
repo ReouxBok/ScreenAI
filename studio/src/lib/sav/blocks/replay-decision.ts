@@ -169,7 +169,8 @@ export function savReplayStubProposal(request: CaseInvestigationModelRequest): u
   }
   const question = "Pouvez-vous nous décrire précisément ce qui s'affiche à l'écran au moment du blocage ?";
   return { caseVersion: request.caseVersion, understanding,
-    nextAction: { kind: "ask", questions: [{ text: question, requestId: open[0]?.id ?? "r1", reducesUncertainty: "Savoir où la demande bloque.", seeks: [{ kind: "observed_result" }] }] },
+    // SAV-92 review P2-3: the question covers every open request (the contract allows 4 questions at most).
+    nextAction: { kind: "ask", questions: (open.length ? open.slice(0, 4).map(row => row.id) : ["r1"]).map(requestId => ({ text: question, requestId, reducesUncertainty: "Savoir où la demande bloque.", seeks: [{ kind: "observed_result" }] })) },
     reply: { text: `Bonjour,\n\n${question}${link}`, citations: [], impossibilityClaims: [], accountAdvice: "none" } };
 }
 

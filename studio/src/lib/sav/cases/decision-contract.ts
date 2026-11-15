@@ -215,6 +215,7 @@ export const caseDecisionRejectionLabels = {
   access_source_orient_only: "Pilote accès : cette fiche sert seulement à orienter (décision en attente ou sujet sensible) ; pas de réponse autonome.",
   pilot_family_out_of_scope: "Pilote accès : seule la famille accès est admise ; une autre famille ordinaire sort du périmètre (une famille sensible impose la passation).",
   other_requests_open: "Résolution partielle : au moins une autre demande reste ouverte.",
+  proposal_request_uncovered: "La réponse laisse une demande ouverte sans la traiter : chaque demande ouverte doit être traitée, faire l'objet d'une question ou être remise à l'équipe.",
   resolution_evidence_invalid: "La confirmation de résolution ne s'appuie pas sur un retour valable du client indiquant que cela fonctionne.",
   resolution_quote_not_found: "La phrase du client citée comme preuve de résolution ne figure pas dans son message.",
   resolution_quote_unverifiable: "Le texte du message client cité n'a pas pu être lu : la résolution ne peut pas être vérifiée pour l'instant.",

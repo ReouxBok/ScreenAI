@@ -551,6 +551,15 @@ function validate(input: unknown, context: CaseDecisionValidationContext, now: D
     });
   }
 
+  // SAV-92 review P2-3: a reply covers EVERY request still open in the case. Each one is answered (`requestIds`), asked about (a question names it), or
+  // resolved with evidence in the same proposal; a team part is already `handed_off` by the admission (notice queued, fixed sentence appended), so it is
+  // not open here. Otherwise refused: nothing is sent, and the model can correct on its next turn.
+  if (action.kind === "answer" || action.kind === "ask") {
+    const covered = new Set(action.kind === "answer" ? action.requestIds : action.questions.map(question => question.requestId));
+    for (const request of context.requests)
+      if (request.status === "open" && status.get(request.id) !== "resolved" && !covered.has(request.id)) reject("proposal_request_uncovered", "nextAction", request.id);
+  }
+
   if (action.kind === "confirm_resolution") {
     unverified.add("resolution_semantics");
     action.requestIds.forEach((requestId, index) => {

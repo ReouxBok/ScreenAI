@@ -112,9 +112,9 @@ const answer = (request: CaseInvestigationModelRequest) => {
 };
 
 /** B's runner on A's stores; the qualification is the one the relay stored (the entry's reading is deterministic on the same run). */
-async function investigate(caseId: string) {
+async function investigate(caseId: string, model: typeof answer = answer) {
   const now = () => new Date(Date.now() + 6 * 60_000);
-  const provider = vi.fn(async (request: CaseInvestigationModelRequest) => answer(request));
+  const provider = vi.fn(async (request: CaseInvestigationModelRequest) => model(request));
   const ports = caseInvestigationStorePorts({
     readTicketOwner: async () => "v2", holder: "sav-v2-investigation", scope: { locale: "fr-FR", audience: "support" }, now, pauseState: async () => (await readSavAgentPause(f.db as never, "v2")).level,
     knowledge: snapshot => selectCaseKnowledge(snapshot, backend, { locale: "fr-FR", audience: "support", now: now() }),
@@ -232,6 +232,35 @@ describe("three requests of the active block: ONE decision, ONE reply", () => {
     expect(handoffNoticeTrigger((await readCase(mail.caseId))!, await listCaseEvents(mail.caseId))).toEqual({ ok: false, why: "not_handoff" });
     expect((await f.db.select().from(savCaseCalls).where(eq(savCaseCalls.caseId, mail.caseId)))).toHaveLength(1);
     expect(vi.mocked(fetch)).not.toHaveBeenCalled();
+  });
+});
+
+describe("SAV-92 review P2-3: a reply covers EVERY open request of the block, or nothing is sent", () => {
+  /** The reviewer's probe: the model answers the first open request only and forgets the other one. */
+  const firstOnly = (request: CaseInvestigationModelRequest) => {
+    const full = answer(request), first = full.output.nextAction.requestIds.slice(0, 1);
+    return { ...full, output: { ...full.output, nextAction: { ...full.output.nextAction, requestIds: first } } };
+  };
+  it("two Access requests, a reply on r0 only: refused with `proposal_request_uncovered` naming r1, and no reply to propose", async () => {
+    const mail = await v1Mail([{ id: "r0", kind: "support", quote: LOGIN_CODE }, { id: "r1", kind: "support", quote: LOGIN_LINK }]);
+    expect((await readCase(mail.caseId))!.body.openRequests.map(row => [row.id, row.status])).toEqual([[mail.id("r0"), "open"], [mail.id("r1"), "open"]]);
+    const { report } = await investigate(mail.caseId, firstOnly);
+    // The model gets its bounded correction turn, forgets r1 again: refused, nothing proposed.
+    expect(report).toMatchObject({ status: "recorded", outcome: "needs_review", refusal: { codes: ["proposal_request_uncovered"] } });
+    const recorded = (await listCaseEvents(mail.caseId)).filter(event => event.kind === "observation_recorded").at(-1)!;
+    const validation = (recorded.detail as { record: { decision: { validation: { outcome: string; rejections: Array<{ code: string; detail?: string }> } } } }).record.decision.validation;
+    expect(validation.outcome).toBe("needs_review");
+    expect(validation.rejections).toEqual([expect.objectContaining({ code: "proposal_request_uncovered", path: "nextAction", detail: mail.id("r1") })]);
+    // No accepted record, so no reply draft and nothing to propose or send.
+    expect(await recordOf(mail.caseId)).toBeNull();
+    expect(vi.mocked(fetch)).not.toHaveBeenCalled();
+  });
+  it("two Access requests, both covered by the reply: accepted, one reply proposal", async () => {
+    const mail = await v1Mail([{ id: "r0", kind: "support", quote: LOGIN_CODE }, { id: "r1", kind: "support", quote: LOGIN_LINK }]);
+    const { report } = await investigate(mail.caseId);
+    expect(report).toMatchObject({ status: "recorded", outcome: "accepted" });
+    expect((await recordOf(mail.caseId))!.decision!.validation).toMatchObject({ outcome: "accepted", decision: { nextAction: { kind: "answer", requestIds: [mail.id("r0"), mail.id("r1")] } } });
+    await oneReplyPerMail(mail);
   });
 });
 
