@@ -35,7 +35,7 @@ import { readCaseInvestigationProgress } from "./investigation-record";
 import { latestInvestigationInput, runCaseInvestigation, SAV_CASE_INVESTIGATION_MAX_CALLS, type CaseInvestigationModelRequest } from "./investigation-runner";
 import { caseInvestigationStorePorts } from "./investigation-store-ports";
 import { firstPersonalLoginRequest } from "./investigation-return-qualify";
-import { SAV_CASE_TEAM_PARTS_INSTRUCTION } from "./investigation-v2-providers";
+import { SAV_CASE_COVER_EVERY_REQUEST_INSTRUCTION, SAV_CASE_TEAM_PARTS_INSTRUCTION } from "./investigation-v2-providers";
 import { SAV_V2_BLOCK_SCOPES_ENV } from "./investigation-pilot-readers";
 import { SAV_CASE_BLOCK_SCOPE_REVISION } from "./investigation-access-scope";
 import { firstBlockEvidence } from "./v2-entry";
@@ -59,6 +59,8 @@ const CONFIRMED: CaseAdmissionQualification["identity"] = { status: "confirmed",
 const LOGIN_CODE = "Je ne reçois pas le code de connexion à mon compte.";
 const LOGIN_LINK = "Le lien de connexion envoyé à mon adresse ne fonctionne pas, je ne peux pas me connecter.";
 const LOGIN_AGAIN = "Je n'arrive plus à me connecter à mon compte depuis hier.";
+const LOGIN_MORNING = "Impossible de me connecter à la plateforme ce matin.";
+const LOGIN_ADDRESS = "Je n'arrive pas à me connecter avec mon adresse.";
 const DOCS = "Pouvez-vous m'envoyer la documentation générale ?";
 const BILLING = "Pouvez-vous rembourser ma dernière facture ?";
 type Req = { id: string; kind: string; quote: string };
@@ -183,6 +185,7 @@ afterEach(() => { vi.unstubAllEnvs(); vi.unstubAllGlobals(); vi.restoreAllMocks(
 describe("SAV-92 preconditions: the real Access detector reads each request's own words", () => {
   it("the three login requests are Access's, the documentation and billing requests are not", () => {
     expect([LOGIN_CODE, LOGIN_LINK, LOGIN_AGAIN, DOCS, BILLING].map(text => firstPersonalLoginRequest(text, ""))).toEqual([true, true, true, false, false]);
+    expect([LOGIN_MORNING, LOGIN_ADDRESS].map(text => firstPersonalLoginRequest(text, ""))).toEqual([true, true]);
     // Read as one mail, the whole-mail detector refuses a mail with another topic: that is why each request is read on its own.
     expect(firstPersonalLoginRequest(`${LOGIN_CODE} ${DOCS}`, "Plusieurs questions")).toBe(false);
   });
@@ -306,6 +309,28 @@ describe("two requests of the active block and one no block covers: ONE reply th
     expect(now.owner).toBe("agent");
     // The ticket is not moved to « attente client » while the team has its part.
     expect(stageAfterReply(now)).toEqual({ plan: false, reason: "team_part_pending" });
+    expect(vi.mocked(fetch)).not.toHaveBeenCalled();
+  });
+
+  it("counter-review of 66e648a: 5 open requests of the block: the first 4 stay the agent's, the 5th is the team's (`request_limit`) with the mention and the notice", async () => {
+    const quotes = [LOGIN_CODE, LOGIN_LINK, LOGIN_AGAIN, LOGIN_MORNING, LOGIN_ADDRESS];
+    const mail = await v1Mail(quotes.map((quote, index) => ({ id: `r${index}`, kind: "support", quote })));
+    const stored = (await readCase(mail.caseId))!;
+    expect(stored.owner).toBe("agent");
+    expect(stored.body.openRequests.map(row => [row.id, row.status])).toEqual([0, 1, 2, 3, 4].map(index => [mail.id(`r${index}`), index < 4 ? "open" : "handed_off"]));
+    expect(stored.admission!.qualification.requests.find(row => row.requestId === mail.id("r4"))!.provenance).toMatchObject({ kind: "team_part", reason: "request_limit" });
+    const { report, provider } = await investigate(mail.caseId);
+    expect(report).toMatchObject({ status: "recorded", outcome: "accepted", modelCalls: 1 });
+    const { caseInvestigationPrompt } = await import("./investigation-v2-providers");
+    expect(caseInvestigationPrompt(provider.mock.calls[0]![0] as never).instruction).toContain(SAV_CASE_COVER_EVERY_REQUEST_INSTRUCTION);
+    const record = (await recordOf(mail.caseId))!;
+    expect(record.decision!.validation).toMatchObject({ outcome: "accepted", decision: { nextAction: { kind: "answer", requestIds: [0, 1, 2, 3].map(index => mail.id(`r${index}`)) } } });
+    expect((record.decision!.validation as { decision: { reply: { text: string } } }).decision.reply.text.endsWith(`\n\n${SAV_CASE_TEAM_PART_MENTION}`)).toBe(true);
+    const notice = handoffNoticeTrigger((await readCase(mail.caseId))!, await listCaseEvents(mail.caseId));
+    expect(notice).toMatchObject({ ok: true, reason: "outside_active_blocks", report: { expectedIntervention: HANDOFF_TEAM_PART_INTERVENTION } });
+    const need = (notice as { report: { need: string } }).report.need;
+    expect(need).toContain(LOGIN_ADDRESS);
+    for (const quote of quotes.slice(0, 4)) expect(need).not.toContain(quote);
     expect(vi.mocked(fetch)).not.toHaveBeenCalled();
   });
 

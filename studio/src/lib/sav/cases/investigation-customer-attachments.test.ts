@@ -11,7 +11,9 @@ import {
 import { caseAttachmentMediaMode, readCaseCustomerAttachments, type CaseStoredMail } from "./investigation-customer-attachments-reader";
 import { buildCaseCustomerContext, reduceCaseCustomerContext, type CaseCustomerContext } from "./investigation-customer-context";
 import type { CaseInvestigationModelRequest } from "./investigation-runner";
-import { caseInvestigationPrompt, caseInvestigationPromptRevision, prepareCaseGeminiDecisionRequest, SAV_CASE_INVESTIGATION_PROMPT_REVISION } from "./investigation-v2-providers";
+import {
+  caseInvestigationPrompt, caseInvestigationPromptRevision, prepareCaseGeminiDecisionRequest, SAV_CASE_COVER_EVERY_REQUEST_INSTRUCTION, SAV_CASE_INVESTIGATION_PROMPT_REVISION,
+} from "./investigation-v2-providers";
 
 /* SAV-92 (15/11): the V2 decision model receives the customer's attachments (screenshots first). SYN data only. */
 
@@ -77,6 +79,18 @@ describe("evidence and the screenshot-or-link rule", () => {
     expect(caseInvestigationPromptRevision(caseAttachmentMediaMode({}) !== "off")).toBe("sav-v2-investigation-prompt-2026-11-14.v4");
     expect(caseInvestigationPromptRevision(caseAttachmentMediaMode({ SAV_V2_ATTACHMENT_MEDIA: "unknown" }) !== "off")).toBe("sav-v2-investigation-prompt-2026-11-14.v4");
     expect(caseInvestigationPromptRevision(caseAttachmentMediaMode({ SAV_V2_ATTACHMENT_MEDIA: "images" }) !== "off")).toBe(SAV_CASE_INVESTIGATION_PROMPT_REVISION);
+  });
+  it("counter-review of 66e648a: the « cover every open request » instruction is sent from 2 open requests only; with 1 the instruction is the v4 one, unchanged", () => {
+    const row = (id: string, status = "open") => ({ id, summary: "Demande synthétique.", family: "access", status, openedAt: "2026-11-15T09:00:00.000Z" });
+    const withRequests = (...rows: ReturnType<typeof row>[]) => caseInvestigationPrompt(request({ snapshot: { version: 1, body: { openRequests: rows, facts: [], questions: [], trials: [] } } as never })).instruction;
+    const none = withRequests(), one = withRequests(row("r1")), resolvedToo = withRequests(row("r1"), row("r0", "resolved")), two = withRequests(row("r1"), row("r2"));
+    expect(SAV_CASE_COVER_EVERY_REQUEST_INSTRUCTION).toMatch(/^Couvre chaque demande ouverte de openRequests : réponds-y, pose la question qui la débloque, ou remets-la à l'équipe\./);
+    expect(one).not.toContain(SAV_CASE_COVER_EVERY_REQUEST_INSTRUCTION);
+    expect(one).toBe(none);
+    // Only OPEN requests count: one open plus a resolved one is still the single-request prompt.
+    expect(resolvedToo).toBe(one);
+    expect(two).toContain(SAV_CASE_COVER_EVERY_REQUEST_INSTRUCTION);
+    expect(two.replace(SAV_CASE_COVER_EVERY_REQUEST_INSTRUCTION, "").replace(/\n\n+/g, "\n")).toBe(one.replace(/\n\n+/g, "\n"));
   });
 });
 

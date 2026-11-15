@@ -18,7 +18,7 @@ import { admissionPolicyPort, admissionPolicyRevisionPort, qualifyTicketIdentity
 import { savCaseRecordingEnabled, v1IntentHash, type CaseTx } from "./case-store";
 import { caseIdsStillHeldByBlock, markCaseBlockHold } from "./case-block-hold";
 import { settleCaseTeamPartWait, SAV_CASE_TEAM_PART_WAIT_CODE } from "./case-team-part-wait";
-import { caseDedupeKey, SAV_CASE_ACCESS_BLOCK_ID, type CaseAdmissionQualification, type CaseTeamPartReason } from "./case-types";
+import { caseDedupeKey, SAV_CASE_ACCESS_BLOCK_ID, SAV_CASE_AGENT_REQUESTS_PER_MAIL, type CaseAdmissionQualification, type CaseTeamPartReason } from "./case-types";
 import { readCaseAccessScope } from "./investigation-access-scope";
 import { caseAccessScopeConfigReader } from "./investigation-pilot-readers";
 import { routeCustomerReturn, type CustomerReturnDeps } from "./customer-return-store";
@@ -152,6 +152,14 @@ async function multiRequestEvidence(env: Env, messageId: string, gmailMessageId:
     const blockOf = (row: CaseAdmissionQualification["requests"][number]) => row.provenance.kind === "qualified_rule" ? caseRuleBlockId({ family: row.family as CaseEntryRule["family"], blockId: row.provenance.blockId }) : null;
     const moved = admitted.filter(row => restricted.has(blockOf(row) ?? ""));
     if (moved.length) result = [...admitted.filter(row => !moved.includes(row)), ...parts, ...moved.map(row => teamPart(row.requestId, "block_switch_restricted"))];
+  }
+  // Counter-review of 66e648a: one reply covers every request the agent keeps, and an `ask` holds at most 4 questions. Beyond that, the extra requests (in the
+  // mail's order) are the team's, with the notice, rather than a decision refused for leaving them uncovered.
+  const kept = result.filter(row => row.provenance.kind !== "team_part");
+  if (kept.length > SAV_CASE_AGENT_REQUESTS_PER_MAIL) {
+    const over = kept.slice(SAV_CASE_AGENT_REQUESTS_PER_MAIL);
+    console.info("sav_v2_entry_request_limit", { messageId, kept: SAV_CASE_AGENT_REQUESTS_PER_MAIL, toTeam: over.length });
+    result = [...result.filter(row => !over.includes(row)), ...over.map(row => teamPart(row.requestId, "request_limit"))];
   }
   // SAV-92 (review of batch 2, finding 1): a team part is only ever left to the team through its notice. No notice channel configured, nobody is admitted and
   // the WHOLE mail stays with the team, as before multi-request mails: the customer is never told « transmis à notre équipe » with nothing reaching the team.

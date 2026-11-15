@@ -252,8 +252,13 @@ export type CaseAdmissionPolicy = z.infer<typeof caseAdmissionPolicySchema>;
  * the request's own words as its request; `ambiguous_block`: two blocks (or one configured twice) claim it; `block_scope_unavailable`: its block has no valid scope
  * for the policy in force; `not_support`: V1 did not classify it as support (commercial, partnership, other...); `request_text_unavailable`: no verified quote of
  * the request is stored, so no detector can read it. `block_switch_restricted` (SAV-92 multi-block): its block's switch is stricter than another block's
- * of the same mail (`planCaseMultiBlockModes`), so the one reply is not held back by it: that request is the team's. */
-export const SAV_CASE_TEAM_PART_REASONS = ["no_block_match", "ambiguous_block", "block_scope_unavailable", "not_support", "request_text_unavailable", "block_switch_restricted"] as const;
+ * of the same mail (`planCaseMultiBlockModes`), so the one reply is not held back by it: that request is the team's. `request_limit` (counter-review of
+ * 66e648a): the mail holds more requests the agent could answer than one reply covers (`SAV_CASE_AGENT_REQUESTS_PER_MAIL`, the contract's 4 questions):
+ * the first ones stay the agent's, the others are the team's, instead of a decision the validator would refuse for leaving them uncovered. */
+export const SAV_CASE_TEAM_PART_REASONS = ["no_block_match", "ambiguous_block", "block_scope_unavailable", "not_support", "request_text_unavailable", "block_switch_restricted",
+  "request_limit"] as const;
+/** The most requests of one mail the agent keeps: an `ask` carries at most 4 questions (decision-contract), and every open request must be covered. */
+export const SAV_CASE_AGENT_REQUESTS_PER_MAIL = 4;
 export type CaseTeamPartReason = typeof SAV_CASE_TEAM_PART_REASONS[number];
 export const caseAdmissionProvenanceSchema = z.discriminatedUnion("kind", [
   z.object({ kind: z.literal("human"), staffUserId: staffId, at }).strict(),
