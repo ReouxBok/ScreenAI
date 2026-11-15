@@ -12,6 +12,7 @@ import { assertSavLearningAdmitted } from "@/lib/sav/learning-origin";
 import { assertSavCrmLearningSource } from "@/lib/sav/learning-source";
 import { assertKnowledgeCandidateReview, assertKnowledgeUgoApproval, canonicalKnowledgeSchema, semanticStepSchema, type CanonicalKnowledge } from "./contracts";
 import { assertSafeKnowledgeDraft, assertSafeOnboardingKnowledge } from "./onboarding-extraction";
+import { savCardCompletenessChecks, savCardCompletenessMessages, savCardVersionValidityChecks } from "./card-checks";
 import { inheritedTemporaryIncident } from "./temporary-incidents-read";
 import { savQualifiedProjectionBody as savProjectionBody } from "./conversion";
 import { knowledgeComparisonInventory, prepareHubspotReview } from "./hubspot-import";
@@ -168,8 +169,10 @@ export async function saveSavKnowledgeProposal(raw: SaveSavKnowledgeProposalInpu
   };
   return transaction ? persist(transaction) : requireDb().transaction(persist);
 }
+// SAV-92: the same rules as "Vérifier ma fiche" (card-checks.ts), same wording; a validity date already past now blocks here too.
 function completeness(document: CanonicalKnowledge, sources: SavKnowledgeSource[], reason: string) {
-  return [!canonicalKnowledgeSchema.safeParse(document).success && "Compléter l’objectif, les intitulés et les instructions des étapes.", !sources.length && "Ajouter au moins une source de preuve.", reason.trim().length < 10 && "Expliquer le motif de la proposition.", !document.steps.length && "Décrire la procédure.", !document.expectedResult && "Préciser le résultat attendu.", !document.prerequisites.length && "Préciser les conditions d’utilisation.", !document.escalation && "Préciser les limites et le passage à un humain.", document.steps.some((step) => !step.expectedResult) && "Préciser le résultat observable de chaque étape."].filter((value): value is string => Boolean(value));
+  return savCardCompletenessMessages([...savCardCompletenessChecks(document, sources, reason, canonicalKnowledgeSchema.safeParse(document).success),
+    ...savCardVersionValidityChecks(document, new Date()).filter(check => check.severity === "error")]);
 }
 async function draftPreview(draft: typeof savKnowledgeProposalDrafts.$inferSelect, db: Db = requireDb(), lock = false) {
   const target = await targetState(draft.targetItemId, db);

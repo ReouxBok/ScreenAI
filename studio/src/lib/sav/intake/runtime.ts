@@ -24,7 +24,7 @@ import { intakeTransientFailure, SAV_INTAKE_ANALYSIS_TIMING, SAV_INTAKE_DETERMIN
 import { readSavAgentPause } from "./agent-pause";
 import { requireDb } from "@/db";
 import { createSavIntakeHubspotReaders } from "./hubspot-readers";
-import { createSavIntakeSemanticReaders } from "./model-readers";
+import { createSavIntakeSemanticReaders, type IntakeValidatedEvidence } from "./model-readers";
 import { createSavIntakeSimpleReaders, memoizeIntakeCrmReaders, SAV_INTAKE_SIMPLE_REVISION } from "./simple-readers";
 import { withSavAiBudget } from "../gemini-transport";
 import { observeSavOther, readSavOtherConfiguration } from "../other-observation";
@@ -74,6 +74,8 @@ async function analyseSavIntakeRuntimeWithinBudget(runId: string, config: Intake
   if (pipeline === "simple") payload.semantics!.validatorRevision = SAV_INTAKE_SIMPLE_REVISION;
   payload.readRecovery = lease.recoveringRead ? structuredClone(previous.readRecovery!) : newReadRecovery(config,lease.sourceHash);
   if (lease.recoveringRead) { payload.semantics=structuredClone(previous.semantics!);payload.attachments=structuredClone(previous.attachments); }
+  // SAV-92: a recovered read reuses the accepted analysis, so it keeps the request quotes captured with it.
+  if (lease.recoveringRead && previous.requestQuotes) payload.requestQuotes = structuredClone(previous.requestQuotes);
   const live = async () => {
     const current = savIntakeRuntimeConfig(env());
     if (!current || current.configHash !== config.configHash || controller.signal.aborted) throw Error("SAV_INTAKE_RUNTIME_CONTEXT_CHANGED");
@@ -166,7 +168,7 @@ async function analyseSavIntakeRuntimeWithinBudget(runId: string, config: Intake
       attachments.state.read = { ...attachments.state.read, observations, state: "complete", completedAt: new Date().toISOString() };
       payload.attachments = attachments.state;
       checkpoint();
-    } } } : {}), model: config.model, call, provenance: lease.provenance, onTrace: trace => {
+    } } } : {}), model: config.model, call, provenance: lease.provenance, onValidatedEvidence: evidence => captureRequestQuotes(payload, evidence), onTrace: trace => {
       semanticFailureReason = trace.errorCode ?? undefined;
       if (trace.budgetLimit) readerBudgetLimit = trace.budgetLimit;
       traces.push(trace); checkpoint();
@@ -284,4 +286,19 @@ function attachmentFailureReason(reason:string|undefined,uncertain:boolean):impo
   if(reason?.includes("TIMEOUT"))return "timeout";
   if(reason?.includes("CONTEXT")||reason?.includes("REVALIDATION"))return "context_changed";
   return reason?"provider_failed":"context_incomplete";
+}
+
+/** SAV-92: the request quotes of the current reader's validated analysis, kept beside the accepted record (the reader drops them before the engine). Passive:
+ * a malformed value captures nothing, and the latest validated analysis of the message wins (a repair replaces an earlier answer). Inherited requests are
+ * not kept: their words belong to an older message. */
+function captureRequestQuotes(payload: IntakeRuntimePayload, evidence: IntakeValidatedEvidence) {
+  if (evidence.reader !== "current" || evidence.kind !== "analysis") return;
+  const value = evidence.value as { messageId?: unknown; requests?: unknown } | null;
+  if (!value || typeof value.messageId !== "string" || !Array.isArray(value.requests)) return;
+  const requests = value.requests.flatMap(row => {
+    const request = row as { id?: unknown; quote?: unknown; originMessageId?: unknown } | null;
+    return request && typeof request.id === "string" && typeof request.quote === "string" && request.quote.trim() && request.originMessageId === undefined
+      ? [{ id: request.id, quote: request.quote }] : [];
+  });
+  payload.requestQuotes = { messageId: value.messageId, requests };
 }

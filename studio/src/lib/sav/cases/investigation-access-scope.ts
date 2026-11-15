@@ -133,3 +133,22 @@ export function caseAccessSourceProblem(scope: CaseBlockScope | null, ref: { kno
   if (listed.contentVersionId !== ref.contentVersionId) return "access_source_version_out_of_scope";
   return listed.use === "answer" ? null : "access_source_orient_only";
 }
+
+/**
+ * SAV-92 (multi-block): the scopes in force for a recorded decision. One block: the scope of the block its stamp names (Access when none), exactly as before.
+ * Several blocks (`blockScopes` recorded): every one of them read now; any one unreadable or missing is the decision's problem (nothing proven, nothing sent).
+ */
+export async function readCaseDecisionScopes(port: () => Promise<unknown>, policyRevision: string | null,
+  recorded: Readonly<{ accessScope?: CaseAccessScopeStamp; blockScopes?: readonly CaseAccessScopeStamp[] }> | null | undefined):
+  Promise<{ ok: true; scope: CaseBlockScope; blocks: CaseBlockScope[] | null } | { ok: false; problem: CaseAccessScopeReadProblem }> {
+  const primary = await readCaseAccessScope(port, policyRevision, caseStampBlockId(recorded?.accessScope));
+  if (!primary.ok) return primary;
+  if (!recorded?.blockScopes) return { ok: true, scope: primary.scope, blocks: null };
+  const blocks: CaseBlockScope[] = [];
+  for (const stamp of recorded.blockScopes) {
+    const read = await readCaseAccessScope(port, policyRevision, caseStampBlockId(stamp));
+    if (!read.ok) return read;
+    blocks.push(read.scope);
+  }
+  return { ok: true, scope: primary.scope, blocks };
+}

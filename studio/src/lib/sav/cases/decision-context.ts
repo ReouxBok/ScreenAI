@@ -1,6 +1,6 @@
 import type { SavRetrievalCandidate } from "../request-retrieval";
 import {
-  caseBodySchema, currentCaseFacts, SAV_CASE_CONTRACT_REVISION, SAV_CASE_EVENT_KIND_DIRECTIONS,
+  caseBodySchema, caseTeamPartRequests, currentCaseFacts, SAV_CASE_CONTRACT_REVISION, SAV_CASE_EVENT_KIND_DIRECTIONS,
   type CaseEvent, type CaseSnapshot, type SourceRef,
 } from "./case-types";
 import type { CaseAdmissionStatus } from "./admission-policy";
@@ -74,6 +74,7 @@ export function buildCaseDecisionContext(input: CaseDecisionContextInput): CaseD
   const humanSince = body.data.handoff?.humanSince;
   if (humanSince && !handoffs.some(row => row.at === humanSince)) handoffs.push({ at: humanSince, order: null });
 
+  const teamParts = caseTeamPartRequests({ admission: snapshot.admission, body: body.data });
   return { ok: true, context: {
     caseId: snapshot.caseId, caseVersion: snapshot.version, owner: snapshot.owner, admission: input.admission,
     locale: input.locale, audience: input.audience,
@@ -87,5 +88,7 @@ export function buildCaseDecisionContext(input: CaseDecisionContextInput): CaseD
     handoffs,
     knowledge: input.knowledge,
     coverage: input.coverage ?? null,
+    // SAV-92: only when part of the mail is the team's, so every other context keeps its exact shape.
+    ...(teamParts.length ? { teamParts: teamParts.map(row => ({ id: row.id })) } : {}),
   } };
 }

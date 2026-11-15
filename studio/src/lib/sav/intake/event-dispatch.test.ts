@@ -348,8 +348,9 @@ it.each(["pending", "observed", "admitted"] as const)("recovery skips more than 
   const eligible = [id];
   for (let n = 0; n < 5; n++) {
     const thread = (await f.db.insert(savThreads).values({ mailboxId, gmailThreadId: randomUUID(), customerEmail: customer }).returning())[0];
-    const message = await storedMessage(thread.id);
+    // Deterministic order: each copy's mail is received and stored 1 ms after the previous one (no wall-clock ties under load).
     const at = new Date(now.getTime() + n + 1);
+    const message = await storedMessage(thread.id, { at, createdAt: at });
     const copy = (await f.db.insert(savIntakeRuns).values({ ...source, id: randomUUID(), threadId: thread.id, messageId: message.id, createdAt: at, updatedAt: at }).returning())[0];
     eligible.push(copy.id);
     if (execution) await f.db.insert(savIntakeExecutions).values({ ...execution, id: randomUUID(), runId: copy.id, threadId: thread.id, messageId: message.id, createdAt: at, updatedAt: at });

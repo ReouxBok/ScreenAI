@@ -12,7 +12,7 @@ import type { CaseBody, CaseTrial, SourceRef } from "./case-types";
 import { maskCaseCustomerText } from "./investigation-customer-context";
 
 export const CASE_HANDOFF_SUMMARY_REVISION = "sav-v2-handoff-summary-2026-11-14.v1";
-export const CASE_HANDOFF_SUMMARY_LIMITS = { problemChars: 400, questions: 5, questionChars: 200, answerChars: 240, trials: 5, trialResultChars: 160, linkHosts: 3, totalChars: 2400 } as const;
+export const CASE_HANDOFF_SUMMARY_LIMITS = { problemChars: 400, questions: 5, questionChars: 200, answerChars: 240, trials: 5, trialResultChars: 160, linkHosts: 3, receivedFiles: 6, receivedNameChars: 80, totalChars: 2400 } as const;
 
 export type CaseHandoffSummary = Readonly<{
   revision: typeof CASE_HANDOFF_SUMMARY_REVISION;
@@ -22,6 +22,8 @@ export type CaseHandoffSummary = Readonly<{
   transmitted: Readonly<{ attachments: number; links: number; linkHosts: readonly string[] }>;
   tried: ReadonlyArray<Readonly<{ knowledgeId: string; outcome: CaseTrial["outcome"]; result: string | null }>>;
   triedOmitted: number;
+  /** SAV-92 (15/11): the files received on the case's stored mails (masked name, type, size; never content). Absent when not read. */
+  received?: Readonly<{ files: ReadonlyArray<Readonly<{ name: string; type: string; sizeKb: number }>>; omitted: number }>;
 }>;
 
 const cut = (value: string, max: number) => value.length <= max ? value : `${value.slice(0, Math.max(0, max - 1)).trimEnd()}…`;
@@ -31,7 +33,8 @@ const URL = /\bhttps?:\/\/([A-Za-z0-9.-]{1,120})(?::\d+)?(?:[/?#][^\s<>"']*)?/gi
 const KNOWLEDGE_ID = /^[A-Za-z0-9._-]{1,80}$/;
 
 /** The synthesis of the stored case, masked and bounded. Never throws on a valid body. */
-export function buildCaseHandoffSummary(input: Partial<Pick<CaseBody, "openRequests" | "facts" | "questions" | "trials">>): CaseHandoffSummary {
+export function buildCaseHandoffSummary(input: Partial<Pick<CaseBody, "openRequests" | "facts" | "questions" | "trials">>,
+  received?: Readonly<{ files: ReadonlyArray<Readonly<{ name: string; type: string; sizeKb: number }>>; omitted: number }> | null): CaseHandoffSummary {
   const L = CASE_HANDOFF_SUMMARY_LIMITS;
   // A partial body (an older caller) reads as empty lists, never as a crash.
   const body = { openRequests: input.openRequests ?? [], facts: input.facts ?? [], questions: input.questions ?? [], trials: input.trials ?? [] };
@@ -66,7 +69,9 @@ export function buildCaseHandoffSummary(input: Partial<Pick<CaseBody, "openReque
     result: trial.result ? clean(trial.result.text, L.trialResultChars) : null,
   }));
   return { revision: CASE_HANDOFF_SUMMARY_REVISION, problem, exchanges, exchangesOmitted: Math.max(0, asked.length - exchanges.length),
-    transmitted: { attachments, links, linkHosts: hosts.slice(0, L.linkHosts) }, tried, triedOmitted: Math.max(0, body.trials.length - tried.length) };
+    transmitted: { attachments, links, linkHosts: hosts.slice(0, L.linkHosts) }, tried, triedOmitted: Math.max(0, body.trials.length - tried.length),
+    ...(received?.files.length ? { received: { files: received.files.slice(0, L.receivedFiles).map(file => ({ name: clean(file.name, L.receivedNameChars), type: file.type, sizeKb: file.sizeKb })),
+      omitted: received.omitted + Math.max(0, received.files.length - L.receivedFiles) } } : {}) };
 }
 
 const OUTCOME: Record<CaseTrial["outcome"], string> = { pending: "en attente de retour du client", failed: "échec", succeeded: "réussie", unknown: "résultat inconnu" };
@@ -89,6 +94,10 @@ export function caseHandoffSummaryLines(summary: CaseHandoffSummary, reasonLabel
   const { attachments, links, linkHosts } = summary.transmitted;
   lines.push(`• Éléments transmis : ${attachments ? `${attachments} pièce(s) jointe(s) ou capture(s) d'écran` : "aucune capture d'écran ni pièce jointe"}, ${links
     ? `${links} lien(s)${linkHosts.length ? ` (${linkHosts.join(", ")})` : ""}` : "aucun lien"}`);
+  if (summary.received?.files.length) {
+    const size = (kb: number) => kb >= 1024 ? `${(kb / 1024).toFixed(1).replace(".", ",")} Mo` : `${kb} Ko`;
+    lines.push(`• Pièces reçues : ${summary.received.files.map(file => `${clean(file.name, L.receivedNameChars)} (${file.type}, ${size(file.sizeKb)})`).join(" ; ")}${summary.received.omitted ? ` ; et ${summary.received.omitted} autre(s)` : ""}`);
+  }
   if (!summary.tried.length) lines.push("• Essais : aucun");
   for (const trial of summary.tried) lines.push(`• Essai ${trial.knowledgeId} : ${OUTCOME[trial.outcome]}${trial.result ? ` (${clean(trial.result, L.trialResultChars)})` : ""}`);
   if (summary.triedOmitted) lines.push(`• et ${summary.triedOmitted} essai(s) plus ancien(s)`);

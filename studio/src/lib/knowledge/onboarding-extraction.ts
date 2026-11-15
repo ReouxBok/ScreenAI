@@ -3,6 +3,7 @@ import type { OnboardingMetadata } from "@/db/schema";
 import { canonicalKnowledgeSchema, type CanonicalKnowledge, type SemanticStep, type OnboardingSourceSection } from "./contracts";
 import { onboardingSectionsBody, onboardingSectionsQualified } from "./onboarding-sections";
 import { redactSavLearningText } from "@/lib/sav/learning-extraction";
+import { hasUnsafeSavCardText, savCardTextProblems, secretAssignmentPattern as secretAssignment, type SavCardTextProblem } from "./card-safety";
 
 export type OnboardingKnowledgePreparation = {
   title: string;
@@ -14,10 +15,7 @@ export type OnboardingKnowledgePreparation = {
 
 type Section = { heading: string; key: string; lines: string[]; level?: number; omittedCode?: boolean };
 const normalize = (value: string) => value.normalize("NFD").replace(/[\u0300-\u036f]/g, "").toLowerCase().replace(/[’]/g, "'").trim();
-const technical = /(?:querySelector|data-testid|data-test-id|nth-child|testId\s*[:=]|domId\s*[:=]|selector\s*[:=]|sélecteur\s*[:=]|\bDOM\b|\b(?:xpath|css selector)\b|\b(?:coordinates|coordonnées)\s*[:=]|\b[xy]\s*[:=]\s*-?\d|\b(?:GET|POST|PUT|PATCH|DELETE)\s+\/)/i;
 const technicalHeading = /rep[eè]res techniques|donn[eé]es techniques|cibles? techniques?|d[eé]tails? (?:dom|techniques)|^dom$|s[eé]lecteurs?/i;
-const secretAssignment = /\b(?:bearer|api[_ -]?key|token|password|mot de passe)["']?\s*[:=]\s*(?:"[^"\n]*"|'[^'\n]*'|[^\s,;}]+)/i;
-const explicitCssSelector = /\b(?:s[eé]lecteur\s+CSS|CSS\s+selector|class(?:Name)?\s*[:=])/i;
 const generic = /ouvrir la fiche de l['’][eé]l[eé]ment exact|s[eé]lectionner l['’]action destructive demand[eé]e|ouvrir le catalogue des int[eé]grations et rechercher le fournisseur demand[eé]|s[eé]lectionner la bonne carte|identifier l['’]organisation, l['’]espace et l['’]objet recherch[eé]s|inspecter les contr[oô]les visibles et s[eé]lectionner l['’]objet exact|le r[eé]sultat de [«“"][^»”"]+[»”"] est visible dans Limova apr[eè]s r[eé]inspection|ouvrir la section correspondant [àa]|ouvrir la section indiqu[eé]e|choisir l['’]action correspondant [àa]|recueillir les valeurs obligatoires visibles|le parcours d[eé]montr[eé] est termin[eé]|ouvrir la liste concern[eé]e|s[eé]lectionner l['’][eé]l[eé]ment exact [àa] modifier|r[eé]aliser l['’]action attendue|v[eé]rifier que le r[eé]sultat correspond [àa] la demande|effectuer les (?:actions|modifications) n[eé]cessaires|action [àa] (?:confirmer|compl[eé]ter)|r[eé]sultat (?:de cette [eé]tape )?[àa] confirmer|contr[oô]le observ[eé]|^\s*(?:clic|click|button|div|span|scroll|d[eé]filement)\s*$/i;
 const truncation = /(?:\.{3}|…)\s*$/;
 const knownHeading = /^(?:objectif|quand utiliser ce parcours|point d['’]entr[eé]e|pr[eé]requis|questions [àa] poser si l['’]information manque|[eé]tapes op[eé]rationnelles|v[eé]rification de r[eé]ussite|variantes et blocages|reprise s[uû]re|d[eé]monstration|rep[eè]res techniques appris)\s*:?$/i;
@@ -333,13 +331,15 @@ export function prepareOnboardingKnowledge(input: {
 }
 
 
+// SAV-92: the rules live in card-safety.ts, where each one is named; an official link (allowlist) is no longer refused.
 function hasUnsafeKnowledgeText(value: string) {
-  return redactSavLearningText(value) !== value.trim()
-    || /\b(?:https?:\/\/|www\.)\S+|\b[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}\b|<[^>]+>|\beyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+|\b[A-Z]{2}\d{2}(?:[ ]?[A-Z0-9]){11,30}\b/i.test(value)
-    || secretAssignment.test(value) || /\+\d{1,3}(?:[ .-]?\d){7,14}\b/i.test(value)
-    || /(?:^|\s)\/[a-z][a-z0-9/_?=&.-]*(?:\s|$)|(?:^|[\s('"«])#[a-z][\w-]*|\[(?:data-|aria-)[^\]]+\]|\b(?:document|window)\.[a-z]+|\bjavascript\s*:|\b(?:coordonn[eé]es|coordinates)\s*:?\s*\(?\d+\s*[,;]\s*\d+/i.test(value)
-    || /^(?:nom du client|client|contact|adresse|identifiant|email)\s*:/i.test(value)
-    || technical.test(value) || explicitCssSelector.test(value);
+  return hasUnsafeSavCardText(value);
+}
+
+/** One refused field: its path in the document (e.g. `steps.0.instruction`) and every reason. The message stays the former code. */
+export type SavCardUnsafeField = Readonly<{ path: string; problems: SavCardTextProblem[] }>;
+export class SavCardUnsafeContentError extends Error {
+  constructor(readonly fields: SavCardUnsafeField[]) { super("ONBOARDING_KNOWLEDGE_UNSAFE_CONTENT"); this.name = "SavCardUnsafeContentError"; }
 }
 
 /** Re-check the semantic allowlist after a human edit; this is not publication approval. */
@@ -349,11 +349,19 @@ export function assertSafeOnboardingKnowledge(document: CanonicalKnowledge): voi
 
 /** Drafts keep the same privacy check while their procedure is still incomplete. */
 export function assertSafeKnowledgeDraft(document: CanonicalKnowledge): void {
-  const inspect = (value: unknown): void => {
+  const fields = unsafeKnowledgeDraftFields(document);
+  if (fields.length) throw new SavCardUnsafeContentError(fields);
+}
+
+/** Every refused field of a draft at once (same walk as the save check), for "Vérifier ma fiche" and for a precise save error. */
+export function unsafeKnowledgeDraftFields(document: CanonicalKnowledge): SavCardUnsafeField[] {
+  const fields: SavCardUnsafeField[] = [];
+  const inspect = (value: unknown, path: string): void => {
     if (typeof value === "string") {
-      if (hasUnsafeKnowledgeText(value)) throw new Error("ONBOARDING_KNOWLEDGE_UNSAFE_CONTENT");
-    } else if (Array.isArray(value)) value.forEach(inspect);
-    else if (value && typeof value === "object") Object.entries(value).forEach(([key, child]) => { if (key !== "id") inspect(child); });
+      const problems = savCardTextProblems(value);
+      if (problems.length) fields.push({ path, problems });
+    } else if (Array.isArray(value)) value.forEach((child, index) => inspect(child, path ? `${path}.${index}` : String(index)));
+    else if (value && typeof value === "object") Object.entries(value).forEach(([key, child]) => { if (key !== "id") inspect(child, path ? `${path}.${key}` : key); });
   };
   // References are validated against canonical steps, not customer prose.
   // In particular a generated step hash must not be mistaken for a phone number.
@@ -361,7 +369,8 @@ export function assertSafeKnowledgeDraft(document: CanonicalKnowledge): void {
     requiredFacts: document.diagnostic.requiredFacts.map(f => ({ key: f.key, label: f.label, question: f.question, questionEn: f.questionEn })),
     checks: document.diagnostic.checks.map(c => ({ instruction: c.instruction, expectedResult: c.expectedResult })),
     knownCauses: document.diagnostic.knownCauses.map(c => ({ symptom: c.symptom, cause: c.cause, fix: c.fix })),
-  } : undefined });
+  } : undefined }, "");
+  return fields;
 }
 
 

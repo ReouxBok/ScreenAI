@@ -6,6 +6,8 @@ import { decryptSavPayload } from "../crypto";
 import { caseAdmissionStatus } from "./admission-policy";
 import { readSavBlockSwitch, savBlockReplyGate } from "./block-switch";
 import { SAV_CASE_ACCESS_BLOCK_ID } from "./case-types";
+import { SAV_CASE_TEAM_PART_MENTION } from "./decision-contract";
+import { enqueueHandoffNotice } from "./case-handoff-notice-store";
 import type { CaseReplyProposal } from "./case-effects";
 import { prepareCaseReplyText, readCaseReplyDisclosure } from "./case-reply-outbound";
 import { decideCaseReply, type CaseReplyStoreDeps } from "./case-reply-store";
@@ -15,7 +17,7 @@ import { judgeCurrentTicketOwner } from "./case-ticket-owner";
 import { listCaseEvents, readCase } from "./case-store";
 import { accessAutoReplyAuthorizer } from "./customer-return-store";
 import { readAccessAutoApprovalConfig, type AccessAutoApprovalFacts } from "./customer-return";
-import { caseAccessScopeStamp, caseStampBlockId, readCaseAccessScope } from "./investigation-access-scope";
+import { caseAccessScopeStamp, caseStampBlockId, readCaseDecisionScopes } from "./investigation-access-scope";
 import { caseDecisionDraft, type CaseDecisionDraft } from "./investigation-intent";
 import { readCaseInvestigationProgress } from "./investigation-record";
 import { caseAdmissionNamesLatestInput, latestInvestigationInput } from "./investigation-runner";
@@ -59,17 +61,26 @@ async function latestDraft(caseId: string, provenance: PilotProvenanceDeps) {
   const read = readCaseInvestigationProgress(events, inputKey);
   if (read.state !== "found") return { draft: null, reason: `decision_${read.state}` } as const;
   // Treatment blocks (11/11): the scope in force of the block the decision was taken under (Access when its stamp names none).
+  // SAV-92 (multi-block): every block the decision was taken under.
   const blockId = caseStampBlockId(read.record.decision?.accessScope);
-  const scope = await readCaseAccessScope(provenance.accessScope, await provenance.currentPolicyRevision(), blockId);
-  const draft = caseDecisionDraft(caseId, read.record, events, { accessScope: scope.ok ? caseAccessScopeStamp(scope.scope) : null });
+  const blockIds = read.record.decision?.blockScopes ? read.record.decision.blockScopes.map(caseStampBlockId) : [blockId];
+  const scope = await readCaseDecisionScopes(provenance.accessScope, await provenance.currentPolicyRevision(), read.record.decision);
+  const draft = caseDecisionDraft(caseId, read.record, events, { accessScope: scope.ok ? caseAccessScopeStamp(scope.scope) : null,
+    ...(read.record.decision?.blockScopes ? { blockScopes: scope.ok && scope.blocks ? scope.blocks.map(caseAccessScopeStamp) : null } : {}) });
   if (!draft) return { draft: null, reason: "decision_not_accepted" } as const;
   const nextAction = read.record.decision?.validation.outcome === "accepted" ? read.record.decision.validation.decision.nextAction.kind : "none";
-  return { draft, nextAction, events, blockId, reason: draft.reply ? null : (draft.replyLimit ?? "no_reply") } as const;
+  return { draft, nextAction, events, blockId, blockIds, reason: draft.reply ? null : (draft.replyLimit ?? "no_reply") } as const;
 }
 
-/** Per-block switch (12/11) of the block the decision was taken under, read now from the database; it can only restrict A's rule. */
-async function blockReplyGate(blockId: string) {
-  return savBlockReplyGate(await readSavBlockSwitch(requireDb(), blockId));
+/**
+ * Per-block switch (12/11) of the block(s) the decision was taken under, read now from the database; it can only restrict A's rule.
+ * SAV-92 (multi-block): ONE reply, ONE mode, the strictest of its blocks: one block that never sends holds the whole reply (never half of it sent),
+ * one block in draft leaves the whole reply to a person. The entry already moved a stricter block's requests to the team, so this only bites when a
+ * switch changed between the entry and the reply.
+ */
+async function blockReplyGate(blockIds: readonly string[]): Promise<{ blockId: string; gate: ReturnType<typeof savBlockReplyGate> }> {
+  const gates = await Promise.all(blockIds.map(async blockId => ({ blockId, gate: savBlockReplyGate(await readSavBlockSwitch(requireDb(), blockId)) })));
+  return gates.find(row => row.gate.send === "never") ?? gates.find(row => row.gate.send === "person") ?? gates[0]!;
 }
 
 /** A's facts, every one read now from the database and the CRM port, never from the caller. */
@@ -104,7 +115,7 @@ export function caseAccessAutoReplyAuthorizer(deps: Pick<CaseReplyPassageDeps, "
   return async request => {
     // The block's switch first: off, paused or draft, the rule never approves (a person still may, through C's own path).
     const current = await latestDraft(request.caseId, deps.provenance);
-    const gate = await blockReplyGate(current.draft ? current.blockId : SAV_CASE_ACCESS_BLOCK_ID);
+    const { gate } = await blockReplyGate(current.draft ? current.blockIds : [SAV_CASE_ACCESS_BLOCK_ID]);
     if (gate.send !== "rule") return { allowed: false, reason: gate.code };
     const [row] = await requireDb().select().from(savCaseReplyValidations).where(and(eq(savCaseReplyValidations.caseId, request.caseId),
       eq(savCaseReplyValidations.replyKey, request.replyKey), eq(savCaseReplyValidations.payloadHash, request.payloadHash)));
@@ -129,9 +140,15 @@ export async function passCaseInvestigationToReplyPlan(caseId: string, deps: Cas
   if (!latest.draft) return { status: "no_reply", caseId, reason: latest.reason };
   const { draft } = latest;
   if (!draft.reply) return { status: "no_reply", caseId, reason: latest.reason ?? "no_reply" };
+  // SAV-92 (review of batch 2, finding 1): a reply telling the customer part of the mail went to the team is proposed only once that part's notice is durably
+  // queued (same execution ledger, never cancelled by a later mail). Otherwise nothing is proposed: the case waits visibly, no promise without the handoff.
+  if (draft.reply.text.trimEnd().endsWith(SAV_CASE_TEAM_PART_MENTION)) {
+    const queued = deps.policy ? await enqueueHandoffNotice({ caseId, policy: deps.policy, env: deps.store.env, inputKey: draft.inputKey }).catch(() => null) : null;
+    if (!queued?.ok) return { status: "proposal_refused", caseId, code: "team_part_handoff_unavailable", detail: queued ? (queued.why ?? queued.code) : deps.policy ? "notice_unreadable" : "execution_policy_absent" };
+  }
   // Per-block switch (12/11): off or paused, nothing is proposed for this block; the case waits visibly with the block's code (never a silent skip).
-  const gate = await blockReplyGate(latest.blockId);
-  if (gate.send === "never") return { status: "block_held", caseId, blockId: latest.blockId, reason: gate.code, detail: latest.blockId };
+  const { blockId: gateBlock, gate } = await blockReplyGate(latest.blockIds);
+  if (gate.send === "never") return { status: "block_held", caseId, blockId: gateBlock, reason: gate.code, detail: gateBlock };
   // Pre-checks before any write: the configured rule, the facts, the provenance of the reply B is about to propose.
   // The language is resolved ONCE, as C will (same input, same function); the provenance is proven on the text prepared once, in that
   // language and in the `automated` mode B is about to ask for: what is checked is what would be stored, never the raw draft.

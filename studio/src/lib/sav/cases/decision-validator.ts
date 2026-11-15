@@ -3,7 +3,7 @@ import { splitSavMessageText } from "../message-context";
 import { assessSavKnowledgeValidity, type SavRetrievalCandidate } from "../request-retrieval";
 import {
   caseAdmissionRefusalCode, caseDecisionAttachmentMail, caseDecisionProposalSchema, caseDecisionRejectionLabels, caseDecisionSignalLabels, caseDecisionUnverifiedLabels,
-  isSensitiveCaseFamily, SAV_CASE_ACCESS_URL, SAV_CASE_DECISION_CONTRACT_REVISION,
+  isSensitiveCaseFamily, SAV_CASE_ACCESS_URL, SAV_CASE_DECISION_CONTRACT_REVISION, SAV_CASE_TEAM_PART_MENTION,
   type CaseDecisionKnowledgeRef, type CaseDecisionRejection, type CaseDecisionRejectionCode, type CaseDecisionSignal,
   type CaseDecisionSourceRef, type CaseDecisionUnverifiedJudgment, type CaseDecisionValidation,
   type CaseDecisionValidationContext, type CaseResolutionEvidence, type SavCaseSensitiveFamily,
@@ -302,7 +302,22 @@ function contextProblem(context: CaseDecisionValidationContext, now: Date) {
   return null;
 }
 
-export const validateCaseDecision = (input: unknown, context: CaseDecisionValidationContext, now: Date): CaseDecisionValidation => validate(input, context, now, false);
+export const validateCaseDecision = (input: unknown, context: CaseDecisionValidationContext, now: Date): CaseDecisionValidation => withTeamPartMention(validate(input, context, now, false), context);
+
+/**
+ * SAV-92 (Ugo 14/11): part of this mail is the team's (`context.teamParts`). An accepted answer or question, whatever composed its text (the model, the
+ * Access template or the login step), ends with our fixed sentence saying the rest was passed to the team: ONE reply covers the customer's whole message.
+ * Idempotent (a stored text already ending with it is kept as is); a text that would exceed the contract is refused, never cut.
+ */
+function withTeamPartMention(result: CaseDecisionValidation, context: CaseDecisionValidationContext): CaseDecisionValidation {
+  if (result.outcome !== "accepted" || !context.teamParts?.length) return result;
+  const { decision } = result, reply = decision.reply;
+  if (!reply || (decision.nextAction.kind !== "answer" && decision.nextAction.kind !== "ask") || reply.text.trimEnd().endsWith(SAV_CASE_TEAM_PART_MENTION)) return result;
+  const text = `${reply.text.trimEnd()}\n\n${SAV_CASE_TEAM_PART_MENTION}`;
+  if (text.length > 6000) return { outcome: "needs_review", contractRevision: result.contractRevision, unverified: result.unverified, signals: result.signals,
+    rejections: [{ code: "proposal_schema_invalid", label: caseDecisionRejectionLabels.proposal_schema_invalid, path: "reply.text", detail: "team_part_mention_too_long" }] };
+  return { ...result, decision: { ...decision, reply: { ...reply, text } } };
+}
 
 /** `composed`: the proposal is this validator's own next step on the login, checked like any other but not composed again. */
 function validate(input: unknown, context: CaseDecisionValidationContext, now: Date, composed: boolean): CaseDecisionValidation {
@@ -386,8 +401,13 @@ function validate(input: unknown, context: CaseDecisionValidationContext, now: D
   // handoff is allowed), never another ordinary one, which would leave the pilot's scope. Treatment blocks (11/11): the same rule
   // with the family of the block's own scope; no scope (null) keeps `access`, so a request of another block is still refused.
   const pilotFamily = context.accessScope?.family ?? "access";
+  // SAV-92 (15/11, multi-block): each request keeps the family of ITS block's scope; a request no block names (a team part) one of the mail's block families.
+  const blockScopes = context.blockScopes;
+  const blockScopeOf = (requestId: string) => { const blockId = blockScopes?.requestBlocks[requestId]; return blockId ? blockScopes!.scopes[blockId] ?? null : null; };
+  const allowedFamilies = (requestId: string): readonly string[] => !blockScopes ? [pilotFamily]
+    : blockScopeOf(requestId) ? [blockScopeOf(requestId)!.family] : [...new Set(Object.values(blockScopes.scopes).map(scope => scope.family))];
   if (context.accessScope !== undefined) proposal.understanding.requests.forEach((request, index) => {
-    if (request.family !== pilotFamily && !isSensitiveCaseFamily(request.family)) reject("pilot_family_out_of_scope", `understanding.requests.${index}.family`, request.family);
+    if (!allowedFamilies(request.id).includes(request.family) && !isSensitiveCaseFamily(request.family)) reject("pilot_family_out_of_scope", `understanding.requests.${index}.family`, request.family);
   });
 
   const sensitive = new Set<SavCaseSensitiveFamily>(context.sensitiveCategories);
@@ -421,7 +441,20 @@ function validate(input: unknown, context: CaseDecisionValidationContext, now: D
   // by the approved scope for answers, at that version, whatever family a request is given; a handoff report, read by the
   // team only, is not limited.
   const pilot = context.accessScope !== undefined;
-  const requireInScope = (ref: CaseDecisionKnowledgeRef, path: string) => {
+  // SAV-92 (multi-block): a source shown for these requests must be an `answer` source of the scope of one of them, AND linked to that very request: block A's
+  // card never supports block B's request, even when the step or the reply also covers a request of A.
+  const requireInScope = (ref: CaseDecisionKnowledgeRef, path: string, requestIds: readonly string[]) => {
+    if (blockScopes) {
+      const problems = requestIds.map(requestId => {
+        const problem = caseAccessSourceProblem(blockScopeOf(requestId), ref);
+        if (problem) return problem;
+        const linked = !context.coverage || context.coverage.some(row => row.requestId === requestId
+          && row.knowledge.some(card => card.knowledgeId === ref.knowledgeId && card.contentVersionId === ref.contentVersionId));
+        return linked ? null : "access_source_out_of_scope" as const;
+      });
+      if (!problems.length || problems.every(Boolean)) reject(problems.find(Boolean) ?? "access_source_out_of_scope", path, ref.knowledgeId);
+      return;
+    }
     const problem = caseAccessSourceProblem(context.accessScope ?? null, ref);
     if (problem) reject(problem, path, ref.knowledgeId);
   };
@@ -492,11 +525,18 @@ function validate(input: unknown, context: CaseDecisionValidationContext, now: D
   if (action.kind === "answer") {
     unverified.add("answer_relevance");
     action.requestIds.forEach((requestId, index) => requireOpenRequest(requestId, `nextAction.requestIds.${index}`));
+    // SAV-92 (multi-block): every request the answer covers rests on at least one step whose card is an `answer` source of ITS block, linked to it. A step
+    // names no request of its own, so this is what keeps block A's card from answering block B's request inside one combined answer.
+    if (blockScopes) action.requestIds.forEach((requestId, index) => {
+      const own = action.steps.some(step => !caseAccessSourceProblem(blockScopeOf(requestId), step.knowledge) && (!context.coverage || context.coverage.some(row => row.requestId === requestId
+        && row.knowledge.some(card => card.knowledgeId === step.knowledge.knowledgeId && card.contentVersionId === step.knowledge.contentVersionId))));
+      if (!own) reject("knowledge_not_linked_to_request", `nextAction.requestIds.${index}`, requestId);
+    });
     action.steps.forEach((step, index) => {
       const path = `nextAction.steps.${index}`;
       citeKnowledge(step.knowledge, `${path}.knowledge`);
       requireLink(step.knowledge, action.requestIds, `${path}.knowledge`);
-      if (pilot) requireInScope(step.knowledge, `${path}.knowledge`);
+      if (pilot) requireInScope(step.knowledge, `${path}.knowledge`, action.requestIds);
       const failed = context.trials.filter(trial => trial.outcome === "failed" && action.requestIds.includes(trial.requestId) && trial.knowledge.knowledgeId === step.knowledge.knowledgeId);
       if (!failed.length) return;
       const since = Math.max(...failed.map(trial => at(trial.resultAt ?? trial.askedAt)));
@@ -632,7 +672,8 @@ function validate(input: unknown, context: CaseDecisionValidationContext, now: D
     && !context.sources.some(row => row.direction.endsWith("_outbound"))) {
     const citation = reply.citations[0]!;
     const matches = (ref: CaseDecisionKnowledgeRef) => ref.knowledgeId === citation.knowledgeId && ref.contentVersionId === citation.contentVersionId;
-    const template = context.accessScope?.sources.find(ref => matches(ref) && ref.use === "answer" && ref.firstReply !== undefined);
+    // SAV-92 (multi-block): a first-reply template would replace the one reply of several blocks by one request's procedure.
+    const template = context.blockScopes ? undefined : context.accessScope?.sources.find(ref => matches(ref) && ref.use === "answer" && ref.firstReply !== undefined);
     if (template && action.steps.every(step => matches(step.knowledge))) {
       const card = context.knowledge.find(row => row.id === citation.knowledgeId && row.contentVersionId === citation.contentVersionId);
       const lines = card?.resolution?.steps;
@@ -665,7 +706,7 @@ Il vous suffira ensuite de saisir ce code sur la page pour accéder à votre esp
     reply.citations.forEach((ref, index) => {
       citeKnowledge(ref, `reply.citations.${index}`);
       requireLink(ref, openIds, `reply.citations.${index}`);
-      if (pilot) requireInScope(ref, `reply.citations.${index}`);
+      if (pilot) requireInScope(ref, `reply.citations.${index}`, openIds);
     });
     reply.impossibilityClaims.forEach((claim, index) => {
       const path = `reply.impossibilityClaims.${index}`;
@@ -674,7 +715,7 @@ Il vous suffira ensuite de saisir ce code sur la page pour accéder à votre esp
       const issue = knowledgeProblem(claim.knowledge);
       if (issue) reject("impossibility_without_valid_source", `${path}.knowledge`, issue.code);
       else requireLink(claim.knowledge, [claim.requestId], `${path}.knowledge`);
-      if (pilot) requireInScope(claim.knowledge, `${path}.knowledge`);
+      if (pilot) requireInScope(claim.knowledge, `${path}.knowledge`, [claim.requestId]);
     });
     if (reply.accountAdvice === "new_subscription" || reply.accountAdvice === "new_account") reject("account_advice_forbidden", "reply.accountAdvice", reply.accountAdvice);
     if (requestsCredential(reply.text)) reject("credential_request_pattern", "reply.text");
