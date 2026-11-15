@@ -49,10 +49,12 @@ describe("A — confirmed execution, follow-up incomplete", () => {
     expect(await blocked(await dossier(null))).toEqual({ blocked: true, cause: "technical_wait" });
 
     // Fixed limits (size, count) never make the follow-up incomplete: partial coverage, named, no loop promise.
-    const limits = ["gmail:18c0synthetic:truncated_8000", "emails:association_limit_100", "gmail:message_limit_200", "timeline:truncated_64k", "notes:body_truncated", "status:history_limit_100"];
+    const limits = ["emails:association_limit_100", "gmail:message_limit_200", "timeline:truncated_64k", "status:history_limit_100"];
     expect(observationCoverage(limits)).toBe("partial");
     expect(splitObservationSourceErrors(limits).errors).toEqual([]);
-    expect(observationLimitsLabel(limits)).toMatch(/^Suivi partiel : mail de plus de 8 000 caractères/);
+    expect(observationLimitsLabel(limits)).toMatch(/^Suivi partiel : plus de 100 éléments associés au ticket/);
+    // A truncated BODY is incomplete evidence (review 575f21c), never a limit.
+    for (const body of ["gmail:18c0synthetic:truncated_8000", "notes:body_truncated", "studio:review_truncated_8000"]) expect(observationCoverage([...limits, body])).toBe("incomplete");
     expect(observationLimitsLabel(limits)).toContain("sans relance en boucle");
     // A real read error keeps it incomplete (re-read at the daily follow-up); an unknown code is never hidden as a limit.
     expect(observationCoverage([...limits, "pipeline:HUBSPOT_HTTP_503"])).toBe("incomplete");
@@ -61,7 +63,7 @@ describe("A — confirmed execution, follow-up incomplete", () => {
     expect(observationCoverage([])).toBe("complete");
     // Diagnostic: named families only, never the Gmail id or a provider message.
     const codes = publicObservationSourceCodes(["gmail:18c0synthetic:truncated_8000", "emails:Request failed for client@example.invalid", "SOURCE_UNAVAILABLE"]);
-    expect(codes).toEqual([{ code: "hubspot_read_failed", kind: "error" }, { code: "source_unavailable", kind: "error" }, { code: "gmail_body_8000", kind: "limit" }]);
+    expect(codes).toEqual([{ code: "gmail_body_truncated_8000", kind: "error" }, { code: "hubspot_read_failed", kind: "error" }, { code: "source_unavailable", kind: "error" }]);
     expect(JSON.stringify(codes)).not.toMatch(/18c0synthetic|example\.invalid|Request failed/);
     // The label no longer promises a catch-up that never comes.
     expect(intakeBlockedRowLabel({ blockedCause: "technical_wait", status: "followup_pending", reason: "Ticket créé et actions confirmées. Collecte du suivi incomplète (source_unavailable)." }))

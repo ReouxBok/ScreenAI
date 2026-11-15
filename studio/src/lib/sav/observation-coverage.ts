@@ -4,34 +4,34 @@
  * the same bound at every re-read). A limit never makes the follow-up "incomplete": it is a partial coverage, named.
  * Pure: no I/O. The stored `sourceErrors` keep every code, so the learning gates that require no code stay unchanged.
  */
+/** A truncated message or note BODY is incomplete evidence (rule of review 575f21c, test « F4 reports a truncated
+ * synchronized Gmail body as incomplete evidence »): it stays a real error below, never a coverage limit. Only bounds on
+ * the NUMBER of items read (or the oldest timeline events dropped) are limits. */
 const LIMITS: ReadonlyArray<[RegExp, string]> = [
-  [/^gmail:[^:]+:truncated_8000$/, "gmail_body_8000"],
   [/^gmail:message_limit_200$/, "gmail_messages_200"],
   [/^gmail:outbound_coverage_unverified$/, "gmail_outbound_unverified"],
-  [/^(emails|notes|calls|meetings|tasks|communications):body_truncated$/, "hubspot_body_8000"],
   [/^[a-z_]+:association_limit_100$/, "hubspot_associations_100"],
   [/^emails:delivery_unverified$/, "hubspot_delivery_unverified"],
   [/^timeline:truncated_64k$/, "timeline_64k"],
   [/^status:history_limit_100$/, "status_history_100"],
   [/^studio:review_limit_200$/, "studio_reviews_200"],
-  [/^studio:review_truncated_8000$/, "studio_review_8000"],
   [/^studio:action_limit_200$/, "studio_actions_200"],
 ];
 const LIMIT_LABELS: Record<string, string> = {
-  gmail_body_8000: "mail de plus de 8 000 caractères (lu en partie)",
   gmail_messages_200: "fil de plus de 200 messages",
   gmail_outbound_unverified: "envois Gmail non vérifiables sans ticket",
-  hubspot_body_8000: "contenu HubSpot de plus de 8 000 caractères (lu en partie)",
   hubspot_associations_100: "plus de 100 éléments associés au ticket",
   hubspot_delivery_unverified: "remise d’un mail sortant HubSpot non confirmée",
   timeline_64k: "chronologie de plus de 64 Ko (début non conservé)",
   status_history_100: "historique de statut de plus de 100 changements",
   studio_reviews_200: "plus de 200 corrections Studio",
-  studio_review_8000: "correction Studio de plus de 8 000 caractères",
   studio_actions_200: "plus de 200 actions Studio",
 };
 /** Families of real read errors, without any id or provider message (allow-list). */
 const ERRORS: ReadonlyArray<[RegExp, string]> = [
+  [/^gmail:[^:]+:truncated_8000$/, "gmail_body_truncated_8000"],
+  [/^(emails|notes|calls|meetings|tasks|communications):body_truncated$/, "hubspot_body_truncated_8000"],
+  [/^studio:review_truncated_8000$/, "studio_review_truncated_8000"],
   [/^ticket_link_changed$/, "ticket_link_changed"],
   [/^intake:baseline_missing$/, "intake_baseline_missing"],
   [/^new_inbound_awaiting_sync$/, "new_inbound_awaiting_sync"],
