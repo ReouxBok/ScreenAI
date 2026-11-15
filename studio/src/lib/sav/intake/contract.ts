@@ -87,7 +87,7 @@ export type SavIntakeMutation = z.infer<typeof savIntakeMutationSchema>;
 const noTicket = z.object({
   kind: z.literal("no_ticket"),
   reason: z.enum(["qualified_other", "acknowledgement_only", "outside_support"]),
-  qualifiedInformation: z.enum(["authenticated_newsletter", "verified_automatic_reply"]).optional(),
+  qualifiedInformation: z.enum(["authenticated_newsletter", "verified_automatic_reply", "automated_noise"]).optional(),
   nextAction: z.enum(["none", "supervised_partnership", "supervised_commercial", "supervised_investor"]),
   learning: z.literal("excluded"), evidenceIds: refs,
 }).strict();
@@ -205,10 +205,16 @@ export const savIntakeDecisionSchema = z.object({
     && ["current_message", "automation_headers"].every(source => decision.evidence.some(e => e.source === source
       && e.sourceId === decision.messageId && disposition.evidenceIds.includes(e.id))) && decision.latestInboundMessageId === decision.messageId;
   if (disposition.kind === "no_ticket" && disposition.qualifiedInformation === "verified_automatic_reply" && !qualifiedReply) reject("SAV_INTAKE_AUTOMATION_EVIDENCE_REQUIRED");
-  const unresolved = !qualifiedReply && !qualifiedInformation && (!kinds.size || kinds.has("unknown"));
+  // SAV-92: the noise filter's proof is the stored headers of the current, latest inbound mail.
+  const qualifiedNoise = !kinds.size && decision.classification === "other" && disposition.kind === "no_ticket"
+    && disposition.reason === "qualified_other" && disposition.qualifiedInformation === "automated_noise"
+    && ["current_message", "automation_headers"].every(source => decision.evidence.some(e => e.source === source
+      && e.sourceId === decision.messageId && disposition.evidenceIds.includes(e.id))) && decision.latestInboundMessageId === decision.messageId;
+  if (disposition.kind === "no_ticket" && disposition.qualifiedInformation === "automated_noise" && !qualifiedNoise) reject("SAV_INTAKE_NOISE_EVIDENCE_REQUIRED");
+  const unresolved = !qualifiedReply && !qualifiedInformation && !qualifiedNoise && (!kinds.size || kinds.has("unknown"));
   let compatible: SavIntakeClassification[];
   if (qualifiedReply) compatible = ["acknowledgement"];
-  else if (qualifiedInformation) compatible = ["other"];
+  else if (qualifiedInformation || qualifiedNoise) compatible = ["other"];
   else if (sensitiveKinds.length) compatible = sensitiveKinds;
   else if (unresolved) compatible = ["unknown"];
   else if (kinds.has("support")) compatible = ["support"];
@@ -321,7 +327,7 @@ export const savIntakeDecisionSchema = z.object({
     const expected = permitted[decision.classification as keyof typeof permitted];
     if (!expected || expected[0] !== disposition.reason || expected[1] !== disposition.nextAction) reject("SAV_INTAKE_NO_TICKET_CLASSIFICATION_INVALID");
     if (decision.classification === "other" && !decision.evidence.some(evidence => disposition.evidenceIds.includes(evidence.id)
-      && ["private_rule", "human_override"].includes(evidence.source))) reject("SAV_INTAKE_QUALIFIED_OTHER_EVIDENCE_REQUIRED");
+      && ["private_rule", "human_override", ...(disposition.qualifiedInformation === "automated_noise" ? ["automation_headers"] : [])].includes(evidence.source))) reject("SAV_INTAKE_QUALIFIED_OTHER_EVIDENCE_REQUIRED");
   }
   if (referenced.some(id => !evidenceIds.includes(id))) reject("SAV_INTAKE_UNKNOWN_EVIDENCE");
   if (["ticket", "request_identification"].includes(disposition.kind) && decision.messageId !== decision.latestInboundMessageId) reject("SAV_INTAKE_SOURCE_SUPERSEDED");

@@ -7,6 +7,7 @@ import { SAV_MESSAGE_CONTEXT_REVISION } from "../message-context";
 import type { EnginePolicy, IntakePlan } from "./engine-types";
 import { intakeReadRecoveryPolicySchema } from "./read-recovery";
 import { SAV_ATTACHMENT_PDF_REVISION } from "../attachment-contract";
+import { SAV_INTAKE_NOISE_FILTER_REVISION, savIntakeNoiseFilterMode } from "./noise-filter";
 
 export const SAV_INTAKE_RUNTIME_REVISION = "sav-intake-runtime-2026-10-21.v1";
 export const intakeRuntimeHash = (value: unknown) => createHash("sha256").update(JSON.stringify(value)).digest("hex");
@@ -28,7 +29,10 @@ export type IntakeRuntimeConfig = z.infer<typeof savIntakeRuntimePins> & { mode:
   /** Reader pipeline for NEW runs only; frozen in each run at creation and deliberately outside configHash. */
   pipeline?: SavIntakePipeline;
   /** SAV-43: PDF attachments read by the visual call. Off by default and inside configHash. */
-  pdfReading?: boolean };
+  pdfReading?: boolean;
+  /** SAV-92: automatic-mail filter before the model. Absent = off. "observe" changes no behaviour and stays outside
+   * configHash; "on" routes to Autre and is inside configHash (a new launch configuration, like PDF reading). */
+  noiseFilter?: "observe" | "on" };
 export const SAV_INTAKE_PIPELINES = ["current", "simple"] as const;
 export type SavIntakePipeline = typeof SAV_INTAKE_PIPELINES[number];
 /** Absent means the current multi-call readers; any other value is a configuration error, never a silent default. */
@@ -53,6 +57,8 @@ export function intakeRuntimeConfigurationHash(p: z.infer<typeof savIntakeRuntim
     ...(env.SAV_INTAKE_CRM_ACK_TEMPLATES_JSON ? {crmAcknowledgementsHash:intakeRuntimeHash(env.SAV_INTAKE_CRM_ACK_TEMPLATES_JSON)} : {}),
     // Switching PDF reading on or off is a new launch configuration; off keeps the previous hash.
     ...(savIntakePdfReading(env) ? { pdfReading: SAV_ATTACHMENT_PDF_REVISION } : {}),
+    // Only routing changes the launch: off and observe keep the previous hash.
+    ...(savIntakeNoiseFilterMode(env) === "on" ? { noiseFilter: SAV_INTAKE_NOISE_FILTER_REVISION } : {}),
     accessBinding: intakeRuntimeHash({ model: env.SAV_GEMINI_API_KEY, crm: env.HUBSPOT_ACCESS_TOKEN }) });
 }
 /** No permissive defaults, campaign resets or hidden reuse of another budget. */
@@ -77,7 +83,8 @@ export function savIntakeRuntimeConfig(env: Record<string, string | undefined> =
     const warning = policy.resources.multiTicketWarning;
     if (warning && createHash("sha256").update(warning.text).digest("hex") !== warning.sha256) throw Error();
     return { ...p, mode: "observe", policy, model: "gemini-3.6-flash", configHash: intakeRuntimeConfigurationHash(p, env), pipeline: savIntakePipeline(env),
-      ...(savIntakePdfReading(env) ? { pdfReading: true } : {}) };
+      ...(savIntakePdfReading(env) ? { pdfReading: true } : {}),
+      ...(savIntakeNoiseFilterMode(env) !== "off" ? { noiseFilter: savIntakeNoiseFilterMode(env) as "observe" | "on" } : {}) };
   } catch { throw Error("SAV_INTAKE_RUNTIME_CONFIGURATION_REQUIRED"); }
 }
 export type IntakeRuntimeState = "pending" | "analysing" | "observed" | "waiting" | "uncertain" | "superseded";
@@ -85,6 +92,8 @@ export type IntakeRuntimePayload = {
   revision: typeof SAV_INTAKE_RUNTIME_REVISION;
   input?: unknown; plan?: IntakePlan;
   other?: import("./other-routing").IntakeOtherQualification;
+  /** SAV-92: the noise filter's verdict (codes and message id only), in observe and on. */
+  noise?: import("./noise-filter").SavIntakeNoiseVerdict & { mode: "observe" | "on"; messageId: string; routed: boolean };
   attachments?: import("./attachments").IntakeAttachmentState;
   configuration?: { configHash: string; resourcesHash: string; policyHash: string; codeRevision: string; model: string };
   semantics?:import("./semantic-records").AcceptedIntakeSemantics;

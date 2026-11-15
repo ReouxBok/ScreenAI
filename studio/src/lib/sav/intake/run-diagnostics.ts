@@ -1,4 +1,5 @@
 import "server-only";
+import { SAV_INTAKE_NOISE_GUARDS, SAV_INTAKE_NOISE_REASONS } from "./noise-filter";
 import { intakeAttemptExhaustion, intakeRunAnalysed, SAV_INTAKE_ATTEMPT_POLICY, SAV_INTAKE_BLOCKING_JOURNAL_KINDS } from "./attempt-policy";
 import { and, desc, eq, gt, inArray, sql } from "drizzle-orm";
 import { requireDb } from "@/db";
@@ -49,6 +50,16 @@ function contextBreakdown(raw: unknown) {
 
 /** Project only diagnostic facts. Never return input bodies, quotes, model
  * results, arbitrary exception messages, recipients or provider credentials. */
+/** SAV-92: the noise filter's verdict, closed codes only (never a header value, address or text). */
+function publicIntakeNoiseVerdict(raw: unknown) {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
+  const v = raw as Record<string, unknown>;
+  const reason = (SAV_INTAKE_NOISE_REASONS as readonly unknown[]).includes(v.reason) ? v.reason as string : null;
+  return { mode: v.mode === "observe" || v.mode === "on" ? v.mode : null, verdict: v.verdict === "noise" || v.verdict === "keep" ? v.verdict : null,
+    reason, guard: (SAV_INTAKE_NOISE_GUARDS as readonly unknown[]).includes(v.guard) ? v.guard as string : null,
+    signals: Array.isArray(v.signals) ? v.signals.filter((s): s is string => (SAV_INTAKE_NOISE_REASONS as readonly unknown[]).includes(s)).slice(0, 10) : [],
+    routed: v.routed === true };
+}
 export function intakeDiagnosticPayload(ciphertext: string) {
   try {
     if (Buffer.byteLength(ciphertext, "utf8") > 262_144) throw Error("DIAGNOSTIC_LIMIT");
@@ -95,9 +106,10 @@ export function intakeDiagnosticPayload(ciphertext: string) {
         inventoryComplete: typeof object(attachments.inventory).complete === "boolean" ? object(attachments.inventory).complete : null,
         observations: (Array.isArray(read.observations) ? read.observations : []).slice(0, 100).map(raw => {
           const o = object(raw); return { status: code(o.status), reason: code(o.reason) };
-        }) }, traces, tracesTruncated: Array.isArray(payload.traces) && payload.traces.length > 40 };
+        }) }, traces, tracesTruncated: Array.isArray(payload.traces) && payload.traces.length > 40,
+      noiseFilter: publicIntakeNoiseVerdict(payload.noise) };
   } catch {
-    return { readable: false, reason: null, waitingCause: "unknown" as const, decision: null, budgetLimit: null, codeRevision: null, contextReasons: [], input: null, attachments: null, traces: [], tracesTruncated: false };
+    return { readable: false, reason: null, waitingCause: "unknown" as const, decision: null, budgetLimit: null, codeRevision: null, contextReasons: [], input: null, attachments: null, traces: [], tracesTruncated: false, noiseFilter: null };
   }
 }
 
