@@ -95,10 +95,15 @@ export async function projectIntakeThread(threadId: string, beforePublish?: () =
     }
   }
   // SAV-92 (sensitive): a finance/cancellation dossier with a V1 decision is never left in a technical wait.
-  if (decided && result.view === null) {
-    const route = intakeSensitiveRoute(result, true);
-    if (route && await intakeDossierSensitive(threadId, thread?.hubspotTicketId ?? null)) result = route;
+  // Review F4: a version re-created without a plan still counts as decided when an earlier version of the SAME mail
+  // holds a V1 plan (the execution of the mail is already read above through `progress`).
+  const route = result.view === null ? intakeSensitiveRoute(result, true) : null;
+  if (route && !decided && run && message && run.messageId === message.id) {
+    const siblings = await db.select({ payload: savIntakeRuns.payloadCiphertext }).from(savIntakeRuns)
+      .where(and(eq(savIntakeRuns.messageId, run.messageId), sql`${savIntakeRuns.id} <> ${run.id}`));
+    decided = siblings.some(s => { try { return Boolean(decryptSavPayload<IntakeRuntimePayload>(s.payload).plan); } catch { return false; } });
   }
+  if (route && decided && await intakeDossierSensitive(threadId, thread?.hubspotTicketId ?? null)) result = route;
   await beforePublish?.();
   const published = await db.update(savIntakeConsole).set({ ...result, projectedEpoch: projection.epoch,
     messageId: message?.id ?? null, runId: run?.id ?? null, version: run?.version ?? null })

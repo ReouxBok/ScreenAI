@@ -122,8 +122,10 @@ describe("C — sources changed", () => {
 
 describe("sensitive dossiers", () => {
   it("a finance or cancellation dossier is never left in a technical wait: it is shown in the sensitive team queue", () => {
-    for (const result of [{ view: null, status: "waiting", reason: "SAV_INTAKE_SEMANTIC_CONTEXT_CHANGED" }, { view: null, status: "followup_pending", reason: "Ticket créé et actions confirmées. Collecte du suivi incomplète (source_unavailable)." },
-      { view: null, status: "uncertain", reason: null }, { view: null, status: "context_changed", reason: "Les sources locales doivent être réinvestiguées" }]) {
+    // Review F1: uncertain keeps its banner, observed is a transit, a confirmed/refused/follow-up dossier has nothing to decide.
+    for (const status of ["uncertain", "observed", "followup_pending", "confirmed", "refused"])
+      expect(intakeSensitiveRoute({ view: null, status, reason: null }, true)).toBeNull();
+    for (const result of [{ view: null, status: "waiting", reason: "SAV_INTAKE_SEMANTIC_CONTEXT_CHANGED" }, { view: null, status: "context_changed", reason: "Les sources locales doivent être réinvestiguées" }]) {
       const route = intakeSensitiveRoute(result, true);
       expect(route).toMatchObject({ view: "sensitive", status: "sensitive_team" });
       expect(route!.reason).toMatch(/^Dossier sensible \(résiliation ou facturation\) : décision de l’équipe, jamais en attente technique\. État : /);

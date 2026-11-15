@@ -115,7 +115,7 @@ export async function reconcileHandledIntakeGmailRead(limit = 3, deadlineMs = Da
     sql`${savMessages.gmailMessageId} is not null`,
     sql`exists(select 1 from sav.mailboxes b where b.id=${savMessages.mailboxId} and b.email='contact@limova.ai' and b.active)`,
     sql`${savMessages.id}=(select m.id from sav.messages m where m.thread_id=${savMessages.threadId} and m.direction='inbound' order by least(m.received_at,m.created_at) desc,m.created_at desc,m.id desc limit 1)`,
-    sql`(${administrative} or exists(select 1 from sav.intake_console c where c.message_id=${savMessages.id} and c.epoch=c.projected_epoch and (c.status='qualified_other' and c.view='other' or c.status='acknowledgement_only' and c.view='completed' or c.status in ('followup_pending','followup_started','not_applicable_sensitive','summary_finished'))))`,
+    sql`(${administrative} or exists(select 1 from sav.intake_console c where c.message_id=${savMessages.id} and c.epoch=c.projected_epoch and (c.status='qualified_other' and c.view='other' or c.status='acknowledgement_only' and c.view='completed' or c.status in ('followup_pending','followup_partial','followup_started','not_applicable_sensitive','summary_finished'))))`,
     sql`not exists(select 1 from public.audit_logs a where a.entity_type='sav_message' and a.entity_id=${savMessages.id}::text and a.actor_email='studio-intake' and a.action=${SAV_INTAKE_GMAIL_READ})`,
     sql`not exists(select 1 from public.audit_logs a where a.entity_type='sav_message' and a.entity_id=${savMessages.id}::text and a.action=${FAILED} and a.created_at>now()-interval '5 minutes')`
   )).orderBy(asc(savEffectiveReceivedAt), asc(savMessages.id)).limit(Math.max(1, Math.min(20, limit)));

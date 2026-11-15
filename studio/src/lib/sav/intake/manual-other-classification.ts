@@ -61,7 +61,8 @@ function humanSourceReview(snapshot: Snapshot): { reason: "source_text_incomplet
   return { reason: null, attachmentCount: attachments.data.length };
 }
 function waiting(projection: { view: string | null; status: string }) {
-  return (projection.view === "to_validate" || projection.view === null)
+  // SAV-92 (F5): a sensitive dossier routed out of « En traitement » (sensitive_team) keeps the eligibility it had there.
+  return (projection.view === "to_validate" || projection.view === null || projection.view === "sensitive" && projection.status === "sensitive_team")
     && !["historical_outside_automation", "paused", "human_hold", "human_refused", "human_revalidation"].includes(projection.status);
 }
 /** GET is read-only, gives bounded reasons, and never queues analysis or a command.

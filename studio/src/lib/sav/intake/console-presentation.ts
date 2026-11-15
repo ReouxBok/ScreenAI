@@ -253,12 +253,14 @@ export function intakeExecutionDecisionRoute(input: { progress: { state: string;
   return { view: "to_validate", status: "crm_review_required",
     reason: `Changement HubSpot à arbitrer${sent ? " (des actions déjà confirmées sont conservées)" : " ; aucune action envoyée"}. ${delta ? `${delta} ` : ""}Prochaine étape : ${nextSteps.human_decision}.` };
 }
-/** Statuses where a dossier is actively moving on its own (analysis or verification running, choice being revalidated). */
-const ACTIVE_STATUSES = new Set(["processing", "pending", "analysing", "running", "human_revalidation", "v2_customer_return", "external_completion_pending", "paused"]);
+/** Technical waits only. Never routed (review F1): `uncertain` keeps its banner and « vérifier, ne rien renvoyer »;
+ * `observed` is a normal transit to execution; `followup_pending`/`confirmed`/`refused` have nothing for the team to decide;
+ * an active analysis or verification moves on its own. */
+const TECHNICAL_WAIT_STATUSES = new Set(["waiting", "context_changed"]);
 /** (Sensitive) A finance/cancellation dossier is never left in a technical wait: it is shown in the team's sensitive queue
  * with the reason it was waiting on, while the automatic pipeline keeps its own state. */
 export function intakeSensitiveRoute(result: { view: string | null; status: string; reason: string | null }, sensitive: boolean): IntakeTeamRoute | null {
-  if (!sensitive || result.view !== null || ACTIVE_STATUSES.has(result.status)) return null;
+  if (!sensitive || result.view !== null || !TECHNICAL_WAIT_STATUSES.has(result.status)) return null;
   const why = intakeReasonLabel(result.reason) ?? "";
   return { view: "sensitive", status: "sensitive_team",
     reason: `Dossier sensible (résiliation ou facturation) : décision de l’équipe, jamais en attente technique. État : ${intakeStatusLabel(result.status)}.${why ? ` ${why}` : ""}` };
