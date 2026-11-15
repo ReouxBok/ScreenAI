@@ -1,7 +1,8 @@
 import { randomUUID } from "node:crypto";
 import { afterAll, afterEach, beforeAll, beforeEach, expect, it, vi } from "vitest";
+import { sql } from "drizzle-orm";
 import { createSavTestDb } from "../../../../test/sav-db";
-import { savMailboxes, savMessages, savThreads } from "@/db/schema";
+import { savIntakeConsole, savMailboxes, savMessages, savThreads } from "@/db/schema";
 const state = vi.hoisted(() => ({ db: null as unknown }));
 vi.mock("@/db", () => ({ requireDb: () => { if (!state.db) throw Error("NO_DATABASE_ALLOWED"); return state.db; } }));
 import { encryptSavPayload } from "../crypto";
@@ -10,13 +11,16 @@ import { enqueueSavIntakeMessage, readSavIntakeBudget, readSavIntakeCurrent } fr
 import { analyseSavIntakeRuntime } from "./runtime";
 import { readIntakeRunDiagnostics } from "./run-diagnostics";
 import { readIntakeNoiseSenderHistory } from "./noise-filter-runtime";
+import { replaySavIntakeNoiseFilter } from "./noise-filter-replay";
 
 // SAV-92 noise filter on the real intake chain (local database, model and CRM mocked at the network boundary).
 // Synthetic data only.
 let f: Awaited<ReturnType<typeof createSavTestDb>>, mailboxId: string;
-const sender = "news@lists.example.invalid";
-const newsletter = { "x-studio-automation-headers": "singleton-v1", "x-studio-noise-headers": "v1", "content-type": "text/plain; charset=UTF-8",
-  "list-id": "present", "list-unsubscribe": "present", precedence: "bulk", "auto-submitted": "", "in-reply-to": "", references: "" };
+const daemon = "mailer-daemon@mx.example.invalid";
+const base = { "x-studio-automation-headers": "singleton-v1", "x-studio-noise-headers": "v1", "auto-submitted": "", "in-reply-to": "", references: "" };
+const dsn = { ...base, "content-type": 'multipart/report; report-type=delivery-status; boundary="synthetic"' };
+const groupAlias = { ...base, "content-type": "text/plain; charset=UTF-8", precedence: "list", "list-id": "present", "list-unsubscribe": "present" };
+const bounceText = "Address not found. Your message could not be delivered.";
 function env(mailbox: string, mode?: string) {
   const policy = { relationRevision: "synthetic-no-associations", admittedRelations: [], resources: {} };
   return { SAV_INTAKE_RUNTIME_MODE: "observe", SAV_CODE_REVISION: "a".repeat(40), SAV_AI_MODEL: "gemini-3.6-flash", SAV_GEMINI_API_KEY: "fake-model", HUBSPOT_ACCESS_TOKEN: "fake-crm",
@@ -25,14 +29,18 @@ function env(mailbox: string, mode?: string) {
     SAV_INTAKE_RUNTIME_CONFIG: JSON.stringify({ mailboxId: mailbox, receivedAfter: new Date(Date.now() - 3600_000).toISOString(), createdAfter: new Date(Date.now() - 60_000).toISOString(),
       expiresAt: new Date(Date.now() + 3600_000).toISOString(), codeRevision: "a".repeat(40), policyHash: intakeRuntimeHash(policy), resourcesHash: intakeRuntimeHash([]), maxNanoUsd: 3_000_000_000, maxCalls: 30 }) } as Record<string, string | undefined>;
 }
-async function mail(options: { from?: string; headers?: Record<string, string>; direction?: "inbound" | "outbound"; to?: string[]; threadTicket?: string; body?: string; receivedAt?: Date } = {}) {
-  const [thread] = await f.db.insert(savThreads).values({ mailboxId, gmailThreadId: randomUUID(), customerEmail: options.from ?? sender, hubspotTicketId: options.threadTicket ?? null }).returning();
-  const [m] = await f.db.insert(savMessages).values({ mailboxId, threadId: thread.id, direction: options.direction ?? "inbound", fromEmail: options.from ?? sender, toEmails: options.to ?? ["support@example.invalid"],
-    subject: "Lettre fictive de novembre", gmailMessageId: randomUUID(), bodyCiphertext: encryptSavPayload({ text: options.body ?? "Les nouveautés fictives du mois. Se désinscrire.", attachments: [], headers: options.headers ?? newsletter }),
+type MailOptions = { from?: string; headers?: Record<string, string>; direction?: "inbound" | "outbound"; to?: string[]; threadTicket?: string; body?: string; subject?: string; receivedAt?: Date; attachments?: unknown[] };
+async function mail(options: MailOptions = {}) {
+  const from = options.from ?? daemon;
+  const [thread] = await f.db.insert(savThreads).values({ mailboxId, gmailThreadId: randomUUID(), customerEmail: from, hubspotTicketId: options.threadTicket ?? null }).returning();
+  const [m] = await f.db.insert(savMessages).values({ mailboxId, threadId: thread.id, direction: options.direction ?? "inbound", fromEmail: from, toEmails: options.to ?? ["support@example.invalid"],
+    subject: options.subject ?? "Delivery Status Notification (Failure)", gmailMessageId: randomUUID(),
+    bodyCiphertext: encryptSavPayload({ text: options.body ?? bounceText, attachments: options.attachments ?? [], headers: options.headers ?? dsn }),
     receivedAt: options.receivedAt ?? new Date(), createdAt: new Date() }).returning();
   return m;
 }
-// A valid model answer for any mail: the off/observe comparison only needs the same normal path.
+const customer = (over: MailOptions = {}) => mail({ from: "client@example.invalid", subject: "Problème de connexion", body: "Bonjour, je n'arrive plus à me connecter, pouvez-vous m'aider ?", headers: groupAlias, ...over });
+// A valid model answer for any mail: the normal path only needs to run.
 const network = (messageId: string) => vi.fn(async (url: Parameters<typeof fetch>[0], init?: RequestInit) => {
   if (String(url).startsWith("https://generativelanguage.googleapis.com/")) {
     const body = JSON.parse(String(init?.body)), data = JSON.parse(body.contents[0].parts[0].text);
@@ -51,6 +59,7 @@ async function run(mode: string | undefined, m: { id: string; threadId: string }
   log.mockRestore();
   return { result, current, fetcher, config, logs, budget: await readSavIntakeBudget(config) };
 }
+const projectOther = (m: { id: string; threadId: string }) => f.db.insert(savIntakeConsole).values({ threadId: m.threadId, messageId: m.id, mailboxId, view: "other", status: "qualified_other" });
 beforeAll(async () => { f = await createSavTestDb(); state.db = f.db; }, 30_000);
 afterAll(async () => { await f?.client.close(); });
 beforeEach(async () => {
@@ -62,10 +71,10 @@ afterEach(() => vi.unstubAllEnvs());
 
 it("configHash: off and observe keep the previous hash, on is a new launch configuration, a typo is refused", () => {
   const environment = env(randomUUID()), pins = savIntakeRuntimePins.parse(JSON.parse(environment.SAV_INTAKE_RUNTIME_CONFIG!));
-  const base = intakeRuntimeConfigurationHash(pins, environment);
-  expect(intakeRuntimeConfigurationHash(pins, { ...environment, SAV_INTAKE_NOISE_FILTER: "off" })).toBe(base);
-  expect(intakeRuntimeConfigurationHash(pins, { ...environment, SAV_INTAKE_NOISE_FILTER: "observe" })).toBe(base);
-  expect(intakeRuntimeConfigurationHash(pins, { ...environment, SAV_INTAKE_NOISE_FILTER: "on" })).not.toBe(base);
+  const hash = intakeRuntimeConfigurationHash(pins, environment);
+  expect(intakeRuntimeConfigurationHash(pins, { ...environment, SAV_INTAKE_NOISE_FILTER: "off" })).toBe(hash);
+  expect(intakeRuntimeConfigurationHash(pins, { ...environment, SAV_INTAKE_NOISE_FILTER: "observe" })).toBe(hash);
+  expect(intakeRuntimeConfigurationHash(pins, { ...environment, SAV_INTAKE_NOISE_FILTER: "on" })).not.toBe(hash);
   expect(savIntakeRuntimeConfig(environment)!.noiseFilter).toBeUndefined();
   expect(savIntakeRuntimeConfig({ ...environment, SAV_INTAKE_NOISE_FILTER: "observe" })!.noiseFilter).toBe("observe");
   expect(() => savIntakeRuntimeConfig({ ...environment, SAV_INTAKE_NOISE_FILTER: "yes" })).toThrow("SAV_INTAKE_RUNTIME_CONFIGURATION_REQUIRED");
@@ -73,7 +82,7 @@ it("configHash: off and observe keep the previous hash, on is a new launch confi
 
 it("off computes nothing and observe changes nothing but the stored verdict and one code-only log line", async () => {
   const off = await run(undefined, await mail());
-  const observe = await run("observe", await mail({ from: "news2@lists.example.invalid" }));
+  const observe = await run("observe", await mail({ from: "postmaster@mx2.example.invalid" }));
   expect(off.current?.payload.noise).toBeUndefined(); expect(off.logs).toEqual([]);
   expect(observe.result.state).toBe(off.result.state);
   expect(observe.current?.payload.reason).toBe(off.current?.payload.reason);
@@ -81,14 +90,14 @@ it("off computes nothing and observe changes nothing but the stored verdict and 
   expect(observe.current?.payload.plan?.decision.disposition).toEqual(off.current?.payload.plan?.decision.disposition);
   expect(observe.fetcher.mock.calls.length).toBe(off.fetcher.mock.calls.length);
   expect(observe.fetcher).toHaveBeenCalled();
-  expect(observe.current?.payload.noise).toMatchObject({ mode: "observe", verdict: "noise", reason: "SAV_NOISE_PRECEDENCE", guard: null, routed: false });
+  expect(observe.current?.payload.noise).toMatchObject({ mode: "observe", verdict: "noise", strength: "strong", reason: "SAV_NOISE_DELIVERY_STATUS", guard: null, routed: false });
   expect(observe.logs).toHaveLength(1);
-  expect(observe.logs[0]).not.toMatch(/@|lists|fictive|Lettre/);
+  expect(observe.logs[0]).not.toMatch(/@|example|Address/);
   const diagnostic = (await readIntakeRunDiagnostics(observe.current!.threadId))?.runs[0].diagnostic;
-  expect(diagnostic).toMatchObject({ noiseFilter: { mode: "observe", verdict: "noise", reason: "SAV_NOISE_PRECEDENCE", routed: false } });
+  expect(diagnostic).toMatchObject({ noiseFilter: { mode: "observe", verdict: "noise", strength: "strong", reason: "SAV_NOISE_DELIVERY_STATUS", routed: false } });
 });
 
-it("on routes a proven newsletter from an unknown sender to Autre with no model or CRM call and no budget", async () => {
+it("on routes a proven delivery report from a new mailer-daemon to Autre with no model or CRM call and no budget", async () => {
   const m = await mail();
   const on = await run("on", m);
   expect(on.fetcher).not.toHaveBeenCalled();
@@ -101,45 +110,80 @@ it("on routes a proven newsletter from an unknown sender to Autre with no model 
   expect(JSON.parse(on.logs[0])).toMatchObject({ mode: "on", routed: true, messageId: m.id });
 });
 
-it("on never filters a known sender, a ticketed thread or a finance mail: the normal model path runs", async () => {
-  // A sender who wrote before, in another thread.
-  await mail({ headers: {}, receivedAt: new Date(Date.now() - 600_000) });
-  const known = await run("on", await mail());
-  expect(known.fetcher).toHaveBeenCalled();
-  expect(known.current?.payload.noise).toMatchObject({ verdict: "keep", guard: "SAV_NOISE_GUARD_KNOWN_SENDER", routed: false });
-  expect(known.current?.payload.plan?.progress.kind).not.toBe("qualified_other");
+it("P1 on: a first customer mail through a group alias or a helpdesk is never filtered, weak rules are only measured", async () => {
+  for (const [headers, reason] of [
+    [groupAlias, "SAV_NOISE_WEAK_LIST_HEADERS"],
+    [{ ...base, "content-type": "text/plain", "auto-submitted": "auto-generated" }, "SAV_NOISE_WEAK_AUTO_GENERATED"],
+    [{ ...base, "content-type": "text/plain", precedence: "bulk" }, "SAV_NOISE_WEAK_PRECEDENCE"],
+    [{ ...base, "content-type": "text/plain", "auto-submitted": "auto-forwarded" }, "SAV_NOISE_WEAK_AUTO_SUBMITTED_OTHER"],
+  ] as const) {
+    const on = await run("on", await customer({ from: `client-${randomUUID()}@example.invalid`, headers }));
+    expect(on.fetcher).toHaveBeenCalled();
+    expect(on.current?.payload.noise).toMatchObject({ verdict: "keep", strength: "weak", reason, guard: "SAV_NOISE_KEEP_WEAK_ONLY", routed: false });
+    expect(on.current?.payload.plan?.progress.kind).not.toBe("qualified_other");
+  }
+});
 
-  const ticketed = await run("on", await mail({ from: "other@lists.example.invalid", threadTicket: "4242" }));
+it("P2a on: a second bounce from the same mailer-daemon is filtered once the first is in Autre; a customer served before is kept", async () => {
+  const first = await mail({ receivedAt: new Date(Date.now() - 600_000) });
+  await projectOther(first);
+  const second = await run("on", await mail());
+  expect(second.fetcher).not.toHaveBeenCalled();
+  expect(second.current?.payload.noise).toMatchObject({ verdict: "noise", routed: true });
+
+  // The same mailer-daemon with one earlier mail NOT proven automatic (not in Autre) stays on the normal path.
+  const other = "mailer-daemon@other.example.invalid";
+  await mail({ from: other, receivedAt: new Date(Date.now() - 600_000) });
+  const unproven = await run("on", await mail({ from: other }));
+  expect(unproven.current?.payload.noise).toMatchObject({ verdict: "keep", guard: "SAV_NOISE_GUARD_KNOWN_SENDER" });
+  expect(unproven.fetcher).toHaveBeenCalled();
+
+  // A customer who already had a ticket: even an absence reply with a strong rule is kept.
+  const client = "served@example.invalid";
+  await mail({ from: client, threadTicket: "4242", headers: { ...base, "content-type": "text/plain" }, subject: "Question", body: "Bonjour." , receivedAt: new Date(Date.now() - 600_000) });
+  const served = await run("on", await mail({ from: client, headers: { ...base, "content-type": "text/plain", "auto-submitted": "auto-replied" }, subject: "Réponse automatique", body: "Je suis absent jusqu'à lundi." }));
+  expect(served.current?.payload.noise).toMatchObject({ verdict: "keep", reason: "SAV_NOISE_AUTO_REPLIED", guard: "SAV_NOISE_GUARD_KNOWN_SENDER" });
+  expect(served.fetcher).toHaveBeenCalled();
+});
+
+it("P2b on: a delivery report with its attached original goes to Autre, never to a vague wait", async () => {
+  const on = await run("on", await mail({ attachments: [{ filename: "original.eml", mimeType: "message/rfc822" }] }));
+  expect(on.fetcher).not.toHaveBeenCalled();
+  expect(on.result.state).toBe("observed");
+  expect(on.current?.payload.reason).toBe("SAV_INTAKE_NOISE_FILTERED");
+  expect(on.current?.payload.plan?.progress).toMatchObject({ kind: "qualified_other", view: "other" });
+});
+
+it("on never filters a ticketed thread or a finance mail: the normal model path runs", async () => {
+  const ticketed = await run("on", await mail({ from: "mailer-daemon@t.example.invalid", threadTicket: "4242" }));
   expect(ticketed.current?.payload.noise).toMatchObject({ verdict: "keep", guard: "SAV_NOISE_GUARD_THREAD_TICKET" });
   expect(ticketed.fetcher).toHaveBeenCalled();
-
-  const finance = await run("on", await mail({ from: "third@lists.example.invalid", body: "Votre facture fictive est disponible. Se désinscrire." }));
+  const finance = await run("on", await mail({ from: "mailer-daemon@f.example.invalid", body: `${bounceText} Votre facture fictive.` }));
   expect(finance.current?.payload.noise).toMatchObject({ verdict: "keep", guard: "SAV_NOISE_GUARD_SENSITIVE" });
   expect(finance.fetcher).toHaveBeenCalled();
 });
 
-it("reads the sender history locally, case-insensitively, across threads and directions", async () => {
+it("reads the sender history locally, case-insensitively, and separates proven-automatic mails", async () => {
   const current = await mail({ from: "Someone@Example.invalid" });
-  expect(await readIntakeNoiseSenderHistory(f.db, { mailboxId, messageId: current.id, address: "someone@example.invalid" })).toEqual({ priorInbound: 0, outboundTo: 0, ticketThreads: 0 });
-  await mail({ from: "SOMEONE@example.invalid", headers: {} });
+  expect(await readIntakeNoiseSenderHistory(f.db, { mailboxId, messageId: current.id, address: "someone@example.invalid" })).toEqual({ priorInbound: 0, priorInboundNotAutomatic: 0, outboundTo: 0, ticketThreads: 0 });
+  await projectOther(await mail({ from: "SOMEONE@example.invalid", headers: {} }));
+  await mail({ from: "someone@example.invalid", headers: {} });
   await mail({ from: "support@example.invalid", direction: "outbound", to: ["someone@EXAMPLE.invalid"], headers: {} });
-  await mail({ from: "someone@example.invalid", threadTicket: "99", headers: {} });
-  expect(await readIntakeNoiseSenderHistory(f.db, { mailboxId, messageId: current.id, address: "Someone@Example.invalid" })).toEqual({ priorInbound: 2, outboundTo: 1, ticketThreads: 1 });
+  await projectOther(await mail({ from: "someone@example.invalid", threadTicket: "99", headers: {} }));
+  expect(await readIntakeNoiseSenderHistory(f.db, { mailboxId, messageId: current.id, address: "Someone@Example.invalid" })).toEqual({ priorInbound: 3, priorInboundNotAutomatic: 2, outboundTo: 1, ticketThreads: 1 });
 });
 
 it("offline replay: read-only counts per rule and guard, ids only, as of each mail's receipt", async () => {
-  const { savIntakeConsole } = await import("@/db/schema");
-  const { sql } = await import("drizzle-orm");
-  const { replaySavIntakeNoiseFilter } = await import("./noise-filter-replay");
-  const noise = await mail({ from: "fresh@lists.example.invalid" });
-  const legacy = await mail({ from: "client@example.invalid", headers: { "x-studio-automation-headers": "singleton-v1", "content-type": "text/plain" }, body: "Bonjour, mon accès est bloqué." });
-  const later = await mail({ from: "fresh@lists.example.invalid", receivedAt: new Date(Date.now() + 1000) });
-  for (const [m, view] of [[noise, "other"], [legacy, "to_validate"], [later, "to_validate"]] as const)
-    await f.db.insert(savIntakeConsole).values({ threadId: m.threadId, messageId: m.id, mailboxId, view, status: "synthetic" });
+  const noise = await mail({ from: "mailer-daemon@fresh.example.invalid" });
+  const weak = await customer();
+  const later = await mail({ from: "mailer-daemon@fresh.example.invalid", receivedAt: new Date(Date.now() + 1000) });
+  for (const [m, view] of [[noise, "other"], [weak, "to_validate"], [later, "to_validate"]] as const)
+    await f.db.insert(savIntakeConsole).values({ threadId: m.threadId, messageId: m.id, mailboxId, view, status: view === "other" ? "qualified_other" : "synthetic" });
   const before = await f.db.select().from(savMessages);
   const report = await f.db.transaction(async tx => { await tx.execute(sql`set transaction read only`); return replaySavIntakeNoiseFilter(tx, { mailboxId }); });
-  expect(report).toMatchObject({ total: 3, scanned: 3, unreadable: 0, headersCaptured: 2, byView: { other: 1, to_validate: 2 },
-    noiseByReason: { SAV_NOISE_PRECEDENCE: 1 }, keptWithSignalByGuard: { SAV_NOISE_GUARD_KNOWN_SENDER: 1 }, noiseFromToValidate: [] });
-  expect(JSON.stringify(report)).not.toMatch(/@|example|Bonjour|Lettre/);
+  // The later bounce sees the earlier one already in Autre: it is filtered too.
+  expect(report).toMatchObject({ total: 3, scanned: 3, unreadable: 0, headersCaptured: 3, byView: { other: 1, to_validate: 2 },
+    noiseByReason: { SAV_NOISE_DELIVERY_STATUS: 2 }, weakOnlyByReason: { SAV_NOISE_WEAK_LIST_HEADERS: 1 }, noiseFromToValidate: [later.id] });
+  expect(JSON.stringify(report)).not.toMatch(/@|example|Bonjour|Address/);
   expect(await f.db.select().from(savMessages)).toEqual(before);
 });

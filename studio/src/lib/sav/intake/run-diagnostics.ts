@@ -56,7 +56,7 @@ function publicIntakeNoiseVerdict(raw: unknown) {
   const v = raw as Record<string, unknown>;
   const reason = (SAV_INTAKE_NOISE_REASONS as readonly unknown[]).includes(v.reason) ? v.reason as string : null;
   return { mode: v.mode === "observe" || v.mode === "on" ? v.mode : null, verdict: v.verdict === "noise" || v.verdict === "keep" ? v.verdict : null,
-    reason, guard: (SAV_INTAKE_NOISE_GUARDS as readonly unknown[]).includes(v.guard) ? v.guard as string : null,
+    reason, strength: v.strength === "strong" || v.strength === "weak" ? v.strength : null, guard: (SAV_INTAKE_NOISE_GUARDS as readonly unknown[]).includes(v.guard) ? v.guard as string : null,
     signals: Array.isArray(v.signals) ? v.signals.filter((s): s is string => (SAV_INTAKE_NOISE_REASONS as readonly unknown[]).includes(s)).slice(0, 10) : [],
     routed: v.routed === true };
 }

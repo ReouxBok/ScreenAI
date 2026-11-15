@@ -16,13 +16,18 @@ export async function readIntakeNoiseSenderHistory(db: Db, input: { mailboxId: s
   const address = normalizeEmailAddress(input.address);
   if (!address) throw Error("SAV_NOISE_SENDER_INVALID");
   const earlier = input.before ? lt(savMessages.receivedAt, input.before) : undefined;
-  const [inbound] = await db.select({ n: sql<number>`count(*)::int` }).from(savMessages).where(and(eq(savMessages.mailboxId, input.mailboxId),
+  // A prior inbound is "proven automatic" only when its thread projection classed THAT mail in Autre
+  // (qualified_other), no person acted on it and its thread has no ticket. Anything else counts as human history.
+  const notAutomatic = sql`(not exists (select 1 from sav.intake_console c where c.message_id = ${savMessages.id} and c.view = 'other' and c.status = 'qualified_other')
+    or exists (select 1 from sav.intake_human_events h where h.message_id = ${savMessages.id})
+    or exists (select 1 from sav.threads t where t.id = ${savMessages.threadId} and t.hubspot_ticket_id is not null))`;
+  const [inbound] = await db.select({ n: sql<number>`count(*)::int`, human: sql<number>`(count(*) filter (where ${notAutomatic}))::int` }).from(savMessages).where(and(eq(savMessages.mailboxId, input.mailboxId),
     eq(savMessages.direction, "inbound"), ne(savMessages.id, input.messageId), earlier, sql`lower(${savMessages.fromEmail}) = ${address}`));
   const [outbound] = await db.select({ n: sql<number>`count(*)::int` }).from(savMessages).where(and(eq(savMessages.mailboxId, input.mailboxId),
     eq(savMessages.direction, "outbound"), earlier, sql`exists (select 1 from unnest(${savMessages.toEmails}) as recipient where lower(recipient) = ${address})`));
   const [tickets] = await db.select({ n: sql<number>`count(*)::int` }).from(savThreads).where(and(eq(savThreads.mailboxId, input.mailboxId),
     isNotNull(savThreads.hubspotTicketId), sql`lower(${savThreads.customerEmail}) = ${address}`));
-  return { priorInbound: Number(inbound?.n ?? NaN), outboundTo: Number(outbound?.n ?? NaN), ticketThreads: Number(tickets?.n ?? NaN) };
+  return { priorInbound: Number(inbound?.n ?? NaN), priorInboundNotAutomatic: Number(inbound?.human ?? NaN), outboundTo: Number(outbound?.n ?? NaN), ticketThreads: Number(tickets?.n ?? NaN) };
 }
 
 /** The verdict for one claimed lease. Any read failure keeps the mail (closed guard code), never throws. */
@@ -54,6 +59,6 @@ export async function evaluateIntakeNoise(lease: IntakeLease, mailboxId: string,
     catch { senderHistory = null; }
     return savIntakeNoiseVerdict({ ...base, context, senderHistory });
   } catch {
-    return { revision: SAV_INTAKE_NOISE_FILTER_REVISION, verdict: "keep", reason: null, signals: [], guard: "SAV_NOISE_GUARD_EVIDENCE_UNAVAILABLE" };
+    return { revision: SAV_INTAKE_NOISE_FILTER_REVISION, verdict: "keep", reason: null, strength: null, signals: [], guard: "SAV_NOISE_GUARD_EVIDENCE_UNAVAILABLE" };
   }
 }
