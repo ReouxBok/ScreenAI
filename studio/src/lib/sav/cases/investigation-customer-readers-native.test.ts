@@ -229,16 +229,34 @@ describe("V1 CRM snapshot read from intake_executions", () => {
 });
 
 describe("attachments reader SQL and references", () => {
-  const withFiles = async (files: unknown[], extra: Record<string, unknown> = {}, env: Record<string, string | undefined> = {}, download?: never) => {
+  // Review P2-2: the attachments feature rides on SAV_V2_ATTACHMENT_MEDIA; the listing is read with it on, the download failing (nothing leaves).
+  const MEDIA_ON = { SAV_V2_ATTACHMENT_MEDIA: "images" };
+  const noDownload: CaseAttachmentDownload = async () => { throw Error("SYN_NO_DOWNLOAD"); };
+  const withFiles = async (files: unknown[], extra: Record<string, unknown> = {}, env: Record<string, string | undefined> = MEDIA_ON, download: CaseAttachmentDownload = noDownload) => {
     const threadId = await newThread(), latest = gm("latest");
     await addMail({ threadId, gmail: latest, minute: 5, body: { text: "Voir la capture.", attachments: files, ...extra } });
-    return caseCustomerContextReader({ env: () => env, ...(download ? { download } : {}) })(snapshot([threadId]), [inbound(latest, 5)]);
+    return caseCustomerContextReader({ env: () => env, download })(snapshot([threadId]), [inbound(latest, 5)]);
   };
 
-  it("lists the stored references of the latest mail without any download (media off), masked name and bounded size in KB", async () => {
+  it("review P2-2: media off (the default) gives the v4 context: no attachments block, no evidence (so no attachments instruction), nothing downloaded", async () => {
+    const files = [attachment("capture.png", "image/png", 2048), attachment("facture.pdf", "application/pdf", 10_240)];
+    const download = vi.fn<CaseAttachmentDownload>(async () => Buffer.alloc(0));
+    for (const env of [{}, { SAV_V2_ATTACHMENT_MEDIA: "off" }, { SAV_V2_ATTACHMENT_MEDIA: "yes" }]) {
+      const context = await withFiles(files, {}, env, download);
+      expect(context.attachments).toBeUndefined();
+      expect(context.evidence).toBeUndefined();
+      expect(caseCustomerAttachmentMedia(context)).toEqual([]);
+      expect(context.latestMessage!.text).toBe("Voir la capture.");
+    }
+    expect(download).not.toHaveBeenCalled();
+    expect(vi.mocked(fetch)).not.toHaveBeenCalled();
+  });
+
+  it("media on: lists the stored references of the latest mail, masked name and bounded size in KB", async () => {
     const context = await withFiles([attachment("capture.png", "image/png", 2048), attachment("facture.pdf", "application/pdf", 10_240), attachment("note.txt", "text/plain", 10)]);
-    expect(context.attachments!.files.map(file => [file.message, file.name, file.kind, file.sizeKb, file.part, file.notAttached])).toEqual([
-      ["latest", "capture.png", "image", 2, null, "media_off"], ["latest", "facture.pdf", "pdf", 10, null, "media_off"], ["latest", "note.txt", "other", 1, null, "unsupported_type"]]);
+    expect(context.attachments!.files.map(file => [file.message, file.name, file.kind, file.sizeKb, file.part])).toEqual([
+      ["latest", "capture.png", "image", 2, null], ["latest", "facture.pdf", "pdf", 10, null], ["latest", "note.txt", "other", 1, null]]);
+    expect(context.attachments!.files.find(file => file.name === "note.txt")!.notAttached).toBe("unsupported_type");
     expect(caseCustomerAttachmentMedia(context)).toEqual([]);
     expect(context.evidence).toMatchObject({ screenshotProvided: true });
     expect(vi.mocked(fetch)).not.toHaveBeenCalled();
@@ -251,7 +269,7 @@ describe("attachments reader SQL and references", () => {
     await addMail({ threadId: mine, gmail: g.latest, minute: 3, body: { text: "dernier", attachments: [attachment("dernier.png")] } });
     await addMail({ threadId: mine, gmail: g.later, minute: 8, body: { text: "plus tard", attachments: [attachment("plus-tard.png")] } });
     await addMail({ threadId: other, gmail: gm("other"), minute: 3, body: { text: "autre client", attachments: [attachment("autre-client.png")] } });
-    const context = await caseCustomerContextReader()(snapshot([mine]), [inbound(g.latest, 3)]);
+    const context = await caseCustomerContextReader({ env: () => MEDIA_ON, download: noDownload })(snapshot([mine]), [inbound(g.latest, 3)]);
     expect(context.attachments!.files.map(file => [file.message, file.name])).toEqual([["latest", "dernier.png"], ["previous", "precedent.png"]]);
     // The earlier mail's screenshot still counts as evidence for the screenshot-or-link rule.
     expect(context.evidence!.screenshotProvided).toBe(true);
@@ -292,7 +310,7 @@ describe("attachments reader SQL and references", () => {
   it("a failure of the attachments read keeps the context without files; an unreadable body is listed as attachments_unavailable", async () => {
     const threadId = await newThread(), latest = gm("latest");
     await addMail({ threadId, gmail: latest, minute: 5, body: "v1.broken.broken.broken" });
-    const context = await caseCustomerContextReader()(snapshot([threadId]), [inbound(latest, 5)]);
+    const context = await caseCustomerContextReader({ env: () => MEDIA_ON, download: noDownload })(snapshot([threadId]), [inbound(latest, 5)]);
     expect(context.latestMessage).toBeNull();
     expect(context.attachments?.missing ?? []).toEqual(expect.arrayContaining(["attachments_unavailable"]));
     expect(context.revision).toBeTruthy();

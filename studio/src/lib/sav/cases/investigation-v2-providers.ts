@@ -116,6 +116,9 @@ export function caseGeminiEmbeddingTransport(input: Readonly<{ env: () => Env; n
 }
 
 export const SAV_CASE_INVESTIGATION_PROMPT_REVISION = "sav-v2-investigation-prompt-2026-11-15.v5";
+/** Review P2-2: with SAV_V2_ATTACHMENT_MEDIA off (default) no attachments instruction is ever sent, so the prompt is the v4 one and is recorded as such. */
+export const SAV_CASE_INVESTIGATION_PROMPT_REVISION_WITHOUT_ATTACHMENTS = "sav-v2-investigation-prompt-2026-11-14.v4";
+export const caseInvestigationPromptRevision = (attachmentsOn: boolean) => attachmentsOn ? SAV_CASE_INVESTIGATION_PROMPT_REVISION : SAV_CASE_INVESTIGATION_PROMPT_REVISION_WITHOUT_ATTACHMENTS;
 const CLOSURE_JSON_SCHEMA = JSON.stringify(z.toJSONSchema(caseResolutionCheckSchema));
 const DECISION_JSON_SCHEMA = JSON.stringify(z.toJSONSchema(caseDecisionProposalSchema, { io: "input", unrepresentable: "any" }));
 /**

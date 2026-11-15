@@ -11,7 +11,7 @@ import {
 import { caseAttachmentMediaMode, readCaseCustomerAttachments, type CaseStoredMail } from "./investigation-customer-attachments-reader";
 import { buildCaseCustomerContext, reduceCaseCustomerContext, type CaseCustomerContext } from "./investigation-customer-context";
 import type { CaseInvestigationModelRequest } from "./investigation-runner";
-import { caseInvestigationPrompt, prepareCaseGeminiDecisionRequest } from "./investigation-v2-providers";
+import { caseInvestigationPrompt, caseInvestigationPromptRevision, prepareCaseGeminiDecisionRequest, SAV_CASE_INVESTIGATION_PROMPT_REVISION } from "./investigation-v2-providers";
 
 /* SAV-92 (15/11): the V2 decision model receives the customer's attachments (screenshots first). SYN data only. */
 
@@ -72,6 +72,11 @@ describe("evidence and the screenshot-or-link rule", () => {
     const legacy = caseInvestigationPrompt(request({ customerContext: baseContext() }));
     expect(legacy.instruction).not.toContain("customerContext.attachments");
     expect(caseInvestigationPrompt(request()).instruction).not.toContain("capture d'écran de l'erreur");
+  });
+  it("review P2-2: with SAV_V2_ATTACHMENT_MEDIA off the decision is recorded under main's v4 prompt revision; v5 only when the feature is on", () => {
+    expect(caseInvestigationPromptRevision(caseAttachmentMediaMode({}) !== "off")).toBe("sav-v2-investigation-prompt-2026-11-14.v4");
+    expect(caseInvestigationPromptRevision(caseAttachmentMediaMode({ SAV_V2_ATTACHMENT_MEDIA: "unknown" }) !== "off")).toBe("sav-v2-investigation-prompt-2026-11-14.v4");
+    expect(caseInvestigationPromptRevision(caseAttachmentMediaMode({ SAV_V2_ATTACHMENT_MEDIA: "images" }) !== "off")).toBe(SAV_CASE_INVESTIGATION_PROMPT_REVISION);
   });
 });
 
