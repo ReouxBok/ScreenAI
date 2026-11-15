@@ -294,6 +294,12 @@ describe("case page: pole C's reply registry, read only (SAV-10 raccord)", () =>
     const readers = connect(); readers.list.mockResolvedValue({ items: [], next: null });
     const admin = { id: "20000000-0000-4000-8000-000000000003", email: "admin@example.test", role: "admin" };
     vi.stubEnv("SAV_CASE_EFFECTS", "supervised");
+    // SAV_V2_REPLY_REVIEW absent (the delivery default): no panel, no button, even for an administrator.
+    mocks.staff.mockResolvedValueOnce(admin); readers.get.mockResolvedValueOnce(replyDetail());
+    const off = await render({ reply: replyId(1) });
+    expect(off).not.toContain("Décision de l’administrateur"); expect(off).not.toMatch(/<form|<button|type="submit"/);
+    expect(off).toContain("La validation depuis le Studio est désactivée sur cet environnement");
+    vi.stubEnv("SAV_V2_REPLY_REVIEW", "on");
     mocks.staff.mockResolvedValueOnce(admin); readers.get.mockResolvedValueOnce(replyDetail());
     const html = await render({ reply: replyId(1) });
     for (const text of ["Décision de l’administrateur", "Approuver et envoyer", "Corriger puis envoyer", "Refuser", "Réponse à valider", "Un administrateur peut approuver, corriger ou refuser"]) expect(html).toContain(text);
@@ -308,6 +314,18 @@ describe("case page: pole C's reply registry, read only (SAV-10 raccord)", () =>
     expect(await render({ reply: replyId(1) })).not.toMatch(/<form|<button|type="submit"/);
     mocks.staff.mockResolvedValueOnce(admin); readers.get.mockResolvedValueOnce(replyDetail({ validation: "approved", approvability: { ok: false, reason: "already_decided" } }));
     expect(await render({ reply: replyId(1) })).not.toContain("Décision de l’administrateur");
+    // P2-1: a Studio approval never queued gets only « Remettre en file »; the same state under another basis, or for a member, gets nothing.
+    const notQueued = (authorizationBasis: string) => replyDetail({ validation: "approved", authorizationBasis, approvability: { ok: false, reason: "already_decided" },
+      status: { code: "approved_not_queued", sent: "no", terminal: false, hold: null, cancel: null, endedBy: null, j2: { state: "none", dueAt: null } } });
+    mocks.staff.mockResolvedValueOnce(admin); readers.get.mockResolvedValueOnce(notQueued("studio_admin_correction.v1"));
+    const requeue = await render({ reply: replyId(1) });
+    expect(requeue).toContain("Remettre en file"); expect(requeue).not.toContain("Approuver et envoyer"); expect(requeue).not.toContain("Décision de l’administrateur");
+    mocks.staff.mockResolvedValueOnce(admin); readers.get.mockResolvedValueOnce(notQueued("access_auto.v1"));
+    expect(await render({ reply: replyId(1) })).not.toContain("Remettre en file");
+    readers.get.mockResolvedValueOnce(notQueued("studio_admin_review.v1"));
+    expect(await render({ reply: replyId(1) })).not.toContain("Remettre en file");
+    vi.unstubAllEnvs(); vi.stubEnv("SAV_CASE_EFFECTS", "supervised"); mocks.staff.mockResolvedValueOnce(admin); readers.get.mockResolvedValueOnce(notQueued("studio_admin_review.v1"));
+    expect(await render({ reply: replyId(1) })).not.toContain("Remettre en file");
     vi.unstubAllEnvs(); mocks.staff.mockResolvedValueOnce(admin); readers.get.mockResolvedValueOnce(replyDetail());
     expect(await render({ reply: replyId(1) })).not.toContain("Décision de l’administrateur");
   });

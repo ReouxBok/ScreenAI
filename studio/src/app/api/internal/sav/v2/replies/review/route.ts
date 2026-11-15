@@ -1,7 +1,7 @@
 import { z } from "zod";
 import { requireApiStaff } from "@/lib/auth";
 import { executionAdministrator } from "@/lib/sav/intake/execution-policy";
-import { CASE_REPLY_REVIEW_TEXT_MAX, reviewCaseReply } from "@/lib/sav/cases/case-reply-review";
+import { CASE_REPLY_REVIEW_TEXT_MAX, caseReplyReviewEnabled, reviewCaseReply } from "@/lib/sav/cases/case-reply-review";
 import { caseReplyReviewDeps } from "@/lib/sav/cases/case-reply-review-binding";
 
 export const runtime = "nodejs";
@@ -12,7 +12,7 @@ const headers = { "Cache-Control": "private, no-store", "X-Content-Type-Options"
 const IMMEDIATE_BUDGET_MS = 105_000;
 const MAX_BYTES = 32 * 1024;
 const request = z.object({
-  action: z.enum(["approve", "correct", "decline"]), token: z.string().min(1).max(200),
+  action: z.enum(["approve", "correct", "decline", "requeue"]), token: z.string().min(1).max(200),
   text: z.string().max(CASE_REPLY_REVIEW_TEXT_MAX * 2).optional(), reason: z.string().max(1000).optional(),
 }).strict();
 
@@ -22,6 +22,8 @@ const request = z.object({
  */
 export async function POST(incoming: Request) {
   const startedAt = Date.now();
+  // Off unless SAV_V2_REPLY_REVIEW=on (review item 4): the route does not exist, before any auth or body read.
+  if (!caseReplyReviewEnabled(process.env)) return Response.json({ error: "not_found" }, { status: 404, headers });
   try { await requireApiStaff("admin"); } catch { return Response.json({ error: "forbidden" }, { status: 403, headers }); }
   let staff;
   try { staff = await executionAdministrator(); } catch { return Response.json({ error: "forbidden" }, { status: 403, headers }); }

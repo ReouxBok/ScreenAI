@@ -13,7 +13,7 @@ type Mode = "idle" | "correct" | "decline";
  * SAV-92: the three decisions an administrator may take on ONE proposed reply. The token is the version the page showed (reply, exact text, case version):
  * the server refuses anything that moved since, and its registry sends at most one reply per mail. Nothing is retried by this component.
  */
-export function ReplyReviewPanel({ token, body, sensitive }: { token: string; body: string; sensitive: boolean }) {
+export function ReplyReviewPanel({ token, body, sensitive, requeue = false }: { token: string; body: string; sensitive: boolean; requeue?: boolean }) {
   const router = useRouter();
   const [mode, setMode] = useState<Mode>("idle");
   const [text, setText] = useState(body);
@@ -34,6 +34,14 @@ export function ReplyReviewPanel({ token, body, sensitive }: { token: string; bo
     if (result.ok || result.approvedValidationId) { setMode("idle"); router.refresh(); }
   });
   const shown = outcome ? (outcome.code === "forbidden" ? { tone: "danger" as const, text: "Action réservée aux administrateurs du Studio. Rien n’a été envoyé." } : describeCaseReplyReview(outcome)) : null;
+
+  if (requeue) return <div className={styles.seam} id="v2-review">
+    <h4>Réponse validée, pas encore en file</h4>
+    <p>Une validation du Studio est enregistrée mais la mise en file n’a pas abouti. Remettre en file la reprend sans nouvelle décision : une seule exécution, un seul envoi au plus, même en cas de double clic.</p>
+    {shown ? <p role={shown.tone === "success" ? "status" : "alert"}><Status tone={shown.tone}>{shown.text}</Status></p> : null}
+    {outcome?.ok || outcome?.code === "review_unconfirmed" ? null
+      : <div className={styles.filters}><Button variant="primary" busy={pending} onClick={() => send({ action: "requeue" })}>Remettre en file</Button></div>}
+  </div>;
 
   return <div className={styles.seam} id="v2-review">
     <h4>Décision de l’administrateur</h4>

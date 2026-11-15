@@ -1,8 +1,9 @@
-import { beforeEach, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, expect, it, vi } from "vitest";
 const mocks = vi.hoisted(() => ({ staff: vi.fn(), admin: vi.fn(), review: vi.fn(), deps: vi.fn() }));
 vi.mock("@/lib/auth", () => ({ requireApiStaff: mocks.staff }));
 vi.mock("@/lib/sav/intake/execution-policy", () => ({ executionAdministrator: mocks.admin }));
-vi.mock("@/lib/sav/cases/case-reply-review", () => ({ CASE_REPLY_REVIEW_TEXT_MAX: 6000, reviewCaseReply: mocks.review }));
+vi.mock("@/lib/sav/cases/case-reply-review", () => ({ CASE_REPLY_REVIEW_TEXT_MAX: 6000, reviewCaseReply: mocks.review,
+  caseReplyReviewEnabled: (env: Record<string, string | undefined>) => env.SAV_V2_REPLY_REVIEW === "on" }));
 vi.mock("@/lib/sav/cases/case-reply-review-binding", () => ({ caseReplyReviewDeps: mocks.deps }));
 import { POST } from "./route";
 
@@ -12,13 +13,27 @@ const token = `v1.30000000-0000-4000-8000-000000000001.${"a".repeat(64)}.4`;
 const post = (body: unknown, origin = "https://studio.example.invalid", type = "application/json") =>
   new Request(URL_, { method: "POST", headers: { origin, "content-type": type }, body: typeof body === "string" ? body : JSON.stringify(body) });
 beforeEach(() => {
-  vi.clearAllMocks();
+  vi.clearAllMocks(); vi.stubEnv("SAV_V2_REPLY_REVIEW", "on");
   mocks.staff.mockResolvedValue({ actorId: "user_x", email: "admin@example.invalid", role: "admin" });
   mocks.admin.mockResolvedValue({ id: "20000000-0000-4000-8000-000000000003", email: "admin@example.invalid", role: "admin" });
   mocks.deps.mockReturnValue({ synthetic: true });
   mocks.review.mockResolvedValue({ ok: true, action: "approve", caseId: "c", validationId: "v", executionId: "e", send: "attempted" });
 });
 
+afterEach(() => { vi.unstubAllEnvs(); });
+
+it("SAV_V2_REPLY_REVIEW absent or not exactly « on »: 404 before any auth, body read or decision", async () => {
+  for (const value of [undefined, "off", "ON", "1"]) {
+    vi.unstubAllEnvs(); if (value !== undefined) vi.stubEnv("SAV_V2_REPLY_REVIEW", value); else delete process.env.SAV_V2_REPLY_REVIEW;
+    const response = await POST(post({ action: "approve", token }));
+    expect(response.status).toBe(404); expect(await response.json()).toEqual({ error: "not_found" });
+  }
+  expect(mocks.staff).not.toHaveBeenCalled(); expect(mocks.admin).not.toHaveBeenCalled(); expect(mocks.review).not.toHaveBeenCalled();
+});
+it("the requeue action is accepted and handed to the same review, with the server-side administrator", async () => {
+  expect((await POST(post({ action: "requeue", token }))).status).toBe(200);
+  expect(mocks.review).toHaveBeenCalledWith({ action: "requeue", token }, { staffUserId: "20000000-0000-4000-8000-000000000003", email: "admin@example.invalid" }, { synthetic: true });
+});
 it("a member or a non-SAV administrator is refused with 403 before anything is read or decided", async () => {
   mocks.staff.mockRejectedValueOnce(Error("UNAUTHORIZED"));
   expect((await POST(post({ action: "approve", token }))).status).toBe(403);

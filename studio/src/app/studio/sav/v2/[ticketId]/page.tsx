@@ -11,7 +11,7 @@ import { safeStudioHref } from "@/lib/ui/navigation-history";
 import { BackLink } from "@/components/ui/back-link";
 import { Badge, PageHeader, Status } from "@/components/ui/primitives";
 import { caseReplyEditableBody } from "@/lib/sav/cases/case-reply-outbound";
-import { caseReplyReviewSensitive, encodeCaseReplyReviewToken } from "@/lib/sav/cases/case-reply-review-token";
+import { caseReplyRequeueable, caseReplyReviewEnabled, caseReplyReviewSensitive, encodeCaseReplyReviewToken } from "@/lib/sav/cases/case-reply-review-token";
 import { describeCaseReply, describeCaseReplyDetail, readCaseReplies, readCaseReply, summarizeCaseReplies } from "../case-replies";
 import { ReplyReviewPanel } from "../reply-review-panel";
 import { caseReplyReaders } from "../case-replies-port";
@@ -62,7 +62,11 @@ export default async function SavV2CasePage({ params, searchParams }: { params: 
   const notice = noticeRead ? describeHandoffNotice(noticeRead, { enabled: readHandoffNoticeConfig(process.env).mode === "on" }) : null;
   const repliesSummary = summarizeCaseReplies(replies);
   // SAV-92: the decision is offered only on what the page itself read: the selected reply, still proposed, with the case version shown above.
-  const reviewable = admin && effects.mode === "supervised" && reply.state === "ok" && reply.reply.validation === "proposed" ? reply.reply : null;
+  // Off unless SAV_V2_REPLY_REVIEW=on (review item 4): no panel, no button, whatever the role.
+  const reviewOn = admin && effects.mode === "supervised" && caseReplyReviewEnabled(process.env);
+  const reviewable = reviewOn && reply.state === "ok" && reply.reply.validation === "proposed" ? reply.reply : null;
+  // Review P2-1: a Studio approval that never reached the queue gets only "Remettre en file".
+  const requeueable = reviewOn && reply.state === "ok" && caseReplyRequeueable(reply.reply) ? reply.reply : null;
   let reviewBody: string | null = null;
   if (reviewable) { try { reviewBody = caseReplyEditableBody(reviewable.proposal.text); } catch { reviewBody = null; } }
   const cardLine = (ref: { knowledgeId: string; contentVersionId: string }) => { const card = cardsRead.state === "ok" ? cardsRead.titleOf(ref) : null;
@@ -182,7 +186,8 @@ export default async function SavV2CasePage({ params, searchParams }: { params: 
       </div>
       <div className={styles.seam} id="v2-approval">
         <h3>Validation humaine de l’envoi</h3>
-        {admin ? <p>Un administrateur peut approuver, corriger ou refuser une réponse proposée, dans « Réponse sélectionnée » ci-dessous. Une proposition n’est jamais présentée comme validée : seule une décision enregistrée par le registre compte.</p>
+        {admin && reviewOn ? <p>Un administrateur peut approuver, corriger ou refuser une réponse proposée, dans « Réponse sélectionnée » ci-dessous. Une proposition n’est jamais présentée comme validée : seule une décision enregistrée par le registre compte.</p>
+          : admin ? <p>La validation depuis le Studio est désactivée sur cet environnement : rien ne peut être validé ni envoyé depuis cette page. Seule une décision enregistrée par le registre compte.</p>
           : <p>Seul un administrateur du Studio peut valider, corriger ou refuser une réponse proposée. Rien ne peut être validé ni envoyé depuis cette page avec votre rôle, et une proposition n’y est jamais présentée comme validée. Seule une décision enregistrée par le registre compte : voir « Réponse préparée ou envoyée, et preuves ».</p>}
       </div>
       <div className={styles.seam} id="v2-note">
@@ -230,6 +235,8 @@ export default async function SavV2CasePage({ params, searchParams }: { params: 
             <p>{shown.validation}</p>
             {reviewable && reviewable.id === reply.reply.id && reviewBody !== null ? <ReplyReviewPanel key={`${reviewable.id}:${view.version}`} body={reviewBody} sensitive={caseReplyReviewSensitive(snapshot)}
               token={encodeCaseReplyReviewToken({ validationId: reviewable.id, payloadHash: reviewable.payloadHash, caseVersion: snapshot.version })}/> : null}
+            {requeueable && requeueable.id === reply.reply.id ? <ReplyReviewPanel key={`requeue:${requeueable.id}:${view.version}`} body="" sensitive={caseReplyReviewSensitive(snapshot)} requeue
+              token={encodeCaseReplyReviewToken({ validationId: requeueable.id, payloadHash: requeueable.payloadHash, caseVersion: snapshot.version })}/> : null}
             {reply.reply.authorizationBasis ? <p className={styles.small}>Base de la décision enregistrée : {reply.reply.authorizationBasis}</p> : null}
           </>; })()}
       </div>}

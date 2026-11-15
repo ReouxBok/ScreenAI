@@ -1,7 +1,16 @@
 // SAV-92: the pure part of a Studio reply decision, shared by the page (server component) and the decision itself. No database, no clock, no network.
 import { SAV_CASE_SENSITIVE_FAMILIES, type CaseSnapshot } from "./case-types";
+import { CASE_REPLY_STUDIO_APPROVAL_BASIS, CASE_REPLY_STUDIO_CORRECTION_BASIS } from "./case-reply-validation";
 
 export const CASE_REPLY_REVIEW_TEXT_MAX = 6000;
+
+/** Review item 4: the Studio decision exists only when `SAV_V2_REPLY_REVIEW=on` exactly; absent or any other value, no panel and no route. */
+export const caseReplyReviewEnabled = (env: Readonly<Record<string, string | undefined>>) => env.SAV_V2_REPLY_REVIEW === "on";
+
+/** Review P2-1: the "Remettre en file" state. A reply a Studio administrator approved (one of the two Studio bases) that never reached the queue. The server re-checks it. */
+export const caseReplyRequeueable = (reply: Readonly<{ validation: string; authorizationBasis: string | null; status: Readonly<{ code: string }> }>) =>
+  reply.validation === "approved" && reply.status.code === "approved_not_queued"
+  && (reply.authorizationBasis === CASE_REPLY_STUDIO_APPROVAL_BASIS || reply.authorizationBasis === CASE_REPLY_STUDIO_CORRECTION_BASIS);
 
 // ---------------------------------------------------------------------------------------------------------------------------------
 // The version token: what the person's screen showed. Not a secret and not a right (the route's administrator check is): every value is re-read and compared.

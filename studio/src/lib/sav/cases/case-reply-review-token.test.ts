@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { describeCaseReplyReview } from "@/app/studio/sav/v2/case-replies";
-import { caseReplyReviewSensitive, encodeCaseReplyReviewToken, parseCaseReplyReviewToken } from "./case-reply-review-token";
+import { caseReplyRequeueable, caseReplyReviewEnabled, caseReplyReviewSensitive, encodeCaseReplyReviewToken, parseCaseReplyReviewToken } from "./case-reply-review-token";
 import { caseReplyTextSafetyProblems } from "./decision-validator";
 import type { CaseSnapshot } from "./case-types";
 import { SAV_CASE_ACCESS_URL } from "./decision-contract";
@@ -55,8 +55,30 @@ describe("what the administrator reads", () => {
       .toBe("Le texte corrigé est refusé par les contrôles de sécurité de l’envoi automatique : le texte demande un mot de passe, un code ou un autre secret ; lien ou nom de domaine non autorisé : https://x.example.invalid. Rien n’a été envoyé.");
     expect(describeCaseReplyReview({ ok: false, code: "case_version_changed" }).text).toContain("Actualisez la page. Rien n’a été envoyé.");
     expect(describeCaseReplyReview({ ok: false, code: "sensitive" }).text).toContain("aucun envoi depuis ce bouton");
-    expect(describeCaseReplyReview({ ok: false, code: "owner_unread", approvedValidationId: id }).text).toMatch(/^Validation enregistrée, mais la mise en file a été refusée .* Rien n’est parti\.$/);
+    expect(describeCaseReplyReview({ ok: false, code: "owner_unread", approvedValidationId: id }).text).toMatch(/^Validation enregistrée, mais la mise en file a été refusée .* Rien n’est parti\. Actualisez la page : .*$/);
     expect(describeCaseReplyReview({ ok: false, code: "review_unconfirmed" })).toMatchObject({ tone: "warning", text: expect.not.stringContaining("Rien n’a été envoyé") });
     expect(describeCaseReplyReview({ ok: false, code: "future_code" }).text).toBe("Action refusée (code future_code). Rien n’a été envoyé.");
+  });
+});
+
+describe("review follow-up: the flag and the « Remettre en file » state", () => {
+  it("SAV_V2_REPLY_REVIEW is on only when exactly « on »", () => {
+    expect(caseReplyReviewEnabled({ SAV_V2_REPLY_REVIEW: "on" })).toBe(true);
+    for (const value of [undefined, "", "off", "ON", "true", "1", " on"]) expect(caseReplyReviewEnabled({ SAV_V2_REPLY_REVIEW: value })).toBe(false);
+  });
+  it("only a Studio approval (either Studio basis) that is approved and not queued", () => {
+    const at = (validation: string, authorizationBasis: string | null, code: string) => caseReplyRequeueable({ validation, authorizationBasis, status: { code } });
+    expect(at("approved", "studio_admin_review.v1", "approved_not_queued")).toBe(true);
+    expect(at("approved", "studio_admin_correction.v1", "approved_not_queued")).toBe(true);
+    expect(at("approved", "access_auto.v1", "approved_not_queued")).toBe(false);
+    expect(at("approved", null, "approved_not_queued")).toBe(false);
+    expect(at("approved", "studio_admin_review.v1", "queued")).toBe(false);
+    expect(at("proposed", "studio_admin_review.v1", "approved_not_queued")).toBe(false);
+  });
+  it("a requeue success and a queue failure say what happened and what to do", () => {
+    expect(describeCaseReplyReview({ ok: true, action: "requeue", send: "catch_up" }).text).toMatch(/^Réponse remise en file\./);
+    expect(describeCaseReplyReview({ ok: false, code: "owner_read_failed", approvedValidationId: id }).text).toContain("« Remettre en file »");
+    expect(describeCaseReplyReview({ ok: false, code: "already_queued" }).text).toContain("déjà en file");
+    expect(describeCaseReplyReview({ ok: false, code: "review_off" }).text).toContain("désactivée");
   });
 });

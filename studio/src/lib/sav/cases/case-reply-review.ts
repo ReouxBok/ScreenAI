@@ -23,7 +23,7 @@ import { CASE_REPLY_STUDIO_APPROVAL_BASIS, CASE_REPLY_STUDIO_CORRECTION_BASIS, t
 import { queueValidatedCaseReply } from "./case-runtime-effects";
 import { listCaseEvents, readCase, transitionCaseOwner } from "./case-store";
 import { judgeCurrentTicketOwner } from "./case-ticket-owner";
-import { CASE_REPLY_REVIEW_TEXT_MAX, caseReplyReviewSensitive, parseCaseReplyReviewToken } from "./case-reply-review-token";
+import { CASE_REPLY_REVIEW_TEXT_MAX, caseReplyReviewEnabled, caseReplyReviewSensitive, parseCaseReplyReviewToken } from "./case-reply-review-token";
 import { caseReplyTextSafetyProblems, type CaseReplyTextSafetyProblem } from "./decision-validator";
 import type { ImmediateCaseReplySend } from "./immediate-send-budget";
 import { caseStampBlockId } from "./investigation-access-scope";
@@ -31,7 +31,8 @@ import { readCaseInvestigationProgress } from "./investigation-record";
 import { latestInvestigationInput } from "./investigation-runner";
 
 export const CASE_REPLY_REVIEW_REVISION = "sav-v2-reply-review.v1";
-export { encodeCaseReplyReviewToken, parseCaseReplyReviewToken, caseReplyReviewSensitive, CASE_REPLY_REVIEW_TEXT_MAX } from "./case-reply-review-token";
+export { encodeCaseReplyReviewToken, parseCaseReplyReviewToken, caseReplyReviewEnabled, caseReplyReviewSensitive, CASE_REPLY_REVIEW_TEXT_MAX } from "./case-reply-review-token";
+const STUDIO_BASES: readonly string[] = [CASE_REPLY_STUDIO_APPROVAL_BASIS, CASE_REPLY_STUDIO_CORRECTION_BASIS];
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 /** The authorizer of ONE Studio decision: this administrator, this action, this exact payload, one basis. Anything else is refused (C's port then refuses). */
@@ -44,7 +45,8 @@ export function studioReviewAuthorizer(expected: Readonly<{ staffUserId: string;
 // The decision
 // ---------------------------------------------------------------------------------------------------------------------------------
 
-export type CaseReplyReviewAction = "approve" | "correct" | "decline";
+/** `requeue` (review P2-1): only the queue step again, for a reply a Studio administrator approved that has no execution (the queue failed after the decision). */
+export type CaseReplyReviewAction = "approve" | "correct" | "decline" | "requeue";
 export type CaseReplyReviewInput = Readonly<{ action: CaseReplyReviewAction; token: string; text?: string; reason?: string }>;
 /** The administrator, as the route's server-side checks resolved them (staff row id, a UUID). Never taken from the request body. */
 export type CaseReplyReviewer = Readonly<{ staffUserId: string; email: string }>;
@@ -60,7 +62,7 @@ export type CaseReplyReviewDeps = Readonly<{
 export type CaseReplyReviewResult =
   | Readonly<{
     ok: true; action: CaseReplyReviewAction; caseId: string; validationId: string;
-    /** approve / correct: the execution of the reply (one per mail); `send`: whether this request started the pass on it. */
+    /** approve / correct / requeue: the execution of the reply (one per mail); `send`: whether this request started the pass on it. */
     executionId?: string; send?: "attempted" | "catch_up";
     /** decline: whether the case was handed to the team. */
     handoff?: "done" | "failed";
@@ -97,8 +99,10 @@ export async function reviewCaseReply(input: CaseReplyReviewInput, reviewer: Cas
   const token = parseCaseReplyReviewToken(input.token);
   if (!token) return no("token_invalid");
   if (!UUID.test(reviewer.staffUserId)) return no("reviewer_invalid");
-  if (!["approve", "correct", "decline"].includes(input.action)) return no("action_invalid");
+  if (!["approve", "correct", "decline", "requeue"].includes(input.action)) return no("action_invalid");
   const env = deps.env();
+  // Off unless `SAV_V2_REPLY_REVIEW=on` (review item 4): the route refuses first, this is the second fence.
+  if (!caseReplyReviewEnabled(env)) return no("review_off");
   if (readCaseEffectsMode(env).mode !== "supervised") return no("effects_off");
   const db = requireDb();
   const [row] = await db.select().from(savCaseReplyValidations).where(eq(savCaseReplyValidations.id, token.validationId));
@@ -111,7 +115,11 @@ export async function reviewCaseReply(input: CaseReplyReviewInput, reviewer: Cas
   };
   // The token first: a new proposal (superseded), a decision taken elsewhere, a new mail or a takeover since the screen was built.
   if (row.payloadHash !== token.payloadHash) return refuse("payload_changed");
-  if (row.state !== "proposed") return refuse("already_decided", { detail: row.state });
+  if (input.action === "requeue") {
+    // Only a Studio approval that never reached the queue: anything else is not this button's (an automatic approval is re-queued by its own passage).
+    if (row.state !== "approved" || !row.authorizationBasis || !STUDIO_BASES.includes(row.authorizationBasis)) return refuse("not_requeueable", { detail: row.state });
+    if (row.executionId) return refuse("already_queued");
+  } else if (row.state !== "proposed") return refuse("already_decided", { detail: row.state });
   if (snapshot.version !== token.caseVersion) return refuse("case_version_changed");
   if (snapshot.owner !== "agent") return refuse("owner_changed");
 
@@ -133,7 +141,7 @@ export async function reviewCaseReply(input: CaseReplyReviewInput, reviewer: Cas
     return { ok: true, action: "decline", caseId: row.caseId, validationId: row.id, handoff };
   }
 
-  // approve / correct: a send. The case must still be the agent's, not sensitive, not paused, its block not off, the CRM ticket still V2's, an execution policy in force.
+  // approve / correct / requeue: a send. The case must still be the agent's, not sensitive, not paused, its block not off, the CRM ticket still V2's, an execution policy in force.
   if (caseReplyReviewSensitive(snapshot)) return refuse("sensitive");
   for (const agent of ["intake", "v2"] as const) {
     const pause = savAgentPauseCode(await readSavAgentPause(db, agent));
@@ -148,8 +156,11 @@ export async function reviewCaseReply(input: CaseReplyReviewInput, reviewer: Cas
   const owner = await judgeCurrentTicketOwner(deps.store.readTicketOwner, snapshot.ticketId);
   if (!owner.ok) return refuse(owner.code);
 
-  let validationId = row.id, payloadHash = row.payloadHash, basis = CASE_REPLY_STUDIO_APPROVAL_BASIS, seen = { payloadHash: row.payloadHash, caseVersion: row.caseVersion, recipient: row.recipient };
+  let validationId = row.id, payloadHash = row.payloadHash, basis = input.action === "requeue" ? row.authorizationBasis! : CASE_REPLY_STUDIO_APPROVAL_BASIS;
+  let seen = { payloadHash: row.payloadHash, caseVersion: row.caseVersion, recipient: row.recipient }, changed = false;
   if (input.action === "correct") {
+    // Review P2-2: every validated correction rests on the correction basis, the text changed or not.
+    basis = CASE_REPLY_STUDIO_CORRECTION_BASIS;
     const text = typeof input.text === "string" ? input.text.replace(/\r\n?/g, "\n").trim() : "";
     if (!text) return refuse("text_empty");
     if (text.length > CASE_REPLY_REVIEW_TEXT_MAX) return refuse("text_too_long");
@@ -161,20 +172,30 @@ export async function reviewCaseReply(input: CaseReplyReviewInput, reviewer: Cas
     const accessOpen = snapshot.body.openRequests.some(request => request.status === "open" && request.family === "access");
     const problems = caseReplyTextSafetyProblems(corrected.text, { accessOpen, answersOrAsks: corrected.purpose === "answer" || corrected.purpose === "question" });
     if (problems.length) return refuse("text_refused", { problems });
+    // Review P2-2: the provenance is judged BEFORE anything is stored, under the basis the approval will carry: a correction it would refuse replaces nothing.
+    if (deps.store.pilotProvenance) {
+      let unproven: string | null;
+      try { unproven = await deps.store.pilotProvenance(corrected, { basis }); } catch { unproven = "provenance_unreadable"; }
+      if (unproven) return refuse("provenance_unproven", { detail: unproven });
+    }
     if (caseReplyPayloadHash(corrected) !== row.payloadHash) {
       const submitted = await submitCaseReplyProposal(corrected, deps.store, { supersedes: { validationId: row.id, payloadHash: row.payloadHash } });
       if (!submitted.ok) return refuse(submitted.code, submitted.detail ? { detail: submitted.detail } : {});
       const [stored] = await db.select().from(savCaseReplyValidations).where(eq(savCaseReplyValidations.id, submitted.id));
       if (!stored) return refuse("unknown");
-      validationId = stored.id; payloadHash = stored.payloadHash; basis = CASE_REPLY_STUDIO_CORRECTION_BASIS;
+      validationId = stored.id; payloadHash = stored.payloadHash;
       seen = { payloadHash: stored.payloadHash, caseVersion: stored.caseVersion, recipient: stored.recipient };
     }
   }
-  const decided = await decideCaseReply({ action: "approve", validationId, approverId: reviewer.staffUserId, seen, deps: deps.store, expectedCaseVersion: token.caseVersion,
-    authorizer: studioReviewAuthorizer({ staffUserId: reviewer.staffUserId, action: "approve", payloadHash, basis }) });
-  if (!decided.ok) return refuse(decided.code, decided.detail ? { detail: decided.detail } : {});
+  if (input.action !== "requeue") {
+    const decided = await decideCaseReply({ action: "approve", validationId, approverId: reviewer.staffUserId, seen, deps: deps.store, expectedCaseVersion: token.caseVersion,
+      authorizer: studioReviewAuthorizer({ staffUserId: reviewer.staffUserId, action: "approve", payloadHash, basis }) });
+    if (!decided.ok) return refuse(decided.code, decided.detail ? { detail: decided.detail } : {});
+    changed = decided.changed;
+  }
+  // The queue is C's and idempotent: a replay (double click, a second requeue) returns the same execution, `created: false`.
   const queued = await queueValidatedCaseReply({ validationId, policy: { id: config.policyId, hash: config.policyHash }, deps: deps.store });
-  await audit(reviewer, row.id, { decision: input.action, caseId: row.caseId, ticketId: snapshot.ticketId, validationId, basis, changed: decided.changed,
+  await audit(reviewer, row.id, { decision: input.action, caseId: row.caseId, ticketId: snapshot.ticketId, validationId, basis, changed,
     executionId: queued.ok ? queued.executionId : null, queued: queued.ok, queueCode: queued.ok ? null : queued.code });
   if (!queued.ok) return refuse(queued.code, { approvedValidationId: validationId, ...("detail" in queued && queued.detail ? { detail: queued.detail } : {}) });
   // Only the request that CREATED the execution starts the pass on it; a replay leaves it to the pass already running or to the catch-up (never a second send).

@@ -163,7 +163,7 @@ export function describeCaseReplyDetail(reply: CaseReplyDetail, date: (value: st
 // ---------------------------------------------------------------------------------------------------------------------------------
 
 export type CaseReplyReviewOutcome = Readonly<{
-  ok: boolean; code?: string; detail?: string; action?: "approve" | "correct" | "decline"; send?: "attempted" | "catch_up"; handoff?: "done" | "failed";
+  ok: boolean; code?: string; detail?: string; action?: "approve" | "correct" | "decline" | "requeue"; send?: "attempted" | "catch_up"; handoff?: "done" | "failed";
   problems?: readonly Readonly<{ code: string; detail?: string }>[]; approvedValidationId?: string;
 }>;
 const problemLabels: Record<string, string> = {
@@ -183,6 +183,7 @@ const refusalLabels: Record<string, string> = {
   owner_human: "Le ticket HubSpot est attribué à une personne : l’agent ne répond plus.",
   owner_none: "Le ticket HubSpot n’a plus de propriétaire V2.",
   owner_unread: "Propriétaire du ticket HubSpot illisible : envoi refusé par prudence.",
+  owner_read_failed: "Propriétaire du ticket HubSpot illisible : envoi refusé par prudence.", owner_unknown: "Propriétaire du ticket HubSpot illisible : envoi refusé par prudence.",
   sensitive: "Dossier sensible (finance, résiliation ou autre sujet réservé à l’équipe) : aucun envoi depuis ce bouton. Vous pouvez refuser pour le confier à l’équipe.",
   paused: "Agent en pause : aucun envoi tant que la pause dure.",
   block_off: "Bloc éteint : aucun envoi pour ce bloc.", block_paused: "Bloc en pause : aucun envoi pour ce bloc.", block_setting_invalid: "Réglage du bloc illisible : aucun envoi.",
@@ -191,6 +192,10 @@ const refusalLabels: Record<string, string> = {
   text_refused: "Le texte corrigé est refusé par les contrôles de sécurité de l’envoi automatique",
   reason_invalid: "Motif obligatoire : 3 à 500 caractères.",
   provenance_unproven: "La provenance de la réponse n’est plus prouvée (décision, périmètre ou fiches modifiés).",
+  not_requeueable: "Cette réponse n’est pas une validation du Studio en attente de mise en file. Actualisez la page.",
+  already_queued: "Cette réponse est déjà en file d’envoi : rien n’est remis. Actualisez la page.",
+  review_off: "La validation depuis le Studio est désactivée sur cet environnement.",
+  proposal_invalid: "Cette proposition porte la mention d’envoi automatique : utilisez « Corriger puis envoyer » (le texte peut rester identique).",
   new_input: "Un nouveau mail du client est arrivé : la réponse proposée ne vaut plus.",
   not_admitted: "Le dossier n’est plus admis pour l’agent.", recipient_changed: "Le destinataire n’est plus celui du mail auquel on répond.",
   trigger_already_approved: "Une réponse à ce mail est déjà validée : une seule réponse par mail.", situation_already_answered: "Cette situation a déjà une réponse validée ou envoyée.",
@@ -201,11 +206,11 @@ export function describeCaseReplyReview(outcome: CaseReplyReviewOutcome): Readon
   if (outcome.ok && outcome.action === "decline") return outcome.handoff === "failed"
     ? { tone: "warning", text: "Refus enregistré, rien n’est parti. Le transfert à l’équipe a échoué : confiez le dossier depuis la console." }
     : { tone: "success", text: "Refus enregistré, rien n’est parti. Le dossier est confié à l’équipe." };
-  if (outcome.ok) return { tone: "success", text: `${outcome.action === "correct" ? "Texte corrigé validé" : "Réponse validée"}. ${outcome.send === "attempted"
+  if (outcome.ok) return { tone: "success", text: `${outcome.action === "correct" ? "Texte corrigé validé" : outcome.action === "requeue" ? "Réponse remise en file" : "Réponse validée"}. ${outcome.send === "attempted"
     ? "L’envoi a été lancé par le registre : son état réel (envoyé, incertain, en attente) est affiché ci-dessous."
     : "Elle part au prochain passage automatique (10 minutes au plus) : son état est affiché ci-dessous."} Une seule réponse par mail, jamais de renvoi automatique.` };
   const code = outcome.code ?? "unknown";
-  if (outcome.approvedValidationId) return { tone: "danger", text: `Validation enregistrée, mais la mise en file a été refusée (${refusalLabels[code] ?? code}). Rien n’est parti.` };
+  if (outcome.approvedValidationId) return { tone: "danger", text: `Validation enregistrée, mais la mise en file a été refusée (${refusalLabels[code] ?? code}). Rien n’est parti. Actualisez la page : le bouton « Remettre en file » reprend la mise en file quand la cause est levée.` };
   const base = refusalLabels[code] ?? `Action refusée (code ${code}).`;
   const problems = code === "text_refused" && outcome.problems?.length ? ` : ${outcome.problems.map(caseReplyReviewProblemLabel).join(" ; ")}.` : code === "text_refused" ? "." : "";
   return { tone: code === "review_unconfirmed" ? "warning" : "danger", text: `${base}${problems}${code === "review_unconfirmed" ? "" : " Rien n’a été envoyé."}` };

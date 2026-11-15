@@ -90,11 +90,23 @@ beforeEach(async () => {
     const grant = await approveIntakeExecutionPolicy(policy);
     policyId = grant.id; policyHash = grant.policyHash;
   }
-  environment = { SAV_CASE_EFFECTS: "supervised", SAV_INTAKE_EXECUTION_MODE: "execute", SAV_INTAKE_EXECUTION_POLICY_ID: policyId, SAV_INTAKE_EXECUTION_POLICY_SHA256: policyHash, SAV_CODE_REVISION: "a".repeat(40), HUBSPOT_ACCESS_TOKEN: "fake" };
+  environment = { SAV_V2_REPLY_REVIEW: "on", SAV_CASE_EFFECTS: "supervised", SAV_INTAKE_EXECUTION_MODE: "execute", SAV_INTAKE_EXECUTION_POLICY_ID: policyId, SAV_INTAKE_EXECUTION_POLICY_SHA256: policyHash, SAV_CODE_REVISION: "a".repeat(40), HUBSPOT_ACCESS_TOKEN: "fake" };
   expect(intakeExecutionConfig(environment)).not.toBeNull();
   sendNow = vi.fn<ImmediateCaseReplySend>(async () => ({ skipped: "synthetic" }));
 });
 afterEach(async () => { vi.unstubAllEnvs(); vi.unstubAllGlobals(); vi.restoreAllMocks(); await setPause("v2", null); await setPause("intake", null); });
+
+describe("SAV_V2_REPLY_REVIEW: off unless exactly « on »", () => {
+  it("absent, off or any other value: every action is refused review_off, nothing is decided, queued, sent or audited", async () => {
+    const s = await proposedReply();
+    for (const value of [undefined, "off", "ON", "true", ""]) {
+      environment = { ...environment, SAV_V2_REPLY_REVIEW: value };
+      for (const action of ["approve", "correct", "decline", "requeue"] as const)
+        expect(await review({ action, token: s.token, text: "Bonjour, corrigé.", reason: "Motif synthétique" })).toEqual({ ok: false, code: "review_off" });
+    }
+    await nothingHappened(s);
+  });
+});
 
 describe("approve and send: the registry's own path, once", () => {
   it("approves the exact proposal with the Studio basis, queues ONE execution, starts ONE immediate pass, audits who and when", async () => {
@@ -123,6 +135,70 @@ describe("approve and send: the registry's own path, once", () => {
     expect(sendNow).toHaveBeenCalledTimes(1);
     expect(await review({ action: "approve", token: s.token })).toEqual({ ok: false, code: "already_decided", detail: "approved" });
     expect(await executionsOf(s.caseId)).toHaveLength(1); expect(sendNow).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("P2-1: an approval recorded but not queued is re-queued by « Remettre en file », once", () => {
+  /** An owner reader that fails on its n-th call only (the queue's read), as a passing CRM outage would. */
+  const failingOnCall = (n: number) => { let calls = 0; return storeDeps({ readTicketOwner: async () => { calls += 1; if (calls === n) throw Error("SYNTHETIC_CRM_DOWN"); return "v2" as const; } }); };
+  const requeueToken = async (caseId: string, validationId: string, payloadHash: string) =>
+    encodeCaseReplyReviewToken({ validationId, payloadHash, caseVersion: (await readCase(caseId))!.version });
+
+  it("approve: the queue fails after the decision; the requeue makes ONE execution and ONE immediate pass; a second and concurrent requeues double nothing", async () => {
+    const s = await proposedReply();
+    // Call 1: the review's own check; call 2: the queue's.
+    expect(await review({ action: "approve", token: s.token }, reviewer, deps(failingOnCall(2)))).toMatchObject({ ok: false, code: "owner_read_failed", approvedValidationId: s.validationId });
+    expect(await validationsOf(s.caseId)).toMatchObject([{ id: s.validationId, state: "approved", authorization_basis: CASE_REPLY_STUDIO_APPROVAL_BASIS, execution_id: null }]);
+    expect(await executionsOf(s.caseId)).toHaveLength(0); expect(sendNow).not.toHaveBeenCalled();
+    // « Approuver » again is refused: it is no longer proposed.
+    expect(await review({ action: "approve", token: s.token })).toEqual({ ok: false, code: "already_decided", detail: "approved" });
+    const token = await requeueToken(s.caseId, s.validationId, caseReplyPayloadHash(s.proposal));
+    const first = await review({ action: "requeue", token });
+    expect(first).toMatchObject({ ok: true, action: "requeue", validationId: s.validationId, send: "catch_up" });
+    const executions = await executionsOf(s.caseId);
+    expect(executions).toHaveLength(1); expect(sendNow).toHaveBeenCalledTimes(1);
+    expect(await validationsOf(s.caseId)).toMatchObject([{ id: s.validationId, state: "approved", execution_id: executions[0]!.id }]);
+    // A second click, then two administrators at once: refused as already queued (or the same execution), never a second one.
+    expect(await review({ action: "requeue", token })).toEqual({ ok: false, code: "already_queued" });
+    const again = await Promise.all([review({ action: "requeue", token }), review({ action: "requeue", token }, otherReviewer)]);
+    for (const r of again) expect(r.ok ? r.executionId : r.code).toBe(r.ok ? executions[0]!.id : "already_queued");
+    expect(await executionsOf(s.caseId)).toHaveLength(1); expect(sendNow).toHaveBeenCalledTimes(1);
+    expect((await auditsOf(s.validationId)).map(entry => (entry.technicalMetadata as { decision: string }).decision).sort()).toEqual(["approve", "requeue"]);
+  });
+
+  it("two requeues racing on an approved, unqueued reply: one execution, one immediate pass", async () => {
+    const s = await proposedReply();
+    expect(await review({ action: "approve", token: s.token }, reviewer, deps(failingOnCall(2)))).toMatchObject({ ok: false, approvedValidationId: s.validationId });
+    const token = await requeueToken(s.caseId, s.validationId, caseReplyPayloadHash(s.proposal));
+    const results = await Promise.all([review({ action: "requeue", token }), review({ action: "requeue", token }), review({ action: "requeue", token }, otherReviewer)]);
+    expect(results.filter(r => r.ok).length).toBeGreaterThanOrEqual(1);
+    for (const r of results) if (!r.ok) expect(r.code).toBe("already_queued");
+    expect(await executionsOf(s.caseId)).toHaveLength(1); expect(sendNow).toHaveBeenCalledTimes(1);
+  });
+
+  it("correct: the corrected text is stored and approved, the queue fails; the requeue on the corrected reply queues it once, under the correction basis", async () => {
+    const s = await proposedReply();
+    // Call 1: the review's check; call 2: the corrected proposal's store; call 3: the queue's.
+    const failed = await review({ action: "correct", token: s.token, text: "Bonjour,\n\nTexte corrigé, file en panne (synthétique)." }, reviewer, deps(failingOnCall(3)));
+    expect(failed).toMatchObject({ ok: false, code: "owner_read_failed" });
+    const corrected = (failed as { approvedValidationId?: string }).approvedValidationId!;
+    expect(await validationsOf(s.caseId)).toMatchObject([{ state: "superseded" }, { id: corrected, state: "approved", authorization_basis: CASE_REPLY_STUDIO_CORRECTION_BASIS, execution_id: null }]);
+    const [row] = await rows("SELECT payload_hash FROM sav.case_reply_validations WHERE id = $1", [corrected]);
+    const token = await requeueToken(s.caseId, corrected, row!.payload_hash as string);
+    expect(await review({ action: "requeue", token })).toMatchObject({ ok: true, action: "requeue", validationId: corrected });
+    expect(await review({ action: "requeue", token })).toEqual({ ok: false, code: "already_queued" });
+    expect(await executionsOf(s.caseId)).toHaveLength(1); expect(sendNow).toHaveBeenCalledTimes(1);
+  });
+
+  it("not this button's: a proposed reply, a declined one, or an approval that is not the Studio's is refused, nothing written", async () => {
+    const s = await proposedReply();
+    expect(await review({ action: "requeue", token: s.token })).toEqual({ ok: false, code: "not_requeueable", detail: "proposed" });
+    await nothingHappened(s);
+    // An approval under another basis (the automatic rule's, here a fixture's): its own passage re-queues it, not the Studio.
+    const seen = { payloadHash: caseReplyPayloadHash(s.proposal), caseVersion: s.proposal.caseVersion, recipient: s.proposal.recipient };
+    expect(await decideCaseReply({ action: "approve", validationId: s.validationId, approverId: ADMIN, seen, deps: storeDeps(), authorizer: () => ({ allowed: true, basis: "fixture.allow" }) })).toMatchObject({ ok: true });
+    expect(await review({ action: "requeue", token: s.token })).toEqual({ ok: false, code: "not_requeueable", detail: "approved" });
+    expect(await executionsOf(s.caseId)).toHaveLength(0); expect(sendNow).not.toHaveBeenCalled();
   });
 });
 
