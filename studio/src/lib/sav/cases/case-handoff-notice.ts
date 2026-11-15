@@ -102,9 +102,13 @@ function refusedHandoffAction(snapshot: Pick<CaseSnapshot, "body">, rejections: 
     missingInformation: [...new Set(rejections.map(row => row.label))].slice(0, 5), expectedIntervention: HANDOFF_REFUSED_INTERVENTION } };
 }
 
-/** SAV-92: the team's part of the latest mail as a handoff report: which requests, in their searchable words (never the mail itself), and our fixed intervention. */
-function teamPartHandoffAction(snapshot: Pick<CaseSnapshot, "body"> & Partial<Pick<CaseSnapshot, "admission">>) {
-  const parts = caseTeamPartRequests({ admission: snapshot.admission ?? null, body: snapshot.body });
+/**
+ * SAV-92: the team's part of a mail as a handoff report: which requests, in their searchable words (never the mail itself), and our fixed intervention.
+ * `recorded` (review of batch 2, finding 1): the ids the decision recorded; without them (a record written before), the parts of the admission in force.
+ */
+function teamPartHandoffAction(snapshot: Pick<CaseSnapshot, "body"> & Partial<Pick<CaseSnapshot, "admission">>, recorded?: readonly string[]) {
+  const parts = recorded ? snapshot.body.openRequests.filter(row => row.status === "handed_off" && recorded.includes(row.id))
+    : caseTeamPartRequests({ admission: snapshot.admission ?? null, body: snapshot.body });
   if (!parts.length) return null;
   const described = parts.map(row => caseRequestSearchText(row));
   const need = `Partie du message à reprendre par l'équipe (${parts.length} demande${parts.length > 1 ? "s" : ""}) : ${described.map(text => text ? `« ${text} »` : "demande non décrite, voir le mail du client").join(" ; ")}`;
@@ -113,7 +117,10 @@ function teamPartHandoffAction(snapshot: Pick<CaseSnapshot, "body"> & Partial<Pi
 }
 
 /** Events after the decision that make it no longer the final word: a newer customer mail, a newer investigation, a person's command, an owner change. */
-export function staleHandoffEventKinds(transferred: boolean) {
+export function staleHandoffEventKinds(transferred: boolean, reason?: HandoffReason) {
+  // SAV-92 (review of batch 2, finding 1): the customer was told this part went to the team. Nothing after the decision (a reply of the customer, a new
+  // investigation, a re-admission) makes that promise void: only a person taking the case cancels the notice (`taken_by_person`, checked on its own).
+  if (reason === "outside_active_blocks") return [];
   const kinds = ["observation_recorded", "human_command", "owner_changed"];
   // A customer follow-up belongs to the pending human case after durable transfer.
   if (!transferred) kinds.push("inbound_confirmed");
@@ -145,7 +152,7 @@ export function handoffNoticeTrigger(snapshot: Pick<CaseSnapshot, "caseId" | "ti
   const decided = refused ? refusedHandoffAction(snapshot, refused.rejections) : decision.validation.outcome === "accepted" ? decision.validation.decision.nextAction : null;
   // SAV-92: an accepted decision that keeps the case (an answer, a question...) still owes the team the part of the mail no active block covers: one notice per input,
   // the same key, fence and channel as a handoff, with nothing transferred. A handoff or a refusal already gives the whole case to the team.
-  const action = decided && decided.kind !== "handoff" ? teamPartHandoffAction(snapshot) : decided;
+  const action = decided && decided.kind !== "handoff" ? teamPartHandoffAction(snapshot, decision.teamParts) : decided;
   if (!action || action.kind !== "handoff") return { ok: false, why: "not_handoff" };
   if (snapshot.body.handoff?.humanSince) return { ok: false, why: "taken_by_person" };
   if (latest.detail?.applied === false) return { ok: false, why: "stale_input" };
@@ -154,13 +161,36 @@ export function handoffNoticeTrigger(snapshot: Pick<CaseSnapshot, "caseId" | "ti
     && event.dedupeKey === "cmd:" + investigationHandoffCommand(read.caseVersion)
     && event.detail?.transition === "handoff" && event.detail.reason === action.reason);
   const recordedAtVersion = transferred?.caseVersion ?? read.caseVersion;
-  const staleKinds = staleHandoffEventKinds(Boolean(transferred) && awaitingHandoff(snapshot, action.reason));
+  const staleKinds = staleHandoffEventKinds(Boolean(transferred) && awaitingHandoff(snapshot, action.reason), action.reason);
   if (events.some(event => event.caseVersion > recordedAtVersion && staleKinds.includes(event.kind))) return { ok: false, why: "stale_input" };
   if (!INPUT_KEY.test(inputKey)) return { ok: false, why: "no_record" };
   const { report } = action;
   return { ok: true, caseId: snapshot.caseId, ticketId: snapshot.ticketId, inputKey, recordedAtVersion, reason: action.reason,
     report: { need: report.need, expected: report.expected, observed: report.observed, trialIds: report.trialIds, hypotheses: report.hypotheses,
       missingInformation: report.missingInformation, expectedIntervention: report.expectedIntervention } };
+}
+
+/**
+ * SAV-92 (review of batch 2, finding 1): every team part the case still owes the team, one per input whose recorded decision (accepted, not a handoff)
+ * left part of the mail to the team: not only the latest input. Each is keyed on ITS input (`handoffNoticeKey`), so the notice sweep recreates nothing twice
+ * and admits one a crash or a later mail left behind. A person who took the case cancels them all (they have the whole case).
+ */
+export function teamPartNoticeTriggers(snapshot: Pick<CaseSnapshot, "caseId" | "ticketId" | "body" | "owner" | "phase"> & Partial<Pick<CaseSnapshot, "admission">>,
+  events: readonly CaseInvestigationJournalEvent[]): Extract<HandoffNoticeTrigger, { ok: true }>[] {
+  if (snapshot.body.handoff?.humanSince) return [];
+  const inputs = [...new Set(events.flatMap(event => {
+    const record = event.kind === "observation_recorded" ? event.detail?.record as { kind?: unknown; inputKey?: unknown } | undefined : undefined;
+    return record?.kind === SAV_CASE_INVESTIGATION_RECORD_KIND && typeof record.inputKey === "string" && INPUT_KEY.test(record.inputKey) ? [record.inputKey] : [];
+  }))];
+  return inputs.flatMap(inputKey => {
+    const read = readCaseInvestigationProgress(events, inputKey);
+    if (read.state !== "found") return [];
+    const decision = read.record.decision, recorded = events.find(event => event.kind === "observation_recorded" && event.caseVersion === read.caseVersion);
+    if (!decision?.teamParts?.length || decision.validation.outcome !== "accepted" || decision.validation.decision.nextAction.kind === "handoff" || recorded?.detail?.applied === false) return [];
+    const action = teamPartHandoffAction(snapshot, decision.teamParts);
+    if (!action) return [];
+    return [{ ok: true as const, caseId: snapshot.caseId, ticketId: snapshot.ticketId, inputKey, recordedAtVersion: read.caseVersion, reason: action.reason, report: { ...action.report } }];
+  });
 }
 
 // ---------------------------------------------------------------------------------------------------------------------------------

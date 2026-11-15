@@ -251,8 +251,9 @@ export type CaseAdmissionPolicy = z.infer<typeof caseAdmissionPolicySchema>;
 /** SAV-92: why a request of a multi-request mail is left to the team while the agent handles the others. `no_block_match`: no active block's detector reads
  * the request's own words as its request; `ambiguous_block`: two blocks (or one configured twice) claim it; `block_scope_unavailable`: its block has no valid scope
  * for the policy in force; `not_support`: V1 did not classify it as support (commercial, partnership, other...); `request_text_unavailable`: no verified quote of
- * the request is stored, so no detector can read it. */
-export const SAV_CASE_TEAM_PART_REASONS = ["no_block_match", "ambiguous_block", "block_scope_unavailable", "not_support", "request_text_unavailable"] as const;
+ * the request is stored, so no detector can read it. `block_switch_restricted` (SAV-92 multi-block): its block's switch is stricter than another block's
+ * of the same mail (`planCaseMultiBlockModes`), so the one reply is not held back by it: that request is the team's. */
+export const SAV_CASE_TEAM_PART_REASONS = ["no_block_match", "ambiguous_block", "block_scope_unavailable", "not_support", "request_text_unavailable", "block_switch_restricted"] as const;
 export type CaseTeamPartReason = typeof SAV_CASE_TEAM_PART_REASONS[number];
 export const caseAdmissionProvenanceSchema = z.discriminatedUnion("kind", [
   z.object({ kind: z.literal("human"), staffUserId: staffId, at }).strict(),

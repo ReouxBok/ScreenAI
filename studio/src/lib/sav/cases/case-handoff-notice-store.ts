@@ -30,7 +30,7 @@ import { createHandoffCrmReader, type HandoffCrmReader } from "./case-handoff-cr
 import { nextSweepPage } from "./case-sweep-cursor";
 import {
   buildHandoffNoticeIntent, HANDOFF_NOTICE_CONTRACT, HANDOFF_REASON_LABELS, HANDOFF_NOTICE_KEY_PREFIX, awaitingHandoff, staleHandoffEventKinds, handoffNoticeFacts, handoffNoticeKey, handoffNoticeTrigger,
-  judgeHandoffCrm, readHandoffNoticeConfig, renderHandoffNotice, type HandoffNoticeFacts,
+  judgeHandoffCrm, readHandoffNoticeConfig, renderHandoffNotice, teamPartNoticeTriggers, type HandoffNoticeFacts, type HandoffNoticeTrigger,
 } from "./case-handoff-notice";
 import { createHandoffSlackAdapters, SLACK_NOT_POSTED_PREFIX } from "./case-handoff-slack";
 import { caseHandoffSummaryLines } from "./case-handoff-summary";
@@ -98,21 +98,36 @@ async function readReceivedAttachments(threadIds: readonly string[]) {
  * from a caller except the policy the execution is queued under (as for a reply). Idempotent on (case, input): the unique reply key makes any second call, concurrent or
  * replayed, the same execution; a cancelled execution stays cancelled (its key is never reused).
  */
-export async function enqueueHandoffNotice(input: Readonly<{ caseId: string; policy: Readonly<{ id: string; hash: string }>; env: () => Record<string, string | undefined> }>): Promise<EnqueueHandoffNoticeResult> {
+export async function enqueueHandoffNotice(input: Readonly<{ caseId: string; policy: Readonly<{ id: string; hash: string }>; env: () => Record<string, string | undefined>;
+  /** SAV-92 (review of batch 2, finding 1): only the notice of this input (the reply passage proving the team part of the mail it answers is queued). */ inputKey?: string }>): Promise<EnqueueHandoffNoticeResult> {
   const config = readHandoffNoticeConfig(input.env());
   if (config.mode !== "on") return { ok: false, code: "notice_off", why: config.why };
   const snapshot = await readCase(input.caseId);
   if (!snapshot) return { ok: false, code: "case_unknown" };
-  const trigger = handoffNoticeTrigger(snapshot, await readJournal(snapshot.caseId));
-  if (!trigger.ok) return { ok: false, code: "no_trigger", why: trigger.why };
+  const events = await readJournal(snapshot.caseId), trigger = handoffNoticeTrigger(snapshot, events);
+  // SAV-92 (review of batch 2, finding 1): the latest decision's notice, then every team part an earlier input still owes the team (same key per input: idempotent).
+  const parts = teamPartNoticeTriggers(snapshot, events).filter(part => !trigger.ok || part.inputKey !== trigger.inputKey);
+  const all = [...(trigger.ok ? [trigger] : []), ...parts].filter(one => input.inputKey === undefined || one.inputKey === input.inputKey);
+  if (!all.length) return { ok: false, code: "no_trigger", why: trigger.ok ? "input_other" : trigger.why };
   const threadId = snapshot.threadIds.at(-1);
   if (!threadId) return { ok: false, code: "no_thread" };
+  const attachments = await readReceivedAttachments(snapshot.threadIds);
+  let first: EnqueueHandoffNoticeResult | null = null;
+  for (const one of all) {
+    const result = await admitHandoffNotice(one, snapshot, threadId, attachments, config.teamOwnerId, input.policy);
+    first ??= result;
+  }
+  return first!;
+}
+
+async function admitHandoffNotice(trigger: Extract<HandoffNoticeTrigger, { ok: true }>, snapshot: NonNullable<Awaited<ReturnType<typeof readCase>>>, threadId: string,
+  attachments: Awaited<ReturnType<typeof readReceivedAttachments>>, teamOwnerId: string | null, policy: Readonly<{ id: string; hash: string }>): Promise<EnqueueHandoffNoticeResult> {
   const key = handoffNoticeKey(trigger.caseId, trigger.inputKey);
-  const facts = handoffNoticeFacts(trigger, snapshot.body, await readReceivedAttachments(snapshot.threadIds)), note = handoffNoteOf(facts, new Date().toISOString());
-  const payload: HandoffNoticePayload = { contract: HANDOFF_NOTICE_CONTRACT, key, facts, teamOwnerId: config.teamOwnerId, ...(note ? { note } : {}) };
+  const facts = handoffNoticeFacts(trigger, snapshot.body, attachments), note = handoffNoteOf(facts, new Date().toISOString());
+  const payload: HandoffNoticePayload = { contract: HANDOFF_NOTICE_CONTRACT, key, facts, teamOwnerId, ...(note ? { note } : {}) };
   return requireDb().transaction(async (tx): Promise<EnqueueHandoffNoticeResult> => {
     const [created] = await tx.insert(savCaseEffectExecutions).values({
-      caseId: snapshot.caseId, replyKey: key, threadId, policyId: input.policy.id, policyHash: input.policy.hash, payloadCiphertext: encryptSavPayload(payload),
+      caseId: snapshot.caseId, replyKey: key, threadId, policyId: policy.id, policyHash: policy.hash, payloadCiphertext: encryptSavPayload(payload),
     }).onConflictDoNothing().returning({ id: savCaseEffectExecutions.id });
     if (created) {
       await executionJournal(tx, created.id, "handoff_notice_admitted", { key, reason: trigger.reason, recordedAtVersion: trigger.recordedAtVersion });
@@ -182,8 +197,10 @@ export function createHandoffNoticeDriver(deps: HandoffNoticeDriverDeps): PassDr
     const transfer = awaitingHandoff(locked, payload.facts.reason) && (await tx.select({ id: savCaseEvents.id }).from(savCaseEvents)
       .where(and(eq(savCaseEvents.caseId, caseId), eq(savCaseEvents.caseVersion, recordedVersion), eq(savCaseEvents.kind, "owner_changed"),
         eq(savCaseEvents.dedupeKey, "cmd:" + investigationHandoffCommand(recordedVersion - 1)))).limit(1))[0];
-    const [later] = await tx.select({ kind: savCaseEvents.kind }).from(savCaseEvents)
-      .where(and(eq(savCaseEvents.caseId, caseId), gt(savCaseEvents.caseVersion, payload.facts.recordedAtVersion), inArray(savCaseEvents.kind, staleHandoffEventKinds(Boolean(transfer))))).limit(1);
+    // SAV-92 (review of batch 2, finding 1): a team part is never cancelled by a later event; only a person taking the case (above) cancels it.
+    const staleKinds = staleHandoffEventKinds(Boolean(transfer), payload.facts.reason);
+    const [later] = staleKinds.length ? await tx.select({ kind: savCaseEvents.kind }).from(savCaseEvents)
+      .where(and(eq(savCaseEvents.caseId, caseId), gt(savCaseEvents.caseVersion, payload.facts.recordedAtVersion), inArray(savCaseEvents.kind, staleKinds))).limit(1) : [];
     if (later) return fault("CANCELLED_STALE_INPUT");
     // The lock waits above can cross the lease expiry: judged again against a clock read after the last of them.
     if (!await ownedExecution(tx, lease)) return fault("LEASE_LOST");

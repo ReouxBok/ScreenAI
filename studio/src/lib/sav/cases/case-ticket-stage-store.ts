@@ -20,7 +20,7 @@ import { savIntakeRuntimeConfig } from "../intake/runtime-contract";
 import { ownedExecution, settleVerification } from "./case-effect-driver";
 import { caseEffectSchemaInstalled } from "./case-effect-recovery";
 import { buildTicketStageIntent, TICKET_STAGE_KEY_PREFIX, type TicketStagePayload } from "./case-ticket-stage";
-import { lastCustomerInboundAt } from "./case-ticket-stage-queue";
+import { caseTeamPartPending, lastCustomerInboundAt } from "./case-ticket-stage-queue";
 import { createCaseTicketStageAdapters, TICKET_STAGE_NOT_APPLIED_PREFIX } from "./case-ticket-stage-hubspot";
 import { v2HubspotOwnerId } from "./intake-boundary";
 import { lockCaseForWrite } from "./case-store";
@@ -77,7 +77,7 @@ export function createTicketStageDriver(deps: TicketStageDriverDeps): PassDriver
     try {
       const planned = planCaseTicketStage({
         config, caseId, ticketId: snapshot.ticketId, case: { owner: snapshot.owner, phase: snapshot.phase, sensitivity: snapshot.sensitivity, cycle: snapshot.body.cycle,
-        ...(snapshot.body.openRequests.some(row => row.status === "handed_off") ? { teamPartPending: true } : {}) },
+        ...(await caseTeamPartPending(tx, snapshot) ? { teamPartPending: true } : {}) },
         trigger: payload.trigger, lastCustomerInboundAt: null,
       });
       still = planned.plan && planned.intent.key === intent.key && planned.intent.stageId === intent.stageId && planned.intent.ticketId === intent.ticketId;

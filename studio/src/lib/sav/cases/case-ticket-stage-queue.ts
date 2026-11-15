@@ -2,19 +2,31 @@
 // « Waiting for the customer » is queued INSIDE the transaction that records a confirmed reply (so a confirmed reply without its stage cannot exist, and a replay or a
 // recovery returns the same row); « closed » is queued by `case-resolution.ts`. This file depends on no driver: the reply driver calls it from its receipt.
 import "server-only";
-import { and, eq, max } from "drizzle-orm";
+import { and, eq, gt, max } from "drizzle-orm";
 import { savCaseEffectExecutions, savCaseEvents } from "@/db/schema";
 import { encryptSavPayload } from "../crypto";
 import { executionJournal, type ExecutionTx } from "../intake/execution-store";
 import { TICKET_STAGE_CONTRACT, type TicketStagePayload } from "./case-ticket-stage";
-import type { CaseSnapshot } from "./case-types";
+import { caseTeamPartRequests, type CaseSnapshot } from "./case-types";
 import { planCaseTicketStage, readCaseTicketStageConfig, type CaseTicketStageTrigger } from "./customer-return";
 
 
 export type EnqueueTicketStageResult =
   | Readonly<{ ok: true; executionId: string; created: boolean; key: string }>
   | Readonly<{ ok: false; reason: string }>;
-type StageCase = Pick<CaseSnapshot, "caseId" | "ticketId" | "owner" | "phase" | "sensitivity" | "body" | "threadIds">;
+type StageCase = Pick<CaseSnapshot, "caseId" | "ticketId" | "owner" | "phase" | "sensitivity" | "body" | "threadIds" | "admission">;
+
+/**
+ * SAV-92 (review of batch 2, finding 2): the team still has its part of the customer's message. Only the team parts of the admission in force (the latest
+ * mail: a new customer mail re-qualifies the case and ends the freeze of the previous one), and only until a person replies on the case after that admission
+ * (an observed `human_outbound`: the team answered its part). A request handed off for another reason never freezes the stage. Read in the caller's transaction.
+ */
+export async function caseTeamPartPending(tx: ExecutionTx, snapshot: Pick<CaseSnapshot, "caseId" | "admission" | "body">): Promise<boolean> {
+  if (!caseTeamPartRequests(snapshot).length) return false;
+  const [reply] = await tx.select({ id: savCaseEvents.id }).from(savCaseEvents).where(and(eq(savCaseEvents.caseId, snapshot.caseId), eq(savCaseEvents.kind, "outbound_observed"),
+    eq(savCaseEvents.direction, "human_outbound"), gt(savCaseEvents.caseVersion, snapshot.admission?.version ?? 0))).limit(1);
+  return !reply;
+}
 
 /** Date of the latest customer mail recorded on the case, read in the caller's transaction. */
 export async function lastCustomerInboundAt(tx: ExecutionTx, caseId: string): Promise<string | null> {
@@ -35,7 +47,7 @@ export async function enqueueCaseTicketStage(tx: ExecutionTx, input: Readonly<{
   try {
     planned = planCaseTicketStage({
       config, caseId: snapshot.caseId, ticketId: snapshot.ticketId, case: { owner: snapshot.owner, phase: snapshot.phase, sensitivity: snapshot.sensitivity, cycle: snapshot.body.cycle,
-        ...(snapshot.body.openRequests.some(row => row.status === "handed_off") ? { teamPartPending: true } : {}) },
+        ...(await caseTeamPartPending(tx, snapshot) ? { teamPartPending: true } : {}) },
       trigger: input.trigger, lastCustomerInboundAt: await lastCustomerInboundAt(tx, snapshot.caseId),
     });
   } catch { return { ok: false, reason: "key_invalid" }; }

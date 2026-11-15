@@ -169,6 +169,40 @@ export function arrangeCaseScopedKnowledge(input: Readonly<{
 }
 
 /**
+ * SAV-92 (Ugo 15/11, multi-block): the same arrangement for a case whose open requests belong to SEVERAL blocks, each block on its own scope. Each request gets
+ * its coverage from ITS block's arrangement (its block's scope cards linked to it, never another block's), and a card that only another block's scope lists
+ * is unlinked from it: block A's cards never support a request of block B. The cards read are the union, every scope card first; a card one block dropped
+ * but another kept is kept. A request without a block (a team part) keeps the first block's arrangement, which links no scope card to it. Pure.
+ */
+export function arrangeCaseMultiBlockKnowledge(input: Readonly<{
+  cards: readonly SavRetrievalCandidate[]; coverage: readonly CaseKnowledgeCoverage[]; relevance: readonly CaseKnowledgeRelevance[];
+  scopes: Readonly<Record<string, CaseBlockScope>>; fetched: readonly SavRetrievalCandidate[]; pool?: readonly CaseKnowledgePoolEntry[];
+  blockOf: (row: CaseKnowledgeCoverage) => string | null;
+}>): CaseScopedKnowledge {
+  const ids = Object.keys(input.scopes).sort();
+  const parts = ids.map(blockId => ({ blockId, scoped: arrangeCaseScopedKnowledge({ ...input, scope: input.scopes[blockId]!, blockOf: input.blockOf }) }));
+  const scopeKeysOf = (blockId: string) => new Set(input.scopes[blockId]!.sources.map(keyOf));
+  const scopeKeys = new Set(parts.flatMap(part => [...part.scoped.scopeKeys])), templateKeys = new Set(parts.flatMap(part => [...part.scoped.templateKeys]));
+  const knowledge = [...new Map([...parts.flatMap(part => part.scoped.knowledge.filter(card => scopeKeys.has(cardKey(card)))),
+    ...parts.flatMap(part => part.scoped.knowledge.filter(card => !scopeKeys.has(cardKey(card))))].map(card => [cardKey(card), card])).values()];
+  const kept = new Set(knowledge.map(cardKey));
+  const coverage = input.coverage.map((row, index): CaseKnowledgeCoverage => {
+    const blockId = input.blockOf(row), own = parts.find(part => part.blockId === blockId) ?? parts[0]!;
+    const arranged = own.scoped.coverage[index]!, ownScope = blockId ? scopeKeysOf(blockId) : new Set<string>();
+    // Another block's scope card is never this request's support (it may still be read: the model sees it linked to its own block's requests only).
+    const foreign = (ref: KnowledgeRef) => !ownScope.has(keyOf(ref)) && ids.some(other => other !== blockId && scopeKeysOf(other).has(keyOf(ref)));
+    const refs = arranged.knowledge.filter(ref => kept.has(keyOf(ref)) && !foreign(ref));
+    const emptied = !refs.length && arranged.knowledge.length > 0 && arranged.status === "covered";
+    return { ...arranged, knowledge: refs, status: refs.length ? arranged.status : emptied ? "no_applicable_knowledge" : arranged.status, limitations: [...arranged.limitations] };
+  });
+  const dropped = [...new Map(parts.flatMap(part => part.scoped.dropped).filter(drop => !kept.has(keyOf(drop))).map(drop => [keyOf(drop), drop])).values()];
+  const added = parts.flatMap(part => part.scoped.added.filter(link => input.blockOf(input.coverage.find(row => row.requestId === link.requestId)!) === part.blockId));
+  const scopeLeftOut = [...new Map(parts.flatMap(part => part.scoped.scopeLeftOut).filter(row => !kept.has(keyOf(row))).map(row => [keyOf(row), row])).values()];
+  const unavailable = [...new Map(parts.flatMap(part => part.scoped.unavailable).map(row => [keyOf(row), row])).values()];
+  return { knowledge, coverage, scopeKeys, templateKeys, dropped, scopeLeftOut, added, unavailable, linkedBefore: parts[0]!.scoped.linkedBefore };
+}
+
+/**
  * Over the input bound: the lowest-ranked out-of-scope card is dropped, again and again, then the least relevant scope card, until `fits`
  * or only the template is left; a template card is never dropped. A request left without any card is `not_searched` with the retrieval's
  * existing `source_context_budget` limitation.
